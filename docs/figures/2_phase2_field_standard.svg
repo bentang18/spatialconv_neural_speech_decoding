@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 1180" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow2" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+    </marker>
+    <marker id="arrow2w" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fff"/>
+    </marker>
+    <filter id="shadow2" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="1" dy="2" stdDeviation="2" flood-opacity="0.1"/>
+    </filter>
+    <linearGradient id="headerGrad2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#2E7D32"/>
+      <stop offset="100%" style="stop-color:#43A047"/>
+    </linearGradient>
+    <linearGradient id="sharedGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#E8F5E9"/>
+      <stop offset="100%" style="stop-color:#C8E6C9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="1180" rx="12" fill="#FAFBFC"/>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="860" height="70" rx="12" fill="url(#headerGrad2)"/>
+  <rect x="0" y="40" width="860" height="30" fill="url(#headerGrad2)"/>
+  <text x="430" y="32" text-anchor="middle" fill="white" font-size="22" font-weight="600">Phase 2 — Field Standard Pipeline (E1)</text>
+  <text x="430" y="56" text-anchor="middle" fill="rgba(255,255,255,0.8)" font-size="13">Per-patient Linear → shared BiGRU → CTC  (Singh, Boccato, Levin, Willett consensus)</text>
+
+  <!-- Color legend -->
+  <rect x="30" y="85" width="14" height="14" rx="3" fill="#F5A623"/>
+  <text x="50" y="96" fill="#546E7A" font-size="11">Per-patient (adapts)</text>
+  <rect x="200" y="85" width="14" height="14" rx="3" fill="#50B860"/>
+  <text x="220" y="96" fill="#546E7A" font-size="11">Shared backbone (freezes in Stage 2)</text>
+  <rect x="470" y="85" width="14" height="14" rx="3" fill="#4A90D9"/>
+  <text x="490" y="96" fill="#546E7A" font-size="11">Data</text>
+  <rect x="570" y="85" width="14" height="14" rx="3" fill="#E74C3C"/>
+  <text x="590" y="96" fill="#546E7A" font-size="11">Loss</text>
+
+  <!-- ═══════════════ ARCHITECTURE FLOW ═══════════════ -->
+
+  <!-- 1. Input -->
+  <rect x="215" y="120" width="350" height="65" rx="10" fill="#4A90D9" filter="url(#shadow2)"/>
+  <text x="390" y="147" text-anchor="middle" fill="white" font-size="15" font-weight="600">uECOG Grid</text>
+  <text x="390" y="168" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">(B, D_padded, T)  —  zero-padded to 208 ch, 200 Hz</text>
+
+  <!-- Annotation: input -->
+  <rect x="595" y="120" width="230" height="65" rx="8" fill="#E3F2FD" stroke="#BBDEFB" stroke-width="1"/>
+  <text x="710" y="140" text-anchor="middle" fill="#1565C0" font-size="10" font-weight="600">INPUT FORMAT</text>
+  <text x="710" y="155" text-anchor="middle" fill="#546E7A" font-size="10">Channels flattened from grid</text>
+  <text x="710" y="168" text-anchor="middle" fill="#546E7A" font-size="10">Non-sig channels zeroed</text>
+  <text x="710" y="181" text-anchor="middle" fill="#546E7A" font-size="10">D_padded = 208 (max across pts)</text>
+
+  <!-- Augmentation box (before read-in) -->
+  <rect x="30" y="128" width="170" height="80" rx="8" fill="#FFF8E1" stroke="#FFE082" stroke-width="1"/>
+  <text x="115" y="147" text-anchor="middle" fill="#F57F17" font-size="10" font-weight="600">AUGMENTATION</text>
+  <text x="115" y="162" text-anchor="middle" fill="#795548" font-size="10">Time shift ±100ms</text>
+  <text x="115" y="175" text-anchor="middle" fill="#795548" font-size="10">Amp scale σ=0.15</text>
+  <text x="115" y="188" text-anchor="middle" fill="#795548" font-size="10">Ch dropout p∈[0, 0.2]</text>
+  <text x="115" y="201" text-anchor="middle" fill="#795548" font-size="10">Gaussian noise 2% RMS</text>
+
+  <!-- Arrow -->
+  <line x1="390" y1="185" x2="390" y2="215" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- ═══════ PER-PATIENT ZONE ═══════ -->
+  <rect x="170" y="218" width="440" height="85" rx="12" fill="none" stroke="#F5A623" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="185" y="236" fill="#F57F17" font-size="11" font-weight="600">PER-PATIENT</text>
+
+  <!-- 2. Linear Read-In -->
+  <rect x="205" y="242" width="370" height="52" rx="10" fill="#F5A623" filter="url(#shadow2)"/>
+  <text x="390" y="265" text-anchor="middle" fill="white" font-size="15" font-weight="600">Linear(208, 64)</text>
+  <text x="390" y="283" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">13,376 params per patient</text>
+
+  <!-- Annotation: read-in -->
+  <rect x="595" y="240" width="230" height="55" rx="8" fill="#FFF3E0" stroke="#FFE0B2" stroke-width="1"/>
+  <text x="710" y="258" text-anchor="middle" fill="#E65100" font-size="10" font-weight="600">PER-PATIENT READ-IN</text>
+  <text x="710" y="273" text-anchor="middle" fill="#546E7A" font-size="10">Absorbs gain/offset variation</text>
+  <text x="710" y="286" text-anchor="middle" fill="#546E7A" font-size="10">(Boccato: predominantly diagonal)</text>
+
+  <!-- Arrow -->
+  <line x1="390" y1="303" x2="390" y2="328" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- ═══════ SHARED BACKBONE ZONE ═══════ -->
+  <rect x="140" y="332" width="500" height="290" rx="12" fill="url(#sharedGrad)" stroke="#66BB6A" stroke-width="2"/>
+  <text x="155" y="352" fill="#2E7D32" font-size="11" font-weight="600">SHARED BACKBONE  (~146k params)</text>
+  <text x="155" y="365" fill="#558B2F" font-size="10">Frozen during Stage 2</text>
+
+  <!-- 3. LayerNorm -->
+  <rect x="205" y="378" width="370" height="42" rx="8" fill="#66BB6A" filter="url(#shadow2)"/>
+  <text x="390" y="403" text-anchor="middle" fill="white" font-size="14" font-weight="600">LayerNorm(64)</text>
+
+  <!-- Annotation: shapes -->
+  <rect x="595" y="340" width="230" height="52" rx="8" fill="#E8F5E9" stroke="#C8E6C9" stroke-width="1"/>
+  <text x="710" y="358" text-anchor="middle" fill="#2E7D32" font-size="10" font-weight="600">TENSOR SHAPE</text>
+  <text x="710" y="373" text-anchor="middle" fill="#546E7A" font-size="10">(B, 64, T)</text>
+  <text x="710" y="386" text-anchor="middle" fill="#546E7A" font-size="10">D_shared = 64, T = 200</text>
+
+  <!-- Arrow -->
+  <line x1="390" y1="420" x2="390" y2="438" stroke="#666" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+  <!-- Feature dropout annotation -->
+  <rect x="30" y="378" width="100" height="32" rx="6" fill="#FFF8E1" stroke="#FFE082" stroke-width="1"/>
+  <text x="80" y="398" text-anchor="middle" fill="#795548" font-size="10">Feat drop</text>
+  <text x="80" y="409" text-anchor="middle" fill="#795548" font-size="9">p∈[0, 0.3]</text>
+
+  <!-- 4. Conv1d temporal -->
+  <rect x="205" y="442" width="370" height="52" rx="8" fill="#43A047" filter="url(#shadow2)"/>
+  <text x="390" y="465" text-anchor="middle" fill="white" font-size="14" font-weight="600">Conv1d(64, 64, k=5, s=5) + GELU</text>
+  <text x="390" y="483" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">200 Hz → 40 Hz  (temporal downsampling)</text>
+
+  <!-- Annotation: shapes -->
+  <rect x="595" y="445" width="230" height="42" rx="8" fill="#E8F5E9" stroke="#C8E6C9" stroke-width="1"/>
+  <text x="710" y="461" text-anchor="middle" fill="#546E7A" font-size="10">(B, 64, 200) → (B, 64, 40)</text>
+  <text x="710" y="476" text-anchor="middle" fill="#546E7A" font-size="10">20,544 params</text>
+
+  <!-- Time mask annotation -->
+  <rect x="30" y="452" width="100" height="32" rx="6" fill="#FFF8E1" stroke="#FFE082" stroke-width="1"/>
+  <text x="80" y="472" text-anchor="middle" fill="#795548" font-size="10">Time mask</text>
+  <text x="80" y="483" text-anchor="middle" fill="#795548" font-size="9">1–4 frames</text>
+
+  <!-- Arrow -->
+  <line x1="390" y1="494" x2="390" y2="512" stroke="#666" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+  <!-- 5. BiGRU -->
+  <rect x="205" y="516" width="370" height="52" rx="8" fill="#2E7D32" filter="url(#shadow2)"/>
+  <text x="390" y="539" text-anchor="middle" fill="white" font-size="14" font-weight="600">BiGRU(64, 64, 2 layers, bidir)</text>
+  <text x="390" y="557" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">124,416 params  →  (B, 40, 128)</text>
+
+  <!-- Annotation: BiGRU -->
+  <rect x="595" y="510" width="230" height="62" rx="8" fill="#E8F5E9" stroke="#C8E6C9" stroke-width="1"/>
+  <text x="710" y="528" text-anchor="middle" fill="#2E7D32" font-size="10" font-weight="600">TEMPORAL DYNAMICS</text>
+  <text x="710" y="543" text-anchor="middle" fill="#546E7A" font-size="10">2H = 128 output dim</text>
+  <text x="710" y="556" text-anchor="middle" fill="#546E7A" font-size="10">Layer 2 input = 128 (bidir)</text>
+  <text x="710" y="569" text-anchor="middle" fill="#546E7A" font-size="10">Dropout 0.2 between layers</text>
+
+  <!-- End shared backbone zone -->
+
+  <!-- Arrow out of backbone -->
+  <line x1="390" y1="622" x2="390" y2="647" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- 6. Flat CTC Head -->
+  <rect x="205" y="652" width="370" height="52" rx="10" fill="#E74C3C" filter="url(#shadow2)"/>
+  <text x="390" y="675" text-anchor="middle" fill="white" font-size="15" font-weight="600">Linear(128, 10) → log_softmax</text>
+  <text x="390" y="693" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">Flat CTC head  —  1,290 params</text>
+
+  <!-- Annotation: output -->
+  <rect x="595" y="652" width="230" height="52" rx="8" fill="#FFEBEE" stroke="#FFCDD2" stroke-width="1"/>
+  <text x="710" y="670" text-anchor="middle" fill="#C62828" font-size="10" font-weight="600">CTC OUTPUT</text>
+  <text x="710" y="685" text-anchor="middle" fill="#546E7A" font-size="10">9 phonemes + 1 blank = 10</text>
+  <text x="710" y="698" text-anchor="middle" fill="#546E7A" font-size="10">Greedy decode → [a, b, e]</text>
+
+  <!-- Arrow -->
+  <line x1="390" y1="704" x2="390" y2="729" stroke="#666" stroke-width="2" marker-end="url(#arrow2)"/>
+
+  <!-- 7. CTC Loss -->
+  <rect x="265" y="734" width="250" height="45" rx="22" fill="#C62828" filter="url(#shadow2)"/>
+  <text x="390" y="762" text-anchor="middle" fill="white" font-size="15" font-weight="600">CTC Loss</text>
+
+  <!-- ═══════════════ TRAINING INFO ═══════════════ -->
+
+  <rect x="40" y="810" width="780" height="350" rx="10" fill="white" stroke="#E0E0E0" stroke-width="1.5"/>
+
+  <!-- Stage 1 -->
+  <rect x="55" y="825" width="370" height="165" rx="8" fill="#F1F8E9" stroke="#C5E1A5" stroke-width="1"/>
+  <text x="240" y="847" text-anchor="middle" fill="#33691E" font-size="14" font-weight="700">Stage 1: Multi-Patient Training</text>
+  <text x="70" y="870" fill="#546E7A" font-size="11">• Standard SGD on 7 source patients</text>
+  <text x="70" y="888" fill="#546E7A" font-size="11">• Gradient accumulated across patients</text>
+  <text x="70" y="906" fill="#546E7A" font-size="11">• Cosine warm restarts (T₀=40) → 5 snapshots</text>
+  <text x="70" y="924" fill="#546E7A" font-size="11">• 200 epochs max, early stopping (patience 50)</text>
+  <text x="70" y="942" fill="#546E7A" font-size="11">• LR: backbone 1e-3, read-in 3e-3 (3× diff)</text>
+  <text x="70" y="960" fill="#546E7A" font-size="11">• Batch: 16/patient → eff. batch 112</text>
+  <text x="70" y="978" fill="#546E7A" font-size="11">• SWA: weight-average 5 snapshot minima</text>
+
+  <!-- Stage 2 -->
+  <rect x="440" y="825" width="365" height="165" rx="8" fill="#FFF3E0" stroke="#FFE0B2" stroke-width="1"/>
+  <text x="622" y="847" text-anchor="middle" fill="#E65100" font-size="14" font-weight="700">Stage 2: Target Adaptation</text>
+  <text x="455" y="870" fill="#546E7A" font-size="11">• 5-fold CV on target patient</text>
+  <text x="455" y="888" fill="#546E7A" font-size="11">• Freeze: Conv1d + BiGRU</text>
+  <text x="455" y="906" fill="#546E7A" font-size="11">• Adapt: Linear + LN + CTC head</text>
+  <text x="455" y="924" fill="#546E7A" font-size="11">• <tspan font-weight="700">14,794 trainable params</tspan></text>
+  <text x="455" y="942" fill="#546E7A" font-size="11">• 30% source replay / 70% target</text>
+  <text x="455" y="960" fill="#546E7A" font-size="11">• 100 epochs max, patience 10</text>
+  <text x="455" y="978" fill="#546E7A" font-size="11">• New Kaiming-init read-in for target</text>
+
+  <!-- Bottom stats bar -->
+  <rect x="55" y="1005" width="750" height="52" rx="8" fill="#ECEFF1"/>
+  <text x="430" y="1026" text-anchor="middle" fill="#37474F" font-size="13" font-weight="700">Parameter Budget</text>
+  <text x="160" y="1046" text-anchor="middle" fill="#546E7A" font-size="11">Shared: ~146k</text>
+  <text x="340" y="1046" text-anchor="middle" fill="#546E7A" font-size="11">Per-patient: 13,376</text>
+  <text x="530" y="1046" text-anchor="middle" fill="#546E7A" font-size="11">Stage 2 trainable: 14,794</text>
+  <text x="720" y="1046" text-anchor="middle" fill="#546E7A" font-size="11">LOPO: 8 folds</text>
+
+  <!-- Evaluation -->
+  <rect x="55" y="1070" width="750" height="90" rx="8" fill="white" stroke="#E0E0E0" stroke-width="1"/>
+  <text x="430" y="1093" text-anchor="middle" fill="#333" font-size="13" font-weight="700">Evaluation</text>
+  <text x="70" y="1113" fill="#546E7A" font-size="11">Primary: PER (edit distance / 3, chance ≈ 0.89)   |   Secondary: balanced accuracy per position</text>
+  <text x="70" y="1131" fill="#546E7A" font-size="11">LOPO cross-validation (leave one patient out), 3 seeds (42, 137, 256)   |   Target: beat Spalding's 0.31</text>
+  <text x="70" y="1149" fill="#546E7A" font-size="11">Statistics: Wilcoxon signed-rank on per-patient PER (N=8 paired, p &lt; 0.05 requires ≥7/8 improve)</text>
+
+</svg>

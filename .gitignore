@@ -1,0 +1,36 @@
+# Data directories (large BIDS datasets)
+BIDS_1.0_*/
+*.fif
+*.edf
+*.mat
+*.pkl
+*.h5
+*.pt
+
+# Machine-specific config
+configs/paths.yaml
+
+# Results
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.venv/
+*.env
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Docs (PDFs generated from LaTeX)
+docs/*.pdf

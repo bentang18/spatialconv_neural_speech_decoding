@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 920" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow1" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+    </marker>
+    <filter id="shadow1" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="1" dy="2" stdDeviation="2" flood-opacity="0.1"/>
+    </filter>
+    <linearGradient id="headerGrad1" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#5C6BC0"/>
+      <stop offset="100%" style="stop-color:#3F51B5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="760" height="920" rx="12" fill="#FAFBFC"/>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="760" height="70" rx="12" fill="url(#headerGrad1)"/>
+  <rect x="0" y="40" width="760" height="30" fill="url(#headerGrad1)"/>
+  <text x="380" y="32" text-anchor="middle" fill="white" font-size="22" font-weight="600">Spalding 2025 — PCA + CCA + SVM Baseline</text>
+  <text x="380" y="56" text-anchor="middle" fill="rgba(255,255,255,0.8)" font-size="13">Current state-of-the-art for cross-patient uECOG phoneme decoding</text>
+
+  <!-- Color legend -->
+  <rect x="30" y="85" width="14" height="14" rx="3" fill="#90A4AE"/>
+  <text x="50" y="96" fill="#546E7A" font-size="11">Statistical (no learned params)</text>
+  <rect x="210" y="85" width="14" height="14" rx="3" fill="#4A90D9"/>
+  <text x="230" y="96" fill="#546E7A" font-size="11">Data / Input</text>
+  <rect x="370" y="85" width="14" height="14" rx="3" fill="#E57373"/>
+  <text x="390" y="96" fill="#546E7A" font-size="11">Classification</text>
+
+  <!-- ═══════════════ MAIN FLOW ═══════════════ -->
+
+  <!-- 1. HGA Input -->
+  <rect x="175" y="120" width="330" height="65" rx="10" fill="#4A90D9" filter="url(#shadow1)"/>
+  <text x="340" y="147" text-anchor="middle" fill="white" font-size="15" font-weight="600">HGA Features (.mat)</text>
+  <text x="340" y="168" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">trials × channels × time  (200 Hz)</text>
+
+  <!-- Annotation: input details -->
+  <rect x="530" y="120" width="200" height="65" rx="8" fill="#E8EAF6" stroke="#C5CAE9" stroke-width="1"/>
+  <text x="630" y="139" text-anchor="middle" fill="#3F51B5" font-size="10" font-weight="600">INPUT DATA</text>
+  <text x="630" y="154" text-anchor="middle" fill="#546E7A" font-size="10">Pre-extracted from MATLAB</text>
+  <text x="630" y="167" text-anchor="middle" fill="#546E7A" font-size="10">8 patients, 46–178 trials</text>
+  <text x="630" y="180" text-anchor="middle" fill="#546E7A" font-size="10">63–201 sig channels each</text>
+
+  <!-- Arrow 1→2 -->
+  <line x1="340" y1="185" x2="340" y2="215" stroke="#666" stroke-width="2" marker-end="url(#arrow1)"/>
+
+  <!-- 2. PCA 90% -->
+  <rect x="175" y="220" width="330" height="55" rx="10" fill="#90A4AE" filter="url(#shadow1)"/>
+  <text x="340" y="244" text-anchor="middle" fill="white" font-size="15" font-weight="600">PCA  (90% variance)</text>
+  <text x="340" y="262" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">Per-patient dimensionality reduction</text>
+
+  <!-- Annotation: PCA details -->
+  <rect x="530" y="225" width="200" height="42" rx="8" fill="#ECEFF1" stroke="#CFD8DC" stroke-width="1"/>
+  <text x="630" y="243" text-anchor="middle" fill="#546E7A" font-size="10">channels → ~20–50 PCs</text>
+  <text x="630" y="258" text-anchor="middle" fill="#546E7A" font-size="10">Fitted per-patient</text>
+
+  <!-- Arrow 2→3 -->
+  <line x1="340" y1="275" x2="340" y2="305" stroke="#666" stroke-width="2" marker-end="url(#arrow1)"/>
+
+  <!-- 3. CCA Alignment — THE KEY STEP -->
+  <rect x="145" y="310" width="390" height="80" rx="10" fill="#78909C" filter="url(#shadow1)" stroke="#546E7A" stroke-width="2"/>
+  <text x="340" y="337" text-anchor="middle" fill="white" font-size="16" font-weight="700">CCA Alignment</text>
+  <text x="340" y="358" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">Condition-averaged, pairwise</text>
+  <text x="340" y="375" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">Training fold only — cross-patient bridge</text>
+
+  <!-- Annotation: CCA details -->
+  <rect x="30" y="310" width="105" height="80" rx="8" fill="#FFF3E0" stroke="#FFE0B2" stroke-width="1"/>
+  <text x="82" y="332" text-anchor="middle" fill="#E65100" font-size="10" font-weight="600">KEY STEP</text>
+  <text x="82" y="348" text-anchor="middle" fill="#795548" font-size="10">Only cross-</text>
+  <text x="82" y="361" text-anchor="middle" fill="#795548" font-size="10">patient</text>
+  <text x="82" y="374" text-anchor="middle" fill="#795548" font-size="10">mechanism</text>
+
+  <!-- Arrow 3→4 -->
+  <line x1="340" y1="390" x2="340" y2="420" stroke="#666" stroke-width="2" marker-end="url(#arrow1)"/>
+
+  <!-- 4. PCA 80% -->
+  <rect x="175" y="425" width="330" height="55" rx="10" fill="#90A4AE" filter="url(#shadow1)"/>
+  <text x="340" y="449" text-anchor="middle" fill="white" font-size="15" font-weight="600">PCA  (80% variance)</text>
+  <text x="340" y="467" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">Further reduction in shared CCA space</text>
+
+  <!-- Arrow 4→5 -->
+  <line x1="340" y1="480" x2="340" y2="510" stroke="#666" stroke-width="2" marker-end="url(#arrow1)"/>
+
+  <!-- 5. Three SVMs (per position) -->
+  <rect x="80" y="515" width="520" height="85" rx="10" fill="none" stroke="#E57373" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="340" y="536" text-anchor="middle" fill="#C62828" font-size="11" font-weight="600">PER-POSITION CLASSIFICATION (×3)</text>
+
+  <rect x="100" y="545" width="140" height="45" rx="8" fill="#E57373" filter="url(#shadow1)"/>
+  <text x="170" y="567" text-anchor="middle" fill="white" font-size="13" font-weight="600">Bagged SVM</text>
+  <text x="170" y="582" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="11">Position 1</text>
+
+  <rect x="270" y="545" width="140" height="45" rx="8" fill="#E57373" filter="url(#shadow1)"/>
+  <text x="340" y="567" text-anchor="middle" fill="white" font-size="13" font-weight="600">Bagged SVM</text>
+  <text x="340" y="582" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="11">Position 2</text>
+
+  <rect x="440" y="545" width="140" height="45" rx="8" fill="#E57373" filter="url(#shadow1)"/>
+  <text x="510" y="567" text-anchor="middle" fill="white" font-size="13" font-weight="600">Bagged SVM</text>
+  <text x="510" y="582" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="11">Position 3</text>
+
+  <!-- Annotation: SVM details -->
+  <rect x="530" y="445" width="200" height="55" rx="8" fill="#FFEBEE" stroke="#FFCDD2" stroke-width="1"/>
+  <text x="630" y="463" text-anchor="middle" fill="#C62828" font-size="10" font-weight="600">CLASSIFIERS</text>
+  <text x="630" y="478" text-anchor="middle" fill="#546E7A" font-size="10">RBF kernel, bagged</text>
+  <text x="630" y="491" text-anchor="middle" fill="#546E7A" font-size="10">9-way per position</text>
+
+  <!-- Arrow 5→6 -->
+  <line x1="340" y1="600" x2="340" y2="630" stroke="#666" stroke-width="2" marker-end="url(#arrow1)"/>
+
+  <!-- 6. Output -->
+  <rect x="175" y="635" width="330" height="55" rx="10" fill="#66BB6A" filter="url(#shadow1)"/>
+  <text x="340" y="659" text-anchor="middle" fill="white" font-size="15" font-weight="600">Phoneme Predictions</text>
+  <text x="340" y="677" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">9-way classification × 3 positions</text>
+
+  <!-- ═══════════════ BOTTOM INFO BOX ═══════════════ -->
+
+  <rect x="40" y="720" width="680" height="175" rx="10" fill="white" stroke="#E0E0E0" stroke-width="1.5"/>
+
+  <!-- Evaluation -->
+  <text x="70" y="748" fill="#333" font-size="14" font-weight="700">Evaluation</text>
+  <text x="70" y="768" fill="#666" font-size="12">• 20-fold stratified CV × 50 iterations per patient</text>
+  <text x="70" y="786" fill="#666" font-size="12">• Balanced accuracy (primary metric): <tspan font-weight="700" fill="#C62828">0.31</tspan></text>
+  <text x="70" y="804" fill="#666" font-size="12">• Patient-specific SVM: ~0.24  |  Unaligned cross-patient: ~0.19</text>
+
+  <line x1="60" y1="818" x2="700" y2="818" stroke="#E0E0E0" stroke-width="1"/>
+
+  <!-- Limitations -->
+  <text x="70" y="840" fill="#333" font-size="14" font-weight="700">Limitations</text>
+  <text x="70" y="860" fill="#888" font-size="12">✗ No end-to-end training (PCA/CCA/SVM are independent stages)</text>
+  <text x="70" y="878" fill="#888" font-size="12">✗ CCA alignment is pairwise, condition-averaged — cannot learn complex mappings</text>
+  <text x="70" y="896" fill="#888" font-size="12">✗ Per-position SVM ignores temporal/sequential structure (no CTC)</text>
+
+</svg>
