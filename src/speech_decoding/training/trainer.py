@@ -127,40 +127,56 @@ def _train_fold(
     patience_counter = 0
     best_state = None
 
+    B = tc["batch_size"]
+    n_train = len(train_x)
+    all_params = (
+        list(backbone.parameters()) + list(head.parameters())
+        + list(readin.parameters())
+    )
+
     for epoch in range(tc["epochs"]):
-        # --- Train ---
+        # --- Train (full epoch: iterate over all training data) ---
         backbone.train()
         head.train()
         readin.train()
 
-        # Sample batch (or use all if small enough)
-        B = min(tc["batch_size"], len(train_x))
-        perm = torch.randperm(len(train_x))[:B]
-        x_batch = train_x[perm]
-        y_batch = [train_y[i] for i in perm]
+        perm = torch.randperm(n_train)
+        epoch_loss = 0.0
+        n_batches = 0
 
-        # Augment
-        x_batch = augment_batch(
-            x_batch,
-            training=True,
-            time_shift_frames=ac["time_shift_frames"],
-            amp_scale_std=ac["amp_scale_std"],
-            channel_dropout_max=ac["channel_dropout_max"],
-            noise_frac=ac["noise_frac"],
-        )
+        for start in range(0, n_train, B):
+            idx = perm[start : start + B]
+            x_batch = train_x[idx]
+            y_batch = [train_y[i] for i in idx.tolist()]
 
-        optimizer.zero_grad()
-        shared = readin(x_batch)
-        h = backbone(shared)
-        log_probs = head(h)
-        loss = ctc_loss(log_probs, y_batch)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(backbone.parameters()) + list(head.parameters()) + list(readin.parameters()),
-            tc["grad_clip"],
-        )
-        optimizer.step()
+            x_batch = augment_batch(
+                x_batch,
+                training=True,
+                time_shift_frames=ac["time_shift_frames"],
+                amp_scale_std=ac["amp_scale_std"],
+                channel_dropout_max=ac["channel_dropout_max"],
+                noise_frac=ac["noise_frac"],
+                do_spatial_cutout=ac.get("spatial_cutout", False),
+                spatial_cutout_max_h=ac.get("spatial_cutout_max_h", 3),
+                spatial_cutout_max_w=ac.get("spatial_cutout_max_w", 6),
+                do_temporal_stretch=ac.get("temporal_stretch", False),
+                temporal_stretch_max_rate=ac.get("temporal_stretch_max_rate", 0.15),
+            )
+
+            optimizer.zero_grad()
+            shared = readin(x_batch)
+            h = backbone(shared)
+            log_probs = head(h)
+            loss = ctc_loss(log_probs, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(all_params, tc["grad_clip"])
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
         scheduler.step()
+        avg_train_loss = epoch_loss / max(n_batches, 1)
 
         # --- Validate ---
         if (epoch + 1) % tc["eval_every"] == 0:
@@ -172,6 +188,12 @@ def _train_fold(
                 h = backbone(shared)
                 log_probs = head(h)
                 val_loss = ctc_loss(log_probs, val_y).item()
+                br = blank_ratio(log_probs)
+
+            logger.info(
+                "  epoch %d: train_loss=%.4f val_loss=%.4f blank=%.0f%%",
+                epoch + 1, avg_train_loss, val_loss, br * 100,
+            )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss

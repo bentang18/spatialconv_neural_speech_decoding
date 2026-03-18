@@ -29,13 +29,17 @@ def assemble_model(
     """
     mc = config["model"]
 
-    # Backbone
+    # Backbone — pass augmentation params if available
+    ac = config.get("training", {}).get("augmentation", {})
     backbone = SharedBackbone(
         D=mc["d_shared"],
         H=mc["hidden_size"],
         temporal_stride=mc["temporal_stride"],
         gru_layers=mc["gru_layers"],
         gru_dropout=mc["gru_dropout"],
+        feat_drop_max=ac.get("feat_dropout_max", 0.3),
+        time_mask_min=ac.get("time_mask_min", 2),
+        time_mask_max=ac.get("time_mask_max", 4),
     )
 
     # Head

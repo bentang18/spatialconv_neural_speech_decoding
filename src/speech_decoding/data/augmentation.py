@@ -70,6 +70,55 @@ def gaussian_noise(x: torch.Tensor, frac: float = 0.02) -> torch.Tensor:
     return x + torch.randn_like(x) * noise_std
 
 
+def temporal_stretch(
+    x: torch.Tensor, max_rate: float = 0.15,
+) -> torch.Tensor:
+    """Random per-trial temporal stretch/compress by factor in [1-max_rate, 1+max_rate].
+
+    Simulates speaking rate variation across trials and patients.
+    Uses linear interpolation, output length matches input length (padded/cropped).
+    """
+    if max_rate == 0.0:
+        return x
+    B, H, W, T = x.shape
+    out = torch.zeros_like(x)
+    for i in range(B):
+        rate = 1.0 + (torch.rand(1).item() * 2 - 1) * max_rate  # U[1-max, 1+max]
+        new_T = int(round(T * rate))
+        if new_T < 2:
+            out[i] = x[i]
+            continue
+        # (H, W, T) → (H*W, 1, T) for interpolate, then reshape back
+        flat = x[i].reshape(-1, 1, T)  # (H*W, 1, T)
+        stretched = torch.nn.functional.interpolate(
+            flat, size=new_T, mode="linear", align_corners=False,
+        )  # (H*W, 1, new_T)
+        # Crop or pad to original T
+        if new_T >= T:
+            out[i] = stretched[:, 0, :T].reshape(H, W, T)
+        else:
+            out[i, :, :, :new_T] = stretched[:, 0, :].reshape(H, W, new_T)
+    return out
+
+
+def spatial_cutout(
+    x: torch.Tensor, max_h: int = 3, max_w: int = 6,
+) -> torch.Tensor:
+    """Zero a random rectangular patch on the spatial grid per trial.
+
+    Simulates localized signal loss and regularizes Conv2d spatial filters.
+    """
+    B, H, W, T = x.shape
+    cut_h = torch.randint(1, max_h + 1, (1,)).item()
+    cut_w = torch.randint(1, max_w + 1, (1,)).item()
+    x = x.clone()
+    for i in range(B):
+        r = torch.randint(0, max(H - cut_h, 1), (1,)).item()
+        c = torch.randint(0, max(W - cut_w, 1), (1,)).item()
+        x[i, r:r + cut_h, c:c + cut_w, :] = 0.0
+    return x
+
+
 def augment_batch(
     x: torch.Tensor,
     training: bool = True,
@@ -77,6 +126,11 @@ def augment_batch(
     amp_scale_std: float = 0.15,
     channel_dropout_max: float = 0.2,
     noise_frac: float = 0.02,
+    do_spatial_cutout: bool = False,
+    spatial_cutout_max_h: int = 3,
+    spatial_cutout_max_w: int = 6,
+    do_temporal_stretch: bool = False,
+    temporal_stretch_max_rate: float = 0.15,
 ) -> torch.Tensor:
     """Apply all pre-read-in augmentations.
 
@@ -87,7 +141,11 @@ def augment_batch(
     if not training:
         return x
     x = time_shift(x, max_frames=time_shift_frames)
+    if do_temporal_stretch:
+        x = temporal_stretch(x, max_rate=temporal_stretch_max_rate)
     x = amplitude_scale(x, std=amp_scale_std)
     x = channel_dropout(x, max_p=channel_dropout_max)
+    if do_spatial_cutout:
+        x = spatial_cutout(x, max_h=spatial_cutout_max_h, max_w=spatial_cutout_max_w)
     x = gaussian_noise(x, frac=noise_frac)
     return x

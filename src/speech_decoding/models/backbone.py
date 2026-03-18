@@ -34,12 +34,13 @@ class SharedBackbone(nn.Module):
         self.time_mask_min = time_mask_min
         self.time_mask_max = time_mask_max
 
+        # Conv1d projects D (read-in dim) → H (GRU input dim), allowing D != H
         self.temporal_conv = nn.Sequential(
-            nn.Conv1d(D, D, kernel_size=temporal_stride, stride=temporal_stride),
+            nn.Conv1d(D, H, kernel_size=temporal_stride, stride=temporal_stride),
             nn.GELU(),
         )
         self.gru = nn.GRU(
-            D, H, num_layers=gru_layers, batch_first=True,
+            H, H, num_layers=gru_layers, batch_first=True,
             bidirectional=True, dropout=gru_dropout if gru_layers > 1 else 0.0,
         )
 
