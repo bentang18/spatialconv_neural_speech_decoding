@@ -13,6 +13,7 @@ Extending Spalding 2025 (PCA+CCA alignment, SVM/Seq2Seq, 8 patients, 9 phonemes,
 
 ## Key Files
 
+### Documentation
 - `docs/implementation_plan.md` — Two-stage implementation plan: Phase 2 = field standard, Phase 3 = two architectural innovations (v9)
 - `docs/pipeline_decisions.md` — ~40 design decisions with tensions/tradeoffs
 - `docs/research_synthesis.md` — 18-paper synthesis: landscape, gaps, ranked directions (16 archived)
@@ -22,15 +23,53 @@ Extending Spalding 2025 (PCA+CCA alignment, SVM/Seq2Seq, 8 patients, 9 phonemes,
 - `pastwork/summaries/` — 18 active summaries (16 in `pastwork/archive/summaries/`)
 - `pastwork/verification_results.md` — All 19 errors across 8 summaries corrected
 
+### Configs
+- `configs/default.yaml` — E2 full model (spatial conv + articulatory CTC)
+- `configs/field_standard.yaml` — E1 field standard (linear + flat CTC)
+- `configs/paths.yaml` — Machine-specific BIDS paths (gitignored)
+
 ## Code Structure
 
 ```
 src/speech_decoding/
-├── data/      (phoneme_map, grid, bids_dataset, augmentation, collate)
-├── models/    (spatial_conv, linear_readin, backbone, articulatory_head, flat_head, assembler)
-├── training/  (trainer, ctc_utils)
-└── evaluation/ (metrics)
+├── data/
+│   ├── phoneme_map.py      # 9 PS phonemes, PS2ARPA normalization, CTC encoding, articulatory matrix (9×15)
+│   ├── grid.py             # Electrode TSV → grid shape + channel-to-grid mapping (handles 8×16, 12×22, 8×32, 8×34)
+│   ├── bids_dataset.py     # Load .fif epochs → position-1 extraction → grid reshape → BIDSDataset
+│   ├── augmentation.py     # Pre-read-in: time shift, amplitude scale, channel dropout, Gaussian noise
+│   └── collate.py          # Group samples by patient_id for multi-grid batching
+├── models/
+│   ├── spatial_conv.py     # Per-patient Conv2d read-in: (B,H,W,T)→(B,64,T), 80 params default
+│   ├── linear_readin.py    # Per-patient Linear read-in: (B,D_padded,T)→(B,64,T), ~13k params
+│   ├── backbone.py         # LayerNorm → Conv1d(k=5,s=5) → BiGRU(64,64,2L) with feat dropout + time mask
+│   ├── articulatory_head.py # 6 feature heads → fixed A matrix → 9 phonemes + blank, 2,064 params
+│   ├── flat_head.py        # Linear(128,10) → log_softmax, 1,290 params
+│   └── assembler.py        # YAML config → (backbone, head, {patient_id: read_in})
+├── training/
+│   ├── ctc_utils.py        # CTC loss (T,B,C transpose), greedy decode, PER, blank ratio
+│   └── trainer.py          # Per-patient training: stratified K-fold CV, AdamW + CosineAnnealingLR, early stopping
+└── evaluation/
+    └── metrics.py          # PER, per-position balanced accuracy, CTC length accuracy
 ```
+
+### Scripts
+- `scripts/train_per_patient.py` — CLI for per-patient training on all PS patients × seeds
+
+### Tests (110 total: 100 fast + 10 slow)
+```
+tests/
+├── test_phoneme_map.py     # 23 tests: label normalization, CTC encoding, articulatory matrix
+├── test_grid.py            # 10 tests: grid inference from TSV, dead positions, reshape (2 slow)
+├── test_bids_dataset.py    # 9 tests: dataset interface, real .fif loading (6 slow)
+├── test_augmentation.py    # 14 tests: all augmentation ops
+├── test_collate.py         # 4 tests: multi-patient grouping
+├── test_models.py          # 24 tests: all model components + assembler
+├── test_ctc_utils.py       # 13 tests: CTC loss, decode, PER, blank ratio
+├── test_trainer.py         # 6 tests: metrics + per-patient trainer on synthetic data
+└── test_integration.py     # 7 tests: end-to-end forward/backward/overfit + real S14 (2 slow)
+```
+
+Run: `pytest tests/ -v -m "not slow"` (fast, no data needed) or `pytest tests/ -v` (all, needs BIDS data)
 
 ## Data
 
@@ -42,31 +81,59 @@ Per-phoneme epochs locked to response onset, window [-1.0, 1.5s].
 - 12 usable patients (S18 excluded — no preprocessed): S14, S16, S22, S23, S26, S32, S33, S36, S39, S57, S58, S62
 - 8 are Spalding's published set: S14, S22, S23, S26, S33, S39, S58, S62
 - 3 phonemes/trial (CVC/VCV), 9 phonemes, 52 tokens
-- Mixed label notation: ARPAbet (AA1, EH1, IY0, B...) + lowercase (a, ae, i...) — normalize in phoneme_map.py
+- PS labels use lowercase notation (`event_id`: `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k':6, 'p':7, 'u':8, 'v':9}`) — `phoneme_map.normalize_label()` handles conversion
 
 **Lexical (secondary)**: `BIDS_1.0_Lexical_µECoG/.../derivatives/epoch(phonemeLevel)(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-lexical_desc-productionZscore_highgamma.fif`
 - 13 usable patients: S41, S45, S47, S51, S53, S55, S56, S63, S67, S73, S74, S75, S76
-- 5 phonemes/trial, 32 phonemes (full ARPABET), filter to 9 PS phonemes for cross-task
+- 5 phonemes/trial, 28 phonemes (ARPABET without stress), e.g. `{'AA':1, 'AE':2, ..., 'Z':28}`
+- **Cross-task filtering yields 0 trials** — no 5-phoneme English word uses only PS phonemes. Cross-task pooling requires per-position approach (future work)
 
-### Grid Layouts
-- 128ch → 8×16 = 128 (no dead positions)
-- 256ch → 12×22 = 264 positions, 256 channels → 8 dead positions (zero in Conv2d)
-- Electrode TSV coords are normalized grid positions (0–1), NOT brain MNI coordinates
+### Grid Layouts (confirmed from electrode TSV inspection)
+Grid shape is inferred from electrode coordinate TSVs, NOT channel count — multiple layouts exist for 256ch:
+
+| Channels | Grid | Dead positions | Patients |
+|----------|------|----------------|----------|
+| 128 | 8×16 = 128 | 0–1 (S14 ch 105 has n/a coords) | S14, S16, S22, S23, S26, S36, S45, S47, S51, S53 |
+| 256 | 12×22 = 264 | 8 (corners of top/bottom row) | S32, S33, S39, S58, S62, S41, S56, S67, S75 |
+| 256 | 8×32 = 256 | 0–1 | S55, S63, S73, S74, S76 |
+| 256 | 8×34 = 272 | 16 | S57 |
+
+- Electrode TSV coords are normalized grid positions (0–1, z=0), NOT brain MNI coordinates
+- TSV files have BOM (`\ufeff`) — `grid.py` opens with `encoding="utf-8-sig"`
+- Dead positions zeroed in Conv2d input; `grid.load_grid_mapping()` returns `GridInfo` with `dead_mask`
 
 ### Loading Pattern
 ```python
+# Via our loader (recommended):
+from speech_decoding.data.bids_dataset import load_patient_data
+ds = load_patient_data("S14", bids_root, task="PhonemeSequence", n_phons=3, tmin=-0.5, tmax=1.0)
+# ds[i] → (grid_data[H,W,T], ctc_label[list[int]], patient_id)
+
+# Raw MNE (reference):
 epochs = mne.read_epochs(fif_path, preload=True, verbose=False)
 data = epochs.get_data()        # (n_epochs, n_channels, n_times)
-events = epochs.events[:, 2]    # event IDs
-event_id = epochs.event_id      # {'label': int_id}
-# Per-phoneme: 148 trials × 3 = 444 epochs interleaved [p1_t1, p2_t1, p3_t1, ...]
-# Use phonemeIdx=1 (every 3rd) for CTC — window captures full utterance
+# Per-phoneme: 153 trials × 3 = 459 epochs (S14) interleaved [p1_t1, p2_t1, p3_t1, ...]
+# Position-1 extraction: data[0::3] gives trial-level epochs containing full utterance
 ```
 
-### Zac's Reusable Constants (from code/decoding/decode_bids_crossPatientTask_phonemes.py)
-- `PS_PTS = ['S14','S22','S23','S26','S33','S39','S58','S62']`
-- `PS2ARPA = {'a':'AA', 'ae':'EH', 'i':'IY', 'u':'UH', 'b':'B', 'p':'P', 'v':'V', 'g':'G', 'k':'K'}`
-- `TARGET_EVENT_ID` — 28-phoneme ARPABET→int mapping
+### Zac's Codebase (reference only — our code replaces the decoding pipeline)
+Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
+- `decode_bids_crossPatientTask_phonemes.py` — source of `PS_PTS`, `PS2ARPA`, `TARGET_EVENT_ID` constants
+- `PhonemeDatasetBIDS.py` — reference for .fif loading pattern (adapted into `bids_dataset.py`)
+- `cross_pt_decoders.py`, `AlignCCA.py` — PCA+CCA pipeline we replace with Conv2d+CTC
+
+## Implementation Status
+
+### Complete (Sprints 0–4)
+- **Sprint 0**: Project setup (uv, Python 3.11 venv, git, pyproject.toml, directory reorganization)
+- **Sprint 1**: Data foundation — phoneme mapping, grid inference, BIDS loading, augmentation, collation
+- **Sprint 2**: Model components — both E1 (Linear+Flat) and E2 (SpatialConv+Articulatory) architectures
+- **Sprint 3**: Per-patient training — CTC utils, stratified CV trainer, evaluation metrics
+- **Sprint 4**: Integration tests — synthetic overfit, real S14 forward pass + quick train
+
+### Next (not yet implemented)
+- **Sprint 5**: Cross-patient LOPO — multi-patient Stage 1 (gradient accumulation, held-out validation, differential LR), Stage 2 target adaptation (freeze backbone, source replay), LOPO orchestrator with Wilcoxon statistics
+- **Sprint 6**: Cross-task pooling — Lexical patients as additional Stage 1 sources (requires per-position phoneme filtering, not per-trial)
 
 ## Established Findings (from literature review)
 
@@ -79,9 +146,9 @@ Field consensus: per-patient input layer → shared backbone (GRU) → CTC loss.
 
 **Downgraded to exploratory (in `future_directions.md`):** Reptile, SupCon, and DRO. Per-patient layers already provide cross-patient transfer (Singh-style). DRO upweights patients hard for practical reasons (few trials, poor signal), not neural coding differences — noisy with N=7.
 
-### Parameter budget (verified 2026-03-14, updated v9 2026-03-17)
+### Parameter budget (verified 2026-03-14, updated v9 2026-03-17, grid shapes confirmed 2026-03-17)
 - **Data confirmed from Spalding Tables S1/S3:** Trials 46–178/patient (S3=46 outlier), sig channels 63–201, frames 9.2k–35.6k/pt → **small regime locked**
-- Per-patient input: Conv2d(1,8,k=3,pad=1), default 1-layer = **80 params** (167× fewer than Linear), configurable to 2-layer = 664 params. AdaptiveAvgPool2d(2,4) handles different grid sizes. Coarse pooling preferred — 15–25mm placement offsets cause finer pool cells to map to different cortex across patients. **Derivable from physics:** per-patient, Conv2d, coarse pool. **Empirical:** num_layers (1 vs 2), C (4 vs 8), pool dims — swept in E13. **Grid shape note:** 12×22=264 positions but arrays labeled "256ch" — 8 positions unaccounted for (dead corners or reference electrodes); Conv2d needs exact grid dims with dead positions zeroed
+- Per-patient input: Conv2d(1,8,k=3,pad=1), default 1-layer = **80 params** (167× fewer than Linear), configurable to 2-layer = 664 params. AdaptiveAvgPool2d(2,4) handles different grid sizes. Coarse pooling preferred — 15–25mm placement offsets cause finer pool cells to map to different cortex across patients. **Derivable from physics:** per-patient, Conv2d, coarse pool. **Empirical:** num_layers (1 vs 2), C (4 vs 8), pool dims — swept in E13. **Grid shapes confirmed from electrode TSVs:** 12×22 (8 dead corners), 8×32 (no dead), 8×34 (S57, 16 dead). Shape must be inferred from TSV, not channel count. S14 ch 105 has n/a coords (bad electrode). All handled by `grid.load_grid_mapping()`
 - Shared backbone: BiGRU 2×64, ~147k shared params (Conv1d 20.5k + GRU 124k + articulatory head 2k). Temporal downsampling configurable: default k=5 s=5 (40Hz), validated alternative k=10 s=10 (20Hz, Spalding's rate)
 - CTC head: 6 articulatory feature heads → fixed composition matrix → 9 phoneme logits + blank. 2,064 params (vs 1,290 flat). Blank bias initialized +2.0 (compensates scale mismatch with composed logits)
 - Two-stage LOPO: Stage 1 = standard multi-patient SGD with **held-out 20% source validation** for early stopping; Stage 2 freezes Conv1d+BiGRU, adapts spatial conv+LayerNorm+articulatory head (~2,272 trainable params at default config). **Stage 2 uses stratified 5-fold CV** on target patient (StratifiedKFold on phoneme labels)
