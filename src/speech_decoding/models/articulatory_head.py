@@ -22,7 +22,7 @@ class ArticulatoryCTCHead(nn.Module):
     Output: (B, T, 10) log probabilities (blank + 9 phonemes)
     """
 
-    def __init__(self, input_dim: int = 128):
+    def __init__(self, input_dim: int = 128, blank_bias: float = 2.0):
         super().__init__()
         # 6 articulatory feature heads
         self.cv_head = nn.Linear(input_dim, 2)       # consonant, vowel
@@ -34,9 +34,11 @@ class ArticulatoryCTCHead(nn.Module):
 
         # CTC blank head (separate)
         self.blank_head = nn.Linear(input_dim, 1)
-        # Blank bias +2.0: phoneme logits are SUMS of 3-4 sub-head outputs,
+        # Blank bias: phoneme logits are SUMS of 3-4 sub-head outputs,
         # giving them ~sqrt(3-4)x larger std than blank at Kaiming init.
-        nn.init.constant_(self.blank_head.bias, 2.0)
+        # +2.0 for LOPO (enough gradient signal to overcome), lower for
+        # per-patient (small data can't escape blank collapse at +2.0).
+        nn.init.constant_(self.blank_head.bias, blank_bias)
 
         # Fixed composition matrix: A[i,j] = 1 iff phoneme i has feature j
         # Phoneme order: AA, EH, IY, UH, B, P, V, G, K (ARPA_PHONEMES)

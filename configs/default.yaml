@@ -10,6 +10,7 @@ model:
   gru_dropout: 0.2
   temporal_stride: 5  # 200Hz → 40Hz
   num_classes: 10  # 9 phonemes + blank
+  blank_bias: 2.0
 
   spatial_conv:
     channels: 8
@@ -20,22 +21,50 @@ model:
 
 training:
   stage1:
-    epochs: 200
+    steps: 2000
     lr: 1.0e-3
+    warmup_epochs: 20
     readin_lr_mult: 3.0
     weight_decay: 1.0e-4
     batch_size: 16
     grad_clip: 5.0
-    patience: 5  # × eval_every = 50 epochs
-    eval_every: 10
+    patience: 5    # × eval_every = 500 steps without improvement
+    eval_every: 100
     val_fraction: 0.2
+    augmentation:
+      time_shift_frames: 20
+      amp_scale_std: 0.15
+      channel_dropout_max: 0.2
+      noise_frac: 0.02
+      feat_dropout_max: 0.3
+      time_mask_min: 2
+      time_mask_max: 4
+      spatial_cutout: false
+      temporal_stretch: false
 
   stage2:
-    epochs: 100
+    steps: 100
     lr: 1.0e-3
+    warmup_epochs: 0
+    readin_lr_mult: 3.0
     weight_decay: 1.0e-3
+    batch_size: 16
+    grad_clip: 5.0
     source_replay_frac: 0.3
     patience: 10
+    eval_every: 1
+    cv_folds: 5
+    val_fraction: 0.2
+    augmentation:
+      time_shift_frames: 10
+      amp_scale_std: 0.1
+      channel_dropout_max: 0.1
+      noise_frac: 0.02
+      feat_dropout_max: 0.2
+      time_mask_min: 2
+      time_mask_max: 4
+      spatial_cutout: false
+      temporal_stretch: false
 
   augmentation:
     time_shift_frames: 20  # ±100ms at 200Hz

@@ -27,6 +27,7 @@ def _full_config(readin="spatial_conv", head="articulatory"):
             "gru_dropout": 0.2,
             "temporal_stride": 5,
             "num_classes": 10,
+            "blank_bias": 2.0,
             "spatial_conv": {
                 "channels": 8, "num_layers": 1,
                 "kernel_size": 3, "pool_h": 2, "pool_w": 4,

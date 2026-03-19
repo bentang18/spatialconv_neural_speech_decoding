@@ -27,6 +27,7 @@ class SharedBackbone(nn.Module):
         feat_drop_max: float = 0.3,
         time_mask_min: int = 2,
         time_mask_max: int = 4,
+        gru_input_dim: int | None = None,
     ):
         super().__init__()
         self.layernorm = nn.LayerNorm(D)
@@ -34,13 +35,16 @@ class SharedBackbone(nn.Module):
         self.time_mask_min = time_mask_min
         self.time_mask_max = time_mask_max
 
-        # Conv1d projects D (read-in dim) → H (GRU input dim), allowing D != H
+        # Conv1d projects D → gru_input_dim for temporal downsampling.
+        # gru_input_dim defaults to H for backward compatibility, but can be
+        # set independently to decouple temporal projection width from GRU size.
+        gi = gru_input_dim if gru_input_dim is not None else H
         self.temporal_conv = nn.Sequential(
-            nn.Conv1d(D, H, kernel_size=temporal_stride, stride=temporal_stride),
+            nn.Conv1d(D, gi, kernel_size=temporal_stride, stride=temporal_stride),
             nn.GELU(),
         )
         self.gru = nn.GRU(
-            H, H, num_layers=gru_layers, batch_first=True,
+            gi, H, num_layers=gru_layers, batch_first=True,
             bidirectional=True, dropout=gru_dropout if gru_layers > 1 else 0.0,
         )
 

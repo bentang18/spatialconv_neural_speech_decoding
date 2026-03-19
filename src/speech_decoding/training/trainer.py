@@ -6,23 +6,29 @@ Stratified 5-fold CV on the patient's trials. Used for Sprint 3
 from __future__ import annotations
 
 import logging
+import math
 from copy import deepcopy
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.model_selection import StratifiedKFold
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 
-from speech_decoding.data.augmentation import augment_batch
+from speech_decoding.data.augmentation import augment_from_config
 from speech_decoding.data.bids_dataset import BIDSDataset
 from speech_decoding.evaluation.metrics import evaluate_predictions
 from speech_decoding.models.assembler import assemble_model
 from speech_decoding.training.ctc_utils import (
     blank_ratio,
+    ce_pooled_decode,
+    ce_pooled_loss,
     ctc_loss,
     greedy_decode,
+    per_position_ce_decode,
+    per_position_ce_loss,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,12 +101,36 @@ def _train_fold(
 ) -> dict:
     """Train one CV fold."""
     tc = config["training"]["stage1"]
-    ac = config["training"]["augmentation"]
+    ac = config["training"].get(
+        "augmentation",
+        config["training"].get("stage1", {}).get("augmentation", {}),
+    )
+    loss_type = config["training"].get("loss_type", "ctc")
+    n_segments = config["training"].get("ce_segments", 3)
 
     # Build model
     patients = {dataset.patient_id: dataset.grid_shape}
     backbone, head, readins = assemble_model(config, patients)
     readin = readins[dataset.patient_id]
+
+    # For CE mode, replace head with a raw linear projecting to
+    # n_positions * n_phonemes logits (3 independent 9-class classifiers
+    # applied to globally pooled backbone output — matches Zac's per-position SVM)
+    if loss_type == "ce":
+        input_dim = config["model"]["hidden_size"] * 2  # bidirectional
+        n_phonemes = config["model"]["num_classes"] - 1  # exclude blank
+        head = nn.Linear(input_dim, n_segments * n_phonemes)
+    elif loss_type == "ce_attn":
+        from speech_decoding.models.ce_position_head import CEPositionHead
+
+        input_dim = config["model"]["hidden_size"] * 2
+        n_phonemes = config["model"]["num_classes"] - 1
+        head = CEPositionHead(input_dim, n_positions=n_segments, n_phonemes=n_phonemes)
+    elif loss_type == "ce_perpos":
+        # Per-position epochs: each sample is a single phoneme, 9-way CE
+        input_dim = config["model"]["hidden_size"] * 2
+        n_phonemes = config["model"]["num_classes"] - 1
+        head = nn.Linear(input_dim, n_phonemes)
 
     backbone = backbone.to(device)
     head = head.to(device)
@@ -115,12 +145,21 @@ def _train_fold(
         ],
         weight_decay=tc["weight_decay"],
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=tc["epochs"])
+    warmup_epochs = tc.get("warmup_epochs", 0)
+    total_epochs = tc.get("epochs", tc.get("steps", 0))
 
-    # Split data
-    train_x = torch.from_numpy(dataset.grid_data[train_idx]).to(device)
+    def lr_lambda(epoch: int) -> float:
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs  # linear ramp from ~0 to 1
+        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))  # cosine decay
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
+    # Split data — keep on CPU for augmentation, move to device in forward pass
+    train_x = torch.from_numpy(dataset.grid_data[train_idx])
     train_y = [dataset.ctc_labels[i] for i in train_idx]
-    val_x = torch.from_numpy(dataset.grid_data[val_idx]).to(device)
+    val_x = torch.from_numpy(dataset.grid_data[val_idx])
     val_y = [dataset.ctc_labels[i] for i in val_idx]
 
     best_val_loss = float("inf")
@@ -149,25 +188,27 @@ def _train_fold(
             x_batch = train_x[idx]
             y_batch = [train_y[i] for i in idx.tolist()]
 
-            x_batch = augment_batch(
-                x_batch,
-                training=True,
-                time_shift_frames=ac["time_shift_frames"],
-                amp_scale_std=ac["amp_scale_std"],
-                channel_dropout_max=ac["channel_dropout_max"],
-                noise_frac=ac["noise_frac"],
-                do_spatial_cutout=ac.get("spatial_cutout", False),
-                spatial_cutout_max_h=ac.get("spatial_cutout_max_h", 3),
-                spatial_cutout_max_w=ac.get("spatial_cutout_max_w", 6),
-                do_temporal_stretch=ac.get("temporal_stretch", False),
-                temporal_stretch_max_rate=ac.get("temporal_stretch_max_rate", 0.15),
-            )
+            # Augment on CPU (avoids MPS↔CPU sync stalls from per-trial loops)
+            x_batch = augment_from_config(x_batch, ac, training=True)
+            x_batch = x_batch.to(device)
 
             optimizer.zero_grad()
             shared = readin(x_batch)
             h = backbone(shared)
-            log_probs = head(h)
-            loss = ctc_loss(log_probs, y_batch)
+            out = head(h)
+            if loss_type == "ce":
+                loss = per_position_ce_loss(out, y_batch, n_segments)
+            elif loss_type == "ce_attn":
+                loss = ce_pooled_loss(out, y_batch, n_segments)
+            elif loss_type == "ce_perpos":
+                # out: (B, T, 9), single-phoneme labels [[k], ...]
+                pooled = out.mean(dim=1)  # (B, 9)
+                tgt = torch.tensor(
+                    [y[0] - 1 for y in y_batch], dtype=torch.long, device=device
+                )
+                loss = F.cross_entropy(pooled, tgt)
+            else:
+                loss = ctc_loss(out, y_batch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(all_params, tc["grad_clip"])
             optimizer.step()
@@ -184,11 +225,26 @@ def _train_fold(
             head.eval()
             readin.eval()
             with torch.no_grad():
-                shared = readin(val_x)
+                val_x_dev = val_x.to(device)
+                shared = readin(val_x_dev)
                 h = backbone(shared)
-                log_probs = head(h)
-                val_loss = ctc_loss(log_probs, val_y).item()
-                br = blank_ratio(log_probs)
+                out = head(h)
+                if loss_type == "ce":
+                    val_loss = per_position_ce_loss(out, val_y, n_segments).item()
+                    br = 0.0
+                elif loss_type == "ce_attn":
+                    val_loss = ce_pooled_loss(out, val_y, n_segments).item()
+                    br = 0.0
+                elif loss_type == "ce_perpos":
+                    pooled = out.mean(dim=1)
+                    tgt = torch.tensor(
+                        [y[0] - 1 for y in val_y], dtype=torch.long, device=device
+                    )
+                    val_loss = F.cross_entropy(pooled, tgt).item()
+                    br = 0.0
+                else:
+                    val_loss = ctc_loss(out, val_y).item()
+                    br = blank_ratio(out)
 
             logger.info(
                 "  epoch %d: train_loss=%.4f val_loss=%.4f blank=%.0f%%",
@@ -221,12 +277,26 @@ def _train_fold(
     head.eval()
     readin.eval()
     with torch.no_grad():
-        shared = readin(val_x)
+        val_x_dev = val_x.to(device)
+        shared = readin(val_x_dev)
         h = backbone(shared)
-        log_probs = head(h)
-        predictions = greedy_decode(log_probs)
-        br = blank_ratio(log_probs)
+        out = head(h)
+        if loss_type == "ce":
+            predictions = per_position_ce_decode(out, n_segments)
+            br = 0.0
+        elif loss_type == "ce_attn":
+            predictions = ce_pooled_decode(out, n_segments)
+            br = 0.0
+        elif loss_type == "ce_perpos":
+            # Single-phoneme predictions: argmax of mean-pooled logits
+            pooled = out.mean(dim=1)  # (B, 9)
+            predictions = [[p.item() + 1] for p in pooled.argmax(dim=-1)]
+            br = 0.0
+        else:
+            predictions = greedy_decode(out)
+            br = blank_ratio(out)
 
-    metrics = evaluate_predictions(predictions, val_y, n_positions=3)
+    eval_n_positions = 1 if loss_type == "ce_perpos" else 3
+    metrics = evaluate_predictions(predictions, val_y, n_positions=eval_n_positions)
     metrics["blank_ratio"] = br
     return metrics

@@ -1,0 +1,57 @@
+# CE + wider Conv1d output: less spatial compression
+# Conv2d(1,8,k=3) → pool(4,8) → d_shared=256
+# Conv1d(256,128,k=10,s=10) = 328K params — 2× less compression than d→64
+# BiGRU(128,64,2L) — GRU stays at H=64 but sees 128-dim temporal features
+experiment: per_patient_ce_conv1d128
+
+model:
+  readin_type: spatial_conv
+  head_type: flat
+  d_shared: 256               # C(8) * pool_h(4) * pool_w(8) = 256
+  hidden_size: 64              # GRU hidden stays at 64 → output 128-dim
+  gru_input_dim: 128           # Conv1d output: 256→128 (not 256→64)
+  gru_layers: 2
+  gru_dropout: 0.3
+  temporal_stride: 10
+  num_classes: 10
+  blank_bias: 0.0
+
+  spatial_conv:
+    channels: 8
+    num_layers: 1
+    kernel_size: 3
+    pool_h: 4
+    pool_w: 8
+
+training:
+  loss_type: ce
+  ce_segments: 3
+
+  stage1:
+    epochs: 300
+    lr: 1.0e-3
+    warmup_epochs: 20
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-4
+    batch_size: 16
+    grad_clip: 5.0
+    patience: 7
+    eval_every: 10
+    val_fraction: 0.2
+
+  augmentation:
+    time_shift_frames: 30
+    amp_scale_std: 0.3
+    channel_dropout_max: 0.2
+    noise_frac: 0.05
+    feat_dropout_max: 0.3
+    time_mask_min: 2
+    time_mask_max: 5
+    spatial_cutout: false
+    temporal_stretch: true
+    temporal_stretch_max_rate: 0.15
+
+evaluation:
+  seeds: [42, 137, 256]
+  cv_folds: 5
+  primary_metric: per

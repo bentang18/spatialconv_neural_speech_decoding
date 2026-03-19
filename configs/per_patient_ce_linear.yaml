@@ -1,0 +1,55 @@
+# Per-patient CE with LINEAR read-in (E3a ablation)
+# Tests whether Conv2d's spatial bias helps or linear projection is equivalent
+# Linear: H*W→64 = 8,256 params (S14) vs Conv2d: 80 params
+experiment: per_patient_ce_linear
+
+model:
+  readin_type: linear
+  head_type: flat
+  d_shared: 64
+  hidden_size: 32
+  gru_layers: 2
+  gru_dropout: 0.3
+  temporal_stride: 5
+  num_classes: 10
+  blank_bias: 0.0
+
+  spatial_conv:
+    channels: 8
+    num_layers: 1
+    kernel_size: 3
+    pool_h: 2
+    pool_w: 4
+
+training:
+  loss_type: ce
+  ce_segments: 3
+
+  stage1:
+    epochs: 300
+    lr: 1.0e-3
+    warmup_epochs: 20
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-4
+    batch_size: 16
+    grad_clip: 5.0
+    patience: 7
+    eval_every: 10
+    val_fraction: 0.2
+
+  augmentation:
+    time_shift_frames: 30
+    amp_scale_std: 0.3
+    channel_dropout_max: 0.2
+    noise_frac: 0.05
+    feat_dropout_max: 0.3
+    time_mask_min: 3
+    time_mask_max: 10
+    spatial_cutout: false
+    temporal_stretch: true
+    temporal_stretch_max_rate: 0.15
+
+evaluation:
+  seeds: [42]
+  cv_folds: 5
+  primary_metric: per

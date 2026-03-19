@@ -170,3 +170,89 @@ def load_patient_data(
         patient_id=subject,
         grid_shape=grid_info.grid_shape,
     )
+
+
+def load_per_position_data(
+    subject: str,
+    bids_root: str | Path,
+    task: str = "PhonemeSequence",
+    n_phons: int = 3,
+    desc: str = "productionZscore",
+    tmin: float | None = None,
+    tmax: float | None = None,
+) -> BIDSDataset:
+    """Load per-position epochs: each phoneme position as a separate sample.
+
+    Instead of extracting only position-1 epochs (which contain a mixed
+    signal from all 3 phonemes), this loads ALL per-phoneme epochs. Each
+    epoch is locked to its own phoneme's response onset, giving a clean
+    temporal window centered on that phoneme.
+
+    Returns a BIDSDataset where:
+    - grid_data has n_trials * n_phons samples
+    - ctc_labels are single-phoneme: [[p1], [p2], [p3], [p1], ...]
+    - Samples are ordered: all position-1, all position-2, all position-3
+      (grouped by position for stratification)
+    """
+    bids_root = Path(bids_root)
+
+    fif_path = _find_fif_path(bids_root, subject, task, desc)
+    epochs = mne.read_epochs(str(fif_path), preload=True, verbose=False)
+
+    if tmin is not None or tmax is not None:
+        crop_tmin = tmin if tmin is not None else epochs.tmin
+        crop_tmax = tmax if tmax is not None else epochs.tmax
+        epochs = epochs.crop(tmin=crop_tmin, tmax=crop_tmax)
+
+    all_data = epochs.get_data()  # (n_total_epochs, n_ch, n_times)
+    all_event_ids = epochs.events[:, 2]
+    inv_event_id = {v: k for k, v in epochs.event_id.items()}
+    ch_names = epochs.ch_names
+
+    n_total = len(all_data)
+    if n_total % n_phons != 0:
+        raise ValueError(
+            f"{subject}: {n_total} epochs not divisible by {n_phons}"
+        )
+    n_trials = n_total // n_phons
+
+    # Collect all position epochs with their single-phoneme labels
+    position_data = []  # list of (n_trials, n_ch, T) per position
+    position_labels: list[list[list[int]]] = []  # per position, per trial
+
+    for pos in range(n_phons):
+        pos_data = all_data[pos::n_phons]  # (n_trials, n_ch, T)
+        position_data.append(pos_data)
+
+        pos_labels = []
+        for i in range(n_trials):
+            epoch_idx = i * n_phons + pos
+            raw_label = inv_event_id[all_event_ids[epoch_idx]]
+            normed = normalize_label(raw_label)
+            encoded = encode_ctc_label([normed])  # single-phoneme label
+            pos_labels.append(encoded)
+        position_labels.append(pos_labels)
+
+    # Stack: all pos-1 epochs, then pos-2, then pos-3
+    stacked_data = np.concatenate(position_data, axis=0)  # (n_trials*n_phons, n_ch, T)
+    stacked_labels: list[list[int]] = []
+    for pos in range(n_phons):
+        stacked_labels.extend(position_labels[pos])
+
+    # Grid reshape
+    electrodes_tsv = _find_electrodes_tsv(bids_root, subject)
+    grid_info = load_grid_mapping(electrodes_tsv)
+    grid_data = channels_to_grid(stacked_data, ch_names, grid_info)
+
+    logger.info(
+        "%s (per-position): %d epochs (%d trials × %d positions), grid %s, T=%d",
+        subject, len(stacked_labels), n_trials, n_phons,
+        grid_info.grid_shape, grid_data.shape[-1],
+    )
+
+    return BIDSDataset(
+        grid_data=grid_data.astype(np.float32),
+        ctc_labels=stacked_labels,
+        patient_id=subject,
+        grid_shape=grid_info.grid_shape,
+    )

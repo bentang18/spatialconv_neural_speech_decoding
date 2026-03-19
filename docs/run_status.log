@@ -1,0 +1,564 @@
+
+========== 2026-03-18 01:43:31 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+01:36:30 speech_decoding.training.lopo INFO: LOPO target: S14
+01:37:34 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6614 val_loss=2.6580
+01:38:35 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.4305 val_loss=2.4264
+01:39:36 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1528 val_loss=2.2225
+01:40:39 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1287 val_loss=2.2385
+01:41:42 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0603 val_loss=2.2836
+01:42:46 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=1.9903 val_loss=2.2897
+  LATEST: 01:42:46 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=1.9903 val_loss=2.2897
+--- Sweep (Runs 5-8) ---
+SWEEP: Run 5: aug tune (time_shift=15, amp_scale=0.15, noise=0.10)
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+  Seeds complete: 2/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 02:13:31 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:09:43 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.7298 val_loss=2.4424
+02:10:46 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.6962 val_loss=2.5036
+02:10:46 speech_decoding.training.adaptor INFO: Stage 2 fold 1/5
+02:10:48 speech_decoding.training.adaptor INFO: Stage 2 fold 2/5
+02:10:56 speech_decoding.training.adaptor INFO: Stage 2 fold 3/5
+02:10:58 speech_decoding.training.adaptor INFO: Stage 2 fold 4/5
+02:11:02 speech_decoding.training.adaptor INFO: Stage 2 fold 5/5
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+  LATEST: 02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+--- Sweep (Runs 5-8) ---
+SWEEP: Run 5: aug tune (time_shift=15, amp_scale=0.15, noise=0.10)
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 02:43:31 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+SWEEP: Run 5: aug tune (time_shift=15, amp_scale=0.15, noise=0.10)
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 03:13:31 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+SWEEP: Run 5: aug tune (time_shift=15, amp_scale=0.15, noise=0.10)
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 03:43:31 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 04:13:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 04:43:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 05:13:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 05:43:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 06:13:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 06:43:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 07:13:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 07:43:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 08:13:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 08:43:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---
+
+========== 2026-03-18 09:13:32 ==========
+--- LOPO pilot (8 patients, seed 42) ---
+02:11:04 speech_decoding.training.lopo INFO: LOPO target: S33
+02:12:08 speech_decoding.training.lopo_trainer INFO: Stage 1 step 100: train_loss=2.6372 val_loss=2.6566
+02:13:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 200: train_loss=2.3445 val_loss=2.3324
+02:14:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 300: train_loss=2.1714 val_loss=2.1958
+02:15:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 400: train_loss=2.1316 val_loss=2.2047
+02:16:10 speech_decoding.training.lopo_trainer INFO: Stage 1 step 500: train_loss=2.0934 val_loss=2.2142
+02:17:11 speech_decoding.training.lopo_trainer INFO: Stage 1 step 600: train_loss=2.0392 val_loss=2.2352
+02:18:12 speech_decoding.training.lopo_trainer INFO: Stage 1 step 700: train_loss=1.9534 val_loss=2.2968
+02:19:14 speech_decoding.training.lopo_trainer INFO: Stage 1 step 800: train_loss=1.8239 val_loss=2.3227
+02:19:14 speech_decoding.training.adaptor INFO: Stage 2 fold 1/4
+  LATEST: ValueError: The test_size = 8 should be greater or equal to the number of classes = 9
+--- Sweep (Runs 5-8) ---
+01:16:13 __main__ INFO: S14 seed=42: PER=0.784±0.038, bal_acc=0.155±0.077
+01:25:17 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+01:34:33 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 6: weight_decay=1e-3
+01:45:35 __main__ INFO: S14 seed=42: PER=0.782±0.042, bal_acc=0.157±0.080
+01:54:46 __main__ INFO: S14 seed=137: PER=0.811±0.047, bal_acc=0.161±0.059
+02:04:08 __main__ INFO: S14 seed=256: PER=0.823±0.091, bal_acc=0.100±0.058
+SWEEP: Run 7: lr=5e-4
+02:19:15 __main__ INFO: S14 seed=42: PER=0.767±0.033, bal_acc=0.098±0.046
+02:33:34 __main__ INFO: S14 seed=137: PER=0.859±0.068, bal_acc=0.067±0.058
+02:48:55 __main__ INFO: S14 seed=256: PER=0.858±0.074, bal_acc=0.120±0.098
+SWEEP: Run 8: gru_dropout=0.1
+02:58:30 __main__ INFO: S14 seed=42: PER=0.803±0.111, bal_acc=0.184±0.101
+03:09:31 __main__ INFO: S14 seed=137: PER=0.749±0.055, bal_acc=0.206±0.100
+03:20:06 __main__ INFO: S14 seed=256: PER=0.812±0.072, bal_acc=0.120±0.089
+  STATUS: COMPLETE
+--- Flat head ablation ---
+01:21:35 __main__ INFO: S14 seed=42: PER=0.763±0.028, bal_acc=0.134±0.048
+01:33:48 __main__ INFO: S14 seed=137: PER=0.760±0.054, bal_acc=0.166±0.070
+01:47:50 __main__ INFO: S14 seed=256: PER=0.792±0.114, bal_acc=0.138±0.099
+  Seeds complete: 3/3
+--- Next check in 30 min ---

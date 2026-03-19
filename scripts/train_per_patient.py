@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from speech_decoding.data.bids_dataset import load_patient_data
+from speech_decoding.data.bids_dataset import load_patient_data, load_per_position_data
 from speech_decoding.training.trainer import train_per_patient
 
 logging.basicConfig(
@@ -58,10 +58,17 @@ def main():
         logger.info("Training patient %s", pid)
 
         try:
-            ds = load_patient_data(
-                pid, bids_root, task="PhonemeSequence", n_phons=3,
-                tmin=args.tmin, tmax=args.tmax,
-            )
+            loss_type = config["training"].get("loss_type", "ctc")
+            if loss_type == "ce_perpos":
+                ds = load_per_position_data(
+                    pid, bids_root, task="PhonemeSequence", n_phons=3,
+                    tmin=args.tmin, tmax=args.tmax,
+                )
+            else:
+                ds = load_patient_data(
+                    pid, bids_root, task="PhonemeSequence", n_phons=3,
+                    tmin=args.tmin, tmax=args.tmax,
+                )
         except FileNotFoundError as e:
             logger.warning("Skipping %s: %s", pid, e)
             continue

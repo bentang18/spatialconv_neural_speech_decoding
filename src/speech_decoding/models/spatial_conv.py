@@ -51,6 +51,11 @@ class SpatialConvReadIn(nn.Module):
         # Reshape to treat each time frame as a separate image
         x = x.permute(0, 3, 1, 2).reshape(B * T, 1, H, W)
         x = self.convs(x)  # (B*T, C, H, W)
-        x = self.pool(x)   # (B*T, C, pool_h, pool_w)
+        # MPS doesn't support AdaptiveAvgPool2d when input sizes aren't
+        # divisible by output sizes (e.g. 22/4). Fall back to CPU for pool.
+        if x.device.type == "mps":
+            x = self.pool(x.cpu()).to("mps")
+        else:
+            x = self.pool(x)   # (B*T, C, pool_h, pool_w)
         x = x.reshape(B, T, -1)  # (B, T, out_dim)
         return x.permute(0, 2, 1)  # (B, out_dim, T)

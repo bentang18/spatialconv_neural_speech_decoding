@@ -17,6 +17,7 @@ dependencies = [
     "pyyaml>=6.0",
     "h5py>=3.9",
     "tqdm>=4.65",
+    "transformers>=4.40",
 ]
 
 [project.optional-dependencies]

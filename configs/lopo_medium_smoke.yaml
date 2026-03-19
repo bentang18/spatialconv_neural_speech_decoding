@@ -1,0 +1,86 @@
+# Medium LOPO smoke test: enough budget to get beyond pure plumbing,
+# still much smaller than the default experiment.
+experiment: E2_lopo_medium_smoke
+
+model:
+  readin_type: spatial_conv
+  head_type: articulatory
+  d_shared: 64
+  hidden_size: 64
+  gru_layers: 2
+  gru_dropout: 0.2
+  temporal_stride: 5
+  num_classes: 10
+  blank_bias: 2.0
+
+  spatial_conv:
+    channels: 8
+    num_layers: 1
+    kernel_size: 3
+    pool_h: 2
+    pool_w: 4
+
+training:
+  stage1:
+    epochs: 50
+    steps: 200
+    lr: 1.0e-3
+    warmup_epochs: 10
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-4
+    batch_size: 16
+    grad_clip: 5.0
+    patience: 4
+    eval_every: 20
+    val_fraction: 0.2
+    augmentation:
+      time_shift_frames: 20
+      amp_scale_std: 0.15
+      channel_dropout_max: 0.2
+      noise_frac: 0.02
+      feat_dropout_max: 0.3
+      time_mask_min: 2
+      time_mask_max: 4
+      spatial_cutout: false
+      temporal_stretch: false
+
+  stage2:
+    epochs: 30
+    steps: 40
+    lr: 1.0e-3
+    warmup_epochs: 0
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-3
+    batch_size: 16
+    grad_clip: 5.0
+    source_replay_frac: 0.3
+    patience: 5
+    eval_every: 2
+    cv_folds: 3
+    val_fraction: 0.2
+    min_outer_class_count: 3
+    min_inner_class_count: 2
+    augmentation:
+      time_shift_frames: 10
+      amp_scale_std: 0.1
+      channel_dropout_max: 0.1
+      noise_frac: 0.02
+      feat_dropout_max: 0.2
+      time_mask_min: 2
+      time_mask_max: 4
+      spatial_cutout: false
+      temporal_stretch: false
+
+  augmentation:
+    time_shift_frames: 20
+    amp_scale_std: 0.15
+    channel_dropout_max: 0.2
+    noise_frac: 0.02
+    feat_dropout_max: 0.3
+    time_mask_min: 2
+    time_mask_max: 4
+
+evaluation:
+  seeds: [42]
+  cv_folds: 3
+  primary_metric: per

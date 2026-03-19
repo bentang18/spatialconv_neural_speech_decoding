@@ -1,0 +1,88 @@
+# LOPO pilot run — 8 Spalding patients, 1 seed
+# Config choices informed by per-patient tuning (see docs/training_log.md):
+#   - blank_bias: 1.0 (compromise: 0.0 was best per-patient but LOPO has 7× more
+#     gradient signal per step; 2.0 caused blank collapse per-patient; 1.0 is safe)
+#   - H=64 (LOPO has ~7× more data, can support larger backbone)
+#   - Original augmentation (Run 5 aug-tune was slightly worse than Run 4 baseline)
+#   - 1 seed for time budget (~5 hours on MPS)
+experiment: lopo_pilot
+
+model:
+  readin_type: spatial_conv
+  head_type: articulatory
+  d_shared: 64
+  hidden_size: 64          # 4× per-patient (more data supports it)
+  gru_layers: 2
+  gru_dropout: 0.2         # lighter than per-patient's 0.3 (more data = less regularization)
+  temporal_stride: 5       # 200Hz → 40Hz — 60 GRU frames
+  num_classes: 10
+  blank_bias: 1.0          # compromise: per-patient needed 0.0, LOPO has 7× more gradient
+
+  spatial_conv:
+    channels: 8
+    num_layers: 1
+    kernel_size: 3
+    pool_h: 2
+    pool_w: 4
+
+training:
+  stage1:
+    steps: 2000            # 1 batch/patient/step, ~2400 effective gradient updates
+    lr: 1.0e-3
+    warmup_epochs: 20
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-4
+    batch_size: 16
+    grad_clip: 5.0
+    patience: 5            # × eval_every = 500 steps without improvement
+    eval_every: 100
+    val_fraction: 0.2
+    augmentation:
+      time_shift_frames: 20  # original augmentation (Run 5 tuning was worse)
+      amp_scale_std: 0.15
+      channel_dropout_max: 0.2
+      noise_frac: 0.02
+      feat_dropout_max: 0.3
+      time_mask_min: 2
+      time_mask_max: 4
+      spatial_cutout: false
+      temporal_stretch: false
+
+  stage2:
+    steps: 100             # per-fold; eval_every=1 so patience=10 = 10 steps
+    lr: 1.0e-3
+    warmup_epochs: 0
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-3   # heavier regularization for small target data
+    batch_size: 16
+    grad_clip: 5.0
+    source_replay_frac: 0.3
+    patience: 10
+    eval_every: 1
+    cv_folds: 5
+    val_fraction: 0.2
+    augmentation:
+      time_shift_frames: 10    # lighter than Stage 1 (frozen backbone)
+      amp_scale_std: 0.1
+      channel_dropout_max: 0.1
+      noise_frac: 0.02
+      feat_dropout_max: 0.2
+      time_mask_min: 2
+      time_mask_max: 4
+      spatial_cutout: false
+      temporal_stretch: false
+
+  # Flat augmentation block for per-patient trainer backward compat
+  augmentation:
+    time_shift_frames: 20
+    amp_scale_std: 0.15
+    channel_dropout_max: 0.2
+    noise_frac: 0.02
+    feat_dropout_max: 0.3
+    time_mask_min: 2
+    time_mask_max: 4
+
+evaluation:
+  seeds: [42]              # 1 seed for pilot (~5h); full run uses [42, 137, 256]
+  cv_folds: 5
+  primary_metric: per

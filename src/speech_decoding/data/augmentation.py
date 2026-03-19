@@ -149,3 +149,24 @@ def augment_batch(
         x = spatial_cutout(x, max_h=spatial_cutout_max_h, max_w=spatial_cutout_max_w)
     x = gaussian_noise(x, frac=noise_frac)
     return x
+
+
+def augment_from_config(
+    x: torch.Tensor,
+    ac: dict,
+    training: bool = True,
+) -> torch.Tensor:
+    """Apply augment_batch using values from an augmentation config dict."""
+    return augment_batch(
+        x,
+        training=training,
+        time_shift_frames=ac.get("time_shift_frames", 20),
+        amp_scale_std=ac.get("amp_scale_std", 0.15),
+        channel_dropout_max=ac.get("channel_dropout_max", 0.2),
+        noise_frac=ac.get("noise_frac", 0.02),
+        do_spatial_cutout=ac.get("spatial_cutout", False),
+        spatial_cutout_max_h=ac.get("spatial_cutout_max_h", 3),
+        spatial_cutout_max_w=ac.get("spatial_cutout_max_w", 6),
+        do_temporal_stretch=ac.get("temporal_stretch", False),
+        temporal_stretch_max_rate=ac.get("temporal_stretch_max_rate", 0.15),
+    )

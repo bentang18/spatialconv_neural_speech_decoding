@@ -1,0 +1,56 @@
+# CE with per-position epochs: each phoneme gets its own clean temporal window
+# Matches Zac's per-position SVM setup exactly
+# 459 samples (153 trials × 3 positions) instead of 153
+# Simple 9-way classification, no position mixing
+experiment: per_patient_ce_perpos
+
+model:
+  readin_type: spatial_conv
+  head_type: flat
+  d_shared: 64                 # SAME as CE baseline
+  hidden_size: 32              # SAME as CE baseline
+  gru_layers: 2
+  gru_dropout: 0.3
+  temporal_stride: 5           # SAME as CE baseline
+  num_classes: 10
+  blank_bias: 0.0
+
+  spatial_conv:
+    channels: 8
+    num_layers: 1
+    kernel_size: 3
+    pool_h: 2
+    pool_w: 4
+
+training:
+  loss_type: ce_perpos
+  ce_segments: 1               # single phoneme per sample
+
+  stage1:
+    epochs: 300
+    lr: 1.0e-3
+    warmup_epochs: 20
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-4
+    batch_size: 16
+    grad_clip: 5.0
+    patience: 7
+    eval_every: 10
+    val_fraction: 0.2
+
+  augmentation:
+    time_shift_frames: 30
+    amp_scale_std: 0.3
+    channel_dropout_max: 0.2
+    noise_frac: 0.05
+    feat_dropout_max: 0.3
+    time_mask_min: 2
+    time_mask_max: 5
+    spatial_cutout: false
+    temporal_stretch: true
+    temporal_stretch_max_rate: 0.15
+
+evaluation:
+  seeds: [42]
+  cv_folds: 5
+  primary_metric: per

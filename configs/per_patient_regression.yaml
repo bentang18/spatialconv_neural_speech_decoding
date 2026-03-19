@@ -1,0 +1,63 @@
+# Per-patient regression: CE + masked MSE on speech embeddings
+experiment: per_patient_regression
+
+data:
+  task: PhonemeSequence
+  n_phons: 3
+  tmin: -1.0
+  tmax: 1.5
+  feature_type: hubert
+  feature_dir: "/Users/bentang/Documents/Code/speech/results/audio_features"
+
+model:
+  readin_type: spatial_conv
+  head_type: flat
+  d_shared: 64
+  hidden_size: 32
+  gru_layers: 2
+  gru_dropout: 0.3
+  temporal_stride: 10
+  num_classes: 10
+  d_emb: 64
+
+  spatial_conv:
+    channels: 8
+    num_layers: 1
+    kernel_size: 3
+    pool_h: 2
+    pool_w: 4
+
+training:
+  loss_type: ce
+  ce_segments: 3
+  regression_lambda: 0.3
+  regression_target_mode: frame
+  regression_pca_scope: all_frames
+
+  stage1:
+    epochs: 200
+    lr: 1.0e-3
+    warmup_epochs: 20
+    readin_lr_mult: 3.0
+    weight_decay: 1.0e-4
+    batch_size: 16
+    grad_clip: 5.0
+    patience: 7
+    eval_every: 10
+    val_fraction: 0.2
+
+  augmentation:
+    time_shift_frames: 0
+    amp_scale_std: 0.15
+    channel_dropout_max: 0.2
+    noise_frac: 0.10
+    feat_dropout_max: 0.3
+    time_mask_min: 3
+    time_mask_max: 10
+    spatial_cutout: false
+    temporal_stretch: false
+
+evaluation:
+  seeds: [42]
+  cv_folds: 5
+  primary_metric: per

@@ -1,4 +1,4 @@
-# Per-patient training config: smaller backbone + harder augmentation
+# Per-patient training config: smaller backbone + tuned augmentation
 # For single-patient CV (Sprint 3). Use default.yaml for cross-patient LOPO.
 experiment: per_patient
 
@@ -9,8 +9,9 @@ model:
   hidden_size: 32       # GRU hidden — 4x smaller than LOPO config
   gru_layers: 2
   gru_dropout: 0.3      # higher dropout for small data
-  temporal_stride: 10   # 200Hz → 20Hz (Spalding-validated, halves GRU seq length)
+  temporal_stride: 5    # 200Hz → 40Hz — 60 GRU frames for finer CTC alignment
   num_classes: 10
+  blank_bias: 0.0          # neutral init — phonemes and blank start at equal footing
 
   spatial_conv:
     channels: 8
@@ -21,31 +22,32 @@ model:
 
 training:
   stage1:
-    epochs: 200
+    epochs: 300
     lr: 1.0e-3
+    warmup_epochs: 20   # linear ramp 0→lr, stabilizes early CTC alignment
     readin_lr_mult: 3.0
     weight_decay: 1.0e-4
     batch_size: 16
     grad_clip: 5.0
-    patience: 7         # more patience (×10 = 70 epochs)
+    patience: 7         # ×10 = 70 epochs without improvement
     eval_every: 10
     val_fraction: 0.2
 
   stage2:
     epochs: 100
     lr: 1.0e-3
-    weight_decay: 1.0e-3
+    weight_decay: 1.0e-4
     source_replay_frac: 0.3
     patience: 10
 
   augmentation:
-    time_shift_frames: 30       # ±150ms (was 20)
-    amp_scale_std: 0.3          # 2x (was 0.15)
-    channel_dropout_max: 0.4    # 2x (was 0.2)
-    noise_frac: 0.05            # 2.5x (was 0.02)
-    feat_dropout_max: 0.5       # ~1.7x (was 0.3)
-    time_mask_min: 2
-    time_mask_max: 6            # up from 4 — masks up to 300ms at 20Hz
+    time_shift_frames: 15       # ±75ms (was 30 — phoneme onsets ~150ms apart, don't overshoot)
+    amp_scale_std: 0.15         # halved — z-scored data already normalizes impedance
+    channel_dropout_max: 0.2    # compound dropout ~23% (with feat_dropout)
+    noise_frac: 0.10            # doubled — gentler regularizer than dropout
+    feat_dropout_max: 0.3       # compound dropout ~23% (with channel_dropout)
+    time_mask_min: 3            # scaled for 40Hz (was 2 at 20Hz)
+    time_mask_max: 10           # ~250ms at 40Hz (was 300ms at 20Hz)
     spatial_cutout: false
     temporal_stretch: true       # ±15% speaking rate variation
     temporal_stretch_max_rate: 0.15

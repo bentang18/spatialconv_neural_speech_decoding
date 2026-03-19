@@ -24,7 +24,10 @@ Extending Spalding 2025 (PCA+CCA alignment, SVM/Seq2Seq, 8 patients, 9 phonemes,
 - `pastwork/verification_results.md` — All 19 errors across 8 summaries corrected
 
 ### Configs
-- `configs/default.yaml` — E2 full model (spatial conv + articulatory CTC)
+- `configs/default.yaml` — E2 full model LOPO config (spatial conv + articulatory CTC, H=64, blank_bias=2.0)
+- `configs/per_patient.yaml` — Per-patient config (H=32, blank_bias=0.0, tuned augmentation)
+- `configs/per_patient_flat.yaml` — Flat head ablation config (head_type=flat)
+- `configs/lopo_pilot.yaml` — LOPO pilot config (8 Spalding patients, 1 seed, blank_bias=1.0)
 - `configs/field_standard.yaml` — E1 field standard (linear + flat CTC)
 - `configs/paths.yaml` — Machine-specific BIDS paths (gitignored)
 
@@ -47,15 +50,20 @@ src/speech_decoding/
 │   └── assembler.py        # YAML config → (backbone, head, {patient_id: read_in})
 ├── training/
 │   ├── ctc_utils.py        # CTC loss (T,B,C transpose), greedy decode, PER, blank ratio
-│   └── trainer.py          # Per-patient training: stratified K-fold CV, AdamW + CosineAnnealingLR, early stopping
+│   ├── trainer.py          # Per-patient training: stratified K-fold CV, AdamW + cosine LR, early stopping
+│   ├── lopo_trainer.py     # Stage 1: multi-patient SGD with gradient accumulation, step-based training
+│   ├── adaptor.py          # Stage 2: target adaptation with frozen backbone, source replay, 5-fold CV
+│   └── lopo.py             # LOPO orchestrator: loops targets × seeds, collects metrics, Wilcoxon
 └── evaluation/
     └── metrics.py          # PER, per-position balanced accuracy, CTC length accuracy
 ```
 
 ### Scripts
 - `scripts/train_per_patient.py` — CLI for per-patient training on all PS patients × seeds
+- `scripts/train_lopo.py` — CLI for LOPO cross-patient training
+- `scripts/sweep_s14.sh` — Hyperparameter sweep on S14 (Runs 5-8)
 
-### Tests (110 total: 100 fast + 10 slow)
+### Tests (127 total: 115 fast + 12 slow)
 ```
 tests/
 ├── test_phoneme_map.py     # 23 tests: label normalization, CTC encoding, articulatory matrix
@@ -66,7 +74,10 @@ tests/
 ├── test_models.py          # 24 tests: all model components + assembler
 ├── test_ctc_utils.py       # 13 tests: CTC loss, decode, PER, blank ratio
 ├── test_trainer.py         # 6 tests: metrics + per-patient trainer on synthetic data
-└── test_integration.py     # 7 tests: end-to-end forward/backward/overfit + real S14 (2 slow)
+├── test_integration.py     # 7 tests: end-to-end forward/backward/overfit + real S14 (2 slow)
+├── test_lopo_trainer.py    # 7 tests: Stage 1 multi-patient training (synthetic)
+├── test_adaptor.py         # 6 tests: Stage 2 target adaptation (synthetic)
+└── test_lopo.py            # 4 tests: LOPO orchestrator + Wilcoxon (synthetic)
 ```
 
 Run: `pytest tests/ -v -m "not slow"` (fast, no data needed) or `pytest tests/ -v` (all, needs BIDS data)
@@ -124,16 +135,65 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 
 ## Implementation Status
 
-### Complete (Sprints 0–4)
+### Complete (Sprints 0–5)
 - **Sprint 0**: Project setup (uv, Python 3.11 venv, git, pyproject.toml, directory reorganization)
 - **Sprint 1**: Data foundation — phoneme mapping, grid inference, BIDS loading, augmentation, collation
 - **Sprint 2**: Model components — both E1 (Linear+Flat) and E2 (SpatialConv+Articulatory) architectures
 - **Sprint 3**: Per-patient training — CTC utils, stratified CV trainer, evaluation metrics
 - **Sprint 4**: Integration tests — synthetic overfit, real S14 forward pass + quick train
+- **Sprint 5**: Cross-patient LOPO — Stage 1 multi-patient trainer (`lopo_trainer.py`), Stage 2 target adaptation with source replay (`adaptor.py`), LOPO orchestrator with Wilcoxon (`lopo.py`), `augment_from_config` helper, `train_lopo.py` CLI
+
+### Per-Patient Results (S14, see `docs/training_log.md`)
+
+**CTC tuning (converged):**
+- **Best CTC**: H=32, stride=5, blank_bias=0.0, original augmentation → **PER=0.778** (mean 3 seeds)
+- Blank bias is the dominant CTC lever: 2.0→0.0 took PER from 1.000 to 0.778. +2.0 causes blank collapse per-patient.
+- Flat head ≈ articulatory head per-patient: both ~0.77. Articulatory value is cross-patient transfer only.
+- Augmentation/LR/weight-decay/dropout sweeps: all within noise. CTC per-patient is data-limited.
+
+**CE loss ablation (new standard for per-patient):**
+- **CE per-position beats CTC**: PER 0.700 vs 0.778 (10% relative), bal_acc 0.266 vs 0.15 (77% relative)
+- CE provides stronger per-position gradients, no blank collapse, no blank bias tuning needed
+- CTC's alignment-freedom is wasted capacity with small data — phoneme positions are already known from epoch structure
+- **Use `training.loss_type: ce` for per-patient.** Keep CTC for LOPO until tested.
+
+**Architecture bottleneck identified:**
+- **GRU capacity is NOT the bottleneck**: H=128 CE showed worse overfitting (train/val gap 55× vs 4× for H=32)
+- **Input layer compression IS the bottleneck**: Pool(2,4) → 64 dims destroys articulatory spatial resolution (4mm cells can't resolve 3-5mm somatotopy)
+- **Pool(4,8) → d_shared=256** retains 2mm spatial resolution, matching somatotopic scale
+- **Stride=10 (20Hz) matches field standard**: 40Hz was unnecessary (0.70 vs 0.70 PER). Spalding/Duraivel/Willett all use ≤20Hz.
+
+**Recommended per-patient config**: CE loss, stride=10, pool(4,8), C=8, d_shared=256, H=32. Input sweep in progress.
+
+**MPS compatibility**: `AdaptiveAvgPool2d` falls back to CPU for non-divisible grid sizes. CTC loss also falls back to CPU. Use `PYTORCH_ENABLE_MPS_FALLBACK=1`.
+
+### LOPO Pilot Results (complete)
+**Config**: `lopo_pilot.yaml` — 8 Spalding patients, 1 seed (42), H=64, CTC, blank_bias=1.0
+
+| Patient | PER |
+|---------|-----|
+| S14 | 0.828 |
+| S22 | 0.851 |
+| S23 | 0.849 |
+| S26 | 0.846 |
+| S33 | 0.853 |
+| S39 | 0.856 |
+| S58 | 0.854 |
+| S62 | 0.832 |
+| **Population** | **0.846 ± 0.010** |
+
+- LOPO (0.846) is **worse** than per-patient CTC (0.778) and per-patient CE (0.700)
+- Stage 1 consistently early-stops ~step 800 of 2000 (val diverges after step 500)
+- Stage 2 folds complete in seconds (~3-5s each, early-stop 13-46 steps)
+- S33 (52 trials) survived with inner stratification fix
+- Very low variance across patients (0.828-0.856) — model is near-chance uniformly
+- **Interpretation**: Cross-patient transfer with CTC + current architecture doesn't help. Need to investigate: CE for LOPO, larger input layer, different Stage 2 strategy
 
 ### Next (not yet implemented)
-- **Sprint 5**: Cross-patient LOPO — multi-patient Stage 1 (gradient accumulation, held-out validation, differential LR), Stage 2 target adaptation (freeze backbone, source replay), LOPO orchestrator with Wilcoxon statistics
 - **Sprint 6**: Cross-task pooling — Lexical patients as additional Stage 1 sources (requires per-position phoneme filtering, not per-trial)
+
+### In Progress
+- **Input layer sweep**: Testing pool(4,8) d=256 and C=16 d=128 with CE + stride=10 on S14
 
 ## Established Findings (from literature review)
 
@@ -142,20 +202,21 @@ Field consensus: per-patient input layer → shared backbone (GRU) → CTC loss.
 
 **Our architecture diverges from field consensus in two ways (architectural only — training is field-standard):**
 1. **Per-patient spatial conv** (Conv2d, default 1-layer ~80 params, configurable to 2-layer ~664 params) replaces Linear read-in (~13k params). Conv2d's factorization (weight-shared within image, different across images) matches rigid-array physics (uniform intra-array, variable inter-array). Learns spatial deblurring (Laplacian/gradient) and orientation-adapted filters. Array placements span 15–25mm with variable orientation → spatial conv is per-patient, not shared. **Layer count, channels, pool resolution are empirical — quick-validate on 1 LOPO fold (E13)**
-2. **Articulatory decomposition CTC head** replaces flat Linear(2H,9) — 6 parallel articulatory feature heads composed via fixed linguistic matrix. Blank logit initialized with +2.0 bias (phoneme logits are sums of 3-4 features → larger magnitude at init; blank must start competitive for CTC stability)
+2. **Articulatory decomposition CTC head** replaces flat Linear(2H,9) — 6 parallel articulatory feature heads composed via fixed linguistic matrix. Blank logit bias is configurable (`model.blank_bias`): +2.0 for LOPO (sufficient gradient signal from 7 sources), 0.0 for per-patient (small data can't overcome high blank bias → blank collapse). Per-patient ablation shows **flat head ≈ articulatory head** (both PER ~0.77) — articulatory value is cross-patient transfer only
 
 **Downgraded to exploratory (in `future_directions.md`):** Reptile, SupCon, and DRO. Per-patient layers already provide cross-patient transfer (Singh-style). DRO upweights patients hard for practical reasons (few trials, poor signal), not neural coding differences — noisy with N=7.
 
-### Parameter budget (verified 2026-03-14, updated v9 2026-03-17, grid shapes confirmed 2026-03-17)
+### Parameter budget (updated 2026-03-18 from first-principles analysis)
 - **Data confirmed from Spalding Tables S1/S3:** Trials 46–178/patient (S3=46 outlier), sig channels 63–201, frames 9.2k–35.6k/pt → **small regime locked**
-- Per-patient input: Conv2d(1,8,k=3,pad=1), default 1-layer = **80 params** (167× fewer than Linear), configurable to 2-layer = 664 params. AdaptiveAvgPool2d(2,4) handles different grid sizes. Coarse pooling preferred — 15–25mm placement offsets cause finer pool cells to map to different cortex across patients. **Derivable from physics:** per-patient, Conv2d, coarse pool. **Empirical:** num_layers (1 vs 2), C (4 vs 8), pool dims — swept in E13. **Grid shapes confirmed from electrode TSVs:** 12×22 (8 dead corners), 8×32 (no dead), 8×34 (S57, 16 dead). Shape must be inferred from TSV, not channel count. S14 ch 105 has n/a coords (bad electrode). All handled by `grid.load_grid_mapping()`
-- Shared backbone: BiGRU 2×64, ~147k shared params (Conv1d 20.5k + GRU 124k + articulatory head 2k). Temporal downsampling configurable: default k=5 s=5 (40Hz), validated alternative k=10 s=10 (20Hz, Spalding's rate)
-- CTC head: 6 articulatory feature heads → fixed composition matrix → 9 phoneme logits + blank. 2,064 params (vs 1,290 flat). Blank bias initialized +2.0 (compensates scale mismatch with composed logits)
+- Per-patient input: Conv2d(1,8,k=3,pad=1), 1-layer = **80 params**. **Pool(4,8) preferred over pool(2,4)** — 2mm spatial resolution resolves 3-5mm somatotopic organization; pool(2,4) at 4mm cannot. d_shared=256 (up from 64). For LOPO cross-patient, coarser pooling may still be preferable (array offsets 15-25mm). **Grid shapes from TSVs:** 12×22 (8 dead corners), 8×32 (no dead), 8×34 (S57, 16 dead). Handled by `grid.load_grid_mapping()`
+- Shared backbone: BiGRU 2×32 with d_shared=256 input. Conv1d(256,32,k=10,s=10) = **82K** temporal projection + GRU ~37K + head ~1.7K = **~121K shared params**. Temporal stride k=10 s=10 (**20Hz**, field standard — validated equivalent to 40Hz). H=32 sufficient — H=128 test showed more overfitting, not better generalization
+- **Loss**: Per-position CE for per-patient (PER 0.700 vs CTC 0.778). CTC for LOPO (alignment-free needed across patients with different timing). Articulatory CTC head configurable: `model.blank_bias` +2.0 LOPO, 0.0 per-patient
+- **Cross-lab comparison**: Our ~121K backbone is 50-100× smaller than Spalding seq2seq (~6.3M), Duraivel (~4.5M), Willett (~12.3M). Even Singh (closest regime) uses BiLSTM-64 (~100-500K). The bottleneck is input compression, not backbone capacity
 - Two-stage LOPO: Stage 1 = standard multi-patient SGD with **held-out 20% source validation** for early stopping; Stage 2 freezes Conv1d+BiGRU, adapts spatial conv+LayerNorm+articulatory head (~2,272 trainable params at default config). **Stage 2 uses stratified 5-fold CV** on target patient (StratifiedKFold on phoneme labels)
 - Stage 1 uses best-checkpoint selection (no SWA — no BCI paper uses SWA, adds unprecedented complexity). AdamW + CosineAnnealingLR (single cycle) + early stopping on held-out validation loss
 - Systematic ablation: 4 experiments (E0 Spalding + E1 field standard + E2 full model + E3–E4 single-removal)
 - Effective augmentation multiplier ~2–3× (not 5×)
-- **Compute: ~88 GPU-hours** for 4 experiments × 8 LOPO folds × 3 seeds (each fold: ~30 min Stage 1 + 5×5 min Stage 2 CV)
+- **Compute**: LOPO pilot (8 patients × 1 seed) takes ~80 min on MPS (Stage 1 early-stops ~step 800 of 2000, Stage 2 folds ~3-5s each). Full run (8 patients × 3 seeds) estimated ~4 hours. Original estimate of ~88 GPU-hours was for 4 experiments × 8 folds × 3 seeds
 
 ### Alignment
 - Boccato: learned affine transforms are predominantly diagonal (per-channel gain adjustment) — **but this is Utah-specific** (fixed stereotactic placement, same orientation). uECOG arrays span 15–25mm in MNI space with variable rotation — electrode channel numbers have no consistent anatomical meaning across patients. Diagonal per-channel scaling is inapplicable. Cross-patient variation includes spatial remapping, not just gain

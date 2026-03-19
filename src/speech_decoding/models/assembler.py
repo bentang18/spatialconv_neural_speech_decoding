@@ -40,6 +40,7 @@ def assemble_model(
         feat_drop_max=ac.get("feat_dropout_max", 0.3),
         time_mask_min=ac.get("time_mask_min", 2),
         time_mask_max=ac.get("time_mask_max", 4),
+        gru_input_dim=mc.get("gru_input_dim"),
     )
 
     # Head
@@ -47,7 +48,10 @@ def assemble_model(
     if mc["head_type"] == "flat":
         head: nn.Module = FlatCTCHead(input_dim=input_dim, num_classes=mc["num_classes"])
     elif mc["head_type"] == "articulatory":
-        head = ArticulatoryCTCHead(input_dim=input_dim)
+        head = ArticulatoryCTCHead(
+            input_dim=input_dim,
+            blank_bias=mc.get("blank_bias", 2.0),
+        )
     else:
         raise ValueError(f"Unknown head_type: {mc['head_type']}")
 
@@ -55,9 +59,10 @@ def assemble_model(
     read_ins: dict[str, nn.Module] = {}
     for pid, (grid_h, grid_w) in patients.items():
         if mc["readin_type"] == "linear":
-            lc = mc["linear"]
+            lc = mc.get("linear", {})
+            d_padded = lc.get("d_padded", grid_h * grid_w)
             read_ins[pid] = LinearReadIn(
-                d_padded=lc["d_padded"],
+                d_padded=d_padded,
                 d_shared=mc["d_shared"],
             )
         elif mc["readin_type"] == "spatial_conv":

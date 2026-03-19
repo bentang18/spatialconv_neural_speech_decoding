@@ -117,7 +117,184 @@ def _edit_distance(a: list[int], b: list[int]) -> int:
     return dp[m]
 
 
+def per_position_ce_loss(
+    logits: torch.Tensor,
+    targets: list[list[int]],
+    n_positions: int = 3,
+) -> torch.Tensor:
+    """Cross-entropy loss with per-position classification heads.
+
+    Mean-pools the ENTIRE temporal sequence, then applies CE for each
+    phoneme position independently. This matches Spalding's per-position
+    SVM approach — the model must encode all 3 phonemes into one shared
+    representation vector.
+
+    Args:
+        logits: (B, T, n_positions * n_phonemes) raw logits from multi-head
+                projection. First n_phonemes columns = position 1, etc.
+        targets: List of integer label sequences, 1-indexed (e.g., [[1,3,5], ...]).
+        n_positions: Number of phoneme positions (default 3 for CVC/VCV).
+
+    Returns:
+        Scalar loss (mean over batch and positions).
+    """
+    n_phonemes = logits.shape[2] // n_positions
+    # Global temporal mean pool
+    pooled = logits.mean(dim=1)  # (B, n_positions * n_phonemes)
+    loss = torch.tensor(0.0, device=logits.device)
+
+    for pos in range(n_positions):
+        pos_logits = pooled[:, pos * n_phonemes : (pos + 1) * n_phonemes]  # (B, n_phonemes)
+        tgt = torch.tensor(
+            [t[pos] - 1 for t in targets], dtype=torch.long, device=logits.device
+        )
+        loss = loss + F.cross_entropy(pos_logits, tgt)
+
+    return loss / n_positions
+
+
+def per_position_ce_decode(
+    logits: torch.Tensor,
+    n_positions: int = 3,
+) -> list[list[int]]:
+    """Decode by argmax per position from globally pooled representation.
+
+    Args:
+        logits: (B, T, n_positions * n_phonemes) raw logits.
+        n_positions: Number of phoneme positions.
+
+    Returns:
+        List of decoded sequences (1-indexed phoneme labels).
+    """
+    n_phonemes = logits.shape[2] // n_positions
+    pooled = logits.mean(dim=1)  # (B, n_positions * n_phonemes)
+    decoded = []
+    for b in range(pooled.shape[0]):
+        seq = []
+        for pos in range(n_positions):
+            pos_logits = pooled[b, pos * n_phonemes : (pos + 1) * n_phonemes]
+            seq.append(pos_logits.argmax().item() + 1)  # 1-indexed
+        decoded.append(seq)
+    return decoded
+
+
+def ce_pooled_loss(
+    logits: torch.Tensor,
+    targets: list[list[int]],
+    n_positions: int = 3,
+) -> torch.Tensor:
+    """CE loss on already-pooled logits (no temporal dim).
+
+    For use with heads that do their own temporal pooling (e.g.,
+    CEPositionHead with attention).
+
+    Args:
+        logits: (B, n_positions * n_phonemes) — already pooled.
+        targets: List of integer label sequences, 1-indexed.
+        n_positions: Number of phoneme positions.
+    """
+    n_phonemes = logits.shape[1] // n_positions
+    loss = torch.tensor(0.0, device=logits.device)
+    for pos in range(n_positions):
+        pos_logits = logits[:, pos * n_phonemes : (pos + 1) * n_phonemes]
+        tgt = torch.tensor(
+            [t[pos] - 1 for t in targets], dtype=torch.long, device=logits.device
+        )
+        loss = loss + F.cross_entropy(pos_logits, tgt)
+    return loss / n_positions
+
+
+def ce_pooled_decode(
+    logits: torch.Tensor,
+    n_positions: int = 3,
+) -> list[list[int]]:
+    """Decode from already-pooled logits (no temporal dim).
+
+    Args:
+        logits: (B, n_positions * n_phonemes) — already pooled.
+        n_positions: Number of phoneme positions.
+    """
+    n_phonemes = logits.shape[1] // n_positions
+    decoded = []
+    for b in range(logits.shape[0]):
+        seq = []
+        for pos in range(n_positions):
+            pos_logits = logits[b, pos * n_phonemes : (pos + 1) * n_phonemes]
+            seq.append(pos_logits.argmax().item() + 1)
+        decoded.append(seq)
+    return decoded
+
+
 def blank_ratio(log_probs: torch.Tensor) -> float:
     """Fraction of time frames where blank (idx 0) is the argmax."""
     best = log_probs.argmax(dim=-1)  # (B, T)
     return (best == 0).float().mean().item()
+
+
+def mfa_guided_ce_loss(
+    logits: torch.Tensor,
+    targets: list[list[int]],
+    segment_masks: torch.Tensor,
+) -> torch.Tensor:
+    """CE loss with MFA-derived per-position temporal pooling.
+
+    Instead of mean-pooling over ALL frames (like per_position_ce_loss),
+    each position classifier pools only over the frames corresponding to
+    its phoneme, as defined by MFA segment boundaries.
+
+    Args:
+        logits: (B, T, n_phonemes) raw logits — one shared 9-way head.
+        targets: List of integer label sequences, 1-indexed.
+        segment_masks: (B, n_positions, T) per-trial, per-position frame
+            weights. mask[b, p, t] = 1.0 if frame t belongs to phoneme p.
+
+    Returns:
+        Scalar loss (mean over batch and positions).
+    """
+    n_positions = segment_masks.shape[1]
+    loss = torch.tensor(0.0, device=logits.device)
+    n_active = 0
+
+    for pos in range(n_positions):
+        # (B, T) mask for this position
+        mask = segment_masks[:, pos, :]  # (B, T)
+        denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
+        # Weighted mean pool: (B, T, C) * (B, T, 1) → sum → / denom → (B, C)
+        pooled = (logits * mask.unsqueeze(-1)).sum(dim=1) / denom  # (B, C)
+
+        tgt = torch.tensor(
+            [t[pos] - 1 for t in targets], dtype=torch.long, device=logits.device
+        )
+
+        # Skip positions with empty masks for all trials
+        if mask.sum() > 0:
+            loss = loss + F.cross_entropy(pooled, tgt)
+            n_active += 1
+
+    return loss / max(n_active, 1)
+
+
+def mfa_guided_ce_decode(
+    logits: torch.Tensor,
+    segment_masks: torch.Tensor,
+) -> list[list[int]]:
+    """Decode phonemes using MFA-guided per-position pooling.
+
+    Args:
+        logits: (B, T, n_phonemes) raw logits.
+        segment_masks: (B, n_positions, T) per-position frame weights.
+
+    Returns:
+        List of decoded sequences (1-indexed phoneme labels).
+    """
+    n_positions = segment_masks.shape[1]
+    decoded = []
+    for b in range(logits.shape[0]):
+        seq = []
+        for pos in range(n_positions):
+            mask = segment_masks[b, pos, :]  # (T,)
+            denom = mask.sum().clamp_min(1.0)
+            pooled = (logits[b] * mask.unsqueeze(-1)).sum(dim=0) / denom  # (C,)
+            seq.append(pooled.argmax().item() + 1)  # 1-indexed
+        decoded.append(seq)
+    return decoded
