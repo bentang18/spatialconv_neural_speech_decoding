@@ -37,16 +37,74 @@ Pretrain a latent dynamics model (JEPA) on synthetic Neural Cellular Automata da
 **Goal**: Teach encoder and predictor to process 2D grids evolving over time and infer latent rules.
 
 **NCA data generation**:
-- Each sequence: sample a random 2-layer MLP (hidden=32, tanh activation) as the transition rule
-  - Input: 3x3 neighborhood flattened to 9 values -> MLP -> 1 output value (next cell state)
-  - Output clamped to [0, 1] via sigmoid
-- Initialize an H x W grid with uniform random values in [0, 1]
-- Apply rule iteratively for 100-500 steps (synchronous update, 3x3 neighborhood, zero-padded boundary)
-- Subsample to 20Hz equivalent: record every K-th frame (K chosen to match ~30-50 frames per sequence)
+- All rule families use **continuous scalar values** per cell (floats, not 0/1). This matches uECOG where each electrode produces a continuous z-scored HGA value.
+- Initialize an H x W grid with random values
+- Apply rule iteratively for 100-500 steps (synchronous update)
+- Subsample to ~30-50 frames per sequence (matching 20Hz neural frame rate)
 - Grid sizes: 8x16, 12x22, 8x32, 8x34 (all actual uECOG array geometries)
-- Complexity control via gzip compression ratio (low / medium / high bands)
-- Volume: ~100K+ sequences (unlimited, generated on CPU in seconds)
-- **Domain gap mitigation**: Normalize NCA outputs to zero mean, unit variance (matching z-scored HGA distribution). Add Gaussian noise (std=0.1-0.3) to NCA frames during Stage 1 to bridge the noise gap with real neural data.
+- Volume: ~100K+ sequences per rule family (unlimited, generated on CPU in seconds)
+
+**NCA rule families** (from generic to cortex-specific):
+
+1. **Random MLP** (from Lee et al. 2026)
+   - Input: 3x3 neighborhood flattened to 9 continuous values
+   - Rule: MLP(9 → 32 → 1), tanh hidden, no output clamping (raw continuous values)
+   - Random weights sampled per sequence
+   - Produces maximally diverse dynamics: chaos, waves, fixed points, oscillations
+   - No biological motivation — forces general spatiotemporal processing
+
+2. **Reaction-Diffusion (Gray-Scott)**
+   - Two continuous variables per cell: u (activator), v (inhibitor)
+   - Update: du/dt = D_u·nabla²u - uv² + F(1-u); dv/dt = D_v·nabla²v + uv² - (F+k)v
+   - Parameters (F, k) sampled randomly per sequence from interesting regime [F∈(0.01,0.06), k∈(0.03,0.07)]
+   - Euler integration with dt=1.0, D_u=0.16, D_v=0.08
+   - Produces Turing patterns: spots, stripes, waves, splitting blobs
+   - Biologically grounded — reaction-diffusion models cortical population dynamics
+   - Model sees only u (activator) as the observable per cell
+
+3. **Excitable Media (FitzHugh-Nagumo on grid)**
+   - Two continuous variables per cell: v (membrane potential), w (recovery)
+   - Update: dv/dt = v - v³/3 - w + D·nabla²v; dw/dt = epsilon·(v + a - b·w)
+   - Parameters (a, b, epsilon, D) sampled randomly per sequence
+   - Produces traveling waves, spiral waves, refractory dynamics
+   - **This IS a model of cortical tissue** — FitzHugh-Nagumo is the standard reduced model of excitable neural populations. Each cell has resting → excited → refractory → resting dynamics, exactly as cortical columns do.
+   - The latent parameter (excitability = f(a, b, epsilon)) determines wave behavior, analogous to how the latent phoneme determines cortical activation patterns
+   - Model sees only v (membrane potential) as the observable per cell
+
+4. **Damped Wave Propagation**
+   - One continuous variable per cell: u (displacement)
+   - Update: u_{t+1} = 2u_t - u_{t-1} + c²·nabla²u_t - gamma·(u_t - u_{t-1}) + noise
+   - Parameters (c=wave speed, gamma=damping, noise_std) sampled per sequence
+   - Random initial impulse locations
+   - Clean traveling waves with controllable speed
+   - Models cortical wave propagation during speech (posterior → anterior, ~0.1-0.5 m/s on cortex)
+
+5. **Sequential Hotspot Activation** (cortex-specific)
+   - One continuous variable per cell: activation level
+   - activation(x, y, t) = A · exp(-||(x,y) - pos(t)||² / 2*sigma²) + noise
+   - pos(t) follows a random smooth trajectory across the grid (cubic spline through 3-5 waypoints)
+   - Parameters (speed, sigma, amplitude, trajectory) sampled per sequence
+   - Directly models somatotopic sequential activation during speech (moving activation along motor strip)
+   - Very cortex-specific but low diversity (always a moving Gaussian bump)
+
+**NCA rule family ablation** (core question: does cortex similarity or rule diversity matter more?):
+
+| Rule family | Cortex similarity | Diversity | Key dynamics |
+|---|---|---|---|
+| Random MLP | Low | Very high | Anything: chaos, waves, fixed points |
+| Gray-Scott | Medium | Medium | Turing patterns, waves, spots |
+| **FitzHugh-Nagumo** | **High** | **Medium** | **Traveling waves, spiral waves, excitable pulses** |
+| Damped Wave | Medium-High | Low | Clean propagating waves |
+| Sequential Hotspot | Very high | Very low | Moving Gaussian bumps |
+| **Mixed (all above)** | **Medium-High** | **Very high** | **Everything** |
+
+Hypothesis: FitzHugh-Nagumo or Mixed wins. FHN because it best matches cortical dynamics (excitable media IS cortex). Mixed because diversity + relevance may outperform either alone. Random MLP may underperform despite diversity because many sequences produce dynamics irrelevant to cortex (chaotic noise, frozen patterns).
+
+**Domain gap mitigation** (applied to ALL rule families):
+- Z-score normalize NCA outputs to zero mean, unit variance (matching HGA distribution)
+- Add Gaussian noise (std=0.1-0.3) per frame (matching neural noise floor)
+- Apply temporal smoothing (Butterworth LPF ~8-10Hz equivalent before subsampling) to match HGA autocorrelation structure — NCA dynamics are "crisp" (deterministic update) while HGA at 20Hz is smooth (envelope + filtering)
+- Complexity control within each family via gzip compression ratio of output sequences
 
 **Training**:
 - Encoder maps one frame (H x W) to latent z_t (d-dim)
@@ -99,15 +157,41 @@ Pretrain a latent dynamics model (JEPA) on synthetic Neural Cellular Automata da
 
 **Unified dimension**: d = 64 throughout the entire pipeline. This is the latent dimension, the encoder's internal dimension, and the predictor's working dimension. No projection layers needed between components.
 
-### Temporal Preprocessing (before encoder)
+### Preprocessing Pipeline
 
-Raw uECOG is 200Hz. ViT encoding every frame at 200Hz is prohibitively expensive (200 forward passes per 1-second trial). Instead:
+The preprocessing is designed to match the statistical properties of neural data and synthetic NCA data as closely as possible before they reach the encoder.
 
-- **Temporal subsampling**: Take every 10th frame (200Hz -> 20Hz). This matches the field standard temporal resolution (Spalding, Duraivel, Willett all use <= 20Hz for HGA envelopes).
-- For a [-0.5, 1.0s] trial: 300 samples -> 30 frames at 20Hz.
-- For a [-1.0, 1.5s] trial: 500 samples -> 50 frames at 20Hz.
-- Each frame is still a full H x W spatial grid.
-- For NCA: subsample similarly (record every K-th step to produce ~30-50 frames per sequence).
+**Neural data preprocessing** (Stages 2-3):
+```
+Raw .fif data (200Hz, z-scored HGA, from upstream pipeline)
+  → Anti-aliasing LPF: zero-phase Butterworth, cutoff 8Hz, order 4
+  → Temporal subsampling: every 10th sample → 20Hz
+  → NO threshold clamping (let the encoder learn what's informative)
+  → Dead electrode masking: set dead positions to 0.0
+  → Output: (n_trials, H, W, T') where T'=30 for [-0.5,1.0s], T'=50 for [-1.0,1.5s]
+```
+
+**Why LPF before subsampling but no threshold clamping:**
+- The 8Hz LPF is proper anti-aliasing: 200Hz→20Hz subsampling has Nyquist at 10Hz. Without LPF, frequencies 10-100Hz alias into the 0-10Hz band, corrupting the signal. This is standard signal processing, not optional.
+- Threshold clamping (z > 2 only) is NOT applied for model input. Subthreshold modulation (z ≈ 0.5-1.5) contains preparatory motor activity and planning signals. The JEPA encoder's job is to learn what's informative; clamping imposes a human prior that may discard signal. The latent bottleneck (H×W → 64-dim) naturally filters noise during compression.
+- The existing upstream preprocessing (CAR, HGA extraction, z-scoring) is unchanged. We consume the same .fif files as the current supervised pipeline.
+
+**NCA data preprocessing** (Stage 1):
+```
+Raw NCA output (continuous values, rule-dependent range)
+  → Z-score normalize: per-sequence zero mean, unit variance
+  → Add Gaussian noise: std=0.2 per frame (bridges noise gap with neural data)
+  → Temporal smoothing: zero-phase Butterworth, cutoff 8Hz equivalent
+    (match the autocorrelation structure of real HGA — NCA dynamics are
+     "crisp" while HGA envelopes are smooth)
+  → Temporal subsampling: ~30-50 frames per sequence
+  → Output: (n_sequences, H, W, T') matching neural data format exactly
+```
+
+**Why match NCA to neural statistics**: The domain gap between raw NCA and neural data is substantial: NCA is deterministic and crisp; HGA is stochastic and smooth. Without normalization, noise injection, and temporal smoothing, the Stage 1 pretrained weights may be tuned to a completely different data distribution, making Stage 2 adaptation harder (or worse than random init). The goal: after preprocessing, a batch of NCA frames and a batch of neural frames should be statistically indistinguishable to the encoder's input layer.
+
+**For visualization** (separate from model pipeline):
+Threshold clamping (z > 2), LPF at ~7Hz, and slower playback remain useful for human inspection. These settings are visualization-only and do not affect model input.
 
 ### Encoder (one spatial frame -> latent vector)
 
@@ -281,9 +365,11 @@ This preemptively addresses the strongest reviewer objection and is a finding ei
 
 ## 8. Ablations
 
-### A. NCA Complexity
-- Low / medium / high complexity bands (gzip compression ratio)
-- Does cortical data prefer a specific complexity?
+### A. NCA Rule Family (core ablation)
+- Random MLP vs Gray-Scott vs FitzHugh-Nagumo vs Damped Wave vs Sequential Hotspot vs Mixed
+- Does cortex-similar dynamics (FHN) transfer better than maximally diverse dynamics (Random MLP)?
+- Within each family: low / medium / high complexity bands (gzip compression ratio)
+- This is the paper's most distinctive ablation — no prior work compares synthetic data generators for neural pretraining
 
 ### B. NCA Grid Geometry
 - Matching grids (8x16, 12x22) vs square (16x16) vs mismatched
@@ -355,14 +441,18 @@ See `docs/nca_jepa_pipeline.svg` for the full three-stage data flow diagram.
 
 ## 12. Resolved Design Decisions
 
-1. **Encoder frame rate**: Temporal subsampling 200Hz -> 20Hz (every 10th sample) before encoding. Field standard, computationally feasible, no temporal information loss for HGA envelopes.
+1. **Encoder frame rate**: Anti-aliasing LPF (8Hz Butterworth) then subsample 200Hz -> 20Hz. Field standard, computationally feasible, proper signal processing.
 2. **Predictor context**: Full trial sequence (30-50 frames at 20Hz). Causal during pretraining, bidirectional during fine-tuning.
-3. **NCA state space**: Continuous [0, 1], z-score normalized to match HGA distribution, with added Gaussian noise.
-4. **Cross-task data**: Include Lexical task patients in Stage 2 (unsupervised, label-free). Different phoneme set is irrelevant since Stage 2 uses no labels.
-5. **Unified dimension**: d=64 throughout (encoder, predictor, latent space). No projection layers between components.
+3. **NCA state space**: Continuous scalar values (floats, not 0/1). Z-score normalized, noise-injected, and temporally smoothed to match HGA statistics.
+4. **NCA rule families**: Five families from generic (Random MLP) to cortex-specific (FitzHugh-Nagumo, Sequential Hotspot), plus Mixed. Rule family is a core ablation axis.
+5. **Cross-task data**: Include Lexical task patients in Stage 2 (unsupervised, label-free). Different phoneme set is irrelevant since Stage 2 uses no labels.
+6. **Unified dimension**: d=64 throughout (encoder, predictor, latent space). No projection layers between components.
+7. **No threshold clamping for model input**: Subthreshold neural activity contains preparatory/planning signal. The encoder learns what's informative. Clamping is visualization-only.
+8. **Preprocessing parity**: NCA and neural data undergo matching preprocessing (z-score, noise, LPF, subsample) so they are statistically similar at the encoder input.
 
 ## 13. Open Questions
 
 1. **Multi-step prediction**: Predict z_{t+1} only (1-step) vs z_{t+1:t+k} (multi-step). Multi-step is harder but may learn richer dynamics. Could be an ablation.
 2. **Predictor depth**: 2 layers may be insufficient for modeling complex temporal dependencies. Could sweep 2-4 layers.
-3. **NCA rule diversity**: How many unique rules to sample? Thousands of simple rules vs hundreds of complex rules. The gzip complexity control partially addresses this.
+3. **FHN parameter ranges**: The FitzHugh-Nagumo parameter space has large regions that produce trivial dynamics (fixed points) or numerical instability. Need to map the "interesting" regime before generating at scale. Same for Gray-Scott (F, k) parameter space — known phase diagrams exist in the literature.
+4. **Multi-variable NCA observation**: FHN and Gray-Scott have 2 variables per cell (v+w, u+v). The model sees only 1 (v or u). Should we expose both channels? This would make the encoder input (H, W, 2) instead of (H, W, 1), closer to multi-band neural data but departing from the scalar-per-electrode format.
