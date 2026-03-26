@@ -332,6 +332,47 @@ No pretraining. Freeze randomly-initialized encoder+predictor. Train only CTC he
 | C vs D | Is the architecture responsible, or is it the pretraining? (control) |
 | B vs C | Does real-data SSL alone help? (SSL value) |
 
+### Experiment Execution Order
+
+Run cheapest experiments first to establish baselines and detect dead ends early.
+
+```
+Step 1: Method D (random-init frozen encoder+predictor, CTC head only)
+  Cost:    Minutes. No pretraining needed.
+  Purpose: Sets the noise floor. If frozen random features already decode
+           well, the whole framing changes (reservoir computing baseline).
+  Go/no-go: If D gives PER < 0.85, random features are non-trivial.
+            Proceed to Step 2 regardless.
+
+Step 2: Method C (supervised from scratch, same architecture)
+  Cost:    ~30 min per patient (5-fold CV).
+  Purpose: Establishes what the architecture can do with direct supervision.
+           This is the number to beat.
+  Go/no-go: If C ≈ D, the architecture has no value even with supervision.
+            Rethink architecture before proceeding.
+
+Step 3: Method B (neural-only pretrain, no NCA)
+  Cost:    Hours (Stage 2 pretraining on ~1500 trials + Stage 3 per patient).
+  Purpose: Does SSL on real data help? If B >> C, SSL works and NCA
+           pretraining only needs to improve on it. If B ≈ C, SSL on
+           ~1500 trials isn't enough — NCA's unlimited data is the
+           only path forward.
+  Go/no-go: If B ≈ D (pretrained features no better than random),
+            something is fundamentally wrong with the pretraining
+            objective or architecture. Debug before adding NCA.
+
+Step 4: Method A (NCA + neural pretrain)
+  Cost:    Hours (Stage 1 NCA + Stage 2 neural + Stage 3 per patient).
+  Purpose: The hypothesis test. Does NCA pre-pretraining add value?
+  Interpretation:
+    A > B > C > D  →  Full pipeline works, NCA adds value. Write paper.
+    A ≈ B > C > D  →  NCA doesn't add value, but real-data SSL works.
+                       Pivot paper to "SSL for data-scarce neural decoding."
+    A ≈ B ≈ C > D  →  Neither SSL helps. Architecture + supervision is
+                       sufficient. Pretraining story doesn't hold.
+    A ≈ B ≈ C ≈ D  →  Architecture is wrong. Rethink everything.
+```
+
 ### Future Round (expand if A shows promise)
 
 | Method | Description |
@@ -430,6 +471,37 @@ Hypothesis: Head-only or Head+embed wins.
 3. **Stage 1 throughput**: 100K+ NCA sequences x 30-50 frames x ViT encoding. Computationally feasible with batched encoding but requires attention to throughput. Estimate: ~2-4 hours on single GPU for Stage 1.
 
 4. **FHN parameter instability**: FitzHugh-Nagumo has large parameter regions producing trivial dynamics (fixed points) or numerical blow-up. Need to map the "interesting" regime using known phase diagrams before generating at scale.
+
+## 9b. Precautionary Lessons from Prior Experiments
+
+Hard-won insights from the existing supervised pipeline that directly apply to this pretraining pipeline.
+
+### Data scarcity is the wall, not architecture
+H=128 GRU showed 55x train/val gap — more capacity = more overfitting with ~150 trials. **If pretrained features aren't good enough to freeze, unfreezing will overfit immediately.** The freeze-level ablation (Section 8F) is the make-or-break diagnostic, not a nice-to-have. If "head only" doesn't work, the pretraining failed.
+
+### Mean-pooling over spatial tokens collapses spatial information
+The current pipeline's Pool(2,4) at 4mm couldn't resolve 3-5mm somatotopy. Our ViT uses 2x2 patches (~1mm, fine), but **mean-pooling all spatial tokens into one z_t vector** may lose spatial structure that the predictor needs. Consider: does the predictor need to know WHERE on the grid activity is occurring, or just WHAT the overall pattern looks like? If spatial position matters for temporal prediction, keep N spatial tokens rather than collapsing to 1 vector. This is an architecture decision worth ablating.
+
+### LOPO failed near chance — pooled training is risky
+LOPO got PER=0.846 with 7 source patients. Stage 1 multi-patient SGD early-stopped at step 800 (val diverging). **Stage 2 neural pretraining (all patients pooled) faces the same risk** — if patient-specific noise dominates, the predictor learns to predict noise. Monitor: does prediction loss decrease similarly across patients, or do some patients dominate? If one patient's loss drops 10x faster, the model is memorizing that patient's dynamics.
+
+### Augmentation tuning is within noise at this data scale
+Swept time-shift, amplitude, noise, dropout — all within PER 0.78-0.83. **Don't spend time fine-tuning NCA preprocessing params** (noise std, LPF cutoff, subsampling rate). Get a reasonable default, validate it runs, move on. Big gains come from whether NCA pretraining helps at all, not from noise_std=0.2 vs 0.15.
+
+### Auxiliary targets need negative controls — acoustic regression was an artifact
+Acoustic regression R² (~0.07 for Mel features) looked positive, but shifted control (+500ms) gave ~0.065 — not alignment-sensitive. The signal was trial structure, not motor→acoustic mapping. **Method D (random-init control) serves the same purpose for this pipeline.** Run it first. If frozen random features give similar PER to pretrained ones, pretraining learned nothing useful.
+
+### CE loss may have been fitting trial artifacts
+CE beat CTC (PER 0.700 vs 0.778), but it may have exploited epoch structure rather than neural dynamics. **The three-way Stage 3 loss comparison (CTC vs CE+learned attention vs CE+MFA) resolves this.** If CE+MFA >> CE+learned ≈ CTC on the SAME frozen features, MFA boundaries were leaking non-neural information.
+
+### MPS breaks with mixed grid sizes
+AdaptiveAvgPool2d silently falls back to CPU for non-divisible sizes. Our ViT avoids this (variable token count, no adaptive pooling), but **test with ALL grid sizes early**: 8x16, 12x22, 8x32, 8x34. Don't develop only on S14 (8x16) and discover integration bugs at scale.
+
+### Stratified splits are essential
+S33 has 52 trials across 52 possible tokens. Some tokens appear 0-1 times. **Use StratifiedKFold on the first phoneme label**, as the existing pipeline does. Inventory class distribution per patient before running any experiment.
+
+### Per-patient layers are non-negotiable for cross-patient work
+Singh (25 patients) achieves group PER 0.49 via per-patient Conv1D + shared LSTM. Without per-patient layers, pooling data across patients causes catastrophic interference. **Our per-patient patch embedding (640 params each) is the minimum required adaptation mechanism.** Do not skip it, even if it seems small.
 
 ## 10. References
 
