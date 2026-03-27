@@ -23,12 +23,20 @@ Extending Spalding 2025 (PCA+CCA alignment, SVM/Seq2Seq, 8 patients, 9 phonemes,
 - `pastwork/summaries/` — 18 active summaries (16 in `pastwork/archive/summaries/`)
 - `pastwork/verification_results.md` — All 19 errors across 8 summaries corrected
 
+### NCA-JEPA Pretraining (new pipeline, separate from supervised decoding)
+- `docs/superpowers/specs/2026-03-26-nca-jepa-pretraining-design.md` — Design spec (v14): 3-stage pipeline (synthetic → neural → CE fine-tune), generator ladder, 3 architecture families, 82 resolved decisions
+- `docs/superpowers/specs/2026-03-26-nca-jepa-implementation-plan.md` — MVP-staged implementation plan: unified architecture with `spatial_mode` axis, 6 gated phases, 92 resolved decisions
+- `docs/superpowers/specs/2026-03-26-nca-jepa-resolved-decisions.md` — 82 resolved decisions from design spec
+- `docs/superpowers/specs/2026-03-26-nca-jepa-changelog.md` — Design spec version history (v6→v14)
+- `docs/superpowers/plans/2026-03-27-nca-jepa-implementation.md` — TDD implementation plan: 17 tasks across Phases 0-2, gated on baselines
+
 ### Configs
 - `configs/default.yaml` — E2 full model LOPO config (spatial conv + articulatory CTC, H=64, blank_bias=2.0)
 - `configs/per_patient.yaml` — Per-patient config (H=32, blank_bias=0.0, tuned augmentation)
 - `configs/per_patient_flat.yaml` — Flat head ablation config (head_type=flat)
 - `configs/lopo_pilot.yaml` — LOPO pilot config (8 Spalding patients, 1 seed, blank_bias=1.0)
 - `configs/field_standard.yaml` — E1 field standard (linear + flat CTC)
+- `configs/pretrain_base.yaml` — NCA-JEPA pretraining defaults (collapse mode, d=64, stride=10)
 - `configs/paths.yaml` — Machine-specific BIDS paths (gitignored)
 
 ## Code Structure
@@ -54,16 +62,34 @@ src/speech_decoding/
 │   ├── lopo_trainer.py     # Stage 1: multi-patient SGD with gradient accumulation, step-based training
 │   ├── adaptor.py          # Stage 2: target adaptation with frozen backbone, source replay, 5-fold CV
 │   └── lopo.py             # LOPO orchestrator: loops targets × seeds, collects metrics, Wilcoxon
-└── evaluation/
-    └── metrics.py          # PER, per-position balanced accuracy, CTC length accuracy
+├── evaluation/
+│   ├── metrics.py          # PER, per-position balanced accuracy, CTC length accuracy
+│   ├── grouped_cv.py       # Grouped-by-token CV splitter (NCA-JEPA Phase 0)
+│   └── content_collapse.py # Entropy, unigram-KL, stereotypy diagnostics (NCA-JEPA Phase 0)
+└── pretraining/            # NCA-JEPA pretraining pipeline (separate from supervised)
+    ├── pretrain_model.py   # UnifiedPretrainModel: spatial_mode ∈ {collapse, preserve, attend}
+    ├── masking.py          # Span masking + learnable [MASK] token (40-60%, 3-6 spans)
+    ├── decoder.py          # Linear reconstruction decoder (discarded after pretraining)
+    ├── local_geometry_pe.py # Linear(3→d) on (row_mm, col_mm, dead_frac)
+    ├── spatial_pooling.py  # Mean-pool + top-k spatial pooling for readout
+    ├── stage1_trainer.py   # Synthetic pretraining loop (S_total/2 steps)
+    ├── stage2_trainer.py   # Neural adaptation loop (masked span prediction on real data)
+    ├── stage3_evaluator.py # Freeze backbone → CE fine-tune → PER + collapse diagnostics
+    ├── synthetic_pipeline.py # Generator → z-score → noise → dead mask → batch
+    └── generators/
+        ├── base.py         # Generator ABC
+        ├── smooth_ar.py    # Level 0: spatially-smoothed Gaussian AR(1)
+        └── switching_lds.py # Level 1: piecewise-linear dynamics, 3-6 regimes
 ```
 
 ### Scripts
 - `scripts/train_per_patient.py` — CLI for per-patient training on all PS patients × seeds
 - `scripts/train_lopo.py` — CLI for LOPO cross-patient training
 - `scripts/sweep_s14.sh` — Hyperparameter sweep on S14 (Runs 5-8)
+- `scripts/run_phase0_baselines.py` — Phase 0 baselines (Methods E, D, spatial-only) with grouped-CV
+- `scripts/train_pretrain.py` — NCA-JEPA pretraining CLI (Methods B, C, A)
 
-### Tests (127 total: 115 fast + 12 slow)
+### Tests (127 existing + NCA-JEPA tests)
 ```
 tests/
 ├── test_phoneme_map.py     # 23 tests: label normalization, CTC encoding, articulatory matrix
@@ -77,7 +103,20 @@ tests/
 ├── test_integration.py     # 7 tests: end-to-end forward/backward/overfit + real S14 (2 slow)
 ├── test_lopo_trainer.py    # 7 tests: Stage 1 multi-patient training (synthetic)
 ├── test_adaptor.py         # 6 tests: Stage 2 target adaptation (synthetic)
-└── test_lopo.py            # 4 tests: LOPO orchestrator + Wilcoxon (synthetic)
+├── test_lopo.py            # 4 tests: LOPO orchestrator + Wilcoxon (synthetic)
+├── test_grouped_cv.py      # NCA-JEPA: grouped-by-token CV splitter
+├── test_content_collapse.py # NCA-JEPA: content-collapse diagnostics
+├── test_masking.py         # NCA-JEPA: span masking module
+├── test_decoder.py         # NCA-JEPA: reconstruction decoder
+├── test_pretrain_model.py  # NCA-JEPA: unified pretrain model (all spatial_modes)
+├── test_stage2_trainer.py  # NCA-JEPA: Stage 2 neural adaptation
+├── test_stage3_evaluator.py # NCA-JEPA: Stage 3 CE fine-tune
+├── test_generators.py      # NCA-JEPA: smooth AR + switching LDS generators
+├── test_synthetic_pipeline.py # NCA-JEPA: synthetic data pipeline
+├── test_stage1_trainer.py  # NCA-JEPA: Stage 1 synthetic pretraining
+├── test_preserve_attend.py # NCA-JEPA: preserve/attend spatial modes
+├── test_local_geometry_pe.py # NCA-JEPA: positional encoding
+└── test_spatial_pooling.py # NCA-JEPA: mean + top-k pooling
 ```
 
 Run: `pytest tests/ -v -m "not slow"` (fast, no data needed) or `pytest tests/ -v` (all, needs BIDS data)
@@ -189,7 +228,17 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 - Very low variance across patients (0.828-0.856) — model is near-chance uniformly
 - **Interpretation**: Cross-patient transfer with CTC + current architecture doesn't help. Need to investigate: CE for LOPO, larger input layer, different Stage 2 strategy
 
-### Next (not yet implemented)
+### NCA-JEPA Pretraining (in progress)
+MVP-staged synthetic pretraining pipeline. 6 gated phases, implementing Phase 0 first.
+- **Phase 0** (next): Evaluation infrastructure + baselines (grouped-CV, CE mean-pool, Methods E/D/spatial-only)
+- **Phase 1**: Minimal SSL on real data (masked span prediction, Method B)
+- **Phase 2**: Minimal synthetic transfer (smooth AR generator, Methods C/A-minimal)
+- **Phase 3**: Spatial architecture comparison (collapse vs preserve vs attend modes)
+- **Phase 4-5**: Full experimental design, expansion (conditional on signal)
+- **Key architecture**: Unified `PretrainModel` with `spatial_mode` ∈ {collapse, preserve, attend}
+- **See plan**: `docs/superpowers/plans/2026-03-27-nca-jepa-implementation.md`
+
+### Other next steps
 - **Sprint 6**: Cross-task pooling — Lexical patients as additional Stage 1 sources (requires per-position phoneme filtering, not per-trial)
 
 ### In Progress
