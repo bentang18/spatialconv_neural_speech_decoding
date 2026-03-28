@@ -61,7 +61,7 @@ def main():
     with open(args.config) as f:
         model_config = yaml.safe_load(f)
 
-    bids_root = paths["bids_root"]
+    bids_root = paths.get("ps_bids_root") or paths["bids_root"]
     output_dir = Path(args.output_dir) / f"method_{args.method}" / args.target
     output_dir.mkdir(parents=True, exist_ok=True)
 

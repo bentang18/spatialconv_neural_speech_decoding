@@ -74,8 +74,10 @@ def train_ce_fold(
         for p in readin.parameters():
             p.requires_grad = False
 
-    params = [p for p in list(readin.parameters()) + list(backbone.parameters()) + list(head.parameters())
-              if p.requires_grad]
+    all_params = list(readin.parameters()) + list(head.parameters())
+    if backbone is not None:
+        all_params += list(backbone.parameters())
+    params = [p for p in all_params if p.requires_grad]
     if not params:
         params = list(head.parameters())
 
@@ -193,7 +195,7 @@ def main():
     import yaml
     with open(args.paths) as f:
         paths = yaml.safe_load(f)
-    bids_root = paths["bids_root"]
+    bids_root = paths.get("ps_bids_root") or paths["bids_root"]
 
     patients = args.patients or (PS_PATIENTS if args.all else ["S14"])
     output_dir = Path(args.output_dir)
