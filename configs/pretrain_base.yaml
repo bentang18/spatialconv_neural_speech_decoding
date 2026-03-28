@@ -1,0 +1,26 @@
+# NCA-JEPA pretraining defaults — collapse mode
+spatial_mode: collapse
+d: 64
+gru_hidden: 32
+gru_layers: 2
+temporal_stride: 10  # 200Hz → 20Hz
+mask_ratio: [0.4, 0.6]
+mask_spans: [3, 6]
+
+spatial_conv:
+  channels: 8
+  pool_h: 4
+  pool_w: 8
+
+stage2:
+  lr: 1e-3
+  weight_decay: 1e-4
+  steps: 5000
+  batch_size: 8
+  checkpoint_every: 1000
+
+stage3:
+  lr: 1e-3
+  epochs: 100
+  patience: 10
+  n_folds: 5
