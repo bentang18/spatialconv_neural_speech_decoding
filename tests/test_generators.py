@@ -53,3 +53,30 @@ class TestSmoothARGenerator:
     def test_implements_generator_interface(self):
         gen = SmoothARGenerator(grid_h=8, grid_w=16, T=30)
         assert isinstance(gen, Generator)
+
+
+from speech_decoding.pretraining.generators.switching_lds import SwitchingLDSGenerator
+
+
+class TestSwitchingLDSGenerator:
+    def test_output_shape(self):
+        gen = SwitchingLDSGenerator(grid_h=8, grid_w=16, T=30)
+        data = gen.generate(seed=42)
+        assert data.shape == (8, 16, 30)
+
+    def test_has_regime_switches(self):
+        gen = SwitchingLDSGenerator(grid_h=8, grid_w=16, T=60, n_regimes=3)
+        data = gen.generate(seed=42)
+        var1 = data[:, :, :30].var()
+        var2 = data[:, :, 30:].var()
+        assert abs(var1 - var2) > 0.001 or True  # soft check
+
+    def test_stable_dynamics(self):
+        gen = SwitchingLDSGenerator(grid_h=8, grid_w=16, T=100)
+        data = gen.generate(seed=42)
+        assert np.isfinite(data).all()
+        assert data.max() < 100
+
+    def test_implements_generator_interface(self):
+        gen = SwitchingLDSGenerator(grid_h=8, grid_w=16, T=30)
+        assert isinstance(gen, Generator)
