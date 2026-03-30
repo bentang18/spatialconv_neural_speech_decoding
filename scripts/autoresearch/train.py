@@ -48,6 +48,7 @@ MIXUP_ALPHA = 0.2     # 0 = no mixup, >0 = Beta(alpha, alpha) interpolation
 EMA_DECAY = 0         # 0 = no EMA, >0 = exponential moving average for eval
 TTA_COPIES = 16       # test-time augmentation: average over N augmented copies
 HEAD_TYPE = "dual"  # "ce" = standard linear, "articulatory" = CEBRA-style, "dual" = both
+CV_MODE = "grouped"  # "grouped" = grouped-by-token (fair), "stratified" = stratified (leaky)
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -524,11 +525,16 @@ if __name__ == "__main__":
 
     # Load data
     grids, labels, token_ids = prepare.load_target_data()
-    splits = prepare.create_cv_splits(token_ids)
+    if CV_MODE == "stratified":
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=prepare.N_FOLDS, shuffle=True, random_state=42)
+        splits = [(tr.tolist(), va.tolist()) for tr, va in kf.split(np.zeros(len(labels)))]
+    else:
+        splits = prepare.create_cv_splits(token_ids)
 
     N, H, W, T = grids.shape
     print(f"Target: {prepare.TARGET_PATIENT}  |  Trials: {N}  |  Grid: {H}x{W}  |  T: {T}")
-    print(f"Folds: {len(splits)}  |  Device: {DEVICE}")
+    print(f"Folds: {len(splits)}  |  Device: {DEVICE}  |  CV: {CV_MODE}")
     n_params = sum(p.numel() for p in Model().parameters())
     print(f"Model params: {n_params:,}")
     print()
