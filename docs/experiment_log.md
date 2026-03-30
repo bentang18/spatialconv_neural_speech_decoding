@@ -133,13 +133,81 @@ Evaluation:
   Best-of: pick min(linear_PER, kNN_PER) per fold
 ```
 
-### What to Try Next
+### Stratified CV Comparison (exp17 recipe)
 
-- **Multi-patient semi-supervised** (fair eval: exclude val-fold from CE)
-- **VICReg with proj_dim ≤ batch_size** (the original failure was dim mismatch)
-- **Self-distillation** (use k-NN soft targets for 2nd training round)
-- **Cross-patient features** (align source patients to S14 grid, use for augmentation)
-- **Different backbone** (1D dilated CNN instead of BiGRU)
+| CV Type | PER | Notes |
+|---------|-----|-------|
+| **Stratified** (random KFold, leaky) | **0.662** | Token reps can leak across folds |
+| **Grouped-by-token** (fair) | **0.737** | No token leakage |
+| Historical stratified (CE only) | 0.700 | No k-NN/TTA/articulatory |
+| Historical grouped (CE only) | 0.825 | No k-NN/TTA/articulatory |
+
+Leakage gap narrowed from 0.125 (old) → 0.075 (now). k-NN + articulatory + TTA improvements are more robust to eval protocol than CE-only.
+
+### Critical Insight: Autoresearch k-NN is on SUPERVISED Features
+
+**The autoresearch k-NN (0.737) operates on CE-trained backbone embeddings, NOT SSL/JEPA features.** The model is trained from scratch with CE loss on S14 labeled data. k-NN just replaces the linear head at eval time — it's a better evaluation method, not SSL.
+
+The JEPA k-NN result (0.811) used SSL-pretrained features with basic unweighted k-NN, no TTA, no articulatory head. **The improved eval recipe (weighted k-NN + TTA 16 + dual articulatory head) has NEVER been applied to JEPA features.** This is the highest-priority next experiment.
+
+---
+
+## Next Direction: Full SSL Exploration
+
+The autoresearch session optimized within the supervised single-patient regime. The SSL solution space remains largely unexplored. Below is the roadmap for systematic SSL exploration.
+
+### Priority 1: Apply Autoresearch Eval Recipe to JEPA Features
+
+The autoresearch eval improvements (weighted k-NN, TTA, articulatory head) should transfer directly to JEPA-pretrained features. This is the fastest way to test whether SSL + better eval can beat supervised + better eval.
+
+**Experiment:** Load JEPA checkpoint → Stage 3 with:
+- Weighted k-NN (k=10, cosine sim weights) instead of unweighted
+- TTA 16 copies on val embeddings
+- Dual head (CE + articulatory) for linear comparison
+- Best-of per fold
+
+**Expected outcome:** JEPA k-NN was 0.811 with basic eval. Weighted k-NN + TTA should push this significantly lower. If JEPA + improved eval < supervised + improved eval (0.737), then SSL feature quality is the bottleneck. If JEPA + improved eval ≈ 0.737, then the features are equivalent and training doesn't matter.
+
+### Priority 2: SSL Objectives Not Yet Tested
+
+| Objective | Status | Why Re-explore |
+|-----------|--------|---------------|
+| **JEPA + improved eval** | Never tested | Priority 1 above |
+| **VICReg (fixed proj_dim)** | Never tested | Original failure was batch_size=8 vs proj_dim=256. With proj_dim ≤ batch_size, covariance regularization should work |
+| **Fair semi-supervised** | Never tested | Semi-supervised BYOL got 0.040 PER but with data leakage. Fix: exclude val-fold tokens from Stage 2 CE |
+| **CEBRA InfoNCE** | Partially tested | Articulatory head in autoresearch is CEBRA-like but supervised. True CEBRA would use InfoNCE on multi-patient SSL features aligned to articulatory targets |
+| **Barlow Twins** | Never tested | Simpler than VICReg — just cross-correlation matrix → identity. No variance/covariance splitting |
+| **wav2vec-style CPC** | Never tested | Contrastive predictive coding on temporal sequences. Different from JEPA (reconstruction vs contrastive) |
+| **Multi-patient SupCon** | Never tested | SupCon failed on single-patient because CE was better. With multi-patient SSL (no labels for source patients), SupCon on S14 labels + self-supervised on sources could combine benefits |
+
+### Priority 3: Hybrid SSL + Supervised
+
+| Approach | Description |
+|----------|-------------|
+| **JEPA pretrain → supervised fine-tune with autoresearch recipe** | Pretrain backbone with JEPA on all patients, then fine-tune with CE + label smoothing + mixup + focal + dual head on S14 |
+| **LP-FT (Linear Probe then Fine-Tune)** | Freeze JEPA backbone → train linear probe → unfreeze backbone → fine-tune with low LR. Kumar et al. 2022 showed this beats direct fine-tuning |
+| **Feature concatenation** | Concatenate JEPA features (64-dim) with supervised features (64-dim) → 128-dim → k-NN. Different training objectives capture complementary structure |
+| **Multi-view k-NN** | Run k-NN on JEPA features AND supervised features separately, average the per-position class probabilities |
+
+### Priority 4: Architecture Improvements for SSL
+
+| Approach | Description |
+|----------|-------------|
+| **Larger SSL pretraining corpus** | Include S26 (dev patient), Lexical patients (13 more), cross-task data from Duraivel 2025 |
+| **Longer pretraining** | JEPA trained 5000 steps. Try 20K-50K steps with LR decay |
+| **Masking schedule** | JEPA used 40-60% mask, 3-6 spans. Try curriculum: easy→hard masking |
+| **Multi-scale JEPA** | Predict at multiple temporal resolutions (stride 5 + stride 10) |
+| **Patient-conditional JEPA** | Add patient embedding to condition the prediction, helping the model learn patient-invariant features |
+
+### Key Open Questions
+
+1. **Are JEPA features complementary to supervised features?** If k-NN on JEPA and supervised features make different errors, combining them could beat either alone.
+
+2. **Is the eval recipe the ceiling, or can better training still help?** The autoresearch session suggests eval dominates. But that was within single-patient supervised — multi-patient SSL might change the landscape.
+
+3. **Does articulatory structure help SSL?** The articulatory head improved supervised k-NN. Can we inject articulatory structure INTO the SSL objective (e.g., CEBRA-style InfoNCE with articulatory targets)?
+
+4. **What's the right SSL → supervised handoff?** Options: frozen backbone (current), LP-FT, full fine-tune, feature concatenation. Each has different properties at N=120.
 
 ---
 
@@ -148,8 +216,12 @@ Evaluation:
 | Metric | Value |
 |--------|-------|
 | Chance PER | 0.889 |
-| **Autoresearch best (exp17)** | **0.737** |
+| **Autoresearch best (grouped, exp17)** | **0.737** |
+| **Autoresearch best (stratified)** | **0.662** |
 | Supervised baseline (grouped) | 0.825-0.872 |
 | Supervised baseline (stratified, leaky) | 0.700 |
+| JEPA k-NN k=10 (grouped, basic eval) | 0.811 |
+| JEPA linear probe (grouped) | 0.854 |
+| All SSL linear probes (grouped) | 0.854-0.911 |
 | Per-patient data | ~150 trials, ~1 min utterance |
-| Previous SSL best (JEPA k-NN k=10) | 0.811 |
+| Multi-patient SSL corpus | ~1621 trials, 11 patients |
