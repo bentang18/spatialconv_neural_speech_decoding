@@ -1,0 +1,7 @@
+commit	val_per	training_sec	status	description
+baseline	0.871635	201.0	keep	SpatialConv(8ch,pool4x8) + BiGRU(32,2L) + CE mean-pool, grouped-by-token CV
+exp01	0.830806	210.7	keep	label smoothing 0.1 — prevents overconfidence, big win on worst folds
+exp02	0.819140	212.4	keep	separate per-position heads + dropout 0.3 before head — decouples positions
+exp03	0.802052	234.1	keep	mixup alpha=0.2 — interpolate pairs + soft CE, reduces overfitting
+exp04	0.812397	321.9	discard	EMA decay=0.998 — slower, exceeded time budget, more variable folds
+exp05	0.845444	205.8	discard	per-position attention pooling — worse, only 30 timesteps too few for learned queries
