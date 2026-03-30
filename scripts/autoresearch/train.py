@@ -46,7 +46,7 @@ LABEL_SMOOTHING = 0.1 # 0.0 = hard labels, >0 = regularize
 MIXUP_ALPHA = 0.2     # 0 = no mixup, >0 = Beta(alpha, alpha) interpolation
 EMA_DECAY = 0         # 0 = no EMA, >0 = exponential moving average for eval
 TTA_COPIES = 8        # test-time augmentation: average over N augmented copies
-HEAD_TYPE = "articulatory"  # "ce" = standard linear, "articulatory" = CEBRA-style
+HEAD_TYPE = "dual"  # "ce" = standard linear, "articulatory" = CEBRA-style, "dual" = both
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -269,13 +269,20 @@ class Model(nn.Module):
         super().__init__()
         self.readin = SpatialReadIn()
         self.backbone = Backbone(d_in=self.readin.d_flat)
-        if HEAD_TYPE == "articulatory":
+        if HEAD_TYPE == "dual":
+            self.head_ce = CEHead(d_in=self.backbone.out_dim)
+            self.head_art = ArticulatoryHead(d_in=self.backbone.out_dim)
+            self.head = self.head_ce  # for param group
+        elif HEAD_TYPE == "articulatory":
             self.head = ArticulatoryHead(d_in=self.backbone.out_dim)
         else:
             self.head = CEHead(d_in=self.backbone.out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.backbone(self.readin(x)))
+        h = self.backbone(self.readin(x))
+        if HEAD_TYPE == "dual":
+            return (self.head_ce(h) + self.head_art(h)) / 2
+        return self.head(h)
 
 
 # ============================================================
@@ -373,11 +380,14 @@ def train_fold(
     model = Model().to(DEVICE)
     ema_model = deepcopy(model) if EMA_DECAY > 0 else None
 
+    head_params = list(model.head.parameters())
+    if HEAD_TYPE == "dual":
+        head_params = list(model.head_ce.parameters()) + list(model.head_art.parameters())
     optimizer = AdamW(
         [
             {"params": model.readin.parameters(), "lr": LR * READIN_LR_MULT},
             {"params": model.backbone.parameters(), "lr": LR},
-            {"params": model.head.parameters(), "lr": LR},
+            {"params": head_params, "lr": LR},
         ],
         weight_decay=WEIGHT_DECAY,
     )
