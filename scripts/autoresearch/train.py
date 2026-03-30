@@ -43,6 +43,7 @@ WARMUP_EPOCHS = 20
 PATIENCE = 7          # early stopping (in eval_every units)
 EVAL_EVERY = 10       # validate every N epochs
 LABEL_SMOOTHING = 0.1 # 0.0 = hard labels, >0 = regularize
+FOCAL_GAMMA = 2.0     # 0 = standard CE, >0 = focal loss (down-weight easy examples)
 MIXUP_ALPHA = 0.2     # 0 = no mixup, >0 = Beta(alpha, alpha) interpolation
 EMA_DECAY = 0         # 0 = no EMA, >0 = exponential moving average for eval
 TTA_COPIES = 8        # test-time augmentation: average over N augmented copies
@@ -289,28 +290,33 @@ class Model(nn.Module):
 # LOSS  (swap freely: CE, CTC, focal, etc.)
 # ============================================================
 
+def focal_ce(logits: torch.Tensor, targets: torch.Tensor, gamma: float = FOCAL_GAMMA) -> torch.Tensor:
+    """Focal cross-entropy: down-weight easy examples."""
+    ce = F.cross_entropy(logits, targets, label_smoothing=LABEL_SMOOTHING, reduction='none')
+    if gamma > 0:
+        pt = torch.exp(-ce)  # probability of correct class
+        ce = ((1 - pt) ** gamma) * ce
+    return ce.mean()
+
+
 def compute_loss(
     logits: torch.Tensor,
     labels: list[list[int]],
     mixup_labels: list[list[int]] | None = None,
     mixup_lam: float = 1.0,
 ) -> torch.Tensor:
-    """Per-position CE with label smoothing and optional mixup."""
+    """Per-position focal CE with label smoothing and optional mixup."""
     loss = torch.tensor(0.0, device=logits.device)
     for pos in range(prepare.N_POSITIONS):
         tgt = torch.tensor(
             [l[pos] - 1 for l in labels], dtype=torch.long, device=logits.device,
         )
-        pos_loss = F.cross_entropy(
-            logits[:, pos, :], tgt, label_smoothing=LABEL_SMOOTHING,
-        )
+        pos_loss = focal_ce(logits[:, pos, :], tgt)
         if mixup_labels is not None:
             tgt2 = torch.tensor(
                 [l[pos] - 1 for l in mixup_labels], dtype=torch.long, device=logits.device,
             )
-            pos_loss2 = F.cross_entropy(
-                logits[:, pos, :], tgt2, label_smoothing=LABEL_SMOOTHING,
-            )
+            pos_loss2 = focal_ce(logits[:, pos, :], tgt2)
             pos_loss = mixup_lam * pos_loss + (1 - mixup_lam) * pos_loss2
         loss = loss + pos_loss
     return loss / prepare.N_POSITIONS
