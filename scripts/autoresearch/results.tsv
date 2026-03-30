@@ -12,3 +12,4 @@ exp09	0.816909	365.0	discard	center loss (wt=0.1) — destroyed linear head, did
 exp10	0.767482	244.8	keep	TTA 8 copies — average logits+embeddings over augmented val copies
 exp11	0.762616	214.8	keep	CEBRA articulatory head — project to 15-dim articulatory features, cosine classify
 exp12	0.756434	256.0	keep	dual head (CE+articulatory averaged logits) — ensemble reduces variance
+exp13	0.754700	253.1	keep	+ focal loss γ=2 — marginal improvement, focuses on hard phonemes
