@@ -13,3 +13,6 @@ exp10	0.767482	244.8	keep	TTA 8 copies — average logits+embeddings over augmen
 exp11	0.762616	214.8	keep	CEBRA articulatory head — project to 15-dim articulatory features, cosine classify
 exp12	0.756434	256.0	keep	dual head (CE+articulatory averaged logits) — ensemble reduces variance
 exp13	0.754700	253.1	keep	+ focal loss γ=2 — marginal improvement, focuses on hard phonemes
+exp14	0.797894	220.8	discard	H=64 (298K params) — still overfits despite regularization, H=32 better at N=120
+exp15	0.797746	250.6	discard	proj head SupCon (wt=0.3,τ=0.2) — contrastive STILL hurts even through separate head
+exp16	0.782397	247.9	discard	mixup alpha=0.4 — too aggressive, fewer clean examples

@@ -46,7 +46,7 @@ LABEL_SMOOTHING = 0.1 # 0.0 = hard labels, >0 = regularize
 FOCAL_GAMMA = 2.0     # 0 = standard CE, >0 = focal loss (down-weight easy examples)
 MIXUP_ALPHA = 0.2     # 0 = no mixup, >0 = Beta(alpha, alpha) interpolation
 EMA_DECAY = 0         # 0 = no EMA, >0 = exponential moving average for eval
-TTA_COPIES = 8        # test-time augmentation: average over N augmented copies
+TTA_COPIES = 16       # test-time augmentation: average over N augmented copies
 HEAD_TYPE = "dual"  # "ce" = standard linear, "articulatory" = CEBRA-style, "dual" = both
 
 # ============================================================
@@ -346,19 +346,23 @@ def knn_predict(
     val_emb: torch.Tensor,
     k: int = 10,
 ) -> list[list[int]]:
-    """Per-position k-NN classification. Returns 1-indexed predictions."""
-    # Normalize embeddings for cosine similarity
+    """Per-position weighted k-NN classification. Returns 1-indexed predictions."""
     train_n = F.normalize(train_emb, dim=1)
     val_n = F.normalize(val_emb, dim=1)
-    sim = val_n @ train_n.T                  # (N_val, N_train)
-    _, topk_idx = sim.topk(k, dim=1)         # (N_val, k)
+    sim = val_n @ train_n.T                        # (N_val, N_train)
+    topk_sim, topk_idx = sim.topk(k, dim=1)        # (N_val, k)
 
     preds = []
     for i in range(val_emb.shape[0]):
         pred = []
         for pos in range(prepare.N_POSITIONS):
-            votes = [train_labels[j][pos] for j in topk_idx[i].tolist()]
-            pred.append(max(set(votes), key=votes.count))
+            # Weighted voting: each neighbor's vote weighted by similarity
+            class_weights = [0.0] * (prepare.N_CLASSES + 1)
+            for j_idx in range(k):
+                j = topk_idx[i, j_idx].item()
+                cls = train_labels[j][pos]
+                class_weights[cls] += topk_sim[i, j_idx].item()
+            pred.append(int(np.argmax(class_weights[1:]) + 1))
         preds.append(pred)
     return preds
 
