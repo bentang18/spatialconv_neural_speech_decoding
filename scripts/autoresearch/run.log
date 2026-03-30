@@ -1,25 +1,21 @@
-   Building speech-decoding @ file:///Users/bentang/Documents/Code/speech
-      Built speech-decoding @ file:///Users/bentang/Documents/Code/speech
-Uninstalled 1 package in 1ms
-Installed 1 package in 0.87ms
 Target: S14  |  Trials: 153  |  Grid: 8x16  |  T: 301
 Folds: 5  |  Device: mps
 Model params: 115,787
 
-  Fold 1/5: PER=0.6875 (linear=0.7708, kNN=0.6875)  (50.8s)
-  Fold 2/5: PER=0.8222 (linear=0.8444, kNN=0.8222)  (45.3s)
-  Fold 3/5: PER=0.7778 (linear=0.7778, kNN=0.7778)  (55.6s)
-  Fold 4/5: PER=0.8000 (linear=0.8000, kNN=0.8333)  (39.6s)
-  Fold 5/5: PER=0.8172 (linear=0.8172, kNN=0.8387)  (45.5s)
+  Fold 1/5: PER=0.7292 (linear=0.7396, kNN=0.7292)  (50.2s)
+  Fold 2/5: PER=0.8333 (linear=0.8333, kNN=0.8556)  (45.1s)
+  Fold 3/5: PER=0.7444 (linear=0.8111, kNN=0.7444)  (45.4s)
+  Fold 4/5: PER=0.7778 (linear=0.7778, kNN=0.8000)  (54.8s)
+  Fold 5/5: PER=0.7527 (linear=0.8065, kNN=0.7527)  (49.4s)
 
 ---
-val_per:            0.780941
-val_per_std:        0.049242
-fold_pers:          [0.6875, 0.8222222222222222, 0.7777777777777778, 0.8, 0.8172043010752689]
-linear_pers:        [0.7708333333333334, 0.8444444444444444, 0.7777777777777778, 0.8, 0.8172043010752689]
-knn_pers:           [0.6875, 0.8222222222222222, 0.7777777777777778, 0.8333333333333334, 0.8387096774193549]
-training_seconds:   236.8
+val_per:            0.767482
+val_per_std:        0.036497
+fold_pers:          [0.7291666666666666, 0.8333333333333334, 0.7444444444444445, 0.7777777777777778, 0.7526881720430108]
+linear_pers:        [0.7395833333333334, 0.8333333333333334, 0.8111111111111111, 0.7777777777777778, 0.8064516129032258]
+knn_pers:           [0.7291666666666666, 0.8555555555555555, 0.7444444444444445, 0.8, 0.7526881720430108]
+training_seconds:   244.8
 collapsed:          False
-mean_entropy:       2.609
-stereotypy:         0.111
-unique_ratio:       0.438
+mean_entropy:       2.763
+stereotypy:         0.052
+unique_ratio:       0.458
