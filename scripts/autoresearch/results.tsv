@@ -16,3 +16,12 @@ exp13	0.754700	253.1	keep	+ focal loss γ=2 — marginal improvement, focuses on
 exp14	0.797894	220.8	discard	H=64 (298K params) — still overfits despite regularization, H=32 better at N=120
 exp15	0.797746	250.6	discard	proj head SupCon (wt=0.3,τ=0.2) — contrastive STILL hurts even through separate head
 exp16	0.782397	247.9	discard	mixup alpha=0.4 — too aggressive, fewer clean examples
+exp17	0.737146	268.0	keep	weighted k-NN + TTA 16 — BEST RESULT
+exp18	0.787545	259.5	discard	k=15 TTA=32 — over-smooths
+exp19	0.768925	222.3	discard	snapshot ensemble
+exp20	0.755035	379.4	discard	patience 15 — budget
+exp21	0.772204	282.3	discard	CutMix+dropout 0.5
+exp22	0.791295	226.7	discard	temporal derivatives+WD 1e-3
+exp23	0.787153	307.8	discard	stride=5 — budget
+exp24	0.757074	265.2	discard	soft k-NN — too diffuse
+exp25	0.776223	239.7	discard	label smoothing 0.15 — 0.1 is optimal

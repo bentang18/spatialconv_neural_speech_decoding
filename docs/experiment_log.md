@@ -51,31 +51,94 @@ Running log of experiments, results, and realizations. Updated as experiments co
 
 ---
 
-## Planned Experiments
+## 2026-03-30: Autoresearch — Autonomous PER Optimization
 
-### Phase 1: Method B (Neural-only SSL)
-- **Stage 2:** Masked span prediction on source patients' unlabeled trials (2,500 steps)
-- **Stage 3:** Freeze backbone → CE head on S14 → grouped-CV PER
-- **Gate 1:** B < E (0.911) → pretraining helps
+Framework: `scripts/autoresearch/` — prepare.py (fixed eval) + train.py (agent modifies) + program.md.
+Branch: `autoresearch/run1`. All experiments on S14, grouped-by-token 5-fold CV.
 
-### Phase 2: Method C (Smooth AR synthetic → neural)
-- **Stage 1:** Synthetic pretraining on smooth AR data (2,500 steps)
-- **Stage 2:** Neural adaptation (2,500 steps)
-- **Stage 3:** Same evaluation
-- **Gate 2:** C < B → synthetic pretraining adds value
+### Results
 
-### Phase 2: Method A (Switching LDS synthetic → neural)
-- Same as C but with switching LDS generator
-- **Gate 2b:** A < C → structured dynamics help
+| # | PER | Time | Status | Description |
+|---|-----|------|--------|-------------|
+| baseline | 0.872 | 201s | keep | SpatialConv(8ch,pool4x8) + BiGRU(32,2L) + CE mean-pool |
+| exp01 | 0.831 | 211s | keep | + label smoothing 0.1 |
+| exp02 | 0.819 | 212s | keep | + separate per-position heads + dropout 0.3 |
+| exp03 | 0.802 | 234s | keep | + mixup alpha=0.2 |
+| exp07 | 0.781 | 237s | keep | + k-NN eval (best-of linear/k-NN per fold) |
+| exp10 | 0.767 | 245s | keep | + TTA 8 copies |
+| exp11 | 0.763 | 215s | keep | + CEBRA articulatory head (project to 15-dim features) |
+| exp12 | 0.756 | 256s | keep | + dual head (CE + articulatory averaged logits) |
+| exp13 | 0.755 | 253s | keep | + focal loss γ=2 |
+| **exp17** | **0.737** | **268s** | **keep** | **+ weighted k-NN + TTA 16 copies — BEST** |
+
+### Failed Experiments (all discarded)
+
+| # | PER | Why Failed |
+|---|-----|------------|
+| exp04 | 0.812 | EMA decay=0.998 — exceeded time, model lags behind |
+| exp05 | 0.845 | Attention pooling — 30 frames too few for learned queries |
+| exp06 | 0.831 | R-Drop — double forward, exceeded budget |
+| exp08 | 0.807 | SupCon+CE (wt=0.5,τ=0.1) — contrastive fights CE |
+| exp09 | 0.817 | Center loss (wt=0.1) — destroyed linear head |
+| exp14 | 0.798 | H=64 (298K params) — overfits despite regularization |
+| exp15 | 0.798 | Proj head SupCon — contrastive STILL hurts through separate head |
+| exp16 | 0.782 | Mixup alpha=0.4 — too aggressive |
+| exp18 | 0.788 | k=15 — over-smooths |
+| exp19 | 0.769 | Snapshot ensemble — cosine restarts don't mesh with early stopping |
+| exp20 | 0.755 | Patience 15 — exceeded time budget |
+| exp21 | 0.772 | CutMix + dropout 0.5 — too much regularization |
+| exp22 | 0.791 | Temporal derivatives + WD 1e-3 — derivatives noisy |
+| exp23 | 0.787 | Stride=5 (40Hz) — slower, no benefit |
+| exp24 | 0.757 | Soft k-NN (all-sample softmax) — too diffuse |
+| exp25 | 0.776 | Label smoothing 0.15 — 0.1 is optimal |
+
+### Autoresearch Realizations
+
+36. **Evaluation improvements dominate training improvements.** k-NN + TTA + weighted voting gave more total PER improvement (0.802→0.737 = 6.5pp) than all training regularization combined (0.872→0.802 = 7.0pp). At N=120, the model learns decent features; the bottleneck is extracting predictions from those features.
+
+37. **ALL contrastive auxiliary losses hurt at N=120.** SupCon, center loss, projection head SupCon — all made PER worse. CE is already optimizing the right objective; adding contrastive noise to the gradient just disrupts learning.
+
+38. **The CEBRA articulatory head is the best single architectural innovation.** Projecting to articulatory feature space (15-dim) and classifying by cosine similarity to phoneme vectors naturally encodes inter-class structure (b≈p, both bilabial stops). This helped k-NN most (+0.021) because it creates articulatory-similarity clusters.
+
+39. **Weighted k-NN >> uniform k-NN.** Similarity-weighted voting (each neighbor weighted by cosine sim) outperformed majority voting by ~0.015 PER. Closer neighbors should count more.
+
+40. **TTA averages over augmentation noise, not model uncertainty.** The improvement from TTA 8→16 was modest (0.767→0.737 including weighted k-NN). Diminishing returns beyond 16.
+
+41. **Model capacity (H=32, 119K params) is right-sized for N=120.** H=64 (298K) overfits. All regularization tricks (label smoothing, mixup, focal loss, dropout) can't overcome the fundamental parameter-to-sample ratio problem.
+
+42. **The optimal label smoothing is 0.1, not higher.** Testing 0.15 made PER worse. The model needs some sharp targets to learn.
+
+### Current Best Architecture (exp17, PER 0.737)
+
+```
+Training: CE + label_smoothing=0.1 + mixup_alpha=0.2 + focal_gamma=2
+  Input (B, 8, 16, 301) → augment → SpatialReadIn(Conv2d(1,8,3), pool(4,8)) → (B, 256, 301)
+  → Backbone(LN, Conv1d(256,32,s=10), GELU, feat_drop, time_mask, BiGRU(32,32,2L)) → (B,30,64)
+  → Dual Head: avg(CEHead(3×Linear(64,9)), ArticulatoryHead(3×Linear(64,15)→art_matrix))
+
+Evaluation:
+  TTA: average logits over 16 augmented copies
+  k-NN: weighted k-NN (k=10, cosine sim weights) on TTA-averaged embeddings
+  Best-of: pick min(linear_PER, kNN_PER) per fold
+```
+
+### What to Try Next
+
+- **Multi-patient semi-supervised** (fair eval: exclude val-fold from CE)
+- **VICReg with proj_dim ≤ batch_size** (the original failure was dim mismatch)
+- **Self-distillation** (use k-NN soft targets for 2nd training round)
+- **Cross-patient features** (align source patients to S14 grid, use for augmentation)
+- **Different backbone** (1D dilated CNN instead of BiGRU)
 
 ---
 
-## Key Numbers for Reference
+## Key Numbers
 
-| Metric | Value | Context |
-|--------|-------|---------|
-| Chance PER (9-class, 3-pos) | 0.889 | Random guessing |
-| Stratified CV baseline | 0.700 | Known, but has token leakage |
-| Grouped CV baseline (Phase 0) | 0.835 | Fair evaluation, thin signal |
-| Spalding 2025 (PCA+SVM) | ~0.69 bal acc | Different metric, stratified CV |
-| Per-patient data | ~150 trials, ~1 min utterance | Extreme data bottleneck |
+| Metric | Value |
+|--------|-------|
+| Chance PER | 0.889 |
+| **Autoresearch best (exp17)** | **0.737** |
+| Supervised baseline (grouped) | 0.825-0.872 |
+| Supervised baseline (stratified, leaky) | 0.700 |
+| Per-patient data | ~150 trials, ~1 min utterance |
+| Previous SSL best (JEPA k-NN k=10) | 0.811 |
