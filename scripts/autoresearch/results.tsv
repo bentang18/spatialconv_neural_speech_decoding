@@ -25,3 +25,6 @@ exp22	0.791295	226.7	discard	temporal derivatives+WD 1e-3
 exp23	0.787153	307.8	discard	stride=5 — budget
 exp24	0.757074	265.2	discard	soft k-NN — too diffuse
 exp25	0.776223	239.7	discard	label smoothing 0.15 — 0.1 is optimal
+exp26	0.802200	229.7	discard	mean+max pool concat — extra head params hurt
+exp27	0.758508	265.0	discard	TTA on train embeddings — adds noise to k-NN reference
+exp28	0.773929	137.9	discard	dilated CNN backbone — 2x faster but BiGRU context matters

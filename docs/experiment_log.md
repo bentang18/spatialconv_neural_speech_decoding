@@ -91,6 +91,9 @@ Branch: `autoresearch/run1`. All experiments on S14, grouped-by-token 5-fold CV.
 | exp23 | 0.787 | Stride=5 (40Hz) — slower, no benefit |
 | exp24 | 0.757 | Soft k-NN (all-sample softmax) — too diffuse |
 | exp25 | 0.776 | Label smoothing 0.15 — 0.1 is optimal |
+| exp26 | 0.802 | Mean+max pool concat — extra head params hurt |
+| exp27 | 0.759 | TTA on train embeddings — adds noise to reference |
+| exp28 | 0.774 | Dilated CNN backbone — 2x faster but BiGRU context matters |
 
 ### Autoresearch Realizations
 
@@ -107,6 +110,14 @@ Branch: `autoresearch/run1`. All experiments on S14, grouped-by-token 5-fold CV.
 41. **Model capacity (H=32, 119K params) is right-sized for N=120.** H=64 (298K) overfits. All regularization tricks (label smoothing, mixup, focal loss, dropout) can't overcome the fundamental parameter-to-sample ratio problem.
 
 42. **The optimal label smoothing is 0.1, not higher.** Testing 0.15 made PER worse. The model needs some sharp targets to learn.
+
+43. **Mean+max pooling adds parameters without adding information at 30 frames.** Max-pool picks the single highest-activation frame, which is noise-sensitive. Mean-pool is the right inductive bias for short sequences where information is distributed.
+
+44. **Train embeddings should NOT be TTA'd.** Augmenting train embeddings during k-NN eval adds noise to reference points. The clean (unaugmented) train embeddings are more reliable because the model was trained to produce good features for those exact inputs.
+
+45. **Dilated CNN is 2× faster but BiGRU is better.** Bidirectional recurrence integrates context from the ENTIRE 30-frame sequence into every frame. Dilated CNN with receptive field 7 misses long-range temporal dependencies. The speed advantage doesn't compensate.
+
+46. **We're approaching the data ceiling.** After 23 experiments, the improvements are getting smaller. The fundamental limit is ~120 training trials with 27 classification targets (3×9). More training data (cross-patient, cross-task) is the most likely path to break through 0.7.
 
 ### Current Best Architecture (exp17, PER 0.737)
 
