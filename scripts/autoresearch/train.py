@@ -46,6 +46,7 @@ LABEL_SMOOTHING = 0.1 # 0.0 = hard labels, >0 = regularize
 MIXUP_ALPHA = 0.2     # 0 = no mixup, >0 = Beta(alpha, alpha) interpolation
 EMA_DECAY = 0         # 0 = no EMA, >0 = exponential moving average for eval
 TTA_COPIES = 8        # test-time augmentation: average over N augmented copies
+HEAD_TYPE = "articulatory"  # "ce" = standard linear, "articulatory" = CEBRA-style
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -219,12 +220,59 @@ class CEHead(nn.Module):
         return torch.stack([head(pooled) for head in self.heads], dim=1)
 
 
+# Articulatory feature matrix: reorder from ARPA to PS label order (0-indexed)
+# PS labels: a=0, ae=1, b=2, g=3, i=4, k=5, p=6, u=7, v=8
+# ARPA rows: AA=0, EH=1, IY=2, UH=3, B=4, P=5, V=6, G=7, K=8
+_ARPA_TO_PS = [0, 1, 4, 7, 2, 8, 5, 3, 6]  # ARPA row -> PS 0-indexed class
+_ART_MATRIX_PS = np.array([
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],  # a: vowel, low, central
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0],  # ae: vowel, mid, front
+    [1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # b: consonant, bilabial, stop, voiced
+    [1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # g: consonant, velar, stop, voiced
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0],  # i: vowel, high, front
+    [1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # k: consonant, velar, stop, voiceless
+    [1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # p: consonant, bilabial, stop, voiceless
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1],  # u: vowel, high, back
+    [1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0],  # v: consonant, labiodental, fricative, voiced
+], dtype=np.float32)
+
+
+class ArticulatoryHead(nn.Module):
+    """CEBRA-style: project embeddings → articulatory space, classify by similarity."""
+
+    def __init__(self, d_in: int = 64, n_positions: int = 3, n_features: int = 15,
+                 dropout: float = 0.3):
+        super().__init__()
+        self.drop = nn.Dropout(dropout)
+        self.projectors = nn.ModuleList([
+            nn.Linear(d_in, n_features) for _ in range(n_positions)
+        ])
+        # Fixed articulatory matrix (normalized)
+        art = torch.from_numpy(_ART_MATRIX_PS)
+        art = F.normalize(art, dim=1)
+        self.register_buffer('art_matrix', art)  # (9, 15)
+        self.log_temp = nn.Parameter(torch.tensor(2.0))  # learned temperature
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        pooled = self.drop(h.mean(dim=1))
+        temp = self.log_temp.exp().clamp(min=0.01)
+        logits_list = []
+        for proj in self.projectors:
+            art_pred = F.normalize(proj(pooled), dim=1)
+            logits = art_pred @ self.art_matrix.T * temp
+            logits_list.append(logits)
+        return torch.stack(logits_list, dim=1)
+
+
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
         self.readin = SpatialReadIn()
         self.backbone = Backbone(d_in=self.readin.d_flat)
-        self.head = CEHead(d_in=self.backbone.out_dim)
+        if HEAD_TYPE == "articulatory":
+            self.head = ArticulatoryHead(d_in=self.backbone.out_dim)
+        else:
+            self.head = CEHead(d_in=self.backbone.out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.backbone(self.readin(x)))
