@@ -11,3 +11,4 @@ exp08	0.806568	305.3	discard	SupCon+CE (wt=0.5,τ=0.1) — hurt both linear and 
 exp09	0.816909	365.0	discard	center loss (wt=0.1) — destroyed linear head, didn't help k-NN, too aggressive
 exp10	0.767482	244.8	keep	TTA 8 copies — average logits+embeddings over augmented val copies
 exp11	0.762616	214.8	keep	CEBRA articulatory head — project to 15-dim articulatory features, cosine classify
+exp12	0.756434	256.0	keep	dual head (CE+articulatory averaged logits) — ensemble reduces variance
