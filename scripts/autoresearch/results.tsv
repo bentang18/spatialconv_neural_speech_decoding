@@ -7,3 +7,5 @@ exp04	0.812397	321.9	discard	EMA decay=0.998 — slower, exceeded time budget, m
 exp05	0.845444	205.8	discard	per-position attention pooling — worse, only 30 timesteps too few for learned queries
 exp06	0.830729	310.7	discard	R-Drop alpha=0.5 — double forward pass exceeds time budget, KL reg didn't help
 exp07	0.780941	236.8	keep	k-NN eval on supervised embeddings — best-of(linear, k-NN k=10) per fold
+exp08	0.806568	305.3	discard	SupCon+CE (wt=0.5,τ=0.1) — hurt both linear and k-NN, contrastive fights CE
+exp09	0.816909	365.0	discard	center loss (wt=0.1) — destroyed linear head, didn't help k-NN, too aggressive

@@ -45,6 +45,7 @@ EVAL_EVERY = 10       # validate every N epochs
 LABEL_SMOOTHING = 0.1 # 0.0 = hard labels, >0 = regularize
 MIXUP_ALPHA = 0.2     # 0 = no mixup, >0 = Beta(alpha, alpha) interpolation
 EMA_DECAY = 0         # 0 = no EMA, >0 = exponential moving average for eval
+TTA_COPIES = 8        # test-time augmentation: average over N augmented copies
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -411,16 +412,30 @@ def train_fold(
     if best_state is not None:
         eval_model.load_state_dict(best_state)
 
-    # Final predictions — linear head
+    # Final predictions — linear head with TTA
     eval_model.eval()
     with torch.no_grad():
-        logits = eval_model(val_grids.to(DEVICE))
+        # TTA: average logits over augmented copies
+        if TTA_COPIES > 1:
+            logits_sum = torch.zeros(len(val_grids), prepare.N_POSITIONS, prepare.N_CLASSES, device=DEVICE)
+            logits_sum += eval_model(val_grids.to(DEVICE))  # original (unaugmented)
+            for _ in range(TTA_COPIES - 1):
+                logits_sum += eval_model(augment(val_grids).to(DEVICE))
+            logits = logits_sum / TTA_COPIES
+        else:
+            logits = eval_model(val_grids.to(DEVICE))
     linear_preds = decode(logits)
     linear_per = prepare.compute_per(linear_preds, val_labels)
 
-    # k-NN evaluation on backbone embeddings
+    # k-NN evaluation on backbone embeddings (with TTA on embeddings)
     train_emb = extract_embeddings(eval_model, train_grids)
-    val_emb = extract_embeddings(eval_model, val_grids)
+    if TTA_COPIES > 1:
+        val_emb_sum = extract_embeddings(eval_model, val_grids)
+        for _ in range(TTA_COPIES - 1):
+            val_emb_sum = val_emb_sum + extract_embeddings(eval_model, augment(val_grids))
+        val_emb = val_emb_sum / TTA_COPIES
+    else:
+        val_emb = extract_embeddings(eval_model, val_grids)
     knn_preds = knn_predict(train_emb, train_labels, val_emb, k=10)
     knn_per = prepare.compute_per(knn_preds, val_labels)
 
