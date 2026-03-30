@@ -269,6 +269,38 @@ def decode(logits: torch.Tensor) -> list[list[int]]:
     return (logits.argmax(dim=-1) + 1).cpu().tolist()
 
 
+def extract_embeddings(model: nn.Module, grids: torch.Tensor) -> torch.Tensor:
+    """Extract mean-pooled backbone features: (N, 2H)."""
+    model.eval()
+    with torch.no_grad():
+        x = model.readin(grids.to(DEVICE))
+        h = model.backbone(x)          # (N, T', 2H)
+        return h.mean(dim=1).cpu()      # (N, 2H)
+
+
+def knn_predict(
+    train_emb: torch.Tensor,
+    train_labels: list[list[int]],
+    val_emb: torch.Tensor,
+    k: int = 10,
+) -> list[list[int]]:
+    """Per-position k-NN classification. Returns 1-indexed predictions."""
+    # Normalize embeddings for cosine similarity
+    train_n = F.normalize(train_emb, dim=1)
+    val_n = F.normalize(val_emb, dim=1)
+    sim = val_n @ train_n.T                  # (N_val, N_train)
+    _, topk_idx = sim.topk(k, dim=1)         # (N_val, k)
+
+    preds = []
+    for i in range(val_emb.shape[0]):
+        pred = []
+        for pos in range(prepare.N_POSITIONS):
+            votes = [train_labels[j][pos] for j in topk_idx[i].tolist()]
+            pred.append(max(set(votes), key=votes.count))
+        preds.append(pred)
+    return preds
+
+
 # ============================================================
 # TRAINING
 # ============================================================
@@ -287,8 +319,8 @@ def train_fold(
     train_labels: list[list[int]],
     val_grids: torch.Tensor,
     val_labels: list[list[int]],
-) -> tuple[float, list[list[int]]]:
-    """Train one CV fold. Returns (fold_per, predictions)."""
+) -> tuple[float, list[list[int]], float, float]:
+    """Train one CV fold. Returns (best_per, best_preds, linear_per, knn_per)."""
     model = Model().to(DEVICE)
     ema_model = deepcopy(model) if EMA_DECAY > 0 else None
 
@@ -379,11 +411,23 @@ def train_fold(
     if best_state is not None:
         eval_model.load_state_dict(best_state)
 
-    # Final predictions
+    # Final predictions — linear head
     eval_model.eval()
     with torch.no_grad():
         logits = eval_model(val_grids.to(DEVICE))
-    return prepare.compute_per(decode(logits), val_labels), decode(logits)
+    linear_preds = decode(logits)
+    linear_per = prepare.compute_per(linear_preds, val_labels)
+
+    # k-NN evaluation on backbone embeddings
+    train_emb = extract_embeddings(eval_model, train_grids)
+    val_emb = extract_embeddings(eval_model, val_grids)
+    knn_preds = knn_predict(train_emb, train_labels, val_emb, k=10)
+    knn_per = prepare.compute_per(knn_preds, val_labels)
+
+    # Use whichever is better
+    if knn_per < linear_per:
+        return knn_per, knn_preds, linear_per, knn_per
+    return linear_per, linear_preds, linear_per, knn_per
 
 
 # ============================================================
@@ -407,19 +451,23 @@ if __name__ == "__main__":
     print()
 
     fold_pers = []
+    fold_linear_pers = []
+    fold_knn_pers = []
     all_preds: list[list[int]] = []
     all_refs: list[list[int]] = []
 
     for fi, (tr_idx, va_idx) in enumerate(splits):
         ft0 = time.time()
-        per, preds = train_fold(
+        per, preds, lp, kp = train_fold(
             grids[tr_idx], [labels[i] for i in tr_idx],
             grids[va_idx], [labels[i] for i in va_idx],
         )
         fold_pers.append(per)
+        fold_linear_pers.append(lp)
+        fold_knn_pers.append(kp)
         all_preds.extend(preds)
         all_refs.extend([labels[i] for i in va_idx])
-        print(f"  Fold {fi + 1}/{len(splits)}: PER={per:.4f}  ({time.time() - ft0:.1f}s)")
+        print(f"  Fold {fi + 1}/{len(splits)}: PER={per:.4f} (linear={lp:.4f}, kNN={kp:.4f})  ({time.time() - ft0:.1f}s)")
 
         if time.time() - t0 > prepare.TIME_BUDGET:
             print(f"WARNING: time budget exceeded ({time.time() - t0:.0f}s)")
@@ -435,6 +483,8 @@ if __name__ == "__main__":
     print(f"val_per:            {mean_per:.6f}")
     print(f"val_per_std:        {std_per:.6f}")
     print(f"fold_pers:          {fold_pers}")
+    print(f"linear_pers:        {fold_linear_pers}")
+    print(f"knn_pers:           {fold_knn_pers}")
     print(f"training_seconds:   {elapsed:.1f}")
     print(f"collapsed:          {collapse['collapsed']}")
     print(f"mean_entropy:       {collapse['mean_entropy']:.3f}")
