@@ -5,3 +5,5 @@ exp02	0.819140	212.4	keep	separate per-position heads + dropout 0.3 before head 
 exp03	0.802052	234.1	keep	mixup alpha=0.2 — interpolate pairs + soft CE, reduces overfitting
 exp04	0.812397	321.9	discard	EMA decay=0.998 — slower, exceeded time budget, more variable folds
 exp05	0.845444	205.8	discard	per-position attention pooling — worse, only 30 timesteps too few for learned queries
+exp06	0.830729	310.7	discard	R-Drop alpha=0.5 — double forward pass exceeds time budget, KL reg didn't help
+exp07	0.780941	236.8	keep	k-NN eval on supervised embeddings — best-of(linear, k-NN k=10) per fold
