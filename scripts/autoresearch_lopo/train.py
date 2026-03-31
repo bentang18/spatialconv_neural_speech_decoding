@@ -3,10 +3,15 @@
 
 THE AI AGENT MODIFIES THIS FILE.
 
-Experiment 17: FlattenLinear read-in + InstanceNorm1d per-patient.
-Replace Conv2d spatial read-in with simple flatten + Linear projection.
-Add InstanceNorm1d before backbone to normalize per-patient distributions.
-Also: lighter S2 augmentation (from exp 11 insight).
+Two-stage pipeline:
+  Stage 1: Train shared backbone + per-patient read-ins on source patients
+  Stage 2: Adapt to target S14 (per CV fold) — full model, differential LR
+
+Pre-baked recipe (from single-patient autoresearch 0.872→0.737):
+  CE loss, label smoothing 0.1, focal γ=2, mixup α=0.2,
+  per-position heads + dropout 0.3, weighted k-NN + TTA 16
+
+Current best PER: (run baseline to establish)  |  Chance PER: ~0.889
 """
 from __future__ import annotations
 
@@ -65,7 +70,7 @@ LABEL_SMOOTHING = 0.1
 FOCAL_GAMMA = 2.0
 MIXUP_ALPHA = 0.2
 TTA_COPIES = 16
-KNN_K = 10
+KNN_K = 20  # larger k since we have ~1400 total neighbors with source patients
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -134,40 +139,29 @@ def augment(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def augment_light(x: torch.Tensor) -> torch.Tensor:
-    """Lighter augmentation for Stage 2."""
-    x = time_shift(x, max_frames=15)
-    x = amplitude_scale(x, std=0.15)
-    x = gaussian_noise(x, frac=0.03)
-    return x
-
-
 # ============================================================
 # MODEL COMPONENTS  (redesign freely)
 # ============================================================
 
-D_OUT = 256  # shared dimension for all patients
-
-
 class SpatialReadIn(nn.Module):
-    """Flatten grid + Linear projection: (B, H, W, T) -> (B, D_OUT, T).
-    Also includes InstanceNorm to normalize per-patient distributions."""
+    """Conv2d on electrode grid: (B, H, W, T) -> (B, d_flat, T)."""
 
-    def __init__(self, grid_h: int, grid_w: int, **kwargs):
+    def __init__(self, grid_h: int, grid_w: int, C: int = 8,
+                 pool_h: int = 4, pool_w: int = 8):
         super().__init__()
-        self.n_channels = grid_h * grid_w
-        self.proj = nn.Linear(self.n_channels, D_OUT)
-        self.norm = nn.InstanceNorm1d(D_OUT, affine=True)
-        self.d_flat = D_OUT
+        self.conv = nn.Conv2d(1, C, 3, padding=1)
+        self.pool = nn.AdaptiveAvgPool2d((pool_h, pool_w))
+        self.d_flat = C * pool_h * pool_w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, T = x.shape
-        # (B, H, W, T) -> (B, T, H*W) -> Linear -> (B, T, D_OUT) -> (B, D_OUT, T)
-        x = x.reshape(B, H * W, T).permute(0, 2, 1)  # (B, T, H*W)
-        x = self.proj(x)  # (B, T, D_OUT)
-        x = x.permute(0, 2, 1)  # (B, D_OUT, T)
-        x = self.norm(x)  # InstanceNorm over time dim
-        return x
+        x = x.permute(0, 3, 1, 2).reshape(B * T, 1, H, W)
+        x = F.relu(self.conv(x))
+        if x.device.type == "mps":
+            x = self.pool(x.cpu()).to("mps")
+        else:
+            x = self.pool(x)
+        return x.reshape(B, T, -1).permute(0, 2, 1)
 
 
 class Backbone(nn.Module):
@@ -441,8 +435,11 @@ def train_stage1(all_data):
 # STAGE 2: TARGET ADAPTATION + EVALUATION (per fold)
 # ============================================================
 
+SOURCE_KNN_WEIGHT = 0.5  # weight for source patient k-NN neighbors vs target
+
+
 def train_eval_fold(backbone, head_init, train_grids, train_labels,
-                    val_grids, val_labels):
+                    val_grids, val_labels, read_ins=None, all_data=None):
     """Adapt Stage 1 model to target fold, evaluate."""
     backbone_copy = deepcopy(backbone)
     target_ri = SpatialReadIn(
@@ -480,15 +477,21 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
 
         for start in range(0, n_train, S2_BATCH_SIZE):
             idx = perm[start:start + S2_BATCH_SIZE]
-            x = augment_light(train_grids[idx]).to(DEVICE)
+            x = augment(train_grids[idx]).to(DEVICE)
             y = [train_labels[i] for i in idx.tolist()]
 
-            # No mixup in S2 (from exp 11 insight)
+            mixup_y, mixup_lam = None, 1.0
+            if MIXUP_ALPHA > 0 and len(idx) > 1:
+                mixup_lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                perm_mix = torch.randperm(x.shape[0])
+                x = mixup_lam * x + (1 - mixup_lam) * x[perm_mix]
+                mixup_y = [y[i] for i in perm_mix.tolist()]
+
             optimizer.zero_grad()
             feat = target_ri(x)
             h = backbone_copy(feat)
             logits = head(h)
-            loss = compute_loss(logits, y)
+            loss = compute_loss(logits, y, mixup_labels=mixup_y, mixup_lam=mixup_lam)
 
             if math.isnan(loss.item()):
                 print("FAIL")
@@ -553,8 +556,28 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
     linear_preds = decode(logits)
     linear_per = prepare.compute_per(linear_preds, val_labels)
 
-    # k-NN with TTA
+    # k-NN with TTA — include source patient embeddings as additional neighbors
     train_emb = extract_embeddings(backbone_copy, target_ri, train_grids)
+    train_emb_all = train_emb
+    train_labels_all = list(train_labels)
+
+    # Add source patient embeddings (using S1 read-ins + S2-adapted backbone)
+    if read_ins is not None and all_data is not None and SOURCE_KNN_WEIGHT > 0:
+        source_embs = []
+        source_labs = []
+        for pid in prepare.SOURCE_PATIENTS:
+            ri = read_ins[pid]
+            ri.eval()
+            sg = all_data[pid]["grids"]
+            sl = all_data[pid]["labels"]
+            emb = extract_embeddings(backbone_copy, ri, sg)
+            source_embs.append(emb)
+            source_labs.extend(sl)
+        source_emb = torch.cat(source_embs, dim=0)
+        # Weight source embeddings lower (scale affects cosine similarity via norm)
+        train_emb_all = torch.cat([train_emb, source_emb * SOURCE_KNN_WEIGHT], dim=0)
+        train_labels_all = list(train_labels) + source_labs
+
     if TTA_COPIES > 1:
         val_emb_sum = extract_embeddings(backbone_copy, target_ri, val_grids)
         for _ in range(TTA_COPIES - 1):
@@ -562,7 +585,7 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
         val_emb = val_emb_sum / TTA_COPIES
     else:
         val_emb = extract_embeddings(backbone_copy, target_ri, val_grids)
-    knn_preds = knn_predict(train_emb, train_labels, val_emb)
+    knn_preds = knn_predict(train_emb_all, train_labels_all, val_emb)
     knn_per = prepare.compute_per(knn_preds, val_labels)
 
     if knn_per < linear_per:
@@ -613,6 +636,7 @@ if __name__ == "__main__":
             backbone, head,
             grids[tr_idx], [labels[i] for i in tr_idx],
             grids[va_idx], [labels[i] for i in va_idx],
+            read_ins=read_ins, all_data=all_data,
         )
         fold_pers.append(per)
         fold_linear_pers.append(lp)
