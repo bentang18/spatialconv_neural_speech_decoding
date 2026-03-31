@@ -1,0 +1,35 @@
+Target: S14  |  Trials: 153  |  Grid: 8x16  |  T: 201
+Source patients: 9  |  Source trials: 1315
+Folds: 5  |  Device: mps
+
+=== Stage 1: Source patient training ===
+  S1 epoch 10: train_loss=1.6815, val_loss=1.7503
+  S1 epoch 20: train_loss=1.6290, val_loss=1.7637
+  S1 epoch 30: train_loss=1.5537, val_loss=1.8198
+  S1 epoch 40: train_loss=1.4866, val_loss=1.9007
+  S1 epoch 50: train_loss=1.4058, val_loss=1.9183
+  S1 epoch 60: train_loss=1.3680, val_loss=1.9405
+  S1 epoch 70: train_loss=1.3000, val_loss=2.0254
+  S1 epoch 80: train_loss=1.1901, val_loss=2.0395
+  S1 early stop at epoch 80
+Stage 1 done in 286.6s
+
+=== Stage 2: Target adaptation + evaluation ===
+  Fold 1/5: PER=0.7708 (linear=0.8646, kNN=0.7708)  (14.7s)
+  Fold 2/5: PER=0.7778 (linear=0.8000, kNN=0.7778)  (26.6s)
+  Fold 3/5: PER=0.7667 (linear=0.9333, kNN=0.7667)  (14.8s)
+  Fold 4/5: PER=0.7222 (linear=0.7222, kNN=0.7444)  (15.3s)
+  Fold 5/5: PER=0.7849 (linear=0.7849, kNN=0.8280)  (15.0s)
+
+---
+val_per:            0.764489
+val_per_std:        0.022030
+fold_pers:          [0.7708333333333334, 0.7777777777777778, 0.7666666666666667, 0.7222222222222222, 0.7849462365591398]
+linear_pers:        [0.8645833333333334, 0.8, 0.9333333333333333, 0.7222222222222222, 0.7849462365591398]
+knn_pers:           [0.7708333333333334, 0.7777777777777778, 0.7666666666666667, 0.7444444444444445, 0.8279569892473119]
+stage1_seconds:     286.6
+training_seconds:   373.2
+collapsed:          False
+mean_entropy:       2.307
+stereotypy:         0.163
+unique_ratio:       0.399

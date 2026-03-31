@@ -1,1 +1,2 @@
 commit	val_per	training_sec	status	description
+baseline	0.7645	373	keep	LOPO pre-baked: CE+focal+mixup+label_smooth+per_pos_heads+kNN+TTA, 9 source pts

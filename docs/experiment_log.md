@@ -152,6 +152,92 @@ The JEPA k-NN result (0.811) used SSL-pretrained features with basic unweighted 
 
 ---
 
+## 2026-03-30: SSL Landscape Audit
+
+Comprehensive review of all SSL experiments in results/ directory.
+
+### All SSL Results (Stage 3: frozen backbone + linear probe, grouped-by-token CV, S14)
+
+| Run | SSL Method | PER | Notes |
+|-----|-----------|-----|-------|
+| pretrain/method_B_byol | BYOL | **0.040** | **Anomalous — likely semi-supervised contamination (see below)** |
+| pretrain/method_B_jepa | JEPA linear probe | 0.854 | |
+| pretrain/method_B_jepa k-NN k=10 | JEPA k-NN (grouped) | 0.811 | Best fair SSL eval |
+| pretrain/method_B | Masked span (PretrainModel) | 0.862 | |
+| pretrain/method_B_lewm | LeWM (next-embed + SIGReg) | 0.911 | Near chance |
+| pretrain_vicreg | VICReg | 0.891 | batch=8 vs proj=256 mismatch |
+| pretrain_v3_target_ce | JEPA + target CE | 0.889 | |
+| pretrain_spatial_16ch | JEPA 16ch spatial | 0.891 | |
+| pretrain_spatial_2layer | JEPA 2-layer spatial | 0.921 | |
+| pretrain_temporal_attn | JEPA + temporal attention | 0.913 | |
+| pretrain_v4_mlp | JEPA MLP predictor | 0.908 | |
+| pretrain_v3_frozen | LeWM frozen eval | 0.921 | |
+| pretrain_v3_ft | LeWM fine-tune | 0.893 | |
+| pretrain_v2/method_B | LeWM v2 | 1.000 | Total collapse |
+| pretrain_v2_finetune | JEPA fine-tune | 1.000 | Total collapse |
+
+### BYOL PER 0.040: Likely Semi-Supervised Contamination
+
+The BYOL result is 20× better than any other SSL method. The codebase has `SemiSupervisedStage2Trainer` which does joint SSL + CE on S14 labels during Stage 2. There is no `--pretrain-mode byol` in the CLI — this was a one-off experiment. If the semi-supervised trainer was used, the backbone saw S14 phoneme labels for ALL tokens (including future Stage 3 val tokens) during training. Stage 3's grouped CV evaluates on frozen features that already had supervised access to val tokens — a form of target data leakage.
+
+**Needs verification**: Run pure BYOL (SSL-only, no labels in Stage 2) → Stage 3 grouped CV. If PER jumps to ~0.85, contamination confirmed.
+
+### SSL Landscape Findings
+
+50. **All pure SSL methods are PER 0.85-0.91**, only 0-4pp above chance (0.889). SSL features are barely discriminative for phonemes at N=120 per patient.
+
+51. **JEPA is the best pure SSL method.** Linear probe 0.854, k-NN 0.811. Only method with k-NN notably below linear probe — suggests decent feature geometry.
+
+52. **Architecture ablations don't help JEPA.** 16ch spatial, 2-layer spatial, temporal attention, MLP predictor — all ≈ base or worse. The bottleneck is the SSL objective, not the architecture.
+
+53. **Fine-tuning collapses.** LeWM v2 and JEPA fine-tune both hit PER 1.000. Unfreezing backbone on ~120 trials destroys pretrained features. LP-FT (Kumar et al. 2022) is required.
+
+54. **The improved eval recipe has never been applied to SSL features.** Weighted k-NN + TTA improved supervised from 0.840→0.737 (10pp). This recipe on JEPA features is the highest-priority experiment.
+
+---
+
+## 2026-03-30: SSL v2 — DINO, BYOL Verification, JEPA EMA Fix
+
+Fixed critical bug: Stage2Trainer was not calling `model.ema_update()` after optimizer steps. All previous JEPA/BYOL results had static target encoders. Created DINO model (`dino_model.py`) and unified SSL script (`run_ssl.py`).
+
+Also applied autoresearch eval recipe (weighted k-NN + TTA 16) to existing JEPA checkpoint.
+
+### Results (Stage 3: frozen backbone + linear probe, grouped-by-token CV, S14)
+
+| Method | PER | Collapsed? | Notes |
+|--------|-----|-----------|-------|
+| DINO (new) | 0.863 ± 0.025 | No | Centering + sharpening didn't help |
+| JEPA (EMA fix) | 0.862 ± 0.061 | No | EMA update didn't improve vs old 0.854 |
+| BYOL (pure SSL) | 0.886 ± 0.056 | Yes | **Confirms old 0.040 was contaminated** |
+| Supervised base CE | 0.837 | — | Better than ALL SSL methods |
+| Chance | 0.889 | — | |
+
+### Eval Recipe on Existing JEPA (weighted k-NN + TTA 16)
+
+| Eval Method | PER | Notes |
+|---|---|---|
+| Weighted k-NN + TTA 16 | 0.827 ± 0.048 | Worse than basic k-NN (0.811) |
+| Linear probe (no readin adapt) | 0.867 ± 0.054 | Worse than Stage3 (0.854) |
+| Best-of per fold | 0.819 ± 0.046 | |
+
+TTA hurts JEPA because the backbone was trained with masking, not augmentation invariance. Augmented inputs produce inconsistent features.
+
+### Realizations
+
+55. **All pure SSL methods converge to PER ~0.86-0.89 — essentially chance (0.889).** DINO, JEPA, BYOL all produce features that can't distinguish phonemes. The SSL corpus (~1600 trials across 8 patients) is too small and the uECOG HGA signal-to-noise too low for self-supervised objectives to discover phoneme structure without labels.
+
+56. **The BYOL 0.040 was semi-supervised contamination.** Pure BYOL gives 0.886 (near chance). The previous result used `SemiSupervisedStage2Trainer` which leaked S14 labels into Stage 2, contaminating Stage 3 evaluation.
+
+57. **The EMA fix didn't help.** JEPA without EMA update: 0.854. With EMA update: 0.862 (worse). The static target encoder was actually better — possibly because EMA tracking makes the target a moving target that's harder to predict, without providing better representations.
+
+58. **DINO's theoretical advantages (centering/sharpening → alignment+uniformity) don't materialize at this data scale.** The k-NN geometry improvements only matter if the base features have some discriminative signal to amplify. With ~200 trials per source patient and no phoneme labels, there's nothing to amplify.
+
+59. **TTA hurts masking-based SSL, not helps.** JEPA's eval recipe k-NN (0.827) is worse than basic k-NN (0.811). The backbone was never trained for augmentation invariance, so augmented inputs produce different features that don't average cleanly. TTA is only useful for augmentation-based SSL methods (BYOL, VICReg) and supervised models.
+
+60. **Supervised > ALL SSL for per-patient decoding at this data scale.** Base CE (0.837) beats every SSL method. The autoresearch recipe (0.737) is 12pp better than the best SSL. With ~120 labeled trials, direct supervision is far more sample-efficient than self-supervised pretraining on ~1600 unlabeled trials.
+
+---
+
 ## Next Direction: Full SSL Exploration
 
 The autoresearch session optimized within the supervised single-patient regime. The SSL solution space remains largely unexplored. Below is the roadmap for systematic SSL exploration.
@@ -211,17 +297,107 @@ The autoresearch eval improvements (weighted k-NN, TTA, articulatory head) shoul
 
 ---
 
+## 2026-03-30: Data Quality Audit & Re-baseline
+
+### Data Quality Findings
+
+1. **.fif epoch markers are MFA-derived.** Verified by exact match (0.0-0.2ms) between .fif event sample times and phoneme CSV onset times for S14 and S22. Both epoch boundaries and CSV timing come from Montreal Forced Aligner. If MFA fails for a patient, both are wrong. Phoneme LABELS are always correct (from known stimulus transcript).
+
+2. **S32 = S36 (same recording).** Identical event arrays despite different file sizes (S32=234MB/256ch, S36=117MB/128ch). **11 unique patients, not 12.**
+
+3. **Per-phoneme alignment quality varies by patient:**
+   - Good: S22, S39, S58 (confirmed by visual inspection of sweep_v2 videos)
+   - Poor: Others have 300-500ms offsets, misaligned phoneme boundaries, or missing phonemes
+
+4. **Decision: Full-trial CTC.** CTC on position-1 epochs (1.0s window) is robust to MFA errors — the window contains all 3 phonemes regardless of alignment quality. Per-position CE requires accurate segmentation, which fails for ~50% of patients.
+
+### Re-baseline: Production-Only Window + Grouped CV
+
+Added `cv_type: grouped` to trainer (uses `grouped_cv.py`). Compared production-only (tmin=0.0, 200 frames) vs original (tmin=-0.5, 300 frames).
+
+**Stratified CV (S14, CE per-position, 3 seeds):**
+
+| Window | Seed 42 | Seed 137 | Seed 256 | Mean |
+|--------|---------|----------|----------|------|
+| tmin=-0.5 (previous) | — | — | — | 0.700 |
+| tmin=0.0 | 0.727 | 0.745 | 0.756 | 0.743 |
+
+**Grouped-by-token CV (S14, CE per-position, 3 seeds):**
+
+| Window | Seed 42 | Seed 137 | Seed 256 | Mean |
+|--------|---------|----------|----------|------|
+| tmin=-0.5 | 0.880 | 0.839 | 0.858 | **0.859** |
+| tmin=0.0 | 0.840 | 0.821 | 0.849 | **0.837** |
+
+### Realizations
+
+47. **Grouped CV is ~10pp harder than stratified** (0.837 vs 0.743 for tmin=0.0, 3-seed means). Confirms significant token leakage in stratified CV. All future comparisons must use grouped.
+
+48. **Production-only HELPS under grouped CV** (0.837 vs 0.859) **but HURTS under stratified** (0.743 vs 0.700). The pre-production planning frames help the model exploit token-level correlations (leakage) but hurt generalization to unseen tokens. Under fair evaluation, trimming to production-only is better.
+
+49. **The base CE model (no recipe improvements) gives 0.837-0.859 under grouped CV.** The autoresearch recipe (label smoothing + mixup + focal + dual head + weighted k-NN + TTA) adds ~10pp of improvements to reach 0.737. These recipe improvements are orthogonal to SSL — they can be layered on top of any backbone.
+
+---
+
 ## Key Numbers
 
-| Metric | Value |
-|--------|-------|
-| Chance PER | 0.889 |
-| **Autoresearch best (grouped, exp17)** | **0.737** |
-| **Autoresearch best (stratified)** | **0.662** |
-| Supervised baseline (grouped) | 0.825-0.872 |
-| Supervised baseline (stratified, leaky) | 0.700 |
-| JEPA k-NN k=10 (grouped, basic eval) | 0.811 |
-| JEPA linear probe (grouped) | 0.854 |
-| All SSL linear probes (grouped) | 0.854-0.911 |
-| Per-patient data | ~150 trials, ~1 min utterance |
-| Multi-patient SSL corpus | ~1621 trials, 11 patients |
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Chance PER | 0.889 | |
+| **Autoresearch best (grouped, exp17)** | **0.737** | Full recipe, tmin=-0.5 |
+| **Autoresearch best (stratified)** | **0.662** | Token leakage |
+| Base CE (grouped, tmin=0.0) | 0.837 | Production-only, 3 seeds |
+| Base CE (grouped, tmin=-0.5) | 0.859 | Original window, 3 seeds |
+| Base CE (stratified, tmin=-0.5) | 0.700 | Token leakage |
+| Base CE (stratified, tmin=0.0) | 0.743 | Production-only, leaky |
+| BYOL semi-supervised (grouped) | 0.040 | **Contaminated — pure BYOL = 0.886** |
+| DINO (grouped) | 0.863 | Near chance |
+| JEPA w/ EMA fix (grouped) | 0.862 | Near chance |
+| JEPA old linear probe (grouped) | 0.854 | Best pure SSL (static target) |
+| BYOL pure (grouped) | 0.886 | Near chance |
+| VICReg (grouped) | 0.891 | batch/proj mismatch |
+| LeWM (grouped) | 0.911 | Near chance |
+| Per-patient data | ~150 trials, ~1 min utterance | |
+| Multi-patient SSL corpus | ~1621 trials, 11 patients | S32=S36 duplicate removed |
+| **LOPO autoresearch baseline** | **0.764** | **CE+recipe, 9 source pts → S14, grouped CV** |
+| LOPO pilot (CTC, no recipe) | 0.846 | 8 patients, baseline |
+| JEPA LP-FT (best-of) | 0.797 | LP then fine-tune on JEPA features |
+| Semi-supervised BYOL (nested CV) | 0.874 | Fair eval, near chance |
+
+---
+
+## 2026-03-30: LOPO Autoresearch Baseline
+
+### Setup
+- **Pipeline:** Stage 1 (9 source patients, ~1315 trials) → Stage 2 (adapt to S14, 5-fold grouped CV)
+- **Recipe:** All single-patient autoresearch wins pre-baked: CE + label smoothing 0.1 + focal γ=2 + mixup α=0.2 + per-position heads + dropout 0.3 + weighted k-NN (k=10) + TTA 16
+- **Architecture:** Per-patient SpatialReadIn(Conv2d(1,8,3), pool(4,8)) + shared Backbone(LN, Conv1d(256,32,s=10), BiGRU(32,32,2L)) + CEHead(3×Linear(64,9))
+- **Window:** tmin=0.0 (production only, 201 frames)
+- **Stage 2:** Full model unfrozen, backbone LR × 0.1, differential LR for read-in (×3) and head (×1)
+
+### Results
+
+| Fold | Best PER | Linear | k-NN |
+|------|----------|--------|------|
+| 1 | 0.771 | 0.865 | 0.771 |
+| 2 | 0.778 | 0.800 | 0.778 |
+| 3 | 0.767 | 0.933 | 0.767 |
+| 4 | 0.722 | 0.722 | 0.744 |
+| 5 | 0.785 | 0.785 | 0.828 |
+| **Mean** | **0.764 ± 0.022** | 0.821 | 0.778 |
+
+- Stage 1: 286.6s, early-stopped at epoch 80 (val loss diverging from epoch 10)
+- Total: 373.2s (~6.2 min), well within 15-min budget
+- No content collapse (entropy 2.31, stereotypy 0.16)
+
+### Realizations
+
+61. **LOPO + recipe already beats the LOPO pilot by 8.2pp** (0.764 vs 0.846). The recipe improvements (label smoothing, focal, mixup, k-NN, TTA) transfer directly from single-patient to cross-patient.
+
+62. **LOPO + recipe nearly matches single-patient autoresearch** (0.764 vs 0.737). With 10× more source data but harder cross-patient transfer, the LOPO baseline is only 2.7pp behind the single-patient best — this is the highest-leverage optimization target.
+
+63. **k-NN dominates linear head in 3/5 folds** (0.778 vs 0.821 mean). Consistent with single-patient findings — backbone features are better than the linear head can exploit.
+
+64. **Stage 1 early-stops at epoch 80 with val diverging from epoch 10.** The source validation loss goes up while train loss drops steadily. This suggests heavy overfitting to source patients — Stage 1 regularization or architecture changes could improve.
+
+65. **Stage 2 completes quickly** (~15-27s per fold). With backbone unfrozen at 0.1× LR, the model adapts rapidly. Stage 1 quality dominates the final result.
