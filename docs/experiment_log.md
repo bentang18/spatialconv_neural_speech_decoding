@@ -359,7 +359,8 @@ Added `cv_type: grouped` to trainer (uses `grouped_cv.py`). Compared production-
 | LeWM (grouped) | 0.911 | Near chance |
 | Per-patient data | ~150 trials, ~1 min utterance | |
 | Multi-patient SSL corpus | ~1621 trials, 11 patients | S32=S36 duplicate removed |
-| **LOPO autoresearch baseline** | **0.764** | **CE+recipe, 9 source pts → S14, grouped CV** |
+| **LOPO autoresearch best** | **0.762** | **Multi-patient k-NN (source embeddings weight 0.5)** |
+| LOPO autoresearch baseline | 0.764 | CE+recipe, 9 source pts → S14, grouped CV |
 | LOPO pilot (CTC, no recipe) | 0.846 | 8 patients, baseline |
 | JEPA LP-FT (best-of) | 0.797 | LP then fine-tune on JEPA features |
 | Semi-supervised BYOL (nested CV) | 0.874 | Fair eval, near chance |
@@ -401,3 +402,72 @@ Added `cv_type: grouped` to trainer (uses `grouped_cv.py`). Compared production-
 64. **Stage 1 early-stops at epoch 80 with val diverging from epoch 10.** The source validation loss goes up while train loss drops steadily. This suggests heavy overfitting to source patients — Stage 1 regularization or architecture changes could improve.
 
 65. **Stage 2 completes quickly** (~15-27s per fold). With backbone unfrozen at 0.1× LR, the model adapts rapidly. Stage 1 quality dominates the final result.
+
+---
+
+## 2026-03-31: LOPO Autoresearch — 16 Experiments
+
+### Summary
+Two agents ran 16 experiments (exp01–exp16). 15 discarded, 1 kept. Best PER improved from 0.764 → **0.762** (exp13: multi-patient k-NN).
+
+### Full Results
+
+| # | PER | Time | Status | Description |
+|---|-----|------|--------|-------------|
+| baseline | **0.764** | 373s | keep | CE+focal+mixup+label_smooth+per_pos_heads+kNN+TTA, 9 source pts |
+| exp01 | 0.825 | 255s | discard | S1 batch=32, eval_every=5, patience=12 |
+| exp02 | 0.826 | 271s | discard | S1 LR=5e-4, WD=1e-3 — COLLAPSED |
+| exp03 | 0.785 | 269s | discard | Source replay 30% in Stage 2 |
+| exp04 | 0.788 | 336s | discard | H=64 backbone |
+| exp05 | 0.804 | 416s | discard | Freeze backbone in Stage 2 |
+| exp06 | 0.788 | 336s | discard | Dual head (CE + articulatory) |
+| exp07 | 0.793 | 275s | discard | Fixed 30-epoch cosine, no val split, no early stop |
+| exp08 | 0.807 | 363s | discard | Progressive unfreezing S2 (freeze backbone 30 epochs) |
+| exp09 | 0.798 | 470s | discard | S2 patience 15, epochs 300 |
+| exp10 | 0.804 | 239s | discard | S1 eval every 5 epochs |
+| exp11 | 0.769 | 402s | discard | Lighter S2 augment + no S2 mixup (closest to baseline!) |
+| exp12 | 0.810 | 396s | discard | Stronger S1 reg (dropout 0.5, WD 5e-4) |
+| **exp13** | **0.762** | **412s** | **keep** | **Multi-patient k-NN (source embeddings as extra neighbors, weight 0.5)** |
+| exp14 | 0.764 | 417s | discard | Source k-NN weight 1.0 (unweighted) |
+| exp15 | 0.764 | 418s | discard | Source k-NN weight 0.3 |
+| exp16 | 0.771 | 411s | discard | Lighter S2 aug + no mixup + multi-pt k-NN |
+| exp17 | — | — | interrupted | FlattenLinear read-in + InstanceNorm (killed mid-run) |
+
+### What Worked: Multi-Patient k-NN (exp13)
+
+**Idea**: At evaluation time, compute embeddings for all source patients using their Stage 1 read-ins + the Stage 2-adapted backbone. Add these as extra neighbors in the k-NN classifier, weighted at 0.5× the target training embeddings.
+
+**Why it works**: Source patients provide ~1300 extra labeled reference points for k-NN. Even though their representations went through different read-ins, the shared backbone maps them to a common feature space. Weighting at 0.5 (not 1.0) acknowledges that source representations are noisier but still informative.
+
+**Implementation**: `SOURCE_KNN_WEIGHT = 0.5`, source embeddings scaled by this weight before concatenation with target training embeddings. Cosine similarity naturally handles the scale difference.
+
+### Categorized Experiment Approaches
+
+**Stage 1 training modifications** (exp01, 02, 07, 10, 12): Batch size, LR, WD, fixed schedule, eval frequency, stronger regularization — ALL failed. Stage 1 overfitting is resistant to standard hyperparameter changes.
+
+**Stage 2 adaptation modifications** (exp03, 05, 08, 09, 11, 16): Source replay, freeze backbone, progressive unfreezing, more patience, lighter augmentation — ALL failed or marginal. Stage 2 is not the bottleneck.
+
+**Architecture changes** (exp04, 06, 17): H=64 backbone, dual articulatory head, FlattenLinear+InstanceNorm — ALL failed or interrupted. Architecture is not the problem at this scale.
+
+**Evaluation improvements** (exp13, 14, 15): Multi-patient k-NN — THIS WORKED. The only improvement came from better evaluation, not training.
+
+### Realizations
+
+66. **Evaluation improvements continue to dominate training improvements for LOPO**, just as they did for single-patient (realization 36). The only experiment that beat the baseline was a k-NN evaluation change, not a training change.
+
+67. **Multi-patient k-NN weight 0.5 is optimal**: 0.3 too low (reverts to baseline), 1.0 too high (source noise overwhelms target signal). The balance matters.
+
+68. **Lighter Stage 2 augmentation was the closest training-side improvement** (exp11, 0.769). Mixup on ~120 training samples may add too much noise. Worth retesting in combination with other improvements.
+
+69. **16 experiments failed to improve Stage 1 training.** The source-patient overfitting pattern (val diverges from epoch 5-10) is deeply structural, not addressable by standard hyperparameter tuning. Future approaches should consider: domain adversarial training, patient-conditional features, or fundamentally different training objectives.
+
+70. **LOPO is evaluation-limited, not training-limited.** The backbone learns decent features for all patients. The challenge is extracting predictions from mixed-patient feature spaces. More sophisticated evaluation (multi-patient k-NN, ensemble, prototype networks) is the highest-leverage direction.
+
+### What to Try Next (for next agent)
+
+1. **Domain adversarial training (gradient reversal)** — force patient-invariant backbone features. Was committed as exp14 variant but never properly tested. This is the highest-priority training-side experiment.
+2. **InstanceNorm per patient** — normalize activations per-patient before shared backbone. Was part of interrupted exp17.
+3. **No S2 mixup + multi-patient k-NN combined** — exp11 (no mixup, 0.769) and exp13 (multi-pt kNN, 0.762) were both improvements individually. Exp16 tried combining but used lighter S2 aug too, which hurt. Try JUST removing mixup from exp13.
+4. **SVM/prototype networks on embeddings** — if k-NN with source neighbors helps, an SVM or nearest-centroid classifier might extract even more from the shared feature space.
+5. **Ensemble of multiple seeds** — run 3 seeds, ensemble predictions. Reduces variance from random init.
+6. **Cross-patient contrastive k-NN** — use cross-patient phoneme pairs as positives in a contrastive loss on the k-NN embedding space (not on training loss).

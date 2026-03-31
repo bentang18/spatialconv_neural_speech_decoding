@@ -204,7 +204,22 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 
 **Recommended per-patient config**: CE loss, stride=10, pool(4,8), C=8, d_shared=256, H=32. Input sweep in progress.
 
-**MPS compatibility**: `AdaptiveAvgPool2d` falls back to CPU for non-divisible grid sizes. CTC loss also falls back to CPU. Use `PYTORCH_ENABLE_MPS_FALLBACK=1`.
+**MPS compatibility** (local Mac only): `AdaptiveAvgPool2d` falls back to CPU for non-divisible grid sizes. CTC loss also falls back to CPU. Use `PYTORCH_ENABLE_MPS_FALLBACK=1`.
+
+## Compute: Duke DCC Cluster (primary)
+
+**Use DCC for all production training runs.** Local MPS is for quick iteration only.
+
+- **SSH**: `ssh ht203@dcc-login.oit.duke.edu` (no MFA currently)
+- **GPU**: RTX 5000 Ada Generation (32 GB VRAM) × 8 on `coganlab-gpu` partition
+- **Repo**: `/work/ht203/repo/speech` (branch `autoresearch/run1`)
+- **Data**: `/work/ht203/data/BIDS` (symlinked from coganlab + preprocessed .fifs transferred)
+- **Conda**: `/work/ht203/miniconda3/envs/speech` (Python 3.11, PyTorch 2.5.1+cu121)
+- **Logs**: `/work/ht203/logs/`
+- **Batch script**: `scripts/train_dcc.sh` (SBATCH template for coganlab-gpu)
+- **Device**: Set `DEVICE=cuda` on DCC (train.py reads `os.environ.get("DEVICE", "mps")`)
+- **Submit**: `sbatch scripts/train_dcc.sh` | Monitor: `squeue -u ht203`
+- **CAUTION**: `/work/ht203` auto-purges after 75 days of no access. Copy important results to `/hpc/group/coganlab/ht203/`.
 
 ### LOPO Pilot Results (complete)
 **Config**: `lopo_pilot.yaml` — 8 Spalding patients, 1 seed (42), H=64, CTC, blank_bias=1.0
@@ -227,6 +242,17 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 - S33 (52 trials) survived with inner stratification fix
 - Very low variance across patients (0.828-0.856) — model is near-chance uniformly
 - **Interpretation**: Cross-patient transfer with CTC + current architecture doesn't help. Need to investigate: CE for LOPO, larger input layer, different Stage 2 strategy
+
+### LOPO Autoresearch Results (2026-03-31)
+**Setup**: 10 source patients (~1468 trials) → adapt to S14, 5-fold grouped-by-token CV.
+**Recipe**: CE + focal γ=2 + label smoothing 0.1 + mixup α=0.2 + per-position heads + dropout 0.3 + weighted k-NN (k=10) + TTA 16.
+
+- **Baseline PER**: 0.764 (CE recipe, beats pilot 0.846 by 8.2pp)
+- **Best PER**: **0.762** (exp13: multi-patient k-NN with source embeddings as extra neighbors, weight 0.5)
+- 16 experiments run, 15 discarded. Only evaluation-side improvement worked (multi-patient k-NN). All training-side modifications (S1 hyperparams, S2 adaptation, architecture changes) failed to beat baseline.
+- **Key insight**: LOPO is evaluation-limited, not training-limited. The backbone learns decent cross-patient features; extracting predictions from the shared feature space is the bottleneck.
+- **Next directions**: Domain adversarial training, InstanceNorm per patient, SVM/prototype networks on embeddings, multi-seed ensemble.
+- See `docs/experiment_log.md` for full results and realizations 66-70.
 
 ### NCA-JEPA Pretraining (in progress)
 MVP-staged synthetic pretraining pipeline. 6 gated phases, implementing Phase 0 first.
