@@ -12,3 +12,4 @@ exp09	0.7975	470	discard	S2 patience 15, epochs 300 — worse, more patience all
 exp10	0.8036	239	discard	S1 eval every 5 — worse, S1 best checkpoint at epoch 5 is undertrained
 exp11	0.7688	402	discard	Lighter S2 augment + no mixup — close to baseline (0.769 vs 0.764) but not better
 exp12	0.8102	396	discard	Stronger S1 reg (dropout 0.5, WD 5e-4) — too much regularization
+exp13	0.7623	412	keep	Multi-patient k-NN (source embeddings as extra neighbors, weight 0.5) — NEW BEST
