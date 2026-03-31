@@ -50,11 +50,11 @@ S1_WEIGHT_DECAY = 1e-4
 S1_GRAD_CLIP = 5.0
 S1_WARMUP_EPOCHS = 20
 S1_PATIENCE = 7
-S1_EVAL_EVERY = 10
+S1_EVAL_EVERY = 5  # eval 2x more often — best checkpoint at epoch 5 instead of 10
 S1_VAL_FRACTION = 0.2  # per-patient val split for early stopping
 
 # Stage 2 (target adaptation)
-S2_EPOCHS = 300
+S2_EPOCHS = 150
 S2_BATCH_SIZE = 16
 S2_LR = 1e-3
 S2_BACKBONE_LR_MULT = 0.1  # backbone at lower LR
@@ -62,7 +62,7 @@ S2_READIN_LR_MULT = 3.0
 S2_WEIGHT_DECAY = 1e-4
 S2_GRAD_CLIP = 5.0
 S2_WARMUP_EPOCHS = 10
-S2_PATIENCE = 15  # more patience — S2 loss is noisy with ~120 trials
+S2_PATIENCE = 7
 S2_EVAL_EVERY = 5
 
 # Shared

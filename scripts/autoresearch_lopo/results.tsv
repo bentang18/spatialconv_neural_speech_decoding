@@ -8,3 +8,4 @@ exp05	0.8040	416	discard	Freeze backbone in Stage 2 (LR_MULT=0.0) — worse
 exp06	0.7882	336	discard	Dual head (CE + articulatory) — worse, articulatory head didn't help cross-patient
 exp07	0.7930	275	discard	S1 fixed 30 epochs cosine, no val split, no early stop — worse
 exp08	0.8066	363	discard	Progressive unfreezing S2 (freeze backbone 30 epochs) — worse, S2 folds too short
+exp09	0.7975	470	discard	S2 patience 15, epochs 300 — worse, more patience allows more overfitting
