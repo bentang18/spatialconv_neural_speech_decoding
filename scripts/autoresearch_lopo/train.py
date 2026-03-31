@@ -50,7 +50,7 @@ S1_WEIGHT_DECAY = 1e-4
 S1_GRAD_CLIP = 5.0
 S1_WARMUP_EPOCHS = 20
 S1_PATIENCE = 7
-S1_EVAL_EVERY = 5  # eval 2x more often — best checkpoint at epoch 5 instead of 10
+S1_EVAL_EVERY = 10
 S1_VAL_FRACTION = 0.2  # per-patient val split for early stopping
 
 # Stage 2 (target adaptation)
@@ -136,6 +136,14 @@ def augment(x: torch.Tensor) -> torch.Tensor:
     x = amplitude_scale(x, std=0.3)
     x = channel_dropout(x, max_p=0.2)
     x = gaussian_noise(x, frac=0.05)
+    return x
+
+
+def augment_light(x: torch.Tensor) -> torch.Tensor:
+    """Lighter augmentation for Stage 2 (small target data)."""
+    x = time_shift(x, max_frames=10)
+    x = amplitude_scale(x, std=0.15)
+    x = gaussian_noise(x, frac=0.03)
     return x
 
 
@@ -474,21 +482,15 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
 
         for start in range(0, n_train, S2_BATCH_SIZE):
             idx = perm[start:start + S2_BATCH_SIZE]
-            x = augment(train_grids[idx]).to(DEVICE)
+            x = augment_light(train_grids[idx]).to(DEVICE)
             y = [train_labels[i] for i in idx.tolist()]
 
-            mixup_y, mixup_lam = None, 1.0
-            if MIXUP_ALPHA > 0 and len(idx) > 1:
-                mixup_lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
-                perm_mix = torch.randperm(x.shape[0])
-                x = mixup_lam * x + (1 - mixup_lam) * x[perm_mix]
-                mixup_y = [y[i] for i in perm_mix.tolist()]
-
+            # No mixup in Stage 2 — too aggressive for ~120 trials
             optimizer.zero_grad()
             feat = target_ri(x)
             h = backbone_copy(feat)
             logits = head(h)
-            loss = compute_loss(logits, y, mixup_labels=mixup_y, mixup_lam=mixup_lam)
+            loss = compute_loss(logits, y)
 
             if math.isnan(loss.item()):
                 print("FAIL")
