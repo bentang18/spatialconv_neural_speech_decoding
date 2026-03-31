@@ -1,2 +1,8 @@
 commit	val_per	training_sec	status	description
 baseline	0.7645	373	keep	LOPO pre-baked: CE+focal+mixup+label_smooth+per_pos_heads+kNN+TTA, 9 source pts
+exp01	0.8254	255	discard	S1 batch=32, eval_every=5, patience=12 — worse, early stop epoch 65
+exp02	0.8257	271	discard	S1 LR=5e-4, WD=1e-3 — worse, COLLAPSED (stereotypy 0.32)
+exp03	0.7845	269	discard	Source replay 30% in Stage 2 — worse by 2pp
+exp04	0.7882	336	discard	H=64 backbone (d=64, gru_hidden=64) — worse, S2 slower
+exp05	0.8040	416	discard	Freeze backbone in Stage 2 (LR_MULT=0.0) — worse
+exp06	0.7882	336	discard	Dual head (CE + articulatory) — worse, articulatory head didn't help cross-patient
