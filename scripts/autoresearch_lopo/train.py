@@ -53,18 +53,17 @@ S1_PATIENCE = 7
 S1_EVAL_EVERY = 10
 S1_VAL_FRACTION = 0.2  # per-patient val split for early stopping
 
-# Stage 2 (target adaptation) — two-phase progressive unfreezing
-S2_EPOCHS = 150
+# Stage 2 (target adaptation)
+S2_EPOCHS = 300
 S2_BATCH_SIZE = 16
 S2_LR = 1e-3
-S2_BACKBONE_LR_MULT = 0.1  # backbone at lower LR (phase 2 only)
+S2_BACKBONE_LR_MULT = 0.1  # backbone at lower LR
 S2_READIN_LR_MULT = 3.0
 S2_WEIGHT_DECAY = 1e-4
 S2_GRAD_CLIP = 5.0
 S2_WARMUP_EPOCHS = 10
-S2_PATIENCE = 7
+S2_PATIENCE = 15  # more patience — S2 loss is noisy with ~120 trials
 S2_EVAL_EVERY = 5
-S2_FREEZE_BACKBONE_EPOCHS = 30  # Phase 1: freeze backbone for this many epochs
 
 # Shared
 LABEL_SMOOTHING = 0.1
@@ -468,16 +467,7 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
     patience_ctr = 0
 
     for epoch in range(S2_EPOCHS):
-        # Progressive unfreezing: freeze backbone during phase 1
-        freeze_backbone = (epoch < S2_FREEZE_BACKBONE_EPOCHS)
-        if freeze_backbone:
-            backbone_copy.eval()  # keep in eval mode (no dropout/mask)
-            for p in backbone_copy.parameters():
-                p.requires_grad = False
-        else:
-            backbone_copy.train()
-            for p in backbone_copy.parameters():
-                p.requires_grad = True
+        backbone_copy.train()
         target_ri.train()
         head.train()
         perm = torch.randperm(n_train)
