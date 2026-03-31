@@ -3,9 +3,15 @@
 
 THE AI AGENT MODIFIES THIS FILE.
 
-Experiment 13: Skip Stage 1 entirely. Train from scratch on S14 only.
-Hypothesis: Stage 1 cross-patient features may HURT S14 performance.
-If this beats 0.764, Stage 1 is net-negative.
+Two-stage pipeline:
+  Stage 1: Train shared backbone + per-patient read-ins on source patients
+  Stage 2: Adapt to target S14 (per CV fold) — full model, differential LR
+
+Pre-baked recipe (from single-patient autoresearch 0.872→0.737):
+  CE loss, label smoothing 0.1, focal γ=2, mixup α=0.2,
+  per-position heads + dropout 0.3, weighted k-NN + TTA 16
+
+Current best PER: (run baseline to establish)  |  Chance PER: ~0.889
 """
 from __future__ import annotations
 
@@ -33,16 +39,30 @@ DEVICE = os.environ.get("DEVICE", "mps")
 SEED = 42
 
 # ============================================================
-# HYPERPARAMETERS
+# HYPERPARAMETERS  (tune freely)
 # ============================================================
-# No Stage 1 — train directly on S14
-S2_EPOCHS = 200
+# Stage 1 (source patients)
+S1_EPOCHS = 200
+S1_BATCH_SIZE = 16
+S1_LR = 1e-3
+S1_READIN_LR_MULT = 3.0
+S1_WEIGHT_DECAY = 1e-4
+S1_GRAD_CLIP = 5.0
+S1_WARMUP_EPOCHS = 20
+S1_PATIENCE = 7
+S1_EVAL_EVERY = 10
+S1_VAL_FRACTION = 0.2  # per-patient val split for early stopping
+
+# Stage 2 (target adaptation)
+S2_EPOCHS = 150
 S2_BATCH_SIZE = 16
 S2_LR = 1e-3
-S2_WEIGHT_DECAY = 5e-4
+S2_BACKBONE_LR_MULT = 0.1  # backbone at lower LR
+S2_READIN_LR_MULT = 3.0
+S2_WEIGHT_DECAY = 1e-4
 S2_GRAD_CLIP = 5.0
-S2_WARMUP_EPOCHS = 15
-S2_PATIENCE = 10
+S2_WARMUP_EPOCHS = 10
+S2_PATIENCE = 7
 S2_EVAL_EVERY = 5
 
 # Shared
@@ -53,7 +73,7 @@ TTA_COPIES = 16
 KNN_K = 10
 
 # ============================================================
-# AUGMENTATION
+# AUGMENTATION  (modify strategy freely)
 # ============================================================
 
 def time_shift(x: torch.Tensor, max_frames: int = 30) -> torch.Tensor:
@@ -120,7 +140,7 @@ def augment(x: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================
-# MODEL COMPONENTS
+# MODEL COMPONENTS  (redesign freely)
 # ============================================================
 
 class SpatialReadIn(nn.Module):
@@ -148,8 +168,8 @@ class Backbone(nn.Module):
     """LN -> feat_drop -> Conv1d(stride) -> GELU -> time_mask -> BiGRU."""
 
     def __init__(self, d_in: int = 256, d: int = 32, gru_hidden: int = 32,
-                 gru_layers: int = 2, stride: int = 10, gru_dropout: float = 0.5,
-                 feat_drop_max: float = 0.5, time_mask_min: int = 2,
+                 gru_layers: int = 2, stride: int = 10, gru_dropout: float = 0.3,
+                 feat_drop_max: float = 0.3, time_mask_min: int = 2,
                  time_mask_max: int = 5):
         super().__init__()
         self.ln = nn.LayerNorm(d_in)
@@ -262,27 +282,175 @@ def knn_predict(train_emb, train_labels, val_emb, k=KNN_K):
 
 
 # ============================================================
-# TRAIN + EVAL (per fold, no Stage 1)
+# STAGE 1: MULTI-PATIENT SOURCE TRAINING
 # ============================================================
 
-def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
-    """Train from scratch on S14 fold (no cross-patient pretraining)."""
+def train_stage1(all_data):
+    """Train shared backbone + per-patient read-ins on source patients."""
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
+    # Build per-patient read-ins
+    read_ins = {}
+    for pid in prepare.SOURCE_PATIENTS:
+        H, W = all_data[pid]["grid_shape"]
+        read_ins[pid] = SpatialReadIn(H, W).to(DEVICE)
+    d_flat = list(read_ins.values())[0].d_flat
+
+    backbone = Backbone(d_in=d_flat).to(DEVICE)
+    head = CEHead(d_in=backbone.out_dim).to(DEVICE)
+
+    # Split each source patient into train/val
+    source_train, source_val = {}, {}
+    for pid in prepare.SOURCE_PATIENTS:
+        n = len(all_data[pid]["labels"])
+        perm = np.random.permutation(n)
+        n_val = max(1, int(round(S1_VAL_FRACTION * n)))
+        val_idx = sorted(perm[:n_val].tolist())
+        train_idx = sorted(perm[n_val:].tolist())
+        source_train[pid] = train_idx
+        source_val[pid] = val_idx
+
+    # Optimizer with differential LR
+    readin_params = []
+    for ri in read_ins.values():
+        readin_params.extend(ri.parameters())
+    optimizer = AdamW([
+        {"params": readin_params, "lr": S1_LR * S1_READIN_LR_MULT},
+        {"params": backbone.parameters(), "lr": S1_LR},
+        {"params": head.parameters(), "lr": S1_LR},
+    ], weight_decay=S1_WEIGHT_DECAY)
+
+    def lr_lambda(epoch):
+        if S1_WARMUP_EPOCHS > 0 and epoch < S1_WARMUP_EPOCHS:
+            return (epoch + 1) / S1_WARMUP_EPOCHS
+        progress = (epoch - S1_WARMUP_EPOCHS) / max(S1_EPOCHS - S1_WARMUP_EPOCHS, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
+    best_val_loss = float("inf")
+    best_state = None
+    patience_ctr = 0
+    pids = prepare.SOURCE_PATIENTS
+
+    for epoch in range(S1_EPOCHS):
+        backbone.train()
+        head.train()
+        for ri in read_ins.values():
+            ri.train()
+
+        # Shuffle patients each epoch, train batches from each
+        np.random.shuffle(pids)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for pid in pids:
+            grids = all_data[pid]["grids"]
+            labels = all_data[pid]["labels"]
+            tr_idx = source_train[pid]
+            perm = np.random.permutation(len(tr_idx))
+
+            for start in range(0, len(tr_idx), S1_BATCH_SIZE):
+                batch_idx = [tr_idx[perm[i]] for i in range(start, min(start + S1_BATCH_SIZE, len(tr_idx)))]
+                x = augment(grids[batch_idx]).to(DEVICE)
+                y = [labels[i] for i in batch_idx]
+
+                mixup_y, mixup_lam = None, 1.0
+                if MIXUP_ALPHA > 0 and len(batch_idx) > 1:
+                    mixup_lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                    perm_mix = torch.randperm(x.shape[0])
+                    x = mixup_lam * x + (1 - mixup_lam) * x[perm_mix]
+                    mixup_y = [y[i] for i in perm_mix.tolist()]
+
+                optimizer.zero_grad()
+                feat = read_ins[pid](x)
+                h = backbone(feat)
+                logits = head(h)
+                loss = compute_loss(logits, y, mixup_labels=mixup_y, mixup_lam=mixup_lam)
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(backbone.parameters()) + list(head.parameters()) + readin_params,
+                    S1_GRAD_CLIP,
+                )
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+
+        scheduler.step()
+        avg_loss = epoch_loss / max(n_batches, 1)
+
+        # Validate
+        if (epoch + 1) % S1_EVAL_EVERY == 0:
+            backbone.eval()
+            head.eval()
+            for ri in read_ins.values():
+                ri.eval()
+            val_loss = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for pid in prepare.SOURCE_PATIENTS:
+                    vi = source_val[pid]
+                    if not vi:
+                        continue
+                    grids = all_data[pid]["grids"]
+                    labels = all_data[pid]["labels"]
+                    x = grids[vi].to(DEVICE)
+                    y = [labels[i] for i in vi]
+                    feat = read_ins[pid](x)
+                    h = backbone(feat)
+                    logits = head(h)
+                    val_loss += compute_loss(logits, y).item()
+                    val_batches += 1
+            val_loss /= max(val_batches, 1)
+
+            print(f"  S1 epoch {epoch+1}: train_loss={avg_loss:.4f}, val_loss={val_loss:.4f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {
+                    "backbone": deepcopy(backbone.state_dict()),
+                    "head": deepcopy(head.state_dict()),
+                    "read_ins": {pid: deepcopy(ri.state_dict()) for pid, ri in read_ins.items()},
+                }
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+                if patience_ctr >= S1_PATIENCE:
+                    print(f"  S1 early stop at epoch {epoch+1}")
+                    break
+
+    # Restore best
+    if best_state:
+        backbone.load_state_dict(best_state["backbone"])
+        head.load_state_dict(best_state["head"])
+        for pid, ri in read_ins.items():
+            if pid in best_state["read_ins"]:
+                ri.load_state_dict(best_state["read_ins"][pid])
+
+    return backbone, head, read_ins
+
+
+# ============================================================
+# STAGE 2: TARGET ADAPTATION + EVALUATION (per fold)
+# ============================================================
+
+def train_eval_fold(backbone, head_init, train_grids, train_labels,
+                    val_grids, val_labels):
+    """Adapt Stage 1 model to target fold, evaluate."""
+    backbone_copy = deepcopy(backbone)
     target_ri = SpatialReadIn(
         prepare.PATIENT_GRIDS[prepare.TARGET_PATIENT][0],
         prepare.PATIENT_GRIDS[prepare.TARGET_PATIENT][1],
     ).to(DEVICE)
-    d_flat = target_ri.d_flat
-    backbone = Backbone(d_in=d_flat).to(DEVICE)
-    head = CEHead(d_in=backbone.out_dim).to(DEVICE)
+    # Warm-start head from Stage 1 (preserves multi-patient phoneme discrimination)
+    head = deepcopy(head_init).to(DEVICE)
 
     n_train = len(train_grids)
 
     optimizer = AdamW([
-        {"params": target_ri.parameters(), "lr": S2_LR * 3.0},
-        {"params": backbone.parameters(), "lr": S2_LR},
+        {"params": target_ri.parameters(), "lr": S2_LR * S2_READIN_LR_MULT},
+        {"params": backbone_copy.parameters(), "lr": S2_LR * S2_BACKBONE_LR_MULT},
         {"params": head.parameters(), "lr": S2_LR},
     ], weight_decay=S2_WEIGHT_DECAY)
 
@@ -299,7 +467,7 @@ def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
     patience_ctr = 0
 
     for epoch in range(S2_EPOCHS):
-        backbone.train()
+        backbone_copy.train()
         target_ri.train()
         head.train()
         perm = torch.randperm(n_train)
@@ -318,7 +486,7 @@ def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
 
             optimizer.zero_grad()
             feat = target_ri(x)
-            h = backbone(feat)
+            h = backbone_copy(feat)
             logits = head(h)
             loss = compute_loss(logits, y, mixup_labels=mixup_y, mixup_lam=mixup_lam)
 
@@ -328,7 +496,7 @@ def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
 
             loss.backward()
             nn.utils.clip_grad_norm_(
-                list(backbone.parameters()) + list(target_ri.parameters()) + list(head.parameters()),
+                list(backbone_copy.parameters()) + list(target_ri.parameters()) + list(head.parameters()),
                 S2_GRAD_CLIP,
             )
             optimizer.step()
@@ -336,19 +504,19 @@ def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
         scheduler.step()
 
         if (epoch + 1) % S2_EVAL_EVERY == 0:
-            backbone.eval()
+            backbone_copy.eval()
             target_ri.eval()
             head.eval()
             with torch.no_grad():
                 feat = target_ri(val_grids.to(DEVICE))
-                h = backbone(feat)
+                h = backbone_copy(feat)
                 logits = head(h)
                 val_loss = compute_loss(logits, val_labels).item()
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_state = {
-                    "backbone": deepcopy(backbone.state_dict()),
+                    "backbone": deepcopy(backbone_copy.state_dict()),
                     "readin": deepcopy(target_ri.state_dict()),
                     "head": deepcopy(head.state_dict()),
                 }
@@ -360,12 +528,12 @@ def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
 
     # Restore best
     if best_state:
-        backbone.load_state_dict(best_state["backbone"])
+        backbone_copy.load_state_dict(best_state["backbone"])
         target_ri.load_state_dict(best_state["readin"])
         head.load_state_dict(best_state["head"])
 
     # --- Evaluate ---
-    backbone.eval()
+    backbone_copy.eval()
     target_ri.eval()
     head.eval()
 
@@ -374,26 +542,26 @@ def train_eval_fold(train_grids, train_labels, val_grids, val_labels):
         if TTA_COPIES > 1:
             logits_sum = torch.zeros(len(val_grids), prepare.N_POSITIONS, prepare.N_CLASSES, device=DEVICE)
             feat = target_ri(val_grids.to(DEVICE))
-            logits_sum += head(backbone(feat))
+            logits_sum += head(backbone_copy(feat))
             for _ in range(TTA_COPIES - 1):
                 feat = target_ri(augment(val_grids).to(DEVICE))
-                logits_sum += head(backbone(feat))
+                logits_sum += head(backbone_copy(feat))
             logits = logits_sum / TTA_COPIES
         else:
             feat = target_ri(val_grids.to(DEVICE))
-            logits = head(backbone(feat))
+            logits = head(backbone_copy(feat))
     linear_preds = decode(logits)
     linear_per = prepare.compute_per(linear_preds, val_labels)
 
     # k-NN with TTA
-    train_emb = extract_embeddings(backbone, target_ri, train_grids)
+    train_emb = extract_embeddings(backbone_copy, target_ri, train_grids)
     if TTA_COPIES > 1:
-        val_emb_sum = extract_embeddings(backbone, target_ri, val_grids)
+        val_emb_sum = extract_embeddings(backbone_copy, target_ri, val_grids)
         for _ in range(TTA_COPIES - 1):
-            val_emb_sum = val_emb_sum + extract_embeddings(backbone, target_ri, augment(val_grids))
+            val_emb_sum = val_emb_sum + extract_embeddings(backbone_copy, target_ri, augment(val_grids))
         val_emb = val_emb_sum / TTA_COPIES
     else:
-        val_emb = extract_embeddings(backbone, target_ri, val_grids)
+        val_emb = extract_embeddings(backbone_copy, target_ri, val_grids)
     knn_preds = knn_predict(train_emb, train_labels, val_emb)
     knn_per = prepare.compute_per(knn_preds, val_labels)
 
@@ -411,20 +579,28 @@ if __name__ == "__main__":
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    # Load data (only need target)
-    all_data = prepare.load_all_patients()  # still load for cache
+    # Load all data
+    all_data = prepare.load_all_patients()
     grids, labels, token_ids = prepare.load_target_data()
     splits = prepare.create_cv_splits(token_ids)
 
     N, H, W, T = grids.shape
+    total_source = sum(len(all_data[p]["labels"]) for p in prepare.SOURCE_PATIENTS)
     print(f"Target: {prepare.TARGET_PATIENT}  |  Trials: {N}  |  Grid: {H}x{W}  |  T: {T}")
-    print(f"NO STAGE 1 — training from scratch on S14 only")
+    print(f"Source patients: {len(prepare.SOURCE_PATIENTS)}  |  Source trials: {total_source}")
     print(f"Folds: {len(splits)}  |  Device: {DEVICE}")
     print()
 
-    # No Stage 1 — go directly to per-fold training
-    print("=== Training from scratch on S14 (no cross-patient pretraining) ===")
+    # Stage 1: train on source patients
+    print("=== Stage 1: Source patient training ===")
+    s1_start = time.time()
+    backbone, head, read_ins = train_stage1(all_data)
+    s1_time = time.time() - s1_start
+    print(f"Stage 1 done in {s1_time:.1f}s")
+    print()
 
+    # Stage 2 + Eval: adapt to target per fold
+    print("=== Stage 2: Target adaptation + evaluation ===")
     fold_pers = []
     fold_linear_pers = []
     fold_knn_pers = []
@@ -434,6 +610,7 @@ if __name__ == "__main__":
     for fi, (tr_idx, va_idx) in enumerate(splits):
         ft0 = time.time()
         per, preds, lp, kp = train_eval_fold(
+            backbone, head,
             grids[tr_idx], [labels[i] for i in tr_idx],
             grids[va_idx], [labels[i] for i in va_idx],
         )
@@ -460,7 +637,7 @@ if __name__ == "__main__":
     print(f"fold_pers:          {fold_pers}")
     print(f"linear_pers:        {fold_linear_pers}")
     print(f"knn_pers:           {fold_knn_pers}")
-    print(f"stage1_seconds:     0.0")
+    print(f"stage1_seconds:     {s1_time:.1f}")
     print(f"training_seconds:   {elapsed:.1f}")
     print(f"collapsed:          {collapse['collapsed']}")
     print(f"mean_entropy:       {collapse['mean_entropy']:.3f}")
