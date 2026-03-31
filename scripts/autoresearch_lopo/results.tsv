@@ -14,3 +14,4 @@ exp11	0.7688	402	discard	Lighter S2 augment + no mixup — close to baseline (0.
 exp12	0.8102	396	discard	Stronger S1 reg (dropout 0.5, WD 5e-4) — too much regularization
 exp13	0.7623	412	keep	Multi-patient k-NN (source embeddings as extra neighbors, weight 0.5) — NEW BEST
 exp14	0.7645	417	discard	Source k-NN weight 1.0 (unweighted) — slightly worse than 0.5
+exp15	0.7645	418	discard	Source k-NN weight 0.3 — same as baseline, 0.5 is optimal
