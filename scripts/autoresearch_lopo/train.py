@@ -435,7 +435,7 @@ def train_stage1(all_data):
 # STAGE 2: TARGET ADAPTATION + EVALUATION (per fold)
 # ============================================================
 
-SOURCE_KNN_WEIGHT = 0.5  # weight for source patient k-NN neighbors vs target
+SOURCE_KNN_WEIGHT = 1.0  # weight for source patient k-NN neighbors (1.0 = unweighted)
 
 
 def train_eval_fold(backbone, head_init, train_grids, train_labels,
