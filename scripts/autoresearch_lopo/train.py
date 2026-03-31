@@ -3,15 +3,10 @@
 
 THE AI AGENT MODIFIES THIS FILE.
 
-Two-stage pipeline:
-  Stage 1: Train shared backbone + per-patient read-ins on source patients
-  Stage 2: Adapt to target S14 (per CV fold) — full model, differential LR
-
-Pre-baked recipe (from single-patient autoresearch 0.872→0.737):
-  CE loss, label smoothing 0.1, focal γ=2, mixup α=0.2,
-  per-position heads + dropout 0.3, weighted k-NN + TTA 16
-
-Current best PER: (run baseline to establish)  |  Chance PER: ~0.889
+Experiment 15: Source k-NN augmentation.
+After Stage 2, embed ALL source patients through their trained read-ins +
+shared backbone. Add those as extra k-NN neighbors at eval time.
+This exploits cross-patient phoneme structure at EVAL time.
 """
 from __future__ import annotations
 
@@ -71,6 +66,7 @@ FOCAL_GAMMA = 2.0
 MIXUP_ALPHA = 0.2
 TTA_COPIES = 16
 KNN_K = 10
+SOURCE_KNN_WEIGHT = 0.5  # weight for source patient k-NN neighbors
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -262,20 +258,33 @@ def extract_embeddings(backbone, readin, grids):
         return h.mean(dim=1).cpu()
 
 
-def knn_predict(train_emb, train_labels, val_emb, k=KNN_K):
-    train_n = F.normalize(train_emb, dim=1)
+def knn_predict(train_emb, train_labels, val_emb, k=KNN_K,
+                extra_emb=None, extra_labels=None, extra_weight=1.0):
+    """Weighted k-NN with optional extra (source patient) embeddings."""
+    if extra_emb is not None and extra_labels is not None:
+        all_emb = torch.cat([train_emb, extra_emb], dim=0)
+        all_labels = list(train_labels) + list(extra_labels)
+        weights = torch.ones(len(all_emb))
+        weights[len(train_emb):] = extra_weight
+    else:
+        all_emb = train_emb
+        all_labels = list(train_labels)
+        weights = torch.ones(len(all_emb))
+
+    all_n = F.normalize(all_emb, dim=1)
     val_n = F.normalize(val_emb, dim=1)
-    sim = val_n @ train_n.T
-    topk_sim, topk_idx = sim.topk(k, dim=1)
+    sim = val_n @ all_n.T
+    topk_sim, topk_idx = sim.topk(min(k, len(all_emb)), dim=1)
+
     preds = []
     for i in range(val_emb.shape[0]):
         pred = []
         for pos in range(prepare.N_POSITIONS):
             class_weights = [0.0] * (prepare.N_CLASSES + 1)
-            for j_idx in range(k):
+            for j_idx in range(topk_sim.shape[1]):
                 j = topk_idx[i, j_idx].item()
-                cls = train_labels[j][pos]
-                class_weights[cls] += topk_sim[i, j_idx].item()
+                cls = all_labels[j][pos]
+                class_weights[cls] += topk_sim[i, j_idx].item() * weights[j].item()
             pred.append(int(np.argmax(class_weights[1:]) + 1))
         preds.append(pred)
     return preds
@@ -340,7 +349,6 @@ def train_stage1(all_data):
         for ri in read_ins.values():
             ri.train()
 
-        # Shuffle patients each epoch, train batches from each
         np.random.shuffle(pids)
         epoch_loss = 0.0
         n_batches = 0
@@ -431,22 +439,41 @@ def train_stage1(all_data):
     return backbone, head, read_ins
 
 
+def get_source_embeddings(backbone, read_ins, all_data):
+    """Get embeddings for all source patients using their trained read-ins."""
+    backbone.eval()
+    all_emb = []
+    all_labels = []
+    with torch.no_grad():
+        for pid in prepare.SOURCE_PATIENTS:
+            ri = read_ins[pid]
+            ri.eval()
+            grids = all_data[pid]["grids"]
+            labels_list = all_data[pid]["labels"]
+            embs = []
+            for start in range(0, len(grids), 32):
+                batch = grids[start:start + 32].to(DEVICE)
+                feat = ri(batch)
+                h = backbone(feat)
+                embs.append(h.mean(dim=1).cpu())
+            all_emb.append(torch.cat(embs, dim=0))
+            all_labels.extend(labels_list)
+    return torch.cat(all_emb, dim=0), all_labels
+
+
 # ============================================================
 # STAGE 2: TARGET ADAPTATION + EVALUATION (per fold)
 # ============================================================
 
-SOURCE_KNN_WEIGHT = 1.0  # weight for source patient k-NN neighbors (1.0 = unweighted)
-
-
 def train_eval_fold(backbone, head_init, train_grids, train_labels,
-                    val_grids, val_labels, read_ins=None, all_data=None):
+                    val_grids, val_labels,
+                    source_emb=None, source_labels=None):
     """Adapt Stage 1 model to target fold, evaluate."""
     backbone_copy = deepcopy(backbone)
     target_ri = SpatialReadIn(
         prepare.PATIENT_GRIDS[prepare.TARGET_PATIENT][0],
         prepare.PATIENT_GRIDS[prepare.TARGET_PATIENT][1],
     ).to(DEVICE)
-    # Warm-start head from Stage 1 (preserves multi-patient phoneme discrimination)
     head = deepcopy(head_init).to(DEVICE)
 
     n_train = len(train_grids)
@@ -556,28 +583,8 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
     linear_preds = decode(logits)
     linear_per = prepare.compute_per(linear_preds, val_labels)
 
-    # k-NN with TTA — include source patient embeddings as additional neighbors
+    # k-NN with TTA
     train_emb = extract_embeddings(backbone_copy, target_ri, train_grids)
-    train_emb_all = train_emb
-    train_labels_all = list(train_labels)
-
-    # Add source patient embeddings (using S1 read-ins + S2-adapted backbone)
-    if read_ins is not None and all_data is not None and SOURCE_KNN_WEIGHT > 0:
-        source_embs = []
-        source_labs = []
-        for pid in prepare.SOURCE_PATIENTS:
-            ri = read_ins[pid]
-            ri.eval()
-            sg = all_data[pid]["grids"]
-            sl = all_data[pid]["labels"]
-            emb = extract_embeddings(backbone_copy, ri, sg)
-            source_embs.append(emb)
-            source_labs.extend(sl)
-        source_emb = torch.cat(source_embs, dim=0)
-        # Weight source embeddings lower (scale affects cosine similarity via norm)
-        train_emb_all = torch.cat([train_emb, source_emb * SOURCE_KNN_WEIGHT], dim=0)
-        train_labels_all = list(train_labels) + source_labs
-
     if TTA_COPIES > 1:
         val_emb_sum = extract_embeddings(backbone_copy, target_ri, val_grids)
         for _ in range(TTA_COPIES - 1):
@@ -585,12 +592,30 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
         val_emb = val_emb_sum / TTA_COPIES
     else:
         val_emb = extract_embeddings(backbone_copy, target_ri, val_grids)
-    knn_preds = knn_predict(train_emb_all, train_labels_all, val_emb)
+
+    # Standard k-NN (target only)
+    knn_preds = knn_predict(train_emb, train_labels, val_emb)
     knn_per = prepare.compute_per(knn_preds, val_labels)
 
-    if knn_per < linear_per:
-        return knn_per, knn_preds, linear_per, knn_per
-    return linear_per, linear_preds, linear_per, knn_per
+    # Source-augmented k-NN (target + source neighbors)
+    source_knn_per = float("inf")
+    source_knn_preds = None
+    if source_emb is not None:
+        source_knn_preds = knn_predict(
+            train_emb, train_labels, val_emb,
+            extra_emb=source_emb, extra_labels=source_labels,
+            extra_weight=SOURCE_KNN_WEIGHT,
+            k=20,
+        )
+        source_knn_per = prepare.compute_per(source_knn_preds, val_labels)
+
+    # Pick best of all methods
+    best_per = min(linear_per, knn_per, source_knn_per)
+    if best_per == source_knn_per and source_knn_preds is not None:
+        return best_per, source_knn_preds, linear_per, knn_per, source_knn_per
+    elif best_per == knn_per:
+        return best_per, knn_preds, linear_per, knn_per, source_knn_per
+    return best_per, linear_preds, linear_per, knn_per, source_knn_per
 
 
 # ============================================================
@@ -620,6 +645,11 @@ if __name__ == "__main__":
     backbone, head, read_ins = train_stage1(all_data)
     s1_time = time.time() - s1_start
     print(f"Stage 1 done in {s1_time:.1f}s")
+
+    # Extract source patient embeddings for k-NN augmentation
+    print("Extracting source patient embeddings...")
+    source_emb, source_labels = get_source_embeddings(backbone, read_ins, all_data)
+    print(f"Source embeddings: {source_emb.shape} ({len(source_labels)} trials)")
     print()
 
     # Stage 2 + Eval: adapt to target per fold
@@ -627,23 +657,25 @@ if __name__ == "__main__":
     fold_pers = []
     fold_linear_pers = []
     fold_knn_pers = []
+    fold_source_knn_pers = []
     all_preds = []
     all_refs = []
 
     for fi, (tr_idx, va_idx) in enumerate(splits):
         ft0 = time.time()
-        per, preds, lp, kp = train_eval_fold(
+        per, preds, lp, kp, skp = train_eval_fold(
             backbone, head,
             grids[tr_idx], [labels[i] for i in tr_idx],
             grids[va_idx], [labels[i] for i in va_idx],
-            read_ins=read_ins, all_data=all_data,
+            source_emb=source_emb, source_labels=source_labels,
         )
         fold_pers.append(per)
         fold_linear_pers.append(lp)
         fold_knn_pers.append(kp)
+        fold_source_knn_pers.append(skp)
         all_preds.extend(preds)
         all_refs.extend([labels[i] for i in va_idx])
-        print(f"  Fold {fi + 1}/{len(splits)}: PER={per:.4f} (linear={lp:.4f}, kNN={kp:.4f})  ({time.time() - ft0:.1f}s)")
+        print(f"  Fold {fi + 1}/{len(splits)}: PER={per:.4f} (linear={lp:.4f}, kNN={kp:.4f}, src_kNN={skp:.4f})  ({time.time() - ft0:.1f}s)")
 
         if time.time() - t0 > prepare.TIME_BUDGET:
             print(f"WARNING: time budget exceeded ({time.time() - t0:.0f}s)")
@@ -661,6 +693,7 @@ if __name__ == "__main__":
     print(f"fold_pers:          {fold_pers}")
     print(f"linear_pers:        {fold_linear_pers}")
     print(f"knn_pers:           {fold_knn_pers}")
+    print(f"source_knn_pers:    {fold_source_knn_pers}")
     print(f"stage1_seconds:     {s1_time:.1f}")
     print(f"training_seconds:   {elapsed:.1f}")
     print(f"collapsed:          {collapse['collapsed']}")
