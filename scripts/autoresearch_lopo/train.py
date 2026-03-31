@@ -3,15 +3,10 @@
 
 THE AI AGENT MODIFIES THIS FILE.
 
-Two-stage pipeline:
-  Stage 1: Train shared backbone + per-patient read-ins on source patients
-  Stage 2: Adapt to target S14 (per CV fold) — full model, differential LR
-
-Pre-baked recipe (from single-patient autoresearch 0.872→0.737):
-  CE loss, label smoothing 0.1, focal γ=2, mixup α=0.2,
-  per-position heads + dropout 0.3, weighted k-NN + TTA 16
-
-Current best PER: (run baseline to establish)  |  Chance PER: ~0.889
+Experiment 18: SWA in Stage 1 + lighter S2.
+- SWA averages backbone over last 50% of S1 training for flatter minimum
+- Fixed 60 epochs S1 with cosine schedule (no early stopping)
+- Lighter S2 augmentation, no S2 mixup (from exp 11 insight)
 """
 from __future__ import annotations
 
@@ -42,16 +37,14 @@ SEED = 42
 # HYPERPARAMETERS  (tune freely)
 # ============================================================
 # Stage 1 (source patients)
-S1_EPOCHS = 200
+S1_EPOCHS = 60  # fixed, no early stopping (SWA needs full training)
 S1_BATCH_SIZE = 16
 S1_LR = 1e-3
 S1_READIN_LR_MULT = 3.0
 S1_WEIGHT_DECAY = 1e-4
 S1_GRAD_CLIP = 5.0
-S1_WARMUP_EPOCHS = 20
-S1_PATIENCE = 7
-S1_EVAL_EVERY = 10
-S1_VAL_FRACTION = 0.2  # per-patient val split for early stopping
+S1_WARMUP_EPOCHS = 10
+S1_SWA_START = 30  # start SWA from epoch 30 (50% of training)
 
 # Stage 2 (target adaptation)
 S2_EPOCHS = 150
@@ -70,7 +63,7 @@ LABEL_SMOOTHING = 0.1
 FOCAL_GAMMA = 2.0
 MIXUP_ALPHA = 0.2
 TTA_COPIES = 16
-KNN_K = 20  # larger k since we have ~1400 total neighbors with source patients
+KNN_K = 10
 
 # ============================================================
 # AUGMENTATION  (modify strategy freely)
@@ -136,6 +129,14 @@ def augment(x: torch.Tensor) -> torch.Tensor:
     x = amplitude_scale(x, std=0.3)
     x = channel_dropout(x, max_p=0.2)
     x = gaussian_noise(x, frac=0.05)
+    return x
+
+
+def augment_light(x: torch.Tensor) -> torch.Tensor:
+    """Lighter augmentation for Stage 2."""
+    x = time_shift(x, max_frames=15)
+    x = amplitude_scale(x, std=0.15)
+    x = gaussian_noise(x, frac=0.03)
     return x
 
 
@@ -286,7 +287,7 @@ def knn_predict(train_emb, train_labels, val_emb, k=KNN_K):
 # ============================================================
 
 def train_stage1(all_data):
-    """Train shared backbone + per-patient read-ins on source patients."""
+    """Train shared backbone + per-patient read-ins with SWA averaging."""
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -300,16 +301,11 @@ def train_stage1(all_data):
     backbone = Backbone(d_in=d_flat).to(DEVICE)
     head = CEHead(d_in=backbone.out_dim).to(DEVICE)
 
-    # Split each source patient into train/val
-    source_train, source_val = {}, {}
+    # Use all source data (no val split — SWA doesn't need early stopping)
+    source_train = {}
     for pid in prepare.SOURCE_PATIENTS:
         n = len(all_data[pid]["labels"])
-        perm = np.random.permutation(n)
-        n_val = max(1, int(round(S1_VAL_FRACTION * n)))
-        val_idx = sorted(perm[:n_val].tolist())
-        train_idx = sorted(perm[n_val:].tolist())
-        source_train[pid] = train_idx
-        source_val[pid] = val_idx
+        source_train[pid] = list(range(n))
 
     # Optimizer with differential LR
     readin_params = []
@@ -329,9 +325,11 @@ def train_stage1(all_data):
 
     scheduler = LambdaLR(optimizer, lr_lambda)
 
-    best_val_loss = float("inf")
-    best_state = None
-    patience_ctr = 0
+    # SWA state: accumulate weights
+    swa_backbone_state = None
+    swa_head_state = None
+    swa_readin_states = None
+    swa_count = 0
     pids = prepare.SOURCE_PATIENTS
 
     for epoch in range(S1_EPOCHS):
@@ -340,7 +338,6 @@ def train_stage1(all_data):
         for ri in read_ins.values():
             ri.train()
 
-        # Shuffle patients each epoch, train batches from each
         np.random.shuffle(pids)
         epoch_loss = 0.0
         n_batches = 0
@@ -379,54 +376,40 @@ def train_stage1(all_data):
 
         scheduler.step()
         avg_loss = epoch_loss / max(n_batches, 1)
+        print(f"  S1 epoch {epoch+1}: train_loss={avg_loss:.4f}")
 
-        # Validate
-        if (epoch + 1) % S1_EVAL_EVERY == 0:
-            backbone.eval()
-            head.eval()
-            for ri in read_ins.values():
-                ri.eval()
-            val_loss = 0.0
-            val_batches = 0
-            with torch.no_grad():
-                for pid in prepare.SOURCE_PATIENTS:
-                    vi = source_val[pid]
-                    if not vi:
-                        continue
-                    grids = all_data[pid]["grids"]
-                    labels = all_data[pid]["labels"]
-                    x = grids[vi].to(DEVICE)
-                    y = [labels[i] for i in vi]
-                    feat = read_ins[pid](x)
-                    h = backbone(feat)
-                    logits = head(h)
-                    val_loss += compute_loss(logits, y).item()
-                    val_batches += 1
-            val_loss /= max(val_batches, 1)
-
-            print(f"  S1 epoch {epoch+1}: train_loss={avg_loss:.4f}, val_loss={val_loss:.4f}")
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {
-                    "backbone": deepcopy(backbone.state_dict()),
-                    "head": deepcopy(head.state_dict()),
-                    "read_ins": {pid: deepcopy(ri.state_dict()) for pid, ri in read_ins.items()},
-                }
-                patience_ctr = 0
+        # SWA: accumulate weights after SWA_START
+        if epoch >= S1_SWA_START:
+            if swa_backbone_state is None:
+                swa_backbone_state = {k: v.clone() for k, v in backbone.state_dict().items()}
+                swa_head_state = {k: v.clone() for k, v in head.state_dict().items()}
+                swa_readin_states = {pid: {k: v.clone() for k, v in ri.state_dict().items()}
+                                     for pid, ri in read_ins.items()}
+                swa_count = 1
             else:
-                patience_ctr += 1
-                if patience_ctr >= S1_PATIENCE:
-                    print(f"  S1 early stop at epoch {epoch+1}")
-                    break
+                for k, v in backbone.state_dict().items():
+                    swa_backbone_state[k] += v
+                for k, v in head.state_dict().items():
+                    swa_head_state[k] += v
+                for pid, ri in read_ins.items():
+                    for k, v in ri.state_dict().items():
+                        swa_readin_states[pid][k] += v
+                swa_count += 1
 
-    # Restore best
-    if best_state:
-        backbone.load_state_dict(best_state["backbone"])
-        head.load_state_dict(best_state["head"])
+    # Apply SWA averaging
+    if swa_count > 0:
+        print(f"  SWA: averaged {swa_count} checkpoints (epochs {S1_SWA_START+1}-{S1_EPOCHS})")
+        for k in swa_backbone_state:
+            swa_backbone_state[k] /= swa_count
+        for k in swa_head_state:
+            swa_head_state[k] /= swa_count
+        for pid in swa_readin_states:
+            for k in swa_readin_states[pid]:
+                swa_readin_states[pid][k] /= swa_count
+        backbone.load_state_dict(swa_backbone_state)
+        head.load_state_dict(swa_head_state)
         for pid, ri in read_ins.items():
-            if pid in best_state["read_ins"]:
-                ri.load_state_dict(best_state["read_ins"][pid])
+            ri.load_state_dict(swa_readin_states[pid])
 
     return backbone, head, read_ins
 
@@ -477,21 +460,15 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
 
         for start in range(0, n_train, S2_BATCH_SIZE):
             idx = perm[start:start + S2_BATCH_SIZE]
-            x = augment(train_grids[idx]).to(DEVICE)
+            x = augment_light(train_grids[idx]).to(DEVICE)
             y = [train_labels[i] for i in idx.tolist()]
 
-            mixup_y, mixup_lam = None, 1.0
-            if MIXUP_ALPHA > 0 and len(idx) > 1:
-                mixup_lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
-                perm_mix = torch.randperm(x.shape[0])
-                x = mixup_lam * x + (1 - mixup_lam) * x[perm_mix]
-                mixup_y = [y[i] for i in perm_mix.tolist()]
-
+            # No mixup in S2 (from exp 11 insight)
             optimizer.zero_grad()
             feat = target_ri(x)
             h = backbone_copy(feat)
             logits = head(h)
-            loss = compute_loss(logits, y, mixup_labels=mixup_y, mixup_lam=mixup_lam)
+            loss = compute_loss(logits, y)
 
             if math.isnan(loss.item()):
                 print("FAIL")
