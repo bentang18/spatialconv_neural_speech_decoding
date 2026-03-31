@@ -435,8 +435,11 @@ def train_stage1(all_data):
 # STAGE 2: TARGET ADAPTATION + EVALUATION (per fold)
 # ============================================================
 
+SOURCE_KNN_WEIGHT = 0.5  # weight for source patient k-NN neighbors vs target
+
+
 def train_eval_fold(backbone, head_init, train_grids, train_labels,
-                    val_grids, val_labels):
+                    val_grids, val_labels, read_ins=None, all_data=None):
     """Adapt Stage 1 model to target fold, evaluate."""
     backbone_copy = deepcopy(backbone)
     target_ri = SpatialReadIn(
@@ -553,8 +556,28 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
     linear_preds = decode(logits)
     linear_per = prepare.compute_per(linear_preds, val_labels)
 
-    # k-NN with TTA
+    # k-NN with TTA — include source patient embeddings as additional neighbors
     train_emb = extract_embeddings(backbone_copy, target_ri, train_grids)
+    train_emb_all = train_emb
+    train_labels_all = list(train_labels)
+
+    # Add source patient embeddings (using S1 read-ins + S2-adapted backbone)
+    if read_ins is not None and all_data is not None and SOURCE_KNN_WEIGHT > 0:
+        source_embs = []
+        source_labs = []
+        for pid in prepare.SOURCE_PATIENTS:
+            ri = read_ins[pid]
+            ri.eval()
+            sg = all_data[pid]["grids"]
+            sl = all_data[pid]["labels"]
+            emb = extract_embeddings(backbone_copy, ri, sg)
+            source_embs.append(emb)
+            source_labs.extend(sl)
+        source_emb = torch.cat(source_embs, dim=0)
+        # Weight source embeddings lower (scale affects cosine similarity via norm)
+        train_emb_all = torch.cat([train_emb, source_emb * SOURCE_KNN_WEIGHT], dim=0)
+        train_labels_all = list(train_labels) + source_labs
+
     if TTA_COPIES > 1:
         val_emb_sum = extract_embeddings(backbone_copy, target_ri, val_grids)
         for _ in range(TTA_COPIES - 1):
@@ -562,7 +585,7 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
         val_emb = val_emb_sum / TTA_COPIES
     else:
         val_emb = extract_embeddings(backbone_copy, target_ri, val_grids)
-    knn_preds = knn_predict(train_emb, train_labels, val_emb)
+    knn_preds = knn_predict(train_emb_all, train_labels_all, val_emb)
     knn_per = prepare.compute_per(knn_preds, val_labels)
 
     if knn_per < linear_per:
@@ -613,6 +636,7 @@ if __name__ == "__main__":
             backbone, head,
             grids[tr_idx], [labels[i] for i in tr_idx],
             grids[va_idx], [labels[i] for i in va_idx],
+            read_ins=read_ins, all_data=all_data,
         )
         fold_pers.append(per)
         fold_linear_pers.append(lp)
