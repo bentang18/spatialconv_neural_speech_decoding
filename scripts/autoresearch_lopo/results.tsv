@@ -6,3 +6,4 @@ exp03	0.7845	269	discard	Source replay 30% in Stage 2 — worse by 2pp
 exp04	0.7882	336	discard	H=64 backbone (d=64, gru_hidden=64) — worse, S2 slower
 exp05	0.8040	416	discard	Freeze backbone in Stage 2 (LR_MULT=0.0) — worse
 exp06	0.7882	336	discard	Dual head (CE + articulatory) — worse, articulatory head didn't help cross-patient
+exp07	0.7930	275	discard	S1 fixed 30 epochs cosine, no val split, no early stop — worse
