@@ -46,7 +46,7 @@ S1_EPOCHS = 200
 S1_BATCH_SIZE = 16
 S1_LR = 1e-3
 S1_READIN_LR_MULT = 3.0
-S1_WEIGHT_DECAY = 1e-4
+S1_WEIGHT_DECAY = 5e-4
 S1_GRAD_CLIP = 5.0
 S1_WARMUP_EPOCHS = 20
 S1_PATIENCE = 7
@@ -139,14 +139,6 @@ def augment(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def augment_light(x: torch.Tensor) -> torch.Tensor:
-    """Lighter augmentation for Stage 2 (small target data)."""
-    x = time_shift(x, max_frames=10)
-    x = amplitude_scale(x, std=0.15)
-    x = gaussian_noise(x, frac=0.03)
-    return x
-
-
 # ============================================================
 # MODEL COMPONENTS  (redesign freely)
 # ============================================================
@@ -176,8 +168,8 @@ class Backbone(nn.Module):
     """LN -> feat_drop -> Conv1d(stride) -> GELU -> time_mask -> BiGRU."""
 
     def __init__(self, d_in: int = 256, d: int = 32, gru_hidden: int = 32,
-                 gru_layers: int = 2, stride: int = 10, gru_dropout: float = 0.3,
-                 feat_drop_max: float = 0.3, time_mask_min: int = 2,
+                 gru_layers: int = 2, stride: int = 10, gru_dropout: float = 0.5,
+                 feat_drop_max: float = 0.5, time_mask_min: int = 2,
                  time_mask_max: int = 5):
         super().__init__()
         self.ln = nn.LayerNorm(d_in)
@@ -482,15 +474,21 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
 
         for start in range(0, n_train, S2_BATCH_SIZE):
             idx = perm[start:start + S2_BATCH_SIZE]
-            x = augment_light(train_grids[idx]).to(DEVICE)
+            x = augment(train_grids[idx]).to(DEVICE)
             y = [train_labels[i] for i in idx.tolist()]
 
-            # No mixup in Stage 2 — too aggressive for ~120 trials
+            mixup_y, mixup_lam = None, 1.0
+            if MIXUP_ALPHA > 0 and len(idx) > 1:
+                mixup_lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                perm_mix = torch.randperm(x.shape[0])
+                x = mixup_lam * x + (1 - mixup_lam) * x[perm_mix]
+                mixup_y = [y[i] for i in perm_mix.tolist()]
+
             optimizer.zero_grad()
             feat = target_ri(x)
             h = backbone_copy(feat)
             logits = head(h)
-            loss = compute_loss(logits, y)
+            loss = compute_loss(logits, y, mixup_labels=mixup_y, mixup_lam=mixup_lam)
 
             if math.isnan(loss.item()):
                 print("FAIL")
