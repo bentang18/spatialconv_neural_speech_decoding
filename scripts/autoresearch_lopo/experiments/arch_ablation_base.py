@@ -643,8 +643,15 @@ def train_eval_fold(backbone, head_init, train_grids, train_labels,
 # ============================================================
 
 def run(ReadInCls=SpatialReadIn, BackboneCls=Backbone,
-        HeadCls=ArticulatoryBottleneckHead, experiment_name=""):
+        HeadCls=ArticulatoryBottleneckHead, experiment_name="",
+        augment_fn=None, seed=SEED):
     """Run full LOPO pipeline with pluggable model components."""
+    global SEED
+    if seed != SEED:
+        SEED = seed
+    if augment_fn is not None:
+        global augment
+        augment = augment_fn
     t0 = time.time()
     torch.manual_seed(SEED)
     np.random.seed(SEED)
