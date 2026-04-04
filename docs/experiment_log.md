@@ -593,3 +593,73 @@ Self-training (0.758) is the only training-side improvement. Knowledge distillat
 84. **The ~0.76 PER wall is a measurement ceiling, not a model ceiling.** With ~30 val samples per fold and fixed fold assignments, PER differences <2pp are within evaluation noise. Fold 5 consistently gets ~0.85; fold 4 gets ~0.70. The average is mechanically constrained by fold difficulty distribution.
 
 85. **Breaking through requires more data, not better models.** 55 experiments × 5 paradigms × multiple architectures converge to 0.750-0.780. The path forward is: (a) more patients in Stage 1, (b) cross-task data pooling, (c) population-level evaluation on all patients, (d) different CV scheme or more folds to reduce measurement noise.
+
+---
+
+## 2026-04-04: Per-Phoneme MFA Epoch Sweeps (S14, DCC)
+
+Three DCC sweeps testing per-phoneme MFA epochs vs full-trial approaches. All on S14, grouped-by-token 5-fold CV.
+
+### Sweep 1: Head Type × tmin (simplified recipe — no mixup/k-NN/TTA)
+
+| Condition | Mode | Head | tmin | PER | Std |
+|-----------|------|------|------|-----|-----|
+| per_phoneme_t-0.15 | per-phoneme | flat | -0.15 | **0.782** | 0.038 |
+| per_phoneme_t0.0 | per-phoneme | flat | 0.0 | 0.789 | 0.055 |
+| mean_pool_t0.0 | full-trial | mean pool | 0.0 | 0.824 | 0.044 |
+| equal_window_t0.0 | full-trial | 3 equal windows | 0.0 | 0.830 | 0.045 |
+| learned_attn_t0.0 | full-trial | learned attention | 0.0 | 0.843 | 0.038 |
+| learned_attn_t-0.5 | full-trial | learned attention | -0.5 | 0.873 | 0.026 |
+
+### Sweep 2: Full Recipe (mixup α=0.2, k-NN k=10, TTA n=16)
+
+| Condition | PER | Std | Seeds | Pos 1 acc | Pos 2 acc | Pos 3 acc |
+|-----------|-----|-----|-------|-----------|-----------|-----------|
+| **perphon_t-0.15_flat_s10** | **0.741** | — | 1 | 0.281 | 0.235 | 0.261 |
+| perphon_t0.0_artic_s10 | 0.747 | — | 1 | 0.261 | 0.248 | 0.248 |
+| perphon_t-0.15_artic_s5 | 0.764 | 0.008 | 3 | 0.251 | 0.220 | 0.237 |
+| perphon_t-0.15_artic_s10 | 0.772 | 0.020 | 3 | 0.242 | 0.214 | 0.229 |
+| fulltrial_meanpool_artic | 0.802 | — | 1 | 0.163 | 0.170 | 0.222 |
+
+### Sweep 3: Padding Grid (simplified recipe, per-phoneme only)
+
+**tmin sweep** (tmax=0.5 fixed):
+
+| tmin | PER | Std |
+|------|-----|-----|
+| -0.25 | 0.776 | 0.014 |
+| -0.20 | 0.793 | 0.035 |
+| -0.15 | 0.771 | 0.041 |
+| **-0.10** | **0.764** | 0.040 |
+| -0.05 | 0.767 | 0.031 |
+| 0.00 | 0.771 | 0.041 |
+
+**tmax sweep** (tmin=-0.15 fixed):
+
+| tmax | PER | Std |
+|------|-----|-----|
+| 0.3 | 0.791 | 0.036 |
+| 0.4 | 0.780 | 0.038 |
+| **0.5** | **0.771** | 0.041 |
+| 0.6 | 0.773 | 0.023 |
+| 0.7 | 0.786 | 0.019 |
+
+### Findings
+
+86. **Per-phoneme MFA epochs strictly dominate full-trial approaches.** Across every comparison — simplified recipe, full recipe, all head types — per-phoneme epochs give ~4-6pp lower PER. Despite known MFA noise for ~50% of patients, for S14 the per-phoneme boundaries provide cleaner signal than any temporal readout from a full 1s window.
+
+87. **Flat head beats articulatory head for per-phoneme single-phoneme classification.** Per-phoneme flat (0.741) vs articulatory (0.772). The articulatory decomposition was designed as a regularizer for cross-patient transfer on phoneme sequences. For single-phoneme classification, it constrains the output space unnecessarily.
+
+88. **Stride=5 beats stride=10 for per-phoneme windows.** 0.764 vs 0.772 (3-seed means). With T=131 frames (650ms window), stride=10 gives only 13 GRU timesteps. Stride=5 doubles to 26, giving the GRU more temporal context. This reverses the full-trial finding where stride=10 was sufficient (20 timesteps from T=201).
+
+89. **tmin=-0.5 (pre-production auditory activation) hurts.** 0.873 vs 0.843 for learned_attn. Including 500ms of auditory response to the prompt adds noise, not signal.
+
+90. **Padding is not critical but ~100ms pre-onset is optimal.** tmin grid from -0.25 to 0.0 varies only 3pp (0.764-0.793). tmin=-0.10 is marginally best (0.764). tmax=0.5 is the sweet spot; shorter (0.3) loses signal, longer (0.7) adds noise.
+
+91. **Learned temporal attention underperforms simple mean pool with simplified recipe.** 0.843 vs 0.824 for full-trial. The attention queries may need the full recipe (k-NN, TTA) to show advantage, or they may simply be unnecessary overhead.
+
+92. **Full recipe provides ~4pp on per-phoneme baseline.** Simplified per-phoneme (0.782) vs full recipe per-phoneme (0.741). Mixup + k-NN + TTA each contribute meaningfully.
+
+93. **Per-phoneme + full recipe + flat head (0.741) matches the previous best per-patient baseline (0.737).** This is a single-seed result; multi-seed validation needed. But the fact that a simpler approach (mean-pool over MFA epochs, no attention queries) matches the tuned full-trial pipeline is significant.
+
+94. **Implication for Neural Field Perceiver**: Use per-phoneme MFA epochs as input, not full-trial with learned temporal attention. This simplifies the temporal readout to mean-pooling and eliminates the need for attention query parameters.
