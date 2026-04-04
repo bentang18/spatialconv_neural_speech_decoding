@@ -1,5 +1,7 @@
 # Training Log — S14 Per-Patient + LOPO Pilot
 
+> **HISTORICAL**: This log covers CTC→CE tuning and LOPO pilot (2026-03). The current best is per-phoneme MFA + flat head (PER 0.734, 2026-04-04). See `experiment_log.md` findings 86-101 for current results.
+
 ## Per-Patient Summary (S14, 153 trials, 8×16 grid, 5-fold CV)
 
 | Run | Key change | Seed 42 | Seed 137 | Seed 256 | Mean PER |
