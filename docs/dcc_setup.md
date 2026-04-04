@@ -35,8 +35,9 @@ PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
 
 ### Environment Details
 - Python 3.11
-- PyTorch 2.5.1+cu121
+- PyTorch 2.10.0+cu126
 - MNE, scikit-learn, speech_decoding (editable install)
+- Note: `torch.cuda.is_available()` returns False on login node (no GPU). Works on compute nodes via SBATCH.
 
 ### Known Issue: `packaging` Module
 If you get `ModuleNotFoundError: No module named 'packaging'`, fix with:
@@ -80,6 +81,7 @@ cd /work/ht203/repo/speech
 
 PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
 export DEVICE=cuda
+export PYTHONUNBUFFERED=1
 
 $PYTHON scripts/my_script.py --paths configs/paths.yaml --device cuda
 ```
@@ -97,34 +99,51 @@ tail -f /work/ht203/logs/my_job_<id>.out  # Live output
 
 ### What's on DCC
 
+**PS (Phoneme Sequence) dataset — all 11 patients transferred (2026-04-04)**:
+- `.fif` files: `/work/ht203/data/BIDS/derivatives/epoch(phonemeLevel)(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
+- Electrode TSVs: `/work/ht203/data/BIDS/sub-{id}/ieeg/sub-{id}_acq-01_space-ACPC_electrodes.tsv`
+- Patients: S14, S16, S22, S23, S26, S32, S33, S39, S57, S58, S62
+- `load_patient_data()` and `load_per_position_data()` work directly with `bids_root=/work/ht203/data/BIDS`
+
 **Pre-cached `.pt` tensors** (from autoresearch `prepare.py`):
 - `/work/ht203/repo/speech/.cache/autoresearch_lopo/` — S14 target + 9 source patients
-- These are grid-reshaped, tmin=0.0, tmax=1.0 tensors ready for training
-- The autoresearch pipeline (`scripts/autoresearch_lopo/`) uses these caches and works on DCC
+- Grid-reshaped, tmin=0.0, tmax=1.0 tensors. Used by the autoresearch pipeline only.
+- Note: this is how LOPO ran on DCC before the .fif files were transferred.
 
-**Raw `.fif` files** (via symlink to coganlab):
-- `/work/ht203/data/BIDS/` contains the BIDS directory structure
-- Productionzscore HGA .fif files were transferred 2026-03-31
-- Verify: `ls /work/ht203/data/BIDS/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS/derivatives/epoch\(phonemeLevel\)\(CAR\)/sub-S14/epoch\(band\)\(power\)/`
+### What's NOT on DCC
 
-### What's NOT on DCC (known gaps)
-
-- ~~Raw .fif files may be missing for some patients~~ — verify per above
-- If `load_patient_data()` fails with `FileNotFoundError`, the .fif for that patient wasn't transferred
-- Electrode TSV files (for grid inference) — check if present in BIDS sourcedata
+- **Lexical dataset** (BIDS_1.0_Lexical_µECoG) — needed for cross-task pooling (future work)
+- **S36** — excluded (duplicate of S32)
+- **S18** — excluded (no preprocessed data)
+- **Permanent storage** — `/hpc/group/coganlab/ht203/` not yet created (needed before /work purge)
 
 ### Transferring Data
 
-From local Mac to DCC:
-```bash
-# Transfer a specific .fif file
-scp /Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/.../sub-S14_task-PhonemeSequence_desc-productionZscore_highgamma.fif \
-  ht203@dcc-login.oit.duke.edu:/work/ht203/data/BIDS/BIDS_1.0_Phoneme_Sequence_uECoG/.../
+**Important**: Do NOT transfer in parallel (multiple concurrent `scp` calls). SSH connection limits cause partial/corrupted transfers. Transfer sequentially:
 
-# Transfer all .fif files (recursive)
-rsync -avz --include='*/' --include='*highgamma.fif' --exclude='*' \
-  /Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/ \
-  ht203@dcc-login.oit.duke.edu:/work/ht203/data/BIDS/BIDS_1.0_Phoneme_Sequence_uECoG/
+```bash
+LOCAL_BIDS="/Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS"
+REMOTE="ht203@dcc-login.oit.duke.edu:/work/ht203/data/BIDS"
+
+for p in S14 S16 S22 S23 S26 S32 S33 S39 S57 S58 S62; do
+  echo "Transferring $p..."
+  # Create dirs
+  ssh ht203@dcc-login.oit.duke.edu "mkdir -p /work/ht203/data/BIDS/derivatives/epoch\(phonemeLevel\)\(CAR\)/sub-$p/epoch\(band\)\(power\) && mkdir -p /work/ht203/data/BIDS/sub-$p/ieeg"
+  # .fif file
+  scp "${LOCAL_BIDS}/derivatives/epoch(phonemeLevel)(CAR)/sub-${p}/epoch(band)(power)/sub-${p}_task-PhonemeSequence_desc-productionZscore_highgamma.fif" \
+    "${REMOTE}/derivatives/epoch(phonemeLevel)(CAR)/sub-${p}/epoch(band)(power)/"
+  # Electrode TSV
+  scp "${LOCAL_BIDS}/sub-${p}/ieeg/sub-${p}_acq-01_space-ACPC_electrodes.tsv" \
+    "${REMOTE}/sub-${p}/ieeg/"
+done
+```
+
+**Verify transfer integrity** (compare sizes):
+```bash
+# On DCC
+for p in S14 S16 S22 S23 S26 S32 S33 S39 S57 S58 S62; do
+  ls -lh /work/ht203/data/BIDS/derivatives/'epoch(phonemeLevel)(CAR)'/sub-$p/'epoch(band)(power)'/*.fif 2>/dev/null | awk '{print $NF, $5}' || echo "sub-$p: MISSING"
+done
 ```
 
 ### DCC `paths.yaml`

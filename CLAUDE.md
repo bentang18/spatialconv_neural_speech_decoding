@@ -202,9 +202,9 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 
 - **SSH**: `ssh ht203@dcc-login.oit.duke.edu` (no MFA currently)
 - **GPU**: 8× RTX 5000 Ada Generation (32 GB VRAM) on `coganlab-gpu` partition
-- **Python**: `/work/ht203/miniconda3/envs/speech/bin/python` (do NOT use `conda activate` — broken base conda)
+- **Python**: `/work/ht203/miniconda3/envs/speech/bin/python` (PyTorch 2.10.0+cu126; do NOT use `conda activate` — broken base conda)
 - **Repo**: `/work/ht203/repo/speech` (branch `autoresearch/run1`)
-- **Data**: `/work/ht203/data/BIDS` (symlinked from coganlab)
+- **Data**: `/work/ht203/data/BIDS` — all 11 PS patients (.fif + electrode TSV transferred 2026-04-04)
 - **Logs**: `/work/ht203/logs/`
 - **Submit**: `sbatch scripts/sweep_tmin_dcc.sh` | Monitor: `squeue -u ht203`
 - **CAUTION**: `/work/ht203` auto-purges after 75 days of no access. Copy results to `/hpc/group/coganlab/ht203/`.
