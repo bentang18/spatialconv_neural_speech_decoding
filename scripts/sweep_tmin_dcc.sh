@@ -15,17 +15,14 @@ set -e
 
 cd /work/ht203/repo/speech
 
-# Activate conda env
-source /work/ht203/miniconda3/etc/profile.d/conda.sh
-conda activate speech
-
+PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
 export DEVICE=cuda
 
 echo "=== Starting sweep at $(date) ==="
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo ""
 
-python scripts/sweep_tmin_perpos.py \
+$PYTHON scripts/sweep_tmin_perpos.py \
     --paths configs/paths.yaml \
     --device cuda
 
