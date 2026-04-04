@@ -1,0 +1,94 @@
+\contentsline {part}{I\hspace {1em}Problem Framing}{4}{part.1}%
+\contentsline {section}{\numberline {1}The Physical Problem}{4}{section.1}%
+\contentsline {subsection}{\numberline {1.1}The cortical surface, not free 3D space}{4}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}What makes this hard}{5}{subsection.1.2}%
+\contentsline {section}{\numberline {2}The Shared Dynamics Hypothesis}{5}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Evidence for shared dynamics}{5}{subsection.2.1}%
+\contentsline {subsubsection}{\numberline {2.1.1}Externally established (published literature)}{5}{subsubsection.2.1.1}%
+\contentsline {subsubsection}{\numberline {2.1.2}Internally observed (our experiments)}{6}{subsubsection.2.1.2}%
+\contentsline {subsubsection}{\numberline {2.1.3}Working hypotheses (plausible but unverified)}{7}{subsubsection.2.1.3}%
+\contentsline {section}{\numberline {3}The Neural Manifold Connection}{7}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Two views of the same phenomenon}{7}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}The factorization is the key insight}{7}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Articulatory manifold dimensionality}{8}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Cross-patient transfer as manifold alignment}{8}{subsection.3.4}%
+\contentsline {section}{\numberline {4}Decomposing Cross-Patient Variation}{8}{section.4}%
+\contentsline {subsection}{\numberline {4.1}The spatial transform $T_i$}{8}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Inter-subject correspondence uncertainty}{8}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}The patient-specific residual $r^{(i)}$}{9}{subsection.4.3}%
+\contentsline {section}{\numberline {5}What Our Experiments Reveal}{9}{section.5}%
+\contentsline {subsection}{\numberline {5.1}The evaluation recipe dominates at this data scale}{9}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Multi-scale temporal structure is validated}{9}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}SSL features carry partial structure}{9}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}The ${\sim }$0.76 PER convergence on S14}{9}{subsection.5.4}%
+\contentsline {section}{\numberline {6}The Case for MNI Coordinates}{10}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Currently unused information}{10}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}What coordinates may provide}{10}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}What coordinates do NOT guarantee}{10}{subsection.6.3}%
+\contentsline {part}{II\hspace {1em}Cross-Disciplinary Foundations}{10}{part.2}%
+\contentsline {section}{\numberline {7}The Multi-View Reconstruction Analogy}{10}{section.7}%
+\contentsline {subsection}{\numberline {7.1}The pose estimation mapping}{10}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}What the analogy reveals}{11}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Where the analogy breaks}{11}{subsection.7.3}%
+\contentsline {section}{\numberline {8}Transferable Patterns from 3D Vision (2024--2026)}{11}{section.8}%
+\contentsline {subsection}{\numberline {8.1}The field's trajectory: per-scene $\to $ feed-forward $\to $ foundation model}{11}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Architectural pattern validation}{12}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}What we are correctly NOT doing}{12}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}The data scale gap}{12}{subsection.8.4}%
+\contentsline {section}{\numberline {9}Lessons from Video Models and Spatiotemporal Autoencoders}{13}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Don't separate spatial and temporal encoding}{13}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Masked spatiotemporal tubes, not per-frame electrode masking}{13}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}Mamba for efficient spatiotemporal processing}{13}{subsection.9.3}%
+\contentsline {subsection}{\numberline {9.4}Summary: architectural evolution}{14}{subsection.9.4}%
+\contentsline {section}{\numberline {10}Uncertainty Estimation}{14}{section.10}%
+\contentsline {subsection}{\numberline {10.1}From binary to continuous weighting}{14}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}Two types of uncertainty}{14}{subsection.10.2}%
+\contentsline {subsection}{\numberline {10.3}Recommended uncertainty stack}{14}{subsection.10.3}%
+\contentsline {subsubsection}{\numberline {10.3.1}Tier 1: Minimal implementation, high value}{14}{subsubsection.10.3.1}%
+\contentsline {subsubsection}{\numberline {10.3.2}Tier 2: Moderate implementation}{15}{subsubsection.10.3.2}%
+\contentsline {subsection}{\numberline {10.4}How uncertainty connects to the architecture}{15}{subsection.10.4}%
+\contentsline {part}{III\hspace {1em}Architecture Design}{15}{part.3}%
+\contentsline {section}{\numberline {11}Spatial vs.\ Temporal Dynamics: Design Rationale}{15}{section.11}%
+\contentsline {subsection}{\numberline {11.1}The spatial problem is static}{16}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}The temporal problem is dynamic but shared}{16}{subsection.11.2}%
+\contentsline {subsection}{\numberline {11.3}The noise argument for temporal context in spatial encoding}{16}{subsection.11.3}%
+\contentsline {subsection}{\numberline {11.4}Design choice: separate with denoising}{16}{subsection.11.4}%
+\contentsline {subsection}{\numberline {11.5}What is shared across patients, and through which mechanism}{17}{subsection.11.5}%
+\contentsline {section}{\numberline {12}The Implemented Model}{17}{section.12}%
+\contentsline {section}{\numberline {13}Design Principles}{18}{section.13}%
+\contentsline {subsection}{\numberline {13.1}What is shared, what is per-patient}{18}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}Symbol table}{18}{subsection.13.2}%
+\contentsline {section}{\numberline {14}Spatial Encoder (${\sim }$100K params)}{19}{section.14}%
+\contentsline {subsection}{\numberline {14.1}Electrode tokens}{19}{subsection.14.1}%
+\contentsline {subsection}{\numberline {14.2}Why not Grid PE?}{20}{subsection.14.2}%
+\contentsline {subsection}{\numberline {14.3}Virtual electrodes and cross-attention}{20}{subsection.14.3}%
+\contentsline {subsection}{\numberline {14.4}Perceiver cross-attention with distance bias}{21}{subsection.14.4}%
+\contentsline {subsection}{\numberline {14.5}Why cross-attention, not ViT patches or point-cloud methods?}{21}{subsection.14.5}%
+\contentsline {subsection}{\numberline {14.6}Spatial readout: attention pooling (not MaxPool)}{22}{subsection.14.6}%
+\contentsline {subsection}{\numberline {14.7}Parameter count}{23}{subsection.14.7}%
+\contentsline {section}{\numberline {15}Observation Decoder (${\sim }$25K params)}{23}{section.15}%
+\contentsline {subsection}{\numberline {15.1}Position-weighted latent aggregation}{23}{subsection.15.1}%
+\contentsline {subsection}{\numberline {15.2}Bilinear observation model}{23}{subsection.15.2}%
+\contentsline {subsection}{\numberline {15.3}Reprojection loss (self-supervised)}{24}{subsection.15.3}%
+\contentsline {section}{\numberline {16}Temporal Encoder (${\sim }$70K params)}{24}{section.16}%
+\contentsline {subsection}{\numberline {16.1}Multi-scale tokenization}{24}{subsection.16.1}%
+\contentsline {subsection}{\numberline {16.2}Temporal transformer}{24}{subsection.16.2}%
+\contentsline {subsection}{\numberline {16.3}Readout and phoneme-position assignment}{24}{subsection.16.3}%
+\contentsline {section}{\numberline {17}Phoneme Decoder (${\sim }$5K params)}{25}{section.17}%
+\contentsline {section}{\numberline {18}Complete Architecture}{25}{section.18}%
+\contentsline {part}{IV\hspace {1em}Training, Evaluation, and Experimental Design}{26}{part.4}%
+\contentsline {section}{\numberline {19}Training Pipeline}{26}{section.19}%
+\contentsline {subsection}{\numberline {19.1}Phase 1: Source patient training (supervised + reprojection)}{26}{subsection.19.1}%
+\contentsline {subsection}{\numberline {19.2}Phase 2: Target adaptation (LP-FT)}{27}{subsection.19.2}%
+\contentsline {subsection}{\numberline {19.3}Phase 3 (optional): Transductive reprojection pre-training}{27}{subsection.19.3}%
+\contentsline {section}{\numberline {20}Evaluation Protocol}{27}{section.20}%
+\contentsline {subsection}{\numberline {20.1}Three evaluation regimes}{27}{subsection.20.1}%
+\contentsline {subsection}{\numberline {20.2}Metrics and protocol}{28}{subsection.20.2}%
+\contentsline {section}{\numberline {21}Ablation Experiments}{28}{section.21}%
+\contentsline {section}{\numberline {22}Experimental Priorities}{28}{section.22}%
+\contentsline {section}{\numberline {23}Success Criteria}{29}{section.23}%
+\contentsline {section}{\numberline {24}Available Data}{29}{section.24}%
+\contentsline {subsection}{\numberline {24.1}Cohort accounting}{29}{subsection.24.1}%
+\contentsline {subsection}{\numberline {24.2}Data sources}{30}{subsection.24.2}%
+\contentsline {section}{\numberline {25}Risk Assessment}{30}{section.25}%
+\contentsline {section}{\numberline {26}Summary}{30}{section.26}%

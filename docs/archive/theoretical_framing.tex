@@ -1,0 +1,498 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ── Packages ──────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{titlesec}
+\usepackage{microtype}
+\usepackage{parskip}
+
+% ── Formatting ────────────────────────────────────────────
+\hypersetup{colorlinks=true, linkcolor=NavyBlue, citecolor=NavyBlue, urlcolor=NavyBlue}
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\itshape}{\thesubsubsection}{1em}{}
+
+% ── Custom environments ──────────────────────────────────
+\newcommand{\caveat}[1]{\par\smallskip\noindent\textcolor{gray}{\textit{Caveat:} #1}\smallskip}
+\newcommand{\pp}{\,\text{pp}}
+
+% ── Math shortcuts ────────────────────────────────────────
+\newcommand{\bfp}{\mathbf{p}}
+\newcommand{\bfz}{\mathbf{z}}
+\newcommand{\bfy}{\mathbf{y}}
+\newcommand{\bfd}{\mathbf{d}}
+\newcommand{\bfb}{\mathbf{b}}
+\newcommand{\cS}{\mathcal{S}}
+\newcommand{\cM}{\mathcal{M}}
+\newcommand{\R}{\mathbb{R}}
+
+\begin{document}
+
+% ── Title ─────────────────────────────────────────────────
+\begin{center}
+{\LARGE\bfseries Cross-Patient Speech Decoding\\[4pt] from Intra-Operative $\mu$ECoG}\\[12pt]
+{\large Theoretical Problem Framing}\\[8pt]
+{\normalsize Ben Tang \quad\textbar\quad Greg Cogan Lab, Duke University}\\[4pt]
+{\normalsize April 2026 \quad\textbar\quad Version 2}
+\end{center}
+
+\medskip\noindent\rule{\textwidth}{0.4pt}\medskip
+
+\noindent This document formalizes the cross-patient speech decoding problem, organizes evidence into explicit epistemic categories, and identifies the structural bottlenecks that any solution must address. Claims are categorized as \textbf{externally established} (published literature), \textbf{internally observed} (our experiments), or \textbf{working hypotheses} (plausible but unverified). Architecture follows as a separate document.
+
+% ══════════════════════════════════════════════════════════
+\section{The Physical Problem}
+% ══════════════════════════════════════════════════════════
+
+Each patient's micro-electrocorticography ($\mu$ECoG) array is a \textbf{sparse spatial sample} of neural activity over the cortical surface during speech production. The array is placed subdurally over left ventral sensorimotor cortex (vSMC) during surgery, and its position in standardized brain space (MNI-152) is determined post-hoc via electrode reconstruction (BioImage Suite for DBS patients, Brainlab for tumor patients).
+
+\subsection{The cortical surface, not free 3D space}
+
+The cortex is a folded two-dimensional sheet, not a volume. Let $\cS$ denote the cortical surface embedded in $\R^3$. The high-gamma analytic amplitude (HGA, 70--150\,Hz envelope) is a function on this surface:
+\begin{equation}
+a: \cS \times \R \to \R
+\end{equation}
+
+For patient $i$ with $N_i$ electrodes at cortical surface positions $\{\bfp_j^{(i)}\}_{j=1}^{N_i} \subset \cS$, we observe:
+\begin{equation}\label{eq:observation}
+d_j^{(i)}(t) = a\bigl(\bfp_j^{(i)},\; t\bigr) + \epsilon_j^{(i)}(t)
+\end{equation}
+where $\epsilon$ captures measurement noise, electrode impedance variation, and sub-electrode-scale neural activity not resolved by the ${\sim}2$\,mm contact spacing.
+
+In practice, we approximate cortical surface positions with 3D MNI coordinates: $\bfp_j^{(i)} \approx (x_j^{(i)}, y_j^{(i)}, z_j^{(i)})_{\text{MNI}}$. This approximation has two consequences:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Euclidean distance in MNI space does not equal geodesic distance on the cortical surface.} Two electrodes 3\,mm apart in MNI may sit on opposite banks of a sulcus, making them functionally distant. For $\mu$ECoG arrays on exposed cortex, the local patch under the array is approximately planar, so within-array Euclidean distances are reasonable. Cross-patient comparisons at larger scales are more affected by folding geometry.
+
+\item \textbf{Surface-based coordinates} (e.g., projection to \texttt{fsaverage}) would better respect cortical geometry than volumetric MNI coordinates. Whether surface reconstructions exist for our patients depends on the BioImage Suite\,/\,Brainlab outputs available.
+\end{enumerate}
+
+\textbf{The decoding problem.} Given observations $\{d_j^{(i)}(t)\}$ at approximately known surface positions, infer the phoneme sequence $\bfy = (y_1, y_2, y_3)$ that produced the spatiotemporal pattern.
+
+\textbf{The cross-patient problem.} Train on patients $\{1, \ldots, K\}$ and decode for a held-out patient $K{+}1$ whose electrodes sample the cortical surface at \emph{different positions}. The observations are not aligned: electrode $j$ on patient $i$ and electrode $j$ on patient $i'$ correspond to different cortical locations.
+
+\subsection{What makes this hard}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Factor} & \textbf{Quantity} & \textbf{Implication} \\
+\midrule
+Electrodes per patient & 63--201 & Sparse sampling of the cortical field \\
+Electrode spacing & ${\sim}2$\,mm & Resolves individual gyral columns \\
+Array offset across patients & 15--25\,mm in MNI & Different cortical regions sampled \\
+Array rotation & Variable & Channel indices meaningless across patients \\
+Correspondence uncertainty & Several mm & Coordinate-based alignment is approximate \\
+Cortical folding variability & Patient-specific & Sulcal geometry differs across individuals \\
+Tumor mass effect (subset) & Variable & Macroscopic warping in 6 of 12 patients \\
+Trials per patient & 46--178 & Small-data regime for supervised learning \\
+Total utterance per patient & ${\sim}1$\,min & Insufficient for single-patient SSL \\
+Phoneme vocabulary & 9 classes $\times$ 3 positions & 27-way classification at each trial \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════
+\section{The Shared Dynamics Hypothesis}
+% ══════════════════════════════════════════════════════════
+
+Cross-patient decoding is only possible if the cortical field $a(\bfp, t)$ shares structure across patients. We decompose:
+\begin{equation}\label{eq:decomposition}
+a^{(i)}(\bfp, t) = f\bigl(T_i(\bfp),\; t;\; \bfy\bigr) + r^{(i)}(\bfp, t)
+\end{equation}
+where:
+\begin{itemize}[leftmargin=2em]
+\item $f(\cdot, t; \bfy)$ is the \textbf{shared neural field}---the spatiotemporal pattern that phoneme sequence $\bfy$ produces in canonical cortical space.
+\item $T_i: \cS_i \to \cS_{\text{canonical}}$ is a \textbf{patient-specific spatial transform} mapping each patient's cortical surface to a canonical reference. MNI normalization is our estimate of $T_i$, but it is imperfect.
+\item $r^{(i)}(\bfp, t)$ is a \textbf{patient-specific residual} capturing individual neural organization, signal characteristics, and functional plasticity.
+\end{itemize}
+The viability of cross-patient decoding depends on the ratio $\|f\| / \|r^{(i)}\|$ at the spatial resolution accessible to our measurements and alignment procedure.
+
+\subsection{Evidence for shared dynamics}
+
+We organize evidence into three explicit categories.
+
+\subsubsection{Externally established (published literature)}
+
+\textbf{Per-patient input layers + shared temporal backbone is the optimal transfer architecture.} Singh et al.\ (2025) demonstrate group training with $N{=}25$ sEEG patients: per-patient Conv1D + shared BiLSTM ($2{\times}64$), frozen shared backbone + fine-tuned per-patient layers yields PER 0.49 vs.\ 0.57 single-subject ($p{<}0.001$). Willett et al.\ (2023) use per-day affine input layer ($256{\to}256$) + shared 5-layer GRU (512 hidden) for day-to-day BCI transfer.
+
+\caveat{Singh's data regime is ${\sim}60$\,min/patient (vs.\ our ${\sim}1$\,min); Conv1D hyperparameters are unreported. Willett is $N{=}1$ with ${\sim}40$\,min/day. The architectural pattern transfers; the hyperparameters do not.}
+
+\textbf{Articulatory somatotopy in vSMC is reproducible within individuals.} Metzger et al.\ (2023) show somatotopic organization of speech articulators in one patient with chronic ECoG (253 channels): labial, front tongue, back tongue, and vocalic representations are spatially organized ($p{<}0.0001$), preserved even after 18 years of anarthria, suggesting the organization is intrinsic to motor cortex circuitry.
+
+\caveat{$N{=}1$ chronic implant. Cross-patient spatial consistency is inferred from anatomical uniformity but not directly measured in any paper in our corpus.}
+
+\textbf{Articulatory features are a robust encoding basis in vSMC.} Wu et al.\ (2025) reconstruct speaker-invariant articulatory features from HD-ECoG over vSMC (PCC 0.75--0.80, $N{=}3$), including one intra-operative patient (PCC\,=\,0.76). The claim that articulatory features are ``more robustly encoded than acoustic features'' is attributed by Wu to Chartier (2018), Conant (2018), and Anumanchipalli (2019).
+
+\caveat{Wu's reconstruction is word-level scalar loadings, not continuous trajectories. The robustness claim is borrowed from cited literature.}
+
+\textbf{MNI coordinates enable cross-patient ECoG transfer.} Chen et al.\ (2025, SwinTW) use MNI coordinates and ROI embeddings as positional information across 43 ECoG + 9 sEEG subjects, reporting mean PCC\,=\,0.765 on unseen participants in cross-validation.
+
+\caveat{Standard ECoG has ${\sim}10$\,mm spacing, comparable to inter-subject correspondence uncertainty. Our $\mu$ECoG spacing (${\sim}2$\,mm) is finer, meaning coordinates may encode global array position but not resolve within-array relationships.}
+
+\textbf{Motor cortex neural manifold structure is preserved across individuals.} Safaie et al.\ (2023, \textit{Nature Neuroscience}) show that motor cortex population dynamics during reaching are geometrically similar across different monkeys.
+
+\caveat{Limb motor cortex in non-human primates, not speech motor cortex in humans. Extension to speech is plausible but not directly tested.}
+
+\textbf{Neural manifold dynamics are stable despite neural turnover.} Gallego et al.\ (2020, \textit{Nature Neuroscience}) establish that low-dimensional manifold dynamics are preserved across long time periods within the same animals, even as recorded neurons change. This is evidence for \emph{temporal stability} of latent dynamics, distinct from the cross-individual claim above.
+
+\caveat{Within-individual stability, not cross-individual similarity.}
+
+\textbf{Consistent articulatory somatotopy across participants.} Bouchard et al.\ (2013, \textit{Nature}) demonstrated reproducible articulatory maps in vSMC across 3 participants. Anumanchipalli et al.\ (2019, \textit{Nature}) reconstructed continuous articulatory trajectories from motor cortex.
+
+\caveat{Neither paper is summarized in our corpus. Bouchard's $N{=}3$ provides limited evidence for population-level consistency.}
+
+\subsubsection{Internally observed (our experiments)}
+
+\textbf{Cross-patient supervised transfer works at this data scale.} Our LOPO pipeline (per-patient SpatialConv + shared BiGRU backbone, 9 source patients) achieves PER\,=\,0.762 on held-out S14, compared to per-patient PER\,=\,0.737 (grouped-by-token CV). This is direct evidence that decodable shared structure exists in~$f$.
+
+\textbf{Articulatory bottleneck head improves LOPO decoding.} Projecting to a 15-dimensional phonological feature space via a fixed linguistic matrix outperforms a flat CE head for cross-patient decoding, consistent with $f$ being organized along articulatory feature dimensions.
+
+\textbf{55 experiments on S14 converge to PER 0.750--0.780.} Across supervised, SSL, domain adaptation, self-training, and knowledge distillation paradigms. See Section~\ref{sec:wall} for interpretation.
+
+\textbf{SSL features carry partial structure.} JEPA features + LP-FT achieve PER\,=\,0.797 (vs.\ 0.854 basic evaluation). Supervised features with the same recipe achieve 0.737.
+
+\subsubsection{Working hypotheses (plausible but unverified)}
+
+The ${\sim}0.76$ PER convergence on S14 reflects (in part) a spatial alignment bottleneck. This has not been isolated from target-data scarcity, measurement noise, or S14-specific effects.
+
+MNI coordinate-based spatial alignment will improve decoding. The practical gain depends on registration accuracy, model architecture, and whether spatial alignment is binding.
+
+Cross-task data pooling (Duraivel 2025 pseudoword repetition, same 9 phonemes, 3 overlapping patients) is a high-value, low-risk path to more data.
+
+
+% ══════════════════════════════════════════════════════════
+\section{The Neural Manifold Connection}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Two views of the same phenomenon}
+
+The cortical field model (Section~2) and the neural manifold hypothesis describe the same system at different levels:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{The field view} (spatial): Activity $a(\bfp, t)$ is a function on the cortical surface. Each electrode samples this field at a known position.
+\item \textbf{The manifold view} (population): The vector of all electrode activities $\bfd(t) = [d_1(t), \ldots, d_N(t)]$ lies on a low-dimensional manifold $\cM \subset \R^N$. Motor behavior corresponds to trajectories on $\cM$.
+\end{itemize}
+
+The bridge is a \textbf{latent state variable}. Let $\bfz(t) \in \R^k$ be the low-dimensional articulatory state---the configuration of the vocal tract at time $t$. Each electrode's activity is determined by \emph{where it sits} on the cortical surface and \emph{what the articulatory state is}:
+\begin{equation}\label{eq:obs-function}
+d_j^{(i)}(t) = g\bigl(\bfp_j^{(i)},\; \bfz(t)\bigr) + \epsilon_j^{(i)}(t)
+\end{equation}
+where $g: \cS \times \R^k \to \R$ is a \textbf{shared observation function} mapping (cortical position, articulatory state) to neural activity. This is the somatotopic map made explicit: electrodes over lip motor cortex respond to lip-state variables; electrodes over tongue motor cortex respond to tongue-state variables.
+
+The dynamics on the manifold are determined by the phoneme sequence:
+\begin{equation}\label{eq:dynamics}
+\dot{\bfz}(t) = h\bigl(\bfz(t);\; \bfy\bigr)
+\end{equation}
+
+\subsection{Why this formulation matters}
+
+The observation function $g(\bfp, \bfz)$ is the central learning target. It says: \textbf{the same function generates neural activity for all patients.} What differs is the set of positions $\{\bfp_j^{(i)}\}$ at which each patient samples $g$.
+
+Without knowing electrode positions, the model must learn a separate observation function per patient---this is what per-patient SpatialConv does. With positions (MNI coordinates as an approximation of $\bfp$), the observation function~$g$ can be parameterized as a shared function of brain coordinates, and cross-patient alignment is built into the architecture.
+
+\subsection{The articulatory manifold has known structure}
+
+For speech, the manifold $\cM$ has physical meaning corresponding to vocal tract configuration:
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+\textbf{Articulator} & \textbf{Approx.\ DoF} & \textbf{Controls} \\
+\midrule
+Tongue (tip, body, dorsum) & ${\sim}6$ & Place of articulation, vowel quality \\
+Jaw & ${\sim}2$ & Aperture, protrusion \\
+Lips & ${\sim}2$ & Rounding, closure \\
+Larynx & ${\sim}2$ & Voicing, pitch \\
+Velum & ${\sim}1$ & Nasal/oral \\
+\midrule
+\textbf{Total} & ${\sim}$\textbf{13--15} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For our 9 phonemes, the effective dimensionality is lower:
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Contrast} & \textbf{Phonemes distinguished} & \textbf{Approx.\ dim.} \\
+\midrule
+Place of articulation & labial (b,p,v) vs.\ velar (g,k) & ${\sim}2$ \\
+Manner & stop vs.\ fricative vs.\ vowel & ${\sim}2$ \\
+Voicing & voiced (b,g,v) vs.\ voiceless (k,p) & ${\sim}1$ \\
+Vowel height & low (a,\ae) vs.\ high (i,u) & ${\sim}1$ \\
+Vowel backness & front (\ae,i) vs.\ back (a,u) & ${\sim}1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Effective manifold dimension for our task: ${\sim}$5--8.} This is far below the electrode count (63--201), consistent with massive oversampling of a low-dimensional manifold. The decoding problem reduces to: given sparse samples of $g(\bfp, \bfz)$ at known positions~$\bfp$, infer the latent trajectory $\bfz(t)$ and classify the phoneme sequence.
+
+\subsection{Cross-patient transfer as manifold alignment}
+
+Each patient's electrode array gives a different \textbf{projection} of the shared manifold:
+\begin{equation}\label{eq:projection}
+\bfd^{(i)}(t) \approx W^{(i)} \bfz(t) + \boldsymbol{\epsilon}^{(i)}
+\end{equation}
+where $W^{(i)} \in \R^{N_i \times k}$ is determined by which cortical positions the electrodes sample.
+
+Existing alignment methods (CCA, Procrustes, CORAL) attempt to align these projections post-hoc. All failed in our experiments. MNI coordinates offer an alternative: \textbf{aligning the projections a priori} by providing the geometric relationship between electrode positions.
+
+The key question is whether inter-subject correspondence uncertainty (several mm) is small enough relative to the somatotopic map scale (${\sim}15$--$20$\,mm) that MNI coordinates provide useful alignment. Chen et al.\ (2025) suggest yes for standard ECoG. Whether this holds for $\mu$ECoG at ${\sim}2$\,mm spacing is an open empirical question.
+
+
+% ══════════════════════════════════════════════════════════
+\section{Decomposing Cross-Patient Variation}
+% ══════════════════════════════════════════════════════════
+
+\subsection{The spatial transform $T_i$}
+
+The primary source of cross-patient variation is \textbf{geometric}: different electrode positions sample different regions of the shared field. The transform $T_i$ decomposes:
+\begin{equation}\label{eq:transform}
+T_i(\bfp) = A_i \cdot \bfp + \bfb_i + \delta_i(\bfp)
+\end{equation}
+where:
+\begin{itemize}[leftmargin=2em]
+\item $A_i \in \R^{3 \times 3}$: rigid or affine transform (rotation, scaling). MNI normalization estimates and corrects this.
+\item $\bfb_i \in \R^3$: translation (array placement offset). Our arrays span 15--25\,mm in MNI.
+\item $\delta_i(\bfp)$: nonlinear residual---sulcal geometry, local cortical folding, and for tumor patients, \textbf{macroscopic warping from mass effect}. Tumor displacement is a geometric mapping error, not signal noise: it physically moves the somatotopic map relative to skull-based coordinates. This is the most severe form of $\delta_i$ in our cohort and violates the affine assumption of $A_i$.
+\end{itemize}
+
+\subsection{Inter-subject correspondence uncertainty}
+
+The commonly cited ``${\sim}5$\,mm'' figure is not a stable physical constant. The actual uncertainty has multiple sources:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Native-space electrode localization}: Validated pipelines can achieve sub-millimeter accuracy---this step is relatively precise.
+\item \textbf{Brain shift correction}: Intra-operative brain shift (craniotomy, CSF drainage, gravity) displaces the cortex relative to pre-operative imaging. Correction quality varies.
+\item \textbf{Warping to common atlas space}: The nonlinear registration from patient anatomy to MNI-152 is the dominant source of inter-subject uncertainty. Quality depends on algorithm, template, and---for tumor patients---whether the lesion distorts the warp.
+\end{enumerate}
+
+The net result is \textbf{several millimeters of inter-subject correspondence uncertainty} for healthy anatomy, potentially more near tumors:
+\begin{itemize}[leftmargin=2em]
+\item At the scale of articulatory somatotopy (${\sim}15$--$20$\,mm zones): correspondence is reliable.
+\item At the scale of electrode spacing (${\sim}2$\,mm): correspondence is unreliable.
+\item In between (${\sim}5$--$10$\,mm): partially informative, varies by patient and region.
+\end{itemize}
+
+\subsection{Resolution mismatch and dual spatial encoding}
+
+$\mu$ECoG electrode spacing (${\sim}2$\,mm) is finer than inter-subject correspondence uncertainty. This implies any coordinate-aware architecture should use \textbf{dual spatial encoding}:
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Scale} & \textbf{Resolution} & \textbf{Best encoded by} & \textbf{What it captures} \\
+\midrule
+Cross-patient & ${\sim}10$--$15$\,mm & MNI coordinates & Articulatory somatotopy \\
+Intra-patient global & ${\sim}5$--$10$\,mm & MNI (approximate) & Array position on cortex \\
+Intra-patient local & ${\sim}2$\,mm & Grid topology & Fine-grained spatial patterns \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The patient-specific residual $r^{(i)}$}
+
+After accounting for shared dynamics and spatial transform, the residual captures:
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Fine-grained neural organization}: Within-articulator spatial patterns that vary across individuals.
+\item \textbf{Signal characteristics}: Electrode impedance, contact quality, and SNR. Z-score normalization addresses amplitude scaling but not higher-order distributional differences.
+\item \textbf{Functional plasticity}: Individual speech development, accent, and articulatory habits.
+\item \textbf{Pathology-specific effects}: Parkinson's motor cortex excitability changes; tumor-adjacent cortical reorganization (distinct from the geometric displacement captured in $\delta_i$).
+\end{enumerate}
+
+
+% ══════════════════════════════════════════════════════════
+\section{What Our Experiments Reveal}
+% ══════════════════════════════════════════════════════════
+
+\subsection{The evaluation recipe dominates at this data scale}
+
+Across experiments on S14, training improvements contributed ${\sim}7\pp$ and evaluation improvements contributed ${\sim}6.5\pp$:
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+\textbf{Component} & \textbf{Category} & \textbf{PER improvement} \\
+\midrule
+Label smoothing 0.1 & Training & $-4.1\pp$ \\
+Mixup $\alpha{=}0.2$ & Training & $-1.7\pp$ \\
+Per-position heads + dropout & Training & $-1.2\pp$ \\
+\midrule
+Weighted $k$-NN ($k{=}10$, cosine) & Evaluation & $-2.1\pp$ \\
+TTA (16 augmented copies) & Evaluation & $-1.4\pp$ \\
+Articulatory + CE dual head & Evaluation & $-1.1\pp$ \\
+Best-of per fold & Evaluation & $-1.8\pp$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Multi-scale temporal structure is validated}
+
+Multi-scale temporal encoding (stride 3+5+10) was the single best architectural improvement (PER $0.766 \to 0.750$):
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Scale} & \textbf{Temporal resolution} & \textbf{Articulatory correlate} \\
+\midrule
+Stride 3 (${\sim}67$\,Hz) & ${\sim}15$\,ms & Fast transitions (stop release, tongue flap) \\
+Stride 5 (${\sim}40$\,Hz) & ${\sim}25$\,ms & Syllable dynamics (CV transition) \\
+Stride 10 (${\sim}20$\,Hz) & ${\sim}50$\,ms & Phoneme-level patterns (steady-state) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{SSL features carry partial structure}
+
+All SSL methods produce near-chance PER (0.85--0.91) under basic evaluation. JEPA features + LP-FT achieve PER\,=\,0.797, and weighted $k$-NN improves them by $2.9\pp$. SSL features capture some structure but their feature geometry is far weaker than supervised features. TTA hurts JEPA features ($-0.2\pp$), confirming they are not augmentation-invariant.
+
+\subsection{The ${\sim}$0.76 PER convergence on S14}\label{sec:wall}
+
+55 experiments across all paradigms converge to PER 0.750--0.780 on S14. \textbf{Attributing this to any single bottleneck would be premature}:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{S14 is no longer a held-out test patient.} With 55+ architectures evaluated against S14, it functions as a validation set. The convergence may partly reflect S14-specific characteristics rather than a universal ceiling.
+\item \textbf{Measurement noise from small validation folds.} ${\sim}30$ samples per fold implies ${\pm}0.05$ PER noise. Differences ${<}2\pp$ are within noise.
+\item \textbf{Target-data scarcity.} S14 has 153 trials (${\sim}120$ per training fold). Stage~2 adaptation contributes only ${\sim}1.6\pp$.
+\item \textbf{Spatial alignment may be one contributing factor.} Per-patient spatial encoders cannot share spatial knowledge. But this has not been isolated as \emph{the} bottleneck.
+\end{enumerate}
+
+Breaking through requires testing multiple hypotheses: \textbf{(a)}~population-level evaluation on all patients, \textbf{(b)}~cross-task data pooling, and \textbf{(c)}~MNI coordinate-based spatial alignment. These are complementary, not competing.
+
+
+% ══════════════════════════════════════════════════════════
+\section{The Case for MNI Coordinates}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Currently unused information}
+
+The current LOPO pipeline processes spatial information through \textbf{per-patient Conv2d} operating on grid topology:
+\[
+d^{(i)} \in \R^{H_i \times W_i \times T}
+\xrightarrow{\;\text{Conv2d}_i\;}
+\R^{d \times T}
+\xrightarrow{\;\text{shared backbone}\;}
+\R^{d' \times T'}
+\]
+
+Each patient's Conv2d is independent. The model has \textbf{zero information} about the spatial relationship between electrodes across patients. The shared backbone implicitly assumes its input features are homologous across the channel dimension---that feature dimension $k$ from different patients' SpatialConv layers carries corresponding information. This assumption is anatomically false: independent per-patient Conv2d layers produce feature spaces with no guaranteed alignment.
+
+\subsection{What coordinates enable (in principle)}
+
+The observation function formulation~\eqref{eq:obs-function} makes the value explicit: knowing $\bfp_j^{(i)}$ allows the model to learn $g$ as a shared function rather than learning independent mappings per patient. Concretely:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Identifying which articulatory zone each electrode samples.} The somatotopic map operates at ${\sim}15$--$20$\,mm scale, above the inter-subject correspondence uncertainty.
+\item \textbf{Shared spatial representations across patients.} Electrodes at similar MNI coordinates can share representations, pooling spatial information across the cohort.
+\item \textbf{Contextualizing variable electrode counts.} Coordinates tell the model which cortical regions are covered and which are absent for each patient.
+\end{enumerate}
+
+\subsection{What coordinates do NOT guarantee}
+
+The availability of MNI coordinates does not automatically improve decoding. Coordinates help only if:
+\begin{itemize}[leftmargin=2em]
+\item The correspondence uncertainty is small enough relative to the somatotopic scale (plausible for ${\sim}15$--$20$\,mm zones, uncertain within ${\sim}5$\,mm neighborhoods).
+\item The model architecture can exploit the information (a design question).
+\item Spatial alignment is actually a binding constraint on performance (unverified).
+\item The coordinates are accurate enough for specific patients (tumor patients may have larger errors).
+\end{itemize}
+
+\noindent\textbf{MNI coordinates are a necessary but not sufficient ingredient for coordinate-based cross-patient transfer.} Their value must be demonstrated empirically.
+
+
+% ══════════════════════════════════════════════════════════
+\section{Available Data and Experimental Paths}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Currently used}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Data source} & \textbf{Volume} & \textbf{Usage} \\
+\midrule
+PS task trial-level HGA & 9 patients, ${\sim}1315$ trials & Supervised LOPO training \\
+S14 trial-level HGA & 153 trials & Target patient evaluation \\
+Grid topology (from TSV) & Per-patient & SpatialConv input structure \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Available but unused}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lllc@{}}
+\toprule
+\textbf{Data source} & \textbf{Volume} & \textbf{Potential usage} & \textbf{Risk} \\
+\midrule
+Cross-task pooling (Duraivel) & 3 patients, 156--208 trials & Doubles labeled data & Low \\
+MNI coordinates & All patients & Spatial alignment & Medium \\
+Continuous recordings & ${\sim}168$\,min & Temporal SSL & Medium \\
+Lexical task patients & 13 patients & Additional sources & Medium \\
+Audio recordings & 4 variants/patient & Auxiliary supervision & Medium \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Cross-task pooling deserves priority}
+
+The pseudoword repetition data (Duraivel 2025) is the lowest-risk path to more training data: same 52 CVC/VCV tokens, same 9 phonemes, 3 overlapping patients, same preprocessing pipeline, same IRB. This should be pursued as a \textbf{central experimental branch}, not a side opportunity.
+
+\subsection{The continuous data caveat}
+
+The ${\sim}168$ minutes of continuous recordings are not ${\sim}168$ minutes of useful SSL signal. Intra-operative recordings are dominated by silence, operating room ambient noise, auditory perception, and anesthesia-related fluctuations. Utilizing this data for SSL requires aggressive curation (VAD, energy thresholding) to extract speech-relevant neural activity.
+
+
+% ══════════════════════════════════════════════════════════
+\section{Summary}
+% ══════════════════════════════════════════════════════════
+
+\subsection*{Externally established}
+\begin{itemize}[leftmargin=2em]
+\item Per-patient spatial layer + shared temporal backbone is optimal (Singh 2025, Willett 2023)
+\item Articulatory somatotopy exists in vSMC and is intrinsic to circuitry (Metzger 2023, Bouchard 2013)
+\item MNI/atlas coordinates enable cross-patient ECoG transfer (Chen 2025)
+\item Motor cortex manifold dynamics are preserved across individuals (Safaie 2023) and stable over time (Gallego 2020)
+\item Articulatory features are robustly encoded in vSMC (Wu 2025, citing Chartier 2018, Anumanchipalli 2019)
+\end{itemize}
+
+\subsection*{Internally observed}
+\begin{itemize}[leftmargin=2em]
+\item Cross-patient LOPO transfer works: PER 0.762 vs.\ per-patient 0.737 (S14, grouped CV)
+\item Articulatory bottleneck head improves cross-patient decoding
+\item Multi-scale temporal encoding (stride 3+5+10) is the best validated architectural improvement
+\item Evaluation recipe contributes ${\sim}6.5\pp$, rivaling training improvements (${\sim}7\pp$)
+\item All SSL methods fail at current data scale but features carry partial structure
+\item 55 experiments on S14 converge to PER 0.750--0.780 across all paradigms
+\item All domain adaptation methods (DANN, CORAL, CCA) provide zero benefit
+\end{itemize}
+
+\subsection*{Working hypotheses}
+\begin{itemize}[leftmargin=2em]
+\item The ${\sim}0.76$ convergence reflects (in part) a spatial alignment bottleneck---not yet isolated from data scarcity, noise, or S14-specific effects
+\item MNI coordinate-based alignment will improve decoding---depends on registration accuracy, architecture, and whether alignment is binding
+\item The neural field decomposes into shared dynamics + spatial transform + residual---productive but magnitudes unmeasured
+\item Cross-task pooling is high-value, low-risk---supported by task compatibility but untested in pipeline
+\item Continuous recordings provide SSL signal after curation---usable fraction unknown
+\end{itemize}
+
+\subsection*{The central question}
+
+Our current results are consistent with the hypothesis that explicit spatial correspondence is one remaining bottleneck, but they do not yet isolate that bottleneck from target-data scarcity, fold noise, and coverage mismatch. The highest-confidence experimental paths are: \textbf{(a)}~population-level evaluation on all patients, \textbf{(b)}~cross-task data pooling, and \textbf{(c)}~MNI coordinate-based spatial alignment. These address complementary aspects of the problem and should be pursued in parallel where feasible.
+
+\end{document}

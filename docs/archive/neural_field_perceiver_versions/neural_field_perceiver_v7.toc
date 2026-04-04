@@ -1,0 +1,32 @@
+\contentsline {section}{\numberline {1}Problem}{3}{section.1}%
+\contentsline {section}{\numberline {2}Key Idea: Shared Neural Field + Reprojection}{3}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Decomposition}{3}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}The factorization}{3}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}The 3D vision analogy}{4}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Evidence}{4}{subsection.2.4}%
+\contentsline {section}{\numberline {3}Architecture}{5}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Overview}{5}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Electrode Tokens}{6}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Temporal Preprocessing}{6}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Virtual Electrodes}{6}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Interleaved Spatiotemporal Blocks ($\times L{=}2$)}{7}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Why Perceiver, not ViT or point-cloud methods?}{8}{subsection.3.6}%
+\contentsline {subsection}{\numberline {3.7}Observation Decoder (${\sim }$25K params)}{8}{subsection.3.7}%
+\contentsline {subsection}{\numberline {3.8}Phoneme Decoder (${\sim }$5K params)}{9}{subsection.3.8}%
+\contentsline {subsection}{\numberline {3.9}Parameter Budget}{9}{subsection.3.9}%
+\contentsline {section}{\numberline {4}Training and Evaluation}{10}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Phase 1: Source training}{10}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Phase 2: Target adaptation (LP-FT)}{10}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Phase 3 (optional): Transductive reprojection pre-training}{10}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Evaluation regimes}{10}{subsection.4.4}%
+\contentsline {section}{\numberline {5}What Our Experiments Show}{10}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Evaluation recipe matters more than architecture}{10}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Multi-scale temporal is the best architectural improvement}{11}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}The ${\sim }0.76$ convergence}{11}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}SSL failed at this data scale}{11}{subsection.5.4}%
+\contentsline {section}{\numberline {6}Ablation Plan}{11}{section.6}%
+\contentsline {section}{\numberline {7}Priorities and Risks}{12}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Priority ordering}{12}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Success criteria}{12}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Risks}{12}{subsection.7.3}%
+\contentsline {section}{\numberline {8}Available Data}{12}{section.8}%

@@ -1,0 +1,30 @@
+\contentsline {section}{\numberline {1}Status}{2}{section.1}%
+\contentsline {section}{\numberline {2}Why A Beta Document Exists}{2}{section.2}%
+\contentsline {section}{\numberline {3}Design Principles}{2}{section.3}%
+\contentsline {section}{\numberline {4}Non-Goals}{2}{section.4}%
+\contentsline {section}{\numberline {5}Anchor Model}{3}{section.5}%
+\contentsline {section}{\numberline {6}Core Architectural Decision}{3}{section.6}%
+\contentsline {section}{\numberline {7}Beta Architecture}{3}{section.7}%
+\contentsline {subsection}{\numberline {7.1}1. Inputs}{3}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}2. Coordinate Representation}{3}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}3. Fusion Strategy}{4}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}4. Backbone and Decoder}{4}{subsection.7.4}%
+\contentsline {section}{\numberline {8}Sequential Experiment Ladder}{4}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Beta-0: Population Anchor}{4}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Beta-1: Minimal Coordinate Injection}{5}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Beta-2: Lightweight Geometric Correction}{5}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}Beta-3: Coarse Nonlinear Coordinate Encoding}{6}{subsection.8.4}%
+\contentsline {subsection}{\numberline {8.5}Beta-4: Within-Patient Masked Reconstruction Only}{6}{subsection.8.5}%
+\contentsline {subsection}{\numberline {8.6}Beta-5: Escalation Threshold}{7}{subsection.8.6}%
+\contentsline {section}{\numberline {9}Why Cross-Patient Reprojection Is Excluded From Beta}{7}{section.9}%
+\contentsline {section}{\numberline {10}Training Protocol}{7}{section.10}%
+\contentsline {subsection}{\numberline {10.1}Fixed Across Beta-0 Through Beta-4}{7}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}Optimization Policy}{7}{subsection.10.2}%
+\contentsline {section}{\numberline {11}Evaluation Contract}{8}{section.11}%
+\contentsline {section}{\numberline {12}Decision Logic}{8}{section.12}%
+\contentsline {subsection}{\numberline {12.1}If Beta-1 Fails}{8}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}If Beta-1 Works but Beta-2/Beta-3 Fail}{8}{subsection.12.2}%
+\contentsline {subsection}{\numberline {12.3}If Beta-1 Through Beta-4 All Help}{8}{subsection.12.3}%
+\contentsline {section}{\numberline {13}Recommended Initial Build}{8}{section.13}%
+\contentsline {subsection}{\numberline {13.1}\texttt {Beta-1}}{9}{subsection.13.1}%
+\contentsline {section}{\numberline {14}Summary}{9}{section.14}%

@@ -14,30 +14,27 @@ Extending Spalding 2025 (PCA+CCA alignment, SVM/Seq2Seq, 8 patients, 9 phonemes,
 ## Key Files
 
 ### Documentation
-- `docs/implementation_plan.md` — Two-stage implementation plan: Phase 2 = field standard, Phase 3 = two architectural innovations (v9)
-- `docs/pipeline_decisions.md` — ~40 design decisions with tensions/tradeoffs
-- `docs/research_synthesis.md` — 18-paper synthesis: landscape, gaps, ranked directions (16 archived)
-- `docs/future_directions.md` — Cross-task pooling, Tier 2 ideas (separated from implementation plan)
+- `docs/neural_field_perceiver_v12.tex` — **Active design document**: Neural Field Perceiver architecture (MNI-based spatial tokenization + cross-attention + reconstruction loss)
+- `docs/current_direction.md` — Active guardrail: current priorities, what's archived, practical rules
+- `docs/dcc_setup.md` — Complete Duke DCC cluster documentation (SSH, conda, data, SBATCH, troubleshooting)
+- `docs/experiment_log.md` — Full experiment history (55 LOPO + per-patient + SSL)
+- `docs/training_log.md` — Per-patient tuning history (S14)
+- `docs/research_synthesis.md` — 18-paper synthesis: landscape, gaps, ranked directions
 - `docs/reading_list.md` — 10 essential papers in reading order
 - `pastwork/paper_index.md` — Paper lookup by contribution category (10 categories)
 - `pastwork/summaries/` — 18 active summaries (16 in `pastwork/archive/summaries/`)
-- `pastwork/verification_results.md` — All 19 errors across 8 summaries corrected
 
-### NCA-JEPA Pretraining (new pipeline, separate from supervised decoding)
-- `docs/superpowers/specs/2026-03-26-nca-jepa-pretraining-design.md` — Design spec (v14): 3-stage pipeline (synthetic → neural → CE fine-tune), generator ladder, 3 architecture families, 82 resolved decisions
-- `docs/superpowers/specs/2026-03-26-nca-jepa-implementation-plan.md` — MVP-staged implementation plan: unified architecture with `spatial_mode` axis, 6 gated phases, 92 resolved decisions
-- `docs/superpowers/specs/2026-03-26-nca-jepa-resolved-decisions.md` — 82 resolved decisions from design spec
-- `docs/superpowers/specs/2026-03-26-nca-jepa-changelog.md` — Design spec version history (v6→v14)
-- `docs/superpowers/plans/2026-03-27-nca-jepa-implementation.md` — TDD implementation plan: 17 tasks across Phases 0-2, gated on baselines
+### Archived Documentation
+- `docs/archive/neural_field_perceiver_versions/` — v2-v11, beta (design doc evolution)
+- `docs/archive/nca_jepa/` — SSL pretraining design specs, plans (Phase 0 complete, paused)
+- `docs/archive/lopo_autoresearch/` — LOPO brainstorm and autoresearch plans
+- `docs/archive/historical_supervised/` — Old implementation plans, pipeline decisions, future directions
 
 ### Configs
-- `configs/default.yaml` — E2 full model LOPO config (spatial conv + articulatory CTC, H=64, blank_bias=2.0)
-- `configs/per_patient.yaml` — Per-patient config (H=32, blank_bias=0.0, tuned augmentation)
-- `configs/per_patient_flat.yaml` — Flat head ablation config (head_type=flat)
-- `configs/lopo_pilot.yaml` — LOPO pilot config (8 Spalding patients, 1 seed, blank_bias=1.0)
-- `configs/field_standard.yaml` — E1 field standard (linear + flat CTC)
-- `configs/pretrain_base.yaml` — NCA-JEPA pretraining defaults (collapse mode, d=64, stride=10)
+- `configs/per_patient_ce_s10_pool48.yaml` — Current recommended per-patient config (CE, stride=10, pool(4,8))
+- `configs/lopo_ce.yaml` — LOPO cross-patient config
 - `configs/paths.yaml` — Machine-specific BIDS paths (gitignored)
+- `configs/archive/` — Historical baselines, sweeps, negative pivots, pretrain configs
 
 ## Code Structure
 
@@ -66,57 +63,44 @@ src/speech_decoding/
 │   ├── metrics.py          # PER, per-position balanced accuracy, CTC length accuracy
 │   ├── grouped_cv.py       # Grouped-by-token CV splitter (NCA-JEPA Phase 0)
 │   └── content_collapse.py # Entropy, unigram-KL, stereotypy diagnostics (NCA-JEPA Phase 0)
-└── pretraining/            # NCA-JEPA pretraining pipeline (separate from supervised)
+└── pretraining/            # NCA-JEPA pretraining (ARCHIVED — on disk but not actively used)
     ├── pretrain_model.py   # UnifiedPretrainModel: spatial_mode ∈ {collapse, preserve, attend}
-    ├── masking.py          # Span masking + learnable [MASK] token (40-60%, 3-6 spans)
-    ├── decoder.py          # Linear reconstruction decoder (discarded after pretraining)
-    ├── local_geometry_pe.py # Linear(3→d) on (row_mm, col_mm, dead_frac)
-    ├── spatial_pooling.py  # Mean-pool + top-k spatial pooling for readout
-    ├── stage1_trainer.py   # Synthetic pretraining loop (S_total/2 steps)
-    ├── stage2_trainer.py   # Neural adaptation loop (masked span prediction on real data)
+    ├── masking.py          # Span masking + learnable [MASK] token
+    ├── decoder.py          # Linear reconstruction decoder
+    ├── stage1_trainer.py   # Synthetic pretraining loop
+    ├── stage2_trainer.py   # Neural adaptation loop
     ├── stage3_evaluator.py # Freeze backbone → CE fine-tune → PER + collapse diagnostics
-    ├── synthetic_pipeline.py # Generator → z-score → noise → dead mask → batch
-    └── generators/
-        ├── base.py         # Generator ABC
-        ├── smooth_ar.py    # Level 0: spatially-smoothed Gaussian AR(1)
-        └── switching_lds.py # Level 1: piecewise-linear dynamics, 3-6 regimes
+    ├── synthetic_pipeline.py # Synthetic data generation
+    └── generators/         # Smooth AR + switching LDS generators
 ```
 
 ### Scripts
 - `scripts/train_per_patient.py` — CLI for per-patient training on all PS patients × seeds
 - `scripts/train_lopo.py` — CLI for LOPO cross-patient training
-- `scripts/sweep_s14.sh` — Hyperparameter sweep on S14 (Runs 5-8)
-- `scripts/run_phase0_baselines.py` — Phase 0 baselines (Methods E, D, spatial-only) with grouped-CV
-- `scripts/train_pretrain.py` — NCA-JEPA pretraining CLI (Methods B, C, A)
+- `scripts/sweep_tmin_perpos.py` — 6-condition temporal windowing sweep (tmin × head_type × per-phoneme)
+- `scripts/sweep_tmin_dcc.sh` — SBATCH wrapper for sweep on DCC
+- `scripts/analyze_real_data_stats.py` — Data statistics analysis
+- `scripts/visualize_ecog.py` — ECoG visualization
+- `scripts/archive/` — SSL evaluation, diagnostics, autoresearch experiments (83 experiments)
 
-### Tests (127 existing + NCA-JEPA tests)
+### Tests
 ```
 tests/
-├── test_phoneme_map.py     # 23 tests: label normalization, CTC encoding, articulatory matrix
-├── test_grid.py            # 10 tests: grid inference from TSV, dead positions, reshape (2 slow)
-├── test_bids_dataset.py    # 9 tests: dataset interface, real .fif loading (6 slow)
-├── test_augmentation.py    # 14 tests: all augmentation ops
-├── test_collate.py         # 4 tests: multi-patient grouping
-├── test_models.py          # 24 tests: all model components + assembler
-├── test_ctc_utils.py       # 13 tests: CTC loss, decode, PER, blank ratio
-├── test_trainer.py         # 6 tests: metrics + per-patient trainer on synthetic data
-├── test_integration.py     # 7 tests: end-to-end forward/backward/overfit + real S14 (2 slow)
-├── test_lopo_trainer.py    # 7 tests: Stage 1 multi-patient training (synthetic)
-├── test_adaptor.py         # 6 tests: Stage 2 target adaptation (synthetic)
-├── test_lopo.py            # 4 tests: LOPO orchestrator + Wilcoxon (synthetic)
-├── test_grouped_cv.py      # NCA-JEPA: grouped-by-token CV splitter
-├── test_content_collapse.py # NCA-JEPA: content-collapse diagnostics
-├── test_masking.py         # NCA-JEPA: span masking module
-├── test_decoder.py         # NCA-JEPA: reconstruction decoder
-├── test_pretrain_model.py  # NCA-JEPA: unified pretrain model (all spatial_modes)
-├── test_stage2_trainer.py  # NCA-JEPA: Stage 2 neural adaptation
-├── test_stage3_evaluator.py # NCA-JEPA: Stage 3 CE fine-tune
-├── test_generators.py      # NCA-JEPA: smooth AR + switching LDS generators
-├── test_synthetic_pipeline.py # NCA-JEPA: synthetic data pipeline
-├── test_stage1_trainer.py  # NCA-JEPA: Stage 1 synthetic pretraining
-├── test_preserve_attend.py # NCA-JEPA: preserve/attend spatial modes
-├── test_local_geometry_pe.py # NCA-JEPA: positional encoding
-└── test_spatial_pooling.py # NCA-JEPA: mean + top-k pooling
+├── test_phoneme_map.py      # 23 tests: label normalization, CTC encoding, articulatory matrix
+├── test_grid.py             # 10 tests: grid inference from TSV, dead positions, reshape (2 slow)
+├── test_bids_dataset.py     # 9 tests: dataset interface, real .fif loading (6 slow)
+├── test_augmentation.py     # 14 tests: all augmentation ops
+├── test_collate.py          # 4 tests: multi-patient grouping
+├── test_models.py           # 24 tests: all model components + assembler
+├── test_ctc_utils.py        # 13 tests: CTC loss, decode, PER, blank ratio
+├── test_trainer.py          # 6 tests: metrics + per-patient trainer on synthetic data
+├── test_integration.py      # 7 tests: end-to-end forward/backward/overfit + real S14 (2 slow)
+├── test_lopo_trainer.py     # 7 tests: Stage 1 multi-patient training (synthetic)
+├── test_adaptor.py          # 6 tests: Stage 2 target adaptation (synthetic)
+├── test_lopo.py             # 4 tests: LOPO orchestrator + Wilcoxon (synthetic)
+├── test_grouped_cv.py       # Grouped-by-token CV splitter
+├── test_content_collapse.py # Content-collapse diagnostics
+└── (NCA-JEPA tests)         # test_masking, test_pretrain_model, test_stage*_trainer, etc.
 ```
 
 Run: `pytest tests/ -v -m "not slow"` (fast, no data needed) or `pytest tests/ -v` (all, needs BIDS data)
@@ -202,24 +186,28 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 - **Pool(4,8) → d_shared=256** retains 2mm spatial resolution, matching somatotopic scale
 - **Stride=10 (20Hz) matches field standard**: 40Hz was unnecessary (0.70 vs 0.70 PER). Spalding/Duraivel/Willett all use ≤20Hz.
 
-**Recommended per-patient config**: CE loss, stride=10, pool(4,8), C=8, d_shared=256, H=32. Input sweep in progress.
+**Per-patient results under different CV types** (all S14):
+- **Grouped-by-token CV** (fair, no token leakage): PER **0.737** (full recipe: CE+focal+mixup+weighted k-NN+TTA 16+articulatory head)
+- **Stratified CV** (leaky, tokens repeat across folds): PER 0.700 (CE only) / 0.662 (full recipe)
+- **Gap**: 0.075 PER (10pp) from token leakage. Always use grouped-by-token CV for fair evaluation.
+- **Grouped-by-token CE-only baseline**: PER 0.825. Recipe improvements (k-NN, TTA, articulatory head) contribute ~8.8pp.
+
+**Recommended per-patient config**: CE loss, stride=10, pool(4,8), C=8, d_shared=256, H=32, articulatory bottleneck head, weighted k-NN eval, TTA 16.
 
 **MPS compatibility** (local Mac only): `AdaptiveAvgPool2d` falls back to CPU for non-divisible grid sizes. CTC loss also falls back to CPU. Use `PYTORCH_ENABLE_MPS_FALLBACK=1`.
 
 ## Compute: Duke DCC Cluster (primary)
 
-**Use DCC for all production training runs.** Local MPS is for quick iteration only.
+**Use DCC for all training runs.** Local MPS is for editing code only. See `docs/dcc_setup.md` for complete documentation.
 
 - **SSH**: `ssh ht203@dcc-login.oit.duke.edu` (no MFA currently)
-- **GPU**: RTX 5000 Ada Generation (32 GB VRAM) × 8 on `coganlab-gpu` partition
+- **GPU**: 8× RTX 5000 Ada Generation (32 GB VRAM) on `coganlab-gpu` partition
+- **Python**: `/work/ht203/miniconda3/envs/speech/bin/python` (do NOT use `conda activate` — broken base conda)
 - **Repo**: `/work/ht203/repo/speech` (branch `autoresearch/run1`)
-- **Data**: `/work/ht203/data/BIDS` (symlinked from coganlab + preprocessed .fifs transferred)
-- **Conda**: `/work/ht203/miniconda3/envs/speech` (Python 3.11, PyTorch 2.5.1+cu121)
+- **Data**: `/work/ht203/data/BIDS` (symlinked from coganlab)
 - **Logs**: `/work/ht203/logs/`
-- **Batch script**: `scripts/train_dcc.sh` (SBATCH template for coganlab-gpu)
-- **Device**: Set `DEVICE=cuda` on DCC (train.py reads `os.environ.get("DEVICE", "mps")`)
-- **Submit**: `sbatch scripts/train_dcc.sh` | Monitor: `squeue -u ht203`
-- **CAUTION**: `/work/ht203` auto-purges after 75 days of no access. Copy important results to `/hpc/group/coganlab/ht203/`.
+- **Submit**: `sbatch scripts/sweep_tmin_dcc.sh` | Monitor: `squeue -u ht203`
+- **CAUTION**: `/work/ht203` auto-purges after 75 days of no access. Copy results to `/hpc/group/coganlab/ht203/`.
 
 ### LOPO Pilot Results (complete)
 **Config**: `lopo_pilot.yaml` — 8 Spalding patients, 1 seed (42), H=64, CTC, blank_bias=1.0
@@ -236,39 +224,57 @@ Located at `BIDS_1.0_Lexical_µECoG/.../BIDS/code/decoding/`. Key files:
 | S62 | 0.832 |
 | **Population** | **0.846 ± 0.010** |
 
-- LOPO (0.846) is **worse** than per-patient CTC (0.778) and per-patient CE (0.700)
+- LOPO pilot (0.846) was near-chance. Subsequent recipe improvements (CE, focal, mixup, k-NN, TTA) reduced to 0.764, then architecture ablations to 0.750.
 - Stage 1 consistently early-stops ~step 800 of 2000 (val diverges after step 500)
-- Stage 2 folds complete in seconds (~3-5s each, early-stop 13-46 steps)
 - S33 (52 trials) survived with inner stratification fix
 - Very low variance across patients (0.828-0.856) — model is near-chance uniformly
-- **Interpretation**: Cross-patient transfer with CTC + current architecture doesn't help. Need to investigate: CE for LOPO, larger input layer, different Stage 2 strategy
 
 ### LOPO Autoresearch Results (2026-03-31)
-**Setup**: 10 source patients (~1468 trials) → adapt to S14, 5-fold grouped-by-token CV.
-**Recipe**: CE + focal γ=2 + label smoothing 0.1 + mixup α=0.2 + per-position heads + dropout 0.3 + weighted k-NN (k=10) + TTA 16.
+**Setup**: 9 source patients (~1315 trials) → S1 multi-patient train → S2 adapt to S14, 5-fold grouped-by-token CV.
+**Recipe**: CE + focal γ=2 + label smoothing 0.1 + mixup α=0.2 + per-position heads + dropout 0.3 + articulatory bottleneck head + weighted k-NN (k=10) + TTA 16 + multi-patient k-NN (source weight 0.5).
 
-- **Baseline PER**: 0.764 (CE recipe, beats pilot 0.846 by 8.2pp)
-- **Best PER**: **0.762** (exp13: multi-patient k-NN with source embeddings as extra neighbors, weight 0.5)
-- 16 experiments run, 15 discarded. Only evaluation-side improvement worked (multi-patient k-NN). All training-side modifications (S1 hyperparams, S2 adaptation, architecture changes) failed to beat baseline.
-- **Key insight**: LOPO is evaluation-limited, not training-limited. The backbone learns decent cross-patient features; extracting predictions from the shared feature space is the bottleneck.
-- **Next directions**: Domain adversarial training, InstanceNorm per patient, SVM/prototype networks on embeddings, multi-seed ensemble.
-- See `docs/experiment_log.md` for full results and realizations 66-70.
+**Progression** (55 experiments across 5 waves, all S14 grouped-by-token CV):
+- Pilot (CTC, no recipe): 0.846
+- LOPO baseline (CE recipe): 0.764
+- Multi-patient k-NN (exp13): 0.762
+- Architecture ablations (exp41-76, 36 experiments): best single-seed 0.749 (MaxPool), 0.749 (stride=5); multi-seed means ~0.760-0.764
+- **Wave 4 best: 0.750** (exp94: multi-scale temporal stride 3+5+10 + MaxPool read-in)
 
-### NCA-JEPA Pretraining (in progress)
-MVP-staged synthetic pretraining pipeline. 6 gated phases, implementing Phase 0 first.
-- **Phase 0** (next): Evaluation infrastructure + baselines (grouped-CV, CE mean-pool, Methods E/D/spatial-only)
-- **Phase 1**: Minimal SSL on real data (masked span prediction, Method B)
-- **Phase 2**: Minimal synthetic transfer (smooth AR generator, Methods C/A-minimal)
-- **Phase 3**: Spatial architecture comparison (collapse vs preserve vs attend modes)
-- **Phase 4-5**: Full experimental design, expansion (conditional on signal)
-- **Key architecture**: Unified `PretrainModel` with `spatial_mode` ∈ {collapse, preserve, attend}
-- **See plan**: `docs/superpowers/plans/2026-03-27-nca-jepa-implementation.md`
+**Per-patient baselines for comparison** (same S14, same grouped-by-token CV):
+- Per-patient (full recipe, exp17): **0.737** — LOPO is 1.3pp worse with best architecture (0.750)
+- Per-patient (simple recipe, exp88): 0.800 — LOPO with any recipe beats this
+- Per-patient (stratified CV, historical): 0.700 — NOT comparable (different CV type)
 
-### Other next steps
-- **Sprint 6**: Cross-task pooling — Lexical patients as additional Stage 1 sources (requires per-position phoneme filtering, not per-trial)
+**Wave 4 findings** (14 experiments exp77-90 + 5 combinations exp91-95):
+- Multi-scale temporal (stride 3+5+10): PER 0.757, 3-seed mean 0.760 ± 0.005
+- Self-training with pseudo-labels: PER 0.758 (doesn't stack with multi-scale)
+- **ALL SSL auxiliary losses failed**: VICReg (0.778), Transformer+masked SSL (0.776)
+- **ALL domain adaptation failed or ≈ baseline**: DANN (0.778), CORAL (0.762), CCA on features (0.771), patient weighting (0.782)
+- Joint training with S14 in S1 (Singh-style) hurt: 0.793
+- Knowledge distillation from per-patient teachers: 0.773
+- S2 contributes ~1.6pp (no-S2: 0.778 vs baseline: 0.762)
 
-### In Progress
-- **Input layer sweep**: Testing pool(4,8) d=256 and C=16 d=128 with CE + stride=10 on S14
+**Convergence analysis**: 55 LOPO experiments across every paradigm (supervised, SSL, domain adaptation, self-training, meta-learning) converge to PER 0.750-0.780. Root causes: (1) Fixed CV fold structure — fold 5 consistently ~0.85, fold 4 ~0.70; fold difficulty dominates experiment differences. (2) ~30 val samples per fold → ±0.05 PER noise per fold → mean PER differences <2pp are within measurement noise. (3) S1 backbone converges to same features regardless of training method. (4) S2 adaptation bottlenecked by 120 target samples.
+
+**Breaking through requires**: More data (cross-task pooling, more patients), population-level evaluation (all patients not just S14), or fundamentally different approach (Spalding-style CCA + our features untested with full eval recipe).
+
+See `docs/experiment_log.md` for full results.
+
+### NCA-JEPA Pretraining (ARCHIVED — Phase 0 complete, paused)
+SSL objectives failed at this data scale (~1 min utterance/patient). Code on disk in `src/speech_decoding/pretraining/`, docs in `docs/archive/nca_jepa/`.
+- ALL tested SSL methods near-chance under grouped CV: BYOL, JEPA, masked span, LeWM, VICReg
+- Not worth pursuing without fundamentally more data
+
+### Next Direction: Neural Field Perceiver (v12)
+**Design doc**: `docs/neural_field_perceiver_v12.tex`
+
+Cross-patient architecture using MNI electrode coordinates instead of per-patient Conv2d:
+- **Fourier PE** on MNI coords → spatial tokenization
+- **Cross-attention** to fixed virtual electrodes (Brainnetome atlas) → shared spatial representation
+- **Reconstruction loss** → spatial supervision (predict HGA from latent + position)
+- **Learned temporal attention queries** for per-phoneme readout (existing `CEPositionHead`)
+
+Implementation spec not yet written. See `docs/current_direction.md` for full context.
 
 ## Established Findings (from literature review)
 
@@ -279,13 +285,13 @@ Field consensus: per-patient input layer → shared backbone (GRU) → CTC loss.
 1. **Per-patient spatial conv** (Conv2d, default 1-layer ~80 params, configurable to 2-layer ~664 params) replaces Linear read-in (~13k params). Conv2d's factorization (weight-shared within image, different across images) matches rigid-array physics (uniform intra-array, variable inter-array). Learns spatial deblurring (Laplacian/gradient) and orientation-adapted filters. Array placements span 15–25mm with variable orientation → spatial conv is per-patient, not shared. **Layer count, channels, pool resolution are empirical — quick-validate on 1 LOPO fold (E13)**
 2. **Articulatory decomposition CTC head** replaces flat Linear(2H,9) — 6 parallel articulatory feature heads composed via fixed linguistic matrix. Blank logit bias is configurable (`model.blank_bias`): +2.0 for LOPO (sufficient gradient signal from 7 sources), 0.0 for per-patient (small data can't overcome high blank bias → blank collapse). Per-patient ablation shows **flat head ≈ articulatory head** (both PER ~0.77) — articulatory value is cross-patient transfer only
 
-**Downgraded to exploratory (in `future_directions.md`):** Reptile, SupCon, and DRO. Per-patient layers already provide cross-patient transfer (Singh-style). DRO upweights patients hard for practical reasons (few trials, poor signal), not neural coding differences — noisy with N=7.
+**Downgraded to exploratory:** Reptile, SupCon, and DRO. Per-patient layers already provide cross-patient transfer (Singh-style). DRO upweights patients hard for practical reasons (few trials, poor signal), not neural coding differences — noisy with N=7.
 
 ### Parameter budget (updated 2026-03-18 from first-principles analysis)
 - **Data confirmed from Spalding Tables S1/S3:** Trials 46–178/patient (S3=46 outlier), sig channels 63–201, frames 9.2k–35.6k/pt → **small regime locked**
 - Per-patient input: Conv2d(1,8,k=3,pad=1), 1-layer = **80 params**. **Pool(4,8) preferred over pool(2,4)** — 2mm spatial resolution resolves 3-5mm somatotopic organization; pool(2,4) at 4mm cannot. d_shared=256 (up from 64). For LOPO cross-patient, coarser pooling may still be preferable (array offsets 15-25mm). **Grid shapes from TSVs:** 12×22 (8 dead corners), 8×32 (no dead), 8×34 (S57, 16 dead). Handled by `grid.load_grid_mapping()`
 - Shared backbone: BiGRU 2×32 with d_shared=256 input. Conv1d(256,32,k=10,s=10) = **82K** temporal projection + GRU ~37K + head ~1.7K = **~121K shared params**. Temporal stride k=10 s=10 (**20Hz**, field standard — validated equivalent to 40Hz). H=32 sufficient — H=128 test showed more overfitting, not better generalization
-- **Loss**: Per-position CE for per-patient (PER 0.700 vs CTC 0.778). CTC for LOPO (alignment-free needed across patients with different timing). Articulatory CTC head configurable: `model.blank_bias` +2.0 LOPO, 0.0 per-patient
+- **Loss**: Per-position CE everywhere (PER 0.737 grouped-CV per-patient, 0.750 LOPO). CTC abandoned — CE provides stronger per-position gradients at this data scale. Articulatory bottleneck head (15-dim cosine sim) outperforms flat CE head for LOPO.
 - **Cross-lab comparison**: Our ~121K backbone is 50-100× smaller than Spalding seq2seq (~6.3M), Duraivel (~4.5M), Willett (~12.3M). Even Singh (closest regime) uses BiLSTM-64 (~100-500K). The bottleneck is input compression, not backbone capacity
 - Two-stage LOPO: Stage 1 = standard multi-patient SGD with **held-out 20% source validation** for early stopping; Stage 2 freezes Conv1d+BiGRU, adapts spatial conv+LayerNorm+articulatory head (~2,272 trainable params at default config). **Stage 2 uses stratified 5-fold CV** on target patient (StratifiedKFold on phoneme labels)
 - Stage 1 uses best-checkpoint selection (no SWA — no BCI paper uses SWA, adds unprecedented complexity). AdamW + CosineAnnealingLR (single cycle) + early stopping on held-out validation loss
@@ -312,7 +318,7 @@ Field consensus: per-patient input layer → shared backbone (GRU) → CTC loss.
 
 ### External pretraining
 - **No existing dataset transfers directly**: spike-based corpora (BIT, NDT3, POSSM) use Poisson statistics incompatible with Gaussian HGA
-- **Speech FM alignment — diagnostic-first design**: Motor cortex → speech FM mapping is untested (Dual Pathway validated STG only; Chang lab uses broad SMC+STG but never isolates motor contribution; Stavisky lab bypasses speech FMs for motor cortex). Our design: post-hoc linear probe on frozen E2 backbone → PCA-reduced HuBERT features (segment-level, MFA-aligned). If R² significant, add segment-level MSE aux loss as E13. Paired audio confirmed for all 8 patients. See `future_directions.md` § "Speech foundation model alignment" for full analysis
+- **Speech FM alignment — diagnostic-first design**: Motor cortex → speech FM mapping is untested (Dual Pathway validated STG only; Chang lab uses broad SMC+STG but never isolates motor contribution; Stavisky lab bypasses speech FMs for motor cortex). Our design: post-hoc linear probe on frozen E2 backbone → PCA-reduced HuBERT features (segment-level, MFA-aligned). If R² significant, add segment-level MSE aux loss as E13. Paired audio confirmed for all 8 patients. See `docs/archive/historical_supervised/future_directions.md` § "Speech foundation model alignment" for full analysis
 - **Articulatory knowledge is the highest bang-for-buck external source**: phonological feature vectors from linguistic databases, zero neural data needed, cross-patient invariant by construction
 - **Architecture patterns transfer without weights**: MRoPE, wav2vec framework, cross-attention, hierarchical CTC
 - **Internal SSL on ~3 hrs is borderline**: masked reconstruction preferred over contrastive (no negatives, MIBRAIN validated on raw broadband sEEG — NOT HGA). wav2vec ECoG is wav2vec **1.0** (CPC, not 2.0 — no quantizer). Minimum successful SSL corpus is ~30 min (participant b); our ~1 min/pt is 30x smaller. Per-patient input layer bottleneck: only ~10 min/patient vs wav2vec ECoG's 30-60 min/patient

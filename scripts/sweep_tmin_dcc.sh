@@ -17,6 +17,7 @@ cd /work/ht203/repo/speech
 
 PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
 export DEVICE=cuda
+export PYTHONUNBUFFERED=1
 
 echo "=== Starting sweep at $(date) ==="
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"

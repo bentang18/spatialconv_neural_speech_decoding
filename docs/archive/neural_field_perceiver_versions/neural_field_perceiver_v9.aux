@@ -1,0 +1,101 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Problem}{3}{section.1}\protected@file@percent }
+\newlabel{sec:problem}{{1}{3}{Problem}{section.1}{}}
+\newlabel{eq:observation}{{1}{3}{Problem}{equation.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Key Idea: Shared Neural Field + Reprojection}{3}{section.2}\protected@file@percent }
+\newlabel{sec:idea}{{2}{3}{Key Idea: Shared Neural Field + Reprojection}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Decomposition}{3}{subsection.2.1}\protected@file@percent }
+\newlabel{eq:decomposition}{{2}{3}{Decomposition}{equation.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}The factorization}{3}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:factorization}{{2.2}{3}{The factorization}{subsection.2.2}{}}
+\newlabel{eq:obs-function}{{3}{3}{The factorization}{equation.3}{}}
+\citation{singh2025}
+\citation{willett2023}
+\citation{metzger2023}
+\citation{bouchard2013}
+\citation{safaie2023}
+\citation{gallego2020}
+\citation{chen2025}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}The 3D vision analogy}{4}{subsection.2.3}\protected@file@percent }
+\newlabel{sec:analogy}{{2.3}{4}{The 3D vision analogy}{subsection.2.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Evidence and central hypothesis}{4}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Architecture}{5}{section.3}\protected@file@percent }
+\newlabel{sec:architecture}{{3}{5}{Architecture}{section.3}{}}
+\newlabel{eq:encoder}{{4}{5}{Architecture}{equation.4}{}}
+\newlabel{eq:implemented}{{5}{5}{Architecture}{equation.5}{}}
+\citation{mildenhall2020}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Overview}{6}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Electrode Tokens}{6}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:tokens}{{3.2}{6}{Electrode Tokens}{subsection.3.2}{}}
+\citation{fan2016}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Temporal Preprocessing}{7}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Virtual Electrodes}{7}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:virtual-electrodes}{{3.4}{7}{Virtual Electrodes}{subsection.3.4}{}}
+\citation{liu2022swinv2}
+\citation{shazeer2020}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Interleaved Spatiotemporal Blocks ($\times 2$)}{8}{subsection.3.5}\protected@file@percent }
+\newlabel{sec:interleaved}{{3.5}{8}{Interleaved Spatiotemporal Blocks ($\times 2$)}{subsection.3.5}{}}
+\citation{duraivel2025}
+\citation{carion2020}
+\citation{qi2017}
+\citation{zhao2021}
+\citation{lu2021}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Why Perceiver, not ViT or point-cloud methods?}{9}{subsection.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.7}Observation Decoder (${\sim }$25K params)}{9}{subsection.3.7}\protected@file@percent }
+\newlabel{sec:obs-decoder}{{3.7}{9}{Observation Decoder (${\sim }$25K params)}{subsection.3.7}{}}
+\citation{spalding2025}
+\newlabel{eq:bilinear}{{14}{10}{Observation Decoder (${\sim }$25K params)}{equation.14}{}}
+\newlabel{sec:cross-reproj}{{3.7}{10}{Observation Decoder (${\sim }$25K params)}{equation.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.8}Phoneme Decoder (${\sim }$5K classification + ${\sim }$17K readout)}{11}{subsection.3.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.9}Parameter Budget}{11}{subsection.3.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Training and Evaluation}{11}{section.4}\protected@file@percent }
+\newlabel{sec:training}{{4}{11}{Training and Evaluation}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Phase 1: Source training}{11}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Phase 2: Target adaptation (LP-FT)}{12}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Phase 3 (optional): Transductive reprojection pre-training}{12}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Evaluation regimes}{12}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}What Our Experiments Show}{12}{section.5}\protected@file@percent }
+\newlabel{sec:experiments}{{5}{12}{What Our Experiments Show}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Evaluation recipe matters more than architecture}{12}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Multi-scale temporal: largest isolated LOPO architectural gain}{12}{subsection.5.2}\protected@file@percent }
+\citation{duraivel2025}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}The ${\sim }0.76$ convergence}{13}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}SSL failed at this data scale}{13}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Ablation Plan}{13}{section.6}\protected@file@percent }
+\newlabel{sec:ablations}{{6}{13}{Ablation Plan}{section.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Priorities and Risks}{13}{section.7}\protected@file@percent }
+\newlabel{sec:priorities}{{7}{13}{Priorities and Risks}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Priority ordering}{13}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Success criteria}{14}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Risks}{14}{subsection.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Available Data}{14}{section.8}\protected@file@percent }
+\newlabel{sec:data}{{8}{14}{Available Data}{section.8}{}}
+\bibcite{singh2025}{1}
+\bibcite{willett2023}{2}
+\bibcite{metzger2023}{3}
+\bibcite{bouchard2013}{4}
+\bibcite{safaie2023}{5}
+\bibcite{gallego2020}{6}
+\bibcite{chen2025}{7}
+\bibcite{wu2025}{8}
+\bibcite{spalding2025}{9}
+\bibcite{duraivel2025}{10}
+\bibcite{wang2025}{11}
+\bibcite{xiong2024}{12}
+\bibcite{truong2023}{13}
+\bibcite{santos2023}{14}
+\bibcite{qi2017}{15}
+\bibcite{zhao2021}{16}
+\bibcite{mildenhall2020}{17}
+\bibcite{lu2021}{18}
+\bibcite{fan2016}{19}
+\bibcite{seitzer2022}{20}
+\bibcite{angelopoulos2021}{21}
+\bibcite{gal2016}{22}
+\bibcite{carion2020}{23}
+\bibcite{liu2022swinv2}{24}
+\bibcite{shazeer2020}{25}
+\gdef \@abspage@last{16}

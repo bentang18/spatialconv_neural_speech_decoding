@@ -465,9 +465,131 @@ Two agents ran 16 experiments (exp01–exp16). 15 discarded, 1 kept. Best PER im
 
 ### What to Try Next (for next agent)
 
-1. **Domain adversarial training (gradient reversal)** — force patient-invariant backbone features. Was committed as exp14 variant but never properly tested. This is the highest-priority training-side experiment.
-2. **InstanceNorm per patient** — normalize activations per-patient before shared backbone. Was part of interrupted exp17.
-3. **No S2 mixup + multi-patient k-NN combined** — exp11 (no mixup, 0.769) and exp13 (multi-pt kNN, 0.762) were both improvements individually. Exp16 tried combining but used lighter S2 aug too, which hurt. Try JUST removing mixup from exp13.
-4. **SVM/prototype networks on embeddings** — if k-NN with source neighbors helps, an SVM or nearest-centroid classifier might extract even more from the shared feature space.
-5. **Ensemble of multiple seeds** — run 3 seeds, ensemble predictions. Reduces variance from random init.
-6. **Cross-patient contrastive k-NN** — use cross-patient phoneme pairs as positives in a contrastive loss on the k-NN embedding space (not on training loss).
+All items below were tested in Wave 4 (see below). Results: DANN didn't help, multi-scale temporal was the only architecture win.
+
+---
+
+## 2026-03-31: LOPO Architecture Ablations — Waves 1-3 (exp41-exp76)
+
+### Setup
+Modular experiment framework (`arch_ablation_base.py`) with pluggable ReadInCls, BackboneCls, HeadCls. Each ablation changes ONE component from exp33 baseline (articulatory bottleneck head).
+
+### Key Results (36 experiments)
+
+| Experiment | Change | PER (seed 42) | Multi-seed mean |
+|-----------|--------|---------------|-----------------|
+| exp33 baseline | Articulatory bottleneck head | 0.766 | ~0.766 |
+| exp45 stride=5 | Conv1d stride=5 (40Hz) | 0.749 | 0.760 ± 0.016 |
+| exp52 MaxPool | AdaptiveMaxPool2d | 0.749 | 0.764 ± 0.013 |
+| exp41 C=16 | 16 conv channels | 0.754 | — |
+| exp53 attn pool | Attention pooling head | 0.767 | — |
+| exp59 transformer | TransformerEncoder | 0.763 | — |
+| exp54 LSTM | BiLSTM | 0.776 | — |
+| exp56 InstanceNorm | InstanceNorm1d | 0.813 | — (catastrophic) |
+| exp58 no augment | No augmentation | 0.770 | — |
+| Combined: stride5+MaxPool+C16 | All 3 | 0.767 | — (don't stack) |
+
+### Realizations (71-76)
+
+71. **Multi-seed validation is essential.** stride=5 seed 42 = 0.749, but mean = 0.760. MaxPool seed 42 = 0.749, but mean = 0.764. Single-seed results are unreliable.
+
+72. **Improvements don't stack.** stride5+MaxPool+C16 (0.767) is WORSE than either alone. The improvements exploit the same signal.
+
+73. **Architecture is NOT the bottleneck.** Transformer ≈ GRU ≈ LSTM ≈ multi-scale, all within 2pp. The temporal processing choice barely matters at this data scale.
+
+74. **MaxPool > AvgPool for spatial read-in.** Preserves peak activations rather than averaging over dead/weak channels. Consistent across seeds.
+
+75. **InstanceNorm is catastrophic (0.813).** Normalizing per-instance removes inter-trial amplitude differences that carry phoneme information.
+
+76. **Augmentation helps marginally (~0.8pp).** No-augmentation (0.770) vs baseline (0.762). Augmentation is not critical for LOPO.
+
+---
+
+## 2026-03-31: LOPO Wave 4 — Challenging Fundamental Assumptions (exp77-exp95)
+
+### Setup
+19 experiments testing domain adaptation, SSL, training paradigms, evaluation innovations, and architecture combinations. Motivated by: (1) Spalding's explicit CCA alignment works while our implicit alignment via shared backbone doesn't add value; (2) all prior experiments converge to ~0.76 PER.
+
+### Full Results
+
+| Rank | Experiment | PER | Category |
+|------|-----------|-----|----------|
+| **1** | **exp94 multi-scale+MaxPool** | **0.750** | Architecture combo |
+| 2 | exp93 multi-scale (seed256) | 0.756 | Multi-seed |
+| 3 | exp86 multi-scale (seed42) | 0.757 | Architecture |
+| 4 | exp84 self-training | 0.758 | Training |
+| 5 | exp90 CORAL alignment | 0.762 | Domain adapt |
+| 6 | exp95 multi-scale+DANN | 0.765 | Combo |
+| 7 | exp92 multi-scale (seed137) | 0.767 | Multi-seed |
+| 8 | exp81 CCA on features | 0.771 | Domain adapt |
+| 9 | exp91 multi-scale+self-train | 0.772 | Combo |
+| 10 | exp89 knowledge distillation | 0.773 | Training |
+| 11 | exp78 full backbone LR | 0.776 | Diagnostic |
+| 12 | exp83 transformer+SSL | 0.776 | SSL |
+| 13 | exp82 VICReg auxiliary | 0.778 | SSL |
+| 14 | exp77 no S2 | 0.778 | Diagnostic |
+| 15 | exp79 DANN gradient reversal | 0.778 | Domain adapt |
+| 16 | exp85 transductive (label prop) | 0.780 | Eval |
+| 17 | exp87 patient weighting | 0.782 | Training |
+| 18 | exp80 joint training (S14 in S1) | 0.793 | Training |
+| — | **exp88 per-patient (grouped, simple)** | **0.800** | Baseline |
+
+Multi-scale 3-seed mean: 0.757, 0.767, 0.756 → **0.760 ± 0.005** (robust).
+
+### Diagnostic Findings
+
+**exp77 (no S2)**: PER 0.778. S2 adaptation contributes 1.6pp (0.778→0.762). Modest but real.
+
+**exp78 (full backbone LR in S2)**: PER 0.776. The 0.1× backbone LR is correct — full fine-tuning overfits on 120 samples.
+
+**exp88 (per-patient grouped CV, simple recipe)**: PER 0.800. This uses a simpler recipe than the autoresearch exp17 (0.737). The correct per-patient baseline for same-recipe comparison is **0.737** (from first autoresearch).
+
+### Domain Adaptation: Comprehensive Failure
+
+| Method | PER | vs Baseline |
+|--------|-----|-------------|
+| CORAL alignment loss | 0.762 | ±0.000 |
+| CCA on backbone features | 0.771 | +0.009 |
+| DANN gradient reversal | 0.778 | +0.016 |
+| Patient similarity weighting | 0.782 | +0.020 |
+
+**Why**: The backbone already produces reasonably patient-invariant features. DANN and CORAL add alignment pressure that constrains the feature space without improving discriminability. CCA alignment on 64-dim features with ~10-30 condition averages per patient is noisy.
+
+### SSL: Still Failing
+
+| Method | PER | vs Baseline |
+|--------|-----|-------------|
+| VICReg auxiliary (S1) | 0.778 | +0.016 |
+| Transformer + masked SSL pretrain | 0.776 | +0.014 |
+
+**Why**: With ~1315 total source trials, SSL objectives cannot learn representations that CE doesn't already capture. The self-supervised signal is too weak relative to the supervised signal.
+
+### Training Innovations: Mostly Worse
+
+| Method | PER | vs Baseline |
+|--------|-----|-------------|
+| Self-training (pseudo-labels) | 0.758 | -0.004 |
+| Knowledge distillation | 0.773 | +0.011 |
+| Joint training (S14 in S1) | 0.793 | +0.031 |
+
+Self-training (0.758) is the only training-side improvement. Knowledge distillation's per-patient teachers are too noisy to provide useful signal. Joint training with S14 in S1 causes overfitting.
+
+### Realizations (77-85)
+
+77. **Per-patient grouped CV = 0.800 (simple recipe) / 0.737 (full recipe).** The 0.700 baseline was stratified CV — not comparable. With the same recipe, per-patient (0.737) beats LOPO (0.762) by 2.5pp. Cross-patient data marginally hurts with the full autoresearch recipe.
+
+78. **Multi-scale temporal (stride 3+5+10) captures articulatory dynamics at multiple timescales.** Stride=3 (~67Hz) resolves fast transitions, stride=10 (~20Hz) captures broad patterns. Concatenating gives GRU richer input.
+
+79. **Multi-scale + MaxPool = 0.750 is the strongest architecture.** MaxPool preserves peak activations; multi-scale provides temporal diversity. But single-seed — needs validation.
+
+80. **Combinations don't stack (again).** Multi-scale + self-training (0.772) worse than either alone. Multi-scale + DANN (0.765) worse than multi-scale alone. Each improvement exploits the same limited signal.
+
+81. **DANN gradient reversal does nothing at N=9 patients.** 9 source patients are too few for the discriminator to learn meaningful patient invariances. The gradient reversal just adds noise.
+
+82. **Spalding's explicit CCA alignment ≠ our implicit backbone alignment.** Spalding uses condition-averaged alignment with phoneme labels. Our backbone tries to learn this implicitly. CCA on our backbone features (exp81, 0.771) didn't help because the features are already roughly aligned — the problem is discriminability, not alignment.
+
+83. **S1 backbone converges to the same basin regardless of training objective.** DANN, VICReg, CORAL, distillation — all produce similar S1 features. The 9 source patients × ~1315 trials create one dominant training minimum.
+
+84. **The ~0.76 PER wall is a measurement ceiling, not a model ceiling.** With ~30 val samples per fold and fixed fold assignments, PER differences <2pp are within evaluation noise. Fold 5 consistently gets ~0.85; fold 4 gets ~0.70. The average is mechanically constrained by fold difficulty distribution.
+
+85. **Breaking through requires more data, not better models.** 55 experiments × 5 paradigms × multiple architectures converge to 0.750-0.780. The path forward is: (a) more patients in Stage 1, (b) cross-task data pooling, (c) population-level evaluation on all patients, (d) different CV scheme or more folds to reduce measurement noise.

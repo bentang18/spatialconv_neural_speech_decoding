@@ -1,0 +1,879 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\PassOptionsToPackage{dvipsnames,svgnames,x11names}{xcolor}
+\documentclass[
+]{article}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\setcounter{secnumdepth}{5}
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math} % this also loads fontspec
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+\usepackage{lmodern}
+\ifPDFTeX\else
+  % xetex/luatex font selection
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{bookmark}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\urlstyle{same}
+\hypersetup{
+  pdftitle={Neural Field Beta},
+  pdfauthor={Ben Tang \textbar{} Greg Cogan Lab, Duke University},
+  colorlinks=true,
+  linkcolor={NavyBlue},
+  filecolor={Maroon},
+  citecolor={Blue},
+  urlcolor={NavyBlue},
+  pdfcreator={LaTeX via pandoc}}
+
+\title{Neural Field Beta}
+\usepackage{etoolbox}
+\makeatletter
+\providecommand{\subtitle}[1]{% add subtitle to \maketitle
+  \apptocmd{\@title}{\par {\large #1 \par}}{}{}
+}
+\makeatother
+\subtitle{Minimum Viable Sequential Test of Coordinate-Aware
+Cross-Patient Transfer}
+\author{Ben Tang \textbar{} Greg Cogan Lab, Duke University}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+{
+\setcounter{tocdepth}{3}
+\tableofcontents
+}
+\section{Status}\label{status}
+
+This document is the \textbf{beta} version of the neural-field
+direction. Its purpose is not to realize the full Neural Field Perceiver
+at once. Its purpose is to test the smallest defensible version of the
+hypothesis:
+
+\begin{quote}
+\textbf{Minimum viable hypothesis.} Coarse anatomical coordinates
+improve cross-patient LOPO speech decoding when added to the current
+best-performing local spatial model, under the existing grouped-by-token
+evaluation protocol.
+\end{quote}
+
+The design is deliberately conservative. It preserves the current
+strongest LOPO recipe wherever possible and changes one thing at a time.
+
+\section{Why A Beta Document Exists}\label{why-a-beta-document-exists}
+
+The full \texttt{v10} design is much cleaner than \texttt{v9}, but it
+still bundles several unresolved bets:
+
+\begin{itemize}
+\tightlist
+\item
+  It introduces a new encoder family, new latent geometry, virtual
+  electrodes, attention-based readout, geometric correction, and two
+  reconstruction losses in one proposal.
+\item
+  It still relies on raw volumetric MNI geometry as the main spatial
+  scaffold, even though the broader project notes argue that MNI is
+  trustworthy mainly at coarse cross-patient scale, while local
+  within-patient structure should still come from the grid.
+\item
+  Its cross-patient reconstruction loss remains a weak and ambiguous
+  supervisory signal: same-token pairing plus full-trial averaging can
+  regularize, but it is not a clean first test of whether coordinates
+  help.
+\end{itemize}
+
+The beta design removes those confounds. If the coordinate hypothesis is
+real, the beta path should show it with far less architectural risk.
+
+\section{Design Principles}\label{design-principles}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Preserve the current LOPO winner unless a change is required to test
+  the hypothesis.
+\item
+  Use coordinates only at the scale where they are scientifically
+  defensible.
+\item
+  Keep local within-patient topology in the model.
+\item
+  Add no self-supervised or cross-patient reconstruction loss until
+  plain supervised coordinate conditioning shows signal.
+\item
+  Gate every additional mechanism on a prior positive result.
+\item
+  Judge success on \textbf{all patients}, not on S14 alone.
+\end{enumerate}
+
+\section{Non-Goals}\label{non-goals}
+
+This beta architecture explicitly does \textbf{not} try to test all of
+the following at once:
+
+\begin{itemize}
+\tightlist
+\item
+  Perceiver-style latent arrays
+\item
+  Virtual electrodes
+\item
+  Cross-patient reprojection
+\item
+  Trial-matched latent swapping
+\item
+  Patient embeddings in the encoder
+\item
+  Point-cloud attention as the first implementation
+\item
+  Full neural-field identifiability claims
+\end{itemize}
+
+If the beta path fails, that is evidence against the immediate value of
+the coordinate hypothesis in this data regime. It is not evidence that a
+larger transformer would have rescued it.
+
+\section{Anchor Model}\label{anchor-model}
+
+The anchor is the \textbf{current best LOPO pipeline}, unchanged except
+where the beta stages explicitly intervene:
+
+\begin{itemize}
+\tightlist
+\item
+  Existing grouped-by-token LOPO protocol
+\item
+  Existing multi-scale temporal frontend
+\item
+  Existing best local spatial read-in / pooling path
+\item
+  Existing articulatory bottleneck classification head
+\item
+  Existing LP-FT target adaptation regime
+\item
+  Existing evaluation recipe and reporting contract
+\end{itemize}
+
+This matters. The beta comparison must answer:
+
+\begin{quote}
+Does adding coarse anatomical information help \textbf{the model that
+already works best}, rather than a brand-new model family?
+\end{quote}
+
+\section{Core Architectural Decision}\label{core-architectural-decision}
+
+The beta architecture uses \textbf{dual spatial encoding}:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Local spatial structure} comes from the patient's native grid
+  topology, as in the current pipeline.
+\item
+  \textbf{Cross-patient spatial structure} comes from coarse anatomical
+  coordinates attached to each electrode.
+\end{itemize}
+
+This matches the project's theoretical framing:
+
+\begin{itemize}
+\tightlist
+\item
+  MNI is useful at coarse somatotopic scale.
+\item
+  Grid adjacency is useful at fine within-array scale.
+\item
+  Neither should be forced to do the other's job.
+\end{itemize}
+
+\section{Beta Architecture}\label{beta-architecture}
+
+\subsection{1. Inputs}\label{inputs}
+
+For patient \(i\), each trial provides:
+
+\begin{itemize}
+\tightlist
+\item
+  HGA grid \(X^{(i)} \in \mathbb{R}^{H_i \times W_i \times T}\)
+\item
+  Electrode-validity mask \(M^{(i)} \in \{0,1\}^{H_i \times W_i}\)
+\item
+  Static coordinate maps
+  \(C^{(i)} \in \mathbb{R}^{H_i \times W_i \times c_{\text{coord}}}\)
+\end{itemize}
+
+The coordinate channels are attached only at valid electrode locations.
+Dead grid positions remain zeroed.
+
+\subsection{2. Coordinate
+Representation}\label{coordinate-representation}
+
+The beta path uses \textbf{coarse coordinates only}.
+
+Stage-dependent coordinate variants:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{Beta-1}: standardized raw \((x, y, z)\) MNI channels
+\item
+  \texttt{Beta-2+}: coarse Fourier features with \(F = 3\), not
+  \(F = 4\)
+\end{itemize}
+
+Rationale:
+
+\begin{itemize}
+\tightlist
+\item
+  Raw XYZ is the simplest possible coordinate test.
+\item
+  \(F=3\) allows smooth coarse nonlinear spatial structure.
+\item
+  The finest \texttt{v10} Fourier scale is intentionally excluded from
+  the beta path because it pushes below plausible cross-patient
+  correspondence precision.
+\end{itemize}
+
+\subsection{3. Fusion Strategy}\label{fusion-strategy}
+
+The model remains grid-native. Coordinates are \textbf{added as static
+side channels}, not as a replacement for the grid model.
+
+For each trial:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\item
+  Broadcast coordinate channels across time.
+\item
+  Concatenate activity and coordinates:
+
+  \[
+  U^{(i)} = \mathrm{concat}\bigl(X^{(i)}, C^{(i)}_{\text{broadcast}}\bigr)
+  \]
+\item
+  Apply a shallow shared channel mixer:
+
+  \[
+  \tilde{U}^{(i)} = \mathrm{Conv2d}_{1 \times 1}(U^{(i)})
+  \]
+\item
+  Feed the mixed tensor into the \textbf{existing} local spatial read-in
+  path.
+\end{enumerate}
+
+Interpretation:
+
+\begin{itemize}
+\tightlist
+\item
+  The current model still learns local spatial filters on the patient's
+  array.
+\item
+  Coordinates tell the read-in what cortical zone each local pattern
+  likely belongs to.
+\item
+  The architecture never asks MNI to substitute for local grid
+  structure.
+\end{itemize}
+
+\subsection{4. Backbone and Decoder}\label{backbone-and-decoder}
+
+Backbone and phoneme decoder remain unchanged from the current LOPO
+winner.
+
+This is a hard rule of the beta design:
+
+\begin{itemize}
+\tightlist
+\item
+  no new temporal backbone
+\item
+  no new latent bottleneck
+\item
+  no new query readout
+\item
+  no new inference recipe
+\end{itemize}
+
+If coordinates help, they should help \textbf{before} a backbone
+rewrite.
+
+\section{Sequential Experiment
+Ladder}\label{sequential-experiment-ladder}
+
+\subsection{Beta-0: Population Anchor}\label{beta-0-population-anchor}
+
+\textbf{Question:} What is the true all-patient anchor under the current
+best LOPO recipe?
+
+Model:
+
+\begin{itemize}
+\tightlist
+\item
+  Current best LOPO architecture
+\item
+  No coordinates
+\item
+  No new losses
+\end{itemize}
+
+Purpose:
+
+\begin{itemize}
+\tightlist
+\item
+  Establish the population baseline
+\item
+  Quantify patient-wise variability
+\item
+  Prevent S14-specific overinterpretation
+\end{itemize}
+
+Gate:
+
+\begin{itemize}
+\tightlist
+\item
+  Required before any architectural conclusion
+\end{itemize}
+
+\subsection{Beta-1: Minimal Coordinate
+Injection}\label{beta-1-minimal-coordinate-injection}
+
+\textbf{Question:} Do coarse anatomical coordinates help at all?
+
+Model:
+
+\begin{itemize}
+\tightlist
+\item
+  Anchor model
+\item
+  Add standardized raw XYZ channels
+\item
+  Shared \texttt{1x1} fusion layer
+\item
+  No \(\Delta\), no \(\omega\), no reconstruction loss
+\end{itemize}
+
+This is the minimum viable test.
+
+Why this first:
+
+\begin{itemize}
+\tightlist
+\item
+  It isolates the value of coordinates without importing geometric
+  correction, latent inversion, or auxiliary supervision.
+\item
+  It preserves the local spatial inductive bias already validated by the
+  current model.
+\item
+  Failure here is highly informative: if raw coarse coordinates do not
+  help the current best model, the case for a much larger
+  coordinate-aware stack weakens substantially.
+\end{itemize}
+
+Primary comparison:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{Beta-1} vs \texttt{Beta-0}
+\end{itemize}
+
+Success gate:
+
+\begin{itemize}
+\tightlist
+\item
+  Mean PER improves by at least \texttt{3pp}
+\item
+  Effect sign is positive for a majority of patients
+\item
+  Paired patient-wise test passes the pre-registered threshold
+\end{itemize}
+
+Stop rule:
+
+\begin{itemize}
+\tightlist
+\item
+  If \texttt{Beta-1} fails, stop the coordinate path and prioritize data
+  pooling / evaluation fixes instead
+\end{itemize}
+
+\subsection{Beta-2: Lightweight Geometric
+Correction}\label{beta-2-lightweight-geometric-correction}
+
+\textbf{Question:} Is residual rigid misregistration the missing piece
+after plain coordinates?
+
+Model:
+
+\begin{itemize}
+\item
+  \texttt{Beta-1}
+\item
+  Add per-patient rigid correction on coordinates only:
+
+  \[
+  \tilde{\mathbf{p}}_j^{(i)} = R(\omega^{(i)})\,\mathbf{p}_j^{(i)} + \Delta^{(i)}
+  \]
+\item
+  Use strong regularization toward identity:
+
+  \[
+  \mathcal{L}_{\text{geom}} = \lambda_{\Delta}\|\Delta^{(i)}\|_2^2 + \lambda_{\omega}\|\omega^{(i)}\|_2^2
+  \]
+\end{itemize}
+
+Rules:
+
+\begin{itemize}
+\tightlist
+\item
+  Coordinates only are transformed
+\item
+  No patient embedding
+\item
+  No decoder-side patient code
+\end{itemize}
+
+Why this second:
+
+\begin{itemize}
+\tightlist
+\item
+  It directly tests whether the coordinate problem is mostly ``use
+  anatomy'' or ``correct anatomy.''
+\item
+  It is still low-dimensional and interpretable.
+\end{itemize}
+
+Primary comparison:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{Beta-2} vs \texttt{Beta-1}
+\end{itemize}
+
+Success gate:
+
+\begin{itemize}
+\tightlist
+\item
+  Consistent positive patient-wise effect
+\item
+  Learned transforms remain small and anatomically plausible
+\end{itemize}
+
+Stop rule:
+
+\begin{itemize}
+\tightlist
+\item
+  If transforms grow large or unstable, treat them as a failed
+  identifiability channel and remove them
+\end{itemize}
+
+\subsection{Beta-3: Coarse Nonlinear Coordinate
+Encoding}\label{beta-3-coarse-nonlinear-coordinate-encoding}
+
+\textbf{Question:} Are raw XYZ channels too linear to expose the
+coordinate signal?
+
+Model:
+
+\begin{itemize}
+\tightlist
+\item
+  Best of \texttt{Beta-1} / \texttt{Beta-2}
+\item
+  Replace raw XYZ with coarse Fourier features \(F=3\)
+\item
+  Keep the rest unchanged
+\end{itemize}
+
+Why this is third:
+
+\begin{itemize}
+\tightlist
+\item
+  It tests nonlinear spatial encoding only after raw coordinates have
+  shown some value
+\item
+  It avoids blaming Fourier engineering for failure of the underlying
+  hypothesis
+\end{itemize}
+
+Primary comparison:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{Beta-3} vs best prior beta stage
+\end{itemize}
+
+Success gate:
+
+\begin{itemize}
+\tightlist
+\item
+  Small but consistent incremental benefit
+\item
+  No evidence that performance gain comes only from one or two patients
+\end{itemize}
+
+\subsection{Beta-4: Within-Patient Masked Reconstruction
+Only}\label{beta-4-within-patient-masked-reconstruction-only}
+
+\textbf{Question:} Does a light reconstruction objective improve spatial
+robustness once supervised coordinate conditioning already works?
+
+Model:
+
+\begin{itemize}
+\tightlist
+\item
+  Best of \texttt{Beta-1} through \texttt{Beta-3}
+\item
+  Add a \textbf{within-patient only} masked-electrode reconstruction
+  head
+\item
+  Reconstruct held-out electrode activity from the same patient's
+  remaining electrodes
+\end{itemize}
+
+Loss:
+
+\[
+\mathcal{L} = \mathcal{L}_{\text{class}} + \lambda_{\text{recon}} \mathcal{L}_{\text{masked-recon}}
+\]
+
+Properties:
+
+\begin{itemize}
+\tightlist
+\item
+  No cross-patient trial pairing
+\item
+  No token matching
+\item
+  No patient latent swapping
+\item
+  No full neural-field decoder
+\end{itemize}
+
+Why this is the first auxiliary loss:
+
+\begin{itemize}
+\tightlist
+\item
+  It is operationally simple
+\item
+  It tests spatial interpolation robustness without creating a new
+  ambiguous cross-patient objective
+\item
+  It uses trustworthy within-patient structure before touching noisy
+  cross-patient reconstruction
+\end{itemize}
+
+Primary comparison:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{Beta-4} vs best prior beta stage
+\end{itemize}
+
+Stop rule:
+
+\begin{itemize}
+\tightlist
+\item
+  If reconstruction helps the auxiliary metric but not PER, remove it
+\end{itemize}
+
+\subsection{Beta-5: Escalation
+Threshold}\label{beta-5-escalation-threshold}
+
+Only after the above sequence should the project consider:
+
+\begin{itemize}
+\tightlist
+\item
+  virtual electrodes
+\item
+  point-set / Perceiver attention
+\item
+  cross-patient reprojection
+\item
+  patient-aware decoder terms
+\item
+  trial-swapped latent supervision
+\end{itemize}
+
+The escalation condition is:
+
+\begin{quote}
+Coordinates show clear population-level value in the beta path, but the
+remaining gap to the anchor still appears spatial rather than purely
+data-limited.
+\end{quote}
+
+\section{Why Cross-Patient Reprojection Is Excluded From
+Beta}\label{why-cross-patient-reprojection-is-excluded-from-beta}
+
+Cross-patient reprojection is not the minimum viable test because it
+adds several ambiguities at once:
+
+\begin{itemize}
+\tightlist
+\item
+  same-token matching can reward token templates
+\item
+  trial-level averaging discards temporal structure
+\item
+  cross-patient residuals are large and hard to interpret
+\item
+  failure is ambiguous: alignment problem, loss-noise problem, or
+  architecture problem
+\end{itemize}
+
+That loss may still be worth exploring later. It is not the right first
+experiment.
+
+\section{Training Protocol}\label{training-protocol}
+
+\subsection{Fixed Across Beta-0 Through
+Beta-4}\label{fixed-across-beta-0-through-beta-4}
+
+\begin{itemize}
+\tightlist
+\item
+  Same grouped-by-token splits
+\item
+  Same LOPO patient reporting
+\item
+  Same target adaptation regime
+\item
+  Same seeds
+\item
+  Same augmentation policy unless an ablation explicitly changes it
+\item
+  Same evaluation recipe
+\end{itemize}
+
+This is necessary because the current evidence shows recipe variance is
+already large enough to obscure small architecture effects.
+
+\subsection{Optimization Policy}\label{optimization-policy}
+
+\begin{itemize}
+\tightlist
+\item
+  Reuse the current optimizer and scheduler unless a stage introduces a
+  new parameter type
+\item
+  New geometric parameters use lower LR than backbone weights
+\item
+  Coordinate channels themselves are deterministic inputs, not learned
+  embeddings, until \texttt{Beta-3}
+\end{itemize}
+
+\section{Evaluation Contract}\label{evaluation-contract}
+
+Primary metric:
+
+\begin{itemize}
+\tightlist
+\item
+  Mean patient-wise PER under LOPO LP-FT
+\end{itemize}
+
+Required reporting:
+
+\begin{itemize}
+\tightlist
+\item
+  Per-patient PER table
+\item
+  Mean and median PER
+\item
+  Seed variance
+\item
+  Paired comparisons against the immediately previous beta stage
+\end{itemize}
+
+Secondary diagnostics:
+
+\begin{itemize}
+\tightlist
+\item
+  Whether gains concentrate in low-coverage or high-coverage patients
+\item
+  Whether gains are larger for displaced arrays
+\item
+  Whether rigid correction magnitude correlates with known registration
+  uncertainty
+\end{itemize}
+
+\section{Decision Logic}\label{decision-logic}
+
+\subsection{If Beta-1 Fails}\label{if-beta-1-fails}
+
+Interpretation:
+
+\begin{itemize}
+\tightlist
+\item
+  Coarse coordinates do not add enough value to the current best local
+  model in this regime
+\end{itemize}
+
+Action:
+
+\begin{itemize}
+\tightlist
+\item
+  Stop architecture escalation
+\item
+  Prioritize cross-task pooling and population evaluation
+\end{itemize}
+
+\subsection{If Beta-1 Works but Beta-2/Beta-3
+Fail}\label{if-beta-1-works-but-beta-2beta-3-fail}
+
+Interpretation:
+
+\begin{itemize}
+\tightlist
+\item
+  Coordinates help, but only in a simple coarse form
+\end{itemize}
+
+Action:
+
+\begin{itemize}
+\tightlist
+\item
+  Keep the simple coordinate-conditioned model
+\item
+  Do not escalate to the full Neural Field Perceiver
+\end{itemize}
+
+\subsection{If Beta-1 Through Beta-4 All
+Help}\label{if-beta-1-through-beta-4-all-help}
+
+Interpretation:
+
+\begin{itemize}
+\tightlist
+\item
+  The coordinate hypothesis is real and robust enough to justify larger
+  architectural investment
+\end{itemize}
+
+Action:
+
+\begin{itemize}
+\tightlist
+\item
+  Re-open the Perceiver / latent-field direction with much stronger
+  prior evidence
+\end{itemize}
+
+\section{Recommended Initial Build}\label{recommended-initial-build}
+
+If only one beta experiment is implemented first, it should be:
+
+\subsection{\texorpdfstring{\texttt{Beta-1}}{Beta-1}}\label{beta-1}
+
+\begin{itemize}
+\tightlist
+\item
+  Current best LOPO model
+\item
+  Add standardized XYZ coordinate channels
+\item
+  Shared \texttt{1x1} coordinate-activity fusion
+\item
+  No geometric correction
+\item
+  No reconstruction loss
+\item
+  Full all-patient evaluation
+\end{itemize}
+
+This is the cleanest first test of the hypothesis and the one least
+likely to produce uninterpretable failure.
+
+\section{Summary}\label{summary}
+
+The beta program asks one question at a time:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Do coordinates help at all?
+\item
+  If yes, does rigid correction help?
+\item
+  If yes, does coarse nonlinear encoding help?
+\item
+  If yes, does a simple within-patient reconstruction loss help?
+\item
+  Only then: is a larger field model justified?
+\end{enumerate}
+
+That sequence is scientifically stronger than starting with the full
+Neural Field Perceiver. It preserves the current best model, respects
+the actual reliability scale of MNI coordinates, and maximizes what can
+be learned from either a positive or a negative result.
+
+\end{document}
