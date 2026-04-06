@@ -309,7 +309,7 @@ The autoresearch eval improvements (weighted k-NN, TTA, articulatory head) shoul
    - Good: S22, S39, S58 (confirmed by visual inspection of sweep_v2 videos)
    - Poor: Others have 300-500ms offsets, misaligned phoneme boundaries, or missing phonemes
 
-4. **Decision: Full-trial CTC.** CTC on position-1 epochs (1.0s window) is robust to MFA errors — the window contains all 3 phonemes regardless of alignment quality. Per-position CE requires accurate segmentation, which fails for ~50% of patients.
+4. **Decision: Full-trial CTC.** CTC on position-1 epochs (1.0s window) is robust to MFA errors — the window contains all 3 phonemes regardless of alignment quality. Per-position CE requires accurate segmentation, which fails for 3/11 patients (S16, S22, S39). *[Corrected 2026-04-06: originally estimated ~50%, but per-phoneme sweep showed 8/11 have good MFA.]*
 
 ### Re-baseline: Production-Only Window + Grouped CV
 
@@ -646,7 +646,7 @@ Three DCC sweeps testing per-phoneme MFA epochs vs full-trial approaches. All on
 
 ### Findings
 
-86. **Per-phoneme MFA epochs strictly dominate full-trial approaches.** Across every comparison — simplified recipe, full recipe, all head types — per-phoneme epochs give ~4-6pp lower PER. Despite known MFA noise for ~50% of patients, for S14 the per-phoneme boundaries provide cleaner signal than any temporal readout from a full 1s window.
+86. **Per-phoneme MFA epochs strictly dominate full-trial approaches.** Across every comparison — simplified recipe, full recipe, all head types — per-phoneme epochs give ~4-6pp lower PER. MFA alignment is good for 8/11 patients; only S16/S22/S39 have poor alignment (per finding 101). Per-phoneme provides cleaner temporal locking than any learned readout from a full 1s window.
 
 87. **Flat head beats articulatory head for per-phoneme single-phoneme classification.** Per-phoneme flat (0.741) vs articulatory (0.772). The articulatory decomposition was designed as a regularizer for cross-patient transfer on phoneme sequences. For single-phoneme classification, it constrains the output space unnecessarily.
 

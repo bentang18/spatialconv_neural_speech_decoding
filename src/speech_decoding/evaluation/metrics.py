@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.metrics import balanced_accuracy_score, r2_score
 
-from speech_decoding.data.phoneme_map import index_to_phoneme
+
 from speech_decoding.training.ctc_utils import compute_per
 
 

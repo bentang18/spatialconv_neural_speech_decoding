@@ -3,7 +3,7 @@
 **Ben Tang | Greg Cogan Lab, Duke University | March 2026**
 **Collaborator: Zac Spalding**
 
-Synthesizes 18 papers (16 archived) on cross-patient speech decoding from intra-operative micro-ECoG. Goal: build decoders generalizing across ~20 patients (128/256-ch uECOG, ~20 min each, left sensorimotor cortex). See `implementation_plan.md` for the concrete design derived from this synthesis.
+Synthesizes 19 papers (16 archived) on cross-patient speech decoding from intra-operative micro-ECoG. Goal: build decoders generalizing across ~20 patients (128/256-ch uECOG, ~20 min each, left sensorimotor cortex). See `implementation_plan.md` for the concrete design derived from this synthesis.
 
 ---
 
@@ -24,6 +24,7 @@ Synthesizes 18 papers (16 archived) on cross-patient speech decoding from intra-
 | Dual Pathway 2025 | SSL + per-pt adaptors | ECoG | ~20 min/pt | Speech reconstruction | Within-patient | WER 18.9%, R²=0.824 |
 | Chen 2024 | None (per-patient) | ECoG sub | 400 trials/pt | 18 speech params | None | PCC 0.806; 3D ResNet >> LSTM; N=48 |
 | Chen 2025 (SwinTW) | MNI coordinate PE | ECoG sub + sEEG | 400 trials/pt | 18 speech params | Cross-patient | PCC 0.837 multi-pt = 0.831 individual; 0.765 LOO; N=52 |
+| Mentzelopoulos 2024 (seegnificant) | RBF PE on MNI + spatial self-attn | sEEG | 3600+ trials | Reaction time | Cross-subject | R²=0.39 multi-subj vs 0.30 single; PE ΔR²=-0.02 (NS); per-subj heads ΔR²=-0.18; N=21 |
 | Duraivel 2023 | None (baselines) | uECOG | ~15 min | 9 phonemes | None | 71% vowel, 50% phoneme |
 | Duraivel 2025 | None (SVD-LDA) | SEEG/ECoG/uECOG | 52+3 pts | 9 phonemes (CVC/VCV pseudo-words) | None | 93% syllable, 38.3% phoneme; planning→execution dynamics |
 | Qian 2025 | None (single patient) | HD-ECoG 256-ch (3mm) | ~9 hrs / 11 days | 394 Mandarin syllables | None | 71.2% syllable acc; 49.7 CPM real-time |
@@ -89,7 +90,7 @@ Most methods operate at the **input** level (per-patient layers). The **output t
 | **Learned linear read-in** (Boccato, Levin) | 8k–21k | No | Yes | Yes | **Phase 2 default.** Task-driven, handles variable channels |
 | **Conv1D per-patient** (Singh) | ~98k+ | No | Yes | Yes | Heavy. Linear read-in achieves same purpose |
 | **Conv2d on grid** (engineering) | 80–664 | No | No | No | **Phase 3.** Conv2d factorization matches rigid-array physics (uniform within-array, variable across arrays). Learned spatial deblurring + orientation adaptation. 15–25mm placement offsets kill diagonal scaling. Depth/channels/pool empirical (E13) |
-| **Coordinate PE** (**Chen 2025 SwinTW**) | 0 | Yes | **Yes (Chen 2025)** | **Yes** | Phase 3. Chen 2025: PCC 0.765 LOO on ECoG speech (N=52) |
+| **Coordinate PE** (**Chen 2025 SwinTW, seegnificant**) | 0 | Yes | **Yes (Chen 2025, seegnificant)** | **Yes** | Phase 3. Chen 2025: PCC 0.765 LOO (N=52). **Caveat: seegnificant PE ΔR²=-0.02, p=0.73 (NOT significant)** — spatial self-attention does the heavy lifting, not PE |
 | **Region prototypes** (MIBRAIN) | Per-region | Yes | Yes | No | Not applicable — our patients all cover same cortical patch |
 | **SSL pretraining** (wav2vec, BIT) | Backbone | No | Partial | Yes | Phase 3. ~3 hrs borderline; masked > contrastive |
 | **Articulatory TCA** (Wu) | Regression | No | Cross-speaker | Indirect | Phase 3 as auxiliary loss. Free alignment signal |
@@ -114,6 +115,8 @@ Most methods operate at the **input** level (per-patient layers). The **output t
 2. **Supervised joint training works IF per-patient layers filter variation first.** Singh: group PER 0.49 vs single 0.57 (25 patients). BIT's Table 9 confirms SSL ≈ supervised for same-subject — the SSL advantage is specifically in the cross-subject regime. BIT's cross-subject supervised failure is at N=2 with heterogeneous setups; Singh's supervised success is at N=25 with per-patient layers.
 3. **Boccato's "mostly diagonal" does NOT apply to uECOG.** Utah arrays have fixed stereotactic placement and orientation — variation is mostly per-channel gain. uECOG has variable surgical placement, variable orientation (electrode (1,1) is not anatomically consistent), and two different grid sizes (8×16, 12×22). Cross-patient variation includes spatial remapping, not just gain. Verify via SVD of learned weights.
 4. **Freeze backbone, train read-in + readout is the optimal transfer mode.** Singh's Mode 3 ("Recurrent Transfer").
+5. **Per-subject heads are the most critical component in multi-subject decoding.** Seegnificant ablation: removing per-subject heads ΔR²=-0.18 (devastating). Spatial self-attention is #2 (ΔR²=-0.10). PE barely helps (ΔR²=-0.02, p=0.73 NOT significant). This calibrates expectations: coordinate PE is NOT the primary mechanism for handling electrode variability — attention itself is. Per-patient capacity (2,081 params/subject in seegnificant vs our 70) may be a critical gap.
+6. **Factored attention (temporal then spatial) outperforms joint 2D attention.** Seegnificant: +0.06 R² and 5.5× faster. Validates v12's factored design (spatial cross-attention → temporal self-attention).
 
 ### External Knowledge Paths
 

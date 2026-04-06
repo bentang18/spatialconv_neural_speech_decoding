@@ -16,7 +16,7 @@ from speech_decoding.data.augmentation import augment_from_config
 from speech_decoding.data.bids_dataset import BIDSDataset
 from speech_decoding.models.assembler import assemble_model
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 from speech_decoding.training.ctc_utils import ctc_loss, per_position_ce_loss
 

@@ -73,7 +73,7 @@ Contact diameter & 200\,$\mu$m & 200\,$\mu$m \\
 \end{tabular}
 \end{table}
 
-\textbf{Task.} Non-word repetition (intra-operative, no delay --- patients repeat immediately after hearing stimulus): 52 CVC/VCV tokens, 9 phonemes, 3 positions per token. Output: three 9-way classifications per trial. Epochs are per-phoneme, locked to each phoneme's production onset via MFA. We use the production-only window ($t_{\min}{=}0.0$, $t_{\max}{=}1.0$\,s relative to response onset) to exclude auditory activation from the stimulus.
+\textbf{Task.} Non-word repetition (intra-operative, no delay --- patients repeat immediately after hearing stimulus): 52 CVC/VCV tokens, 9 phonemes, 3 positions per token. Output: three 9-way classifications per trial. Epochs are per-phoneme, locked to each phoneme's production onset via MFA ($t_{\min}{=}{-}0.15$, $t_{\max}{=}0.5$\,s). MFA alignment is good for 8/11 patients; 3 patients (S16, S22, S39) have 300--500\,ms offsets and use full-trial fallback.
 
 \textbf{Cross-patient challenge.} Arrays are offset 15--25\,mm in MNI space with variable rotation. Channel indices are meaningless across patients. Current LOPO achieves PER\,=\,0.762 (S14, grouped-by-token CV) using a per-patient Conv2d read-in that ignores electrode coordinates entirely. 55 architecture/training experiments converge to PER 0.750--0.780, suggesting a systematic barrier.
 
@@ -129,12 +129,15 @@ Everything else in the architecture --- temporal attention, classification head,
 Per patient $i$:
 \begin{itemize}[leftmargin=2em]
 \item $\Delta^{(i)} \in \R^3$, $\omega^{(i)} \in \R^3$: translation and rotation of MNI coordinates (6 params). Absorbs systematic registration error. L2-regularized ($10^{-3}$), init at $\mathbf{0}$.
-\item $e^{(i)} \in \R^{64}$: patient embedding entering \textbf{only} the reconstruction decoder. Absorbs impedance, gain, tissue differences. During training, dropped to $\mathbf{0}$ with $p{=}0.5$ so the decoder learns to reconstruct without patient identity (matching zero-shot test conditions).
+\item $W^{(i)} \in \R^{d \times d}$, $b^{(i)} \in \R^d$: per-patient input projection ($d^2 + d$ params). Applied to each electrode token after shared Conv1d temporal binning. Absorbs impedance, gain, tissue conductivity, and electrode-surface coupling differences. Initialized to identity + zero bias so the model starts at the shared solution. \textbf{Motivated by:} every successful cross-patient system has per-patient input capacity (BIT: ${\sim}$6M/pt Conv2d; Willett: 65.8K/day affine; Levin: 262K/session; Singh: per-patient Conv1D; seegnificant: per-subject heads are the \#1 ablation component at $\Delta R^2 = -0.18$).
+\item $e^{(i)} \in \R^{64}$: patient embedding entering \textbf{only} the reconstruction decoder. During training, dropped to $\mathbf{0}$ with $p{=}0.5$ so the decoder learns to reconstruct without patient identity (matching zero-shot test conditions).
 \end{itemize}
 
-Total: 70 learnable params per patient. The encoder sees \textbf{no patient identity} --- only electrode coordinates and activity. This forces the latent representation into a patient-agnostic spatial frame.
+Total at $d{=}64$: ${\sim}$4.2K learnable params per patient (6 geometric + 4{,}160 input projection + 64 decoder embedding). The encoder sees patient identity \textit{only} through the input projection --- electrode coordinates and activity are otherwise processed by the shared backbone.
 
-\textcolor{BrickRed}{\textit{Position leakage:}} At $N{=}10$, each patient's electrode positions trivially identify them. The benefit of withholding $e$ from the encoder is not preventing memorization but improving transfer: position-conditioned processing generalizes to new positions; embedding-conditioned processing does not.
+\textcolor{BrickRed}{\textit{Capacity calibration:}} 4.2K/pt $\times$ 10 patients = 42K per-patient params total, ${\sim}$37\% of the shared backbone at $B{=}1$. This is far below BIT (6M/pt) and Willett (65.8K/day) but appropriate for our 10-patient, 1{,}300-trial regime. A15 ablates this down to 70 params/pt to test whether the projection is needed or whether coordinates alone suffice.
+
+\textcolor{BrickRed}{\textit{Patient identity in encoder:}} The per-patient projection $W^{(i)}$ gives the encoder explicit patient identity, but only in the form of a signal normalization (identity-initialized). This matches field consensus (BIT, Willett, Singh, seegnificant all use per-patient input layers). At $N{=}10$, electrode positions alone trivially identify patients anyway; the projection simply provides a principled pathway for absorbing measurement variation. The reconstruction decoder also receives $e^{(i)}$ for impedance-dependent reconstruction; $e$ is dropped to $\mathbf{0}$ with $p{=}0.5$ during training.
 
 
 %% ====================================================================
@@ -181,10 +184,12 @@ Total: 70 learnable params per patient. The encoder sees \textbf{no patient iden
 
 For electrode $j$ on patient $i$, at temporal bin $t'$:
 \begin{equation}
-\text{token}_j(t') = \underbrace{\text{Conv1d}(d_j;\; k{=}10,\, s{=}10)_{t'}}_{\text{activity (time-varying)}} + \underbrace{\text{Linear}\bigl(\gamma(\tilde{\bfp}_j)\bigr)}_{\text{position (constant)}} + \underbrace{\text{sinPE}(t')}_{\text{temporal index}}
+\text{token}_j(t') = \underbrace{W^{(i)} \text{Conv1d}(d_j;\; k{=}10,\, s{=}10)_{t'} + b^{(i)}}_{\text{per-patient projected activity}} + \underbrace{\text{Linear}\bigl(\gamma(\tilde{\bfp}_j)\bigr)}_{\text{position (constant)}} + \underbrace{\text{sinPE}(t')}_{\text{temporal index}}
 \end{equation}
 
 \textbf{Temporal binning.} Per-electrode Conv1d($1 \to d$, $k{=}10$, $s{=}10$): non-overlapping 50\,ms windows at 200\,Hz $\to$ $T' \approx 20$ tokens. Shared weights across all electrodes and patients. Matches field standard (Spalding, Willett: 20\,Hz effective rate). Our BiGRU experiments show stride\,=\,5 (40\,Hz) $\approx$ stride\,=\,10 (20\,Hz); test as ablation.
+
+\textbf{Per-patient input projection.} The shared Conv1d output is projected through a per-patient affine: $W^{(i)} x + b^{(i)}$, $W^{(i)} \in \R^{d \times d}$, initialized to identity. This absorbs per-patient gain, impedance, and tissue differences before the shared backbone sees the tokens. Functionally analogous to Willett's per-day affine layer and BIT's per-subject read-in.
 
 \textbf{Fourier PE ($F{=}3$).} Calibrated MNI coordinates $\tilde{\bfp}_j = R(\omega^{(i)}) \bfp_j + \Delta^{(i)}$, standardized so the speech motor region spans $[-1, 1]$ per axis:
 \begin{equation}
@@ -220,7 +225,9 @@ Standard scaled dot-product attention plus a learnable isotropic distance bias $
 
 \textbf{Block internals.} Pre-LN residual connections, ReLU FFN ($d_\text{ff} = 4d$), dropout $p{=}0.2$, DropPath $p{=}0.1$.
 
-\textbf{Electrode masking.} During training, 50\% of electrodes are excluded from KV for all time steps. The reconstruction loss is still computed at masked positions, forcing spatial interpolation.
+\textbf{Electrode masking (spatial).} During supervised training, 50\% of electrodes are excluded from KV for all time steps. The reconstruction loss is still computed at masked positions, forcing spatial interpolation.
+
+\textbf{Temporal masking (SSL only).} For self-supervised pretraining (Section~\ref{sec:ssl}), contiguous spans of temporal patches are replaced with a learnable mask token. This forces the model to predict neural activity at masked time positions from surrounding context --- learning temporal dynamics rather than spatial interpolation. Motivated by BIT~\cite{zhang2026bit}, which showed temporal masking is the appropriate SSL objective for speech decoding. Both masking types can coexist: spatial masking for reconstruction loss, temporal masking for SSL.
 
 
 \subsection{Reconstruction decoder}\label{sec:recon-decoder}
@@ -249,11 +256,11 @@ Computed over all electrodes including masked ones. Gradient flows back through 
 
 Mean-pool across $L$ virtual electrodes: $s_\text{pool}(t') = \frac{1}{L}\sum_\ell s_\ell(t')$.
 
-\textbf{Temporal readout.} The data provides per-phoneme MFA epochs, but MFA alignment is unreliable for ${\sim}50\%$ of patients (300--500\,ms offsets observed). We therefore use \textbf{full-trial input} ($t_\text{min}{=}0.0$, $t_\text{max}{=}1.0$\,s, all 3 phonemes in one sample) with learned temporal attention queries --- one per phoneme position --- matching our current pipeline:
-\begin{equation}
-\bfz_p = \sum_{t'} \text{softmax}_{t'}\!\bigl(q_p \cdot s_\text{pool}(t') / \sqrt{d}\bigr) \;\cdot\; s_\text{pool}(t'), \qquad p \in \{1,2,3\}
-\end{equation}
-Each $q_p \in \R^d$ is a learned query. Position 1's query learns to attend to early frames, position 3's to late frames. This handles unequal phoneme durations without relying on MFA boundaries. Validated at PER\,=\,0.737 (per-patient, S14).
+\textbf{Per-phoneme MFA input (default).} Each trial is split into 3 per-phoneme epochs locked to MFA onset ($t_\text{min}{=}{-}0.15$, $t_\text{max}{=}0.5$\,s). Each epoch yields a single 9-way classification. Temporal readout: global mean pool $\to$ linear head. This triples the labeled samples and anchors each label to the correct temporal context.
+
+\textbf{Empirical support:} Per-phoneme MFA beats learned temporal attention by 6\,pp (PER 0.734 vs.\ 0.797) and wins on 8/11 patients (+4.0\,pp population mean). The 3 patients where full-trial wins (S16, S22, S39) have poor MFA alignment (300--500\,ms offsets); these patients use full-trial fallback. \textbf{A21} ablates full-trial with learned attention queries as an alternative.
+
+\textbf{Trial-aware batching.} Consecutive per-phoneme epochs from the same trial share ${\sim}$85\% temporal overlap (mean inter-phoneme gap: 80--130\,ms). Batches are stratified so that epochs from the same trial do not appear in both train and validation within a fold. This prevents leakage from temporal autocorrelation.
 
 Per position, dual head:
 \begin{equation}
@@ -261,7 +268,7 @@ Per position, dual head:
 \end{equation}
 $A \in \R^{9 \times 15}$: fixed articulatory feature matrix. $\tau$: learnable temperature.
 
-$\mathcal{L}_\text{class} = \frac{1}{3}\sum_p \text{FocalCE}(\text{logits}_p, y_p;\; \gamma{=}2,\; \text{LS}{=}0.1)$ with mixup ($\alpha{=}0.2$).
+$\mathcal{L}_\text{class} = \text{FocalCE}(\text{logits}_p, y_p;\; \gamma{=}2,\; \text{LS}{=}0.1)$ with mixup ($\alpha{=}0.2$).
 
 
 \subsection{Parameter budget}
@@ -280,15 +287,17 @@ Reconstruction decoder & ${\sim}$5K & Shared & Position-aware linear \\
 Phoneme heads ($\times 3$) & ${\sim}$5K & Shared & Dual CE + artic \\
 \midrule
 $\Delta^{(i)} + \omega^{(i)}$ & 6/pt & Per-patient & Registration correction \\
+$W^{(i)}, b^{(i)}$ & ${\sim}$4.2K/pt & Per-patient & Input projection (identity init) \\
 $e^{(i)}$ & 64/pt & Per-patient & Decoder only \\
 \midrule
-\textbf{Total ($B{=}1$)} & $\mathbf{{\sim}112}$\textbf{K} & & Comparable to current BiGRU \\
-\textbf{Total ($B{=}2$)} & $\mathbf{{\sim}212}$\textbf{K} & & $1.8\times$ current \\
+\textbf{Shared ($B{=}1$)} & $\mathbf{{\sim}112}$\textbf{K} & & Comparable to current BiGRU \\
+\textbf{Shared ($B{=}2$)} & $\mathbf{{\sim}212}$\textbf{K} & & $1.8\times$ current \\
+\textbf{Per-patient ($\times$10)} & $\mathbf{{\sim}42}$\textbf{K} & & 4.2K/pt, ${\sim}$37\% of shared at $B{=}1$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textcolor{BrickRed}{\textit{Capacity concern:}} 112--212K params on ${\sim}$1,300 trials. Mitigated by: electrode masking (50\%), reconstruction loss (${\sim}2.6$M targets vs.\ 3.9K classification labels), dropout, early stopping. $B{=}1$ is the safe default; $B{=}2$ only if $B{=}1$ underfits.
+\textcolor{BrickRed}{\textit{Capacity concern:}} 154--254K total params (shared + per-patient) on ${\sim}$1,300 trials. Per-patient projection adds 42K params, but these are identity-initialized and absorb measurement variation (not content), so effective capacity increase is modest. Mitigated by: electrode masking (50\%), reconstruction loss (${\sim}2.6$M targets vs.\ 3.9K classification labels), dropout, early stopping. $B{=}1$ is the safe default; $B{=}2$ only if $B{=}1$ underfits.
 
 
 %% ====================================================================
@@ -319,7 +328,99 @@ Per fold of 5-fold grouped-by-token CV on target patient:
 
 
 %% ====================================================================
-%%  SECTION 5: ABLATIONS
+%%  SECTION 4.5: SSL PRETRAINING
+%% ====================================================================
+
+\section{Self-Supervised Pretraining}\label{sec:ssl}
+
+SSL pretraining on continuous (unlabeled) neural recordings addresses the fundamental data bottleneck: ${\sim}$1{,}300 labeled trials vs.\ 456\,min of raw continuous EDF across 29 patients. The design below is informed by BIT~\cite{zhang2026bit} (ICLR 2026, SOTA on Brain-to-Text with 367\,h pretraining) and adapted to our $\mu$ECoG regime.
+
+\subsection{Why temporal masking, not spatial}
+
+Our supervised reconstruction loss (Section~\ref{sec:recon-decoder}) masks \textit{electrodes} and predicts spatial activity --- this teaches the model to interpolate across space. For SSL, we instead mask \textit{time} and predict temporal activity. The rationale:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Speech is temporal.} Phonemes are articulatory gestures evolving over ${\sim}$50--200\,ms. A model that predicts ``what happens next in this neural sequence'' learns speech dynamics. A model that predicts ``what's the activity at a masked electrode'' learns spatial smoothness --- useful but not speech-specific.
+\item \textbf{BIT validates this.} BIT uses temporal span masking (up to 300\,ms) with MSE reconstruction on 367\,h of Utah array data. The pretrained encoder achieves SOTA PER (14.39\% T12) and transfers to imagined speech. Supervised cross-subject pretraining \textit{fails} (Appendix M), but SSL cross-subject pretraining helps.
+\item \textbf{The two objectives complement.} Spatial reconstruction (supervised, Section~\ref{sec:recon-decoder}) teaches cross-patient electrode alignment. Temporal reconstruction (SSL, this section) teaches speech dynamics. Both can coexist in v12.
+\end{itemize}
+
+\subsection{SSL objective: masked temporal patch reconstruction}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Input.} Continuous HGA at 200\,Hz, windowed into ${\sim}$2\,s segments (400 samples). The same tokenization as supervised: per-electrode shared Conv1d $\to$ per-patient input projection $\to$ $d$-dimensional electrode tokens per time step.
+\item \textbf{Temporal patching.} Group every $P{=}10$ time steps (50\,ms) into one patch $\to$ $T'{=}40$ patches/segment. Each patch token: $d$-dim mean over $P$ frames per electrode.
+\item \textbf{Span masking.} Replace contiguous spans of patches with a learnable mask token $m \in \R^d$, maintaining a target mask ratio of 50\%. Maximum span length: 6 patches (300\,ms). Following BIT, masked spans are drawn to maintain the overall ratio while allowing variable-length spans.
+\item \textbf{Encoder.} v12's spatial cross-attention + temporal self-attention blocks process the partially masked sequence (both masked and unmasked tokens).
+\item \textbf{Reconstruction.} A reversed linear projection maps encoder outputs back to original patch dimensionality. MSE loss on masked positions only:
+\begin{equation}
+\mathcal{L}_{\text{SSL}} = \frac{1}{|\mathcal{M}|} \sum_{t' \in \mathcal{M}} \|x_{t'} - \hat{x}_{t'}\|^2
+\end{equation}
+where $\mathcal{M}$ is the set of masked patch indices.
+\item \textbf{Validation.} $R^2$ on held-out reconstruction (not downstream PER) for checkpoint selection during pretraining.
+\end{enumerate}
+
+\subsection{Per-patient layers during SSL}
+
+Following BIT, each patient gets \textbf{separate read-in and read-out layers} for SSL, while the transformer backbone is shared. This is critical: different patients have different electrode layouts, different numbers of channels, different impedance profiles. The per-patient input projection (Section~\ref{sec:tokens}, $W^{(i)}x + b^{(i)}$) absorbs these differences before the shared backbone sees the data.
+
+\textcolor{BrickRed}{\textit{Architectural consistency note:}} BIT uses per-patient Conv2d on raw grids. Our supervised v12 uses shared per-electrode Conv1d + per-patient Linear projection (enabling coordinate-based tokenization). For SSL, we keep the same architecture: shared Conv1d $\to$ per-patient projection $\to$ Fourier PE $\to$ shared blocks. This ensures clean weight transfer from SSL to supervised. The per-patient SSL reconstruction head (Linear($d \to d_{\text{patch}}$)) is the only component discarded at transfer.
+
+\begin{table}[ht!]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{During SSL} & \textbf{During supervised} \\
+\midrule
+Shared Conv1d + per-patient $W^{(i)}, b^{(i)}$ & Same as supervised & Same \\
+Fourier PE + Linear & Shared & Same \\
+Spatial/temporal blocks & Shared & Same \\
+SSL reconstruction head & Per-patient Linear($d \to d_{\text{patch}}$) & Removed \\
+Spatial reconstruction decoder & Not used & Shared (Sec.~\ref{sec:recon-decoder}) \\
+Phoneme heads & Not used & Shared \\
+$\Delta^{(i)}, \omega^{(i)}, e^{(i)}$ & Learned during SSL & Transferred or reset \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Data augmentation for SSL}\label{sec:ssl-augment}
+
+BIT uses heavier augmentation during pretraining than typical supervised training. Our existing augmentation module (\texttt{augmentation.py}) provides the right primitives, but SSL-specific tuning is needed:
+
+\begin{table}[ht!]\centering\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Augmentation} & \textbf{Supervised default} & \textbf{SSL recommendation} \\
+\midrule
+White noise (additive) & \texttt{noise\_frac}$\,{=}\,$0.02 & \textbf{0.10--0.20} (BIT: SD=0.2) \\
+Constant offset (per-trial) & --- & \textbf{0.05--0.10} (BIT: SD=0.05; Willett: 0.2) \\
+Amplitude scaling (per-electrode) & \texttt{amp\_scale\_std}$\,{=}\,$0.15 & \textbf{0.15--0.25} \\
+Time shift & \texttt{time\_shift\_frames}$\,{=}\,$20 & \textbf{0} (continuous data, no onset) \\
+Channel dropout & \texttt{channel\_dropout\_max}$\,{=}\,$0.2 & \textbf{0.1} (less aggressive; temporal masking is the main regularizer) \\
+Gaussian smoothing (temporal) & --- & \textbf{width=2.0} (BIT uses this; smooths high-freq noise) \\
+Temporal stretch & Disabled & \textbf{Disabled} (continuous data, no utterance structure) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key differences from supervised augmentation:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{No time shift.} SSL operates on continuous windows, not aligned epochs. Random windowing provides implicit time shift.
+\item \textbf{Heavier noise.} SSL must learn robust representations from noisy data. BIT uses $5{-}10\times$ more noise than our supervised default.
+\item \textbf{Add constant offset.} Per-trial additive constant simulates baseline drift. New augmentation: \texttt{x += N(0, offset\_std\textsuperscript{2})}. Not in current \texttt{augmentation.py} but trivial to add.
+\item \textbf{Add Gaussian smoothing.} Temporal smoothing with width=2.0 reduces high-frequency noise while preserving speech-relevant dynamics ($<$100\,Hz).
+\end{itemize}
+
+\subsection{SSL training recipe}
+
+\textbf{Pretraining data.} 456\,min raw continuous EDF across 29 patients (13 PS + 17 Lexical, zero patient overlap). Requires HGA extraction first (CAR $\to$ 70--150\,Hz filterbank $\to$ Hilbert $\to$ 200\,Hz $\to$ z-score). \textcolor{BrickRed}{Blocked on HGA extraction pipeline for raw EDF (not yet implemented).}
+
+\textbf{Training.} AdamW, lr=$5 \times 10^{-4}$, weight decay $10^{-5}$, batch 64, cosine decay. Use bfloat16 mixed precision if available. Checkpoint selection: best validation $R^2$ on reconstruction.
+
+\textbf{Transfer.} After SSL, discard the SSL reconstruction head. Transfer: shared Conv1d, per-patient $W^{(i)}/b^{(i)}$, Fourier PE, spatial/temporal blocks, $\Delta/\omega/e$. Initialize the supervised reconstruction decoder (Section~\ref{sec:recon-decoder}) and phoneme heads from scratch. Fine-tune with Phase 1 (source training) then Phase 2 (target adaptation) as before.
+
+
+%% ====================================================================
+%%  SECTION 6: ABLATIONS
 %% ====================================================================
 
 \section{Ablation Plan}\label{sec:ablations}
@@ -345,11 +446,67 @@ A10 & $B \in \{1, 2\}$ & Block count / capacity \\
 A11 & $F \in \{2, 3, 4\}$; Linear PE & PE resolution \\
 A12 & $e$ in encoder vs decoder-only & Patient identity split \\
 A13 & Cross-task data (Duraivel 2025) & Data quantity vs architecture \\
+A14 & Spatial self-attn (no VEs) & seegnificant-style: electrodes attend directly, MLP compress to fixed size \\
+A15 & No input projection & Remove per-patient Linear($d \to d$): 70 params/pt vs.\ default ${\sim}$4.2K/pt \\
+A16 & Per-patient output head & Add per-patient Linear($d \to 9$) (${\sim}$600/pt) on top of default \\
+A17 & Per-patient input + output & Default A15 input + A16 output (${\sim}$4.8K/pt total) \\
+\midrule
+A18 & SSL pretrained (temporal mask) & BIT-style SSL $\to$ fine-tune vs.\ training from scratch \\
+A19 & SSL + spatial recon & SSL temporal masking + supervised spatial reconstruction \\
+A20 & Spatial masking only (SSL) & Electrode masking for SSL (our original) vs.\ temporal masking (A18) \\
+A21 & Full-trial + learned attn & Full-trial input ($t{=}0$--$1$\,s) + 3 learned temporal queries vs.\ default per-phoneme MFA \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \textbf{A1--A6 are the core experiment.} Each row adds exactly one component. If A3 $\approx$ A2, coordinates don't help and the paper's hypothesis is wrong. If A4 $\approx$ A3, reconstruction loss doesn't help and we drop it. Clean isolation.
+
+
+\subsection{Insights from seegnificant~\cite{mentzelopoulos2024}}\label{sec:seegnificant}
+
+Mentzelopoulos et al.\ (NeurIPS 2024) solve the closest problem to ours in the literature: multi-subject neural decoding with variable electrode counts and positions, using MNI-based positional encoding and transformers. Key differences in regime:
+
+\begin{table}[ht!]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+& \textbf{seegnificant (sEEG)} & \textbf{Ours ($\mu$ECoG)} \\
+\midrule
+Modality & Depth electrodes (sEEG) & Surface grid ($\mu$ECoG) \\
+Topology & Sparse, scattered 3D & Dense 2D grid, 1.3--1.7\,mm pitch \\
+Electrodes/subject & 3--28 & 63--201 \\
+Subjects & 21 (29 sessions) & 10--11 \\
+Trials & 3{,}600+ & ${\sim}$1{,}300 \\
+Task & Reaction time (regression) & 9-phoneme classification \\
+Spatial scale & Whole-brain distributed & Focal vSMC (${\sim}$20$\times$40\,mm) \\
+Params & 797K (753K shared) & ${\sim}$112K \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Their architecture:} per-electrode 1D Conv tokenizer ($K{=}2$), then alternating temporal self-attention and spatial self-attention ($\times L$ blocks), with RBF PE on MNI coordinates added before spatial attention. Per-subject regression heads (2{,}081 params each). No virtual electrodes, no reconstruction loss.
+
+Three findings directly inform our ablation plan:
+
+\textbf{(A) Spatial self-attention among real electrodes is their \#2 component ($\Delta R^2 = -0.10$ when ablated).} They use spatial \textit{self-attention} among all electrodes; we use \textit{cross-attention} from virtual electrodes to real electrodes. The approaches are complementary:
+\begin{itemize}[leftmargin=2em]
+\item \textit{Self-attention} (theirs): electrodes attend to each other directly. More flexible. But does not produce a fixed-size output --- they compress via MLP.
+\item \textit{Cross-attention to VEs} (ours): forces information through 10 fixed anatomical bottlenecks. Fixed-size $L \times d$ output by construction. More constrained, more interpretable.
+\end{itemize}
+At our electrode counts (63--201), self-attention is still trivial: $201^2 \approx 40$K entries. \textbf{A14} tests their architecture on our data: per-electrode tokens + Fourier PE + spatial self-attention + MLP compression. No virtual electrodes. If A14 $\geq$ A3, VEs add complexity without benefit and should be dropped.
+
+\textbf{(B) Per-subject heads are critical ($\Delta R^2 = -0.18$ when ablated).} Their per-subject regression head is 2{,}081 params each. Our v12 default now includes a per-patient input projection (${\sim}$4.2K/pt), closing the gap with the literature (seegnificant: 2K/subject, Willett: 65.8K/day, Levin: 262K/session). Three ablations diagnose where per-patient capacity is needed:
+\begin{itemize}[leftmargin=2em]
+\item \textbf{A15} (remove input projection): ablate to 70 params/pt (6 geometric + 64 decoder embedding). Tests whether coordinates alone suffice without per-patient signal normalization. If A15 $\approx$ default, the projection is unnecessary.
+\item \textbf{A16} (add output head): per-patient Linear($d \to 9$) classification head (${\sim}$600/pt) on top of the default input projection. Tests whether the shared backbone produces truly patient-agnostic representations, or whether the neural-to-phoneme mapping varies per patient.
+\item \textbf{A17} (both): default input projection + A16 output head (${\sim}$4.8K/pt total). Maximum per-patient capacity. Risk: $N{=}10$ patients may allow memorization.
+\end{itemize}
+If A15 drops substantially, the projection is load-bearing (variability is in measurement). If A16 helps further, the ``phoneme features are universal'' assumption is wrong.
+
+\textbf{(C) PE provides only $\Delta R^2 = -0.02$ (p\,=\,0.73, not significant).} This is a calibration warning: in their 21-subject, 3{,}600-trial setup, MNI positional encoding barely helps. However, their task (reaction time from widely distributed sEEG) is different from ours (phoneme classification from focal somatotopic cortex). Position should matter \textit{more} for somatotopic discrimination (tongue vs lip M1 are ${\sim}$5\,mm apart) than for distributed reaction time networks. Additionally, their spatial self-attention can implicitly discover spatial relationships from signal correlations even without PE. Our A3 vs A2 ablation will settle this empirically.
+
+\textbf{What this does \textit{not} change:} Fourier PE is validated as equivalent to RBF PE (both $R^2 = 0.39$). Factored time/space attention beats joint 2D ($\Delta R^2 = +0.06$, $5.5\times$ faster). Per-electrode Conv1d tokenization is validated. The shared-backbone + per-subject-adaptation paradigm is validated.
+
+\textcolor{BrickRed}{\textit{Topology caveat:}} sEEG electrodes are sparse points scattered in 3D (no local grid structure to exploit). $\mu$ECoG electrodes are a dense 2D grid with known precise local topology (1.3--1.7\,mm pitch). Their architecture deliberately avoids 2D conv because sEEG has no grid. For us, the grid is real and Conv2d exploits it --- the question is whether per-electrode tokenization with MNI PE (discarding the grid) outperforms Conv2d (exploiting the grid). This is the A1 vs A2/A3 comparison.
 
 
 %% ====================================================================
@@ -361,11 +518,15 @@ A13 & Cross-task data (Duraivel 2025) & Data quantity vs architecture \\
 \subsection{Priority ordering}
 
 \begin{enumerate}[leftmargin=2em]
-\item \textbf{Cross-task data pooling (A13).} Lowest risk. Same phonemes, overlapping patients~\cite{duraivel2025}. Directly addresses data scarcity. Works with any architecture.
+\item \textbf{Coordinate architecture (A1--A6).} The central bet. Highest novelty.
 
-\item \textbf{Population-level evaluation (A7).} Methodology fix. Required to know if we have a real effect.
+\item \textbf{SSL pretraining (A18--A20).} Unlocks 456\,min of continuous data. \textcolor{BrickRed}{Blocked on HGA extraction.} Once unblocked, BIT-style temporal masking is the proven approach. Lower risk than architecture because the SSL backbone \textit{is} the v12 architecture.
 
-\item \textbf{Coordinate architecture (A1--A6).} Highest novelty, highest risk. The central bet.
+\item \textbf{Per-patient capacity (A15--A17).} Default now includes input projection (${\sim}$4.2K/pt), matching literature consensus. A15 ablates down to test if coordinates alone suffice. Low risk, high diagnostic value.
+
+\item \textbf{Cross-task data pooling (A13).} Same phonemes, overlapping patients~\cite{duraivel2025}. Directly addresses data scarcity. Works with any architecture.
+
+\item \textbf{Population-level evaluation (A7).} Required to know if we have a real effect.
 \end{enumerate}
 
 \subsection{Hard gate}
@@ -390,6 +551,10 @@ MNI too noisy ($>10$\,mm) & High & $\Delta/\omega$ calibration; $F{=}2$ \\
 Recon competes with classification & Med & $\lambda$ sweep (A8); $\lambda{=}0$ \\
 212K params overfits 1{,}300 trials & Med & $B{=}1$ (112K); masking; early stop \\
 Coords don't help (A3 $\approx$ A2) & Med & Paper becomes ``Perceiver for uECOG'' \\
+VEs add no value over self-attn (A14 $\geq$ A3) & Med & Drop VEs, use seegnificant-style spatial self-attn \\
+Per-patient capacity too high for $N{=}10$ & Low & A15: ablate down to 70 params/pt; monitor train-val gap \\
+SSL data too small (7.6\,h vs BIT's 367\,h) & Med & 15$\times$ threshold; augmentation; lower mask ratio \\
+HGA extraction pipeline not ready & High & \textcolor{BrickRed}{Blocked} --- must implement EDF $\to$ HGA before SSL \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -450,6 +615,16 @@ Individual variability in functional connectivity architecture of the human brai
 Fan, L., et al.\ (2016).
 The Human Brainnetome Atlas.
 \textit{Cerebral Cortex}, 26(8), 3508--3526.
+
+\bibitem{mentzelopoulos2024}
+Mentzelopoulos, G., et al.\ (2024).
+Neural decoding from stereotactic EEG: accounting for electrode variability across subjects.
+\textit{Advances in Neural Information Processing Systems}, 38 (NeurIPS 2024).
+
+\bibitem{zhang2026bit}
+Zhang, Y., He, L., et al.\ (2026).
+A cross-species neural foundation model for end-to-end speech decoding.
+\textit{ICLR 2026}. arXiv:2511.21740.
 
 \end{thebibliography}
 

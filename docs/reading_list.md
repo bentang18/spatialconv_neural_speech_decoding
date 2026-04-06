@@ -1,6 +1,6 @@
 # Reading List — Cross-Patient uECOG Speech Decoding
 
-Read in order. Each paper teaches something the next one builds on. (10 papers)
+Read in order. Each paper teaches something the next one builds on. (11 papers)
 
 ---
 
@@ -77,7 +77,14 @@ Follow-up to Chen 2024. Replaces grid-dependent architectures with SwinTW: indiv
 
 **You need this for:** Phase 3.1 (coordinate PE variant) and Phase 3 spatial architecture decisions. The **untested hybrid** — coordinate PE + per-patient read-in — is a strong novel contribution candidate. Key caveat: validated on 1cm-spaced standard ECoG, not uECOG (<2mm). At uECOG resolution, coordinates may matter less than local spatial structure.
 
-### 10. Wu 2025 — Articulatory features as alignment targets
+### 10. Mentzelopoulos 2024 (seegnificant) — Multi-subject sEEG with PE ablation
+`pastwork/summaries/mentzelopoulos2024_seegnificant.md` · [NeurIPS 2024](https://gmentz.github.io/seegnificant)
+
+First scalable multi-subject sEEG decoder. Per-electrode Conv tokenizer → factored temporal + spatial self-attention → MLP compress → per-subject regression heads. RBF PE on MNI coordinates. Multi-subject R²=0.39 vs single R²=0.30. **Critical ablation: per-subject heads are #1 (ΔR²=-0.18), spatial attention #2 (ΔR²=-0.10), PE barely helps (ΔR²=-0.02, p=0.73).** Factored > joint 2D (+0.06 R², 5.5× faster). 21 subjects, 3–28 electrodes each, reaction time regression.
+
+**You need this to understand:** why per-patient capacity matters (A15/A16/A17 ablations), why spatial self-attention among real electrodes is a strong alternative to VE cross-attention (A14), and why coordinate PE should be treated as uncertain until empirically validated on our data. The sEEG vs uECOG topology difference (sparse 3D vs dense 2D grid) is a fundamental caveat.
+
+### 11. Wu 2025 — Articulatory features as alignment targets
 `pastwork/summaries/wu2025_articulatory_reconstruction.md`
 
 Articulatory features extracted via TCA from EMA data, reconstructed from HD-ECoG with PCC 0.75–0.80 across 8 speakers. Articulatory dynamics are cross-speaker invariant because all humans share the same articulators.

@@ -1,5 +1,6 @@
-# Data directories (large BIDS datasets)
+# Data directories (large BIDS datasets + patient electrode data)
 BIDS_1.0_*/
+data/
 *.fif
 *.edf
 *.mat

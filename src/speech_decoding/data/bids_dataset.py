@@ -13,12 +13,13 @@ import mne
 import numpy as np
 from torch.utils.data import Dataset
 
-from speech_decoding.data.grid import GridInfo, channels_to_grid, load_grid_mapping
+from speech_decoding.data.grid import channels_to_grid, load_grid_mapping
 from speech_decoding.data.phoneme_map import (
     ARPA_PHONEMES,
     encode_ctc_label,
     normalize_label,
 )
+from speech_decoding.data.sig_channels import detect_artifact_channels
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,30 @@ class BIDSDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, list[int], str]:
         return self.grid_data[idx], self.ctc_labels[idx], self.patient_id
+
+
+def _exclude_artifact_channels(
+    data: np.ndarray,
+    ch_names: list[str],
+    subject: str,
+    abs_threshold: float = 10.0,
+    min_trial_fraction: float = 0.05,
+) -> list[str]:
+    """Zero out chronic artifact channels in-place. Returns excluded names."""
+    artifact_mask, spike_rates = detect_artifact_channels(
+        data, abs_threshold=abs_threshold, min_trial_fraction=min_trial_fraction,
+    )
+    n_excluded = int(artifact_mask.sum())
+    if n_excluded == 0:
+        return []
+    excluded = [ch_names[i] for i in range(len(ch_names)) if artifact_mask[i]]
+    data[:, artifact_mask, :] = 0.0
+    logger.info(
+        "%s: excluded %d artifact channels (>%g std in >%.0f%% trials): %s",
+        subject, n_excluded, abs_threshold, min_trial_fraction * 100,
+        excluded[:5] if n_excluded > 5 else excluded,
+    )
+    return excluded
 
 
 def _find_fif_path(
@@ -83,6 +108,7 @@ def load_patient_data(
     tmin: float | None = None,
     tmax: float | None = None,
     filter_ps_only: bool = False,
+    exclude_artifacts: bool = False,
 ) -> BIDSDataset:
     """Load a single patient's HGA data as a grid-shaped CTC dataset.
 
@@ -96,6 +122,8 @@ def load_patient_data(
         tmax: End of time crop. None = use full.
         filter_ps_only: If True, keep only trials where ALL phonemes are in
             the 9-phoneme PS set (for cross-task with Lexical).
+        exclude_artifacts: If True, zero out chronic artifact channels
+            (electronic noise >10 std in >5% of trials).
 
     Returns:
         BIDSDataset with grid-shaped data and CTC labels.
@@ -113,6 +141,10 @@ def load_patient_data(
         epochs = epochs.crop(tmin=crop_tmin, tmax=crop_tmax)
 
     all_data = epochs.get_data()  # (n_total_epochs, n_ch, n_times)
+
+    # Exclude artifact channels before any further processing
+    if exclude_artifacts:
+        _exclude_artifact_channels(all_data, epochs.ch_names, subject)
     all_event_ids = epochs.events[:, 2]
     inv_event_id = {v: k for k, v in epochs.event_id.items()}
     ch_names = epochs.ch_names
@@ -180,6 +212,7 @@ def load_per_position_data(
     desc: str = "productionZscore",
     tmin: float | None = None,
     tmax: float | None = None,
+    exclude_artifacts: bool = False,
 ) -> BIDSDataset:
     """Load per-position epochs: each phoneme position as a separate sample.
 
@@ -205,6 +238,11 @@ def load_per_position_data(
         epochs = epochs.crop(tmin=crop_tmin, tmax=crop_tmax)
 
     all_data = epochs.get_data()  # (n_total_epochs, n_ch, n_times)
+
+    # Exclude artifact channels before any further processing
+    if exclude_artifacts:
+        _exclude_artifact_channels(all_data, epochs.ch_names, subject)
+
     all_event_ids = epochs.events[:, 2]
     inv_event_id = {v: k for k, v in epochs.event_id.items()}
     ch_names = epochs.ch_names
