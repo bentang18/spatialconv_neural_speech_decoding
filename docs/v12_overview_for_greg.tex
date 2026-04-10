@@ -1,0 +1,218 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ── Packages ──────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{fancyvrb}
+
+% ── Formatting ────────────────────────────────────────────
+\hypersetup{colorlinks=true, linkcolor=NavyBlue, citecolor=NavyBlue, urlcolor=NavyBlue}
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\setlength{\parskip}{0.6em}
+
+\begin{document}
+
+% ── Title ─────────────────────────────────────────────────
+\begin{center}
+{\LARGE\bfseries Cross-Patient Speech Decoding:\\[4pt]A Foundation Model Approach}\\[12pt]
+{\normalsize Ben Tang \quad\textbar\quad Cogan Lab, Duke University \quad\textbar\quad April 2026}
+\end{center}
+
+\medskip\noindent\rule{\textwidth}{0.4pt}\medskip
+
+
+%% ====================================================================
+\section{The Problem}
+%% ====================================================================
+
+We have intra-operative \textmu ECoG recordings from ${\sim}$10 patients during a non-word repetition task (52 CVC/VCV tokens, 9 phonemes). Each patient has a thin-film electrode array on left sensorimotor cortex---128 or 256 channels at 1.3--1.7\,mm pitch. The goal: decode the 3-phoneme sequence the patient is saying from neural activity.
+
+The fundamental challenge is that \textbf{every patient's array sits in a different place}. Arrays are offset 15--25\,mm from each other in standardized brain coordinates, with variable rotation. Channel 47 in Patient A records from a completely different patch of cortex than channel 47 in Patient B.
+
+This means we can't simply pool data across patients---the spatial correspondence doesn't exist at the electrode level. Current approaches either train separate models per patient (missing shared structure) or use linear alignment methods like PCA+CCA (Spalding 2025, 31\% balanced accuracy)---a reasonable first pass, but one that doesn't exploit the spatial correspondence between arrays.
+
+\textbf{What we want:} A single model trained on all patients that outperforms individual per-patient models, and that can be quickly calibrated to a new patient with minimal data.
+
+
+%% ====================================================================
+\section{The Insight}
+%% ====================================================================
+
+Think of each patient's electrode array as a \textbf{camera pointed at the brain from a slightly different angle}. Each camera sees a partial, noisy view of the same underlying scene---the neural dynamics of speech production. The scene is shared; the viewpoints differ.
+
+In computer vision, multi-view reconstruction solves exactly this: given images from different cameras, recover the 3D scene. The recipe is:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Calibrate each camera} (intrinsics/extrinsics)
+    \item \textbf{Define sample points} in 3D space where you want to reconstruct
+    \item \textbf{Aggregate information} from whichever cameras can see each point
+\end{enumerate}
+
+We do the same thing with brains:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Per-patient calibration}---a small set of learned parameters (182 per patient) that absorb differences in signal gain/impedance and electrode registration error. This is the ``camera calibration.''
+
+    \item \textbf{Virtual electrodes (VEs)}---16 fixed positions in standardized brain space, chosen from a neuroanatomical atlas (Brainnetome, derived from 40 healthy subjects). These positions correspond to known speech-relevant regions: tongue motor cortex, face motor cortex, Broca's area, auditory cortex, etc. These are the ``3D sample points.''
+
+    \item \textbf{Cross-attention}---each virtual electrode ``looks at'' the real electrodes nearby and extracts a weighted summary. Electrodes close to a VE contribute more (distance bias), and the model learns \textit{what} to extract from them (shared attention weights). This is the ``multi-view aggregation.''
+\end{enumerate}
+
+The result: every patient's variable-count, variable-position electrode array gets mapped into the \textbf{same 16-dimensional functional space}. A tongue motor cortex VE always represents tongue motor cortex activity, regardless of which patient's electrodes contributed to it.
+
+
+%% ====================================================================
+\section{Why This Should Work}
+%% ====================================================================
+
+Three lines of evidence:
+
+\subsection*{1.~Speech motor cortex has conserved organization across people}
+
+The gross layout---lips, jaw, tongue, larynx arranged along the cortical surface---is the same in every human (Breshears 2015, $n{=}33$; Bouchard 2013; Roux 2020). The \textit{ordinal} arrangement is invariant; the \textit{absolute positions} vary by 5--15\,mm. Our architecture handles this: the atlas provides the average positions, and per-patient offsets (leashed to ${\leq}$15\,mm) adapt to individual anatomy.
+
+\subsection*{2.~Multiple independent groups have converged on this design}
+
+At least 5 groups have independently arrived at Perceiver-style cross-attention bottlenecks for multi-patient intracranial data:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{MIBRAIN} (Wu 2025)---sEEG, cross-patient consonant decoding via atlas region mapping
+    \item \textbf{BarISTA} (Oganesian 2025, NeurIPS)---atlas-level encoding beats channel-level by 8--10 percentage points
+    \item \textbf{Charmander} (Mahato 2025, NeurIPS WS)---Perceiver bottleneck for multi-patient iEEG
+    \item \textbf{POYO} (Azabou 2023, NeurIPS)---motor decoding across 7 monkeys
+    \item \textbf{Population Transformer} (Chau 2025, ICLR)---cross-patient sEEG with coordinate encoding
+\end{itemize}
+
+None has applied this to \textmu ECoG speech, and none combines atlas-grounded positions with per-patient adaptation---but the convergence validates the core mechanism.
+
+\subsection*{3.~Scale without spatial mechanism fails}
+
+The Brant family of models (Zhang 2023, NeurIPS) trained on up to 40,000 hours of intracranial data with up to 1 billion parameters---and fails at cross-patient speech decoding. NDT3 (Ye 2025) used 2,000 hours with 350M parameters and found cross-subject transfer fundamentally limited by sensor variability. These are the clearest negative results in the field: \textbf{raw scale is insufficient}. You need an explicit mechanism to handle electrode placement variation.
+
+
+%% ====================================================================
+\section{The Architecture}
+%% ====================================================================
+
+\begin{Verbatim}[frame=single, fontsize=\small]
+Raw HGA signal (per electrode, 200 Hz)
+  → Temporal binning (Conv1d, 50ms windows)
+  → Per-patient gain/offset normalization (128 params/patient)
+  → Add spatial identity (Fourier encoding of MNI coordinates)
+  → VE cross-attention (16 atlas positions, distance-biased)
+  → 2 blocks of [spatial self-attention + temporal self-attention]
+  → Autoregressive decoder: predict phoneme 1, then 2, then 3
+\end{Verbatim}
+
+\textbf{${\sim}$175,000 shared parameters. 182 per-patient parameters.}
+
+For context: BIT (the Utah array foundation model, Zhang 2026) uses ${\sim}$7 million parameters and 6 million per patient. Willett's clinical system uses ${\sim}$66,000 per session. We use 182.
+
+The per-patient parameters do three things:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Signal normalization} (128 params): absorbs impedance/gain differences. Initialized from each patient's channel statistics---starts as z-scoring, learns residual corrections.
+    \item \textbf{Coordinate correction} (6 params): a small rigid translation + rotation of the electrode positions, absorbing systematic registration error (${\sim}$4--8\,mm from surgical reconstruction).
+    \item \textbf{VE position offsets} (48 params): shifts each of the 16 atlas positions by up to 15\,mm to match the patient's individual somatotopy.
+\end{itemize}
+
+Everything else---the attention weights, the temporal processing, the decoder---is shared across all patients. The shared weights learn \textit{what speech activity looks like}; the per-patient weights learn \textit{where to find it in this patient}.
+
+
+%% ====================================================================
+\section{Training Plan}
+%% ====================================================================
+
+\subsection*{Phase 1 (immediate): Supervised cross-patient training on our data}
+
+Train on $N{-}1$ patients, evaluate on the held-out patient. Establish whether the architecture produces a useful cross-patient model at all. Compare against the per-patient baseline (PER\,=\,0.734 on our best patient, S14).
+
+This phase requires no new data---just implementation and compute on DCC.
+
+\subsection*{Phase 2 (contingent on data access): Foundation model with external pretraining}
+
+This is where the project becomes a foundation model paper. The idea:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Pretrain} on a large corpus of chronic ECoG speech recordings using self-supervised learning (predict masked neural activity). No phoneme labels needed---just raw neural data during speech.
+    \item \textbf{Fine-tune} on our labeled CoganLab data (per-patient, 46--178 trials each).
+\end{enumerate}
+
+The architecture is \textbf{modality-agnostic}---it treats any intracranial recording as ``electrodes with positions and time series.'' This means we can pretrain on clinical ECoG (10\,mm electrode spacing) and fine-tune on our research \textmu ECoG (1.3\,mm spacing). The VE bottleneck abstracts away electrode density.
+
+\textbf{This cross-density transfer is the unique story no other lab can tell alone.}
+
+
+%% ====================================================================
+\section{What We Need: External Data}
+%% ====================================================================
+
+The single highest-leverage action is obtaining external chronic ECoG speech data for pretraining. Two sources:
+
+\textbf{Priority 1: Flinker/Chen lab (NYU).} 48 patients, chronic epilepsy monitoring ECoG, speech production tasks. Code is already public (Chen 2024, \textit{Nature Machine Intelligence}). Data available upon request with a standard sharing agreement. This is a straightforward PI-to-PI data request.
+
+\textbf{Priority 2: Chang lab (UCSF).} ${\sim}$15--25 patients, high-density 256-channel ECoG, speech production. Papers state ``data available from corresponding author.'' This is better framed as a \textbf{collaboration}: three institutions (Duke, NYU, UCSF) contributing three electrode densities (1.3\,mm, 10\,mm, 4\,mm) to build the first cross-density intracranial foundation model. Each lab needs the others to tell the cross-density story.
+
+Combined, this would give us ${\sim}$50--100 hours of diverse speech-related neural data for pretraining---100$\times$ more than our CoganLab data alone.
+
+\textbf{Without external data}, we fall back to pretraining on our own smaller corpus (${\sim}$24 hours of CoganLab sEEG + \textmu ECoG). The architecture still works, but the paper becomes a methods paper instead of a foundation model paper.
+
+
+%% ====================================================================
+\section{The Paper}
+%% ====================================================================
+
+\textbf{Title direction:} \textit{Neural Field Perceiver: A Foundation Model for Intracranial Field Potentials}
+
+\textbf{Core claim:} The first foundation model for intracranial high-gamma activity (HGA). BIT (Zhang 2026) built a foundation model for Utah array spikes; we do the same for field potentials. These are fundamentally different signals---HGA reflects postsynaptic potentials (inputs to cortex), spikes reflect action potentials (outputs). Different biophysics, different clinical modalities, no existing foundation model.
+
+\textbf{Key results we expect to show:}
+
+\begin{enumerate}[leftmargin=2em]
+    \item Cross-patient v12 beats per-patient baselines (the architecture works)
+    \item Performance scales with number of patients (the pooling works)
+    \item Atlas-grounded VEs beat learned latents at small $N$ (the atlas prior matters)
+    \item SSL pretraining shifts the calibration curve left (fewer trials needed per new patient)
+    \item Cross-density transfer works (clinical ECoG pretraining helps research \textmu ECoG)
+\end{enumerate}
+
+\textbf{Worst case:} If nothing transfers, that's still a publishable negative result showing why intracranial field potential foundation models are hard. The systematic evaluation (8 experiment phases, ${\sim}$44 controlled ablations) would be the most thorough investigation of cross-patient intracranial transfer to date.
+
+
+%% ====================================================================
+\section{Current Status}
+%% ====================================================================
+
+\begin{itemize}[leftmargin=2em]
+    \item Architecture fully designed (22-page technical design document)
+    \item Per-patient baseline established (PER\,=\,0.734, S14)
+    \item 55 prior cross-patient experiments characterizing the problem
+    \item All electrode coordinates verified and mapped to MNI space (11 patients)
+    \item 16 atlas positions selected and validated for patient reachability
+    \item DCC compute ready (8$\times$ RTX 5000 Ada)
+\end{itemize}
+
+\textbf{Immediate blockers:}
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{External data request}---Greg needs to initiate PI-to-PI contact with Flinker (NYU) and/or Chang (UCSF).
+    \item \textbf{Nonlinear MNI normalization}---current coordinate transform is linear-only (${\sim}$5--15\,mm residual error). If T1 MRIs exist, ANTs nonlinear warp could halve this. Need to check with Zac.
+    \item \textbf{Implementation}---architecture is designed but not yet coded. Estimate ${\sim}$2 weeks to first training run on DCC.
+\end{enumerate}
+
+
+%% ====================================================================
+\section*{Summary}
+%% ====================================================================
+
+Each patient's electrode array is a partial view of shared speech motor dynamics. We use anatomical atlas positions to define a common coordinate system, map each patient's electrodes into that space via cross-attention, and learn shared temporal representations that transfer across patients. 175K shared parameters, 182 per patient. The architecture is validated by convergent independent work from 5+ groups. What's missing is scale---and that requires data from other labs.
+
+
+\end{document}

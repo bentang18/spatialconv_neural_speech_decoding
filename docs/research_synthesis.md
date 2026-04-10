@@ -3,7 +3,7 @@
 **Ben Tang | Greg Cogan Lab, Duke University | March 2026**
 **Collaborator: Zac Spalding**
 
-Synthesizes 19 papers (16 archived) on cross-patient speech decoding from intra-operative micro-ECoG. Goal: build decoders generalizing across ~20 patients (128/256-ch uECOG, ~20 min each, left sensorimotor cortex). See `implementation_plan.md` for the concrete design derived from this synthesis.
+Synthesizes 46 papers on cross-patient speech decoding from intra-operative micro-ECoG. Goal: build decoders generalizing across ~20 patients (128/256-ch uECOG, ~20 min each, left sensorimotor cortex). See `implementation_plan.md` for the concrete design derived from this synthesis.
 
 ---
 
@@ -28,10 +28,36 @@ Synthesizes 19 papers (16 archived) on cross-patient speech decoding from intra-
 | Duraivel 2023 | None (baselines) | uECOG | ~15 min | 9 phonemes | None | 71% vowel, 50% phoneme |
 | Duraivel 2025 | None (SVD-LDA) | SEEG/ECoG/uECOG | 52+3 pts | 9 phonemes (CVC/VCV pseudo-words) | None | 93% syllable, 38.3% phoneme; planning→execution dynamics |
 | Qian 2025 | None (single patient) | HD-ECoG 256-ch (3mm) | ~9 hrs / 11 days | 394 Mandarin syllables | None | 71.2% syllable acc; 49.7 CPM real-time |
+| PopT (Chau 2025) | 3D PE + self-attn | sEEG | 55.5h / 10 pts | Binary detection | Cross-subject | 0.93 AUC speech; PE critical; discriminative > recon SSL |
+| Neuro-MoBRE (Wu 2025) | Region MoE + region embed | sEEG | Same as MIBRAIN | 23-class + multi-task | Cross-subject | 28.26% initial; 43.41% tone; T16-512 collapses |
+| H2DiLR (Wu 2025) | Per-pt VQ encoder + shared codebook | sEEG | 4 pts | 4-class tone | Cross-subject | 43.67% tone; 1.55M/pt; shared codes cluster by class |
+| BrainBERT (Wang 2023) | Per-electrode SSL (no spatial) | sEEG | 43.7h / 10 pts | Binary detection | Cross-subject | 0.83 AUC; +0.23 vs random init; 5× data efficiency |
+| Brant (Zhang 2023) | None (anonymous channels) | sEEG | 2528h / 9 pts | Forecasting/seizure | Same-task only | 91.17% seizure; **fails cross-patient speech** |
+| BrainWave (Yuan 2025) | Channel attn (no spatial ID) | sEEG+EEG | 40,907h / 16K pts | Disease classification | Cross-domain | 0.93+ AUROC seizure; never tested speech |
+| BrantX (KDD 2024) | Cross-modality contrastive | scalp EEG+EXG | Brant-2 (1B, 4TB) | Sleep/emotion/FoG | Cross-modality | SOTA sleep staging; orthogonal to our problem |
+| Evanson 2025 | Supervised contrastive (audio) | sEEG | 83-108h/pt | Audio retrieval | Single-patient | Log-linear scaling, no plateau at 100h; sup > SSL |
+| Feng 2025 | Per-pt CNN + articulatory decomp | sEEG | 4 pts | Mandarin sentences | Per-patient | 71% char acc; NAR with F0/formants; subcortical contrib |
+| BarISTA (Oganesian 2025) | Parcel embedding + combined attn | sEEG | 29.2h / 10 pts | Binary detection | Cross-subject | **Parcel >> channel +8-10pp**; JEPA latent SSL; ~1M params |
+| Charmander (Mahato 2025) | Perceiver (32 latents) + channel embed | ECoG+sEEG | 12+10 pts | Activity classif | Cross-subject | F1 0.869; model scaling no benefit |
+| NDT3 (Ye 2025) | None (linear readin) | Utah/Neuropixel spikes | 2000h / 30+ subjects | Motor | Cross-subject limited | Channel shuffle cripples transfer; per-pt layers needed |
+| RPNT (Fang 2026) | MRoPE + contrastive | Spikes | 43h / 4 macaques | Motor | Cross-site/subject | U(0,1) mask ratio > fixed; +3.5pp contrastive |
+| Brain-OF (Guo 2026) | ARNESS Perceiver + MoE | fMRI+EEG+MEG | 32K pts | Classification | Cross-modality | 1.7B; MTFM freq masking; Brainnetome atlas |
 | Willett 2023 | Day-specific input layers | Utah | Days | Phonemes→sentences | Cross-session | WER 9.1% (50-word) |
 | Metzger 2023 | None (single patient) | ECoG 253-ch | Weeks | Phonemes+synth+avatar | None | WER 25.5% (1024-word); 78 WPM |
 | Littlejohn 2025 | None (single patient) | ECoG 253-ch | Weeks | Speech synthesis+text | None | PER 10.8%; 47.5 WPM streaming |
 | Nason 2026 | Day-specific dense | Utah 64-ch | 2 years | Phonemes→sentences | Cross-session | WER 19.6% (125k-word) |
+| POYO (Azabou 2023) | Perceiver cross-attn (512 latents) | Utah/Neuropixels spikes | 178 sessions, 7 monkeys | Motor kinematics | Cross-animal (FT) | R²=0.94 (FT); unit ID <1 min |
+| POYO+ (Azabou 2025) | Multi-task Perceiver (128 latents) | Calcium imaging | 1335 sessions, 256 animals | 12 visual tasks | Cross-region/cell-type | 55.96% (all regions > any single) |
+| FALCON (Karpowicz 2024) | NDT2 Multi / CORP / NoMAD | Utah/Neuropixels spikes | 5 datasets | Motor/communication | Cross-session few-shot | NDT2 R²=0.59; CORP WER 0.11 |
+| Jiang 2025 | NDT + session stitchers | Neuropixels spikes | 84-460 sessions | Spike prediction/choice | Cross-session (scaling) | **Heterogeneity limits spatial scaling; 5 ranked > 40 random** |
+| NEDS (Zhang 2025) | Multi-task masking (4 schemes) | Neuropixels spikes | 74 sessions, 73 mice | Encoding + decoding | Cross-session | Choice 0.91; 83% emergent region prediction |
+| POSSM (Ryoo 2025) | Cross-attn + SSM (S4D/GRU/Mamba) | Utah/Neuropixels spikes | 148 sessions | Motor/handwriting/speech | Cross-species | **PER 19.80% monkey→human speech** |
+| FunctionalMap (Javadzadeh 2025) | Siamese contrastive + Transformer | sEEG LFP | 20 subjects, DBS | Region reconstruction | Cross-subject | **Functional > MNI (p<0.001)**; 0 per-pt params |
+| NoMAD (Karpowicz 2025) | LFADS + KL alignment | Utah spikes | 20 sessions, 95 days | Isometric force/reaching | Cross-session (within-subj) | R²=0.91; 208-day half-life |
+| Neuroformer (Antoniades 2024) | GPT AR + CLIP contrastive | Calcium imaging | 386-1905 neurons | Spike pred + behavior | Single-dataset | Speed r=0.97; 1% pretrained > 10% scratch |
+| CycleGAN BCI (Ma 2023) | Adversarial cycle-consistency | Utah spikes | 6 monkeys, 30-100 days | Motor kinematics | Cross-day (within-subj) | R² drop -0.02/day; 20 trials sufficient |
+| BrainLM (Caro 2024) | MAE + AAL-424 atlas | fMRI | 6700h, 61K subjects | Clinical vars/forecasting | Cross-subject/dataset | R²=0.464 recon; scaling log-linear |
+| Safaie 2023 (Nature) | PCA + CCA | Utah + Neuropixels spikes | 3 monkeys + 4 mice | Motor kinematics | **Cross-animal** | **R²≈0.86 aligned; linear alignment sufficient** |
 
 ### 1.2 Key Observations
 
@@ -45,7 +71,43 @@ Synthesizes 19 papers (16 archived) on cross-patient speech decoding from intra-
 
 5. **Dense ECoG can decode large vocabularies (with sufficient data).** Qian 2025 achieves 71.2% on 394 Mandarin syllables from 256-ch HD-ECoG (3mm spacing — denser than clinical 10mm but coarser than uECOG's <2mm), with real-time sentence decoding. However, this required **~9 hours of neural data over 11 days** from a single epilepsy-monitoring patient, with 30–60 repetitions per syllable. Data scaling curve: 5 reps → 20.4%, 20 reps → 55.6%, full (30–60 reps) → 71.2%. Our intra-op setting provides ~1 min/patient — orders of magnitude less, though with far fewer classes (9 phonemes vs 394 syllables).
 
-6. **Training protocol details are poorly reported across the field.** Singh doesn't report optimizer, LR, or batch size. Levin puts hyperparameters in an external spreadsheet. Boccato's backbone (~100M params, d=2048) is far larger than what our data supports. Our implementation choices (differential LR, specific regularization) are our own design decisions, not precedent-based.
+6. **Atlas-grounded region mapping independently validated for cross-patient intracranial decoding (MIBRAIN).** Wu et al. 2025 independently converge on the same core idea as v12: map variable electrode placements into a fixed set of atlas-defined brain regions to create a common representational space across patients. MIBRAIN uses 21 FreeSurfer gyral regions with hard parcellation + learnable prototype tokens; v12 uses 16 Brainnetome sub-gyral ROIs with soft distance-biased cross-attention. Both use per-subject layers + shared backbone + SSL pretrain → supervised fine-tune. Key differences: (a) MIBRAIN uses NO coordinates (hard region labels suffice at gyrus-level granularity), (b) MIBRAIN uses spatial region masking for SSL (complementary to our temporal masking), (c) MIBRAIN has much heavier per-patient params (per-subject per-region Conv1D banks vs our 134 diagonal+Δ/ω), (d) MIBRAIN's unseen-subject handling (majority voting) is acknowledged as a limitation vs our LP-FT/TTO. Scaling result: adding 1-3 subjects initially hurts, need ≥6 for gains. Multi-sub beats single-sub by 5-8% (audible). Baselines (Brant, BrainBERT) barely exceed chance — validates that generic pretrained models fail without the cross-patient integration mechanism.
+
+7. **Coordinates vs discrete region labels: the emerging evidence.** Four papers from Di Wu's group (MIBRAIN, Neuro-MoBRE, H2DiLR, Neuro-BERT) succeed with ZERO coordinates — using discrete FreeSurfer region labels only. seegnificant finds PE barely helps (ΔR²=-0.02, NS). BUT PopT finds PE removal is the most damaging ablation (0.93→0.83). The resolution: seegnificant tests PE ON TOP of spatial self-attention (which already captures spatial relationships); PopT tests PE as the ONLY spatial signal. For v12: PE + distance-biased cross-attention together should outperform either alone. The Wu group's success without coordinates operates at gyrus-level (cm-scale) granularity; our sub-gyral Brainnetome ROIs at <2mm uECOG resolution may benefit more from continuous coordinates.
+
+8. **Discriminative vs reconstructive SSL: task-dependent.** PopT: discriminative SSL (temporal proximity + channel-swap detection) >> reconstructive for binary detection tasks. BrainBERT: reconstructive with content-aware loss works for per-electrode tasks. BIT: reconstructive temporal masking works for speech at scale. Neuro-BERT: spatiotemporal MSE is fragile at >10% mask ratio; FIP (Fourier prediction) is robust. For v12: reconstructive temporal masking (BIT recipe) remains primary, but adding discriminative auxiliary losses (from PopT) and content-aware weighting (from BrainBERT) should improve robustness.
+
+9. **Data scaling is log-linear with no observed plateau.** Evanson 2025: performance improves log-linearly from ~1h to ~100h of pretraining data per patient, with no plateau. LaBraM (scalp EEG): Huge model still improving at 2500h, estimated to need 10,000+h. Our ~7.6h uECoG + ~16.7h sEEG for SSL is modest but on the curve. Expanding to DABI/OpenNeuro sEEG data could substantially help.
+
+10. **Scale without mechanism fails — confirmed across the entire Brant family.** Brant (505M, 2528h) fails cross-patient speech (MIBRAIN baseline). BrainWave (~100M, 40,907h, 16K subjects) adds channel attention but still no spatial identity — never tested on speech. BrantX (1B, 4TB) goes cross-modality instead. The family scaled from 505M/2528h to 1B/40,907h without ever adding spatial identity or per-patient layers. Architecture mechanism (atlas-grounded spatial alignment + per-patient normalization) is necessary — raw scale is insufficient.
+
+11. **Atlas-level spatial encoding >> channel-level for iEEG, quantified.** BarISTA (NeurIPS 2025) tests three spatial granularities on the same iEEG data: channel-level (LPI coordinate embeddings), parcel-level (Destrieux atlas), lobe-level (Desikan-Killiany). Parcel-level outperforms channel-level by **+8-10pp AUC** — the strongest quantitative evidence that region-level grouping is THE mechanism enabling cross-patient iEEG models. v12's 16 Brainnetome VEs operate at a granularity between parcels and lobes. This finding, combined with MIBRAIN/Neuro-MoBRE/H2DiLR using FreeSurfer parcellation, makes atlas-grounded spatial encoding the highest-confidence design choice in v12.
+
+12. **Perceiver bottleneck independently validated for multi-patient iEEG.** Three independent papers converge on Perceiver-style cross-attention compressing variable electrode counts into fixed latent tokens: Charmander (32 latents, NeurIPS 2025 WS), Brain-OF (128 latents, ARNESS), v12 (16 VEs). Charmander uses purely learned latents; Brain-OF uses learned latents; v12 uses atlas-grounded positions with distance bias. Model scaling provides no downstream benefit (Charmander: 8M ≈ 33M ≈ 142M), confirming architecture > capacity.
+
+13. **Sensor variability is THE bottleneck for cross-subject intracortical transfer.** NDT3 (Ye 2025): 350M params, 2000h of spikes, cross-subject R² ~0.5 vs cross-session ~0.7. Channel shuffle alone reduces cross-session to cross-subject level — electrode order/identity carries critical spatial information. Explicitly identifies per-patient layers as needed future work. Combined with Brant family's failure (505M-1B, 40K+h, no spatial identity → fails speech), this establishes that spatial identity mechanism + per-patient layers are necessary architectural components, not optional.
+
+14. **Factored vs combined attention: now contested.** seegnificant: factored temporal→spatial outperforms joint 2D by +0.06 R² (5.5× faster). BarISTA: combined (interleaved) attention outperforms factored by +1-2pp AUC. The discrepancy may reflect different spatial dimensionalities (seegnificant: 100+ sEEG contacts; BarISTA: 72-205 contacts). v12 maps to 16 VEs before attention, making combined feasible at minimal cost. Both configurations should be tested.
+
+15. **Training protocol details are poorly reported across the field.**
+
+16. **Data heterogeneity limits scaling for spatial tasks but NOT temporal.** Jiang 2025: region-level heterogeneity kills co-smoothing scaling (flat in BWM). Forward-prediction (temporal) scales consistently. Session ranking: 5 carefully selected > 40 random (8× data efficiency). Rankings are target-specific (best sources for one held-out ≠ best for another). **Critical for v12 SSL:** temporal masking is the right choice; don't blindly pool all patients; implement patient ranking.
+
+17. **Preserved latent dynamics across animals validates cross-patient premise.** Safaie 2023 (Nature): PCA+CCA reveals that motor cortex latent dynamics are preserved across 3 monkeys and 4 mice performing the same behavior. Cross-animal LSTM R²≈0.86 (aligned) vs 0.02 (unaligned). Linear alignment sufficient. ~60 neurons minimum. Behavioral similarity required (r=0.89 monkeys vs 0.72 mice). This is the biological foundation for v12's cross-patient approach.
+
+18. **Multi-session pretrain + few-shot fine-tuning dominates all alignment approaches.** FALCON benchmark: NDT2 Multi (train on all sessions, few-shot FT) beats unsupervised alignment (NoMAD, CycleGAN), zero-shot, and single-session training. CORP test-time adaptation with LM pseudo-labels wins for communication tasks. Deep networks without per-session calibration catastrophically unstable (RNN: -0.60 R² zero-shot).
+
+19. **Perceiver cross-attention bottleneck is now consensus across 5+ independent groups.** POYO (512 latents), POYO+ (128), Charmander (32), Brain-OF ARNESS (128), v12 (16 VEs), POSSM (1/chunk). All compress variable neural inputs into fixed-size latent spaces via cross-attention. Model scaling provides no downstream benefit at this data scale (Charmander: 8M≈142M). Architecture matters more than capacity.
+
+20. **Cross-species transfer validated for speech.** POSSM: monkey motor cortex pretraining → human speech decoding (PER 19.80% on Willett data, with multi-input modality). Two-phase training: reconstruction loss (Phase 1) → CTC loss (Phase 2). Encouraging for cross-modality (sEEG→uECoG) transfer in v12.
+
+21. **Functional embeddings can outperform coordinates for neural alignment.** FunctionalMap (Javadzadeh 2025): contrastive-learned 32-dim functional embeddings beat MNI coordinates for masked-region reconstruction in SEEG (p<0.001). Zero per-patient params. Complementary to v12: functional embeddings could augment Fourier PE. But requires expert region labels (impractical for cortical uECOG) and tested only on deep brain nuclei.
+
+22. **Within-modality masking is the most critical SSL component for encoding quality.** NEDS: removing within-modality masking drops encoding 50%. Cross-modal masking helps behavior decoding but less important for neural representation learning. Validates v12's temporal masking focus over multimodal objectives.
+
+23. **Distribution matching (KL divergence) enables unsupervised manifold alignment.** NoMAD: frozen backbone + lightweight alignment network + KL divergence between reference and new-session latent distributions. R²=0.91, half-life 208 days. Single reference alignment > sequential (avoids error accumulation). Importable as auxiliary loss on VE representations.
+
+24. **1-2 minutes of calibration data sufficient for per-session adaptation.** FALCON: 1-2 min budget, even for complex communication tasks. CycleGAN: 20 trials plateau. Our 46-178 trials/patient (3-10 min) is generous for v12's 134 per-patient params. Singh doesn't report optimizer, LR, or batch size. Levin puts hyperparameters in an external spreadsheet. Boccato's backbone (~100M params, d=2048) is far larger than what our data supports. Our implementation choices (differential LR, specific regularization) are our own design decisions, not precedent-based.
 
 7. **Spatial processing of ECoG grids outperforms non-spatial approaches, but architecture choice is data-regime-dependent.** Chen 2024: 3D ResNet (PCC 0.806) > 3D Swin Transformer (0.792) > LSTM (0.745) on N=48 patients with 8×8 grids. Chen 2025: SwinTW (0.825) > ResNet (0.804) on same data — but the advantage came from **coordinate-based tokenization** (enabling multi-patient training), not from being a transformer per se (Chen 2024's grid-based Swin *lost* to ResNet). Qian 2025: ViT (~0.63) significantly underperformed stacked LSTM (0.712) on 256-ch HD-ECoG (p<0.0001). CNNs' inductive biases (translation equivariance, local receptive fields) act as free regularization at small data scales — ViTs need ImageNet-scale data to overcome this (Dosovitskiy 2020). For our ~200 trials/patient on regular grids, 2D conv is better regularized than attention (shared spatial kernels vs O(N²) attention). Chen 2024's 18-parameter speech intermediate representation (pitch, formants, voicing, loudness) is compact and cross-patient-invariant by construction.
 
@@ -91,7 +153,7 @@ Most methods operate at the **input** level (per-patient layers). The **output t
 | **Conv1D per-patient** (Singh) | ~98k+ | No | Yes | Yes | Heavy. Linear read-in achieves same purpose |
 | **Conv2d on grid** (engineering) | 80–664 | No | No | No | **Phase 3.** Conv2d factorization matches rigid-array physics (uniform within-array, variable across arrays). Learned spatial deblurring + orientation adaptation. 15–25mm placement offsets kill diagonal scaling. Depth/channels/pool empirical (E13) |
 | **Coordinate PE** (**Chen 2025 SwinTW, seegnificant**) | 0 | Yes | **Yes (Chen 2025, seegnificant)** | **Yes** | Phase 3. Chen 2025: PCC 0.765 LOO (N=52). **Caveat: seegnificant PE ΔR²=-0.02, p=0.73 (NOT significant)** — spatial self-attention does the heavy lifting, not PE |
-| **Region prototypes** (MIBRAIN) | Per-region | Yes | Yes | No | Not applicable — our patients all cover same cortical patch |
+| **Region prototypes** (MIBRAIN) | Per-region | Yes | Yes | No | **Closest prior to v12 VE approach.** Hard FreeSurfer region assignment + learnable prototypes ≈ our soft distance-biased VE cross-attention. No coordinates. Per-subject per-region Conv1D (heavy). Scaling: need ≥6 subjects. |
 | **SSL pretraining** (wav2vec, BIT) | Backbone | No | Partial | Yes | Phase 3. ~3 hrs borderline; masked > contrastive |
 | **Articulatory TCA** (Wu) | Regression | No | Cross-speaker | Indirect | Phase 3 as auxiliary loss. Free alignment signal |
 
