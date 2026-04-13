@@ -99,17 +99,19 @@ Resolving a blocker means: logic agreed, contract (inputs, outputs, shapes, unit
     - the resulting `N_tok`
     - which parcels remain explicit extension candidates
 
-- [ ] **#5 Define the exact parcel support statistic**
-  - The model now depends on parcel support explicitly, but the exact support statistic is not yet frozen.
-  - This is a blocker because it determines:
-    - `token_mask`
-    - `token_support`
-    - the unsupported-vs-weak threshold itself
-    - low-coverage behavior across patients
-  - Before locking Phase 1, write down:
-    - the exact support formula
-    - whether it is based on summed memberships, effective electrode count, or another normalized quantity
-    - whether support is static per patient / parcel or varies over time
+- [x] **#5 Parcel support statistic — DECIDED 2026-04-13**
+  - **Decision**: PM-weighted sum of non-artifact contacts inside the parcel.
+    - Formula: `support[parcel] = Σ_i PM(parcel | x_i)` over non-artifact contacts `i`, using the real Brainnetome PM volume (`data/atlas/BNA_PM_4D.nii.gz`).
+    - Purely geometric. Does **not** depend on task-responsiveness or the sig-channel files. Channel inclusion is a separate decision (#11).
+    - Static per `(patient, parcel)`. Does not vary over time.
+    - Consistent with Phase 1's commitment to the real PM volume over hard MPM labels.
+  - **Rationale**:
+    - Raw count throws away the PM uncertainty we loaded the real volume to preserve.
+    - Task-responsiveness couples calibration to the supervised task, which breaks Phase 1.5 SSL — you cannot compute support for an SSL window without re-running the significance test.
+  - **Open sub-questions** (tracked separately):
+    - unsupported-vs-weak threshold → #3
+    - how `token_support` enters the model → #7
+  - **Phase 2 / sEEG note**: a flat PM-weighted sum over-rewards redundant shaft-internal sampling. When sEEG joins, the formula needs a diversity weighting — downweight contacts close to each other in MNI (or close along a shaft axis). Safe to defer: the Phase 1 formula is replaceable without breaking the `token_mask` / `token_support` interface.
 
 - [ ] **#6 Lock the temporal-layer output contract**
   - Choosing the temporal layer architecture is not enough; the exact interface it emits must also be frozen.
@@ -123,16 +125,13 @@ Resolving a blocker means: logic agreed, contract (inputs, outputs, shapes, unit
     - output tensor shape
     - whether outputs are overlapping patch tokens or a continuous feature stream
 
-- [ ] **#7 Decide how `token_support` enters the model**
-  - The docs already assume `token_support` exists, but not how it is actually used.
-  - This is a blocker because it changes whether low-support parcels are:
-    - merely logged
-    - appended to token features
-    - used as attention bias / gating
-    - used in loss weighting only
-  - Before locking Phase 1, write down:
-    - where `token_support` is injected
-    - whether it affects backbone attention, decoder reads, or only diagnostics
+- [x] **#7 How `token_support` enters the model — DECIDED 2026-04-13**
+  - **Decision**: concat-to-token. The per-parcel scalar `token_support` is concatenated onto the token feature and passed through a linear projection back to `d`, so every token that enters inter-region attention carries its own support signal as part of its content. Attention-bias stays on the ablation list but is **not** active in the Phase 1 baseline.
+  - **Rationale**: concat-to-token and attention-bias answer different questions, so they are not redundant. Concat puts support inside the token's representation — the model learns what low support means for content. Attention-bias externally discounts how much *other* tokens attend to a low-support token and does not touch its content.
+  - A low-support token can still be the only evidence in its parcel (e.g. one contact in Broca's for some patient). The right behavior is "let other tokens attend fully, but mark it as low-confidence internally". That is concat-to-token without attention-bias. Attention-bias would wrongly suppress the only evidence available.
+  - Conversely, a high-support token may be task-irrelevant, and attention-bias cannot express that (support is high, so no discount fires).
+  - **Phase 1 discipline**: only one mechanism active in the baseline so ablations stay readable. Concat-to-token is the default; attention-bias is a named ablation comparison.
+  - **Implementation note**: the concat dimension is `d + 1` before the linear projection, so the point-summarizer output `d` is preserved for the backbone. `token_mask` is still a separate binary signal and gates attention structurally — concat-to-token handles graded support inside the active set, `token_mask` handles hard absence.
 
 - [ ] **#8 Lock token-level connectivity expansion details**
   - The design already assumes Brainnetome SC/FC bias initialization, but the exact expansion from parcel-level connectivity to token-level attention bias is still not frozen.
@@ -160,18 +159,70 @@ Resolving a blocker means: logic agreed, contract (inputs, outputs, shapes, unit
     - train-time vs eval-time decoding behavior
     - loss definition
 
-- [ ] **#10 Lock the parcel-frame construction contract**
-  - The local summarizer depends on canonical parcel coordinates, but the exact construction is still not fully written down.
-  - This is a blocker because it determines:
-    - what “within-parcel geometry” actually means
-    - reproducibility of the local summarizer inputs
-    - whether parcel-frame features are computed consistently across patients
-  - Before locking Phase 1, write down:
-    - how parcel centroids are defined
-    - how parcel axes / rotations are defined
-    - how parcel axis scales are defined
-    - whether these are computed once offline and cached
-    - how canonical parcel coordinates are attached to local electrode features
+- [x] **#10 Parcel-frame construction contract — DECIDED 2026-04-13**
+
+  ### Origin
+  - PM-weighted centroid over the Brainnetome PM volume (`data/atlas/BNA_PM_4D.nii.gz`).
+    - `origin[parcel] = Σ_v PM(parcel | v) * position_v / Σ_v PM(parcel | v)`, summed over MNI voxels `v`.
+    - Volumetric, not surface-projected. Keeps the origin consistent across uECoG (contacts on pia) and Phase 2 sEEG (contacts distributed through the cortical slab).
+
+  ### Rotation method — fsaverage-based cortical-normal axes
+  - **Space mapping**: use `nilearn.surface.vol_to_surf()` to project the BNA PM volume onto the fsaverage pial mesh. nilearn handles the MNI152 ↔ fsaverage (MNI305) space mapping internally — we do **not** build our own warp.
+    - Resolution: `fsaverage` (full, 163 842 vertices per hemisphere). Fs6/5 is too coarse for small parcels like `A44op`. Cache is built once offline, so resolution does not matter for runtime.
+    - Interpolation: `interpolation="linear"`, `kind="ball"` with a small radius (needs empirical tuning at build time). **Must be verified**: for a probabilistic atlas, we need "PM value near this vertex", not "line-integral through the cortical slab" — the nilearn defaults are tuned for fMRI BOLD, not atlas membership, and the choice must be checked against a flat-parcel smoke test.
+    - Separate LH and RH projections. fsaverage has distinct `pial_left` and `pial_right` meshes and vertex sets. A left Brainnetome parcel must only receive left-hemisphere vertices, and vice versa. Mixing sides silently invalidates the axes.
+  - **z-axis (cortical normal)**: first eigenvector of the **PM-weighted second-moment tensor** of the per-vertex pial normals:
+    ```
+    M_parcel = Σ_v PM(parcel | v) * n_v n_v^T / Σ_v PM(parcel | v)
+    z_axis[parcel] = dominant eigenvector of M_parcel
+    ```
+    where `n_v` is the unit pial normal at fsaverage vertex `v`, and `v` ranges over the hemisphere-matched fsaverage vertices inside the parcel.
+    - **Second-moment tensor, not mean-subtracted covariance.** The distinction is load-bearing — see rigor note below.
+    - `n_v` from per-vertex normals computed from the fsaverage triangle mesh (cross products of adjacent triangle edges, area-weighted, normalized). Standard mesh-normal computation.
+  - **Tangent axes (x, y)**: project the in-parcel vertex positions onto the plane perpendicular to `z_axis`, then run 2D PCA on the PM-weighted projected positions.
+    - Primary tangent direction = first 2D PC (roughly "gyrus long axis" for curved parcels, "principal cortical extent" for flat ones).
+    - Secondary tangent direction = second 2D PC, with sign fixed by `y = z × x` to force a right-handed frame.
+
+  ### Rigor: why second-moment tensor, not mean
+  - **Mean normal** fails on curved and sulcal parcels:
+    - Flat gyral parcel (e.g. `A4hf` on the precentral crown): mean ≈ outward normal. Works.
+    - Curved gyral parcel (e.g. `A44` wrapping over IFG): normals fan along an arc; mean points into the middle of the arc, which is roughly outward but underweights the curvature.
+    - Sulcal / bimodal parcel (e.g. `INSa` in the insular pocket, `STGa` wrapping into STS): normals come from two opposing walls; mean ≈ 0 and the z-axis becomes undefined.
+  - **Second-moment tensor** `M = E[n n^T]` handles all three cases correctly:
+    - Concentrated distribution: `M ≈ v v^T` for the mean direction `v`, so the dominant eigenvector recovers the mean. Matches the simple case exactly.
+    - Arc distribution: dominant eigenvector ≈ center of arc (same as mean), because the arc is spread around the mean direction.
+    - Bimodal distribution (`+v` and `-v` clusters): `M = v v^T` (both contributions are equal because `n n^T` is sign-invariant). Dominant eigenvector = the bank-normal axis, which is the correct cortical-normal direction for a sulcal parcel.
+  - Equivalently: `M` is a dyadic orientation tensor on unit vectors, and this is the standard formulation in diffusion-MRI orientation analysis for exactly this reason. Do **not** mean-subtract before the eigendecomposition — that would compute the covariance of residuals, which picks up noise in the concentrated case and tangent-plane variation in the arc case. We want the dominant *direction*, not the dominant *variation*.
+  - The dominant eigenvalue `λ_1 ∈ [1/3, 1]` is a diagnostic for how well-concentrated the parcel's normals are: `λ_1 → 1` means tightly concentrated (flat gyrus), `λ_1 → 1/2` means bimodal (sulcal wall), `λ_1 → 1/3` means isotropic (should not happen for any real parcel — fail loudly if it does).
+
+  ### Per-axis scale normalization
+  - Feed `(x/σ_x, y/σ_y, z/σ_z)` to the shared point encoder, where `σ_*` are the standard deviations of the PM-weighted in-parcel positions projected along each parcel-frame axis.
+  - Append `(log σ_x, log σ_y, log σ_z)` as three scalar features on the parcel's token (once per parcel, not per electrode). The point encoder sees parcel-size-invariant positions; parcel size lives on the token as a three-number side channel.
+  - Std-based, not extent-based — robust to boundary outlier voxels.
+  - Log-scaled token scalars because parcel sizes span more than an order of magnitude.
+
+  ### Sign determinism
+  - `z` (cortical normal): eigenvectors have ±1 ambiguity. Pin by `sign(z · (origin − brain_centroid)) > 0`, where `brain_centroid` is the mean of the fsaverage mesh vertices (approximately the MNI origin). This forces positive `z` = outward from the brain for every parcel on the cortical surface. For any parcel where the dot product is within numerical noise of zero (`< 1e-3`), fail loudly — the parcel is near the brain centre and the rule is ambiguous.
+  - `x` (primary tangent): pin by "positive `x` points toward the anterior-most in-parcel fsaverage vertex, projected onto the tangent plane". Deterministic as long as there is a single unambiguous anterior extreme — flag otherwise.
+  - `y` (secondary tangent): `y = z × x` (right-handed frame). No independent sign choice.
+
+  ### Offline caching
+  - Build once, cache to `data/atlas/parcel_frames.npz`.
+  - Keys:
+    - `parcel_ids`: `(N_parcel,) int` — BNA parcel indices covered by the cache
+    - `hemisphere`: `(N_parcel,) str` — `"L"` or `"R"` per parcel
+    - `origins`: `(N_parcel, 3) float` — PM-weighted centroids in MNI
+    - `rotations`: `(N_parcel, 3, 3) float` — stacked `[x_axis; y_axis; z_axis]` per parcel
+    - `sigmas`: `(N_parcel, 3) float` — axis standard deviations in mm
+    - `log_sigmas`: `(N_parcel, 3) float` — pre-computed token-level scalars
+    - `concentration`: `(N_parcel,) float` — dominant eigenvalue `λ_1` of the second-moment tensor (diagnostic for gyral / sulcal / isotropic)
+    - `n_vertices`: `(N_parcel,) int` — number of fsaverage vertices that contributed (coverage diagnostic)
+    - `build_metadata`: dict — fsaverage version, nilearn version, `vol_to_surf` configuration, PM threshold, build timestamp
+  - Cache must be bit-deterministic given the same inputs. Running the builder twice produces byte-identical output — verified by content hash in CI.
+
+  ### Phase 2 upgrade path (tracked separately in `## Phase 2`)
+  - Refine from **per-parcel mean cortical normal** to **per-voxel local cortical normal**. Phase 1 stores one rotation per parcel; Phase 2 stores one rotation per PM voxel (or per contact, looked up at load time). The Phase 1 cache is a valid fallback for Phase 2, not a wasted artifact.
+  - Per-voxel is strictly better only for sEEG in curved parcels (where contacts at the crown vs at the fundus should get different local normals). uECoG is invariant to this refinement because all contacts are on the pial surface.
 
 - [ ] **#11 Lock the channel inclusion policy**
   - It is still unresolved whether Phase 1 should use:
@@ -387,6 +438,28 @@ This phase is also **supervised only**.
 - [ ] Lock translation / rotation to the verified ACPC → MNI output for `v14-core`
 - [ ] Implement soft Brainnetome membership lookup
 - [ ] Implement parcel support / confidence summary
+- [ ] **Build and verify `data/atlas/parcel_frames.npz`** per the `#10` contract
+  - Dependencies: fsaverage pial mesh (`nilearn.datasets.fetch_surf_fsaverage(mesh="fsaverage")`), BNA PM volume at `data/atlas/BNA_PM_4D.nii.gz`.
+  - Builder steps (per hemisphere, then merged):
+    1. Load fsaverage pial mesh and compute per-vertex unit normals from the triangle mesh (area-weighted average of adjacent face normals, normalized).
+    2. Project the BNA PM volume onto the fsaverage mesh via `nilearn.surface.vol_to_surf()` using `interpolation="linear"`, `kind="ball"`. **Sub-task**: empirically pick the ball radius against a flat-parcel smoke test and lock it in `build_metadata`.
+    3. For each BNA parcel on this hemisphere, compute the PM-weighted second-moment tensor of the per-vertex normals, its dominant eigenvector (= z-axis), and the dominant eigenvalue (= concentration diagnostic).
+    4. Project in-parcel PM-weighted vertex positions onto the plane ⊥ z-axis; run 2D PCA to get x and y tangent axes; set `y = z × x` to force right-handed.
+    5. Apply sign-determinism rules: `sign(z · (origin − brain_centroid)) > 0`, `x` points toward the anterior-most in-parcel vertex, `y = z × x`.
+    6. Compute PM-weighted origin (volumetric, from `BNA_PM_4D.nii.gz` directly — not surface-projected).
+    7. Compute per-axis sigmas from PM-weighted in-parcel positions in the parcel frame; pre-compute `log_sigmas`.
+    8. Pack and save as `.npz` with the keys listed in `#10`.
+  - Verification checklist (all must pass before the cache is committed):
+    - [ ] Smoke test: flat gyral parcel `A4hf` — dominant eigenvalue `λ_1 > 0.9`, z-axis points approximately along `(origin − brain_centroid) / ||·||` (within a few degrees). Visualize as an arrow on fsaverage; manually confirm it looks "up" from the precentral gyrus.
+    - [ ] Smoke test: curved gyral parcel `A44d` — z-axis points outward from the IFG ridge; `λ_1` lower than `A4hf`; tangent x-axis roughly along the gyrus long axis.
+    - [ ] Smoke test: sulcal / pocket parcel `INSa` — mean normal is small (would be near-zero with the mean method), but second-moment z-axis is well-defined and `λ_1 ∈ [0.5, 0.9]`.
+    - [ ] Numerical invariants: `trace(M) ≈ 1` for every parcel (because normals are unit vectors), fail loudly otherwise; `λ_1 ∈ [1/3, 1]`, fail loudly otherwise; rotation matrices are orthonormal to float32 precision; determinant `det(R) = +1` for every parcel (right-handed frame).
+    - [ ] Hemisphere purity: every left BNA parcel receives only left-fsaverage vertices and vice versa. Assert at build time, fail loudly on any crossover.
+    - [ ] Coverage floor: every parcel in `DEFAULT_BASE_PARCELS` has at least 50 fsaverage vertices contributing (after PM weighting). Below that, the second-moment statistic is too noisy.
+    - [ ] Sign-rule coverage: every parcel has `|z · (origin − brain_centroid)| > 1e-3`. Any parcel where this fails is flagged and handled individually (probably a parcel near the brain centre where the outward-normal rule is ambiguous).
+    - [ ] Determinism: running the builder twice produces a byte-identical `.npz`. Compared by SHA-256 in CI.
+    - [ ] BNA vs fsaverage space sanity: project a known Brainnetome label map (MPM) onto the fsaverage surface and visually confirm that parcel boundaries land where expected on the mesh. This is the end-to-end check that `nilearn.surface.vol_to_surf` is doing what we think it is.
+  - No `v14` code reads `parcel_frames.npz` until the verification checklist is green.
 - [ ] Verify expected parcels are reached for core patients
 - [ ] Add ACPC vs MNI array visualization check
 - [ ] Visualize parcel support per patient
@@ -458,7 +531,7 @@ This is the next step after supervised `v14-core` correctness.
   - current default expectation: JEPA-style latent prediction
 - [ ] Define the handoff from full-corpus SSL back to supervised response-locked fine-tuning
 
-## Phase 2: Learned Per-Patient Calibration
+## Phase 2: Learned Per-Patient Calibration + Modality Join
 
 Only start this after `v14-core` is working end-to-end.
 
@@ -470,6 +543,21 @@ Only start this after `v14-core` is working end-to-end.
 - [ ] Decide whether the first learned calibration step should be gain/offset only or full `Δ/ω`
 - [ ] Decide whether any fixed gain / impedance normalization from baseline-only channel statistics is warranted
 - [ ] Verify learned calibration improves rather than destabilizes the fixed-atlas baseline
+
+### sEEG modality join
+
+- [ ] **Wire a modality embedding into the shared point encoder** — DECIDED 2026-04-13 (design commitment; implementation in Phase 2 when sEEG actually joins)
+  - **Decision**: the shared point encoder takes `[x, y, z, m_embed]`, where `m_embed ∈ R^{d_m}` is a learned per-modality vector. Concat, not FiLM, unless concat under-performs in ablation. `modality_id ∈ {uECoG, sEEG}` for Phase 2; more modalities (external ECoG, MEG, ...) slot in the same way.
+  - **Rationale**: a shared MLP from `(x,y,z) → d` trained on mixed data specializes toward whichever modality dominates the batch. A modality embedding lets the same weights carry two regimes — "on uECoG, ignore z because it's constant; on sEEG, use z because it's informative" — without forking into two networks.
+  - **Do not make the latent queries modality-specific.** Keeping queries shared forces the summarizer to learn a modality-agnostic notion of "what to extract from a parcel". Per-modality queries effectively splits into two summarizers sharing a backbone and undoes the unification.
+  - **Phase 1 implication**: reserve the input slot in the point encoder config now. The alternative is re-training the first layer at the sEEG join, because you cannot safely zero-pad a channel the encoder was never trained with. For Phase 1, `d_m = 0` (no-op) is acceptable only if the point encoder is explicitly marked as "modality-aware, currently one-hot uECoG".
+  - **Does not fix** (separate Phase 2 items, each needs its own discussion):
+    - support statistic — needs diversity weighting for sEEG (Phase 1 PM-weighted sum over-rewards shaft-internal redundancy; see #5)
+    - parcel-frame axes — Phase 1 stores one per-parcel mean cortical normal; sEEG in curved parcels wants per-voxel local cortical normals so that contacts at the gyral crown vs sulcal fundus get different local rotations (see #10)
+    - default split map — `DEFAULT_SPLIT_COUNTS` was picked from uECoG coverage; sEEG coverage geometry is different
+- [ ] **Re-derive `DEFAULT_SPLIT_COUNTS` from sEEG coverage** when sEEG joins. The elongated-parcel splits in `token_spec.py` come from uECoG reachability across 11 PS patients; the right split set for sEEG is probably different.
+- [ ] **Upgrade the support statistic with diversity weighting** when sEEG joins — downweight contacts close to each other in MNI (or close along a shaft axis) so four adjacent sEEG contacts on one shaft count as roughly one probe instead of four. Tracked in #5.
+- [ ] **Refine parcel-frame axes from per-parcel mean cortical normal to per-voxel local cortical normals** when sEEG joins. Phase 1's `parcel_frames.npz` stores one `(origin, R)` per parcel, built from the PM-weighted second-moment tensor of fsaverage pial normals. That is correct for uECoG (all contacts on pia; constant cortical depth) and correct-enough for sEEG in flat parcels. For sEEG in curved parcels, a contact at the gyral crown vs a contact at the sulcal fundus should get *different* local rotations — the per-voxel upgrade stores one rotation per PM voxel (or computes one per contact at load time), which is a superset of the Phase 1 cache. Same `.npz` format, extra keys. The Phase 1 cache is a valid fallback. Tracked in #10.
 
 ## Deferred Until After uECoG Correctness
 

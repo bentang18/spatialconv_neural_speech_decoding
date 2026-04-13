@@ -99,17 +99,17 @@ is still unresolved. This matters because it changes the effective active-token 
 
 The current design assumes a 21-token default built from selective 2-token parcel splits, but that split set should still be treated as an explicit implementation decision. It affects the shared interface, the local summarizer, and the expansion of Brainnetome connectivity from parcels to token-level graph bias. The current likely default is to split `A6cvl`, `A4hf`, `A1/2/3ulhf`, `A2`, and `A1/2/3tonIa`, with `A4tl` left as the first extension candidate.
 
-- **Exact parcel support statistic is not yet locked**
+- **Parcel support statistic — DECIDED 2026-04-13**
 
-The model now depends on parcel support explicitly, but the exact support formula still needs to be frozen. This matters because it drives `token_mask`, `token_support`, and low-coverage behavior.
+PM-weighted sum of non-artifact contacts inside the parcel: `support[parcel] = Σ_i PM(parcel | x_i)` over the real Brainnetome PM volume. Purely geometric — no task-responsiveness, no sig-channel dependency (that would break Phase 1.5 SSL). Static per `(patient, parcel)`. The unsupported-vs-weak threshold (#3) and how `token_support` enters the model (#7) remain open. Phase 2 / sEEG will need diversity weighting to downweight shaft-internal redundancy; the Phase 1 formula is replaceable without breaking the `token_mask` / `token_support` interface.
 
 - **Temporal-layer output contract is not yet locked**
 
 The temporal layer choice is not the whole issue; the exact output contract into the local summarizer also needs to be frozen. Token rate, receptive field, and time-axis semantics all still need to be written down explicitly.
 
-- **How `token_support` enters the model is not yet locked**
+- **How `token_support` enters the model — DECIDED 2026-04-13**
 
-The design assumes `token_support` exists, but not yet whether it is only diagnostic or also enters the backbone/decoder as an explicit signal. That remains an implementation blocker.
+Concat-to-token: `token_support` is concatenated onto the token feature and projected back to `d`, so every token entering inter-region attention carries its own support signal. Attention-bias is **not** active in the Phase 1 baseline and stays on the ablation list. Rationale: concat lets the model learn what low support means for content and preserves the "lone low-support token in an otherwise-empty parcel" case (attention-bias would wrongly suppress the only evidence available). `token_mask` still gates attention structurally for hard absences.
 
 - **Token-level connectivity expansion is not yet fully specified**
 
@@ -119,9 +119,9 @@ The design assumes Brainnetome SC/FC initializes graph attention, but the exact 
 
 Phase 1 is supervised-only, but the exact training contract still needs to be frozen: supervised input window, target semantics, decoder training behavior, and how train-time and eval-time decoding relate.
 
-- **Parcel-frame construction is not yet fully locked**
+- **Parcel-frame construction — DECIDED 2026-04-13**
 
-The local summarizer depends on canonical parcel coordinates, but the exact parcel-frame construction rule still needs to be written down explicitly: centroids, axes, scales, and whether these are computed offline and cached.
+Origin is the PM-weighted centroid over `BNA_PM_4D.nii.gz`. Rotation is fsaverage-based cortical-normal axes: project the BNA PM volume onto the fsaverage pial mesh via `nilearn.surface.vol_to_surf()` (nilearn handles the MNI152 ↔ MNI305 space mapping), then compute the z-axis as the dominant eigenvector of the **PM-weighted second-moment tensor** of the per-vertex pial normals `M = Σ PM(parcel|v) · n_v n_v^T`. This formulation, not the mean normal, is the rigorous choice: mean cancels on bimodal sulcal parcels, whereas the second-moment tensor handles concentrated, arc, and bimodal distributions uniformly. Tangent axes come from 2D PCA of PM-weighted in-parcel positions projected onto the plane ⊥ z; `y = z × x` forces a right-handed frame. Sign pins: `z` by `sign(z · (origin − brain_centroid)) > 0`, `x` by "anterior-most in-parcel vertex", `y` by the cross product. Per-axis normalization `(x/σ_x, y/σ_y, z/σ_z)` into the point encoder; `(log σ_x, log σ_y, log σ_z)` appended to the parcel's token as a size side-channel. Built once offline to `data/atlas/parcel_frames.npz` with a strict verification checklist. Phase 2 sEEG refinement: per-voxel cortical normals instead of per-parcel mean normals — same cache format, superset of Phase 1.
 
 - **Channel inclusion policy is still not fully decided**
 
