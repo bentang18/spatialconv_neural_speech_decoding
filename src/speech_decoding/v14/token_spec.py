@@ -31,6 +31,32 @@ discussion with Ben rather than importing these constants.
 
 from __future__ import annotations
 
+# Machine-readable provisional flag. Blocker #4 requires this to be cleared
+# (set to False) by the Phase-1 parcel re-derivation before any v14 code path
+# consumes DEFAULT_BASE_PARCELS or DEFAULT_SPLIT_COUNTS. Code that reads those
+# constants must call `assert_token_spec_frozen()` first so the banner cannot
+# be ignored by silent import.
+PROVISIONAL_TOKEN_SPEC: bool = True
+
+
+def assert_token_spec_frozen() -> None:
+    """Fail if the provisional parcel set has not yet been re-derived.
+
+    Blocker #4 in `docs/implementation_tasks.md` requires every v14 code path
+    that reads `DEFAULT_BASE_PARCELS` or `DEFAULT_SPLIT_COUNTS` to call this
+    guard first. It refuses to return until `PROVISIONAL_TOKEN_SPEC` is
+    cleared by the re-derivation.
+    """
+
+    if PROVISIONAL_TOKEN_SPEC:
+        raise RuntimeError(
+            "token_spec is still provisional — blocker #4 (Phase-1 parcel "
+            "re-derivation) must close before DEFAULT_BASE_PARCELS / "
+            "DEFAULT_SPLIT_COUNTS may enter a v14 code path. See "
+            "docs/implementation_tasks.md #4."
+        )
+
+
 DEFAULT_BASE_PARCELS: tuple[str, ...] = (
     "A6cvl",
     "A4tl",

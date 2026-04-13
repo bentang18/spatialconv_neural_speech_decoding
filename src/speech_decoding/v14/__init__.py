@@ -2,6 +2,12 @@
 
 This package is the clean home for the current atlas-calibrated architecture.
 Legacy baseline modules remain elsewhere in the repo.
+
+Note: `DEFAULT_BASE_PARCELS`, `DEFAULT_SPLIT_COUNTS`, and `default_token_count`
+are intentionally not re-exported at package level. They live in `token_spec`
+and are still provisional under blocker #4 (Phase-1 parcel re-derivation);
+any v14 code path that consumes them must import from `token_spec` directly
+and call `assert_token_spec_frozen()` first.
 """
 
 from .config import (
@@ -13,7 +19,6 @@ from .config import (
     TemporalTokenizerConfig,
     V14Config,
 )
-from .token_spec import DEFAULT_BASE_PARCELS, DEFAULT_SPLIT_COUNTS, default_token_count
 
 __all__ = [
     "AtlasConfig",
@@ -23,7 +28,4 @@ __all__ = [
     "PatientCalibrationConfig",
     "TemporalTokenizerConfig",
     "V14Config",
-    "DEFAULT_BASE_PARCELS",
-    "DEFAULT_SPLIT_COUNTS",
-    "default_token_count",
 ]

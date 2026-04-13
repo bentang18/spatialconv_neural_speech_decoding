@@ -8,9 +8,8 @@ Every numeric default in this file was written before the 2026-04-13
 discussion-first rule was locked. None of these values have a written
 justification tied to data scale, token rate, or a named paper. Under
 the working principle recorded in `CLAUDE.md`, `docs/current_direction.md`,
-`docs/implementation_start.md`, and `docs/implementation_tasks.md` (blocker
-#15), none of these numbers may enter a training run until each has been
-explicitly discussed and agreed.
+and `docs/implementation_tasks.md` (blocker #15), none of these numbers may
+enter a training run until each has been explicitly discussed and agreed.
 
 Specifically unresolved:
 
@@ -18,12 +17,15 @@ Specifically unresolved:
   max_parcel_offset_mm, min_temperature, max_temperature. These are
   inherited from the pre-Phase-1 v14 draft.
 - TemporalTokenizerConfig: d_model, patch_ms, stride_ms, sample_rate_hz,
-  hidden_channels. The temporal front-end is itself a top blocker.
+  hidden_channels. The temporal front-end is itself a top blocker (#2/#6).
 - LocalSummarizerConfig: d_model, point_mlp_hidden, parcel_embedding_dim,
-  support_feature_dim.
+  support_feature_dim. Gated on #26.
 - BackboneConfig: d_model, num_blocks, num_heads, ffn_hidden, dropout.
+  Current values match the written expectation in #27 (d=256, B=2,
+  head_dim=64, ~1.2M–2M params) but are not yet frozen.
 - DecoderConfig: d_model, num_queries, vocab_size, ar_embedding_dim. The
-  label->integer index contract is a separate blocker (#16).
+  label->integer index contract is a separate blocker (#16) and the full
+  decoder contract is #28.
 
 The `AtlasConfig` and the `learn_*` flags on `PatientCalibrationConfig`
 encode the Phase-1 contract (real PM volume, no learned calibration) and
@@ -89,9 +91,14 @@ class PatientCalibrationConfig:
 
 @dataclass(frozen=True)
 class TemporalTokenizerConfig:
-    """Shared temporal front-end before atlas pooling."""
+    """Shared temporal front-end before atlas pooling.
 
-    d_model: int = 64
+    `d_model = 256` matches the written expectation in blocker #27 so the
+    parameter-budget math there is consistent. Every field is still
+    provisional under #15 / #2 / #6 — see the module banner.
+    """
+
+    d_model: int = 256
     patch_ms: int = 250
     stride_ms: int = 50
     sample_rate_hz: int = 200
@@ -100,33 +107,49 @@ class TemporalTokenizerConfig:
 
 @dataclass(frozen=True)
 class LocalSummarizerConfig:
-    """Within-parcel Perceiver-style local summarizer."""
+    """Within-parcel Perceiver-style local summarizer.
 
-    d_model: int = 64
-    point_mlp_hidden: int = 64
+    `d_model = 256` matches the shared width used by the tokenizer and
+    backbone. Provisional under #15 / #26.
+    """
+
+    d_model: int = 256
+    point_mlp_hidden: int = 256
     parcel_embedding_dim: int = 16
     support_feature_dim: int = 1
 
 
 @dataclass(frozen=True)
 class BackboneConfig:
-    """Shared relational-temporal model after atlas-token formation."""
+    """Shared relational-temporal model after atlas-token formation.
 
-    d_model: int = 64
+    `d_model = 256`, `head_dim = 64`, `B = 2` factored blocks are the
+    written defaults in blocker #27 (~1.2M–2M parameters). All values
+    still provisional under #15 / #27 until the discussion freezes.
+    """
+
+    d_model: int = 256
     num_blocks: int = 2
     num_heads: int = 4
-    ffn_hidden: int = 256
-    dropout: float = 0.2
+    ffn_hidden: int = 1024
+    dropout: float = 0.1
 
 
 @dataclass(frozen=True)
 class DecoderConfig:
-    """Autoregressive phoneme decoder."""
+    """Autoregressive phoneme decoder.
 
-    d_model: int = 64
+    `d_model = 256` matches the backbone width so cross-attention keys
+    do not need an extra projection. `num_queries = 3` and `vocab_size = 9`
+    follow the 3-phoneme target and the 9-phoneme PS set but the exact
+    label→index contract is blocker #16. All values still provisional
+    under #15 / #28.
+    """
+
+    d_model: int = 256
     num_queries: int = 3
     vocab_size: int = 9
-    ar_embedding_dim: int = 64
+    ar_embedding_dim: int = 256
 
 
 @dataclass(frozen=True)
