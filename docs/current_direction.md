@@ -40,7 +40,6 @@ Phase 1 assumptions:
 - fixed atlas mapping first; no learned `Δ/ω`, `δ_l`, or `τ_l` yet
 - no extra gain / impedance correction beyond the existing HGA preprocessing
 - no Fourier PE
-- no global electrode→region cross-attention
 - fixed `N_tok` layout with `token_mask` and `token_support`
 - supervised-only `uECoG` implementation before SSL or modality expansion
 
@@ -95,9 +94,9 @@ The first implementation already assumes a fixed atlas-token interface with `tok
 
 is still unresolved. This matters because it changes the effective active-token set per patient and the semantics of low-coverage training cases.
 
-- **Default parcel split map is not yet fully locked**
+- **Base parcel set and default split map must be re-derived from scratch (blocker #4)**
 
-The current design assumes a 21-token default built from selective 2-token parcel splits, but that split set should still be treated as an explicit implementation decision. It affects the shared interface, the local summarizer, and the expansion of Brainnetome connectivity from parcels to token-level graph bias. The current likely default is to split `A6cvl`, `A4hf`, `A1/2/3ulhf`, `A2`, and `A1/2/3tonIa`, with `A4tl` left as the first extension candidate.
+The current `DEFAULT_BASE_PARCELS` (16 parcels) and split candidates (`A6cvl`, `A4hf`, `A1/2/3ulhf`, `A2`, `A1/2/3tonIa`, + `A4tl` extension) were computed under the quarantined v12 / centroid-VE pipeline — node routing with 25/15 mm reachability thresholds over all 11 PS patients including S22/S58 (RH) and S32/S57 (excluded). None of that methodology survives into Phase 1. The ranking must be recomputed using volumetric Brainnetome PM membership (per `#5`) over the effective Phase 1 patient set `S14, S16, S23, S26, S33, S39, S62` (7 patients; RH and S32/S57 excluded). Upstream dependencies: `#1` (ACPC→MNI) and `#12` (channel-map bridge). Output: a per-parcel × per-patient coverage matrix over *all* LH BNA parcels, a ranked list, and a Phase 1 base parcel set chosen from it. The default split map is then re-derived from parcel-frame sigmas in `parcel_frames.npz` (`#10`). Sets `N_tok`, `K_l`, and token-level connectivity bias expansion — blocks every summarizer and backbone decision downstream.
 
 - **Parcel support statistic — DECIDED 2026-04-13**
 
@@ -114,6 +113,38 @@ Concat-to-token: `token_support` is concatenated onto the token feature and proj
 - **Token-level connectivity expansion is not yet fully specified**
 
 The design assumes Brainnetome SC/FC initializes graph attention, but the exact token-level expansion rule is still open: SC vs FC, normalization, sibling-token bias, and random/no-bias fallback.
+
+- **Within-parcel cross-attention contract is not yet locked (blocker #26)**
+
+The one place where per-patient electrode space becomes shared atlas-token space. Open items: exact per-electrode input feature, whether cross-attention runs per time-step or over a flattened `(N_p × T)` set, number and sharing of latent queries across parcels, hard-vs-soft PM assignment of electrodes to parcels, and confirmation that `token_support` enters at the parcel-token level only (per `#7`) and not inside the electrode-side softmax. Depends on `#2`/`#6` temporal-output contract and `#10` parcel frames; blocks all summarizer code.
+
+- **Inter-region attention backbone contract is not yet locked (blocker #27)**
+
+Shared-dynamics stack over `(N_tok × d × T)` parcel tokens. Open items: joint spatiotemporal attention vs factored alternating spatial-then-temporal vs axial; block count `B`; per-block structure (pre-/post-norm, FFN width, dropout, residuals); heads and head dim per axis; how Brainnetome SC/FC bias enters the spatial softmax (additive logit, learnable gain, per-head vs shared); temporal positional structure (RoPE vs relative bias vs absolute PE — no Fourier PE); `token_mask` propagation and whether absent-parcel rows are skipped or zeroed; whether `token_support` is injected once or per-block; readout handoff shape to the AR decoder; parameter-count budget against the ~11 min/patient regime. Depends on `#26`, `#8`, `#9`, `#6`; blocks all backbone code.
+
+- **AR cross-attention decoder contract is not yet locked (blocker #28)**
+
+Rough shape known — 3 AR-conditioned decode queries cross-attend over the backbone output — but the fine details that govern training and eval are all still open. Open items: fixed-length-3 vs `<eos>`-terminated; query design (independent vs shared-query + slot embedding); AR conditioning mechanism (previous-token embedding added to query vs causal self-attention over past slots vs concat-and-project); cross-attention keys/values shape and whether to add a positional tag; output head (shared vs per-slot); loss (plain CE vs label smoothing vs focal); teacher forcing vs scheduled sampling; greedy vs beam at eval; parameter budget. Depends on `#9`, `#16`, `#17`, `#26`, `#27`, `#21`; blocks all decoder code.
+
+- **Input window / epoching contract — DECIDED 2026-04-13**
+
+Response-onset-locked full-trial epoch. `tmin = -0.5 s`, `tmax = 1.0 s`. Not MFA per-phoneme. One sample = one trial = three phonemes as decoder target. This is what the v14 AR cross-attention decoder (`#28`) was designed for; per-phoneme MFA epochs break the continuous `N_tok · T` cross-attention key set. The `-0.5 s` pre-onset window catches late stimulus-listening and motor-planning activity (auditory stimulus ends ~600 ms before response onset); the `1.0 s` post-onset tail covers the ~450 ms utterance plus a buffer. `tmin` may shorten after a closer look at the data — left as an explicit one-conversation revisit, not a blocker. Closes the "supervised input window" sub-item of `#9`.
+
+- **Phase 1 right-hemisphere exclusion — DECIDED 2026-04-13**
+
+Phase 1 excludes S22 and S58 from training and eval. Core set unchanged (S14, S26, S33, S62 — all LH). Phase 1 extended set is LH-only: S16, S23, S39. Right-hemisphere routing to RH Brainnetome parcels is a real design decision (affects `N_tok` semantics, hemisphere-agnostic vs per-hemisphere indexing, mixed-hemisphere batching) and is deferred to Phase 2 with the sEEG modality join. `parcel_frames.npz` still builds both hemispheres by construction; Phase 1 just never loads RH data.
+
+- **Patient-mixing and batching policy is not yet locked (blocker #31)**
+
+How samples from different patients compose inside a batch, and whether the first supervised `v14-core` run is per-patient or joint across core patients. Open items: first-run structure (per-patient first vs joint from day one — default expectation is per-patient first to match the `0.734 ± 0.007` baseline comparison on S14); variable `N_ch` handling across patients (grouped-by-patient sampler as default, padded joint batches as upgrade); per-sample vs per-patient `token_mask` emission; sampler shuffling rule; fixed-trials vs per-patient-variable batch sizes; per-trial vs per-patient loss weighting; CV filtering applied before batching; joint-batch future-compatibility of the sampler interface; gradient accumulation policy on the DCC memory envelope. Depends on `#13`, `#29`, `#30`, `#11`; blocks the v14 data loader and training loop.
+
+- **Input normalization at the v14 boundary — DECIDED 2026-04-13**
+
+No additional normalization beyond upstream `productionZscore_highgamma`. The loader hands z-scored HGA features to the model directly. Per-sample / per-batch / per-patient re-normalization is explicitly rejected. In-model `LayerNorm` at the point encoder or temporal front-end is a separate architectural choice belonging to `#2` / `#6`, not a data-side normalization.
+
+- **PER metric exact definition — DECIDED 2026-04-13**
+
+Slot-averaged PER: `PER = 1 − (correct slots / total slots)` across all three slots of every trial, averaged over all trials in the held-out fold. Matches the old per-phoneme baseline `0.734 ± 0.007` so the v14 comparison is apples-to-apples. Reported per-patient and as a population mean; 3-seed aggregation is mean ± std across seeds. Per-slot PER (slot 0 / 1 / 2 separately) is a diagnostic for the first run only, not a headline number.
 
 - **Supervised training contract is not yet fully locked**
 
