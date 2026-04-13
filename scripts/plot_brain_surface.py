@@ -1,24 +1,45 @@
 #!/usr/bin/env python3
-"""Plot electrodes + VEs on 3D fsaverage cortical surface using nilearn.
+"""Render Brainnetome parcellations on fsaverage.
 
-Generates interactive HTML (rotatable in browser) and static PNG views.
+Outputs:
+- docs/figures/brainnetome_parcellations_surface.png
+- docs/figures/brainnetome_parcellations_interactive.html
+
+The preferred source is the official Brainnetome probabilistic atlas
+`BNA_PM_4D.nii.gz`. For local development, `--allow-mpm-proxy` falls back to
+Gaussian-smoothed masks derived from the MPM atlas.
 """
+from __future__ import annotations
+
+import argparse
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+import matplotlib
+import nibabel as nib
 import numpy as np
+import plotly.graph_objects as go
+from matplotlib.colors import to_rgb
+from matplotlib.patches import Patch
+from nilearn import datasets, image, surface
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from speech_decoding.data.atlas import (
-    SPEECH_ROIS_CORE,
-    _SPEECH_ROIS_EXTENDED,
+from speech_decoding.data.atlas import (  # noqa: E402
+    OFFICIAL_CANDIDATE_ROIS,
+    ROI_BRAINNETOME_INDEX,
+    ROI_CATEGORIES,
+    get_brainnetome_roi_index,
+    get_roi_categories,
     get_roi_labels,
-    get_virtual_electrode_positions,
 )
-from speech_decoding.data.coordinates import (
+from speech_decoding.data.coordinates import (  # noqa: E402
     apply_talairach_transform,
     build_electrode_coordinates,
     load_talairach_transform,
@@ -29,29 +50,65 @@ COORDS_DIR = DATA_DIR / "mni_coords"
 CHANMAP_DIR = DATA_DIR / "channel_maps"
 TRANSFORM_DIR = DATA_DIR / "transforms"
 
-CORE_PATIENTS = ["S14", "S26", "S33", "S62"]
-EXTENDED_PATIENTS = ["S16", "S22", "S23", "S39", "S58"]
-EXCLUDED_PATIENTS = ["S32", "S57"]
 PATIENTS_128CH = {"S14", "S16", "S22", "S23", "S26"}
-ALL_PATIENTS = CORE_PATIENTS + EXTENDED_PATIENTS + EXCLUDED_PATIENTS
+ALL_PATIENTS = ["S14", "S16", "S22", "S23", "S26", "S32", "S33", "S39", "S57", "S58", "S62"]
 
-PATIENT_COLORS = {
-    "S14": "#1f77b4", "S26": "#2ca02c", "S33": "#ff7f0e", "S62": "#9467bd",
-    "S16": "#8c564b", "S22": "#e377c2", "S23": "#7f7f7f", "S39": "#bcbd22",
-    "S58": "#17becf", "S32": "#d3d3d3", "S57": "#c0c0c0",
+ROI_COLORS = {
+    "A6cvl": "#b9352f",
+    "A4tl": "#e17c2c",
+    "A4hf": "#ef625d",
+    "A1/2/3tonIa": "#f1a93b",
+    "A1/2/3ulhf": "#f3ca52",
+    "A2": "#90c657",
+    "A44d": "#3a7bbf",
+    "A45c": "#5d9ddb",
+    "A44v": "#3756a8",
+    "A45i": "#6b66b9",
+    "A45r": "#8a6bbf",
+    "A44op": "#4ca2a4",
+    "STGpp": "#2a9d8f",
+    "STGa": "#58c5c8",
+    "INSa": "#a05dbd",
+    "MFG": "#7d6a58",
+    "A6cdl": "#6f3cba",
 }
 
-VE_CATEGORIES = {
-    "A4hf": "Motor", "A4tl": "Motor",
-    "A6cdl": "Premotor", "A6cvl": "Premotor",
-    "A1/2/3ulhf": "Sensory", "A1/2/3tonIa": "Sensory", "A2": "Sensory",
-    "A44d": "Broca", "A44v": "Broca", "A45c": "Broca",
+CATEGORY_COLORS = {
+    "Motor": "#d1493f",
+    "Sensory": "#e9b949",
+    "Broca": "#5079d8",
+    "Auditory": "#2ca59b",
+    "Insula": "#9d5fc5",
+    "Executive": "#7d6a58",
 }
 
-VE_CATEGORY_COLORS = {
-    "Motor": "#d62728", "Sensory": "#ff7f0e",
-    "Broca": "#2ca02c", "Premotor": "#9467bd",
-}
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pm-atlas",
+        type=Path,
+        default=Path.home() / "nilearn_data" / "BNA_PM_4D.nii.gz",
+        help="Official Brainnetome probabilistic atlas.",
+    )
+    parser.add_argument(
+        "--mpm-atlas",
+        type=Path,
+        default=Path.home() / "nilearn_data" / "bnatlas.nii.gz",
+        help="Brainnetome MPM atlas used only for explicit proxy fallback.",
+    )
+    parser.add_argument(
+        "--allow-mpm-proxy",
+        action="store_true",
+        help="Fall back to smoothed MPM masks if the PM atlas is missing.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=project_root / "docs" / "figures",
+        help="Figure output directory.",
+    )
+    return parser.parse_args()
 
 
 def load_patient_mni(patient_id: str) -> np.ndarray:
@@ -67,204 +124,452 @@ def load_patient_mni(patient_id: str) -> np.ndarray:
     ch_names = list(elec.coords.keys())
     acpc = elec.to_array(ch_names)
     valid = ~np.isnan(acpc).any(axis=1)
-    acpc = acpc[valid]
     affine = load_talairach_transform(xfm_path)
-    return apply_talairach_transform(acpc, affine)
+    return apply_talairach_transform(acpc[valid], affine)
 
 
-def plot_surface_matplotlib(patient_mni: dict, output_path: Path):
-    """Render electrodes on fsaverage pial surface using matplotlib (static)."""
-    from nilearn import datasets
-    from nilearn.surface import load_surf_mesh
+def load_roi_volumes(
+    roi_labels: list[str],
+    pm_path: Path,
+    mpm_path: Path,
+    allow_mpm_proxy: bool,
+) -> tuple[dict[str, nib.spatialimages.SpatialImage], str]:
+    if pm_path.exists():
+        pm_img = nib.load(str(pm_path))
+        if len(pm_img.shape) != 4:
+            raise ValueError(f"Expected 4D PM atlas at {pm_path}, got {pm_img.shape}.")
+        roi_imgs = {}
+        for label in roi_labels:
+            roi_idx = get_brainnetome_roi_index(label)
+            roi_imgs[label] = image.index_img(pm_img, roi_idx - 1)
+        return roi_imgs, "pm"
 
-    fsaverage = datasets.fetch_surf_fsaverage("fsaverage")
-    pial_left = load_surf_mesh(fsaverage.pial_left)
-    coords_surf = pial_left.coordinates
-    faces_surf = pial_left.faces
-
-    ve_pos = get_virtual_electrode_positions("core")
-    ve_labels = get_roi_labels("core")
-
-    # Extended VEs (for comparison)
-    ve_ext_pos = np.array([[x, y, z] for _, _, x, y, z in _SPEECH_ROIS_EXTENDED])
-    ve_ext_labels = [label for label, _, _, _, _ in _SPEECH_ROIS_EXTENDED]
-
-    fig = plt.figure(figsize=(20, 10))
-
-    views = [
-        ("Left lateral", -90, 0),
-        ("Left lateral (tilted)", -75, 15),
-        ("Ventral-lateral", -70, -20),
-        ("Anterior", -180, 0),
-    ]
-
-    for idx, (title, azim, elev) in enumerate(views):
-        ax = fig.add_subplot(1, 4, idx + 1, projection="3d")
-
-        # Draw brain surface (subsample triangles for speed)
-        ax.plot_trisurf(
-            coords_surf[:, 0], coords_surf[:, 1], coords_surf[:, 2],
-            triangles=faces_surf[::4],  # every 4th face for speed
-            color="#e8d4c0", alpha=0.15, edgecolor="none",
-            linewidth=0,
+    if not allow_mpm_proxy:
+        raise FileNotFoundError(
+            f"Missing {pm_path}. Download the official Brainnetome PM atlas or rerun "
+            "with --allow-mpm-proxy for a local proxy render."
         )
 
-        # Patient electrodes
-        for pid in ALL_PATIENTS:
-            if pid not in patient_mni:
-                continue
-            mni = patient_mni[pid]
-            is_core = pid in CORE_PATIENTS
-            ax.scatter(
-                mni[:, 0], mni[:, 1], mni[:, 2],
-                c=PATIENT_COLORS[pid],
-                s=8 if is_core else 3,
-                alpha=0.8 if is_core else 0.25,
-                label=pid if idx == 0 else None,
-                edgecolors="none", depthshade=True,
-            )
+    mpm_img = nib.load(str(mpm_path))
+    mpm_data = np.nan_to_num(np.asarray(mpm_img.dataobj), nan=0.0)
+    roi_imgs = {}
+    for label in roi_labels:
+        roi_idx = get_brainnetome_roi_index(label)
+        mask = (mpm_data == roi_idx).astype(np.float32)
+        smooth = gaussian_filter(mask, sigma=5.0)
+        if smooth.max() > 0:
+            smooth /= smooth.max()
+        roi_imgs[label] = nib.Nifti1Image(smooth, mpm_img.affine)
+    return roi_imgs, "mpm-proxy"
 
-        # Core VEs — large colored spheres
-        for i, label in enumerate(ve_labels):
-            cat = VE_CATEGORIES[label]
-            color = VE_CATEGORY_COLORS[cat]
-            ax.scatter(
-                [ve_pos[i, 0]], [ve_pos[i, 1]], [ve_pos[i, 2]],
-                c=color, s=150, marker="o", alpha=0.95,
-                edgecolors="black", linewidths=0.8, depthshade=False,
-                zorder=10,
-            )
-            # Label on select views
-            if idx in (0, 1):
-                ax.text(
-                    ve_pos[i, 0] + 2, ve_pos[i, 1] + 2, ve_pos[i, 2] + 2,
-                    label.replace("1/2/3", ""), fontsize=5.5,
-                    color=color, fontweight="bold", alpha=0.9,
-                )
 
-        # Extended VEs — small hollow diamonds
-        for i, label in enumerate(ve_ext_labels):
-            ax.scatter(
-                [ve_ext_pos[i, 0]], [ve_ext_pos[i, 1]], [ve_ext_pos[i, 2]],
-                c="none", s=60, marker="D", alpha=0.6,
-                edgecolors="gray", linewidths=1.0, depthshade=False,
-            )
-            if idx == 1:
-                ax.text(
-                    ve_ext_pos[i, 0] + 2, ve_ext_pos[i, 1], ve_ext_pos[i, 2],
-                    label.replace("1/2/3", ""), fontsize=4.5,
-                    color="gray", alpha=0.6,
-                )
+def project_probabilities(
+    roi_imgs: dict[str, nib.spatialimages.SpatialImage],
+    mesh_for_sampling: str,
+) -> dict[str, np.ndarray]:
+    surf_probs: dict[str, np.ndarray] = {}
+    for label, img in roi_imgs.items():
+        prob = surface.vol_to_surf(
+            img,
+            mesh_for_sampling,
+            interpolation="linear",
+            radius=3.0,
+            kind="ball",
+            n_samples=20,
+        )
+        prob = np.nan_to_num(prob, nan=0.0, posinf=0.0, neginf=0.0)
+        if prob.max() > 1.0:
+            scale = 100.0 if prob.max() <= 100.0 else prob.max()
+            prob = prob / scale
+        surf_probs[label] = np.clip(prob, 0.0, 1.0)
+    return surf_probs
 
-        ax.view_init(elev=elev, azim=azim)
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("X", fontsize=7)
-        ax.set_ylabel("Y", fontsize=7)
-        ax.set_zlabel("Z", fontsize=7)
-        ax.tick_params(labelsize=5)
 
-        # Zoom to electrode region
-        ax.set_xlim(-80, -25)
-        ax.set_ylim(-45, 60)
-        ax.set_zlim(-25, 65)
+def snap_points_to_surface(
+    points: np.ndarray,
+    source_coords: np.ndarray,
+    target_coords: np.ndarray,
+    tree: cKDTree,
+) -> np.ndarray:
+    if len(points) == 0:
+        return np.empty((0, 3))
+    _, indices = tree.query(points, k=1)
+    return target_coords[indices]
 
-    # Legend
-    from matplotlib.lines import Line2D
-    handles = []
-    for pid in CORE_PATIENTS:
-        handles.append(Line2D([0], [0], marker="o", color="w",
-                              markerfacecolor=PATIENT_COLORS[pid], markersize=7,
-                              label=f"{pid} (core)"))
-    for pid in EXTENDED_PATIENTS:
-        handles.append(Line2D([0], [0], marker="o", color="w",
-                              markerfacecolor=PATIENT_COLORS[pid], markersize=5,
-                              label=pid, alpha=0.4))
-    handles.append(Line2D([0], [0], color="w", label=""))
-    for cat, color in VE_CATEGORY_COLORS.items():
-        handles.append(Line2D([0], [0], marker="o", color="w",
-                              markerfacecolor=color, markersize=9,
-                              markeredgecolor="black", markeredgewidth=0.5,
-                              label=f"VE: {cat}"))
-    handles.append(Line2D([0], [0], marker="D", color="w",
-                          markerfacecolor="none", markeredgecolor="gray",
-                          markersize=7, label="VE: extended (dropped)"))
 
-    fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=7,
-               frameon=True)
-    fig.suptitle(
-        "Electrode Arrays + Virtual Electrodes on fsaverage Pial Surface\n"
-        "Solid circles = 10 core VEs  |  Diamonds = 6 extended VEs (dropped, >30mm from all)",
-        fontsize=12, y=0.98,
+def compute_display_colors(
+    surf_probs: dict[str, np.ndarray],
+    roi_labels: list[str],
+    base_gray: tuple[float, float, float] = (0.86, 0.86, 0.86),
+) -> np.ndarray:
+    stacked = np.stack([surf_probs[label] for label in roi_labels], axis=0).astype(np.float64)
+    n_vertices = stacked.shape[1]
+    boosted = np.power(np.clip(stacked, 0.0, 1.0), 0.55)
+    dominant_idx = boosted.argmax(axis=0)
+    dominant_weight = boosted.max(axis=0)
+
+    dominant_rgb = np.tile(np.asarray(base_gray), (stacked.shape[1], 1))
+    palette = np.asarray([to_rgb(ROI_COLORS[label]) for label in roi_labels], dtype=np.float64)
+    active = dominant_weight > 0
+    dominant_rgb[active] = palette[dominant_idx[active]]
+
+    if active.any():
+        alpha = dominant_weight / np.percentile(dominant_weight[active], 90)
+    else:
+        alpha = dominant_weight
+    alpha = np.clip(alpha, 0.0, 1.0) * 0.98
+
+    rgb = np.asarray(base_gray)[None, :] * (1.0 - alpha[:, None]) + dominant_rgb * alpha[:, None]
+    return np.column_stack([rgb, np.ones(n_vertices)])
+
+
+def face_colors_from_vertex_rgba(vertex_rgba: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    return vertex_rgba[faces].mean(axis=1)
+
+
+def render_static(
+    output_path: Path,
+    infl_coords: np.ndarray,
+    infl_faces: np.ndarray,
+    roi_labels: list[str],
+    surf_probs: dict[str, np.ndarray],
+    snapped_electrodes: np.ndarray,
+    source_mode: str,
+) -> None:
+    fig = plt.figure(figsize=(10.5, 6.0))
+    ax = fig.add_subplot(1, 2, 1, projection="3d")
+    legend_ax = fig.add_subplot(1, 2, 2)
+
+    vertex_rgba = compute_display_colors(surf_probs, roi_labels)
+    face_rgba = face_colors_from_vertex_rgba(vertex_rgba, infl_faces)
+
+    trisurf = ax.plot_trisurf(
+        infl_coords[:, 0],
+        infl_coords[:, 1],
+        infl_coords[:, 2],
+        triangles=infl_faces,
+        linewidth=0.0,
+        antialiased=False,
+        shade=False,
     )
-    plt.tight_layout(rect=(0, 0.06, 1, 0.93))
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    print(f"Saved surface plot: {output_path}")
+    trisurf.set_facecolors(face_rgba)
+    trisurf.set_edgecolors("none")
+
+    if len(snapped_electrodes) > 0:
+        ax.scatter(
+            snapped_electrodes[:, 0],
+            snapped_electrodes[:, 1],
+            snapped_electrodes[:, 2],
+            s=2.8,
+            c="#444444",
+            alpha=0.14,
+            depthshade=False,
+        )
+
+    ax.view_init(elev=14, azim=-92)
+    mins = infl_coords.min(axis=0)
+    maxs = infl_coords.max(axis=0)
+    pad = np.array([4.0, 3.0, 3.0])
+    ax.set_xlim(mins[0] - pad[0], maxs[0] + pad[0])
+    ax.set_ylim(mins[1] - pad[1], maxs[1] + pad[1])
+    ax.set_zlim(mins[2] - pad[2], maxs[2] + pad[2])
+    ax.set_axis_off()
+    ax.set_box_aspect((1.55, 1.05, 0.85))
+
+    legend_ax.axis("off")
+    legend_handles = [Patch(facecolor=ROI_COLORS[label], edgecolor="none", label=label) for label in roi_labels]
+    legend = legend_ax.legend(
+        handles=legend_handles,
+        loc="center left",
+        frameon=False,
+        fontsize=9,
+        ncol=2,
+        handlelength=1.2,
+        handletextpad=0.4,
+        columnspacing=1.1,
+    )
+    legend_ax.add_artist(legend)
+    legend_ax.text(0.0, 0.12, "Context", fontsize=10, fontweight="bold", transform=legend_ax.transAxes)
+    legend_ax.text(
+        0.0,
+        0.05,
+        "Gray points = pooled patient electrodes",
+        fontsize=8,
+        color="#444444",
+        transform=legend_ax.transAxes,
+    )
+    fig.suptitle("Brainnetome Speech Parcellations on fsaverage", fontsize=14, y=0.97)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
 
 
-def plot_interactive_html(patient_mni: dict, output_path: Path):
-    """Generate interactive HTML brain view using nilearn view_surf."""
-    from nilearn import datasets, plotting, surface
+def build_roi_trace(
+    label: str,
+    probs: np.ndarray,
+    coords: np.ndarray,
+    visible: bool = True,
+    max_points: int = 9000,
+    threshold: float = 0.12,
+) -> go.Scatter3d:
+    idx = np.flatnonzero(probs > threshold)
+    if len(idx) > max_points:
+        top = np.argsort(probs[idx])[-max_points:]
+        idx = idx[top]
+    sel_probs = probs[idx]
+    color = np.asarray(to_rgb(ROI_COLORS[label]))
+    colors = [
+        f"rgba({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)},{0.28 + 0.62*float(p):.3f})"
+        for p in sel_probs
+    ]
+    category = ROI_CATEGORIES[label]
+    return go.Scatter3d(
+        x=coords[idx, 0],
+        y=coords[idx, 1],
+        z=coords[idx, 2],
+        mode="markers",
+        marker=dict(size=2.6, color=colors),
+        name=f"{label} ({category})",
+        customdata=sel_probs[:, None],
+        hovertemplate=f"{label}<br>category={category}<br>p=%{{customdata[0]:.2f}}<extra></extra>",
+        visible=visible,
+        showlegend=True,
+    )
 
-    fsaverage = datasets.fetch_surf_fsaverage("fsaverage")
 
-    pial_mesh = surface.load_surf_mesh(fsaverage.pial_left)
-    surf_coords = pial_mesh.coordinates
-    n_vertices = len(surf_coords)
+def render_interactive(
+    output_path: Path,
+    infl_coords: np.ndarray,
+    infl_faces: np.ndarray,
+    roi_labels: list[str],
+    surf_probs: dict[str, np.ndarray],
+    snapped_electrodes: np.ndarray,
+    candidate_probs: dict[str, np.ndarray],
+    candidate_points: dict[str, np.ndarray],
+    source_mode: str,
+) -> None:
+    mesh_trace = go.Mesh3d(
+        x=infl_coords[:, 0],
+        y=infl_coords[:, 1],
+        z=infl_coords[:, 2],
+        i=infl_faces[:, 0],
+        j=infl_faces[:, 1],
+        k=infl_faces[:, 2],
+        color="rgba(165,175,190,0.18)",
+        opacity=0.16,
+        name="fsaverage surface",
+        hoverinfo="skip",
+        showlegend=False,
+        lighting=dict(ambient=0.55, diffuse=0.55, specular=0.12, roughness=0.95),
+    )
 
-    # Stat map: 0 = background, 1-4 = core patients, 5 = VE
-    stat_map = np.zeros(n_vertices, dtype=np.float64)
+    traces: list[go.BaseTraceType] = [mesh_trace]
 
-    # Paint surface near electrodes with patient-specific values
-    for pid_idx, pid in enumerate(CORE_PATIENTS):
-        if pid not in patient_mni:
+    electrode_trace = go.Scatter3d(
+        x=snapped_electrodes[:, 0],
+        y=snapped_electrodes[:, 1],
+        z=snapped_electrodes[:, 2],
+        mode="markers",
+        marker=dict(
+            size=2.4,
+            color="rgba(245,248,252,0.72)",
+            line=dict(color="rgba(8,10,14,0.95)", width=1.0),
+        ),
+        name="Pooled electrodes",
+        hoverinfo="skip",
+        visible=False,
+        showlegend=True,
+    )
+    traces.append(electrode_trace)
+
+    for label in roi_labels:
+        traces.append(build_roi_trace(label, surf_probs[label], infl_coords, visible=True))
+
+    candidate_start = len(traces)
+    for label in OFFICIAL_CANDIDATE_ROIS:
+        if label not in candidate_probs:
             continue
-        mni = patient_mni[pid]
-        # Vectorized: distance from all vertices to all electrodes
-        # Process in chunks to avoid memory blowup
-        for elec in mni:
-            dists = np.sqrt(((surf_coords - elec) ** 2).sum(axis=1))
-            nearby = dists < 5  # 5mm radius
-            stat_map[nearby] = pid_idx + 1
+        traces.append(build_roi_trace(label, candidate_probs[label], infl_coords, visible=False, threshold=0.04))
+        point = candidate_points[label]
+        traces.append(
+            go.Scatter3d(
+                x=[point[0]],
+                y=[point[1]],
+                z=[point[2]],
+                mode="markers+text",
+                marker=dict(size=5.0, color=ROI_COLORS[label], line=dict(color="black", width=0.5)),
+                text=[label],
+                textposition="top center",
+                name=f"{label} centroid",
+                hovertemplate=f"{label}<br>official candidate<extra></extra>",
+                visible=False,
+                showlegend=False,
+            )
+        )
 
-    # Paint VE locations
-    ve_pos = get_virtual_electrode_positions("core")
-    for ve in ve_pos:
-        dists = np.sqrt(((surf_coords - ve) ** 2).sum(axis=1))
-        nearby = dists < 4
-        stat_map[nearby] = 6  # distinct from patients
+    fig = go.Figure(data=traces)
 
-    view = plotting.view_surf(
-        fsaverage.infl_left,
-        stat_map,
-        cmap="tab10",
-        symmetric_cmap=False,
-        threshold=0.5,
-        title="Electrode coverage on fsaverage (core patients + VEs)",
+    n_traces = len(traces)
+    base_visible = [False] * n_traces
+    base_visible[0] = True
+    for idx in range(2, candidate_start):
+        base_visible[idx] = True
+
+    with_electrodes = base_visible.copy()
+    with_electrodes[1] = True
+
+    with_candidate = base_visible.copy()
+    for idx in range(candidate_start, n_traces):
+        with_candidate[idx] = True
+
+    with_all = with_electrodes.copy()
+    for idx in range(candidate_start, n_traces):
+        with_all[idx] = True
+
+    title = "Brainnetome Speech Parcellations (pm)"
+    if source_mode != "pm":
+        title = "Brainnetome Speech Parcellations (proxy)"
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            aspectmode="data",
+            camera=dict(eye=dict(x=-1.75, y=-0.12, z=0.42)),
+            dragmode="orbit",
+            bgcolor="rgb(12,14,18)",
+        ),
+        paper_bgcolor="rgb(12,14,18)",
+        plot_bgcolor="rgb(12,14,18)",
+        font=dict(color="rgb(232,236,242)"),
+        margin=dict(l=0, r=0, t=50, b=0),
+        legend=dict(
+            x=0.01,
+            y=0.99,
+            bgcolor="rgba(18,22,30,0.82)",
+            bordercolor="rgba(255,255,255,0.10)",
+            borderwidth=1,
+            font=dict(size=11),
+        ),
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="right",
+                x=0.01,
+                y=1.08,
+                buttons=[
+                    dict(label="Active 16", method="update", args=[{"visible": base_visible}]),
+                    dict(label="+ Electrodes", method="update", args=[{"visible": with_electrodes}]),
+                    dict(label="+ A6cdl", method="update", args=[{"visible": with_candidate}]),
+                    dict(label="All layers", method="update", args=[{"visible": with_all}]),
+                ],
+            )
+        ],
+        annotations=[
+            dict(
+                x=0.01,
+                y=1.015,
+                xref="paper",
+                yref="paper",
+                text="Drag to rotate. Scroll/right-drag to zoom. Shift-drag to pan. Buttons toggle layers.",
+                showarrow=False,
+                font=dict(size=11, color="rgb(200,205,214)"),
+            )
+        ],
     )
-    view.save_as_html(str(output_path))
-    print(f"Saved interactive HTML: {output_path}")
-    print(f"Open in browser: file://{output_path}")
+
+    fig.write_html(
+        str(output_path),
+        include_plotlyjs=True,
+        full_html=True,
+        config={
+            "displayModeBar": True,
+            "scrollZoom": True,
+            "displaylogo": False,
+            "responsive": True,
+        },
+    )
 
 
-def main():
-    output_dir = project_root / "docs" / "figures"
-    output_dir.mkdir(exist_ok=True)
+def main() -> None:
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    patient_mni = {}
-    for pid in ALL_PATIENTS:
-        try:
-            patient_mni[pid] = load_patient_mni(pid)
-        except Exception as e:
-            print(f"WARN: {pid}: {e}")
+    roi_labels = get_roi_labels("core")
+    patient_mni = {pid: load_patient_mni(pid) for pid in ALL_PATIENTS}
 
-    # Static matplotlib surface plot
-    plot_surface_matplotlib(patient_mni, output_dir / "electrodes_brain_surface.png")
+    fsaverage = datasets.fetch_surf_fsaverage(mesh="fsaverage")
+    infl_mesh = surface.load_surf_mesh(fsaverage.infl_left)
+    pial_mesh = surface.load_surf_mesh(fsaverage.pial_left)
+    infl_coords = infl_mesh.coordinates
+    infl_faces = infl_mesh.faces
+    pial_coords = pial_mesh.coordinates
+    pial_faces = pial_mesh.faces
+    pial_tree = cKDTree(pial_coords)
 
-    # Interactive HTML
-    try:
-        plot_interactive_html(patient_mni, output_dir / "electrodes_brain_interactive.html")
-    except Exception as e:
-        print(f"Interactive HTML failed: {e}")
+    roi_imgs, source_mode = load_roi_volumes(
+        roi_labels,
+        pm_path=args.pm_atlas,
+        mpm_path=args.mpm_atlas,
+        allow_mpm_proxy=args.allow_mpm_proxy,
+    )
+    surf_probs = project_probabilities(roi_imgs, fsaverage.pial_left)
+
+    candidate_imgs, _ = load_roi_volumes(
+        OFFICIAL_CANDIDATE_ROIS,
+        pm_path=args.pm_atlas,
+        mpm_path=args.mpm_atlas,
+        allow_mpm_proxy=args.allow_mpm_proxy,
+    )
+    candidate_probs = project_probabilities(candidate_imgs, fsaverage.pial_left)
+
+    all_electrodes = np.vstack(list(patient_mni.values()))
+    snapped_electrodes = snap_points_to_surface(all_electrodes, pial_coords, pial_coords, pial_tree)
+
+    candidate_points = {}
+    for label in OFFICIAL_CANDIDATE_ROIS:
+        roi_idx = ROI_BRAINNETOME_INDEX[label]
+        if source_mode == "pm" and args.pm_atlas.exists():
+            vol = np.asarray(image.index_img(nib.load(str(args.pm_atlas)), roi_idx - 1).dataobj)
+        else:
+            vol = np.asarray(candidate_imgs[label].dataobj)
+        coords = np.argwhere(np.nan_to_num(vol) > (0.30 if source_mode == "pm" else 0.45))
+        if len(coords) == 0:
+            candidate_points[label] = snap_points_to_surface(
+                np.array([[0.0, 0.0, 0.0]]), pial_coords, pial_coords, pial_tree
+            )[0]
+            continue
+        world = nib.affines.apply_affine(candidate_imgs[label].affine, coords)
+        centroid = world.mean(axis=0, keepdims=True)
+        candidate_points[label] = snap_points_to_surface(centroid, pial_coords, pial_coords, pial_tree)[0]
+
+    render_static(
+        args.output_dir / "brainnetome_parcellations_surface.png",
+        infl_coords=pial_coords,
+        infl_faces=pial_faces,
+        roi_labels=roi_labels,
+        surf_probs=surf_probs,
+        snapped_electrodes=snapped_electrodes,
+        source_mode=source_mode,
+    )
+    render_interactive(
+        args.output_dir / "brainnetome_parcellations_interactive.html",
+        infl_coords=pial_coords,
+        infl_faces=pial_faces,
+        roi_labels=roi_labels,
+        surf_probs=surf_probs,
+        snapped_electrodes=snapped_electrodes,
+        candidate_probs=candidate_probs,
+        candidate_points=candidate_points,
+        source_mode=source_mode,
+    )
+
+    print(f"Saved static figure: {args.output_dir / 'brainnetome_parcellations_surface.png'}")
+    print(f"Saved interactive figure: {args.output_dir / 'brainnetome_parcellations_interactive.html'}")
+    if source_mode != "pm":
+        print("WARN: rendered with smoothed MPM proxy; drop in BNA_PM_4D.nii.gz for the true PM atlas.")
 
 
 if __name__ == "__main__":

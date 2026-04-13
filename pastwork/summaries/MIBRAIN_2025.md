@@ -167,3 +167,36 @@ For an unseen (m+1)-th subject, MIBRAIN uses a **channel similarity alignment + 
 7. **Two-stage training: self-supervised prototyping then supervised decoding.** Separating the cross-patient alignment objective (masked autoencoding) from the task-specific decoding (supervised classification) allows the shared representation space to be learned without task labels, which is valuable when labeled data is scarce. For intra-op: pre-train the prototype tokens on unlabeled or lightly labeled multi-patient data, then fine-tune the decoding head on the limited labeled intra-op trials.
 
 8. **Gradient-based region contribution scores (Grad-CAM variant).** Compute the contribution score of each brain region at each timestep as the ReLU of the gradient of the predicted label with respect to the region token. This provides a time-resolved importance map across regions that reveals the temporal sequence of speech-related cortical activations (SFG earliest, then frontal motor, then sensorimotor, then STG). This is an analysis tool, not a training objective, but provides interpretability for which grid zones are most informative at each time point within a trial.
+
+---
+
+## v12 Comparison (added 2026-04-07)
+
+**MIBRAIN is the closest prior work to v12.** Both independently converge on atlas-grounded region mapping for cross-patient intracranial decoding.
+
+### Convergent design choices
+- Atlas-defined brain regions as common representational space
+- Per-subject layers + shared backbone
+- Learnable representations for missing/uncovered regions
+- Self-attention across regions
+- SSL pretrain (masked autoencoding) → supervised fine-tune
+- Factored processing (region-independent temporal → cross-region attention)
+
+### v12 advantages over MIBRAIN
+1. **Soft vs hard assignment**: Distance-biased cross-attention (~25mm receptive fields) vs binary FreeSurfer parcellation. Handles border electrodes gracefully.
+2. **Lighter per-patient params**: 134 (diagonal + Δ/ω) vs ~2-5K (per-subject per-region Conv1D banks). Scales better.
+3. **Continuous spatial coordinates**: MNI + Fourier PE + distance bias. Finer spatial resolution than gyrus-level labels.
+4. **Cleaner new-patient handling**: LP-FT / TTO vs majority voting across all encoders (O(m), acknowledged as limitation).
+5. **Sequence decoding**: AR decoder for 52 CVC tokens vs single-class MLP for 23 consonants.
+6. **Per-electrode uncertainty weighting**: σ_j-based soft reliability mask. No MIBRAIN equivalent.
+7. **Explicit registration error correction**: Learned Δ/ω. No MIBRAIN equivalent.
+
+### MIBRAIN advantages over v12
+1. **Demonstrated results**: 11 patients with clear multi-sub > single-sub. v12 is still a design doc.
+2. **Whole-brain coverage**: sEEG reaches subcortical structures (hippocampus, amygdala, thalamus). Our uECOG is cortical-only.
+3. **Region masking SSL**: Spatial masking directly trains prototypes for cross-region relationships. Complementary to our temporal masking.
+4. **Online real-time decoding**: Demonstrated on 2 patients. We haven't attempted.
+5. **Token merging (ToMe)**: Dynamic functional grouping of regions. We don't have this.
+
+### New ablation suggested
+**A_ve_mask**: During SSL, randomly mask VE tokens and reconstruct from remaining VEs + temporal context. Directly trains VE content vectors. Complementary to temporal masking.

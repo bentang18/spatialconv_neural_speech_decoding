@@ -1,100 +1,206 @@
 # Current Direction
 
-Updated: 2026-04-08 (SSL simplified: JEPA L1 with temporal masking replaces 3-headed discriminative+JEPA hybrid. V-JEPA 2/2.1 recipe.)
+Updated: 2026-04-13 (repo cleaned for implementation; first pass narrowed to uECoG-only v14 correctness)
 
-## Active Priority: Intracranial Field Potential Foundation Model (v12)
+## Active Priority: Intracranial Field Potential Foundation Model (v14)
 
-**Design doc**: `docs/neural_field_perceiver_v12.tex`
+**Design doc**: `docs/neural_field_perceiver_v14.tex`
+**Implementation scope**: `docs/implementation_start.md`
+**Implementation task list**: `docs/implementation_tasks.md`
 
-**Architecture** (atlas-grounded multi-view reconstruction):
+**Two-problem decomposition** (atlas-guided calibration + shared dynamics):
+- **Problem 1 — Spatial Calibration**: Map raw electrodes into atlas-grounded parcel/subparcel tokens via Brainnetome volumetric membership. Long-term this may include small learned per-patient corrections, but Phase 1 uses a fixed atlas mapping once the ACPC→MNI pipeline is verified.
+- **Problem 2 — Shared Dynamics**: Map atlas-grounded parcel/subparcel tokens → phoneme sequence via a small relational-temporal model + AR decoder. Same `(N_tok × d × T)` token interface for every patient.
+
+**Active Phase-1 architecture contract**:
 ```
-electrode HGA + MNI coord
-→ Conv1d(1→d, k=10, s=10)           shared temporal binning
-→ s^(i) ⊙ x + b^(i)                per-patient diagonal (128 params/pt)
-→ + Fourier PE(MNI + Δ/ω)           directional spatial identity
-→ VE cross-attention (L=16 atlas, distance bias)  maps N_i → 16 common space
-→ [VE self-attn (16×16) → Temporal self-attn] × 2
-→ Lightweight AR: pos attn → [z̄_k; emb(y_{k-1})] → Linear(2d→9) × 3 + beam search (52 tokens)
+── Fixed Spatial Interface ──
+corrected electrode coordinates -> Brainnetome PM membership -> parcel support
+
+── Shared Processing ──
+(1) Shared temporal tokenizer                              -> (N_i × d × T)
+(2) Canonical parcel-frame local point encoding
+    + within-parcel Perceiver summarizer                   -> (N_tok × d × T)
+(3) [Inter-region graph attention
+     -> Temporal self-attn] × B                            -> (N_tok × d × T)
+(4) 3 AR-conditioned decode queries attend over N_tok·T    -> phoneme sequence
 ```
 
-~175K total params (B=2), 182 per-patient (128 diagonal + 6 geometric + 48 VE offsets). Per-patient VE positions (atlas + leashed offset ≤15mm) adapt to individual somatotopy. Electrode self-attention is an ablation (A_elec_attn), not default — detailed spatial layout varies too much (R²=0.05-0.13) for shared electrode-level spatial processing to transfer. The transferable signal is temporal dynamics at VE resolution. Dual spatial encoding: distance bias (proximity) + Fourier PE (direction). Lightweight AR decoder (4.1K). 16 Brainnetome atlas positions (N=40; somatotopic motor/sensory subdivisions > HCP-MMP for speech). Full-trial input tmin=-0.2, tmax=1.0s (premotor + production). Works identically for sEEG, uECoG, and macro-ECoG.
+Phase 1 assumptions:
+- fixed atlas mapping first; no learned `Δ/ω`, `δ_l`, or `τ_l` yet
+- no extra gain / impedance correction beyond the existing HGA preprocessing
+- no Fourier PE
+- no global electrode→region cross-attention
+- fixed `N_tok` layout with `token_mask` and `token_support`
+- supervised-only `uECoG` implementation before SSL or modality expansion
 
-**Paper direction**: First intracranial field potential (HGA) foundation model. Multi-view reconstruction framing: each patient is a camera view of a shared neural manifold; VEs are the template mesh; per-patient layers are camera calibration. BIT did this for Utah array spikes; nobody for HGA/field potentials.
+Long-term target: the same token interface, but with optional learned per-patient calibration once the fixed-atlas path is correct and stable.
 
-## Key Design Choices (2026-04-06)
+**Paper direction**: Atlas-grounded common-space decoding for intracranial field potentials. The scientific claim is that electrodes are patient-specific observations, while atlas parcel/subparcel tokens are the shared representation. Phase 1 is only the fixed-atlas supervised correctness pass.
 
-- **VEs over self-attention** — N=10 patients can't learn population-average anatomy from data. Atlas (Brainnetome, N=40; somatotopic subdivisions for speech) provides the spatial prior. Self-attention is an ablation (A_self_attn) testing whether the model can learn without the atlas.
-- **Distance-biased cross-attention** — creates ~25mm soft receptive fields around atlas positions, naturally accommodating 15-25mm inter-patient anatomical variation. Learned per-head scale α_h.
-- **Diagonal normalization over full affine** — impedance/gain = scale+offset, not rotation. 128/pt vs 4160/pt. Willett's full affine is for Utah array day-to-day drift; we have single-session surface electrodes.
-- **Δ/ω hard-clamped** — 15mm translation, 0.15 rad rotation. Covers worst-case registration error.
-- **Deformable atlas (ablation A_deform)** — per-patient per-VE position adjustments (+48/pt). Like 3D Morphable Model deformation. Tests nonlinear coordinate correction beyond global Δ/ω.
-- **Modality-agnostic** — same VE atlas for sEEG and uECoG. Full weight transfer in SSL.
-- **HGA ≠ spikes** — HGA is postsynaptic (inputs), spikes are action potentials (outputs). Different biophysics. Cannot pool across Utah arrays and surface/depth field potentials.
+## First Implementation Scope (2026-04-13)
+
+Before expanding to `sEEG`, external chronic ECoG, or SSL, the first executable target is:
+
+- **implement and verify `v14` on the existing intra-op `uECoG` data only**
+
+This means:
+
+- core patients first: `S14`, `S26`, `S33`, `S62`
+- architecture correctness before broad ablations
+- end-to-end overfit and token-construction sanity before scaling
+
+Deferred until the `uECoG` path is verified:
+
+- `sEEG`
+- external datasets
+- functional pooling variants
+
+The immediate next step after supervised `v14-core` correctness should be:
+
+- **SSL / JEPA on the full continuous `uECoG` corpus**
+
+Not:
+
+- SSL only on response-locked epochs
+
+Response-locked windows are the right unit for the first supervised decoding check. For SSL, the better default is the full continuous `uECoG` data because it preserves more temporal context and uses more of the limited intra-op recording time.
+
+Code boundary for the new implementation:
+
+- `src/speech_decoding/v14/`
+
+## Top Blocker (2026-04-13)
+
+- **ACPC → MNI transform pipeline is currently not trusted**
+
+Recent discussion with Zac indicates the current ACPC-to-MNI handling was wrong. This is now the top blocker ahead of model implementation, because every spatial step in `v14` depends on it:
+
+- Brainnetome membership
+- parcel support estimates
+- canonical parcel-frame coordinates
+- learned spatial calibration parameters
+
+Do not treat the current coordinate path as settled until the transform logic is re-verified.
+
+- **Unsupported-vs-weak parcel support threshold is not yet locked**
+
+The first implementation already assumes a fixed atlas-token interface with `token_mask` and `token_support`, but the rule separating:
+
+- unsupported parcels that should be masked out entirely
+- from weakly observed parcels that should stay active with low support
+
+is still unresolved. This matters because it changes the effective active-token set per patient and the semantics of low-coverage training cases.
+
+- **Default parcel split map is not yet fully locked**
+
+The current design assumes a 21-token default built from selective 2-token parcel splits, but that split set should still be treated as an explicit implementation decision. It affects the shared interface, the local summarizer, and the expansion of Brainnetome connectivity from parcels to token-level graph bias. The current likely default is to split `A6cvl`, `A4hf`, `A1/2/3ulhf`, `A2`, and `A1/2/3tonIa`, with `A4tl` left as the first extension candidate.
+
+- **Exact parcel support statistic is not yet locked**
+
+The model now depends on parcel support explicitly, but the exact support formula still needs to be frozen. This matters because it drives `token_mask`, `token_support`, and low-coverage behavior.
+
+- **Temporal-layer output contract is not yet locked**
+
+The temporal layer choice is not the whole issue; the exact output contract into the local summarizer also needs to be frozen. Token rate, receptive field, and time-axis semantics all still need to be written down explicitly.
+
+- **How `token_support` enters the model is not yet locked**
+
+The design assumes `token_support` exists, but not yet whether it is only diagnostic or also enters the backbone/decoder as an explicit signal. That remains an implementation blocker.
+
+- **Token-level connectivity expansion is not yet fully specified**
+
+The design assumes Brainnetome SC/FC initializes graph attention, but the exact token-level expansion rule is still open: SC vs FC, normalization, sibling-token bias, and random/no-bias fallback.
+
+- **Supervised training contract is not yet fully locked**
+
+Phase 1 is supervised-only, but the exact training contract still needs to be frozen: supervised input window, target semantics, decoder training behavior, and how train-time and eval-time decoding relate.
+
+- **Parcel-frame construction is not yet fully locked**
+
+The local summarizer depends on canonical parcel coordinates, but the exact parcel-frame construction rule still needs to be written down explicitly: centroids, axes, scales, and whether these are computed offline and cached.
+
+- **Channel inclusion policy is still not fully decided**
+
+It remains unresolved whether Phase 1 should use all non-artifact channels, sig-only channels, or another filtering rule. That changes support statistics and active-token counts, so it should be treated as a true implementation blocker rather than a minor preprocessing detail.
+
+- **No stale Brainnetome proxy fallback should be allowed**
+
+Phase 1 should use the real PM volume at `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz` as the active membership source. The MPM label map remains useful for ROI indexing and sanity checks only. The implementation should not silently fall back to the old smoothed-MPM pseudo-probability construction.
+
+## Key Design Choices (Phase-1 active assumptions only)
+
+- **Use the real Brainnetome PM volume** — Active membership source is `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`. Keep the MPM label map only for ROI indexing and sanity checks. Do not silently fall back to the old smoothed-MPM proxy.
+- **Within-parcel Perceiver summarizer is the default spatial mechanism** — Electrode→parcel mapping remains anatomy-guided aggregation, but the default parcel representation is now a small local point encoder plus fixed latent queries, not mean-only or mean+gradient pooling.
+- **Mean+gradient stays as the main linear ablation** — It is still useful as a lower-capacity baseline, but not the default shared spatial interface.
+- **Temporal front-end remains an explicit blocker** — The temporal layer and its output contract into the parcel summarizer are not frozen yet. Do not treat the current tokenizer sketch as settled.
+- **Coverage and support are explicit** — Unsupported parcels are masked, not hallucinated. Weakly supported parcels remain active with low support. The exact support statistic, threshold rule, and use of `token_support` are still blockers.
+- **Inter-region attention happens in token space** — After parcel summarization, the model operates on atlas/subparcel tokens, not on raw electrodes. Brainnetome SC/FC bias initialization is still intended, but the exact token-level expansion rule is not frozen yet.
+- **No learned per-patient calibration in Phase 1** — `Δ/ω`, `δ_l`, `τ_l`, and any extra gain/impedance correction are deferred until after the fixed-atlas supervised path is correct.
+- **Phase 1 is supervised-only on intra-op `uECoG`** — The first milestone is end-to-end correctness on the existing `uECoG` data. SSL, `sEEG`, and external datasets come only after that.
+- **Core patients first** — `S14`, `S26`, `S33`, `S62`. Keep `S32` and `S57` excluded for the first pass. Always exclude artifact channels. Channel inclusion beyond that is still a blocker.
 
 ## Immediate Next Steps
 
-1. **Request external chronic ECoG data (CRITICAL)** — Talk to Greg about PI-to-PI data requests:
-   - **Flinker/Chen lab (NYU)**: 48 patients, ECoG speech production. Code public (Chen 2024, Nature Machine Intelligence). Data upon request with sharing agreement.
-   - **Chang lab (UCSF)**: ~15-25 patients, high-density ECoG. Papers state "data available from corresponding author."
-   - **Bouchard/Chang Figshare**: 3 patients, CV syllables, **public today** — download immediately for pipeline validation.
-   - This is THE highest-leverage action. With external data: 2-stage pipeline (external SSL → per-patient supervised FT). Without: fallback 3-stage on CoganLab-only data.
-2. **Nonlinear MNI normalization (HARD BLOCKER)** — talairach.xfm is a 12-param linear affine; residual nonlinear error is ~5-15mm. Ask Zac: do T1 MRIs exist? If yes, ANTs SyN could halve error. Do before Phase 0.
-3. **HGA extraction pipeline** — 456 min raw EDF across 29 uECoG patients. Need CAR → filterbank → Hilbert → 200Hz. Blocker for fallback SSL pipeline.
-4. **v12 implementation** — Implement VE cross-attention architecture. Run Phase 0 sanity check on 4 core patients.
-5. **Brainnetome atlas VEs** — DONE (2026-04-06). 16 core ROIs selected (reachability-verified).
+1. ~~**v14 design doc rewrite**~~ — DONE (2026-04-10). Full rewrite: two-problem decomposition, parcellation pooling, cross-attention decoder, updated ablations.
+2. ~~**Update presentation doc**~~ — DONE (2026-04-10). `physics_informed_architecture.tex` rewritten for v14 (4 pages).
+3. **Fix and verify ACPC → MNI transform pipeline (TOP BLOCKER)** — current handling is not trusted; re-verify the coordinate chain with Zac before serious spatial-model implementation.
+4. **uECoG-only v14 implementation** — once coordinates are trustworthy, build the clean end-to-end path under `src/speech_decoding/v14/` and verify correctness on core patients before any modality expansion.
+5. **Full-corpus uECoG SSL after v14-core** — once supervised `v14-core` is stable, pretrain on the full continuous `uECoG` corpus rather than only response-locked epochs.
+6. **Nonlinear MNI normalization** — Only revisit this after the correct baseline ACPC→MNI path is confirmed. Do not optimize around the wrong transform.
+7. **Verify and wire the real probabilistic maps cleanly** — the local PM file now lives at `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`; verify orientation/indexing and use it as the active spatial-membership source.
+8. **Request external chronic ECoG data** — Greg → Flinker (48pts, NYU) + Chang (~15-25pts, UCSF). High leverage, but not on the critical path for the first local implementation.
+9. **HGA extraction pipeline** — 456 min raw EDF, 29 patients. Needed before SSL / broader scaling.
+10. **Linear/local ablations** — Mean+gradient pooling, selective splitting, and parcel-frame 2D conv compared against the default local summarizer after the core implementation is stable.
+11. **Large-scale generic iEEG pretraining watchlist** — SWEC (`~10,000 h`, MVPFormer release) belongs in the acquisition roadmap as a staged generic pretraining source, but not in the first implementation phase.
 
-## Data Readiness (audited 2026-04-05)
+## Data Readiness
 
-**Electrode coordinates**: ACPC space, 11/11 patients. `build_electrode_coordinates()` handles both 128-ch (chanMap) and 256-ch (direct) paths.
+**Electrode coordinates**:
+- ACPC electrode files exist for 11/11 patients.
+- ACPC-side channel/electrode bookkeeping is mostly checked.
+- The ACPC→MNI transform path is still the top blocker, so do not treat cross-patient spatial alignment as ready yet.
 
-**Artifact exclusion**: `exclude_artifacts=True` in `bids_dataset.py`. S39=20, S57=15, S58=37 channels excluded.
+**Brainnetome atlas**:
+- real PM volume is present at `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`
+- MPM label map remains useful for ROI indexing and sanity checks
+- remaining work is implementation-path verification of PM orientation/indexing, not atlas download
 
-**Raw continuous data**: 456 min across 29 unique patients (13 PS + 17 Lexical). EDF at 2kHz. Need HGA extraction.
+**Artifact exclusion**:
+- artifact-channel exclusion is active and should remain on for Phase 1
 
-**sEEG speech data**: ~1000 min (25 patients) on Box. Same temporal masking SSL, same architecture.
+**Raw continuous data**:
+- 456 min across 29 unique patients are available for later SSL
+- HGA extraction is still needed before that Phase 1.5 step
 
-**Patient selection**: Core: S14, S26, S33, S62. Excluded: S32 (no HG), S57 (52/256 sig). Extended: S16, S22, S23, S39, S58.
+**Patient selection**:
+- core: `S14`, `S26`, `S33`, `S62`
+- excluded for the first pass: `S32`, `S57`
+- extended set comes only after the core path is correct
 
-## Scalable Data Sources (all field potentials, all poolable)
-
-| Source | Modality | Hours | Status |
-|---|---|---|---|
-| CoganLab uECoG continuous | uECoG | ~7.6h | Have EDF, need HGA extraction (~52% task cycles, ~48% overhead) |
-| CoganLab sEEG speech | sEEG | ~16.7h | On Box, need to inventory |
-| CoganLab sEEG other tasks | sEEG | ? | Ask Zac |
-| Epilepsy monitoring (DABI, OpenNeuro) | sEEG/ECoG | 100s-1000s h | Public, need harmonization |
-| NOT poolable: Utah arrays | Spikes | — | Different biophysics |
-
-## Per-Patient Baseline (v12 must beat this)
+## Per-Patient Baseline (v14 must beat this)
 
 **PER 0.734 ± 0.007** (S14, grouped-by-token CV, 3-seed). Per-phoneme MFA flat head + full recipe.
 **Population: 0.825 mean** across 11 patients.
 
-## Experimental Design (overhauled 2026-04-07)
+## Ablation Posture
 
-Phased, ~43 experiments, ~108 runs. Each phase gates the next. See design doc Section 6 for full details.
+Do not treat the full ablation program as active until `v14-core` is implemented correctly.
 
-- **Phase 0**: Sanity + temporal window + sEEG coverage inventory — sweep tmin∈{-0.5,-0.3,-0.2,-0.1,0.0} and tmax∈{0.6,0.8,1.0} on per-patient v12 S14 (~8 runs), then cross-patient sanity check. Also: compute VE reachability for CoganLab sEEG patients (≥3 patients must cover motor VEs to justify Stage 1 SSL).
-- **Phase 1**: Scaling — N-scaling curve (1→2→4→7→10 patients) + sEEG cross-modality transfer
-- **Phase 2**: Mechanism — controlled ablations + mandatory negative controls:
-  - *Spatial*: E2.1 (learned latents vs atlas — KEY), A_self_attn, A_no_dist, A3, **A_deform** (per-patient VE position offsets, +48/pt), **A_elec_attn** (add electrode self-attn before VE — tests if local spatial preprocessing helps), **A_elec_attn_no_pe** (electrode self-attn with distance bias only, no Fourier PE — isolates smoothing from position-specific patterns)
-  - *Negative controls*: A_shuffle_coord (permute MNI coords), A_random_atlas (random VE positions), A_no_auditory (remove auditory VEs), A_late_window (tmin=0.2s, production only)
-  - *Per-patient*: A15, E2.6 (zero per-patient)
-  - *Decoder*: A_no_ar
-- **Phase 3**: Adaptation — training protocol (LP vs full FT vs gradual unfreezing) + calibration efficiency curve ({5,10,20,50,100,all} target trials)
-- **Phase 4**: Diagnostics — per-patient residual analysis (diagonal magnitudes, Δ/ω, variance decomposition, cross-patient CKA) + VE interpretability (activation profiles, region probes, phoneme selectivity, attention maps, trajectory analysis)
-- **Phase 5**: Hyperparameters — A_dim (d∈{32,64,128} — novel), A10 (B∈{1,2,3}), A_thresh (VE threshold {15,25}mm)
-- **Phase 6**: SSL (gated on HGA extraction) — A18 (SSL vs scratch), A_mse (L2 vs JEPA L1), A_dense (V-JEPA 2.1 context loss), A_deep (hierarchical supervision), A_disc (+ temporal discrimination), A_spatial_mask (+ VE masking), A_rank, A_domain + SSL scaling curve ({1,2,4,8,16,50,100}h)
-- **Phase 7**: Refinements — full-trial vs per-phoneme, cross-task data, joint attention, KL matching, TTO
+Immediate comparison targets after the fixed-atlas supervised path is stable:
+- local Perceiver summarizer vs mean+gradient
+- exact parcel split map
+- temporal front-end choice
+- token-level SC/FC bias init vs no-init
+
+Broader ablation planning still lives in the design doc, but it is not on the critical path for the first implementation milestone.
 
 ## Practical Rules
 
-- Active design = `neural_field_perceiver_v12.tex`.
-- VE cross-attn + distance bias + Fourier PE is the default. Self-attention/Conv2d are ablations.
-- Cross-task data (Duraivel 2025) included by default.
+- Active design = `neural_field_perceiver_v14.tex`.
+- Shared within-parcel Perceiver-style summarization is the default spatial interface. Mean+gradient, selective splitting, and cross-attention are ablations.
 - Core patients: S14, S26, S33, S62. Extended: S16, S22, S23, S39, S58. Excluded: S32, S57.
 - Always `exclude_artifacts=True`. Always grouped-by-token CV.
 - All training on DCC. See `docs/dcc_setup.md`.
-- Default regularization: E_Δω + E_smooth + standard dropout. CLIP/neural-audio contrastive is future work, NOT default. Contrastive/KL alignment losses are Phase 7, NOT default.
-- uECoG SSL uses full continuous data (456 min) with content-aware weighting + segment-level sampling to prioritize task-engaged periods (~52% task cycles, ~48% overhead from awake craniotomy setup/breaks). Fallback: drop uECoG SSL entirely (sEEG SSL → supervised).
-- If a doc references: electrode self-attention as default, fixed atlas VE positions as default (A_deform as ablation), Conv2d as default, full affine W·x+b, L=12 VEs, AR transformer decoder as default, B=1 as default, 4-stage pipeline, ~171K params, ~191K params, 134/pt, "only temporal layers transfer", the old 37-ablation flat table, CLIP as default SSL, a 9-term loss equation, Brainnetome N>200, ~35 experiments/~85 runs, ~39 experiments/~100 runs, ~41 experiments/~104 runs, ~42 experiments/~106 runs, ~44 experiments/~110 runs, "89% baseline", A_no_elec_attn, A_deform (now A_no_deform), "discriminative + JEPA hybrid" SSL, A_jepa_only, A_disc_only, swap detection, L_swap_detect, 3-headed SSL, or L2/MSE as JEPA loss — it's stale.
+- Treat the supervised training contract as blocked until the exact loss/decoder/eval setup is frozen.
+- If a doc references: VE cross-attention as default spatial mechanism, distance bias, Fourier PE, Wendland kernel, "multi-view reconstruction" framing, "camera view" analogy, ~175K shared params, 182/pt, "dual spatial encoding", Q/K/V for electrode→VE mapping, spherical node decay, "distance determines WHERE, Q/K/V determines WHAT", v12 as active, A3/A_no_dist/A_dist_only ablations, or any of the v12 stale markers listed previously — it's stale.

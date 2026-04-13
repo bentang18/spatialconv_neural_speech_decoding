@@ -7,66 +7,60 @@ Extending Spalding 2025 (PCA+CCA, SVM/Seq2Seq, 8 patients, 9 phonemes, 0.31 bal.
 
 **Task**: Non-word repetition (52 CVC/VCV tokens, 3 phonemes each, e.g. /abe/; 9 phonemes). Intra-operative, left sensorimotor cortex, 128/256-ch uECOG arrays. ~1 min utterance/patient. Stimulus-to-response delay: 1.1 ± 0.3s (Duraivel 2023); stimulus duration ~500ms; utterance ~450ms. Auditory stimulus ends ~600ms before response onset (t=0).
 
-**Patients**: 11 unique PS patients (S18 excluded — no preprocessed; S36 excluded — duplicate of S32): S14, S16, S22, S23, S26, S32, S33, S39, S57, S58, S62. 8 are Spalding's published set. 46–178 trials/pt, 63–201 sig channels. Core v12 set: S14, S26, S33, S62. Excluded: S32 (no HG response), S57 (52/256 sig, hybrid strip). Extended: S16, S22, S23, S39, S58.
+**Patients**: 11 unique PS patients (S18 excluded — no preprocessed; S36 excluded — duplicate of S32): S14, S16, S22, S23, S26, S32, S33, S39, S57, S58, S62. 8 are Spalding's published set. 46–178 trials/pt, 63–201 sig channels. Core set: S14, S26, S33, S62. Excluded: S32 (no HG response), S57 (52/256 sig, hybrid strip). Extended: S16, S22, S23, S39, S58.
 
-## Current Direction: Neural Field Perceiver (v12) — Intracranial Foundation Model
+## Current Direction: Neural Field Perceiver (v14) — Intracranial Foundation Model
 
-**Design doc**: `docs/neural_field_perceiver_v12.tex`
+**Design doc**: `docs/neural_field_perceiver_v14.tex`
 
-**Architecture** (atlas-grounded multi-view reconstruction):
+**Two-problem decomposition** (atlas-guided spatial calibration + shared dynamics):
+- **Problem 1 — Calibration** (per-patient, physics-constrained): Map raw electrodes → atlas-grounded regional tokens via Brainnetome volumetric parcellation. Atlas does ~90% of calibration; supervised gradient refines ~10%. Analogous to template fitting with known sensor placement.
+- **Problem 2 — Dynamics** (shared, unconstrained ML): Map atlas-grounded regional tokens → phoneme sequence via a small relational-temporal transformer + AR decoder. Same representation for every patient.
+
+**Target architecture**:
 ```
-electrode HGA + MNI coord
-→ Conv1d(1→d, k=10, s=10)           shared temporal binning
-→ s^(i) ⊙ x + b^(i)                per-patient diagonal (128 params/pt)
-→ + Fourier PE(MNI + Δ/ω)           directional spatial identity
-→ VE cross-attention (L=16 atlas, distance bias)  maps N_i → 16 common space
-→ [VE self-attn (16×16) → Temporal self-attn] × 2
-→ Lightweight AR: pos attn → [z̄_k; emb(y_{k-1})] → Linear(2d→9) × 3 + beam search (52 tokens)
+── Phase 2+ / Full v14 target ──
+Calibration: corrected electrode coordinates -> Brainnetome PM membership
+             optional learned per-patient calibration only after Phase 1
+
+── Shared Processing ──
+(1) Shared temporal tokenizer                              -> (N_i × d × T)
+(2) Canonical parcel-frame local point encoding
+    + within-parcel Perceiver summarizer                   -> (N_tok × d × T)
+(3) [Inter-region graph attention
+     -> Temporal self-attn] × B                            -> (N_tok × d × T)
+(4) 3 AR-conditioned decode queries attend over N_tok·T    -> phoneme sequence
 ```
-~175K total params (B=2), 182 per-patient (128 diagonal + 6 geometric + 48 VE offsets). Per-patient VE positions (atlas centroid + leashed offset ≤15mm) adapt to individual somatotopy; distance bias determines WHERE to look (per-patient), Q/K/V determines WHAT to extract (shared). Electrode self-attention is an ablation (A_elec_attn), NOT default — detailed spatial layout varies too much (R²=0.05-0.13) for shared electrode-level processing to transfer. Dual spatial encoding: distance bias (proximity) + Fourier PE (direction). Lightweight AR decoder (4.1K). 16 Brainnetome atlas positions (40 HCP subjects; somatotopic subdivisions > HCP-MMP for speech). Full-trial input tmin=-0.2, tmax=1.0s. Works for sEEG, uECoG, and macro-ECoG at any electrode density.
+Shared interface: `(N_tok × d × T)` atlas/subparcel token tensor, with default `N_tok=21` from 16 base parcels and selective 2-token splits in elongated speech-relevant parcels. Mean+gradient pooling is the main linear ablation. No Fourier PE. No global electrode->region cross-attention.
 
-**Key design choices** (2026-04-07):
-- **Dual spatial encoding**: Distance bias (proximity, isotropic) + Fourier PE on electrode tokens (direction, anisotropic). Distance bias can't distinguish equidistant electrodes in different directions; Fourier PE can. A3 tests removing PE.
-- **Lightweight AR decoder**: Position-specific temporal attention + previous phoneme embedding → Linear(2d→9). 4.1K params vs 67K full transformer decoder. AR conditioning for ~2K extra params. A_no_ar tests removing AR.
-- **2-stage pipeline (primary, contingent on external data)**: External chronic ECoG SSL (Flinker 48pts + Chang ~15-25pts, est. 50-100h) → per-patient supervised FT on CoganLab. SSL is task-agnostic (different speech tasks handled by masking objective, not labels). **Fallback (CoganLab-only)**: sEEG SSL → uECoG SSL → supervised (~24h).
-- **VEs over self-attention**: N=10 can't learn population-average anatomy. Atlas (Brainnetome, N=40; somatotopic subdivisions > HCP-MMP for speech) provides spatial prior. A_self_attn tests electrode self-attention. E2.1 (learned latents, no atlas) isolates atlas from bottleneck.
-- **Diagonal normalization over full affine**: impedance/gain = scale+offset, not rotation. 128/pt vs 4160/pt. Init from channel statistics.
-- **Δ/ω hard-clamped** (15mm translation, 0.15 rad rotation): covers worst-case registration error.
-- **Per-patient VE positions (default, was A_deform)**: Atlas centroid + learned offset ≤15mm (+48 params/pt, total 182/pt). Motor VE gap (A4tl↔A4hf: 32mm) exceeds full somatotopic gradient (~15-30mm). Individual somatotopy varies 5-15mm. A_no_deform reverts to fixed atlas. A_dist_only removes Q/K/V from cross-attention (distance-only pooling) — tests whether functional selectivity matters beyond proximity.
-- **Electrode self-attention is an ablation (A_elec_attn), NOT default**: Detailed spatial layout varies too much across patients (spatial gradient R²=0.05-0.13, Duraivel 2025) for shared electrode-level spatial processing to transfer. The transferable signal is temporal dynamics at VE resolution, not spatial patterns at electrode resolution. A_elec_attn_no_pe tests distance-bias-only (generic smoothing, no PE).
-- **Per-patient/shared boundary**: Per-patient = WHERE things are (VE positions, gain/offset, registration). Shared = WHAT things mean (VE queries, temporal dynamics, decoder).
-- **Coordinate pipeline**: ACPC → talairach.xfm → MNI → learned Δ/ω correction → standardize → Fourier PE(F=3). **HARD BLOCKER: talairach.xfm is linear (12-param affine), ~5-15mm nonlinear residual. If T1 MRIs exist, ANTs SyN nonlinear warp could halve error. Do before Phase 0.**
-- Core patients: S14, S26, S33, S62. Exclude S32, S57. Artifact channels dropped entirely.
+**Current Phase-1 implementation contract** (2026-04-13):
+- **Use the real Brainnetome PM volume, not the old proxy**: Active membership source is `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`. Keep `~/nilearn_data/bnatlas.nii.gz` only for ROI indexing and sanity checks. No silent fallback to the old smoothed-MPM pseudo-probability proxy.
+- **Fixed-atlas `v14-core`, not learned calibration yet**: Phase 1 freezes the spatial interface to the best verified ACPC→MNI path. No learned `Δ/ω`, `δ_l`, or `τ_l` yet. The coordinate pipeline is still a blocker and must be re-verified with Zac before implementation starts.
+- **No extra gain / impedance correction in Phase 1**: Inputs already come from existing `productionZscore_highgamma` features. Do not add another gain/offset layer or channel-stat normalization in the first pass.
+- **Within-parcel Perceiver summarizer is the default spatial mechanism**: Canonical parcel-frame coordinates + shared point encoder + fixed latent queries summarize each parcel locally into 1-2 tokens. Mean+gradient pooling is the main linear ablation.
+- **Temporal front-end is shared and still an explicit blocker**: The next architectural decision is the exact temporal layer and its output contract into the parcel summarizer. Do not harden downstream code until that interface is frozen.
+- **Unsupported parcels are masked, not hallucinated**: Phase 1 uses a fixed `N_tok` layout with `token_mask` and `token_support`. Unsupported parcels are computationally absent; zero-filled inactive slots are only a storage convenience. The exact support statistic and unsupported-vs-weak threshold are still blockers.
+- **Inter-region attention is token-space, not sensor-space**: After parcel summarization, the backbone operates over atlas/subparcel tokens. Brainnetome SC/FC bias initialization is still intended, but the exact token-level expansion rule remains a blocker.
+- **Phase 1 is supervised-only on `uECoG`**: First executable milestone is supervised `v14-core` on the existing intra-op `uECoG` data, verifying token construction, masking, and end-to-end correctness before SSL, `sEEG`, or external datasets.
+- **Next step after `v14-core` is full-corpus `uECoG` SSL**: If the supervised path is correct, Phase 1.5 is SSL on the full continuous `uECoG` corpus, not only response-locked epochs.
+- **Do not start implementation before blocker review**: The active blocker list in `docs/implementation_start.md` and `docs/implementation_tasks.md` must be explicitly discussed and frozen before coding begins.
 
-**Paper direction**: First intracranial field potential (HGA) foundation model. Multi-view framing: each patient is a camera view of a shared neural manifold; VEs are the template mesh. BIT did this for spikes; nobody for field potentials. HGA ≠ spikes (postsynaptic inputs vs action potential outputs — different biophysics, can't pool).
+**Paper direction**: Atlas-grounded common-space decoding for intracranial field potentials. The scientific bet is that electrodes are patient-specific observations, while parcel/subparcel tokens are the shared representation. Phase 1 is only the fixed-atlas supervised correctness pass; broader calibration claims come later.
 
-**SSL pretraining** (JEPA with temporal masking, V-JEPA 2/2.1 recipe):
-- **Default: single JEPA objective.** L1 prediction of masked VE-time latent representations via EMA target encoder (τ=0.996→1.0). Content-aware weighting (upweight high-activation bins, BrainBERT). Temporal span masking (max 6 patches / 300ms). Mask ratio r~U(0,1) per sample (RPNT). One loss, one auxiliary hyperparameter (EMA momentum). Rationale: V-JEPA 2/2.1 (Meta SOTA) uses a single JEPA loss — intensifying one objective beats diversifying across many. Prior 3-headed design (temporal discrimination + swap detection + JEPA regularizer) over-engineered: swap detection architecturally misaligned (electrode-level gradient doesn't reach VE layers), temporal discrimination is a pretext task superseded by masked prediction, hyperparameter coupling untuneable at 24-100h scale.
-- **Ablations:** A_mse (L2 MSE replacing JEPA L1), A_dense (V-JEPA 2.1 dense prediction: supervise visible tokens with distance-weighted loss), A_deep (hierarchical supervision across encoder levels), A_disc (add temporal discrimination auxiliary), A_spatial_mask (add VE spatial masking).
-- Per-patient layers during SSL: diagonal normalization + Δ/ω only. Shared backbone. Modality-agnostic.
-- **Primary (2-stage)**: External chronic ECoG SSL (Flinker/Chang, 50-100h) → per-patient supervised FT. **Fallback (3-stage)**: sEEG SSL → uECoG SSL → supervised (~24h). 
-- **If audio available from external data:** add neural-audio contrastive (CLIP-style) as auxiliary. Future direction, not default.
-- Heavier augmentation for SSL: noise 0.10-0.20, constant offset SD=0.05, Gaussian smooth w=2.0
+**Near-term sequencing**:
+- Phase 1: supervised `v14-core` on response-locked `uECoG`
+- Phase 1.5: SSL on the full continuous `uECoG` corpus
+- Phase 2: learned per-patient calibration
+- Only after that: `sEEG`, external datasets, and broader scaling
 
-**Default regularization**: L_class (focal CE + label smoothing + mixup) + E_Δω (L2 on geometric params, λ=10^-3) + E_smooth (temporal smoothness). Plus AdamW weight decay (10^-4), dropout (0.2), DropPath (0.1), channel dropout (0.2). Per-patient loss weighting by signal quality. Optional alignment losses (contrastive, KL) are Phase 7 refinements, not default.
+Detailed SSL planning, historical literature findings, and broader data-scaling notes now live under:
+- `docs/archive/literature_findings.md`
+- `docs/archive/research_synthesis.md`
+- `docs/archive/reading_list.md`
 
-**Other design elements**:
-- **Per-electrode uncertainty weighting**: σ_j predicted per electrode, down-weighted in cross-attention. Soft reliability mask.
-- **Spatial augmentation**: Coordinate jitter (2-5mm), rigid perturbation, electrode subset sampling (70-100%), VE atlas jitter (3-8mm).
-- **Neural-audio contrastive (CLIP)**: Future direction, not default. JEPA alone is the core SSL story.
+**v14 is the sole active direction.** v12 (cross-attention + distance bias + Fourier PE), Conv2d pipeline, JEPA, LeWM, LOPO autoresearch — all discontinued.
 
-**Scalable data sources** (all measure HGA/field potentials, all poolable):
-- **Flinker/Chen lab (NYU)**: est. 50+h (48 patients, chronic ECoG speech) — request with data sharing agreement
-- **Chang lab (UCSF)**: est. 20+h (~15-25 patients, chronic high-density ECoG) — request from corresponding author
-- Bouchard/Chang (Figshare): small (3 patients, CV syllables) — **public today**
-- CoganLab uECoG: ~7.6h (29 patients) — needs HGA extraction (fallback)
-- CoganLab sEEG speech: ~16.7h (25 patients) — on Box (fallback, motor coverage ~15-30%)
-- Epilepsy sEEG (DABI, OpenNeuro, hospital data): potentially 100s-1000s h
-- NOT poolable: Utah arrays (spikes, different biophysics)
-
-**v12 is the sole active direction.** Conv2d pipeline, JEPA, LeWM, LOPO autoresearch — all discontinued.
-
-## Best Per-Patient Results (baseline for v12 to beat)
+## Best Per-Patient Results (baseline for v14 to beat)
 
 **Per-phoneme MFA + flat head + full recipe = PER 0.734 ± 0.007** (S14, grouped-by-token CV, 3-seed).
 
@@ -81,7 +75,7 @@ Training: Focal CE (γ=2) + label smoothing (0.1) + mixup (α=0.2)
 Eval: Weighted k-NN (k=10) + TTA (n=16)
 ```
 
-Key sweep findings (see `docs/experiment_log.md` findings 86-101):
+Key sweep findings (see `docs/archive/experiment_log.md` findings 86-101):
 - Per-phoneme beats learned attention by 6pp in fair head-to-head (0.734 vs 0.797)
 - Per-phoneme wins 8/11 patients, population mean +4.0pp over full-trial
 - Flat head > articulatory for single-phoneme (0.734 vs 0.772)
@@ -98,12 +92,17 @@ Previous baselines: LOPO best 0.750, per-patient full-trial 0.737, LOPO pilot 0.
 - `data/transforms/<subj>_talairach.xfm` — ACPC → Talairach/MNI transform (11/11)
 
 ### Active
-- `docs/neural_field_perceiver_v12.tex` — Active design document
+- `docs/neural_field_perceiver_v14.tex` — Active design document (v14: parcellation + two-problem decomposition)
 - `docs/current_direction.md` — Current priorities and what's archived
 - `docs/dcc_setup.md` — Complete DCC documentation
-- `docs/experiment_log.md` — Full experiment history (101 findings)
-- `docs/research_synthesis.md` — 19-paper literature synthesis (seegnificant added)
-- `docs/reading_list.md` — 11 essential papers (seegnificant added as #10)
+- `docs/implementation_start.md` — First-pass `uECoG`-only implementation scope
+- `docs/implementation_tasks.md` — Active blockers and implementation tasks
+
+### Archived but useful
+- `docs/archive/experiment_log.md` — Full experiment history (101 findings)
+- `docs/archive/research_synthesis.md` — 19-paper literature synthesis (seegnificant added)
+- `docs/archive/reading_list.md` — Historical paper reading order and notes
+- `docs/archive/literature_findings.md` — Historical literature-driven findings and data-scaling context
 
 ### Configs
 - `configs/per_patient_ce_s10_pool48.yaml` — Per-patient config (CE, stride=10, pool(4,8))
@@ -136,7 +135,7 @@ src/speech_decoding/
 │   ├── augmentation.py     # Time shift, amplitude scale, channel dropout, noise
 │   ├── coordinates.py      # ACPC electrode coords: RAS loading, chanMap bridge, hemisphere mirroring
 │   ├── sig_channels.py     # Significant channel detection + artifact channel exclusion
-│   ├── atlas.py            # Brainnetome atlas ROIs: 16 core + 8 extended virtual electrode positions for v12
+│   ├── atlas.py            # Brainnetome atlas ROIs: 16 core + 8 extended positions + parcellation lookup (v14)
 │   └── collate.py          # Group samples by patient_id for multi-grid batching
 ├── models/
 │   ├── spatial_conv.py     # Per-patient Conv2d read-in: (B,H,W,T)→(B,256,T)
@@ -185,18 +184,25 @@ ds = load_patient_data("S14", bids_root, task="PhonemeSequence", n_phons=3,
 
 Grid inferred from electrode TSVs, NOT channel count. TSVs have BOM (`\ufeff`). Dead positions zeroed in Conv2d input.
 
-### Electrode Coordinates (ACPC, verified 2026-04-05)
+### Electrode Coordinates (ACPC bookkeeping mostly checked; ACPC→MNI still blocked)
 
 Coordinates are in **ACPC space** (per-patient, AC-PC aligned), NOT MNI-152. Source: `Box/ECoG_Recon/<subj>/elec_recon/<subj>_elec_locations_RAS_brainshifted.txt`. Format: `prefix electrode_num x y z hemisphere type`.
 
-**Coordinate mapping chain** — implemented in `src/speech_decoding/data/coordinates.py`:
-- 128-ch: `fif ch N → chanMap[r,c]==N → phys_elec = r*16+c+1 → RAS(x,y,z)`. Mean error 8.55mm without chanMap, ~1.4mm with chanMap (verified).
-- 256-ch: `fif ch N → RAS electrode N` directly (~85% overlap; fif-only = dead positions). S57/S58 are 0-indexed (need +1 offset). chanMapAll is NaN-filled — not needed.
-- Use `build_electrode_coordinates()` — handles both paths automatically.
+**What is currently trusted**:
+- 128-ch ACPC bookkeeping: `fif ch N → chanMap[r,c]==N → phys_elec = r*16+c+1 → RAS(x,y,z)`. This fixed a large indexing error relative to ignoring `chanMap`.
+- 256-ch ACPC bookkeeping: `fif ch N → RAS electrode N` directly for the standard 256-ch arrays, with `+1` handling for the 0-indexed `S57/S58` convention.
+- `build_electrode_coordinates()` encodes the current ACPC-side mapping logic.
 
-**DCC TSV vs RAS files**: DCC electrode TSVs have normalized 0-1 grid coordinates (synthetic, for per-patient Conv2d). RAS files have real ACPC coordinates (for v12). TSV grid = vertically-flipped chanMap (cosmetic, irrelevant for Conv2d).
+**What is NOT yet trusted**:
+- the downstream **ACPC → MNI** transform path
+- any quantitative cross-patient overlap analysis derived from that path
+- any statement that the current coordinates are already in their final atlas-ready form
 
-**Coordinate acquisition**: Electrode positions obtained by measuring 4 array corners → interpolating grid → projecting onto smoothed cortical surface. Error is primarily systematic (rigid-body ~4-8mm), not random per-electrode noise. Relative within-array positions near-perfect (~0.1mm). Learned Δ/ω correction is the correct model for this systematic error.
+Treat the ACPC-side bookkeeping and the ACPC→MNI transform as separate issues. The former is mostly checked; the latter is still an active blocker and must be re-verified against Zac's MATLAB path before Phase 1 implementation.
+
+**DCC TSV vs RAS files**: DCC electrode TSVs have normalized 0-1 grid coordinates (synthetic, for older per-patient Conv2d baselines). RAS files have real ACPC coordinates and are the relevant source for `v14`. TSV grid = vertically-flipped chanMap (cosmetic, irrelevant for Conv2d).
+
+**Coordinate acquisition**: Electrode positions were obtained by measuring 4 array corners → interpolating the grid → projecting onto a smoothed cortical surface. This suggests relative within-array positions should be much better than absolute cross-patient placement, but any stronger claim about systematic rigid-body error or the exact correction model should be treated as provisional until the ACPC→MNI pipeline is verified.
 
 **Hemisphere**: S22 and S58 are **right hemisphere** (positive x). All others left. `ElectrodeCoordinates.mirror_to_left()` negates x for cross-patient alignment.
 
@@ -218,7 +224,7 @@ Coordinates are in **ACPC space** (per-patient, AC-PC aligned), NOT MNI-152. Sou
 | S58 | 171 | 256 | 67% |
 | S62 | 201 | 256 | 78% |
 
-Sig channel filtering does NOT improve per-patient decoding for S14 (85% sig). Conv2d learns to suppress non-sig channels. For v12, include ALL non-artifact channels (model learns to weight via cross-attention).
+Sig channel filtering did NOT improve per-patient decoding for S14 (85% sig) in the older Conv2d baseline, but the Phase 1 `v14-core` channel-inclusion policy is still unresolved. Treat `all non-artifact channels` versus `sig-only` as an explicit blocker to freeze before implementation.
 
 ### Artifact Channels (electronic, not brain signal)
 
@@ -234,20 +240,15 @@ Some channels exhibit extreme activations (>10 std in >5% of trials) — electro
 
 S39/S57/S58 are the worst. S14/S16/S23/S32 are clean (0 chronic).
 
-### Inter-Patient Electrode Overlap (quantified 2026-04-06)
+### Inter-Patient Spatial Mismatch
 
-Arrays are placed by surgeon, not experimentally standardized. Mean centroid distance: **36mm** (range 8.5–75.6mm). Most pairs have no electrode-level overlap (<5mm).
+Arrays are placed by surgeon, not experimentally standardized. The important operational fact is:
 
-Two spatial clusters:
-- **Posterior-dorsal**: S14, S23, S39, S58, S62 (centroids ~MNI -60, 0, 40)
-- **Anterior-ventral**: S26, S32, S33, S57 (centroids ~MNI -58, 20, 5)
-- **Outliers**: S16 (y=50), S22 (right hemisphere)
+- there is **no shared channel-index space across patients**, and only partial anatomical overlap in where arrays happen to land
 
-Best overlapping pairs: S26↔S33 (1.3mm NN), S22↔S62 (2.7mm), S32↔S33 (4.4mm).
+An older inter-patient MNI overlap analysis was run before the current ACPC→MNI pipeline was re-flagged as incorrect, so those quantitative overlap numbers should no longer be treated as trustworthy. For `v14`, the active solution is not electrode-overlap matching; it is mapping each patient's electrodes into a shared Brainnetome parcel/subparcel space after the coordinate pipeline is re-verified.
 
-This is THE core challenge for cross-patient models — no shared electrode space. v12's VE cross-attention maps each patient's electrodes into a common functional space (16 atlas positions) regardless of array placement.
-
-### Virtual Electrodes (Brainnetome atlas, `atlas.py`) — DEFAULT SPATIAL MECHANISM
+### Brainnetome Core Parcels (`atlas.py`)
 
 16 core ROIs — top 16 by patient reachability from systematic check of all 123 LH Brainnetome ROIs + speech-relevant candidates (2026-04-06). Top 15 have ≥4 patients; #16 (A2) has 3.
 - Motor (3): A6cvl (ventral PMC, 9pts), A4tl (tongue M1, 7pts), A4hf (face M1, 6pts)
@@ -257,7 +258,7 @@ This is THE core challenge for cross-patient models — no shared electrode spac
 - Insula (1): INSa (articulatory planning, 4pts)
 - Executive (1): MFG (dorsolateral PFC, 6pts)
 
-8 extended ROIs for analysis (parietal, SMA — mostly unreachable). Patient-adaptive selection via `select_active_virtual_electrodes()`. Each patient reaches ~6-12 of 16 core VEs at 25mm threshold. VE cross-attention with distance bias maps variable electrode counts into this common functional space.
+8 extended ROIs for analysis (parietal, SMA — mostly unreachable). Older centroid-based helper functions still exist in `atlas.py` for ROI indexing and historical analysis, but the active `v14` path is volumetric atlas membership into parcel/subparcel tokens, not centroid-based routing or distance-thresholded VE selection.
 
 ### Raw Continuous Recordings (for SSL)
 
@@ -283,47 +284,29 @@ PS labels: `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k':6, 'p':7, 'u':8, 'v':9}` �
 - **Submit**: `sbatch scripts/<script>_dcc.sh` | Monitor: `squeue -u ht203`
 - **CAUTION**: `/work/ht203` auto-purges after 75 days. Copy results to `/hpc/group/coganlab/ht203/`.
 
-## Completed Exploration (summary — details in experiment_log.md)
+## Completed Exploration (summary — details in `docs/archive/experiment_log.md`)
+
+Historical literature context and older paper-positioning notes now live under `docs/archive/`. The active implementation contract is defined by:
+
+- `docs/neural_field_perceiver_v14.tex`
+- `docs/current_direction.md`
+- `docs/implementation_start.md`
+- `docs/implementation_tasks.md`
 
 - **LOPO** (55 experiments): Converged to PER 0.750-0.780 on S14. Measurement ceiling from fixed CV folds.
 - **SSL / NCA-JEPA**: All methods near-chance on ~11 min epoched data. CoganLab-only SSL limited (~24h, intra-op data quality). Primary SSL plan: external chronic ECoG from Flinker (48 pts) and/or Chang (~15-25 pts), est. 50-100h of diverse speech. Contingent on data access (PI-level request). Fallback: CoganLab sEEG + uECoG (~24h).
 - **Per-patient tuning**: CTC→CE (+7.8pp), pool(2,4)→pool(4,8), stride=10, H=32 sufficient.
 - **Per-phoneme MFA sweep** (2026-04-04): Per-phoneme flat (0.734) beats learned attention (0.797) and full-trial (0.807). Generalizes 8/11 patients.
 
-## Established Findings (from literature)
+## Archived Literature Context
 
-- **Field consensus**: per-patient input → shared backbone (GRU) → CTC/CE. Used by Willett, Metzger, Singh, Boccato, Levin, BIT.
-- **Alignment**: uECOG arrays span 15-25mm in MNI with variable rotation. VE cross-attention with atlas positions + distance bias maps variable electrodes into a common functional space, accommodating anatomical variation via ~25mm soft receptive fields. Self-attention + MNI coordinates (seegnificant) is an ablation (A_self_attn).
-- **Transfer**: Singh — freeze shared backbone, fine-tune per-patient layers. Levin — 30% source replay prevents forgetting.
-- **SSL**: Advantage is cross-subject only (BIT Table 9: SL ≈ SSL same-subject). Supervised cross-subject pretraining FAILS without per-patient layers (BIT Appendix M, NDT3). Temporal masking > spatial for speech (BIT SOTA). Minimum corpus ~30 min (wav2vec ECoG); we have 456 min raw continuous (29 patients, needs HGA extraction).
-- **Per-patient layers**: Decisive factor for cross-patient transfer. NDT3 (no per-patient, 2000h) fails cross-subject. BIT (per-patient read-in/out, 367h) succeeds. Singh (per-patient Conv1D, supervised) also succeeds. seegnificant: per-subject heads ΔR²=-0.18 (most important component).
-- **Coordinate PE**: seegnificant: PE barely helps (ΔR²=-0.02, p=0.73). Spatial self-attention does the heavy lifting. Fourier PE = RBF PE (both R²=0.39). Treat PE as uncertain until A2 vs A3 tested.
-- **Factored attention**: Temporal then spatial outperforms joint 2D (seegnificant: +0.06 R², 5.5× faster). Validates v12's factored design.
-- **Data regime**: Small epoched (46-178 trials/pt), ~24h SSL corpus (~1000 min sEEG + 456 min uECoG). ~175K total params (B=2). Foundation model direction: scale data, not architecture.
-- **HGA ≠ spikes**: HGA (70-150Hz) reflects postsynaptic activation (inputs to measured area). Spikes (Utah arrays) are action potentials (outputs). Different biophysics — cannot pool across modalities. Surface recordings (uECoG, ECoG, sEEG HGA) ARE poolable.
-- **Nason 2024 (NEJM)**: Best speech BCI uses CTC encoder (5-layer GRU 512) + 5-gram LM + OPT rescoring. NOT autoregressive. Raw PER 7-15%, WER 2.5% with LMs. Day-specific 512→512+softsign layer.
-- **Transformer > GRU**: Confirmed by B2T benchmarks (Feghhi 2025 NeurIPS: time-masked Transformer, Feghhi 2026: LightBeam). WER 5.01% (Transformer) vs 9.37% (GRU) on B2T '24.
-- **MIBRAIN (Wu 2025)**: Independent convergence on atlas-grounded region mapping for cross-patient sEEG (11 pts, 23 Mandarin consonants). Hard FreeSurfer parcellation + learnable prototypes + region masking SSL. Multi-sub beats single-sub by 5-8%. NO coordinates used. Scaling: 1-3 added subjects HURT, need ≥6 for gains. v12 generalizes MIBRAIN: soft distance-biased attention subsumes hard region assignment, coordinates provide finer resolution, 134 per-patient params vs ~2-5K. Closest prior to v12.
-- **Di Wu group evolution** (MIBRAIN → Neuro-MoBRE → H2DiLR): All use discrete FreeSurfer regions, zero coordinates, same 11-pt cohort. Neuro-MoBRE adds MoE routing (21 region experts, TopK=2) + freq-domain SSL target. H2DiLR uses VQ codebook disentanglement (1.55M/pt, impractical for us). Transformer-16-512 collapses in their data regime — validates our ~175K model.
-- **Population Transformer (Chau 2025, ICLR)**: Self-attention + 3D sinusoidal PE on sEEG coordinates, ZERO per-patient params, ~20M total. Binary detection tasks (0.93 AUC speech). PE removal is most damaging ablation. Discriminative SSL >> reconstructive. BUT: no temporal sequence modeling, can't do phoneme decoding, tasks are much easier.
-- **Brant family (2023-2025)**: Brant (505M, 2528h) → BrainWave (~100M, 40,907h, 16K subjects) → BrantX (1B, cross-modality). Scaled massively but NEVER added spatial identity or per-patient layers. Brant fails cross-patient speech (MIBRAIN baseline). BrainWave adds channel attention but channels are still anonymous (no coordinates). BrantX is cross-modality (EEG→EOG/ECG), orthogonal to our problem. The entire family proves: scale alone insufficient — atlas-grounded spatial mechanism + per-patient layers are necessary.
-- **BrainBERT (Wang 2023, ICLR)**: Per-electrode SSL on sEEG spectrograms, ~28M, 43.7h. Content-aware L1 loss prevents collapse on sparse signals (importable). +0.23 AUC from pretraining, 5× data efficiency. Cross-subject transfer works. Fails as MIBRAIN baseline (no spatial model).
-- **Evanson 2025**: Supervised contrastive pretraining on 83-108h sEEG. Log-linear scaling, NO plateau at 100h. Supervised > SSL for same-subject. Cross-day drift massive (r=0.95). Single-patient only.
-- **Content-aware loss** (BrainBERT): 68% of z-scored neural data near zero. Upweight reconstruction of high-activation bins during SSL. Directly importable for v12's temporal masking MSE.
-- **BarISTA (Oganesian 2025, NeurIPS)**: Parcel-level spatial encoding >> channel-level by +8-10pp AUC on iEEG. Strongest external validation of v12's VE approach. JEPA-style latent reconstruction with spatial masking. Combined attention > factored (+1-2pp, contradicts seegnificant). ~1M params, zero per-patient. Uses Destrieux atlas parcels.
-- **Charmander (Mahato 2025, NeurIPS WS)**: Perceiver bottleneck (32 latents) for multi-patient iEEG with 50% channel masking. Model scaling 8M→142M: no downstream benefit. Converges with v12's VE cross-attention architecture.
-- **NDT3 (Ye 2025)**: 350M-param intracortical motor FM. Cross-subject transfer fundamentally limited by sensor variability — channel shuffle cripples performance. Explicitly identifies per-patient layers as needed. THE key negative result motivating v12's per-patient design.
-- **RPNT (Fang 2026)**: Uniform random mask ratio U(0,1) outperforms all fixed ratios — free improvement for SSL. MRoPE for metadata encoding. Cross-site contrastive loss helps (+3.5pp).
-- **Factored vs combined attention**: seegnificant (factored +0.06 R²) vs BarISTA (combined +1-2pp). Resolution: may depend on spatial dimensionality. v12 operates on 16 VEs after cross-attention, so factored cost is minimal and combined is feasible. Test both.
-- **Perceiver cross-attention bottleneck is consensus**: 5+ independent groups converge — POYO (512 latents, NeurIPS 2023), POYO+ (128, ICLR 2025), Charmander (32), Brain-OF ARNESS (128), v12 (16 VEs), POSSM (1/chunk). Model scaling provides no downstream benefit (Charmander 8M≈142M). Architecture > capacity.
-- **Data heterogeneity limits scaling for spatial tasks but NOT temporal**: Jiang 2025: region heterogeneity kills co-smoothing scaling. Forward-prediction (temporal) scales consistently. 5 ranked sessions > 40 random (8× efficiency). Rankings are target-specific. Validates temporal masking SSL over spatial masking. Don't blindly pool all patients — rank and select.
-- **Preserved latent dynamics across animals**: Safaie 2023 (Nature): PCA+CCA reveals shared motor cortex dynamics across 3 monkeys + 4 mice. Cross-animal LSTM R²≈0.86. Linear alignment sufficient. ~60 neurons minimum. Biological foundation for cross-patient approach.
-- **Multi-session pretrain + few-shot FT dominates**: FALCON benchmark (NeurIPS 2024): NDT2 Multi > unsupervised alignment > zero-shot. CORP test-time adaptation with LM pseudo-labels wins communication (WER 0.11). Deep networks catastrophically unstable without per-session layers (RNN: -0.60 R² zero-shot). 1-2 min calibration sufficient.
-- **Cross-species transfer works for speech**: POSSM (NeurIPS 2025): monkey→human speech PER 19.80% with multi-input (spike counts + spike-band power). Two-phase training (reconstruction→CTC). SSM backbone real-time (<6ms CPU).
-- **Functional embeddings can outperform coordinates**: FunctionalMap (Javadzadeh 2025): contrastive-learned 32-dim functional embeddings beat MNI coordinates for SEEG reconstruction (p<0.001). Complementary to v12 (augment Fourier PE). But requires region labels, tested only on deep brain nuclei.
-- **Within-modality masking most critical for encoding**: NEDS (ICML 2025): removing within-modality masking drops encoding 50%. Multi-task masking (4 schemes) enables simultaneous encoding + decoding. Neuron embeddings become 83% brain-region-predictive without labels. 12M right for 74 sessions; our 175K for 4-11 patients is correct regime.
-- **Distribution matching (KL) enables manifold alignment**: NoMAD (Nature Comms 2025): frozen backbone + KL divergence alignment. R²=0.91, 208-day half-life. Single reference > sequential. Importable as auxiliary loss on VE representations. Authors note applicability to ECoG.
-- **POYO family (Dyer group)**: Spike tokenization + Perceiver + per-unit embeddings + gradual unfreezing. No spatial encoding (works for chronic arrays, not variable placement). POYO: 7 monkeys, supervised. POYO+: 1335 sessions, multi-task. POSSM: + SSM, cross-species. All validate v12's Perceiver architecture but lack spatial mechanism.
+Broader literature findings and data-scaling context now live in:
+
+- `docs/archive/literature_findings.md`
+- `docs/archive/research_synthesis.md`
+- `docs/archive/reading_list.md`
+
+Those are useful for paper framing and later scaling decisions, but they are no longer part of the active implementation contract in this file.
 
 ## Preprocessing Pipeline (do not change)
 
