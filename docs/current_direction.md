@@ -1,6 +1,16 @@
 # Current Direction
 
-Updated: 2026-04-13 (repo cleaned for implementation; first pass narrowed to uECoG-only v14 correctness)
+Updated: 2026-04-13 (repo cleaned for implementation; first pass narrowed to uECoG-only v14 correctness; working principle locked)
+
+## Working Principle
+
+**v14 is slow, methodical, and precise. Everything before v14 was playing around.** Every logic step — raw voltages through phoneme decode — is **discussed, agreed, and understood before any code is written**. No handwavy implementation. No pre-committed numeric defaults. No legacy reuse.
+
+If a legacy helper looks useful, re-derive it from scratch under `src/speech_decoding/v14/`. The pre-v14 tree is quarantined under `src/speech_decoding/archive/legacy/` and blocked by `tests/v14/test_no_legacy_imports.py`. No file or design is sacred.
+
+Each blocker here and in `docs/implementation_tasks.md` is a **discussion item**, not an engineering ticket. Resolution means the logic, the contract, the units, and the trade-offs are agreed. Then code. See `CLAUDE.md` "Working Principle: Discuss Before Code".
+
+**Phoneme / label-space rigor audit (2026-04-13):** a first-pass audit of the PS label space surfaced 9 discussion items, now blockers **#17–#25**. The most load-bearing is **#17** — the inherited `PS2ARPA` mapping (`ae → EH`, `u → UH`) looks phonetically wrong; it should probably be `ae → AE` (/æ/) and `u → UW` (/u/). Until #17–#25 are resolved, no phoneme-level metric is trustworthy and no v14 data loader should be written.
 
 ## Active Priority: Intracranial Field Potential Foundation Model (v14)
 
@@ -72,16 +82,9 @@ Code boundary for the new implementation:
 
 ## Top Blocker (2026-04-13)
 
-- **ACPC → MNI transform pipeline is currently not trusted**
+- **ACPC → MNI transform pipeline is not trusted**
 
-Recent discussion with Zac indicates the current ACPC-to-MNI handling was wrong. This is now the top blocker ahead of model implementation, because every spatial step in `v14` depends on it:
-
-- Brainnetome membership
-- parcel support estimates
-- canonical parcel-frame coordinates
-- learned spatial calibration parameters
-
-Do not treat the current coordinate path as settled until the transform logic is re-verified.
+Zac flagged the current handling as wrong. Top blocker — every spatial step in v14 depends on it: Brainnetome membership, parcel support, parcel-frame coordinates, learned calibration. Do not treat coordinates as settled until the transform is re-verified.
 
 - **Unsupported-vs-weak parcel support threshold is not yet locked**
 
@@ -124,6 +127,15 @@ The local summarizer depends on canonical parcel coordinates, but the exact parc
 
 It remains unresolved whether Phase 1 should use all non-artifact channels, sig-only channels, or another filtering rule. That changes support statistics and active-token counts, so it should be treated as a true implementation blocker rather than a minor preprocessing detail.
 
+- **The old grid/loader path is not trustworthy enough for `v14-core`**
+
+The existing baseline data path was built for the older grid-based Conv2d model, not for the current atlas-first implementation. Two specific risks should be treated as blockers:
+
+- `load_patient_data()` / `load_per_position_data()` currently zero artifact channels in place rather than defining an explicit active-channel interface.
+- `src/speech_decoding/data/grid.py` currently reconstructs the physical grid by heuristically quantizing normalized TSV coordinates, even though there is an authoritative channel-to-physical-electrode mapping file available.
+
+Do not blindly reuse the old loader/grid logic for `v14-core`.
+
 - **No stale Brainnetome proxy fallback should be allowed**
 
 Phase 1 should use the real PM volume at `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz` as the active membership source. The MPM label map remains useful for ROI indexing and sanity checks only. The implementation should not silently fall back to the old smoothed-MPM pseudo-probability construction.
@@ -131,6 +143,7 @@ Phase 1 should use the real PM volume at `/Users/bentang/Documents/Code/speech/d
 ## Key Design Choices (Phase-1 active assumptions only)
 
 - **Use the real Brainnetome PM volume** — Active membership source is `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`. Keep the MPM label map only for ROI indexing and sanity checks. Do not silently fall back to the old smoothed-MPM proxy.
+- **Replace the old TSV-derived grid heuristic before `v14-core`** — The old grid-based baseline inferred physical array layout from normalized electrode TSV coordinates. That is not rigorous enough for the new implementation phase. Use the authoritative channel-mapping files instead of relying on heuristic grid reconstruction.
 - **Within-parcel Perceiver summarizer is the default spatial mechanism** — Electrode→parcel mapping remains anatomy-guided aggregation, but the default parcel representation is now a small local point encoder plus fixed latent queries, not mean-only or mean+gradient pooling.
 - **Mean+gradient stays as the main linear ablation** — It is still useful as a lower-capacity baseline, but not the default shared spatial interface.
 - **Temporal front-end remains an explicit blocker** — The temporal layer and its output contract into the parcel summarizer are not frozen yet. Do not treat the current tokenizer sketch as settled.
@@ -145,14 +158,15 @@ Phase 1 should use the real PM volume at `/Users/bentang/Documents/Code/speech/d
 1. ~~**v14 design doc rewrite**~~ — DONE (2026-04-10). Full rewrite: two-problem decomposition, parcellation pooling, cross-attention decoder, updated ablations.
 2. ~~**Update presentation doc**~~ — DONE (2026-04-10). `physics_informed_architecture.tex` rewritten for v14 (4 pages).
 3. **Fix and verify ACPC → MNI transform pipeline (TOP BLOCKER)** — current handling is not trusted; re-verify the coordinate chain with Zac before serious spatial-model implementation.
-4. **uECoG-only v14 implementation** — once coordinates are trustworthy, build the clean end-to-end path under `src/speech_decoding/v14/` and verify correctness on core patients before any modality expansion.
-5. **Full-corpus uECoG SSL after v14-core** — once supervised `v14-core` is stable, pretrain on the full continuous `uECoG` corpus rather than only response-locked epochs.
-6. **Nonlinear MNI normalization** — Only revisit this after the correct baseline ACPC→MNI path is confirmed. Do not optimize around the wrong transform.
-7. **Verify and wire the real probabilistic maps cleanly** — the local PM file now lives at `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`; verify orientation/indexing and use it as the active spatial-membership source.
-8. **Request external chronic ECoG data** — Greg → Flinker (48pts, NYU) + Chang (~15-25pts, UCSF). High leverage, but not on the critical path for the first local implementation.
-9. **HGA extraction pipeline** — 456 min raw EDF, 29 patients. Needed before SSL / broader scaling.
-10. **Linear/local ablations** — Mean+gradient pooling, selective splitting, and parcel-frame 2D conv compared against the default local summarizer after the core implementation is stable.
-11. **Large-scale generic iEEG pretraining watchlist** — SWEC (`~10,000 h`, MVPFormer release) belongs in the acquisition roadmap as a staged generic pretraining source, but not in the first implementation phase.
+4. **Replace the old loader/grid assumptions** — before `v14-core`, freeze the active-channel semantics and replace the TSV-derived grid heuristic with the authoritative channel-mapping path.
+5. **uECoG-only v14 implementation** — once coordinates and channel/electrode mapping are trustworthy, build the clean end-to-end path under `src/speech_decoding/v14/` and verify correctness on core patients before any modality expansion.
+6. **Full-corpus uECoG SSL after v14-core** — once supervised `v14-core` is stable, pretrain on the full continuous `uECoG` corpus rather than only response-locked epochs.
+7. **Nonlinear MNI normalization** — Only revisit this after the correct baseline ACPC→MNI path is confirmed. Do not optimize around the wrong transform.
+8. **Verify and wire the real probabilistic maps cleanly** — the local PM file now lives at `/Users/bentang/Documents/Code/speech/data/atlas/BNA_PM_4D.nii.gz`; verify orientation/indexing and use it as the active spatial-membership source.
+9. **Request external chronic ECoG data** — Greg → Flinker (48pts, NYU) + Chang (~15-25pts, UCSF). High leverage, but not on the critical path for the first local implementation.
+10. **HGA extraction pipeline** — 456 min raw EDF, 29 patients. Needed before SSL / broader scaling.
+11. **Linear/local ablations** — Mean+gradient pooling, selective splitting, and parcel-frame 2D conv compared against the default local summarizer after the core implementation is stable.
+12. **Large-scale generic iEEG pretraining watchlist** — SWEC (`~10,000 h`, MVPFormer release) belongs in the acquisition roadmap as a staged generic pretraining source, but not in the first implementation phase.
 
 ## Data Readiness
 

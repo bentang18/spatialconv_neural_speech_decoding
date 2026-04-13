@@ -1,3 +1,40 @@
+"""Configuration dataclasses for Neural Field Perceiver v14.
+
+=============================================================================
+PROVISIONAL — DISCUSS BEFORE USE (2026-04-13)
+=============================================================================
+
+Every numeric default in this file was written before the 2026-04-13
+discussion-first rule was locked. None of these values have a written
+justification tied to data scale, token rate, or a named paper. Under
+the working principle recorded in `CLAUDE.md`, `docs/current_direction.md`,
+`docs/implementation_start.md`, and `docs/implementation_tasks.md` (blocker
+#15), none of these numbers may enter a training run until each has been
+explicitly discussed and agreed.
+
+Specifically unresolved:
+
+- PatientCalibrationConfig leashes: max_translation_mm, max_rotation_rad,
+  max_parcel_offset_mm, min_temperature, max_temperature. These are
+  inherited from the pre-Phase-1 v14 draft.
+- TemporalTokenizerConfig: d_model, patch_ms, stride_ms, sample_rate_hz,
+  hidden_channels. The temporal front-end is itself a top blocker.
+- LocalSummarizerConfig: d_model, point_mlp_hidden, parcel_embedding_dim,
+  support_feature_dim.
+- BackboneConfig: d_model, num_blocks, num_heads, ffn_hidden, dropout.
+- DecoderConfig: d_model, num_queries, vocab_size, ar_embedding_dim. The
+  label->integer index contract is a separate blocker (#16).
+
+The `AtlasConfig` and the `learn_*` flags on `PatientCalibrationConfig`
+encode the Phase-1 contract (real PM volume, no learned calibration) and
+are therefore consistent with today's decisions. Everything else is a
+placeholder skeleton.
+
+If you are reading this before a field has been discussed and agreed,
+surface the discussion with Ben rather than importing the default.
+=============================================================================
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

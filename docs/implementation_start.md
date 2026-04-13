@@ -1,20 +1,33 @@
 # v14 Implementation Start
 
-This document narrows the implementation scope to the first executable target:
+First executable target:
 
-**verify the `v14-core` architecture on the existing intra-op `uECoG` data before expanding to learned calibration, `sEEG`, external datasets, or SSL.**
+**verify `v14-core` on the existing intra-op `uECoG` data before expanding to learned calibration, `sEEG`, external datasets, or SSL.**
 
-Implementation should not begin until the blocker list has been explicitly discussed and frozen. The point is to lock the interface contracts first and avoid coding against moving assumptions.
+Do not start implementation until the blocker list is discussed and frozen. Lock the interface contracts first; don't code against moving assumptions.
+
+## Working Principle (2026-04-13)
+
+**v14 is slow, methodical, and precise. Nothing before v14 counts.** Every component — raw voltages, amplifier channel indices, ACPC bookkeeping, coordinate verification, Brainnetome PM membership, parcel support, parcel-frame construction, temporal front-end, local summarizer, inter-region attention, AR decoder, loss, eval split — is **discussed, agreed, and understood before any code is written**. This applies to every function, shape, unit, threshold, and numeric default. It applies to the label space too: phoneme vocabulary, PS → ARPABET mapping, event_id assertion, ordering, ground-truth fixtures (blockers #17–#25).
+
+- No handwavy implementation.
+- No "obvious" step skipped because it looks simple.
+- No pre-committed magic numbers (window sizes, `d_model`, stride, split counts, support thresholds) before they are justified and agreed.
+- No reuse of pre-v14 code from `src/speech_decoding/archive/legacy/`. Re-derive and write fresh under `src/speech_decoding/v14/`.
+- Rewriting from scratch is the default, not the exception.
+- `tests/v14/test_no_legacy_imports.py` enforces "no legacy imports". It must stay green.
+
+Each blocker here and in `docs/implementation_tasks.md` is a **discussion item**, not an engineering ticket. Resolution means the logic, contract, units, and trade-offs are agreed. **No phoneme-level metric is trustworthy** until blockers #17–#25 are resolved — including any v14 data loader whose output depends on the PS → ARPABET mapping.
 
 ## Top Blocker
 
-- **ACPC → MNI transform pipeline is currently not trusted**
+- **ACPC → MNI transform pipeline is not trusted**
 
-Recent discussion with Zac indicates the current ACPC-to-MNI handling was wrong. This must be treated as the top blocker before serious spatial implementation work, because all atlas-driven parts of `v14` depend on it.
+Zac flagged the current handling as wrong. Top blocker before spatial implementation — every atlas-driven part of v14 depends on it.
 
-- **Temporal layer design is still the next architectural blocker**
+- **Temporal layer design is the next architectural blocker**
 
-Once coordinates are trustworthy, the next unresolved implementation decision is the exact shared temporal front-end. The first pass should choose the simplest plausible temporal layer that is expressive enough to validate the rest of `v14-core`.
+After coordinates, the next unresolved decision is the shared temporal front-end. First pass: the simplest plausible temporal layer expressive enough to validate the rest of `v14-core`.
 
 - **Unsupported-vs-weak parcel support threshold is also still unresolved**
 
@@ -56,6 +69,24 @@ The local summarizer depends on canonical parcel coordinates, but the exact defi
 - **Channel inclusion policy is still unresolved**
 
 It is still not fully decided whether `v14-core` should use all non-artifact channels, sig-only channels, or another filtering rule. That decision changes parcel support, active-token counts, and the semantics of weak coverage, so it should be frozen before Phase 1 implementation hardens.
+
+- **Current baseline data loaders should not be reused blindly for `v14-core`**
+
+The existing supervised baseline path in `src/speech_decoding/data/bids_dataset.py` and `src/speech_decoding/data/grid.py` was built for the older grid-based Conv2d pipeline, not for the current `v14-core` implementation contract. Two issues are especially dangerous:
+
+- `load_patient_data()` / `load_per_position_data()` currently **zero artifact channels in place** rather than removing them from the active channel set. That may be acceptable for the old Conv2d baseline, but it is not yet an approved `v14-core` interface because it changes support semantics while preserving dead channels in the tensor.
+- `grid.py` currently reconstructs the physical grid by **heuristically inferring row/column indices from normalized TSV coordinates**. That is not rigorous enough for the current implementation phase. There exists an exact channel-to-physical-electrode mapping file, and the implementation should use that authoritative mapping instead of reverse-engineering grid indices from TSV coordinate values.
+
+Treat the current loader/grid path as historical baseline code until it is checked against the Phase 1 spec.
+
+Other legacy modules that should also be treated as historical baseline code unless explicitly re-approved:
+
+- `src/speech_decoding/data/atlas.py` — still centered on centroid-based virtual-electrode logic, distance thresholds, and reachability calculations from the older `v12` era rather than the active volumetric-membership `v14-core` interface.
+- `src/speech_decoding/data/coordinates.py` — directionally useful, but several comments and assumptions are too confident for the current blocker state, especially around ACPC sufficiency and the direct 256-ch mapping path.
+- `src/speech_decoding/models/spatial_conv.py` and `src/speech_decoding/models/linear_readin.py` — built for the old grid-based read-in story, not the atlas/subparcel token interface.
+- `src/speech_decoding/models/backbone.py`, `src/speech_decoding/training/trainer.py`, and `src/speech_decoding/training/ctc_utils.py` — encode the older Conv/GRU + pooled CE/CTC training contract. Useful as reference code, but dangerous to reuse blindly because the new decoder, token interface, and supervision contract are different.
+- `src/speech_decoding/data/augmentation.py` — old grid-baseline augmentations include assumptions like synthetic amplitude scaling for impedance variation. These should not silently become the `v14-core` augmentation contract.
+- `src/speech_decoding/data/collate.py` — groups by patient for variable grid sizes, which may or may not match the eventual batching contract once the token interface is active.
 
 - **No stale Brainnetome proxy fallback should be allowed in Phase 1**
 
@@ -107,6 +138,7 @@ That means:
 - the token interface is assembled correctly
 - missing / weakly supported parcels are handled sensibly
 - the model can overfit a tiny `uECoG` slice without shape or logic bugs
+- the channel-to-electrode mapping is driven by the authoritative mapping files rather than the older TSV grid heuristic
 
 ## Patient Scope
 
@@ -124,8 +156,9 @@ Only expand to the extended set after:
 
 1. **Data and atlas interface**
    - load `uECoG` trials
-   - load artifact-filtered channels
+   - define the correct active-channel set rather than blindly zero-filling artifact channels
    - build corrected electrode coordinates
+   - replace the old TSV-derived grid heuristic with the exact channel-to-electrode mapping file where needed
    - treat translation / rotation as fixed by the verified ACPC→MNI pipeline
    - compute soft Brainnetome membership
    - compute parcel support / confidence
@@ -166,6 +199,7 @@ These checks matter more than early leaderboard numbers.
 - **Coordinate sanity**
   - left/right mirroring correct
   - array geometry consistent with known placements
+  - authoritative channel→electrode mapping verified against the mapping files, not only against TSV heuristics
 
 - **Atlas sanity**
   - expected speech parcels receive support

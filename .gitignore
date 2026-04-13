@@ -1,6 +1,8 @@
-# Data directories (large BIDS datasets + patient electrode data)
+# Data directories (large BIDS datasets + patient electrode data).
+# IMPORTANT: `/data/` is anchored to the repo root so it does NOT match
+# `src/speech_decoding/data/` or `src/speech_decoding/archive/legacy/data/`.
 BIDS_1.0_*/
-data/
+/data/
 *.fif
 *.edf
 *.mat
