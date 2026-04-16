@@ -27,32 +27,32 @@
       "detail": "all 148 trial-reconstructions resolve uniquely to a PS token"
     },
     {
-      "name": "fif_labels_match_authoritative",
-      "level": "must",
-      "passed": true,
-      "detail": "148 reconstructed trial tokens align with eventsOLD.tsv"
-    },
-    {
-      "name": "no_leaked_tokens",
-      "level": "must",
-      "passed": true,
-      "detail": "all 52 distinct tokens \u2286 PS inventory"
-    },
-    {
       "name": "signal_finite",
       "level": "must",
       "passed": true,
       "detail": "0 non-finite samples across 56832000 total"
     },
     {
-      "name": "fif_samples_match_authoritative",
-      "level": "must",
+      "name": "fif_labels_match_events_tsv",
+      "level": "soft",
+      "passed": true,
+      "detail": "148 reconstructed trial tokens align with events TSV"
+    },
+    {
+      "name": "events_tsv_tokens_in_ps",
+      "level": "soft",
+      "passed": true,
+      "detail": "all 52 distinct tokens \u2286 PS inventory"
+    },
+    {
+      "name": "fif_samples_match_events_tsv",
+      "level": "soft",
       "passed": true,
       "detail": "max |\u0394|=6 samples, median=1.0, n_outside_tol(12)=0 (148 pos-0 epochs vs 148 responses)"
     },
     {
-      "name": "epoch_t0_equals_response_onset",
-      "level": "must",
+      "name": "fif_t0_matches_events_tsv_onset",
+      "level": "soft",
       "passed": true,
       "detail": "max |\u0394|=2.80 ms, median=0.20 ms, n_outside_tol(6ms)=0"
     },

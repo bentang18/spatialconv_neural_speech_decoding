@@ -27,40 +27,40 @@
       "detail": "all 153 trial-reconstructions resolve uniquely to a PS token"
     },
     {
-      "name": "fif_labels_match_authoritative",
-      "level": "must",
-      "passed": true,
-      "detail": "153 reconstructed trial tokens align with eventsOLD.tsv"
-    },
-    {
-      "name": "no_leaked_tokens",
-      "level": "must",
-      "passed": true,
-      "detail": "all 52 distinct tokens \u2286 PS inventory"
-    },
-    {
       "name": "signal_finite",
       "level": "must",
       "passed": true,
       "detail": "0 non-finite samples across 29376000 total"
     },
     {
-      "name": "events_stale_is_divergent",
+      "name": "fif_labels_match_events_tsv",
       "level": "soft",
       "passed": true,
-      "detail": "events.tsv matches 27/148 reconstructed trial tokens (expect << 0.5N since events.tsv is known-bad)"
+      "detail": "153 reconstructed trial tokens align with events TSV"
     },
     {
-      "name": "fif_samples_match_authoritative",
-      "level": "must",
+      "name": "events_tsv_tokens_in_ps",
+      "level": "soft",
+      "passed": true,
+      "detail": "all 52 distinct tokens \u2286 PS inventory"
+    },
+    {
+      "name": "fif_samples_match_events_tsv",
+      "level": "soft",
       "passed": true,
       "detail": "max |\u0394|=1 samples, median=0.0, n_outside_tol(12)=0 (153 pos-0 epochs vs 153 responses)"
     },
     {
-      "name": "epoch_t0_equals_response_onset",
-      "level": "must",
+      "name": "fif_t0_matches_events_tsv_onset",
+      "level": "soft",
       "passed": true,
       "detail": "max |\u0394|=0.23 ms, median=0.10 ms, n_outside_tol(6ms)=0"
+    },
+    {
+      "name": "events_stale_is_divergent",
+      "level": "soft",
+      "passed": true,
+      "detail": "events.tsv matches 27/148 reconstructed trial tokens (expect << 0.5N since events.tsv is known-bad)"
     },
     {
       "name": "audio_neural_clock_fit_exists",

@@ -1,23 +1,35 @@
 """Structural predicates for the `#34` audit.
 
-Data source is the phoneme-level `.fif` (one epoch per phoneme; shape
+## Authoritativeness
+
+The `.fif` is the authoritative source of signal, labels, and per-trial
+response onsets for the Phase-1 loader. Zac's preprocessing writes labels
+into `event_id` + per-epoch codes and response onsets into `events[:, 0]`;
+these are self-contained and self-validating (per-trial 3 phonemes → unique
+PS token).
+
+The BIDS events TSV (`eventsOLD.tsv` or `events.tsv`) is a **cross-check**
+that was originally derived from the same trial table but can drift
+independently from the `.fif` upstream (regeneration bugs, accidental
+row drops). S14 and S26 are concrete examples — in both cases the `.fif`
+is correct and internally consistent but the events TSV is broken.
+
+Therefore:
+- **must-pass**: invariants the `.fif` must satisfy on its own.
+- **soft**: cross-checks between the `.fif` and the events TSV. A mismatch
+  means the events TSV is out-of-sync; the loader can still use the `.fif`.
+
+Data shape: phoneme-level `.fif` (one epoch per phoneme; shape
 `(3*n_trials, n_ch, T)`). Position-0 phoneme epochs — `epochs.events[0::3]` —
 lock to the same raw sample as the trial response onset (verified on S14:
-exact equality with trial-level `.fif` at raw-sample resolution). We use
-pos-0 as the Phase-1 trial-level stand-in everywhere trial-level is
-unavailable, and validate trial identity by checking that each trial's three
-consecutive phoneme labels reconstruct a valid 52-token PS entry.
+exact equality with trial-level `.fif` at raw-sample resolution).
 
 Covers:
-- file existence
-- `.fif` window / sfreq / T (relaxed: file window must ⊇ `#29`'s `[-0.5, 1.0]`)
-- `event_id` = 9 PS ARPABET phonemes
-- per-trial reconstructed token (3 consecutive phoneme labels) resolves to
-  exactly one `ps_tokens.arpabet_sequence`
-- per-trial reconstructed token equals `eventsOLD.tsv` response value
-- no `rest` / `task-start` / malformed tokens in eventsOLD responses
-- signal finite
-- (soft) `events.tsv` trial identities diverge from reconstructed tokens
+- must: file existence; window/sfreq/T; `event_id` = 9 PS phonemes;
+  per-trial 3-phoneme → unique PS token; signal finite.
+- soft: fif labels vs events TSV `value`; fif pos-0 sample vs events TSV
+  `sample`; fif t=0 vs events TSV `onset`; events TSV token set ⊆ PS;
+  events.tsv trial identities diverge from `.fif` (when eventsOLD exists).
 """
 from __future__ import annotations
 
@@ -141,20 +153,23 @@ def check_per_trial_token_reconstruction(epochs, ps_tokens: pd.DataFrame) -> Che
     )
 
 
-def check_fif_labels_match_authoritative(
+def check_fif_labels_match_events_tsv(
     epochs, authoritative_resp: pd.DataFrame, ps_tokens: pd.DataFrame
 ) -> Check:
-    """Predicate #4a/#5: for every trial, the reconstructed token from the
-    3 consecutive phoneme epochs equals `eventsOLD.tsv[i].value`."""
+    """Soft cross-check: for every trial, the reconstructed token from the
+    3 consecutive phoneme epochs equals `events[OLD].tsv[i].value`. A
+    mismatch indicates the events TSV is out of sync with the `.fif` (e.g.
+    dropped row for S26 at trial 71, or wholesale regeneration for S14);
+    the loader falls back to the `.fif`'s own labels."""
     tokens, _ = _reconstruct_trial_tokens(epochs, ps_tokens)
     n_trials = len(tokens)
     n_ev = len(authoritative_resp)
     if n_trials != n_ev:
         return make_check(
-            "fif_labels_match_authoritative",
-            "must",
+            "fif_labels_match_events_tsv",
+            "soft",
             False,
-            f"n_trials={n_trials} but eventsOLD responses={n_ev}",
+            f"n_trials={n_trials} but events TSV responses={n_ev} — events TSV likely has a dropped/extra row",
         )
     mismatches = []
     for i, tok in enumerate(tokens):
@@ -163,27 +178,29 @@ def check_fif_labels_match_authoritative(
             mismatches.append((i, tok, old_tok))
     ok = len(mismatches) == 0
     return make_check(
-        "fif_labels_match_authoritative",
-        "must",
+        "fif_labels_match_events_tsv",
+        "soft",
         ok,
-        f"{n_trials} reconstructed trial tokens align with eventsOLD.tsv"
+        f"{n_trials} reconstructed trial tokens align with events TSV"
         if ok
-        else f"{len(mismatches)}/{n_trials} mismatched, first: {mismatches[:3]}",
+        else f"{len(mismatches)}/{n_trials} mismatched, first: {mismatches[:3]} — events TSV out of sync, `.fif` labels are used",
     )
 
 
-def check_no_leaked_tokens(
+def check_events_tsv_tokens_in_ps(
     authoritative_resp: pd.DataFrame, ps_tokens: pd.DataFrame
 ) -> Check:
-    """Predicate #9: no `rest` / `task-start` / non-PS tokens in the authoritative
-    events file's response rows."""
+    """Soft cross-check: no `rest` / `task-start` / non-PS tokens in the events
+    TSV's response rows. A failure means the events TSV itself contains
+    non-PS tokens — still doesn't block loading since labels come from the
+    `.fif`, but worth surfacing."""
     values = set(authoritative_resp["value"])
     ps_keys = set(ps_tokens["ps_notation"])
     leaks = values - ps_keys
     ok = len(leaks) == 0
     return make_check(
-        "no_leaked_tokens",
-        "must",
+        "events_tsv_tokens_in_ps",
+        "soft",
         ok,
         f"all {len(values)} distinct tokens ⊆ PS inventory"
         if ok

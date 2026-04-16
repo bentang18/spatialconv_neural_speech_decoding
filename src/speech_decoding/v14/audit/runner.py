@@ -26,16 +26,16 @@ from speech_decoding.v14.audit.schema import AuditResult, Check
 from speech_decoding.v14.audit.structural_checks import (
     check_event_id_is_9_ps_phonemes,
     check_events_stale_is_divergent,
-    check_fif_labels_match_authoritative,
+    check_events_tsv_tokens_in_ps,
+    check_fif_labels_match_events_tsv,
     check_fif_path_exists,
     check_fif_window_contains_target,
-    check_no_leaked_tokens,
     check_per_trial_token_reconstruction,
     check_signal_finite,
 )
 from speech_decoding.v14.audit.timing_checks import (
-    check_epoch_t0_equals_response_onset,
-    check_fif_samples_match_authoritative,
+    check_fif_samples_match_events_tsv,
+    check_fif_t0_matches_events_tsv_onset,
 )
 from speech_decoding.v14.audit.verdict import assemble_result
 
@@ -120,23 +120,23 @@ def run_patient_audit(patient: str, verbose: bool = True) -> AuditResult:
         }
     )
 
-    # 3. structural checks
+    # 3. `.fif`-internal must-pass checks
     if verbose:
-        print(f"[{patient}] structural checks…")
+        print(f"[{patient}] .fif-internal checks…")
     checks.append(check_fif_window_contains_target(epochs))
     checks.append(check_event_id_is_9_ps_phonemes(epochs))
     checks.append(check_per_trial_token_reconstruction(epochs, ps_tokens))
-    checks.append(check_fif_labels_match_authoritative(epochs, auth_resp, ps_tokens))
-    checks.append(check_no_leaked_tokens(auth_resp, ps_tokens))
     checks.append(check_signal_finite(epochs))
+
+    # 4. events-TSV cross-checks (all soft — `.fif` is authoritative)
+    if verbose:
+        print(f"[{patient}] events-TSV cross-checks…")
+    checks.append(check_fif_labels_match_events_tsv(epochs, auth_resp, ps_tokens))
+    checks.append(check_events_tsv_tokens_in_ps(auth_resp, ps_tokens))
+    checks.append(check_fif_samples_match_events_tsv(epochs, auth_resp))
+    checks.append(check_fif_t0_matches_events_tsv_onset(epochs, auth_resp))
     if stale_resp is not None:
         checks.append(check_events_stale_is_divergent(epochs, stale_resp, ps_tokens))
-
-    # 4. timing checks
-    if verbose:
-        print(f"[{patient}] timing checks…")
-    checks.append(check_fif_samples_match_authoritative(epochs, auth_resp))
-    checks.append(check_epoch_t0_equals_response_onset(epochs, auth_resp))
 
     # 5. audio + audio-neural alignment
     if verbose:
@@ -163,7 +163,19 @@ def run_patient_audit(patient: str, verbose: bool = True) -> AuditResult:
                         f"exclude silent-suspect trials at loader time via {csv}"
                     )
             elif c["name"] == "events_stale_is_divergent":
-                workarounds.append("ignore events.tsv; use eventsOLD.tsv as authoritative")
+                workarounds.append("ignore events.tsv; eventsOLD.tsv preserved")
+            elif c["name"] in (
+                "fif_labels_match_events_tsv",
+                "fif_samples_match_events_tsv",
+                "fif_t0_matches_events_tsv_onset",
+            ):
+                w = "events TSV is out of sync with the `.fif`; loader reads labels and response onsets from the `.fif` directly"
+                if w not in workarounds:
+                    workarounds.append(w)
+            elif c["name"] == "events_tsv_tokens_in_ps":
+                workarounds.append(
+                    "events TSV contains non-PS tokens; loader uses `.fif` labels only"
+                )
 
     return assemble_result(patient, checks, metadata, workarounds)
 
