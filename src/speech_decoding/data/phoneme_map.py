@@ -15,14 +15,13 @@ and are not importable from active code.
 
 What this module provides:
 
-- `ARPA_PHONEMES`: the 9 canonical PS phonemes. **The ordering of this
-  list is inherited from the pre-v14 era and has not been re-agreed
-  under the 2026-04-13 discussion-first rule.** If v14 wants a different
-  canonical ordering, raise that as part of blocker #16 rather than
-  editing this list silently.
+- `ARPA_PHONEMES`: the 9 canonical PS phonemes in the frozen alphabetical
+  ordering from `#16`. Position in this list is the label index
+  (`AA=0, AE=1, B=2, G=3, IY=4, K=5, P=6, UW=7, V=8`).
 - `PS2ARPA` / `ARPA2PS`: notation conversion between the lowercase PS
   convention (`a`, `ae`, `i`, `u`, `b`, `p`, `v`, `g`, `k`) and canonical
-  ARPABET (`AA`, `EH`, `IY`, `UH`, `B`, `P`, `V`, `G`, `K`).
+  ARPABET (`AA`, `AE`, `IY`, `UW`, `B`, `P`, `V`, `G`, `K`), frozen per
+  `#17` (`ae → AE` for /æ/, `u → UW` for /u/).
 - `normalize_label`: the single canonical path for going from whatever a
   raw upstream label looks like (lowercase PS, stressed ARPABET, or
   already-canonical ARPABET) to the canonical ARPA string.
@@ -36,16 +35,13 @@ from __future__ import annotations
 
 # --- The 9 PS phonemes in canonical ARPABET notation ---
 #
-# Ordering note (2026-04-13): this list is the pre-v14 ordering
-# (vowels first: AA, EH, IY, UH; then consonants: B, P, V, G, K).
-# It has not been re-agreed under the discussion-first rule. Treat as
-# provisional — if v14 needs a specific canonical ordering for its
-# decoder vocab, that is blocker #16, not a quiet edit here.
-ARPA_PHONEMES: list[str] = ["AA", "EH", "IY", "UH", "B", "P", "V", "G", "K"]
+# Ordering: alphabetical, frozen per #16. Position in this list is the
+# decoder label index (AA=0, AE=1, B=2, G=3, IY=4, K=5, P=6, UW=7, V=8).
+ARPA_PHONEMES: list[str] = ["AA", "AE", "B", "G", "IY", "K", "P", "UW", "V"]
 
 # Lowercase PS notation -> canonical ARPA.
 PS2ARPA: dict[str, str] = {
-    "a": "AA", "ae": "EH", "i": "IY", "u": "UH",
+    "a": "AA", "ae": "AE", "i": "IY", "u": "UW",
     "b": "B", "p": "P", "v": "V", "g": "G", "k": "K",
 }
 

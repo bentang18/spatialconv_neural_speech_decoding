@@ -53,9 +53,9 @@ class TestNormalizeLabel:
 
     def test_lowercase_ps_labels(self) -> None:
         assert normalize_label("a") == "AA"
-        assert normalize_label("ae") == "EH"
+        assert normalize_label("ae") == "AE"
         assert normalize_label("i") == "IY"
-        assert normalize_label("u") == "UH"
+        assert normalize_label("u") == "UW"
         assert normalize_label("b") == "B"
         assert normalize_label("p") == "P"
         assert normalize_label("v") == "V"
@@ -93,9 +93,10 @@ class TestNormalizeLabel:
 
 class TestFilterToPS:
     def test_filter_keeps_ps_phonemes(self) -> None:
+        """Per #17, EH is no longer a PS phoneme (that slot moved to AE)."""
         labels = ["AA", "B", "HH", "EH", "Z", "IY"]
         mask = filter_to_ps_phonemes(labels)
-        assert mask == [True, True, False, True, False, True]
+        assert mask == [True, True, False, False, False, True]
 
     def test_filter_normalizes_first(self) -> None:
         labels = ["AA1", "b", "HH", "ae"]
