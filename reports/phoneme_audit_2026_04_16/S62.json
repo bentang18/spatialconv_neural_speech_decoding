@@ -1,0 +1,114 @@
+{
+  "patient": "S62",
+  "verdict": "pass",
+  "checks": [
+    {
+      "name": "fif_path_exists",
+      "level": "must",
+      "passed": true,
+      "detail": "/Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS/derivatives/epoch(phonemeLevel)(CAR)/sub-S62/epoch(band)(power)/sub-S62_task-PhonemeSequence_desc-productionZscore_highgamma.fif"
+    },
+    {
+      "name": "fif_window_contains_target",
+      "level": "must",
+      "passed": true,
+      "detail": "tmin=-1.000 tmax=1.495 sfreq=200.0 \u2014 target \u2286 [-0.5, 0.995] @ 200.0Hz"
+    },
+    {
+      "name": "event_id_is_9_ps_phonemes",
+      "level": "must",
+      "passed": true,
+      "detail": "n_keys=9"
+    },
+    {
+      "name": "per_trial_token_reconstruction",
+      "level": "must",
+      "passed": true,
+      "detail": "all 191 trial-reconstructions resolve uniquely to a PS token"
+    },
+    {
+      "name": "fif_labels_match_authoritative",
+      "level": "must",
+      "passed": true,
+      "detail": "191 reconstructed trial tokens align with eventsOLD.tsv"
+    },
+    {
+      "name": "no_leaked_tokens",
+      "level": "must",
+      "passed": true,
+      "detail": "all 52 distinct tokens \u2286 PS inventory"
+    },
+    {
+      "name": "signal_finite",
+      "level": "must",
+      "passed": true,
+      "detail": "0 non-finite samples across 73344000 total"
+    },
+    {
+      "name": "fif_samples_match_authoritative",
+      "level": "must",
+      "passed": true,
+      "detail": "max |\u0394|=6 samples, median=2.0, n_outside_tol(12)=0 (191 pos-0 epochs vs 191 responses)"
+    },
+    {
+      "name": "epoch_t0_equals_response_onset",
+      "level": "must",
+      "passed": true,
+      "detail": "max |\u0394|=2.73 ms, median=0.93 ms, n_outside_tol(6ms)=0"
+    },
+    {
+      "name": "audio_neural_clock_fit_exists",
+      "level": "must",
+      "passed": true,
+      "detail": "linear fit: n_inliers=191/191, a=1.283s, b=1.000005 (drift=0.00 ms/s)"
+    },
+    {
+      "name": "audio_neural_clock_consistent",
+      "level": "must",
+      "passed": true,
+      "detail": "residual std = 117.4 ms, max |resid| = 365.4 ms (tol \u2264 150 ms std)"
+    },
+    {
+      "name": "silent_trial_fraction_low",
+      "level": "soft",
+      "passed": true,
+      "detail": "silent-suspect trials = 0/191 (0.0%, tol \u2264 10%)"
+    }
+  ],
+  "workarounds": [],
+  "metadata": {
+    "patient": "S62",
+    "fif_path": "/Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS/derivatives/epoch(phonemeLevel)(CAR)/sub-S62/epoch(band)(power)/sub-S62_task-PhonemeSequence_desc-productionZscore_highgamma.fif",
+    "fif_level": "phoneme (pos-0 used as trial stand-in)",
+    "events_authoritative_path": "/Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS/sub-S62/ieeg/sub-S62_task-phoneme_acq-01_run-01_events.tsv",
+    "events_authoritative_kind": "events",
+    "events_stale_path": null,
+    "raw_microphone_wav": "/Users/bentang/Documents/Code/speech/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS_1.0_Phoneme_Sequence_uECoG/BIDS/derivatives/audio/sub-S62/microphone/sub-S62_task-phoneme_acq-01_run-01_desc-raw_microphone.wav",
+    "n_phoneme_epochs": 573,
+    "n_trials": 191,
+    "tmin_s": -1.0,
+    "tmax_s": 1.495,
+    "sfreq_hz": 200.0,
+    "T_samples": 500,
+    "n_events_auth_response": 191,
+    "n_events_stale_response": null,
+    "n_event_id_keys": 9,
+    "audio_sr_hz": 22050,
+    "audio_duration_s": 1027.8272108843537,
+    "audio": {
+      "audio_sr_hz": 22050,
+      "audio_duration_s": 1027.8272108843537,
+      "audio_noise_floor_rms": 0.007780765183269978,
+      "clock_fit_a": 1.283411069512165,
+      "clock_fit_b": 1.0000046932769275,
+      "clock_fit_drift_ms_per_s": 0.004693276927536516,
+      "clock_fit_n_inliers": 191,
+      "clock_fit_n_input": 191,
+      "clock_fit_residual_std_s": 0.11740310994585852,
+      "clock_fit_residual_max_s": 0.36535344508271805,
+      "n_silent_suspect": 0,
+      "silent_fraction": 0.0,
+      "exclusion_candidates_csv": "/Users/bentang/Documents/Code/speech/reports/phoneme_audit_2026_04_16/S62_exclusion_candidates.csv"
+    }
+  }
+}

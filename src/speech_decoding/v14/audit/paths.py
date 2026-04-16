@@ -28,6 +28,7 @@ def reports_dir() -> Path:
 
 
 def trial_fif(patient: str) -> Path:
+    """Trial-level `.fif`. Only S14 has this upstream as of 2026-04-16."""
     root = ps_bids_root()
     return (
         root
@@ -40,7 +41,10 @@ def trial_fif(patient: str) -> Path:
 
 
 def phoneme_fif(patient: str) -> Path:
-    """Phoneme-level `.fif` (audit-only cross-check per `#18`)."""
+    """Phoneme-level `.fif`. Position-0 (every 3rd starting at 0) epochs lock
+    to the same raw sample as the trial-level response onset (verified on S14:
+    `phon.events[0::3, 0] == trial.events[:, 0]` exact). Used as the Phase-1
+    stand-in for trial-level epochs everywhere trial-level is unavailable."""
     root = ps_bids_root()
     return (
         root
@@ -52,9 +56,7 @@ def phoneme_fif(patient: str) -> Path:
     )
 
 
-def events_authoritative(patient: str) -> Path:
-    """Authoritative events TSV (named `eventsOLD` on disk; confirmed via
-    `.fif` alignment + audio-video verification 2026-04-16)."""
+def _events_old(patient: str) -> Path:
     root = ps_bids_root()
     return (
         root
@@ -64,9 +66,7 @@ def events_authoritative(patient: str) -> Path:
     )
 
 
-def events_stale(patient: str) -> Path:
-    """Known-stale events TSV (named `events.tsv` on disk). Used only to
-    assert divergence from the authoritative file."""
+def _events_plain(patient: str) -> Path:
     root = ps_bids_root()
     return (
         root
@@ -74,6 +74,25 @@ def events_stale(patient: str) -> Path:
         / "ieeg"
         / f"sub-{patient}_task-phoneme_acq-01_run-01_events.tsv"
     )
+
+
+def events_authoritative(patient: str) -> Path:
+    """Authoritative events TSV. Prefer `eventsOLD.tsv` when present (S14:
+    upstream replaced the original with a broken `events.tsv` but kept the
+    original as `eventsOLD`). Fall back to `events.tsv` for the ~10 patients
+    where no OLD backup exists — verified 2026-04-16 that its `sample` column
+    aligns with phoneme-level `.fif` at ≤5 ms for every core patient except
+    S26 (which is a separate data blocker)."""
+    old = _events_old(patient)
+    return old if old.exists() else _events_plain(patient)
+
+
+def events_stale(patient: str) -> Path | None:
+    """Known-stale events TSV if one exists. Returns `None` when the patient
+    has no supersession history (only `events.tsv`, which is authoritative
+    for them)."""
+    old = _events_old(patient)
+    return _events_plain(patient) if old.exists() else None
 
 
 def raw_microphone_wav(patient: str) -> Path:

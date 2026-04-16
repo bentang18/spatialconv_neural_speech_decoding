@@ -44,7 +44,7 @@ def _verdict_table(results: dict[str, dict]) -> str:
         bulk = audio.get("clock_fit_a")
         res_std = audio.get("clock_fit_residual_std_s")
         n_silent = audio.get("n_silent_suspect")
-        n_trials = r.get("metadata", {}).get("n_epochs", "—")
+        n_trials = r.get("metadata", {}).get("n_trials", "—")
         silent_cell = f"{n_silent}/{n_trials}" if n_silent is not None else "—"
         bulk_cell = f"{bulk:.3f}" if isinstance(bulk, (int, float)) else "—"
         res_cell = f"{res_std * 1000:.1f}" if isinstance(res_std, (int, float)) else "—"

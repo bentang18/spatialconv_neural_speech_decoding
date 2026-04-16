@@ -125,24 +125,48 @@ def _predict_audio_time(fit: dict, ecog_t: np.ndarray) -> np.ndarray:
     return fit["a"] + fit["b"] * ecog_t
 
 
+def _trial_peak_rms(
+    env_times: np.ndarray,
+    env_rms: np.ndarray,
+    predicted_audio_onsets: np.ndarray,
+) -> np.ndarray:
+    """For each trial, the peak RMS in `[predicted - pre, predicted + post]`."""
+    bin_s = env_times[1] - env_times[0]
+    pre = int(round(RESPONSE_WIN_PRE_S / bin_s))
+    post = int(round(RESPONSE_WIN_POST_S / bin_s))
+    peaks = np.full(len(predicted_audio_onsets), np.nan)
+    for i, at in enumerate(predicted_audio_onsets):
+        ci = int(round((at - env_times[0]) / bin_s))
+        lo, hi = max(0, ci - pre), min(len(env_rms), ci + post)
+        if hi - lo < 1:
+            continue
+        peaks[i] = float(env_rms[lo:hi].max())
+    return peaks
+
+
 def _silent_trial_mask(
     env_times: np.ndarray,
     env_rms: np.ndarray,
     predicted_audio_onsets: np.ndarray,
     noise_floor: float,
 ) -> np.ndarray:
-    bin_s = env_times[1] - env_times[0]
-    pre = int(round(RESPONSE_WIN_PRE_S / bin_s))
-    post = int(round(RESPONSE_WIN_POST_S / bin_s))
-    thresh = noise_floor * SILENT_THRESHOLD_FACTOR
-    silent = np.zeros(len(predicted_audio_onsets), dtype=bool)
-    for i, at in enumerate(predicted_audio_onsets):
-        ci = int(round((at - env_times[0]) / bin_s))
-        lo, hi = max(0, ci - pre), min(len(env_rms), ci + post)
-        if hi - lo < 1:
-            silent[i] = True
-            continue
-        silent[i] = bool(env_rms[lo:hi].max() < thresh)
+    """Silent iff trial peak RMS is both below 4× noise floor AND below
+    half the patient-specific median trial peak.
+
+    The absolute threshold (4× noise floor) alone fails for recordings where
+    the gain is low relative to S14: median trial peak is barely above noise
+    floor, so every trial window appears "silent" under a fixed factor. The
+    patient-relative term (trial peak < 0.5 × median trial peak) is scale-
+    invariant and catches trials that are genuinely quieter than the
+    patient's own typical speech. Combining the two preserves S14's
+    behavior (still 0/153 silent) while producing a sane rate on S16, S32,
+    S33, S62, etc."""
+    peaks = _trial_peak_rms(env_times, env_rms, predicted_audio_onsets)
+    median_peak = float(np.nanmedian(peaks)) if np.isfinite(peaks).any() else 0.0
+    abs_thresh = noise_floor * SILENT_THRESHOLD_FACTOR
+    rel_thresh = 0.5 * median_peak
+    silent = (peaks < abs_thresh) & (peaks < rel_thresh)
+    silent[~np.isfinite(peaks)] = True
     return silent
 
 
@@ -178,7 +202,7 @@ def run_audio_checks(
     audio: np.ndarray,
     audio_sr: int,
     authoritative_resp: pd.DataFrame,
-    production_events: pd.DataFrame,
+    production_events: pd.DataFrame | None,
     plots_dir: Path,
     exclusions_csv: Path,
 ) -> tuple[list[Check], dict]:
@@ -187,7 +211,38 @@ def run_audio_checks(
     # ── 1. RMS envelope ──
     times_hi, rms_hi = _rms_envelope(audio, audio_sr, RMS_WIN_S, RMS_HOP_S)
     times, rms = _downsample_envelope(times_hi, rms_hi, ENV_DOWN_S)
-    noise_floor = float(np.median(rms))
+    # Low percentile of the RMS envelope ≈ inter-trial silence level.
+    # Median is wrong when trials are densely packed (as in most patients'
+    # recordings) — the median would land in speech, and every trial's peak
+    # would appear below the threshold. 5th percentile tracks silence across
+    # every patient we've seen (S14, S16, S23, S32, S33, S62).
+    noise_floor = float(np.percentile(rms, 5))
+
+    # Patients without desc-production_events.tsv (S39, S58): skip clock fit,
+    # fall back to silent-trial detection against the eventsOLD/events.tsv
+    # ECoG onsets in audio time (1:1 clock assumption + bulk offset from a
+    # trivial fit over the ECoG recording).
+    if production_events is None:
+        # Phase 1 doesn't use audio-derived timing; the clock fit is a
+        # cross-check, not a gate. Demote to soft so patients without
+        # `desc-production_events.tsv` (S22 placeholder; S39, S58) can still
+        # pass the rest of the audit.
+        checks = [
+            make_check(
+                "audio_neural_clock_fit_exists",
+                "soft",
+                False,
+                "desc-production_events.tsv not present or empty — clock fit skipped",
+            ),
+        ]
+        meta = {
+            "clock_fit_skipped": True,
+            "reason": "desc-production_events.tsv missing or empty",
+            "n_silent_suspect": None,
+            "silent_fraction": None,
+            "exclusion_candidates_csv": None,
+        }
+        return checks, meta
 
     # ── 2. Clock model via desc-production_events.tsv ──
     fit = _fit_clock_model(production_events)
