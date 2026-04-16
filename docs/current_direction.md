@@ -37,7 +37,7 @@ If any of these change, update `implementation_tasks.md` first and let this doc 
 
 ## Phoneme / label-space rigor audit
 
-A first-pass audit surfaced nine discussion items, now blockers **#17–#25** plus the operational audit **#34**. The most load-bearing item is **#17** — the inherited `PS2ARPA` mapping (`ae → EH`, `u → UH`) looks phonetically wrong; the correct mapping is probably `ae → AE` (/æ/) and `u → UW` (/u/). Until these resolve, **no phoneme-level metric is trustworthy and no v14 data loader is written.**
+A first-pass audit surfaced blockers **#17–#25** plus the operational audit **#34**. `#17–#25` are now closed (frozen in `docs/implementation_tasks.md`) — notably `#17` fixed the inherited `PS2ARPA` drift (`ae → AE` for /æ/, `u → UW` for /u/). `#34` is the sole remaining open loader gate: the v14 loader is not written until the phoneme-loading and trial-timing audit reports `pass` or `warn with workaround` on every core patient.
 
 ## First implementation scope
 

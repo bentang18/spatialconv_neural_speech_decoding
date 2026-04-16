@@ -200,42 +200,44 @@ src/speech_decoding/
 
 ## Data
 
-### Loader contract (not written yet)
+### Loader contract (frozen per `#13`)
 
-The v14 loader is an open discussion item. Expected sample shape, pending agreement:
+Baseline `v14-core` sample:
 
 ```
-signal[N_ch, T]         # float32, z-scored HGA on non-artifact channels
-mni_coords[N_ch, 3]     # verified ACPC→MNI positions (blocked on coord pipeline)
-token_mask[N_tok]       # which atlas/subparcel tokens are supported for this patient
-token_support[N_tok]    # support statistic (exact formula is a blocker)
-label                   # phoneme sequence — decoder contract is a blocker
+signal[N_ch, T]         # float32, z-scored HGA on non-artifact channels; T from #29 trial window
+coords[N_ch, 3]         # MNI electrode coordinates (#1, migrating to fsaverage per #36)
+token_mask[N_tok]       # Tier-1 parcel support mask per #3 (N_tok = 15, #4)
+token_support[N_tok]    # PM-weighted support statistic per #5
+label                   # 3-slot phoneme sequence, alphabetical ARPABET indices per #16
 patient_id              # str
 ```
 
-Nothing is locked. Every field is a separate discussion before code. Per-patient sig-channel counts, artifact-channel counts, and array layouts live in `docs/data_reference.md` — load it when implementing the loader.
+Channel inclusion is all non-artifact channels (`#11`); sig-channel masks are ablation-only. Trial epoching follows `#29` (one epoch per trial, `tmin=-0.5s`, `tmax=1.0s`). Per-patient sig-channel counts, artifact-channel counts, and array layouts live in `docs/data_reference.md`. `#34` (phoneme-loading audit) is the one remaining gate before the loader is written.
 
-### Electrode coordinates — ACPC bookkeeping mostly checked, ACPC→MNI still blocked
+### Electrode coordinates
 
-Coordinates are in **ACPC space** (per-patient, AC-PC aligned), NOT MNI-152. Source: `Box/ECoG_Recon/<subj>/elec_recon/<subj>_elec_locations_RAS_brainshifted.txt`. Format: `prefix electrode_num x y z hemisphere type`.
+ACPC source: `Box/ECoG_Recon/<subj>/elec_recon/<subj>_elec_locations_RAS_brainshifted.txt`. Format: `prefix electrode_num x y z hemisphere type`.
 
-**Currently trusted**:
-- 128-ch ACPC bookkeeping: `fif ch N → chanMap[r,c]==N → phys_elec = r*16+c+1 → RAS(x,y,z)`. This fixed a large indexing error relative to ignoring `chanMap`.
-- 256-ch ACPC bookkeeping: `fif ch N → RAS electrode N` directly, with `+1` handling for the 0-indexed S57/S58 convention.
+**ACPC → MNI pipeline (`#1`):** Python port of Zac's `sub2AvgBrainClinical.m` in `src/speech_decoding/v14/coordinates.py`, projecting patient `pial-outer-smoothed` → patient `sphere-outer-mni.reg` → `cvs_avg35` `sphere-outer.reg` → `cvs_avg35` `pial-outer-smoothed`. Output cached at `data/mni_coords/<pt>_MNI152.csv`, keyed by physical electrode name. Verified against the S14 oracle (max 1.39 mm, median 0.68 mm). **Migrating to fsaverage under `#36` (decided, executing);** the cvs_avg35 cache is the reference / migration oracle.
 
-**Not trusted**: the ACPC → MNI transform path, any cross-patient overlap analysis derived from it, any claim that current coordinates are atlas-ready. Re-verify with Zac's MATLAB path before Phase 1.
+**Amp → physical → coordinate bridge (`#12`):** 128-strip patients (`S14 S16 S22 S23 S26`) use Map 4 from local `*_channelMap.mat` with `phys_idx = r*16 + c + 1`. 256-grid patients (`S33 S39 S62`) use Map 3 from `*_channelMapAll.mat`. `S58` resolves its 12×24 zero-indexed crop onto full Map 3. The lookup key at the coordinate cache is the concatenated electrode name from `<pt>.electrodeNames`, not a row index. `S39_channelMap.mat` is non-authoritative; never load it.
 
-**Hemisphere**: S22 and S58 are right-hemisphere (positive x). All others left. The old `mirror_to_left()` helper that flipped x is wrong for volumetric membership — Brainnetome has distinct L/R parcels. v14 must route right-hemisphere patients to right parcels directly. Exact rule is a discussion item.
+**Hemisphere (`#30`):** Phase 1 is left-hemisphere only. S22 and S58 (right-hemisphere) are deferred to Phase 2 alongside the sEEG join. The old `mirror_to_left()` helper is discarded; Brainnetome has distinct L/R parcels.
 
 **DCC TSV vs RAS**: DCC electrode TSVs have normalized 0–1 grid coordinates (synthetic, for older Conv2d baselines). RAS files are the relevant source for v14.
 
 ### .fif path and labels
 
-`{bids_root}/derivatives/epoch(phonemeLevel)(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
+Phase 1 input (per `#29`, one epoch per trial, `tmin=-0.5s`, `tmax=1.0s`):
 
-PS labels: `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k':6, 'p':7, 'u':8, 'v':9}` — `phoneme_map.normalize_label()` handles PS → ARPABET conversion.
+`{bids_root}/derivatives/epoch(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
 
-> **Phoneme / label-space rigor audit (2026-04-13) — nothing above is locked.** A first-pass audit of the label space and the upstream assumptions the pre-v14 loader silently inherited surfaced several discussion items, now tracked as blockers **#17–#25** in `docs/implementation_tasks.md`. Most notable: the inherited `PS2ARPA` mapping `ae → EH` and `u → UH` is very likely phonetically wrong (standard ARPABET would be `ae → AE` for /æ/ and `u → UW` for /u/), and the event_id mapping quoted above has never been positively asserted at load time. Do not treat any phoneme-level metric as trustworthy and do not write a v14 data loader until the audit blockers are resolved.
+Per-trial token (e.g. `bak`, `ugae`) comes from the `value` column of `events.tsv`; the canonical 52-token inventory is `data/ps_tokens.csv`. Per-phoneme targets are derived by decomposing each trial's token into its 3-phoneme ARPABET sequence via `phoneme_map.normalize_label()` (PS → ARPABET per `#17`, alphabetical index per `#16`).
+
+The sister phoneme-level `.fif` at `epoch(phonemeLevel)(CAR)/...` is not loaded for training. It exists as an audit-only cross-check under `#34`; its event_id mapping `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k':6, 'p':7, 'u':8, 'v':9}` is asserted under `#18`.
+
+> **Phoneme / label-space rigor audit.** The first-pass audit surfaced blockers `#17–#25` plus the operational audit `#34`. `#17–#25` are now closed in `docs/implementation_tasks.md`; `#34` is the one remaining open blocker and gates the v14 loader. Do not write the v14 loader until `#34` closes.
 
 ## Compute: Duke DCC cluster
 

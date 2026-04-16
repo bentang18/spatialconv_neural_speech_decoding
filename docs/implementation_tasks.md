@@ -114,18 +114,20 @@ Critical path to coding:
     - `S23`
     - `S39`
   - Must-pass checks:
-    - `.fif` `event_id` matches the frozen PS mapping exactly
-    - trials are reconstructed from explicit metadata, not stride-3 assumptions
-    - every trial has exactly 3 phoneme events
-    - every 3-phoneme sequence maps to exactly one entry in `data/ps_tokens.csv`
-    - trial counts agree across `.fif` and BIDS event tables after explicit upstream exclusions
-    - `t=0` in the epochs really means response onset
-    - the frozen `[-0.5, 1.0] s` window lands where expected on real trials
+    - Phase 1 `.fif` path is `{bids_root}/derivatives/epoch(CAR)/sub-<id>/epoch(band)(power)/sub-<id>_task-PhonemeSequence_desc-productionZscore_highgamma.fif` (trial-level, per `#29`)
+    - one epoch per trial, `tmin = -0.5 s`, `tmax = 1.0 s`, sfreq = 200 Hz
+    - `.fif` `event_id` matches the 52-token inventory in `data/ps_tokens.csv` exactly (`#18`)
+    - every trial's `value` (token string) decomposes into exactly 3 PS phonemes via `phoneme_map.normalize_label()`, and every resulting 3-phoneme ARPABET sequence appears exactly once in `data/ps_tokens.csv`
+    - trial count in `.fif` matches `events.tsv`'s distinct `trial` count after explicit upstream exclusions
+    - `.fif` epoch timing is consistent with `events.tsv`'s `response` rows (not `eventsOLD.tsv`)
+    - `t = 0` in each epoch equals the `events.tsv` `response` onset for that trial
+    - the `[-0.5, 1.0] s` window lands where expected on real trials (plot sanity-check)
     - no silent contamination from non-task / rest / malformed epochs
   - Spot-check only:
-    - audio sanity checks on a small handful of trials per patient
-    - MFA boundary comparison as audit-only cross-check, not a training dependency
-    - PS vs Lexical `event_id` comparison as warn-only metadata
+    - audio sanity on a small handful of trials per patient
+    - phoneme-level `.fif` `event_id` audit-only cross-check per `#18`
+    - optional MFA boundary cross-check (audit-only; not a training dependency)
+    - PS vs Lexical token-value comparison as warn-only metadata
   - Deliverables:
     - one short markdown audit report
     - one rerunnable structural audit script
@@ -266,12 +268,26 @@ Critical path to coding:
   - Standard ARPABET is the canonical downstream label space.
 
 - [x] `#18` `event_id` assertion
-  - Hard-assert:
-    - `a:1, ae:2, b:3, g:4, i:5, k:6, p:7, u:8, v:9`
+  - Phase 1 loads the trial-level `.fif` (`#29`). Its `event_id` is the
+    52-token mapping drawn from `data/ps_tokens.csv`: each unique token
+    string (`bak`, `uvi`, ...) carries one integer code.
+  - Hard-assert that the loaded `.fif`'s `event_id` keys are exactly
+    the 52 tokens in `data/ps_tokens.csv`; no unknown tokens, no
+    missing tokens.
+  - The phoneme-level `.fif` at `epoch(phonemeLevel)(CAR)/...` is not
+    loaded for training. If `#34` inspects it as an audit-only
+    cross-check, its `event_id` must match
+    `{a:1, ae:2, b:3, g:4, i:5, k:6, p:7, u:8, v:9}` and must remain
+    PS-consistent across patients.
 
 - [x] `#19` Trial reconstruction
-  - No stride-3 assumption
-  - Trials must be reconstructed from explicit metadata
+  - No stride-based assumption about trial ordering or epoch layout.
+  - Trial identity on the trial-level `.fif` comes from the `.fif`
+    epoch index cross-verified against `events.tsv`'s `trial` column
+    and `value` token string.
+  - If `#34` inspects the phoneme-level `.fif`, per-trial grouping of
+    its 3 phoneme events uses `events.tsv`'s `trial` column, never
+    stride-3.
 
 - [x] `#20` MFA posture
   - No MFA in the Phase 1 training path

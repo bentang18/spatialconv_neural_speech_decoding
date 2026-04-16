@@ -100,10 +100,10 @@ tail -f /work/ht203/logs/my_job_<id>.out  # Live output
 ### What's on DCC
 
 **PS (Phoneme Sequence) dataset — all 11 patients transferred (2026-04-04)**:
-- `.fif` files: `/work/ht203/data/BIDS/derivatives/epoch(phonemeLevel)(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
+- `.fif` files (v14 Phase 1 trial-level input, per `#29`): `/work/ht203/data/BIDS/derivatives/epoch(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
 - Electrode TSVs: `/work/ht203/data/BIDS/sub-{id}/ieeg/sub-{id}_acq-01_space-ACPC_electrodes.tsv`
 - Patients: S14, S16, S22, S23, S26, S32, S33, S39, S57, S58, S62
-- `load_patient_data()` and `load_per_position_data()` work directly with `bids_root=/work/ht203/data/BIDS`
+- Pre-v14 phoneme-level files under `epoch(phonemeLevel)(CAR)/...` may still be on DCC from the earlier sync; they are audit-only per `#18` and not consumed by v14 training.
 
 **Pre-cached `.pt` tensors** (from autoresearch `prepare.py`):
 - `/work/ht203/repo/speech/.cache/autoresearch_lopo/` — S14 target + 9 source patients
@@ -128,10 +128,10 @@ REMOTE="ht203@dcc-login.oit.duke.edu:/work/ht203/data/BIDS"
 for p in S14 S16 S22 S23 S26 S32 S33 S39 S57 S58 S62; do
   echo "Transferring $p..."
   # Create dirs
-  ssh ht203@dcc-login.oit.duke.edu "mkdir -p /work/ht203/data/BIDS/derivatives/epoch\(phonemeLevel\)\(CAR\)/sub-$p/epoch\(band\)\(power\) && mkdir -p /work/ht203/data/BIDS/sub-$p/ieeg"
-  # .fif file
-  scp "${LOCAL_BIDS}/derivatives/epoch(phonemeLevel)(CAR)/sub-${p}/epoch(band)(power)/sub-${p}_task-PhonemeSequence_desc-productionZscore_highgamma.fif" \
-    "${REMOTE}/derivatives/epoch(phonemeLevel)(CAR)/sub-${p}/epoch(band)(power)/"
+  ssh ht203@dcc-login.oit.duke.edu "mkdir -p /work/ht203/data/BIDS/derivatives/epoch\(CAR\)/sub-$p/epoch\(band\)\(power\) && mkdir -p /work/ht203/data/BIDS/sub-$p/ieeg"
+  # .fif file (trial-level, v14 Phase 1 input per #29)
+  scp "${LOCAL_BIDS}/derivatives/epoch(CAR)/sub-${p}/epoch(band)(power)/sub-${p}_task-PhonemeSequence_desc-productionZscore_highgamma.fif" \
+    "${REMOTE}/derivatives/epoch(CAR)/sub-${p}/epoch(band)(power)/"
   # Electrode TSV
   scp "${LOCAL_BIDS}/sub-${p}/ieeg/sub-${p}_acq-01_space-ACPC_electrodes.tsv" \
     "${REMOTE}/sub-${p}/ieeg/"
@@ -142,7 +142,7 @@ done
 ```bash
 # On DCC
 for p in S14 S16 S22 S23 S26 S32 S33 S39 S57 S58 S62; do
-  ls -lh /work/ht203/data/BIDS/derivatives/'epoch(phonemeLevel)(CAR)'/sub-$p/'epoch(band)(power)'/*.fif 2>/dev/null | awk '{print $NF, $5}' || echo "sub-$p: MISSING"
+  ls -lh /work/ht203/data/BIDS/derivatives/'epoch(CAR)'/sub-$p/'epoch(band)(power)'/*.fif 2>/dev/null | awk '{print $NF, $5}' || echo "sub-$p: MISSING"
 done
 ```
 
