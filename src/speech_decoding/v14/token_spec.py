@@ -1,104 +1,85 @@
-"""Provisional atlas/subparcel token layout for Neural Field Perceiver v14.
+"""Frozen atlas/subparcel token layout for Neural Field Perceiver v14 Phase 1.
 
-=============================================================================
-PROVISIONAL — DISCUSS BEFORE USE (2026-04-13)
-=============================================================================
+Frozen 2026-04-14 by blocker #4 in ``docs/implementation_tasks.md``. Revised
+later that day to the argmax-centric rule:
 
-The 16 base parcels and the 2-token splits below were inherited from the
-pre-Phase-1 v14 draft. They are still explicitly listed as an open blocker
-in `docs/implementation_tasks.md` (#4 "Decide the default parcel split
-map"). Under the 2026-04-13 discussion-first rule (`CLAUDE.md` -> "Working
-Principle: Discuss Before Code"), this file must not be treated as a
-locked contract. Before any v14 component consumes `DEFAULT_BASE_PARCELS`
-or `DEFAULT_SPLIT_COUNTS`, the following must be discussed and agreed:
+    parcel p becomes a Tier-1 token iff
+        argmax_wins(p) >= 10
 
-- whether the 16-parcel base list is the right short list for Phase 1
-- the canonical ordering of the parcels within the list (currently
-  grouped by functional category, but the grouping was not an explicit
-  agreement)
-- which parcels actually get a 2-token split, and the anatomical
-  justification for each
-- whether A4tl should stay single-token or get a split
-- the resulting `N_tok` and how it interacts with `token_mask` /
-  `token_support`
-- how the token ordering maps to the inter-region graph attention bias
-  (parent parcels + sibling splits)
+where ``argmax_wins(p)`` is the number of Phase-1 LH electrodes for which
+``p`` is the dominant parcel across all 246 BNA ROIs, computed on the
+frozen spatial pipeline (raw MNI + 8 mm PM dilation + σ=1.5 mm Gaussian).
 
-If you are reading this before the above has been discussed, surface the
-discussion with Ben rather than importing these constants.
-=============================================================================
+The rule went through two earlier iterations in the same session:
+
+1. "Top-12 by effective_N" — a quantity rule masquerading as a quality rule.
+2. "effective_N >= 10 AND argmax_wins >= 1" — caught leakage sinks (A4t,
+   A44op, etc.) but excluded primary auditory cortex (TE1.0/1.2) because
+   its eff_N (7.14) fell below the arbitrary 10 floor despite 12 genuine
+   argmax-winning electrodes across 3 patients.
+3. "argmax_wins >= 10" (current) — directly measures "how many electrodes
+   have this parcel as their true anatomical home," without using eff_N as
+   a proxy that entangles sampling density with evidence quality. Cutoff
+   is robust: argmax in the [5, 9] band is empty on current data, so any
+   threshold from 5 to 12 gives the same 15-parcel list.
+
+The ranking was computed by ``scripts/rank_parcels_by_support.py`` over
+the 7 Phase-1 LH patients (S14, S16, S23, S26, S33, S39, S62) = 1280
+electrodes. Uniform ``k_parcel = 1`` (no 2-token splits in Phase 1); the
+2-token variant is a named ablation gated on ``parcel_frames.npz`` and a
+future elongation metric; it is not part of the Phase-1 baseline.
+
+``PROVISIONAL_TOKEN_SPEC`` is ``False``. ``assert_token_spec_frozen`` is a
+no-op kept for API stability with code written against the earlier
+provisional banner.
 """
 
 from __future__ import annotations
 
-# Machine-readable provisional flag. Blocker #4 requires this to be cleared
-# (set to False) by the Phase-1 parcel re-derivation before any v14 code path
-# consumes DEFAULT_BASE_PARCELS or DEFAULT_SPLIT_COUNTS. Code that reads those
-# constants must call `assert_token_spec_frozen()` first so the banner cannot
-# be ignored by silent import.
-PROVISIONAL_TOKEN_SPEC: bool = True
+
+PROVISIONAL_TOKEN_SPEC: bool = False
 
 
 def assert_token_spec_frozen() -> None:
-    """Fail if the provisional parcel set has not yet been re-derived.
-
-    Blocker #4 in `docs/implementation_tasks.md` requires every v14 code path
-    that reads `DEFAULT_BASE_PARCELS` or `DEFAULT_SPLIT_COUNTS` to call this
-    guard first. It refuses to return until `PROVISIONAL_TOKEN_SPEC` is
-    cleared by the re-derivation.
-    """
+    """Assert that the Phase-1 token spec is frozen. No-op since 2026-04-14."""
 
     if PROVISIONAL_TOKEN_SPEC:
         raise RuntimeError(
-            "token_spec is still provisional — blocker #4 (Phase-1 parcel "
-            "re-derivation) must close before DEFAULT_BASE_PARCELS / "
-            "DEFAULT_SPLIT_COUNTS may enter a v14 code path. See "
-            "docs/implementation_tasks.md #4."
+            "token_spec is still provisional — blocker #4 must close before "
+            "DEFAULT_BASE_PARCELS / DEFAULT_SPLIT_COUNTS may enter a v14 code "
+            "path. See docs/implementation_tasks.md #4."
         )
 
 
-DEFAULT_BASE_PARCELS: tuple[str, ...] = (
-    "A6cvl",
-    "A4tl",
-    "A4hf",
-    "A1/2/3tonIa",
-    "A1/2/3ulhf",
-    "A2",
-    "A44d",
-    "A45c",
-    "A44v",
-    "A45i",
-    "A45r",
-    "A44op",
-    "STGpp",
-    "STGa",
-    "INSa",
-    "MFG",
+# 15 LH Brainnetome parcels selected by argmax_wins >= 10 on the frozen
+# Phase-1 spatial pipeline (raw + dilated_8mm + σ=1.5 mm, 2026-04-14).
+# Ordered by argmax_wins high -> low (primary), eff_N high -> low (tiebreak).
+# Tuple of (parcel_name, BNA_index_1based) pairs so name-to-index and
+# ordering are both canonical in a single source.
+DEFAULT_BASE_PARCELS: tuple[tuple[str, int], ...] = (
+    ("A45c",        33),   # IFG_L_6_3   argmx=223  eff_N=202.43  pts=6
+    ("A45r",        35),   # IFG_L_6_4   argmx=199  eff_N=179.17  pts=6
+    ("IFS",         31),   # IFG_L_6_2   argmx=181  eff_N=188.61  pts=6
+    ("A4hf",        53),   # PrG_L_6_1   argmx=168  eff_N=121.19  pts=5
+    ("A44v",        39),   # IFG_L_6_6   argmx=123  eff_N=112.55  pts=6
+    ("A9/46v",      21),   # MFG_L_7_4   argmx=100  eff_N= 77.02  pts=4
+    ("A12/47l",     51),   # OrG_L_6_6   argmx= 48  eff_N= 32.08  pts=2
+    ("A4tl",        61),   # PrG_L_6_5   argmx= 44  eff_N= 52.15  pts=5
+    ("A38l",        77),   # STG_L_6_5   argmx= 40  eff_N= 15.60  pts=3
+    ("A44d",        29),   # IFG_L_6_1   argmx= 34  eff_N= 48.13  pts=6
+    ("A1/2/3tonIa", 157),  # PoG_L_4_2   argmx= 29  eff_N= 26.93  pts=2
+    ("A1/2/3ulhf", 155),   # PoG_L_4_1   argmx= 28  eff_N= 30.10  pts=2
+    ("IFJ",         17),   # MFG_L_7_2   argmx= 27  eff_N= 23.65  pts=4
+    ("A6cvl",       63),   # PrG_L_6_6   argmx= 24  eff_N= 31.94  pts=5
+    ("TE1.0/1.2",   73),   # STG_L_6_3   argmx= 12  eff_N=  7.14  pts=3  primary auditory (Heschl's)
 )
 
-# Current default: 16 base parcels with selective splits for the most
-# spatially elongated / coverage-sensitive parcels, yielding 21 tokens total.
-DEFAULT_SPLIT_COUNTS: dict[str, int] = {
-    "A6cvl": 2,
-    "A4tl": 1,
-    "A4hf": 2,
-    "A1/2/3tonIa": 2,
-    "A1/2/3ulhf": 2,
-    "A2": 2,
-    "A44d": 1,
-    "A45c": 1,
-    "A44v": 1,
-    "A45i": 1,
-    "A45r": 1,
-    "A44op": 1,
-    "STGpp": 1,
-    "STGa": 1,
-    "INSa": 1,
-    "MFG": 1,
-}
+# Uniform k_parcel = 1 in Phase 1. The 2-token variant is a named ablation
+# and requires a future parcel elongation metric before it can be derived.
+DEFAULT_SPLIT_COUNTS: dict[str, int] = {name: 1 for name, _ in DEFAULT_BASE_PARCELS}
 
 
 def default_token_count() -> int:
-    """Return the current default atlas/subparcel token count."""
+    """Return the current default atlas/subparcel token count (N_tok = 15)."""
 
     return sum(DEFAULT_SPLIT_COUNTS.values())

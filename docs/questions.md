@@ -4,6 +4,8 @@ These are the main unresolved architectural questions for the project. They shou
 
 ## 1. What should the shared representation be?
 
+> **Phase 1 addresses this via** the atlas-token default (`v14-core`) against the `mean+gradient` linear ablation and the uniform-`k=1` ablation from `implementation_tasks.md` #4 / #26. The electrode-space baseline is named but deferred to a later comparison.
+
 This is still the most important representational tension:
 
 - **electrode tokens with anatomical positional bias**
@@ -36,6 +38,8 @@ This remains the key ablation:
    - shared atlas/subparcel dynamics
 
 ## 2. At what level should we pool?
+
+> **Phase 1 addresses this via** the re-derived base parcel set and `k_parcel ∈ {1, 2}` split map (`implementation_tasks.md` #4), plus the within-parcel summarizer contract (#26). Functional pooling is explicitly deferred past Phase 1.
 
 Even if atlas/subparcel tokens are the right shared object, the pooling question is not fully settled.
 
@@ -71,6 +75,8 @@ Still unresolved:
 
 ## 3. Should we actually learn the per-patient calibration parameters?
 
+> **Phase 1 addresses this by answering "no" for now**: the fixed-atlas `v14-core` path is supervised-only with no learned `Δ/ω`, `δ_l`, `τ_l`, or gain/offset. Phase 2 turns learned calibration back on and compares against the frozen Phase 1 baseline. Whether learned calibration earns its keep is a direct Phase 1 → Phase 2 comparison.
+
 The current model includes small per-patient parameters for:
 
 - gain / impedance normalization
@@ -97,6 +103,8 @@ This includes:
 - should parcel offsets / temperatures be learned in full, or only enabled after stronger evidence?
 
 ## 4. How much of the spatial topology and spatiotemporal dynamics is really shared across patients?
+
+> **Phase 1 addresses this partially** via the per-patient-first vs joint-across-core-patients comparison in `implementation_tasks.md` #31. A real answer needs SSL on the full continuous `uECoG` corpus (Phase 1.5) and external chronic ECoG (later). Phase 1 only tests the weakest version of the sharing hypothesis — that the fixed-atlas token interface is adequate for per-patient decoding.
 
 This is the deepest scientific question behind all of the modeling choices.
 

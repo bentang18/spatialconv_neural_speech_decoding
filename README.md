@@ -4,7 +4,7 @@ Active docs:
 
 - [Current direction](docs/current_direction.md)
 - [v14 design doc](docs/neural_field_perceiver_v14.tex)
-- [Implementation start](docs/implementation_start.md)
+- [Implementation tasks](docs/implementation_tasks.md)
 - [Central questions](docs/questions.md)
 
 Current focus:

@@ -9,7 +9,6 @@ Note:
 - do **not** treat `reading_list.md` as the active architecture spec
 - the active implementation/design spec is:
   - `docs/current_direction.md`
-  - `docs/implementation_start.md`
   - `docs/implementation_tasks.md`
   - `docs/neural_field_perceiver_v14.tex`
 

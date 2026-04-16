@@ -6,7 +6,6 @@ If anything here conflicts with:
 
 - `docs/neural_field_perceiver_v14.tex`
 - `docs/current_direction.md`
-- `docs/implementation_start.md`
 - `docs/implementation_tasks.md`
 
 then the active implementation docs win.

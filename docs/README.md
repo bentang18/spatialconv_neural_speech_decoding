@@ -3,9 +3,8 @@
 ## Active
 
 - `neural_field_perceiver_v14.tex`: **Active design document** — Neural Field Perceiver v14 (atlas-guided spatial calibration)
-- `current_direction.md`: First stop for the current implementation path and what's archived
-- `implementation_start.md`: Narrow implementation scope for the first `uECoG`-only `v14` pass
-- `implementation_tasks.md`: Working task list and blockers for the first implementation phase
+- `current_direction.md`: First stop for the current implementation path and what's archived. Absorbs the first-pass `uECoG`-only scope, implementation order, and correctness checks.
+- `implementation_tasks.md`: Single source of truth for blockers, decisions, and the critical path for Phase 1
 - `questions.md`: Central unresolved architectural questions that should stay visible across redesigns
 - `dcc_setup.md`: Complete Duke DCC cluster documentation
 
