@@ -234,15 +234,19 @@ class PerPhonemeConfig:
     per_cell_temporal: PerCellTemporalConfig = field(default_factory=PerCellTemporalConfig)
     parcel_embedding_n_parcels: int = 15
     use_parcel_embedding: bool = True
-    # "flat": Conv1d(8·n_cells → d, k, s) on flattened (B, C·n_cells, T) — baseline
-    # 2026-04-04 front-end that bakes full spatial mixing into the temporal conv
-    # (~245k temporal params). Post-conv sequence is temporal-only (T_tokens) and
-    # the parcel embedding is skipped (no cell axis). Promoted to default
-    # 2026-04-18: halved pop-PER variance vs per_cell (0.034 vs 0.059) on Q1a
-    # with matched mean, and best-per-patient on S14/S26/S33.
     # "per_cell": shared Conv1d(8→d, k, s) applied to each cell independently
-    # (~7.7k temporal params). Retained for ablation.
-    temporal_frontend: str = "flat"
+    # (~7.7k temporal params). Canonical. Permutation-equivariant across cells;
+    # cross-patient alignment via the atlas parcel embedding; scales natively
+    # to variable-shape arrays and per-electrode tokens (required for sEEG /
+    # external corpora). This is the long-term research direction — cross-
+    # patient / cross-sensor generalization. Do not swap the default to `flat`
+    # chasing per-subject peaks; flat is a rigid-grid local optimum that
+    # breaks the moment we touch sEEG or non-uECoG arrays.
+    # "flat": Conv1d(8·n_cells → d, k, s) on flattened (B, C·n_cells, T) —
+    # baseline 2026-04-04 front-end that bakes full spatial mixing into the
+    # temporal conv (~245k params, position-specific weights). Retained as
+    # ablation / single-dataset reference; NOT the canonical path.
+    temporal_frontend: str = "per_cell"
     # "masked_mean": our Stage-3 pool — start-index-only non-overlapping bins,
     # divisor = #active electrodes per cell. Inactives drop out of both ends.
     # "adaptive_avg": torch.nn.functional.adaptive_avg_pool2d over the scattered
