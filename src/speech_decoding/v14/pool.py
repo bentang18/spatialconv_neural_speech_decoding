@@ -6,10 +6,14 @@ One scatter-mean kernel services two callers:
   reshape to `(B, C, H_p·W_p, T)` and pool along `dim=2`.
 * Parcel-support pool:  `(B, N_e, P)` → `(B, n_cells, P)` along `dim=1`.
 
-The pool is non-overlapping integer blocks. All Phase-1 grid shapes
-(8×16, 16×16, 12×24) divide evenly into the baseline `(4, 8)` pool, so this
-matches `AdaptiveAvgPool2d((4, 8))` exactly on all-active inputs. Mixed
-divisibility would need adaptive-pool's overlapping bins — we assert instead.
+The pool uses non-overlapping bins whose boundaries follow
+`AdaptiveAvgPool2d`'s start-index formula: input position `i` goes to output
+bin `(i · out) // in`. Identical to floor-div blocks on divisible grids
+(8×16, 12×24) and yields cells of sizes `3,3,2,3,3,2,3,3` on the 12×22
+grid — unevenly partitioned but still non-overlapping, so each electrode
+contributes to exactly one cell and the masked-mean denominator stays honest.
+Strict `AdaptiveAvgPool2d` parity (overlapping bins on non-divisible grids)
+is not attempted; empty cells return 0 with no NaN.
 """
 
 from __future__ import annotations
@@ -40,22 +44,24 @@ def precompute_pool_assignment(
 ) -> torch.Tensor:
     """Return `cell_of_grid: (H_p·W_p,)` mapping each grid position to a pool cell.
 
-    Row-major flat index: `flat(r, c) = r · W_p + c`.
-    Cell index is row-major in the pool grid: `cell = (r // bH) · out_W + (c // bW)`.
+    Row-major flat index: `flat(r, c) = r · W_p + c`. Cell boundaries follow
+    the `AdaptiveAvgPool2d` start-index rule: `cell = ((r · out_H) // H_p) ·
+    out_W + ((c · out_W) // W_p)`. Equivalent to floor-div blocks when
+    `H_p % out_H == 0` and `W_p % out_W == 0`; otherwise produces uneven
+    non-overlapping bins.
     """
 
     H_p, W_p = grid_shape
     out_H, out_W = pool_shape
-    if H_p % out_H != 0 or W_p % out_W != 0:
+    if H_p < out_H or W_p < out_W:
         raise ValueError(
-            f"grid {grid_shape} not divisible by pool {pool_shape}; "
-            "add adaptive-pool overlapping bins if this grid shape is real"
+            f"grid {grid_shape} smaller than pool {pool_shape}; "
+            "each output cell would need at least one input position"
         )
-    block_H, block_W = H_p // out_H, W_p // out_W
 
     rs = torch.arange(H_p).repeat_interleave(W_p)  # (H_p·W_p,)
     cs = torch.arange(W_p).repeat(H_p)
-    return (rs // block_H) * out_W + (cs // block_W)
+    return (rs * out_H) // H_p * out_W + (cs * out_W) // W_p
 
 
 def precompute_pool(

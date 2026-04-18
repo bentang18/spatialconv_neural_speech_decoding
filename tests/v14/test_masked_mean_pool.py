@@ -31,9 +31,29 @@ class TestPrecomputePoolAssignment:
         # Bottom-right corner → cell 31.
         assert int(cell_of[-1, -1]) == 31
 
-    def test_rejects_non_divisible_grid(self) -> None:
-        with pytest.raises(ValueError, match="not divisible"):
-            precompute_pool_assignment((7, 16), (4, 8))
+    def test_rejects_grid_smaller_than_pool(self) -> None:
+        with pytest.raises(ValueError, match="smaller than pool"):
+            precompute_pool_assignment((3, 16), (4, 8))
+
+    def test_non_divisible_grid_has_no_overlap(self) -> None:
+        # 12x22 grid, (4, 8) pool: H divides evenly (3 rows per cell); W does
+        # not (22 / 8 = 2.75). AdaptiveAvgPool2d-style start-index binning gives
+        # col widths 3,3,2,3,3,2,3,3 — uneven but non-overlapping.
+        cell_of = precompute_pool_assignment((12, 22), (4, 8)).view(12, 22)
+        # Every input position maps to exactly one cell.
+        assert int(cell_of.min()) == 0
+        assert int(cell_of.max()) == 31
+        # Row boundaries are exact: rows 0-2 → pool-row 0, 3-5 → 1, 6-8 → 2, 9-11 → 3.
+        assert torch.all(cell_of[0:3, :] // 8 == 0)
+        assert torch.all(cell_of[3:6, :] // 8 == 1)
+        assert torch.all(cell_of[6:9, :] // 8 == 2)
+        assert torch.all(cell_of[9:12, :] // 8 == 3)
+        # Expected col-bin widths (start-index rule): 3,3,3,2,3,3,3,2 for
+        # W_p=22, out_W=8 → bin_of(c) = (c·8)//22.
+        col_of_pool = cell_of[0] % 8
+        widths = torch.bincount(col_of_pool)
+        assert widths.tolist() == [3, 3, 3, 2, 3, 3, 3, 2]
+        assert widths.sum().item() == 22
 
     def test_deterministic(self) -> None:
         a = precompute_pool_assignment((12, 24), (4, 8))
