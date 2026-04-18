@@ -151,6 +151,55 @@ class TestPartialConv:
         assert n_part == n_zero
 
 
+class TestReadoutModes:
+    """CLS + hierarchical readouts — alternatives to mean_pool."""
+
+    def test_cls_shapes(self) -> None:
+        cfg = replace(PerPhonemeConfig(), readout_mode="cls")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_cls_memory_has_extra_token(self) -> None:
+        """CLS-enabled memory has exactly one more token than mean_pool."""
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+
+        cfg_mean = PerPhonemeConfig()
+        cfg_cls = replace(PerPhonemeConfig(), readout_mode="cls")
+        m_mean = NeuralFieldPerceiverPerPhoneme(cfg_mean).encode_memory(batch)
+        m_cls = NeuralFieldPerceiverPerPhoneme(cfg_cls).encode_memory(batch)
+        assert m_cls.shape == (2, m_mean.shape[1] + 1, 32)
+
+    def test_cls_adds_d_model_params(self) -> None:
+        n_base = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme().parameters())
+        cfg = replace(PerPhonemeConfig(), readout_mode="cls")
+        n_cls = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme(cfg).parameters())
+        assert n_cls - n_base == 32  # one (1, 1, d=32) learnable CLS vector.
+
+    def test_hierarchical_shapes(self) -> None:
+        cfg = replace(PerPhonemeConfig(), readout_mode="hierarchical")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_hierarchical_adds_two_d_model_params(self) -> None:
+        """Hierarchical adds exactly q_temporal (d) + q_cell (d) = 2·d params."""
+        n_base = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme().parameters())
+        cfg = replace(PerPhonemeConfig(), readout_mode="hierarchical")
+        n_h = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme(cfg).parameters())
+        assert n_h - n_base == 2 * 32
+
+    def test_hierarchical_rejects_flat_frontend(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(), readout_mode="hierarchical", temporal_frontend="flat"
+        )
+        import pytest
+        with pytest.raises(ValueError, match="requires temporal_frontend='per_cell'"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+
 class TestOverfit:
     def test_ten_steps_drop_loss_by_at_least_0_1(self) -> None:
         """10 AdamW steps on a fixed batch should drive CE down by ≥0.1."""

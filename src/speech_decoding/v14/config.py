@@ -207,13 +207,30 @@ class PerCellTemporalConfig:
 class D1DecoderConfig:
     """Minimum AR decoder for the per-phoneme path.
 
-    Pools memory by mean, adds BOS-aware `prev_phoneme` embedding, projects
-    to vocab. Vocab index 9 is the BOS slot in the embedding table.
+    Reduces backbone memory to a (B, d) summary per `readout_mode`, adds
+    BOS-aware `prev_phoneme` embedding, projects to vocab. Vocab index 9 is
+    the BOS slot in the embedding table.
+
+    ``readout_mode``:
+    * "mean_pool" — current baseline. ``memory.mean(dim=1)``. 0 added params.
+    * "cls" — expects the top-level model to prepend a learnable CLS token
+      at position 0. Decoder reads ``memory[:, 0]``. +d params live on the
+      model, not here.
+    * "hierarchical" — expects memory shape ``(B, n_cells * t_tokens, d)``.
+      Reshape to ``(B, n_cells, t_tokens, d)``; attention-pool across
+      ``t_tokens`` via learned query ``q_temporal ∈ R^d`` → ``(B, n_cells, d)``;
+      then attention-pool across ``n_cells`` via learned ``q_cell ∈ R^d`` →
+      ``(B, d)``. +2d params. ``n_cells`` / ``t_tokens`` default to the
+      canonical per_cell path at pool (4,8) + tmin=-0.15, tmax=0.5, fs=200,
+      k=30, s=10 → 32 cells, 11 tokens.
     """
 
     d_model: int = 32
     vocab_size: int = 9  # 9 ARPA phonemes
     prev_embedding_size: int = 10  # 9 phonemes + 1 BOS
+    readout_mode: str = "mean_pool"
+    n_cells: int = 32
+    t_tokens: int = 11
 
 
 @dataclass(frozen=True)
@@ -263,6 +280,18 @@ class PerPhonemeConfig:
     # transfers identically to sEEG / external arrays / future grid shapes.
     # No mask propagation needed (only one Conv2d layer before the pool).
     masking_mode: str = "zero_fill"
+    # "mean_pool": current baseline — decoder does memory.mean(dim=1).
+    # "cls": prepend a learnable CLS token at position 0 before the backbone
+    #   (runs through all 3 combined-attention blocks like any other token).
+    #   Decoder reads position 0. +d_model params. No-regret integration test
+    #   — CLS has been the standard ViT/BERT readout since 2017.
+    # "hierarchical": keep the flat (B, n_cells*T_tokens, d) memory; the
+    #   decoder reshapes to (B, n_cells, T_tokens, d) and runs two learned-
+    #   query attention pools — first across time per cell, then across cells.
+    #   +2·d_model params. Tests the factored-structure hypothesis — whether
+    #   summarizing time-within-cell before pooling across cells beats a flat
+    #   single-pool. per_cell-only (flat temporal_frontend has no cell axis).
+    readout_mode: str = "mean_pool"
     backbone: BackboneConfig = field(
         default_factory=lambda: BackboneConfig(
             d_model=32, num_heads=2, head_dim=16, ffn_hidden=128,

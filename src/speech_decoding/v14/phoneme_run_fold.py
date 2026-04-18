@@ -58,6 +58,7 @@ def _build_config(
     temporal_frontend: str = "per_cell",
     pool_method: str = "masked_mean",
     masking_mode: str = "zero_fill",
+    readout_mode: str = "mean_pool",
 ) -> PerPhonemeConfig:
     """Build a consistent config at the given width, depth, conv2d, and pool.
 
@@ -87,6 +88,7 @@ def _build_config(
         temporal_frontend=temporal_frontend,
         pool_method=pool_method,
         masking_mode=masking_mode,
+        readout_mode=readout_mode,
         backbone=BackboneConfig(
             d_model=d_model, num_heads=num_heads, head_dim=16,
             ffn_hidden=4 * d_model, num_blocks=backbone_depth, dropout=0.1,
@@ -122,6 +124,7 @@ def run_one_fold(
     temporal_frontend: str = "per_cell",
     pool_method: str = "masked_mean",
     masking_mode: str = "zero_fill",
+    readout_mode: str = "mean_pool",
     label_smoothing: float = 0.0,
     mixup_alpha: float = 0.0,
     max_epochs: int | None = None,
@@ -163,6 +166,7 @@ def run_one_fold(
         temporal_frontend=temporal_frontend,
         pool_method=pool_method,
         masking_mode=masking_mode,
+        readout_mode=readout_mode,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
 
@@ -238,6 +242,7 @@ def run_one_fold(
         "temporal_frontend": temporal_frontend,
         "pool_method": pool_method,
         "masking_mode": masking_mode,
+        "readout_mode": readout_mode,
         "label_smoothing": label_smoothing,
         "mixup_alpha": mixup_alpha,
         "best_val_per_phoneme": fold_result.best_val_per,

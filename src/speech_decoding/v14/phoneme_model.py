@@ -15,6 +15,8 @@ Total params ~45k. Matches Ben's 0.734 baseline param budget.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -61,6 +63,20 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 f"masking_mode must be 'zero_fill' or 'partial_conv', "
                 f"got {self.cfg.masking_mode!r}"
             )
+        if self.cfg.readout_mode not in ("mean_pool", "cls", "hierarchical"):
+            raise ValueError(
+                f"readout_mode must be 'mean_pool', 'cls', or 'hierarchical', "
+                f"got {self.cfg.readout_mode!r}"
+            )
+        if (
+            self.cfg.readout_mode in ("cls", "hierarchical")
+            and self.cfg.temporal_frontend != "per_cell"
+        ):
+            raise ValueError(
+                f"readout_mode={self.cfg.readout_mode!r} requires "
+                f"temporal_frontend='per_cell' (no cell axis in "
+                f"{self.cfg.temporal_frontend!r})"
+            )
         if self.cfg.temporal_frontend == "per_cell":
             self.conv1d = nn.Conv1d(
                 t_cfg.in_channels,
@@ -95,11 +111,32 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
             )
         self.backbone = Backbone(self.cfg.backbone)
 
+        if self.cfg.readout_mode == "cls":
+            # Learnable CLS prepended before the combined-attention backbone.
+            # Flows through every block like any other token.
+            self.cls_token = nn.Parameter(torch.empty(1, 1, d))
+            nn.init.normal_(self.cls_token, std=0.02)
+        else:
+            self.cls_token = None
+
         if self.cfg.decoder.d_model != d:
             raise ValueError(
                 f"decoder.d_model ({self.cfg.decoder.d_model}) != d_model ({d})"
             )
-        self.decoder = D1Decoder(self.cfg.decoder)
+        # Propagate top-level readout_mode into the nested decoder config and
+        # sync hierarchical shape info from the pool / temporal front-end, so
+        # the two configs never disagree.
+        n_cells = self.cfg.pool.pool_shape[0] * self.cfg.pool.pool_shape[1]
+        t_cfg = self.cfg.per_cell_temporal
+        # T_tokens for the per_cell path given 200 Hz, 0.65 s window = 130 samples.
+        t_tokens = (130 - t_cfg.kernel_size) // t_cfg.stride + 1
+        decoder_cfg = replace(
+            self.cfg.decoder,
+            readout_mode=self.cfg.readout_mode,
+            n_cells=n_cells,
+            t_tokens=t_tokens,
+        )
+        self.decoder = D1Decoder(decoder_cfg)
 
     def forward(self, batch: dict) -> torch.Tensor:
         """Return per-phoneme logits `(B, 9)` in train mode."""
@@ -250,6 +287,29 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 .expand(n_cells, -1)
                 .reshape(-1)
             )
+
+            if self.cls_token is not None:
+                # Prepend CLS at position 0. RoPE rotates by time_id; using
+                # time_id=0 leaves CLS with the identity rotation (cos=1,
+                # sin=0), a clean "no temporal position" semantic.
+                cls = self.cls_token.expand(B, 1, self.cfg.d_model)
+                y_flat = torch.cat([cls, y_flat], dim=1)
+                active_flat = torch.cat(
+                    [
+                        torch.ones(
+                            B, 1, dtype=active_flat.dtype, device=active_flat.device
+                        ),
+                        active_flat,
+                    ],
+                    dim=1,
+                )
+                time_ids = torch.cat(
+                    [
+                        torch.zeros(1, dtype=time_ids.dtype, device=time_ids.device),
+                        time_ids,
+                    ],
+                    dim=0,
+                )
         else:  # temporal_frontend == "flat" — baseline 256→d front-end
             # Flatten (C, n_cells) into the channel dim and run one Conv1d.
             # Zero out inactive cells across all channels so they don't

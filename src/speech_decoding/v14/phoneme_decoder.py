@@ -1,13 +1,25 @@
 """D1 minimum AR decoder for the per-phoneme v14 stack (plan P4 / Stage 7).
 
-Mean-pool memory → add BOS-aware `prev_phoneme` embedding → Linear to vocab.
-Vocab index 9 in the embedding table is reserved for BOS; `prev_phoneme = -1`
-at `phoneme_pos == 0` is remapped to 9 before the embedding lookup.
+Reduces memory to (B, d) per `readout_mode`, adds BOS-aware `prev_phoneme`
+embedding, projects to vocab. Vocab index 9 in the embedding table is
+reserved for BOS; `prev_phoneme = -1` at `phoneme_pos == 0` is remapped
+to 9 before the embedding lookup.
+
+Readout modes:
+* ``mean_pool`` — ``memory.mean(dim=1)``. Baseline.
+* ``cls``       — ``memory[:, 0]``; assumes the model prepended a learnable
+                  CLS token before the backbone.
+* ``hierarchical`` — reshape ``(B, n_cells*t_tokens, d) → (B, n_cells, t_tokens, d)``,
+                  attention-pool over time per cell (learned ``q_temporal``),
+                  then attention-pool over cells (learned ``q_cell``).
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from speech_decoding.v14.config import D1DecoderConfig
@@ -18,7 +30,7 @@ _BOS_EMBEDDING_INDEX = 9  # assumes vocab_size == 9; asserted in __init__
 
 
 class D1Decoder(nn.Module):
-    """Mean-pool + prev-embedding + Linear head. ~617 params at d=32."""
+    """Readout + prev-embedding + Linear head."""
 
     def __init__(self, cfg: D1DecoderConfig | None = None) -> None:
         super().__init__()
@@ -29,12 +41,52 @@ class D1Decoder(nn.Module):
                 f"vocab_size + 1 (= {cfg.vocab_size + 1})"
             )
         if cfg.vocab_size != 9:
-            # The BOS index assumption is specific to the 9-phoneme vocab.
             raise ValueError(f"D1Decoder assumes vocab_size=9, got {cfg.vocab_size}")
+        if cfg.readout_mode not in ("mean_pool", "cls", "hierarchical"):
+            raise ValueError(
+                f"readout_mode must be 'mean_pool', 'cls', or 'hierarchical', "
+                f"got {cfg.readout_mode!r}"
+            )
         self.d_model = cfg.d_model
         self.vocab_size = cfg.vocab_size
+        self.readout_mode = cfg.readout_mode
+        self.n_cells = cfg.n_cells
+        self.t_tokens = cfg.t_tokens
         self.prev_emb = nn.Embedding(cfg.prev_embedding_size, cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size)
+
+        if cfg.readout_mode == "hierarchical":
+            self.q_temporal = nn.Parameter(torch.empty(cfg.d_model))
+            self.q_cell = nn.Parameter(torch.empty(cfg.d_model))
+            nn.init.normal_(self.q_temporal, std=1.0 / math.sqrt(cfg.d_model))
+            nn.init.normal_(self.q_cell, std=1.0 / math.sqrt(cfg.d_model))
+
+    def _readout(self, memory: torch.Tensor) -> torch.Tensor:
+        """Reduce `(B, S, d)` → `(B, d)` per `readout_mode`."""
+
+        if self.readout_mode == "mean_pool":
+            return memory.mean(dim=1)
+        if self.readout_mode == "cls":
+            return memory[:, 0]
+        # hierarchical
+        B, S, d = memory.shape
+        expected = self.n_cells * self.t_tokens
+        if S != expected:
+            raise ValueError(
+                f"hierarchical readout expects S = n_cells*t_tokens = "
+                f"{expected}, got S={S}"
+            )
+        m = memory.view(B, self.n_cells, self.t_tokens, d)
+        # 1) time pool: attention over t per cell.
+        scale = 1.0 / math.sqrt(d)
+        # scores_t[b, c, t] = <q_temporal, m[b, c, t]>.
+        scores_t = (m * self.q_temporal).sum(dim=-1) * scale  # (B, C, T)
+        w_t = F.softmax(scores_t, dim=-1).unsqueeze(-1)        # (B, C, T, 1)
+        cell_vec = (w_t * m).sum(dim=2)                        # (B, C, d)
+        # 2) cell pool: attention over cells.
+        scores_c = (cell_vec * self.q_cell).sum(dim=-1) * scale  # (B, C)
+        w_c = F.softmax(scores_c, dim=-1).unsqueeze(-1)          # (B, C, 1)
+        return (w_c * cell_vec).sum(dim=1)                       # (B, d)
 
     def forward(
         self,
@@ -53,7 +105,7 @@ class D1Decoder(nn.Module):
                 f"({memory.shape[0]},)"
             )
 
-        mem_pooled = memory.mean(dim=1)  # (B, d)
+        mem_pooled = self._readout(memory)  # (B, d)
 
         idx = torch.where(
             prev_phoneme == BOS_SENTINEL,

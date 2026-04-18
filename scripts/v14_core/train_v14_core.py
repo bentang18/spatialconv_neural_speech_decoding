@@ -188,6 +188,17 @@ def main(argv: list[str] | None = None) -> int:
         "the attenuation with zero learnable params.",
     )
     parser.add_argument(
+        "--readout-mode",
+        type=str,
+        default="mean_pool",
+        choices=("mean_pool", "cls", "hierarchical"),
+        help="Per-phoneme + pooled: decoder readout. 'mean_pool' (default, "
+        "baseline) averages backbone memory across all tokens. 'cls' prepends "
+        "a learnable CLS token before the backbone and reads position 0. "
+        "'hierarchical' keeps the flat memory, reshapes to (cells, time), and "
+        "attention-pools time-per-cell then cells — +2·d learned params.",
+    )
+    parser.add_argument(
         "--label-smoothing",
         type=float,
         default=0.0,
@@ -321,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             temporal_frontend=args.temporal_frontend,
             pool_method=args.pool_method,
             masking_mode=args.masking_mode,
+            readout_mode=args.readout_mode,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,
@@ -356,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             temporal_frontend=args.temporal_frontend,
             pool_method=args.pool_method,
             masking_mode=args.masking_mode,
+            readout_mode=args.readout_mode,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,
