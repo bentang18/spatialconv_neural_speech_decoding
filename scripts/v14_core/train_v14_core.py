@@ -111,8 +111,37 @@ def main(argv: list[str] | None = None) -> int:
         "--backbone-depth",
         type=int,
         default=3,
-        choices=(1, 3),
-        help="Per-phoneme mode: number of attention blocks (plan: {1, 3}).",
+        choices=(1, 3, 5),
+        help="Per-phoneme mode: number of attention blocks. P8 uses {1, 3}; "
+        "depth=5 is the post-P8 capacity ablation.",
+    )
+    parser.add_argument(
+        "--d-model",
+        type=int,
+        default=32,
+        choices=(32, 64),
+        help="Per-phoneme mode: backbone width. Default 32 (plan); 64 is the "
+        "width ablation. Cascades to per-cell Conv1d + decoder.",
+    )
+    parser.add_argument(
+        "--conv2d-kernel",
+        type=int,
+        default=3,
+        choices=(1, 3, 5),
+        help="Per-phoneme mode: Conv2d spatial kernel. Default 3. k=1 removes "
+        "spatial context (pure channel-wise); k=5 is a larger receptive field.",
+    )
+    parser.add_argument(
+        "--pool-h",
+        type=int,
+        default=4,
+        help="Per-phoneme mode: pool target rows. Default 4.",
+    )
+    parser.add_argument(
+        "--pool-w",
+        type=int,
+        default=8,
+        help="Per-phoneme mode: pool target cols. Default 8.",
     )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument(
@@ -193,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
             fold_idx=args.fold,
             seed=args.seed,
             backbone_depth=args.backbone_depth,
+            d_model=args.d_model,
+            conv2d_kernel=args.conv2d_kernel,
+            pool_shape=(args.pool_h, args.pool_w),
             out_dir=args.out_dir,
             patient_id=args.patient,
             **smoke_kw,

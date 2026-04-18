@@ -50,12 +50,43 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _build_config(backbone_depth: int) -> PerPhonemeConfig:
-    """Depth = number of backbone blocks. Default in the plan is 3; the P8
-    array sweeps depth ∈ {1, 3} as the two cheapest ablation rungs."""
+def _build_config(
+    backbone_depth: int,
+    d_model: int = 32,
+    conv2d_kernel: int = 3,
+    pool_shape: tuple[int, int] = (4, 8),
+) -> PerPhonemeConfig:
+    """Build a consistent config at the given width, depth, conv2d, and pool.
 
-    cfg = PerPhonemeConfig()
-    return replace(cfg, backbone=replace(cfg.backbone, num_blocks=backbone_depth))
+    The model enforces `d_model == per_cell_temporal.out_channels ==
+    backbone.d_model == decoder.d_model`, so we rebuild every nested config
+    whose width depends on `d_model`. Heads follow the B-1 contract:
+    `d=32 → 2 heads × 16`, `d=64 → 4 heads × 16`. FFN stays at 4·d.
+    Conv2d padding auto-derives from kernel (k=1→0, k=3→1, k=5→2).
+    """
+
+    from speech_decoding.v14.config import BackboneConfig, D1DecoderConfig, PoolConfig
+
+    if d_model not in (32, 64):
+        raise ValueError(f"d_model must be 32 or 64, got {d_model}")
+    if conv2d_kernel not in (1, 3, 5):
+        raise ValueError(f"conv2d_kernel must be 1, 3, or 5, got {conv2d_kernel}")
+
+    num_heads = 2 if d_model == 32 else 4
+    base = PerPhonemeConfig()
+    return replace(
+        base,
+        d_model=d_model,
+        conv2d_kernel_size=conv2d_kernel,
+        conv2d_padding=conv2d_kernel // 2,
+        pool=PoolConfig(pool_shape=pool_shape),
+        per_cell_temporal=replace(base.per_cell_temporal, out_channels=d_model),
+        backbone=BackboneConfig(
+            d_model=d_model, num_heads=num_heads, head_dim=16,
+            ffn_hidden=4 * d_model, num_blocks=backbone_depth, dropout=0.1,
+        ),
+        decoder=D1DecoderConfig(d_model=d_model, vocab_size=9, prev_embedding_size=10),
+    )
 
 
 def _select_device() -> torch.device:
@@ -79,12 +110,15 @@ def run_one_fold(
     backbone_depth: int,
     out_dir: Path,
     patient_id: str,
+    d_model: int = 32,
+    conv2d_kernel: int = 3,
+    pool_shape: tuple[int, int] = (4, 8),
     max_epochs: int | None = None,
     val_every: int | None = None,
     patience: int | None = None,
     warmup_epochs: int | None = None,
 ) -> dict:
-    """Train + eval one `(fold, seed, depth)` per-phoneme run."""
+    """Train + eval one `(fold, seed, depth, d_model)` per-phoneme run."""
 
     if backbone_depth < 1:
         raise ValueError(f"backbone_depth must be >= 1, got {backbone_depth}")
@@ -108,7 +142,12 @@ def run_one_fold(
 
     set_seed(seed)
     device = _select_device()
-    cfg = _build_config(backbone_depth)
+    cfg = _build_config(
+        backbone_depth,
+        d_model=d_model,
+        conv2d_kernel=conv2d_kernel,
+        pool_shape=pool_shape,
+    )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
 
     g = torch.Generator()
@@ -163,6 +202,9 @@ def run_one_fold(
         "fold": fold_idx,
         "seed": seed,
         "backbone_depth": backbone_depth,
+        "d_model": d_model,
+        "conv2d_kernel": conv2d_kernel,
+        "pool_shape": list(pool_shape),
         "best_val_per_phoneme": fold_result.best_val_per,
         "test_per_phoneme": test_per_phoneme,
         "test_slot_averaged_per": test_slot_per,
