@@ -1,6 +1,6 @@
 # Current Direction
 
-Updated: 2026-04-18 (late) — Phase 1 ablations converged. `per_cell` + attention + atlas parcel embedding is canonical. `flat` is retained as ablation only. Q1d (7-LH pooled) landed; LOPO pretrain→finetune 35/60 in flight **on the flat arm only** — not the arm where pooled transfer was observed, so the early read is uninformative about cross-patient transfer.
+Updated: 2026-04-18 (late) — Phase 1 ablations converged. `per_cell` + attention + atlas parcel embedding is canonical. `flat` is retained as ablation only. Q1d (7-LH pooled) landed; flat-arm LOPO pretrain→finetune complete (null, as expected — flat shows no pooled transfer); per_cell-arm LOPO pretrain→finetune submitted as `45724809` (the informative test; first submission `45724593` cancelled after 0/60 succeeded due to an uncommitted `cv.py` helper — see commit `41bc7cc`).
 
 ## Canonical research goal
 
@@ -22,7 +22,9 @@ Canonical references (do not restate them here):
 
 **Q1d** (landed): pooled run on the full Phase-1 LH cohort (`S14, S16, S23, S26, S33, S39, S62`) with the flat front-end. Job `45720982`, 15 jobs. At 4 patients, pooled flat (pop 0.791) ≈ per-subject flat mean (0.784) — no transfer signal. 7-LH pooled flat: 0.794 ± 0.025 (per-patient mean 0.797). Per-subject wins on variance but not on mean; Phase-1 data-scaling alone does not recover transfer.
 
-**LOPO warm-start on `flat`** (job `45723956`, 60 jobs, 35 done): pretrain pooled flat on 3 core patients, finetune on held-out. S14 0.797 ± 0.051 vs scratch 0.790 ± 0.032 (Δ +0.007); S26 0.758 ± 0.058 vs scratch 0.755 ± 0.034 (Δ +0.003); S33 partial 6/15 at 0.843 ± 0.062 vs scratch 0.779 ± 0.073; S62 queued. **Caveat**: pooled joint training on flat showed no cross-patient lift per-subject (Q1a 4-core: pooled flat 0.791 ≈ per-subject flat mean 0.784). Running LOPO on the arm with no visible transfer in the first place is not a test of warm-start transfer — it confirms flat has no transfer handle, not that warm-start fails. The informative experiment is LOPO warm-start on `per_cell`, where pooled joint training does pull S26 (−7.6pp) and S33 (−10.9pp) toward the pop mean. Sbatch should be re-run with the default front-end before drawing conclusions about warm-start itself.
+**LOPO warm-start on `flat`** (job `45723956`, 60/60 done): pretrain pooled flat on 3 core patients, finetune on held-out. S14 0.797 ± 0.051 (Δ +0.007); S26 0.758 ± 0.058 (Δ +0.003); S33 0.777 ± 0.092 (Δ −0.002); S62 0.793 ± 0.042 (Δ −0.019). All four Δs within noise. **Caveat**: pooled joint training on flat showed no cross-patient lift per-subject (Q1a 4-core: pooled flat 0.791 ≈ per-subject flat mean 0.784), so running LOPO on flat was a null test by construction — confirms flat has no transfer handle, not that warm-start fails.
+
+**LOPO warm-start on `per_cell`** (job `45724593`, 60 jobs, queued 2026-04-18): same pretrain→finetune contract but on the canonical arm. Pooled joint training on per_cell does pull S26 (−7.6pp) and S33 (−10.9pp) toward the pop mean at 4 patients, so this is the informative test of whether a warm-started backbone transfers without the held-out patient's tokens in the pretrain set.
 
 ## Where we are
 
@@ -96,9 +98,21 @@ signal (B, N_e, 130) at 200 Hz, window [-0.15, 0.5)s around MFA phoneme onset
 3. Phase 2: learned per-patient calibration (`Δ/ω`, `δ_l`, `τ_l`).
 4. Phase 2+: `sEEG` join, external chronic ECoG (Flinker, Chang).
 
+## Canonical experimental protocol
+
+Every architectural or data-scaling change is evaluated against **two** protocols, always:
+
+1. **Pooled joint** — one model trained on all patients simultaneously, each patient's held-out fold evaluated on that shared model. Tests whether weight-sharing during training helps each patient. Cheap: one training run per (fold, seed).
+2. **LOPO warm-start** — pretrain pooled on `N−1` patients (held-out patient's data never seen), then finetune per-patient on the held-out patient's fold-train split, loading the pretrained checkpoint as initialization. Tests whether pretraining transfers to a *new* patient. This is the foundation-model test and is load-bearing for Phase 1.5 SSL → supervised finetune, Phase 2+ cross-sensor transfer, and external-corpus transfer.
+
+The informative signal is the **gap between pooled joint and LOPO warm-start**. If warm-start matches or beats pooled joint, the backbone is learning transferable structure. If warm-start is no better than scratch per-patient, no transfer is happening — regardless of how good pooled joint looks.
+
+Sbatch wrappers: every architectural config should have both `v14_pooled_<tag>_dcc.sh` and `v14_lopo_<tag>_dcc.sh`. Aggregator handles LOPO outputs via the existing variant-suffix mechanism.
+
 ## Practical rules
 
 - Always `exclude_artifacts=True`. Always grouped-by-token CV. Always 3-seed runs.
 - All training on DCC. Never local. See `docs/dcc_setup.md`.
 - Supervised contract `#9` is frozen for Phase 1.
+- **Every architectural change reports both pooled joint and LOPO warm-start** (see protocol above). Single-protocol evidence does not justify defaulting an arch change.
 - If a doc references v12, factored spatial-then-temporal attention, within-parcel Perceiver summarizer, `parcel_frames.npz` as a runtime input, `N_tok = 15` atlas-pool tokens, or cvs_avg35 as the active spatial base — it is stale. Authoritative pipeline is the per-phoneme path above.

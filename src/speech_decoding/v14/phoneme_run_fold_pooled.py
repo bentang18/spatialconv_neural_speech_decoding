@@ -70,11 +70,11 @@ def _build_config(
 ) -> PerPhonemeConfig:
     from speech_decoding.v14.config import BackboneConfig, D1DecoderConfig, PoolConfig
 
-    if d_model not in (32, 64):
-        raise ValueError(f"d_model must be 32 or 64, got {d_model}")
+    if d_model not in (16, 32, 64):
+        raise ValueError(f"d_model must be 16, 32, or 64, got {d_model}")
     if conv2d_kernel not in (1, 3, 5):
         raise ValueError(f"conv2d_kernel must be 1, 3, or 5, got {conv2d_kernel}")
-    num_heads = 2 if d_model == 32 else 4
+    num_heads = {16: 1, 32: 2, 64: 4}[d_model]
     base = PerPhonemeConfig()
     return replace(
         base,

@@ -333,3 +333,4 @@ Full experiment history in `docs/archive/experiment_log.md`.
 - **Write simply.** Ordinary words. Short sentences. No throat-clearing, no redundant qualifiers, no ceremonial preambles. Cut is the main edit. Applies to all docs, commit messages, PR descriptions, memory files, and chat responses. Paul Graham's "Write Simply" is the reference. Code comments stay minimal (default: none).
 - **Discuss logic before writing code.** See Working Principle above.
 - **All training on DCC, never local.**
+- **Every architectural change reports both pooled joint AND LOPO warm-start** (see "Canonical experimental protocol" in `docs/current_direction.md`). LOPO warm-start is the foundation-model test — load-bearing for Phase 1.5 SSL, Phase 2+ cross-sensor transfer, and external-corpus transfer. Single-protocol evidence does not justify defaulting an arch change.

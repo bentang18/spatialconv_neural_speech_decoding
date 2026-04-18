@@ -132,9 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         "--d-model",
         type=int,
         default=32,
-        choices=(32, 64),
-        help="Per-phoneme mode: backbone width. Default 32 (plan); 64 is the "
-        "width ablation. Cascades to per-cell Conv1d + decoder.",
+        choices=(16, 32, 64),
+        help="Per-phoneme mode: backbone width. Default 32 (plan); 16/64 are "
+        "capacity ablations. At d=16, single head; d=32, 2 heads; d=64, 4 heads.",
     )
     parser.add_argument(
         "--conv2d-kernel",
