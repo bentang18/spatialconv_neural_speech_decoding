@@ -1,6 +1,6 @@
 # v14-core baseline-aligned rework
 
-**Plan written:** 2026-04-17. **Status:** DRAFT — awaiting sign-off. **Scope:** full Phase-1 v14-core rewrite that re-aligns the spatial/temporal stack with Ben's 0.734 baseline architecture, adds the Brainnetome parcel embedding as the cross-patient hook, and switches to per-phoneme labeling + minimal AR teacher-forcing. Supersedes `docs/plans/v14-core-per-phoneme.md` (which captured only the decoder/labeling change).
+**Plan written:** 2026-04-17. **Status:** IMPLEMENTED. P1–P6 committed (`875ccb8`), 269 v14 tests green. P7 smoke passed; P8 S14 run hit 0.783 mean PER at `d=32 depth=3` (target 0.78). Capacity + spatial ablations running; P9 cohort extension pending. **Scope:** full Phase-1 v14-core rewrite that re-aligns the spatial/temporal stack with Ben's 0.734 baseline architecture, adds the Brainnetome parcel embedding as the cross-patient hook, and switches to per-phoneme labeling + minimal AR teacher-forcing.
 
 ## Motivation
 
@@ -327,7 +327,7 @@ Ordered cheapest → most-capacity:
 
 ## Related docs
 
-- `docs/v14_core_contract_amendment_2026-04-16.md` — B-1 amendment this plan further amends (#2, #6, #15, #27, #28, #29).
-- `docs/plans/v14-core.md` — original v14-core plan (now superseded for the spatial/temporal stack; the Phase A atlas pre-flight and CV splitter are still load-bearing).
-- `docs/plans/v14-core-per-phoneme.md` — earlier plan this one supersedes; captures only the decoder/labeling change.
-- `docs/implementation_tasks.md` — blocker list; record the six amendments from the table above.
+- `docs/archive/sessions/v14_core_contract_amendment_2026-04-16.md` — B-1 amendment this plan further amends (#2, #6, #15, #27, #28, #29).
+- `docs/archive/plans/v14-core.md` — original v14-core plan (superseded; Phase A atlas pre-flight and CV splitter are still load-bearing).
+- `docs/archive/plans/v14-core-per-phoneme.md` — earlier per-phoneme plan superseded by this one.
+- `docs/implementation_tasks.md` — live status + open work.

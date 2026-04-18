@@ -11,39 +11,41 @@ Extending Spalding 2025 (PCA+CCA, SVM/Seq2Seq, 8 patients, 9 phonemes, 0.31 bal.
 
 ## Current Direction: Neural Field Perceiver (v14) — Intracranial Foundation Model
 
-**Design doc**: `docs/neural_field_perceiver_v14.tex`. **Per-patient tables and data reference**: `docs/data_reference.md`.
+**Design doc**: `docs/neural_field_perceiver_v14.tex`. **Per-patient tables and data reference**: `docs/data_reference.md`. **Live status**: `docs/current_direction.md`. **Open work**: `docs/implementation_tasks.md`. **Results log**: `docs/experiments/v14_ablation_log.csv`.
 
 **Two-problem decomposition** (atlas calibration + shared dynamics):
-- **Problem 1 — Calibration** (per-patient, physics-constrained): raw electrodes → atlas-grounded regional tokens via Brainnetome volumetric parcellation. Atlas does ~90% of calibration; supervised gradient refines ~10%.
+- **Problem 1 — Calibration** (per-patient, physics-constrained): raw electrodes → atlas-grounded regional tokens via Brainnetome surface parcellation on fsaverage (`#36`). Atlas does ~90% of calibration; supervised gradient refines ~10% (Phase 2+).
 - **Problem 2 — Dynamics** (shared, unconstrained ML): regional tokens → phoneme sequence via a small relational-temporal transformer + AR decoder. Same representation for every patient.
 
-**Target architecture**:
+**Phase 1 architecture as implemented** (per-phoneme path, plan `docs/plans/v14-core-current.md`):
 ```
-── Phase 2+ / Full v14 target ──
-Calibration: corrected electrode coordinates -> Brainnetome PM membership
-             optional learned per-patient calibration only after Phase 1
-
-── Shared Processing ──
-(1) Shared temporal tokenizer                              -> (N_i × d × T)
-(2) Canonical parcel-frame local point encoding
-    + within-parcel Perceiver summarizer                   -> (N_tok × d × T)
-(3) [Inter-region graph attention
-     -> Temporal self-attn] × B                            -> (N_tok × d × T)
-(4) 3 AR-conditioned decode queries attend over N_tok·T    -> phoneme sequence
+signal (B, N_e, 130) at 200 Hz, phoneme-centered window [-0.15, 0.5)s
+→ grid-scatter (B, 1, H_p, W_p, 130)
+→ Conv2d(1→8, k=3, pad=1) per time-step + GELU
+→ masked-mean pool to (4, 8) = 32 cells        ← grid-level spatial compression
+→ per-cell Conv1d(8→32, k=30, stride=10)       ← shared temporal front-end (baseline-exact)
+→ + pooled_support @ P_emb[15, d=32]           ← cross-patient atlas anchor
+→ flatten to (B, 352 tokens, d=32)
+→ Backbone: 3 × [combined attention + FFN], 2 heads × 16, FFN 128, RoPE on temporal axis only, dropout 0.1
+→ D1 decoder: mean-pool memory + prev_phoneme embedding + Linear(d, 9)
+→ per-phoneme logits; train with flat CE + teacher forcing; eval exhaustive 9^3 AR per `#9`
 ```
-Shared interface: `(N_tok × d × T)` atlas/subparcel token tensor. `N_tok = 15` LH Brainnetome parcels, frozen 2026-04-14 under the argmax-centric rule `argmax_wins >= 10` on the frozen spatial pipeline (raw MNI + 8 mm PM dilation + σ=1.5 mm Gaussian). Uniform `k_parcel = 1`. Canonical list in `src/speech_decoding/v14/token_spec.py`; rationale in `docs/implementation_tasks.md` #4. Mean+gradient pooling is the main linear ablation. No Fourier PE. No global electrode->region cross-attention.
+47k parameters at the baseline. Samples are **phoneme-level** from `epoch(phonemeLevel)(CAR)`; 3 phonemes/trial, grouped-by-token CV.
 
-**Current Phase-1 implementation contract** (2026-04-13):
-- **Real Brainnetome PM volume only.** Source: `data/atlas/BNA_PM_4D.nii.gz`. `~/nilearn_data/bnatlas.nii.gz` is for ROI indexing and sanity checks only. No fallback to the old smoothed-MPM proxy.
-- **Fixed-atlas `v14-core`, no learned calibration yet.** Phase 1 freezes the spatial interface to the verified ACPC→MNI path. No learned `Δ/ω`, `δ_l`, or `τ_l`. The coordinate pipeline is still a blocker — re-verify with Zac before coding.
-- **No extra gain / impedance correction.** Inputs come from existing `productionZscore_highgamma` features. Don't add another gain/offset layer or channel-stat normalization.
-- **Within-parcel Perceiver summarizer is the default.** Canonical parcel-frame coordinates + shared point encoder + fixed latent queries summarize each parcel into 1–2 tokens. Mean+gradient pooling is the main linear ablation.
-- **Shared temporal front-end is still a blocker.** The next architectural decision is the exact temporal layer and its output contract into the parcel summarizer. Don't harden downstream code until that is frozen.
-- **Unsupported parcels are masked, not hallucinated.** Fixed `N_tok` layout with `token_mask` and `token_support`. Zero-filled inactive slots are a storage convenience only. Support statistic is DECIDED (`implementation_tasks.md` #5, PM-weighted sum). Exact unsupported-vs-weak threshold (#3) is still a blocker.
-- **Inter-region attention is token-space, not sensor-space.** The backbone operates over atlas/subparcel tokens. SC/FC bias initialization is intended; the exact token-level expansion rule is still a blocker.
-- **Phase 1 is supervised-only on `uECoG`.** First milestone: supervised `v14-core` on the existing intra-op `uECoG` data. Verify token construction, masking, and end-to-end correctness before SSL, `sEEG`, or external datasets.
-- **Next step after `v14-core` is full-corpus `uECoG` SSL** — not response-locked-only SSL.
-- **No implementation before blocker review.** The list in `docs/implementation_tasks.md` must be discussed and frozen first.
+The Phase-2+ target is the `B-1` per-electrode-token path without the `(4, 8)` pool — `signal (B, N_e, d, T)` flowing into the combined attention backbone unchanged. Shared interface: per-electrode tokens. Cross-patient sharing via the soft parcel embedding, not per-parcel pooling. `N_tok = 15` LH Brainnetome parcels (rule `argmax_wins ≥ 10`) is the **embedding-lookup table size**, not a token count; canonical list in `src/speech_decoding/v14/token_spec.py`. No within-parcel Perceiver summarizer, no `parcel_frames.npz`, no intra-parcel positional encoding (registration noise dominates anatomical variability — sub-parcel cross-patient alignment is below the SNR floor). No Fourier PE. No global electrode-to-region cross-attention. SC/FC additive logit bias deferred to Phase F ablation A4.
+
+**Current Phase-1 contract** (all 36 blockers closed 2026-04-16 late; per-phoneme path implemented + shipped on DCC):
+- **Spatial base is fsaverage (`#36` closed).** Patient side is `src/speech_decoding/v14/fsaverage_projection.py` — strict snap-to-pial via stock `sphere.reg`, one vertex per electrode, caches at `data/fsaverage_coords/<pt>_fsaverage_pial.csv`. Atlas side is `data/atlas/fsaverage_bake_v2c/` — `mri_vol2surf --projfrac-avg 0 1 0.1` from `ICBM152_fs` then `mri_surf2surf` to fsaverage, no smoothing. Physical PSF is baked into the atlas; no query-time Gaussian. The cvs_avg35 / `BNA_PM_dilated_8mm` path is a parity oracle only; not Phase-1 active.
+- **Atlas source.** Ground truth for the atlas-side bake is `data/atlas/BNA_PM_4D.nii.gz`. `~/nilearn_data/bnatlas.nii.gz` is for ROI indexing and sanity checks only.
+- **Fixed-atlas, no learned calibration.** No learned `Δ/ω`, `δ_l`, or `τ_l`.
+- **No extra gain / impedance correction.** Inputs come from existing `productionZscore_highgamma` features. No additional normalization.
+- **Soft parcel embedding (`#26` deprecated, `#3` relaxed).** Stage 5 is `pooled_support @ P_emb` with `P_emb: (15, d)` Xavier-init learnable lookup; raw support (not normalized). No within-parcel Perceiver summarizer. Electrodes with `max over Tier-1 == 0` are still emitted; their embedding contribution is zero. Only hard exclusion is `#11` (artifact channels).
+- **Temporal front-end.** Per-cell `Conv1d(8→32, k=30, stride=10)` matches Ben's 0.734 baseline (150 ms kernel, 50 ms hop, 200 Hz → 20 Hz token rate). The original `#2`/`#6` per-electrode Conv1d at `kernel=28` is the Phase-2+ target for the full per-electrode-token path.
+- **No per-parcel tokens, no token_mask, no token_support in the loader.** Per-electrode `electrode_active_mask[N_e]` and `support[N_e, 15]` replace them.
+- **Backbone is combined spatiotemporal attention (`#27` revised).** `B = 3` blocks, combined attention over `(cell × time)` tokens, FFN, pre-norm, residual, dropout 0.1. `num_heads = 2`, `head_dim = 16` at `d=32`. FFN width `4d = 128`. RoPE on temporal axis only. `token_active_mask` from the pool-cell active mask broadcast across T; applied on both key and query axes. **No SC/FC bias in baseline** (deferred to Phase F ablation A4 per `#8`).
+- **Width budget.** Current baseline `d_model = 32` (chosen for the 47k parameter target matching Ben's baseline). First width ablation `d_model = 64`; running now.
+- **Phase 1 is supervised-only on `uECoG`.** Flat per-phoneme CE; teacher forcing in train; exhaustive `9^3 = 729` decode at eval per `#9`.
+- **Next step after Phase 1** is full-corpus `uECoG` SSL (Phase 1.5) — not response-locked-only SSL.
 
 **Paper direction**: Atlas-grounded common-space decoding for intracranial field potentials. The bet: electrodes are patient-specific observations; parcel/subparcel tokens are the shared representation. Phase 1 is the fixed-atlas supervised correctness pass only — broader calibration claims come later.
 
@@ -70,7 +72,7 @@ Every piece of the pipeline — raw voltages through phoneme decode — follows 
 7. **Freeze blockers before coding.** See `docs/implementation_tasks.md`. Do not implement a component while its blockers are open.
 8. **Prefer standard, scalable contracts when they do not compromise Phase 1 correctness.** If two choices are equally valid for Phase 1, choose the one that keeps a cleaner path to cross-task use, external datasets, and broader scaling. Do not add speculative infrastructure early, but do avoid Phase-1-only conventions when a standard reusable contract works just as well.
 
-This applies to every logic step: channel indices, channel-to-electrode bookkeeping, coordinate-frame verification, Brainnetome PM lookup, parcel support, parcel-frame construction, temporal front-end, local summarizer, inter-region attention, AR decoder, loss, eval split, metrics. No step is too obvious to skip.
+This applies to every logic step: channel indices, channel-to-electrode bookkeeping, coordinate-frame verification, Brainnetome PM lookup, per-electrode support, grid scatter, soft parcel embedding, temporal front-end, combined attention backbone, AR decoder, loss, eval split, metrics. No step is too obvious to skip.
 
 ## Engineering Discipline
 
@@ -110,6 +112,15 @@ Define success criteria. Loop until verified.
 - "Refactor X" → "ensure tests pass before and after"
 
 For multi-step tasks, state a brief plan with a verification check per step. Strong success criteria let you loop independently; weak ones ("make it work") require constant clarification.
+
+### 5. Verify before claiming done
+Never claim tests pass, code works, or a bug is fixed without running the verification command in the current turn. "Should work," "probably fixed," "seems to pass" are lies, not confidence. If you haven't seen the exit code / test output / UI since your last change, run it before reporting. No "Great!" / "Perfect!" / "Done!" before evidence.
+
+### 6. Debug root cause, not symptoms
+On any bug or test failure: read the full error, reproduce it, check recent changes, and for multi-component systems log data at every boundary before proposing any fix. "Just one quick fix" masks the real issue and multiplies bugs.
+
+### 7. No performative agreement on pushback
+When the user questions a design or pushes back, do not capitulate with "You're absolutely right!" and start rewriting. Restate the technical point in your own words, verify against the codebase, and push back with reasoning if the feedback is wrong for this context. Technical correctness over social comfort.
 
 ## Environment
 
@@ -158,68 +169,123 @@ Previous baselines: LOPO best 0.750, per-patient full-trial 0.737, LOPO pilot 0.
 ### Box mount (macOS, personal laptop)
 - Mount root: `/Users/bentang/Library/CloudStorage/Box-Box/`
 - FreeSurfer reconstructions: `/Users/bentang/Library/CloudStorage/Box-Box/ECoG_Recon/<pt>/` with subfolders `surf/`, `elec_recon/`, `mri/`, `label/`.
-- Average subject for MNI152 projection: `.../ECoG_Recon/cvs_avg35_inMNI152/`.
+- Target template for Phase 1 (per `#36`): FreeSurfer `fsaverage` under the local FreeSurfer `SUBJECTS_DIR` (typically `/Applications/freesurfer/<version>/subjects/fsaverage/`). Patient projection uses stock `lh.sphere.reg`.
+- Migration-oracle average subject: `.../ECoG_Recon/cvs_avg35_inMNI152/`. Used for the cvs_avg35 path in `src/speech_decoding/v14/coordinates.py` as the parity oracle; not the Phase-1 active representation.
 - **Patient folders are `S<num>`**, matching the internal patient IDs: `S14, S16, S22, S23, S26, S32, S33, S39, S57, S58, S62`. All 11 PS patients are present. Each has `surf/{lh,rh}.{pial,pial-outer-smoothed,sphere.reg,sphere-outer.reg,sphere-outer-mni.reg}` and `elec_recon/<pt>.{LEPTO,LEPTOVOX,POSTIMPLANT,electrodeNames}` plus `<pt>_elec_locations_RAS{,_brainshifted}.txt`.
 - **Do not confuse `S<num>` with `D<num>`**: `ECoG_Recon/` also contains unrelated `D<num>` folders from a different Duke cohort (`D14` is 120 electrodes, not the same person as `S14`). Always use `S<num>`.
 - **Avoid the `_old`, `_no_tkr`, `_kumar`, `_diag`, `_med` sibling folders** (e.g. `S14_old`, `S14_no_tkr`). These are alternative reconstructions kept for history and are not the current trusted version. Read from the plain `S<num>/` folder.
 
 ### Active docs
-- `docs/neural_field_perceiver_v14.tex` — v14 design document
-- `docs/current_direction.md` — current priorities and what's archived
+- `docs/current_direction.md` — where we are now (post-P8, ablations underway, P9 pending)
+- `docs/implementation_tasks.md` — live status summary + active work items
+- `docs/plans/v14-core-current.md` — implementation plan with verification checks (P1–P9)
 - `docs/data_reference.md` — per-patient tables: array layouts, sig/artifact channel counts, Brainnetome parcel list, raw-corpus sizes
-- `docs/implementation_tasks.md` — active blockers and decisions (single source of truth for Phase 1 gating)
+- `docs/experiments/v14_ablation_log.csv` — live experiment results log (updated by `scripts/v14_core/update_ablation_log.py`)
 - `docs/dcc_setup.md` — DCC cluster setup
+- `docs/neural_field_perceiver_v14.tex` — v14 design document (historical, pre-B-1-amendment; being rewritten)
+- `docs/questions.md` — unresolved architectural questions (thinking doc)
+- `docs/qc/phoneme_level_fif_audit_cohort.md` — #34 cohort audit results
+- `docs/qc/coord_bridge_verification.md` — #12 bridge verification
+- `docs/qc/support_cache_v2c_snap_qc_report.md` — current support-cache QC
 
 ### Archived but useful
+- `docs/archive/sessions/` — 2026-04-16/17 session logs (cras fix, kernel ablation, #36 handoff, B-1 amendment, slack draft)
+- `docs/archive/plans/` — superseded plan drafts (`v14-core.md`, per-phoneme draft, open-notes)
+- `docs/archive/qc_old_caches/` — pre-v2c support-cache QC reports
+- `docs/archive/implementation_tasks_archived.md` — pre-closure blocker log (Apr 14)
+- `docs/archive/implementation_tasks_2026-04-16_post-closure.md` — all-closed blocker log (2026-04-16 late)
 - `docs/archive/experiment_log.md` — 101-finding experiment history
 - `docs/archive/research_synthesis.md` — 19-paper literature synthesis
 - `docs/archive/reading_list.md`, `docs/archive/literature_findings.md` — historical literature and data-scaling context
 
 ### Configs & scripts
-- `configs/paths.yaml` — machine-specific BIDS paths (gitignored).
-- No v14 training config and no v14 training/sweep scripts exist yet. They will be written fresh once the training loop contract is agreed. Pre-v14 YAMLs live in `configs/archive/`; pre-v14 CLIs live in `scripts/archive/legacy/`.
+- `configs/paths.yaml` — machine-specific BIDS paths (gitignored). On DCC: `ps_bids_root=/work/ht203/data/BIDS`, `support_cache_dir=/work/ht203/data/atlas/support_cache_v2c_snap`, `channel_maps_dir=/work/ht203/data/channel_maps`.
+- `scripts/v14_core/` — active v14 CLI + sbatch wrappers (see Code Structure above).
+- Pre-v14 YAMLs live in `configs/archive/`; pre-v14 CLIs live in `scripts/archive/legacy/`.
 
-## Code Structure (post-quarantine, 2026-04-13)
+## Code Structure (Phase 1 implementation live, 2026-04-17)
 
 ```
 src/speech_decoding/
-├── v14/                    # Phase-1 implementation home (WIP, discussion-first)
-│   ├── __init__.py         # re-exports config dataclasses + default_token_count
-│   ├── config.py           # AtlasConfig / PatientCalibrationConfig / TemporalTokenizerConfig / LocalSummarizerConfig / BackboneConfig / DecoderConfig / V14Config
-│   ├── token_spec.py       # DEFAULT_BASE_PARCELS (16) + DEFAULT_SPLIT_COUNTS (→21 tokens) — PROVISIONAL, still a blocker
-│   ├── calibration.py      # atlas-resource path helpers (stub; no logic yet)
-│   ├── tokenizer.py        # (stub) shared temporal front-end
-│   ├── local_summarizer.py # (stub) within-parcel Perceiver summarizer
-│   ├── backbone.py         # (stub) inter-region + temporal attention
-│   ├── decoder.py          # (stub) 3-query AR decoder
-│   └── model.py            # (stub) top-level assembly
-├── data/phoneme_map.py     # 9 PS phonemes, PS→ARPA, normalize_label. CTC/articulatory helpers are pre-v14 contract — discuss before reuse.
+├── v14/                    # Phase-1 implementation home
+│   ├── __init__.py         # re-exports config dataclasses
+│   ├── config.py           # V14Config + per-phoneme configs (PoolConfig, PerCellTemporalConfig, D1DecoderConfig, PerPhonemeConfig). Also holds the B-1 target configs (GridMixerConfig, SoftParcelEmbeddingConfig, BackboneConfig) — frozen per #15 + B-1 amendment.
+│   ├── token_spec.py       # DEFAULT_BASE_PARCELS (15) — embedding-lookup keys for soft parcel embedding — frozen per #4
+│   ├── pool.py             # masked-mean pool primitive (grid → cells) with divisibility assertion
+│   ├── phoneme_dataset.py  # ACTIVE loader — V14PhonemeDataset (phoneme-level .fif, grouped-by-token CV)
+│   ├── phoneme_model.py    # ACTIVE model — NeuralFieldPerceiverPerPhoneme
+│   ├── phoneme_decoder.py  # D1 minimum AR decoder (mean-pool + prev_emb + Linear)
+│   ├── phoneme_run_fold.py # per-phoneme fold runner (P1–P6)
+│   ├── backbone.py         # combined spatiotemporal attention (revised #27)
+│   ├── train.py            # train_one_fold + per-phoneme loss wrapper (tail-flush grad-accum fix)
+│   ├── eval.py             # evaluate_per_phoneme + exhaustive 9³ AR decode
+│   ├── cv.py               # make_outer_folds + make_val_split
+│   ├── dataset.py          # (kept) V14TrialDataset — trial-level slot-CE path (deprecated B-1 B-1-full)
+│   ├── run_fold.py         # (kept) slot-CE fold runner — deprecated B-1-full path
+│   ├── fsaverage_projection.py # strict fsaverage snap-to-pial — ACTIVE (#36)
+│   ├── fsaverage_atlas.py  # baked fsaverage atlas loader, support/argmax/argmax_wins helpers
+│   ├── support_cache.py    # per-electrode Tier-1 cache I/O
+│   ├── channel_map.py      # #12 amp-to-physical bridge per patient
+│   ├── coordinates.py      # cvs_avg35 projection — PARITY ORACLE only
+│   ├── cvsavg_projection.py # outer-envelope → cvs_avg35 pial snap — parity oracle alternative
+│   ├── electrode_pool.py   # exploration tooling (kernel-ablation, not on canonical path)
+│   ├── parcel_frames.py    # archived per B-1 amendment (kept for parity reference)
+│   ├── local_summarizer.py # deprecated (was within-parcel Perceiver summarizer #26)
+│   ├── grid_mixer.py       # B-1 target Stage 2 (not on per-phoneme path)
+│   ├── parcel_embedding.py # B-1 target Stage 3 (not on per-phoneme path — emb lives in phoneme_model)
+│   ├── aggregate.py        # fold result aggregation helper
+│   ├── calibration.py      # atlas-resource path helpers (Phase 2+)
+│   ├── decoder.py          # (stub) 3-query AR decoder for B-1-full path — not on per-phoneme path
+│   ├── model.py            # (stub) B-1-full top-level assembly
+│   ├── tokenizer.py        # (stub) B-1-full per-electrode temporal Conv1d
+│   └── audit/              # #34 phoneme-loading audit (closed 2026-04-16)
+├── data/phoneme_map.py     # 9 PS phonemes, PS→ARPA (alphabetical), normalize_label
 ├── evaluation/grouped_cv.py # grouped-by-token CV splitter (kept, contract-neutral)
 └── archive/legacy/         # QUARANTINE — see Working Principle #6
+
+scripts/v14_core/
+├── train_v14_core.py                      # single-job CLI (--mode per-phoneme | slot)
+├── update_ablation_log.py                 # aggregate result JSONs into the experiment CSV
+├── v14_per_phoneme_smoke_dcc.sh           # P7 smoke (1 job)
+├── v14_per_phoneme_s14_dcc.sh             # P8 S14 full (30 jobs)
+├── v14_per_phoneme_s14_ablation_dcc.sh    # capacity ablation (45 jobs: d×depth)
+├── v14_per_phoneme_s14_spatial_ablation_dcc.sh # spatial ablation (60 jobs: k, pool)
+├── v14_per_phoneme_cohort_dcc.sh          # P9 cohort (180 jobs)
+└── v14_core_*.sh                          # deprecated B-1-full slot-CE sbatch wrappers
+
+docs/experiments/v14_ablation_log.csv       # per-cell aggregated results, updated by update_ablation_log.py
 ```
 
 ## Data
 
-### Loader contract (frozen per `#13`)
+### Loader contracts
 
-Baseline `v14-core` sample:
+**Active per-phoneme loader** (`src/speech_decoding/v14/phoneme_dataset.py`) — reads phoneme-level `.fif` from `derivatives/epoch(phonemeLevel)(CAR)/...`, crops to `[-0.15, 0.5)` s (130 samples at 200 Hz), emits one sample per phoneme (3 per trial):
 
 ```
-signal[N_ch, T]         # float32, z-scored HGA on non-artifact channels; T from #29 trial window
-coords[N_ch, 3]         # MNI electrode coordinates (#1, migrating to fsaverage per #36)
-token_mask[N_tok]       # Tier-1 parcel support mask per #3 (N_tok = 15, #4)
-token_support[N_tok]    # PM-weighted support statistic per #5
-label                   # 3-slot phoneme sequence, alphabetical ARPABET indices per #16
-patient_id              # str
+signal[N_e, 130]                   # float32, z-scored HGA, 200 Hz, 0.65 s (phoneme-centered)
+patient_id                         # str
+label                              # long — alphabetical ARPABET index (#16)
+prev_phoneme                       # long — previous phoneme index in trial; -1 for slot 0 (BOS)
+trial_id                           # long — to group-back phonemes into trials for exhaustive 9^3 AR
+phoneme_pos                        # long ∈ {0, 1, 2}
+electrode_grid_layout[N_e, 2]      # int (row, col) on patient device grid
+electrode_grid_shape               # tuple (H_p, W_p) per-patient bounding rect
+electrode_active_mask[N_e]         # bool: non-artifact AND not pad
+support[N_e, 15]                   # float32, raw BNA probability over Tier-1 (#5)
 ```
 
-Channel inclusion is all non-artifact channels (`#11`); sig-channel masks are ablation-only. Trial epoching follows `#29` (one epoch per trial, `tmin=-0.5s`, `tmax=1.0s`). Per-patient sig-channel counts, artifact-channel counts, and array layouts live in `docs/data_reference.md`. `#34` (phoneme-loading audit) is the one remaining gate before the loader is written.
+**B-1-full trial-level loader** (`dataset.py`) — trial-level `.fif` from `derivatives/epoch(CAR)/...`, `[-0.5, 1.0)` s, 300 samples, slot-CE over 3 phoneme positions. Kept but deprecated for the per-phoneme path; will be revisited for Phase-2+ per-electrode-token experiments.
+
+Channel inclusion is all non-artifact channels (`#11`); sig-channel masks are ablation-only. `#34` closed 2026-04-16. `support` comes from the per-electrode Tier-1 cache `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv` (built once per patient; see `docs/plans/v14-core-current.md`). Per-patient sig/artifact channel counts and array layouts live in `docs/data_reference.md`.
 
 ### Electrode coordinates
 
 ACPC source: `Box/ECoG_Recon/<subj>/elec_recon/<subj>_elec_locations_RAS_brainshifted.txt`. Format: `prefix electrode_num x y z hemisphere type`.
 
-**ACPC → MNI pipeline (`#1`):** Python port of Zac's `sub2AvgBrainClinical.m` in `src/speech_decoding/v14/coordinates.py`, projecting patient `pial-outer-smoothed` → patient `sphere-outer-mni.reg` → `cvs_avg35` `sphere-outer.reg` → `cvs_avg35` `pial-outer-smoothed`. Output cached at `data/mni_coords/<pt>_MNI152.csv`, keyed by physical electrode name. Verified against the S14 oracle (max 1.39 mm, median 0.68 mm). **Migrating to fsaverage under `#36` (decided, executing);** the cvs_avg35 cache is the reference / migration oracle.
+**Active spatial pipeline (`#36`, closed 2026-04-16 late):** Patient side is `src/speech_decoding/v14/fsaverage_projection.py` — strict snap-to-pial: patient `lh.pial` → patient `lh.sphere.reg` → fsaverage `lh.sphere.reg` → fsaverage `lh.pial`, one vertex per electrode. Output caches at `data/fsaverage_coords/<pt>_fsaverage_pial.csv`. Atlas side is `data/atlas/fsaverage_bake_v2c/` — full 246-frame bake via `mri_vol2surf --projfrac-avg 0 1 0.1` from `ICBM152_fs`, then `mri_surf2surf` to fsaverage, no additional smoothing.
+
+**Parity oracle (`#1`):** Python port of Zac's `sub2AvgBrainClinical.m` in `src/speech_decoding/v14/coordinates.py` v2 (cras-corrected 2026-04-16), projecting patient `pial-outer-smoothed` → patient `sphere-outer-mni.reg` → `cvs_avg35` `sphere-outer.reg` → `cvs_avg35` `pial-outer-smoothed`, then adding avg cras to reach true MNI. Output cached at `data/mni_coords/<pt>_MNI152.csv`. Retained as parity oracle only via `scripts/compare_fsaverage_spatial_parity.py`; not the Phase-1 active representation. Pre-cras-fix caches are archived at `data/mni_coords/archive_pre_cras_fix/`.
 
 **Amp → physical → coordinate bridge (`#12`):** 128-strip patients (`S14 S16 S22 S23 S26`) use Map 4 from local `*_channelMap.mat` with `phys_idx = r*16 + c + 1`. 256-grid patients (`S33 S39 S62`) use Map 3 from `*_channelMapAll.mat`. `S58` resolves its 12×24 zero-indexed crop onto full Map 3. The lookup key at the coordinate cache is the concatenated electrode name from `<pt>.electrodeNames`, not a row index. `S39_channelMap.mat` is non-authoritative; never load it.
 
@@ -227,17 +293,15 @@ ACPC source: `Box/ECoG_Recon/<subj>/elec_recon/<subj>_elec_locations_RAS_brainsh
 
 **DCC TSV vs RAS**: DCC electrode TSVs have normalized 0–1 grid coordinates (synthetic, for older Conv2d baselines). RAS files are the relevant source for v14.
 
-### .fif path and labels
+### .fif paths and labels
 
-Phase 1 input (per `#29`, one epoch per trial, `tmin=-0.5s`, `tmax=1.0s`):
+**Active per-phoneme path**: `{bids_root}/derivatives/epoch(phonemeLevel)(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
 
-`{bids_root}/derivatives/epoch(CAR)/sub-{id}/epoch(band)(power)/sub-{id}_task-PhonemeSequence_desc-productionZscore_highgamma.fif`
+Event-id mapping asserted under `#18`: `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k':6, 'p':7, 'u':8, 'v':9}`. Labels derived directly from event codes; alphabetical ARPA index per `#16` (`AA AE B G IY K P UW V` → `0..8`). `.fif` is authoritative per `#34` closure (events TSV is a soft cross-check only).
 
-Per-trial token (e.g. `bak`, `ugae`) comes from the `value` column of `events.tsv`; the canonical 52-token inventory is `data/ps_tokens.csv`. Per-phoneme targets are derived by decomposing each trial's token into its 3-phoneme ARPABET sequence via `phoneme_map.normalize_label()` (PS → ARPABET per `#17`, alphabetical index per `#16`).
+**Trial-level path** (B-1-full, deprecated for per-phoneme): `{bids_root}/derivatives/epoch(CAR)/...`; token from the `value` column of `events.tsv`; canonical 52-token inventory at `data/ps_tokens.csv`.
 
-The sister phoneme-level `.fif` at `epoch(phonemeLevel)(CAR)/...` is not loaded for training. It exists as an audit-only cross-check under `#34`; its event_id mapping `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k':6, 'p':7, 'u':8, 'v':9}` is asserted under `#18`.
-
-> **Phoneme / label-space rigor audit.** The first-pass audit surfaced blockers `#17–#25` plus the operational audit `#34`. `#17–#25` are now closed in `docs/implementation_tasks.md`; `#34` is the one remaining open blocker and gates the v14 loader. Do not write the v14 loader until `#34` closes.
+> **Phoneme / label-space rigor audit.** The first-pass audit surfaced blockers `#17–#25` plus the operational audit `#34`. All closed.
 
 ## Compute: Duke DCC cluster
 
