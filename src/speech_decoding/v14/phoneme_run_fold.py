@@ -55,6 +55,8 @@ def _build_config(
     d_model: int = 32,
     conv2d_kernel: int = 3,
     pool_shape: tuple[int, int] = (4, 8),
+    temporal_frontend: str = "per_cell",
+    pool_method: str = "masked_mean",
 ) -> PerPhonemeConfig:
     """Build a consistent config at the given width, depth, conv2d, and pool.
 
@@ -81,6 +83,8 @@ def _build_config(
         conv2d_padding=conv2d_kernel // 2,
         pool=PoolConfig(pool_shape=pool_shape),
         per_cell_temporal=replace(base.per_cell_temporal, out_channels=d_model),
+        temporal_frontend=temporal_frontend,
+        pool_method=pool_method,
         backbone=BackboneConfig(
             d_model=d_model, num_heads=num_heads, head_dim=16,
             ffn_hidden=4 * d_model, num_blocks=backbone_depth, dropout=0.1,
@@ -113,6 +117,10 @@ def run_one_fold(
     d_model: int = 32,
     conv2d_kernel: int = 3,
     pool_shape: tuple[int, int] = (4, 8),
+    temporal_frontend: str = "per_cell",
+    pool_method: str = "masked_mean",
+    label_smoothing: float = 0.0,
+    mixup_alpha: float = 0.0,
     max_epochs: int | None = None,
     val_every: int | None = None,
     patience: int | None = None,
@@ -147,6 +155,8 @@ def run_one_fold(
         d_model=d_model,
         conv2d_kernel=conv2d_kernel,
         pool_shape=pool_shape,
+        temporal_frontend=temporal_frontend,
+        pool_method=pool_method,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
 
@@ -172,8 +182,15 @@ def run_one_fold(
         collate_fn=collate_v14_phoneme_batch,
     )
 
+    if label_smoothing > 0.0 or mixup_alpha > 0.0:
+        from speech_decoding.v14.train import make_per_phoneme_ce_loss
+        loss_fn = make_per_phoneme_ce_loss(
+            label_smoothing=label_smoothing, mixup_alpha=mixup_alpha
+        )
+    else:
+        loss_fn = per_phoneme_ce_loss
     kw: dict = {
-        "loss_fn": per_phoneme_ce_loss,
+        "loss_fn": loss_fn,
         "evaluate_fn": evaluate_per_phoneme,
     }
     if max_epochs is not None:
@@ -205,6 +222,10 @@ def run_one_fold(
         "d_model": d_model,
         "conv2d_kernel": conv2d_kernel,
         "pool_shape": list(pool_shape),
+        "temporal_frontend": temporal_frontend,
+        "pool_method": pool_method,
+        "label_smoothing": label_smoothing,
+        "mixup_alpha": mixup_alpha,
         "best_val_per_phoneme": fold_result.best_val_per,
         "test_per_phoneme": test_per_phoneme,
         "test_slot_averaged_per": test_slot_per,

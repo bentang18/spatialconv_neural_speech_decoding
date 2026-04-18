@@ -233,6 +233,23 @@ class PerPhonemeConfig:
     pool: PoolConfig = field(default_factory=PoolConfig)
     per_cell_temporal: PerCellTemporalConfig = field(default_factory=PerCellTemporalConfig)
     parcel_embedding_n_parcels: int = 15
+    use_parcel_embedding: bool = True
+    # "flat": Conv1d(8·n_cells → d, k, s) on flattened (B, C·n_cells, T) — baseline
+    # 2026-04-04 front-end that bakes full spatial mixing into the temporal conv
+    # (~245k temporal params). Post-conv sequence is temporal-only (T_tokens) and
+    # the parcel embedding is skipped (no cell axis). Promoted to default
+    # 2026-04-18: halved pop-PER variance vs per_cell (0.034 vs 0.059) on Q1a
+    # with matched mean, and best-per-patient on S14/S26/S33.
+    # "per_cell": shared Conv1d(8→d, k, s) applied to each cell independently
+    # (~7.7k temporal params). Retained for ablation.
+    temporal_frontend: str = "flat"
+    # "masked_mean": our Stage-3 pool — start-index-only non-overlapping bins,
+    # divisor = #active electrodes per cell. Inactives drop out of both ends.
+    # "adaptive_avg": torch.nn.functional.adaptive_avg_pool2d over the scattered
+    # grid — overlapping bins on non-divisible W, divisor = fixed bin size.
+    # Matches the 2026-04-04 baseline pool. Only materially differs from
+    # masked_mean on non-divisible grids (12×22) or with inactive electrodes.
+    pool_method: str = "masked_mean"
     backbone: BackboneConfig = field(
         default_factory=lambda: BackboneConfig(
             d_model=32, num_heads=2, head_dim=16, ffn_hidden=128,

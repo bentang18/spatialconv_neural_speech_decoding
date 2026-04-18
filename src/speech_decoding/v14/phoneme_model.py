@@ -50,17 +50,38 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 f"per_cell_temporal.out_channels ({t_cfg.out_channels}) != "
                 f"d_model ({d})"
             )
-        self.conv1d = nn.Conv1d(
-            t_cfg.in_channels,
-            t_cfg.out_channels,
-            kernel_size=t_cfg.kernel_size,
-            stride=t_cfg.stride,
-        )
+        if self.cfg.temporal_frontend not in ("per_cell", "flat"):
+            raise ValueError(
+                f"temporal_frontend must be 'per_cell' or 'flat', "
+                f"got {self.cfg.temporal_frontend!r}"
+            )
+        if self.cfg.temporal_frontend == "per_cell":
+            self.conv1d = nn.Conv1d(
+                t_cfg.in_channels,
+                t_cfg.out_channels,
+                kernel_size=t_cfg.kernel_size,
+                stride=t_cfg.stride,
+            )
+        else:  # "flat" — baseline 256→32 front-end
+            n_cells = self.cfg.pool.pool_shape[0] * self.cfg.pool.pool_shape[1]
+            self.conv1d = nn.Conv1d(
+                t_cfg.in_channels * n_cells,
+                t_cfg.out_channels,
+                kernel_size=t_cfg.kernel_size,
+                stride=t_cfg.stride,
+            )
 
-        self.parcel_embedding = nn.Parameter(
-            torch.empty(self.cfg.parcel_embedding_n_parcels, d)
-        )
-        nn.init.xavier_uniform_(self.parcel_embedding)
+        if self.cfg.temporal_frontend == "flat":
+            # Flat front-end collapses the cell axis — parcel embedding is
+            # not applicable (no per-cell tokens). Skip even if the flag is on.
+            self.parcel_embedding = None
+        elif self.cfg.use_parcel_embedding:
+            self.parcel_embedding = nn.Parameter(
+                torch.empty(self.cfg.parcel_embedding_n_parcels, d)
+            )
+            nn.init.xavier_uniform_(self.parcel_embedding)
+        else:
+            self.parcel_embedding = None
 
         if self.cfg.backbone.d_model != d:
             raise ValueError(
@@ -134,47 +155,86 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
         x = x.view(B, T_raw, Cout, H_p, W_p).permute(0, 2, 3, 4, 1)
         # (B, 8, H_p, W_p, T_raw)
 
-        # -- Stage 3: masked-mean pool to (4, 8) cells --------------------------
-        x_flat = x.reshape(B, Cout, H_p * W_p, T_raw)
-        pooled = masked_mean_pool(
-            x_flat, cell_of_grid, grid_active, active_count,
-            dim=2, n_cells=n_cells,
-        )                                       # (B, 8, n_cells, T_raw)
+        # -- Stage 3: spatial pool to (out_H, out_W) cells ----------------------
+        out_H, out_W = self.cfg.pool.pool_shape
+        if self.cfg.pool_method == "masked_mean":
+            x_flat = x.reshape(B, Cout, H_p * W_p, T_raw)
+            pooled = masked_mean_pool(
+                x_flat, cell_of_grid, grid_active, active_count,
+                dim=2, n_cells=n_cells,
+            )                                   # (B, 8, n_cells, T_raw)
+        elif self.cfg.pool_method == "adaptive_avg":
+            # AdaptiveAvgPool2d over the scattered grid per time-step. Inactive
+            # positions are already zeroed at scatter time; divisor = fixed bin
+            # size (matches baseline).
+            x_bt = x.permute(0, 4, 1, 2, 3).reshape(B * T_raw, Cout, H_p, W_p)
+            pooled_bt = torch.nn.functional.adaptive_avg_pool2d(
+                x_bt, (out_H, out_W)
+            )                                   # (B·T_raw, Cout, out_H, out_W)
+            pooled = (
+                pooled_bt.view(B, T_raw, Cout, out_H * out_W)
+                .permute(0, 2, 3, 1)
+                .contiguous()
+            )                                   # (B, Cout, n_cells, T_raw)
+        else:
+            raise ValueError(
+                f"pool_method must be 'masked_mean' or 'adaptive_avg', "
+                f"got {self.cfg.pool_method!r}"
+            )
 
-        # -- Stage 4: per-cell Conv1d (8→32, k=30, s=10) ------------------------
-        # Treat each of the `n_cells` cells as an independent sequence; shared weights.
-        y = pooled.permute(0, 2, 1, 3).reshape(B * n_cells, Cout, T_raw)
-        y = self.conv1d(y)                      # (B·n_cells, d, T_tokens)
-        T_tokens = y.shape[-1]
-        y = y.view(B, n_cells, self.cfg.d_model, T_tokens)
+        if self.cfg.temporal_frontend == "per_cell":
+            # -- Stage 4 (per-cell): Conv1d(8→d, k, s) shared across cells -------
+            y = pooled.permute(0, 2, 1, 3).reshape(B * n_cells, Cout, T_raw)
+            y = self.conv1d(y)                      # (B·n_cells, d, T_tokens)
+            T_tokens = y.shape[-1]
+            y = y.view(B, n_cells, self.cfg.d_model, T_tokens)
 
-        # -- Stage 5: + parcel embedding at d -----------------------------------
-        # Same patient per batch (#31) → active[0] is the batch-invariant mask.
-        pooled_support = masked_mean_pool(
-            support, cell_of_electrode, active[0], active_count,
-            dim=1, n_cells=n_cells,
-        )                                       # (B, n_cells, 15)
-        cell_emb = pooled_support @ self.parcel_embedding  # (B, n_cells, d)
-        y = y + cell_emb.unsqueeze(-1)
+            # -- Stage 5: + parcel embedding at d ---------------------------------
+            if self.parcel_embedding is not None:
+                pooled_support = masked_mean_pool(
+                    support, cell_of_electrode, active[0], active_count,
+                    dim=1, n_cells=n_cells,
+                )                                       # (B, n_cells, 15)
+                cell_emb = pooled_support @ self.parcel_embedding  # (B, n_cells, d)
+                y = y + cell_emb.unsqueeze(-1)
 
-        # -- Stage 6: flatten + combined-attention backbone ---------------------
-        # Cell-major flatten: idx = cell * T_tokens + t.
-        # Active mask broadcasts cell_active_mask across T_tokens.
-        y_flat = y.permute(0, 1, 3, 2).reshape(B, n_cells * T_tokens, self.cfg.d_model)
-        active_flat = (
-            cell_active_mask.unsqueeze(-1)
-            .expand(n_cells, T_tokens)
-            .reshape(-1)
-            .unsqueeze(0)
-            .expand(B, -1)
-            .contiguous()
-        )
-        time_ids = (
-            torch.arange(T_tokens, device=y_flat.device)
-            .unsqueeze(0)
-            .expand(n_cells, -1)
-            .reshape(-1)
-        )
+            # -- Stage 6: flatten + combined-attention backbone -------------------
+            # Cell-major flatten: idx = cell * T_tokens + t.
+            y_flat = y.permute(0, 1, 3, 2).reshape(
+                B, n_cells * T_tokens, self.cfg.d_model
+            )
+            active_flat = (
+                cell_active_mask.unsqueeze(-1)
+                .expand(n_cells, T_tokens)
+                .reshape(-1)
+                .unsqueeze(0)
+                .expand(B, -1)
+                .contiguous()
+            )
+            time_ids = (
+                torch.arange(T_tokens, device=y_flat.device)
+                .unsqueeze(0)
+                .expand(n_cells, -1)
+                .reshape(-1)
+            )
+        else:  # temporal_frontend == "flat" — baseline 256→d front-end
+            # Flatten (C, n_cells) into the channel dim and run one Conv1d.
+            # Zero out inactive cells across all channels so they don't
+            # contribute to the supervised front-end.
+            mask_cell = cell_active_mask.to(pooled.dtype).view(1, 1, n_cells, 1)
+            pooled_masked = pooled * mask_cell
+            # (B, C, n_cells, T_raw) → (B, C·n_cells, T_raw), cell-major in ch dim.
+            flat_in = pooled_masked.permute(0, 2, 1, 3).reshape(
+                B, n_cells * Cout, T_raw
+            )
+            y = self.conv1d(flat_in)                # (B, d, T_tokens)
+            T_tokens = y.shape[-1]
+            y_flat = y.transpose(1, 2).contiguous()  # (B, T_tokens, d)
+            # No cell dim: every token is a time-token, always active.
+            active_flat = torch.ones(
+                B, T_tokens, dtype=torch.bool, device=y_flat.device
+            )
+            time_ids = torch.arange(T_tokens, device=y_flat.device)
 
         memory = self.backbone(y_flat, active_flat, time_ids)
         return memory

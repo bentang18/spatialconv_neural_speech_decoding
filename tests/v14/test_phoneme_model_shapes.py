@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
+from speech_decoding.v14.config import PerPhonemeConfig
 from speech_decoding.v14.phoneme_dataset import (
     BOS_TOKEN,
     N_TIER1_PARCELS,
@@ -59,19 +62,33 @@ class TestForwardShape:
         logits = model(batch)
         assert logits.shape == (2, 9)
 
-    def test_encode_memory_shape(self) -> None:
-        """Memory is (B, n_cells * T_tokens, d)."""
+    def test_encode_memory_shape_flat(self) -> None:
+        """Default (flat) memory is (B, T_tokens, d). Conv1d 130→11 tokens; d=32."""
         model = NeuralFieldPerceiverPerPhoneme()
         batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
         memory = model.encode_memory(batch)
-        # (4,8) pool = 32 cells; Conv1d 130→11 tokens; d=32.
+        assert memory.shape == (2, 11, 32)
+
+    def test_encode_memory_shape_per_cell(self) -> None:
+        """per_cell memory is (B, n_cells * T_tokens, d)."""
+        cfg = replace(PerPhonemeConfig(), temporal_frontend="per_cell")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        memory = model.encode_memory(batch)
         assert memory.shape == (2, 32 * 11, 32)
 
 
 class TestParamBudget:
-    def test_total_params_near_plan_target(self) -> None:
-        """Plan target is ~45k total params."""
+    def test_total_params_flat_default(self) -> None:
+        """Flat default bakes spatial mixing into the temporal conv — ~285k."""
         model = NeuralFieldPerceiverPerPhoneme()
+        total = sum(p.numel() for p in model.parameters())
+        assert 250_000 <= total <= 320_000, f"got {total}, expected ~285k"
+
+    def test_total_params_per_cell_near_plan_target(self) -> None:
+        """per_cell matches the original ~45k plan target."""
+        cfg = replace(PerPhonemeConfig(), temporal_frontend="per_cell")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
         total = sum(p.numel() for p in model.parameters())
         assert 30_000 <= total <= 60_000, f"got {total}, expected ~45k"
 

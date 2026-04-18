@@ -36,6 +36,9 @@ from speech_decoding.v14.phoneme_dataset import V14PhonemeDataset  # noqa: E402
 from speech_decoding.v14.phoneme_run_fold import (  # noqa: E402
     run_one_fold as run_one_fold_per_phoneme,
 )
+from speech_decoding.v14.phoneme_run_fold_pooled import (  # noqa: E402
+    run_one_fold_pooled,
+)
 from speech_decoding.v14.run_fold import run_one_fold  # noqa: E402
 
 
@@ -92,12 +95,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("slot", "per-phoneme"),
+        choices=("slot", "per-phoneme", "pooled"),
         default="slot",
         help="Training mode. 'slot' = original B-1 slot-CE; "
-        "'per-phoneme' = baseline-aligned rework.",
+        "'per-phoneme' = single-patient baseline-aligned rework; "
+        "'pooled' = multi-patient per-phoneme (Q1a).",
     )
-    parser.add_argument("--patient", required=True)
+    parser.add_argument(
+        "--patient",
+        default=None,
+        help="Required for slot / per-phoneme modes. Ignored for pooled mode.",
+    )
+    parser.add_argument(
+        "--patients",
+        default=None,
+        help="Comma-separated patient IDs for pooled mode (e.g. S14,S26,S33,S62).",
+    )
     parser.add_argument("--fold", type=int, required=True, choices=range(5))
     parser.add_argument("--seed", type=int, required=True, choices=(0, 1, 2))
     parser.add_argument(
@@ -143,6 +156,46 @@ def main(argv: list[str] | None = None) -> int:
         default=8,
         help="Per-phoneme mode: pool target cols. Default 8.",
     )
+    parser.add_argument(
+        "--temporal-frontend",
+        type=str,
+        default="per_cell",
+        choices=("per_cell", "flat"),
+        help="Per-phoneme + pooled mode: temporal front-end style. 'per_cell' "
+        "(default) is the current 8→d shared Conv1d. 'flat' is the baseline "
+        "C·n_cells→d Conv1d — bakes full spatial mixing into the front-end.",
+    )
+    parser.add_argument(
+        "--pool-method",
+        type=str,
+        default="masked_mean",
+        choices=("masked_mean", "adaptive_avg"),
+        help="Per-phoneme + pooled: Stage-3 pool implementation. "
+        "'masked_mean' (default) uses start-index non-overlapping bins and "
+        "divides by active count. 'adaptive_avg' uses torch's "
+        "adaptive_avg_pool2d — overlapping bins on non-divisible W, divisor = "
+        "fixed bin size. Matches baseline pool.",
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="Per-phoneme + pooled: label smoothing on the CE target. "
+        "Baseline recipe uses 0.1 (−4.1pp autoresearch delta). Default 0.0.",
+    )
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=0.0,
+        help="Per-phoneme + pooled: mixup Beta α on the signal. Baseline "
+        "recipe uses 0.2 (−2.9pp autoresearch delta). Default 0.0.",
+    )
+    parser.add_argument(
+        "--no-parcel-embedding",
+        action="store_true",
+        help="Pooled mode: disable the soft parcel embedding (ablation — "
+        "tests whether the atlas anchor actually helps the pooled model).",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument(
         "--smoke",
@@ -152,15 +205,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.mode == "slot" and args.patient not in CORE_PATIENTS:
-        parser.error(
-            f"slot mode supports core patients {CORE_PATIENTS}; got {args.patient}"
-        )
-    if args.mode == "per-phoneme" and args.patient not in PHASE1_LH_PATIENTS:
-        parser.error(
-            f"per-phoneme mode supports Phase-1 LH patients {PHASE1_LH_PATIENTS}; "
-            f"got {args.patient}"
-        )
+    pooled_patients: tuple[str, ...] = ()
+    if args.mode == "slot":
+        if args.patient not in CORE_PATIENTS:
+            parser.error(
+                f"slot mode supports core patients {CORE_PATIENTS}; got {args.patient}"
+            )
+    elif args.mode == "per-phoneme":
+        if args.patient not in PHASE1_LH_PATIENTS:
+            parser.error(
+                f"per-phoneme mode supports Phase-1 LH patients {PHASE1_LH_PATIENTS}; "
+                f"got {args.patient}"
+            )
+    else:  # pooled
+        if not args.patients:
+            parser.error("--mode pooled requires --patients S1,S2,...")
+        pooled_patients = tuple(p.strip() for p in args.patients.split(","))
+        bad = [p for p in pooled_patients if p not in PHASE1_LH_PATIENTS]
+        if bad:
+            parser.error(
+                f"pooled mode patients must be Phase-1 LH {PHASE1_LH_PATIENTS}; "
+                f"got invalid {bad}"
+            )
+        if len(pooled_patients) < 2:
+            parser.error("pooled mode needs ≥2 patients")
 
     paths = _load_paths()
     bids_root = Path(paths["ps_bids_root"])
@@ -179,7 +247,6 @@ def main(argv: list[str] | None = None) -> int:
             Path.home() / "Library" / "CloudStorage" / "Box-Box" / "ECoG_Recon",
         )
     )
-    support_cache_path = support_cache_dir / f"{args.patient}_support_tier1.csv"
 
     t0 = time.time()
     smoke_kw = (
@@ -187,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.mode == "slot":
+        support_cache_path = support_cache_dir / f"{args.patient}_support_tier1.csv"
         fif_path = _resolve_fif_path(bids_root, args.patient)
         dataset = V14TrialDataset(
             args.patient,
@@ -208,7 +276,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{args.patient}_fold{args.fold}_seed{args.seed}"
             f"_depth{args.grid_mixer_depth}"
         )
-    else:
+    elif args.mode == "per-phoneme":
+        support_cache_path = support_cache_dir / f"{args.patient}_support_tier1.csv"
         fif_path = _resolve_phoneme_fif_path(bids_root, args.patient)
         dataset = V14PhonemeDataset(
             args.patient,
@@ -225,12 +294,48 @@ def main(argv: list[str] | None = None) -> int:
             d_model=args.d_model,
             conv2d_kernel=args.conv2d_kernel,
             pool_shape=(args.pool_h, args.pool_w),
+            temporal_frontend=args.temporal_frontend,
+            pool_method=args.pool_method,
+            label_smoothing=args.label_smoothing,
+            mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,
             patient_id=args.patient,
             **smoke_kw,
         )
         tag = (
             f"{args.patient}_fold{args.fold}_seed{args.seed}"
+            f"_depth{args.backbone_depth}"
+        )
+    else:  # pooled
+        datasets: dict[str, V14PhonemeDataset] = {}
+        for pt in pooled_patients:
+            fif_path = _resolve_phoneme_fif_path(bids_root, pt)
+            datasets[pt] = V14PhonemeDataset(
+                pt,
+                fif_path,
+                support_cache_path=support_cache_dir / f"{pt}_support_tier1.csv",
+                channel_maps_dir=channel_maps_dir,
+                box_root=box_root,
+            )
+        result = run_one_fold_pooled(
+            datasets,
+            fold_idx=args.fold,
+            seed=args.seed,
+            backbone_depth=args.backbone_depth,
+            d_model=args.d_model,
+            conv2d_kernel=args.conv2d_kernel,
+            pool_shape=(args.pool_h, args.pool_w),
+            use_parcel_embedding=not args.no_parcel_embedding,
+            temporal_frontend=args.temporal_frontend,
+            pool_method=args.pool_method,
+            label_smoothing=args.label_smoothing,
+            mixup_alpha=args.mixup_alpha,
+            out_dir=args.out_dir,
+            **smoke_kw,
+        )
+        patient_slug = "_".join(sorted(pooled_patients))
+        tag = (
+            f"pooled_{patient_slug}_fold{args.fold}_seed{args.seed}"
             f"_depth{args.backbone_depth}"
         )
 

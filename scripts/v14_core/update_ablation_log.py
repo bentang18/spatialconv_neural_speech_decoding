@@ -28,6 +28,9 @@ BASELINE_PER = 0.734
 
 def _config_key(row: dict) -> tuple:
     pool_shape = row.get("pool_shape", [4, 8])
+    # Append suffix tags so ablations don't collide with the canonical config
+    # cell on the same (patient, d, depth, k, pool). Order matches the CSV
+    # `patient` column (e.g. "S26", "S26::flat", "pooled:S14_S26::noemb").
     return (
         row["patient"],
         int(row.get("d_model", 32)),
@@ -49,8 +52,63 @@ def _csv_row_key(row: dict) -> tuple:
     )
 
 
+def _variant_suffix(r: dict) -> str:
+    """Distinguishing tag appended to the patient column for ablations."""
+    bits = []
+    if r.get("temporal_frontend") == "flat":
+        bits.append("flat")
+    if r.get("pool_method") == "adaptive_avg":
+        bits.append("aavg")
+    if r.get("use_parcel_embedding") is False:
+        bits.append("noemb")
+    ls = r.get("label_smoothing") or 0.0
+    if ls > 0.0:
+        bits.append(f"ls{int(round(ls * 100)):02d}")
+    mu = r.get("mixup_alpha") or 0.0
+    if mu > 0.0:
+        bits.append(f"mix{int(round(mu * 100)):02d}")
+    return ("::" + "_".join(bits)) if bits else ""
+
+
+def _pooled_label(patients: list[str]) -> str:
+    return "pooled:" + "_".join(patients)
+
+
+def _flatten_run(r: dict) -> list[dict]:
+    """Normalize per-patient and pooled JSONs into a uniform per-run record.
+
+    Per-patient JSON → one record with `patient`, `test_per_phoneme`, etc.
+    Pooled JSON → one synthetic record whose `patient` is
+    `pooled:<p1_p2_...>` and whose `test_per_phoneme` is the run's pop mean.
+    Per-patient breakdowns are preserved under `_per_patient` for the notes
+    field.
+    """
+
+    suffix = _variant_suffix(r)
+    if r.get("mode") == "pooled":
+        patients = r.get("patients") or []
+        if "pop_test_per_phoneme_mean" not in r:
+            return []
+        return [{
+            "patient": _pooled_label(patients) + suffix,
+            "test_per_phoneme": r["pop_test_per_phoneme_mean"],
+            "test_slot_averaged_per": r.get("pop_test_slot_averaged_per_mean"),
+            "backbone_depth": r["backbone_depth"],
+            "d_model": r.get("d_model", 32),
+            "conv2d_kernel": r.get("conv2d_kernel", 3),
+            "pool_shape": r.get("pool_shape", [4, 8]),
+            "_per_patient": r.get("per_patient_test", {}),
+            "_path": r["_path"],
+        }]
+    if "test_per_phoneme" in r and "patient" in r:
+        out = dict(r)
+        out["patient"] = r["patient"] + suffix
+        return [out]
+    return []
+
+
 def aggregate_results(results_root: Path) -> dict[tuple, dict]:
-    """Walk result JSONs and group by config tuple."""
+    """Walk result JSONs and group by config tuple. Handles per-patient + pooled."""
 
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for p in results_root.rglob("*.result.json"):
@@ -58,10 +116,9 @@ def aggregate_results(results_root: Path) -> dict[tuple, dict]:
             r = json.loads(p.read_text())
         except json.JSONDecodeError:
             continue
-        if "test_per_phoneme" not in r:
-            continue
         r["_path"] = p
-        groups[_config_key(r)].append(r)
+        for rec in _flatten_run(r):
+            groups[_config_key(rec)].append(rec)
 
     out: dict[tuple, dict] = {}
     for key, runs in groups.items():
@@ -70,6 +127,22 @@ def aggregate_results(results_root: Path) -> dict[tuple, dict]:
         slot = [s for s in slot if s is not None]
         best = min(runs, key=lambda r: r["test_per_phoneme"])
         best_tag = Path(best["_path"]).stem.replace(".result", "")
+
+        per_pt_note = ""
+        pooled_runs = [r for r in runs if "_per_patient" in r]
+        if pooled_runs:
+            # Mean per-patient test PER across runs in this cell.
+            by_pt: dict[str, list[float]] = defaultdict(list)
+            for r in pooled_runs:
+                for pt, entry in r["_per_patient"].items():
+                    if "test_per_phoneme" in entry:
+                        by_pt[pt].append(entry["test_per_phoneme"])
+            if by_pt:
+                per_pt_note = "; ".join(
+                    f"{pt}:{statistics.mean(v):.3f}"
+                    for pt, v in sorted(by_pt.items())
+                )
+
         out[key] = {
             "n_completed": len(runs),
             "per_phoneme_mean": statistics.mean(pers),
@@ -78,6 +151,7 @@ def aggregate_results(results_root: Path) -> dict[tuple, dict]:
             "per_phoneme_max": max(pers),
             "slot_avg_mean": statistics.mean(slot) if slot else None,
             "best_run_tag": best_tag,
+            "per_patient_note": per_pt_note,
         }
     return out
 
@@ -141,7 +215,11 @@ def update_csv(csv_path: Path, agg: dict[tuple, dict]) -> tuple[int, int]:
             "best_run_tag": stats["best_run_tag"],
             "vs_baseline_0.734": f"{stats['per_phoneme_mean'] - BASELINE_PER:+.3f}",
             "status": "completed" if stats["n_completed"] >= 15 else "running",
-            "notes": "auto-appended by update_ablation_log",
+            "notes": (
+                f"pooled per-patient: {stats['per_patient_note']}"
+                if stats.get("per_patient_note")
+                else "auto-appended by update_ablation_log"
+            ),
         })
         rows.append(new_row)
         appended += 1

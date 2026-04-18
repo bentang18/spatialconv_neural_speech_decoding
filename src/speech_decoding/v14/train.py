@@ -66,6 +66,40 @@ def per_phoneme_ce_loss(model: nn.Module, batch: dict) -> torch.Tensor:
     return compute_flat_ce(logits, batch["labels"])
 
 
+def make_per_phoneme_ce_loss(
+    label_smoothing: float = 0.0,
+    mixup_alpha: float = 0.0,
+) -> Callable[[nn.Module, dict], torch.Tensor]:
+    """Build a per-phoneme CE loss with optional label smoothing + mixup.
+
+    Mixup interpolates the raw signal and the *loss* (not the labels, which
+    are categorical). `prev_tokens` and all per-patient constants (layout,
+    support, grid shape, active mask) are kept from the primary example —
+    mixing is a one-sided signal perturbation, not a full context blend.
+    """
+
+    def _loss(model: nn.Module, batch: dict) -> torch.Tensor:
+        labels = batch["labels"]
+        if mixup_alpha > 0.0 and model.training:
+            beta = torch.distributions.Beta(mixup_alpha, mixup_alpha)
+            lam = float(beta.sample().item())
+            B = labels.shape[0]
+            perm = torch.randperm(B, device=labels.device)
+            mixed_signal = lam * batch["signal"] + (1.0 - lam) * batch["signal"][perm]
+            mixed_batch = dict(batch)
+            mixed_batch["signal"] = mixed_signal
+            logits = model(mixed_batch)
+            loss_a = F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
+            loss_b = F.cross_entropy(
+                logits, labels[perm], label_smoothing=label_smoothing
+            )
+            return lam * loss_a + (1.0 - lam) * loss_b
+        logits = model(batch)
+        return F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
+
+    return _loss
+
+
 def _move(batch: dict, device: torch.device) -> dict:
     moved: dict = {}
     for k, v in batch.items():
@@ -156,6 +190,7 @@ def train_one_fold(
     loss_fn: Callable[[nn.Module, dict], torch.Tensor] = _default_slot_ce_loss,
     evaluate_fn: Callable[[nn.Module, Iterable[dict]], float] | None = None,
     warmup_epochs: int = WARMUP_EPOCHS,
+    grad_accum_steps: int | None = None,
 ) -> FoldResult:
     """Full First-Run Protocol training loop for one fold/seed.
 
@@ -169,6 +204,10 @@ def train_one_fold(
 
     ``evaluate_fn`` is the val-time PER reporter. Default is the slot-CE
     ``evaluate`` above; per-phoneme callers should pass their own.
+
+    ``grad_accum_steps`` overrides the module default (4) — the pooled runner
+    sets this to ``n_patients`` so each optimizer step sees one micro-batch
+    from every patient.
     """
 
     device = next(model.parameters()).device
@@ -176,6 +215,7 @@ def train_one_fold(
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
     scheduler = make_cosine_warmup_schedule(optimizer, warmup_epochs, max_epochs)
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    accum_steps = grad_accum_steps if grad_accum_steps is not None else GRAD_ACCUM_STEPS
 
     if evaluate_fn is None:
         evaluate_fn = evaluate
@@ -197,15 +237,15 @@ def train_one_fold(
             if use_amp and scaler is not None:
                 with torch.amp.autocast("cuda"):
                     raw_loss = loss_fn(model, batch)
-                    loss = raw_loss / GRAD_ACCUM_STEPS
+                    loss = raw_loss / accum_steps
                 scaler.scale(loss).backward()
             else:
                 raw_loss = loss_fn(model, batch)
-                loss = raw_loss / GRAD_ACCUM_STEPS
+                loss = raw_loss / accum_steps
                 loss.backward()
             epoch_loss_sum += float(raw_loss.detach().item())
             epoch_micro += 1
-            if (i + 1) % GRAD_ACCUM_STEPS == 0:
+            if (i + 1) % accum_steps == 0:
                 if use_amp and scaler is not None:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -217,7 +257,7 @@ def train_one_fold(
                 optimizer.zero_grad(set_to_none=True)
         # Flush any tail accumulation so small datasets (and partial-tail epochs
         # on any dataset) still get at least one optimizer step per epoch.
-        if epoch_micro % GRAD_ACCUM_STEPS != 0:
+        if epoch_micro % accum_steps != 0:
             if use_amp and scaler is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
