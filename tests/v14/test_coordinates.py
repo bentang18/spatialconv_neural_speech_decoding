@@ -309,18 +309,32 @@ def test_s14_projection_end_to_end(tmp_path: Path) -> None:
         f"max x = {cache.coords[:, 0].max():.2f}"
     )
 
-    # MNI152 brain bounding box sanity (generous bounds).
+    # MNI152 brain bounding box. Tight bounds — a missing cras shift would
+    # systematically push every y up by +17 mm and every z down by -19 mm,
+    # putting electrodes outside these ranges.
     xs, ys, zs = cache.coords[:, 0], cache.coords[:, 1], cache.coords[:, 2]
-    assert -90.0 < xs.min() and xs.max() < 90.0, f"x range {xs.min():.1f}..{xs.max():.1f}"
-    assert -130.0 < ys.min() and ys.max() < 90.0, f"y range {ys.min():.1f}..{ys.max():.1f}"
-    assert -80.0 < zs.min() and zs.max() < 100.0, f"z range {zs.min():.1f}..{zs.max():.1f}"
+    assert -80.0 < xs.min() and xs.max() < 10.0, f"x range {xs.min():.1f}..{xs.max():.1f}"
+    assert -120.0 < ys.min() and ys.max() < 80.0, f"y range {ys.min():.1f}..{ys.max():.1f}"
+    assert -70.0 < zs.min() and zs.max() < 90.0, f"z range {zs.min():.1f}..{zs.max():.1f}"
 
-    # Sidecar metadata should exist and name S14.
+    # Landmark sanity: S14's array covers ventral left sensorimotor cortex
+    # (face/tongue territory on the inferior precentral/postcentral gyrus).
+    # The centroid should sit in that region in MNI; this check fails if the
+    # cras frame-translation is missing (centroid shifts ~17 mm anterior).
+    centroid = cache.coords.mean(axis=0)
+    assert -70.0 < centroid[0] < -40.0, f"x centroid {centroid[0]:.1f} not in left ventral SMC"
+    assert -25.0 < centroid[1] < 10.0, f"y centroid {centroid[1]:.1f} not in ventral SMC"
+    assert 10.0 < centroid[2] < 55.0, f"z centroid {centroid[2]:.1f} not in ventral SMC"
+
+    # Sidecar metadata should exist and name S14, and should record the avg
+    # subject's cras so downstream consumers can audit the frame translation.
     meta = json.loads((tmp_path / "_projection_meta.json").read_text())
     assert "S14" in meta
     assert meta["S14"]["n_electrodes"] == 128
     assert meta["S14"]["n_left"] == 128
     assert meta["S14"]["avg_subject"] == DEFAULT_AVG_SUBJECT
+    assert "avg_cras_mm" in meta["S14"]
+    assert len(meta["S14"]["avg_cras_mm"]) == 3
 
 
 @pytest.mark.skipif(
@@ -329,7 +343,13 @@ def test_s14_projection_end_to_end(tmp_path: Path) -> None:
 )
 @requires_box
 def test_s14_matches_oracle_within_tolerance(tmp_path: Path) -> None:
-    """Compare the Python port against Zac's trusted MATLAB run.
+    """Compare the Python port against Zac's trusted MATLAB run (v2, cras-corrected).
+
+    Zac's MATLAB ``sub2AvgBrainClinical.m`` outputs coordinates in cvs_avg35
+    *subject tkrRAS* — it terminates with a vertex lookup in
+    ``lh.pial-outer-smoothed`` and does not add cras. The Python port, as of
+    v2 (2026-04-16), adds the ``lh.pial`` cras so its output is in true MNI.
+    This test compares (MATLAB oracle + cras) against the Python port.
 
     Tolerance is intentionally wider than pure floating-point noise (~0.05 mm
     expected) because Zac's oracle was generated against an earlier snapshot
@@ -354,7 +374,13 @@ def test_s14_matches_oracle_within_tolerance(tmp_path: Path) -> None:
     project_patient("S14", BOX_ROOT, tmp_path)
     cache = load_mni_cache("S14", tmp_path)
 
-    oracle_names, oracle_coords = _load_matlab_avgcoords(ORACLE_FIXTURE, "S14")
+    oracle_names, oracle_coords_tkr = _load_matlab_avgcoords(ORACLE_FIXTURE, "S14")
+    # The MATLAB fixture is in cvs_avg35 tkrRAS; our v2 port is in scanner RAS.
+    # Add the same cras the Python port adds so the comparison is frame-matched.
+    meta = json.loads((tmp_path / "_projection_meta.json").read_text())
+    avg_cras = np.asarray(meta["S14"]["avg_cras_mm"], dtype=np.float64)
+    oracle_coords = oracle_coords_tkr + avg_cras
+
     stats = compare_against_oracle(cache, oracle_names, oracle_coords)
 
     summary = (

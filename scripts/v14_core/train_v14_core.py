@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Single-patient / single-fold / single-seed v14-core training CLI (Task E1).
+
+Resolves machine-specific paths from `configs/paths.yaml`, builds the per-
+patient dataset, and delegates to the right fold runner. One SLURM array
+task = one invocation of this script.
+
+Two modes:
+
+* ``--mode slot`` (default, original B-1 path): trial-level `.fif`, slot-CE
+  over 3 phoneme positions, ``grid_mixer_depth`` ablation knob.
+* ``--mode per-phoneme`` (baseline-aligned rework): phoneme-level `.fif`,
+  flat per-phoneme CE, ``backbone_depth`` ablation knob. Full Phase-1 LH
+  cohort supported.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from speech_decoding.v14.dataset import V14TrialDataset  # noqa: E402
+from speech_decoding.v14.phoneme_dataset import V14PhonemeDataset  # noqa: E402
+from speech_decoding.v14.phoneme_run_fold import (  # noqa: E402
+    run_one_fold as run_one_fold_per_phoneme,
+)
+from speech_decoding.v14.run_fold import run_one_fold  # noqa: E402
+
+
+CORE_PATIENTS = ("S14", "S26", "S33", "S62")
+PHASE1_LH_PATIENTS = ("S14", "S16", "S23", "S26", "S33", "S39", "S62")
+
+
+def _repo_root() -> Path:
+    return PROJECT_ROOT
+
+
+def _load_paths() -> dict:
+    cfg = yaml.safe_load((_repo_root() / "configs" / "paths.yaml").read_text())
+    return cfg
+
+
+def _resolve_fif_path(bids_root: Path, patient: str) -> Path:
+    """Trial-level `.fif` per `#34` — authoritative for tokens + onsets."""
+
+    return (
+        bids_root
+        / "derivatives"
+        / "epoch(CAR)"
+        / f"sub-{patient}"
+        / "epoch(band)(power)"
+        / f"sub-{patient}_task-PhonemeSequence_desc-productionZscore_highgamma.fif"
+    )
+
+
+def _resolve_phoneme_fif_path(bids_root: Path, patient: str) -> Path:
+    """Phoneme-level `.fif` — 3·n_trials epochs at 9-phoneme event_id."""
+
+    return (
+        bids_root
+        / "derivatives"
+        / "epoch(phonemeLevel)(CAR)"
+        / f"sub-{patient}"
+        / "epoch(band)(power)"
+        / f"sub-{patient}_task-PhonemeSequence_desc-productionZscore_highgamma.fif"
+    )
+
+
+def _git_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(_repo_root()), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("slot", "per-phoneme"),
+        default="slot",
+        help="Training mode. 'slot' = original B-1 slot-CE; "
+        "'per-phoneme' = baseline-aligned rework.",
+    )
+    parser.add_argument("--patient", required=True)
+    parser.add_argument("--fold", type=int, required=True, choices=range(5))
+    parser.add_argument("--seed", type=int, required=True, choices=(0, 1, 2))
+    parser.add_argument(
+        "--grid-mixer-depth",
+        type=int,
+        default=1,
+        choices=(1, 2),
+        help="Slot mode only: grid-mixer Conv2d depth.",
+    )
+    parser.add_argument(
+        "--backbone-depth",
+        type=int,
+        default=3,
+        choices=(1, 3),
+        help="Per-phoneme mode: number of attention blocks (plan: {1, 3}).",
+    )
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Smoke-test mode: 5 epochs, val every epoch, no early-stop. "
+        "For pipeline validation, not for real results.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.mode == "slot" and args.patient not in CORE_PATIENTS:
+        parser.error(
+            f"slot mode supports core patients {CORE_PATIENTS}; got {args.patient}"
+        )
+    if args.mode == "per-phoneme" and args.patient not in PHASE1_LH_PATIENTS:
+        parser.error(
+            f"per-phoneme mode supports Phase-1 LH patients {PHASE1_LH_PATIENTS}; "
+            f"got {args.patient}"
+        )
+
+    paths = _load_paths()
+    bids_root = Path(paths["ps_bids_root"])
+    support_cache_dir = Path(
+        paths.get(
+            "support_cache_dir",
+            _repo_root() / "data" / "atlas" / "support_cache_v2c_snap",
+        )
+    )
+    channel_maps_dir = Path(
+        paths.get("channel_maps_dir", _repo_root() / "data" / "channel_maps")
+    )
+    box_root = Path(
+        paths.get(
+            "box_root",
+            Path.home() / "Library" / "CloudStorage" / "Box-Box" / "ECoG_Recon",
+        )
+    )
+    support_cache_path = support_cache_dir / f"{args.patient}_support_tier1.csv"
+
+    t0 = time.time()
+    smoke_kw = (
+        {"max_epochs": 5, "val_every": 1, "patience": 100} if args.smoke else {}
+    )
+
+    if args.mode == "slot":
+        fif_path = _resolve_fif_path(bids_root, args.patient)
+        dataset = V14TrialDataset(
+            args.patient,
+            fif_path,
+            support_cache_path=support_cache_path,
+            channel_maps_dir=channel_maps_dir,
+            box_root=box_root,
+        )
+        result = run_one_fold(
+            dataset,
+            fold_idx=args.fold,
+            seed=args.seed,
+            grid_mixer_depth=args.grid_mixer_depth,
+            out_dir=args.out_dir,
+            patient_id=args.patient,
+            **smoke_kw,
+        )
+        tag = (
+            f"{args.patient}_fold{args.fold}_seed{args.seed}"
+            f"_depth{args.grid_mixer_depth}"
+        )
+    else:
+        fif_path = _resolve_phoneme_fif_path(bids_root, args.patient)
+        dataset = V14PhonemeDataset(
+            args.patient,
+            fif_path,
+            support_cache_path=support_cache_path,
+            channel_maps_dir=channel_maps_dir,
+            box_root=box_root,
+        )
+        result = run_one_fold_per_phoneme(
+            dataset,
+            fold_idx=args.fold,
+            seed=args.seed,
+            backbone_depth=args.backbone_depth,
+            out_dir=args.out_dir,
+            patient_id=args.patient,
+            **smoke_kw,
+        )
+        tag = (
+            f"{args.patient}_fold{args.fold}_seed{args.seed}"
+            f"_depth{args.backbone_depth}"
+        )
+
+    wall_s = time.time() - t0
+
+    # Augment on-disk result with reproducibility metadata; the runner already
+    # wrote the primary fields.
+    result["mode"] = args.mode
+    result["wall_s"] = wall_s
+    result["git_sha"] = _git_sha()
+    result["hostname"] = socket.gethostname()
+    result["timestamp_unix"] = time.time()
+    (args.out_dir / f"{tag}.result.json").write_text(json.dumps(result, indent=2))
+
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

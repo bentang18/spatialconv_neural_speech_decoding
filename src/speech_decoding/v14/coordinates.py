@@ -1,4 +1,14 @@
-"""Python port of Zac Spalding's ``sub2AvgBrainClinical.m``.
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+Per `#36` in `docs/implementation_tasks.md`, the active Phase-1 patient-side
+projection is `src/speech_decoding/v14/fsaverage_projection.py` (stock pial +
+sphere.reg → fsaverage). This module is kept as the cvs_avg35 migration
+oracle: it feeds `scripts/compare_fsaverage_spatial_parity.py` and has an
+S14 oracle regression in `tests/v14/test_coordinates.py`. Do not route
+loader/model code through the cvs_avg35 cache produced by this file.
+
+Python port of Zac Spalding's ``sub2AvgBrainClinical.m``, plus a frame
+translation step (added 2026-04-16, v2) described below.
 
 Projects subdural ECoG electrodes from subject FreeSurfer space to the
 ``cvs_avg35_inMNI152`` average brain via surface-based registration. The
@@ -12,17 +22,38 @@ algorithm has four steps per hemisphere:
 3. Find the nearest vertex on the average subject's
    ``lh.sphere-outer.reg`` / ``rh.sphere-outer.reg`` sphere.
 4. Read out the corresponding point from the average subject's
-   ``lh.pial-outer-smoothed`` / ``rh.pial-outer-smoothed`` surface. That
-   point is the MNI152 coordinate.
+   ``lh.pial-outer-smoothed`` / ``rh.pial-outer-smoothed`` surface.
+5. *Frame translation:* add the average subject's ``cras`` (read from
+   its ``lh.pial`` header) so the output is in scanner RAS (≈ MNI).
 
 The projection is not an affine transform. It is a nonlinear surface
-registration; the output is constrained to lie on the average subject's
-outer-smoothed pial envelope. See ``docs/implementation_tasks.md`` blocker
-#1 for the full context and the post-trust PM coverage spot check.
+registration; the output of step 4 is constrained to lie on the average
+subject's outer-smoothed pial envelope. See ``docs/implementation_tasks.md``
+blocker #1 for the full context and the post-trust PM coverage spot check.
 
 Output is keyed by electrode *name* (from ``<pt>.electrodeNames``), not by
 physical position. See blocker #12 for the reason and the downstream bridge
 contract.
+
+Frame translation rationale (v2, 2026-04-16):
+
+    Box's ``cvs_avg35_inMNI152/surf/lh.pial-outer-smoothed`` stores
+    ``cras = (0, 0, 0)`` in its FreeSurfer header, while the sibling
+    ``lh.pial`` stores ``cras = (-1, -17, 19)``. Both surfaces are in
+    the same subject tkrRAS; only ``lh.pial`` has the cras metadata to
+    translate to scanner RAS. Without step 5, the output of step 4 is
+    mislabeled — the file name is ``_MNI152.csv`` but the coords are
+    tkrRAS, offset by +(-1, -17, 19) from true MNI. Sampling a volume
+    that lives in MNI (e.g. ``BNA_PM_dilated_8mm.nii.gz``) at these
+    coords lands ~22 mm off the electrode's actual location and flips
+    whole sub-gyri (e.g., S14 sensorimotor argmax-to-PrG instead of
+    PoG). The Python port inherited this from ``sub2AvgBrainClinical.m``.
+    Verified via triangulation across S14/S26/S33/S62 surface-baked vs
+    volumetric argmax on 2026-04-16.
+
+    The fix is defensive and generalizes: for any average subject whose
+    ``lh.pial`` has a correct cras (including fsaverage, where cras is
+    zero and the step is a no-op), the output is always in scanner RAS.
 """
 
 from __future__ import annotations
@@ -31,8 +62,9 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
+import nibabel as nib
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -40,7 +72,7 @@ import mne
 
 
 DEFAULT_AVG_SUBJECT = "cvs_avg35_inMNI152"
-_ALGORITHM_VERSION = "sub2AvgBrainClinical.m python port v1 (2026-04-13)"
+_ALGORITHM_VERSION = "sub2AvgBrainClinical.m python port v2 (2026-04-16, cras-corrected)"
 
 
 @dataclass(frozen=True)
@@ -185,6 +217,25 @@ def _load_surface(path: Path) -> np.ndarray:
     return np.asarray(verts, dtype=np.float64)
 
 
+def _read_surface_cras(path: Path) -> np.ndarray:
+    """Read the FreeSurfer ``cras`` (surfaceRAS-to-scannerRAS translation) from a surface file.
+
+    Raises if the file is missing or the header lacks a valid ``cras`` entry.
+    The returned vector is a 3-vector in mm; adding it to vertex coordinates
+    expressed in subject tkrRAS yields scanner RAS.
+    """
+
+    if not path.exists():
+        raise FileNotFoundError(f"missing surface file: {path}")
+    result = nib.freesurfer.io.read_geometry(str(path), read_metadata=True)
+    if not isinstance(result, tuple) or len(result) < 3:
+        raise RuntimeError(f"{path}: unexpected read_geometry return shape {type(result)!r}")
+    meta: Any = result[2]
+    if "cras" not in meta:
+        raise ValueError(f"{path}: surface header missing cras metadata")
+    return np.asarray(meta["cras"], dtype=np.float64)
+
+
 def project_to_average(
     sub_coords: np.ndarray,
     is_left: np.ndarray,
@@ -204,6 +255,20 @@ def project_to_average(
         raise ValueError(f"is_left shape {is_left.shape} != ({n},)")
     out = np.full((n, 3), np.nan, dtype=np.float64)
 
+    # Frame translation: read cras from the average subject's `lh.pial`. Step 4
+    # returns a point on `<hem>.pial-outer-smoothed`, whose cras is unreliable
+    # (zero on Box's cvs_avg35_inMNI152 even though the surface is stored in
+    # tkrRAS). The sibling `lh.pial` has the correct cras; both surfaces share
+    # the same subject coordinate frame. We read cras from `lh.pial` once and
+    # assert it matches `rh.pial` so the translation is unambiguous.
+    cras = _read_surface_cras(avg_surf_dir / "lh.pial")
+    rh_cras = _read_surface_cras(avg_surf_dir / "rh.pial")
+    if not np.allclose(cras, rh_cras, atol=1e-3):
+        raise ValueError(
+            f"average-subject lh.pial cras {cras} differs from rh.pial cras "
+            f"{rh_cras}; frame translation is ambiguous"
+        )
+
     for hem, mask in (("lh", is_left), ("rh", ~is_left)):
         if not mask.any():
             continue
@@ -213,7 +278,7 @@ def project_to_average(
         avg_pial = _load_surface(avg_surf_dir / f"{hem}.pial-outer-smoothed")
         out[mask] = project_single_hemisphere(
             sub_coords[mask], sub_pial, sub_sph, avg_sph, avg_pial
-        )
+        ) + cras
 
     if np.isnan(out).any():
         raise RuntimeError("projection left NaN rows — hemisphere mask did not cover all electrodes")
@@ -277,6 +342,8 @@ def project_patient(
         )
     _assert_hemisphere_sign_consistent(elec)
 
+    avg_cras = _read_surface_cras(avg_dir / "lh.pial")
+
     mni = project_to_average(
         sub_coords=elec.coords,
         is_left=elec.is_left,
@@ -299,6 +366,7 @@ def project_patient(
         elec=elec,
         lepto_path=elec_recon / f"{patient_id}.LEPTO",
         names_path=elec_recon / f"{patient_id}.electrodeNames",
+        avg_cras=avg_cras,
     )
     return out_path
 
@@ -310,6 +378,7 @@ def _update_sidecar(
     elec: PatientElectrodes,
     lepto_path: Path,
     names_path: Path,
+    avg_cras: np.ndarray,
 ) -> None:
     meta_path = cache_dir / "_projection_meta.json"
     if meta_path.exists():
@@ -321,6 +390,7 @@ def _update_sidecar(
         "run_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "algorithm_version": _ALGORITHM_VERSION,
         "avg_subject": avg_subject,
+        "avg_cras_mm": [float(c) for c in avg_cras],
         "brainshift_method": elec.brainshift_method,
         "n_electrodes": len(elec.names),
         "n_left": int(elec.is_left.sum()),

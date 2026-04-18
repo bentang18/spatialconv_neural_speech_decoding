@@ -1,4 +1,20 @@
-"""Parcel-frame construction on the baked fsaverage atlas."""
+"""ARCHIVED: parcel-frame construction on the baked fsaverage atlas (pre-amendment ``#10``).
+
+The 2026-04-16 late B-1 amendment retired ``parcel_frames.npz`` from the
+v14-core pipeline. The B-1 architecture has no within-parcel positional
+encoding: registration noise (~3-5 mm RMS) plus inter-individual
+anatomical variability (~10 mm RMS) gives ~11 mm joint uncertainty in
+localizing sub-parcel functional landmarks, which is larger than the
+5-10 mm cluster width we'd want to align. Sub-parcel cross-patient
+position-driven transfer is therefore below the SNR floor, and the
+intra-parcel ``(u, v)`` chart is no longer used for token construction.
+
+This module and ``scripts/build_fsaverage_parcel_frames.py`` are kept
+for archival reference only — they remain useful for visualizing parcel
+geometry on fsaverage and for parity comparisons against the cvs_avg35
+oracle, but no v14-core code path consumes the resulting ``parcel_frames.npz``.
+See ``docs/v14_core_contract_amendment_2026-04-16.md`` for the full record.
+"""
 
 from __future__ import annotations
 

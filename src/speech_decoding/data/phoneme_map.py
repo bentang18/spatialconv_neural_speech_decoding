@@ -62,7 +62,7 @@ def normalize_label(label: str) -> str:
 
     Three input cases are handled:
 
-    1. Lowercase PS notation: `'a' -> 'AA'`, `'ae' -> 'EH'`.
+    1. Lowercase PS notation: `'a' -> 'AA'`, `'ae' -> 'AE'`.
     2. ARPABET with stress digits: `'AA1' -> 'AA'`, `'IY0' -> 'IY'`.
     3. Already-canonical ARPABET: `'AA' -> 'AA'`, `'B' -> 'B'`.
 

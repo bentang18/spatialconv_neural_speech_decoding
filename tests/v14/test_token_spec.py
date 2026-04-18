@@ -10,9 +10,9 @@ from speech_decoding.v14.token_spec import (
 def test_default_base_parcels_frozen_fifteen() -> None:
     """The Phase-1 Tier-1 list is 15 LH parcels. See #4 in implementation_tasks.md.
 
-    Selection rule: argmax_wins >= 10 on the frozen spatial pipeline
-    (raw MNI + 8 mm PM dilation + σ=1.5 mm Gaussian). Primary auditory
-    cortex TE1.0/1.2 (73) is the minimum-argmax entry at argmx=12.
+    Selection rule: argmax_wins >= 10 on the fsaverage cohort ranking
+    (strict snap-to-pial + baked atlas read; see token_spec.py docstring
+    for the full derivation). Minimum-wins entry is A22r (79) at 17 wins.
     """
     assert len(DEFAULT_BASE_PARCELS) == 15
     assert all(isinstance(name, str) and isinstance(idx, int)

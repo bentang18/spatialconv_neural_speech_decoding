@@ -15,7 +15,7 @@ from .fsaverage_projection import FsaverageCoordinateCache
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_BAKE_DIR = PROJECT_ROOT / "data" / "atlas" / "fsaverage_bake"
+DEFAULT_BAKE_DIR = PROJECT_ROOT / "data" / "atlas" / "fsaverage_bake_v2c"
 DEFAULT_BNA_TREE = Path.home() / "nilearn_data" / "bnatlas_tree.csv"
 DEFAULT_ORACLE_PM_PATH = PROJECT_ROOT / "data" / "atlas" / "BNA_PM_dilated_8mm.nii.gz"
 DEFAULT_ORACLE_SIGMA_MM = 1.5
@@ -127,6 +127,20 @@ def _frame_path(
     return hemi_dir / f"{hemi}.frame{frame:03d}.fsaverage.fwhm{smooth_fwhm:g}.mgh"
 
 
+def _multiframe_path(
+    out_dir: Path,
+    hemi: str,
+    kind: str,
+    smooth_fwhm: float | None,
+) -> Path:
+    hemi_dir = out_dir / hemi
+    if kind == "raw":
+        return hemi_dir / f"{hemi}.fsaverage.mgh"
+    if smooth_fwhm is None:
+        raise ValueError("smooth_fwhm is required for smoothed atlas loads")
+    return hemi_dir / f"{hemi}.fsaverage.fwhm{smooth_fwhm:g}.mgh"
+
+
 def _load_surface_stack(paths: list[Path]) -> np.ndarray:
     cols: list[np.ndarray] = []
     for path in paths:
@@ -135,6 +149,18 @@ def _load_surface_stack(paths: list[Path]) -> np.ndarray:
         data = np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float64).reshape(-1)
         cols.append(data)
     return np.stack(cols, axis=1)
+
+
+def _load_multiframe_surface(path: Path) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"missing baked atlas file: {path}")
+    data = np.asarray(nib.load(str(path)).get_fdata(), dtype=np.float64)
+    data = np.squeeze(data)
+    if data.ndim == 1:
+        return data[:, None]
+    if data.ndim != 2:
+        raise ValueError(f"unexpected multiframe surface shape {data.shape} in {path}")
+    return data
 
 
 def consolidate_baked_atlas(out_dir: Path, tree_path: Path = DEFAULT_BNA_TREE) -> None:
@@ -147,17 +173,26 @@ def consolidate_baked_atlas(out_dir: Path, tree_path: Path = DEFAULT_BNA_TREE) -
         arrays: dict[str, np.ndarray] = {}
         for hemi in manifest["hemis"]:
             hemi_str = str(hemi)
-            paths = [
-                _frame_path(
-                    out_dir=out_dir,
-                    hemi=hemi_str,
-                    frame=frame,
-                    kind=kind,
-                    smooth_fwhm=smooth_fwhm,
-                )
-                for frame in frames
-            ]
-            arrays[hemi_str] = _load_surface_stack(paths)
+            multi_path = _multiframe_path(
+                out_dir=out_dir,
+                hemi=hemi_str,
+                kind=kind,
+                smooth_fwhm=smooth_fwhm,
+            )
+            if multi_path.exists():
+                arrays[hemi_str] = _load_multiframe_surface(multi_path)
+            else:
+                paths = [
+                    _frame_path(
+                        out_dir=out_dir,
+                        hemi=hemi_str,
+                        frame=frame,
+                        kind=kind,
+                        smooth_fwhm=smooth_fwhm,
+                    )
+                    for frame in frames
+                ]
+                arrays[hemi_str] = _load_surface_stack(paths)
         np.savez_compressed(
             _stack_file(out_dir, kind),
             frame_ids=np.array(frames, dtype=np.int64),
@@ -200,17 +235,26 @@ def load_baked_atlas(
     values_by_hemi: dict[str, np.ndarray] = {}
     for hemi in manifest["hemis"]:
         hemi_str = str(hemi)
-        paths = [
-            _frame_path(
-                out_dir=out_dir,
-                hemi=hemi_str,
-                frame=frame,
-                kind=kind,
-                smooth_fwhm=smooth_fwhm,
-            )
-            for frame in frames
-        ]
-        values_by_hemi[hemi_str] = _load_surface_stack(paths)
+        multi_path = _multiframe_path(
+            out_dir=out_dir,
+            hemi=hemi_str,
+            kind=kind,
+            smooth_fwhm=smooth_fwhm,
+        )
+        if multi_path.exists():
+            values_by_hemi[hemi_str] = _load_multiframe_surface(multi_path)
+        else:
+            paths = [
+                _frame_path(
+                    out_dir=out_dir,
+                    hemi=hemi_str,
+                    frame=frame,
+                    kind=kind,
+                    smooth_fwhm=smooth_fwhm,
+                )
+                for frame in frames
+            ]
+            values_by_hemi[hemi_str] = _load_surface_stack(paths)
 
     return BakedAtlasSurface(
         frame_ids=frames,
