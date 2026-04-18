@@ -1,9 +1,9 @@
 experiment_id,patient,d_model,backbone_depth,conv2d_kernel,pool_h,pool_w,n_folds,n_seeds,n_completed,per_phoneme_mean,per_phoneme_std,per_phoneme_min,per_phoneme_max,slot_avg_mean,best_run_tag,vs_baseline_0.734,job_id,status,date_started,notes
 P8_s14_d32_depth1,S14,32,1,3,4,8,5,3,15,0.820,0.066,0.697,0.944,0.867,S14_fold0_seed1_depth1,+0.086,45707149,completed,2026-04-17,P8 depth-ablation rung (control)
-P8_s14_d32_depth3,S14,32,3,3,4,8,5,3,15,0.783,0.064,0.644,0.889,0.877,S14_fold2_seed1_depth3,+0.049,45707149,completed,2026-04-17,P8 baseline — target PER ~0.78 hit on mean
-ablation_s14_d32_depth5,S14,32,5,3,4,8,5,3,0,,,,,,,,45707426,running,2026-04-17,Capacity: depth-only over baseline
-ablation_s14_d64_depth3,S14,64,3,3,4,8,5,3,0,,,,,,,,45707426,running,2026-04-17,Capacity: width-only over baseline
-ablation_s14_d64_depth5,S14,64,5,3,4,8,5,3,0,,,,,,,,45707426,running,2026-04-17,Capacity: width + depth combined
+P8_s14_d32_depth3,S14,32,3,3,4,8,5,3,15,0.783,0.064,0.644,0.889,0.863,S14_fold2_seed1_depth3,+0.049,45707149,completed,2026-04-17,P8 baseline — target PER ~0.78 hit on mean
+ablation_s14_d32_depth5,S14,32,5,3,4,8,5,3,7,0.809,0.067,0.697,0.909,0.853,S14_fold0_seed1_depth5,+0.075,45707426,running,2026-04-17,Capacity: depth-only over baseline
+ablation_s14_d64_depth3,S14,64,3,3,4,8,5,3,6,0.786,0.038,0.747,0.838,0.882,S14_fold2_seed1_depth3,+0.052,45707426,running,2026-04-17,Capacity: width-only over baseline
+ablation_s14_d64_depth5,S14,64,5,3,4,8,5,3,6,0.789,0.043,0.707,0.828,0.850,S14_fold0_seed2_depth5,+0.055,45707426,running,2026-04-17,Capacity: width + depth combined
 ablation_s14_k1_pool4x8,S14,32,3,1,4,8,5,3,0,,,,,,,,45707427,running,2026-04-17,Spatial: no Conv2d context (k=1)
 ablation_s14_k5_pool4x8,S14,32,3,5,4,8,5,3,0,,,,,,,,45707427,running,2026-04-17,Spatial: larger Conv2d kernel (k=5)
 ablation_s14_k3_pool2x4,S14,32,3,3,2,4,5,3,0,,,,,,,,45707427,running,2026-04-17,Spatial: coarser pool (8 cells)
