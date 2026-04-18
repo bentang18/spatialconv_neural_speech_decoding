@@ -1,6 +1,6 @@
 # Current Direction
 
-Updated: 2026-04-18 (late) — Phase 1 ablations converged. `per_cell` + attention + atlas parcel embedding is canonical. `flat` is retained as ablation only. Q1d (7-LH pooled) landed and LOPO pretrain→finetune is in flight.
+Updated: 2026-04-18 (late) — Phase 1 ablations converged. `per_cell` + attention + atlas parcel embedding is canonical. `flat` is retained as ablation only. Q1d (7-LH pooled) landed; LOPO pretrain→finetune 35/60 in flight **on the flat arm only** — not the arm where pooled transfer was observed, so the early read is uninformative about cross-patient transfer.
 
 ## Canonical research goal
 
@@ -20,7 +20,9 @@ Canonical references (do not restate them here):
 
 ## Active priority
 
-**Q1d**: pooled run on the full Phase-1 LH cohort (`S14, S16, S23, S26, S33, S39, S62`) with the flat front-end. Job `45720982`, 15 jobs. Open question: at 4 patients, pooled flat (pop 0.791) ≈ per-subject flat mean (0.784) — no transfer signal. If 7 patients still don't beat per-subject, the bottleneck is architectural, not data — that decision gates Phase 1.5 SSL planning.
+**Q1d** (landed): pooled run on the full Phase-1 LH cohort (`S14, S16, S23, S26, S33, S39, S62`) with the flat front-end. Job `45720982`, 15 jobs. At 4 patients, pooled flat (pop 0.791) ≈ per-subject flat mean (0.784) — no transfer signal. 7-LH pooled flat: 0.794 ± 0.025 (per-patient mean 0.797). Per-subject wins on variance but not on mean; Phase-1 data-scaling alone does not recover transfer.
+
+**LOPO warm-start on `flat`** (job `45723956`, 60 jobs, 35 done): pretrain pooled flat on 3 core patients, finetune on held-out. S14 0.797 ± 0.051 vs scratch 0.790 ± 0.032 (Δ +0.007); S26 0.758 ± 0.058 vs scratch 0.755 ± 0.034 (Δ +0.003); S33 partial 6/15 at 0.843 ± 0.062 vs scratch 0.779 ± 0.073; S62 queued. **Caveat**: pooled joint training on flat showed no cross-patient lift per-subject (Q1a 4-core: pooled flat 0.791 ≈ per-subject flat mean 0.784). Running LOPO on the arm with no visible transfer in the first place is not a test of warm-start transfer — it confirms flat has no transfer handle, not that warm-start fails. The informative experiment is LOPO warm-start on `per_cell`, where pooled joint training does pull S26 (−7.6pp) and S33 (−10.9pp) toward the pop mean. Sbatch should be re-run with the default front-end before drawing conclusions about warm-start itself.
 
 ## Where we are
 
