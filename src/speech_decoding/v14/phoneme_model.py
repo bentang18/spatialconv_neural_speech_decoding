@@ -16,6 +16,7 @@ Total params ~45k. Matches Ben's 0.734 baseline param budget.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from speech_decoding.v14.backbone import Backbone
@@ -54,6 +55,11 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
             raise ValueError(
                 f"temporal_frontend must be 'per_cell' or 'flat', "
                 f"got {self.cfg.temporal_frontend!r}"
+            )
+        if self.cfg.masking_mode not in ("zero_fill", "partial_conv"):
+            raise ValueError(
+                f"masking_mode must be 'zero_fill' or 'partial_conv', "
+                f"got {self.cfg.masking_mode!r}"
             )
         if self.cfg.temporal_frontend == "per_cell":
             self.conv1d = nn.Conv1d(
@@ -150,6 +156,33 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
             B * T_raw, 1, H_p, W_p
         )                                       # (B·T, 1, H_p, W_p)
         x = self.conv2d(x)                      # (B·T, 8, H_p, W_p)
+        if self.cfg.masking_mode == "partial_conv":
+            # Liu 2018 renormalization, adapted for our structural-boundary
+            # setting. At each position, scale the Conv2d output by
+            #     nominal_sum / sum(M in receptive field)
+            # where nominal_sum is what sum(M) would be if every electrode at
+            # the static layout were active. That isolates the *artifact*
+            # contribution: positions whose RF is reduced purely by the grid
+            # edge or by pad-within-grid have nominal == actual, so scale = 1
+            # (matches zero-fill). Positions where artifacts remove valid
+            # neighbors get scale > 1, undoing the attenuation. Zero learnable
+            # params; layout-agnostic; no boundary side-effect.
+            k = self.cfg.conv2d_kernel_size
+            pad = self.cfg.conv2d_padding
+            grid_nominal = signal.new_zeros((1, 1, H_p, W_p))
+            grid_nominal[:, 0, rows, cols] = 1.0
+            grid_actual = signal.new_zeros((B, 1, H_p, W_p))
+            grid_actual[:, 0, rows, cols] = active.to(signal.dtype)
+            ones_kernel = grid_nominal.new_ones((1, 1, k, k))
+            nominal_sum = F.conv2d(grid_nominal, ones_kernel, padding=pad)
+            actual_sum = F.conv2d(grid_actual, ones_kernel, padding=pad)
+            scale = nominal_sum / actual_sum.clamp(min=1.0)   # (B, 1, H_p, W_p)
+            scale_bt = (
+                scale.unsqueeze(1)
+                .expand(-1, T_raw, -1, -1, -1)
+                .reshape(B * T_raw, 1, H_p, W_p)
+            )
+            x = x * scale_bt
         x = self.conv2d_act(x)
         Cout = x.shape[1]
         x = x.view(B, T_raw, Cout, H_p, W_p).permute(0, 2, 3, 4, 1)

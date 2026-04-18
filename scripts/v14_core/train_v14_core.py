@@ -177,6 +177,17 @@ def main(argv: list[str] | None = None) -> int:
         "fixed bin size. Matches baseline pool.",
     )
     parser.add_argument(
+        "--masking-mode",
+        type=str,
+        default="zero_fill",
+        choices=("zero_fill", "partial_conv"),
+        help="Per-phoneme + pooled: Conv2d masking correction. 'zero_fill' "
+        "(default, baseline) zero-fills artifact/pad positions and lets the "
+        "k=3 kernel spread zeros into active neighbors. 'partial_conv' "
+        "(Liu 2018) renormalizes Conv2d output by k²/sum(M in RF), removing "
+        "the attenuation with zero learnable params.",
+    )
+    parser.add_argument(
         "--label-smoothing",
         type=float,
         default=0.0,
@@ -309,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
             pool_shape=(args.pool_h, args.pool_w),
             temporal_frontend=args.temporal_frontend,
             pool_method=args.pool_method,
+            masking_mode=args.masking_mode,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,
@@ -343,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             use_parcel_embedding=not args.no_parcel_embedding,
             temporal_frontend=args.temporal_frontend,
             pool_method=args.pool_method,
+            masking_mode=args.masking_mode,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,

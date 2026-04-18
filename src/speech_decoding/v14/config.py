@@ -254,6 +254,15 @@ class PerPhonemeConfig:
     # Matches the 2026-04-04 baseline pool. Only materially differs from
     # masked_mean on non-divisible grids (12×22) or with inactive electrodes.
     pool_method: str = "masked_mean"
+    # "zero_fill": artifact / pad positions are zero-filled before Conv2d; the
+    # k=3 kernel then spreads those zeros into active neighbors, attenuating
+    # their output by ~(k²-n_artifact)/k². Baseline behavior.
+    # "partial_conv": Liu et al. 2018 renormalization —
+    #     out = W · (X ⊙ M) · (k² / sum(M in RF))    if sum(M) > 0, else 0
+    # Zero learnable params, purely arithmetic correction. Layout-agnostic;
+    # transfers identically to sEEG / external arrays / future grid shapes.
+    # No mask propagation needed (only one Conv2d layer before the pool).
+    masking_mode: str = "zero_fill"
     backbone: BackboneConfig = field(
         default_factory=lambda: BackboneConfig(
             d_model=32, num_heads=2, head_dim=16, ffn_hidden=128,

@@ -93,6 +93,64 @@ class TestParamBudget:
         assert 250_000 <= total <= 320_000, f"got {total}, expected ~285k"
 
 
+class TestPartialConv:
+    """Partial-conv renormalization (Liu 2018) — masking_mode='partial_conv'."""
+
+    def test_equivalent_to_zero_fill_when_fully_active(self) -> None:
+        """All-active grid → mask_sum == k² everywhere → scale == 1 everywhere.
+        Memory must match bit-for-bit between zero_fill and partial_conv.
+        """
+        torch.manual_seed(0)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+
+        cfg_zero = PerPhonemeConfig()
+        cfg_part = replace(PerPhonemeConfig(), masking_mode="partial_conv")
+
+        model_zero = NeuralFieldPerceiverPerPhoneme(cfg_zero)
+        model_part = NeuralFieldPerceiverPerPhoneme(cfg_part)
+        # Copy weights so only the masking path differs.
+        model_part.load_state_dict(model_zero.state_dict())
+
+        model_zero.eval()
+        model_part.eval()
+        with torch.no_grad():
+            m_zero = model_zero.encode_memory(batch)
+            m_part = model_part.encode_memory(batch)
+        assert torch.allclose(m_zero, m_part, atol=1e-5)
+
+    def test_renormalizes_when_artifacts_present(self) -> None:
+        """With artifacts, partial_conv must diverge from zero_fill.
+        Specifically, positions with partially-valid RFs get scale > 1.
+        """
+        torch.manual_seed(0)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        active = batch["electrode_active_mask"].clone()
+        # Mark ~20% of electrodes as artifacts.
+        active[:, ::5] = False
+        batch["electrode_active_mask"] = active
+
+        cfg_zero = PerPhonemeConfig()
+        cfg_part = replace(PerPhonemeConfig(), masking_mode="partial_conv")
+
+        model_zero = NeuralFieldPerceiverPerPhoneme(cfg_zero)
+        model_part = NeuralFieldPerceiverPerPhoneme(cfg_part)
+        model_part.load_state_dict(model_zero.state_dict())
+
+        model_zero.eval()
+        model_part.eval()
+        with torch.no_grad():
+            m_zero = model_zero.encode_memory(batch)
+            m_part = model_part.encode_memory(batch)
+        assert not torch.allclose(m_zero, m_part, atol=1e-4)
+
+    def test_no_new_parameters(self) -> None:
+        """Partial-conv adds zero learnable params."""
+        n_zero = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme().parameters())
+        cfg_part = replace(PerPhonemeConfig(), masking_mode="partial_conv")
+        n_part = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme(cfg_part).parameters())
+        assert n_part == n_zero
+
+
 class TestOverfit:
     def test_ten_steps_drop_loss_by_at_least_0_1(self) -> None:
         """10 AdamW steps on a fixed batch should drive CE down by ≥0.1."""

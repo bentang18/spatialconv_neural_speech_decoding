@@ -67,6 +67,7 @@ def _build_config(
     use_parcel_embedding: bool = True,
     temporal_frontend: str = "per_cell",
     pool_method: str = "masked_mean",
+    masking_mode: str = "zero_fill",
 ) -> PerPhonemeConfig:
     from speech_decoding.v14.config import BackboneConfig, D1DecoderConfig, PoolConfig
 
@@ -86,6 +87,7 @@ def _build_config(
         use_parcel_embedding=use_parcel_embedding,
         temporal_frontend=temporal_frontend,
         pool_method=pool_method,
+        masking_mode=masking_mode,
         backbone=BackboneConfig(
             d_model=d_model, num_heads=num_heads, head_dim=16,
             ffn_hidden=4 * d_model, num_blocks=backbone_depth, dropout=0.1,
@@ -163,6 +165,7 @@ def run_one_fold_pooled(
     use_parcel_embedding: bool = True,
     temporal_frontend: str = "per_cell",
     pool_method: str = "masked_mean",
+    masking_mode: str = "zero_fill",
     label_smoothing: float = 0.0,
     mixup_alpha: float = 0.0,
     max_epochs: int | None = None,
@@ -225,6 +228,7 @@ def run_one_fold_pooled(
         use_parcel_embedding=use_parcel_embedding,
         temporal_frontend=temporal_frontend,
         pool_method=pool_method,
+        masking_mode=masking_mode,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
 
@@ -317,6 +321,7 @@ def run_one_fold_pooled(
         "use_parcel_embedding": use_parcel_embedding,
         "temporal_frontend": temporal_frontend,
         "pool_method": pool_method,
+        "masking_mode": masking_mode,
         "label_smoothing": label_smoothing,
         "mixup_alpha": mixup_alpha,
         "grad_accum_steps": effective_accum,
