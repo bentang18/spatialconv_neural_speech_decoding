@@ -170,6 +170,8 @@ def run_one_fold_pooled(
     patience: int | None = None,
     warmup_epochs: int | None = None,
     grad_accum_steps: int | None = None,
+    init_from: Path | None = None,
+    save_checkpoint: bool = False,
 ) -> dict:
     """Train one pooled model on ``datasets`` for one (fold, seed, depth).
 
@@ -225,6 +227,10 @@ def run_one_fold_pooled(
         pool_method=pool_method,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
+
+    if init_from is not None:
+        state = torch.load(init_from, map_location=device)
+        model.load_state_dict(state, strict=True)
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -284,6 +290,9 @@ def run_one_fold_pooled(
         fold_result = train_one_fold(
             model, train_loader, val_obj, log_callback=_log, **kw
         )
+
+    if save_checkpoint:
+        torch.save(model.state_dict(), out_dir / f"{tag}.ckpt.pt")
 
     # Per-patient test eval.
     per_patient_test: dict[str, dict[str, float]] = {}

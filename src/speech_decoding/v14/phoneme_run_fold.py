@@ -125,6 +125,8 @@ def run_one_fold(
     val_every: int | None = None,
     patience: int | None = None,
     warmup_epochs: int | None = None,
+    init_from: Path | None = None,
+    save_checkpoint: bool = False,
 ) -> dict:
     """Train + eval one `(fold, seed, depth, d_model)` per-phoneme run."""
 
@@ -159,6 +161,10 @@ def run_one_fold(
         pool_method=pool_method,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
+
+    if init_from is not None:
+        state = torch.load(init_from, map_location=device)
+        model.load_state_dict(state, strict=True)
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -210,6 +216,9 @@ def run_one_fold(
         fold_result = train_one_fold(
             model, train_loader, val_loader, log_callback=_log, **kw
         )
+
+    if save_checkpoint:
+        torch.save(model.state_dict(), out_dir / f"{tag}.ckpt.pt")
 
     test_per_phoneme = evaluate_per_phoneme(model, test_loader)
     test_slot_per = exhaustive_ar_per_from_loader(model, test_loader)

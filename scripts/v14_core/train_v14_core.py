@@ -198,6 +198,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument(
+        "--init-from",
+        type=Path,
+        default=None,
+        help="Optional .ckpt.pt path — load state_dict before training. Used "
+        "for LOPO pretrain → per-patient finetune.",
+    )
+    parser.add_argument(
+        "--save-checkpoint",
+        action="store_true",
+        help="Save best-val model state_dict as {tag}.ckpt.pt in --out-dir. "
+        "Used to produce LOPO pretrain checkpoints.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Smoke-test mode: 5 epochs, val every epoch, no early-stop. "
@@ -300,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
             mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,
             patient_id=args.patient,
+            init_from=args.init_from,
+            save_checkpoint=args.save_checkpoint,
             **smoke_kw,
         )
         tag = (
@@ -331,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
             out_dir=args.out_dir,
+            init_from=args.init_from,
+            save_checkpoint=args.save_checkpoint,
             **smoke_kw,
         )
         patient_slug = "_".join(sorted(pooled_patients))
