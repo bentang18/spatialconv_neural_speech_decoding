@@ -199,6 +199,51 @@ class TestReadoutModes:
         with pytest.raises(ValueError, match="requires temporal_frontend='per_cell'"):
             NeuralFieldPerceiverPerPhoneme(cfg)
 
+    def test_hierarchical_atlas_shapes(self) -> None:
+        cfg = replace(PerPhonemeConfig(), readout_mode="hierarchical_atlas")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_hierarchical_atlas_adds_only_temporal_query(self) -> None:
+        """Atlas-anchored cell query reuses the existing parcel embedding, so
+        it only adds the temporal query (d params) — no q_cell."""
+        n_base = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme().parameters())
+        cfg = replace(PerPhonemeConfig(), readout_mode="hierarchical_atlas")
+        n_h = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme(cfg).parameters())
+        assert n_h - n_base == 32
+
+    def test_hierarchical_atlas_rejects_flat_frontend(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(),
+            readout_mode="hierarchical_atlas",
+            temporal_frontend="flat",
+        )
+        import pytest
+        with pytest.raises(ValueError, match="requires temporal_frontend='per_cell'"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_hierarchical_atlas_rejects_no_parcel_embedding(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(),
+            readout_mode="hierarchical_atlas",
+            use_parcel_embedding=False,
+        )
+        import pytest
+        with pytest.raises(ValueError, match="use_parcel_embedding=True"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_hierarchical_atlas_compute_cell_query(self) -> None:
+        """compute_cell_query returns (B, n_cells, d) for hier_atlas, else None."""
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        cfg = replace(PerPhonemeConfig(), readout_mode="hierarchical_atlas")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        cq = model.compute_cell_query(batch)
+        assert cq is not None and cq.shape == (2, 32, 32)
+        model_base = NeuralFieldPerceiverPerPhoneme()
+        assert model_base.compute_cell_query(batch) is None
+
 
 class TestAttentionHeads:
     """Heads ablation — d=32 splits as 1×32, 2×16 (baseline), 4×8."""

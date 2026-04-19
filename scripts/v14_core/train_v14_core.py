@@ -191,12 +191,15 @@ def main(argv: list[str] | None = None) -> int:
         "--readout-mode",
         type=str,
         default="mean_pool",
-        choices=("mean_pool", "cls", "hierarchical"),
+        choices=("mean_pool", "cls", "hierarchical", "hierarchical_atlas"),
         help="Per-phoneme + pooled: decoder readout. 'mean_pool' (default, "
         "baseline) averages backbone memory across all tokens. 'cls' prepends "
         "a learnable CLS token before the backbone and reads position 0. "
         "'hierarchical' keeps the flat memory, reshapes to (cells, time), and "
-        "attention-pools time-per-cell then cells — +2·d learned params.",
+        "attention-pools time-per-cell then cells — +2·d learned params. "
+        "'hierarchical_atlas' (T3.1) replaces the free-learned cell-pool "
+        "query with an atlas-anchored query = pooled_support @ parcel_emb — "
+        "anatomy-indexed, not cell-indexed. Requires use_parcel_embedding.",
     )
     parser.add_argument(
         "--num-heads",

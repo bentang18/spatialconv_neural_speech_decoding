@@ -27,7 +27,7 @@ class TestExhaustiveARPER:
             def __init__(self):
                 super().__init__()
                 self.vocab_size = 9
-            def forward(self, memory, prev):  # noqa: ARG002
+            def forward(self, memory, prev, cell_query=None):  # noqa: ARG002
                 # memory[:, :, 0] encodes the label index; argmax on one-hot
                 # at that index.
                 idx = memory[:, 0, 0].long().clamp(0, 8)

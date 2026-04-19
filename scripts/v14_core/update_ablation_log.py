@@ -70,6 +70,8 @@ def _variant_suffix(r: dict) -> str:
     rm = r.get("readout_mode")
     if rm in ("cls", "hierarchical"):
         bits.append(rm)
+    elif rm == "hierarchical_atlas":
+        bits.append("hieratlas")
     if r.get("masking_mode") == "partial_conv":
         bits.append("partialconv")
     pe = r.get("spatial_pe_mode")

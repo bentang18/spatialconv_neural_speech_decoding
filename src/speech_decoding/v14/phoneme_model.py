@@ -55,19 +55,28 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 f"masking_mode must be 'zero_fill' or 'partial_conv', "
                 f"got {self.cfg.masking_mode!r}"
             )
-        if self.cfg.readout_mode not in ("mean_pool", "cls", "hierarchical"):
+        _RO_MODES = ("mean_pool", "cls", "hierarchical", "hierarchical_atlas")
+        if self.cfg.readout_mode not in _RO_MODES:
             raise ValueError(
-                f"readout_mode must be 'mean_pool', 'cls', or 'hierarchical', "
+                f"readout_mode must be one of {_RO_MODES}, "
                 f"got {self.cfg.readout_mode!r}"
             )
         if (
-            self.cfg.readout_mode in ("cls", "hierarchical")
+            self.cfg.readout_mode in ("cls", "hierarchical", "hierarchical_atlas")
             and self.cfg.temporal_frontend != "per_cell"
         ):
             raise ValueError(
                 f"readout_mode={self.cfg.readout_mode!r} requires "
                 f"temporal_frontend='per_cell' (no cell axis in "
                 f"{self.cfg.temporal_frontend!r})"
+            )
+        if (
+            self.cfg.readout_mode == "hierarchical_atlas"
+            and not self.cfg.use_parcel_embedding
+        ):
+            raise ValueError(
+                "readout_mode='hierarchical_atlas' requires "
+                "use_parcel_embedding=True (cell_query = pooled_support @ P_emb)"
             )
         _PE_MODES = (
             "none",
@@ -114,10 +123,10 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                     "spatial_path='per_electrode' is incompatible with "
                     f"spatial_pe_mode={self.cfg.spatial_pe_mode!r} (no grid axis)"
                 )
-            if self.cfg.readout_mode == "hierarchical":
+            if self.cfg.readout_mode in ("hierarchical", "hierarchical_atlas"):
                 raise ValueError(
-                    "spatial_path='per_electrode' is incompatible with "
-                    "readout_mode='hierarchical' (no cell axis)"
+                    f"spatial_path='per_electrode' is incompatible with "
+                    f"readout_mode={self.cfg.readout_mode!r} (no cell axis)"
                 )
         if self.cfg.electrode_pe_mode not in ("none", "fourier_mni", "distance_bias"):
             raise ValueError(
@@ -268,8 +277,42 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
 
         return self._forward_memory(batch)
 
-    def decode(self, memory: torch.Tensor, prev_phoneme: torch.Tensor) -> torch.Tensor:
-        return self.decoder(memory, prev_phoneme)
+    def compute_cell_query(self, batch: dict) -> torch.Tensor | None:
+        """Atlas-anchored cell query for `hierarchical_atlas` readout.
+
+        Returns `(B, n_cells, d)` = pooled_support @ parcel_embedding, or
+        `None` for other readout modes. Exposed so exhaustive-AR eval can
+        cache the query alongside memory and pass it into each decoder call.
+        """
+
+        if self.cfg.readout_mode != "hierarchical_atlas":
+            return None
+        assert self.parcel_embedding is not None, "validator enforces this"
+        support: torch.Tensor = batch["support"]                 # (B, N_e, 15)
+        layout: torch.Tensor = batch["electrode_grid_layout"]    # (B, N_e, 2)
+        active: torch.Tensor = batch["electrode_active_mask"]    # (B, N_e) bool
+        grid_shape: tuple[int, int] = batch["electrode_grid_shape"]
+        pp = precompute_pool(
+            layout[0].to("cpu"),
+            active[0].to("cpu"),
+            grid_shape,
+            self.cfg.pool.pool_shape,
+        )
+        cell_of_electrode = pp.cell_of_electrode.to(support.device)
+        active_count = pp.active_count.to(support.device)
+        pooled_support = masked_mean_pool(
+            support, cell_of_electrode, active[0], active_count,
+            dim=1, n_cells=pp.n_cells,
+        )                                                        # (B, n_cells, 15)
+        return pooled_support @ self.parcel_embedding            # (B, n_cells, d)
+
+    def decode(
+        self,
+        memory: torch.Tensor,
+        prev_phoneme: torch.Tensor,
+        cell_query: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.decoder(memory, prev_phoneme, cell_query=cell_query)
 
     def _forward_memory(self, batch: dict) -> torch.Tensor:
         if self.cfg.spatial_path == "per_electrode":
@@ -572,4 +615,5 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
 
     def _forward_logits(self, batch: dict) -> torch.Tensor:
         memory = self._forward_memory(batch)
-        return self.decoder(memory, batch["prev_tokens"])
+        cell_query = self.compute_cell_query(batch)
+        return self.decoder(memory, batch["prev_tokens"], cell_query=cell_query)
