@@ -1,7 +1,7 @@
 """Configuration dataclasses for Neural Field Perceiver v14 (B-1).
 
 Every numeric default here tracks a frozen Phase-1 contract in
-``docs/implementation_tasks.md`` (with the 2026-04-16 late ``[AMENDED]``
+``docs/tactics.md`` (with the 2026-04-16 late ``[AMENDED]``
 markers) and ``docs/v14_core_contract_amendment_2026-04-16.md``. Blockers
 cited per field. No speculative defaults; no Phase-2 leash constants
 carried as live Phase-1 values (per ``#15``).

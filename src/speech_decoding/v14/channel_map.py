@@ -3,7 +3,7 @@
 Single source of truth for the channel-map layer of the loader. Used by the
 Phase-A2 verifier, the B1 `V14TrialDataset`, and the E1 CLI.
 
-Bridge contracts (per `docs/implementation_tasks.md` #12):
+Bridge contracts (per `docs/tactics.md` #12):
 
 - **128-strip (Map 4)**: `data/channel_maps/<pt>_channelMap.mat` contains an
   8×16 int array `chanMap`. `amp → (r, c)` where `chanMap[r, c] == amp`;

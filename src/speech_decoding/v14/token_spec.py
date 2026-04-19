@@ -66,7 +66,7 @@ def assert_token_spec_frozen() -> None:
         raise RuntimeError(
             "token_spec is still provisional — blocker #4 must close before "
             "DEFAULT_BASE_PARCELS / DEFAULT_SPLIT_COUNTS may enter a v14 code "
-            "path. See docs/implementation_tasks.md #4."
+            "path. See docs/tactics.md #4."
         )
 
 

@@ -1,6 +1,6 @@
 # P1 cohort summary — phoneme-level `.fif` audit
 
-**Plan:** `docs/plans/v14-core-current.md` → P1. **Date:** 2026-04-17.
+**Plan:** `docs/archive/plans/v14-core-current_implemented_2026_04_17.md` → P1. **Date:** 2026-04-17.
 
 Reuses the `#34` audit artifacts at `reports/phoneme_audit_2026_04_16/`. No re-run was required — every predicate P1 names is a strict subset of the `#34` check set, and the four must-pass checks (`fif_window_contains_target`, `event_id_is_9_ps_phonemes`, `per_trial_token_reconstruction`, `signal_finite`) pass on all 7 Phase-1 LH patients.
 

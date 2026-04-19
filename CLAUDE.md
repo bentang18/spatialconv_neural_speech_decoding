@@ -11,13 +11,13 @@ Extending Spalding 2025 (PCA+CCA, SVM/Seq2Seq, 8 patients, 9 phonemes, 0.31 bal.
 
 ## Current Direction: Neural Field Perceiver (v14) — Intracranial Foundation Model
 
-**Design doc**: `docs/neural_field_perceiver_v14.tex`. **Per-patient tables and data reference**: `docs/data_reference.md`. **Live status**: `docs/current_direction.md`. **Open work**: `docs/implementation_tasks.md`. **Results log**: `docs/experiments/v14_ablation_log.csv`.
+**Objectives / program hypothesis + stage roadmap**: `docs/objectives.md`. **Strategy / per-stage architecture + scoreboard**: `docs/strategy.md` (index) → `docs/strategy/stage_<N>.md` (current: `stage_1.md`). **Tactics / task list**: `docs/tactics.md`. **Per-patient tables and data reference**: `docs/references/data_reference.md`. **Results log**: `docs/experiments/v14_ablation_log.csv`. Historical design doc (pre-B-1-amendment): `docs/archive/design_docs/neural_field_perceiver_v14.tex`.
 
 **Two-problem decomposition** (atlas calibration + shared dynamics):
 - **Problem 1 — Calibration** (per-patient, physics-constrained): raw electrodes → atlas-grounded regional tokens via Brainnetome surface parcellation on fsaverage (`#36`). Atlas does ~90% of calibration; supervised gradient refines ~10% (Phase 2+).
 - **Problem 2 — Dynamics** (shared, unconstrained ML): regional tokens → phoneme sequence via a small relational-temporal transformer + AR decoder. Same representation for every patient.
 
-**Phase 1 architecture as implemented** (per-phoneme path, plan `docs/plans/v14-core-current.md`):
+**Phase 1 architecture as implemented** (per-phoneme path, historical implementation plan `docs/archive/plans/v14-core-current_implemented_2026_04_17.md`; current Stage-1 default + frozen contract at `docs/strategy/stage_1.md`):
 ```
 signal (B, N_e, 130) at 200 Hz, phoneme-centered window [-0.15, 0.5)s
 → grid-scatter (B, 1, H_p, W_p, 130)
@@ -51,9 +51,11 @@ The Phase-2+ target is the `B-1` per-electrode-token path without the `(4, 8)` p
 
 **Near-term sequencing**:
 - Phase 1: supervised `v14-core` on response-locked `uECoG`
-- Phase 1.5: SSL on the full continuous `uECoG` corpus
+- Phase 1.5: SSL on the full continuous `uECoG` corpus + supervised expansion on lexical
 - Phase 2: learned per-patient calibration
 - Only after that: `sEEG`, external datasets, and broader scaling
+
+**Phase 1.5 corpus** (audit 2026-04-18, details in `docs/references/data_reference.md`): PS intra-op uECoG = **2.83 h / 11 pts**; lexical raw corpus (`lex_bids_root` in `configs/paths.yaml`, zero PS overlap) = **3.96 h / 16 pts (S41–S81)**. Combined raw = 6.79 h / 27 disjoint. **Projectable today = 3.57 h / 14 pts (11 PS + 3 lex: S76/S78/S81) — FreeSurfer recons for the other 13 lexical patients are not on Box or DCC, blocking fsaverage projection. Ask Zac.** Lexical uses 28-ARPABET (8-phoneme PS intersection); phoneme-level `.fif` exists for 15/16 (S71 has split-role events.tsv, merge + MFA needed to regen). Zac's pre-computed CCA cross-patient decoders (PS→lex, within-lex, patient-specific _p1.._p5) sit under `derivatives/decoding/` — S73 is the transfer anchor (PS-aligned CCA p1 = 0.351; chance 1/28 = 0.036).
 
 **v14 is the sole active direction.** v12 (cross-attention + distance bias + Fourier PE), Conv2d pipeline, JEPA, LeWM, LOPO autoresearch — all discontinued. SSL planning, historical literature, and data-scaling notes live under `docs/archive/`.
 
@@ -69,7 +71,7 @@ Every piece of the pipeline — raw voltages through phoneme decode — follows 
 4. **No pre-committed numeric defaults.** Window sizes, `d_model`, stride, hidden widths, thresholds, split counts — all justified before they enter the code, not after.
 5. **Rewrite from scratch when needed.** No file or design is sacred. If it turns out handwavy, rewrite — don't patch.
 6. **No legacy reuse, ever.** Pre-v14 code lives under `src/speech_decoding/archive/legacy/` and fails `import` from active code — `tests/v14/test_no_legacy_imports.py` enforces this. If a legacy helper looks useful, re-derive it fresh inside `src/speech_decoding/v14/`. Never `git mv` anything out of `archive/legacy/`. This is the only place the no-legacy rule is stated; treat it as canonical.
-7. **Freeze blockers before coding.** See `docs/implementation_tasks.md`. Do not implement a component while its blockers are open.
+7. **Freeze blockers before coding.** See `docs/tactics.md`. Do not implement a component while its blockers are open.
 8. **Prefer standard, scalable contracts when they do not compromise Phase 1 correctness.** If two choices are equally valid for Phase 1, choose the one that keeps a cleaner path to cross-task use, external datasets, and broader scaling. Do not add speculative infrastructure early, but do avoid Phase-1-only conventions when a standard reusable contract works just as well.
 
 This applies to every logic step: channel indices, channel-to-electrode bookkeeping, coordinate-frame verification, Brainnetome PM lookup, per-electrode support, grid scatter, soft parcel embedding, temporal front-end, combined attention backbone, AR decoder, loss, eval split, metrics. No step is too obvious to skip.
@@ -122,6 +124,9 @@ On any bug or test failure: read the full error, reproduce it, check recent chan
 ### 7. No performative agreement on pushback
 When the user questions a design or pushes back, do not capitulate with "You're absolutely right!" and start rewriting. Restate the technical point in your own words, verify against the codebase, and push back with reasoning if the feedback is wrong for this context. Technical correctness over social comfort.
 
+### 8. Empirical iteration over armchair design
+You cannot think your way to a perfect design. Only building and testing, over many iterations, can reveal the flaws in your mental model and provide the feedback you need to create the best design possible. This is the corollary to "Discuss Before Code": discussion surfaces the known unknowns and the contract, but once that is done, *run the experiment*. Each round of real-data feedback — ablation deltas, LOPO transfer numbers, loss curves — is more informative than another round of pure reasoning. When a brainstorm starts producing increasingly elaborate architectures stacked on shaky citations or internal contradictions, that is the signal to stop reasoning and go measure. Thinking narrows the hypothesis space; experiments collapse it.
+
 ## Environment
 
 - **Python ≥3.11, managed via `uv`.** `pyproject.toml` + `uv.lock` are authoritative.
@@ -129,7 +134,7 @@ When the user questions a design or pushes back, do not capitulate with "You're 
 - **Tests**: `.venv/bin/python -m pytest tests/ -q`. The suite is intentionally tiny — only `test_phoneme_map.py`, `test_grouped_cv.py`, and everything under `tests/v14/`. New tests live under `tests/v14/` once the underlying component is discussed and written.
 - **Key deps**: `torch ≥2.0`, `mne`, `mne-bids`, `transformers`. Full list in `pyproject.toml`.
 - **Machine-specific BIDS paths** live in `configs/paths.yaml` (gitignored).
-- **All training on DCC, never local.** See `docs/dcc_setup.md`.
+- **All training on DCC, never local.** See `docs/references/dcc_setup.md`.
 
 ## Best Per-Patient Results (baseline for v14 to beat)
 
@@ -175,32 +180,50 @@ Previous baselines: LOPO best 0.750, per-patient full-trial 0.737, LOPO pilot 0.
 - **Do not confuse `S<num>` with `D<num>`**: `ECoG_Recon/` also contains unrelated `D<num>` folders from a different Duke cohort (`D14` is 120 electrodes, not the same person as `S14`). Always use `S<num>`.
 - **Avoid the `_old`, `_no_tkr`, `_kumar`, `_diag`, `_med` sibling folders** (e.g. `S14_old`, `S14_no_tkr`). These are alternative reconstructions kept for history and are not the current trusted version. Read from the plain `S<num>/` folder.
 
-### Active docs
-- `docs/current_direction.md` — where we are now (post-P8, ablations underway, P9 pending)
-- `docs/implementation_tasks.md` — live status summary + active work items
-- `docs/plans/v14-core-current.md` — implementation plan with verification checks (P1–P9)
-- `docs/data_reference.md` — per-patient tables: array layouts, sig/artifact channel counts, Brainnetome parcel list, raw-corpus sizes
-- `docs/experiments/v14_ablation_log.csv` — live experiment results log (updated by `scripts/v14_core/update_ablation_log.py`)
-- `docs/dcc_setup.md` — DCC cluster setup
-- `docs/neural_field_perceiver_v14.tex` — v14 design document (historical, pre-B-1-amendment; being rewritten)
-- `docs/questions.md` — unresolved architectural questions (thinking doc)
-- `docs/qc/phoneme_level_fif_audit_cohort.md` — #34 cohort audit results
-- `docs/qc/coord_bridge_verification.md` — #12 bridge verification
-- `docs/qc/support_cache_v2c_snap_qc_report.md` — current support-cache QC
+### Docs organization (STRICT — enforce, don't dilute)
+
+`/docs` is organized as Sun Tzu's three layers: **objectives → strategy → tactics**. Exactly **three working docs** exist; everything else is reference or archive. Do not add a fourth working doc.
+
+**Working docs (the triad):**
+- `docs/objectives.md` — **OBJECTIVES**: program hypothesis, stage roadmap, evaluation philosophy, stage-advance gates. Stage-stable.
+- `docs/strategy.md` (index) + `docs/strategy/stage_<N>.md` (per-stage) — **STRATEGY**: default architecture, frozen contract, patient scope, live scoreboard, rejected paths, discipline — scoped to that stage only. Revision-prone. **A Stage-N strategy doc is written only when Stage-(N−1) has concluded enough to define the architectural entry point.** Do not pre-write downstream stages.
+- `docs/tactics.md` — **TACTICS**: concrete task list, in-flight jobs, post-landing actions, blockers. Refreshed when jobs land.
+
+**Rule: do not create additional planning, tracker, or status docs under `/docs`.** Extend the relevant triad doc instead. Doc surplus breaks the organization and causes stale duplicates (we have paid this cost multiple times — see archived `v14_next_steps_2026_04_19_morning.md` and `decision_gate_2026_04_19_snapshot.md`). When tempted to create a new planning doc, ask: "which triad layer is this? Why doesn't it live there?"
+
+**Reference docs** (static, consult as needed):
+- `docs/references/data_reference.md` — per-patient tables: array layouts, sig/artifact channel counts, Brainnetome parcel list, raw-corpus sizes.
+- `docs/references/dcc_setup.md` — DCC cluster setup, rsync recipes, submission workflow.
+- `docs/experiments/v14_ablation_log.csv` — authoritative raw results (updated by `scripts/v14_core/update_ablation_log.py`).
+- `docs/qc/` — short per-check QC reports (coord bridge `#12`, support cache v2c, phoneme audit `#34`).
+- `docs/figures/` — generated images + HTML interactives.
+- `docs/README.md` — thin index enforcing the triad + reference layout.
 
 ### Archived but useful
-- `docs/archive/sessions/` — 2026-04-16/17 session logs (cras fix, kernel ablation, #36 handoff, B-1 amendment, slack draft)
-- `docs/archive/plans/` — superseded plan drafts (`v14-core.md`, per-phoneme draft, open-notes)
-- `docs/archive/qc_old_caches/` — pre-v2c support-cache QC reports
-- `docs/archive/implementation_tasks_archived.md` — pre-closure blocker log (Apr 14)
-- `docs/archive/implementation_tasks_2026-04-16_post-closure.md` — all-closed blocker log (2026-04-16 late)
-- `docs/archive/experiment_log.md` — 101-finding experiment history
-- `docs/archive/research_synthesis.md` — 19-paper literature synthesis
-- `docs/archive/reading_list.md`, `docs/archive/literature_findings.md` — historical literature and data-scaling context
+- `docs/archive/sessions/` — 2026-04-16/17 session logs (cras fix, kernel ablation, #36 handoff, B-1 amendment, slack draft).
+- `docs/archive/plans/` — superseded plan drafts (`v14-core.md`, per-phoneme draft, open-notes, `v14-core-current_implemented_2026_04_17.md` = shipped P1–P9 plan, `v14_next_steps_2026_04_19_morning.md` = pre-T3.6 plan).
+- `docs/archive/experiments/decision_gate_2026_04_19_snapshot.md` — absorbed into `docs/strategy/stage_1.md` §Current scoreboard; snapshot kept for audit trail.
+- `docs/archive/design_docs/neural_field_perceiver_v14.{tex,pdf}` — pre-B-1-amendment design document (historical reference only).
+- `docs/archive/qc_old_caches/` — pre-v2c support-cache QC reports.
+- `docs/archive/implementation_tasks_archived.md` — pre-closure blocker log (Apr 14).
+- `docs/archive/implementation_tasks_2026-04-16_post-closure.md` — all-closed blocker log (2026-04-16 late).
+- `docs/archive/experiment_log.md` — 101-finding experiment history.
+- `docs/archive/research_synthesis.md` — 19-paper literature synthesis.
+- `docs/archive/reading_list.md`, `docs/archive/literature_findings.md` — historical literature and data-scaling context.
 
 ### Configs & scripts
 - `configs/paths.yaml` — machine-specific BIDS paths (gitignored). On DCC: `ps_bids_root=/work/ht203/data/BIDS`, `support_cache_dir=/work/ht203/data/atlas/support_cache_v2c_snap`, `channel_maps_dir=/work/ht203/data/channel_maps`.
-- `scripts/v14_core/` — active v14 CLI + sbatch wrappers (see Code Structure above).
+- `scripts/v14_core/` — active v14 CLI + hand-written sbatch wrappers (see Code Structure above).
+- `scripts/ablation/` — **default tooling for new ablations + DCC interaction.** Seven CLIs, all with `--help`:
+    - `submit.py --name X --mode {per-phoneme|pooled|slot} --patient(s) ... --folds 0-4 --seeds 0-2 --flag k=v ...` — renders a sbatch from a CLI spec, rsyncs the repo to DCC, sbatches, prints `job_id=…  sbatch=…  jobs=…  out=…`. Bare flags use empty value (`--flag no-parcel-embedding=`). `--dry-run` prints the sbatch without submitting.
+    - `status.py [job_id ...]` — one line per job: `done/run/pend/fail` from `squeue` + `sacct`. Failed tasks decoded back to `fold=…,seed=…`. Empty arg list reads `.ablation_submissions.jsonl`.
+    - `logs.py <job_id> [--task N | --grep PAT | --failed | --stream | --tail N]` — peeks `.out`/`.err` from `/work/ht203/logs/v14core/`. Default tail = 30 lines, never dumps full files.
+    - `collect.py [job_ids ...] [--all] [--no-aggregate]` — rsyncs `*.result.json` to `/tmp/v14_results/<name>/`, then runs `update_ablation_log.py` to append to `docs/experiments/v14_ablation_log.csv`.
+    - `query.py [--patient X] [--d N] [--depth N] [--k N] [--pool HxW] [--status STATE] [--job JOB] [--recent N]` — slice the ablation CSV without reading the whole file. S14 baseline cell shown automatically when filtering S14.
+    - `dcc_sync_check.py [--strict]` — verifies `local HEAD == DCC HEAD == origin`, lists DCC dirty files. Run before any submit; use `--strict` to gate scripts.
+    - `peek.py <job_id> [--task N | --fold F --seed S | --all]` — `cat` one or more `result.json` files from DCC over ssh without rsyncing the tree. Useful for spot-checking mid-flight runs.
+    - Each submission is recorded in `.ablation_submissions.jsonl` (gitignored) so the helpers can decode task ids back to (fold, seed). Generated sbatch wrappers land under `scripts/v14_core/_gen/` (gitignored). Shared plumbing in `_common.py` (DCC host, paths, `ssh()`/`rsync_repo()`/parsers).
+    - Use these instead of cloning a hand-written wrapper for routine ablations — keep the hand-written `scripts/v14_core/v14_*_dcc.sh` for non-standard array math (multi-cell cross-products, LOPO pretrain→finetune chains).
 - Pre-v14 YAMLs live in `configs/archive/`; pre-v14 CLIs live in `scripts/archive/legacy/`.
 
 ## Code Structure (Phase 1 implementation live, 2026-04-17)
@@ -277,7 +300,7 @@ support[N_e, 15]                   # float32, raw BNA probability over Tier-1 (#
 
 **B-1-full trial-level loader** (`dataset.py`) — trial-level `.fif` from `derivatives/epoch(CAR)/...`, `[-0.5, 1.0)` s, 300 samples, slot-CE over 3 phoneme positions. Kept but deprecated for the per-phoneme path; will be revisited for Phase-2+ per-electrode-token experiments.
 
-Channel inclusion is all non-artifact channels (`#11`); sig-channel masks are ablation-only. `#34` closed 2026-04-16. `support` comes from the per-electrode Tier-1 cache `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv` (built once per patient; see `docs/plans/v14-core-current.md`). Per-patient sig/artifact channel counts and array layouts live in `docs/data_reference.md`.
+Channel inclusion is all non-artifact channels (`#11`); sig-channel masks are ablation-only. `#34` closed 2026-04-16. `support` comes from the per-electrode Tier-1 cache `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv` (built once per patient; see `docs/archive/plans/v14-core-current_implemented_2026_04_17.md`). Per-patient sig/artifact channel counts and array layouts live in `docs/references/data_reference.md`.
 
 ### Electrode coordinates
 
@@ -305,7 +328,7 @@ Event-id mapping asserted under `#18`: `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k'
 
 ## Compute: Duke DCC cluster
 
-**Use DCC for all training.** Full docs: `docs/dcc_setup.md`.
+**Use DCC for all training.** Full docs: `docs/references/dcc_setup.md`.
 
 - **SSH**: `ssh ht203@dcc-login.oit.duke.edu`
 - **GPU**: 8× RTX 5000 Ada (32 GB) on `coganlab-gpu`
@@ -317,14 +340,14 @@ Event-id mapping asserted under `#18`: `{'a':1, 'ae':2, 'b':3, 'g':4, 'i':5, 'k'
 
 ## Preprocessing Pipeline (do not change)
 
-Decimate 2kHz → CAR → impedance exclusion (log10>6) → 70-150Hz Gaussian filterbank (8 bands) → Hilbert envelope → sum → 200Hz → z-score → significant channel selection. Implemented in `coganlab/IEEG_Pipelines`.
+Decimate 2kHz → CAR → impedance exclusion (log10>6) → 70-150Hz Gaussian filterbank (8 bands) → Hilbert envelope → sum → 200Hz → z-score → significant channel selection. Implemented in `coganlab/IEEG_Pipelines`. **Z-score is per-channel mean/std pooled across ALL pre-auditory baseline trials + samples** (500 ms window immediately before auditory-stim onset, perception-locked; empirically verified 2026-04-18 via reconstruction test on 7 patients, corr=1.0000). NOT per-trial and NOT pre-production. **Recording-level median/MAD ≡ this recipe up to per-channel affine (ρ=1.0000 across tested patients)** — Phase-1.5 SSL can swap recipes without bit-exact equivalence constraints; details in `docs/references/data_reference.md`.
 
 ## Completed Exploration (summary)
 
 Full experiment history in `docs/archive/experiment_log.md`.
 
 - **LOPO** (55 experiments): Converged to PER 0.750–0.780 on S14. Measurement ceiling from fixed CV folds.
-- **SSL / NCA-JEPA**: All methods near-chance on ~11 min epoched data. CoganLab-only SSL limited (~24h, intra-op data quality). Primary plan: external chronic ECoG (Flinker 48 pts, Chang ~15-25 pts), 50–100h of diverse speech, contingent on PI-level data access. Fallback: CoganLab sEEG + uECoG (~24h).
+- **SSL / NCA-JEPA**: All methods near-chance on ~11 min epoched data. Corpus audit 2026-04-18 (`docs/references/data_reference.md`): raw intra-op uECoG is **2.83 h PS + 3.96 h lexical = 6.79 h on 27 disjoint patients**; fsaverage-projectable today is **3.57 h / 14 patients** pending 13 missing lexical FreeSurfer recons. Continuous/epoched ≈ 1× (SSL is a representation-structure bet, not data expansion). External chronic ECoG remains the volume plan (Flinker 48 pts, Chang ~15-25 pts, 50–100h), contingent on PI-level access.
 - **Per-patient tuning**: CTC→CE (+7.8pp), pool(2,4)→pool(4,8), stride=10, H=32 sufficient.
 - **Per-phoneme MFA sweep** (2026-04-04): Per-phoneme flat (0.734) beats learned attention (0.797) and full-trial (0.807). Generalizes 8/11 patients.
 
@@ -333,4 +356,5 @@ Full experiment history in `docs/archive/experiment_log.md`.
 - **Write simply.** Ordinary words. Short sentences. No throat-clearing, no redundant qualifiers, no ceremonial preambles. Cut is the main edit. Applies to all docs, commit messages, PR descriptions, memory files, and chat responses. Paul Graham's "Write Simply" is the reference. Code comments stay minimal (default: none).
 - **Discuss logic before writing code.** See Working Principle above.
 - **All training on DCC, never local.**
-- **Every architectural change reports both pooled joint AND LOPO warm-start** (see "Canonical experimental protocol" in `docs/current_direction.md`). LOPO warm-start is the foundation-model test — load-bearing for Phase 1.5 SSL, Phase 2+ cross-sensor transfer, and external-corpus transfer. Single-protocol evidence does not justify defaulting an arch change.
+- **Every architectural change reports both pooled joint AND LOPO warm-start** (see "Canonical experimental protocol" in `docs/objectives.md`). LOPO warm-start is the foundation-model test — load-bearing for Phase 1.5 SSL, Phase 2+ cross-sensor transfer, and external-corpus transfer. Single-protocol evidence does not justify defaulting an arch change.
+- **Always aggregate experiment results into `docs/experiments/v14_ablation_log.csv`.** Every finished DCC run lands in the CSV. Treat unaggregated `result.json` files as *at risk* — `/work/ht203` auto-purges after 75 days and the CSV is the only long-term record. Workflow: when a job (or coherent subset) finishes, pull results and run the aggregator — `scripts/ablation/collect.py <job_ids>` for submissions in `.ablation_submissions.jsonl`, or rsync the results dir to `/tmp/v14_full_mirror` and run `.venv/bin/python scripts/v14_core/update_ablation_log.py --results-root /tmp/v14_full_mirror --csv docs/experiments/v14_ablation_log.csv` for hand-written sbatches (LOPO stages, etc.). If an ablation introduces a new hyperparameter dimension (readout mode, masking mode, new PE, new aug preset, etc.), extend `_variant_suffix()` in `update_ablation_log.py` *before* the first result lands, or the aggregator silently collides new runs into the canonical cell and clobbers the baseline. For LOPO stages the standard aggregator can't express (e.g., flat LOPO pretrain vs Q1a 4-core pretrain), append by hand with a distinctive `experiment_id` + `patient` suffix. Never defer — a forgotten aggregation is a forgotten experiment.

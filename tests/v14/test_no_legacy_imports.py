@@ -73,7 +73,7 @@ def test_v14_module_has_no_legacy_imports(source_path: Path) -> None:
     assert not offenders, (
         f"{source_path.relative_to(_REPO_ROOT)} imports legacy path(s) "
         f"{offenders}. v14 must not reuse pre-pivot code. Rewrite fresh "
-        f"under src/speech_decoding/v14/ per docs/current_direction.md."
+        f"under src/speech_decoding/v14/ per docs/objectives.md."
     )
 
 

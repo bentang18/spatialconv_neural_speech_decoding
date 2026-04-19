@@ -1,6 +1,6 @@
 """ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
 
-Per `#36` in `docs/implementation_tasks.md`, the active Phase-1 patient-side
+Per `#36` in `docs/tactics.md`, the active Phase-1 patient-side
 projection is `src/speech_decoding/v14/fsaverage_projection.py` (stock pial +
 sphere.reg → fsaverage). This module is kept as the cvs_avg35 migration
 oracle: it feeds `scripts/compare_fsaverage_spatial_parity.py` and has an
@@ -28,7 +28,7 @@ algorithm has four steps per hemisphere:
 
 The projection is not an affine transform. It is a nonlinear surface
 registration; the output of step 4 is constrained to lie on the average
-subject's outer-smoothed pial envelope. See ``docs/implementation_tasks.md``
+subject's outer-smoothed pial envelope. See ``docs/tactics.md``
 blocker #1 for the full context and the post-trust PM coverage spot check.
 
 Output is keyed by electrode *name* (from ``<pt>.electrodeNames``), not by

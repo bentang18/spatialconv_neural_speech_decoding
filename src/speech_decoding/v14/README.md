@@ -1,6 +1,6 @@
 # v14 Package Layout
 
-This package is the implementation boundary for the current Phase-1 architecture. The B-1 architecture amendment (2026-04-16 late) retired the within-parcel Perceiver summarizer and per-parcel pooled tokens in favor of per-electrode tokens with soft parcel embedding; the subsequent per-phoneme rework (2026-04-17) replaced the trial-level slot-CE path with a per-phoneme MFA-aligned pipeline for Phase 1. See `docs/plans/v14-core-current.md` for the current plan and `CLAUDE.md` → Code Structure for the per-file breakdown.
+This package is the implementation boundary for the current Phase-1 architecture. The B-1 architecture amendment (2026-04-16 late) retired the within-parcel Perceiver summarizer and per-parcel pooled tokens in favor of per-electrode tokens with soft parcel embedding; the subsequent per-phoneme rework (2026-04-17) replaced the trial-level slot-CE path with a per-phoneme MFA-aligned pipeline for Phase 1. See `docs/strategy/stage_1.md` for the current Stage-1 default architecture, frozen contract, and live scoreboard, and `CLAUDE.md` → Code Structure for the per-file breakdown. The shipped P1–P9 implementation record lives at `docs/archive/plans/v14-core-current_implemented_2026_04_17.md`.
 
 ## Active modules (per-phoneme Phase-1 path)
 

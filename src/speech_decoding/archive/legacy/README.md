@@ -24,7 +24,7 @@ Each of these modules silently embeds a pre-pivot contract that would corrupt v1
 - right-hemisphere mirror_to_left hack that is wrong for volumetric parcel lookups
 - SSL objectives designed around electrode neighborhoods, not atlas tokens
 
-See `docs/current_direction.md`, `docs/implementation_tasks.md`, and memory file `project_v14_phase1_contract_2026_04_13.md` for the Phase-1 contract and the active blocker list.
+See `docs/objectives.md`, `docs/tactics.md`, and memory file `project_v14_phase1_contract_2026_04_13.md` for the Phase-1 contract and the active blocker list.
 
 ## If you need functionality from here
 

@@ -4,7 +4,7 @@ Contract-neutral label-space utilities only. This file must not grow into
 a supervision-contract file. In particular:
 
 - no label -> integer index mapping (that is a v14 decoder decision; see
-  `docs/implementation_tasks.md` blocker #16)
+  `docs/tactics.md` blocker #16)
 - no CTC helpers (v14 does not use CTC)
 - no articulatory feature matrix (v12 articulatory head is not used)
 

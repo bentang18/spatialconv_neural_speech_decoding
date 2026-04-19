@@ -1,4 +1,13 @@
-"""Dilate BNA PM outward by Euclidean nearest-neighbor up to d_max mm.
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+Per `#36` in `docs/tactics.md`, the active Phase-1 spatial base
+is the fsaverage surface bake from `scripts/bake_bna_on_fsaverage.py`. The
+8 mm PM dilation was retired by `#36`; this script is kept only to reproduce
+the oracle `BNA_PM_dilated_8mm.nii.gz` volume used by
+`scripts/compare_fsaverage_spatial_parity.py`. Do not use its output as a
+Phase-1 representation.
+
+Dilate BNA PM outward by Euclidean nearest-neighbor up to d_max mm.
 
 Rationale (2026-04-14):
 cvs_avg35_inMNI152/lh.pial extends 2-5 mm beyond where BNA's cortical

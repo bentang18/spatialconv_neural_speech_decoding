@@ -2,7 +2,7 @@
 
 Closes blocker `#34`. The gate is deterministic per-patient and must return
 `pass` (or `warn with workaround`) on every core patient before the v14-core
-loader is written. See `docs/implementation_tasks.md` #34.
+loader is written. See `docs/tactics.md` #34.
 
 Ground truth (settled 2026-04-16 during S14 pilot):
 - `eventsOLD.tsv` is the authoritative trial/timing/token source for PS uECoG.

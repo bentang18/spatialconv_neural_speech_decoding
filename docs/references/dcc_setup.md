@@ -95,6 +95,60 @@ scancel <job_id>                   # Cancel
 tail -f /work/ht203/logs/my_job_<id>.out  # Live output
 ```
 
+### Ablation tooling — `scripts/ablation/` (preferred entry point)
+
+For routine ablations (single mode, single patient or pooled set, fold × seed
+cross-product, flag overrides) reach for `scripts/ablation/` instead of cloning
+a hand-written sbatch. Seven small CLIs, all `--help`-documented:
+
+```bash
+# Pre-flight: verify local repo == DCC repo
+scripts/ablation/dcc_sync_check.py
+
+# Submit a new ablation cell
+scripts/ablation/submit.py \
+    --name q1e_d64 \
+    --mode per-phoneme --patient S14 \
+    --folds 0-4 --seeds 0-2 \
+    --flag d_model=64 --flag backbone-depth=5 \
+    --walltime 8:00:00 --mem 32G
+# → job_id=12345  sbatch=scripts/v14_core/_gen/q1e_d64_dcc.sh  jobs=15  out=/work/ht203/results/v14_per_phoneme/_gen/q1e_d64
+
+# Monitor (one line per job)
+scripts/ablation/status.py 12345
+scripts/ablation/status.py             # all known submissions
+
+# Peek at logs without dragging full files into context
+scripts/ablation/logs.py 12345                  # tail of task 0 .out + .err
+scripts/ablation/logs.py 12345 --task 7
+scripts/ablation/logs.py 12345 --grep ERROR
+scripts/ablation/logs.py 12345 --failed
+scripts/ablation/logs.py 12345 --stream         # tail -f via ssh
+
+# Spot-check one result.json over ssh (no rsync)
+scripts/ablation/peek.py 12345 --fold 2 --seed 1
+scripts/ablation/peek.py 12345 --all
+
+# Pull results back + run aggregator → docs/experiments/v14_ablation_log.csv
+scripts/ablation/collect.py 12345
+
+# Slice the ablation CSV (no need to read the whole file)
+scripts/ablation/query.py --patient S14 --d 64
+scripts/ablation/query.py --recent 10
+```
+
+Each submission is recorded to `.ablation_submissions.jsonl` (gitignored) so
+`status.py`, `logs.py`, `peek.py`, `collect.py` can decode array task ids back
+to `(fold, seed)` and find the remote `out_dir` without re-asking. Generated
+sbatch wrappers land under `scripts/v14_core/_gen/` (gitignored). Shared
+plumbing — DCC host, paths, `ssh()`, `rsync_repo()` — lives in
+`scripts/ablation/_common.py`.
+
+When **not** to use this tooling: non-standard array math (multi-cell
+cross-products encoded into `task_id`, LOPO pretrain → finetune chains where
+one task's flags depend on another). Hand-write those under
+`scripts/v14_core/v14_*_dcc.sh` as before.
+
 ## Data
 
 ### What's on DCC
@@ -167,6 +221,52 @@ git push origin autoresearch/run1
 git pull
 ```
 
+### When `git pull` is blocked by a dirty worktree
+
+The DCC worktree drifts: files get edited in place, scripts get scp'd over before they're committed upstream, QC reports get written directly. A plain `git pull` then aborts with *"Your local changes to the following files would be overwritten by merge"* and *"The following untracked working tree files would be overwritten by merge"*. **Never blind-stash, blind-rm, or `reset --hard` to resolve it — some of those files may be mid-flight experiments or real local fixes.**
+
+Recovery sequence that actually preserves work:
+
+**1. Fetch origin (non-destructive) and see the full error.**
+```bash
+cd /work/ht203/repo/speech
+git fetch origin
+git pull --ff-only 2>&1   # will fail, but lists every blocker file
+```
+
+**2. Classify every blocker by hash-comparing disk ↔ `origin/main`.** This is the step that tells you what's safe to touch. For each blocker file:
+```bash
+on=$(md5sum "$f" | awk '{print $1}')
+tg=$(git show origin/main:"$f" 2>/dev/null | md5sum | awk '{print $1}')
+[ "$on" = "$tg" ] && echo MATCH || echo DIFFER
+```
+(Loop it over the full blocker list; a one-liner was run verbatim in the 2026-04-18 cleanup — see `git log` on that date for a reference invocation.)
+
+Three classes emerge:
+- **Untracked, MATCH origin/main** — DCC scp'd the file in before it was committed; `origin/main`'s tracked version is byte-identical. Safe to `rm`.
+- **Modified-tracked, MATCH origin/main** — phantom modification; disk content already equals `origin/main`. `git checkout -- <file>` clears the "modified" flag without rewriting disk.
+- **Modified-tracked, DIFFER** — real local divergence. Must preserve.
+
+Do NOT skip the hash step. Two prior cleanups looked like the "safe" class but the blocker list included real local edits mixed in.
+
+**3. Snapshot the DIFFER set before clobbering.** A named stash is the minimum; a backup branch is better because it's visible and recoverable via normal git commands:
+```bash
+git stash push -u -m "dcc-pre-sync-<ISO-date>-<task-name>"
+```
+Stash messages must be specific and dated. `git stash` with no message produces `WIP on main: <sha>` which is indistinguishable from any other idle stash months later.
+
+**4. Pull.**
+```bash
+git pull --ff-only   # now succeeds
+git status --short   # expect empty
+```
+
+**5. Check the in-flight Slurm jobs are unaffected.** Before pulling, verify which source files the running jobs import at runtime. If those files are in the MATCH class on disk, pull doesn't rewrite disk bytes and running tasks keep their cached modules. If any are DIFFER, either scancel first or wait until the job drains.
+
+**6. Leave the stash/branch in place.** Never `git stash pop` an old DCC-sync stash blindly — they carry pre-push working-tree state that includes older versions of `CLAUDE.md`, `docs/objectives.md`, `docs/tactics.md`, `docs/strategy.md`, etc. Popping silently regresses doc progress. Drop with `git stash drop <ref>` only after `git stash show -p <ref>` confirms nothing worth keeping.
+
+**7. Prefer deleting an identical untracked file over `git checkout --` on a modified file** when both would work — `rm` is a no-op on disk state (the tracked pull re-creates it byte-identical), whereas `checkout --` writes disk bytes and could race with a running task mid-import.
+
 ## Running the Sweep Script (Example)
 
 ```bash
@@ -202,3 +302,4 @@ $PYTHON scripts/sweep_tmin_perpos.py \
 | Python output not appearing in log | stdout buffering with `tee` | Add `export PYTHONUNBUFFERED=1` to SBATCH script |
 | `CUDA out of memory` | Batch too large for 32GB | Reduce batch size or use gradient accumulation |
 | Job stuck in `PD` state | GPU queue full | Try `scavenger-gpu` partition or wait |
+| `git pull` aborts: "local changes would be overwritten" | DCC worktree dirty (scp'd scripts, edited docs) | See "When `git pull` is blocked by a dirty worktree" above — hash-compare each blocker vs `origin/main`, stash DIFFERs before pulling |

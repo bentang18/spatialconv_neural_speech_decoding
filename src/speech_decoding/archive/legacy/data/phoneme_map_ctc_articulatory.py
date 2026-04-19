@@ -20,7 +20,7 @@ Why it was split out:
 
 Under the 2026-04-13 working principle, v14 will define its own
 label -> integer index contract once the blocker in
-`docs/implementation_tasks.md` (#16) is discussed and locked. This file
+`docs/tactics.md` (#16) is discussed and locked. This file
 exists only as historical reference for what the previous contract was.
 """
 from __future__ import annotations
