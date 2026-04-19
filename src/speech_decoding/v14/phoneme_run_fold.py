@@ -224,13 +224,12 @@ def run_one_fold(
         collate_fn=collate_v14_phoneme_batch,
     )
 
-    from speech_decoding.v14.augmentation import LEGACY_DEFAULT, AugmentationConfig
-    if aug_preset == "none":
-        aug_cfg: AugmentationConfig | None = None
-    elif aug_preset == "legacy":
-        aug_cfg = LEGACY_DEFAULT
-    else:
-        raise ValueError(f"aug_preset must be 'none' or 'legacy', got {aug_preset!r}")
+    from speech_decoding.v14.augmentation import PRESETS, AugmentationConfig
+    if aug_preset not in PRESETS:
+        raise ValueError(
+            f"aug_preset must be one of {tuple(PRESETS)}, got {aug_preset!r}"
+        )
+    aug_cfg: AugmentationConfig | None = None if aug_preset == "none" else PRESETS[aug_preset]
     if label_smoothing > 0.0 or mixup_alpha > 0.0 or aug_cfg is not None:
         from speech_decoding.v14.train import make_per_phoneme_ce_loss
         loss_fn = make_per_phoneme_ce_loss(

@@ -124,9 +124,9 @@ def main(argv: list[str] | None = None) -> int:
         "--backbone-depth",
         type=int,
         default=3,
-        choices=(1, 3, 5),
+        choices=(1, 3, 4, 5),
         help="Per-phoneme mode: number of attention blocks. P8 uses {1, 3}; "
-        "depth=5 is the post-P8 capacity ablation.",
+        "depth=5 is the capacity ablation; depth=4 is the T2.2 scalable probe.",
     )
     parser.add_argument(
         "--d-model",
@@ -210,23 +210,39 @@ def main(argv: list[str] | None = None) -> int:
         "--aug-preset",
         type=str,
         default="none",
-        choices=("none", "legacy"),
+        choices=(
+            "none",
+            "legacy",
+            "shift_only",
+            "amp_only",
+            "dropout_only",
+            "noise_only",
+        ),
         help="Per-phoneme + pooled: signal augmentation preset. 'none' "
-        "(default, baseline) runs without aug. 'legacy' = zero-pad time-shift "
-        "±20, per-electrode log-normal amp-scale std 0.15, channel-dropout "
-        "max_p 0.2, gaussian noise frac 0.02. Channel-dropout COMPOSES with "
-        "electrode_active_mask so downstream masking stays consistent.",
+        "(default, baseline) runs without aug. 'legacy' composites all four "
+        "ops. The *_only variants (T1.2 decomposition) apply exactly one op "
+        "at legacy strength — shift_only: ±20 frames zero-pad; amp_only: "
+        "log-normal std 0.15; dropout_only: channel-dropout max_p 0.2; "
+        "noise_only: gaussian noise frac 0.02.",
     )
     parser.add_argument(
         "--spatial-pe-mode",
         type=str,
         default="none",
-        choices=("none", "factorized_2d"),
-        help="Per-phoneme + pooled: rigid-grid cell PE. 'none' (default) "
-        "relies on parcel embedding only. 'factorized_2d' adds learnable "
-        "row_emb (H_pool, d/2) + col_emb (W_pool, d/2), concatenated per "
-        "cell and added across time. Rigid-grid ablation only — does NOT "
-        "transfer to sEEG.",
+        choices=(
+            "none",
+            "factorized_2d",
+            "factorized_2d_frozen",
+            "row_only",
+            "col_only",
+        ),
+        help="Per-phoneme + pooled: rigid-grid cell PE. 'none' relies on "
+        "parcel embedding only. 'factorized_2d' adds learnable row_emb + "
+        "col_emb, concatenated per cell. 'factorized_2d_frozen' (T3.3) "
+        "freezes the same random init — tests whether learned content "
+        "matters vs any stable cell-id prior. 'row_only' / 'col_only' "
+        "(T3.3) use a single axis embedding (H×d or W×d) — separates "
+        "row-axis from col-axis contribution.",
     )
     parser.add_argument(
         "--spatial-path",

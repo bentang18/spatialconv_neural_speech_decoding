@@ -50,6 +50,20 @@ LEGACY_DEFAULT = AugmentationConfig(
     gaussian_noise_frac=0.02,
 )
 
+SHIFT_ONLY = AugmentationConfig(time_shift_max_frames=20)
+AMP_ONLY = AugmentationConfig(amp_scale_std=0.15)
+DROPOUT_ONLY = AugmentationConfig(channel_dropout_max_p=0.2)
+NOISE_ONLY = AugmentationConfig(gaussian_noise_frac=0.02)
+
+PRESETS: dict[str, AugmentationConfig] = {
+    "none": AugmentationConfig(),
+    "legacy": LEGACY_DEFAULT,
+    "shift_only": SHIFT_ONLY,
+    "amp_only": AMP_ONLY,
+    "dropout_only": DROPOUT_ONLY,
+    "noise_only": NOISE_ONLY,
+}
+
 
 def _time_shift_zeropad(signal: torch.Tensor, max_frames: int) -> torch.Tensor:
     """Per-sample integer shift in [-max, +max] samples, zero-padded at both ends.

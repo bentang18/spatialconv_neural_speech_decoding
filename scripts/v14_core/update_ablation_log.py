@@ -67,6 +67,30 @@ def _variant_suffix(r: dict) -> str:
     mu = r.get("mixup_alpha") or 0.0
     if mu > 0.0:
         bits.append(f"mix{int(round(mu * 100)):02d}")
+    rm = r.get("readout_mode")
+    if rm in ("cls", "hierarchical"):
+        bits.append(rm)
+    if r.get("masking_mode") == "partial_conv":
+        bits.append("partialconv")
+    pe = r.get("spatial_pe_mode")
+    if pe and pe != "none":
+        bits.append({
+            "factorized_2d": "pe2d",
+            "factorized_2d_frozen": "pe2df",
+            "row_only": "perow",
+            "col_only": "pecol",
+        }.get(pe, pe))
+    if r.get("spatial_path") == "per_electrode":
+        bits.append("perelec")
+    epm = r.get("electrode_pe_mode")
+    if epm and epm != "none":
+        bits.append(epm.replace("_", ""))
+    nh = r.get("num_heads")
+    if nh is not None and nh != 2:
+        bits.append(f"h{nh}")
+    aug = r.get("aug_preset")
+    if aug and aug != "none":
+        bits.append(f"aug_{aug}")
     return ("::" + "_".join(bits)) if bits else ""
 
 

@@ -69,9 +69,16 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 f"temporal_frontend='per_cell' (no cell axis in "
                 f"{self.cfg.temporal_frontend!r})"
             )
-        if self.cfg.spatial_pe_mode not in ("none", "factorized_2d"):
+        _PE_MODES = (
+            "none",
+            "factorized_2d",
+            "factorized_2d_frozen",
+            "row_only",
+            "col_only",
+        )
+        if self.cfg.spatial_pe_mode not in _PE_MODES:
             raise ValueError(
-                f"spatial_pe_mode must be 'none' or 'factorized_2d', "
+                f"spatial_pe_mode must be one of {_PE_MODES}, "
                 f"got {self.cfg.spatial_pe_mode!r}"
             )
         if (
@@ -83,10 +90,13 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 f"temporal_frontend='per_cell' (no cell axis in "
                 f"{self.cfg.temporal_frontend!r})"
             )
-        if self.cfg.spatial_pe_mode == "factorized_2d" and d % 2 != 0:
+        if (
+            self.cfg.spatial_pe_mode in ("factorized_2d", "factorized_2d_frozen")
+            and d % 2 != 0
+        ):
             raise ValueError(
-                f"spatial_pe_mode='factorized_2d' requires d_model % 2 == 0, "
-                f"got d_model={d}"
+                f"spatial_pe_mode={self.cfg.spatial_pe_mode!r} requires "
+                f"d_model % 2 == 0, got d_model={d}"
             )
         if self.cfg.spatial_path not in ("pool", "per_electrode"):
             raise ValueError(
@@ -99,10 +109,10 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                     "spatial_path='per_electrode' requires "
                     "temporal_frontend='per_cell' (flat bakes in spatial mixing)"
                 )
-            if self.cfg.spatial_pe_mode == "factorized_2d":
+            if self.cfg.spatial_pe_mode != "none":
                 raise ValueError(
                     "spatial_path='per_electrode' is incompatible with "
-                    "spatial_pe_mode='factorized_2d' (no grid axis)"
+                    f"spatial_pe_mode={self.cfg.spatial_pe_mode!r} (no grid axis)"
                 )
             if self.cfg.readout_mode == "hierarchical":
                 raise ValueError(
@@ -176,11 +186,23 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
         else:
             self.parcel_embedding = None
 
-        if self.cfg.spatial_pe_mode == "factorized_2d":
-            H_pool, W_pool = self.cfg.pool.pool_shape
+        H_pool, W_pool = self.cfg.pool.pool_shape
+        pe_mode = self.cfg.spatial_pe_mode
+        if pe_mode in ("factorized_2d", "factorized_2d_frozen"):
             self.row_emb = nn.Parameter(torch.empty(H_pool, d // 2))
             self.col_emb = nn.Parameter(torch.empty(W_pool, d // 2))
             nn.init.normal_(self.row_emb, std=0.02)
+            nn.init.normal_(self.col_emb, std=0.02)
+            if pe_mode == "factorized_2d_frozen":
+                self.row_emb.requires_grad_(False)
+                self.col_emb.requires_grad_(False)
+        elif pe_mode == "row_only":
+            self.row_emb = nn.Parameter(torch.empty(H_pool, d))
+            self.col_emb = None
+            nn.init.normal_(self.row_emb, std=0.02)
+        elif pe_mode == "col_only":
+            self.row_emb = None
+            self.col_emb = nn.Parameter(torch.empty(W_pool, d))
             nn.init.normal_(self.col_emb, std=0.02)
         else:
             self.row_emb = None
@@ -365,16 +387,19 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 y = y + cell_emb.unsqueeze(-1)
 
             # -- Stage 5b: + factorized 2D spatial PE on pool cells ---------------
-            if self.row_emb is not None and self.col_emb is not None:
+            if self.row_emb is not None or self.col_emb is not None:
                 H_pool, W_pool = self.cfg.pool.pool_shape
-                half = self.cfg.d_model // 2
-                # Row-major cells (#p_row * W_pool + #p_col): match pool.py.
-                row_exp = self.row_emb.unsqueeze(1).expand(H_pool, W_pool, half)
-                col_exp = self.col_emb.unsqueeze(0).expand(H_pool, W_pool, half)
-                cell_pe = torch.cat([row_exp, col_exp], dim=-1).reshape(
-                    n_cells, self.cfg.d_model
-                )                                       # (n_cells, d)
-                # Broadcast across batch and time tokens.
+                d_ = self.cfg.d_model
+                if self.row_emb is not None and self.col_emb is not None:
+                    half = d_ // 2
+                    row_exp = self.row_emb.unsqueeze(1).expand(H_pool, W_pool, half)
+                    col_exp = self.col_emb.unsqueeze(0).expand(H_pool, W_pool, half)
+                    cell_pe = torch.cat([row_exp, col_exp], dim=-1)
+                elif self.row_emb is not None:
+                    cell_pe = self.row_emb.unsqueeze(1).expand(H_pool, W_pool, d_)
+                else:
+                    cell_pe = self.col_emb.unsqueeze(0).expand(H_pool, W_pool, d_)
+                cell_pe = cell_pe.reshape(n_cells, d_)
                 y = y + cell_pe.unsqueeze(0).unsqueeze(-1)
 
             # -- Stage 6: flatten + combined-attention backbone -------------------
