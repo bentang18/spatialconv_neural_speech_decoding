@@ -292,6 +292,36 @@ class PerPhonemeConfig:
     #   summarizing time-within-cell before pooling across cells beats a flat
     #   single-pool. per_cell-only (flat temporal_frontend has no cell axis).
     readout_mode: str = "mean_pool"
+    # "none": no added spatial PE (baseline). Cells carry only parcel + time info.
+    # "factorized_2d": rigid-grid ViT-style PE — learnable row_emb (H_pool, d/2)
+    #   and col_emb (W_pool, d/2), concatenated to (n_cells, d) and added to
+    #   every cell broadcast across time tokens. +H_pool·d/2 + W_pool·d/2 params
+    #   (at pool (4,8), d=32 → 192 params). Does NOT transfer to sEEG (no grid
+    #   axis); retained as rigid-grid bucket ablation. per_cell-only.
+    spatial_pe_mode: str = "none"
+    # "pool": current baseline — scatter to grid, Conv2d, masked-mean pool to
+    #   (H_pool, W_pool) cells, per-cell temporal Conv1d. Grid-dependent.
+    # "per_electrode": skips scatter + Conv2d + pool; runs a shared per-
+    #   electrode Conv1d(1 → d, k, s) directly on the raw per-electrode signal,
+    #   then adds per-electrode atlas embedding (support @ P_emb). Tokens are
+    #   (N_e × T_tokens). Grid-agnostic; canonical path for sEEG / external
+    #   arrays. Requires temporal_frontend='per_cell' (flat bakes in spatial
+    #   mixing). Incompatible with factorized_2d spatial PE and hierarchical
+    #   readout (both grid-only).
+    spatial_path: str = "pool"
+    # Per-electrode path extra PE.
+    # "none": atlas embedding only (default).
+    # "fourier_mni": random-Fourier PE on electrode xyz. A frozen random matrix
+    #   W ~ N(0, fourier_pe_std^2) with shape (3, d/2) projects the 3D coord
+    #   into d/2 phases; PE = concat(sin(xyz @ W), cos(xyz @ W)) ∈ R^d. Added
+    #   per electrode broadcast across time. per_electrode-only.
+    # "distance_bias": pairwise Euclidean-distance additive bias in backbone
+    #   attention (added separately in task #51).
+    electrode_pe_mode: str = "none"
+    # Frequency scale for Fourier PE (cycles per mm). Default 0.2 mm^-1 gives
+    # per-coord phase excursion ~25 at 130 mm extent — enough cycles to be
+    # informative without aliasing into noise.
+    fourier_pe_std: float = 0.2
     backbone: BackboneConfig = field(
         default_factory=lambda: BackboneConfig(
             d_model=32, num_heads=2, head_dim=16, ffn_hidden=128,

@@ -78,6 +78,7 @@ class CombinedAttentionBlock(nn.Module):
         active_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, d = x.shape
         active = active_mask.to(x.dtype).unsqueeze(-1)  # (B, S, 1)
@@ -93,11 +94,18 @@ class CombinedAttentionBlock(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Key mask: True = attend to this key. (B, 1, 1, S) broadcasts over (H, S_query).
-        key_mask = active_mask.view(B, 1, 1, S)
+        if attn_bias is None:
+            # Key mask: True = attend. (B, 1, 1, S) broadcasts over (H, S_query).
+            mask = active_mask.view(B, 1, 1, S)
+        else:
+            # Combine bool key mask + float additive bias into a float mask.
+            # -inf where keys are inactive; add `attn_bias` everywhere else.
+            neg_inf = torch.finfo(q.dtype).min
+            keep = active_mask.view(B, 1, 1, S).to(q.dtype)
+            mask = attn_bias + (1.0 - keep) * neg_inf
         attn = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=key_mask,
+            attn_mask=mask,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
         attn = attn.transpose(1, 2).reshape(B, S, d)
@@ -148,12 +156,15 @@ class Backbone(nn.Module):
         x: torch.Tensor,
         active_mask: torch.Tensor,
         time_ids: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the combined-attention stack.
 
         ``x``: ``(B, S, d)`` with ``S = N_e * T``.
         ``active_mask``: ``(B, S)`` bool.
         ``time_ids``: ``(S,)`` long, each token's time index in ``[0, T)``.
+        ``attn_bias``: optional ``(B, 1|H, S, S)`` float additive bias merged
+            with the key mask and passed as ``attn_mask`` to every block.
         """
 
         if x.ndim != 3 or x.shape[-1] != self.d_model:
@@ -168,5 +179,5 @@ class Backbone(nn.Module):
         sin = self._rope_sin[time_ids]
         x = x * active_mask.to(x.dtype).unsqueeze(-1)
         for block in self.blocks:
-            x = block(x, active_mask, cos, sin)
+            x = block(x, active_mask, cos, sin, attn_bias)
         return x

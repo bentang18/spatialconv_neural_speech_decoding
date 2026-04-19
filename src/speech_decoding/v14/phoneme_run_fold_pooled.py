@@ -69,6 +69,10 @@ def _build_config(
     pool_method: str = "masked_mean",
     masking_mode: str = "zero_fill",
     readout_mode: str = "mean_pool",
+    spatial_pe_mode: str = "none",
+    spatial_path: str = "pool",
+    electrode_pe_mode: str = "none",
+    num_heads: int | None = None,
 ) -> PerPhonemeConfig:
     from speech_decoding.v14.config import BackboneConfig, D1DecoderConfig, PoolConfig
 
@@ -76,7 +80,17 @@ def _build_config(
         raise ValueError(f"d_model must be 16, 32, or 64, got {d_model}")
     if conv2d_kernel not in (1, 3, 5):
         raise ValueError(f"conv2d_kernel must be 1, 3, or 5, got {conv2d_kernel}")
-    num_heads = {16: 1, 32: 2, 64: 4}[d_model]
+    if num_heads is None:
+        num_heads = {16: 1, 32: 2, 64: 4}[d_model]
+    if d_model % num_heads != 0:
+        raise ValueError(
+            f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        )
+    head_dim = d_model // num_heads
+    if head_dim % 2 != 0:
+        raise ValueError(
+            f"head_dim = d_model/num_heads = {head_dim} must be even for RoPE"
+        )
     base = PerPhonemeConfig()
     return replace(
         base,
@@ -90,8 +104,11 @@ def _build_config(
         pool_method=pool_method,
         masking_mode=masking_mode,
         readout_mode=readout_mode,
+        spatial_pe_mode=spatial_pe_mode,
+        spatial_path=spatial_path,
+        electrode_pe_mode=electrode_pe_mode,
         backbone=BackboneConfig(
-            d_model=d_model, num_heads=num_heads, head_dim=16,
+            d_model=d_model, num_heads=num_heads, head_dim=head_dim,
             ffn_hidden=4 * d_model, num_blocks=backbone_depth, dropout=0.1,
         ),
         decoder=D1DecoderConfig(d_model=d_model, vocab_size=9, prev_embedding_size=10),
@@ -169,8 +186,13 @@ def run_one_fold_pooled(
     pool_method: str = "masked_mean",
     masking_mode: str = "zero_fill",
     readout_mode: str = "mean_pool",
+    spatial_pe_mode: str = "none",
+    spatial_path: str = "pool",
+    electrode_pe_mode: str = "none",
+    num_heads: int | None = None,
     label_smoothing: float = 0.0,
     mixup_alpha: float = 0.0,
+    aug_preset: str = "none",
     max_epochs: int | None = None,
     val_every: int | None = None,
     patience: int | None = None,
@@ -233,6 +255,10 @@ def run_one_fold_pooled(
         pool_method=pool_method,
         masking_mode=masking_mode,
         readout_mode=readout_mode,
+        spatial_pe_mode=spatial_pe_mode,
+        spatial_path=spatial_path,
+        electrode_pe_mode=electrode_pe_mode,
+        num_heads=num_heads,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
 
@@ -269,10 +295,19 @@ def run_one_fold_pooled(
     val_obj = val_loaders
     effective_accum = grad_accum_steps if grad_accum_steps is not None else len(datasets)
 
-    if label_smoothing > 0.0 or mixup_alpha > 0.0:
+    from speech_decoding.v14.augmentation import LEGACY_DEFAULT, AugmentationConfig
+    if aug_preset == "none":
+        aug_cfg: AugmentationConfig | None = None
+    elif aug_preset == "legacy":
+        aug_cfg = LEGACY_DEFAULT
+    else:
+        raise ValueError(f"aug_preset must be 'none' or 'legacy', got {aug_preset!r}")
+    if label_smoothing > 0.0 or mixup_alpha > 0.0 or aug_cfg is not None:
         from speech_decoding.v14.train import make_per_phoneme_ce_loss
         loss_fn = make_per_phoneme_ce_loss(
-            label_smoothing=label_smoothing, mixup_alpha=mixup_alpha
+            label_smoothing=label_smoothing,
+            mixup_alpha=mixup_alpha,
+            aug_cfg=aug_cfg,
         )
     else:
         loss_fn = per_phoneme_ce_loss
@@ -327,8 +362,14 @@ def run_one_fold_pooled(
         "pool_method": pool_method,
         "masking_mode": masking_mode,
         "readout_mode": readout_mode,
+        "spatial_pe_mode": spatial_pe_mode,
+        "spatial_path": spatial_path,
+        "electrode_pe_mode": electrode_pe_mode,
+        "num_heads": cfg.backbone.num_heads,
+        "head_dim": cfg.backbone.head_dim,
         "label_smoothing": label_smoothing,
         "mixup_alpha": mixup_alpha,
+        "aug_preset": aug_preset,
         "grad_accum_steps": effective_accum,
         "best_val_per_phoneme": fold_result.best_val_per,
         "per_patient_test": per_patient_test,

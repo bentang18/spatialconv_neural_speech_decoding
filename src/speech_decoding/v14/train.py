@@ -69,17 +69,26 @@ def per_phoneme_ce_loss(model: nn.Module, batch: dict) -> torch.Tensor:
 def make_per_phoneme_ce_loss(
     label_smoothing: float = 0.0,
     mixup_alpha: float = 0.0,
+    aug_cfg: "AugmentationConfig | None" = None,
 ) -> Callable[[nn.Module, dict], torch.Tensor]:
-    """Build a per-phoneme CE loss with optional label smoothing + mixup.
+    """Build a per-phoneme CE loss with optional label smoothing + mixup + aug.
 
     Mixup interpolates the raw signal and the *loss* (not the labels, which
     are categorical). `prev_tokens` and all per-patient constants (layout,
     support, grid shape, active mask) are kept from the primary example —
     mixing is a one-sided signal perturbation, not a full context blend.
+
+    `aug_cfg` (if given) applies signal-level augmentation BEFORE mixup, only
+    in training mode. Augmentation may also update `electrode_active_mask`
+    (channel dropout).
     """
+
+    from speech_decoding.v14.augmentation import AugmentationConfig, augment_batch
 
     def _loss(model: nn.Module, batch: dict) -> torch.Tensor:
         labels = batch["labels"]
+        if aug_cfg is not None and model.training:
+            batch = augment_batch(batch, aug_cfg)
         if mixup_alpha > 0.0 and model.training:
             beta = torch.distributions.Beta(mixup_alpha, mixup_alpha)
             lam = float(beta.sample().item())

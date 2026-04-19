@@ -28,6 +28,7 @@ from speech_decoding.v14.channel_map import (
     expected_grid_shape_for_patient,
     resolve_physical_names_for_patient,
 )
+from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache
 from speech_decoding.v14.support_cache import lookup_support_for_kept_channels
 
 
@@ -55,6 +56,9 @@ class V14PhonemeSample:
     electrode_grid_shape: tuple[int, int]
     electrode_active_mask: torch.Tensor  # (N_e,) bool
     support: torch.Tensor                # (N_e, 15) float32
+    # fsaverage pial xyz in mm; None when no coord cache dir is provided
+    # (the model ignores electrode_xyz whenever electrode_pe_mode='none').
+    electrode_xyz: torch.Tensor | None   # (N_e, 3) float32 or None
 
 
 def _build_code_to_arpa_index(event_id: dict[str, int]) -> dict[int, int]:
@@ -97,6 +101,7 @@ class V14PhonemeDataset(torch.utils.data.Dataset[V14PhonemeSample]):
         support_cache_path: Path,
         channel_maps_dir: Path,
         box_root: Path,
+        fsaverage_coords_dir: Path | None = None,
     ) -> None:
         self.patient_id = patient_id
         self.fif_path = Path(fif_path)
@@ -137,6 +142,21 @@ class V14PhonemeDataset(torch.utils.data.Dataset[V14PhonemeSample]):
         )
         active_mask = np.ones(len(kept_names), dtype=bool)
 
+        if fsaverage_coords_dir is not None:
+            cache = load_fsaverage_cache(patient_id, Path(fsaverage_coords_dir))
+            name_to_idx = {n: i for i, n in enumerate(cache.names)}
+            missing = [n for n in phys_names if n not in name_to_idx]
+            if missing:
+                raise KeyError(
+                    f"{patient_id}: missing electrodes in fsaverage cache: "
+                    f"{missing[:10]}"
+                    + (f" (+{len(missing) - 10} more)" if len(missing) > 10 else "")
+                )
+            idx = np.array([name_to_idx[n] for n in phys_names], dtype=np.int64)
+            electrode_xyz = cache.coords[idx].astype(np.float32, copy=False)
+        else:
+            electrode_xyz = None
+
         # Pull only kept channels from the `.fif` data matrix. `get_data(picks=...)`
         # returns `(n_epochs, n_kept, T_RAW)` in `kept_names` order.
         signals = epochs.get_data(picks=list(kept_names), copy=False).astype(np.float32)
@@ -155,6 +175,7 @@ class V14PhonemeDataset(torch.utils.data.Dataset[V14PhonemeSample]):
         self._electrode_grid_layout = layout
         self._electrode_active_mask = active_mask
         self._support = support
+        self._electrode_xyz = electrode_xyz
 
     @property
     def n_trials(self) -> int:
@@ -187,6 +208,14 @@ class V14PhonemeDataset(torch.utils.data.Dataset[V14PhonemeSample]):
         pos = index % 3
         prev = BOS_TOKEN if pos == 0 else int(self._labels[index - 1])
 
+        electrode_xyz: torch.Tensor | None
+        if self._electrode_xyz is not None:
+            electrode_xyz = torch.from_numpy(
+                np.ascontiguousarray(self._electrode_xyz, dtype=np.float32)
+            )
+        else:
+            electrode_xyz = None
+
         return V14PhonemeSample(
             signal=torch.from_numpy(
                 np.ascontiguousarray(self._signals[index], dtype=np.float32)
@@ -206,6 +235,7 @@ class V14PhonemeDataset(torch.utils.data.Dataset[V14PhonemeSample]):
             support=torch.from_numpy(
                 np.ascontiguousarray(self._support, dtype=np.float32)
             ),
+            electrode_xyz=electrode_xyz,
         )
 
 
@@ -253,7 +283,7 @@ def collate_v14_phoneme_batch(samples: list[V14PhonemeSample]) -> dict[str, obje
     )
     support = torch.stack([s.support for s in samples], dim=0)
 
-    return {
+    batch: dict[str, object] = {
         "signal": signal,
         "labels": labels,
         "prev_tokens": prev_tokens,
@@ -265,3 +295,14 @@ def collate_v14_phoneme_batch(samples: list[V14PhonemeSample]) -> dict[str, obje
         "support": support,
         "patient_id": patient_id,
     }
+    xyz_samples = [s.electrode_xyz for s in samples]
+    has_xyz = [x is not None for x in xyz_samples]
+    if any(has_xyz):
+        if not all(has_xyz):
+            raise ValueError(
+                "collate: mixed electrode_xyz presence within a batch (some None)"
+            )
+        batch["electrode_xyz"] = torch.stack(
+            [x for x in xyz_samples if x is not None], dim=0
+        )
+    return batch

@@ -143,6 +143,61 @@ class TestPhonemeDataset:
         assert s.support.shape == (16, N_TIER1_PARCELS)
         assert float(s.support[0, 0]) == pytest.approx(0.77)
 
+    def test_xyz_none_when_cache_dir_not_provided(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fif, cmap, box, sup = _setup_patient_fixture(tmp_path, monkeypatch)
+        ds = V14PhonemeDataset(
+            "SXX", fif,
+            support_cache_path=sup, channel_maps_dir=cmap, box_root=box,
+        )
+        assert ds[0].electrode_xyz is None
+
+    def test_xyz_loaded_from_cache_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fif, cmap, box, sup = _setup_patient_fixture(tmp_path, monkeypatch)
+        # Write a minimal fsaverage coord cache for the 16 kept electrodes.
+        coords_dir = tmp_path / "fsaverage_coords"
+        coords_dir.mkdir()
+        with (coords_dir / "SXX_fsaverage_pial.csv").open("w") as f:
+            f.write("name,hemisphere,fsaverage_vertex,x,y,z\n")
+            for i in range(1, 17):
+                f.write(f"EL{i},L,{i},{i}.0,{i + 0.5},{i + 1.0}\n")
+        ds = V14PhonemeDataset(
+            "SXX", fif,
+            support_cache_path=sup, channel_maps_dir=cmap, box_root=box,
+            fsaverage_coords_dir=coords_dir,
+        )
+        s = ds[0]
+        assert s.electrode_xyz is not None
+        assert s.electrode_xyz.shape == (16, 3)
+        assert s.electrode_xyz.dtype == torch.float32
+        # Row 0 is EL1 → (1.0, 1.5, 2.0)
+        assert float(s.electrode_xyz[0, 0]) == pytest.approx(1.0)
+        assert float(s.electrode_xyz[0, 1]) == pytest.approx(1.5)
+        assert float(s.electrode_xyz[0, 2]) == pytest.approx(2.0)
+
+    def test_xyz_collates_into_batch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fif, cmap, box, sup = _setup_patient_fixture(tmp_path, monkeypatch)
+        coords_dir = tmp_path / "fsaverage_coords"
+        coords_dir.mkdir()
+        with (coords_dir / "SXX_fsaverage_pial.csv").open("w") as f:
+            f.write("name,hemisphere,fsaverage_vertex,x,y,z\n")
+            for i in range(1, 17):
+                f.write(f"EL{i},L,{i},{float(i)},{float(i)},{float(i)}\n")
+        ds = V14PhonemeDataset(
+            "SXX", fif,
+            support_cache_path=sup, channel_maps_dir=cmap, box_root=box,
+            fsaverage_coords_dir=coords_dir,
+        )
+        samples = [ds[i] for i in range(3)]
+        batch = collate_v14_phoneme_batch(samples)
+        assert "electrode_xyz" in batch
+        assert batch["electrode_xyz"].shape == (3, 16, 3)  # type: ignore[union-attr]
+
 
 class TestCollator:
     def _make_samples(
@@ -187,6 +242,7 @@ class TestCollator:
             electrode_grid_shape=samples[1].electrode_grid_shape,
             electrode_active_mask=samples[1].electrode_active_mask,
             support=samples[1].support,
+            electrode_xyz=samples[1].electrode_xyz,
         )
         with pytest.raises(ValueError, match="patient_id"):
             collate_v14_phoneme_batch(samples)

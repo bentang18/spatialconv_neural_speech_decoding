@@ -199,6 +199,61 @@ def main(argv: list[str] | None = None) -> int:
         "attention-pools time-per-cell then cells — +2·d learned params.",
     )
     parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=None,
+        help="Per-phoneme + pooled: backbone attention heads. Default derived "
+        "from d_model (16→1, 32→2, 64→4 with head_dim=16). Override to ablate "
+        "(d=32 supports 1 / 2 / 4 → head_dim 32 / 16 / 8).",
+    )
+    parser.add_argument(
+        "--aug-preset",
+        type=str,
+        default="none",
+        choices=("none", "legacy"),
+        help="Per-phoneme + pooled: signal augmentation preset. 'none' "
+        "(default, baseline) runs without aug. 'legacy' = zero-pad time-shift "
+        "±20, per-electrode log-normal amp-scale std 0.15, channel-dropout "
+        "max_p 0.2, gaussian noise frac 0.02. Channel-dropout COMPOSES with "
+        "electrode_active_mask so downstream masking stays consistent.",
+    )
+    parser.add_argument(
+        "--spatial-pe-mode",
+        type=str,
+        default="none",
+        choices=("none", "factorized_2d"),
+        help="Per-phoneme + pooled: rigid-grid cell PE. 'none' (default) "
+        "relies on parcel embedding only. 'factorized_2d' adds learnable "
+        "row_emb (H_pool, d/2) + col_emb (W_pool, d/2), concatenated per "
+        "cell and added across time. Rigid-grid ablation only — does NOT "
+        "transfer to sEEG.",
+    )
+    parser.add_argument(
+        "--spatial-path",
+        type=str,
+        default="pool",
+        choices=("pool", "per_electrode"),
+        help="Per-phoneme + pooled: spatial pipeline. 'pool' (default) runs "
+        "grid-scatter → Conv2d → (H_pool, W_pool) masked-mean pool → per-cell "
+        "Conv1d. 'per_electrode' skips scatter + Conv2d + pool; runs a shared "
+        "Conv1d(1 → d) on each electrode's raw signal and adds per-electrode "
+        "atlas embedding. Grid-agnostic — canonical path for sEEG. Requires "
+        "temporal_frontend='per_cell'.",
+    )
+    parser.add_argument(
+        "--electrode-pe-mode",
+        type=str,
+        default="none",
+        choices=("none", "fourier_mni", "distance_bias"),
+        help="Per-electrode-only: extra per-electrode positional info. 'none' "
+        "(default) uses atlas embedding only. 'fourier_mni' adds random-"
+        "Fourier PE on electrode xyz with a frozen W ~ N(0, fourier_pe_std²) "
+        "of shape (3, d/2) → concat(sin, cos) ∈ R^d. 'distance_bias' adds a "
+        "learnable scalar α so attention scores pick up -α · ||xyz_a - xyz_b|| "
+        "per electrode pair, broadcast across time and heads. Requires "
+        "--spatial-path=per_electrode and the fsaverage coord cache.",
+    )
+    parser.add_argument(
         "--label-smoothing",
         type=float,
         default=0.0,
@@ -282,6 +337,12 @@ def main(argv: list[str] | None = None) -> int:
             Path.home() / "Library" / "CloudStorage" / "Box-Box" / "ECoG_Recon",
         )
     )
+    fsaverage_coords_dir = Path(
+        paths.get(
+            "fsaverage_coords_dir",
+            _repo_root() / "data" / "fsaverage_coords",
+        )
+    )
 
     t0 = time.time()
     smoke_kw = (
@@ -320,6 +381,7 @@ def main(argv: list[str] | None = None) -> int:
             support_cache_path=support_cache_path,
             channel_maps_dir=channel_maps_dir,
             box_root=box_root,
+            fsaverage_coords_dir=fsaverage_coords_dir,
         )
         result = run_one_fold_per_phoneme(
             dataset,
@@ -333,8 +395,13 @@ def main(argv: list[str] | None = None) -> int:
             pool_method=args.pool_method,
             masking_mode=args.masking_mode,
             readout_mode=args.readout_mode,
+            spatial_pe_mode=args.spatial_pe_mode,
+            spatial_path=args.spatial_path,
+            electrode_pe_mode=args.electrode_pe_mode,
+            num_heads=args.num_heads,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
+            aug_preset=args.aug_preset,
             out_dir=args.out_dir,
             patient_id=args.patient,
             init_from=args.init_from,
@@ -355,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
                 support_cache_path=support_cache_dir / f"{pt}_support_tier1.csv",
                 channel_maps_dir=channel_maps_dir,
                 box_root=box_root,
+                fsaverage_coords_dir=fsaverage_coords_dir,
             )
         result = run_one_fold_pooled(
             datasets,
@@ -369,8 +437,13 @@ def main(argv: list[str] | None = None) -> int:
             pool_method=args.pool_method,
             masking_mode=args.masking_mode,
             readout_mode=args.readout_mode,
+            spatial_pe_mode=args.spatial_pe_mode,
+            spatial_path=args.spatial_path,
+            electrode_pe_mode=args.electrode_pe_mode,
+            num_heads=args.num_heads,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
+            aug_preset=args.aug_preset,
             out_dir=args.out_dir,
             init_from=args.init_from,
             save_checkpoint=args.save_checkpoint,

@@ -200,6 +200,309 @@ class TestReadoutModes:
             NeuralFieldPerceiverPerPhoneme(cfg)
 
 
+class TestAttentionHeads:
+    """Heads ablation — d=32 splits as 1×32, 2×16 (baseline), 4×8."""
+
+    def _model(self, num_heads: int) -> NeuralFieldPerceiverPerPhoneme:
+        from speech_decoding.v14.config import BackboneConfig
+
+        base = PerPhonemeConfig()
+        cfg = replace(
+            base,
+            backbone=replace(
+                base.backbone,
+                num_heads=num_heads,
+                head_dim=base.d_model // num_heads,
+            )
+            if isinstance(base.backbone, BackboneConfig)
+            else base.backbone,
+        )
+        return NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_heads_1x32_forwards(self) -> None:
+        model = self._model(1)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_heads_4x8_forwards(self) -> None:
+        model = self._model(4)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_heads_param_count_matches_between_splits(self) -> None:
+        """Heads × head_dim covers the same projection volume for any valid split."""
+        m1 = self._model(1)
+        m2 = self._model(2)
+        m4 = self._model(4)
+        n1 = sum(p.numel() for p in m1.parameters())
+        n2 = sum(p.numel() for p in m2.parameters())
+        n4 = sum(p.numel() for p in m4.parameters())
+        assert n1 == n2 == n4  # Q/K/V/O are all d×d regardless of heads split
+
+
+class TestFactorized2DSpatialPE:
+    """Rigid-grid ViT-style PE on the (H_pool, W_pool) cell grid."""
+
+    def test_forward_shape(self) -> None:
+        cfg = replace(PerPhonemeConfig(), spatial_pe_mode="factorized_2d")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_param_count_matches_expected(self) -> None:
+        """Adds H_pool*d/2 + W_pool*d/2 params at pool (4,8), d=32 → 4·16+8·16=192."""
+        cfg = replace(PerPhonemeConfig(), spatial_pe_mode="factorized_2d")
+        n_base = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme().parameters())
+        n_pe = sum(p.numel() for p in NeuralFieldPerceiverPerPhoneme(cfg).parameters())
+        d = PerPhonemeConfig().d_model
+        H_pool, W_pool = PerPhonemeConfig().pool.pool_shape
+        expected = H_pool * (d // 2) + W_pool * (d // 2)
+        assert n_pe - n_base == expected
+
+    def test_rejects_flat_frontend(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(),
+            spatial_pe_mode="factorized_2d",
+            temporal_frontend="flat",
+        )
+        import pytest
+        with pytest.raises(ValueError, match="requires temporal_frontend='per_cell'"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_changes_memory_vs_baseline(self) -> None:
+        """Adding non-zero PE must shift memory; with std=0.02 init it's non-zero."""
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        m_base = NeuralFieldPerceiverPerPhoneme()
+        cfg_pe = replace(PerPhonemeConfig(), spatial_pe_mode="factorized_2d")
+        m_pe = NeuralFieldPerceiverPerPhoneme(cfg_pe)
+        # Copy shared weights so only the PE path differs.
+        base_state = m_base.state_dict()
+        pe_state = m_pe.state_dict()
+        for k, v in base_state.items():
+            pe_state[k] = v
+        m_pe.load_state_dict(pe_state, strict=False)
+        m_base.eval()
+        m_pe.eval()
+        with torch.no_grad():
+            mem_base = m_base.encode_memory(batch)
+            mem_pe = m_pe.encode_memory(batch)
+        assert not torch.allclose(mem_base, mem_pe, atol=1e-5)
+
+
+class TestPerElectrodePath:
+    """Grid-agnostic scalable path — no scatter, no Conv2d, no pool."""
+
+    def test_forward_shape(self) -> None:
+        cfg = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        logits = model(batch)
+        assert logits.shape == (2, 9)
+
+    def test_encode_memory_shape(self) -> None:
+        """Per-electrode memory is (B, N_e * T_tokens, d)."""
+        cfg = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        memory = model.encode_memory(batch)
+        assert memory.shape == (2, 128 * 11, 32)
+
+    def test_works_with_non_rectangular_N_e(self) -> None:
+        """No grid dependency — arbitrary N_e forwards cleanly."""
+        cfg = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        batch = _fake_batch(B=2, N_e=53, H_p=8, W_p=16)
+        memory = model.encode_memory(batch)
+        assert memory.shape == (2, 53 * 11, 32)
+
+    def test_no_conv2d_allocated(self) -> None:
+        cfg = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        assert model.conv2d is None
+        assert model.conv1d is None
+        assert model.per_electrode_conv1d is not None
+
+    def test_rejects_flat_frontend(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(),
+            spatial_path="per_electrode",
+            temporal_frontend="flat",
+        )
+        import pytest
+        with pytest.raises(ValueError, match="requires\n*.*temporal_frontend='per_cell'"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_rejects_factorized_2d_pe(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(),
+            spatial_path="per_electrode",
+            spatial_pe_mode="factorized_2d",
+        )
+        import pytest
+        with pytest.raises(ValueError, match="incompatible.*factorized_2d"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_rejects_hierarchical_readout(self) -> None:
+        cfg = replace(
+            PerPhonemeConfig(),
+            spatial_path="per_electrode",
+            readout_mode="hierarchical",
+        )
+        import pytest
+        with pytest.raises(ValueError, match="incompatible.*hierarchical"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_inactive_electrodes_are_masked(self) -> None:
+        """Setting some electrodes inactive must change the memory output."""
+        cfg = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        model = NeuralFieldPerceiverPerPhoneme(cfg)
+        model.eval()
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        with torch.no_grad():
+            mem_all = model.encode_memory(batch)
+        batch["electrode_active_mask"] = batch["electrode_active_mask"].clone()
+        batch["electrode_active_mask"][:, ::4] = False
+        with torch.no_grad():
+            mem_some = model.encode_memory(batch)
+        assert not torch.allclose(mem_all, mem_some, atol=1e-5)
+
+    def test_cls_adds_one_token(self) -> None:
+        batch = _fake_batch(B=2, N_e=128, H_p=8, W_p=16)
+        cfg = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        cfg_cls = replace(cfg, readout_mode="cls")
+        m_base = NeuralFieldPerceiverPerPhoneme(cfg)
+        m_cls = NeuralFieldPerceiverPerPhoneme(cfg_cls)
+        mem_base = m_base.encode_memory(batch)
+        mem_cls = m_cls.encode_memory(batch)
+        assert mem_cls.shape[1] == mem_base.shape[1] + 1
+
+
+class TestFourierElectrodePE:
+    """Random-Fourier PE on electrode xyz — scalable bucket, per-electrode only."""
+
+    def _cfg(self) -> PerPhonemeConfig:
+        return replace(
+            PerPhonemeConfig(),
+            spatial_path="per_electrode",
+            electrode_pe_mode="fourier_mni",
+        )
+
+    def _batch_with_xyz(self, seed: int = 0) -> dict:
+        batch = _fake_batch(B=2, N_e=64, H_p=8, W_p=16, seed=seed)
+        torch.manual_seed(seed)
+        batch["electrode_xyz"] = torch.randn(2, 64, 3) * 50.0
+        return batch
+
+    def test_forward_shape(self) -> None:
+        model = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        logits = model(self._batch_with_xyz())
+        assert logits.shape == (2, 9)
+
+    def test_rejects_missing_xyz_in_batch(self) -> None:
+        model = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        batch = _fake_batch(B=2, N_e=64, H_p=8, W_p=16)  # no electrode_xyz
+        import pytest
+        with pytest.raises(KeyError, match="electrode_xyz"):
+            model(batch)
+
+    def test_rejects_on_pool_path(self) -> None:
+        cfg = replace(PerPhonemeConfig(), electrode_pe_mode="fourier_mni")
+        import pytest
+        with pytest.raises(ValueError, match="requires spatial_path='per_electrode'"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_changes_memory_vs_no_pe(self) -> None:
+        batch = self._batch_with_xyz()
+        cfg_no = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        cfg_pe = self._cfg()
+        m_no = NeuralFieldPerceiverPerPhoneme(cfg_no)
+        m_pe = NeuralFieldPerceiverPerPhoneme(cfg_pe)
+        # Copy overlapping weights so only the PE differs.
+        m_pe.load_state_dict(m_no.state_dict(), strict=False)
+        m_no.eval()
+        m_pe.eval()
+        with torch.no_grad():
+            mem_no = m_no.encode_memory(batch)
+            mem_pe = m_pe.encode_memory(batch)
+        assert not torch.allclose(mem_no, mem_pe, atol=1e-5)
+
+    def test_buffer_is_frozen(self) -> None:
+        """fourier_W must be a buffer (no grad), not a trainable parameter."""
+        model = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        param_names = {n for n, _ in model.named_parameters()}
+        assert "fourier_W" not in param_names
+        assert "fourier_W" in dict(model.named_buffers())
+
+
+class TestDistanceBiasAttention:
+    """Learnable -α · pairwise-distance additive bias in backbone attention."""
+
+    def _cfg(self) -> PerPhonemeConfig:
+        return replace(
+            PerPhonemeConfig(),
+            spatial_path="per_electrode",
+            electrode_pe_mode="distance_bias",
+        )
+
+    def _batch_with_xyz(self, seed: int = 0) -> dict:
+        batch = _fake_batch(B=2, N_e=64, H_p=8, W_p=16, seed=seed)
+        torch.manual_seed(seed)
+        batch["electrode_xyz"] = torch.randn(2, 64, 3) * 50.0
+        return batch
+
+    def test_forward_shape(self) -> None:
+        model = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        logits = model(self._batch_with_xyz())
+        assert logits.shape == (2, 9)
+
+    def test_rejects_missing_xyz_in_batch(self) -> None:
+        model = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        batch = _fake_batch(B=2, N_e=64, H_p=8, W_p=16)
+        import pytest
+        with pytest.raises(KeyError, match="electrode_xyz"):
+            model(batch)
+
+    def test_rejects_on_pool_path(self) -> None:
+        cfg = replace(PerPhonemeConfig(), electrode_pe_mode="distance_bias")
+        import pytest
+        with pytest.raises(ValueError, match="requires spatial_path='per_electrode'"):
+            NeuralFieldPerceiverPerPhoneme(cfg)
+
+    def test_alpha_is_zero_initialized(self) -> None:
+        """Init α=0 means the bias is the additive identity at start."""
+        model = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        assert float(model.dist_alpha.item()) == 0.0
+
+    def test_alpha_zero_matches_baseline_memory(self) -> None:
+        """With α=0, distance_bias must produce identical memory to no bias."""
+        batch = self._batch_with_xyz()
+        cfg_no = replace(PerPhonemeConfig(), spatial_path="per_electrode")
+        cfg_db = self._cfg()
+        m_no = NeuralFieldPerceiverPerPhoneme(cfg_no)
+        m_db = NeuralFieldPerceiverPerPhoneme(cfg_db)
+        m_db.load_state_dict(m_no.state_dict(), strict=False)
+        m_no.eval()
+        m_db.eval()
+        with torch.no_grad():
+            mem_no = m_no.encode_memory(batch)
+            mem_db = m_db.encode_memory(batch)
+        assert torch.allclose(mem_no, mem_db, atol=1e-5)
+
+    def test_alpha_nonzero_changes_memory(self) -> None:
+        """After setting α > 0, memory must diverge from the α=0 baseline."""
+        batch = self._batch_with_xyz()
+        m_db = NeuralFieldPerceiverPerPhoneme(self._cfg())
+        m_db.eval()
+        with torch.no_grad():
+            mem_a0 = m_db.encode_memory(batch)
+            m_db.dist_alpha.data.fill_(0.1)
+            mem_a1 = m_db.encode_memory(batch)
+        assert not torch.allclose(mem_a0, mem_a1, atol=1e-5)
+
+
 class TestOverfit:
     def test_ten_steps_drop_loss_by_at_least_0_1(self) -> None:
         """10 AdamW steps on a fixed batch should drive CE down by ≥0.1."""

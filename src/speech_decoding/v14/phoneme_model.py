@@ -35,14 +35,6 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
         self.cfg = cfg or PerPhonemeConfig()
         d = self.cfg.d_model
 
-        self.conv2d = nn.Conv2d(
-            self.cfg.conv2d_in_channels,
-            self.cfg.conv2d_out_channels,
-            kernel_size=self.cfg.conv2d_kernel_size,
-            padding=self.cfg.conv2d_padding,
-        )
-        self.conv2d_act = nn.GELU()
-
         t_cfg = self.cfg.per_cell_temporal
         if t_cfg.in_channels != self.cfg.conv2d_out_channels:
             raise ValueError(
@@ -77,21 +69,100 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 f"temporal_frontend='per_cell' (no cell axis in "
                 f"{self.cfg.temporal_frontend!r})"
             )
-        if self.cfg.temporal_frontend == "per_cell":
-            self.conv1d = nn.Conv1d(
-                t_cfg.in_channels,
+        if self.cfg.spatial_pe_mode not in ("none", "factorized_2d"):
+            raise ValueError(
+                f"spatial_pe_mode must be 'none' or 'factorized_2d', "
+                f"got {self.cfg.spatial_pe_mode!r}"
+            )
+        if (
+            self.cfg.spatial_pe_mode != "none"
+            and self.cfg.temporal_frontend != "per_cell"
+        ):
+            raise ValueError(
+                f"spatial_pe_mode={self.cfg.spatial_pe_mode!r} requires "
+                f"temporal_frontend='per_cell' (no cell axis in "
+                f"{self.cfg.temporal_frontend!r})"
+            )
+        if self.cfg.spatial_pe_mode == "factorized_2d" and d % 2 != 0:
+            raise ValueError(
+                f"spatial_pe_mode='factorized_2d' requires d_model % 2 == 0, "
+                f"got d_model={d}"
+            )
+        if self.cfg.spatial_path not in ("pool", "per_electrode"):
+            raise ValueError(
+                f"spatial_path must be 'pool' or 'per_electrode', "
+                f"got {self.cfg.spatial_path!r}"
+            )
+        if self.cfg.spatial_path == "per_electrode":
+            if self.cfg.temporal_frontend != "per_cell":
+                raise ValueError(
+                    "spatial_path='per_electrode' requires "
+                    "temporal_frontend='per_cell' (flat bakes in spatial mixing)"
+                )
+            if self.cfg.spatial_pe_mode == "factorized_2d":
+                raise ValueError(
+                    "spatial_path='per_electrode' is incompatible with "
+                    "spatial_pe_mode='factorized_2d' (no grid axis)"
+                )
+            if self.cfg.readout_mode == "hierarchical":
+                raise ValueError(
+                    "spatial_path='per_electrode' is incompatible with "
+                    "readout_mode='hierarchical' (no cell axis)"
+                )
+        if self.cfg.electrode_pe_mode not in ("none", "fourier_mni", "distance_bias"):
+            raise ValueError(
+                f"electrode_pe_mode must be 'none', 'fourier_mni', or "
+                f"'distance_bias', got {self.cfg.electrode_pe_mode!r}"
+            )
+        if (
+            self.cfg.electrode_pe_mode != "none"
+            and self.cfg.spatial_path != "per_electrode"
+        ):
+            raise ValueError(
+                f"electrode_pe_mode={self.cfg.electrode_pe_mode!r} requires "
+                f"spatial_path='per_electrode'"
+            )
+        if self.cfg.electrode_pe_mode == "fourier_mni" and d % 2 != 0:
+            raise ValueError(
+                f"electrode_pe_mode='fourier_mni' requires d_model % 2 == 0, "
+                f"got d_model={d}"
+            )
+
+        if self.cfg.spatial_path == "per_electrode":
+            # Skip Conv2d + pool. Shared per-electrode Conv1d(1 → d, k, s).
+            self.conv2d = None
+            self.conv2d_act = None
+            self.conv1d = None
+            self.per_electrode_conv1d = nn.Conv1d(
+                1,
                 t_cfg.out_channels,
                 kernel_size=t_cfg.kernel_size,
                 stride=t_cfg.stride,
             )
-        else:  # "flat" — baseline 256→32 front-end
-            n_cells = self.cfg.pool.pool_shape[0] * self.cfg.pool.pool_shape[1]
-            self.conv1d = nn.Conv1d(
-                t_cfg.in_channels * n_cells,
-                t_cfg.out_channels,
-                kernel_size=t_cfg.kernel_size,
-                stride=t_cfg.stride,
+        else:  # "pool" — scatter → Conv2d → pool → per-cell Conv1d
+            self.conv2d = nn.Conv2d(
+                self.cfg.conv2d_in_channels,
+                self.cfg.conv2d_out_channels,
+                kernel_size=self.cfg.conv2d_kernel_size,
+                padding=self.cfg.conv2d_padding,
             )
+            self.conv2d_act = nn.GELU()
+            self.per_electrode_conv1d = None
+            if self.cfg.temporal_frontend == "per_cell":
+                self.conv1d = nn.Conv1d(
+                    t_cfg.in_channels,
+                    t_cfg.out_channels,
+                    kernel_size=t_cfg.kernel_size,
+                    stride=t_cfg.stride,
+                )
+            else:  # "flat" — baseline 256→32 front-end
+                n_cells = self.cfg.pool.pool_shape[0] * self.cfg.pool.pool_shape[1]
+                self.conv1d = nn.Conv1d(
+                    t_cfg.in_channels * n_cells,
+                    t_cfg.out_channels,
+                    kernel_size=t_cfg.kernel_size,
+                    stride=t_cfg.stride,
+                )
 
         if self.cfg.temporal_frontend == "flat":
             # Flat front-end collapses the cell axis — parcel embedding is
@@ -104,6 +175,29 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
             nn.init.xavier_uniform_(self.parcel_embedding)
         else:
             self.parcel_embedding = None
+
+        if self.cfg.spatial_pe_mode == "factorized_2d":
+            H_pool, W_pool = self.cfg.pool.pool_shape
+            self.row_emb = nn.Parameter(torch.empty(H_pool, d // 2))
+            self.col_emb = nn.Parameter(torch.empty(W_pool, d // 2))
+            nn.init.normal_(self.row_emb, std=0.02)
+            nn.init.normal_(self.col_emb, std=0.02)
+        else:
+            self.row_emb = None
+            self.col_emb = None
+
+        if self.cfg.electrode_pe_mode == "fourier_mni":
+            W_f = torch.randn(3, d // 2) * self.cfg.fourier_pe_std
+            self.register_buffer("fourier_W", W_f, persistent=True)
+        else:
+            self.fourier_W = None
+
+        if self.cfg.electrode_pe_mode == "distance_bias":
+            # Scalar negative-distance weight. Zero-init so early training
+            # ignores the bias; optimizer scales it up if the signal helps.
+            self.dist_alpha = nn.Parameter(torch.zeros(()))
+        else:
+            self.dist_alpha = None
 
         if self.cfg.backbone.d_model != d:
             raise ValueError(
@@ -156,6 +250,8 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
         return self.decoder(memory, prev_phoneme)
 
     def _forward_memory(self, batch: dict) -> torch.Tensor:
+        if self.cfg.spatial_path == "per_electrode":
+            return self._forward_memory_per_electrode(batch)
         signal: torch.Tensor = batch["signal"]               # (B, N_e, 130)
         layout: torch.Tensor = batch["electrode_grid_layout"]  # (B, N_e, 2) long
         grid_shape: tuple[int, int] = batch["electrode_grid_shape"]
@@ -268,6 +364,19 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
                 cell_emb = pooled_support @ self.parcel_embedding  # (B, n_cells, d)
                 y = y + cell_emb.unsqueeze(-1)
 
+            # -- Stage 5b: + factorized 2D spatial PE on pool cells ---------------
+            if self.row_emb is not None and self.col_emb is not None:
+                H_pool, W_pool = self.cfg.pool.pool_shape
+                half = self.cfg.d_model // 2
+                # Row-major cells (#p_row * W_pool + #p_col): match pool.py.
+                row_exp = self.row_emb.unsqueeze(1).expand(H_pool, W_pool, half)
+                col_exp = self.col_emb.unsqueeze(0).expand(H_pool, W_pool, half)
+                cell_pe = torch.cat([row_exp, col_exp], dim=-1).reshape(
+                    n_cells, self.cfg.d_model
+                )                                       # (n_cells, d)
+                # Broadcast across batch and time tokens.
+                y = y + cell_pe.unsqueeze(0).unsqueeze(-1)
+
             # -- Stage 6: flatten + combined-attention backbone -------------------
             # Cell-major flatten: idx = cell * T_tokens + t.
             y_flat = y.permute(0, 1, 3, 2).reshape(
@@ -331,6 +440,110 @@ class NeuralFieldPerceiverPerPhoneme(nn.Module):
 
         memory = self.backbone(y_flat, active_flat, time_ids)
         return memory
+
+    def _forward_memory_per_electrode(self, batch: dict) -> torch.Tensor:
+        """Grid-agnostic path. Per-electrode Conv1d + atlas embedding.
+
+        Produces `(B, N_e · T_tokens, d)` tokens and runs them through the
+        combined-attention backbone. No scatter, no Conv2d, no pool.
+        Inactive electrodes are zero-filled and masked in attention.
+        """
+
+        signal: torch.Tensor = batch["signal"]               # (B, N_e, 130)
+        active: torch.Tensor = batch["electrode_active_mask"]  # (B, N_e) bool
+        support: torch.Tensor = batch["support"]             # (B, N_e, 15) float32
+
+        B, N_e, T_raw = signal.shape
+        d = self.cfg.d_model
+
+        # Zero out inactive electrodes before the shared Conv1d.
+        act_f = active.to(signal.dtype).unsqueeze(-1)         # (B, N_e, 1)
+        signal_masked = signal * act_f
+        # (B·N_e, 1, T_raw) → Conv1d → (B·N_e, d, T_tokens).
+        x = signal_masked.reshape(B * N_e, 1, T_raw)
+        x = self.per_electrode_conv1d(x)
+        T_tokens = x.shape[-1]
+        y = x.view(B, N_e, d, T_tokens)                       # (B, N_e, d, T_tokens)
+
+        # Per-electrode atlas embedding.
+        if self.parcel_embedding is not None:
+            elec_emb = support @ self.parcel_embedding        # (B, N_e, d)
+            y = y + elec_emb.unsqueeze(-1)
+
+        # Random-Fourier PE on electrode xyz coords.
+        if self.fourier_W is not None:
+            if "electrode_xyz" not in batch:
+                raise KeyError(
+                    "electrode_pe_mode='fourier_mni' requires 'electrode_xyz' "
+                    "in batch (provide fsaverage_coords_dir to the dataset)"
+                )
+            xyz: torch.Tensor = batch["electrode_xyz"]        # (B, N_e, 3)
+            phases = xyz @ self.fourier_W                      # (B, N_e, d/2)
+            fe = torch.cat(
+                [torch.sin(phases), torch.cos(phases)], dim=-1
+            )                                                  # (B, N_e, d)
+            y = y + fe.unsqueeze(-1)
+
+        # Electrode-major flatten: idx = electrode * T_tokens + t.
+        y_flat = y.permute(0, 1, 3, 2).reshape(B, N_e * T_tokens, d)
+        active_flat = (
+            active.unsqueeze(-1)
+            .expand(B, N_e, T_tokens)
+            .reshape(B, N_e * T_tokens)
+            .contiguous()
+        )
+        time_ids = (
+            torch.arange(T_tokens, device=y_flat.device)
+            .unsqueeze(0)
+            .expand(N_e, -1)
+            .reshape(-1)
+        )
+
+        attn_bias: torch.Tensor | None = None
+        if self.dist_alpha is not None:
+            if "electrode_xyz" not in batch:
+                raise KeyError(
+                    "electrode_pe_mode='distance_bias' requires 'electrode_xyz' "
+                    "in batch (provide fsaverage_coords_dir to the dataset)"
+                )
+            xyz_d: torch.Tensor = batch["electrode_xyz"]      # (B, N_e, 3)
+            d_e = torch.cdist(xyz_d, xyz_d)                    # (B, N_e, N_e)
+            # Tile across the time axis into a (B, 1, S, S) bias, block-
+            # constant across (t_q, t_k) pairs per electrode pair.
+            S = N_e * T_tokens
+            attn_bias = (
+                (-self.dist_alpha * d_e)
+                .view(B, 1, N_e, 1, N_e, 1)
+                .expand(B, 1, N_e, T_tokens, N_e, T_tokens)
+                .reshape(B, 1, S, S)
+            )
+
+        if self.cls_token is not None:
+            cls = self.cls_token.expand(B, 1, d)
+            y_flat = torch.cat([cls, y_flat], dim=1)
+            active_flat = torch.cat(
+                [
+                    torch.ones(
+                        B, 1, dtype=active_flat.dtype, device=active_flat.device
+                    ),
+                    active_flat,
+                ],
+                dim=1,
+            )
+            time_ids = torch.cat(
+                [
+                    torch.zeros(1, dtype=time_ids.dtype, device=time_ids.device),
+                    time_ids,
+                ],
+                dim=0,
+            )
+            if attn_bias is not None:
+                S1 = attn_bias.shape[-1] + 1
+                padded = attn_bias.new_zeros(B, 1, S1, S1)
+                padded[:, :, 1:, 1:] = attn_bias
+                attn_bias = padded
+
+        return self.backbone(y_flat, active_flat, time_ids, attn_bias)
 
     def _forward_logits(self, batch: dict) -> torch.Tensor:
         memory = self._forward_memory(batch)
