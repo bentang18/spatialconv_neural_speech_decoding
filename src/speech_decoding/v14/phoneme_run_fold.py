@@ -63,6 +63,7 @@ def _build_config(
     spatial_path: str = "pool",
     electrode_pe_mode: str = "none",
     num_heads: int | None = None,
+    use_parcel_embedding: bool = True,
 ) -> PerPhonemeConfig:
     """Build a consistent config at the given width, depth, conv2d, and pool.
 
@@ -108,6 +109,7 @@ def _build_config(
         spatial_pe_mode=spatial_pe_mode,
         spatial_path=spatial_path,
         electrode_pe_mode=electrode_pe_mode,
+        use_parcel_embedding=use_parcel_embedding,
         backbone=BackboneConfig(
             d_model=d_model, num_heads=num_heads, head_dim=head_dim,
             ffn_hidden=4 * d_model, num_blocks=backbone_depth, dropout=0.1,
@@ -148,6 +150,7 @@ def run_one_fold(
     spatial_path: str = "pool",
     electrode_pe_mode: str = "none",
     num_heads: int | None = None,
+    use_parcel_embedding: bool = True,
     label_smoothing: float = 0.0,
     mixup_alpha: float = 0.0,
     aug_preset: str = "none",
@@ -195,6 +198,7 @@ def run_one_fold(
         spatial_path=spatial_path,
         electrode_pe_mode=electrode_pe_mode,
         num_heads=num_heads,
+        use_parcel_embedding=use_parcel_embedding,
     )
     model = NeuralFieldPerceiverPerPhoneme(cfg).to(device)
 
@@ -282,6 +286,7 @@ def run_one_fold(
         "spatial_pe_mode": spatial_pe_mode,
         "spatial_path": spatial_path,
         "electrode_pe_mode": electrode_pe_mode,
+        "use_parcel_embedding": use_parcel_embedding,
         "num_heads": cfg.backbone.num_heads,
         "head_dim": cfg.backbone.head_dim,
         "label_smoothing": label_smoothing,

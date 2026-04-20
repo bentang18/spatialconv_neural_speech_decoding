@@ -289,8 +289,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-parcel-embedding",
         action="store_true",
-        help="Pooled mode: disable the soft parcel embedding (ablation — "
-        "tests whether the atlas anchor actually helps the pooled model).",
+        help="Disable the soft parcel embedding (`support @ P_emb`). Applies "
+        "to both pooled and per-phoneme modes. Used for the atlas-mechanism "
+        "ablation and for noemb LOPO pretrain→finetune.",
     )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument(
@@ -418,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             spatial_path=args.spatial_path,
             electrode_pe_mode=args.electrode_pe_mode,
             num_heads=args.num_heads,
+            use_parcel_embedding=not args.no_parcel_embedding,
             label_smoothing=args.label_smoothing,
             mixup_alpha=args.mixup_alpha,
             aug_preset=args.aug_preset,
