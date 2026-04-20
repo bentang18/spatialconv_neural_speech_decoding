@@ -1,41 +1,24 @@
 # Tactics — Concrete Task List
 
-Tactics layer of the triad (objectives → strategy → tactics). Operational: what's running, what to do when it lands, what's blocked. Updated 2026-04-19 late.
+Tactics layer of the triad (objectives → strategy → tactics). Operational: what's running, what to do when it lands, what's blocked. Updated 2026-04-20 (Stage 1 closed).
 
 - Objectives: `objectives.md`
 - Current-stage strategy: `strategy/stage_1.md`
 - DCC tooling: `references/dcc_setup.md`
 
-**Current stage:** Stage 1 (Phase 1). Architectural ablation wave in flight. When it drains, Stage 1 pauses; pivot to Stage 2 prerequisite work while waiting on data unblock.
+**Current stage:** Stage 1 closed 2026-04-20. Default frozen at `per_cell + partialconv + pe2d_frozen` @ d=32, depth=3, pool=(4,8). H1.2 confirmed at full Phase-1 LH scope (0.833 ± 0.060). Atlas-mechanism LOPO-inert at 4-core scale (mechanism-claim deferred to Stage 2). Pivoted to Stage-2 prerequisite work.
 
 ---
 
 ## In flight (DCC queue)
 
+Nothing. Close-out wave landed 2026-04-20.
+
 Poll with `scripts/ablation/status.py`. Tail logs with `scripts/ablation/logs.py <job_id>`. Peek mid-flight JSONs with `scripts/ablation/peek.py <job_id>`.
 
-| Job | Arm | Decides |
-|---|---|---|
-| 45769580 | T3.4 LOPO: `per_cell + pe2d + hier + partialconv` | Whether hierarchical joins Stage-1 default |
-| 45769655 | T3.3_frozen LOPO: `per_cell + pe2d_frozen + partialconv` | Whether pe2d's 192 learned params are load-bearing under transfer |
-| 45768642 | Default LOPO: `per_cell + partialconv + pe2d` | Fallback default if T3.4 disappoints |
-| 45769582 | T3.1 pooled: `hierarchical_atlas + partialconv + pe2d` | Anatomy-indexed query vs cell-indexed free query |
-| 45768472 | T1.2 amp_only pooled | Whether single-op amp augmentation passes pooled gate |
-| 45768473 | T1.2 dropout_only pooled | Whether single-op dropout augmentation passes pooled gate |
-| 45768474 | T1.2 noise_only pooled | Whether single-op noise augmentation passes pooled gate |
-| 45768489 | T2.2 per_electrode d=32 depth=4 pooled | Whether depth helps per_electrode path |
+## Immediate housekeeping (Stage-1 close-out admin)
 
----
-
-## When jobs land (post-wave actions)
-
-In order, per landing batch:
-
-1. **Aggregate** — `scripts/ablation/collect.py <job_ids>` pulls `*.result.json` from DCC and runs `update_ablation_log.py`. Result rows land in `experiments/v14_ablation_log.csv`.
-2. **Update Stage-1 scoreboard** — fill the matching row in `strategy/stage_1.md` §Current scoreboard with pooled / LOPO numbers + 1-line verdict. Remove the job row from the "In flight" table above.
-3. **Fire follow-on LOPOs** — any T1.2 variant that cleared the pooled gate (< 0.800) gets a LOPO: `sbatch scripts/v14_core/v14_lopo_<variant>_dcc.sh` after `rsync_repo`; record in `.ablation_submissions.jsonl`; add row to "In flight" above.
-4. **Update Stage-1 default** — if composed LOPOs confirm hierarchical + pe2d_frozen, rewrite §Default architecture in `strategy/stage_1.md` with the confirmed version and note the verdict.
-5. **Pause architectural ablation** — per §Discipline in `strategy/stage_1.md`. Further Stage-1 arch ablations below the reliability horizon are not actionable.
+- [x] **Copy 7-LH pooled checkpoint off `/work`.** Done 2026-04-20: 15 `.ckpt.pt` + 15 `.result.json` at `/hpc/group/coganlab/ht203/stage1_ckpt/`. Warm-start / SSL init source.
 
 ---
 
