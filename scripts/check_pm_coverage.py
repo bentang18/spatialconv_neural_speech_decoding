@@ -1,4 +1,10 @@
-"""Brainnetome PM coverage spot check (blocker #1 follow-up).
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+This sanity check operates on the retired cvs_avg35 MNI cache and the raw
+volumetric BNA_PM_4D volume. Per `#36` the Phase-1 representation is the
+baked fsaverage surface atlas. Kept as an oracle spot-check only.
+
+Brainnetome PM coverage spot check (blocker #1 follow-up).
 
 For every Phase-1 LH patient with a cached MNI152 electrode file, samples the
 4D Brainnetome probability map and reports:

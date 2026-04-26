@@ -1,4 +1,10 @@
-"""Walk a handful of S14 and S26 electrodes through sub2AvgBrainClinical
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+Debug/diagnostic for the retired `sub2AvgBrainClinical.m` path. Per `#36`
+the Phase-1 patient-side projection is `fsaverage_projection.py`. Keep for
+investigating cvs_avg35 parity questions; do not reuse as an active path.
+
+Walk a handful of S14 and S26 electrodes through sub2AvgBrainClinical
 step by step, printing the intermediate position at every stage.
 
 sub2AvgBrainClinical has four steps per hemisphere:

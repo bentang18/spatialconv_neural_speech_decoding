@@ -1,4 +1,12 @@
-"""Precompute MNI152 electrode coordinates for one or more patients.
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+Precomputes the cvs_avg35 MNI152 cache used by
+`scripts/compare_fsaverage_spatial_parity.py` as the oracle target. Per
+`#36`, the Phase-1 patient-side cache is
+`scripts/preprocess_fsaverage_coordinates.py` → `*_fsaverage_pial.csv`.
+This script stays around only to regenerate the parity oracle.
+
+Precompute MNI152 electrode coordinates for one or more patients.
 
 Reads FreeSurfer reconstructions from Box, runs the Python port of
 ``sub2AvgBrainClinical.m`` (see ``speech_decoding.v14.coordinates``), and

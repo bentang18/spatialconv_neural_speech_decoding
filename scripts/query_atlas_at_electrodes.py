@@ -1,4 +1,12 @@
-"""Per-electrode atlas cross-tab: Destrieux + Brainnetome, for every Phase-1 LH electrode.
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+This cross-tab runs on the retired cvs_avg35 + 8 mm dilation pipeline
+(envelope-vs-pial chaining, volumetric BNA sampling). Per `#36` the active
+equivalent samples the baked fsaverage atlas at each electrode's fsaverage
+vertex. Keep for diagnostic sanity checks on the oracle; do not use as the
+Phase-1 representation.
+
+Per-electrode atlas cross-tab: Destrieux + Brainnetome, for every Phase-1 LH electrode.
 
 For each electrode in ``data/mni_coords/<pt>_MNI152.csv``:
   - nearest vertex on ``cvs_avg35_inMNI152/lh.pial-outer-smoothed`` (the dural

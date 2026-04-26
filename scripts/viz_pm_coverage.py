@@ -1,4 +1,10 @@
-"""Plot Brainnetome PM coverage under every Phase-1 LH patient's electrodes.
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+Volumetric MNI152 visualization on the retired cvs_avg35 pipeline. Per
+`#36` the Phase-1 visualization target is the fsaverage surface. Kept for
+oracle-side QC only.
+
+Plot Brainnetome PM coverage under every Phase-1 LH patient's electrodes.
 
 Uses ``nilearn.plotting.plot_stat_map`` to render MNI152 template + Brainnetome
 PM overlay + electrode markers on orthogonal slices. One PNG per patient under

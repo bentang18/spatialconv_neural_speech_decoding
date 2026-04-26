@@ -33,10 +33,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+
 try:
     import nibabel as nib
 except Exception:  # pragma: no cover - handled at runtime
     nib = None
+try:
+    from scipy import sparse
+except Exception:  # pragma: no cover - handled at runtime
+    sparse = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT / "src") not in sys.path:
@@ -133,6 +139,20 @@ def parse_args() -> argparse.Namespace:
         help="Geodesic surface smoothing FWHM on fsaverage",
     )
     parser.add_argument(
+        "--projfrac-mode",
+        choices=("avg", "single"),
+        default="avg",
+        help="Ribbon sampling mode: 'avg' uses --projfrac-avg 0 1 0.1, "
+             "'single' uses --projfrac at a fixed depth (see --projfrac)",
+    )
+    parser.add_argument(
+        "--projfrac",
+        type=float,
+        default=0.9,
+        help="Single-depth pial-to-white fraction used when --projfrac-mode=single "
+             "(0 = white, 1 = pial; default 0.9 biases to outer ribbon)",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Only check local prerequisites and exit",
@@ -225,34 +245,38 @@ def vol2surf_cmd(
     atlas_volume: Path,
     atlas_subject: str,
     hemi: str,
-    frame: int,
     out_path: Path,
+    frame: int | None = None,
+    projfrac_mode: str = "avg",
+    projfrac: float = 0.9,
 ) -> list[str]:
     ensure_subject_surface(fsenv, atlas_subject, hemi, "white")
     ensure_subject_surface(fsenv, atlas_subject, hemi, "pial")
-    return [
+    if projfrac_mode == "avg":
+        proj_args = ["--projfrac-avg", "0", "1", "0.1"]
+    elif projfrac_mode == "single":
+        proj_args = ["--projfrac", f"{projfrac:g}"]
+    else:
+        raise ValueError(f"unknown projfrac_mode: {projfrac_mode!r}")
+    cmd = [
         str(fsenv.bin_path("mri_vol2surf")),
         "--mov",
         str(atlas_volume),
-        "--srcsubject",
-        atlas_subject,
-        "--trgsubject",
+        "--regheader",
         atlas_subject,
         "--hemi",
         hemi,
         "--surf",
         "white",
-        "--projfrac-avg",
-        "0",
-        "1",
-        "0.1",
-        "--frame",
-        str(frame),
+        *proj_args,
         "--interp",
         "trilinear",
         "--o",
         str(out_path),
     ]
+    if frame is not None:
+        cmd[cmd.index("--interp"):cmd.index("--interp")] = ["--frame", str(frame)]
+    return cmd
 
 
 def surf2surf_cmd(
@@ -312,6 +336,59 @@ def smooth_cmd(
     ]
 
 
+def _surface_smoothing_matrix(surface_path: Path) -> tuple["sparse.csr_matrix", int]:
+    if nib is None or sparse is None:
+        raise RuntimeError("nibabel and scipy are required for the Python smoothing fallback")
+    verts, faces = nib.freesurfer.io.read_geometry(str(surface_path))
+    n_vertices = int(verts.shape[0])
+    rows: list[int] = []
+    cols: list[int] = []
+    for tri in np.asarray(faces, dtype=np.int64):
+        a, b, c = (int(tri[0]), int(tri[1]), int(tri[2]))
+        rows.extend([a, b, b, c, c, a])
+        cols.extend([b, a, c, b, a, c])
+    data = np.ones((len(rows),), dtype=np.float32)
+    adj = sparse.coo_matrix((data, (rows, cols)), shape=(n_vertices, n_vertices)).tocsr()
+    adj.data[:] = 1.0
+    adj = adj + sparse.identity(n_vertices, dtype=np.float32, format="csr")
+    deg = np.asarray(adj.sum(axis=1)).reshape(-1)
+    inv_deg = np.reciprocal(np.maximum(deg, 1.0), dtype=np.float32)
+    norm = sparse.diags(inv_deg) @ adj
+    return norm.tocsr(), n_vertices
+
+
+def smooth_python(
+    *,
+    fsenv: FsEnv,
+    target_subject: str,
+    hemi: str,
+    in_path: Path,
+    out_path: Path,
+    smooth_fwhm: float,
+) -> None:
+    surface_path = ensure_subject_surface(fsenv, target_subject, hemi, "pial")
+    norm, n_vertices = _surface_smoothing_matrix(surface_path)
+    img = nib.load(str(in_path))
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    data = np.squeeze(data)
+    if data.ndim == 1:
+        data = data[:, None]
+    if data.ndim != 2 or data.shape[0] != n_vertices:
+        raise ValueError(
+            f"unexpected input shape {data.shape} for smoothing on {surface_path}"
+        )
+    n_iters = max(1, int(round((smooth_fwhm / 3.5) * 9)))
+    smoothed = data
+    for _ in range(n_iters):
+        smoothed = norm @ smoothed
+    out_img = nib.freesurfer.mghformat.MGHImage(
+        smoothed.astype(np.float32).reshape((n_vertices, 1, 1, smoothed.shape[1])),
+        affine=img.affine,
+        header=img.header,
+    )
+    nib.save(out_img, str(out_path))
+
+
 def write_manifest(out_dir: Path, payload: dict[str, object]) -> None:
     path = out_dir / "bake_manifest.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -353,7 +430,9 @@ def main() -> int:
         "hemis": args.hemis,
         "frames": frames,
         "smooth_fwhm": args.smooth_fwhm,
-        "projfrac_avg": [0, 1, 0.1],
+        "projfrac_mode": args.projfrac_mode,
+        "projfrac": args.projfrac if args.projfrac_mode == "single" else None,
+        "projfrac_avg": [0, 1, 0.1] if args.projfrac_mode == "avg" else None,
         "notes": [
             "This bake assumes atlas-side nonlinear surface alignment via mri_surf2surf sphere.reg.",
             "The accepted #36 contract requires ICBM152_fs (or equivalent) to exist as a real surface subject.",
@@ -361,22 +440,25 @@ def main() -> int:
     }
     write_manifest(out_dir, manifest)
 
+    full_run = frames == list(range(n_frames))
+
     for hemi in args.hemis:
         hemi_dir = out_dir / hemi
         hemi_dir.mkdir(parents=True, exist_ok=True)
-        for frame in frames:
-            proj_path = intermediates / f"{hemi}.frame{frame:03d}.atlas.mgh"
-            fsavg_path = hemi_dir / f"{hemi}.frame{frame:03d}.fsaverage.mgh"
-            smooth_path = hemi_dir / f"{hemi}.frame{frame:03d}.fsaverage.fwhm{args.smooth_fwhm:g}.mgh"
-
+        target_has_white = (args.subjects_dir / args.target_subject / "surf" / f"{hemi}.white").exists()
+        if full_run:
+            proj_path = intermediates / f"{hemi}.atlas.mgh"
+            fsavg_path = hemi_dir / f"{hemi}.fsaverage.mgh"
+            smooth_path = hemi_dir / f"{hemi}.fsaverage.fwhm{args.smooth_fwhm:g}.mgh"
             run(
                 vol2surf_cmd(
                     fsenv,
                     atlas_volume=args.atlas_volume,
                     atlas_subject=args.atlas_subject,
                     hemi=hemi,
-                    frame=frame,
                     out_path=proj_path,
+                    projfrac_mode=args.projfrac_mode,
+                    projfrac=args.projfrac,
                 ),
                 env=fsenv.env,
                 dry_run=args.dry_run,
@@ -393,18 +475,94 @@ def main() -> int:
                 env=fsenv.env,
                 dry_run=args.dry_run,
             )
-            run(
-                smooth_cmd(
-                    fsenv,
+            if args.dry_run:
+                print(f"[dry-run] smooth {fsavg_path} -> {smooth_path}")
+            elif target_has_white:
+                run(
+                    smooth_cmd(
+                        fsenv,
+                        target_subject=args.target_subject,
+                        hemi=hemi,
+                        in_path=fsavg_path,
+                        out_path=smooth_path,
+                        smooth_fwhm=args.smooth_fwhm,
+                    ),
+                    env=fsenv.env,
+                    dry_run=args.dry_run,
+                )
+            else:
+                print(
+                    f"[python-smooth] target {args.target_subject} missing {hemi}.white; "
+                    f"using pial-mesh NN smoothing for {smooth_path}"
+                )
+                smooth_python(
+                    fsenv=fsenv,
                     target_subject=args.target_subject,
                     hemi=hemi,
                     in_path=fsavg_path,
                     out_path=smooth_path,
                     smooth_fwhm=args.smooth_fwhm,
-                ),
-                env=fsenv.env,
-                dry_run=args.dry_run,
-            )
+                )
+        else:
+            for frame in frames:
+                proj_path = intermediates / f"{hemi}.frame{frame:03d}.atlas.mgh"
+                fsavg_path = hemi_dir / f"{hemi}.frame{frame:03d}.fsaverage.mgh"
+                smooth_path = hemi_dir / f"{hemi}.frame{frame:03d}.fsaverage.fwhm{args.smooth_fwhm:g}.mgh"
+
+                run(
+                    vol2surf_cmd(
+                        fsenv,
+                        atlas_volume=args.atlas_volume,
+                        atlas_subject=args.atlas_subject,
+                        hemi=hemi,
+                        frame=frame,
+                        out_path=proj_path,
+                        projfrac_mode=args.projfrac_mode,
+                        projfrac=args.projfrac,
+                    ),
+                    env=fsenv.env,
+                    dry_run=args.dry_run,
+                )
+                run(
+                    surf2surf_cmd(
+                        fsenv,
+                        atlas_subject=args.atlas_subject,
+                        target_subject=args.target_subject,
+                        hemi=hemi,
+                        in_path=proj_path,
+                        out_path=fsavg_path,
+                    ),
+                    env=fsenv.env,
+                    dry_run=args.dry_run,
+                )
+                if args.dry_run:
+                    print(f"[dry-run] smooth {fsavg_path} -> {smooth_path}")
+                elif target_has_white:
+                    run(
+                        smooth_cmd(
+                            fsenv,
+                            target_subject=args.target_subject,
+                            hemi=hemi,
+                            in_path=fsavg_path,
+                            out_path=smooth_path,
+                            smooth_fwhm=args.smooth_fwhm,
+                        ),
+                        env=fsenv.env,
+                        dry_run=args.dry_run,
+                    )
+                else:
+                    print(
+                        f"[python-smooth] target {args.target_subject} missing {hemi}.white; "
+                        f"using pial-mesh NN smoothing for {smooth_path}"
+                    )
+                    smooth_python(
+                        fsenv=fsenv,
+                        target_subject=args.target_subject,
+                        hemi=hemi,
+                        in_path=fsavg_path,
+                        out_path=smooth_path,
+                        smooth_fwhm=args.smooth_fwhm,
+                    )
 
     if not args.dry_run:
         consolidate_baked_atlas(out_dir)

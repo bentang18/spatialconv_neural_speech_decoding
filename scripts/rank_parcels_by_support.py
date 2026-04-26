@@ -1,4 +1,12 @@
-"""Rank Brainnetome parcels by Phase-1 electrode support (blocker #5 stat).
+"""ORACLE / MIGRATION REFERENCE — NOT PHASE-1 ACTIVE.
+
+This script ranks parcels on the retired cvs_avg35 + 8 mm dilation pipeline.
+It was used to derive the frozen 15-parcel Tier-1 list now stored in
+`src/speech_decoding/v14/token_spec.py`. Per `#36`, the active ranking runs
+on the baked fsaverage atlas via `scripts/summarize_fsaverage_support.py`.
+Kept as a parity oracle; do not rerun against the active pipeline.
+
+Rank Brainnetome parcels by Phase-1 electrode support (blocker #5 stat).
 
 Support statistic (blocker #5, agreed 2026-04-13; kernel revised 2026-04-14):
 
