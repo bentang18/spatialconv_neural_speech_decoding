@@ -157,6 +157,8 @@ Discussion surfaces the known unknowns and the contract, but once done, *run the
 
 **Archived** (historical only): `docs/archive/{sessions,plans,experiments,design_docs,experiment_log.md,research_synthesis.md,...}`. Previously-live doc forms (`current_direction.md`, `implementation_tasks.md`, `v14-core.md`) live here; the triad above supersedes them.
 
+**Reports** (`reports/`): point-in-time audit/scoping artifacts (READMEs + CSVs/JSONs). When findings migrate to memory or strategy, move the folder to `reports/archive/`. Active root holds only open investigations — empty is the correct state when nothing is in flight. No top-level INDEX; the active/archive split + dated folder names + memory back-references are the index.
+
 ### Configs & scripts
 
 - `configs/paths.yaml` — machine-specific BIDS paths (gitignored). DCC: `ps_bids_root=/work/ht203/data/BIDS`, `support_cache_dir=/work/ht203/data/atlas/support_cache_v2c_snap`, `channel_maps_dir=/work/ht203/data/channel_maps`.
