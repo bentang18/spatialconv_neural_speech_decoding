@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__exa__web_search_exa",
+      "mcp__exa__web_search_advanced_exa",
+      "mcp__arxiv__arxiv_search_papers",
+      "mcp__arxiv__arxiv_get_paper"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/record_sbatch.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
