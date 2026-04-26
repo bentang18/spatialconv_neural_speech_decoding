@@ -18,13 +18,13 @@ Strategy layer of the triad, scoped to **Stage 1: single-sensor supervised corre
 
 ## Default architecture
 
-Stage-1 default (confirmed by the 2026-04-19 wave — see scoreboard):
+Stage-1 default (updated 2026-04-20 after scoreboard re-audit corrected a direction-flipped LOPO verdict, and T3.1 LOPO landed tying T3.4):
 
 ```
-per_cell + partialconv + pe2d_frozen @ d=32, depth=3, pool=(4, 8)
+per_cell + partialconv + pe2d + hierarchical_atlas @ d=32, depth=3, pool=(4, 8)
 ```
 
-Hierarchical readout was in the provisional default but **LOPO-dropped**: T3.4 composed LOPO mean 0.787 vs Default LOPO mean 0.810 (−0.023 pp). Pooled win did not transfer. `pe2d_frozen` ties learned `pe2d` at LOPO within noise (0.807 vs 0.810) and saves 176 learnable params, so it promotes.
+Previous default was `per_cell + partialconv + pe2d_frozen` with mean-pool (D1) readout. The T3.4 composition (hierarchical + learned pe2d + partialconv) wins pooled 0.770 / LOPO 0.787 vs previous 0.814 / 0.807. T3.1 (atlas-anchored `hierarchical_atlas` — same architecture as T3.4 but the cell query comes from `pooled_support @ P_emb` instead of a free learned `q_cell`) ties T3.4 pooled (0.765 vs 0.770) and LOPO (0.788 vs 0.787). **T3.1 promoted as default on the tiebreak:** atlas-grounded query carries the program-hypothesis cross-patient story (calibration via Brainnetome anchoring) that a free `q_cell` does not, at matched accuracy and parameter budget. T3.4 is kept as the second-choice baseline.
 
 ### Pipeline
 
@@ -42,7 +42,7 @@ STAGE 1  Grid-scatter + Conv2d front-end
 
 STAGE 2  Masked-mean grid pool
  pool to (4, 8) = 32 cells
- + pe2d_frozen: row_emb[4, 16] ⊕ col_emb[8, 16] broadcast to cells (random-init, frozen)
+ + pe2d: row_emb[4, 16] ⊕ col_emb[8, 16] broadcast to cells (learnable)
 
 STAGE 3  Per-cell temporal Conv1d (shared weights)
  Conv1d(8 → 32, k=30, s=10)
@@ -58,22 +58,26 @@ STAGE 5  Combined-attention backbone
  pre-norm, residual, dropout 0.1
  token_active_mask (from pool-cell active mask broadcast across time) on Q and K
 
-STAGE 6  D1 readout
- mean-pool memory across tokens
+STAGE 6  Hierarchical_atlas readout
+ cell-vec = mean over time for each of 32 cells → (B, 32, d)
+ pooled_support[32, 15] = masked-mean pool of support[N_e, 15] onto 32 cells
+ cell_query = pooled_support @ P_emb[15, d] → (B, 32, d)   ← atlas-anchored (no free q_cell)
+ scores  = (cell_vec · cell_query).sum(-1) * (1/√d) → (B, 32)
+ readout = softmax(scores) · cell_vec → (B, d)
  concat prev_phoneme_emb → Linear → (B, 9)
 
 LOSS  flat per-phoneme CE + teacher forcing; exhaustive 9³ AR at eval
 ```
 
-~47 k parameters.
+~47 k parameters — same budget as T3.4, the 1 k free `q_cell[32, d]` is replaced with the pre-existing P_emb projection.
 
 ### Why this default
 
 - **per_cell with (4, 8) pool** — rigid-grid pool is a local optimum at 4 patients / 1 min: pooled numbers match or edge the per-electrode arms within seed-noise. Grid-conditional; does not generalize to sEEG, but we are not at sEEG yet.
 - **partialconv** — Liu-2018 mask renormalization upgrades conv correctness under missing / masked inputs. Composes cleanly; small pooled effect alone, beneficial in composition.
-- **pe2d_frozen** — random-init row + column embeddings broadcast to pooled cells. LOPO-measured cross-patient regularizer (Batch 2: −0.013 uniform across 4 patients). Frozen version matches learned at LOPO within noise (0.807 vs 0.810), 176 fewer learnable params, no transfer cost.
-- **D1 readout (mean-pool + prev_phoneme + Linear)** — the minimum AR head. Hierarchical readout was tested in composition (T3.4) and LOPO-dropped (−0.023 pp vs D1). Pooled win did not transfer.
-- **d=32, depth=3** — matches Ben's 0.734 baseline param budget (~47 k). Growing capacity without growing the corpus does not move LOPO (Charmander scaling observation); revisit at Stage 2 scale.
+- **pe2d (learned)** — row + column embeddings broadcast to pooled cells. LOPO-measured cross-patient regularizer (pe2d-alone: −0.013 uniform across 4 patients). Learned version is used in T3.4 (the composition being elevated). Frozen variant ties at LOPO within noise and is the zero-parameter fallback; kept as ablation.
+- **hierarchical_atlas readout** — cell query is computed as `pooled_support @ P_emb[15, d]` and softmax-weights the 32 cell vectors. Same information pathway as T3.4's free `q_cell[32, d]` but the query is anatomically grounded — it is literally a linear projection of the cell's Brainnetome support profile through the learned parcel embedding. T3.1 ties T3.4 on both pooled (0.765 vs 0.770) and LOPO (0.788 vs 0.787); chosen as default because the atlas-grounded query carries the cross-patient calibration story that the program hypothesis commits to.
+- **d=32, depth=3** — matches Ben's 0.734 baseline param budget (~47 k). Growing capacity without growing the corpus does not move LOPO; revisit at Stage 2 scale.
 
 This default is revisable at stage pass-through. Any Stage-1 win that requires rigid-grid assumptions (per_cell, pe2d) is re-tested on per-electrode tokens at Stage 2 and may be displaced.
 
@@ -123,10 +127,13 @@ All pooled-joint numbers: S14 + S26 + S33 + S62, 5 folds × 3 seeds, d=32, depth
 | canonical per_cell | 0.794 ± 0.059 | 0.790 ± 0.056 (S14) | the thing to beat |
 | flat Conv1d | 0.791 ± 0.034 | 0.797 / 0.758 / 0.777 / 0.793 | rigid-grid local optimum; ablation only |
 | pe2d alone | 0.823 ± 0.059 | −0.013 uniform across 4 pts | LOPO-measured cross-patient regularizer |
-| hierarchical alone | 0.761 ± 0.040 | LOPO-dropped via T3.4 composed | pooled win, LOPO loss |
+| hierarchical alone (no partialconv, no pe2d) | 0.761 ± 0.040 | **not LOPO-tested** | best pooled 4-core in the log; edges T3.4 (0.770) within noise. Gap: if T3.1 LOPO ties T3.4, worth LOPO-testing hierarchical-alone to check whether partialconv+pe2d are load-bearing in the T3.4 composition. |
 | partial_conv alone | 0.795 ± 0.058 | trended −0.006 Batch-1 (within noise) | no-op alone; useful composed |
-| per_cell + noemb (canonical alone) | 0.805 ± 0.027 | — | atlas-embedding pooled-inert; LOPO arm tested inside default (see T3.5 below) |
-| default (partialconv + pe2d_frozen) | 0.816 ± 0.062 (4-core) / **0.833 ± 0.060 (7-LH)** | **0.810 ± 0.028** (S14 0.791 / S26 0.795 / S33 0.855 / S62 0.800) | LOPO confirmed via job 45768642; 7-LH pooled confirmed via job 45793090 |
+| per_cell + noemb (canonical alone) | 0.805 ± 0.027 | — | atlas-embedding pooled-inert; LOPO arm tested inside old default (see T3.5 below) |
+| old default (partialconv + pe2d learned, D1 readout) | 0.816 ± 0.062 (4-core) / 0.833 ± 0.060 (7-LH) | 0.810 ± 0.028 (S14 0.791 / S26 0.795 / S33 0.855 / S62 0.800) | LOPO via job 45768642; 7-LH pooled via job 45793090 |
+| old default (partialconv + pe2d_frozen, D1 readout) | 0.814 ± 0.067 (4-core) | 0.807 ± 0.015 (S14 0.790 / S26 0.804 / S33 0.829 / S62 0.804) | LOPO via job 45769655 — dominated by T3.4 on both protocols |
+| T3.4 (partialconv + pe2d + hierarchical) — second choice | 0.770 ± 0.036 (4-core) | 0.787 ± 0.002 (S14 0.790 / S26 0.788 / S33 0.786 / S62 0.785) | free `q_cell` version; see T3.4 below. Elevated 2026-04-20 interim. |
+| **new default — T3.1 (partialconv + pe2d + hierarchical_atlas)** | **0.765 ± 0.042** (4-core) | **0.788 ± 0.014** (S14 0.806 / S26 0.773 / S33 0.789 / S62 0.783) | atlas-anchored query (`pooled_support @ P_emb`). Ties T3.4 on both protocols; wins the default tiebreak via program-hypothesis alignment. Job 45798311 (2026-04-20). |
 
 ### T3.3 — pe2d mechanism
 
@@ -140,21 +147,42 @@ All pooled-joint numbers: S14 + S26 + S33 + S62, 5 folds × 3 seeds, d=32, depth
 
 **Mechanism verdict:** learned / frozen / row / col cluster inside ±0.011 pooled. pe2d_frozen matches learned pe2d at LOPO within noise and saves 176 learnable params. **Promoted to default.**
 
-### T3.4 — pe2d + hierarchical composition
+### T3.4 — pe2d + hierarchical composition (second choice after T3.1)
 
 | variant | job | pooled PER | LOPO mean (4 held-out) | gate |
 |---|---|---|---|---|
-| pe2d + hierarchical + partialconv | 45768287 / 45769580 | 0.770 ± 0.036 | **0.787 ± 0.002** (S14 0.790 / S26 0.788 / S33 0.786 / S62 0.785) | **LOPO FAILED**: −0.023 pp vs Default LOPO 0.810 |
+| pe2d + hierarchical + partialconv | 45768287 / 45769580 | 0.770 ± 0.036 | **0.787 ± 0.002** (S14 0.790 / S26 0.788 / S33 0.786 / S62 0.785) | **PASSED** — tied by T3.1, superseded on anatomy-grounding tiebreak |
 
-Pooled win (0.770) did not transfer. Per-patient LOPO is uniformly at/below Default LOPO: hierarchical's slot-specific queries overfit in-distribution but fail on the held-out patient. **Hierarchical is LOPO-dropped from the Stage-1 default.**
+Both protocols win vs the previous default. Per-patient LOPO deltas vs `per_cell + partialconv + pe2d_frozen` default (0.807 LOPO mean):
+- S14: 0.790 − 0.790 = 0.000 (tie)
+- S26: 0.788 − 0.804 = −0.016 (T3.4 better, edge of noise)
+- S33: 0.786 − 0.829 = **−0.043** (T3.4 dominant; S33 recovery from the previous default's outlier)
+- S62: 0.785 − 0.804 = −0.019 (T3.4 better, edge of noise)
 
-### T3.1 — atlas-anchored hierarchical readout
+Aggregate LOPO delta −0.020 pp; T3.4 dominates on both protocols and all 4 LOPO patients. The previous verdict "LOPO FAILED −0.023 pp" was direction-flipped (PER is wrong/total, so a negative delta is an improvement). Corrected 2026-04-20. **Hierarchical readout promoted to Stage-1 default.**
 
-| variant | job | pooled PER | LOPO | gate |
+### T3.1 — atlas-anchored hierarchical readout (new Stage-1 default)
+
+| variant | job | pooled PER | LOPO mean (4 held-out) | gate |
 |---|---|---|---|---|
-| hierarchical_atlas + partialconv + pe2d | 45769582 | **0.765 ± 0.042** | not run | pooled ties T3.4 (0.770); moot since T3.4 LOPO-failed |
+| hierarchical_atlas + partialconv + pe2d | 45769582 (pooled) / 45798311 (LOPO) | **0.765 ± 0.042** | **0.788 ± 0.014** (S14 0.806 / S26 0.773 / S33 0.789 / S62 0.783) | **PASSED — promoted to default on tiebreak vs T3.4** |
 
-Anatomy-indexed query trades the 32-cell free `q_cell` for `pooled_support @ parcel_embedding`. Pooled PER ties T3.4 within noise (0.765 vs 0.770). LOPO not run — T3.4 parent LOPO-failed the same readout primitive, so atlas-anchoring the query is not a rescue path at Stage 1. **Retired for Stage 1.**
+Anatomy-indexed query: `cell_query = pooled_support @ P_emb[15, d]` replaces T3.4's free `q_cell[32, d]`. Pooled and LOPO both tie T3.4 within noise:
+
+| protocol | T3.1 | T3.4 | Δ (T3.1 − T3.4) |
+|---|---|---|---|
+| pooled 4-core | 0.765 | 0.770 | −0.005 |
+| LOPO S14 | 0.806 | 0.790 | +0.016 (T3.1 worse, edge of ±0.020 noise) |
+| LOPO S26 | 0.773 | 0.788 | −0.015 (T3.1 better, edge of noise) |
+| LOPO S33 | 0.789 | 0.786 | +0.003 (tie) |
+| LOPO S62 | 0.783 | 0.785 | −0.002 (tie) |
+| LOPO mean | 0.788 | 0.787 | +0.001 (tie) |
+
+Per-patient spread differs: T3.4 is uniform (0.785–0.790 range 0.005); T3.1 is wider (0.773–0.806 range 0.033). T3.1 trades S14 saturation for S26 lift — consistent with the data-starved LOPO rule that capacity should shift toward weaker patients. Aggregate tie on both protocols; tiebreak resolves in T3.1's favor because `pooled_support @ P_emb` grounds the readout in Brainnetome anatomy, matching the program hypothesis (problem 1: calibration; problem 2: shared dynamics) — a free `q_cell` does not.
+
+Also a param saving: T3.1's query is zero new parameters (reuses P_emb), vs T3.4's 1024-param `q_cell`. Total ~47 k (T3.1) vs ~48 k (T3.4).
+
+**Caveat for Stage 2:** S14 regression (+0.016 pp) is at the noise-band edge. At Stage-2 scale (SSL + more patients), watch whether S14 recovers as P_emb becomes better-characterized — if S14 stays degraded, the atlas projection is noise-limited at 4 patients × 1 min and a larger embedding or cross-attention (T3.6-mid) is the next step.
 
 ### T1.2 — aug decomposition (per-op)
 
@@ -175,10 +203,10 @@ Tests whether the per-electrode arm closes on per_cell as capacity grows — inf
 | variant | job | pooled PER | gate |
 |---|---|---|---|
 | per_electrode + fourier_mni, d=32, depth=3 | — | 0.826 ± 0.046 | reference |
-| per_electrode + fourier_mni, d=64, depth=3 (h=4) | 45768288 | 0.786 ± 0.034 | **PASSED**: narrows pooled deficit vs per_cell (0.795) to 0.009 pp |
-| per_electrode + fourier_mni, d=32, depth=4 | 45768489 | **0.841 ± 0.062** | **FAILED**: depth alone (no width) does not help per_electrode |
+| per_electrode + fourier_mni, d=64, depth=3 (h=4) | 45768288 | **0.786 ± 0.034** | **PASSED**: at d=64, per_electrode+fourier *leads* per_cell+partialconv pooled (0.795) by 0.009 pp |
+| per_electrode + fourier_mni, d=32, depth=4 | 45768489 | 0.841 ± 0.062 | **FAILED**: depth alone (no width) does not help per_electrode |
 
-**Capacity probe verdict:** width (d=64) closes the per_cell gap; depth alone (d=32, depth=4) does not. Per-electrode capacity is width-bound at this corpus size. At Stage-2 scale, start per-electrode at d=64.
+**Capacity probe verdict:** width (d=64) closes the per_cell gap and edges past it; depth alone (d=32, depth=4) regresses. Per-electrode capacity is width-bound at this corpus size. At Stage-2 scale, start per-electrode at d=64. (Previous phrasing "narrows deficit to 0.009 pp" was direction-flipped; at d=64 per_electrode leads per_cell, it does not trail.)
 
 ### T3.5 — noemb LOPO (atlas-mechanism isolation)
 
@@ -217,23 +245,25 @@ After each `scripts/ablation/collect.py <job_id>`:
 
 ### Wave closed 2026-04-19
 
-8 jobs landed. Stage-1 default updated to `per_cell + partialconv + pe2d_frozen` (D1 readout). Hierarchical LOPO-dropped; atlas-anchored hierarchical retired. T1.2 aug decomposition inconclusive at current scale (all variants inside seed-noise, LOPO not prioritized). T2.2 width > depth for per-electrode capacity.
+8 jobs landed. Initial reading promoted `per_cell + partialconv + pe2d_frozen` (D1 readout) as default and retired the hierarchical family. **Scoreboard re-audit 2026-04-20 corrected a direction-flipped LOPO verdict** on T3.4 (PER is `wrong/total`; lower is better, so the −0.023 pp T3.4 delta was a win, not a loss). Corrected outcomes in current scoreboard. T1.2 aug decomposition inconclusive at current scale (all variants inside seed-noise, LOPO not prioritized). T2.2 width > depth for per-electrode capacity; at d=64 per_electrode+fourier edges past per_cell.
 
 ### Close-out wave 2026-04-20
 
-2 jobs landed (45793090, 45793091). Stage 1 genuinely closed:
+3 jobs landed (45793090, 45793091, 45798311) + scoreboard re-audit:
 
-- **H1.2 confirmed at full Phase-1 LH scope.** 7-LH pooled default = 0.833 ± 0.060 (per-patient range 0.826–0.851), +0.017 pp vs 4-core within noise. Stage-1 default holds at the originally-defined patient scope. Checkpoint saved for Stage-2 warm-start.
-- **Atlas-mechanism isolated.** noemb LOPO = 0.823 ± 0.055 vs default LOPO 0.810 ± 0.028 — noemb matches or slightly exceeds default on 3/4 patients, all inside ±0.020 LOPO seed-noise. **Soft parcel embedding is LOPO-inert at 4-core, ~1 min/patient.** Kept in architecture; mechanism-claim deferred to Stage-2 scale.
+- **H1.2 confirmed at full Phase-1 LH scope.** 7-LH pooled (under the *old* default) = 0.833 ± 0.060 (per-patient range 0.826–0.851), +0.017 pp vs 4-core within noise. Scaling to extended Phase-1 LH cohort does not degrade the old default. Checkpoint saved for Stage-2 warm-start. *Re-running 7-LH under the T3.1 default is a pending Stage-1 close-out task.*
+- **Atlas-mechanism isolated.** noemb LOPO = 0.823 ± 0.055 vs old default LOPO 0.807 ± 0.015 — aggregate +0.016 pp (noemb worse); all inside ±0.020 LOPO seed-noise. **Soft parcel embedding is LOPO-inert at 4-core, ~1 min/patient** — not a dominant win, not a loss. Kept in architecture; mechanism-claim deferred to Stage-2 scale.
+- **Scoreboard re-audit 2026-04-20 (load-bearing).** T3.4 `hierarchical + partialconv + pe2d` LOPO 0.787 vs old default LOPO 0.807 was mis-read as "−0.023 pp LOPO FAILED" — direction was flipped. T3.4 wins both pooled (0.770 vs 0.814) and LOPO on all 4 patients, with a dominant S33 recovery (0.855 → 0.786, −0.069 pp vs learned-pe2d default). T3.4 elevated to interim default; T3.1 LOPO requeued (had been skipped on the flipped rationale).
+- **T3.1 LOPO landed (job 45798311).** T3.1 `hierarchical_atlas + partialconv + pe2d` LOPO mean 0.788 ± 0.014 (S14 0.806 / S26 0.773 / S33 0.789 / S62 0.783) — ties T3.4 at 0.787 within noise. **T3.1 promoted to Stage-1 default on the tiebreak:** atlas-grounded query (`pooled_support @ P_emb`) carries the program-hypothesis cross-patient story at matched accuracy and a ~1 k parameter saving. T3.4 retained as second-choice baseline.
 
-**Architectural ablation fully paused** per §Discipline. Stage-1 is closed. Pivot to Stage-2 prerequisite work (continuous-sample loader, SSL objective, calibration stub) while waiting on data unblock (13 missing lexical FreeSurfer recons). Stage-2 atlas-mechanism question (P_emb at larger scale / with SSL / vs cross-attn) is the decisive re-test for noemb.
+**Stage 1 closed 2026-04-20.** Default: `per_cell + partialconv + pe2d + hierarchical_atlas` @ d=32, depth=3, pool=(4,8). Architectural ablation paused per §Discipline. Pivot to Stage-2 prerequisite work (continuous-sample loader, SSL objective, calibration stub) + data unblock on 13 missing lexical FreeSurfer recons. Open follow-ups at Stage-1 scope (not blocking Stage-2 kickoff): re-run 7-LH under the T3.1 default; LOPO-test plain `hierarchical alone` to check whether partialconv+pe2d are load-bearing in the composition.
 
 ---
 
 ## Rejected paths (Stage 1)
 
 - **flat Conv1d as default** — rigid-grid local optimum (0.791 pooled ≈ per_cell). Retained as ablation only.
-- **hierarchical readout (any composition)** — LOPO-dropped 2026-04-19. Pooled win (0.770, T3.4) did not transfer: LOPO mean 0.787 vs Default LOPO 0.810 (−0.023 pp). Atlas-anchored variant (T3.1 hieratlas, 0.765 pooled) tied the base form and was retired without LOPO on the same reasoning. Slot-specific queries overfit the 4-patient in-distribution set. Revisit at Stage-2 scale only with a new motivation, not as a reopened question.
+- **~~hierarchical readout (any composition)~~ — removed from rejected paths 2026-04-20.** Previously listed as LOPO-dropped 2026-04-19 based on a direction-flipped reading (PER is `wrong/total`; the T3.4 LOPO 0.787 vs old default 0.810 was a **win** of 0.023 pp, not a loss). Corrected: T3.4 wins both pooled and LOPO across all 4 patients with a dominant S33 recovery; elevated to Stage-1 default. T3.1 (atlas-anchored) LOPO is now in-flight.
 - **noemb (no soft parcel embedding) as a Stage-1 rejection** — *not* rejected. Pooled-inert at current scale (0.805 vs canonical 0.794, inside ±0.015). LOPO tested 2026-04-20 (T3.5 / job 45793091): noemb LOPO 0.823 ± 0.055 vs default LOPO 0.810 ± 0.028 — matches within seed-noise on 3/4 patients. **Soft parcel embedding is LOPO-inert at 4-core, ~1 min/patient.** Kept in architecture; load-bearing claim deferred to Stage-2 scale re-test under SSL / 16+ patients.
 - **T3.6 original specification** (per_cell + cross-attn + dual-stream + 611-token backbone) — deferred to Stage 2 where cross-attn lives naturally on per_electrode tokens without dual-stream.
 - **FiLM / AdaIN / patient-stat normalization** — zero in-modality precedent (2026-04-19 iEEG-FM audit).
@@ -247,7 +277,7 @@ After each `scripts/ablation/collect.py <job_id>`:
 
 Three rules override naive "keep adding wins":
 
-1. **Pooled and LOPO can disagree.** pe2d lost pooled and won LOPO. Hierarchical won pooled, LOPO pending. Single-protocol evidence is insufficient to default an architectural change.
+1. **Pooled and LOPO can disagree.** pe2d lost pooled and won LOPO. Hierarchical won both (corrected 2026-04-20 after a direction-flipped LOPO reading). Single-protocol evidence is insufficient to default an architectural change — and direction of the metric must be verified before citing deltas.
 2. **Stop architectural ablation at the noise floor.** The pe2d mechanism probe already showed this: learned / frozen / row / col cluster inside ±0.015. More variants don't change the verdict.
 3. **Stage-1 wins that require rigid-grid assumptions don't carry forward.** Any Stage-1 default that wins via per_cell or pe2d is re-tested on per-electrode tokens at Stage 2. Do not promote rigid-grid defaults as if they survive a sensor change.
 

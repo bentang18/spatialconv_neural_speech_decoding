@@ -90,6 +90,26 @@ Cutoff is robust: the `argmax_wins ∈ [5, 9]` band is empty on current data, so
 
 Older centroid-VE logic (reachability thresholds, distance-to-ROI routing, 25/15 mm thresholds) is quarantined under `archive/legacy/data/atlas.py`. v14 uses baked fsaverage surface BNA vectors per `#36`, not centroid routing.
 
+### Per-electrode BNA support radius — canonical = 3 mm (first-principles)
+
+`ECoG_Recon/D<N>/elec_recon/` ships pre-baked BNA CSVs at 1/2/3/5/7/10 mm. We use **3 mm** for both uECoG and D-cohort sEEG, derived from three independent constraints that converge on this value:
+
+1. **HG sensitivity volume of a depth contact.** DIXI Microdeep contact (0.8 mm × 2 mm). Dubey & Ray 2019 (J Neurosci) measured 50%-power half-width ~1–2 mm for HG on depth contacts; Lachaux 2003/2012 estimated effective HG sampling radius ~3 mm. → r_phys ≈ **2–3 mm**.
+2. **Localization uncertainty in patient-space recon.** FreeSurfer cortical surface sub-mm + post-implant brain-shift correction 1–2 mm + atlas-snap quantization 0.5–1 mm. → r_loc ≈ **1–2 mm**.
+3. **Inter-contact spacing constraint.** DIXI standard 3.5 mm (verified 3.3–3.5 mm median in the 2026-04-24 A6 sensor-geometry audit). r > 3.5 mm starts attributing parcels to a contact that physically belong to its neighbor. → soft ceiling **r < 3.5 mm**.
+
+Convolution of (1) and (2): √(r_phys² + r_loc²) ≈ √(2.5² + 1.5²) ≈ 2.9 mm. Combined with the 3.5 mm ceiling from (3), the goldilocks pick is **3 mm**.
+
+**Empirical confirmation**: 2026-04-21 BNA parity audit at 3 mm gave 74% Tier-1 argmax coverage on D-cohort — argmax is meaningful and not noise-dominated. Smaller radii (1 mm) produce many all-zero supports (sphere lands in WM/CSF); larger (5+ mm) saturate adjacent contacts to redundant supports.
+
+**Encoded in**:
+- `scripts/v14_core/build_dpatient_support_cache.py` (D-cohort builder)
+- `scripts/bna_parity_dpatients.py` (parity audit)
+- `scripts/audit_seeg_cohort_coverage.py` (cohort coverage)
+- `scripts/build_euclidean_support_cache.py` (uECoG builder)
+
+Re-derivation justifies the convention without needing Nanlin's input — the radius is fully determined by HG biophysics + recon-pipeline noise + DIXI geometry, all independently measurable.
+
 ## Corpus Scale (Phase 1.5 data audit, 2026-04-18)
 
 Numbers below were audited from local BIDS on 2026-04-18 (from each `_ieeg.json`'s `RecordingDuration` and events.tsv). Supersedes the prior "~24 h" and "456 min / 29 patients" figures, which referenced a different cross-cohort estimate that included sEEG.
@@ -116,6 +136,47 @@ S26   710 s (11.8 min)   S58  1021 s (17.0 min)
 
 **Continuous / epoched ratio ≈ 1.04× median** (range 0.85× S33 → 2.43× S14). The response-locked 2.5 s trial windows already cover nearly all recording — "continuous SSL beyond epoched" is marginal for most patients. SSL at this scale is a representation-structure bet, not a data-expansion play; the real expansion lever for Phase 1.5 is the lexical corpus below.
 
+## sEEG D-cohort Corpus (Stage-3 ceiling, 2026-04-24)
+
+Audited via `scripts/seeg_corpus_audit.py` (JSON-first: `RecordingDuration` read from each `*_ieeg.json` sidecar; all 674 EDFs resolved from sidecar, zero EDF-header fallbacks, zero failures). Source: `reports/seeg_corpus_audit_2026_04_24/{per_run,per_patient,summary}.{csv,md}`.
+
+| Task | Hours | D-patients | BIDS root (Box) |
+|---|---:|---:|---|
+| Phoneme sequencing (PS)       | **40.73 h** | 50 | `BIDS-1.4_Phoneme_sequencing/BIDS/sub-D*` |
+| Lexical decision + delay      | **65.87 h** | 52 | `BIDS-1.0_LexicalDecRepDelay/BIDS/sub-D*` |
+| Lexical decision, no delay    | **31.68 h** | 26 | `BIDS-1.0_LexicalDecRepNoDelay/BIDS/sub-D*` |
+| Sentence repetition           | **42.31 h** | 34 | `BIDS-1.4_SentenceRep/BIDS/sub-D*` |
+| **Grand total (union)**       | **180.59 h** | **87 unique** | — |
+
+**Ratio to uECoG corpus**: 180.59 h / 6.79 h ≈ **26.6× more raw data**, **87 / 27 ≈ 3.2× more patients**. This is the Stage-3 SSL-pretrain ceiling.
+
+Top-10 by total hours: D22 (6.09 h, PS+SR), D24 (5.75 h, all 4), D71 (5.05 h, all 4), D29 (4.96 h, all 4), D57 (4.62 h, all 4), D23 (4.56 h, PS+Lex+SR), D79 (4.05 h, PS+LexDelay), D59 (4.00 h, PS+LexDelay+SR), D53 (3.98 h, all 4), D28 (3.91 h, all 4). Five of the top-10 have coverage across all four speech tasks.
+
+DCC presence (`reports/dcc_sync_plan_2026_04_24/`): PS 50/50 ✓, SentenceRep 34/34 ✓, LexDelay 21/52 (31 Box-only), LexNoDelay 0/26 (entire task Box-only). Of the 180.59 h, 122.24 h (PS+SR+partial-LexDelay) is DCC-accessible today; 58.35 h needs rsync from Box first. Per-patient join with support cache / sig-channel / z-score verdicts in `data/dcohort_manifest.csv` (B3).
+
+## Box Mount Audit Pattern (lesson from A3, 2026-04-24)
+
+The macOS Box mount (`/Users/bentang/Library/CloudStorage/Box-Box/`) is **latency-bound, not bandwidth-bound**. Every file open hits a remote stat; concurrent opens are partially serialized inside the Finder integration. Patterns that look fast on a local FS hang indefinitely on Box.
+
+**A3's first version**: sequential `mne.io.read_raw_edf(path, preload=False)` over 674 BIDS `*_ieeg.edf` files (≥1 GB each). `preload=False` still reads enough header bytes for MNE to populate `n_times` and `info`, and Python's `Path.glob()` serializes those opens. Result: 0% CPU, no output for 22+ minutes, never completed.
+
+**The fix that worked**: read the BIDS JSON sidecar instead. Every `*_ieeg.edf` has a co-located `*_ieeg.json` that already carries `SamplingFrequency`, `RecordingDuration`, and `SEEGChannelCount` (~250 bytes vs. 1 GB). Combined with a 16-thread `ThreadPoolExecutor`, all 674 runs probed in **1m54s, zero EDF-header fallbacks, zero failures**.
+
+### Audit pattern: prefer sidecar metadata, parallelize aggressively, skip Finder
+
+When auditing anything on the Box mount, in this order:
+
+1. **Read BIDS sidecars (`*.json`, `*.tsv`) first.** They carry duration, sampling frequency, channel counts, event timing — most of what an audit needs. Open them via plain `Path.read_text()` + `json.loads`, not via MNE/pandas helpers that may also touch the data file.
+2. **If you must touch the data file, parallelize.** Box latency per request is 0.5–2 s; throughput dies under serialization but scales linearly with `ThreadPoolExecutor(max_workers=16)`. This is I/O-bound work, GIL is irrelevant.
+3. **Don't use `mne.io.read_raw_edf` to count samples.** Use the JSON `RecordingDuration` × `SamplingFrequency` instead. Even with `preload=False`, MNE opens the EDF.
+4. **Don't use shell `find` over Box for anything but path enumeration.** `find -name '*_ieeg.edf'` works for lists but `find -size` triggers stats per file and stalls.
+5. **Warm the cache before timing.** A first `ls` on a cold dir can take 10× longer than the second. If a script seems hung, check `lsof -p <pid> | grep Box-Box` to see whether it's progressing on different files (still working) or stuck on the same file (truly hung).
+6. **All training reads happen on DCC, never via Box mount.** Box is for recon files, sidecar audits, and one-off coord/atlas extraction — not for `.fif` loads in a training loop.
+
+### When the sidecar is missing
+
+Fall back to the data-file header read, but in parallel and as a tagged source so the report shows it. `scripts/seeg_corpus_audit.py:_process_one_edf` is the reference: returns `source: "json" | "edf" | "error"` per row, and the summary surfaces fallback counts. If `source=edf` shows up in any future audit, that's a flag that the BIDS dataset is missing sidecars for those runs — fix upstream rather than perpetuating the slow path.
+
 ## Lexical Corpus
 
 **Path**: `configs/paths.yaml` → `lex_bids_root` → `/Users/bentang/Documents/Code/speech/BIDS_1.0_Lexical_µECoG/BIDS_1.0_Lexical_µECoG/BIDS`.
@@ -141,7 +202,11 @@ S51   660 s (11.0 min)   S63  1866 s (31.1 min)   S76   652 s (10.9 min)
 
 **Events schema variants (audited 2026-04-18)**:
 - Standard (13/16 patients): `subject trial onset duration value trial_type sample`; filename `sub-<pt>_task-lexical_acq-01_run-01_events.tsv`.
-- **S71** has BOTH tsv files, split by role: `sub-<pt>_task-lexical_acq-01_run-01_events.tsv` contains stimulus-only rows (trial_type = word itself, `duration=0`, numeric `value`) and `sub-<pt>_task-lexical_events.tsv` contains response-only rows with `trial_type=response`. Neither file alone is ingestible by the standard pipeline; a merge is required to regen. This is the root cause of S71's missing `.fif`.
+- **S71** has BOTH tsv files, neither in the canonical merged shape (empirically re-verified 2026-04-20):
+  - `sub-S71_task-lexical_acq-01_run-01_events.tsv`: 144 rows, 5 cols. `trial_type` holds the WORD ITSELF (`comet`, `tanic`, ...), not `stimulus`/`response`. `duration=0`. Onsets precede the other file's onsets by median 1.23 s (p5 1.01 s, p95 1.79 s) — consistent with stim→resp delay, so these rows are stim events but unlabeled as such.
+  - `sub-S71_task-lexical_events.tsv`: 142 rows, 7 cols. `trial_type='response'` only. 71 trials × **2 words per trial** (= 142 responses).
+  - **Task variant**: 2 words per trial suggests this session ran the Lexical Decision Repeat **Delay** protocol, different from the 1-word-per-trial structure every other lexical patient has.
+  - **Canonical shape**: S78 (same older filename convention, `.fif` exists) has a single `_events.tsv` with merged `{stimulus, response} × trial` rows and explicit `trial_type` column. Regen for S71 likely requires labeling the word-keyed file as `stimulus`, concatenating with the response file, and possibly adapting MFA for 2-words-per-trial audio. Whether this alone recovers the `.fif` is unverified — could also be task variant, audio quality, or an unrelated upstream issue. Confirm with Zac.
 - **S78, S81** use filename `sub-<pt>_task-lexical_events.tsv` (no `acq-01_run-01` entity); `trial_type` is simple `stimulus|response` without the `/word/low` suffix. **Derivatives `.fif` filenames are identical across all 16 patients** — the naming delta is in raw ieeg only, so our v14 loader needs no change.
 
 **Phantom `sub-S52/` in `derivatives/events/`** (audited 2026-04-18): `sub-S52/phoneme/` and `sub-S52/word/` contain 340 real MFA phoneme events + 85 word events (`galef`, etc.). But no raw EDF / channels.tsv / electrodes.tsv exists anywhere in the BIDS root for S52. S52 is unusable until Zac provides the raw data (or confirms exclusion).

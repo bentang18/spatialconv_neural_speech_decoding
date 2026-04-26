@@ -39,7 +39,7 @@ This remains the key ablation:
 
 ## 2. At what level should we pool?
 
-> **Phase 1 addresses this via** the re-derived base parcel set and `k_parcel ∈ {1, 2}` split map (`implementation_tasks.md` #4), plus the within-parcel summarizer contract (#26). Functional pooling is explicitly deferred past Phase 1.
+> **Phase 1 addresses this via** the frozen 15-parcel Tier-1 set with uniform `k_parcel = 1` (`implementation_tasks.md` #4) plus the within-parcel summarizer contract (#26). Functional pooling and 2-token splits are deferred past Phase 1.
 
 Even if atlas/subparcel tokens are the right shared object, the pooling question is not fully settled.
 
