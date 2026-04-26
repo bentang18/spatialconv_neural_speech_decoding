@@ -16,6 +16,15 @@ configs/paths.yaml
 # Results
 results/
 
+# Past papers (large PDF library, kept locally)
+pastwork/
+
+# Auto-generated sbatch wrappers from scripts/ablation/submit.py
+scripts/v14_core/_gen/
+
+# Local submission log (DCC job ids + specs)
+.ablation_submissions.jsonl
+
 # Python
 __pycache__/
 *.py[cod]
@@ -23,6 +32,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
 
 # Environment
 .venv/
