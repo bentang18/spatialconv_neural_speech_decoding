@@ -1,0 +1,73 @@
+{
+  "patient": "S55",
+  "cohort": "lexical",
+  "shapes": {
+    "n_trial": 142,
+    "n_phon": 710,
+    "n_channels": 244,
+    "sfreq": 200.0,
+    "production_samples": 500,
+    "baseline_samples": 100
+  },
+  "recipe_A_reconstruction_vs_productionZscore": {
+    "max_abs_diff": 0.3291342678050633,
+    "rmse": 0.0016960067622654787,
+    "corr": 0.9999986753914355
+  },
+  "summaries": {
+    "B_recording_median_MAD": {
+      "name": "recording_median_MAD",
+      "loc_diff_abs_median": 0.08643000874116791,
+      "loc_diff_abs_p95": 0.22933054700797786,
+      "scale_ratio_median": 0.982607498564926,
+      "scale_ratio_p5": 0.868149127241154,
+      "scale_ratio_p95": 1.0432466081217657,
+      "pearson_median": 1.0,
+      "pearson_p5": 0.9999999999999999,
+      "pearson_min": 0.9999999999999997,
+      "rms": 1.069243871724454
+    },
+    "Bp_recording_mean_std": {
+      "name": "recording_mean_std",
+      "loc_diff_abs_median": 0.048022148630891076,
+      "loc_diff_abs_p95": 0.2419618446588931,
+      "scale_ratio_median": 1.009933103499532,
+      "scale_ratio_p5": 0.9505950808885657,
+      "scale_ratio_p95": 1.0855786011380455,
+      "pearson_median": 1.0,
+      "pearson_p5": 0.9999999999999998,
+      "pearson_min": 0.9999999999999997,
+      "rms": 0.9999985915391958
+    },
+    "C_baseline_median_MAD": {
+      "name": "baseline_median_MAD",
+      "loc_diff_abs_median": 0.08639897518824718,
+      "loc_diff_abs_p95": 0.12322982800908683,
+      "scale_ratio_median": 0.9734738479137904,
+      "scale_ratio_p5": 0.8940512430674783,
+      "scale_ratio_p95": 1.00919589138552,
+      "pearson_median": 1.0,
+      "pearson_p5": 0.9999999999999999,
+      "pearson_min": 0.9999999999999997,
+      "rms": 1.106628862956698
+    }
+  },
+  "class_separability": {
+    "A_pooled_baseline_mean_std": {
+      "median": 0.0883074489547537,
+      "p95": 0.18350218125294365
+    },
+    "B_recording_median_MAD": {
+      "median": 0.08830744895476464,
+      "p95": 0.183502181252882
+    },
+    "Bp_recording_mean_std": {
+      "median": 0.08830744895474132,
+      "p95": 0.1835021812528562
+    },
+    "C_baseline_median_MAD": {
+      "median": 0.08830744895476303,
+      "p95": 0.18350218125295736
+    }
+  }
+}

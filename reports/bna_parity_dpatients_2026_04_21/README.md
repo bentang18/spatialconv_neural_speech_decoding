@@ -1,0 +1,122 @@
+# BNA parity check: pre-baked 3mm CSV vs fsaverage-vertex snap on D-patients (2026-04-21)
+
+## Question
+
+Can the Stage-3 loader use the pre-baked per-D-patient CSVs
+(`D<N>_elec_location_radius_3mm_aparc.BN_atlas+aseg.mgz.csv`) directly,
+or must we project each D-patient through `fsaverage_projection.py`
+and sample from the v2c fsaverage bake?
+
+## Method
+
+For 4 top-LH D-patients (D40, D73, D96, D79 — 878 sEEG contacts total):
+
+1. **Theirs** (pre-baked): parse 3mm radius CSV; argmax label per contact is
+   the parcel with the highest voxel-count proportion in the patient-space
+   `aparc.BN_atlas+aseg.mgz` within a 3 mm sphere around the contact. "Unknown"
+   when the sphere falls in white matter / subcortical / outside parcellation.
+2. **Ours** (snap): `project_to_fsaverage(...)` — snap each RAS contact to
+   nearest patient `lh.pial` vertex, follow `sphere.reg` to fsaverage, sample
+   the v2c bake (projfrac-avg, no smoothing) at that vertex. Argmax over the
+   246-frame support vector.
+3. **Ours gated**: same as (2) but if snap distance > threshold, label Unknown.
+   The snap is physically meaningful only when the contact is near cortex; a
+   deep sEEG contact otherwise gets pulled to an arbitrary surface parcel.
+4. **Name-join**: our bake stores gyrus-based names (`PrG_L_6_1`); the CSVs use
+   area shortnames (`A4hf_L`). Map tree column 5 area shortname + column 2
+   hemisphere to recover the CSV convention. Verified on known Tier-1 parcels.
+
+## Key finding: proximity, not physics, is the disagreement axis
+
+Snap distance distribution split by CSV verdict:
+
+| CSV verdict | N | median | p90 | max | ≤3mm | ≤5mm |
+|---|---:|---:|---:|---:|---:|---:|
+| Tier-1 | 129 | 2.07 | 3.74 | 4.94 | 77% | **100%** |
+| Cortical non-Tier-1 | 296 | 1.66 | 3.45 | 9.35 | 81% | 99% |
+| Unknown | 453 | 3.54 | 6.52 | 11.66 | 38% | 75% |
+
+**100% of CSV-Tier-1 contacts are within 5mm of pial.** Our snap is
+physically meaningful on exactly the subset that matters for Stage-3
+supervised inclusion.
+
+## Agreement on CSV-Tier-1 contacts (n=129 pooled)
+
+| Pipeline | Tier-1 count ours | Exact match on theirs=Tier-1 |
+|---|---:|---:|
+| Raw snap (no gate) | 278 (2.15× inflation) | 96/129 (74%) |
+| Snap gated at ≤3mm | 166 (1.29× inflation) | 78/129 (60%) |
+| Snap gated at ≤5mm | 243 (1.88× inflation) | 96/129 (74%) |
+
+The 3mm gate over-filters: drops 18 legitimate Tier-1 matches because the
+CSV's 3mm radius is around the *contact* but our snap distance is to the
+*nearest pial vertex* — a contact can be 4mm from pial while still having
+Tier-1 voxels inside its own 3mm-radius sphere.
+
+The 5mm gate preserves all 129 CSV-Tier-1 matches (since 100% are ≤5mm
+snap) while cutting the Unknown contacts' over-labeling in half.
+
+## Interpretation
+
+The residual 26% disagreement on CSV-Tier-1 contacts (33/129) is **not**
+from deep contacts — those contacts all sit within 5mm of pial. The
+disagreement is:
+
+1. **Parcel-boundary registration noise**: CSV uses patient-space BNA
+   (via the FreeSurfer GCS classifier on the patient's own surface).
+   Our bake uses fsaverage-space BNA (via `mri_vol2surf` on ICBM152_fs
+   then `mri_surf2surf` to fsaverage). The two pipelines can disagree
+   on which side of a parcel boundary a near-boundary electrode falls.
+   Comparable magnitude to the 10-15% BNA-bake vs authors'-annot
+   disagreement we measured earlier on fsaverage itself.
+
+2. **Single-vertex snap vs 3mm voxel count**: the CSV sums over a 3mm
+   sphere (many voxels, probabilistic); our snap picks one pial vertex
+   (binary). Near a parcel boundary these methods naturally disagree.
+
+3. **`TE1.0/TE1.2_L` vs `TE1.0 and TE1.2_L`** (9 contacts): string-join
+   difference between our tree CSV column 5 and the pre-baked CSV.
+   Doesn't affect Tier-1 (TE1.0/TE1.2 is not in our 15-parcel set).
+
+## Stage-3 decisions
+
+1. **Use pre-baked 3mm CSVs as the primary source for D-patient support.**
+   The CSV's 3mm voxel-count recipe is physically correct and Tier-1-
+   compatible. Build the loader's per-electrode support matrix by reading
+   all 15 Tier-1 proportions out of each CSV row (not just argmax).
+
+2. **The claim `fsaverage_projection.py` works unchanged on D-patients is
+   misleading.** The snap runs, but 45% of all D-patient contacts are
+   >3mm from any pial vertex (42% of 878), so labeling them via the
+   snap is physically meaningless. The pipeline is safe only on the
+   subset of contacts the CSV already classifies as cortical.
+
+3. **If cross-sensor uECoG+sEEG joint training needs a shared spatial
+   representation**, project the sEEG contacts through fsaverage with a
+   ≤5mm snap gate (all CSV-Tier-1 contacts survive; ~26% residual argmax
+   noise vs the patient-space CSV). The shared embedding-side
+   representation (`P_emb` indexed by 15 Tier-1 `_L`/`_R` parcel names)
+   is already compatible — the question is whether per-patient support
+   rows generated by the two different methods carry the same meaning
+   across sensors, which is an empirical Stage-3 question.
+
+4. **Cohort filtering stays as in the audit**: a D-patient enters the
+   Stage-3 supervised set iff the CSV's 3mm argmax hits Tier-1 on ≥10
+   contacts. Coverage numbers from
+   `reports/seeg_cohort_scoping_2026_04_21/coverage.csv` are correct.
+
+## Artifacts
+
+- `scripts/bna_parity_dpatients.py` — re-runnable audit source.
+- `per_electrode.csv` — 878-row per-contact comparison (patient, electrode,
+  hemisphere, snap_mm, ours_argmax_raw, ours_argmax (gated), theirs_argmax,
+  tier1 flags, exact/area_match flags for both raw and gated).
+- `summary.json` — per-patient and pooled summary counts.
+- `gate5mm/` — re-run with `--snap-mm 5.0` for the 5mm-gate numbers.
+
+## Verdict
+
+**The pre-baked CSVs are the correct source for Stage-3 D-patient support.
+Our fsaverage snap pipeline is a 74%-concordant second opinion, suitable
+for cross-sensor joint embedding experiments with a ≤5mm snap gate, but
+not a replacement.**

@@ -25,6 +25,9 @@ scripts/v14_core/_gen/
 # Local submission log (DCC job ids + specs)
 .ablation_submissions.jsonl
 
+# Per-fold DCC training outputs (canonical record is v14_ablation_log.csv)
+docs/experiments/logs/
+
 # Python
 __pycache__/
 *.py[cod]
