@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.support_cache import TIER1_COLUMNS, read_support_cache
+from speech_decoding.atlas.support import TIER1_COLUMNS, read_support_cache
 
 DEFAULT_SNAP_DIR = PROJECT_ROOT / "data" / "atlas" / "support_cache"
 DEFAULT_POOL_DIR = PROJECT_ROOT / "data" / "atlas" / "support_cache_euclidean"

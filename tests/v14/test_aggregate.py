@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from speech_decoding.v14.aggregate import (
+from speech_decoding.training.aggregate import (
     BASELINE_PER_PATIENT,
     BASELINE_POPULATION,
     GATE_TOLERANCE,

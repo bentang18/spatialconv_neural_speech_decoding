@@ -6,13 +6,13 @@ import nibabel as nib
 import numpy as np
 import pytest
 
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     assert_full_bake,
     compute_argmax_assignments,
     compute_token_support,
     load_baked_atlas,
 )
-from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache, project_single_hemisphere_to_fsaverage
+from speech_decoding.atlas.fsaverage import load_fsaverage_cache, project_single_hemisphere_to_fsaverage
 
 
 def test_project_single_hemisphere_to_fsaverage_identity() -> None:

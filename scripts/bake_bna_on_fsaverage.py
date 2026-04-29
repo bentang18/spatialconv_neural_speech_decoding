@@ -48,7 +48,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.fsaverage_atlas import consolidate_baked_atlas
+from speech_decoding.atlas.fsaverage import consolidate_baked_atlas
 
 
 DEFAULT_FS_HOME = Path("/Applications/freesurfer/8.2.0")

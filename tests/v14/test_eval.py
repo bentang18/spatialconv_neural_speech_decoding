@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from speech_decoding.v14.eval import slot_averaged_per
+from speech_decoding.training.eval import slot_averaged_per
 
 
 class TestSlotAveragedPER:

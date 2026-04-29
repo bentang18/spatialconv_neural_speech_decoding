@@ -9,7 +9,7 @@ import pytest
 import scipy.io
 import torch
 
-from speech_decoding.v14.phoneme_dataset import (
+from speech_decoding.studies.cogan_ps.dataset import (
     BOS_TOKEN,
     N_TIER1_PARCELS,
     T_RAW_SAMPLES,
@@ -27,8 +27,8 @@ def _setup_patient_fixture(
     """Wire up a fake 128-strip patient. Returns
     (fif_path, channel_maps_dir, box_root, support_cache_path)."""
 
-    from speech_decoding.v14.channel_map import GRID_SHAPES, PATIENT_KIND
-    from speech_decoding.v14.support_cache import write_support_cache
+    from speech_decoding.studies.cogan_ps.channels import GRID_SHAPES, PATIENT_KIND
+    from speech_decoding.atlas.support import write_support_cache
 
     monkeypatch.setitem(PATIENT_KIND, patient_id, "map4_128")
     monkeypatch.setitem(GRID_SHAPES, patient_id, (8, 16))

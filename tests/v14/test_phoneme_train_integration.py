@@ -12,13 +12,13 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from speech_decoding.v14.eval import evaluate_per_phoneme
-from speech_decoding.v14.phoneme_dataset import (
+from speech_decoding.training.eval import evaluate_per_phoneme
+from speech_decoding.studies.cogan_ps.dataset import (
     V14PhonemeDataset,
     collate_v14_phoneme_batch,
 )
-from speech_decoding.v14.phoneme_model import NeuralFieldPerceiverPerPhoneme
-from speech_decoding.v14.train import per_phoneme_ce_loss, train_one_fold
+from speech_decoding.models.phoneme import NeuralFieldPerceiverPerPhoneme
+from speech_decoding.training.train import per_phoneme_ce_loss, train_one_fold
 
 from tests.v14.test_phoneme_dataset import _setup_patient_fixture
 

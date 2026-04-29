@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from speech_decoding.v14.phoneme_dataset import V14PhonemeDataset
-from speech_decoding.v14.phoneme_run_fold import (
+from speech_decoding.studies.cogan_ps.dataset import V14PhonemeDataset
+from speech_decoding.training.run_fold import (
     _expand_trial_indices_to_phoneme_indices,
     run_one_fold,
 )
@@ -31,8 +31,8 @@ class TestRunOneFold:
         # 5 tokens → 5-fold CV is possible (each fold holds out one token).
         # We need the fake fixture to produce these tokens.
         from tests.v14.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
-        from speech_decoding.v14.channel_map import GRID_SHAPES, PATIENT_KIND
-        from speech_decoding.v14.support_cache import write_support_cache
+        from speech_decoding.studies.cogan_ps.channels import GRID_SHAPES, PATIENT_KIND
+        from speech_decoding.atlas.support import write_support_cache
         import scipy.io
         import numpy as np
 

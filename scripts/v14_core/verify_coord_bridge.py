@@ -25,14 +25,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.channel_map import (
+from speech_decoding.studies.cogan_ps.channels import (
     GRID_SHAPES,
     PATIENT_KIND,
     expected_grid_shape_for_patient,
     resolve_physical_names_for_patient,
 )
-from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache
-from speech_decoding.v14.support_cache import read_support_cache
+from speech_decoding.atlas.fsaverage import load_fsaverage_cache
+from speech_decoding.atlas.support import read_support_cache
 
 
 DEFAULT_BOX_ROOT = Path("/Users/bentang/Library/CloudStorage/Box-Box")

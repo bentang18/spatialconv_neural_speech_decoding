@@ -29,14 +29,14 @@ from pathlib import Path
 
 import numpy as np
 
-from speech_decoding.v14.support_cache import (
+from speech_decoding.atlas.support import (
     TIER1_COLUMNS,
     PatientQC,
     qc_row_for_patient,
     write_qc_report,
     write_support_cache,
 )
-from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS
+from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS
 
 
 BOX_RECON = Path("/Users/bentang/Library/CloudStorage/Box-Box/ECoG_Recon")

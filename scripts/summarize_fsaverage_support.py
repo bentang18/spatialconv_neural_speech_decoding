@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BAKE_DIR,
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
@@ -26,7 +26,7 @@ from speech_decoding.v14.fsaverage_atlas import (
     load_baked_atlas,
     sample_baked_support,
 )
-from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache
+from speech_decoding.atlas.fsaverage import load_fsaverage_cache
 
 
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "fsaverage_coords"

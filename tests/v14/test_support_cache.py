@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from speech_decoding.v14.support_cache import (
+from speech_decoding.atlas.support import (
     TIER1_BNA_INDICES_1BASED,
     TIER1_COLUMNS,
     PatientQC,
@@ -23,7 +23,7 @@ from speech_decoding.v14.support_cache import (
     write_qc_report,
     write_support_cache,
 )
-from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS
+from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

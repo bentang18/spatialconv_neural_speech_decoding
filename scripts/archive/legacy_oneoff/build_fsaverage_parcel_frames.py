@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BAKE_DIR,
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
@@ -24,7 +24,7 @@ from speech_decoding.v14.parcel_frames import (
     plot_parcel_frame_qc,
     save_parcel_frames,
 )
-from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS, assert_token_spec_frozen
+from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS, assert_token_spec_frozen
 
 
 DEFAULT_SUBJECTS_DIR = Path("/Applications/freesurfer/8.2.0/subjects")

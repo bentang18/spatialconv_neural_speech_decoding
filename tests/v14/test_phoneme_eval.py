@@ -5,11 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from speech_decoding.v14.eval import (
+from speech_decoding.training.eval import (
     evaluate_per_phoneme,
     exhaustive_ar_per,
 )
-from speech_decoding.v14.phoneme_decoder import D1Decoder
+from speech_decoding.models.decoder import D1Decoder
 
 
 class TestExhaustiveARPER:

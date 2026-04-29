@@ -13,13 +13,13 @@ import numpy as np
 import pytest
 import scipy.io
 
-from speech_decoding.v14.channel_map import GRID_SHAPES, PATIENT_KIND
-from speech_decoding.v14.phoneme_dataset import V14PhonemeDataset
-from speech_decoding.v14.phoneme_run_fold_pooled import (
+from speech_decoding.studies.cogan_ps.channels import GRID_SHAPES, PATIENT_KIND
+from speech_decoding.studies.cogan_ps.dataset import V14PhonemeDataset
+from speech_decoding.training.run_fold_pooled import (
     _RoundRobinInterleaveLoader,
     run_one_fold_pooled,
 )
-from speech_decoding.v14.support_cache import write_support_cache
+from speech_decoding.atlas.support import write_support_cache
 from tests.v14.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
 
 

@@ -6,13 +6,13 @@ from dataclasses import replace
 
 import torch
 
-from speech_decoding.v14.config import PerPhonemeConfig
-from speech_decoding.v14.phoneme_dataset import (
+from speech_decoding.training.config import PerPhonemeConfig
+from speech_decoding.studies.cogan_ps.dataset import (
     BOS_TOKEN,
     N_TIER1_PARCELS,
     T_RAW_SAMPLES,
 )
-from speech_decoding.v14.phoneme_model import NeuralFieldPerceiverPerPhoneme
+from speech_decoding.models.phoneme import NeuralFieldPerceiverPerPhoneme
 
 
 def _fake_batch(
@@ -249,7 +249,7 @@ class TestAttentionHeads:
     """Heads ablation — d=32 splits as 1×32, 2×16 (baseline), 4×8."""
 
     def _model(self, num_heads: int) -> NeuralFieldPerceiverPerPhoneme:
-        from speech_decoding.v14.config import BackboneConfig
+        from speech_decoding.training.config import BackboneConfig
 
         base = PerPhonemeConfig()
         cfg = replace(

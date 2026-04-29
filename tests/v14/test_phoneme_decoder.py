@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from speech_decoding.v14.config import D1DecoderConfig
-from speech_decoding.v14.phoneme_decoder import BOS_SENTINEL, D1Decoder
+from speech_decoding.training.config import D1DecoderConfig
+from speech_decoding.models.decoder import BOS_SENTINEL, D1Decoder
 
 
 class TestD1Decoder:

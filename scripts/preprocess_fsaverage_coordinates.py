@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.fsaverage_projection import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BOX_ROOT,
     DEFAULT_SUBJECTS_DIR,
     project_patient_to_fsaverage,

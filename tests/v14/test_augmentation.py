@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from speech_decoding.v14.augmentation import (
+from speech_decoding.training.augmentation import (
     AugmentationConfig,
     LEGACY_DEFAULT,
     augment_batch,

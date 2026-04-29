@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from speech_decoding.v14.backbone import Backbone, _apply_rope
-from speech_decoding.v14.config import BackboneConfig
+from speech_decoding.models.backbone import Backbone, _apply_rope
+from speech_decoding.training.config import BackboneConfig
 
 
 def _time_ids(n_e: int, T: int) -> torch.Tensor:

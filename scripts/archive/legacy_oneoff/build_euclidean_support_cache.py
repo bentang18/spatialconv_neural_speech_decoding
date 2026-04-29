@@ -29,21 +29,21 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from speech_decoding.v14.electrode_pool import euclidean_support
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
     assert_full_bake,
     load_baked_atlas,
 )
-from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache
-from speech_decoding.v14.support_cache import (
+from speech_decoding.atlas.fsaverage import load_fsaverage_cache
+from speech_decoding.atlas.support import (
     PatientQC,
     TIER1_BNA_INDICES_1BASED,
     TIER1_COLUMNS,
     qc_row_for_patient,
     write_support_cache,
 )
-from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS
+from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS
 
 _HIST_BIN_LABELS = ("[0,1)", "[1,10)", "[10,25)", "[25,50)", "[50,75)", "[75,100]")
 

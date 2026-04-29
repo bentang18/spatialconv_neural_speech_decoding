@@ -32,7 +32,7 @@ from speech_decoding.v14.cvsavg_projection import (
     ensure_cvsavg35_subject,
     load_cvsavg_pial_cache,
 )
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
     DEFAULT_ORACLE_PM_PATH,
@@ -47,7 +47,7 @@ from speech_decoding.v14.fsaverage_atlas import (
     load_oracle_volume_support,
     sample_baked_support,
 )
-from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS
+from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS
 
 
 DEFAULT_CORE_PATIENTS = ["S14", "S26", "S33", "S62"]

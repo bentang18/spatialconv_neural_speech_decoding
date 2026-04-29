@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from speech_decoding.v14.cv import (
+from speech_decoding.training.cv import (
     make_outer_folds,
     make_outer_folds_pooled,
     make_val_split,

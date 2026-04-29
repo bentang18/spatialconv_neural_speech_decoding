@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from speech_decoding.v14.config import (
+from speech_decoding.training.config import (
     AtlasConfig,
     BackboneConfig,
     DecoderConfig,
@@ -53,7 +53,7 @@ class TestSoftParcelEmbeddingConfig:
 
     def test_n_parcels_matches_default_base_parcels(self) -> None:
         """Soft embedding lookup width must equal the Tier-1 cardinality (#4)."""
-        from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS
+        from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS
         cfg = SoftParcelEmbeddingConfig()
         assert cfg.n_parcels == len(DEFAULT_BASE_PARCELS)
 
@@ -138,7 +138,7 @@ class TestV14Config:
             == 64
         )
         # Parcel-embedding width must match the Tier-1 cardinality.
-        from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS
+        from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS
         assert cfg.parcel_embedding.n_parcels == len(DEFAULT_BASE_PARCELS)
 
     def test_no_local_summarizer_config_field(self) -> None:

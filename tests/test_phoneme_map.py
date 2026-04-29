@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from speech_decoding.data.phoneme_map import (
+from speech_decoding.training.phoneme_map import (
     ARPA_PHONEMES,
     ARPA2PS,
     PS2ARPA,

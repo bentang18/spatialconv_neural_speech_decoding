@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CLI wrapper for materializing the per-electrode Tier-1 support cache.
 
-Library logic lives in `speech_decoding.v14.support_cache`. This script just
+Library logic lives in `speech_decoding.atlas.support`. This script just
 wires paths and iterates patients.
 
 See docs/plans/v14-core.md Task A1.
@@ -17,8 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from speech_decoding.v14.fsaverage_atlas import DEFAULT_BNA_TREE
-from speech_decoding.v14.support_cache import (
+from speech_decoding.atlas.fsaverage import DEFAULT_BNA_TREE
+from speech_decoding.atlas.support import (
     PatientQC,
     build_patient_support,
     qc_row_for_patient,

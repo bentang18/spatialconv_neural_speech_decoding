@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from speech_decoding.data.phoneme_map import (
+from speech_decoding.training.phoneme_map import (
     ARPA_PHONEMES,
     PS2ARPA,
     filter_to_ps_phonemes,

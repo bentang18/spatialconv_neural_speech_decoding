@@ -17,7 +17,7 @@ from speech_decoding.v14.cvsavg_projection import (
     DEFAULT_TARGET_SUBJECT,
     ensure_cvsavg35_subject,
 )
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
     assert_full_bake,
@@ -29,7 +29,7 @@ from speech_decoding.v14.parcel_frames import (
     plot_parcel_frame_qc,
     save_parcel_frames,
 )
-from speech_decoding.v14.token_spec import DEFAULT_BASE_PARCELS, assert_token_spec_frozen
+from speech_decoding.atlas.tokens import DEFAULT_BASE_PARCELS, assert_token_spec_frozen
 
 
 DEFAULT_BAKE_DIR = PROJECT_ROOT / "data" / "atlas" / "cvsavg35_bake"

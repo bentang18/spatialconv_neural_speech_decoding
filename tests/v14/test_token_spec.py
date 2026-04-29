@@ -1,4 +1,4 @@
-from speech_decoding.v14.token_spec import (
+from speech_decoding.atlas.tokens import (
     DEFAULT_BASE_PARCELS,
     DEFAULT_SPLIT_COUNTS,
     PROVISIONAL_TOKEN_SPEC,

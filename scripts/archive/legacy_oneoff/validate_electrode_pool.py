@@ -37,14 +37,14 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from speech_decoding.v14.electrode_pool import euclidean_support
-from speech_decoding.v14.fsaverage_atlas import (
+from speech_decoding.atlas.fsaverage import (
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
     assert_full_bake,
     load_baked_atlas,
 )
-from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache
-from speech_decoding.v14.support_cache import TIER1_BNA_INDICES_1BASED, read_support_cache
+from speech_decoding.atlas.fsaverage import load_fsaverage_cache
+from speech_decoding.atlas.support import TIER1_BNA_INDICES_1BASED, read_support_cache
 
 DEFAULT_FS_HOME = Path("/Applications/freesurfer/8.2.0")
 DEFAULT_SUBJECTS_DIR = DEFAULT_FS_HOME / "subjects"

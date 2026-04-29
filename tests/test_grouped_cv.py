@@ -4,7 +4,7 @@ import pytest
 import numpy as np
 from pathlib import Path
 
-from speech_decoding.evaluation.grouped_cv import (
+from speech_decoding.training.cv import (
     _patient_seed,
     build_token_groups,
     create_grouped_splits,
