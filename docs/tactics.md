@@ -44,18 +44,20 @@ Full restructure to NeuralSet-mirrored layout. Plan: `neuroprobe/repo_reorg_plan
 - [ ] **Commit 4 — Tests + cleanup**: colocate the ~17 active-module tests under their new module homes (not 3 — the original count was wrong; full list = the active half of `tests/v14/`); update `pyproject.toml` `tool.pytest.ini_options.testpaths = ["src"]`; delete empty `v14/` + `data/` + `evaluation/` packages; delete now-empty `tests/v14/`. Run `pytest -q`.
 - [ ] **Verification gates** all pass: `pytest -q`; `python -m scripts.v14_core.train_v14_core --help`; `python -c "import speech_decoding; from speech_decoding import atlas, models, training, studies, extractors"`; `grep -r "from speech_decoding.v14\|speech_decoding\.evaluation\|speech_decoding\.data" src/ scripts/ tests/ docs/` returns nothing in active code; DCC dry run via `scripts/ablation/dcc_sync_check.py` against the `.venv` env.
 
-### Phase 3 — NeuralSet adoption PR (~3 days)
+### Phase 3 — NeuralSet adoption PR (PAUSED 2026-04-28 evening)
 
-Add NeuralSet adapter files. Plan: `neuroprobe/neuralset_integration_plan.md`.
+Add NeuralSet adapter files. Plan: `neuroprobe/neuralset_integration_plan.md`. **Paused mid-step** pending full read of the four neuroai docs (NeuralSet / NeuralFetch / NeuralTrain / Exca) at `https://facebookresearch.github.io/neuroai/`. Discovery during Phase 3: NeuralFetch ships `Wang2024Treebank` (= BrainTreebank) pre-registered, which likely supersedes the custom `BraintreebankStudy` written in `eb0910d`. State + resume plan: `memory/project_phase3_pause_neuroai_docs_2026_04_28.md`.
 
-- [ ] **Add `neuralset>=0.1.0` to `pyproject.toml`** + `uv sync`.
-- [ ] **`src/speech_decoding/studies/braintreebank/study.py`** — `BraintreebankIeeg(Ieeg)` + `BraintreebankStudy(ns.Study)`. Real implementation of `_load_timeline_events()` (replaces smoke-test placeholder).
-- [ ] **`src/speech_decoding/studies/braintreebank/loader.py`** — productionize smoke `bt_load_raw()` (raw 2048 Hz voltage, no re-reference, matches Neuroprobe native output); add colocated `test_loader.py`.
-- [ ] **`src/speech_decoding/studies/braintreebank/labels.py`** — Stage-0-E3 (15-task derivation; can land empty-stub if Stage-0 not started yet).
-- [ ] **`src/speech_decoding/studies/braintreebank/manifest.py`** — empty-stub for Tier-1 whitelist + BT-Tier-1 parcel list (populated by Stage-0 A0).
-- [ ] **`src/speech_decoding/extractors/parcel.py`** — `V14ParcelMetadataExtractor(BaseStatic)`.
+- [x] **Add `neuralset>=0.1.0` (+`nibabel>=5.1`, `pandas>=2.2`) to `pyproject.toml`** + `uv sync` (commit `69a3631`).
+- [x] **`src/speech_decoding/extractors/parcel.py`** — `V14ParcelMetadataExtractor(BaseStatic)` reading per-patient support cache + fsaverage coords (commit `eb0910d`).
+- [~] **`src/speech_decoding/studies/braintreebank/{study,loader,test_loader}.py`** — written in `eb0910d`, **likely to be deleted on resume** if `Wang2024Treebank` proves equivalent. Architectural decision deferred to post-doc-read.
+- [x] **`labels.py` + `manifest.py`** — empty stubs landed in `eb0910d`. Will stay regardless of (above).
+- [ ] **Decision on resume**: keep custom `BraintreebankStudy` OR swap to `ns.Study(name="Wang2024Treebank", ...)`. Verify `Wang2024Treebank` returns raw 2048 Hz voltage, no re-reference (PopT-comparability).
+- [ ] **Decide on neuralfetch / neuraltrain / exca direct deps** (currently only neuralset declared; exca lands transitively).
+- [ ] **Revise `docs/neuroprobe/neuralset_integration_plan.md`** — its "BT is h5, not MNE-readable" friction-finding is stale post-NeuralFetch.
 - [ ] **DCC env questions resolved** (3 open at integration plan §Open questions): exca cache location (`CACHE_FOLDER=/hpc/group/coganlab/ht203/exca_cache`) — **must answer before first `dataset.prepare()` invocation on DCC**, otherwise cache lands on auto-purging `/work/`; `MapInfra(cluster="slurm")` partition kwargs; coexistence with `scripts/ablation/`.
-- [ ] **Delete smoke script** (`scripts/scratch/neuralset_smoke_bt.py`) — superseded by real cohort module.
+
+**Resume preflight**: verify DCC `uv sync` completed cleanly via `/work/ht203/repo/speech/.venv/bin/python -c "import neuralset, nibabel, pandas, pyarrow; print(neuralset.__version__)"` (sync was running at pause; `pyarrow` was mid-install with broken `__version__` attr).
 
 ### Phase 4 — Stage 0 begins
 
