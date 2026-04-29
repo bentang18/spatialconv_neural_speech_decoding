@@ -22,14 +22,14 @@ import mne
 import numpy as np
 import torch
 
-from speech_decoding.data.phoneme_map import ARPA_PHONEMES, normalize_label
-from speech_decoding.v14.channel_map import (
+from speech_decoding.training.phoneme_map import ARPA_PHONEMES, normalize_label
+from speech_decoding.studies.cogan_ps.channels import (
     GRID_SHAPES,
     expected_grid_shape_for_patient,
     resolve_physical_names_for_patient,
 )
-from speech_decoding.v14.fsaverage_projection import load_fsaverage_cache
-from speech_decoding.v14.support_cache import lookup_support_for_kept_channels
+from speech_decoding.atlas.fsaverage import load_fsaverage_cache
+from speech_decoding.atlas.support import lookup_support_for_kept_channels
 
 
 T_RAW_SAMPLES: int = 130  # tmin=-0.15, tmax=0.495 inclusive at 200 Hz

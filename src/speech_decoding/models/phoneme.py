@@ -21,10 +21,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from speech_decoding.v14.backbone import Backbone
-from speech_decoding.v14.config import PerPhonemeConfig
-from speech_decoding.v14.phoneme_decoder import D1Decoder
-from speech_decoding.v14.pool import masked_mean_pool, precompute_pool
+from speech_decoding.models.backbone import Backbone
+from speech_decoding.training.config import PerPhonemeConfig
+from speech_decoding.models.decoder import D1Decoder
+from speech_decoding.models.pool import masked_mean_pool, precompute_pool
 
 
 class NeuralFieldPerceiverPerPhoneme(nn.Module):

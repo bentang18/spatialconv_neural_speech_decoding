@@ -14,15 +14,15 @@ from pathlib import Path
 
 import numpy as np
 
-from .fsaverage_atlas import (
+from .fsaverage import (
     DEFAULT_BNA_N_ROIS,
     DEFAULT_BNA_TREE,
     assert_full_bake,
     load_baked_atlas,
+    load_fsaverage_cache,
     sample_baked_support,
 )
-from .fsaverage_projection import load_fsaverage_cache
-from .token_spec import DEFAULT_BASE_PARCELS
+from .tokens import DEFAULT_BASE_PARCELS
 
 
 def sanitize_parcel_name(name: str) -> str:

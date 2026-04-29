@@ -30,7 +30,7 @@ dev = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["src"]
 markers = [
     "slow: marks tests that load real BIDS data (deselect with '-m \"not slow\"')",
 ]

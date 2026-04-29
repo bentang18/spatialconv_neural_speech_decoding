@@ -19,7 +19,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from speech_decoding.v14.config import BackboneConfig
+from speech_decoding.training.config import BackboneConfig
 
 
 _ROPE_BASE = 10000.0

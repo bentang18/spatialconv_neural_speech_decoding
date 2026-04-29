@@ -20,7 +20,7 @@ from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from speech_decoding.v14.eval import slot_averaged_per
+from speech_decoding.training.eval import slot_averaged_per
 
 
 TRIALS_PER_BATCH = 8
@@ -83,7 +83,7 @@ def make_per_phoneme_ce_loss(
     (channel dropout).
     """
 
-    from speech_decoding.v14.augmentation import AugmentationConfig, augment_batch
+    from speech_decoding.training.augmentation import AugmentationConfig, augment_batch
 
     def _loss(model: nn.Module, batch: dict) -> torch.Tensor:
         labels = batch["labels"]

@@ -29,18 +29,18 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
-from speech_decoding.v14.config import PerPhonemeConfig
-from speech_decoding.v14.cv import make_outer_folds_pooled, make_val_split_pooled
-from speech_decoding.v14.eval import (
+from speech_decoding.training.config import PerPhonemeConfig
+from speech_decoding.training.cv import make_outer_folds_pooled, make_val_split_pooled
+from speech_decoding.training.eval import (
     evaluate_per_phoneme,
     exhaustive_ar_per_from_loader,
 )
-from speech_decoding.v14.phoneme_dataset import (
+from speech_decoding.studies.cogan_ps.dataset import (
     V14PhonemeDataset,
     collate_v14_phoneme_batch,
 )
-from speech_decoding.v14.phoneme_model import NeuralFieldPerceiverPerPhoneme
-from speech_decoding.v14.train import (
+from speech_decoding.models.phoneme import NeuralFieldPerceiverPerPhoneme
+from speech_decoding.training.train import (
     TRIALS_PER_BATCH,
     per_phoneme_ce_loss,
     train_one_fold,
@@ -74,7 +74,7 @@ def _build_config(
     electrode_pe_mode: str = "none",
     num_heads: int | None = None,
 ) -> PerPhonemeConfig:
-    from speech_decoding.v14.config import BackboneConfig, D1DecoderConfig, PoolConfig
+    from speech_decoding.training.config import BackboneConfig, D1DecoderConfig, PoolConfig
 
     if d_model not in (16, 32, 64):
         raise ValueError(f"d_model must be 16, 32, or 64, got {d_model}")
@@ -295,14 +295,14 @@ def run_one_fold_pooled(
     val_obj = val_loaders
     effective_accum = grad_accum_steps if grad_accum_steps is not None else len(datasets)
 
-    from speech_decoding.v14.augmentation import PRESETS, AugmentationConfig
+    from speech_decoding.training.augmentation import PRESETS, AugmentationConfig
     if aug_preset not in PRESETS:
         raise ValueError(
             f"aug_preset must be one of {tuple(PRESETS)}, got {aug_preset!r}"
         )
     aug_cfg: AugmentationConfig | None = None if aug_preset == "none" else PRESETS[aug_preset]
     if label_smoothing > 0.0 or mixup_alpha > 0.0 or aug_cfg is not None:
-        from speech_decoding.v14.train import make_per_phoneme_ce_loss
+        from speech_decoding.training.train import make_per_phoneme_ce_loss
         loss_fn = make_per_phoneme_ce_loss(
             label_smoothing=label_smoothing,
             mixup_alpha=mixup_alpha,

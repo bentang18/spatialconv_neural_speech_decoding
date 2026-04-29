@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from speech_decoding.v14.config import D1DecoderConfig
+from speech_decoding.training.config import D1DecoderConfig
 
 
 BOS_SENTINEL = -1

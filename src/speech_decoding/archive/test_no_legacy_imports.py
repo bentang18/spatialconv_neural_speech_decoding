@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_PKG_ROOT = _REPO_ROOT / "src" / "speech_decoding"
+_PKG_ROOT = Path(__file__).resolve().parent.parent
 _ARCHIVE_DIR = _PKG_ROOT / "archive"
+_REPO_ROOT = _PKG_ROOT.parent.parent
 
 _LEGACY_PREFIX = "speech_decoding.archive"
 
