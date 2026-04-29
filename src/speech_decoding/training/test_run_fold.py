@@ -30,7 +30,7 @@ class TestRunOneFold:
         and exhaustive-AR slot-averaged PER. Requires ≥5 unique tokens for CV."""
         # 5 tokens → 5-fold CV is possible (each fold holds out one token).
         # We need the fake fixture to produce these tokens.
-        from tests.v14.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
+        from speech_decoding.studies.cogan_ps.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
         from speech_decoding.studies.cogan_ps.channels import GRID_SHAPES, PATIENT_KIND
         from speech_decoding.atlas.support import write_support_cache
         import scipy.io

@@ -20,7 +20,7 @@ from speech_decoding.training.run_fold_pooled import (
     run_one_fold_pooled,
 )
 from speech_decoding.atlas.support import write_support_cache
-from tests.v14.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
+from speech_decoding.studies.cogan_ps.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
 
 
 def _register_fake_patient(monkeypatch: pytest.MonkeyPatch, patient_id: str) -> None:

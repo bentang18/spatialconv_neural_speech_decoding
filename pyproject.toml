@@ -18,6 +18,9 @@ dependencies = [
     "h5py>=3.9",
     "tqdm>=4.65",
     "transformers>=4.40",
+    "neuralset>=0.1.0",
+    "nibabel>=5.1",
+    "pandas>=2.2",
 ]
 
 [project.optional-dependencies]

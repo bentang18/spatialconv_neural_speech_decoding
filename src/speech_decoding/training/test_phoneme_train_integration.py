@@ -20,7 +20,7 @@ from speech_decoding.studies.cogan_ps.dataset import (
 from speech_decoding.models.phoneme import NeuralFieldPerceiverPerPhoneme
 from speech_decoding.training.train import per_phoneme_ce_loss, train_one_fold
 
-from tests.v14.test_phoneme_dataset import _setup_patient_fixture
+from speech_decoding.studies.cogan_ps.test_dataset import _setup_patient_fixture
 
 
 def test_phoneme_loop_drops_below_chance_on_tiny_fake(

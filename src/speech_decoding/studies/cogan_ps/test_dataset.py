@@ -18,7 +18,7 @@ from speech_decoding.studies.cogan_ps.dataset import (
     collate_v14_phoneme_batch,
 )
 
-from tests.v14.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
+from speech_decoding.studies.cogan_ps.fixtures.fake_phoneme_fif import build_fake_phoneme_epochs
 
 
 def _setup_patient_fixture(

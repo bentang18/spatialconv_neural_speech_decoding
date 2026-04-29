@@ -10,8 +10,6 @@ in CI rather than producing a quietly wrong run.
 
 from __future__ import annotations
 
-import pytest
-
 from speech_decoding.training.config import (
     AtlasConfig,
     BackboneConfig,
@@ -150,12 +148,6 @@ class TestV14Config:
         fields = set(V14Config.__dataclass_fields__.keys())
         assert "summarizer" not in fields
         assert "local_summarizer" not in fields
-
-    def test_local_summarizer_module_raises_on_import(self) -> None:
-        """Hard guard: importing the deprecated module fails loudly."""
-        import importlib
-        with pytest.raises(ImportError, match="deprecated by the 2026-04-16"):
-            importlib.import_module("speech_decoding.v14.local_summarizer")
 
     def test_config_is_hashable_and_immutable(self) -> None:
         """Dataclasses are frozen, so accidental mutation during a run raises."""
