@@ -14,10 +14,10 @@
 set -euo pipefail
 
 REPO=/work/ht203/repo/speech
-PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
+PYTHON=/work/ht203/repo/speech/.venv/bin/python
 OUT_DIR=/work/ht203/results/v14core/smoke
 
-export LD_LIBRARY_PATH=/work/ht203/miniconda3/envs/speech/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/work/ht203/repo/speech/.venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}
 export PYTHONPATH=${REPO}/src:${PYTHONPATH:-}
 
 mkdir -p "${OUT_DIR}"

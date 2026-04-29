@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "speech-decoding"
 version = "0.1.0"
 description = "Cross-patient speech decoding from intra-operative uECOG"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch>=2.0",
     "mne>=1.6",

@@ -6,7 +6,7 @@ Conventions hard-coded here so the CLIs stay short:
 - Remote repo      : /work/ht203/repo/speech
 - Remote results   : /work/ht203/results
 - Remote logs      : /work/ht203/logs/v14core
-- Python on DCC    : /work/ht203/miniconda3/envs/speech/bin/python
+- Python on DCC    : /work/ht203/repo/speech/.venv/bin/python
 - Local repo       : the parent of this file's grandparent
 """
 
@@ -24,7 +24,7 @@ DCC_HOST = f"{DCC_USER}@dcc-login.oit.duke.edu"
 REMOTE_REPO = "/work/ht203/repo/speech"
 REMOTE_RESULTS = "/work/ht203/results"
 REMOTE_LOGS = "/work/ht203/logs/v14core"
-REMOTE_PY = "/work/ht203/miniconda3/envs/speech/bin/python"
+REMOTE_PY = "/work/ht203/repo/speech/.venv/bin/python"
 
 LOCAL_REPO = Path(__file__).resolve().parents[2]
 SUBMIT_LOG = LOCAL_REPO / ".ablation_submissions.jsonl"

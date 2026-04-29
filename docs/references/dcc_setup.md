@@ -13,11 +13,12 @@ ssh ht203@dcc-login.oit.duke.edu
 
 ```
 /work/ht203/
-├── repo/speech/              # Git repo (branch: autoresearch/run1)
+├── repo/speech/              # Git repo (branch: main)
+│   └── .venv/                # Python 3.12 venv (uv-managed)
 ├── data/BIDS/                # Symlinked BIDS datasets
 │   ├── BIDS_1.0_Phoneme_Sequence_uECoG/  # PS dataset
 │   └── BIDS_1.0_Lexical_µECoG/           # Lexical dataset
-├── miniconda3/envs/speech/   # Python 3.11 conda env
+├── miniconda3/envs/speech/   # Legacy Python 3.11 conda env (kept as fallback through 2026-05-05)
 └── logs/                     # SLURM output logs
 
 /hpc/group/coganlab/ht203/    # Permanent storage (NOT auto-purged)
@@ -27,25 +28,31 @@ ssh ht203@dcc-login.oit.duke.edu
 
 ## Python Environment
 
-The base conda on DCC has a broken `frozendict` with Python 3.13. **Do NOT use `conda activate speech`**. Instead, use the python binary directly:
+uv-managed venv inside the repo. Built 2026-04-28 to land Python 3.12 (required by `neuralset>=0.1.0`); the previous Python 3.11 conda env at `miniconda3/envs/speech/` stays untouched as a fallback through ~2026-05-05.
 
 ```bash
-PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
+PYTHON=/work/ht203/repo/speech/.venv/bin/python
 ```
 
 ### Environment Details
-- Python 3.11
-- PyTorch 2.10.0+cu126
-- MNE, scikit-learn, speech_decoding (editable install)
+- Python 3.12.13 (uv-managed via `python-build-standalone`)
+- PyTorch 2.10.0+cu126 (bundled CUDA libs at `.venv/lib/python3.12/site-packages/torch/lib`)
+- MNE, scikit-learn, speech_decoding (editable install via `pyproject.toml`)
 - Note: `torch.cuda.is_available()` returns False on login node (no GPU). Works on compute nodes via SBATCH.
 
-### Known Issue: `packaging` Module
-If you get `ModuleNotFoundError: No module named 'packaging'`, fix with:
+### Rebuild from scratch
+
 ```bash
-cd /work/ht203/miniconda3/envs/speech/lib/python3.11/site-packages
-rm -rf packaging-25.0.dist-info  # ghost dist-info with empty packaging/ dir
-$PYTHON -m pip install packaging==24.2
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv not yet installed; lives at ~/.local/bin/uv
+cd /work/ht203/repo/speech
+~/.local/bin/uv venv .venv --python 3.12
+~/.local/bin/uv pip install --python .venv/bin/python torch==2.10.0 --index-url https://download.pytorch.org/whl/cu126
+~/.local/bin/uv pip install --python .venv/bin/python -e ".[dev]"
+.venv/bin/python -m pytest -q tests/test_phoneme_map.py tests/test_grouped_cv.py tests/v14/test_no_legacy_imports.py
+# expect: 65 passed
 ```
+
+The 3-file canonical baseline avoids known pre-existing pyproject.toml gaps (nibabel/pandas not declared; tracked separately). Full `tests/` collection currently fails on those imports — fix lives in the Phase 3 NeuralSet-adoption PR.
 
 ## GPU Hardware
 
@@ -79,7 +86,7 @@ $PYTHON -m pip install packaging==24.2
 set -e
 cd /work/ht203/repo/speech
 
-PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
+PYTHON=/work/ht203/repo/speech/.venv/bin/python
 export DEVICE=cuda
 export PYTHONUNBUFFERED=1
 
@@ -283,7 +290,7 @@ git status --short   # expect empty
 set -e
 cd /work/ht203/repo/speech
 
-PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
+PYTHON=/work/ht203/repo/speech/.venv/bin/python
 export DEVICE=cuda
 export PYTHONUNBUFFERED=1
 

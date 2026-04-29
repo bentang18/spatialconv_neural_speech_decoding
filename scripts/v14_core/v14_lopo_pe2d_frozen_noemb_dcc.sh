@@ -44,12 +44,12 @@ for p in "${CORE[@]}"; do
 done
 
 REPO=/work/ht203/repo/speech
-PYTHON=/work/ht203/miniconda3/envs/speech/bin/python
+PYTHON=/work/ht203/repo/speech/.venv/bin/python
 ROOT=/work/ht203/results/v14_lopo/per_cell_partialconv_pe2dfrozen_noemb_d32_depth${DEPTH}
 PRETRAIN_DIR=${ROOT}/pretrain_heldout_${held_out}
 FINETUNE_DIR=${ROOT}/finetune_${held_out}
 
-export LD_LIBRARY_PATH=/work/ht203/miniconda3/envs/speech/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/work/ht203/repo/speech/.venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}
 export PYTHONPATH=${REPO}/src:${PYTHONPATH:-}
 
 mkdir -p "${PRETRAIN_DIR}" "${FINETUNE_DIR}"

@@ -74,7 +74,7 @@ REPO={remote_repo}
 PYTHON={remote_py}
 OUT_DIR={out_dir}
 
-export LD_LIBRARY_PATH=/work/ht203/miniconda3/envs/speech/lib:${{LD_LIBRARY_PATH:-}}
+export LD_LIBRARY_PATH=/work/ht203/repo/speech/.venv/lib/python3.12/site-packages/torch/lib:${{LD_LIBRARY_PATH:-}}
 export PYTHONPATH=${{REPO}}/src:${{PYTHONPATH:-}}
 
 mkdir -p "${{OUT_DIR}}"

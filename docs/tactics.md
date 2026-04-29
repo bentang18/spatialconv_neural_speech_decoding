@@ -1,70 +1,65 @@
 # Tactics — Concrete Task List
 
-Tactics layer of the triad (objectives → strategy → tactics). Operational: what's running, what to do when it lands, what's blocked. Updated 2026-04-21 (Stage-2 kickoff after Box audit).
+Tactics layer of the triad (objectives → strategy → tactics). Operational: what's running, what to do when it lands, what's blocked. Refreshed 2026-04-26 evening for the **pre-Stage 0 reorg + NeuralSet adoption** sprint.
 
 - Objectives: `objectives.md`
-- Current-stage strategy: `strategy/stage_2.md`
+- Active plans: `neuroprobe/{neuralset_integration_plan.md, repo_reorg_plan.md}`
+- Project decision rationale: `memory/project_pre_stage0_reorg_neuralset_adoption_2026_04_26.md`
 - DCC tooling: `references/dcc_setup.md`
 
-**Current stage:** Stage 2 opened 2026-04-21. Frozen architecture = Stage-1 T3.1 default (`per_cell + partialconv + pe2d + hierarchical_atlas` @ d=32, depth=3, pool=(4,8)). Stage-2 scope narrowed to **uECoG only** — Cogan sEEG D-cohort deferred to Stage 3 per 2026-04-21 alignment. Scoreboard is the **cohort-growth curve** (pooled joint + LOPO warm-start at 7-LH → 10-LH → 17-LH target).
+**Current sprint:** pre-Stage 0 — full repo reorganization to a NeuralSet-mirrored layout + full NeuralSet adoption. Lands BEFORE any Stage 0 code. ~2 weeks walltime. PS Stage-2 work paused 2026-04-24; queued for resume after Neuroprobe submission. Archived Stage-2 priorities at the bottom of this doc for resume reference.
 
 ---
 
-## In flight (DCC queue)
+## Active sprint — pre-Stage 0 reorg + NeuralSet adoption
 
-- **Job 45899893** — 7-LH pooled under T3.1 default (`v14_pooled_7lh_t31_dcc.sh`, 15 tasks, submitted 2026-04-21). Fills Stage-2 scoreboard row cohort=7 (baseline). Save-ckpt on; copy to `/hpc/group/coganlab/ht203/stage2_ckpt_t31_7lh/` on completion.
+Sequenced as one continuous arc; each phase bisectable.
 
-Poll with `scripts/ablation/status.py`. Tail logs with `scripts/ablation/logs.py <job_id>`. Peek mid-flight JSONs with `scripts/ablation/peek.py <job_id>`.
+### Phase 0 — Smoke test (DONE 2026-04-28)
 
----
+Verify NeuralSet API contract end-to-end on `BraintreebankIeeg + IeegExtractor + Pulse + Segmenter` before reorg PR opens. **Self-contained under `scripts/scratch/neuralset_smoke_bt.py`** — no `speech_decoding.studies...` imports — survives the reorg, deleted in Phase 3.
 
-## Stage-2 immediate priorities
+- [x] **BT smoke script** at `scripts/scratch/neuralset_smoke_bt.py`. Synthetic `mne.io.RawArray` stub via overridden `Ieeg._read()`; `Segmenter(start=0.0, duration=1.0, trigger_query="type=='Word'")` over 4 Word triggers + 1 BraintreebankIeeg row standardized through `ns.events.utils.standardize_events`; `IeegExtractor(event_types="Ieeg", frequency=2048.0, channel_order="original")` + `Pulse(event_types="Word")`. Verified `batch.data["neural"].shape == (4, 128, 2048)` raw voltage at 2048 Hz.
+- [x] **Day-2**: inline `V14ParcelMetadataExtractor(BaseStatic, event_types="Ieeg")` returning `(N_CHANNELS, 5)` per Ieeg event (parcel_id, support, fsaverage_xyz). Verified `batch.data["metadata"].shape == (4, 128, 5)`. Real cache I/O lands in Phase 3 production extractor.
+- [x] **Run**: `/tmp/neuralset_scratch/.venv/bin/python scripts/scratch/neuralset_smoke_bt.py` — passes.
+- **Findings to fold into Phase 3 production code**: (a) row's `type` column must be the **subclass name** (`"BraintreebankIeeg"`), not `"Ieeg"` — otherwise `Event.from_dict` reconstructs the parent and our `_read()` override is bypassed; (b) events DataFrame must go through `standardize_events()` before `Segmenter.apply()`; (c) `IeegExtractor.event_types="Ieeg"` matches `BraintreebankIeeg`-typed rows via `EventTypesHelper`'s subclass-aware filter — no need to add a literal for the subclass.
 
-Ordered by blockage: things that gate cohort expansion come first.
+### Phase 1 — Python 3.12 bump (DONE 2026-04-28)
 
-### Data unblock (ask / chase Zac)
+Required by `neuralset>=0.1.0`. Fully independent of reorg and smoke.
 
-- [ ] **Localization pipeline for 10 priority lex patients.** Box audit 2026-04-21: only S76/S78/S81 have recons on my mount; the spreadsheet's "Localization" column is empty across all lex rows. Zac said recons exist "back to S73" but they're not under `ECoG_Recon/` or `ECoG_Recon_Full/`. Priority pipeline order (best-HG first): **S73 (210/256), S75 (227/256), S56 (186/256), S67 (159/256), S74 (156/256), S41 (146/256), S53 (114/256), S47 (108/128), S45 (101/128), S55 (100/256)**.
-- [ ] **Re-check spreadsheet / Box for localization tracking doc.** The "Localization" column in `uECoG_Upload/uECoG Recording Details.xlsx` is empty — the doc Zac referenced may live elsewhere. Scan `CoganLab/preprocessing_documentation/` and `CoganLab/uECoG_Meetings/`.
-- [ ] **S52 + S71 usability (Zac checking).** S52 = MFA events in derivatives but no raw in BIDS; S71 = two incompatible events.tsvs, no merged `.fif`. Drop both from Stage 2 if unresolvable by next meeting.
-- [ ] **S41 is not in Zac's pipeline back-reach.** Zac: pipeline reaches "back to S73" — S41 is from 2022-12-12 and won't be picked up. Ask explicitly whether S41 recon can be run as a one-off (best-HG patient after S73/S75).
+- [x] **Bump `pyproject.toml`** `requires-python = ">=3.12,<3.13"` (pinned to 3.12 — uv otherwise picked 3.14, drifting from NeuralSet's verified version).
+- [x] **Regenerate `uv.lock` + `.venv/`** via `uv sync` (then `uv sync --extra dev` for pytest). Local venv now Python 3.12.12. Resolved versions: torch 2.10.0, mne 1.11.0, mne_bids 0.18.0, transformers 5.4.0, numpy 2.4.3, scipy 1.17.1, scikit-learn 1.8.0, h5py + pyyaml + tqdm refreshed.
+- [x] **Existing tiny test suite passes** (local + DCC): `tests/test_phoneme_map.py` + `tests/test_grouped_cv.py` + `tests/v14/test_no_legacy_imports.py` = 65/65 on both. Full `tests/` collection fails on pre-existing pyproject.toml gaps (`nibabel`, `pandas` not declared) — fix in Phase 3.
+- [x] **DCC env built** at `/work/ht203/repo/speech/.venv` (Python 3.12.13, uv-managed via `python-build-standalone`). Switched from the planned conda sibling env after DCC's miniconda base rotted (`frozendict` ImportError); uv is more reliable for this use case (single static binary, hermetic Python tree, matches local workflow). Existing `miniconda3/envs/speech/` Python 3.11 env left untouched as fallback through ~2026-05-05. Recipe lives in `docs/references/dcc_setup.md`.
+- [x] **Path swap landed** — 58 active files (52 sbatch + `scripts/ablation/_common.py` + `scripts/ablation/submit.py` + 4 doc spots) plus `docs/references/dcc_setup.md`. Replaced `/work/ht203/miniconda3/envs/speech/bin/python` → `/work/ht203/repo/speech/.venv/bin/python` and `/work/ht203/miniconda3/envs/speech/lib` → `/work/ht203/repo/speech/.venv/lib/python3.12/site-packages/torch/lib`. `scripts/archive/legacy/*` (16 files) intentionally untouched (quarantined, no longer executed). Verified: `grep -r envs/speech scripts/v14_core/ scripts/ablation/` returns nothing.
 
-### Architecture close-out (Stage-1 → Stage-2 handoff)
+### Phase 2 — Reorg PR (~1 week, 4 commits)
 
-- [ ] **Re-run 7-LH pooled under T3.1 default** (`hierarchical_atlas + partialconv + pe2d`). This becomes the Stage-2 baseline row (cohort=7, reference for cohort-growth deltas). 15-task pooled sbatch; copy ckpts to `/hpc/group/coganlab/ht203/stage2_ckpt_t31_7lh/`.
-- [ ] **7-LH LOPO under T3.1** after pooled lands. Fills the 7-LH row's LOPO column.
+Full restructure to NeuralSet-mirrored layout. Plan: `neuroprobe/repo_reorg_plan.md`. Each commit passes `pytest -q`.
 
-### Infrastructure (self-contained; unblocked)
+- [ ] **Commit 1 — Skeleton**: create empty target subpackages (`extractors/`, `studies/`, `atlas/`, `models/`, `training/`) with `__init__.py`. No moves. (`events/` + `ssl/` deferred per empty-package rule.)
+- [ ] **Commit 2 — Archive sweep**: move stubs / parity oracles / exploration / audit into `archive/{stage2_stubs,parity_oracles,exploration}/`. **Delete** the ~17 quarantined-module tests under `tests/v14/` (calibration, tokenizer, model, decoder, grid_mixer, parcel_embedding, parcel_frames, electrode_pool, slot-CE dataset, coordinates, cvsavg_spatial, audit-suite tests, etc.). Update `test_no_legacy_imports.py` to enforce new archive paths.
+- [ ] **Commit 3 — Bulk move + call-sites (merged from old commits 3+4)**: atlas + models + training + studies/cogan_ps. Update internal imports + `scripts/v14_core/*.py` + `scripts/v14_core/v14_*_dcc.sh` + `scripts/ablation/submit.py` + flat `scripts/*.py` (audit + archive unused) + `docs/CLAUDE.md` + `docs/strategy/stage_*.md` + `docs/references/*.md`. Smoke: `python -c "from speech_decoding import atlas, models, training, studies"` and `python -m scripts.v14_core.train_v14_core --help`.
+- [ ] **Commit 4 — Tests + cleanup**: colocate the ~17 active-module tests under their new module homes (not 3 — the original count was wrong; full list = the active half of `tests/v14/`); update `pyproject.toml` `tool.pytest.ini_options.testpaths = ["src"]`; delete empty `v14/` + `data/` + `evaluation/` packages; delete now-empty `tests/v14/`. Run `pytest -q`.
+- [ ] **Verification gates** all pass: `pytest -q`; `python -m scripts.v14_core.train_v14_core --help`; `python -c "import speech_decoding; from speech_decoding import atlas, models, training, studies, extractors"`; `grep -r "from speech_decoding.v14\|speech_decoding\.evaluation\|speech_decoding\.data" src/ scripts/ tests/ docs/` returns nothing in active code; DCC dry run via `scripts/ablation/dcc_sync_check.py` against the `.venv` env.
 
-- [ ] **28-ARPABET joint label map.** Extend `src/speech_decoding/data/phoneme_map.py`: add lex 28-class index, keep PS 9-class as a subset with a stable mapping. Add per-task mask for exhaustive AR decode (9³ for PS trials, 28³ for lex trials). Add class-frequency probe — PS-acc / lex-acc ratio in eval JSONs.
-- [ ] **Lex phoneme-level loader.** Parallel to `phoneme_dataset.py` — reads `derivatives/epoch(phonemeLevel)(CAR)/...` from the lex BIDS root (`configs/paths.yaml:lex_bids_root`). 15/16 lex patients have phoneme-level `.fif` (S71 missing — needs merge from `events.tsv` split-role + MFA rerun).
-- [ ] **Mixed-cohort sampler.** Same-patient-per-batch invariant holds; cohort set extends to PS ∪ lex. `V14PhonemeDataset` wraps both per-task dataset objects transparently — patient_id disambiguates.
-- [ ] **Continuous-sample loader.** Raw `.fif` for SSL pretrain, not phoneme-epoched. Recipe A z-score (per-channel mean/std over all pre-auditory baselines). Target: `src/speech_decoding/v14/continuous_dataset.py`.
-- [ ] **Per-lex-patient channel bridge.** As each lex recon lands, build `data/channel_maps/<pt>_channelMap.mat` lookup + `data/fsaverage_coords/<pt>_fsaverage_pial.csv` + `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv`. Automate with a single `scripts/v14_core/prepare_new_patient.py`.
+### Phase 3 — NeuralSet adoption PR (~3 days)
 
-### SSL objective (Stage-2 mid-wave, triggered at ≥10-LH)
+Add NeuralSet adapter files. Plan: `neuroprobe/neuralset_integration_plan.md`.
 
-- [ ] **Choose SSL objective** (DIVER-1 multi-domain reconstruction preferred, see `strategy/stage_2.md §SSL ablation`). Candidate stack ordered by expected transfer strength.
-- [ ] **Mask generator + reconstruction head**, checkpoint interop so SSL ckpt loads cleanly into the per-phoneme loader.
-- [ ] **Calibration module stub.** `src/speech_decoding/v14/calibration.py` signature-only (no-op default). Preserves interface for Phase 2 without baking assumptions.
+- [ ] **Add `neuralset>=0.1.0` to `pyproject.toml`** + `uv sync`.
+- [ ] **`src/speech_decoding/studies/braintreebank/study.py`** — `BraintreebankIeeg(Ieeg)` + `BraintreebankStudy(ns.Study)`. Real implementation of `_load_timeline_events()` (replaces smoke-test placeholder).
+- [ ] **`src/speech_decoding/studies/braintreebank/loader.py`** — productionize smoke `bt_load_raw()` (raw 2048 Hz voltage, no re-reference, matches Neuroprobe native output); add colocated `test_loader.py`.
+- [ ] **`src/speech_decoding/studies/braintreebank/labels.py`** — Stage-0-E3 (15-task derivation; can land empty-stub if Stage-0 not started yet).
+- [ ] **`src/speech_decoding/studies/braintreebank/manifest.py`** — empty-stub for Tier-1 whitelist + BT-Tier-1 parcel list (populated by Stage-0 A0).
+- [ ] **`src/speech_decoding/extractors/parcel.py`** — `V14ParcelMetadataExtractor(BaseStatic)`.
+- [ ] **DCC env questions resolved** (3 open at integration plan §Open questions): exca cache location (`CACHE_FOLDER=/hpc/group/coganlab/ht203/exca_cache`) — **must answer before first `dataset.prepare()` invocation on DCC**, otherwise cache lands on auto-purging `/work/`; `MapInfra(cluster="slurm")` partition kwargs; coexistence with `scripts/ablation/`.
+- [ ] **Delete smoke script** (`scripts/scratch/neuralset_smoke_bt.py`) — superseded by real cohort module.
 
----
+### Phase 4 — Stage 0 begins
 
-## Backlog (deferred to later stages)
-
-- **Architectural re-tests at Stage-2 scale** — `P_emb` LOPO keep (T3.5 follow-up), per-electrode d=64 (T2.2 follow-up), plain hierarchical-alone LOPO. Queued until 17-LH pooled + LOPO lands.
-- **T3.6 decomposed path** (old tasks #10/#11/#12) — dual-stream cross-attn + 611-token backbone. Subsumed into the Stage-2 atlas-mechanism ablation, where cross-attn on per-electrode tokens is strictly cleaner than per_cell dual-stream. Likely retired as originally specified.
-- **Cogan sEEG D-cohort scoping** — Stage 3 kickoff. Full self-audit 2026-04-21 (`reports/seeg_cohort_scoping_2026_04_21/`): **85 unique D-patients** across 4 speech-task BIDS roots, **all with complete FreeSurfer recons on Box** (`ECoG_Recon/D<N>`, no zero-pad; BIDS `sub-D0023` → recon `D23`). RAS format identical to S-patients — `fsaverage_projection.py` transfers unchanged. PS events.tsv uses identical 52 CVC/VCV tokens — **same 9-phoneme label map**, no remap. BNA lookups pre-baked per D-recon at `D<N>_elec_location_radius_{1,2,3,5,7,10}mm_aparc.BN_atlas+aseg.mgz.csv` (patient-space probabilistic; convention-compatible with our Tier-1 naming). Projectable cohort × Tier-1 (3mm argmax ≥10 electrodes): PS 17 LH / 9 RH / 25 either; LexDelay 13 LH / 11 RH / 24 either; LexNoDelay 7 LH / 6 RH; SentenceRep 7 LH / 2 RH. PS ∩ LexDelay = 27. Derivatives are trial-level multi-band (`epoch(CAR)/sub-D*/epoch(band)(power)/`) — no phoneme-level fif; Stage 3 would MFA-epoch from production. Self-answerable prep complete 2026-04-24 (all 11 items landed — see `memory/project_seeg_stage3_prep_inflight_2026_04_24.md`): A1 sig-channel (`reports/seeg_sig_channels_2026_04_24/`), A2 events+muscle (`reports/seeg_events_audit_2026_04_24/`), A3 continuous corpus (`reports/seeg_corpus_audit_2026_04_24/` — **180.59 h / 87 unique D-patients, 26.6× uECoG**), A4 z-score recipe (`reports/seeg_zscore_recipe_2026_04_24/`), A5 DCC sync diff (`reports/dcc_sync_plan_2026_04_24/`), A6 sensor geometry (`reports/seeg_sensor_geometry_2026_04_24/`), B1 support caches (`data/atlas/support_cache_v2c_snap_dcohort/`, 122 patients), B2 coord caches (`data/dcohort_coords/`, 128 patients), B3 manifest (`data/dcohort_manifest.csv`, 122 ready + 6 partial), C1 RH-expansion stub (`docs/strategy/stage_3_rh_expansion.md`). Corpus section in `docs/references/data_reference.md`.
-  - **Nanlin asks** (two; everything else is our call):
-    1. **Laplacian / bipolar reference variant?** Box has stats directories for CAR / WM / M1 / STG / HIPP / LING — all global or anatomical-region references. BT cross-subject baseline uses a Laplacian re-reference (mean of adjacent same-stem depth contacts) and that's the winning recipe at 0.539. Ask whether the Cogan pipeline has a Laplacian/bipolar option we missed, or which of the six is closest to local-bipolar style. Default to CAR if no clear match.
-    2. **MFA / TextGrid / production-WAV location for D-cohort.** `SCRIPTS_USAGE.md` at the BIDS root references `D_Data/Phoneme_Sequencing/` but that path isn't visible at `/datacommons/coganlab/D_Data/` on DCC. If they don't exist, we stay continuous-corpus / SSL-only on the D-cohort side — no Tier-2 blocker.
-  - **Our calls** (don't bother him):
-    - **DCC sync direction.** Box → `/work/ht203/data/` per `reports/dcc_sync_plan_2026_04_24/rsync_commands.sh`.
-    - **Authoritative usability tiering.** A1 sig-fraction proxy is good enough for SSL pretrain (false positives nearly free). Defer his authoritative call until/unless we fine-tune on D-cohort.
-    - **Z-score recipe exact form.** A4 confirmed `production_highgamma.fif` is directly z-scored and consistent within-patient. uECoG audit showed mean/std ≡ recording-level median/MAD up to per-channel affine (ρ=1.0000); recipe identity is academic for model input.
-    - **Patient-space atlas convention.** Radius (3 mm), model-input form (full weighted Tier-1 support), normalization (raw [0, 100]), and Tier-1 selection rule (argmax_wins ≥ N pooled across cohort) are all our calls. Decide empirically by ablation if needed.
-- **Phase-2 learned per-patient calibration** — enabled by `calibration.py` stub.
-- **RH patient re-inclusion (S22, S58)** — Stage 3 with sEEG join.
+Cleared to start Stage 0 Block A on the new shape. Entry point: `neuroprobe/stage_0.md`.
 
 ---
 
@@ -74,3 +69,48 @@ Ordered by blockage: things that gate cohort expansion come first.
 - DCC setup + rsync recipe: `references/dcc_setup.md`.
 - Raw ablation log: `experiments/v14_ablation_log.csv` (authoritative results).
 - Submissions ledger: `.ablation_submissions.jsonl` (gitignored; decodes task ids → fold/seed).
+
+---
+
+## Paused — PS Stage-2 (resume after Neuroprobe submission)
+
+Frozen architecture at PS pause = `per_cell + partialconv + pe2d + hierarchical_atlas` @ d=32, depth=3, pool=(4,8). All file paths below assume **post-reorg layout** — substitute when resuming.
+
+### Data unblock (ask / chase Zac)
+
+- [ ] **Localization pipeline for 10 priority lex patients.** Box audit 2026-04-21: only S76/S78/S81 have recons on my mount; the spreadsheet's "Localization" column is empty across all lex rows. Zac said recons exist "back to S73" but they're not under `ECoG_Recon/` or `ECoG_Recon_Full/`. Priority order (best-HG first): **S73, S75, S56, S67, S74, S41, S53, S47, S45, S55**.
+- [ ] **Re-check spreadsheet / Box for localization tracking doc.** Scan `CoganLab/preprocessing_documentation/` and `CoganLab/uECoG_Meetings/`.
+- [ ] **S52 + S71 usability (Zac checking).** S52 = MFA events in derivatives but no raw in BIDS; S71 = two incompatible events.tsvs, no merged `.fif`. Drop both from Stage 2 if unresolvable.
+- [ ] **S41 not in Zac's pipeline back-reach.** Pipeline reaches "back to S73" — S41 from 2022-12-12 won't be picked up. Ask explicitly whether S41 recon can be run as a one-off.
+
+### Architecture close-out (Stage-1 → Stage-2 handoff)
+
+- [ ] **Re-run 7-LH pooled under T3.1 default** (`hierarchical_atlas + partialconv + pe2d`) — Stage-2 baseline row. Copy ckpts to `/hpc/group/coganlab/ht203/stage2_ckpt_t31_7lh/`.
+- [ ] **7-LH LOPO under T3.1** after pooled lands.
+
+### Infrastructure (self-contained; unblocked)
+
+- [ ] **28-ARPABET joint label map.** Extend `src/speech_decoding/training/phoneme_map.py`: add lex 28-class index, keep PS 9-class as a subset. Per-task mask for AR decode (9³ for PS, 28³ for lex). Class-frequency probe in eval JSONs.
+- [ ] **Lex phoneme-level loader.** Parallel to `studies/cogan_ps/dataset.py` — reads `derivatives/epoch(phonemeLevel)(CAR)/...` from the lex BIDS root. 15/16 lex patients have phoneme-level `.fif` (S71 missing).
+- [ ] **Mixed-cohort sampler.** Same-patient-per-batch invariant; cohort set extends to PS ∪ lex.
+- [ ] **Continuous-sample loader.** Raw `.fif` for SSL pretrain — `src/speech_decoding/studies/cogan_ps/continuous_dataset.py` (or unified across cohorts via NeuralSet `Ieeg` event).
+- [ ] **Per-lex-patient channel bridge.** As each lex recon lands, build `data/channel_maps/<pt>_channelMap.mat` lookup + `data/fsaverage_coords/<pt>_fsaverage_pial.csv` + `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv`. Automate with `scripts/v14_core/prepare_new_patient.py`.
+
+### SSL objective (Stage-2 mid-wave, triggered at ≥10-LH)
+
+- [ ] **Choose SSL objective.** Post-NeuralSet adoption: joint `L = L_recon + 1{paired}·L_DSigLIP + 0.1·L_KoLeo` per `docs/neuroprobe/plan.md` Experiment 5 (resolved 4/27 night). `L_recon` = JEPA-family latent prediction (data2vec 2.0 + V-JEPA 2.1). `L_DSigLIP` = brain ↔ frozen **Whisper-large-v3 L8** (~25% depth; default revised 4/27 late-night per `docs/neuroprobe/plan.md` line 17; sweep {L8, L16, L30}) via NeuralSet `Segmenter(extractors={neural, metadata, stim_audio})`. See `neuroprobe/stage_2.md §SSL recipe ablation cells` for full ablation matrix.
+- [ ] **Mask generator + reconstruction head**, ckpt interop so SSL ckpt loads cleanly into the per-phoneme loader.
+- [ ] **Calibration module stub.** `src/speech_decoding/models/calibration.py` signature-only (no-op default).
+
+### D-cohort / Stage 3 prep (open Nanlin questions)
+
+- [ ] **Laplacian / bipolar reference variant for D-cohort?** Box has CAR / WM / M1 / STG / HIPP / LING. BT cross-subject baseline uses Laplacian re-reference. Default to CAR if no clear match.
+- [ ] **MFA / TextGrid / production-WAV location for D-cohort.** `SCRIPTS_USAGE.md` references `D_Data/Phoneme_Sequencing/` not visible at `/datacommons/coganlab/D_Data/` on DCC. If absent, stay continuous-corpus / SSL-only on D side.
+
+Stage-3 prep status: 11/11 tasks landed 2026-04-24 (per `memory/project_seeg_stage3_prep_inflight_2026_04_24.md`). 87 D-pts / 180.59 h corpus on disk. Ready to consume on resume.
+
+### Backlog (deferred to later stages)
+
+- Architectural re-tests at Stage-2 scale — `P_emb` LOPO, per-electrode d=64, plain hierarchical-alone LOPO. Queued until 17-LH pooled + LOPO lands.
+- Phase-2 learned per-patient calibration — enabled by `models/calibration.py` stub.
+- RH patient re-inclusion (S22, S58) — Stage 3 with sEEG join.
