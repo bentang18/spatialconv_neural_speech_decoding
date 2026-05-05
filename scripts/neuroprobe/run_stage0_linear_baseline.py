@@ -42,21 +42,27 @@ UPSTREAM_REPO_URL = "https://github.com/insight-neuro/neuroprobe"
 UPSTREAM_COMMIT = "c7b955b0a31464f4a5eec3f3bd78ff29841d61ac"
 
 NORMALIZATION_CELLS: dict[str, str] = {
-    "per_window_z":           "L.1.N0",
-    "train_set_fixed":        "L.1.N1",
-    "per_session_fixed":      "L.1.N2",
-    "train_set_scale_only":   "L.1.N3",
-    "none":                   "L.1.N4",
-    "per_session_robust_mad": "L.1.N5",
+    "per_window_z":              "L.1.N0",
+    "train_set_fixed":           "L.1.N1",
+    "per_session_fixed":         "L.1.N2",
+    "train_set_scale_only":      "L.1.N3",
+    "none":                      "L.1.N4",
+    "per_session_robust_mad":    "L.1.N5",
+    "train_set_robust_mad":      "L.1.N6",
+    "per_session_robust_scale":  "L.1.N7",
+    "per_channel_train_set_z":   "L.1.N8",
 }
 
 NORMALIZATION_DESCRIPTIONS: dict[str, str] = {
-    "per_window_z":           "per-sample z-score across the flattened feature dim (BrainBERT/PopT recipe)",
-    "train_set_fixed":        "sklearn StandardScaler fit on training features (current upstream linear baseline)",
-    "per_session_fixed":      "StandardScaler fit independently on each session's own features (closest analog to recording-level)",
-    "train_set_scale_only":   "StandardScaler with_mean=False fit on training features (isolates demean from scale)",
-    "none":                   "no normalization, raw features (sanity floor)",
-    "per_session_robust_mad": "per-feature median + 1.4826*MAD fit independently on each session (Cogan-pipeline analog)",
+    "per_window_z":             "per-sample z-score across the flattened feature dim (BrainBERT/PopT recipe)",
+    "train_set_fixed":          "sklearn StandardScaler fit on training features (current upstream linear baseline)",
+    "per_session_fixed":        "StandardScaler fit independently on each session's own features (transductive: test stats fit on test)",
+    "train_set_scale_only":     "StandardScaler with_mean=False fit on training features (isolates demean from scale)",
+    "none":                     "no normalization, raw features (sanity floor)",
+    "per_session_robust_mad":   "per-feature median + 1.4826*MAD fit independently on each session (transductive: test stats fit on test)",
+    "train_set_robust_mad":     "per-feature median + 1.4826*MAD fit on training set, applied to test (inductive analog of N5)",
+    "per_session_robust_scale": "per-feature MAD scale only (no median subtraction) fit independently on each session",
+    "per_channel_train_set_z":  "one mean/std per electrode pooled over freq+time, fit on training set (standard iEEG recipe)",
 }
 
 
@@ -268,6 +274,7 @@ def run_eval(
                         X_train, X_test, regions_train, regions_test
                     )
 
+                n_channels = int(X_train.shape[1])
                 X_train = X_train.reshape(X_train.shape[0], -1)
                 X_test = X_test.reshape(X_test.shape[0], -1)
 
@@ -279,7 +286,9 @@ def run_eval(
                         "qc_fold": fold_idx,
                     }
 
-                X_train, X_test = apply_normalization(X_train, X_test, args.normalization)
+                X_train, X_test = apply_normalization(
+                    X_train, X_test, args.normalization, n_channels=n_channels,
+                )
 
                 if qc_payload is not None and "post_train_sample" not in qc_payload:
                     qc_payload["post_train_sample"] = _subsample(X_train, 200_000)
@@ -344,7 +353,7 @@ def run_eval(
 
 
 def apply_normalization(
-    X_train: Any, X_test: Any, normalization: str
+    X_train: Any, X_test: Any, normalization: str, *, n_channels: int = 0,
 ) -> tuple[Any, Any]:
     if normalization == "train_set_fixed":
         scaler = StandardScaler(copy=False)
@@ -362,6 +371,13 @@ def apply_normalization(
     elif normalization == "per_session_robust_mad":
         X_train = _mad_normalize(X_train)
         X_test = _mad_normalize(X_test)
+    elif normalization == "train_set_robust_mad":
+        X_train, X_test = _train_set_mad(X_train, X_test)
+    elif normalization == "per_session_robust_scale":
+        X_train = _mad_scale_only(X_train)
+        X_test = _mad_scale_only(X_test)
+    elif normalization == "per_channel_train_set_z":
+        X_train, X_test = _per_channel_train_set_z(X_train, X_test, n_channels)
     elif normalization == "per_window_z":
         X_train = _per_window_z(X_train)
         X_test = _per_window_z(X_test)
@@ -382,6 +398,35 @@ def _mad_normalize(X: np.ndarray) -> np.ndarray:
     med = np.median(X, axis=0, keepdims=True)
     mad = np.median(np.abs(X - med), axis=0, keepdims=True) * 1.4826
     return (X - med) / (mad + 1e-8)
+
+
+def _train_set_mad(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    med = np.median(X_train, axis=0, keepdims=True)
+    mad = np.median(np.abs(X_train - med), axis=0, keepdims=True) * 1.4826
+    return (X_train - med) / (mad + 1e-8), (X_test - med) / (mad + 1e-8)
+
+
+def _mad_scale_only(X: np.ndarray) -> np.ndarray:
+    mad = np.median(np.abs(X), axis=0, keepdims=True) * 1.4826
+    return X / (mad + 1e-8)
+
+
+def _per_channel_train_set_z(
+    X_train: np.ndarray, X_test: np.ndarray, n_channels: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if n_channels <= 0 or X_train.shape[1] % n_channels != 0:
+        raise ValueError(
+            f"per_channel_train_set_z needs feature_dim divisible by n_channels; "
+            f"got n_channels={n_channels} feature_dim={X_train.shape[1]}"
+        )
+    feat_per_ch = X_train.shape[1] // n_channels
+    Xtr = X_train.reshape(X_train.shape[0], n_channels, feat_per_ch)
+    Xte = X_test.reshape(X_test.shape[0], n_channels, feat_per_ch)
+    mu = Xtr.mean(axis=(0, 2), keepdims=True)
+    sd = Xtr.std(axis=(0, 2), keepdims=True)
+    Xtr = (Xtr - mu) / (sd + 1e-8)
+    Xte = (Xte - mu) / (sd + 1e-8)
+    return Xtr.reshape(X_train.shape[0], -1), Xte.reshape(X_test.shape[0], -1)
 
 
 def _subsample(X: np.ndarray, n: int) -> np.ndarray:

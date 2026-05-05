@@ -34,6 +34,9 @@ NORMALIZATION_CELLS: tuple[tuple[str, str], ...] = (
     ("L.1.N3", "train_set_scale_only"),
     ("L.1.N4", "none"),
     ("L.1.N5", "per_session_robust_mad"),
+    ("L.1.N6", "train_set_robust_mad"),
+    ("L.1.N7", "per_session_robust_scale"),
+    ("L.1.N8", "per_channel_train_set_z"),
 )
 
 
@@ -276,8 +279,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--partition", default="coganlab-gpu")
     parser.add_argument("--account", default="coganlab")
-    parser.add_argument("--cpus-per-task", type=int, default=8)
-    parser.add_argument("--mem", default="160G")
+    parser.add_argument("--cpus-per-task", type=int, default=4)
+    parser.add_argument("--mem", default="48G")
     parser.add_argument("--time", default="12:00:00")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
