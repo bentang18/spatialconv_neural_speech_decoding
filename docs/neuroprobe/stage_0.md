@@ -1,240 +1,514 @@
-# Neuroprobe Stage 0 — Reproduce Linear baselines + pipeline rigor + linear ablation matrix
+# Neuroprobe Stage 0 — Current Execution Plan
 
-*Drafted 2026-04-24. Revised 2026-04-25 to reflect: (i) BT-derived Tier-1 selection (the LH-only PS Tier-1 is wrong for BT); (ii) hardened BNA bake gate (must-pass, no soft-fail); (iii) dropped A3.5 Gaussian-volumetric alternate readout (structurally unavailable for BT — pial-snap discards volumetric truth); (iv) expanded Block D from "reproduce 0.539" into an 8-cell linear ablation matrix that diagnoses every claim about the v14 prior at the linear-decoding regime, before any neural-net compute; (v) excluded missing electrodes by default rather than zero-row; (vi) added Cogan-lab convention questions to A4 for Stage-3 prep; (vii) extended Block D to 13 cells with the D.6–D.10 Better-Linear feature-engineering matrix (log-power, L1, zero-fill, WM-rejection, composite) — diagnoses whether v14's atlas-anchoring claim is already pre-empted by smarter feature engineering before any neural-net compute, and yields a paired-submission decomposition story.*
+*Last revised 2026-05-01.*
 
-Strategy anchor: `docs/neuroprobe/plan.md`. Project memory: `memory/project_neuroprobe_cross_subject_hillclimb_2026_04_22.md`. Benchmark reference: `docs/references/neuroprobe_benchmark.md`.
+## Purpose
 
-## Stage goals
+Stage 0 is the foundation pass before v14 model training. It proves the data, labels, evaluation protocol, and QC path are correct enough to build on.
 
-Two interlocked goals — neither alone closes the stage.
+Stage 0 does **not** implement or train v14.
 
-1. **Reproduce the #1 Linear (Laplacian+spectrogram) cross-subject baseline = 0.539 on DCC.** Protocol-correctness proof. If we can't match the leaderboard within ±0.005 per session-task, we don't understand the eval protocol and cannot trust Stage-1/2 comparisons.
-2. **Validate every pipeline primitive we'll reuse in Stages 1–3** *and* **diagnose every claim about the v14 prior at the linear-decoding regime, before spending neural-net compute.** Coordinate lookup on fsaverage, BNA bake readout at BT electrode positions, support cache schema, loader contract — each gets a pass/fail gate. Plus a 13-cell linear ablation matrix (Block D) in two groups: D.0–D.5 isolate v14-prior axes (atlas, prep, soft-vs-hard, Tier-1 selection); D.6–D.10 test the orthogonal axis — feature-engineering ceiling on a "Better Linear" baseline (log-power, L1, zero-fill, WM-rejection, composite). Answers we read *before* Stage 1 instead of post-mortem after.
+Data scope is BrainTreebank Lite only: 12 eval sessions plus metadata. Full BrainTreebank pretraining sessions are Stage 2 work.
 
-**Stage 0 closes when:** Blocks A + B + C + D pass their gates. Block E (loader scaffold) lands inside Stage 0 in parallel with D but its only gate is "loader runs end-to-end on sub_2/trial_4 without error" — Stage 1 should be able to start the day Block D passes.
+## Protocol Notes
 
-## Known limitation — Cogan-lab volumetric convention is unavailable for BT
+Neuroprobe's ICLR 2026 rebuttal changes four Stage 0 assumptions:
 
-Cogan lab's canonical sEEG BNA-sampling convention is **patient-space volumetric**: for each contact, aggregate BNA mass over a 3 mm sphere centered on the native-T1 RAS coordinate, lookup against per-patient `aparc.BN_atlas+aseg.mgz` (volumetric BNA + aseg merge, queried in patient T1 space). Source format: `ECoG_Recon/<D>/elec_recon/<D>_elec_location_radius_{1,2,3,5,7,10}mm_aparc.BN_atlas+aseg.mgz.csv`. Per-electrode CSV with columns = BNA parcels + cortical/subcortical labels; values are probabilistic mass [0, 100] within the radius sphere.
+- **Multiclass is official protocol, not an internal variant.** Upstream exposes `binary_tasks=False`, and the authors report CrossSession multiclass tables. D.0b therefore remains a required Stage 0 reference, with Linear Laplacian + spectrogram at `0.611 ± 0.003`.
+- **Lite sampling is class-balanced and time-shuffled before capping.** In the current public code, each label's candidate indices are sampled with a seeded `rng.choice(..., replace=False)` before the per-class cap is applied, then sorted back into temporal order for access. Lite is still a selected subset, but it is not simply the first chronological 3500 samples.
+- **S2-only CrossSubject is leaderboard parity only.** The project now depends on `azaho/neuroprobe@main` pinned at `c7b955b0a31464f4a5eec3f3bd78ff29841d61ac`. It exposes `include_all_train_subjects`, but the default remains S2/trial-4. Treat S2-only as a parity cell, not the scientific default.
+- **Scientific cross-subject default is pooled multi-source multiclass.** GitHub-main `include_all_train_subjects=True` returns separate 1-to-1 source-subject folds, not pooled N-to-1 training. Stage 0 still needs a local pooled leave-one-subject/session-out split for architecture selection.
 
-Verified parity-cached for 122 D-patients via `scripts/bna_parity_dpatients.py`. The 2026-04-21 audit (`reports/bna_parity_dpatients_2026_04_21/`) found surface-snap inflates Tier-1 support **2.2×** vs the volumetric truth — surface snap aliases WM-resident depth contacts onto cortex they aren't actually sampling.
+The rebuttal also matters for Stage 1 entry:
 
-For BrainTreebank we **cannot** apply this convention:
+- Linear's advantage is partly preprocessing/normalization, not proof that linear models are intrinsically better. BrainBERT/PopT used within-window z-scoring; the linear baseline uses train-set normalization after Laplacian + spectrogram features. Stage 1 must treat normalization and input view as explicit ablation axes.
+- The authors report window-anchor robustness for 1 s windows starting from roughly `-0.375` to `+0.125` s relative to word onset. Stage 0 keeps Neuroprobe's `[0, 1]` s benchmark window, but Stage 1 should include a small window-anchor robustness cell.
+- Performance-driven Lite electrode selection is only modestly stronger than random or anatomy-driven selection in their rebuttal. Still, the 120-electrode Lite cap is biased toward decodable electrodes. Use it for leaderboard parity; do not let it define the scientific default if full/anatomy/random electrode-set robustness is available.
 
-- BT releases only **fsaverage-projected** coords (`coordinates_type="cortical"`) and **patient-LPI** coords (`coordinates_type="lpi"`). `coordinates_type="mni"` raises NotImplementedError.
-- BT does **not** release per-patient FreeSurfer recons. So we have no per-patient `aparc.BN_atlas+aseg.mgz` to query volumetrically, and no patient sphere registration to do a custom projection ourselves.
-- BT's pipeline (per their §A.5) projects GM and GM-WM-boundary contacts to the patient pial along the cortical normal *before* mapping to fsaverage. Non-GM (deep WM, subcortical) contacts are **omitted from the fsaverage CSV**, which is why 15 of the 1160 Lite electrodes have no `elec_coords_full.csv` entry (sub_9 T1aI1..8 = 8 contacts; sub_10 F10Fa1..4 + F10Fa14..16 = 7 contacts). Those 15 are correctly omitted by BT — they're the WM contacts whose projection would be physically meaningless. Not a bug, a feature.
-- Consequence: **the 2.2× inflation pattern from the D-cohort audit applies to BT too, but baked in by BT's pipeline, not by ours.** A 3D Gaussian readout on top of BT's snapped coords would not recover the volumetric truth — the volumetric information was discarded the moment they snapped. Any volumetric-truth correction would require BT to release recons or raw T1s. (This is why the originally-proposed A3.5 Gaussian alternate readout was dropped from this plan.)
+## Current State
 
-**Mitigation we can do.** A2 (Destrieux match) verifies the projection is *self-consistent* (≥95% agreement with BT's `Region` column = projection isn't broken). A3 (BNA bake rigor) verifies our bake at the projected positions is correct. We document the inflation as a known cross-cohort comparison limit in the eventual paper / submission write-up.
+Completed:
 
-**Stage-3 implication.** When we resume the D-cohort program, Cogan-lab volumetric remains our default (122 D-patients already cached). The limit is BT-specific.
+- **NeuroAI data path**: local `Wang2024Treebank` NeuralSet study exists and emits raw iEEG events.
+- **Raw-voltage proof**: NeuralSet/Segmenter/IeegExtractor output matches Neuroprobe direct raw h5 reads at 2048 Hz. Report: `reports/neuroai_raw_voltage_proof_2026_04_29/`.
+- **Block B data integrity**: all 12 Lite h5 sessions open, use 2048 Hz, have expected Lite electrodes, and have parseable transcript feature CSVs. Report: `reports/neuroprobe_stage0_b_bt_lite_integrity_with_transcripts_2026_04_30/`.
+- **Transcript repair**: truncated `thor-ragnarok/features.csv` and `lotr-1/features.csv` in `/work/ht203/data/braintreebank/` were backed up with `.corrupt_20260430T015020Z` suffixes and replaced from complete copies in `/work/ht203/data/braintreebank_smoke/`.
+- **E3 label parity**: our label-index derivation matches Neuroprobe exactly for all 15 tasks in binary and multiclass modes on `sub2/trial4`. Report: `reports/neuroprobe_stage0_e3_label_parity_2026_04_30/`.
+- **D.0 preflights**: exact upstream linear baseline wrapper passed for `sub1/trial1/pitch` in both modes. Reports:
+  - `reports/neuroprobe_stage0_d0a_preflight_pitch_2026_04_30/`
+  - `reports/neuroprobe_stage0_d0b_preflight_pitch_rerun_2026_04_30/`
+- **D.0 full replication**: exact upstream linear Laplacian + spectrogram baseline rerun closed. Report: `reports/neuroprobe_stage0_d0_upstream_baselines_2026_04_30/`.
+  - D.0a CrossSubject binary: `0.539210` mean AUROC vs figure reference `0.539212`.
+  - D.0b CrossSession multiclass: `0.613232` mean AUROC vs figure reference `0.611336`.
+  - All collected D.0 job records succeeded.
+  - D.0b task means do not pass the old fixed `±0.005` task-level gate; max task delta is `0.018576`. This is documented as multiclass reference drift because the upstream figure reference was generated from `older_neuroprobe_results_fromEngaging`, while the rerun uses pinned public upstream code and current public Lite data. The aggregate target is reproduced within the published SEM.
+- **A-public hard-label coverage audit**: public BT `depth-wm.csv:DesikanKilliany` labels are complete for all filtered electrodes and can support a DK/Destrieux-style hard-label control. Report: `reports/neuroprobe_stage0_public_bt_hard_labels_2026_05_05/`.
+  - Full filtered BT subjects: 10 subjects, 1,550 labeled electrodes, 64 unique labels, 0 missing labels.
+  - Neuroprobe Lite electrode cap across all 10 subjects: 1,160 labeled electrodes, 60 unique labels, 0 missing labels.
+  - No public label appears in all 10 subjects. Top shared full-filtered labels are `ctx-lh-superiortemporal` (94 electrodes, 7 subjects), `ctx-lh-middletemporal` (70, 7), `ctx-lh-insula` (59, 7), and `ctx-lh-precentral` (54, 6). Lite-cap top shared labels are `ctx-lh-superiortemporal` (93, 7), `ctx-lh-middletemporal` (63, 7), and `ctx-lh-insula` (38, 7).
+  - Pairwise label-set overlap is modest: full-filtered mean Jaccard `0.217` with range `0.000-0.762`; Lite-cap mean Jaccard `0.206` with range `0.000-0.609`.
+  - Strongest co-coverage edges are the LH temporal/insula triad: `ctx-lh-insula` + `ctx-lh-middletemporal`, `ctx-lh-insula` + `ctx-lh-superiortemporal`, and `ctx-lh-middletemporal` + `ctx-lh-superiortemporal`, each in 7 subjects.
+  - Same-shaft public-label uniqueness check from `electrode_label_audit.csv`: Lite has 115 parsed shafts; 97 shafts (84.3%) span more than one public label, covering 1,060/1,160 contacts (91.4%). Full filtered has 140 parsed shafts; 123 shafts (87.9%) span more than one label, covering 1,451/1,550 contacts (93.6%).
+  - Interpretation: this is a public hard-label support control only. It does not create BNA support, surface coordinates, or a valid A0-A4 BNA co-coverage graph.
 
-## Data footprint
+Blocked:
 
-Stage 0 only needs the Neuroprobe Lite eval subset (12 trials per `NEUROPROBE_LITE_SUBJECT_TRIALS`) plus metadata zips — exactly what BT's `braintreebank_download_extract.py --lite` produces. Tier-1 pretrain sessions (14 full + 5 partial whitelist) are **not** downloaded in Stage 0 — they enter in Stage 2. Estimated DCC footprint: ~50 GB unzipped at `/work/ht203/data/braintreebank/` (12 h5 files + ~530 MB metadata).
+- **A0-A4 BNA / C / D.1+ BNA / V7-V8 surface geometry** remain blocked until we get true per-electrode `fsaverage` surface mapping from Christopher Wang, or Ben explicitly approves a weaker Destrieux-first fallback.
+- **BT shaft/depth geometry contract** is now a Stage-0 blocker before any v14 BT architecture run. sEEG shaft-relative depth is a real measurement feature: contacts on one shaft commonly traverse multiple anatomical labels. We must decide which shaft/depth features are transferable and which are patient-ID shortcuts before encoding them.
 
-## Blocks
+## Remaining Work
 
-### Block A — Coordinate + BNA pipeline rigor (local, ~1 day local + async wait on A4)
+### 1. Run V0-V6 Data QC
 
-Cheap. Runs against metadata zips already at `/tmp/bt_metadata/` + our existing `data/atlas/fsaverage_bake_v2c/`. No DCC required. A4 (Zac/Nanlin sign-off) comes after A0–A3 land — we present numbers, not hypotheses.
+This is the main unblocked work while waiting for Christopher.
 
-**Pre-conditions for A2/A3:** local FreeSurfer install with `fsaverage` subject for Destrieux (`$FREESURFER_HOME/subjects/fsaverage/label/{l,r}h.aparc.a2009s.annot`); BNA authors' shipped fsaverage annot at `data/atlas/BN_Atlas_freesurfer/fsaverage/label/{l,r}h.BN_Atlas.annot`. Default FS path `/Applications/freesurfer/8.2.0/...` per `scripts/verify_bna_fsaverage_bake.py`. Confirm both before A2.
+V0-V6 is a data-contract QC report, not a model experiment. It should decide which signal views are valid Stage-1 candidates and which artifact probes must travel with every later result. It should use all 12 Lite sessions for tabular summaries, with readable plots for a fixed representative subset.
 
-- **A0 — BT-derived Tier-1 parcel list.** `src/speech_decoding/v14/token_spec.py::DEFAULT_BASE_PARCELS` is **LH-only, 15 parcels, frozen for Phase-1**, derived from the PS uECoG cohort (7 LH patients, motor strip + STG concentration). It is the wrong list for BT — BT's 1145 Lite-with-coord sEEG contacts span the whole brain bilaterally (frontal, MTG, hippocampus, insula, RH everything) and the 15 Neuroprobe tasks include visual / linguistic / audio whole-brain decoders. A naive LH→RH mirror just doubles the wrong list. **Fresh derivation:** snap each Lite-with-coord electrode to nearest fsaverage vertex, compute argmax BNA parcel id, count argmax-wins per parcel across the cohort. Tier-1 = **every parcel with ≥1 argmax-win** (no further threshold — we do not bias toward speech-motor, the eval is whole-brain). Land as `BT_TIER1_PARCELS` in **new** module `src/speech_decoding/neuroprobe/atlas_tier1_bt.py`. **Do not mutate `token_spec.py`** — Phase-1 contract is frozen. **Gate:** all parcel ids in 1–246; cardinality recorded; LH/RH distribution recorded; cohort coverage stat (% of 1145 electrodes whose argmax lands in the list) ≥99%.
+Output should land under a dated report folder:
 
-- **A1 — Mesh identity.** Verify our bake uses standard 163,842-vertex/hemi fsaverage. Vertex count is recorded in `data/atlas/fsaverage_bake_v2c/bake_manifest.json` — confirm via `src/speech_decoding/v14/fsaverage_atlas.py::load_bake_manifest`. Then snap each of the 1145 Lite-with-coord electrodes; compute snap-distance histogram. **Gate:** vertex count = 163,842/hemi; mean snap distance <0.5 mm; max <2 mm. Failure = different mesh subdivision than BT, re-derive bake on correct mesh.
+```text
+reports/neuroprobe_stage0_v_data_qc_YYYY_MM_DD/
+```
 
-- **A2 — Destrieux cross-check (projection end-to-end verification).** For each Lite electrode: snap to nearest fsaverage vertex, look up Destrieux label from `aparc.a2009s.annot`, compare to BT's `Region` column in `elec_coords_full.csv`. **Gate:** ≥95% exact-label match across all 1145 electrodes; disagreements must not cluster by hemisphere. **This is the single sharpest integrity test** — it validates mesh alignment, axis convention, hemi sign, and vertex lookup simultaneously, *without* depending on our BNA bake. It is also the empirical verification that BT's coords actually live on fsaverage — if A2 passes, the BT-fsaverage assumption is verified end-to-end. Failure = XYZ axis order, hemi sign convention, or mesh version is wrong.
+Expected artifacts:
 
-- **A3 — BNA bake rigor at Lite electrode positions (must-pass, no soft-fail).** Extend `scripts/verify_bna_fsaverage_bake.py` (which already runs the cohort-wide bake-vs-published-annot per-vertex argmax compare) to **restrict the comparison to the 1145 Lite-electrode nearest-vertex set**. Add a `--electrodes-csv` flag or a wrapper script `scripts/neuroprobe/verify_bna_at_lite.py` that reuses the existing comparison code. Tabulate disagreements per parcel.
+- `README.md` with interpretation and Stage-1 implications.
+- `summary.json` with pass/fail flags and open decisions.
+- `session_channel_metrics.csv` with one row per session/electrode.
+- `session_view_metrics.csv` with one row per session/reference/input-view.
+- `lite_full_audit.csv` for Lite-vs-Full selection summaries where Full data is available.
+- `nuisance_probe_metrics.csv` for subject/session/reference/coverage/timing proxy summaries.
+- Representative plots, not an unreadable dump of every channel.
 
-  **Gates (hardened, all must pass):**
-  - Overall argmax match ≥**90%** on Lite vertices (was ≥85% cohort-wide; tightening for the Lite-only restriction since we only need the bake correct where we read it).
-  - Per-parcel Dice ≥**0.85** for **every parcel in the BT-derived Tier-1 list** (A0 output) — not just speech-motor; the whole BT-Tier-1.
-  - Zero parcels in BT-Tier-1 with overall match <80% (no quiet sinks).
+#### V0 — Lite Vs Full Selection Audit
 
-  **Failure mode:** re-bake using authors' GCS classifier on fsaverage directly, instead of the current `mri_vol2surf --projfrac-avg` column-walk. Stage 0 blocks until re-bake passes. **No soft-fail — every Stage 1+ claim about atlas-anchored cross-subject transfer rests on the bake being correct at every electrode position we ever read.**
+Lite is the leaderboard-parity set, but it is selected. Stage 0 must quantify what that selection changes before v14 treats Lite performance as scientific evidence.
 
-- **A4 — Zac / Nanlin sign-off (async, 0–3 days).** Present A0–A3 results plus the 15 missing Lite electrodes (sub_9 T1aI ×8, sub_10 F10Fa ×7) to Zac and Nanlin.
+Compare Lite against Full/uncapped BrainTreebank where public data permits:
 
-  **Stage-0-blocking asks:**
-  1. Is BT's native-to-pial nearest-neighbor projection trustworthy for sEEG depth contacts (within the GM-only restriction BT applies)?
-  2. Is **excluding** the 15 missing electrodes from the loader (default — see C2) preferable to zero-support emission with `active_mask=0`? They are functionally equivalent for attention architectures with mask support; differ only if a Stage-1+ variant uses subject-fixed electrode index as a feature (we currently don't).
-  3. Is the BNA bake disagreement rate from A3 acceptable for Stage-0 proceed, or do we re-bake?
-  4. Is `localization/sub_*/depth-wm.csv` a per-electrode WM/GM column we can use as a free filter (gates Block-D D.9 cell), or does it require its own labeling pass?
+- channel/electrode overlap by subject/session;
+- label distributions by task/class;
+- movie-position and time-bin histograms;
+- Lite-channel vs non-Lite-channel raw amplitude, PSD, covariance, and bad-channel summaries;
+- whether Lite capping/shuffling creates temporal artifacts;
+- whether Lite is biased toward cleaner, more active, or more decodable electrodes.
 
-  **Stage-3 prep asks (non-blocking, while we have her in conversation):**
+Record the decision explicitly: Lite is for leaderboard parity; Full/uncapped data is for robustness whenever available.
 
-  5. Cogan-lab canonical convention questions for the D-cohort program:
-     a. Is **3 mm** her canonical sphere radius for the model-input convention, or a different radius (1/2/5/7/10 mm available in the cached CSVs)?
-     b. **Argmax-only**, **top-k**, or the **full weighted support vector** as the model input?
-     c. **Probability normalization** — raw [0, 100] (current `support_cache.py` schema), softmax, or unit-sum?
-     d. **Tier-1 selection rule** for D-cohort — same `argmax_wins ≥ N` family, or different?
+#### V1 — Raw Signal Health
 
-  Sign-off on (1)–(4) gates Blocks C–E. (5) lands in a separate Stage-3-prep memory note (see F2); not Stage-0-blocking.
+Generate raw-voltage QC:
 
-### Block B — Data download to DCC (~0.5 day, parallel with A)
+- raw voltage traces
+- amplitude and bad-channel audit
+- sample-rate, duration, channel count, and channel-label/order checks
+- NaN/inf, flatline, clipping-like repeated-extrema, and robust outlier metrics
 
-- **B1 — DCC scratch budget.** Confirm ≥200 GB free on `/work/ht203/`. Stage-2 footprint (full 27 trials) = ~270 GB; reserve.
-- **B2 — Run BT's own `--lite` download script.** Use `braintreebank_download_extract.py --lite` from `insight-neuro/neuroprobe` (cloned at `/tmp/neuroprobe_explore/neuroprobe/` locally; rsync to DCC under `/work/ht203/repo/neuroprobe/` for execution). The `--lite` filter targets exactly `NEUROPROBE_LITE_SUBJECT_TRIALS = [(1,1),(1,2),(2,0),(2,4),(3,0),(3,1),(4,0),(4,1),(7,0),(7,1),(10,0),(10,1)]` plus all metadata zips, downloads to `braintreebank_zip/`, and extracts to `braintreebank/`. Total ~50 GB. **Do not roll our own curl loop** — upstream handles DC-trigger files, partial extracts, and root-vs-data path quirks correctly. Move/symlink the resulting `braintreebank/` into `/work/ht203/data/braintreebank/` so paths.yaml entries are stable.
-- **B3 — Integrity check.** For each downloaded h5 (`sub_N_trialT.h5`), open with `h5py` and verify the per-subject electrode count matches `len(NEUROPROBE_LITE_ELECTRODES["btbankN"])`. (No upstream SHA available; `Content-Length` is the only server-side hint and `--lite` already retries truncated downloads.) Script: `scripts/neuroprobe/verify_bt_download.py`. **Gate:** all 12 trials open cleanly; per-subject electrode counts match.
+V1 should answer whether BT's Lite mask is sufficient or whether additional split-aware bad-channel exclusions are needed.
 
-### Block C — BT support cache build (~0.5 day, depends on A passing)
+#### V2 — Reference Transform QC
 
-- **C1 — `scripts/neuroprobe/build_bt_support.py`.** Consume `elec_coords_full.csv` + our fsaverage bake → nearest-vertex per electrode → BNA support vector restricted to BT-Tier-1 (A0 output) → cache at `/work/ht203/data/bt_support/<sub>_support_tier1.csv`. **Reuse the v14 support-cache IO contract**: call `src/speech_decoding/v14/support_cache.py::write_support_cache` and `src/speech_decoding/v14/fsaverage_atlas.py::sample_baked_support` directly. The `TIER1_COLUMNS` / `TIER1_BNA_INDICES_1BASED` tuples must be **parameterized** on the BT-Tier-1 list — write a thin BT-specific wrapper module `src/speech_decoding/neuroprobe/support_cache_bt.py` that builds `BT_TIER1_COLUMNS` / `BT_TIER1_BNA_INDICES_1BASED` analogously to the v14 constants. **Do not invent a new CSV format.** Stage-1 code loads via the same `read_support_cache` primitive.
+Re-reference is a first-class transform, not hidden preprocessing. It changes the measurement operator:
 
-- **C2 — Missing-electrode contract: exclude (default).** The 15 Lite electrodes with no `elec_coords_full.csv` entry are **excluded from the loader's electrode list** by default. This is consistent with what BT's own `combine_regions()` does (drops DK-Unknown electrodes silently) and matches the volumetric-truth picture (those contacts are non-GM and have no meaningful BNA labels — see Known Limitation above). Per-subject electrode count drops accordingly: sub_9 from 93 → 85, sub_10 from 120 → 113; others unchanged. Loader emits a structured log entry per excluded electrode (subject, name, reason: "no fsaverage coord; non-GM contact omitted by BT").
+```text
+raw:           y  = Ls + c + noise
+rereferenced: y' = R y = R L s + R c + R noise
+```
 
-  **Optional `--include-zero-support` flag** preserves the 15 with all-zero support rows + `active_mask=0`. Functionally equivalent for attention architectures (zero attention contribution, zero gradient) but useful if any future Stage-1+ architecture variant uses subject-fixed electrode index as a feature. We do not currently use such a variant.
+Therefore every later v14 reference transform must carry provenance. For Stage 0 QC, compare signal behavior under:
 
-- **C3 — Corrupted-contact mask.** Apply `corrupted_elec.json` at load time. Block A confirms zero intersection between the Lite set and the corrupted list, but emit the mask anyway so Stage-2 pretraining (which sees non-Lite electrodes) inherits the filter for free.
+- **R0 raw/monopolar** — diagnostic and raw-view ablation.
+- **R1 robust global CAR** — diagnostic only unless later evidence justifies promotion.
+- **R2 shaft-local robust reference / within-shaft CAR** where channel names support shaft grouping.
+- **R3 bipolar or shaft Laplacian/local reference** where adjacent-contact order is reliable.
 
-### Block D — Linear ablation matrix (~3 days, depends on A + B passing)
+For each transform, export enough metadata to reconstruct the virtual channels:
 
-Restructured from the original "reproduce 0.539 only" into a **13-cell ablation matrix** in two groups: D.0–D.5 isolate v14-prior axes (atlas, prep, soft-vs-hard, Tier-1 selection); D.6–D.10 test the orthogonal axis ("how much of the v14 thesis evaporates if you just engineer the linear baseline harder?"). All at the linear-decoding regime, **before any neural-net compute**. The post-mortems we'd otherwise do at Stage-1 failure are pre-empted: every claim about the v14 prior gets a number we read before Stage 1 spends a single GPU-hour.
+- reference type;
+- source physical channels;
+- virtual channel labels;
+- `R` matrix or sparse equivalent;
+- bad-channel exclusions;
+- virtual-channel coordinate/support status. Before exact geometry arrives, this field must be marked unresolved rather than inferred.
 
-**All 13 cells are must-run.** Linear regression on ≤3500 samples is CPU-cheap (~800 core-hours total for all 13 cells, i.e. ~1950 jobs). D.6–D.9 are one-line hyperparameter switches on the D.0 pipeline (~37 core-hours each). D.10 is the composite "Better-Linear" submission candidate. The marginal cost of D.6–D.10 over D.0–D.5 is ~200 core-hours — trivial against the value of (a) catching whether v14's atlas-anchoring claim is already pre-empted by smarter feature engineering, and (b) holding a credible Better-Linear submission that decomposes which v14 component is load-bearing.
+Global CAR is not the default. In sparse asymmetric clinical coverage it can inject artifacts into covariance structure. For BrainTreebank sEEG, within-shaft local/bipolar/Laplacian-style references are the physics-matched family; raw and CAR remain diagnostics.
 
-| Cell | Re-ref + spectral | Atlas | Pooling | Hypothesis tested |
-|---|---|---|---|---|
-| **D.0** | Lap + STFT (theirs) | DK `combine_regions()` (theirs) | mean | Reproduce 0.539. Protocol-correctness gate. |
-| **D.1a** | Lap + STFT | BNA BT-Tier-1 (ours) | argmax-hard + mean | BNA-mean vs DK-mean (their prep held constant). |
-| **D.1b** | Lap + STFT | BNA BT-Tier-1 | probabilistic-support weighted sum | Soft vs hard support (their prep held constant). |
-| **D.2** | CAR + HG (ours) | DK `combine_regions()` | mean | Our prep vs theirs (their atlas held constant). |
-| **D.3a** | CAR + HG | BNA BT-Tier-1 | argmax-hard + mean | Full-stack-ours, hard. |
-| **D.3b** | CAR + HG | BNA BT-Tier-1 | probabilistic | Full-stack-ours, soft. The "is v14 even needed?" linear ceiling. |
-| D.4 | CAR + HG | full BNA 246 (no Tier-1 filter) | probabilistic | Does BT-Tier-1 selection help, hurt, or wash? |
-| D.5 | CAR + HG | Phase-1 PS LH-only 15 (`DEFAULT_BASE_PARCELS`) | probabilistic | Anti-control: confirm the PS Tier-1 list is wrong for whole-brain bilateral BT. |
+#### V3 — Frequency-View QC
 
-#### Better-Linear feature-engineering extensions (D.6–D.10)
+Compare the relevant input views after each valid reference:
 
-D.0–D.5 test the v14 prior at the linear regime. D.6–D.10 test the orthogonal axis: **how much of the v14 thesis evaporates if you just engineer the linear baseline harder?** Each of D.6–D.9 is a +1 change vs D.0; D.10 is the composite "Better Linear" — submission candidate if it lands ≥ 0.55. Strategic motivation: a paired-submission story (Better Linear flat-mean baseline + v14 learned within-parcel attention) decomposes which v14 component is load-bearing far more cleanly than v14-alone vs leaderboard-#1.
+- raw voltage;
+- low-frequency LFP summaries;
+- STFT/log-power;
+- HG/HFA envelope;
+- CAR+HG;
+- local-reference HG/HFA.
 
-| Cell | Change vs D.0 | Hypothesis tested |
+The biologically privileged supervised speech view is local-reference HG/HFA because high-gamma field activity is the conventional proxy closest to local population firing/spiking. The richer intrinsic-SSL candidate is local-reference multi-band log-power/STFT. Raw 2048 Hz voltage remains an auxiliary/ablation view because it preserves information but carries the highest artifact and subject/device burden.
+
+#### V4 — Artifact Source Battery
+
+For every reference/input-view pair, quantify the nuisance sources most likely to fake cross-patient generalization:
+
+- subject/session/device separability from cheap summary features;
+- reference/common-mode structure;
+- line noise and harmonics;
+- channel-count and coverage-proxy separability;
+- amplitude/gain/noise-floor fingerprints;
+- slow drift;
+- high-frequency EMG-like broadband bursts;
+- pre-event label decodability;
+- shifted-window label decodability;
+- reaction-time, block-order, movie-time, or other timing proxies where available.
+
+The report should flag any view that improves apparent signal quality while increasing subject/session/reference/coverage decodability. That pattern is not a Stage-1 default candidate without stronger task evidence.
+
+#### V5 — Event-Locked Sanity
+
+Check benchmark windows and nearby anchors:
+
+- word/event-locked raw, HG, and spectrogram averages;
+- trial-locked heatmaps;
+- pre-stimulus controls;
+- shifted-window controls;
+- event-count and valid-window summaries by session;
+- whether response/event structure is aligned or smeared.
+
+Stage 0 keeps Neuroprobe's `[0, 1]` s benchmark window. Anchor robustness is a Stage-1 cell, but V5 should decide whether such a cell is mandatory.
+
+#### V6 — Stage-1 Input-View Decision Table
+
+Synthesize V0-V5 into a decision table. For each candidate view, record:
+
+- task-relevant event signal: low/medium/high;
+- line/common-mode burden;
+- subject/session/reference decodability;
+- Lite-vs-Full shift;
+- preprocessing cost;
+- virtual-channel/support bookkeeping burden;
+- allowed Stage-1 role: default candidate, required ablation, or diagnostic only.
+
+The expected roles before evidence are:
+
+| View | Provisional role |
+|---|---|
+| raw monopolar | diagnostic + ablation |
+| robust global CAR raw | diagnostic, not default |
+| within-shaft local raw | serious Stage-1 cell |
+| within-shaft log-STFT | serious Stage-1 cell |
+| within-shaft HG/HFA | biologically privileged Stage-1 cell |
+| CAR+HG | conventional control |
+
+V0-V6 should answer:
+
+- Are there dead/saturated/noisy channels beyond BT's mask?
+- Does 60 Hz or harmonic noise dominate any sessions?
+- Is noise low-rank enough for an SSP-style Stage 1 re-reference sweep?
+- Are event-locked responses aligned well enough to trust downstream labels/windows?
+- Are there session-specific quirks that should be excluded before training?
+- Which signal view should be trusted for Stage 1: raw voltage, Laplacian/local raw, Laplacian/local STFT/log-power, Laplacian/local HG/HFA, or CAR+HG?
+- Which normalization scope should be trusted: train-set/session-level normalization, recording-level normalization, or window-local normalization? This is load-bearing because upstream attributes part of the BrainBERT/PopT deficit to within-window z-scoring.
+- Does Neuroprobe-Lite shuffle samples across time before class-balanced capping? Verify the upstream sampling code, record whether the first-N temporal-bias risk is real or closed, and do not rely on author rebuttal text alone.
+- Which cross-subject split is actually implemented in the checked-out Neuroprobe code: S2-only, pairwise all-source, pooled leave-one-subject/session-out, or some mixture?
+- How much do label distributions, movie moments, and task difficulty differ between Lite and Full/uncapped samples?
+- How much patient/session/reference identity is visible in simple spectral and covariance summaries before any neural net sees the data?
+
+### 2. Resolve BT Surface Mapping
+
+Current public BT localization files are insufficient for rigorous BNA support construction:
+
+- `depth-wm.csv` gives anatomical/localization labels and coordinates.
+- `elec_coords_full.csv` is a 2-D plotting overlay for PNG brain visualizations.
+- Public files do not expose `fsaverage` hemisphere, vertex index, or surface RAS coordinate.
+
+Need one of:
+
+- per-electrode `fsaverage` hemisphere + vertex index + surface RAS table;
+- the exact script/transform used to create the pre-plotting fsaverage coordinates;
+- explicit approval to use a weaker Destrieux-first fallback.
+
+Until this resolves, do not build BT BNA support caches or run BNA/atlas linear cells.
+
+Do not substitute the Cogan D-cohort volumetric convention here. BT does not release per-subject FreeSurfer recons, and the public plotting coordinates do not recover volumetric truth.
+
+Public hard-label fallback status:
+
+- `depth-wm.csv:DesikanKilliany` is valid for a DK/Destrieux-style one-hot support control: `support_kind="hard_public_bt_label"`.
+- This support axis is the public BT label vocabulary, not BNA. It can test whether even coarse hard anatomy helps cross-subject transfer before Christopher shares surface coordinates.
+- The coverage report is `reports/neuroprobe_stage0_public_bt_hard_labels_2026_05_05/`; use `label_vocabulary.csv`, `subject_label_coverage.csv`, `pairwise_label_overlap.csv`, and `label_co_coverage_edges.csv` when deciding hard-label ablations.
+- The hard-label co-coverage graph is not a substitute for A4. It is a control showing the current public-label overlap structure: no label spans all 10 subjects, the best shared labels cover 7 subjects, and mean pairwise overlap is only about `0.21`.
+
+### 3. Resolve BT Shaft/Depth Geometry Contract
+
+This is a blocker before any v14 BT architecture run. It can proceed before surface mapping arrives because it uses electrode labels and public anatomy, not MNI/fsaverage coordinates.
+
+Why it matters:
+
+- sEEG contacts are ordered samples along depth shafts, not unordered cortical surface sensors.
+- One shaft commonly spans several public anatomy labels: in Lite, 84.3% of parsed shafts span more than one label, and 91.4% of contacts sit on multi-label shafts.
+- A public hard label alone discards within-shaft position. A future BNA support vector alone will also not encode whether a contact is deep, superficial, adjacent to another contact, or part of a local-reference virtual channel.
+- Raw `shaft_id` is patient-specific. It is valid for grouping and local reference construction, but a learned shaft-ID embedding can become a subject-identity shortcut.
+
+Decisions to freeze before coding:
+
+- **Shaft parser**: define the canonical parse from electrode label to `(subject, shaft_id, contact_index)`. The default candidate is final integer suffix as contact index and preceding stem as shaft id; exceptions and non-numeric contacts must be audited.
+- **Contact order orientation**: determine whether contact indices are consistently deep-to-superficial or superficial-to-deep across BT subjects. If unknown, signed depth is not allowed as a default feature.
+- **Depth feature**: choose one of: no depth; ordinal contact index; normalized shaft position `index / max_index`; centered normalized position; orientation-invariant features only. No numeric default is accepted until orientation is checked.
+- **Transferable geometry**: allowed by default only if shared across subjects: same-shaft adjacency, relative contact offset, normalized position, and local-reference provenance. Raw shaft-ID embeddings are disallowed by default.
+- **Local reference contract**: define how shaft grouping creates bipolar/Laplacian/local-reference virtual channels, and how virtual-channel metadata records source contacts, contact offsets, and unresolved coordinate/support status.
+- **Interaction with anatomy**: public hard label or future BNA support supplies brain-region identity; shaft/depth supplies within-shaft measurement geometry. Do not conflate them.
+- **Nuisance risk**: run subject/session decoding probes with and without shaft/depth features. Promote a depth feature only if it improves transfer or task evidence without making subject identity trivially separable.
+- **Ablation matrix**: Stage 1 must include at least `hard_public_bt_label` only, shaft/depth only, and hard label + shaft/depth before making depth default.
+
+Required outputs:
+
+- `reports/neuroprobe_stage0_shaft_depth_geometry_YYYY_MM_DD/shaft_contact_inventory.csv`
+- `reports/neuroprobe_stage0_shaft_depth_geometry_YYYY_MM_DD/shaft_label_transition_summary.csv`
+- `reports/neuroprobe_stage0_shaft_depth_geometry_YYYY_MM_DD/contact_order_orientation_audit.csv`
+- `reports/neuroprobe_stage0_shaft_depth_geometry_YYYY_MM_DD/README.md` with the frozen feature contract and rejected encodings.
+
+### 4. Linear Ablation Matrix (Block L)
+
+The linear baseline is a preprocessing oracle. Anything the architecture would otherwise have to learn — reference choice, input view, normalization recipe, filtering, bad-channel exclusion, window anchor — can be tested on the linear and baked into Stage 1. Whatever the linear cannot already exploit is what v14 actually has to learn.
+
+L cells use the D.0 protocol harness extended with the relevant config flag:
+
+- **L.1 (normalization sweep)** runs through `scripts/neuroprobe/run_stage0_linear_baseline.py` (own wrapper, mirrors upstream `eval_population.py` byte-for-byte except for an internalized `--normalization` step). Submitter: `scripts/neuroprobe/submit_l1_normalization_sweep.py`. Collector + per-sweep aggregate viz: `scripts/neuroprobe/collect_l1_normalization_sweep.py`. The wrapper writes per-cell `signal_qc.png` (feature-magnitude histogram pre vs post normalization) + `metrics.json` + `diagnostics.csv` + `experiment_record.json` sidecar; the collector emits `cell_task_heatmap.png` + `cell_aggregate_bar.png` + `n0_vs_n1_delta.csv`.
+- **L.2/L.3/L.4** will extend the same wrapper by adding NeuralFetch-driven preprocess swaps (reference + filter + window anchor). The N1 cell of L.1 is the byte-equivalent reproduction of the upstream D.0 baseline; this serves as the regression check on the wrapper's own pipeline before any new axis sweeps.
+
+Default eval is D.0b CrossSession multiclass on all 15 tasks, full upstream subject matrix. D.0a CrossSubject binary runs as a confirmation pass on each Sweep winner via the same wrapper with `--include-cross-subject`.
+
+**Sequencing**: greedy hill-climb. L.1 → L.2 → L.3 → L.4. Each sweep freezes one Stage-1 default; the next sweep inherits it. Greedy was chosen over a small factorial for compute reasons; the interaction-risk assumption (norm × view × ref independent enough that fixing one before sweeping the next doesn't lose meaningful AUROC) is checked retroactively via an interaction sanity row recorded on the final L.4 winner. L.5 probes run as kill-criteria gates after every sweep winner.
+
+**Visualization deliverable per cell** (non-negotiable, Block L is co-developed with Stage 0 visualizations): every cell folder ships with `signal_qc.png` showing what its recipe does to the signal on a representative subject/session, in addition to its `metrics.json`. The `signal_qc.png` axes vary by sweep:
+
+- **L.1**: per-cell feature-magnitude histogram pre vs post normalization.
+- **L.2**: per-cell representative voltage trace + spectrogram side-by-side.
+- **L.3**: per-cell PSD before vs after filter, with 60 Hz family annotated.
+- **L.4**: per-anchor event-locked heatmap on a representative task.
+- **L.5**: per-probe AUROC bar with kill-threshold line drawn.
+
+**Visualization deliverable per sweep**: each sweep produces an aggregate plot in its report folder:
+
+- **L.1**: cell × task AUROC heatmap with N0-vs-N1 delta highlighted.
+- **L.2**: reference × input-view AUROC matrix.
+- **L.3**: cell-vs-floor delta bar chart.
+- **L.4**: anchor-robustness curve (anchor offset on x, AUROC on y, ribbon = SEM across tasks).
+- **L.5**: probe bar chart with kill thresholds annotated.
+
+These are the pictures Ben reviews to make Stage-1 freeze decisions; the CSVs are evidence, the PNGs are how the decision actually gets made.
+
+#### L.0 — Prerequisites (must clear before any L sweep dispatches)
+
+Surfaced by the 2026-05-05 NeuroAI integration audit. None of the L sweeps run cleanly until these land.
+
+- **L.0a** `Experiment` must inherit `neuraltrain.utils.BaseExperiment` so `neuraltrain.utils.run_grid` will type-accept it. Without this, the canonical Slurm grid-array dispatch is unreachable. One-line change in `src/speech_decoding/experiments/experiment.py`.
+- **L.0b** Set the exca cache folder to `/hpc/group/coganlab/ht203/cache_neuroai/` (persistent) on DCC, not `/work/ht203/` (75-day purge). Document `EXCA_CACHE_FOLDER` env var convention in `docs/references/dcc_setup.md`. Without this every sweep silently recomputes after the next purge cycle.
+- **L.0c** *(Stage-1-entry preparation, NOT an L-sweep blocker)* Write a `DeriveLabelIndices` `EventsTransform` and a `Wang2024Treebank` `ns.Chain` so the events DataFrame carries `code` + `split` before the `Segmenter` sees it. This unblocks running D.0 and L cells through our canonical `Experiment` class. L sweeps themselves are dispatched via the upstream-wrapper path (`scripts/neuroprobe/run_upstream_linear_baseline.py` extended with the relevant config flag), which already works and writes `ExperimentLogger` sidecars. Treat L.0c as a Stage-1-entry deliverable; it shouldn't gate L.1.
+- **L.0d** Verify `scripts/neuroprobe/run_upstream_linear_baseline.py` wraps each run in `ExperimentLogger`. If not, retrofit so D.0 cells and all L cells write the canonical `experiment_record.json` sidecar that `collect_experiment_records.py` aggregates into `docs/experiments/runs.csv`.
+- **L.0e** Write `CARIeegExtractor` and `ShaftCARIeegExtractor` subclasses in `src/speech_decoding/extractors/reference.py`. NeuralSet's `IeegExtractor` exposes `bipolar_ref`, `notch_filter`, `filter`, `apply_hilbert`, `scaler`, `clamp` as constructor kwargs — those cover R0/R3/R4 and the F-/I-family cells via config swaps. CAR has no first-class kwarg; needs a thin subclass that subtracts the per-channel-mean post-load. Without this, L.2 cells R1 and R2 cannot run.
+
+#### L.1 — Normalization Scope (Sweep 1, runs first)
+
+Tests the rebuttal claim that normalization recipe explains a meaningful chunk of the linear-vs-foundation-model gap. Fixed input view: Lap+spec (D.0 default). Fixed model: logistic regression. Vary only the per-channel normalization scope.
+
+| Cell | Recipe | Provenance |
 |---|---|---|
-| **D.6** | + `log(power + ε)` before standardize | Distribution-matched scaling for linear classifier. Free expected 0.003–0.008. |
-| **D.7** | + L1 (or elastic-net) instead of L2 | Right regularizer for p≈25k, n≈3500. Expected 0.005–0.015. |
-| **D.8** | + zero-fill missing parcels (no DK intersect) | Stops discarding signal at the alignment step. **Tests one of v14's implicit choices** — v14 attaches every parcel embedding to every electrode; D.8 emulates "don't discard signal" in DK. Expected 0.003–0.010. |
-| **D.9** | + WM-contact rejection (drop electrodes flagged WM in `depth-wm.csv`) | Free if labels reliable. Volume conduction in WM is structurally mis-aligned for cross-subject. Expected 0.002–0.008. |
-| **D.10** | composite: D.6 + D.7 + D.8 + D.9 + BNA BT-Tier-1 + soft support (i.e. D.3b stacked with all four engineering improvements) | Better-Linear submission candidate. Linear ceiling under best-effort feature engineering. |
+| L.1.N0 | per-window z-score | BrainBERT/PopT recipe per rebuttal |
+| L.1.N1 | train-set fixed (mean/std over training windows) | current upstream linear baseline |
+| L.1.N2 | per-session fixed | closest analog to "recording-level" |
+| L.1.N3 | train-set fixed, scale-only (no demean) | isolates demean from scale |
+| L.1.N4 | none / raw Lap+spec | sanity baseline |
+| L.1.N5 | per-session robust (median/MAD) | Cogan-pipeline analog; ratifies our PS recipe transferring to sEEG |
 
-**Open question for A4 (Zac/Nanlin) — adding to the blocking list:** is `depth-wm.csv` a derived label column (free filter for D.9) or a separate file requiring its own labeling pass? Determines whether D.9 is a one-line filter or a heavier scoping change.
+Headline: gap between L.1.N0 and L.1.N1 averaged across tasks. Anything above ~0.02 multiclass AUROC means recipe is load-bearing for the rebuttal claim. Whatever's left is genuinely architecture. Secondary: N2 vs N5 — if mean/std and median/MAD give the same result on sEEG (as they did on PS uECoG, ρ=1.0), the choice is moot; if they diverge, sEEG has heavier outlier tails. Stage-1 v14 default normalization is frozen from this sweep.
 
-#### Pairwise readouts (consume **before** Stage 1)
+#### L.2 — Reference × Input-View (Sweep 2, after L.1)
 
-- **D.0** sets the protocol gate. Within ±0.005 of the leaderboard JSON per session-task; per-task mean within ±0.003. Failure → debug binary-search BT's `eval_population.py` flags before any other cell is interpreted (other cells share the split + label code).
-- **D.0 → D.3b** is the headline: full-stack-ours linear vs full-stack-theirs linear.
-  - **D.3b ≥ 0.539** → the v14 prior alone (atlas + HG prep) beats DK + STFT without a neural net. Stage 1+ is locking it in, not discovering it.
-  - **D.3b < 0.539** → our prior is individually worse than theirs at the linear regime; understand why before Stage-1 compute. Possible causes: BNA bake error (A3 caught it; if not it's a real architectural problem), Tier-1 too narrow (D.4 will tell), HG vs STFT genuinely bad for these tasks (D.2 will tell).
-- **D.0 → D.1*** isolates **atlas effect** (DK `combine_regions` vs BNA BT-Tier-1) holding their prep constant.
-- **D.0 → D.2** isolates **prep effect** (Lap+STFT vs CAR+HG) holding their atlas constant.
-- **D.1a → D.1b** and **D.3a → D.3b**: **soft vs hard support**, twice (under each prep). If soft ≈ hard in both, hard simplifies the architecture and we drop probabilistic support; if soft > hard, probabilistic support is empirically buying us something and we keep it.
-- **D.3b → D.4**: does Tier-1 filtering matter? D.4 > D.3b → drop the filter; D.4 ≈ D.3b → filter harmless; D.4 < D.3b → filter is doing useful denoising.
-- **D.5**: anti-control. Expected to be the worst cell (LH-only on bilateral whole-brain tasks). If D.5 ≈ D.3b, our Tier-1 selection is irrelevant and the parcel set itself doesn't matter — that would be a surprising and important finding worth investigating.
-- **D.0 → D.6**: log-transform effect. Free regularization for any later cell; if positive, fold into D.10.
-- **D.0 → D.7**: L1 vs L2. Tests whether the under-determined-regime regularizer matters at all here. If D.7 < D.0, surprising — investigate whether `combine_regions` already handled the dimensionality issue implicitly.
-- **D.0 → D.8**: zero-fill vs intersect. **Specifically tests one of v14's implicit choices.** If D.8 ≈ D.0, intersection isn't actually discarding meaningful signal in DK. If D.8 > D.0 by ≥ 0.005, signal-discard is a real problem worth our architectural attention.
-- **D.0 → D.9**: WM-rejection. Independent benefit from filtering non-cortical contacts before any spatial averaging.
-- **D.6–D.9 → D.10**: composition test. Sub-linear sum = redundancy among the engineering steps. Super-linear = surprising synergy worth investigating before Stage 1.
-- **D.3b → D.10**: pure feature-engineering lift on top of full-stack-ours. Closes the "is Linear-BNA-soft-zero-fill enough" question.
-- **D.10 ≥ 0.55**: submission candidate. Submit it as the Better-Linear baseline alongside (or before) v14. Sets the bar v14 must beat and gives us a paired-submission decomposition story.
-- **D.10 ∈ [0.539, 0.55]**: clears the leaderboard #1 by a couple thousandths but doesn't clear v14's ≥ 0.56 submission threshold; submit only if we want a leaderboard win regardless of the v14 program.
-- **D.10 < 0.539**: feature-engineering ceiling sits at the Linear Lap+spec line; v14's gain has to come from learning, not engineering. Don't submit Better Linear.
+Two crossed axes. Reference transform changes the measurement operator (`y' = R y = R L s + R c + R noise`); input view changes which signal property is exposed. Both are configured by swapping `IeegExtractor` configs (except R1/R2 which need L.0e).
 
-#### What we are explicitly **not** sweeping in D
+Reference (rows):
 
-- Time-window (1 s vs 0.5 s vs 2 s) — benchmark fixes 1 s; ablating it confounds with everything.
-- Pooling strategy beyond mean (median, top-k, max) — `combine_regions` mean and our soft-support sum are the two principled choices; others are arbitrary.
-- Frequency-range alternatives (broad gamma 30–150, theta-alpha) — testing these at the linear regime doesn't inform Stage 1+.
-- Per-task vs joint multi-task linear — benchmark eval is per-task by definition.
-- Within-session linear — we're submitting Cross-Subject only.
+| Cell | Recipe | NeuralSet path |
+|---|---|---|
+| R0 | raw monopolar | default `IeegExtractor` |
+| R1 | robust global CAR | `CARIeegExtractor` (L.0e) |
+| R2 | within-shaft local / shaft-CAR | `ShaftCARIeegExtractor` (L.0e) |
+| R3 | bipolar (adjacent-pair) | `bipolar_ref=True` |
+| R4 | shaft Laplacian | `bipolar_ref=...` shaft-aware |
+| R5 | WM-rejected variants of R2/R3/R4 | gated on Chris's WM-flag answer |
 
-If D.0–D.10 results force any of these open, they reopen as Stage-1 ablations.
+Input view (columns):
 
-#### Implementation
+| Cell | Recipe | NeuralSet path |
+|---|---|---|
+| I0 | raw 2048 Hz voltage | default `IeegExtractor` |
+| I1 | low-frequency LFP (<30 Hz) | `filter=(None, 30)` |
+| I2 | STFT log-power | downstream transform |
+| I3 | HG/HFA envelope (70–150 Hz) | `filter=(70, 150) + apply_hilbert=True` |
+| I4 | multi-band log-power (6 bands) | downstream transform |
+| I5 | wavelet (Morlet, 6 scales) | downstream transform |
 
-- **D.D1 — DCC Python env.** Install `insight-neuro/neuroprobe` as a local package in `/work/ht203/miniconda3/envs/speech/`. Add `h5py`, `scikit-learn`, missing deps. Verify `from neuroprobe.braintreebank_subject import BrainTreebankSubject` works and `BrainTreebankSubject(2, 4).get_electrode_data(...)` returns sensible shapes.
-- **D.D2 — Hand-written sbatch arrays.** 13 cells × 10 sessions × 15 tasks = **~1950 jobs** total. Per-cell wrapper: `scripts/neuroprobe/stage0_linear_<cell>.sh` (e.g. `stage0_linear_d0.sh`, `stage0_linear_d1a.sh`, …, `stage0_linear_d10.sh`). D.6–D.9 reuse D.0's pipeline with one swapped step (log-transform / L1 solver / zero-fill at the `combine_regions` step / WM filter at the loader). D.10 stacks all swaps + the D.3b atlas/prep choice. **Why hand-written and not `scripts/ablation/submit.py`** — Block D runs BT's reference pipeline (D.0, D.1) or hybrid scripts swapping atlas/prep modules in place (D.2–D.10); not v14 train. CLAUDE.md retains hand-written sbatches for "non-standard array math"; this is one. Per-job walltime <30 min; total ~800 CPU core-hours, cluster-cheap.
-- **D.D3 — Run + collect.** Submit per cell. Aggregate via rsync: `rsync -av ht203@dcc-login:/work/ht203/results/stage0_linear_<cell>/ docs/neuroprobe/stage0_results/linear_<cell>_<date>/` (target dir gitignored — large, reproducible). `scripts/neuroprobe/diff_vs_leaderboard.py` consumes the local mirror, writes per-cell `diff_table.csv` and a cross-cell `pairwise_readouts.csv` that emits the comparisons listed above.
-- **D.D4 — Reference JSONs committed.** Reference D.0 JSONs from upstream `leaderboard/Linear_Laplacian_rereferencing_spectrogram_.../Cross-Subject/population_*.json` are committed to `docs/neuroprobe/reference_jsons/linear_lapspec_cross_subject/` (small, few KB each — checked in so the source-of-truth doesn't sit in `/tmp/neuroprobe_explore/...` which is ephemeral). License: upstream is Apache-2.0; quoting reference numbers is fair use.
-- **D.D5 — Block D closure gate.** Block D passes (and Stage 0 closes on the D-axis) iff:
-  - **D.0 numerical gate:** all 150 session-tasks within ±0.005 of reference; per-task mean within ±0.003.
-  - **D.1a–D.10 completeness gate:** all cells run, all numbers collected, `pairwise_readouts.csv` emitted. No numerical gate on these — they inform Stage 1+ but don't fail-block. (D.0 failure does fail-block all of them, since they share split + label code.)
-  - **Strategy gates (not mechanical):**
-    - If D.0 passes but D.3b is catastrophically below 0.5, we re-evaluate the v14 thesis with the user before launching Stage 1.
-    - If D.10 ≥ 0.55, we decide with the user whether to submit Better Linear as a paired baseline (default: yes — strengthens the v14 paper as the explicit ablation control).
-    - If D.10 ≥ v14 Stage-1 cold-start by ≥ 0.005, the v14 thesis sharpens to "*learned* within-parcel attention beats *flat* within-parcel mean," not "atlas-anchoring beats DK." Update Stage-1/2 framing accordingly.
+Earlier drafts listed I6 = Lap+spec and I7 = CAR+HG as input views. They are not — they are (reference, view) pairs (R4, I2) and (R1, I3) respectively. Dropped to remove alias collisions. The D.0 default "Lap+spec" is now spelled R4×I2, and the conventional CAR+HG control is R1×I3.
 
-### Block E — Our-pipeline BT loader scaffold (~1 day, parallel with D)
+Don't run all 5×6=30. Pre-register a 12-cell hand-picked subset covering the physically meaningful combinations:
 
-Lands inside Stage 0 in parallel with D. Stage-0 gate: "loader runs end-to-end on sub_2/trial_4 without error" (E1+E3). Stage 1 starts day-of-D-pass.
+| Cell | Recipe | Role |
+|---|---|---|
+| R0×I0 | raw monopolar × raw 2048 Hz | floor / v14-aligned ceiling |
+| R0×I2 | raw × STFT | spectral without re-reference |
+| R1×I3 | global CAR × HG | conventional control (was I7) |
+| R2×I3 | within-shaft CAR × HG | physics-matched sEEG candidate |
+| R2×I4 | within-shaft CAR × multi-band | richer view on shaft-CAR |
+| R3×I2 | bipolar × STFT | bipolar spectral |
+| R3×I3 | bipolar × HG | bipolar HG conventional |
+| R3×I4 | bipolar × multi-band | bipolar wide |
+| R4×I2 | shaft Laplacian × STFT | **D.0 default ("Lap+spec")** |
+| R4×I3 | shaft Laplacian × HG | biologically privileged |
+| R4×I4 | shaft Laplacian × multi-band | rich shaft-Lap view |
+| R4×I5 | shaft Laplacian × wavelet | scale-localized shaft-Lap |
 
-- **E1 — `src/speech_decoding/neuroprobe/loader.py`.** BrainTreebank h5 → our HG z-scored tokens at **exact 200 Hz**. Pipeline: read channel data via `BrainTreebankSubject.get_electrode_data()` → CAR across Lite electrodes per session → Gaussian filterbank 70–150 Hz (8 bands) → Hilbert envelope → sum → **anti-alias FIR + `scipy.signal.resample_poly(up=125, down=1280)` to exact 200 Hz** (2048 × 125 / 1280 = 200; do **not** stride-decimate, which lands at 204.8 Hz and breaks parity with the PS pipeline output rate) → recording-level median/MAD z-score per channel. Output per 1-s event-locked window: `(N_e, 200)` float32 + `(N_e,)` active mask + `(N_e, |BT-Tier-1|)` BNA support from Block C cache. `N_e` after C2 default exclusion: subject-specific (sub_9 = 85, sub_10 = 113, others = 120 / 119 / 109). API mirrors `src/speech_decoding/v14/phoneme_dataset.py` so Stage-1 can swap loaders.
-- **E2 — Unit tests under `tests/neuroprobe/test_loader.py`.** Shape; **exact** 200 Hz sample rate; z-score stats (mean ≈ 0, MAD-scaled σ ≈ 1); CAR correctness on synthetic 2-channel data (common mode cancels); filterbank passband sanity (power in 70–150 Hz band >> out-of-band).
-- **E3 — Label contract replication.** Re-implement BT's 15-task label derivation from `datasets.py::get_label()` as `src/speech_decoding/neuroprobe/labels.py`. **Gate:** 100% match against `BrainTreebankSubjectTrialBenchmarkDataset` output on a 100-window subset of sub_2/trial_4.
-- **E4 — h5 read parity.** Feed sub_2/trial_4 through our loader's raw-h5-read step (no CAR, no filterbank) and compare against `BrainTreebankSubject.get_electrode_data()` on the same channels and time window. Numerical outputs should match exactly. Confirms our h5 read path doesn't drop channels or shuffle time. (We do **not** compare against `--preprocess.type none` — that path skips re-referencing entirely; the original "preprocessing parity smoke" framing was wrong. CAR correctness is covered by E2 synthetic test.)
+Stage-1 v14 default reference + input view are frozen from this sweep.
 
-### Block F — Close-out (~0.5 day)
+#### L.3 — Filtering + Bad-Channel (Sweep 3, after L.2)
 
-- **F1 — Update `docs/neuroprobe/plan.md`.** Move resolved open questions from §"Open questions to resolve in Stage 0" into the body as decided facts: coord space (fsaverage pial, no recons needed); BT-derived Tier-1 (A0 output, parcels list + cardinality); per-electrode token scoping (defer to Stage 1); preprocessing parity (E4 + 200 Hz exact resample landed in E1); known limitation (Cogan-lab volumetric convention not applicable to BT). Append the linear ablation matrix results table — **D.0 through D.10 numbers** + pairwise readouts. Decide and record the Better-Linear submission outcome: D.10 ≥ 0.55 → submit Better Linear paired with eventual v14; D.10 ∈ [0.539, 0.55] → optional standalone leaderboard win; D.10 < 0.539 → don't submit Better Linear.
-- **F2 — Memory updates.**
-  - New: `project_neuroprobe_stage0_closeout_<YYYY>_<MM>_<DD>.md` capturing A0–A3 numbers, **all 13 D-cell AUROCs** + pairwise readouts, Zac/Nanlin sign-off outcome on (1)–(4), Better-Linear submission decision.
-  - New: `project_cogan_lab_bna_convention_canonical_<YYYY>_<MM>_<DD>.md` capturing Nanlin's answers to A4 question (5) — Stage-3 prep, separate file because it concerns the D-cohort program, not Neuroprobe.
-  - Update `MEMORY.md` index with one-line pointers to both.
-- **F3 — Commit scaffolding + paths + CLAUDE.md.** All code under `scripts/neuroprobe/*.py`, `src/speech_decoding/neuroprobe/*.py`, `tests/neuroprobe/*.py`. Add DCC paths to `configs/paths.yaml` (gitignored locally): `bt_root`, `bt_metadata_dir`, `bt_support_cache_dir`, `bt_results_dir`. Update `CLAUDE.md` §"Code Structure" to register `src/speech_decoding/neuroprobe/` as a new module (key files: `atlas_tier1_bt.py`, `support_cache_bt.py`, `loader.py`, `labels.py`); update §"Key Files" with new scripts dir, support cache dir, reference JSONs dir.
+Run on the L.2 winner reference+input. Tests whether more aggressive front-end cleaning helps the linear.
 
-## How our BNA fsaverage bake is built (informational reference)
+| Cell | Recipe | NeuralSet path |
+|---|---|---|
+| L.3.F0 | none | default |
+| L.3.F1 | 60 Hz notch + harmonics | `notch_filter=(60, 120, 180)` |
+| L.3.F2 | F1 + 0.5 Hz HPF | `notch_filter=... + filter=(0.5, None)` |
+| L.3.F3 | F1 + 1 Hz HPF | `notch_filter=... + filter=(1, None)` |
+| L.3.E0 | BT Lite mask only | status quo |
+| L.3.E1 | E0 + flatline + amplitude-outlier + clipping | V1-derived per-channel exclusions |
 
-Provided so future readers can see what A3's gate is testing.
+#### L.4 — Window Anchor Robustness (Sweep 4, after L.3)
 
-1. **Source.** `data/atlas/BNA_PM_4D.nii.gz` — Brainnetome's probabilistic atlas in MNI152 space. 4D NIfTI, 246 frames (one per parcel), each voxel value ∈ [0, 100] = probability of belonging to that parcel.
-2. **Volume → fsaverage surface.** `mri_vol2surf --projfrac-avg 0 1 0.1`. This is a **column walk**: at every fsaverage vertex, sample the MNI volume at 11 depths from white-matter (projfrac=0) to pial (projfrac=1) and average. **Depth integration is baked into the surface representation** — every vertex's BNA support reflects the column above/below it, not just the pial-tangent slab. **For sEEG GM contacts that are roughly column-aligned with their snap target, this means BT's pial-snap + our column-walk read = "BNA distribution sampled at this electrode's column"** — a defensible approximation. For non-GM contacts (the 15 missing) the column-walk would be meaningless, but BT correctly omits those upstream.
-3. **Cross-subject normalization.** `mri_surf2surf` to ensure values land on the canonical fsaverage mesh.
-4. **Smoothing.** None on `fsaverage_bake_v2c`. The PSF is whatever `--projfrac-avg` integrated. (A prior bake used 3.5 mm 2D geodesic; we retired it post-cras-fix because it didn't help.)
-5. **Verification (2026-04-16).** vs the BNA authors' shipped `BN_Atlas_freesurfer/fsaverage/*.annot`: 85–87% interior vertex argmax agreement, 90%+ Dice on Tier-1 speech-motor parcels. A3 hardens this to ≥90% argmax / Dice ≥0.85 *on the BT Lite vertex set specifically* and *on every BT-Tier-1 parcel specifically*, with no quiet sinks.
+Run on the L.3 winner. Tests the rebuttal's claim of near-equivalent decoding for 1 s windows starting between roughly `-0.375` and `+0.125` s relative to word onset.
 
-## What BT's preprocessing does (informational reference)
+| Cell | Window | Note |
+|---|---|---|
+| L.4.W0 | [0, 1] s | D.0 default |
+| L.4.W1 | [-0.375, 0.625] s | rebuttal lower bound |
+| L.4.W2 | [-0.125, 0.875] s | midrange |
+| L.4.W3 | [+0.125, 1.125] s | rebuttal upper bound |
+| L.4.W4 | [0, 2] s | wider |
+| L.4.W5 | [0, 0.5] s | narrower |
 
-For Block D.0 reproduction context. From `insight-neuro/neuroprobe`:
+Output is a robustness curve, not a single winner. Stage-1 keeps Neuroprobe's [0, 1] s default; this sweep decides whether a Stage-1 anchor-robustness ablation is mandatory or optional.
 
-- **Coord pipeline.** Native individual T1 FreeSurfer recon per subject → CT-MR co-registration + manual contact labeling → for GM / GM-WM-boundary contacts: project to native pial along cortical normal → patient `sphere.reg → fsaverage sphere.reg` → fsaverage pial NN snap. Output: `elec_coords_full.csv` with columns (ID, Z, X, Y, Hemisphere, Subject, Electrode, Region) where `Region` is Destrieux. `depth-wm.csv` keeps the pre-snap (L, I, P) plus `ShiftDist` (snap distance) and `ConfType`.
-- **Signal pipeline (leaderboard `--preprocess.type laplacian-stft_abs`).** 2048 Hz raw voltages from the h5 → 1-second window from word onset (2048 samples) → Laplacian re-referencing (subtract local-neighborhood mean per electrode based on physical adjacency on the shank) → STFT magnitude (their default windows / hops; spectral feature extraction) → flatten for the linear classifier.
-- **Cross-subject alignment.** `examples/eval_utils.py::combine_regions()` mean-pools electrodes within each Desikan-Killiany region, then takes the intersection of DK regions present in both train and test subjects. DK-Unknown electrodes are silently dropped. **This is the move D.1*** **upgrades — replacing DK region-averaging with BNA BT-Tier-1 weighted support pooling.**
+#### L.5 — Diagnostic Probes (Gates, run after every Sweep winner)
 
-## Dependency graph
+Run on the chosen view from each sweep. **Used as kill criteria, not for selection**: a view that makes the task easier *and* makes nuisance variables more decodable is suspect.
 
-```
-A0 (BT Tier-1, local) ─→ C1 (support cache schema)
-A1/A2/A3 (rigor, local) ─→ A4 (Zac/Nanlin sign-off, async) ─┬─→ C (support cache, DCC)
-                                                            │
-                                                            └─→ D (13-cell linear matrix, DCC) ─→ F (close-out)
-                                                                       ↑
-B (download, DCC) ──────────────────────────────────────────────────────┘
-                                                                       ↓
-                                                                    E (loader scaffold, parallel with D)
-```
+| Cell | Probe | Kill criterion |
+|---|---|---|
+| L.5.P1 | subject-id from features | KILL: drop view if held-out AUROC > 0.95 |
+| L.5.P2 | session-id from features | KILL: drop view if held-out AUROC > 0.95 |
+| L.5.P3 | reference-id (R0 vs winner) | POSITIVE sanity: AUROC ≈ 1 expected; surprise if it isn't |
+| L.5.P4 | pre-stim window [-1, 0] s on the same task | flag if above chance + 0.05 |
+| L.5.P5 | shifted window [+5, +6] s on the same task | flag if above chance + 0.05 |
+| L.5.P6 | channel-shuffled-per-subject | KILL: cross-subject task accuracy must drop substantially; if not, channel-order shortcut |
+| L.5.P7 | movie-time / block-order from features | flag if above chance + 0.10 |
+| L.5.P8 | 60 Hz residual power post-notch | flag if median residual > floor by > 6 dB; bad notch / wrong harmonic set |
 
-A0–A3 and B run in parallel from day 0. A4 is async wait on Zac/Nanlin (0–3 days). C and D both depend on A (via A4) + B. E parallel with D. F last.
+#### L.6 — Deferred Tier-2 (post-Stage-0 close, only if budget permits)
 
-Expected Stage-0 walltime: **6–11 days**. Breakdown: A0–A3 ~1 d local; A4 0–3 d async; B ~0.5 d (parallel A); C ~0.5 d; **D ~4 d** (13 cells incl. debug per cell; D.6–D.10 add ~1 d over the original 8-cell budget); E ~1 d (parallel D); F ~0.5 d.
+Not Stage-0 close-criterion. Listed so future-us doesn't reinvent the cell IDs.
 
-## What Stage 0 explicitly does NOT do
+- **L.6.ES** electrode-set robustness: Lite-120 vs random-120 (×3 seeds) vs anatomy-120 (DK gray-matter top-120) vs Full uncapped vs hard-label-restricted.
+- **L.6.NR** feature-level nuisance regression: regress out per-trial channel-mean / per-session top-k PCs / subject-mean / ComBat / CORAL.
+- **L.6.WL** window length × sub-windowing: 1×1 s vs 4×250 ms concat vs 2×500 ms concat vs mean-pool sub-windows vs 8×125 ms (matches Perceiver token grid).
+- **L.6.CB** class balance: uniform vs inverse-frequency vs effective-number-of-samples vs per-task weighted.
+- **L.6.FA** feature aggregation: mean vs median vs PCA-50-per-channel vs PCA-50-cross-channel.
 
-- **No v14 cold-start training.** That's Stage 1. Block E only produces the loader scaffold.
-- **No SSL pretraining or pretraining-corpus download beyond Lite.** Tier-1 pretrain sessions enter in Stage 2.
-- **No architecture / SSL-objective commitment.** Experiments #1–#6 in `docs/neuroprobe/plan.md` stay empirically open.
-- **No HG vs STFT lock-in.** Block D measures both at the linear regime; for Stage 1+ we default to HG (v14 thesis) but re-evaluate if D.2 shows STFT advantage is structural, not just at the linear regime.
-- **No Cogan-lab volumetric BNA on BT.** See Known Limitation. Stage-3 D-cohort still uses it.
-- **No 3D Gaussian alternate readout.** (Originally proposed as A3.5; dropped 2026-04-25.) BT pre-projects to pial; volumetric truth was discarded at the snap step; a 3D Gaussian on snapped coords would not recover it.
-- **No time-window / pooling-strategy / frequency-range / per-task-vs-joint sweeps beyond the D matrix.** If D-results force them open, they reopen as Stage-1 ablations.
+Atlas-coordinate cells (Tier-4) live under Block D (D.public, D.1+) since they extend the upstream linear baseline rather than ablating it. Cross-reference, don't duplicate.
 
-## Fail-closed escape hatches
+#### L sweep ownership
 
-- **A0 fails** (cohort coverage <99%): debug snap pipeline first; if real, document the uncovered tail and proceed (informational, not catastrophic).
-- **A1 fails** (mesh mismatch): re-derive bake on correct subdivision. Stage-1 blocked.
-- **A2 fails** (<95% Destrieux match): debug axis / hemi / vertex mapping in our bake's I/O before touching BT data further. Likely 0.5 d fix, not a re-bake. Implies the BT-fsaverage assumption is wrong end-to-end.
-- **A3 fails** (must-pass — overall <90%, any BT-Tier-1 parcel <80% match or Dice <0.85): re-bake using authors' GCS classifier on fsaverage directly. **Stage 0 blocks until re-bake passes.** No soft-fail.
-- **D.0 fails** (Linear repro outside tolerance): binary-search the preprocessing + split pipeline against BT's reference. Most likely culprits: undocumented flag in `eval_population.py`, env-version drift in `scikit-learn` LR solver, wrong split generator, wrong time-window crop. See `docs/references/neuroprobe_benchmark.md` for the option inventory. Other D cells share split + label code, so D.0 failure invalidates them all until fixed.
-- **A4 (1)–(4) reject** (depth-contact projection untrusted, BNA bake disagreement deemed unacceptable, or `depth-wm.csv` unusable as a free filter — the last drops D.9 from must-run to deferred): escalate to BT authors (Wang lab, czlwang@mit.edu per paper) on (1)–(3); D.9 reverts to a scoping decision rather than a Stage-0 fail. Stage-0 close-out defers on (1)–(3) until response. (5) — Cogan-lab convention questions — is non-blocking; whatever Nanlin says lands in the separate Stage-3-prep memory note (F2).
+After each sweep, regenerate `docs/experiments/runs.csv` via `scripts/neuroprobe/collect_experiment_records.py` and update `docs/experiments/stage0_summary.csv` with the cell winner + delta vs. D.0 reference. The frozen Stage-1 default for that knob is recorded in `docs/strategy/stage_1.md`.
+
+### 5. After Surface Mapping Arrives
+
+Run the anatomy-dependent path:
+
+- **A0**: derive BT Tier-1 BNA parcel list from Lite electrode surface positions. Gate: parcel ids in `1..246`; cardinality and LH/RH split recorded; cohort coverage `>=99%`.
+- **A1**: verify fsaverage mesh identity and electrode snap distances. Gate: `163842` vertices per hemisphere; mean snap distance `<0.5 mm`; max `<2 mm`.
+- **A2**: compare snapped Destrieux labels to BT region labels. Gate: `>=95%` exact match without hemisphere-clustered failures.
+- **A3**: verify BNA fsaverage bake at Lite electrode vertices. Gate: overall argmax match `>=90%`; every BT Tier-1 parcel Dice `>=0.85`; no Tier-1 parcel match `<80%`.
+- **A4**: compute the BT Lite parcel co-coverage graph. Nodes are BNA Tier-1 parcels; weighted edges count subject/session support for parcel pairs under the approved coverage threshold. Export node coverage, edge weights, connected components, bridge parcels, shortest-path distances, and per-session coverage matrices to `reports/neuroprobe_stage0_a4_parcel_cocoverage_YYYY_MM_DD/`. This is a blocker for any Stage-1/2 claim that v14 can learn cross-parcel completion: direct A-C structure is learnable only when parcels co-occur; indirect A-B-C structure is plausible only through connected overlap paths. The Stage-2 JEPA contract must distinguish covered, intentionally masked, and uncovered parcels before training.
+- **C**: build BT support cache using the approved schema.
+- **E5 extension**: rerun real NeuralSet smoke with both neural tensor and parcel metadata tensor.
+- **D.1+**: run atlas/BNA linear ablations.
+- **V7-V8**: plot surface geometry and parcel coverage.
+
+## Block D After D.0
+
+Only D.0 and public hard-label controls can run now. BNA cells still depend on valid surface geometry.
+
+Planned cells after the surface-mapping blocker clears:
+
+| Cell | Eval | Prep | Atlas/pooling | Purpose |
+|---|---|---|---|---|
+| D.public | CrossSession multiclass | Lap + STFT | public BT hard label mean / support bias | **DK hard-mean pooling — confirmed 2026-05-05 to be what `c7b955b0`'s upstream CrossSubject linear baseline already does** via `combine_regions()`; reframed from "DK control" to "upstream cross-subject baseline architecture itself" |
+| D.1a | CrossSession multiclass | Lap + STFT | BNA Tier-1 hard mean | BNA hard vs DK baseline |
+| D.1b | CrossSession multiclass | Lap + STFT | BNA Tier-1 soft support | soft vs hard support |
+| D.2 | CrossSession multiclass | CAR + HG | DK mean | prep-only control |
+| D.3a | CrossSession multiclass | CAR + HG | BNA hard mean | HG + BNA hard |
+| D.3b | CrossSession multiclass | CAR + HG | BNA soft support | HG + BNA soft |
+| D.5 | CrossSession multiclass | CAR + HG | old PS LH-only parcels | anti-control |
+| D.8 | CrossSession multiclass | Lap + STFT | zero-fill missing parcels | tests always-include parcel commitment |
+| D.10 | CrossSession multiclass | engineered composite | BNA soft support | Better-Linear candidate |
+| D.11 | CrossSession multiclass | raw 2048 Hz | BNA soft support | v14-aligned raw linear ceiling |
+| D.12 | CrossSession multiclass | Laplacian raw | BNA soft support | raw re-reference check |
+| D.13 | CrossSession multiclass | Laplacian/local + HG/HFA | BNA soft support | biologically privileged local population-firing view |
+
+D.11 is no longer a default-input coronation test. It is the raw-view ceiling and artifact-risk baseline. The Stage-1 input decision must compare D.11/D.12/D.13 against D.0b and V0-V6 QC. Raw voltage keeps a role as an auxiliary or ablation view because it preserves information and matches existing Neuroprobe models, but Laplacian/local spectral or HG/HFA views are the biologically privileged candidates after the Pesaran artifact review.
+
+Conditional cells:
+
+- D.4 if Tier-1 looks too narrow.
+- D.6/D.7 if D.10 is strong enough to warrant attribution.
+- D.9 only if WM rejection is approved as a free label/filter.
+- D.14 pooled multi-source CrossSubject multiclass split. Train on all allowed source subjects/sessions and test held-out subjects/sessions. This is the scientific generalization default. Implement locally if upstream still lacks it.
+- D.15 upstream all-source CrossSubject robustness if Christopher's newer `include_all_train_subjects=True` code lands. Record whether it is pairwise 1-to-1 or pooled N-to-1; do not assume from rebuttal text.
+- D.16 electrode-set robustness: Lite-120 parity set, random-120, anatomy-120, and full/uncapped where public data permits. Use Lite-120 for leaderboard parity only.
+
+Stage 1 should also carry a small window-anchor robustness cell around Neuroprobe's `[0, 1]` s window because the rebuttal reports near-equivalent decoding for 1 s windows starting between about `-0.375` and `+0.125` s relative to word onset.
+
+## Close Criteria
+
+Stage 0 closes when:
+
+- D.0a and D.0b aggregate reference baselines are reproduced, with D.0b task-level reference drift documented.
+- V0-V6 QC is reviewed and any data exclusions are decided.
+- Lite-vs-Full selection effects are documented, including whether Full/uncapped data can support robustness analyses.
+- Reference transforms are treated as first-class provenance-bearing transforms, including virtual-channel metadata and unresolved geometry/support status where applicable.
+- Surface mapping is resolved or a fallback is approved.
+- Public hard-label coverage is reviewed as a DK/Destrieux control and kept distinct from BNA/fsaverage support.
+- BT shaft/depth geometry contract is frozen, including shaft parser, contact-order orientation, transferable depth features, local-reference provenance, and nuisance-probe gates.
+- A0-A3 pass on valid geometry.
+- A4 co-coverage graph is reviewed, including disconnected parcels and bridge parcels, and its implications for Stage-1 architecture claims and Stage-2 JEPA loss masks are written down.
+- The Stage-1 input-view matrix is decided from V0-V6, L.2, and D.11/D.12/D.13, with explicit notes on reference physics, artifact burden, Lite-vs-Full shift, and whether raw voltage is default, auxiliary, or ablation-only.
+- The Stage-1 normalization contract is decided from L.1, with train-set/session-level normalization compared against window-local normalization. The chosen recipe is recorded in `docs/strategy/stage_1.md`.
+- The Stage-1 reference transform is decided from L.2, with explicit notes on R0/R1/R2/R3/R4 deltas and WM-rejection treatment.
+- The Stage-1 filtering and bad-channel mask is decided from L.3.
+- The Stage-1 anchor-robustness ablation is marked mandatory or optional from L.4.
+- L.5 diagnostic probes have run on each Sweep winner, and no chosen view fails the L.5.P1/P2/P6 kill criteria.
+- L.0 prerequisites have all landed: `Experiment` inherits `BaseExperiment`, exca cache folder is set on DCC, `DeriveLabelIndices` `EventsTransform` is wired into a `ns.Chain`, the linear baseline wrapper writes `ExperimentLogger` sidecars, and `CARIeegExtractor` + `ShaftCARIeegExtractor` exist.
+- Neuroprobe-Lite temporal sampling behavior is verified from code, not assumed from review-thread claims.
+- The Stage-1 split contract is written down: multiclass default, pooled multi-source cross-subject generalization default, S2-only cross-subject parity cell, and Lite-120 electrode cap parity-only.
+- C support cache is built and schema-tested.
+- E5 passes with neural + parcel metadata tensors aligned.
+- D.1+ required linear cells are collected and interpreted.
+- `docs/experiments/runs.csv` and Stage 0 summary CSVs are regenerated from sidecar records.
+
+## Explicit Non-Goals
+
+- No v14 architecture implementation.
+- No neural network training.
+- No SSL pretraining.
+- No full BrainTreebank pretraining download.
+- No BNA support cache from public PNG plotting coordinates.
+- No D.1+ atlas/BNA linear cells until valid surface geometry exists.
