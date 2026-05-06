@@ -306,7 +306,7 @@ Surfaced by the 2026-05-05 NeuroAI integration audit. None of the L sweeps run c
 - **L.0b** Set the exca cache folder to `/hpc/group/coganlab/ht203/cache_neuroai/` (persistent) on DCC, not `/work/ht203/` (75-day purge). Document `EXCA_CACHE_FOLDER` env var convention in `docs/references/dcc_setup.md`. Without this every sweep silently recomputes after the next purge cycle.
 - **L.0c** *(Stage-1-entry preparation, NOT an L-sweep blocker)* Write a `DeriveLabelIndices` `EventsTransform` and a `Wang2024Treebank` `ns.Chain` so the events DataFrame carries `code` + `split` before the `Segmenter` sees it. This unblocks running D.0 and L cells through our canonical `Experiment` class. L sweeps themselves are dispatched via the upstream-wrapper path (`scripts/neuroprobe/run_upstream_linear_baseline.py` extended with the relevant config flag), which already works and writes `ExperimentLogger` sidecars. Treat L.0c as a Stage-1-entry deliverable; it shouldn't gate L.1.
 - **L.0d** Verify `scripts/neuroprobe/run_upstream_linear_baseline.py` wraps each run in `ExperimentLogger`. If not, retrofit so D.0 cells and all L cells write the canonical `experiment_record.json` sidecar that `collect_experiment_records.py` aggregates into `docs/experiments/runs.csv`.
-- **L.0e** Write `CARIeegExtractor` and `ShaftCARIeegExtractor` subclasses in `src/speech_decoding/extractors/reference.py`. NeuralSet's `IeegExtractor` exposes `bipolar_ref`, `notch_filter`, `filter`, `apply_hilbert`, `scaler`, `clamp` as constructor kwargs — those cover R0/R3/R4 and the F-/I-family cells via config swaps. CAR has no first-class kwarg; needs a thin subclass that subtracts the per-channel-mean post-load. Without this, L.2 cells R1 and R2 cannot run.
+- **L.0e** *(cleared 2026-05-06)* `CARIeegExtractor` ships in `src/speech_decoding/extractors/reference.py` (`car="global"` and `car="shaft"`). The `ShaftCARIeegExtractor` is the same class with `car="shaft"`. R1/R2 cells of L.2 are unblocked. `bipolar_ref` and Laplacian are handled in `scripts/neuroprobe/preprocess_views.py` directly (see L.2 below); NeuralSet kwargs alone don't cover shaft Laplacian.
 
 #### L.1 — Normalization Scope (Sweep 1, runs first)
 
@@ -325,50 +325,67 @@ Headline: gap between L.1.N0 and L.1.N1 averaged across tasks. Anything above ~0
 
 #### L.2 — Reference × Input-View (Sweep 2, after L.1)
 
-Two crossed axes. Reference transform changes the measurement operator (`y' = R y = R L s + R c + R noise`); input view changes which signal property is exposed. Both are configured by swapping `IeegExtractor` configs (except R1/R2 which need L.0e).
+> **2026-05-06 status.** First L.2 dispatch (`reports/neuroprobe_stage0_l2_reference_view_2026_05_05/`) was degenerate — 9 cells collapsed onto 4 upstream `preprocess_type` strings (`laplacian-stft_abs` / `stft_abs` / `laplacian` / `none`). Five `laplacian-stft_abs` cells produced byte-identical diagnostics; the headline ref × view comparisons (bipolar vs shaft-Lap; HG vs multi-band) were untested. Pivoted to `scripts/neuroprobe/preprocess_views.py` which factors `(reference, view)` into discrete primitives. Wrapper gains `--backend {upstream, neuralset}` flag; upstream backend stays default for byte-compat with L.1 N1 baseline. Tier-A grid (3 ref × 3 view = 9 distinct cells) re-dispatched 2026-05-06.
+
+Two crossed axes. Reference transform changes the measurement operator (`y' = R y = R L s + R c + R noise`); input view changes which signal property is exposed.
 
 Reference (rows):
 
-| Cell | Recipe | NeuralSet path |
+| Cell | Recipe | preprocess_views.py kind |
 |---|---|---|
-| R0 | raw monopolar | default `IeegExtractor` |
-| R1 | robust global CAR | `CARIeegExtractor` (L.0e) |
-| R2 | within-shaft local / shaft-CAR | `ShaftCARIeegExtractor` (L.0e) |
-| R3 | bipolar (adjacent-pair) | `bipolar_ref=True` |
-| R4 | shaft Laplacian | `bipolar_ref=...` shaft-aware |
+| R0 | raw monopolar | `ref_kind="raw"` |
+| R1 | robust global CAR | `ref_kind="global_car"` (Tier-B) |
+| R2 | within-shaft local / shaft-CAR | `ref_kind="shaft_car"` (Tier-B) |
+| R3 | bipolar (adjacent within-shaft pair) | `ref_kind="bipolar"` |
+| R4 | shaft Laplacian (upstream byte-parity) | `ref_kind="shaft_laplacian"` |
 | R5 | WM-rejected variants of R2/R3/R4 | gated on Chris's WM-flag answer |
 
 Input view (columns):
 
-| Cell | Recipe | NeuralSet path |
+| Cell | Recipe | preprocess_views.py kind |
 |---|---|---|
-| I0 | raw 2048 Hz voltage | default `IeegExtractor` |
-| I1 | low-frequency LFP (<30 Hz) | `filter=(None, 30)` |
-| I2 | STFT log-power | downstream transform |
-| I3 | HG/HFA envelope (70–150 Hz) | `filter=(70, 150) + apply_hilbert=True` |
-| I4 | multi-band log-power (6 bands) | downstream transform |
-| I5 | wavelet (Morlet, 6 scales) | downstream transform |
+| I0 | raw 2048 Hz voltage | `view_kind="raw_voltage"` |
+| I1 | low-frequency LFP (<30 Hz) | `view_kind="low_lfp"` (Tier-B) |
+| I2 | STFT magnitude (`stft_abs`) | `view_kind="stft_abs"` (reuses upstream `preprocess_stft`) |
+| I3 | HG/HFA envelope (70–150 Hz) | `view_kind="hg_envelope"` (Butterworth band + Hilbert) |
+| I4 | multi-band log-power (6 bands) | `view_kind="multi_band_log_power"` (Tier-B) |
+| I5 | wavelet (Morlet, 6 scales) | `view_kind="wavelet"` (Tier-B) |
+
+Note: I2 is the upstream `stft_abs` magnitude (not log-power) so the existing N1 baseline of 0.6132 reproduces byte-for-byte. The L.2 plan originally said "stft log-power"; that's a deferred Tier-B variant.
 
 Earlier drafts listed I6 = Lap+spec and I7 = CAR+HG as input views. They are not — they are (reference, view) pairs (R4, I2) and (R1, I3) respectively. Dropped to remove alias collisions. The D.0 default "Lap+spec" is now spelled R4×I2, and the conventional CAR+HG control is R1×I3.
 
-Don't run all 5×6=30. Pre-register a 12-cell hand-picked subset covering the physically meaningful combinations:
+Don't run all 5×6=30. Run the **Tier-A 9-cell grid first** (3 ref × 3 view, all distinct, all bytes-different). Tier-B (12 additional cells) only runs if Tier-A flags an open question.
+
+**Tier-A (active, 2026-05-06)**:
 
 | Cell | Recipe | Role |
 |---|---|---|
-| R0×I0 | raw monopolar × raw 2048 Hz | floor / v14-aligned ceiling |
+| R0×I0 | raw monopolar × raw voltage | floor / v14-aligned ceiling |
 | R0×I2 | raw × STFT | spectral without re-reference |
-| R1×I3 | global CAR × HG | conventional control (was I7) |
-| R2×I3 | within-shaft CAR × HG | physics-matched sEEG candidate |
-| R2×I4 | within-shaft CAR × multi-band | richer view on shaft-CAR |
+| R0×I3 | raw × HG envelope | spectral via HG without re-reference |
+| R3×I0 | bipolar × raw voltage | bipolar floor |
 | R3×I2 | bipolar × STFT | bipolar spectral |
 | R3×I3 | bipolar × HG | bipolar HG conventional |
+| R4×I0 | shaft Laplacian × raw voltage | shaft-Lap floor |
+| R4×I2 | shaft Laplacian × STFT | **D.0 default ("Lap+spec") — parity anchor** |
+| R4×I3 | shaft Laplacian × HG | biologically privileged candidate |
+
+**Tier-B (gated on Tier-A results)**:
+
+| Cell | Recipe | Role |
+|---|---|---|
+| R1×I3 | global CAR × HG | conventional CAR+HG control |
+| R2×I3 | within-shaft CAR × HG | physics-matched sEEG candidate |
+| R2×I4 | within-shaft CAR × multi-band | richer view on shaft-CAR |
 | R3×I4 | bipolar × multi-band | bipolar wide |
-| R4×I2 | shaft Laplacian × STFT | **D.0 default ("Lap+spec")** |
-| R4×I3 | shaft Laplacian × HG | biologically privileged |
 | R4×I4 | shaft Laplacian × multi-band | rich shaft-Lap view |
 | R4×I5 | shaft Laplacian × wavelet | scale-localized shaft-Lap |
+| R*×I1 | any × low-LFP | spectral floor (sub-30 Hz) |
 
-Stage-1 v14 default reference + input view are frozen from this sweep.
+Tier-B fires if (a) Tier-A's R3 vs R4 winner is < 0.005 ahead and CAR (R1/R2) might break the tie, or (b) HG envelope wins and we want to confirm with the multi-band richer cousin.
+
+Stage-1 v14 default reference + input view are frozen from Tier-A unless Tier-B is needed.
 
 #### L.3 — Filtering + Bad-Channel (Sweep 3, after L.2)
 
