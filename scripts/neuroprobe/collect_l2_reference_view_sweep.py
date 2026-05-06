@@ -121,13 +121,9 @@ def main() -> None:
 def collect_diagnostic_rows(sweep_root: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for diag_path in sorted(sweep_root.rglob("diagnostics.csv")):
-        record_path = diag_path.parent / "experiment_record.json"
-        cell = ""
-        if record_path.exists():
-            record = json.loads(record_path.read_text())
-            cell = str(record.get("cell", ""))
-        if not cell:
-            cell = _infer_cell_from_path(diag_path.parent, sweep_root)
+        cell = _infer_cell_from_path(diag_path.parent, sweep_root)
+        if not cell.startswith("L.2."):
+            continue
         df = pd.read_csv(diag_path)
         df["cell"] = cell
         df["report_dir"] = str(diag_path.parent)
@@ -165,6 +161,8 @@ def compute_paired_tests(diagnostics: pd.DataFrame) -> pd.DataFrame:
         out.append(
             {"cell_a": a, "cell_b": b, "n_pairs": len(common), "delta": delta, "p": p}
         )
+    if not out:
+        return pd.DataFrame(columns=pd.Index(["cell_a", "cell_b", "n_pairs", "delta", "p"]))
     return pd.DataFrame(out).sort_values("p")
 
 
