@@ -250,10 +250,10 @@ def _parse_args() -> argparse.Namespace:
         "--sessions", default="",
         help="Comma-separated subject:trial pairs; default = all 12 BT Lite sessions.",
     )
-    parser.add_argument("--partition", default="coganlab-gpu")
+    parser.add_argument("--partition", default="common,scavenger,coganlab-gpu")
     parser.add_argument("--account", default="coganlab")
     parser.add_argument("--cpus-per-task", type=int, default=4)
-    parser.add_argument("--mem", default="48G")
+    parser.add_argument("--mem", default="24G")
     parser.add_argument("--time", default="12:00:00")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
