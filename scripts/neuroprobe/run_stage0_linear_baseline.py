@@ -204,9 +204,14 @@ def run_eval(
             stft_params=preprocess_parameters,
         )
 
-    bins_start_before = 0.0
-    bins_end_after = 1.0
-    bin_starts, bin_ends = [0.0], [1.0]
+    # Anchor window: feature window is [-bins_start_before, +bins_end_after]s
+    # around word onset. Default = [0, 1]s (D.0 baseline). data_idx_from is
+    # computed below as (bin_start + bins_start_before) * SR; setting
+    # bin_starts=[-bins_start_before], bin_ends=[bins_end_after] makes the
+    # slice cover the full requested window.
+    bins_start_before = float(getattr(args, "anchor_start_before", 0.0))
+    bins_end_after = float(getattr(args, "anchor_end_after", 1.0))
+    bin_starts, bin_ends = [-bins_start_before], [bins_end_after]
 
     subject = BrainTreebankSubject(args.subject_id, cache=True, dtype=torch.float32)
     subset_electrodes(subject, lite=True, nano=False)
@@ -582,6 +587,16 @@ def _parse_args() -> argparse.Namespace:
         "--normalization",
         choices=tuple(NORMALIZATION_CELLS),
         required=True,
+    )
+    p.add_argument(
+        "--anchor-start-before", type=float, default=0.0,
+        help="Seconds before word onset to include in feature window. "
+             "Default = 0.0 (D.0 baseline). L.4 sanity = 0.375.",
+    )
+    p.add_argument(
+        "--anchor-end-after", type=float, default=1.0,
+        help="Seconds after word onset to include in feature window. "
+             "Default = 1.0 (D.0 baseline). L.4 sanity = 0.625.",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reference-mean-auroc", type=float, default=None)
