@@ -145,7 +145,7 @@ def compute_paired_tests(diagnostics: pd.DataFrame) -> pd.DataFrame:
     keys = ["subject_id", "trial_id", "task", "fold"]
     available = [k for k in keys if k in diagnostics.columns]
     if not available:
-        return pd.DataFrame(columns=["cell_a", "cell_b", "n_pairs", "delta", "p"])
+        return pd.DataFrame(columns=pd.Index(["cell_a", "cell_b", "n_pairs", "delta", "p"]))
 
     out: list[dict[str, object]] = []
     for a, b in combinations(cells, 2):
@@ -259,9 +259,11 @@ def plot_cell_aggregate_bar(summary_by_cell: pd.DataFrame, out_path: Path) -> No
 def build_summary(
     summary_by_cell: pd.DataFrame, paired: pd.DataFrame
 ) -> dict[str, object]:
-    by_cell = {
-        row["cell"]: {
-            "label": CELL_LABEL.get(row["cell"], "?"),
+    by_cell: dict[str, dict[str, object]] = {}
+    for _, row in summary_by_cell.iterrows():
+        cell_id = cast(str, row["cell"])
+        by_cell[cell_id] = {
+            "label": CELL_LABEL.get(cell_id, "?"),
             "mean_test_roc_auc": float(row["mean_test_roc_auc"]),
             "std_test_roc_auc": (
                 float(row["std_test_roc_auc"])
@@ -270,12 +272,12 @@ def build_summary(
             ),
             "n_rows": int(row["n"]),
         }
-        for _, row in summary_by_cell.iterrows()
-    }
-    baseline = by_cell.get(BASELINE_CELL, {}).get("mean_test_roc_auc")
+    baseline_entry = by_cell.get(BASELINE_CELL, {})
+    baseline_obj = baseline_entry.get("mean_test_roc_auc") if baseline_entry else None
+    baseline = float(cast(float, baseline_obj)) if baseline_obj is not None else None
     winner = summary_by_cell.iloc[0]
     delta_winner_minus_baseline = (
-        float(winner["mean_test_roc_auc"]) - float(baseline)
+        float(winner["mean_test_roc_auc"]) - baseline
         if baseline is not None
         else None
     )
