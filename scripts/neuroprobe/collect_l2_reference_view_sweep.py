@@ -35,27 +35,35 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 CELL_ORDER: tuple[str, ...] = (
+    # Tier-A NeuralSet sweep (3 ref × 3 view = 9 distinct cells)
     "L.2.R0xI0",
     "L.2.R0xI2",
+    "L.2.R0xI3",
+    "L.2.R3xI0",
     "L.2.R3xI2",
     "L.2.R3xI3",
-    "L.2.R3xI4",
+    "L.2.R4xI0",
     "L.2.R4xI2",
     "L.2.R4xI3",
+    # Legacy degenerate cells (kept for back-compat with the broken sweep)
+    "L.2.R3xI4",
     "L.2.R4xI4",
     "L.2.R4xI5",
 )
 
 CELL_LABEL: dict[str, str] = {
     "L.2.R0xI0": "raw × voltage",
-    "L.2.R0xI2": "raw × stft_log",
-    "L.2.R3xI2": "bipolar × stft_log",
-    "L.2.R3xI3": "bipolar × HG",
-    "L.2.R3xI4": "bipolar × multi-band",
-    "L.2.R4xI2": "shaftLap × stft_log [D.0]",
-    "L.2.R4xI3": "shaftLap × HG",
-    "L.2.R4xI4": "shaftLap × multi-band",
-    "L.2.R4xI5": "shaftLap × wavelet",
+    "L.2.R0xI2": "raw × stft_abs",
+    "L.2.R0xI3": "raw × HG envelope",
+    "L.2.R3xI0": "bipolar × voltage",
+    "L.2.R3xI2": "bipolar × stft_abs",
+    "L.2.R3xI3": "bipolar × HG envelope",
+    "L.2.R4xI0": "shaftLap × voltage",
+    "L.2.R4xI2": "shaftLap × stft_abs [D.0]",
+    "L.2.R4xI3": "shaftLap × HG envelope (privileged)",
+    "L.2.R3xI4": "bipolar × multi-band (legacy)",
+    "L.2.R4xI4": "shaftLap × multi-band (legacy)",
+    "L.2.R4xI5": "shaftLap × wavelet (legacy)",
 }
 
 BASELINE_CELL = "L.2.R4xI2"

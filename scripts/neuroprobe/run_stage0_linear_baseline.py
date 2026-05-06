@@ -85,7 +85,9 @@ def main() -> None:
     from eval_utils import (  # noqa: E402
         combine_regions,
         get_region_labels,
+        laplacian_rereference_neural_data,
         preprocess_data,
+        preprocess_stft,
         subset_electrodes,
     )
 
@@ -105,6 +107,9 @@ def main() -> None:
         "task": args.task,
         "split_type": args.split_type,
         "binary_tasks": args.binary_tasks,
+        "backend": args.backend,
+        "ref_kind": args.ref_kind if args.backend == "neuralset" else None,
+        "view_kind": args.view_kind if args.backend == "neuralset" else None,
         "preprocess_type": args.preprocess_type,
         "normalization": args.normalization,
         "normalization_cell": cell_id,
@@ -132,6 +137,8 @@ def main() -> None:
             nts=nts,
             nconfig=nconfig,
             preprocess_data=preprocess_data,
+            preprocess_stft=preprocess_stft,
+            laplacian_rereference_neural_data=laplacian_rereference_neural_data,
             subset_electrodes=subset_electrodes,
             get_region_labels=get_region_labels,
             combine_regions=combine_regions,
@@ -164,6 +171,8 @@ def run_eval(
     nts,
     nconfig,
     preprocess_data,
+    preprocess_stft,
+    laplacian_rereference_neural_data,
     subset_electrodes,
     get_region_labels,
     combine_regions,
@@ -184,6 +193,16 @@ def run_eval(
         },
         "projection": {"dim": 192, "method": "pca"},
     }
+
+    upstream_helpers = None
+    if args.backend == "neuralset":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from preprocess_views import make_upstream_helpers
+        upstream_helpers = make_upstream_helpers(
+            preprocess_stft=preprocess_stft,
+            laplacian_rereference_neural_data=laplacian_rereference_neural_data,
+            stft_params=preprocess_parameters,
+        )
 
     bins_start_before = 0.0
     bins_end_after = 1.0
@@ -245,23 +264,28 @@ def run_eval(
                 train_dataset = fold["train_dataset"]
                 test_dataset = fold["test_dataset"]
 
+                def _preprocess(item_data, electrode_labels):
+                    sliced = item_data[:, data_idx_from:data_idx_to].unsqueeze(0)
+                    if args.backend == "upstream":
+                        return preprocess_data(
+                            sliced, electrode_labels, preprocess_type, preprocess_parameters,
+                        ).float().numpy()
+                    from preprocess_views import preprocess_views  # noqa: PLC0415
+                    feats, _ = preprocess_views(
+                        sliced, list(electrode_labels),
+                        ref_kind=args.ref_kind, view_kind=args.view_kind,
+                        sampling_rate=int(nconfig.SAMPLING_RATE),
+                        upstream_helpers=upstream_helpers,
+                    )
+                    return feats.float().numpy()
+
                 X_train = np.concatenate([
-                    preprocess_data(
-                        item[0][:, data_idx_from:data_idx_to].unsqueeze(0),
-                        train_subject.electrode_labels,
-                        preprocess_type,
-                        preprocess_parameters,
-                    ).float().numpy()
+                    _preprocess(item[0], train_subject.electrode_labels)
                     for item in train_dataset
                 ], axis=0)
                 y_train = np.array([item[1] for item in train_dataset])
                 X_test = np.concatenate([
-                    preprocess_data(
-                        item[0][:, data_idx_from:data_idx_to].unsqueeze(0),
-                        subject.electrode_labels,
-                        preprocess_type,
-                        preprocess_parameters,
-                    ).float().numpy()
+                    _preprocess(item[0], subject.electrode_labels)
                     for item in test_dataset
                 ], axis=0)
                 y_test = np.array([item[1] for item in test_dataset])
@@ -529,6 +553,31 @@ def _parse_args() -> argparse.Namespace:
         default=False,
     )
     p.add_argument("--preprocess-type", default="laplacian-stft_abs")
+    p.add_argument(
+        "--backend",
+        choices=("upstream", "neuralset"),
+        default="upstream",
+        help="upstream = call eval_utils.preprocess_data (default, byte-equivalent to D.0). "
+             "neuralset = factor reference × view via scripts/neuroprobe/preprocess_views.py.",
+    )
+    p.add_argument(
+        "--ref-kind",
+        choices=("raw", "bipolar", "shaft_laplacian", "global_car", "shaft_car"),
+        default="shaft_laplacian",
+        help="Spatial reference (only used when --backend=neuralset).",
+    )
+    p.add_argument(
+        "--view-kind",
+        choices=("raw_voltage", "stft_abs", "hg_envelope"),
+        default="stft_abs",
+        help="Input view (only used when --backend=neuralset).",
+    )
+    p.add_argument(
+        "--run-nuisance-probes",
+        action="store_true",
+        help="Also train probes on subject_id / session_id from same X (L.5 P1/P2). "
+             "Writes nuisance_probe_metrics.csv to out_dir.",
+    )
     p.add_argument(
         "--normalization",
         choices=tuple(NORMALIZATION_CELLS),
