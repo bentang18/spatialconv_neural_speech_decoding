@@ -323,6 +323,36 @@ Tests the rebuttal claim that normalization recipe explains a meaningful chunk o
 
 Headline: gap between L.1.N0 and L.1.N1 averaged across tasks. Anything above ~0.02 multiclass AUROC means recipe is load-bearing for the rebuttal claim. Whatever's left is genuinely architecture. Secondary: N2 vs N5 — if mean/std and median/MAD give the same result on sEEG (as they did on PS uECoG, ρ=1.0), the choice is moot; if they diverge, sEEG has heavier outlier tails. Stage-1 v14 default normalization is frozen from this sweep.
 
+> **2026-05-08 — L.1 FROZEN at N1 (`train_set_fixed`).** Full 9-cell ranking (Tier-A + Tier-B) on 12 sessions × 15 tasks = 180 (session, task) pairs/cell, bootstrap N=2000:
+>
+> | rank | cell | recipe | mean | CI |
+> |---|---|---|---|---|
+> | 1 | N2 | per_session_fixed (transductive) | 0.6175 | [0.598, 0.638] |
+> | 2 | N3 | train_set_scale_only | 0.6137 | [0.595, 0.632] |
+> | 3 | **N1** | **train_set_fixed (upstream)** | **0.6132** | **[0.595, 0.633]** |
+> | 4 | N5 | per_session_robust_mad (transductive) | 0.6114 | overlap |
+> | 5 | N6 | train_set_robust_mad (Tier-B) | 0.6072 | overlap |
+> | 6 | N7 | per_session_robust_scale (transductive Tier-B) | 0.6068 | overlap |
+> | 7 | N0 | per_window_z (BrainBERT/PopT) | 0.5597 | clear loss |
+> | 8 | N8 | per_channel_train_set_z (Tier-B) | 0.5550 | clear loss |
+> | 9 | N4 | none | 0.5536 | clear loss |
+>
+> **Decision tree application** (rule 2): top-3 cells (N2/N3/N1) all have overlapping CIs; N2 is transductive (refits scaler on test session's own features). Prefer inductive → eliminate N2. N3 vs N1 is statistically indistinguishable (Wilcoxon p=0.46). Default to upstream-parity baseline → **N1**.
+>
+> **Tier-B decomposition findings**:
+> - N5 vs N6 (Δ=+0.0042, CIs overlap): per-session scope is decorative — the robust statistic does what little work there is. *No reason to adopt per-session normalization.*
+> - N5 vs N7 (Δ=+0.0046, overlap): centering vs scale-only barely matters under robust statistics.
+> - N8 vs N1 (Δ=−0.0582): per-channel z-scoring is decisively *worse* than pooled. *Reject per-channel as a Stage-1 default.*
+>
+> **Headline**: N0 − N1 = −0.0536 (~5.4 pp tax for the BrainBERT/PopT per-window-z recipe). Above the 0.02 load-bearing threshold; preprocessing recipe **is** load-bearing for the linear-vs-FM gap.
+>
+> **Architectural consequences for v14**:
+> - Stage-1 preprocessing contract: `train_set_fixed` (StandardScaler fit on training fold). No per-session test-time adaptation required.
+> - Per-channel scope rejected — token-level normalization in v14 should pool across channels within a parcel, not per-electrode.
+> - The transductive ~0.004 lift is in v15-territory, not load-bearing for v14.
+>
+> Artifacts: `reports/neuroprobe_stage0_l1_normalization_2026_05_05/{freeze_analysis.md, freeze_analysis.json, cell_ci_forest.png, paired_tests.csv}`.
+
 #### L.2 — Reference × Input-View (Sweep 2, after L.1)
 
 > **2026-05-06 status.** First L.2 dispatch (`reports/neuroprobe_stage0_l2_reference_view_2026_05_05/`) was degenerate — 9 cells collapsed onto 4 upstream `preprocess_type` strings (`laplacian-stft_abs` / `stft_abs` / `laplacian` / `none`). Five `laplacian-stft_abs` cells produced byte-identical diagnostics; the headline ref × view comparisons (bipolar vs shaft-Lap; HG vs multi-band) were untested. Pivoted to `scripts/neuroprobe/preprocess_views.py` which factors `(reference, view)` into discrete primitives. Wrapper gains `--backend {upstream, neuralset}` flag; upstream backend stays default for byte-compat with L.1 N1 baseline. Tier-A grid (3 ref × 3 view = 9 distinct cells) re-dispatched 2026-05-06.
