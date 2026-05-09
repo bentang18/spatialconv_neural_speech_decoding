@@ -60,7 +60,7 @@ Blocked:
 
 ### 1. Run V0-V6 Data QC
 
-This is the main unblocked work while waiting for Christopher.
+> **Status: COMPLETED 2026-05-01.** Report: `reports/neuroprobe_stage0_v_data_qc_2026_05_01_v3/`. Headlines: raw monopolar has high common-mode burden (median top eigen-fraction 0.400, max 0.711, median |corr| 0.412). Robust global CAR reduces to 0.214 / 0.169 — diagnostic, not default. Shaft-local median + shaft-bipolar reduce to 0.167-0.179 / 0.124 — these are the real Stage-1 references (consistent with L.2's R3/R4 winners). Cheap nuisance probes decode subject-ID at balanced acc 0.699 (chance 0.167) and session-ID at 0.518 (chance 0.083) — corroborates the L.5.P1/P2 kill-criterion necessity. The Stage-1 input-view roles below are inherited from this report. The cell-by-cell description that follows in V0-V6 is preserved as the **specification** the report was built against; refer to the dated report for the actual numbers.
 
 V0-V6 is a data-contract QC report, not a model experiment. It should decide which signal views are valid Stage-1 candidates and which artifact probes must travel with every later result. It should use all 12 Lite sessions for tabular summaries, with readable plots for a fixed representative subset.
 
@@ -94,6 +94,8 @@ Compare Lite against Full/uncapped BrainTreebank where public data permits:
 - whether Lite is biased toward cleaner, more active, or more decodable electrodes.
 
 Record the decision explicitly: Lite is for leaderboard parity; Full/uncapped data is for robustness whenever available.
+
+**V0.x — Stimulus-overlap audit (CrossSession leakage)**: for every (task, label) pair in the 15-task suite, check whether the same word/exemplar appears in both train sessions and test sessions. CrossSession protocol shuffles train/test by session, not by stimulus — so a stimulus heard in sub1/trial1 (train) can re-appear in sub1/trial2 (test). If yes, the linear classifier can pattern-match stimulus identity rather than brain response, making the AUROC partially a stimulus-recognition score rather than a brain-decoding score. Single-shot audit; report fraction of test stimuli also present in train per (subject, task). Add to V0 deliverables. Rerun expected when any new task or session enters the suite.
 
 #### V1 — Raw Signal Health
 
@@ -506,6 +508,22 @@ Run on the chosen view from each sweep. **Used as kill criteria, not for selecti
 - **P13 architecture coupling**: P13 uses DK-region mean pooling as a cheap proxy for v14's BNA-soft-support pooling. Once v14 lands, replay P13 on the actual v14 parcel-pooled features.
 - **Deferred to Cogan-stage** (not run at Neuroprobe Stage 0): EMG / myogenic 80-200 Hz contamination (only matters for production-speech tasks, BT is passive listening); audio-bleed through off-task electrode (BT setup vetted upstream); heartbeat-phase decoding (matters for deep mesial temporal contacts, BT Lite is largely lateral-cortical); eye-movement residual (orbital-frontal contacts; rare in BT Lite). All of these become mandatory probes when v14 moves to Cogan PS uECoG / sEEG D-cohort.
 
+#### L.7 — Audio-FM upper-bound baseline (Conwell veRSA control)
+
+**One cell. v14-load-bearing for paper framing.** Tests whether Neuroprobe's 15 tasks are partially solvable from the *audio* alone via a frozen Foundation Model — establishing a "no-brain" upper-bound that v14 must beat by a margin to claim brain-relevance.
+
+| Cell | Pipeline | Output |
+|---|---|---|
+| L.7.A0 | stim audio (1 s aligned to word onset) → frozen Whisper-large-v3 L8 → mean-pool over time → Logistic Regression → Neuroprobe label, per task, per session, CrossSession protocol | mean test AUROC per task; aggregate summary against L.2 winner R4×I2 (brain-only spectral linear, 0.6132). |
+| L.7.A1 | same as A0 but L16 (~50% depth) | layer-depth control |
+| L.7.A2 | same as A0 but HuBERT-large L9 (~25% depth) | FM-identity control (not Whisper-specific?) |
+
+**Read-out**: if L.7 AUROC ≥ L.2 winner, Neuroprobe is largely solvable from audio — v14's brain contribution must clear `L.7.A0 + 0.05` to claim brain-decodability is real and not just a sophisticated audio classifier. If L.7 AUROC ≪ L.2 winner, brain features carry information audio-FMs do not — strong v14 framing. Either outcome is publishable.
+
+This is the Conwell 2024 veRSA caution operationalized for our specific FM choice (`memory/feedback_diet_over_architecture_priority_2026_05_09.md`). Distinct from L.5.P9 (P9 regresses brain → Whisper for the inverse direction; L.7 regresses audio → label with no brain involvement).
+
+Implementation: Whisper-large-v3 L8 forward passes are cheap (one-time per session, cache to `/hpc/group/coganlab/ht203/cache_neuroai/whisper_l8_features/`). 12 sessions × 15 tasks × 3 FM-cells = 540 fits, all CPU LogReg, fits inside L.1 wrapper.
+
 #### L.6 — Deferred Tier-2 (post-Stage-0 close, only if budget permits)
 
 Not Stage-0 close-criterion. Listed so future-us doesn't reinvent the cell IDs.
@@ -569,6 +587,33 @@ Conditional cells:
 - D.16 electrode-set robustness: Lite-120 parity set, random-120, anatomy-120, and full/uncapped where public data permits. Use Lite-120 for leaderboard parity only.
 
 Stage 1 should also carry a small window-anchor robustness cell around Neuroprobe's `[0, 1]` s window because the rebuttal reports near-equivalent decoding for 1 s windows starting between about `-0.375` and `+0.125` s relative to word onset.
+
+## Statistical Methods (binding for all Stage-0 reports)
+
+Single appendix so every L-sweep + V-QC + D-block + L.5 probe uses the same machinery. Reviewers in 2026 expect explicit stat-method specs; per-cell choices are not defensible.
+
+- **CIs on AUROC / accuracy**: bootstrap N=2000, percentile method, sampling units = (session, task) pairs. For multi-task aggregates, resample (session, task) pairs jointly so cross-task correlation is preserved. Report `[lo, hi]` alongside means in every freeze decision.
+- **Paired comparisons across cells**: paired Wilcoxon signed-rank on (session, task)-paired AUROCs (one signed delta per (session, task) pair, two cells). Report W, n, p, rank-biserial r as effect size.
+- **Multi-cell screening**: when comparing K > 2 cells against a baseline, apply Benjamini-Hochberg correction at α = 0.05 across the K-1 paired tests. Report both raw and BH-adjusted p; interpretive decisions use BH-adjusted.
+- **Effect-size threshold for "load-bearing"**: ΔAUROC ≥ 0.02 (multiclass CrossSession) for a cell to override the upstream / inherited default. Below 0.02, freeze upstream parity (decision rule 2 from L.1). The threshold is calibrated to the published 95% CI half-width of the Neuroprobe linear baseline (~0.018-0.020 across 12 Lite sessions) — anything under one CI half-width is below noise.
+- **Seed variance**: each freeze decision quoted with ≥ 3 seeds (42, 43, 44) on the chosen cell + nearest competitor. Report seed-variance SEM separately from session-task SEM. Cells whose ΔAUROC is within 1× seed-variance SEM are not load-bearing regardless of CI.
+- **Multiple-comparison correction across L-sweeps**: do not BH-correct across sweeps (L.1, L.2, L.3, L.4 are independent decisions on independent axes). Within a sweep, BH-correct across cells.
+- **L.5 probes**: kill criteria use raw thresholds (no MC correction) because they are conservative pre-registered floors, not exploratory tests. P9 / P13 measurements report R² + retrieval@10 with bootstrap CI but no kill-threshold p-value.
+- **Session-token leakage**: every paired comparison must verify train/test (session, task) pairs do not overlap. Add an assert to every freeze-analyzer script.
+- **Reproducibility pinning**: every report README cites upstream Neuroprobe commit (`c7b955b0a31464f4a5eec3f3bd78ff29841d61ac`), Whisper-large-v3 HuggingFace commit (record on first L.7 / L.5.P9 run), `pyproject.toml` + `uv.lock` git SHA at run time. Version-drift between report regenerations is a defect.
+
+## Stage-1 Entry Pre-Commitments
+
+The architectural ablation roster v14 must run between Stage-1 dispatch and Stage-1 close. These are not Stage-0 work but are spec'd here so the handoff is unambiguous and Stage-0's frozen contracts (L.1 N1 + L.2 R4×I2 + L.3 winner + L.4 robustness) feed directly into them. Canonical source: `memory/project_v14_paper_corrections_post_newpapers6_2026_05_09.md` + `memory/project_v14_p_emb_drift_ablation_2026_05_09.md`.
+
+| Cell | Tests | Why |
+|---|---|---|
+| **AC1 FM-swap** | v14 with frozen Whisper-large-v3 L8 → swap to HuBERT-large L9 / WavLM-large L9 / EnCodec / w2v-BERT-2-mid at fixed v14 architecture | Conwell "diet > arch" test for our specific FM choice. If FM identity dominates architecture, v14's contribution is FM-selection, not the architecture. |
+| **AC2 frozen-features linear probe** | Whisper-L8 (or per-task winning FM from AC1) → linear → Neuroprobe labels, no brain features | Must be beaten by v14's brain-FM contrastive. If linear-on-FM-only matches v14, the brain contribution is decorative. **Identical pipeline to L.7.A0 — L.7 IS the AC2 baseline run early.** |
+| **AC3 anatomy-blind random Perceiver** | Same Perceiver IO architecture, same M·d budget, but `parcel_latents[p, m]` initialized **random** (no `P_emb[p]` BNA prior) and **no `log(support[i,p])` Graphormer cross-attn bias** | Bhattacharjee 2024 SRM PCA-control analog: tests whether anatomy-as-routing actually does work vs random latents. If random-Perceiver matches v14, anatomy is decorative — biggest single architectural ablation. |
+| **AC4 P_emb drift** | Unfreeze `P_emb[p]` (BNA-init, learnable) while keeping `support[i,p]` anatomy-fixed and `log(support)` cross-attn bias active | Tests Cogan's functional-vs-anatomical-alignment question. Triangulates with AC3: full v14 (both fixed) vs P_emb-drift (routing only) vs anatomy-blind (neither). Free interpretability story either way: either anatomy-as-content-prior holds, or attention finds a better functional prior than BNA. |
+
+Each cell reports pooled multi-source CrossSubject multiclass + S2/trial-4 CrossSubject parity + per-task breakdown using Stage-0's stat-method appendix. AC2 (= L.7) lands earliest because it needs no architecture; AC3/AC4 land last.
 
 ## Close Criteria
 
