@@ -1,6 +1,6 @@
 # Neuroprobe Stage 0 — Current Execution Plan
 
-*Last revised 2026-05-01.*
+*Last revised 2026-05-09.*
 
 ## Purpose
 
@@ -276,7 +276,7 @@ The linear baseline is a preprocessing oracle. Anything the architecture would o
 L cells use the D.0 protocol harness extended with the relevant config flag:
 
 - **L.1 (normalization sweep)** runs through `scripts/neuroprobe/run_stage0_linear_baseline.py` (own wrapper, mirrors upstream `eval_population.py` byte-for-byte except for an internalized `--normalization` step). Submitter: `scripts/neuroprobe/submit_l1_normalization_sweep.py`. Collector + per-sweep aggregate viz: `scripts/neuroprobe/collect_l1_normalization_sweep.py`. The wrapper writes per-cell `signal_qc.png` (feature-magnitude histogram pre vs post normalization) + `metrics.json` + `diagnostics.csv` + `experiment_record.json` sidecar; the collector emits `cell_task_heatmap.png` + `cell_aggregate_bar.png` + `n0_vs_n1_delta.csv`.
-- **L.2/L.3/L.4** will extend the same wrapper by adding NeuralFetch-driven preprocess swaps (reference + filter + window anchor). The N1 cell of L.1 is the byte-equivalent reproduction of the upstream D.0 baseline; this serves as the regression check on the wrapper's own pipeline before any new axis sweeps.
+- **L.2/L.3/L.4** extend the same wrapper by adding NeuralFetch-driven preprocess swaps (reference + filter + window anchor). The N1 cell of L.1 is the byte-equivalent reproduction of the upstream D.0 baseline; this serves as the regression check on the wrapper's own pipeline before any new axis sweeps. L.2 is FROZEN at R4×I2 (2026-05-09); L.3 + L.4 dispatch on the L.1 + L.2 frozen winners.
 
 Default eval is D.0b CrossSession multiclass on all 15 tasks, full upstream subject matrix. D.0a CrossSubject binary runs as a confirmation pass on each Sweep winner via the same wrapper with `--include-cross-subject`.
 
@@ -306,7 +306,7 @@ Surfaced by the 2026-05-05 NeuroAI integration audit. None of the L sweeps run c
 
 - **L.0a** `Experiment` must inherit `neuraltrain.utils.BaseExperiment` so `neuraltrain.utils.run_grid` will type-accept it. Without this, the canonical Slurm grid-array dispatch is unreachable. One-line change in `src/speech_decoding/experiments/experiment.py`.
 - **L.0b** Set the exca cache folder to `/hpc/group/coganlab/ht203/cache_neuroai/` (persistent) on DCC, not `/work/ht203/` (75-day purge). Document `EXCA_CACHE_FOLDER` env var convention in `docs/references/dcc_setup.md`. Without this every sweep silently recomputes after the next purge cycle.
-- **L.0c** *(Stage-1-entry preparation, NOT an L-sweep blocker)* Write a `DeriveLabelIndices` `EventsTransform` and a `Wang2024Treebank` `ns.Chain` so the events DataFrame carries `code` + `split` before the `Segmenter` sees it. This unblocks running D.0 and L cells through our canonical `Experiment` class. L sweeps themselves are dispatched via the upstream-wrapper path (`scripts/neuroprobe/run_upstream_linear_baseline.py` extended with the relevant config flag), which already works and writes `ExperimentLogger` sidecars. Treat L.0c as a Stage-1-entry deliverable; it shouldn't gate L.1.
+- **L.0c** *(Stage-1-entry preparation, NOT an L-sweep blocker)* Write a `DeriveLabelIndices` `EventsTransform` and a `Wang2024Treebank` `ns.Chain` so the events DataFrame carries `code` + `split` before the `Segmenter` sees it. This unblocks running D.0 and L cells through our canonical `Experiment` class. L sweeps themselves are dispatched via the Stage-0 wrapper path (`scripts/neuroprobe/run_stage0_linear_baseline.py`, which mirrors `run_upstream_linear_baseline.py` byte-for-byte for the N1 cell and adds the `--normalization` / `--backend {upstream, neuralset}` / `--ref-kind` / `--view-kind` flags). Both wrappers write `ExperimentLogger` sidecars. Treat L.0c as a Stage-1-entry deliverable; it shouldn't gate L.1.
 - **L.0d** Verify `scripts/neuroprobe/run_upstream_linear_baseline.py` wraps each run in `ExperimentLogger`. If not, retrofit so D.0 cells and all L cells write the canonical `experiment_record.json` sidecar that `collect_experiment_records.py` aggregates into `docs/experiments/runs.csv`.
 - **L.0e** *(cleared 2026-05-06)* `CARIeegExtractor` ships in `src/speech_decoding/extractors/reference.py` (`car="global"` and `car="shaft"`). The `ShaftCARIeegExtractor` is the same class with `car="shaft"`. R1/R2 cells of L.2 are unblocked. `bipolar_ref` and Laplacian are handled in `scripts/neuroprobe/preprocess_views.py` directly (see L.2 below); NeuralSet kwargs alone don't cover shaft Laplacian.
 
@@ -375,7 +375,7 @@ Headline: gap between L.1.N0 and L.1.N1 averaged across tasks. Anything above ~0
 >
 > **Decision tree application** (rule 2): top cell R3×I2 ties baseline R4×I2 (Δ = +0.0025, CI overlap, NOT load-bearing at 0.02 threshold). Default to upstream-parity → **R4×I2**. (Bipolar tie carried into Tier-C as the CrossSubject contrast.)
 >
-> **Headline** (rule 3 fires): view marginal Δ = 0.555 [I2=0.6071, I0=0.5516] swamps reference marginal Δ = 0.0122 [R3=0.5855, R0=0.5733] by 4.5×. *View matters; reference does not.* For v14 architectural design, this shifts complexity budget from reference design (Laplacian/bipolar/CAR variants) to spectral feature design (STFT/HG/multi-band/wavelet/learned tokenizer).
+> **Headline** (rule 3 fires): view marginal Δ = 0.0555 [I2=0.6071, I0=0.5516] swamps reference marginal Δ = 0.0122 [R3=0.5855, R0=0.5733] by 4.5×. *View matters; reference does not.* For v14 architectural design, this shifts complexity budget from reference design (Laplacian/bipolar/CAR variants) to spectral feature design (STFT/HG/multi-band/wavelet/learned tokenizer).
 >
 > **Spectral floor**: all three I0 (raw voltage) cells cluster at 0.55, separated from the I2/I3 cluster (0.59–0.62) by a clear gap. Linear readout cannot extract speech-relevant structure from raw voltage at this scale; spectral pre-tokenization is load-bearing for the linear baseline (consistent with Neuroprobe's "Linear (Lap+spec) 0.611" finding).
 >
@@ -416,14 +416,17 @@ Input view (columns):
 | I3 | HG/HFA envelope (70–150 Hz) | `view_kind="hg_envelope"` (Butterworth band + Hilbert) |
 | I4 | multi-band log-power (6 bands) | `view_kind="multi_band_log_power"` (Tier-B) |
 | I5 | wavelet (Morlet, 6 scales) | `view_kind="wavelet"` (Tier-B) |
+| I6 | theta-band (4-8 Hz) instantaneous-phase mean cos+sin | `view_kind="instantaneous_phase"` (Tier-B, added 2026-05-09 to close phase axis) |
+| I2L | log STFT (`log(|STFT|² + ε)`) | `view_kind="log_stft"` (Tier-B) |
+| I3W | wider HG envelope (70–250 Hz) | `view_kind="hg_envelope_wide"` (Tier-B) |
 
-Note: I2 is the upstream `stft_abs` magnitude (not log-power) so the existing N1 baseline of 0.6132 reproduces byte-for-byte. The L.2 plan originally said "stft log-power"; that's a deferred Tier-B variant.
+Note: I2 is the upstream `stft_abs` magnitude (not log-power) so the existing N1 baseline of 0.6132 reproduces byte-for-byte. I2L is the deferred Tier-B "stft log-power" variant.
 
 Earlier drafts listed I6 = Lap+spec and I7 = CAR+HG as input views. They are not — they are (reference, view) pairs (R4, I2) and (R1, I3) respectively. Dropped to remove alias collisions. The D.0 default "Lap+spec" is now spelled R4×I2, and the conventional CAR+HG control is R1×I3.
 
 Don't run all 5×6=30. Run the **Tier-A 9-cell grid first** (3 ref × 3 view, all distinct, all bytes-different). Tier-B (12 additional cells) only runs if Tier-A flags an open question.
 
-**Tier-A (active, 2026-05-06)**:
+**Tier-A (FROZEN 2026-05-09 — see freeze block above)**:
 
 | Cell | Recipe | Role |
 |---|---|---|
@@ -447,9 +450,12 @@ Don't run all 5×6=30. Run the **Tier-A 9-cell grid first** (3 ref × 3 view, al
 | R3×I4 | bipolar × multi-band | bipolar wide |
 | R4×I4 | shaft Laplacian × multi-band | rich shaft-Lap view |
 | R4×I5 | shaft Laplacian × wavelet | scale-localized shaft-Lap |
+| R4×I6 | shaft Laplacian × theta phase | phase-axis hedge (added 2026-05-09; closes the phase axis missing from Tier-A magnitude views) |
+| R4×I2L | shaft Laplacian × log STFT | log-power variant of upstream parity |
+| R4×I3W | shaft Laplacian × wide HG (70–250) | high-band richer cousin |
 | R*×I1 | any × low-LFP | spectral floor (sub-30 Hz) |
 
-Tier-B fires if (a) Tier-A's R3 vs R4 winner is < 0.005 ahead and CAR (R1/R2) might break the tie, or (b) HG envelope wins and we want to confirm with the multi-band richer cousin.
+Tier-B fires if (a) Tier-A's R3 vs R4 winner is < 0.005 ahead and CAR (R1/R2) might break the tie, or (b) HG envelope wins and we want to confirm with the multi-band richer cousin, or (c) any Tier-A loser comes from a feature class (phase, wider HG, log-power) not covered by Tier-A.
 
 Stage-1 v14 default reference + input view are frozen from Tier-A unless Tier-B is needed.
 
@@ -516,13 +522,13 @@ Run on the chosen view from each sweep. **Used as kill criteria, not for selecti
 |---|---|---|
 | L.7.A0 | stim audio (1 s aligned to word onset) → frozen Whisper-large-v3 L8 → mean-pool over time → Logistic Regression → Neuroprobe label, per task, per session, CrossSession protocol | mean test AUROC per task; aggregate summary against L.2 winner R4×I2 (brain-only spectral linear, 0.6132). |
 | L.7.A1 | same as A0 but L16 (~50% depth) | layer-depth control |
-| L.7.A2 | same as A0 but HuBERT-large L9 (~25% depth) | FM-identity control (not Whisper-specific?) |
+| L.7.A2 | same as A0 but HuBERT-large L6 (~25% depth, 24-layer encoder) | FM-identity control (not Whisper-specific?) |
 
 **Read-out**: if L.7 AUROC ≥ L.2 winner, Neuroprobe is largely solvable from audio — v14's brain contribution must clear `L.7.A0 + 0.05` to claim brain-decodability is real and not just a sophisticated audio classifier. If L.7 AUROC ≪ L.2 winner, brain features carry information audio-FMs do not — strong v14 framing. Either outcome is publishable.
 
 This is the Conwell 2024 veRSA caution operationalized for our specific FM choice (`memory/feedback_diet_over_architecture_priority_2026_05_09.md`). Distinct from L.5.P9 (P9 regresses brain → Whisper for the inverse direction; L.7 regresses audio → label with no brain involvement).
 
-Implementation: Whisper-large-v3 L8 forward passes are cheap (one-time per session, cache to `/hpc/group/coganlab/ht203/cache_neuroai/whisper_l8_features/`). 12 sessions × 15 tasks × 3 FM-cells = 540 fits, all CPU LogReg, fits inside L.1 wrapper.
+Implementation: Whisper-large-v3 L8 forward passes are cheap (one-time per session, cache to `/hpc/group/coganlab/ht203/cache_neuroai/whisper_l8_features/`). 12 sessions × 15 tasks × 3 FM-cells = 540 fits, all CPU LogReg, fits inside L.1 wrapper. **Cache shared with L.5.P9** — both L.7 and P9 hit the same Whisper-L8 features (P9 regresses brain → these features; L.7 regresses these features → label). Extract once, both consume.
 
 #### L.6 — Deferred Tier-2 (post-Stage-0 close, only if budget permits)
 
@@ -634,6 +640,9 @@ Stage 0 closes when:
 - The Stage-1 filtering and bad-channel mask is decided from L.3.
 - The Stage-1 anchor-robustness ablation is marked mandatory or optional from L.4.
 - L.5 diagnostic probes have run on each Sweep winner, and no chosen view fails the L.5.P1/P2/P6/P11/P12 hard kill criteria. P9 (FM-leakage) and P13 (post-aggregation subject-ID) are v14-load-bearing measurements rather than hard kills — their results are recorded as baselines that v14's contrastive loss (P9) and parcel pooling (P13) must beat at Stage 2 dispatch. P10 runs only if `multi_band_log_power` becomes a v14 tokenizer candidate. P12 only adds new information under WithinSession splits.
+- L.7 audio-FM upper-bound has run (L.7.A0 minimum; A1/A2 if A0 is competitive with L.2 winner) and the per-task table comparing L.7 to L.2 R4×I2 is recorded. Stage-1 v14 must clear `L.7.A0 + 0.05` to claim brain-decodability is real.
+- V0.x stimulus-overlap audit has run and the train/test stimulus overlap fraction per (subject, task) is recorded. Tasks with > 50% overlap are flagged in V6 as stimulus-recognition-confounded and reported alongside L.2/L.3 numbers.
+- All freeze decisions (L.1, L.2, L.3 winner, L.4 anchor robustness) cite the Statistical Methods appendix: bootstrap N=2000 percentile CIs, paired Wilcoxon + rank-biserial, BH within sweep, ≥ 3 seeds on chosen + nearest competitor, train/test pair-overlap assert, upstream-commit + Whisper-commit + uv.lock SHA pinned.
 - L.0 prerequisites have all landed: `Experiment` inherits `BaseExperiment`, exca cache folder is set on DCC, `DeriveLabelIndices` `EventsTransform` is wired into a `ns.Chain`, the linear baseline wrapper writes `ExperimentLogger` sidecars, and `CARIeegExtractor` + `ShaftCARIeegExtractor` exist.
 - Neuroprobe-Lite temporal sampling behavior is verified from code, not assumed from review-thread claims.
 - The Stage-1 split contract is written down: multiclass default, pooled multi-source cross-subject generalization default, S2-only cross-subject parity cell, and Lite-120 electrode cap parity-only.
