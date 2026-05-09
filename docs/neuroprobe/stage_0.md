@@ -357,6 +357,40 @@ Headline: gap between L.1.N0 and L.1.N1 averaged across tasks. Anything above ~0
 
 > **2026-05-06 status.** First L.2 dispatch (`reports/neuroprobe_stage0_l2_reference_view_2026_05_05/`) was degenerate — 9 cells collapsed onto 4 upstream `preprocess_type` strings (`laplacian-stft_abs` / `stft_abs` / `laplacian` / `none`). Five `laplacian-stft_abs` cells produced byte-identical diagnostics; the headline ref × view comparisons (bipolar vs shaft-Lap; HG vs multi-band) were untested. Pivoted to `scripts/neuroprobe/preprocess_views.py` which factors `(reference, view)` into discrete primitives. Wrapper gains `--backend {upstream, neuralset}` flag; upstream backend stays default for byte-compat with L.1 N1 baseline. Tier-A grid (3 ref × 3 view = 9 distinct cells) re-dispatched 2026-05-06.
 
+> **2026-05-09 — L.2 FROZEN at R4×I2 (`shaft_laplacian × stft_abs`, upstream parity).** Full Tier-A 9-cell ranking on 12 sessions × 15 tasks = 180 rows/cell, bootstrap N=2000:
+>
+> | rank | cell | recipe | mean | CI | Δ vs baseline |
+> |---|---|---|---|---|---|
+> | 1 | R3×I2 | bipolar × stft_abs | 0.6157 | [0.597, 0.636] | +0.0025 |
+> | 2 | **R4×I2** | **shaftLap × stft_abs [D.0 baseline]** | **0.6132** | **[0.595, 0.633]** | **+0.0000** |
+> | 3 | R0×I2 | raw × stft_abs | 0.5923 | [0.576, 0.611] | −0.0209 |
+> | 4 | R3×I3 | bipolar × HG envelope | 0.5893 | [0.573, 0.607] | −0.0239 |
+> | 5 | R4×I3 | shaftLap × HG envelope | 0.5868 | [0.570, 0.604] | −0.0264 |
+> | 6 | R0×I3 | raw × HG envelope | 0.5743 | [0.560, 0.590] | −0.0389 |
+> | 7 | R0×I0 | raw × voltage | 0.5534 | [0.543, 0.564] | −0.0598 |
+> | 8 | R3×I0 | bipolar × voltage | 0.5516 | [0.542, 0.563] | −0.0616 |
+> | 9 | R4×I0 | shaftLap × voltage | 0.5498 | [0.540, 0.560] | −0.0634 |
+>
+> **Decision tree application** (rule 2): top cell R3×I2 ties baseline R4×I2 (Δ = +0.0025, CI overlap, NOT load-bearing at 0.02 threshold). Default to upstream-parity → **R4×I2**. (Bipolar tie carried into Tier-C as the CrossSubject contrast.)
+>
+> **Headline** (rule 3 fires): view marginal Δ = 0.555 [I2=0.6071, I0=0.5516] swamps reference marginal Δ = 0.0122 [R3=0.5855, R0=0.5733] by 4.5×. *View matters; reference does not.* For v14 architectural design, this shifts complexity budget from reference design (Laplacian/bipolar/CAR variants) to spectral feature design (STFT/HG/multi-band/wavelet/learned tokenizer).
+>
+> **Spectral floor**: all three I0 (raw voltage) cells cluster at 0.55, separated from the I2/I3 cluster (0.59–0.62) by a clear gap. Linear readout cannot extract speech-relevant structure from raw voltage at this scale; spectral pre-tokenization is load-bearing for the linear baseline (consistent with Neuroprobe's "Linear (Lap+spec) 0.611" finding).
+>
+> **Interaction residuals**: max |residual| = 0.0092 < 0.01 → main-effect story holds; no hidden ref × view non-additivity.
+>
+> **Architectural consequences for v14**:
+> - Stage-1 input-view contract: `stft_abs` (or richer learnable spectral). Raw voltage tokens cannot be the only input view.
+> - Reference choice not load-bearing for linear readout — defer R-design complexity until non-linear backbone is in place. Stage-1 default = `shaft_laplacian` (upstream parity).
+> - Three I0 cells at 0.55 = reviewer-defensible floor: linear-on-raw is genuinely weak. Architecture's job is to do better than spectral-pretokenizer-on-linear, not better than linear-on-raw.
+>
+> **Tag-along sweeps dispatched 2026-05-09** (gated on L.1 + L.2 winners):
+> - **Tier-C CrossSubject parity** (20 jobs, `reports/neuroprobe_stage0_tier_c_cross_subject_2026_05_09/`): C.1 = N1 + R4×I2 (baseline at CrossSubject); C.2 = N1 + R3×I2 (does the bipolar tie hold at distribution shift?). 11 BT-Lite sessions × 2 cells, sub2 excluded (DS_DM_TRAIN_SUBJECT_ID).
+> - **L.4 anchor sanity** (24 jobs, `reports/neuroprobe_stage0_l4_anchor_2026_05_09/`): A.0 = baseline [0, 1]s, A.1 = lead [-0.375, +0.625]s on N1 + R4×I2. Tests whether anchor window choice has hidden interaction with the chosen recipe.
+> - **L.4 norm × view interaction** (96 jobs, `reports/neuroprobe_stage0_l4_norm_view_interaction_2026_05_09/`): refs={shaft_laplacian, bipolar} × views={stft_abs, hg_envelope} × norms={train_set_fixed, train_set_scale_only}. 8 cells × 12 sessions. Tests whether the greedy hill-climb's independence assumption is safe.
+>
+> Artifacts: `reports/neuroprobe_stage0_l2_neuralset_2026_05_06/{freeze_analysis.md, freeze_analysis.json, cell_ci_forest.png, factor_marginals.png, paired_tests.csv}`.
+
 Two crossed axes. Reference transform changes the measurement operator (`y' = R y = R L s + R c + R noise`); input view changes which signal property is exposed.
 
 Reference (rows):
