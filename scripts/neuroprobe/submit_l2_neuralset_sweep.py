@@ -54,6 +54,7 @@ VIEWS_TIER_B: tuple[tuple[str, str], ...] = (
     ("I3W", "hg_envelope_wide"),
     ("I4", "multi_band_log_power"),
     ("I5", "wavelet_db4"),
+    ("I6", "instantaneous_phase"),
 )
 REFERENCES_ALL = REFERENCES_TIER_A + REFERENCES_TIER_B
 VIEWS_ALL = VIEWS_TIER_A + VIEWS_TIER_B

@@ -62,6 +62,7 @@ VIEWS: tuple[str, ...] = (
     "low_lfp",
     "multi_band_log_power",
     "wavelet_db4",
+    "instantaneous_phase",
 )
 
 
@@ -152,6 +153,8 @@ def apply_view(
         return _multi_band_log_power(data, sampling_rate)
     if view_kind == "wavelet_db4":
         return _wavelet_db4(data, sampling_rate)
+    if view_kind == "instantaneous_phase":
+        return _instantaneous_phase(data, sampling_rate)
     raise ValueError(f"Unknown view_kind: {view_kind}")
 
 
@@ -303,6 +306,27 @@ def _wavelet_db4(data: torch.Tensor, sampling_rate: int) -> torch.Tensor:
             coeffs = pywt.wavedec(arr[b, c], "db4", level=n_levels)
             for k, coef in enumerate(coeffs):
                 feats[b, c, k] = np.log(np.mean(coef ** 2) + 1e-12)
+    return torch.from_numpy(feats)
+
+
+def _instantaneous_phase(data: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+    """Theta-band (4-8 Hz) instantaneous phase, summarized per channel.
+
+    Bandpass to theta + Hilbert -> instantaneous phase phi(t). For a linear
+    readout with fixed feature-dim per channel, summarize as
+    (mean cos(phi), mean sin(phi)) — these are the real and imaginary parts
+    of the time-averaged complex phase, magnitude = within-window PLV proxy.
+    Output shape (B, C, 2).
+    """
+    arr = data.detach().cpu().numpy().astype(np.float64)
+    nyq = 0.5 * sampling_rate
+    sos = signal.butter(4, [4.0 / nyq, 8.0 / nyq], btype="band", output="sos")
+    filtered = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
+    analytic = np.asarray(signal.hilbert(filtered, axis=-1))
+    phase = np.angle(analytic)
+    cos_mean = np.cos(phase).mean(axis=-1)
+    sin_mean = np.sin(phase).mean(axis=-1)
+    feats = np.stack([cos_mean, sin_mean], axis=-1).astype(np.float32)
     return torch.from_numpy(feats)
 
 

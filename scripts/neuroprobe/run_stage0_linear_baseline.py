@@ -577,6 +577,7 @@ def _parse_args() -> argparse.Namespace:
             "raw_voltage", "stft_abs", "hg_envelope",
             "log_stft", "hg_envelope_wide", "low_lfp",
             "multi_band_log_power", "wavelet_db4",
+            "instantaneous_phase",
         ),
         default="stft_abs",
         help="Input view (only used when --backend=neuralset).",
