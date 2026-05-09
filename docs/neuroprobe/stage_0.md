@@ -493,6 +493,11 @@ Run on the chosen view from each sweep. **Used as kill criteria, not for selecti
 | L.5.P6 | channel-shuffled-per-subject | KILL: cross-subject task accuracy must drop substantially; if not, channel-order shortcut |
 | L.5.P7 | movie-time / block-order from features | flag if above chance + 0.10 |
 | L.5.P8 | 60 Hz residual power post-notch | flag if median residual > floor by > 6 dB; bad notch / wrong harmonic set |
+| L.5.P9 | acoustic-leakage: linear regression of stim envelope / pitch / Whisper-large-v3 L8 pooled features from response-window features | KILL the `L_DSigLIP` premise: if held-out R² > 0.5 on Whisper-L8 regression, brain↔FM contrastive is decorative — linear already solves the alignment. Flag at R² > 0.2 (architecture must justify what the contrastive loss adds beyond linear). v14-load-bearing. |
+| L.5.P10 | per-band identity leakage: P1 (subject-id) re-run on each frequency band of `multi_band_log_power` view in isolation (delta / theta / alpha / beta / gamma / HG) | Diagnostic only (not kill): identifies which band carries the subject-ID leak. Informs v14's per-band weighting / suppression. Run only if `multi_band_log_power` becomes a v14 tokenizer candidate. |
+| L.5.P11 | label-permutation null: train logistic on shuffled task labels at the chosen view | KILL: held-out AUROC must be ≤ chance + 0.02 across 3 permutation seeds. Anything above flags a CV / split-leakage bug in the pipeline. Cheap sanity floor. |
+
+P9 is the architecturally load-bearing one for v14 — it directly tests whether `L_DSigLIP` (brain ↔ frozen Whisper-large-v3 L8) is solving a problem the linear baseline can already solve. Spec it now while linear infrastructure is still hot; running it post-architecture is more expensive. P10 is conditional on `multi_band_log_power` winning L.2 Phase B. P11 is universal sanity.
 
 #### L.6 — Deferred Tier-2 (post-Stage-0 close, only if budget permits)
 
@@ -576,7 +581,7 @@ Stage 0 closes when:
 - The Stage-1 reference transform is decided from L.2, with explicit notes on R0/R1/R2/R3/R4 deltas and WM-rejection treatment.
 - The Stage-1 filtering and bad-channel mask is decided from L.3.
 - The Stage-1 anchor-robustness ablation is marked mandatory or optional from L.4.
-- L.5 diagnostic probes have run on each Sweep winner, and no chosen view fails the L.5.P1/P2/P6 kill criteria.
+- L.5 diagnostic probes have run on each Sweep winner, and no chosen view fails the L.5.P1/P2/P6/P9/P11 kill criteria. P9 (acoustic-leakage) is gated on the chosen view from L.2 and is v14-load-bearing; if it fails, the `L_DSigLIP` premise must be reframed before Stage-2 dispatch. P10 runs only if `multi_band_log_power` becomes a v14 tokenizer candidate.
 - L.0 prerequisites have all landed: `Experiment` inherits `BaseExperiment`, exca cache folder is set on DCC, `DeriveLabelIndices` `EventsTransform` is wired into a `ns.Chain`, the linear baseline wrapper writes `ExperimentLogger` sidecars, and `CARIeegExtractor` + `ShaftCARIeegExtractor` exist.
 - Neuroprobe-Lite temporal sampling behavior is verified from code, not assumed from review-thread claims.
 - The Stage-1 split contract is written down: multiclass default, pooled multi-source cross-subject generalization default, S2-only cross-subject parity cell, and Lite-120 electrode cap parity-only.
