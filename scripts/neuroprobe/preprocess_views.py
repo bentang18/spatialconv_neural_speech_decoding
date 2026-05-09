@@ -51,11 +51,17 @@ REFERENCES: tuple[str, ...] = (
     "shaft_laplacian",
     "global_car",
     "shaft_car",
+    "median",
 )
 VIEWS: tuple[str, ...] = (
     "raw_voltage",
     "stft_abs",
     "hg_envelope",
+    "log_stft",
+    "hg_envelope_wide",
+    "low_lfp",
+    "multi_band_log_power",
+    "wavelet_db4",
 )
 
 
@@ -106,6 +112,8 @@ def apply_reference(
         return _global_car(data, electrode_labels)
     if ref_kind == "shaft_car":
         return _shaft_car(data, electrode_labels)
+    if ref_kind == "median":
+        return _median_reference(data, electrode_labels)
     raise ValueError(f"Unknown ref_kind: {ref_kind}")
 
 
@@ -127,7 +135,23 @@ def apply_view(
             preprocess="stft_abs", preprocess_parameters=params,
         )
     if view_kind == "hg_envelope":
-        return _hg_envelope(data, sampling_rate)
+        return _hg_envelope(data, sampling_rate, lo_hz=70.0, hi_hz=150.0)
+    if view_kind == "log_stft":
+        upstream_stft: Callable[..., torch.Tensor] = upstream_helpers["stft"]
+        params = upstream_helpers["stft_params"]
+        x = upstream_stft(
+            data, sampling_rate=sampling_rate,
+            preprocess="stft_abs", preprocess_parameters=params,
+        )
+        return torch.log(x + 1e-6)
+    if view_kind == "hg_envelope_wide":
+        return _hg_envelope(data, sampling_rate, lo_hz=70.0, hi_hz=200.0)
+    if view_kind == "low_lfp":
+        return _low_lfp(data, sampling_rate)
+    if view_kind == "multi_band_log_power":
+        return _multi_band_log_power(data, sampling_rate)
+    if view_kind == "wavelet_db4":
+        return _wavelet_db4(data, sampling_rate)
     raise ValueError(f"Unknown view_kind: {view_kind}")
 
 
@@ -198,20 +222,88 @@ def _shaft_car(
     return out, list(electrode_labels)
 
 
-def _hg_envelope(data: torch.Tensor, sampling_rate: int) -> torch.Tensor:
-    """70-150 Hz bandpass + Hilbert envelope, per channel.
+def _hg_envelope(
+    data: torch.Tensor, sampling_rate: int, *, lo_hz: float = 70.0, hi_hz: float = 150.0
+) -> torch.Tensor:
+    """Bandpass + Hilbert envelope, per channel. Default 70-150 Hz HG; 70-200 for wide.
 
     Output shape: (B, C, T) — same length as input, raw envelope (no log,
     no downsample) so the downstream flatten doesn't change dimension.
-    Stage 1 will likely add log / downsample as a separate transform cell.
     """
     arr = data.detach().cpu().numpy().astype(np.float64)
     nyq = 0.5 * sampling_rate
-    sos = signal.butter(4, [70.0 / nyq, 150.0 / nyq], btype="band", output="sos")
+    sos = signal.butter(4, [lo_hz / nyq, hi_hz / nyq], btype="band", output="sos")
     filtered = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
     analytic = np.asarray(signal.hilbert(filtered, axis=-1))
     env = np.abs(analytic).astype(np.float32)
     return torch.from_numpy(env)
+
+
+def _median_reference(
+    data: torch.Tensor, electrode_labels: list[str]
+) -> tuple[torch.Tensor, list[str]]:
+    """Subtract per-timepoint median across electrodes (MVPFormer 2026 ICLR)."""
+    return data - data.median(dim=1, keepdim=True).values, list(electrode_labels)
+
+
+def _low_lfp(data: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+    """Low-LFP (< 30 Hz) bandpass, per channel. Output shape (B, C, T)."""
+    arr = data.detach().cpu().numpy().astype(np.float64)
+    nyq = 0.5 * sampling_rate
+    sos = signal.butter(4, [1.0 / nyq, 30.0 / nyq], btype="band", output="sos")
+    filtered = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1)).astype(np.float32)
+    return torch.from_numpy(filtered)
+
+
+_MULTI_BANDS: tuple[tuple[float, float], ...] = (
+    (1.0, 4.0),     # delta
+    (4.0, 8.0),     # theta
+    (8.0, 13.0),    # alpha
+    (13.0, 30.0),   # beta
+    (30.0, 70.0),   # gamma
+    (70.0, 150.0),  # high-gamma
+)
+
+
+def _multi_band_log_power(data: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+    """6-band log-power (delta, theta, alpha, beta, gamma, HG).
+
+    Per band: 4th-order Butterworth bandpass + Hilbert envelope + log + per-channel
+    mean over time. Output shape (B, C, n_bands).
+    """
+    arr = data.detach().cpu().numpy().astype(np.float64)
+    nyq = 0.5 * sampling_rate
+    band_powers: list[np.ndarray] = []
+    for lo_hz, hi_hz in _MULTI_BANDS:
+        sos = signal.butter(4, [lo_hz / nyq, hi_hz / nyq], btype="band", output="sos")
+        filtered = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
+        analytic = np.asarray(signal.hilbert(filtered, axis=-1))
+        env = np.abs(analytic)
+        log_power = np.log(env + 1e-6).mean(axis=-1)
+        band_powers.append(log_power)
+    feats = np.stack(band_powers, axis=-1).astype(np.float32)
+    return torch.from_numpy(feats)
+
+
+def _wavelet_db4(data: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+    """db4 multi-resolution wavelet decomposition (MVPFormer 2026 ICLR).
+
+    Per channel: pywt.wavedec at level=6 with db4 wavelet, gives 7 coefficient
+    arrays (1 approx + 6 details). For linear-readout fairness with STFT, we
+    return per-band log-energy summary: log(mean(|coef|^2)). Output shape
+    (B, C, n_levels+1) = (B, C, 7).
+    """
+    import pywt
+    arr = data.detach().cpu().numpy().astype(np.float64)
+    B, C, T = arr.shape
+    n_levels = 6
+    feats = np.zeros((B, C, n_levels + 1), dtype=np.float32)
+    for b in range(B):
+        for c in range(C):
+            coeffs = pywt.wavedec(arr[b, c], "db4", level=n_levels)
+            for k, coef in enumerate(coeffs):
+                feats[b, c, k] = np.log(np.mean(coef ** 2) + 1e-12)
+    return torch.from_numpy(feats)
 
 
 def make_upstream_helpers(

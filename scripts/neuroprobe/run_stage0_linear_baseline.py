@@ -567,13 +567,17 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--ref-kind",
-        choices=("raw", "bipolar", "shaft_laplacian", "global_car", "shaft_car"),
+        choices=("raw", "bipolar", "shaft_laplacian", "global_car", "shaft_car", "median"),
         default="shaft_laplacian",
         help="Spatial reference (only used when --backend=neuralset).",
     )
     p.add_argument(
         "--view-kind",
-        choices=("raw_voltage", "stft_abs", "hg_envelope"),
+        choices=(
+            "raw_voltage", "stft_abs", "hg_envelope",
+            "log_stft", "hg_envelope_wide", "low_lfp",
+            "multi_band_log_power", "wavelet_db4",
+        ),
         default="stft_abs",
         help="Input view (only used when --backend=neuralset).",
     )

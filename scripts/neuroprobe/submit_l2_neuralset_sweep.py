@@ -38,11 +38,25 @@ REFERENCES_TIER_A: tuple[tuple[str, str], ...] = (
     ("R3", "bipolar"),
     ("R4", "shaft_laplacian"),
 )
+REFERENCES_TIER_B: tuple[tuple[str, str], ...] = (
+    ("R1", "global_car"),
+    ("R2", "shaft_car"),
+    ("R5", "median"),
+)
 VIEWS_TIER_A: tuple[tuple[str, str], ...] = (
     ("I0", "raw_voltage"),
     ("I2", "stft_abs"),
     ("I3", "hg_envelope"),
 )
+VIEWS_TIER_B: tuple[tuple[str, str], ...] = (
+    ("I1", "low_lfp"),
+    ("I2L", "log_stft"),
+    ("I3W", "hg_envelope_wide"),
+    ("I4", "multi_band_log_power"),
+    ("I5", "wavelet_db4"),
+)
+REFERENCES_ALL = REFERENCES_TIER_A + REFERENCES_TIER_B
+VIEWS_ALL = VIEWS_TIER_A + VIEWS_TIER_B
 
 
 def cell_id(ref_code: str, view_code: str) -> str:
@@ -62,7 +76,7 @@ def build_cells(
     ref_filter: list[str] | None, view_filter: list[str] | None
 ) -> list[L2Cell]:
     cells: list[L2Cell] = []
-    for (rc, rk), (vc, vk) in product(REFERENCES_TIER_A, VIEWS_TIER_A):
+    for (rc, rk), (vc, vk) in product(REFERENCES_ALL, VIEWS_ALL):
         if ref_filter and rc not in ref_filter and rk not in ref_filter:
             continue
         if view_filter and vc not in view_filter and vk not in view_filter:
