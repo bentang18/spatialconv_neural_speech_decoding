@@ -386,12 +386,35 @@ Headline: gap between L.1.N0 and L.1.N1 averaged across tasks. Anything above ~0
 > - Reference choice not load-bearing for linear readout — defer R-design complexity until non-linear backbone is in place. Stage-1 default = `shaft_laplacian` (upstream parity).
 > - Three I0 cells at 0.55 = reviewer-defensible floor: linear-on-raw is genuinely weak. Architecture's job is to do better than spectral-pretokenizer-on-linear, not better than linear-on-raw.
 >
-> **Tag-along sweeps dispatched 2026-05-09** (gated on L.1 + L.2 winners):
-> - **Tier-C CrossSubject parity** (20 jobs, `reports/neuroprobe_stage0_tier_c_cross_subject_2026_05_09/`): C.1 = N1 + R4×I2 (baseline at CrossSubject); C.2 = N1 + R3×I2 (does the bipolar tie hold at distribution shift?). 11 BT-Lite sessions × 2 cells, sub2 excluded (DS_DM_TRAIN_SUBJECT_ID).
-> - **L.4 anchor sanity** (24 jobs, `reports/neuroprobe_stage0_l4_anchor_2026_05_09/`): A.0 = baseline [0, 1]s, A.1 = lead [-0.375, +0.625]s on N1 + R4×I2. Tests whether anchor window choice has hidden interaction with the chosen recipe.
-> - **L.4 norm × view interaction** (96 jobs, `reports/neuroprobe_stage0_l4_norm_view_interaction_2026_05_09/`): refs={shaft_laplacian, bipolar} × views={stft_abs, hg_envelope} × norms={train_set_fixed, train_set_scale_only}. 8 cells × 12 sessions. Tests whether the greedy hill-climb's independence assumption is safe.
+> **2026-05-10 — L.2 EXHAUSTIVE 24-cell ranking lands; freeze HOLDS at R4×I2.** Full Tier-A + Tier-B + I6 sweep on 12 sessions × 15 tasks, bootstrap N=2000:
 >
-> Artifacts: `reports/neuroprobe_stage0_l2_neuralset_2026_05_06/{freeze_analysis.md, freeze_analysis.json, cell_ci_forest.png, factor_marginals.png, paired_tests.csv}`.
+> | rank | cell | recipe | mean | CI |
+> |---|---|---|---|---|
+> | 1 | R3×I2 | bipolar × stft_abs | 0.6157 | [0.598, 0.635] |
+> | 2 | R4×I2L | shaftLap × log-STFT | 0.6150 | [0.597, 0.636] |
+> | 3 | R2×I2 | shaftCAR × stft_abs | 0.6138 | [0.596, 0.633] |
+> | 4 | **R4×I2** ★ | **shaftLap × stft_abs [D.0 baseline]** | **0.6132** | [0.594, 0.633] |
+> | 5 | R1×I2 | globalCAR × stft_abs | 0.6111 | [0.593, 0.631] |
+> | 6 | R5×I2 | median × stft_abs | 0.6016 | [0.584, 0.620] |
+> | 7 | R4×I3W | shaftLap × wide-HG (70-250) | 0.5924 | [0.575, 0.610] |
+> | 13 | R4×I4 | shaftLap × multi-band log-power | 0.5793 | [0.563, 0.597] |
+> | 15 | R4×I5 | shaftLap × wavelet | 0.5766 | [0.561, 0.595] |
+> | 23 | R4×I1 | shaftLap × low-LFP (<30 Hz) | 0.5243 | [0.517, 0.532] |
+> | 24 | R4×I6 | shaftLap × theta-band phase | 0.5004 | [0.498, 0.503] |
+>
+> **Top-5 cells are all I2-family** (stft_abs / log-STFT) regardless of reference — confirms "view dominates reference" at greater scale. **R4×I2L (log-STFT) ties baseline at +0.0018 — well below 0.02 threshold; freeze holds.** **R4×I3W (wide HG 70-250 Hz) +0.0055 over standard R4×I3** — modest improvement, not architecture-changing. **R4×I4 multi-band and R4×I5 wavelet *underperform* stft_abs** — spectral richness ≠ better; STFT magnitude already captures what's needed for linear. **R4×I6 (theta phase) = chance (0.500)**: phase-only features carry zero linear signal; phase encoders dead unless paired with magnitude. **R4×I1 (<30 Hz LFP) = 0.524**: speech-relevant signal does not live below 30 Hz.
+>
+> Full ranking: `reports/neuroprobe_stage0_l2_exhaustive_2026_05_09/freeze_analysis.md`.
+>
+> **Tag-along sweeps dispatched 2026-05-09** (gated on L.1 + L.2 winners):
+> - **Tier-C CrossSubject parity** (`reports/neuroprobe_stage0_tier_c_cross_subject_2026_05_09/`): C.1 = N1 + R4×I2 (baseline at CrossSubject); C.2 = N1 + R3×I2 (does the bipolar tie hold at distribution shift?). 11 BT-Lite sessions × 2 cells, sub2 excluded.
+>   - **C.1 status (2026-05-10)**: 10/10 OOM at 24G, re-dispatched at 64G mem.
+>   - **C.2 status (2026-05-10) — KNOWN ISSUE**: bipolar reference + CrossSubject hits upstream `combine_regions()` IndexError because bipolar virtual channel counts differ across subjects (mask sized from one subject doesn't match another). 1× OOM + 9× IndexError. C.2 is parked pending a wrapper-side fix to rebuild the DK-region mask per-subject when ref_kind="bipolar". Bipolar tie at CrossSession remains untested at CrossSubject distribution shift.
+> - **L.4 anchor sanity** (`reports/neuroprobe_stage0_l4_anchor_2026_05_09/`): A.0 = baseline [0, 1]s, A.1 = lead [-0.375, +0.625]s on N1 + R4×I2. **Status (2026-05-10)**: 15/24 done; 9 OOM/exit-1 jobs re-dispatched at 64G.
+> - **L.4 norm × view interaction** (96 jobs, `reports/neuroprobe_stage0_l4_norm_view_interaction_2026_05_09/`): refs={shaft_laplacian, bipolar} × views={stft_abs, hg_envelope} × norms={train_set_fixed, train_set_scale_only}. 8 cells × 12 sessions. **VERDICT (2026-05-10): greedy hill-climb safe.** Max interaction |residual| = 0.0008 across all 8 cells — refs, views, and norm act as nearly independent factors. Stage-1 contract (L.1 N1 + L.2 R4×I2 + L.3 winner + L.4 robustness) is robust to interaction effects. Artifact: `interaction_analysis.md`.
+> - **L.2 seed43/seed44** (24 jobs total): seed-variance reruns of L.2 winner R4×I2 at seed 43/44. **Status (2026-05-10)**: 14/24 done; 10 OOM jobs re-dispatched at 64G.
+>
+> Artifacts: `reports/neuroprobe_stage0_l2_exhaustive_2026_05_09/{freeze_analysis.md, freeze_analysis.json, cell_ci_forest.png, factor_marginals.png, paired_tests.csv, aggregate_summary_by_cell.csv}` (24-cell exhaustive); `reports/neuroprobe_stage0_l2_neuralset_2026_05_06/` (original 9-cell Tier-A frozen).
 
 Two crossed axes. Reference transform changes the measurement operator (`y' = R y = R L s + R c + R noise`); input view changes which signal property is exposed.
 

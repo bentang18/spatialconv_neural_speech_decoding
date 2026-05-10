@@ -44,26 +44,47 @@ CELL_LABEL: dict[str, str] = {
     "L.2.R0xI0": "raw × voltage",
     "L.2.R0xI2": "raw × stft_abs",
     "L.2.R0xI3": "raw × HG envelope",
+    "L.2.R1xI0": "globalCAR × voltage",
+    "L.2.R1xI2": "globalCAR × stft_abs",
+    "L.2.R1xI3": "globalCAR × HG envelope",
+    "L.2.R2xI0": "shaftCAR × voltage",
+    "L.2.R2xI2": "shaftCAR × stft_abs",
+    "L.2.R2xI3": "shaftCAR × HG envelope",
     "L.2.R3xI0": "bipolar × voltage",
     "L.2.R3xI2": "bipolar × stft_abs",
     "L.2.R3xI3": "bipolar × HG envelope",
     "L.2.R4xI0": "shaftLap × voltage",
+    "L.2.R4xI1": "shaftLap × low-LFP",
     "L.2.R4xI2": "shaftLap × stft_abs [D.0 baseline]",
+    "L.2.R4xI2L": "shaftLap × log-STFT",
     "L.2.R4xI3": "shaftLap × HG envelope (privileged)",
-    "L.2.R3xI4": "bipolar × multi-band (legacy)",
-    "L.2.R4xI4": "shaftLap × multi-band (legacy)",
-    "L.2.R4xI5": "shaftLap × wavelet (legacy)",
+    "L.2.R4xI3W": "shaftLap × wide-HG (70-250)",
+    "L.2.R4xI4": "shaftLap × multi-band log-power",
+    "L.2.R4xI5": "shaftLap × wavelet",
+    "L.2.R4xI6": "shaftLap × theta-phase",
+    "L.2.R5xI0": "median × voltage",
+    "L.2.R5xI2": "median × stft_abs",
+    "L.2.R5xI3": "median × HG envelope",
 }
 
 REF_LABEL: dict[str, str] = {
     "R0": "raw",
+    "R1": "global CAR",
+    "R2": "shaft CAR",
     "R3": "bipolar (adjacent within-shaft)",
     "R4": "shaft Laplacian",
+    "R5": "median",
 }
 VIEW_LABEL: dict[str, str] = {
     "I0": "raw voltage",
+    "I1": "low-LFP (<30 Hz)",
     "I2": "STFT magnitude",
+    "I2L": "log STFT",
     "I3": "HG envelope (70-150 Hz)",
+    "I3W": "wide HG (70-250 Hz)",
+    "I4": "multi-band log-power",
+    "I5": "wavelet",
+    "I6": "theta-band phase",
 }
 
 
@@ -79,14 +100,20 @@ def main() -> None:
     if "cell" not in df.columns:
         raise SystemExit("aggregate_diagnostics.csv missing 'cell' column")
 
-    # Restrict to Tier-A cells (skip legacy degenerate I4/I5 rows if present).
-    tier_a = sorted(c for c in df["cell"].unique() if _is_tier_a(c))
-    if not tier_a:
-        raise SystemExit("No Tier-A L.2 cells found in diagnostics.")
+    if args.tier_a_only:
+        tier_a = sorted(c for c in df["cell"].unique() if _is_tier_a(c))
+        if not tier_a:
+            raise SystemExit("No Tier-A L.2 cells found in diagnostics.")
+    else:
+        tier_a = sorted(
+            c for c in df["cell"].unique() if isinstance(c, str) and c.startswith("L.2.R")
+        )
+        if not tier_a:
+            raise SystemExit("No L.2 cells found in diagnostics.")
     df_a = cast(pd.DataFrame, df[df["cell"].isin(tier_a)]).copy()
     cell_series = df_a["cell"].astype(str)
     df_a["ref_code"] = cell_series.str.extract(r"L\.2\.(R\d+)x")[0]
-    df_a["view_code"] = cell_series.str.extract(r"x(I\d+)$")[0]
+    df_a["view_code"] = cell_series.str.extract(r"x(I\d+[A-Z]*)$")[0]
 
     ci = bootstrap_cis(df_a, tier_a)
     paired = paired_tests(df_a, tier_a)
@@ -354,11 +381,16 @@ def build_payload(
 
 
 def render_markdown(payload: dict[str, Any]) -> str:
-    lines: list[str] = ["# L.2 Freeze Analysis (Tier A)", ""]
+    n_cells = payload.get("n_cells")
+    title = (
+        "# L.2 Freeze Analysis (Tier A)" if n_cells == 9
+        else f"# L.2 Freeze Analysis ({n_cells} cells, exhaustive)"
+    )
+    lines: list[str] = [title, ""]
 
     n_sess = payload.get("n_sessions")
     lines.append(
-        f"Tier-A grid: 3 references × 3 views = 9 cells. "
+        f"Grid: {n_cells} cells. "
         f"{n_sess if n_sess is not None else 'N/A'} sessions × 15 tasks per cell."
     )
     lines.append("")
@@ -472,6 +504,11 @@ def render_markdown(payload: dict[str, Any]) -> str:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sweep-root", type=Path, required=True)
+    p.add_argument(
+        "--tier-a-only", action="store_true",
+        help="Restrict analysis to Tier-A cells (R0/R3/R4 × I0/I2/I3). "
+             "Default: analyze all L.2.R*xI* cells present.",
+    )
     return p.parse_args()
 
 
