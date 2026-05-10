@@ -330,6 +330,42 @@ def _instantaneous_phase(data: torch.Tensor, sampling_rate: int) -> torch.Tensor
     return torch.from_numpy(feats)
 
 
+def apply_temporal_filter_inplace(
+    tensor: torch.Tensor,
+    *,
+    sampling_rate: int,
+    notch_freqs: tuple[float, ...] = (),
+    notch_q: float = 30.0,
+    hpf_hz: float = 0.0,
+    hpf_order: int = 4,
+) -> None:
+    """In-place IIR notch + Butterworth HPF on a session-length voltage tensor.
+
+    Operates on tensors of shape (C, T) — the canonical
+    `subject.neural_data_cache[trial_id]` layout. Applied to the FULL session
+    voltage *before* trial windowing so 0.5/1 Hz HPF cutoffs (period 1-2 s)
+    have enough samples to escape filtfilt edge artifacts that would otherwise
+    dominate a 1-s windowed slice. Notch + HPF are stable IIR sections and
+    apply per-channel via `sosfiltfilt` (zero-phase).
+
+    No-op when both `notch_freqs` is empty and `hpf_hz <= 0`.
+    """
+    if not notch_freqs and hpf_hz <= 0:
+        return
+    arr = tensor.detach().cpu().numpy().astype(np.float64)
+    nyq = 0.5 * sampling_rate
+    for f0 in notch_freqs:
+        if f0 <= 0 or f0 >= nyq:
+            continue
+        b, a = signal.iirnotch(f0 / nyq, notch_q)
+        sos = signal.tf2sos(b, a)
+        arr = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
+    if hpf_hz > 0:
+        sos = signal.butter(hpf_order, hpf_hz / nyq, btype="highpass", output="sos")
+        arr = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
+    tensor.copy_(torch.from_numpy(arr.astype(np.float32)))
+
+
 def make_upstream_helpers(
     preprocess_stft: Callable[..., torch.Tensor],
     laplacian_rereference_neural_data: Callable[..., Any],

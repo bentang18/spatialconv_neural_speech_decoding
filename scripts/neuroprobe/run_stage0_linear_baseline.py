@@ -95,10 +95,11 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    cell_id = NORMALIZATION_CELLS[args.normalization]
+    cell_id = args.cell_id or NORMALIZATION_CELLS[args.normalization]
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    notch_freqs = _parse_notch_freqs(args.notch_freqs)
     config = {
         "upstream_repo_url": UPSTREAM_REPO_URL,
         "upstream_commit": UPSTREAM_COMMIT,
@@ -115,6 +116,9 @@ def main() -> None:
         "normalization": args.normalization,
         "normalization_cell": cell_id,
         "normalization_description": NORMALIZATION_DESCRIPTIONS[args.normalization],
+        "notch_freqs": list(notch_freqs),
+        "hpf_hz": float(args.hpf_hz),
+        "cell_id": cell_id,
         "seed": args.seed,
     }
 
@@ -219,6 +223,22 @@ def run_eval(
     t0 = time.time()
     subject.load_neural_data(args.trial_id)
     print(f"[load] subject {args.subject_id} trial {args.trial_id} in {time.time() - t0:.1f}s")
+
+    notch_freqs = _parse_notch_freqs(getattr(args, "notch_freqs", ""))
+    hpf_hz = float(getattr(args, "hpf_hz", 0.0))
+    if notch_freqs or hpf_hz > 0:
+        from preprocess_views import apply_temporal_filter_inplace  # noqa: PLC0415
+        sr = int(nconfig.SAMPLING_RATE)
+        t1 = time.time()
+        apply_temporal_filter_inplace(
+            subject.neural_data_cache[args.trial_id],
+            sampling_rate=sr, notch_freqs=tuple(notch_freqs), hpf_hz=hpf_hz,
+        )
+        print(
+            f"[L.3] filter notch={list(notch_freqs)} hpf={hpf_hz}Hz "
+            f"applied to subject {args.subject_id} trial {args.trial_id} "
+            f"in {time.time() - t1:.1f}s"
+        )
 
     rows: list[dict[str, Any]] = []
     qc_payload: dict[str, Any] | None = None
@@ -506,6 +526,12 @@ def _per_channel_train_set_z(
     return Xtr.reshape(X_train.shape[0], -1), Xte.reshape(X_test.shape[0], -1)
 
 
+def _parse_notch_freqs(spec: str) -> tuple[float, ...]:
+    if not spec:
+        return ()
+    return tuple(float(x.strip()) for x in spec.split(",") if x.strip())
+
+
 def _subsample(X: np.ndarray, n: int) -> np.ndarray:
     flat = np.asarray(X).reshape(-1)
     if flat.size <= n:
@@ -559,13 +585,17 @@ def write_readme(
     cell_id: str,
     args: argparse.Namespace,
 ) -> None:
+    notch = getattr(args, "notch_freqs", "") or "(none)"
+    hpf = getattr(args, "hpf_hz", 0.0)
     lines = [
-        f"# Neuroprobe Stage 0 L.1 Linear Baseline — {cell_id}",
+        f"# Neuroprobe Stage 0 Linear Baseline — {cell_id}",
         "",
-        f"- recipe: `{args.normalization}` ({NORMALIZATION_DESCRIPTIONS[args.normalization]})",
+        f"- normalization: `{args.normalization}` ({NORMALIZATION_DESCRIPTIONS[args.normalization]})",
         f"- subject: {args.subject_id}, trial: {args.trial_id}, task: {args.task}",
         f"- split: {args.split_type}, binary: {args.binary_tasks}",
-        f"- preprocess: `{args.preprocess_type}`",
+        f"- preprocess: `{args.preprocess_type}` (backend={args.backend})",
+        f"- ref_kind: `{getattr(args, 'ref_kind', '-')}`  view_kind: `{getattr(args, 'view_kind', '-')}`",
+        f"- notch: `{notch}` Hz  hpf: `{hpf}` Hz",
         f"- mean test AUROC: {summary['mean_test_roc_auc']:.6f}",
         f"- mean test accuracy: {summary['mean_test_accuracy']:.6f}",
         "",
@@ -650,6 +680,24 @@ def _parse_args() -> argparse.Namespace:
         "--anchor-end-after", type=float, default=1.0,
         help="Seconds after word onset to include in feature window. "
              "Default = 1.0 (D.0 baseline). L.4 sanity = 0.625.",
+    )
+    p.add_argument(
+        "--notch-freqs", default="",
+        help="Comma-separated notch-filter frequencies in Hz (e.g. '60,120,180'). "
+             "Applied per-channel via zero-phase IIR notch on the FULL session "
+             "voltage before trial slicing. Empty = no notch (L.3.F0 default).",
+    )
+    p.add_argument(
+        "--hpf-hz", type=float, default=0.0,
+        help="High-pass filter cutoff in Hz (e.g. 0.5, 1.0). 4th-order Butterworth, "
+             "applied per-channel via zero-phase filtfilt on the FULL session voltage. "
+             "0.0 = no HPF (L.3.F0/F1 default). HPF on 1-s windowed slices is "
+             "mathematically broken at <2 Hz cutoffs — must be applied pre-window.",
+    )
+    p.add_argument(
+        "--cell-id", default=None,
+        help="Optional override for the L-cell ID written to ExperimentLogger "
+             "(e.g. 'L.3.F1'). Defaults to the L.1 cell derived from --normalization.",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reference-mean-auroc", type=float, default=None)
