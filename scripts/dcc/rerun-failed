@@ -53,13 +53,15 @@ fi
 failed_count=0
 relaunched_count=0
 
-for err in "${report_dir}"/slurm-*.err; do
-  [[ -e "${err}" ]] || continue
+while IFS= read -r err; do
   [[ -s "${err}" ]] || continue
   if grep -qE "oom-kill|out-of-memory|MemoryError|Killed|exceeded memory limit|Traceback|Exception" "${err}"; then
     failed_count=$((failed_count + 1))
     job_id="$(basename "${err}" .err)"; job_id="${job_id#slurm-}"
-    sbatch_script="${report_dir}/slurm-${job_id}.sbatch"
+    sbatch_script="$(dirname "${err}")/submit.sbatch"
+    if [[ ! -f "${sbatch_script}" ]]; then
+      sbatch_script="${report_dir}/slurm-${job_id}.sbatch"
+    fi
     if [[ ! -f "${sbatch_script}" ]]; then
       sbatch_script="$(grep -lE "JobID *${job_id}" "${report_dir}"/*.sbatch 2>/dev/null | head -1 || true)"
     fi
@@ -84,7 +86,7 @@ for err in "${report_dir}"/slurm-*.err; do
       fi
     fi
   fi
-done
+done < <(find "${report_dir}" -name "slurm-*.err" -size +0)
 
 echo "summary: ${failed_count} failed, ${relaunched_count} relaunched (dry_run=${dry_run})"
 '
