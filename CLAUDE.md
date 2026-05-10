@@ -18,6 +18,8 @@ PS/uECoG stage program **paused 2026-04-24**. Active work is the Neuroprobe cros
 - **NeuroAI substrate**: active path is `Study → Events DataFrame → Transforms/Chain → Segmenter → Dataset/DataLoader → NeuralTrain Experiment → Exca`. Custom code is guilty until proven necessary. Keep BNA/fsaverage/support logic, v14 parcel metadata, BrainTreebank labels/splits/leakage transforms, v14 architecture, and the ablation-log export adapter. **Do not** keep old loaders, old training loops, old sbatch tooling, or archived experiments in active import paths.
 - **Raw-voltage gate**: `Wang2024Treebank` proof passed on DCC 2026-04-29 (`reports/neuroai_raw_voltage_proof_2026_04_29/`).
 - **Naming gotcha**: "Stage 1" inside `docs/neuroprobe/plan.md` = *hillclimb* stage. Elsewhere "Stage N" = PS-program stage.
+- **v14 is the sole active architectural direction.** v12, Conv2d pipeline, v12-era Brain-JEPA, LeWM, LOPO autoresearch — all discontinued. *JEPA-family note*: "Brain-JEPA discontinued" refers to the v12-era prototype only; Stage-2 SSL `L_recon` IS JEPA-family (data2vec 2.0 + V-JEPA 2.1 latent prediction).
+- **Provenance** (1-line lineage): PopT (zero per-subject params, ICLR 2025 Oral) → BaRISTA (parcel-level encoding > channel-level, NeurIPS 2025 poster) → Evanson (cross-modal SSL paradigm; rejected, right paradigm wrong arch) → v14's novel piece = multi-FM extension on PopT's zero-per-subject architecture. Diagnosis: `memory/reference_evanson_lost_to_popt_diagnosis_2026_04_26.md`.
 
 **Load on demand for v14 architectural / paper-framing work** (don't keep in always-on context):
 - Arch spec: `memory/project_v14_parcel_token_readout_2026_04_26.md` (Perceiver IO + parcel-id-tagged latents + Graphormer support bias + DETR readout + Stage-2 SSL contract).
@@ -25,22 +27,9 @@ PS/uECoG stage program **paused 2026-04-24**. Active work is the Neuroprobe cros
 - Paper-framing live: `memory/project_v14_paper_corrections_post_newpapers6_batch2_2026_05_09.md` (Goldstein-2025 scope; Whisper-L8 = acoustic-phonetic NOT semantic; defensive language playbook; 5 ablation cells; Podcast pretrain-with-sister-run policy).
 - Stage-2 schedule: `memory/project_stage2_ssl_initial_diet_bt_only_joint_step1_2026_05_09.md`.
 
-## v14 program (paused — resumes after Neuroprobe)
+## PS program (paused — won't resume until Neuroprobe closes; ~summer of work away)
 
-Atlas-grounded parcel tokens as the shared representation across patients and sensors. Two-problem decomposition: (1) calibration (per-patient, physics-constrained — raw electrodes → atlas-grounded tokens via Brainnetome on fsaverage); (2) dynamics (shared, unconstrained ML — tokens → phoneme sequence). v14 is the **sole active architectural direction**; v12, Conv2d pipeline, v12-era Brain-JEPA, LeWM, LOPO autoresearch all discontinued.
-
-**Provenance** (1-line lineage): PopT (zero per-subject params, ICLR 2025 Oral) → BaRISTA (parcel-level encoding > channel-level, NeurIPS 2025 poster) → Evanson (cross-modal SSL paradigm; rejected, right paradigm wrong arch) → v14's novel piece = multi-FM extension on PopT's zero-per-subject architecture. Diagnosis: `memory/reference_evanson_lost_to_popt_diagnosis_2026_04_26.md`.
-
-**PS stages** (per `docs/objectives.md` — paused):
-
-| Stage | Scope | Strategy |
-|---|---|---|
-| Stage 1 | Single-sensor supervised correctness pass on uECoG | `stage_1.md` (closed 2026-04-20) |
-| Stage 2 | In-sensor scaling: PS + lex uECoG + continuous-corpus SSL | `stage_2.md` (paused 2026-04-24) |
-| Stage 3 | Cross-sensor join (+ Cogan sEEG D-cohort) | *TBD* |
-| Stage 4 | External-lab validation | *TBD* |
-
-**Resume reference**: `memory/project_phase1_default_vs_phase15_target_2026_04_19.md` (PS-resume defaults — partialconv + pe2d + hierarchical_atlas). **Path divergence**: PS-resume keeps the original `partialconv + pe2d + hierarchical_atlas` defaults — the 2-D Utah grid is real on PS uECoG. The Neuroprobe-path changes (BNA-connectivity bias, flat per-parcel pool, no partialconv) are sEEG-specific. Two paths now diverge by modality, not program version. Triad docs: `docs/objectives.md`, `docs/strategy/stage_<N>.md`, `docs/tactics.md`.
+Don't read PS-resume context until Neuroprobe submits/aborts. Pointers when you do: `memory/project_phase1_default_vs_phase15_target_2026_04_19.md` (PS-resume defaults: per_cell + partialconv + pe2d + hierarchical_atlas @ d=32, depth=3, pool=(4,8); Utah grid is real on PS uECoG so partialconv stays — Neuroprobe-path's BNA-connectivity bias / flat pool / no partialconv are sEEG-specific, two paths diverge by modality not version), `docs/objectives.md` (4-stage roadmap; Stage 1 closed 2026-04-20, Stage 2 paused 2026-04-24, Stage 3+ TBD), `docs/strategy/stage_<N>.md`, `docs/tactics.md`. v14 calibration scope: fixed atlas through PS-Stage 2; learned calibration deferred to PS-Stage 3+.
 
 ## Working Principle: Discuss Before Code
 
@@ -131,7 +120,7 @@ PER 0.734 ± 0.007 on S14 (grouped-by-token CV, 3-seed, per-phoneme MFA + flat h
 - Root: `/Users/bentang/Library/CloudStorage/Box-Box/`
 - FreeSurfer recons: `ECoG_Recon/<pt>/` (PS = `S<num>`). ACPC source: `<pt>/elec_recon/<subj>_elec_locations_RAS_brainshifted.txt`.
 - `D<num>` = different Duke sEEG cohort (Stage 3 scope) — do not confuse with `S<num>`.
-- Avoid sibling recon folders (`_old`, `_no_tkr`, `_kumar`, `_diag`, `_med`); always use plain `S<num>/`.
+- Avoid sibling recon folders (`_old`, `_no_tkr`, `_kumar`, `_diag`, `_med`); always use plain `S<num>/`. `cvs_avg35_inMNI152/` = parity-oracle template only, not active.
 
 ### BrainTreebank raw data
 DCC-only at `/work/ht203/data/braintreebank/`. `ROOT_DIR_BRAINTREEBANK=/work/ht203/data/braintreebank` for any DCC-side script touching neural data.
@@ -144,7 +133,7 @@ DCC-only at `/work/ht203/data/braintreebank/`. `ROOT_DIR_BRAINTREEBANK=/work/ht2
 - `docs/strategy.md` (index) + `docs/strategy/stage_<N>.md` (per-stage) — default architecture, frozen contract, scoreboard, rejected paths. Stage-N is written only when Stage-(N−1) has concluded enough to define the entry point.
 - `docs/tactics.md` — concrete task list, in-flight jobs, blockers.
 
-**Rule**: do not create additional planning, tracker, or status docs under `/docs` for the PS stage program. Extend the relevant triad doc instead. Doc surplus breaks the organization and creates stale duplicates (paid this cost multiple times). Parallel initiatives (e.g. `docs/neuroprobe/`) get their own subdirectory with a single active plan doc.
+**Rule**: do not create additional planning, tracker, or status docs under `/docs` for the PS stage program. Extend the relevant triad doc instead. Doc surplus breaks the organization and creates stale duplicates (paid this cost multiple times). The triad above supersedes deprecated forms — do not recreate `current_direction.md`, `implementation_tasks.md`, or `v14-core.md` (all archived). Parallel initiatives (e.g. `docs/neuroprobe/`) get their own subdirectory with a single active plan doc.
 
 **Reference docs** (static): `docs/references/{data_reference,dcc_setup,neuroai_reference,neuroprobe_benchmark}.md`. **Experiment exports**: `docs/experiments/README.md` (pre-reset logs archived under `docs/archive/experiments/pre_neuroai_reset_2026_04_29/`). **QC + figures**: `docs/qc/`, `docs/figures/` (history under `docs/archive/`).
 
@@ -192,5 +181,5 @@ Decimate 2kHz → CAR → impedance exclusion (log10 > 6) → 70–150 Hz Gaussi
 - **Write simply.** Ordinary words. Short sentences. No throat-clearing, no redundant qualifiers, no ceremonial preambles. Cut is the main edit. Applies to docs, commits, PRs, memory files, chat. Paul Graham's "Write Simply" is the reference. Code comments stay minimal (default: none).
 - **Discuss logic before writing code.** See Working Principle.
 - **All training on DCC, never local.**
-- **Every architectural change reports both pooled joint AND LOPO warm-start.** `docs/objectives.md §Evaluation philosophy`. LOPO is the foundation-model test; load-bearing for Stage-2 SSL, Stage-3 cross-sensor transfer, Stage-4 external-corpus transfer.
+- **Every architectural change reports both pooled joint AND LOPO warm-start.** `docs/objectives.md §Evaluation philosophy`. LOPO is the foundation-model test; load-bearing for Stage-2 SSL, Stage-3 cross-sensor transfer, Stage-4 external-corpus transfer. **Single-protocol evidence does not justify defaulting an arch change.**
 - **Always export DCC results into `docs/experiments/`.** Every finished DCC run needs a durable record because `/work/ht203` auto-purges every 75 days. The old CSV + aggregator were retired; define the NeuralTrain/Exca export schema before the first Stage-0 result lands.
