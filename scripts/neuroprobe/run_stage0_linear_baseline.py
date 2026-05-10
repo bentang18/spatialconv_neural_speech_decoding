@@ -299,6 +299,35 @@ def run_eval(
                 if splits_type == "CrossSubject":
                     regions_train = get_region_labels(train_subject)
                     regions_test = get_region_labels(subject)
+                    if args.backend == "neuralset":
+                        # Re-derive regions to match post-reference virtual channels.
+                        # Bipolar collapses pairs (`chA-chB`); CAR/median preserve
+                        # labels 1:1; shaft_laplacian preserves labels with
+                        # remove_non_laplacian=False. Without this, regions sized
+                        # to the original electrode count don't index post-ref X.
+                        from preprocess_views import apply_reference  # noqa: PLC0415
+                        train_labels_orig = list(train_subject.electrode_labels)
+                        test_labels_orig = list(subject.electrode_labels)
+                        _, train_labels_ref = apply_reference(
+                            torch.zeros(1, len(train_labels_orig), 1),
+                            train_labels_orig,
+                            args.ref_kind,
+                            upstream_helpers=upstream_helpers,
+                        )
+                        _, test_labels_ref = apply_reference(
+                            torch.zeros(1, len(test_labels_orig), 1),
+                            test_labels_orig,
+                            args.ref_kind,
+                            upstream_helpers=upstream_helpers,
+                        )
+                        regions_train = _derive_virtual_regions(
+                            list(train_labels_ref),
+                            dict(zip(train_labels_orig, regions_train)),
+                        )
+                        regions_test = _derive_virtual_regions(
+                            list(test_labels_ref),
+                            dict(zip(test_labels_orig, regions_test)),
+                        )
                     X_train, X_test, _ = combine_regions(
                         X_train, X_test, regions_train, regions_test
                     )
@@ -415,6 +444,24 @@ def apply_normalization(
     else:
         raise ValueError(f"Unknown normalization: {normalization}")
     return X_train, X_test
+
+
+def _derive_virtual_regions(
+    virtual_labels: list[str], label_to_region: dict[str, str]
+) -> np.ndarray:
+    """Map post-reference virtual channel labels back to DK regions.
+
+    Bipolar pairs are formatted ``"chA-chB"``; both contacts are within-shaft
+    adjacent neighbors so they share a DK region in practice. We take the
+    anode (chA) region for the pair. Non-bipolar references (raw, CAR,
+    shaft_laplacian with remove_non_laplacian=False, median) preserve labels
+    1:1 and look up directly. Unknown labels fall back to ``"unknown"``.
+    """
+    out: list[str] = []
+    for label in virtual_labels:
+        anode = label.split("-", 1)[0] if "-" in label else label
+        out.append(str(label_to_region.get(anode, "unknown")))
+    return np.array(out)
 
 
 def _per_window_z(X: np.ndarray) -> np.ndarray:
