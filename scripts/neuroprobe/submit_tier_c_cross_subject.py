@@ -56,6 +56,7 @@ def build_cells(
     baseline_ref: str = "shaft_laplacian",
     baseline_view: str = "stft_abs",
     skip_baseline: bool = False,
+    only_baseline: bool = False,
 ) -> list[CrossSubjectCell]:
     cells: list[CrossSubjectCell] = []
     if not skip_baseline:
@@ -65,6 +66,8 @@ def build_cells(
             normalization=baseline_norm,
             label=f"upstream baseline ({baseline_norm}, {baseline_ref}, {baseline_view})",
         ))
+    if only_baseline:
+        return cells
     cells.append(CrossSubjectCell(
         cell_id="C.1_l1_winner",
         ref_kind=baseline_ref, view_kind=baseline_view,
@@ -112,6 +115,7 @@ def main() -> None:
         baseline_ref=args.baseline_ref,
         baseline_view=args.baseline_view,
         skip_baseline=args.skip_baseline,
+        only_baseline=args.only_baseline,
     )
 
     rows: list[dict[str, str]] = []
@@ -253,6 +257,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-baseline", action="store_true",
         help="Skip the C.0 baseline cell (use if upstream parity already established).",
+    )
+    parser.add_argument(
+        "--only-baseline", action="store_true",
+        help="Dispatch only the C.0 baseline cell (skip C.1 / C.2). "
+             "Useful for backfilling C.0 into a sweep dispatched with --skip-baseline.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
