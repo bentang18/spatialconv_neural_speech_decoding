@@ -214,62 +214,9 @@ The active package should stay small: NeuroAI integration plus v14 science only.
 
 ## Compute: Duke DCC cluster
 
-Full docs: `docs/references/dcc_setup.md`. **Quick-start cheatsheet below — keep this section terse and accurate; it loads every session.**
+All training on DCC, never local. Repo: `/work/ht203/repo/speech`. Python: `.venv/bin/python` (uv 3.12, no conda). SSH: `ssh ht203@dcc-login.oit.duke.edu`.
 
-### Identity + paths
-
-| What | Where |
-|---|---|
-| SSH | `ssh ht203@dcc-login.oit.duke.edu` |
-| Repo | `/work/ht203/repo/speech` |
-| Python | `.venv/bin/python` (uv-managed Python 3.12) — **NOT** the old miniconda env |
-| BT raw data | `/work/ht203/data/braintreebank` (env: `ROOT_DIR_BRAINTREEBANK`) |
-| PS BIDS | `/work/ht203/data/BIDS` |
-| Aux data | `/work/ht203/data/{mni_coords,channel_maps,transforms,atlas}/` |
-| Slurm logs | `/work/ht203/logs/` (also per-report `slurm-*.out/.err`) |
-| GPU | 8× RTX 5000 Ada (32 GB), partition `coganlab-gpu`, account `coganlab` |
-| Upstream Neuroprobe clone | `/work/ht203/repo/neuroprobe_upstream/` (pinned `c7b955b0`) |
-| Persistent cache (Exca, ckpts, results) | `/hpc/group/coganlab/ht203/cache_neuroai/` |
-
-### Critical environment rules
-
-- **`/work/ht203/` auto-purges every 75 days.** Long-lived caches, checkpoints, and result artifacts → `/hpc/group/coganlab/ht203/`. Reports stay in `/work/ht203/repo/speech/reports/` only as long as you actively read them.
-- **`EXCA_CACHE_FOLDER` must point at `/hpc/group/coganlab/ht203/cache_neuroai/`** (or per-`infra.folder=` to a sub-path). Never `/work/ht203/`.
-- **`ROOT_DIR_BRAINTREEBANK=/work/ht203/data/braintreebank`** for any DCC-side script that touches BT neural data.
-- **No `conda activate`.** Direct path: `.venv/bin/python -m ...`.
-
-### Sync + dispatch (the local↔DCC speedups)
-
-| Command | Does |
-|---|---|
-| `scripts/dcc/sync` | Push current branch → DCC `git fetch` + `git reset --hard origin/<branch>` + show last 3 commits. |
-| `scripts/dcc/dispatch <submitter-relpath> [args...]` | `sync` then SSH-run `.venv/bin/python <submitter> [args...]` on DCC. |
-| `scripts/dcc/status [report-glob]` | One-shot: `squeue -u ht203` + `status_l_sweeps.py` for each report dir matching the glob (default `reports/neuroprobe_stage0_*/`). |
-| `scripts/dcc/rerun-failed <report-dir> [--mem 64G] [--dry-run]` | Scans `slurm-*.err` in a sweep dir, finds OOM / traceback / non-zero exits, re-sbatches `slurm-<jobid>.sbatch` with optional bumped `--mem`. |
-| `scripts/sync_dcc_repo.sh` | Heavyweight rsync (sources without git history); use for non-git artifacts only. |
-
-Env overrides (rarely needed): `DCC_HOST`, `DCC_REPO`, `DCC_USER`. Defaults are baked.
-
-### Slurm + monitoring
-
-```bash
-# Default sbatch header used by all submit_* scripts:
-#SBATCH -p coganlab-gpu          # or "common,scavenger,coganlab-gpu" to drain queue
-#SBATCH --account=coganlab
-#SBATCH --gres=gpu:1             # add for training jobs; linear baselines are CPU-only
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=24G                # bump to 48G/64G/160G for OOM-prone cells
-#SBATCH -t 04:00:00
-
-# Direct monitoring:
-squeue -u ht203
-sacct -j <job_id> --format=JobID,State,Elapsed,MaxRSS,ReqMem,ExitCode
-tail -f /work/ht203/repo/speech/reports/<sweep>/slurm-<jobid>.out
-```
-
-### NeuroAI dispatch
-
-Use NeuralTrain/Exca for training + grid sweeps. Canonical: `TaskInfra` decorates `Experiment.run`, then `neuraltrain.utils.run_grid` wraps the grid into one Slurm array via `infra.job_array()`. `MapInfra` is for *extractor*-layer per-subject precompute, not hyperparameter grids. Full example in `docs/references/dcc_setup.md §NeuroAI Execution`.
+**Load-on-demand rule.** Before dispatching, syncing, debugging, or rerunning *any* DCC job — or before invoking `scripts/dcc/*` or `scripts/neuroprobe/submit_*` — Read `docs/references/dcc_setup.md`. The quick-start cheatsheet at the top has identity+paths, required env vars (`ROOT_DIR_BRAINTREEBANK`, `EXCA_CACHE_FOLDER`), sync/dispatch helper API (`scripts/dcc/{sync,dispatch,rerun-failed,status}`), standard sbatch header, and the `/work` 75-day purge rule. Don't reproduce that content here. Skip the read when the session has nothing to do with DCC.
 
 ## Preprocessing Pipeline (do not change)
 

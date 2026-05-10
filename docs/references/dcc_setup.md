@@ -4,7 +4,7 @@ Use DCC for all training runs. Local machine is for editing, tests, and small im
 
 ## Quick-start cheatsheet
 
-A condensed mirror also lives in `CLAUDE.md §Compute` (loaded every session). This is the deeper version.
+This is the canonical reference. `CLAUDE.md §Compute` is intentionally a 4-line load-on-demand stub that says "Read this file when dispatching" — to avoid bloating every-session context with DCC details that don't apply when the session has nothing to do with the cluster. If you've been pointed here, you're probably about to dispatch, sync, or debug a DCC job.
 
 ### Identity + paths
 
