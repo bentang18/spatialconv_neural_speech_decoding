@@ -216,7 +216,14 @@ The active package should stay small: NeuroAI integration plus v14 science only.
 
 All training on DCC, never local. Repo: `/work/ht203/repo/speech`. Python: `.venv/bin/python` (uv 3.12, no conda). SSH: `ssh ht203@dcc-login.oit.duke.edu`.
 
-**Load-on-demand rule.** Before dispatching, syncing, debugging, or rerunning *any* DCC job — or before invoking `scripts/dcc/*` or `scripts/neuroprobe/submit_*` — Read `docs/references/dcc_setup.md`. The quick-start cheatsheet at the top has identity+paths, required env vars (`ROOT_DIR_BRAINTREEBANK`, `EXCA_CACHE_FOLDER`), sync/dispatch helper API (`scripts/dcc/{sync,dispatch,rerun-failed,status}`), standard sbatch header, and the `/work` 75-day purge rule. Don't reproduce that content here. Skip the read when the session has nothing to do with DCC.
+**DCC helpers — prefer these over manual git/ssh/sbatch chains.** When the session involves syncing, dispatching, monitoring, or rerunning DCC jobs, USE the four helpers under `scripts/dcc/`:
+
+- `scripts/dcc/sync` — push current branch + reset DCC clone to it. Replaces `git push && ssh dcc 'git fetch && git reset --hard origin/<branch>'`.
+- `scripts/dcc/dispatch <submitter> [args...]` — sync, then SSH-run `.venv/bin/python <submitter> [args...]` on DCC. Use `--help` first as a "does this even import on DCC" preflight (catches uncommitted-helper bugs before they sbatch a 540-job array; cf. `feedback_verify_committed_before_dcc_launch`).
+- `scripts/dcc/status [report-glob]` — `squeue -u ht203` + `status_l_sweeps.py` per report dir. One round-trip instead of three.
+- `scripts/dcc/rerun-failed <report-dir> [--mem 64G]` — rescue OOM/traceback jobs in one command instead of per-job grep+sbatch.
+
+**Load `docs/references/dcc_setup.md` on demand** — when first touching any of these helpers, `submit_*` scripts, or DCC paths in a session — for the full cheatsheet (identity+paths table, env vars `ROOT_DIR_BRAINTREEBANK`/`EXCA_CACHE_FOLDER`, sbatch template, `/work` 75-day purge rule, NeuroAI `TaskInfra`/`run_grid` example). Skip the read when the session has nothing to do with DCC.
 
 ## Preprocessing Pipeline (do not change)
 
