@@ -1,19 +1,24 @@
 # pyright: reportMissingImports=false
-"""L.5.P1 + L.5.P2 nuisance probes on the L.2 winner view (R4xI2 + N1).
+"""L.5.P2 within-subject session-id nuisance probe on the L.2 winner view.
 
-Decode subject-ID (P1) and session-ID (P2) from word-level features pooled
-across all 12 BT Lite sessions, on the L.2 winner cell (shaft_laplacian +
-stft_abs + train_set_fixed normalization).
+Per-subject probe: for each subject with ≥ 2 sessions in BT Lite, fit a linear
+classifier on word-level features from the L.2 winner view (R4xI2 + N1 =
+shaft_laplacian + stft_abs + train_set_fixed) to decode session-id from
+features. Macro AUROC across subjects + per-subject kill verdict.
 
-Per `docs/neuroprobe/stage_0.md` L.5 spec — kill criterion: drop view if
-held-out AUROC > 0.95. Stratified random 80/20 split (not LOSO) — these
-probes ask "can I decode subject from features?" treating subject/session
-as multi-class classification, the standard nuisance-probe protocol used by
-the V0 QC report (2026-05-01) at the upstream baseline.
+Why P2 only (P1 dropped):
+  P1 (subject-id) is trivially decodable from the raw view — different subjects
+  have different channel sets so feature width itself reveals identity. The
+  meaningful test is whether the L.2 winner *within a subject* drifts across
+  sessions in a way a linear classifier can exploit; that is the leak v14 must
+  be invariant to.
+
+Per `docs/neuroprobe/stage_0.md` L.5 spec — kill the view if any subject's
+held-out P2 macro AUROC > 0.95.
 
 Output:
-  metrics.json       — held-out balanced acc + macro AUROC + chance for P1, P2
-  nuisance_probe_metrics.csv — one row per probe with full diagnostics
+  metrics.json           — per-subject + macro P2 + kill flags
+  nuisance_probe_metrics.csv — one row per subject probe with diagnostics
   experiment_record.json — ExperimentLogger sidecar
 """
 
@@ -25,6 +30,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +48,7 @@ from speech_decoding.studies.braintreebank.manifest import BT_LITE_SESSIONS
 
 UPSTREAM_REPO_URL = "https://github.com/insight-neuro/neuroprobe"
 UPSTREAM_COMMIT = "c7b955b0a31464f4a5eec3f3bd78ff29841d61ac"
+KILL_AUROC = 0.95
 
 
 def main() -> None:
@@ -96,30 +103,29 @@ def main() -> None:
         "ref_kind": args.ref_kind,
         "view_kind": args.view_kind,
         "normalization": "train_set_fixed",
-        "cell_id_p1": "L.5.P1",
-        "cell_id_p2": "L.5.P2",
+        "cell_id": "L.5.P2",
         "window_seconds": args.window_seconds,
         "sessions": [list(s) for s in sessions],
         "seed": args.seed,
+        "kill_auroc": KILL_AUROC,
     }
 
     with ExperimentLogger(
         artifact_dir=out_dir,
         block="L",
-        cell="L.5.P1+P2",
+        cell="L.5.P2",
         run_kind="stage0_nuisance_probes",
-        eval_mode="multiclass",
-        split_mode="random_80_20",
-        subject_id="pooled",
-        trial_id="pooled",
-        task="subject_id+session_id",
+        eval_mode="binary",
+        split_mode="random_80_20_per_subject",
+        subject_id="per_subject",
+        trial_id="per_subject",
+        task="session_id_within_subject",
         seed=str(args.seed),
         config_json=config,
         report_dir=str(out_dir),
     ) as logger:
-        feats_per_session: list[np.ndarray] = []
-        subject_ids: list[int] = []
-        session_ids: list[int] = []
+        feats_by_subject: dict[int, list[np.ndarray]] = defaultdict(list)
+        labels_by_subject: dict[int, list[int]] = defaultdict(list)
 
         for s_idx, (sub_id, trial_id) in enumerate(sessions):
             t_session = time.time()
@@ -156,9 +162,8 @@ def main() -> None:
 
             X_session = np.concatenate(session_feats, axis=0)
             del session_feats
-            feats_per_session.append(X_session)
-            subject_ids.extend([sub_id] * n_kept)
-            session_ids.extend([s_idx] * n_kept)
+            feats_by_subject[sub_id].append(X_session)
+            labels_by_subject[sub_id].extend([trial_id] * n_kept)
             print(
                 f"[{s_idx + 1}/{len(sessions)}] sub{sub_id} trial{trial_id}: "
                 f"{n_kept}/{len(words_df)} words, F={X_session.shape[1]}, "
@@ -167,42 +172,62 @@ def main() -> None:
             subject.clear_neural_data_cache(trial_id)
             gc.collect()
 
-        X_all = np.concatenate(feats_per_session, axis=0)
-        del feats_per_session
-        y_subj = np.array(subject_ids)
-        y_sess = np.array(session_ids)
-        gc.collect()
-
-        print(
-            f"\n[pooled] X_all={X_all.shape} subjects={len(np.unique(y_subj))} "
-            f"sessions={len(np.unique(y_sess))}"
-        )
-
         rows: list[dict[str, float | int | str]] = []
-        for probe_id, label_name, y in (
-            ("L.5.P1", "subject_id", y_subj),
-            ("L.5.P2", "session_id", y_sess),
-        ):
-            row = run_probe(probe_id, label_name, X_all, y, seed=args.seed)
+        for sub_id in sorted(feats_by_subject):
+            X_subj = np.concatenate(feats_by_subject[sub_id], axis=0)
+            y_subj = np.array(labels_by_subject[sub_id])
+            n_classes = int(len(np.unique(y_subj)))
+            if n_classes < 2:
+                print(f"[skip sub{sub_id}] only {n_classes} session(s) — skipping P2.")
+                continue
+            row = run_probe(
+                f"L.5.P2.sub{sub_id}", "session_id", X_subj, y_subj, seed=args.seed,
+            )
+            row["subject_id"] = sub_id
             rows.append(row)
+            del X_subj
+            gc.collect()
             print(json.dumps(row, indent=2, sort_keys=True))
+
+        if not rows:
+            raise RuntimeError(
+                "No subjects with ≥ 2 sessions found — P2 probe needs at least one "
+                "subject with multiple sessions."
+            )
 
         diagnostics = pd.DataFrame(rows)
         diagnostics.to_csv(out_dir / "nuisance_probe_metrics.csv", index=False)
 
-        p1_auroc = float(rows[0]["test_macro_auroc"])  # type: ignore[arg-type]
-        p2_auroc = float(rows[1]["test_macro_auroc"])  # type: ignore[arg-type]
+        per_subject_aurocs = [float(r["test_macro_auroc"]) for r in rows]
+        per_subject_balaccs = [float(r["test_balanced_accuracy"]) for r in rows]
+        kill_subjects = [
+            int(r["subject_id"])
+            for r, a in zip(rows, per_subject_aurocs)
+            if a > KILL_AUROC
+        ]
         summary = {
-            "p1_subject_id_auroc": p1_auroc,
-            "p1_subject_id_balacc": float(rows[0]["test_balanced_accuracy"]),  # type: ignore[arg-type]
-            "p1_chance": float(rows[0]["chance_balanced_accuracy"]),  # type: ignore[arg-type]
-            "p1_kill": bool(p1_auroc > 0.95),
-            "p2_session_id_auroc": p2_auroc,
-            "p2_session_id_balacc": float(rows[1]["test_balanced_accuracy"]),  # type: ignore[arg-type]
-            "p2_chance": float(rows[1]["chance_balanced_accuracy"]),  # type: ignore[arg-type]
-            "p2_kill": bool(p2_auroc > 0.95),
-            "n_words_pooled": int(X_all.shape[0]),
-            "n_features": int(X_all.shape[1]),
+            "p2_per_subject": [
+                {
+                    "subject_id": int(r["subject_id"]),
+                    "n_classes": int(r["n_classes"]),
+                    "n_train": int(r["n_train"]),
+                    "n_test": int(r["n_test"]),
+                    "n_features": int(r["n_features"]),
+                    "auroc": float(r["test_macro_auroc"]),
+                    "balacc": float(r["test_balanced_accuracy"]),
+                    "chance": float(r["chance_balanced_accuracy"]),
+                    "kill": bool(float(r["test_macro_auroc"]) > KILL_AUROC),
+                }
+                for r in rows
+            ],
+            "p2_macro_auroc": float(np.mean(per_subject_aurocs)),
+            "p2_macro_balacc": float(np.mean(per_subject_balaccs)),
+            "p2_max_auroc": float(np.max(per_subject_aurocs)),
+            "p2_min_auroc": float(np.min(per_subject_aurocs)),
+            "p2_kill_any": bool(len(kill_subjects) > 0),
+            "p2_kill_subjects": kill_subjects,
+            "n_subjects_probed": int(len(rows)),
+            "kill_auroc_threshold": KILL_AUROC,
         }
         (out_dir / "metrics.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"
@@ -211,8 +236,8 @@ def main() -> None:
 
         logger.set_metrics(
             summary,
-            primary_metric_name="p1_subject_id_auroc",
-            primary_metric_value=summary["p1_subject_id_auroc"],
+            primary_metric_name="p2_macro_auroc",
+            primary_metric_value=summary["p2_macro_auroc"],
         )
 
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -236,12 +261,17 @@ def run_probe(
     test_pred = clf.predict(X_te)
 
     classes = list(clf.classes_)
-    y_te_oh = np.zeros((len(y_te), len(classes)), dtype=np.float32)
-    for i, lab in enumerate(y_te):
-        y_te_oh[i, classes.index(lab)] = 1.0
-    test_auroc = float(
-        roc_auc_score(y_te_oh, test_proba, multi_class="ovr", average="macro")
-    )
+    if n_classes == 2:
+        # Binary: roc_auc_score expects 1-D scores for the positive class.
+        pos_idx = classes.index(max(classes))
+        test_auroc = float(roc_auc_score(y_te, test_proba[:, pos_idx]))
+    else:
+        y_te_oh = np.zeros((len(y_te), len(classes)), dtype=np.float32)
+        for i, lab in enumerate(y_te):
+            y_te_oh[i, classes.index(lab)] = 1.0
+        test_auroc = float(
+            roc_auc_score(y_te_oh, test_proba, multi_class="ovr", average="macro")
+        )
     test_balacc = float(balanced_accuracy_score(y_te, test_pred))
 
     return {
@@ -271,28 +301,37 @@ def write_readme(
     out_dir: Path, summary: dict, args: argparse.Namespace,
 ) -> None:
     lines = [
-        "# Stage 0 L.5.P1 + L.5.P2 — nuisance probes on L.2 winner view",
+        "# Stage 0 L.5.P2 — within-subject session-id nuisance probe",
         "",
         f"- ref_kind: `{args.ref_kind}`  view_kind: `{args.view_kind}`",
         f"- normalization: `train_set_fixed` (per-probe StandardScaler refit)",
-        f"- pooled across {len([1 for _ in (BT_LITE_SESSIONS if not args.sessions else args.sessions.split(','))])} sessions",
-        f"- N words pooled: {summary['n_words_pooled']}, F = {summary['n_features']}",
+        f"- per-subject probe (binary: trial-id within subject)",
+        f"- N subjects probed: {summary['n_subjects_probed']}",
         "",
-        "## P1 — subject-id from features",
+        "## Headline",
         "",
-        f"- held-out balanced accuracy: {summary['p1_subject_id_balacc']:.4f} (chance {summary['p1_chance']:.4f})",
-        f"- held-out macro AUROC: {summary['p1_subject_id_auroc']:.4f}",
-        f"- KILL (AUROC > 0.95): {summary['p1_kill']}",
+        f"- macro AUROC across subjects: **{summary['p2_macro_auroc']:.4f}**",
+        f"- max AUROC: {summary['p2_max_auroc']:.4f}, min: {summary['p2_min_auroc']:.4f}",
+        f"- kill threshold: {summary['kill_auroc_threshold']:.2f}",
+        f"- KILL (any subject > threshold): {summary['p2_kill_any']}",
+        f"- subjects exceeding kill threshold: {summary['p2_kill_subjects'] or 'none'}",
         "",
-        "## P2 — session-id from features",
+        "## Per-subject",
         "",
-        f"- held-out balanced accuracy: {summary['p2_session_id_balacc']:.4f} (chance {summary['p2_chance']:.4f})",
-        f"- held-out macro AUROC: {summary['p2_session_id_auroc']:.4f}",
-        f"- KILL (AUROC > 0.95): {summary['p2_kill']}",
+        "| subject | n_classes | balacc | chance | macro AUROC | kill |",
+        "|---|---|---|---|---|---|",
+    ]
+    for s in summary["p2_per_subject"]:
+        lines.append(
+            f"| {s['subject_id']} | {s['n_classes']} | {s['balacc']:.4f} | "
+            f"{s['chance']:.4f} | {s['auroc']:.4f} | "
+            f"{'YES' if s['kill'] else 'no'} |"
+        )
+    lines += [
         "",
         "Files:",
-        "- `nuisance_probe_metrics.csv` — per-probe diagnostics",
-        "- `metrics.json` — aggregate summary + kill flags",
+        "- `nuisance_probe_metrics.csv` — per-subject probe diagnostics",
+        "- `metrics.json` — aggregate summary + per-subject + kill flags",
         "- `experiment_record.json` — ExperimentLogger sidecar",
     ]
     (out_dir / "README.md").write_text("\n".join(lines) + "\n")

@@ -1,13 +1,18 @@
-"""Submit Neuroprobe Stage 0 L.5.P1+P2 nuisance probes on DCC.
+"""Submit Neuroprobe Stage 0 L.5.P2 within-subject nuisance probe on DCC.
 
-Single CPU sbatch job. Pools features across all 12 BT Lite sessions on
-the L.2 winner view (R4xI2 = shaft_laplacian × stft_abs), then trains two
-LogReg classifiers — subject-id (P1) and session-id (P2) — with stratified
-random 80/20 splits. Kill criterion: drop view if AUROC > 0.95.
+Single CPU sbatch job. For each subject in BT Lite (6 subjects × 2 sessions),
+trains a per-subject LogReg classifier to decode session-id (trial within
+subject) from features on the L.2 winner view (R4xI2 = shaft_laplacian
+× stft_abs). Kill criterion: drop view if any subject's held-out macro
+AUROC > 0.95.
 
-Memory: ~12 sessions × ~500 words × ~5K features × 4 B ≈ 120 MB before
-StandardScaler doubles it. Default `--mem=64G` accommodates the upstream
-laplacian + stft scratch buffers comfortably.
+Why P2-only (P1 dropped): subject-id is trivially decodable from per-subject
+feature width (different channel sets → different F). The meaningful test is
+within-subject session drift.
+
+Memory: per-subject features kept on the heap before per-subject probe; peak
+~24 GB. `--mem=64G` covers upstream laplacian + stft scratch + StandardScaler
+copies.
 
 Usage on DCC:
     .venv/bin/python scripts/neuroprobe/submit_l5_nuisance_probes.py
@@ -28,7 +33,7 @@ def main() -> None:
         f"reports/neuroprobe_stage0_l5_nuisance_probes_{datetime.now():%Y_%m_%d}"
     )
     out_root.mkdir(parents=True, exist_ok=True)
-    report_dir = out_root / "L.5.P1+P2"
+    report_dir = out_root / "L.5.P2"
     report_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
