@@ -1,1 +1,0 @@
-"""NCA-JEPA pretraining pipeline."""
