@@ -10,7 +10,7 @@ where ``argmax_wins(p)`` is the number of Phase-1 LH electrodes for which
 Current derivation (2026-04-16 late, blocker #36 closed):
 
 - Spatial pipeline: strict fsaverage snap-to-pial via
-  ``src/speech_decoding/v14/fsaverage_projection.py``
+  ``src/speech_decoding/atlas/fsaverage.py``
   (patient pial -> patient sphere.reg -> fsaverage sphere.reg -> fsaverage pial).
 - Atlas bake: ``data/atlas/fsaverage_bake_fast2/`` (mri_vol2surf
   --projfrac-avg 0 1 0.1 from ICBM152_fs, then mri_surf2surf to fsaverage,
@@ -19,8 +19,7 @@ Current derivation (2026-04-16 late, blocker #36 closed):
   vertex. No extra query-time Gaussian — the PSF is baked in.
 - Cohort: 7 Phase-1 LH patients (S14, S16, S23, S26, S33, S39, S62) =
   1280 electrodes.
-- Ranking source: ``data/atlas/fsaverage_parity/fsaverage_cohort_ranking.csv``
-  produced by ``scripts/summarize_fsaverage_support.py``.
+- Ranking source: ``data/atlas/fsaverage_parity/fsaverage_cohort_ranking.csv``.
 
 Retired pipelines (kept as oracles, not for Tier-1 derivation):
 

@@ -1,13 +1,9 @@
-"""BrainTreebank cohort — NeuralSet Study + Ieeg + loader.
+"""BrainTreebank cohort — local NeuroAI Study + raw h5 loader.
 
-Used by the Neuroprobe hillclimb path. Continuous-trial sEEG events; raw 2048 Hz
-voltage with no re-reference (Stage-1 ablation cells re-add CAR / Laplacian / HG
-envelope on top — those are not loader behavior).
+Used by the Neuroprobe hillclimb path. Continuous-trial sEEG events expose raw
+2048 Hz voltage with no re-reference.
 """
 
-from speech_decoding.studies.braintreebank.study import (
-    BraintreebankIeeg,
-    BraintreebankStudy,
-)
+from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 
-__all__ = ["BraintreebankIeeg", "BraintreebankStudy"]
+__all__ = ["Wang2024Treebank"]

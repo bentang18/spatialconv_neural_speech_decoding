@@ -1,72 +1,119 @@
-"""BrainTreebank Study + Ieeg event for NeuralSet.
+"""Local NeuralFetch-style Study for BrainTreebank.
 
-`BraintreebankIeeg._read()` returns raw 2048 Hz voltage with no re-reference,
-matching Neuroprobe `__getitem__` native output. Re-ref + HG envelope are
-Stage-1 ablation cells layered on top.
-
-`BraintreebankStudy.iter_timelines()` enumerates the Tier-1 cohort via
-`manifest.TIER1_WHITELIST`. `_load_timeline_events()` builds one Ieeg row
-covering the full continuous trial plus N Word triggers from the trial's
-transcript.
-
-Stage-0 Block A0 fills `manifest.TIER1_WHITELIST`; Stage-0 Block E3 wires
-the 15-task derivation through `labels.py`.
+The NeuroAI docs advertise `Wang2024Treebank`, but the installable
+`neuralfetch==0.1.0` catalog does not ship it yet. This local Study preserves the
+public NeuroAI API shape (`ns.Study(name="Wang2024Treebank", ...)`) while keeping
+raw h5 loading behind NeuralSet's `SpecialLoader`.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import os
+import typing as tp
+from pathlib import Path
 
+import h5py
 import mne
-import neuralset as ns
 import pandas as pd
-from neuralset.events.etypes import Ieeg
+from neuralset.events import study
 
 from speech_decoding.studies.braintreebank.loader import bt_load_raw
-from speech_decoding.studies.braintreebank.manifest import TIER1_WHITELIST
+from speech_decoding.studies.braintreebank.manifest import (
+    BT_FULL_SESSIONS,
+    BT_LITE_SESSIONS,
+    BT_NANO_SESSIONS,
+)
 
 
-class BraintreebankIeeg(Ieeg):
-    """h5-backed continuous-trial Ieeg event for BrainTreebank.
+_SESSIONS_BY_MODE: dict[str, tuple[tuple[int, int], ...]] = {
+    "lite": BT_LITE_SESSIONS,
+    "nano": BT_NANO_SESSIONS,
+    "full": BT_FULL_SESSIONS,
+}
 
-    Keyed by `(subject_num, trial)`. `_read()` constructs the
-    `BrainTreebankSubject`, pulls raw voltage via `bt_load_raw()`, and wraps
-    it as `mne.io.RawArray` (raw 2048 Hz, no re-reference).
+
+class Wang2024Treebank(study.Study):
+    """BrainTreebank: sEEG from 10 participants watching narrated movies."""
+
+    mode: tp.Literal["lite", "nano", "full"] = "lite"
+
+    aliases: tp.ClassVar[tuple[str, ...]] = (
+        "BrainTreebank",
+        "Braintreebank",
+        "BT",
+    )
+    bibtex: tp.ClassVar[str] = """
+    @article{wang2024treebank,
+        title={A Brain Treebank},
+        author={Wang, Christopher and others},
+        year={2024}
+    }
     """
+    url: tp.ClassVar[str] = "https://braintreebank.dev/"
+    licence: tp.ClassVar[str] = "See https://braintreebank.dev/"
+    description: tp.ClassVar[str] = (
+        "sEEG recordings from 10 participants watching movies while narrating "
+        "(syntax treebank)."
+    )
+    requirements: tp.ClassVar[tuple[str, ...]] = ("neuroprobe>=0.1.7",)
+    _info: tp.ClassVar[study.StudyInfo | None] = None
 
-    subject_num: int = 0
-    trial: int = 0
+    def _download(self) -> None:
+        raise NotImplementedError(
+            "Wang2024Treebank download is not wrapped here yet. Use Neuroprobe's "
+            "braintreebank_download_extract.py, then set ROOT_DIR_BRAINTREEBANK."
+        )
 
-    def _read(self) -> mne.io.RawArray:
+    def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
+        for subject_id, trial_id in _SESSIONS_BY_MODE[self.mode]:
+            yield {
+                "subject": f"btbank{subject_id}",
+                "subject_id": subject_id,
+                "trial_id": trial_id,
+            }
+
+    def _load_timeline_events(self, timeline: dict[str, tp.Any]) -> pd.DataFrame:
+        filepath = study.SpecialLoader(method=self._load_raw, timeline=timeline).to_json()
+        return pd.DataFrame(
+            [
+                {
+                    "type": "Ieeg",
+                    "start": 0.0,
+                    "duration": self._trial_duration_seconds(timeline),
+                    "frequency": 2048.0,
+                    "filepath": filepath,
+                }
+            ]
+        )
+
+    def _load_raw(self, timeline: dict[str, tp.Any]) -> mne.io.RawArray:
         from neuroprobe.braintreebank_subject import BrainTreebankSubject
 
-        bt = BrainTreebankSubject(self.subject_num, self.trial)
-        data, ch_names, sfreq = bt_load_raw(bt)
+        subject_id = int(timeline["subject_id"])
+        trial_id = int(timeline["trial_id"])
+        bt = BrainTreebankSubject(
+            subject_id=subject_id,
+            cache=False,
+            coordinates_type="cortical",
+        )
+        data, ch_names, sfreq = bt_load_raw(bt, trial_id=trial_id)
         info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="seeg")
         return mne.io.RawArray(data, info, verbose=False)
 
+    def _trial_duration_seconds(self, timeline: dict[str, tp.Any]) -> float:
+        from neuroprobe.braintreebank_subject import BrainTreebankSubject
+        from neuroprobe.config import ROOT_DIR, SAMPLING_RATE
 
-class BraintreebankStudy(ns.Study):
-    """BrainTreebank — 10 subjects, 26 movie-watching trials.
-
-    Tier-1 whitelist only (post-Tier-1-parcel-coverage filtering) — see
-    `manifest.TIER1_WHITELIST`. Stage-2 SSL trains on the whitelist; Stage-0
-    bake-out fills the whitelist itself.
-    """
-
-    aliases = ("braintreebank", "BT")
-
-    def iter_timelines(self) -> list[dict[str, Any]]:
-        return [
-            {"subject_num": s, "trial": t} for (s, t) in TIER1_WHITELIST
-        ]
-
-    def _load_timeline_events(self, timeline: dict[str, Any]) -> pd.DataFrame:
-        """One Ieeg row covering the full trial + N Word triggers from transcript.
-
-        The Word-trigger derivation (transcript onset times, downstream-task
-        labels) is Stage-0 Block E3. This stub returns the Ieeg row alone so
-        the Segmenter contract holds; Stage-2 SSL fills the trigger half.
-        """
-        del timeline  # unused until Stage-0 E3 lands
-        return pd.DataFrame()
+        subject_id = int(timeline["subject_id"])
+        trial_id = int(timeline["trial_id"])
+        bt = BrainTreebankSubject(
+            subject_id=subject_id,
+            cache=False,
+            coordinates_type="cortical",
+        )
+        trial_path = Path(os.fspath(ROOT_DIR)) / f"sub_{subject_id}_trial{trial_id:03}.h5"
+        first_label = bt.electrode_labels[0]
+        first_key = bt.h5_neural_data_keys[first_label]
+        with h5py.File(trial_path, "r") as h5:
+            n_samples = int(h5["data"][first_key].shape[0])
+        return n_samples / float(SAMPLING_RATE)

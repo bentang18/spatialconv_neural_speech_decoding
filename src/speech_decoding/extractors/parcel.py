@@ -8,8 +8,7 @@ For each Ieeg event emit a `(n_channels, 5)` tensor with columns:
 
 Source of truth: per-patient Tier-1 support CSV under `support_cache_dir`,
 file pattern `<event.subject>_support_tier1.csv`. Cohort-agnostic — the same
-extractor runs over BraintreebankIeeg and CoganIeeg via `event_types="Ieeg"`
-+ NeuralSet's subclass-aware filter.
+extractor runs over NeuralSet `Ieeg` events from BrainTreebank and Cogan cohorts.
 
 `fsaverage_xyz` is read from a sibling per-patient CSV at
 `fsaverage_coords_dir/<event.subject>_fsaverage_pial.csv` (canonical strict

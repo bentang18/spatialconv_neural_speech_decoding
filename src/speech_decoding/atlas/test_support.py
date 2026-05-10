@@ -140,12 +140,12 @@ def test_write_qc_report_contains_headers(tmp_path: Path) -> None:
 def test_support_cache_on_disk_for_core_patients(patient: str) -> None:
     """Integration: a prebuilt cache file exists and passes the declared contract.
 
-    Skipped until `scripts/v14_core/build_support_cache.py` has been run.
+    Skipped until a support cache has been built for the patient.
     """
 
     path = SUPPORT_CACHE_DIR / f"{patient}_support_tier1.csv"
     if not path.exists():
-        pytest.skip(f"support cache not built for {patient}; run build_support_cache.py")
+        pytest.skip(f"support cache not built for {patient}")
 
     lines = path.read_text().splitlines()
     header = lines[0].split(",")
