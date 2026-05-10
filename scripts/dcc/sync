@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Push current branch to origin and reset DCC clone to match.
+# Usage: scripts/dcc/sync
+#
+# Steps: git push origin <branch>; ssh DCC; git fetch; git reset --hard
+# origin/<branch>; print last 3 commits.
+#
+# Stays small on purpose. For dispatch coupling, use scripts/dcc/dispatch.
+
+set -euo pipefail
+
+DCC_HOST="${DCC_HOST:-ht203@dcc-login.oit.duke.edu}"
+DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "${branch}" == "HEAD" ]]; then
+  echo "error: detached HEAD — checkout a branch first" >&2
+  exit 1
+fi
+
+echo ">> push origin ${branch}"
+git push origin "${branch}"
+
+echo ">> ${DCC_HOST}: fetch + reset --hard origin/${branch}"
+ssh -o BatchMode=yes "${DCC_HOST}" \
+  "cd '${DCC_REPO}' && git fetch origin && git reset --hard 'origin/${branch}' && git log --oneline -3"

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# One-line summary of all active DCC sweeps + my squeue.
+# Usage: scripts/dcc/status [report-dir-glob]
+#
+# Default glob: reports/neuroprobe_stage0_*/
+# For each report dir with launch_manifest.csv, runs the existing
+# scripts/neuroprobe/status_l_sweeps.py for live counts. Then prints
+# `squeue -u ht203` summary.
+
+set -euo pipefail
+
+DCC_HOST="${DCC_HOST:-ht203@dcc-login.oit.duke.edu}"
+DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
+DCC_USER="${DCC_USER:-ht203}"
+glob="${1:-reports/neuroprobe_stage0_*/}"
+
+remote_cmd='set -euo pipefail
+cd '"'${DCC_REPO}'"'
+echo "=== squeue -u '"${DCC_USER}"' ==="
+squeue -u '"${DCC_USER}"' --format="%.10i %.9P %.40j %.2t %.10M %.6D %R" 2>/dev/null | head -50 || echo "(squeue unavailable)"
+echo ""
+echo "=== sweep status ==="
+for d in '"${glob}"'; do
+  [[ -d "${d}" ]] || continue
+  [[ -f "${d}/launch_manifest.csv" ]] || continue
+  echo "--- ${d}"
+  .venv/bin/python scripts/neuroprobe/status_l_sweeps.py "${d}" 2>&1 | tail -20 || true
+  echo ""
+done
+'
+
+ssh -o BatchMode=yes "${DCC_HOST}" "bash -lc $(printf '%q' "${remote_cmd}")"

@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 """Run Neuroprobe Stage 0 L-sweep linear baseline with normalization swap.
 
 Mirrors the upstream `examples/eval_population.py` pipeline (Laplacian

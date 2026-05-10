@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Re-sbatch failed jobs in a sweep report directory.
+# Usage: scripts/dcc/rerun-failed <report-dir> [--mem 64G] [--dry-run]
+#
+# Scans <report-dir> on DCC for slurm-*.err. A job is treated as failed if its
+# .err file is non-empty AND contains an OOM, exit code != 0, or Python
+# traceback. For each failed job, finds the matching sbatch script in the same
+# directory (slurm-<jobid>.sbatch) and re-sbatches it after optionally bumping
+# --mem. The new job_id is appended to <report-dir>/launch_manifest.csv if
+# present (column rerun_for_job_id).
+#
+# OOM heuristic: matches /oom-kill|out-of-memory|MemoryError|Killed|exceeded memory limit/
+# in slurm-*.err.
+
+set -euo pipefail
+
+DCC_HOST="${DCC_HOST:-ht203@dcc-login.oit.duke.edu}"
+DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
+
+mem=""
+dry_run=false
+report_dir=""
+
+while (($#)); do
+  case "$1" in
+    --mem) mem="$2"; shift 2;;
+    --dry-run) dry_run=true; shift;;
+    -h|--help)
+      sed -n '2,16p' "$0"
+      exit 0
+      ;;
+    -*) echo "unknown flag: $1" >&2; exit 2;;
+    *) report_dir="$1"; shift;;
+  esac
+done
+
+if [[ -z "${report_dir}" ]]; then
+  echo "usage: scripts/dcc/rerun-failed <report-dir> [--mem 64G] [--dry-run]" >&2
+  exit 2
+fi
+
+remote_cmd='set -euo pipefail
+cd '"'${DCC_REPO}'"'
+report_dir="'"${report_dir}"'"
+mem="'"${mem}"'"
+dry_run='"${dry_run}"'
+
+if [[ ! -d "${report_dir}" ]]; then
+  echo "error: ${report_dir} not found on DCC" >&2
+  exit 1
+fi
+
+failed_count=0
+relaunched_count=0
+
+for err in "${report_dir}"/slurm-*.err; do
+  [[ -e "${err}" ]] || continue
+  [[ -s "${err}" ]] || continue
+  if grep -qE "oom-kill|out-of-memory|MemoryError|Killed|exceeded memory limit|Traceback|Exception" "${err}"; then
+    failed_count=$((failed_count + 1))
+    job_id="$(basename "${err}" .err)"; job_id="${job_id#slurm-}"
+    sbatch_script="${report_dir}/slurm-${job_id}.sbatch"
+    if [[ ! -f "${sbatch_script}" ]]; then
+      sbatch_script="$(grep -lE "JobID *${job_id}" "${report_dir}"/*.sbatch 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "${sbatch_script}" || ! -f "${sbatch_script}" ]]; then
+      echo "skip ${job_id}: no sbatch script in report dir" >&2
+      continue
+    fi
+    rerun_script="${sbatch_script%.sbatch}.rerun.sbatch"
+    if [[ -n "${mem}" ]]; then
+      sed -E "s/^#SBATCH --mem=.*/#SBATCH --mem=${mem}/" "${sbatch_script}" > "${rerun_script}"
+    else
+      cp "${sbatch_script}" "${rerun_script}"
+    fi
+    if [[ "${dry_run}" == true ]]; then
+      echo "DRY-RUN would sbatch ${rerun_script} (was job ${job_id})"
+    else
+      new_id="$(sbatch --parsable "${rerun_script}")"
+      echo "relaunched ${job_id} -> ${new_id}  (mem=${mem:-unchanged})"
+      relaunched_count=$((relaunched_count + 1))
+      if [[ -f "${report_dir}/launch_manifest.csv" ]]; then
+        echo "${new_id},rerun_for_${job_id}" >> "${report_dir}/launch_manifest.csv"
+      fi
+    fi
+  fi
+done
+
+echo "summary: ${failed_count} failed, ${relaunched_count} relaunched (dry_run=${dry_run})"
+'
+
+ssh -o BatchMode=yes "${DCC_HOST}" "bash -lc $(printf '%q' "${remote_cmd}")"

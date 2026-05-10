@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Sync local branch to DCC, then run a submitter remotely.
+# Usage: scripts/dcc/dispatch <submitter-relpath> [args...]
+#
+# Examples:
+#   scripts/dcc/dispatch scripts/neuroprobe/submit_tier_c_cross_subject.py \
+#       --l1-winner-norm train_set_fixed --l2-winner-ref bipolar \
+#       --l2-winner-view stft_abs --skip-baseline
+#
+#   scripts/dcc/dispatch scripts/neuroprobe/audit_stimulus_overlap_cross_session.py \
+#       --mode per-task --out-dir reports/neuroprobe_stage0_v0x_per_task_2026_05_10
+#
+# Submitter path is relative to repo root. The remote runs it via .venv/bin/python.
+
+set -euo pipefail
+
+DCC_HOST="${DCC_HOST:-ht203@dcc-login.oit.duke.edu}"
+DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: scripts/dcc/dispatch <submitter-relpath> [args...]" >&2
+  exit 2
+fi
+
+submitter="$1"; shift
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+"${script_dir}/sync"
+
+remote_args=()
+for arg in "$@"; do
+  remote_args+=("$(printf '%q' "${arg}")")
+done
+
+echo ">> ${DCC_HOST}: .venv/bin/python ${submitter} ${remote_args[*]:-}"
+ssh -t "${DCC_HOST}" \
+  "cd '${DCC_REPO}' && .venv/bin/python ${submitter} ${remote_args[*]:-}"

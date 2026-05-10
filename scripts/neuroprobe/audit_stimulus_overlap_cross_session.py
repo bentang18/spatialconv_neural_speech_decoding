@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 """V0.x — CrossSession stimulus-overlap audit.
 
 Per (subject, task), the Neuroprobe CrossSession protocol uses one trial as
