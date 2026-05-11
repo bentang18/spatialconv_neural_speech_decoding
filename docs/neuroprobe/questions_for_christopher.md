@@ -1,6 +1,6 @@
 # Questions for Christopher Wang
 
-Running list. Pruned and reordered before each call. Last refreshed 2026-05-05.
+Running list. Pruned and reordered before each call. Last refreshed 2026-05-10.
 
 Next contact: ping 2026-05-08, request a chat.
 
@@ -11,6 +11,7 @@ Next contact: ping 2026-05-08, request a chat.
 - Would you accept a community-contributed mapping if we derived one from public anatomy + plotting coords + (where available) per-subject FreeSurfer-style intermediates? What would make such a contribution land vs. not?
 - Is there any provenance attached to `elec_coords_full.csv` we can use? E.g., the projection script, the snap-distance threshold, the hemisphere assignment rule.
 - The braintreebank.dev quickstart notebook — does any cell in it touch a latent fsaverage step we missed in the public files? (Will check the notebook before the call regardless.)
+- When the per-electrode `fsaverage` table ships, will it land as a `NeuralFetch` artifact (per-electrode metadata extractor on the `Wang2024Treebank` Study) or as a one-off CSV? If `NeuralFetch`, our v14 `BNAParcelMetadataExtractor` builds on top cleanly; if not, we build it ourselves from your coords as input.
 
 ## B — New linear-decoding NeurIPS submission
 
@@ -93,10 +94,49 @@ V0 already verified the seeded-shuffle-then-cap behavior from `c7b955b0`'s code.
 - Any internal experiments on Lite-vs-Full or random/anatomy/full electrode-set robustness beyond what's in the rebuttal Appendix?
 - Sessions or electrodes you'd quietly exclude even though they pass the Lite mask? (V1 didn't find anything major, but you'd know.)
 
-## H — Misc / future-facing
+## H — Stimulus overlap across CrossSession trials — TIER 2
+
+V0.x DCC per-task audit landed 2026-05-10. **15/15 evaluated tasks leak**, 0 clean, 0 in the watch band. Per-task mean overlap fraction (test rows whose word also appears in train) ranges 33–48% across CrossSession; worst per-cell case sub7 onset 79.2% max, sub7 speech 75.9% max. `frame_brightness`, `pitch`, `face_num` average ≥0.479. Even `onset` (label stimulus-independent in principle) shows 33% mean — issue is brain-pattern memorization, not just label-bound content. Numbers in `reports/neuroprobe_stage0_v0x_stimulus_overlap_2026_05_10/`.
+
+Earlier laptop upper bound (V0.x outer): ALL unique words in the test trial appear in the train trial **40% mean, 45% max** across all 12 (subject, trial-pair) cells. Same-movie repeats are not randomized, so word identity is shared between trials. Per-task DCC mode tightens after Neuroprobe's label-balancing + `rng.choice` cap and the picture is roughly the same.
+
+For tasks whose label is a function of the word's acoustic / lexical / surprisal properties (pitch, volume / RMS, speech vs non-speech, GPT-2 surprisal, sentence-final, etc.), the linear classifier can in principle learn the (subject, word) → label association during train and re-recognize the same brain pattern at test — partial stimulus memorization rather than brain-decoding generalization. Tasks whose label is stimulus-independent (word onset y/n) are still affected by raw-pattern memorization at the 33%-overlap level.
+
+- Are you aware of the train/test word overlap in the CrossSession protocol, and is it factored into the published headline numbers anywhere?
+- Does the upstream pipeline (`eval_population.py` / `datasets.py` / `eval_utils.py`) do any word-level dedup at any stage, or are train and test allowed to share exemplars freely?
+- For the new NeurIPS linear-decoding submission (section B): is there an "exclude-overlap" or "leakage-corrected" sister metric reported alongside the standard CrossSession AUROC? If so, what's the protocol (drop test rows whose word also appears in train; drop full word groups; something else)?
+- Recommended canonical way for us to report a leakage-corrected number for label-content tasks so the comparison to PopT / BrainBERT stays apples-to-apples? Per-task post-hoc filter on the same eval rows, or re-run on a filtered Lite split?
+- Plans for Neuroprobe v2 to mark or pre-filter overlapping exemplars in the eval set? (Would influence whether we ship our own filter for v14 vs. wait.)
+- Practical take: do you read the CrossSession AUROC for label-content tasks as a clean brain-decoding number, or do you treat CrossSubject as the load-bearing eval for those? (We're planning to lean on CrossSubject in the v14 headline; want to know if you'd advocate or push back on that framing.)
+
+## H2 — Within-subject session-id linear separability — TIER 2
+
+L.5.P2 nuisance probe landed 2026-05-10 (`reports/neuroprobe_stage0_l5_nuisance_probes_2026_05_10_p2only/L.5.P2/metrics.json`). For each of the 6 BT Lite subjects, trained a per-subject LogReg to decode session-id (binary, since each Lite subject has 2 trials) from the L.2 winner features (shaft_laplacian × stft_abs, train_set_fixed normalization, 1s window). Result: **all 6 subjects ≥ 0.999 AUROC** (macro 0.9998, balanced accuracy 0.997). Within-subject, the L.2 winner view carries enough session-level structure for a linear probe to identify which session a window came from with near-perfect accuracy.
+
+Caveat we want to discuss: feature dim is ~77K with ~15K train rows on a binary task — high-dim binary is biased toward near-perfect linear separability under any session-statistic shift (electrode drift, gain change, noise floor). So the kill-threshold of AUROC > 0.95 is loose for this regime, and the finding may not mean "the view is unusable" so much as "session statistics are non-trivially different and a CrossSession linear classifier could exploit them as a side channel for any task whose label is also session-correlated."
+
+- Have you ever probed within-subject session-id separability from your linear-baseline features? If so, what numbers did you get and how did you read them?
+- Is there any session-drift correction in the upstream pipeline we missed (per-session re-norm, channel-wise gain alignment, drift removal between trials)? `c7b955b0` `eval_population.py:248-250` fits StandardScaler on training features only — but train spans multiple sessions, so per-session mean shift would survive into the fit. We're not seeing a separate per-session re-baseline in your code.
+- For tasks whose label distribution differs across the 2 sessions of a CrossSession pair (e.g. one trial features more high-pitch words than the other), a linear classifier could in principle short-circuit through "which session is this?" → "what label distribution to predict?" rather than learning a brain → label mapping. Have you checked whether any of the 15 CrossSession headline numbers are session-confounded in this way?
+- Does the new NeurIPS linear-decoding submission (section B) include any session-drift mitigation we should adopt for v14?
+- Practical: should we be reporting a "session-balanced" CrossSession AUROC alongside the standard one, where train and test are constructed to have matched per-session label priors? Or does that defeat the purpose of CrossSession?
+- Stage-0 freeze impact: we're holding R4×I2 as the L.2 winner. The session-id leak doesn't disqualify the view (every reasonable preprocessing recipe will leak this on a binary high-dim probe), but it does mean v14's CrossSession wins must be checked against a session-shuffled control. Reasonable read?
+
+## I — Misc / future-facing
 
 - Any plans for a multi-corpus iEEG release that would compose with BT (e.g. AJILE12-style)? We're targeting ~500–1000h Tier-0 SSL fuel and BT alone won't get us there.
 - Anything about your roadmap for BT v2 / additional sessions we should know before committing to a v14 architecture freeze on the current Lite contract?
+- **L.7 audio-FM upper bound (Conwell veRSA control)**: do you happen to have cached Whisper-large-v3 features (any layer, but ideally L8) per word for the BT movie corpus? Public BT distribution has classical features.csv (mel/RMS/pitch) but no waveforms, so we can't run Whisper ourselves without sourcing the source movies separately. Cached features would short-circuit the audio-source problem entirely. (If not, we'll source the movies — wanted to check before doing so.)
+
+## J — NeuralBench / NeuralFetch upstreaming — TIER 2
+
+Context: NeuralBench-EEG v1.0 (Banville/King 2026, FAIR) explicitly invites iEEG tasks; v1 ships zero iEEG. Our Stage-0 substrate is already NeuralFetch / NeuralSet / NeuralTrain. Two upstream contributions are on the table — both touch your data and overlap with your NeurIPS submission, so we want to coordinate with you before opening any PR.
+
+- **`Wang2024Treebank` Study → NeuralFetch upstream**: would you object to us upstreaming a `Wang2024Treebank` Study class (NeuralFetch's per-corpus metadata + raw-loader contract) so that any FAIR/Meta-built model can pull BT through the standard interface? It's your dataset; we'd want you on the PR (as co-author or reviewer, your call) and would not land it without your sign-off. Alternative: you have your own canonical Study you'd rather upstream — happy to defer.
+- **Neuroprobe task definitions → NeuralBench iEEG slice**: the Neuroprobe tasks (15 binary + multi-class on word features) are the most usable iEEG-eval surface today. We were planning to propose them as the first iEEG slice of NeuralBench. Same coordination ask — would you support, push back, or want to lead the proposal? Worried we'd step on whatever your NeurIPS submission frames as the canonical BT eval.
+- **Linear-baseline pinning**: if your NeurIPS result lands a new canonical multiclass number above the 0.611 published, we'd want both the v14 submit gate AND any NeuralBench iEEG-task YAMLs to pin to the new linear baseline. What's the cleanest way to coordinate that — track a pinned commit, ship the new baseline as a NeuralFetch eval recipe, something else?
+- **NeuralBench awareness**: are you tracking NeuralBench as competing with Neuroprobe, complementing it, or orthogonal? Asking because if your view is "Neuroprobe is the iEEG benchmark; NeuralBench is for non-invasive," then our upstreaming proposal should be framed differently.
+- **v14 thesis disclosure (briefly, before any infra PR)**: atlas-anchored shared coordinate frame (BNA Tier-1 soft support, not DK hard pooling), multi-FM cross-modal SSL with Whisper-L8 + DINOv3 teachers, zero per-subject parameters. You should know what we're doing on your data before agreeing to be on infra PRs that benefit from it.
 
 ## Resolved (kept for reference)
 

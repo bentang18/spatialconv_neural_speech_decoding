@@ -1,0 +1,116 @@
+{
+  "noise_band": 0.005,
+  "aggregate": {
+    "C.0_baseline": {
+      "n": 10,
+      "mean": 0.5309576222958742,
+      "sd": 0.023456957644994874
+    },
+    "C.1_l1_winner": {
+      "n": 10,
+      "mean": 0.5309576222958742,
+      "sd": 0.023456957644994874,
+      "delta_mean_vs_C0": 0.0,
+      "delta_sd_vs_C0": 0.0,
+      "n_better": 0,
+      "n_worse": 0,
+      "n_tie": 10
+    },
+    "C.2_l1_l2_winner": {
+      "n": 10,
+      "mean": 0.5391836874056825,
+      "sd": 0.027732562719113996,
+      "delta_mean_vs_C0": 0.008226065109808316,
+      "delta_sd_vs_C0": 0.013523284025842306,
+      "n_better": 6,
+      "n_worse": 4,
+      "n_tie": 7
+    }
+  },
+  "per_session": [
+    {
+      "session": "(1,1)",
+      "C.0_baseline": 0.5582489728972969,
+      "C.1_l1_winner": 0.5582489728972969,
+      "C.2_l1_l2_winner": 0.5577422735102576,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": -0.0005066993870392889
+    },
+    {
+      "session": "(1,2)",
+      "C.0_baseline": 0.5664018789432376,
+      "C.1_l1_winner": 0.5664018789432376,
+      "C.2_l1_l2_winner": 0.5734083223368065,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": 0.0070064433935689285
+    },
+    {
+      "session": "(10,0)",
+      "C.0_baseline": 0.523626159173799,
+      "C.1_l1_winner": 0.523626159173799,
+      "C.2_l1_l2_winner": 0.5218045041558796,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": -0.0018216550179193103
+    },
+    {
+      "session": "(10,1)",
+      "C.0_baseline": 0.5075377875710972,
+      "C.1_l1_winner": 0.5075377875710972,
+      "C.2_l1_l2_winner": 0.5122962998761589,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": 0.004758512305061635
+    },
+    {
+      "session": "(3,0)",
+      "C.0_baseline": 0.5242194088407022,
+      "C.1_l1_winner": 0.5242194088407022,
+      "C.2_l1_l2_winner": 0.5570776584305223,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": 0.03285824958982009
+    },
+    {
+      "session": "(3,1)",
+      "C.0_baseline": 0.5391569744912238,
+      "C.1_l1_winner": 0.5391569744912238,
+      "C.2_l1_l2_winner": 0.5729977442068187,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": 0.03384076971559491
+    },
+    {
+      "session": "(4,0)",
+      "C.0_baseline": 0.5531496290332505,
+      "C.1_l1_winner": 0.5531496290332505,
+      "C.2_l1_l2_winner": 0.5564624706837247,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": 0.0033128416504741853
+    },
+    {
+      "session": "(4,1)",
+      "C.0_baseline": 0.5340007844149129,
+      "C.1_l1_winner": 0.5340007844149129,
+      "C.2_l1_l2_winner": 0.5336073581296812,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": -0.00039342628523175716
+    },
+    {
+      "session": "(7,0)",
+      "C.0_baseline": 0.49910521315348993,
+      "C.1_l1_winner": 0.49910521315348993,
+      "C.2_l1_l2_winner": 0.5024623810818499,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": 0.0033571679283599942
+    },
+    {
+      "session": "(7,1)",
+      "C.0_baseline": 0.5041294144397315,
+      "C.1_l1_winner": 0.5041294144397315,
+      "C.2_l1_l2_winner": 0.5039778616451253,
+      "C.1_l1_winner_minus_C0": 0.0,
+      "C.2_l1_l2_winner_minus_C0": -0.0001515527946062134
+    }
+  ],
+  "verdicts": {
+    "C.1_l1_winner": "no transfer (\u0394 within \u00b10.005) \u2014 within-session winner doesn't carry",
+    "C.2_l1_l2_winner": "generalizes (\u0394 > +0.005) \u2014 v14 inherits the gain"
+  }
+}
