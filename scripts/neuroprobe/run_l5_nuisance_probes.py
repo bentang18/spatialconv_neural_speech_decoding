@@ -60,7 +60,6 @@ def main() -> None:
 
     sys.path.insert(0, str(repo_dir))
     sys.path.insert(0, str(repo_dir / "examples"))
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     os.environ["ROOT_DIR_BRAINTREEBANK"] = str(bt_root)
 
     from neuroprobe.braintreebank_subject import BrainTreebankSubject  # noqa: E402
@@ -70,7 +69,7 @@ def main() -> None:
         preprocess_stft,
         subset_electrodes,
     )
-    from preprocess_views import make_upstream_helpers, preprocess_views  # noqa: E402
+    from speech_decoding.views import make_upstream_helpers, preprocess_views  # noqa: E402
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

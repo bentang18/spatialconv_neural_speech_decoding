@@ -26,23 +26,13 @@ The two primitives are reused directly from upstream where they exist
 
 from __future__ import annotations
 
-import re
 from typing import Any, Callable
 
 import numpy as np
 import torch
 from scipy import signal
 
-
-_SHAFT_RE = re.compile(r"^(.*?)(\d+)$")
-
-
-def parse_shaft(channel_name: str) -> tuple[str, int | None]:
-    """Split ``"OFa12"`` into ``("OFa", 12)``. Non-numeric suffix returns ``(name, None)``."""
-    match = _SHAFT_RE.match(channel_name)
-    if match is None:
-        return channel_name, None
-    return match.group(1), int(match.group(2))
+from speech_decoding.extractors.reference import parse_shaft  # noqa: F401
 
 
 REFERENCES: tuple[str, ...] = (

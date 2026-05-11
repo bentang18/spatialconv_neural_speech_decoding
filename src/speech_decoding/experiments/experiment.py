@@ -138,32 +138,32 @@ class Experiment(BaseExperiment):
             kwargs["limit_test_batches"] = self.limit_test_batches
         return pl.Trainer(**kwargs)
 
+    def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:
+        if self.infra.folder is None:
+            return None, ""
+        try:
+            uid_folder = self.infra.uid_folder(create=True)
+        except RuntimeError:
+            uid_folder = None
+        if uid_folder is None:
+            return Path(self.infra.folder) / "records", ""
+        return Path(uid_folder), Path(uid_folder).name
+
+    def _train_and_test(self) -> dict[str, float | None]:
+        pl.seed_everything(self.seed, workers=True)
+        loaders = self.data.build()
+        brain_module = self._build_brain_module(loaders["train"])
+        trainer = self._trainer()
+        if not self.test_only:
+            trainer.fit(brain_module, loaders["train"], loaders["val"])
+        results = trainer.test(brain_module, loaders["test"])
+        return dict(results[0]) if results else {}
+
     @infra.apply
     def run(self) -> dict[str, float | None]:
-        artifact_dir = None
-        exca_uid = ""
-        if self.infra.folder is not None:
-            try:
-                uid_folder = self.infra.uid_folder(create=True)
-            except RuntimeError:
-                uid_folder = None
-            if uid_folder is not None:
-                exca_uid = Path(uid_folder).name
-            artifact_dir = (
-                Path(uid_folder)
-                if uid_folder is not None
-                else Path(self.infra.folder) / "records"
-            )
+        artifact_dir, exca_uid = self._artifact_dir_and_uid()
         if artifact_dir is None:
-            pl.seed_everything(self.seed, workers=True)
-            loaders = self.data.build()
-            brain_module = self._build_brain_module(loaders["train"])
-            trainer = self._trainer()
-            if not self.test_only:
-                trainer.fit(brain_module, loaders["train"], loaders["val"])
-            results = trainer.test(brain_module, loaders["test"])
-            return dict(results[0]) if results else {}
-
+            return self._train_and_test()
         with ExperimentLogger(
             artifact_dir=artifact_dir,
             stage="neuraltrain",
@@ -172,14 +172,7 @@ class Experiment(BaseExperiment):
             exca_uid=exca_uid,
             config_json=self.model_dump_json(exclude={"infra"}),
         ) as run_log:
-            pl.seed_everything(self.seed, workers=True)
-            loaders = self.data.build()
-            brain_module = self._build_brain_module(loaders["train"])
-            trainer = self._trainer()
-            if not self.test_only:
-                trainer.fit(brain_module, loaders["train"], loaders["val"])
-            results = trainer.test(brain_module, loaders["test"])
-            output = dict(results[0]) if results else {}
+            output = self._train_and_test()
             primary_name = next(iter(output), "")
             primary_value = output.get(primary_name) if primary_name else None
             run_log.set_metrics(

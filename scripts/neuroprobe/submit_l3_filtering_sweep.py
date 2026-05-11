@@ -11,7 +11,7 @@ Cells dispatched (per `docs/neuroprobe/stage_0.md` L.3 spec):
   L.3.F3  F1 + 1.0 Hz Butterworth HPF
 
 Filters apply to the FULL session voltage before trial windowing — see
-`scripts/neuroprobe/preprocess_views.py:apply_temporal_filter_inplace`.
+`speech_decoding.views.apply_temporal_filter_inplace`.
 
 L.3.E0 (BT Lite mask only) is identical to L.3.F0 — no separate dispatch.
 L.3.E1 (extra robust per-channel exclusions: flatline + amplitude-outlier +

@@ -3,7 +3,7 @@
 Replaces `submit_l2_reference_view_sweep.py` (degenerate — 9 cells collapsed
 onto 4 upstream `preprocess_type` strings). This submitter dispatches one
 sbatch per (cell × session), where cell = (reference, view) wired through
-`scripts/neuroprobe/preprocess_views.py` and the wrapper's
+`speech_decoding.views` and the wrapper's
 `--backend neuralset --ref-kind ... --view-kind ...` flags.
 
 Tier-A grid: 3 references (raw / bipolar / shaft_laplacian) × 3 views

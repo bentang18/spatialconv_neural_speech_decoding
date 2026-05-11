@@ -201,8 +201,7 @@ def run_eval(
 
     upstream_helpers = None
     if args.backend == "neuralset":
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from preprocess_views import make_upstream_helpers
+        from speech_decoding.views import make_upstream_helpers
         upstream_helpers = make_upstream_helpers(
             preprocess_stft=preprocess_stft,
             laplacian_rereference_neural_data=laplacian_rereference_neural_data,
@@ -227,7 +226,7 @@ def run_eval(
     notch_freqs = _parse_notch_freqs(getattr(args, "notch_freqs", ""))
     hpf_hz = float(getattr(args, "hpf_hz", 0.0))
     if notch_freqs or hpf_hz > 0:
-        from preprocess_views import apply_temporal_filter_inplace  # noqa: PLC0415
+        from speech_decoding.views import apply_temporal_filter_inplace  # noqa: PLC0415
         sr = int(nconfig.SAMPLING_RATE)
         t1 = time.time()
         apply_temporal_filter_inplace(
@@ -296,7 +295,7 @@ def run_eval(
                         return preprocess_data(
                             sliced, electrode_labels, preprocess_type, preprocess_parameters,
                         ).float().numpy()
-                    from preprocess_views import preprocess_views  # noqa: PLC0415
+                    from speech_decoding.views import preprocess_views  # noqa: PLC0415
                     feats, _ = preprocess_views(
                         sliced, list(electrode_labels),
                         ref_kind=args.ref_kind, view_kind=args.view_kind,
@@ -326,7 +325,7 @@ def run_eval(
                         # labels 1:1; shaft_laplacian preserves labels with
                         # remove_non_laplacian=False. Without this, regions sized
                         # to the original electrode count don't index post-ref X.
-                        from preprocess_views import apply_reference  # noqa: PLC0415
+                        from speech_decoding.views import apply_reference  # noqa: PLC0415
                         train_labels_orig = list(train_subject.electrode_labels)
                         test_labels_orig = list(subject.electrode_labels)
                         _, train_labels_ref = apply_reference(
@@ -641,7 +640,7 @@ def _parse_args() -> argparse.Namespace:
         choices=("upstream", "neuralset"),
         default="upstream",
         help="upstream = call eval_utils.preprocess_data (default, byte-equivalent to D.0). "
-             "neuralset = factor reference × view via scripts/neuroprobe/preprocess_views.py.",
+             "neuralset = factor reference × view via speech_decoding.views.",
     )
     p.add_argument(
         "--ref-kind",
