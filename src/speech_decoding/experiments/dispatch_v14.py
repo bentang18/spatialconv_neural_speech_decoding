@@ -96,7 +96,10 @@ def build_v14_experiment(
             c_max=DEFAULT_C_MAX,
         )
 
-    study = Wang2024Treebank(path=Path(bt_root), mode=mode)
+    study = Wang2024Treebank(
+        path=Path(bt_root), mode=mode,
+        infra_timelines={"cluster": None},
+    )
     dk_extractor = V14DKHardSupportExtractor(
         event_types="Ieeg", bt_root=bt_root, unknown_label_policy="skip",
         c_max=DEFAULT_C_MAX,
