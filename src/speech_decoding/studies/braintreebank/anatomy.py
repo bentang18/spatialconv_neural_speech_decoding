@@ -179,3 +179,84 @@ def _require_columns(table: pd.DataFrame, columns: set[str]) -> None:
     missing = sorted(columns - set(table.columns))
     if missing:
         raise KeyError(f"missing required columns {missing}")
+
+
+_DK_APARC_BASE_LABELS: tuple[str, ...] = (
+    "bankssts",
+    "caudalanteriorcingulate",
+    "caudalmiddlefrontal",
+    "cuneus",
+    "entorhinal",
+    "frontalpole",
+    "fusiform",
+    "inferiorparietal",
+    "inferiortemporal",
+    "insula",
+    "isthmuscingulate",
+    "lateraloccipital",
+    "lateralorbitofrontal",
+    "lingual",
+    "medialorbitofrontal",
+    "middletemporal",
+    "paracentral",
+    "parahippocampal",
+    "parsopercularis",
+    "parsorbitalis",
+    "parstriangularis",
+    "pericalcarine",
+    "postcentral",
+    "posteriorcingulate",
+    "precentral",
+    "precuneus",
+    "rostralanteriorcingulate",
+    "rostralmiddlefrontal",
+    "superiorfrontal",
+    "superiorparietal",
+    "superiortemporal",
+    "supramarginal",
+    "temporalpole",
+    "transversetemporal",
+)
+
+_DK_ASEG_BASE_LABELS: tuple[str, ...] = (
+    "Hippocampus",
+    "Amygdala",
+    "Caudate",
+    "Putamen",
+    "Pallidum",
+    "Thalamus-Proper",
+)
+
+V14_DK_PARCEL_LABELS_CORTICAL: tuple[str, ...] = tuple(
+    f"ctx-{hemi}-{base}" for hemi in ("lh", "rh") for base in _DK_APARC_BASE_LABELS
+)
+"""68 FreeSurfer DK aparc cortical labels (hemis-distinct), in BT depth-wm.csv string format."""
+
+V14_DK_PARCEL_LABELS_SUBCORTICAL: tuple[str, ...] = tuple(
+    f"{prefix}-{base}" for prefix in ("Left", "Right") for base in _DK_ASEG_BASE_LABELS
+)
+"""12 FreeSurfer aseg subcortical labels (Hippocampus/Amygdala/Caudate/Putamen/Pallidum/Thalamus-Proper, bilateral)."""
+
+V14_DK_PARCEL_LABELS: tuple[str, ...] = (
+    V14_DK_PARCEL_LABELS_CORTICAL + V14_DK_PARCEL_LABELS_SUBCORTICAL
+)
+"""Canonical K=80 v14 DK parcel vocabulary. Atlas-fixed, not cohort-derived —
+keeps unpopulated parcels alive for cross-cohort portability."""
+
+
+def parse_dk_label(label: str) -> tuple[str, str, str]:
+    """Parse a BT depth-wm DK label into ``(kind, hemi, base)``.
+
+    Returns
+    -------
+    kind : ``"cortical"`` or ``"subcortical"``.
+    hemi : ``"lh"`` or ``"rh"``.
+    base : the DK base region without prefix.
+    """
+    if label.startswith("ctx-lh-") or label.startswith("ctx-rh-"):
+        return "cortical", label[4:6], label[7:]
+    if label.startswith("Left-"):
+        return "subcortical", "lh", label.removeprefix("Left-")
+    if label.startswith("Right-"):
+        return "subcortical", "rh", label.removeprefix("Right-")
+    raise ValueError(f"unrecognised DK label: {label!r}")
