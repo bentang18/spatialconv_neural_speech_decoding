@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from speech_decoding.studies.braintreebank.anatomy import (
+    DEFAULT_SUPPORT_BIAS_EPS,
     build_hard_public_bt_label_support,
     bt_label_vocabulary,
     load_public_bt_anatomy,
@@ -132,3 +133,13 @@ def test_support_attention_bias_is_log_support_plus_eps() -> None:
 def test_support_attention_bias_rejects_negative_support() -> None:
     with pytest.raises(ValueError, match="non-negative"):
         support_attention_bias(np.array([[-1.0]], dtype=np.float32))
+
+
+def test_support_attention_bias_default_eps_is_v14_prior_strength() -> None:
+    assert DEFAULT_SUPPORT_BIAS_EPS == 1e-2
+    bias = support_attention_bias(np.array([[1.0, 0.0]], dtype=np.float32))
+    np.testing.assert_allclose(
+        bias,
+        np.log(np.array([[1.01, 0.01]], dtype=np.float32)),
+        rtol=1e-6,
+    )

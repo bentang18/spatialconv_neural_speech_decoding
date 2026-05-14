@@ -143,12 +143,25 @@ def build_hard_public_bt_label_support(
     )
 
 
+DEFAULT_SUPPORT_BIAS_EPS: float = 1e-2
+"""v14 anatomy-prior strength. Controls cross-attn QK-bias headroom off-parcel:
+1e-6 ≈ hard mask (off-parcel gradient ~ -14, dies), 1e-2 ≈ strong-but-finite
+prior (off-parcel ~ -4.6, learnable), 0.5 ≈ weak prior, ∞ → vanilla cross-attn.
+Default 1e-2 picked for first-pass robustness to residual DK label noise;
+sweep {1e-4, 1e-3, 1e-2, 1e-1} on first dispatch."""
+
+
 def support_attention_bias(
     support: np.ndarray,
     *,
-    eps: float = 1e-6,
+    eps: float = DEFAULT_SUPPORT_BIAS_EPS,
 ) -> np.ndarray:
-    """Convert support weights to Graphormer-style log attention bias."""
+    """Convert support weights to Graphormer-style log attention bias.
+
+    Used by v14 cross-attn as `softmax(QK / sqrt(d) + log(support + eps))`.
+    `eps` is the anatomy-prior strength hyperparameter — not a numerical-
+    stability constant. See ``DEFAULT_SUPPORT_BIAS_EPS``.
+    """
 
     if eps <= 0.0:
         raise ValueError("eps must be positive")
