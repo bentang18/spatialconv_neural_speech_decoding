@@ -31,10 +31,16 @@ from speech_decoding.studies.braintreebank.labels import NEUROPROBE_TASKS
 from speech_decoding.studies.braintreebank.manifest import BT_LITE_SESSIONS
 
 
-# Two anchor windows: D.0 baseline and the leading-window sanity row.
+# L.4 anchor / window cells. (start_before, end_after) → window
+# [-start_before, +end_after]s relative to word onset. Negative
+# start_before = window starts AFTER onset.
 ANCHORS: tuple[tuple[str, float, float], ...] = (
     ("L.4.A0_baseline_0_1s", 0.0, 1.0),
     ("L.4.A1_lead_neg375_pos625", 0.375, 0.625),
+    ("L.4.W2_neg125_pos875", 0.125, 0.875),
+    ("L.4.W3_pos125_pos1125", -0.125, 1.125),
+    ("L.4.W4_0_2s", 0.0, 2.0),
+    ("L.4.W5_0_05s", 0.0, 0.5),
 )
 
 
@@ -70,6 +76,14 @@ def main() -> None:
         anchors = (ANCHORS[0],)
     if args.lead_only:
         anchors = (ANCHORS[1],)
+    if args.cells:
+        wanted = {c.strip() for c in args.cells.split(",") if c.strip()}
+        anchors = tuple(a for a in ANCHORS if a[0] in wanted)
+        missing = wanted - {a[0] for a in ANCHORS}
+        if missing:
+            raise SystemExit(f"Unknown cell ids in --cells: {sorted(missing)}")
+        if not anchors:
+            raise SystemExit("--cells filter selected zero anchors")
 
     rows: list[dict[str, str]] = []
     for cell_id, start_before, end_after in anchors:
@@ -222,6 +236,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Only run the [0,1]s baseline anchor (parity check).")
     parser.add_argument("--lead-only", action="store_true",
                         help="Only run the [-0.375, +0.625]s leading anchor.")
+    parser.add_argument("--cells", default="",
+                        help="Comma-separated cell ids to dispatch (e.g. "
+                             "'L.4.W2_neg125_pos875,L.4.W3_pos125_pos1125'). "
+                             "Default: all six L.4 cells.")
     parser.add_argument("--partition", default="common,scavenger,coganlab-gpu")
     parser.add_argument("--account", default="coganlab")
     parser.add_argument("--cpus-per-task", type=int, default=4)

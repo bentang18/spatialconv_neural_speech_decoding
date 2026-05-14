@@ -53,6 +53,9 @@ VIEWS: tuple[str, ...] = (
     "multi_band_log_power",
     "wavelet_db4",
     "instantaneous_phase",
+    "hg_envelope_70_90",
+    "hg_envelope_90_120",
+    "hg_envelope_120_150",
 )
 
 
@@ -137,6 +140,12 @@ def apply_view(
         return torch.log(x + 1e-6)
     if view_kind == "hg_envelope_wide":
         return _hg_envelope(data, sampling_rate, lo_hz=70.0, hi_hz=200.0)
+    if view_kind == "hg_envelope_70_90":
+        return _hg_envelope(data, sampling_rate, lo_hz=70.0, hi_hz=90.0)
+    if view_kind == "hg_envelope_90_120":
+        return _hg_envelope(data, sampling_rate, lo_hz=90.0, hi_hz=120.0)
+    if view_kind == "hg_envelope_120_150":
+        return _hg_envelope(data, sampling_rate, lo_hz=120.0, hi_hz=150.0)
     if view_kind == "low_lfp":
         return _low_lfp(data, sampling_rate)
     if view_kind == "multi_band_log_power":
