@@ -339,6 +339,9 @@ def _render_readme(
     if len(orientation):
         pct_linear_ok = 100.0 * orientation["linear_ok"].mean()
         pct_monotonic = 100.0 * orientation["monotonic_r_ok"].mean()
+        deeper_counts = orientation["deeper_end"].value_counts().to_dict()
+        cohort_dominant = max(deeper_counts.items(), key=lambda kv: kv[1])[0]
+        cohort_dominant_pct = 100.0 * deeper_counts[cohort_dominant] / len(orientation)
         deeper_consistency = orientation.groupby("subject_id")["deeper_end"].agg(
             lambda s: s.value_counts(normalize=True).max()
         )
@@ -353,18 +356,63 @@ def _render_readme(
             }
         )
         per_subject_md = per_subject.to_markdown()
-        cross_subject_majority = deeper_majority.value_counts().to_dict()
+        deeper_breakdown_md = "; ".join(
+            f"{k}={v} ({100.0 * v / len(orientation):.1f}%)" for k, v in deeper_counts.items()
+        )
     else:
         pct_linear_ok = pct_monotonic = 0.0
         per_subject_md = "_(no orientation rows)_"
-        cross_subject_majority = {}
+        deeper_breakdown_md = "(no orientation rows)"
+        cohort_dominant = "n/a"
+        cohort_dominant_pct = 0.0
+        deeper_majority = pd.Series(dtype=object)
 
-    # Headline decisions
+    # Signed depth is admissible only if (a) suffix order is monotonic in
+    # physical position, AND (b) the sign convention is cohort-uniform at
+    # ≥95% per-shaft agreement on the dominant orientation. Per-subject
+    # majority agreement is necessary but not sufficient — within-subject
+    # disagreement on sign still flips ordinal features.
     signed_depth_allowed = (
         len(orientation) > 0
         and pct_monotonic >= 95.0
-        and len(cross_subject_majority) == 1
+        and cohort_dominant_pct >= 95.0
+        and len(set(deeper_majority.tolist())) == 1
     )
+
+    if signed_depth_allowed:
+        signed_depth_block = (
+            "**ALLOWED** — orientation is cohort-uniform at ≥95% per-shaft "
+            "agreement on the dominant sign. v14 may use signed depth features, "
+            "subject to the rejected-encodings list below:"
+        )
+        feature_lines = [
+            "- ordinal `contact_index` ✓ allowed (subject-mean-centered).",
+            "- normalized `contact_index / max_index` ✓ allowed.",
+            "- centered normalized position `2 * (i - 0.5*(max+min)) / range` ✓ allowed.",
+            "- same-shaft adjacency mask ✓ allowed.",
+            "- relative offset `|i - j|` on same shaft ✓ allowed.",
+            "- local-reference provenance metadata ✓ allowed (shaft-CAR / Laplacian indices).",
+        ]
+    else:
+        signed_depth_block = (
+            "**FORBIDDEN by default** — sign convention is not cohort-uniform "
+            f"({cohort_dominant_pct:.1f}% of shafts agree on dominant orientation "
+            f"`{cohort_dominant}`; threshold for admission is ≥95%). Within-subject "
+            "consistency ranges over the table below. Without a per-shaft sign "
+            "verifier (would need brain-entry-point coords from Chris MNI), any "
+            "signed-depth feature silently flips on the minority shafts and leaks "
+            "patient identity. v14 must use orientation-invariant within-shaft "
+            "features only:"
+        )
+        feature_lines = [
+            "- ordinal `contact_index` ✗ disallowed as a feature (subject-specific magnitude AND sign-ambiguous).",
+            "- normalized `contact_index / max_index` ✗ disallowed (sign-ambiguous).",
+            "- centered normalized position `2 * (i - 0.5*(max+min)) / range` ✗ disallowed (sign-ambiguous).",
+            "- same-shaft adjacency mask ✓ allowed.",
+            "- relative offset `|i - j|` on same shaft ✓ allowed.",
+            "- local-reference provenance metadata ✓ allowed (shaft-CAR / Laplacian indices).",
+        ]
+    signed_depth_block = signed_depth_block + "\n\n" + "\n".join(feature_lines)
 
     return f"""# BT shaft/depth geometry contract
 
@@ -404,19 +452,12 @@ gives PC1; `r(contact_index, PC1)` measures whether the integer suffix is a
 monotonic projection of physical position. Sign of `r` tells the suffix→depth
 direction *up to sign*.
 
-The cross-subject majority of `deeper_end` per shaft (from
-`pearson_suffix_centroid_dist`) is `{cross_subject_majority}`.
+Per-shaft `deeper_end` is computed by the per-subject-centroid heuristic
+(contacts farther from the cohort-subject centroid are taken to be closer to
+the skull entry point). Cohort breakdown: {deeper_breakdown_md}.
 
 ### 3. Signed-depth-feature policy
-{"**ALLOWED** — orientation is consistent across the cohort. v14 may use" if signed_depth_allowed else "**FORBIDDEN by default** — orientation is not consistent across the cohort. v14 must use"}
-orientation-invariant within-shaft features only:
-
-- ordinal `contact_index` ✗ disallowed as a feature (subject-specific magnitude).
-- normalized `contact_index / max_index` ✗ disallowed (sign-ambiguous).
-- centered normalized position `2 * (i - 0.5*(max+min)) / range` ✗ disallowed (sign-ambiguous).
-- same-shaft adjacency mask ✓ allowed.
-- relative offset `|i - j|` on same shaft ✓ allowed.
-- local-reference provenance metadata ✓ allowed (shaft-CAR / Laplacian indices).
+{signed_depth_block}
 
 ### 4. Reference scheme compatibility
 - **shaftCAR (R2, v14 default)**: orientation-INDEPENDENT. Uses `parse_shaft`
