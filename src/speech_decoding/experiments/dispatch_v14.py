@@ -154,6 +154,7 @@ def build_v14_experiment(
                     "name": "EventField",
                     "event_types": "Word",
                     "event_field": "label",
+                    "aggregation": "trigger",
                 },
             },
             "trigger_query": "type == 'Word'",
