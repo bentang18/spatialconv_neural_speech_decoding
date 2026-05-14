@@ -210,6 +210,33 @@ class _CrossAttnBlock(nn.Module):
         return latents
 
 
+def _compute_latent_valid(
+    *,
+    support: Tensor,
+    valid_mask: Optional[Tensor],
+    m_sub_slots: int,
+) -> Tensor:
+    """Return ``(B, L=K*M)`` bool mask: True iff parcel ``p`` has ≥1 covered electrode.
+
+    Used as the DETR memory-padding-mask for the readout (Carion 2020 §3.3):
+    a parcel slot with no electrode coverage in this subject is "padded memory"
+    and must not be attended to by the task query. All ``m_sub_slots`` of a
+    parcel share the same validity. When ``valid_mask`` is None, every
+    electrode row of ``support`` is treated as real.
+    """
+    if valid_mask is not None:
+        effective_support = support * valid_mask.unsqueeze(-1).to(support.dtype)
+    else:
+        effective_support = support
+    parcel_covered = effective_support.sum(dim=1) > 0  # (B, K)
+    B, K = parcel_covered.shape
+    return (
+        parcel_covered.unsqueeze(-1)
+        .expand(B, K, m_sub_slots)
+        .reshape(B, K * m_sub_slots)
+    )
+
+
 class V14ParcelPerceiverModel(nn.Module):
     """v14 Perceiver-IO encoder with parcel-id-tagged latents."""
 
@@ -321,7 +348,11 @@ class V14ClassifierHead(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.classifier = nn.Linear(d_model, n_classes)
 
-    def forward(self, latents: Tensor) -> Tensor:
+    def forward(
+        self,
+        latents: Tensor,
+        latent_valid: Optional[Tensor] = None,  # (B, L) bool
+    ) -> Tensor:
         B, L, d = latents.shape
         q = self.q_proj(self.ln_q(self.query.expand(B, 1, d))).reshape(
             B, 1, self.n_heads, self.head_dim
@@ -330,7 +361,14 @@ class V14ClassifierHead(nn.Module):
             B, L, 2, self.n_heads, self.head_dim
         )
         k, v = kv.unbind(dim=2)
-        attn = (torch.einsum("blhd,bshd->bhls", q, k) * self.scale).softmax(dim=-1)
+        attn_logits = torch.einsum("blhd,bshd->bhls", q, k) * self.scale
+        if latent_valid is not None:
+            invalid = ~latent_valid                              # (B, L)
+            attn_logits = attn_logits.masked_fill(
+                invalid.unsqueeze(1).unsqueeze(1),                # (B, 1, 1, L)
+                torch.finfo(attn_logits.dtype).min,
+            )
+        attn = attn_logits.softmax(dim=-1)
         ctx = torch.einsum("bhls,bshd->blhd", attn, v).reshape(B, 1, d)
         pooled = self.out_proj(ctx).squeeze(1)
         return self.classifier(pooled)
@@ -360,7 +398,12 @@ class V14ParcelPerceiverWithHead(nn.Module):
     ) -> Tensor:
         eps_used = self.eps if eps is None else eps
         latents = self.encoder(electrode_tokens, support, valid_mask, eps=eps_used)
-        return self.head(latents)
+        latent_valid = _compute_latent_valid(
+            support=support,
+            valid_mask=valid_mask,
+            m_sub_slots=self.encoder.m_sub_slots,
+        )
+        return self.head(latents, latent_valid=latent_valid)
 
 
 class V14ParcelPerceiver(BaseModelConfig):
