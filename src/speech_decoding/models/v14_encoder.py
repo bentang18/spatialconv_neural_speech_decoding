@@ -133,7 +133,14 @@ class _MultiHeadCrossAttentionWithBias(nn.Module):
 
 
 class _PlainMultiHeadSelfAttention(nn.Module):
-    """Self-attn over latents — no positional encoding (parcel-id embedding owns identity)."""
+    """Self-attn over latents — no positional encoding (parcel-id embedding owns identity).
+
+    Accepts an optional ``key_padding_mask: (B, L) bool`` (True = valid, False
+    = padded). v14-specific extension beyond canonical PerceiverIO/DETR: our
+    latents have variable per-subject validity (no-coverage parcels), so we
+    must mask invalid latents as keys/values to keep covered latents free of
+    no-coverage contamination — preserving the zero-per-subject-params claim.
+    """
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
@@ -143,12 +150,22 @@ class _PlainMultiHeadSelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        key_padding_mask: Optional[Tensor] = None,  # (B, L) bool — True = valid
+    ) -> Tensor:
         B, L, _ = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        attn = torch.einsum("blhd,bshd->bhls", q, k) * self.scale
-        attn = attn.softmax(dim=-1)
+        attn_logits = torch.einsum("blhd,bshd->bhls", q, k) * self.scale
+        if key_padding_mask is not None:
+            invalid = ~key_padding_mask                       # (B, L)
+            attn_logits = attn_logits.masked_fill(
+                invalid.unsqueeze(1).unsqueeze(1),             # (B, 1, 1, L)
+                torch.finfo(attn_logits.dtype).min,
+            )
+        attn = attn_logits.softmax(dim=-1)
         ctx = torch.einsum("bhls,bshd->blhd", attn, v)
         return self.out(ctx.reshape(B, L, -1))
 
@@ -178,7 +195,13 @@ class _TemporalEncoderBlock(nn.Module):
 
 
 class _LatentSelfAttnBlock(nn.Module):
-    """Latent self-attn + FFN, pre-LN."""
+    """Latent self-attn + FFN, pre-LN.
+
+    Forwards ``latent_valid: (B, L) bool`` as a key-padding mask to the inner
+    attention (see :class:`_PlainMultiHeadSelfAttention`). Invalid positions
+    still produce query outputs, but no covered position attends to them as
+    keys/values.
+    """
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
@@ -187,8 +210,12 @@ class _LatentSelfAttnBlock(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = _ffn(d_model)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self,
+        x: Tensor,
+        latent_valid: Optional[Tensor] = None,
+    ) -> Tensor:
+        x = x + self.attn(self.ln1(x), key_padding_mask=latent_valid)
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -327,8 +354,14 @@ class V14ParcelPerceiverModel(nn.Module):
         latents = self.parcel_embedding.reshape(1, L, self.d_model).expand(B, L, self.d_model)
 
         latents = self.cross_attn(latents, electrodes, bias_full)
+
+        latent_valid = _compute_latent_valid(
+            support=support,
+            valid_mask=valid_mask,
+            m_sub_slots=self.m_sub_slots,
+        )
         for block in self.latent_blocks:
-            latents = block(latents)
+            latents = block(latents, latent_valid=latent_valid)
         return self.encoder_ln(latents)
 
 
