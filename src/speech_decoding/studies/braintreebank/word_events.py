@@ -129,15 +129,20 @@ def _word_event_rows(
         )
         for class_id, indices in label_indices.items():
             for idx in indices:
-                if task in {"onset", "speech"} and class_id == 0:
+                is_nonverbal = task in {"onset", "speech"} and class_id == 0
+                if is_nonverbal:
                     source = nonverbal_df.iloc[int(idx)]
+                    text = "<nonverbal>"
                 else:
                     source = words_df.iloc[int(idx)]
+                    raw_text = source.get("full_word", "")
+                    text = str(raw_text) if pd.notna(raw_text) and str(raw_text) else "<word>"
                 rows.append(
                     {
                         "type": "Word",
                         "start": float(source["start"]),
                         "duration": float(duration),
+                        "text": text,
                         "task": task,
                         "label": int(class_id),
                         "subject_id": str(subject_id),
@@ -148,7 +153,7 @@ def _word_event_rows(
     if not rows:
         return pd.DataFrame(
             {col: pd.Series(dtype=object) for col in (
-                "type", "start", "duration", "task", "label",
+                "type", "start", "duration", "text", "task", "label",
                 "subject_id", "trial_id", "timeline",
             )}
         )
