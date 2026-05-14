@@ -35,7 +35,19 @@ collect_experiment_records()  ────────────────�
   `ExperimentRunRecord` pydantic model, and writes a CSV. Idempotent —
   re-running overwrites `runs.csv` from the JSON ground truth.
 - `scripts/neuroprobe/collect_experiment_records.py` is the CLI entrypoint
-  (`--artifact-root` repeatable, `--out-csv` overridable).
+  (`--artifact-root` repeatable, `--out-csv` overridable). Typical invocation:
+
+  ```bash
+  .venv/bin/python scripts/neuroprobe/collect_experiment_records.py \
+    --artifact-root reports \
+    --artifact-root /hpc/group/coganlab/ht203/cache_neuroai \
+    --out-csv docs/experiments/runs.csv
+  ```
+
+- Pre-NeuroAI-reset ablation log + run JSONs are archived at
+  `docs/archive/experiments/pre_neuroai_reset_2026_04_29/`. Do **not** extend
+  that schema — it reflects the retired PS-era training loop and sbatch
+  tooling. New runs land in `runs.csv` via the schema below.
 
 ## Schema
 
