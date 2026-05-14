@@ -35,6 +35,17 @@ def test_wang2024treebank_defaults_to_lite_manifest(tmp_path) -> None:
     assert timelines[0] == {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
 
 
+def test_wang2024treebank_mode_excluded_from_cls_kwargs(tmp_path) -> None:
+    """``mode='nano'`` would otherwise be flagged by NeuralSet's
+    ``_cls_kwargs`` as an unsupported class parameter, blocking dispatch."""
+    study = Wang2024Treebank(path=tmp_path, mode="nano")
+    assert study._cls_kwargs() == {}
+    timeline_str = study._to_timeline_string(
+        {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
+    )
+    assert "mode" not in timeline_str
+
+
 def test_wang2024treebank_emits_ieeg_special_loader_without_reading_raw(
     monkeypatch, tmp_path
 ) -> None:

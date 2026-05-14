@@ -64,6 +64,24 @@ class Wang2024Treebank(study.Study):
             "braintreebank_download_extract.py, then set ROOT_DIR_BRAINTREEBANK."
         )
 
+    def _cls_kwargs(self) -> dict[str, tp.Any]:
+        """`mode` selects which timelines are emitted; it doesn't change content
+        within a timeline. NeuralSet's default ``_cls_kwargs`` rejects any
+        non-default pydantic field as an unsupported "class parameter", which
+        blocks dispatch with ``mode != "lite"``. Drop ``mode`` from the class
+        descriptor — it lives in the timeline list, not the class uid.
+        """
+        kwargs: dict[str, tp.Any] = self.model_dump(
+            serialize_as_any=True, exclude_defaults=True,
+        )
+        for p in ("infra", "infra_timelines", "path", "name", "query", "mode"):
+            kwargs.pop(p, None)
+        if kwargs:
+            raise RuntimeError(
+                f"Wang2024Treebank: unexpected non-default fields {sorted(kwargs)}"
+            )
+        return kwargs
+
     def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
         for subject_id, trial_id in _SESSIONS_BY_MODE[self.mode]:
             yield {
