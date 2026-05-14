@@ -112,6 +112,36 @@ def test_dk_support_c_max_pads_output(tmp_path) -> None:
     assert out[2:].sum().item() == 0.0
 
 
+def test_dispatch_default_wires_btwordevents_chain(tmp_path, monkeypatch) -> None:
+    """``build_v14_experiment`` wraps Wang2024Treebank + BTWordEvents in an
+    ``ns.Chain`` so split-aware Word events flow into the segmenter."""
+    import neuralset as ns
+    from speech_decoding.studies.braintreebank.study import Wang2024Treebank
+    from speech_decoding.studies.braintreebank.word_events import BTWordEvents
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+
+    chain = xp.data.study
+    assert isinstance(chain, ns.Chain), f"expected ns.Chain, got {type(chain)!r}"
+    assert len(chain.steps) == 2
+    assert isinstance(chain.steps[0], Wang2024Treebank)
+    assert isinstance(chain.steps[1], BTWordEvents)
+    assert chain.steps[1].tasks == (dispatch_v14.DEFAULT_TASK,)
+    assert chain.steps[1].eval_mode == "CrossSession"
+    assert xp.data.segmenter.trigger_query == "type == 'Word'"
+
+
+def test_dispatch_default_target_pulls_label_from_word(tmp_path, monkeypatch) -> None:
+    """Target extractor must read ``label`` off the Word events, not from Ieeg."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+
+    target = xp.data.segmenter.extractors["target"]
+    assert target.event_types == "Word"
+    assert target.event_field == "label"
+
+
 def test_log_stft_view_pads_to_c_max(monkeypatch) -> None:
     """When ``c_max`` is set, LogStftView pads (C_event, F, T) -> (c_max, F, T)."""
     from neuralset.base import TimedArray
