@@ -224,6 +224,7 @@ class V14ParcelPerceiverModel(nn.Module):
         depth_self_attn: int = 6,
         depth_temporal: int = 1,
         m_sub_slots: int = 4,
+        time_last_input: bool = False,
     ) -> None:
         super().__init__()
         self.n_freq_bins = n_freq_bins
@@ -231,6 +232,7 @@ class V14ParcelPerceiverModel(nn.Module):
         self.k_parcels = k_parcels
         self.m_sub_slots = m_sub_slots
         self.d_model = d_model
+        self.time_last_input = time_last_input
 
         self.input_proj = nn.Linear(n_freq_bins, d_model)
         self.temporal_blocks = nn.ModuleList(
@@ -250,12 +252,14 @@ class V14ParcelPerceiverModel(nn.Module):
 
     def forward(
         self,
-        electrode_tokens: Tensor,   # (B, C, T_bins, F_bins)
+        electrode_tokens: Tensor,   # (B, C, T_bins, F_bins) or (B, C, F_bins, T_bins) if time_last_input
         support: Tensor,            # (B, C, K_parcels)
         valid_mask: Optional[Tensor] = None,  # (B, C) bool
         *,
         eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     ) -> Tensor:
+        if self.time_last_input:
+            electrode_tokens = electrode_tokens.transpose(-1, -2)
         B, C, T, F = electrode_tokens.shape
         if F != self.n_freq_bins:
             raise ValueError(
@@ -377,6 +381,7 @@ class V14ParcelPerceiver(BaseModelConfig):
     depth_temporal: int = 1
     m_sub_slots: int = 4
     eps: float = DEFAULT_SUPPORT_BIAS_EPS
+    time_last_input: bool = False
 
     def build(
         self,
@@ -406,6 +411,7 @@ class V14ParcelPerceiver(BaseModelConfig):
             depth_self_attn=self.depth_self_attn,
             depth_temporal=self.depth_temporal,
             m_sub_slots=self.m_sub_slots,
+            time_last_input=self.time_last_input,
         )
         head = V14ClassifierHead(
             d_model=self.d_model, n_classes=n_classes, n_heads=self.n_heads

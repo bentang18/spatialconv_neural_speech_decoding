@@ -257,13 +257,8 @@ def test_v14_dispatch_dry_run_prints_config(capsys) -> None:
     assert "S5 excluded" in out
 
 
-def test_v14_dispatch_raises_until_electrode_tokens_extractor_wired(
-    tmp_path, monkeypatch,
-) -> None:
-    """Without an electrode-tokens extractor, ``build_v14_experiment`` must
-    raise NotImplementedError loudly — not silently produce a half-wired config."""
-    from speech_decoding.experiments import dispatch_v14
-    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
-    import pytest
-    with pytest.raises(NotImplementedError, match="electrode-tokens extractor"):
-        dispatch_v14.build_v14_experiment(mode="nano")
+# Removed: ``test_v14_dispatch_raises_until_electrode_tokens_extractor_wired``.
+# Gate closed by ``LogStftView`` (see ``test_v14_dispatch_wired.py``). The
+# inverse assertion — that ``build_v14_experiment`` defaults to LogStftView when
+# ``electrode_tokens_extractor`` is omitted — is covered by
+# ``test_dispatch_default_wires_log_stft_view`` in that file.

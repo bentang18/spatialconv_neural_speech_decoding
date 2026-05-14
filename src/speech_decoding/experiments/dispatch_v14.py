@@ -13,11 +13,11 @@ Smoke-test (laptop, no BT data):
 
     .venv/bin/python -m speech_decoding.experiments.dispatch_v14 --dry-run
 
-GAP — does NOT run real BT data yet.  The encoder + DK support extractor +
-Wang2024Treebank study are all wired, but the per-event ``electrode_tokens``
-extractor (the STFT pipeline R2 × I2L × F1 applied per-trigger window) is not
-yet a ``BaseStatic`` extractor.  ``build_v14_experiment`` raises if called with
-``electrode_tokens_extractor=None`` so the gap is loud, not silent.
+Default electrode-tokens extractor is :class:`LogStftView` (N1 × R2 × I2L × F1),
+default support is :class:`V14DKHardSupportExtractor` (K=80 DK, ``c_max=120``
+padded), default valid-mask is :class:`ElectrodeValidMask` (``c_max=120``).
+Caller can pass ``electrode_tokens_extractor=...`` to override the default
+(e.g. for the P2 defensive sister run using the linear-baseline recipe).
 """
 
 from __future__ import annotations
@@ -27,8 +27,11 @@ import os
 import typing as tp
 from pathlib import Path
 
+import speech_decoding.models  # noqa: F401  # registers V14ParcelPerceiver with BaseModelConfig
 from speech_decoding.experiments import Data, Experiment
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
+from speech_decoding.extractors.valid_mask import ElectrodeValidMask
+from speech_decoding.extractors.view import LogStftView
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
@@ -48,6 +51,7 @@ DEFAULT_N_TIME_BINS = 17   # 1-second window with overlap=0.75
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_N_EPOCHS = 100
 DEFAULT_TASK = "frame_perception"
+DEFAULT_C_MAX = 120  # Neuroprobe-Lite electrode cap (Wang 2024 / Zahorodnii 2026 p.6)
 
 
 def build_v14_experiment(
@@ -82,16 +86,23 @@ def build_v14_experiment(
         )
 
     if electrode_tokens_extractor is None:
-        raise NotImplementedError(
-            "v14 electrode-tokens extractor not wired yet: needs a BaseStatic "
-            "wrapper around preprocess_views(N1 × R2 × I2L × F1) emitting "
-            f"(n_channels, n_time_bins={n_time_bins}, n_freq_bins={n_freq_bins}) "
-            "per Ieeg trigger window. Pass an instance to unblock real dispatch."
+        electrode_tokens_extractor = LogStftView(
+            event_types="Ieeg",
+            car="shaft",
+            notch_filter=60.0,
+            scaler="StandardScaler",
+            channel_order="original",
+            c_max=DEFAULT_C_MAX,
         )
 
     study = Wang2024Treebank(path=Path(bt_root), mode=mode)
     dk_extractor = V14DKHardSupportExtractor(
         event_types="Ieeg", bt_root=bt_root, unknown_label_policy="skip",
+        c_max=DEFAULT_C_MAX,
+    )
+    valid_mask_extractor = ElectrodeValidMask(
+        event_types="Ieeg", bt_root=bt_root, c_max=DEFAULT_C_MAX,
+        unknown_label_policy="skip",
     )
 
     data = Data(
@@ -100,6 +111,7 @@ def build_v14_experiment(
             "extractors": {
                 "electrode_tokens": electrode_tokens_extractor,
                 "support": dk_extractor,
+                "valid_mask": valid_mask_extractor,
                 "target": {
                     "name": "EventField",
                     "event_types": "Ieeg",
@@ -122,6 +134,7 @@ def build_v14_experiment(
 
     return Experiment(
         data=data,
+        infra=infra_cfg,
         brain_model_config={
             "name": "V14ParcelPerceiver",
             "n_freq_bins": n_freq_bins,
@@ -132,6 +145,7 @@ def build_v14_experiment(
             "depth_self_attn": depth,
             "m_sub_slots": m_sub_slots,
             "eps": eps,
+            "time_last_input": True,
         },
         loss={"name": "CrossEntropyLoss"},
         optim={"optimizer": {"name": "Adam", "lr": 1e-3}},
@@ -144,10 +158,9 @@ def build_v14_experiment(
         ],
         n_epochs=n_epochs,
         seed=seed,
-        x_name=("electrode_tokens", "support"),
+        x_name=("electrode_tokens", "support", "valid_mask"),
         accelerator="auto",
         devices="auto",
-        infra=infra_cfg if infra_cfg else None,  # type: ignore[arg-type]
     )
 
 
@@ -184,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print("  (dry-run: not building Experiment; "
-              "electrode-tokens extractor not wired yet)")
+              "default electrode-tokens extractor = LogStftView)")
         return 0
 
     xp = build_v14_experiment(

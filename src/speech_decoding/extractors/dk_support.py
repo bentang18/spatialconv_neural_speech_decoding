@@ -31,12 +31,18 @@ from speech_decoding.studies.braintreebank.anatomy import (
 
 
 class V14DKHardSupportExtractor(BaseStatic):
-    """Per-event ``(n_electrodes, K=80)`` DK-hard-one-hot support tensor."""
+    """Per-event DK-hard-one-hot support tensor.
+
+    Default output shape is ``(n_electrodes, K=80)`` in depth-wm.csv row order.
+    Setting ``c_max`` pads to ``(c_max, K=80)`` with zero-rows so per-batch
+    collation aligns alongside ``LogStftView`` and ``ElectrodeValidMask``.
+    """
 
     event_types: tp.Literal["Ieeg"] = "Ieeg"
     bt_root: str
     unknown_label_policy: tp.Literal["raise", "skip"] = "raise"
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS
+    c_max: int | None = None
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
@@ -56,7 +62,17 @@ class V14DKHardSupportExtractor(BaseStatic):
         result = build_hard_public_bt_label_support(
             electrode_labels, anatomy, self.parcel_labels,
         )
-        return torch.from_numpy(result.support)
+        support = torch.from_numpy(result.support)
+        if self.c_max is not None:
+            n_real = support.shape[0]
+            if n_real > self.c_max:
+                raise ValueError(
+                    f"subject {subject_id} has {n_real} electrodes which exceeds c_max={self.c_max}"
+                )
+            padded = torch.zeros(self.c_max, support.shape[1], dtype=support.dtype)
+            padded[:n_real] = support
+            support = padded
+        return support
 
 
 _BTBANK_RE = re.compile(r"^(?:btbank|sub_)?(\d+)$", re.IGNORECASE)
