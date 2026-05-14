@@ -174,6 +174,7 @@ def build_v14_experiment(
     return Experiment(
         data=data,
         infra=infra_cfg,
+        target_field="label",
         brain_model_config={
             "name": "V14ParcelPerceiver",
             "n_freq_bins": n_freq_bins,
