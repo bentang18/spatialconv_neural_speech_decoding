@@ -27,7 +27,6 @@ def _tiny_kwargs() -> dict:
         "d_model": 32,
         "n_heads": 4,
         "depth_self_attn": 2,
-        "depth_temporal": 1,
         "m_sub_slots": 2,
     }
 

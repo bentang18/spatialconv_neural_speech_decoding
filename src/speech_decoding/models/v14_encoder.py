@@ -71,37 +71,16 @@ def _apply_rope(x: Tensor, rope: Tensor) -> Tensor:
     return x * cos + x_rotated * sin
 
 
-class _RoPEMultiHeadSelfAttention(nn.Module):
-    """Multi-head self-attention with RoPE applied to Q and K."""
-
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int) -> None:
-        super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
-        self.register_buffer(
-            "rope", _rope_freqs(self.head_dim, max_seq_len), persistent=False
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B', T, d)
-        Bp, T, _ = x.shape
-        qkv = self.qkv(x).reshape(Bp, T, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)  # each (B', T, H, head_dim)
-        q = _apply_rope(q.transpose(1, 2), self.rope).transpose(1, 2)
-        k = _apply_rope(k.transpose(1, 2), self.rope).transpose(1, 2)
-        attn = torch.einsum("bthd,bshd->bhts", q, k) * self.scale
-        attn = attn.softmax(dim=-1)
-        ctx = torch.einsum("bhts,bshd->bthd", attn, v)
-        return self.out(ctx.reshape(Bp, T, -1))
-
-
 class _MultiHeadCrossAttentionWithBias(nn.Module):
-    """Latent ← electrode cross-attn with additive QK bias broadcast over heads."""
+    """Latent ← electrode cross-attn with additive QK bias broadcast over heads.
+
+    Optionally applies one-sided RoPE to the K vectors based on their time-bin
+    index. Q (latents) has no time axis, so it stays unrotated — this is
+    unusual versus canonical bidirectional Q+K RoPE but principled here:
+    absolute K position is what we need, and it lets us honor the
+    "RoPE on T_bins" spec commitment without introducing a separate
+    per-electrode temporal self-attn block.
+    """
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
@@ -119,12 +98,26 @@ class _MultiHeadCrossAttentionWithBias(nn.Module):
         latents: Tensor,         # (B, L, d)
         electrodes: Tensor,      # (B, N, d)  N = C * T_bins
         bias: Tensor,            # (B, L, N) — log(support+eps) + valid_mask
+        *,
+        key_rope: Optional[Tensor] = None,  # (2, T_bins, head_dim) cos/sin
+        t_bins: Optional[int] = None,
     ) -> Tensor:
         B, L, _ = latents.shape
         N = electrodes.shape[1]
         q = self.q_proj(latents).reshape(B, L, self.n_heads, self.head_dim)
         kv = self.kv_proj(electrodes).reshape(B, N, 2, self.n_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
+        if key_rope is not None:
+            if t_bins is None or N % t_bins != 0:
+                raise ValueError(
+                    f"key_rope requires t_bins that evenly divides N={N}, got t_bins={t_bins}"
+                )
+            C = N // t_bins
+            # (B, N, H, head_dim) → (B, C, T, H, head_dim) → (B, C, H, T, head_dim)
+            k_rot = k.reshape(B, C, t_bins, self.n_heads, self.head_dim).transpose(2, 3)
+            k_rot = _apply_rope(k_rot, key_rope)
+            # back to (B, N, H, head_dim)
+            k = k_rot.transpose(2, 3).reshape(B, N, self.n_heads, self.head_dim)
         logits = torch.einsum("blhd,bnhd->bhln", q, k) * self.scale
         logits = logits + bias.unsqueeze(1)  # broadcast over heads
         attn = logits.softmax(dim=-1)
@@ -178,22 +171,6 @@ def _ffn(d_model: int, mult: int = 4) -> nn.Module:
     )
 
 
-class _TemporalEncoderBlock(nn.Module):
-    """Per-electrode temporal self-attn with RoPE + FFN, pre-LN."""
-
-    def __init__(self, d_model: int, n_heads: int, max_t_bins: int) -> None:
-        super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = _RoPEMultiHeadSelfAttention(d_model, n_heads, max_t_bins)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = _ffn(d_model)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
-        return x
-
-
 class _LatentSelfAttnBlock(nn.Module):
     """Latent self-attn + FFN, pre-LN.
 
@@ -231,8 +208,19 @@ class _CrossAttnBlock(nn.Module):
         self.ln_ffn = nn.LayerNorm(d_model)
         self.ffn = _ffn(d_model)
 
-    def forward(self, latents: Tensor, electrodes: Tensor, bias: Tensor) -> Tensor:
-        latents = latents + self.attn(self.ln_q(latents), self.ln_kv(electrodes), bias)
+    def forward(
+        self,
+        latents: Tensor,
+        electrodes: Tensor,
+        bias: Tensor,
+        *,
+        key_rope: Optional[Tensor] = None,
+        t_bins: Optional[int] = None,
+    ) -> Tensor:
+        latents = latents + self.attn(
+            self.ln_q(latents), self.ln_kv(electrodes), bias,
+            key_rope=key_rope, t_bins=t_bins,
+        )
         latents = latents + self.ffn(self.ln_ffn(latents))
         return latents
 
@@ -276,7 +264,6 @@ class V14ParcelPerceiverModel(nn.Module):
         d_model: int = 128,
         n_heads: int = 4,
         depth_self_attn: int = 6,
-        depth_temporal: int = 1,
         m_sub_slots: int = 4,
         time_last_input: bool = False,
     ) -> None:
@@ -289,16 +276,20 @@ class V14ParcelPerceiverModel(nn.Module):
         self.time_last_input = time_last_input
 
         self.input_proj = nn.Linear(n_freq_bins, d_model)
-        self.temporal_blocks = nn.ModuleList(
-            [
-                _TemporalEncoderBlock(d_model, n_heads, n_time_bins)
-                for _ in range(depth_temporal)
-            ]
-        )
         self.parcel_embedding = nn.Parameter(
             torch.randn(k_parcels, m_sub_slots, d_model) * (1.0 / math.sqrt(d_model))
         )
         self.cross_attn = _CrossAttnBlock(d_model, n_heads)
+        # Time positional encoding for cross-attn keys (one-sided RoPE on K).
+        # Q (latents) has no time, so it is unrotated. The spec commitment
+        # "RoPE on per-electrode T_bins axis" is honored here without a
+        # separate temporal self-attn block.
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        head_dim = d_model // n_heads
+        self.register_buffer(
+            "key_rope", _rope_freqs(head_dim, n_time_bins), persistent=False
+        )
         self.latent_blocks = nn.ModuleList(
             [_LatentSelfAttnBlock(d_model, n_heads) for _ in range(depth_self_attn)]
         )
@@ -330,10 +321,6 @@ class V14ParcelPerceiverModel(nn.Module):
             )
 
         x = self.input_proj(electrode_tokens)              # (B, C, T, d)
-        x = x.reshape(B * C, T, self.d_model)
-        for block in self.temporal_blocks:
-            x = block(x)
-        x = x.reshape(B, C, T, self.d_model)
         electrodes = x.reshape(B, C * T, self.d_model)     # (B, N=C*T, d)
 
         bias = torch.log(support + eps)                    # (B, C, K)
@@ -353,7 +340,10 @@ class V14ParcelPerceiverModel(nn.Module):
         L = self.k_parcels * self.m_sub_slots
         latents = self.parcel_embedding.reshape(1, L, self.d_model).expand(B, L, self.d_model)
 
-        latents = self.cross_attn(latents, electrodes, bias_full)
+        latents = self.cross_attn(
+            latents, electrodes, bias_full,
+            key_rope=self.key_rope, t_bins=T,
+        )
 
         latent_valid = _compute_latent_valid(
             support=support,
@@ -454,7 +444,6 @@ class V14ParcelPerceiver(BaseModelConfig):
     d_model: int = 128
     n_heads: int = 4
     depth_self_attn: int = 6
-    depth_temporal: int = 1
     m_sub_slots: int = 4
     eps: float = DEFAULT_SUPPORT_BIAS_EPS
     time_last_input: bool = False
@@ -485,7 +474,6 @@ class V14ParcelPerceiver(BaseModelConfig):
             d_model=self.d_model,
             n_heads=self.n_heads,
             depth_self_attn=self.depth_self_attn,
-            depth_temporal=self.depth_temporal,
             m_sub_slots=self.m_sub_slots,
             time_last_input=self.time_last_input,
         )
