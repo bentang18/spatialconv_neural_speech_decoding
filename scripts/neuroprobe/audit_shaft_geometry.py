@@ -215,8 +215,8 @@ def _build_transitions(inventory: pd.DataFrame) -> pd.DataFrame:
     parsed = inventory[(~inventory["is_trigger"]) & inventory["contact_index"].notna()]
     for (sid, shaft), group in parsed.groupby(["subject_id", "shaft"], sort=True):
         group = group.sort_values("contact_index")
-        labels = group["DesikanKilliany"].astype(str).tolist()
-        hemis = group["hemisphere"].astype(str).tolist()
+        labels = group["DesikanKilliany"].fillna("unknown").astype(str).tolist()
+        hemis = group["hemisphere"].fillna("unknown").astype(str).tolist()
         unique_dk = sorted(set(labels))
         hemispheres_spanned = sorted(set(hemis))
         transitions = sum(1 for a, b in zip(labels, labels[1:]) if a != b)
