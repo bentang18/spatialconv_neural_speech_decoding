@@ -56,6 +56,71 @@ Blocked:
 - **A0-A4 BNA / C / D.1+ BNA / V7-V8 surface geometry** remain blocked until we get true per-electrode `fsaverage` surface mapping from Christopher Wang, or Ben explicitly approves a weaker Destrieux-first fallback.
 - **BT shaft/depth geometry contract** is now a Stage-0 blocker before any v14 BT architecture run. sEEG shaft-relative depth is a real measurement feature: contacts on one shaft commonly traverse multiple anatomical labels. We must decide which shaft/depth features are transferable and which are patient-ID shortcuts before encoding them.
 
+## Stage-0 Closeout (2026-05-13)
+
+Stage 0 closes 2026-05-13 with explicit disposition for every close-criterion. Frozen contracts are load-bearing for Stage 1; deferred items have named unblock paths and named owners. The DK-first pivot 2026-05-13 reframes the BNA / fsaverage block: BNA route is deferred to Stage-3+ (still gated on Chris MNI), DK route is the Stage-0-close anatomy contract.
+
+### Frozen contracts (Stage-1 inheritances)
+
+| ID | Decision | Date | Source |
+|---|---|---|---|
+| L.1 | Normalization = N1 `train_set_fixed` | 2026-05-08 | L.1 freeze block above |
+| L.2 | Reference × view = R4×I2 (`shaft_laplacian × stft_abs`) | 2026-05-09 (held 2026-05-10 under 24-cell exhaustive) | L.2 freeze block above |
+| L.3 | Filtering = F0 (no-op; cleaning ceiling) | 2026-05-11 | L.3 freeze block above |
+| Shaft/depth | Same-shaft adjacency + `|i−j|` offset + local-ref provenance only; signed depth FORBIDDEN by default | 2026-05-13 | `memory/project_shaft_depth_geometry_freeze_2026_05_13.md` |
+| L.4 norm × view interaction | Greedy hill-climb safe (max |residual| 0.0008) | 2026-05-10 | `reports/neuroprobe_stage0_l4_norm_view_interaction_2026_05_09/interaction_analysis.md` |
+| Tier-C C.0/C.1/C.2 | C.2 generalizes (+0.0082 Δ over C.0) at CrossSubject | 2026-05-10 | `reports/neuroprobe_stage0_tier_c_cross_subject_2026_05_09/tier_c_analysis.md` |
+| L.5.P1/P2/P3/P4/P5/P6/P8 (on L.2 winner) | No kill criterion fired; Stage-1 view passes nuisance gates | 2026-05-08 → 2026-05-12 | reports under `reports/neuroprobe_stage0_l5_p*` |
+
+### Stage-0-close decisions on previously blocked items
+
+| ID | Disposition | Rationale | Owner / unblock path |
+|---|---|---|---|
+| Anatomy A0-A4 (BNA route) | DEFERRED to Stage-3+ | DK-first pivot 2026-05-13 (`memory/project_v14_dk_first_pass_2026_05_13.md`) makes BNA-soft-support a P1 sister cell, not v14 default. BNA work resumes when Chris MNI lands or Stage-3 PS-extension needs it. | Christopher Wang fsaverage mapping |
+| Anatomy DK route (Stage-1-entry) | DEFERRED to Stage-1 entry | DK extractor + `support_cache_dk` + E5 smoke with parcel metadata. Code skeleton lives at `src/speech_decoding/extractors/parcel.py`; `studies/braintreebank/anatomy.py` provides the DK side. Not a Stage-0 blocker — DK metadata derives from BT public hard-label CSVs (already audited 2026-05-05, 0 missing labels). | Stage-1 entry implementer |
+| C support cache | DEFERRED to Stage-1 entry (DK variant) | DK-hard-one-hot 80-vocab support cache replaces BNA-soft-support cache as Stage-0 close artifact. Build at Stage-1 entry alongside DK extractor. | Stage-1 entry implementer |
+| E5 (NeuralSet smoke with neural + parcel metadata) | DEFERRED to Stage-1 entry | Gated on DK extractor producing parcel metadata. Run as the first Stage-1 dispatch sanity. | Stage-1 entry implementer |
+| L.7 audio-FM upper bound | DEFERRED to Stage-1 entry | BT data on DCC has `features.csv` (mel/RMS/pitch) but no `.wav`. Two unblock paths: source movies externally OR ask upstream for cached Whisper-L8 features. **Stage-1 v14 must beat L.7.A0 + 0.05** to claim brain-relevance — gate is in front of Stage-2 SSL dispatch, not Stage-0 close. | Ben to source movies, or upstream Whisper cache |
+| L.5.P9 (FM-leakage on Whisper-L8) | DEFERRED to Stage-1 entry | Same blocker as L.7 (needs Whisper-L8 features). Spec is locked; replays once features land. | Same as L.7 |
+| BT shaft/depth geometry contract | FROZEN 2026-05-13 (parallel session) | See `memory/project_shaft_depth_geometry_freeze_2026_05_13.md`; Stage-0-close artifact. | — |
+| MNI ↔ BNA parity gate | SIDESTEPPED by DK-first pivot | Stays as gating predicate for the BNA-soft-support P1 sister cell only. | Chris MNI |
+| v14 subcortical scope blocker | RESOLVED by DK-first pivot | DK aseg labels handle hippocampus/amygdala/putamen natively. | — |
+| Stage-1 split contract (multiclass + pooled-CS default + S2-CS parity + Lite-120 parity) | FROZEN 2026-05-09 → 2026-05-13 | Documented in this doc + Stage-1 plan. Pooled multi-source CS = scientific default; S2-only CS = leaderboard parity only; Lite-120 = leaderboard parity only. | — |
+| L.0a Experiment inherits BaseExperiment | DONE | `src/speech_decoding/experiments/experiment.py:22` `class Experiment(BaseExperiment)`. | — |
+| L.0b EXCA_CACHE_FOLDER on DCC | DONE | Documented in `docs/references/dcc_setup.md`; cache routing verified 2026-05-11 substrate smoke. | — |
+| L.0c DeriveLabelIndices + Wang2024Treebank `ns.Chain` | DEFERRED to Stage-1 entry (per L.0c spec; not L-sweep blocker) | Stage-0 wrapper path is canonical. | Stage-1 entry implementer |
+| L.0d ExperimentLogger sidecars | DONE | `scripts/neuroprobe/run_stage0_linear_baseline.py:127` wraps every run in `ExperimentLogger`. | — |
+| `CARIeegExtractor` + `ShaftCARIeegExtractor` | DONE | `src/speech_decoding/extractors/reference.py` (verified 2026-05-13). | — |
+
+### In-flight on DCC at close (analyzers will fold into freeze blocks above on landing)
+
+| ID | Status | Disposition |
+|---|---|---|
+| L.4 W2-W5 (W4/W5 RUNNING 2026-05-13; W2/W3 PD on quota) | in-flight | Robustness curve, not single-winner. When all land, write L.4 freeze block + decide whether Stage-1 anchor-robustness ablation is mandatory or optional. |
+| L.5.P11 label-permutation null | in-flight (PD on quota) | KILL gate; expected pass (held-out AUROC ≤ chance + 0.02). When lands, fold result into L.5 disposition row. |
+| Tier-C C.3 (bipolar × stft) + C.4 (shaftLap × HG) | in-flight (PD on quota) | C.3 settles the bipolar tie at CrossSubject; C.4 sanity-checks HG vs spec at CrossSubject. When land, fold into Tier-C disposition row. |
+| D.14 pooled multi-source CS (smoke 46908857) | smoke queued | When smoke confirms pool path runs, dispatch full 48-job sweep. D.14 is the SOTA-at-submission anchor for the v14 gate "beat SOTA by ≥0.05". |
+| D.15 upstream `include_all_train_subjects` probe | blocked on D.14 | Runs once D.14 lands; sister cell verifying our pool layer matches upstream's per-source-fold protocol. |
+| L.5 full sweep on L.4 winner | blocked on L.4 freeze | Per `stage_0.md:285` "L.5 probes run as kill-criteria gates after every sweep winner". L.4 robustness has no single winner, so this collapses to "re-run L.5 on the L.4 W winning by ±0.02 of W0" — only fires if L.4 finds a non-W0 winner. |
+| V0.x per-task accurate stimulus-overlap audit | in-flight (DCC dispatched) | Bounded above by upper-bound result (max 0.450 < 0.50 kill). Refines per-task numbers; not gating. |
+| L.6 sub-cells (WL/NR/ES/CB/FA) | dispatched, partial analyzer | Tier-2 robustness, non-blocking per L.6 spec. Fold into stage_0.md when all analyzers settle. |
+
+### Explicit non-closures (will not happen this Stage-0)
+
+- BNA support cache from public PNG plotting coordinates — explicit non-goal (line in §Explicit Non-Goals below).
+- D.1+ BNA atlas/linear cells — explicit non-goal until valid surface geometry exists.
+- v14 architecture implementation, neural network training, SSL pretraining, full BT pretraining download — explicit non-goals.
+
+### Stage-1 entry handoff
+
+The Stage-1 entry implementer inherits:
+
+1. **Frozen preprocessing recipe**: N1 train-set z + R4 shaftLap + I2 stft_abs + F0 no-filter + L.0 wrapper.
+2. **Frozen split contract**: pooled multi-source CS multiclass = scientific default; S2-CS + Lite-120 = leaderboard parity only.
+3. **DK-first anatomy contract**: DK extractor + `support_cache_dk` + E5 smoke with parcel metadata; BNA route deferred to Stage-3+.
+4. **L.7 + L.5.P9 unblock-then-run**: Whisper-L8 cache or .wav source needed before Stage-2 SSL dispatch.
+5. **In-flight DCC tail folded back into stage_0.md**: L.4 W2-W5 freeze block, L.5.P11 disposition, Tier-C C.3/C.4 update, D.14 baseline.
+
 ## Remaining Work
 
 ### 1. Run V0-V6 Data QC
@@ -497,6 +562,27 @@ Run on the L.2 winner reference+input. Tests whether more aggressive front-end c
 | L.3.E0 | BT Lite mask only | status quo |
 | L.3.E1 | E0 + flatline + amplitude-outlier + clipping | V1-derived per-channel exclusions |
 
+> **2026-05-11 — L.3 FROZEN at F0 (no-op winner; filtering does no work at linear-readout scope).** Tier-A 4-cell sweep on 12 sessions (F0) / 7 sessions (F1/F2/F3) × 15 tasks, ±0.005 noise band (matches L.4 anchor convention):
+>
+> | rank | cell | recipe | n | mean | sd | Δ vs F0 | sd(Δ) | better/worse/tie |
+> |---|---|---|---|---|---|---|---|---|
+> | — | **F0** ★ | **no filter (parity to L.2 winner)** | 12 | **0.6132** | 0.0254 | — | — | — |
+> | 1 | F2 | F1 + 0.5 Hz HPF | 7 | 0.6043 | 0.0217 | +0.0032 | 0.0059 | 4/1/5 |
+> | 2 | F3 | F1 + 1.0 Hz HPF | 7 | 0.6042 | 0.0215 | +0.0031 | 0.0058 | 4/1/5 |
+> | 3 | F1 | 60 + 120 + 180 Hz notch | 7 | 0.6027 | 0.0215 | +0.0016 | 0.0058 | 2/3/6 |
+>
+> **Decision tree application** (rule 1): all three cells' Δ vs F0 fall within ±0.005 noise band — filtering is no-op at this scope. **Freeze L.2 winner (R4×I2 N1) unchanged**; do not fold notch or HPF into the Stage-1 default.
+>
+> **Why filtering doesn't help here**: stft_abs (L.2 winner) integrates DC drift out of every spectrogram bin; shaft_laplacian (L.2 winner) kills slow common-mode at the reference layer. Both 60 Hz line noise and ≤1 Hz drift are already removed by the upstream contract — F1/F2/F3 are double-cleaning.
+>
+> **Architectural consequences for v14**:
+> - Stage-1 filtering contract: `none` (parity to L.2 winner; rely on STFT + shaft-Lap for cleaning).
+> - L.4 (window anchor) and L.5 (probes) inherit F0 — no front-end filter on top of L.2.
+> - **Cleaning ceiling reached for the linear baseline.** Architecture work moves to L.4 anchor + L.5 nuisance (already in flight).
+> - Notch/HPF are not load-bearing for v14's Stage-2 SSL pretokenizer either; the front-end can stay minimal.
+>
+> Artifacts: `reports/neuroprobe_stage0_l3_filtering_2026_05_10/{filtering_analysis.md, filtering_analysis.json, launch_manifest.csv}`.
+
 #### L.4 — Window Anchor Robustness (Sweep 4, after L.3)
 
 Run on the L.3 winner. Tests the rebuttal's claim of near-equivalent decoding for 1 s windows starting between roughly `-0.375` and `+0.125` s relative to word onset.
@@ -559,9 +645,9 @@ Implementation: Whisper-large-v3 L8 forward passes are cheap (one-time per sessi
 
 Not Stage-0 close-criterion. Listed so future-us doesn't reinvent the cell IDs.
 
-- **L.6.ES** electrode-set robustness: Lite-120 vs random-120 (×3 seeds) vs anatomy-120 (DK gray-matter top-120) vs Full uncapped vs hard-label-restricted.
-- **L.6.NR** feature-level nuisance regression: regress out per-trial channel-mean / per-session top-k PCs / subject-mean / ComBat / CORAL.
-- **L.6.WL** window length × sub-windowing: 1×1 s vs 4×250 ms concat vs 2×500 ms concat vs mean-pool sub-windows vs 8×125 ms (matches Perceiver token grid).
+- **L.6.ES** electrode-set robustness — *redefined 2026-05-13 to random-dropout robustness only*: keep_n ∈ {60, 90} of 120 Lite electrodes × 3 seeds {42, 43, 44}, sorted by original index to preserve shaft ordering. The full anatomy-120 / Full uncapped / hard-label-restricted variants from the original sketch are deferred until BT shaft/depth geometry contract lands. **In flight 2026-05-13** (`reports/neuroprobe_stage0_l6_es_electrode_dropout_2026_05_13`, 72 jobs).
+- **L.6.NR** *narrowband HG sub-band sweep — redefined 2026-05-13 from feature-level nuisance regression*: three narrowband HG envelopes (70-90 / 90-120 / 120-150 Hz) at L.2 winner ref (shaft_laplacian) and L.1 winner norm (train_set_fixed). Feeds the v14 D-SigLIP layer-match decision (whether HG should be banded or broadband for cross-modal alignment). The original feature-level nuisance regression cells (per-trial channel-mean / per-session top-k PCs / ComBat / CORAL) are deferred. **In flight 2026-05-13** (`reports/neuroprobe_stage0_l6_nr_hg_subbands_2026_05_13`, 36 jobs).
+- **L.6.WL** *window-length sweep — redefined 2026-05-13 from window length × sub-windowing*: onset-anchored (`anchor_start_before=0.0`) sweep of `anchor_end_after` ∈ {0.25, 0.5, 0.75, 1.0, 1.5, 2.0} s. 1.0 s = L.4 D.0 baseline (control). The sub-windowing variants (1×1 s vs 4×250 ms concat vs 2×500 ms concat vs mean-pool vs 8×125 ms Perceiver-token-grid) are deferred to v14 — they intersect the readout architecture and are best ablated within the Perceiver IO design. **In flight 2026-05-13** (`reports/neuroprobe_stage0_l6_wl_window_length_2026_05_13`, 72 jobs).
 - **L.6.CB** class balance: uniform vs inverse-frequency vs effective-number-of-samples vs per-task weighted.
 - **L.6.FA** feature aggregation: mean vs median vs PCA-50-per-channel vs PCA-50-cross-channel.
 
