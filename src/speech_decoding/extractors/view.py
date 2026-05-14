@@ -60,6 +60,15 @@ def _log_stft_view(
     hop_length = nperseg - noverlap
     window = torch.hann_window(nperseg, device=waveform.device)
 
+    # NeuralSet's `prepare()` probes extractors with a 0.001s window (~2
+    # samples @ 2048 Hz). torch.stft(center=True) reflect-pads by nperseg//2
+    # and needs input_len >= pad_size + 1. Real 1 s windows (2048 samples)
+    # never hit this branch — pad only the introspection probe so output
+    # shapes can be discovered, then real calls remain bit-identical.
+    if waveform.shape[-1] < nperseg:
+        pad_amount = nperseg - waveform.shape[-1]
+        waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
+
     complex_stft = torch.stft(
         waveform,
         n_fft=nperseg,

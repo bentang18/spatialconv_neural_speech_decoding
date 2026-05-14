@@ -165,3 +165,18 @@ def test_dk_extractor_accepts_btbank_prefixed_subject(tmp_path: Path) -> None:
     out_plain = ext.get_static(SimpleNamespace(subject="2"))  # type: ignore[arg-type]
     out_prefixed = ext.get_static(SimpleNamespace(subject="btbank2"))  # type: ignore[arg-type]
     torch.testing.assert_close(out_plain, out_prefixed)
+
+
+def test_dk_extractor_accepts_study_qualified_subject(tmp_path: Path) -> None:
+    """Wang2024Treebank emits ``Wang2024Treebank/btbank<N>`` as the canonical
+    event.subject; extractor must strip the study prefix and coerce the tail."""
+    _write_depth_wm(
+        tmp_path, subject_id=2,
+        rows=[("E1", "ctx-rh-insula")],
+    )
+    ext = V14DKHardSupportExtractor(event_types="Ieeg", bt_root=str(tmp_path))
+    out_plain = ext.get_static(SimpleNamespace(subject="2"))  # type: ignore[arg-type]
+    out_qualified = ext.get_static(  # type: ignore[arg-type]
+        SimpleNamespace(subject="Wang2024Treebank/btbank2"),
+    )
+    torch.testing.assert_close(out_plain, out_qualified)
