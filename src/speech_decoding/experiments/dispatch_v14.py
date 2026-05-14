@@ -72,6 +72,7 @@ def build_v14_experiment(
     seed: int = 33,
     exca_folder: str | None = None,
     cluster: str | None = None,
+    fast_dev_run: bool | int = False,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -161,6 +162,7 @@ def build_v14_experiment(
         x_name=("electrode_tokens", "support", "valid_mask"),
         accelerator="auto",
         devices="auto",
+        fast_dev_run=fast_dev_run,
     )
 
 
@@ -184,6 +186,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
+    p.add_argument("--fast-dev-run", action="store_true",
+                   help="Lightning fast-dev-run: 1 batch train+val+test, no checkpoints.")
     return p
 
 
@@ -205,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         eps=args.eps, d_model=args.d_model, depth=args.depth,
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         batch_size=args.batch_size, n_epochs=args.n_epochs,
-        cluster=args.cluster,
+        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")
