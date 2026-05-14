@@ -244,6 +244,8 @@ Public hard-label fallback status:
 
 ### 3. Resolve BT Shaft/Depth Geometry Contract
 
+> **Status: FROZEN 2026-05-13.** Audit script `scripts/neuroprobe/audit_shaft_geometry.py`, report `reports/neuroprobe_stage0_shaft_depth_geometry_2026_05_13/` (README + 4 CSVs). Headline: 1549 contacts across 9 subjects (S5 dropped per DK-first-pass), 128 shafts, 0 parse anomalies, 0 cross-hemisphere shafts, 99.2% linear, 98.4% suffix-monotonic; **signed depth FORBIDDEN by default** — sign convention is 75% cohort-uniform (lower_suffix), below the 95% admission threshold. v14 may use orientation-invariant within-shaft features only (adjacency mask, relative offset `|i − j|`, local-reference provenance). shaftCAR (R2, v14 default) + shaftLaplacian (R4, upstream parity) both cleared because they are orientation-invariant under symmetric form. Unfreeze triggers: Chris MNI ship + subject-pool change + BNA subcortical scope decision.
+
 This is a blocker before any v14 BT architecture run. It can proceed before surface mapping arrives because it uses electrode labels and public anatomy, not MNI/fsaverage coordinates.
 
 Why it matters:

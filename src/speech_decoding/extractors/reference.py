@@ -13,8 +13,11 @@ Two CAR modes:
     matched candidate for sEEG.
 
 The shaft parser splits trailing integer suffix from stem (``"OFa12" -> ("OFa", 12)``).
-The Stage-0 shaft/depth contract (`docs/neuroprobe/stage_0.md` Section 3) may
-revise this; revisit after that contract is frozen.
+The Stage-0 shaft/depth contract froze this parser on 2026-05-13; see
+``reports/neuroprobe_stage0_shaft_depth_geometry_2026_05_13/README.md`` for the
+admissibility verdict on signed-depth features, reference-scheme compatibility,
+and the rejected encodings list. Audit: 1549 contacts across 9 subjects, 128
+shafts, 0 parse anomalies, 0 cross-hemisphere shafts.
 """
 
 from __future__ import annotations
