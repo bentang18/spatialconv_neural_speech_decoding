@@ -42,8 +42,8 @@ def test_dispatch_default_wires_valid_mask_and_support_with_c_max(
     extractors = xp.data.segmenter.extractors
     assert isinstance(extractors["support"], V14DKHardSupportExtractor)
     assert isinstance(extractors["valid_mask"], ElectrodeValidMask)
-    assert extractors["support"].c_max == 120
-    assert extractors["valid_mask"].c_max == 120
+    assert extractors["support"].c_max == 256
+    assert extractors["valid_mask"].c_max == 256
 
 
 def test_dispatch_default_sets_x_name_tuple_with_mask(

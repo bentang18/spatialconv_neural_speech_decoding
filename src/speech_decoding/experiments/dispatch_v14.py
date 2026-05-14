@@ -61,7 +61,11 @@ DEFAULT_TASK = "speech"
 DEFAULT_EVAL_MODE = "CrossSession"
 DEFAULT_TEST_SUBJECT_ID = 2
 DEFAULT_TEST_TRIAL_ID = 4
-DEFAULT_C_MAX = 120  # Neuroprobe-Lite electrode cap (Wang 2024 / Zahorodnii 2026 p.6)
+DEFAULT_C_MAX = 256  # BT raw electrode max — Wang2024Treebank emits full set,
+                     # the NEUROPROBE_LITE_ELECTRODES filter is not yet a chain
+                     # step (TODO: add as EventsTransform). 120 was the Lite
+                     # cap which assumed upstream filtering; un-filtered BT
+                     # subjects can carry 130-200+ electrodes.
 
 
 def build_v14_experiment(
