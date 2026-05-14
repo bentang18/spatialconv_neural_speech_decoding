@@ -75,17 +75,20 @@ class V14DKHardSupportExtractor(BaseStatic):
         return support
 
 
-_BTBANK_RE = re.compile(r"^(?:btbank|sub_)?(\d+)$", re.IGNORECASE)
+_BTBANK_RE = re.compile(r"(?:btbank|sub_)?(\d+)$", re.IGNORECASE)
 
 
 def _coerce_subject_id(subject: tp.Any) -> int:
     """Normalise an event.subject value to a BT integer subject id.
 
-    Accepts ``int``, ``"7"``, ``"btbank7"``, ``"sub_7"``.
+    Accepts ``int``, ``"7"``, ``"btbank7"``, ``"sub_7"``, and the
+    NeuralSet study-qualified form ``"Wang2024Treebank/btbank7"``.
     """
     if isinstance(subject, int):
         return subject
-    match = _BTBANK_RE.match(str(subject).strip())
+    raw = str(subject).strip()
+    tail = raw.rsplit("/", 1)[-1]  # strip "Wang2024Treebank/" study prefix
+    match = _BTBANK_RE.match(tail)
     if match is None:
         raise ValueError(f"unrecognised BT subject identifier: {subject!r}")
     return int(match.group(1))
