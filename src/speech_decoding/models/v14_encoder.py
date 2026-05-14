@@ -356,7 +356,23 @@ class V14ParcelPerceiverModel(nn.Module):
 
 
 class V14ClassifierHead(nn.Module):
-    """DETR-style readout: one learnable query → cross-attn over latents → linear."""
+    """DETR-style readout: one full decoder layer (cross-attn + FFN) on a
+    single learnable task query, then a linear classifier.
+
+    Layout matches canonical DETR (Carion 2020 §3.3) decoder layer minus the
+    trivial query self-attn (we have N=1 query so it would attend only to
+    itself):
+
+        q_state ← task_query  (expanded to B)
+        q_state ← q_state + cross_attn(LN(q_state), latents, latents, mask)
+        q_state ← q_state + ffn(LN(q_state))
+        logits  ← classifier(q_state)
+
+    The ``latent_valid`` kwarg masks no-coverage parcel slots in the cross-attn
+    keys (memory-padding mask). The residual + FFN brings the head to a
+    canonical DETR decoder layer; earlier the FFN was missing — unagreed
+    implementation choice flagged 2026-05-13 and corrected here.
+    """
 
     def __init__(self, d_model: int, n_classes: int, n_heads: int = 4) -> None:
         super().__init__()
@@ -369,6 +385,8 @@ class V14ClassifierHead(nn.Module):
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.kv_proj = nn.Linear(d_model, 2 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.ln_ffn = nn.LayerNorm(d_model)
+        self.ffn = _ffn(d_model)
         self.classifier = nn.Linear(d_model, n_classes)
 
     def forward(
@@ -377,7 +395,9 @@ class V14ClassifierHead(nn.Module):
         latent_valid: Optional[Tensor] = None,  # (B, L) bool
     ) -> Tensor:
         B, L, d = latents.shape
-        q = self.q_proj(self.ln_q(self.query.expand(B, 1, d))).reshape(
+        q_state = self.query.expand(B, 1, d)                          # (B, 1, d)
+
+        q = self.q_proj(self.ln_q(q_state)).reshape(
             B, 1, self.n_heads, self.head_dim
         )
         kv = self.kv_proj(self.ln_kv(latents)).reshape(
@@ -386,14 +406,18 @@ class V14ClassifierHead(nn.Module):
         k, v = kv.unbind(dim=2)
         attn_logits = torch.einsum("blhd,bshd->bhls", q, k) * self.scale
         if latent_valid is not None:
-            invalid = ~latent_valid                              # (B, L)
+            invalid = ~latent_valid                                    # (B, L)
             attn_logits = attn_logits.masked_fill(
-                invalid.unsqueeze(1).unsqueeze(1),                # (B, 1, 1, L)
+                invalid.unsqueeze(1).unsqueeze(1),                     # (B, 1, 1, L)
                 torch.finfo(attn_logits.dtype).min,
             )
         attn = attn_logits.softmax(dim=-1)
         ctx = torch.einsum("bhls,bshd->blhd", attn, v).reshape(B, 1, d)
-        pooled = self.out_proj(ctx).squeeze(1)
+        ctx = self.out_proj(ctx)
+
+        h = q_state + ctx                                              # cross-attn residual
+        h = h + self.ffn(self.ln_ffn(h))                               # FFN residual
+        pooled = h.squeeze(1)                                          # (B, d)
         return self.classifier(pooled)
 
 
