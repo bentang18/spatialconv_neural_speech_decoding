@@ -93,6 +93,30 @@ def test_log_stft_view_helper_matches_upstream_preprocess_stft() -> None:
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+def test_log_stft_view_helper_accepts_probe_window_shorter_than_nperseg() -> None:
+    """NeuralSet's ``prepare()`` probes the extractor with a 0.001s window
+    (~2 samples @ 2048 Hz). ``torch.stft(center=True)`` reflect-pads by
+    ``nperseg//2`` and chokes on inputs that short. The helper must
+    zero-pad short inputs so introspection runs without RuntimeError."""
+    from speech_decoding.extractors.view import _log_stft_view
+
+    # 135 channels × 2 samples — the literal shape that crashed
+    # in the DCC nano smoke (job 46929894).
+    waveform = torch.zeros(135, 2)
+    out = _log_stft_view(
+        waveform,
+        sample_rate=2048,
+        nperseg=512,
+        poverlap=0.75,
+        min_freq_hz=0.0,
+        max_freq_hz=150.0,
+        log_eps=1e-6,
+    )
+    assert out.shape[0] == 135
+    assert out.shape[1] == 38
+    assert torch.isfinite(out).all()
+
+
 def test_log_stft_view_helper_shape_38_freq_17_time() -> None:
     """For 1-s @ 2048 Hz input with nperseg=512, hop=128, center=True:
     F_bin = 38 (bins from 0 to 148 Hz at 4 Hz/bin),
