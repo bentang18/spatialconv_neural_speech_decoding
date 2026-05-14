@@ -194,7 +194,32 @@ def main() -> None:
                 "subject with multiple sessions."
             )
 
-        diagnostics = pd.DataFrame(rows)
+        p1_row: dict[str, float | int | str] | None = None
+        if getattr(args, "include_p1", False):
+            common_F = min(
+                X.shape[1] for sub_id in feats_by_subject for X in feats_by_subject[sub_id]
+            )
+            X_all_chunks: list[np.ndarray] = []
+            y_all_chunks: list[int] = []
+            for sub_id in sorted(feats_by_subject):
+                for X_sess in feats_by_subject[sub_id]:
+                    X_all_chunks.append(X_sess[:, :common_F])
+                    y_all_chunks.extend([sub_id] * X_sess.shape[0])
+            X_all = np.concatenate(X_all_chunks, axis=0)
+            y_all = np.array(y_all_chunks)
+            del X_all_chunks
+            gc.collect()
+            print(
+                f"[L.5.P1] cross-subject pool: N={len(y_all)} trials, "
+                f"F={X_all.shape[1]} (truncated to common min), "
+                f"K={len(np.unique(y_all))} subjects"
+            )
+            p1_row = run_probe("L.5.P1", "subject_id", X_all, y_all, seed=args.seed)
+            print(json.dumps(p1_row, indent=2, sort_keys=True))
+            del X_all, y_all
+            gc.collect()
+
+        diagnostics = pd.DataFrame(rows + ([p1_row] if p1_row is not None else []))
         diagnostics.to_csv(out_dir / "nuisance_probe_metrics.csv", index=False)
 
         per_subject_aurocs = [float(r["test_macro_auroc"]) for r in rows]
@@ -228,6 +253,17 @@ def main() -> None:
             "n_subjects_probed": int(len(rows)),
             "kill_auroc_threshold": KILL_AUROC,
         }
+        if p1_row is not None:
+            summary["p1"] = {
+                "n_classes": int(p1_row["n_classes"]),
+                "n_train": int(p1_row["n_train"]),
+                "n_test": int(p1_row["n_test"]),
+                "n_features": int(p1_row["n_features"]),
+                "auroc": float(p1_row["test_macro_auroc"]),
+                "balacc": float(p1_row["test_balanced_accuracy"]),
+                "chance": float(p1_row["chance_balanced_accuracy"]),
+                "kill": bool(float(p1_row["test_macro_auroc"]) > KILL_AUROC),
+            }
         (out_dir / "metrics.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"
         )
@@ -357,6 +393,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sessions", default="",
                    help="Comma-separated subject:trial pairs; default = all 12 BT Lite sessions.")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--include-p1", action="store_true",
+        help="Also run L.5.P1 cross-subject id probe: pool features across all "
+             "subjects (truncated to min common feature dim), label = subject_id, "
+             "kill if held-out AUROC > 0.95.",
+    )
     args = p.parse_args()
     if args.bt_root is None:
         p.error("--bt-root or ROOT_DIR_BRAINTREEBANK is required")

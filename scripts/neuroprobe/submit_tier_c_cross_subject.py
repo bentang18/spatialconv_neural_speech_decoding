@@ -117,6 +117,21 @@ def main() -> None:
         skip_baseline=args.skip_baseline,
         only_baseline=args.only_baseline,
     )
+    if args.cells_only:
+        wanted = {c.strip() for c in args.cells_only.split(",") if c.strip()}
+        cells = [c for c in cells if c.cell_id in wanted]
+        if not cells:
+            raise SystemExit(f"--cells-only filter selected zero cells from {wanted}")
+    if args.cell_id_override:
+        if len(cells) != 1:
+            raise SystemExit("--cell-id-override requires exactly one selected cell")
+        cells[0] = CrossSubjectCell(
+            cell_id=args.cell_id_override,
+            ref_kind=cells[0].ref_kind,
+            view_kind=cells[0].view_kind,
+            normalization=cells[0].normalization,
+            label=cells[0].label,
+        )
 
     rows: list[dict[str, str]] = []
     for cell in cells:
@@ -262,6 +277,17 @@ def _parse_args() -> argparse.Namespace:
         "--only-baseline", action="store_true",
         help="Dispatch only the C.0 baseline cell (skip C.1 / C.2). "
              "Useful for backfilling C.0 into a sweep dispatched with --skip-baseline.",
+    )
+    parser.add_argument(
+        "--cells-only", default="",
+        help="Comma-separated cell ids to keep (e.g. 'C.2_l1_l2_winner'). "
+             "Default: keep whatever build_cells() returned.",
+    )
+    parser.add_argument(
+        "--cell-id-override", default="",
+        help="Rename the single remaining cell after --cells-only. Use to relabel "
+             "an alt-recipe dispatch (e.g. 'C.3_bipolar_stft') so the report dir "
+             "doesn't collide with prior C.x runs.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(

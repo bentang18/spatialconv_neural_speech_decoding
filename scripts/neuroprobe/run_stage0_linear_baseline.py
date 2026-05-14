@@ -118,6 +118,8 @@ def main() -> None:
         "normalization_description": NORMALIZATION_DESCRIPTIONS[args.normalization],
         "notch_freqs": list(notch_freqs),
         "hpf_hz": float(args.hpf_hz),
+        "pool_multi_source": bool(getattr(args, "pool_multi_source", False)),
+        "region_pool_mode": str(getattr(args, "region_pool_mode", "pairwise")),
         "cell_id": cell_id,
         "seed": args.seed,
     }
@@ -186,6 +188,10 @@ def run_eval(
     splits_type = args.split_type
     binary_tasks = bool(args.binary_tasks)
     preprocess_type = args.preprocess_type
+    pool_multi_source = bool(getattr(args, "pool_multi_source", False))
+    train_subject: Any = None
+    fold_source_subjects: list[Any] | None = None
+    fold_source_trials: list[int] = []
 
     preprocess_parameters = {
         "type": preprocess_type,
@@ -216,9 +222,42 @@ def run_eval(
     bins_start_before = float(getattr(args, "anchor_start_before", 0.0))
     bins_end_after = float(getattr(args, "anchor_end_after", 1.0))
     bin_starts, bin_ends = [-bins_start_before], [bins_end_after]
+    fb_start = getattr(args, "feature_bin_start", None)
+    fb_end = getattr(args, "feature_bin_end", None)
+    if fb_start is not None:
+        bin_starts = [float(fb_start)]
+    if fb_end is not None:
+        bin_ends = [float(fb_end)]
 
     subject = BrainTreebankSubject(args.subject_id, cache=True, dtype=torch.float32)
     subset_electrodes(subject, lite=True, nano=False)
+    keep_n = int(getattr(args, "keep_n_electrodes", 0) or 0)
+    if keep_n > 0:
+        full_labels = list(subject.electrode_labels)
+        if keep_n < len(full_labels):
+            rng = np.random.default_rng(int(getattr(args, "electrode_dropout_seed", args.seed)))
+            kept_idx = rng.choice(len(full_labels), size=keep_n, replace=False)
+            kept_idx.sort()
+            kept_labels = [full_labels[i] for i in kept_idx]
+            subject.set_electrode_subset(kept_labels)
+            print(
+                f"[L.6.ES] random dropout: kept {keep_n}/{len(full_labels)} electrodes "
+                f"(seed={int(getattr(args, 'electrode_dropout_seed', args.seed))})"
+            )
+        else:
+            print(
+                f"[L.6.ES] keep_n {keep_n} ≥ available {len(full_labels)}; "
+                f"keeping all electrodes"
+            )
+    if getattr(args, "shuffle_channels_per_subject", False):
+        full = list(subject.electrode_labels)
+        perm_seed = int(args.seed) * 1_000_000 + int(args.subject_id) * 1000
+        perm = np.random.default_rng(perm_seed).permutation(len(full))
+        subject.set_electrode_subset([full[i] for i in perm])
+        print(
+            f"[L.5.P6] subject {args.subject_id} channels shuffled "
+            f"(perm_seed={perm_seed}, n={len(full)})"
+        )
     t0 = time.time()
     subject.load_neural_data(args.trial_id)
     print(f"[load] subject {args.subject_id} trial {args.trial_id} in {time.time() - t0:.1f}s")
@@ -262,21 +301,82 @@ def run_eval(
             )
             train_subject = subject
         elif splits_type == "CrossSubject":
-            train_subject_id = nconfig.DS_DM_TRAIN_SUBJECT_ID
-            train_subject = BrainTreebankSubject(
-                train_subject_id, allow_corrupted=False, cache=True, dtype=torch.float32
-            )
-            train_subject.set_electrode_subset(
-                nconfig.NEUROPROBE_LITE_ELECTRODES[train_subject.subject_identifier]
-            )
-            all_subjects = {args.subject_id: subject, train_subject_id: train_subject}
-            folds = nts.generate_splits_cross_subject(
-                all_subjects, args.subject_id, args.trial_id, eval_name, dtype=torch.float32,
-                output_indices=False, output_dict=False,
-                start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
-                end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
-                lite=True, nano=False, binary_tasks=binary_tasks,
-            )
+            if pool_multi_source:
+                # D.14: train across every NEUROPROBE_LITE source subject (excluding test).
+                source_subject_ids: list[int] = []
+                source_subjects: dict[int, Any] = {}
+                for src_id, _ in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS:
+                    if src_id == args.subject_id or src_id in source_subjects:
+                        continue
+                    src_subj = BrainTreebankSubject(
+                        src_id, allow_corrupted=False, cache=True, dtype=torch.float32,
+                    )
+                    src_subj.set_electrode_subset(
+                        nconfig.NEUROPROBE_LITE_ELECTRODES[src_subj.subject_identifier]
+                    )
+                    source_subjects[src_id] = src_subj
+                    source_subject_ids.append(src_id)
+                if not source_subject_ids:
+                    raise RuntimeError("--pool-multi-source: no source subjects available.")
+                train_subject = None
+                all_subjects = {args.subject_id: subject, **source_subjects}
+                folds = nts.generate_splits_cross_subject(
+                    all_subjects, args.subject_id, args.trial_id, eval_name,
+                    dtype=torch.float32, output_indices=False, output_dict=False,
+                    start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
+                    end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
+                    lite=True, nano=False, binary_tasks=binary_tasks,
+                    include_all_train_subjects=True,
+                )
+                # Each upstream fold corresponds to one source (subject_id, trial_id)
+                # pair from NEUROPROBE_LITE_SUBJECT_TRIALS; recover both for ordering
+                # alignment AND for per-fold cache cleanup after feature extraction.
+                fold_source_subjects = [
+                    source_subjects[src_id]
+                    for src_id, _ in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS
+                    if src_id != args.subject_id
+                ]
+                fold_source_trials = [
+                    src_trial
+                    for src_id, src_trial in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS
+                    if src_id != args.subject_id
+                ]
+                if len(fold_source_subjects) != len(folds):
+                    raise RuntimeError(
+                        f"upstream returned {len(folds)} folds but built "
+                        f"{len(fold_source_subjects)} source subjects — ordering mismatch"
+                    )
+                print(
+                    f"[D.14] pool_multi_source: {len(source_subject_ids)} source subjects "
+                    f"{source_subject_ids} → 1 pooled train, region_pool_mode={args.region_pool_mode}"
+                )
+            else:
+                train_subject_id = nconfig.DS_DM_TRAIN_SUBJECT_ID
+                train_subject = BrainTreebankSubject(
+                    train_subject_id, allow_corrupted=False, cache=True, dtype=torch.float32
+                )
+                train_subject.set_electrode_subset(
+                    nconfig.NEUROPROBE_LITE_ELECTRODES[train_subject.subject_identifier]
+                )
+                if getattr(args, "shuffle_channels_per_subject", False):
+                    t_full = list(train_subject.electrode_labels)
+                    t_seed = int(args.seed) * 1_000_000 + int(train_subject_id) * 1000
+                    t_perm = np.random.default_rng(t_seed).permutation(len(t_full))
+                    train_subject.set_electrode_subset([t_full[i] for i in t_perm])
+                    print(
+                        f"[L.5.P6] train subject {train_subject_id} channels shuffled "
+                        f"(perm_seed={t_seed}, n={len(t_full)})"
+                    )
+                all_subjects = {args.subject_id: subject, train_subject_id: train_subject}
+                folds = nts.generate_splits_cross_subject(
+                    all_subjects, args.subject_id, args.trial_id, eval_name, dtype=torch.float32,
+                    output_indices=False, output_dict=False,
+                    start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
+                    end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
+                    lite=True, nano=False, binary_tasks=binary_tasks,
+                )
+                fold_source_subjects = None
+                source_subject_ids = []
         else:
             raise ValueError(f"Unknown split type: {splits_type}")
 
@@ -284,77 +384,130 @@ def run_eval(
             data_idx_from = int((bin_start + bins_start_before) * nconfig.SAMPLING_RATE)
             data_idx_to = int((bin_end + bins_start_before) * nconfig.SAMPLING_RATE)
 
-            for fold_idx, fold in enumerate(folds):
-                t_fold = time.time()
-                train_dataset = fold["train_dataset"]
-                test_dataset = fold["test_dataset"]
+            def _preprocess(item_data, electrode_labels):
+                sliced = item_data[:, data_idx_from:data_idx_to].unsqueeze(0)
+                if args.backend == "upstream":
+                    return preprocess_data(
+                        sliced, electrode_labels, preprocess_type, preprocess_parameters,
+                    ).float().numpy()
+                from speech_decoding.views import preprocess_views  # noqa: PLC0415
+                feats, _ = preprocess_views(
+                    sliced, list(electrode_labels),
+                    ref_kind=args.ref_kind, view_kind=args.view_kind,
+                    sampling_rate=int(nconfig.SAMPLING_RATE),
+                    upstream_helpers=upstream_helpers,
+                )
+                return feats.float().numpy()
 
-                def _preprocess(item_data, electrode_labels):
-                    sliced = item_data[:, data_idx_from:data_idx_to].unsqueeze(0)
-                    if args.backend == "upstream":
-                        return preprocess_data(
-                            sliced, electrode_labels, preprocess_type, preprocess_parameters,
-                        ).float().numpy()
-                    from speech_decoding.views import preprocess_views  # noqa: PLC0415
-                    feats, _ = preprocess_views(
-                        sliced, list(electrode_labels),
-                        ref_kind=args.ref_kind, view_kind=args.view_kind,
-                        sampling_rate=int(nconfig.SAMPLING_RATE),
-                        upstream_helpers=upstream_helpers,
+            # Build evaluation cells. Single-source CrossSubject (and Within /
+            # CrossSession) produce one cell per upstream fold; pool-multi-source
+            # CrossSubject (D.14) collapses all upstream folds into one cell
+            # using --region-pool-mode (test-anchored | source-union).
+            eval_cells: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+            if splits_type == "CrossSubject" and pool_multi_source:
+                per_src_X: list[np.ndarray] = []
+                per_src_y: list[np.ndarray] = []
+                per_src_r: list[np.ndarray] = []
+                X_test_raw: np.ndarray | None = None
+                y_test_pool: np.ndarray | None = None
+                regions_test_raw: np.ndarray | None = None
+                assert fold_source_subjects is not None
+                for fi, fold in enumerate(folds):
+                    train_dataset = fold["train_dataset"]
+                    test_dataset = fold["test_dataset"]
+                    src_subj = fold_source_subjects[fi]
+                    src_trial = fold_source_trials[fi]
+                    X_tr = np.concatenate(
+                        [_preprocess(item[0], src_subj.electrode_labels) for item in train_dataset],
+                        axis=0,
                     )
-                    return feats.float().numpy()
-
-                X_train = np.concatenate([
-                    _preprocess(item[0], train_subject.electrode_labels)
-                    for item in train_dataset
-                ], axis=0)
-                y_train = np.array([item[1] for item in train_dataset])
-                X_test = np.concatenate([
-                    _preprocess(item[0], subject.electrode_labels)
-                    for item in test_dataset
-                ], axis=0)
-                y_test = np.array([item[1] for item in test_dataset])
+                    y_tr = np.array([item[1] for item in train_dataset])
+                    r_tr = _resolve_regions_for_subject(
+                        src_subj, args, upstream_helpers, get_region_labels,
+                    )
+                    per_src_X.append(X_tr)
+                    per_src_y.append(y_tr)
+                    per_src_r.append(r_tr)
+                    if X_test_raw is None:
+                        X_test_raw = np.concatenate(
+                            [_preprocess(item[0], subject.electrode_labels) for item in test_dataset],
+                            axis=0,
+                        )
+                        y_test_pool = np.array([item[1] for item in test_dataset])
+                        regions_test_raw = _resolve_regions_for_subject(
+                            subject, args, upstream_helpers, get_region_labels,
+                        )
+                    src_subj.clear_neural_data_cache(src_trial)
+                    gc.collect()
+                assert X_test_raw is not None and y_test_pool is not None and regions_test_raw is not None
+                if args.region_pool_mode == "test-anchored":
+                    target_regions = sorted(set(regions_test_raw.tolist()))
+                elif args.region_pool_mode == "source-union":
+                    target_regions = sorted(set(np.concatenate(per_src_r).tolist()))
+                else:
+                    raise ValueError(
+                        f"--pool-multi-source requires --region-pool-mode in "
+                        f"{{test-anchored, source-union}}, got {args.region_pool_mode}"
+                    )
+                X_train_pool_parts = [
+                    _pool_to_target_regions(X, r, target_regions)
+                    for X, r in zip(per_src_X, per_src_r)
+                ]
+                X_train_pooled = np.concatenate(X_train_pool_parts, axis=0)
+                y_train_pooled = np.concatenate(per_src_y, axis=0)
+                X_test_pooled = _pool_to_target_regions(X_test_raw, regions_test_raw, target_regions)
+                eval_cells.append((0, X_train_pooled, y_train_pooled, X_test_pooled, y_test_pool))
+                print(
+                    f"[D.14] pooled cell: |target_regions|={len(target_regions)} "
+                    f"({args.region_pool_mode}), n_train={len(y_train_pooled)} "
+                    f"across {len(per_src_X)} source subjects, n_test={len(y_test_pool)}"
+                )
+                del per_src_X, per_src_r, X_train_pool_parts, X_test_raw
                 gc.collect()
-
-                if splits_type == "CrossSubject":
-                    regions_train = get_region_labels(train_subject)
-                    regions_test = get_region_labels(subject)
-                    if args.backend == "neuralset":
-                        # Re-derive regions to match post-reference virtual channels.
-                        # Bipolar collapses pairs (`chA-chB`); CAR/median preserve
-                        # labels 1:1; shaft_laplacian preserves labels with
-                        # remove_non_laplacian=False. Without this, regions sized
-                        # to the original electrode count don't index post-ref X.
-                        from speech_decoding.views import apply_reference  # noqa: PLC0415
-                        train_labels_orig = list(train_subject.electrode_labels)
-                        test_labels_orig = list(subject.electrode_labels)
-                        _, train_labels_ref = apply_reference(
-                            torch.zeros(1, len(train_labels_orig), 1),
-                            train_labels_orig,
-                            args.ref_kind,
-                            upstream_helpers=upstream_helpers,
-                        )
-                        _, test_labels_ref = apply_reference(
-                            torch.zeros(1, len(test_labels_orig), 1),
-                            test_labels_orig,
-                            args.ref_kind,
-                            upstream_helpers=upstream_helpers,
-                        )
-                        regions_train = _derive_virtual_regions(
-                            list(train_labels_ref),
-                            dict(zip(train_labels_orig, regions_train)),
-                        )
-                        regions_test = _derive_virtual_regions(
-                            list(test_labels_ref),
-                            dict(zip(test_labels_orig, regions_test)),
-                        )
-                    X_train, X_test, _ = combine_regions(
-                        X_train, X_test, regions_train, regions_test
+            else:
+                for fold_idx, fold in enumerate(folds):
+                    train_dataset = fold["train_dataset"]
+                    test_dataset = fold["test_dataset"]
+                    assert train_subject is not None
+                    X_train = np.concatenate(
+                        [_preprocess(item[0], train_subject.electrode_labels) for item in train_dataset],
+                        axis=0,
                     )
+                    y_train = np.array([item[1] for item in train_dataset])
+                    X_test = np.concatenate(
+                        [_preprocess(item[0], subject.electrode_labels) for item in test_dataset],
+                        axis=0,
+                    )
+                    y_test = np.array([item[1] for item in test_dataset])
+                    gc.collect()
+                    if splits_type == "CrossSubject":
+                        regions_train = _resolve_regions_for_subject(
+                            train_subject, args, upstream_helpers, get_region_labels,
+                        )
+                        regions_test = _resolve_regions_for_subject(
+                            subject, args, upstream_helpers, get_region_labels,
+                        )
+                        X_train, X_test, _ = combine_regions(
+                            X_train, X_test, regions_train, regions_test
+                        )
+                    eval_cells.append((fold_idx, X_train, y_train, X_test, y_test))
 
+            for fold_idx, X_train, y_train, X_test, y_test in eval_cells:
+                t_fold = time.time()
                 n_channels = int(X_train.shape[1])
+                fa_mode = getattr(args, "feature_aggregation", "none") or "none"
+                if fa_mode in ("mean", "median") and X_train.ndim == 3:
+                    op = np.mean if fa_mode == "mean" else np.median
+                    X_train = op(X_train, axis=2)
+                    X_test = op(X_test, axis=2)
                 X_train = X_train.reshape(X_train.shape[0], -1)
                 X_test = X_test.reshape(X_test.shape[0], -1)
+                if fa_mode == "pca50_cross_channel":
+                    from sklearn.decomposition import PCA  # noqa: PLC0415
+                    n_comp = int(min(50, X_train.shape[1], max(1, X_train.shape[0] - 1)))
+                    pca = PCA(n_components=n_comp, random_state=args.seed)
+                    X_train = pca.fit_transform(X_train)
+                    X_test = pca.transform(X_test)
 
                 if qc_payload is None:
                     qc_payload = {
@@ -374,7 +527,28 @@ def run_eval(
 
                 gc.collect()
 
-                clf = LogisticRegression(random_state=args.seed, max_iter=10000, tol=1e-3)
+                if getattr(args, "shuffle_labels", False):
+                    rng = np.random.default_rng(args.seed)
+                    y_train = rng.permutation(y_train)
+                    y_test = rng.permutation(y_test)
+
+                cw_mode = getattr(args, "class_weight", "none") or "none"
+                if cw_mode == "none":
+                    cw: Any = None
+                elif cw_mode == "balanced":
+                    cw = "balanced"
+                elif cw_mode == "effective_num":
+                    beta = 0.999
+                    cls, counts = np.unique(y_train, return_counts=True)
+                    eff = (1.0 - beta ** counts) / (1.0 - beta)
+                    weights = (1.0 / eff)
+                    weights = weights / weights.sum() * len(cls)
+                    cw = {int(c): float(w) for c, w in zip(cls, weights)}
+                else:
+                    raise ValueError(f"Unknown class_weight: {cw_mode}")
+                clf = LogisticRegression(
+                    random_state=args.seed, max_iter=10000, tol=1e-3, class_weight=cw,
+                )
                 clf.fit(X_train, y_train)
                 train_accuracy = clf.score(X_train, y_train)
                 test_accuracy = clf.score(X_test, y_test)
@@ -464,6 +638,55 @@ def apply_normalization(
     else:
         raise ValueError(f"Unknown normalization: {normalization}")
     return X_train, X_test
+
+
+def _resolve_regions_for_subject(
+    subject: Any,
+    args: argparse.Namespace,
+    upstream_helpers: Any,
+    get_region_labels: Any,
+) -> np.ndarray:
+    """Return DK regions aligned to the post-reference virtual channels.
+
+    For backend=upstream the upstream pipeline preserves labels 1:1 so
+    `get_region_labels(subject)` is correct as-is. For backend=neuralset the
+    reference may collapse pairs (bipolar) or preserve labels (CAR /
+    shaft_laplacian / median); we re-derive virtual-channel regions from the
+    original `electrode_labels → region` map.
+    """
+    base = get_region_labels(subject)
+    if args.backend != "neuralset":
+        return base
+    from speech_decoding.views import apply_reference  # noqa: PLC0415
+    labels_orig = list(subject.electrode_labels)
+    _, labels_ref = apply_reference(
+        torch.zeros(1, len(labels_orig), 1),
+        labels_orig,
+        args.ref_kind,
+        upstream_helpers=upstream_helpers,
+    )
+    return _derive_virtual_regions(list(labels_ref), dict(zip(labels_orig, base)))
+
+
+def _pool_to_target_regions(
+    X: np.ndarray, regions: np.ndarray, target_regions: list[str],
+) -> np.ndarray:
+    """Mean-pool channels per region; zero-fill regions absent from `regions`.
+
+    X has shape (B, C, ...) — any trailing time/feature dims preserved.
+    Output shape (B, len(target_regions), ...). Channels with `regions[i] == r`
+    are mean-aggregated for each target region r; if no channel matches r the
+    column is filled with zeros.
+    """
+    if X.ndim < 2:
+        raise ValueError(f"_pool_to_target_regions expects (B, C, ...), got shape {X.shape}")
+    out_shape = (X.shape[0], len(target_regions)) + X.shape[2:]
+    out = np.zeros(out_shape, dtype=X.dtype)
+    for j, r in enumerate(target_regions):
+        mask = regions == r
+        if mask.any():
+            out[:, j, ...] = X[:, mask, ...].mean(axis=1)
+    return out
 
 
 def _derive_virtual_regions(
@@ -655,6 +878,7 @@ def _parse_args() -> argparse.Namespace:
             "log_stft", "hg_envelope_wide", "low_lfp",
             "multi_band_log_power", "wavelet_db4",
             "instantaneous_phase",
+            "hg_envelope_70_90", "hg_envelope_90_120", "hg_envelope_120_150",
         ),
         default="stft_abs",
         help="Input view (only used when --backend=neuralset).",
@@ -664,6 +888,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also train probes on subject_id / session_id from same X (L.5 P1/P2). "
              "Writes nuisance_probe_metrics.csv to out_dir.",
+    )
+    p.add_argument(
+        "--shuffle-labels",
+        action="store_true",
+        help="L.5.P11 label-permutation null: independently permute y_train and "
+             "y_test before LogReg fit (seeded by --seed). Held-out AUROC must "
+             "be ≤ empirical-chance + 0.02 across 3 seeds. Anything above flags "
+             "label-into-features leakage in the pipeline.",
     )
     p.add_argument(
         "--normalization",
@@ -698,12 +930,81 @@ def _parse_args() -> argparse.Namespace:
         help="Optional override for the L-cell ID written to ExperimentLogger "
              "(e.g. 'L.3.F1'). Defaults to the L.1 cell derived from --normalization.",
     )
+    p.add_argument(
+        "--keep-n-electrodes", type=int, default=0,
+        help="L.6.ES random electrode dropout: after Lite cap, restrict to a "
+             "random subset of size keep_n (sorted by original index). 0 = no "
+             "dropout. If keep_n exceeds available, all are kept.",
+    )
+    p.add_argument(
+        "--electrode-dropout-seed", type=int, default=None,
+        help="Seed for L.6.ES random electrode subset draw. Defaults to --seed.",
+    )
+    p.add_argument(
+        "--shuffle-channels-per-subject", action="store_true",
+        help="L.5.P6: independently permute electrode order per subject before "
+             "reference is applied. CrossSubject only; intent is to verify that "
+             "cross-subject task accuracy drops substantially when channel "
+             "identity correspondence is broken.",
+    )
+    p.add_argument(
+        "--feature-bin-start", type=float, default=None,
+        help="L.5.P5: override start of feature slice (seconds, in onset-anchored "
+             "frame). Default = -anchor_start_before. Use to slice a sub-window "
+             "of the loaded context — e.g., load [0, 6]s and slice [5, 6]s.",
+    )
+    p.add_argument(
+        "--feature-bin-end", type=float, default=None,
+        help="L.5.P5: override end of feature slice (seconds). Default = "
+             "anchor_end_after.",
+    )
+    p.add_argument(
+        "--class-weight", choices=("none", "balanced", "effective_num"),
+        default="none",
+        help="L.6.CB: LogisticRegression class_weight. balanced = inverse "
+             "frequency. effective_num = Cui 2019 (β=0.999).",
+    )
+    p.add_argument(
+        "--feature-aggregation",
+        choices=("none", "mean", "median", "pca50_cross_channel"),
+        default="none",
+        help="L.6.FA: aggregation applied to (B, C, F) features before LogReg. "
+             "mean / median collapse the time/feature axis per channel; "
+             "pca50_cross_channel reduces flattened (B, C*F) → 50 components.",
+    )
+    p.add_argument(
+        "--pool-multi-source", action="store_true",
+        help="D.14: pool training across every NEUROPROBE_LITE source subject "
+             "(excluding the held-out test subject) into a single classifier "
+             "instead of one fold per source. Requires --split-type CrossSubject. "
+             "Test subject may be subject 2 in this mode.",
+    )
+    p.add_argument(
+        "--region-pool-mode",
+        choices=("pairwise", "test-anchored", "source-union"),
+        default="pairwise",
+        help="DK region pooling for CrossSubject. pairwise = upstream "
+             "intersection mean-pool (single-source default). test-anchored = "
+             "D.14 default; pool to test subject's DK regions, mean over source "
+             "channels per region, zero-fill missing. source-union = D.14 sister; "
+             "pool to ⋃ source DK regions, zero-fill missing in test.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reference-mean-auroc", type=float, default=None)
     args = p.parse_args()
     if args.bt_root is None:
         p.error("--bt-root or ROOT_DIR_BRAINTREEBANK is required")
-    if args.split_type == "CrossSubject" and args.subject_id == 2:
+    if args.pool_multi_source and args.split_type != "CrossSubject":
+        p.error("--pool-multi-source requires --split-type CrossSubject")
+    if args.pool_multi_source and args.region_pool_mode == "pairwise":
+        p.error(
+            "--pool-multi-source requires --region-pool-mode in {test-anchored, source-union}"
+        )
+    if (
+        args.split_type == "CrossSubject"
+        and args.subject_id == 2
+        and not args.pool_multi_source
+    ):
         p.error("CrossSubject cannot evaluate subject 2; Neuroprobe uses subject 2 as train")
     return args
 

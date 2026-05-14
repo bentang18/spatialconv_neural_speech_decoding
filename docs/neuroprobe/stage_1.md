@@ -245,8 +245,11 @@ Operationalizes the four lanes above. Source of truth for what counts as a *matc
 - Upstream Neuroprobe: `c7b955b0a31464f4a5eec3f3bd78ff29841d61ac`.
 - L.1 normalization winner: N1 = `train_set_fixed`. Frozen 2026-05-08. See `reports/neuroprobe_stage0_l1_normalization_2026_05_05/freeze_analysis.md`.
 - L.2 reference × view winner: R4xI2 = `shaft_laplacian × stft_abs`. Frozen 2026-05-09. See `reports/neuroprobe_stage0_l2_neuralset_*/freeze_analysis.md`.
-- L.4 anchor robustness: confirmed within ±0.005 noise band 2026-05-10 (`reports/neuroprobe_stage0_l4_anchor_2026_05_09/anchor_robustness.md`).
+- L.4 anchor robustness: confirmed within ±0.005 noise band 2026-05-10 (`reports/neuroprobe_stage0_l4_anchor_2026_05_09/anchor_robustness.md`). Full window sweep W2–W5 in flight 2026-05-13 (`reports/neuroprobe_stage0_l4_window_sweep_w2_w5_2026_05_13/`).
 - L.2 seed-robustness: linear baseline seed-invariant 2026-05-10 (`reports/neuroprobe_stage0_l2_seed_robustness_2026_05_10/seed_robustness.md`).
+- L.3 filtering: frozen as no-op 2026-05-13 (12/12 sessions). F1 (60/120/180 Hz notch) Δ +0.0007, F2 (F1 + 0.5 Hz HPF) Δ +0.0016, F3 (F1 + 1.0 Hz HPF) Δ +0.0015 — all within ±0.005 noise band vs L.2 winner. See `reports/neuroprobe_stage0_l3_filtering_2026_05_10/filtering_analysis.md`.
+- L.4 norm × view interaction: greedy hill-climb safe 2026-05-10. Max |interaction residual| = 0.0008 across 8 cells (refs={shaft_laplacian, bipolar} × views={stft_abs, hg_envelope} × norms={train_set_fixed, train_set_scale_only}). See `reports/neuroprobe_stage0_l4_norm_view_interaction_2026_05_09/interaction_analysis.md`.
+- Tier-C CrossSubject parity: C.0 baseline 0.5310 ± 0.0235; C.2 (L.1+L.2 winners joint) +0.0082 vs baseline 2026-05-10 (`reports/neuroprobe_stage0_tier_c_cross_subject_2026_05_09/tier_c_analysis.md`). C.3 (bipolar × stft) and C.4 (shaft_lap × HG envelope) in flight 2026-05-13 (`reports/neuroprobe_stage0_tier_c_alts_2026_05_13/`).
 
 ---
 
