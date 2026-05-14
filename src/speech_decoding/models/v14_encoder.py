@@ -339,10 +339,12 @@ class V14ParcelPerceiverWithHead(nn.Module):
         self,
         encoder: V14ParcelPerceiverModel,
         head: V14ClassifierHead,
+        eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.head = head
+        self.eps = eps
 
     def forward(
         self,
@@ -350,9 +352,10 @@ class V14ParcelPerceiverWithHead(nn.Module):
         support: Tensor,
         valid_mask: Optional[Tensor] = None,
         *,
-        eps: float = DEFAULT_SUPPORT_BIAS_EPS,
+        eps: Optional[float] = None,
     ) -> Tensor:
-        latents = self.encoder(electrode_tokens, support, valid_mask, eps=eps)
+        eps_used = self.eps if eps is None else eps
+        latents = self.encoder(electrode_tokens, support, valid_mask, eps=eps_used)
         return self.head(latents)
 
 
@@ -373,8 +376,27 @@ class V14ParcelPerceiver(BaseModelConfig):
     depth_self_attn: int = 6
     depth_temporal: int = 1
     m_sub_slots: int = 4
+    eps: float = DEFAULT_SUPPORT_BIAS_EPS
 
-    def build(self, n_classes: int) -> nn.Module:
+    def build(
+        self,
+        n_classes: int | None = None,
+        *,
+        n_in_channels: int | None = None,
+        n_outputs: int | None = None,
+    ) -> nn.Module:
+        """Build a v14 encoder + classifier head.
+
+        Accepts both the standalone ``n_classes=`` form and the NeuralTrain
+        ``Experiment._build_brain_module`` convention ``build(n_in_channels=...,
+        n_outputs=...)``. ``n_in_channels`` is informational only — v14 handles
+        variable C via the per-batch ``valid_mask``.
+        """
+        if n_classes is None:
+            n_classes = n_outputs
+        if n_classes is None:
+            raise ValueError("V14ParcelPerceiver.build needs n_classes or n_outputs")
+
         encoder = V14ParcelPerceiverModel(
             n_freq_bins=self.n_freq_bins,
             n_time_bins=self.n_time_bins,
@@ -388,4 +410,4 @@ class V14ParcelPerceiver(BaseModelConfig):
         head = V14ClassifierHead(
             d_model=self.d_model, n_classes=n_classes, n_heads=self.n_heads
         )
-        return V14ParcelPerceiverWithHead(encoder, head)
+        return V14ParcelPerceiverWithHead(encoder, head, eps=self.eps)
