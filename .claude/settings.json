@@ -6,19 +6,5 @@
       "mcp__arxiv__arxiv_search_papers",
       "mcp__arxiv__arxiv_get_paper"
     ]
-  },
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".claude/hooks/record_sbatch.py",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
   }
 }
