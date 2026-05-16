@@ -6,5 +6,18 @@
       "mcp__arxiv__arxiv_search_papers",
       "mcp__arxiv__arxiv_get_paper"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/paper_guard.py"
+          }
+        ]
+      }
+    ]
   }
 }

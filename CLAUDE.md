@@ -31,6 +31,14 @@ PS/uECoG stage program **paused 2026-04-24**. Active work is the Neuroprobe cros
 
 Don't read PS-resume context until Neuroprobe submits/aborts. Pointers when you do: `memory/project_phase1_default_vs_phase15_target_2026_04_19.md` (PS-resume defaults: per_cell + partialconv + pe2d + hierarchical_atlas @ d=32, depth=3, pool=(4,8); Utah grid is real on PS uECoG so partialconv stays — Neuroprobe-path's BNA-connectivity bias / flat pool / no partialconv are sEEG-specific, two paths diverge by modality not version), `docs/objectives.md` (4-stage roadmap; Stage 1 closed 2026-04-20, Stage 2 paused 2026-04-24, Stage 3+ TBD), `docs/strategy/stage_<N>.md`, `docs/tactics.md`. v14 calibration scope: fixed atlas through PS-Stage 2; learned calibration deferred to PS-Stage 3+.
 
+## v14 Paper Authorship — IRONCLAD
+
+Ben drafts the bulk of the v14 preprint/paper. Claude does **not** bulk-draft paper prose. After Ben has written the bulk, we iterate surgically piece-by-piece. In that surgical mode, every citation, every number, every empirical claim Claude touches must be rigorously double-checked against a real source. **NO EXCEPTIONS.**
+
+Mechanical guard: `.claude/hooks/paper_guard.py` (PreToolUse) fires on every Claude Write/Edit/MultiEdit/NotebookEdit to `paper/neuroprobe-hillclimb/`. Three layers: hard-block on meta-LLM phrases, hard-block on bulk drafting (>25 net lines added), force-ask permission prompt on all surviving edits so Ben visually approves every diff regardless of auto-accept mode. No env-var bypass — for a legitimate large edit, Ben writes it directly via his editor (the hook only intercepts Claude's tool calls).
+
+Full rule + verification checklist: `memory/feedback_arxiv_llm_content_responsibility_2026_05_16.md`. Floor: arXiv policy (Dietterich 2026-05-15) — un-checked LLM output → 1-year ban + peer-review requirement on subsequent submissions. Ceiling: the paper is Ben's; voice, framing, and claim structure come from Ben.
+
 ## Working Principle: Discuss Before Code
 
 **v14 is slow, methodical, and precise.** Discuss every pipeline piece — assumptions, I/O, why right for this data, what would make it wrong, precedent and trade-offs — before any code:
