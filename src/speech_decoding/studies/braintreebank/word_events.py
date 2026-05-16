@@ -7,14 +7,19 @@ labelling (``derive_label_indices``) and split policy
 (``train_test_splits.generate_splits_cross_session``).
 
 Split policy mirrors upstream exactly so v14 numbers compare apples-to-apples
-with the v2 paper baselines:
+with the v2 paper baselines. Row order within each (subject, trial)
+follows upstream's ``BrainTreebankSubjectTrialBenchmarkDataset.__getitem__``
+verbatim — items strictly interleave classes via ``(idx + 1) % n_classes``
+over chronologically-sorted per-class index lists. The val|test halving
+then operates on this interleaved order, NOT on a sort by overall
+``start``:
 
-* ``CrossSession`` (the submission gate): the test trial's balanced events
-  are sorted by ``start`` and split in half — first half → ``val``, second
-  half → ``test``. The *other* trial of the same subject becomes ``train``.
+* ``CrossSession`` (the submission gate): the test trial's interleaved
+  events are split at ``n // 2`` — first half → ``val``, second half →
+  ``test``. The *other* trial of the same subject becomes ``train``.
   Other subjects' timelines are dropped.
-* ``CrossSubject``: the test (subject, trial) provides the same chronological
-  val/test halves; train comes from ``(DS_DM_TRAIN_SUBJECT_ID,
+* ``CrossSubject``: same per-trial split policy on the test (subject,
+  trial); train comes from ``(DS_DM_TRAIN_SUBJECT_ID,
   DS_DM_TRAIN_TRIAL_ID)`` only (``include_all_train_subjects=False``, the
   upstream leaderboard default).
 
@@ -40,6 +45,8 @@ from speech_decoding.studies.braintreebank.labels import (
     NEUROPROBE_TASKS,
     derive_label_indices,
     enrich_words_with_transcript_features,
+    ordered_dataset_labels,
+    ordered_dataset_source_indices,
 )
 
 
@@ -109,12 +116,16 @@ def _word_event_rows(
     random_seed: int,
     duration: float,
 ) -> pd.DataFrame:
-    """Build per-task balanced Word rows for one (subject, trial) timeline.
+    """Build per-task balanced Word rows in upstream Dataset item order.
 
-    Returns rows in chronological order (sorted by ``start``) so downstream
-    half-half slicing reproduces upstream's val/test halves bit-for-bit. One
-    row per (task, class, sample). ``label`` is the integer class id from
-    :func:`derive_label_indices`.
+    Mirrors :meth:`BrainTreebankSubjectTrialBenchmarkDataset.__getitem__`
+    exactly: items strictly interleave classes via ``(idx + 1) % n_classes``
+    over chronologically-sorted per-class index lists. The downstream cut
+    ``val = range(0, n//2); test = range(n//2, n)`` then produces
+    class-balanced halves — sorting these rows by overall ``start`` instead
+    would silently flip val/test majority class whenever one class
+    temporally clusters differently from the other, producing the failure
+    mode ``test_acc ≈ 1 − val_acc`` regardless of model quality.
     """
     rows: list[dict[str, tp.Any]] = []
     for task in tasks:
@@ -127,29 +138,32 @@ def _word_event_rows(
             nano=nano,
             random_seed=random_seed,
         )
-        for class_id, indices in label_indices.items():
-            for idx in indices:
-                is_nonverbal = task in {"onset", "speech"} and class_id == 0
-                if is_nonverbal:
-                    source = nonverbal_df.iloc[int(idx)]
-                    text = "<nonverbal>"
-                else:
-                    source = words_df.iloc[int(idx)]
-                    raw_text = source.get("full_word", "")
-                    text = str(raw_text) if pd.notna(raw_text) and str(raw_text) else "<word>"
-                rows.append(
-                    {
-                        "type": "Word",
-                        "start": float(source["start"]),
-                        "duration": float(duration),
-                        "text": text,
-                        "task": task,
-                        "label": int(class_id),
-                        "subject_id": str(subject_id),
-                        "trial_id": str(trial_id),
-                        "timeline": timeline,
-                    }
-                )
+        ordered_labels = ordered_dataset_labels(label_indices)
+        ordered_source_indices = ordered_dataset_source_indices(label_indices)
+        for class_id_arr, src_idx_arr in zip(ordered_labels, ordered_source_indices):
+            class_id = int(class_id_arr)
+            src_idx = int(src_idx_arr)
+            is_nonverbal = task in {"onset", "speech"} and class_id == 0
+            if is_nonverbal:
+                source = nonverbal_df.iloc[src_idx]
+                text = "<nonverbal>"
+            else:
+                source = words_df.iloc[src_idx]
+                raw_text = source.get("full_word", "")
+                text = str(raw_text) if pd.notna(raw_text) and str(raw_text) else "<word>"
+            rows.append(
+                {
+                    "type": "Word",
+                    "start": float(source["start"]),
+                    "duration": float(duration),
+                    "text": text,
+                    "task": task,
+                    "label": class_id,
+                    "subject_id": str(subject_id),
+                    "trial_id": str(trial_id),
+                    "timeline": timeline,
+                }
+            )
     if not rows:
         return pd.DataFrame(
             {col: pd.Series(dtype=object) for col in (
@@ -157,8 +171,7 @@ def _word_event_rows(
                 "subject_id", "trial_id", "timeline",
             )}
         )
-    df = pd.DataFrame(rows)
-    return df.sort_values(["task", "start"], kind="stable").reset_index(drop=True)
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def _assign_cross_session_split(
