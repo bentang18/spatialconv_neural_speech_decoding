@@ -59,6 +59,9 @@ VIEWS: tuple[str, ...] = (
     "low_gamma_30_70",
     "vhg_150_300",
     "mua_300_500",
+    "envelope_30_500",
+    "envelope_70_500",
+    "envelope_30_150",
 )
 
 
@@ -155,6 +158,12 @@ def apply_view(
         return _hg_envelope(data, sampling_rate, lo_hz=150.0, hi_hz=300.0)
     if view_kind == "mua_300_500":
         return _hg_envelope(data, sampling_rate, lo_hz=300.0, hi_hz=500.0)
+    if view_kind == "envelope_30_500":
+        return _hg_envelope(data, sampling_rate, lo_hz=30.0, hi_hz=500.0)
+    if view_kind == "envelope_70_500":
+        return _hg_envelope(data, sampling_rate, lo_hz=70.0, hi_hz=500.0)
+    if view_kind == "envelope_30_150":
+        return _hg_envelope(data, sampling_rate, lo_hz=30.0, hi_hz=150.0)
     if view_kind == "low_lfp":
         return _low_lfp(data, sampling_rate)
     if view_kind == "multi_band_log_power":

@@ -880,6 +880,7 @@ def _parse_args() -> argparse.Namespace:
             "instantaneous_phase",
             "hg_envelope_70_90", "hg_envelope_90_120", "hg_envelope_120_150",
             "low_gamma_30_70", "vhg_150_300", "mua_300_500",
+            "envelope_30_500", "envelope_70_500", "envelope_30_150",
         ),
         default="stft_abs",
         help="Input view (only used when --backend=neuralset).",
