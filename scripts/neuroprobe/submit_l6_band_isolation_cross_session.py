@@ -39,6 +39,7 @@ class BandCell:
     min_freq: float
     max_freq: float
     description: str
+    notch_freqs: str = ""  # extra notch freqs beyond upstream default (60/120/180/240/300)
 
 
 CELLS: tuple[BandCell, ...] = (
@@ -48,6 +49,11 @@ CELLS: tuple[BandCell, ...] = (
     BandCell("L.6.BI.4", 150.0, 200.0, "150-200 Hz isolated very-HG"),
     BandCell("L.6.BI.5", 200.0, 300.0, "200-300 Hz ripple band"),
     BandCell("L.6.BI.6",   0.0, 200.0, "0-200 Hz cumulative reference"),
+    BandCell(
+        "L.6.BI.7", 300.0, 1000.0,
+        "300-1000 Hz spike-band (Zac micro-ECoG question)",
+        notch_freqs="360,420,480,540,600,660,720,780,840,900,960",
+    ),
 )
 
 
@@ -112,6 +118,7 @@ def main() -> None:
                 "cell_id": cell.cell_id,
                 "stft_min_freq": str(cell.min_freq),
                 "stft_max_freq": str(cell.max_freq),
+                "notch_freqs": cell.notch_freqs,
                 "description": cell.description,
                 "subject_id": str(sub_id),
                 "trial_id": str(trial_id),
@@ -145,6 +152,7 @@ def build_command(job: BandJob, report_dir: Path, args: argparse.Namespace) -> s
         "--cell-id", job.cell.cell_id,
         "--stft-min-freq", str(job.cell.min_freq),
         "--stft-max-freq", str(job.cell.max_freq),
+        "--notch-freqs", job.cell.notch_freqs,
         "--seed", str(args.seed),
     ]
     return "ROOT_DIR_BRAINTREEBANK=" + shlex.quote(str(args.bt_root)) + " " + shlex.join(cmd)
