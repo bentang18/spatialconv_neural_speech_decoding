@@ -199,8 +199,8 @@ def run_eval(
             "nperseg": 512,
             "poverlap": 0.75,
             "window": "hann",
-            "max_frequency": 150,
-            "min_frequency": 0,
+            "max_frequency": args.stft_max_freq,
+            "min_frequency": args.stft_min_freq,
         },
         "projection": {"dim": 192, "method": "pca"},
     }
@@ -924,6 +924,16 @@ def _parse_args() -> argparse.Namespace:
              "applied per-channel via zero-phase filtfilt on the FULL session voltage. "
              "0.0 = no HPF (L.3.F0/F1 default). HPF on 1-s windowed slices is "
              "mathematically broken at <2 Hz cutoffs — must be applied pre-window.",
+    )
+    p.add_argument(
+        "--stft-min-freq", type=float, default=0.0,
+        help="STFT min frequency in Hz to retain (L.6.BI band-isolation sweep). "
+             "Default 0.0 (upstream lock).",
+    )
+    p.add_argument(
+        "--stft-max-freq", type=float, default=150.0,
+        help="STFT max frequency in Hz to retain (L.6.BI band-isolation sweep). "
+             "Default 150.0 (upstream lock).",
     )
     p.add_argument(
         "--cell-id", default=None,
