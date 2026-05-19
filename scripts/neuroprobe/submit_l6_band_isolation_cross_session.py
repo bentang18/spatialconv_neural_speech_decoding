@@ -54,6 +54,13 @@ CELLS: tuple[BandCell, ...] = (
         "300-1000 Hz spike-band (Zac micro-ECoG question)",
         notch_freqs="360,420,480,540,600,660,720,780,840,900,960",
     ),
+    BandCell("L.6.BI.C0",   0.0,  150.0, "0-150 Hz cumulative (upstream-default anchor)"),
+    BandCell("L.6.BI.C1",   0.0,  300.0, "0-300 Hz cumulative (ripple-band extension)"),
+    BandCell(
+        "L.6.BI.C2",   0.0, 1000.0,
+        "0-1000 Hz cumulative (full-band extension)",
+        notch_freqs="360,420,480,540,600,660,720,780,840,900,960",
+    ),
 )
 
 
