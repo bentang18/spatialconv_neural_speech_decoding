@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -285,6 +286,15 @@ def run_eval(
     rows: list[dict[str, Any]] = []
     qc_payload: dict[str, Any] | None = None
 
+    # STFT feature cache. The 15 Neuroprobe tasks share one trial and heavily
+    # overlapping word-onset windows; STFT features depend only on (raw window,
+    # electrode order, view), not on the task. Memoize on a content hash of the
+    # sliced raw window so each unique window is transformed once, not once per
+    # task. Pure speedup — same features out.
+    view_sig = f"{args.backend}|{args.ref_kind}|{args.view_kind}|{preprocess_type}"
+    _feat_cache: dict[bytes, np.ndarray] = {}
+    _cache_stats = {"hits": 0, "misses": 0}
+
     for eval_name in eval_names:
         if splits_type == "WithinSession":
             folds = nts.generate_splits_within_session(
@@ -389,19 +399,29 @@ def run_eval(
             data_idx_to = int((bin_end + bins_start_before) * nconfig.SAMPLING_RATE)
 
             def _preprocess(item_data, electrode_labels):
-                sliced = item_data[:, data_idx_from:data_idx_to].unsqueeze(0)
+                sliced = item_data[:, data_idx_from:data_idx_to]
+                key = _window_cache_key(sliced, electrode_labels, view_sig)
+                cached = _feat_cache.get(key)
+                if cached is not None:
+                    _cache_stats["hits"] += 1
+                    return cached
+                _cache_stats["misses"] += 1
+                batched = sliced.unsqueeze(0)
                 if args.backend == "upstream":
-                    return preprocess_data(
-                        sliced, electrode_labels, preprocess_type, preprocess_parameters,
+                    feats_np = preprocess_data(
+                        batched, electrode_labels, preprocess_type, preprocess_parameters,
                     ).float().numpy()
-                from speech_decoding.views import preprocess_views  # noqa: PLC0415
-                feats, _ = preprocess_views(
-                    sliced, list(electrode_labels),
-                    ref_kind=args.ref_kind, view_kind=args.view_kind,
-                    sampling_rate=int(nconfig.SAMPLING_RATE),
-                    upstream_helpers=upstream_helpers,
-                )
-                return feats.float().numpy()
+                else:
+                    from speech_decoding.views import preprocess_views  # noqa: PLC0415
+                    feats, _ = preprocess_views(
+                        batched, list(electrode_labels),
+                        ref_kind=args.ref_kind, view_kind=args.view_kind,
+                        sampling_rate=int(nconfig.SAMPLING_RATE),
+                        upstream_helpers=upstream_helpers,
+                    )
+                    feats_np = feats.float().numpy()
+                _feat_cache[key] = feats_np
+                return feats_np
 
             # Build evaluation cells. Single-source CrossSubject (and Within /
             # CrossSession) produce one cell per upstream fold; pool-multi-source
@@ -607,7 +627,31 @@ def run_eval(
                 del y_test_filtered, test_probs_filtered, y_test_oh, y_train_oh, clf
                 gc.collect()
 
+    _total = _cache_stats["hits"] + _cache_stats["misses"]
+    if _total:
+        cache_mb = sum(a.nbytes for a in _feat_cache.values()) / 1e6
+        print(
+            f"[stft-cache] {_cache_stats['hits']}/{_total} hits "
+            f"({100 * _cache_stats['hits'] / _total:.1f}%); "
+            f"{len(_feat_cache)} unique windows, {cache_mb:.0f} MB"
+        )
     return pd.DataFrame(rows), qc_payload
+
+
+def _window_cache_key(window: Any, electrode_labels: Any, view_sig: str) -> bytes:
+    """Content hash of a sliced raw neural window for STFT-feature memoization.
+
+    Two items with byte-identical sliced windows, electrode order, and view
+    config produce identical features and share a cache entry. Keying on
+    content (not word id) keeps this independent of upstream dataset internals.
+    """
+    arr = window.detach().cpu().contiguous().numpy()
+    h = hashlib.blake2b(digest_size=16)
+    h.update(view_sig.encode())
+    h.update(repr((arr.shape, str(arr.dtype))).encode())
+    h.update(repr(tuple(electrode_labels)).encode())
+    h.update(arr.tobytes())
+    return h.digest()
 
 
 def apply_normalization(
