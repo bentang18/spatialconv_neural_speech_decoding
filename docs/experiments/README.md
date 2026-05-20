@@ -9,6 +9,9 @@ artifacts and a `experiment_record.json` sidecar; this dir collects them.
 - `runs.csv` — flat one-row-per-run table, regenerated from all
   `experiment_record.json` sidecars by `scripts/neuroprobe/collect_experiment_records.py`.
 - `stage0_summary.csv` — Stage-0 freeze table (curated; not auto-generated).
+- `stage0_csubject_band_campaign_2026_05.md` — digest of the 5/13–5/18
+  CrossSubject + band sweep campaign (17 dirs, 860 runs), aggregated by
+  `scripts/neuroprobe/collect_stage0_grid.py`.
 - `SCHEMA.md` — pointer to §Schema below; kept for greppability.
 - `v14_ablation_log.csv` — pre-NeuroAI-reset log. Frozen historical reference;
   do not extend. New runs land in `runs.csv` via the schema below.
