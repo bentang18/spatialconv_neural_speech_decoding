@@ -52,6 +52,8 @@ NORMALIZATION_CELLS: dict[str, str] = {
     "train_set_robust_mad":      "L.1.N6",
     "per_session_robust_scale":  "L.1.N7",
     "per_channel_train_set_z":   "L.1.N8",
+    "per_session_robust_freqbin": "L.1.NA",
+    "per_session_robust_pooled":  "L.1.NB",
 }
 
 NORMALIZATION_DESCRIPTIONS: dict[str, str] = {
@@ -64,6 +66,8 @@ NORMALIZATION_DESCRIPTIONS: dict[str, str] = {
     "train_set_robust_mad":     "per-feature median + 1.4826*MAD fit on training set, applied to test (inductive analog of N5)",
     "per_session_robust_scale": "per-feature MAD scale only (no median subtraction) fit independently on each session",
     "per_channel_train_set_z":  "one mean/std per electrode pooled over freq+time, fit on training set (standard iEEG recipe)",
+    "per_session_robust_freqbin": "robust median + 1.4826*MAD per (electrode, freq-bin) pooled over time+batch, fit per session (transductive) — Nv14 per-freq-bin-z proxy",
+    "per_session_robust_pooled":  "robust median + 1.4826*MAD per electrode pooled over time+freq+batch, fit per session (transductive) — pooled-z split proxy (Job-1 only)",
 }
 
 
@@ -500,6 +504,7 @@ def run_eval(
                     op = np.mean if fa_mode == "mean" else np.median
                     X_train = op(X_train, axis=2)
                     X_test = op(X_test, axis=2)
+                feat_shape = tuple(X_train.shape[1:])
                 X_train = X_train.reshape(X_train.shape[0], -1)
                 X_test = X_test.reshape(X_test.shape[0], -1)
                 if fa_mode == "pca50_cross_channel":
@@ -518,7 +523,8 @@ def run_eval(
                     }
 
                 X_train, X_test = apply_normalization(
-                    X_train, X_test, args.normalization, n_channels=n_channels,
+                    X_train, X_test, args.normalization,
+                    n_channels=n_channels, feat_shape=feat_shape,
                 )
 
                 if qc_payload is not None and "post_train_sample" not in qc_payload:
@@ -606,6 +612,7 @@ def run_eval(
 
 def apply_normalization(
     X_train: Any, X_test: Any, normalization: str, *, n_channels: int = 0,
+    feat_shape: tuple[int, ...] | None = None,
 ) -> tuple[Any, Any]:
     if normalization == "train_set_fixed":
         scaler = StandardScaler(copy=False)
@@ -630,6 +637,12 @@ def apply_normalization(
         X_test = _mad_scale_only(X_test)
     elif normalization == "per_channel_train_set_z":
         X_train, X_test = _per_channel_train_set_z(X_train, X_test, n_channels)
+    elif normalization == "per_session_robust_freqbin":
+        X_train = _robust_freqbin(X_train, feat_shape)
+        X_test = _robust_freqbin(X_test, feat_shape)
+    elif normalization == "per_session_robust_pooled":
+        X_train = _robust_pooled(X_train, feat_shape)
+        X_test = _robust_pooled(X_test, feat_shape)
     elif normalization == "per_window_z":
         X_train = _per_window_z(X_train)
         X_test = _per_window_z(X_test)
@@ -746,6 +759,45 @@ def _per_channel_train_set_z(
     Xtr = (Xtr - mu) / (sd + 1e-8)
     Xte = (Xte - mu) / (sd + 1e-8)
     return Xtr.reshape(X_train.shape[0], -1), Xte.reshape(X_test.shape[0], -1)
+
+
+def _robust_freqbin(X: np.ndarray, feat_shape: tuple[int, ...] | None) -> np.ndarray:
+    """Robust z per (electrode, freq-bin), pooled over time + batch (Nv14 proxy).
+
+    feat_shape is the per-window feature shape (C, [T], F) with frequency as the
+    last axis — the STFT layout from `preprocess_stft` is (B, C, n_timebins,
+    n_freqs). Statistic is fit on X itself (transductive / per-session); called
+    separately on train and test.
+    """
+    if feat_shape is None or len(feat_shape) < 2:
+        raise ValueError(
+            f"per_session_robust_freqbin needs feat_shape (C, [T], F); got {feat_shape}"
+        )
+    n_freqs = int(feat_shape[-1])
+    n_channels = int(feat_shape[0])
+    Xr = X.reshape(X.shape[0], n_channels, -1, n_freqs)  # (B, C, M, F)
+    med = np.median(Xr, axis=(0, 2), keepdims=True)       # (1, C, 1, F)
+    mad = np.median(np.abs(Xr - med), axis=(0, 2), keepdims=True) * 1.4826
+    Xr = (Xr - med) / (mad + 1e-8)
+    return Xr.reshape(X.shape[0], -1)
+
+
+def _robust_pooled(X: np.ndarray, feat_shape: tuple[int, ...] | None) -> np.ndarray:
+    """Robust z per electrode, pooled over time + freq + batch (pooled-z proxy).
+
+    Removes per-recording per-channel scale only, preserving each recording's
+    cross-frequency shape. Transductive / per-session: fit on X itself.
+    """
+    if feat_shape is None or len(feat_shape) < 2:
+        raise ValueError(
+            f"per_session_robust_pooled needs feat_shape (C, ...); got {feat_shape}"
+        )
+    n_channels = int(feat_shape[0])
+    Xr = X.reshape(X.shape[0], n_channels, -1)            # (B, C, F)
+    med = np.median(Xr, axis=(0, 2), keepdims=True)       # (1, C, 1)
+    mad = np.median(np.abs(Xr - med), axis=(0, 2), keepdims=True) * 1.4826
+    Xr = (Xr - med) / (mad + 1e-8)
+    return Xr.reshape(X.shape[0], -1)
 
 
 def _parse_notch_freqs(spec: str) -> tuple[float, ...]:
