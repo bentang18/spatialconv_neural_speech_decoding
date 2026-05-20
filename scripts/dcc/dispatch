@@ -27,6 +27,19 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 "${script_dir}/sync"
 
+# Log every dispatch — a sweep is a loop that must be closed (pulled + analyzed).
+repo_root="$(git rev-parse --show-toplevel)"
+ledger="${repo_root}/docs/experiments/dispatch_log.csv"
+if [[ -f "${ledger}" ]]; then
+  args_csv="${*//\"/\"\"}"
+  printf '%s,%s,%s,%s,"%s",dispatched\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(git rev-parse --abbrev-ref HEAD)" \
+    "$(git rev-parse --short HEAD)" \
+    "${submitter}" "${args_csv}" >> "${ledger}"
+  echo ">> logged dispatch to docs/experiments/dispatch_log.csv (status=dispatched)"
+fi
+
 remote_args=()
 for arg in "$@"; do
   remote_args+=("$(printf '%q' "${arg}")")
@@ -35,3 +48,7 @@ done
 echo ">> ${DCC_HOST}: .venv/bin/python ${submitter} ${remote_args[*]:-}"
 ssh -t "${DCC_HOST}" \
   "cd '${DCC_REPO}' && .venv/bin/python ${submitter} ${remote_args[*]:-}"
+
+echo
+echo ">> sweep dispatched. Close the loop: pull results, run the collector +"
+echo ">> analysis, then set this run's docs/experiments/dispatch_log.csv row to 'analyzed'."

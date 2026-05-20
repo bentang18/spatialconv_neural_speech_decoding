@@ -8,6 +8,11 @@ artifacts and a `experiment_record.json` sidecar; this dir collects them.
 
 - `runs.csv` — flat one-row-per-run table, regenerated from all
   `experiment_record.json` sidecars by `scripts/neuroprobe/collect_experiment_records.py`.
+- `dispatch_log.csv` — one row per `scripts/dcc/dispatch` call
+  (`dispatched_at,branch,commit,submitter,args,status`). `status` starts at
+  `dispatched`; set it to `analyzed` once the sweep's results are pulled and
+  analyzed. Rows still `dispatched` are open loops — clear them before
+  launching new sweeps.
 - `stage0_summary.csv` — Stage-0 freeze table (curated; not auto-generated).
 - `SCHEMA.md` — pointer to §Schema below; kept for greppability.
 - `v14_ablation_log.csv` — pre-NeuroAI-reset log. Frozen historical reference;

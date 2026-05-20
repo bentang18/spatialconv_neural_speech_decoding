@@ -165,7 +165,7 @@ Active module layout under `src/speech_decoding/` after the NeuroAI reset:
 
 Tests colocated next to modules. Active package stays small: NeuroAI integration plus v14 science only. Reorg blueprint: `docs/neuroprobe/repo_reorg_plan.md`. Adapter spec: `docs/neuroprobe/neuralset_integration_plan.md`.
 
-**Retired-script anti-pattern**: do **not** revive `scripts/v14_core/`, `scripts/ablation/`, or `scripts/archive/` — backed up externally, removed from active tree. Future training dispatch belongs in NeuralTrain/Exca. The active proof harness `scripts/neuroprobe/prove_wang2024treebank_raw_voltage.py` and the four `scripts/dcc/*` helpers are the only sanctioned operational scripts.
+**Retired-script anti-pattern**: do **not** revive `scripts/v14_core/`, `scripts/ablation/`, or `scripts/archive/` — backed up externally, removed from active tree. Future training dispatch belongs in NeuralTrain/Exca. The active proof harness `scripts/neuroprobe/prove_wang2024treebank_raw_voltage.py`, the four `scripts/dcc/*` helpers, and `scripts/git/worktree-sweep` are the only sanctioned operational scripts.
 
 ## Compute: Duke DCC cluster
 
@@ -180,6 +180,11 @@ All training on DCC, never local. Repo: `/work/ht203/repo/speech`. Python: `.ven
 
 **Load `docs/references/dcc_setup.md` on demand** when first touching any of these helpers, `submit_*` scripts, or DCC paths in a session — full cheatsheet (identity+paths, env vars `ROOT_DIR_BRAINTREEBANK`/`EXCA_CACHE_FOLDER`, sbatch template, `/work` 75-day purge rule, NeuroAI dispatch example). Skip when the session has nothing to do with the cluster.
 
+**Sweep discipline — close every dispatch loop.** A sweep started and never analyzed is the default failure mode; these rules force the loop shut.
+- **Never commit on the DCC clone.** It is a `git reset --hard` target — commits made there are silently destroyed on the next `scripts/dcc/sync`. `sync` now aborts if it detects them (push from DCC, or rerun `--force`). Always commit on the laptop → push → sync.
+- **No sweep without a collector.** A `submit_*` script is not dispatched until its paired `collect_*`/`analyze_*` exists. A sweep is not *done* until results are pulled, analyzed, and recorded under `docs/experiments/`.
+- **Every dispatch is logged.** `scripts/dcc/dispatch` appends a row to `docs/experiments/dispatch_log.csv`. Rows still `dispatched` are open loops — clear them (pull + analyze, set `analyzed`) before launching new sweeps.
+
 ## Preprocessing Pipeline (do not change)
 
 Decimate 2kHz → CAR → impedance exclusion (log10 > 6) → 70–150 Hz Gaussian filterbank (8 bands) → Hilbert envelope → sum → 200 Hz → z-score → sig-channel selection. In `coganlab/IEEG_Pipelines`. **Z-score is per-channel mean/std pooled across all pre-auditory baseline trials + samples** (500 ms window immediately before auditory-stim onset; verified 2026-04-18 via reconstruction test on 7 patients, corr = 1.0000). NOT per-trial and NOT pre-production. **Recording-level median/MAD ≡ this recipe up to per-channel affine** (ρ=1.0000 across tested patients) — SSL (Stage 2) can swap recipes without bit-exact constraints. Details: `docs/references/data_reference.md`.
@@ -191,3 +196,4 @@ Decimate 2kHz → CAR → impedance exclusion (log10 > 6) → 70–150 Hz Gaussi
 - **All training on DCC, never local.**
 - **Every architectural change reports both pooled joint AND LOPO warm-start.** `docs/objectives.md §Evaluation philosophy`. LOPO is the foundation-model test; load-bearing for Stage-2 SSL, Stage-3 cross-sensor transfer, Stage-4 external-corpus transfer. **Single-protocol evidence does not justify defaulting an arch change.**
 - **Always export DCC results into `docs/experiments/`.** Every finished DCC run needs a durable record because `/work/ht203` auto-purges every 75 days. The old CSV + aggregator were retired; define the NeuralTrain/Exca export schema before the first Stage-0 result lands.
+- **Tear down agent worktrees on merge.** When a `.claude/worktrees/` branch lands on main, `git worktree remove` + `git branch -d` in the same step. Run `scripts/git/worktree-sweep` periodically to clear merged + clean worktrees.

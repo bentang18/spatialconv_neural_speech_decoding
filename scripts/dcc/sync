@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Push current branch to origin and reset DCC clone to match.
-# Usage: scripts/dcc/sync
+# Usage: scripts/dcc/sync [--force]
 #
-# Steps: git push origin <branch>; ssh DCC; git fetch; git reset --hard
-# origin/<branch>; print last 3 commits.
+# Steps: git push origin <branch>; ssh DCC; git fetch; ABORT if the DCC clone
+# has commit(s) on no origin branch (reset --hard would destroy them); else
+# git reset --hard origin/<branch>; print last 3 commits.
 #
-# Stays small on purpose. For dispatch coupling, use scripts/dcc/dispatch.
+# --force discards unpushed DCC commits instead of aborting. Stays small on
+# purpose. For dispatch coupling, use scripts/dcc/dispatch.
 
 set -euo pipefail
+
+force=0
+if [[ "${1:-}" == "--force" ]]; then force=1; fi
 
 DCC_HOST="${DCC_HOST:-ht203@dcc-login.oit.duke.edu}"
 DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
@@ -21,6 +26,22 @@ fi
 echo ">> push origin ${branch}"
 git push origin "${branch}"
 
-echo ">> ${DCC_HOST}: fetch + reset --hard origin/${branch}"
+echo ">> ${DCC_HOST}: fetch + check for unpushed DCC commits"
+unpushed="$(ssh -o BatchMode=yes "${DCC_HOST}" \
+  "cd '${DCC_REPO}' && git fetch origin --quiet && git log --oneline HEAD --not --remotes=origin")"
+
+if [[ -n "${unpushed}" ]]; then
+  if [[ "${force}" -eq 0 ]]; then
+    echo "error: DCC clone has commit(s) on no origin branch — 'git reset --hard'" >&2
+    echo "would destroy them:" >&2
+    echo "${unpushed}" | sed 's/^/  /' >&2
+    echo "push them from the DCC clone, or rerun: scripts/dcc/sync --force" >&2
+    exit 3
+  fi
+  echo "warning: --force — discarding unpushed DCC commit(s):" >&2
+  echo "${unpushed}" | sed 's/^/  /' >&2
+fi
+
+echo ">> ${DCC_HOST}: reset --hard origin/${branch}"
 ssh -o BatchMode=yes "${DCC_HOST}" \
-  "cd '${DCC_REPO}' && git fetch origin && git reset --hard 'origin/${branch}' && git log --oneline -3"
+  "cd '${DCC_REPO}' && git reset --hard 'origin/${branch}' && git log --oneline -3"

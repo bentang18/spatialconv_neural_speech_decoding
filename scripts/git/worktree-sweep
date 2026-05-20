@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Sweep merged + clean agent worktrees under .claude/worktrees/.
+# Usage: scripts/git/worktree-sweep [--apply]
+#
+# For each worktree under .claude/worktrees/, removes it and deletes its
+# branch IF the branch is fully merged into main AND the working tree is
+# clean (no tracked changes, no untracked files). Dry-run by default; pass
+# --apply to actually remove.
+#
+# A worktree may be the cwd of a live background job — this script cannot
+# detect that. Review the dry-run before --apply.
+
+set -euo pipefail
+
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
+apply=0
+if [[ "${1:-}" == "--apply" ]]; then apply=1; fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+swept=0
+kept=0
+wt_path=""
+
+while IFS= read -r line; do
+  case "${line}" in
+    "worktree "*)
+      wt_path="${line#worktree }"
+      ;;
+    "detached")
+      case "${wt_path}" in
+        */.claude/worktrees/*)
+          echo "KEEP   ${wt_path}  [detached HEAD] — not a branch"
+          kept=$((kept + 1))
+          ;;
+      esac
+      ;;
+    "branch "*)
+      case "${wt_path}" in
+        */.claude/worktrees/*) ;;
+        *) continue ;;
+      esac
+      wt_branch="${line#branch refs/heads/}"
+
+      reason=""
+      if [[ "${wt_branch}" == "${MAIN_BRANCH}" ]]; then
+        reason="is ${MAIN_BRANCH} itself"
+      elif [[ -n "$(git -C "${wt_path}" status --porcelain)" ]]; then
+        reason="dirty working tree"
+      elif ! git merge-base --is-ancestor "${wt_branch}" "${MAIN_BRANCH}"; then
+        reason="not merged into ${MAIN_BRANCH}"
+      fi
+
+      if [[ -n "${reason}" ]]; then
+        echo "KEEP   ${wt_path}  [${wt_branch}] — ${reason}"
+        kept=$((kept + 1))
+      elif [[ "${apply}" -eq 1 ]]; then
+        git worktree remove "${wt_path}"
+        git branch -d "${wt_branch}"
+        echo "SWEPT  ${wt_path}  [${wt_branch}]"
+        swept=$((swept + 1))
+      else
+        echo "WOULD SWEEP  ${wt_path}  [${wt_branch}] — merged + clean"
+        swept=$((swept + 1))
+      fi
+      ;;
+  esac
+done < <(git worktree list --porcelain)
+
+echo
+if [[ "${apply}" -eq 1 ]]; then
+  echo "swept ${swept}, kept ${kept}."
+else
+  echo "${swept} would be swept, ${kept} kept. Rerun with --apply to remove."
+fi
