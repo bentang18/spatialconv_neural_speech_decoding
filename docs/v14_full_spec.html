@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>v14 — Complete Architecture Specification</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2330; --ink:#e6edf3; --mut:#9aa7b4;
+    --line:#2d3742; --accent:#5aa9ff; --pre:#ffb454; --arch:#7ee787; --train:#d2a8ff;
+    --loss:#ff7b9c; --eval:#79c0ff; --chip:#222b38;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1100px;margin:0 auto;padding:32px 28px 96px}
+  h1{font-size:30px;margin:0 0 4px;letter-spacing:-.3px}
+  h2{font-size:20px;margin:46px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:26px 0 10px;color:var(--accent)}
+  .sub{color:var(--mut);font-size:13px;margin:0 0 6px}
+  code,.mono{font-family:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+  code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12.5px;color:#e6c07b}
+  .tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;
+       padding:2px 8px;border-radius:20px;border:1px solid var(--line)}
+  .t-pre{color:var(--pre);border-color:#4a3c1f;background:#241d0d}
+  .t-arch{color:var(--arch);border-color:#1f4a2c;background:#0d2415}
+  .t-train{color:var(--train);border-color:#3a2f4a;background:#1c142a}
+  .t-loss{color:var(--loss);border-color:#4a2030;background:#280d16}
+
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:12.5px}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.3px}
+  tr:nth-child(even) td{background:#12161d}
+  .num{text-align:right;font-family:"SF Mono",ui-monospace,monospace}
+
+  .flow{display:flex;flex-direction:column;align-items:stretch;gap:0;margin:14px 0}
+  .step{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--pre);
+        border-radius:7px;padding:9px 14px;position:relative}
+  .step .n{font-weight:700;color:var(--pre);margin-right:8px}
+  .step .d{color:var(--mut);font-size:12px;margin-top:2px}
+  .arrow{align-self:center;color:var(--line);font-size:16px;line-height:1;margin:3px 0}
+
+  .stage{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--arch);
+         border-radius:8px;padding:12px 16px;margin:10px 0}
+  .stage .hd{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .stage .glyph{font-size:18px;font-weight:800;color:var(--arch)}
+  .stage .nm{font-size:14.5px;font-weight:700}
+  .stage .shape{margin-left:auto;font-family:"SF Mono",ui-monospace,monospace;font-size:11.5px;
+        color:var(--accent);background:#0d1b2a;border:1px solid #1d3a52;padding:2px 8px;border-radius:5px}
+  .stage ul{margin:8px 0 0;padding-left:18px}
+  .stage li{margin:2px 0;font-size:12.5px}
+  .stage .pp{font-size:11.5px;color:var(--mut);margin-top:6px}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 15px}
+  .card h4{margin:0 0 8px;font-size:13.5px}
+  .card.p-train{border-left:4px solid var(--train)}
+  .card.p-loss{border-left:4px solid var(--loss)}
+  .kv{font-size:12px}
+  .kv b{color:var(--mut);font-weight:600;display:inline-block;min-width:104px}
+
+  .phase-bar{display:flex;gap:6px;margin:16px 0 8px}
+  .ph{flex:1;border-radius:7px;padding:9px 11px;text-align:center;border:1px solid var(--line)}
+  .ph .pn{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut)}
+  .ph .pt{font-weight:700;font-size:13px;margin-top:2px;color:var(--train)}
+  .ph .ps{font-size:11px;color:var(--mut);margin-top:2px}
+  .ph.f1{flex:2.6}.ph.f2{flex:2.6}.ph.f3{flex:3.4}
+
+  .note{background:var(--panel2);border:1px solid var(--line);border-radius:7px;
+        padding:9px 13px;font-size:12px;color:var(--mut);margin:10px 0}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:8px 0 0;font-size:12px;color:var(--mut)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .sw{width:13px;height:13px;border-radius:3px;display:inline-block}
+  .formula{background:#0d1b2a;border:1px solid #1d3a52;border-radius:6px;padding:8px 12px;
+           font-family:"SF Mono",ui-monospace,monospace;font-size:12.5px;color:#9ecbff;margin:8px 0;overflow-x:auto}
+  .frozen{color:#6ea8d8}.train-c{color:var(--arch)}.slow{color:var(--pre)}
+  .toc{columns:2;column-gap:30px;font-size:12.5px;background:var(--panel);border:1px solid var(--line);
+       border-radius:8px;padding:14px 20px;margin:16px 0}
+  .toc a{color:var(--accent);text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  .small{font-size:11.5px;color:var(--mut)}
+  svg{display:block;margin:8px auto;max-width:100%}
+  .footer{margin-top:60px;border-top:1px solid var(--line);padding-top:12px;color:var(--mut);font-size:11.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>v14 &mdash; Complete Architecture Specification</h1>
+<p class="sub">iEEG foundation model &middot; anatomy-tagged factorized Perceiver IO + 3-phase staged SSL &middot; BrainTreebank 9-subject cohort</p>
+<p class="sub mono">Canonical state: v4 (post-v3 amendment 2026-05-19) &middot; recipe lock 2026-05-18 + 5/19 amendment &middot; d=256 &middot; ~13M params</p>
+
+<div class="toc">
+<a href="#thesis">0. Thesis &amp; scope</a><br>
+<a href="#preproc">1. Preprocessing pipeline</a><br>
+<a href="#filterbank">2. Filterbank (30-bin log ⅓-octave)</a><br>
+<a href="#arch">3. Architecture (7 stages)</a><br>
+<a href="#params">4. Parameter budget</a><br>
+<a href="#recipe">5. Training recipe (3-phase staged)</a><br>
+<a href="#loss">6. Objectives &amp; losses</a><br>
+<a href="#eval">7. Evaluation &amp; submission gate</a><br>
+<a href="#hparams">8. Hyperparameter summary</a><br>
+<a href="#sisters">9. Ablation / sister-cell suite</a>
+</div>
+
+<div class="legend">
+  <span><span class="sw" style="background:var(--pre)"></span>Preprocessing</span>
+  <span><span class="sw" style="background:var(--arch)"></span>Architecture</span>
+  <span><span class="sw" style="background:var(--train)"></span>Training</span>
+  <span><span class="sw" style="background:var(--loss)"></span>Loss / objective</span>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="thesis">0. Thesis &amp; scope</h2>
+<div class="note" style="color:var(--ink)">
+<b>Thesis.</b> An iEEG foundation model with anatomy-tagged factorized Perceiver&nbsp;IO and soft
+parcel-routing cross-attention (<code>log(support+&epsilon;)</code> over BrainTreebank&ndash;Desikan-Killiany
+one-hot), pretrained with a factorized&nbsp;t&times;f Stage&nbsp;A token-mask phase + an electrode-mask
+Stage&nbsp;B phase + a multi-teacher Phase-3 distillation (Whisper-L8 + DINOv3), beats PopT cross-subject
+by &ge;0.05 AUROC at &le;30M params on the 9-subject BrainTreebank cohort.
+</div>
+<table>
+<tr><th>Item</th><th>Value</th></tr>
+<tr><td>Downstream cohort</td><td>9 BrainTreebank subjects {1,2,3,4,6,7,8,9,10}; S5 dropped (frontal lesion). Leaderboard subset {1,2,3,4,7,10}.</td></tr>
+<tr><td>Parcel taxonomy</td><td>BT-shipped FreeSurfer Desikan-Killiany (Pipeline C, native-volumetric aparc+aseg, mean snap 0.5&nbsp;mm). K=80 vocab, 98.1% cohort coverage.</td></tr>
+<tr><td>Model size</td><td>d=256, 8 heads, <b>~13M params</b> (5&ndash;15M target; &le;30M cap).</td></tr>
+<tr><td>Native sampling</td><td>BrainTreebank 2048&nbsp;Hz (Nyquist 1024&nbsp;Hz).</td></tr>
+<tr><td>Open blockers</td><td>None &mdash; architecture fully locked.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="preproc">1. Preprocessing pipeline <span class="tag t-pre">preprocessing</span></h2>
+<p class="sub">Raw iEEG voltage &rarr; model input tensor <code>(C electrodes, F=30 freq-bins, T time-bins)</code>. BrainTreebank-specific (2048&nbsp;Hz native).</p>
+
+<div class="flow">
+  <div class="step"><span class="n">1</span><b>HPF 0.5&nbsp;Hz</b><div class="d">Butterworth filtfilt high-pass &mdash; removes DC drift before robust-z statistics are estimated.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">2</span><b>Comb filter @ 60&nbsp;Hz</b><div class="d"><code>scipy.signal.iircomb(w0=60, Q=30, ftype='notch', fs=fs)</code> &mdash; single true comb filter; rejects all 17 line-noise harmonics (60&ndash;1020&nbsp;Hz) in one pass.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">3</span><b>MNE-LOF channel-quality flag</b><div class="d"><code>mne.preprocessing.find_bad_channels_lof</code>, threshold 1.5, n_neighbors 20, per session. Emits per-session bad-channel mask.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">4</span><b>shaftCAR over good channels</b><div class="d">Common-average re-reference within each shaft, computed over non-flagged channels only. Kills within-shaft common-mode noise; leaves spatial structure for the model's learned inverse.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">5</span><b>Drop flagged-bad channels</b><div class="d">Bad channels removed from the token sequence before slicing &mdash; clean handoff <code>(C_good &times; T)</code>.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">6</span><b>Slice trial window</b><div class="d">Onset-anchored <code>[0, 1]&nbsp;s</code> (A.0); avoids pre-stimulus contamination from previous-trial residue.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">7</span><b>STFT</b><div class="d">Magnitude STFT &mdash; Neuroprobe swept-optimal window/hop parameters. The STFT <i>is</i> the patch embedding: each STFT cell = one patch.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">8</span><b>Triangular ⅓-octave filterbank</b><div class="d">30 bins, mel-style overlapping edges, uniform log spacing. Centers <code>f_k = 2^(k/3)</code>&nbsp;Hz, k=0&hellip;29 (1&nbsp;Hz&ndash;813&nbsp;Hz). See §2.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">9</span><b>Log-power compression</b><div class="d"><code>log(filterbank_energy + &epsilon;)</code>, &epsilon;&nbsp;&asymp;&nbsp;1e-6 (AST log-mel convention). Phase discarded here &mdash; input is log-magnitude only.</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step"><span class="n">10</span><b>Nv14 robust-z normalization</b><div class="d">Per <code>(electrode, freq-bin, session)</code>: <code>(x &minus; median) / (1.4826 &middot; MAD)</code>, full-session pooled over time only. Robust to sEEG artifact spikes; per-session scope makes a SWEC-pretrained model transfer to BT (different amplifiers/gains).</div></div>
+  <div class="arrow">&#9660;</div>
+  <div class="step" style="border-left-color:var(--arch)"><span class="n" style="color:var(--arch)">&#8594;</span><b>Model input</b> <span class="mono" style="color:var(--accent)">(C electrodes, F=30, T time-bins)</span></div>
+</div>
+
+<table>
+<tr><th>Step</th><th>Operation</th><th>Key parameters</th></tr>
+<tr><td>HPF</td><td>Butterworth high-pass, filtfilt</td><td>cutoff 0.5&nbsp;Hz</td></tr>
+<tr><td>Line noise</td><td>IIR comb notch</td><td>w0=60, Q=30, ftype=notch</td></tr>
+<tr><td>Channel QC</td><td>MNE Local Outlier Factor</td><td>threshold 1.5, n_neighbors 20, per session</td></tr>
+<tr><td>Re-reference</td><td>shaftCAR (within-shaft CAR over good channels)</td><td>0th-order; bipolar / Laplacian rejected</td></tr>
+<tr><td>Window</td><td>onset-anchored slice</td><td>[0, 1]&nbsp;s</td></tr>
+<tr><td>Spectral</td><td>magnitude STFT</td><td>Neuroprobe swept-optimal window/hop</td></tr>
+<tr><td>Filterbank</td><td>triangular ⅓-octave, mel-style edges</td><td>30 bins, uniform log spacing, area-norm moot post-z</td></tr>
+<tr><td>Compression</td><td>log-power</td><td><code>log(energy + 1e-6)</code></td></tr>
+<tr><td>Normalization</td><td>Nv14 robust-z, per (electrode, freq, session)</td><td>median + MAD&times;1.4826, full-session time pool, transductive at inference</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="filterbank">2. Filterbank &mdash; 30-bin log ⅓-octave <span class="tag t-pre">preprocessing</span></h2>
+<p class="sub">Centers <code>f_k = 2^(k/3)</code>&nbsp;Hz. Triangular filter for bin <i>k</i> spans <code>[f_{k-1}, f_{k+1}]</code>, peak at <code>f_k</code>, 50% neighbor overlap. Upper edge of bin 29 = 2<sup>10</sup> = 1024&nbsp;Hz = Nyquist.</p>
+<table>
+<tr><th>Bins</th><th>Center range (Hz)</th><th>Band</th><th>#</th><th>Notes</th></tr>
+<tr><td class="mono">k0&ndash;k5</td><td class="mono">1.0 &ndash; 3.17</td><td>Delta</td><td class="num">6</td><td>log-scale stretches the sub-decade</td></tr>
+<tr><td class="mono">k6&ndash;k8</td><td class="mono">4.0 &ndash; 6.35</td><td>Theta</td><td class="num">3</td><td></td></tr>
+<tr><td class="mono">k9&ndash;k11</td><td class="mono">8.0 &ndash; 12.7</td><td>Alpha</td><td class="num">3</td><td></td></tr>
+<tr><td class="mono">k12&ndash;k14</td><td class="mono">16.0 &ndash; 25.4</td><td>Beta</td><td class="num">3</td><td></td></tr>
+<tr><td class="mono">k15&ndash;k18</td><td class="mono">32.0 &ndash; 64.0</td><td>Low gamma</td><td class="num">4</td><td></td></tr>
+<tr><td class="mono">k19&ndash;k21</td><td class="mono">80.6 &ndash; 128.0</td><td>High gamma</td><td class="num">3</td><td>speech-relevant band</td></tr>
+<tr><td class="mono">k22&ndash;k23</td><td class="mono">161.3 &ndash; 203.2</td><td>Very-HG / ripple</td><td class="num">2</td><td></td></tr>
+<tr><td class="mono">k24&ndash;k27</td><td class="mono">256.0 &ndash; 512.0</td><td>Ripple / MUA</td><td class="num">4</td><td></td></tr>
+<tr><td class="mono">k28&ndash;k29</td><td class="mono">645.1 &ndash; 812.7</td><td>MUA-envelope</td><td class="num">2</td><td>last safe sub-Nyquist centers</td></tr>
+</table>
+<div class="note">Spacing is uniform ⅓-octave (<b>not</b> rebalanced toward high gamma) so band attribution has a neutral axis. Per-corpus bandwidth: SWEC is band-limited 0.5&ndash;150&nbsp;Hz, so it trains only bins <code>k0&ndash;k21</code> (&le;128&nbsp;Hz); bins k22&ndash;k29 receive gradient only from broadband corpora (BT 2048&nbsp;Hz, AJILE12, D-cohort).</div>
+
+<!-- ============================================================ -->
+<h2 id="arch">3. Architecture &mdash; 7 stages <span class="tag t-arch">architecture</span></h2>
+<p class="sub">Factorized throughout: token blocks do <code>t&times;f</code>, latent stack does <code>t&times;parcel</code>. Latents keep a time axis &mdash; <code>(320, T, d)</code>.</p>
+
+<!-- block diagram -->
+<svg width="760" height="560" viewBox="0 0 760 560" font-family="-apple-system,Segoe UI,sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#7ee787"/>
+    </marker>
+  </defs>
+  <!-- input -->
+  <rect x="250" y="14" width="260" height="40" rx="6" fill="#241d0d" stroke="#4a3c1f"/>
+  <text x="380" y="32" fill="#ffb454" font-size="12.5" font-weight="700" text-anchor="middle">Preprocessed input</text>
+  <text x="380" y="47" fill="#9aa7b4" font-size="11" text-anchor="middle" font-family="monospace">(C electrodes, F=30, T)</text>
+  <line x1="380" y1="54" x2="380" y2="74" stroke="#7ee787" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- stage 1 -->
+  <rect x="190" y="76" width="380" height="48" rx="6" fill="#0d2415" stroke="#1f4a2c"/>
+  <text x="380" y="94" fill="#7ee787" font-size="12.5" font-weight="700" text-anchor="middle">❶  A1 linear embed  +  categorical freq embedding</text>
+  <text x="380" y="110" fill="#9aa7b4" font-size="10.5" text-anchor="middle">Linear(1→d) per (t,f) cell  ·  30 flat learnable d-vectors  ·  no time PE</text>
+  <line x1="380" y1="124" x2="380" y2="142" stroke="#7ee787" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- stage 2 -->
+  <rect x="150" y="144" width="460" height="58" rx="6" fill="#0d2415" stroke="#1f4a2c"/>
+  <text x="380" y="162" fill="#7ee787" font-size="12.5" font-weight="700" text-anchor="middle">❷  Token block × N=4  —  per-electrode, factorized t × f</text>
+  <text x="380" y="178" fill="#9aa7b4" font-size="10.5" text-anchor="middle">temporal SA (RoPE) → freq SA → MLP   ·   hard −∞ cross-electrode mask</text>
+  <text x="380" y="193" fill="#5aa9ff" font-size="10.5" text-anchor="middle" font-family="monospace">→ (C, F, T, d)</text>
+  <line x1="380" y1="202" x2="380" y2="220" stroke="#7ee787" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- stage 5 -->
+  <rect x="150" y="222" width="460" height="64" rx="6" fill="#0d2415" stroke="#1f4a2c"/>
+  <text x="380" y="240" fill="#7ee787" font-size="12.5" font-weight="700" text-anchor="middle">❺  Parcel-routed cross-attention  ×2  @ {0,3}</text>
+  <text x="380" y="256" fill="#9aa7b4" font-size="10.5" text-anchor="middle">320 free latents  ·  pools (electrode,freq)→parcels strict 1:1 per time-step</text>
+  <text x="380" y="270" fill="#9aa7b4" font-size="10.5" text-anchor="middle" font-family="monospace">bias = log(support[e,p] + ε),  ε = 1e-2</text>
+  <text x="380" y="282" fill="#5aa9ff" font-size="10.5" text-anchor="middle" font-family="monospace">→ (320, T, d)   ← latents carry time</text>
+  <!-- latent feed -->
+  <rect x="622" y="232" width="118" height="44" rx="6" fill="#1c2330" stroke="#2d3742"/>
+  <text x="681" y="249" fill="#d2a8ff" font-size="10.5" font-weight="700" text-anchor="middle">320 latents</text>
+  <text x="681" y="263" fill="#9aa7b4" font-size="9.5" text-anchor="middle">K=80 × M=4 slots</text>
+  <line x1="622" y1="254" x2="612" y2="254" stroke="#d2a8ff" stroke-width="1.4" stroke-dasharray="3 2"/>
+  <line x1="380" y1="286" x2="380" y2="304" stroke="#7ee787" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- stage 6 -->
+  <rect x="150" y="306" width="460" height="58" rx="6" fill="#0d2415" stroke="#1f4a2c"/>
+  <text x="380" y="324" fill="#7ee787" font-size="12.5" font-weight="700" text-anchor="middle">❻  Latent stack × L=6  —  factorized time × parcel</text>
+  <text x="380" y="340" fill="#9aa7b4" font-size="10.5" text-anchor="middle">time SA (RoPE) → parcel SA → MLP</text>
+  <text x="380" y="355" fill="#5aa9ff" font-size="10.5" text-anchor="middle" font-family="monospace">→ (320, T, d)</text>
+  <line x1="380" y1="364" x2="380" y2="382" stroke="#7ee787" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- stage 7 -->
+  <rect x="190" y="384" width="380" height="58" rx="6" fill="#0d2415" stroke="#1f4a2c"/>
+  <text x="380" y="402" fill="#7ee787" font-size="12.5" font-weight="700" text-anchor="middle">❼  PMA readout  (Set Transformer)</text>
+  <text x="380" y="418" fill="#9aa7b4" font-size="10.5" text-anchor="middle">k learnable seed queries cross-attend the latent set</text>
+  <text x="380" y="433" fill="#9aa7b4" font-size="10.5" text-anchor="middle">downstream: k=1 (or n_tasks)   ·   Phase-3: k=50 @ 10 Hz</text>
+  <line x1="380" y1="442" x2="380" y2="460" stroke="#7ee787" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- heads -->
+  <rect x="120" y="462" width="240" height="44" rx="6" fill="#0d1b2a" stroke="#1d3a52"/>
+  <text x="240" y="480" fill="#79c0ff" font-size="11.5" font-weight="700" text-anchor="middle">Downstream head</text>
+  <text x="240" y="495" fill="#9aa7b4" font-size="10" text-anchor="middle">Linear(d → n_classes)</text>
+  <rect x="400" y="462" width="240" height="44" rx="6" fill="#280d16" stroke="#4a2030"/>
+  <text x="520" y="480" fill="#ff7b9c" font-size="11.5" font-weight="700" text-anchor="middle">Phase-3 adapter target</text>
+  <text x="520" y="495" fill="#9aa7b4" font-size="10" text-anchor="middle">50 buckets → Smooth-L1 vs fused teacher</text>
+</svg>
+
+<h3>Stage-by-stage specification</h3>
+
+<div class="stage">
+  <div class="hd"><span class="glyph">❶</span><span class="nm">Input embedding</span><span class="shape">(C,F,T) → (C,F,T,d)</span></div>
+  <ul>
+    <li><b>A1 linear embed</b> &mdash; <code>Linear(1 → d)</code> applied per <code>(t,f)</code> cell, shared across all cells. This is the patch-embedding projection; the patch is one STFT cell (AST Conv2d-patchify at patch size 1&times;1).</li>
+    <li><b>Categorical freq embedding</b> &mdash; 30 independent learnable d-vectors, added per freq-bin. Flat / non-separable (NOT factored into band&otimes;position) so freq-embedding clustering can recover brain bands without supervision.</li>
+    <li><b>No time PE at input</b> &mdash; time is encoded relatively via RoPE inside ❷.</li>
+  </ul>
+</div>
+
+<div class="stage">
+  <div class="hd"><span class="glyph">❷</span><span class="nm">Token block × N=4 — per-electrode, factorized t × f</span><span class="shape">(C,F,T,d) → (C,F,T,d)</span></div>
+  <ul>
+    <li>Each block (TimeSformer-divided / axial attention): <code>temporal SA → residual</code>, then <code>freq SA → residual</code>, then <code>MLP → residual</code>.</li>
+    <li><b>Temporal SA</b> applies RoPE (&theta;=10000) to Q/K &mdash; relative, translation-equivariant time.</li>
+    <li><b>Freq SA</b> attends across the 30 categorical bins, time fixed.</li>
+    <li><b>Hard &minus;&infin; cross-electrode mask</b> &mdash; no electrode&harr;electrode mixing here; the activation cascade across regions is modeled only in the latent stack.</li>
+    <li>Block internals: pre-norm, LayerNorm, GeLU, MLP 4&times;, 8 heads (32 dim/head).</li>
+  </ul>
+  <div class="pp">N=4 default; sweep {2,4,6}.</div>
+</div>
+
+<div class="stage">
+  <div class="hd"><span class="glyph">❺</span><span class="nm">Parcel-routed cross-attention — 2 layers @ {0,3}</span><span class="shape">(C,F,T,d) → (320,T,d)</span></div>
+  <ul>
+    <li><b>320 free latents</b> &mdash; <code>nn.Parameter(320,d)</code>, truncated-normal init std&nbsp;&asymp;&nbsp;0.02 (Perceiver-IO standard). 320 = K=80 DK parcels &times; M=4 slots. Parcel identity is carried by the cross-attn bias, not the latent vector.</li>
+    <li>Pools <code>(electrode, freq) → parcels</code> <b>strict 1:1 per time-step</b>: latent-time-<i>t</i> attends only to <code>(C,F)</code> tokens at time <i>t</i>. <code>T_latent = T</code>; no resampling in the encoder.</li>
+    <li><b>Anatomy bias</b> on the QK score: <code>log(support[e,p] + ε)</code>, &epsilon;=1e-2 (tunable anatomy-prior strength), <code>support</code> = BT-DK one-hot. Graphormer-style additive bias.</li>
+    <li>2 cross-attn layers inserted at positions {0,3} of the L=6 latent stack &mdash; multi-pass routing for dense parcels (STG/IFG).</li>
+    <li><b>Latents keep a time axis</b> &mdash; required for non-degenerate Phase-3 cross-modal alignment and to model cross-parcel temporal dynamics.</li>
+  </ul>
+</div>
+
+<div class="stage">
+  <div class="hd"><span class="glyph">❻</span><span class="nm">Latent stack × L=6 — factorized time × parcel</span><span class="shape">(320,T,d) → (320,T,d)</span></div>
+  <ul>
+    <li>Each layer: <code>time SA (RoPE) → residual</code>, then <code>parcel SA → residual</code>, then <code>MLP → residual</code>.</li>
+    <li><b>Time SA</b> models within-parcel temporal evolution; <b>parcel SA</b> + the time interleave model cross-parcel temporal dynamics (auditory → STG → motor cascade).</li>
+    <li>Native rate kept (~STFT rate, ~13 Hz) &mdash; finer than the 10 Hz teacher-target rate.</li>
+  </ul>
+  <div class="pp">L=6 default; factorization order time-first (sweepable).</div>
+</div>
+
+<div class="stage">
+  <div class="hd"><span class="glyph">❼</span><span class="nm">PMA readout — Set Transformer (Lee 2019)</span><span class="shape">(320,T,d) → (k,d) → out</span></div>
+  <ul>
+    <li><b>k learnable seed queries</b> cross-attend the latent set; standard readout primitive.</li>
+    <li><b>Downstream:</b> k=1 (or k=n_tasks for multi-task &ge;4) → <code>Linear(d → n_classes)</code> minimal head (keeps frozen-linear-probe comparison clean).</li>
+    <li><b>Phase-3:</b> k=50 queries → 50 buckets @ 10 Hz → Smooth-L1 vs fused teacher. The PMA-K=50 adapter is the rate-bridge (collapses parcels, buckets time to syllable rate).</li>
+  </ul>
+</div>
+
+<h3>Spatial information &mdash; 2 mechanisms, disjoint roles</h3>
+<table>
+<tr><th>Mechanism</th><th>Type</th><th>Role</th></tr>
+<tr><td>Parcel routing @ ❺</td><td>Discrete</td><td>Parcel-id-tagged latents + <code>log(support+ε)</code> bias. Universal where parcels are available.</td></tr>
+<tr><td>Geometry slot @ ❸g</td><td>Continuous, modality-configurable</td><td>Empty for sparse sEEG (default); 2D-RoPE within-grid SA for ECoG/Utah; 3D-RoPE on MNI for parcel-less cohorts.</td></tr>
+</table>
+<div class="note">No additive position features anywhere. MNI Fourier PE dropped from the default (2026-05-19). Within-parcel electrode-depth is a single P1 sister (<code>F-depth-bias</code>, learned <code>B[m,depth]</code> bias table) &mdash; not in first pass.</div>
+
+<!-- ============================================================ -->
+<h2 id="params">4. Parameter budget <span class="tag t-arch">architecture</span></h2>
+<p class="sub">d=256, 8 heads. MHA &asymp; 4d² &asymp; 262k; MLP-4&times; &asymp; 524k per block.</p>
+<table>
+<tr><th>Component</th><th>Per unit</th><th>Count</th><th class="num">Subtotal</th></tr>
+<tr><td>❶ Input stem (A1 + freq embed)</td><td>&mdash;</td><td>&mdash;</td><td class="num">~0.01M</td></tr>
+<tr><td>❷ Token block (temporal MHA + freq MHA + MLP)</td><td>~1.05M</td><td>N=4</td><td class="num">~4.2M</td></tr>
+<tr><td>❺ Cross-attn (MHA + MLP)</td><td>~0.79M</td><td>2</td><td class="num">~1.6M</td></tr>
+<tr><td>&nbsp;&nbsp;&nbsp;latents 320&times;256</td><td>&mdash;</td><td>&mdash;</td><td class="num">~0.08M</td></tr>
+<tr><td>❻ Latent stack (time MHA + parcel MHA + MLP)</td><td>~1.05M</td><td>L=6</td><td class="num">~6.3M</td></tr>
+<tr><td>❼ PMA readout (MHA + MLP)</td><td>~0.8M</td><td>1</td><td class="num">~0.8M</td></tr>
+<tr><td colspan="3"><b>Total</b></td><td class="num"><b>~13M</b></td></tr>
+</table>
+<div class="note">Within the 5&ndash;15M target and far below the 30M cap. Biggest sweep levers: latent-stack depth (L) and token-block count (N). d-sweep {128,192,256}.</div>
+
+<!-- ============================================================ -->
+<h2 id="recipe">5. Training recipe &mdash; 3-phase staged <span class="tag t-train">training</span></h2>
+<p class="sub">Maximum data scale on unpaired SSL backbones (Phase 1 + 2); a small adapter on paired data with frozen backbones (Phase 3). The audio bridge is a head, not a training signal.</p>
+
+<div class="phase-bar">
+  <div class="ph f1"><div class="pn">Phase 1</div><div class="pt">Stage A SSL</div><div class="ps">token-mask JEPA &middot; ~8k h unpaired iEEG</div></div>
+  <div class="ph f2"><div class="pn">Phase 2</div><div class="pt">Stage B SSL</div><div class="ps">electrode-mask JEPA &middot; Stage A frozen</div></div>
+  <div class="ph f3"><div class="pn">Phase 3</div><div class="pt">MTDP cross-modal distillation</div><div class="ps">3a gating → 3b-warmup → 3b-unfreeze &middot; ~200 h paired</div></div>
+</div>
+
+<div class="grid2">
+  <div class="card p-train">
+    <h4>Phase 1 &mdash; Stage A SSL pretrain</h4>
+    <div class="kv">
+      <p><b>Trains</b> <span class="train-c">A1 embed + freq embed + 4 token blocks (❶❷)</span>, ~1&ndash;1.5M params</p>
+      <p><b>Objective</b> <code>L_recon</code> Level&nbsp;B &mdash; within-electrode token-level mask JEPA</p>
+      <p><b>Masking</b> 80% inverse-block on the (t,f) grid per electrode (EAT/SSLAM)</p>
+      <p><b>Target</b> EMA-teacher latent, layer-averaged across teacher encoder layers (data2vec-2.0)</p>
+      <p><b>Loss fn</b> MSE; UFO (frame + utterance, &lambda;=1)</p>
+      <p><b>EMA decay</b> linear warmup 0.99 → 0.9999</p>
+      <p><b>Output</b> Stage A checkpoint; teacher discarded</p>
+    </div>
+  </div>
+  <div class="card p-train">
+    <h4>Phase 2 &mdash; Stage B SSL pretrain</h4>
+    <div class="kv">
+      <p><b>Frozen</b> <span class="frozen">Stage A</span></p>
+      <p><b>Trains</b> <span class="train-c">parcel-id routing + cross-attn (320 latents) + latent stack L=6 (❺❻)</span>, ~0.8&ndash;1M params</p>
+      <p><b>Objective</b> <code>L_recon</code> Level&nbsp;A &mdash; electrode-level mask JEPA</p>
+      <p><b>Masking</b> 30% random whole-electrode mask before cross-attn (J1 sweep {0.25,0.30,0.40,0.50})</p>
+      <p><b>Target</b> EMA-teacher Stage B latents (full electrode set), layer-averaged, StopGrad</p>
+      <p><b>Loss fn</b> MSE on student vs teacher latents</p>
+      <p><b>Output</b> Stage B latent-stack checkpoint; teacher discarded</p>
+    </div>
+  </div>
+</div>
+
+<h3>Phase 1 + 2 pretraining corpus</h3>
+<table>
+<tr><th>Corpus</th><th class="num">Hours</th><th>Notes</th></tr>
+<tr><td>SWEC iEEG</td><td class="num">6,672</td><td>50 unique subjects; band-limited 0.5&ndash;150&nbsp;Hz → trains bins k0&ndash;k21 only; no electrode anatomy → touches ❶❷ / Stage A only</td></tr>
+<tr><td>AJILE12</td><td class="num">1,280</td><td>unpaired iEEG</td></tr>
+<tr><td>Internal D-cohort</td><td class="num">180</td><td></td></tr>
+<tr><td>BrainTreebank</td><td class="num">43.5</td><td>9-subject cohort</td></tr>
+<tr><td>PS + lex</td><td class="num">~7</td><td></td></tr>
+<tr><td><b>Total</b></td><td class="num"><b>~8,180</b></td><td>post SWEC de-duplication correction</td></tr>
+</table>
+
+<h3>Phase 3 &mdash; MTDP cross-modal distillation</h3>
+<p class="sub">Stage A + B frozen by default. ~200 h paired iEEG-audio (~40 h with paired video on BT, ~160 h audio-only). Target = K=50 bucketed-pooled tokens at 10 Hz (syllable rate).</p>
+
+<svg width="760" height="172" viewBox="0 0 760 172" font-family="-apple-system,Segoe UI,sans-serif">
+  <defs>
+    <marker id="ah2" markerWidth="9" markerHeight="9" refX="5" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#d2a8ff"/>
+    </marker>
+  </defs>
+  <!-- 3a -->
+  <rect x="14" y="30" width="220" height="92" rx="7" fill="#1c142a" stroke="#3a2f4a"/>
+  <text x="124" y="50" fill="#d2a8ff" font-size="12.5" font-weight="700" text-anchor="middle">Stage 3a — gating</text>
+  <text x="124" y="68" fill="#9aa7b4" font-size="10" text-anchor="middle">train 2-layer gating MLP</text>
+  <text x="124" y="82" fill="#9aa7b4" font-size="10" text-anchor="middle">(~10k params, softmax over</text>
+  <text x="124" y="95" fill="#9aa7b4" font-size="10" text-anchor="middle">teacher weights)</text>
+  <text x="124" y="112" fill="#6ea8d8" font-size="9.5" text-anchor="middle">frozen: Whisper-L8 + DINOv3</text>
+  <line x1="234" y1="76" x2="262" y2="76" stroke="#d2a8ff" stroke-width="1.6" marker-end="url(#ah2)"/>
+  <!-- 3b-warmup -->
+  <rect x="264" y="30" width="220" height="92" rx="7" fill="#1c142a" stroke="#3a2f4a"/>
+  <text x="374" y="50" fill="#d2a8ff" font-size="12.5" font-weight="700" text-anchor="middle">Stage 3b-warmup</text>
+  <text x="374" y="68" fill="#9aa7b4" font-size="10" text-anchor="middle">adapter-only (~0.6–0.8M)</text>
+  <text x="374" y="82" fill="#9aa7b4" font-size="10" text-anchor="middle">~3–5% of 3b token budget</text>
+  <text x="374" y="95" fill="#9aa7b4" font-size="10" text-anchor="middle">closes cold-start gap</text>
+  <text x="374" y="112" fill="#6ea8d8" font-size="9.5" text-anchor="middle">frozen: teachers + gating + A + B</text>
+  <line x1="484" y1="76" x2="512" y2="76" stroke="#d2a8ff" stroke-width="1.6" marker-end="url(#ah2)"/>
+  <!-- 3b-unfreeze -->
+  <rect x="514" y="30" width="232" height="92" rx="7" fill="#1c142a" stroke="#3a2f4a"/>
+  <text x="630" y="50" fill="#d2a8ff" font-size="12.5" font-weight="700" text-anchor="middle">Stage 3b-unfreeze</text>
+  <text x="630" y="68" fill="#9aa7b4" font-size="10" text-anchor="middle">~95% of 3b token budget</text>
+  <text x="630" y="83" fill="#ffb454" font-size="9.5" text-anchor="middle">Stage A : slow-LR (LR/10)</text>
+  <text x="630" y="96" fill="#7ee787" font-size="9.5" text-anchor="middle">Stage B + adapter : normal LR</text>
+  <text x="630" y="112" fill="#6ea8d8" font-size="9.5" text-anchor="middle">frozen: teachers + gating MLP</text>
+  <text x="380" y="150" fill="#9aa7b4" font-size="10.5" text-anchor="middle">AdamW (β₁=0.9, β₂=0.98, wd=0.05) · peak LR 3e-4 · 2k warmup + cosine → 1e-5 over 50k steps · batch 256</text>
+</svg>
+
+<div class="grid2">
+  <div class="card p-train">
+    <h4>Stage 3a &mdash; gating MLP</h4>
+    <div class="kv">
+      <p><b>Frozen</b> <span class="frozen">Whisper-large-v3 L8 + DINOv3-ViT-B/16</span></p>
+      <p><b>Trains</b> <span class="train-c">2-layer gating MLP</span> (~10k params), softmax over teacher weights</p>
+      <p><b>Loss</b> masked-latent-denoising MSE on the fused teacher representation</p>
+      <p><b>Output</b> per-bucket learned weights <code>w_audio, w_video</code></p>
+    </div>
+  </div>
+  <div class="card p-train">
+    <h4>Stage 3b &mdash; adapter</h4>
+    <div class="kv">
+      <p><b>Adapter</b> 1-layer PMA, K=50 learnable queries (d=256), ~0.6&ndash;0.8M params</p>
+      <p><b>Whisper-L8</b> mean-pool-by-5 (250 frames → 50 buckets, d=1280 → d=256)</p>
+      <p><b>DINOv3</b> 24fps&times;5s = 120 frames → 50 buckets → d=256</p>
+      <p><b>Fusion</b> Stage-3a gates → 50 fused-teacher target tokens</p>
+      <p><b>Teacher norm</b> instance-norm per-token before pooling (collapse prevention)</p>
+      <p><b>Adapter EMA</b> none (teachers external, already frozen)</p>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="loss">6. Objectives &amp; losses <span class="tag t-loss">loss</span></h2>
+
+<h3>Phase 1 &mdash; <code>L_recon</code> Level B (token-mask JEPA)</h3>
+<div class="formula">L_recon_B = MSE( predictor(student tokens, mask),  StopGrad( EMA-teacher latent, layer-averaged ) )</div>
+<ul style="font-size:12.5px">
+  <li>80% inverse-block mask on the per-electrode (t,f) grid.</li>
+  <li>data2vec-2.0 target construction: average top-K teacher FFN block outputs, instance-norm.</li>
+  <li>UFO dual-scale: frame loss + utterance loss, &lambda;=1.</li>
+  <li>EMA teacher prevents collapse; no KoLeo term (pruned 2026-05-12).</li>
+</ul>
+
+<h3>Phase 2 &mdash; <code>L_recon</code> Level A (electrode-mask JEPA)</h3>
+<div class="formula">L_recon_A = MSE( student latents,  StopGrad( EMA-teacher Stage-B latents, full electrode set ) )</div>
+<ul style="font-size:12.5px">
+  <li>30% random whole-electrode mask applied to Stage-A features before cross-attn.</li>
+  <li>Trains cross-attn + latent stack to be robust to electrode dropout &mdash; directly relevant for cross-subject transfer.</li>
+</ul>
+
+<h3>Phase 3 &mdash; cross-modal distillation</h3>
+<div class="formula">L_distill = Smooth-L1( v14 adapter output[50 buckets],  fused-teacher target[50 buckets] )</div>
+<ul style="font-size:12.5px">
+  <li><b>Smooth-L1</b> (data2vec-2.0 &sect;3.4, outlier-robust at &beta;=0.5&ndash;2.0); cosine = P1 sister.</li>
+  <li><b>K=50 bucketed-pooled at 10 Hz</b> &mdash; syllable rate, where iEEG&harr;Whisper-L8 alignment exists (Goldstein 2025). Per-frame 50 Hz rejected; utterance-pooling rejected.</li>
+  <li><b>Fused teacher</b> = gating-MLP-weighted Whisper-L8 + DINOv3 (Stage 3a).</li>
+  <li>Distill <i>into</i> the iEEG latent space &mdash; the iEEG encoder is the bottleneck and the downstream-probed model; teachers are bridge supervision.</li>
+</ul>
+
+<table>
+<tr><th>Phase</th><th>Loss</th><th>Mask</th><th>Target</th><th>Collapse prevention</th></tr>
+<tr><td>1 &mdash; Stage A</td><td>MSE (Level B)</td><td>80% inverse-block (t,f)</td><td>EMA-teacher latent, layer-avg</td><td>EMA + StopGrad</td></tr>
+<tr><td>2 &mdash; Stage B</td><td>MSE (Level A)</td><td>30% random electrode</td><td>EMA-teacher Stage-B latents</td><td>EMA + StopGrad</td></tr>
+<tr><td>3a</td><td>masked-latent MSE</td><td>&mdash;</td><td>fused teacher rep</td><td>&mdash;</td></tr>
+<tr><td>3b</td><td>Smooth-L1</td><td>&mdash;</td><td>50 fused-teacher buckets @ 10 Hz</td><td>teacher instance-norm</td></tr>
+</table>
+
+<h3>Explicit rejections</h3>
+<table>
+<tr><th>Rejected</th><th>Reason</th></tr>
+<tr><td>Per-frame 50 Hz regression</td><td>Below the iEEG&harr;Whisper alignment timescale; gradient dominated by spectral noise.</td></tr>
+<tr><td>InfoNCE / SigLIP / contrastive head</td><td>Beaten 4/4 vs regression; negative-sampling structurally bad at ~200 h paired.</td></tr>
+<tr><td>Hybrid loss (regression + contrastive aux)</td><td>No &lt;1k h SOTA uses it.</td></tr>
+<tr><td>EMA on the Phase-3 adapter</td><td>EMA is for self-distillation only, not external-teacher.</td></tr>
+<tr><td>BLIP-2-scale Q-Former</td><td>Requires 100&times;+ more paired data.</td></tr>
+<tr><td><code>L_KoLeo</code> term</td><td>EMA + StopGrad already handle collapse (pruned 2026-05-12).</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="eval">7. Evaluation &amp; submission gate <span class="tag" style="color:var(--eval);border:1px solid #1d3a52;background:#0d1b2a">phase 4</span></h2>
+<table>
+<tr><th>Path</th><th>Setup</th><th>Claim strength</th></tr>
+<tr><td><b>A1 (headline, conservative)</b></td><td>Stage A frozen + Stage B frozen + adapter + linear-probe per Neuroprobe task</td><td>Strongest; competes directly with DIVER-1 frozen linear-probe (0.678 within-session)</td></tr>
+<tr><td>A2 (gap-closing)</td><td>Stage A unfrozen via 3b-unfreeze + linear-probe per task</td><td>Reports whether Phase-3 improves Stage A beyond pure SSL</td></tr>
+<tr><td>B</td><td>Frozen everything + 2-layer MLP probe per task</td><td>Supporting</td></tr>
+<tr><td>C</td><td>Light task fine-tune (Charmander recipe: decoder warmup → partial 4-layer unfreeze)</td><td>Supporting</td></tr>
+</table>
+<div class="note" style="color:var(--ink)">
+<b>Submission gate</b> (dual-prong, SOTA-at-submission): &ge;&nbsp;<b>0.667</b> CrossSession multi-class accuracy <b>AND</b> &ge;&nbsp;<b>0.628</b> CrossSubject binary AUROC, &ge;&nbsp;4 tasks evaluated, &le;&nbsp;30M params. Always report both A1 (frozen-headline) and A2 (unfrozen-headline); the &Delta; is itself an ablation result.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="hparams">8. Hyperparameter summary <span class="tag t-arch">architecture</span></h2>
+<table>
+<tr><th>Group</th><th>Parameter</th><th>Value</th></tr>
+<tr><td rowspan="6">Model</td><td>d_model</td><td>256 (sweep {128,192,256})</td></tr>
+<tr><td>heads</td><td>8 (32 dim/head)</td></tr>
+<tr><td>token blocks N</td><td>4 (sweep {2,4,6})</td></tr>
+<tr><td>latent-stack depth L</td><td>6</td></tr>
+<tr><td>latents</td><td>320 (K=80 parcels &times; M=4 slots)</td></tr>
+<tr><td>cross-attn layers</td><td>2, at positions {0,3}</td></tr>
+<tr><td rowspan="5">Blocks</td><td>norm</td><td>pre-norm, LayerNorm</td></tr>
+<tr><td>activation</td><td>GeLU</td></tr>
+<tr><td>MLP ratio</td><td>4&times;</td></tr>
+<tr><td>RoPE &theta;</td><td>10000 (temporal SA, latent time SA)</td></tr>
+<tr><td>latent init</td><td>free <code>nn.Parameter(320,d)</code>, trunc-normal std 0.02</td></tr>
+<tr><td rowspan="3">Routing</td><td>support</td><td>BT-DK one-hot</td></tr>
+<tr><td>bias</td><td><code>log(support[e,p] + ε)</code></td></tr>
+<tr><td>&epsilon;</td><td>1e-2 (sweep {1e-4,1e-3,1e-2,1e-1})</td></tr>
+<tr><td rowspan="3">SSL masking</td><td>Phase 1 (token)</td><td>80% inverse-block on (t,f)</td></tr>
+<tr><td>Phase 2 (electrode)</td><td>30% random (J1 sweep)</td></tr>
+<tr><td>EMA decay</td><td>0.99 → 0.9999 linear warmup</td></tr>
+<tr><td rowspan="5">Phase 3 optim</td><td>optimizer</td><td>AdamW, &beta;=(0.9, 0.98), wd=0.05</td></tr>
+<tr><td>peak LR</td><td>3e-4 (adapter + Stage B); LR/10 on Stage A</td></tr>
+<tr><td>schedule</td><td>2k warmup + cosine decay → 1e-5 over 50k steps</td></tr>
+<tr><td>batch</td><td>256 clips (~25 epochs over 144k clips)</td></tr>
+<tr><td>adapter</td><td>1-layer PMA, K=50 queries, d=256</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="sisters">9. Ablation / sister-cell suite</h2>
+<table>
+<tr><th>Cell</th><th>Priority</th><th>Tests</th></tr>
+<tr><td>F-joint-tF</td><td>P0</td><td>joint vs factorized t&times;f attention</td></tr>
+<tr><td>F-linear-STFT-38</td><td>P0</td><td>linear STFT vs log ⅓-octave filterbank</td></tr>
+<tr><td>F-150Hz-cap</td><td>P0</td><td>cap log-bins at 150 Hz vs extend to 813 Hz</td></tr>
+<tr><td>single-cross-attn / 3-cross-attn @ {0,2,4}</td><td>P0</td><td>depth of routing vs 2-cross-attn default</td></tr>
+<tr><td>M-sweep {4,8,16}</td><td>P0</td><td>latents per parcel (rank of routing)</td></tr>
+<tr><td>F10b</td><td>P0</td><td>AST 2&times;4 patch stem from scratch</td></tr>
+<tr><td>BiL-NoSpatial / BiL-MNI / BiL-Freq-Plain</td><td>P0</td><td>Bitter-Lesson: do anatomical / biophysical priors load-bear at BT scale?</td></tr>
+<tr><td>J1 mask rate / J2 mask level</td><td>P0</td><td>SSL masking levers</td></tr>
+<tr><td>N-sweep / L-sweep / d-sweep / N2 factorization-order</td><td>P0</td><td>depth, width, factorization order</td></tr>
+<tr><td>R-joint / R-staged</td><td>P0</td><td>joint-from-step-1 vs 3-phase staged recipe</td></tr>
+<tr><td>R-no-phase-3</td><td>P0</td><td>does the audio bridge add over pure SSL?</td></tr>
+<tr><td>F-depth-bias</td><td>P1</td><td>within-parcel ordinal depth bias table <code>B[m,depth]</code></td></tr>
+<tr><td>F-additive-time-PE</td><td>P1</td><td>RoPE vs additive learnable time PE</td></tr>
+<tr><td>factored-freq-embed / F-no-freq-embed</td><td>P1</td><td>freq-embedding structure</td></tr>
+<tr><td>R-frame / R-cosine / R-no-gating / R-no-warmup</td><td>P1</td><td>Phase-3 recipe levers</td></tr>
+<tr><td>F-Morlet / B-edges / F-½-octave / F-band-prior-spacing</td><td>P1</td><td>filterbank shape / edges / spacing</td></tr>
+</table>
+
+<div class="footer">
+v14 complete specification &mdash; preprocessing, architecture, training recipe, objectives, evaluation.
+Compiled from canonical project memory: post-v3 architecture amendment (2026-05-19, v4 state) &middot;
+3-phase staged SSL recipe lock (2026-05-18 + 5/19 amendment) &middot; preprocessing recipe (2026-05-12 / 2026-05-17) &middot;
+DK-first routing pivot (2026-05-13) &middot; v14 pruning decisions (2026-05-12).
+Generated 2026-05-20.
+</div>
+
+</div>
+</body>
+</html>
