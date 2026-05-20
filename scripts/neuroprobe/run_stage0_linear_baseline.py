@@ -195,8 +195,11 @@ def run_eval(
     preprocess_type = args.preprocess_type
     pool_multi_source = bool(getattr(args, "pool_multi_source", False))
     train_subject: Any = None
+    all_subjects: dict[int, Any] = {}
+    source_subjects: dict[int, Any] = {}
+    source_subject_ids: list[int] = []
     fold_source_subjects: list[Any] | None = None
-    fold_source_trials: list[int] = []
+    fold_source_trials: list[int] | None = None
 
     preprocess_parameters = {
         "type": preprocess_type,
@@ -295,6 +298,72 @@ def run_eval(
     _feat_cache: dict[bytes, np.ndarray] = {}
     _cache_stats = {"hits": 0, "misses": 0}
 
+    # Build train/source subjects once, before the task loop. The 15 Neuroprobe
+    # tasks share the same recordings, so constructing these inside the loop
+    # gave each task a fresh empty neural_data_cache and re-loaded the source
+    # HDF5 ~15×. Construction and the deterministic electrode subset/shuffle
+    # (task-independent — keyed on seed + subject id, not eval_name) are hoisted
+    # here; only generate_splits_* stays per-task. NOTE: the pool-multi-source
+    # path still clears each source's neural cache per fold (OOM guard) so it
+    # reloads per task — hoisting only removes its object-construction cost. The
+    # non-pool CrossSubject path keeps its train subject's cache resident, so
+    # its train HDF5 loads exactly once across all tasks.
+    if splits_type in ("WithinSession", "CrossSession"):
+        train_subject = subject
+    elif splits_type == "CrossSubject" and pool_multi_source:
+        # D.14: train across every NEUROPROBE_LITE source subject (excluding test).
+        for src_id, _ in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS:
+            if src_id == args.subject_id or src_id in source_subjects:
+                continue
+            src_subj = BrainTreebankSubject(
+                src_id, allow_corrupted=False, cache=True, dtype=torch.float32,
+            )
+            src_subj.set_electrode_subset(
+                nconfig.NEUROPROBE_LITE_ELECTRODES[src_subj.subject_identifier]
+            )
+            source_subjects[src_id] = src_subj
+            source_subject_ids.append(src_id)
+        if not source_subject_ids:
+            raise RuntimeError("--pool-multi-source: no source subjects available.")
+        all_subjects = {args.subject_id: subject, **source_subjects}
+        # Each upstream fold corresponds to one source (subject_id, trial_id)
+        # pair from NEUROPROBE_LITE_SUBJECT_TRIALS; recover both for ordering
+        # alignment AND for per-fold cache cleanup after feature extraction.
+        fold_source_subjects = [
+            source_subjects[src_id]
+            for src_id, _ in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS
+            if src_id != args.subject_id
+        ]
+        fold_source_trials = [
+            src_trial
+            for src_id, src_trial in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS
+            if src_id != args.subject_id
+        ]
+        print(
+            f"[D.14] pool_multi_source: {len(source_subject_ids)} source subjects "
+            f"{source_subject_ids} → 1 pooled train, region_pool_mode={args.region_pool_mode}"
+        )
+    elif splits_type == "CrossSubject":
+        train_subject_id = nconfig.DS_DM_TRAIN_SUBJECT_ID
+        train_subject = BrainTreebankSubject(
+            train_subject_id, allow_corrupted=False, cache=True, dtype=torch.float32
+        )
+        train_subject.set_electrode_subset(
+            nconfig.NEUROPROBE_LITE_ELECTRODES[train_subject.subject_identifier]
+        )
+        if getattr(args, "shuffle_channels_per_subject", False):
+            t_full = list(train_subject.electrode_labels)
+            t_seed = int(args.seed) * 1_000_000 + int(train_subject_id) * 1000
+            t_perm = np.random.default_rng(t_seed).permutation(len(t_full))
+            train_subject.set_electrode_subset([t_full[i] for i in t_perm])
+            print(
+                f"[L.5.P6] train subject {train_subject_id} channels shuffled "
+                f"(perm_seed={t_seed}, n={len(t_full)})"
+            )
+        all_subjects = {args.subject_id: subject, train_subject_id: train_subject}
+    else:
+        raise ValueError(f"Unknown split type: {splits_type}")
+
     for eval_name in eval_names:
         if splits_type == "WithinSession":
             folds = nts.generate_splits_within_session(
@@ -304,7 +373,6 @@ def run_eval(
                 end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
                 lite=True, nano=False, binary_tasks=binary_tasks,
             )
-            train_subject = subject
         elif splits_type == "CrossSession":
             folds = nts.generate_splits_cross_session(
                 subject, args.trial_id, eval_name, dtype=torch.float32,
@@ -313,84 +381,29 @@ def run_eval(
                 end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
                 lite=True, binary_tasks=binary_tasks,
             )
-            train_subject = subject
+        elif splits_type == "CrossSubject" and pool_multi_source:
+            folds = nts.generate_splits_cross_subject(
+                all_subjects, args.subject_id, args.trial_id, eval_name,
+                dtype=torch.float32, output_indices=False, output_dict=False,
+                start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
+                end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
+                lite=True, nano=False, binary_tasks=binary_tasks,
+                include_all_train_subjects=True,
+            )
+            assert fold_source_subjects is not None
+            if len(fold_source_subjects) != len(folds):
+                raise RuntimeError(
+                    f"upstream returned {len(folds)} folds but built "
+                    f"{len(fold_source_subjects)} source subjects — ordering mismatch"
+                )
         elif splits_type == "CrossSubject":
-            if pool_multi_source:
-                # D.14: train across every NEUROPROBE_LITE source subject (excluding test).
-                source_subject_ids: list[int] = []
-                source_subjects: dict[int, Any] = {}
-                for src_id, _ in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS:
-                    if src_id == args.subject_id or src_id in source_subjects:
-                        continue
-                    src_subj = BrainTreebankSubject(
-                        src_id, allow_corrupted=False, cache=True, dtype=torch.float32,
-                    )
-                    src_subj.set_electrode_subset(
-                        nconfig.NEUROPROBE_LITE_ELECTRODES[src_subj.subject_identifier]
-                    )
-                    source_subjects[src_id] = src_subj
-                    source_subject_ids.append(src_id)
-                if not source_subject_ids:
-                    raise RuntimeError("--pool-multi-source: no source subjects available.")
-                train_subject = None
-                all_subjects = {args.subject_id: subject, **source_subjects}
-                folds = nts.generate_splits_cross_subject(
-                    all_subjects, args.subject_id, args.trial_id, eval_name,
-                    dtype=torch.float32, output_indices=False, output_dict=False,
-                    start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
-                    end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
-                    lite=True, nano=False, binary_tasks=binary_tasks,
-                    include_all_train_subjects=True,
-                )
-                # Each upstream fold corresponds to one source (subject_id, trial_id)
-                # pair from NEUROPROBE_LITE_SUBJECT_TRIALS; recover both for ordering
-                # alignment AND for per-fold cache cleanup after feature extraction.
-                fold_source_subjects = [
-                    source_subjects[src_id]
-                    for src_id, _ in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS
-                    if src_id != args.subject_id
-                ]
-                fold_source_trials = [
-                    src_trial
-                    for src_id, src_trial in nconfig.NEUROPROBE_LITE_SUBJECT_TRIALS
-                    if src_id != args.subject_id
-                ]
-                if len(fold_source_subjects) != len(folds):
-                    raise RuntimeError(
-                        f"upstream returned {len(folds)} folds but built "
-                        f"{len(fold_source_subjects)} source subjects — ordering mismatch"
-                    )
-                print(
-                    f"[D.14] pool_multi_source: {len(source_subject_ids)} source subjects "
-                    f"{source_subject_ids} → 1 pooled train, region_pool_mode={args.region_pool_mode}"
-                )
-            else:
-                train_subject_id = nconfig.DS_DM_TRAIN_SUBJECT_ID
-                train_subject = BrainTreebankSubject(
-                    train_subject_id, allow_corrupted=False, cache=True, dtype=torch.float32
-                )
-                train_subject.set_electrode_subset(
-                    nconfig.NEUROPROBE_LITE_ELECTRODES[train_subject.subject_identifier]
-                )
-                if getattr(args, "shuffle_channels_per_subject", False):
-                    t_full = list(train_subject.electrode_labels)
-                    t_seed = int(args.seed) * 1_000_000 + int(train_subject_id) * 1000
-                    t_perm = np.random.default_rng(t_seed).permutation(len(t_full))
-                    train_subject.set_electrode_subset([t_full[i] for i in t_perm])
-                    print(
-                        f"[L.5.P6] train subject {train_subject_id} channels shuffled "
-                        f"(perm_seed={t_seed}, n={len(t_full)})"
-                    )
-                all_subjects = {args.subject_id: subject, train_subject_id: train_subject}
-                folds = nts.generate_splits_cross_subject(
-                    all_subjects, args.subject_id, args.trial_id, eval_name, dtype=torch.float32,
-                    output_indices=False, output_dict=False,
-                    start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
-                    end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
-                    lite=True, nano=False, binary_tasks=binary_tasks,
-                )
-                fold_source_subjects = None
-                source_subject_ids = []
+            folds = nts.generate_splits_cross_subject(
+                all_subjects, args.subject_id, args.trial_id, eval_name, dtype=torch.float32,
+                output_indices=False, output_dict=False,
+                start_neural_data_before_word_onset=int(bins_start_before * nconfig.SAMPLING_RATE),
+                end_neural_data_after_word_onset=int(bins_end_after * nconfig.SAMPLING_RATE),
+                lite=True, nano=False, binary_tasks=binary_tasks,
+            )
         else:
             raise ValueError(f"Unknown split type: {splits_type}")
 
@@ -435,7 +448,7 @@ def run_eval(
                 X_test_raw: np.ndarray | None = None
                 y_test_pool: np.ndarray | None = None
                 regions_test_raw: np.ndarray | None = None
-                assert fold_source_subjects is not None
+                assert fold_source_subjects is not None and fold_source_trials is not None
                 for fi, fold in enumerate(folds):
                     train_dataset = fold["train_dataset"]
                     test_dataset = fold["test_dataset"]
