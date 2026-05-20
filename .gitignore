@@ -59,3 +59,6 @@ docs/*.pdf
 *.out
 *.toc
 *.synctex.gz
+
+# Claude Code worktrees (transient agent worktrees)
+.claude/worktrees/
