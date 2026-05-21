@@ -395,6 +395,7 @@ Canonical: `docs/neuroprobe/stage_2.md §"Sub-stages"` and `docs/neuroprobe/stag
 | Banville 4-point curve | ~8h, ~16h, ~33h Tier-1, ~66h Tier-1 + D-cohort | slope < 0.04 AUROC/log-h means SSL is not earning its keep |
 | Downstream transfer curve | pretrain budget × Neuroprobe finetune-size 2-D grid | fits scaling-law / alignment coefficient; prevents single-budget overread |
 | Capacity | `d_model ∈ {32, 64, 128}` | Full Tier-1 sweep; winner becomes Stage-3 width |
+| μP / μTransfer | tune LR + weight-decay once on the 13M proxy under Maximal Update Parametrization (Tensor Programs V, Yang/Hu, NeurIPS 2021); μTransfer copies HPs to 25M/40M | prerequisite for the 13M/25M/40M sizing sweep — keeps HP optima width-invariant so capacity is isolated from a mistuned LR (DIVER meta-review #3 confound, [[reference_diver1_ieeg_fm_2026_05_18]]); ~⅔ HP-search compute saved. Width transfer reliable, depth not — hold depth fixed across the sweep; verify with a coord-check |
 | Distribution controls | AGD + distribution-balanced sampling; capacity-threshold check; effective seen-window export | prevents blaming objectives for exposure/capacity failures |
 | Cross-subject batching | implicit random same-content vs active same-audio cross-subject batching | activate if 8h/16h slope is below prior band |
 | Projection dimension | common D-SigLIP projection `k ∈ {256, 512}` | pin in first ablation |
