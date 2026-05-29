@@ -58,6 +58,7 @@ import typing as tp
 from typing import Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from neuraltrain.models.base import BaseModelConfig
@@ -184,12 +185,19 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)                     # (B, T, H, head_dim) each
         # Move T into a contiguous-last-but-one slot so `_apply_rope` picks it
-        # up (it operates on the second-to-last axis).
-        q = _apply_rope(q.transpose(1, 2), rope).transpose(1, 2)
-        k = _apply_rope(k.transpose(1, 2), rope).transpose(1, 2)
-        attn_logits = torch.einsum("bthd,bshd->bhts", q, k) * self.scale
-        attn = attn_logits.softmax(dim=-1)
-        ctx = torch.einsum("bhts,bshd->bthd", attn, v)
+        # up (it operates on the second-to-last axis). After RoPE, leave the
+        # tensors in (B, H, T, head_dim) — the shape SDPA expects.
+        q = _apply_rope(q.transpose(1, 2), rope)        # (B, H, T, head_dim)
+        k = _apply_rope(k.transpose(1, 2), rope)        # (B, H, T, head_dim)
+        v = v.transpose(1, 2)                           # (B, H, T, head_dim)
+        # SDPA's default scale is 1/sqrt(head_dim), matching ``self.scale``.
+        # Routes to FlashAttention / mem-efficient backends under autocast
+        # bf16-mixed, so the (B, H, T, T) attn matrix is never materialized
+        # — critical because the hand-rolled softmax was upcast to fp32 by
+        # PyTorch autocast and OOM'd at C=384 padded electrodes × T~130 on
+        # 31 GiB GPUs (see [[feedback_dcc_partition_default_coganlab_gpu_2026_05_29]]).
+        ctx = F.scaled_dot_product_attention(q, k, v)   # (B, H, T, head_dim)
+        ctx = ctx.transpose(1, 2)                       # (B, T, H, head_dim)
         return self.out(ctx.reshape(B, T, -1))
 
 
