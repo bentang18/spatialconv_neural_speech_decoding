@@ -1,4 +1,4 @@
-"""Tests for Whisper-large-v2 distillation contract."""
+"""Tests for Whisper-large-v3 distillation contract (v3 upgrade 2026-05-28)."""
 from speech_decoding.bt_alignment.contract import (
     WHISPER_CONTRACT,
     STUDENT_RATE_HZ,
@@ -9,10 +9,10 @@ from speech_decoding.bt_alignment.contract import (
 )
 
 
-def test_whisper_contract_large_v2():
+def test_whisper_contract_large_v3():
     c = WHISPER_CONTRACT
-    assert c["variant"] == "openai/whisper-large-v2"
-    assert c["n_mels"] == 80
+    assert c["variant"] == "openai/whisper-large-v3"
+    assert c["n_mels"] == 128
     assert c["sr"] == 16000
     assert c["hop"] == 160
     assert c["n_fft"] == 400

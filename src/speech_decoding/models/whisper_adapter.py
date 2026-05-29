@@ -29,8 +29,9 @@ class WhisperAdapter(nn.Module):
     Parameters
     ----------
     in_dim
-        Whisper-L8 hidden-state width; default ``1280`` (Whisper-large
-        / large-v2 / large-v3 layer-8 hidden size).
+        Whisper-L8 hidden-state width; default ``1280`` (Whisper-large-v3
+        layer-8 hidden size; v2 had the same width but was upgraded to v3
+        on 2026-05-28).
     hidden_dim
         Intermediate width; default ``256`` (matches student d_model).
     out_dim

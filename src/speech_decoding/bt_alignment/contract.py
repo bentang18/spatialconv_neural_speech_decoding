@@ -1,18 +1,25 @@
-"""Whisper-large-v2 distillation contract + clock-consistency assertion.
+"""Whisper-large-v3 distillation contract + clock-consistency assertion.
 
-Provenance: v14 B05+B06 lock (5/25 PM). Whisper variant verified by inspecting
-transformers WhisperConfig for openai/whisper-large-v2:
-    n_mels=80, d_model=1280, encoder_layers=32, hop=160 samples @ 16 kHz.
-Large-v3 has n_mels=128 → incompatible with v14 src whisper_adapter.py (in_dim=1280
-+ n_mels=80 assumption). Goldstein-2025 L8 semantics also match large-v2.
+Provenance: v14 B05+B06 lock (5/25 PM) + v3 upgrade 2026-05-28 per memo
+``project_v14_whisper_teacher_v3_upgrade_2026_05_28.md``. Whisper variant
+verified by inspecting transformers WhisperConfig for openai/whisper-large-v3:
+    n_mels=128, d_model=1280, encoder_layers=32, hop=160 samples @ 16 kHz.
+Encoder topology is identical to large-v2 (32 layers, d=1280, layer-8 native
+50 Hz); v3 differs only in the mel front-end (80→128 bins) which lives
+UPSTREAM of the encoder. Cache writer + whisper_adapter consume layer-8
+hidden state (B, T, 1280), so the mel-bin change is invisible to the
+distillation contract; only the source model string and n_mels need to
+flip. Goldstein-2025 L8 semantics still apply (v3 was a drop-in noisy-speech
+robustness upgrade, −10–20% WER on noisy benchmarks per Whisper v3
+release notes).
 """
 from __future__ import annotations
 import numpy as np
 import pandas as pd
 
 WHISPER_CONTRACT = {
-    "variant": "openai/whisper-large-v2",
-    "n_mels": 80,
+    "variant": "openai/whisper-large-v3",
+    "n_mels": 128,
     "sr": 16000,
     "hop": 160,
     "n_fft": 400,
