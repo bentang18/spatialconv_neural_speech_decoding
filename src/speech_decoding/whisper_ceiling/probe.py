@@ -60,10 +60,16 @@ def binary_labels_from_continuous(values: np.ndarray) -> tuple[np.ndarray, np.nd
     """
     v = np.asarray(values, dtype=float)
     finite_mask = np.isfinite(v)
-    finite = v[finite_mask]
-    if finite.size == 0:
+    if not finite_mask.any():
         return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
-    percentiles = np.array([np.mean(finite < x) for x in v])
+    # O(N log N) percentile (was O(N^2) python-comprehension): for each finite v,
+    # fraction of finite values strictly less than v — matches np.mean(finite < x).
+    finite_vals = v[finite_mask]
+    sorted_finite = np.sort(finite_vals)
+    percentiles = np.full(len(v), np.nan)
+    percentiles[finite_mask] = (
+        np.searchsorted(sorted_finite, finite_vals, side="left") / len(finite_vals)
+    )
     pos = np.where(finite_mask & (percentiles > 0.75))[0]
     neg = np.where(finite_mask & (percentiles < 0.25))[0]
     kept = np.concatenate([neg, pos])
