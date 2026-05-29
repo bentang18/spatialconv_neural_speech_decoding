@@ -21,10 +21,17 @@ Layer-merge sweep — five strategies:
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+# Above this feature dim, fall back to RidgeClassifier (closed-form SVD).
+# LBFGS LogReg at d ≥ 5000 scales to minutes per fit; Ridge is ~30× faster
+# and AUROC ranking is essentially identical for binary discrimination
+# on the same feature columns. Empirical: smoke job at d=40960 took >40 min
+# per (trial × 9 tasks); Ridge on the same data lands in ~1 min.
+HIGH_DIM_THRESHOLD = 5000
 
 # Continuous Neuroprobe Lite tasks (top-quartile vs bottom-quartile binary).
 # Maps probe-task-name -> column name in words_df after labels merge.
@@ -90,6 +97,23 @@ def binary_labels_face_num(face_nums: np.ndarray) -> tuple[np.ndarray, np.ndarra
     return kept[order], labels[order]
 
 
+def _make_classifier(n_features: int, seed: int):
+    if n_features >= HIGH_DIM_THRESHOLD:
+        # Closed-form SVD ridge; no iterative solver. ~30× faster at d=40k.
+        return RidgeClassifier(alpha=1.0, class_weight="balanced", random_state=seed)
+    return LogisticRegression(
+        C=1.0, max_iter=200, class_weight="balanced",
+        random_state=seed, solver="lbfgs",
+    )
+
+
+def _decision_scores(clf, X) -> np.ndarray:
+    if hasattr(clf, "predict_proba"):
+        return clf.predict_proba(X)[:, 1]
+    # RidgeClassifier exposes decision_function only — fine for AUROC ranking.
+    return clf.decision_function(X)
+
+
 def _fit_score(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -102,13 +126,10 @@ def _fit_score(
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
-    clf = LogisticRegression(
-        C=1.0, max_iter=1000, class_weight="balanced",
-        random_state=seed, solver="lbfgs",
-    )
+    clf = _make_classifier(X_train.shape[1], seed)
     clf.fit(X_train_s, y_train)
-    proba = clf.predict_proba(X_test_s)[:, 1]
-    return float(roc_auc_score(y_test, proba))
+    scores = _decision_scores(clf, X_test_s)
+    return float(roc_auc_score(y_test, scores))
 
 
 def _fit_predict_proba(
@@ -117,19 +138,22 @@ def _fit_predict_proba(
     X_test: np.ndarray,
     seed: int,
 ) -> np.ndarray:
-    """Same as _fit_score's pipeline but returns predicted probabilities for the
-    positive class — used by late-fusion ensembles."""
+    """Same as _fit_score's pipeline but returns probabilities (or decision
+    scores for high-d Ridge) — used by late-fusion ensembles. Scores are
+    converted to [0,1] via min-max so they can be averaged across layers."""
     if len(np.unique(y_train)) < 2:
         return np.full(len(X_test), 0.5, dtype=float)
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
-    clf = LogisticRegression(
-        C=1.0, max_iter=1000, class_weight="balanced",
-        random_state=seed, solver="lbfgs",
-    )
+    clf = _make_classifier(X_train.shape[1], seed)
     clf.fit(X_train_s, y_train)
-    return clf.predict_proba(X_test_s)[:, 1]
+    scores = _decision_scores(clf, X_test_s)
+    # Min-max normalize so late-fusion mean is comparable across layers
+    lo, hi = float(scores.min()), float(scores.max())
+    if hi - lo < 1e-12:
+        return np.full(len(X_test), 0.5, dtype=float)
+    return (scores - lo) / (hi - lo)
 
 
 def late_fusion_within(

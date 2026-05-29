@@ -15,13 +15,24 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+
+# Pin BLAS to a single thread per process so joblib's process-level parallelism
+# doesn't oversubscribe CPUs (8 workers × 8 OMP threads → 64 threads on 8 cores
+# is a 5-10× wall-clock regression). MUST be set before numpy/sklearn import.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ[_k] = "1"
+
 import argparse
 import csv
 import json
 import re
+import time
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
 
 from speech_decoding.whisper_ceiling.probe import (
     DEFAULT_TASKS,
@@ -34,6 +45,10 @@ from speech_decoding.whisper_ceiling.probe import (
     late_fusion_within,
     topk_layers_by_within_auroc,
 )
+
+
+def _n_jobs() -> int:
+    return int(os.environ.get("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
 
 NEUROPROBE_LITE_SUBJECT_TRIALS = [
     (1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
@@ -155,17 +170,37 @@ def main() -> None:
     # === WITHIN-TRIAL ===
     # Two-pass: first run base layer + merge sweep, then identify top-3 layers
     # per task across pooled trials and add a `concat_top_3` sister.
-    print(f"[probe] PASS 1: WITHIN-TRIAL (per-layer + concat-all + mean-all + late-fusion)",
-          flush=True)
-    for (sid, tid), data in trial_features.items():
-        for task in tasks:
-            for r in run_within_trial(data, layers, task, base_layer_keys, seed=args.seed):
-                rows.append({
-                    "subject_id": sid, "trial_id": tid,
-                    "task": r.task, "layer": str(r.layer), "split": r.split,
-                    "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
-                    "seed": r.seed,
-                })
+    n_jobs = _n_jobs()
+    units = [(sid, tid, task) for (sid, tid) in trial_features for task in tasks]
+    print(
+        f"[probe] PASS 1: WITHIN-TRIAL ({len(units)} trial×task units, "
+        f"n_jobs={n_jobs})",
+        flush=True,
+    )
+
+    def _do_unit(sid, tid, task):
+        t0 = time.time()
+        data = trial_features[(sid, tid)]
+        results = run_within_trial(data, layers, task, base_layer_keys, seed=args.seed)
+        return sid, tid, task, results, time.time() - t0
+
+    pass1 = Parallel(n_jobs=n_jobs, backend="loky", verbose=10)(
+        delayed(_do_unit)(sid, tid, task) for (sid, tid, task) in units
+    )
+    assert pass1 is not None
+    for sid, tid, task, results, elapsed in pass1:
+        print(
+            f"[probe]   sub_{sid} trial{tid} task={task} "
+            f"({len(results)} fits, {elapsed:.1f}s)",
+            flush=True,
+        )
+        for r in results:
+            rows.append({
+                "subject_id": sid, "trial_id": tid,
+                "task": r.task, "layer": str(r.layer), "split": r.split,
+                "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
+                "seed": r.seed,
+            })
 
     # Pool per-task per-layer within-trial AUROCs across trials -> pick top-3
     print(f"[probe] PASS 2: deriving top-3 layers per task and re-probing", flush=True)
@@ -230,13 +265,21 @@ def main() -> None:
     }
 
     # === CROSS-SESSION (same subject, different trial pairs) ===
-    print(f"[probe] CROSS-SESSION probes", flush=True)
     subjects = sorted({s for (s, _) in trial_features})
+    css_units = [
+        (sid, ta, tb)
+        for sid in subjects
+        for trials in [sorted([t for (s, t) in trial_features if s == sid])]
+        if len(trials) >= 2
+        for (ta, tb) in [(trials[0], trials[1]), (trials[1], trials[0])]
+    ]
+    print(f"[probe] CROSS-SESSION ({len(css_units)} subject×direction)", flush=True)
     for sid in subjects:
         trials = sorted([t for (s, t) in trial_features if s == sid])
         if len(trials) < 2:
             continue
         for ta, tb in [(trials[0], trials[1]), (trials[1], trials[0])]:
+            t_css = time.time()
             data_a = trial_features[(sid, ta)]
             data_b = trial_features[(sid, tb)]
             for task in tasks:
@@ -265,12 +308,22 @@ def main() -> None:
                         "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
                         "seed": r.seed,
                     })
+            print(
+                f"[probe]   sub_{sid} {ta}->{tb} cross-session "
+                f"({time.time() - t_css:.1f}s)",
+                flush=True,
+            )
 
     # === CROSS-SUBJECT (LOSO) ===
-    print(f"[probe] CROSS-SUBJECT probes (LOSO)", flush=True)
+    print(
+        f"[probe] CROSS-SUBJECT probes (LOSO) — "
+        f"{len(subjects)} subjects × {len(tasks)} tasks",
+        flush=True,
+    )
     features_by_subject: dict = {sid: {} for sid in subjects}
     labels_by_subject: dict = {sid: {} for sid in subjects}
     for task in tasks:
+        t_cs = time.time()
         keys_for_task = layer_keys_per_task.get(task, layer_keys)
         for sid in subjects:
             X_layers: dict = {repr(k): [] for k in keys_for_task}
@@ -319,6 +372,10 @@ def main() -> None:
                     "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
                     "seed": r.seed,
                 })
+        print(
+            f"[probe]   task={task} LOSO done ({time.time() - t_cs:.1f}s)",
+            flush=True,
+        )
 
     # Write CSV
     out_csv = args.out_dir / "ceiling_results.csv"

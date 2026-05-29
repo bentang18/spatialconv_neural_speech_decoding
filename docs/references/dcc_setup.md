@@ -156,6 +156,26 @@ Default GPU partition:
 #SBATCH --gres=gpu:1
 ```
 
+Default CPU partition (probes, eval, postproc):
+
+```bash
+#SBATCH --partition=common         # NOT scavenger — preemptable + older nodes
+#SBATCH --account=coganlab
+```
+
+Partition picker (5/28):
+
+| Resource | Partition | Hardware | Why |
+|---|---|---|---|
+| GPU | `coganlab-gpu` (fallback `scavenger-gpu`) | RTX 5000 Ada × 8 @ 32 GB | Lab-owned, no preempt |
+| CPU | `common` | 72-128 CPU, 385GB-1TB RAM, newer | NOT preemptable; lab-priority |
+| Big-RAM CPU | `common` u-ab25-3-[1-8] | 128 CPU, 1 TB | Available without separate request |
+| Short-burst CPU (<10 min) | `scavenger` | 48-96 CPU, 257GB+, mixed lab hw | OK if common queue jammed |
+
+There is NO `coganlab` CPU partition. Only `coganlab-gpu`. Don't put `coganlab` in a CPU `-p` list — sbatch rejects.
+
+`sinfo -p <part> -N -o '%N %c %m %f %G'` shows per-node CPU/RAM. `squeue -u ht203 -o "%i %P %j %R"` shows which node landed.
+
 Monitor jobs directly when needed:
 
 ```bash
