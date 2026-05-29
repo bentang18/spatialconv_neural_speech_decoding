@@ -176,6 +176,26 @@ class V14JointExperiment(V14Experiment):
         """Override: joint phase uses the B29 4-term tuple."""
         return v14_joint_loss_coefficients()
 
+    def _train_and_test(self) -> dict[str, float | None]:
+        # B2.1 (#96) wires construction through the dispatch phase-switch,
+        # but the SSL training-step itself is gated on the rest of Bucket 2:
+        # B2.2 (compose 4-term L_total via ssl/aggregator.py with the B30
+        # ``latent_valid`` single-source-of-truth mask), B2.3 (shaft-mask +
+        # ref_aug + ref_embed extractors into the forward), B2.4 (B02
+        # WRS-over-valid-bin-electrode-hours sampler + StatefulDataLoader),
+        # B2.5 (MON-SLOT-REDUNDANCY / MON-MASK-002/004 monitors +
+        # best-val probe callback). Until those land, falling through to
+        # the parent CE-supervised path would silently mis-train the
+        # joint phase as Phase-4. Raise here so the gating is loud.
+        raise NotImplementedError(
+            "V14JointExperiment._train_and_test is gated on Bucket-2 SSL "
+            "wiring: B2.2 (4-term L_total via ssl/aggregator.py with B30 "
+            "latent_valid), B2.3 (shaft-mask + ref_aug + ref_embed "
+            "extractors into the forward), B2.4 (B02 sampler + "
+            "StatefulDataLoader), B2.5 (monitors + best-val probe "
+            "callback). See docs/neuroprobe/v14_blockers.md."
+        )
+
 
 __all__ = [
     "JOINT_PHASE",

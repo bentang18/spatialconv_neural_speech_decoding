@@ -229,6 +229,14 @@ def build_v14_experiment(
     # B29 Item 14 + MoE-FFN audit 2026-05-28: dense default; soft_moe_4
     # is the P2-if-budget sister.
     ffn_variant: str = DEFAULT_FFN_VARIANT,
+    # B2.1 (#96) phase-switch hook. When ``joint_phase=True`` the builder
+    # returns a :class:`V14JointExperiment` pinned to ``phase=1`` (B29
+    # Item 1 P1+P2 collapse) instead of a vanilla supervised
+    # :class:`Experiment`. The SSL training-step itself is gated on
+    # B2.2-B2.5; ``V14JointExperiment._train_and_test`` raises with the
+    # remaining blocker IDs so wiring the dispatch never silently
+    # downgrades to Phase-4 CE.
+    joint_phase: bool = False,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -435,7 +443,19 @@ def build_v14_experiment(
     if cluster is not None:
         infra_cfg["cluster"] = cluster
 
-    return Experiment(
+    experiment_cls: type[Experiment] = Experiment
+    extra_experiment_kwargs: dict[str, tp.Any] = {}
+    if joint_phase:
+        # Imported here to avoid pulling V14JointExperiment into the
+        # supervised Phase-4 path's import chain.
+        from speech_decoding.experiments.v14_joint import (
+            JOINT_PHASE_VALUE,
+            V14JointExperiment,
+        )
+        experiment_cls = V14JointExperiment
+        extra_experiment_kwargs = {"phase": JOINT_PHASE_VALUE}
+
+    return experiment_cls(
         data=data,
         infra=infra_cfg,
         target_field="label",
@@ -487,6 +507,7 @@ def build_v14_experiment(
         accelerator="auto",
         devices="auto",
         fast_dev_run=fast_dev_run,
+        **extra_experiment_kwargs,
     )
 
 
@@ -645,12 +666,15 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+# B2.1 (#96) closed 2026-05-28: phase=1 now routes to V14JointExperiment
+# (B29 Item 1). The SSL training-step itself still raises with the
+# remaining B2.x blockers from inside
+# ``V14JointExperiment._train_and_test`` — see v14_joint.py. The dispatch
+# path is thus the *construction* gate only.
 _PHASE1_BLOCKERS = (
-    # Per B29 Item 1, P1 + P2 collapse → single joint SSL phase routed
-    # through V14JointExperiment. Phases 1 and 2 share the same open
-    # blockers as a result; see `--phase-mode joint` for the canonical
-    # joint-phase routing.
-    "B2.1 (wire V14JointExperiment into the dispatch phase-switch), "
+    # Retained as a string for the test-harness substring contract; the
+    # blockers below now fire from V14JointExperiment._train_and_test,
+    # not from the dispatch.
     "B2.2 (compose 4-term L_total via ssl/aggregator.py with B30 latent_valid), "
     "B2.3 (shaft-mask + ref_aug + ref_embed extractors — B03 / REF-01 / REF-02), "
     "B2.4 (B02 sampler — WRS over valid-bin-electrode-hours + StatefulDataLoader), "
@@ -658,7 +682,16 @@ _PHASE1_BLOCKERS = (
     "B30-dispatch-sister-flags (latent_valid_override + sa_mask_mode), "
     "per-corpus mains notch (60 Hz US / 50 Hz SWEC)"
 )
-_PHASE2_BLOCKERS = _PHASE1_BLOCKERS  # B29 Item 1: P1 + P2 joint phase.
+_PHASE2_BLOCKERS = (
+    # B29 Item 1 collapsed P1 + P2 into a single joint phase; dispatch
+    # via ``--phase 1`` (V14JointExperiment is pinned to ``phase=1``).
+    # The R-keep-phase-split sister keeps explicit P1/P2 via the parent
+    # V14Experiment — but is not exposed through this dispatch.
+    "B29 Item 1 collapsed P1 + P2 into a single joint phase; "
+    "dispatch via --phase 1 (V14JointExperiment). "
+    "Sister R-keep-phase-split keeps explicit P1/P2 via the parent "
+    "V14Experiment — see docs/neuroprobe/v14_blockers.md."
+)
 _PHASE3_BLOCKERS = (
     # B06 ✅ closed 2026-05-25 (joint with B05). The remaining open
     # Phase-3 work is the readout / distillation wiring layered on top
@@ -671,12 +704,13 @@ _PHASE3_BLOCKERS = (
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.phase != 4:
-        # T3.1 scaffold: phase entry-points exist so dispatch is one switch
-        # away once the gating blockers resolve. Each branch raises with the
-        # exact blocker IDs to surface what is missing — do NOT fill defaults
-        # here (would pre-empt the v14_blockers.md decisions).
-        gating = {1: _PHASE1_BLOCKERS, 2: _PHASE2_BLOCKERS, 3: _PHASE3_BLOCKERS}
+    if args.phase in (2, 3):
+        # B2.1 (#96): phase=1 now constructs V14JointExperiment; the
+        # training-step still raises from inside its ``_train_and_test``
+        # for B2.2-B2.5. Phase 2 is the legacy split-P2 entry-point —
+        # B29 Item 1 collapsed it into the joint phase; phase 3 stays
+        # gated on a frozen Phase-1+2 SSL checkpoint.
+        gating = {2: _PHASE2_BLOCKERS, 3: _PHASE3_BLOCKERS}
         raise NotImplementedError(
             f"--phase {args.phase} dispatch is gated on unresolved blockers: "
             f"{gating[args.phase]}. See docs/neuroprobe/v14_blockers.md."
@@ -728,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
         phase_mode=args.phase_mode,
         anatomy_bias_mode=args.anatomy_bias_mode,
         ref_operator_alpha=args.ref_operator_alpha,
+        joint_phase=(args.phase == 1),
         include_ajile12=args.include_ajile12,
         ffn_variant=args.ffn_variant,
     )
