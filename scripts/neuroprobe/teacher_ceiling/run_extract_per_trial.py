@@ -116,6 +116,9 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / f"sub_{args.subject_id}_trial{args.trial_id}.npz"
+    if out_path.exists() and not args.force:
+        print(f"[extract] {out_path} already exists -- skip (use --force to overwrite)", flush=True)
+        return
     print(f"[extract] writing {out_path}", flush=True)
     np.savez_compressed(
         out_path,
@@ -170,6 +173,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--before-s", type=float, default=0.0)
     p.add_argument("--after-s", type=float, default=1.0)
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    p.add_argument("--force", action="store_true",
+                   help="re-extract even if the per-trial NPZ already exists")
     return p.parse_args()
 
 
