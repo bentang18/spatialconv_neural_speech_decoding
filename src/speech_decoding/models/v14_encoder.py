@@ -872,22 +872,30 @@ class V14ParcelPerceiverModel(nn.Module):
                 if subject_subtype is None:
                     sub_ids = torch.zeros(B, dtype=torch.long, device=x.device)
                 else:
-                    # NeuralSet collates per-event ``(1,)`` TimedArrays into
-                    # ``(B, 1)``. Squeeze the trailing singleton so the
-                    # embedding lookup stays 1-D.
-                    if subject_subtype.dim() == 2 and subject_subtype.shape[-1] == 1:
-                        subject_subtype = subject_subtype.squeeze(-1)
-                    if subject_subtype.shape != (B,):
+                    # NeuralSet collates per-event TimedArrays into a leading
+                    # batch axis. Our extractor emits ``(1, 1)`` (one channel,
+                    # one sample) per event — required by NeuralSet's
+                    # ``BaseExtractor._missing_default`` invariant
+                    # (``tensor.shape[:-1]`` must be non-empty when
+                    # frequency != 0) — which collates to ``(B, 1, 1)``. Strip
+                    # all trailing singleton axes so the embedding lookup
+                    # stays 1-D. ``(B,)`` is already accepted unchanged.
+                    # Bind to a non-Optional local so the loop body's
+                    # rebinding doesn't break narrowing.
+                    sst: Tensor = subject_subtype
+                    while sst.dim() > 1 and sst.shape[-1] == 1:
+                        sst = sst.squeeze(-1)
+                    if sst.shape != (B,):
                         raise ValueError(
-                            f"subject_subtype shape {tuple(subject_subtype.shape)} "
+                            f"subject_subtype shape {tuple(sst.shape)} "
                             f"does not match (B,) = ({B},)"
                         )
-                    if subject_subtype.dtype not in (torch.long, torch.int32, torch.int64):
+                    if sst.dtype not in (torch.long, torch.int32, torch.int64):
                         raise TypeError(
                             f"subject_subtype dtype must be integer; got "
-                            f"{subject_subtype.dtype}"
+                            f"{sst.dtype}"
                         )
-                    sub_ids = subject_subtype.to(torch.long).to(x.device)
+                    sub_ids = sst.to(torch.long).to(x.device)
                     if (sub_ids < 0).any() or (sub_ids >= self.subtype_vocab).any():
                         raise ValueError(
                             f"subject_subtype ids must be in [0, {self.subtype_vocab}); "
@@ -898,19 +906,23 @@ class V14ParcelPerceiverModel(nn.Module):
                 if ref_idx is None:
                     ref_ids = torch.zeros(B, dtype=torch.long, device=x.device)
                 else:
-                    # See subject_subtype above — same (B,1) squeeze contract.
-                    if ref_idx.dim() == 2 and ref_idx.shape[-1] == 1:
-                        ref_idx = ref_idx.squeeze(-1)
-                    if ref_idx.shape != (B,):
+                    # See subject_subtype above — same trailing-singleton
+                    # squeeze contract; covers both (B, 1) and (B, 1, 1).
+                    # Bind to a non-Optional local so the loop body's
+                    # rebinding doesn't break narrowing.
+                    ri: Tensor = ref_idx
+                    while ri.dim() > 1 and ri.shape[-1] == 1:
+                        ri = ri.squeeze(-1)
+                    if ri.shape != (B,):
                         raise ValueError(
-                            f"ref_idx shape {tuple(ref_idx.shape)} does not "
+                            f"ref_idx shape {tuple(ri.shape)} does not "
                             f"match (B,) = ({B},)"
                         )
-                    if ref_idx.dtype not in (torch.long, torch.int32, torch.int64):
+                    if ri.dtype not in (torch.long, torch.int32, torch.int64):
                         raise TypeError(
-                            f"ref_idx dtype must be integer; got {ref_idx.dtype}"
+                            f"ref_idx dtype must be integer; got {ri.dtype}"
                         )
-                    ref_ids = ref_idx.to(torch.long).to(x.device)
+                    ref_ids = ri.to(torch.long).to(x.device)
                     if (ref_ids < 0).any() or (ref_ids >= 3).any():
                         raise ValueError(
                             f"ref_idx ids must be in [0, 3); got "

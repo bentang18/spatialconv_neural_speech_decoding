@@ -76,9 +76,12 @@ def compute_gated_log_support_bias(
             if scalar < 0.0:
                 raise ValueError(f"lambda_anat must be >= 0; got {scalar}")
             return scalar * torch.log(support + eps)
-        # NeuralSet collates per-event ``(1,)`` TimedArrays into
-        # ``(B, 1)``; squeeze the trailing singleton before validating.
-        if lambda_anat.dim() == 2 and int(lambda_anat.shape[-1]) == 1:
+        # NeuralSet collates per-event ``(1, 1)`` TimedArrays (one channel
+        # + one sample; required by ``BaseExtractor._missing_default``'s
+        # ``tensor.shape[:-1]`` non-empty invariant) into ``(B, 1, 1)``.
+        # Strip all trailing singleton axes so the per-clip gate is 1-D;
+        # ``(B,)`` is already accepted unchanged.
+        while lambda_anat.dim() > 1 and int(lambda_anat.shape[-1]) == 1:
             lambda_anat = lambda_anat.squeeze(-1)
         if lambda_anat.dim() != 1 or int(lambda_anat.shape[0]) != B:
             raise ValueError(
