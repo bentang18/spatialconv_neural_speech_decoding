@@ -19,12 +19,19 @@ Layer-merge sweep — five strategies:
     - late-fusion:     per-layer probes, ensemble by mean probability
 """
 from __future__ import annotations
+import warnings
 from dataclasses import dataclass
 import numpy as np
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+# LBFGS hits max_iter=200 routinely on these high-d, small-n features; the
+# resulting decision scores still produce valid AUROC. The warnings flood
+# stderr and obscure real failures during sweep triage.
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 # Above this feature dim, fall back to RidgeClassifier (closed-form SVD).
 # LBFGS LogReg at d ≥ 5000 scales to minutes per fit; Ridge is ~30× faster
@@ -181,7 +188,7 @@ def late_fusion_within(
         return ProbeResult(task, "late_fusion", "within_trial", float("nan"),
                            len(y_train), len(y_test), seed)
     probas = []
-    for L, feats in layer_features.items():
+    for feats in layer_features.values():
         proba = _fit_predict_proba(
             feats[train_idx].astype(np.float32), y_train,
             feats[test_idx].astype(np.float32), seed,
@@ -218,17 +225,60 @@ def fit_probe_within_trial(
     test_frac: float = 0.2,
 ) -> ProbeResult:
     """80/20 random split within one trial."""
+    result, _, _ = fit_probe_within_trial_with_scores(
+        features, labels, task, layer, seed, test_frac,
+    )
+    return result
+
+
+def fit_probe_within_trial_with_scores(
+    features: np.ndarray,
+    labels: np.ndarray,
+    task: str,
+    layer: int | str,
+    seed: int = 42,
+    test_frac: float = 0.2,
+) -> tuple[ProbeResult, np.ndarray | None, np.ndarray | None]:
+    """Like ``fit_probe_within_trial`` but also returns the per-test
+    (y_test, min-max-normalized scores) so multiple per-layer fits sharing
+    the same (labels, seed, test_frac) can be averaged into a late-fusion
+    ensemble for free — no refit needed.
+
+    Returns (result, None, None) when the trial is too short or the split
+    leaves a degenerate y_train/y_test.
+    """
     if len(features) < 20:
-        return ProbeResult(task, layer, "within_trial", float("nan"),
-                           len(features), 0, seed)
+        return (
+            ProbeResult(task, layer, "within_trial", float("nan"),
+                        len(features), 0, seed),
+            None, None,
+        )
     split = train_test_split(
         features.astype(np.float32), labels,
         test_size=test_frac, stratify=labels, random_state=seed,
     )
     X_train, X_test, y_train, y_test = (np.asarray(x) for x in split)
-    auc = _fit_score(X_train, y_train, X_test, y_test, seed)
-    return ProbeResult(task, layer, "within_trial", auc,
-                       len(y_train), len(y_test), seed)
+    if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+        return (
+            ProbeResult(task, layer, "within_trial", float("nan"),
+                        len(y_train), len(y_test), seed),
+            None, None,
+        )
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+    clf = _make_classifier(X_train.shape[1], seed)
+    clf.fit(X_train_s, y_train)
+    scores = _decision_scores(clf, X_test_s)
+    auc = float(roc_auc_score(y_test, scores))
+    lo, hi = float(scores.min()), float(scores.max())
+    if hi - lo < 1e-12:
+        norm = np.full(len(scores), 0.5, dtype=float)
+    else:
+        norm = (scores - lo) / (hi - lo)
+    result = ProbeResult(task, layer, "within_trial", auc,
+                         len(y_train), len(y_test), seed)
+    return result, y_test, norm
 
 
 def fit_probe_cross_session(

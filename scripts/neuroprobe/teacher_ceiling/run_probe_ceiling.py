@@ -29,10 +29,17 @@ import csv
 import json
 import re
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.metrics import roc_auc_score
+
+# Belt + suspenders — also set in probe.py so loky workers inherit the filter
+# via re-import; this line covers warnings emitted from main-process paths.
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 from speech_decoding.whisper_ceiling.probe import (
     DEFAULT_TASKS,
@@ -42,13 +49,29 @@ from speech_decoding.whisper_ceiling.probe import (
     fit_probe_cross_session,
     fit_probe_cross_subject,
     fit_probe_within_trial,
-    late_fusion_within,
+    fit_probe_within_trial_with_scores,
     topk_layers_by_within_auroc,
 )
 
 
 def _n_jobs() -> int:
     return int(os.environ.get("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
+
+
+# Single-slot per-worker cache. With joblib loky workers persistent across
+# delayed() calls, this means each worker loads a given trial NPZ at most once
+# even when it gets assigned multiple (sid, tid, task) units in sequence.
+_WORKER_TRIAL_CACHE: dict[str, dict] = {}
+
+
+def _load_trial_in_worker(npz_path: str) -> dict:
+    cached = _WORKER_TRIAL_CACHE.get(npz_path)
+    if cached is not None:
+        return cached
+    _WORKER_TRIAL_CACHE.clear()
+    data = dict(np.load(npz_path, allow_pickle=False))
+    _WORKER_TRIAL_CACHE[npz_path] = data
+    return data
 
 NEUROPROBE_LITE_SUBJECT_TRIALS = [
     (1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
@@ -125,39 +148,75 @@ def run_within_trial(
     kept, y = labels_for_task(trial_data, task)
     if len(kept) < 20:
         return results
+    per_layer_scores: dict[int, np.ndarray] = {}
+    y_test_shared: np.ndarray | None = None
     for key in layer_keys:
         X = features_for_key(trial_data, layers, key)[kept]
-        results.append(fit_probe_within_trial(X, y, task=task, layer=key, seed=seed))
-    # Late-fusion sister (per-layer probes ensembled by mean(prob))
-    layer_feats = {L: trial_data[f"layer_{L}"][kept].astype(np.float32) for L in layers}
-    results.append(late_fusion_within(layer_feats, y, task=task, seed=seed))
+        result, y_test, norm = fit_probe_within_trial_with_scores(
+            X, y, task=task, layer=key, seed=seed,
+        )
+        results.append(result)
+        # Cache scores for the late-fusion ensemble. All single-layer fits share
+        # the same (labels, seed) stratified split, so their test slices align
+        # row-for-row and can be averaged into an ensemble with zero refits.
+        if isinstance(key, int) and y_test is not None and norm is not None:
+            per_layer_scores[key] = norm
+            y_test_shared = y_test
+    if per_layer_scores and y_test_shared is not None:
+        ensemble = np.mean(
+            np.stack(list(per_layer_scores.values()), axis=0), axis=0,
+        )
+        try:
+            lf_auc = float(roc_auc_score(y_test_shared, ensemble))
+        except ValueError:
+            lf_auc = float("nan")
+        n_test = len(y_test_shared)
+        n_train = max(0, len(y) - n_test)
+        results.append(ProbeResult(
+            task, "late_fusion", "within_trial", lf_auc, n_train, n_test, seed,
+        ))
+    else:
+        results.append(ProbeResult(
+            task, "late_fusion", "within_trial", float("nan"), 0, 0, seed,
+        ))
     return results
 
 
-def collect_features_by_trial(features_dir: Path) -> dict[tuple[int, int], dict]:
-    out = {}
+def collect_trial_paths(features_dir: Path) -> dict[tuple[int, int], str]:
+    out: dict[tuple[int, int], str] = {}
     for path in sorted(features_dir.glob("sub_*_trial*.npz")):
         m = re.match(r"sub_(\d+)_trial(\d+)\.npz", path.name)
         if not m:
             continue
         sid, tid = int(m.group(1)), int(m.group(2))
-        out[(sid, tid)] = load_trial_npz(path)
+        out[(sid, tid)] = str(path)
     return out
+
+
+def _pass1_worker(
+    sid: int, tid: int, npz_path: str, task: str,
+    layers: list[int], layer_keys: list, seed: int,
+) -> tuple[int, int, str, list[ProbeResult], float]:
+    t0 = time.time()
+    data = _load_trial_in_worker(npz_path)
+    results = run_within_trial(data, layers, task, layer_keys, seed=seed)
+    return sid, tid, task, results, time.time() - t0
 
 
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[probe] loading features from {args.features_dir}", flush=True)
-    trial_features = collect_features_by_trial(args.features_dir)
-    if not trial_features:
+    print(f"[probe] indexing features from {args.features_dir}", flush=True)
+    trial_paths = collect_trial_paths(args.features_dir)
+    if not trial_paths:
         raise SystemExit(f"no NPZ files found in {args.features_dir}")
-    print(f"[probe] loaded {len(trial_features)} trials", flush=True)
+    print(f"[probe] indexed {len(trial_paths)} trials", flush=True)
 
-    # Determine which layers are available (assume same across all trials)
-    any_data = next(iter(trial_features.values()))
-    layers = list(int(x) for x in any_data["layers"])
+    # Peek one NPZ to learn the layer list (assumed uniform across trials).
+    peek_path = next(iter(trial_paths.values()))
+    with np.load(peek_path, allow_pickle=False) as peek:
+        layers = list(int(x) for x in peek["layers"])
     print(f"[probe] hooked layers = {layers}", flush=True)
 
     base_layer_keys: list = list(layers) + ["concat_all", "mean_all"]
@@ -168,24 +227,25 @@ def main() -> None:
     rows: list[dict] = []
 
     # === WITHIN-TRIAL ===
-    # Two-pass: first run base layer + merge sweep, then identify top-3 layers
-    # per task across pooled trials and add a `concat_top_3` sister.
+    # Pass NPZ paths through the joblib closure, not the materialized feature
+    # dicts. With ~700 MB per trial × 12 trials, the previous closure was
+    # pickling ~8 GB of features into every loky worker on startup; now each
+    # worker mmaps only the trial(s) it gets assigned, cached single-slot.
     n_jobs = _n_jobs()
-    units = [(sid, tid, task) for (sid, tid) in trial_features for task in tasks]
+    units = [
+        (sid, tid, path, task)
+        for (sid, tid), path in trial_paths.items()
+        for task in tasks
+    ]
     print(
         f"[probe] PASS 1: WITHIN-TRIAL ({len(units)} trial×task units, "
         f"n_jobs={n_jobs})",
         flush=True,
     )
 
-    def _do_unit(sid, tid, task):
-        t0 = time.time()
-        data = trial_features[(sid, tid)]
-        results = run_within_trial(data, layers, task, base_layer_keys, seed=args.seed)
-        return sid, tid, task, results, time.time() - t0
-
     pass1 = Parallel(n_jobs=n_jobs, backend="loky", verbose=10)(
-        delayed(_do_unit)(sid, tid, task) for (sid, tid, task) in units
+        delayed(_pass1_worker)(sid, tid, path, task, layers, base_layer_keys, args.seed)
+        for (sid, tid, path, task) in units
     )
     assert pass1 is not None
     for sid, tid, task, results, elapsed in pass1:
@@ -201,6 +261,19 @@ def main() -> None:
                 "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
                 "seed": r.seed,
             })
+
+    # Downstream passes (top-3 concat, cross-session, cross-subject) still
+    # operate on the in-memory feature dicts. PASS 1 has finished, so loading
+    # now no longer pickles through any joblib closures.
+    print(
+        f"[probe] materializing {len(trial_paths)} trial feature dicts "
+        f"for downstream passes",
+        flush=True,
+    )
+    trial_features: dict[tuple[int, int], dict] = {
+        key: dict(np.load(path, allow_pickle=False))
+        for key, path in trial_paths.items()
+    }
 
     # Pool per-task per-layer within-trial AUROCs across trials -> pick top-3
     print(f"[probe] PASS 2: deriving top-3 layers per task and re-probing", flush=True)
