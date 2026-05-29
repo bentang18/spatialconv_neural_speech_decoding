@@ -231,6 +231,14 @@ def test_best_val_probe_callback_default_metric_name_for_regression() -> None:
     assert callback.metric_name == "val_probe_r2"
 
 
+def test_best_val_probe_callback_default_mode_is_binary_classification() -> None:
+    """S06 spec lock: default is logistic on speech-onset binary, not
+    ridge. Pins the callback default to binary_classification so that any
+    future flip to regression must be deliberate (and update S06)."""
+    callback = BestValProbeR2Callback([])
+    assert callback.metric_name == "val_probe_auroc"
+
+
 def test_best_val_probe_callback_validation_epoch_end_logs_probe_score() -> None:
     loader = _make_probe_loader(n_clips=20)
     module = _ToyLitModule(d=8, n_clips=20)

@@ -263,6 +263,9 @@ class BestValProbeR2Callback:
         encoder output. Default mean-pools the M4 tap over the time and
         parcel axes.
     mode: ``"regression"`` (r²) or ``"binary_classification"`` (AUROC).
+        **Default is binary_classification** to match S06 spec (logistic
+        regression on speech-onset binary). Pass ``mode="regression"``
+        explicitly for r²-based probes.
     metric_name: key used to log the probe score. Default matches the
         mode: ``"val_probe_r2"`` / ``"val_probe_auroc"``.
     co_save_ema_teacher: when ``True``, hooks
@@ -279,7 +282,7 @@ class BestValProbeR2Callback:
         feature_extractor: tp.Optional[
             tp.Callable[[tp.Any, dict[str, Tensor]], Tensor]
         ] = None,
-        mode: tp.Literal["regression", "binary_classification"] = "regression",
+        mode: tp.Literal["regression", "binary_classification"] = "binary_classification",
         metric_name: tp.Optional[str] = None,
         n_folds: int = DEFAULT_N_FOLDS,
         ridge_lambda: float = PROBE_RIDGE_LAMBDA,
