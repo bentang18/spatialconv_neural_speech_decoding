@@ -220,7 +220,9 @@ def main() -> None:
     print(f"[probe] hooked layers = {layers}", flush=True)
 
     base_layer_keys: list = list(layers) + ["concat_all", "mean_all"]
-    tasks = list(DEFAULT_TASKS.keys()) + ["face_num"]
+    # `face_num` is already in DEFAULT_TASKS; don't double-add (was costing
+    # ~200s of duplicate fits per trial and writing duplicate CSV rows).
+    tasks = list(DEFAULT_TASKS.keys())
     if args.tasks:
         tasks = [t for t in tasks if t in args.tasks]
 
