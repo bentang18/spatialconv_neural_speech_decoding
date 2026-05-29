@@ -229,6 +229,7 @@ def build_v14_experiment(
     # ``common`` partition + ~2GB mem, which OOM-kills any real BT data
     # prep. See submitit field defs in ``exca/slurm.py``.
     slurm_partition: str | None = None,
+    slurm_account: str | None = None,
     mem_gb: float | None = None,
     gpus_per_node: int | None = None,
     cpus_per_task: int | None = None,
@@ -521,6 +522,8 @@ def build_v14_experiment(
         infra_cfg["cluster"] = cluster
     if slurm_partition is not None:
         infra_cfg["slurm_partition"] = slurm_partition
+    if slurm_account is not None:
+        infra_cfg["slurm_account"] = slurm_account
     if mem_gb is not None:
         infra_cfg["mem_gb"] = mem_gb
     if gpus_per_node is not None:
@@ -667,6 +670,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--slurm-partition", default=None,
                    help="Slurm partition (e.g. 'scavenger-gpu', "
                         "'coganlab-gpu'). Required for real GPU runs.")
+    p.add_argument("--slurm-account", default="coganlab",
+                   help="Slurm account. Default 'coganlab' (the lab "
+                        "account ht203 is associated with). Required by "
+                        "scavenger partitions and matches the access "
+                        "list for coganlab-gpu.")
     p.add_argument("--mem-gb", type=float, default=None,
                    help="Memory per task in GB. Lite BT data prep needs "
                         "≥64; Full BT needs ≥128.")
@@ -968,7 +976,8 @@ def main(argv: list[str] | None = None) -> int:
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant}")
     if args.cluster == "slurm":
-        print(f"  slurm: partition={args.slurm_partition} mem_gb={args.mem_gb} "
+        print(f"  slurm: partition={args.slurm_partition} "
+              f"account={args.slurm_account} mem_gb={args.mem_gb} "
               f"gpus_per_node={args.gpus_per_node} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
     print(f"  precision={args.precision}")
@@ -995,6 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size, n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
         slurm_partition=args.slurm_partition,
+        slurm_account=args.slurm_account,
         mem_gb=args.mem_gb,
         gpus_per_node=args.gpus_per_node,
         cpus_per_task=args.cpus_per_task,
