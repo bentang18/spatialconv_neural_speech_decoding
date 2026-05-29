@@ -1047,13 +1047,22 @@ class V14ParcelPerceiverModel(nn.Module):
                 if subject_subtype is None:
                     sub_ids_kv = torch.zeros(B, dtype=torch.long, device=x.device)
                 else:
-                    sub_ids_kv = subject_subtype.to(torch.long).to(x.device)
+                    # Strip trailing singletons (NeuralSet collates
+                    # extractor's (1, 1) into (B, 1, 1)); see the A1
+                    # additive branch for the same contract.
+                    sst_kv: Tensor = subject_subtype
+                    while sst_kv.dim() > 1 and sst_kv.shape[-1] == 1:
+                        sst_kv = sst_kv.squeeze(-1)
+                    sub_ids_kv = sst_kv.to(torch.long).to(x.device)
                 kv_extra = kv_extra + self.subtype_embed(sub_ids_kv)
             if self.ref_embed_enabled and self.ref_embed_reuse_kv:
                 if ref_idx is None:
                     ref_ids_kv = torch.zeros(B, dtype=torch.long, device=x.device)
                 else:
-                    ref_ids_kv = ref_idx.to(torch.long).to(x.device)
+                    ri_kv: Tensor = ref_idx
+                    while ri_kv.dim() > 1 and ri_kv.shape[-1] == 1:
+                        ri_kv = ri_kv.squeeze(-1)
+                    ref_ids_kv = ri_kv.to(torch.long).to(x.device)
                 kv_extra = kv_extra + self.ref_embed(ref_ids_kv)
             # Broadcast (B, d) → (B, T_p, C·F_p, d) → (B·T_p, C·F_p, d).
             kv_extra_bt = (
