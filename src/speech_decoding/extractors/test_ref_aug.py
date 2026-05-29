@@ -126,13 +126,16 @@ def test_draw_ref_idx_raises_when_event_has_no_timeline() -> None:
         draw_ref_idx(_NoTimelineEvent(), 0.0, 1.0, seed=0)
 
 
-def test_ref_idx_extractor_returns_zero_d_timed_array() -> None:
-    """RefIdxExtractor emits per-event ref_idx as a 1-element TimedArray."""
+def test_ref_idx_extractor_returns_channel_time_timed_array() -> None:
+    """RefIdxExtractor emits per-event ref_idx as a (1, 1) TimedArray —
+    NeuralSet's BaseExtractor needs at least one non-time axis so the
+    missing-default placeholder (``shape = tensor.shape[:-1]``) is a
+    non-empty tuple."""
     extractor = RefIdxExtractor(event_types="Ieeg", seed=0)
     out = extractor._get_timed_array(_FakeEvent("tl-0"), start=0.0, duration=1.0)
     assert isinstance(out, TimedArray)
     arr = np.asarray(out.data)
-    assert arr.shape == (1,)
+    assert arr.shape == (1, 1)
     assert arr.dtype == np.int64
     assert 0 <= int(arr.item()) < 3
 

@@ -155,7 +155,13 @@ class RefIdxExtractor(CARIeegExtractor):
             event, start, duration,
             seed=self.seed, ref_modes=tuple(self.ref_modes),
         )
-        data = np.asarray([ref_idx], dtype=np.int64)
+        # Shape (1, 1) = (1 channel, 1 sample): NeuralSet's BaseExtractor
+        # computes ``shape = tensor.shape[:-1]`` for the missing-default
+        # placeholder; a 1-d (time-only) array makes that slice empty and
+        # crashes ``torch.zeros(*shape)`` during the zero-duration prepare
+        # call. Keeping a single channel axis preserves the (B, 1) scalar
+        # semantics downstream while satisfying NeuralSet's invariant.
+        data = np.asarray([[ref_idx]], dtype=np.int64)
         return TimedArray(
             frequency=1.0 / float(duration),
             start=start,
