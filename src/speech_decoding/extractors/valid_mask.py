@@ -13,8 +13,9 @@ tensor are True and the rest are False. The ``unknown_label_policy`` field
 mirrors :class:`V14DKHardSupportExtractor` so that filtering decisions stay
 aligned between mask + support + electrode-tokens extractors.
 
-Cohort C_MAX default = 120 = Neuroprobe-Lite electrode cap
-(Wang 2024 / Zahorodnii 2026 paper p.6).
+Cohort C_MAX default = 384 (CQ12 / B14 lock 2026-05-23 PM: covers
+D-cohort max 366, AJILE12 ~200, BT 256, SWEC 128 with 18-electrode
+headroom past D-cohort max). Raises ValueError if any subject exceeds.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ class ElectrodeValidMask(BaseStatic):
 
     event_types: tp.Literal["Ieeg"] = "Ieeg"
     bt_root: str
-    c_max: int = 120
+    c_max: int = 384
     unknown_label_policy: tp.Literal["raise", "skip"] = "raise"
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS
 

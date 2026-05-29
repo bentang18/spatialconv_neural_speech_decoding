@@ -38,7 +38,11 @@ class BrainModule(pl.LightningModule):
     def forward(self, batch):
         if isinstance(self.x_name, str):
             return self.model(batch.data[self.x_name])
-        return self.model(*(batch.data[name] for name in self.x_name))
+        # Tuple ``x_name`` dispatches by keyword so per-clip conditioning
+        # kwargs (``subject_subtype`` / ``ref_idx`` / ``lambda_anat``) can
+        # be marked keyword-only on the inner forward without colliding
+        # with the positional order.
+        return self.model(**{name: batch.data[name] for name in self.x_name})
 
     def _target(self, batch) -> torch.Tensor:
         target = batch.data[self.y_name]

@@ -1,4 +1,12 @@
-"""V14 per-electrode atlas-token metadata extractor.
+"""V14 per-electrode atlas-token metadata extractor — BNA-soft (P1 sister).
+
+NOT the v14 default. The v14 default routing pivoted to BT-DK one-hot on
+2026-05-13 (see ``memory/project_v14_dk_first_pass_2026_05_13.md``). This
+module is kept alive as the seed for the BNA-soft P1 sister ablation, which
+is gated on Chris Wang's input (per MEMORY.md "BNA-soft P1-gated-on-Chris").
+When that gate opens, this extractor is the entry point for the comparison
+arm; until then, the active routing path lives in
+``extractors/dk_support.py`` (``V14DKHardSupportExtractor``).
 
 For each Ieeg event emit a `(n_channels, 5)` tensor with columns:
 

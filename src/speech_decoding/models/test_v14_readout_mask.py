@@ -1,17 +1,19 @@
-"""DETR-readout memory-padding-mask tests.
+"""Readout memory-padding-mask tests.
 
-Canonical DETR (Carion 2020 §3.3) passes ``memory_key_padding_mask`` into the
-decoder so object queries cannot attend to padded encoder features. The v14
-analog: parcel slots with no electrode coverage for this subject are "padded
-memory" — the task query must not attend to them.
+Replaces the original DETR-style ``V14ClassifierHead`` mask tests after T1.10:
+the readout is now a frozen ``V14ParcelCollapsePMA`` (k=1 over the K*M parcel
+axis, per timestep) followed by ``V14Phase4FlatHead``. The mask semantics
+carry over — parcel slots with no electrode coverage in this subject are
+padded memory and must not be attended to by the PMA query.
 
-These tests pin three behaviors:
+Pins:
 
-1. ``V14ClassifierHead.forward(..., latent_valid=mask)`` is invariant to the
-   activations of latent rows marked invalid.
-2. ``latent_valid=None`` reproduces the pre-mask behavior (backward compat).
-3. ``V14ParcelPerceiverWithHead`` computes ``latent_valid`` from ``support``
-   and ``valid_mask`` and forwards it to the head.
+1. ``V14ParcelCollapsePMA.forward(..., latent_valid=mask)`` is invariant to
+   the activations of latent rows marked invalid.
+2. ``latent_valid=None`` reduces to plain PMA (perturbing any latent affects
+   the pooled output).
+3. The wrapper computes ``latent_valid`` from ``support`` and ``valid_mask``
+   and forwards it to the PMA.
 """
 
 from __future__ import annotations
@@ -19,9 +21,8 @@ from __future__ import annotations
 import torch
 
 from speech_decoding.models.v14_encoder import (
-    V14ClassifierHead,
+    V14ParcelCollapsePMA,
     V14ParcelPerceiver,
-    V14ParcelPerceiverModel,
     V14ParcelPerceiverWithHead,
 )
 
@@ -31,16 +32,16 @@ N_CLASSES = 3
 N_HEADS = 4
 
 
-def test_classifier_head_is_invariant_to_perturbations_of_invalid_latents() -> None:
+def test_parcel_collapse_pma_is_invariant_to_perturbations_of_invalid_latents() -> None:
     """Standard memory-padding semantics: perturbing invalid latent rows must
-    not change the readout output. Tests the head in isolation with a hand-built
-    latent tensor and validity mask."""
+    not change the PMA output. ``freeze=False`` so we can train if needed in
+    a follow-up; the freeze-by-default smoke is exercised separately."""
     torch.manual_seed(0)
-    head = V14ClassifierHead(d_model=D_MODEL, n_classes=N_CLASSES, n_heads=N_HEADS)
-    head.eval()
+    pma = V14ParcelCollapsePMA(d_model=D_MODEL, n_heads=N_HEADS, freeze=False)
+    pma.eval()
 
-    B, L = 2, 8
-    latents = torch.randn(B, L, D_MODEL)
+    B, L, T = 2, 8, 4
+    latents = torch.randn(B, L, T, D_MODEL)
     latent_valid = torch.tensor(
         [
             [True, True, False, False, True, True, False, True],
@@ -48,53 +49,51 @@ def test_classifier_head_is_invariant_to_perturbations_of_invalid_latents() -> N
         ]
     )
 
-    out_ref = head(latents, latent_valid=latent_valid)
+    with torch.no_grad():
+        out_ref = pma(latents, latent_valid=latent_valid)
 
-    perturbed = latents.clone()
-    invalid = ~latent_valid                                 # (B, L)
-    n_invalid = int(invalid.sum().item())
-    perturbed[invalid] = torch.randn(n_invalid, D_MODEL) * 100.0
-
-    out_perturbed = head(perturbed, latent_valid=latent_valid)
+        perturbed = latents.clone()
+        for b in range(B):
+            invalid_rows = (~latent_valid[b]).nonzero(as_tuple=False).flatten()
+            for r in invalid_rows.tolist():
+                perturbed[b, r] = torch.randn(T, D_MODEL) * 100.0
+        out_perturbed = pma(perturbed, latent_valid=latent_valid)
 
     assert torch.allclose(out_ref, out_perturbed, atol=1e-5), (
-        "head output must be invariant to perturbations of invalid latent rows"
+        "PMA output must be invariant to perturbations of invalid latent rows"
     )
 
 
-def test_classifier_head_defaults_to_no_mask_for_backward_compat() -> None:
-    """When ``latent_valid`` is omitted, the head reduces to its pre-mask form:
-    perturbing any latent row changes the output. Ensures existing call sites
-    that don't pass the mask still see the original behavior."""
+def test_parcel_collapse_pma_unmasked_attends_to_every_position() -> None:
+    """Backward-compat: when ``latent_valid`` is omitted, every position
+    contributes to the pooled output — perturbing any row changes it."""
     torch.manual_seed(0)
-    head = V14ClassifierHead(d_model=D_MODEL, n_classes=N_CLASSES, n_heads=N_HEADS)
-    head.eval()
+    pma = V14ParcelCollapsePMA(d_model=D_MODEL, n_heads=N_HEADS, freeze=False)
+    pma.eval()
 
-    B, L = 1, 4
-    latents = torch.randn(B, L, D_MODEL)
-    out_ref = head(latents)
+    B, L, T = 1, 4, 3
+    latents = torch.randn(B, L, T, D_MODEL)
 
-    perturbed = latents.clone()
-    perturbed[0, 0, :] = perturbed[0, 0, :] + torch.randn(D_MODEL) * 10.0
-    out_perturbed = head(perturbed)
+    with torch.no_grad():
+        out_ref = pma(latents)
+        perturbed = latents.clone()
+        perturbed[0, 0] = perturbed[0, 0] + torch.randn(T, D_MODEL) * 10.0
+        out_perturbed = pma(perturbed)
 
     assert not torch.allclose(out_ref, out_perturbed, atol=1e-5), (
-        "without a mask, perturbing any latent must change the head output"
+        "without a mask, perturbing any latent must change the PMA output"
     )
 
 
 def test_wrapper_passes_latent_valid_computed_from_support_and_mask() -> None:
     """Integration: the wrapper computes ``latent_valid`` from ``support`` and
-    ``valid_mask`` and forwards it to the head. Captured by monkey-patching the
-    head's forward and inspecting kwargs.
+    ``valid_mask`` and forwards it to the PMA. Captured by monkey-patching the
+    PMA's forward and inspecting kwargs.
 
     Setup: B=1, C=4, K=3 parcels, M=2 sub-slots → L=6 latents.
-      * electrode 0 → parcel 0, electrode 1 → parcel 1, electrodes 2,3 padded
-        (valid_mask all-False).
-      * Parcel 2 has no coverage anywhere → both of its sub-slots invalid.
-      * Padded electrodes 2,3 have all-zero support rows by construction.
-    Expected latent_valid: parcel 0 valid (×M), parcel 1 valid (×M), parcel 2
-    invalid (×M) → (B, 6) = [[T,T, T,T, F,F]].
+      * electrode 0 → parcel 0, electrode 1 → parcel 1, electrodes 2,3 padded.
+      * Parcel 2 has no coverage anywhere → both sub-slots invalid.
+    Expected latent_valid: [[T,T, T,T, F,F]].
     """
     torch.manual_seed(0)
     cfg = V14ParcelPerceiver(
@@ -106,14 +105,14 @@ def test_wrapper_passes_latent_valid_computed_from_support_and_mask() -> None:
     model.eval()
 
     captured: dict[str, torch.Tensor] = {}
-    orig_head_forward = model.head.forward
+    orig_pma_forward = model.parcel_pma.forward
 
     def _capturing_forward(latents, latent_valid=None):
         if latent_valid is not None:
             captured["latent_valid"] = latent_valid.detach().clone()
-        return orig_head_forward(latents, latent_valid=latent_valid)
+        return orig_pma_forward(latents, latent_valid=latent_valid)
 
-    model.head.forward = _capturing_forward  # type: ignore[assignment]
+    model.parcel_pma.forward = _capturing_forward  # type: ignore[assignment]
 
     B, C, T, F = 1, 4, 5, 3
     electrodes = torch.randn(B, C, T, F)
@@ -124,7 +123,7 @@ def test_wrapper_passes_latent_valid_computed_from_support_and_mask() -> None:
 
     _ = model(electrodes, support, valid_mask)
 
-    assert "latent_valid" in captured, "wrapper must pass latent_valid to head"
+    assert "latent_valid" in captured, "wrapper must pass latent_valid to PMA"
     assert captured["latent_valid"].shape == (B, 6)
     expected = torch.tensor([[True, True, True, True, False, False]])
     assert torch.equal(captured["latent_valid"], expected), (
@@ -132,11 +131,10 @@ def test_wrapper_passes_latent_valid_computed_from_support_and_mask() -> None:
     )
 
 
-def test_wrapper_passes_no_mask_when_valid_mask_absent() -> None:
-    """If ``valid_mask`` is not provided, the wrapper falls back to support-only
-    coverage and still passes a ``latent_valid`` (every parcel with any nonzero
-    support row is valid). This keeps the readout consistent even when the
-    caller — e.g. legacy tests — omits ``valid_mask``."""
+def test_wrapper_passes_latent_valid_when_valid_mask_absent() -> None:
+    """If ``valid_mask`` is not provided, the wrapper falls back to
+    support-only coverage and still passes a ``latent_valid`` (every parcel
+    with any nonzero support row is valid)."""
     torch.manual_seed(0)
     cfg = V14ParcelPerceiver(
         n_freq_bins=3, n_time_bins=5, k_parcels=3,
@@ -146,22 +144,21 @@ def test_wrapper_passes_no_mask_when_valid_mask_absent() -> None:
     model.eval()
 
     captured: dict[str, torch.Tensor] = {}
-    orig_head_forward = model.head.forward
+    orig_pma_forward = model.parcel_pma.forward
 
     def _capturing_forward(latents, latent_valid=None):
         captured["latent_valid"] = (
             latent_valid.detach().clone() if latent_valid is not None else None
         )
-        return orig_head_forward(latents, latent_valid=latent_valid)
+        return orig_pma_forward(latents, latent_valid=latent_valid)
 
-    model.head.forward = _capturing_forward  # type: ignore[assignment]
+    model.parcel_pma.forward = _capturing_forward  # type: ignore[assignment]
 
     B, C, T, F = 1, 3, 5, 3
     electrodes = torch.randn(B, C, T, F)
     support = torch.zeros(B, C, 3)
     support[0, 0, 0] = 1.0
     support[0, 1, 1] = 1.0
-    # parcel 2 has no coverage; valid_mask omitted.
 
     _ = model(electrodes, support)
 

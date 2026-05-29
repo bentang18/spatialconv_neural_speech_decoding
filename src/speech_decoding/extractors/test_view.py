@@ -1,11 +1,13 @@
-"""Tests for the v14 I2L log-STFT view extractor.
+"""Tests for the v14 I2 STFT view extractor (5/25 default: abs magnitude).
 
 Contract:
 - Emit ``(C, F_bin=38, T_bin=17)`` per Ieeg trigger window, NeuralSet time-last
   (``frequency = T_bin / duration = 17 Hz`` for a 1-s window @ 2048 Hz).
-- Byte parity with upstream ``preprocess_stft(..., "stft_abs")`` + log(x + eps),
-  matching the linear-baseline STFT spec from Neuroprobe Section D
-  (nperseg=512, poverlap=0.75, hann, 0-150 Hz, torch.stft center=True).
+- Default ``apply_log=False`` → byte parity with upstream
+  ``preprocess_stft(..., "stft_abs")``. ``apply_log=True`` recovers the
+  pre-5/25 ``log(|X| + eps)`` behavior.
+- STFT spec from Neuroprobe Section D: nperseg=512, poverlap=0.75, hann,
+  0-150 Hz, torch.stft center=True.
 - Inherit ``CARIeegExtractor`` so v14's R2 shaftCAR + F1 notch + N1 z-score
   preprocessing chain stays in front of the STFT.
 """
@@ -49,8 +51,9 @@ def test_log_stft_view_accepts_v14_recipe_kwargs() -> None:
 
 
 def test_log_stft_view_helper_matches_upstream_preprocess_stft() -> None:
-    """The internal STFT helper produces byte-exact agreement with the upstream
-    ``preprocess_stft(..., 'stft_abs')`` then ``log(x + eps)`` recipe."""
+    """Default (``apply_log=False``) yields byte-exact ``|X|`` per upstream
+    ``preprocess_stft(..., 'stft_abs')``. ``apply_log=True`` adds
+    ``log(|X| + eps)`` byte-exact."""
     from speech_decoding.extractors.view import _log_stft_view
 
     torch.manual_seed(0)
@@ -59,16 +62,6 @@ def test_log_stft_view_helper_matches_upstream_preprocess_stft() -> None:
     n_channels = 3
     n_samples = int(sample_rate * duration_s)
     waveform = torch.randn(n_channels, n_samples)
-
-    out = _log_stft_view(
-        waveform,
-        sample_rate=sample_rate,
-        nperseg=512,
-        poverlap=0.75,
-        min_freq_hz=0.0,
-        max_freq_hz=150.0,
-        log_eps=1e-6,
-    )
 
     nperseg = 512
     poverlap = 0.75
@@ -88,9 +81,31 @@ def test_log_stft_view_helper_matches_upstream_preprocess_stft() -> None:
     freqs = torch.fft.rfftfreq(nperseg, d=1.0 / sample_rate)
     keep = (freqs >= 0.0) & (freqs <= 150.0)
     x_filtered = x_complex[:, keep]
-    expected = torch.log(torch.abs(x_filtered) + 1e-6)
 
-    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    out_abs = _log_stft_view(
+        waveform,
+        sample_rate=sample_rate,
+        nperseg=512,
+        poverlap=0.75,
+        min_freq_hz=0.0,
+        max_freq_hz=150.0,
+        log_eps=1e-6,
+    )
+    torch.testing.assert_close(out_abs, torch.abs(x_filtered), rtol=0, atol=0)
+
+    out_log = _log_stft_view(
+        waveform,
+        sample_rate=sample_rate,
+        nperseg=512,
+        poverlap=0.75,
+        min_freq_hz=0.0,
+        max_freq_hz=150.0,
+        log_eps=1e-6,
+        apply_log=True,
+    )
+    torch.testing.assert_close(
+        out_log, torch.log(torch.abs(x_filtered) + 1e-6), rtol=0, atol=0,
+    )
 
 
 def test_log_stft_view_helper_accepts_probe_window_shorter_than_nperseg() -> None:
@@ -233,3 +248,126 @@ def test_log_stft_view_get_timed_array_preserves_log_stft_values(monkeypatch) ->
         log_eps=1e-6,
     )
     np.testing.assert_allclose(out.data, expected.numpy(), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# Multi-STFT view (T1.5)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_stft_bin_centers_span_1hz_to_813hz() -> None:
+    """30 log ⅓-octave bins from 2^0=1 Hz to 2^(29/3)≈813 Hz (5/22 spec)."""
+    from speech_decoding.extractors.view import multi_stft_bin_centers_hz
+
+    centers = multi_stft_bin_centers_hz()
+    assert centers.shape == (30,)
+    assert abs(centers[0].item() - 1.0) < 1e-6
+    assert abs(centers[-1].item() - 2 ** (29 / 3)) < 1e-3
+    # Monotonic increasing.
+    assert (centers[1:] > centers[:-1]).all()
+
+
+def test_multi_stft_valid_bin_mask_swec_passband_22_bins() -> None:
+    """5/19 SWEC audit (0.5–120 Hz): low-edge-overlap criterion gives the
+    SWEC-trainable bins — bins k=21 (center 128 Hz) and k=22 (center 161 Hz)
+    sit just inside the upper edge by their half-octave skirts."""
+    from speech_decoding.extractors.view import multi_stft_valid_bin_mask
+
+    mask = multi_stft_valid_bin_mask(passband_low_hz=0.5, passband_high_hz=120.0)
+    assert mask.shape == (30,)
+    # The exact cutoff hovers around k=21 / k=22 depending on the threshold
+    # convention. Either of these is acceptable; the spec gives k0–k21.
+    n_valid = int(mask.sum())
+    assert n_valid in (22, 23), f"expected 22–23 valid bins, got {n_valid}"
+    assert mask[:22].all(), "first 22 bins must be valid"
+    assert not mask[25:].any(), "bins 25+ must be invalid for a 120 Hz cap"
+
+
+def test_multi_stft_view_shape_is_30_freq_9_time_at_1s_2048hz() -> None:
+    """FE-01 (B20 v4 lock 2026-05-24): Common hop=256 @ 2048 Hz with
+    Nperseg ∈ {1024, 512, 256} and 1-s input yields 9 frames at 8 Hz frame rate
+    (1 + 2048/256 with center=True padding). Filterbank flattens to 30 output
+    bins. Previous default hop=128 (14.7 Hz, 17 frames) is retired."""
+    from speech_decoding.extractors.view import (
+        MULTI_STFT_ROUTING,
+        _multi_stft_view,
+    )
+
+    waveform = torch.zeros(4, 2048)
+    out = _multi_stft_view(
+        waveform,
+        sample_rate=2048,
+        hop_length=256,
+        nperseg_low=1024,
+        nperseg_mid=512,
+        nperseg_hi=256,
+        n_bins=30,
+        f0_hz=1.0,
+        octave_step=1.0 / 3.0,
+        half_bw_octaves=0.5,
+        routing=MULTI_STFT_ROUTING,
+        log_eps=1e-6,
+    )
+    assert out.shape == (4, 30, 9)
+
+
+def test_multi_stft_view_routes_tone_to_correct_band() -> None:
+    """A pure 100-Hz tone must peak in a filterbank bin centered near 100 Hz
+    (k ≈ 20, center ≈ 101.6 Hz). This bin is routed from STFT_mid per the
+    5/22 routing — implicitly validates the cross-STFT plumbing."""
+    from speech_decoding.extractors.view import (
+        MULTI_STFT_ROUTING,
+        _multi_stft_view,
+        multi_stft_bin_centers_hz,
+    )
+
+    sr = 2048
+    t = torch.arange(sr).float() / sr
+    tone_100hz = torch.sin(2 * torch.pi * 100.0 * t).unsqueeze(0)  # (1, 2048)
+    out = _multi_stft_view(
+        tone_100hz,
+        sample_rate=sr,
+        hop_length=256,
+        nperseg_low=1024,
+        nperseg_mid=512,
+        nperseg_hi=256,
+        n_bins=30,
+        f0_hz=1.0,
+        octave_step=1.0 / 3.0,
+        half_bw_octaves=0.5,
+        routing=MULTI_STFT_ROUTING,
+        log_eps=1e-6,
+    )
+    centers = multi_stft_bin_centers_hz()
+    peak_bin = int(out.mean(dim=-1)[0].argmax().item())
+    assert abs(centers[peak_bin].item() - 100.0) < 20.0, (
+        f"100 Hz tone peaked at bin {peak_bin} (center {centers[peak_bin].item():.1f} Hz)"
+    )
+
+
+def test_multi_stft_view_inherits_car_ieeg_extractor() -> None:
+    """MultiStftView keeps the v14 CAR/notch/scaler chain (CARIeegExtractor)."""
+    from speech_decoding.extractors.reference import CARIeegExtractor
+    from speech_decoding.extractors.view import MultiStftView
+
+    assert issubclass(MultiStftView, CARIeegExtractor)
+
+
+def test_multi_stft_view_accepts_v14_recipe_kwargs() -> None:
+    """Constructor accepts the v14 preprocessing chain alongside Multi-STFT params."""
+    from speech_decoding.extractors.view import MultiStftView
+
+    view = MultiStftView(
+        event_types="Ieeg",
+        car="shaft",
+        notch_filter=60.0,
+        scaler="StandardScaler",
+        hop_length=256,
+        nperseg_low=1024,
+        nperseg_mid=512,
+        nperseg_hi=256,
+    )
+    assert view.car == "shaft"
+    assert view.hop_length == 256
+    assert view.nperseg_low == 1024
+    assert view.n_fbank_bins == 30

@@ -4,6 +4,18 @@ The NeuroAI docs advertise `Wang2024Treebank`, but the installable
 `neuralfetch==0.1.0` catalog does not ship it yet. This local Study preserves the
 public NeuroAI API shape (`ns.Study(name="Wang2024Treebank", ...)`) while keeping
 raw h5 loading behind NeuralSet's `SpecialLoader`.
+
+Collision policy (see CLAUDE.md §Environment "Wang2024Treebank upgrade-path"):
+NeuralSet routes ``ns.Study(name="X", ...)`` through a Pydantic discriminated
+union keyed off the implementation class's ``__name__``. That makes the class
+name part of the public API — we cannot rename to a private class and keep the
+public dispatch working. Instead, we rely on NeuralSet's own
+``__init_subclass__`` collision check: if upstream NeuralFetch ever ships its
+own ``Wang2024Treebank``, whichever module imports second will raise
+``RuntimeError("Study name collision: 'Wang2024Treebank' is already
+registered ...")``. NeuralSet ships its own test for that mechanism — we
+don't duplicate it here because exercising the registry on the live module
+pollutes the Pydantic discriminated-union state for sibling tests.
 """
 
 from __future__ import annotations

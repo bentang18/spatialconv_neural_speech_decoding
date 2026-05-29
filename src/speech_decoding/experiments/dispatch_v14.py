@@ -13,11 +13,14 @@ Smoke-test (laptop, no BT data):
 
     .venv/bin/python -m speech_decoding.experiments.dispatch_v14 --dry-run
 
-Default electrode-tokens extractor is :class:`LogStftView` (N1 × R2 × I2L × F1),
-default support is :class:`V14DKHardSupportExtractor` (K=80 DK, ``c_max=120``
-padded), default valid-mask is :class:`ElectrodeValidMask` (``c_max=120``).
-Caller can pass ``electrode_tokens_extractor=...`` to override the default
-(e.g. for the P2 defensive sister run using the linear-baseline recipe).
+Default electrode-tokens extractor is :class:`LogStftView` with
+``apply_log=False`` (N1 × R2 × I2 × F1) — 5/25 swap from log to abs
+magnitude. Set ``apply_log=True`` to recover the pre-5/25 ``I2L`` behavior
+as the F-log-amplitude sister cell. Default support is
+:class:`V14DKHardSupportExtractor` (K=80 DK, ``c_max=384`` padded), default
+valid-mask is :class:`ElectrodeValidMask` (``c_max=384``). Caller can pass
+``electrode_tokens_extractor=...`` to override the default (e.g. for the
+P2 defensive sister run using the linear-baseline recipe).
 """
 
 from __future__ import annotations
@@ -32,6 +35,15 @@ import neuralset as ns
 import speech_decoding.models  # noqa: F401  # registers V14ParcelPerceiver with BaseModelConfig
 from speech_decoding.experiments import Data, Experiment
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
+from speech_decoding.extractors.ref_aug import (
+    REF_MODES,
+    RefAugMultiStftView,
+    RefIdxExtractor,
+)
+from speech_decoding.extractors.subtype_meta import (
+    LambdaAnatExtractor,
+    SubjectSubtypeExtractor,
+)
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import LogStftView
 from speech_decoding.studies.braintreebank.anatomy import (
@@ -43,11 +55,16 @@ from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 from speech_decoding.studies.braintreebank.word_events import BTWordEvents
 
 
-# First-pass defaults, locked in the encoder design memo.
-DEFAULT_D_MODEL = 128
+# v4 amendment defaults (5/19 §3) + B28 (5/27 PM) + B29 Item 13 (5/27 PM-late):
+# d=256, heads=8, depth=6, ~14.235M params at K=80, M=1 (B29 default), N=6,
+# 1 cross-attn (B28 default). Sister R-m4-slots flips m_sub_slots back to 4
+# via dispatch.
+DEFAULT_D_MODEL = 256
 DEFAULT_DEPTH = 6
-DEFAULT_N_HEADS = 4
-DEFAULT_M_SUB_SLOTS = 4
+DEFAULT_N_HEADS = 8
+# B29 Item 13 lock 2026-05-27 PM-late: M=1 default (was 4). Sister
+# R-m4-slots P0 flips via dispatch.
+DEFAULT_M_SUB_SLOTS = 1
 DEFAULT_K_PARCELS = len(V14_DK_PARCEL_LABELS)  # 80
 DEFAULT_N_FREQ_BINS = 38   # ≤150 Hz with the locked STFT nperseg=512 @ 2 kHz
 DEFAULT_N_TIME_BINS = 17   # 1-second window with overlap=0.75
@@ -61,11 +78,105 @@ DEFAULT_TASK = "speech"
 DEFAULT_EVAL_MODE = "CrossSession"
 DEFAULT_TEST_SUBJECT_ID = 2
 DEFAULT_TEST_TRIAL_ID = 4
-DEFAULT_C_MAX = 256  # BT raw electrode max — Wang2024Treebank emits full set,
-                     # the NEUROPROBE_LITE_ELECTRODES filter is not yet a chain
-                     # step (TODO: add as EventsTransform). 120 was the Lite
-                     # cap which assumed upstream filtering; un-filtered BT
-                     # subjects can carry 130-200+ electrodes.
+DEFAULT_C_MAX = 384  # Locked 2026-05-23 PM per CQ12/B14 close. Covers all four
+                     # Phase-1 corpora: D-cohort max=366 (n=128 manifest),
+                     # AJILE12 max≈200 (146 surface + ~50 depth per Peterson
+                     # 2022), BT max=256 (Wang2024Treebank raw), SWEC max=128.
+                     # ValueError already raised in dk_support.py, view.py,
+                     # valid_mask.py if any subject's n_real > c_max.
+
+# MASK-01 per-corpus mains-notch field (v14_implementation_fix_list.md §A.3).
+# Lifted from the formerly hardcoded `notch_filter=60.0`. SWEC pretrain (CH
+# site) MUST pass `mains_notch_hz=50.0`; BT / D-cohort / AJILE12 (US sites)
+# default to 60.0. Per-corpus call-out also propagated to
+# training_recipe.md §2 and v14_blockers.md.
+DEFAULT_MAINS_NOTCH_HZ = 60.0
+MAINS_NOTCH_BY_CORPUS: dict[str, float] = {
+    "braintreebank": 60.0,
+    "wang2024treebank": 60.0,
+    "d_cohort": 60.0,
+    "cogan_dcohort": 60.0,
+    "ajile12": 60.0,
+    "swec": 50.0,
+}
+
+# B28 DKoleo demotion 2026-05-27 PM (B28 Item 1) + B29 sister-set
+# expansion 2026-05-27 PM-late: DKoleo @ M4 is OFF by default; the four
+# modes select which collapse-prevention sister arms the loss.
+#
+#   * ``off`` (default) — pure 4-term B28 loss; no DKoleo arm at all.
+#   * ``intra_clip_slots`` — B21-original per-clip × 80 slots (was 320
+#     under M=4) unit, kept as the falsifier sister ``R-dkoleo-intra-clip-slots``.
+#   * ``batch_cls_unit`` — DINOv2-faithful per-batch × CLS-analog
+#     (utterance PMA-pooled vectors) unit (``R-dkoleo-batch-cls-unit``).
+#   * ``vicreg_slot_variance`` — per-dim variance hinge per VICReg
+#     (Bardes 2022), gated by MON-SLOT-REDUNDANCY's diag-zeroed mean
+#     threshold (``R-vicreg-slot-variance``).
+#
+# Pre-B29 alias: ``batch_cls`` is accepted and silently maps to
+# ``batch_cls_unit`` for back-compat with the 2026-05-27 PM (pre-late)
+# dispatch surface. The composer in ``ssl/total_loss.py`` applies the
+# locked ``W_DKOLEO_M4=0.1`` weight when a tensor is supplied; the unit
+# choice is made upstream of the composer.
+DKOLEO_MODES: tuple[str, ...] = (
+    "off", "intra_clip_slots", "batch_cls_unit", "vicreg_slot_variance",
+)
+_DKOLEO_MODE_ALIASES: dict[str, str] = {"batch_cls": "batch_cls_unit"}
+DEFAULT_DKOLEO_MODE: str = "off"
+
+# B29 Item 11 lock 2026-05-27 PM-late: subtype embed vocab choice.
+SUBTYPE_EMBED_VOCABS: tuple[str, ...] = ("binary", "three_way")
+DEFAULT_SUBTYPE_EMBED_VOCAB: str = "binary"
+
+# B29 Item 14 lock 2026-05-27 PM-late + MoE-FFN audit 2026-05-28: dense
+# FFN preserved (default); ``soft_moe_4`` is the P2-if-budget sister
+# pending a separate ``models/soft_moe.py`` build (Puigcerver 2024).
+FFN_VARIANTS: tuple[str, ...] = ("dense", "soft_moe_4")
+DEFAULT_FFN_VARIANT: str = "dense"
+
+# B29 phase-mode lock 2026-05-27 PM-late: single joint phase replaces
+# the split P1/P2 path. Sister ``R-keep-phase-split`` P0 holds the old
+# 2-phase machinery behind the dispatch flag.
+PHASE_MODES: tuple[str, ...] = ("joint_b29", "split_p1_p2")
+DEFAULT_PHASE_MODE: str = "joint_b29"
+
+# B28 anatomy-bias warmup (5/27 PM) → B29 per-clip gate (5/27 PM-late)
+# supersession: default uses per-clip metadata to gate the bias;
+# sisters reinstate the step-time schedules.
+ANATOMY_BIAS_MODES: tuple[str, ...] = (
+    "per_clip_gate_b29",  # B29 default
+    "warmup_b28",         # B28 step warmup over 25%+25%
+    "step_b19",           # B19 instant ON at P2 step 0
+    "on_from_p1",         # always ON from P1 step 0
+)
+DEFAULT_ANATOMY_BIAS_MODE: str = "per_clip_gate_b29"
+
+# B29 Item 5 corpus sampler-weight (α-hierarchical). 0.3 = the B29 lock
+# default; sisters sweep α via dispatch.
+DEFAULT_REF_OPERATOR_ALPHA: float = 0.3
+
+# B29 corpus mix (HB02 doc-quality fix 2026-05-28): normalize the B29
+# share-table headline (SWEC 35 / AJILE12 22 / D 18 / BT 12 — sums to
+# 87) against per-corpus vb_eh totals. The HB02 memo flagged that the
+# headline does not sum to 1.0; we land the normalized default so
+# downstream code can assert sum == 1.0 ± 1e-4. When wiring against
+# actual vb_eh totals, override via the ``corpus_mix`` dispatch kwarg.
+DEFAULT_CORPUS_MIX: dict[str, float] = {
+    "swec": 35.0 / 87.0,
+    "ajile12": 22.0 / 87.0,
+    "d_cohort": 18.0 / 87.0,
+    "braintreebank": 12.0 / 87.0,
+}
+
+# B29 AJILE12 inclusion: re-included after being dropped in earlier
+# memos (sensor-gap was reversed same-day per Agent 2's
+# Charmander/DIVER-1 evidence).
+DEFAULT_INCLUDE_AJILE12: bool = True
+
+
+def _validate_choice(name: str, value: str, choices: tuple[str, ...]) -> None:
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {choices}; got {value!r}")
 
 
 def build_v14_experiment(
@@ -78,6 +189,7 @@ def build_v14_experiment(
     test_trial_id: int = DEFAULT_TEST_TRIAL_ID,
     binary_tasks: bool = True,
     electrode_tokens_extractor: tp.Any | None = None,
+    mains_notch_hz: float = DEFAULT_MAINS_NOTCH_HZ,
     eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
@@ -91,12 +203,39 @@ def build_v14_experiment(
     exca_folder: str | None = None,
     cluster: str | None = None,
     fast_dev_run: bool | int = False,
+    # B28 DKoleo demotion 2026-05-27 PM: select the DKoleo @ M4 unit
+    # (or disable). Plumbed onto the brain-model config so the SSL
+    # training loop sees it; the downstream Phase-4 path treats it as
+    # informational.
+    dkoleo_mode: str = DEFAULT_DKOLEO_MODE,
+    # B28 cross-attn collapse 2026-05-27 PM: ``[0]`` Perceiver IO default,
+    # ``[0, 3]`` opt-in via ``R-perceiver-original-2-cross-attns`` sister.
+    cross_attn_positions: list[int] | None = None,
+    # B29 Item 11 + 5/28 PM precedent-audit flip 2026-05-28: subtype default
+    # ON → OFF (Agent 2 found M3AE precedent net-neutral on iEEG via DIVER-1
+    # §4.1). Ref defaults unchanged.
+    subtype_embed_enabled: bool = False,
+    subtype_embed_reuse_kv: bool = True,
+    subtype_embed_vocab: str = DEFAULT_SUBTYPE_EMBED_VOCAB,
+    ref_embed_enabled: bool = True,
+    ref_embed_reuse_kv: bool = True,
+    # B29 phase-mode + anatomy-bias + corpus mix lock 2026-05-27 PM-late.
+    phase_mode: str = DEFAULT_PHASE_MODE,
+    anatomy_bias_mode: str = DEFAULT_ANATOMY_BIAS_MODE,
+    include_ajile12: bool = DEFAULT_INCLUDE_AJILE12,
+    ref_operator_alpha: float = DEFAULT_REF_OPERATOR_ALPHA,
+    corpus_mix: dict[str, float] | None = None,
+    notch_filter_hz_by_corpus: dict[str, float] | None = None,
+    # B29 Item 14 + MoE-FFN audit 2026-05-28: dense default; soft_moe_4
+    # is the P2-if-budget sister.
+    ffn_variant: str = DEFAULT_FFN_VARIANT,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
     The ``electrode_tokens_extractor`` arg is REQUIRED for real runs and must
     emit per-event ``(n_channels, n_time_bins, n_freq_bins)`` STFT tokens
-    following the v14 preprocessing recipe (``N1 × R2 × I2L × F1``).
+    following the v14 preprocessing recipe (``N1 × R2 × I2 × F1`` post-5/25
+    swap; ``I2L`` is now the F-log-amplitude sister via ``apply_log=True``).
 
     Word events are appended downstream of :class:`Wang2024Treebank` via
     :class:`BTWordEvents` (``ns.Chain``) so per-trial ``words_df`` /
@@ -108,15 +247,119 @@ def build_v14_experiment(
             "ROOT_DIR_BRAINTREEBANK must be set or bt_root passed explicitly"
         )
 
+    dkoleo_mode = _DKOLEO_MODE_ALIASES.get(dkoleo_mode, dkoleo_mode)
+    _validate_choice("dkoleo_mode", dkoleo_mode, DKOLEO_MODES)
+    _validate_choice("subtype_embed_vocab", subtype_embed_vocab, SUBTYPE_EMBED_VOCABS)
+    subtype_vocab_size = 2 if subtype_embed_vocab == "binary" else 3
+    _validate_choice("phase_mode", phase_mode, PHASE_MODES)
+    _validate_choice("anatomy_bias_mode", anatomy_bias_mode, ANATOMY_BIAS_MODES)
+    _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
+    if ffn_variant != "dense":
+        # MoE-FFN audit 2026-05-28: ``soft_moe_4`` is reserved as a P2
+        # if-budget sister and requires ``models/soft_moe.py``. Fail
+        # closed until that lands.
+        raise NotImplementedError(
+            f"ffn_variant={ffn_variant!r} requires models/soft_moe.py "
+            "(R-moe-ffn-soft-4 P2 if-budget sister; not yet built)."
+        )
+
+    # B29 corpus mix sum-to-1.0 assertion.
+    corpus_mix = dict(corpus_mix) if corpus_mix is not None else dict(DEFAULT_CORPUS_MIX)
+    if not include_ajile12 and "ajile12" in corpus_mix:
+        # Re-normalize over remaining corpora when AJILE12 is excluded.
+        del corpus_mix["ajile12"]
+        total = sum(corpus_mix.values())
+        if total <= 0:
+            raise ValueError(
+                "corpus_mix with AJILE12 removed sums to zero — supply an "
+                "explicit ``corpus_mix`` dict."
+            )
+        corpus_mix = {k: v / total for k, v in corpus_mix.items()}
+    mix_sum = sum(corpus_mix.values())
+    if abs(mix_sum - 1.0) > 1e-4:
+        raise ValueError(
+            f"corpus_mix must sum to 1.0 ± 1e-4; got sum={mix_sum:.6f} "
+            f"over {sorted(corpus_mix.keys())}"
+        )
+
+    # Every corpus in ``corpus_mix`` must have a
+    # ``notch_filter_hz_by_corpus`` entry — closing the loop on
+    # MASK-01 (60 Hz US sites vs 50 Hz SWEC CH). Default seeded from
+    # ``MAINS_NOTCH_BY_CORPUS``; explicit dispatch can override.
+    notch_filter_hz_by_corpus = (
+        dict(notch_filter_hz_by_corpus)
+        if notch_filter_hz_by_corpus is not None
+        else dict(MAINS_NOTCH_BY_CORPUS)
+    )
+    missing_notch = sorted(set(corpus_mix) - set(notch_filter_hz_by_corpus))
+    if missing_notch:
+        raise ValueError(
+            "notch_filter_hz_by_corpus is missing entries for "
+            f"{missing_notch}; supply the per-corpus mains frequency "
+            "(US sites = 60.0, SWEC CH = 50.0) so the extractor builds "
+            "with the right notch for each corpus."
+        )
+    # Reconcile the legacy scalar with the per-corpus map: if the
+    # default ``mains_notch_hz`` was kept, the BT extractor inherits
+    # the map's BT entry; an explicit non-default scalar overrides
+    # (preserves the SWEC-via-scalar dispatch path covered by
+    # ``test_b28_dispatch_mains_notch_kwarg_overrides_default``).
+    bt_notch_hz = notch_filter_hz_by_corpus.get("braintreebank", mains_notch_hz)
+    effective_bt_notch_hz = (
+        mains_notch_hz if mains_notch_hz != DEFAULT_MAINS_NOTCH_HZ else bt_notch_hz
+    )
+    notch_filter_hz_by_corpus["braintreebank"] = effective_bt_notch_hz
+
+    if not 0.0 < ref_operator_alpha < 1.0:
+        raise ValueError(
+            f"ref_operator_alpha must lie in (0, 1); got {ref_operator_alpha}"
+        )
+
     if electrode_tokens_extractor is None:
         electrode_tokens_extractor = LogStftView(
             event_types="Ieeg",
             car="shaft",
-            notch_filter=60.0,
+            notch_filter=effective_bt_notch_hz,
             scaler="StandardScaler",
             channel_order="original",
             c_max=DEFAULT_C_MAX,
         )
+
+    # The encoder's ``ref_idx`` token must label the operator the
+    # waveform actually saw. When the caller hands in a
+    # :class:`RefAugMultiStftView` the operator varies per clip — lift
+    # its ``ref_modes`` + ``seed`` so the draws stay aligned via the
+    # shared ``(seed, event_key)`` key. Otherwise the operator is the
+    # static CAR config baked into the electrode-tokens extractor:
+    # collapse the label to that single mode (and reject any CAR that
+    # does not map cleanly into ``REF_MODES`` rather than silently
+    # mislabelling the operator).
+    if isinstance(electrode_tokens_extractor, RefAugMultiStftView):
+        ref_modes_for_label = tuple(electrode_tokens_extractor.ref_modes)
+        ref_seed_for_label = int(electrode_tokens_extractor.seed)
+    else:
+        if not hasattr(electrode_tokens_extractor, "car"):
+            raise ValueError(
+                f"electrode_tokens_extractor {type(electrode_tokens_extractor).__name__} "
+                "exposes no 'car' attribute, so the dispatch cannot label "
+                "the upstream reference operator. Inherit from "
+                "CARIeegExtractor, or use a RefAugMultiStftView for "
+                "per-clip ref switching."
+            )
+        car = electrode_tokens_extractor.car
+        reference = getattr(electrode_tokens_extractor, "reference", None)
+        if car != "shaft" or reference == "bipolar":
+            raise ValueError(
+                "electrode_tokens_extractor uses a reference operator that "
+                f"does not map into REF_MODES={REF_MODES!r} "
+                f"(car={car!r}, reference={reference!r}). The default "
+                "dispatch only supports a static shaft-CAR upstream; for "
+                "per-clip operator switching use a RefAugMultiStftView. "
+                "Either swap to LogStftView(car='shaft'), construct a "
+                "RefAugMultiStftView, or pass an explicit ref_idx extractor."
+            )
+        ref_modes_for_label = ("shaft_car",)
+        ref_seed_for_label = seed
 
     study = Wang2024Treebank(
         path=Path(bt_root), mode=mode,
@@ -143,6 +386,24 @@ def build_v14_experiment(
         unknown_label_policy="skip",
     )
 
+    # B29 Item 11/12 per-clip metadata extractors. Each emits a
+    # 1-element TimedArray that the Lightning collator stacks into a
+    # ``(B,)`` tensor matching the encoder kwarg contract.
+    ref_idx_extractor = RefIdxExtractor(
+        event_types="Ieeg",
+        seed=ref_seed_for_label,
+        ref_modes=ref_modes_for_label,
+    )
+    subtype_extractor = SubjectSubtypeExtractor(
+        event_types="Ieeg",
+        vocab=subtype_embed_vocab,
+        corpus="braintreebank",
+    )
+    lambda_anat_extractor = LambdaAnatExtractor(
+        event_types="Ieeg",
+        corpus="braintreebank",
+    )
+
     data = Data(
         study=chain,
         segmenter={
@@ -150,6 +411,9 @@ def build_v14_experiment(
                 "electrode_tokens": electrode_tokens_extractor,
                 "support": dk_extractor,
                 "valid_mask": valid_mask_extractor,
+                "ref_idx": ref_idx_extractor,
+                "subject_subtype": subtype_extractor,
+                "lambda_anat": lambda_anat_extractor,
                 "target": {
                     "name": "EventField",
                     "event_types": "Word",
@@ -186,6 +450,22 @@ def build_v14_experiment(
             "m_sub_slots": m_sub_slots,
             "eps": eps,
             "time_last_input": True,
+            # B28 cross-attn collapse (default ``[0]``; sister opt-in
+            # ``[0, 3]`` for ``R-perceiver-original-2-cross-attns``).
+            "cross_attn_positions": cross_attn_positions,
+            # B29 Item 11 lock 2026-05-27 PM-late: subtype + ref embeds.
+            "subtype_vocab": subtype_vocab_size,
+            "subtype_embed_enabled": subtype_embed_enabled,
+            "subtype_embed_reuse_kv": subtype_embed_reuse_kv,
+            "ref_embed_enabled": ref_embed_enabled,
+            "ref_embed_reuse_kv": ref_embed_reuse_kv,
+            # SSL-pretrain dispatch flags threaded onto the model config
+            # so they ride along with the persisted run record. The
+            # supervised downstream classifier path does not branch on
+            # them; the SSL trainer reads them from this same snapshot.
+            "dkoleo_mode": dkoleo_mode,
+            "phase_mode": phase_mode,
+            "anatomy_bias_mode": anatomy_bias_mode,
         },
         loss={"name": "CrossEntropyLoss"},
         optim={"optimizer": {"name": "Adam", "lr": 1e-3}},
@@ -198,7 +478,12 @@ def build_v14_experiment(
         ],
         n_epochs=n_epochs,
         seed=seed,
-        x_name=("electrode_tokens", "support", "valid_mask"),
+        # Per-clip metadata reaches the encoder forward as additional
+        # kwargs alongside (tokens, support, valid_mask).
+        x_name=(
+            "electrode_tokens", "support", "valid_mask",
+            "subject_subtype", "ref_idx", "lambda_anat",
+        ),
         accelerator="auto",
         devices="auto",
         fast_dev_run=fast_dev_run,
@@ -237,17 +522,185 @@ def _parser() -> argparse.ArgumentParser:
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
                    help="Lightning fast-dev-run: 1 batch train+val+test, no checkpoints.")
+    # Phase-2 shaft-mask 5/27 PM final spec. Default is
+    # ``K = 1 if N_shafts >= 2 else 0`` with ``extent_blocks=("alpha",)``.
+    # Supersedes the original ``K=3`` spec and the same-day AM
+    # ``min(2, ceil(0.25 * N_shafts))`` fraction spec. Sisters reach K=2
+    # / K=3 via ``--shaft-mask-k-override`` together with
+    # ``--shaft-mask-extent-blocks``.
+    p.add_argument(
+        "--shaft-mask-k-override", type=int, default=None,
+        help="Override the default ``K = 1 if N_shafts >= 2 else 0`` formula "
+             "with a fixed K. Sister R-shaft-K1-explicit: 1 (matches default). "
+             "Sister R-shaft-K2: 2. Sister R-shaft-K3-mixed-3block: 3.",
+    )
+    p.add_argument(
+        "--shaft-mask-extent-blocks", default="alpha",
+        help="Comma-separated list of active block extents. Default 'alpha'. "
+             "Sister R-shaft-K2: 'alpha,beta'. "
+             "Sister R-shaft-K3-mixed-3block: 'alpha,beta,gamma'.",
+    )
+    # B28 DKoleo demotion 2026-05-27 PM + B29 sister-set expansion
+    # 2026-05-27 PM-late. ``batch_cls`` is accepted as a pre-B29 alias
+    # of ``batch_cls_unit``.
+    p.add_argument(
+        "--dkoleo-mode",
+        choices=(*DKOLEO_MODES, *_DKOLEO_MODE_ALIASES.keys()),
+        default=DEFAULT_DKOLEO_MODE,
+        help="DKoleo @ M4 unit (B28 2026-05-27 PM demotion + B29 expansion). "
+             "'off' (default) drops the term. Sisters: 'intra_clip_slots' "
+             "(B21 per-clip × 80 slots), 'batch_cls_unit' (DINOv2-faithful "
+             "per-batch × CLS-analog utterance vectors), and "
+             "'vicreg_slot_variance' (per-dim VICReg variance hinge gated "
+             "on MON-SLOT-REDUNDANCY). 'batch_cls' is a pre-B29 alias of "
+             "'batch_cls_unit'.",
+    )
+    # B29 Item 11 + 5/28 PM flip: subtype default OFF, so CLI flag enables.
+    p.add_argument(
+        "--subtype-embed", dest="subtype_embed_enabled",
+        action="store_true", default=False,
+        help="Enable the per-clip subject-subtype embedding "
+             "(R-subtype-embed-on-with-kv-reuse P0 sister; default OFF per "
+             "5/28 PM precedent-audit flip).",
+    )
+    p.add_argument(
+        "--no-subtype-embed-reuse-kv", dest="subtype_embed_reuse_kv",
+        action="store_false", default=True,
+        help="Keep the subtype embed input-only (skip K/V reuse, M3AE-"
+             "faithful). Sister R-subtype-embed-input-only P0.",
+    )
+    p.add_argument(
+        "--subtype-embed-vocab",
+        choices=SUBTYPE_EMBED_VOCABS, default=DEFAULT_SUBTYPE_EMBED_VOCAB,
+        help="Subtype embed vocab: 'binary' (default, sEEG/iEEG vs ECoG) "
+             "or 'three_way' (sEEG / iEEG-surface / ECoG).",
+    )
+    p.add_argument(
+        "--no-ref-embed", dest="ref_embed_enabled",
+        action="store_false", default=True,
+        help="Disable the per-clip reference-operator embedding "
+             "(R-ref-embed-disabled sister).",
+    )
+    p.add_argument(
+        "--no-ref-embed-reuse-kv", dest="ref_embed_reuse_kv",
+        action="store_false", default=True,
+        help="Keep the ref embed input-only (skip K/V reuse). "
+             "Sister R-ref-embed-input-only.",
+    )
+    p.add_argument(
+        "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
+        help="B29 Item 1: single joint SSL phase ('joint_b29', default) vs "
+             "the split P1/P2 path ('split_p1_p2', sister R-keep-phase-split).",
+    )
+    p.add_argument(
+        "--anatomy-bias-mode",
+        choices=ANATOMY_BIAS_MODES, default=DEFAULT_ANATOMY_BIAS_MODE,
+        help="Anatomy-bias schedule. 'per_clip_gate_b29' (default) uses "
+             "per-clip metadata to gate the bias; 'warmup_b28' restores the "
+             "B28 step warmup; 'step_b19' the B19 instant ON; 'on_from_p1' "
+             "is always ON.",
+    )
+    p.add_argument(
+        "--ref-operator-alpha", type=float,
+        default=DEFAULT_REF_OPERATOR_ALPHA,
+        help="α-hierarchical corpus sampler weight (B29 Item 5). Default 0.3.",
+    )
+    p.add_argument(
+        "--no-include-ajile12", dest="include_ajile12",
+        action="store_false", default=DEFAULT_INCLUDE_AJILE12,
+        help="Drop AJILE12 from the pretraining mix (sister "
+             "R-no-ajile12). Default is to include it (B29 reversal of the "
+             "5/27 PM-late same-day sensor-gap drop).",
+    )
+    p.add_argument(
+        "--ffn-variant",
+        choices=FFN_VARIANTS, default=DEFAULT_FFN_VARIANT,
+        help="FFN variant. Default 'dense' (B29 Item 14 + MoE audit "
+             "2026-05-28). 'soft_moe_4' raises NotImplementedError until "
+             "models/soft_moe.py lands (R-moe-ffn-soft-4 P2 if-budget).",
+    )
+    # B28 cross-attn collapse 2026-05-27 PM.
+    p.add_argument(
+        "--cross-attn-positions", default=None,
+        help="Comma-separated latent-stack positions for cross-attn blocks. "
+             "Default (omitted) = [0] (Perceiver IO canonical). Sister "
+             "R-perceiver-original-2-cross-attns: '0,3'. Position 0 is "
+             "required; interior positions must satisfy p < depth_self_attn.",
+    )
+    # MASK-01 per-corpus mains-notch field.
+    p.add_argument(
+        "--mains-notch-hz", type=float, default=DEFAULT_MAINS_NOTCH_HZ,
+        help="Mains-frequency notch (Hz). Default 60.0 (US — BT, D-cohort, "
+             "AJILE12). Pass 50.0 for SWEC (Swiss site). Per-corpus map "
+             "lives in MAINS_NOTCH_BY_CORPUS.",
+    )
+    p.add_argument("--phase", type=int, choices=(1, 2, 3, 4), default=4,
+                   help="Training phase per docs/neuroprobe/plan.md §3-phase staged. "
+                        "1 = Stage-A factorized t×f reconstruction (EAT Level-B). "
+                        "2 = Stage-B electrode-mask reconstruction. "
+                        "3 = Whisper-L8 distillation readout. "
+                        "4 = downstream linear/finetune probe (current behavior). "
+                        "Phases 1/2/3 raise NotImplementedError citing the "
+                        "blocker IDs that gate their parameters.")
     return p
+
+
+_PHASE1_BLOCKERS = (
+    # Per B29 Item 1, P1 + P2 collapse → single joint SSL phase routed
+    # through V14JointExperiment. Phases 1 and 2 share the same open
+    # blockers as a result; see `--phase-mode joint` for the canonical
+    # joint-phase routing.
+    "B2.1 (wire V14JointExperiment into the dispatch phase-switch), "
+    "B2.2 (compose 4-term L_total via ssl/aggregator.py with B30 latent_valid), "
+    "B2.3 (shaft-mask + ref_aug + ref_embed extractors — B03 / REF-01 / REF-02), "
+    "B2.4 (B02 sampler — WRS over valid-bin-electrode-hours + StatefulDataLoader), "
+    "B2.5 (monitors + best-val probe callback), "
+    "B30-dispatch-sister-flags (latent_valid_override + sa_mask_mode), "
+    "per-corpus mains notch (60 Hz US / 50 Hz SWEC)"
+)
+_PHASE2_BLOCKERS = _PHASE1_BLOCKERS  # B29 Item 1: P1 + P2 joint phase.
+_PHASE3_BLOCKERS = (
+    # B06 ✅ closed 2026-05-25 (joint with B05). The remaining open
+    # Phase-3 work is the readout / distillation wiring layered on top
+    # of a frozen Phase-1+2 SSL checkpoint, which does not exist until
+    # the joint phase converges.
+    "Phase-3 distillation gated on a frozen SSL checkpoint from Phase-1+2 "
+    "(joint phase per B29 Item 1); see ssl/distill.py + experiments/phase3_preflight.py"
+)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.phase != 4:
+        # T3.1 scaffold: phase entry-points exist so dispatch is one switch
+        # away once the gating blockers resolve. Each branch raises with the
+        # exact blocker IDs to surface what is missing — do NOT fill defaults
+        # here (would pre-empt the v14_blockers.md decisions).
+        gating = {1: _PHASE1_BLOCKERS, 2: _PHASE2_BLOCKERS, 3: _PHASE3_BLOCKERS}
+        raise NotImplementedError(
+            f"--phase {args.phase} dispatch is gated on unresolved blockers: "
+            f"{gating[args.phase]}. See docs/neuroprobe/v14_blockers.md."
+        )
     print(f"V14 dispatch — cohort subject_ids = {V14_TRAIN_SUBJECT_IDS} (9 subjects, S5 excluded)")
     print(f"  mode={args.mode} task={args.task} binary_tasks={args.binary_tasks} seed={args.seed}")
     print(f"  eval_mode={args.eval_mode} test=({args.test_subject_id},{args.test_trial_id})")
     print(f"  d_model={args.d_model} depth={args.depth} n_heads={args.n_heads} "
           f"M={args.m_sub_slots} eps={args.eps}")
     print(f"  K=80 DK parcels, batch_size={args.batch_size}, n_epochs={args.n_epochs}")
+    print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
+          f"mains_notch_hz={args.mains_notch_hz}")
+    print(f"  phase_mode={args.phase_mode} anatomy_bias_mode={args.anatomy_bias_mode} "
+          f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
+    print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
+          f"vocab={args.subtype_embed_vocab}) "
+          f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
+          f"ffn_variant={args.ffn_variant}")
+
+    cross_attn_positions: list[int] | None = None
+    if args.cross_attn_positions is not None:
+        cross_attn_positions = [
+            int(x) for x in args.cross_attn_positions.split(",") if x.strip()
+        ]
 
     if args.dry_run:
         print("  (dry-run: not building Experiment; "
@@ -264,6 +717,19 @@ def main(argv: list[str] | None = None) -> int:
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         batch_size=args.batch_size, n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
+        dkoleo_mode=args.dkoleo_mode,
+        cross_attn_positions=cross_attn_positions,
+        mains_notch_hz=args.mains_notch_hz,
+        subtype_embed_enabled=args.subtype_embed_enabled,
+        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
+        subtype_embed_vocab=args.subtype_embed_vocab,
+        ref_embed_enabled=args.ref_embed_enabled,
+        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
+        phase_mode=args.phase_mode,
+        anatomy_bias_mode=args.anatomy_bias_mode,
+        ref_operator_alpha=args.ref_operator_alpha,
+        include_ajile12=args.include_ajile12,
+        ffn_variant=args.ffn_variant,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

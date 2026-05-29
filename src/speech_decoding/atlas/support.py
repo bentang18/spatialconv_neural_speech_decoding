@@ -4,11 +4,15 @@ One CSV per patient at `data/atlas/support_cache/<pt>_support_tier1.csv`.
 Columns: `name`, then 15 Tier-1 support columns in `DEFAULT_BASE_PARCELS`
 order. Values are raw BNA probability in [0, 100] (float32); no normalization.
 
-See docs/plans/v14-core.md Task A1 and the B-1 contract amendment.
+Also exposes :func:`compute_gated_log_support_bias` — the B29 Item 12
+per-clip ``λ_anat`` gate on the ``log(support + ε)`` cross-attn bias.
+The encoder forward calls this inline at every step; the helper exists
+so callers can pre-compute / debug the bias outside the model.
 """
 
 from __future__ import annotations
 
+import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +27,74 @@ from .fsaverage import (
     sample_baked_support,
 )
 from .tokens import DEFAULT_BASE_PARCELS
+
+try:
+    import torch
+    from torch import Tensor as _Tensor
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - torch is a hard dep, but guard for docs builds
+    torch = None  # type: ignore[assignment]
+    _Tensor = tp.Any  # type: ignore[misc, assignment]
+    _TORCH_AVAILABLE = False
+
+
+def compute_gated_log_support_bias(
+    support: "_Tensor",
+    *,
+    eps: float,
+    lambda_anat: "float | _Tensor" = 1.0,
+) -> "_Tensor":
+    """Return ``λ_anat * log(support + ε)`` with B29 per-clip broadcasting.
+
+    Parameters
+    ----------
+    support: (B, C, K) float Tensor — per-electrode parcel-support mass.
+    eps:     float — anatomy-prior strength (default 1e-2 lives in
+             :data:`speech_decoding.studies.braintreebank.anatomy.DEFAULT_SUPPORT_BIAS_EPS`).
+    lambda_anat:
+        Either a scalar (B28 warmup) or a (B,) Tensor (B29 per-clip
+        metadata gate). Broadcasts to ``(B, 1, 1)`` for the latter so
+        each clip independently scales its bias. Must be ≥ 0.
+
+    The encoder forward inlines this computation; this helper exists so
+    monitor probes / debug scripts can reproduce the gated bias outside
+    the model. See :class:`speech_decoding.extractors.subtype_meta.LambdaAnatExtractor`
+    for the per-clip metadata source.
+    """
+    if not _TORCH_AVAILABLE:  # pragma: no cover
+        raise RuntimeError("torch is required for compute_gated_log_support_bias")
+    if support.dim() != 3:
+        raise ValueError(
+            f"support must be (B, C, K); got shape {tuple(support.shape)}"
+        )
+    B = int(support.shape[0])
+    if isinstance(lambda_anat, _Tensor):
+        # Warmup schedule wrappers may pass a 0-d Tensor; treat that as
+        # the scalar branch rather than rejecting it.
+        if lambda_anat.dim() == 0:
+            scalar = float(lambda_anat.item())
+            if scalar < 0.0:
+                raise ValueError(f"lambda_anat must be >= 0; got {scalar}")
+            return scalar * torch.log(support + eps)
+        # NeuralSet collates per-event ``(1,)`` TimedArrays into
+        # ``(B, 1)``; squeeze the trailing singleton before validating.
+        if lambda_anat.dim() == 2 and int(lambda_anat.shape[-1]) == 1:
+            lambda_anat = lambda_anat.squeeze(-1)
+        if lambda_anat.dim() != 1 or int(lambda_anat.shape[0]) != B:
+            raise ValueError(
+                f"lambda_anat tensor must have shape (B={B},); "
+                f"got shape {tuple(lambda_anat.shape)}"
+            )
+        if (lambda_anat < 0).any():
+            raise ValueError("lambda_anat tensor must be >= 0")
+        # ``support`` is the device-of-truth (often CUDA); per-clip
+        # metadata may arrive on CPU. Match both device AND dtype.
+        gate = lambda_anat.to(device=support.device, dtype=support.dtype).view(B, 1, 1)
+    else:
+        if float(lambda_anat) < 0.0:
+            raise ValueError(f"lambda_anat must be >= 0; got {lambda_anat}")
+        gate = lambda_anat
+    return gate * torch.log(support + eps)
 
 
 def sanitize_parcel_name(name: str) -> str:

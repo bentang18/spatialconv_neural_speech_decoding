@@ -1,22 +1,16 @@
-"""Cross-attn one-sided RoPE tests.
+"""Cross-attn temporal-distinction + interim shape tests.
 
-After dropping the per-electrode temporal self-attn block (the implementation
-artifact that was never explicitly agreed), the spec commitment "RoPE on
-per-electrode T_bins axis" is honored by applying one-sided RoPE to the K
-vectors inside the parcel cross-attention. K has a time index (each
-electrode-time-bin token); Q (latents) has no time, so it stays unrotated.
+Lineage note: the v3 spec carried "RoPE on per-electrode T_bins axis" via
+one-sided RoPE on cross-attn K vectors (because K had a time axis when
+electrode tokens were flattened to ``(B, C*T, d)``). The v4 amendment
+(5/19) factorises cross-attn per-timestep — K is now ``(B, C, d)`` per t,
+no time index, no RoPE on K. The latent-stack time-SA (T1.9) carries
+temporal position instead, via RoPE on the latent time axis.
 
-This is unusual versus canonical bidirectional RoPE (Su 2021) but principled:
-- absolute K position is what we need (Q has none, so "relative" is degenerate);
-- it keeps temporal positional information without inventing a separate
-  per-electrode self-attn block.
-
-Pins:
-1. The encoder distinguishes time-bin order (permuting a single electrode's
-   T_bins changes the output).
-2. ``V14ParcelPerceiverModel`` has no ``temporal_blocks`` attribute and the
-   config has no ``depth_temporal`` field.
-3. End-to-end shape/dtype/finite invariants still hold.
+These tests survive the refactor by checking weaker but still-load-bearing
+invariants: the encoder must distinguish time-bin order (each t's
+cross-attn sees different electrode values), there is no per-electrode
+temporal self-attn block, and the output shape/finiteness contract holds.
 """
 
 from __future__ import annotations
@@ -87,14 +81,18 @@ def test_config_has_no_depth_temporal_field() -> None:
 
 
 def test_encoder_forward_shape_dtype_finite_after_block_removal() -> None:
-    """End-to-end shape/dtype/finite invariants survive the refactor."""
+    """End-to-end shape/dtype/finite invariants survive the v4 latent-time-axis
+    refactor (T1.1) + B20 FE-02 patch stem: output is ``(B, K*M, T_p, d)``
+    where ``T_p = (T - k_t) // k_t + 1`` is the post-patch frame count."""
     model = V14ParcelPerceiverModel(**_kwargs())
-    B, C = 2, 7
-    electrodes = torch.randn(B, C, 5, 4)
+    B, C, T, F = 2, 7, 5, 4
+    electrodes = torch.randn(B, C, T, F)
     support = torch.zeros(B, C, 6)
     support[..., 0] = 1.0
 
     out = model(electrodes, support)
-    assert out.shape == (B, 6 * 2, 32)
+    # T=5 with kernel_time=2 stride=2: T_p = (5 - 2) // 2 + 1 = 2
+    T_p = model.patch_stem.n_time_patches(T)
+    assert out.shape == (B, 6 * 2, T_p, 32)
     assert out.dtype == torch.float32
     assert torch.isfinite(out).all()

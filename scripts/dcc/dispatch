@@ -24,11 +24,25 @@ fi
 
 submitter="$1"; shift
 script_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(git rev-parse --show-toplevel)"
+
+# SCAFFOLD-07 / B18 closure-gate: run the must_pass_before_dispatch test
+# suite locally before syncing. Aborts the dispatch on any failure so the DCC
+# clone never receives an inconsistent v14 spec. Skip with `DISPATCH_SKIP_GATE=1`
+# only when intentionally bypassing the gate (e.g., scaffolding before tests
+# exist).
+if [[ "${DISPATCH_SKIP_GATE:-0}" != "1" ]]; then
+  echo ">> pre-dispatch gate: pytest -m must_pass_before_dispatch"
+  if ! (cd "${repo_root}" && .venv/bin/python -m pytest -m must_pass_before_dispatch -q); then
+    echo ">> ABORT: pre-dispatch gate failed. Fix red tests or set DISPATCH_SKIP_GATE=1 to bypass intentionally." >&2
+    exit 3
+  fi
+  echo ">> pre-dispatch gate GREEN"
+fi
 
 "${script_dir}/sync"
 
 # Log every dispatch — a sweep is a loop that must be closed (pulled + analyzed).
-repo_root="$(git rev-parse --show-toplevel)"
 ledger="${repo_root}/docs/experiments/dispatch_log.csv"
 if [[ -f "${ledger}" ]]; then
   args_csv="${*//\"/\"\"}"

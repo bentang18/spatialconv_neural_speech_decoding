@@ -6,6 +6,7 @@ from pathlib import Path
 import exca
 import lightning.pytorch as pl
 import pydantic
+import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, Logger
 from lightning.pytorch.loggers.logger import DummyLogger
@@ -151,7 +152,11 @@ class Experiment(BaseExperiment):
 
     def _train_and_test(self) -> dict[str, float | None]:
         pl.seed_everything(self.seed, workers=True)
-        loaders = self.data.build()
+        # CR01: pl.seed_everything may miss some CUDA RNG init paths in
+        # DDP-forked workers; explicit manual_seed_all closes that gap.
+        torch.cuda.manual_seed_all(self.seed)
+        # CR02: per-worker numpy + random + torch RNG seeded as seed+worker_id.
+        loaders = self.data.build(worker_seed=self.seed)
         brain_module = self._build_brain_module(loaders["train"])
         trainer = self._trainer()
         if not self.test_only:

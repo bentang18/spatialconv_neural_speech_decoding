@@ -8,7 +8,7 @@ Cohort: 9 BT subj {1,2,3,4,6,7,8,9,10}, S5 dropped. Parcels: FS Desikan-Killiany
 
 ## 1. Preprocessing → `(C, F=30, T)`
 
-HPF 0.5 Hz → comb notch `w0=60,Q=30` → MNE-LOF QC (thr 1.5) → shaftCAR → drop bad → slice `[0,1]s` → magnitude STFT → triangular ⅓-octave 30-bin filterbank → `log(energy+1e-6)` → Nv14 robust-z per `(electrode,freq,session)` `(x−median)/(1.4826·MAD)`.
+HPF 0.5 Hz → comb notch `w0=mains_hz,Q=30` (per-corpus: 60 Hz BT/D/AJILE12, 50 Hz SWEC) → MNE-LOF QC (thr 1.5) → **ref draw** (5/27 PM ref-aug lock: per-clip uniform-random over `{shaftCAR, bipolar, Laplacian}`; raw skipped; SWEC degenerates to global-CAR-only) → drop bad → slice `[0,1]s` → magnitude STFT → triangular ⅓-octave 30-bin filterbank → Nv14 robust-z per `(electrode,freq,session)` `(x−median)/(1.4826·MAD)`. (5/25 swap: post-filterbank `log(energy+1e-6)` step dropped; raw filterbank magnitude is the default. F-log-amplitude sister re-enables `log` via `apply_log=True`. Bin spacing is unchanged — "log" in §2 refers to log-SPACED bin centers, not value-axis compression.) Ref-aug dispatch is sister-first: BT-Lite paired run (ref-aug ON vs OFF) gates full P1 all-corpora rollout via 4 kill criteria; details in `docs/neuroprobe/training_recipe.md §3` + memo `[[project_v14_ref_aug_input_distribution_lock_2026_05_27]]`.
 
 ## 2. Filterbank — 30-bin log ⅓-octave
 
@@ -30,7 +30,7 @@ Factorized throughout. Latents keep time axis `(320,T,d)`.
 
 | Stage | Spec | Shape |
 |---|---|---|
-| ❶ | `Linear(1→d)` per (t,f) + 30 flat freq embeds; no time PE | (C,F,T,d) |
+| ❶ | Conv2d (3,2) patches @ A1 + per-patch freq embed (10 vec) + `ref_embed[ref_idx]` (3,d) additive (5/27 PM ref-aug); no time PE | (C,F_p=10,T_p,d) |
 | ❷ ×4 | per-electrode: temporal SA (RoPE θ=1e4) → freq SA → MLP; hard −∞ cross-electrode mask; 8 heads, MLP 4× | (C,F,T,d) |
 | ❺ ×2 @{0,3} | 320 free latents (K=80×M=4, std 0.02); pool (elec,freq)→parcel 1:1/timestep; QK bias `log(support[e,p]+ε)`, ε=1e-2 | (320,T,d) |
 | ❻ ×6 | time SA (RoPE) → parcel SA → MLP | (320,T,d) |

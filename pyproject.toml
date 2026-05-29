@@ -36,4 +36,5 @@ where = ["src"]
 testpaths = ["src"]
 markers = [
     "slow: marks tests that load real BIDS data (deselect with '-m \"not slow\"')",
+    "must_pass_before_dispatch: pre-dispatch gate (SCAFFOLD-07, B18 closure-gate). Run by `scripts/dcc/dispatch` before sync; aborts on failure.",
 ]

@@ -1,4 +1,13 @@
-"""Schema tests for the local `Wang2024Treebank` NeuralSet Study."""
+"""Schema tests for the local `Wang2024Treebank` NeuralSet Study.
+
+Collision policy: see study.py docstring + CLAUDE.md "Wang2024Treebank
+upgrade-path". NeuralSet's ``__init_subclass__`` already raises on duplicate
+``Wang2024Treebank`` registration, and Pydantic's discriminated-union
+registry independently detects the duplicate via its own error path. We
+don't add a redundant test here because forcing the duplicate via ``type()``
+or ``class`` statements pollutes Pydantic's discriminator registry and
+breaks later tests in this module.
+"""
 
 from __future__ import annotations
 

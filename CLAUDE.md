@@ -15,21 +15,21 @@ PS/uECoG stage program **paused 2026-04-24**. Active work is the Neuroprobe cros
 - **Live plan**: `docs/neuroprobe/plan.md`. Targets: ≥ 0.65 multi-class cross-session + beat finetuned PopT by ≥ 0.05 + ≥ 4 tasks pre-baked + K-fold/chronological splits + ≤ 30M params. Stretch ≥ 0.70. Benchmark reference: `docs/references/neuroprobe_benchmark.md`.
 - **S2/trial-4 CrossSubject + 120-electrode Lite cap are leaderboard-parity cells, not architecture-selection defaults.** Pooled multi-source CrossSubject multiclass is the scientific generalization default.
 - **Live status**: `MEMORY.md §Status (live)` — frozen contracts (L.1, L.2), in-flight jobs, blockers.
-- **NeuroAI substrate**: active path is `Study → Events DataFrame → Transforms/Chain → Segmenter → Dataset/DataLoader → NeuralTrain Experiment → Exca`. Custom code is guilty until proven necessary. Keep BNA/fsaverage/support logic, v14 parcel metadata, BrainTreebank labels/splits/leakage transforms, v14 architecture, and the ablation-log export adapter. **Do not** keep old loaders, old training loops, old sbatch tooling, or archived experiments in active import paths.
+- **NeuroAI substrate**: active path is `Study → Events DataFrame → Transforms/Chain → Segmenter → Dataset/DataLoader → NeuralTrain Experiment → Exca`. Custom code is guilty until proven necessary. Keep DK/fsaverage/support logic (BNA-soft routing is gated future P1 ablation, NOT v14's active default — see `memory/feedback_v14_routing_atlas_is_dk_not_bna_2026_05_27.md` and `memory/project_v14_dk_first_pass_2026_05_13.md`), v14 parcel metadata, BrainTreebank labels/splits/leakage transforms, v14 architecture, and the ablation-log export adapter. **Do not** keep old loaders, old training loops, old sbatch tooling, or archived experiments in active import paths.
 - **Raw-voltage gate**: `Wang2024Treebank` proof passed on DCC 2026-04-29 (`reports/neuroai_raw_voltage_proof_2026_04_29/`).
 - **Naming gotcha**: "Stage 1" inside `docs/neuroprobe/plan.md` = *hillclimb* stage. Elsewhere "Stage N" = PS-program stage.
-- **v14 is the sole active architectural direction.** v12, Conv2d pipeline, v12-era Brain-JEPA, LeWM, LOPO autoresearch — all discontinued. *JEPA-family note*: "Brain-JEPA discontinued" refers to the v12-era prototype only; Stage-2 SSL `L_recon` IS JEPA-family (data2vec 2.0 + V-JEPA 2.1 latent prediction).
+- **v14 is the sole active architectural direction.** v12, Conv2d pipeline, v12-era Brain-JEPA, LeWM, LOPO autoresearch — all discontinued. *JEPA-family note*: "Brain-JEPA discontinued" refers to the v12-era prototype only; SSL `L_recon` IS JEPA-family — V-JEPA-2-canonical pure-L1 mask-prediction (see MEMORY.md §Status canonical-source table for current loss-form lock).
 - **Provenance** (1-line lineage): PopT (zero per-subject params, ICLR 2025 Oral) → BaRISTA (parcel-level encoding > channel-level, NeurIPS 2025 poster) → Evanson (cross-modal SSL paradigm; rejected, right paradigm wrong arch) → v14's novel piece = multi-FM extension on PopT's zero-per-subject architecture. Diagnosis: `memory/reference_evanson_lost_to_popt_diagnosis_2026_04_26.md`.
 
 **Load on demand for v14 architectural / paper-framing work** (don't keep in always-on context):
-- Arch spec: `memory/project_v14_parcel_token_readout_2026_04_26.md` (Perceiver IO + parcel-id-tagged latents + Graphormer support bias + DETR readout + Stage-2 SSL contract).
+- Arch spec: `memory/project_v14_parcel_token_readout_2026_04_26.md` (Perceiver IO + parcel-id-tagged latents + Graphormer support bias + DETR readout + Stage-2 SSL contract). **Historical anchor — heavily superseded; for current arch state see MEMORY.md §Status canonical-source table.**
 - Paper claim: `memory/project_v14_unique_contribution_2026_04_26.md` (3 commitments, retroactive-validation hooks).
 - Paper-framing live: `memory/project_v14_paper_corrections_post_newpapers6_batch2_2026_05_09.md` (Goldstein-2025 scope; Whisper-L8 = acoustic-phonetic NOT semantic; defensive language playbook; 5 ablation cells; Podcast pretrain-with-sister-run policy).
 - Stage-2 schedule: `memory/project_stage2_ssl_initial_diet_bt_only_joint_step1_2026_05_09.md`.
 
 ## PS program (paused — won't resume until Neuroprobe closes; ~summer of work away)
 
-Don't read PS-resume context until Neuroprobe submits/aborts. Pointers when you do: `memory/project_phase1_default_vs_phase15_target_2026_04_19.md` (PS-resume defaults: per_cell + partialconv + pe2d + hierarchical_atlas @ d=32, depth=3, pool=(4,8); Utah grid is real on PS uECoG so partialconv stays — Neuroprobe-path's BNA-connectivity bias / flat pool / no partialconv are sEEG-specific, two paths diverge by modality not version), `docs/objectives.md` (4-stage roadmap; Stage 1 closed 2026-04-20, Stage 2 paused 2026-04-24, Stage 3+ TBD), `docs/strategy/stage_<N>.md`, `docs/tactics.md`. v14 calibration scope: fixed atlas through PS-Stage 2; learned calibration deferred to PS-Stage 3+.
+Don't read PS-resume context until Neuroprobe submits/aborts. Pointers when you do: `memory/project_phase1_default_vs_phase15_target_2026_04_19.md` (PS-resume defaults: per_cell + partialconv + pe2d + hierarchical_atlas @ d=32, depth=3, pool=(4,8); Utah grid is real on PS uECoG so partialconv stays — Neuroprobe-path's DK-routing / flat pool / no partialconv are sEEG-specific, two paths diverge by modality not version), `docs/objectives.md` (4-stage roadmap; Stage 1 closed 2026-04-20, Stage 2 paused 2026-04-24, Stage 3+ TBD), `docs/strategy/stage_<N>.md`, `docs/tactics.md`. v14 calibration scope: fixed atlas through PS-Stage 2; learned calibration deferred to PS-Stage 3+.
 
 ## v14 Paper Authorship — IRONCLAD
 
@@ -50,7 +50,7 @@ Full rule + verification checklist: `memory/feedback_arxiv_llm_content_responsib
 5. **Freeze blockers before coding.** See `docs/tactics.md`.
 6. **Prefer standard, scalable contracts** when they don't compromise current-stage correctness.
 
-Applies to every logic step — channel indices, coordinate frames, Brainnetome PM lookup, per-electrode support, parcel embedding, temporal front-end, backbone, decoder, loss, eval, metrics. No step is too obvious to skip.
+Applies to every logic step — channel indices, coordinate frames, DK / atlas lookup, per-electrode support, parcel embedding, temporal front-end, backbone, decoder, loss, eval, metrics. No step is too obvious to skip.
 
 ## Engineering Discipline
 
@@ -102,7 +102,10 @@ Discussion surfaces the known unknowns and the contract, but once done, *run the
 - **NeuroAI substrate**: `neuralset[all]`, `neuralfetch`, `neuraltrain`, `exca` are explicit dependencies. NeuralSet owns data orchestration; NeuralTrain/Exca own training runs, caching, grids, DCC dispatch. Canonical sweep dispatch is `TaskInfra + neuraltrain.utils.run_grid` (one Slurm array per sweep), not `MapInfra` — `MapInfra` is for extractor-layer per-subject precompute.
 - **Machine-specific paths**: `configs/paths.yaml` (gitignored).
 - **All training on DCC, never local.**
-- **Exca cache folder**: must point at `/hpc/group/coganlab/ht203/cache_neuroai/` (persistent), never `/work/ht203/` (75-day purge). Set via `EXCA_CACHE_FOLDER` env var or per-`infra.folder=`.
+- **Storage tiering** (scope-amended 2026-05-23 PM per HB01 close):
+  - **`/hpc/group/coganlab/ht203/cache_neuroai/`** (persistent, 1 TB lab-shared / ~400 GB free) → Exca metadata, checkpoints, Whisper-L8 teacher cache, eval/analysis artifacts. Set via `EXCA_CACHE_FOLDER`.
+  - **`/work/ht203/cache/`** (75-day purge, 950 TB cluster / 233 TB free) → bulk feature precomputes cheap to regenerate (Multi-STFT cache ~5–8 TB fp16; normalization stats). Each such cache MUST ship a documented `MapInfra` regenerate spec.
+  - The old "never `/work/` for caches" rule applied to long-lived caches where regenerate ≈ training cost. For embarrassingly parallel CPU precomputes (Multi-STFT ~25 CPU-hr full corpus on 32 workers), `/work/` is correct.
 - **Upstream Neuroprobe clone**: pinned at `c7b955b0a31464f4a5eec3f3bd78ff29841d61ac`. Local: `.cache/neuroprobe_upstream/`. DCC: `/work/ht203/repo/neuroprobe_upstream/`. Stage-0 wrappers default automatically. Bundled `braintreebank_features_time_alignment/*.csv` enables laptop-side audits without BT data. Full reference + bootstrap: `memory/reference_neuroprobe_upstream_api.md`.
 - **`Wang2024Treebank` upgrade-path**: when upstream NeuralFetch ships its own `Wang2024Treebank`, our local registration will collide on `STUDY_PATHS` import — rename local class to private name (keep `name="Wang2024Treebank"` ClassVar) or add precedence handling.
 
@@ -119,9 +122,10 @@ PER 0.734 ± 0.007 on S14 (grouped-by-token CV, 3-seed, per-phoneme MFA + flat h
 - `data/mni_coords/<subj>_RAS.txt` — ACPC electrode coordinates (11/11).
 - `data/channel_maps/<subj>_{channelMap,sigChannel}.mat` — amp→grid + sig-channel masks (sig: 9/11; missing S32/S57).
 - `data/transforms/<subj>_talairach.xfm` — ACPC → Talairach/MNI.
-- `data/atlas/BNA_PM_4D.nii.gz` — Brainnetome PM volume (only v14 atlas source).
 - `data/atlas/fsaverage_bake_v2c/` — baked fsaverage atlas (projfrac-avg, no smoothing).
-- `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv` — per-electrode Tier-1 BNA support.
+- **v14 active atlas = Desikan-Killiany (DK)** via FreeSurfer `aparc+aseg` 0.5mm native-vol per Pipeline C ([[project_v14_dk_first_pass_2026_05_13]]). DK one-hot support tables (K=80 standard slots; BT-populated K=64) live under `data/atlas/dk_support/` (per-pt CSV, lookup-only); cross-attn bias = `log(support[e, p] + ε)`, ε=1e-2.
+- `data/atlas/BNA_PM_4D.nii.gz` — Brainnetome PM volume. **Gated future P1 ablation only** (`BNA-soft-P1-gated-on-Chris`); NOT the v14 active atlas. Pre-2026-05-13 BNA-as-only-atlas-source line is stale; do not revive without explicit Chris-Wang signal.
+- `data/atlas/support_cache_v2c_snap/<pt>_support_tier1.csv` — per-electrode Tier-1 BNA support (legacy artifact, retained for the BNA-soft sister; v14 default uses DK support instead).
 - `data/fsaverage_coords/<pt>_fsaverage_pial.csv` — strict snap-to-pial coordinates.
 
 ### Box mount (macOS laptop)
@@ -158,9 +162,10 @@ Active module layout under `src/speech_decoding/` after the NeuroAI reset:
 - **`models/`** — empty shell until v14 Perceiver IO lands.
 - **Training** — do not recreate the old `training/` package. Add NeuralTrain pydantic `Data` and `Experiment` classes (already scaffolded under `experiments/`) when Stage 0 training begins.
 
+- **`ssl/`** — v14 self-supervised pretraining primitives. `ema.py` (EMA teacher + StopGrad), `recon.py` (masked Phase-1/2 reconstruction loss), `distill.py` (Phase-3 Whisper-L8 distillation loss), `koleo.py` (optional readout uniformity), `warmup.py` (λ schedulers). Per-phase loss composition lives in the NeuralTrain Experiment, not here.
+
 **Empty-package rule**: don't create a subpackage until the first real file lands. Documented intents:
 - `events/` — first cross-cohort event subclass or transform.
-- `ssl/` — Stage 2 SSL kickoff (`d_siglip.py`, `projection.py`, JEPA-target generation, EMA teacher).
 - `studies/cogan_seeg/`, `studies/cogan_lex/` — Stage-3 / Stage-2 PS-extension.
 
 Tests colocated next to modules. Active package stays small: NeuroAI integration plus v14 science only. Reorg blueprint: `docs/neuroprobe/repo_reorg_plan.md`. Adapter spec: `docs/neuroprobe/neuralset_integration_plan.md`.
@@ -185,9 +190,11 @@ All training on DCC, never local. Repo: `/work/ht203/repo/speech`. Python: `.ven
 - **No sweep without a collector.** A `submit_*` script is not dispatched until its paired `collect_*`/`analyze_*` exists. A sweep is not *done* until results are pulled, analyzed, and recorded under `docs/experiments/`.
 - **Every dispatch is logged.** `scripts/dcc/dispatch` appends a row to `docs/experiments/dispatch_log.csv`. Rows still `dispatched` are open loops — clear them (pull + analyze, set `analyzed`) before launching new sweeps.
 
-## Preprocessing Pipeline (do not change)
+## Preprocessing Pipeline — PS uECoG HG-envelope (do not change)
 
-Decimate 2kHz → CAR → impedance exclusion (log10 > 6) → 70–150 Hz Gaussian filterbank (8 bands) → Hilbert envelope → sum → 200 Hz → z-score → sig-channel selection. In `coganlab/IEEG_Pipelines`. **Z-score is per-channel mean/std pooled across all pre-auditory baseline trials + samples** (500 ms window immediately before auditory-stim onset; verified 2026-04-18 via reconstruction test on 7 patients, corr = 1.0000). NOT per-trial and NOT pre-production. **Recording-level median/MAD ≡ this recipe up to per-channel affine** (ρ=1.0000 across tested patients) — SSL (Stage 2) can swap recipes without bit-exact constraints. Details: `docs/references/data_reference.md`.
+**Scope**: this recipe is PS-only (paused program). The v14 Neuroprobe-path preproc is different — see `memory/project_v14_preproc_recipe_2026_05_12.md` (canonical) for HPF + per-corpus notch + MNE-LOF + shaftCAR + Multi-STFT-abs + Nv14 robust-z.
+
+PS recipe: Decimate 2kHz → CAR → impedance exclusion (log10 > 6) → 70–150 Hz Gaussian filterbank (8 bands) → Hilbert envelope → sum → 200 Hz → z-score → sig-channel selection. In `coganlab/IEEG_Pipelines`. **Z-score is per-channel mean/std pooled across all pre-auditory baseline trials + samples** (500 ms window immediately before auditory-stim onset; verified 2026-04-18 via reconstruction test on 7 patients, corr = 1.0000). NOT per-trial and NOT pre-production. **Recording-level median/MAD ≡ this recipe up to per-channel affine** (ρ=1.0000 across tested patients) — SSL (Stage 2) can swap recipes without bit-exact constraints. Details: `docs/references/data_reference.md`.
 
 ## Conventions
 

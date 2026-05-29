@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -201,6 +203,14 @@ def test_btwordevents_run_appends_word_rows_with_split(monkeypatch) -> None:
     assert (words["label"].isin([0, 1])).all()
 
 
+@pytest.mark.skipif(
+    os.environ.get("ROOT_DIR_BRAINTREEBANK") is None,
+    reason=(
+        "neuroprobe.config imports os.environ['ROOT_DIR_BRAINTREEBANK'] at "
+        "module-import time; skip on environments without BT data mounted "
+        "(local). Runs cleanly on DCC where ROOT_DIR_BRAINTREEBANK is set."
+    ),
+)
 def test_btwordevents_real_vendored_csvs_balanced_val_test_halves(monkeypatch) -> None:
     """Regression for the chronological-sort bug: on real (2, 0) + (2, 4) speech
     data, ``val`` and ``test`` halves must each be exactly 50/50 balanced.
