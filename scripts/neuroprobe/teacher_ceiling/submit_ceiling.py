@@ -240,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--extract-time", default="04:00:00")
     p.add_argument("--probe-cpus", type=int, default=8)
     p.add_argument("--probe-mem", default="48G")
-    p.add_argument("--probe-time", default="02:00:00")
+    p.add_argument("--probe-time", default="08:00:00")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 

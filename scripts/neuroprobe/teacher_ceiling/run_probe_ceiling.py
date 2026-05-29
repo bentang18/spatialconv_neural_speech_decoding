@@ -187,6 +187,41 @@ def run_within_trial(
     return results
 
 
+def _write_csv(rows: list[dict], path: Path) -> None:
+    """Atomic incremental dump of `rows` to `path`. Called after every probe
+    pass + every cross-movie LOSO task so a SLURM time-limit kill never loses
+    more than one task's worth of fits."""
+    if not rows:
+        return
+    fieldnames = sorted({k for row in rows for k in row})
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(path)
+
+
+def _cm_fit_unit(
+    X_train: np.ndarray, y_train: np.ndarray,
+    X_test: np.ndarray, y_test: np.ndarray,
+    task: str, key_label: str, held_out: str, seed: int,
+) -> dict:
+    """One cross-movie LOSO fit. Returns the CSV row. Threading-safe: sklearn
+    Ridge's cholesky path releases the GIL during the scipy linalg.solve call,
+    and OMP_NUM_THREADS=1 (set at module top) prevents BLAS thread contention."""
+    r = fit_probe_train_test(
+        X_train, y_train, X_test, y_test,
+        task=task, layer=key_label, split="cross_movie", seed=seed,
+    )
+    return {
+        "subject_id": -1, "trial_id": -1, "held_out_movie": held_out,
+        "task": r.task, "layer": key_label, "split": r.split,
+        "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
+        "seed": r.seed,
+    }
+
+
 def collect_trial_paths(features_dir: Path) -> dict[tuple[int, int], str]:
     out: dict[tuple[int, int], str] = {}
     for path in sorted(features_dir.glob("sub_*_trial*.npz")):
@@ -232,6 +267,7 @@ def main() -> None:
         tasks = [t for t in tasks if t in args.tasks]
 
     rows: list[dict] = []
+    out_csv = args.out_dir / "ceiling_results.csv"
 
     # === WITHIN-TRIAL ===
     # Pass NPZ paths through the joblib closure, not the materialized feature
@@ -268,6 +304,8 @@ def main() -> None:
                 "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
                 "seed": r.seed,
             })
+    _write_csv(rows, out_csv)
+    print(f"[probe] PASS 1 done -> wrote {len(rows)} rows to {out_csv}", flush=True)
 
     # Downstream passes (top-3 concat, cross-session, cross-subject) still
     # operate on the in-memory feature dicts. PASS 1 has finished, so loading
@@ -336,6 +374,8 @@ def main() -> None:
                 "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
                 "seed": r.seed,
             })
+    _write_csv(rows, out_csv)
+    print(f"[probe] PASS 2 done -> wrote {len(rows)} rows to {out_csv}", flush=True)
 
     # Update layer_keys to include the concat_top_3 sister for downstream splits
     layer_keys: list = list(base_layer_keys)
@@ -393,6 +433,7 @@ def main() -> None:
                 f"({time.time() - t_css:.1f}s)",
                 flush=True,
             )
+            _write_csv(rows, out_csv)
 
     # === CROSS-MOVIE LOSO ===
     # The teacher-ceiling probe sees Whisper features extracted from the WAV;
@@ -438,6 +479,12 @@ def main() -> None:
                 for k in keys_for_task
             }
             movie_y[movie] = y
+        # Per-fold: build (X_train, y_train, X_test, y_test) for every key, then
+        # dispatch all key-fits in parallel via joblib threading. Sklearn's Ridge
+        # cholesky path releases the GIL during scipy linalg.solve, and BLAS is
+        # pinned single-thread, so per-fold wall ≈ (slowest-key) instead of
+        # sum-over-keys. Build per fold (not all folds) to cap peak memory at
+        # ~5 GB instead of ~50 GB.
         for held_out in movies:
             if held_out not in movie_X:
                 continue
@@ -446,6 +493,7 @@ def main() -> None:
                 continue
             y_train = np.concatenate([movie_y[m] for m in train_movies], axis=0)
             y_test = movie_y[held_out]
+            fold_units = []
             for key in keys_for_task:
                 key_repr = repr(key)
                 X_train = np.concatenate(
@@ -456,33 +504,25 @@ def main() -> None:
                     key_label = f"concat_top3_{'_'.join(map(str, key[2]))}"
                 else:
                     key_label = str(key)
-                r = fit_probe_train_test(
-                    X_train, y_train, X_test, y_test,
-                    task=task, layer=key_label, split="cross_movie",
-                    seed=args.seed,
+                fold_units.append(
+                    (X_train, y_train, X_test, y_test, task, key_label, held_out)
                 )
-                rows.append({
-                    "subject_id": -1,
-                    "trial_id": -1,
-                    "held_out_movie": held_out,
-                    "task": r.task, "layer": key_label, "split": r.split,
-                    "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
-                    "seed": r.seed,
-                })
+            fold_rows = Parallel(n_jobs=n_jobs, backend="threading", verbose=0)(
+                delayed(_cm_fit_unit)(*u, seed=args.seed) for u in fold_units
+            )
+            assert fold_rows is not None
+            rows.extend(fold_rows)
+        _write_csv(rows, out_csv)
         print(
             f"[probe]   task={task} cross-movie LOSO done "
-            f"({time.time() - t_cm:.1f}s)",
+            f"({time.time() - t_cm:.1f}s) -> {len(rows)} rows persisted",
             flush=True,
         )
 
-    # Write CSV
-    out_csv = args.out_dir / "ceiling_results.csv"
-    fieldnames = sorted({k for row in rows for k in row})
-    with open(out_csv, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"[probe] wrote {len(rows)} rows -> {out_csv}", flush=True)
+    # Final write (idempotent — incremental writes after each pass already
+    # persist; this guarantees the file matches the in-memory rows list).
+    _write_csv(rows, out_csv)
+    print(f"[probe] FINAL: wrote {len(rows)} rows -> {out_csv}", flush=True)
 
     summary = {
         "n_trials": len(trial_features),
