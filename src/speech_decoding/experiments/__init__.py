@@ -2,7 +2,7 @@
 
 from speech_decoding.experiments.data import Data
 from speech_decoding.experiments.experiment import Experiment
-from speech_decoding.experiments.logging import (
+from speech_decoding.experiments.experiment_logging import (
     ExperimentLogger,
     ExperimentRunRecord,
     collect_experiment_records,

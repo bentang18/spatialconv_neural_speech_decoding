@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from speech_decoding.experiments.logging import (
+from speech_decoding.experiments.experiment_logging import (
     EXPERIMENT_EVENTS_NAME,
     EXPERIMENT_RECORD_NAME,
     RUN_RECORD_FIELDS,

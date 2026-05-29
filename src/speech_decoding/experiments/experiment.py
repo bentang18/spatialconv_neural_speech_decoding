@@ -16,7 +16,7 @@ from neuraltrain import BaseLoss, BaseMetric, BaseModelConfig, LightningOptimize
 from neuraltrain.utils import BaseExperiment, CsvLoggerConfig, WandbLoggerConfig
 
 from speech_decoding.experiments.data import Data
-from speech_decoding.experiments.logging import ExperimentLogger
+from speech_decoding.experiments.experiment_logging import ExperimentLogger
 from speech_decoding.experiments.module import BrainModule
 
 
