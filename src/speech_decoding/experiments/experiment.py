@@ -46,6 +46,13 @@ class Experiment(BaseExperiment):
     fast_dev_run: bool | int = False
     accelerator: str = "auto"
     devices: int | str = "auto"
+    # Lightning trainer precision. Default ``None`` → fp32 (back-compat).
+    # Pass ``"bf16-mixed"`` for activation-half precision on Ada/Hopper
+    # GPUs; pass ``"16-mixed"`` for older fp16 mixed (requires GradScaler
+    # under the hood). Added 2026-05-29 after the B31 Lite Phase-4 baseline
+    # OOM'd repeatedly on RTX 5000 Ada at fp32 — see
+    # [[feedback_dcc_partition_default_coganlab_gpu_2026_05_29]].
+    precision: str | None = None
     log_every_n_steps: int = 10
     limit_train_batches: int | float | None = None
     limit_val_batches: int | float | None = None
@@ -137,6 +144,8 @@ class Experiment(BaseExperiment):
             kwargs["limit_val_batches"] = self.limit_val_batches
         if self.limit_test_batches is not None:
             kwargs["limit_test_batches"] = self.limit_test_batches
+        if self.precision is not None:
+            kwargs["precision"] = self.precision
         return pl.Trainer(**kwargs)
 
     def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:

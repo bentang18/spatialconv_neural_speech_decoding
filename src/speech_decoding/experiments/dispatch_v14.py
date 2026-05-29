@@ -233,6 +233,12 @@ def build_v14_experiment(
     gpus_per_node: int | None = None,
     cpus_per_task: int | None = None,
     timeout_min: int | None = None,
+    # Lightning trainer precision. v14 first-pass default is bf16-mixed
+    # per 2026-05-29 OOM diagnosis on RTX 5000 Ada (31 GiB): factorized
+    # per-electrode SA over C=384 padded electrodes at d=256 exhausts
+    # fp32 activations even at BS=8. bf16-mixed halves activation memory
+    # at the standard transformer-training precision floor.
+    precision: str | None = "bf16-mixed",
     fast_dev_run: bool | int = False,
     # B28 DKoleo demotion 2026-05-27 PM: select the DKoleo @ M4 unit
     # (or disable). Plumbed onto the brain-model config so the SSL
@@ -619,6 +625,7 @@ def build_v14_experiment(
         ),
         accelerator="auto",
         devices="auto",
+        precision=precision,
         fast_dev_run=fast_dev_run,
         **extra_experiment_kwargs,
     )
@@ -670,6 +677,16 @@ def _parser() -> argparse.ArgumentParser:
                         "parallelism).")
     p.add_argument("--timeout-min", type=int, default=None,
                    help="Slurm timeout in minutes (e.g. 720 = 12h).")
+    # Lightning trainer precision. Default 'bf16-mixed' was chosen 2026-05-29
+    # after the B31 Lite Phase-4 baseline OOM'd on RTX 5000 Ada (31 GiB) at
+    # every batch size tried — factorized per-electrode SA over C=384 padded
+    # electrodes at d=256 exhausts fp32 activations. bf16-mixed halves
+    # activation memory at the standard transformer-training precision floor.
+    # Pass '32-true' (or 'fp32') to restore the prior fp32 default.
+    p.add_argument("--precision", default="bf16-mixed",
+                   help="Lightning trainer precision. Default 'bf16-mixed' "
+                        "per 2026-05-29 OOM diagnosis on RTX 5000 Ada. Pass "
+                        "'32-true' or '16-mixed' to override.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
@@ -954,6 +971,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  slurm: partition={args.slurm_partition} mem_gb={args.mem_gb} "
               f"gpus_per_node={args.gpus_per_node} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
+    print(f"  precision={args.precision}")
 
     cross_attn_positions: list[int] | None = None
     if args.cross_attn_positions is not None:
@@ -981,6 +999,7 @@ def main(argv: list[str] | None = None) -> int:
         gpus_per_node=args.gpus_per_node,
         cpus_per_task=args.cpus_per_task,
         timeout_min=args.timeout_min,
+        precision=args.precision,
         dkoleo_mode=args.dkoleo_mode,
         cross_attn_positions=cross_attn_positions,
         mains_notch_hz=args.mains_notch_hz,
