@@ -166,11 +166,15 @@ class SubjectSubtypeExtractor(CARIeegExtractor):
         self, event, start: float, duration: float,
     ) -> TimedArray:
         idx = self._resolve_idx(event)
+        # Shape (1, 1) = (1 channel, 1 sample) — see RefIdxExtractor for
+        # the same NeuralSet BaseExtractor invariant. A 1-d data array
+        # crashes ``torch.zeros(*tensor.shape[:-1])`` on the zero-duration
+        # prepare call.
         return TimedArray(
             frequency=1.0 / float(duration),
             start=start,
             duration=duration,
-            data=np.asarray([idx], dtype=np.int64),
+            data=np.asarray([[idx]], dtype=np.int64),
         )
 
 
@@ -226,5 +230,5 @@ class LambdaAnatExtractor(CARIeegExtractor):
             frequency=1.0 / float(duration),
             start=start,
             duration=duration,
-            data=np.asarray([value], dtype=np.float32),
+            data=np.asarray([[value]], dtype=np.float32),
         )

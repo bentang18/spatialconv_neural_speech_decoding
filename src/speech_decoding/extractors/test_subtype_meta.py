@@ -54,7 +54,7 @@ def test_subject_subtype_default_emits_zero_for_bt() -> None:
     )
     assert isinstance(out, TimedArray)
     arr = np.asarray(out.data)
-    assert arr.shape == (1,)
+    assert arr.shape == (1, 1)
     assert arr.dtype == np.int64
     assert int(arr.item()) == 0  # depth
 
@@ -163,7 +163,7 @@ def test_lambda_anat_anatomy_rich_corpus_gates_on() -> None:
     )
     assert isinstance(out, TimedArray)
     arr = np.asarray(out.data)
-    assert arr.shape == (1,)
+    assert arr.shape == (1, 1)
     assert arr.dtype == np.float32
     assert float(arr.item()) == 1.0
 
