@@ -153,6 +153,57 @@ def test_v14_joint_experiment_rejects_every_phase_except_canonical_joint() -> No
             )
 
 
+def test_v14_joint_experiment_accepts_b30_sister_flag_defaults() -> None:
+    """B30-dispatch-sister-flags: default values match the B30 lock and
+    construct without raising."""
+    from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
+
+    # Minimal payload: pydantic on V14JointExperiment / V14Experiment /
+    # Experiment requires several other fields. Use ``model_construct``
+    # to bypass nested validation and just test the sister-flag
+    # post-init guard, which is what the row tracks.
+    xp = V14JointExperiment.model_construct(
+        phase=JOINT_PHASE_VALUE,
+        latent_valid_override="support",
+        sa_mask_mode="bidirectional",
+    )
+    xp.model_post_init(None)
+    assert xp.latent_valid_override == "support"
+    assert xp.sa_mask_mode == "bidirectional"
+
+
+def test_v14_joint_experiment_rejects_b30_sister_latent_valid_override() -> None:
+    """B30 sister falsifier ``R-item-12-all-true`` raises
+    :class:`NotImplementedError` until B2.2 lands the aggregator-call
+    branch that actually consumes ``latent_valid_override != "support"``.
+    Drift-table row ``B30-dispatch-sister-flags``."""
+    from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
+
+    # ``model_construct`` triggers ``model_post_init`` in pydantic v2 so
+    # the NotImplementedError lands at construction time, not on a later
+    # explicit ``model_post_init(None)``.
+    with pytest.raises(NotImplementedError, match="B2.2"):
+        V14JointExperiment.model_construct(
+            phase=JOINT_PHASE_VALUE,
+            latent_valid_override="all_true",
+            sa_mask_mode="bidirectional",
+        )
+
+
+def test_v14_joint_experiment_rejects_b30_sister_sa_mask_mode() -> None:
+    """B30 sister falsifier ``R-sa-key-only`` raises
+    :class:`NotImplementedError` until the encoder latent-SA key-only
+    branch lands. Drift-table row ``B30-dispatch-sister-flags``."""
+    from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
+
+    with pytest.raises(NotImplementedError, match="key-only"):
+        V14JointExperiment.model_construct(
+            phase=JOINT_PHASE_VALUE,
+            latent_valid_override="support",
+            sa_mask_mode="key_only",
+        )
+
+
 def test_v14_joint_loss_form_l1_not_smooth_l1() -> None:
     """B26 correction (5/27 PM) over B25 (5/27 AM): the per-term loss
     form is *pure L1*, not Smooth-L1. The encoded loss must not collapse

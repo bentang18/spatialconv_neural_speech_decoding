@@ -40,6 +40,7 @@ from speech_decoding.extractors.ref_aug import (
     RefAugMultiStftView,
     RefIdxExtractor,
 )
+from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 from speech_decoding.extractors.subtype_meta import (
     LambdaAnatExtractor,
     SubjectSubtypeExtractor,
@@ -237,6 +238,14 @@ def build_v14_experiment(
     # remaining blocker IDs so wiring the dispatch never silently
     # downgrades to Phase-4 CE.
     joint_phase: bool = False,
+    # B30-dispatch-sister-flags (drift-table row added 2026-05-28 by R12
+    # wiring audit). Default values match the B30 lock; non-default
+    # values flag :class:`NotImplementedError` from
+    # :class:`V14JointExperiment.model_post_init` until the corresponding
+    # runtime branch (B2.2 aggregator-call / encoder latent-SA key-only)
+    # lands. Persisted onto the run record so the choice is grep-able.
+    latent_valid_override: str = "support",
+    sa_mask_mode: str = "bidirectional",
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -412,16 +421,34 @@ def build_v14_experiment(
         corpus="braintreebank",
     )
 
+    # B03 shaft-mask (5/27 PM final spec): student-only paradigm-B
+    # electrode drop. Only constructed for the joint SSL phase — the
+    # supervised Phase-4 dispatch never reads a shaft-mask (the BrainModule
+    # does not exist on that path). The :class:`V14JointBrainModule`
+    # routes ``batch.data["shaft_mask"]`` student-only per the B26
+    # teacher full-input contract.
+    segmenter_extractors: dict[str, tp.Any] = {
+        "electrode_tokens": electrode_tokens_extractor,
+        "support": dk_extractor,
+        "valid_mask": valid_mask_extractor,
+        "ref_idx": ref_idx_extractor,
+        "subject_subtype": subtype_extractor,
+        "lambda_anat": lambda_anat_extractor,
+    }
+    if joint_phase:
+        segmenter_extractors["shaft_mask"] = BTShaftMaskExtractor(
+            event_types="Ieeg",
+            bt_root=bt_root,
+            c_max=DEFAULT_C_MAX,
+            seed=seed,
+            unknown_label_policy="skip",
+        )
+
     data = Data(
         study=chain,
         segmenter={
             "extractors": {
-                "electrode_tokens": electrode_tokens_extractor,
-                "support": dk_extractor,
-                "valid_mask": valid_mask_extractor,
-                "ref_idx": ref_idx_extractor,
-                "subject_subtype": subtype_extractor,
-                "lambda_anat": lambda_anat_extractor,
+                **segmenter_extractors,
                 "target": {
                     "name": "EventField",
                     "event_types": "Word",
@@ -453,7 +480,27 @@ def build_v14_experiment(
             V14JointExperiment,
         )
         experiment_cls = V14JointExperiment
-        extra_experiment_kwargs = {"phase": JOINT_PHASE_VALUE}
+        extra_experiment_kwargs = {
+            "phase": JOINT_PHASE_VALUE,
+            # B30-dispatch-sister-flags persisted onto the joint
+            # experiment so the run-record YAML records the sister
+            # choice; the field validators in V14JointExperiment refuse
+            # non-default values until the runtime branch lands.
+            "latent_valid_override": latent_valid_override,
+            "sa_mask_mode": sa_mask_mode,
+        }
+    elif latent_valid_override != "support" or sa_mask_mode != "bidirectional":
+        # B30 sister flags only have semantic effect under the joint
+        # phase. The supervised Phase-4 path doesn't run the SSL
+        # aggregator or the bidirectional-mask latent-SA branch, so a
+        # non-default flag here would silently mis-record the sister.
+        raise ValueError(
+            "latent_valid_override / sa_mask_mode are B30 sister "
+            "selectors for the joint phase only; got "
+            f"latent_valid_override={latent_valid_override!r}, "
+            f"sa_mask_mode={sa_mask_mode!r} with joint_phase=False. "
+            "Pass --phase 1 (joint) when setting these flags."
+        )
 
     return experiment_cls(
         data=data,
@@ -614,6 +661,25 @@ def _parser() -> argparse.ArgumentParser:
              "the split P1/P2 path ('split_p1_p2', sister R-keep-phase-split).",
     )
     p.add_argument(
+        "--latent-valid-override",
+        choices=("support", "all_true", "parcels_supervised"),
+        default="support",
+        help="B30 sister selector for the latent-validity mask source. "
+             "'support' (default) is the B30 lock; 'all_true' is "
+             "R-item-12-all-true P0; 'parcels_supervised' is "
+             "R-parcels-supervised-gating (retired-into-default falsifier). "
+             "Sisters raise NotImplementedError until B2.2 lands.",
+    )
+    p.add_argument(
+        "--sa-mask-mode",
+        choices=("bidirectional", "key_only"),
+        default="bidirectional",
+        help="B30 sister selector for the latent self-attention mask "
+             "shape. 'bidirectional' (default) is the B30 lock; "
+             "'key_only' is R-sa-key-only P1. Sister raises "
+             "NotImplementedError until the encoder branch lands.",
+    )
+    p.add_argument(
         "--anatomy-bias-mode",
         choices=ANATOMY_BIAS_MODES, default=DEFAULT_ANATOMY_BIAS_MODE,
         help="Anatomy-bias schedule. 'per_clip_gate_b29' (default) uses "
@@ -675,12 +741,20 @@ _PHASE1_BLOCKERS = (
     # Retained as a string for the test-harness substring contract; the
     # blockers below now fire from V14JointExperiment._train_and_test,
     # not from the dispatch.
-    "B2.2 (compose 4-term L_total via ssl/aggregator.py with B30 latent_valid), "
-    "B2.3 (shaft-mask + ref_aug + ref_embed extractors — B03 / REF-01 / REF-02), "
-    "B2.4 (B02 sampler — WRS over valid-bin-electrode-hours + StatefulDataLoader), "
-    "B2.5 (monitors + best-val probe callback), "
+    # B2.2 (#97) closed 2026-05-28: V14JointBrainModule composes the
+    # B28/B29 4-term aggregator with B30 latent_valid.
+    # B2.3 (#98) closed 2026-05-28: BTShaftMaskExtractor + RefAugMultiStftView
+    # + ref_embed wired into the joint segmenter.
+    # B2.4 (#99) closed 2026-05-28: WRS primitive landed; full multi-corpus
+    # loader integration deferred to multi-corpus loader build.
+    # B2.5 (#100) closed 2026-05-28: MON-MASK-002 + MON-MASK-004 +
+    # BestValProbeR2Callback landed; MON-MASK-002 wired into joint module
+    # step; the periodic monitors + probe callback are constructed at
+    # dispatch time when a probe loader is supplied (see
+    # ``construct_v14_joint_callbacks``).
+    "B2.6 (pre-dispatch test gate — TST01/03/05/10 + RT10), "
     "B30-dispatch-sister-flags (latent_valid_override + sa_mask_mode), "
-    "per-corpus mains notch (60 Hz US / 50 Hz SWEC)"
+    "multi-corpus loader build (B02 plumbing + per-corpus mains notch live)"
 )
 _PHASE2_BLOCKERS = (
     # B29 Item 1 collapsed P1 + P2 into a single joint phase; dispatch
@@ -700,6 +774,53 @@ _PHASE3_BLOCKERS = (
     "Phase-3 distillation gated on a frozen SSL checkpoint from Phase-1+2 "
     "(joint phase per B29 Item 1); see ssl/distill.py + experiments/phase3_preflight.py"
 )
+
+
+def construct_v14_joint_callbacks(
+    *,
+    probe_dataloader: tp.Optional[tp.Iterable[tp.Any]] = None,
+    probe_mode: tp.Literal["regression", "binary_classification"] = "binary_classification",
+    co_save_ema_teacher: bool = True,
+    seed: int = 0,
+) -> list[tp.Any]:
+    """Build the dispatch-time callbacks for V14JointBrainModule.
+
+    Currently a single callback: the S06 best-val probe-r² / AUROC. The
+    periodic MON-* canaries (slot-redundancy, sensor-type, ref-type,
+    head-balance, MON-MASK-004) are stateless pure functions; the
+    canary cadence + sustain-window state lives in the training loop's
+    Lightning callbacks once the multi-corpus loader build supplies the
+    probe-batch sources.
+
+    When ``probe_dataloader`` is ``None`` the function returns an empty
+    list — the joint module still runs MON-MASK-002 inline (B03d), but
+    nothing else is registered. This keeps the dispatch path unblocked
+    for the BT-Lite sister cell (which has no probe loader yet).
+
+    Args:
+        probe_dataloader: held-out probe DataLoader (one batch per
+            validation epoch). Items yield ``{"electrode_tokens",
+            "support", "probe_label"}``. S06 default: speech-onset
+            binary on sub-1, M07 session held-out, 5-fold CV.
+        probe_mode: ``"regression"`` (r²) or ``"binary_classification"``
+            (AUROC). S06 default is binary (speech-onset).
+        co_save_ema_teacher: S06 §3 lock — every checkpoint carries the
+            EMA teacher state.
+        seed: deterministic fold permutation seed.
+    """
+    from speech_decoding.experiments.best_val_probe import BestValProbeR2Callback
+
+    callbacks: list[tp.Any] = []
+    if probe_dataloader is not None:
+        callbacks.append(
+            BestValProbeR2Callback(
+                probe_dataloader=probe_dataloader,
+                mode=probe_mode,
+                co_save_ema_teacher=co_save_ema_teacher,
+                seed=seed,
+            )
+        )
+    return callbacks
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -765,6 +886,8 @@ def main(argv: list[str] | None = None) -> int:
         joint_phase=(args.phase == 1),
         include_ajile12=args.include_ajile12,
         ffn_variant=args.ffn_variant,
+        latent_valid_override=args.latent_valid_override,
+        sa_mask_mode=args.sa_mask_mode,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

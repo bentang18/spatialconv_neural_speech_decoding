@@ -51,24 +51,29 @@ def test_phase_1_dry_run_constructs_joint_experiment_path(
     assert "V14 dispatch" in out
 
 
-def test_phase_1_train_step_still_gated_on_ssl_blockers() -> None:
-    """B2.1 (#96) only wires the dispatch-side construction. The
-    training-step itself raises with the B2.2-B2.5 blocker IDs until
-    those tasks land."""
+def test_phase_1_build_brain_module_uses_joint_ssl_module() -> None:
+    """B2.2 (#97): the joint Experiment now overrides
+    :meth:`_build_brain_module` to construct
+    :class:`V14JointBrainModule` (EMA teacher + 3 LN heads + PMA + 4-term
+    aggregator) instead of the parent CE-classifier ``BrainModule``.
+    Confirms the surface exists and is grep'able; the actual training
+    loop is exercised end-to-end by the synthetic-batch test in
+    :mod:`test_v14_joint_module`."""
+    import inspect
+
     from speech_decoding.experiments.v14_joint import (
         JOINT_PHASE_VALUE,
         V14JointExperiment,
     )
-    # Skip the full Experiment construction path (Data/BrainModule/etc.)
-    # and verify the gate by calling the unbound method directly — the
-    # body raises immediately, so ``self`` is never dereferenced.
-    with pytest.raises(NotImplementedError) as exc_info:
-        V14JointExperiment._train_and_test(
-            None,  # type: ignore[arg-type]
-        )
-    msg = str(exc_info.value)
-    for token in ("B2.2", "B2.3", "B2.4", "B2.5", "latent_valid"):
-        assert token in msg, f"missing blocker id {token}"
+    from speech_decoding.experiments.v14_joint_module import V14JointBrainModule
+
+    src = inspect.getsource(V14JointExperiment._build_brain_module)
+    assert "V14JointBrainModule" in src, (
+        "V14JointExperiment._build_brain_module must construct a "
+        "V14JointBrainModule (B2.2 wiring)."
+    )
+    # Sanity: the override is grep'able from the symbol surface too.
+    assert V14JointBrainModule.__name__ == "V14JointBrainModule"
     assert JOINT_PHASE_VALUE == 1
 
 

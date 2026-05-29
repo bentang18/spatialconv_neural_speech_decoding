@@ -718,3 +718,36 @@ def test_b_cr_3_brain_model_config_carries_ssl_dispatch_flags(
     assert cfg.dkoleo_mode == "vicreg_slot_variance"
     assert cfg.phase_mode == "split_p1_p2"
     assert cfg.anatomy_bias_mode == "warmup_b28"
+
+
+def test_b23_dispatch_joint_phase_wires_shaft_mask_extractor(
+    tmp_path, monkeypatch,
+) -> None:
+    """B2.3 / B03 lock 2026-05-27 PM: the joint SSL dispatch wires a
+    :class:`BTShaftMaskExtractor` under the ``shaft_mask`` key. The
+    student-only routing (teacher full-input contract) is enforced by
+    :class:`V14JointBrainModule._extract_student_kwargs` — this test
+    locks the segmenter-side wiring."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano", joint_phase=True)
+    extractors = xp.data.segmenter.extractors
+    assert "shaft_mask" in extractors, (
+        "joint phase must wire the BT shaft-mask extractor"
+    )
+    assert isinstance(extractors["shaft_mask"], BTShaftMaskExtractor)
+
+
+def test_b23_dispatch_supervised_phase_4_omits_shaft_mask(
+    tmp_path, monkeypatch,
+) -> None:
+    """Phase-4 supervised dispatch does NOT run the joint BrainModule, so
+    the shaft-mask extractor stays absent (avoids a no-op extractor +
+    cache cost on the downstream classifier path)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")  # joint_phase=False
+    extractors = xp.data.segmenter.extractors
+    assert "shaft_mask" not in extractors, (
+        "supervised Phase-4 path must NOT wire the shaft-mask extractor"
+    )

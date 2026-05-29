@@ -7,16 +7,25 @@ import torch
 
 from speech_decoding.experiments.monitors import (
     BATCH_COS_PCT95_THRESHOLD,
+    CHANCE_F1_BT9,
     DIAG_ZEROED_MEAN_THRESHOLD,
+    ESCALATE_SHAFT_K2,
+    ESCALATE_STRATIFIED_SHAFT_MASK,
     HEAD_BALANCE_BOUNDS,
+    MASK_ORPHAN_MAX_RATIO,
+    MASK_ORPHAN_MIN_RATIO,
     PER_CLIP_COS_PCT95_THRESHOLD,
     PROBE_BATCH_SIZE_M1_DEFAULT,
     REF_TYPE_CANARY_F1_THRESHOLD,
     SENSOR_TYPE_CANARY_F1_THRESHOLD,
+    SUBJECT_ID_LEAKAGE_F1_THRESHOLD,
+    compute_orphan_parcels,
     head_balance_monitor,
+    mask_orphan_ratio_monitor,
     ref_type_canary_monitor,
     sensor_type_canary_monitor,
     slot_redundancy_monitor,
+    subject_id_leakage_monitor,
 )
 
 
@@ -210,3 +219,230 @@ def test_head_balance_dominating_head_flagged_but_does_not_kill() -> None:
 def test_head_balance_rejects_non_4d_input() -> None:
     with pytest.raises(ValueError, match="must be"):
         head_balance_monitor(torch.zeros(2, 4, 8))
+
+
+# ---------------------------------------------------------------------------
+# MON-MASK-002 (mask_orphan_ratio)
+# ---------------------------------------------------------------------------
+
+
+def test_mask_orphan_ratio_band_locked_at_0p7_1p5() -> None:
+    """B03d lock: healthy band is [0.7, 1.5] under K=1 default."""
+    assert MASK_ORPHAN_MIN_RATIO == 0.7
+    assert MASK_ORPHAN_MAX_RATIO == 1.5
+
+
+def test_mask_orphan_ratio_balanced_signal_in_band() -> None:
+    """When orphan & visible parcels have similar per-parcel MSE, the
+    ratio is 1.0 and ``in_band`` is True."""
+    torch.manual_seed(0)
+    B, P, T, d = 4, 8, 5, 6
+    # Student and teacher differ by the same iid noise everywhere → per-
+    # parcel MSE is equal in expectation across parcels.
+    student = torch.randn(B, P, T, d)
+    noise = torch.randn(B, P, T, d) * 0.1
+    teacher = student + noise
+    orphan = torch.zeros(P, dtype=torch.bool)
+    orphan[:3] = True  # first 3 parcels are orphan, rest visible
+    verdict = mask_orphan_ratio_monitor(
+        student, teacher, orphan, parcel_dim=1,
+    )
+    assert verdict.in_band is True
+    assert verdict.escalations == ()
+    assert MASK_ORPHAN_MIN_RATIO <= verdict.ratio <= MASK_ORPHAN_MAX_RATIO
+
+
+def test_mask_orphan_ratio_below_band_escalates_stratified() -> None:
+    """Orphan MSE much smaller than visible MSE (mean-collapse signature)
+    → ``R-stratified-shaft-mask`` escalation."""
+    B, P, T, d = 2, 6, 4, 4
+    student = torch.zeros(B, P, T, d)
+    teacher = torch.zeros(B, P, T, d)
+    # Orphan parcels: student ≈ teacher (tiny error). Visible parcels:
+    # large error.
+    orphan = torch.zeros(P, dtype=torch.bool)
+    orphan[:3] = True
+    teacher[:, orphan] = 0.01    # tiny error on orphan side
+    teacher[:, ~orphan] = 1.0    # big error on visible side
+    verdict = mask_orphan_ratio_monitor(
+        student, teacher, orphan, parcel_dim=1,
+    )
+    assert verdict.ratio < MASK_ORPHAN_MIN_RATIO
+    assert verdict.in_band is False
+    assert ESCALATE_STRATIFIED_SHAFT_MASK in verdict.escalations
+
+
+def test_mask_orphan_ratio_above_band_escalates_shaft_k2() -> None:
+    """Orphan MSE much larger than visible MSE (student failing the
+    prediction task) → ``R-shaft-K2`` escalation."""
+    B, P, T, d = 2, 6, 4, 4
+    student = torch.zeros(B, P, T, d)
+    teacher = torch.zeros(B, P, T, d)
+    orphan = torch.zeros(P, dtype=torch.bool)
+    orphan[:3] = True
+    teacher[:, orphan] = 5.0     # huge error on orphan side
+    teacher[:, ~orphan] = 0.5    # small error on visible side
+    verdict = mask_orphan_ratio_monitor(
+        student, teacher, orphan, parcel_dim=1,
+    )
+    assert verdict.ratio > MASK_ORPHAN_MAX_RATIO
+    assert verdict.in_band is False
+    assert ESCALATE_SHAFT_K2 in verdict.escalations
+
+
+def test_mask_orphan_ratio_no_orphan_returns_nan_verdict() -> None:
+    """Batch with no orphan parcels → ratio = nan, no escalation, training
+    loop must not tick the sustain counter."""
+    B, P, T, d = 2, 4, 4, 4
+    student = torch.randn(B, P, T, d)
+    teacher = torch.randn(B, P, T, d)
+    orphan = torch.zeros(P, dtype=torch.bool)
+    verdict = mask_orphan_ratio_monitor(
+        student, teacher, orphan, parcel_dim=1,
+    )
+    assert verdict.ratio != verdict.ratio  # nan
+    assert verdict.in_band is False
+    assert verdict.escalations == ()
+
+
+def test_mask_orphan_ratio_no_visible_returns_nan_verdict() -> None:
+    """All parcels orphan (pathological) → no visible side → ratio nan."""
+    B, P, T, d = 2, 4, 4, 4
+    student = torch.randn(B, P, T, d)
+    teacher = torch.randn(B, P, T, d)
+    orphan = torch.ones(P, dtype=torch.bool)
+    verdict = mask_orphan_ratio_monitor(
+        student, teacher, orphan, parcel_dim=1,
+    )
+    assert verdict.ratio != verdict.ratio
+    assert verdict.escalations == ()
+
+
+def test_mask_orphan_ratio_rejects_shape_mismatch() -> None:
+    student = torch.randn(2, 4, 3, 5)
+    teacher = torch.randn(2, 4, 3, 6)
+    orphan = torch.zeros(4, dtype=torch.bool)
+    with pytest.raises(ValueError, match="must share shape"):
+        mask_orphan_ratio_monitor(student, teacher, orphan, parcel_dim=1)
+
+
+def test_mask_orphan_ratio_rejects_non_bool_orphan_mask() -> None:
+    student = torch.randn(2, 4, 3, 5)
+    teacher = torch.randn(2, 4, 3, 5)
+    orphan = torch.zeros(4, dtype=torch.float32)
+    with pytest.raises(ValueError, match="must be bool"):
+        mask_orphan_ratio_monitor(student, teacher, orphan, parcel_dim=1)
+
+
+def test_mask_orphan_ratio_rejects_parcel_axis_mismatch() -> None:
+    student = torch.randn(2, 4, 3, 5)
+    teacher = torch.randn(2, 4, 3, 5)
+    orphan = torch.zeros(8, dtype=torch.bool)  # P=8 but tap has P=4
+    with pytest.raises(ValueError, match="parcel axis size mismatch"):
+        mask_orphan_ratio_monitor(student, teacher, orphan, parcel_dim=1)
+
+
+def test_compute_orphan_parcels_dk_one_hot_drop_one_shaft() -> None:
+    """C=4 electrodes, P=3 parcels, all electrodes cover distinct
+    parcels. Shaft-mask electrodes {0,1} → parcels {0,1} lose all
+    coverage → both flagged orphan."""
+    B, C, P = 2, 4, 3
+    support = torch.zeros(B, C, P)
+    support[:, 0, 0] = 1.0   # elec 0 covers parcel 0
+    support[:, 1, 1] = 1.0   # elec 1 covers parcel 1
+    support[:, 2, 2] = 1.0   # elec 2 covers parcel 2
+    support[:, 3, 2] = 1.0   # elec 3 also covers parcel 2 (backup)
+    shaft = torch.zeros(B, C, dtype=torch.bool)
+    shaft[:, :2] = True       # drop electrodes 0 and 1
+    orphan = compute_orphan_parcels(shaft, support)
+    expected = torch.tensor([True, True, False])
+    torch.testing.assert_close(orphan, expected)
+
+
+def test_compute_orphan_parcels_per_clip_reduction_intersection() -> None:
+    """A parcel is orphan only if BOTH clips lose all coverage. Clip 0
+    drops electrode 0 only → parcel 0 orphan in clip 0; clip 1 drops
+    electrode 1 → parcel 0 NOT orphan in clip 1 → batch-level not
+    orphan."""
+    B, C, P = 2, 2, 2
+    support = torch.zeros(B, C, P)
+    support[:, 0, 0] = 1.0   # elec 0 covers parcel 0
+    support[:, 1, 1] = 1.0   # elec 1 covers parcel 1
+    shaft = torch.zeros(B, C, dtype=torch.bool)
+    shaft[0, 0] = True        # clip 0 loses parcel 0
+    shaft[1, 1] = True        # clip 1 loses parcel 1
+    orphan = compute_orphan_parcels(shaft, support)
+    # Batch intersection: no parcel is orphan in BOTH clips.
+    expected = torch.tensor([False, False])
+    torch.testing.assert_close(orphan, expected)
+
+
+def test_compute_orphan_parcels_rejects_bad_shapes() -> None:
+    support = torch.zeros(2, 4, 3)
+    with pytest.raises(ValueError, match="shaft_mask must be \\(B, C\\)"):
+        compute_orphan_parcels(torch.zeros(2, dtype=torch.bool), support)
+    shaft = torch.zeros(2, 4, dtype=torch.bool)
+    with pytest.raises(ValueError, match="support must be \\(B, C, P\\)"):
+        compute_orphan_parcels(shaft, torch.zeros(2, 4))
+
+
+# ---------------------------------------------------------------------------
+# MON-MASK-004 (subject-ID leakage canary)
+# ---------------------------------------------------------------------------
+
+
+def test_subject_id_leakage_threshold_locked_at_0p5() -> None:
+    """§B03f lock: F1 > 0.50 is the kill threshold; chance baseline is
+    1 / 9 ≈ 0.111 over the BT 9-subject cohort."""
+    assert SUBJECT_ID_LEAKAGE_F1_THRESHOLD == 0.50
+    assert abs(CHANCE_F1_BT9 - 1.0 / 9.0) < 1e-9
+
+
+def test_subject_id_leakage_random_features_below_threshold() -> None:
+    """Random features uncorrelated with subject id → probe macro-F1
+    well below the 0.50 absolute kill threshold."""
+    torch.manual_seed(0)
+    B, d, n_sub = 36, 16, 9
+    features = torch.randn(B, d)
+    subjects = torch.randint(0, n_sub, (B,))
+    verdict = subject_id_leakage_monitor(
+        features, subjects, n_subjects=n_sub, n_epochs=30,
+    )
+    assert verdict.probe_f1 < SUBJECT_ID_LEAKAGE_F1_THRESHOLD
+    assert verdict.kill is False
+
+
+def test_subject_id_leakage_id_encoded_features_trip_threshold() -> None:
+    """When the encoder leaks subject identity, a single linear probe can
+    perfectly recover the subject id and the canary kills."""
+    B, n_sub = 36, 9
+    subjects = torch.arange(B) % n_sub
+    # One-hot per subject as the feature → linearly separable.
+    features = torch.zeros(B, n_sub)
+    features[torch.arange(B), subjects] = 5.0
+    verdict = subject_id_leakage_monitor(
+        features, subjects, n_subjects=n_sub, n_epochs=80,
+    )
+    assert verdict.probe_f1 > SUBJECT_ID_LEAKAGE_F1_THRESHOLD
+    assert verdict.kill is True
+
+
+def test_subject_id_leakage_rejects_out_of_range_id() -> None:
+    features = torch.randn(4, 8)
+    subjects = torch.tensor([0, 1, 2, 9])  # id 9 outside n=9 (0-indexed)
+    with pytest.raises(ValueError, match=">= n_subjects"):
+        subject_id_leakage_monitor(features, subjects, n_subjects=9)
+
+
+def test_subject_id_leakage_rejects_negative_id() -> None:
+    features = torch.randn(4, 8)
+    subjects = torch.tensor([0, -1, 2, 3])
+    with pytest.raises(ValueError, match="negative id"):
+        subject_id_leakage_monitor(features, subjects, n_subjects=9)
+
+
+def test_subject_id_leakage_rejects_small_cohort() -> None:
+    features = torch.randn(4, 8)
+    subjects = torch.tensor([0, 0, 0, 0])
+    with pytest.raises(ValueError, match="n_subjects >= 2"):
+        subject_id_leakage_monitor(features, subjects, n_subjects=1)

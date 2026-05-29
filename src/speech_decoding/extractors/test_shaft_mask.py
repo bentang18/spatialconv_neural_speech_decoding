@@ -276,3 +276,158 @@ def test_extractor_shaft_mask_fraction_in_expected_band_under_k1_default() -> No
         f"K=1 shaft-mask fraction {mean_frac:.3f} outside the [0.02, 0.15] "
         f"band expected under the 5/27 PM lock"
     )
+
+
+# ---------- BTShaftMaskExtractor (NeuralFetch-style per-event wrapper) -
+
+
+from pathlib import Path
+from types import SimpleNamespace
+
+
+def _write_depth_wm(
+    bt_root: Path, subject_id: int, rows: list[tuple[str, str]],
+) -> Path:
+    path = bt_root / "localization" / f"sub_{subject_id}" / "depth-wm.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        f.write("Electrode,DesikanKilliany\n")
+        for electrode, label in rows:
+            f.write(f"{electrode},{label}\n")
+    return path
+
+
+def _bt_event(
+    subject_id: int = 1, timeline: str = "t0", start: float = 0.0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        subject=str(subject_id), timeline=timeline, start=start, duration=1.0,
+    )
+
+
+def _bt_rows_two_shafts() -> list[tuple[str, str]]:
+    # 2 shafts × 5 contacts = 10 real electrodes. Each row uses a DK label
+    # that's in V14_DK_PARCEL_LABELS so unknown_label_policy="raise"
+    # passes too.
+    rows = []
+    for i in range(1, 6):
+        rows.append((f"OFa{i}", "ctx-lh-superiortemporal"))
+    for i in range(1, 6):
+        rows.append((f"OFb{i}", "ctx-rh-bankssts"))
+    return rows
+
+
+def test_bt_shaft_mask_extractor_shape_and_dtype(tmp_path: Path) -> None:
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
+    )
+    out = ext.get_static(_bt_event(subject_id=1))
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == (120,)
+    assert out.dtype == torch.bool
+
+
+def test_bt_shaft_mask_extractor_padding_slots_are_false(tmp_path: Path) -> None:
+    """Slots past ``n_electrodes`` must stay False — they must NOT count as
+    shaft-blocked or they'd silently corrupt the cross-attn keypad path."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
+    )
+    out = ext.get_static(_bt_event(subject_id=1))
+    n_real = len(_bt_rows_two_shafts())  # 10
+    # All padding slots must be False.
+    assert not out[n_real:].any(), "padding slots must remain False"
+
+
+def test_bt_shaft_mask_extractor_k1_at_n_shafts_2(tmp_path: Path) -> None:
+    """N_shafts=2 → K=1 → exactly one shaft block in the first ``n_real``
+    slots; the mask must have at least one True."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
+    )
+    out = ext.get_static(_bt_event(subject_id=1))
+    assert out.any(), "K=1 must produce >=1 True at the real-electrode region"
+
+
+def test_bt_shaft_mask_extractor_per_event_seed_varies(tmp_path: Path) -> None:
+    """Two events on the same subject (distinct ``event.start``) get
+    different per-event seeds → likely different masks."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
+    )
+    a = ext.get_static(_bt_event(subject_id=1, start=0.0))
+    b = ext.get_static(_bt_event(subject_id=1, start=10.0))
+    # K=1 on 2 shafts could collide; check across many event-start values.
+    seen = {tuple(ext.get_static(_bt_event(subject_id=1, start=float(s))).tolist())
+            for s in range(8)}
+    assert len(seen) >= 2, "per-event seed should produce at least 2 distinct masks"
+    # And the dispatch contract uses (a, b) directly.
+    _ = a, b
+
+
+def test_bt_shaft_mask_extractor_reproducible_under_fixed_event(tmp_path: Path) -> None:
+    """Same (subject, timeline, start) → identical mask. Required so the
+    NeuralSet collator + caching see the same bytes per event."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=42,
+    )
+    e = _bt_event(subject_id=1, timeline="trial0", start=3.14)
+    a = ext.get_static(e)
+    b = ext.get_static(e)
+    assert torch.equal(a, b)
+
+
+def test_bt_shaft_mask_extractor_rejects_subject_exceeding_c_max(tmp_path: Path) -> None:
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=4, seed=0,
+    )
+    with pytest.raises(ValueError, match="c_max"):
+        ext.get_static(_bt_event(subject_id=1))
+
+
+def test_bt_shaft_mask_extractor_unknown_label_policy_skip(tmp_path: Path) -> None:
+    """``unknown_label_policy="skip"`` drops out-of-vocab DK rows. Must
+    match the DK/valid-mask filter so the C dimension stays aligned."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    rows = _bt_rows_two_shafts() + [("BAD1", "not-a-real-dk-label")]
+    _write_depth_wm(tmp_path, subject_id=1, rows=rows)
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
+        unknown_label_policy="skip",
+    )
+    out = ext.get_static(_bt_event(subject_id=1))
+    # Real electrodes after skip = 10 (the 2 shafts), so positions 10+ are
+    # all padding-False.
+    assert not out[10:].any()
+
+
+def test_bt_shaft_mask_extractor_k0_at_single_shaft(tmp_path: Path) -> None:
+    """Single-shaft subject → K=0 → all-False (5/27 PM guard)."""
+    from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
+
+    rows = [(f"OFa{i}", "ctx-lh-superiortemporal") for i in range(1, 6)]
+    _write_depth_wm(tmp_path, subject_id=1, rows=rows)
+    ext = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
+    )
+    out = ext.get_static(_bt_event(subject_id=1))
+    assert not out.any(), "N_shafts=1 must produce K=0 (all-False mask)"

@@ -136,6 +136,45 @@ def compose_v14_joint_loss(
     return breakdown.total, breakdown
 
 
+LatentValidOverride = Literal["support", "all_true", "parcels_supervised"]
+"""B30 sister selector for the latent-validity mask source.
+
+``support`` (default): B30 single source of truth, ``support.sum(over
+electrodes) > 0`` expanded across the M sub-slots — the same tensor the
+encoder's latent-SA ``attn_mask`` consumes and the aggregator threads
+through ``L_mid_slot`` / ``L_post_frame`` / ``L_post_utterance``.
+
+Sister falsifiers (drift row ``B30-dispatch-sister-flags``):
+
+* ``all_true`` (``R-item-12-all-true`` P0) — every slot active for every
+  clip; falsifies the per-subject anatomy gating.
+* ``parcels_supervised`` (``R-parcels-supervised-gating`` P0-retired-into-default)
+  — pre-B30 per-subject ``parcels_supervised[subject]`` override; kept
+  as falsifier so the retire-into-default move is empirically defended.
+
+Only the ``support`` value is wired into the SSL trainer today; the
+sister branches raise :class:`NotImplementedError` at construction
+until the joint-phase aggregator-call path (#97 B2.2) lands.
+"""
+
+SaMaskMode = Literal["bidirectional", "key_only"]
+"""B30 sister selector for the latent self-attention mask shape.
+
+``bidirectional`` (default): inactive slots fully bypass latent SA —
+neither keys nor queries. Encoder applies an ``attn_mask (L, L)`` over
+the latent token sequence.
+
+``key_only`` (``R-sa-key-only`` P1 falsifier): pre-B30 key-only
+``key_padding_mask`` path; queries from inactive slots still emit
+attention but receive zeroed contributions. Falsifies the move from
+key-only to bidirectional masking.
+
+Only ``bidirectional`` is wired into the encoder today; ``key_only``
+raises :class:`NotImplementedError` at construction until the
+encoder-side branch lands.
+"""
+
+
 class V14JointExperiment(V14Experiment):
     """Joint-by-default v14 SSL experiment (B29 Item 1).
 
@@ -149,9 +188,28 @@ class V14JointExperiment(V14Experiment):
     :class:`speech_decoding.extractors.subtype_meta.LambdaAnatExtractor`
     and reaches the encoder forward as a ``(B,)`` tensor (see B29 Item
     12 in ``models/v14_encoder.py``).
+
+    B30 sister selectors (drift row ``B30-dispatch-sister-flags``,
+    surfaced 2026-05-28 by the R12 wiring audit):
+
+    * ``latent_valid_override`` picks the source of the
+      :data:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
+      ``latent_valid`` argument. Default ``"support"`` matches the B30
+      lock; ``"all_true"`` / ``"parcels_supervised"`` are
+      :class:`NotImplementedError`-gated sister falsifiers.
+    * ``sa_mask_mode`` picks the encoder's latent-SA mask shape.
+      Default ``"bidirectional"`` matches the B30 lock; ``"key_only"``
+      is a :class:`NotImplementedError`-gated sister falsifier.
     """
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    # B30 sister selectors. Pinned to the locked defaults; sister values
+    # are accepted by the field but rejected at construction until the
+    # respective runtime branch lands (B2.2 aggregator-call, encoder
+    # latent-SA key-only path).
+    latent_valid_override: LatentValidOverride = "support"
+    sa_mask_mode: SaMaskMode = "bidirectional"
 
     # NOTE: ``phase`` inherits from ``V14Experiment``; restricting to a
     # single-value ``Literal`` here would require redeclaring the field
@@ -160,6 +218,26 @@ class V14JointExperiment(V14Experiment):
 
     def model_post_init(self, _ctx) -> None:  # type: ignore[override]
         super().model_post_init(_ctx)
+        # B30 sister selectors: default values match the B30 lock and are
+        # always accepted. Non-default values flag the drift-table
+        # B30-dispatch-sister-flags row as runtime-gated — they parse OK
+        # at config time so the run-record YAML records the choice, but
+        # the trainer / encoder branch hasn't landed yet.
+        if self.latent_valid_override != "support":
+            raise NotImplementedError(
+                f"latent_valid_override={self.latent_valid_override!r} is a "
+                "B30 sister falsifier (R-item-12-all-true / "
+                "R-parcels-supervised-gating). Wiring blocked on #97 B2.2 "
+                "(joint SSL aggregator call) — see "
+                "docs/neuroprobe/v14_blockers.md row B30-dispatch-sister-flags."
+            )
+        if self.sa_mask_mode != "bidirectional":
+            raise NotImplementedError(
+                f"sa_mask_mode={self.sa_mask_mode!r} is the B30 sister "
+                "falsifier R-sa-key-only. Wiring blocked on the encoder "
+                "latent-SA key-only branch — see "
+                "docs/neuroprobe/v14_blockers.md row B30-dispatch-sister-flags."
+            )
         # B29 Item 1: ``V14JointExperiment`` is *only* the joint phase,
         # which is pinned to ``phase == 1`` (the canonical collapsed
         # P1 ∪ P2). Split P1 / P2 must instantiate ``V14Experiment``
@@ -176,30 +254,62 @@ class V14JointExperiment(V14Experiment):
         """Override: joint phase uses the B29 4-term tuple."""
         return v14_joint_loss_coefficients()
 
-    def _train_and_test(self) -> dict[str, float | None]:
-        # B2.1 (#96) wires construction through the dispatch phase-switch,
-        # but the SSL training-step itself is gated on the rest of Bucket 2:
-        # B2.2 (compose 4-term L_total via ssl/aggregator.py with the B30
-        # ``latent_valid`` single-source-of-truth mask), B2.3 (shaft-mask +
-        # ref_aug + ref_embed extractors into the forward), B2.4 (B02
-        # WRS-over-valid-bin-electrode-hours sampler + StatefulDataLoader),
-        # B2.5 (MON-SLOT-REDUNDANCY / MON-MASK-002/004 monitors +
-        # best-val probe callback). Until those land, falling through to
-        # the parent CE-supervised path would silently mis-train the
-        # joint phase as Phase-4. Raise here so the gating is loud.
-        raise NotImplementedError(
-            "V14JointExperiment._train_and_test is gated on Bucket-2 SSL "
-            "wiring: B2.2 (4-term L_total via ssl/aggregator.py with B30 "
-            "latent_valid), B2.3 (shaft-mask + ref_aug + ref_embed "
-            "extractors into the forward), B2.4 (B02 sampler + "
-            "StatefulDataLoader), B2.5 (monitors + best-val probe "
-            "callback). See docs/neuroprobe/v14_blockers.md."
+    def _build_brain_module(self, train_loader):  # type: ignore[override]
+        """B2.2: build the joint SSL Lightning module.
+
+        Replaces the parent's CE-classifier ``BrainModule`` with
+        :class:`speech_decoding.experiments.v14_joint_module.V14JointBrainModule`,
+        which owns the EMA teacher + 3 LN heads + PMA pair and composes the
+        4-term B28/B29 ``L_total`` via the
+        :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses` path
+        (drift row ``B29-joint-collapse`` runtime arm).
+
+        The parent's ``brain_model_config.build(n_in_channels, n_outputs)``
+        returns a :class:`V14ParcelPerceiverWithHead` (encoder + frozen
+        parcel-PMA + flat head) — meant for Phase-4 supervised. The joint
+        SSL trainer only needs the bare encoder; we extract ``.encoder``
+        and let the BrainModule construct its own student-side PMA + LN
+        heads + EMA teacher mirror.
+
+        ``n_outputs`` is informational here (SSL has no classification
+        head); we pass ``1`` so the build call succeeds, then ignore the
+        head.
+        """
+        from speech_decoding.experiments.v14_joint_module import V14JointBrainModule
+        from speech_decoding.models.v14_encoder import V14ParcelPerceiverModel
+
+        batch = next(iter(train_loader))
+        input_name = self._input_tensor_name()
+        x = batch.data[input_name]
+        head_model = self.brain_model_config.build(
+            n_in_channels=int(x.shape[1]),
+            n_outputs=1,
+        )
+        encoder = getattr(head_model, "encoder", None)
+        if not isinstance(encoder, V14ParcelPerceiverModel):
+            raise RuntimeError(
+                "V14JointExperiment expected brain_model_config.build to "
+                "return a model with an ``.encoder`` attribute of type "
+                "V14ParcelPerceiverModel (per V14ParcelPerceiverWithHead); "
+                f"got {type(head_model).__name__} without a recognized "
+                "encoder slot."
+            )
+        return V14JointBrainModule(
+            encoder=encoder,
+            optim_config=self.optim,
+            pma_n_heads=encoder.d_model // max(1, encoder.d_model // 8),
+            ema_tau=0.999,
+            loss_form="l1",
+            latent_valid_override=self.latent_valid_override,
+            sa_mask_mode=self.sa_mask_mode,
         )
 
 
 __all__ = [
     "JOINT_PHASE",
     "JOINT_PHASE_VALUE",
+    "LatentValidOverride",
+    "SaMaskMode",
     "V14JointExperiment",
     "compose_v14_joint_loss",
     "v14_joint_l1_loss",

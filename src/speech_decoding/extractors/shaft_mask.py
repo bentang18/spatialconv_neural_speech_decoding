@@ -44,6 +44,9 @@ Sister cells:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import typing as tp
+from pathlib import Path
 from typing import Sequence
 
 import torch
@@ -254,3 +257,159 @@ class ShaftMaskExtractor:
             mask[block_idx] = True
 
         return mask
+
+
+# ---------------------------------------------------------------------------
+# NeuralFetch-style per-event wrapper for the BT cohort.
+# ---------------------------------------------------------------------------
+
+
+def _bt_shaft_ids_from_labels(electrode_labels: Sequence[str]) -> Tensor:
+    """Map BT electrode labels (`"OFa3"`) → contiguous shaft ids (`(C,) long`).
+
+    Uses :func:`speech_decoding.extractors.reference.parse_shaft` to peel the
+    trailing contact number off each label; identical alphabetic prefixes share
+    a shaft. Order-of-first-appearance defines the shaft index.
+    """
+    from speech_decoding.extractors.reference import parse_shaft
+
+    seen: dict[str, int] = {}
+    out = torch.zeros(len(electrode_labels), dtype=torch.long)
+    for i, label in enumerate(electrode_labels):
+        prefix, _ = parse_shaft(str(label))
+        if prefix not in seen:
+            seen[prefix] = len(seen)
+        out[i] = seen[prefix]
+    return out
+
+
+def _bt_contact_pos_from_labels(electrode_labels: Sequence[str]) -> Tensor:
+    """Normalise within-shaft contact index → [0, 1] float (`(C,)`)."""
+    from speech_decoding.extractors.reference import parse_shaft
+
+    shafts: list[tuple[str, tp.Optional[int]]] = [
+        parse_shaft(str(label)) for label in electrode_labels
+    ]
+    counts: dict[str, int] = {}
+    for prefix, _ in shafts:
+        counts[prefix] = counts.get(prefix, 0) + 1
+    cur: dict[str, int] = {}
+    out = torch.zeros(len(electrode_labels), dtype=torch.float32)
+    for i, (prefix, _) in enumerate(shafts):
+        idx = cur.get(prefix, 0)
+        n_on_shaft = max(counts[prefix], 1)
+        out[i] = float(idx) / float(max(n_on_shaft - 1, 1))
+        cur[prefix] = idx + 1
+    return out
+
+
+def _bt_event_clip_seed(
+    base_seed: int, subject_id: int, event: tp.Any,
+) -> int:
+    """Deterministic per-event seed for the shaft-block sampler.
+
+    Reads ``event.timeline`` and ``event.start`` so two events from the same
+    subject get distinct shaft blocks; ``BaseStatic`` is per-event so the
+    same mask broadcasts across all clips of one event (the per-clip B03c
+    seed lives in REF-aug, not here — the shaft-block lives at event-level).
+    """
+    timeline = getattr(event, "timeline", "")
+    start = float(getattr(event, "start", 0.0))
+    payload = f"{int(base_seed)}:{int(subject_id)}:{timeline}:{start:.9f}"
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False) % (2**31 - 1)
+
+
+try:
+    from neuralset.events.etypes import Event as _NeuralsetEvent
+    from neuralset.extractors.base import BaseStatic as _BaseStatic
+except ImportError:  # pragma: no cover — tests without neuralset import
+    _NeuralsetEvent = tp.Any  # type: ignore[assignment,misc]
+    _BaseStatic = object  # type: ignore[assignment,misc]
+
+
+class BTShaftMaskExtractor(_BaseStatic):  # type: ignore[misc,valid-type]
+    """Per-event ``(c_max,) bool`` shaft-mask aligned with the DK / valid-mask filter.
+
+    Composes BT subject anatomy (``depth-wm.csv``) →
+    :class:`SubjectAnatomy` → :class:`ShaftMaskExtractor.__call__` → pad to
+    ``(c_max,)`` with ``False``. ``True`` at shaft-blocked electrodes.
+
+    Drift-table row **B03 shaft-mask** (5/27 PM final spec): student-only mask
+    (OR-ed into the student forward's ``shaft_mask`` kwarg, never passed to
+    the EMA teacher per the B26 full-input contract). The
+    :class:`V14JointBrainModule` already routes ``batch.data["shaft_mask"]``
+    student-only.
+
+    Parameters mirror :class:`ElectrodeValidMask` / :class:`V14DKHardSupportExtractor`
+    so the electrode-axis ordering matches across ``support``, ``valid_mask``,
+    ``electrode_tokens``, and ``shaft_mask``. ``unknown_label_policy="skip"``
+    drops out-of-vocab DK labels (matches the other extractors' production
+    config); ``"raise"`` rejects any subject with an unknown label.
+
+    Sister cells:
+
+    * ``R-shaft-K2`` — ``k_override=2, extent_blocks=("alpha", "beta")``.
+    * ``R-shaft-K3-mixed-3block`` — ``k_override=3,
+      extent_blocks=("alpha", "beta", "gamma")``.
+    * ``R-shaft-K1-explicit`` — ``k_override=1``.
+    """
+
+    event_types: tp.Literal["Ieeg"] = "Ieeg"
+    bt_root: str
+    c_max: int = 384
+    seed: int = 0
+    k_override: int | None = None
+    extent_blocks: tuple[str, ...] = ("alpha",)
+    unknown_label_policy: tp.Literal["raise", "skip"] = "raise"
+
+    def get_static(self, event: tp.Any) -> Tensor:
+        # Imports kept local so the module stays importable without
+        # neuralset (tests import the inner ``ShaftMaskExtractor`` /
+        # ``SubjectAnatomy`` directly).
+        from speech_decoding.extractors.dk_support import _coerce_subject_id
+        from speech_decoding.studies.braintreebank.anatomy import (
+            V14_DK_PARCEL_LABELS,
+            load_public_bt_anatomy,
+        )
+
+        subject_id = _coerce_subject_id(getattr(event, "subject"))
+        anatomy_df = load_public_bt_anatomy(self.bt_root, subject_id)
+
+        if self.unknown_label_policy == "skip":
+            keep = anatomy_df["DesikanKilliany"].isin(V14_DK_PARCEL_LABELS)
+            anatomy_df = anatomy_df.loc[keep].reset_index(drop=True)
+        else:
+            unknown = sorted(
+                set(anatomy_df["DesikanKilliany"]) - set(V14_DK_PARCEL_LABELS)
+            )
+            if unknown:
+                raise KeyError(
+                    "BT anatomy labels absent from parcel vocabulary: "
+                    f"{unknown[:10]}"
+                    + (f" (+{len(unknown) - 10} more)" if len(unknown) > 10 else "")
+                )
+
+        n_real = len(anatomy_df)
+        if n_real > self.c_max:
+            raise ValueError(
+                f"subject {subject_id} has {n_real} electrodes which exceeds c_max={self.c_max}"
+            )
+
+        electrode_labels = tuple(anatomy_df["Electrode"].astype(str).tolist())
+        anatomy = SubjectAnatomy(
+            shaft_ids=_bt_shaft_ids_from_labels(electrode_labels),
+            contact_pos=_bt_contact_pos_from_labels(electrode_labels),
+        )
+
+        clip_seed = _bt_event_clip_seed(self.seed, subject_id, event)
+        inner = ShaftMaskExtractor(
+            seed=clip_seed,
+            k_override=self.k_override,
+            extent_blocks=tuple(self.extent_blocks),
+        )
+        real_mask = inner(anatomy)
+
+        out = torch.zeros(self.c_max, dtype=torch.bool)
+        out[:n_real] = real_mask
+        return out
