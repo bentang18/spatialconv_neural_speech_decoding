@@ -1,0 +1,213 @@
+"""MON-TEACHER-FEATURE-RANK: RankMe dimensional-collapse monitor.
+
+Catches the failure mode that MON-SLOT-REDUNDANCY (B28; cosine between
+slots) cannot see: *dimensional* collapse within an individual slot's
+feature, where all 256 dims become a low-rank affine of a small
+subspace even while inter-slot cosines stay healthy. This is the
+canonical V-JEPA / DINOv2 collapse symptom (data2vec-2.0 §3.2; DINOv3
+§3.3); the EMA-teacher *target* is what collapses first because it has
+no direct gradient pressure away from a degenerate fixed point.
+
+Precedent: RankMe (Garrido et al. ICML'23, arXiv 2210.02885 §3). For a
+feature matrix Z ∈ R^{N × d}, let σ_k be the singular values of Z and
+``p_k = (σ_k + ε) / Σ(σ_j + ε)`` the normalised spectrum. Then::
+
+    RankMe(Z) = exp(-Σ p_k log p_k)
+
+Range: ``[1, min(N, d)]`` ; ``d`` = no collapse, ``1`` = full
+dimensional collapse to a single direction. Smooth, differentiable,
+batch-statistic only. DINOv3 uses RankMe as the primary feature-health
+metric; data2vec-2.0 ships the same proxy under a different name.
+
+Cost: one SVD per logging cadence. The recommended cadence (every 10k
+optimiser steps on a held-out 1024-clip probe batch) makes the
+amortised cost negligible. For (N=1024, d=256) the SVD is ~30 ms on
+H100; the dispatch wires the cadence.
+
+Outputs per probe call:
+
+* ``rankme`` — RankMe (effective rank) on the EMA teacher's pooled
+  feature matrix.
+* ``rankme_normalised`` — ``rankme / d``. ``1.0`` = full rank;
+  ``< 0.5`` = warning band; ``< 0.25`` = hard collapse alarm.
+* ``is_alarm`` — ``True`` iff ``rankme_normalised < 0.25`` (hard
+  collapse signature per DINOv3 §3.3 + RankMe §4.2 empirical band).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from torch import Tensor
+
+
+# DINOv3 §3.3 reports healthy RankMe / d > 0.6 across pretraining; the
+# warning band starts around 0.5 (recoverable), hard alarm < 0.25
+# (collapse signature; needs intervention per RankMe §4.2).
+RANKME_NORMALISED_WARN: float = 0.5
+RANKME_NORMALISED_ALARM: float = 0.25
+RANKME_EPS: float = 1e-7
+
+
+@dataclass(frozen=True)
+class TeacherRankVerdict:
+    """Instantaneous MON-TEACHER-FEATURE-RANK probe verdict.
+
+    Fields
+    ------
+    rankme:
+        Effective rank of the teacher feature matrix; range
+        ``[1, min(N, d)]``.
+    rankme_normalised:
+        ``rankme / d_feature``. ``1.0`` = no collapse; ``< 0.25`` = hard
+        alarm.
+    n_samples:
+        ``N`` — number of feature vectors used in the SVD (e.g. clips
+        × parcel slots × time bins, after masking).
+    d_feature:
+        ``d`` — feature dimensionality (student d_model, default 256).
+    is_warn:
+        ``True`` iff ``rankme_normalised < RANKME_NORMALISED_WARN``.
+    is_alarm:
+        ``True`` iff ``rankme_normalised < RANKME_NORMALISED_ALARM``.
+    """
+
+    rankme: float
+    rankme_normalised: float
+    n_samples: int
+    d_feature: int
+    is_warn: bool
+    is_alarm: bool
+
+
+def _rankme_from_singular_values(
+    singular_values: Tensor, *, eps: float = RANKME_EPS,
+) -> float:
+    """RankMe from a 1-D tensor of non-negative singular values.
+
+    Implements Eq. (1) of Garrido et al. 2023::
+
+        p_k = (σ_k + ε) / Σ(σ_j + ε)
+        RankMe = exp(-Σ p_k log p_k)
+
+    The ``ε`` prevents ``log 0`` on zero singular values.
+    """
+    if singular_values.dim() != 1:
+        raise ValueError(
+            f"singular_values must be 1-D; got shape "
+            f"{tuple(singular_values.shape)}"
+        )
+    sv = singular_values.to(torch.float64).clamp_min(0.0) + eps
+    p = sv / sv.sum()
+    entropy = -(p * p.log()).sum()
+    return float(entropy.exp().item())
+
+
+def teacher_rank_monitor(
+    teacher_features: Tensor,
+    *,
+    valid_mask: Tensor | None = None,
+    warn_threshold: float = RANKME_NORMALISED_WARN,
+    alarm_threshold: float = RANKME_NORMALISED_ALARM,
+) -> TeacherRankVerdict:
+    """Compute the instantaneous MON-TEACHER-FEATURE-RANK verdict.
+
+    Parameters
+    ----------
+    teacher_features:
+        Teacher feature tensor. Supported shapes::
+
+          (N, d)              — already flattened
+          (B, L, d)           — slot-bank features
+          (B, L, T, d)        — full M4 tap
+
+        For ``(B, L, T, d)``, the (B, L, T) axes are flattened to N.
+        For ``(B, L, d)``, the (B, L) axes are flattened. Returning a
+        ``(B, L, d)`` tap with ``valid_mask`` of shape ``(B, L)``
+        keeps only the True rows so a degenerate SWEC batch can't
+        spoof a low rank.
+    valid_mask:
+        Optional bool tensor aligning to the *non-d* axes of
+        ``teacher_features``: shape ``(B, L)`` for ``(B, L, d)``,
+        shape ``(B, L, T)`` for ``(B, L, T, d)``. ``True`` rows are
+        kept. ``None`` keeps everything.
+    warn_threshold, alarm_threshold:
+        ``rankme_normalised`` thresholds (warn > alarm).
+
+    Returns
+    -------
+    TeacherRankVerdict — see field docs above. Returns a degenerate
+    verdict (``rankme = 1.0``, alarms ``False``) if fewer than 2
+    samples survive the mask.
+    """
+    if not 0.0 < alarm_threshold < warn_threshold <= 1.0:
+        raise ValueError(
+            f"need 0 < alarm < warn <= 1; got alarm={alarm_threshold}, "
+            f"warn={warn_threshold}"
+        )
+
+    if teacher_features.dim() == 2:
+        Z = teacher_features
+    elif teacher_features.dim() == 3:
+        if valid_mask is not None:
+            if valid_mask.shape != teacher_features.shape[:2]:
+                raise ValueError(
+                    f"valid_mask shape {tuple(valid_mask.shape)} must match "
+                    f"teacher_features (B, L) = "
+                    f"{tuple(teacher_features.shape[:2])}"
+                )
+            Z = teacher_features[valid_mask]
+        else:
+            B, L, d = teacher_features.shape
+            Z = teacher_features.reshape(B * L, d)
+    elif teacher_features.dim() == 4:
+        B, L, T, d = teacher_features.shape
+        if valid_mask is not None:
+            if valid_mask.shape == (B, L):
+                # Expand per-clip slot mask across time.
+                expanded = valid_mask.unsqueeze(-1).expand(B, L, T)
+            elif valid_mask.shape == (B, L, T):
+                expanded = valid_mask
+            else:
+                raise ValueError(
+                    f"valid_mask shape {tuple(valid_mask.shape)} not "
+                    f"compatible with teacher_features (B, L, T) = "
+                    f"({B}, {L}, {T})"
+                )
+            flat = teacher_features.reshape(B * L * T, d)
+            mask_flat = expanded.reshape(B * L * T)
+            Z = flat[mask_flat]
+        else:
+            Z = teacher_features.reshape(B * L * T, d)
+    else:
+        raise ValueError(
+            f"teacher_features must be 2-/3-/4-D; got shape "
+            f"{tuple(teacher_features.shape)}"
+        )
+
+    N, d = int(Z.shape[0]), int(Z.shape[-1])
+    if N < 2:
+        # Not enough samples for a meaningful SVD — return a healthy
+        # placeholder so the monitor never trips on an empty mask.
+        return TeacherRankVerdict(
+            rankme=1.0, rankme_normalised=1.0 / max(d, 1),
+            n_samples=N, d_feature=d,
+            is_warn=False, is_alarm=False,
+        )
+
+    # SVD on float32 for stability; SVD on bf16 occasionally returns
+    # NaN singular values on H100.
+    Z32 = Z.to(torch.float32)
+    sv = torch.linalg.svdvals(Z32)
+    rankme = _rankme_from_singular_values(sv)
+    rankme_normalised = rankme / d
+
+    return TeacherRankVerdict(
+        rankme=rankme,
+        rankme_normalised=rankme_normalised,
+        n_samples=N,
+        d_feature=d,
+        is_warn=rankme_normalised < warn_threshold,
+        is_alarm=rankme_normalised < alarm_threshold,
+    )

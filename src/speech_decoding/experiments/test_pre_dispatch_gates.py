@@ -66,11 +66,21 @@ def _make_tiny_encoder() -> V14ParcelPerceiverModel:
     )
 
 
-def _make_module() -> V14JointBrainModule:
+def _make_module(*, loss_variant: str = "b31_default") -> V14JointBrainModule:
+    """Construct a tiny ``V14JointBrainModule`` for pre-dispatch gates.
+
+    The default ``loss_variant="b31_default"`` matches the B31 2-term
+    joint SSL surface. Tests that touch the dropped heads (LN_mid,
+    LN_utt, PMA) — TST03 strict-load + TST05 finiteness — pass
+    ``loss_variant="b31_plus_both"`` to exercise the full historical
+    head set + 4-term breakdown so the strict-load contract still
+    covers every named parameter.
+    """
     return V14JointBrainModule(
         encoder=_make_tiny_encoder(),
         optim_config=_optim_config(),
         pma_n_heads=4,
+        loss_variant=loss_variant,  # type: ignore[arg-type]
     )
 
 
@@ -98,8 +108,13 @@ def _make_synthetic_batch() -> SimpleNamespace:
 @pytest.mark.must_pass_before_dispatch
 def test_tst03_joint_module_state_dict_strict_roundtrip() -> None:
     """Save a full joint module state dict, reload it into a fresh
-    module with ``strict=True``, and verify every parameter matches."""
-    src = _make_module()
+    module with ``strict=True``, and verify every parameter matches.
+
+    Exercises the ``b31_plus_both`` sister so every dropped head is
+    reconstructed — the strict-load contract must cover the full
+    historical parameter set, not just the B31 2-term default.
+    """
+    src = _make_module(loss_variant="b31_plus_both")
     # Perturb the source so the round-trip is non-trivial.
     with torch.no_grad():
         for p in src.student.parameters():
@@ -107,7 +122,7 @@ def test_tst03_joint_module_state_dict_strict_roundtrip() -> None:
         src.teacher.update_from(src.student)
 
     state = src.state_dict()
-    dst = _make_module()
+    dst = _make_module(loss_variant="b31_plus_both")
     missing_unexpected = dst.load_state_dict(state, strict=True)
     # Lightning's load_state_dict returns IncompatibleKeys; on a
     # strict-True success both lists are empty.
@@ -128,15 +143,19 @@ def test_tst03_joint_module_strict_load_rejects_dropped_keys() -> None:
     """The pre-dispatch contract: a state dict missing keys against
     the target module must raise under ``strict=True``. Silent fallback
     to ``strict=False`` would random-init the missing tensors and
-    invalidate the resume."""
-    src = _make_module()
+    invalidate the resume.
+
+    Exercises ``b31_plus_both`` so ``ln_mid`` is in the parameter set
+    and can be dropped to trigger the contract.
+    """
+    src = _make_module(loss_variant="b31_plus_both")
     state = src.state_dict()
     # Drop a load-bearing key (LN_mid weight) and confirm strict load
     # rejects.
     dropped_key = "student.ln_mid.weight"
     assert dropped_key in state, "state dict layout drifted; update key"
     del state[dropped_key]
-    dst = _make_module()
+    dst = _make_module(loss_variant="b31_plus_both")
     with pytest.raises(RuntimeError, match="Missing key"):
         dst.load_state_dict(state, strict=True)
 
@@ -145,10 +164,10 @@ def test_tst03_joint_module_strict_load_rejects_dropped_keys() -> None:
 def test_tst03_joint_module_strict_load_rejects_extra_keys() -> None:
     """Extra unknown keys also raise — guards against checkpoint drift
     where an upstream module renamed a parameter."""
-    src = _make_module()
+    src = _make_module(loss_variant="b31_plus_both")
     state = src.state_dict()
     state["student.ghost_parameter"] = torch.zeros(4)
-    dst = _make_module()
+    dst = _make_module(loss_variant="b31_plus_both")
     with pytest.raises(RuntimeError, match="Unexpected key"):
         dst.load_state_dict(state, strict=True)
 
@@ -163,7 +182,7 @@ def test_tst05_joint_step_finite_under_bf16_inputs() -> None:
     """The joint module's ``_step`` returns finite per-term + total
     losses when the batch is cast to bf16. Catches silent ``-inf`` /
     NaN cascades through the LN heads + L1 + PMA softmax."""
-    module = _make_module()
+    module = _make_module(loss_variant="b31_plus_both")
     batch = _make_synthetic_batch()
     # Cast every float tensor in the batch to bf16 — the encoder is
     # tiny enough to run at bf16 end-to-end on CPU.
@@ -177,6 +196,10 @@ def test_tst05_joint_step_finite_under_bf16_inputs() -> None:
     # the matmul stays homogeneous.
     module = module.to(torch.bfloat16)
     breakdown = module._step(cast_batch_data)
+    # ``b31_plus_both`` reconstructs all 4 SSL terms so the bf16 NaN
+    # detector covers every loss-head path. Skip the None-typed defaults
+    # via the `if term is not None` guard so the test still parses on the
+    # 2-term default branch.
     for label, term in (
         ("l_pre_frame", breakdown.l_pre_frame),
         ("l_mid_slot", breakdown.l_mid_slot),
@@ -184,6 +207,7 @@ def test_tst05_joint_step_finite_under_bf16_inputs() -> None:
         ("l_post_utterance", breakdown.l_post_utterance),
         ("total", breakdown.total),
     ):
+        assert term is not None, f"{label} unexpectedly None under b31_plus_both"
         assert torch.isfinite(term).all(), f"{label} is non-finite under bf16"
 
 
@@ -229,12 +253,17 @@ def test_rt10_phase_boundary_strict_false_silently_drops_keys() -> None:
     """Negative control: prove the failure mode RT10 prevents is real.
     Under ``strict=False`` the missing-key path silently random-inits
     the destination's parameter, which is exactly the pre-dispatch
-    failure mode."""
-    src = _make_module()
+    failure mode.
+
+    Exercises ``b31_plus_both`` so ``ln_mid`` is in the parameter set
+    and can be dropped to demonstrate the silent-random-init failure
+    mode (the B31 2-term default has no ``ln_mid``).
+    """
+    src = _make_module(loss_variant="b31_plus_both")
     src_state = src.state_dict()
     dropped_key = "student.ln_mid.weight"
     del src_state[dropped_key]
-    dst = _make_module()
+    dst = _make_module(loss_variant="b31_plus_both")
     # The dst module's ln_mid.weight stays at its random init; load
     # under strict=False does NOT raise (this is what the gate forbids
     # in practice).

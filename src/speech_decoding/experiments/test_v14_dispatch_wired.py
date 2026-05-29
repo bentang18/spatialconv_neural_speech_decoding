@@ -9,6 +9,7 @@ in ``test_v14_wiring.py`` — that gap is now closed by the default
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from speech_decoding.experiments import dispatch_v14
@@ -361,17 +362,19 @@ def test_b29_dispatch_r_m4_slots_sister_restores_m_eq_4(tmp_path, monkeypatch) -
     assert xp.brain_model_config.m_sub_slots == 4
 
 
-def test_b29_dispatch_default_disables_subtype_keeps_ref_enabled(
+def test_b29_dispatch_default_disables_subtype_and_ref_embed(
     tmp_path, monkeypatch,
 ) -> None:
-    """B29 Item 11 + 5/28 PM precedent-audit flip: subtype default OFF;
-    ref defaults unchanged (ON with K/V reuse). vocab=2 (binary) stays."""
+    """B29 Item 11 + 5/28 PM precedent-audit flip: subtype default OFF.
+    B32 5/28 PM-late first-pass-no-input-aug lock: ref_embed default
+    also OFF (was ON). vocab=2 (binary) stays."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano")
     cfg = xp.brain_model_config
     assert cfg.subtype_embed_enabled is False
     assert cfg.subtype_embed_reuse_kv is True
-    assert cfg.ref_embed_enabled is True
+    # B32 5/28 PM-late first-pass-no-input-aug lock: ref_embed default OFF.
+    assert cfg.ref_embed_enabled is False
     assert cfg.ref_embed_reuse_kv is True
     assert cfg.subtype_vocab == 2  # binary default
 
@@ -415,9 +418,11 @@ def test_b29_dispatch_r_subtype_embed_input_only_sister(
 
 
 def test_b29_dispatch_ref_embed_input_only_sister(tmp_path, monkeypatch) -> None:
+    """Post-B32 the default is ``ref_embed_enabled=False``; the input-only
+    sister cell now needs callers to opt-in both flags explicitly."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(
-        mode="nano", ref_embed_reuse_kv=False,
+        mode="nano", ref_embed_enabled=True, ref_embed_reuse_kv=False,
     )
     assert xp.brain_model_config.ref_embed_enabled is True
     assert xp.brain_model_config.ref_embed_reuse_kv is False
@@ -565,16 +570,115 @@ def test_b29_cli_subtype_embed_default_is_disabled() -> None:
 
 
 def test_b29_cli_no_ref_embed_reuse_kv_flag_disables_reuse() -> None:
+    """`--no-ref-embed-reuse-kv` only flips reuse_kv. Post-B32 the
+    ref_embed default is OFF, so this flag in isolation does NOT enable
+    the embed — callers must combine it with ``--ref-embed`` to land the
+    input-only sister."""
     parser = dispatch_v14._parser()
     args = parser.parse_args(["--no-ref-embed-reuse-kv"])
     assert args.ref_embed_reuse_kv is False
-    assert args.ref_embed_enabled is True  # only K/V reuse disabled
+    assert args.ref_embed_enabled is False  # B32 default; ``--ref-embed`` not passed
 
 
 def test_b29_cli_no_include_ajile12_flag() -> None:
     parser = dispatch_v14._parser()
     args = parser.parse_args(["--no-include-ajile12"])
     assert args.include_ajile12 is False
+
+
+# ---------------------------------------------------------------------------
+# B31 V-JEPA-2-canonical 2-term lock 2026-05-28 PM-late
+# ([[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]). CLI surface +
+# dispatch wiring of the ``--loss-variant`` selector.
+# ---------------------------------------------------------------------------
+
+
+def test_b31_cli_loss_variant_default_is_b31_default() -> None:
+    """B31 default: ``--loss-variant`` omitted → ``"b31_default"`` (the
+    V-JEPA-2-canonical 2-term joint SSL surface)."""
+    parser = dispatch_v14._parser()
+    args = parser.parse_args([])
+    assert args.loss_variant == "b31_default"
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both"],
+)
+def test_b31_cli_loss_variant_accepts_all_four_arms(variant: str) -> None:
+    """All four B31 ``loss_variant`` arms parse without error."""
+    parser = dispatch_v14._parser()
+    args = parser.parse_args(["--loss-variant", variant])
+    assert args.loss_variant == variant
+
+
+def test_b31_cli_loss_variant_rejects_bogus_value() -> None:
+    """argparse rejects an unknown variant (defends the run record
+    YAML from drift)."""
+    parser = dispatch_v14._parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--loss-variant", "bogus"])
+
+
+def test_b31_dispatch_supervised_phase_rejects_non_default_loss_variant(
+    tmp_path, monkeypatch,
+) -> None:
+    """``loss_variant`` is a joint-phase-only selector. Passing a
+    sister value with ``joint_phase=False`` (the default supervised
+    Phase-4 path) raises so the run record never silently mis-records
+    the sister."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match="loss_variant"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", loss_variant="b31_plus_utt",
+        )
+
+
+def test_b31_dispatch_supervised_phase_accepts_default_loss_variant(
+    tmp_path, monkeypatch,
+) -> None:
+    """Sanity: supervised Phase-4 path WITH the default
+    ``loss_variant`` constructs cleanly."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", loss_variant="b31_default",
+    )
+    # Supervised path uses vanilla Experiment, not V14JointExperiment.
+    assert type(xp).__name__ == "Experiment"
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both"],
+)
+def test_b31_dispatch_joint_phase_propagates_loss_variant_to_experiment(
+    tmp_path, monkeypatch, variant: str,
+) -> None:
+    """Joint-phase dispatch threads ``loss_variant`` onto the
+    :class:`V14JointExperiment` instance. The brain-model config does
+    NOT carry it (its Pydantic schema is ``extra='forbid'``); the
+    Experiment-level snapshot records the choice."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, loss_variant=variant,
+    )
+    assert type(xp).__name__ == "V14JointExperiment"
+    assert xp.loss_variant == variant
+    # The brain-model config must NOT carry ``loss_variant`` (would
+    # crash Pydantic ``extra='forbid'``).
+    assert "loss_variant" not in xp.brain_model_config.model_dump()
+
+
+def test_b31_dispatch_invalid_loss_variant_rejected(
+    tmp_path, monkeypatch,
+) -> None:
+    """``build_v14_experiment`` validates the variant string up front,
+    before any Experiment construction."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match="loss_variant must be one of"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, loss_variant="bogus",
+        )
 
 
 def test_b_bug_4_default_log_stft_view_pins_ref_idx_to_shaft_car(

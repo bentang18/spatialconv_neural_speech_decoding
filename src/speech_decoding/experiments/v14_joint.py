@@ -45,6 +45,7 @@ import torch
 from torch import Tensor
 
 from speech_decoding.experiments.v14_experiment import V14Experiment
+from speech_decoding.ssl.aggregator import LossVariant
 from speech_decoding.ssl.total_loss import (
     W_MID_SLOT,
     W_POST_FRAME,
@@ -211,6 +212,22 @@ class V14JointExperiment(V14Experiment):
     latent_valid_override: LatentValidOverride = "support"
     sa_mask_mode: SaMaskMode = "bidirectional"
 
+    # B31 (5/28 PM-late, [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]):
+    # V-JEPA-2-canonical 2-term default drops L_mid_slot + L_post_utterance.
+    # ``"b31_default"`` is the locked first-pass shape; the three sisters
+    # reconstruct the B28/B29 dropped terms for falsification:
+    #
+    #   * ``b31_plus_m3``   → R-add-m3-loss          P0
+    #   * ``b31_plus_utt``  → R-add-utterance-loss   P0 (EAT-faithful, ≥0.02 AUROC promo gate)
+    #   * ``b31_plus_both`` → R-add-both             P0
+    #
+    # The brain module constructs the dropped heads (LN_mid / LN_utt /
+    # PMA-student-teacher pair) only when the variant selects them; the
+    # aggregator only computes the corresponding sister-arm L term when
+    # the matching tensors are supplied. Default keeps the joint SSL
+    # surface at exactly 2 terms.
+    loss_variant: LossVariant = "b31_default"
+
     # NOTE: ``phase`` inherits from ``V14Experiment``; restricting to a
     # single-value ``Literal`` here would require redeclaring the field
     # on the subclass. Use a runtime check in ``model_post_init`` so the
@@ -300,6 +317,7 @@ class V14JointExperiment(V14Experiment):
             pma_n_heads=encoder.d_model // max(1, encoder.d_model // 8),
             ema_tau=0.999,
             loss_form="l1",
+            loss_variant=self.loss_variant,
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
         )

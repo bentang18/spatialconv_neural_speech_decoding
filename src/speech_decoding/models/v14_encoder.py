@@ -543,12 +543,18 @@ class V14ParcelPerceiverModel(nn.Module):
         #   ``R-subtype-embed-3way`` P2-if-budget: subtype_vocab=3 matches
         #     DIVER-1 {sEEG-depth, ECoG-grid, ECoG-strip}.
         #   ``R-no-subtype-embed`` retired — IS the default.
-        # ``ref_embed_*`` defaults are unchanged (5/28 flip was subtype only).
-        # ``R-no-ref-embed`` P1 disables ``ref_embed_enabled``.
+        # 5/28 PM-late B32 first-pass-no-input-aug lock: ref_embed default
+        # ON → OFF. With ref-aug already off in the default dispatch path
+        # (LogStftView is single static shaft-CAR), the ref_embed lookup
+        # always indexes the same row; the additive A1 contribution +
+        # cross-attn K/V reuse become no-ops at best, distribution drift
+        # at worst. Re-enable as P1 sister `R-ref-aug-3-cell` (paired
+        # with RefAugMultiStftView) once first-pass results are in.
+        # See: memory/project_v14_b32_first_pass_no_input_aug_2026_05_28.md
         subtype_vocab: int = 2,
         subtype_embed_enabled: bool = False,
         subtype_embed_reuse_kv: bool = True,
-        ref_embed_enabled: bool = True,
+        ref_embed_enabled: bool = False,
         ref_embed_reuse_kv: bool = True,
     ) -> None:
         super().__init__()
@@ -861,11 +867,13 @@ class V14ParcelPerceiverModel(nn.Module):
 
         # B29 Item 11 (A1 additive): per-clip subtype + ref embeddings added
         # at the patch-embed output (before token blocks). Looked up once
-        # per clip and broadcast over (C, F_p, T_p). Sister
-        # ``R-no-subtype-embed`` P0 (subtype_embed_enabled=False) skips the
-        # subtype branch; ``R-no-ref-embed`` P1 skips ref. None ids fall
-        # back to embed(0) so callers without metadata still produce a
-        # non-degenerate forward.
+        # per clip and broadcast over (C, F_p, T_p). 5/28 audit + B32 flip
+        # both default branches OFF: ``subtype_embed_enabled=False`` IS the
+        # default; ``ref_embed_enabled=False`` IS the default. Sister
+        # ``R-subtype-embed-on-with-kv-reuse`` P0 re-enables subtype;
+        # sister ``R-ref-aug-3-cell`` P1 re-enables ref (paired with
+        # RefAugMultiStftView). None ids fall back to embed(0) so callers
+        # without metadata still produce a non-degenerate forward.
         if self.subtype_embed_enabled or self.ref_embed_enabled:
             cond_emb = torch.zeros(B, self.d_model, device=x.device, dtype=x.dtype)
             if self.subtype_embed_enabled:
@@ -1210,11 +1218,21 @@ class V14ParcelCollapsePMA(nn.Module):
     attends to all ``K*M`` parcel latents per timestep, producing one ``d``
     vector per ``t``. Input ``(B, L, T, d)`` → output ``(B, T, d)``.
 
-    **Frozen by default** (5/22 spec §3): both Phase-3 SSL distillation and
-    Phase-4 downstream evaluation share this readout, and freezing it keeps
-    the representation comparable across phases. Init is random (the spec
-    ambiguity around "pretrained from Phase 1 vs. random+frozen" is resolved
-    in favor of random+frozen per the T1.10 task description).
+    **Three-phase training contract** (B31 lock 2026-05-28,
+    [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]):
+
+    * **P1+P2 (joint SSL)** — PMA is NOT in the loss path. The B31 default
+      drops ``L_post_utterance`` from the SSL aggregator; PMA receives no
+      gradient. The ``R-add-utterance-loss`` sister constructs an
+      unfrozen PMA in this phase to falsify the drop.
+    * **P3 (Whisper-L8 distillation)** — PMA is **unfrozen** and trained by
+      the cross-modal distillation gradient (Antonello/Shimizu precedent).
+    * **P4 (Neuroprobe linear probe)** — PMA is **frozen** alongside the
+      backbone so the readout is identical to the one Phase 3 left behind.
+      The Phase-4 construction site passes ``freeze=True`` explicitly.
+
+    Default is ``freeze=False`` so the natural P3 construction picks up an
+    unfrozen PMA without ceremony; P4 overrides explicitly. Init is random.
     """
 
     def __init__(
@@ -1222,7 +1240,7 @@ class V14ParcelCollapsePMA(nn.Module):
         d_model: int,
         n_heads: int,
         *,
-        freeze: bool = True,
+        freeze: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -1457,11 +1475,12 @@ class V14ParcelPerceiver(BaseModelConfig):
     #   R-subtype-embed-on-with-kv-reuse → subtype_embed_enabled=True,
     #                                     subtype_embed_reuse_kv=True
     #   R-subtype-embed-3way             → subtype_vocab=3 (DIVER-1)
-    #   R-no-ref-embed                   → ref_embed_enabled=False
+    #   R-ref-aug-3-cell                 → ref_embed_enabled=True paired
+    #                                      with RefAugMultiStftView (B32).
     subtype_vocab: int = 2
     subtype_embed_enabled: bool = False
     subtype_embed_reuse_kv: bool = True
-    ref_embed_enabled: bool = True
+    ref_embed_enabled: bool = False
     ref_embed_reuse_kv: bool = True
 
     # SSL-pretrain dispatch flags persisted on the model config so they

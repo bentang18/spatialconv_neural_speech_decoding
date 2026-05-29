@@ -1,5 +1,11 @@
 # v14 — Architecture Spec
 
+> **SUPERSESSION BANNER (2026-05-28).** This markdown spec was last fully rewritten on 2026-05-19 and is a v3/v4 snapshot. **Active state has drifted in several places.** Use `MEMORY.md §Status (live) — canonical-source table` as the authoritative reference; locks below this banner are superseded where they conflict.
+>
+> **B31 V-JEPA-2-canonical 2-term lock (2026-05-28)** ([[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]) supersedes §5 (P1+P2 collapsed to one joint phase per B29) and §6 (4-term `L_recon_A/B + L_distill` surface superseded; B31 default = 2-term `L_pre_frame @ M2 + L_post_frame @ M4`, both pure L1 per V-JEPA 2 §2.1 Eq 1). PMA is unused in B31's default joint SSL aggregator; it is unfrozen at P3 (Whisper-L8 distillation) and frozen at P4 (linear probe). Other heavily-drifted sections: §3 (M=1 default per B29 Item 13, not M=4 → 80 latents; 1 cross-attn @ {0} per B28, not 2 @ {0,3}), §6 (4-term language pre-B31), §8 (N=6 not N=4 after B28).
+>
+> ---
+
 iEEG FM · anatomy-tagged factorized Perceiver IO + 3-phase staged SSL · BrainTreebank. v4 (2026-05-19) · d=256 · ~13M params.
 
 **Thesis.** Anatomy-tagged factorized Perceiver IO + soft parcel-routing cross-attn (`log(support+ε)`, BT-DK one-hot), pretrained factorized-t×f Stage A + electrode-mask Stage B + multi-teacher P3 distill → beats PopT cross-subject ≥0.05 AUROC at ≤30M params.

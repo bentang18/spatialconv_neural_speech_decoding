@@ -1,18 +1,24 @@
 """B2.2 — :class:`V14JointBrainModule` Lightning module.
 
-Composes the B28/B29 4-term v14 joint SSL loss via
-:func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`:
+Composes the B31 V-JEPA-2-canonical 2-term v14 joint SSL loss via
+:func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
+(see [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]):
 
+* **Default ``loss_variant="b31_default"``** computes 2 terms — pure-L1
+  ``L_pre_frame @ M2`` (V-JEPA 2 §2.1 Eq 1) + pure-L1
+  ``L_post_frame @ M4`` gated by the B30 single-source-of-truth
+  ``latent_valid``. ``L_mid_slot`` and ``L_post_utterance`` are dropped
+  from the default surface; PMA is constructed only for the P3 readout.
+* **Sister variants** (P0 falsifiers) re-add the dropped terms:
+  ``b31_plus_m3`` adds ``L_mid_slot @ LN_mid(M3)``; ``b31_plus_utt``
+  adds ``L_post_utterance @ LN_utt(M4)-PMA``; ``b31_plus_both`` restores
+  the pre-B31 4-term default.
 * student encoder forwarded with ``return_taps=True`` →
-  ``{"M2", "M3", "M4"}``.
+  ``{"M2", "M3", "M4"}`` (M3 tap kept for diagnostics + sisters).
 * EMA teacher (full-input contract per B26) forwarded on the unmasked
-  batch → ``{"M2", "M3", "M4"}`` under ``torch.no_grad``.
-* ``LN_mid`` / ``LN_frame`` / ``LN_utt`` (student-owned) and the EMA-
-  mirrored teacher copies normalise the M3 / M4 taps before they flow
-  into the aggregator.
-* :class:`V14ParcelCollapsePMA` (student-owned) + EMA-mirrored teacher
-  PMA feed the utterance term via :func:`pma_then_mean` — the B30
-  single-source-of-truth ``latent_valid`` is threaded everywhere.
+  batch → same taps under ``torch.no_grad``.
+* ``LN_frame`` (and conditionally ``LN_mid`` / ``LN_utt`` per sister)
+  are student-owned with EMA-mirrored teacher copies.
 * :func:`compute_v14_ssl_losses` returns the
   :class:`V14TotalLossBreakdown`; ``.total`` is the scalar the optimiser
   steps on.
@@ -65,14 +71,22 @@ from neuraltrain.optimizers import BaseOptimizer
 
 from speech_decoding.experiments.monitors import (
     compute_orphan_parcels,
+    grad_spike_monitor,
     mask_orphan_ratio_monitor,
+    parcel_coverage_monitor,
+    teacher_rank_monitor,
 )
 from speech_decoding.models.v14_encoder import (
     V14ParcelCollapsePMA,
     V14ParcelPerceiverModel,
     _compute_latent_valid,
 )
-from speech_decoding.ssl.aggregator import compute_v14_ssl_losses
+from speech_decoding.ssl.aggregator import (
+    LossVariant,
+    compute_v14_ssl_losses,
+    variant_wants_m3,
+    variant_wants_utt,
+)
 from speech_decoding.ssl.ema import (
     EmaTeacher,
     assert_teacher_full_input,
@@ -84,16 +98,32 @@ from speech_decoding.ssl.total_loss import V14TotalLossBreakdown
 
 _LossForm = tp.Literal["l1", "mse"]
 
+# B31 sister-arm gating is single-sourced in
+# ``speech_decoding.ssl.aggregator``; we just rebind under the local
+# pre-fix names so existing call sites stay legible.
+_variant_wants_m3 = variant_wants_m3
+_variant_wants_utt = variant_wants_utt
+
 
 class _V14StudentBundle(nn.Module):
     """All student-side modules that EMA-mirror into the teacher.
 
-    Holds the encoder, the 3 SSL LN heads (``ln_mid`` / ``ln_frame`` /
-    ``ln_utt``), and the parcel-collapse PMA. ``EmaTeacher`` deepcopies
-    this bundle so the teacher's LN heads + PMA also mirror.
+    Holds the encoder, ``ln_frame`` (always present — half of the B31
+    2-term default), and, conditionally on ``loss_variant``, ``ln_mid``,
+    ``ln_utt``, and the parcel-collapse PMA. ``EmaTeacher`` deepcopies
+    this bundle so whatever heads exist on the student also mirror on
+    the teacher.
 
-    The bundle's ``forward`` is the encoder forward; LN heads + PMA are
-    accessed as attributes by :class:`V14JointBrainModule` per-tap.
+    **B31 lock 2026-05-28 PM**: under ``loss_variant="b31_default"`` the
+    ``ln_mid`` / ``ln_utt`` / ``pma`` modules are NOT constructed. The
+    PMA query stops accumulating gradient in the joint SSL phase; it
+    gets its first gradient at P3 (Whisper-L8 distillation, separate
+    Experiment) and is frozen at P4. Sister variants reconstruct only
+    the heads the chosen falsifier needs.
+
+    The bundle's ``forward`` is the encoder forward; the heads above are
+    accessed as attributes by :class:`V14JointBrainModule` per-tap, with
+    runtime guards on the loss-variant gating.
     """
 
     def __init__(
@@ -102,16 +132,29 @@ class _V14StudentBundle(nn.Module):
         encoder: V14ParcelPerceiverModel,
         d_model: int,
         pma_n_heads: int,
+        loss_variant: LossVariant = "b31_default",
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.ln_mid = nn.LayerNorm(d_model)
+        # ln_frame is always present — it's the LN applied to M4 for the
+        # always-on L_post_frame term in the B31 default.
         self.ln_frame = nn.LayerNorm(d_model)
-        self.ln_utt = nn.LayerNorm(d_model)
-        # PMA freeze=False so the student's PMA query trains during the
-        # joint phase per B19 (P1+P2 train PMA; P4 freezes). EMA teacher
-        # mirrors it.
-        self.pma = V14ParcelCollapsePMA(d_model, pma_n_heads, freeze=False)
+        # Sister-only heads. Construction is conditional so the default
+        # joint SSL phase ships with no PMA / LN_mid / LN_utt on the
+        # graph (closes the B19-vs-code PMA-training drift).
+        if _variant_wants_m3(loss_variant):
+            self.ln_mid = nn.LayerNorm(d_model)
+        else:
+            self.ln_mid = None  # type: ignore[assignment]
+        if _variant_wants_utt(loss_variant):
+            self.ln_utt = nn.LayerNorm(d_model)
+            # PMA freeze=False: when the utterance sister fires, its PMA
+            # query trains alongside the rest of the student. EMA
+            # teacher mirrors it.
+            self.pma = V14ParcelCollapsePMA(d_model, pma_n_heads, freeze=False)
+        else:
+            self.ln_utt = None  # type: ignore[assignment]
+            self.pma = None  # type: ignore[assignment]
 
     def forward(self, **encoder_kwargs: tp.Any) -> dict[str, Tensor]:
         out = self.encoder(return_taps=True, **encoder_kwargs)
@@ -190,6 +233,7 @@ class V14JointBrainModule(pl.LightningModule):
         pma_n_heads: int = 8,
         ema_tau: float = 0.999,
         loss_form: _LossForm = "l1",
+        loss_variant: LossVariant = "b31_default",
         predictor: tp.Optional[nn.Module] = None,
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
@@ -217,11 +261,17 @@ class V14JointBrainModule(pl.LightningModule):
             raise ValueError(
                 f"ema_tau must be in (0.0, 1.0); got {ema_tau}"
             )
+        if loss_variant not in tp.get_args(LossVariant):
+            raise ValueError(
+                f"loss_variant={loss_variant!r} not in "
+                f"{tp.get_args(LossVariant)}"
+            )
 
         self.student = _V14StudentBundle(
             encoder=encoder,
             d_model=encoder.d_model,
             pma_n_heads=pma_n_heads,
+            loss_variant=loss_variant,
         )
         # B26 lock: fixed τ via EmaTeacher's coeff_schedule.
         self.teacher = EmaTeacher(
@@ -232,6 +282,17 @@ class V14JointBrainModule(pl.LightningModule):
         self._m_sub_slots = encoder.m_sub_slots
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
+        self._loss_variant: LossVariant = loss_variant
+
+        # MON-GRAD-SPIKE-DIVERGENCE persistent EMA buffer. ``0.0`` seeds
+        # the first step (the monitor skips spike detection until the
+        # EMA has a baseline). Persisted in checkpoints so the buffer
+        # survives ``trainer.fit_loop`` restarts.
+        self.register_buffer(
+            "_grad_ema_l2",
+            torch.zeros((), dtype=torch.float32),
+            persistent=True,
+        )
 
     # ------------------------------------------------------------------
     # Batch ingest
@@ -356,13 +417,28 @@ class V14JointBrainModule(pl.LightningModule):
         m2_t, m3_t, m4_t = teacher_taps["M2"], teacher_taps["M3"], teacher_taps["M4"]
 
         # ── LN heads (student + EMA-mirrored teacher) ──
-        m3_s_lnmid = self.student.ln_mid(m3_s)
+        # ln_frame is always on (B31 default + every sister). LN_mid +
+        # LN_utt + PMA are constructed only when the chosen
+        # ``loss_variant`` selects them; we mirror that conditional
+        # construction at the per-tap forward.
         m4_s_lnframe = self.student.ln_frame(m4_s)
-        m4_s_lnutt = self.student.ln_utt(m4_s)
-
-        m3_t_lnmid = self.teacher.model.ln_mid(m3_t).detach()
         m4_t_lnframe = self.teacher.model.ln_frame(m4_t).detach()
-        m4_t_lnutt = self.teacher.model.ln_utt(m4_t).detach()
+
+        m3_s_lnmid: tp.Optional[Tensor] = None
+        m3_t_lnmid: tp.Optional[Tensor] = None
+        if _variant_wants_m3(self._loss_variant):
+            m3_s_lnmid = self.student.ln_mid(m3_s)
+            m3_t_lnmid = self.teacher.model.ln_mid(m3_t).detach()
+
+        m4_s_lnutt: tp.Optional[Tensor] = None
+        m4_t_lnutt: tp.Optional[Tensor] = None
+        pma_student: tp.Optional[nn.Module] = None
+        pma_teacher: tp.Optional[nn.Module] = None
+        if _variant_wants_utt(self._loss_variant):
+            m4_s_lnutt = self.student.ln_utt(m4_s)
+            m4_t_lnutt = self.teacher.model.ln_utt(m4_t).detach()
+            pma_student = self.student.pma
+            pma_teacher = self.teacher.model.pma
 
         # ── B30 single source of truth: latent_valid ──
         latent_valid = _latent_valid_from_batch(
@@ -383,23 +459,24 @@ class V14JointBrainModule(pl.LightningModule):
             l_pre_frame_fallback = self._compose_l_pre_frame(
                 student_m2=m2_s, teacher_m2=m2_t,
             )
-            # Compose 3 slot/utterance terms via the aggregator with a
-            # zero scalar M2 pair to make L_pre_frame structurally 0;
-            # add the fallback term to .total below.
+            # Compose remaining terms via the aggregator with a zero
+            # scalar M2 pair to make L_pre_frame structurally 0; add the
+            # fallback term to .total below.
             zero_pair = torch.zeros((), device=m2_s.device, dtype=m2_s.dtype)
-            breakdown, _clip_valid = compute_v14_ssl_losses(
+            breakdown = compute_v14_ssl_losses(
                 student_m2_pred=zero_pair,
                 m2_target=zero_pair,
                 m2_valid_mask=None,
-                student_m3_lnmid=m3_s_lnmid,
-                teacher_m3_lnmid=m3_t_lnmid,
                 student_m4_lnframe=m4_s_lnframe,
                 teacher_m4_lnframe=m4_t_lnframe,
+                latent_valid=latent_valid,
+                loss_variant=self._loss_variant,
+                student_m3_lnmid=m3_s_lnmid,
+                teacher_m3_lnmid=m3_t_lnmid,
                 student_m4_lnutt=m4_s_lnutt,
                 teacher_m4_lnutt=m4_t_lnutt,
-                latent_valid=latent_valid,
-                pma_student=self.student.pma,
-                pma_teacher=self.teacher.model.pma,
+                pma_student=pma_student,
+                pma_teacher=pma_teacher,
                 loss_form=self._loss_form,
             )
             # Materialize the fallback L_pre_frame term into the total +
@@ -420,22 +497,22 @@ class V14JointBrainModule(pl.LightningModule):
         student_m2_pred = self._compose_l_pre_frame(
             student_m2=m2_s, teacher_m2=m2_t,
         )  # raises NotImplementedError; reserved for future use
-        breakdown, _clip_valid = compute_v14_ssl_losses(
+        return compute_v14_ssl_losses(
             student_m2_pred=student_m2_pred,
             m2_target=m2_t,
             m2_valid_mask=None,
-            student_m3_lnmid=m3_s_lnmid,
-            teacher_m3_lnmid=m3_t_lnmid,
             student_m4_lnframe=m4_s_lnframe,
             teacher_m4_lnframe=m4_t_lnframe,
+            latent_valid=latent_valid,
+            loss_variant=self._loss_variant,
+            student_m3_lnmid=m3_s_lnmid,
+            teacher_m3_lnmid=m3_t_lnmid,
             student_m4_lnutt=m4_s_lnutt,
             teacher_m4_lnutt=m4_t_lnutt,
-            latent_valid=latent_valid,
-            pma_student=self.student.pma,
-            pma_teacher=self.teacher.model.pma,
+            pma_student=pma_student,
+            pma_teacher=pma_teacher,
             loss_form=self._loss_form,
         )
-        return breakdown
 
     # ------------------------------------------------------------------
     # Lightning hooks
@@ -449,9 +526,117 @@ class V14JointBrainModule(pl.LightningModule):
     ) -> None:
         self.log(f"{step_name}_loss", breakdown.total, on_epoch=True, prog_bar=True)
         self.log(f"{step_name}_l_pre_frame", breakdown.l_pre_frame, on_epoch=True)
-        self.log(f"{step_name}_l_mid_slot", breakdown.l_mid_slot, on_epoch=True)
         self.log(f"{step_name}_l_post_frame", breakdown.l_post_frame, on_epoch=True)
-        self.log(f"{step_name}_l_post_utterance", breakdown.l_post_utterance, on_epoch=True)
+        # B31 sister-only terms are ``None`` under the 2-term default.
+        if breakdown.l_mid_slot is not None:
+            self.log(f"{step_name}_l_mid_slot", breakdown.l_mid_slot, on_epoch=True)
+        if breakdown.l_post_utterance is not None:
+            self.log(
+                f"{step_name}_l_post_utterance",
+                breakdown.l_post_utterance,
+                on_epoch=True,
+            )
+
+    # MON-TEACHER-FEATURE-RANK validation-time subsample cap. The SVD
+    # cost is O(min(N, d) * N * d); capping N at 4096 keeps it under
+    # ~30 ms on H100 while staying well above the d=256 ceiling for
+    # the rank estimate to converge.
+    _RANKME_N_MAX: tp.ClassVar[int] = 4096
+
+    def _run_parcel_coverage_monitor(
+        self, *, latent_valid: Tensor, step_name: str,
+    ) -> None:
+        """MON-PARCEL-COVERAGE-VARIANCE (5/28 P0).
+
+        Cheap — bool reductions over the (B, L) ``latent_valid`` mask.
+        Run on every train/val/test step so a degenerate ref-aug or
+        shaft-mask combo trips an alarm immediately.
+        """
+        verdict = parcel_coverage_monitor(latent_valid)
+        self.log(
+            f"{step_name}_mon_coverage_active_mean",
+            verdict.active_slots_per_clip_mean,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_coverage_active_cv",
+            verdict.active_slots_per_clip_cv,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_coverage_slot_var",
+            verdict.slot_usage_fraction_var,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_coverage_degenerate_frac",
+            verdict.degenerate_clip_fraction,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_coverage_swec_frac",
+            verdict.front_end_only_clip_fraction,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_coverage_alarm",
+            1.0 if verdict.is_alarm else 0.0,
+            on_epoch=True,
+        )
+
+    def _run_teacher_rank_monitor(
+        self,
+        *,
+        teacher_m4_lnframe: Tensor,
+        latent_valid: Tensor,
+        step_name: str,
+    ) -> None:
+        """MON-TEACHER-FEATURE-RANK (5/28 P0).
+
+        Computes RankMe on the EMA teacher's LN_frame-normalised M4 tap,
+        masked by ``latent_valid`` so SWEC / front-end-only positions
+        don't dilute the rank estimate. Sub-samples to
+        ``_RANKME_N_MAX`` rows to keep the SVD cheap.
+
+        Wired into ``validation_step`` via :meth:`_monitor_from_step`
+        with the val-cadence (Lightning's default = every train epoch),
+        which closely approximates the spec's 10k-step probe.
+        """
+        if teacher_m4_lnframe.dim() != 4:
+            return  # not a (B, L, T, d) tap — skip silently
+        B, L, T, d = teacher_m4_lnframe.shape
+        if L != latent_valid.shape[1] or B != latent_valid.shape[0]:
+            return  # shape mismatch — skip rather than crash a probe
+
+        # Expand (B, L) → (B, L, T), flatten, gather only valid rows.
+        expanded = latent_valid.unsqueeze(-1).expand(B, L, T)
+        flat = teacher_m4_lnframe.reshape(B * L * T, d)
+        mask_flat = expanded.reshape(B * L * T)
+        valid_rows = flat[mask_flat]
+        if valid_rows.shape[0] > self._RANKME_N_MAX:
+            # Deterministic head-slice keeps the probe reproducible
+            # across resumes; the rank estimate is permutation-invariant.
+            valid_rows = valid_rows[: self._RANKME_N_MAX]
+
+        verdict = teacher_rank_monitor(valid_rows.detach())
+        self.log(
+            f"{step_name}_mon_rankme", verdict.rankme, on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_rankme_normalised",
+            verdict.rankme_normalised,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_rankme_warn",
+            1.0 if verdict.is_warn else 0.0,
+            on_epoch=True,
+        )
+        self.log(
+            f"{step_name}_mon_rankme_alarm",
+            1.0 if verdict.is_alarm else 0.0,
+            on_epoch=True,
+        )
 
     def _run_mask_orphan_monitor(
         self,
@@ -516,28 +701,98 @@ class V14JointBrainModule(pl.LightningModule):
     def _monitor_from_step(
         self, batch_data: dict[str, Tensor], *, step_name: str,
     ) -> None:
-        """Re-run the encoder + teacher forward in eval/no-grad mode to
-        feed MON-MASK-002 without retaining the training-step graph.
+        """Run per-step monitors that need the encoder/teacher forwards.
 
-        Re-doing the forward keeps the monitor independent of any
+        Re-doing the forward keeps each monitor independent of any
         training-step caching layout; the cost is two extra forwards on
         ~5% of steps (Lightning's val cadence). For training_step the
         caller can override the cadence by gating the call.
+
+        Monitors fired here:
+
+        * MON-PARCEL-COVERAGE-VARIANCE (5/28 P0) — cheap; no forward
+          needed. Runs on every step.
+        * MON-MASK-002 (B03d) — requires ``shaft_mask`` in the batch.
+        * MON-TEACHER-FEATURE-RANK (5/28 P0) — RankMe on the EMA
+          teacher's LN_frame M4 tap, masked by ``latent_valid``. Run
+          on validation/test steps only (default Lightning cadence
+          ≈ 10k-step probe spec).
         """
-        if "shaft_mask" not in batch_data:
-            return
         student_kwargs, _ = self._extract_student_kwargs(batch_data)
+
+        latent_valid = _latent_valid_from_batch(
+            support=student_kwargs["support"],
+            valid_mask=student_kwargs.get("valid_mask"),
+            m_sub_slots=self._m_sub_slots,
+        )
+        self._run_parcel_coverage_monitor(
+            latent_valid=latent_valid, step_name=step_name,
+        )
+
+        needs_orphan = "shaft_mask" in batch_data
+        needs_rankme = step_name in ("val", "test")
+        if not (needs_orphan or needs_rankme):
+            return
+
         with torch.no_grad():
-            student_taps = self.student(**student_kwargs)
             teacher_taps = self.teacher.model(**student_kwargs)
-            m4_s_lnframe = self.student.ln_frame(student_taps["M4"])
             m4_t_lnframe = self.teacher.model.ln_frame(teacher_taps["M4"])
-            self._run_mask_orphan_monitor(
-                batch_data=batch_data,
-                student_m4_lnframe=m4_s_lnframe,
-                teacher_m4_lnframe=m4_t_lnframe,
-                step_name=step_name,
-            )
+
+            if needs_orphan:
+                student_taps = self.student(**student_kwargs)
+                m4_s_lnframe = self.student.ln_frame(student_taps["M4"])
+                self._run_mask_orphan_monitor(
+                    batch_data=batch_data,
+                    student_m4_lnframe=m4_s_lnframe,
+                    teacher_m4_lnframe=m4_t_lnframe,
+                    step_name=step_name,
+                )
+            if needs_rankme:
+                self._run_teacher_rank_monitor(
+                    teacher_m4_lnframe=m4_t_lnframe,
+                    latent_valid=latent_valid,
+                    step_name=step_name,
+                )
+
+    def on_before_optimizer_step(
+        self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature
+    ) -> None:
+        """MON-GRAD-SPIKE-DIVERGENCE (5/28 P0) — SPAM grad-L2 + spike
+        probe before ``optimizer.step()``.
+
+        Reads the post-backward grads off the student parameters (the
+        teacher has no grads), computes the global L2, compares it to
+        the persistent EMA buffer, and updates the buffer in-place.
+
+        Done before the optimiser step so a flagged step still gets the
+        update (the alarm is informational; the dispatch callback owns
+        any rollback / LR backoff escalation per SPAM §3.1).
+        """
+        sq_sum = torch.zeros(
+            (), device=self._grad_ema_l2.device, dtype=torch.float32,
+        )
+        for p in self.student.parameters():
+            if p.grad is not None:
+                sq_sum = sq_sum + p.grad.detach().to(torch.float32).pow(2).sum()
+        grad_l2 = float(sq_sum.sqrt().item())
+        verdict = grad_spike_monitor(
+            grad_l2=grad_l2,
+            prior_ema_l2=float(self._grad_ema_l2.item()),
+        )
+        self._grad_ema_l2.fill_(verdict.new_grad_ema_l2)
+        self.log("train_mon_grad_l2", verdict.grad_l2, on_step=True)
+        self.log("train_mon_grad_ema_l2", verdict.grad_ema_l2, on_step=True)
+        self.log("train_mon_grad_spike_ratio", verdict.spike_ratio, on_step=True)
+        self.log(
+            "train_mon_grad_spike",
+            1.0 if verdict.is_spike else 0.0,
+            on_step=True,
+        )
+        self.log(
+            "train_mon_grad_diverged",
+            1.0 if verdict.is_diverged else 0.0,
+            on_step=True,
+        )
 
     def on_train_batch_end(
         self,

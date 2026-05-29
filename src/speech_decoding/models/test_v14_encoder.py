@@ -538,12 +538,28 @@ def test_v14_parcel_collapse_pma_shape() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_v14_parcel_collapse_pma_is_frozen_by_default() -> None:
-    """5/22 spec §3: PMA is frozen so Phase-3 SSL distillation and Phase-4
-    downstream evaluation share a non-trainable parcel-collapse readout."""
+def test_v14_parcel_collapse_pma_default_is_unfrozen_under_b31() -> None:
+    """B31 lock 2026-05-28
+    ([[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]): PMA's default
+    ``freeze=False`` so the P3 cross-modal distillation construction picks
+    up an unfrozen PMA (gradient flows from the Whisper-L8 distillation
+    loss). P4 explicitly passes ``freeze=True`` at the Phase-4 construction
+    site so the downstream linear-probe contract is unaffected; see
+    ``V14Phase4FlatHead`` build in ``v14_encoder.py`` for the explicit
+    override. The pre-B31 ``freeze=True`` default is locked out — the
+    P3-vs-P4 freeze policy is now explicit at each construction site."""
     pma = V14ParcelCollapsePMA(d_model=32, n_heads=4)
     for name, p in pma.named_parameters():
-        assert not p.requires_grad, f"{name} should be frozen but requires grad"
+        assert p.requires_grad, f"{name} should be trainable under B31 default"
+
+
+def test_v14_parcel_collapse_pma_freeze_true_kwarg_freezes_all_params() -> None:
+    """Explicit ``freeze=True`` (the P4 construction-site kwarg) freezes
+    every PMA parameter — preserves the frozen-readout contract that the
+    Phase-4 linear-probe protocol depends on."""
+    pma = V14ParcelCollapsePMA(d_model=32, n_heads=4, freeze=True)
+    for name, p in pma.named_parameters():
+        assert not p.requires_grad, f"{name} should be frozen under freeze=True"
 
 
 def test_v14_phase3_triangular_pool_shape_and_normalization() -> None:
@@ -612,6 +628,7 @@ def test_v14_head_wrapper_forwards_b29_conditioning_to_encoder() -> None:
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
         subtype_embed_enabled=True,                  # post 5/28 flip: opt in
+        ref_embed_enabled=True,                      # post B32 flip: opt in
     )
     model = cfg.build(n_classes=3).eval()
     B, C, T, F = 2, 7, 4, 6
@@ -977,21 +994,29 @@ def test_v14_b29_r_subtype_embed_input_only_sister_enables_without_kv_reuse() ->
     assert model.subtype_embed_reuse_kv is False
 
 
-def test_v14_b29_ref_embed_default_is_three_cell_enabled() -> None:
-    """Default: ref_embed_enabled=True, fixed 3-cell vocab
-    {shaftCAR, bipolar, Laplacian}."""
+def test_v14_b29_ref_embed_default_is_disabled() -> None:
+    """B32 5/28 PM-late first-pass-no-input-aug lock: default
+    ref_embed_enabled=False; the embedding module is None. Sister
+    ``R-ref-aug-3-cell`` re-enables a fixed 3-cell vocab
+    {shaftCAR, bipolar, Laplacian} paired with RefAugMultiStftView."""
     model = V14ParcelPerceiverModel(**_tiny_kwargs())
-    assert model.ref_embed_enabled is True
-    assert model.ref_embed.weight.shape == (3, _tiny_kwargs()["d_model"])
+    assert model.ref_embed_enabled is False
+    assert model.ref_embed is None
+    # K/V reuse flag stays at its True default (it gates a code path that
+    # is no-op when ``ref_embed_enabled=False``; the flag itself is
+    # preserved so opt-in callers don't have to set it).
     assert model.ref_embed_reuse_kv is True
 
 
 def test_v14_b29_no_subtype_embed_sister_disables_module() -> None:
-    """``R-no-subtype-embed`` P0 sets subtype_embed_enabled=False."""
+    """``R-no-subtype-embed`` IS the default post 5/28 PM Item-11 flip,
+    so this test just re-confirms that the default leaves the subtype
+    embed module unset. Forward still runs end-to-end (B32 also leaves
+    ref_embed off by default; the A1 additive branch is fully skipped
+    when both flags are False)."""
     kw = _tiny_kwargs() | {"subtype_embed_enabled": False}
     model = V14ParcelPerceiverModel(**kw)
     assert model.subtype_embed is None
-    # Forward still runs (ref_embed still active, contributing embed(0)).
     B, C, T, F = 2, 3, kw["n_time_bins"], kw["n_freq_bins"]
     out = model(torch.randn(B, C, T, F), torch.rand(B, C, kw["k_parcels"]))
     assert torch.isfinite(out).all()
@@ -1045,9 +1070,14 @@ def test_v14_b29_subtype_embed_changes_output_when_id_changes() -> None:
 
 
 def test_v14_b29_ref_embed_changes_output_when_id_changes() -> None:
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    B, C, T, F = 2, 3, _tiny_kwargs()["n_time_bins"], _tiny_kwargs()["n_freq_bins"]
-    K = _tiny_kwargs()["k_parcels"]
+    """Different ref_idx values must produce different encoder outputs —
+    proves the embed is wired into the forward, not a dead parameter.
+    Ref embed defaults OFF post B32, so the sister-enabled path is what
+    we test here."""
+    kw = _tiny_kwargs() | {"ref_embed_enabled": True}
+    model = V14ParcelPerceiverModel(**kw).eval()
+    B, C, T, F = 2, 3, kw["n_time_bins"], kw["n_freq_bins"]
+    K = kw["k_parcels"]
     electrodes = torch.randn(B, C, T, F)
     support = torch.rand(B, C, K)
     with torch.no_grad():
@@ -1111,20 +1141,28 @@ def test_v14_b29_subtype_embed_invalid_id_rejected() -> None:
 
 
 def test_v14_b29_ref_idx_invalid_id_rejected() -> None:
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    B, C, T, F = 2, 3, _tiny_kwargs()["n_time_bins"], _tiny_kwargs()["n_freq_bins"]
-    K = _tiny_kwargs()["k_parcels"]
+    """Vocab-range validation lives on the ref_embed branch — opt the
+    embed in (B32 default OFF) so the validation path executes."""
+    kw = _tiny_kwargs() | {"ref_embed_enabled": True}
+    model = V14ParcelPerceiverModel(**kw).eval()
+    B, C, T, F = 2, 3, kw["n_time_bins"], kw["n_freq_bins"]
+    K = kw["k_parcels"]
     bad = torch.tensor([3, 0], dtype=torch.long)  # out of vocab=3
     with pytest.raises(ValueError, match="ref_idx"):
         model(torch.randn(B, C, T, F), torch.rand(B, C, K), ref_idx=bad)
 
 
 def test_v14_b29_subtype_ref_config_propagates_through_build() -> None:
+    """Config-level overrides flow through ``build``. Note: B32 sets the
+    ``ref_embed_enabled`` default to False, so this test passes
+    ``ref_embed_enabled=True`` explicitly to verify that the K/V-reuse
+    flag still propagates (i.e. the input-only ref-embed sister wiring
+    survives the cfg → encoder boundary)."""
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2,
         subtype_vocab=3, subtype_embed_enabled=False,
-        ref_embed_reuse_kv=False,
+        ref_embed_enabled=True, ref_embed_reuse_kv=False,
     )
     wrap = cfg.build(n_classes=5)
     encoder = wrap.encoder

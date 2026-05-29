@@ -1,9 +1,22 @@
 """LOSS-04 (B19 + B21 5-term loss lock 2026-05-25; B26 loss-form
-amendment 2026-05-27 PM; **B30 mask-discipline lock 2026-05-28**):
+amendment 2026-05-27 PM; B30 mask-discipline lock 2026-05-28;
+**B31 V-JEPA-2-canonical 2-term lock 2026-05-28
+([[project_v14_b31_vjepa2_canonical_loss_2026_05_28]])**):
 utterance-level loss between student and teacher PMA-pooled M4
 representations.
 
-Path (recipe §5 + ``project_v14_collapse_prevention_lock_2026_05_25`` +
+**B31 scope-shift**: this module survives because :func:`pma_then_mean`
+is still needed at **Phase-3** for the Whisper-L8 cross-modal
+distillation readout. It is NOT used in the **B31 default joint SSL
+aggregator** (``loss_variant="b31_default"``) — the B31 default drops
+``L_post_utterance`` to two pure-L1 terms (``L_pre_frame @ M2`` +
+``L_post_frame @ M4``). The 5-term path documented below is reached only
+via the ``R-add-utterance-loss`` (``loss_variant="b31_plus_utt"``) /
+``R-add-both`` (``loss_variant="b31_plus_both"``) sisters, which exist
+to empirically re-litigate B31's drop.
+
+Path (P3 distillation, or B31 utterance-sister: recipe §5 +
+``project_v14_collapse_prevention_lock_2026_05_25`` +
 ``project_v14_anatomy_gated_symmetric_2026_05_28``)::
 
     student_M4   --(LN_utt)--> PMA(latent_valid) → (B, T_p, d)
@@ -17,8 +30,12 @@ MSE remains available as the ``R-l2-loss`` / ``R-mse-loss`` sister
 falsifier via explicit ``loss_form="mse"``.
 
 The PMA module is owned by the encoder so its query is checkpointable and
-participates in EMA-teacher mirroring. PMA query is trained during P1 +
-P2 (via this loss) + P3 (Smooth-L1) and frozen only at P4 (B07).
+participates in EMA-teacher mirroring. Under the **B31 three-phase
+training contract**, the PMA query receives gradient only at **P3**
+(Whisper-L8 distillation); P1+P2 use no PMA in the default joint SSL
+loss path, and P4 freezes PMA explicitly at the Phase-4 construction
+site. The ``R-add-utterance-loss`` sister restores PMA training in
+P1+P2 to falsify the B31 drop.
 
 The caller passes the SAME PMA module instance for both student and
 teacher forward passes; the EMA teacher's PMA mirror is built by the

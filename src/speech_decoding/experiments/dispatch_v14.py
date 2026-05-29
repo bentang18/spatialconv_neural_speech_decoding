@@ -141,6 +141,26 @@ DEFAULT_FFN_VARIANT: str = "dense"
 PHASE_MODES: tuple[str, ...] = ("joint_b29", "split_p1_p2")
 DEFAULT_PHASE_MODE: str = "joint_b29"
 
+# B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical loss simplification):
+# joint SSL default is a 2-term surface (L_pre_frame @ M2 + L_post_frame
+# @ LN_frame(M4), both pure L1 per V-JEPA 2 §2.1 Eq 1). The three
+# falsifier sisters reinstate the B28/B29 dropped L_mid_slot / L_post_utt:
+#
+#   * ``b31_plus_m3``   → R-add-m3-loss         P0
+#   * ``b31_plus_utt``  → R-add-utterance-loss  P0 (EAT-faithful, ≥0.02
+#                          AUROC promotion gate vs default at BT-Lite Cell-0)
+#   * ``b31_plus_both`` → R-add-both            P0
+#
+# The brain module builds the dropped heads only when the variant
+# selects them; the SSL aggregator only computes the corresponding
+# term when the matching tensors are supplied. ``LOSS_VARIANTS`` is
+# derived from the canonical ``LossVariant`` Literal so a new sister
+# arm added in ``ssl/aggregator.py`` is automatically exposed at the
+# CLI without a parallel edit here.
+from speech_decoding.ssl.aggregator import LOSS_VARIANTS  # noqa: E402
+
+DEFAULT_LOSS_VARIANT: str = "b31_default"
+
 # B28 anatomy-bias warmup (5/27 PM) → B29 per-clip gate (5/27 PM-late)
 # supersession: default uses per-clip metadata to gate the bias;
 # sisters reinstate the step-time schedules.
@@ -214,11 +234,18 @@ def build_v14_experiment(
     cross_attn_positions: list[int] | None = None,
     # B29 Item 11 + 5/28 PM precedent-audit flip 2026-05-28: subtype default
     # ON → OFF (Agent 2 found M3AE precedent net-neutral on iEEG via DIVER-1
-    # §4.1). Ref defaults unchanged.
+    # §4.1).
+    # B32 5/28 PM-late first-pass-no-input-aug lock: ref_embed default ON →
+    # OFF. With LogStftView (single static shaft-CAR) as the default
+    # dispatch extractor, ref_embed always indexes the same row; the
+    # additive contribution is a no-op (best case) or pure distribution
+    # drift (worst case). Sister `R-ref-aug-3-cell` re-enables the lookup
+    # paired with RefAugMultiStftView. See:
+    # memory/project_v14_b32_first_pass_no_input_aug_2026_05_28.md
     subtype_embed_enabled: bool = False,
     subtype_embed_reuse_kv: bool = True,
     subtype_embed_vocab: str = DEFAULT_SUBTYPE_EMBED_VOCAB,
-    ref_embed_enabled: bool = True,
+    ref_embed_enabled: bool = False,
     ref_embed_reuse_kv: bool = True,
     # B29 phase-mode + anatomy-bias + corpus mix lock 2026-05-27 PM-late.
     phase_mode: str = DEFAULT_PHASE_MODE,
@@ -246,6 +273,12 @@ def build_v14_experiment(
     # lands. Persisted onto the run record so the choice is grep-able.
     latent_valid_override: str = "support",
     sa_mask_mode: str = "bidirectional",
+    # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical 2-term joint SSL
+    # default). ``"b31_default"`` is the locked first-pass shape; the
+    # three sisters reinstate the B28/B29 dropped terms for
+    # falsification. Only effective under ``joint_phase=True``; the
+    # supervised Phase-4 path raises if a non-default is requested.
+    loss_variant: str = DEFAULT_LOSS_VARIANT,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -271,6 +304,7 @@ def build_v14_experiment(
     _validate_choice("phase_mode", phase_mode, PHASE_MODES)
     _validate_choice("anatomy_bias_mode", anatomy_bias_mode, ANATOMY_BIAS_MODES)
     _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
+    _validate_choice("loss_variant", loss_variant, LOSS_VARIANTS)
     if ffn_variant != "dense":
         # MoE-FFN audit 2026-05-28: ``soft_moe_4`` is reserved as a P2
         # if-budget sister and requires ``models/soft_moe.py``. Fail
@@ -488,17 +522,24 @@ def build_v14_experiment(
             # non-default values until the runtime branch lands.
             "latent_valid_override": latent_valid_override,
             "sa_mask_mode": sa_mask_mode,
+            # B31 loss-variant selector: 2-term default + 3 sister arms.
+            "loss_variant": loss_variant,
         }
-    elif latent_valid_override != "support" or sa_mask_mode != "bidirectional":
-        # B30 sister flags only have semantic effect under the joint
-        # phase. The supervised Phase-4 path doesn't run the SSL
+    elif (
+        latent_valid_override != "support"
+        or sa_mask_mode != "bidirectional"
+        or loss_variant != DEFAULT_LOSS_VARIANT
+    ):
+        # B30 + B31 sister flags only have semantic effect under the
+        # joint phase. The supervised Phase-4 path doesn't run the SSL
         # aggregator or the bidirectional-mask latent-SA branch, so a
         # non-default flag here would silently mis-record the sister.
         raise ValueError(
-            "latent_valid_override / sa_mask_mode are B30 sister "
-            "selectors for the joint phase only; got "
+            "latent_valid_override / sa_mask_mode / loss_variant are "
+            "B30/B31 sister selectors for the joint phase only; got "
             f"latent_valid_override={latent_valid_override!r}, "
-            f"sa_mask_mode={sa_mask_mode!r} with joint_phase=False. "
+            f"sa_mask_mode={sa_mask_mode!r}, "
+            f"loss_variant={loss_variant!r} with joint_phase=False. "
             "Pass --phase 1 (joint) when setting these flags."
         )
 
@@ -533,6 +574,11 @@ def build_v14_experiment(
             "dkoleo_mode": dkoleo_mode,
             "phase_mode": phase_mode,
             "anatomy_bias_mode": anatomy_bias_mode,
+            # NOTE: ``loss_variant`` (B31) lives on the V14JointExperiment
+            # field via ``extra_experiment_kwargs`` below, NOT on the
+            # brain-model config — the brain-model Pydantic schema is
+            # ``extra='forbid'``. The run-record YAML still captures it
+            # via the Experiment-level snapshot.
         },
         loss={"name": "CrossEntropyLoss"},
         optim={"optimizer": {"name": "Adam", "lr": 1e-3}},
@@ -644,10 +690,12 @@ def _parser() -> argparse.ArgumentParser:
              "or 'three_way' (sEEG / iEEG-surface / ECoG).",
     )
     p.add_argument(
-        "--no-ref-embed", dest="ref_embed_enabled",
-        action="store_false", default=True,
-        help="Disable the per-clip reference-operator embedding "
-             "(R-ref-embed-disabled sister).",
+        "--ref-embed", dest="ref_embed_enabled",
+        action="store_true", default=False,
+        help="Enable the per-clip reference-operator embedding (B32 "
+             "first-pass-no-input-aug default = OFF; pair with "
+             "`--ref-aug` / RefAugMultiStftView to re-enable as the "
+             "`R-ref-aug-3-cell` P1 sister).",
     )
     p.add_argument(
         "--no-ref-embed-reuse-kv", dest="ref_embed_reuse_kv",
@@ -678,6 +726,17 @@ def _parser() -> argparse.ArgumentParser:
              "shape. 'bidirectional' (default) is the B30 lock; "
              "'key_only' is R-sa-key-only P1. Sister raises "
              "NotImplementedError until the encoder branch lands.",
+    )
+    p.add_argument(
+        "--loss-variant",
+        choices=LOSS_VARIANTS, default=DEFAULT_LOSS_VARIANT,
+        help="B31 V-JEPA-2-canonical 2-term joint SSL selector. "
+             "'b31_default' (default) = L_pre_frame @ M2 + L_post_frame "
+             "@ LN_frame(M4), both pure L1 per V-JEPA 2 §2.1 Eq 1. "
+             "'b31_plus_m3' adds L_mid_slot (R-add-m3-loss P0); "
+             "'b31_plus_utt' adds L_post_utterance (R-add-utterance-loss "
+             "P0, EAT-faithful, ≥0.02 AUROC promotion gate); "
+             "'b31_plus_both' adds both (R-add-both P0). Joint phase only.",
     )
     p.add_argument(
         "--anatomy-bias-mode",
@@ -742,7 +801,10 @@ _PHASE1_BLOCKERS = (
     # blockers below now fire from V14JointExperiment._train_and_test,
     # not from the dispatch.
     # B2.2 (#97) closed 2026-05-28: V14JointBrainModule composes the
-    # B28/B29 4-term aggregator with B30 latent_valid.
+    # joint SSL aggregator with B30 latent_valid; B31 lock (2026-05-28
+    # PM-late, [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]])
+    # collapsed the default to 2 terms; the 4-term path now lives behind
+    # the b31_plus_both sister flag.
     # B2.3 (#98) closed 2026-05-28: BTShaftMaskExtractor + RefAugMultiStftView
     # + ref_embed wired into the joint segmenter.
     # B2.4 (#99) closed 2026-05-28: WRS primitive landed; full multi-corpus
@@ -849,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
-          f"ffn_variant={args.ffn_variant}")
+          f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant}")
 
     cross_attn_positions: list[int] | None = None
     if args.cross_attn_positions is not None:
@@ -888,6 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         ffn_variant=args.ffn_variant,
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
+        loss_variant=args.loss_variant,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

@@ -172,6 +172,50 @@ def test_v14_joint_experiment_accepts_b30_sister_flag_defaults() -> None:
     assert xp.sa_mask_mode == "bidirectional"
 
 
+def test_v14_joint_experiment_default_loss_variant_is_b31_default() -> None:
+    """B31 lock 2026-05-28 PM-late: ``V14JointExperiment.loss_variant``
+    defaults to ``"b31_default"`` (the V-JEPA-2-canonical 2-term joint
+    SSL surface). The three sister variants are accepted by the field
+    Literal without raising."""
+    from speech_decoding.experiments.v14_joint import (
+        JOINT_PHASE_VALUE,
+        LossVariant,
+    )
+    import typing as tp
+
+    xp = V14JointExperiment.model_construct(
+        phase=JOINT_PHASE_VALUE,
+        latent_valid_override="support",
+        sa_mask_mode="bidirectional",
+    )
+    xp.model_post_init(None)
+    assert xp.loss_variant == "b31_default"
+    # Schema check: the Literal exposes all 4 B31 arms.
+    assert set(tp.get_args(LossVariant)) == {
+        "b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both",
+    }
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both"],
+)
+def test_v14_joint_experiment_propagates_loss_variant(variant: str) -> None:
+    """The 4 B31 ``loss_variant`` values are all accepted and persisted
+    onto the V14JointExperiment instance — the value is what
+    ``_build_brain_module`` threads onto :class:`V14JointBrainModule`."""
+    from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
+
+    xp = V14JointExperiment.model_construct(
+        phase=JOINT_PHASE_VALUE,
+        latent_valid_override="support",
+        sa_mask_mode="bidirectional",
+        loss_variant=variant,
+    )
+    xp.model_post_init(None)
+    assert xp.loss_variant == variant
+
+
 def test_v14_joint_experiment_rejects_b30_sister_latent_valid_override() -> None:
     """B30 sister falsifier ``R-item-12-all-true`` raises
     :class:`NotImplementedError` until B2.2 lands the aggregator-call
