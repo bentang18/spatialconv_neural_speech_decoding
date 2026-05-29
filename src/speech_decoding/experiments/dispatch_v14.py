@@ -223,6 +223,16 @@ def build_v14_experiment(
     seed: int = 33,
     exca_folder: str | None = None,
     cluster: str | None = None,
+    # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
+    # they only override exca's TaskInfra / submitit defaults when set.
+    # Without them, ``--cluster slurm`` falls through to submitit's
+    # ``common`` partition + ~2GB mem, which OOM-kills any real BT data
+    # prep. See submitit field defs in ``exca/slurm.py``.
+    slurm_partition: str | None = None,
+    mem_gb: float | None = None,
+    gpus_per_node: int | None = None,
+    cpus_per_task: int | None = None,
+    timeout_min: int | None = None,
     fast_dev_run: bool | int = False,
     # B28 DKoleo demotion 2026-05-27 PM: select the DKoleo @ M4 unit
     # (or disable). Plumbed onto the brain-model config so the SSL
@@ -503,6 +513,16 @@ def build_v14_experiment(
         infra_cfg["folder"] = exca_folder
     if cluster is not None:
         infra_cfg["cluster"] = cluster
+    if slurm_partition is not None:
+        infra_cfg["slurm_partition"] = slurm_partition
+    if mem_gb is not None:
+        infra_cfg["mem_gb"] = mem_gb
+    if gpus_per_node is not None:
+        infra_cfg["gpus_per_node"] = gpus_per_node
+    if cpus_per_task is not None:
+        infra_cfg["cpus_per_task"] = cpus_per_task
+    if timeout_min is not None:
+        infra_cfg["timeout_min"] = timeout_min
 
     experiment_cls: type[Experiment] = Experiment
     extra_experiment_kwargs: dict[str, tp.Any] = {}
@@ -632,6 +652,24 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
+    # Slurm resource knobs (B1.4a, 2026-05-29). Only used when
+    # --cluster=slurm; otherwise ignored. Defaults are conservative
+    # (None = inherit submitit defaults) — pass explicit values for any
+    # real BT run because submitit's ``common`` partition + 2GB-mem
+    # fallback OOM-kills the LogStftView extractor prep.
+    p.add_argument("--slurm-partition", default=None,
+                   help="Slurm partition (e.g. 'scavenger-gpu', "
+                        "'coganlab-gpu'). Required for real GPU runs.")
+    p.add_argument("--mem-gb", type=float, default=None,
+                   help="Memory per task in GB. Lite BT data prep needs "
+                        "≥64; Full BT needs ≥128.")
+    p.add_argument("--gpus-per-node", type=int, default=None,
+                   help="GPUs per node (1 for single-GPU Lite/Full).")
+    p.add_argument("--cpus-per-task", type=int, default=None,
+                   help="CPUs per task (≥8 recommended for data prep "
+                        "parallelism).")
+    p.add_argument("--timeout-min", type=int, default=None,
+                   help="Slurm timeout in minutes (e.g. 720 = 12h).")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
@@ -912,6 +950,10 @@ def main(argv: list[str] | None = None) -> int:
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant}")
+    if args.cluster == "slurm":
+        print(f"  slurm: partition={args.slurm_partition} mem_gb={args.mem_gb} "
+              f"gpus_per_node={args.gpus_per_node} "
+              f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
 
     cross_attn_positions: list[int] | None = None
     if args.cross_attn_positions is not None:
@@ -934,6 +976,11 @@ def main(argv: list[str] | None = None) -> int:
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         batch_size=args.batch_size, n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
+        slurm_partition=args.slurm_partition,
+        mem_gb=args.mem_gb,
+        gpus_per_node=args.gpus_per_node,
+        cpus_per_task=args.cpus_per_task,
+        timeout_min=args.timeout_min,
         dkoleo_mode=args.dkoleo_mode,
         cross_attn_positions=cross_attn_positions,
         mains_notch_hz=args.mains_notch_hz,

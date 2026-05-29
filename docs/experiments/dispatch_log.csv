@@ -12,3 +12,4 @@ dispatched_at,branch,commit,submitter,args,status
 2026-05-29T06:31:03Z,main,db966ac,scripts/neuroprobe/teacher_ceiling/submit_ceiling.py,"--out-dir reports/neuroprobe_whisper_ceiling_2026_05_28 --wav-dir /work/ht203/data/braintreebank_wavs",dispatched
 2026-05-29T06:39:33Z,main,cda8dae,scripts/neuroprobe/teacher_ceiling/submit_ceiling.py,"--out-dir reports/neuroprobe_whisper_ceiling_2026_05_28 --wav-dir /work/ht203/data/braintreebank_wavs",dispatched
 2026-05-29T06:40:47Z,main,73a0518,scripts/neuroprobe/teacher_ceiling/submit_ceiling.py,"--out-dir reports/neuroprobe_whisper_ceiling_2026_05_28 --wav-dir /work/ht203/data/braintreebank_wavs",dispatched
+2026-05-29T07:03:19Z,main,6b67a36,src/speech_decoding/experiments/dispatch_v14.py,"--mode lite --phase 4",dispatched
