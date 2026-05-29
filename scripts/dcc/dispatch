@@ -16,6 +16,11 @@ set -euo pipefail
 
 DCC_HOST="${DCC_HOST:-ht203@dcc-login.oit.duke.edu}"
 DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
+# DCC non-interactive shells do NOT source ~/.bashrc, so the canonical
+# v14 env vars (set there for interactive sessions) need to be injected
+# here. Override per-invocation if needed.
+DCC_ROOT_BT="${DCC_ROOT_BT:-/work/ht203/data/braintreebank}"
+DCC_EXCA_CACHE="${DCC_EXCA_CACHE:-/hpc/group/coganlab/ht203/cache_neuroai}"
 
 if [[ $# -lt 1 ]]; then
   echo "usage: scripts/dcc/dispatch <submitter-relpath> [args...]" >&2
@@ -59,9 +64,9 @@ for arg in "$@"; do
   remote_args+=("$(printf '%q' "${arg}")")
 done
 
-echo ">> ${DCC_HOST}: .venv/bin/python ${submitter} ${remote_args[*]:-}"
+echo ">> ${DCC_HOST}: ROOT_DIR_BRAINTREEBANK=${DCC_ROOT_BT} EXCA_CACHE_FOLDER=${DCC_EXCA_CACHE} .venv/bin/python ${submitter} ${remote_args[*]:-}"
 ssh -t "${DCC_HOST}" \
-  "cd '${DCC_REPO}' && .venv/bin/python ${submitter} ${remote_args[*]:-}"
+  "cd '${DCC_REPO}' && ROOT_DIR_BRAINTREEBANK='${DCC_ROOT_BT}' EXCA_CACHE_FOLDER='${DCC_EXCA_CACHE}' .venv/bin/python ${submitter} ${remote_args[*]:-}"
 
 echo
 echo ">> sweep dispatched. Close the loop: pull results, run the collector +"
