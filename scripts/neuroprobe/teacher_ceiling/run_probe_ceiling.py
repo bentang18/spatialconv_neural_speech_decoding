@@ -47,11 +47,16 @@ from speech_decoding.whisper_ceiling.probe import (
     binary_labels_face_num,
     binary_labels_from_continuous,
     fit_probe_cross_session,
-    fit_probe_cross_subject,
     fit_probe_within_trial,
     fit_probe_within_trial_with_scores,
     topk_layers_by_within_auroc,
 )
+from speech_decoding.whisper_ceiling.probe import fit_probe_train_test
+
+# Import the (sid, tid) -> movie mapping from the sibling submitter so the
+# cross-movie LOSO split has the same canonical cohort definition. Python adds
+# the script's directory to sys.path automatically.
+from submit_ceiling import SUBJECT_TRIAL_MOVIE
 
 
 def _n_jobs() -> int:
@@ -389,66 +394,84 @@ def main() -> None:
                 flush=True,
             )
 
-    # === CROSS-SUBJECT (LOSO) ===
+    # === CROSS-MOVIE LOSO ===
+    # The teacher-ceiling probe sees Whisper features extracted from the WAV;
+    # there is no notion of "brain subject" in this feature space. Two trials
+    # of the same movie (e.g. cars-2 watched by sub_3 / sub_7 / sub_10) yield
+    # IDENTICAL feature vectors per word. A subject-level LOSO would leak the
+    # held-out subject's movie into the train pool whenever another subject
+    # watched the same movie. So we dedup by movie (take the first canonical
+    # (sid, tid) per movie) and run LOSO over the 9 unique movies.
+    #
+    # We skip `concat_all` (d=40960) under LOSO: with ~30k pooled train
+    # samples its Ridge cholesky needs X^T X ≈ 6.4 GB and the within-trial
+    # numbers already show concat_all overfits vs concat_top3 / single-layer.
+    movie_to_canonical: dict[str, tuple[int, int]] = {}
+    for (sid, tid) in sorted(trial_features.keys()):
+        movie = SUBJECT_TRIAL_MOVIE.get((sid, tid))
+        if movie is None or movie in movie_to_canonical:
+            continue
+        movie_to_canonical[movie] = (sid, tid)
+    movies = sorted(movie_to_canonical.keys())
     print(
-        f"[probe] CROSS-SUBJECT probes (LOSO) — "
-        f"{len(subjects)} subjects × {len(tasks)} tasks",
+        f"[probe] CROSS-MOVIE LOSO — {len(movies)} unique movies, "
+        f"{len(tasks)} tasks (concat_all skipped: see comment)",
         flush=True,
     )
-    features_by_subject: dict = {sid: {} for sid in subjects}
-    labels_by_subject: dict = {sid: {} for sid in subjects}
-    for task in tasks:
-        t_cs = time.time()
-        keys_for_task = layer_keys_per_task.get(task, layer_keys)
-        for sid in subjects:
-            X_layers: dict = {repr(k): [] for k in keys_for_task}
-            y_concat = []
-            for (s, t), data in trial_features.items():
-                if s != sid:
-                    continue
-                kept, y = labels_for_task(data, task)
-                if len(kept) < 5:
-                    continue
-                y_concat.append(y)
-                for key in keys_for_task:
-                    X_layers[repr(key)].append(features_for_key(data, layers, key)[kept])
-            if not y_concat:
-                continue
-            features_by_subject[sid][task] = {
-                repr(k): np.concatenate(X_layers[repr(k)], axis=0) for k in keys_for_task
-            }
-            labels_by_subject[sid][task] = np.concatenate(y_concat)
 
-        for held_out in subjects:
-            if task not in features_by_subject[held_out]:
+    for task in tasks:
+        t_cm = time.time()
+        # Per-movie kept-masked features + labels for every key except concat_all.
+        keys_for_task = [
+            k for k in layer_keys_per_task.get(task, layer_keys)
+            if k != "concat_all"
+        ]
+        movie_X: dict[str, dict[str, np.ndarray]] = {}
+        movie_y: dict[str, np.ndarray] = {}
+        for movie, (sid, tid) in movie_to_canonical.items():
+            data = trial_features[(sid, tid)]
+            kept, y = labels_for_task(data, task)
+            if len(kept) < 5:
                 continue
+            movie_X[movie] = {
+                repr(k): features_for_key(data, layers, k)[kept]
+                for k in keys_for_task
+            }
+            movie_y[movie] = y
+        for held_out in movies:
+            if held_out not in movie_X:
+                continue
+            train_movies = [m for m in movies if m != held_out and m in movie_X]
+            if not train_movies:
+                continue
+            y_train = np.concatenate([movie_y[m] for m in train_movies], axis=0)
+            y_test = movie_y[held_out]
             for key in keys_for_task:
                 key_repr = repr(key)
-                feats_by_subj = {
-                    s: features_by_subject[s][task][key_repr] for s in subjects
-                    if task in features_by_subject[s]
-                }
-                labs_by_subj = {
-                    s: labels_by_subject[s][task] for s in subjects
-                    if task in labels_by_subject[s]
-                }
+                X_train = np.concatenate(
+                    [movie_X[m][key_repr] for m in train_movies], axis=0,
+                )
+                X_test = movie_X[held_out][key_repr]
                 if isinstance(key, tuple) and key[0] == "concat_top":
                     key_label = f"concat_top3_{'_'.join(map(str, key[2]))}"
                 else:
                     key_label = str(key)
-                r = fit_probe_cross_subject(
-                    feats_by_subj, labs_by_subj,
-                    held_out_subject=held_out,
-                    task=task, layer=key_label, seed=args.seed,
+                r = fit_probe_train_test(
+                    X_train, y_train, X_test, y_test,
+                    task=task, layer=key_label, split="cross_movie",
+                    seed=args.seed,
                 )
                 rows.append({
-                    "subject_id": held_out, "trial_id": -2,
+                    "subject_id": -1,
+                    "trial_id": -1,
+                    "held_out_movie": held_out,
                     "task": r.task, "layer": key_label, "split": r.split,
                     "auroc": r.auroc, "n_train": r.n_train, "n_test": r.n_test,
                     "seed": r.seed,
                 })
         print(
-            f"[probe]   task={task} LOSO done ({time.time() - t_cs:.1f}s)",
+            f"[probe]   task={task} cross-movie LOSO done "
+            f"({time.time() - t_cm:.1f}s)",
             flush=True,
         )
 

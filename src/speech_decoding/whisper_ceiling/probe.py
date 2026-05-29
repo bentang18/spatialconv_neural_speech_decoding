@@ -302,6 +302,33 @@ def fit_probe_cross_session(
                        len(y_tr), len(y_te), seed)
 
 
+def fit_probe_train_test(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    task: str,
+    layer: int | str,
+    split: str,
+    seed: int = 42,
+) -> ProbeResult:
+    """Generic pooled-train / held-out-test probe fit.
+
+    Used by cross-movie LOSO where the held-out unit is one of N movies and
+    the train pool is all other movies' features concatenated. ``split`` is
+    the label written to the CSV ``split`` column (e.g. ``"cross_movie"``).
+    """
+    if len(X_train) < 20 or len(X_test) < 20:
+        return ProbeResult(task, layer, split, float("nan"),
+                           len(X_train), len(X_test), seed)
+    auc = _fit_score(
+        X_train.astype(np.float32), y_train,
+        X_test.astype(np.float32), y_test, seed,
+    )
+    return ProbeResult(task, layer, split, auc,
+                       len(y_train), len(y_test), seed)
+
+
 def fit_probe_cross_subject(
     features_by_subject: dict[int, np.ndarray],
     labels_by_subject: dict[int, np.ndarray],

@@ -60,7 +60,7 @@ def best_layer_per_task_split(agg: dict) -> dict:
 def markdown_report(agg: dict, csv_path: Path) -> str:
     best = best_layer_per_task_split(agg)
     tasks = sorted({t for (t, _, _) in agg})
-    splits = ["within_trial", "cross_session", "cross_subject"]
+    splits = ["within_trial", "cross_session", "cross_movie"]
 
     lines = []
     lines.append(f"# Whisper-large-v3 teacher ceiling — {csv_path.name}")
@@ -71,7 +71,7 @@ def markdown_report(agg: dict, csv_path: Path) -> str:
     # Headline table: best layer per (task, split)
     lines.append("## Best layer per task × split")
     lines.append("")
-    lines.append("| task | within_trial | cross_session | cross_subject |")
+    lines.append("| task | within_trial | cross_session | cross_movie |")
     lines.append("|---|---|---|---|")
     for task in tasks:
         row = [task]
@@ -105,29 +105,28 @@ def markdown_report(agg: dict, csv_path: Path) -> str:
         )
     lines.append("")
 
-    # Neuroprobe gate comparison
-    lines.append("## Neuroprobe gate clearance (best cross-subject AUROC)")
+    # Teacher generalization across movies — Whisper features come from WAV,
+    # so "cross-subject" is mechanically cross-movie. The two columns below
+    # are both cross-movie at the feature level: cross-session = per-subject
+    # A->B (1 train movie, 1 test movie); cross-movie LOSO = pool all-but-one
+    # of the 9 unique movies. Brain-side submission gates apply to the v14
+    # student, not this teacher-ceiling table.
+    lines.append("## Teacher generalization across movies")
     lines.append("")
-    lines.append(f"Submission gate (5/15 dual-prong): cross-subject AUROC ≥ "
-                 f"**{NEUROPROBE_GATE_CSUBJECT_BIN}**; cross-session ≥ "
-                 f"**{NEUROPROBE_GATE_CSESSION}** (multi-class proxy).")
-    lines.append("")
-    lines.append("| task | best CSubject AUROC | gate? | best CSession AUROC | gate? |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| task | best cross-movie LOSO AUROC | best cross-session AUROC |")
+    lines.append("|---|---|---|")
     for task in tasks:
-        cs = best.get((task, "cross_subject"))
+        cs = best.get((task, "cross_movie"))
         css = best.get((task, "cross_session"))
         cs_str = f"{cs['mean']:.3f} @ {cs['layer']}" if cs else "—"
         css_str = f"{css['mean']:.3f} @ {css['layer']}" if css else "—"
-        cs_gate = "✓" if cs and cs["mean"] >= NEUROPROBE_GATE_CSUBJECT_BIN else "✗"
-        css_gate = "✓" if css and css["mean"] >= NEUROPROBE_GATE_CSESSION else "✗"
-        lines.append(f"| {task} | {cs_str} | {cs_gate} | {css_str} | {css_gate} |")
+        lines.append(f"| {task} | {cs_str} | {css_str} |")
     lines.append("")
 
     # Sanity stats
     lines.append("## Per-task n")
     lines.append("")
-    lines.append("| task | within_trial n | cross_session n | cross_subject n |")
+    lines.append("| task | within_trial n | cross_session n | cross_movie LOSO n |")
     lines.append("|---|---|---|---|")
     for task in tasks:
         ns = []
