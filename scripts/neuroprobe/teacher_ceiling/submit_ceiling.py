@@ -234,7 +234,7 @@ def parse_args() -> argparse.Namespace:
                    help="single (subject, trial) for first-light run")
     p.add_argument("--account", default="coganlab")
     p.add_argument("--gpu-partition", default="scavenger-gpu,coganlab-gpu")
-    p.add_argument("--cpu-partition", default="common,scavenger,coganlab")
+    p.add_argument("--cpu-partition", default="common,scavenger")
     p.add_argument("--extract-cpus", type=int, default=4)
     p.add_argument("--extract-mem", default="64G")
     p.add_argument("--extract-time", default="04:00:00")
