@@ -119,8 +119,11 @@ class WhisperMultiLayerExtractor:
             wav_chunk_30s, sampling_rate=WHISPER_SR, return_tensors="pt"
         )
         device = next(self.model.parameters()).device
+        dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
-            self.model.model.encoder(inputs.input_features.to(device))
+            self.model.model.encoder(
+                inputs.input_features.to(device=device, dtype=dtype)
+            )
         out = {}
         for L in self.layers:
             tensor = self._captures[L]
