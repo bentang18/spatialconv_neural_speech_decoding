@@ -3,6 +3,7 @@ from __future__ import annotations
 from speech_decoding.studies.braintreebank.manifest import (
     BT_FULL_SESSIONS,
     BT_LITE_SESSIONS,
+    BT_NANO_SESSIONS,
     V14_EXCLUDED_SUBJECT_IDS,
     V14_LEADERBOARD_SUBJECT_IDS,
     V14_TRAIN_SESSIONS,
@@ -34,3 +35,20 @@ def test_v14_train_sessions_filter_excluded_subjects() -> None:
     # S5's single session (5, 0) is the only drop from BT_FULL_SESSIONS.
     assert (5, 0) not in V14_TRAIN_SESSIONS
     assert len(V14_TRAIN_SESSIONS) == len(BT_FULL_SESSIONS) - 1
+
+
+def test_bt_nano_carries_two_trials_for_default_test_subject() -> None:
+    """The default CrossSession contract picks ``test_subject_id=2,
+    test_trial_id=4`` and trains on *other* trials of the same subject.
+    Nano must therefore carry a second trial of subject 2 (``(2, 0)``)
+    or the train split is structurally empty and the nano smoke fails
+    inside ``SegmentsMixin.select`` with ``ValueError: Empty
+    subselection`` before the first batch.
+    """
+    subject_2_trials = sorted({t for s, t in BT_NANO_SESSIONS if s == 2})
+    assert len(subject_2_trials) >= 2, (
+        f"Nano needs ≥2 trials of subject 2 for the default CrossSession "
+        f"contract; got {subject_2_trials}"
+    )
+    assert 4 in subject_2_trials, "Nano must include the test trial (2, 4)"
+    assert 0 in subject_2_trials, "Nano must include a train trial (2, 0)"

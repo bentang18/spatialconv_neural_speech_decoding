@@ -9,13 +9,22 @@ from __future__ import annotations
 
 BT_NANO_SESSIONS: tuple[tuple[int, int], ...] = (
     (1, 1),
+    (2, 0),
     (2, 4),
     (3, 1),
     (4, 0),
     (7, 1),
     (10, 1),
 )
-"""Tiny BrainTreebank subset used by Neuroprobe for CI-scale smoke tests."""
+"""Tiny BrainTreebank subset used by Neuroprobe for CI-scale smoke tests.
+
+Subject 2 carries both trial 0 and trial 4 so the default CrossSession
+contract — test on ``(test_subject_id=2, test_trial_id=4)`` and train on
+*other* trials of the same subject — has a non-empty train split. With
+trial 4 alone the train mask is structurally empty and
+:class:`neuralset.dataloader.SegmentsMixin.select` raises
+``ValueError: Empty subselection`` before the first batch.
+"""
 
 BT_LITE_SESSIONS: tuple[tuple[int, int], ...] = (
     (1, 1),
