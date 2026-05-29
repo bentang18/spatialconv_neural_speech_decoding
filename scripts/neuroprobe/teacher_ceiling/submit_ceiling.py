@@ -203,7 +203,14 @@ def build_probe_sbatch(
         ".venv/bin/python scripts/neuroprobe/teacher_ceiling/run_probe_ceiling.py \\",
         f"    --features-dir {shlex.quote(str(feature_cache))} \\",
         f"    --out-dir {shlex.quote(str(out_dir))} \\",
-        "    --seed 42",
+    ])
+    if args.tasks:
+        tasks_str = " ".join(shlex.quote(t) for t in args.tasks)
+        lines.append("    --seed 42 \\")
+        lines.append(f"    --tasks {tasks_str}")
+    else:
+        lines.append("    --seed 42")
+    lines.extend([
         "",
         ".venv/bin/python scripts/neuroprobe/teacher_ceiling/collect_ceiling.py \\",
         f"    --probe-csv {shlex.quote(str(out_dir / 'ceiling_results.csv'))} \\",
@@ -241,6 +248,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-cpus", type=int, default=8)
     p.add_argument("--probe-mem", default="48G")
     p.add_argument("--probe-time", default="08:00:00")
+    p.add_argument("--tasks", nargs="*", default=None,
+                   help="forward to run_probe_ceiling.py (filter to subset of tasks)")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
