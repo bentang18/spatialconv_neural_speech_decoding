@@ -1457,7 +1457,7 @@ class V14ParcelPerceiver(BaseModelConfig):
     # linear probe; PMA gets gradient only at P3 via Whisper distill). Set
     # False for an all-trainable from-scratch supervised smoke (encoder +
     # PMA + head all unfrozen) that exercises the full forward+backward
-    # without a pretrained checkpoint — see dispatch flag --pma-unfrozen.
+    # without a pretrained checkpoint — see dispatch flag --unfreeze-pma.
     pma_freeze: bool = True
 
     # SSL-pretrain dispatch flags persisted on the model config so they
