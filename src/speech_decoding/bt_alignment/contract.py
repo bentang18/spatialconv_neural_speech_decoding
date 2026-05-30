@@ -32,22 +32,27 @@ WHISPER_CONTRACT = {
 TEACHER_RATE_HZ = 50
 STUDENT_RATE_HZ = 8
 POOL_FACTOR = TEACHER_RATE_HZ / STUDENT_RATE_HZ
-POOL_FWHM_MS = 250.0
+POOL_BASE_MS = 250.0  # triangle BASE (full w>0 support), not the half-max FWHM (=125 ms)
 NEURAL_SAMPLE_RATE_HZ = 2048
 
 
 def triangular_pool_kernel(
-    fwhm_ms: float = POOL_FWHM_MS, teacher_rate_hz: int = TEACHER_RATE_HZ
+    base_ms: float = POOL_BASE_MS, teacher_rate_hz: int = TEACHER_RATE_HZ
 ) -> np.ndarray:
     """Parameterless sum-to-1 triangular kernel for teacher-side pool, zero-padded edges.
 
-    FWHM_samples = fwhm_ms / 1000 * teacher_rate_hz. Kernel half-width = FWHM (so total
-    length = 2*FWHM + 1 samples). Triangular shape rises linearly to a centered apex.
+    Reconciled to the canonical live kernel A in
+    ``extractors.whisper_teacher_pool``: ``base_ms`` is the triangle BASE (full
+    w>0 support), so the half-base = ``base_ms/1000 * teacher_rate_hz / 2`` acts
+    as the linear-decay half-width = bucket stride. At 50→8 Hz this gives a
+    250 ms base (half-base 6.25 frames = stride; true half-max FWHM 125 ms), ~13
+    nonzero samples, length 15 — matching kernel A, not the prior 2×-wide form.
+    Triangular shape rises linearly to a centered apex.
     """
-    fwhm_samples = fwhm_ms / 1000.0 * teacher_rate_hz
-    half = int(np.ceil(fwhm_samples))
+    half_base_samples = base_ms / 1000.0 * teacher_rate_hz / 2.0
+    half = int(np.ceil(half_base_samples))
     x = np.arange(-half, half + 1)
-    raw = np.maximum(0.0, 1.0 - np.abs(x) / fwhm_samples)
+    raw = np.maximum(0.0, 1.0 - np.abs(x) / half_base_samples)
     return raw / raw.sum()
 
 

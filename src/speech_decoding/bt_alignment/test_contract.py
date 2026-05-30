@@ -27,15 +27,19 @@ def test_pool_factor():
     assert POOL_FACTOR == TEACHER_RATE_HZ / STUDENT_RATE_HZ == 6.25
 
 
-def test_triangular_kernel_fwhm_250ms_sum_to_one():
-    k = triangular_pool_kernel(fwhm_ms=250.0, teacher_rate_hz=50)
+def test_triangular_kernel_base_250ms_sum_to_one():
+    # Triangle base 250 ms @ 50 Hz: half-base = stride = 6.25 frames
+    # (true half-max FWHM 125 ms). Reconciled to live kernel A.
+    k = triangular_pool_kernel(base_ms=250.0, teacher_rate_hz=50)
     assert k.ndim == 1
     assert abs(k.sum() - 1.0) < 1e-9
     assert k[k.shape[0] // 2] == k.max()
     import math
-    fwhm_samples = 250.0 / 1000.0 * 50
-    expected_len = 2 * math.ceil(fwhm_samples) + 1
+    half_base_samples = 250.0 / 1000.0 * 50 / 2.0  # 6.25 = stride
+    expected_len = 2 * math.ceil(half_base_samples) + 1
     assert k.shape[0] == expected_len
+    # ~13 nonzero samples (base 250 ms with half-base = stride).
+    assert 11 <= int((k > 0).sum()) <= 14
 
 
 def test_clock_consistency_pass():
