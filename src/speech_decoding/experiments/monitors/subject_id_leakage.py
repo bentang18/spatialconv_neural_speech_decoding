@@ -2,9 +2,10 @@
 
 Spec: ``docs/neuroprobe/v14_blockers.md §B03f`` (registered 2026-05-25 PM).
 
-The B03f supervision gate ``parcels_supervised[subject]`` is a deterministic
-per-subject set — it encodes subject identity as a side channel that the
-encoder can latch onto, which would corrupt the CSubject gate.
+The per-subject anatomy gate (B03f ``parcels_supervised[subject]``, now the
+B30 ``latent_valid`` single source of truth) is deterministic per subject — it
+encodes subject identity as a side channel that the encoder can latch onto,
+which would corrupt the CSubject gate.
 
 This monitor fits a single-layer linear probe from the encoder's pooled
 per-clip output (typically the PMA-pooled M4 utterance vector) to the
@@ -13,7 +14,8 @@ threshold.
 
 Default threshold: ``F1 > 0.50`` against the 9-subject BT cohort's chance
 baseline of ``1 / 9 ≈ 0.111``. The 0.50 absolute threshold matches the
-"P2 step ~30k subject-ID linear-probe F1 > 0.50" criterion in §B03f.
+"~30k joint-SSL steps subject-ID linear-probe F1 > 0.50" criterion in §B03f
+(the old P2-step framing predates the B29 P1+P2 merge).
 
 Probe-fit recipe matches the sensor/ref canaries:
 

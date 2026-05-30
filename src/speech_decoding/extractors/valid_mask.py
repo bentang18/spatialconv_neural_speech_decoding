@@ -20,6 +20,7 @@ headroom past D-cohort max). Raises ValueError if any subject exceeds.
 
 from __future__ import annotations
 
+import functools
 import typing as tp
 
 import torch
@@ -33,6 +34,38 @@ from speech_decoding.studies.braintreebank.anatomy import (
 )
 
 
+@functools.lru_cache(maxsize=64)
+def _cached_n_real(
+    bt_root: str,
+    subject_id: int,
+    unknown_label_policy: str,
+    parcel_labels: tuple[str, ...],
+) -> int:
+    """Per-subject real-electrode count after unknown-label policy, memoized.
+
+    ``load_public_bt_anatomy`` re-reads ``depth-wm.csv`` on every call; the
+    count is static per subject, so the un-memoized version was ~31% of
+    warm-cache ``__getitem__`` cost. ``lru_cache`` does not cache exceptions,
+    so the FileNotFoundError ("...depth-wm.csv") and the "absent from parcel
+    vocabulary" KeyError raised under ``policy='raise'`` are both preserved.
+    The ``c_max`` ValueError is kept in ``get_static`` (out of the cache key)
+    because ``c_max`` varies per extractor instance.
+    """
+    anatomy = load_public_bt_anatomy(bt_root, subject_id)
+    if unknown_label_policy == "skip":
+        keep = anatomy["DesikanKilliany"].isin(parcel_labels)
+        anatomy = anatomy.loc[keep].reset_index(drop=True)
+    else:
+        unknown = sorted(set(anatomy["DesikanKilliany"]) - set(parcel_labels))
+        if unknown:
+            raise KeyError(
+                "BT anatomy labels absent from parcel vocabulary: "
+                f"{unknown[:10]}"
+                + (f" (+{len(unknown) - 10} more)" if len(unknown) > 10 else "")
+            )
+    return len(anatomy)
+
+
 class ElectrodeValidMask(BaseStatic):
     """Per-event ``(c_max,) bool`` valid-mask aligned with depth-wm.csv row order."""
 
@@ -44,23 +77,13 @@ class ElectrodeValidMask(BaseStatic):
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
-        anatomy = load_public_bt_anatomy(self.bt_root, subject_id)
-
-        if self.unknown_label_policy == "skip":
-            keep = anatomy["DesikanKilliany"].isin(self.parcel_labels)
-            anatomy = anatomy.loc[keep].reset_index(drop=True)
-        else:
-            unknown = sorted(
-                set(anatomy["DesikanKilliany"]) - set(self.parcel_labels)
-            )
-            if unknown:
-                raise KeyError(
-                    "BT anatomy labels absent from parcel vocabulary: "
-                    f"{unknown[:10]}"
-                    + (f" (+{len(unknown) - 10} more)" if len(unknown) > 10 else "")
-                )
-
-        n_real = len(anatomy)
+        # Memoized per-subject electrode count (after unknown-label policy):
+        # load_public_bt_anatomy re-reads depth-wm.csv per call for a value
+        # that is static per subject. FileNotFoundError + "absent from parcel
+        # vocabulary" KeyError are preserved inside the cached helper.
+        n_real = _cached_n_real(
+            self.bt_root, subject_id, self.unknown_label_policy, self.parcel_labels,
+        )
         if n_real > self.c_max:
             raise ValueError(
                 f"subject {subject_id} has {n_real} electrodes which exceeds c_max={self.c_max}"

@@ -1,11 +1,14 @@
 """V14 view extractors: single-STFT (legacy) + Multi-STFT (T1.5, 5/22 pivot).
 
 T1.5 / 5/22 spec lock (project_v14_imindbench_multistft_pivot_2026_05_22.md):
-v14's default front-end is ``MultiStftView`` — 3 STFTs at common hop=128
-@ 2048 Hz (Nperseg=1024/512/256) feeding a 30-bin ⅓-octave filterbank
-with per-bin STFT routing (k0–k14 from low, k15–k21 from mid, k22–k29 from
-hi). The original ``LogStftView`` is preserved as the F-single-STFT sister
-cell and as the fast smoke-test front-end.
+v14's front-end-of-record is ``MultiStftView`` — 3 STFTs at common
+hop=256 @ 2048 Hz (8 Hz frame rate, B20 v4 lock 2026-05-24;
+Nperseg=1024/512/256) feeding a 30-bin ⅓-octave filterbank with per-bin
+STFT routing (k0–k14 from low, k15–k21 from mid, k22–k29 from hi).
+``LogStftView`` (single-STFT) is preserved as the F-single-STFT sister
+cell and the fast smoke-test front-end; per B32 it is still the wired
+dispatch default ``electrode_tokens_extractor`` until the Multi-STFT
+cache lands.
 
 5/25 swap: ``apply_log`` defaults to ``False`` (abs magnitude, no log
 compression) — matches iMINDBench's Multi-STFT track which standardizes raw
@@ -35,11 +38,13 @@ Then applies a torch-STFT byte-equivalent to the upstream Neuroprobe baseline
 helper ``preprocess_stft(..., preprocess="stft_abs")``. Log compression
 (``log(x + eps)``) is opt-in via ``apply_log=True``.
 
-Output shape: ``(C, F_bin=38, T_bin=17)`` per 1-s @ 2048 Hz Ieeg trigger
-window. Time-last per NeuralSet's :class:`~neuralset.base.TimedArray`
-convention (``frequency = T_bin / duration = 17 Hz``). The v14 encoder
-transposes to ``(C, T_bin, F_bin)`` internally via its ``time_last_input``
-flag.
+``LogStftView`` (single-STFT) output shape: ``(C, F_bin=38, T_bin=17)``
+per 1-s @ 2048 Hz Ieeg trigger window (nperseg=512, hop=128). Time-last
+per NeuralSet's :class:`~neuralset.base.TimedArray` convention
+(``frequency = T_bin / duration = 17 Hz``). ``MultiStftView`` instead
+emits ``(C, F=30, T_bin)`` at the common hop=256 → 8 Hz frame rate (B20
+v4 lock). The v14 encoder transposes to ``(C, T_bin, F_bin)`` internally
+via its ``time_last_input`` flag.
 
 STFT params source: Neuroprobe Section D (page 18) — ``nperseg=512``,
 ``poverlap=0.75``, ``window=hann``, freq range ``0-150 Hz``, sample rate
@@ -375,8 +380,8 @@ class MultiStftView(CARIeegExtractor):
     feed a 30-bin ⅓-octave filterbank centered at ``2^(k/3)`` Hz for
     ``k ∈ [0, 30)`` (~1 Hz → ~813 Hz). Routing: k0–k14 from low, k15–k21 from
     mid, k22–k29 from hi (see ``MULTI_STFT_ROUTING``). Hop=256 yields 8 Hz
-    frame rate (B20 v4 lock 2026-05-24); previous default 128 (14.7 Hz) is
-    retired.
+    frame rate (B20 v4 lock 2026-05-24); previous default hop=128 (true rate
+    16 Hz; "14.7 Hz" was the pre-B20 mislabel) is retired.
 
     5/25 swap: ``apply_log`` defaults to ``False`` — iMINDBench-parity raw
     magnitude. Set ``apply_log=True`` for the F-log-amplitude sister cell
@@ -386,8 +391,8 @@ class MultiStftView(CARIeegExtractor):
     sample_rate_hz: int = 2048
     # FE-01 (B20 v4 lock 2026-05-24): hop=256 @ 2048 Hz → 8 Hz frame rate.
     # Matches Whisper teacher-pool target (B06 PM lock 5/25: 50 Hz → 8 Hz),
-    # avoids upsample at Phase-3 student side. Previous default 128 (14.7 Hz)
-    # was v3-era and is retired.
+    # avoids upsample at Phase-3 student side. Previous default hop=128 (true
+    # rate 16 Hz; "14.7 Hz" was the pre-B20 mislabel) was v3-era and is retired.
     hop_length: int = 256
     nperseg_low: int = 1024
     nperseg_mid: int = 512

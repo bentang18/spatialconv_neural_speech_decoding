@@ -70,6 +70,12 @@ DEFAULT_K_PARCELS = len(V14_DK_PARCEL_LABELS)  # 80
 DEFAULT_N_FREQ_BINS = 38   # ≤150 Hz with the locked STFT nperseg=512 @ 2 kHz
 DEFAULT_N_TIME_BINS = 17   # 1-second window with overlap=0.75
 DEFAULT_BATCH_SIZE = 32
+# DataLoader worker count (B1.4e, 2026-05-29). The per-sample extractor stack
+# (CAR + torch.stft in LogStftView is recomputed per __getitem__; only the raw
+# waveform load is MapInfra-cached) is CPU-bound, so num_workers=0 starves the
+# GPU (1.48 it/s on the 5/29 Lite baseline). 4 workers overlap that CPU STFT
+# with GPU compute; pair with --cpus-per-task >= num_workers + 1.
+DEFAULT_NUM_WORKERS = 4
 DEFAULT_N_EPOCHS = 100
 # Ship-first task default — `speech` is the highest-signal binary task
 # requiring zero transcript enrichment (Sentence Onset = 0.780 CS-SOTA,
@@ -105,7 +111,7 @@ MAINS_NOTCH_BY_CORPUS: dict[str, float] = {
 # expansion 2026-05-27 PM-late: DKoleo @ M4 is OFF by default; the four
 # modes select which collapse-prevention sister arms the loss.
 #
-#   * ``off`` (default) — pure 4-term B28 loss; no DKoleo arm at all.
+#   * ``off`` (default) — the B31 2-term base loss; no DKoleo arm at all.
 #   * ``intra_clip_slots`` — B21-original per-clip × 80 slots (was 320
 #     under M=4) unit, kept as the falsifier sister ``R-dkoleo-intra-clip-slots``.
 #   * ``batch_cls_unit`` — DINOv2-faithful per-batch × CLS-analog
@@ -200,6 +206,35 @@ def _validate_choice(name: str, value: str, choices: tuple[str, ...]) -> None:
         raise ValueError(f"{name} must be one of {choices}; got {value!r}")
 
 
+def _apply_extractor_cache(
+    extractor: tp.Any, name: str, root_folder: str | Path | None
+) -> None:
+    """Point an extractor's ``infra.folder`` at the persistent two-tier cache.
+
+    B1.5 (task #120, 2026-05-29): extractor outputs cached under
+    ``{root_folder}/{name}/`` survive across Experiment-config changes
+    (precision, batch_size, model knobs). Without this wiring every
+    dispatch re-runs notch + STFT + per-clip metadata extractors (~16 min
+    on Lite) because exca's TaskInfra slot binds the Experiment uid to a
+    single folder containing both extractor outputs AND model
+    checkpoints. CLAUDE.md storage tiering: this folder belongs on the
+    DCC ``/work`` regenerate-cheap cache tier (75-day purge; set via
+    ``EXCA_EXTRACTOR_CACHE_FOLDER``, concrete path in CLAUDE.md) — separate
+    from the durable ``/hpc/group/coganlab/`` Experiment cache.
+
+    No-op when ``root_folder`` is None (laptop dry-runs, tests). Skips
+    extractors that don't inherit ``infra: MapInfra`` (BaseStatic
+    subclasses like DK support / ValidMask carry no infra field).
+    """
+    if root_folder is None:
+        return
+    if not hasattr(extractor, "infra"):
+        return
+    folder = Path(root_folder) / name
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    extractor.infra.folder = folder
+
+
 def build_v14_experiment(
     *,
     bt_root: str | None = None,
@@ -219,9 +254,21 @@ def build_v14_experiment(
     n_freq_bins: int = DEFAULT_N_FREQ_BINS,
     n_time_bins: int = DEFAULT_N_TIME_BINS,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    # DataLoader worker count (B1.4e, 2026-05-29). >0 overlaps the per-sample
+    # CPU STFT with GPU compute; pass --cpus-per-task >= num_workers + 1.
+    num_workers: int = DEFAULT_NUM_WORKERS,
     n_epochs: int = DEFAULT_N_EPOCHS,
     seed: int = 33,
     exca_folder: str | None = None,
+    # B1.5 (task #120, 2026-05-29) two-tier extractor cache root. When set,
+    # each extractor's ``infra.folder`` is pointed at
+    # ``{extractor_cache_folder}/{extractor_name}/`` so its outputs survive
+    # across Experiment-config changes (precision, batch_size, model knobs)
+    # — the previous behavior re-ran ~16 min of notch + STFT + per-clip
+    # metadata prep on every OOM-debug iteration. Resolved from
+    # ``EXCA_EXTRACTOR_CACHE_FOLDER`` if unset; ``None`` means no caching
+    # (laptop dry-runs / tests).
+    extractor_cache_folder: str | None = None,
     cluster: str | None = None,
     # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
     # they only override exca's TaskInfra / submitit defaults when set.
@@ -296,6 +343,14 @@ def build_v14_experiment(
     # falsification. Only effective under ``joint_phase=True``; the
     # supervised Phase-4 path raises if a non-default is requested.
     loss_variant: str = DEFAULT_LOSS_VARIANT,
+    # B1.4f (#125) Phase-4 PMA freeze knob. Default ``True`` preserves the
+    # B31 Phase-4 contract (P4 = frozen pretrained linear probe; PMA gets
+    # gradient only at P3 via Whisper distillation). ``False`` unfreezes the
+    # PMA so the encoder + PMA + flat head are ALL trainable — a
+    # full-pipeline supervised smoke that exercises the complete
+    # forward+backward without a pretrained checkpoint. NOT a science cell;
+    # only meaningful on the supervised Phase-4 path (``joint_phase=False``).
+    pma_freeze: bool = True,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -383,6 +438,11 @@ def build_v14_experiment(
             f"ref_operator_alpha must lie in (0, 1); got {ref_operator_alpha}"
         )
 
+    # Resolve two-tier extractor cache root from env if not explicit.
+    extractor_cache_folder = extractor_cache_folder or os.environ.get(
+        "EXCA_EXTRACTOR_CACHE_FOLDER"
+    )
+
     if electrode_tokens_extractor is None:
         electrode_tokens_extractor = LogStftView(
             event_types="Ieeg",
@@ -392,6 +452,9 @@ def build_v14_experiment(
             channel_order="original",
             c_max=DEFAULT_C_MAX,
         )
+    _apply_extractor_cache(
+        electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
+    )
 
     # The encoder's ``ref_idx`` token must label the operator the
     # waveform actually saw. When the caller hands in a
@@ -449,10 +512,12 @@ def build_v14_experiment(
         event_types="Ieeg", bt_root=bt_root, unknown_label_policy="skip",
         c_max=DEFAULT_C_MAX,
     )
+    _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(
         event_types="Ieeg", bt_root=bt_root, c_max=DEFAULT_C_MAX,
         unknown_label_policy="skip",
     )
+    _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
 
     # B29 Item 11/12 per-clip metadata extractors. Each emits a
     # 1-element TimedArray that the Lightning collator stacks into a
@@ -462,14 +527,19 @@ def build_v14_experiment(
         seed=ref_seed_for_label,
         ref_modes=ref_modes_for_label,
     )
+    _apply_extractor_cache(ref_idx_extractor, "ref_idx", extractor_cache_folder)
     subtype_extractor = SubjectSubtypeExtractor(
         event_types="Ieeg",
         vocab=subtype_embed_vocab,
         corpus="braintreebank",
     )
+    _apply_extractor_cache(subtype_extractor, "subject_subtype", extractor_cache_folder)
     lambda_anat_extractor = LambdaAnatExtractor(
         event_types="Ieeg",
         corpus="braintreebank",
+    )
+    _apply_extractor_cache(
+        lambda_anat_extractor, "lambda_anat", extractor_cache_folder
     )
 
     # B03 shaft-mask (5/27 PM final spec): student-only paradigm-B
@@ -487,13 +557,17 @@ def build_v14_experiment(
         "lambda_anat": lambda_anat_extractor,
     }
     if joint_phase:
-        segmenter_extractors["shaft_mask"] = BTShaftMaskExtractor(
+        shaft_mask_extractor = BTShaftMaskExtractor(
             event_types="Ieeg",
             bt_root=bt_root,
             c_max=DEFAULT_C_MAX,
             seed=seed,
             unknown_label_policy="skip",
         )
+        _apply_extractor_cache(
+            shaft_mask_extractor, "shaft_mask", extractor_cache_folder
+        )
+        segmenter_extractors["shaft_mask"] = shaft_mask_extractor
 
     data = Data(
         study=chain,
@@ -512,6 +586,7 @@ def build_v14_experiment(
             "duration": 1.0,
         },
         batch_size=batch_size,
+        num_workers=num_workers,
     )
 
     exca_folder = exca_folder or os.environ.get("EXCA_CACHE_FOLDER")
@@ -596,6 +671,10 @@ def build_v14_experiment(
             "subtype_embed_reuse_kv": subtype_embed_reuse_kv,
             "ref_embed_enabled": ref_embed_enabled,
             "ref_embed_reuse_kv": ref_embed_reuse_kv,
+            # B1.4f (#125): Phase-4 PMA freeze. Default True = B31 contract;
+            # False unfreezes for an all-trainable full-pipeline smoke. The
+            # encoder build branches on this (V14ParcelPerceiver.build).
+            "pma_freeze": pma_freeze,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
             # supervised downstream classifier path does not branch on
@@ -658,6 +737,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--m-sub-slots", type=int, default=DEFAULT_M_SUB_SLOTS)
     p.add_argument("--n-heads", type=int, default=DEFAULT_N_HEADS)
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    p.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS,
+                   help="DataLoader worker processes (B1.4e, 2026-05-29). "
+                        "0 starves the GPU on the per-sample CPU STFT; default "
+                        "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
     p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS)
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
@@ -695,6 +778,18 @@ def _parser() -> argparse.ArgumentParser:
                    help="Lightning trainer precision. Default 'bf16-mixed' "
                         "per 2026-05-29 OOM diagnosis on RTX 5000 Ada. Pass "
                         "'32-true' or '16-mixed' to override.")
+    p.add_argument("--extractor-cache-folder", default=None,
+                   help="Two-tier extractor cache root (B1.5, 2026-05-29). "
+                        "Each extractor's MapInfra folder gets pointed at "
+                        "{root}/{extractor_name}/ so outputs survive across "
+                        "Experiment-config changes (precision, batch_size, "
+                        "model knobs). On DCC the path comes from the "
+                        "EXCA_EXTRACTOR_CACHE_FOLDER env var (scripts/dcc/"
+                        "dispatch injects the /work regenerate-cheap cache "
+                        "tier; concrete path in CLAUDE.md storage tiering). "
+                        "Locally pass --extractor-cache-folder /tmp/v14_cache "
+                        "to reproduce the behavior, or leave unset for no "
+                        "caching.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
@@ -765,6 +860,16 @@ def _parser() -> argparse.ArgumentParser:
         action="store_false", default=True,
         help="Keep the ref embed input-only (skip K/V reuse). "
              "Sister R-ref-embed-input-only.",
+    )
+    # B1.4f (#125): unfreeze the Phase-4 PMA for a full-pipeline smoke. The
+    # default keeps the B31 contract (P4 = frozen pretrained linear probe).
+    p.add_argument(
+        "--unfreeze-pma", dest="pma_freeze",
+        action="store_false", default=True,
+        help="Unfreeze the Phase-4 PMA pooling query so the encoder + PMA + "
+             "flat head are ALL trainable. Default frozen per the B31 P4 "
+             "contract (PMA gets gradient only at P3 via Whisper distill). "
+             "This flag is a full-pipeline smoke knob, NOT a science cell.",
     )
     p.add_argument(
         "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
@@ -974,13 +1079,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
-          f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant}")
+          f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
+          f"pma_freeze={args.pma_freeze}")
     if args.cluster == "slurm":
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "
               f"gpus_per_node={args.gpus_per_node} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
     print(f"  precision={args.precision}")
+    _resolved_xc = args.extractor_cache_folder or os.environ.get(
+        "EXCA_EXTRACTOR_CACHE_FOLDER"
+    )
+    print(f"  extractor_cache_folder={_resolved_xc!r}")
 
     cross_attn_positions: list[int] | None = None
     if args.cross_attn_positions is not None:
@@ -1001,7 +1111,8 @@ def main(argv: list[str] | None = None) -> int:
         binary_tasks=args.binary_tasks,
         eps=args.eps, d_model=args.d_model, depth=args.depth,
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
-        batch_size=args.batch_size, n_epochs=args.n_epochs,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
         slurm_partition=args.slurm_partition,
         slurm_account=args.slurm_account,
@@ -1010,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
         cpus_per_task=args.cpus_per_task,
         timeout_min=args.timeout_min,
         precision=args.precision,
+        extractor_cache_folder=args.extractor_cache_folder,
         dkoleo_mode=args.dkoleo_mode,
         cross_attn_positions=cross_attn_positions,
         mains_notch_hz=args.mains_notch_hz,
@@ -1027,6 +1139,7 @@ def main(argv: list[str] | None = None) -> int:
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
+        pma_freeze=args.pma_freeze,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

@@ -1,13 +1,18 @@
 """Phase-3 cross-modal distillation loss (T2.4).
 
-Wraps the Phase-3 student → Whisper-L8 supervision specified by the 5/22
-iMINDBench pivot:
+Wraps the Phase-3 student → Whisper-L8 supervision from the 5/22 iMINDBench
+pivot, as amended by the B05/B06 lock (2026-05-25 PM) that moved the pool +
+projection to the teacher side and made the student an identity passthrough:
 
-    student_readout: (B, T_out, D)  ←  V14Phase3DistillHead output
-    teacher_target:  (B, T_out, D)  ←  Whisper-L8 mean-pool-by-5 + linear proj
+    student_readout: (B, 40, 256)  ←  encoder PMA-k=1 over parcels; identity
+                                       passthrough at 8 Hz native (NO
+                                       student-side pool or projection)
+    teacher_target:  (B, 40, 256)  ←  Whisper-L8 (B, 250, 1280) → triangular
+                                       pool 50→8 Hz (whisper_teacher_pool) →
+                                       WhisperAdapter 2-layer MLP (1280→256)
 
-Both should be in the same projected-to-d space at the call site. The teacher
-target is expected to be detached (caller's responsibility).
+Both meet at d=256 (40 buckets = 8 Hz × 5 s). The teacher target is expected
+to be detached (caller's responsibility).
 
 Open blockers (see docs/neuroprobe/v14_blockers.md):
 

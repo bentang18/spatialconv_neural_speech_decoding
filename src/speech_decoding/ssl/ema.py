@@ -1,7 +1,9 @@
 """EMA teacher + explicit StopGrad (T2.2) + phase-aware schedules + layer-avg target.
 
-Recipe-independent — used by Phase-1 (Stage A) and Phase-2 (Stage B) of the
-v14 SSL plan, and available for Phase-3 if a teacher-side EMA target is added.
+Recipe-independent — used by the single joint SSL phase (B29 merged the old
+Phase-1 + Phase-2), and available for Phase-3 if a teacher-side EMA target is
+added. The ``p1_``/``p2_`` schedule helpers below predate the merge; they are
+retained only as fixed-τ aliases / sister-sweep primitives.
 
 ``EmaTeacher`` keeps a copy of the student under ``no_grad`` and updates it in
 place after each optimizer step:
@@ -11,7 +13,7 @@ place after each optimizer step:
 The coefficient schedule is callable (``coeff(step) → float``).
 
 **B26 amendment 2026-05-27 PM**: EMA momentum is locked at **fixed
-τ=0.999** throughout both Phase-1 and Phase-2 per V-JEPA 2 §2.4 (which
+τ=0.999** throughout the joint SSL phase per V-JEPA 2 §2.4 (which
 explicitly drops the V-JEPA 1-style 0.996 → 1.0 ramp). The previous
 ramping schedules (P1 0.99 → 0.9999 over 400k steps, P2 0.999 → 0.9999
 over 40k steps) are retired. The V-JEPA 1 ramp is preserved as the
@@ -24,8 +26,9 @@ P3 distillation uses an external frozen Whisper teacher and skips EMA entirely.
 LOSS-06 (v14_implementation_fix_list.md §A.4 + B11 in v14_blockers.md):
 data2vec-2.0 / EAT recipe layer-averaging with per-layer instance-norm.
 ``layer_avg_with_instance_norm()`` accepts a list of K=6 layer outputs and
-returns the per-layer instance-normed average. Used by L_post_frame and
-L_mid_slot to build the EMA target.
+returns the per-layer instance-normed average. Used by ``L_post_frame`` to
+build the EMA target (and by the ``L_mid_slot`` sister when that B31 sister
+is enabled).
 
 **B26 teacher full-input contract** (V-JEPA 2 §2.1, V-JEPA 2.1 §2.3.1):
 in the SSL loss path, the EMA teacher MUST encode the full unmasked

@@ -17,8 +17,6 @@ from speech_decoding.models.v14_encoder import (
     V14ParcelPerceiver,
     V14ParcelPerceiverModel,
     V14ParcelPerceiverWithHead,
-    V14Phase3DistillHead,
-    V14Phase3TimePoolTriangular,
     V14Phase4FlatHead,
     _JointTokenBlock,
     _PatchStem,
@@ -249,27 +247,13 @@ def test_v14_b29_item12_supervised_slot_mask_kwarg_dropped() -> None:
         model(electrodes, support, supervised_slot_mask=bogus_mask)
 
 
-def test_v14_lat02_03_04_three_dedicated_layer_norms() -> None:
-    """LAT-02 / LAT-03 / LAT-04 (B21+B22 collapse-prevention lock 2026-05-25):
-    encoder owns three dedicated LayerNorm(d=d_model) modules, one per
-    SSL loss head — ``ln_mid`` (M3), ``ln_frame`` (M4 frame head),
-    ``ln_utt`` (M4 utterance head).
-
-    They are NOT inserted in the default forward path; the loss heads apply
-    them externally. Verifying only existence + dim here; usage is exercised
-    by the Phase-1/2 loss tests once those land (Wave 6, LOSS-01).
-    """
-    model = V14ParcelPerceiverModel(**_tiny_kwargs())
-    d = _tiny_kwargs()["d_model"]
-    for name in ("ln_mid", "ln_frame", "ln_utt"):
-        assert hasattr(model, name), f"{name} missing on encoder (LAT-02..04)"
-        ln = getattr(model, name)
-        assert isinstance(ln, torch.nn.LayerNorm), (
-            f"{name} must be a torch.nn.LayerNorm; got {type(ln)}"
-        )
-        assert ln.normalized_shape == (d,), (
-            f"{name} normalized_shape must be (d={d},); got {ln.normalized_shape}"
-        )
+# NOTE: the per-loss-head LayerNorms (ln_frame always-on; ln_mid / ln_utt
+# only for the b31_plus_* sisters) live on the SSL student bundle
+# (``experiments/v14_joint_module._V14StudentBundle``), NOT on the encoder.
+# B31 dropped LN_mid + LN_utt from the default SSL path, and the 5/29 drift
+# audit removed the encoder's never-read ln_mid/ln_frame/ln_utt scaffold.
+# Their construction + EMA-teacher mirroring is tested in
+# ``experiments/test_v14_joint_module.py``.
 
 
 def test_v14_lat05_return_taps_yields_m2_m3_m4_dict() -> None:
@@ -325,8 +309,9 @@ def test_v14_lat05_return_taps_yields_m2_m3_m4_dict() -> None:
 
 
 def test_v14_encoder_lat01_identity_anchored_init() -> None:
-    """LAT-01 (B21 collapse-prevention lock 2026-05-25): the 320-slot tensor
-    is NOT a single free Parameter — it is reconstructed each forward from
+    """LAT-01 (B21 collapse-prevention lock 2026-05-25): the latent-slot tensor
+    (80 at the B29 M=1 default, 320 under the M=4 ``R-m4-slots`` sister) is NOT
+    a single free Parameter — it is reconstructed each forward from
     LearnableParcelEmbed + LearnableSubSlotEmbed + frozen ε.
 
     Verifies:
@@ -347,6 +332,9 @@ def test_v14_encoder_lat01_identity_anchored_init() -> None:
     assert hasattr(model, "learnable_subslot_embed"), "LearnableSubSlotEmbed missing (LAT-01)"
     assert hasattr(model, "latent_init_noise"), "frozen ε buffer missing (LAT-01)"
 
+    # _tiny_kwargs() runs at M=2, so the subslot table is instantiated (it is
+    # None only at the M=1 B29 default — see test_v14_b29_m_sub_slots_default_is_one).
+    assert model.learnable_subslot_embed is not None
     assert model.learnable_parcel_embed.shape == (K, d)
     assert model.learnable_subslot_embed.shape == (M, d)
     assert model.latent_init_noise.shape == (K, M, d)
@@ -562,33 +550,50 @@ def test_v14_parcel_collapse_pma_freeze_true_kwarg_freezes_all_params() -> None:
         assert not p.requires_grad, f"{name} should be frozen under freeze=True"
 
 
-def test_v14_phase3_triangular_pool_shape_and_normalization() -> None:
-    """5/22 spec §3 Phase-3 readout: triangular-window pool from T_in to T_out
-    buckets. Output shape ``(B, T_out, d)``; each output bucket is a row-
-    normalized weighted average of input bins (no information bleed-out)."""
-    pool = V14Phase3TimePoolTriangular(t_in=73, t_out=50)
-    x = torch.randn(2, 73, 32)
-    out = pool(x)
-    assert out.shape == (2, 50, 32)
-    row_sums = pool.weights.sum(dim=1)
-    torch.testing.assert_close(row_sums, torch.ones_like(row_sums), atol=1e-5, rtol=1e-5)
+def test_v14_config_build_pma_freeze_default_true_freezes_pma() -> None:
+    """The build-config default ``pma_freeze=True`` preserves the B31 Phase-4
+    contract: the built model's PMA is frozen, encoder + flat head trainable."""
+    cfg = V14ParcelPerceiver(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6,
+        d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+    )
+    assert cfg.pma_freeze is True
+    model = cfg.build(n_classes=3)
+    for name, p in model.parcel_pma.named_parameters():
+        assert not p.requires_grad, f"PMA {name} should be frozen by default"
+    # Encoder + flat head stay trainable.
+    assert any(p.requires_grad for p in model.encoder.parameters())
+    assert any(p.requires_grad for p in model.flat_head.parameters())
 
 
-def test_v14_phase3_distill_head_shape() -> None:
-    """Phase-3 distillation head: ``(B, T_in, d) → (B, T_out, d_teacher)``
-    via triangular pool + linear. Whisper-L8 teacher dim 1280."""
-    head = V14Phase3DistillHead(t_in=73, t_out=50, d_model=32, d_teacher=1280)
-    x = torch.randn(2, 73, 32)
-    out = head(x)
-    assert out.shape == (2, 50, 1280)
-    assert torch.isfinite(out).all()
+def test_v14_config_build_pma_freeze_false_unfreezes_whole_pipeline() -> None:
+    """``pma_freeze=False`` (the --unfreeze-pma full-pipeline smoke knob)
+    makes the encoder + PMA + flat head ALL trainable."""
+    cfg = V14ParcelPerceiver(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6,
+        d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        pma_freeze=False,
+    )
+    model = cfg.build(n_classes=3)
+    for name, p in model.parcel_pma.named_parameters():
+        assert p.requires_grad, f"PMA {name} should be trainable when unfrozen"
+    assert any(p.requires_grad for p in model.encoder.parameters())
+    assert any(p.requires_grad for p in model.flat_head.parameters())
+
+
+# Phase-3 distillation pool + projection moved to the teacher side under the
+# B05/B06 lock (2026-05-25 PM); the student is identity. Their tests live in
+# extractors/test_whisper_teacher_pool.py and models/test_whisper_adapter.py.
+# The former student-side V14Phase3TimePoolTriangular / V14Phase3DistillHead
+# tests (5/22-era, t_out=50 @ 10 Hz, d_teacher=1280) were removed with the
+# stale classes.
 
 
 def test_v14_config_build_param_budget_at_first_pass_defaults() -> None:
-    """v4 defaults (5/19 amendment §3): d=256, heads=8, depth=6, M=4, K=80,
-    T=17, F=38, n_classes=10 → ~13M params, comfortably under the 30M cap
-    (also under the 25M Stage-2-mid-sweep cell of the 13/25/40M sizing sweep
-    per project_v14_scaling_law_param_sizing_2026_05_20)."""
+    """First-pass defaults: d=256, heads=8, depth=6, M=1 (B29 Item 13 default;
+    was M=4 pre-B29), K=80, T=17, F=38, n_classes=10 → ~13M params, comfortably
+    under the 30M cap (also under the 25M Stage-2-mid-sweep cell of the
+    13/25/40M sizing sweep per project_v14_scaling_law_param_sizing_2026_05_20)."""
     cfg = V14ParcelPerceiver(
         n_freq_bins=38,
         n_time_bins=17,
@@ -898,9 +903,14 @@ def test_v14_b29_m_sub_slots_default_is_one() -> None:
     )
     K = kw_no_m["k_parcels"]
     d = kw_no_m["d_model"]
-    # Latent reconstruction is K*M-shaped — with M=1 the cross-attn fires over
-    # exactly K latent slots.
-    assert model.learnable_subslot_embed.shape == (1, d)
+    # B29 Item 13: SubSlotEmbed is DROPPED at the M=1 default (z[p] =
+    # ParcelEmbed[p] + ε); the per-sub-slot table is instantiated only for
+    # the R-m4-slots sister (M>1).
+    assert model.learnable_subslot_embed is None, (
+        "B29 Item 13: learnable_subslot_embed must be None at the M=1 "
+        "default; the per-sub-slot table exists only for M>1."
+    )
+    # Cross-attn fires over exactly K latent slots; ε noise stays (K, 1, d).
     assert model.latent_init_noise.shape == (K, 1, d)
 
 

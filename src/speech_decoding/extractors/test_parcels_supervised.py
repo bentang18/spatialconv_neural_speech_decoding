@@ -66,7 +66,8 @@ def test_parcels_supervised_to_slot_mask_expands_over_subslots() -> None:
 
 
 def test_parcels_supervised_to_slot_mask_swec_fallback_is_all_true() -> None:
-    """SWEC fallback (empty / None) supervises all 320 slots — anatomy-blind."""
+    """SWEC fallback (empty / None) supervises all K×M slots — anatomy-blind
+    (320 here at the M=4 R-m4-slots config; 80 at the B29 M=1 default)."""
     K, M = 80, 4
     mask_empty = parcels_supervised_to_slot_mask(set(), k_parcels=K, m_sub_slots=M)
     mask_none = parcels_supervised_to_slot_mask(None, k_parcels=K, m_sub_slots=M)

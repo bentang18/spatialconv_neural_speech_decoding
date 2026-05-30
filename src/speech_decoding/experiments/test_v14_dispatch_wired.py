@@ -855,3 +855,87 @@ def test_b23_dispatch_supervised_phase_4_omits_shaft_mask(
     assert "shaft_mask" not in extractors, (
         "supervised Phase-4 path must NOT wire the shaft-mask extractor"
     )
+
+
+# B1.5 (task #120, 2026-05-29) two-tier extractor cache wiring.
+# ``EXCA_EXTRACTOR_CACHE_FOLDER`` env var or
+# ``--extractor-cache-folder`` CLI flag points each extractor's
+# ``infra.folder`` at ``{root}/{extractor_name}/`` so outputs survive
+# across Experiment-config changes (precision, batch_size, model knobs).
+# CLAUDE.md storage tiering: belongs on /work/ (75-day purge,
+# regenerate cheap), separate from the Experiment slot on
+# /hpc/group/coganlab/.
+
+
+def test_b15_extractor_cache_default_no_caching(tmp_path, monkeypatch) -> None:
+    """Without ``EXCA_EXTRACTOR_CACHE_FOLDER`` or the CLI flag, the
+    extractor cache stays off — laptop dry-runs / tests pay zero infra
+    overhead and never write to disk."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    monkeypatch.delenv("EXCA_EXTRACTOR_CACHE_FOLDER", raising=False)
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    for name, extractor in xp.data.segmenter.extractors.items():
+        if name == "target":
+            continue
+        if not hasattr(extractor, "infra"):
+            continue
+        assert extractor.infra.folder is None, (
+            f"extractor {name!r} has infra.folder set without explicit "
+            f"cache root: {extractor.infra.folder!r}"
+        )
+
+
+def test_b15_extractor_cache_arg_points_each_infra_folder(
+    tmp_path, monkeypatch,
+) -> None:
+    """With ``extractor_cache_folder=...`` set, each extractor's
+    ``infra.folder`` points at ``{root}/{name}/`` — independent of
+    Experiment-config so the cache survives precision/batch_size
+    changes."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    cache_root = tmp_path / "v14_extractors"
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", extractor_cache_folder=str(cache_root),
+    )
+    extractors = xp.data.segmenter.extractors
+    # MapInfra-bearing extractors get their folder set; BaseStatic
+    # subclasses (DK support, valid mask) carry no infra and are skipped.
+    for name in ("electrode_tokens", "ref_idx", "subject_subtype", "lambda_anat"):
+        ext = extractors[name]
+        assert hasattr(ext, "infra"), (
+            f"extractor {name!r} unexpectedly missing infra field"
+        )
+        expected = cache_root / name
+        assert str(ext.infra.folder) == str(expected), (
+            f"extractor {name!r}: expected infra.folder={expected!r}, "
+            f"got {ext.infra.folder!r}"
+        )
+
+
+def test_b15_extractor_cache_env_var_fallback(tmp_path, monkeypatch) -> None:
+    """``EXCA_EXTRACTOR_CACHE_FOLDER`` env var picks up when no explicit
+    argument is passed — matches the ``scripts/dcc/dispatch`` injection
+    path."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    cache_root = tmp_path / "via_env"
+    monkeypatch.setenv("EXCA_EXTRACTOR_CACHE_FOLDER", str(cache_root))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    ext = xp.data.segmenter.extractors["electrode_tokens"]
+    assert str(ext.infra.folder) == str(cache_root / "electrode_tokens")
+
+
+def test_b15_extractor_cache_joint_phase_wires_shaft_mask(
+    tmp_path, monkeypatch,
+) -> None:
+    """Joint-phase shaft-mask extractor also gets the cache folder so
+    the joint dispatch never silently bypasses caching for one of its
+    most expensive extractors."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    cache_root = tmp_path / "joint_cache"
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True,
+        extractor_cache_folder=str(cache_root),
+    )
+    shaft = xp.data.segmenter.extractors["shaft_mask"]
+    if hasattr(shaft, "infra"):
+        assert str(shaft.infra.folder) == str(cache_root / "shaft_mask")

@@ -1,10 +1,16 @@
-"""LOSS-05 (B21 collapse-prevention lock 2026-05-25): slot-bank uniformity
-regularizer ``L_DKoleo @ M4``.
+"""LOSS-05: slot-bank uniformity regularizer ``L_DKoleo @ M4``.
 
-Operates over **all 320 slots** of the M4 latent state — NOT restricted to
-``parcels_supervised[subject]`` (B21 default; slot-bank regularizers are
-anatomy-blind so the full latent bank remains well-spread even on subjects
-where most parcels are unsupervised).
+**Sister-only primitive** — B28 (2026-05-27) demoted DKoleo from the always-on
+default to three opt-in sisters (``R-dkoleo-batch-cls-unit`` /
+``R-dkoleo-intra-clip-slots`` / ``R-vicreg-slot-variance``). The B31 2-term
+default (``L_pre_frame @ M2 + L_post_frame @ M4``) does NOT include it. The
+loss composer (``ssl/total_loss.py``) wires it at weight 0.1 only when a
+``l_dkoleo_m4`` tensor is supplied.
+
+Operates over **all latent slots** of the M4 state (80 at the B29 M=1 default,
+320 under the ``R-m4-slots`` M=4 sister) — slot-bank regularizers are
+anatomy-blind, so they are NOT gated by ``latent_valid``; the full bank stays
+well-spread even on subjects where most parcels have no coverage.
 
 Metric (DINOv3 koleo, per slot::
 
@@ -12,9 +18,6 @@ Metric (DINOv3 koleo, per slot::
 
 where ``z`` is the per-slot vector obtained by mean-pooling M4 over the
 time-patch axis. Computed per batch element, then averaged over the batch.
-
-Weight 0.1 always-on in P1 + P2 (LOSS-01). Reactive cousin ``L_DKoleo@M3``
-(weight 0.05) is off-default and lives in the loss composer, not here.
 """
 
 from __future__ import annotations

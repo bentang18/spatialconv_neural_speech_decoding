@@ -7,13 +7,6 @@ import pytest
 from speech_decoding.studies.ajile12 import AJILE12Study
 
 
-def test_ajile12_class_declares_phase1_only_corpus_role() -> None:
-    """AJILE12 is ECoG-heavy (89.7% per Peterson 2022 Table 2) and is
-    therefore a Phase-1 SSL contributor only; Phase-2 sEEG corpus drops
-    it. Pin the literal so dispatch grep can detect drift."""
-    assert AJILE12Study.PHASE_SCOPE == ("p1",)
-
-
 def test_ajile12_mains_notch_is_60_hz_us_site() -> None:
     """Peterson 2022 cohort is US-sited; mains notch = 60 Hz (matches BT
     + D-cohort; SWEC is 50 Hz CH)."""

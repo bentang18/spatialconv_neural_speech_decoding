@@ -14,8 +14,6 @@ from speech_decoding.models.v14_encoder import (
     V14ParcelPerceiver,
     V14ParcelPerceiverModel,
     V14ParcelPerceiverWithHead,
-    V14Phase3DistillHead,
-    V14Phase3TimePoolTriangular,
     V14Phase4FlatHead,
 )
 
@@ -26,7 +24,5 @@ __all__ = [
     "V14ParcelPerceiver",
     "V14ParcelPerceiverModel",
     "V14ParcelPerceiverWithHead",
-    "V14Phase3DistillHead",
-    "V14Phase3TimePoolTriangular",
     "V14Phase4FlatHead",
 ]

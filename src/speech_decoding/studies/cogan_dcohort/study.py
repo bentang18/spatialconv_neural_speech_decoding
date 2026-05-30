@@ -47,8 +47,9 @@ class DCohortStudy(study.Study):
     methods raise until DP03 (subpackage contract) lands.
 
     NOTE: D-cohort sample rate is 2000 Hz (vs Wang2024Treebank 2048 Hz);
-    Multi-STFT (T1.5) common-hop=128 stays valid; the bin-frequency mapping
-    differs slightly and must be honored in the corpus valid-bin mask.
+    the Multi-STFT common-hop=256 (8 Hz, B20 v4 lock 2026-05-24) stays
+    valid; the bin-frequency mapping differs slightly and must be honored
+    in the corpus valid-bin mask.
     """
 
     aliases: tp.ClassVar[tuple[str, ...]] = (
@@ -71,9 +72,9 @@ class DCohortStudy(study.Study):
     # Half-open ``(start, stop)`` of the trainable v14 30-bin filterbank.
     # D-cohort 2000 Hz → all 30 bins valid → ``(0, 30)``.
     VALID_BIN_RANGE: tp.ClassVar[tuple[int, int]] = (0, 30)
-    # Phase-2 cohort audit 2026-05-23: 85 D-pts pass FS+RAS+`.fif` gate.
+    # D-cohort cohort audit 2026-05-23 (project_d_cohort_phase2_cohort_audit_2026_05_23):
+    # 85 / 87 D-pts pass FS+RAS+`.fif` gate.
     N_UNIQUE_PATIENTS: tp.ClassVar[int] = 85
-    PHASE_SCOPE: tp.ClassVar[tuple[str, ...]] = ("p1", "p2")
 
     def _download(self) -> None:
         raise NotImplementedError(_BLOCKER_MSG)

@@ -15,9 +15,9 @@ layers can pass ``unknown_label_policy="skip"`` to drop those electrodes.
 
 from __future__ import annotations
 
+import functools
 import re
 import typing as tp
-from pathlib import Path
 
 import torch
 from neuralset.events.etypes import Event
@@ -28,6 +28,35 @@ from speech_decoding.studies.braintreebank.anatomy import (
     build_hard_public_bt_label_support,
     load_public_bt_anatomy,
 )
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_hard_support(
+    bt_root: str,
+    subject_id: int,
+    unknown_label_policy: str,
+    parcel_labels: tuple[str, ...],
+) -> torch.Tensor:
+    """Per-subject DK-hard one-hot support ``(n_real, K)``, memoized.
+
+    ``load_public_bt_anatomy`` re-reads + re-parses ``depth-wm.csv`` on every
+    call (~5 ms); the value is static per subject, so the un-memoized version
+    was ~38% of warm-cache ``__getitem__`` cost. ``lru_cache`` does not cache
+    exceptions, so the FileNotFoundError / KeyError paths are preserved.
+
+    The returned tensor is shared across callers; ``get_static`` always returns
+    a copy (a fresh padded buffer when ``c_max`` is set, else ``.clone()``), so
+    callers never mutate the cached array.
+    """
+    anatomy = load_public_bt_anatomy(bt_root, subject_id)
+    if unknown_label_policy == "skip":
+        mask = anatomy["DesikanKilliany"].isin(parcel_labels)
+        anatomy = anatomy.loc[mask].reset_index(drop=True)
+    electrode_labels = tuple(anatomy["Electrode"].tolist())
+    result = build_hard_public_bt_label_support(
+        electrode_labels, anatomy, parcel_labels,
+    )
+    return torch.from_numpy(result.support)
 
 
 class V14DKHardSupportExtractor(BaseStatic):
@@ -46,23 +75,13 @@ class V14DKHardSupportExtractor(BaseStatic):
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
-        depth_wm_path = (
-            Path(self.bt_root) / "localization" / f"sub_{subject_id}" / "depth-wm.csv"
+        # Memoized per-subject lookup: load_public_bt_anatomy re-reads
+        # depth-wm.csv on every call, which is static per subject. The
+        # FileNotFoundError ("...depth-wm.csv") and KeyError ("absent from
+        # parcel vocabulary") paths are preserved inside the cached helper.
+        support = _cached_hard_support(
+            self.bt_root, subject_id, self.unknown_label_policy, self.parcel_labels,
         )
-        if not depth_wm_path.exists():
-            raise FileNotFoundError(f"depth-wm.csv not found at {depth_wm_path}")
-
-        anatomy = load_public_bt_anatomy(self.bt_root, subject_id)
-
-        if self.unknown_label_policy == "skip":
-            mask = anatomy["DesikanKilliany"].isin(self.parcel_labels)
-            anatomy = anatomy.loc[mask].reset_index(drop=True)
-
-        electrode_labels = tuple(anatomy["Electrode"].tolist())
-        result = build_hard_public_bt_label_support(
-            electrode_labels, anatomy, self.parcel_labels,
-        )
-        support = torch.from_numpy(result.support)
         if self.c_max is not None:
             n_real = support.shape[0]
             if n_real > self.c_max:
@@ -71,8 +90,11 @@ class V14DKHardSupportExtractor(BaseStatic):
                 )
             padded = torch.zeros(self.c_max, support.shape[1], dtype=support.dtype)
             padded[:n_real] = support
-            support = padded
-        return support
+            return padded
+        # c_max is None: never hit by the live pipeline (dispatch pins
+        # c_max=384), but clone so callers can't mutate the shared cached
+        # tensor in place and poison _cached_hard_support for the subject.
+        return support.clone()
 
 
 _BTBANK_RE = re.compile(r"(?:btbank|sub_)?(\d+)$", re.IGNORECASE)

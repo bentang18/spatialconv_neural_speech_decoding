@@ -3,11 +3,11 @@
 Per ``docs/neuroprobe/v14_implementation_fix_list.md`` (SCAFFOLD-05) and
 ``docs/neuroprobe/v14_blockers.md`` DP03 + the cross-corpus pretraining
 strategy memo (``project_v14_cross_subject_pretraining_data_strategy_2026_05_22``),
-AJILE12 is an ECoG-heavy upper-limb-movement BCI cohort. The v14 cross-
-corpus pretraining strategy treats it as a **Phase-1-only** SSL
-contributor because the corpus is 89.7% ECoG per Peterson 2022 Table 2
-— including it in Phase-2 would dilute the sEEG cohort that the
-anatomy-ON pretrain depends on.
+AJILE12 is an ECoG-heavy upper-limb-movement BCI cohort. B29 Item 1
+collapsed P1+P2 into a single joint SSL phase, and B29 Item 6 includes
+AJILE12 in that joint pretrain (reversing the 5/27 sensor-gap drop). Its
+per-subject anatomy contribution is governed by B30 ``latent_valid``
+(``support.sum(electrodes) > 0``), not by a phase-scope exclusion.
 
 DP03 itself is not yet ratified, so this module is a structural
 scaffold: class declaration + ClassVars. Every method that would commit
@@ -17,11 +17,11 @@ Audited facts (ClassVars sourced from Peterson 2022 + the
 cross-subject-pretraining strategy memo):
 
   * 12 patients, ~50 days of recording, motor BCI task.
-  * 1000 Hz acquisition → 500 Hz Nyquist → v14 30-bin log ⅓-octave
-    filterbank trainable bin range = ``k0..k20`` (inclusive).
+  * 1000 Hz acquisition → 500 Hz Nyquist → v14 30-bin ⅓-octave
+    Multi-STFT-abs front-end trainable bin range = ``k0..k20`` (inclusive).
   * Mains notch = 60 Hz (US site).
   * 89.7% ECoG electrode share (Peterson 2022 Table 2).
-  * Phase-1 corpus contributor only (no Phase-2 use).
+  * Joint-SSL corpus contributor (B29 Item 6).
 
 Cited blockers (text below):
 
@@ -54,9 +54,10 @@ _BLOCKER_MSG = (
 class AJILE12Study(study.Study):
     """AJILE12 (Peterson 2022) ECoG-heavy motor BCI cohort.
 
-    Phase-1-only Phase-1 SSL contributor under v14's cross-corpus
-    pretraining strategy. The class declaration exists so dispatch can
-    reference it; all data-loading methods raise until DP03 ratifies."""
+    Joint-SSL corpus contributor under v14's cross-corpus pretraining
+    strategy (B29 Item 6 includes AJILE12). The class declaration exists
+    so dispatch can reference it; all data-loading methods raise until
+    DP03 ratifies."""
 
     aliases: tp.ClassVar[tuple[str, ...]] = (
         "AJILE12", "AJILE-12", "Peterson2022",
@@ -76,13 +77,12 @@ class AJILE12Study(study.Study):
     description: tp.ClassVar[str] = (
         "Long-term naturalistic human intracranial recordings + pose tracking "
         "(Peterson 2022). 12 patients, ~50 days of recording, 1000 Hz "
-        "acquisition, 89.7% ECoG electrode share. Phase-1-only SSL "
-        "contributor in v14."
+        "acquisition, 89.7% ECoG electrode share. Joint-SSL corpus "
+        "contributor in v14 (B29 Item 6)."
     )
     requirements: tp.ClassVar[tuple[str, ...]] = ()
     _info: tp.ClassVar[study.StudyInfo | None] = None
 
-    PHASE_SCOPE: tp.ClassVar[tuple[str, ...]] = ("p1",)
     SAMPLE_RATE_HZ: tp.ClassVar[float] = 1000.0
     MAINS_NOTCH_HZ: tp.ClassVar[float] = 60.0
     # Half-open ``(start, stop)`` of the trainable v14 30-bin filterbank.

@@ -5,7 +5,8 @@ count. Required because NeuralSet's ``MneRaw._get_timed_array`` zero-pads
 to channel-union dim but does NOT emit a sibling mask. The v14 encoder
 consumes ``valid_mask`` to set ``-inf`` cross-attn bias for padding slots.
 
-Cohort C_MAX default = 120 = Neuroprobe-Lite electrode cap (paper p.6).
+Cohort C_MAX default = 384 (CQ12 / B14 lock 2026-05-23 PM; covers D-cohort
+max 366, AJILE12 ~200, BT 256, SWEC 128 with headroom). See ElectrodeValidMask.
 """
 
 from __future__ import annotations

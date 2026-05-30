@@ -33,7 +33,16 @@ class Data(pydantic.BaseModel):
     study: ns.Step
     segmenter: ns.dataloader.Segmenter
     batch_size: int = 64
+    # num_workers=0 runs the per-sample extractor stack (CAR + torch.stft in
+    # LogStftView/MultiStftView is recomputed per __getitem__ — only the raw
+    # waveform load is MapInfra-cached) single-threaded in the main process,
+    # which starves the GPU (1.48 it/s on the 5/29 Lite Phase-4 baseline).
+    # Dispatch overrides this; the >0 path also enables persistent workers +
+    # prefetch + pinned host buffers so the CPU STFT overlaps GPU compute.
     num_workers: int = 0
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
     split_field: str = "split"
     splits: tuple[str, ...] = ("train", "val", "test")
     prepare: bool = True
@@ -66,13 +75,20 @@ class Data(pydantic.BaseModel):
             selected = dataset.select(dataset.triggers[self.split_field] == split)
             if len(selected) == 0:
                 raise ValueError(f"Split {split!r} has no segments")
-            loaders[split] = DataLoader(
-                selected,
+            loader_kwargs: dict = dict(
                 batch_size=self.batch_size,
                 shuffle=split == "train",
                 num_workers=self.num_workers,
                 collate_fn=selected.collate_fn,
                 worker_init_fn=worker_init_fn,
                 generator=train_generator if split == "train" else None,
+                pin_memory=self.pin_memory,
             )
+            # persistent_workers / prefetch_factor are only valid when workers
+            # are spawned; torch raises ValueError if they are passed with
+            # num_workers=0.
+            if self.num_workers > 0:
+                loader_kwargs["persistent_workers"] = self.persistent_workers
+                loader_kwargs["prefetch_factor"] = self.prefetch_factor
+            loaders[split] = DataLoader(selected, **loader_kwargs)
         return loaders

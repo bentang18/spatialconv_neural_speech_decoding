@@ -1,21 +1,24 @@
-"""V14 ``parcels_supervised`` per-subject map (MASK-02).
+"""V14 per-subject DK-parcel-coverage set (MASK-02).
 
-B03 mask-discipline lock (2026-05-25 PM, ``project_v14_b03_mask_lock_2026_05_25``)
-replaces the per-clip JEPA-inverted ``valid_parcels[clip]`` mask with a
-**per-subject** ``parcels_supervised[subject]`` map: for each subject, the
-set of DK parcels with ≥1 electrode. SSL loss-side gates (``L_mid_slot``,
-``L_post_frame``, ``L_post_utterance``) scope only to slots whose parcel is
-in this set. Slot-bank regularizers (``L_DKoleo``, monitor F1, reactive Gram)
-revert to **all 320 slots** per B21.
+**Superseded as the default gate by B30 (2026-05-28).** The live single
+source of truth is ``latent_valid = (support.sum(over electrodes) > 0)``,
+computed once per batch by the encoder's ``_compute_latent_valid`` and
+consumed by the encoder SA + every loss head (``ssl/aggregator.py``,
+``slot_loss.py``, ``utterance_loss.py``). The per-subject
+``parcels_supervised[subject]`` map this module computes survives only as the
+``"parcels_supervised"`` value of the ``LatentValidOverride`` sister knob
+(see ``experiments/v14_joint.py``); it is NOT the default path.
+
+Historical (B03, 2026-05-25 PM): this map replaced the per-clip JEPA-inverted
+``valid_parcels[clip]`` mask — for each subject, the set of DK parcels with
+≥1 electrode. Under the B31 2-term default, the only anatomy-gated loss term
+is ``L_post_frame``; ``L_mid_slot`` and ``L_post_utterance`` are now opt-in
+sisters. Slot-bank regularizers (``L_DKoleo``, monitor F1) stay anatomy-blind
+over **all latent slots** (80 at the B29 M=1 default).
 
 This is a build-time computation: the set per subject does not change across
-clips. Compute once when the study or extractor pipeline initializes; carry
-it as a metadata field on the batch so the encoder forward + loss heads can
-gate without re-reading anatomy at each step.
-
-SWEC fallback (empty set): downstream loss sites are anatomy-blind for that
-subject and supervise all 320 slots. The same convention applies to any
-subject for which DK anatomy is unavailable.
+clips. SWEC / no-anatomy fallback (empty set): ``latent_valid`` is all-False,
+so that subject contributes front-end terms only.
 """
 
 from __future__ import annotations

@@ -48,10 +48,12 @@ _BLOCKER_MSG = (
 class SWECStudy(study.Study):
     """SWEC-iEEG (Bern dataset). Anatomy-blind, 0.5-120 Hz band-passed.
 
-    Phase-1 SSL training corpus contributor under v14's cross-corpus
-    pretraining strategy (`memory/project_v14_cross_subject_pretraining_data_strategy_2026_05_22.md`).
-    The class declaration exists so dispatch can reference it; all data-
-    loading methods raise until DP03 (subpackage contract) lands."""
+    Joint-SSL corpus contributor under v14's cross-corpus pretraining
+    strategy (`memory/project_v14_cross_subject_pretraining_data_strategy_2026_05_22.md`).
+    Front-end-only: anatomy-blind, so under B30 its ``latent_valid`` is
+    all-False (zero slot-axis contribution; front-end ``L_pre_frame_masked``
+    only). The class declaration exists so dispatch can reference it; all
+    data-loading methods raise until DP03 (subpackage contract) lands."""
 
     aliases: tp.ClassVar[tuple[str, ...]] = ("SWEC", "SWEC-iEEG", "SWEC_ETHZ")
     bibtex: tp.ClassVar[str] = """
@@ -83,7 +85,6 @@ class SWECStudy(study.Study):
     # SWEC hardware band-pass 0.5–120 Hz → bins k0..k21 inclusive →
     # ``(0, 22)`` (per the 5/19 SWEC audit + MEMORY.md B1 closure).
     VALID_BIN_RANGE: tp.ClassVar[tuple[int, int]] = (0, 22)
-    PHASE_SCOPE: tp.ClassVar[tuple[str, ...]] = ("p1",)  # anatomy-blind
 
     def _download(self) -> None:
         raise NotImplementedError(_BLOCKER_MSG)

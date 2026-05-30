@@ -21,6 +21,11 @@ DCC_REPO="${DCC_REPO:-/work/ht203/repo/speech}"
 # here. Override per-invocation if needed.
 DCC_ROOT_BT="${DCC_ROOT_BT:-/work/ht203/data/braintreebank}"
 DCC_EXCA_CACHE="${DCC_EXCA_CACHE:-/hpc/group/coganlab/ht203/cache_neuroai}"
+# B1.5 (task #120, 2026-05-29) two-tier extractor cache root. Lives on
+# /work/ (75-day purge, regenerate cheap) so OOM-debug iterations don't
+# pay the ~16-min notch + STFT + per-clip metadata prep cost every time
+# an Experiment-config knob changes. CLAUDE.md storage tiering rule.
+DCC_EXTRACTOR_CACHE="${DCC_EXTRACTOR_CACHE:-/work/ht203/cache/v14_extractors}"
 
 if [[ $# -lt 1 ]]; then
   echo "usage: scripts/dcc/dispatch <submitter-relpath> [args...]" >&2
@@ -64,9 +69,9 @@ for arg in "$@"; do
   remote_args+=("$(printf '%q' "${arg}")")
 done
 
-echo ">> ${DCC_HOST}: ROOT_DIR_BRAINTREEBANK=${DCC_ROOT_BT} EXCA_CACHE_FOLDER=${DCC_EXCA_CACHE} .venv/bin/python ${submitter} ${remote_args[*]:-}"
+echo ">> ${DCC_HOST}: ROOT_DIR_BRAINTREEBANK=${DCC_ROOT_BT} EXCA_CACHE_FOLDER=${DCC_EXCA_CACHE} EXCA_EXTRACTOR_CACHE_FOLDER=${DCC_EXTRACTOR_CACHE} .venv/bin/python ${submitter} ${remote_args[*]:-}"
 ssh -t "${DCC_HOST}" \
-  "cd '${DCC_REPO}' && ROOT_DIR_BRAINTREEBANK='${DCC_ROOT_BT}' EXCA_CACHE_FOLDER='${DCC_EXCA_CACHE}' .venv/bin/python ${submitter} ${remote_args[*]:-}"
+  "mkdir -p '${DCC_EXTRACTOR_CACHE}' && cd '${DCC_REPO}' && ROOT_DIR_BRAINTREEBANK='${DCC_ROOT_BT}' EXCA_CACHE_FOLDER='${DCC_EXCA_CACHE}' EXCA_EXTRACTOR_CACHE_FOLDER='${DCC_EXTRACTOR_CACHE}' .venv/bin/python ${submitter} ${remote_args[*]:-}"
 
 echo
 echo ">> sweep dispatched. Close the loop: pull results, run the collector +"

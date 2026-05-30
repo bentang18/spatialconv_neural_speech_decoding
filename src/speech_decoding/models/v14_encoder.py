@@ -615,7 +615,8 @@ class V14ParcelPerceiverModel(nn.Module):
         nn.init.trunc_normal_(self.freq_embed, std=0.02)
 
         # LAT-01 (B21 collapse-prevention lock 2026-05-25; recipe §1 "Latent init").
-        # The 320-slot tensor is NOT a single free parameter. It is reconstructed
+        # The latent-slot tensor (80 at the B29 M=1 default; 320 under the M=4
+        # ``R-m4-slots`` sister) is NOT a single free parameter. It is reconstructed
         # at every forward from two embedding tables + a frozen broken-symmetry
         # noise buffer. Identity-anchored init is the symmetry-breaker that lets
         # cross-attn ❺ pool meaningfully in P1 when the anatomy bias is OFF.
@@ -626,10 +627,19 @@ class V14ParcelPerceiverModel(nn.Module):
             torch.empty(k_parcels, d_model)
         )
         nn.init.trunc_normal_(self.learnable_parcel_embed, std=0.02)
-        self.learnable_subslot_embed = nn.Parameter(
-            torch.empty(m_sub_slots, d_model)
-        )
-        nn.init.trunc_normal_(self.learnable_subslot_embed, std=0.02)
+        # B29 Item 13: SubSlotEmbed DROPPED at the M=1 default — identity init
+        # becomes ``z[p] = LearnableParcelEmbed[p] + ε``. At M=1 a (1, d)
+        # sub-slot table would only add a shared-across-parcels bias already
+        # spanned by ``learnable_parcel_embed`` (redundant reparameterization).
+        # The per-sub-slot table is instantiated ONLY for the ``R-m4-slots``
+        # sister (M>1), where distinct sub-slots need a per-slot offset.
+        if m_sub_slots > 1:
+            self.learnable_subslot_embed = nn.Parameter(
+                torch.empty(m_sub_slots, d_model)
+            )
+            nn.init.trunc_normal_(self.learnable_subslot_embed, std=0.02)
+        else:
+            self.learnable_subslot_embed = None
         # Frozen broken-symmetry noise: built once at construction, never
         # updated. Persistent so checkpoint round-trip preserves the same ε.
         self.register_buffer(
@@ -709,19 +719,14 @@ class V14ParcelPerceiverModel(nn.Module):
         )
         self.encoder_ln = nn.LayerNorm(d_model)
 
-        # LAT-02 / LAT-03 / LAT-04 (B21+B22 collapse-prevention lock 2026-05-25):
-        # Three dedicated LayerNorms, ONE per loss head. Owned by the encoder
-        # so they checkpoint with the model + get mirrored on the EMA teacher.
-        # NOT inserted in the default forward path — applied externally by the
-        # SSL loss heads when computing L_mid_slot / L_post_frame /
-        # L_post_utterance. Param cost ≈ +1.5k (three × LN(d=256)).
-        #
-        #   ln_mid    @ M3 (post cross-attn-0 / pre self-attn-0)
-        #   ln_frame  @ M4 (frame-level L_post_frame head)
-        #   ln_utt    @ M4 (utterance-level L_post_utterance head, pre-PMA)
-        self.ln_mid = nn.LayerNorm(d_model)
-        self.ln_frame = nn.LayerNorm(d_model)
-        self.ln_utt = nn.LayerNorm(d_model)
+        # Per-loss-head LayerNorms live on the SSL student bundle
+        # (``experiments/v14_joint_module._V14StudentBundle``), NOT on the
+        # encoder: ``ln_frame`` always-on; ``ln_mid`` / ``ln_utt`` only for
+        # the ``b31_plus_*`` sister variants (B31 dropped LN_mid + LN_utt
+        # from the default SSL path). The EMA teacher mirrors that bundle.
+        # The encoder formerly carried its own dead ``ln_mid/ln_frame/ln_utt``
+        # (B21/B22 era) — removed as never-read scaffold per the 5/29 drift
+        # audit.
 
         # B29 Item 11 lock 2026-05-27 PM-late: subtype + ref-operator
         # per-clip embeddings. Both additive at A1 patch-embed (broadcast
@@ -1026,13 +1031,19 @@ class V14ParcelPerceiverModel(nn.Module):
             )
 
         # LAT-01: reconstruct the (K, M, d) parcel-embedding tensor at every
-        # forward from learnable_parcel_embed + learnable_subslot_embed + ε
-        # (identity-anchored init, B21 lock 2026-05-25).
+        # forward from learnable_parcel_embed + ε (identity-anchored init,
+        # B21 lock 2026-05-25). B29 Item 13: at the M=1 default the per-sub-slot
+        # table is dropped (z[p] = ParcelEmbed[p] + ε); it is added back only
+        # for the R-m4-slots sister (M>1).
         parcel_embedding = (
             self.learnable_parcel_embed.unsqueeze(1)         # (K, 1, d)
-            + self.learnable_subslot_embed.unsqueeze(0)      # (1, M, d)
             + self.latent_init_noise                          # (K, M, d) frozen
-        )                                                     # (K, M, d)
+        )                                                     # (K, M, d) via broadcast
+        if self.learnable_subslot_embed is not None:
+            parcel_embedding = (
+                parcel_embedding
+                + self.learnable_subslot_embed.unsqueeze(0)  # (1, M, d)
+            )
         latents_t = (
             parcel_embedding.reshape(L, self.d_model)
             .unsqueeze(0)                                               # (1, L, d)
@@ -1107,10 +1118,12 @@ class V14ParcelPerceiverModel(nn.Module):
         )                                                            # (B, L)
         latent_valid_bt = latent_valid.unsqueeze(1).expand(B, T_p, L).reshape(B * T_p, L)
 
-        # v4 amendment 5/19 §5: cross-attn fires at latent-stack positions
-        # {0, 3}; the rest of the stack is the factorized latent block
-        # (T1.9 — t-SA × parcel-SA × FFN). Position 0 (pre-stack routing)
-        # ALWAYS runs, even at depth=0.
+        # B28 lock 2026-05-27 PM: cross-attn fires at position 0 ONLY by
+        # default (was {0, 3} under v4 amendment 5/19 §5). Position 0
+        # (pre-stack routing) ALWAYS runs, even at depth=0. Interior
+        # positions are empty unless ``cross_attn_positions`` adds them
+        # (sister ``R-perceiver-original-2-cross-attns`` = [0, 3]); the rest
+        # of the stack is the latent block (t-SA × parcel-SA × FFN).
         latents_bt = self.cross_attns[0](
             latents_bt, electrodes_bt, bias_bt, key_rope=None, t_bins=None,
         )
@@ -1161,9 +1174,10 @@ class Predictor2Block(nn.Module):
     context. Per-electrode-patch path.
 
     Spec (``project_v14_b03_mask_lock_2026_05_25``): ``hidden=128, heads=4,
-    depth=2``, ~0.2M params total. Trained P1 + P2 jointly with the encoder.
-    Warm-started P1→P2 (``MASK-05``) and **discarded at the P2→P3 boundary**
-    once Phase-3 distillation begins (predictor is SSL-only auxiliary).
+    depth=2``, ~0.2M params total. Trained from step 0 alongside the encoder
+    in the single joint SSL phase (B29 Item 1 merged P1+P2, so the old
+    ``MASK-05`` P1→P2 warm-start no longer applies). **Discarded when Phase-3
+    distillation begins** (predictor is SSL-only auxiliary).
 
     Input  : ``(B, N, d_model)``  patch-axis context tokens (e.g. (B*C, F_p·T_p, d))
     Output : ``(B, N, d_model)``  predicted tokens, evaluated at masked
@@ -1316,67 +1330,14 @@ class V14Phase4FlatHead(nn.Module):
         return self.classifier(x.reshape(B, -1))
 
 
-class V14Phase3TimePoolTriangular(nn.Module):
-    """Parameterless triangular-window pool over the time axis. Input
-    ``(B, T_in, d)`` → output ``(B, T_out, d)``. Used by the Phase-3 SSL
-    distillation head before linear projection to teacher dim.
-
-    Weights are precomputed: each output bucket ``j`` is the row-normalized
-    triangular window centered at ``(j + 0.5) * T_in / T_out`` with base
-    half-width ``T_in / T_out`` — i.e. adjacent buckets' windows overlap by
-    exactly half, matching iMINDBench-style adjacent-bucket pooling.
-    """
-
-    def __init__(self, t_in: int, t_out: int) -> None:
-        super().__init__()
-        if t_in <= 0 or t_out <= 0:
-            raise ValueError(f"t_in={t_in}, t_out={t_out} must be positive")
-        ratio = t_in / t_out
-        i_idx = torch.arange(t_in).float() + 0.5
-        j_idx = torch.arange(t_out).float() + 0.5
-        d = (i_idx.unsqueeze(0) - (j_idx * ratio).unsqueeze(1)).abs()  # (T_out, T_in)
-        raw = (1.0 - d / ratio).clamp(min=0.0)
-        row_sum = raw.sum(dim=1, keepdim=True)
-        # Per blocker IE10: every bucket center falls within [0, t_in) so each
-        # output row has at least one positive weight. If a future change to
-        # the triangle shape breaks that invariant, fail loudly at init
-        # rather than masking the zero with a `+ eps` forward-time hack.
-        if (row_sum <= 0).any():
-            raise ValueError(
-                f"triangular pool produced a zero-sum row at t_in={t_in}, "
-                f"t_out={t_out}; widen the triangle base half-width"
-            )
-        weights = raw / row_sum
-        self.register_buffer("weights", weights, persistent=False)
-        self.t_in = t_in
-        self.t_out = t_out
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, T_in, d). Returns (B, T_out, d).
-        return torch.einsum("ot,btd->bod", self.weights, x)
-
-
-class V14Phase3DistillHead(nn.Module):
-    """Phase-3 SSL distillation head: triangular pool → linear to teacher dim.
-
-    5/22 spec: pool to 50 buckets @ 10 Hz, then linear from ``d_model`` to
-    ``d_teacher`` (e.g. 256 for the Whisper-L8 → 5-step mean-pool → linear-256
-    target). Input ``(B, T_in, d_model)`` → output ``(B, t_out, d_teacher)``.
-    """
-
-    def __init__(
-        self,
-        t_in: int,
-        t_out: int,
-        d_model: int,
-        d_teacher: int,
-    ) -> None:
-        super().__init__()
-        self.pool = V14Phase3TimePoolTriangular(t_in, t_out)
-        self.proj = nn.Linear(d_model, d_teacher)
-
-    def forward(self, x_td: Tensor) -> Tensor:
-        return self.proj(self.pool(x_td))
+# Phase-3 distillation pool + projection live on the TEACHER side, not here.
+# Per the B05/B06 lock (2026-05-25 PM) the v14 student is an identity
+# passthrough at its 8 Hz native rate; the Whisper-L8 teacher is pooled
+# 50 → 8 Hz by ``extractors.whisper_teacher_pool.triangular_pool_50_to_8_hz``
+# and projected 1280 → 256 by ``models.whisper_adapter.WhisperAdapter``.
+# The former student-side ``V14Phase3TimePoolTriangular`` +
+# ``V14Phase3DistillHead`` (5/22-era student-side pool @ 10 Hz / 50 buckets)
+# were removed as stale scaffold; they predated the teacher-side relocation.
 
 
 class V14ParcelPerceiverWithHead(nn.Module):
@@ -1491,6 +1452,14 @@ class V14ParcelPerceiver(BaseModelConfig):
     ref_embed_enabled: bool = False
     ref_embed_reuse_kv: bool = True
 
+    # P4 build knob: freeze the PMA pooling query. Default True is
+    # spec-correct for the B31 Phase-4 contract (P4 = frozen pretrained
+    # linear probe; PMA gets gradient only at P3 via Whisper distill). Set
+    # False for an all-trainable from-scratch supervised smoke (encoder +
+    # PMA + head all unfrozen) that exercises the full forward+backward
+    # without a pretrained checkpoint — see dispatch flag --pma-unfrozen.
+    pma_freeze: bool = True
+
     # SSL-pretrain dispatch flags persisted on the model config so they
     # ride along with the run-record YAML. The encoder ``build`` does
     # not branch on them — they are metadata for sister-cell rollouts
@@ -1550,7 +1519,7 @@ class V14ParcelPerceiver(BaseModelConfig):
         parcel_pma = V14ParcelCollapsePMA(
             d_model=self.d_model,
             n_heads=self.n_heads,
-            freeze=True,
+            freeze=self.pma_freeze,
         )
         # FE-02: flat head sees the post-patch frame count T_p, not the raw
         # T. ``V14Phase4FlatHead`` parameter named ``n_time_bins`` here is the

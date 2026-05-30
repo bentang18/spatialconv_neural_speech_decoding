@@ -30,11 +30,6 @@ def test_swec_valid_bin_range_is_k0_to_k21() -> None:
     assert SWECStudy.VALID_BIN_RANGE == (0, 22)
 
 
-def test_swec_is_phase1_only() -> None:
-    """SWEC is anatomy-blind; Phase-2 anatomy-ON pretrain excludes it."""
-    assert SWECStudy.PHASE_SCOPE == ("p1",)
-
-
 @pytest.mark.parametrize(
     "method, args",
     [

@@ -20,12 +20,17 @@ This is the canonical reference. `CLAUDE.md §Compute` is intentionally a 4-line
 | GPU | 8× RTX 5000 Ada (32 GB), partition `coganlab-gpu`, account `coganlab` |
 | Upstream Neuroprobe clone | `/work/ht203/repo/neuroprobe_upstream/` (pinned `c7b955b0`) |
 | Persistent cache (Exca, ckpts, results) | `/hpc/group/coganlab/ht203/cache_neuroai/` |
+| Extractor precompute cache (v14, 75-day purge) | `/work/ht203/cache/v14_extractors/<extractor_name>/` |
+| Multi-STFT precompute cache (75-day purge) | `/work/ht203/cache/multi_stft/` |
 
 ### Required env vars
 
 ```bash
 export ROOT_DIR_BRAINTREEBANK=/work/ht203/data/braintreebank
 export EXCA_CACHE_FOLDER=/hpc/group/coganlab/ht203/cache_neuroai
+# B1.5 (task #120, 2026-05-29): two-tier extractor cache root. `scripts/dcc/dispatch`
+# injects this automatically; set explicitly only if running a submitter directly.
+export EXCA_EXTRACTOR_CACHE_FOLDER=/work/ht203/cache/v14_extractors
 ```
 
 ### Sync + dispatch helpers (local-machine commands)

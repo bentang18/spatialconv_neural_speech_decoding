@@ -30,11 +30,6 @@ def test_dcohort_85_subjects_from_phase2_audit() -> None:
     assert DCohortStudy.N_UNIQUE_PATIENTS == 85
 
 
-def test_dcohort_phase_scope_is_p1_p2() -> None:
-    """D-cohort is anatomy-bearing sEEG; contributes to both P1 and P2."""
-    assert DCohortStudy.PHASE_SCOPE == ("p1", "p2")
-
-
 @pytest.mark.parametrize(
     "method, args",
     [

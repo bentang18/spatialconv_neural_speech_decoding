@@ -1,7 +1,8 @@
 """Reconstruction loss with valid-bin mask honored on input AND target (T2.3).
 
-Used by Phase 1 (Stage A: time-frequency mask, UFO frame target) and Phase 2
-(Stage B: electrode-mask + utterance target) of the v14 SSL recipe.
+Used by the single joint SSL phase (B29 collapsed the old Phase 1 + Phase 2)
+for the two B31 masked-prediction terms ``L_pre_frame @ M2`` and
+``L_post_frame @ M4``.
 
 Two design decisions are *deliberately deferred* and surfaced as constructor
 parameters rather than baked in, because they are open blockers in

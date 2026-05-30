@@ -1,15 +1,16 @@
 """Tests for B29 Item 1 joint SSL experiment (``v14_joint``).
 
 Covers:
-  * The 4-term coefficient tuple matches the B19/B26/B27/B28 + B29
-    cascade lock (all 1.0; DKoleo @ M4 NOT in default).
   * The L1 loss form matches V-JEPA-2 §2.1 Eq 1 (B26 correction over
     B25's Smooth-L1 citation; B27 keeps L1).
-  * The composer sums to the same scalar as direct ``W * L`` adds.
-  * The composer's :class:`V14TotalLossBreakdown` carries DKoleo / Gram /
-    context loss as ``None`` (B27 dropped context loss; B28 demoted
-    DKoleo).
-  * No context-loss term reachable from the joint path.
+  * ``V14JointExperiment`` is pinned to the canonical joint phase and
+    defaults to the B31 2-term ``loss_variant="b31_default"`` surface;
+    the B30 sister flags + B31 sister variants parse but stay gated.
+
+The pre-B31 4-term coefficient tuple + ``compose_v14_joint_loss`` composer
+were deleted (the live loss SSOT is
+:func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`); their
+guard-tests were removed with them.
 """
 
 from __future__ import annotations
@@ -20,35 +21,13 @@ import torch
 from speech_decoding.experiments.v14_joint import (
     JOINT_PHASE,
     V14JointExperiment,
-    compose_v14_joint_loss,
     v14_joint_l1_loss,
-    v14_joint_loss_coefficients,
-)
-from speech_decoding.ssl.total_loss import (
-    W_MID_SLOT,
-    W_POST_FRAME,
-    W_POST_UTTERANCE,
-    W_PRE_FRAME,
-    V14TotalLossBreakdown,
 )
 
 
 def test_v14_joint_phase_literal_is_joint_b29() -> None:
     """B29 Item 1: the joint phase is identified by the ``joint_b29`` tag."""
     assert JOINT_PHASE == "joint_b29"
-
-
-def test_v14_joint_loss_coefficients_are_all_one() -> None:
-    """B19/B26/B27/B28 lock: all four W's are 1.0 in the joint default."""
-    coeffs = v14_joint_loss_coefficients()
-    assert coeffs == (1.0, 1.0, 1.0, 1.0)
-    assert coeffs == (W_PRE_FRAME, W_MID_SLOT, W_POST_FRAME, W_POST_UTTERANCE)
-
-
-def test_v14_joint_loss_coefficients_omit_dkoleo() -> None:
-    """B28 Item 1: DKoleo @ M4 demoted to sister-only → NOT in joint default."""
-    coeffs = v14_joint_loss_coefficients()
-    assert len(coeffs) == 4  # not 5
 
 
 def test_v14_joint_l1_loss_matches_torch_l1_loss() -> None:
@@ -74,61 +53,6 @@ def test_v14_joint_l1_loss_rejects_unknown_reduction() -> None:
         v14_joint_l1_loss(
             torch.zeros(2), torch.zeros(2), reduction="bogus",
         )
-
-
-def test_compose_v14_joint_loss_total_equals_sum_of_terms() -> None:
-    l_pre = torch.tensor(0.1)
-    l_mid = torch.tensor(0.2)
-    l_post_f = torch.tensor(0.3)
-    l_post_u = torch.tensor(0.4)
-    total, breakdown = compose_v14_joint_loss(
-        l_pre_frame=l_pre, l_mid_slot=l_mid,
-        l_post_frame=l_post_f, l_post_utterance=l_post_u,
-    )
-    expected = 1.0 * 0.1 + 1.0 * 0.2 + 1.0 * 0.3 + 1.0 * 0.4
-    assert float(total.item()) == pytest.approx(expected)
-    assert isinstance(breakdown, V14TotalLossBreakdown)
-    torch.testing.assert_close(breakdown.total, total)
-
-
-def test_compose_v14_joint_loss_breakdown_carries_terms_and_no_dkoleo() -> None:
-    """Joint composer returns ``None`` for DKoleo / Gram / context loss
-    fields — these are sister-only after B28 / dropped after B27."""
-    l_pre = torch.tensor(0.1)
-    l_mid = torch.tensor(0.2)
-    l_post_f = torch.tensor(0.3)
-    l_post_u = torch.tensor(0.4)
-    _, breakdown = compose_v14_joint_loss(
-        l_pre_frame=l_pre, l_mid_slot=l_mid,
-        l_post_frame=l_post_f, l_post_utterance=l_post_u,
-    )
-    assert breakdown.l_dkoleo_m4 is None
-    assert breakdown.l_dkoleo_m3_reactive is None
-    assert breakdown.l_gram_reactive is None
-
-
-def test_compose_v14_joint_loss_breakdown_carries_coefficients() -> None:
-    """``V14TotalLossBreakdown.coefficients`` mirrors the joint defaults
-    plus ``None`` for the DKoleo slot."""
-    _, breakdown = compose_v14_joint_loss(
-        l_pre_frame=torch.tensor(0.0), l_mid_slot=torch.tensor(0.0),
-        l_post_frame=torch.tensor(0.0), l_post_utterance=torch.tensor(0.0),
-    )
-    assert breakdown.coefficients == (1.0, 1.0, 1.0, 1.0, None)
-
-
-def test_compose_v14_joint_loss_no_context_loss_term() -> None:
-    """B27 lock 2026-05-27 PM-late: context loss is DROPPED from the
-    joint default. The composer's surface must not expose it."""
-    import inspect
-
-    sig = inspect.signature(compose_v14_joint_loss)
-    assert "l_pre_frame_context" not in sig.parameters
-    assert "lambda_ctx" not in sig.parameters
-    # Only the 4 canonical terms are accepted.
-    assert set(sig.parameters) == {
-        "l_pre_frame", "l_mid_slot", "l_post_frame", "l_post_utterance",
-    }
 
 
 def test_v14_joint_experiment_rejects_every_phase_except_canonical_joint() -> None:

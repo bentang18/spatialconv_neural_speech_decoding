@@ -1,12 +1,16 @@
 """B29 Item 1: single joint SSL phase (replaces split P1 + P2).
 
-Lock memo: ``memory/project_v14_b29_joint_default_2026_05_27.md`` §Item 1.
+Lock memos: ``memory/project_v14_b29_joint_default_2026_05_27.md`` §Item 1
+(joint phase), as amended by
+``memory/project_v14_b31_vjepa2_canonical_loss_2026_05_28.md`` (B31, the
+current loss-surface winner).
 
 Per the 5/27 PM-late lock, v14's pretraining collapses to a single SSL
-phase running the canonical 4-term L1 objective with the anatomy bias
-gated per-clip by ``λ_anat`` (B29 Item 12). The old split P1/P2 path is
-preserved as the ``R-keep-phase-split`` sister via ``V14Experiment``;
-this module is the *joint-by-default* surface.
+phase with the anatomy bias gated per-clip by ``λ_anat`` (B29 Item 12).
+B31 (5/28 PM) then trimmed the loss surface to the V-JEPA-2-canonical
+2-term default. The old split P1/P2 path is preserved as the
+``R-keep-phase-split`` sister via ``V14Experiment``; this module is the
+*joint-by-default* surface.
 
 Lineage of the loss form:
 
@@ -23,17 +27,22 @@ Lineage of the loss form:
   * B29 Item 1 (5/27 PM-late): P1 + P2 collapse → single joint phase.
   * B29 Item 12 (5/27 PM-late): replace step-time anatomy-bias warmup
     with per-clip ``λ_anat`` gate from metadata.
+  * B31 (5/28 PM): V-JEPA-2-canonical 2-term default. DROP ``L_mid_slot``
+    @ M3 and ``L_post_utterance`` @ M4-PMA from the default surface; they
+    return only via the ``loss_variant`` sisters (``b31_plus_m3`` /
+    ``b31_plus_utt`` / ``b31_plus_both``). PMA is trained only at P3
+    (Whisper distillation), frozen at P4.
 
 So the joint default is::
 
-    L_total = W_PRE_FRAME      · L_pre_frame_masked   @ M2
-            + W_MID_SLOT       · L_mid_slot           @ LN_mid(M3)
-            + W_POST_FRAME     · L_post_frame         @ LN_frame(M4)
-            + W_POST_UTTERANCE · L_post_utterance     @ LN_utt(M4)-PMA
+    L_total = L_pre_frame_masked @ M2  +  L_post_frame @ LN_frame(M4)
 
-with all four W's = 1.0 and the per-term loss form = **pure L1**. DKoleo
-@ M4 is OFF by default (3-sister escalation path lives in dispatch's
-``--dkoleo-mode``); context loss is dropped (B27); EMA τ fixed at 0.999.
+both **pure L1** (V-JEPA-2 §2.1 Eq 1). DKoleo @ M4 is OFF by default
+(3-sister escalation via dispatch's ``--dkoleo-mode``); context loss is
+dropped (B27); EMA τ fixed at 0.999. The live per-step composition runs
+through :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
+with ``loss_variant="b31_default"`` — see :class:`V14JointExperiment`;
+the trainer never hard-codes the weights.
 """
 
 from __future__ import annotations
@@ -46,14 +55,6 @@ from torch import Tensor
 
 from speech_decoding.experiments.v14_experiment import V14Experiment
 from speech_decoding.ssl.aggregator import LossVariant
-from speech_decoding.ssl.total_loss import (
-    W_MID_SLOT,
-    W_POST_FRAME,
-    W_POST_UTTERANCE,
-    W_PRE_FRAME,
-    V14TotalLossBreakdown,
-    v14_total_loss,
-)
 
 
 JOINT_PHASE: Literal["joint_b29"] = "joint_b29"
@@ -76,17 +77,6 @@ value except this one.
 """
 
 
-def v14_joint_loss_coefficients() -> tuple[float, float, float, float]:
-    """B29 Item 1 + B27 + B28 lock: 4-term joint default.
-
-    Returns the canonical ``(W_PRE_FRAME, W_MID_SLOT, W_POST_FRAME,
-    W_POST_UTTERANCE)`` tuple; all four equal ``1.0``. DKoleo @ M4 is
-    dispatched via the sister-set machinery and is NOT in the default
-    tuple (B28 Item 1 demoted it).
-    """
-    return (W_PRE_FRAME, W_MID_SLOT, W_POST_FRAME, W_POST_UTTERANCE)
-
-
 def v14_joint_l1_loss(
     pred: Tensor, target: Tensor, *, reduction: str = "mean",
 ) -> Tensor:
@@ -104,37 +94,6 @@ def v14_joint_l1_loss(
             f"reduction must be one of 'mean', 'none', 'sum'; got {reduction!r}"
         )
     return torch.nn.functional.l1_loss(pred, target, reduction=reduction)
-
-
-def compose_v14_joint_loss(
-    *,
-    l_pre_frame: Tensor,
-    l_mid_slot: Tensor,
-    l_post_frame: Tensor,
-    l_post_utterance: Tensor,
-) -> tuple[Tensor, V14TotalLossBreakdown]:
-    """Sum the 4-term joint objective with B19 unit weights.
-
-    Thin wrapper around :func:`speech_decoding.ssl.total_loss.v14_total_loss`
-    that preserves the legacy ``(total, breakdown)`` tuple shape. The
-    breakdown is constructed in ONE place (``v14_total_loss``) so the
-    coefficient bindings and the ``V14TotalLossBreakdown`` field
-    population can't drift between two parallel composers (Round 12
-    audit finding, 2026-05-28).
-
-    DKoleo / Gram / context loss are OMITTED here — they're sister-only
-    arms gated by the dispatch (DKoleo) or removed entirely (B27 context
-    loss). Sister cells should call ``v14_total_loss`` directly with the
-    extra terms via its ``l_dkoleo_m4`` / ``l_dkoleo_m3_reactive`` /
-    ``l_gram_reactive`` kwargs.
-    """
-    breakdown = v14_total_loss(
-        l_pre_frame=l_pre_frame,
-        l_mid_slot=l_mid_slot,
-        l_post_frame=l_post_frame,
-        l_post_utterance=l_post_utterance,
-    )
-    return breakdown.total, breakdown
 
 
 LatentValidOverride = Literal["support", "all_true", "parcels_supervised"]
@@ -184,8 +143,10 @@ class V14JointExperiment(V14Experiment):
     with explicit ``phase=1`` then ``phase=2``.
 
     The per-step loss composition runs through
-    :func:`compose_v14_joint_loss`; the trainer never hard-codes the
-    weights. ``λ_anat`` flows in from per-clip metadata via the
+    :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
+    (``loss_variant="b31_default"`` → B31 2-term surface); the trainer
+    never hard-codes the weights. ``λ_anat`` flows in from per-clip
+    metadata via the
     :class:`speech_decoding.extractors.subtype_meta.LambdaAnatExtractor`
     and reaches the encoder forward as a ``(B,)`` tensor (see B29 Item
     12 in ``models/v14_encoder.py``).
@@ -267,17 +228,14 @@ class V14JointExperiment(V14Experiment):
                 "(R-keep-phase-split sister)."
             )
 
-    def loss_coefficients(self) -> tuple[float, ...]:
-        """Override: joint phase uses the B29 4-term tuple."""
-        return v14_joint_loss_coefficients()
-
     def _build_brain_module(self, train_loader):  # type: ignore[override]
         """B2.2: build the joint SSL Lightning module.
 
         Replaces the parent's CE-classifier ``BrainModule`` with
         :class:`speech_decoding.experiments.v14_joint_module.V14JointBrainModule`,
-        which owns the EMA teacher + 3 LN heads + PMA pair and composes the
-        4-term B28/B29 ``L_total`` via the
+        which owns the EMA teacher + LN head(s) + PMA pair and composes the
+        B31 2-term default ``L_total`` (the dropped B19/B28 terms are wired
+        behind ``loss_variant`` sisters) via the
         :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses` path
         (drift row ``B29-joint-collapse`` runtime arm).
 
@@ -329,7 +287,5 @@ __all__ = [
     "LatentValidOverride",
     "SaMaskMode",
     "V14JointExperiment",
-    "compose_v14_joint_loss",
     "v14_joint_l1_loss",
-    "v14_joint_loss_coefficients",
 ]

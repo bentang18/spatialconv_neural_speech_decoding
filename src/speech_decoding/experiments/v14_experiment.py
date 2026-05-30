@@ -2,21 +2,27 @@
 experiment for the v14 cross-subject SSL stack.
 
 Per ``docs/neuroprobe/v14_implementation_fix_list.md`` (SCAFFOLD-01) and
-``docs/neuroprobe/v14_blockers.md`` NT01, the v14 training program runs
-five distinct phases — Phase-1 (anatomy-OFF SSL), Phase-2 (anatomy-ON SSL
-+ shaft-block electrode mask), Phase-3a (Whisper-L8 MLP-adapter warmup),
-Phase-3b (slow-LR student unfreeze), and Phase-4 (frozen-encoder linear
-probe). One class branches per phase via the ``phase`` discriminator.
+``docs/neuroprobe/v14_blockers.md`` NT01, the v14 program has five phase
+*values* — Phase-1 / Phase-2 (SSL), Phase-3a (Whisper-L8 MLP-adapter
+warmup), Phase-3b (slow-LR student unfreeze), and Phase-4 (frozen-encoder
+linear probe). B29 Item 1 collapsed Phase-1 ∪ Phase-2 into a single joint
+SSL phase as the default (run by :class:`V14JointExperiment`, pinned to
+``phase == 1``); the split P1→P2 path survives only as the
+``R-keep-phase-split`` sister, which instantiates this class directly with
+``phase=1`` then ``phase=2``. One class branches per phase via the
+``phase`` discriminator. (Per-subject anatomy gating is via B30
+``latent_valid``, not a P1-anatomy-OFF / P2-anatomy-ON phase split; the
+shaft-block electrode mask was dropped in B03.)
 
-This module is structural: the class declaration, the phase discriminator,
-and the per-phase loss-coefficient resolver are stable. The full runtime
-path (V14Data, EMA teacher, Predictor2Block warm-start, checkpoint reload)
-is gated on SCAFFOLD-02..06 and the downstream blockers (B03/B05/B06).
+This module is structural: the class declaration and the phase
+discriminator are stable. The full runtime path (V14Data, EMA teacher,
+checkpoint reload) is gated on SCAFFOLD-02..06 and the downstream blockers.
 
-Wiring the LOSS-01 composer (Wave 6) into the per-phase ``_train_step``
-happens here once SCAFFOLD-02 (V14Data) lands; the resolver returns the
-coefficients the trainer should apply, so the wiring can be tested at
-unit granularity without instantiating the data pipeline.
+The per-step loss is composed by
+:func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses` — the loss
+single-source-of-truth; its ``loss_variant`` argument selects the B31
+2-term default (``b31_default``) or its sisters — NOT by a per-phase
+coefficient tuple on this class.
 """
 
 from __future__ import annotations
@@ -26,41 +32,9 @@ from typing import Literal
 import pydantic
 
 from speech_decoding.experiments.experiment import Experiment
-from speech_decoding.ssl.total_loss import (
-    W_DKOLEO_M4,
-    W_MID_SLOT,
-    W_POST_FRAME,
-    W_POST_UTTERANCE,
-    W_PRE_FRAME,
-)
 
 
 V14Phase = Literal[1, 2, "3a", "3b", 4]
-
-
-# Phase-3 (Whisper distillation) coefficient. Single Smooth-L1 term,
-# β=1.0 default (Wave 2 lock). Surfaced here so phase-3 wiring grep'able.
-W_PHASE3_DISTILL: float = 1.0
-
-
-def v14_phase_loss_coefficients(phase: V14Phase) -> tuple[float, ...]:
-    """Per-phase loss-coefficient tuple.
-
-    * P1 / P2: the LOSS-01 5-term lock
-      ``(W_PRE_FRAME, W_MID_SLOT, W_POST_FRAME, W_POST_UTTERANCE,
-      W_DKOLEO_M4)``.
-    * P3a / P3b: ``(W_PHASE3_DISTILL,)`` — single Whisper Smooth-L1 term.
-    * P4: ``()`` — frozen-encoder linear probe; no SSL loss.
-
-    Raises :class:`ValueError` on unknown phases.
-    """
-    if phase in (1, 2):
-        return (W_PRE_FRAME, W_MID_SLOT, W_POST_FRAME, W_POST_UTTERANCE, W_DKOLEO_M4)
-    if phase in ("3a", "3b"):
-        return (W_PHASE3_DISTILL,)
-    if phase == 4:
-        return ()
-    raise ValueError(f"unknown phase: {phase!r}")
 
 
 class V14Experiment(Experiment):
@@ -70,20 +44,16 @@ class V14Experiment(Experiment):
     :class:`speech_decoding.experiments.experiment.Experiment` (logger,
     callbacks, trainer, infra). Adds the ``phase`` discriminator.
 
-    The runtime branching (EMA teacher in P1/P2; Predictor2Block
-    warm-start at P1→P2; Whisper adapter+pool in P3; frozen-encoder
-    probe in P4) lives in ``_train_and_test`` once SCAFFOLD-02 lands.
+    The runtime branching (EMA teacher in the joint SSL phase; Whisper
+    adapter+pool in P3; frozen-encoder probe in P4) lives in
+    ``_train_and_test`` once SCAFFOLD-02 lands.
 
-    Coefficients for the active phase are resolved via
-    :func:`v14_phase_loss_coefficients` so the trainer never hard-codes
-    them — a single source of truth keeps LOSS-01 and the phase
-    branching coupled.
+    The active loss is composed by
+    :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses` (the
+    single source of truth), so the trainer never hard-codes a per-phase
+    coefficient tuple on this class.
     """
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     phase: V14Phase
-
-    def loss_coefficients(self) -> tuple[float, ...]:
-        """Coefficients for the active phase. Convenience accessor."""
-        return v14_phase_loss_coefficients(self.phase)

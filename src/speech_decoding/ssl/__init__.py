@@ -1,29 +1,32 @@
 """v14 self-supervised pretraining components.
 
-Recipe (still in flux — see canonical sources below) is the
-3-phase staged plan from
-``memory/project_v14_three_phase_staged_recipe_2026_05_18.md`` amended by
-``memory/project_v14_imindbench_multistft_pivot_2026_05_22.md``:
+Recipe (canonical sources below) — B29 (2026-05-27) collapsed the old
+Phase 1 + Phase 2 into a single joint SSL phase, and B31 (2026-05-28) reduced
+the SSL loss surface to two terms:
 
-    Phase 1 (Stage A): EAT Level-B time-frequency mask + UFO frame target.
-    Phase 2 (Stage B): Electrode-mask Level-A (mask_rate=0.30, J1 sweep) +
-                       UFO utterance target.
-    Phase 3        :   Single-teacher Whisper-L8 distillation (DINOv3 dropped
-                       5/22, Stage 3a deleted): 3b-warmup ~3–5% LR → 3b-unfreeze
-                       slow-LR ~95%.
-    Phase 4        :   Downstream — frozen PMA + flat-head linear classifier.
+    Joint SSL phase: V-JEPA-2-canonical masked prediction. Two pure-L1 terms,
+                     ``L_pre_frame @ M2 + L_post_frame @ M4`` (B31). EMA +
+                     StopGrad teacher encodes the full unmasked input.
+    Phase 3        : Single-teacher Whisper-L8 distillation (DINOv3 dropped
+                     5/22, Stage 3a deleted): 3b-warmup ~3–5% LR → 3b-unfreeze
+                     slow-LR ~95%. PMA is trained here (frozen P4).
+    Phase 4        : Downstream — frozen PMA + flat-head linear classifier.
+
+The dropped B19 terms (``L_mid_slot @ M3``, ``L_post_utterance``) and the
+demoted DKoleo regularizer survive as opt-in sisters, NOT in the default.
 
 Files in this package are intentionally small and decoupled so individual
 pieces can be swapped without cascading rewrites. Loss composition lives in
-``compose.py``; the substrate primitives (EMA teacher, recon loss,
-distillation loss, KoLeo) sit in their own modules.
+``total_loss.py`` (the ``v14_total_loss`` composer) wired by ``aggregator.py``
+(``compute_v14_ssl_losses``, the live single-source-of-truth); the substrate
+primitives (EMA teacher, recon loss, distillation loss, KoLeo) sit in their
+own modules.
 
-Order of operations in a single training step (Phase 1/2 example):
+Order of operations in a single joint-SSL training step:
 
     student_out = student(x_masked)
     with torch.no_grad():
-        teacher_out = teacher(x_target)            # EMA + StopGrad
-    loss_recon  = recon_loss(student_out, teacher_out, valid_bin_mask)
-    loss_koleo  = koleo_loss(student_readout)
-    loss = lam_recon * loss_recon + lam_koleo * loss_koleo
+        teacher_out = teacher(x_full)              # EMA + StopGrad, full input
+    breakdown = compute_v14_ssl_losses(...)        # B31 2-term default
+    loss = breakdown.total
 """
