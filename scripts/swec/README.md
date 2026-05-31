@@ -30,13 +30,17 @@ audit bind to this so we source exactly the bytes we proved.
    27-32,34-40). Bit-compares signal on the top dupe pairs. Pins the revision.
 
 2. **Fetch the 50 unique folders** (skips the 18 dupes -> saves ~1.3 TB and
-   avoids over-weighting 18 subjects in SSL):
+   avoids over-weighting 18 subjects in SSL). The full pull MUST go through
+   Slurm — `hf_xet`'s parallel workers get SIGKILLed by the login-node watchdog
+   within seconds. `fetch_swec.sbatch` chains fetch -> audit on a `common` CPU
+   node (compute nodes have outbound internet):
    ```
-   .venv/bin/python scripts/swec/fetch_swec.py             # all 50 unique
-   .venv/bin/python scripts/swec/fetch_swec.py --subjects ID19   # one (smoke)
+   sbatch scripts/swec/fetch_swec.sbatch                   # full pull + audit
+   .venv/bin/python scripts/swec/fetch_swec.py --subjects ID19   # one (smoke, login OK)
    ```
-   Resumable. Set an `HF_TOKEN` (`huggingface-cli login`) for higher rate limits
-   on the multi-hour pull.
+   Resumable: resubmit and `snapshot_download` skips completed files. HF auth is
+   read from `~/.cache/huggingface/token` (run `huggingface-cli login` once, or
+   copy the laptop's token file to `~/.cache/huggingface/token` on DCC).
 
 3. **Audit on-disk integrity + contract**:
    ```
