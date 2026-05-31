@@ -21,6 +21,8 @@ dependencies = [
     "neuralset>=0.1.0",
     "nibabel>=5.1",
     "pandas>=2.2",
+    "hdf5plugin>=6.0.0",
+    "hf-xet>=1.4.2",
 ]
 
 [project.optional-dependencies]
