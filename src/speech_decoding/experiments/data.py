@@ -21,6 +21,16 @@ def _make_worker_init_fn(seed: int):
         np.random.seed(local_seed)
         random.seed(local_seed)
         torch.manual_seed(local_seed)
+        # 2026-05-30 speedup audit (Tier-1): cap each DataLoader worker's
+        # torch intra-op thread pool to 1. The per-__getitem__ STFT runs
+        # via torch.stft (torch threads); with num_workers workers each
+        # defaulting to all cores, the pool oversubscribes whenever
+        # --cpus-per-task > num_workers, slowing the very path the workers
+        # exist to overlap. One thread/worker removes the contention.
+        # In-process so it works under submitit (login-node env never
+        # reaches the GPU job). Numerics-safe: torch.stft is thread-count
+        # independent.
+        torch.set_num_threads(1)
 
     return init_fn
 

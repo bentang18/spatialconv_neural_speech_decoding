@@ -2,7 +2,7 @@
 + layer-avg target (LOSS-06) + B26 fixed-τ lock (2026-05-27 PM) + B26 teacher
 full-input contract assert.
 
-B26 amendment 2026-05-27 PM: EMA momentum is locked at fixed τ=0.999 across
+B26 amendment 2026-05-27 PM: EMA momentum is locked at fixed τ=0.99925 across
 P1 and P2 per V-JEPA 2 §2.4 (drops the V-JEPA 1-style 0.996 → 1.0 ramp).
 The ramp is preserved as the ``R-ema-ramp-v-jepa1`` sister falsifier via
 :func:`v_jepa1_ema_schedule`.
@@ -123,26 +123,104 @@ def test_ema_teacher_update_uses_schedule_at_current_step() -> None:
     assert seen_steps == [0, 1, 2]
 
 
+# --- #135 aliased-tensor double-update fix (2026-05-30 speedup audit) -------
+
+
+class _AliasModule(nn.Module):
+    """A module that registers one block under two attribute names — the same
+    shape as the v14 encoder's legacy ``self.cross_attn = self.cross_attns[0]``
+    handle. ``state_dict()`` then yields both keys pointing at one storage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+        self.alias = self.blocks[0]  # same object → duplicate state_dict key
+        self.solo = nn.Linear(4, 4, bias=False)  # non-aliased control
+
+
+def test_ema_update_applies_coeff_once_to_aliased_params() -> None:
+    """#135: a tensor that appears under two state_dict keys (module aliasing)
+    must receive the EMA coefficient EXACTLY ONCE, not twice. The pre-fix loop
+    applied ``mul_(coeff).add_(s, 1-coeff)`` per key → effective coeff² on the
+    aliased params, violating the B26 uniform-τ contract."""
+    torch.manual_seed(0)
+    student = _AliasModule()
+    coeff = 0.9
+    teacher = EmaTeacher(student, coeff_schedule=lambda _s: coeff)
+    # Move the teacher off the student so single vs double application differ
+    # (they collapse to ``s`` while teacher == student from the deepcopy).
+    with torch.no_grad():
+        for p in teacher.model.parameters():
+            p.add_(torch.randn_like(p) * 5.0)
+
+    t0_alias = teacher.model.blocks[0].weight.detach().clone()
+    s_alias = student.blocks[0].weight.detach().clone()
+    t0_solo = teacher.model.solo.weight.detach().clone()
+    s_solo = student.solo.weight.detach().clone()
+
+    teacher.update_from(student)
+
+    single_alias = t0_alias * coeff + s_alias * (1.0 - coeff)
+    double_alias = t0_alias * coeff**2 + s_alias * (1.0 - coeff**2)
+    t1_alias = teacher.model.blocks[0].weight
+    assert torch.allclose(t1_alias, single_alias), "aliased param double-updated"
+    assert not torch.allclose(t1_alias, double_alias), "still hitting the coeff² bug"
+
+    # Non-aliased control still follows the single-application formula.
+    single_solo = t0_solo * coeff + s_solo * (1.0 - coeff)
+    assert torch.allclose(teacher.model.solo.weight, single_solo)
+
+
+def test_ema_foreach_matches_reference_sequential_loop() -> None:
+    """#135: the fused ``_foreach`` update must be bit-identical to a reference
+    per-tensor (deduped) ``mul_/add_`` loop on a realistic module."""
+    torch.manual_seed(1)
+    student = nn.Sequential(nn.Linear(8, 8), nn.LayerNorm(8), nn.Linear(8, 4))
+    coeff = 0.99925
+    teacher = EmaTeacher(student, coeff_schedule=lambda _s: coeff)
+    with torch.no_grad():
+        for p in teacher.model.parameters():
+            p.add_(torch.randn_like(p) * 2.0)
+
+    # Reference: dedup by storage, then per-tensor mul_/add_.
+    ref = {}
+    s_state = student.state_dict()
+    seen: set[int] = set()
+    for name, t in teacher.model.state_dict().items():
+        if t.data_ptr() in seen:
+            continue
+        seen.add(t.data_ptr())
+        s = s_state[name]
+        if t.dtype.is_floating_point and s.dtype.is_floating_point:
+            ref[name] = (t.detach().clone() * coeff + s.detach() * (1.0 - coeff))
+
+    teacher.update_from(student)
+
+    t_state = teacher.model.state_dict()
+    for name, expected in ref.items():
+        assert torch.equal(t_state[name], expected), f"{name}: foreach != sequential"
+
+
 # ---- EMA-01 / B26: phase-aware decay schedules ------------------------------
 
 
-def test_p1_ema_tau_locked_at_0p999() -> None:
-    """B26 lock 2026-05-27 PM: P1 EMA momentum constant ``P1_EMA_TAU = 0.999``
+def test_p1_ema_tau_locked_at_0p99925() -> None:
+    """B26 lock 2026-05-27 PM: P1 EMA momentum constant ``P1_EMA_TAU = 0.99925``
     per V-JEPA 2 §2.4."""
-    assert P1_EMA_TAU == 0.999
+    assert P1_EMA_TAU == 0.99925
 
 
-def test_p2_ema_tau_locked_at_0p999() -> None:
-    """B26 lock 2026-05-27 PM: P2 EMA momentum constant ``P2_EMA_TAU = 0.999``
+def test_p2_ema_tau_locked_at_0p99925() -> None:
+    """B26 lock 2026-05-27 PM: P2 EMA momentum constant ``P2_EMA_TAU = 0.99925``
     per V-JEPA 2 §2.4."""
-    assert P2_EMA_TAU == 0.999
+    assert P2_EMA_TAU == 0.99925
 
 
 def test_fixed_ema_schedule_returns_constant_tau() -> None:
     """B26: ``fixed_ema_schedule(tau)`` returns ``tau`` at every step."""
-    sched = fixed_ema_schedule(tau=0.999)
+    sched = fixed_ema_schedule(tau=0.99925)
     for step in (0, 1, 1_000, P1_TOTAL_STEPS, 10 * P1_TOTAL_STEPS):
-        assert abs(sched(step) - 0.999) < 1e-12
+        assert abs(sched(step) - 0.99925) < 1e-12
 
 
 def test_fixed_ema_schedule_rejects_out_of_range_tau() -> None:
@@ -156,7 +234,7 @@ def test_fixed_ema_schedule_rejects_out_of_range_tau() -> None:
 
 
 def test_p1_ema_schedule_is_fixed_0p999_under_b26() -> None:
-    """B26 lock: P1 schedule is now constant τ=0.999 (previously a 0.99 →
+    """B26 lock: P1 schedule is now constant τ=0.99925 (previously a 0.99 →
     0.9999 ramp). Verify a few step counts return the same value."""
     sched = p1_ema_schedule()
     assert abs(sched(0) - P1_EMA_TAU) < 1e-12
@@ -166,7 +244,7 @@ def test_p1_ema_schedule_is_fixed_0p999_under_b26() -> None:
 
 
 def test_p2_ema_schedule_is_fixed_0p999_under_b26() -> None:
-    """B26 lock: P2 schedule is now constant τ=0.999 (previously a 0.999 →
+    """B26 lock: P2 schedule is now constant τ=0.99925 (previously a 0.999 →
     0.9999 ramp). Verify a few step counts return the same value."""
     sched = p2_ema_schedule()
     assert abs(sched(0) - P2_EMA_TAU) < 1e-12
@@ -175,14 +253,14 @@ def test_p2_ema_schedule_is_fixed_0p999_under_b26() -> None:
 
 
 def test_phase_ema_schedule_dispatches_to_fixed_0p999_under_b26() -> None:
-    """B26 lock: phase dispatch returns fixed-τ=0.999 for both P1 and P2."""
+    """B26 lock: phase dispatch returns fixed-τ=0.99925 for both P1 and P2."""
     p1 = phase_ema_schedule(1)
     p2 = phase_ema_schedule(2)
-    assert abs(p1(0) - 0.999) < 1e-12
-    assert abs(p2(0) - 0.999) < 1e-12
+    assert abs(p1(0) - 0.99925) < 1e-12
+    assert abs(p2(0) - 0.99925) < 1e-12
     # And at any later step.
-    assert abs(p1(100_000) - 0.999) < 1e-12
-    assert abs(p2(20_000) - 0.999) < 1e-12
+    assert abs(p1(100_000) - 0.99925) < 1e-12
+    assert abs(p2(20_000) - 0.99925) < 1e-12
 
 
 def test_phase_ema_schedule_rejects_phase3() -> None:

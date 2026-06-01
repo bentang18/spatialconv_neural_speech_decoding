@@ -11,7 +11,7 @@ Covers:
   B19/B22/B28 shape.
 * B30 ``latent_valid`` flows from ``support`` → every active slot/
   utterance term.
-* B26 EMA step τ=0.999 fixed; teacher params trail the student.
+* B26 EMA step τ=0.99925 fixed; teacher params trail the student.
 * Predictor fallback path: ``L_pre_frame = F.l1_loss(M2_student,
   detach(M2_teacher))`` when ``predictor is None``.
 * B30 sister-flag runtime gates raise ``NotImplementedError`` at
@@ -306,7 +306,7 @@ def test_v14_joint_brain_module_predictor_fallback_l1_form() -> None:
 
 
 def test_v14_joint_brain_module_ema_step_updates_teacher() -> None:
-    """B26 lock: EMA τ=0.999 fixed; ``update_from`` brings teacher
+    """B26 lock: EMA τ=0.99925 fixed; ``update_from`` brings teacher
     parameters toward the (post-step) student parameters. Exercised on
     ``ln_frame`` so the test runs under the B31 default head set."""
     module = _make_module(loss_variant="b31_default")
@@ -315,8 +315,8 @@ def test_v14_joint_brain_module_ema_step_updates_teacher() -> None:
     pre = module.teacher.model.ln_frame.weight.detach().clone()
     coeff = module.teacher.update_from(module.student)
     post = module.teacher.model.ln_frame.weight.detach().clone()
-    assert coeff == pytest.approx(0.999)
-    expected = 0.999 * pre + 0.001 * 2.0
+    assert coeff == pytest.approx(0.99925)
+    expected = 0.99925 * pre + 0.00075 * 2.0
     torch.testing.assert_close(post, expected)
 
 
@@ -525,3 +525,27 @@ def test_v14_joint_brain_module_grad_ema_buffer_persists_across_calls() -> None:
     # Step 2 sees the seeded EMA as its baseline.
     assert logged["train_mon_grad_ema_l2"] == pytest.approx(first_ema)
     assert logged["train_mon_grad_spike_ratio"] > 0.0
+
+
+# --- #128 train-monitor cadence-gate (2026-05-30 speedup audit) ------------
+
+
+def test_v14_joint_brain_module_train_monitor_due_fires_on_log_cadence() -> None:
+    """#128: the extra per-train-step SSL monitor forward is gated to fire
+    only every ``trainer.log_every_n_steps`` steps. With a trainer reporting
+    cadence 10, batch indices 0/10/20 fire and 1/5/9/11 do not."""
+    module = _make_module()
+    module.trainer = SimpleNamespace(log_every_n_steps=10)  # type: ignore[assignment]
+    for due_idx in (0, 10, 20, 100):
+        assert module._train_monitor_due(due_idx) is True, due_idx
+    for skip_idx in (1, 5, 9, 11, 19, 99):
+        assert module._train_monitor_due(skip_idx) is False, skip_idx
+
+
+def test_v14_joint_brain_module_train_monitor_due_falls_back_to_every_step() -> None:
+    """#128: with no trainer attached (direct-call / unit-test path), the
+    cadence falls back to 1 so the monitor fires every step — preserving the
+    pre-change behavior for tests and ``fast_dev_run`` (batch_idx 0)."""
+    module = _make_module()  # no trainer attached → property raises
+    for idx in (0, 1, 2, 3, 7, 50):
+        assert module._train_monitor_due(idx) is True, idx

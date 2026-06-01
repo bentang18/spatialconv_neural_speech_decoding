@@ -18,7 +18,7 @@ Lineage of the loss form:
     W_POST_UTTERANCE / W_DKOLEO_M4 = 1, 1, 1, 1, 0.1``.
   * B25 (5/27 AM): Smooth-L1 β=1.0 across SSL prediction terms.
   * B26 (5/27 PM): pure L1 (V-JEPA-2 §2.1 Eq 1 canonical) — Smooth-L1
-    citation was wrong. EMA τ=0.999 fixed. Teacher full-input contract.
+    citation was wrong. EMA τ=0.99925 fixed. Teacher full-input contract.
   * B27 (5/27 PM-late): DROP context loss + λ_ctx warmup; keep B26's
     pure L1 + fixed EMA + full-input teacher.
   * B28 (5/27 PM-late): DKoleo @ M4 demoted from default → 3 sisters;
@@ -39,7 +39,7 @@ So the joint default is::
 
 both **pure L1** (V-JEPA-2 §2.1 Eq 1). DKoleo @ M4 is OFF by default
 (3-sister escalation via dispatch's ``--dkoleo-mode``); context loss is
-dropped (B27); EMA τ fixed at 0.999. The live per-step composition runs
+dropped (B27); EMA τ fixed at 0.99925. The live per-step composition runs
 through :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
 with ``loss_variant="b31_default"`` — see :class:`V14JointExperiment`;
 the trainer never hard-codes the weights.
@@ -273,7 +273,7 @@ class V14JointExperiment(V14Experiment):
             encoder=encoder,
             optim_config=self.optim,
             pma_n_heads=encoder.d_model // max(1, encoder.d_model // 8),
-            ema_tau=0.999,
+            ema_tau=0.99925,
             loss_form="l1",
             loss_variant=self.loss_variant,
             latent_valid_override=self.latent_valid_override,

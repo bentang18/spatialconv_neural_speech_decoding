@@ -1,9 +1,13 @@
 """P3-02 + P3-03: teacher-side triangular pool 50 → 8 Hz.
 
-Pools the frozen Whisper-L8 hidden state from its 50 Hz native frame
-rate (10 ms hop) down to v14's 8 Hz student native rate. Triangular
-FWHM = 250 ms (≈ 12.5 Whisper frames per output bucket). Sum-to-1
-normalized per bucket. Zero-padded at the start / end.
+Pools the frozen Whisper teacher feature (the all-layer mean over the 32
+encoder layers; see ``bt_alignment.teacher_cache``) from its 50 Hz native
+frame rate (10 ms hop) down to v14's 8 Hz student native rate. The pool is
+layer-merge-agnostic — it operates on the merged (B, T, 1280) sequence, so
+the all-layer-mean teacher and the single-layer sister share this code.
+Triangle base = 250 ms = 12.5 input frames (half-base = stride = 6.25 frames); true
+half-max FWHM = 125 ms; each bucket aggregates ~12-13 nonzero Whisper
+frames. Row-normalized sum-to-1 per bucket; zero-padded edges.
 
 Locked constants (B05 + B06 lock 2026-05-25 PM)::
 
@@ -28,7 +32,7 @@ from torch import Tensor
 P3_TEACHER_RATE_HZ: float = 8.0
 P3_WHISPER_NATIVE_RATE_HZ: float = 50.0
 
-_FWHM_MS: float = 250.0  # 250 ms triangular FWHM
+_BASE_MS: float = 250.0  # triangle BASE (full w>0 support), not the half-max FWHM (=125 ms)
 _CLIP_SECONDS: float = 5.0
 _EXPECTED_N_IN: int = int(P3_WHISPER_NATIVE_RATE_HZ * _CLIP_SECONDS)   # 250
 _EXPECTED_N_OUT: int = int(P3_TEACHER_RATE_HZ * _CLIP_SECONDS)         # 40
@@ -43,7 +47,8 @@ def triangular_pool_weight_matrix(n_in: int, n_out: int) -> Tensor:
     Zero outside the support — no wrap-around, no negative indexing.
     """
     stride = n_in / n_out                   # 50/8 = 6.25 for the 5-s clip
-    half_fwhm_frames = (_FWHM_MS / 1000.0) * P3_WHISPER_NATIVE_RATE_HZ / 2.0  # 6.25
+    # half-base frames = base_ms/1000 * rate / 2 = 6.25 = stride
+    half_fwhm_frames = (_BASE_MS / 1000.0) * P3_WHISPER_NATIVE_RATE_HZ / 2.0  # 6.25
     centres = torch.arange(n_out, dtype=torch.float32) * stride              # (n_out,)
     in_positions = torch.arange(n_in, dtype=torch.float32)                   # (n_in,)
     # Distance from each input position to each output bucket centre.
@@ -52,7 +57,8 @@ def triangular_pool_weight_matrix(n_in: int, n_out: int) -> Tensor:
     W = (1.0 - dist / half_fwhm_frames).clamp(min=0.0)
     # Sum-to-1 per row (with a tiny eps floor for the degenerate
     # edge case where rounding wipes a row, though it shouldn't with
-    # FWHM 12.5 ≫ stride 6.25).
+    # half-base 6.25 == stride 6.25; Bartlett COLA tiling on the
+    # unnormalized triangle, row-normalized here).
     row_sum = W.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     W = W / row_sum
     return W

@@ -18,7 +18,21 @@ def test_whisper_contract_large_v3():
     assert c["n_fft"] == 400
     assert c["d_model"] == 1280
     assert c["encoder_layers"] == 32
-    assert c["l8_native_rate_hz"] == 50
+    assert c["native_rate_hz"] == 50
+    # Teacher target = plain mean over all 32 encoder layers (all-layer-mean
+    # supersedes the single-layer-8 default; ceiling probe 2026-05-29).
+    assert c["layer_merge"] == "mean_all"
+    assert c["merged_layers"] == 32
+
+
+def test_whisper_contract_project_up_b33():
+    """B33 (2026-05-30): student projects 256→1280, no teacher-side adapter,
+    mandatory per-channel train-only z-score, MLP student head."""
+    c = WHISPER_CONTRACT
+    assert c["project_direction"] == "up"
+    assert c["target_standardization"] == "per_channel_zscore_train_only"
+    assert c["teacher_down_adapter"] is False
+    assert c["student_head"] == "mlp_256_1280"
 
 
 def test_pool_factor():

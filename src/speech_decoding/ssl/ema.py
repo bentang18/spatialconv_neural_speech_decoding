@@ -12,9 +12,14 @@ place after each optimizer step:
 
 The coefficient schedule is callable (``coeff(step) → float``).
 
-**B26 amendment 2026-05-27 PM**: EMA momentum is locked at **fixed
-τ=0.999** throughout the joint SSL phase per V-JEPA 2 §2.4 (which
-explicitly drops the V-JEPA 1-style 0.996 → 1.0 ramp). The previous
+**B26 amendment 2026-05-27 PM; value corrected 2026-05-30**: EMA momentum
+is locked at **fixed τ=0.99925** throughout the joint SSL phase. The
+fixed/no-ramp form is V-JEPA 2 §2.4 (which explicitly drops the V-JEPA
+1-style 0.996 → 1.0 ramp); the *value* 0.99925 is V-JEPA 2's disclosed
+pretraining EMA (main.tex:957) and is identical in V-JEPA 2.1 (App. A).
+The earlier B26 value τ=0.999 was set on the false premise that V-JEPA 2
+doesn't disclose its τ — it does; 0.999 is only the *start* of a *ramped*
+schedule in V-JEPA 2's abbreviated 90k-step ablation recipe. The previous
 ramping schedules (P1 0.99 → 0.9999 over 400k steps, P2 0.999 → 0.9999
 over 40k steps) are retired. The V-JEPA 1 ramp is preserved as the
 ``R-ema-ramp-v-jepa1`` sister-cell falsifier via
@@ -55,10 +60,10 @@ P1_TOTAL_STEPS: int = 400_000
 P2_TOTAL_STEPS: int = 40_000
 
 # B26 lock 2026-05-27 PM: fixed EMA momentum across P1 and P2 per
-# V-JEPA 2 §2.4. The previous P1 (0.99 → 0.9999) and P2 (0.999 → 0.9999)
+# V-JEPA 2 §2.4. The previous P1 (0.99 → 0.9999) and P2 (0.99925 → 0.9999)
 # linear ramps are retired.
-P1_EMA_TAU: float = 0.999
-P2_EMA_TAU: float = 0.999
+P1_EMA_TAU: float = 0.99925
+P2_EMA_TAU: float = 0.99925
 
 
 def stop_grad(x: Tensor) -> Tensor:
@@ -68,11 +73,12 @@ def stop_grad(x: Tensor) -> Tensor:
     return x.detach()
 
 
-def fixed_ema_schedule(tau: float = 0.999) -> tp.Callable[[int], float]:
+def fixed_ema_schedule(tau: float = 0.99925) -> tp.Callable[[int], float]:
     """Constant EMA momentum (B26 lock).
 
-    Returns ``coeff(step) → tau`` for all ``step``. ``tau=0.999`` is the
-    V-JEPA 2 §2.4 default; the ``R-ema-tau-{0.99, 0.9995, 0.9999}``
+    Returns ``coeff(step) → tau`` for all ``step``. ``tau=0.99925`` is
+    V-JEPA 2's disclosed pretraining EMA (main.tex:957; fixed/no-ramp per
+    §2.4; identical in V-JEPA 2.1 App. A); the ``R-ema-tau-{0.99, 0.9995, 0.9999}``
     sister sweep wires custom values.
     """
     if not 0.0 < tau < 1.0:
@@ -95,7 +101,7 @@ def linear_ema_schedule(
     Retained for custom EMA sweeps and as the underlying primitive of the
     :func:`v_jepa1_ema_schedule` sister-cell falsifier. **Not** used by
     the B26 default — :func:`p1_ema_schedule` and :func:`p2_ema_schedule`
-    now return :func:`fixed_ema_schedule(0.999)`.
+    now return :func:`fixed_ema_schedule(0.99925)`.
     """
     if total_steps <= 0:
         raise ValueError(f"total_steps must be positive, got {total_steps}")
@@ -110,8 +116,8 @@ def linear_ema_schedule(
 def p1_ema_schedule(
     total_steps: int = P1_TOTAL_STEPS,  # noqa: ARG001  retained for signature stability
 ) -> tp.Callable[[int], float]:
-    """Phase-1 EMA momentum (B26 lock 2026-05-27 PM): fixed τ=0.999 per
-    V-JEPA 2 §2.4.
+    """Phase-1 EMA momentum (B26 lock 2026-05-27 PM): fixed τ=0.99925
+    (V-JEPA 2 main.tex:957; fixed/no-ramp per §2.4).
 
     The ``total_steps`` parameter is retained for backward-compatible
     callers but ignored — the schedule is a constant.
@@ -122,8 +128,8 @@ def p1_ema_schedule(
 def p2_ema_schedule(
     total_steps: int = P2_TOTAL_STEPS,  # noqa: ARG001  retained for signature stability
 ) -> tp.Callable[[int], float]:
-    """Phase-2 EMA momentum (B26 lock 2026-05-27 PM): fixed τ=0.999 per
-    V-JEPA 2 §2.4.
+    """Phase-2 EMA momentum (B26 lock 2026-05-27 PM): fixed τ=0.99925
+    (V-JEPA 2 main.tex:957; fixed/no-ramp per §2.4).
 
     The ``total_steps`` parameter is retained for backward-compatible
     callers but ignored — the schedule is a constant.
@@ -154,7 +160,7 @@ def phase_ema_schedule(
     an external frozen Whisper teacher, no EMA.
 
     Under the B26 lock, both P1 and P2 return :func:`fixed_ema_schedule`
-    at τ=0.999. ``total_steps`` is accepted for backward compatibility
+    at τ=0.99925. ``total_steps`` is accepted for backward compatibility
     and ignored.
     """
     if phase == 1:
@@ -306,13 +312,38 @@ class EmaTeacher(nn.Module):
         coeff = float(self._coeff_schedule(step))
         student_state = student.state_dict()
         teacher_state = self.model.state_dict()
+        # Dedup by storage address (2026-05-30 speedup audit, #135). A module
+        # assigned under two attribute names — e.g. the v14 encoder's legacy
+        # ``self.cross_attn = self.cross_attns[0]`` handle — appears in
+        # ``state_dict()`` under BOTH keys, each a distinct ``.detach()`` view
+        # sharing one storage. Iterating naively applied the EMA twice to those
+        # tensors → effective coeff² (τ≈0.9985 not 0.99925), silently breaking the
+        # B26 uniform-τ contract for the anatomy-routing cross-attn params. Key
+        # on ``data_ptr()`` (storage start + offset) so each unique tensor is
+        # updated exactly once; ``state_dict`` returns detached views so
+        # in-place ops still write through to the live teacher params.
+        seen: set[int] = set()
+        ema_t: list[Tensor] = []
+        ema_s: list[Tensor] = []
         for name, t_param in teacher_state.items():
+            ptr = t_param.data_ptr()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
             s_param = student_state[name]
             if t_param.dtype.is_floating_point and s_param.dtype.is_floating_point:
-                t_param.mul_(coeff).add_(s_param, alpha=1.0 - coeff)
+                ema_t.append(t_param)
+                ema_s.append(s_param)
             else:
                 # Non-float buffers (e.g. step counters) get copied verbatim.
                 t_param.copy_(s_param)
+        # Fused multi-tensor EMA: one ``_foreach`` kernel pair for the whole
+        # float param set instead of a per-tensor Python ``mul_/add_`` loop.
+        # Bit-identical to the sequential loop now that aliases are deduped —
+        # each tensor independently becomes ``t*coeff + s*(1-coeff)``.
+        if ema_t:
+            torch._foreach_mul_(ema_t, coeff)
+            torch._foreach_add_(ema_t, ema_s, alpha=1.0 - coeff)
         # Defensive: ensure no parameter accidentally has requires_grad re-set.
         for p in self.model.parameters():
             p.requires_grad_(False)

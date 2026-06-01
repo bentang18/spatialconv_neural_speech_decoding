@@ -13,11 +13,14 @@ import torch
 
 from speech_decoding.models.v14_encoder import (
     Predictor2Block,
+    V14MeanPoolLinearHead,
     V14ParcelCollapsePMA,
     V14ParcelPerceiver,
     V14ParcelPerceiverModel,
     V14ParcelPerceiverWithHead,
+    V14PerTaskAttentivePooler,
     V14Phase4FlatHead,
+    V14PmaReadout,
     _JointTokenBlock,
     _PatchStem,
 )
@@ -530,55 +533,106 @@ def test_v14_parcel_collapse_pma_default_is_unfrozen_under_b31() -> None:
     """B31 lock 2026-05-28
     ([[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]): PMA's default
     ``freeze=False`` so the P3 cross-modal distillation construction picks
-    up an unfrozen PMA (gradient flows from the Whisper-L8 distillation
-    loss). P4 explicitly passes ``freeze=True`` at the Phase-4 construction
-    site so the downstream linear-probe contract is unaffected; see
-    ``V14Phase4FlatHead`` build in ``v14_encoder.py`` for the explicit
-    override. The pre-B31 ``freeze=True`` default is locked out — the
-    P3-vs-P4 freeze policy is now explicit at each construction site."""
+    up an unfrozen PMA (gradient flows from the Whisper distillation loss).
+    Under B35 (2026-05-31) the PMA returns to Phase-4 but FROZEN there —
+    :class:`V14PmaReadout` re-freezes it via ``requires_grad_(False)``, so
+    the bare ``V14ParcelCollapsePMA`` default stays unfrozen (the natural P3
+    construction) and the P4 freeze is owned by the readout wrapper."""
     pma = V14ParcelCollapsePMA(d_model=32, n_heads=4)
     for name, p in pma.named_parameters():
         assert p.requires_grad, f"{name} should be trainable under B31 default"
 
 
 def test_v14_parcel_collapse_pma_freeze_true_kwarg_freezes_all_params() -> None:
-    """Explicit ``freeze=True`` (the P4 construction-site kwarg) freezes
-    every PMA parameter — preserves the frozen-readout contract that the
-    Phase-4 linear-probe protocol depends on."""
+    """Explicit ``freeze=True`` freezes every PMA parameter. Under B35 the
+    P4 freeze is owned by :class:`V14PmaReadout` (``requires_grad_(False)``)
+    rather than this kwarg, but the kwarg path still freezes correctly —
+    used by any caller that wants an inert PMA at construction."""
     pma = V14ParcelCollapsePMA(d_model=32, n_heads=4, freeze=True)
     for name, p in pma.named_parameters():
         assert not p.requires_grad, f"{name} should be frozen under freeze=True"
 
 
-def test_v14_config_build_pma_freeze_default_true_freezes_pma() -> None:
-    """The build-config default ``pma_freeze=True`` preserves the B31 Phase-4
-    contract: the built model's PMA is frozen, encoder + flat head trainable."""
+def test_v14_config_build_default_readout_is_pma_mean_linear() -> None:
+    """B35 (2026-05-31): the build-config default ``readout="pma_mean_linear"``
+    wires a :class:`V14PmaReadout` whose PMA is FROZEN (loaded from P3 at the
+    trainer level) and whose ONLY trainable param is the linear classifier.
+    The encoder stays trainable in the bare build (the trainer freezes it for
+    the real probe)."""
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
     )
-    assert cfg.pma_freeze is True
+    assert cfg.readout == "pma_mean_linear"
     model = cfg.build(n_classes=3)
-    for name, p in model.parcel_pma.named_parameters():
-        assert not p.requires_grad, f"PMA {name} should be frozen by default"
-    # Encoder + flat head stay trainable.
+    assert isinstance(model.readout, V14PmaReadout)
+    assert model.readout.temporal == "mean"
+    # The PMA is frozen; the linear classifier is the only trainable readout param.
+    assert not any(p.requires_grad for p in model.readout.pma.parameters())
+    assert all(p.requires_grad for p in model.readout.classifier.parameters())
     assert any(p.requires_grad for p in model.encoder.parameters())
-    assert any(p.requires_grad for p in model.flat_head.parameters())
 
 
-def test_v14_config_build_pma_freeze_false_unfreezes_whole_pipeline() -> None:
-    """``pma_freeze=False`` (the --unfreeze-pma full-pipeline smoke knob)
-    makes the encoder + PMA + flat head ALL trainable."""
+def test_v14_config_build_pma_flatten_readout_sister() -> None:
+    """B35 ``readout="pma_flatten_linear"`` (R-p4-flatten): frozen PMA collapse
+    → flatten T_p·d → Linear. The classifier in-features = n_time_patches·d."""
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
-        pma_freeze=False,
+        readout="pma_flatten_linear",
     )
     model = cfg.build(n_classes=3)
-    for name, p in model.parcel_pma.named_parameters():
-        assert p.requires_grad, f"PMA {name} should be trainable when unfrozen"
-    assert any(p.requires_grad for p in model.encoder.parameters())
-    assert any(p.requires_grad for p in model.flat_head.parameters())
+    assert isinstance(model.readout, V14PmaReadout)
+    assert model.readout.temporal == "flatten"
+    t_p = model.encoder.patch_stem.n_time_patches(cfg.n_time_bins)
+    assert model.readout.classifier.in_features == t_p * cfg.d_model
+    assert not any(p.requires_grad for p in model.readout.pma.parameters())
+
+
+def test_v14_config_build_pma_timeattn_readout_sister() -> None:
+    """B35 ``readout="pma_timeattn_linear"`` (R-p4-time-attn-pool): frozen PMA
+    collapse → learned convex pool over T_p → Linear. Adds a ``time_score``
+    head; the linear in-features = d (pooled to one vector)."""
+    cfg = V14ParcelPerceiver(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6,
+        d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        readout="pma_timeattn_linear",
+    )
+    model = cfg.build(n_classes=3)
+    assert isinstance(model.readout, V14PmaReadout)
+    assert model.readout.temporal == "timeattn"
+    assert hasattr(model.readout, "time_score")
+    assert model.readout.classifier.in_features == cfg.d_model
+
+
+def test_v14_config_build_attentive_readout_sister() -> None:
+    """B35 ``readout="attentive"`` (R-p4-attentive, retired B34 default): a
+    :class:`V14PerTaskAttentivePooler` over the full parcel×time field; fully
+    trainable, no PMA on the readout path."""
+    cfg = V14ParcelPerceiver(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6,
+        d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        readout="attentive",
+    )
+    model = cfg.build(n_classes=3)
+    assert isinstance(model.readout, V14PerTaskAttentivePooler)
+    assert not hasattr(model.readout, "pma")
+    assert any(p.requires_grad for p in model.readout.parameters())
+
+
+def test_v14_config_build_meanpool_readout_baseline() -> None:
+    """B35 (2026-05-31): ``readout="meanpool"`` (R-p4-meanpool-no-pma) wires
+    the :class:`V14MeanPoolLinearHead` reference (means over parcel×time,
+    skipping the PMA); it produces finite per-class logits."""
+    cfg = V14ParcelPerceiver(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6,
+        d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        readout="meanpool",
+    )
+    model = cfg.build(n_classes=3)
+    assert isinstance(model.readout, V14MeanPoolLinearHead)
+    assert not hasattr(model.readout, "pma")
+    assert any(p.requires_grad for p in model.readout.parameters())
 
 
 # Phase-3 distillation pool + projection moved to the teacher side under the
@@ -605,6 +659,20 @@ def test_v14_config_build_param_budget_at_first_pass_defaults() -> None:
     assert n_params < 20_000_000, (
         f"v14 first-pass unexpectedly large: {n_params:,} — v4 spec projects "
         f"~13M at d=256, heads=8"
+    )
+    # B35 readout accounting (d=256, n_heads=8, n_classes=10): the frozen
+    # P3-PMA = 263,424 params (query 256 + ln_q 512 + ln_kv 512 + q_proj
+    # 65,536 + kv_proj 131,072 + out_proj 65,536; no rFF MLP), contributing
+    # ZERO trainable params at P4. The only trainable readout param is the
+    # 10-way linear = 2,570 (256·10 + 10).
+    pma_total = sum(p.numel() for p in model.readout.pma.parameters())
+    assert pma_total == 263_424, f"frozen PMA param count drifted: {pma_total:,}"
+    assert not any(p.requires_grad for p in model.readout.pma.parameters())
+    linear_trainable = sum(
+        p.numel() for p in model.readout.classifier.parameters() if p.requires_grad
+    )
+    assert linear_trainable == 2_570, (
+        f"trainable P4 linear drifted: {linear_trainable:,} (expected 2,570)"
     )
 
 
@@ -660,9 +728,17 @@ def test_v14_head_wrapper_forwards_b29_conditioning_to_encoder() -> None:
         "head wrapper must forward ref_idx into the encoder; "
         "different ids produced identical logits."
     )
-    # Build graded support (every electrode covers multiple parcels) so the
-    # anatomy-bias gate has actual contrast to scale.
-    graded_support = torch.rand(B, C, 6) + 1e-3
+    # Build STRONGLY-PEAKED support (each electrode concentrates on one distinct
+    # parcel) so the anatomy-bias gate has real per-parcel contrast to scale. A
+    # near-uniform support makes log(support+eps) ~constant across parcels, so
+    # the bias adds the same shift everywhere and the lambda_anat gate is a
+    # near-no-op regardless of wiring — and the B35 frozen-PMA readout (ln_q/
+    # ln_kv + parcel-softmax) still attenuates a weak-contrast gate, so the
+    # peaked support keeps the delta above the 1e-4 floor.
+    # Deterministic (no torch.rand) so the gate signal is stable, not flaky.
+    graded_support = torch.full((B, C, 6), 1e-3)
+    dominant = torch.arange(C) % 6
+    graded_support[:, torch.arange(C), dominant] = 1.0
     graded_support = graded_support / graded_support.sum(dim=-1, keepdim=True)
     with torch.no_grad():
         bias_on = model(
@@ -1180,3 +1256,82 @@ def test_v14_b29_subtype_ref_config_propagates_through_build() -> None:
     assert encoder.subtype_embed is None
     assert encoder.ref_embed_reuse_kv is False
     assert encoder.ref_embed_enabled is True
+
+
+# --- #119 activation checkpointing (2026-05-30 speedup audit, Tier-2) -------
+
+
+def _ckpt_loss_and_grads(model: V14ParcelPerceiverModel) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Deterministic forward+backward on a fixed input; returns the scalar
+    loss and a flat list of per-parameter grads (None grads → zeros)."""
+    torch.manual_seed(1234)
+    kw = _tiny_kwargs()
+    B, C = 2, 7
+    electrodes = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"])
+    support = torch.zeros(B, C, kw["k_parcels"])
+    support[..., 0] = 1.0
+    model.zero_grad(set_to_none=True)
+    out = model(electrodes, support)
+    loss = out.float().pow(2).mean()
+    loss.backward()
+    grads = [
+        (p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p))
+        for p in model.parameters()
+    ]
+    return loss.detach(), grads
+
+
+def test_v14_gradient_checkpointing_is_bit_identical() -> None:
+    """#119 (Tier-2 speedup): activation checkpointing on the encoder block
+    stacks must not change numerics. The blocks contain no dropout, and the
+    flag is gated on ``training and grad_enabled`` — under those conditions
+    the recomputed forward (use_reentrant=False) is exact, so loss + every
+    gradient must match the non-checkpointed run.
+
+    Same model object, toggled flag → params are byte-for-byte identical
+    across both runs; only the checkpointing path differs.
+    """
+    model = V14ParcelPerceiverModel(**_tiny_kwargs())
+    model.train()
+
+    assert model.gradient_checkpointing is False, (
+        "#119: gradient_checkpointing must default OFF"
+    )
+    loss_off, grads_off = _ckpt_loss_and_grads(model)
+
+    model.gradient_checkpointing = True
+    loss_on, grads_on = _ckpt_loss_and_grads(model)
+
+    assert torch.equal(loss_off, loss_on), (
+        f"#119: checkpointed loss {loss_on.item()!r} != "
+        f"non-checkpointed {loss_off.item()!r} (no dropout ⇒ exact)"
+    )
+    assert len(grads_off) == len(grads_on)
+    for i, (g_off, g_on) in enumerate(zip(grads_off, grads_on)):
+        assert torch.equal(g_off, g_on), (
+            f"#119: grad[{i}] diverged under checkpointing "
+            f"(max abs diff {(g_off - g_on).abs().max().item():.3e})"
+        )
+
+
+def test_v14_gradient_checkpointing_skipped_in_eval() -> None:
+    """The checkpoint path is gated on ``self.training`` so the no_grad
+    EMA-teacher pass (and any eval forward) is never checkpointed even when
+    the flag is on. Verifies an eval-mode forward still runs and matches the
+    flag-off eval forward exactly."""
+    model = V14ParcelPerceiverModel(**_tiny_kwargs())
+    model.eval()
+    torch.manual_seed(7)
+    kw = _tiny_kwargs()
+    electrodes = torch.randn(1, 4, kw["n_time_bins"], kw["n_freq_bins"])
+    support = torch.zeros(1, 4, kw["k_parcels"])
+    support[..., 0] = 1.0
+
+    with torch.no_grad():
+        out_off = model(electrodes, support)
+        model.gradient_checkpointing = True
+        out_on = model(electrodes, support)
+
+    assert torch.equal(out_off, out_on), (
+        "#119: eval/no_grad forward must be unaffected by the checkpointing flag"
+    )

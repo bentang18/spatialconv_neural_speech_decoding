@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import typing as tp
 from pathlib import Path
 
@@ -7,6 +8,15 @@ import exca
 import lightning.pytorch as pl
 import pydantic
 import torch
+
+# 2026-05-30 speedup audit (Tier-1): let the CUDA caching allocator grow
+# segments instead of fragmenting into fixed blocks. Read once when the
+# allocator first initializes, so it must be set before any CUDA op —
+# module import in the submitit worker is the earliest reliable point
+# (the login-node ``scripts/dcc/dispatch`` env never reaches the GPU job).
+# ``setdefault`` so an explicit override on the job still wins. Benign
+# allocator hygiene; no effect on CPU/test runs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, Logger
 from lightning.pytorch.loggers.logger import DummyLogger

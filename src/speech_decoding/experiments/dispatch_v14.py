@@ -343,14 +343,23 @@ def build_v14_experiment(
     # falsification. Only effective under ``joint_phase=True``; the
     # supervised Phase-4 path raises if a non-default is requested.
     loss_variant: str = DEFAULT_LOSS_VARIANT,
-    # B1.4f (#125) Phase-4 PMA freeze knob. Default ``True`` preserves the
-    # B31 Phase-4 contract (P4 = frozen pretrained linear probe; PMA gets
-    # gradient only at P3 via Whisper distillation). ``False`` unfreezes the
-    # PMA so the encoder + PMA + flat head are ALL trainable — a
-    # full-pipeline supervised smoke that exercises the complete
-    # forward+backward without a pretrained checkpoint. NOT a science cell;
-    # only meaningful on the supervised Phase-4 path (``joint_phase=False``).
-    pma_freeze: bool = True,
+    # B35 (2026-05-31) Phase-4 readout selector (reverts B34).
+    # "pma_mean_linear" (default) = V14PmaReadout: frozen P3-PMA collapses
+    # parcels → (B, T_p, d), then mean-over-time → Linear (only the linear
+    # trains). "pma_flatten_linear" (R-p4-flatten) / "pma_timeattn_linear"
+    # (R-p4-time-attn-pool) vary the temporal op. "attentive"
+    # (R-p4-attentive) = V14PerTaskAttentivePooler over the full parcel×time
+    # field (792k trainable — demoted, not fittable at the eval budget);
+    # "meanpool" (R-p4-meanpool-no-pma) = V14MeanPoolLinearHead. The P3 PMA
+    # weights load into readout.pma.* and the encoder-freeze for a real
+    # probe are trainer-level concerns (load checkpoint → freeze), not
+    # build flags.
+    readout: str = "pma_mean_linear",
+    # 2026-05-30 speedup audit (Tier-2, #119): default-off activation
+    # checkpointing on the encoder block stacks. Threaded onto the
+    # brain-model config; the encoder forward gates it on training + grad
+    # so the no_grad teacher pass is never checkpointed. Numerics-safe.
+    gradient_checkpointing: bool = False,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -671,10 +680,13 @@ def build_v14_experiment(
             "subtype_embed_reuse_kv": subtype_embed_reuse_kv,
             "ref_embed_enabled": ref_embed_enabled,
             "ref_embed_reuse_kv": ref_embed_reuse_kv,
-            # B1.4f (#125): Phase-4 PMA freeze. Default True = B31 contract;
-            # False unfreezes for an all-trainable full-pipeline smoke. The
-            # encoder build branches on this (V14ParcelPerceiver.build).
-            "pma_freeze": pma_freeze,
+            # B35 (2026-05-31): Phase-4 readout selector threaded onto the
+            # model config. V14ParcelPerceiver.build() picks the frozen-PMA
+            # readout (pma_*) or an attentive/meanpool sister.
+            "readout": readout,
+            # 2026-05-30 speedup audit (Tier-2, #119): default-off
+            # activation checkpointing on the encoder block stacks.
+            "gradient_checkpointing": gradient_checkpointing,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
             # supervised downstream classifier path does not branch on
@@ -689,7 +701,16 @@ def build_v14_experiment(
             # via the Experiment-level snapshot.
         },
         loss={"name": "CrossEntropyLoss"},
-        optim={"optimizer": {"name": "Adam", "lr": 1e-3}},
+        # ``fused=True`` Adam (2026-05-30 speedup audit Tier-1): one fused
+        # kernel for the whole step instead of a per-tensor foreach loop.
+        # neuraltrain BaseTorchOptimizer forwards ``kwargs`` verbatim to
+        # ``torch.optim.Adam``; ``fused`` is valid on CPU + CUDA in the
+        # pinned torch 2.10, so the laptop test path is unaffected. Applies
+        # to BOTH the supervised Phase-4 and the joint SSL optimizer (same
+        # ``self.optim``). Same Adam math as the foreach impl, equivalent
+        # within fp tolerance — NOT bit-identical (the fused kernel uses a
+        # different reduction order, esp. under bf16-mixed on CUDA).
+        optim={"optimizer": {"name": "Adam", "lr": 1e-3, "kwargs": {"fused": True}}},
         metrics=[
             {
                 "name": "Accuracy",
@@ -861,15 +882,36 @@ def _parser() -> argparse.ArgumentParser:
         help="Keep the ref embed input-only (skip K/V reuse). "
              "Sister R-ref-embed-input-only.",
     )
-    # B1.4f (#125): unfreeze the Phase-4 PMA for a full-pipeline smoke. The
-    # default keeps the B31 contract (P4 = frozen pretrained linear probe).
+    # B35 (2026-05-31): Phase-4 readout selector (reverts B34).
+    # "pma_mean_linear" (default) = frozen P3-PMA collapse → mean-over-time
+    # → Linear; "pma_flatten_linear"/"pma_timeattn_linear" vary the
+    # temporal op; "attentive"/"meanpool" are the B34 sisters.
     p.add_argument(
-        "--unfreeze-pma", dest="pma_freeze",
-        action="store_false", default=True,
-        help="Unfreeze the Phase-4 PMA pooling query so the encoder + PMA + "
-             "flat head are ALL trainable. Default frozen per the B31 P4 "
-             "contract (PMA gets gradient only at P3 via Whisper distill). "
-             "This flag is a full-pipeline smoke knob, NOT a science cell.",
+        "--readout", dest="readout",
+        choices=[
+            "pma_mean_linear", "pma_flatten_linear", "pma_timeattn_linear",
+            "attentive", "meanpool",
+        ],
+        default="pma_mean_linear",
+        help="Phase-4 readout. 'pma_mean_linear' (default) = frozen P3-PMA "
+             "collapses parcels → (B, T_p, d), then mean-over-time → Linear "
+             "(only the linear trains). 'pma_flatten_linear' (R-p4-flatten) "
+             "/ 'pma_timeattn_linear' (R-p4-time-attn-pool) vary the temporal "
+             "op. 'attentive' (R-p4-attentive) = single-query attentive probe "
+             "over (B, L, T, d); 'meanpool' (R-p4-meanpool-no-pma) = masked "
+             "mean-pool over parcel×time, skipping the PMA.",
+    )
+    # 2026-05-30 speedup audit (Tier-2, #119): default-off activation
+    # checkpointing on the encoder block stacks. Trades ~one extra encoder
+    # forward for the activation memory of the deepest stack — insurance
+    # for the bs=32 OOM, off by default since DeltaAI H100 80GB does not
+    # bind on memory. Numerics-safe (bit-identical loss + grads).
+    p.add_argument(
+        "--gradient-checkpointing", dest="gradient_checkpointing",
+        action="store_true", default=False,
+        help="Enable activation checkpointing on the encoder token-block and "
+             "latent-block stacks. Off by default; gated on training + grad "
+             "so the no_grad EMA-teacher pass is never checkpointed.",
     )
     p.add_argument(
         "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
@@ -1080,7 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
-          f"pma_freeze={args.pma_freeze}")
+          f"readout={args.readout} "
+          f"gradient_checkpointing={args.gradient_checkpointing}")
     if args.cluster == "slurm":
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "
@@ -1139,7 +1182,8 @@ def main(argv: list[str] | None = None) -> int:
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
-        pma_freeze=args.pma_freeze,
+        readout=args.readout,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

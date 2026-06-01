@@ -1,17 +1,27 @@
 """Whisper-large-v3 distillation contract + clock-consistency assertion.
 
 Provenance: v14 B05+B06 lock (5/25 PM) + v3 upgrade 2026-05-28 per memo
-``project_v14_whisper_teacher_v3_upgrade_2026_05_28.md``. Whisper variant
-verified by inspecting transformers WhisperConfig for openai/whisper-large-v3:
+``project_v14_whisper_teacher_v3_upgrade_2026_05_28.md`` + all-layer-mean
+teacher 2026-05-30 per ``project_v14_whisper_teacher_all_layer_mean_2026_05_30``.
+Whisper variant verified by inspecting transformers WhisperConfig for
+openai/whisper-large-v3:
     n_mels=128, d_model=1280, encoder_layers=32, hop=160 samples @ 16 kHz.
-Encoder topology is identical to large-v2 (32 layers, d=1280, layer-8 native
-50 Hz); v3 differs only in the mel front-end (80→128 bins) which lives
-UPSTREAM of the encoder. Cache writer + whisper_adapter consume layer-8
-hidden state (B, T, 1280), so the mel-bin change is invisible to the
-distillation contract; only the source model string and n_mels need to
-flip. Goldstein-2025 L8 semantics still apply (v3 was a drop-in noisy-speech
-robustness upgrade, −10–20% WER on noisy benchmarks per Whisper v3
-release notes).
+Encoder topology is identical to large-v2 (32 layers, d=1280, native 50 Hz);
+v3 differs only in the mel front-end (80→128 bins) which lives UPSTREAM of the
+encoder. The teacher target is the **plain mean over all 32 encoder layers**
+(``layer_merge="mean_all"``), which beat every single-layer pick on the
+transfer splits (ceiling probe 2026-05-29). This superseded the prior
+single-layer-8 default; the merge keeps the 1280-d width, so cache writer +
+whisper_adapter are unchanged below the layer-merge step, and the mel-bin
+change is still invisible to the contract. The probe did NOT per-layer
+normalize before averaging — its win rode a downstream per-channel
+StandardScaler. Under B33 project-up (2026-05-30) that StandardScaler role is
+filled by an explicit, mandatory, train-only per-channel z-score
+(``TargetStandardizer`` / ``fit_channel_stats`` in ``bt_alignment.teacher_cache``);
+the teacher carries NO trainable adapter (``WhisperAdapter`` is demoted to the
+``R-project-down`` sister, and the student projects 256→1280 via
+``StudentWhisperProjector``). v3 was a drop-in noisy-speech robustness upgrade
+(−10–20% WER per release notes).
 """
 from __future__ import annotations
 import numpy as np
@@ -25,8 +35,14 @@ WHISPER_CONTRACT = {
     "n_fft": 400,
     "d_model": 1280,
     "encoder_layers": 32,
-    "l8_layer_index": 8,
-    "l8_native_rate_hz": 50,
+    "layer_merge": "mean_all",   # plain unweighted mean over all 32 encoder layers
+    "merged_layers": 32,
+    "native_rate_hz": 50,
+    # B33 project-up (2026-05-30): student projects 256→1280, no teacher-side adapter.
+    "project_direction": "up",
+    "target_standardization": "per_channel_zscore_train_only",  # mandatory
+    "teacher_down_adapter": False,        # True only for the R-project-down sister
+    "student_head": "mlp_256_1280",       # R-head-linear sister = "linear_256_1280"
 }
 
 TEACHER_RATE_HZ = 50

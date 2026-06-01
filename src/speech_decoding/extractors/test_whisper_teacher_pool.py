@@ -1,9 +1,10 @@
 """P3-03 tests: teacher-side triangular pool 50 → 8 Hz.
 
 Pools the frozen Whisper-L8 hidden state from ``(250, 1280)`` (50 Hz
-× 5 s clip) to ``(40, 1280)`` (8 Hz × 5 s clip). Triangular FWHM =
-250 ms = 12.5 Whisper frames per bucket; sum-to-1 normalized per
-bucket. Zero-padded at the start / end.
+× 5 s clip) to ``(40, 1280)`` (8 Hz × 5 s clip). Triangle base = 250 ms
+= 12.5 frames (true half-max FWHM = 125 ms); per-bucket support ~12-13
+nonzero frames; sum-to-1 normalized per bucket. Zero-padded at the
+start / end.
 
 P3-02 ships alongside: the teacher rate constant is locked at 8 Hz
 per the B05 + B06 lock (2026-05-25 PM).
@@ -71,19 +72,22 @@ def test_weight_matrix_centers_track_uniform_8hz_grid() -> None:
         )
 
 
-def test_weight_matrix_fwhm_around_12p5_input_frames() -> None:
-    """250 ms FWHM @ 50 Hz = 12.5 Whisper frames. Each row's support
-    (number of positions with weight > 1% of the row max) should land
-    around that band — allow [10, 20] frames as the structural sanity
-    range (exact FWHM depends on the triangular's discrete profile)."""
+def test_weight_matrix_base_support_around_12p5_input_frames() -> None:
+    """Triangle base = 250 ms @ 50 Hz = 12.5 frames (true half-max FWHM
+    = 125 ms); per-bucket support ~12-13 nonzero frames. Each row's
+    support (number of positions with weight > 1% of the row max) should
+    land around that band — allow [10, 20] frames as the structural
+    sanity range (exact support depends on the triangle's discrete
+    profile)."""
     W = triangular_pool_weight_matrix(n_in=250, n_out=40)
     # Avoid the two edges where zero-pad truncates the triangle.
     centre_rows = W[5:35]
     row_max = centre_rows.max(dim=-1).values
     above_threshold = (centre_rows > 0.01 * row_max.unsqueeze(-1)).sum(dim=-1)
-    fwhm_in_frames = above_threshold.float().mean().item()
-    assert 10 <= fwhm_in_frames <= 20, (
-        f"expected FWHM ~12.5 frames; got mean support {fwhm_in_frames:.1f}"
+    base_support_frames = above_threshold.float().mean().item()
+    assert 10 <= base_support_frames <= 20, (
+        f"expected base support ~12-13 frames; got mean support "
+        f"{base_support_frames:.1f}"
     )
 
 

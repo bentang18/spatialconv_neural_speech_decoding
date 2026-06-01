@@ -23,7 +23,7 @@ Composes the B31 V-JEPA-2-canonical 2-term v14 joint SSL loss via
   :class:`V14TotalLossBreakdown`; ``.total`` is the scalar the optimiser
   steps on.
 
-EMA discipline (B26 lock 2026-05-27 PM): fixed τ=0.999 via
+EMA discipline (B26 lock 2026-05-27 PM): fixed τ=0.99925 via
 :func:`speech_decoding.ssl.ema.fixed_ema_schedule`; ``on_train_batch_end``
 applies :meth:`EmaTeacher.update_from` so the teacher trails the student
 exactly one optimiser step behind.
@@ -205,7 +205,7 @@ class V14JointBrainModule(pl.LightningModule):
     * ``student`` — :class:`_V14StudentBundle` with the encoder + 3 LN
       heads + PMA.
     * ``teacher`` — :class:`EmaTeacher` deepcopy of ``student``,
-      ``requires_grad=False`` on every parameter, τ=0.999 fixed.
+      ``requires_grad=False`` on every parameter, τ=0.99925 fixed.
     * ``predictor`` — optional :class:`Predictor2Block` for the B03c
       paradigm-B masked-patch path. ``None`` until B2.3 lands the patch-
       drop forward threading; the fallback L_pre_frame path is documented
@@ -231,7 +231,7 @@ class V14JointBrainModule(pl.LightningModule):
         encoder: V14ParcelPerceiverModel,
         optim_config: BaseOptimizer,
         pma_n_heads: int = 8,
-        ema_tau: float = 0.999,
+        ema_tau: float = 0.99925,
         loss_form: _LossForm = "l1",
         loss_variant: LossVariant = "b31_default",
         predictor: tp.Optional[nn.Module] = None,
@@ -682,11 +682,40 @@ class V14JointBrainModule(pl.LightningModule):
                 on_epoch=True,
             )
 
-    def training_step(self, batch, batch_idx: int) -> Tensor:  # noqa: ARG002
+    def training_step(self, batch, batch_idx: int) -> Tensor:
         breakdown = self._step(batch.data)
         self._log_breakdown(breakdown, step_name="train")
-        self._monitor_from_step(batch.data, step_name="train")
+        # 2026-05-30 speedup audit (Tier-2): cadence-gate the per-step
+        # monitors on the train loop. ``_monitor_from_step`` re-runs the
+        # (no_grad) teacher + student encoder forwards every step — ~2
+        # extra forward-equivalents on top of ``_step``'s student+teacher,
+        # i.e. ~4 forwards/train-step where only 2 carry gradient. The
+        # monitors are diagnostic-log-only (never enter loss/grads), so
+        # firing them every ``log_every_n_steps`` steps instead of every
+        # step removes the redundant compute with ZERO effect on the B31
+        # loss path (``_step`` above is untouched). The
+        # ``_monitor_from_step`` docstring explicitly blesses this gating.
+        # val/test monitor every step (their cadence is already sparse).
+        if self._train_monitor_due(batch_idx):
+            self._monitor_from_step(batch.data, step_name="train")
         return breakdown.total
+
+    def _train_monitor_due(self, batch_idx: int) -> bool:
+        """Train-step monitor cadence (2026-05-30 speedup audit).
+
+        True on step 0 and every ``trainer.log_every_n_steps`` steps
+        thereafter, so the forward-heavy diagnostic monitors run at the
+        logging cadence rather than every step. Falls back to every step
+        (cadence 1) when no trainer is attached — unit tests that call
+        ``training_step`` directly keep their prior every-step behavior,
+        and ``fast_dev_run`` (batch_idx 0) still exercises the monitors
+        once.
+        """
+        try:
+            cadence = int(self.trainer.log_every_n_steps)
+        except (RuntimeError, AttributeError):
+            cadence = 1
+        return batch_idx % max(cadence, 1) == 0
 
     def validation_step(self, batch, batch_idx: int) -> None:  # noqa: ARG002
         breakdown = self._step(batch.data)
@@ -801,7 +830,7 @@ class V14JointBrainModule(pl.LightningModule):
         batch_idx: int,            # noqa: ARG002
     ) -> None:
         # B26 EMA step. ``update_from`` advances the schedule step
-        # internally; coeff is fixed at τ=0.999 under the B26 lock.
+        # internally; coeff is fixed at τ=0.99925 under the B26 lock.
         self.teacher.update_from(self.student)
 
     def configure_optimizers(self):  # type: ignore[override]

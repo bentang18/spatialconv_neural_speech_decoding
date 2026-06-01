@@ -44,11 +44,17 @@ B28 cross-attn collapse 2026-05-27 PM):
       × FFN); additional cross-attns fire pre-block at each interior
       position in ``cross_attn_positions`` (``R-perceiver-original-2-
       cross-attns`` sister uses ``[0, 3]``)                              [T1.9, T1.3]
-    → frozen V14ParcelCollapsePMA k=1 over K*M parcels per time-patch   [T1.10]
-    → (B, T_p, d)
-    → Phase-4 V14Phase4FlatHead: flatten T_p·d → linear classifier
-       (Phase-3 SSL distill path: identity passthrough at 8 Hz native
-        student side per B06 PM lock 2026-05-25.)
+    → (B, L, T_p, d) full parcel×time field carried to the readout
+    → Phase-4 readout (B35 2026-05-31,
+      [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]): the frozen
+      P3-PMA collapses the parcel/slot axis → (B, T_p, d), then
+      mean-over-time → (B, d) → per-task Linear (V14PmaReadout, default
+      readout="pma_mean_linear"). Only the linear trains at P4 (PMA and
+      encoder frozen). Reverts B34's transient drop-PMA / per-task-
+      attentive-query readout, which isn't trainable at Neuroprobe's
+      ≤3500-sample/task budget; the attentive query (readout="attentive")
+      and flatten (readout="pma_flatten_linear") survive as deferred
+      sisters.
 """
 
 from __future__ import annotations
@@ -60,6 +66,7 @@ from typing import Optional, Sequence
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from neuraltrain.models.base import BaseModelConfig
 
@@ -564,8 +571,20 @@ class V14ParcelPerceiverModel(nn.Module):
         subtype_embed_reuse_kv: bool = True,
         ref_embed_enabled: bool = False,
         ref_embed_reuse_kv: bool = True,
+        # 2026-05-30 speedup audit (Tier-2, #119 finally wired): when True,
+        # the token-block + latent-block stacks run under
+        # ``torch.utils.checkpoint`` so per-block activations are recomputed
+        # in backward instead of held. Trades ~25-33% extra student-path
+        # compute for the dominant retained activation (the token blocks
+        # over BC = B·C rows). Default OFF — no behavior change. The forward
+        # gates it on ``self.training and torch.is_grad_enabled()`` so the
+        # no_grad EMA-teacher pass is never checkpointed. Numerics-safe: the
+        # encoder blocks contain no dropout, so the recomputed forward is
+        # bit-identical.
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
+        self.gradient_checkpointing = gradient_checkpointing
         self.n_freq_bins = n_freq_bins
         self.n_time_bins = n_time_bins
         self.k_parcels = k_parcels
@@ -967,8 +986,20 @@ class V14ParcelPerceiverModel(nn.Module):
         # Slice the precomputed tiled rope to the current flat length so the
         # existing _apply_rope (which does `cos[:T]`) finds matching entries.
         rope_token = self.rope_joint_token[:, : T_p * F_p, :]
+        # 2026-05-30 speedup audit (#119): activation checkpointing on the
+        # block stacks. Gated on training + grad so the no_grad EMA-teacher
+        # pass (and eval) run normally — checkpointing only helps the
+        # gradient-carrying student backward. No-op when the flag is off.
+        use_ckpt = (
+            self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        )
         for token_block in self.token_blocks:
-            x_joint = token_block(x_joint, rope_token)
+            if use_ckpt:
+                x_joint = checkpoint(
+                    token_block, x_joint, rope_token, use_reentrant=False
+                )
+            else:
+                x_joint = token_block(x_joint, rope_token)
         # Reshape back to (B, C, F_p, T_p, d) for cross-attn consumption.
         x = (
             x_joint.reshape(B, C, T_p, F_p, self.d_model)
@@ -1142,12 +1173,22 @@ class V14ParcelPerceiverModel(nn.Module):
                     latents_bt, electrodes_bt, bias_bt,
                     key_rope=None, t_bins=None,
                 )
-            latents_bt = block(
-                latents_bt,
-                B=B, T=T_p, L=L,
-                latent_valid=latent_valid_bt,
-                rope_t=self.key_rope,
-            )
+            if use_ckpt:
+                latents_bt = checkpoint(
+                    block,
+                    latents_bt,
+                    B=B, T=T_p, L=L,
+                    latent_valid=latent_valid_bt,
+                    rope_t=self.key_rope,
+                    use_reentrant=False,
+                )
+            else:
+                latents_bt = block(
+                    latents_bt,
+                    B=B, T=T_p, L=L,
+                    latent_valid=latent_valid_bt,
+                    rope_t=self.key_rope,
+                )
 
         latents_bt = self.encoder_ln(latents_bt)
         # Unflatten T_p back out → (B, L, T_p, d).
@@ -1240,21 +1281,28 @@ class V14ParcelCollapsePMA(nn.Module):
     attends to all ``K*M`` parcel latents per timestep, producing one ``d``
     vector per ``t``. Input ``(B, L, T, d)`` → output ``(B, T, d)``.
 
-    **Three-phase training contract** (B31 lock 2026-05-28,
-    [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]):
+    **Training contract** (B31 lock 2026-05-28,
+    [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]; P4 per B35
+    2026-05-31, [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]):
 
     * **P1+P2 (joint SSL)** — PMA is NOT in the loss path. The B31 default
       drops ``L_post_utterance`` from the SSL aggregator; PMA receives no
       gradient. The ``R-add-utterance-loss`` sister constructs an
       unfrozen PMA in this phase to falsify the drop.
-    * **P3 (Whisper-L8 distillation)** — PMA is **unfrozen** and trained by
-      the cross-modal distillation gradient (Antonello/Shimizu precedent).
-    * **P4 (Neuroprobe linear probe)** — PMA is **frozen** alongside the
-      backbone so the readout is identical to the one Phase 3 left behind.
-      The Phase-4 construction site passes ``freeze=True`` explicitly.
+    * **P3 (Whisper distillation)** — PMA is **unfrozen** and trained by
+      the cross-modal distillation gradient (Antonello/Shimizu precedent;
+      B33 project-up).
+    * **P4 (Neuroprobe probe)** — PMA is **kept, FROZEN** (loaded from the
+      P3 checkpoint): it collapses the parcel/slot axis → ``(B, T_p, d)``,
+      then :class:`V14PmaReadout` applies mean-over-time → per-task Linear
+      (B35; reverts B34's drop-PMA-add-attentive-query change). The forward
+      below already produces ``(B, T_p, d)`` keyed by ``latent_valid`` — P4
+      reuses that exact contract; there is no second collapse path.
 
     Default is ``freeze=False`` so the natural P3 construction picks up an
-    unfrozen PMA without ceremony; P4 overrides explicitly. Init is random.
+    unfrozen PMA without ceremony; the P4 readout re-freezes it
+    (:class:`V14PmaReadout` calls ``requires_grad_(False)``). Init is
+    random. Also instantiated by the ``R-add-utterance-loss`` SSL sister.
     """
 
     def __init__(
@@ -1313,9 +1361,15 @@ class V14ParcelCollapsePMA(nn.Module):
 
 
 class V14Phase4FlatHead(nn.Module):
-    """Phase-4 downstream readout (5/22 spec §3): flatten the time axis of
-    the PMA output, then linear → ``n_classes``. iMINDBench-parity (no time
-    pool). Input ``(B, T, d)`` → output ``(B, n_classes)``.
+    """Generic flatten-time + linear head. Input ``(B, T, d)`` → ``(B,
+    n_classes)``.
+
+    **Not the Phase-4 default** (B35 lock 2026-05-31,
+    [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]: the default
+    means over time, not flattens). Reusable primitive: the
+    ``readout="pma_flatten_linear"`` build (the ``R-p4-flatten`` sister)
+    flattens the frozen-PMA-collapsed ``(B, T_p, d)`` via this head's
+    ``Linear(T_p·d, n_classes)`` logic, wired through :class:`V14PmaReadout`.
     """
 
     def __init__(self, n_time_bins: int, d_model: int, n_classes: int) -> None:
@@ -1330,6 +1384,215 @@ class V14Phase4FlatHead(nn.Module):
         return self.classifier(x.reshape(B, -1))
 
 
+class V14PerTaskAttentivePooler(nn.Module):
+    """Phase-4 per-task attentive readout — **no longer the default**
+    (B35 lock 2026-05-31,
+    [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]] reverted B34's
+    default to frozen-PMA → mean → linear). Kept as the
+    ``readout="attentive"`` / ``R-p4-attentive`` sister — revisit only with
+    a much larger per-task train budget (792k trainable params is
+    ~152–453× over Neuroprobe's ≤3500-sample/task data). A fresh trainable
+    attentive probe over the FULL parcel×time encoder output
+    ``(B, L, T, d)``.
+
+    Mechanism — lean V-JEPA §4.3 attentive probe (Set Transformer PMA
+    k=1, Lee 2019 §3.2; class-attention, CaiT 2021 §3)::
+
+        (B, L, T, d) → flatten to (B, L*T, d) tokens
+          → ONE cross-attention layer, single learnable query, keys/values
+            = the (L*T) tokens, anatomically-inactive parcel slots masked
+            out via ``latent_valid``
+          → residual add to query → LN → 2-layer MLP
+          → Linear(d, n_classes)
+
+    Deliberately the LEAN single-query / single-cross-attn-layer form, NOT
+    the V-JEPA-2 §5 4-block probe: the Neuroprobe gate is subject-leakage-
+    bound on the CSubject prong, and the attentive-probe capacity caution
+    (P4 precedent audit Q5: V-JEPA §4.3 +17/+16.1 over avg-pool;
+    "Attention, Please!" 2025) says keep the per-task probe small and
+    always report the :class:`V14MeanPoolLinearHead` leakage-control
+    baseline alongside.
+
+    Always trainable — this IS the per-task probe (the P4 frozen-encoder
+    protocol freezes the backbone, never the probe).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_classes: int,
+        *,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.query = nn.Parameter(
+            torch.randn(1, 1, d_model) * (1.0 / math.sqrt(d_model))
+        )
+        self.ln_q = nn.LayerNorm(d_model)
+        self.ln_kv = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.ln_post = nn.LayerNorm(d_model)
+        hidden = d_model * mlp_ratio
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+        )
+        self.classifier = nn.Linear(d_model, n_classes)
+        for lin in (self.q_proj, self.kv_proj, self.out_proj):
+            nn.init.trunc_normal_(lin.weight, std=0.02)
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                nn.init.trunc_normal_(layer.weight, std=0.02)
+                nn.init.zeros_(layer.bias)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(
+        self,
+        latents: Tensor,                              # (B, L, T, d)
+        latent_valid: Optional[Tensor] = None,        # (B, L) bool
+    ) -> Tensor:
+        B, L, T, d = latents.shape
+        tokens = latents.reshape(B, L * T, d)
+        q = self.q_proj(self.ln_q(self.query)).reshape(
+            1, 1, self.n_heads, self.head_dim
+        ).expand(B, 1, self.n_heads, self.head_dim)
+        kv = self.kv_proj(self.ln_kv(tokens)).reshape(
+            B, L * T, 2, self.n_heads, self.head_dim
+        )
+        k, v = kv.unbind(dim=2)
+        attn_logits = torch.einsum("bqhd,bshd->bhqs", q, k) * self.scale   # (B,H,1,L*T)
+        if latent_valid is not None:
+            invalid = (
+                (~latent_valid).unsqueeze(-1).expand(B, L, T).reshape(B, L * T)
+            )                                                              # (B, L*T)
+            attn_logits = attn_logits.masked_fill(
+                invalid.unsqueeze(1).unsqueeze(1),                         # (B,1,1,L*T)
+                NEG_INF_MASK_VALUE,
+            )
+        attn = attn_logits.softmax(dim=-1)
+        ctx = torch.einsum("bhqs,bshd->bqhd", attn, v).reshape(B, 1, d)
+        ctx = self.out_proj(ctx)                                          # (B,1,d)
+        h = self.query.expand(B, 1, d) + ctx                             # residual to query
+        h = h + self.mlp(self.ln_post(h))                                # MLP block
+        return self.classifier(h.squeeze(1))                            # (B, n_classes)
+
+
+class V14MeanPoolLinearHead(nn.Module):
+    """``R-p4-meanpool-no-pma`` sister readout (B35, 2026-05-31): masked
+    mean-pool the encoder output ``(B, L, T, d)`` over anatomically-valid
+    ``(parcel, time)`` cells → ``(B, d)`` → ``Linear(d, n_classes)``.
+
+    **Means over parcel×time directly, SKIPPING the PMA** — distinct from
+    the B35 default :class:`V14PmaReadout` (``pma_mean_linear``), which
+    means over time *after* the frozen PMA collapses parcels. Leakage /
+    ablation reference: does the PMA's learned parcel-pooling beat a dumb
+    parcel mean? (MAE §4.3; PopT Fig. 17 frozen-aggregator+linear sanity.)
+    """
+
+    def __init__(self, d_model: int, n_classes: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.classifier = nn.Linear(d_model, n_classes)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(
+        self,
+        latents: Tensor,                              # (B, L, T, d)
+        latent_valid: Optional[Tensor] = None,        # (B, L) bool
+    ) -> Tensor:
+        B, L, T, d = latents.shape
+        if latent_valid is None:
+            pooled = latents.reshape(B, L * T, d).mean(dim=1)
+        else:
+            mask = latent_valid.to(latents.dtype).reshape(B, L, 1, 1)
+            num = (latents * mask).sum(dim=(1, 2))                        # (B, d)
+            den = (
+                latent_valid.to(latents.dtype).sum(dim=1) * T
+            ).clamp(min=1.0).unsqueeze(-1)                               # (B, 1)
+            pooled = num / den
+        return self.classifier(pooled)
+
+
+class V14PmaReadout(nn.Module):
+    """B35 Phase-4 default readout (2026-05-31,
+    [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]): the
+    **frozen** P3-PMA collapses the parcel/slot axis, then a temporal op
+    over ``T_p``, then a per-task ``Linear``::
+
+        latents (B, L, T_p, d)
+          → frozen PMA (parcel-collapse, key-masked by latent_valid) → (B, T_p, d)
+          → temporal {mean | flatten | timeattn}                     → (B, d) or (B, T_p·d)
+          → Linear(., n_classes)                                     → (B, n_classes)
+
+    ``temporal="mean"`` is the B35 default (``pma_mean_linear``): mean over
+    ``T_p`` → ``(B, d)`` → ``Linear(d, n_classes)``. ``"flatten"``
+    (``pma_flatten_linear`` / ``R-p4-flatten``) restores B31's
+    ``Linear(T_p·d, n_classes)`` flat head. ``"timeattn"``
+    (``pma_timeattn_linear`` / ``R-p4-time-attn-pool``) convex-pools over
+    ``T_p`` with one learned score vector (~257 params) before the linear.
+
+    The PMA is the P3-trained query, loaded from the P3 checkpoint into
+    ``readout.pma.*`` and **frozen here** (``requires_grad_(False)``); the
+    linear (and, for ``timeattn``, the score vector) are the ONLY trainable
+    P4 params — the readout the Neuroprobe ≤3500-sample/task budget can
+    actually fit (B35 rationale). The encoder is frozen by the trainer.
+    """
+
+    def __init__(
+        self,
+        pma: "V14ParcelCollapsePMA",
+        temporal: str,
+        d_model: int,
+        n_classes: int,
+        n_time_patches: int,
+    ) -> None:
+        super().__init__()
+        if temporal not in ("mean", "flatten", "timeattn"):
+            raise ValueError(f"unknown temporal={temporal!r}")
+        self.pma = pma
+        self.pma.requires_grad_(False)                  # frozen P3-PMA at P4
+        self.temporal = temporal
+        if temporal == "flatten":
+            self.classifier = nn.Linear(n_time_patches * d_model, n_classes)
+        else:
+            self.classifier = nn.Linear(d_model, n_classes)
+        if temporal == "timeattn":
+            self.time_score = nn.Linear(d_model, 1)     # ~257p, convex pool over T_p
+            nn.init.trunc_normal_(self.time_score.weight, std=0.02)
+            nn.init.zeros_(self.time_score.bias)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(
+        self,
+        latents: Tensor,                              # (B, L, T, d)
+        latent_valid: Optional[Tensor] = None,        # (B, L) bool
+    ) -> Tensor:
+        collapsed = self.pma(latents, latent_valid=latent_valid)   # (B, T, d), PMA frozen
+        if self.temporal == "mean":
+            pooled = collapsed.mean(dim=1)                         # (B, d)
+        elif self.temporal == "flatten":
+            pooled = collapsed.reshape(collapsed.shape[0], -1)     # (B, T·d)
+        else:  # timeattn
+            scores = self.time_score(collapsed).squeeze(-1)        # (B, T)
+            weights = scores.softmax(dim=1).unsqueeze(-1)          # (B, T, 1)
+            pooled = (collapsed * weights).sum(dim=1)              # (B, d)
+        return self.classifier(pooled)                            # (B, n_classes)
+
+
 # Phase-3 distillation pool + projection live on the TEACHER side, not here.
 # Per the B05/B06 lock (2026-05-25 PM) the v14 student is an identity
 # passthrough at its 8 Hz native rate; the Whisper-L8 teacher is pooled
@@ -1341,25 +1604,35 @@ class V14Phase4FlatHead(nn.Module):
 
 
 class V14ParcelPerceiverWithHead(nn.Module):
-    """Encoder + (frozen) parcel-PMA + Phase-4 flat head.
+    """Encoder + Phase-4 per-task readout (B35 lock 2026-05-31,
+    [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]).
 
-    Phase-4 downstream pipeline:
-        encoder(...)      → (B, L, T, d)
-        parcel_pma(...)   → (B, T, d)         frozen
-        flat_head(...)    → (B, n_classes)    trainable
+    Phase-4 downstream pipeline::
+
+        encoder(...)   → (B, L, T, d)
+        readout(...)   → (B, n_classes)    per-task probe
+
+    ``readout`` is a :class:`V14PmaReadout` for the default + flatten +
+    time-attn options (``readout="pma_mean_linear"`` default,
+    ``"pma_flatten_linear"``, ``"pma_timeattn_linear"``): a **frozen**
+    P3-PMA collapses parcels → ``(B, T_p, d)``, then a temporal op →
+    Linear. The B34 sisters stay selectable:
+    :class:`V14PerTaskAttentivePooler` (``"attentive"``) over the full
+    parcel×time field, and :class:`V14MeanPoolLinearHead` (``"meanpool"``,
+    the ``R-p4-meanpool-no-pma`` reference). The frozen-encoder protocol
+    freezes ``encoder``; the only trainable P4 params are the readout's
+    linear (and the attentive sister's query/MLP).
     """
 
     def __init__(
         self,
         encoder: V14ParcelPerceiverModel,
-        parcel_pma: V14ParcelCollapsePMA,
-        flat_head: V14Phase4FlatHead,
+        readout: nn.Module,
         eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.parcel_pma = parcel_pma
-        self.flat_head = flat_head
+        self.readout = readout
         self.eps = eps
 
     def forward(
@@ -1393,8 +1666,7 @@ class V14ParcelPerceiverWithHead(nn.Module):
             valid_mask=valid_mask,
             m_sub_slots=self.encoder.m_sub_slots,
         )
-        td = self.parcel_pma(latents, latent_valid=latent_valid)                     # (B, T, d)
-        return self.flat_head(td)                                                    # (B, n_classes)
+        return self.readout(latents, latent_valid=latent_valid)                      # (B, n_classes)
 
 
 class V14ParcelPerceiver(BaseModelConfig):
@@ -1452,13 +1724,32 @@ class V14ParcelPerceiver(BaseModelConfig):
     ref_embed_enabled: bool = False
     ref_embed_reuse_kv: bool = True
 
-    # P4 build knob: freeze the PMA pooling query. Default True is
-    # spec-correct for the B31 Phase-4 contract (P4 = frozen pretrained
-    # linear probe; PMA gets gradient only at P3 via Whisper distill). Set
-    # False for an all-trainable from-scratch supervised smoke (encoder +
-    # PMA + head all unfrozen) that exercises the full forward+backward
-    # without a pretrained checkpoint — see dispatch flag --unfreeze-pma.
-    pma_freeze: bool = True
+    # B35 P4 readout selector (2026-05-31,
+    # [[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]; reverts
+    # B34). Default "pma_mean_linear" = V14PmaReadout: the FROZEN P3-PMA
+    # collapses parcels → (B, T_p, d), then mean-over-time → Linear; only
+    # the linear trains at P4. "pma_flatten_linear" (R-p4-flatten) restores
+    # B31's flatten→Linear; "pma_timeattn_linear" (R-p4-time-attn-pool)
+    # convex-pools over T_p. "attentive" = V14PerTaskAttentivePooler
+    # (R-p4-attentive sister, 792k trainable — not fittable at Neuroprobe's
+    # ≤3500-sample/task budget, hence demoted). "meanpool" =
+    # V14MeanPoolLinearHead (R-p4-meanpool-no-pma, means over parcel×time
+    # directly, skipping the PMA). The P3 PMA weights load into
+    # readout.pma.* at P4 (trainer-level); the encoder-freeze for the real
+    # probe is also a trainer concern (load checkpoint → freeze encoder).
+    readout: tp.Literal[
+        "pma_mean_linear", "pma_flatten_linear", "pma_timeattn_linear",
+        "attentive", "meanpool",
+    ] = "pma_mean_linear"
+
+    # 2026-05-30 speedup audit (Tier-2, #119): activation checkpointing on
+    # the encoder block stacks. Default OFF (no behavior change). True
+    # recomputes per-block activations in backward to cut peak memory —
+    # insurance for memory-bound configs / larger batches. Numerics-safe
+    # (no dropout in the blocks). Threaded into the encoder; the no_grad
+    # teacher pass is never checkpointed (see the forward's training/grad
+    # gate).
+    gradient_checkpointing: bool = False
 
     # SSL-pretrain dispatch flags persisted on the model config so they
     # ride along with the run-record YAML. The encoder ``build`` does
@@ -1515,20 +1806,45 @@ class V14ParcelPerceiver(BaseModelConfig):
             subtype_embed_reuse_kv=self.subtype_embed_reuse_kv,
             ref_embed_enabled=self.ref_embed_enabled,
             ref_embed_reuse_kv=self.ref_embed_reuse_kv,
+            gradient_checkpointing=self.gradient_checkpointing,
         )
-        parcel_pma = V14ParcelCollapsePMA(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            freeze=self.pma_freeze,
-        )
-        # FE-02: flat head sees the post-patch frame count T_p, not the raw
-        # T. ``V14Phase4FlatHead`` parameter named ``n_time_bins`` here is the
-        # "input time dim seen by the head" — we pass T_p so the linear
-        # ``Linear(T_p * d, n_classes)`` is sized correctly.
-        n_time_patches = encoder.patch_stem.n_time_patches(self.n_time_bins)
-        flat_head = V14Phase4FlatHead(
-            n_time_bins=n_time_patches,
-            d_model=self.d_model,
-            n_classes=n_classes,
-        )
-        return V14ParcelPerceiverWithHead(encoder, parcel_pma, flat_head, eps=self.eps)
+        # B35: P4 readout. The "pma_*" options collapse parcels with a
+        # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only
+        # the linear trains; the P3 PMA weights load into readout.pma.* at
+        # the trainer level). "attentive"/"meanpool" consume the full
+        # (B, L, T, d) field directly (B34 sisters).
+        readout: nn.Module
+        if self.readout in (
+            "pma_mean_linear", "pma_flatten_linear", "pma_timeattn_linear",
+        ):
+            pma = V14ParcelCollapsePMA(
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+            )
+            temporal = {
+                "pma_mean_linear": "mean",
+                "pma_flatten_linear": "flatten",
+                "pma_timeattn_linear": "timeattn",
+            }[self.readout]
+            n_time_patches = encoder.patch_stem.n_time_patches(self.n_time_bins)
+            readout = V14PmaReadout(
+                pma=pma,
+                temporal=temporal,
+                d_model=self.d_model,
+                n_classes=n_classes,
+                n_time_patches=n_time_patches,
+            )
+        elif self.readout == "attentive":
+            readout = V14PerTaskAttentivePooler(
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                n_classes=n_classes,
+            )
+        elif self.readout == "meanpool":
+            readout = V14MeanPoolLinearHead(
+                d_model=self.d_model,
+                n_classes=n_classes,
+            )
+        else:
+            raise ValueError(f"unknown readout={self.readout!r}")
+        return V14ParcelPerceiverWithHead(encoder, readout, eps=self.eps)

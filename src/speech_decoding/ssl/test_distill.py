@@ -85,3 +85,15 @@ def test_gradient_flows_to_student_only_when_teacher_detached() -> None:
     loss.backward()
     assert s.grad is not None
     assert torch.isfinite(s.grad).all()
+
+
+def test_project_up_1280d_shape_contract() -> None:
+    """B33: under project-up both student (after StudentWhisperProjector) and
+    the per-channel-z'd teacher are (B, 40, 1280); the loss is shape-agnostic."""
+    torch.manual_seed(4)
+    s = torch.randn(2, 40, 1280, requires_grad=True)
+    t = torch.randn(2, 40, 1280)
+    loss = phase3_distillation_loss(s, t, loss_form="smooth_l1", beta=1.0)
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    loss.backward()
+    assert s.grad is not None and torch.isfinite(s.grad).all()

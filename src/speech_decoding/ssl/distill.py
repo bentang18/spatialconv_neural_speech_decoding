@@ -1,29 +1,44 @@
 """Phase-3 cross-modal distillation loss (T2.4).
 
-Wraps the Phase-3 student → Whisper-L8 supervision from the 5/22 iMINDBench
-pivot, as amended by the B05/B06 lock (2026-05-25 PM) that moved the pool +
-projection to the teacher side and made the student an identity passthrough:
+Wraps the Phase-3 student → Whisper supervision from the 5/22 iMINDBench pivot.
+B33 (2026-05-30) flipped distillation from project-DOWN to **project-UP**: the
+student projects its 256-d readout up to the fixed 1280-d Whisper target via the
+``StudentWhisperProjector`` head, and the loss lives in 1280-d. The teacher
+carries no trainable module — its target is the raw all-layer-mean feature
+(``layer_merge="mean_all"``; 2026-05-30) run through a fixed, train-only
+per-channel z-score (``TargetStandardizer``):
 
-    student_readout: (B, 40, 256)  ←  encoder PMA-k=1 over parcels; identity
-                                       passthrough at 8 Hz native (NO
-                                       student-side pool or projection)
-    teacher_target:  (B, 40, 256)  ←  Whisper-L8 (B, 250, 1280) → triangular
-                                       pool 50→8 Hz (whisper_teacher_pool) →
-                                       WhisperAdapter 2-layer MLP (1280→256)
+    student_readout: (B, 40, 256)   ←  encoder PMA-k=1 over parcels (identity
+                                        passthrough at 8 Hz native)
+    student:         (B, 40, 1280)  ←  StudentWhisperProjector 256→1280 head
+    teacher_target:  (B, 40, 1280)  ←  Whisper all-layer mean (B, 250, 1280) →
+                                        triangular pool 50→8 Hz
+                                        (whisper_teacher_pool) → per-channel
+                                        z-score (TargetStandardizer); FIXED, detached
 
-Both meet at d=256 (40 buckets = 8 Hz × 5 s). The teacher target is expected
-to be detached (caller's responsibility).
+Both meet at d=1280 (40 buckets = 8 Hz × 5 s). The loss math is shape-agnostic;
+this module is unchanged from project-down except for the contract it documents.
+The teacher target is a fixed cached + standardized tensor, so the ``detach()``
+below is trivially correct (no teacher-side trainable module to starve).
+
+Do not conflate the two distinct normalization axes:
+
+  * **Per-channel corpus z-score** (mandatory, B33): one scalar ``(μ, σ)`` per
+    feature channel, fit train-only over ``(clips × timesteps)``, applied
+    UPSTREAM by ``TargetStandardizer`` before the target reaches this loss —
+    NOT done here.
+  * **``target_instance_norm``** (opt-in, default ``False``): per-**token**
+    instance-norm across the 1280-channel axis (M05 candidate). Different axis,
+    computed here when enabled. Orthogonal to the per-channel z-score.
 
 Open blockers (see docs/neuroprobe/v14_blockers.md):
 
   * **M04** — Smooth-L1 β value not locked. ``beta`` is a required field of
     :class:`PhaseThreeDistillationConfig` (no default that would silently
     pin the decision).
-  * **M05** — Whisper instance-norm axes not locked. We do NOT instance-norm
-    inside this loss. If the caller decides M05's default candidate
-    (per-token over the 1280-channel axis), they pre-normalize the teacher
-    target before calling. Optional ``target_instance_norm`` hook exists for
-    AB10 sweep convenience but defaults to ``False``.
+  * **M05** — Whisper instance-norm axes not locked. We do NOT per-token
+    instance-norm inside this loss by default; ``target_instance_norm``
+    (per-token over the 1280-channel axis) defaults to ``False``.
   * **AB10** — R-loss-family sweep. ``loss_form`` accepts ``mse``,
     ``smooth_l1``, or ``cosine`` to make the sweep one-liner.
 """
@@ -48,9 +63,11 @@ def phase3_distillation_loss(
 ) -> Tensor:
     """Phase-3 distillation loss.
 
-    Caller is responsible for ``stop_grad`` on teacher; this function does
-    NOT detach. (We keep teacher gradient-routable so it's traceable in
-    debugging; the recipe just attaches a detached tensor here.)
+    The teacher target is ``detach()``-ed inside this function: stop-grad on a
+    feature-regression target is a load-bearing collapse-safety property
+    (SimSiam, data2vec), so it is enforced here as a code invariant rather than
+    left to the caller. The recipe already passes a detached tensor; the extra
+    detach is idempotent.
 
     ``target_instance_norm=True`` activates M05's default candidate: per-token
     instance-norm across the feature dim on the *teacher* side only. Kept
@@ -61,6 +78,8 @@ def phase3_distillation_loss(
             f"student.shape ({tuple(student.shape)}) != "
             f"teacher.shape ({tuple(teacher.shape)})"
         )
+
+    teacher = teacher.detach()
 
     if target_instance_norm:
         mu = teacher.mean(dim=-1, keepdim=True)
