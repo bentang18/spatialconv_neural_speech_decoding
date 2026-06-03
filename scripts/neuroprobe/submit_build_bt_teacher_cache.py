@@ -78,6 +78,13 @@ def build_sbatch(out_dir: Path | None, log_dir: Path, args: argparse.Namespace) 
         "",
         "set -euo pipefail",
         f"cd {args.repo_root}",
+    ])
+    if args.pythonpath:
+        # Isolated-worktree runs reuse the MAIN clone's .venv binary but must
+        # import the worktree's src, so PYTHONPATH has to win over the editable
+        # install's path. Lets a separate clone build without its own uv sync.
+        lines.append(f"export PYTHONPATH={shlex.quote(str(args.pythonpath))}")
+    lines.extend([
         # whisper-large-v3 is pre-cached in ~/.cache/huggingface (shared /hpc/home);
         # pin offline so the compute node never blocks on a HF network HEAD request.
         "export HF_HUB_OFFLINE=1",
@@ -85,7 +92,7 @@ def build_sbatch(out_dir: Path | None, log_dir: Path, args: argparse.Namespace) 
         "",
     ])
     cmd = [
-        ".venv/bin/python scripts/neuroprobe/build_bt_teacher_cache.py \\",
+        f"{shlex.quote(args.python)} scripts/neuroprobe/build_bt_teacher_cache.py \\",
         f"    --wav-dir {shlex.quote(str(args.wav_dir))} \\",
     ]
     if out_dir is not None:
@@ -121,6 +128,17 @@ def parse_args() -> argparse.Namespace:
         help="Where the .sbatch + slurm logs land (default reports/bt_teacher_cache_build_<date>).",
     )
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
+    p.add_argument(
+        "--python", default=".venv/bin/python",
+        help="Interpreter for the build (relative to repo-root, or absolute). For "
+             "an isolated worktree without its own venv, point at the main clone's "
+             "interpreter and pass --pythonpath.",
+    )
+    p.add_argument(
+        "--pythonpath", default=None,
+        help="If set, exported as PYTHONPATH so the worktree's src shadows the "
+             "editable install (e.g. /work/ht203/repo/speech_bt/src).",
+    )
     p.add_argument("--model", default="openai/whisper-large-v3")
     p.add_argument("--layer-merge", default="mean_all")
     p.add_argument("--chunk-s", type=float, default=30.0)
