@@ -99,6 +99,64 @@ def test_slot_redundancy_rejects_mismatched_batch_dim() -> None:
         )
 
 
+def test_slot_redundancy_latent_valid_masks_degenerate_uncovered_slots() -> None:
+    """K=80 sparse regime: only 10 of 80 slots are covered (diverse
+    random vectors); the 70 uncovered slots are identical empty-parcel
+    pools. Without the mask the degenerate majority dominates → intra-clip
+    + vicreg escalate. With latent_valid the stats see only the 10 diverse
+    covered slots → no intra-clip escalation."""
+    torch.manual_seed(3)
+    B, L, d = 4, 80, 32
+    n_cov = 10
+    degenerate = torch.randn(d)
+    slot_bank = degenerate.expand(B, L, d).clone()
+    latent_valid = torch.zeros(B, L, dtype=torch.bool)
+    for b in range(B):
+        slot_bank[b, :n_cov] = torch.randn(n_cov, d)
+        latent_valid[b, :n_cov] = True
+    utterance_pma = torch.randn(B, d)
+
+    unmasked = slot_redundancy_monitor(slot_bank, utterance_pma)
+    assert "R-dkoleo-intra-clip-slots" in unmasked.escalations
+    assert "R-vicreg-slot-variance" in unmasked.escalations
+
+    masked = slot_redundancy_monitor(slot_bank, utterance_pma, latent_valid)
+    assert masked.per_clip_cos_pct95 < PER_CLIP_COS_PCT95_THRESHOLD
+    assert "R-dkoleo-intra-clip-slots" not in masked.escalations
+
+
+def test_slot_redundancy_fewer_than_two_covered_contributes_zero() -> None:
+    """A batch where every clip covers < 2 slots cannot yield a pairwise
+    similarity → per-clip stats are 0.0 and nothing escalates intra-clip."""
+    B, L, d = 4, 80, 32
+    slot_bank = torch.randn(B, L, d)
+    latent_valid = torch.zeros(B, L, dtype=torch.bool)
+    latent_valid[:, 0] = True  # exactly 1 covered slot per clip
+    utterance_pma = torch.randn(B, d)
+    v = slot_redundancy_monitor(slot_bank, utterance_pma, latent_valid)
+    assert v.per_clip_cos_pct95 == 0.0
+    assert v.diag_zeroed_mean == 0.0
+    assert "R-dkoleo-intra-clip-slots" not in v.escalations
+
+
+def test_slot_redundancy_rejects_wrong_shape_latent_valid() -> None:
+    with pytest.raises(ValueError, match=r"latent_valid must be \(B, L\)"):
+        slot_redundancy_monitor(
+            torch.randn(4, 80, 32),
+            torch.randn(4, 32),
+            torch.zeros(4, 79, dtype=torch.bool),  # wrong L
+        )
+
+
+def test_slot_redundancy_rejects_non_bool_latent_valid() -> None:
+    with pytest.raises(ValueError, match="latent_valid must be bool"):
+        slot_redundancy_monitor(
+            torch.randn(4, 80, 32),
+            torch.randn(4, 32),
+            torch.zeros(4, 80),  # float, not bool
+        )
+
+
 # ---------------------------------------------------------------------------
 # MON-SENSOR-TYPE-CANARY
 # ---------------------------------------------------------------------------
@@ -141,6 +199,26 @@ def test_sensor_type_canary_rejects_wrong_features_shape() -> None:
             torch.zeros(5),                   # missing d dim
             torch.zeros(5, dtype=torch.long),
         )
+
+
+def test_sensor_type_canary_default_baseline_is_chance_for_n_classes() -> None:
+    """baseline_f1=None resolves to chance = 1/n_classes (0.5 binary,
+    1/3 three-way), not a hardcoded 0.5 — so the 3-way subtype sister
+    compares its probe against the correct chance level."""
+    torch.manual_seed(1)
+    B, d = 240, 16
+    v3 = sensor_type_canary_monitor(
+        torch.randn(B, d),
+        torch.randint(0, 3, (B,), dtype=torch.long),
+        n_classes=3, n_epochs=20, lr=1e-2,
+    )
+    assert v3.baseline_f1 == pytest.approx(1.0 / 3.0)
+    v2 = sensor_type_canary_monitor(
+        torch.randn(B, d),
+        torch.randint(0, 2, (B,), dtype=torch.long),
+        n_classes=2, n_epochs=20, lr=1e-2,
+    )
+    assert v2.baseline_f1 == 0.5
 
 
 # ---------------------------------------------------------------------------

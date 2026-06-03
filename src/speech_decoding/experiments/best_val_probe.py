@@ -41,6 +41,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from speech_decoding.models.v14_encoder import _compute_latent_valid
+
 
 PROBE_RIDGE_LAMBDA: float = 1.0
 """Default ridge regularizer for the regression probe (~standard for
@@ -386,15 +388,23 @@ class BestValProbeR2Callback:
 def _default_mean_pool_m4_feature_extractor(
     pl_module: tp.Any, batch_data: dict[str, Tensor],
 ) -> Tensor:
-    """Default S06 feature extractor: ``mean(M4, dim=(parcel, time))``.
+    """Default S06 feature extractor: masked mean of M4 over *covered*
+    parcels and time. Returns ``(B, d)``.
 
     Calls ``pl_module.student(...)`` with the same kwarg surface used by
-    the joint module's ``_step``. Returns ``(B, d)``.
+    the joint module's ``_step``. Under K=80 sparse per-clip DK coverage
+    most parcel slots have no electrode in a given subject; their M4 rows
+    are empty-parcel pools that would bias a naive
+    ``mean(dim=(parcel, time))``. The mean is therefore taken only over
+    the parcels the encoder's latent self-attention actually attends to —
+    the B30 ``latent_valid`` set from :func:`_compute_latent_valid`.
     """
+    support = batch_data["support"]
+    valid_mask = batch_data.get("valid_mask")
     kwargs = {
         "electrode_tokens": batch_data["electrode_tokens"],
-        "support": batch_data["support"],
-        "valid_mask": batch_data.get("valid_mask"),
+        "support": support,
+        "valid_mask": valid_mask,
     }
     taps = pl_module.student(**{k: v for k, v in kwargs.items() if v is not None})
     if not isinstance(taps, dict) or "M4" not in taps:
@@ -407,7 +417,25 @@ def _default_mean_pool_m4_feature_extractor(
         raise ValueError(
             f"M4 tap must be (B, P, T, d); got shape {tuple(m4.shape)}"
         )
-    return m4.mean(dim=(1, 2))
+    _, P, T, _ = m4.shape
+    # M4's parcel axis is K*M; support's last axis is K (the helper's own
+    # contract). Derive M = P // K self-contained — no encoder coupling.
+    k_parcels = support.shape[-1]
+    if k_parcels == 0 or P % k_parcels != 0:
+        raise ValueError(
+            f"M4 parcel axis {P} is not a multiple of support parcel count "
+            f"{k_parcels}; cannot align latent_valid to M4"
+        )
+    latent_valid = _compute_latent_valid(
+        support=support, valid_mask=valid_mask, m_sub_slots=P // k_parcels,
+    )  # (B, P) bool
+    covered = latent_valid.to(m4.dtype)                       # (B, P)
+    # (B, P) -> (B, P, 1, 1) to broadcast over (T, d); matches the
+    # masked-mean idiom in ssl/slot_loss.py.
+    summed = (m4 * covered.unsqueeze(-1).unsqueeze(-1)).sum(dim=(1, 2))  # (B, d)
+    # Covered (parcel, time) cell count per clip = (#covered parcels) * T.
+    denom = (covered.sum(dim=1) * T).clamp_min(1.0)           # (B,)
+    return summed / denom[:, None]
 
 
 __all__ = [

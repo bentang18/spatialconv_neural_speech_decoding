@@ -90,8 +90,14 @@ class ParcelCoverageVerdict:
         (SWEC etc.). Informational; not a kill signal.
     is_alarm:
         ``True`` iff ``degenerate_clip_fraction >
-        DEGENERATE_CLIP_FRACTION_ALARM`` or
-        ``slot_usage_fraction_var > SLOT_USAGE_VARIANCE_ALARM``.
+        DEGENERATE_CLIP_FRACTION_ALARM``. ``slot_usage_fraction_var`` is
+        logged but does NOT trip the alarm: under K=80 sparse per-clip DK
+        coverage the per-slot usage fraction is structurally bimodal
+        (a parcel is either wired or never wired across the sub-batch),
+        so its variance sits ≈ p(1-p) — well above
+        ``SLOT_USAGE_VARIANCE_ALARM`` by construction — and is
+        non-discriminative. ``degenerate_clip_fraction`` is the
+        load-bearing degeneracy signal.
     """
 
     active_slots_per_clip_mean: float
@@ -108,7 +114,6 @@ def parcel_coverage_monitor(
     *,
     degenerate_slot_count_max: int = DEGENERATE_SLOT_COUNT_MAX,
     degenerate_clip_fraction_alarm: float = DEGENERATE_CLIP_FRACTION_ALARM,
-    slot_usage_variance_alarm: float = SLOT_USAGE_VARIANCE_ALARM,
 ) -> ParcelCoverageVerdict:
     """Compute the instantaneous MON-PARCEL-COVERAGE-VARIANCE verdict.
 
@@ -176,10 +181,12 @@ def parcel_coverage_monitor(
     else:
         slot_usage_var = 0.0
 
-    is_alarm = (
-        degenerate_clip_fraction > degenerate_clip_fraction_alarm
-        or slot_usage_var > slot_usage_variance_alarm
-    )
+    # slot_usage_var is computed and reported (below) but is NOT an alarm
+    # trigger: under K=80 sparse per-clip DK coverage the per-slot usage
+    # fraction is structurally bimodal, so its variance ≈ p(1-p) exceeds
+    # SLOT_USAGE_VARIANCE_ALARM by construction and is non-discriminative.
+    # degenerate_clip_fraction is the load-bearing degeneracy signal.
+    is_alarm = degenerate_clip_fraction > degenerate_clip_fraction_alarm
 
     return ParcelCoverageVerdict(
         active_slots_per_clip_mean=mean,

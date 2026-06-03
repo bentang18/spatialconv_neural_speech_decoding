@@ -94,16 +94,20 @@ def test_parcel_coverage_mixed_swec_and_bt_excludes_swec_from_stats() -> None:
     assert v.is_alarm is False
 
 
-def test_parcel_coverage_high_slot_usage_variance_trips_alarm() -> None:
+def test_parcel_coverage_high_slot_usage_variance_logged_but_no_alarm() -> None:
     """If every clip activates the same 10 slots (slots 0..9), per-slot
-    usage is 1.0 for slots 0..9, 0.0 for slots 10..79. With p = 0.125
-    the bimodal variance ≈ p(1-p) = 0.109 > 0.05 → alarm."""
+    usage is 1.0 for slots 0..9, 0.0 for slots 10..79. With p = 0.125 the
+    bimodal variance ≈ p(1-p) = 0.109 > 0.05 — this is the structural
+    K=80-sparse regime. The variance is STILL computed and logged, but it
+    does NOT trip the alarm: every clip has 10 active slots (> 1) so
+    degenerate_clip_fraction is 0.0 and is_alarm is False."""
     B, L = 16, 80
     latent_valid = torch.zeros(B, L, dtype=torch.bool)
     latent_valid[:, :10] = True
     v = parcel_coverage_monitor(latent_valid)
     assert v.slot_usage_fraction_var > SLOT_USAGE_VARIANCE_ALARM
-    assert v.is_alarm is True
+    assert v.degenerate_clip_fraction == 0.0
+    assert v.is_alarm is False
 
 
 def test_parcel_coverage_rejects_non_2d_input() -> None:

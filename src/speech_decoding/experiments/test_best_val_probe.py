@@ -28,6 +28,7 @@ from speech_decoding.experiments.best_val_probe import (
     DEFAULT_N_FOLDS,
     PROBE_RIDGE_LAMBDA,
     ProbeScore,
+    _default_mean_pool_m4_feature_extractor,
     fit_linear_probe_score,
 )
 
@@ -299,3 +300,100 @@ def test_probe_score_returns_per_fold_breakdown() -> None:
     score = fit_linear_probe_score(X, y, mode="regression", n_folds=5)
     assert isinstance(score, ProbeScore)
     assert len(score.per_fold) == 5
+
+
+# ---------------------------------------------------------------------------
+# _default_mean_pool_m4_feature_extractor — masked mean over covered parcels
+# ---------------------------------------------------------------------------
+
+
+class _StubStudentReturningM4(torch.nn.Module):
+    """Callable stub whose forward ignores its kwargs and returns a fixed
+    M4 tap, so the extractor's pooling math can be exercised directly."""
+
+    def __init__(self, m4: Tensor) -> None:
+        super().__init__()
+        self._m4 = m4
+
+    def forward(self, **_kwargs: Tensor) -> dict[str, Tensor]:
+        return {"M4": self._m4}
+
+
+def test_default_extractor_masks_uncovered_parcels() -> None:
+    """Parcels with no electrode coverage must be excluded from the mean,
+    even when their M4 rows carry large values (empty-parcel pools). The
+    naive mean(dim=(parcel, time)) would be dominated by the 1000.0
+    uncovered parcel; the masked mean returns exactly the covered 1.0."""
+    B, P, T, d = 2, 3, 2, 4
+    m4 = torch.ones(B, P, T, d)
+    m4[:, 2] = 1000.0  # parcel 2 is the uncovered empty-pool slot
+    module = SimpleNamespace(student=_StubStudentReturningM4(m4))
+    # support: electrode0→parcel0, electrode1→parcel1, parcel2 uncovered.
+    support = torch.zeros(B, 2, P)
+    support[:, 0, 0] = 1.0
+    support[:, 1, 1] = 1.0
+    batch = {
+        "electrode_tokens": torch.randn(B, 2, T, 5),
+        "support": support,
+        "valid_mask": torch.ones(B, 2, dtype=torch.bool),
+    }
+    feats = _default_mean_pool_m4_feature_extractor(module, batch)
+    assert feats.shape == (B, d)
+    assert torch.allclose(feats, torch.ones(B, d))
+
+
+def test_default_extractor_aligns_latent_valid_to_m4_with_m_sub_slots_gt_1() -> None:
+    """M>1: M4's parcel axis is K*M laid out parcel-major (slot l = k*M + s).
+    With K=2, M=2 (P=4), covering parcel 0 only, latent_valid must mark
+    slots {0,1} True and {2,3} False. Parcel 0's slots carry 2.0, the
+    uncovered parcel 1's slots carry 1000.0 → masked mean == 2.0. A
+    slot-major / interleaved misalignment would mix in the 1000.0."""
+    B, K, M, T, d = 2, 2, 2, 3, 4
+    P = K * M
+    m4 = torch.empty(B, P, T, d)
+    m4[:, 0:2] = 2.0      # parcel 0, slots 0,1 (covered)
+    m4[:, 2:4] = 1000.0   # parcel 1, slots 2,3 (uncovered empty pool)
+    module = SimpleNamespace(student=_StubStudentReturningM4(m4))
+    # One electrode → parcel 0 only; parcel 1 has zero coverage.
+    support = torch.zeros(B, 1, K)
+    support[:, 0, 0] = 1.0
+    batch = {
+        "electrode_tokens": torch.randn(B, 1, T, 5),
+        "support": support,
+        "valid_mask": torch.ones(B, 1, dtype=torch.bool),
+    }
+    feats = _default_mean_pool_m4_feature_extractor(module, batch)
+    assert feats.shape == (B, d)
+    assert torch.allclose(feats, torch.full((B, d), 2.0))
+
+
+def test_default_extractor_zero_covered_returns_zero_not_nan() -> None:
+    """A clip with no covered parcels yields a finite 0 vector, not NaN
+    (denominator clamped to 1)."""
+    B, P, T, d = 1, 3, 2, 4
+    m4 = torch.full((B, P, T, d), 5.0)
+    module = SimpleNamespace(student=_StubStudentReturningM4(m4))
+    support = torch.zeros(B, 2, P)  # nothing covered
+    batch = {
+        "electrode_tokens": torch.randn(B, 2, T, 5),
+        "support": support,
+        "valid_mask": torch.ones(B, 2, dtype=torch.bool),
+    }
+    feats = _default_mean_pool_m4_feature_extractor(module, batch)
+    assert torch.isfinite(feats).all()
+    assert torch.allclose(feats, torch.zeros(B, d))
+
+
+def test_default_extractor_rejects_non_divisible_parcel_axis() -> None:
+    """M4 parcel axis must be an integer multiple of support's K."""
+    B, P, T, d = 1, 3, 2, 4  # P=3
+    m4 = torch.ones(B, P, T, d)
+    module = SimpleNamespace(student=_StubStudentReturningM4(m4))
+    support = torch.zeros(B, 2, 2)  # K=2; 3 % 2 != 0
+    support[:, 0, 0] = 1.0
+    batch = {
+        "electrode_tokens": torch.randn(B, 2, T, 5),
+        "support": support,
+    }
+    with pytest.raises(ValueError, match="not a multiple"):
+        _default_mean_pool_m4_feature_extractor(module, batch)

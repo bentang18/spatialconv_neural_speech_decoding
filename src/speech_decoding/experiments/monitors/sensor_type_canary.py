@@ -121,7 +121,7 @@ def sensor_type_canary_monitor(
     labels: Tensor,
     *,
     n_classes: int = 2,
-    baseline_f1: float = 0.5,
+    baseline_f1: float | None = None,
     threshold: float = SENSOR_TYPE_CANARY_F1_THRESHOLD,
     n_epochs: int = 50,
     lr: float = 1e-2,
@@ -135,9 +135,15 @@ def sensor_type_canary_monitor(
     n_classes: 2 (binary default) or 3 (three-way sister).
     baseline_f1: macro-F1 of a baseline encoder without ``subtype_embed``.
         The canary's F1 must not exceed ``baseline_f1 + threshold``.
+        ``None`` (default) resolves to chance for a balanced classifier,
+        ``1 / n_classes`` (0.5 binary, 1/3 three-way) — matching
+        :func:`ref_type_canary_monitor`. A hardcoded 0.5 was only correct
+        for ``n_classes == 2``.
     threshold: kill margin (default 0.05 per B29 Item 9 lock).
     """
     _validate_probe_inputs(features, labels)
+    if baseline_f1 is None:
+        baseline_f1 = 1.0 / n_classes
     canary_f1 = _fit_linear_probe_macro_f1(
         features, labels, n_classes=n_classes, n_epochs=n_epochs, lr=lr,
     )

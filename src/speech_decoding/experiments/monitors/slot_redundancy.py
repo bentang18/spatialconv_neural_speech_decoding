@@ -121,6 +121,7 @@ def _diag_zeroed_mean(mat: Tensor) -> float:
 def slot_redundancy_monitor(
     slot_bank: Tensor,
     utterance_pma: Tensor,
+    latent_valid: Tensor | None = None,
     *,
     per_clip_cos_pct95_threshold: float = PER_CLIP_COS_PCT95_THRESHOLD,
     batch_cos_pct95_threshold: float = BATCH_COS_PCT95_THRESHOLD,
@@ -135,6 +136,14 @@ def slot_redundancy_monitor(
         is the slot count — ``K * M`` (B29 default: 80).
     utterance_pma: ``(B, d)`` Tensor of per-clip utterance-level vectors
         (PMA-pooled M4 latents).
+    latent_valid: optional ``(B, L)`` bool mask (B30 single source of
+        truth). When given, the per-clip pairwise-cosine stats are
+        computed over the *covered* slots only (``slot_bank[b,
+        latent_valid[b]]``); a clip with < 2 covered slots contributes
+        0.0. Under K=80 sparse per-clip DK coverage the uncovered slots
+        are empty-parcel pools (near-identical / degenerate vectors) that
+        would otherwise dominate the within-clip redundancy estimate.
+        ``None`` (default) keeps the legacy all-``L`` behaviour.
 
     Threshold kwargs override the locked defaults for sister sweeps and
     the BT-Lite preflight calibration.
@@ -158,10 +167,27 @@ def slot_redundancy_monitor(
         )
 
     B, L, _ = slot_bank.shape
+    if latent_valid is not None:
+        if tuple(latent_valid.shape) != (B, L):
+            raise ValueError(
+                f"latent_valid must be (B, L) = {(B, L)}; "
+                f"got shape {tuple(latent_valid.shape)}"
+            )
+        if latent_valid.dtype != torch.bool:
+            raise ValueError(
+                f"latent_valid must be bool; got dtype {latent_valid.dtype}"
+            )
+
     per_clip_pct95s: list[float] = []
     diag_zeroed_means: list[float] = []
     for b in range(B):
-        mat = _pairwise_cosine(slot_bank[b])              # (L, L)
+        bank_b = slot_bank[b]                             # (L, d)
+        if latent_valid is not None:
+            bank_b = bank_b[latent_valid[b]]              # (n_covered, d)
+        # n_covered < 2 → _pairwise_cosine yields an (n, n) matrix whose
+        # pct95 / diag-zeroed-mean helpers both return 0.0, so such a clip
+        # contributes 0 to the batch averages (can't measure redundancy).
+        mat = _pairwise_cosine(bank_b)                    # (n_covered, n_covered)
         per_clip_pct95s.append(_upper_triangular_pct95(mat))
         diag_zeroed_means.append(_diag_zeroed_mean(mat))
     per_clip_cos_pct95 = (
