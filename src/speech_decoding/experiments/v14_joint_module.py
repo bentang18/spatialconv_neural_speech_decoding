@@ -1,56 +1,49 @@
-"""B2.2 — :class:`V14JointBrainModule` Lightning module.
+"""B36 WS-B — :class:`V14JointBrainModule` masked-JEPA Lightning module.
 
-Composes the B31 V-JEPA-2-canonical 2-term v14 joint SSL loss via
-:func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
-(see [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]]):
+Composes the B36 paradigm-B masked-JEPA SSL loss (one active term per phase,
+B9 — see [[project_v14_b36_perparcel_pool_structured_jepa_2026_06_01]]),
+replacing the inert B31 2-term self-distill (full input both sides, no mask,
+no predictor):
 
-* **Default ``loss_variant="b31_default"``** computes 2 terms — pure-L1
-  ``L_pre_frame @ M2`` (V-JEPA 2 §2.1 Eq 1) + pure-L1
-  ``L_post_frame @ M4`` gated by the B30 single-source-of-truth
-  ``latent_valid``. ``L_mid_slot`` and ``L_post_utterance`` are dropped
-  from the default surface; PMA is constructed only for the P3 readout.
-* **Sister variants** (P0 falsifiers) re-add the dropped terms:
-  ``b31_plus_m3`` adds ``L_mid_slot @ LN_mid(M3)``; ``b31_plus_utt``
-  adds ``L_post_utterance @ LN_utt(M4)-PMA``; ``b31_plus_both`` restores
-  the pre-B31 4-term default.
-* student encoder forwarded with ``return_taps=True`` →
-  ``{"M2", "M3", "M4"}`` (M3 tap kept for diagnostics + sisters).
-* EMA teacher (full-input contract per B26) forwarded on the unmasked
-  batch → same taps under ``torch.no_grad``.
-* ``LN_frame`` (and conditionally ``LN_mid`` / ``LN_utt`` per sister)
-  are student-owned with EMA-mirrored teacher copies.
-* :func:`compute_v14_ssl_losses` returns the
-  :class:`V14TotalLossBreakdown`; ``.total`` is the scalar the optimiser
-  steps on.
+* **P1 (``phase="p1"``)** — front-end M2 masked JEPA. A structured 1D
+  spectro-temporal band ``token_mask`` (6/03 lock, held-out 0.50: whole
+  time-columns ∪ whole freq-rows) zeroes the masked front-end cells UPSTREAM
+  of the token blocks (paradigm A — the token blocks self-predict). Loss = L1
+  between the student's masked M2 tokens and the EMA teacher's full-input M2
+  (post-``frontend_ln``). The pool / inter-parcel encoder / predictor are
+  downstream of M2 → no gradient. The per-cell Bernoulli ``"random"`` shape is
+  the R-m2-random must-beat sister.
+* **P2 (``phase="p2"``)** — parcel M4 masked JEPA (paradigm B). A parcel
+  ``"tube"`` mask (6/03 lock: a uniform-random 0.20 subset of COVERED parcels,
+  each masked across ALL time-patches) drops the masked parcels' electrodes
+  upstream AND excludes them from the inter-parcel self-attention keys
+  (visible-only encoder). The
+  :class:`~speech_decoding.models.v14_encoder.JepaPredictor` (cross-time)
+  predicts the masked parcel-time M4 cells from the visible parcel tokens;
+  target = EMA teacher full-input M4 (post-``encoder_ln``). The
+  contiguous-time-block shape is the ``"time_block"`` sister (pairs with a
+  ``co_temporal`` predictor — never ``cross_time``; that is the H1 leak).
+
+Both targets are ``detach()``ed (stop-grad on the EMA teacher, V-JEPA 2 §2.1)
+and normalized only by the encoder's own terminal LayerNorm — there is NO
+separate ``ln_frame`` head (B6 / B36 §4 canonical V-JEPA target-norm). The
+predictor is student-only (never EMA-mirrored).
 
 EMA discipline (B26 lock 2026-05-27 PM): fixed τ=0.99925 via
 :func:`speech_decoding.ssl.ema.fixed_ema_schedule`; ``on_train_batch_end``
 applies :meth:`EmaTeacher.update_from` so the teacher trails the student
 exactly one optimiser step behind.
 
-Predictor (B03c paradigm-B) is wired *optionally* — when the dispatch
-plumbs a :class:`speech_decoding.models.v14_encoder.Predictor2Block` into
-the module via ``predictor=...``, ``L_pre_frame`` is computed on the
-predictor's output at masked positions per the B03 lock. Until B2.3
-lands the masking extractors + the patch-drop / shaft-drop forward
-threading, the predictor stays ``None`` and ``L_pre_frame`` falls back
-to a direct ``F.l1_loss(student_M2, stop_grad(teacher_M2))`` over the
-full M2 tap — a degenerate fallback that keeps the aggregator path
-unit-testable end-to-end without the B2.3 plumbing. The fallback's
-graph-level structure (per-element L1 between student-pred and detached
-teacher-target) IS the structural contract the predictor path will
-preserve once it lands.
-
 Batch contract (B30 single source of truth) — ``batch.data`` keys read::
 
   electrode_tokens : (B, C, T_bins, F_bins)  required
   support          : (B, C, K)               required
   valid_mask       : (B, C) bool             optional (default: all-True)
-  shaft_mask       : (B, C) bool             optional — student-only,
-                                             never passed to teacher.
   subject_subtype  : (B,) or (B, 1[, 1]) int optional
   ref_idx          : (B,) or (B, 1[, 1]) int optional
-  lambda_anat      : (B,) float              optional (default: 1.0)
+
+(``shaft_mask`` is dropped from the B36 default SSL path — WS-H5; the mask is
+the SSL signal now, not a shaft drop.)
 
 Sister-flag gating: ``V14JointBrainModule`` honours
 ``latent_valid_override`` / ``sa_mask_mode`` only at their lock-default
@@ -77,84 +70,48 @@ from speech_decoding.experiments.monitors import (
     teacher_rank_monitor,
 )
 from speech_decoding.models.v14_encoder import (
-    V14ParcelCollapsePMA,
+    JepaPredictor,
     V14ParcelPerceiverModel,
     _compute_latent_valid,
-)
-from speech_decoding.ssl.aggregator import (
-    LossVariant,
-    compute_v14_ssl_losses,
-    variant_wants_m3,
-    variant_wants_utt,
+    compute_latent_valid_3way,
 )
 from speech_decoding.ssl.ema import (
     EmaTeacher,
     assert_teacher_full_input,
     fixed_ema_schedule,
-    stop_grad,
 )
-from speech_decoding.ssl.total_loss import V14TotalLossBreakdown
+from speech_decoding.ssl.mask import (
+    sample_m2_mask,
+    sample_m4_mask,
+    validate_m4_coupling,
+)
+from speech_decoding.ssl.masked_jepa import (
+    MaskedJepaBreakdown,
+    p1_frontend_m2_loss,
+    p2_parcel_m4_loss,
+)
 
 
 _LossForm = tp.Literal["l1", "mse"]
-
-# B31 sister-arm gating is single-sourced in
-# ``speech_decoding.ssl.aggregator``; we just rebind under the local
-# pre-fix names so existing call sites stay legible.
-_variant_wants_m3 = variant_wants_m3
-_variant_wants_utt = variant_wants_utt
+_Phase = tp.Literal["p1", "p2"]
 
 
 class _V14StudentBundle(nn.Module):
-    """All student-side modules that EMA-mirror into the teacher.
+    """The student encoder, wrapped so the :class:`EmaTeacher` deepcopy
+    mirrors exactly the modules that supply the JEPA targets.
 
-    Holds the encoder, ``ln_frame`` (always present — half of the B31
-    2-term default), and, conditionally on ``loss_variant``, ``ln_mid``,
-    ``ln_utt``, and the parcel-collapse PMA. ``EmaTeacher`` deepcopies
-    this bundle so whatever heads exist on the student also mirror on
-    the teacher.
-
-    **B31 lock 2026-05-28 PM**: under ``loss_variant="b31_default"`` the
-    ``ln_mid`` / ``ln_utt`` / ``pma`` modules are NOT constructed. The
-    PMA query stops accumulating gradient in the joint SSL phase; it
-    gets its first gradient at P3 (Whisper-L8 distillation, separate
-    Experiment) and is frozen at P4. Sister variants reconstruct only
-    the heads the chosen falsifier needs.
-
-    The bundle's ``forward`` is the encoder forward; the heads above are
-    accessed as attributes by :class:`V14JointBrainModule` per-tap, with
-    runtime guards on the loss-variant gating.
+    B36 §4 (canonical V-JEPA target-norm) deletes the per-loss-head
+    ``ln_frame`` / ``ln_mid`` / ``ln_utt`` and the SSL-phase PMA: the
+    target is the EMA teacher's terminal-LN tap (``frontend_ln`` at M2,
+    ``encoder_ln`` at M4), both INSIDE the encoder. So the bundle is now
+    just the encoder. The predictor is student-only and lives on the
+    :class:`V14JointBrainModule` (never EMA-mirrored — V-JEPA predictors
+    are not part of the teacher).
     """
 
-    def __init__(
-        self,
-        *,
-        encoder: V14ParcelPerceiverModel,
-        d_model: int,
-        pma_n_heads: int,
-        loss_variant: LossVariant = "b31_default",
-    ) -> None:
+    def __init__(self, *, encoder: V14ParcelPerceiverModel) -> None:
         super().__init__()
         self.encoder = encoder
-        # ln_frame is always present — it's the LN applied to M4 for the
-        # always-on L_post_frame term in the B31 default.
-        self.ln_frame = nn.LayerNorm(d_model)
-        # Sister-only heads. Construction is conditional so the default
-        # joint SSL phase ships with no PMA / LN_mid / LN_utt on the
-        # graph (closes the B19-vs-code PMA-training drift).
-        if _variant_wants_m3(loss_variant):
-            self.ln_mid = nn.LayerNorm(d_model)
-        else:
-            self.ln_mid = None  # type: ignore[assignment]
-        if _variant_wants_utt(loss_variant):
-            self.ln_utt = nn.LayerNorm(d_model)
-            # PMA freeze=False: when the utterance sister fires, its PMA
-            # query trains alongside the rest of the student. EMA
-            # teacher mirrors it.
-            self.pma = V14ParcelCollapsePMA(d_model, pma_n_heads, freeze=False)
-        else:
-            self.ln_utt = None  # type: ignore[assignment]
-            self.pma = None  # type: ignore[assignment]
 
     def forward(self, **encoder_kwargs: tp.Any) -> dict[str, Tensor]:
         out = self.encoder(return_taps=True, **encoder_kwargs)
@@ -198,18 +155,25 @@ def _latent_valid_from_batch(
 
 
 class V14JointBrainModule(pl.LightningModule):
-    """B29 Item 1 + B30 lock — joint SSL Lightning module.
+    """B36 WS-B — staged masked-JEPA SSL Lightning module.
 
     Owns:
 
-    * ``student`` — :class:`_V14StudentBundle` with the encoder + 3 LN
-      heads + PMA.
+    * ``student`` — :class:`_V14StudentBundle` (the encoder; ``frontend_ln``
+      / ``encoder_ln`` are inside it and supply the terminal-LN targets).
     * ``teacher`` — :class:`EmaTeacher` deepcopy of ``student``,
       ``requires_grad=False`` on every parameter, τ=0.99925 fixed.
-    * ``predictor`` — optional :class:`Predictor2Block` for the B03c
-      paradigm-B masked-patch path. ``None`` until B2.3 lands the patch-
-      drop forward threading; the fallback L_pre_frame path is documented
-      on the module docstring.
+    * ``predictor`` — the student-only :class:`JepaPredictor` (paradigm-B
+      parcel predictor). Constructed here if not supplied; used only in P2
+      (P1 is paradigm A — the front-end token blocks self-predict). Never
+      EMA-mirrored.
+
+    ``phase`` selects which single term is active (B9):
+    ``"p1"`` → front-end M2 (``m2_mask_type`` bands/random, held-out
+    ``m2_mask_ratio``); ``"p2"`` → parcel M4 (``m4_mask_type`` tube/time_block,
+    ``m4_mask_ratio`` of covered parcels). ``predictor_scope`` must couple with
+    ``m4_mask_type`` (tube↔cross_time, time_block↔co_temporal); the constructor
+    enforces this and rejects the H1-leak pairing.
 
     Sister-flag gates: non-default ``latent_valid_override`` /
     ``sa_mask_mode`` raise :class:`NotImplementedError` at construction
@@ -230,11 +194,20 @@ class V14JointBrainModule(pl.LightningModule):
         *,
         encoder: V14ParcelPerceiverModel,
         optim_config: BaseOptimizer,
-        pma_n_heads: int = 8,
+        phase: _Phase = "p1",
+        m2_mask_type: str = "bands",
+        m2_mask_ratio: float = 0.50,
+        m2_time_band_floor: int = 2,
+        m2_freq_band_floor: int = 1,
+        m2_time_freq_split: tp.Optional[tuple[float, float]] = None,
+        m4_mask_type: str = "tube",
+        m4_mask_ratio: float = 0.20,
+        m4_n_min_visible: int = 3,
+        predictor_scope: str = "cross_time",
+        mask_seed: int = 0,
         ema_tau: float = 0.99925,
         loss_form: _LossForm = "l1",
-        loss_variant: LossVariant = "b31_default",
-        predictor: tp.Optional[nn.Module] = None,
+        predictor: tp.Optional[JepaPredictor] = None,
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
     ) -> None:
@@ -258,31 +231,49 @@ class V14JointBrainModule(pl.LightningModule):
                 "row B30-dispatch-sister-flags."
             )
         if not 0.0 < ema_tau < 1.0:
-            raise ValueError(
-                f"ema_tau must be in (0.0, 1.0); got {ema_tau}"
-            )
-        if loss_variant not in tp.get_args(LossVariant):
-            raise ValueError(
-                f"loss_variant={loss_variant!r} not in "
-                f"{tp.get_args(LossVariant)}"
+            raise ValueError(f"ema_tau must be in (0.0, 1.0); got {ema_tau}")
+        if phase not in tp.get_args(_Phase):
+            raise ValueError(f"phase={phase!r} not in {tp.get_args(_Phase)}")
+        # 6/03 masking lock: mask shape ↔ predictor scope must move as a pair,
+        # or the M4 SSL task leaks (time_block+cross_time = the H1 leak). Cheap
+        # insurance at construction, before any step runs.
+        validate_m4_coupling(m4_mask_type, predictor_scope)
+        # The co_temporal predictor (the time_block sister's other half) is not
+        # built — only the cross_time JepaPredictor exists. Gate it the same way
+        # as the other not-yet-landed sister falsifiers above so the time_block
+        # SSL path fails loud at construction rather than silently mis-predicting.
+        if predictor_scope != "cross_time":
+            raise NotImplementedError(
+                f"predictor_scope={predictor_scope!r} (the M4 'time_block' "
+                "sister's co_temporal predictor) has not landed — only the "
+                "cross_time JepaPredictor is built. See WS-B6 / "
+                "reports/b36_masking_handoff_2026_06_03.md."
             )
 
-        self.student = _V14StudentBundle(
-            encoder=encoder,
-            d_model=encoder.d_model,
-            pma_n_heads=pma_n_heads,
-            loss_variant=loss_variant,
-        )
-        # B26 lock: fixed τ via EmaTeacher's coeff_schedule.
+        self.student = _V14StudentBundle(encoder=encoder)
+        # B26 lock: fixed τ via EmaTeacher's coeff_schedule. The teacher
+        # deepcopies the encoder (incl. frontend_ln / encoder_ln) — the
+        # terminal-LN targets are EMA-mirrored automatically (B1).
         self.teacher = EmaTeacher(
             self.student, coeff_schedule=fixed_ema_schedule(tau=ema_tau),
         )
-        self.predictor = predictor
+        # Student-only paradigm-B predictor (B2). NOT part of the teacher.
+        self.predictor = predictor or JepaPredictor(encoder.d_model)
         self.optim_config = optim_config
+        self._phase: _Phase = phase
+        self._m2_mask_type = m2_mask_type
+        self._m2_mask_ratio = m2_mask_ratio
+        self._m2_time_band_floor = m2_time_band_floor
+        self._m2_freq_band_floor = m2_freq_band_floor
+        self._m2_time_freq_split = m2_time_freq_split
+        self._m4_mask_type = m4_mask_type
+        self._m4_mask_ratio = m4_mask_ratio
+        self._m4_n_min_visible = m4_n_min_visible
+        self._predictor_scope = predictor_scope
+        self._mask_seed = mask_seed
         self._m_sub_slots = encoder.m_sub_slots
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
-        self._loss_variant: LossVariant = loss_variant
 
         # MON-GRAD-SPIKE-DIVERGENCE persistent EMA buffer. ``0.0`` seeds
         # the first step (the monitor skips spike detection until the
@@ -294,18 +285,80 @@ class V14JointBrainModule(pl.LightningModule):
             persistent=True,
         )
 
+    def _trainable_parameters(self) -> tp.Iterator[nn.Parameter]:
+        """Student encoder + predictor params (the teacher is frozen)."""
+        yield from self.student.parameters()
+        yield from self.predictor.parameters()
+
+    # ------------------------------------------------------------------
+    # B36 WS-E (E3/E4): cross-phase weight handoff
+    # ------------------------------------------------------------------
+
+    def transferable_state(self) -> dict[str, dict[str, Tensor]]:
+        """Components that carry forward to the next phase (E4).
+
+        P1/P2 export ONLY the shared encoder. The student-only predictor and
+        the EMA teacher are not transferred — the predictor is re-trained per
+        phase, and the next phase re-syncs its teacher from the loaded
+        student. P3/P4 modules extend this with a ``"pma"`` entry; the handoff
+        loader matches on the intersection of component names, so the P3-only
+        ``StudentWhisperProjector`` is simply absent here and never crosses to
+        P4 (E4 "projector keys dropped").
+        """
+        return {"encoder": self.student.encoder.state_dict()}
+
+    def load_transferable_state(
+        self, state: dict[str, dict[str, Tensor]], *, strict: bool = True,
+    ) -> None:
+        """Warm-start from a prior phase's :meth:`transferable_state` (E4).
+
+        Loads the ``"encoder"`` component into the student encoder with
+        ``strict=True`` — a missing/unexpected encoder key is a hard error
+        (the early warning that the encoder topology drifted between phases,
+        per SCAFFOLD-08). After the student is warm-started the EMA teacher is
+        re-synced to it so the V-JEPA target starts == the student (the
+        construction-time deepcopy held the cold init). Components this module
+        does not own (e.g. ``"pma"`` from a P3/P4 snapshot) are ignored.
+        """
+        if "encoder" not in state:
+            raise KeyError(
+                "transferable state has no 'encoder' component; cannot "
+                f"warm-start the SSL encoder. Got keys: {sorted(state)}."
+            )
+        # strict=True raises RuntimeError on any missing/unexpected key.
+        self.student.encoder.load_state_dict(state["encoder"], strict=strict)
+        # Re-sync the EMA teacher to the freshly-loaded student (the __init__
+        # deepcopy captured the cold init). Teacher params stay frozen.
+        self.teacher.model.load_state_dict(self.student.state_dict(), strict=True)
+        for p in self.teacher.model.parameters():
+            p.requires_grad_(False)
+
     # ------------------------------------------------------------------
     # Batch ingest
     # ------------------------------------------------------------------
 
     def _extract_student_kwargs(
         self, batch_data: dict[str, Tensor],
-    ) -> tuple[dict[str, tp.Any], tp.Optional[Tensor]]:
+    ) -> dict[str, tp.Any]:
         """Pull student-forward kwargs from the batch dict.
 
-        Returns ``(kwargs, shaft_mask)`` — ``shaft_mask`` is kept
-        separate so the teacher forward can drop it (B26 full-input
-        contract).
+        ``shaft_mask`` is intentionally NOT threaded — B36 (WS-H5) drops
+        the shaft drop from the default SSL path; the JEPA token /
+        parcel-time mask IS the SSL signal now, sampled per-step in
+        :meth:`_sample_phase_mask` rather than read from the batch.
+
+        ``freq_patch_valid`` (B36 C5, SWEC corpus-valid freq prefix) is also
+        NOT threaded yet, by design. The capability is fully built downstream
+        — the M2 sampler (:func:`sample_token_band_mask`), the front-end loss
+        (:func:`p1_frontend_m2_loss`) and the encoder forward all accept it —
+        but the live wiring (which batch key carries it, the per-clip vs
+        shared-prefix shape in a mixed-corpus batch, and the valid-bin RANGE
+        itself) is a Ben-gated WS-H decision tied to the unbuilt SWEC/AJILE12
+        loaders (all ``NotImplementedError`` today). BT (the capstone corpus)
+        is all-valid ⇒ ``None`` ⇒ no-op, so leaving it ``None`` here is exact
+        for every currently-runnable path. WS-H threads it through this method
+        + :meth:`_sample_phase_mask` + :meth:`_step` when SWEC P1 lands.
+        See ``docs/neuroprobe/v14_blockers.md`` (C5 / freq_patch_valid row).
         """
         if "electrode_tokens" not in batch_data:
             raise KeyError(
@@ -327,10 +380,9 @@ class V14JointBrainModule(pl.LightningModule):
         if "valid_mask" in batch_data:
             kwargs["valid_mask"] = batch_data["valid_mask"]
 
-        # Per-clip conditioning + λ_anat are looked up by the encoder
-        # itself; the encoder forward tolerates ``None``. Trailing
-        # NeuralSet-collated singleton axes get stripped to match the
-        # encoder's internal handling.
+        # Per-clip conditioning is looked up by the encoder itself; the
+        # encoder forward tolerates ``None``. Trailing NeuralSet-collated
+        # singleton axes get stripped to match the encoder's handling.
         if "subject_subtype" in batch_data:
             kwargs["subject_subtype"] = _maybe_drop_singleton_trailing(
                 batch_data["subject_subtype"],
@@ -339,180 +391,150 @@ class V14JointBrainModule(pl.LightningModule):
             kwargs["ref_idx"] = _maybe_drop_singleton_trailing(
                 batch_data["ref_idx"],
             )
-        if "lambda_anat" in batch_data:
-            kwargs["lambda_anat"] = _maybe_drop_singleton_trailing(
-                batch_data["lambda_anat"],
-            )
 
-        shaft_mask = batch_data.get("shaft_mask")
-        return kwargs, shaft_mask
+        return kwargs
 
     # ------------------------------------------------------------------
     # Per-step composition
     # ------------------------------------------------------------------
 
-    def _compose_l_pre_frame(
-        self,
-        *,
-        student_m2: Tensor,
-        teacher_m2: Tensor,
-    ) -> Tensor:
-        """B03c paradigm-B predictor path when wired; fallback otherwise.
+    def _sample_phase_mask(
+        self, *, electrode_tokens: Tensor, support: Tensor,
+    ) -> dict[str, Tensor]:
+        """Sample the active phase's JEPA mask (B3/B4).
 
-        Until B2.3 lands the patch-drop forward threading and the
-        masking extractor, ``self.predictor is None`` and the fallback
-        applies pure L1 between student M2 and detached teacher M2 over
-        the full tap — degenerate but graph-correct so the joint trainer
-        can be exercised end-to-end without B2.3.
+        Returns the encoder-forward mask kwarg for the student
+        (``token_mask`` in P1, ``parcel_time_mask`` in P2). The mask is drawn
+        from a per-step :class:`torch.Generator` seeded by
+        ``mask_seed + global_step`` so a given (seed, step) reproduces it
+        bit-for-bit while successive steps differ. Falls back to
+        ``global_step = 0`` when no trainer is attached (unit tests call
+        ``_step`` directly).
         """
-        if self.predictor is None:
-            # Fallback: pure L1 over the full M2 tap. Detach teacher
-            # branch per B26 JEPA contract.
-            return torch.nn.functional.l1_loss(
-                student_m2, stop_grad(teacher_m2),
-                reduction="mean",
+        device = electrode_tokens.device
+        C, F_p, T_p = self.student.encoder.patch_grid_shape(electrode_tokens)
+        B = electrode_tokens.shape[0]
+        try:
+            step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            step = 0
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self._mask_seed + step)
+        if self._phase == "p1":
+            # freq_patch_valid omitted (= None = all-valid) — see
+            # _extract_student_kwargs: SWEC corpus-valid confinement is the
+            # Ben-gated WS-H wiring; BT (capstone) is all-valid ⇒ no-op.
+            token_mask = sample_m2_mask(
+                (B, C, F_p, T_p),
+                mask_type=self._m2_mask_type,
+                held_out_ratio=self._m2_mask_ratio,
+                generator=gen,
+                time_band_floor=self._m2_time_band_floor,
+                freq_band_floor=self._m2_freq_band_floor,
+                time_freq_split=self._m2_time_freq_split,
+                device=device,
             )
-        # Predictor path (B03c). The predictor accepts ``(B, N, d)``;
-        # the caller is responsible for flattening the per-electrode M2
-        # tap into the predictor's expected shape. This branch is here
-        # for forward-compatibility but is not yet exercised — it's
-        # gated on B2.3 wiring the patch-mask into the encoder
-        # forward + threading visible/masked indices through.
-        raise NotImplementedError(
-            "V14JointBrainModule.predictor branch is gated on B2.3 "
-            "(patch-mask + visible/masked-index threading from the "
-            "extractor through to predictor input). See "
-            "docs/neuroprobe/v14_blockers.md row B03 shaft-mask + "
-            "REF-01/REF-02."
+            return {"token_mask": token_mask}
+        parcel_time_mask, _drop = sample_m4_mask(
+            support,
+            n_time_patches=T_p,
+            mask_type=self._m4_mask_type,
+            mask_ratio=self._m4_mask_ratio,
+            n_min_visible=self._m4_n_min_visible,
+            generator=gen,
+        )
+        return {"parcel_time_mask": parcel_time_mask}
+
+    def _step(self, batch_data: dict[str, Tensor]) -> MaskedJepaBreakdown:
+        """One masked-JEPA forward + loss pass (B36 WS-B, B5/B6/B7/B8).
+
+        P1 (paradigm A): the front-end masked cells are zeroed UPSTREAM of
+        the token blocks, so the blocks self-predict masked M2; loss =
+        L1(student M2[masked], sg teacher M2[masked]) — pool / inter-parcel
+        encoder / predictor are downstream of M2 and get no gradient.
+
+        P2 (paradigm B): the visible-only student encoder produces M4; the
+        :class:`JepaPredictor` predicts the masked parcel-time M4 cells from
+        the visible parcel tokens; loss = L1(prediction, sg teacher M4[masked]).
+
+        Exactly one term is active per phase (B9). The teacher always
+        encodes the FULL input (B7 — :func:`assert_teacher_full_input`).
+        """
+        student_kwargs = self._extract_student_kwargs(batch_data)
+        mask_kwargs = self._sample_phase_mask(
+            electrode_tokens=student_kwargs["electrode_tokens"],
+            support=student_kwargs["support"],
         )
 
-    def _step(
-        self, batch_data: dict[str, Tensor],
-    ) -> V14TotalLossBreakdown:
-        """One forward + loss compose pass. Returns the breakdown so the
-        Lightning step can log per-term scalars."""
-        student_kwargs, shaft_mask = self._extract_student_kwargs(batch_data)
+        # P1 (paradigm A) reads ONLY M2, so skip the downstream pool /
+        # inter-parcel encoder on both the student and teacher forwards
+        # (M2 is taken pre-pool and carries no downstream P1 gradient). P2
+        # (paradigm B) needs the full encoder output M4.
+        m2_only = self._phase == "p1"
 
-        # ── Student forward (with shaft_mask if present) ──
-        student_taps_kwargs = dict(student_kwargs)
-        if shaft_mask is not None:
-            student_taps_kwargs["shaft_mask"] = shaft_mask
-        student_taps = self.student(**student_taps_kwargs)
+        # ── Student forward (masked / visible-only) ──
+        student_taps = self.student(**student_kwargs, **mask_kwargs, m2_only=m2_only)
 
-        # ── Teacher forward (FULL input, no shaft, no mask). B26 ──
-        # The teacher's ``self.teacher.model`` is the deepcopy of the
-        # student bundle, whose forward already injects
-        # ``return_taps=True`` into the encoder call — passing it again
-        # here would raise "multiple values for keyword argument".
-        assert_teacher_full_input(patch_mask=None, shaft_mask=None)
+        # ── Teacher forward (FULL input — no mask, no shaft). B26 / B7 ──
+        teacher_taps = self._teacher_forward(dict(student_kwargs), m2_only=m2_only)
+
+        if self._phase == "p1":
+            # freq_patch_valid omitted (all-valid) — WS-H threads the SWEC
+            # corpus-valid prefix here alongside the sampler/encoder (C5).
+            return p1_frontend_m2_loss(
+                student_m2=student_taps["M2"],
+                teacher_m2=teacher_taps["M2"],
+                token_mask=mask_kwargs["token_mask"],
+                loss_form=self._loss_form,
+            )
+
+        # ── P2: B8 three-way latent_valid → visible context + masked targets ──
+        visible, target_mask, _teacher_valid = compute_latent_valid_3way(
+            support=student_kwargs["support"],
+            valid_mask=student_kwargs.get("valid_mask"),
+            m_sub_slots=self._m_sub_slots,
+            parcel_time_mask=mask_kwargs["parcel_time_mask"],
+        )
+        return p2_parcel_m4_loss(
+            predictor=self.predictor,
+            student_m4=student_taps["M4"],
+            teacher_m4=teacher_taps["M4"],
+            visible=visible,
+            target_mask=target_mask,
+            loss_form=self._loss_form,
+        )
+
+    def _teacher_forward(
+        self, teacher_kwargs: dict[str, tp.Any], *, m2_only: bool = False,
+    ) -> dict[str, Tensor]:
+        """EMA-teacher FULL-input forward with the B7 tripwire (B26 /
+        V-JEPA 2 §2.1).
+
+        The teacher builds the V-JEPA target from the full UNMASKED input,
+        so ``teacher_kwargs`` (a copy of the student kwargs) must carry NO
+        JEPA mask — the per-step mask lives in a separate ``mask_kwargs``
+        spread into the student ONLY. :func:`assert_teacher_full_input`
+        inspects exactly the kwargs the teacher will receive: if a future
+        refactor ever threads a (partial) ``token_mask`` /
+        ``parcel_time_mask`` into this pass, the guard sees ``False``
+        visibility entries (``~mask``) and raises instead of silently
+        leaking the mask into the target. On the live path both keys are
+        absent ⇒ ``None`` ⇒ full input ⇒ the guard passes.
+        """
+        _t_tok = teacher_kwargs.get("token_mask")
+        _t_par = teacher_kwargs.get("parcel_time_mask")
+        assert_teacher_full_input(
+            patch_mask=None if _t_tok is None else ~_t_tok,
+            shaft_mask=None if _t_par is None else ~_t_par,
+        )
         with torch.no_grad():
-            teacher_taps = self.teacher.model(**student_kwargs)
+            teacher_taps = self.teacher.model(**teacher_kwargs, m2_only=m2_only)
         if not isinstance(teacher_taps, dict):
             raise RuntimeError(
                 "EMA teacher returned a single tensor; expected the M2/M3/M4 "
                 "tap dict (return_taps=True)."
             )
-
-        m2_s, m3_s, m4_s = student_taps["M2"], student_taps["M3"], student_taps["M4"]
-        m2_t, m3_t, m4_t = teacher_taps["M2"], teacher_taps["M3"], teacher_taps["M4"]
-
-        # ── LN heads (student + EMA-mirrored teacher) ──
-        # ln_frame is always on (B31 default + every sister). LN_mid +
-        # LN_utt + PMA are constructed only when the chosen
-        # ``loss_variant`` selects them; we mirror that conditional
-        # construction at the per-tap forward.
-        m4_s_lnframe = self.student.ln_frame(m4_s)
-        m4_t_lnframe = self.teacher.model.ln_frame(m4_t).detach()
-
-        m3_s_lnmid: tp.Optional[Tensor] = None
-        m3_t_lnmid: tp.Optional[Tensor] = None
-        if _variant_wants_m3(self._loss_variant):
-            m3_s_lnmid = self.student.ln_mid(m3_s)
-            m3_t_lnmid = self.teacher.model.ln_mid(m3_t).detach()
-
-        m4_s_lnutt: tp.Optional[Tensor] = None
-        m4_t_lnutt: tp.Optional[Tensor] = None
-        pma_student: tp.Optional[nn.Module] = None
-        pma_teacher: tp.Optional[nn.Module] = None
-        if _variant_wants_utt(self._loss_variant):
-            m4_s_lnutt = self.student.ln_utt(m4_s)
-            m4_t_lnutt = self.teacher.model.ln_utt(m4_t).detach()
-            pma_student = self.student.pma
-            pma_teacher = self.teacher.model.pma
-
-        # ── B30 single source of truth: latent_valid ──
-        latent_valid = _latent_valid_from_batch(
-            support=student_kwargs["support"],
-            valid_mask=student_kwargs.get("valid_mask"),
-            m_sub_slots=self._m_sub_slots,
-        )
-
-        # ── L_pre_frame (predictor path or fallback) ──
-        # The aggregator computes L_pre_frame from (student_m2_pred,
-        # m2_target) via recon_loss; for the fallback path we hand-roll
-        # it here and stub the aggregator's L_pre_frame to zero, then
-        # add ours into the total. That keeps the aggregator's surface
-        # (predictor output vs target) clean once B2.3 wires the
-        # predictor. To avoid double-counting, we route the predictor
-        # path through the aggregator and the fallback path around it.
-        if self.predictor is None:
-            l_pre_frame_fallback = self._compose_l_pre_frame(
-                student_m2=m2_s, teacher_m2=m2_t,
-            )
-            # Compose remaining terms via the aggregator with a zero
-            # scalar M2 pair to make L_pre_frame structurally 0; add the
-            # fallback term to .total below.
-            zero_pair = torch.zeros((), device=m2_s.device, dtype=m2_s.dtype)
-            breakdown = compute_v14_ssl_losses(
-                student_m2_pred=zero_pair,
-                m2_target=zero_pair,
-                m2_valid_mask=None,
-                student_m4_lnframe=m4_s_lnframe,
-                teacher_m4_lnframe=m4_t_lnframe,
-                latent_valid=latent_valid,
-                loss_variant=self._loss_variant,
-                student_m3_lnmid=m3_s_lnmid,
-                teacher_m3_lnmid=m3_t_lnmid,
-                student_m4_lnutt=m4_s_lnutt,
-                teacher_m4_lnutt=m4_t_lnutt,
-                pma_student=pma_student,
-                pma_teacher=pma_teacher,
-                loss_form=self._loss_form,
-            )
-            # Materialize the fallback L_pre_frame term into the total +
-            # breakdown by rebuilding the breakdown (frozen dataclass).
-            total = (
-                breakdown.total
-                - breakdown.l_pre_frame                # subtract zero stub
-                + l_pre_frame_fallback                 # add fallback term
-            )
-            from dataclasses import replace
-            return replace(
-                breakdown, total=total, l_pre_frame=l_pre_frame_fallback,
-            )
-
-        # Predictor path: route through the aggregator's L_pre_frame
-        # branch. (Reached only after B2.3 lands the patch-drop
-        # threading + the predictor input pipeline.)
-        student_m2_pred = self._compose_l_pre_frame(
-            student_m2=m2_s, teacher_m2=m2_t,
-        )  # raises NotImplementedError; reserved for future use
-        return compute_v14_ssl_losses(
-            student_m2_pred=student_m2_pred,
-            m2_target=m2_t,
-            m2_valid_mask=None,
-            student_m4_lnframe=m4_s_lnframe,
-            teacher_m4_lnframe=m4_t_lnframe,
-            latent_valid=latent_valid,
-            loss_variant=self._loss_variant,
-            student_m3_lnmid=m3_s_lnmid,
-            teacher_m3_lnmid=m3_t_lnmid,
-            student_m4_lnutt=m4_s_lnutt,
-            teacher_m4_lnutt=m4_t_lnutt,
-            pma_student=pma_student,
-            pma_teacher=pma_teacher,
-            loss_form=self._loss_form,
-        )
+        return teacher_taps
 
     # ------------------------------------------------------------------
     # Lightning hooks
@@ -520,22 +542,16 @@ class V14JointBrainModule(pl.LightningModule):
 
     def _log_breakdown(
         self,
-        breakdown: V14TotalLossBreakdown,
+        breakdown: MaskedJepaBreakdown,
         *,
         step_name: str,
     ) -> None:
+        # B9: exactly one active term per phase — log the scalar + the
+        # masked-cell count (n_masked == 0 ⇒ total is an exact 0).
         self.log(f"{step_name}_loss", breakdown.total, on_epoch=True, prog_bar=True)
-        self.log(f"{step_name}_l_pre_frame", breakdown.l_pre_frame, on_epoch=True)
-        self.log(f"{step_name}_l_post_frame", breakdown.l_post_frame, on_epoch=True)
-        # B31 sister-only terms are ``None`` under the 2-term default.
-        if breakdown.l_mid_slot is not None:
-            self.log(f"{step_name}_l_mid_slot", breakdown.l_mid_slot, on_epoch=True)
-        if breakdown.l_post_utterance is not None:
-            self.log(
-                f"{step_name}_l_post_utterance",
-                breakdown.l_post_utterance,
-                on_epoch=True,
-            )
+        self.log(
+            f"{step_name}_n_masked", float(breakdown.n_masked), on_epoch=True,
+        )
 
     # MON-TEACHER-FEATURE-RANK validation-time subsample cap. The SVD
     # cost is O(min(N, d) * N * d); capping N at 4096 keeps it under
@@ -587,30 +603,31 @@ class V14JointBrainModule(pl.LightningModule):
     def _run_teacher_rank_monitor(
         self,
         *,
-        teacher_m4_lnframe: Tensor,
+        teacher_m4: Tensor,
         latent_valid: Tensor,
         step_name: str,
     ) -> None:
         """MON-TEACHER-FEATURE-RANK (5/28 P0).
 
-        Computes RankMe on the EMA teacher's LN_frame-normalised M4 tap,
-        masked by ``latent_valid`` so SWEC / front-end-only positions
-        don't dilute the rank estimate. Sub-samples to
-        ``_RANKME_N_MAX`` rows to keep the SVD cheap.
+        Computes RankMe on the EMA teacher's M4 tap (already post
+        ``encoder_ln`` — the canonical terminal-LN target, B6), masked by
+        ``latent_valid`` so SWEC / front-end-only positions don't dilute
+        the rank estimate. Sub-samples to ``_RANKME_N_MAX`` rows to keep
+        the SVD cheap.
 
         Wired into ``validation_step`` via :meth:`_monitor_from_step`
         with the val-cadence (Lightning's default = every train epoch),
         which closely approximates the spec's 10k-step probe.
         """
-        if teacher_m4_lnframe.dim() != 4:
+        if teacher_m4.dim() != 4:
             return  # not a (B, L, T, d) tap — skip silently
-        B, L, T, d = teacher_m4_lnframe.shape
+        B, L, T, d = teacher_m4.shape
         if L != latent_valid.shape[1] or B != latent_valid.shape[0]:
             return  # shape mismatch — skip rather than crash a probe
 
         # Expand (B, L) → (B, L, T), flatten, gather only valid rows.
         expanded = latent_valid.unsqueeze(-1).expand(B, L, T)
-        flat = teacher_m4_lnframe.reshape(B * L * T, d)
+        flat = teacher_m4.reshape(B * L * T, d)
         mask_flat = expanded.reshape(B * L * T)
         valid_rows = flat[mask_flat]
         if valid_rows.shape[0] > self._RANKME_N_MAX:
@@ -642,8 +659,8 @@ class V14JointBrainModule(pl.LightningModule):
         self,
         *,
         batch_data: dict[str, Tensor],
-        student_m4_lnframe: Tensor,
-        teacher_m4_lnframe: Tensor,
+        student_m4: Tensor,
+        teacher_m4: Tensor,
         step_name: str,
     ) -> None:
         """MON-MASK-002 (B03d): orphan/visible MSE ratio per step.
@@ -666,8 +683,8 @@ class V14JointBrainModule(pl.LightningModule):
         else:
             orphan_slots = orphan_parcels
         verdict = mask_orphan_ratio_monitor(
-            student_post_frame=student_m4_lnframe,
-            teacher_post_frame=teacher_m4_lnframe,
+            student_post_frame=student_m4,
+            teacher_post_frame=teacher_m4,
             orphan_parcels=orphan_slots,
             parcel_dim=1,  # (B, P, T, d) → parcel at axis 1
         )
@@ -747,7 +764,7 @@ class V14JointBrainModule(pl.LightningModule):
           on validation/test steps only (default Lightning cadence
           ≈ 10k-step probe spec).
         """
-        student_kwargs, _ = self._extract_student_kwargs(batch_data)
+        student_kwargs = self._extract_student_kwargs(batch_data)
 
         latent_valid = _latent_valid_from_batch(
             support=student_kwargs["support"],
@@ -763,22 +780,25 @@ class V14JointBrainModule(pl.LightningModule):
         if not (needs_orphan or needs_rankme):
             return
 
+        # The M4 tap is already post-``encoder_ln`` (B6 canonical terminal
+        # LN) — the monitors read it directly; there is no separate
+        # ``ln_frame`` head any more. The monitor forwards are FULL-input
+        # (no JEPA mask) so they measure the unmasked feature geometry.
         with torch.no_grad():
             teacher_taps = self.teacher.model(**student_kwargs)
-            m4_t_lnframe = self.teacher.model.ln_frame(teacher_taps["M4"])
+            m4_t = teacher_taps["M4"]
 
             if needs_orphan:
                 student_taps = self.student(**student_kwargs)
-                m4_s_lnframe = self.student.ln_frame(student_taps["M4"])
                 self._run_mask_orphan_monitor(
                     batch_data=batch_data,
-                    student_m4_lnframe=m4_s_lnframe,
-                    teacher_m4_lnframe=m4_t_lnframe,
+                    student_m4=student_taps["M4"],
+                    teacher_m4=m4_t,
                     step_name=step_name,
                 )
             if needs_rankme:
                 self._run_teacher_rank_monitor(
-                    teacher_m4_lnframe=m4_t_lnframe,
+                    teacher_m4=m4_t,
                     latent_valid=latent_valid,
                     step_name=step_name,
                 )
@@ -800,7 +820,10 @@ class V14JointBrainModule(pl.LightningModule):
         sq_sum = torch.zeros(
             (), device=self._grad_ema_l2.device, dtype=torch.float32,
         )
-        for p in self.student.parameters():
+        # Student encoder + predictor both carry grads (the teacher is
+        # frozen). P1 leaves the predictor grad-free (paradigm A); P2
+        # exercises it — iterating both keeps the L2 correct either way.
+        for p in self._trainable_parameters():
             if p.grad is not None:
                 sq_sum = sq_sum + p.grad.detach().to(torch.float32).pow(2).sum()
         grad_l2 = float(sq_sum.sqrt().item())
@@ -833,14 +856,75 @@ class V14JointBrainModule(pl.LightningModule):
         # internally; coeff is fixed at τ=0.99925 under the B26 lock.
         self.teacher.update_from(self.student)
 
-    def configure_optimizers(self):  # type: ignore[override]
-        try:
-            return self.optim_config.build(
-                self.student.parameters(),
-                total_steps=self.trainer.estimated_stepping_batches,
+    # B36 WS-E (E2): discriminative-LR factor for the front-end param group
+    # in P2. The front-end was pretrained in P1, so it rides at base_lr/10
+    # while the freshly-trained pool / inter-parcel encoder / predictor get
+    # the full base LR (B36 §7 "front-end @ LR/10; discriminative unfreeze").
+    _FRONTEND_LR_SCALE: tp.ClassVar[float] = 0.1
+
+    def _phase_param_groups(self) -> list[tp.Any]:
+        """Phase-conditional optimizer parameters (B36 WS-E, E1/E2).
+
+        * **P1** — front-end params ONLY (E1). The masked-JEPA loss flows
+          only through the M2 tap (``m2_only``), so the pool / inter-parcel
+          encoder / predictor are already grad-free; excluding them from the
+          optimizer makes "front-end only" the explicit, update-level
+          contract (no stray weight-decay drift on a grad-free param).
+        * **P2** — two param groups (E2): the front-end at ``base_lr / 10``
+          and the parcel side + the student predictor at the full base LR.
+          PyTorch reads each group's ``lr`` as its ``base_lr``, so a
+          downstream scheduler scales both proportionally and the 10:1 ratio
+          holds for the whole run.
+        """
+        frontend, parcel = self.student.encoder.partition_parameters_for_staging()
+        if self._phase == "p1":
+            return frontend
+        predictor_params = list(self.predictor.parameters())
+        base_lr = self._base_lr()
+        return [
+            {"params": frontend, "lr": base_lr * self._FRONTEND_LR_SCALE},
+            {"params": parcel + predictor_params},
+        ]
+
+    def _base_lr(self) -> float:
+        """Base LR from the optim config (E2 needs it to scale the front-end
+        group). ``LightningOptimizer.optimizer`` is a ``BaseTorchOptimizer``
+        with a required ``lr`` field; raise loudly if it is somehow absent so
+        a misconfigured P2 never silently runs without discriminative LR."""
+        inner = getattr(self.optim_config, "optimizer", None)
+        lr = getattr(inner, "lr", None)
+        if lr is None:
+            raise RuntimeError(
+                "P2 discriminative LR (B36 WS-E E2) needs "
+                "optim_config.optimizer.lr; got None. Pass a LightningOptimizer "
+                "whose inner optimizer config exposes a base lr."
             )
+        return float(lr)
+
+    def _estimated_total_steps(self) -> int | None:
+        """``trainer.estimated_stepping_batches`` when attached, else ``None``.
+
+        Mirrors the ``_sample_phase_mask`` / ``_train_monitor_due`` fallback:
+        unit tests call ``configure_optimizers`` with no trainer attached, so
+        the scheduler's ``total_steps`` is simply omitted there.
+        """
+        try:
+            return int(self.trainer.estimated_stepping_batches)
+        except (RuntimeError, AttributeError):
+            return None
+
+    def configure_optimizers(self):  # type: ignore[override]
+        # B36 WS-E: phase-conditional param groups (P1 front-end only; P2
+        # two-group discriminative LR). The teacher is EMA-frozen and never
+        # optimised.
+        params = self._phase_param_groups()
+        total_steps = self._estimated_total_steps()
+        if total_steps is None:
+            return self.optim_config.build(params)
+        try:
+            return self.optim_config.build(params, total_steps=total_steps)
         except TypeError:
-            return self.optim_config.build(self.student.parameters())
+            return self.optim_config.build(params)
 
 
 __all__ = [

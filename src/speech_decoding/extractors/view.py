@@ -2,7 +2,8 @@
 
 T1.5 / 5/22 spec lock (project_v14_imindbench_multistft_pivot_2026_05_22.md):
 v14's front-end-of-record is ``MultiStftView`` — 3 STFTs at common
-hop=256 @ 2048 Hz (8 Hz frame rate, B20 v4 lock 2026-05-24;
+hop=128 @ 2048 Hz (16 Hz front-end rate → 8 Hz latent after the (3,2)
+patch stem; iMINDBench-standard hop, hop=128 re-lock 2026-06-03;
 Nperseg=1024/512/256) feeding a 30-bin ⅓-octave filterbank with per-bin
 STFT routing (k0–k14 from low, k15–k21 from mid, k22–k29 from hi).
 ``LogStftView`` (single-STFT) is preserved as the F-single-STFT sister
@@ -42,8 +43,8 @@ helper ``preprocess_stft(..., preprocess="stft_abs")``. Log compression
 per 1-s @ 2048 Hz Ieeg trigger window (nperseg=512, hop=128). Time-last
 per NeuralSet's :class:`~neuralset.base.TimedArray` convention
 (``frequency = T_bin / duration = 17 Hz``). ``MultiStftView`` instead
-emits ``(C, F=30, T_bin)`` at the common hop=256 → 8 Hz frame rate (B20
-v4 lock). The v14 encoder transposes to ``(C, T_bin, F_bin)`` internally
+emits ``(C, F=30, T_bin)`` at the common hop=128 → 16 Hz front-end rate
+(hop=128 re-lock 2026-06-03). The v14 encoder transposes to ``(C, T_bin, F_bin)`` internally
 via its ``time_last_input`` flag.
 
 STFT params source: Neuroprobe Section D (page 18) — ``nperseg=512``,
@@ -326,6 +327,7 @@ class LogStftView(CARIeegExtractor):
     ``ElectrodeValidMask``.
     """
 
+    sample_rate_hz: int = 2048
     stft_nperseg: int = 512
     stft_poverlap: float = 0.75
     stft_max_freq_hz: float = 150.0
@@ -333,6 +335,14 @@ class LogStftView(CARIeegExtractor):
     stft_log_eps: float = 1e-6
     apply_log: bool = False
     c_max: int | None = None
+
+    def n_time_bins_for_duration(self, duration_s: float) -> int:
+        """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
+        ``hop = nperseg·(1 − poverlap)`` and ``L = round(duration_s · fs)``
+        (``torch.stft(center=True)``). 1 s @ 2048 Hz → 17."""
+        hop = self.stft_nperseg - int(self.stft_nperseg * self.stft_poverlap)
+        n_samples = int(round(duration_s * self.sample_rate_hz))
+        return 1 + n_samples // hop
 
     def _get_timed_array(
         self, event, start: float, duration: float,
@@ -376,12 +386,15 @@ class MultiStftView(CARIeegExtractor):
     on as the F-single-STFT sister cell.
 
     Per-event output: ``(C, F=30, T_bin)`` magnitude filterbank, time-last.
-    Three internal STFTs at common hop=256 @ 2048 Hz (Nperseg=1024/512/256)
+    Three internal STFTs at common hop=128 @ 2048 Hz (Nperseg=1024/512/256)
     feed a 30-bin ⅓-octave filterbank centered at ``2^(k/3)`` Hz for
     ``k ∈ [0, 30)`` (~1 Hz → ~813 Hz). Routing: k0–k14 from low, k15–k21 from
-    mid, k22–k29 from hi (see ``MULTI_STFT_ROUTING``). Hop=256 yields 8 Hz
-    frame rate (B20 v4 lock 2026-05-24); previous default hop=128 (true rate
-    16 Hz; "14.7 Hz" was the pre-B20 mislabel) is retired.
+    mid, k22–k29 from hi (see ``MULTI_STFT_ROUTING``). Hop=128 matches
+    iMINDBench's standardized Multi-STFT (hop=128 across all three nperseg) and
+    yields a 16 Hz front-end frame rate; the downstream (3,2)-stride patch stem
+    halves the time axis to an 8 Hz latent, matching the Whisper teacher (50→8
+    Hz pool, B33) with identity passthrough at Phase-3 (hop=128 re-lock
+    2026-06-03, reverses the B20 v4 hop=256 token-halving choice).
 
     5/25 swap: ``apply_log`` defaults to ``False`` — iMINDBench-parity raw
     magnitude. Set ``apply_log=True`` for the F-log-amplitude sister cell
@@ -389,11 +402,15 @@ class MultiStftView(CARIeegExtractor):
     """
 
     sample_rate_hz: int = 2048
-    # FE-01 (B20 v4 lock 2026-05-24): hop=256 @ 2048 Hz → 8 Hz frame rate.
-    # Matches Whisper teacher-pool target (B06 PM lock 5/25: 50 Hz → 8 Hz),
-    # avoids upsample at Phase-3 student side. Previous default hop=128 (true
-    # rate 16 Hz; "14.7 Hz" was the pre-B20 mislabel) was v3-era and is retired.
-    hop_length: int = 256
+    # FE-01 (hop=128 re-lock 2026-06-03, reverses B20 v4 hop=256): hop=128 @
+    # 2048 Hz → 16 Hz front-end frame rate. Matches iMINDBench's standardized
+    # Multi-STFT (Fig 8 "all STFT sections use a hop length of 128 timepoints";
+    # PopT-v2 uses the same 128-sample hop) — the config behind the 0.663 gate.
+    # The (3,2)-stride patch stem then halves the time axis to an 8 Hz latent
+    # (T_p), which equals the Whisper teacher pool target (50→8 Hz, B33) → the
+    # P3 student is a true identity-rate passthrough, no resample either side.
+    # R-hop-256 (the old B20 default) lives on as a sister cell.
+    hop_length: int = 128
     nperseg_low: int = 1024
     nperseg_mid: int = 512
     nperseg_hi: int = 256
@@ -407,6 +424,18 @@ class MultiStftView(CARIeegExtractor):
     # Pydantic doesn't allow tuple[int, ...] as a default freely — keep
     # the routing as a class-level constant pulled from the module.
     fbank_routing: tp.ClassVar[tuple[int, ...]] = MULTI_STFT_ROUTING
+
+    def n_time_bins_for_duration(self, duration_s: float) -> int:
+        """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
+        ``L = round(duration_s · sample_rate_hz)`` (``torch.stft(center=True)``).
+        At hop=128: 5 s → 81, 1 s → 17 — the nominal 16 Hz × duration (80 / 16)
+        plus the one center-pad frame. The (3,2)-stride patch stem floors both
+        onto the load-bearing patch counts T_p = 40 / 8 (8 Hz latent; RoPE
+        downward-generalizes from 40 to 8, D8). The dispatch uses this to size
+        the encoder's ``n_time_bins`` (RoPE ceiling) from a phase-conditional
+        ``clip_len``."""
+        n_samples = int(round(duration_s * self.sample_rate_hz))
+        return 1 + n_samples // self.hop_length
 
     def _get_timed_array(
         self, event, start: float, duration: float,

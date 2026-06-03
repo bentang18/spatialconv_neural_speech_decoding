@@ -5,25 +5,22 @@ and §"Silent-failure traps (RT)". All tests in this file are marked
 ``@pytest.mark.must_pass_before_dispatch`` and run by the
 ``scripts/dcc/dispatch`` pre-flight gate.
 
-The tests below cover:
+The tests below cover (B36 WS-B masked-JEPA surface):
 
 * **TST03** — V14JointBrainModule state-dict round-trip with
-  ``strict=True``. After B29 collapsed P1 + P2 into a single joint
-  phase, the "P1 ↔ P2 checkpoint strict-mode" question becomes "joint
-  ↔ joint (resume) checkpoint strict-mode" — verifying ``strict=True``
-  is the default at the phase-boundary load is the load-bearing piece.
+  ``strict=True``. The module owns the student encoder + EMA teacher +
+  the student-only ``JepaPredictor``; the strict-load contract must cover
+  every named parameter across all three.
 
-* **TST05** — joint loss is finite under bf16-cast inputs. The
-  aggregator chains L1 + masked-MSE + cross-modal sites; any silent
-  ``-inf`` / NaN cascade through bf16's narrower exponent would
-  invalidate the gradient. TST05 catches the bf16 cascade before
-  dispatch.
+* **TST05** — the masked-JEPA ``_step`` total is finite under bf16-cast
+  inputs. Any silent ``-inf`` / NaN cascade through the front-end +
+  terminal-LN + L1 path would invalidate the gradient; TST05 catches it
+  before dispatch.
 
 * **RT10** — load_state_dict at phase boundaries uses ``strict=True``;
-  ``strict=False`` would silently random-init the predictor / LN heads
-  if a key drifted, masking the load failure with a working forward
-  pass but corrupted weights. The test pins the strict-mode contract by
-  forcing a key-drift case to raise.
+  ``strict=False`` would silently random-init the predictor / encoder if a
+  key drifted, masking the load failure with a working forward pass but
+  corrupted weights. The test pins the strict-mode contract.
 """
 
 from __future__ import annotations
@@ -55,7 +52,7 @@ def _make_tiny_encoder() -> V14ParcelPerceiverModel:
     return V14ParcelPerceiverModel(
         n_freq_bins=4,
         n_time_bins=8,
-        k_parcels=2,
+        k_parcels=5,
         m_sub_slots=1,
         d_model=16,
         n_heads=4,
@@ -66,38 +63,41 @@ def _make_tiny_encoder() -> V14ParcelPerceiverModel:
     )
 
 
-def _make_module(*, loss_variant: str = "b31_default") -> V14JointBrainModule:
+def _make_module(*, phase: str = "p1") -> V14JointBrainModule:
     """Construct a tiny ``V14JointBrainModule`` for pre-dispatch gates.
 
-    The default ``loss_variant="b31_default"`` matches the B31 2-term
-    joint SSL surface. Tests that touch the dropped heads (LN_mid,
-    LN_utt, PMA) — TST03 strict-load + TST05 finiteness — pass
-    ``loss_variant="b31_plus_both"`` to exercise the full historical
-    head set + 4-term breakdown so the strict-load contract still
-    covers every named parameter.
+    The default ``phase="p1"`` is the front-end masked-JEPA term; ``"p2"``
+    exercises the predictor path. The state-dict gates use the union of
+    encoder + EMA-teacher + predictor parameters either way.
     """
     return V14JointBrainModule(
         encoder=_make_tiny_encoder(),
         optim_config=_optim_config(),
-        pma_n_heads=4,
-        loss_variant=loss_variant,  # type: ignore[arg-type]
+        phase=phase,  # type: ignore[arg-type]
     )
 
 
 def _make_synthetic_batch() -> SimpleNamespace:
     torch.manual_seed(0)
-    B, C, T_bins, F_bins, K = 2, 3, 8, 4, 2
+    B, C, T_bins, F_bins, K = 2, 5, 8, 4, 5
     electrode_tokens = torch.randn(B, C, T_bins, F_bins)
+    # Diagonal support: all K parcels covered so the locked M4 tube default
+    # (0.20 of covered, n_min_visible=3) masks 1 of 5 → the P2 bf16 gate
+    # exercises a real masked predictor path, not an empty set.
     support = torch.zeros(B, C, K)
-    support[:, 0, 0] = 1.0
-    support[:, 1, 1] = 1.0
-    support[:, 2, 0] = 0.5
+    for i in range(min(C, K)):
+        support[:, i, i] = 1.0
     valid_mask = torch.ones(B, C, dtype=torch.bool)
     return SimpleNamespace(data={
         "electrode_tokens": electrode_tokens,
         "support": support,
         "valid_mask": valid_mask,
     })
+
+
+# A load-bearing parameter present in every joint-module state dict — the
+# front-end terminal LN (B1). Used by the strict-load drop/round-trip gates.
+_LOAD_BEARING_KEY = "student.encoder.frontend_ln.weight"
 
 
 # ---------------------------------------------------------------------------
@@ -107,55 +107,50 @@ def _make_synthetic_batch() -> SimpleNamespace:
 
 @pytest.mark.must_pass_before_dispatch
 def test_tst03_joint_module_state_dict_strict_roundtrip() -> None:
-    """Save a full joint module state dict, reload it into a fresh
-    module with ``strict=True``, and verify every parameter matches.
-
-    Exercises the ``b31_plus_both`` sister so every dropped head is
-    reconstructed — the strict-load contract must cover the full
-    historical parameter set, not just the B31 2-term default.
-    """
-    src = _make_module(loss_variant="b31_plus_both")
+    """Save a full joint module state dict, reload it into a fresh module
+    with ``strict=True``, and verify every parameter matches — covering the
+    encoder, the EMA teacher mirror, and the student-only predictor."""
+    src = _make_module()
     # Perturb the source so the round-trip is non-trivial.
     with torch.no_grad():
         for p in src.student.parameters():
             p.add_(0.01)
+        for p in src.predictor.parameters():
+            p.add_(0.01)
         src.teacher.update_from(src.student)
 
     state = src.state_dict()
-    dst = _make_module(loss_variant="b31_plus_both")
+    dst = _make_module()
     missing_unexpected = dst.load_state_dict(state, strict=True)
-    # Lightning's load_state_dict returns IncompatibleKeys; on a
-    # strict-True success both lists are empty.
     assert list(missing_unexpected.missing_keys) == []
     assert list(missing_unexpected.unexpected_keys) == []
 
-    # Spot-check: a perturbed student parameter must match after load.
-    src_lnmid = src.student.ln_mid.weight.detach()
-    dst_lnmid = dst.student.ln_mid.weight.detach()
-    torch.testing.assert_close(dst_lnmid, src_lnmid)
-    src_teacher = src.teacher.model.ln_mid.weight.detach()
-    dst_teacher = dst.teacher.model.ln_mid.weight.detach()
-    torch.testing.assert_close(dst_teacher, src_teacher)
+    # Spot-check: a perturbed encoder param + a predictor param + the EMA
+    # teacher mirror must all match after load.
+    torch.testing.assert_close(
+        dst.student.encoder.frontend_ln.weight.detach(),
+        src.student.encoder.frontend_ln.weight.detach(),
+    )
+    torch.testing.assert_close(
+        dst.predictor.output_proj.weight.detach(),
+        src.predictor.output_proj.weight.detach(),
+    )
+    torch.testing.assert_close(
+        dst.teacher.model.encoder.frontend_ln.weight.detach(),
+        src.teacher.model.encoder.frontend_ln.weight.detach(),
+    )
 
 
 @pytest.mark.must_pass_before_dispatch
 def test_tst03_joint_module_strict_load_rejects_dropped_keys() -> None:
-    """The pre-dispatch contract: a state dict missing keys against
-    the target module must raise under ``strict=True``. Silent fallback
-    to ``strict=False`` would random-init the missing tensors and
-    invalidate the resume.
-
-    Exercises ``b31_plus_both`` so ``ln_mid`` is in the parameter set
-    and can be dropped to trigger the contract.
-    """
-    src = _make_module(loss_variant="b31_plus_both")
+    """A state dict missing a load-bearing key must raise under
+    ``strict=True``. Silent fallback to ``strict=False`` would random-init
+    the missing tensor and invalidate the resume."""
+    src = _make_module()
     state = src.state_dict()
-    # Drop a load-bearing key (LN_mid weight) and confirm strict load
-    # rejects.
-    dropped_key = "student.ln_mid.weight"
-    assert dropped_key in state, "state dict layout drifted; update key"
-    del state[dropped_key]
-    dst = _make_module(loss_variant="b31_plus_both")
+    assert _LOAD_BEARING_KEY in state, "state dict layout drifted; update key"
+    del state[_LOAD_BEARING_KEY]
+    dst = _make_module()
     with pytest.raises(RuntimeError, match="Missing key"):
         dst.load_state_dict(state, strict=True)
 
@@ -164,61 +159,48 @@ def test_tst03_joint_module_strict_load_rejects_dropped_keys() -> None:
 def test_tst03_joint_module_strict_load_rejects_extra_keys() -> None:
     """Extra unknown keys also raise — guards against checkpoint drift
     where an upstream module renamed a parameter."""
-    src = _make_module(loss_variant="b31_plus_both")
+    src = _make_module()
     state = src.state_dict()
     state["student.ghost_parameter"] = torch.zeros(4)
-    dst = _make_module(loss_variant="b31_plus_both")
+    dst = _make_module()
     with pytest.raises(RuntimeError, match="Unexpected key"):
         dst.load_state_dict(state, strict=True)
 
 
 # ---------------------------------------------------------------------------
-# TST05 — Joint loss NaN / inf detector under bf16
+# TST05 — masked-JEPA loss NaN / inf detector under bf16
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.must_pass_before_dispatch
-def test_tst05_joint_step_finite_under_bf16_inputs() -> None:
-    """The joint module's ``_step`` returns finite per-term + total
-    losses when the batch is cast to bf16. Catches silent ``-inf`` /
-    NaN cascades through the LN heads + L1 + PMA softmax."""
-    module = _make_module(loss_variant="b31_plus_both")
+@pytest.mark.parametrize("phase", ["p1", "p2"])
+def test_tst05_joint_step_finite_under_bf16_inputs(phase: str) -> None:
+    """The masked-JEPA ``_step`` total is finite when the batch + module are
+    cast to bf16 — catches a silent ``-inf`` / NaN cascade through the
+    front-end, terminal LN, predictor and L1 for both phases."""
+    module = _make_module(phase=phase).to(torch.bfloat16)
     batch = _make_synthetic_batch()
-    # Cast every float tensor in the batch to bf16 — the encoder is
-    # tiny enough to run at bf16 end-to-end on CPU.
     cast_batch_data: dict = {}
     for key, tensor in batch.data.items():
         if isinstance(tensor, torch.Tensor) and tensor.dtype.is_floating_point:
             cast_batch_data[key] = tensor.to(torch.bfloat16)
         else:
             cast_batch_data[key] = tensor
-    # The student bundle's parameters are still fp32 — cast them too so
-    # the matmul stays homogeneous.
-    module = module.to(torch.bfloat16)
     breakdown = module._step(cast_batch_data)
-    # ``b31_plus_both`` reconstructs all 4 SSL terms so the bf16 NaN
-    # detector covers every loss-head path. Skip the None-typed defaults
-    # via the `if term is not None` guard so the test still parses on the
-    # 2-term default branch.
-    for label, term in (
-        ("l_pre_frame", breakdown.l_pre_frame),
-        ("l_mid_slot", breakdown.l_mid_slot),
-        ("l_post_frame", breakdown.l_post_frame),
-        ("l_post_utterance", breakdown.l_post_utterance),
-        ("total", breakdown.total),
-    ):
-        assert term is not None, f"{label} unexpectedly None under b31_plus_both"
-        assert torch.isfinite(term).all(), f"{label} is non-finite under bf16"
+    assert torch.isfinite(breakdown.total).all(), (
+        f"masked-JEPA total is non-finite under bf16 (phase={phase})"
+    )
 
 
 @pytest.mark.must_pass_before_dispatch
 def test_tst05_joint_step_nan_input_propagates_to_total() -> None:
-    """Sanity check the detector itself: a NaN-seeded input MUST yield
-    a non-finite total. Otherwise TST05 would silently pass on a true
-    NaN cascade because the aggregator absorbed the NaN."""
+    """Sanity-check the detector: a NaN-seeded input MUST yield a non-finite
+    total. Otherwise TST05 would silently pass on a true NaN cascade."""
     module = _make_module()
     batch = _make_synthetic_batch()
-    batch.data["electrode_tokens"][0, 0, 0, 0] = float("nan")
+    # NaN every sample of electrode 0 so the masked set (ratio 0.5 over that
+    # electrode's front-end cells) is guaranteed to gather a NaN target.
+    batch.data["electrode_tokens"][:, 0, :, :] = float("nan")
     breakdown = module._step(batch.data)
     assert not torch.isfinite(breakdown.total).all(), (
         "NaN-seeded input must propagate to total; the gate cannot pass "
@@ -233,15 +215,11 @@ def test_tst05_joint_step_nan_input_propagates_to_total() -> None:
 
 @pytest.mark.must_pass_before_dispatch
 def test_rt10_phase_boundary_load_strict_true_is_default() -> None:
-    """The phase-boundary load path MUST default to ``strict=True`` so
-    a key drift between phases (e.g. P1 saves predictor weights;
-    Phase-3 module has no predictor module to receive them) raises
-    instead of silently random-initialising."""
+    """The phase-boundary load path MUST default to ``strict=True`` so a key
+    drift between phases (e.g. a P1 checkpoint carrying a key the P3 module
+    does not own) raises instead of silently random-initialising."""
     src = _make_module()
     src_state = src.state_dict()
-    # Inject a key that the destination module DOES NOT own. Under
-    # strict=False this would be silently dropped; strict=True must
-    # raise. Default is strict=True.
     src_state["student.fake_phase3_head.weight"] = torch.zeros(4)
     dst = _make_module()
     with pytest.raises(RuntimeError, match="Unexpected key"):
@@ -250,26 +228,15 @@ def test_rt10_phase_boundary_load_strict_true_is_default() -> None:
 
 @pytest.mark.must_pass_before_dispatch
 def test_rt10_phase_boundary_strict_false_silently_drops_keys() -> None:
-    """Negative control: prove the failure mode RT10 prevents is real.
-    Under ``strict=False`` the missing-key path silently random-inits
-    the destination's parameter, which is exactly the pre-dispatch
-    failure mode.
-
-    Exercises ``b31_plus_both`` so ``ln_mid`` is in the parameter set
-    and can be dropped to demonstrate the silent-random-init failure
-    mode (the B31 2-term default has no ``ln_mid``).
-    """
-    src = _make_module(loss_variant="b31_plus_both")
+    """Negative control: prove the failure mode RT10 prevents is real. Under
+    ``strict=False`` the missing-key path silently leaves the destination's
+    parameter at its random init — exactly the pre-dispatch failure mode."""
+    src = _make_module()
     src_state = src.state_dict()
-    dropped_key = "student.ln_mid.weight"
-    del src_state[dropped_key]
-    dst = _make_module(loss_variant="b31_plus_both")
-    # The dst module's ln_mid.weight stays at its random init; load
-    # under strict=False does NOT raise (this is what the gate forbids
-    # in practice).
-    dst_pre_load = deepcopy(dst.student.ln_mid.weight.detach())
+    del src_state[_LOAD_BEARING_KEY]
+    dst = _make_module()
+    dst_pre_load = deepcopy(dst.student.encoder.frontend_ln.weight.detach())
     dst.load_state_dict(src_state, strict=False)
-    dst_post_load = dst.student.ln_mid.weight.detach()
-    # strict=False leaves ln_mid at its random init — proving the
-    # silent-random-init failure mode RT10 prevents is real.
+    dst_post_load = dst.student.encoder.frontend_ln.weight.detach()
+    # strict=False leaves the dropped param at its random init.
     torch.testing.assert_close(dst_post_load, dst_pre_load)

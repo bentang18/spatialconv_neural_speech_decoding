@@ -1,4 +1,9 @@
-"""Tests for B29 Item 9/11/12 subject-subtype + λ_anat metadata extractors."""
+"""Tests for B29 Item 9/11 subject-subtype metadata extractor.
+
+(The B28/B29 ``LambdaAnatExtractor`` per-clip ``λ_anat`` gate was removed at
+B36 — the encoder's hard block-diagonal parcel pool consumes the one-hot DK
+support directly, with no soft anatomy bias to gate. Its tests went with it.)
+"""
 
 from __future__ import annotations
 
@@ -9,10 +14,8 @@ from neuralset.base import TimedArray
 from speech_decoding.extractors.reference import CARIeegExtractor
 from speech_decoding.extractors.subtype_meta import (
     BINARY_SUBTYPE_TO_IDX,
-    DEFAULT_CORPUS_LAMBDA_ANAT,
     DEFAULT_CORPUS_SUBTYPE,
     THREE_WAY_SUBTYPE_TO_IDX,
-    LambdaAnatExtractor,
     SubjectSubtypeExtractor,
 )
 
@@ -141,89 +144,6 @@ def test_subject_subtype_three_way_demotes_grid_to_ecog_under_binary_vocab() -> 
 
 def test_subject_subtype_inherits_car_ieeg_extractor() -> None:
     assert issubclass(SubjectSubtypeExtractor, CARIeegExtractor)
-
-
-# ---------------------------------------------------------------------------
-# λ_anat
-# ---------------------------------------------------------------------------
-
-
-def test_default_corpus_lambda_anat_table_b29_item_12() -> None:
-    """BT/D/AJILE12 = 1.0 (anatomy-rich); SWEC = 0.0."""
-    assert DEFAULT_CORPUS_LAMBDA_ANAT["braintreebank"] == 1.0
-    assert DEFAULT_CORPUS_LAMBDA_ANAT["d_cohort"] == 1.0
-    assert DEFAULT_CORPUS_LAMBDA_ANAT["ajile12"] == 1.0
-    assert DEFAULT_CORPUS_LAMBDA_ANAT["swec"] == 0.0
-
-
-def test_lambda_anat_anatomy_rich_corpus_gates_on() -> None:
-    extractor = LambdaAnatExtractor(event_types="Ieeg")
-    out = extractor._get_timed_array(
-        _Event(corpus="braintreebank"), start=0.0, duration=1.0,
-    )
-    assert isinstance(out, TimedArray)
-    arr = np.asarray(out.data)
-    assert arr.shape == (1, 1)
-    assert arr.dtype == np.float32
-    assert float(arr.item()) == 1.0
-
-
-def test_lambda_anat_swec_corpus_gates_off_by_default() -> None:
-    extractor = LambdaAnatExtractor(event_types="Ieeg")
-    out = extractor._get_timed_array(
-        _Event(corpus="swec"), start=0.0, duration=1.0,
-    )
-    assert float(np.asarray(out.data).item()) == 0.0
-
-
-def test_lambda_anat_per_subject_override_wins_over_corpus() -> None:
-    extractor = LambdaAnatExtractor(
-        event_types="Ieeg",
-        subject_lambda_anat={"swec_sub1": 0.5},
-    )
-    out = extractor._get_timed_array(
-        _Event(corpus="swec", subject_id="swec_sub1"),
-        start=0.0, duration=1.0,
-    )
-    assert float(np.asarray(out.data).item()) == 0.5
-
-
-def test_lambda_anat_rejects_value_out_of_range() -> None:
-    with pytest.raises(ValueError, match="must lie in"):
-        LambdaAnatExtractor(
-            event_types="Ieeg",
-            corpus_lambda_anat={"braintreebank": 1.5},
-        )
-    with pytest.raises(ValueError, match="must lie in"):
-        LambdaAnatExtractor(
-            event_types="Ieeg",
-            subject_lambda_anat={"sub_neg": -0.1},
-        )
-
-
-def test_lambda_anat_rejects_unregistered_corpus() -> None:
-    extractor = LambdaAnatExtractor(event_types="Ieeg")
-    with pytest.raises(KeyError, match="no λ_anat registered"):
-        extractor._get_timed_array(
-            _Event(corpus="unknown_cohort"), start=0.0, duration=1.0,
-        )
-
-
-def test_lambda_anat_swec_pseudo_parcel_sister_can_turn_on() -> None:
-    """Sister ``R-swec-pseudo-parcel-per-shaft`` flips SWEC λ_anat ON
-    via the per-corpus override."""
-    extractor = LambdaAnatExtractor(
-        event_types="Ieeg",
-        corpus_lambda_anat={"swec": 1.0},
-    )
-    out = extractor._get_timed_array(
-        _Event(corpus="swec"), start=0.0, duration=1.0,
-    )
-    assert float(np.asarray(out.data).item()) == 1.0
-
-
-def test_lambda_anat_extractor_inherits_car_ieeg_extractor() -> None:
-    assert issubclass(LambdaAnatExtractor, CARIeegExtractor)
 
 
 def test_subject_subtype_corpus_kwarg_fallback_when_event_has_no_attr() -> None:

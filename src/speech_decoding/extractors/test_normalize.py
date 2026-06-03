@@ -7,6 +7,7 @@ import torch
 from speech_decoding.extractors.normalize import (
     SCALE_TO_SIGMA,
     Nv14RobustZTransform,
+    SessionRobustZNormalizer,
     robust_z,
 )
 
@@ -85,3 +86,84 @@ def test_nv14_robust_z_transform_callable_matches_function() -> None:
     a = robust_z(x)
     b = t(x)
     torch.testing.assert_close(a, b, atol=1e-6, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# WS-C / C3: session-level robust-z (fit-on-train / apply-frozen)
+# ---------------------------------------------------------------------------
+
+
+def test_session_robust_z_fits_per_electrode_freq_over_time() -> None:
+    """``fit`` stores per-(electrode, freq) median + MAD-σ over the session time
+    axis → shape (C, F, 1). ``transform`` applies the frozen stats and preserves
+    the clip's (C, F, T) shape."""
+    torch.manual_seed(0)
+    session = torch.randn(4, 30, 200)  # (C, F, T_session)
+    norm = SessionRobustZNormalizer().fit(session)
+    assert norm.median.shape == (4, 30, 1)
+    assert norm.sigma.shape == (4, 30, 1)
+    clip = torch.randn(4, 30, 20)
+    z = norm.transform(clip)
+    assert z.shape == (4, 30, 20)
+    assert torch.isfinite(z).all()
+
+
+def test_session_robust_z_is_gain_invariant() -> None:
+    """C3 gain-invariance (ρ=1.0): a pure ×k gain on one channel — present in
+    BOTH the fit data and the applied clip — leaves the normalized output
+    unchanged, because median and σ both scale by k and cancel."""
+    torch.manual_seed(1)
+    session = torch.randn(4, 30, 200)
+    clip = torch.randn(4, 30, 20)
+
+    norm = SessionRobustZNormalizer().fit(session)
+    z = norm.transform(clip)
+
+    k = 7.3
+    session_g = session.clone()
+    session_g[1] *= k
+    clip_g = clip.clone()
+    clip_g[1] *= k
+    norm_g = SessionRobustZNormalizer().fit(session_g)
+    z_g = norm_g.transform(clip_g)
+
+    torch.testing.assert_close(z, z_g, atol=1e-4, rtol=1e-4)
+
+
+def test_session_robust_z_uses_train_stats_not_clip_stats() -> None:
+    """C3 'stats fit on train only': a clip held constant at
+    ``train_median + train_σ`` normalizes to +1 everywhere under the FROZEN
+    train stats. A per-clip normalizer would see a constant (σ→0, floored to 0),
+    so this distinguishes train-fit from clip-fit."""
+    torch.manual_seed(2)
+    session = torch.randn(4, 30, 500)
+    norm = SessionRobustZNormalizer().fit(session)
+    # Constant-in-time clip = train_median + train_σ.
+    offset_clip = (norm.median + norm.sigma).expand(4, 30, 5).clone()
+    z = norm.transform(offset_clip)
+    torch.testing.assert_close(z, torch.ones_like(z), atol=1e-4, rtol=1e-4)
+
+
+def test_session_robust_z_transform_before_fit_raises() -> None:
+    import pytest
+
+    norm = SessionRobustZNormalizer()
+    with pytest.raises(RuntimeError, match="fit"):
+        norm.transform(torch.randn(2, 30, 8))
+
+
+def test_session_robust_z_honors_valid_bin_mask() -> None:
+    """C3/C5: invalid freq bins (per the per-corpus mask) return z=0 on
+    transform regardless of input value."""
+    torch.manual_seed(3)
+    session = torch.randn(2, 30, 200)
+    mask = torch.ones(30, dtype=torch.bool)
+    mask[22:] = False  # SWEC k22-29 invalid
+    norm = SessionRobustZNormalizer().fit(
+        session, valid_bin_mask=mask.reshape(1, 30, 1),
+    )
+    clip = torch.randn(2, 30, 20)
+    clip[:, 22:] = 999.0
+    z = norm.transform(clip)
+    assert torch.allclose(z[:, 22:], torch.zeros_like(z[:, 22:]), atol=1e-5)
+    assert torch.isfinite(z[:, :22]).all()

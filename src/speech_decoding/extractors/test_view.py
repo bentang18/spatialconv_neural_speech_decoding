@@ -283,11 +283,12 @@ def test_multi_stft_valid_bin_mask_swec_passband_22_bins() -> None:
     assert not mask[25:].any(), "bins 25+ must be invalid for a 120 Hz cap"
 
 
-def test_multi_stft_view_shape_is_30_freq_9_time_at_1s_2048hz() -> None:
-    """FE-01 (B20 v4 lock 2026-05-24): Common hop=256 @ 2048 Hz with
-    Nperseg ∈ {1024, 512, 256} and 1-s input yields 9 frames at 8 Hz frame rate
-    (1 + 2048/256 with center=True padding). Filterbank flattens to 30 output
-    bins. Previous default hop=128 (14.7 Hz, 17 frames) is retired."""
+def test_multi_stft_view_shape_is_30_freq_17_time_at_1s_2048hz() -> None:
+    """FE-01 (hop=128 re-lock 2026-06-03): Common hop=128 @ 2048 Hz with
+    Nperseg ∈ {1024, 512, 256} and 1-s input yields 17 frames at a 16 Hz
+    front-end rate (1 + 2048/128 with center=True padding). Filterbank flattens
+    to 30 output bins. iMINDBench-standard hop; the old hop=256 default is the
+    R-hop-256 sister."""
     from speech_decoding.extractors.view import (
         MULTI_STFT_ROUTING,
         _multi_stft_view,
@@ -297,7 +298,7 @@ def test_multi_stft_view_shape_is_30_freq_9_time_at_1s_2048hz() -> None:
     out = _multi_stft_view(
         waveform,
         sample_rate=2048,
-        hop_length=256,
+        hop_length=128,
         nperseg_low=1024,
         nperseg_mid=512,
         nperseg_hi=256,
@@ -308,7 +309,7 @@ def test_multi_stft_view_shape_is_30_freq_9_time_at_1s_2048hz() -> None:
         routing=MULTI_STFT_ROUTING,
         log_eps=1e-6,
     )
-    assert out.shape == (4, 30, 9)
+    assert out.shape == (4, 30, 17)
 
 
 def test_multi_stft_view_routes_tone_to_correct_band() -> None:
@@ -327,7 +328,7 @@ def test_multi_stft_view_routes_tone_to_correct_band() -> None:
     out = _multi_stft_view(
         tone_100hz,
         sample_rate=sr,
-        hop_length=256,
+        hop_length=128,
         nperseg_low=1024,
         nperseg_mid=512,
         nperseg_hi=256,
@@ -362,12 +363,42 @@ def test_multi_stft_view_accepts_v14_recipe_kwargs() -> None:
         car="shaft",
         notch_filter=60.0,
         scaler="StandardScaler",
-        hop_length=256,
+        hop_length=256,  # explicit override = the R-hop-256 sister (default is 128)
         nperseg_low=1024,
         nperseg_mid=512,
         nperseg_hi=256,
     )
     assert view.car == "shaft"
-    assert view.hop_length == 256
+    assert view.hop_length == 256  # override took (proves hop is settable off-default)
     assert view.nperseg_low == 1024
     assert view.n_fbank_bins == 30
+
+
+def test_multi_stft_view_n_time_bins_for_duration_maps_to_t_p_40_and_8() -> None:
+    """WS-C / C1 (hop=128 re-lock 2026-06-03): phase-conditional ``clip_len`` →
+    T_bin → T_p. MultiStftView (hop=128 @ 2048 Hz, ``torch.stft(center=True)``)
+    emits ``1 + L // hop`` frames: 5 s → 81, 1 s → 17. These differ from the
+    nominal 16 Hz × duration (80 / 16) by the single center-pad frame, but the
+    (3,2)-stride patch stem floors both onto the load-bearing patch counts
+    **T_p = 40 / 8** (8 Hz latent → matches the 8 Hz Whisper teacher)."""
+    from speech_decoding.extractors.view import MultiStftView
+    from speech_decoding.models.v14_encoder import _PatchStem
+
+    view = MultiStftView(event_types="Ieeg", car="shaft")
+    assert view.n_time_bins_for_duration(5.0) == 81
+    assert view.n_time_bins_for_duration(1.0) == 17
+
+    stem = _PatchStem(8)  # default kernel/stride (3, 2)
+    assert stem.n_time_patches(81) == 40  # 5 s SSL clip
+    assert stem.n_time_patches(17) == 8   # 1 s P4 readout clip
+    # The nominal 16 Hz frame counts land on the same T_p (floor-division
+    # absorbs the center-pad off-by-one) — so RoPE downward-generalizes (D8).
+    assert stem.n_time_patches(80) == 40
+    assert stem.n_time_patches(16) == 8
+
+
+def test_log_stft_view_n_time_bins_for_duration_matches_17_at_1s() -> None:
+    """The sister single-STFT view (hop = nperseg·(1−poverlap) = 128 @ 2048 Hz)
+    emits 17 frames for a 1-s window — the historical ``DEFAULT_N_TIME_BINS``."""
+    view = LogStftView(event_types="Ieeg", car="shaft")
+    assert view.n_time_bins_for_duration(1.0) == 17

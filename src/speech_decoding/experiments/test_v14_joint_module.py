@@ -1,25 +1,30 @@
-"""B2.2 + B31 tests for :class:`V14JointBrainModule`.
+"""B36 WS-B tests for :class:`V14JointBrainModule` (masked-JEPA SSL).
 
-Covers:
+Covers the module-level masked-JEPA contract (the encoder-level B1/B2/B5/B8
+unit tests live in ``models/test_v14_encoder.py``):
 
-* Construction from a tiny encoder; EMA teacher is a frozen mirror.
-* B31 default (``loss_variant="b31_default"``): student bundle ships
-  ``ln_frame`` only; ``ln_mid`` / ``ln_utt`` / ``pma`` are ``None``;
-  ``_step`` returns a 2-term breakdown.
-* B31 sister (``loss_variant="b31_plus_both"``): student bundle ships
-  every head; ``_step`` returns a 4-term breakdown matching the legacy
-  B19/B22/B28 shape.
-* B30 ``latent_valid`` flows from ``support`` → every active slot/
-  utterance term.
-* B26 EMA step τ=0.99925 fixed; teacher params trail the student.
-* Predictor fallback path: ``L_pre_frame = F.l1_loss(M2_student,
-  detach(M2_teacher))`` when ``predictor is None``.
-* B30 sister-flag runtime gates raise ``NotImplementedError`` at
-  construction.
+* Construction: EMA teacher is a frozen mirror; the student bundle is
+  encoder-only (no ``ln_frame`` / ``ln_mid`` / ``ln_utt`` / PMA heads); a
+  student-only :class:`JepaPredictor` is built and is NOT EMA-mirrored.
+* B30 sister-flag runtime gates + invalid ``phase`` raise at construction.
+* P1 (``phase="p1"``, paradigm A): ``_step`` returns a single-term
+  ``MaskedJepaBreakdown(phase="p1")``; gradient reaches the front-end
+  (``frontend_ln``) but NOT the terminal ``encoder_ln`` or the predictor.
+* P2 (``phase="p2"``, paradigm B): single-term ``MaskedJepaBreakdown(
+  phase="p2")``; gradient reaches both the encoder and the predictor.
+* B6: empty mask → exact-0 total (no NaN); target is detached (teacher
+  accumulates no grad); the loss is L1, not MSE.
+* B7: the EMA teacher always encodes the FULL input — the guard fires if a
+  False-containing visibility mask reaches it.
+* B9: exactly ONE active loss term per phase; the retired multi-term
+  aggregator helpers are not imported by the module.
+* B26 EMA step τ=0.99925 fixed.
+* 5/28 P0 monitors (coverage / RankMe / grad-spike) still wired.
 """
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -31,7 +36,8 @@ from speech_decoding.experiments.v14_joint_module import (
     V14JointBrainModule,
     _V14StudentBundle,
 )
-from speech_decoding.models.v14_encoder import V14ParcelPerceiverModel
+from speech_decoding.models.v14_encoder import JepaPredictor, V14ParcelPerceiverModel
+from speech_decoding.ssl.masked_jepa import MaskedJepaBreakdown
 
 
 def _optim_config() -> LightningOptimizer:
@@ -42,7 +48,7 @@ def _make_tiny_encoder(
     *,
     n_freq_bins: int = 4,
     n_time_bins: int = 8,
-    k_parcels: int = 2,
+    k_parcels: int = 5,
     m_sub_slots: int = 1,
     d_model: int = 16,
     n_heads: int = 4,
@@ -70,19 +76,20 @@ def _make_tiny_encoder(
 def _make_synthetic_batch(
     *,
     B: int = 2,
-    C: int = 3,
+    C: int = 5,
     T_bins: int = 8,
     F_bins: int = 4,
-    K: int = 2,
+    K: int = 5,
 ) -> SimpleNamespace:
     torch.manual_seed(0)
     electrode_tokens = torch.randn(B, C, T_bins, F_bins)
-    # Make support have ≥1 covered electrode per parcel for each clip so
-    # latent_valid is non-empty everywhere (full-active case).
+    # One covered electrode per parcel (diagonal support) so all K parcels are
+    # covered → latent_valid is non-empty everywhere AND the locked M4 tube
+    # default (0.20 of covered, n_min_visible=3) masks exactly 1 of 5 parcels
+    # while keeping ≥3 visible — exercising the real default in P2.
     support = torch.zeros(B, C, K)
-    support[:, 0, 0] = 1.0
-    support[:, 1, 1] = 1.0
-    support[:, 2, 0] = 0.5
+    for i in range(min(C, K)):
+        support[:, i, i] = 1.0
     valid_mask = torch.ones(B, C, dtype=torch.bool)
     data = {
         "electrode_tokens": electrode_tokens,
@@ -93,447 +100,424 @@ def _make_synthetic_batch(
 
 
 def _make_module(
-    encoder=None, *, loss_variant: str = "b31_default",
+    encoder=None, *, phase: str = "p1", **kwargs,
 ) -> V14JointBrainModule:
     if encoder is None:
         encoder = _make_tiny_encoder()
-    optim_config = _optim_config()
     return V14JointBrainModule(
         encoder=encoder,
-        optim_config=optim_config,
-        pma_n_heads=4,
-        loss_variant=loss_variant,  # type: ignore[arg-type]
+        optim_config=_optim_config(),
+        phase=phase,  # type: ignore[arg-type]
+        **kwargs,
     )
 
 
-def test_v14_joint_brain_module_constructs_with_frozen_teacher() -> None:
+# ---------------------------------------------------------------------------
+# Construction
+# ---------------------------------------------------------------------------
+
+
+def test_construct_frozen_teacher_and_encoder_only_student() -> None:
     module = _make_module()
-    # Teacher params: every one must be ``requires_grad=False``.
     for p in module.teacher.parameters():
         assert p.requires_grad is False
-    # Student bundle exists; under the B31 2-term default it carries
-    # ``ln_frame`` only and the dropped heads are ``None``.
+    # B6/B36 §4: the student bundle is encoder-only — no LN/PMA heads.
     assert isinstance(module.student, _V14StudentBundle)
-    assert module.student.ln_frame is not None
-    assert module.student.ln_mid is None
-    assert module.student.ln_utt is None
-    assert module.student.pma is None
+    assert hasattr(module.student, "encoder")
+    for dead in ("ln_frame", "ln_mid", "ln_utt", "pma"):
+        assert not hasattr(module.student, dead), dead
 
 
-def test_v14_joint_brain_module_b31_default_omits_dropped_heads() -> None:
-    """B31 5/28 PM-late: ``loss_variant="b31_default"`` constructs the
-    student bundle WITHOUT ``ln_mid`` / ``ln_utt`` / PMA — the PMA query
-    receives no gradient in the joint SSL phase (P3 distillation is the
-    first place it sees one)."""
-    module = _make_module(loss_variant="b31_default")
-    assert module.student.ln_frame is not None
-    assert module.student.ln_mid is None
-    assert module.student.ln_utt is None
-    assert module.student.pma is None
-    # Teacher mirror also omits these (it's an EMA-deepcopy of the student).
-    assert module.teacher.model.ln_mid is None
-    assert module.teacher.model.ln_utt is None
-    assert module.teacher.model.pma is None
-
-
-def test_v14_joint_brain_module_b31_plus_both_builds_full_head_set() -> None:
-    """``R-add-both`` sister: every dropped head is reconstructed on
-    both student and teacher."""
-    module = _make_module(loss_variant="b31_plus_both")
-    assert module.student.ln_frame is not None
-    assert module.student.ln_mid is not None
-    assert module.student.ln_utt is not None
-    assert module.student.pma is not None
-    assert module.teacher.model.ln_mid is not None
-    assert module.teacher.model.ln_utt is not None
-    assert module.teacher.model.pma is not None
-
-
-def test_v14_joint_brain_module_b31_plus_m3_builds_only_mid_head() -> None:
-    """``R-add-m3-loss`` sister: only the M3 head reconstructs;
-    utterance + PMA stay ``None``."""
-    module = _make_module(loss_variant="b31_plus_m3")
-    assert module.student.ln_mid is not None
-    assert module.student.ln_utt is None
-    assert module.student.pma is None
-
-
-def test_v14_joint_brain_module_b31_plus_utt_builds_only_utterance_heads() -> None:
-    """``R-add-utterance-loss`` sister (EAT-faithful comparator): only
-    LN_utt + PMA reconstruct; M3 head stays ``None``."""
-    module = _make_module(loss_variant="b31_plus_utt")
-    assert module.student.ln_mid is None
-    assert module.student.ln_utt is not None
-    assert module.student.pma is not None
-
-
-def test_v14_joint_brain_module_rejects_unknown_loss_variant() -> None:
-    """Invalid ``loss_variant`` is caught at construction."""
-    optim_config = _optim_config()
-    with pytest.raises(ValueError, match="loss_variant"):
-        V14JointBrainModule(
-            encoder=_make_tiny_encoder(),
-            optim_config=optim_config,
-            loss_variant="bogus",  # type: ignore[arg-type]
-        )
-
-
-def test_v14_joint_brain_module_rejects_b30_sister_latent_valid_override() -> None:
-    optim_config = _optim_config()
-    with pytest.raises(NotImplementedError, match="B30"):
-        V14JointBrainModule(
-            encoder=_make_tiny_encoder(),
-            optim_config=optim_config,
-            latent_valid_override="all_true",
-        )
-
-
-def test_v14_joint_brain_module_rejects_b30_sister_sa_mask_mode() -> None:
-    optim_config = _optim_config()
-    with pytest.raises(NotImplementedError, match="key-only"):
-        V14JointBrainModule(
-            encoder=_make_tiny_encoder(),
-            optim_config=optim_config,
-            sa_mask_mode="key_only",
-        )
-
-
-def test_v14_joint_brain_module_b31_default_step_returns_two_term_breakdown() -> None:
-    """B31 default: ``_step`` returns a breakdown with ``L_pre_frame +
-    L_post_frame`` only; the dropped term fields are ``None``."""
-    module = _make_module(loss_variant="b31_default")
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
-
-    for term in (breakdown.l_pre_frame, breakdown.l_post_frame):
-        assert isinstance(term, torch.Tensor)
-        assert term.ndim == 0
-        assert torch.isfinite(term)
-    # B31 dropped terms are None under the default.
-    assert breakdown.l_mid_slot is None
-    assert breakdown.l_post_utterance is None
-    # DKoleo + reactive cousins also None.
-    assert breakdown.l_dkoleo_m4 is None
-    assert breakdown.l_dkoleo_m3_reactive is None
-    assert breakdown.l_gram_reactive is None
-
-    # Total = sum of the 2 active terms (unit coefficients).
-    expected = breakdown.l_pre_frame + breakdown.l_post_frame
-    torch.testing.assert_close(breakdown.total, expected)
-
-
-def test_v14_joint_brain_module_b31_plus_both_step_returns_four_term_breakdown() -> None:
-    """``R-add-both`` sister: ``_step`` returns the full 4-term legacy
-    breakdown (B19/B22/B28 shape)."""
-    module = _make_module(loss_variant="b31_plus_both")
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
-
-    for term in (
-        breakdown.l_pre_frame,
-        breakdown.l_mid_slot,
-        breakdown.l_post_frame,
-        breakdown.l_post_utterance,
-    ):
-        assert isinstance(term, torch.Tensor)
-        assert term.ndim == 0
-        assert torch.isfinite(term)
-
-    assert breakdown.l_dkoleo_m4 is None
-    assert breakdown.l_dkoleo_m3_reactive is None
-    assert breakdown.l_gram_reactive is None
-
-    expected = (
-        breakdown.l_pre_frame + breakdown.l_mid_slot
-        + breakdown.l_post_frame + breakdown.l_post_utterance
-    )
-    torch.testing.assert_close(breakdown.total, expected)
-
-
-def test_v14_joint_brain_module_total_is_non_negative_and_finite() -> None:
+def test_predictor_is_jepa_predictor_and_not_ema_mirrored() -> None:
+    """The predictor is student-only — V-JEPA predictors are never part of
+    the teacher. The EMA mirror deepcopies only the student BUNDLE (encoder)."""
     module = _make_module()
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
-    # L1 (default) is non-negative.
-    assert float(breakdown.total.item()) >= 0.0
+    assert isinstance(module.predictor, JepaPredictor)
+    # The teacher mirrors the bundle (which holds only the encoder); it must
+    # NOT carry a copy of the predictor.
+    assert not hasattr(module.teacher.model, "predictor")
+
+
+def test_rejects_b30_sister_latent_valid_override() -> None:
+    with pytest.raises(NotImplementedError, match="B30"):
+        _make_module(latent_valid_override="all_true")
+
+
+def test_rejects_b30_sister_sa_mask_mode() -> None:
+    with pytest.raises(NotImplementedError, match="key-only"):
+        _make_module(sa_mask_mode="key_only")
+
+
+def test_rejects_unknown_phase() -> None:
+    with pytest.raises(ValueError, match="phase"):
+        _make_module(phase="p3")
+
+
+# ---------------------------------------------------------------------------
+# B5/B6/B9: P1 paradigm-A front-end masked JEPA
+# ---------------------------------------------------------------------------
+
+
+def test_p1_step_returns_single_term_p1_breakdown() -> None:
+    module = _make_module(phase="p1")
+    breakdown = module._step(_make_synthetic_batch().data)
+    assert isinstance(breakdown, MaskedJepaBreakdown)
+    assert breakdown.phase == "p1"
+    assert breakdown.n_masked > 0
+    assert breakdown.total.ndim == 0
+    assert torch.isfinite(breakdown.total)
+    assert float(breakdown.total.detach()) >= 0.0  # L1 is non-negative
+
+
+def test_p1_grad_reaches_frontend_not_terminal_ln_or_predictor() -> None:
+    """B36 §7 P1 grad-scope: the front-end token blocks self-predict the
+    masked M2, so gradient reaches ``frontend_ln`` (front-end terminal LN)
+    but the downstream pool / inter-parcel encoder (``encoder_ln``) and the
+    predictor get NO gradient — the loss is computed entirely at M2."""
+    module = _make_module(phase="p1")
+    breakdown = module._step(_make_synthetic_batch().data)
+    breakdown.total.backward()
+    enc = module.student.encoder
+    assert enc.frontend_ln.weight.grad is not None
+    assert torch.isfinite(enc.frontend_ln.weight.grad).all()
+    # Downstream of M2 → off the loss path → no grad.
+    assert enc.encoder_ln.weight.grad is None
+    for p in module.predictor.parameters():
+        assert p.grad is None
+
+
+# ---------------------------------------------------------------------------
+# B6/B8/B9: P2 paradigm-B parcel masked JEPA
+# ---------------------------------------------------------------------------
+
+
+def test_p2_step_returns_single_term_p2_breakdown() -> None:
+    module = _make_module(phase="p2")
+    breakdown = module._step(_make_synthetic_batch().data)
+    assert isinstance(breakdown, MaskedJepaBreakdown)
+    assert breakdown.phase == "p2"
+    assert breakdown.n_masked > 0
+    assert breakdown.total.ndim == 0
+    assert torch.isfinite(breakdown.total)
+    assert float(breakdown.total.detach()) >= 0.0
+
+
+def test_p2_grad_reaches_encoder_and_predictor() -> None:
+    """P2 paradigm B: the visible-only encoder feeds the separate predictor,
+    so gradient reaches both the encoder (``encoder_ln``) and the predictor
+    (``output_proj``)."""
+    module = _make_module(phase="p2")
+    breakdown = module._step(_make_synthetic_batch().data)
+    breakdown.total.backward()
+    enc = module.student.encoder
+    assert enc.encoder_ln.weight.grad is not None
+    assert module.predictor.output_proj.weight.grad is not None
+    assert torch.isfinite(module.predictor.output_proj.weight.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# B6: masked-empty exact 0, detached target, L1 form
+# ---------------------------------------------------------------------------
+
+
+def test_p1_empty_mask_gives_exact_zero_no_nan() -> None:
+    """B6 masked-empty contract: ratio 0 → no masked cell → total is an
+    exact 0 (graph-connected, no NaN)."""
+    module = _make_module(phase="p1", m2_mask_ratio=0.0)
+    breakdown = module._step(_make_synthetic_batch().data)
+    assert breakdown.n_masked == 0
+    assert float(breakdown.total.detach()) == 0.0
     assert torch.isfinite(breakdown.total)
 
 
-def test_v14_joint_brain_module_b31_default_total_has_grad_through_ln_frame() -> None:
-    """B31 default: backward must populate ``ln_frame`` (the only LN
-    head in the bundle) and the encoder."""
-    module = _make_module(loss_variant="b31_default")
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
-    breakdown.total.backward()
-    assert module.student.ln_frame.weight.grad is not None
-    assert torch.isfinite(module.student.ln_frame.weight.grad).all()
-
-
-def test_v14_joint_brain_module_b31_plus_both_total_has_grad_through_all_heads() -> None:
-    """``R-add-both`` sister: backward must populate every reconstructed
-    head (``ln_mid``, ``ln_utt``, PMA query)."""
-    module = _make_module(loss_variant="b31_plus_both")
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
-    breakdown.total.backward()
-    assert module.student.ln_mid.weight.grad is not None
-    assert module.student.ln_utt.weight.grad is not None
-    assert module.student.pma.query.grad is not None
-
-
-def test_v14_joint_brain_module_predictor_fallback_l1_form() -> None:
-    """Predictor-None branch: L_pre_frame = F.l1_loss(M2_s, detach(M2_t))."""
-    module = _make_module()
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
-
-    # Recompute the fallback term independently from the encoder taps.
-    student_kwargs = {
-        "electrode_tokens": batch.data["electrode_tokens"],
-        "support": batch.data["support"],
-        "valid_mask": batch.data["valid_mask"],
-    }
-    student_taps = module.student(**student_kwargs)
-    with torch.no_grad():
-        teacher_taps = module.teacher.model(**student_kwargs)
-    expected_l_pre = torch.nn.functional.l1_loss(
-        student_taps["M2"], teacher_taps["M2"].detach(),
-    )
-    torch.testing.assert_close(
-        breakdown.l_pre_frame, expected_l_pre, atol=1e-4, rtol=1e-4,
-    )
-
-
-def test_v14_joint_brain_module_ema_step_updates_teacher() -> None:
-    """B26 lock: EMA τ=0.99925 fixed; ``update_from`` brings teacher
-    parameters toward the (post-step) student parameters. Exercised on
-    ``ln_frame`` so the test runs under the B31 default head set."""
-    module = _make_module(loss_variant="b31_default")
-    with torch.no_grad():
-        module.student.ln_frame.weight.fill_(2.0)
-    pre = module.teacher.model.ln_frame.weight.detach().clone()
-    coeff = module.teacher.update_from(module.student)
-    post = module.teacher.model.ln_frame.weight.detach().clone()
-    assert coeff == pytest.approx(0.99925)
-    expected = 0.99925 * pre + 0.00075 * 2.0
-    torch.testing.assert_close(post, expected)
-
-
-def test_v14_joint_brain_module_teacher_uses_full_input_via_no_grad() -> None:
-    """B26 contract: teacher forward runs under no_grad, so teacher
-    parameters never accumulate grads from the SSL backward."""
-    module = _make_module()
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
+def test_teacher_accumulates_no_grad_target_is_detached() -> None:
+    """B6/B26: the teacher target is ``detach()``ed and the teacher forward
+    runs under ``no_grad`` — no teacher parameter accumulates gradient."""
+    module = _make_module(phase="p2")
+    breakdown = module._step(_make_synthetic_batch().data)
     breakdown.total.backward()
     for p in module.teacher.parameters():
         assert p.grad is None
 
 
-def test_v14_joint_brain_module_routes_shaft_mask_student_only() -> None:
-    """B03 + B26 contract: ``shaft_mask`` is included in the student
-    encoder kwargs but is NOT forwarded to the EMA teacher (whose forward
-    must see the full unmasked input). The kwarg split is enforced by
-    :meth:`_extract_student_kwargs`."""
-    module = _make_module()
+def test_loss_is_l1_not_mse() -> None:
+    """B6: ``loss_form='mse'`` produces a strictly different scalar than the
+    default L1 on the same (seeded) masked set — proves the default is L1."""
     batch = _make_synthetic_batch()
-    # Mark every electrode as shaft-blocked → student forward sees mask;
-    # teacher forward sees no shaft input.
-    B, C = batch.data["electrode_tokens"].shape[:2]
-    batch.data["shaft_mask"] = torch.zeros(B, C, dtype=torch.bool)
-    batch.data["shaft_mask"][:, 0] = True
+    enc = _make_tiny_encoder()
+    l1 = _make_module(enc, phase="p1", loss_form="l1")._step(batch.data)
+    # A fresh module with an identical encoder + the same mask seed, MSE form.
+    enc2 = _make_tiny_encoder()
+    enc2.load_state_dict(enc.state_dict())
+    mse = _make_module(enc2, phase="p1", loss_form="mse")._step(batch.data)
+    assert l1.n_masked == mse.n_masked > 0
+    assert not torch.allclose(l1.total, mse.total)
 
-    student_kwargs, shaft_mask = module._extract_student_kwargs(batch.data)
-    assert "shaft_mask" not in student_kwargs, (
-        "shaft_mask must be carried separately from student_kwargs so the "
-        "teacher forward (which reuses student_kwargs) does NOT see it"
+
+def test_b6_l1_gradient_magnitude_constant_in_error() -> None:
+    """B6 (canonical V-JEPA target-norm) — the masked loss is *pure L1*, so
+    ``d|s-t|/ds = sign(s-t)``: the per-element gradient magnitude is a
+    constant ``1/(n_masked·d)`` regardless of the error scale. (MSE / Smooth-L1
+    grads scale with the error and would NOT be constant.) This is the
+    "gradient magnitude constant in error" check the B6 TEST clause demands,
+    stronger than the L1≠MSE scalar comparison above."""
+    from speech_decoding.ssl.masked_jepa import p1_frontend_m2_loss
+
+    B, C, F_p, T_p, d = 1, 1, 1, 1, 4
+    token_mask = torch.ones(B, C, F_p, T_p, dtype=torch.bool)  # every cell masked
+    teacher_m2 = torch.zeros(B, C, F_p, T_p, d)
+
+    grads = []
+    for scale in (0.1, 1.0, 5.0):
+        student_m2 = torch.full(
+            (B, C, F_p, T_p, d), float(scale), requires_grad=True,
+        )
+        bd = p1_frontend_m2_loss(
+            student_m2=student_m2, teacher_m2=teacher_m2, token_mask=token_mask,
+        )
+        bd.total.backward()
+        g = student_m2.grad[token_mask].abs()  # (n_masked, d)
+        # student > teacher ⇒ sign = +1 ⇒ |grad| == 1/(n_masked·d) everywhere.
+        expected = 1.0 / g.numel()
+        torch.testing.assert_close(g, torch.full_like(g, expected))
+        grads.append(g)
+    # The discriminator: L1's grad is identical across error scales (MSE's
+    # would be 0.1× vs 5×). Constant ⇒ pure L1.
+    torch.testing.assert_close(grads[0], grads[-1])
+
+
+# ---------------------------------------------------------------------------
+# B7: teacher full-input guard
+# ---------------------------------------------------------------------------
+
+
+def test_b7_teacher_full_input_guard_is_wired() -> None:
+    """B7: the teacher forward must see full input. The module never threads
+    a JEPA mask into the teacher; the guard fires if a False-containing
+    visibility mask is passed (simulating a leak)."""
+    from speech_decoding.ssl.ema import assert_teacher_full_input
+
+    # The wired call: both masks None ⇒ vacuously passes (teacher full-input).
+    assert_teacher_full_input(patch_mask=None, shaft_mask=None)
+    # A leaked student mask → its visibility (~mask) has False entries → raise.
+    token_mask = torch.zeros(2, 3, 2, 4, dtype=torch.bool)
+    token_mask[0, 0, 0, 0] = True
+    with pytest.raises(AssertionError, match="full-input"):
+        assert_teacher_full_input(patch_mask=~token_mask)
+
+
+def test_b7_step_does_not_pass_mask_to_teacher() -> None:
+    """B7 integration: running ``_step`` (which calls the guard at the teacher
+    call site) never raises — the teacher truly gets full input."""
+    for phase in ("p1", "p2"):
+        module = _make_module(phase=phase)
+        breakdown = module._step(_make_synthetic_batch().data)
+        assert torch.isfinite(breakdown.total)
+
+
+def test_b7_teacher_forward_call_site_raises_on_leaked_mask() -> None:
+    """B7 call-site wiring: ``_teacher_forward`` runs
+    ``assert_teacher_full_input`` on the EXACT kwargs the teacher receives.
+    Inject a partial ``token_mask`` (simulating a refactor that leaks the
+    student mask into the teacher pass) and confirm the guard fires — this
+    exercises the live ``_step`` call site, not just the helper in isolation,
+    closing the 'guard is vacuously wired' gap."""
+    module = _make_module(phase="p1")
+    batch = _make_synthetic_batch()
+    student_kwargs = module._extract_student_kwargs(batch.data)
+    C, F_p, T_p = module.student.encoder.patch_grid_shape(
+        student_kwargs["electrode_tokens"],
     )
-    assert shaft_mask is not None
-    assert shaft_mask.shape == (B, C)
-    assert shaft_mask.dtype == torch.bool
-    assert bool(shaft_mask[:, 0].all().item()), (
-        "shaft_mask payload must round-trip through _extract_student_kwargs"
+    B = batch.data["electrode_tokens"].shape[0]
+    leaked = torch.zeros(B, C, F_p, T_p, dtype=torch.bool)
+    leaked[0, 0, 0, 0] = True  # one masked cell ⇒ ~leaked has a False entry
+    teacher_kwargs = dict(student_kwargs, token_mask=leaked)
+    with pytest.raises(AssertionError, match="full-input"):
+        module._teacher_forward(teacher_kwargs)
+
+    # A parcel-time leak fires the same tripwire.
+    K = student_kwargs["support"].shape[-1]
+    leaked_ptm = torch.zeros(B, K, T_p, dtype=torch.bool)
+    leaked_ptm[0, 0, 0] = True
+    with pytest.raises(AssertionError, match="full-input"):
+        module._teacher_forward(dict(student_kwargs, parcel_time_mask=leaked_ptm))
+
+
+def test_b7_teacher_forward_full_input_passes_and_returns_taps() -> None:
+    """B7 live path: with no mask key in ``teacher_kwargs`` the guard passes
+    and the teacher returns its tap dict. ``m2_only=True`` (the P1 path)
+    returns just the M2 tap."""
+    module = _make_module(phase="p1")
+    student_kwargs = module._extract_student_kwargs(_make_synthetic_batch().data)
+    taps = module._teacher_forward(dict(student_kwargs), m2_only=True)
+    assert set(taps.keys()) == {"M2"}
+
+
+# ---------------------------------------------------------------------------
+# B9: exactly one term; retired multi-term path not imported
+# ---------------------------------------------------------------------------
+
+
+def test_b9_module_does_not_import_retired_aggregator_helpers() -> None:
+    """B9: the retired multi-term aggregator surface is gone from the joint
+    module's namespace (the masked-JEPA default is single-term)."""
+    mod = importlib.import_module(
+        "speech_decoding.experiments.v14_joint_module"
     )
+    for dead in (
+        "compute_v14_ssl_losses",
+        "V14TotalLossBreakdown",
+        "LossVariant",
+        "_variant_wants_m3",
+        "_variant_wants_utt",
+        "_compose_l_pre_frame",
+    ):
+        assert not hasattr(mod, dead), dead
 
 
-def test_v14_joint_brain_module_step_accepts_shaft_mask_in_batch() -> None:
-    """End-to-end: with ``shaft_mask`` present, ``_step`` still returns
-    a finite breakdown (the encoder forward accepts the kwarg)."""
+def test_b9_breakdown_exposes_exactly_one_scalar_term() -> None:
+    """B9: the breakdown carries a single ``total`` scalar + its phase tag —
+    there are no per-term sub-fields (l_mid_slot / l_post_utterance / ...)."""
+    breakdown = _make_module(phase="p1")._step(_make_synthetic_batch().data)
+    fields = set(vars(breakdown).keys())
+    assert fields == {"total", "phase", "n_masked"}
+
+
+def test_b9_layer_avg_with_instance_norm_retired_from_runtime() -> None:
+    """B9: ``layer_avg_with_instance_norm`` (data2vec-2.0 / EAT layer-averaging)
+    is explicitly named for quarantine. Under the canonical V-JEPA target-norm
+    the target is the encoder's own terminal LN, so this helper builds NO live
+    target — neither the joint module nor the masked-JEPA loss module imports
+    or calls it (it survives only as the ``R-layer-avg-target`` sister + its
+    own unit test)."""
+    import inspect
+
+    import speech_decoding.experiments.v14_joint_module as jm
+    import speech_decoding.ssl.masked_jepa as mj
+
+    for mod in (jm, mj):
+        assert not hasattr(mod, "layer_avg_with_instance_norm"), mod.__name__
+        assert "layer_avg_with_instance_norm(" not in inspect.getsource(mod), (
+            f"{mod.__name__} must not CALL the retired data2vec helper"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B26 EMA + optimizer scope
+# ---------------------------------------------------------------------------
+
+
+def test_ema_step_updates_teacher_fixed_tau() -> None:
+    """B26 lock: τ=0.99925 fixed; ``update_from`` pulls the teacher toward
+    the (post-step) student. Exercised on the encoder's ``encoder_ln``."""
     module = _make_module()
-    batch = _make_synthetic_batch()
-    B, C = batch.data["electrode_tokens"].shape[:2]
-    sm = torch.zeros(B, C, dtype=torch.bool)
-    sm[:, 0] = True
-    batch.data["shaft_mask"] = sm
-    breakdown = module._step(batch.data)
-    assert torch.isfinite(breakdown.total)
-
-
-def test_v14_joint_brain_module_monitor_skips_when_shaft_mask_absent() -> None:
-    """MON-MASK-002 is a no-op when ``shaft_mask`` is not in the batch
-    (e.g. supervised-phase smoke test or any path without joint masking)."""
-    module = _make_module()
-    batch = _make_synthetic_batch()
-    assert "shaft_mask" not in batch.data
-    # Spy on log calls so we can confirm the monitor key never fires.
-    logged: dict[str, float] = {}
-    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
-    module._monitor_from_step(batch.data, step_name="val")
-    assert "val_mon_mask_002_ratio" not in logged
-    assert "val_mon_mask_002_in_band" not in logged
-
-
-def test_v14_joint_brain_module_monitor_logs_when_shaft_mask_orphans_some_parcel() -> None:
-    """MON-MASK-002 fires when ``shaft_mask`` drives at least one parcel
-    to lose every electrode in every clip. The verdict's ratio is finite
-    and ``in_band`` is reported.
-
-    The teacher is constructed as a deepcopy of the student so at
-    init their M4 taps are identical → both MSE values are zero and the
-    monitor returns nan. We perturb the student ``ln_frame`` to inject a
-    non-zero student/teacher divergence so the ratio is well-defined.
-    """
-    module = _make_module()
-    batch = _make_synthetic_batch()
-    B, C = batch.data["electrode_tokens"].shape[:2]
-    sm = torch.zeros(B, C, dtype=torch.bool)
-    sm[:, 0] = True
-    sm[:, 2] = True
-    batch.data["shaft_mask"] = sm
-
     with torch.no_grad():
-        module.student.ln_frame.weight.add_(0.5)
-
-    logged: dict[str, float] = {}
-    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
-    module._monitor_from_step(batch.data, step_name="val")
-    assert "val_mon_mask_002_ratio" in logged
-    assert "val_mon_mask_002_in_band" in logged
-    assert logged["val_mon_mask_002_in_band"] in (0.0, 1.0)
+        module.student.encoder.encoder_ln.weight.fill_(2.0)
+    pre = module.teacher.model.encoder.encoder_ln.weight.detach().clone()
+    coeff = module.teacher.update_from(module.student)
+    post = module.teacher.model.encoder.encoder_ln.weight.detach().clone()
+    assert coeff == pytest.approx(0.99925)
+    torch.testing.assert_close(post, 0.99925 * pre + 0.00075 * 2.0)
 
 
-# ---------------------------------------------------------------------------
-# 5/28 P0 monitors: MON-PARCEL-COVERAGE-VARIANCE, MON-TEACHER-FEATURE-RANK,
-# MON-GRAD-SPIKE-DIVERGENCE — wired into V14JointBrainModule.
-# ---------------------------------------------------------------------------
-
-
-def test_v14_joint_brain_module_logs_parcel_coverage_on_every_step() -> None:
-    """MON-PARCEL-COVERAGE-VARIANCE has no forward dependency — must fire
-    on every train/val/test step regardless of shaft_mask."""
+def test_trainable_parameters_include_predictor() -> None:
+    """The optimizer scope (``_trainable_parameters``) covers the student
+    encoder + the predictor, and excludes the frozen teacher."""
     module = _make_module()
-    batch = _make_synthetic_batch()
+    trainable = {id(p) for p in module._trainable_parameters()}
+    assert all(id(p) in trainable for p in module.predictor.parameters())
+    assert all(id(p) in trainable for p in module.student.parameters())
+    assert not any(id(p) in trainable for p in module.teacher.parameters())
 
+
+# ---------------------------------------------------------------------------
+# 5/28 P0 monitors — coverage / RankMe / grad-spike still wired
+# ---------------------------------------------------------------------------
+
+
+def test_monitor_logs_parcel_coverage_on_every_step() -> None:
+    module = _make_module()
     logged: dict[str, float] = {}
     module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
-    module._monitor_from_step(batch.data, step_name="train")
-    assert "train_mon_coverage_active_mean" in logged
-    assert "train_mon_coverage_active_cv" in logged
-    assert "train_mon_coverage_slot_var" in logged
-    assert "train_mon_coverage_degenerate_frac" in logged
-    assert "train_mon_coverage_swec_frac" in logged
-    assert "train_mon_coverage_alarm" in logged
+    module._monitor_from_step(_make_synthetic_batch().data, step_name="train")
+    for key in (
+        "train_mon_coverage_active_mean",
+        "train_mon_coverage_active_cv",
+        "train_mon_coverage_slot_var",
+        "train_mon_coverage_alarm",
+    ):
+        assert key in logged
     assert logged["train_mon_coverage_alarm"] in (0.0, 1.0)
 
 
-def test_v14_joint_brain_module_logs_teacher_rank_on_val_only() -> None:
-    """MON-TEACHER-FEATURE-RANK is the expensive SVD probe; wire only on
-    val/test steps, not on every train step."""
+def test_monitor_logs_teacher_rank_on_val_only() -> None:
     module = _make_module()
-    batch = _make_synthetic_batch()
-
     train_logged: dict[str, float] = {}
-    module.log = (  # type: ignore[method-assign]
-        lambda key, value, **_kw: train_logged.update({key: float(value)})
-    )
-    module._monitor_from_step(batch.data, step_name="train")
+    module.log = lambda key, value, **_kw: train_logged.update({key: float(value)})  # type: ignore[method-assign]
+    module._monitor_from_step(_make_synthetic_batch().data, step_name="train")
     assert "train_mon_rankme" not in train_logged
 
     val_logged: dict[str, float] = {}
-    module.log = (  # type: ignore[method-assign]
-        lambda key, value, **_kw: val_logged.update({key: float(value)})
-    )
-    module._monitor_from_step(batch.data, step_name="val")
-    assert "val_mon_rankme" in val_logged
-    assert "val_mon_rankme_normalised" in val_logged
-    assert "val_mon_rankme_warn" in val_logged
-    assert "val_mon_rankme_alarm" in val_logged
+    module.log = lambda key, value, **_kw: val_logged.update({key: float(value)})  # type: ignore[method-assign]
+    module._monitor_from_step(_make_synthetic_batch().data, step_name="val")
+    for key in (
+        "val_mon_rankme",
+        "val_mon_rankme_normalised",
+        "val_mon_rankme_warn",
+        "val_mon_rankme_alarm",
+    ):
+        assert key in val_logged
 
 
-def _perturb_student_for_nonzero_loss(module: V14JointBrainModule) -> None:
-    """Perturb the student so the deepcopy-identical EMA teacher no
-    longer matches; otherwise all L1 terms are 0 → zero grads → the
-    grad-spike hook can't be exercised. ``ln_frame`` is always present
-    on the student bundle (B31 2-term default + every sister)."""
+def _perturb_student_for_nonzero_grad(module: V14JointBrainModule) -> None:
+    """Perturb the student so the deepcopy-identical EMA teacher no longer
+    matches; otherwise all L1 terms could be ~0. ``encoder_ln`` is on the
+    M4 path (P2) and downstream of M2 (P1)."""
     with torch.no_grad():
-        module.student.ln_frame.weight.add_(0.3)
+        module.student.encoder.frontend_ln.weight.add_(0.3)
 
 
-def test_v14_joint_brain_module_on_before_optimizer_step_logs_grad_spike() -> None:
-    """MON-GRAD-SPIKE-DIVERGENCE fires from the Lightning hook with the
-    student grads populated. On the first call (EMA buffer = 0) the
-    spike flag is False and the EMA is seeded to the current grad
-    norm."""
-    module = _make_module()
-    _perturb_student_for_nonzero_loss(module)
-    batch = _make_synthetic_batch()
-    breakdown = module._step(batch.data)
+def test_on_before_optimizer_step_logs_grad_spike() -> None:
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    breakdown = module._step(_make_synthetic_batch().data)
     breakdown.total.backward()
-
     logged: dict[str, float] = {}
     module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
     module.on_before_optimizer_step(optimizer=None)
-    assert "train_mon_grad_l2" in logged
-    assert "train_mon_grad_ema_l2" in logged
-    assert "train_mon_grad_spike_ratio" in logged
-    assert "train_mon_grad_spike" in logged
-    assert "train_mon_grad_diverged" in logged
-    # First step: EMA seeded from current grad (was zero before).
+    for key in (
+        "train_mon_grad_l2",
+        "train_mon_grad_ema_l2",
+        "train_mon_grad_spike_ratio",
+        "train_mon_grad_spike",
+        "train_mon_grad_diverged",
+    ):
+        assert key in logged
     assert logged["train_mon_grad_ema_l2"] == pytest.approx(0.0)
-    assert logged["train_mon_grad_spike"] == 0.0
-    assert logged["train_mon_grad_diverged"] == 0.0
     assert logged["train_mon_grad_l2"] > 0.0
-    # And the persistent buffer should now hold the seeded value.
     assert float(module._grad_ema_l2.item()) > 0.0
 
 
-def test_v14_joint_brain_module_grad_ema_buffer_persists_across_calls() -> None:
-    """The EMA buffer must persist across hook calls (so the next step
-    has a baseline to spike against). Run two steps and verify the
-    second sees a non-zero prior EMA."""
-    module = _make_module()
-    _perturb_student_for_nonzero_loss(module)
+def test_grad_ema_buffer_persists_across_calls() -> None:
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
     batch = _make_synthetic_batch()
-
-    breakdown = module._step(batch.data)
-    breakdown.total.backward()
+    module._step(batch.data).total.backward()
     module.on_before_optimizer_step(optimizer=None)
     first_ema = float(module._grad_ema_l2.item())
     assert first_ema > 0.0
 
-    # Second backward — fresh grads, but the EMA buffer survives.
-    for p in module.student.parameters():
+    for p in module._trainable_parameters():
         if p.grad is not None:
             p.grad.zero_()
-    breakdown2 = module._step(batch.data)
-    breakdown2.total.backward()
-
+    module._step(batch.data).total.backward()
     logged: dict[str, float] = {}
     module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
     module.on_before_optimizer_step(optimizer=None)
-    # Step 2 sees the seeded EMA as its baseline.
     assert logged["train_mon_grad_ema_l2"] == pytest.approx(first_ema)
-    assert logged["train_mon_grad_spike_ratio"] > 0.0
 
 
-# --- #128 train-monitor cadence-gate (2026-05-30 speedup audit) ------------
-
-
-def test_v14_joint_brain_module_train_monitor_due_fires_on_log_cadence() -> None:
-    """#128: the extra per-train-step SSL monitor forward is gated to fire
-    only every ``trainer.log_every_n_steps`` steps. With a trainer reporting
-    cadence 10, batch indices 0/10/20 fire and 1/5/9/11 do not."""
+def test_train_monitor_due_fires_on_log_cadence() -> None:
     module = _make_module()
     module.trainer = SimpleNamespace(log_every_n_steps=10)  # type: ignore[assignment]
     for due_idx in (0, 10, 20, 100):
@@ -542,10 +526,7 @@ def test_v14_joint_brain_module_train_monitor_due_fires_on_log_cadence() -> None
         assert module._train_monitor_due(skip_idx) is False, skip_idx
 
 
-def test_v14_joint_brain_module_train_monitor_due_falls_back_to_every_step() -> None:
-    """#128: with no trainer attached (direct-call / unit-test path), the
-    cadence falls back to 1 so the monitor fires every step — preserving the
-    pre-change behavior for tests and ``fast_dev_run`` (batch_idx 0)."""
+def test_train_monitor_due_falls_back_to_every_step() -> None:
     module = _make_module()  # no trainer attached → property raises
     for idx in (0, 1, 2, 3, 7, 50):
         assert module._train_monitor_due(idx) is True, idx

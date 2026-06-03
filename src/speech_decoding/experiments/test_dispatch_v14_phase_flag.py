@@ -11,28 +11,43 @@ import pytest
 from speech_decoding.experiments.dispatch_v14 import main
 
 
-@pytest.mark.parametrize(
-    "phase, expected_substrings",
-    [
-        # B29 Item 1 (2026-05-27 PM-late) collapsed P1 + P2 into a single
-        # joint SSL phase routed through V14JointExperiment. B2.1 (#96)
-        # closed 2026-05-28: phase=1 now constructs V14JointExperiment;
-        # the SSL training-step blockers (B2.2-B2.5) raise from inside
-        # ``V14JointExperiment._train_and_test`` instead. Phase 2 stays
-        # gated with the B29 Item 1 redirect message; Phase 3 stays
-        # gated on a frozen SSL checkpoint.
-        (2, ("B29 Item 1", "joint phase", "V14JointExperiment")),
-        (3, ("Phase-3 distillation", "frozen SSL checkpoint", "B29 Item 1")),
-    ],
-)
-def test_phase_2_3_raise_with_blocker_ids(
-    phase: int, expected_substrings: tuple[str, ...]
-) -> None:
+def test_phase_2_raises_with_blocker_ids() -> None:
+    """Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
+    phase by B29 Item 1; it stays gated at the dispatch level with the
+    redirect-to-``--phase 1`` message."""
     with pytest.raises(NotImplementedError) as exc_info:
-        main(["--phase", str(phase), "--dry-run"])
+        main(["--phase", "2", "--dry-run"])
     message = str(exc_info.value)
-    for token in expected_substrings:
-        assert token in message, f"phase {phase}: missing blocker id {token}"
+    for token in ("B29 Item 1", "joint phase", "V14JointExperiment"):
+        assert token in message, f"phase 2: missing blocker id {token}"
+
+
+def test_phase_3_dry_run_no_longer_gated(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """WS-F: --phase 3 is no longer blanket-gated. --dry-run short-circuits
+    before any build, so it exits 0 (the module/experiment are wired); the
+    live (non-dry-run) path raises the precise whisper_target data blocker —
+    see :func:`test_phase_3_live_raises_whisper_target_data_blocker`."""
+    rc = main(["--phase", "3", "--dry-run"])
+    assert rc == 0
+    assert "V14 dispatch" in capsys.readouterr().out
+
+
+def test_phase_3_live_raises_whisper_target_data_blocker() -> None:
+    """WS-F: a real --phase 3 run (no --dry-run) fails fast with the precise
+    remaining blocker — the whisper_target data emission (WS-H) — rather than
+    silently building a Phase-4 CE classifier. The module + experiment
+    themselves are wired (V14Phase3DistillModule / V14Phase3Experiment) and
+    unit-tested in test_v14_phase3.py; full P3 end-to-end construction is the
+    WS-I2 capstone (pending)."""
+    with pytest.raises(NotImplementedError) as exc_info:
+        main(["--phase", "3"])
+    message = str(exc_info.value)
+    for token in (
+        "whisper_target", "V14Phase3DistillModule", "WS-H", "v14_phase3.py",
+    ):
+        assert token in message, f"phase 3: missing blocker token {token}"
 
 
 def test_phase_1_dry_run_constructs_joint_experiment_path(

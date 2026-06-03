@@ -329,9 +329,9 @@ except ImportError:  # pragma: no cover — tests without neuralset import
 
 
 class BTShaftMaskExtractor(_BaseStatic):  # type: ignore[misc,valid-type]
-    """Per-event ``(c_max,) bool`` shaft-mask aligned with the DK / valid-mask filter.
+    """Per-event ``(c_max,) bool`` shaft-mask aligned to the voltage electrode order.
 
-    Composes BT subject anatomy (``depth-wm.csv``) →
+    Composes BT voltage electrode labels (``voltage_electrode_order``) →
     :class:`SubjectAnatomy` → :class:`ShaftMaskExtractor.__call__` → pad to
     ``(c_max,)`` with ``False``. ``True`` at shaft-blocked electrodes.
 
@@ -341,11 +341,12 @@ class BTShaftMaskExtractor(_BaseStatic):  # type: ignore[misc,valid-type]
     :class:`V14JointBrainModule` already routes ``batch.data["shaft_mask"]``
     student-only.
 
-    Parameters mirror :class:`ElectrodeValidMask` / :class:`V14DKHardSupportExtractor`
-    so the electrode-axis ordering matches across ``support``, ``valid_mask``,
-    ``electrode_tokens``, and ``shaft_mask``. ``unknown_label_policy="skip"``
-    drops out-of-vocab DK labels (matches the other extractors' production
-    config); ``"raise"`` rejects any subject with an unknown label.
+    The electrode axis is the VOLTAGE order
+    (``BrainTreebankSubject.electrode_labels``), so it lines up row-for-row with
+    ``support`` / ``valid_mask`` / ``electrode_tokens`` (C1/C2 fix). Shaft
+    membership is parsed from the physical electrode label and is independent of
+    the DK vocabulary, so there is no unknown-label filter here — every voltage
+    electrode sits on a physical shaft and participates.
 
     Sister cells:
 
@@ -361,7 +362,6 @@ class BTShaftMaskExtractor(_BaseStatic):  # type: ignore[misc,valid-type]
     seed: int = 0
     k_override: int | None = None
     extent_blocks: tuple[str, ...] = ("alpha",)
-    unknown_label_policy: tp.Literal["raise", "skip"] = "raise"
 
     def get_static(self, event: tp.Any) -> Tensor:
         # Imports kept local so the module stays importable without
@@ -369,34 +369,21 @@ class BTShaftMaskExtractor(_BaseStatic):  # type: ignore[misc,valid-type]
         # ``SubjectAnatomy`` directly).
         from speech_decoding.extractors.dk_support import _coerce_subject_id
         from speech_decoding.studies.braintreebank.anatomy import (
-            V14_DK_PARCEL_LABELS,
-            load_public_bt_anatomy,
+            voltage_electrode_order,
         )
 
         subject_id = _coerce_subject_id(getattr(event, "subject"))
-        anatomy_df = load_public_bt_anatomy(self.bt_root, subject_id)
-
-        if self.unknown_label_policy == "skip":
-            keep = anatomy_df["DesikanKilliany"].isin(V14_DK_PARCEL_LABELS)
-            anatomy_df = anatomy_df.loc[keep].reset_index(drop=True)
-        else:
-            unknown = sorted(
-                set(anatomy_df["DesikanKilliany"]) - set(V14_DK_PARCEL_LABELS)
-            )
-            if unknown:
-                raise KeyError(
-                    "BT anatomy labels absent from parcel vocabulary: "
-                    f"{unknown[:10]}"
-                    + (f" (+{len(unknown) - 10} more)" if len(unknown) > 10 else "")
-                )
-
-        n_real = len(anatomy_df)
+        # Shaft membership is parsed from the physical label, so this aligns to
+        # the VOLTAGE electrode order (same axis as support / valid_mask /
+        # electrode_tokens) and needs no DK-vocab filter — an out-of-vocab
+        # electrode still sits on a physical shaft (C1/C2 fix).
+        electrode_labels = voltage_electrode_order(self.bt_root, subject_id)
+        n_real = len(electrode_labels)
         if n_real > self.c_max:
             raise ValueError(
                 f"subject {subject_id} has {n_real} electrodes which exceeds c_max={self.c_max}"
             )
 
-        electrode_labels = tuple(anatomy_df["Electrode"].astype(str).tolist())
         anatomy = SubjectAnatomy(
             shaft_ids=_bt_shaft_ids_from_labels(electrode_labels),
             contact_pos=_bt_contact_pos_from_labels(electrode_labels),

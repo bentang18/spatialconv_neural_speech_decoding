@@ -207,7 +207,7 @@ def test_ref_aug_multi_stft_view_no_ref_aug_sister_passes_shaft_car_only(
     out = view._get_timed_array(_FakeEvent("tl-0"), start=0.0, duration=1.0)
     assert isinstance(out, TimedArray)
     arr = np.asarray(out.data)
-    # 30-bin filterbank @ hop=256 over 2048 samples → T_bin ≈ 9.
+    # 30-bin filterbank @ hop=128 over 2048 samples → T_bin = 17 (time unchecked).
     assert arr.shape[0] == 4
     assert arr.shape[1] == 30
 

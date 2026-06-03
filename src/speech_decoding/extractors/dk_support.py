@@ -2,20 +2,27 @@
 
 Reads BT-shipped ``localization/sub_<id>/depth-wm.csv`` and emits per-event
 ``(n_electrodes, K=80)`` one-hot support over the canonical v14 DK parcel
-vocabulary (``V14_DK_PARCEL_LABELS``). Consumed by the v14 encoder cross-attn
-``log(support + eps)`` Graphormer-style anatomy bias.
+vocabulary (``V14_DK_PARCEL_LABELS``). Consumed by the v14 encoder's hard
+block-diagonal per-parcel pool: the one-hot assignment IS the routing — a
+parcel-slot attends ONLY to its own parcel's electrodes (B36 2026-06-01
+replaced the soft ``log(support + eps)`` Graphormer bias).
 
-Row order matches depth-wm.csv row order — the canonical per-subject electrode
-order that downstream NeuralSet alignment assumes.
+Row order matches the VOLTAGE electrode order — exactly
+``BrainTreebankSubject.electrode_labels`` (the cleaned, corrupted/trigger/
+missing-coord-filtered ``electrode_labels.json`` order), which is the channel
+order the loader feeds the front-end. This is NOT the same as ``depth-wm.csv``
+row order: support row ``c`` therefore lines up with ``electrode_tokens[c]``
+(C1/C2 fix). See ``anatomy.voltage_electrode_order``.
 
 Labels falling outside the K=80 vocabulary (e.g. BT btbank4 has
-``Left-Inf-Lat-Vent`` ventricle electrodes) raise by default; cohort-loading
-layers can pass ``unknown_label_policy="skip"`` to drop those electrodes.
+``Left-Inf-Lat-Vent`` ventricle electrodes), and voltage electrodes with no
+``depth-wm.csv`` row, raise by default; cohort-loading layers can pass
+``unmapped_policy="zero"`` to emit a zero support row + ``valid=False`` for
+those electrodes **in place** (no re-pack — positions stay aligned).
 """
 
 from __future__ import annotations
 
-import functools
 import re
 import typing as tp
 
@@ -25,62 +32,39 @@ from neuralset.extractors.base import BaseStatic
 
 from speech_decoding.studies.braintreebank.anatomy import (
     V14_DK_PARCEL_LABELS,
-    build_hard_public_bt_label_support,
-    load_public_bt_anatomy,
+    aligned_voltage_support,
 )
-
-
-@functools.lru_cache(maxsize=64)
-def _cached_hard_support(
-    bt_root: str,
-    subject_id: int,
-    unknown_label_policy: str,
-    parcel_labels: tuple[str, ...],
-) -> torch.Tensor:
-    """Per-subject DK-hard one-hot support ``(n_real, K)``, memoized.
-
-    ``load_public_bt_anatomy`` re-reads + re-parses ``depth-wm.csv`` on every
-    call (~5 ms); the value is static per subject, so the un-memoized version
-    was ~38% of warm-cache ``__getitem__`` cost. ``lru_cache`` does not cache
-    exceptions, so the FileNotFoundError / KeyError paths are preserved.
-
-    The returned tensor is shared across callers; ``get_static`` always returns
-    a copy (a fresh padded buffer when ``c_max`` is set, else ``.clone()``), so
-    callers never mutate the cached array.
-    """
-    anatomy = load_public_bt_anatomy(bt_root, subject_id)
-    if unknown_label_policy == "skip":
-        mask = anatomy["DesikanKilliany"].isin(parcel_labels)
-        anatomy = anatomy.loc[mask].reset_index(drop=True)
-    electrode_labels = tuple(anatomy["Electrode"].tolist())
-    result = build_hard_public_bt_label_support(
-        electrode_labels, anatomy, parcel_labels,
-    )
-    return torch.from_numpy(result.support)
 
 
 class V14DKHardSupportExtractor(BaseStatic):
     """Per-event DK-hard-one-hot support tensor.
 
-    Default output shape is ``(n_electrodes, K=80)`` in depth-wm.csv row order.
-    Setting ``c_max`` pads to ``(c_max, K=80)`` with zero-rows so per-batch
-    collation aligns alongside ``LogStftView`` and ``ElectrodeValidMask``.
+    Default output shape is ``(n_voltage, K=80)`` in VOLTAGE electrode order
+    (``BrainTreebankSubject.electrode_labels``). Setting ``c_max`` pads to
+    ``(c_max, K=80)`` with zero-rows so per-batch collation aligns alongside
+    ``MultiStftView`` and ``ElectrodeValidMask``.
     """
 
     event_types: tp.Literal["Ieeg"] = "Ieeg"
     bt_root: str
-    unknown_label_policy: tp.Literal["raise", "skip"] = "raise"
+    unmapped_policy: tp.Literal["raise", "zero"] = "raise"
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS
     c_max: int | None = None
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
-        # Memoized per-subject lookup: load_public_bt_anatomy re-reads
-        # depth-wm.csv on every call, which is static per subject. The
-        # FileNotFoundError ("...depth-wm.csv") and KeyError ("absent from
-        # parcel vocabulary") paths are preserved inside the cached helper.
-        support = _cached_hard_support(
-            self.bt_root, subject_id, self.unknown_label_policy, self.parcel_labels,
+        # ``aligned_voltage_support`` is memoized per subject and keyed on the
+        # voltage electrode order; ``from_numpy`` is a cheap zero-copy view over
+        # its shared array. The FileNotFoundError ("...depth-wm.csv" /
+        # "...electrode_labels") and KeyError ("absent from parcel vocabulary")
+        # paths flow through unchanged (lru_cache does not cache exceptions).
+        support = torch.from_numpy(
+            aligned_voltage_support(
+                self.bt_root,
+                subject_id,
+                parcel_labels=self.parcel_labels,
+                unmapped_policy=self.unmapped_policy,
+            ).support
         )
         if self.c_max is not None:
             n_real = support.shape[0]
@@ -92,8 +76,7 @@ class V14DKHardSupportExtractor(BaseStatic):
             padded[:n_real] = support
             return padded
         # c_max is None: never hit by the live pipeline (dispatch pins
-        # c_max=384), but clone so callers can't mutate the shared cached
-        # tensor in place and poison _cached_hard_support for the subject.
+        # c_max=384), but clone so callers can't mutate the shared cached array.
         return support.clone()
 
 

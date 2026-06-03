@@ -71,6 +71,14 @@ class Experiment(BaseExperiment):
     checkpoint_monitor: str = "val_loss"
     csv_config: CsvLoggerConfig | None = None
     wandb_config: WandbLoggerConfig | None = None
+    # B36 WS-E (E3/E4): cross-phase checkpoint handoff. ``pretrained_ckpt``
+    # warm-starts the brain module from a prior phase's snapshot before fit;
+    # ``snapshot_ckpt_to`` writes this run's transferable state after test so
+    # the next phase can load it. Both default off — inert for single-phase
+    # runs. The multi-phase driver (``experiments/v14_phase_pipeline.py``)
+    # wires one phase's ``snapshot_ckpt_to`` to the next's ``pretrained_ckpt``.
+    pretrained_ckpt: str | None = None
+    snapshot_ckpt_to: str | None = None
     infra: exca.TaskInfra = exca.TaskInfra(version="1")
 
     def _input_tensor_name(self) -> str:
@@ -169,6 +177,37 @@ class Experiment(BaseExperiment):
             return Path(self.infra.folder) / "records", ""
         return Path(uid_folder), Path(uid_folder).name
 
+    def _load_pretrained(self, brain_module: pl.LightningModule, ckpt_path: str) -> None:
+        """E4: warm-start ``brain_module`` from a prior phase's snapshot.
+
+        Delegates to the module's ``load_transferable_state`` protocol (the
+        v14 BrainModules implement it: encoder strict-load + teacher re-sync,
+        phase-local keys dropped). A module without the protocol is a hard
+        error — the handoff contract is explicit, never a silent no-op.
+        """
+        loader = getattr(brain_module, "load_transferable_state", None)
+        if loader is None:
+            raise TypeError(
+                f"{type(brain_module).__name__} has no load_transferable_state; "
+                "pretrained_ckpt handoff needs the transferable-state protocol."
+            )
+        # weights_only=True: the snapshot is a pure dict-of-tensor-dicts
+        # (``transferable_state``); load it under the safe unpickler.
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        loader(state, strict=True)
+
+    def _snapshot(self, brain_module: pl.LightningModule, ckpt_path: str) -> None:
+        """E3: write the trained module's transferable state for the next phase."""
+        snap = getattr(brain_module, "transferable_state", None)
+        if snap is None:
+            raise TypeError(
+                f"{type(brain_module).__name__} has no transferable_state; "
+                "snapshot_ckpt_to handoff needs the transferable-state protocol."
+            )
+        path = Path(ckpt_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(snap(), str(path))
+
     def _train_and_test(self) -> dict[str, float | None]:
         pl.seed_everything(self.seed, workers=True)
         # CR01: pl.seed_everything may miss some CUDA RNG init paths in
@@ -177,10 +216,17 @@ class Experiment(BaseExperiment):
         # CR02: per-worker numpy + random + torch RNG seeded as seed+worker_id.
         loaders = self.data.build(worker_seed=self.seed)
         brain_module = self._build_brain_module(loaders["train"])
+        # B36 WS-E (E4): warm-start the encoder (+PMA from P3) from the prior
+        # phase BEFORE fit, so the optimizer/scheduler see the loaded weights.
+        if self.pretrained_ckpt is not None:
+            self._load_pretrained(brain_module, self.pretrained_ckpt)
         trainer = self._trainer()
         if not self.test_only:
             trainer.fit(brain_module, loaders["train"], loaders["val"])
         results = trainer.test(brain_module, loaders["test"])
+        # B36 WS-E (E3): snapshot this phase's transferable state for the next.
+        if self.snapshot_ckpt_to is not None:
+            self._snapshot(brain_module, self.snapshot_ckpt_to)
         return dict(results[0]) if results else {}
 
     @infra.apply

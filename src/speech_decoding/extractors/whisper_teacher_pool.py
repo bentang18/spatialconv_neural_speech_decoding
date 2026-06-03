@@ -76,7 +76,15 @@ def triangular_pool_50_to_8_hz(features: Tensor) -> Tensor:
             f"expected 250 Whisper frames (5 s × 50 Hz); got "
             f"{features.shape[-2]}"
         )
-    W = triangular_pool_weight_matrix(_EXPECTED_N_IN, _EXPECTED_N_OUT)  # (40, 250)
-    W = W.to(features.device, features.dtype)
+    W = triangular_pool_weight_matrix(_EXPECTED_N_IN, _EXPECTED_N_OUT)  # (40, 250) fp32
+    W = W.to(features.device)
+    # Accumulate in fp32: the cache is fp16, and a fp16 einsum over ~12-13
+    # frames per bucket loses precision — fit_channel_stats upcasts the same
+    # way. Cast back to the caller's dtype so the output contract is unchanged.
+    # einsum is autocast-eligible, so disable autocast here: Lightning runs the
+    # P3 distill step under bf16-mixed, which would otherwise downcast the
+    # explicit fp32 inputs back to bf16 and defeat the fp32 accumulation.
     # (B, N_in, D) × (N_out, N_in) → (B, N_out, D)
-    return torch.einsum("ot,btd->bod", W, features)
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        out = torch.einsum("ot,btd->bod", W, features.to(torch.float32))
+    return out.to(features.dtype)

@@ -97,10 +97,10 @@ def test_v14_joint_experiment_accepts_b30_sister_flag_defaults() -> None:
 
 
 def test_v14_joint_experiment_default_loss_variant_is_b31_default() -> None:
-    """B31 lock 2026-05-28 PM-late: ``V14JointExperiment.loss_variant``
-    defaults to ``"b31_default"`` (the V-JEPA-2-canonical 2-term joint
-    SSL surface). The three sister variants are accepted by the field
-    Literal without raising."""
+    """B36 WS-B: ``loss_variant`` still defaults to ``"b31_default"`` (the
+    single-term masked-JEPA surface). The field's Literal retains all 4 B31
+    arms for dispatch config-record compatibility, but only the default is
+    wired (the multi-term ``b31_plus_*`` sisters are quarantined — B9)."""
     from speech_decoding.experiments.v14_joint import (
         JOINT_PHASE_VALUE,
         LossVariant,
@@ -114,30 +114,68 @@ def test_v14_joint_experiment_default_loss_variant_is_b31_default() -> None:
     )
     xp.model_post_init(None)
     assert xp.loss_variant == "b31_default"
-    # Schema check: the Literal exposes all 4 B31 arms.
+    # Schema check: the Literal still exposes all 4 B31 arms.
     assert set(tp.get_args(LossVariant)) == {
         "b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both",
     }
 
 
-@pytest.mark.parametrize(
-    "variant",
-    ["b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both"],
-)
-def test_v14_joint_experiment_propagates_loss_variant(variant: str) -> None:
-    """The 4 B31 ``loss_variant`` values are all accepted and persisted
-    onto the V14JointExperiment instance — the value is what
-    ``_build_brain_module`` threads onto :class:`V14JointBrainModule`."""
+@pytest.mark.parametrize("variant", ["b31_plus_m3", "b31_plus_utt", "b31_plus_both"])
+def test_v14_joint_experiment_quarantines_multiterm_loss_variants(variant: str) -> None:
+    """B9 (B36 WS-B): the masked-JEPA default is single-term per phase, so
+    the B31 multi-term aggregator sisters are quarantined — they raise
+    :class:`NotImplementedError` at construction until re-added on the
+    masked path (R-add-m3-loss / R-add-utterance-loss)."""
+    from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
+
+    with pytest.raises(NotImplementedError, match="single-term"):
+        V14JointExperiment.model_construct(
+            phase=JOINT_PHASE_VALUE,
+            latent_valid_override="support",
+            sa_mask_mode="bidirectional",
+            loss_variant=variant,
+        )
+
+
+def test_v14_joint_experiment_jepa_phase_and_mask_ratio_defaults() -> None:
+    """B36 WS-B: the masked-JEPA phase defaults to P1 with the 6/03
+    masking-lock defaults (M2 ``bands`` held-out 0.50 / M4 ``tube`` 0.20 of
+    covered parcels, ``cross_time`` predictor); WS-E threads the staged
+    P1→P2 handoff."""
     from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
 
     xp = V14JointExperiment.model_construct(
         phase=JOINT_PHASE_VALUE,
         latent_valid_override="support",
         sa_mask_mode="bidirectional",
-        loss_variant=variant,
     )
     xp.model_post_init(None)
-    assert xp.loss_variant == variant
+    assert xp.jepa_phase == "p1"
+    assert xp.m2_mask_type == "bands"
+    assert xp.m2_mask_ratio == pytest.approx(0.50)
+    assert xp.m4_mask_type == "tube"
+    assert xp.m4_mask_ratio == pytest.approx(0.20)
+    assert xp.predictor_scope == "cross_time"
+    assert xp.mask_seed == 0
+
+
+def test_v14_joint_experiment_rejects_h1_leak_coupling_at_config_time() -> None:
+    """B36 coupling guard fires at the CONFIG layer (``model_post_init``), not
+    only in the module: the H1-leak pairing (``time_block`` mask +
+    ``cross_time`` predictor — masked-at-t target visible at t±1) must raise
+    before dispatch. A regression dropping the ``validate_m4_coupling`` call
+    from ``model_post_init`` is caught here. ``model_construct`` triggers
+    ``model_post_init`` in pydantic v2 so the raise lands at construction."""
+    from speech_decoding.experiments.v14_joint import JOINT_PHASE_VALUE
+
+    with pytest.raises(ValueError, match="H1 leak"):
+        V14JointExperiment.model_construct(
+            phase=JOINT_PHASE_VALUE,
+            latent_valid_override="support",
+            sa_mask_mode="bidirectional",
+            m4_mask_type="time_block",
+            predictor_scope="cross_time",
+        )
 
 
 def test_v14_joint_experiment_rejects_b30_sister_latent_valid_override() -> None:

@@ -28,12 +28,16 @@ over 40k steps) are retired. The V-JEPA 1 ramp is preserved as the
 
 P3 distillation uses an external frozen Whisper teacher and skips EMA entirely.
 
-LOSS-06 (v14_implementation_fix_list.md §A.4 + B11 in v14_blockers.md):
-data2vec-2.0 / EAT recipe layer-averaging with per-layer instance-norm.
-``layer_avg_with_instance_norm()`` accepts a list of K=6 layer outputs and
-returns the per-layer instance-normed average. Used by ``L_post_frame`` to
-build the EMA target (and by the ``L_mid_slot`` sister when that B31 sister
-is enabled).
+``layer_avg_with_instance_norm()`` (data2vec-2.0 / EAT recipe layer-averaging
+with per-layer instance-norm; accepts K=6 layer outputs, returns the per-layer
+instance-normed average) is **RETIRED from the default path (B36 WS-B / B9)**.
+Under the canonical V-JEPA-2 target-norm the SSL target is the EMA teacher's
+own terminal LayerNorm tap (``frontend_ln`` at M2, ``encoder_ln`` at M4), so
+this helper builds NO live target — it is on no runtime path (grep confirms:
+only this module + its unit test reference it). It is kept solely as the
+``R-layer-avg-target`` data2vec-recipe sister-cell falsifier and its numeric
+unit test; the earlier docstring claim that it is "used by ``L_post_frame`` /
+the ``L_mid_slot`` sister" is stale and was corrected here.
 
 **B26 teacher full-input contract** (V-JEPA 2 §2.1, V-JEPA 2.1 §2.3.1):
 in the SSL loss path, the EMA teacher MUST encode the full unmasked
@@ -228,7 +232,14 @@ def layer_avg_with_instance_norm(
     instance_norm_dim: int = -1,
     eps: float = 1e-6,
 ) -> Tensor:
-    """data2vec-2.0 / EAT teacher target builder (LOSS-06; B11 closed).
+    """data2vec-2.0 / EAT teacher target builder.
+
+    **RETIRED from the default path (B36 WS-B / B9).** The canonical
+    V-JEPA-2 target is the EMA teacher's own terminal LayerNorm tap, so this
+    layer-averaging builder is on no runtime path; it survives only as the
+    ``R-layer-avg-target`` sister-cell falsifier and its unit test. The
+    P1/P2 "symmetric across N=6 token blocks / L=6 latent stack" note below
+    describes that retired data2vec recipe, NOT the live masked-JEPA loss.
 
     For each layer output ``L_k`` (shape ``(*lead, d)``), apply instance-norm
     across ``instance_norm_dim`` then average across the K layer outputs.
@@ -237,8 +248,7 @@ def layer_avg_with_instance_norm(
     larger activation magnitudes.
 
     Use the LAST K layers from the teacher's forward (typically K=6 for v14's
-    L=6 latent stack); caller selects which K. Symmetric across P1 (N=6 token
-    blocks) and P2 (L=6 latent stack).
+    L=6 latent stack); caller selects which K.
     """
     if len(layer_outputs) == 0:
         raise ValueError("layer_outputs must be non-empty")

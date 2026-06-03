@@ -6,12 +6,30 @@ contract — shape, dtype, channel-name ↔ row alignment, sfreq passthrough.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
+import mne
 import numpy as np
 import pytest
 
+from speech_decoding.extractors.reference import CARIeegExtractor, parse_shaft
+from speech_decoding.studies.braintreebank.anatomy import clean_bt_electrode_label
 from speech_decoding.studies.braintreebank.loader import bt_load_raw
+
+# Real BT per-subject label JSONs live in the untracked vendored cache (not in
+# CI). The synthetic fixtures below run everywhere; the all-subjects test skips
+# when the cache is absent. `parents[4]` == repo root (mirrors test_anatomy.py).
+_BT_CACHE = Path(__file__).resolve().parents[4] / ".cache" / "braintreebank"
+
+# Two real mark geometries. sub_2 has 34 TRAILING-marked contacts (22 `*` + 12
+# `#`, across 3 shafts) — the only geometry that fragments `parse_shaft` into
+# singleton shafts (the silent-zeroing bug). sub_7/9/10 carry a MID-LABEL `*`
+# (`RF2I*1`) that keeps its trailing digit and groups fine even raw. The loader
+# strips both. `_SUB2_RAW_LABELS` magnifies the bug into one synthetic shaft;
+# d1d checks the real per-shaft split across the vendored cohort.
+_SUB2_RAW_LABELS = [f"RT1aIa{i}*" for i in range(1, 35)]
 
 
 @dataclass
@@ -56,3 +74,99 @@ def test_bt_load_raw_rejects_non_2d_voltage() -> None:
     )
     with pytest.raises(ValueError, match="expected"):
         bt_load_raw(fake, trial_id=1)
+
+
+# --- WS-D1: `*`/`#` mark -> singleton shaft -> shaft-CAR zeroing regression ---
+
+
+def _make_raw(ch_names: list[str], data: np.ndarray, sfreq: float = 200.0) -> mne.io.RawArray:
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="seeg")
+    return mne.io.RawArray(np.asarray(data, dtype=np.float64), info, verbose=False)
+
+
+def test_d1a_raw_trailing_mark_fragments_shaft_parser_into_singletons() -> None:
+    """(a) On RAW sub_2 labels the trailing `*` defeats `parse_shaft`'s
+    numeric-suffix match -> 34 distinct singleton stems; cleaning collapses them
+    back to one real `RT1aIa` shaft."""
+    raw_stems = {parse_shaft(label)[0] for label in _SUB2_RAW_LABELS}
+    assert len(raw_stems) == 34  # every contact its own shaft — the bug
+    clean_stems = {parse_shaft(clean_bt_electrode_label(label))[0] for label in _SUB2_RAW_LABELS}
+    assert clean_stems == {"RT1aIa"}  # one real shaft — the fix
+
+
+def test_d1b_loader_chnames_equal_independent_expected_no_mark_survives() -> None:
+    """(b) `bt_load_raw` strips marks so its `ch_names` equal a HAND-SPELLED
+    expected list (independent of the SUT cleaner — catches a wrong/partial
+    strip), no `*`/`#` survives, and the `parse_shaft` grouping actually differs
+    from the raw labels (cleaning is not a no-op). Mixes trailing + mid-label +
+    plain marks."""
+    labels = ["RT1aIa1*", "RT1aIa2*", "RF2I*1", "RF2I*2", "LF1#", "LF2"]
+    expected = ["RT1aIa1", "RT1aIa2", "RF2I1", "RF2I2", "LF1", "LF2"]
+    fake = _FakeBT(
+        data=np.zeros((len(labels), 16), dtype=np.float32),
+        electrode_labels=labels,
+    )
+    _, ch_names, _ = bt_load_raw(fake, trial_id=1)
+
+    assert ch_names == expected
+    assert not any("*" in n or "#" in n for n in ch_names)
+    assert [parse_shaft(lab) for lab in labels] != [parse_shaft(n) for n in ch_names]
+
+
+def test_d1c_loader_clean_prevents_shaft_car_zeroing() -> None:
+    """(c) Differential control: shaft-CAR on the RAW sub_2 labels zeros all 34
+    contacts (singleton self-subtraction — the data loss); after `bt_load_raw`
+    cleans them into one shaft, shaft-CAR leaves nonzero residuals and no channel
+    is wiped."""
+    rng = np.random.default_rng(1)
+    data = (rng.standard_normal((34, 128)) + np.arange(34)[:, None]).astype(np.float32)
+
+    raw_out = CARIeegExtractor(car="shaft")._apply_car(_make_raw(_SUB2_RAW_LABELS, data.copy()))
+    assert np.all(np.isclose(raw_out._data, 0.0))  # positive control: the bug
+
+    fake = _FakeBT(data=data, electrode_labels=list(_SUB2_RAW_LABELS))
+    _, ch_names, _ = bt_load_raw(fake, trial_id=1)
+    fixed_out = CARIeegExtractor(car="shaft")._apply_car(_make_raw(ch_names, data.copy()))
+    all_zero = np.all(np.isclose(fixed_out._data, 0.0), axis=1)
+    assert not all_zero.any()  # the fix: the 34 zeroed contacts are gone
+
+
+def test_d1d_loader_cleans_every_mark_across_all_real_subjects() -> None:
+    """(b, spec-literal "all subjects") Over the real per-subject
+    `electrode_labels.json` for every vendored BT subject, `bt_load_raw` strips
+    every `*`/`#` so its `ch_names` equal an INDEPENDENT in-test strip and no
+    mark survives to the shaft parser / DK support table. Exercises the
+    mid-label cohort (sub_7/9/10) the synthetic fixtures cannot. Skips when the
+    untracked vendored cache is absent (CI without BT fixtures)."""
+    labels_root = _BT_CACHE / "electrode_labels"
+    if not labels_root.exists():
+        pytest.skip(f"vendored BT fixtures absent: {labels_root}")
+
+    marked_present: set[int] = set()
+    checked = 0
+    for sid in range(1, 11):
+        path = labels_root / f"sub_{sid}" / "electrode_labels.json"
+        if not path.exists():
+            continue
+        raw = json.loads(path.read_text())
+        if any("*" in lab or "#" in lab for lab in raw):
+            marked_present.add(sid)
+        expected = [lab.replace("*", "").replace("#", "") for lab in raw]  # independent of SUT
+        fake = _FakeBT(
+            data=np.zeros((len(raw), 4), dtype=np.float32),
+            electrode_labels=list(raw),
+        )
+        _, ch_names, _ = bt_load_raw(fake, trial_id=1)
+        assert ch_names == expected
+        assert not any("*" in n or "#" in n for n in ch_names)
+        checked += 1
+
+    assert checked >= 1
+    # Coverage guard: the known marked cohort that is present MUST have carried
+    # marks, else the cleaning path was never exercised (a vacuous pass).
+    known_marked_present = {
+        s for s in (2, 7, 9, 10)
+        if (labels_root / f"sub_{s}" / "electrode_labels.json").exists()
+    }
+    assert known_marked_present  # at least one marked subject exercised
+    assert known_marked_present <= marked_present

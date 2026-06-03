@@ -41,10 +41,12 @@ def test_neg_inf_mask_drives_softmax_below_threshold_in_all_dtypes() -> None:
 
 
 def test_neg_inf_mask_does_not_overflow_when_added_to_negative_bias() -> None:
-    """The cross-attn site adds ``log(support+eps)`` to the masked logits.
-    For zero-support electrodes that bias is itself a small negative.
-    Adding the sentinel to it must not produce -Inf in any dtype — this
-    is the HF/transformers `dtype.min` pitfall."""
+    """B36's default hard pool masks straight to ``NEG_INF_MASK_VALUE`` (no
+    additive anatomy bias), but the gated ``R-bna-soft`` sister still adds
+    ``log(support+eps)`` to the masked logits, where for zero-support
+    electrodes that bias is itself a small negative. Adding the sentinel to it
+    must not produce -Inf in any dtype — the HF/transformers `dtype.min`
+    pitfall. This pins the sentinel's headroom for that sister and in general."""
     bias = torch.tensor(-10.0)  # log(1e-2 + 1e-2) ≈ -3.9, well within typical range
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
         sentinel = torch.tensor(NEG_INF_MASK_VALUE, dtype=dtype)

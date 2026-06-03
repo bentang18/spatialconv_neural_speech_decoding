@@ -1,30 +1,24 @@
-"""B29 Item 9 / Item 11 per-clip subject-subtype + λ_anat metadata.
+"""B29 Item 9 / Item 11 per-clip subject-subtype metadata.
 
-Lock memos:
+Lock memo:
   * Subtype: ``memory/project_v14_b29_joint_default_2026_05_27.md`` §Item 11
     (``subtype_embed: nn.Embedding(2, d=256)``; sister three-way ``{depth,
     grid, strip}``).
-  * λ_anat per-clip gate: ``memory/project_v14_b29_joint_default_2026_05_27.md``
-    §Item 12 (drop ``parcels_supervised`` gating, drive anatomy-bias from
-    per-clip metadata) + ``docs/neuroprobe/v14_implementation_fix_list.md``
-    §B28 Item 3 → SUPERSEDED by per-clip gate.
 
-Two per-event extractors:
+One per-event extractor:
 
   * :class:`SubjectSubtypeExtractor` — emits ``subject_subtype`` per
     clip. Binary default = {0 = sEEG-depth (intracranial), 1 = ECoG
     (surface)}; three-way sister = {0 = depth, 1 = grid, 2 = strip}.
-  * :class:`LambdaAnatExtractor` — emits per-clip ``λ_anat ∈ [0, 1]``
-    scalar driving the anatomy-bias gate at the cross-attn layer.
-    Default policy: anatomy-rich corpora (BT / D-cohort / AJILE12) →
-    1.0; SWEC → 0.0 until ``R-swec-pseudo-parcel-per-shaft`` sister
-    lands.
 
-The per-subject subtype + per-corpus λ_anat tables live as module-level
-dicts so dispatch can override them via kwargs. Real data wiring should
-override these from the per-corpus manifests in
-``studies/braintreebank/manifest.py`` and the equivalent SWEC/D-cohort
-manifests once they land.
+(The B28/B29 ``LambdaAnatExtractor`` per-clip ``λ_anat`` gate was removed at
+B36: the encoder's hard block-diagonal parcel pool consumes the one-hot DK
+support directly, with no soft anatomy bias to gate.)
+
+The per-subject subtype table lives as a module-level dict so dispatch can
+override it via kwargs. Real data wiring should override it from the
+per-corpus manifests in ``studies/braintreebank/manifest.py`` and the
+equivalent SWEC/D-cohort manifests once they land.
 """
 
 from __future__ import annotations
@@ -62,19 +56,6 @@ DEFAULT_CORPUS_SUBTYPE: tp.Final[dict[str, str]] = {
     "swec": "depth",               # sEEG depth (CH)
     "ajile12": "ecog",             # surface ECoG (Peterson 2022)
 }
-
-# Per-corpus λ_anat default per the B29 Item 12 spec. Anatomy-rich
-# corpora gate ON; SWEC defaults to 0 until the per-shaft pseudo-parcel
-# sister lands.
-DEFAULT_CORPUS_LAMBDA_ANAT: tp.Final[dict[str, float]] = {
-    "braintreebank": 1.0,
-    "wang2024treebank": 1.0,
-    "d_cohort": 1.0,
-    "cogan_dcohort": 1.0,
-    "ajile12": 1.0,
-    "swec": 0.0,                  # turned ON only via R-swec-pseudo-parcel-per-shaft sister
-}
-
 
 def _resolve_corpus_name(event: tp.Any, corpus: str | None) -> str:
     """Best-effort lookup of the corpus/study name from an event.
@@ -175,60 +156,4 @@ class SubjectSubtypeExtractor(CARIeegExtractor):
             start=start,
             duration=duration,
             data=np.asarray([[idx]], dtype=np.int64),
-        )
-
-
-class LambdaAnatExtractor(CARIeegExtractor):
-    """Per-event ``λ_anat ∈ [0, 1]`` scalar (0-d float32 TimedArray).
-
-    Default policy (B29 Item 12): anatomy-rich corpora gate ON
-    (``λ_anat = 1.0``); SWEC defaults to 0.0 until the per-shaft
-    pseudo-parcel sister lands. Override either per-corpus
-    (``corpus_lambda_anat``) or per-subject (``subject_lambda_anat``) at
-    build time.
-
-    The encoder forward already multiplies the anatomy bias by
-    ``λ_anat`` (kwarg landed at B28); this extractor wires the per-clip
-    metadata that drives it.
-    """
-
-    corpus_lambda_anat: dict[str, float] = {}
-    subject_lambda_anat: dict[str, float] = {}
-    corpus: str | None = None
-
-    def model_post_init(self, log__):
-        super().model_post_init(log__)
-        for source, table in (
-            ("corpus_lambda_anat", self.corpus_lambda_anat),
-            ("subject_lambda_anat", self.subject_lambda_anat),
-        ):
-            for k, v in table.items():
-                if not 0.0 <= float(v) <= 1.0:
-                    raise ValueError(
-                        f"{source}[{k!r}]={v!r} must lie in [0, 1]"
-                    )
-
-    def _resolve_value(self, event) -> float:
-        subject_id = _resolve_subject_id(event)
-        if subject_id is not None and subject_id in self.subject_lambda_anat:
-            return float(self.subject_lambda_anat[subject_id])
-        corpus = _resolve_corpus_name(event, self.corpus)
-        if corpus in self.corpus_lambda_anat:
-            return float(self.corpus_lambda_anat[corpus])
-        if corpus in DEFAULT_CORPUS_LAMBDA_ANAT:
-            return float(DEFAULT_CORPUS_LAMBDA_ANAT[corpus])
-        raise KeyError(
-            f"no λ_anat registered for corpus={corpus!r} subject={subject_id!r}; "
-            f"set ``corpus_lambda_anat`` or ``subject_lambda_anat`` at build time."
-        )
-
-    def _get_timed_array(
-        self, event, start: float, duration: float,
-    ) -> TimedArray:
-        value = self._resolve_value(event)
-        return TimedArray(
-            frequency=1.0 / float(duration),
-            start=start,
-            duration=duration,
-            data=np.asarray([[value]], dtype=np.float32),
         )

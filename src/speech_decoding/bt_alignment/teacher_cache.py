@@ -28,8 +28,8 @@ the per-channel z-score rescales, and it is what won.) Falsifier
 v2→v3 upgrade 2026-05-28 (``project_v14_whisper_teacher_v3_upgrade_2026_05_28``):
 same encoder topology as v2 (32 layers, d=1280, native 50 Hz); v3 differs only
 in the mel front-end (80→128 bins) and produces −10–20% WER on noisy speech.
-Features are 1280-d at 50 Hz native (1 step per 20 ms WAV @ 16 kHz / 160-hop /
-2× downsample inside the encoder).
+Features are 1280-d at 50 Hz native: the 160-sample mel hop @ 16 kHz = 10 ms
+(100 Hz mel), and the encoder's 2× conv downsample → 50 Hz = one step per 20 ms.
 
 Cache schema (per clip):
     out_dir / <film> / <clip_id>.pt   ->  dict({
@@ -66,7 +66,7 @@ DEFAULT_LAYER_MERGE: int | str = "mean_all"
 SINGLE_LAYER_SISTER_INDEX = 8  # R-whisper-single-layer-L8 falsifier anchor (was the B06 default)
 DEFAULT_TEACHER_HZ = 50
 WHISPER_SR = 16000
-WHISPER_HOP = 160  # 20 ms in mel-input space
+WHISPER_HOP = 160  # mel hop: 160 / 16 kHz = 10 ms (mel 100 Hz; 2× conv → 50 Hz enc)
 
 
 @dataclass
@@ -144,7 +144,17 @@ class WhisperFeatureExtractor:
         # the ceiling-probe mean_all merge exactly. Single-layer is a 1-element
         # stack-mean (no-op). Each capture is (1, T, d_model).
         feat = torch.stack([self._captures[L] for L in self._layers], dim=0).mean(dim=0)
-        return feat.squeeze(0).cpu().to(torch.float16)
+        feat = feat.squeeze(0)  # (T_enc, d_model)
+        # Whisper pads/crops every clip to 30 s, so the encoder ALWAYS emits 1500
+        # frames; only the first round(clip_s × 50) are real audio — the rest is
+        # pad-silence. Trim to real frames so the cache matches the (clip_s × 50,
+        # d) contract the 50→8 Hz pool consumes, and so pad-silence does not
+        # poison fit_channel_stats (H3). enc rate = sr / WHISPER_HOP / 2 (mel
+        # 100 Hz, 2× conv downsample → 50 Hz); at the enforced 16 kHz this is 50.
+        enc_frames_per_s = sample_rate / WHISPER_HOP / 2.0
+        n_real = round(len(wav) / sample_rate * enc_frames_per_s)
+        feat = feat[:n_real]
+        return feat.cpu().to(torch.float16)
 
     def close(self):
         for handle in self._handles:
@@ -161,7 +171,13 @@ def write_clip_cache(
     out_dir: Path,
     rate_hz: int = DEFAULT_TEACHER_HZ,
 ) -> TeacherCacheEntry:
-    """Extract layer-merged features for one clip and save to out_dir/<film>/<clip_id>.pt."""
+    """Extract layer-merged features for one clip and save to out_dir/<film>/<clip_id>.pt.
+
+    Precondition for the P3 path: the downstream 50→8 Hz pool requires exactly
+    250 frames, so callers must feed exactly-5.0-s (80000-sample @ 16 kHz) clips.
+    A non-whole-second clip trims to ``round(clip_s × 50) ≠ 250`` and the pool
+    rejects it loudly (this is intended — a mis-sized clip should fail, not be
+    silently re-pooled)."""
     import torch
     feat = feature_extractor.extract(wav, sample_rate)
     film_dir = out_dir / film
@@ -190,10 +206,16 @@ def fit_channel_stats(
 
     B33 (project-up, 2026-05-30) makes per-channel target standardization
     mandatory: with the teacher-side adapter gone, nothing else plays the
-    ``StandardScaler`` role the ceiling probe relied on. Streams each cached
-    ``features`` tensor ``(T, d)``, accumulates in **fp32** (cache is fp16;
-    single-pass fp16 variance over large N is unstable), pools over
-    ``(clips × timesteps)`` — one scalar per channel, never per-timestep (that
+    ``StandardScaler`` role the ceiling probe relied on. The standardizer is
+    applied to the **8 Hz pooled** target (cache 50 Hz →
+    :func:`~speech_decoding.extractors.whisper_teacher_pool.triangular_pool_50_to_8_hz`
+    → z-score; see ``ssl.distill``), so we fit at that same rate: each cached
+    ``features`` tensor ``(250, d)`` is pooled to ``(40, d)`` before
+    accumulation. Fitting on the raw 50 Hz cache instead would leave the
+    standardized target at std≈0.33 — the triangular pool averages ~12-13
+    frames per bucket and shrinks the variance ~9× (H2). Accumulates in **fp32**
+    (cache is fp16; single-pass fp16 variance over large N is unstable) over
+    ``(clips × 8 Hz frames)`` — one scalar per channel, never per-timestep (that
     would erase the onset/temporal structure the student must predict) — and
     returns ``{'mean': (d,), 'inv_std': (d,)}``.
 
@@ -209,21 +231,31 @@ def fit_channel_stats(
     :class:`TargetStandardizer` consumes it at load/train time. Falsifier
     ``R-no-target-standardize`` skips standardization (raw 1280-d target).
     """
-    # Pass 1 — per-channel mean over (clips × timesteps), fp32.
+    from speech_decoding.extractors.whisper_teacher_pool import (
+        triangular_pool_50_to_8_hz,
+    )
+
+    def _load_pooled(path: Path) -> Tensor:
+        # Fit at the rate the standardizer is applied: the 8 Hz pooled target,
+        # not the 50 Hz cache (H2). fp32 (cache is fp16); pool 250→40.
+        feat = torch.load(path, weights_only=False)["features"].to(torch.float32)
+        return triangular_pool_50_to_8_hz(feat.unsqueeze(0)).squeeze(0)
+
+    # Pass 1 — per-channel mean over (clips × 8 Hz frames), fp32.
     total = torch.zeros(d_model, dtype=torch.float32)
     n_frames = 0
     for path in feature_paths:
-        feat = torch.load(path, weights_only=False)["features"].to(torch.float32)
-        total += feat.sum(dim=0)
-        n_frames += int(feat.shape[0])
+        pooled = _load_pooled(path)
+        total += pooled.sum(dim=0)
+        n_frames += int(pooled.shape[0])
     if n_frames == 0:
         raise ValueError("fit_channel_stats: no frames in feature_paths")
     mean = total / n_frames
     # Pass 2 — sum of squared deviations (stable).
     ss = torch.zeros(d_model, dtype=torch.float32)
     for path in feature_paths:
-        feat = torch.load(path, weights_only=False)["features"].to(torch.float32)
-        ss += ((feat - mean) ** 2).sum(dim=0)
+        pooled = _load_pooled(path)
+        ss += ((pooled - mean) ** 2).sum(dim=0)
     var = ss / n_frames
     inv_std = 1.0 / torch.sqrt(var + eps)
     # Zero-variance guard: σ≈0 → pass channel through unscaled.

@@ -205,9 +205,12 @@ def test_v14_experiment_dry_run_end_to_end(tmp_path) -> None:
     assert payload["status"] == "succeeded"
 
 
-def test_v14_config_eps_is_plumbed_to_model_forward() -> None:
-    """``V14ParcelPerceiver(eps=...)`` must change the model output. Required
-    for the Stage-1 ``eps ∈ {1e-4, 1e-3, 1e-2, 1e-1}`` sweep."""
+def test_v14_config_eps_is_vestigial_under_b36_hard_pool() -> None:
+    """B36: the hard block-diagonal pool consumes the one-hot DK support
+    directly (no ``log(support + ε)`` smoothing), so ``eps`` is vestigial
+    (reserved for the gated ``R-bna-soft`` sister) and must NOT change the
+    model output. Regression guard against re-softening the default path.
+    (The pre-B36 ``eps ∈ {1e-4..1e-1}`` Stage-1 sweep is retired.)"""
     torch.manual_seed(0)
     base_kwargs = dict(
         n_freq_bins=F_BINS, n_time_bins=T_BINS, k_parcels=K_PARCELS,
@@ -222,17 +225,15 @@ def test_v14_config_eps_is_plumbed_to_model_forward() -> None:
     model_weak = cfg_weak.build(n_outputs=2)
 
     electrodes = torch.randn(2, C_MAX, T_BINS, F_BINS)
-    # Varied support across electrodes — each electrode targets a different
-    # parcel — so eps changes the softmax over electrodes (otherwise the bias
-    # is a uniform additive constant per latent and softmax is invariant to it).
+    # One-hot DK assignment: each electrode targets a distinct parcel. Under
+    # the hard pool the routing depends only on support>0, never on eps.
     support = torch.zeros(2, C_MAX, K_PARCELS)
     for i in range(C_MAX):
         support[:, i, i % K_PARCELS] = 1.0
     out_strong = model_strong(electrodes, support)
     out_weak = model_weak(electrodes, support)
-    assert not torch.allclose(out_strong, out_weak, atol=1e-4), (
-        "eps must change the cross-attn bias and therefore the logits"
-    )
+    # eps is vestigial under the B36 hard pool and must not change the logits.
+    torch.testing.assert_close(out_strong, out_weak)
 
 
 def test_v14_dispatch_script_imports() -> None:

@@ -15,6 +15,8 @@ Sister cells:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
@@ -285,16 +287,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-def _write_depth_wm(
+def _write_bt(
     bt_root: Path, subject_id: int, rows: list[tuple[str, str]],
 ) -> Path:
-    path = bt_root / "localization" / f"sub_{subject_id}" / "depth-wm.csv"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        f.write("Electrode,DesikanKilliany\n")
-        for electrode, label in rows:
-            f.write(f"{electrode},{label}\n")
-    return path
+    """Write the only fixture ``BTShaftMaskExtractor`` reads: the VOLTAGE order
+    (``electrode_labels.json``). Shaft membership is parsed from these labels;
+    the DK label in each row is ignored (shaft parsing is DK-vocab-independent),
+    and ``depth-wm.csv`` is not read by this extractor."""
+    labels_path = (
+        bt_root / "electrode_labels" / f"sub_{subject_id}" / "electrode_labels.json"
+    )
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    labels_path.write_text(json.dumps([electrode for electrode, _ in rows]))
+    return labels_path
 
 
 def _bt_event(
@@ -306,9 +311,9 @@ def _bt_event(
 
 
 def _bt_rows_two_shafts() -> list[tuple[str, str]]:
-    # 2 shafts × 5 contacts = 10 real electrodes. Each row uses a DK label
-    # that's in V14_DK_PARCEL_LABELS so unknown_label_policy="raise"
-    # passes too.
+    # 2 shafts × 5 contacts = 10 electrodes. BTShaftMaskExtractor parses shaft
+    # membership from the electrode label only (DK-vocab-independent), so the
+    # DK label column is arbitrary here.
     rows = []
     for i in range(1, 6):
         rows.append((f"OFa{i}", "ctx-lh-superiortemporal"))
@@ -320,7 +325,7 @@ def _bt_rows_two_shafts() -> list[tuple[str, str]]:
 def test_bt_shaft_mask_extractor_shape_and_dtype(tmp_path: Path) -> None:
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    _write_bt(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
     )
@@ -335,7 +340,7 @@ def test_bt_shaft_mask_extractor_padding_slots_are_false(tmp_path: Path) -> None
     shaft-blocked or they'd silently corrupt the cross-attn keypad path."""
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    _write_bt(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
     )
@@ -350,7 +355,7 @@ def test_bt_shaft_mask_extractor_k1_at_n_shafts_2(tmp_path: Path) -> None:
     slots; the mask must have at least one True."""
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    _write_bt(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
     )
@@ -363,7 +368,7 @@ def test_bt_shaft_mask_extractor_per_event_seed_varies(tmp_path: Path) -> None:
     different per-event seeds → likely different masks."""
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    _write_bt(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
     )
@@ -382,7 +387,7 @@ def test_bt_shaft_mask_extractor_reproducible_under_fixed_event(tmp_path: Path) 
     NeuralSet collator + caching see the same bytes per event."""
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    _write_bt(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=42,
     )
@@ -395,7 +400,7 @@ def test_bt_shaft_mask_extractor_reproducible_under_fixed_event(tmp_path: Path) 
 def test_bt_shaft_mask_extractor_rejects_subject_exceeding_c_max(tmp_path: Path) -> None:
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    _write_depth_wm(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
+    _write_bt(tmp_path, subject_id=1, rows=_bt_rows_two_shafts())
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=4, seed=0,
     )
@@ -403,21 +408,30 @@ def test_bt_shaft_mask_extractor_rejects_subject_exceeding_c_max(tmp_path: Path)
         ext.get_static(_bt_event(subject_id=1))
 
 
-def test_bt_shaft_mask_extractor_unknown_label_policy_skip(tmp_path: Path) -> None:
-    """``unknown_label_policy="skip"`` drops out-of-vocab DK rows. Must
-    match the DK/valid-mask filter so the C dimension stays aligned."""
+def test_bt_shaft_mask_extractor_includes_out_of_vocab_electrodes(tmp_path: Path) -> None:
+    """C1/C2: shaft membership is DK-vocab-independent. An electrode whose DK
+    label is out-of-vocab is still a real electrode on its physical shaft, so
+    it is NOT dropped — it keeps its true voltage slot (the old
+    ``unknown_label_policy="skip"`` re-pack is gone)."""
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
-    rows = _bt_rows_two_shafts() + [("BAD1", "not-a-real-dk-label")]
-    _write_depth_wm(tmp_path, subject_id=1, rows=rows)
-    ext = BTShaftMaskExtractor(
-        event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
-        unknown_label_policy="skip",
-    )
-    out = ext.get_static(_bt_event(subject_id=1))
-    # Real electrodes after skip = 10 (the 2 shafts), so positions 10+ are
-    # all padding-False.
-    assert not out[10:].any()
+    # 11 voltage electrodes: 10 in-vocab + 1 (OFa6) out-of-vocab, extending
+    # shaft OFa so N_shafts stays 2 (K=1, deterministic).
+    rows = _bt_rows_two_shafts() + [("OFa6", "not-a-real-dk-label")]
+    _write_bt(tmp_path, subject_id=1, rows=rows)
+
+    # c_max=11 fits exactly -> the out-of-vocab electrode IS counted.
+    out = BTShaftMaskExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=11, seed=0,
+    ).get_static(_bt_event(subject_id=1))
+    assert out.shape == (11,)
+
+    # c_max=10 would fit only if the out-of-vocab electrode were dropped;
+    # under voltage-order alignment it is kept, so n_real=11 > 10 raises.
+    with pytest.raises(ValueError, match="c_max"):
+        BTShaftMaskExtractor(
+            event_types="Ieeg", bt_root=str(tmp_path), c_max=10, seed=0,
+        ).get_static(_bt_event(subject_id=1))
 
 
 def test_bt_shaft_mask_extractor_k0_at_single_shaft(tmp_path: Path) -> None:
@@ -425,7 +439,7 @@ def test_bt_shaft_mask_extractor_k0_at_single_shaft(tmp_path: Path) -> None:
     from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 
     rows = [(f"OFa{i}", "ctx-lh-superiortemporal") for i in range(1, 6)]
-    _write_depth_wm(tmp_path, subject_id=1, rows=rows)
+    _write_bt(tmp_path, subject_id=1, rows=rows)
     ext = BTShaftMaskExtractor(
         event_types="Ieeg", bt_root=str(tmp_path), c_max=120, seed=0,
     )

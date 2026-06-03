@@ -13,10 +13,11 @@ Smoke-test (laptop, no BT data):
 
     .venv/bin/python -m speech_decoding.experiments.dispatch_v14 --dry-run
 
-Default electrode-tokens extractor is :class:`LogStftView` with
-``apply_log=False`` (N1 × R2 × I2 × F1) — 5/25 swap from log to abs
-magnitude. Set ``apply_log=True`` to recover the pre-5/25 ``I2L`` behavior
-as the F-log-amplitude sister cell. Default support is
+Default electrode-tokens extractor is :class:`MultiStftView` (WS-C / C2,
+B36): F=30 ⅓-octave filterbank, hop=128 → 16 Hz (8 Hz latent), ``apply_log=False`` (raw
+|X|), 0.5 Hz HPF, and ``scaler=None`` (robust-z normalizes downstream).
+:class:`LogStftView` is the demoted ``F-single-STFT`` sister; ``apply_log``
+recovers the log-amplitude sister. Default support is
 :class:`V14DKHardSupportExtractor` (K=80 DK, ``c_max=384`` padded), default
 valid-mask is :class:`ElectrodeValidMask` (``c_max=384``). Caller can pass
 ``electrode_tokens_extractor=...`` to override the default (e.g. for the
@@ -41,12 +42,9 @@ from speech_decoding.extractors.ref_aug import (
     RefIdxExtractor,
 )
 from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
-from speech_decoding.extractors.subtype_meta import (
-    LambdaAnatExtractor,
-    SubjectSubtypeExtractor,
-)
+from speech_decoding.extractors.subtype_meta import SubjectSubtypeExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
-from speech_decoding.extractors.view import LogStftView
+from speech_decoding.extractors.view import MultiStftView
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
@@ -67,8 +65,15 @@ DEFAULT_N_HEADS = 8
 # R-m4-slots P0 flips via dispatch.
 DEFAULT_M_SUB_SLOTS = 1
 DEFAULT_K_PARCELS = len(V14_DK_PARCEL_LABELS)  # 80
-DEFAULT_N_FREQ_BINS = 38   # ≤150 Hz with the locked STFT nperseg=512 @ 2 kHz
-DEFAULT_N_TIME_BINS = 17   # 1-second window with overlap=0.75
+# WS-C / C2 (B36): default front-end flips single-STFT → Multi-STFT.
+# F=30 ⅓-octave filterbank bins (≈1–813 Hz) → encoder F_p = (30−3)//3+1 = 10.
+DEFAULT_N_FREQ_BINS = 30
+# WS-C / C1 (B36, hop=128 re-lock 2026-06-03): phase-conditional clip window.
+# 5 s SSL clips (P1/P2/P3) → T_p=40; the P4 readout driver passes clip_len=1.0
+# → T_p=8. n_time_bins (the RoPE ceiling) is derived from clip_len × the
+# Multi-STFT frame geometry (1 + L//hop, center=True) — 5 s → 81, 1 s → 17 —
+# not hardcoded.
+DEFAULT_CLIP_LEN_S = 5.0
 DEFAULT_BATCH_SIZE = 32
 # DataLoader worker count (B1.4e, 2026-05-29). The per-sample extractor stack
 # (CAR + torch.stft in LogStftView is recomputed per __getitem__; only the raw
@@ -167,16 +172,11 @@ from speech_decoding.ssl.aggregator import LOSS_VARIANTS  # noqa: E402
 
 DEFAULT_LOSS_VARIANT: str = "b31_default"
 
-# B28 anatomy-bias warmup (5/27 PM) → B29 per-clip gate (5/27 PM-late)
-# supersession: default uses per-clip metadata to gate the bias;
-# sisters reinstate the step-time schedules.
-ANATOMY_BIAS_MODES: tuple[str, ...] = (
-    "per_clip_gate_b29",  # B29 default
-    "warmup_b28",         # B28 step warmup over 25%+25%
-    "step_b19",           # B19 instant ON at P2 step 0
-    "on_from_p1",         # always ON from P1 step 0
-)
-DEFAULT_ANATOMY_BIAS_MODE: str = "per_clip_gate_b29"
+# B36 (2026-06-01): the soft λ_anat·log(support+ε) routing bias and its
+# schedule selector (ANATOMY_BIAS_MODES) were removed — the hard
+# block-diagonal per-parcel pool consumes the one-hot DK ``support`` directly,
+# with no bias to schedule. See
+# project_v14_b36_perparcel_pool_structured_jepa_2026_06_01.
 
 # B29 Item 5 corpus sampler-weight (α-hierarchical). 0.3 = the B29 lock
 # default; sisters sweep α via dispatch.
@@ -252,7 +252,13 @@ def build_v14_experiment(
     n_heads: int = DEFAULT_N_HEADS,
     m_sub_slots: int = DEFAULT_M_SUB_SLOTS,
     n_freq_bins: int = DEFAULT_N_FREQ_BINS,
-    n_time_bins: int = DEFAULT_N_TIME_BINS,
+    # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
+    # phases (P1/P2/P3 → T_p=40); the P4 readout driver passes 1.0 (→ T_p=8).
+    clip_len: float = DEFAULT_CLIP_LEN_S,
+    # ``None`` → derive the RoPE ceiling from ``clip_len`` × the front-end's
+    # frame geometry (``electrode_tokens_extractor.n_time_bins_for_duration``).
+    # Pass an explicit int only to override (e.g. a custom front-end).
+    n_time_bins: int | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     # DataLoader worker count (B1.4e, 2026-05-29). >0 overlaps the per-sample
     # CPU STFT with GPU compute; pass --cpus-per-task >= num_workers + 1.
@@ -311,9 +317,8 @@ def build_v14_experiment(
     subtype_embed_vocab: str = DEFAULT_SUBTYPE_EMBED_VOCAB,
     ref_embed_enabled: bool = False,
     ref_embed_reuse_kv: bool = True,
-    # B29 phase-mode + anatomy-bias + corpus mix lock 2026-05-27 PM-late.
+    # B29 phase-mode + corpus mix lock 2026-05-27 PM-late.
     phase_mode: str = DEFAULT_PHASE_MODE,
-    anatomy_bias_mode: str = DEFAULT_ANATOMY_BIAS_MODE,
     include_ajile12: bool = DEFAULT_INCLUDE_AJILE12,
     ref_operator_alpha: float = DEFAULT_REF_OPERATOR_ALPHA,
     corpus_mix: dict[str, float] | None = None,
@@ -322,12 +327,15 @@ def build_v14_experiment(
     # is the P2-if-budget sister.
     ffn_variant: str = DEFAULT_FFN_VARIANT,
     # B2.1 (#96) phase-switch hook. When ``joint_phase=True`` the builder
-    # returns a :class:`V14JointExperiment` pinned to ``phase=1`` (B29
-    # Item 1 P1+P2 collapse) instead of a vanilla supervised
-    # :class:`Experiment`. The SSL training-step itself is gated on
-    # B2.2-B2.5; ``V14JointExperiment._train_and_test`` raises with the
-    # remaining blocker IDs so wiring the dispatch never silently
-    # downgrades to Phase-4 CE.
+    # returns a :class:`V14JointExperiment` (pinned to ``phase=1`` via its
+    # ``model_post_init`` check, B29 Item 1 P1+P2 collapse) instead of a
+    # vanilla supervised :class:`Experiment`. The joint subclass overrides
+    # ``_build_brain_module`` (builds the masked-JEPA ``V14JointBrainModule``)
+    # and ``model_post_init`` (validates phase + quarantined sisters); it does
+    # NOT override ``_train_and_test`` / ``run``. Quarantined sisters
+    # (non-default ``latent_valid_override`` / ``sa_mask_mode`` / ``loss_variant``)
+    # raise at *construction* (model_post_init), so wiring the dispatch never
+    # silently downgrades to Phase-4 CE.
     joint_phase: bool = False,
     # B30-dispatch-sister-flags (drift-table row added 2026-05-28 by R12
     # wiring audit). Default values match the B30 lock; non-default
@@ -383,7 +391,6 @@ def build_v14_experiment(
     _validate_choice("subtype_embed_vocab", subtype_embed_vocab, SUBTYPE_EMBED_VOCABS)
     subtype_vocab_size = 2 if subtype_embed_vocab == "binary" else 3
     _validate_choice("phase_mode", phase_mode, PHASE_MODES)
-    _validate_choice("anatomy_bias_mode", anatomy_bias_mode, ANATOMY_BIAS_MODES)
     _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
     _validate_choice("loss_variant", loss_variant, LOSS_VARIANTS)
     if ffn_variant != "dense":
@@ -453,11 +460,18 @@ def build_v14_experiment(
     )
 
     if electrode_tokens_extractor is None:
-        electrode_tokens_extractor = LogStftView(
+        # WS-C / C2 (B36): Multi-STFT front-end (F=30 ⅓-octave filterbank,
+        # hop=128 → 16 Hz (8 Hz latent), raw |X| via apply_log=False). C4: 0.5 Hz HPF
+        # removes DC + slow drift before the STFT. C3: StandardScaler dropped
+        # (scaler=None) — robust-z normalizes the filterbank output downstream
+        # of the view (see Nv14RobustZTransform / SessionRobustZNormalizer).
+        electrode_tokens_extractor = MultiStftView(
             event_types="Ieeg",
             car="shaft",
             notch_filter=effective_bt_notch_hz,
-            scaler="StandardScaler",
+            filter=(0.5, None),
+            scaler=None,
+            apply_log=False,
             channel_order="original",
             c_max=DEFAULT_C_MAX,
         )
@@ -501,6 +515,20 @@ def build_v14_experiment(
         ref_modes_for_label = ("shaft_car",)
         ref_seed_for_label = seed
 
+    # WS-C / C1: size the encoder's n_time_bins (RoPE ceiling) from clip_len ×
+    # the resolved front-end's frame geometry, unless the caller pinned it.
+    # (Runs after extractor validation so a malformed extractor fails on the
+    # more fundamental `car` check first.)
+    if n_time_bins is None:
+        if not hasattr(electrode_tokens_extractor, "n_time_bins_for_duration"):
+            raise ValueError(
+                "n_time_bins could not be derived: the supplied "
+                f"electrode_tokens_extractor "
+                f"{type(electrode_tokens_extractor).__name__} has no "
+                "n_time_bins_for_duration(); pass n_time_bins explicitly."
+            )
+        n_time_bins = electrode_tokens_extractor.n_time_bins_for_duration(clip_len)
+
     study = Wang2024Treebank(
         path=Path(bt_root), mode=mode,
         infra_timelines={"cluster": None},
@@ -518,13 +546,13 @@ def build_v14_experiment(
     chain = ns.Chain(steps=[study, word_events])
 
     dk_extractor = V14DKHardSupportExtractor(
-        event_types="Ieeg", bt_root=bt_root, unknown_label_policy="skip",
+        event_types="Ieeg", bt_root=bt_root, unmapped_policy="zero",
         c_max=DEFAULT_C_MAX,
     )
     _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(
         event_types="Ieeg", bt_root=bt_root, c_max=DEFAULT_C_MAX,
-        unknown_label_policy="skip",
+        unmapped_policy="zero",
     )
     _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
 
@@ -543,13 +571,6 @@ def build_v14_experiment(
         corpus="braintreebank",
     )
     _apply_extractor_cache(subtype_extractor, "subject_subtype", extractor_cache_folder)
-    lambda_anat_extractor = LambdaAnatExtractor(
-        event_types="Ieeg",
-        corpus="braintreebank",
-    )
-    _apply_extractor_cache(
-        lambda_anat_extractor, "lambda_anat", extractor_cache_folder
-    )
 
     # B03 shaft-mask (5/27 PM final spec): student-only paradigm-B
     # electrode drop. Only constructed for the joint SSL phase — the
@@ -563,7 +584,6 @@ def build_v14_experiment(
         "valid_mask": valid_mask_extractor,
         "ref_idx": ref_idx_extractor,
         "subject_subtype": subtype_extractor,
-        "lambda_anat": lambda_anat_extractor,
     }
     if joint_phase:
         shaft_mask_extractor = BTShaftMaskExtractor(
@@ -571,7 +591,6 @@ def build_v14_experiment(
             bt_root=bt_root,
             c_max=DEFAULT_C_MAX,
             seed=seed,
-            unknown_label_policy="skip",
         )
         _apply_extractor_cache(
             shaft_mask_extractor, "shaft_mask", extractor_cache_folder
@@ -592,7 +611,8 @@ def build_v14_experiment(
             },
             "trigger_query": "type == 'Word'",
             "start": 0.0,
-            "duration": 1.0,
+            # WS-C / C1: phase-conditional clip window (5 s SSL, 1 s P4).
+            "duration": clip_len,
         },
         batch_size=batch_size,
         num_workers=num_workers,
@@ -693,7 +713,6 @@ def build_v14_experiment(
             # them; the SSL trainer reads them from this same snapshot.
             "dkoleo_mode": dkoleo_mode,
             "phase_mode": phase_mode,
-            "anatomy_bias_mode": anatomy_bias_mode,
             # NOTE: ``loss_variant`` (B31) lives on the V14JointExperiment
             # field via ``extra_experiment_kwargs`` below, NOT on the
             # brain-model config — the brain-model Pydantic schema is
@@ -724,7 +743,7 @@ def build_v14_experiment(
         # kwargs alongside (tokens, support, valid_mask).
         x_name=(
             "electrode_tokens", "support", "valid_mask",
-            "subject_subtype", "ref_idx", "lambda_anat",
+            "subject_subtype", "ref_idx",
         ),
         accelerator="auto",
         devices="auto",
@@ -752,7 +771,9 @@ def _parser() -> argparse.ArgumentParser:
                         "Pass --no-binary-tasks to switch to 3-class multiclass.")
     p.add_argument("--no-binary-tasks", dest="binary_tasks", action="store_false")
     p.add_argument("--eps", type=float, default=DEFAULT_SUPPORT_BIAS_EPS,
-                   help="Anatomy-prior strength for log(support+eps).")
+                   help="Vestigial under the B36 hard pool (reserved for the "
+                        "gated R-bna-soft routing sister); ignored on the "
+                        "default hard-pool path.")
     p.add_argument("--d-model", type=int, default=DEFAULT_D_MODEL)
     p.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
     p.add_argument("--m-sub-slots", type=int, default=DEFAULT_M_SUB_SLOTS)
@@ -763,6 +784,10 @@ def _parser() -> argparse.ArgumentParser:
                         "0 starves the GPU on the per-sample CPU STFT; default "
                         "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
     p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS)
+    p.add_argument("--clip-len", type=float, default=DEFAULT_CLIP_LEN_S,
+                   help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
+                        "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
+                        "encoder n_time_bins / RoPE ceiling.")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
@@ -949,14 +974,6 @@ def _parser() -> argparse.ArgumentParser:
              "'b31_plus_both' adds both (R-add-both P0). Joint phase only.",
     )
     p.add_argument(
-        "--anatomy-bias-mode",
-        choices=ANATOMY_BIAS_MODES, default=DEFAULT_ANATOMY_BIAS_MODE,
-        help="Anatomy-bias schedule. 'per_clip_gate_b29' (default) uses "
-             "per-clip metadata to gate the bias; 'warmup_b28' restores the "
-             "B28 step warmup; 'step_b19' the B19 instant ON; 'on_from_p1' "
-             "is always ON.",
-    )
-    p.add_argument(
         "--ref-operator-alpha", type=float,
         default=DEFAULT_REF_OPERATOR_ALPHA,
         help="α-hierarchical corpus sampler weight (B29 Item 5). Default 0.3.",
@@ -991,43 +1008,29 @@ def _parser() -> argparse.ArgumentParser:
              "lives in MAINS_NOTCH_BY_CORPUS.",
     )
     p.add_argument("--phase", type=int, choices=(1, 2, 3, 4), default=4,
-                   help="Training phase per docs/neuroprobe/plan.md §3-phase staged. "
-                        "1 = Stage-A factorized t×f reconstruction (EAT Level-B). "
-                        "2 = Stage-B electrode-mask reconstruction. "
-                        "3 = Whisper-L8 distillation readout. "
-                        "4 = downstream linear/finetune probe (current behavior). "
-                        "Phases 1/2/3 raise NotImplementedError citing the "
-                        "blocker IDs that gate their parameters.")
+                   help="Training phase per docs/neuroprobe/plan.md §staged. "
+                        "1 = joint masked-JEPA SSL (B29; V14JointExperiment). "
+                        "2 = legacy split-P2 (raises — use --phase 1). "
+                        "3 = Whisper all-layer-mean distillation (module wired; "
+                        "raises the whisper_target data blocker until WS-H). "
+                        "4 = downstream linear/finetune probe (current behavior).")
+    p.add_argument("--p3-stage", choices=("3a", "3b"), default="3a",
+                   help="Phase-3 sub-stage (only with --phase 3): '3a' freezes "
+                        "the encoder for the PMA+projector connector warmup; "
+                        "'3b' unfreezes it with a discriminative LR "
+                        "(front-end base/10, parcel base/3, connector base). "
+                        "Default 3a.")
     return p
 
 
-# B2.1 (#96) closed 2026-05-28: phase=1 now routes to V14JointExperiment
-# (B29 Item 1). The SSL training-step itself still raises with the
-# remaining B2.x blockers from inside
-# ``V14JointExperiment._train_and_test`` — see v14_joint.py. The dispatch
-# path is thus the *construction* gate only.
-_PHASE1_BLOCKERS = (
-    # Retained as a string for the test-harness substring contract; the
-    # blockers below now fire from V14JointExperiment._train_and_test,
-    # not from the dispatch.
-    # B2.2 (#97) closed 2026-05-28: V14JointBrainModule composes the
-    # joint SSL aggregator with B30 latent_valid; B31 lock (2026-05-28
-    # PM-late, [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]])
-    # collapsed the default to 2 terms; the 4-term path now lives behind
-    # the b31_plus_both sister flag.
-    # B2.3 (#98) closed 2026-05-28: BTShaftMaskExtractor + RefAugMultiStftView
-    # + ref_embed wired into the joint segmenter.
-    # B2.4 (#99) closed 2026-05-28: WRS primitive landed; full multi-corpus
-    # loader integration deferred to multi-corpus loader build.
-    # B2.5 (#100) closed 2026-05-28: MON-MASK-002 + MON-MASK-004 +
-    # BestValProbeR2Callback landed; MON-MASK-002 wired into joint module
-    # step; the periodic monitors + probe callback are constructed at
-    # dispatch time when a probe loader is supplied (see
-    # ``construct_v14_joint_callbacks``).
-    "B2.6 (pre-dispatch test gate — TST01/03/05/10 + RT10), "
-    "B30-dispatch-sister-flags (latent_valid_override + sa_mask_mode), "
-    "multi-corpus loader build (B02 plumbing + per-corpus mains notch live)"
-)
+# B2.1 (#96) closed 2026-05-28: phase=1 routes to V14JointExperiment (B29
+# Item 1). The surviving B2.x sister-gating fires at *construction* —
+# ``V14JointExperiment.model_post_init`` (quarantined latent_valid /
+# sa_mask_mode / loss_variant) and ``_build_brain_module`` (encoder-slot
+# check) — NOT from a ``_train_and_test`` override, which the joint subclass
+# does not define. The dispatch path is thus the construction gate only.
+# (E5 2026-06-03: removed the dead ``_PHASE1_BLOCKERS`` tuple — never
+# referenced from the dispatch.)
 _PHASE2_BLOCKERS = (
     # B29 Item 1 collapsed P1 + P2 into a single joint phase; dispatch
     # via ``--phase 1`` (V14JointExperiment is pinned to ``phase=1``).
@@ -1039,12 +1042,20 @@ _PHASE2_BLOCKERS = (
     "V14Experiment — see docs/neuroprobe/v14_blockers.md."
 )
 _PHASE3_BLOCKERS = (
-    # B06 ✅ closed 2026-05-25 (joint with B05). The remaining open
-    # Phase-3 work is the readout / distillation wiring layered on top
-    # of a frozen Phase-1+2 SSL checkpoint, which does not exist until
-    # the joint phase converges.
-    "Phase-3 distillation gated on a frozen SSL checkpoint from Phase-1+2 "
-    "(joint phase per B29 Item 1); see ssl/distill.py + experiments/phase3_preflight.py"
+    # WS-F closed the Phase-3 readout/distillation wiring: the
+    # V14Phase3DistillModule (frozen-or-discriminative encoder → PMA → 256→1280
+    # projector → Smooth-L1 vs pooled+standardized Whisper target) and the
+    # V14Phase3Experiment are built and unit-tested (module forward/loss/freeze
+    # + the experiment's model_post_init guards + _build_standardizer in
+    # test_v14_phase3.py). Full P3 end-to-end construction is the WS-I2 capstone
+    # (pending). The one remaining LIVE-dispatch blocker is the whisper_target
+    # data emission: the segmenter has no extractor for the cached 50 Hz
+    # all-layer-mean Whisper feature ((B, 250, 1280)) yet — that is WS-H.
+    "Phase-3 distillation (V14Phase3DistillModule / V14Phase3Experiment) is "
+    "wired and unit-tested; the live dispatch path still needs the "
+    "whisper_target segmenter extractor (cached 50 Hz Whisper all-layer-mean "
+    "feature, (B, 250, 1280)) — the P3 data-layer emission is the remaining "
+    "WS-H blocker. See ssl/distill.py + experiments/v14_phase3.py."
 )
 
 
@@ -1097,16 +1108,18 @@ def construct_v14_joint_callbacks(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.phase in (2, 3):
-        # B2.1 (#96): phase=1 now constructs V14JointExperiment; the
-        # training-step still raises from inside its ``_train_and_test``
-        # for B2.2-B2.5. Phase 2 is the legacy split-P2 entry-point —
-        # B29 Item 1 collapsed it into the joint phase; phase 3 stays
-        # gated on a frozen Phase-1+2 SSL checkpoint.
-        gating = {2: _PHASE2_BLOCKERS, 3: _PHASE3_BLOCKERS}
+    if args.phase == 2:
+        # Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
+        # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 (V14JointExperiment).
+        # Phase 3 is NO LONGER gated here — its module/experiment are wired
+        # (WS-F: V14Phase3DistillModule / V14Phase3Experiment) and the live
+        # dispatch hits the precise whisper_target data blocker below (after the
+        # dry-run short-circuit) rather than a blanket gate. (phase=1 falls
+        # through to construct V14JointExperiment; its B2.x sister-gating fires
+        # at construction in model_post_init, see above.)
         raise NotImplementedError(
-            f"--phase {args.phase} dispatch is gated on unresolved blockers: "
-            f"{gating[args.phase]}. See docs/neuroprobe/v14_blockers.md."
+            f"--phase 2 dispatch is gated on unresolved blockers: "
+            f"{_PHASE2_BLOCKERS}. See docs/neuroprobe/v14_blockers.md."
         )
     print(f"V14 dispatch — cohort subject_ids = {V14_TRAIN_SUBJECT_IDS} (9 subjects, S5 excluded)")
     print(f"  mode={args.mode} task={args.task} binary_tasks={args.binary_tasks} seed={args.seed}")
@@ -1116,7 +1129,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  K=80 DK parcels, batch_size={args.batch_size}, n_epochs={args.n_epochs}")
     print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
           f"mains_notch_hz={args.mains_notch_hz}")
-    print(f"  phase_mode={args.phase_mode} anatomy_bias_mode={args.anatomy_bias_mode} "
+    print(f"  phase_mode={args.phase_mode} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
@@ -1143,8 +1156,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print("  (dry-run: not building Experiment; "
-              "default electrode-tokens extractor = LogStftView)")
+              "default electrode-tokens extractor = MultiStftView)")
         return 0
+
+    if args.phase == 3:
+        # WS-F: the Phase-3 distillation module + experiment are wired
+        # (V14Phase3DistillModule / V14Phase3Experiment) and unit-tested
+        # (test_v14_phase3.py). Full P3 end-to-end construction is the WS-I2
+        # capstone (pending). The LIVE dispatch path still needs the
+        # whisper_target data emission (WS-H); fail fast + precise rather than
+        # silently building a Phase-4 CE classifier.
+        raise NotImplementedError(
+            f"--phase 3 (stage {args.p3_stage}) dispatch: {_PHASE3_BLOCKERS} "
+            "See docs/neuroprobe/v14_blockers.md."
+        )
 
     xp = build_v14_experiment(
         mode=args.mode, task=args.task, seed=args.seed,
@@ -1154,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
         binary_tasks=args.binary_tasks,
         eps=args.eps, d_model=args.d_model, depth=args.depth,
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
+        clip_len=args.clip_len,
         batch_size=args.batch_size, num_workers=args.num_workers,
         n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
@@ -1174,7 +1200,6 @@ def main(argv: list[str] | None = None) -> int:
         ref_embed_enabled=args.ref_embed_enabled,
         ref_embed_reuse_kv=args.ref_embed_reuse_kv,
         phase_mode=args.phase_mode,
-        anatomy_bias_mode=args.anatomy_bias_mode,
         ref_operator_alpha=args.ref_operator_alpha,
         joint_phase=(args.phase == 1),
         include_ajile12=args.include_ajile12,

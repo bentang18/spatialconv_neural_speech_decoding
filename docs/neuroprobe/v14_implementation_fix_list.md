@@ -1,5 +1,7 @@
 # v14 Implementation Fix List
 
+> **SUPERSEDED 2026-06-03 by `docs/neuroprobe/b36_implementation_plan.md`.** This ledger was written against the pre-B36 design (B31 inert SSL, B29 joint phase, Perceiver soft routing). B36 (2026-06-01) retires that design — hard per-parcel pool, paradigm-B masked JEPA, staged P1/P2. Use the B36 plan as the active implementation doc; this file is kept for the closed-item audit trail only.
+
 **Generated**: 2026-05-26 from a 4-agent cross-reference audit (canonical memos × `docs/neuroprobe/v14_blockers.md` × `docs/neuroprobe/training_recipe.md` × `src/speech_decoding/`).
 **Purpose**: actionable cross-product of design-vs-code gaps. Treat as the **B18 closure ledger** — when every item here is closed (or explicitly accepted as deferred), B18 is closed.
 

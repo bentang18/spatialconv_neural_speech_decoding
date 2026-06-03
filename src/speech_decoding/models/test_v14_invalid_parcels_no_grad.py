@@ -1,11 +1,26 @@
-"""Invariant: latents for invalid (no-coverage) parcels receive no gradient
-from the downstream readout (IE08).
+"""Invariant: latents for invalid (no-coverage) parcels — and the inputs of
+electrodes dropped via ``valid_mask`` — receive NO gradient from the
+downstream readout (IE08).
 
-The layered masking (cross-attn bias -∞ for invalid channels at the
-cross-attn boundary + latent-SA key-padding-mask + PMA key-padding-mask
-for invalid parcels) is supposed to make invalid-parcel latents a dead
-branch from the readout's perspective. This test pins that invariant so
-any future change to the masking stack that breaks it gets caught.
+**B36 (2026-06-01, hard block-diagonal pool)** tightens this from the
+pre-B36 soft-leak tolerance to EXACT zero. Two structural facts make the
+zero exact, not approximate:
+
+1. The cross-attn pool is a hard one-hot DK assignment: an off-parcel /
+   dropped electrode is masked to ``NEG_INF_MASK_VALUE`` pre-softmax AND
+   zeroed post-softmax, so its pooling weight is **exactly 0.0** in every
+   dtype. A no-coverage parcel's whole row is zero → its latent is left at
+   its frozen init and is masked out of the latent-SA (B30 bidirectional)
+   and the PMA readout (``latent_valid``).
+2. The FE-04 front-end token blocks fold the electrode axis into the batch
+   dim (``BC = B*C``, ``v14_encoder.py:1002``), so they are strictly
+   per-electrode — a dropped electrode's tokens never bleed into any other
+   electrode's tokens before the (masked) cross-attn.
+
+Together: a dropped electrode has exactly one path to the readout (the
+cross-attn pool) and that path is hard-zeroed, so its gradient is 0.0
+exactly. This test pins the exact-zero invariant so any future change to
+the masking stack (or a regression to a soft bias) gets caught.
 """
 
 from __future__ import annotations
@@ -34,19 +49,27 @@ def _make_tiny_model() -> tuple:
     return model, B, C, T, F, K, M
 
 
-def test_invalid_parcels_have_zero_grad_at_encoder_output() -> None:
-    """Set parcels 4, 5 to zero support (no electrode routes there). After
-    forward+backward, the encoder-output latents for those parcel rows
-    must have grad ≈ 0 — they are masked-out as keys in both latent-SA and
-    PMA, so the downstream flat-head loss cannot depend on them.
+def test_invalid_parcels_have_exactly_zero_grad_at_encoder_output() -> None:
+    """One-hot DK assignment: electrode c → parcel c (c in 0..3); parcels
+    4, 5 get NO electrode. After forward+backward, the encoder-output
+    latents for the no-coverage parcel rows must have grad == 0.0 EXACTLY.
+    Primary severance is the ``latent_valid`` mask (the no-coverage slots are
+    dropped from both the latent-SA and the PMA readout — this alone would
+    zero the grad even under the pre-B36 soft bias). The B36 hard pool is
+    consistent with it (all-zero pooling row → frozen-init latent). The
+    genuinely hard-pool-*specific* grad proof — where a soft bias would leak —
+    is ``test_invalid_channel_input_has_exactly_zero_grad`` below.
     """
     torch.manual_seed(0)
     model, B, C, T, F, K, M = _make_tiny_model()
 
-    # Parcels 0..3 have nonzero support; parcels 4, 5 are entirely zero.
+    # Clean one-hot assignment: electrode c assigned to parcel c. Parcels
+    # 0..3 are covered (one electrode each); parcels 4, 5 are no-coverage.
     n_valid_parcels = 4
+    assert C == n_valid_parcels
     support = torch.zeros(B, C, K)
-    support[:, :, :n_valid_parcels] = torch.rand(B, C, n_valid_parcels) + 0.1
+    for c in range(C):
+        support[:, c, c] = 1.0
     valid_mask = torch.ones(B, C, dtype=torch.bool)
     electrode_tokens = torch.randn(B, C, T, F)
 
@@ -70,39 +93,46 @@ def test_invalid_parcels_have_zero_grad_at_encoder_output() -> None:
     grad_invalid = latents_grad[:, invalid_idx].abs().max().item()
     grad_valid = latents_grad[:, valid_idx].abs().max().item()
 
-    assert grad_invalid < 1e-6, (
-        f"invalid-parcel latents leaked gradient: max |grad| = {grad_invalid}"
+    assert grad_invalid == 0.0, (
+        f"no-coverage-parcel latents leaked gradient (B36 hard pool must give "
+        f"them an exactly-zero pool row): max |grad| = {grad_invalid}"
     )
-    assert grad_valid > 1e-6, (
-        f"sanity: valid-parcel latents must have nonzero grad, got {grad_valid}"
+    assert grad_valid > 0.0, (
+        f"sanity: covered-parcel latents must have nonzero grad, got {grad_valid}"
     )
 
 
-def test_invalid_channels_have_attenuated_grad_pathway() -> None:
-    """A channel marked invalid via valid_mask must propagate ≪ a valid
-    channel's gradient signal. Looser than the parcel test because invalid
-    channels still feed token-blocks (which are pre-cross-attn-mask), but
-    the cross-attn bias masks them out so downstream signal is heavily
-    attenuated.
+def test_invalid_channel_input_has_exactly_zero_grad() -> None:
+    """A channel marked invalid via ``valid_mask`` must receive grad == 0.0
+    EXACTLY on its input. Under B36 the hard pool masks it to an exact-zero
+    pooling weight for every parcel, and the per-electrode front-end
+    (``BC = B*C``) never lets its tokens bleed into other electrodes — so it
+    has no surviving path to the readout. (Pre-B36 this was only attenuated
+    because the soft ``log(support+ε)`` bias still gave it a finite weight.)
     """
     torch.manual_seed(1)
     model, B, C, T, F, K, M = _make_tiny_model()
 
-    support = torch.rand(B, C, K) + 0.1
+    # One-hot assignment so every parcel that is covered stays covered after
+    # dropping the last channel (electrode c → parcel c).
+    support = torch.zeros(B, C, K)
+    for c in range(C):
+        support[:, c, c] = 1.0
     valid_mask = torch.ones(B, C, dtype=torch.bool)
     valid_mask[:, -1] = False  # last channel is invalid
 
     tokens_a = torch.randn(B, C, T, F, requires_grad=True)
     out_a = model(tokens_a, support, valid_mask)
     out_a.sum().backward()
+    assert tokens_a.grad is not None
     grad_invalid_chan = tokens_a.grad[:, -1].abs().max().item()
     grad_valid_chan = tokens_a.grad[:, 0].abs().max().item()
 
-    # Invalid channel's gradient is dominated by the (pre-mask) token-block
-    # contribution but is attenuated downstream relative to valid channels.
-    # The exact ratio depends on token-block depth; we just check it's not
-    # the *dominant* path.
-    assert grad_invalid_chan < grad_valid_chan * 10.0, (
-        f"invalid channel grad {grad_invalid_chan} dominates valid channel "
-        f"grad {grad_valid_chan}"
+    assert grad_invalid_chan == 0.0, (
+        f"invalid-channel input leaked gradient (B36 hard pool + per-electrode "
+        f"front-end must give it no path to the readout): "
+        f"max |grad| = {grad_invalid_chan}"
+    )
+    assert grad_valid_chan > 0.0, (
+        f"sanity: valid channel must carry gradient, got {grad_valid_chan}"
     )

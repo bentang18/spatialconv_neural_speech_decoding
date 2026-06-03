@@ -24,11 +24,11 @@ then operates on this interleaved order, NOT on a sort by overall
   upstream leaderboard default).
 
 Onset/Speech tasks use ``words_df`` for positives and ``nonverbal_df`` for
-negatives; all other tasks pull from ``words_df`` alone. The continuous-valued
-tasks (``delta_volume``, ``word_index``, ...) need transcript enrichment from
-``$ROOT_DIR_BRAINTREEBANK/transcripts/{movie}/features.csv`` to materialise
-columns like ``idx_in_sentence`` and ``delta_rms``; ``speech`` and ``face_num``
-work without enrichment.
+negatives; all other tasks pull from ``words_df`` alone. Tasks whose label
+column is transcript-derived (``face_num``, ``delta_volume``, ``word_index``,
+...) need enrichment from ``$ROOT_DIR_BRAINTREEBANK/transcripts/{movie}/features.csv``
+to materialise columns like ``face_num``, ``idx_in_sentence`` and ``delta_rms``;
+only ``speech`` works without enrichment.
 """
 
 from __future__ import annotations
@@ -55,6 +55,21 @@ EvalMode = tp.Literal["CrossSession", "CrossSubject"]
 
 _UPSTREAM_TRAIN_SUBJECT_ID = 2
 _UPSTREAM_TRAIN_TRIAL_ID = 4
+
+
+def _neural_sample_rate() -> float:
+    """BT neural-clock sample rate (2048 Hz). ``est_idx`` is indexed on this
+    clock, so word-onset seconds = ``est_idx / _neural_sample_rate()``.
+
+    Mirrors ``loader._sampling_rate``: reads ``neuroprobe.config.SAMPLING_RATE``
+    when available, else falls back to 2048.0 (``neuroprobe.config`` reads
+    ``os.environ['ROOT_DIR_BRAINTREEBANK']`` at import, so it raises ``KeyError``
+    on laptops without BT data mounted — the unit tests' path)."""
+    try:
+        from neuroprobe.config import SAMPLING_RATE
+    except (ImportError, KeyError):
+        return 2048.0
+    return float(SAMPLING_RATE)
 
 
 def _vendored_csv_dir() -> Path:
@@ -128,6 +143,17 @@ def _word_event_rows(
     mode ``test_acc ≈ 1 − val_acc`` regardless of model quality.
     """
     rows: list[dict[str, tp.Any]] = []
+    # Word/nonverbal events are sliced from the neural stream at the NEURAL-clock
+    # onset `est_idx` (samples @ 2048 Hz), NOT the transcript/movie-relative
+    # `start` time. The two diverge by a per-trial neural-vs-movie-clock offset
+    # that DRIFTS within a trial (sub_4_trial1: first word est_idx 561472 =
+    # 274.16 s vs transcript 39.02 s → 235 s; the gap widens to ~904 s by the
+    # last word). Upstream `datasets.py:300-301` windows
+    # `[est_idx - before, est_idx + after]`; the leaderboard uses before=0,
+    # after=1 s, which is exactly `start=est_idx/SR` with the default
+    # `duration=1.0`. Emitting transcript `start` would slice every BT clip
+    # 235–900 s off-target (C3).
+    sample_rate = _neural_sample_rate()
     for task in tasks:
         label_indices = derive_label_indices(
             words_df=words_df,
@@ -154,7 +180,7 @@ def _word_event_rows(
             rows.append(
                 {
                     "type": "Word",
-                    "start": float(source["start"]),
+                    "start": float(source["est_idx"]) / sample_rate,
                     "duration": float(duration),
                     "text": text,
                     "task": task,
@@ -273,9 +299,11 @@ class BTWordEvents(EventsTransform):
             )
 
     def _enrich_needed(self) -> bool:
-        """``speech`` and ``face_num`` work without transcript enrichment;
-        all other tasks need it."""
-        return not all(t in {"speech", "face_num"} for t in self.tasks)
+        """Only ``speech`` works without transcript enrichment. ``face_num`` is
+        itself a transcript-derived column (``labels.py`` reads
+        ``words_df['face_num']``, absent from the vendored CSV), so it needs
+        enrichment like every continuous-valued task (H7)."""
+        return not all(t == "speech" for t in self.tasks)
 
     def _resolve_bt_root(self) -> str | None:
         return self.bt_root or os.environ.get("ROOT_DIR_BRAINTREEBANK")

@@ -49,6 +49,16 @@ def test_weight_matrix_rows_sum_to_one() -> None:
     assert torch.allclose(W.sum(dim=-1), torch.ones(40), atol=1e-6)
 
 
+def test_weight_matrix_rows_sum_to_one_at_fp32_epsilon() -> None:
+    """WS-F F3 regression pin: the row-normalization lands every bucket sum on
+    1.0 to within fp32 epsilon (2⁻²³ ≈ 1.19e-7). A looser-than-this deviation
+    means the row-sum clamp / normalization drifted — fail CI. (Tighter than
+    the ``1e-6`` structural check above; this one pins the exact numeric
+    floor.)"""
+    W = triangular_pool_weight_matrix(n_in=250, n_out=40)
+    assert (W.sum(dim=-1) - 1.0).abs().max().item() < 1.2e-7
+
+
 def test_weight_matrix_is_finite_and_non_negative() -> None:
     """Triangular weights are non-negative; no NaN / -inf from edge
     padding."""
@@ -70,6 +80,21 @@ def test_weight_matrix_centers_track_uniform_8hz_grid() -> None:
         assert abs(got - exp) <= 1, (
             f"bucket {i}: centre {got} drifts > 1 from expected {exp}"
         )
+
+
+def test_weight_matrix_interior_centroid_lands_on_8hz_grid() -> None:
+    """WS-F F3 regression pin: 50→8 Hz grid alignment, exact. For interior
+    buckets (away from the zero-padded edges) the triangle is symmetric, so its
+    weighted centroid ``Σ wᵢ·i`` equals the uniform-grid centre ``i·(50/8)`` to
+    <0.05 frames. Pins the bucket placement tighter than the ±1 argmax check —
+    an off-by-one in the centre formula (e.g. integer ``50//8`` instead of the
+    6.25 stride) would shift the centroid by ≈0.5+ frames and fail here."""
+    W = triangular_pool_weight_matrix(n_in=250, n_out=40)
+    in_positions = torch.arange(250, dtype=torch.float32)
+    centroid = (W * in_positions).sum(dim=-1)  # rows sum to 1 ⇒ weighted mean
+    expected = torch.arange(40, dtype=torch.float32) * (250.0 / 40.0)
+    interior = slice(3, 37)
+    assert (centroid[interior] - expected[interior]).abs().max().item() < 0.05
 
 
 def test_weight_matrix_base_support_around_12p5_input_frames() -> None:
@@ -121,6 +146,36 @@ def test_triangular_pool_constant_feature_passes_through_unchanged() -> None:
     assert out.shape == (1, 40, 4)
     expected = constant_row.unsqueeze(0).unsqueeze(0).repeat(1, 40, 1)
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_triangular_pool_preserves_dtype_and_accumulates_in_fp32() -> None:
+    """The cache is fp16; the pool upcasts to fp32 for the einsum (a fp16
+    accumulation over ~12-13 frames per bucket loses precision) then casts back
+    to the caller's dtype. Output dtype matches input, and the fp16 result is
+    within fp16 quantization of the fp32 reference."""
+    torch.manual_seed(0)
+    feat32 = torch.randn(1, 250, 1280)
+    ref = triangular_pool_50_to_8_hz(feat32)
+    assert ref.dtype == torch.float32
+    out16 = triangular_pool_50_to_8_hz(feat32.to(torch.float16))
+    assert out16.dtype == torch.float16  # dtype contract preserved
+    assert (out16.float() - ref).abs().max().item() < 1e-2
+
+
+def test_triangular_pool_fp32_accumulation_holds_under_bf16_autocast() -> None:
+    """WS-F bug-hunt pin: ``einsum`` is autocast-eligible, so under an outer
+    bf16 autocast (Lightning's bf16-mixed in the P3 distill step) it would
+    silently downcast the explicit fp32 cast and defeat the documented fp32
+    accumulation. The pool disables autocast internally, so the fp32-input
+    result is identical inside vs outside an autocast region. Before the fix
+    this deviated ~0.4%; after, it is bit-exact."""
+    torch.manual_seed(0)
+    feat = torch.randn(1, 250, 1280)  # fp32 input
+    ref = triangular_pool_50_to_8_hz(feat)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        got = triangular_pool_50_to_8_hz(feat)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got, ref, atol=0.0, rtol=0.0)
 
 
 def test_triangular_pool_rejects_wrong_input_length() -> None:

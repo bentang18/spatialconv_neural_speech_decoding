@@ -118,3 +118,74 @@ class Nv14RobustZTransform(BaseModel):
             sigma_floor=self.sigma_floor,
             dim=self.dim,
         )
+
+
+class SessionRobustZNormalizer:
+    """Session-level robust-z: fit per-(electrode, freq-bin) median + MAD-σ once
+    over a session/train recording, then apply the FROZEN stats to each clip.
+
+    This is the stateful fit/apply form of :func:`robust_z` (which fits its
+    stats per call over its own time axis). Fitting at session granularity is
+    what the v14 N_v14 recipe specifies: stable stats (the full recording, not a
+    noisy ~20-frame clip) and a clean train-only contract — ``fit`` on the train
+    split, ``transform`` every split with those stats, so test clips never leak
+    into normalization. Gain-invariant: a pure ×k per-channel gain scales both
+    median and σ by k, so it cancels exactly in linear space.
+
+    Scope note (WS-C / C3): this object only fits/applies the (C, F) stats. The
+    "where the stats get fit" wiring — a per-session precompute over each
+    session's Multi-STFT frames, cached per (electrode, freq, session) — is the
+    data pipeline's job (WS-E/WS-H, multi-corpus). The default dispatch drops
+    ``scaler="StandardScaler"`` from the view so this normalizer owns the
+    post-STFT scaling once that precompute lands.
+    """
+
+    _FLOAT_DTYPES = (torch.float16, torch.float32, torch.float64)
+
+    def __init__(self, *, sigma_floor: float = 1e-6) -> None:
+        self.sigma_floor = sigma_floor
+        self.median: tp.Optional[torch.Tensor] = None
+        self.sigma: tp.Optional[torch.Tensor] = None
+        self._valid_bin_mask: tp.Optional[torch.Tensor] = None
+
+    def fit(
+        self,
+        frames: torch.Tensor,
+        *,
+        valid_bin_mask: tp.Optional[torch.Tensor] = None,
+    ) -> "SessionRobustZNormalizer":
+        """Fit median + MAD-σ over the last (time) axis of ``frames``.
+
+        ``frames`` is the session's view output ``(..., F, T_session)`` (all
+        train clips of a session concatenated along time). Stats reduce over the
+        last axis → ``(..., F, 1)``, kept independent per (electrode, freq).
+        ``valid_bin_mask`` (broadcastable to a clip's shape, True = valid) is
+        stored and applied on ``transform`` so invalid bins return z=0.
+        """
+        x = frames if frames.dtype in self._FLOAT_DTYPES else frames.float()
+        median = x.median(dim=-1, keepdim=True).values
+        mad = (x - median).abs().median(dim=-1, keepdim=True).values
+        self.median = median
+        self.sigma = SCALE_TO_SIGMA * mad
+        self._valid_bin_mask = valid_bin_mask
+        return self
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the frozen stats: ``z = (x − median) / max(σ, floor)``, with
+        constant-bin (σ < floor) and invalid-bin positions zeroed."""
+        if self.median is None or self.sigma is None:
+            raise RuntimeError(
+                "SessionRobustZNormalizer.transform called before fit()"
+            )
+        x = x if x.dtype in self._FLOAT_DTYPES else x.float()
+        safe_sigma = self.sigma.clamp(min=self.sigma_floor)
+        z = (x - self.median) / safe_sigma
+        z = torch.where(self.sigma >= self.sigma_floor, z, torch.zeros_like(z))
+        if self._valid_bin_mask is not None:
+            z = torch.where(
+                self._valid_bin_mask.to(dtype=torch.bool), z, torch.zeros_like(z),
+            )
+        return z
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return self.transform(x)

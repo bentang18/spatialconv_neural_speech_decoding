@@ -37,8 +37,10 @@ B28 cross-attn collapse 2026-05-27 PM):
     → (B, C, F_p, T_p, d) preserved (SA flat over F_p·T_p tokens)
     → broadcast K*M parcel-id-tagged latents to (B, K*M, T_p, d)        [LAT-01]
     → per-time-patch cross-attn @ ``cross_attn_positions`` (default
-      ``[0]``, B28 Perceiver-IO canonical) with K/V = (C·F_p) tokens
-      and λ_anat · log(support + eps) bias broadcast over F_p axis
+      ``[0]``, B28 Perceiver-IO canonical) with K/V = (C·F_p) tokens and a
+      HARD block-diagonal per-parcel pool: parcel-slot l attends ONLY to its
+      own DK parcel's electrodes (one-hot ``support``), off-parcel weight is
+      exactly 0 (B36 2026-06-01 replaced the soft λ_anat·log(support+ε) bias)
       (position 0 always runs; depth=0 OK)                              [T1.1, T1.3]
     → factorized latent stack: depth=6 blocks of (t_p-SA RoPE × parcel-SA
       × FFN); additional cross-attns fire pre-block at each interior
@@ -70,7 +72,6 @@ from torch.utils.checkpoint import checkpoint
 
 from neuraltrain.models.base import BaseModelConfig
 
-from speech_decoding.atlas.support import compute_gated_log_support_bias
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
 )
@@ -102,6 +103,17 @@ def _rope_freqs(head_dim: int, max_seq_len: int, base: float = 10_000.0) -> Tens
 # IE12 in docs/neuroprobe/v14_blockers.md.
 NEG_INF_MASK_VALUE: float = -1e4
 
+# Renormalisation floor for the hand-rolled ``pool_weights`` path. After the
+# post-softmax ``masked_fill(0)`` zeroes off-parcel weights, the on-parcel row
+# is divided by its own sum so it totals exactly 1.0. This corrects the
+# residual sum-rounding a bf16 softmax leaves on the *attended* weights — it is
+# a no-op in fp32 / under autocast-fp32, where the row already sums to 1. A
+# no-coverage parcel's row sums to 0 → ``clamp_min`` keeps the division finite
+# (the row stays all-zero, no NaN). On-parcel sums are ≈1.0, so this tiny floor
+# never rescales a covered row. ``forward`` pools via SDPA (softmax over the
+# attended set only) and needs no renormalisation.
+_POOL_RENORM_EPS: float = 1e-6
+
 
 def _apply_rope(x: Tensor, rope: Tensor) -> Tensor:
     """Apply RoPE to ``x`` of shape ``(..., T, head_dim)`` using cached table."""
@@ -116,15 +128,36 @@ def _apply_rope(x: Tensor, rope: Tensor) -> Tensor:
     return x * cos + x_rotated * sin
 
 
-class _MultiHeadCrossAttentionWithBias(nn.Module):
-    """Latent ← electrode cross-attn with additive QK bias broadcast over heads.
+class _MultiHeadCrossAttention(nn.Module):
+    """Latent ← electrode cross-attn with a hard block-diagonal parcel pool.
 
-    Optionally applies one-sided RoPE to the K vectors based on their time-bin
-    index. Q (latents) has no time axis, so it stays unrotated — this is
-    unusual versus canonical bidirectional Q+K RoPE but principled here:
-    absolute K position is what we need, and it lets us honor the
-    "RoPE on T_bins" spec commitment without introducing a separate
-    per-electrode temporal self-attn block.
+    B36 (2026-06-01, ``project_v14_b36_perparcel_pool_structured_jepa``):
+    the soft additive ``λ_anat·log(support+ε)`` Graphormer bias is replaced
+    by a hard one-hot DK assignment mask. Parcel-slot query ``l`` attends
+    ONLY to the electrode-freq-patch tokens of its own DK parcel
+    (``key_mask[b, l, n] == True``). ``forward`` pools via
+    ``F.scaled_dot_product_attention`` with an *additive* ``NEG_INF_MASK_VALUE``
+    (-1e4) bias at off-parcel keys (NOT a boolean mask): off-parcel
+    ``exp(score - 1e4)`` underflows to **exactly** 0 in every dtype, so their
+    weight is exactly 0, and no ``(B, H, L, N)`` score matrix is materialised
+    (the masked SDPA routes to the mem-efficient backend under autocast
+    bf16-mixed — the same OOM the latent-SA path dodges via SDPA). The finite
+    sentinel (vs a boolean mask's true -inf) is load-bearing: a no-coverage
+    parcel's row is *fully* blocked, and a -inf row would softmax over an empty
+    set → NaN in BOTH forward and backward (the latter poisons q/k/v grads even
+    when the forward output is zeroed: 0·NaN = NaN). The -1e4 sentinel makes a
+    fully-blocked row a *uniform* finite softmax instead, NaN-free on every
+    backend; ``forward`` then zeroes those rows → zero context → the residual
+    leaves the latent untouched (and a zero upstream grad × finite jacobian
+    gives the slot exactly-zero grad), matching ``_compute_latent_valid``
+    downstream. ``pool_weights`` mirrors the same partition with an explicit
+    masked softmax (off-parcel masked to ``NEG_INF_MASK_VALUE`` then zeroed,
+    on-parcel renormalised to sum 1) for the collapse-monitor / test path,
+    which needs the weights SDPA cannot return.
+
+    The cross-attn is strict per-time-patch (the caller batches ``T_p`` into
+    the batch dim), so there is no RoPE on the keys — temporal position is
+    carried by the joint token blocks and the latent time-SA.
     """
 
     def __init__(self, d_model: int, n_heads: int) -> None:
@@ -138,36 +171,90 @@ class _MultiHeadCrossAttentionWithBias(nn.Module):
         self.kv_proj = nn.Linear(d_model, 2 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(
+    def _validate(self, latents: Tensor, electrodes: Tensor, key_mask: Tensor) -> None:
+        B, L, _ = latents.shape
+        N = electrodes.shape[1]
+        if key_mask.shape != (B, L, N):
+            raise ValueError(
+                f"key_mask shape {tuple(key_mask.shape)} does not match "
+                f"(B, L, N) = ({B}, {L}, {N})"
+            )
+        if key_mask.dtype != torch.bool:
+            raise TypeError(
+                f"key_mask dtype must be torch.bool; got {key_mask.dtype}"
+            )
+
+    def pool_weights(
         self,
         latents: Tensor,         # (B, L, d)
-        electrodes: Tensor,      # (B, N, d)  N = C * T_bins
-        bias: Tensor,            # (B, L, N) — log(support+eps) + valid_mask
-        *,
-        key_rope: Optional[Tensor] = None,  # (2, T_bins, head_dim) cos/sin
-        t_bins: Optional[int] = None,
+        electrodes: Tensor,      # (B, N, d)  N = C * F_p
+        key_mask: Tensor,        # (B, L, N) bool — True = on-parcel & kept
     ) -> Tensor:
+        """Post-softmax pooling weights ``(B, H, L, N)``: off-parcel == 0
+        exactly, on-parcel rows sum to 1, no-coverage rows all-zero.
+
+        Exposed for the WS-A hard-pool test and collapse monitors; ``forward``
+        reproduces the same masking inline (recomputing q/k here keeps this
+        path read-only and side-effect free)."""
+        self._validate(latents, electrodes, key_mask)
         B, L, _ = latents.shape
         N = electrodes.shape[1]
         q = self.q_proj(latents).reshape(B, L, self.n_heads, self.head_dim)
-        kv = self.kv_proj(electrodes).reshape(B, N, 2, self.n_heads, self.head_dim)
-        k, v = kv.unbind(dim=2)
-        if key_rope is not None:
-            if t_bins is None or N % t_bins != 0:
-                raise ValueError(
-                    f"key_rope requires t_bins that evenly divides N={N}, got t_bins={t_bins}"
-                )
-            C = N // t_bins
-            # (B, N, H, head_dim) → (B, C, T, H, head_dim) → (B, C, H, T, head_dim)
-            k_rot = k.reshape(B, C, t_bins, self.n_heads, self.head_dim).transpose(2, 3)
-            k_rot = _apply_rope(k_rot, key_rope)
-            # back to (B, N, H, head_dim)
-            k = k_rot.transpose(2, 3).reshape(B, N, self.n_heads, self.head_dim)
+        k = self.kv_proj(electrodes).reshape(
+            B, N, 2, self.n_heads, self.head_dim
+        ).unbind(dim=2)[0]
         logits = torch.einsum("blhd,bnhd->bhln", q, k) * self.scale
-        logits = logits + bias.unsqueeze(1)  # broadcast over heads
-        attn = logits.softmax(dim=-1)
-        ctx = torch.einsum("bhln,bnhd->blhd", attn, v)
-        return self.out(ctx.reshape(B, L, -1))
+        blocked = (~key_mask).unsqueeze(1)                       # (B, 1, L, N)
+        logits = logits.masked_fill(blocked, NEG_INF_MASK_VALUE)
+        attn = logits.softmax(dim=-1).masked_fill(blocked, 0.0)
+        return attn / attn.sum(dim=-1, keepdim=True).clamp_min(_POOL_RENORM_EPS)
+
+    def forward(
+        self,
+        latents: Tensor,         # (B, L, d)
+        electrodes: Tensor,      # (B, N, d)  N = C * F_p
+        key_mask: Tensor,        # (B, L, N) bool — True = on-parcel & kept
+    ) -> Tensor:
+        self._validate(latents, electrodes, key_mask)
+        B, L, _ = latents.shape
+        N = electrodes.shape[1]
+        q = self.q_proj(latents).reshape(
+            B, L, self.n_heads, self.head_dim
+        ).transpose(1, 2)                                        # (B, H, L, hd)
+        kv = self.kv_proj(electrodes).reshape(B, N, 2, self.n_heads, self.head_dim)
+        k, v = (t.transpose(1, 2) for t in kv.unbind(dim=2))     # (B, H, N, hd) each
+        # Additive FLOAT mask (0 = attend, NEG_INF_MASK_VALUE = block), NOT a
+        # boolean mask. A boolean mask forces SDPA to use true -inf, and a
+        # no-coverage parcel's row is FULLY blocked (K=80 is the cross-cohort
+        # union; one BT subject covers only ~20 → ~60 empty parcels per
+        # subject), so a -inf row would
+        # softmax over an empty set → NaN in forward AND backward on CUDA's
+        # mem-efficient/flash kernels. Zeroing the forward output (below) does
+        # NOT save the backward: 0·NaN = NaN poisons the q/k/v grads. The finite
+        # -1e4 sentinel instead makes a fully-blocked row a *uniform* finite
+        # softmax, so forward and backward stay finite on every backend; the
+        # no-coverage zeroing below then forces the output (and its grad via a
+        # zero upstream grad × finite jacobian) to exactly 0. For covered rows
+        # exp(score - 1e4) underflows to exactly 0 in fp32/fp16/bf16, so the
+        # off-parcel weight is still exactly 0 — matching pool_weights and the
+        # project-wide NEG_INF_MASK_VALUE convention (latent-SA mask + the
+        # NEG_INF_MASK_VALUE module-constant rationale). No (B, H, L, N) score
+        # matrix is materialised (the
+        # mem-efficient backend the masked SDPA routes to), dodging the OOM the
+        # hand-rolled softmax hits at C=384 × T~130 on 31 GiB GPUs. SDPA's
+        # default scale is 1/sqrt(head_dim) == self.scale.
+        attn_bias = torch.zeros_like(
+            key_mask, dtype=q.dtype
+        ).masked_fill_(~key_mask, NEG_INF_MASK_VALUE).unsqueeze(1)  # (B, 1, L, N)
+        ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)  # (B,H,L,hd)
+        ctx = ctx.transpose(1, 2).reshape(B, L, -1)              # (B, L, d)
+        # No-coverage slot: the uniform softmax above pools mean(v); zero it so
+        # the residual leaves the parcel latent untouched — matching
+        # pool_weights' renorm-to-zero and _compute_latent_valid. out has
+        # bias=False, so out(0) == 0 keeps the row exactly zero.
+        no_coverage = ~key_mask.any(dim=-1)                      # (B, L)
+        ctx = ctx.masked_fill(no_coverage.unsqueeze(-1), 0.0)
+        return self.out(ctx)
 
 
 class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
@@ -186,8 +273,13 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x: Tensor, rope: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, rope: Tensor, *, key_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         # x: (B, T, d), rope: (2, T_max, head_dim) packed cos/sin
+        # key_mask: (B, T) bool, True = keepable key (B36 C5 freq-patch
+        #   exclusion; None → full attention, byte-identical to the no-mask
+        #   path). The latent time-SA caller passes None.
         B, T, _ = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)                     # (B, T, H, head_dim) each
@@ -197,13 +289,18 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
         q = _apply_rope(q.transpose(1, 2), rope)        # (B, H, T, head_dim)
         k = _apply_rope(k.transpose(1, 2), rope)        # (B, H, T, head_dim)
         v = v.transpose(1, 2)                           # (B, H, T, head_dim)
+        attn_mask = None
+        if key_mask is not None:
+            # (B, T) key-padding → (B, 1, 1, T) bool broadcast over heads and
+            # query positions. True = participate (SDPA bool-mask convention).
+            attn_mask = key_mask[:, None, None, :].to(torch.bool)
         # SDPA's default scale is 1/sqrt(head_dim), matching ``self.scale``.
         # Routes to FlashAttention / mem-efficient backends under autocast
         # bf16-mixed, so the (B, H, T, T) attn matrix is never materialized
         # — critical because the hand-rolled softmax was upcast to fp32 by
         # PyTorch autocast and OOM'd at C=384 padded electrodes × T~130 on
         # 31 GiB GPUs (see [[feedback_dcc_partition_default_coganlab_gpu_2026_05_29]]).
-        ctx = F.scaled_dot_product_attention(q, k, v)   # (B, H, T, head_dim)
+        ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         ctx = ctx.transpose(1, 2)                       # (B, T, H, head_dim)
         return self.out(ctx.reshape(B, T, -1))
 
@@ -346,6 +443,38 @@ class _PatchStem(nn.Module):
         return out.permute(0, 2, 3, 1).reshape(B, C, F_p, T_p, -1)
 
 
+def freq_patch_valid_mask(
+    valid_bin_mask: Tensor,
+    *,
+    kernel_freq: int,
+    stride_freq: int,
+) -> Tensor:
+    """B36 C5 — map a per-freq-BIN validity mask to per-freq-PATCH validity.
+
+    The Conv2d patch stem groups ``kernel_freq`` adjacent freq bins (stride
+    ``stride_freq``) into one freq patch. A patch is valid iff EVERY bin it
+    covers is valid — conservative: a patch straddling the SWEC k21/k22
+    boundary (one valid + two invalid bins) is dropped, which is exactly the
+    plan's "SWEC k0–21 → F-patch 0–6" (patch 7 = bins {21,22,23} → dropped).
+
+    Inputs
+    ------
+    valid_bin_mask
+        ``(..., F)`` bool, True = the freq bin carries real signal for this
+        corpus. SWEC: bins k0–21 True, k22–29 False.
+
+    Output
+    ------
+    ``(..., F_p)`` bool where ``F_p = (F − kernel_freq)//stride_freq + 1``.
+    """
+    if valid_bin_mask.dtype != torch.bool:
+        valid_bin_mask = valid_bin_mask.to(torch.bool)
+    # unfold the bin axis into (F_p, kernel_freq) windows; a patch is valid
+    # iff all bins in its window are valid.
+    windows = valid_bin_mask.unfold(-1, kernel_freq, stride_freq)  # (..., F_p, kernel_freq)
+    return windows.all(dim=-1)
+
+
 class _JointTokenBlock(nn.Module):
     """FE-04 (B20 v4 lock 2026-05-24): per-electrode JOINT (t_p·f_p) self-
     attention block. Single multi-head SA over the flat ``F_p · T_p`` token
@@ -370,14 +499,23 @@ class _JointTokenBlock(nn.Module):
         self.ln_ffn = nn.LayerNorm(d_model)
         self.ffn = _ffn(d_model)
 
-    def forward(self, tokens: Tensor, rope_time: Tensor) -> Tensor:
+    def forward(
+        self,
+        tokens: Tensor,
+        rope_time: Tensor,
+        key_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """tokens: ``(B*C, F_p · T_p, d)`` flat joint sequence.
         rope_time: ``(2, F_p · T_p, head_dim)`` per-token RoPE table where
         position i carries the time-patch index ``i // F_p`` rotation
         (built once per forward by the encoder; freq-patch axis collapses
         into the flat token index).
+        key_mask: ``(B*C, F_p · T_p)`` bool, True = keepable key. B36 C5 —
+        invalid freq-patch tokens (e.g. SWEC k22–29) are excluded as
+        self-attention keys. ``None`` → full attention. Positional (not
+        keyword) so the ``checkpoint(...)`` call can pass it through.
         """
-        x = tokens + self.attn(self.ln_attn(tokens), rope_time)
+        x = tokens + self.attn(self.ln_attn(tokens), rope_time, key_mask=key_mask)
         return x + self.ffn(self.ln_ffn(x))
 
 
@@ -441,13 +579,13 @@ class _LatentSelfAttnBlock(nn.Module):
 
 
 class _CrossAttnBlock(nn.Module):
-    """Latent ← electrode cross-attn with anatomy bias, then FFN, pre-LN."""
+    """Latent ← electrode hard block-diagonal parcel pool, then FFN, pre-LN."""
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
         self.ln_q = nn.LayerNorm(d_model)
         self.ln_kv = nn.LayerNorm(d_model)
-        self.attn = _MultiHeadCrossAttentionWithBias(d_model, n_heads)
+        self.attn = _MultiHeadCrossAttention(d_model, n_heads)
         self.ln_ffn = nn.LayerNorm(d_model)
         self.ffn = _ffn(d_model)
 
@@ -455,14 +593,10 @@ class _CrossAttnBlock(nn.Module):
         self,
         latents: Tensor,
         electrodes: Tensor,
-        bias: Tensor,
-        *,
-        key_rope: Optional[Tensor] = None,
-        t_bins: Optional[int] = None,
+        key_mask: Tensor,
     ) -> Tensor:
         latents = latents + self.attn(
-            self.ln_q(latents), self.ln_kv(electrodes), bias,
-            key_rope=key_rope, t_bins=t_bins,
+            self.ln_q(latents), self.ln_kv(electrodes), key_mask,
         )
         latents = latents + self.ffn(self.ln_ffn(latents))
         return latents
@@ -493,6 +627,45 @@ def _compute_latent_valid(
         .expand(B, K, m_sub_slots)
         .reshape(B, K * m_sub_slots)
     )
+
+
+def compute_latent_valid_3way(
+    *,
+    support: Tensor,
+    valid_mask: Optional[Tensor],
+    m_sub_slots: int,
+    parcel_time_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """B36 B8 — 3-way slot/time validity for paradigm-B masked JEPA.
+
+    Splits the ``covered`` slot-time grid into the three roles the masked-JEPA
+    step needs:
+
+      * ``visible`` ``(B, L, T_p)`` — ``covered ∧ ¬masked``. Fed to the student
+        encoder's latent self-attention keys (visible-only forward).
+      * ``target``  ``(B, L, T_p)`` — ``covered ∧ masked``. The masked-prediction
+        positions: predictor queries + the L1 loss support.
+      * ``teacher`` ``(B, L)``      — ``covered`` (time-invariant). The EMA
+        teacher encodes the FULL input, so its valid set ignores the mask.
+
+    ``visible ⊎ target == covered`` (per time patch) and ``visible ∩ target ==
+    ∅`` by construction. ``parcel_time_mask`` is ``(B, K, T_p)`` (True = masked,
+    only over covered parcels); it is lifted to the slot axis via
+    ``repeat_interleave`` over ``M`` (slot ``l = k·M + s``).
+    """
+    teacher = _compute_latent_valid(
+        support=support, valid_mask=valid_mask, m_sub_slots=m_sub_slots,
+    )                                                                # (B, L)
+    if parcel_time_mask.dim() != 3:
+        raise ValueError(
+            f"parcel_time_mask must be (B, K, T_p); got "
+            f"{tuple(parcel_time_mask.shape)}"
+        )
+    masked_lt = parcel_time_mask.repeat_interleave(m_sub_slots, dim=1)  # (B, L, T_p)
+    covered_lt = teacher.unsqueeze(-1)                                  # (B, L, 1)
+    visible = covered_lt & ~masked_lt                                  # (B, L, T_p)
+    target = covered_lt & masked_lt                                    # (B, L, T_p)
+    return visible, target, teacher
 
 
 class V14ParcelPerceiverModel(nn.Module):
@@ -638,7 +811,8 @@ class V14ParcelPerceiverModel(nn.Module):
         # ``R-m4-slots`` sister) is NOT a single free parameter. It is reconstructed
         # at every forward from two embedding tables + a frozen broken-symmetry
         # noise buffer. Identity-anchored init is the symmetry-breaker that lets
-        # cross-attn ❺ pool meaningfully in P1 when the anatomy bias is OFF.
+        # cross-attn ❺ pool meaningfully — the B36 hard per-parcel pool has no
+        # learnable routing bias to break inter-slot ties, so init does.
         #     z[p·M + s] = LearnableParcelEmbed[p] + LearnableSubSlotEmbed[s] + ε
         # where ε ~ N(0, 0.02²) per (p, s, d) is fixed at construction. Replaces
         # the prior `parcel_embedding = nn.Parameter(K, M, d)` single tensor.
@@ -694,6 +868,14 @@ class V14ParcelPerceiverModel(nn.Module):
         self.token_blocks = nn.ModuleList(
             [_JointTokenBlock(d_model, n_heads) for _ in range(n_token_blocks)]
         )
+        # B36 B1: terminal LayerNorm of the front-end sub-encoder. The M2 tap
+        # (the front-end JEPA target in P1) is returned post-``frontend_ln``,
+        # the canonical V-JEPA-2 convention — the EMA teacher mirrors this LN
+        # (it lives inside the encoder, so the deepcopy carries it), so the
+        # masked-prediction target ``sg(teacher frontend_ln(M2))`` is matched
+        # to the student's own normalized front-end output. Mirrors
+        # ``encoder_ln`` (the M4 terminal LN) one stage earlier.
+        self.frontend_ln = nn.LayerNorm(d_model)
 
         # B28 cross-attn lock 2026-05-27 PM (supersedes v4 amendment 5/19 §5
         # 2-cross-attn @ {0, 3} default). Perceiver IO (Jaegle 2021,
@@ -780,45 +962,91 @@ class V14ParcelPerceiverModel(nn.Module):
         else:
             self.ref_embed = None  # type: ignore[assignment]
 
+    def patch_grid_shape(self, electrode_tokens: Tensor) -> tuple[int, int, int]:
+        """B36 B5/B8 — the ``(C, F_p, T_p)`` front-end token grid for a batch.
+
+        Lets the SSL trainer size the P1 token-mask ``(B, C, F_p, T_p)`` and
+        the P2 parcel-time mask ``(B, K, T_p)`` without re-deriving the
+        patch-stem arithmetic. ``electrode_tokens`` is the raw encoder input
+        ``(B, C, T_bins, F_bins)`` (or ``(B, C, F_bins, T_bins)`` under
+        ``time_last_input``); returns the post-patch ``(C, F_p, T_p)``.
+        """
+        if self.time_last_input:
+            _B, C, _F, T = electrode_tokens.shape
+        else:
+            _B, C, T, _F = electrode_tokens.shape
+        F_p = self.patch_stem.n_freq_patches(self.n_freq_bins)
+        T_p = self.patch_stem.n_time_patches(T)
+        return C, F_p, T_p
+
+    # B36 WS-E (phase orchestration). Top-level submodules whose parameters
+    # belong to each staging group. The FRONT-END produces the M2 tap (patch
+    # stem → per-patch freq embed → joint token blocks → frontend_ln); P1
+    # trains it alone. The PARCEL side is everything downstream of M2 — the
+    # per-parcel pool (``cross_attns``), the inter-parcel self-attention
+    # (``latent_blocks``), the terminal ``encoder_ln``, and the learnable
+    # latent-slot tables; P2 trains these (plus the student-only predictor,
+    # which lives on the BrainModule) while the front-end rides at LR/10.
+    # Per-clip conditioning embeds (``subtype_embed`` / ``ref_embed``,
+    # default OFF per B32) inject at the front-end ``cond_emb`` upstream of
+    # the token blocks, so they group with the front-end. ``latent_init_noise``
+    # and the RoPE tables are buffers (no grad) and never appear here.
+    _FRONTEND_PARAM_TOPS: tp.ClassVar[frozenset[str]] = frozenset(
+        {"patch_stem", "freq_embed", "token_blocks", "frontend_ln",
+         "subtype_embed", "ref_embed"}
+    )
+    _PARCEL_PARAM_TOPS: tp.ClassVar[frozenset[str]] = frozenset(
+        {"cross_attns", "latent_blocks", "encoder_ln",
+         "learnable_parcel_embed", "learnable_subslot_embed"}
+    )
+
+    def partition_parameters_for_staging(
+        self,
+    ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        """Split encoder params into ``(frontend, parcel)`` for B36 staging.
+
+        ``named_parameters`` dedups the ``self.cross_attn = self.cross_attns[0]``
+        alias automatically, so every parameter lands in exactly one bucket.
+        Any parameter whose top-level attribute is in neither set raises — a
+        new encoder parameter must be consciously assigned to a stage, never
+        silently defaulted into the wrong LR group.
+        """
+        frontend: list[nn.Parameter] = []
+        parcel: list[nn.Parameter] = []
+        for name, p in self.named_parameters():
+            top = name.split(".", 1)[0]
+            if top in self._FRONTEND_PARAM_TOPS:
+                frontend.append(p)
+            elif top in self._PARCEL_PARAM_TOPS:
+                parcel.append(p)
+            else:
+                raise RuntimeError(
+                    f"V14ParcelPerceiverModel parameter {name!r} (top-level "
+                    f"{top!r}) is unassigned to a B36 staging group; add it to "
+                    "_FRONTEND_PARAM_TOPS or _PARCEL_PARAM_TOPS in "
+                    "partition_parameters_for_staging."
+                )
+        return frontend, parcel
+
     def forward(
         self,
         electrode_tokens: Tensor,   # (B, C, T_bins, F_bins) or (B, C, F_bins, T_bins) if time_last_input
         support: Tensor,            # (B, C, K_parcels)
         valid_mask: Optional[Tensor] = None,  # (B, C) bool
         *,
+        # B36 hard pool: the one-hot DK ``support`` IS the parcel assignment,
+        # so there is no ``log(support + ε)`` smoothing term. ``eps`` is kept
+        # in the signature (vestigial, reserved for the gated ``R-bna-soft``
+        # routing sister) but unused on the default hard-pool path.
         eps: float = DEFAULT_SUPPORT_BIAS_EPS,
         return_taps: bool = False,
         # MASK-03 (B03 mask-discipline lock 2026-05-25 PM): per-electrode
-        # SHAFT mask (B, C) bool — True = DROP from cross-attn K/V via the
-        # key_padding_mask path. Combines with ``~valid_mask`` (pad mask).
-        # P1 leaves this as zeros (None ≡ no shaft drop); P2 supplies the
-        # K=3 mixed-extent shaft blocks at ~40% effective rate (Brain-JEPA
-        # pattern). Pure DROP — no [MASK] token (paradigm B).
+        # SHAFT mask (B, C) bool — True = DROP. A dropped electrode is
+        # non-attendable by every parcel (folded into the hard-pool
+        # ``key_mask`` below). Combines with ``~valid_mask`` (pad mask).
+        # P1 leaves this as None (no shaft drop). Pure DROP — no [MASK]
+        # token (paradigm B).
         shaft_mask: Optional[Tensor] = None,
-        # B29 Item 12 (5/27 PM-late) DROPS the prior MASK-07 / B03b
-        # ``supervised_slot_mask`` kwarg. Loss heads (L_mid_slot,
-        # L_post_frame) AND the latent-SA bidirectional ``attn_mask``
-        # (B30 lock 2026-05-28) now always operate on the support-derived
-        # ``_compute_latent_valid`` slot bank; SWEC degenerates naturally
-        # (no support coverage → no latent attendable slots) without a
-        # per-subject override.
-        # B28 anatomy-bias warmup 2026-05-27 PM + B29 Item 12 per-clip
-        # gate 2026-05-27 PM-late: multiplier on the log(support+eps)
-        # cross-attn bias. Two surfaces:
-        #
-        #   * ``float`` (default ``1.0``) — scalar broadcast over the
-        #     full batch. ``0.0`` = bias OFF (uniform attention over
-        #     electrodes). Compatible with the B28 warmup schedule in
-        #     ``ssl.warmup.anatomy_bias_warmup_schedule``.
-        #   * ``Tensor`` of shape ``(B,)`` — B29 per-clip gate. Each
-        #     clip independently scales its anatomy bias; driven by
-        #     ``LambdaAnatExtractor`` per-clip metadata (anatomy-rich
-        #     corpora → 1.0; SWEC → 0.0 by default).
-        #
-        # The drop-mask (NEG_INF_MASK_VALUE on padded/shaft-masked
-        # positions) is applied AFTER this scaling, so dropped electrodes
-        # stay dropped at every λ.
-        lambda_anat: tp.Union[float, Tensor] = 1.0,
         # B29 Item 11 lock 2026-05-27 PM-late: per-clip conditioning ids.
         # When the corresponding embed is enabled and ``subject_subtype`` /
         # ``ref_idx`` is provided, the embedding vector is added at A1
@@ -830,6 +1058,33 @@ class V14ParcelPerceiverModel(nn.Module):
         # subtype/ref metadata still produce non-degenerate features.
         subject_subtype: Optional[Tensor] = None,
         ref_idx: Optional[Tensor] = None,
+        # B36 B5 (paradigm-B masked JEPA, visible-only student forward). Both
+        # default ``None`` → byte-identical to the unmasked forward.
+        #   ``token_mask``: (B, C, F_p, T_p) bool, True = masked — the P1
+        #     front-end M2 token mask. Masked post-patch tokens are zeroed
+        #     before the token blocks so visible tokens never encode them.
+        #   ``parcel_time_mask``: (B, K, T_p) bool, True = masked — the P2
+        #     parcel-time block mask. Its electrodes are zeroed at the masked
+        #     time patches (front-end input drop, derived via the one-hot
+        #     ``support``) and the masked parcel-times are excluded from the
+        #     latent self-attention keys (visible-only encoder).
+        token_mask: Optional[Tensor] = None,
+        parcel_time_mask: Optional[Tensor] = None,
+        # B36 WS-B efficiency (P1 paradigm A reads ONLY M2): when True, return
+        # ``{"M2": frontend_ln(token-block output)}`` and skip the entire
+        # downstream pool / inter-parcel encoder / encoder_ln. M2 is computed
+        # upstream of the pool, so the returned tap is byte-identical to the
+        # full forward's M2 — the skipped stages produce M3/M4 which P1 never
+        # reads and which carry no P1 gradient anyway. Requires return_taps.
+        m2_only: bool = False,
+        # B36 C5: per-corpus freq-PATCH validity ``(F_p,)`` or ``(B, F_p)`` bool,
+        # True = valid. Derived from the per-corpus valid-bin mask via
+        # ``freq_patch_valid_mask``. Invalid freq patches (SWEC k22–29 →
+        # F-patches 7–9) are excluded as keys in BOTH the per-electrode joint
+        # token-block self-attention AND the hard-pool cross-attention. ``None``
+        # → every freq patch valid (the BT all-30-bins-valid default), making
+        # this path byte-identical to the pre-C5 forward.
+        freq_patch_valid: Optional[Tensor] = None,
     ) -> Tensor | dict[str, Tensor]:
         """Returns parcel latents shaped ``(B, K*M, T_p, d)`` where ``T_p``
         is the post-patch frame count from the Conv2d patch stem.
@@ -891,6 +1146,22 @@ class V14ParcelPerceiverModel(nn.Module):
                 f"patch stem produced F_p={F_p} but init-time n_freq_patches="
                 f"{self.n_freq_patches} — likely a kernel/stride mismatch"
             )
+
+        # B36 C5: normalize the per-corpus freq-patch validity to (B, F_p) bool.
+        # None → all valid (BT default; the whole block below is then a no-op).
+        freq_patch_valid_bf: Optional[Tensor] = None
+        if freq_patch_valid is not None:
+            fpv = freq_patch_valid.to(torch.bool)
+            if fpv.shape not in {(F_p,), (B, F_p)}:
+                raise ValueError(
+                    f"freq_patch_valid shape {tuple(freq_patch_valid.shape)} "
+                    f"must be (F_p,) or (B, F_p) = ({F_p},) / ({B}, {F_p})"
+                )
+            if fpv.dim() == 1:
+                fpv = fpv.unsqueeze(0).expand(B, F_p)
+            # All-valid is byte-identical to None; only carry a real mask.
+            if not bool(fpv.all()):
+                freq_patch_valid_bf = fpv
 
         # FE-03: per-patch freq embedding broadcast over T_p.
         # freq_embed: (F_p, d) → unsqueeze(1) → (F_p, 1, d) → broadcasts to
@@ -974,6 +1245,40 @@ class V14ParcelPerceiverModel(nn.Module):
         else:
             cond_emb = None
 
+        # B36 B5: visible-only masking. Zero the masked front-end tokens
+        # (post-patch, post-freq/cond-embed) BEFORE the token blocks so visible
+        # tokens never encode masked content — the leakage-free paradigm-B
+        # contract. ``token_mask`` (P1) masks individual (electrode, freq-patch,
+        # time-patch) cells; ``parcel_time_mask`` (P2) drops a covered parcel's
+        # electrodes at the masked time patches (derived from the one-hot
+        # ``support``). Zeroing a token makes the masked input a constant, so a
+        # visible token's output is independent of any masked input value.
+        token_drop: Optional[Tensor] = None  # (B, C, F_p, T_p) bool
+        if token_mask is not None:
+            if token_mask.shape != (B, C, F_p, T_p):
+                raise ValueError(
+                    f"token_mask shape {tuple(token_mask.shape)} does not "
+                    f"match (B, C, F_p, T_p) = ({B}, {C}, {F_p}, {T_p})"
+                )
+            token_drop = token_mask
+        if parcel_time_mask is not None:
+            if parcel_time_mask.shape != (B, self.k_parcels, T_p):
+                raise ValueError(
+                    f"parcel_time_mask shape {tuple(parcel_time_mask.shape)} "
+                    f"does not match (B, K, T_p) = "
+                    f"({B}, {self.k_parcels}, {T_p})"
+                )
+            # electrode_time_drop[b, c, t] = ∃k: support[b,c,k]>0 ∧ mask[b,k,t].
+            onehot = (support > 0).to(x.dtype)                          # (B, C, K)
+            etd = (
+                torch.einsum("bck,bkt->bct", onehot, parcel_time_mask.to(x.dtype))
+                > 0
+            )                                                           # (B, C, T_p)
+            etd_grid = etd.unsqueeze(2).expand(B, C, F_p, T_p)          # (B,C,F_p,T_p)
+            token_drop = etd_grid if token_drop is None else (token_drop | etd_grid)
+        if token_drop is not None:
+            x = x.masked_fill(token_drop.unsqueeze(-1), 0.0)
+
         # FE-04: per-electrode JOINT (t_p·f_p) self-attention token blocks.
         # Flatten the per-electrode plane into a single token sequence,
         # ordered (t_p outer, f_p inner) so flat-index i = t_p · F_p + f_p
@@ -986,6 +1291,20 @@ class V14ParcelPerceiverModel(nn.Module):
         # Slice the precomputed tiled rope to the current flat length so the
         # existing _apply_rope (which does `cos[:T]`) finds matching entries.
         rope_token = self.rope_joint_token[:, : T_p * F_p, :]
+        # B36 C5: per-electrode joint token-block key mask. Flat token order is
+        # (t_p outer, f_p inner) — token i = t_p·F_p + f_p — so freq validity
+        # tiles over T_p and replicates across electrodes (all C share a
+        # corpus's freq mask). None (BT) → full attention.
+        token_key_mask: Optional[Tensor] = None
+        if freq_patch_valid_bf is not None:
+            fk = (
+                freq_patch_valid_bf.unsqueeze(1)
+                .expand(B, T_p, F_p)
+                .reshape(B, T_p * F_p)
+            )                                                         # (B, T_p·F_p)
+            token_key_mask = (
+                fk.unsqueeze(1).expand(B, C, T_p * F_p).reshape(BC, T_p * F_p)
+            )                                                         # (BC, T_p·F_p)
         # 2026-05-30 speedup audit (#119): activation checkpointing on the
         # block stacks. Gated on training + grad so the no_grad EMA-teacher
         # pass (and eval) run normally — checkpointing only helps the
@@ -996,10 +1315,11 @@ class V14ParcelPerceiverModel(nn.Module):
         for token_block in self.token_blocks:
             if use_ckpt:
                 x_joint = checkpoint(
-                    token_block, x_joint, rope_token, use_reentrant=False
+                    token_block, x_joint, rope_token, token_key_mask,
+                    use_reentrant=False,
                 )
             else:
-                x_joint = token_block(x_joint, rope_token)
+                x_joint = token_block(x_joint, rope_token, token_key_mask)
         # Reshape back to (B, C, F_p, T_p, d) for cross-attn consumption.
         x = (
             x_joint.reshape(B, C, T_p, F_p, self.d_model)
@@ -1007,40 +1327,38 @@ class V14ParcelPerceiverModel(nn.Module):
                    .contiguous()
         )                                                            # (B, C, F_p, T_p, d)
 
-        # Time-invariant cross-attn bias λ_anat · log(support + eps).
-        # After FE-02 the cross-attn K/V are (C · F_p) tokens per time-patch
-        # (no mean-pool over freq). All F_p patches of an electrode share
-        # the same support bias for any parcel, so we replicate
-        # (B, L, C) over F_p.
-        #
-        # The per-clip ``λ_anat`` validation + broadcast + device/dtype
-        # reconciliation lives in
-        # :func:`atlas.support.compute_gated_log_support_bias` and handles
-        # both the scalar warmup path and the per-clip (B,) tensor path
-        # (B29 Item 12). The helper's ``(B, C, K)`` output is reshaped to
-        # ``(B, K, C)`` for the K/V axis below.
-        #
-        # At λ=0 the anatomy contribution vanishes and the cross-attn
-        # becomes uniform over electrodes (modulo the drop mask). The
-        # drop mask uses NEG_INF_MASK_VALUE which is independent of λ —
-        # dropped electrodes stay dropped at every λ.
-        L = self.k_parcels * self.m_sub_slots
-        log_support = compute_gated_log_support_bias(
-            support, eps=eps, lambda_anat=lambda_anat,
-        )                                                               # (B, C, K)
-        bias_kc = log_support.transpose(1, 2)                           # (B, K, C)
-        bias_lc = bias_kc.unsqueeze(2).expand(
-            B, self.k_parcels, self.m_sub_slots, C
-        ).reshape(B, L, C)                                              # (B, L=K*M, C)
-        bias_lcf = (
-            bias_lc.unsqueeze(-1)
-                   .expand(B, L, C, F_p)
-                   .reshape(B, L, C * F_p)
-        )                                                               # (B, L, C·F_p)
+        # B36 WS-B P1 efficiency early-exit: paradigm A reads ONLY M2, so the
+        # hard pool + inter-parcel encoder + encoder_ln below are dead compute
+        # in P1 (they build M3/M4, which the P1 loss never reads and which
+        # carry no P1 gradient — M2 is taken pre-pool). Skip them. The
+        # returned M2 == ``frontend_ln(x)`` is identical to the full-forward
+        # tap below; the monitors run their own full-input forward (no
+        # ``m2_only``) so RankMe still sees M4.
+        if m2_only:
+            if not return_taps:
+                raise ValueError("m2_only=True requires return_taps=True")
+            return {"M2": self.frontend_ln(x)}
 
-        # MASK-03: drop set = invalid (pad) | shaft (P2 block). All F_p
-        # patches of a dropped electrode share the same DROP — they
-        # represent that one electrode's signal.
+        # B36 hard block-diagonal parcel pool (replaces the soft
+        # λ_anat·log(support+ε) Graphormer bias). The one-hot DK ``support``
+        # (support[b, c, k] ∈ {0, 1}) IS the assignment: parcel-slot l = k·M+s
+        # attends ONLY to electrode c iff ``support[b, c, k] > 0``. After
+        # FE-02 the cross-attn keys are (C · F_p) tokens per time-patch; all
+        # F_p patches of an electrode share its parcel, so the per-electrode
+        # attendability replicates over F_p. ``key_mask[b, l, n] == True``
+        # means token n is on-parcel for slot l AND not dropped.
+        L = self.k_parcels * self.m_sub_slots
+        assigned_kc = support > 0                                       # (B, C, K) bool
+        attend_lc = (
+            assigned_kc.transpose(1, 2)                                 # (B, K, C)
+            .unsqueeze(2)
+            .expand(B, self.k_parcels, self.m_sub_slots, C)
+            .reshape(B, L, C)
+        )                                                               # (B, L=K*M, C)
+
+        # MASK-03: drop set = invalid (pad) | shaft (P2 block). A dropped
+        # electrode is non-attendable by every parcel; all F_p patches of a
+        # dropped electrode share the same DROP.
         drop_electrode: Optional[Tensor] = None
         if valid_mask is not None:
             drop_electrode = ~valid_mask                                # (B, C)
@@ -1054,12 +1372,26 @@ class V14ParcelPerceiverModel(nn.Module):
                 shaft_mask if drop_electrode is None else drop_electrode | shaft_mask
             )
         if drop_electrode is not None:
-            drop_cf = (
-                drop_electrode.unsqueeze(-1).expand(B, C, F_p).reshape(B, C * F_p)
+            attend_lc = attend_lc & ~drop_electrode.unsqueeze(1)        # (B, L, C)
+
+        # Expand per-electrode attendability over the F_p freq patches.
+        key_mask_lcf = (
+            attend_lc.unsqueeze(-1)
+                     .expand(B, L, C, F_p)
+                     .reshape(B, L, C * F_p)
+        )                                                               # (B, L, C·F_p) bool
+
+        # B36 C5: invalid freq patches are non-attendable keys for every parcel
+        # slot. The C·F_p key axis is ordered (C outer, F_p inner) — matching
+        # ``electrodes_bt`` below — so freq validity replicates across the C
+        # electrodes. None (BT) → no-op.
+        if freq_patch_valid_bf is not None:
+            freq_key_valid = (
+                freq_patch_valid_bf.unsqueeze(1)
+                .expand(B, C, F_p)
+                .reshape(B, C * F_p)
             )                                                           # (B, C·F_p)
-            bias_lcf = bias_lcf.masked_fill(
-                drop_cf.unsqueeze(1), NEG_INF_MASK_VALUE
-            )
+            key_mask_lcf = key_mask_lcf & freq_key_valid.unsqueeze(1)   # (B, L, C·F_p)
 
         # LAT-01: reconstruct the (K, M, d) parcel-embedding tensor at every
         # forward from learnable_parcel_embed + ε (identity-anchored init,
@@ -1130,11 +1462,12 @@ class V14ParcelPerceiverModel(nn.Module):
             )
             electrodes_bt = electrodes_bt + kv_extra_bt
 
-        # bias_lcf is time-invariant; replicate per time-patch.
-        bias_bt = (
-            bias_lcf.unsqueeze(1)
-                    .expand(B, T_p, L, C * F_p)
-                    .reshape(B * T_p, L, C * F_p)
+        # key_mask is time-invariant (anatomy + drop set don't depend on t);
+        # replicate per time-patch to match the batched (B·T_p) attention.
+        key_mask_bt = (
+            key_mask_lcf.unsqueeze(1)
+                        .expand(B, T_p, L, C * F_p)
+                        .reshape(B * T_p, L, C * F_p)
         )
 
         # B29 Item 12 (5/27 PM-late) + B30 lock (2026-05-28): latent-SA
@@ -1146,8 +1479,18 @@ class V14ParcelPerceiverModel(nn.Module):
             support=support,
             valid_mask=valid_mask,
             m_sub_slots=self.m_sub_slots,
-        )                                                            # (B, L)
-        latent_valid_bt = latent_valid.unsqueeze(1).expand(B, T_p, L).reshape(B * T_p, L)
+        )                                                            # (B, L) covered
+        if parcel_time_mask is not None:
+            # B36 B8 (3-way ``latent_valid``): the latent-SA keys are the
+            # VISIBLE set = covered & ~masked, per time patch (visible-only
+            # encoder). ``parcel_time_mask`` (B, K, T_p) → slot axis via
+            # repeat_interleave over M (slot l = k·M+s) → exclude masked
+            # parcel-times as both queries and keys.
+            ptm_l = parcel_time_mask.repeat_interleave(self.m_sub_slots, dim=1)  # (B, L, T_p)
+            visible_blt = latent_valid.unsqueeze(-1) & ~ptm_l                    # (B, L, T_p)
+            latent_valid_bt = visible_blt.permute(0, 2, 1).reshape(B * T_p, L)
+        else:
+            latent_valid_bt = latent_valid.unsqueeze(1).expand(B, T_p, L).reshape(B * T_p, L)
 
         # B28 lock 2026-05-27 PM: cross-attn fires at position 0 ONLY by
         # default (was {0, 3} under v4 amendment 5/19 §5). Position 0
@@ -1156,7 +1499,7 @@ class V14ParcelPerceiverModel(nn.Module):
         # (sister ``R-perceiver-original-2-cross-attns`` = [0, 3]); the rest
         # of the stack is the latent block (t-SA × parcel-SA × FFN).
         latents_bt = self.cross_attns[0](
-            latents_bt, electrodes_bt, bias_bt, key_rope=None, t_bins=None,
+            latents_bt, electrodes_bt, key_mask_bt,
         )
         # LAT-05 tap M3: first-routing post cross-attn-0 / pre self-attn-0.
         # Captured BEFORE LN_mid so the loss head owns the normalization.
@@ -1170,8 +1513,7 @@ class V14ParcelPerceiverModel(nn.Module):
             interior = interior_cross_attn.get(i)
             if interior is not None:
                 latents_bt = interior(
-                    latents_bt, electrodes_bt, bias_bt,
-                    key_rope=None, t_bins=None,
+                    latents_bt, electrodes_bt, key_mask_bt,
                 )
             if use_ckpt:
                 latents_bt = checkpoint(
@@ -1199,30 +1541,77 @@ class V14ParcelPerceiverModel(nn.Module):
         assert m3_bt is not None  # Pyright: return_taps=True ⇒ m3_bt was captured above.
         m3 = m3_bt.reshape(B, T_p, L, self.d_model).transpose(1, 2).contiguous()
         return {
-            # M2: per-electrode-patch state pre-cross-attn-0.
-            #     (B, C, F_p, T_p, d) — see post-token-blocks reshape above.
-            "M2": x,
+            # M2: per-electrode-patch state post token blocks, returned
+            #     post-``frontend_ln`` (B36 B1 — the V-JEPA-2-canonical
+            #     terminal-LN target convention; teacher mirrors this LN).
+            #     (B, C, F_p, T_p, d).
+            "M2": self.frontend_ln(x),
             # M3: first post-routing latent state, pre LN_mid.
             "M3": m3,
-            # M4: final encoder output, pre any task-head LayerNorm.
+            # M4: final encoder output, post encoder_ln (no task-head LN).
             "M4": out,
         }
 
 
-class Predictor2Block(nn.Module):
-    """MASK-04 (B03c Paradigm-B predictor 2026-05-25 PM): lightweight 2-block
-    transformer that predicts masked-patch tokens from the visible-patch
-    context. Per-electrode-patch path.
+def _sinusoidal_1d(positions: Tensor, dim: int) -> Tensor:
+    """Fixed sin/cos positional embedding for one integer axis.
 
-    Spec (``project_v14_b03_mask_lock_2026_05_25``): ``hidden=128, heads=4,
-    depth=2``, ~0.2M params total. Trained from step 0 alongside the encoder
-    in the single joint SSL phase (B29 Item 1 merged P1+P2, so the old
-    ``MASK-05`` P1→P2 warm-start no longer applies). **Discarded when Phase-3
-    distillation begins** (predictor is SSL-only auxiliary).
+    ``positions`` ``(B, N)`` (long/float) → ``(B, N, dim)``. Standard
+    Transformer sinusoid; zero params.
+    """
+    pos = positions.to(torch.float32).unsqueeze(-1)            # (B, N, 1)
+    half = (dim + 1) // 2
+    idx = torch.arange(half, device=positions.device, dtype=torch.float32)
+    inv_freq = torch.exp(-math.log(10000.0) * (2.0 * idx / dim))  # (half,)
+    ang = pos * inv_freq.view(1, 1, -1)                        # (B, N, half)
+    emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # (B, N, 2*half)
+    return emb[..., :dim]
 
-    Input  : ``(B, N, d_model)``  patch-axis context tokens (e.g. (B*C, F_p·T_p, d))
-    Output : ``(B, N, d_model)``  predicted tokens, evaluated at masked
-                                  positions by the loss head.
+
+def factored_sinusoidal_pos_emb(axis_ids: Sequence[Tensor], dim: int) -> Tensor:
+    """B36 §5 — fixed factored sinusoidal positional embedding for the JEPA
+    predictor's (id/parcel + position) tagging.
+
+    Each axis in ``axis_ids`` (a list of ``(B, N)`` integer tensors — e.g.
+    ``[parcel_id, time]`` for the P2 parcel-time grid, ``[electrode, freq_patch,
+    time]`` for the P1 front-end grid) gets a contiguous ``dim // n_axes`` slice
+    of the embedding (the last axis absorbs the remainder). Zero params
+    (V-JEPA convention: the predictor's only learnable piece is the mask token;
+    positions are fixed sinusoids). Returns ``(B, N, dim)``.
+    """
+    if not axis_ids:
+        raise ValueError("axis_ids must be non-empty")
+    n_axes = len(axis_ids)
+    base = dim // n_axes
+    sizes = [base] * n_axes
+    sizes[-1] += dim - base * n_axes                  # remainder → last axis
+    parts = [_sinusoidal_1d(ids, sz) for ids, sz in zip(axis_ids, sizes)]
+    return torch.cat(parts, dim=-1)                   # (B, N, dim)
+
+
+class JepaPredictor(nn.Module):
+    """B36 §5 paradigm-B masked-JEPA predictor (replaces ``Predictor2Block``).
+
+    A separate narrow transformer that predicts masked-cell features from the
+    **visible** encoder tokens (V-JEPA / Brain-JEPA paradigm B). Default =
+    **3 blocks @ d=128, 4 heads, MLP 4×, terminal ``Linear → d_model``, NO
+    per-head LN** (~0.6M params), discarded after SSL. Depth is a config knob
+    (D2 center 3; sweep {2, 3, 4}).
+
+    The predictor consumes:
+
+    * ``context`` ``(B, N_ctx, d_model)`` — visible encoder tokens (P1: visible
+      front-end M2 tokens; P2: visible parcel M4 tokens), projected to ``hidden``.
+    * ``query_pos`` ``(B, N_qry, hidden)`` — fixed positional embeddings
+      (``factored_sinusoidal_pos_emb``) for the masked target slots. The single
+      learnable ``mask_token`` is broadcast-added to these → the queries are
+      "learnable mask tokens tagged by (id/parcel + position) embed" (B2).
+
+    Context and queries are concatenated into one sequence; ``depth`` pre-norm
+    transformer blocks attend over both (bidirectional, padding-masked); the
+    query slice is read out and projected back to ``d_model``. With a
+    ``query_valid`` mask the predictions are gathered to ``(n_masked, d_model)``
+    — exactly the masked positions the L1 loss scores (B6).
     """
 
     def __init__(
@@ -1231,23 +1620,29 @@ class Predictor2Block(nn.Module):
         *,
         hidden: int = 128,
         n_heads: int = 4,
-        depth: int = 2,
+        depth: int = 3,
+        mlp_ratio: int = 4,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if hidden % n_heads != 0:
             raise ValueError(f"hidden={hidden} not divisible by n_heads={n_heads}")
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1; got {depth}")
         self.d_model = d_model
         self.hidden = hidden
         self.depth = depth
         self.input_proj = nn.Linear(d_model, hidden)
-        # 2-block standard pre-norm transformer encoder.
+        # Single learnable mask token (V-JEPA): every masked query starts from
+        # this vector, then gets its position via the fixed sinusoid added by
+        # the caller / forward.
+        self.mask_token = nn.Parameter(torch.zeros(hidden))
         self.blocks = nn.ModuleList(
             [
                 nn.TransformerEncoderLayer(
                     d_model=hidden,
                     nhead=n_heads,
-                    dim_feedforward=hidden * 4,
+                    dim_feedforward=hidden * mlp_ratio,
                     dropout=dropout,
                     activation="gelu",
                     norm_first=True,
@@ -1261,19 +1656,62 @@ class Predictor2Block(nn.Module):
         nn.init.zeros_(self.input_proj.bias)
         nn.init.trunc_normal_(self.output_proj.weight, std=0.02)
         nn.init.zeros_(self.output_proj.bias)
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
 
     def forward(
         self,
-        tokens: Tensor,
+        context: Tensor,                            # (B, N_ctx, d_model)
+        query_pos: Tensor,                          # (B, N_qry, hidden)
         *,
-        src_key_padding_mask: Optional[Tensor] = None,
+        context_pos: Optional[Tensor] = None,       # (B, N_ctx, hidden)
+        context_key_padding_mask: Optional[Tensor] = None,  # (B, N_ctx) True=ignore
+        query_valid: Optional[Tensor] = None,       # (B, N_qry) True=real masked slot
     ) -> Tensor:
-        """``tokens``: ``(B, N, d_model)``. ``src_key_padding_mask``: ``(B, N)``
-        bool — True = position is padding/masked from the predictor's K/V."""
-        h = self.input_proj(tokens)
+        """Predict masked-slot features from the visible ``context``.
+
+        Returns ``(n_masked, d_model)`` (gathered at ``query_valid``) when
+        ``query_valid`` is given, else ``(B, N_qry, d_model)``. Padded query
+        slots (``~query_valid``) are excluded as attention keys so they never
+        leak into a real prediction; if every slot is padded the gathered
+        return is the empty ``(0, d_model)`` (→ the masked-empty loss == 0).
+        """
+        B, n_ctx, _ = context.shape
+        n_qry = query_pos.shape[1]
+        h_ctx = self.input_proj(context)                        # (B, N_ctx, h)
+        if context_pos is not None:
+            h_ctx = h_ctx + context_pos
+        q = self.mask_token.view(1, 1, -1) + query_pos          # (B, N_qry, h)
+        seq = torch.cat([h_ctx, q], dim=1)                      # (B, N_ctx+N_qry, h)
+
+        # Combined key-padding mask: True = position is ignored as a key.
+        kpm: Optional[Tensor] = None
+        if context_key_padding_mask is not None or query_valid is not None:
+            ctx_pad = (
+                context_key_padding_mask
+                if context_key_padding_mask is not None
+                else torch.zeros(B, n_ctx, dtype=torch.bool, device=seq.device)
+            )
+            qry_pad = (
+                ~query_valid
+                if query_valid is not None
+                else torch.zeros(B, n_qry, dtype=torch.bool, device=seq.device)
+            )
+            kpm_t = torch.cat([ctx_pad, qry_pad], dim=1)        # (B, N_ctx+N_qry)
+            # A fully-padded row would make softmax over keys all -inf → NaN.
+            # Guard by un-padding such rows (their outputs are gathered away by
+            # query_valid anyway, so the un-pad is numerically inert).
+            all_pad = kpm_t.all(dim=1)
+            if bool(all_pad.any()):
+                kpm_t = kpm_t.clone()
+                kpm_t[all_pad] = False
+            kpm = kpm_t
+
         for block in self.blocks:
-            h = block(h, src_key_padding_mask=src_key_padding_mask)
-        return self.output_proj(h)
+            seq = block(seq, src_key_padding_mask=kpm)
+        out = self.output_proj(seq[:, n_ctx:, :])               # (B, N_qry, d_model)
+        if query_valid is not None:
+            return out[query_valid]                             # (n_masked, d_model)
+        return out
 
 
 class V14ParcelCollapsePMA(nn.Module):
@@ -1642,11 +2080,10 @@ class V14ParcelPerceiverWithHead(nn.Module):
         valid_mask: Optional[Tensor] = None,
         *,
         eps: Optional[float] = None,
-        # Forward B29 conditioning + per-clip gates through to the inner
-        # encoder so Phase-4 downstream + dispatch's ``cfg.build()`` path
-        # can exercise them (not just unit-test mocks).
+        # Forward B29 conditioning through to the inner encoder so Phase-4
+        # downstream + dispatch's ``cfg.build()`` path can exercise it (not
+        # just unit-test mocks).
         shaft_mask: Optional[Tensor] = None,
-        lambda_anat: tp.Union[float, Tensor] = 1.0,
         subject_subtype: Optional[Tensor] = None,
         ref_idx: Optional[Tensor] = None,
     ) -> Tensor:
@@ -1657,7 +2094,6 @@ class V14ParcelPerceiverWithHead(nn.Module):
             valid_mask,
             eps=eps_used,
             shaft_mask=shaft_mask,
-            lambda_anat=lambda_anat,
             subject_subtype=subject_subtype,
             ref_idx=ref_idx,
         )  # (B, L, T, d)
@@ -1762,9 +2198,6 @@ class V14ParcelPerceiver(BaseModelConfig):
         "off", "intra_clip_slots", "batch_cls_unit", "vicreg_slot_variance",
     ] = "off"
     phase_mode: tp.Literal["joint_b29", "split_p1_p2"] = "joint_b29"
-    anatomy_bias_mode: tp.Literal[
-        "per_clip_gate_b29", "warmup_b28", "step_b19", "on_from_p1",
-    ] = "per_clip_gate_b29"
 
     def build(
         self,

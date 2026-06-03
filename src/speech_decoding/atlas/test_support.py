@@ -12,13 +12,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import torch
-
 from speech_decoding.atlas.support import (
     TIER1_BNA_INDICES_1BASED,
     TIER1_COLUMNS,
     PatientQC,
-    compute_gated_log_support_bias,
     lookup_support_for_kept_channels,
     qc_row_for_patient,
     read_support_cache,
@@ -169,111 +166,3 @@ def test_support_cache_on_disk_for_core_patients(patient: str) -> None:
             assert 0.0 <= value <= 100.0 + 1e-3, (
                 f"{path}:{row_idx} col {col_idx}: value {value} outside [0, 100]"
             )
-
-
-# ---------------------------------------------------------------------------
-# B29 Item 12 — λ_anat per-clip gate on log(support+ε)
-# ---------------------------------------------------------------------------
-
-
-def _toy_support(B: int = 4, C: int = 3, K: int = 5) -> torch.Tensor:
-    rng = np.random.default_rng(0)
-    arr = rng.random((B, C, K)).astype(np.float32)
-    return torch.from_numpy(arr)
-
-
-def test_b29_compute_gated_log_support_bias_scalar_lambda_default() -> None:
-    """``lambda_anat=1.0`` (default) is just ``log(support + ε)``."""
-    support = _toy_support()
-    eps = 1e-2
-    out = compute_gated_log_support_bias(support, eps=eps, lambda_anat=1.0)
-    expected = torch.log(support + eps)
-    torch.testing.assert_close(out, expected)
-
-
-def test_b29_compute_gated_log_support_bias_scalar_zero_zeros_output() -> None:
-    """``lambda_anat=0`` collapses the anatomy bias to zero (uniform-over-electrodes)."""
-    support = _toy_support()
-    out = compute_gated_log_support_bias(support, eps=1e-2, lambda_anat=0.0)
-    torch.testing.assert_close(out, torch.zeros_like(out))
-
-
-def test_b29_compute_gated_log_support_bias_per_clip_tensor_broadcasts() -> None:
-    """A ``(B,)`` ``lambda_anat`` scales each clip independently — anatomy-rich
-    clips keep the full bias while SWEC clips zero out."""
-    B, C, K = 4, 3, 5
-    support = _toy_support(B, C, K)
-    lambda_anat = torch.tensor([1.0, 0.0, 1.0, 0.0])
-    out = compute_gated_log_support_bias(support, eps=1e-2, lambda_anat=lambda_anat)
-    log_support = torch.log(support + 1e-2)
-    torch.testing.assert_close(out[0], log_support[0])      # anatomy-rich
-    torch.testing.assert_close(out[2], log_support[2])      # anatomy-rich
-    torch.testing.assert_close(out[1], torch.zeros_like(log_support[1]))  # SWEC
-    torch.testing.assert_close(out[3], torch.zeros_like(log_support[3]))  # SWEC
-
-
-def test_b29_compute_gated_log_support_bias_rejects_wrong_tensor_shape() -> None:
-    support = _toy_support(B=4)
-    with pytest.raises(ValueError, match="must have shape"):
-        compute_gated_log_support_bias(
-            support, eps=1e-2,
-            lambda_anat=torch.tensor([1.0, 0.0]),  # wrong B
-        )
-
-
-def test_b_cr_2_compute_gated_log_support_bias_accepts_b1_collated_shape() -> None:
-    """NeuralSet collates per-event ``(1,)`` TimedArrays into
-    ``(B, 1)``. The helper must squeeze the trailing singleton so the
-    encoder/atlas pair don't reject every realistic dataloader batch.
-    """
-    B, C, K = 4, 3, 5
-    support = _toy_support(B, C, K)
-    lambda_b1 = torch.tensor([[1.0], [0.0], [1.0], [0.0]])  # (B, 1)
-    out = compute_gated_log_support_bias(support, eps=1e-2, lambda_anat=lambda_b1)
-    log_support = torch.log(support + 1e-2)
-    torch.testing.assert_close(out[0], log_support[0])
-    torch.testing.assert_close(out[2], log_support[2])
-    torch.testing.assert_close(out[1], torch.zeros_like(log_support[1]))
-    torch.testing.assert_close(out[3], torch.zeros_like(log_support[3]))
-
-
-def test_b_bug_5_compute_gated_log_support_bias_accepts_0d_tensor() -> None:
-    """A 0-d Tensor (e.g. from a warmup schedule wrapper) is the
-    scalar branch — broadcast to all clips.
-    """
-    support = _toy_support()
-    eps = 1e-2
-    out = compute_gated_log_support_bias(
-        support, eps=eps, lambda_anat=torch.tensor(0.7),
-    )
-    expected = 0.7 * torch.log(support + eps)
-    torch.testing.assert_close(out, expected)
-
-
-def test_b_bug_5_compute_gated_log_support_bias_rejects_negative_0d_tensor() -> None:
-    with pytest.raises(ValueError, match=">= 0"):
-        compute_gated_log_support_bias(
-            _toy_support(), eps=1e-2, lambda_anat=torch.tensor(-0.5),
-        )
-
-
-def test_b29_compute_gated_log_support_bias_rejects_negative_scalar() -> None:
-    with pytest.raises(ValueError, match=">= 0"):
-        compute_gated_log_support_bias(
-            _toy_support(), eps=1e-2, lambda_anat=-0.1,
-        )
-
-
-def test_b29_compute_gated_log_support_bias_rejects_negative_tensor() -> None:
-    support = _toy_support(B=4)
-    with pytest.raises(ValueError, match="must be >= 0"):
-        compute_gated_log_support_bias(
-            support, eps=1e-2,
-            lambda_anat=torch.tensor([1.0, -0.1, 1.0, 0.5]),
-        )
-
-
-def test_b29_compute_gated_log_support_bias_rejects_non_3d_support() -> None:
-    bad = torch.zeros(3, 5)  # missing batch dim
-    with pytest.raises(ValueError, match="must be"):
-        compute_gated_log_support_bias(bad, eps=1e-2, lambda_anat=1.0)

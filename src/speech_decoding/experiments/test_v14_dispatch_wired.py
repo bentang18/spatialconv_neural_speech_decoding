@@ -15,22 +15,128 @@ import torch
 from speech_decoding.experiments import dispatch_v14
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
-from speech_decoding.extractors.view import LogStftView
+from speech_decoding.extractors.view import LogStftView, MultiStftView
 
 
-def test_dispatch_default_wires_log_stft_view(tmp_path, monkeypatch) -> None:
-    """Without ``electrode_tokens_extractor``, the dispatch picks LogStftView."""
+def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
+    """WS-C / C2: without ``electrode_tokens_extractor`` the dispatch now picks
+    :class:`MultiStftView` (was ``LogStftView`` pre-B36). Keeps the v14 chain:
+    shaft-CAR, per-corpus mains notch, abs-magnitude (``apply_log=False``), and
+    the C4 0.5 Hz HPF (``filter=(0.5, None)``)."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano")
 
     extractors = xp.data.segmenter.extractors
-    assert isinstance(extractors["electrode_tokens"], LogStftView)
     ext = extractors["electrode_tokens"]
+    assert isinstance(ext, MultiStftView)
     assert ext.car == "shaft"
     assert ext.notch_filter == 60.0
-    assert ext.stft_nperseg == 512
-    assert abs(ext.stft_poverlap - 0.75) < 1e-9
-    assert ext.stft_max_freq_hz == 150.0
+    assert ext.hop_length == 128  # hop=128 re-lock 2026-06-03 (iMINDBench-standard)
+    assert ext.n_fbank_bins == 30
+    assert ext.apply_log is False
+    # C4 HPF: 0.5 Hz high-pass (None upper edge → high-pass only).
+    assert ext.filter == (0.5, None)
+    # C3: StandardScaler dropped from the default view (robust-z replaces it).
+    assert ext.scaler is None
+
+
+def test_dispatch_default_n_freq_bins_30_gives_encoder_f_p_10(
+    tmp_path, monkeypatch,
+) -> None:
+    """WS-C / C2: ``DEFAULT_N_FREQ_BINS`` flips 38 → 30 (Multi-STFT filterbank);
+    the (3,3)-freq-stride patch stem maps F=30 → F_p=10."""
+    from speech_decoding.models.v14_encoder import _PatchStem
+
+    assert dispatch_v14.DEFAULT_N_FREQ_BINS == 30
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp.brain_model_config.n_freq_bins == 30
+    assert _PatchStem(8).n_freq_patches(30) == 10
+
+
+def test_dispatch_clip_len_threads_to_segmenter_duration_and_time_bins(
+    tmp_path, monkeypatch,
+) -> None:
+    """WS-C / C1 (hop=128 re-lock 2026-06-03): phase-conditional ``clip_len``
+    sets the segmenter window and sizes the encoder's ``n_time_bins`` (RoPE
+    ceiling) from the Multi-STFT frame geometry. 5 s (P1/P2/P3) → T_bin 81 →
+    T_p 40; 1 s (P4) → T_bin 17 → T_p 8. (The nominal 16 Hz counts 80/16 floor
+    to the same T_p — D8.)"""
+    from speech_decoding.models.v14_encoder import _PatchStem
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    stem = _PatchStem(8)
+
+    xp5 = dispatch_v14.build_v14_experiment(mode="nano", clip_len=5.0)
+    assert xp5.data.segmenter.duration == 5.0
+    assert xp5.brain_model_config.n_time_bins == 81
+    assert stem.n_time_patches(xp5.brain_model_config.n_time_bins) == 40
+
+    xp1 = dispatch_v14.build_v14_experiment(mode="nano", clip_len=1.0)
+    assert xp1.data.segmenter.duration == 1.0
+    assert xp1.brain_model_config.n_time_bins == 17
+    assert stem.n_time_patches(xp1.brain_model_config.n_time_bins) == 8
+
+
+def test_dispatch_default_clip_len_is_5s(tmp_path, monkeypatch) -> None:
+    """The default ``clip_len`` is the 5 s SSL window (P1/P2/P3); the P4 driver
+    passes ``clip_len=1.0`` for the 1 s readout window."""
+    assert dispatch_v14.DEFAULT_CLIP_LEN_S == 5.0
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp.data.segmenter.duration == 5.0
+
+
+def test_c4_hpf_0_5hz_removes_dc_and_slow_drift_keeps_passband() -> None:
+    """WS-C / C4: the dispatch wires ``filter=(0.5, None)`` → ``raw.filter(0.5,
+    None)`` (MNE default FIR HPF). Faithful spec of THAT filter:
+
+      * DC offset → fully removed (the dominant slow-drift concern).
+      * deep slow drift (≤ 0.05 Hz) → > 35 dB attenuated; 0.02 Hz → > 50 dB.
+      * passband (≥ 1 Hz) → flat within 0.1 dB.
+
+    Note on the plan's "> 40 dB at 0.1 Hz": with the plain ``(0.5, None)`` tuple
+    MNE picks an auto transition band whose stopband edge sits at ~0 Hz, so
+    0.1 Hz lands inside the transition band (~23 dB), not the stopband. Hitting
+    40 dB *at 0.1 Hz* would need a custom ``l_trans_bandwidth`` the MneRaw
+    ``filter`` tuple can't express — out of scope for the C4 config. The HPF's
+    actual job (kill DC + sub-0.05 Hz drift, preserve the band) is met."""
+    import mne
+    import numpy as np
+
+    fs = 2048.0
+    dur_s = 32.0  # long enough to resolve 0.02 Hz
+    n = int(fs * dur_s)
+    t = np.arange(n) / fs
+
+    def amp_at(sig: np.ndarray, freq_hz: float) -> float:
+        # Single-bin DFT magnitude normalized to sinusoid amplitude.
+        w = np.exp(-2j * np.pi * freq_hz * t)
+        return 2.0 * np.abs(np.dot(sig, w)) / n
+
+    def atten_db(freq_hz: float) -> float:
+        sig = np.sin(2 * np.pi * freq_hz * t)
+        flt = mne.filter.filter_data(
+            sig.astype(np.float64), sfreq=fs, l_freq=0.5, h_freq=None,
+            verbose=False,
+        )
+        return 20.0 * np.log10(max(amp_at(flt, freq_hz), 1e-12))
+
+    # Deep stopband: slow drift is crushed.
+    assert atten_db(0.02) < -50.0
+    assert atten_db(0.05) < -35.0
+    # Transition band: 0.1 Hz is partially attenuated (not the full stopband).
+    assert atten_db(0.1) < -20.0
+    # Passband: ≥ 1 Hz preserved within 0.1 dB.
+    for f in (1.0, 2.0, 10.0):
+        assert abs(atten_db(f)) < 0.1, f"{f} Hz passband not flat"
+
+    # DC offset: a pure constant is removed to numerical zero.
+    dc = np.full(n, 5.0)
+    dc_filtered = mne.filter.filter_data(
+        dc, sfreq=fs, l_freq=0.5, h_freq=None, verbose=False,
+    )
+    assert np.abs(dc_filtered).max() < 1e-6, "DC offset not removed by HPF"
 
 
 def test_dispatch_default_wires_valid_mask_and_support_with_c_max(
@@ -51,13 +157,15 @@ def test_dispatch_default_sets_x_name_tuple_with_mask(
     tmp_path, monkeypatch,
 ) -> None:
     """v14 BrainModule x_name unpacks the base 3-tuple plus the
-    per-clip metadata kwargs (subject_subtype, ref_idx, lambda_anat)."""
+    per-clip metadata kwargs (subject_subtype, ref_idx). The B28
+    ``lambda_anat`` soft-gate kwarg was removed at B36 — the hard
+    block-diagonal pool consumes the one-hot DK support directly."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano")
 
     assert tuple(xp.x_name) == (
         "electrode_tokens", "support", "valid_mask",
-        "subject_subtype", "ref_idx", "lambda_anat",
+        "subject_subtype", "ref_idx",
     )
 
 
@@ -72,7 +180,8 @@ def test_b_m2_dispatch_registers_metadata_extractors_in_segmenter(
     extractors = xp.data.segmenter.extractors
     assert "ref_idx" in extractors
     assert "subject_subtype" in extractors
-    assert "lambda_anat" in extractors
+    # B36: no lambda_anat extractor — the hard pool needs no soft anatomy gate.
+    assert "lambda_anat" not in extractors
 
 
 def test_dispatch_default_sets_time_last_input_true(tmp_path, monkeypatch) -> None:
@@ -109,11 +218,16 @@ def test_dispatch_dry_run_no_longer_mentions_missing_extractor(
     out = capsys.readouterr().out
     assert rc == 0
     assert "not wired yet" not in out
-    assert "LogStftView" in out or "electrode-tokens extractor wired" in out
+    assert "MultiStftView" in out or "electrode-tokens extractor wired" in out
 
 
 def test_dk_support_c_max_pads_output(tmp_path) -> None:
     """When ``c_max`` is set, the support tensor pads to (c_max, K=80) zero-rows."""
+    import json
+
+    labels_dir = tmp_path / "electrode_labels" / "sub_1"
+    labels_dir.mkdir(parents=True)
+    (labels_dir / "electrode_labels.json").write_text(json.dumps(["E1", "E2"]))
     csv_dir = tmp_path / "localization" / "sub_1"
     csv_dir.mkdir(parents=True)
     (csv_dir / "depth-wm.csv").write_text(
@@ -264,7 +378,7 @@ def test_b28_dispatch_swec_corpus_uses_50hz_notch() -> None:
 def test_b28_dispatch_mains_notch_kwarg_overrides_default(
     tmp_path, monkeypatch,
 ) -> None:
-    """SWEC dispatch passes ``mains_notch_hz=50.0`` → LogStftView gets 50 Hz."""
+    """SWEC dispatch passes ``mains_notch_hz=50.0`` → the default view gets 50 Hz."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano", mains_notch_hz=50.0)
     ext = xp.data.segmenter.extractors["electrode_tokens"]
@@ -479,12 +593,6 @@ def test_b29_dispatch_phase_mode_default_is_joint_b29() -> None:
     assert args.phase_mode == "joint_b29"
 
 
-def test_b29_dispatch_anatomy_bias_mode_default_is_per_clip_gate() -> None:
-    parser = dispatch_v14._parser()
-    args = parser.parse_args([])
-    assert args.anatomy_bias_mode == "per_clip_gate_b29"
-
-
 def test_b29_dispatch_default_includes_ajile12() -> None:
     parser = dispatch_v14._parser()
     args = parser.parse_args([])
@@ -647,26 +755,37 @@ def test_b31_dispatch_supervised_phase_accepts_default_loss_variant(
     assert type(xp).__name__ == "Experiment"
 
 
-@pytest.mark.parametrize(
-    "variant",
-    ["b31_default", "b31_plus_m3", "b31_plus_utt", "b31_plus_both"],
-)
-def test_b31_dispatch_joint_phase_propagates_loss_variant_to_experiment(
-    tmp_path, monkeypatch, variant: str,
+def test_b31_dispatch_joint_phase_propagates_default_loss_variant_to_experiment(
+    tmp_path, monkeypatch,
 ) -> None:
-    """Joint-phase dispatch threads ``loss_variant`` onto the
-    :class:`V14JointExperiment` instance. The brain-model config does
-    NOT carry it (its Pydantic schema is ``extra='forbid'``); the
+    """Joint-phase dispatch threads the default ``loss_variant`` onto the
+    :class:`V14JointExperiment` instance. The brain-model config does NOT
+    carry it (its Pydantic schema is ``extra='forbid'``); the
     Experiment-level snapshot records the choice."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(
-        mode="nano", joint_phase=True, loss_variant=variant,
+        mode="nano", joint_phase=True, loss_variant="b31_default",
     )
     assert type(xp).__name__ == "V14JointExperiment"
-    assert xp.loss_variant == variant
+    assert xp.loss_variant == "b31_default"
     # The brain-model config must NOT carry ``loss_variant`` (would
     # crash Pydantic ``extra='forbid'``).
     assert "loss_variant" not in xp.brain_model_config.model_dump()
+
+
+@pytest.mark.parametrize("variant", ["b31_plus_m3", "b31_plus_utt", "b31_plus_both"])
+def test_b31_dispatch_joint_phase_quarantines_multiterm_loss_variants(
+    tmp_path, monkeypatch, variant: str,
+) -> None:
+    """B9 (B36 WS-B): the masked-JEPA default is single-term, so the B31
+    multi-term ``b31_plus_*`` sisters are quarantined — joint-phase dispatch
+    construction raises :class:`NotImplementedError` (the CLI still parses
+    them; the run-record gate fires at Experiment construction)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(NotImplementedError, match="single-term"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, loss_variant=variant,
+        )
 
 
 def test_b31_dispatch_invalid_loss_variant_rejected(
@@ -773,11 +892,11 @@ def test_dispatch_rejects_extractor_without_car_attribute(
 
 
 def test_r3_bug_4_v14_parcel_perceiver_rejects_bogus_ssl_modes() -> None:
-    """``dkoleo_mode`` / ``phase_mode`` / ``anatomy_bias_mode`` on
-    :class:`V14ParcelPerceiver` are typed as :class:`Literal` so
-    reconstruction from a persisted YAML rejects typos at
-    deserialization, rather than silently riding a bogus string through
-    to the (absent) SSL trainer.
+    """``dkoleo_mode`` / ``phase_mode`` on :class:`V14ParcelPerceiver` are
+    typed as :class:`Literal` so reconstruction from a persisted YAML rejects
+    typos at deserialization, rather than silently riding a bogus string
+    through to the (absent) SSL trainer. (``anatomy_bias_mode`` was removed
+    with the soft routing bias by the B36 hard pool, 2026-06-01.)
     """
     import pytest
     from pydantic import ValidationError
@@ -794,34 +913,28 @@ def test_r3_bug_4_v14_parcel_perceiver_rejects_bogus_ssl_modes() -> None:
             n_freq_bins=12, n_time_bins=8, k_parcels=80,
             phase_mode="p1_only",  # type: ignore[arg-type]
         )
-    with pytest.raises(ValidationError):
-        V14ParcelPerceiver(
-            n_freq_bins=12, n_time_bins=8, k_parcels=80,
-            anatomy_bias_mode="off",  # type: ignore[arg-type]
-        )
 
 
 def test_b_cr_3_brain_model_config_carries_ssl_dispatch_flags(
     tmp_path, monkeypatch,
 ) -> None:
-    """``dkoleo_mode`` / ``phase_mode`` / ``anatomy_bias_mode`` were
-    validated by ``build_v14_experiment`` then silently dropped on the
-    floor — the downstream supervised path and the SSL trainer alike
-    never saw them in the persisted config. Lock them as named fields
-    on the ``V14ParcelPerceiver`` config so they ride along with the
-    run record.
+    """``dkoleo_mode`` / ``phase_mode`` were validated by
+    ``build_v14_experiment`` then silently dropped on the floor — the
+    downstream supervised path and the SSL trainer alike never saw them in
+    the persisted config. Lock them as named fields on the
+    ``V14ParcelPerceiver`` config so they ride along with the run record.
+    (``anatomy_bias_mode`` was removed with the soft routing bias by the B36
+    hard pool, 2026-06-01.)
     """
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(
         mode="nano",
         dkoleo_mode="vicreg_slot_variance",
         phase_mode="split_p1_p2",
-        anatomy_bias_mode="warmup_b28",
     )
     cfg = xp.brain_model_config
     assert cfg.dkoleo_mode == "vicreg_slot_variance"
     assert cfg.phase_mode == "split_p1_p2"
-    assert cfg.anatomy_bias_mode == "warmup_b28"
 
 
 def test_b23_dispatch_joint_phase_wires_shaft_mask_extractor(
@@ -900,7 +1013,7 @@ def test_b15_extractor_cache_arg_points_each_infra_folder(
     extractors = xp.data.segmenter.extractors
     # MapInfra-bearing extractors get their folder set; BaseStatic
     # subclasses (DK support, valid mask) carry no infra and are skipped.
-    for name in ("electrode_tokens", "ref_idx", "subject_subtype", "lambda_anat"):
+    for name in ("electrode_tokens", "ref_idx", "subject_subtype"):
         ext = extractors[name]
         assert hasattr(ext, "infra"), (
             f"extractor {name!r} unexpectedly missing infra field"

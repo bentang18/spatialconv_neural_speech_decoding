@@ -51,11 +51,15 @@ def _synthetic_ieeg_events() -> pd.DataFrame:
 
 
 def _stub_words_df() -> pd.DataFrame:
-    """8 word rows with monotonic ``start``, no enrichment columns."""
+    """8 word rows, no enrichment columns. ``est_idx`` (neural-clock samples) is
+    deliberately offset +200 s from transcript ``start`` so tests prove events
+    slice at ``est_idx``, not ``start`` (C3)."""
+    starts = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
     return pd.DataFrame(
         {
-            "start": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
-            "end": [11.0, 21.0, 31.0, 41.0, 51.0, 61.0, 71.0, 81.0],
+            "start": starts,
+            "end": [s + 1.0 for s in starts],
+            "est_idx": [round((s + 200.0) * 2048.0) for s in starts],
             "original_index": list(range(8)),
             "full_word": list("ABCDEFGH"),
         }
@@ -63,11 +67,13 @@ def _stub_words_df() -> pd.DataFrame:
 
 
 def _stub_nonverbal_df() -> pd.DataFrame:
-    """8 nonverbal rows interleaved with the word starts."""
+    """8 nonverbal rows interleaved with the word starts (+ offset ``est_idx``)."""
+    starts = [15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0]
     return pd.DataFrame(
         {
-            "start": [15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0],
-            "end": [16.0, 26.0, 36.0, 46.0, 56.0, 66.0, 76.0, 86.0],
+            "start": starts,
+            "end": [s + 1.0 for s in starts],
+            "est_idx": [round((s + 200.0) * 2048.0) for s in starts],
         }
     )
 
@@ -113,10 +119,13 @@ def test_word_event_rows_matches_upstream_interleaved_order() -> None:
     test_labels = rows["label"].iloc[cut:].to_numpy()
     assert (val_labels == 0).sum() == (val_labels == 1).sum()
     assert (test_labels == 0).sum() == (test_labels == 1).sum()
-    # And the source `start` matches what the upstream interleaved order would emit
+    # And the emitted `start` is the NEURAL-clock onset `est_idx / SR` (C3), not
+    # the transcript `start` — the fixtures offset est_idx +200 s, so asserting
+    # against transcript `start` would now fail.
+    sr = we._neural_sample_rate()
     for row_i, (lbl, src) in enumerate(zip(expected_labels, expected_src_indices)):
         src_df = nonverbal if int(lbl) == 0 else words
-        assert rows.iloc[row_i]["start"] == float(src_df.iloc[int(src)]["start"])
+        assert rows.iloc[row_i]["start"] == float(src_df.iloc[int(src)]["est_idx"]) / sr
 
 
 def test_assign_cross_session_split_halves_test_trial_chronologically() -> None:
@@ -169,9 +178,12 @@ def test_btwordevents_rejects_unknown_task() -> None:
 
 def test_btwordevents_enrich_only_needed_for_continuous_tasks() -> None:
     assert BTWordEvents(tasks=("speech",))._enrich_needed() is False
-    assert BTWordEvents(tasks=("face_num",))._enrich_needed() is False
+    # face_num is a transcript-derived column -> needs enrichment (H7)
+    assert BTWordEvents(tasks=("face_num",))._enrich_needed() is True
     assert BTWordEvents(tasks=("delta_volume",))._enrich_needed() is True
     assert BTWordEvents(tasks=("onset",))._enrich_needed() is True
+    # mixed speech + face_num still needs enrichment (face_num forces it)
+    assert BTWordEvents(tasks=("speech", "face_num"))._enrich_needed() is True
 
 
 def test_btwordevents_run_appends_word_rows_with_split(monkeypatch) -> None:

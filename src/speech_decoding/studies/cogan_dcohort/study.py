@@ -47,9 +47,9 @@ class DCohortStudy(study.Study):
     methods raise until DP03 (subpackage contract) lands.
 
     NOTE: D-cohort sample rate is 2000 Hz (vs Wang2024Treebank 2048 Hz);
-    the Multi-STFT common-hop=256 (8 Hz, B20 v4 lock 2026-05-24) stays
-    valid; the bin-frequency mapping differs slightly and must be honored
-    in the corpus valid-bin mask.
+    the Multi-STFT common-hop=128 (16 Hz front-end / 8 Hz latent, hop=128
+    re-lock 2026-06-03) stays valid; the bin-frequency mapping differs
+    slightly and must be honored in the corpus valid-bin mask.
     """
 
     aliases: tp.ClassVar[tuple[str, ...]] = (

@@ -1,12 +1,13 @@
 """Speech-decoding model configs.
 
 `TinyMLP` is the substrate-integration smoke-test model. `V14ParcelPerceiver`
-is the v14 architecture (Perceiver-IO with parcel-id-tagged latents,
-log(support+eps) cross-attn bias, factorized t×parcel latent stack, and a
+is the v14 architecture (parcel-id-tagged latents, a hard block-diagonal
+per-parcel pool over the one-hot DK ``support`` — B36 2026-06-01 replaced the
+soft log(support+eps) cross-attn bias — factorized t×parcel latent stack, and a
 Phase-4 readout that collapses parcels with the frozen P3-PMA then
 mean-over-time → Linear — B35). See
-``memory/project_v14_arch_revision_2026_05_19_v3.md`` (base) and
-``memory/project_v14_arch_post_v3_amendment_2026_05_19.md`` (v4 amendment).
+``memory/project_v14_b36_perparcel_pool_structured_jepa_2026_06_01.md`` (current
+hard-pool lock) and ``memory/project_v14_arch_revision_2026_05_19_v3.md`` (base).
 """
 
 from speech_decoding.models.mlp import TinyMLP, TinyMLPModel

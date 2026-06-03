@@ -1,9 +1,11 @@
 """Tests for the v14 Perceiver-IO encoder.
 
 Validates shape, dtype, finiteness, param budget, and the load-bearing
-invariants: anatomy bias actually routes attention through `log(support+eps)`,
-parcel-id-tagged latents are not shared across parcels, and `valid_mask`
-zeros out padded electrodes from the cross-attn pool.
+invariants: the B36 hard block-diagonal pool routes attention by the one-hot
+DK assignment (parcel-slot ← own-parcel electrodes only), parcel-id-tagged
+latents are not shared across parcels, and `valid_mask` drops padded
+electrodes from the cross-attn pool. (The exact-0.0 / sum-1.0 pool invariant
+and the soft-bias removal live in ``test_v14_hard_pool.py``.)
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import pytest
 import torch
 
 from speech_decoding.models.v14_encoder import (
-    Predictor2Block,
+    JepaPredictor,
     V14MeanPoolLinearHead,
     V14ParcelCollapsePMA,
     V14ParcelPerceiver,
@@ -23,6 +25,7 @@ from speech_decoding.models.v14_encoder import (
     V14PmaReadout,
     _JointTokenBlock,
     _PatchStem,
+    compute_latent_valid_3way,
 )
 from speech_decoding.studies.braintreebank.anatomy import DEFAULT_SUPPORT_BIAS_EPS
 
@@ -206,31 +209,82 @@ def test_v14_mask03_shaft_mask_combines_with_valid_mask() -> None:
     torch.testing.assert_close(out_a, out_b, atol=1e-5, rtol=1e-5)
 
 
-def test_v14_mask04_predictor2block_shape_and_param_budget() -> None:
-    """MASK-04 (B03c Paradigm-B predictor 2026-05-25 PM): standalone
-    2-block transformer predictor. Shape preservation + param budget."""
-    torch.manual_seed(0)
-    predictor = Predictor2Block(d_model=256, hidden=128, n_heads=4, depth=2)
-    x = torch.randn(2, 50, 256)
-    out = predictor(x)
-    assert out.shape == x.shape, f"got {tuple(out.shape)}, expected {tuple(x.shape)}"
-    assert torch.isfinite(out).all()
-    # Param budget: spec says ~0.2M; the standard nn.TransformerEncoderLayer
-    # default of dim_feedforward = 4 × hidden gives ~0.5M at hidden=128.
-    # Spec is approximate — we pin "lightweight" with a generous upper bound
-    # and a hard cap below the encoder backbone (15M).
-    n_params = sum(p.numel() for p in predictor.parameters() if p.requires_grad)
-    assert 100_000 < n_params < 800_000, (
-        f"Predictor2Block param count out of lightweight scale: {n_params:,}"
+def _n_params(m: torch.nn.Module) -> int:
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
+def test_v14_b2_jepa_predictor_depth_default_and_param_budget() -> None:
+    """B36 B2 — ``JepaPredictor`` default depth = 3; param count at depth 3
+    within ±2% of the locked target (~0.66M); depth knob {2,3,4} monotone;
+    depth-2 ≠ the B36 default (regression guard against the old
+    ``Predictor2Block`` depth-2 spec)."""
+    # Analytical target for d_model=256, hidden=128, heads=4, MLP 4×, depth 3.
+    # per block (TransformerEncoderLayer, norm_first):
+    #   attn in_proj 3·128·128+3·128 + out_proj 128·128+128
+    #   + ff 128·512+512 + 512·128+128 + 2·LN(2·128) = 198_272
+    # + input_proj(256·128+128) + output_proj(128·256+256) + mask_token(128)
+    target = 198_272 * 3 + (256 * 128 + 128) + (128 * 256 + 256) + 128
+    assert target == 660_864  # pins the arithmetic
+
+    pred3 = JepaPredictor(d_model=256)          # default depth
+    assert pred3.depth == 3, "B36 default predictor depth must be 3 (D2)"
+    n3 = _n_params(pred3)
+    assert abs(n3 - target) <= 0.02 * target, (
+        f"depth-3 param count {n3:,} not within ±2% of target {target:,}"
     )
-    # Trainable end-to-end (gradient flow check).
-    target = torch.randn_like(out)
-    loss = (out - target).pow(2).mean()
+    assert 500_000 < n3 < 800_000, f"~0.6M budget violated: {n3:,}"
+
+    n2 = _n_params(JepaPredictor(d_model=256, depth=2))
+    n4 = _n_params(JepaPredictor(d_model=256, depth=4))
+    assert n2 < n3 < n4, f"depth knob not monotone: {n2:,} {n3:,} {n4:,}"
+    assert n2 != target, "depth-2 must differ from the B36 default (depth-3)"
+
+
+def test_v14_b2_jepa_predictor_output_at_masked_positions_only() -> None:
+    """B36 B2 — predictor returns ``(n_masked, d_model)`` gathered at the
+    masked query slots; the ungathered path returns ``(B, N_qry, d_model)``;
+    gradients flow to every param including the learnable mask token."""
+    torch.manual_seed(0)
+    d_model, hidden = 256, 128
+    B, n_ctx, n_qry = 2, 10, 6
+    pred = JepaPredictor(d_model=d_model, hidden=hidden, depth=3)
+    context = torch.randn(B, n_ctx, d_model)
+    query_pos = torch.randn(B, n_qry, hidden)
+    query_valid = torch.tensor(
+        [[True, True, False, True, False, False],
+         [True, False, False, False, False, False]]
+    )
+    n_masked = int(query_valid.sum())
+
+    out = pred(context, query_pos, query_valid=query_valid)
+    assert out.shape == (n_masked, d_model), (
+        f"gathered output {tuple(out.shape)} != ({n_masked}, {d_model})"
+    )
+    assert torch.isfinite(out).all()
+
+    # Ungathered path → (B, N_qry, d_model).
+    out_full = pred(context, query_pos)
+    assert out_full.shape == (B, n_qry, d_model)
+
+    loss = out.pow(2).mean()
     loss.backward()
-    for name, p in predictor.named_parameters():
+    assert pred.mask_token.grad is not None
+    for name, p in pred.named_parameters():
         assert p.grad is not None and torch.isfinite(p.grad).all(), (
-            f"Predictor2Block {name} did not receive finite gradient"
+            f"JepaPredictor {name} did not receive finite gradient"
         )
+
+
+def test_v14_b2_jepa_predictor_empty_mask_returns_empty() -> None:
+    """B36 B6 precondition — all-padded query rows → gathered ``(0, d_model)``
+    (no NaN), so the masked-empty L1 term is exactly 0."""
+    pred = JepaPredictor(d_model=256, depth=2)
+    context = torch.randn(2, 8, 256)
+    query_pos = torch.randn(2, 5, 128)
+    query_valid = torch.zeros(2, 5, dtype=torch.bool)
+    out = pred(context, query_pos, query_valid=query_valid)
+    assert out.shape == (0, 256)
+    assert torch.isfinite(out).all()  # vacuously true; no NaN from empty softmax
 
 
 def test_v14_b29_item12_supervised_slot_mask_kwarg_dropped() -> None:
@@ -498,17 +552,22 @@ def test_v14_encoder_valid_mask_excludes_padded_electrodes() -> None:
     torch.testing.assert_close(out_a, out_b, atol=1e-5, rtol=1e-5)
 
 
-def test_v14_encoder_default_eps_is_anatomy_prior_strength() -> None:
-    """`forward()` default for `eps` matches `DEFAULT_SUPPORT_BIAS_EPS=1e-2`."""
+def test_v14_encoder_eps_is_vestigial_under_b36_hard_pool() -> None:
+    """B36: the hard block-diagonal pool consumes the one-hot DK support
+    directly — there is no ``log(support + ε)`` smoothing — so ``eps`` is
+    vestigial (reserved for the gated ``R-bna-soft`` sister) and varying it
+    must NOT change the output. Regression guard: if a future edit reintroduces
+    an eps-dependent softening on the default path, this fails."""
     assert DEFAULT_SUPPORT_BIAS_EPS == 1e-2
     kw = _tiny_kwargs()
     model = V14ParcelPerceiverModel(**kw)
     model.eval()
     electrodes = torch.randn(1, 3, kw["n_time_bins"], kw["n_freq_bins"])
     support = torch.eye(6)[None, :3, :].float()
-    a = model(electrodes, support)
-    b = model(electrodes, support, eps=DEFAULT_SUPPORT_BIAS_EPS)
-    torch.testing.assert_close(a, b)
+    with torch.no_grad():
+        tiny_eps = model(electrodes, support, eps=1e-9)
+        big_eps = model(electrodes, support, eps=10.0)
+    torch.testing.assert_close(tiny_eps, big_eps)
 
 
 def test_v14_phase4_head_shape() -> None:
@@ -694,9 +753,10 @@ def test_v14_config_build_returns_callable_module() -> None:
 
 def test_v14_head_wrapper_forwards_b29_conditioning_to_encoder() -> None:
     """The head wrapper's ``forward`` must thread ``subject_subtype``,
-    ``ref_idx``, ``lambda_anat``, and ``shaft_mask`` through to the inner
-    encoder; otherwise Phase-4 downstream + the dispatch ``cfg.build()``
-    path can't exercise the B29 conditioning."""
+    ``ref_idx``, and ``shaft_mask`` through to the inner encoder; otherwise
+    Phase-4 downstream + the dispatch ``cfg.build()`` path can't exercise the
+    B29 conditioning. (The B28 ``lambda_anat`` soft-gate was removed at B36 —
+    the hard block-diagonal pool consumes the one-hot DK support directly.)"""
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
@@ -727,29 +787,6 @@ def test_v14_head_wrapper_forwards_b29_conditioning_to_encoder() -> None:
     assert (zero_ref - two_ref).abs().max().item() > 1e-4, (
         "head wrapper must forward ref_idx into the encoder; "
         "different ids produced identical logits."
-    )
-    # Build STRONGLY-PEAKED support (each electrode concentrates on one distinct
-    # parcel) so the anatomy-bias gate has real per-parcel contrast to scale. A
-    # near-uniform support makes log(support+eps) ~constant across parcels, so
-    # the bias adds the same shift everywhere and the lambda_anat gate is a
-    # near-no-op regardless of wiring — and the B35 frozen-PMA readout (ln_q/
-    # ln_kv + parcel-softmax) still attenuates a weak-contrast gate, so the
-    # peaked support keeps the delta above the 1e-4 floor.
-    # Deterministic (no torch.rand) so the gate signal is stable, not flaky.
-    graded_support = torch.full((B, C, 6), 1e-3)
-    dominant = torch.arange(C) % 6
-    graded_support[:, torch.arange(C), dominant] = 1.0
-    graded_support = graded_support / graded_support.sum(dim=-1, keepdim=True)
-    with torch.no_grad():
-        bias_on = model(
-            electrodes, graded_support, lambda_anat=torch.tensor([1.0, 1.0]),
-        )
-        bias_mixed = model(
-            electrodes, graded_support, lambda_anat=torch.tensor([1.0, 0.0]),
-        )
-    assert (bias_on - bias_mixed).abs().max().item() > 1e-4, (
-        "head wrapper must forward lambda_anat into the encoder; "
-        "per-clip gate had no effect."
     )
 
 
@@ -820,147 +857,6 @@ def test_v14_b28_cross_attn_config_propagates_through_build() -> None:
     encoder = model.encoder  # type: ignore[attr-defined]
     assert encoder._cross_attn_at_block == (0, 3)
     assert len(encoder.cross_attns) == 2
-
-
-# --- B28-anatomy-warmup (2026-05-27 PM) ------------------------------
-# ``lambda_anat`` is a forward-time scalar multiplier on the
-# ``log(support+eps)`` cross-attn bias. The training-loop scheduler in
-# ``ssl/warmup.py::anatomy_bias_warmup_schedule`` ramps it 0 → 1 over the
-# last 25% of P1 ∪ first 25% of P2.
-
-
-def test_v14_b28_lambda_anat_default_one_matches_legacy() -> None:
-    """``lambda_anat=1.0`` (default) is the pre-B28 behavior — calling
-    without the kwarg must produce the same output as λ=1.0 explicit."""
-    torch.manual_seed(0)
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    support = torch.rand(2, 5, 6)
-    with torch.no_grad():
-        out_default = model(electrodes, support)
-        out_explicit = model(electrodes, support, lambda_anat=1.0)
-    torch.testing.assert_close(out_default, out_explicit)
-
-
-def test_v14_b28_lambda_anat_zero_decouples_from_anatomy() -> None:
-    """``lambda_anat=0`` zeros the anatomy bias; varying support no longer
-    changes the encoder output (uniform-attention regime)."""
-    torch.manual_seed(0)
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    support_a = torch.rand(2, 5, 6)
-    support_b = torch.rand(2, 5, 6)  # different anatomy
-    with torch.no_grad():
-        out_a = model(electrodes, support_a, lambda_anat=0.0)
-        out_b = model(electrodes, support_b, lambda_anat=0.0)
-    # With λ=0, the only support-dependent path is _compute_latent_valid
-    # (the latent SA key_padding_mask), which depends on support>0 not its
-    # magnitude. Both support_a and support_b have all-positive entries
-    # under torch.rand, so the masks match and outputs must be bit-equal.
-    torch.testing.assert_close(out_a, out_b)
-
-
-def test_v14_b28_lambda_anat_changes_output_when_bias_loadbearing() -> None:
-    """At λ=1, support magnitudes route attention; at λ=0 they don't.
-    The two outputs must differ for a non-trivial support distribution."""
-    torch.manual_seed(0)
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    # Skewed support: each electrode strongly favors one parcel. Without
-    # the bias, the cross-attn cannot recover this routing.
-    support = torch.zeros(2, 5, 6)
-    for c in range(5):
-        support[:, c, c % 6] = 0.99
-        support[:, c, (c + 1) % 6] = 0.01
-    with torch.no_grad():
-        out_on = model(electrodes, support, lambda_anat=1.0)
-        out_off = model(electrodes, support, lambda_anat=0.0)
-    diff = (out_on - out_off).abs().max().item()
-    assert diff > 1e-3, (
-        f"lambda_anat had no observable effect on the encoder output "
-        f"(max |Δ| = {diff:.2e}); the bias-scaling wiring is dead"
-    )
-
-
-def test_v14_b28_lambda_anat_rejects_negative() -> None:
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(1, 3, 4, 6)
-    support = torch.zeros(1, 3, 6)
-    support[..., 0] = 1.0
-    with pytest.raises(ValueError, match="lambda_anat"):
-        model(electrodes, support, lambda_anat=-0.5)
-
-
-# --- B29 Item 12: per-clip λ_anat tensor (anatomy-rich vs SWEC) ----------
-
-
-def test_v14_b29_lambda_anat_per_clip_tensor_accepted() -> None:
-    """A ``(B,)`` ``lambda_anat`` tensor must run cleanly — B29 Item 12 spec."""
-    torch.manual_seed(0)
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    support = torch.rand(2, 5, 6)
-    lambda_anat = torch.tensor([1.0, 0.0])  # anatomy-rich, SWEC
-    with torch.no_grad():
-        out = model(electrodes, support, lambda_anat=lambda_anat)
-    assert out.shape[0] == 2
-
-
-def test_v14_b29_lambda_anat_per_clip_tensor_matches_scalar_for_uniform() -> None:
-    """Per-clip tensor ``[1.0, 1.0]`` must equal scalar ``1.0`` for both clips."""
-    torch.manual_seed(0)
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    support = torch.rand(2, 5, 6)
-    with torch.no_grad():
-        out_scalar = model(electrodes, support, lambda_anat=1.0)
-        out_tensor = model(
-            electrodes, support, lambda_anat=torch.tensor([1.0, 1.0]),
-        )
-    torch.testing.assert_close(out_scalar, out_tensor)
-
-
-def test_v14_b29_lambda_anat_per_clip_tensor_gates_independently() -> None:
-    """Two-clip batch with ``λ_anat = [1.0, 0.0]`` — the λ=0 clip's output
-    must equal what you'd get from a single-clip scalar λ=0 run."""
-    torch.manual_seed(0)
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    # Use skewed support so the λ-gating actually moves the output.
-    support_one = torch.zeros(5, 6)
-    for c in range(5):
-        support_one[c, c % 6] = 0.99
-        support_one[c, (c + 1) % 6] = 0.01
-    electrodes_one = torch.randn(5, 4, 6)
-    electrodes = electrodes_one.unsqueeze(0).repeat(2, 1, 1, 1)
-    support = support_one.unsqueeze(0).repeat(2, 1, 1)
-    with torch.no_grad():
-        out_batch = model(
-            electrodes, support, lambda_anat=torch.tensor([1.0, 0.0]),
-        )
-        out_off = model(
-            electrodes[:1], support[:1], lambda_anat=0.0,
-        )
-        out_on = model(
-            electrodes[:1], support[:1], lambda_anat=1.0,
-        )
-    torch.testing.assert_close(out_batch[1:2], out_off)
-    torch.testing.assert_close(out_batch[0:1], out_on)
-
-
-def test_v14_b29_lambda_anat_per_clip_tensor_rejects_wrong_shape() -> None:
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    support = torch.rand(2, 5, 6)
-    with pytest.raises(ValueError, match="must have shape"):
-        model(electrodes, support, lambda_anat=torch.tensor([1.0, 0.0, 0.5]))
-
-
-def test_v14_b29_lambda_anat_per_clip_tensor_rejects_negative() -> None:
-    model = V14ParcelPerceiverModel(**_tiny_kwargs()).eval()
-    electrodes = torch.randn(2, 5, 4, 6)
-    support = torch.rand(2, 5, 6)
-    with pytest.raises(ValueError, match="must be >= 0"):
-        model(electrodes, support, lambda_anat=torch.tensor([1.0, -0.1]))
 
 
 # ---------------------------------------------------------------------------
@@ -1335,3 +1231,279 @@ def test_v14_gradient_checkpointing_skipped_in_eval() -> None:
     assert torch.equal(out_off, out_on), (
         "#119: eval/no_grad forward must be unaffected by the checkpointing flag"
     )
+
+
+# ─────────────────── B36 WS-B: masked-JEPA encoder seams ──────────────────
+
+
+def _mask_fixture():
+    """Tiny encoder + a 2-clip batch with a known parcel assignment.
+
+    Electrodes 0,1 → parcel 0; electrode 2 → parcel 1; electrode 3 → parcel 2.
+    Returns (model, electrodes, support).
+    """
+    torch.manual_seed(0)
+    model = V14ParcelPerceiverModel(**_tiny_kwargs())
+    model.eval()
+    kw = _tiny_kwargs()
+    B, C = 2, 4
+    electrodes = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"])
+    support = torch.zeros(B, C, kw["k_parcels"])
+    support[:, 0, 0] = 1.0
+    support[:, 1, 0] = 1.0
+    support[:, 2, 1] = 1.0
+    support[:, 3, 2] = 1.0
+    return model, electrodes, support
+
+
+def test_v14_b1_frontend_ln_normalizes_m2_tap() -> None:
+    """B36 B1 — the M2 tap is post-``frontend_ln``: each token is
+    LayerNorm-normalized over the feature axis (mean≈0, var≈1 at init)."""
+    model, electrodes, support = _mask_fixture()
+    assert isinstance(model.frontend_ln, torch.nn.LayerNorm)
+    with torch.no_grad():
+        taps = model(electrodes, support, return_taps=True)
+    m2 = taps["M2"]  # (B, C, F_p, T_p, d)
+    assert m2.shape[-1] == _tiny_kwargs()["d_model"]
+    mean = m2.mean(dim=-1)
+    var = m2.var(dim=-1, unbiased=False)
+    torch.testing.assert_close(mean, torch.zeros_like(mean), atol=1e-5, rtol=0)
+    torch.testing.assert_close(var, torch.ones_like(var), atol=1e-3, rtol=1e-3)
+
+
+def _patch_mask_to_bin_mask(token_mask: torch.Tensor) -> torch.Tensor:
+    """(B, C, F_p, T_p) patch mask → (B, C, T_bins, F_bins) input-bin mask for
+    _tiny_kwargs (kernel (3,2), stride (3,2): F 6→2, T 4→2, non-overlap)."""
+    # token_mask freq axis (F_p=2) tiles 3 freq bins each; time axis (T_p=2)
+    # tiles 2 time bins each. Input layout is (B, C, T_bins, F_bins).
+    bin_ft = token_mask.repeat_interleave(3, dim=2).repeat_interleave(2, dim=3)
+    # bin_ft is (B, C, F_bins=6, T_bins=4) → transpose to (B, C, T_bins, F_bins)
+    return bin_ft.transpose(2, 3)
+
+
+def test_v14_b5_token_mask_is_leakage_free() -> None:
+    """B36 B5 — with a P1 token mask, changing a masked-region INPUT value
+    does not change any VISIBLE token's M2 (front-end never encodes masked
+    cells: they are zeroed pre-token-block)."""
+    model, electrodes, support = _mask_fixture()
+    B, C = electrodes.shape[0], electrodes.shape[1]
+    F_p, T_p = _tiny_freq_patches(), _tiny_time_patches()
+    token_mask = torch.zeros(B, C, F_p, T_p, dtype=torch.bool)
+    # mask patch (f_p=0, t_p=1) on electrode 0, and (f_p=1,t_p=0) on electrode 3.
+    token_mask[:, 0, 0, 1] = True
+    token_mask[:, 3, 1, 0] = True
+
+    with torch.no_grad():
+        m2_a = model(electrodes, support, return_taps=True, token_mask=token_mask)["M2"]
+        # perturb ONLY the input bins that belong to masked patches.
+        bin_mask = _patch_mask_to_bin_mask(token_mask)
+        electrodes_b = electrodes.clone()
+        electrodes_b[bin_mask] = electrodes_b[bin_mask] + 123.0
+        m2_b = model(electrodes_b, support, return_taps=True, token_mask=token_mask)["M2"]
+
+    visible = ~token_mask  # (B, C, F_p, T_p)
+    vis = visible.unsqueeze(-1).expand_as(m2_a)
+    torch.testing.assert_close(m2_a[vis], m2_b[vis], atol=1e-6, rtol=0)
+    # And the masked region's INPUT really differs (test is not vacuous):
+    assert not torch.equal(electrodes, electrodes_b)
+
+
+def test_v14_b8_three_way_latent_valid_partitions_covered() -> None:
+    """B36 B8 — ``compute_latent_valid_3way`` splits ``covered`` into
+    visible/target with teacher == covered: visible ⊎ target == covered,
+    visible ∩ target == ∅, per time patch."""
+    _model, _e, support = _mask_fixture()
+    m = 2  # m_sub_slots in _tiny_kwargs
+    K = _tiny_kwargs()["k_parcels"]
+    T_p = _tiny_time_patches()
+    B = support.shape[0]
+    # mask parcel 0 at t=1 and parcel 2 at t=0 (both covered).
+    ptm = torch.zeros(B, K, T_p, dtype=torch.bool)
+    ptm[:, 0, 1] = True
+    ptm[:, 2, 0] = True
+
+    visible, target, teacher = compute_latent_valid_3way(
+        support=support, valid_mask=None, m_sub_slots=m, parcel_time_mask=ptm,
+    )
+    L = K * m
+    assert teacher.shape == (B, L)
+    assert visible.shape == (B, L, T_p)
+    assert target.shape == (B, L, T_p)
+    # teacher == covered (parcels 0,1,2 covered → slots 0..5 True; 6..11 False)
+    covered = teacher
+    # partition: visible ⊎ target == covered (broadcast over time); disjoint.
+    union = visible | target
+    torch.testing.assert_close(
+        union.float(), covered.unsqueeze(-1).expand(B, L, T_p).float(),
+    )
+    assert not bool((visible & target).any())
+    # target lands exactly on masked covered slot-times (slot l=k*m+s).
+    # parcel 0 → slots 0,1 ; parcel 2 → slots 4,5.
+    assert bool(target[:, 0, 1].all()) and bool(target[:, 1, 1].all())
+    assert bool(target[:, 4, 0].all()) and bool(target[:, 5, 0].all())
+    # uncovered parcels (3,4,5 → slots 6..11) never visible/target.
+    assert not bool(visible[:, 6:].any()) and not bool(target[:, 6:].any())
+
+
+def test_v14_b5_parcel_time_mask_is_leakage_free() -> None:
+    """B36 B5 (P2 paradigm B) — with a parcel-time mask, perturbing a masked
+    parcel's dropped (electrode, masked-time) INPUT does not change any
+    VISIBLE parcel token's M4. The visible-only encoder zeroes the dropped
+    electrode-times pre-token-block AND excludes the masked parcel-times from
+    the latent-SA keys, so visible M4 is independent of the masked region.
+    Companion to the P1 ``token_mask`` leakage test above."""
+    model, electrodes, support = _mask_fixture()
+    K = _tiny_kwargs()["k_parcels"]
+    m = _tiny_kwargs()["m_sub_slots"]
+    T_p = _tiny_time_patches()
+    B = electrodes.shape[0]
+    # Mask parcel 0 at t_p=1 (electrodes 0,1 are assigned parcel 0).
+    ptm = torch.zeros(B, K, T_p, dtype=torch.bool)
+    ptm[:, 0, 1] = True
+
+    with torch.no_grad():
+        m4_a = model(
+            electrodes, support, return_taps=True, parcel_time_mask=ptm,
+        )["M4"]
+        # Perturb ONLY parcel-0 electrodes (0,1) at the masked time patch:
+        # t_p=1 → input time bins {2,3} (stride-2 non-overlap, T 4→2). Input
+        # layout is (B, C, T_bins, F_bins), so the time axis is dim 2.
+        electrodes_b = electrodes.clone()
+        electrodes_b[:, 0:2, 2:4, :] = electrodes_b[:, 0:2, 2:4, :] + 123.0
+        m4_b = model(
+            electrodes_b, support, return_taps=True, parcel_time_mask=ptm,
+        )["M4"]
+
+    visible, _target, _teacher = compute_latent_valid_3way(
+        support=support, valid_mask=None, m_sub_slots=m, parcel_time_mask=ptm,
+    )
+    vis = visible.unsqueeze(-1).expand_as(m4_a)  # (B, L, T_p, d)
+    torch.testing.assert_close(m4_a[vis], m4_b[vis], atol=1e-6, rtol=0)
+    # Non-vacuity: the masked-region input really changed.
+    assert not torch.equal(electrodes, electrodes_b)
+
+
+def test_v14_m2_only_early_exit_matches_full_forward() -> None:
+    """B36 WS-B P1 efficiency — ``m2_only=True`` returns ONLY the M2 tap and
+    that tap is byte-identical to the full forward's M2 (the skipped pool /
+    inter-parcel encoder are pure downstream compute P1 never reads)."""
+    model, electrodes, support = _mask_fixture()
+    B, C = electrodes.shape[0], electrodes.shape[1]
+    F_p, T_p = _tiny_freq_patches(), _tiny_time_patches()
+    token_mask = torch.zeros(B, C, F_p, T_p, dtype=torch.bool)
+    token_mask[:, 0, 0, 1] = True
+
+    with torch.no_grad():
+        full = model(
+            electrodes, support, return_taps=True, token_mask=token_mask,
+        )
+        m2o = model(
+            electrodes, support, return_taps=True, token_mask=token_mask,
+            m2_only=True,
+        )
+    assert set(m2o.keys()) == {"M2"}
+    torch.testing.assert_close(m2o["M2"], full["M2"], atol=0, rtol=0)
+
+
+def test_v14_m2_only_requires_return_taps() -> None:
+    """``m2_only`` is a tap-only short-circuit — it is meaningless without
+    ``return_taps=True`` and must raise rather than silently fall through to
+    the full (non-taps) tensor return."""
+    model, electrodes, support = _mask_fixture()
+    with pytest.raises(ValueError, match="return_taps"):
+        model(electrodes, support, m2_only=True)
+
+
+# ---------------------------------------------------------------------------
+# B36 C5: per-corpus freq-patch validity (SWEC k0–21 → F-patch 0–6)
+# ---------------------------------------------------------------------------
+
+
+def test_c5_freq_patch_valid_mask_swec_k0_21_maps_to_fpatch_0_6() -> None:
+    """``freq_patch_valid_mask`` maps the SWEC per-bin validity (k0–21 valid,
+    k22–29 invalid) to per-PATCH validity. With the non-overlap (kernel=3,
+    stride=3) stem, patch p covers bins [3p, 3p+3): patch 7 = {21,22,23}
+    straddles the k21/k22 boundary → dropped (all-bins-valid rule). So valid
+    F-patches = 0–6, exactly the plan's 'SWEC k0–21 → F-patch 0–6'."""
+    from speech_decoding.models.v14_encoder import freq_patch_valid_mask
+
+    bin_mask = torch.ones(30, dtype=torch.bool)
+    bin_mask[22:] = False  # k22–29 invalid
+    fpv = freq_patch_valid_mask(bin_mask, kernel_freq=3, stride_freq=3)
+    assert fpv.shape == (10,)
+    expected = torch.tensor([True] * 7 + [False] * 3)
+    assert torch.equal(fpv, expected), f"got {fpv.tolist()}"
+
+
+def _c5_fixture():
+    """Encoder with F_p=10 (n_freq_bins=30), T_p=4 (n_time_bins=8), a 2-clip
+    batch, and a SWEC-style freq_patch_valid masking F-patches 7–9."""
+    torch.manual_seed(0)
+    kw = {
+        "n_freq_bins": 30, "n_time_bins": 8, "k_parcels": 6,
+        "d_model": 32, "n_heads": 4, "depth_self_attn": 2, "m_sub_slots": 2,
+    }
+    model = V14ParcelPerceiverModel(**kw)
+    model.eval()
+    B, C = 2, 4
+    electrodes = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"])
+    support = torch.zeros(B, C, kw["k_parcels"])
+    support[:, 0, 0] = 1.0
+    support[:, 1, 0] = 1.0
+    support[:, 2, 1] = 1.0
+    support[:, 3, 2] = 1.0
+    fpv = torch.tensor([True] * 7 + [False] * 3)  # F-patches 7–9 invalid
+    return model, electrodes, support, fpv
+
+
+def test_c5_freq_patch_excluded_from_keys_protects_valid_outputs() -> None:
+    """With freq_patch_valid masking F-patches 7–9, BOTH the parcel latents
+    (M4) and the valid-freq-patch M2 tokens are invariant to the CONTENT of
+    the invalid freq bins (k22–29) — the masked patches are excluded as keys
+    in both the per-electrode token-block SA and the hard-pool cross-attn.
+    Patches 0–6 cover bins 0–20 (non-overlap stem), so the perturbation never
+    enters a valid patch's Conv window; the only path is via the (masked-out)
+    invalid-patch keys."""
+    model, electrodes, support, fpv = _c5_fixture()
+    pert = electrodes.clone()
+    pert[:, :, :, 22:] += 50.0  # perturb invalid freq bins only
+
+    with torch.no_grad():
+        a = model(electrodes, support, return_taps=True, freq_patch_valid=fpv)
+        b = model(pert, support, return_taps=True, freq_patch_valid=fpv)
+    torch.testing.assert_close(a["M4"], b["M4"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        a["M2"][:, :, :7], b["M2"][:, :, :7], atol=1e-5, rtol=1e-5,
+    )
+
+    # Control: WITHOUT the mask, the same perturbation DOES move M4 — so it is
+    # the freq-patch key mask, not an accident, protecting the valid outputs.
+    with torch.no_grad():
+        c = model(electrodes, support, return_taps=True)
+        d = model(pert, support, return_taps=True)
+    assert (c["M4"] - d["M4"]).abs().max() > 1e-4
+
+
+def test_c5_freq_patch_valid_none_is_byte_identical() -> None:
+    """freq_patch_valid=None and an all-True mask both reduce to the pre-C5
+    forward — the BT no-op (all 30 bins valid)."""
+    model, electrodes, support, _ = _c5_fixture()
+    all_true = torch.ones(10, dtype=torch.bool)
+    with torch.no_grad():
+        none_out = model(electrodes, support, return_taps=True)
+        true_out = model(
+            electrodes, support, return_taps=True, freq_patch_valid=all_true,
+        )
+    torch.testing.assert_close(none_out["M4"], true_out["M4"], atol=0, rtol=0)
+    torch.testing.assert_close(none_out["M2"], true_out["M2"], atol=0, rtol=0)
+
+
+def test_c5_freq_patch_valid_rejects_bad_shape() -> None:
+    """A freq_patch_valid that is neither (F_p,) nor (B, F_p) is a contract
+    violation, not silently broadcast."""
+    model, electrodes, support, _ = _c5_fixture()
+    with pytest.raises(ValueError, match="freq_patch_valid"):
+        model(
+            electrodes, support, return_taps=True,
+            freq_patch_valid=torch.ones(5, dtype=torch.bool),  # F_p is 10
+        )

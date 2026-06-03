@@ -19,6 +19,8 @@ import typing as tp
 
 import numpy as np
 
+from speech_decoding.studies.braintreebank.anatomy import clean_bt_electrode_label
+
 
 class _BrainTreebankSubjectLike(tp.Protocol):
     """Subset of `neuroprobe.braintreebank_subject.BrainTreebankSubject` we use."""
@@ -41,7 +43,15 @@ def bt_load_raw(
     data = np.asarray(raw_data, dtype=np.float32)
     if data.ndim != 2:
         raise ValueError(f"expected (n_ch, n_samples) array, got shape {data.shape}")
-    ch_names = list(bt.electrode_labels)
+    # Clean BT `*`/`#` annotation marks at the loader boundary (H6 / WS-D1).
+    # The real upstream `BrainTreebankSubject._get_all_electrode_names` already
+    # strips these, so on the production path this is defense-in-depth — but
+    # `_BrainTreebankSubjectLike` is only a Protocol and cannot guarantee the
+    # caller pre-cleaned. Were a raw mark to reach `reference.parse_shaft`
+    # (e.g. sub_2's 34 `RT1aIa*` contacts), the trailing `*` defeats the
+    # numeric-suffix match, making each its own singleton shaft that shaft-CAR
+    # self-subtracts to zero. Idempotent on already-cleaned labels.
+    ch_names = [clean_bt_electrode_label(name) for name in bt.electrode_labels]
     if len(ch_names) != data.shape[0]:
         raise ValueError(
             f"electrode_labels len {len(ch_names)} != n_channels {data.shape[0]}"
