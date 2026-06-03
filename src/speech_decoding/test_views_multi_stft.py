@@ -7,18 +7,22 @@ Covers the only novel logic in the sweep harness: octave bin-count math,
 
 from __future__ import annotations
 
+import numpy as np
 import torch
+from scipy import signal
 
 from speech_decoding.extractors.view import (
     _multi_stft_view,
     multi_stft_bin_centers_hz,
 )
 from speech_decoding.views import (
+    _FILTER_CHUNK_CH,
     _derive_multi_stft_routing,
     _multi_stft_band,
     _multi_stft_n_bins,
     _raw_multi_stft_bins,
     _resolve_multi_stft_params,
+    apply_temporal_filter_inplace,
     apply_view,
     multi_stft_dead_bin_count,
 )
@@ -148,3 +152,47 @@ def test_filterbank_changes_with_half_bw():
     wide = _multi_stft_band(_wave(c=2), SR, _resolve_multi_stft_params({"half_bw_octaves": 1.0}))
     assert narrow.shape == wide.shape
     assert not torch.allclose(narrow, wide)
+
+
+def _ref_filtered(arr: np.ndarray, *, notch_freqs, notch_q, hpf_hz, hpf_order) -> np.ndarray:
+    # Whole-array float64 reference: exactly the pre-chunking code path.
+    nyq = 0.5 * SR
+    out = arr.astype(np.float64)
+    for f0 in notch_freqs:
+        if f0 <= 0 or f0 >= nyq:
+            continue
+        b, a = signal.iirnotch(f0 / nyq, notch_q)
+        out = np.asarray(signal.sosfiltfilt(signal.tf2sos(b, a), out, axis=-1))
+    if hpf_hz > 0:
+        sos = signal.butter(hpf_order, hpf_hz / nyq, btype="highpass", output="sos")
+        out = np.asarray(signal.sosfiltfilt(sos, out, axis=-1))
+    return out.astype(np.float32)
+
+
+def test_chunked_filter_is_bit_identical_to_whole_array():
+    # Channel chunking is a pure memory knob: sosfiltfilt along axis=-1 is
+    # independent per channel, so filtering in _FILTER_CHUNK_CH-row blocks must
+    # equal filtering the whole tensor at once. Use >2 chunks worth of channels.
+    n_ch = 2 * _FILTER_CHUNK_CH + 5
+    g = torch.Generator().manual_seed(7)
+    base = torch.randn(n_ch, 6000, generator=g)
+    notch_freqs = (60.0, 120.0, 180.0)
+
+    ref = _ref_filtered(
+        base.numpy(), notch_freqs=notch_freqs, notch_q=30.0, hpf_hz=0.5, hpf_order=4
+    )
+    got = base.clone()
+    apply_temporal_filter_inplace(
+        got, sampling_rate=SR, notch_freqs=notch_freqs, notch_q=30.0, hpf_hz=0.5, hpf_order=4
+    )
+
+    assert got.shape == base.shape
+    np.testing.assert_array_equal(got.numpy(), ref)
+
+
+def test_filter_noop_when_nothing_requested():
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(4, 1000, generator=g)
+    before = x.clone()
+    apply_temporal_filter_inplace(x, sampling_rate=SR, notch_freqs=(), hpf_hz=0.0)
+    assert torch.equal(x, before)

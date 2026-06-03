@@ -350,6 +350,13 @@ def _instantaneous_phase(data: torch.Tensor, sampling_rate: int) -> torch.Tensor
     return torch.from_numpy(feats)
 
 
+# Channel tiling for the in-place session filter. Pure memory knob (numerically
+# inert — per-channel filtering is independent), sized so one float64 block plus
+# the sosfiltfilt input+output pair stays well under a node's RAM on a ~10^7-sample
+# session: 32 ch x 27.5M samp x 8 B ~ 7 GB/block, ~14 GB transient.
+_FILTER_CHUNK_CH = 32
+
+
 def apply_temporal_filter_inplace(
     tensor: torch.Tensor,
     *,
@@ -369,21 +376,36 @@ def apply_temporal_filter_inplace(
     apply per-channel via `sosfiltfilt` (zero-phase).
 
     No-op when both `notch_freqs` is empty and `hpf_hz <= 0`.
+
+    Filtered in channel chunks: `sosfiltfilt` along `axis=-1` is independent per
+    channel, so chunking rows is bit-identical to filtering the whole tensor at
+    once, but caps peak memory at ~`_FILTER_CHUNK_CH x T x 8` bytes instead of the
+    full `C x T` float64 copy (plus the sosfiltfilt input+output pair). A full
+    BrainTreebank session is ~10^7 samples; the whole-tensor float64 path peaks at
+    tens of GB and OOMs the cross cells (sub 2 / trial 4 = 164 ch x 27.5M samp).
     """
     if not notch_freqs and hpf_hz <= 0:
         return
-    arr = tensor.detach().cpu().numpy().astype(np.float64)
     nyq = 0.5 * sampling_rate
+    sos_sections: list = []  # scipy SOS arrays (untyped upstream)
     for f0 in notch_freqs:
         if f0 <= 0 or f0 >= nyq:
             continue
         b, a = signal.iirnotch(f0 / nyq, notch_q)
-        sos = signal.tf2sos(b, a)
-        arr = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
+        sos_sections.append(signal.tf2sos(b, a))
     if hpf_hz > 0:
-        sos = signal.butter(hpf_order, hpf_hz / nyq, btype="highpass", output="sos")
-        arr = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
-    tensor.copy_(torch.from_numpy(arr.astype(np.float32)))
+        sos_sections.append(
+            signal.butter(hpf_order, hpf_hz / nyq, btype="highpass", output="sos")
+        )
+    if not sos_sections:
+        return
+    n_ch = tensor.shape[0]
+    for start in range(0, n_ch, _FILTER_CHUNK_CH):
+        sl = slice(start, min(start + _FILTER_CHUNK_CH, n_ch))
+        block = tensor[sl].detach().cpu().numpy().astype(np.float64)
+        for sos in sos_sections:
+            block = np.asarray(signal.sosfiltfilt(sos, block, axis=-1))
+        tensor[sl].copy_(torch.from_numpy(block.astype(np.float32)))
 
 
 # ---------------------------------------------------------------------------
