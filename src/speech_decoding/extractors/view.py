@@ -66,6 +66,7 @@ import torch
 from neuralset.base import TimedArray
 
 from speech_decoding.extractors.reference import CARIeegExtractor
+from speech_decoding.extractors.normalize import SessionRobustZNormalizer
 
 
 # ---------------------------------------------------------------------------
@@ -421,9 +422,40 @@ class MultiStftView(CARIeegExtractor):
     log_eps: float = 1e-6
     apply_log: bool = False
     c_max: int | None = None
+    # C3 (WS-C, B13 lock): per-(electrode, freq-bin, session) robust-z over the
+    # filterbank output. When True, ``prepare`` fits a ``SessionRobustZNormalizer``
+    # once per session over that session's *own* full recording (B13: median/MAD
+    # is physical-unit calibration — impedance × amp-gain — fit identically train
+    # and eval, NOT fit-on-train-only) and ``_get_timed_array`` applies the frozen
+    # stats per clip. Replaces the dropped ``scaler="StandardScaler"`` (raw-voltage,
+    # whole-recording, non-robust). Default False so the synthetic capstone /
+    # fast_dev_run smoke (per-token encoder LN handles scale) stays untouched; the
+    # dispatch flips it True for real runs.
+    session_robust_z: bool = False
+    session_z_sigma_floor: float = 1e-6
+    # STFT-fit chunk for the session stat pass: the full recording's filterbank
+    # is computed in ``session_z_chunk_s``-wide slices (one cached-raw read per
+    # session, STFT'd chunk-by-chunk to bound peak memory) then concatenated
+    # along time before the median/MAD fit. Numerically inert for a median over
+    # ~10^5 frames: only the handful of center-pad frames at each chunk seam
+    # differ from a single continuous STFT (<0.5% of frames).
+    session_z_chunk_s: float = 60.0
     # Pydantic doesn't allow tuple[int, ...] as a default freely — keep
     # the routing as a class-level constant pulled from the module.
     fbank_routing: tp.ClassVar[tuple[int, ...]] = MULTI_STFT_ROUTING
+    # Per-session frozen normalizers, keyed by ``event._splittable_event_uid()``
+    # (the session key the cached raw is keyed on). Mutated once in ``prepare`` on
+    # the main process, read per-clip in ``_get_timed_array`` — the same
+    # prepare-fills-private-state / workers-inherit pattern as ``_channels`` on
+    # the MneRaw base (Linux fork inherits parent memory; pydantic pickles private
+    # attrs under spawn).
+    _session_stats: dict[str, SessionRobustZNormalizer] = {}
+    # False until ``_fit_session_robust_z`` has run. ``MneRaw.prepare`` fires a
+    # ``duration=0.001`` shape-probe clip THROUGH this view *before* the fit, so
+    # ``_apply_session_robust_z`` must skip while this is False (the probe only
+    # needs the output shape, which robust-z leaves unchanged). Real training
+    # clips run with it True, so a genuinely-missing session still fails loud.
+    _stats_ready: bool = False
 
     def n_time_bins_for_duration(self, duration_s: float) -> int:
         """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
@@ -437,14 +469,16 @@ class MultiStftView(CARIeegExtractor):
         n_samples = int(round(duration_s * self.sample_rate_hz))
         return 1 + n_samples // self.hop_length
 
-    def _get_timed_array(
-        self, event, start: float, duration: float,
-    ) -> TimedArray:
-        waveform_ta = super()._get_timed_array(event, start, duration)
-        waveform_t = torch.from_numpy(np.asarray(waveform_ta.data)).float()
-        spec = _multi_stft_view(
+    def _spec_from_waveform(
+        self, waveform_t: torch.Tensor, sample_rate: int,
+    ) -> torch.Tensor:
+        """``(C, T)`` waveform → ``(C, F, T_bin)`` filterbank, with this view's
+        exact STFT/routing config. Single source of truth shared by the per-clip
+        path and the session-stat fit, so fit-time and apply-time features are
+        byte-identical."""
+        return _multi_stft_view(
             waveform_t,
-            sample_rate=int(float(waveform_ta.frequency)),
+            sample_rate=sample_rate,
             hop_length=self.hop_length,
             nperseg_low=self.nperseg_low,
             nperseg_mid=self.nperseg_mid,
@@ -457,6 +491,20 @@ class MultiStftView(CARIeegExtractor):
             log_eps=self.log_eps,
             apply_log=self.apply_log,
         )
+
+    def _get_timed_array(
+        self, event, start: float, duration: float,
+    ) -> TimedArray:
+        waveform_ta = super()._get_timed_array(event, start, duration)
+        waveform_t = torch.from_numpy(np.asarray(waveform_ta.data)).float()
+        spec = self._spec_from_waveform(
+            waveform_t, int(float(waveform_ta.frequency)),
+        )
+        if self.session_robust_z:
+            # Apply BEFORE c_max padding: stats cover the real C electrodes only;
+            # padded channels stay exactly 0 (normalizing them would map 0 →
+            # -median/σ ≠ 0 and pollute the pad).
+            spec = self._apply_session_robust_z(event, spec)
         if self.c_max is not None:
             c_event = int(spec.shape[0])
             if c_event > self.c_max:
@@ -476,3 +524,117 @@ class MultiStftView(CARIeegExtractor):
             duration=duration,
             data=spec.cpu().numpy(),
         )
+
+    def _apply_session_robust_z(
+        self, event, spec: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply this session's frozen robust-z stats to a ``(C_global, F, T)``
+        clip spec. The session is keyed by ``event._splittable_event_uid()`` —
+        the same key the cached raw (and therefore the fit) is keyed on. The
+        stats were scattered into the global-channel index at fit time (see
+        ``_fit_session_robust_z``) so they broadcast against the global-channel
+        clip ``super()._get_timed_array`` produced — across sessions with
+        differing electrode counts the absent rows are zero in both."""
+        if not self._stats_ready:
+            # ``MneRaw.prepare`` shape-probe runs before the fit; robust-z does
+            # not change the output shape, so pass the raw spec through.
+            return spec
+        key = event._splittable_event_uid()
+        normalizer = self._session_stats.get(key)
+        if normalizer is None:
+            raise KeyError(
+                f"MultiStftView.session_robust_z is on but no fitted stats for "
+                f"session {key!r}. prepare() must run (and see this session) "
+                f"before clips are drawn. Have stats for: "
+                f"{sorted(self._session_stats)[:8]}..."
+            )
+        return normalizer.transform(spec)
+
+    def prepare(self, obj) -> None:  # type: ignore[override]
+        # ``super().prepare`` populates ``_channels`` (needed by the fit's
+        # global-channel scatter) and fires a shape-probe clip; the probe runs
+        # with ``_stats_ready`` still False so it skips robust-z safely. Only
+        # after the fit do we arm ``_stats_ready`` so real clips normalize.
+        super().prepare(obj)
+        if self.session_robust_z:
+            self._fit_session_robust_z(obj)
+            self._stats_ready = True
+
+    def _fit_session_robust_z(self, obj) -> None:
+        """Fit one ``SessionRobustZNormalizer`` per session over that session's
+        own full recording (B13: per-(electrode, freq, session), identical train
+        and eval). Reads each session's cached preprocessed raw once, computes the
+        full-recording filterbank in ``session_z_chunk_s`` slices to bound peak
+        memory, concatenates along time, and fits median/MAD. Runs on the main
+        process inside ``Data.build``; the fitted stats are inherited by forked
+        DataLoader workers."""
+        events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
+        seen: set[str] = set()
+        for event in events:
+            key = event._splittable_event_uid()
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_ta = next(self._get_data([event]))
+            waveform = torch.from_numpy(np.asarray(raw_ta.data)).float()
+            sample_rate = int(float(raw_ta.frequency))
+            chunk = max(
+                int(round(self.session_z_chunk_s * sample_rate)), self.nperseg_low,
+            )
+            n_samples = int(waveform.shape[-1])
+            specs: list[torch.Tensor] = []
+            for c0 in range(0, n_samples, chunk):
+                seg = waveform[:, c0 : c0 + chunk]
+                if int(seg.shape[-1]) < self.nperseg_low:
+                    continue  # too short for the largest STFT window — drop tail
+                specs.append(self._spec_from_waveform(seg, sample_rate))
+            if not specs:
+                # whole recording shorter than one nperseg_low window
+                specs = [self._spec_from_waveform(waveform, sample_rate)]
+            # Free the full-session waveform (up to ~15 GB for a 2 h / 250-ch
+            # recording) BEFORE the fit allocates its median sort buffer — it is
+            # unused past the STFT pass. Cuts worst-case fit peak ~25 GB → ~7 GB
+            # with no numeric change (the concat-then-median is identical).
+            del waveform
+            frames = torch.cat(specs, dim=-1)  # (C_session, F, T_session)
+            del specs  # torch.cat copied the data; the per-chunk specs are dead
+            normalizer = SessionRobustZNormalizer(
+                sigma_floor=self.session_z_sigma_floor,
+            ).fit(frames)
+            # Scatter the session-indexed (C_session, F, 1) stats into the
+            # GLOBAL channel index. ``_get_data`` yields the session's own
+            # C_session channels in ``raw_ta.ch_names`` order, but the apply
+            # path's ``super()._get_timed_array`` scatters each clip into a
+            # ``(max(_channels)+1, ...)`` global array via the SAME
+            # ``_get_channels(ch_names)`` map (neuro.py:453,463). Placing the
+            # stats at those identical global rows makes fit and apply align by
+            # construction regardless of channel_order, and lets one set of
+            # stats broadcast against clips from sessions with differing
+            # electrode counts. Global rows with no source channel keep σ=0 →
+            # ``transform`` zeros them, matching the clip's zero pad rows.
+            self._scatter_stats_to_global(normalizer, raw_ta.ch_names)
+            self._session_stats[key] = normalizer
+            del frames, raw_ta
+
+    def _scatter_stats_to_global(
+        self, normalizer: SessionRobustZNormalizer, ch_names: list[str],
+    ) -> None:
+        """In-place: replace ``normalizer.median``/``.sigma`` ``(C_session,F,1)``
+        with global-channel ``(C_global,F,1)`` tensors, the session's stats
+        placed at the global indices ``_get_channels(ch_names)`` assigns — the
+        exact rows the apply-path scatter lands this session's clip data on."""
+        channel_idx = self._get_channels(ch_names)  # type: ignore[attr-defined]
+        c_global = max(self._channels.values()) + 1  # type: ignore[attr-defined]
+        idx = torch.as_tensor(channel_idx, dtype=torch.long)
+        session_median = normalizer.median
+        session_sigma = normalizer.sigma
+        assert session_median is not None and session_sigma is not None, (
+            "normalizer must be .fit() before scatter"
+        )
+        f_bins = int(session_median.shape[1])
+        global_median = torch.zeros(c_global, f_bins, 1, dtype=session_median.dtype)
+        global_sigma = torch.zeros(c_global, f_bins, 1, dtype=session_sigma.dtype)
+        global_median[idx] = session_median
+        global_sigma[idx] = session_sigma
+        normalizer.median = global_median
+        normalizer.sigma = global_sigma

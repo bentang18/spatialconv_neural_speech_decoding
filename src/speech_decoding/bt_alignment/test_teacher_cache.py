@@ -11,9 +11,10 @@ import pytest
 import torch
 
 from speech_decoding.bt_alignment.teacher_cache import (
-    WhisperFeatureExtractor, write_clip_cache,
+    WhisperFeatureExtractor, write_clip_cache, write_movie_cache,
     fit_channel_stats, TargetStandardizer,
     DEFAULT_LAYER_MERGE, SINGLE_LAYER_SISTER_INDEX, DEFAULT_TEACHER_HZ, WHISPER_SR,
+    WHISPER_ENCODER_WINDOW_S,
 )
 
 
@@ -326,3 +327,220 @@ def test_target_standardizer_rejects_mismatched_shapes():
 def test_fit_channel_stats_empty_raises():
     with pytest.raises(ValueError, match="no frames"):
         fit_channel_stats([], d_model=8)
+
+
+# --- whole-movie teacher cache (T14) -----------------------------------------
+
+
+def _movie_wav(seconds: float, seed: int = 0) -> np.ndarray:
+    """Deterministic non-silent mono movie waveform at 16 kHz."""
+    n = int(round(seconds * WHISPER_SR))
+    return (np.random.RandomState(seed).randn(n) * 0.05).astype(np.float32)
+
+
+def test_write_movie_cache_chunks_whole_movie_not_truncated(whisper_tiny, tmp_path):
+    """THE truncation guard. Whisper's encoder is fixed at a 30 s window, so a
+    naive single forward over a >30 s movie keeps only its first 30 s (1500
+    frames). write_movie_cache must chunk on the 30 s grid and concatenate, so a
+    65 s movie yields round(65 × 50) = 3250 frames (1500 + 1500 + 250), NOT
+    1500. Frame f maps to movie-time f / 50."""
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    try:
+        wav = _movie_wav(65.0)
+        entry = write_movie_cache(
+            fe, wav, sample_rate=WHISPER_SR, movie="megamind", out_dir=tmp_path,
+        )
+        assert entry.n_frames == 3250, (
+            f"65 s movie → {entry.n_frames} frames; want 3250 "
+            "(truncated to 1500 == the 30 s-window bug)"
+        )
+        assert entry.n_frames != 1500
+        assert entry.d_model == 384
+        assert abs(entry.duration_s - 65.0) < 1e-3
+        assert entry.chunk_s == WHISPER_ENCODER_WINDOW_S
+        payload = torch.load(entry.out_path, weights_only=False)
+        assert payload["features"].shape == (3250, 384)
+        assert payload["features"].dtype == torch.float16
+        assert payload["rate_hz"] == 50
+        assert payload["t0_movie_s"] == 0.0
+        assert payload["movie"] == "megamind"
+    finally:
+        fe.close()
+
+
+def test_write_movie_cache_dense_equals_chunk_concat(whisper_tiny, tmp_path):
+    """The dense stream is EXACTLY the per-chunk extracts concatenated in order;
+    each full 30 s chunk contributes exactly 1500 frames. This is what makes the
+    frame↔movie-time map exact across chunk boundaries (no drift, no overlap)."""
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    try:
+        wav = _movie_wav(65.0, seed=1)
+        entry = write_movie_cache(
+            fe, wav, sample_rate=WHISPER_SR, movie="m", out_dir=tmp_path,
+        )
+        dense = torch.load(entry.out_path, weights_only=False)["features"]
+        chunk_n = int(round(WHISPER_ENCODER_WINDOW_S * WHISPER_SR))
+        expected = torch.cat(
+            [fe.extract(wav[s : s + chunk_n], WHISPER_SR)
+             for s in range(0, len(wav), chunk_n)],
+            dim=0,
+        )
+        assert dense.shape == expected.shape == (3250, 384)
+        torch.testing.assert_close(dense, expected, atol=0.0, rtol=0.0)
+        # Full chunks are exactly 1500 frames → grid is exact.
+        assert fe.extract(wav[:chunk_n], WHISPER_SR).shape[0] == 1500
+    finally:
+        fe.close()
+
+
+def test_write_movie_cache_frame_maps_to_movie_time(whisper_tiny, tmp_path):
+    """A clip at movie-onset t0 is the slice dense[round(t0×50) : +250]. Verify
+    the slicing contract the segmenter (T20) will use, including a clip that
+    STRADDLES a 30 s chunk seam (t0=29.5 s → frames 1475..1725, drawing 25
+    frames from chunk 0 and 225 from chunk 1) — the concat must make that seam
+    invisible to movie-time indexing."""
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    rate = DEFAULT_TEACHER_HZ
+    try:
+        wav = _movie_wav(65.0, seed=2)
+        entry = write_movie_cache(
+            fe, wav, sample_rate=WHISPER_SR, movie="m", out_dir=tmp_path,
+        )
+        dense = torch.load(entry.out_path, weights_only=False)["features"]
+        chunk_n = int(round(WHISPER_ENCODER_WINDOW_S * WHISPER_SR))
+        c0 = fe.extract(wav[:chunk_n], WHISPER_SR)
+        c1 = fe.extract(wav[chunk_n : 2 * chunk_n], WHISPER_SR)
+
+        # In-chunk clip at t0 = 10 s → frames [500:750] from chunk 0.
+        f0 = round(10.0 * rate)
+        torch.testing.assert_close(dense[f0 : f0 + 250], c0[500:750], atol=0.0, rtol=0.0)
+
+        # Seam-straddling clip at t0 = 29.5 s → frames [1475:1725].
+        fs = round(29.5 * rate)
+        assert fs == 1475
+        seam = torch.cat([c0[1475:1500], c1[0:225]], dim=0)
+        torch.testing.assert_close(dense[fs : fs + 250], seam, atol=0.0, rtol=0.0)
+    finally:
+        fe.close()
+
+
+def test_write_movie_cache_keys_path_by_model_and_merge(whisper_tiny, tmp_path):
+    """Like write_clip_cache: model + layer-merge fold into the PATH so two
+    target-defining configs can never share one movie file. One file per movie
+    (no clip_id / film subdir)."""
+    model, proc = whisper_tiny
+    wav = _movie_wav(35.0, seed=3)
+    fe_mean = WhisperFeatureExtractor(model, proc)            # mean_all
+    fe_l0 = WhisperFeatureExtractor(model, proc, layer_merge=0)
+    try:
+        e_mean = write_movie_cache(fe_mean, wav, WHISPER_SR, "venom", tmp_path)
+        e_l0 = write_movie_cache(fe_l0, wav, WHISPER_SR, "venom", tmp_path)
+    finally:
+        fe_mean.close()
+        fe_l0.close()
+    assert e_mean.out_path != e_l0.out_path
+    assert "mean_all" in e_mean.out_path and "openai_whisper-tiny" in e_mean.out_path
+    assert "L0" in e_l0.out_path
+    assert Path(e_mean.out_path).name == Path(e_l0.out_path).name == "venom.pt"
+    # 35 s movie → round(35×50)=1750 frames (1500 + 250), not 1500.
+    assert e_mean.n_frames == 1750
+
+
+def test_write_movie_cache_exact_multiple_has_no_partial_chunk(whisper_tiny, tmp_path):
+    """A movie that is an EXACT multiple of the 30 s grid (90 s = 3 chunks) must
+    yield exactly 3 × 1500 = 4500 frames — no spurious extra (empty) chunk, no
+    dropped tail. Complements the 65 s partial-chunk case: this exercises the
+    no-remainder branch of the chunk loop."""
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    try:
+        wav = _movie_wav(90.0, seed=4)
+        entry = write_movie_cache(fe, wav, WHISPER_SR, "exact", tmp_path)
+        assert entry.n_frames == 4500, f"90 s → {entry.n_frames}, want 4500"
+        assert abs(entry.duration_s - 90.0) < 1e-3
+    finally:
+        fe.close()
+
+
+def test_write_movie_cache_non_round_duration_keeps_partial(whisper_tiny, tmp_path):
+    """A non-grid-aligned, non-round duration (100.5 s) must give
+    round(100.5 × 50) = 5025 frames = 3 full chunks (4500) + a 10.5 s partial
+    (525). Guards the partial-chunk frame count at a length unlike the other
+    tests, and the dense frame f → movie-time f/50 map at a non-round seam."""
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    rate = DEFAULT_TEACHER_HZ
+    try:
+        wav = _movie_wav(100.5, seed=5)
+        entry = write_movie_cache(fe, wav, WHISPER_SR, "nonround", tmp_path)
+        assert entry.n_frames == 5025, f"100.5 s → {entry.n_frames}, want 5025"
+        dense = torch.load(entry.out_path, weights_only=False)["features"]
+        assert dense.shape[0] == 5025
+        # The partial tail (chunk 3) is the last 525 frames; verify it equals a
+        # direct extract of the 10.5 s remainder audio.
+        chunk_n = int(round(WHISPER_ENCODER_WINDOW_S * WHISPER_SR))
+        tail = fe.extract(wav[3 * chunk_n :], WHISPER_SR)
+        assert tail.shape[0] == round(10.5 * rate) == 525
+        torch.testing.assert_close(dense[4500:], tail, atol=0.0, rtol=0.0)
+    finally:
+        fe.close()
+
+
+def test_write_movie_cache_rejects_bad_inputs(whisper_tiny, tmp_path):
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    try:
+        with pytest.raises(ValueError, match="16000"):
+            write_movie_cache(fe, _movie_wav(5.0), 22050, "m", tmp_path)
+        with pytest.raises(ValueError, match="mono"):
+            write_movie_cache(
+                fe, np.zeros((2, 16000), dtype=np.float32), WHISPER_SR, "m", tmp_path,
+            )
+    finally:
+        fe.close()
+
+
+class _FixedFramesExtractor:
+    """Emits a fixed frame count for EVERY chunk regardless of its true duration
+    — simulates a silent per-chunk truncation (the first-30-s trap) so the
+    frame-count invariant in write_movie_cache has something to catch."""
+
+    def __init__(self, frames_per_chunk: int = 100, d: int = 8):
+        self._n = frames_per_chunk
+        self._d = d
+
+    def extract(self, wav, sample_rate):  # noqa: ARG002 - signature parity
+        return torch.zeros(self._n, self._d, dtype=torch.float16)
+
+
+def test_write_movie_cache_truncation_guard_fires(tmp_path):
+    """A per-chunk truncation (fixed frames regardless of chunk length) must trip
+    the frame-count invariant: a 65 s movie chunks to 3 windows → 300 frames, but
+    65 s × 50 Hz ⇒ 3250 expected. Refuse to cache a broken frame↔time map."""
+    fe = _FixedFramesExtractor(frames_per_chunk=100, d=8)
+    with pytest.raises(RuntimeError, match="truncated/dropped"):
+        write_movie_cache(fe, _movie_wav(65.0), WHISPER_SR, "trunc", tmp_path)  # type: ignore[arg-type]
+
+
+def test_write_movie_cache_detects_corrupt_save(whisper_tiny, tmp_path, monkeypatch):
+    """If the on-disk .pt reloads a different shape than what was written (a
+    truncated/corrupt save from OOM or a full disk), the post-save reload check
+    must raise rather than record a bad entry as valid."""
+    model, proc = whisper_tiny
+    fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+    real_save = torch.save
+
+    def corrupt_save(payload, path, *a, **k):
+        bad = dict(payload)
+        bad["features"] = payload["features"][:1]  # truncate the saved stream
+        real_save(bad, path, *a, **k)
+
+    monkeypatch.setattr(torch, "save", corrupt_save)
+    try:
+        with pytest.raises(RuntimeError, match="truncated/corrupt"):
+            write_movie_cache(fe, _movie_wav(5.0), WHISPER_SR, "corrupt", tmp_path)
+    finally:
+        fe.close()

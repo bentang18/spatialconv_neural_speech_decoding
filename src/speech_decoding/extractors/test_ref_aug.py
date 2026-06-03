@@ -180,6 +180,19 @@ def test_ref_aug_multi_stft_view_validates_ref_modes() -> None:
         )
 
 
+def test_ref_aug_multi_stft_view_rejects_session_robust_z() -> None:
+    """BUG #3 guard: the ref-aug sister overrides ``_get_timed_array`` and never
+    applies C3 robust-z, so ``session_robust_z=True`` would silently emit
+    un-normalized features. It must fail loud at construction instead (stats are
+    fit on the un-re-referenced recording — wiring needs a fit-on-reffed
+    decision first)."""
+    with pytest.raises(NotImplementedError, match="session_robust_z"):
+        RefAugMultiStftView(
+            event_types="Ieeg", car="shaft", notch_filter=60.0,
+            session_robust_z=True,
+        )
+
+
 def test_ref_aug_multi_stft_view_no_ref_aug_sister_passes_shaft_car_only(
     monkeypatch,
 ) -> None:

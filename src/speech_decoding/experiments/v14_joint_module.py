@@ -210,6 +210,7 @@ class V14JointBrainModule(pl.LightningModule):
         predictor: tp.Optional[JepaPredictor] = None,
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
+        frontend_lr_scale: float = 0.1,
     ) -> None:
         super().__init__()
         # B30 sister-flag runtime gates. Drift row B30-dispatch-sister-flags
@@ -234,6 +235,15 @@ class V14JointBrainModule(pl.LightningModule):
             raise ValueError(f"ema_tau must be in (0.0, 1.0); got {ema_tau}")
         if phase not in tp.get_args(_Phase):
             raise ValueError(f"phase={phase!r} not in {tp.get_args(_Phase)}")
+        # B36 WS-E E2 hyperparameter (P2 only). 0.0 = R-p2-freeze-frontend
+        # (front-end frozen, parcel side trains alone); 0.1 = base/10 default;
+        # 0.2 = R-p2-frontend-lr-5 (base/5). >1.0 would let the pretrained
+        # front-end out-pace the fresh parcel side — rejected.
+        if not 0.0 <= frontend_lr_scale <= 1.0:
+            raise ValueError(
+                "frontend_lr_scale must lie in [0.0, 1.0]; got "
+                f"{frontend_lr_scale}"
+            )
         # 6/03 masking lock: mask shape ↔ predictor scope must move as a pair,
         # or the M4 SSL task leaks (time_block+cross_time = the H1 leak). Cheap
         # insurance at construction, before any step runs.
@@ -274,6 +284,16 @@ class V14JointBrainModule(pl.LightningModule):
         self._m_sub_slots = encoder.m_sub_slots
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
+        self._frontend_lr_scale = frontend_lr_scale
+
+        # R-p2-freeze-frontend falsifier: a 0.0 scale freezes the
+        # P1-pretrained front-end in P2 so the parcel side + predictor train
+        # alone (front-end gets no update and is dropped from the optimizer).
+        # P1 is unaffected — there the front-end is the only trained group.
+        if self._phase == "p2" and self._frontend_lr_scale == 0.0:
+            frontend, _parcel = self.student.encoder.partition_parameters_for_staging()
+            for p in frontend:
+                p.requires_grad_(False)
 
         # MON-GRAD-SPIKE-DIVERGENCE persistent EMA buffer. ``0.0`` seeds
         # the first step (the monitor skips spike detection until the
@@ -863,12 +883,6 @@ class V14JointBrainModule(pl.LightningModule):
         # internally; coeff is fixed at τ=0.99925 under the B26 lock.
         self.teacher.update_from(self.student)
 
-    # B36 WS-E (E2): discriminative-LR factor for the front-end param group
-    # in P2. The front-end was pretrained in P1, so it rides at base_lr/10
-    # while the freshly-trained pool / inter-parcel encoder / predictor get
-    # the full base LR (B36 §7 "front-end @ LR/10; discriminative unfreeze").
-    _FRONTEND_LR_SCALE: tp.ClassVar[float] = 0.1
-
     def _phase_param_groups(self) -> list[tp.Any]:
         """Phase-conditional optimizer parameters (B36 WS-E, E1/E2).
 
@@ -877,19 +891,25 @@ class V14JointBrainModule(pl.LightningModule):
           encoder / predictor are already grad-free; excluding them from the
           optimizer makes "front-end only" the explicit, update-level
           contract (no stray weight-decay drift on a grad-free param).
-        * **P2** — two param groups (E2): the front-end at ``base_lr / 10``
-          and the parcel side + the student predictor at the full base LR.
+        * **P2** — discriminative LR (E2). The front-end (pretrained in P1)
+          rides at ``base_lr · frontend_lr_scale`` (default 0.1 = base/10)
+          while the parcel side + the student predictor get the full base LR.
+          ``frontend_lr_scale`` is a hyperparameter: 0.2 = R-p2-frontend-lr-5,
+          0.0 = R-p2-freeze-frontend (the front-end is frozen in ``__init__``
+          and dropped from the optimizer → a single parcel-side group).
           PyTorch reads each group's ``lr`` as its ``base_lr``, so a
-          downstream scheduler scales both proportionally and the 10:1 ratio
-          holds for the whole run.
+          downstream scheduler scales every group proportionally.
         """
         frontend, parcel = self.student.encoder.partition_parameters_for_staging()
         if self._phase == "p1":
             return frontend
         predictor_params = list(self.predictor.parameters())
         base_lr = self._base_lr()
+        if self._frontend_lr_scale == 0.0:
+            # R-p2-freeze-frontend: front-end frozen above → one base-LR group.
+            return [{"params": parcel + predictor_params}]
         return [
-            {"params": frontend, "lr": base_lr * self._FRONTEND_LR_SCALE},
+            {"params": frontend, "lr": base_lr * self._frontend_lr_scale},
             {"params": parcel + predictor_params},
         ]
 

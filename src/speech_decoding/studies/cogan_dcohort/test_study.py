@@ -9,7 +9,8 @@ from speech_decoding.studies.cogan_dcohort.study import DCohortStudy
 
 
 def test_dcohort_imports_with_sample_rate_classvar() -> None:
-    assert DCohortStudy.SAMPLE_RATE_HZ == 2000.0
+    # v14 canonical resample target; native rate is mixed (mostly 2048).
+    assert DCohortStudy.SAMPLE_RATE_HZ == 2048.0
     assert "DCohort" in DCohortStudy.aliases
 
 
@@ -19,15 +20,16 @@ def test_dcohort_mains_notch_is_60_hz_us_site() -> None:
 
 
 def test_dcohort_valid_bin_range_is_full_30_bins() -> None:
-    """SCAFFOLD-04: 2000 Hz acquisition → 1000 Hz Nyquist → all 30 v14
+    """SCAFFOLD-04: resampled to 2048 Hz → 1024 Hz Nyquist → all 30 v14
     filterbank bins valid → half-open (0, 30)."""
     assert DCohortStudy.VALID_BIN_RANGE == (0, 30)
 
 
-def test_dcohort_85_subjects_from_phase2_audit() -> None:
-    """SCAFFOLD-04 + project_d_cohort_phase2_cohort_audit_2026_05_23:
-    85 / 87 D-pts pass FS + RAS + .fif gate."""
-    assert DCohortStudy.N_UNIQUE_PATIENTS == 85
+def test_dcohort_87_subjects_from_inventory() -> None:
+    """SCAFFOLD-04 + project_d_cohort_data_inventory_2026_06_03:
+    87 / 87 speech-subset D-pts pass FS + RAS + .fif gate (D107/D139 earlier
+    mis-flagged — recons live under suffix variants D107A/B, D139A/B)."""
+    assert DCohortStudy.N_UNIQUE_PATIENTS == 87
 
 
 @pytest.mark.parametrize(

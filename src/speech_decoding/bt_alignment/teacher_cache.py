@@ -83,6 +83,26 @@ class TeacherCacheEntry:
     out_path: str
 
 
+# Whisper's encoder is architecturally fixed at a 30 s receptive window (1500
+# frames @ 50 Hz); the mel front-end pads/crops every input to 30 s. Feeding a
+# whole movie at once therefore SILENTLY truncates to its first 30 s. The
+# whole-movie cache (write_movie_cache) chunks on this exact grid so each full
+# chunk emits exactly round(30 × 50) = 1500 frames and the dense stream's frame
+# f maps to movie-clock time f / rate_hz with no drift.
+WHISPER_ENCODER_WINDOW_S: float = 30.0
+
+
+@dataclass
+class MovieCacheEntry:
+    movie: str
+    rate_hz: int
+    n_frames: int
+    d_model: int
+    duration_s: float
+    chunk_s: float
+    out_path: str
+
+
 class WhisperFeatureExtractor:
     """Wraps a transformers Whisper model and forward hooks to grab encoder
     layer outputs, then merges them. Designed for batch-of-1 inference (one
@@ -136,9 +156,14 @@ class WhisperFeatureExtractor:
         inputs = self.processor(
             wav, sampling_rate=sample_rate, return_tensors="pt"
         )
+        # Move the mel input to the model's device so the same code path runs on
+        # a GPU node (large-v3) and on a CPU laptop (tiny smoke). No-op when the
+        # model is on CPU — the unit tests exercise that branch.
+        device = next(self.model.parameters()).device
+        input_features = inputs.input_features.to(device)
         self._captures.clear()
         with torch.no_grad():
-            self.model.model.encoder(inputs.input_features)
+            self.model.model.encoder(input_features)
         if len(self._captures) != len(self._layers):
             raise RuntimeError(
                 f"hooks captured {len(self._captures)}/{len(self._layers)} layers"
@@ -218,6 +243,124 @@ def write_clip_cache(
     return TeacherCacheEntry(
         clip_id=clip_id, film=film, t0_movie_s=float(t0_movie_s),
         rate_hz=rate_hz, n_frames=int(feat.shape[0]), d_model=int(feat.shape[1]),
+        out_path=str(out_path),
+    )
+
+
+def write_movie_cache(
+    feature_extractor: WhisperFeatureExtractor,
+    wav: np.ndarray,
+    sample_rate: int,
+    movie: str,
+    out_dir: Path,
+    chunk_s: float = WHISPER_ENCODER_WINDOW_S,
+    rate_hz: int = DEFAULT_TEACHER_HZ,
+) -> MovieCacheEntry:
+    """Encode a WHOLE movie into one dense ``(T, d)`` teacher stream at ``rate_hz``.
+
+    The whole-movie form (vs the per-clip :func:`write_clip_cache`): run Whisper
+    ONCE per movie over consecutive ``chunk_s`` grid windows and concatenate, so
+    every training clip — at any ``t0_movie_s``, any Δlag, any sampler — is a
+    free slice ``dense[round(t0 × rate_hz) : +round(clip_s × rate_hz)]`` of this
+    stream, and the cost is shared across every subject/trial that watched the
+    movie. The dense frame ``f`` maps to movie-clock time ``f / rate_hz``.
+
+    Why chunk (not feed the whole movie): Whisper's encoder is fixed at a
+    ``WHISPER_ENCODER_WINDOW_S`` (30 s) receptive window — the mel front-end
+    pads/crops every input to 30 s, so a single forward over a 90-minute movie
+    would silently keep only its first 30 s. We chunk on a 30 s grid (the
+    encoder's native window, giving every frame full in-window context) so each
+    full chunk emits exactly ``round(chunk_s × rate_hz)`` real frames and the
+    frame↔time map carries no drift across chunks.
+
+    Boundary caveat (flagged, accepted per the grid-aligned directive): a clip
+    whose window straddles a chunk seam draws its teacher frames from two
+    separate passes, each context-truncated at the seam. The ``R-teacher-overlap``
+    falsifier (overlapping windows, keep center) is the fallback if seam effects
+    surface.
+
+    Path keyed by model + layer-merge exactly like :func:`write_clip_cache`
+    (``out_dir/<model_slug>/<merge_slug>/<movie>.pt``) so two target-defining
+    configs can never land in one file. Features fp16, like the per-clip cache.
+    """
+    import torch
+
+    if sample_rate != WHISPER_SR:
+        raise ValueError(f"Whisper expects {WHISPER_SR} Hz, got {sample_rate}")
+    if wav.ndim != 1:
+        raise ValueError(f"expected mono 1-D waveform, got shape {wav.shape}")
+    chunk_samples = int(round(chunk_s * sample_rate))
+    if chunk_samples <= 0:
+        raise ValueError(f"chunk_s {chunk_s} × sr {sample_rate} → non-positive chunk")
+
+    feats: list[Tensor] = []
+    for start in range(0, len(wav), chunk_samples):
+        chunk = wav[start : start + chunk_samples]
+        feat = feature_extractor.extract(chunk, sample_rate)  # (n_real, d) fp16
+        if feat.shape[0] > 0:
+            feats.append(feat)
+    if not feats:
+        raise ValueError(f"movie {movie!r}: no frames extracted (empty waveform?)")
+    dense = torch.cat(feats, dim=0)  # (T, d) fp16
+
+    # Frame-count invariant (truncation guard — the headline silent-corruption
+    # mode). For 30 s grid chunking at the fixed enc rate, dense frames ==
+    # round(duration_s × rate_hz) EXACTLY: each full chunk emits
+    # round(chunk_s × rate_hz) frames, k·(that) is integer, so the per-chunk
+    # rounds sum to the whole-movie round. A mismatch means a chunk silently
+    # truncated to its first 30 s (the exact trap this design exists to avoid),
+    # a chunk got dropped, or enc rate ≠ rate_hz. Fail loud — never cache a
+    # teacher stream whose frame↔movie-clock map is wrong (that would slice the
+    # P3 target off-target, undetectably).
+    duration_s = len(wav) / float(sample_rate)
+    expected_frames = round(duration_s * rate_hz)
+    if int(dense.shape[0]) != expected_frames:
+        raise RuntimeError(
+            f"movie {movie!r}: dense has {dense.shape[0]} frames but "
+            f"{duration_s:.3f}s × {rate_hz}Hz ⇒ {expected_frames} expected — "
+            f"a chunk truncated/dropped or enc rate ≠ {rate_hz}Hz. Refusing to "
+            f"cache a teacher stream with a broken frame↔time map."
+        )
+
+    model_name = feature_extractor.model.name_or_path
+    if not model_name:
+        raise ValueError(
+            "feature_extractor.model has no name_or_path; cannot key the cache "
+            "by model. Load the Whisper model via from_pretrained(...)."
+        )
+    layer_merge = feature_extractor.layer_merge
+    merge_slug = "mean_all" if layer_merge == "mean_all" else f"L{int(layer_merge)}"
+    movie_dir = out_dir / model_name.replace("/", "_") / merge_slug
+    movie_dir.mkdir(parents=True, exist_ok=True)
+    out_path = movie_dir / f"{movie}.pt"
+    torch.save({
+        "features": dense,
+        "rate_hz": rate_hz,
+        "t0_movie_s": 0.0,  # dense stream starts at the movie origin
+        "duration_s": float(duration_s),
+        "chunk_s": float(chunk_s),
+        "movie": movie,
+        "model": model_name,
+        "layer_merge": layer_merge,
+    }, out_path)
+
+    # Re-open the just-written file (mmap = header read, no full materialize) and
+    # confirm shape/dtype survived the write. Guards a truncated/corrupt .pt from
+    # an OOM or full disk mid-save being recorded as a valid cache entry — a
+    # downstream torch.load would then silently slice the wrong region.
+    reloaded = torch.load(out_path, map_location="cpu", mmap=True, weights_only=False)
+    rf = reloaded["features"]
+    if tuple(rf.shape) != tuple(dense.shape) or rf.dtype != torch.float16:
+        raise RuntimeError(
+            f"movie {movie!r}: cache reloads as shape {tuple(rf.shape)} dtype "
+            f"{rf.dtype}, expected {tuple(dense.shape)} float16 — write was "
+            f"truncated/corrupt ({out_path})."
+        )
+
+    return MovieCacheEntry(
+        movie=movie, rate_hz=rate_hz,
+        n_frames=int(dense.shape[0]), d_model=int(dense.shape[1]),
+        duration_s=float(duration_s), chunk_s=float(chunk_s),
         out_path=str(out_path),
     )
 

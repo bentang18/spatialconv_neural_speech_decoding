@@ -304,6 +304,50 @@ def test_3b_param_groups_three_groups_discriminative_lr() -> None:
     assert enc_in_groups == {id(p) for p in module.encoder.parameters()}
 
 
+def test_3b_lr_scales_are_hyperparameters() -> None:
+    # The 3b ratios are configurable; R-3b-lr-uniform (1.0/1.0) is one point.
+    base_lr = 1e-3
+    module = V14Phase3DistillModule(
+        encoder=_make_tiny_encoder(),
+        optim_config=_optim_config(base_lr),
+        stage="3b",
+        pma_n_heads=4,
+        frontend_lr_scale=0.2,
+        parcel_lr_scale=0.5,
+    )
+    frontend_g, parcel_g, connector_g = module._phase_param_groups()
+    assert frontend_g["lr"] == pytest.approx(base_lr * 0.2)
+    assert parcel_g["lr"] == pytest.approx(base_lr * 0.5)
+    assert connector_g["lr"] == pytest.approx(base_lr)
+
+
+def test_3b_frontend_frozen_falsifier_drops_group_and_freezes() -> None:
+    # R-3b-frontend-frozen: 0.0 front-end scale freezes the front-end and
+    # drops its group (parcel + connector remain).
+    base_lr = 1e-3
+    module = V14Phase3DistillModule(
+        encoder=_make_tiny_encoder(),
+        optim_config=_optim_config(base_lr),
+        stage="3b",
+        pma_n_heads=4,
+        frontend_lr_scale=0.0,
+    )
+    frontend, parcel = module.encoder.partition_parameters_for_staging()
+    assert all(not p.requires_grad for p in frontend)
+    assert all(p.requires_grad for p in parcel)
+    groups = module._phase_param_groups()
+    assert len(groups) == 2
+    parcel_g, connector_g = groups
+    assert parcel_g["lr"] == pytest.approx(base_lr / 3.0)
+    assert connector_g["lr"] == pytest.approx(base_lr)
+
+
+def test_3b_lr_scale_out_of_range_raises() -> None:
+    for kw in ({"frontend_lr_scale": 1.5}, {"parcel_lr_scale": -0.1}):
+        with pytest.raises(ValueError, match="lr_scale"):
+            _make_module(stage="3b", **kw)
+
+
 # ---------------------------------------------------------------------------
 # 8 Hz rate-match guard
 # ---------------------------------------------------------------------------

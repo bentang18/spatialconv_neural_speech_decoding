@@ -109,7 +109,7 @@ Frozen architecture at PS pause = `per_cell + partialconv + pe2d + hierarchical_
 - [ ] **Laplacian / bipolar reference variant for D-cohort?** Box has CAR / WM / M1 / STG / HIPP / LING. BT cross-subject baseline uses Laplacian re-reference. Default to CAR if no clear match.
 - [ ] **MFA / TextGrid / production-WAV location for D-cohort.** `SCRIPTS_USAGE.md` references `D_Data/Phoneme_Sequencing/` not visible at `/datacommons/coganlab/D_Data/` on DCC. If absent, stay continuous-corpus / SSL-only on D side.
 
-Stage-3 prep status: 11/11 tasks landed 2026-04-24 (per `memory/project_seeg_stage3_prep_inflight_2026_04_24.md`). 87 D-pts / 180.59 h corpus on disk. Ready to consume on resume.
+Stage-3 prep status: 11/11 tasks landed 2026-04-24 (per `memory/project_seeg_stage3_prep_inflight_2026_04_24.md`). 87 D-pts / 180.59 h is the **4-speech-task subset**; the full D-cohort is **113 D-pts / 384.7 h across 14 BIDS tasks** (134 have recons) — re-derived 2026-06-03, `memory/project_d_cohort_data_inventory_2026_06_03.md`. Ready to consume on resume.
 
 ### Backlog (deferred to later stages)
 

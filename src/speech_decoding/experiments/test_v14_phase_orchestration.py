@@ -51,12 +51,15 @@ _ENC_KW = dict(
 _BASE_LR = 1e-3
 
 
-def _module(phase: str, *, seed: int = 0) -> V14JointBrainModule:
+def _module(
+    phase: str, *, seed: int = 0, frontend_lr_scale: float = 0.1,
+) -> V14JointBrainModule:
     torch.manual_seed(seed)
     return V14JointBrainModule(
         encoder=V14ParcelPerceiverModel(**_ENC_KW),
         optim_config=LightningOptimizer(optimizer=AdamW(lr=_BASE_LR)),
         phase=phase,
+        frontend_lr_scale=frontend_lr_scale,
     )
 
 
@@ -126,6 +129,48 @@ def test_e2_p2_frontend_group_holds_exactly_the_frontend_params() -> None:
     # The parcel group is the encoder-parcel params PLUS the predictor.
     expected_parcel = {id(p) for p in parcel} | {id(p) for p in m.predictor.parameters()}
     assert parcel_group_ids == expected_parcel
+
+
+def test_e2_p2_frontend_lr_scale_is_a_hyperparameter() -> None:
+    # R-p2-frontend-lr-5: scale 0.2 → front-end at base/5, ratio 5:1.
+    m = _module("p2", frontend_lr_scale=0.2)
+    opt = _opt(m)
+    assert len(opt.param_groups) == 2
+    front_lr, parcel_lr = opt.param_groups[0]["lr"], opt.param_groups[1]["lr"]
+    assert front_lr == pytest.approx(_BASE_LR * 0.2)
+    assert parcel_lr == pytest.approx(_BASE_LR)
+    assert parcel_lr / front_lr == pytest.approx(5.0)
+
+
+def test_e2_p2_frontend_frozen_falsifier_single_group() -> None:
+    # R-p2-freeze-frontend: scale 0.0 → front-end frozen + dropped from the
+    # optimizer, leaving one base-LR group over the parcel side + predictor.
+    m = _module("p2", frontend_lr_scale=0.0)
+    frontend, parcel = m.student.encoder.partition_parameters_for_staging()
+    assert all(not p.requires_grad for p in frontend)
+    assert all(p.requires_grad for p in parcel)
+    opt = _opt(m)
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["lr"] == pytest.approx(_BASE_LR)
+    group_ids = {id(p) for p in opt.param_groups[0]["params"]}
+    expected = {id(p) for p in parcel} | {id(p) for p in m.predictor.parameters()}
+    assert group_ids == expected
+
+
+def test_e2_p2_frontend_frozen_backward_leaves_frontend_grad_free() -> None:
+    # The frozen front-end gets no gradient; the parcel side still trains.
+    m = _module("p2", frontend_lr_scale=0.0)
+    loss = m._step(_synthetic_batch()).total
+    loss.backward()
+    frontend, parcel = m.student.encoder.partition_parameters_for_staging()
+    assert all(p.grad is None for p in frontend)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in parcel)
+
+
+def test_e2_frontend_lr_scale_out_of_range_raises() -> None:
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match="frontend_lr_scale"):
+            _module("p2", frontend_lr_scale=bad)
 
 
 def test_partition_raises_on_unassigned_param() -> None:

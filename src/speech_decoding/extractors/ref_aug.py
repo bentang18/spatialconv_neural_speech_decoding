@@ -193,6 +193,21 @@ class RefAugMultiStftView(MultiStftView):
     def model_post_init(self, log__):
         super().model_post_init(log__)
         _validate_ref_modes(self.ref_modes)
+        if self.session_robust_z:
+            # Fail loud rather than silently un-normalize: this subclass
+            # overrides ``_get_timed_array`` and never calls
+            # ``_apply_session_robust_z``. Wiring it is not a one-line add — the
+            # fit reads the session's UN-re-referenced recording (via
+            # ``_get_data``) but each clip is re-referenced per draw, so applying
+            # those stats is a distribution mismatch. Resolve fit-on-reffed vs
+            # fit-on-unreffed before enabling C3 on the ref-aug sister.
+            raise NotImplementedError(
+                "RefAugMultiStftView does not support session_robust_z=True: "
+                "robust-z stats are fit on the un-re-referenced recording but "
+                "ref-aug re-references each clip (distribution mismatch). Set "
+                "session_robust_z=False on the ref-aug sister, or wire the "
+                "fit-on-reffed path first (REF-01 / C3)."
+            )
 
     def _apply_ref_operator(
         self,

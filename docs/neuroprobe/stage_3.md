@@ -90,7 +90,7 @@ Stage 3 requires **paired stimulus** (audio + transcripts time-aligned to neural
 | Auditory Naming ds006234 | 119+ | — | Single-word naming + audio | Whisper-acoustic / -speech only; language-level degenerate (single word) |
 
 **Production-corpus subset** (own-speech audio, no external visual stimulus):
-- Internal Cogan D-cohort (Tier 2: 87 D-pts, 180 h) — Whisper-acoustic / -speech extractable from spoken-word audio. Limited Stage-3 value — single-CVC-token utterances make Whisper-decoder / language targets degenerate. Stays primarily Stage-2 SSL fuel.
+- Internal Cogan D-cohort (Tier 2: 87 D-pts, 180 h — the 4-speech-task subset of a larger 113-pt / 384.7 h / 14-task D-cohort; `memory/project_d_cohort_data_inventory_2026_06_03.md`) — Whisper-acoustic / -speech extractable from spoken-word audio. Limited Stage-3 value — single-CVC-token utterances make Whisper-decoder / language targets degenerate. Stays primarily Stage-2 SSL fuel.
 - Verwoert 2022 ds003194 (10 sEEG, Dutch read-aloud + 48 kHz mic), Bouchard-Chang DANDI 000019 (4 HD ECoG, CV syllables), Du-IN (12 sEEG, Mandarin 61-word).
 
 **Watch-list (paper-only, monitor for release)** — would transformatively scale Stage 3 if any opens up:

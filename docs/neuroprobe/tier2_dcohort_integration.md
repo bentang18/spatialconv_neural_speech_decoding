@@ -2,6 +2,8 @@
 
 *Drafted 2026-04-25. Sibling to `plan.md` (Tier-2 of the pretraining corpus). Live until Tier 2 either submits or is abandoned.*
 
+> **⚠️ SUPERSEDED 2026-06-03 — do not use for current integration.** This doc's core proposal (recipe (a): run the Cogan **HG @ 200 Hz** envelope recipe on raw, **BNA** atlas routing, "Tier" framing) predates the NeuroAI reset. v14's active front-end is **Multi-STFT on raw voltage** (not HG envelope) and the active atlas is **DK** (`aparc+aseg`, present directly in the recons — not BNA, which is now a gated P1 ablation). Several data facts here are also stale: native rate is **mixed, mostly 2048 Hz** (not a flat 2000 Hz EDF); the 180.59 h / 87 D-pts is the **4-speech-task subset** of a 113-pt / 384.7 h / 14-task inventory. Current state: D-cohort is BrainTreebank-shaped, loaders template off `studies/braintreebank/`. Canonical inventory: `memory/project_d_cohort_data_inventory_2026_06_03.md`; build plan: `docs/neuroprobe/b36_implementation_plan.md`. Kept for the pipeline-diff reasoning only.
+
 This doc plans how to fold our 180.59 h Cogan sEEG D-cohort into the Neuroprobe hillclimb after Tier 1 (BrainTreebank-only) clears Linear (0.539). The hard part is not "more data" — it's making the two corpora live in the same input distribution. The sensors are identical (depth sEEG, ~3 mm DIXI inter-contact). The preprocessing pipelines are not.
 
 The Tier-2 entry condition is unchanged from `plan.md`: only attempt this after Tier-1 SSL clears the Linear (Lap+spec) baseline of 0.539 cross-subject.

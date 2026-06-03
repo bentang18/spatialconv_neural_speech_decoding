@@ -87,6 +87,79 @@ def test_dispatch_default_clip_len_is_5s(tmp_path, monkeypatch) -> None:
     assert xp.data.segmenter.duration == 5.0
 
 
+def test_b36_default_neural_lag_is_zero_1to1_baseline(tmp_path, monkeypatch) -> None:
+    """Δlag default = 0.0: the 1:1 stimulus-onset baseline / falsifier null.
+    The segmenter clip ``start`` is 0.0 so the neural clip begins exactly at
+    the word onset (current behavior)."""
+    assert dispatch_v14.DEFAULT_NEURAL_LAG_S == 0.0
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp.data.segmenter.start == 0.0
+
+
+def test_b36_neural_lag_threads_to_segmenter_start(tmp_path, monkeypatch) -> None:
+    """A non-zero Δlag slides the neural clip ``start`` forward by that lag
+    (joint/SSL path) so the lagged response aligns to the stimulus-time
+    teacher. The teacher cache is audio-keyed and untouched — a lag sweep is a
+    pure re-slice, no recache."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, neural_lag_s=0.15,
+    )
+    assert xp.data.segmenter.start == 0.15
+    # duration (clip window) is unchanged — only the start offset moves.
+    assert xp.data.segmenter.duration == dispatch_v14.DEFAULT_CLIP_LEN_S
+
+
+def test_b36_neural_lag_out_of_range_raises(tmp_path, monkeypatch) -> None:
+    """Δlag must be causal and bounded: negative (acausal — neural window
+    before the stimulus) and > 1 s (unphysical) both raise."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    # match= pins the RANGE guard specifically (not the P4 supervised guard,
+    # which also mentions "neural_lag_s").
+    with pytest.raises(ValueError, match=r"must lie in \[0\.0, 1\.0\]"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, neural_lag_s=-0.05,
+        )
+    with pytest.raises(ValueError, match=r"must lie in \[0\.0, 1\.0\]"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, neural_lag_s=1.5,
+        )
+
+
+def test_b36_neural_lag_rejected_on_supervised_p4_path(tmp_path, monkeypatch) -> None:
+    """A non-zero Δlag on the supervised Phase-4 path raises: it WOULD shift the
+    probe window, breaking the leaderboard-parity [onset, onset+1 s] window."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    # match= pins the SUPERVISED-P4 guard specifically ("joint_phase=False"
+    # never appears in the range-check message).
+    with pytest.raises(ValueError, match=r"joint_phase=False"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=False, neural_lag_s=0.15,
+        )
+
+
+def test_b36_neural_lag_cli_arg_parses() -> None:
+    """The ``--neural-lag-s`` CLI flag exists, defaults to the 0.0 baseline, and
+    parses an explicit lag through to ``args.neural_lag_s`` (covers the argparse
+    wiring + ``main`` build-call that the builder-level tests above skip)."""
+    parser = dispatch_v14._parser()
+    assert parser.parse_args([]).neural_lag_s == dispatch_v14.DEFAULT_NEURAL_LAG_S
+    assert parser.parse_args([]).neural_lag_s == 0.0
+    assert parser.parse_args(["--neural-lag-s", "0.15"]).neural_lag_s == 0.15
+
+
+def test_b36_neural_lag_inclusive_upper_bound_accepted(tmp_path, monkeypatch) -> None:
+    """The range is INCLUSIVE [0.0, 1.0]: the 1.0 s upper edge is accepted and
+    threads through to the segmenter (guards a ``<=`` → ``<`` mutation that
+    would reject the boundary)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, neural_lag_s=1.0,
+    )
+    assert xp.data.segmenter.start == 1.0
+
+
 def test_c4_hpf_0_5hz_removes_dc_and_slow_drift_keeps_passband() -> None:
     """WS-C / C4: the dispatch wires ``filter=(0.5, None)`` → ``raw.filter(0.5,
     None)`` (MNE default FIR HPF). Faithful spec of THAT filter:

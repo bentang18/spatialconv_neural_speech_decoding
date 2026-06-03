@@ -32,17 +32,21 @@ from speech_decoding.whisper_ceiling.extract import (
 
 # Mirror of upstream BRAINTREEBANK_SUBJECT_TRIAL_MOVIE_NAME_MAPPING entries we need.
 # Hard-coded here so the script imports without ROOT_DIR_BRAINTREEBANK.
+# VERIFIED 2026-06-02 against .cache/neuroprobe_upstream/neuroprobe/config.py
+# (authoritative). The prior hand-typed dict had 6 wrong values — (2,4)/(2,5),
+# (6,1), (8,0)/(9,0), (10,1) — which mispaired wrong-movie audio+labels.
 SUBJECT_TRIAL_MOVIE = {
     (1, 0): "fantastic-mr-fox", (1, 1): "the-martian", (1, 2): "thor-ragnarok",
     (2, 0): "venom", (2, 1): "spider-man-3-homecoming",
     (2, 2): "guardians-of-the-galaxy", (2, 3): "guardians-of-the-galaxy-2",
-    (2, 4): "black-panther", (2, 5): "avengers-infinity-war", (2, 6): "aquaman",
+    (2, 4): "avengers-infinity-war", (2, 5): "black-panther", (2, 6): "aquaman",
     (3, 0): "cars-2", (3, 1): "lotr-1", (3, 2): "lotr-2",
     (4, 0): "shrek-the-third", (4, 1): "megamind", (4, 2): "incredibles",
     (5, 0): "fantastic-mr-fox",
-    (6, 0): "megamind", (6, 1): "coraline", (6, 4): "coraline",
+    (6, 0): "megamind", (6, 1): "toy-story", (6, 4): "coraline",
     (7, 0): "cars-2", (7, 1): "megamind",
-    (8, 0): "ant-man", (9, 0): "toy-story", (10, 0): "cars-2", (10, 1): "ant-man",
+    (8, 0): "sesame-street-episode-3990", (9, 0): "ant-man",
+    (10, 0): "cars-2", (10, 1): "spider-man-far-from-home",
 }
 
 

@@ -402,3 +402,397 @@ def test_log_stft_view_n_time_bins_for_duration_matches_17_at_1s() -> None:
     emits 17 frames for a 1-s window — the historical ``DEFAULT_N_TIME_BINS``."""
     view = LogStftView(event_types="Ieeg", car="shaft")
     assert view.n_time_bins_for_duration(1.0) == 17
+
+
+# ---------------------------------------------------------------------------
+# C3 (WS-C, B13): session-level robust-z wired into MultiStftView
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_stft_view(**kw):
+    from speech_decoding.extractors.view import MultiStftView
+
+    base = dict(event_types="Ieeg", car="shaft", notch_filter=60.0, apply_log=False)
+    base.update(kw)
+    return MultiStftView(**base)
+
+
+def test_c3_session_robust_z_default_off_leaves_output_unchanged(monkeypatch) -> None:
+    """Default ``session_robust_z=False`` → the view emits the raw filterbank,
+    byte-identical to ``_spec_from_waveform`` (regression guard: the capstone /
+    smoke path must be untouched)."""
+    from neuralset.base import TimedArray
+    from speech_decoding.extractors.reference import CARIeegExtractor
+
+    view = _make_multi_stft_view()  # session_robust_z defaults False
+    assert view.session_robust_z is False
+
+    rng = np.random.default_rng(3)
+    wf = rng.standard_normal((5, 2048)).astype(np.float32)
+    ta = TimedArray(frequency=2048.0, start=0.0, duration=1.0, data=wf)
+    monkeypatch.setattr(
+        CARIeegExtractor, "_get_timed_array",
+        lambda self, e, start, duration: ta, raising=False,
+    )
+
+    class _FakeEvent:
+        def _splittable_event_uid(self):
+            return "sess-A"
+
+    out = view._get_timed_array(_FakeEvent(), start=0.0, duration=1.0)
+    expected = view._spec_from_waveform(torch.from_numpy(wf), 2048)
+    np.testing.assert_allclose(out.data, expected.numpy(), rtol=0, atol=0)
+
+
+def test_c3_apply_uses_frozen_session_stats(monkeypatch) -> None:
+    """With stats fitted, ``_get_timed_array`` returns the normalizer-transformed
+    spec for the clip's session key."""
+    from neuralset.base import TimedArray
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+    from speech_decoding.extractors.reference import CARIeegExtractor
+
+    view = _make_multi_stft_view(session_robust_z=True)
+
+    rng = np.random.default_rng(11)
+    recording = rng.standard_normal((4, 8192)).astype(np.float32)
+    session_frames = view._spec_from_waveform(torch.from_numpy(recording), 2048)
+    norm = SessionRobustZNormalizer().fit(session_frames)
+    view._session_stats["sess-A"] = norm
+    view._stats_ready = True  # prepare() would set this; here we inject stats directly
+
+    clip = recording[:, :2048]
+    ta = TimedArray(frequency=2048.0, start=0.0, duration=1.0, data=clip)
+    monkeypatch.setattr(
+        CARIeegExtractor, "_get_timed_array",
+        lambda self, e, start, duration: ta, raising=False,
+    )
+
+    class _FakeEvent:
+        def _splittable_event_uid(self):
+            return "sess-A"
+
+    out = view._get_timed_array(_FakeEvent(), start=0.0, duration=1.0)
+    expected = norm.transform(view._spec_from_waveform(torch.from_numpy(clip), 2048))
+    np.testing.assert_allclose(out.data, expected.numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_c3_gain_invariance_rho_one(monkeypatch) -> None:
+    """C3 spec test: a pure ×k gain on a channel leaves the normalized clip
+    output unchanged (median and MAD both scale by k → cancel). Fit + apply the
+    full wired path at gain 1 and gain k; outputs must match (ρ=1)."""
+    from neuralset.base import TimedArray
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+    from speech_decoding.extractors.reference import CARIeegExtractor
+
+    rng = np.random.default_rng(23)
+    recording = rng.standard_normal((4, 8192)).astype(np.float32)
+    gains = np.array([1.0, 7.0, 0.2, 50.0], dtype=np.float32)[:, None]
+
+    def _normalized_clip(scale: float):
+        view = _make_multi_stft_view(session_robust_z=True)
+        rec = (recording * gains * scale).astype(np.float32)
+        frames = view._spec_from_waveform(torch.from_numpy(rec), 2048)
+        view._session_stats["s"] = SessionRobustZNormalizer().fit(frames)
+        view._stats_ready = True
+        clip = rec[:, :2048]
+        ta = TimedArray(frequency=2048.0, start=0.0, duration=1.0, data=clip)
+        monkeypatch.setattr(
+            CARIeegExtractor, "_get_timed_array",
+            lambda self, e, start, duration: ta, raising=False,
+        )
+
+        class _E:
+            def _splittable_event_uid(self):
+                return "s"
+
+        return view._get_timed_array(_E(), start=0.0, duration=1.0).data
+
+    base = _normalized_clip(1.0)
+    scaled = _normalized_clip(13.0)
+    # Per-channel gain already baked into both; the extra ×13 must wash out.
+    np.testing.assert_allclose(scaled, base, rtol=1e-4, atol=1e-4)
+
+
+def test_c3_chunked_fit_matches_whole_recording_fit(monkeypatch) -> None:
+    """The PRODUCTION ``_fit_session_robust_z`` chunked path must equal a single
+    whole-recording median/MAD fit, on NON-STATIONARY data.
+
+    This routes through the real ``_fit_session_robust_z`` (not an inline
+    re-implementation of the concat), on a recording with per-second gain wobble
+    + slow offset drift, so a fit that takes the median PER CHUNK and averages
+    (instead of concatenating all time then taking one median) diverges sharply
+    (≳100% on non-stationary input) and is caught. The only legitimate
+    difference vs a single STFT is the handful of ``center=True`` reflect-pad
+    frames at each 60-s chunk seam (<0.5% of frames)."""
+    import types
+
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+    from speech_decoding.extractors.view import MultiStftView
+
+    view = _make_multi_stft_view(session_robust_z=True)  # chunk_s defaults 60.0
+    ch = ["e0", "e1", "e2"]
+    rng = np.random.default_rng(31)
+    n = 2048 * 300  # 300 s → 5 chunks at the 60-s default
+    t = (np.arange(n, dtype=np.float32) / 2048.0)
+    base = rng.standard_normal((3, n)).astype(np.float32)
+    # Strong non-stationarity: slow per-channel gain wobble + offset drift, so
+    # per-chunk statistics differ materially from the whole-recording statistic.
+    gain = (1.0 + 0.5 * np.sin(2 * np.pi * t / 90.0))[None, :]
+    offset = (4.0 * np.tanh(t / 120.0))[None, :]
+    rec = (base * gain + offset).astype(np.float32)
+
+    class _E:
+        start = 0.0
+
+        def _splittable_event_uid(self):
+            return "s"
+
+    def _fake_get_data(self, evs):
+        for _e in evs:
+            yield types.SimpleNamespace(
+                frequency=2048.0, data=rec, ch_names=list(ch),
+            )
+
+    monkeypatch.setattr(
+        MultiStftView, "_get_data",
+        property(lambda self: types.MethodType(_fake_get_data, self)), raising=False,
+    )
+    monkeypatch.setattr(
+        MultiStftView, "_event_types_helper",
+        property(lambda self: types.SimpleNamespace(extract=lambda obj: obj)),
+        raising=False,
+    )
+    view._channels.update({c: i for i, c in enumerate(ch)})  # global == session here
+    view._fit_session_robust_z([_E()])  # the real chunked path + global scatter
+    got = view._session_stats["s"]
+
+    # Independent reference: one STFT over the whole recording, one median/MAD.
+    whole = view._spec_from_waveform(torch.from_numpy(rec), 2048)
+    ref = SessionRobustZNormalizer(sigma_floor=view.session_z_sigma_floor).fit(whole)
+
+    sw = ref.sigma.squeeze(-1).numpy()
+    valid = sw > 1e-3
+    np.testing.assert_allclose(
+        got.median.squeeze(-1).numpy()[:3][valid],
+        ref.median.squeeze(-1).numpy()[valid],
+        rtol=0.05, atol=0.05,
+    )
+    np.testing.assert_allclose(
+        got.sigma.squeeze(-1).numpy()[:3][valid], sw[valid], rtol=0.05, atol=0.05,
+    )
+
+
+def test_c3_missing_session_stats_raises(monkeypatch) -> None:
+    """Fail loud: ``session_robust_z=True`` but no fitted stats for the clip's
+    session → KeyError (never silently emit un-normalized features)."""
+    from neuralset.base import TimedArray
+    from speech_decoding.extractors.reference import CARIeegExtractor
+
+    view = _make_multi_stft_view(session_robust_z=True)
+    view._stats_ready = True  # past prepare; a genuinely-missing session must fail loud
+    ta = TimedArray(
+        frequency=2048.0, start=0.0, duration=1.0,
+        data=np.random.default_rng(0).standard_normal((4, 2048)).astype(np.float32),
+    )
+    monkeypatch.setattr(
+        CARIeegExtractor, "_get_timed_array",
+        lambda self, e, start, duration: ta, raising=False,
+    )
+
+    class _FakeEvent:
+        def _splittable_event_uid(self):
+            return "never-fitted"
+
+    import pytest
+
+    with pytest.raises(KeyError, match="never-fitted"):
+        view._get_timed_array(_FakeEvent(), start=0.0, duration=1.0)
+
+
+def test_c3_prepare_fits_per_session(monkeypatch) -> None:
+    """``prepare`` fits one normalizer per session AND survives the shape-probe.
+
+    The fake ``super().prepare`` faithfully models ``MneRaw.prepare``'s two jobs
+    — (1) populate ``_channels`` from each session's raw, (2) fire the 0.001 s
+    shape-probe THROUGH the view's robust-z apply — so this test exercises the
+    real ordering instead of a no-op that hid BUG #2 (probe-before-fit KeyError).
+    With the ``_stats_ready`` gate the probe must pass the spec through, then the
+    fit scatters per-session stats into the global channel index and arms
+    ``_stats_ready``."""
+    import types
+
+    from speech_decoding.extractors.view import MultiStftView
+
+    view = _make_multi_stft_view(session_robust_z=True, session_z_chunk_s=2.0)
+
+    rng = np.random.default_rng(41)
+    ch = ["e0", "e1", "e2"]
+    raws = {
+        "sess-A": rng.standard_normal((3, 2048 * 6)).astype(np.float32),
+        "sess-B": (rng.standard_normal((3, 2048 * 6)) * 9.0).astype(np.float32),
+    }
+
+    class _SessEvent:
+        start = 0.0
+
+        def __init__(self, key):
+            self.key = key
+
+        def _splittable_event_uid(self):
+            return self.key
+
+    events = [_SessEvent("sess-A"), _SessEvent("sess-B"), _SessEvent("sess-A")]
+
+    # Fake the session-level cached raw read (now carries ch_names, which the
+    # global-index scatter and _update_channels both need) + event extraction.
+    def _fake_get_data(self, evs):
+        for e in evs:
+            yield types.SimpleNamespace(
+                frequency=2048.0, start=0.0, duration=6.0,
+                data=raws[e.key], ch_names=list(ch),
+            )
+
+    monkeypatch.setattr(
+        MultiStftView, "_get_data", property(lambda self: types.MethodType(_fake_get_data, self)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        MultiStftView, "_event_types_helper",
+        property(lambda self: types.SimpleNamespace(extract=lambda obj: obj)),
+        raising=False,
+    )
+
+    probe_log: dict = {}
+
+    def _fake_super_prepare(self, obj):
+        evs = self._event_types_helper.extract(obj)
+        for ta in self._get_data(evs):
+            self._update_channels(ta.ch_names)
+        # The shape-probe: route a spec through robust-z BEFORE the fit runs.
+        probe_log["ready_at_probe"] = self._stats_ready
+        probe_log["out"] = self._apply_session_robust_z(
+            evs[0], torch.zeros(len(ch), self.n_fbank_bins, 1),
+        )
+
+    monkeypatch.setattr(
+        MultiStftView.__mro__[1], "prepare", _fake_super_prepare, raising=False,
+    )
+
+    view.prepare(events)
+
+    # BUG #2 regression: the probe ran before the fit, with no stats and
+    # _stats_ready False, and did NOT raise — it passed the spec through.
+    assert probe_log["ready_at_probe"] is False
+    assert probe_log["out"] is not None
+    # After prepare: stats armed + one normalizer per session.
+    assert view._stats_ready is True
+    assert set(view._session_stats) == {"sess-A", "sess-B"}
+    # Stats were scattered to the global channel index (3 channels here).
+    assert view._session_stats["sess-A"].sigma.shape[0] == len(view._channels)
+    # B's recording is 9× A's → B's σ ≈ 9× A's (gain shows up in the stats).
+    sig_a = view._session_stats["sess-A"].sigma.flatten()
+    sig_b = view._session_stats["sess-B"].sigma.flatten()
+    # Constant (σ≈0) filterbank bins give 0/0 → drop them before the ratio.
+    keep = sig_a > 1e-3
+    ratio = (sig_b[keep] / sig_a[keep]).median()
+    assert 6.0 < float(ratio) < 13.0
+
+
+def test_c3_scatter_to_noncontiguous_global_indices(monkeypatch) -> None:
+    """BUG #1 regression, hardened against a wrong-index scatter.
+
+    A session with FEWER electrodes than the cohort-global dimension must apply
+    (the apply path scatters every clip into a ``(C_global, F, T)`` array; fit-side
+    stats are session-indexed). Critically, this session's channels map to
+    NON-CONTIGUOUS, NON-IDENTITY global rows (``_get_channels`` from a shuffled
+    cohort), so a scatter that used ``range(len)`` or reversed indices instead of
+    ``_get_channels`` would place stats on the WRONG electrodes and be caught.
+
+    The expected output is built INDEPENDENTLY — each global row's stats come
+    from that channel's own session-indexed median/σ at the row ``_get_channels``
+    assigns — NOT by re-running ``norm.transform`` (which would be tautological
+    against a wrong-index scatter)."""
+    from neuralset.base import TimedArray
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+    from speech_decoding.extractors.reference import CARIeegExtractor
+
+    view = _make_multi_stft_view(session_robust_z=True)
+    view._stats_ready = True
+    floor = view.session_z_sigma_floor
+    # Cohort-global = 8 rows; this session owns 4 channels at scrambled rows.
+    cohort = {"e0": 0, "e9": 1, "e2": 2, "e7": 3, "e1": 4, "e5": 5, "e3": 6, "e8": 7}
+    view._channels.update(cohort)
+    sess_ch = ["e7", "e2", "e8", "e1"]  # → global rows [3, 2, 7, 4]
+    g_idx = view._get_channels(sess_ch)
+    assert g_idx == [3, 2, 7, 4]  # non-contiguous, non-identity
+
+    rng = np.random.default_rng(7)
+    # Distinct per-channel scale so a mis-routed scatter changes the numbers.
+    session_rec = (
+        rng.standard_normal((4, 8192)) * np.array([1.0, 5.0, 0.3, 12.0])[:, None]
+    ).astype(np.float32)
+    session_frames = view._spec_from_waveform(torch.from_numpy(session_rec), 2048)
+    norm = SessionRobustZNormalizer().fit(session_frames)
+    sess_med = norm.median.clone()  # (4, F, 1), session order — saved BEFORE scatter
+    sess_sig = norm.sigma.clone()
+    view._scatter_stats_to_global(norm, sess_ch)
+    assert norm.median.shape[0] == 8 and norm.sigma.shape[0] == 8
+    view._session_stats["sess-A"] = norm
+
+    # Apply path hands a GLOBAL (8, T) clip: this session's channels at g_idx,
+    # the other 4 rows are pad zeros.
+    clip = np.zeros((8, 2048), dtype=np.float32)
+    for i, g in enumerate(g_idx):
+        clip[g] = session_rec[i, :2048]
+    ta = TimedArray(frequency=2048.0, start=0.0, duration=1.0, data=clip)
+    monkeypatch.setattr(
+        CARIeegExtractor, "_get_timed_array",
+        lambda self, e, start, duration: ta, raising=False,
+    )
+
+    class _E:
+        def _splittable_event_uid(self):
+            return "sess-A"
+
+    out = view._get_timed_array(_E(), start=0.0, duration=1.0)  # must not raise
+    assert out.data.shape[0] == 8
+
+    # Independent expected: transform each real row with ITS OWN session stats at
+    # the row _get_channels assigned; pad rows stay 0.
+    clip_spec = view._spec_from_waveform(torch.from_numpy(clip), 2048)
+    expected = torch.zeros_like(clip_spec)
+    for i, g in enumerate(g_idx):
+        safe = sess_sig[i].clamp(min=floor)
+        z = (clip_spec[g] - sess_med[i]) / safe
+        z = torch.where(sess_sig[i] >= floor, z, torch.zeros_like(z))
+        expected[g] = z
+    np.testing.assert_allclose(out.data, expected.numpy(), rtol=1e-6, atol=1e-6)
+    # Pad rows (not owned by this session) come out exactly 0.
+    pad_rows = [r for r in range(8) if r not in g_idx]
+    np.testing.assert_allclose(out.data[pad_rows], 0.0, atol=0)
+
+
+def test_c3_normalizer_is_robust_median_mad_not_mean_std() -> None:
+    """Pin the statistic: the C3 fit must be median + 1.4826·MAD, NOT mean/std.
+    On a heavy-tailed signal (a few large outliers) median≠mean and MAD≪std, so a
+    mean/std substitution would visibly diverge. Guards the gain-invariance and
+    delegation tests above, which a mean/std swap would silently still pass."""
+    from speech_decoding.extractors.normalize import SCALE_TO_SIGMA, SessionRobustZNormalizer
+
+    rng = np.random.default_rng(99)
+    # (C=2, F=3, T=4000): mostly N(0,1) with a handful of ±60 spikes per bin.
+    frames = rng.standard_normal((2, 3, 4000)).astype(np.float32)
+    frames[..., :40] = 60.0  # outliers that wreck mean/std but barely move median/MAD
+    t = torch.from_numpy(frames)
+
+    norm = SessionRobustZNormalizer().fit(t)
+
+    exp_median = t.median(dim=-1, keepdim=True).values
+    exp_sigma = SCALE_TO_SIGMA * (t - exp_median).abs().median(dim=-1, keepdim=True).values
+    torch.testing.assert_close(norm.median, exp_median)
+    torch.testing.assert_close(norm.sigma, exp_sigma)
+    # And it must NOT be mean/std: the outliers pull mean/std far from median/MAD.
+    assert (norm.median.abs() < 0.2).all()  # robust center near 0
+    assert (t.mean(dim=-1) > 0.4).all()  # mean dragged up by the +60 spikes
+    assert (norm.sigma < 2.0 * SCALE_TO_SIGMA).all()  # MAD-σ stays ~O(1)
+    assert (t.std(dim=-1) > 5.0).all()  # std blown out by the spikes

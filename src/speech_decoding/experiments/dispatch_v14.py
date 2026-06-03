@@ -74,6 +74,17 @@ DEFAULT_N_FREQ_BINS = 30
 # Multi-STFT frame geometry (1 + L//hop, center=True) — 5 s → 81, 1 s → 17 —
 # not hardcoded.
 DEFAULT_CLIP_LEN_S = 5.0
+# B36 (2026-06-03) neural-response-lag knob (Δlag). The Whisper teacher cache is
+# keyed by AUDIO movie-time and is immutable; sliding the NEURAL clip start by
+# +Δlag aligns the lagged cortical response (neural-frame t reflects audio at
+# t−lag) to the stimulus-time teacher frame. Default 0.0 = the 1:1 baseline
+# (current behavior) and the falsifier null; the P3-distill sweep tries
+# {0.075, 0.15, 0.30} s against it (R-distill-lag-*). Because the teacher is
+# audio-keyed, the sweep is a pure neural re-slice — NO teacher recache. No-op
+# for P1/P2 (student + EMA-teacher shift together); meaningful only for P3's
+# frame-for-frame distill. The P4 probe MUST keep 0.0 (leaderboard parity) — a
+# non-default raises under --phase 4 (guard below).
+DEFAULT_NEURAL_LAG_S = 0.0
 DEFAULT_BATCH_SIZE = 32
 # DataLoader worker count (B1.4e, 2026-05-29). The per-sample extractor stack
 # (CAR + torch.stft in LogStftView is recomputed per __getitem__; only the raw
@@ -162,6 +173,10 @@ DEFAULT_PHASE_MODE: str = "split_p1_p2"
 # ``V14JointExperiment.jepa_phase`` (v14_joint.py) is the field it threads onto.
 JEPA_PHASES: tuple[str, ...] = ("p1", "p2")
 DEFAULT_JEPA_PHASE: str = "p1"
+
+# B36 WS-E E2: P2 front-end discriminative-LR scale. 0.1 = base/10 default;
+# 0.2 = R-p2-frontend-lr-5; 0.0 = R-p2-freeze-frontend (front-end frozen).
+DEFAULT_FRONTEND_LR_SCALE: float = 0.1
 
 # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical loss simplification):
 # joint SSL default is a 2-term surface (L_pre_frame @ M2 + L_post_frame
@@ -256,6 +271,14 @@ def build_v14_experiment(
     test_trial_id: int = DEFAULT_TEST_TRIAL_ID,
     binary_tasks: bool = True,
     electrode_tokens_extractor: tp.Any | None = None,
+    # C3 (WS-C, B13): per-(electrode, freq, session) robust-z on the default
+    # MultiStftView. True (the real-run default) fits frozen median/MAD per
+    # session over its own full recording in prepare() and applies it per clip;
+    # False emits the raw filterbank (only valid for the synthetic capstone /
+    # plumbing smokes, where per-token encoder LN absorbs scale — plan §C3).
+    # Ignored when a custom ``electrode_tokens_extractor`` is supplied (set the
+    # flag on that extractor directly).
+    session_robust_z: bool = True,
     mains_notch_hz: float = DEFAULT_MAINS_NOTCH_HZ,
     eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     d_model: int = DEFAULT_D_MODEL,
@@ -266,6 +289,12 @@ def build_v14_experiment(
     # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
     # phases (P1/P2/P3 → T_p=40); the P4 readout driver passes 1.0 (→ T_p=8).
     clip_len: float = DEFAULT_CLIP_LEN_S,
+    # B36 (2026-06-03) Δlag neural-response-lag (seconds), wired to the
+    # segmenter clip ``start`` offset. 0.0 (default) = 1:1 stimulus-onset
+    # baseline / falsifier null; P3-distill sweep sisters R-distill-lag-{75,150,
+    # 300}ms. Audio-keyed teacher ⇒ no recache. Non-default raises under the
+    # supervised Phase-4 path (leaderboard parity); no-op for P1/P2.
+    neural_lag_s: float = DEFAULT_NEURAL_LAG_S,
     # ``None`` → derive the RoPE ceiling from ``clip_len`` × the front-end's
     # frame geometry (``electrode_tokens_extractor.n_time_bins_for_duration``).
     # Pass an explicit int only to override (e.g. a custom front-end).
@@ -368,6 +397,12 @@ def build_v14_experiment(
     # Effective under ``joint_phase=True`` only; a non-default under the
     # supervised Phase-4 path raises (same guard as the B30/B31 sister flags).
     jepa_phase: str = DEFAULT_JEPA_PHASE,
+    # B36 WS-E E2: P2 front-end discriminative-LR scale (hyperparameter).
+    # 0.1 = base/10 default; 0.2 = R-p2-frontend-lr-5; 0.0 =
+    # R-p2-freeze-frontend. Effective under ``joint_phase=True`` +
+    # ``jepa_phase="p2"`` only (no effect at P1, where the front-end is the
+    # sole trained group).
+    frontend_lr_scale: float = DEFAULT_FRONTEND_LR_SCALE,
     # B35 (2026-05-31) Phase-4 readout selector (reverts B34).
     # "pma_mean_linear" (default) = V14PmaReadout: frozen P3-PMA collapses
     # parcels → (B, T_p, d), then mean-over-time → Linear (only the linear
@@ -472,6 +507,16 @@ def build_v14_experiment(
             f"ref_operator_alpha must lie in (0, 1); got {ref_operator_alpha}"
         )
 
+    # Δlag (neural-response lag) must be causal and bounded: a cortical
+    # response follows its stimulus (≥0) and the higher-order auditory /
+    # associative response to passively-watched film is well under 1 s. Negative
+    # would slice the neural window *before* the stimulus (acausal); > 1 s is
+    # unphysical for this distill alignment.
+    if not 0.0 <= neural_lag_s <= 1.0:
+        raise ValueError(
+            f"neural_lag_s (Δlag) must lie in [0.0, 1.0] s; got {neural_lag_s}"
+        )
+
     # Resolve two-tier extractor cache root from env if not explicit.
     extractor_cache_folder = extractor_cache_folder or os.environ.get(
         "EXCA_EXTRACTOR_CACHE_FOLDER"
@@ -492,6 +537,7 @@ def build_v14_experiment(
             apply_log=False,
             channel_order="original",
             c_max=DEFAULT_C_MAX,
+            session_robust_z=session_robust_z,
         )
     _apply_extractor_cache(
         electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
@@ -628,7 +674,21 @@ def build_v14_experiment(
                 },
             },
             "trigger_query": "type == 'Word'",
-            "start": 0.0,
+            # B36 Δlag: slide the neural clip start by +neural_lag_s so the
+            # lagged cortical response aligns to the stimulus-time Whisper
+            # teacher. 0.0 = 1:1 baseline. The teacher cache is unaffected
+            # (audio-keyed), so a lag sweep needs no recache.
+            #
+            # WS-H LANDMINE: this `start` is shared by EVERY extractor the
+            # segmenter runs (dataloader applies one (start, duration) to all).
+            # When P3 wires the `whisper_target` extractor in beside
+            # `**segmenter_extractors` above, it MUST anchor the teacher lookup
+            # to the UN-shifted trigger movie-time (est_idx/2048), NOT inherit
+            # this Δlag-shifted start — otherwise the lag is double-counted
+            # (neural slid +Δlag AND teacher slid +Δlag → net misalign 2·Δlag,
+            # and Δlag=0 sweeps silently become no-ops). The teacher is keyed by
+            # absolute audio movie-time; only the NEURAL window moves with Δlag.
+            "start": neural_lag_s,
             # WS-C / C1: phase-conditional clip window (5 s SSL, 1 s P4).
             "duration": clip_len,
         },
@@ -678,26 +738,37 @@ def build_v14_experiment(
             # B36 staged masked-JEPA sub-phase (H4): p1 front-end M2 / p2
             # parcel M4. The staged P1->P2 handoff is WS-E; this picks the stage.
             "jepa_phase": jepa_phase,
+            # B36 WS-E E2: P2 front-end discriminative-LR scale.
+            "frontend_lr_scale": frontend_lr_scale,
         }
     elif (
         latent_valid_override != "support"
         or sa_mask_mode != "bidirectional"
         or loss_variant != DEFAULT_LOSS_VARIANT
         or jepa_phase != DEFAULT_JEPA_PHASE
+        or frontend_lr_scale != DEFAULT_FRONTEND_LR_SCALE
+        or neural_lag_s != DEFAULT_NEURAL_LAG_S
     ):
         # B30 + B31 + B36 joint-only flags have semantic effect under the
         # joint phase only. The supervised Phase-4 path doesn't run the SSL
-        # aggregator, the bidirectional-mask latent-SA branch, or a staged
-        # masked-JEPA phase, so a non-default flag here would silently
-        # mis-record the sister / stage.
+        # aggregator, the bidirectional-mask latent-SA branch, a staged
+        # masked-JEPA phase, or the P2 discriminative-LR split, so a non-default
+        # flag here would silently mis-record the sister / stage. neural_lag_s
+        # is blocked here for a different reason: it DOES shift the segmenter
+        # window on this path, and a non-zero P4 probe offset breaks the
+        # leaderboard-parity [onset, onset+1 s] window.
         raise ValueError(
             "latent_valid_override / sa_mask_mode / loss_variant / jepa_phase "
-            "are B30/B31/B36 joint-phase selectors only; got "
+            "/ frontend_lr_scale / neural_lag_s are B30/B31/B36 joint-phase / "
+            "distill selectors only; got "
             f"latent_valid_override={latent_valid_override!r}, "
             f"sa_mask_mode={sa_mask_mode!r}, "
             f"loss_variant={loss_variant!r}, "
-            f"jepa_phase={jepa_phase!r} with joint_phase=False. "
-            "Pass --phase 1 (joint) when setting these flags."
+            f"jepa_phase={jepa_phase!r}, "
+            f"frontend_lr_scale={frontend_lr_scale!r}, "
+            f"neural_lag_s={neural_lag_s!r} with joint_phase=False. "
+            "Pass --phase 1 (joint) when setting these flags "
+            "(neural_lag_s must stay 0.0 on the Phase-4 probe path)."
         )
 
     return experiment_cls(
@@ -812,6 +883,26 @@ def _parser() -> argparse.ArgumentParser:
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
                         "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
                         "encoder n_time_bins / RoPE ceiling.")
+    p.add_argument("--neural-lag-s", dest="neural_lag_s", type=float,
+                   default=DEFAULT_NEURAL_LAG_S,
+                   help="B36 Δlag: neural-response lag (s) added to the clip "
+                        "start so the lagged cortical response aligns to the "
+                        "stimulus-time Whisper teacher. 0.0 (default) = 1:1 "
+                        "baseline / falsifier null; P3-distill sweep sisters "
+                        "R-distill-lag-{75,150,300}ms. Audio-keyed teacher ⇒ no "
+                        "recache. Must stay 0.0 under --phase 4 (leaderboard "
+                        "parity); no-op for P1/P2.")
+    p.add_argument("--session-robust-z", dest="session_robust_z",
+                   action="store_true", default=True,
+                   help="C3 (B13): per-(electrode,freq,session) robust-z on the "
+                        "default Multi-STFT front-end (fit per session over its "
+                        "own full recording in prepare(), applied frozen per "
+                        "clip). ON by default — required for any real run.")
+    p.add_argument("--no-session-robust-z", dest="session_robust_z",
+                   action="store_false",
+                   help="Emit the RAW (un-normalized) filterbank. Only for "
+                        "plumbing smokes / fast-dev-run — encoder LN absorbs "
+                        "scale there; NOT valid for a science run.")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
@@ -977,6 +1068,15 @@ def _parser() -> argparse.ArgumentParser:
              "'p2' = parcel M4 masked prediction (anatomy corpora, front-end "
              "LR/10). The staged P1->P2 checkpoint handoff is WS-E; this flag "
              "selects which stage trains. A non-default raises under --phase 4.",
+    )
+    p.add_argument(
+        "--p2-frontend-lr-scale", dest="frontend_lr_scale", type=float,
+        default=DEFAULT_FRONTEND_LR_SCALE,
+        help="B36 WS-E E2: P2 front-end discriminative-LR scale (joint SSL / "
+             "--phase 1, jepa-phase p2 only). 0.1 (default) = base/10; 0.2 = "
+             "R-p2-frontend-lr-5 (base/5); 0.0 = R-p2-freeze-frontend "
+             "(front-end frozen, parcel side trains alone). A non-default "
+             "raises under --phase 4.",
     )
     p.add_argument(
         "--latent-valid-override",
@@ -1167,6 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
           f"mains_notch_hz={args.mains_notch_hz}")
     print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
+          f"frontend_lr_scale={args.frontend_lr_scale} neural_lag_s={args.neural_lag_s} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
@@ -1214,9 +1315,11 @@ def main(argv: list[str] | None = None) -> int:
         test_subject_id=args.test_subject_id,
         test_trial_id=args.test_trial_id,
         binary_tasks=args.binary_tasks,
+        session_robust_z=args.session_robust_z,
         eps=args.eps, d_model=args.d_model, depth=args.depth,
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         clip_len=args.clip_len,
+        neural_lag_s=args.neural_lag_s,
         batch_size=args.batch_size, num_workers=args.num_workers,
         n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
@@ -1245,6 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
         jepa_phase=args.jepa_phase,
+        frontend_lr_scale=args.frontend_lr_scale,
         readout=args.readout,
         gradient_checkpointing=args.gradient_checkpointing,
     )
