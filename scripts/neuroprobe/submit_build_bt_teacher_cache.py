@@ -78,6 +78,10 @@ def build_sbatch(out_dir: Path | None, log_dir: Path, args: argparse.Namespace) 
         "",
         "set -euo pipefail",
         f"cd {args.repo_root}",
+        # whisper-large-v3 is pre-cached in ~/.cache/huggingface (shared /hpc/home);
+        # pin offline so the compute node never blocks on a HF network HEAD request.
+        "export HF_HUB_OFFLINE=1",
+        "export TRANSFORMERS_OFFLINE=1",
         "",
     ])
     cmd = [
