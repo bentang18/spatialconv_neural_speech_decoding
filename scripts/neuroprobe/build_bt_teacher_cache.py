@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
+from scipy.io import wavfile
 
 from speech_decoding.bt_alignment.teacher_cache import (
     DEFAULT_LAYER_MERGE,
@@ -105,14 +105,29 @@ def _movie_slugs(wav_dir: Path, subset: list[str] | None) -> list[str]:
 
 
 def _load_mono_16k(path: Path) -> np.ndarray:
-    """Read a wav as float32 mono at 16 kHz; downmix stereo, fail loud on rate."""
-    data, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    """Read a wav as float32 mono in [-1, 1] at 16 kHz; downmix stereo, fail loud
+    on rate.
+
+    Uses ``scipy.io.wavfile`` (the audio reader present in the DCC venv —
+    ``soundfile`` is NOT a declared dependency). Unlike soundfile's
+    ``dtype="float32"`` read, ``wavfile.read`` returns the WAV's native dtype
+    WITHOUT normalizing, so an int PCM stream must be divided by its dtype max to
+    land in [-1, 1] — Whisper's mel front-end expects that range, and raw ±32768
+    int16 would corrupt the log-mel. The BT movies are int16/16 kHz/mono."""
+    sr, data = wavfile.read(str(path))
     if sr != WHISPER_SR:
         raise SystemExit(
             f"{path.name}: sample rate {sr} != {WHISPER_SR}; re-extract at 16 kHz."
         )
-    if data.ndim == 2:  # stereo → mono
+    orig_dtype = data.dtype
+    data = data.astype(np.float32)
+    if data.ndim == 2:  # stereo → mono (float-domain mean; int mean would clip)
         data = data.mean(axis=1).astype(np.float32)
+    if np.issubdtype(orig_dtype, np.signedinteger):
+        # PCM int → [-1, 1) by 2^(bits-1), the soundfile/librosa/torchaudio
+        # convention (int16 ÷ 32768, NOT ÷ iinfo.max 32767) so this matches the
+        # float read the Whisper ceiling probe validated against.
+        data = data / float(2 ** (8 * orig_dtype.itemsize - 1))
     return np.ascontiguousarray(data, dtype=np.float32)
 
 
