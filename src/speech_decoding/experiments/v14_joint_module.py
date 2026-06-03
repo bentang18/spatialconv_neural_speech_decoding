@@ -615,9 +615,10 @@ class V14JointBrainModule(pl.LightningModule):
         the rank estimate. Sub-samples to ``_RANKME_N_MAX`` rows to keep
         the SVD cheap.
 
-        Wired into ``validation_step`` via :meth:`_monitor_from_step`
-        with the val-cadence (Lightning's default = every train epoch),
-        which closely approximates the spec's 10k-step probe.
+        Wired into ``training_step`` (from global step 0, at the
+        ``log_every_n_steps`` cadence — I1, B36 WS-I) as well as every
+        ``validation_step`` / ``test_step``, so a collapse is caught at
+        the start of pretraining rather than only at the first val epoch.
         """
         if teacher_m4.dim() != 4:
             return  # not a (B, L, T, d) tap — skip silently
@@ -760,9 +761,10 @@ class V14JointBrainModule(pl.LightningModule):
           needed. Runs on every step.
         * MON-MASK-002 (B03d) — requires ``shaft_mask`` in the batch.
         * MON-TEACHER-FEATURE-RANK (5/28 P0) — RankMe on the EMA
-          teacher's LN_frame M4 tap, masked by ``latent_valid``. Run
-          on validation/test steps only (default Lightning cadence
-          ≈ 10k-step probe spec).
+          teacher's post-``encoder_ln`` M4 tap (the canonical terminal-LN
+          target, B6 — there is no separate ``ln_frame`` head any more),
+          masked by ``latent_valid``. Fired from TRAIN step 0 (I1) plus
+          every val/test step.
         """
         student_kwargs = self._extract_student_kwargs(batch_data)
 
@@ -776,7 +778,12 @@ class V14JointBrainModule(pl.LightningModule):
         )
 
         needs_orphan = "shaft_mask" in batch_data
-        needs_rankme = step_name in ("val", "test")
+        # I1 (B36 WS-I): RankMe fires from TRAIN step 0, not just val/test, so a
+        # teacher-feature collapse is caught the moment pretraining starts rather
+        # than at the first validation epoch. The train caller already gates the
+        # whole monitor pass to ``log_every_n_steps`` cadence (batch_idx 0
+        # included), so this only adds one capped SVD per logging step.
+        needs_rankme = True
         if not (needs_orphan or needs_rankme):
             return
 

@@ -450,12 +450,21 @@ def test_monitor_logs_parcel_coverage_on_every_step() -> None:
     assert logged["train_mon_coverage_alarm"] in (0.0, 1.0)
 
 
-def test_monitor_logs_teacher_rank_on_val_only() -> None:
+def test_monitor_logs_teacher_rank_on_train_from_step0_and_val() -> None:
+    """I1 (B36 WS-I): RankMe now fires on the TRAIN loop from step 0 (the
+    val/test gate was dropped) so a teacher-feature collapse is caught at the
+    start of pretraining, not only at the first val epoch."""
     module = _make_module()
     train_logged: dict[str, float] = {}
     module.log = lambda key, value, **_kw: train_logged.update({key: float(value)})  # type: ignore[method-assign]
     module._monitor_from_step(_make_synthetic_batch().data, step_name="train")
-    assert "train_mon_rankme" not in train_logged
+    for key in (
+        "train_mon_rankme",
+        "train_mon_rankme_normalised",
+        "train_mon_rankme_warn",
+        "train_mon_rankme_alarm",
+    ):
+        assert key in train_logged, key
 
     val_logged: dict[str, float] = {}
     module.log = lambda key, value, **_kw: val_logged.update({key: float(value)})  # type: ignore[method-assign]
@@ -467,6 +476,29 @@ def test_monitor_logs_teacher_rank_on_val_only() -> None:
         "val_mon_rankme_alarm",
     ):
         assert key in val_logged
+
+
+def test_rankme_reads_post_encoder_ln_tap_not_ln_frame() -> None:
+    """I1: the RankMe monitor reads the EMA teacher's post-``encoder_ln`` M4 tap
+    (the canonical terminal LN, B6) — there is no separate ``ln_frame`` head any
+    more. Guards the doc/code claim against an ``ln_frame`` revival."""
+    module = _make_module()
+    student_enc = module.student.encoder
+    teacher_enc = module.teacher.model.encoder
+    assert hasattr(student_enc, "encoder_ln")
+    assert hasattr(teacher_enc, "encoder_ln")
+    assert not hasattr(student_enc, "ln_frame")
+    assert not hasattr(teacher_enc, "ln_frame")
+
+
+def test_training_step_at_batch_idx_0_logs_rankme() -> None:
+    """I1 end-to-end: driving ``training_step`` at global step 0 (monitor-due
+    with no trainer attached → every-step cadence) emits ``train_mon_rankme``."""
+    module = _make_module()
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.training_step(_make_synthetic_batch(), 0)
+    assert "train_mon_rankme" in logged
 
 
 def _perturb_student_for_nonzero_grad(module: V14JointBrainModule) -> None:
