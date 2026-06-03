@@ -289,7 +289,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cpus-per-task", type=int, default=8,
                    help="BLAS threads for the LogReg gradient (the bottleneck on the "
                         "~166k-feature raw-bins cells). Free on `common`.")
-    p.add_argument("--mem", default="32G")
+    p.add_argument("--mem", default="128G",
+                   help="Sized for the cross cells: the L.3 canonical filter upcasts the FULL "
+                        "session voltage to float64 and sosfiltfilt holds input+output at once. "
+                        "Train sub 2 / trial 4 is 164 ch x 27.5M samp = 36 GB float64 -> ~72 GB "
+                        "transient + the persistent test cache. 32G OOMs. `common` mem is free.")
     p.add_argument("--time", default="08:00:00")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
