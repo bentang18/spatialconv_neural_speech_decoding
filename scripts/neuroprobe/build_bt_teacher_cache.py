@@ -174,7 +174,15 @@ def main(argv: list[str] | None = None) -> int:
     if device == "cuda" and not torch.cuda.is_available():
         print("  WARNING: cuda requested but unavailable; falling back to cpu.")
         device = "cpu"
-    model = WhisperForConditionalGeneration.from_pretrained(args.model).eval().to(device)
+    # Force fp32. transformers v5 loads a checkpoint in its NATIVE dtype, and
+    # large-v3's HF weights are fp16 — but the teacher target is a mean over all
+    # 32 encoder layers, and accumulating that in fp16 drifts from the fp32
+    # ceiling-probe that validated `mean_all`. fp32 large-v3 ≈6 GB, well within
+    # the 32 GB RTX 5000 Ada; the dense stream is still stored fp16 downstream.
+    model = (
+        WhisperForConditionalGeneration.from_pretrained(args.model)
+        .eval().float().to(device)
+    )
     proc = WhisperProcessor.from_pretrained(args.model)
     fe = WhisperFeatureExtractor(model, proc, layer_merge=merge)
 

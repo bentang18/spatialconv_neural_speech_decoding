@@ -45,6 +45,7 @@ from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 from speech_decoding.extractors.subtype_meta import SubjectSubtypeExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import MultiStftView
+from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
@@ -403,6 +404,16 @@ def build_v14_experiment(
     # ``jepa_phase="p2"`` only (no effect at P1, where the front-end is the
     # sole trained group).
     frontend_lr_scale: float = DEFAULT_FRONTEND_LR_SCALE,
+    # WS-H / T20 (B33 P3 distillation): root of the whole-movie Whisper teacher
+    # cache built by scripts/neuroprobe/build_bt_teacher_cache.py. When set, the
+    # segmenter emits a per-clip ``whisper_target`` (B, 250, 1280) the P3 loss
+    # consumes; ``None`` (P1/P2/P4) omits it. The join is keyed by the trigger
+    # Word's MOVIE-clock onset (``movie_onset_s``), NOT the Δlag-shifted neural
+    # window — see the WhisperTargetExtractor docstring (FLAG 9). ``layer_merge``
+    # must match the cache build ("mean_all" locked default; "8" = the
+    # R-whisper-single-layer-L8 sister).
+    whisper_target_cache_dir: str | None = None,
+    whisper_layer_merge: str = "mean_all",
     # B35 (2026-05-31) Phase-4 readout selector (reverts B34).
     # "pma_mean_linear" (default) = V14PmaReadout: frozen P3-PMA collapses
     # parcels → (B, T_p, d), then mean-over-time → Linear (only the linear
@@ -661,6 +672,17 @@ def build_v14_experiment(
         )
         segmenter_extractors["shaft_mask"] = shaft_mask_extractor
 
+    # WS-H / T20: P3 Whisper teacher target. Built only when a cache dir is
+    # passed (P3 dispatch); P1/P2/P4 leave it None so the batch never carries
+    # the 1280-d stream. NO _apply_extractor_cache — the whole-movie teacher
+    # cache IS the precompute; the extractor only mmap-slices it per clip.
+    if whisper_target_cache_dir is not None:
+        segmenter_extractors["whisper_target"] = WhisperTargetExtractor(
+            cache_dir=whisper_target_cache_dir,
+            layer_merge=whisper_layer_merge,
+            clip_s=clip_len,
+        )
+
     data = Data(
         study=chain,
         segmenter={
@@ -679,15 +701,19 @@ def build_v14_experiment(
             # teacher. 0.0 = 1:1 baseline. The teacher cache is unaffected
             # (audio-keyed), so a lag sweep needs no recache.
             #
-            # WS-H LANDMINE: this `start` is shared by EVERY extractor the
-            # segmenter runs (dataloader applies one (start, duration) to all).
-            # When P3 wires the `whisper_target` extractor in beside
-            # `**segmenter_extractors` above, it MUST anchor the teacher lookup
-            # to the UN-shifted trigger movie-time (est_idx/2048), NOT inherit
-            # this Δlag-shifted start — otherwise the lag is double-counted
-            # (neural slid +Δlag AND teacher slid +Δlag → net misalign 2·Δlag,
-            # and Δlag=0 sweeps silently become no-ops). The teacher is keyed by
-            # absolute audio movie-time; only the NEURAL window moves with Δlag.
+            # WS-H / FLAG 9: this `start` is shared by EVERY extractor the
+            # segmenter runs (the dataloader applies one (start, duration) to
+            # all), and it is the NEURAL clock (est_idx/sample_rate). The
+            # `whisper_target` extractor MUST NOT key off it: the teacher cache
+            # is a whole-MOVIE stream indexed by audio movie-time, and the
+            # neural vs movie clocks diverge 235-904 s within a single BT trial.
+            # WhisperTargetExtractor sidesteps this by reading the trigger Word's
+            # MOVIE-clock onset (`movie_onset_s`, threaded from words_df['start']
+            # in word_events.py) off the event directly — it never touches this
+            # `start`. So the teacher is anchored to movie-audio time while only
+            # the NEURAL window slides with Δlag; no double-count, and Δlag=0
+            # stays a true 1:1 baseline. (DO NOT "fix" this to est_idx/2048 — the
+            # neural clock is exactly the wrong key; that inversion is the trap.)
             "start": neural_lag_s,
             # WS-C / C1: phase-conditional clip window (5 s SSL, 1 s P4).
             "duration": clip_len,

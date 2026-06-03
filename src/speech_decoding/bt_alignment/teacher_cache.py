@@ -156,11 +156,17 @@ class WhisperFeatureExtractor:
         inputs = self.processor(
             wav, sampling_rate=sample_rate, return_tensors="pt"
         )
-        # Move the mel input to the model's device so the same code path runs on
-        # a GPU node (large-v3) and on a CPU laptop (tiny smoke). No-op when the
-        # model is on CPU — the unit tests exercise that branch.
-        device = next(self.model.parameters()).device
-        input_features = inputs.input_features.to(device)
+        # Move the mel input to the model's device AND dtype so the same code
+        # path runs on a GPU node (large-v3) and on a CPU laptop (tiny smoke).
+        # The dtype match is load-bearing under transformers v5, which loads a
+        # checkpoint in its NATIVE dtype: large-v3's HF weights are fp16, so the
+        # encoder conv1d sees Half weights while the processor emits a float32
+        # mel — a raw ``.to(device)`` then raises "Input type (float) and bias
+        # type (c10::Half) should be the same". Aligning to the param dtype is a
+        # no-op when the model is fp32 (the build forces fp32; see
+        # build_bt_teacher_cache) and the CPU tiny-smoke path.
+        param = next(self.model.parameters())
+        input_features = inputs.input_features.to(device=param.device, dtype=param.dtype)
         self._captures.clear()
         with torch.no_grad():
             self.model.model.encoder(input_features)

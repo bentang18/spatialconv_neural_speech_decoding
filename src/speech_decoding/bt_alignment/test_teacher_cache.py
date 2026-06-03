@@ -69,6 +69,48 @@ def test_extract_returns_correct_shape_and_dtype(whisper_tiny):
         fe.close()
 
 
+def test_extract_aligns_input_dtype_to_model_dtype(whisper_tiny):
+    """Regression: transformers v5 loads large-v3 in its NATIVE fp16, so the
+    encoder conv1d sees Half weights while the processor emits a float32 mel —
+    a raw ``.to(device)`` raised "Input type (float) and bias type (c10::Half)".
+    ``extract`` must cast the mel to the model's param dtype. Spied via a fake
+    model so the assertion runs on CPU (real CPU fp16 conv is unsupported);
+    checks BOTH dtypes to prove it matches the model, not "always fp16"."""
+    model, proc = whisper_tiny
+    seen: dict[str, torch.dtype] = {}
+
+    class _Inner:
+        def __init__(self, captures: dict, layers: list[int]) -> None:
+            self._captures, self._layers = captures, layers
+
+        def encoder(self, input_features: torch.Tensor) -> None:
+            seen["dtype"] = input_features.dtype
+            for layer in self._layers:  # stand in for the real forward hooks
+                self._captures[layer] = torch.zeros(
+                    1, 1500, 384, dtype=input_features.dtype
+                )
+
+    class _FakeModel:
+        def __init__(self, dtype: torch.dtype, fe) -> None:
+            self._p = torch.nn.Parameter(torch.zeros(1, dtype=dtype))
+            self.model = _Inner(fe._captures, fe._layers)
+
+        def parameters(self):
+            yield self._p
+
+    wav = np.zeros(WHISPER_SR, dtype=np.float32)  # 1 s, float32 mel input
+
+    for model_dtype in (torch.float16, torch.float32):
+        fe = WhisperFeatureExtractor(model, proc, layer_merge=3)
+        try:
+            fe.model = _FakeModel(model_dtype, fe)
+            feat = fe.extract(wav, sample_rate=WHISPER_SR)
+            assert seen["dtype"] == model_dtype  # mel cast to MATCH the model
+            assert feat.dtype == torch.float16   # cache dtype is always fp16
+        finally:
+            fe.close()
+
+
 def test_extract_trims_pad_silence_to_real_frames(whisper_tiny):
     """Whisper pads every clip to 30 s, so the encoder always emits 1500 frames;
     extract must trim to the real ``round(clip_s × 50)`` frames so the cache

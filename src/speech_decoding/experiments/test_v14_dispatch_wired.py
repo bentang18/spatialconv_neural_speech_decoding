@@ -16,6 +16,7 @@ from speech_decoding.experiments import dispatch_v14
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import LogStftView, MultiStftView
+from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
 
 
 def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
@@ -38,6 +39,41 @@ def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
     assert ext.filter == (0.5, None)
     # C3: StandardScaler dropped from the default view (robust-z replaces it).
     assert ext.scaler is None
+
+
+def test_dispatch_omits_whisper_target_by_default(tmp_path, monkeypatch) -> None:
+    """WS-H: P1/P2/P4 never carry the 1280-d teacher stream — the extractor is
+    built only when a teacher-cache dir is passed (P3)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert "whisper_target" not in xp.data.segmenter.extractors
+
+
+def test_dispatch_wires_whisper_target_when_cache_dir_set(tmp_path, monkeypatch) -> None:
+    """WS-H / T20: ``whisper_target_cache_dir`` inserts a WhisperTargetExtractor
+    into the segmenter, with its clip window pinned to the dispatch ``clip_len``
+    (5 s SSL → 250 teacher frames) and the locked mean_all merge."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", whisper_target_cache_dir="/cache/bt_teacher",
+    )
+    ext = xp.data.segmenter.extractors["whisper_target"]
+    assert isinstance(ext, WhisperTargetExtractor)
+    assert ext.cache_dir == "/cache/bt_teacher"
+    assert ext.layer_merge == "mean_all"
+    assert ext.clip_s == dispatch_v14.DEFAULT_CLIP_LEN_S  # 5.0 -> n_frames 250
+    assert ext.n_frames == 250
+    assert ext.event_types == "Word"
+    assert ext.aggregation == "trigger"
+
+
+def test_dispatch_whisper_layer_merge_threads_to_extractor(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", whisper_target_cache_dir="/cache/bt_teacher",
+        whisper_layer_merge="8",
+    )
+    assert xp.data.segmenter.extractors["whisper_target"].layer_merge == "8"
 
 
 def test_dispatch_default_n_freq_bins_30_gives_encoder_f_p_10(
