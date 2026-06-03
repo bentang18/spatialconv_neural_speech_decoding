@@ -66,11 +66,15 @@ from speech_decoding.ssl.aggregator import LossVariant
 JOINT_PHASE: Literal["joint_b29"] = "joint_b29"
 """Dispatch-side tag for the joint mode (B29 Item 1).
 
-This is the ``phase_mode`` value the CLI emits, NOT the ``phase`` field
-on :class:`V14Experiment`. The joint experiment runs at the parent
-class's canonical first phase (``phase == 1``) and the dispatch wraps
-that single phase under the ``JOINT_PHASE`` label so the trainer's
-checkpoint cadence and logging match the P1 ∪ P2 collapse contract.
+This is the ``phase_mode`` value the CLI emits **for the B29-joint
+falsifier sister (R-joint-ssl)**, NOT the ``phase`` field on
+:class:`V14Experiment`. As of the B36 relabel (2026-06-03) the default
+recorded regime is ``split_p1_p2`` (see ``dispatch_v14.DEFAULT_PHASE_MODE``);
+``joint_b29`` is no longer the dispatch default. The joint experiment
+still runs at the parent class's canonical first phase (``phase == 1``)
+and the dispatch wraps that single phase under the ``JOINT_PHASE`` label
+so the trainer's checkpoint cadence and logging match the P1 ∪ P2
+collapse contract.
 """
 
 JOINT_PHASE_VALUE: Literal[1] = 1

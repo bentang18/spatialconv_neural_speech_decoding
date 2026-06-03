@@ -587,10 +587,14 @@ def test_b29_dispatch_ref_operator_alpha_must_be_in_open_unit_interval(
         dispatch_v14.build_v14_experiment(mode="nano", ref_operator_alpha=1.0)
 
 
-def test_b29_dispatch_phase_mode_default_is_joint_b29() -> None:
+def test_b36_dispatch_phase_mode_default_is_split_p1_p2() -> None:
+    """B36 relabel (2026-06-03): the recorded-only run-record default regime
+    is now ``split_p1_p2`` (staged P1 front-end M2 -> P2 parcel M4); the
+    behavioral stage is selected via --jepa-phase. ``joint_b29`` survives
+    only as the R-joint-ssl falsifier sister."""
     parser = dispatch_v14._parser()
     args = parser.parse_args([])
-    assert args.phase_mode == "joint_b29"
+    assert args.phase_mode == "split_p1_p2"
 
 
 def test_b29_dispatch_default_includes_ajile12() -> None:

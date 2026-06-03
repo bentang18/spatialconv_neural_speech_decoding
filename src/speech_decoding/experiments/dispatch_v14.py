@@ -146,11 +146,14 @@ DEFAULT_SUBTYPE_EMBED_VOCAB: str = "binary"
 FFN_VARIANTS: tuple[str, ...] = ("dense", "soft_moe_4")
 DEFAULT_FFN_VARIANT: str = "dense"
 
-# B29 phase-mode lock 2026-05-27 PM-late: single joint phase replaces
-# the split P1/P2 path. Sister ``R-keep-phase-split`` P0 holds the old
-# 2-phase machinery behind the dispatch flag.
+# B36 phase-mode relabel 2026-06-03: B36 reverses the B29 joint phase back
+# to a staged P1 (front-end M2, all corpora) -> P2 (parcel M4, anatomy
+# corpora, front-end LR/10) regime, so the recorded-only default regime is
+# now ``split_p1_p2``. Behavioral stage selection is via ``--jepa-phase``
+# (p1/p2), not this axis. ``joint_b29`` survives as the B29-collapse
+# falsifier sister (R-joint-ssl).
 PHASE_MODES: tuple[str, ...] = ("joint_b29", "split_p1_p2")
-DEFAULT_PHASE_MODE: str = "joint_b29"
+DEFAULT_PHASE_MODE: str = "split_p1_p2"
 
 # B36 staged masked-JEPA sub-phase (within the joint SSL experiment, --phase 1).
 # ``p1`` = front-end M2 masked prediction (all corpora); ``p2`` = parcel M4
@@ -961,10 +964,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
-        help="B29 Item 1: single joint SSL phase ('joint_b29', default) vs "
-             "the split P1/P2 path ('split_p1_p2', sister R-keep-phase-split). "
-             "Recorded-only metadata; under B36 the staged P1->P2 split is "
-             "selected via --jepa-phase, not this axis.",
+        help="B36 staged regime: split P1 (front-end M2) -> P2 (parcel M4) "
+             "('split_p1_p2', default) vs the B29 single-joint-phase falsifier "
+             "('joint_b29', sister R-joint-ssl). Recorded-only run-record "
+             "metadata; the behavioral stage is selected via --jepa-phase, "
+             "not this axis.",
     )
     p.add_argument(
         "--jepa-phase", choices=JEPA_PHASES, default=DEFAULT_JEPA_PHASE,

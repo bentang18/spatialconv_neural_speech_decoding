@@ -296,12 +296,13 @@ Source: `docs/neuroprobe/v14_blockers.md §B13`.
 
 ## 8. Phase-3 — Whisper-L8 distillation (B05 + B06 lock)
 
-**Default** = teacher rate 8 Hz, teacher-side triangular pool 50→8 Hz factor 6.25 FWHM 250 ms in dataloader → (40, 1280); 2-layer MLP Whisper-side `Linear(1280, 256)→GeLU→Linear(256, 256)` LLaVA-1.5 shape ~393k params → (40, 256); v14 student identity (40, 256) at 8 Hz native after PMA-k=1 + no time pool; Smooth-L1((40, 256), (40, 256)). Phase-4 readout: NO time pool — flatten T·d → linear (iMINDBench-parity).
+**Default** = teacher rate 8 Hz, teacher-side triangular pool 50→8 Hz factor 6.25, triangle base 250 ms (half-base 6.25 = stride; true half-max FWHM 125 ms) in dataloader → (40, 1280); 2-layer MLP Whisper-side `Linear(1280, 256)→GeLU→Linear(256, 256)` LLaVA-1.5 shape ~393k params → (40, 256); v14 student identity (40, 256) at 8 Hz native after PMA-k=1 + no time pool; Smooth-L1((40, 256), (40, 256)). Phase-4 readout: NO time pool — flatten T·d → linear (iMINDBench-parity).
 
 | Cell | Tests | Priority |
 |---|---|---|
 | **R-rate-5Hz** | Phase-3 distillation rate: 5 Hz (slower averaging, halfway to word rate; lower-end bracket) | **P1** rate falsification |
 | **R-rate-20Hz** | 20 Hz (upper end of preflight grid; Goldstein 2025 found ECoG alignment degraded above 20 Hz) | **P1** rate falsification |
+| **R-pool-wide** | Triangular pool **base = 500 ms / FWHM = 250 ms** (2× the default base; sinc² null drops to 2 Hz, ~4-bucket overlap) — tests whether extra target smoothing helps vs the minimal-distortion default (base 250 ms / FWHM 125 ms). Ratified default chosen on first principles 2026-06-03; B05 flagged for P3-preflight revisit. | P2 pool-width falsification |
 | **R-event-locked** | MFA-aligned variable-width buckets at syllable / word / phoneme onsets, vs uniform rate-r\* triangular pool | P2 |
 | **R-adapter-linear** | Single-linear adapter instead of 2-layer MLP | P1 (fallback) |
 | **R-pool-then-probe** | Phase-4: DIVER-1-style mean-over-T → 256-dim → linear | P1 (reported, not headline) |
