@@ -26,6 +26,7 @@ The two primitives are reused directly from upstream where they exist
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable
 
 import numpy as np
@@ -33,6 +34,11 @@ import torch
 from scipy import signal
 
 from speech_decoding.extractors.reference import parse_shaft  # noqa: F401
+from speech_decoding.extractors.view import (
+    _build_multi_stft_filterbank,
+    _multi_stft_view,
+    multi_stft_bin_centers_hz,
+)
 
 
 REFERENCES: tuple[str, ...] = (
@@ -56,6 +62,8 @@ VIEWS: tuple[str, ...] = (
     "hg_envelope_70_90",
     "hg_envelope_90_120",
     "hg_envelope_120_150",
+    "multi_stft",
+    "raw_multi_stft",
 )
 
 
@@ -154,6 +162,12 @@ def apply_view(
         return _wavelet_db4(data, sampling_rate)
     if view_kind == "instantaneous_phase":
         return _instantaneous_phase(data, sampling_rate)
+    if view_kind == "multi_stft":
+        params = _resolve_multi_stft_params(upstream_helpers.get("multi_stft_params"))
+        return _multi_stft_band(data, sampling_rate, params)
+    if view_kind == "raw_multi_stft":
+        params = _resolve_multi_stft_params(upstream_helpers.get("multi_stft_params"))
+        return _raw_multi_stft_bins(data, sampling_rate, params)
     raise ValueError(f"Unknown view_kind: {view_kind}")
 
 
@@ -210,7 +224,14 @@ def _global_car(
 def _shaft_car(
     data: torch.Tensor, electrode_labels: list[str]
 ) -> tuple[torch.Tensor, list[str]]:
-    """Subtract per-shaft mean from each channel."""
+    """Subtract per-shaft mean from each channel.
+
+    Relies on the caller passing electrode labels already stripped of BT's `*`/`#`
+    markers (upstream `BrainTreebankSubject._clean_electrode_label` does this). Raw
+    BT labels keep those markers, which make `parse_shaft` mis-split a contact into
+    a singleton shaft whose CAR then zeroes it — the sub_2 zeroing bug. The sweep
+    consumes upstream-cleaned labels, so it is immune; do not feed raw labels here.
+    """
     shafts = [parse_shaft(name)[0] for name in electrode_labels]
     out = data.clone()
     for shaft in set(shafts):
@@ -363,6 +384,215 @@ def apply_temporal_filter_inplace(
         sos = signal.butter(hpf_order, hpf_hz / nyq, btype="highpass", output="sos")
         arr = np.asarray(signal.sosfiltfilt(sos, arr, axis=-1))
     tensor.copy_(torch.from_numpy(arr.astype(np.float32)))
+
+
+# ---------------------------------------------------------------------------
+# Multi-STFT front-end sweep views (FE filterbank sweep, 2026-06-03)
+#
+# Two sweep view-kinds sitting on the frozen 3-STFT grid (nperseg 1024/512/256,
+# hop 128 @ 2048 Hz):
+#   * ``multi_stft``     — v14's constant-Q log-octave triangular filterbank.
+#   * ``raw_multi_stft`` — iMINDBench raw |STFT| bins, no filterbank (the
+#                          control / harness gate). Spec: build doc §2.
+# Filterbank knobs (f0, cap, octave_step, half_bw) are threaded through
+# ``upstream_helpers["multi_stft_params"]`` so the runner can sweep them without
+# touching the live MultiStftView extractor.
+# ---------------------------------------------------------------------------
+
+_MULTI_STFT_DEFAULTS: dict[str, Any] = {
+    # STFT grid (frozen, iMINDBench parity).
+    "nperseg_low": 1024,
+    "nperseg_mid": 512,
+    "nperseg_hi": 256,
+    "hop_length": 128,
+    # Filterbank knobs — default = build-doc cell 1 (constant-Q matched).
+    "f0_hz": 2.0,
+    "cap_hz": 256.0,
+    "octave_step": 0.5,
+    "half_bw_octaves": 0.5,
+    "log_eps": 1e-6,
+    "apply_log": False,
+    # raw_multi_stft band edges (Hz) per source STFT (build doc §2).
+    "raw_low_band": (2.0, 40.0),
+    "raw_mid_band": (20.0, 148.0),
+    "raw_hi_band": (80.0, 248.0),
+}
+
+# §6 routing crossovers (iMINDBench-parity band midpoints) and 1-cycle floors.
+_ROUTING_CROSSOVERS: tuple[float, float] = (32.0, 152.0)
+_TIER_ONE_CYCLE_FLOOR_HZ: dict[int, float] = {0: 2.0, 1: 4.0, 2: 8.0}
+
+
+def _resolve_multi_stft_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    """Merge caller params over the frozen defaults."""
+    merged = dict(_MULTI_STFT_DEFAULTS)
+    if params:
+        merged.update(params)
+    return merged
+
+
+def _multi_stft_n_bins(f0_hz: float, cap_hz: float, octave_step: float) -> int:
+    """Largest ``n`` with ``f0 * 2^((n-1)*step) <= cap`` — contiguous octave bins."""
+    if cap_hz < f0_hz:
+        raise ValueError(f"cap_hz {cap_hz} must be >= f0_hz {f0_hz}")
+    return int(math.floor(math.log2(cap_hz / f0_hz) / octave_step + 1e-9)) + 1
+
+
+def _derive_multi_stft_routing(centers: torch.Tensor) -> tuple[int, ...]:
+    """Per §6: assign each bin center to a source STFT tier at the crossovers.
+
+    center < 32 Hz → low (1024); 32 ≤ center < 152 → mid (512); ≥ 152 → hi (256).
+    """
+    lo_x, hi_x = _ROUTING_CROSSOVERS
+    routing: list[int] = []
+    for c in centers.tolist():
+        if c < lo_x:
+            routing.append(0)
+        elif c < hi_x:
+            routing.append(1)
+        else:
+            routing.append(2)
+    return tuple(routing)
+
+
+def _multi_stft_valid_mask(
+    centers: torch.Tensor, routing: tuple[int, ...]
+) -> torch.Tensor:
+    """1-cycle floor guard (FE-MULTISTFT-1): a bin below its tier floor is dead."""
+    return torch.tensor(
+        [c >= _TIER_ONE_CYCLE_FLOOR_HZ[r] for c, r in zip(centers.tolist(), routing)],
+        dtype=torch.bool,
+    )
+
+
+def _multi_stft_band(
+    data: torch.Tensor, sampling_rate: int, params: dict[str, Any]
+) -> torch.Tensor:
+    """Constant-Q log-octave filterbank view via the live ``_multi_stft_view``.
+
+    Input ``(..., C, T)`` → output ``(..., C, n_bins, T_bin)``. n_bins, centers
+    and routing are derived from {f0, cap, step}; the live filterbank function
+    is then driven with the matching contiguous-octave parameters, so this view
+    is byte-identical to the v14 MultiStftView for the same knobs.
+    """
+    f0 = float(params["f0_hz"])
+    cap = float(params["cap_hz"])
+    step = float(params["octave_step"])
+    half_bw = float(params["half_bw_octaves"])
+
+    n_bins = _multi_stft_n_bins(f0, cap, step)
+    centers = multi_stft_bin_centers_hz(n_bins=n_bins, f0_hz=f0, octave_step=step)
+    routing = _derive_multi_stft_routing(centers)
+
+    # 1-cycle floor guard. With f0>=2 (the grid) every bin clears its tier floor,
+    # so `keep` is all-True and nothing is dropped. The branch only fires for an
+    # out-of-grid f0<2; dead low bins are a contiguous prefix, so dropping them
+    # and lifting f0 to the lowest survivor preserves the octave geometry that
+    # `_multi_stft_view` reconstructs internally.
+    keep = _multi_stft_valid_mask(centers, routing)
+    if not bool(keep.all()):
+        centers = centers[keep]
+        routing = tuple(r for r, k in zip(routing, keep.tolist()) if k)
+        n_bins = int(keep.sum().item())
+        f0 = float(centers[0].item())
+
+    flat = data.reshape(-1, data.shape[-1])
+    spec = _multi_stft_view(
+        flat,
+        sample_rate=int(sampling_rate),
+        hop_length=int(params["hop_length"]),
+        nperseg_low=int(params["nperseg_low"]),
+        nperseg_mid=int(params["nperseg_mid"]),
+        nperseg_hi=int(params["nperseg_hi"]),
+        n_bins=n_bins,
+        f0_hz=f0,
+        octave_step=step,
+        half_bw_octaves=half_bw,
+        routing=routing,
+        log_eps=float(params["log_eps"]),
+        apply_log=bool(params["apply_log"]),
+    )
+    return spec.reshape(*data.shape[:-1], spec.shape[-2], spec.shape[-1])
+
+
+def _raw_multi_stft_bins(
+    data: torch.Tensor, sampling_rate: int, params: dict[str, Any]
+) -> torch.Tensor:
+    """iMINDBench raw-|STFT|-bins control view (no filterbank).
+
+    Concatenates the raw magnitude bins of each source STFT over its band:
+    low (1024) 2–40 Hz, mid (512) 20–148, hi (256) 80–248. Input ``(..., C, T)``
+    → output ``(..., C, n_raw_bins, T_bin)``. STFT params match the live grid
+    bit-for-bit (Hann, center=True, normalized=False).
+    """
+    hop = int(params["hop_length"])
+    bands = (
+        (int(params["nperseg_low"]), params["raw_low_band"]),
+        (int(params["nperseg_mid"]), params["raw_mid_band"]),
+        (int(params["nperseg_hi"]), params["raw_hi_band"]),
+    )
+    flat = data.reshape(-1, data.shape[-1])
+    mags: list[torch.Tensor] = []
+    t_bins: list[int] = []
+    for nperseg, (lo_hz, hi_hz) in bands:
+        win = torch.hann_window(nperseg, device=flat.device)
+        wf = flat
+        if wf.shape[-1] < nperseg:
+            wf = torch.nn.functional.pad(wf, (0, nperseg - wf.shape[-1]))
+        spec = torch.stft(
+            wf,
+            n_fft=nperseg,
+            hop_length=hop,
+            win_length=nperseg,
+            window=win,
+            return_complex=True,
+            normalized=False,
+            center=True,
+        )
+        mag = torch.abs(spec)  # (N, F_stft, T)
+        freqs = torch.fft.rfftfreq(nperseg, d=1.0 / sampling_rate)
+        keep = (freqs >= float(lo_hz)) & (freqs <= float(hi_hz))
+        mags.append(mag[..., keep, :])
+        t_bins.append(int(mag.shape[-1]))
+    t = min(t_bins)
+    banded = torch.cat([m[..., :t] for m in mags], dim=-2)  # (N, F_total, T)
+    return banded.reshape(*data.shape[:-1], banded.shape[-2], banded.shape[-1])
+
+
+def multi_stft_dead_bin_count(sampling_rate: int, params: dict[str, Any]) -> int:
+    """Count constant-Q output bins that receive zero rfft support (FE-MULTISTFT-1).
+
+    At f0=2 Hz the 1024-nperseg STFT has 2 Hz resolution; a narrow constant-Q
+    triangle can fall entirely between two rfft bins, so its L1-normalized weight
+    column is all-zero (the builder leaves it at 0 when the triangle integral is
+    0). Such bins are constant-zero features — they confound the resolution axis
+    (cells 4/5 gain more of them as the step narrows). This reports the count per
+    cell so the analyst can read the confound off the manifest; it does NOT change
+    the filterbank (the guard is a Ben/FE-MULTISTFT-1 decision).
+    """
+    p = _resolve_multi_stft_params(params)
+    f0 = float(p["f0_hz"]); cap = float(p["cap_hz"])
+    step = float(p["octave_step"]); half_bw = float(p["half_bw_octaves"])
+
+    n_bins = _multi_stft_n_bins(f0, cap, step)
+    centers = multi_stft_bin_centers_hz(n_bins=n_bins, f0_hz=f0, octave_step=step)
+    routing = _derive_multi_stft_routing(centers)
+    keep = _multi_stft_valid_mask(centers, routing)  # mirror _multi_stft_band's floor guard
+    if not bool(keep.all()):
+        centers = centers[keep]
+        routing = tuple(r for r, k in zip(routing, keep.tolist()) if k)
+        n_bins = int(keep.sum().item())
+        f0 = float(centers[0].item())
+
+    fbank = _build_multi_stft_filterbank(
+        int(sampling_rate),
+        int(p["nperseg_low"]), int(p["nperseg_mid"]), int(p["nperseg_hi"]),
+        n_bins, f0, step, half_bw, routing,
+    )
+    dead = 0
+    for weights, _idx in fbank.values():
+        dead += int((weights.sum(dim=0) == 0).sum())
+    return dead
 
 
 def make_upstream_helpers(

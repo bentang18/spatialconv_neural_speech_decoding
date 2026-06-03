@@ -213,6 +213,16 @@ def run_eval(
             laplacian_rereference_neural_data=laplacian_rereference_neural_data,
             stft_params=preprocess_parameters,
         )
+        # FE filterbank sweep: thread the swept knobs to the multi_stft /
+        # raw_multi_stft views (ignored by every other view_kind). Only the four
+        # swept knobs are exposed; the STFT grid + raw band edges stay frozen.
+        if args.view_kind in ("multi_stft", "raw_multi_stft"):
+            upstream_helpers["multi_stft_params"] = {
+                "f0_hz": float(args.fbank_f0_hz),
+                "cap_hz": float(args.fbank_cap_hz),
+                "octave_step": float(args.fbank_octave_step),
+                "half_bw_octaves": float(args.fbank_half_bw),
+            }
 
     # Anchor window: feature window is [-bins_start_before, +bins_end_after]s
     # around word onset. Default = [0, 1]s (D.0 baseline). data_idx_from is
@@ -487,6 +497,13 @@ def run_eval(
                         regions_test = _resolve_regions_for_subject(
                             subject, args, upstream_helpers, get_region_labels,
                         )
+                        # multi_stft/raw_multi_stft views are 4D (N, C, F, T).
+                        # combine_regions reduces ONLY axis 1 (channels -> regions)
+                        # via mean(axis=1); it treats axes 2/3 as (timebins, d_model)
+                        # but only passes them through, so our (F, T) survive untouched
+                        # -> (N, regions, F, T). The later reshape flattens (regions,F,T).
+                        # NB: --feature-aggregation mean/median only fires on 3D, so it
+                        # never accidentally folds the F axis of these 4D views.
                         X_train, X_test, _ = combine_regions(
                             X_train, X_test, regions_train, regions_test
                         )
@@ -879,10 +896,23 @@ def _parse_args() -> argparse.Namespace:
             "multi_band_log_power", "wavelet_db4",
             "instantaneous_phase",
             "hg_envelope_70_90", "hg_envelope_90_120", "hg_envelope_120_150",
+            "multi_stft", "raw_multi_stft",
         ),
         default="stft_abs",
         help="Input view (only used when --backend=neuralset).",
     )
+    # FE filterbank sweep knobs — only consumed by view_kind in
+    # {multi_stft, raw_multi_stft}. Defaults = build-doc cell 1 (constant-Q
+    # matched). raw_multi_stft ignores all four (its bins are fixed iMINDBench
+    # bands).
+    p.add_argument("--fbank-f0-hz", type=float, default=2.0,
+                   help="Lowest filterbank bin center (Hz).")
+    p.add_argument("--fbank-cap-hz", type=float, default=256.0,
+                   help="Highest filterbank bin center (Hz); sets n_bins.")
+    p.add_argument("--fbank-octave-step", type=float, default=0.5,
+                   help="Filterbank bin spacing in octaves.")
+    p.add_argument("--fbank-half-bw", type=float, default=0.5,
+                   help="Triangular kernel half-width in octaves.")
     p.add_argument(
         "--run-nuisance-probes",
         action="store_true",
