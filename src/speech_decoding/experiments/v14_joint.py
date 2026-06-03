@@ -148,21 +148,27 @@ class V14JointExperiment(V14Experiment):
     sister ``R-keep-phase-split`` uses the parent :class:`V14Experiment`
     with explicit ``phase=1`` then ``phase=2``.
 
-    The per-step loss composition runs through
-    :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
-    (``loss_variant="b31_default"`` → B31 2-term surface); the trainer
-    never hard-codes the weights. (B36 2026-06-01 removed the soft
+    The per-step loss runs through the staged B36 masked-JEPA objective
+    (:mod:`speech_decoding.ssl.masked_jepa` — ``p1_frontend_m2_loss`` /
+    ``p2_parcel_m4_loss``) inside
+    :meth:`speech_decoding.experiments.v14_joint_module.V14JointBrainModule._step`,
+    NOT the aggregator. ``loss_variant`` (default ``"b31_default"``) is
+    retained only as a dispatch config-record + the quarantined
+    ``b31_plus_*`` falsifier selector — the
+    :func:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses` multi-term
+    path is off the default. (B36 2026-06-01 also removed the soft
     ``λ_anat`` routing bias — the hard per-parcel pool needs no per-clip
     gate, and the ``LambdaAnatExtractor`` it flowed through is gone.)
 
     B30 sister selectors (drift row ``B30-dispatch-sister-flags``,
     surfaced 2026-05-28 by the R12 wiring audit):
 
-    * ``latent_valid_override`` picks the source of the
-      :data:`speech_decoding.ssl.aggregator.compute_v14_ssl_losses`
-      ``latent_valid`` argument. Default ``"support"`` matches the B30
-      lock; ``"all_true"`` / ``"parcels_supervised"`` are
-      :class:`NotImplementedError`-gated sister falsifiers.
+    * ``latent_valid_override`` picks the source of the ``latent_valid``
+      gate threaded into
+      :class:`speech_decoding.experiments.v14_joint_module.V14JointBrainModule`.
+      Default ``"support"`` matches the B30 lock; ``"all_true"`` /
+      ``"parcels_supervised"`` are :class:`NotImplementedError`-gated sister
+      falsifiers.
     * ``sa_mask_mode`` picks the encoder's latent-SA mask shape.
       Default ``"bidirectional"`` matches the B30 lock; ``"key_only"``
       is a :class:`NotImplementedError`-gated sister falsifier.
