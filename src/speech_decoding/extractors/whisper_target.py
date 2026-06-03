@@ -22,21 +22,18 @@ from __future__ import annotations
 
 import logging
 import typing as tp
-from pathlib import Path
 
 import pydantic
 import torch
 from neuralset.events.etypes import Event
 from neuralset.extractors.base import BaseStatic
 
-from speech_decoding.bt_alignment.teacher_cache import DEFAULT_TEACHER_HZ
+from speech_decoding.bt_alignment.teacher_cache import (
+    DEFAULT_TEACHER_HZ,
+    movie_cache_path,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _merge_slug(layer_merge: str) -> str:
-    """Cache-path segment for a layer-merge spec (matches build_bt_teacher_cache)."""
-    return "mean_all" if layer_merge == "mean_all" else f"L{int(layer_merge)}"
 
 
 def _resolve_movie(subject_id: int, trial_id: int) -> str:
@@ -77,16 +74,27 @@ class WhisperTargetExtractor(BaseStatic):
         """Teacher window length in frames (pinned to 250 = 5 s × 50 Hz)."""
         return round(self.clip_s * self.rate_hz)
 
+    def __getstate__(self) -> dict:
+        # Drop the per-movie mmap memo before pickling. ``prepare()`` runs
+        # get_static once in the MAIN process (to populate the output shape),
+        # which loads one whole-movie dense stream into ``_dense``; without this,
+        # that multi-GB tensor would be pickled into every spawned dataloader
+        # worker, defeating the mmap design (each worker should rebuild it lazily
+        # and share the OS page cache). Reset to the empty construction state.
+        state = super().__getstate__()
+        private = state.get("__pydantic_private__")
+        if private and ("_dense" in private or "_n_clamped" in private):
+            private = dict(private)
+            private["_dense"] = {}
+            private["_n_clamped"] = 0
+            state["__pydantic_private__"] = private
+        return state
+
     def _movie_dense(self, movie: str) -> torch.Tensor:
         dense = self._dense.get(movie)
         if dense is not None:
             return dense
-        path = (
-            Path(self.cache_dir)
-            / self.model.replace("/", "_")
-            / _merge_slug(self.layer_merge)
-            / f"{movie}.pt"
-        )
+        path = movie_cache_path(self.cache_dir, self.model, self.layer_merge, movie)
         if not path.is_file():
             raise FileNotFoundError(
                 f"WhisperTargetExtractor: teacher cache missing for movie "
@@ -144,10 +152,6 @@ class WhisperTargetExtractor(BaseStatic):
                 movie, movie_onset_s, frame0, total, clamped, self._n_clamped,
             )
 
-        window = dense[clamped : clamped + n].to(torch.float32).contiguous()
-        if tuple(window.shape) != (n, self.d_model):
-            raise RuntimeError(
-                f"{movie}: sliced teacher window {tuple(window.shape)} != "
-                f"({n}, {self.d_model})."
-            )
-        return window
+        # Exactly (n, d_model) by construction: clamped ∈ [0, total-n] (so the
+        # first axis is n) and dense.shape[1] == d_model was asserted on load.
+        return dense[clamped : clamped + n].to(torch.float32).contiguous()

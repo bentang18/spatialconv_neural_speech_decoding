@@ -72,6 +72,25 @@ WHISPER_SR = 16000
 WHISPER_HOP = 160  # mel hop: 160 / 16 kHz = 10 ms (mel 100 Hz; 2× conv → 50 Hz enc)
 
 
+def merge_slug(layer_merge: int | str) -> str:
+    """Cache-path segment for a layer merge: ``mean_all`` or ``L{int}``."""
+    return "mean_all" if layer_merge == "mean_all" else f"L{int(layer_merge)}"
+
+
+def movie_cache_path(
+    out_dir: Path | str, model: str, layer_merge: int | str, movie: str
+) -> Path:
+    """``out_dir/<model_slug>/<merge_slug>/<movie>.pt`` — the SINGLE source of
+    truth for the whole-movie cache layout.
+
+    Writer (:func:`write_movie_cache`), reader
+    (:class:`~speech_decoding.extractors.whisper_target.WhisperTargetExtractor`),
+    and the build-script skip check all route through here so they cannot drift
+    apart: a one-character slug mismatch between writer and reader would make
+    every clip silently miss its cache."""
+    return Path(out_dir) / model.replace("/", "_") / merge_slug(layer_merge) / f"{movie}.pt"
+
+
 @dataclass
 class TeacherCacheEntry:
     clip_id: str
@@ -235,8 +254,7 @@ def write_clip_cache(
             "by model. Load the Whisper model via from_pretrained(...)."
         )
     layer_merge = feature_extractor.layer_merge
-    merge_slug = "mean_all" if layer_merge == "mean_all" else f"L{int(layer_merge)}"
-    clip_dir = out_dir / model_name.replace("/", "_") / merge_slug / film
+    clip_dir = out_dir / model_name.replace("/", "_") / merge_slug(layer_merge) / film
     clip_dir.mkdir(parents=True, exist_ok=True)
     out_path = clip_dir / f"{clip_id}.pt"
     torch.save({
@@ -320,12 +338,21 @@ def write_movie_cache(
     # P3 target off-target, undetectably).
     duration_s = len(wav) / float(sample_rate)
     expected_frames = round(duration_s * rate_hz)
-    if int(dense.shape[0]) != expected_frames:
+    # Tolerance of 1 frame (20 ms): the only LEGITIMATE disagreement between the
+    # whole-movie round and the per-chunk-summed dense length is round-half-to-
+    # even (banker's rounding) on the final partial chunk landing on a .5
+    # boundary — at most ±1 frame, well past any word onset. A REAL truncation
+    # (a 30 s chunk silently cropped, or a chunk dropped) is off by ~1500 frames,
+    # so >1 still fails loud. Without the tolerance an unlucky movie length
+    # crashes the build with a misleading "truncated" message (no real BT movie
+    # hits it, but D-cohort / SWEC durations are unaudited).
+    if abs(int(dense.shape[0]) - expected_frames) > 1:
         raise RuntimeError(
             f"movie {movie!r}: dense has {dense.shape[0]} frames but "
-            f"{duration_s:.3f}s × {rate_hz}Hz ⇒ {expected_frames} expected — "
-            f"a chunk truncated/dropped or enc rate ≠ {rate_hz}Hz. Refusing to "
-            f"cache a teacher stream with a broken frame↔time map."
+            f"{duration_s:.3f}s × {rate_hz}Hz ⇒ {expected_frames} expected "
+            f"(off by {int(dense.shape[0]) - expected_frames}) — a chunk "
+            f"truncated/dropped or enc rate ≠ {rate_hz}Hz. Refusing to cache a "
+            f"teacher stream with a broken frame↔time map."
         )
 
     model_name = feature_extractor.model.name_or_path
@@ -335,10 +362,8 @@ def write_movie_cache(
             "by model. Load the Whisper model via from_pretrained(...)."
         )
     layer_merge = feature_extractor.layer_merge
-    merge_slug = "mean_all" if layer_merge == "mean_all" else f"L{int(layer_merge)}"
-    movie_dir = out_dir / model_name.replace("/", "_") / merge_slug
-    movie_dir.mkdir(parents=True, exist_ok=True)
-    out_path = movie_dir / f"{movie}.pt"
+    out_path = movie_cache_path(out_dir, model_name, layer_merge, movie)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "features": dense,
         "rate_hz": rate_hz,

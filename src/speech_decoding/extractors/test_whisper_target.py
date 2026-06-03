@@ -144,6 +144,15 @@ def test_tail_clamp_keeps_exactly_250_frames(tmp_path: Path, monkeypatch) -> Non
     assert ext._n_clamped == 1
 
 
+def test_last_valid_window_no_clamp(tmp_path: Path, monkeypatch) -> None:
+    # frame0 == total - n exactly: the final window that fits without clamping.
+    dense = _write_cache(tmp_path, n_frames=300)
+    ext = _ext(tmp_path, monkeypatch)
+    out = ext.get_static(_event(1.0))  # frame0 = 50 == total(300)-n(250)
+    torch.testing.assert_close(out, dense[50:300].float())
+    assert ext._n_clamped == 0
+
+
 def test_clamp_floor_at_zero(tmp_path: Path, monkeypatch) -> None:
     dense = _write_cache(tmp_path, n_frames=2000)
     ext = _ext(tmp_path, monkeypatch)

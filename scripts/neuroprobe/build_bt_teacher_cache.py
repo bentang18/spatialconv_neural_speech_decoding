@@ -41,6 +41,8 @@ from speech_decoding.bt_alignment.teacher_cache import (
     WHISPER_SR,
     MovieCacheEntry,
     WhisperFeatureExtractor,
+    merge_slug,
+    movie_cache_path,
     write_movie_cache,
 )
 
@@ -142,8 +144,8 @@ def _git_commit() -> str:
 
 
 def _expected_path(out_dir: Path, model: str, merge: int | str, movie: str) -> Path:
-    merge_slug = "mean_all" if merge == "mean_all" else f"L{int(merge)}"
-    return out_dir / model.replace("/", "_") / merge_slug / f"{movie}.pt"
+    # Single source of truth for cache layout (writer/reader/skip-check share it).
+    return movie_cache_path(out_dir, model, merge, movie)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,15 +209,17 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         fe.close()
 
-    manifest_dir = out_dir / args.model.replace("/", "_")
-    manifest_path = manifest_dir / "build_manifest.json"
+    # Manifest lives in the SAME <model>/<merge_slug>/ dir as the .pt files it
+    # describes — keying by model alone let a `mean_all` and an `L8` build clobber
+    # each other's manifest while their caches sat side by side.
+    cache_dir = out_dir / args.model.replace("/", "_") / merge_slug(merge)
+    manifest_path = cache_dir / "build_manifest.json"
     if not entries:
         # A pure-skip resume built nothing — do NOT clobber a good manifest with
         # an empty one (the bug a skip-only re-run would otherwise cause).
         print(f"Built 0 new movie(s); manifest unchanged -> {manifest_path}")
         return 0
-    merge_slug = "mean_all" if merge == "mean_all" else f"L{int(merge)}"
-    cached_total = sorted(p.stem for p in (manifest_dir / merge_slug).glob("*.pt"))
+    cached_total = sorted(p.stem for p in cache_dir.glob("*.pt"))
     manifest = {
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "git_commit": _git_commit(),
@@ -228,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         "movies_cached_total": cached_total,                # full cache state (filenames)
         "entries": [vars(e) for e in entries],
     }
-    manifest_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"Built {len(entries)} movie(s); cached total {len(cached_total)}; "
           f"manifest -> {manifest_path}")
