@@ -307,6 +307,37 @@ def run_eval(
 
     _apply_canonical_filter(subject, args.subject_id, args.trial_id)
 
+    # Hoist the fixed single-source CrossSubject train subject OUT of the per-task
+    # loop. It is identical for every eval_name (same sub 2 / trial 4 / electrode
+    # subset / L.3 filter), so create + load + filter it ONCE here rather than
+    # re-running the ~4-min full-session filter for all 15 tasks (it was being
+    # rebuilt per task). Mirrors how the test subject is handled just above; the
+    # result is byte-identical, only faster. (pool_multi_source keeps its own
+    # per-fold source creation — that path is unused by the FE sweep.)
+    train_subject = None
+    if splits_type == "CrossSubject" and not pool_multi_source:
+        train_subject_id = nconfig.DS_DM_TRAIN_SUBJECT_ID
+        train_subject = BrainTreebankSubject(
+            train_subject_id, allow_corrupted=False, cache=True, dtype=torch.float32
+        )
+        train_subject.set_electrode_subset(
+            nconfig.NEUROPROBE_LITE_ELECTRODES[train_subject.subject_identifier]
+        )
+        if getattr(args, "shuffle_channels_per_subject", False):
+            t_full = list(train_subject.electrode_labels)
+            t_seed = int(args.seed) * 1_000_000 + int(train_subject_id) * 1000
+            t_perm = np.random.default_rng(t_seed).permutation(len(t_full))
+            train_subject.set_electrode_subset([t_full[i] for i in t_perm])
+            print(
+                f"[L.5.P6] train subject {train_subject_id} channels shuffled "
+                f"(perm_seed={t_seed}, n={len(t_full)})"
+            )
+        # BUG-RUNNER-1: filter the fixed train subject too so it matches the
+        # filtered test subject (train/test distribution parity).
+        _apply_canonical_filter(
+            train_subject, train_subject_id, nconfig.DS_DM_TRAIN_TRIAL_ID
+        )
+
     rows: list[dict[str, Any]] = []
     qc_payload: dict[str, Any] | None = None
 
@@ -380,28 +411,12 @@ def run_eval(
                     f"{source_subject_ids} → 1 pooled train, region_pool_mode={args.region_pool_mode}"
                 )
             else:
-                train_subject_id = nconfig.DS_DM_TRAIN_SUBJECT_ID
-                train_subject = BrainTreebankSubject(
-                    train_subject_id, allow_corrupted=False, cache=True, dtype=torch.float32
-                )
-                train_subject.set_electrode_subset(
-                    nconfig.NEUROPROBE_LITE_ELECTRODES[train_subject.subject_identifier]
-                )
-                if getattr(args, "shuffle_channels_per_subject", False):
-                    t_full = list(train_subject.electrode_labels)
-                    t_seed = int(args.seed) * 1_000_000 + int(train_subject_id) * 1000
-                    t_perm = np.random.default_rng(t_seed).permutation(len(t_full))
-                    train_subject.set_electrode_subset([t_full[i] for i in t_perm])
-                    print(
-                        f"[L.5.P6] train subject {train_subject_id} channels shuffled "
-                        f"(perm_seed={t_seed}, n={len(t_full)})"
-                    )
-                # BUG-RUNNER-1: filter the fixed train subject too (trial = upstream
-                # DS_DM_TRAIN_TRIAL_ID) so it matches the filtered test subject.
-                _apply_canonical_filter(
-                    train_subject, train_subject_id, nconfig.DS_DM_TRAIN_TRIAL_ID
-                )
-                all_subjects = {args.subject_id: subject, train_subject_id: train_subject}
+                # Train subject (fixed sub 2 / trial 4) was created + filtered ONCE
+                # above the eval_name loop — identical across every task. Reuse it.
+                all_subjects = {
+                    args.subject_id: subject,
+                    nconfig.DS_DM_TRAIN_SUBJECT_ID: train_subject,
+                }
                 folds = nts.generate_splits_cross_subject(
                     all_subjects, args.subject_id, args.trial_id, eval_name, dtype=torch.float32,
                     output_indices=False, output_dict=False,
