@@ -274,12 +274,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cells", default=None, help="Comma list of cell ids (default: all). e.g. 0,1")
     p.add_argument("--sessions", default=None, help="Comma list sub:trial (default: all lite). e.g. 1:1,3:0")
     p.add_argument("--eval-types", default="within,cross", help="Comma list of {within,cross}.")
-    p.add_argument("--normalization", default="per_session_robust_mad",
-                   help="Held-constant normalization recipe. Default = per-session median+1.4826*MAD "
-                        "robust-z (build doc §3 'per-(C,F) session robust-z' + v14 Nv14). NB: the "
-                        "runner normalizes the flattened (N,C*F*T) matrix, so this is per-(C,F,T), "
-                        "NOT per-(C,F) pooled over time — held constant across cells so ranking is "
-                        "unaffected; cell-G absolute is approximate.")
+    p.add_argument("--normalization", default="per_session_robust_mad_cf",
+                   help="Held-constant normalization recipe. Default = per-(C,F) robust median+MAD "
+                        "POOLED OVER TIME (build doc §3 'per-(C,F) session robust-z' + v14 Nv14): one "
+                        "stat per (channel,freq) over trials+time, so the within-window temporal "
+                        "envelope is preserved. Frozen across all cells.")
     p.add_argument("--notch-freqs", default="60,120,180",
                    help="Held-constant mains notch (Hz, comma list). Default = v14 canonical "
                         "recipe 60/120/180 (BT = US). Frozen across all cells (build doc §3); "

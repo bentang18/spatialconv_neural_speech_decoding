@@ -52,6 +52,7 @@ NORMALIZATION_CELLS: dict[str, str] = {
     "train_set_robust_mad":      "L.1.N6",
     "per_session_robust_scale":  "L.1.N7",
     "per_channel_train_set_z":   "L.1.N8",
+    "per_session_robust_mad_cf": "L.1.N9",
 }
 
 NORMALIZATION_DESCRIPTIONS: dict[str, str] = {
@@ -64,6 +65,7 @@ NORMALIZATION_DESCRIPTIONS: dict[str, str] = {
     "train_set_robust_mad":     "per-feature median + 1.4826*MAD fit on training set, applied to test (inductive analog of N5)",
     "per_session_robust_scale": "per-feature MAD scale only (no median subtraction) fit independently on each session",
     "per_channel_train_set_z":  "one mean/std per electrode pooled over freq+time, fit on training set (standard iEEG recipe)",
+    "per_session_robust_mad_cf": "robust median+1.4826*MAD per (channel,freq) POOLED OVER TIME, fit independently per session (Nv14 / iMINDBench per-(C,F) recipe; preserves the within-window temporal envelope). 4D views only.",
 }
 
 
@@ -274,19 +276,36 @@ def run_eval(
 
     notch_freqs = _parse_notch_freqs(getattr(args, "notch_freqs", ""))
     hpf_hz = float(getattr(args, "hpf_hz", 0.0))
-    if notch_freqs or hpf_hz > 0:
+    sr = int(nconfig.SAMPLING_RATE)
+
+    def _apply_canonical_filter(subj: Any, sid: int, trial: int) -> None:
+        """Apply the L.3 notch/HPF to one subject's full voltage cache, in place.
+
+        Must reach EVERY subject whose voltage becomes features. In CrossSubject
+        the train/source subjects load their voltage lazily inside
+        generate_splits_* (not at the call site above), so without this they stay
+        unfiltered while the test subject is filtered — a train/test distribution
+        mismatch on the exact cross-subject cells that are this sweep's payload
+        (BUG-RUNNER-1). load_neural_data caches the full window and
+        cache_neural_data is idempotent, so the dataset's later sub-window
+        requests reuse this filtered cache (filter applied once, never reloaded
+        away). No-op when no filter is requested.
+        """
+        if not (notch_freqs or hpf_hz > 0):
+            return
         from speech_decoding.views import apply_temporal_filter_inplace  # noqa: PLC0415
-        sr = int(nconfig.SAMPLING_RATE)
+        subj.load_neural_data(trial)
         t1 = time.time()
         apply_temporal_filter_inplace(
-            subject.neural_data_cache[args.trial_id],
+            subj.neural_data_cache[trial],
             sampling_rate=sr, notch_freqs=tuple(notch_freqs), hpf_hz=hpf_hz,
         )
         print(
             f"[L.3] filter notch={list(notch_freqs)} hpf={hpf_hz}Hz "
-            f"applied to subject {args.subject_id} trial {args.trial_id} "
-            f"in {time.time() - t1:.1f}s"
+            f"applied to subject {sid} trial {trial} in {time.time() - t1:.1f}s"
         )
+
+    _apply_canonical_filter(subject, args.subject_id, args.trial_id)
 
     rows: list[dict[str, Any]] = []
     qc_payload: dict[str, Any] | None = None
@@ -377,6 +396,11 @@ def run_eval(
                         f"[L.5.P6] train subject {train_subject_id} channels shuffled "
                         f"(perm_seed={t_seed}, n={len(t_full)})"
                     )
+                # BUG-RUNNER-1: filter the fixed train subject too (trial = upstream
+                # DS_DM_TRAIN_TRIAL_ID) so it matches the filtered test subject.
+                _apply_canonical_filter(
+                    train_subject, train_subject_id, nconfig.DS_DM_TRAIN_TRIAL_ID
+                )
                 all_subjects = {args.subject_id: subject, train_subject_id: train_subject}
                 folds = nts.generate_splits_cross_subject(
                     all_subjects, args.subject_id, args.trial_id, eval_name, dtype=torch.float32,
@@ -427,6 +451,9 @@ def run_eval(
                     test_dataset = fold["test_dataset"]
                     src_subj = fold_source_subjects[fi]
                     src_trial = fold_source_trials[fi]
+                    # BUG-RUNNER-1: filter each pooled source subject too. Cache is
+                    # cleared per fold below, so this applies the filter exactly once.
+                    _apply_canonical_filter(src_subj, src_subj.subject_id, src_trial)
                     X_tr = np.concatenate(
                         [_preprocess(item[0], src_subj.electrode_labels) for item in train_dataset],
                         axis=0,
@@ -517,6 +544,9 @@ def run_eval(
                     op = np.mean if fa_mode == "mean" else np.median
                     X_train = op(X_train, axis=2)
                     X_test = op(X_test, axis=2)
+                # Capture the per-sample feature shape (C,F,T for 4D views) BEFORE
+                # flattening, so per_session_robust_mad_cf can pool over time per (C,F).
+                feat_shape = tuple(int(d) for d in X_train.shape[1:])
                 X_train = X_train.reshape(X_train.shape[0], -1)
                 X_test = X_test.reshape(X_test.shape[0], -1)
                 if fa_mode == "pca50_cross_channel":
@@ -535,7 +565,8 @@ def run_eval(
                     }
 
                 X_train, X_test = apply_normalization(
-                    X_train, X_test, args.normalization, n_channels=n_channels,
+                    X_train, X_test, args.normalization,
+                    n_channels=n_channels, feat_shape=feat_shape,
                 )
 
                 if qc_payload is not None and "post_train_sample" not in qc_payload:
@@ -623,6 +654,7 @@ def run_eval(
 
 def apply_normalization(
     X_train: Any, X_test: Any, normalization: str, *, n_channels: int = 0,
+    feat_shape: tuple[int, ...] | None = None,
 ) -> tuple[Any, Any]:
     if normalization == "train_set_fixed":
         scaler = StandardScaler(copy=False)
@@ -640,6 +672,14 @@ def apply_normalization(
     elif normalization == "per_session_robust_mad":
         X_train = _mad_normalize(X_train)
         X_test = _mad_normalize(X_test)
+    elif normalization == "per_session_robust_mad_cf":
+        if feat_shape is None or len(feat_shape) != 3:
+            raise ValueError(
+                "per_session_robust_mad_cf needs a 3D per-sample feature shape "
+                f"(C,F,T) — got feat_shape={feat_shape}. Use a multi_stft/raw_multi_stft view."
+            )
+        X_train = _mad_normalize_cf(X_train, feat_shape)
+        X_test = _mad_normalize_cf(X_test, feat_shape)
     elif normalization == "train_set_robust_mad":
         X_train, X_test = _train_set_mad(X_train, X_test)
     elif normalization == "per_session_robust_scale":
@@ -734,6 +774,25 @@ def _mad_normalize(X: np.ndarray) -> np.ndarray:
     med = np.median(X, axis=0, keepdims=True)
     mad = np.median(np.abs(X - med), axis=0, keepdims=True) * 1.4826
     return (X - med) / (mad + 1e-8)
+
+
+def _mad_normalize_cf(X: np.ndarray, feat_shape: tuple[int, ...]) -> np.ndarray:
+    """Robust z per (channel, freq) POOLED over trials AND time (Nv14 / iMINDBench).
+
+    X is the flattened (N, C*F*T) matrix; feat_shape = (C, F, T). One median+MAD
+    per (C, F), pooling over the trial axis and the time axis, so every time bin
+    of a band is rescaled by the SAME stat — the within-window temporal envelope
+    is preserved, only the band's level/scale is removed. Transductive (fit on
+    whichever set is passed). Contrast _mad_normalize, which gives each (C,F,T)
+    its own stat and whitens the time course.
+    """
+    n = X.shape[0]
+    xr = X.reshape(n, *feat_shape)                       # (N, C, F, T)
+    pool_axes = (0, xr.ndim - 1)                         # trials + time
+    med = np.median(xr, axis=pool_axes, keepdims=True)   # (1, C, F, 1)
+    mad = np.median(np.abs(xr - med), axis=pool_axes, keepdims=True) * 1.4826
+    xn = (xr - med) / (mad + 1e-8)
+    return xn.reshape(n, -1)
 
 
 def _train_set_mad(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

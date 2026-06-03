@@ -494,6 +494,11 @@ def _multi_stft_band(
         centers = centers[keep]
         routing = tuple(r for r, k in zip(routing, keep.tolist()) if k)
         n_bins = int(keep.sum().item())
+        if n_bins == 0:
+            raise ValueError(
+                "multi_stft floor guard dropped every bin — degenerate config "
+                f"(f0={f0}, cap={cap} below the 2 Hz tier-0 floor). Out of the swept grid."
+            )
         f0 = float(centers[0].item())
 
     flat = data.reshape(-1, data.shape[-1])
@@ -550,7 +555,9 @@ def _raw_multi_stft_bins(
             center=True,
         )
         mag = torch.abs(spec)  # (N, F_stft, T)
-        freqs = torch.fft.rfftfreq(nperseg, d=1.0 / sampling_rate)
+        # BUG-VIEWS-1: build freqs/keep on the data's device so the boolean mask
+        # indexes `mag` without a CPU↔GPU device mismatch (mirrors _multi_stft_view).
+        freqs = torch.fft.rfftfreq(nperseg, d=1.0 / sampling_rate, device=flat.device)
         keep = (freqs >= float(lo_hz)) & (freqs <= float(hi_hz))
         mags.append(mag[..., keep, :])
         t_bins.append(int(mag.shape[-1]))
@@ -582,6 +589,11 @@ def multi_stft_dead_bin_count(sampling_rate: int, params: dict[str, Any]) -> int
         centers = centers[keep]
         routing = tuple(r for r, k in zip(routing, keep.tolist()) if k)
         n_bins = int(keep.sum().item())
+        if n_bins == 0:
+            raise ValueError(
+                "multi_stft floor guard dropped every bin — degenerate config "
+                f"(f0={f0}, cap={cap} below the 2 Hz tier-0 floor). Out of the swept grid."
+            )
         f0 = float(centers[0].item())
 
     fbank = _build_multi_stft_filterbank(

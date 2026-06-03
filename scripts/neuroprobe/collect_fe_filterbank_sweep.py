@@ -71,9 +71,21 @@ def summarize(long: pd.DataFrame) -> pd.DataFrame:
         .mean()
         .reset_index()
     )
+    # Footprint = the exact (subject, task) pairs a (cell, eval) actually has.
+    # A cell's mean/delta is only comparable to the control's when they cover the
+    # SAME footprint; a failed or partial job otherwise yields a silently
+    # non-comparable delta (BUG-COLLECT-4). We record means over what's present
+    # but NaN out rank4/all15 (and their deltas) for any cell whose footprint
+    # differs from the control's, and warn loudly. The full raw data survives in
+    # the per_task.csv, so nothing is lost — only the headline is made safe.
     rows: list[dict[str, object]] = []
+    r4_fp: dict[tuple[str, str], frozenset] = {}
+    all_fp: dict[tuple[str, str], frozenset] = {}
     for (cell, ev), grp in by_subj.groupby(["cell", "eval"]):
+        cell, ev = str(cell), str(ev)
         rank4 = grp[grp["task"].isin(RANK4_TASKS)]
+        r4_fp[(cell, ev)] = frozenset(zip(rank4["subject_id"], rank4["task"]))
+        all_fp[(cell, ev)] = frozenset(zip(grp["subject_id"], grp["task"]))
         # subject-level means (per task already folded), then average across the
         # rank-4 tasks per subject, then across subjects → CI across subjects.
         rank4_subj = rank4.groupby("subject_id")["test_roc_auc"].mean().to_numpy()
@@ -85,6 +97,7 @@ def summarize(long: pd.DataFrame) -> pd.DataFrame:
             "eval": ev,
             "n_subjects": int(grp["subject_id"].nunique()),
             "n_tasks": int(grp["task"].nunique()),
+            "n_rank4_tasks": int(rank4["task"].nunique()),
             "rank4_mean_auc": r4_mean,
             "rank4_ci95": r4_ci,
             "all15_mean_auc": a15_mean,
@@ -92,16 +105,42 @@ def summarize(long: pd.DataFrame) -> pd.DataFrame:
         })
     summary = pd.DataFrame(rows)
 
-    # Δ vs the shaft-CAR raw-bins control (cell 0), within each eval.
+    # Δ vs the shaft-CAR raw-bins control (cell 0), within each eval — but only
+    # between footprint-identical cells.
     for ev in summary["eval"].unique():
-        ctrl = summary[(summary["eval"] == ev) & (summary["cell"] == CONTROL_CELL)]
-        if ctrl.empty:
+        ctrl_key = (CONTROL_CELL, ev)
+        if ctrl_key not in r4_fp:
+            print(f"WARNING: [{ev}] control cell {CONTROL_CELL} absent — no Δ computed "
+                  f"for this eval; every cell here is non-comparable.")
             continue
-        base_r4 = float(ctrl["rank4_mean_auc"].iloc[0])
-        base_a15 = float(ctrl["all15_mean_auc"].iloc[0])
-        mask = summary["eval"] == ev
-        summary.loc[mask, "delta_rank4_vs_ctrl"] = summary.loc[mask, "rank4_mean_auc"] - base_r4
-        summary.loc[mask, "delta_all15_vs_ctrl"] = summary.loc[mask, "all15_mean_auc"] - base_a15
+        ctrl_r4, ctrl_all = r4_fp[ctrl_key], all_fp[ctrl_key]
+        ctrl_tasks = {t for _, t in ctrl_r4}
+        if ctrl_tasks != set(RANK4_TASKS):
+            print(f"WARNING: [{ev}] control cell {CONTROL_CELL} is itself missing rank-4 "
+                  f"task(s) {sorted(set(RANK4_TASKS) - ctrl_tasks)} — every Δ for this "
+                  f"eval is against a PARTIAL baseline.")
+        base_r4 = float(summary.loc[
+            (summary["eval"] == ev) & (summary["cell"] == CONTROL_CELL), "rank4_mean_auc"].iloc[0])
+        base_a15 = float(summary.loc[
+            (summary["eval"] == ev) & (summary["cell"] == CONTROL_CELL), "all15_mean_auc"].iloc[0])
+        for i in summary.index[summary["eval"] == ev]:
+            cell = str(summary.at[i, "cell"])
+            key = (cell, ev)
+            if r4_fp.get(key) != ctrl_r4:
+                miss = len(ctrl_r4 - r4_fp.get(key, frozenset()))
+                extra = len(r4_fp.get(key, frozenset()) - ctrl_r4)
+                print(f"WARNING: [{ev}] cell {cell} rank-4 footprint differs from control "
+                      f"(missing {miss} / extra {extra} subject×task pairs) — rank4_mean_auc "
+                      f"& delta_rank4 set to NaN (non-comparable).")
+                summary.at[i, "rank4_mean_auc"] = np.nan
+                summary.at[i, "delta_rank4_vs_ctrl"] = np.nan
+            else:
+                summary.at[i, "delta_rank4_vs_ctrl"] = summary.at[i, "rank4_mean_auc"] - base_r4
+            if all_fp.get(key) != ctrl_all:
+                summary.at[i, "all15_mean_auc"] = np.nan
+                summary.at[i, "delta_all15_vs_ctrl"] = np.nan
+            else:
+                summary.at[i, "delta_all15_vs_ctrl"] = summary.at[i, "all15_mean_auc"] - base_a15
 
     return summary.sort_values(["eval", "cell"]).reset_index(drop=True)
 
