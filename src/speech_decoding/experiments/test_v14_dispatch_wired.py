@@ -800,6 +800,71 @@ def test_b31_dispatch_invalid_loss_variant_rejected(
         )
 
 
+# ---------------------------------------------------------------------------
+# B36 staged masked-JEPA sub-phase (2026-06-03 H4). ``--jepa-phase`` threads
+# ``V14JointExperiment.jepa_phase`` so the parcel-M4 stage (p2) is launchable
+# from the entrypoint; previously only the default front-end-M2 stage (p1)
+# could run. Mirrors the B31 ``loss_variant`` joint-only-selector pattern.
+# ---------------------------------------------------------------------------
+
+
+def test_b36_dispatch_default_jepa_phase_is_p1() -> None:
+    """B36 default: ``--jepa-phase`` omitted → ``"p1"`` (front-end M2)."""
+    parser = dispatch_v14._parser()
+    args = parser.parse_args([])
+    assert args.jepa_phase == "p1"
+    assert dispatch_v14.DEFAULT_JEPA_PHASE == "p1"
+    assert dispatch_v14.JEPA_PHASES == ("p1", "p2")
+
+
+def test_b36_dispatch_joint_phase_threads_jepa_phase_to_experiment(
+    tmp_path, monkeypatch,
+) -> None:
+    """Joint-phase dispatch threads ``jepa_phase`` onto the
+    :class:`V14JointExperiment` instance so the staged P1->P2 split is
+    recorded and the parcel-M4 stage is reachable."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, jepa_phase="p2",
+    )
+    assert type(xp).__name__ == "V14JointExperiment"
+    assert xp.jepa_phase == "p2"
+
+
+def test_b36_dispatch_joint_phase_default_jepa_phase_is_p1(
+    tmp_path, monkeypatch,
+) -> None:
+    """Default joint-phase dispatch lands the front-end-M2 stage (p1)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano", joint_phase=True)
+    assert xp.jepa_phase == "p1"
+
+
+def test_b36_dispatch_supervised_phase_rejects_non_default_jepa_phase(
+    tmp_path, monkeypatch,
+) -> None:
+    """``jepa_phase`` is a joint-phase-only selector. A non-default value on
+    the supervised Phase-4 path (``joint_phase=False``) raises so the run
+    record never silently mis-records the stage — same guard as the B30/B31
+    sister flags."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match="jepa_phase"):
+        dispatch_v14.build_v14_experiment(mode="nano", jepa_phase="p2")
+
+
+def test_b36_dispatch_invalid_jepa_phase_rejected_by_build(
+    tmp_path, monkeypatch,
+) -> None:
+    """``build_v14_experiment`` validates the stage string up front, before
+    any Experiment construction (defends a programmatic caller that bypasses
+    argparse)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match="jepa_phase"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, jepa_phase="bogus",
+        )
+
+
 def test_b_bug_4_default_log_stft_view_pins_ref_idx_to_shaft_car(
     tmp_path, monkeypatch,
 ) -> None:

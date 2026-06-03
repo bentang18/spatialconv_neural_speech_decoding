@@ -117,3 +117,34 @@ def test_invalid_phase_rejected_by_argparse() -> None:
         main(["--phase", "0", "--dry-run"])
     with pytest.raises(SystemExit):
         main(["--phase", "5", "--dry-run"])
+
+
+# --- B36 (2026-06-03 H4) --jepa-phase staged masked-JEPA sub-phase ----------
+
+
+def test_jepa_phase_default_p1_in_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No flag → the run summary records the default ``jepa_phase=p1``
+    (front-end M2). --dry-run short-circuits before any build."""
+    rc = main(["--dry-run"])
+    assert rc == 0
+    assert "jepa_phase=p1" in capsys.readouterr().out
+
+
+def test_jepa_phase_p2_dry_run_prints_in_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B36 H4: ``--phase 1 --jepa-phase p2`` selects the staged parcel-M4
+    stage; the run summary records it so the persisted run record never
+    silently rides the wrong stage. --dry-run exits 0 before the build."""
+    rc = main(["--phase", "1", "--jepa-phase", "p2", "--dry-run"])
+    assert rc == 0
+    assert "jepa_phase=p2" in capsys.readouterr().out
+
+
+def test_invalid_jepa_phase_rejected_by_argparse() -> None:
+    """argparse ``choices`` rejects an unknown stage so the run record YAML
+    never drifts to a typo'd sub-phase."""
+    with pytest.raises(SystemExit):
+        main(["--jepa-phase", "p3", "--dry-run"])

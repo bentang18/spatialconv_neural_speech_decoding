@@ -152,6 +152,14 @@ DEFAULT_FFN_VARIANT: str = "dense"
 PHASE_MODES: tuple[str, ...] = ("joint_b29", "split_p1_p2")
 DEFAULT_PHASE_MODE: str = "joint_b29"
 
+# B36 staged masked-JEPA sub-phase (within the joint SSL experiment, --phase 1).
+# ``p1`` = front-end M2 masked prediction (all corpora); ``p2`` = parcel M4
+# masked prediction (anatomy corpora, front-end LR/10). WS-E owns the staged
+# P1->P2 checkpoint handoff; this axis selects which stage the run trains.
+# ``V14JointExperiment.jepa_phase`` (v14_joint.py) is the field it threads onto.
+JEPA_PHASES: tuple[str, ...] = ("p1", "p2")
+DEFAULT_JEPA_PHASE: str = "p1"
+
 # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical loss simplification):
 # joint SSL default is a 2-term surface (L_pre_frame @ M2 + L_post_frame
 # @ LN_frame(M4), both pure L1 per V-JEPA 2 §2.1 Eq 1). The three
@@ -351,6 +359,12 @@ def build_v14_experiment(
     # falsification. Only effective under ``joint_phase=True``; the
     # supervised Phase-4 path raises if a non-default is requested.
     loss_variant: str = DEFAULT_LOSS_VARIANT,
+    # B36 staged masked-JEPA sub-phase (H4 2026-06-03): threads
+    # ``V14JointExperiment.jepa_phase`` so P2 (parcel M4) is launchable from the
+    # CLI — previously only the default ``p1`` (front-end M2) could run.
+    # Effective under ``joint_phase=True`` only; a non-default under the
+    # supervised Phase-4 path raises (same guard as the B30/B31 sister flags).
+    jepa_phase: str = DEFAULT_JEPA_PHASE,
     # B35 (2026-05-31) Phase-4 readout selector (reverts B34).
     # "pma_mean_linear" (default) = V14PmaReadout: frozen P3-PMA collapses
     # parcels → (B, T_p, d), then mean-over-time → Linear (only the linear
@@ -393,6 +407,7 @@ def build_v14_experiment(
     _validate_choice("phase_mode", phase_mode, PHASE_MODES)
     _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
     _validate_choice("loss_variant", loss_variant, LOSS_VARIANTS)
+    _validate_choice("jepa_phase", jepa_phase, JEPA_PHASES)
     if ffn_variant != "dense":
         # MoE-FFN audit 2026-05-28: ``soft_moe_4`` is reserved as a P2
         # if-budget sister and requires ``models/soft_moe.py``. Fail
@@ -657,22 +672,28 @@ def build_v14_experiment(
             "sa_mask_mode": sa_mask_mode,
             # B31 loss-variant selector: 2-term default + 3 sister arms.
             "loss_variant": loss_variant,
+            # B36 staged masked-JEPA sub-phase (H4): p1 front-end M2 / p2
+            # parcel M4. The staged P1->P2 handoff is WS-E; this picks the stage.
+            "jepa_phase": jepa_phase,
         }
     elif (
         latent_valid_override != "support"
         or sa_mask_mode != "bidirectional"
         or loss_variant != DEFAULT_LOSS_VARIANT
+        or jepa_phase != DEFAULT_JEPA_PHASE
     ):
-        # B30 + B31 sister flags only have semantic effect under the
-        # joint phase. The supervised Phase-4 path doesn't run the SSL
-        # aggregator or the bidirectional-mask latent-SA branch, so a
-        # non-default flag here would silently mis-record the sister.
+        # B30 + B31 + B36 joint-only flags have semantic effect under the
+        # joint phase only. The supervised Phase-4 path doesn't run the SSL
+        # aggregator, the bidirectional-mask latent-SA branch, or a staged
+        # masked-JEPA phase, so a non-default flag here would silently
+        # mis-record the sister / stage.
         raise ValueError(
-            "latent_valid_override / sa_mask_mode / loss_variant are "
-            "B30/B31 sister selectors for the joint phase only; got "
+            "latent_valid_override / sa_mask_mode / loss_variant / jepa_phase "
+            "are B30/B31/B36 joint-phase selectors only; got "
             f"latent_valid_override={latent_valid_override!r}, "
             f"sa_mask_mode={sa_mask_mode!r}, "
-            f"loss_variant={loss_variant!r} with joint_phase=False. "
+            f"loss_variant={loss_variant!r}, "
+            f"jepa_phase={jepa_phase!r} with joint_phase=False. "
             "Pass --phase 1 (joint) when setting these flags."
         )
 
@@ -941,7 +962,17 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
         help="B29 Item 1: single joint SSL phase ('joint_b29', default) vs "
-             "the split P1/P2 path ('split_p1_p2', sister R-keep-phase-split).",
+             "the split P1/P2 path ('split_p1_p2', sister R-keep-phase-split). "
+             "Recorded-only metadata; under B36 the staged P1->P2 split is "
+             "selected via --jepa-phase, not this axis.",
+    )
+    p.add_argument(
+        "--jepa-phase", choices=JEPA_PHASES, default=DEFAULT_JEPA_PHASE,
+        help="B36 staged masked-JEPA sub-phase (joint SSL / --phase 1 only). "
+             "'p1' (default) = front-end M2 masked prediction (all corpora); "
+             "'p2' = parcel M4 masked prediction (anatomy corpora, front-end "
+             "LR/10). The staged P1->P2 checkpoint handoff is WS-E; this flag "
+             "selects which stage trains. A non-default raises under --phase 4.",
     )
     p.add_argument(
         "--latent-valid-override",
@@ -1009,8 +1040,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--phase", type=int, choices=(1, 2, 3, 4), default=4,
                    help="Training phase per docs/neuroprobe/plan.md §staged. "
-                        "1 = joint masked-JEPA SSL (B29; V14JointExperiment). "
-                        "2 = legacy split-P2 (raises — use --phase 1). "
+                        "1 = masked-JEPA SSL (V14JointExperiment); B36 staged "
+                        "P1->P2 selected via --jepa-phase (p1 front-end M2 / "
+                        "p2 parcel M4). "
+                        "2 = legacy split-P2 (raises — use --phase 1 --jepa-phase p2). "
                         "3 = Whisper all-layer-mean distillation (module wired; "
                         "raises the whisper_target data blocker until WS-H). "
                         "4 = downstream linear/finetune probe (current behavior).")
@@ -1129,7 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  K=80 DK parcels, batch_size={args.batch_size}, n_epochs={args.n_epochs}")
     print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
           f"mains_notch_hz={args.mains_notch_hz}")
-    print(f"  phase_mode={args.phase_mode} "
+    print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
@@ -1207,6 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
+        jepa_phase=args.jepa_phase,
         readout=args.readout,
         gradient_checkpointing=args.gradient_checkpointing,
     )
