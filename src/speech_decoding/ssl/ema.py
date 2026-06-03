@@ -280,9 +280,11 @@ class EmaTeacher(nn.Module):
     Implementation notes:
 
       * The EMA copy is a deepcopy of the student so the structure tracks
-        exactly. Buffers are copied as-is on each ``update_from`` (since EMA
-        of running stats is generally not what you want — copy is closer to
-        the V-JEPA 2.1 reference).
+        exactly. Only *parameters* are EMA-blended; *buffers* are copied
+        as-is on each ``update_from`` (EMA of running stats is not the
+        V-JEPA contract). The param-vs-buffer split is by ``named_parameters``
+        membership, NOT dtype — so a persistent FLOAT buffer is copied
+        verbatim, not τ-blended.
       * ``requires_grad`` is set to False on every parameter at construction
         AND re-cleared after each ``load_state_dict``-equivalent op, so it
         cannot accidentally accumulate gradients downstream.
@@ -320,8 +322,28 @@ class EmaTeacher(nn.Module):
         if step is None:
             step = int(self._step.item())
         coeff = float(self._coeff_schedule(step))
+        # EMA-BF16-STUCK guard: (1-τ) underflows bf16/fp16 spacing for a param
+        # near O(0.25) → the increment rounds to 0 and the teacher FREEZES.
+        # bf16-mixed autocast leaves params fp32 (safe); a literal teacher
+        # ``.to(bf16)``/``.half()`` is the footgun. Fail loud, not silent.
+        bad_dtype = [
+            n for n, p in self.model.named_parameters()
+            if p.dtype.is_floating_point and p.dtype is not torch.float32
+        ]
+        if bad_dtype:
+            raise RuntimeError(
+                f"EMA teacher params must be fp32; got non-fp32 {bad_dtype[:3]}"
+                f"{'...' if len(bad_dtype) > 3 else ''}. (1-tau)={1.0 - coeff:.2g} "
+                f"underflows bf16/fp16 spacing -> teacher freezes. Use bf16-mixed "
+                f"autocast (params stay fp32), not a teacher .to(bf16)/.half()."
+            )
         student_state = student.state_dict()
         teacher_state = self.model.state_dict()
+        # Params are EMA-blended; buffers are copied verbatim. The split is by
+        # ``named_parameters`` membership, NOT dtype — so a persistent FLOAT
+        # buffer (running stats, a re-seeded noise buffer) is copied as-is and
+        # never τ-blended (EMA-BUFFER-1).
+        param_names = {name for name, _ in student.named_parameters()}
         # Dedup by storage address (2026-05-30 speedup audit, #135). A module
         # assigned under two attribute names — e.g. the v14 encoder's legacy
         # ``self.cross_attn = self.cross_attns[0]`` handle — appears in
@@ -341,11 +363,12 @@ class EmaTeacher(nn.Module):
                 continue
             seen.add(ptr)
             s_param = student_state[name]
-            if t_param.dtype.is_floating_point and s_param.dtype.is_floating_point:
+            if name in param_names:
                 ema_t.append(t_param)
                 ema_s.append(s_param)
             else:
-                # Non-float buffers (e.g. step counters) get copied verbatim.
+                # Buffers (step counters, running stats, float buffers) are
+                # copied verbatim — never EMA-blended.
                 t_param.copy_(s_param)
         # Fused multi-tensor EMA: one ``_foreach`` kernel pair for the whole
         # float param set instead of a per-tensor Python ``mul_/add_`` loop.

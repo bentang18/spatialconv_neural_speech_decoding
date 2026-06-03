@@ -201,6 +201,66 @@ def test_ema_foreach_matches_reference_sequential_loop() -> None:
         assert torch.equal(t_state[name], expected), f"{name}: foreach != sequential"
 
 
+# ---- EMA-BUFFER-1: float buffers copied verbatim, params EMA-blended --------
+
+
+class _ModuleWithFloatBuffer(nn.Module):
+    """A module with a registered persistent FLOAT buffer — the EMA-BUFFER-1
+    case. The buffer is float (same dtype as the param), so a dtype-based
+    param/buffer split would wrongly τ-blend it; the membership split must
+    copy it verbatim (EMA of running stats is not the V-JEPA contract)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(4, 4, bias=False)
+        self.register_buffer("running_scale", torch.ones(4))
+
+
+def test_ema_update_copies_float_buffer_verbatim_and_blends_param() -> None:
+    """EMA-BUFFER-1: on ``update_from`` a persistent FLOAT buffer is copied
+    VERBATIM from the student — never τ-blended — while a parameter under the
+    same module IS EMA-blended. The split is by ``named_parameters`` membership
+    (NOT dtype: buffer and param are both float here, so a dtype test would
+    misclassify the buffer)."""
+    coeff = 0.9
+    student = _ModuleWithFloatBuffer()
+    teacher = EmaTeacher(student, coeff_schedule=lambda _s: coeff)
+
+    # Distinct, known values so verbatim-copy vs EMA-blend give different results.
+    with torch.no_grad():
+        student.lin.weight.fill_(2.0)
+        student.running_scale.fill_(7.0)
+        teacher.model.lin.weight.fill_(10.0)
+        teacher.model.running_scale.fill_(3.0)
+
+    teacher.update_from(student)
+
+    # Param: EMA-blended → 10*0.9 + 2*0.1 = 9.2.
+    expected_param = 10.0 * coeff + 2.0 * (1.0 - coeff)
+    assert torch.allclose(teacher.model.lin.weight, torch.full((4, 4), expected_param))
+    # Float buffer: copied verbatim → 7.0 (NOT the blend 3*0.9 + 7*0.1 = 3.4).
+    assert torch.allclose(teacher.model.running_scale, torch.full((4,), 7.0))
+    blended = 3.0 * coeff + 7.0 * (1.0 - coeff)
+    assert not torch.allclose(teacher.model.running_scale, torch.full((4,), blended))
+
+
+# ---- EMA-BF16-STUCK: non-fp32 teacher params fail loud ----------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ema_update_rejects_non_fp32_teacher_params(dtype: torch.dtype) -> None:
+    """EMA-BF16-STUCK: τ=0.99925 → (1-τ)=7.5e-4, below the bf16/fp16 mantissa
+    spacing near O(0.25), so a low-precision teacher param's EMA increment
+    rounds to 0 and the teacher silently FREEZES. ``update_from`` must fail
+    loud on any non-fp32 float param (bf16-mixed autocast keeps params fp32;
+    a literal teacher ``.half()``/``.to(bf16)`` is the footgun)."""
+    student = nn.Linear(4, 4)
+    teacher = EmaTeacher(student, coeff_schedule=lambda _s: 0.99925)
+    teacher.model.to(dtype)  # low-precision teacher params — the footgun
+    with pytest.raises(RuntimeError, match="fp32"):
+        teacher.update_from(student)
+
+
 # ---- EMA-01 / B26: phase-aware decay schedules ------------------------------
 
 

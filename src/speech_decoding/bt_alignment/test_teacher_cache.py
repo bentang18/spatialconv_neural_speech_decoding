@@ -158,8 +158,45 @@ def test_write_clip_cache_round_trip(whisper_tiny):
             assert payload["t0_movie_s"] == 42.5
             assert payload["layer_merge"] == 3
             assert payload["features"].shape == (entry.n_frames, 384)
+            # TCACHE-KEY-1: model identity is the wrapped model's, NOT a hardcoded
+            # large-v3 constant — payload + path slug both reflect whisper-tiny.
+            assert payload["model"] == "openai/whisper-tiny"
+            assert "openai_whisper-tiny" in entry.out_path
     finally:
         fe.close()
+
+
+def test_write_clip_cache_keys_path_by_layer_merge(whisper_tiny):
+    """TCACHE-KEY-1: two configs that change the stored target (mean_all vs a
+    single layer) must land in DISJOINT paths under the same out_dir, even
+    with identical clip_id/film. The payload alone did not protect against an
+    alt-config silently reusing the dir and mixing two targets into one fit."""
+    model, proc = whisper_tiny
+    sr = WHISPER_SR
+    wav = (np.random.RandomState(0).randn(int(sr * 5.0)) * 0.1).astype(np.float32)
+    with tempfile.TemporaryDirectory() as td:
+        out_dir = Path(td)
+        fe_mean = WhisperFeatureExtractor(model, proc)           # mean_all
+        fe_l0 = WhisperFeatureExtractor(model, proc, layer_merge=0)
+        try:
+            e_mean = write_clip_cache(
+                fe_mean, wav, sample_rate=sr, clip_id="anchor_0",
+                film="megamind", t0_movie_s=1.0, out_dir=out_dir,
+            )
+            e_l0 = write_clip_cache(
+                fe_l0, wav, sample_rate=sr, clip_id="anchor_0",
+                film="megamind", t0_movie_s=1.0, out_dir=out_dir,
+            )
+        finally:
+            fe_mean.close()
+            fe_l0.close()
+        assert e_mean.out_path != e_l0.out_path
+        assert Path(e_mean.out_path).exists()
+        assert Path(e_l0.out_path).exists()
+        assert "mean_all" in e_mean.out_path
+        assert "L0" in e_l0.out_path
+        # Same filename, disjoint dirs → no collision.
+        assert Path(e_mean.out_path).name == Path(e_l0.out_path).name == "anchor_0.pt"
 
 
 # --- B33 per-channel target standardizer -------------------------------------

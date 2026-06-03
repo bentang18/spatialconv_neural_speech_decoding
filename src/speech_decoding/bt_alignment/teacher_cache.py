@@ -31,14 +31,17 @@ in the mel front-end (80→128 bins) and produces −10–20% WER on noisy speec
 Features are 1280-d at 50 Hz native: the 160-sample mel hop @ 16 kHz = 10 ms
 (100 Hz mel), and the encoder's 2× conv downsample → 50 Hz = one step per 20 ms.
 
-Cache schema (per clip):
-    out_dir / <film> / <clip_id>.pt   ->  dict({
+Cache schema (per clip). The model + layer-merge are folded into the PATH
+(not just the payload) so two target-defining configs can never be mixed into
+one stats fit / training set:
+    out_dir / <model_slug> / <layer_merge> / <film> / <clip_id>.pt   ->  dict({
         "features": Tensor of shape (T, 1280) float16,
         "rate_hz": 50,
         "t0_movie_s": float,  # absolute movie clock when feature[0] applies
-        "model": "openai/whisper-large-v3",
+        "model": str,  # the wrapped model's name_or_path, e.g. "openai/whisper-large-v3"
         "layer_merge": "mean_all",  # or an int for the single-layer sister
     })
+    # <model_slug> = model_name_or_path.replace("/", "_"); <layer_merge> = "mean_all" | f"L{int}"
 
 Implementation notes:
 - Registers a forward hook on every hooked encoder.layers[L] and takes the
@@ -171,7 +174,15 @@ def write_clip_cache(
     out_dir: Path,
     rate_hz: int = DEFAULT_TEACHER_HZ,
 ) -> TeacherCacheEntry:
-    """Extract layer-merged features for one clip and save to out_dir/<film>/<clip_id>.pt.
+    """Extract layer-merged features for one clip and save to
+    ``out_dir/<model_slug>/<layer_merge>/<film>/<clip_id>.pt``.
+
+    The two fields that DEFINE the stored target — the layer merge
+    (``mean_all`` vs the ``R-whisper-single-layer-L8`` sister) and the model —
+    are folded into the path, not just the payload. Two configs that produce
+    different Whisper targets therefore land in disjoint dirs and can never be
+    mixed into one :func:`fit_channel_stats` fit or one training set (the
+    payload alone did not protect against an alt-config reusing ``out_dir``).
 
     Precondition for the P3 path: the downstream 50→8 Hz pool requires exactly
     250 frames, so callers must feed exactly-5.0-s (80000-sample @ 16 kHz) clips.
@@ -180,15 +191,29 @@ def write_clip_cache(
     silently re-pooled)."""
     import torch
     feat = feature_extractor.extract(wav, sample_rate)
-    film_dir = out_dir / film
-    film_dir.mkdir(parents=True, exist_ok=True)
-    out_path = film_dir / f"{clip_id}.pt"
+    # Model identity comes from the wrapped model, NOT a constant — a constant
+    # would collide an alt-model (e.g. the whisper-tiny CPU smoke) with large-v3
+    # in one dir AND mislabel the payload's source. ``name_or_path`` is set by
+    # ``from_pretrained`` (the only constructor in this codebase). Fail loud on
+    # an empty name rather than collapse to ``out_dir/""/...`` and silently
+    # collide — the exact silent-landmine class this batch closes.
+    model_name = feature_extractor.model.name_or_path
+    if not model_name:
+        raise ValueError(
+            "feature_extractor.model has no name_or_path; cannot key the cache "
+            "by model. Load the Whisper model via from_pretrained(...)."
+        )
+    layer_merge = feature_extractor.layer_merge
+    merge_slug = "mean_all" if layer_merge == "mean_all" else f"L{int(layer_merge)}"
+    clip_dir = out_dir / model_name.replace("/", "_") / merge_slug / film
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    out_path = clip_dir / f"{clip_id}.pt"
     torch.save({
         "features": feat,
         "rate_hz": rate_hz,
         "t0_movie_s": float(t0_movie_s),
-        "model": "openai/whisper-large-v3",
-        "layer_merge": feature_extractor.layer_merge,
+        "model": model_name,
+        "layer_merge": layer_merge,
     }, out_path)
     return TeacherCacheEntry(
         clip_id=clip_id, film=film, t0_movie_s=float(t0_movie_s),
