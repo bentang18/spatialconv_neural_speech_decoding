@@ -327,8 +327,8 @@ class V14Phase3DistillModule(pl.LightningModule):
     def _phase_param_groups(self) -> list[tp.Any]:
         """3a: connector params only. 3b: 3 discriminative-LR groups.
 
-        3b groups (B33 §5): front-end @ ``base·frontend_lr_scale`` (=base/10),
-        parcel side @ ``base·parcel_lr_scale`` (=base/3), connector @ full base.
+        3b groups (B33 §5): front-end @ ``base·_FRONTEND_LR_SCALE`` (=base/10),
+        parcel side @ ``base·_PARCEL_LR_SCALE`` (=base/3), connector @ full base.
         """
         if self._stage == "3a":
             return self._connector_parameters()
