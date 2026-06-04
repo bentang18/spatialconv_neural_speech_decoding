@@ -304,13 +304,6 @@ def build_v14_experiment(
     # DataLoader worker count (B1.4e, 2026-05-29). >0 overlaps the per-sample
     # CPU STFT with GPU compute; pass --cpus-per-task >= num_workers + 1.
     num_workers: int = DEFAULT_NUM_WORKERS,
-    # Cap the MultiStftView extractor-cache build concurrency (exca MapInfra
-    # local processpool, map.py:488). None = exca default (min(n_items,
-    # os.cpu_count()-1)); on a memory-bounded allocation 2+ concurrent
-    # full-session raw loads (~10-22 GB each as float) OOM, so pass 1 to build
-    # serially (bit-identical cache, lower peak RAM). Only the heavy
-    # electrode_tokens build is capped; tiny metadata extractors are untouched.
-    extractor_build_max_jobs: int | None = None,
     n_epochs: int = DEFAULT_N_EPOCHS,
     seed: int = 33,
     exca_folder: str | None = None,
@@ -590,15 +583,6 @@ def build_v14_experiment(
     _apply_extractor_cache(
         electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
     )
-    # Memory guard: serialize the front-end cache build when asked. The
-    # MapInfra local pool runs min(n_items, os.cpu_count()-1, max_jobs) workers,
-    # and os.cpu_count() ignores the cgroup --cpus-per-task, so a 32 GB job on a
-    # many-core node otherwise loads several multi-GB raw sessions at once and
-    # OOMs. Bit-identical output; only the worker count changes.
-    if extractor_build_max_jobs is not None and hasattr(
-        electrode_tokens_extractor, "infra"
-    ):
-        electrode_tokens_extractor.infra.max_jobs = extractor_build_max_jobs
 
     # The encoder's ``ref_idx`` token must label the operator the
     # waveform actually saw. When the caller hands in a
@@ -1015,13 +999,6 @@ def _parser() -> argparse.ArgumentParser:
                    help="DataLoader worker processes (B1.4e, 2026-05-29). "
                         "0 starves the GPU on the per-sample CPU STFT; default "
                         "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
-    p.add_argument("--extractor-build-max-jobs", type=int, default=None,
-                   help="Cap MultiStftView cache-build concurrency (exca "
-                        "MapInfra local pool). Default None = exca default "
-                        "(min(n_items, os.cpu_count()-1)), which ignores "
-                        "--cpus-per-task and OOMs a memory-bounded job on "
-                        "multiple concurrent multi-GB raw loads. Pass 1 to "
-                        "build serially (bit-identical cache, lower peak RAM).")
     p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS)
     p.add_argument("--clip-len", type=float, default=None,
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
@@ -1449,7 +1426,6 @@ def _common_build_kwargs(
         eps=args.eps, d_model=args.d_model, depth=args.depth,
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        extractor_build_max_jobs=args.extractor_build_max_jobs,
         n_epochs=args.n_epochs,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
         slurm_partition=args.slurm_partition,
