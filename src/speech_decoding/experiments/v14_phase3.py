@@ -91,12 +91,6 @@ class V14Phase3DistillModule(pl.LightningModule):
     (connector-only warmup), ``"3b"`` unfreezes it with a discriminative LR.
     """
 
-    # B33 §5 discriminative-LR scales for 3b (pinned, not a sweep axis — mirrors
-    # the sibling V14JointBrainModule's ClassVar convention). Front-end rides at
-    # base/10 (pretrained in P1 + as the P2 LR/10 group); parcel side at base/3.
-    _FRONTEND_LR_SCALE: tp.ClassVar[float] = 0.1
-    _PARCEL_LR_SCALE: tp.ClassVar[float] = 1.0 / 3.0
-
     def __init__(
         self,
         *,
@@ -109,12 +103,28 @@ class V14Phase3DistillModule(pl.LightningModule):
         standardizer: tp.Optional[TargetStandardizer] = None,
         pma: tp.Optional[V14ParcelCollapsePMA] = None,
         projector: tp.Optional[StudentWhisperProjector] = None,
+        frontend_lr_scale: float = 0.1,
+        parcel_lr_scale: float = 1.0 / 3.0,
     ) -> None:
         super().__init__()
         if stage not in tp.get_args(_Stage):
             raise ValueError(f"stage={stage!r} not in {tp.get_args(_Stage)}")
+        # B33 §5 discriminative-LR scales for 3b, now hyperparameters. Front-end
+        # rides at base·frontend_lr_scale (default 0.1 = base/10; pretrained in
+        # P1 + the P2 LR/10 group); parcel side at base·parcel_lr_scale
+        # (default 1/3 = base/3). 0.0 freezes that sub-group in 3b
+        # (R-3b-frontend-frozen / R-3b-parcel-frozen); a uniform 1.0/1.0 is
+        # R-3b-lr-uniform. >1.0 would out-pace the connector — rejected.
+        for _nm, _sc in (
+            ("frontend_lr_scale", frontend_lr_scale),
+            ("parcel_lr_scale", parcel_lr_scale),
+        ):
+            if not 0.0 <= _sc <= 1.0:
+                raise ValueError(f"{_nm} must lie in [0.0, 1.0]; got {_sc}")
 
         self.encoder = encoder
+        self._frontend_lr_scale = frontend_lr_scale
+        self._parcel_lr_scale = parcel_lr_scale
         # Default freeze=False ⇒ the P3 connector trains; the encoder freeze
         # is applied separately by stage below so 3a/3b share one construction.
         self.pma = pma or V14ParcelCollapsePMA(encoder.d_model, pma_n_heads)
@@ -142,9 +152,21 @@ class V14Phase3DistillModule(pl.LightningModule):
         contract the optimizer param-groups and the unit tests both read; 3a
         additionally runs the encoder forward under ``no_grad`` (see
         :meth:`_encoder_taps`) so frozen-encoder activations are never retained.
+
+        In 3b a ``0.0`` LR scale freezes that encoder sub-group
+        (R-3b-frontend-frozen / R-3b-parcel-frozen): the sub-group keeps
+        ``requires_grad=False`` and is dropped from the optimizer.
         """
         train_encoder = self._stage == "3b"
         self.encoder.requires_grad_(train_encoder)
+        if train_encoder:
+            frontend, parcel = self.encoder.partition_parameters_for_staging()
+            if self._frontend_lr_scale == 0.0:
+                for p in frontend:
+                    p.requires_grad_(False)
+            if self._parcel_lr_scale == 0.0:
+                for p in parcel:
+                    p.requires_grad_(False)
         self.pma.requires_grad_(True)
         self.projector.requires_grad_(True)
 
@@ -325,20 +347,26 @@ class V14Phase3DistillModule(pl.LightningModule):
         return float(lr)
 
     def _phase_param_groups(self) -> list[tp.Any]:
-        """3a: connector params only. 3b: 3 discriminative-LR groups.
+        """3a: connector params only. 3b: up to 3 discriminative-LR groups.
 
-        3b groups (B33 §5): front-end @ ``base·_FRONTEND_LR_SCALE`` (=base/10),
-        parcel side @ ``base·_PARCEL_LR_SCALE`` (=base/3), connector @ full base.
+        3b groups (B33 §5, now hyperparameters): front-end @
+        ``base·frontend_lr_scale`` (default base/10), parcel side @
+        ``base·parcel_lr_scale`` (default base/3), connector @ full base. A
+        ``0.0`` scale drops that group (the sub-group is frozen in
+        :meth:`_apply_stage_freeze`), so the frozen falsifiers run with 2
+        groups. The connector group is always present.
         """
         if self._stage == "3a":
             return self._connector_parameters()
         frontend, parcel = self.encoder.partition_parameters_for_staging()
         base_lr = self._base_lr()
-        return [
-            {"params": frontend, "lr": base_lr * self._FRONTEND_LR_SCALE},
-            {"params": parcel, "lr": base_lr * self._PARCEL_LR_SCALE},
-            {"params": self._connector_parameters(), "lr": base_lr},
-        ]
+        groups: list[tp.Any] = []
+        if self._frontend_lr_scale > 0.0:
+            groups.append({"params": frontend, "lr": base_lr * self._frontend_lr_scale})
+        if self._parcel_lr_scale > 0.0:
+            groups.append({"params": parcel, "lr": base_lr * self._parcel_lr_scale})
+        groups.append({"params": self._connector_parameters(), "lr": base_lr})
+        return groups
 
     def _estimated_total_steps(self) -> int | None:
         try:
@@ -384,6 +412,14 @@ class V14Phase3Experiment(V14Experiment):
     distill: PhaseThreeDistillationConfig = pydantic.Field(
         default_factory=PhaseThreeDistillationConfig,
     )
+    # B33 §5 3b discriminative-LR scales, now hyperparameters. Front-end @
+    # base·frontend_lr_scale (default 0.1 = base/10); parcel side @
+    # base·parcel_lr_scale (default 1/3 = base/3); connector @ full base.
+    # Falsifiers: 0.0 freezes that sub-group (R-3b-frontend-frozen /
+    # R-3b-parcel-frozen); 1.0/1.0 = R-3b-lr-uniform. No effect under 3a
+    # (connector-only warmup).
+    frontend_lr_scale: float = pydantic.Field(default=0.1, ge=0.0, le=1.0)
+    parcel_lr_scale: float = pydantic.Field(default=1.0 / 3.0, ge=0.0, le=1.0)
 
     def model_post_init(self, _ctx) -> None:  # type: ignore[override]
         super().model_post_init(_ctx)
@@ -436,6 +472,8 @@ class V14Phase3Experiment(V14Experiment):
             projector_mode=self.projector_mode,
             distill_config=self.distill,
             standardizer=self._build_standardizer(),
+            frontend_lr_scale=self.frontend_lr_scale,
+            parcel_lr_scale=self.parcel_lr_scale,
         )
 
 

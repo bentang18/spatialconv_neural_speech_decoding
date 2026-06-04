@@ -210,6 +210,14 @@ class V14JointExperiment(V14Experiment):
     predictor_scope: Literal["cross_time", "co_temporal"] = "cross_time"
     mask_seed: int = 0
 
+    # B36 WS-E E2 LR-staging hyperparameter (P2 only). The front-end was
+    # pretrained in P1; in P2 it rides at ``base_lr · frontend_lr_scale`` while
+    # the fresh parcel side + predictor get full base LR. Default 0.1 (base/10).
+    # Falsifiers: 0.0 = R-p2-freeze-frontend (front-end frozen, parcel-only);
+    # 0.2 = R-p2-frontend-lr-5 (base/5). No effect under jepa_phase="p1" (the
+    # front-end is the only trained group there).
+    frontend_lr_scale: float = pydantic.Field(default=0.1, ge=0.0, le=1.0)
+
     # B31 ``loss_variant`` field RETAINED for dispatch config-record
     # compatibility (``dispatch_v14`` passes it through), but B36 WS-B
     # replaced the multi-term aggregator path with the single-term masked
@@ -332,6 +340,7 @@ class V14JointExperiment(V14Experiment):
             loss_form="l1",
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
+            frontend_lr_scale=self.frontend_lr_scale,
         )
 
 

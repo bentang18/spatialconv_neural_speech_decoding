@@ -332,7 +332,7 @@
 
 ### SCAFFOLD-04: DCohortStudy scaffold
 - **Severity**: SCAFFOLD
-- **File**: `src/speech_decoding/studies/cogan_dcohort/study.py` (extend; scaffold exists with `2000 Hz sample rate, DP03 gated`)
+- **File**: `src/speech_decoding/studies/cogan_dcohort/study.py` (extend; scaffold exists, `DP03 gated`. Native rate is **mixed, mostly 2048 Hz** — NOT a flat 2000 Hz; loader reads per-run rate + resamples to 2048. See `memory/project_d_cohort_data_inventory_2026_06_03.md`)
 - **Change**: NeuralFetch Study contract; full 30-bin valid range; mains notch 60 Hz; 85 D-cohort subjects per audit 2026-05-23.
 - **Citation**: DP03; `project_d_cohort_phase2_cohort_audit_2026_05_23.md`
 

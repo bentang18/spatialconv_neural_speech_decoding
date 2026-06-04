@@ -188,13 +188,22 @@ def _word_event_rows(
                     "subject_id": str(subject_id),
                     "trial_id": str(trial_id),
                     "timeline": timeline,
+                    # MOVIE-clock onset (seconds into the movie audio), for the
+                    # P3 Whisper-teacher join (WS-H / WhisperTargetExtractor). This
+                    # is the transcript `start`, NOT `est_idx/SR` above: the two
+                    # diverge by the per-trial neural-vs-movie drift (235-904 s,
+                    # FLAG 9). The neural window slices at `start` (neural clock);
+                    # the audio-keyed teacher cache is indexed by movie time, so
+                    # it MUST slice at `movie_onset_s`. Both words_df and
+                    # nonverbal_df carry the movie-clock column `start`.
+                    "movie_onset_s": float(source["start"]),
                 }
             )
     if not rows:
         return pd.DataFrame(
             {col: pd.Series(dtype=object) for col in (
                 "type", "start", "duration", "text", "task", "label",
-                "subject_id", "trial_id", "timeline",
+                "subject_id", "trial_id", "timeline", "movie_onset_s",
             )}
         )
     return pd.DataFrame(rows).reset_index(drop=True)

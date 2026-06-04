@@ -144,6 +144,27 @@ def test_session_robust_z_uses_train_stats_not_clip_stats() -> None:
     torch.testing.assert_close(z, torch.ones_like(z), atol=1e-4, rtol=1e-4)
 
 
+def test_session_robust_z_zeros_constant_nonzero_bin_under_jitter() -> None:
+    """σ-floor zeroing (mutant guard): a bin CONSTANT but NONZERO across the
+    training session (median≠0, σ=0) must transform to exactly 0 even when a clip
+    jitters it slightly. Without ``transform``'s ``where(sigma >= floor, z, 0)``
+    branch, ``(7.001 − 7.0) / max(0, 1e-6)`` blows the jitter up to ~1e3. This is
+    distinct from the all-zero pad-channel case (median is nonzero here), and from
+    the per-call ``robust_z`` floor tests (this pins the FROZEN-stat transform)."""
+    torch.manual_seed(5)
+    session = torch.randn(2, 4, 300)
+    session[:, 1, :] = 7.0  # bin (·,1,·): constant nonzero → median 7, MAD 0, σ 0
+    norm = SessionRobustZNormalizer(sigma_floor=1e-6).fit(session)
+    assert torch.allclose(norm.sigma[:, 1], torch.zeros_like(norm.sigma[:, 1]))
+    assert torch.allclose(norm.median[:, 1], torch.full_like(norm.median[:, 1], 7.0))
+
+    clip = torch.randn(2, 4, 10)
+    clip[:, 1, :] = 7.0 + 1e-3 * torch.randn(2, 10)  # small jitter around the constant
+    z = norm.transform(clip)
+    torch.testing.assert_close(z[:, 1], torch.zeros_like(z[:, 1]), atol=0.0, rtol=0.0)
+    assert torch.isfinite(z).all()
+
+
 def test_session_robust_z_transform_before_fit_raises() -> None:
     import pytest
 

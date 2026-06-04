@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from neuraltrain import BaseLoss, BaseMetric, BaseModelConfig, LightningOptimizer
 from neuraltrain.utils import BaseExperiment, CsvLoggerConfig, WandbLoggerConfig
 
+from speech_decoding.experiments.collapse_guard import CollapseGuardCallback
 from speech_decoding.experiments.data import Data
 from speech_decoding.experiments.experiment_logging import ExperimentLogger
 from speech_decoding.experiments.module import BrainModule
@@ -48,6 +49,28 @@ class Experiment(BaseExperiment):
 
     seed: int = 33
     n_epochs: int = 1
+    # Optional step budget for SSL/distill phases. When set it caps training at
+    # ``max_steps`` optimizer steps and disables the epoch cap (``max_epochs=-1``)
+    # so ``estimated_stepping_batches`` equals ``max_steps`` exactly. ``None``
+    # (default) keeps the epoch budget. Real SSL runs over multi-hundred-hour
+    # corpora are budgeted in steps, not epochs — "1 epoch" over the joint corpus
+    # is enormous and uneven across phases. NOTE: no LR scheduler is currently
+    # configured in the v14 dispatch optim (constant LR); if a warmup/cosine
+    # schedule is added later, ``estimated_stepping_batches`` already feeds its
+    # ``total_steps`` via ``configure_optimizers`` so the horizon tracks this cap.
+    max_steps: int | None = None
+    # Lightning ``gradient_clip_val``. ``None`` (default) → no clipping
+    # (back-compat for the tiny test experiments). The v14 §7 recipe locks
+    # ``grad_clip = 1.0`` as a non-swept universal; the v14 dispatch sets it.
+    gradient_clip_val: float | None = None
+    # Lightning ``accumulate_grad_batches``. 1 (default) → no accumulation, bit
+    # -for-bit the prior behavior. >1 sums grads over N micro-batches before each
+    # optimizer step → effective batch = batch_size * N, at N× the wall-clock per
+    # step (it does NOT reduce the per-step horizon — ``max_steps`` still counts
+    # optimizer steps, so ``estimated_stepping_batches`` already tracks the right
+    # cosine horizon). The effective-batch lever for the 32 GB card when a bigger
+    # GPU is unavailable; a larger physical batch on a 48 GB+ card is preferred.
+    accumulate_grad_batches: int = 1
     x_name: str | tuple[str, ...] = "input"
     y_name: str = "target"
     target_field: str = "code"
@@ -69,6 +92,13 @@ class Experiment(BaseExperiment):
     limit_test_batches: int | float | None = None
     early_stopping_patience: int | None = None
     checkpoint_monitor: str = "val_loss"
+    collapse_guard: bool = True
+    # Validation cadence as a step count. On a ``max_steps``-budgeted SSL
+    # phase that ends mid-epoch (1500 steps < one BT-lite epoch), epoch-
+    # boundary validation never runs, so the collapse-guard soft panel
+    # would never evaluate. Setting this forces validation every N steps.
+    # ``None`` → Lightning's default (epoch-boundary only).
+    val_check_interval: int | float | None = None
     csv_config: CsvLoggerConfig | None = None
     wandb_config: WandbLoggerConfig | None = None
     # B36 WS-E (E3/E4): cross-phase checkpoint handoff. ``pretrained_ckpt``
@@ -111,6 +141,29 @@ class Experiment(BaseExperiment):
             y_name=self.y_name,
         )
 
+    def _artifact_root(self) -> Path | None:
+        """Per-run root for Lightning side-artifacts (checkpoints, CSV logs).
+
+        Routes them under this config's unique exca ``uid_folder`` so chained
+        phases (P1→P2→P3→P4, each a distinct exca UID via ``clone_obj``) and
+        grid cells never collide on a shared ``checkpoints/`` or
+        ``lightning_logs/version_N`` — each phase/cell owns its own subtree and
+        keeps a stable ``best.ckpt``/``last.ckpt`` rather than Lightning's
+        ``-v1`` auto-increment. Falls back to ``infra.folder`` (the prior flat
+        layout) when no ``uid_folder`` is available, matching
+        :meth:`_artifact_dir_and_uid`'s own fallback so that edge is unchanged.
+
+        Note the cross-phase warm-start handoff is unaffected: it uses explicit
+        ``snapshot_ckpt_to`` / ``pretrained_ckpt`` paths, not this auto dir.
+        """
+        if self.infra.folder is None:
+            return None
+        try:
+            uid_folder = self.infra.uid_folder(create=True)
+        except RuntimeError:
+            uid_folder = None
+        return Path(uid_folder) if uid_folder is not None else Path(self.infra.folder)
+
     def _logger(self) -> Logger | list[Logger]:
         loggers: list[Logger] = []
         if self.csv_config is not None:
@@ -119,16 +172,18 @@ class Experiment(BaseExperiment):
             loggers.append(self.wandb_config.build())
         if loggers:
             return loggers
-        if self.infra.folder is not None:
-            return CSVLogger(save_dir=str(Path(self.infra.folder) / "lightning"))
+        root = self._artifact_root()
+        if root is not None:
+            return CSVLogger(save_dir=str(root / "lightning"))
         return DummyLogger()
 
     def _callbacks(self) -> list[pl.Callback]:
         callbacks: list[pl.Callback] = [LearningRateMonitor(logging_interval="epoch")]
-        if self.infra.folder is not None:
+        root = self._artifact_root()
+        if root is not None:
             callbacks.append(
                 ModelCheckpoint(
-                    dirpath=str(Path(self.infra.folder) / "checkpoints"),
+                    dirpath=str(root / "checkpoints"),
                     filename="best",
                     monitor=self.checkpoint_monitor,
                     save_last=True,
@@ -143,6 +198,14 @@ class Experiment(BaseExperiment):
                     patience=self.early_stopping_patience,
                 )
             )
+        # #54: active collapse/divergence kill switch. Disarmed under
+        # fast_dev_run (a 1-batch smoke would never reach the sustain
+        # window and the soft alarms are noisy on a single batch); the
+        # non-finite-loss catch is irrelevant there too. Writes its
+        # diagnosis JSON next to the checkpoints (``root`` may be None on
+        # an infra-less run — the guard still aborts, just skips the file).
+        if self.collapse_guard and not self.fast_dev_run:
+            callbacks.append(CollapseGuardCallback(artifact_root=root))
         return callbacks
 
     def _trainer(self) -> pl.Trainer:
@@ -156,6 +219,15 @@ class Experiment(BaseExperiment):
             "enable_checkpointing": self.infra.folder is not None,
             "fast_dev_run": self.fast_dev_run,
         }
+        if self.max_steps is not None:
+            # Step budget overrides the epoch cap; max_epochs=-1 lets the run go
+            # the full max_steps (estimated_stepping_batches == max_steps).
+            kwargs["max_steps"] = self.max_steps
+            kwargs["max_epochs"] = -1
+        if self.val_check_interval is not None:
+            # A step-count cadence so the collapse-guard soft panel runs on
+            # a max_steps phase that never reaches an epoch boundary.
+            kwargs["val_check_interval"] = self.val_check_interval
         if self.limit_train_batches is not None:
             kwargs["limit_train_batches"] = self.limit_train_batches
         if self.limit_val_batches is not None:
@@ -164,6 +236,10 @@ class Experiment(BaseExperiment):
             kwargs["limit_test_batches"] = self.limit_test_batches
         if self.precision is not None:
             kwargs["precision"] = self.precision
+        if self.gradient_clip_val is not None:
+            kwargs["gradient_clip_val"] = self.gradient_clip_val
+        if self.accumulate_grad_batches != 1:
+            kwargs["accumulate_grad_batches"] = self.accumulate_grad_batches
         return pl.Trainer(**kwargs)
 
     def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:
@@ -190,6 +266,20 @@ class Experiment(BaseExperiment):
             raise TypeError(
                 f"{type(brain_module).__name__} has no load_transferable_state; "
                 "pretrained_ckpt handoff needs the transferable-state protocol."
+            )
+        # Gate-D fix: `_snapshot` runs INSIDE the exca-cached `run()` body, so a
+        # cache-HIT phase returns its stored result without re-writing its
+        # snapshot. If the prior phase's `.ckpt` was purged (e.g. a `--work-dir`
+        # on /work's 75-day-purge tier while the exca metadata cache persists)
+        # the bare torch.load below would raise an opaque FileNotFoundError on a
+        # re-run. Fail with an actionable message instead.
+        if not Path(ckpt_path).is_file():
+            raise FileNotFoundError(
+                f"pretrained_ckpt {ckpt_path!r} is missing. The prior phase's "
+                "snapshot is written inside its exca-cached run(), so a cache-hit "
+                "on a purged/cleared work_dir leaves no .ckpt to warm-start from. "
+                "Re-run the prior phase with its exca cache cleared, or keep "
+                "--work-dir on the same persistence tier as EXCA_CACHE_FOLDER."
             )
         # weights_only=True: the snapshot is a pure dict-of-tensor-dicts
         # (``transferable_state``); load it under the safe unpickler.
@@ -223,11 +313,31 @@ class Experiment(BaseExperiment):
         trainer = self._trainer()
         if not self.test_only:
             trainer.fit(brain_module, loaders["train"], loaders["val"])
-        results = trainer.test(brain_module, loaders["test"])
+        results = trainer.test(
+            brain_module, loaders["test"], ckpt_path=self._test_ckpt_path(trainer),
+        )
         # B36 WS-E (E3): snapshot this phase's transferable state for the next.
         if self.snapshot_ckpt_to is not None:
             self._snapshot(brain_module, self.snapshot_ckpt_to)
         return dict(results[0]) if results else {}
+
+    def _test_ckpt_path(self, trainer: pl.Trainer) -> str | None:
+        """Which weights the test pass evaluates: val-best when early-stopping
+        ran, else the in-memory (last) weights.
+
+        EarlyStopping does NOT restore best weights, so after it fires the module
+        sits ``patience`` epochs past the val optimum — reporting the P4 submission
+        metric on those over-fit weights would undercut the early-stop. So the one
+        phase that early-stops (the supervised P4 probe) tests its ``best.ckpt``.
+        The SSL/distill phases never early-stop: they keep last-epoch weights, and
+        the cross-phase ``_snapshot`` handoff snapshots those same last-epoch
+        weights (unchanged). Falls back to in-memory if no best checkpoint was
+        written (e.g. a step budget that stops before the first validation)."""
+        if self.early_stopping_patience is None or self.test_only:
+            return None
+        cb = trainer.checkpoint_callback
+        best = getattr(cb, "best_model_path", "") if cb is not None else ""
+        return "best" if best else None
 
     @infra.apply
     def run(self) -> dict[str, float | None]:

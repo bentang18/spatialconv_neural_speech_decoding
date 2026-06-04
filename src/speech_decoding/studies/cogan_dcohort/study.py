@@ -2,8 +2,8 @@
 
 Per ``docs/neuroprobe/v14_blockers.md`` DP03 the decision-*candidate* is to
 implement ``studies/cogan_dcohort/`` as a Study subclass mirroring
-``Wang2024Treebank`` and anatomy-bearing via native FS recons + Pipeline C
-``aparc.BN_atlas+aseg``. The D-cohort is the Cogan-lab Duke sEEG cohort
+``Wang2024Treebank`` and anatomy-bearing via native FS recons (DK
+``aparc+aseg`` is present directly in the recon CSVs). The D-cohort is the Cogan-lab Duke sEEG cohort
 referenced in ``CLAUDE.md §Key Files`` (``D<num>`` = Stage-3 scope sEEG
 patients, distinct from ``S<num>`` PS uECoG).
 
@@ -42,14 +42,15 @@ class DCohortStudy(study.Study):
     """Cogan-lab Duke sEEG D-cohort (D<num> patients).
 
     Anatomy-bearing under v14: per-subject DK parcel routing via native
-    FreeSurfer recons + Pipeline C ``aparc.BN_atlas+aseg``. The class
-    declaration exists so dispatch can reference it; all data-loading
-    methods raise until DP03 (subpackage contract) lands.
+    FreeSurfer recons (DK ``aparc+aseg`` is present directly in the recon
+    CSVs — no Pipeline C derivation needed). The class declaration exists
+    so dispatch can reference it; all data-loading methods raise until DP03
+    (subpackage contract) lands.
 
-    NOTE: D-cohort sample rate is 2000 Hz (vs Wang2024Treebank 2048 Hz);
-    the Multi-STFT common-hop=128 (16 Hz front-end / 8 Hz latent, hop=128
-    re-lock 2026-06-03) stays valid; the bin-frequency mapping differs
-    slightly and must be honored in the corpus valid-bin mask.
+    NOTE: D-cohort native rate is MIXED (mostly 2048 Hz; also 2000 / 1024 /
+    1000 Hz across runs) — NOT a flat 2000 Hz. Loader reads the per-run rate
+    and resamples to the v14 canonical 2048 Hz; after resample all 30
+    Multi-STFT bins are valid. Inventory: ``memory/project_d_cohort_data_inventory_2026_06_03.md``.
     """
 
     aliases: tp.ClassVar[tuple[str, ...]] = (
@@ -60,21 +61,25 @@ class DCohortStudy(study.Study):
     licence: tp.ClassVar[str] = "Internal Cogan-lab data; IRB-restricted."
     description: tp.ClassVar[str] = (
         "Cogan-lab Duke sEEG D-cohort (D<num> patients). Anatomy-bearing via "
-        "native FS recons + Pipeline C aparc.BN_atlas+aseg. Distinct from "
+        "native FS recons (DK aparc+aseg present in recon CSVs). Distinct from "
         "the PS S<num> uECoG cohort."
     )
     requirements: tp.ClassVar[tuple[str, ...]] = ()
     _info: tp.ClassVar[study.StudyInfo | None] = None
 
-    SAMPLE_RATE_HZ: tp.ClassVar[float] = 2000.0
+    # v14 canonical RESAMPLE TARGET. Native rate is mixed (mostly 2048; also
+    # 2000 / 1024 / 1000 across runs); loader resamples per-run to this.
+    SAMPLE_RATE_HZ: tp.ClassVar[float] = 2048.0
     # US site (Duke); v14 dispatch's 60 Hz notch already correct.
     MAINS_NOTCH_HZ: tp.ClassVar[float] = 60.0
     # Half-open ``(start, stop)`` of the trainable v14 30-bin filterbank.
-    # D-cohort 2000 Hz → all 30 bins valid → ``(0, 30)``.
+    # After resample to 2048 Hz → all 30 bins valid → ``(0, 30)``.
     VALID_BIN_RANGE: tp.ClassVar[tuple[int, int]] = (0, 30)
-    # D-cohort cohort audit 2026-05-23 (project_d_cohort_phase2_cohort_audit_2026_05_23):
-    # 85 / 87 D-pts pass FS+RAS+`.fif` gate.
-    N_UNIQUE_PATIENTS: tp.ClassVar[int] = 85
+    # Speech-subset FS gate (project_d_cohort_data_inventory_2026_06_03):
+    # 87 / 87 D-pts pass — D107/D139 earlier mis-flagged (recons live under
+    # suffix variants D107A/B, D139A/B). Full inventory has 113 task subjects,
+    # 134 recon-localized.
+    N_UNIQUE_PATIENTS: tp.ClassVar[int] = 87
 
     def _download(self) -> None:
         raise NotImplementedError(_BLOCKER_MSG)

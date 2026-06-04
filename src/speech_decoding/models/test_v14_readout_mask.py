@@ -178,6 +178,7 @@ def test_wrapper_passes_latent_valid_computed_from_support_and_mask() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=3, n_time_bins=5, k_parcels=3,
         d_model=D_MODEL, n_heads=N_HEADS, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=3 config
     )
     model = cfg.build(n_outputs=N_CLASSES)
     assert isinstance(model, V14ParcelPerceiverWithHead)
@@ -218,6 +219,7 @@ def test_wrapper_passes_latent_valid_when_valid_mask_absent() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=3, n_time_bins=5, k_parcels=3,
         d_model=D_MODEL, n_heads=N_HEADS, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=3 config
     )
     model = cfg.build(n_outputs=N_CLASSES)
     model.eval()

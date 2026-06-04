@@ -59,13 +59,38 @@ selects 38 bins.
 from __future__ import annotations
 
 import functools
+import json
+import logging
 import typing as tp
+from pathlib import Path
 
 import numpy as np
 import torch
 from neuralset.base import TimedArray
+from pydantic import model_validator
 
+from speech_decoding.extractors.quality import lof_bad_channel_mask
 from speech_decoding.extractors.reference import CARIeegExtractor
+from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+logger = logging.getLogger(__name__)
+
+
+def _reset_infra_uid_cache(infra) -> None:
+    """Clear exca's MEMOIZED uid on a freshly model_copy(deep=True)'d infra so it
+    recomputes from its own (post-update) config. ``model_copy(deep=True)`` deep-
+    copies the memo (``_uid`` and ``_state.uid``); if the source infra's uid was
+    ever computed before the copy, the copy would otherwise return the SOURCE's
+    stale uid — silently writing to the wrong cache namespace. Touches only ``_uid``
+    and ``_state.uid`` (NOT ``_uid_string``, the format template, which ``uid()``
+    needs). Defensive: a no-op if exca's internals move, never raises — worst case
+    reverts to the order-dependent behavior that is correct on today's path."""
+    priv = getattr(infra, "__pydantic_private__", None) or {}
+    if "_uid" in priv:
+        priv["_uid"] = None
+    state = priv.get("_state")
+    if state is not None and hasattr(state, "uid"):
+        state.uid = None
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +104,71 @@ MULTI_STFT_HALF_BW_OCTAVES: float = 0.5            # triangular kernel half-widt
 # Routing per the 5/22 spec: which STFT each output bin sources from.
 # Index 0 = STFT_low (Nperseg=1024), 1 = STFT_mid (Nperseg=512), 2 = STFT_hi (Nperseg=256).
 MULTI_STFT_ROUTING: tuple[int, ...] = tuple([0] * 15 + [1] * 7 + [2] * 8)
+
+
+# ---------------------------------------------------------------------------
+# FE-RAW-1 (2026-06-04): raw |STFT| bins replace the const-Q filterbank as the
+# live front end. Spec: reports/fe_raw_frontend_handoff_2026_06_04.md §4.2.
+#
+# Non-overlapping crossovers at 32 / 152 Hz, drop-delta floor 4 Hz, cap 192 Hz.
+# Each (nperseg, k_start, k_end) selects the inclusive rfft-bin slice for one
+# source STFT; ``k = f / Δf`` with Δf = sample_rate / nperseg. At 2048 Hz:
+#   low  (Δf=2)  k2 (4 Hz)  … k15 (30 Hz)   → 14 bins
+#   mid  (Δf=4)  k8 (32 Hz) … k37 (148 Hz)  → 30 bins
+#   hi   (Δf=8)  k19 (152)  … k24 (192 Hz)  → 6 bins
+# Concatenation order low → mid → hi gives a strictly-increasing, piecewise-
+# uniform (2/4/8 Hz) freq axis of length F_RAW = 50.
+# ---------------------------------------------------------------------------
+F_RAW: int = 50
+# (stft_idx, k_start, k_end inclusive). stft_idx 0=low(1024) 1=mid(512) 2=hi(256).
+MULTI_STFT_RAW_BINS: tuple[tuple[int, int, int], ...] = (
+    (0, 2, 15),
+    (1, 8, 37),
+    (2, 19, 24),
+)
+
+
+def multi_stft_raw_bin_freqs_hz(
+    *,
+    sample_rate: int = 2048,
+    nperseg_low: int = 1024,
+    nperseg_mid: int = 512,
+    nperseg_hi: int = 256,
+    raw_bins: tuple[tuple[int, int, int], ...] = MULTI_STFT_RAW_BINS,
+) -> torch.Tensor:
+    """Center frequencies of the F=50 raw-|STFT| bins, in concat order
+    (low → mid → hi). Strictly increasing by construction (§4.2)."""
+    nperseg_by_stft = {0: nperseg_low, 1: nperseg_mid, 2: nperseg_hi}
+    freqs: list[float] = []
+    for s_idx, k0, k1 in raw_bins:
+        rfftfreq = torch.fft.rfftfreq(nperseg_by_stft[s_idx], d=1.0 / sample_rate)
+        freqs.extend(float(rfftfreq[k]) for k in range(k0, k1 + 1))
+    return torch.tensor(freqs)
+
+
+def multi_stft_raw_valid_bin_mask(
+    *,
+    passband_low_hz: float,
+    passband_high_hz: float,
+    sample_rate: int = 2048,
+    nperseg_low: int = 1024,
+    nperseg_mid: int = 512,
+    nperseg_hi: int = 256,
+    raw_bins: tuple[tuple[int, int, int], ...] = MULTI_STFT_RAW_BINS,
+) -> torch.Tensor:
+    """Per-corpus valid-bin mask for the raw front end (FE-RAW-1 §4.4) — the
+    raw analog of :func:`multi_stft_valid_bin_mask`. A raw bin is valid iff its
+    center frequency lies in ``[passband_low_hz, passband_high_hz]`` (point-
+    frequency test, replacing the filterbank's triangular-overlap criterion).
+
+    BT / D-cohort (broadband) → all 50 valid. SWEC / AJILE12 (≤ 120 Hz) → 37
+    valid (low 14 + mid k8–k30 = 32–120 Hz) / 13 invalid (mid k31–k37 + hi).
+    """
+    freqs = multi_stft_raw_bin_freqs_hz(
+        sample_rate=sample_rate, nperseg_low=nperseg_low,
+        nperseg_mid=nperseg_mid, nperseg_hi=nperseg_hi, raw_bins=raw_bins,
+    )
+    return (freqs >= passband_low_hz) & (freqs <= passband_high_hz)
 
 
 def multi_stft_bin_centers_hz(
@@ -262,6 +352,62 @@ def _multi_stft_view(
     return out
 
 
+def _multi_stft_raw_view(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    hop_length: int,
+    nperseg_low: int,
+    nperseg_mid: int,
+    nperseg_hi: int,
+    raw_bins: tuple[tuple[int, int, int], ...],
+    log_eps: float,
+    apply_log: bool = False,
+) -> torch.Tensor:
+    """FE-RAW-1 (§4.2): raw |STFT| bins, no filterbank.
+
+    Runs the same three STFTs as :func:`_multi_stft_view` (Hann, ``center=True``,
+    ``normalized=False``, value axis = raw ``|STFT|``) and concatenates the
+    exact rfft-bin slices in ``raw_bins`` (inclusive k ranges), low → mid → hi.
+    Input ``(..., C, T_samples)`` → output ``(..., C, F_RAW, T_bin)`` with
+    ``T_bin`` shared across STFTs (common hop). The STFT call is byte-identical
+    to the const-Q path; only the bin *selection* differs.
+    """
+    nps_by_stft = {0: nperseg_low, 1: nperseg_mid, 2: nperseg_hi}
+    mag_stfts: dict[int, torch.Tensor] = {}
+    for s_idx, nps in nps_by_stft.items():
+        win = torch.hann_window(nps, device=waveform.device)
+        wf = waveform
+        if wf.shape[-1] < nps:
+            # NeuralSet's prepare() probes with sub-second inputs — pad so
+            # torch.stft(center=True) can reflect-pad without crashing. Real
+            # 1 s windows never hit this branch.
+            wf = torch.nn.functional.pad(wf, (0, nps - wf.shape[-1]))
+        spec = torch.stft(
+            wf,
+            n_fft=nps,
+            hop_length=hop_length,
+            win_length=nps,
+            window=win,
+            return_complex=True,
+            normalized=False,
+            center=True,
+        )
+        mag_stfts[s_idx] = torch.abs(spec)                                # (..., F_stft, T)
+
+    # Common-hop time axes should match; trim the rare center-pad off-by-one.
+    T = min(int(mag_stfts[s].shape[-1]) for s in (0, 1, 2))
+
+    bands: list[torch.Tensor] = []
+    for s_idx, k0, k1 in raw_bins:
+        bands.append(mag_stfts[s_idx][..., k0 : k1 + 1, :T])              # (..., k1-k0+1, T)
+    out = torch.cat(bands, dim=-2)                                        # (..., F_RAW, T)
+
+    if apply_log:
+        return torch.log(out + log_eps)
+    return out
+
+
 def _log_stft_view(
     waveform: torch.Tensor,
     *,
@@ -381,26 +527,39 @@ class LogStftView(CARIeegExtractor):
 
 
 class MultiStftView(CARIeegExtractor):
-    """v14 5/22 Multi-STFT front-end on top of CARIeegExtractor's waveform
-    pipeline. Replaces ``LogStftView`` as the v14 default; single-STFT lives
-    on as the F-single-STFT sister cell.
+    """v14 Multi-STFT front-end on top of CARIeegExtractor's waveform pipeline.
+    Replaces ``LogStftView`` as the v14 default; single-STFT lives on as the
+    F-single-STFT sister cell.
 
-    Per-event output: ``(C, F=30, T_bin)`` magnitude filterbank, time-last.
-    Three internal STFTs at common hop=128 @ 2048 Hz (Nperseg=1024/512/256)
-    feed a 30-bin ⅓-octave filterbank centered at ``2^(k/3)`` Hz for
-    ``k ∈ [0, 30)`` (~1 Hz → ~813 Hz). Routing: k0–k14 from low, k15–k21 from
-    mid, k22–k29 from hi (see ``MULTI_STFT_ROUTING``). Hop=128 matches
-    iMINDBench's standardized Multi-STFT (hop=128 across all three nperseg) and
-    yields a 16 Hz front-end frame rate; the downstream (3,2)-stride patch stem
-    halves the time axis to an 8 Hz latent, matching the Whisper teacher (50→8
-    Hz pool, B33) with identity passthrough at Phase-3 (hop=128 re-lock
-    2026-06-03, reverses the B20 v4 hop=256 token-halving choice).
+    FE-RAW-1 (2026-06-04, ``reports/fe_raw_frontend_handoff_2026_06_04.md``):
+    ``front_end="raw"`` (default) emits the §4.2 RAW ``|STFT|`` bins — F=50, no
+    filterbank — non-overlapping crossovers at 32/152 Hz, drop-delta 4 Hz, cap
+    192 Hz. The FE-filterbank-sweep (2026-06-03) showed the const-Q filterbank
+    hurts cross-subject transfer (RANK4 −0.013…−0.019), so the lossy pooling is
+    dropped and the learned Conv2d patch stem does the pooling instead. The
+    const-Q ⅓-octave filterbank is DEMOTED, not deleted — ``front_end="fbank"``
+    recovers it (the F=30 P1 low-data-regularizer sister, handoff §8).
+
+    Per-event output:
+      * raw   → ``(C, F=50, T_bin)`` raw |STFT| bins, time-last.
+      * fbank → ``(C, F=30, T_bin)`` ⅓-octave magnitude filterbank, time-last
+                (k0–k14 from low, k15–k21 from mid, k22–k29 from hi; centered at
+                ``2^(k/3)`` Hz, ~1 → ~813 Hz; see ``MULTI_STFT_ROUTING``).
+
+    Three internal STFTs at common hop=128 @ 2048 Hz (Nperseg=1024/512/256).
+    Hop=128 matches iMINDBench's standardized Multi-STFT and yields a 16 Hz
+    front-end frame rate; the downstream patch stem halves the time axis to an
+    8 Hz latent, matching the Whisper teacher (50→8 Hz pool, B33) with identity
+    passthrough at Phase-3 (hop=128 re-lock 2026-06-03).
 
     5/25 swap: ``apply_log`` defaults to ``False`` — iMINDBench-parity raw
     magnitude. Set ``apply_log=True`` for the F-log-amplitude sister cell
     (pre-5/25 default behavior).
     """
 
+    # FE-RAW-1: front-end mode. "raw" (default) = F=50 raw |STFT| bins; "fbank"
+    # = the demoted F=30 const-Q filterbank sister.
+    front_end: tp.Literal["raw", "fbank"] = "raw"
     sample_rate_hz: int = 2048
     # FE-01 (hop=128 re-lock 2026-06-03, reverses B20 v4 hop=256): hop=128 @
     # 2048 Hz → 16 Hz front-end frame rate. Matches iMINDBench's standardized
@@ -421,9 +580,100 @@ class MultiStftView(CARIeegExtractor):
     log_eps: float = 1e-6
     apply_log: bool = False
     c_max: int | None = None
+    # C3 (WS-C, B13 lock): per-(electrode, freq-bin, session) robust-z over the
+    # filterbank output. When True, ``prepare`` fits a ``SessionRobustZNormalizer``
+    # once per session over that session's *own* full recording (B13: median/MAD
+    # is physical-unit calibration — impedance × amp-gain — fit identically train
+    # and eval, NOT fit-on-train-only) and ``_get_timed_array`` applies the frozen
+    # stats per clip. Replaces the dropped ``scaler="StandardScaler"`` (raw-voltage,
+    # whole-recording, non-robust). Default False so the synthetic capstone /
+    # fast_dev_run smoke (per-token encoder LN handles scale) stays untouched; the
+    # dispatch flips it True for real runs.
+    session_robust_z: bool = False
+    session_z_sigma_floor: float = 1e-6
+    # STFT-fit chunk for the session stat pass: the full recording's filterbank
+    # is computed in ``session_z_chunk_s``-wide slices (one cached-raw read per
+    # session, STFT'd chunk-by-chunk to bound peak memory) then concatenated
+    # along time before the median/MAD fit. Numerically inert for a median over
+    # ~10^5 frames: only the handful of center-pad frames at each chunk seam
+    # differ from a single continuous STFT (<0.5% of frames).
+    session_z_chunk_s: float = 60.0
     # Pydantic doesn't allow tuple[int, ...] as a default freely — keep
     # the routing as a class-level constant pulled from the module.
     fbank_routing: tp.ClassVar[tuple[int, ...]] = MULTI_STFT_ROUTING
+    # FE-RAW-1: raw-bin selection (stft_idx, k_start, k_end inclusive) for the
+    # ``front_end="raw"`` path. Class-level (data-determining but fixed).
+    raw_bins: tp.ClassVar[tuple[tuple[int, int, int], ...]] = MULTI_STFT_RAW_BINS
+    # Per-session frozen normalizers, keyed by ``event._splittable_event_uid()``
+    # (the session key the cached raw is keyed on). Mutated once in ``prepare`` on
+    # the main process, read per-clip in ``_get_timed_array`` — the same
+    # prepare-fills-private-state / workers-inherit pattern as ``_channels`` on
+    # the MneRaw base (Linux fork inherits parent memory; pydantic pickles private
+    # attrs under spawn).
+    _session_stats: dict[str, SessionRobustZNormalizer] = {}
+    # False until ``_fit_session_robust_z`` has run. ``MneRaw.prepare`` fires a
+    # ``duration=0.001`` shape-probe clip THROUGH this view *before* the fit, so
+    # ``_apply_session_robust_z`` must skip while this is False (the probe only
+    # needs the output shape, which robust-z leaves unchanged). Real training
+    # clips run with it True, so a genuinely-missing session still fails loud.
+    _stats_ready: bool = False
+
+    # D2 (T1.7, project_v14_preproc_recipe_2026_05_12 L.0 amendment): per-session
+    # MNE-LOF bad-channel detection. When True, ``prepare`` runs
+    # ``find_bad_channels_lof(threshold, n_neighbors)`` once per session over that
+    # session's FILTERED, PRE-CAR voltage (the fit loads a ``car=None`` sibling, so
+    # LOF input = notch+HPF applied, no CAR: a bad channel must not pollute the CAR
+    # reference, and CAR's rank-deficiency would distort LOF's neighbor structure),
+    # records the flagged channels, and ``_preprocess_raw`` then stamps
+    # ``raw.info["bads"]`` per clip so the inherited ``drop_bads`` step removes them
+    # BEFORE shaft-CAR. So the LOF-relevant order holds: filtered → LOF → drop →
+    # shaftCAR. NOTE the inherited clip path (CARIeegExtractor._preprocess_raw)
+    # applies shaft-CAR BEFORE notch/HPF (pick → drop_bads → CAR → MneRaw filter) —
+    # a pre-existing CAR-before-filter ordering, harmless because CAR and the linear
+    # notch/HPF commute, flagged to Ben separately. Requires ``drop_bads=True`` and
+    # ``lof_report_path`` (model_validator). Default False so the synthetic capstone
+    # / fast_dev_run smoke is untouched; the BT dispatch flips it True. BEN REVIEW
+    # GATE: the per-session/per-subject drop counts are logged loud and written to
+    # JSON for review before this is relied on in a scored run ("report back how
+    # many channels are dropped").
+    lof_bad_channels: bool = False
+    lof_threshold: float = 1.5
+    lof_n_neighbors: int = 20
+    lof_ch_type: str = "seeg"
+    lof_report_path: str | None = None
+    # session key (``event._splittable_event_uid()``) -> LOF-flagged bad channel
+    # names. Mirrors the ``_session_stats`` fill-in-prepare / read-per-clip pattern.
+    _session_bads: dict[str, list[str]] = {}
+    _bads_ready: bool = False
+
+    @model_validator(mode="after")
+    def _validate_lof_config(self) -> "MultiStftView":
+        # Fail at construction, not silently mid-run. LOF that flags-but-never-
+        # drops, or drops-but-never-reports, both defeat the point.
+        if self.lof_bad_channels:
+            if not self.drop_bads:
+                raise ValueError(
+                    "MultiStftView.lof_bad_channels=True requires drop_bads=True "
+                    "so the LOF-flagged channels are actually removed before "
+                    "shaft-CAR (otherwise LOF flags but never drops)."
+                )
+            if not self.lof_report_path:
+                raise ValueError(
+                    "MultiStftView.lof_bad_channels=True requires lof_report_path "
+                    "set: the per-session/per-subject drop counts MUST be written "
+                    "to JSON for the Ben review gate ('report back how many "
+                    "channels are dropped'). Set a run-scoped path."
+                )
+        return self
+
+    def _exclude_from_cache_uid(self) -> list[str]:
+        # ``lof_report_path`` is an OUTPUT-LOCATION knob, not data-determining: two
+        # runs writing the report to different paths must hit the SAME multi-TB
+        # STFT cache. The other ``lof_*`` fields DO determine which channels get
+        # dropped, so they stay in the uid. (Default-OFF ``lof_bad_channels`` is
+        # excluded by exclude_defaults, so for the maiden run none of this perturbs
+        # the existing cache uid at all.)
+        return super()._exclude_from_cache_uid() + ["lof_report_path"]
 
     def n_time_bins_for_duration(self, duration_s: float) -> int:
         """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
@@ -437,14 +687,29 @@ class MultiStftView(CARIeegExtractor):
         n_samples = int(round(duration_s * self.sample_rate_hz))
         return 1 + n_samples // self.hop_length
 
-    def _get_timed_array(
-        self, event, start: float, duration: float,
-    ) -> TimedArray:
-        waveform_ta = super()._get_timed_array(event, start, duration)
-        waveform_t = torch.from_numpy(np.asarray(waveform_ta.data)).float()
-        spec = _multi_stft_view(
+    def _spec_from_waveform(
+        self, waveform_t: torch.Tensor, sample_rate: int,
+    ) -> torch.Tensor:
+        """``(C, T)`` waveform → ``(C, F, T_bin)``, with this view's exact
+        STFT config. ``front_end="raw"`` (default) emits the F=50 raw |STFT|
+        bins; ``front_end="fbank"`` the demoted F=30 const-Q filterbank. Single
+        source of truth shared by the per-clip path and the session-stat fit, so
+        fit-time and apply-time features are byte-identical."""
+        if self.front_end == "raw":
+            return _multi_stft_raw_view(
+                waveform_t,
+                sample_rate=sample_rate,
+                hop_length=self.hop_length,
+                nperseg_low=self.nperseg_low,
+                nperseg_mid=self.nperseg_mid,
+                nperseg_hi=self.nperseg_hi,
+                raw_bins=self.raw_bins,
+                log_eps=self.log_eps,
+                apply_log=self.apply_log,
+            )
+        return _multi_stft_view(
             waveform_t,
-            sample_rate=int(float(waveform_ta.frequency)),
+            sample_rate=sample_rate,
             hop_length=self.hop_length,
             nperseg_low=self.nperseg_low,
             nperseg_mid=self.nperseg_mid,
@@ -457,6 +722,20 @@ class MultiStftView(CARIeegExtractor):
             log_eps=self.log_eps,
             apply_log=self.apply_log,
         )
+
+    def _get_timed_array(
+        self, event, start: float, duration: float,
+    ) -> TimedArray:
+        waveform_ta = super()._get_timed_array(event, start, duration)
+        waveform_t = torch.from_numpy(np.asarray(waveform_ta.data)).float()
+        spec = self._spec_from_waveform(
+            waveform_t, int(float(waveform_ta.frequency)),
+        )
+        if self.session_robust_z:
+            # Apply BEFORE c_max padding: stats cover the real C electrodes only;
+            # padded channels stay exactly 0 (normalizing them would map 0 →
+            # -median/σ ≠ 0 and pollute the pad).
+            spec = self._apply_session_robust_z(event, spec)
         if self.c_max is not None:
             c_event = int(spec.shape[0])
             if c_event > self.c_max:
@@ -476,3 +755,275 @@ class MultiStftView(CARIeegExtractor):
             duration=duration,
             data=spec.cpu().numpy(),
         )
+
+    def _apply_session_robust_z(
+        self, event, spec: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply this session's frozen robust-z stats to a ``(C_global, F, T)``
+        clip spec. The session is keyed by ``event._splittable_event_uid()`` —
+        the same key the cached raw (and therefore the fit) is keyed on. The
+        stats were scattered into the global-channel index at fit time (see
+        ``_fit_session_robust_z``) so they broadcast against the global-channel
+        clip ``super()._get_timed_array`` produced — across sessions with
+        differing electrode counts the absent rows are zero in both."""
+        if not self._stats_ready:
+            # ``MneRaw.prepare`` shape-probe runs before the fit; robust-z does
+            # not change the output shape, so pass the raw spec through.
+            return spec
+        key = event._splittable_event_uid()
+        normalizer = self._session_stats.get(key)
+        if normalizer is None:
+            raise KeyError(
+                f"MultiStftView.session_robust_z is on but no fitted stats for "
+                f"session {key!r}. prepare() must run (and see this session) "
+                f"before clips are drawn. Have stats for: "
+                f"{sorted(self._session_stats)[:8]}..."
+            )
+        return normalizer.transform(spec)
+
+    def prepare(self, obj) -> None:  # type: ignore[override]
+        # ORDER IS LOAD-BEARING (Gate-C showstopper, 2026-06-03). ``self._get_data``
+        # is an exca-cached property; ``super().prepare`` materializes it for EVERY
+        # session (to populate ``_channels`` and fire a shape-probe). The cache key
+        # does NOT include ``_bads_ready``, so if that first materialization ran
+        # with bads un-armed it would memoize the PRE-LOF (no-drop) raw per session
+        # and every later apply/robust-z fit would read it stale — LOF detected,
+        # logged, but never actually dropped. So fit + ARM the bad sets FIRST: then
+        # the very first ``self._get_data`` already stamps+drops, and the cache,
+        # ``_channels``, the robust-z fit, and per-clip apply are all consistent.
+        # The fit itself reads a ``car=None`` SIBLING (distinct cache namespace —
+        # ``car`` is in the uid), so it cannot poison self's cache. It needs only
+        # ``_event_types_helper`` (set in __init__) and ``_get_data`` (works pre-
+        # prepare — prepare is its own first caller), NOT ``_channels``, so it is
+        # safe to run before ``super().prepare``.
+        if self.lof_bad_channels:
+            self._fit_session_bads(obj)
+            self._bads_ready = True
+        # ``super().prepare`` populates ``_channels`` (needed by the robust-z fit's
+        # global-channel scatter) and fires a shape-probe clip; the probe runs with
+        # ``_stats_ready`` still False so it skips robust-z safely (it DOES drop LOF
+        # bads now, which is exactly what we want cached). Only after the fit do we
+        # arm ``_stats_ready`` so real clips normalize.
+        super().prepare(obj)
+        if self.session_robust_z:
+            self._fit_session_robust_z(obj)
+            self._stats_ready = True
+
+    def _fit_session_robust_z(self, obj) -> None:
+        """Fit one ``SessionRobustZNormalizer`` per session over that session's
+        own full recording (B13: per-(electrode, freq, session), identical train
+        and eval). Reads each session's cached preprocessed raw once, computes the
+        full-recording filterbank in ``session_z_chunk_s`` slices to bound peak
+        memory, concatenates along time, and fits median/MAD. Runs on the main
+        process inside ``Data.build``; the fitted stats are inherited by forked
+        DataLoader workers."""
+        events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
+        seen: set[str] = set()
+        for event in events:
+            key = event._splittable_event_uid()
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_ta = next(self._get_data([event]))
+            waveform = torch.from_numpy(np.asarray(raw_ta.data)).float()
+            sample_rate = int(float(raw_ta.frequency))
+            chunk = max(
+                int(round(self.session_z_chunk_s * sample_rate)), self.nperseg_low,
+            )
+            n_samples = int(waveform.shape[-1])
+            specs: list[torch.Tensor] = []
+            for c0 in range(0, n_samples, chunk):
+                seg = waveform[:, c0 : c0 + chunk]
+                if int(seg.shape[-1]) < self.nperseg_low:
+                    continue  # too short for the largest STFT window — drop tail
+                specs.append(self._spec_from_waveform(seg, sample_rate))
+            if not specs:
+                # whole recording shorter than one nperseg_low window
+                specs = [self._spec_from_waveform(waveform, sample_rate)]
+            # Free the full-session waveform (up to ~15 GB for a 2 h / 250-ch
+            # recording) BEFORE the fit allocates its median sort buffer — it is
+            # unused past the STFT pass. Cuts worst-case fit peak ~25 GB → ~7 GB
+            # with no numeric change (the concat-then-median is identical).
+            del waveform
+            frames = torch.cat(specs, dim=-1)  # (C_session, F, T_session)
+            del specs  # torch.cat copied the data; the per-chunk specs are dead
+            normalizer = SessionRobustZNormalizer(
+                sigma_floor=self.session_z_sigma_floor,
+            ).fit(frames)
+            # Scatter the session-indexed (C_session, F, 1) stats into the
+            # GLOBAL channel index. ``_get_data`` yields the session's own
+            # C_session channels in ``raw_ta.ch_names`` order, but the apply
+            # path's ``super()._get_timed_array`` scatters each clip into a
+            # ``(max(_channels)+1, ...)`` global array via the SAME
+            # ``_get_channels(ch_names)`` map (neuro.py:453,463). Placing the
+            # stats at those identical global rows makes fit and apply align by
+            # construction regardless of channel_order, and lets one set of
+            # stats broadcast against clips from sessions with differing
+            # electrode counts. Global rows with no source channel keep σ=0 →
+            # ``transform`` zeros them, matching the clip's zero pad rows.
+            self._scatter_stats_to_global(normalizer, raw_ta.ch_names)
+            self._session_stats[key] = normalizer
+            del frames, raw_ta
+
+    def _scatter_stats_to_global(
+        self, normalizer: SessionRobustZNormalizer, ch_names: list[str],
+    ) -> None:
+        """In-place: replace ``normalizer.median``/``.sigma`` ``(C_session,F,1)``
+        with global-channel ``(C_global,F,1)`` tensors, the session's stats
+        placed at the global indices ``_get_channels(ch_names)`` assigns — the
+        exact rows the apply-path scatter lands this session's clip data on."""
+        channel_idx = self._get_channels(ch_names)  # type: ignore[attr-defined]
+        c_global = max(self._channels.values()) + 1  # type: ignore[attr-defined]
+        idx = torch.as_tensor(channel_idx, dtype=torch.long)
+        session_median = normalizer.median
+        session_sigma = normalizer.sigma
+        assert session_median is not None and session_sigma is not None, (
+            "normalizer must be .fit() before scatter"
+        )
+        f_bins = int(session_median.shape[1])
+        global_median = torch.zeros(c_global, f_bins, 1, dtype=session_median.dtype)
+        global_sigma = torch.zeros(c_global, f_bins, 1, dtype=session_sigma.dtype)
+        global_median[idx] = session_median
+        global_sigma[idx] = session_sigma
+        normalizer.median = global_median
+        normalizer.sigma = global_sigma
+
+    # ------------------------------------------------------------------ #
+    # D2: per-session MNE-LOF bad-channel detection (T1.7)                #
+    # ------------------------------------------------------------------ #
+    def _stamp_lof_bads(self, raw, event) -> None:
+        """Set ``raw.info["bads"]`` to this session's LOF-flagged channels that
+        are present in ``raw`` so the inherited ``drop_bads`` step removes them
+        before shaft-CAR. No-op until the fit has armed ``_bads_ready`` (the
+        prepare shape-probe runs through here first)."""
+        if not (self._bads_ready and self.lof_bad_channels):
+            return
+        key = event._splittable_event_uid()
+        bads = self._session_bads.get(key)
+        if bads is None:
+            raise KeyError(
+                f"MultiStftView.lof_bad_channels is on but no fitted bad-channel "
+                f"set for session {key!r}. prepare() must run (and see this "
+                f"session) before clips are drawn. Have bads for: "
+                f"{sorted(self._session_bads)[:8]}..."
+            )
+        # Union, not overwrite: keep any bads the upstream loader pre-marked and
+        # ADD the LOF-flagged ones (never drop fewer channels than before).
+        present = set(raw.ch_names)
+        existing = list(raw.info["bads"])
+        raw.info["bads"] = existing + [
+            b for b in bads if b in present and b not in existing
+        ]
+
+    def _preprocess_raw(self, raw, event):  # type: ignore[override]
+        self._stamp_lof_bads(raw, event)
+        return super()._preprocess_raw(raw, event)
+
+    def _fit_session_bads(self, obj) -> None:
+        """Flag bad channels per session via MNE LOF over that session's FILTERED,
+        PRE-CAR voltage. Loads each session once through a ``car=None`` sibling
+        view (CAR's rank-deficiency would distort LOF's neighbor structure and a
+        bad channel must not be in the CAR average — the recipe runs LOF before
+        shaft-CAR). Runs on the main process inside ``Data.build``; the per-session
+        bad sets are inherited by forked DataLoader workers. Drop counts are logged
+        loud and (if ``lof_report_path`` is set) written to JSON — the Ben gate."""
+        if not self.drop_bads:
+            raise ValueError(
+                "MultiStftView.lof_bad_channels=True requires drop_bads=True so the "
+                "LOF-flagged channels are actually removed before shaft-CAR."
+            )
+        # car=None sibling for the fit load. deep=True IS LOAD-BEARING (Gate-C
+        # re-audit, 2026-06-03): a SHALLOW model_copy shares the exca infra object,
+        # whose ``_obj`` stays bound to self (car=shaft) — the sibling would then
+        # (1) preprocess with CAR after all (wrong LOF input) and (2) materialize a
+        # car=shaft NO-DROP entry under self's production cache uid before bads are
+        # armed, re-seeding the very poison this whole ordering kills. deep=True
+        # forks the infra so the sibling gets the distinct car=None uid (verified ==
+        # an independently-built car=None view) and preprocesses pre-CAR. The copy
+        # carries the private state (_event_types_helper, _session_bads); _bads_ready
+        # is still False on it so its _preprocess_raw passes through and LOF sees
+        # every channel — it is the detector, not a consumer.
+        precar = self.model_copy(update={"car": None}, deep=True)
+        # deep=True ALSO deep-copies exca's memoized uid; reset it so the sibling
+        # recomputes its car=None uid instead of inheriting self's car=shaft one if
+        # self.infra.uid() was computed earlier (see _reset_infra_uid_cache).
+        _reset_infra_uid_cache(precar.infra)
+        events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
+        report: list[dict] = []
+        seen: set[str] = set()
+        for event in events:
+            key = event._splittable_event_uid()
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_ta = next(precar._get_data([event]))
+            voltage = np.asarray(raw_ta.data)
+            ch_names = list(raw_ta.ch_names)
+            sample_rate = float(raw_ta.frequency)
+            mask = lof_bad_channel_mask(
+                voltage,
+                sample_rate_hz=sample_rate,
+                threshold=self.lof_threshold,
+                n_neighbors=self.lof_n_neighbors,
+                ch_names=ch_names,
+                ch_type=self.lof_ch_type,
+            )
+            bad_names = [ch_names[i] for i in range(len(ch_names)) if bool(mask[i])]
+            self._session_bads[key] = bad_names
+            try:
+                subject_id = int(event._get_field_or_extra("subject_id"))
+            except (KeyError, AttributeError, ValueError, TypeError) as exc:
+                # Don't silently bucket under -1: a missing/garbled subject_id
+                # corrupts the per-subject drop attribution the Ben gate reads.
+                subject_id = -1
+                logger.warning(
+                    "MNE-LOF: could not resolve subject_id for session %s (%s); "
+                    "its %d bad channels are attributed to subject_id=-1",
+                    key, exc, len(bad_names),
+                )
+            report.append({
+                "session": key,
+                "subject_id": subject_id,
+                "n_channels": len(ch_names),
+                "n_bad": len(bad_names),
+                "bad_channels": bad_names,
+            })
+            logger.warning(
+                "MNE-LOF session %s (subject %s): %d/%d channels flagged bad %s",
+                key, subject_id, len(bad_names), len(ch_names), bad_names,
+            )
+            del raw_ta, voltage
+        self._log_and_write_lof_report(report)
+
+    def _log_and_write_lof_report(self, report: list[dict]) -> None:
+        total_bad = sum(r["n_bad"] for r in report)
+        total_ch = sum(r["n_channels"] for r in report)
+        by_subject: dict[int, list[int]] = {}
+        for r in report:
+            agg = by_subject.setdefault(r["subject_id"], [0, 0])
+            agg[0] += r["n_bad"]
+            agg[1] += r["n_channels"]
+        logger.warning(
+            "MNE-LOF SUMMARY (threshold=%.2f, n_neighbors=%d): %d sessions, "
+            "%d/%d channels dropped (%.2f%%). Per-subject n_bad/n_ch: %s",
+            self.lof_threshold, self.lof_n_neighbors, len(report),
+            total_bad, total_ch, 100.0 * total_bad / max(total_ch, 1),
+            {s: f"{b}/{t}" for s, (b, t) in sorted(by_subject.items())},
+        )
+        if self.lof_report_path:
+            payload = {
+                "threshold": self.lof_threshold,
+                "n_neighbors": self.lof_n_neighbors,
+                "total_sessions": len(report),
+                "total_bad": total_bad,
+                "total_channels": total_ch,
+                "by_subject": {
+                    str(s): {"n_bad": b, "n_channels": t}
+                    for s, (b, t) in sorted(by_subject.items())
+                },
+                "sessions": report,
+            }
+            path = Path(self.lof_report_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2))
+            logger.warning("MNE-LOF drop-count report written -> %s", path)

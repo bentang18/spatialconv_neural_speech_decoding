@@ -35,6 +35,7 @@ import neuralset as ns
 
 import speech_decoding.models  # noqa: F401  # registers V14ParcelPerceiver with BaseModelConfig
 from speech_decoding.experiments import Data, Experiment
+from speech_decoding.experiments.lr_schedule import WarmupCosine  # noqa: F401  # registers WarmupCosine BaseLRScheduler for the optim discriminator
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
 from speech_decoding.extractors.ref_aug import (
     REF_MODES,
@@ -45,6 +46,7 @@ from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 from speech_decoding.extractors.subtype_meta import SubjectSubtypeExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import MultiStftView
+from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
@@ -66,14 +68,28 @@ DEFAULT_N_HEADS = 8
 DEFAULT_M_SUB_SLOTS = 1
 DEFAULT_K_PARCELS = len(V14_DK_PARCEL_LABELS)  # 80
 # WS-C / C2 (B36): default front-end flips single-STFT → Multi-STFT.
-# F=30 ⅓-octave filterbank bins (≈1–813 Hz) → encoder F_p = (30−3)//3+1 = 10.
-DEFAULT_N_FREQ_BINS = 30
+# FE-RAW-1 (2026-06-04): the Multi-STFT default front end is the RAW |STFT|
+# bins (F=50, §4.2), not the const-Q filterbank — encoder F_p = (50−5)//5+1
+# = 10 at the kernel-5 patch stem (byte-shape-identical to the old F=30/kernel-3
+# grid). The F=30 filterbank is the demoted ``front_end="fbank"`` sister.
+DEFAULT_N_FREQ_BINS = 50
 # WS-C / C1 (B36, hop=128 re-lock 2026-06-03): phase-conditional clip window.
 # 5 s SSL clips (P1/P2/P3) → T_p=40; the P4 readout driver passes clip_len=1.0
 # → T_p=8. n_time_bins (the RoPE ceiling) is derived from clip_len × the
 # Multi-STFT frame geometry (1 + L//hop, center=True) — 5 s → 81, 1 s → 17 —
 # not hardcoded.
 DEFAULT_CLIP_LEN_S = 5.0
+# B36 (2026-06-03) neural-response-lag knob (Δlag). The Whisper teacher cache is
+# keyed by AUDIO movie-time and is immutable; sliding the NEURAL clip start by
+# +Δlag aligns the lagged cortical response (neural-frame t reflects audio at
+# t−lag) to the stimulus-time teacher frame. Default 0.0 = the 1:1 baseline
+# (current behavior) and the falsifier null; the P3-distill sweep tries
+# {0.075, 0.15, 0.30} s against it (R-distill-lag-*). Because the teacher is
+# audio-keyed, the sweep is a pure neural re-slice — NO teacher recache. No-op
+# for P1/P2 (student + EMA-teacher shift together); meaningful only for P3's
+# frame-for-frame distill. The P4 probe MUST keep 0.0 (leaderboard parity) — a
+# non-default raises under --phase 4 (guard below).
+DEFAULT_NEURAL_LAG_S = 0.0
 DEFAULT_BATCH_SIZE = 32
 # DataLoader worker count (B1.4e, 2026-05-29). The per-sample extractor stack
 # (CAR + torch.stft in LogStftView is recomputed per __getitem__; only the raw
@@ -82,6 +98,13 @@ DEFAULT_BATCH_SIZE = 32
 # with GPU compute; pair with --cpus-per-task >= num_workers + 1.
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_N_EPOCHS = 100
+# P4 frozen-probe early-stop patience (epochs on val_loss). P4 is a tiny
+# supervised readout (≤3500 samples, ~514–2570 trainable params); it converges
+# in a handful of epochs and the --n-epochs cap (100) would otherwise overfit
+# it. Early-stopping on val_loss is correct ONLY for P4 (the actual downstream
+# task); the SSL/distill phases never early-stop. Patience 10 is the operative
+# limit; the epoch cap is a safety ceiling. <=0 disables (run to the cap).
+DEFAULT_P4_EARLY_STOP_PATIENCE = 10
 # Ship-first task default — `speech` is the highest-signal binary task
 # requiring zero transcript enrichment (Sentence Onset = 0.780 CS-SOTA,
 # Speech = 0.751; full ship-first set is {onset, speech, delta_volume,
@@ -162,6 +185,10 @@ DEFAULT_PHASE_MODE: str = "split_p1_p2"
 # ``V14JointExperiment.jepa_phase`` (v14_joint.py) is the field it threads onto.
 JEPA_PHASES: tuple[str, ...] = ("p1", "p2")
 DEFAULT_JEPA_PHASE: str = "p1"
+
+# B36 WS-E E2: P2 front-end discriminative-LR scale. 0.1 = base/10 default;
+# 0.2 = R-p2-frontend-lr-5; 0.0 = R-p2-freeze-frontend (front-end frozen).
+DEFAULT_FRONTEND_LR_SCALE: float = 0.1
 
 # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical loss simplification):
 # joint SSL default is a 2-term surface (L_pre_frame @ M2 + L_post_frame
@@ -246,6 +273,91 @@ def _apply_extractor_cache(
     extractor.infra.folder = folder
 
 
+def _build_optim_cfg(
+    *,
+    lr: float,
+    lr_schedule: str,
+    warmup_steps: int,
+    min_lr_ratio: float,
+    weight_decay: float,
+    optimizer_name: str,
+    adam_betas: tuple[float, float] | None,
+) -> dict[str, tp.Any]:
+    """Assemble the ``LightningOptimizer`` config dict (#37, audit 2026-06-03).
+
+    NOT fused: a fused torch optimizer sets ``_step_supports_amp_scaling=True``,
+    which makes Lightning's bf16-mixed AMP precision plugin REFUSE gradient
+    clipping (``precision/amp.py`` raises "does not allow for gradient clipping
+    because it performs unscaling of gradients internally"). The §7 recipe locks
+    BOTH ``grad_clip=1.0`` and ``bf16-mixed``, so fused is incompatible and must
+    stay off (verified live: job 47686013 crashed at the first optimizer step on
+    exactly this combo; pre-#37 runs only got away with fused because grad-clip
+    was silently OFF). fused was a 2026-05-30 speedup, never a recipe lock — the
+    non-fused path is the standard, with negligible cost at this model size.
+    ``betas`` / ``weight_decay`` are added ONLY when set, so the default (Adam,
+    lr=1e-3, no β/wd) is the prior plain-Adam config (sans the fused speedup).
+    With ``lr_schedule="warmup_cosine"`` the §7
+    locked linear-warmup → cosine→0 shape is attached via the custom
+    ``WarmupCosine`` scheduler — fields are TOP-LEVEL (it is a plain
+    ``BaseLRScheduler``, NOT a ``kwargs``-dict ``BaseTorchLRScheduler``); its
+    ``total_steps`` is supplied at ``configure_optimizers`` time from
+    ``trainer.estimated_stepping_batches`` (which ``--ssl-max-steps`` pins).
+    """
+    _validate_choice("lr_schedule", lr_schedule, ("constant", "warmup_cosine"))
+    _validate_choice("optimizer_name", optimizer_name, ("Adam", "AdamW"))
+    # §7 LOCK GUARD (audit 2026-06-03, lens-2 FAIL): the B01 recipe locks TWO
+    # param groups — no weight-decay on biases, LayerNorm/RMSNorm γβ, and the
+    # freq embedding. The phase modules' ``_phase_param_groups`` split by stage
+    # for discriminative LR but do NOT yet carry a ``weight_decay: 0.0`` override
+    # for that no-WD subset, so a non-zero ``weight_decay`` here would be applied
+    # UNIFORMLY to every param — a silent lock violation. Refuse loudly until the
+    # no-WD groups are implemented (a Ben-gated training-orchestration follow-up,
+    # paired with the M0 weight_decay value). wd=0.0 (the default) is unaffected
+    # and a valid first-pass center; this never fires on the maiden run.
+    if weight_decay:
+        raise ValueError(
+            f"weight_decay={weight_decay} is not yet supported: the §7 no-WD "
+            "param-group split (biases / LayerNorm γβ / freq_embed exempt) is "
+            "NOT implemented in the phase modules' configure_optimizers, so a "
+            "non-zero weight_decay would decay those params too — violating the "
+            "B01 lock. Pass --weight-decay 0 (the locked-shape-compliant first "
+            "pass), or implement the no-WD groups first. See "
+            "reports/b01_lr_schedule_unimplemented_lock_2026_06_03.md."
+        )
+    # NOT fused — fused optimizers are incompatible with Lightning's bf16-mixed
+    # AMP gradient clipping (see docstring; both are §7 locks). Empty default →
+    # standard non-fused torch optimizer, which clears _step_supports_amp_scaling
+    # so the AMP clip guard does not fire.
+    optim_kwargs: dict[str, tp.Any] = {}
+    if weight_decay:
+        # Unreachable while the guard above stands (wd is falsy here); retained as
+        # the exact post-guard-removal path — when the no-WD groups land (task #40)
+        # the guard is deleted and this forwards the M0 weight_decay to either
+        # optimizer family.
+        optim_kwargs["weight_decay"] = weight_decay
+    elif optimizer_name == "AdamW":
+        # AdamW's torch default is weight_decay=0.01 — pin it to 0.0 EXPLICITLY so
+        # the §7 no-WD lock is not violated via the torch family default on the
+        # lock-recommended ``--optimizer AdamW`` path (the guard only sees the flag
+        # value, which is 0.0 here; without this pin AdamW would decay biases / LN
+        # γβ / freq_embed at 0.01 uniformly). Adam's torch default is already 0.0,
+        # so its kwargs stay empty.
+        optim_kwargs["weight_decay"] = 0.0
+    if adam_betas is not None:
+        optim_kwargs["betas"] = list(adam_betas)
+    cfg: dict[str, tp.Any] = {
+        "optimizer": {"name": optimizer_name, "lr": lr, "kwargs": optim_kwargs}
+    }
+    if lr_schedule == "warmup_cosine":
+        cfg["scheduler"] = {
+            "name": "WarmupCosine",
+            "warmup_steps": warmup_steps,
+            "min_lr_ratio": min_lr_ratio,
+        }
+        cfg["interval"] = "step"
+    return cfg
+
+
 def build_v14_experiment(
     *,
     bt_root: str | None = None,
@@ -256,7 +368,42 @@ def build_v14_experiment(
     test_trial_id: int = DEFAULT_TEST_TRIAL_ID,
     binary_tasks: bool = True,
     electrode_tokens_extractor: tp.Any | None = None,
+    # C3 (WS-C, B13): per-(electrode, freq, session) robust-z on the default
+    # MultiStftView. True (the real-run default) fits frozen median/MAD per
+    # session over its own full recording in prepare() and applies it per clip;
+    # False emits the raw filterbank (only valid for the synthetic capstone /
+    # plumbing smokes, where per-token encoder LN absorbs scale — plan §C3).
+    # Ignored when a custom ``electrode_tokens_extractor`` is supplied (set the
+    # flag on that extractor directly).
+    session_robust_z: bool = True,
     mains_notch_hz: float = DEFAULT_MAINS_NOTCH_HZ,
+    # #17 (D2 / T1.7): per-session MNE-LOF bad-channel drop on the default
+    # MultiStftView. Default OFF so the existing multi-TB STFT cache uid is
+    # untouched (the lof_* fields sit out of the uid via exclude_defaults). When
+    # flipped True the dispatch also forces ``drop_bads=True`` (the view validator
+    # requires it) and a ``lof_report_path`` so the per-subject drop counts are
+    # written to JSON for the BEN REVIEW GATE ("report back how many channels are
+    # dropped") before the run is scored. ``lof_threshold`` / ``lof_n_neighbors``
+    # enter the cache uid (they change which channels drop) — only passed when LOF
+    # is on. Ignored when a custom ``electrode_tokens_extractor`` is supplied (set
+    # lof_* on that extractor directly). The 1.5 / 20 defaults MIRROR the
+    # MultiStftView field defaults (extractors/view.py — the single source of
+    # truth; the CLI defaults mirror them too, so all three must move in
+    # lock-step. test_dispatch_lof_threshold_inert_when_lof_off pins the match).
+    lof_bad_channels: bool = False,
+    lof_threshold: float = 1.5,
+    lof_n_neighbors: int = 20,
+    lof_report_path: str | None = None,
+    # #35: padded electrode-slot count C. Default 384 (DEFAULT_C_MAX) covers all
+    # four Phase-1 corpora (D-cohort max=366) so the multi-corpus cache is shared.
+    # BT-only runs can pass 256 (BT raw max=256, the exact safe floor — the
+    # extractors raise if any subject's n_real > c_max) to drop the 128 pure-pad
+    # slots the per-electrode front-end would otherwise process (~33% wasted
+    # FLOPs/activations, an OOM lever). c_max is in the extractor-cache uid
+    # (MultiStftView/dk_support/valid_mask/shaft_mask) → a non-default value forces
+    # a fresh STFT cache and is a recipe-amendment (HB02 re-cost). When a custom
+    # ``electrode_tokens_extractor`` is supplied its c_max must match this value.
+    c_max: int = DEFAULT_C_MAX,
     eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
@@ -266,6 +413,12 @@ def build_v14_experiment(
     # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
     # phases (P1/P2/P3 → T_p=40); the P4 readout driver passes 1.0 (→ T_p=8).
     clip_len: float = DEFAULT_CLIP_LEN_S,
+    # B36 (2026-06-03) Δlag neural-response-lag (seconds), wired to the
+    # segmenter clip ``start`` offset. 0.0 (default) = 1:1 stimulus-onset
+    # baseline / falsifier null; P3-distill sweep sisters R-distill-lag-{75,150,
+    # 300}ms. Audio-keyed teacher ⇒ no recache. Non-default raises under the
+    # supervised Phase-4 path (leaderboard parity); no-op for P1/P2.
+    neural_lag_s: float = DEFAULT_NEURAL_LAG_S,
     # ``None`` → derive the RoPE ceiling from ``clip_len`` × the front-end's
     # frame geometry (``electrode_tokens_extractor.n_time_bins_for_duration``).
     # Pass an explicit int only to override (e.g. a custom front-end).
@@ -275,8 +428,38 @@ def build_v14_experiment(
     # CPU STFT with GPU compute; pass --cpus-per-task >= num_workers + 1.
     num_workers: int = DEFAULT_NUM_WORKERS,
     n_epochs: int = DEFAULT_N_EPOCHS,
+    # Step budget (SSL/distill phases). None → epoch budget (``n_epochs``).
+    max_steps: int | None = None,
+    # Validation cadence as a step count (#54). On a ``max_steps`` SSL phase
+    # that ends mid-epoch, epoch-boundary validation never runs, so the
+    # collapse-guard soft panel would never evaluate. The chain sets this for
+    # the SSL phases; None → Lightning default (epoch-boundary only).
+    val_check_interval: int | float | None = None,
+    # Early-stopping patience on ``val_loss``. None → no early-stop (the SSL /
+    # distill phases train to a fixed budget; their val loss is a pretext
+    # reconstruction/distill objective, NOT the downstream metric, so val-loss-min
+    # is the wrong stop signal). The supervised P4 probe sets this — there
+    # val_loss IS the downstream task, so val-loss-min is correct.
+    early_stopping_patience: int | None = None,
+    # #54 audit M1: the collapse guard is an SSL/distill kill-switch. P4 is a
+    # frozen linear probe that cannot "collapse" in the SSL sense and already
+    # has EarlyStopping on its real downstream val_loss, so the chain disables
+    # the guard there (its loss-blowup criterion would only duplicate
+    # EarlyStopping while risking an exca-cache-poisoning abort on benign
+    # probe over-fit). True for P1/P2/P3a/P3b.
+    collapse_guard: bool = True,
     seed: int = 33,
     exca_folder: str | None = None,
+    # #54 audit C1: exca's default ``mode="cached"`` re-RAISES a stored failure
+    # (e.g. a CollapseStop abort) on a same-config relaunch instead of
+    # recomputing — so a code-level fix (which does not change the config-derived
+    # uid) would never actually run. ``retry`` recomputes on a cached *error*
+    # while keeping cached *successes*; it is the correct mode for the abort →
+    # diagnose → fix → relaunch loop. This builder default stays ``cached``
+    # (back-compat for direct callers); ``main()`` resolves an unset
+    # ``--exca-mode`` to ``retry`` for ``--chain`` and ``cached`` otherwise, so
+    # the capstone chain is C1-safe by default.
+    exca_mode: str = "cached",
     # B1.5 (task #120, 2026-05-29) two-tier extractor cache root. When set,
     # each extractor's ``infra.folder`` is pointed at
     # ``{extractor_cache_folder}/{extractor_name}/`` so its outputs survive
@@ -368,6 +551,22 @@ def build_v14_experiment(
     # Effective under ``joint_phase=True`` only; a non-default under the
     # supervised Phase-4 path raises (same guard as the B30/B31 sister flags).
     jepa_phase: str = DEFAULT_JEPA_PHASE,
+    # B36 WS-E E2: P2 front-end discriminative-LR scale (hyperparameter).
+    # 0.1 = base/10 default; 0.2 = R-p2-frontend-lr-5; 0.0 =
+    # R-p2-freeze-frontend. Effective under ``joint_phase=True`` +
+    # ``jepa_phase="p2"`` only (no effect at P1, where the front-end is the
+    # sole trained group).
+    frontend_lr_scale: float = DEFAULT_FRONTEND_LR_SCALE,
+    # WS-H / T20 (B33 P3 distillation): root of the whole-movie Whisper teacher
+    # cache built by scripts/neuroprobe/build_bt_teacher_cache.py. When set, the
+    # segmenter emits a per-clip ``whisper_target`` (B, 250, 1280) the P3 loss
+    # consumes; ``None`` (P1/P2/P4) omits it. The join is keyed by the trigger
+    # Word's MOVIE-clock onset (``movie_onset_s``), NOT the Δlag-shifted neural
+    # window — see the WhisperTargetExtractor docstring (FLAG 9). ``layer_merge``
+    # must match the cache build ("mean_all" locked default; "8" = the
+    # R-whisper-single-layer-L8 sister).
+    whisper_target_cache_dir: str | None = None,
+    whisper_layer_merge: str = "mean_all",
     # B35 (2026-05-31) Phase-4 readout selector (reverts B34).
     # "pma_mean_linear" (default) = V14PmaReadout: frozen P3-PMA collapses
     # parcels → (B, T_p, d), then mean-over-time → Linear (only the linear
@@ -385,6 +584,63 @@ def build_v14_experiment(
     # brain-model config; the encoder forward gates it on training + grad
     # so the no_grad teacher pass is never checkpointed. Numerics-safe.
     gradient_checkpointing: bool = False,
+    # WS-F / B33 Phase-3 distillation routing (#21). ``p3_distill=True`` returns
+    # a :class:`V14Phase3Experiment` (Whisper all-layer-mean SmoothL1 distill)
+    # instead of the joint / supervised path; ``p3_stage`` picks 3a (encoder
+    # frozen, PMA+projector connector warmup) or 3b (encoder unfrozen,
+    # discriminative LR). P3 REQUIRES ``whisper_target_cache_dir`` (the teacher
+    # stream) and, when ``target_standardize`` (B33 default), a
+    # ``channel_stats_path`` (train-only per-channel z-score stats from
+    # fit_channel_stats). Mutually exclusive with ``joint_phase``.
+    p3_distill: bool = False,
+    p3_stage: tp.Literal["3a", "3b"] = "3a",
+    channel_stats_path: str | None = None,
+    target_standardize: bool = True,
+    projector_mode: tp.Literal["mlp", "linear"] = "mlp",
+    # B33 §5 3b parcel-side discriminative-LR scale (base/3 lock). No effect
+    # under 3a / the non-P3 paths; persisted onto the run record either way.
+    parcel_lr_scale: float = 1.0 / 3.0,
+    # WS-G B35 Phase-4 frozen-probe routing (#21). ``phase4_frozen_probe=True``
+    # returns a :class:`V14Phase4ReadoutExperiment` (frozen encoder + frozen
+    # P3-PMA → mean → trainable Linear, the B35 readout) carrying the
+    # transferable-state protocol so it can warm-start from a P3 snapshot — the
+    # base supervised ``Experiment`` (default P4) builds a from-scratch CE
+    # ``BrainModule`` with no handoff. The chain / any ``--resume-from`` P4 run
+    # uses the frozen probe. Mutually exclusive with ``joint_phase`` / ``p3_distill``.
+    phase4_frozen_probe: bool = False,
+    # Optimizer / LR-schedule (#37, 4-agent audit 2026-06-03). The v14 §7 recipe
+    # (closed B01 lock) fixes the LR *shape* as linear-warmup → cosine→0 + AdamW
+    # + β=(0.9, 0.95) + grad_clip=1.0 as non-swept universals; the peak-LR value
+    # and weight_decay were re-classified to M0-measured sweep centers on
+    # 2026-06-01. Defaults here REPRODUCE the prior constant-Adam behavior bit-
+    # for-bit (lr=1e-3, schedule="constant", optimizer="Adam", wd=0, no β
+    # override) so nothing silently changes; the locked warmup+cosine+AdamW path
+    # is opt-in via ``lr_schedule="warmup_cosine"``. ``gradient_clip_val`` is the
+    # one exception — the CLI defaults it to 1.0 (restoring the locked-universal
+    # that was silently OFF), but this function-level default stays None for the
+    # tiny test experiments. EMA τ is fixed at 0.99925 (B26/B27); the §9 EMA
+    # ramp is DEAD and is NOT wired here.
+    lr: float = 1e-3,
+    lr_schedule: tp.Literal["constant", "warmup_cosine"] = "constant",
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.0,
+    weight_decay: float = 0.0,
+    optimizer_name: tp.Literal["Adam", "AdamW"] = "Adam",
+    # None → torch optimizer default betas (Adam (0.9, 0.999)). Pass (0.9, 0.95)
+    # for the locked v14 SSL β2. Kept None by default for behavior parity.
+    adam_betas: tuple[float, float] | None = None,
+    gradient_clip_val: float | None = None,
+    # Lightning ``accumulate_grad_batches`` (effective-batch lever). 1 → no
+    # accumulation (default; bit-for-bit prior behavior). >1 → effective batch =
+    # batch_size * N at N× wall-clock/step. Prefer a larger physical batch on a
+    # 48 GB+ card; this is the fallback for the 32 GB coganlab-gpu cards.
+    accumulate_grad_batches: int = 1,
+    # B36 WS-E (E3/E4) cross-phase checkpoint handoff, threaded onto the
+    # Experiment so the multi-phase chain (``run_phase_pipeline``) or a manual
+    # per-phase ``--resume-from`` warm-starts / snapshots the transferable
+    # encoder (+PMA from P3). Both default off — inert for a standalone phase.
+    pretrained_ckpt: str | None = None,
+    snapshot_ckpt_to: str | None = None,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -411,6 +667,12 @@ def build_v14_experiment(
     _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
     _validate_choice("loss_variant", loss_variant, LOSS_VARIANTS)
     _validate_choice("jepa_phase", jepa_phase, JEPA_PHASES)
+    optim_cfg = _build_optim_cfg(
+        lr=lr, lr_schedule=lr_schedule, warmup_steps=warmup_steps,
+        min_lr_ratio=min_lr_ratio, weight_decay=weight_decay,
+        optimizer_name=optimizer_name, adam_betas=adam_betas,
+    )
+
     if ffn_variant != "dense":
         # MoE-FFN audit 2026-05-28: ``soft_moe_4`` is reserved as a P2
         # if-budget sister and requires ``models/soft_moe.py``. Fail
@@ -472,18 +734,29 @@ def build_v14_experiment(
             f"ref_operator_alpha must lie in (0, 1); got {ref_operator_alpha}"
         )
 
+    # Δlag (neural-response lag) must be causal and bounded: a cortical
+    # response follows its stimulus (≥0) and the higher-order auditory /
+    # associative response to passively-watched film is well under 1 s. Negative
+    # would slice the neural window *before* the stimulus (acausal); > 1 s is
+    # unphysical for this distill alignment.
+    if not 0.0 <= neural_lag_s <= 1.0:
+        raise ValueError(
+            f"neural_lag_s (Δlag) must lie in [0.0, 1.0] s; got {neural_lag_s}"
+        )
+
     # Resolve two-tier extractor cache root from env if not explicit.
     extractor_cache_folder = extractor_cache_folder or os.environ.get(
         "EXCA_EXTRACTOR_CACHE_FOLDER"
     )
 
     if electrode_tokens_extractor is None:
-        # WS-C / C2 (B36): Multi-STFT front-end (F=30 ⅓-octave filterbank,
-        # hop=128 → 16 Hz (8 Hz latent), raw |X| via apply_log=False). C4: 0.5 Hz HPF
-        # removes DC + slow drift before the STFT. C3: StandardScaler dropped
-        # (scaler=None) — robust-z normalizes the filterbank output downstream
-        # of the view (see Nv14RobustZTransform / SessionRobustZNormalizer).
-        electrode_tokens_extractor = MultiStftView(
+        # WS-C / C2 (B36) + FE-RAW-1 (2026-06-04): Multi-STFT front-end, RAW
+        # |STFT| bins (F=50, front_end="raw" default), hop=128 → 16 Hz (8 Hz
+        # latent), raw |X| via apply_log=False. C4: 0.5 Hz HPF removes DC + slow
+        # drift before the STFT. C3: StandardScaler dropped (scaler=None) —
+        # robust-z normalizes the front-end output downstream of the view (see
+        # Nv14RobustZTransform / SessionRobustZNormalizer).
+        mstft_kwargs: dict[str, tp.Any] = dict(
             event_types="Ieeg",
             car="shaft",
             notch_filter=effective_bt_notch_hz,
@@ -491,8 +764,27 @@ def build_v14_experiment(
             scaler=None,
             apply_log=False,
             channel_order="original",
-            c_max=DEFAULT_C_MAX,
+            c_max=c_max,
+            session_robust_z=session_robust_z,
         )
+        # #17: only attach the lof_* kwargs when LOF is ON. Off → none of them are
+        # forwarded, so the view keeps its field defaults and the multi-TB STFT
+        # cache uid is untouched. NOTE the load-bearing protection is this NOT-
+        # passing, not exclude_defaults: a stray ``--lof-threshold 2.0`` without
+        # ``--lof-bad-channels`` would, IF forwarded, be a non-default value that
+        # exclude_defaults does NOT drop → it would perturb the cache. Not
+        # forwarding it is what keeps the cache stable. On → drop_bads=True is
+        # forced (the view validator requires it; default-False = the prior
+        # no-drop behaviour) and threshold/n_neighbors/report_path flow through.
+        if lof_bad_channels:
+            mstft_kwargs.update(
+                lof_bad_channels=True,
+                drop_bads=True,
+                lof_threshold=lof_threshold,
+                lof_n_neighbors=lof_n_neighbors,
+                lof_report_path=lof_report_path,
+            )
+        electrode_tokens_extractor = MultiStftView(**mstft_kwargs)
     _apply_extractor_cache(
         electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
     )
@@ -565,11 +857,11 @@ def build_v14_experiment(
 
     dk_extractor = V14DKHardSupportExtractor(
         event_types="Ieeg", bt_root=bt_root, unmapped_policy="zero",
-        c_max=DEFAULT_C_MAX,
+        c_max=c_max,
     )
     _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(
-        event_types="Ieeg", bt_root=bt_root, c_max=DEFAULT_C_MAX,
+        event_types="Ieeg", bt_root=bt_root, c_max=c_max,
         unmapped_policy="zero",
     )
     _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
@@ -607,13 +899,24 @@ def build_v14_experiment(
         shaft_mask_extractor = BTShaftMaskExtractor(
             event_types="Ieeg",
             bt_root=bt_root,
-            c_max=DEFAULT_C_MAX,
+            c_max=c_max,
             seed=seed,
         )
         _apply_extractor_cache(
             shaft_mask_extractor, "shaft_mask", extractor_cache_folder
         )
         segmenter_extractors["shaft_mask"] = shaft_mask_extractor
+
+    # WS-H / T20: P3 Whisper teacher target. Built only when a cache dir is
+    # passed (P3 dispatch); P1/P2/P4 leave it None so the batch never carries
+    # the 1280-d stream. NO _apply_extractor_cache — the whole-movie teacher
+    # cache IS the precompute; the extractor only mmap-slices it per clip.
+    if whisper_target_cache_dir is not None:
+        segmenter_extractors["whisper_target"] = WhisperTargetExtractor(
+            cache_dir=whisper_target_cache_dir,
+            layer_merge=whisper_layer_merge,
+            clip_s=clip_len,
+        )
 
     data = Data(
         study=chain,
@@ -628,7 +931,25 @@ def build_v14_experiment(
                 },
             },
             "trigger_query": "type == 'Word'",
-            "start": 0.0,
+            # B36 Δlag: slide the neural clip start by +neural_lag_s so the
+            # lagged cortical response aligns to the stimulus-time Whisper
+            # teacher. 0.0 = 1:1 baseline. The teacher cache is unaffected
+            # (audio-keyed), so a lag sweep needs no recache.
+            #
+            # WS-H / FLAG 9: this `start` is shared by EVERY extractor the
+            # segmenter runs (the dataloader applies one (start, duration) to
+            # all), and it is the NEURAL clock (est_idx/sample_rate). The
+            # `whisper_target` extractor MUST NOT key off it: the teacher cache
+            # is a whole-MOVIE stream indexed by audio movie-time, and the
+            # neural vs movie clocks diverge 235-904 s within a single BT trial.
+            # WhisperTargetExtractor sidesteps this by reading the trigger Word's
+            # MOVIE-clock onset (`movie_onset_s`, threaded from words_df['start']
+            # in word_events.py) off the event directly — it never touches this
+            # `start`. So the teacher is anchored to movie-audio time while only
+            # the NEURAL window slides with Δlag; no double-count, and Δlag=0
+            # stays a true 1:1 baseline. (DO NOT "fix" this to est_idx/2048 — the
+            # neural clock is exactly the wrong key; that inversion is the trap.)
+            "start": neural_lag_s,
             # WS-C / C1: phase-conditional clip window (5 s SSL, 1 s P4).
             "duration": clip_len,
         },
@@ -640,6 +961,10 @@ def build_v14_experiment(
     infra_cfg: dict[str, tp.Any] = {}
     if exca_folder is not None:
         infra_cfg["folder"] = exca_folder
+    # #54 audit C1: exca cache mode. Not part of the config-derived uid, so it
+    # does not perturb cache hits — it only governs how a stored FAILURE is
+    # handled on relaunch (cached → re-raise; retry → recompute).
+    infra_cfg["mode"] = exca_mode
     if cluster is not None:
         infra_cfg["cluster"] = cluster
     if slurm_partition is not None:
@@ -654,6 +979,17 @@ def build_v14_experiment(
         infra_cfg["cpus_per_task"] = cpus_per_task
     if timeout_min is not None:
         infra_cfg["timeout_min"] = timeout_min
+
+    # #21: phase routing is exclusive — joint (P1/P2), P3 distill, and the
+    # P4 frozen probe each replace the brain module differently and cannot
+    # co-select. Fail at construction rather than silently letting the first
+    # branch win.
+    if sum((joint_phase, p3_distill, phase4_frozen_probe)) > 1:
+        raise ValueError(
+            "joint_phase / p3_distill / phase4_frozen_probe are mutually "
+            f"exclusive phase selectors; got joint_phase={joint_phase}, "
+            f"p3_distill={p3_distill}, phase4_frozen_probe={phase4_frozen_probe}."
+        )
 
     experiment_cls: type[Experiment] = Experiment
     extra_experiment_kwargs: dict[str, tp.Any] = {}
@@ -678,26 +1014,85 @@ def build_v14_experiment(
             # B36 staged masked-JEPA sub-phase (H4): p1 front-end M2 / p2
             # parcel M4. The staged P1->P2 handoff is WS-E; this picks the stage.
             "jepa_phase": jepa_phase,
+            # B36 WS-E E2: P2 front-end discriminative-LR scale.
+            "frontend_lr_scale": frontend_lr_scale,
         }
+    elif p3_distill:
+        # WS-F P3 Whisper distillation. The teacher stream is mandatory — the
+        # SmoothL1 loss consumes ``whisper_target``; without it the segmenter
+        # emits no target and the P3 step crashes downstream. Fail early + loud.
+        if whisper_target_cache_dir is None:
+            raise ValueError(
+                "p3_distill=True needs whisper_target_cache_dir (the whole-movie "
+                "Whisper teacher cache); the P3 SmoothL1 loss has no target "
+                "without it. Pass --whisper-target-cache-dir."
+            )
+        from speech_decoding.experiments.v14_phase3 import V14Phase3Experiment
+
+        experiment_cls = V14Phase3Experiment
+        extra_experiment_kwargs = {
+            "phase": p3_stage,
+            "projector_mode": projector_mode,
+            "target_standardize": target_standardize,
+            # Validated by V14Phase3Experiment.model_post_init (required when
+            # target_standardize=True; the R-no-target-standardize sister sets
+            # target_standardize=False and may leave this None).
+            "channel_stats_path": channel_stats_path,
+            # B33 §5 3b discriminative-LR scales (front-end base·scale, parcel
+            # base·scale, connector base). No effect under 3a.
+            "frontend_lr_scale": frontend_lr_scale,
+            "parcel_lr_scale": parcel_lr_scale,
+        }
+    elif phase4_frozen_probe:
+        # WS-G B35 frozen-encoder readout probe. Carries the transferable-state
+        # protocol (encoder + PMA strict load, projector dropped) so it can
+        # warm-start from a P3 snapshot; the base supervised Experiment cannot.
+        # Gate-D fix: the neural_lag parity guard below lives in the *base*-P4
+        # elif, which this branch short-circuits — so re-assert it here. The
+        # frozen probe IS the canonical P4 readout (chain P4 + every
+        # --resume-from / --frozen-probe run), exactly the path that must keep
+        # the leaderboard-parity [onset, onset+1 s] window.
+        if neural_lag_s != DEFAULT_NEURAL_LAG_S:
+            raise ValueError(
+                "neural_lag_s must stay 0.0 on the Phase-4 frozen-probe path: a "
+                f"non-zero probe offset (got {neural_lag_s!r}) shifts the "
+                "segmenter clip start off the leaderboard-parity "
+                "[onset, onset+1 s] window."
+            )
+        from speech_decoding.experiments.v14_phase4 import (
+            V14Phase4ReadoutExperiment,
+        )
+
+        experiment_cls = V14Phase4ReadoutExperiment
+        extra_experiment_kwargs = {"phase": 4}
     elif (
         latent_valid_override != "support"
         or sa_mask_mode != "bidirectional"
         or loss_variant != DEFAULT_LOSS_VARIANT
         or jepa_phase != DEFAULT_JEPA_PHASE
+        or frontend_lr_scale != DEFAULT_FRONTEND_LR_SCALE
+        or neural_lag_s != DEFAULT_NEURAL_LAG_S
     ):
         # B30 + B31 + B36 joint-only flags have semantic effect under the
         # joint phase only. The supervised Phase-4 path doesn't run the SSL
-        # aggregator, the bidirectional-mask latent-SA branch, or a staged
-        # masked-JEPA phase, so a non-default flag here would silently
-        # mis-record the sister / stage.
+        # aggregator, the bidirectional-mask latent-SA branch, a staged
+        # masked-JEPA phase, or the P2 discriminative-LR split, so a non-default
+        # flag here would silently mis-record the sister / stage. neural_lag_s
+        # is blocked here for a different reason: it DOES shift the segmenter
+        # window on this path, and a non-zero P4 probe offset breaks the
+        # leaderboard-parity [onset, onset+1 s] window.
         raise ValueError(
             "latent_valid_override / sa_mask_mode / loss_variant / jepa_phase "
-            "are B30/B31/B36 joint-phase selectors only; got "
+            "/ frontend_lr_scale / neural_lag_s are B30/B31/B36 joint-phase / "
+            "distill selectors only; got "
             f"latent_valid_override={latent_valid_override!r}, "
             f"sa_mask_mode={sa_mask_mode!r}, "
             f"loss_variant={loss_variant!r}, "
-            f"jepa_phase={jepa_phase!r} with joint_phase=False. "
-            "Pass --phase 1 (joint) when setting these flags."
+            f"jepa_phase={jepa_phase!r}, "
+            f"frontend_lr_scale={frontend_lr_scale!r}, "
+            f"neural_lag_s={neural_lag_s!r} with joint_phase=False. "
+            "Pass --phase 1 (joint) when setting these flags "
+            "(neural_lag_s must stay 0.0 on the Phase-4 probe path)."
         )
 
     return experiment_cls(
@@ -744,16 +1139,14 @@ def build_v14_experiment(
             # via the Experiment-level snapshot.
         },
         loss={"name": "CrossEntropyLoss"},
-        # ``fused=True`` Adam (2026-05-30 speedup audit Tier-1): one fused
-        # kernel for the whole step instead of a per-tensor foreach loop.
+        # #37: optimizer/LR-schedule config built above from the optim flags.
+        # NOT fused — fused sets _step_supports_amp_scaling=True, which makes
+        # Lightning's bf16-mixed AMP plugin refuse the §7-locked grad_clip=1.0
+        # (verified: job 47686013 crashed on this combo at the first opt step).
         # neuraltrain BaseTorchOptimizer forwards ``kwargs`` verbatim to
-        # ``torch.optim.Adam``; ``fused`` is valid on CPU + CUDA in the
-        # pinned torch 2.10, so the laptop test path is unaffected. Applies
-        # to BOTH the supervised Phase-4 and the joint SSL optimizer (same
-        # ``self.optim``). Same Adam math as the foreach impl, equivalent
-        # within fp tolerance — NOT bit-identical (the fused kernel uses a
-        # different reduction order, esp. under bf16-mixed on CUDA).
-        optim={"optimizer": {"name": "Adam", "lr": 1e-3, "kwargs": {"fused": True}}},
+        # ``torch.optim.{Adam,AdamW}``. Applies to BOTH the supervised Phase-4
+        # and the joint SSL optimizer.
+        optim=optim_cfg,
         metrics=[
             {
                 "name": "Accuracy",
@@ -762,7 +1155,22 @@ def build_v14_experiment(
             }
         ],
         n_epochs=n_epochs,
+        max_steps=max_steps,
+        val_check_interval=val_check_interval,
+        collapse_guard=collapse_guard,
+        early_stopping_patience=early_stopping_patience,
+        # #37: Lightning gradient clipping. v14 §7 locks grad_clip=1.0 as a
+        # non-swept universal; the CLI defaults --grad-clip to 1.0, but this
+        # function default is None (the tiny test experiments don't clip).
+        gradient_clip_val=gradient_clip_val,
+        accumulate_grad_batches=accumulate_grad_batches,
         seed=seed,
+        # B36 WS-E (E3/E4) cross-phase handoff. On a standalone phase both are
+        # None (no-op); the chain driver (run_phase_pipeline) rewrites them via
+        # infra.clone_obj, and a manual incremental launch sets them from
+        # --resume-from / --snapshot-ckpt-to.
+        pretrained_ckpt=pretrained_ckpt,
+        snapshot_ckpt_to=snapshot_ckpt_to,
         # Per-clip metadata reaches the encoder forward as additional
         # kwargs alongside (tokens, support, valid_mask).
         x_name=(
@@ -807,14 +1215,156 @@ def _parser() -> argparse.ArgumentParser:
                    help="DataLoader worker processes (B1.4e, 2026-05-29). "
                         "0 starves the GPU on the per-sample CPU STFT; default "
                         "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
-    p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS)
-    p.add_argument("--clip-len", type=float, default=DEFAULT_CLIP_LEN_S,
+    p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS,
+                   help="Epoch budget for the SSL/distill phases (P1/P2/P3a/P3b) "
+                        "and the P4 cap. The SSL phases train to this fixed "
+                        "budget; no early-stop.")
+    p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, default=None,
+                   help="Optional step budget for the SSL/distill phases "
+                        "(P1/P2/P3a/P3b). When set it overrides --n-epochs for "
+                        "those phases: training stops at this many optimizer "
+                        "steps (max_epochs=-1). Real SSL runs over the "
+                        "multi-hundred-hour joint corpus are budgeted in steps, "
+                        "not epochs. P4 ignores this.")
+    p.add_argument("--ssl-val-check-interval", dest="ssl_val_check_interval",
+                   type=int, default=None,
+                   help="Validation cadence (optimizer steps) for the SSL/"
+                        "distill phases (#54). A step-budgeted phase ends mid-"
+                        "epoch, so without this the collapse-guard soft panel "
+                        "(RankMe/coverage/no-masking/loss-blowup) never fires. "
+                        "Default when --ssl-max-steps is set: max(50, steps//10) "
+                        "(~10 checks/phase). Ignored on an epoch budget.")
+    p.add_argument("--p4-early-stop-patience", dest="p4_early_stop_patience",
+                   type=int, default=DEFAULT_P4_EARLY_STOP_PATIENCE,
+                   help="Early-stopping patience (epochs) on val_loss for the "
+                        "P4 frozen probe ONLY — the one phase where val_loss-min "
+                        "is the right signal (P4 IS the supervised task). The "
+                        "SSL/distill phases never early-stop. Pass a value <= 0 "
+                        "to disable and run P4 to the --n-epochs cap.")
+    # #37 optimizer / LR-schedule flags (4-agent audit 2026-06-03). Defaults
+    # reproduce the prior constant-Adam config bit-for-bit EXCEPT --grad-clip,
+    # which defaults to 1.0 to restore the §7 locked-universal that was silently
+    # OFF. The locked linear-warmup → cosine→0 + AdamW path is opt-in via
+    # --lr-schedule warmup-cosine (peak --lr + β2=0.95 + wd are M0-sweep choices,
+    # so they are NOT auto-flipped — the launcher sets them explicitly).
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="Peak/base LR (constant value, or warmup-cosine peak). "
+                        "1e-3 default = prior behavior; the §7 M0 sweep centers "
+                        "are 5e-4 (P1) / 3e-4 (P2) @ batch 1024/512 (√-rule-"
+                        "rescale for the live bs=8 before a real run).")
+    p.add_argument("--lr-schedule", dest="lr_schedule",
+                   choices=("constant", "warmup_cosine"), default="constant",
+                   help="constant (default, prior behavior) or warmup_cosine "
+                        "(§7 locked shape: linear warmup → cosine → "
+                        "min_lr_ratio·peak). warmup_cosine reads its horizon from "
+                        "estimated_stepping_batches (--ssl-max-steps pins it).")
+    p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=0,
+                   help="Linear-warmup optimizer steps for --lr-schedule "
+                        "warmup_cosine (§7: 20k P1 / 5k P2 @ full corpus; scale "
+                        "to the actual step budget). Clamped below total_steps.")
+    p.add_argument("--min-lr-ratio", dest="min_lr_ratio", type=float, default=0.0,
+                   help="Cosine floor as a fraction of peak LR (0.0 = →0, the "
+                        "§7 lock). Per-group-proportional, so P2/P3 "
+                        "discriminative-LR ratios survive a non-zero floor.")
+    p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.0,
+                   help="AdamW weight decay (0.0 default = prior plain-Adam). §7 "
+                        "M0 sweep center is 0.05; only added to the optimizer "
+                        "kwargs when > 0 (use --optimizer adamw for decoupled WD).")
+    p.add_argument("--optimizer", dest="optimizer_name",
+                   choices=("Adam", "AdamW"), default="Adam",
+                   help="Adam (default, prior behavior) or AdamW (§7 locked "
+                        "family, decoupled weight decay).")
+    p.add_argument("--adam-beta2", dest="adam_beta2", type=float, default=None,
+                   help="When set, optimizer betas = (0.9, beta2). §7 locks "
+                        "β2=0.95 for the SSL phases; unset → torch default "
+                        "(Adam (0.9, 0.999)) for behavior parity.")
+    p.add_argument("--grad-clip", dest="grad_clip", type=float, default=1.0,
+                   help="Lightning gradient_clip_val. Defaults to 1.0 to restore "
+                        "the §7 locked-universal grad_clip that was silently OFF "
+                        "(top divergence-risk fix per the 6/03 run-health audit). "
+                        "Pass <= 0 to disable clipping.")
+    p.add_argument("--accumulate-grad-batches", dest="accumulate_grad_batches",
+                   type=int, default=1,
+                   help="Lightning accumulate_grad_batches. 1 (default) = no "
+                        "accumulation. >1 sums grads over N micro-batches → "
+                        "effective batch = --batch-size * N at N× wall-clock per "
+                        "optimizer step. The effective-batch lever for the 32 GB "
+                        "coganlab-gpu cards; a larger physical --batch-size on a "
+                        "48 GB+ card is preferred.")
+    p.add_argument("--clip-len", type=float, default=None,
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
                         "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
-                        "encoder n_time_bins / RoPE ceiling.")
+                        "encoder n_time_bins / RoPE ceiling. Unset → resolves "
+                        "to 1.0 for --phase 4 (leaderboard parity, Gate-B "
+                        "flag 3) and 5.0 otherwise.")
+    p.add_argument("--neural-lag-s", dest="neural_lag_s", type=float,
+                   default=DEFAULT_NEURAL_LAG_S,
+                   help="B36 Δlag: neural-response lag (s) added to the clip "
+                        "start so the lagged cortical response aligns to the "
+                        "stimulus-time Whisper teacher. 0.0 (default) = 1:1 "
+                        "baseline / falsifier null; P3-distill sweep sisters "
+                        "R-distill-lag-{75,150,300}ms. Audio-keyed teacher ⇒ no "
+                        "recache. Must stay 0.0 under --phase 4 (leaderboard "
+                        "parity); no-op for P1/P2.")
+    p.add_argument("--session-robust-z", dest="session_robust_z",
+                   action="store_true", default=True,
+                   help="C3 (B13): per-(electrode,freq,session) robust-z on the "
+                        "default Multi-STFT front-end (fit per session over its "
+                        "own full recording in prepare(), applied frozen per "
+                        "clip). ON by default — required for any real run.")
+    p.add_argument("--no-session-robust-z", dest="session_robust_z",
+                   action="store_false",
+                   help="Emit the RAW (un-normalized) filterbank. Only for "
+                        "plumbing smokes / fast-dev-run — encoder LN absorbs "
+                        "scale there; NOT valid for a science run.")
+    p.add_argument("--lof-bad-channels", dest="lof_bad_channels",
+                   action="store_true", default=False,
+                   help="#17 (D2/T1.7): per-session MNE-LOF bad-channel drop on "
+                        "the default Multi-STFT front-end (filtered, pre-CAR "
+                        "voltage; flagged channels dropped before shaft-CAR). OFF "
+                        "by default (cache uid untouched). ON forces drop_bads=True "
+                        "and REQUIRES --lof-report-path: the per-subject drop "
+                        "counts are written to JSON for Ben review before a scored "
+                        "run ('report back how many channels are dropped'). "
+                        "Changes the STFT cache uid → forces a rebuild.")
+    p.add_argument("--lof-threshold", dest="lof_threshold", type=float,
+                   default=1.5,
+                   help="MNE-LOF z-score threshold (default 1.5, the L.0 recipe "
+                        "amendment value). Lower = more aggressive. In the cache "
+                        "uid. Inert unless --lof-bad-channels.")
+    p.add_argument("--lof-n-neighbors", dest="lof_n_neighbors", type=int,
+                   default=20,
+                   help="MNE-LOF neighbor count (default 20). In the cache uid. "
+                        "Inert unless --lof-bad-channels.")
+    p.add_argument("--lof-report-path", dest="lof_report_path", default=None,
+                   help="Where to write the per-session/per-subject LOF drop-count "
+                        "JSON (the Ben review gate). REQUIRED when "
+                        "--lof-bad-channels is set. Output-location only — NOT in "
+                        "the cache uid.")
+    p.add_argument("--c-max", dest="c_max", type=int, default=DEFAULT_C_MAX,
+                   help=f"#35: padded electrode-slot count C (default "
+                        f"{DEFAULT_C_MAX}, covers all 4 Phase-1 corpora / shared "
+                        "multi-corpus cache). Pass 256 for BT-only runs (BT raw "
+                        "max=256, the exact safe floor) to drop the 128 pure-pad "
+                        "slots the per-electrode front-end would otherwise process "
+                        "(~33%% wasted FLOPs, an OOM lever). In the extractor-cache "
+                        "uid → a non-default value forces a fresh STFT cache "
+                        "(recipe-amendment, HB02 re-cost).")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
+    p.add_argument("--exca-mode", dest="exca_mode", default=None,
+                   choices=("cached", "retry", "force", "read-only"),
+                   help="Exca TaskInfra cache mode (#54 audit C1). 'cached' "
+                        "RE-RAISES a stored failure on a same-config relaunch "
+                        "instead of recomputing — so a collapse-guard abort "
+                        "followed by a code-level fix would never re-run. "
+                        "'retry' recomputes a cached *error* while keeping "
+                        "cached *successes*, so the abort → fix → relaunch loop "
+                        "works. DEFAULT (unset): 'retry' for --chain, 'cached' "
+                        "for a single phase — a chained capstone is C1-safe "
+                        "without the operator remembering the flag. An explicit "
+                        "value always wins. Not part of the uid.")
     # Slurm resource knobs (B1.4a, 2026-05-29). Only used when
     # --cluster=slurm; otherwise ignored. Defaults are conservative
     # (None = inherit submitit defaults) — pass explicit values for any
@@ -979,6 +1529,15 @@ def _parser() -> argparse.ArgumentParser:
              "selects which stage trains. A non-default raises under --phase 4.",
     )
     p.add_argument(
+        "--p2-frontend-lr-scale", dest="frontend_lr_scale", type=float,
+        default=DEFAULT_FRONTEND_LR_SCALE,
+        help="B36 WS-E E2: P2 front-end discriminative-LR scale (joint SSL / "
+             "--phase 1, jepa-phase p2 only). 0.1 (default) = base/10; 0.2 = "
+             "R-p2-frontend-lr-5 (base/5); 0.0 = R-p2-freeze-frontend "
+             "(front-end frozen, parcel side trains alone). A non-default "
+             "raises under --phase 4.",
+    )
+    p.add_argument(
         "--latent-valid-override",
         choices=("support", "all_true", "parcels_supervised"),
         default="support",
@@ -1057,6 +1616,49 @@ def _parser() -> argparse.ArgumentParser:
                         "'3b' unfreezes it with a discriminative LR "
                         "(front-end base/10, parcel base/3, connector base). "
                         "Default 3a.")
+    # WS-F P3 distillation data (#21). The teacher cache is the whole-movie
+    # Whisper stream; channel stats are the train-only per-channel z-score.
+    p.add_argument("--whisper-target-cache-dir", default=None,
+                   help="Root of the whole-movie Whisper teacher cache "
+                        "(scripts/neuroprobe/build_bt_teacher_cache.py). REQUIRED "
+                        "for --phase 3 / --chain; the P3 SmoothL1 loss consumes "
+                        "the per-clip whisper_target it slices.")
+    p.add_argument("--whisper-layer-merge", choices=("mean_all", "8"),
+                   default="mean_all",
+                   help="Whisper teacher layer merge; must match the cache build. "
+                        "'mean_all' (locked default) / '8' = R-whisper-single-layer-L8.")
+    p.add_argument("--channel-stats-path", default=None,
+                   help="Train-only per-channel target z-score stats "
+                        "({'mean','inv_std'} from fit_channel_stats). REQUIRED for "
+                        "--phase 3 / --chain unless --no-target-standardize.")
+    p.add_argument("--no-target-standardize", dest="target_standardize",
+                   action="store_false", default=True,
+                   help="R-no-target-standardize sister: distill against the raw "
+                        "1280-d Whisper target (no per-channel z-score).")
+    # WS-G P4 frozen probe + cross-phase handoff (#21).
+    p.add_argument("--frozen-probe", action="store_true", default=False,
+                   help="--phase 4 only: build the B35 frozen-encoder readout "
+                        "probe (V14Phase4ReadoutExperiment, transferable-state "
+                        "protocol) instead of the from-scratch supervised CE "
+                        "classifier. Implied when --resume-from is set on P4.")
+    p.add_argument("--resume-from", default=None,
+                   help="Warm-start this phase's encoder (+PMA from P3) from a "
+                        "prior phase's transferable-state snapshot "
+                        "(Experiment.pretrained_ckpt). Lets the chain run "
+                        "incrementally, one verified sbatch per phase.")
+    p.add_argument("--snapshot-ckpt-to", default=None,
+                   help="After test, write this phase's transferable state to PATH "
+                        "(Experiment.snapshot_ckpt_to) for the next phase to load.")
+    # #21 full in-process chain driver.
+    p.add_argument("--chain", action="store_true", default=False,
+                   help="Run the full P1->P2->P3a->P3b->P4 pipeline in one "
+                        "process with checkpoint handoff (run_phase_pipeline). "
+                        "Overrides --phase. Needs --work-dir, "
+                        "--whisper-target-cache-dir, and --channel-stats-path "
+                        "(unless --no-target-standardize).")
+    p.add_argument("--work-dir", default=None,
+                   help="Directory for the --chain per-phase ckpt handoff "
+                        "(phase_{i}.ckpt). Required with --chain.")
     return p
 
 
@@ -1078,22 +1680,11 @@ _PHASE2_BLOCKERS = (
     "Sister R-keep-phase-split keeps explicit P1/P2 via the parent "
     "V14Experiment — see docs/neuroprobe/v14_blockers.md."
 )
-_PHASE3_BLOCKERS = (
-    # WS-F closed the Phase-3 readout/distillation wiring: the
-    # V14Phase3DistillModule (frozen-or-discriminative encoder → PMA → 256→1280
-    # projector → Smooth-L1 vs pooled+standardized Whisper target) and the
-    # V14Phase3Experiment are built and unit-tested (module forward/loss/freeze
-    # + the experiment's model_post_init guards + _build_standardizer in
-    # test_v14_phase3.py). Full P3 end-to-end construction is the WS-I2 capstone
-    # (pending). The one remaining LIVE-dispatch blocker is the whisper_target
-    # data emission: the segmenter has no extractor for the cached 50 Hz
-    # all-layer-mean Whisper feature ((B, 250, 1280)) yet — that is WS-H.
-    "Phase-3 distillation (V14Phase3DistillModule / V14Phase3Experiment) is "
-    "wired and unit-tested; the live dispatch path still needs the "
-    "whisper_target segmenter extractor (cached 50 Hz Whisper all-layer-mean "
-    "feature, (B, 250, 1280)) — the P3 data-layer emission is the remaining "
-    "WS-H blocker. See ssl/distill.py + experiments/v14_phase3.py."
-)
+# E5/WS-F/#21 2026-06-03: ``_PHASE3_BLOCKERS`` removed. The whisper_target
+# segmenter emission (WS-H, #20) landed, so --phase 3 now routes to
+# V14Phase3Experiment via build_v14_experiment(p3_distill=True) and the chain
+# driver runs P3a/P3b end-to-end. (``_PHASE1_BLOCKERS`` was removed in E5; only
+# ``_PHASE2_BLOCKERS`` survives — phase 2 is the collapsed legacy split.)
 
 
 def construct_v14_joint_callbacks(
@@ -1143,17 +1734,201 @@ def construct_v14_joint_callbacks(
     return callbacks
 
 
+def _common_build_kwargs(
+    args, *, cross_attn_positions: list[int] | None,
+) -> dict[str, tp.Any]:
+    """Knobs identical across every phase in BOTH the single-phase ``main()``
+    build and the ``--chain`` builds.
+
+    Centralized after the Gate-D audit: ``binary_tasks`` / ``latent_valid_override``
+    / ``sa_mask_mode`` / ``loss_variant`` had drifted OUT of the chain's inline
+    ``common`` dict while the single-phase call still passed them, so a
+    ``--chain --loss-variant X`` (or any of those) silently ran the DEFAULT arm
+    while the run summary printed the sister as applied. Both call sites consume
+    this one dict, so a forgotten flag is now structurally impossible.
+
+    Excludes the per-phase selectors (``joint_phase`` / ``p3_distill`` /
+    ``phase4_frozen_probe`` / ``p3_stage`` / ``jepa_phase`` / ``clip_len`` /
+    ``neural_lag_s`` / ``frontend_lr_scale`` / the whisper + handoff knobs),
+    which each call site sets explicitly.
+    """
+    return dict(
+        mode=args.mode, task=args.task, seed=args.seed,
+        eval_mode=args.eval_mode,
+        exca_mode=args.exca_mode,
+        test_subject_id=args.test_subject_id,
+        test_trial_id=args.test_trial_id,
+        binary_tasks=args.binary_tasks,
+        session_robust_z=args.session_robust_z,
+        eps=args.eps, d_model=args.d_model, depth=args.depth,
+        n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        n_epochs=args.n_epochs,
+        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
+        slurm_partition=args.slurm_partition,
+        slurm_account=args.slurm_account,
+        mem_gb=args.mem_gb,
+        gpus_per_node=args.gpus_per_node,
+        cpus_per_task=args.cpus_per_task,
+        timeout_min=args.timeout_min,
+        precision=args.precision,
+        extractor_cache_folder=args.extractor_cache_folder,
+        dkoleo_mode=args.dkoleo_mode,
+        cross_attn_positions=cross_attn_positions,
+        mains_notch_hz=args.mains_notch_hz,
+        # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
+        # one dict so the chain + single-phase builds stay in lock-step.
+        lof_bad_channels=args.lof_bad_channels,
+        lof_threshold=args.lof_threshold,
+        lof_n_neighbors=args.lof_n_neighbors,
+        lof_report_path=args.lof_report_path,
+        # #35: padded electrode-slot count. Reaches every phase via this one dict
+        # so the chain's 4 c_max-padded extractors stay in lock-step.
+        c_max=args.c_max,
+        subtype_embed_enabled=args.subtype_embed_enabled,
+        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
+        subtype_embed_vocab=args.subtype_embed_vocab,
+        ref_embed_enabled=args.ref_embed_enabled,
+        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
+        phase_mode=args.phase_mode,
+        ref_operator_alpha=args.ref_operator_alpha,
+        include_ajile12=args.include_ajile12,
+        ffn_variant=args.ffn_variant,
+        gradient_checkpointing=args.gradient_checkpointing,
+        readout=args.readout,
+        latent_valid_override=args.latent_valid_override,
+        sa_mask_mode=args.sa_mask_mode,
+        loss_variant=args.loss_variant,
+        # #37 optim / LR-schedule (audit 2026-06-03). --adam-beta2 → (0.9, β2)
+        # tuple; --grad-clip <= 0 → None (disable). Reaches every phase via this
+        # one dict, so the chain and single-phase builds stay in lock-step.
+        lr=args.lr,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer_name,
+        adam_betas=(0.9, args.adam_beta2) if args.adam_beta2 is not None else None,
+        gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+    )
+
+
+def _build_v14_chain(
+    args, *, cross_attn_positions: list[int] | None,
+) -> list[Experiment]:
+    """Assemble the 5 staged experiments [P1, P2, P3a, P3b, P4] for the chain.
+
+    Every phase shares the model/eval/cluster knobs from ``args``; only the
+    phase selector, clip window, and (for P3) the teacher stream differ. The
+    cross-phase ckpt handoff is NOT set here — ``run_phase_pipeline`` rewrites
+    ``snapshot_ckpt_to`` / ``pretrained_ckpt`` per boundary via
+    ``infra.clone_obj`` so each phase snapshots to / loads from its neighbour.
+
+    Clip window: 5 s (T_p=40) for the SSL + distill phases so the student grid
+    meets the Whisper teacher's 40-frame pool; 1 s (T_p=8) for the P4 readout
+    (leaderboard parity). P4 forces ``neural_lag_s=0.0`` — a non-zero probe
+    offset breaks the [onset, onset+1 s] parity window (Gate-B flag 3).
+    """
+    if args.work_dir is None:
+        raise ValueError("--chain needs --work-dir for the per-phase ckpt handoff.")
+    if args.whisper_target_cache_dir is None:
+        raise ValueError(
+            "--chain needs --whisper-target-cache-dir (the P3 stages distill "
+            "against the Whisper teacher stream)."
+        )
+    if args.target_standardize and args.channel_stats_path is None:
+        raise ValueError(
+            "--chain with target standardization (B33 default) needs "
+            "--channel-stats-path; pass --no-target-standardize to distill "
+            "against the raw 1280-d target instead."
+        )
+
+    common = _common_build_kwargs(args, cross_attn_positions=cross_attn_positions)
+    whisper = dict(
+        whisper_target_cache_dir=args.whisper_target_cache_dir,
+        whisper_layer_merge=args.whisper_layer_merge,
+        channel_stats_path=args.channel_stats_path,
+        target_standardize=args.target_standardize,
+    )
+    # SSL/distill phases (P1/P2/P3a/P3b): fixed budget, NEVER early-stop (their
+    # val loss is a pretext objective, not the downstream metric).
+    # ``--ssl-max-steps`` (when set) budgets them in steps instead of --n-epochs.
+    # #54: a step-budgeted phase ends mid-epoch, so force a validation cadence
+    # (≈10 checks across the phase) — else the collapse-guard soft panel, which
+    # fires on validation, never evaluates. Resolved here so the run summary is
+    # honest; --ssl-val-check-interval overrides. Stays None on an epoch budget
+    # (epoch-boundary validation already runs).
+    ssl_val_check = args.ssl_val_check_interval
+    if ssl_val_check is None and args.ssl_max_steps is not None:
+        ssl_val_check = max(50, args.ssl_max_steps // 10)
+    ssl_budget: dict[str, tp.Any] = dict(
+        max_steps=args.ssl_max_steps, val_check_interval=ssl_val_check,
+    )
+    p1 = build_v14_experiment(
+        **common, **ssl_budget, joint_phase=True, jepa_phase="p1", clip_len=5.0,
+        neural_lag_s=args.neural_lag_s,
+    )
+    p2 = build_v14_experiment(
+        **common, **ssl_budget, joint_phase=True, jepa_phase="p2", clip_len=5.0,
+        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+    )
+    p3a = build_v14_experiment(
+        **common, **ssl_budget, **whisper, p3_distill=True, p3_stage="3a",
+        clip_len=5.0,
+        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+    )
+    p3b = build_v14_experiment(
+        **common, **ssl_budget, **whisper, p3_distill=True, p3_stage="3b",
+        clip_len=5.0,
+        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+    )
+    # binary_tasks now rides in `common` (reaches every phase, so the SSL /
+    # distill clip population matches the P4 eval set); P4 only overrides the
+    # parity window + zero lag. P4 is the one phase that early-stops on val_loss
+    # (it IS the supervised task); <=0 disables and runs to the --n-epochs cap.
+    p4_patience = (
+        args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None
+    )
+    p4 = build_v14_experiment(
+        **common, phase4_frozen_probe=True,
+        clip_len=1.0, neural_lag_s=0.0,
+        early_stopping_patience=p4_patience,
+        # #54 audit M1: no collapse guard on the supervised frozen probe — it
+        # has EarlyStopping on the real downstream val_loss, and a frozen linear
+        # head can't dimensionally collapse.
+        collapse_guard=False,
+    )
+    return [p1, p2, p3a, p3b, p4]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.phase == 2:
+    # #54 audit C1: a chained run that aborts a phase (collapse-guard) and is
+    # then relaunched with a code fix would, under the 'cached' default,
+    # re-raise the stored failure instead of recomputing. Default an unset
+    # --exca-mode to 'retry' for --chain (recompute cached errors, keep cached
+    # successes) so the abort → fix → relaunch loop is safe without the
+    # operator remembering the flag; a single phase stays 'cached'. An explicit
+    # --exca-mode always wins.
+    if args.exca_mode is None:
+        args.exca_mode = "retry" if args.chain else "cached"
+    # Gate-B flag 3 / Gate-D fix: phase-couple the clip window when the operator
+    # leaves --clip-len unset. A single --phase 4 run that defaulted to 5 s would
+    # silently run the readout off the leaderboard-parity 1 s window. --chain
+    # ignores this (it sets each phase's clip explicitly), but resolving here
+    # keeps the run summary honest.
+    if args.clip_len is None:
+        args.clip_len = 1.0 if args.phase == 4 else DEFAULT_CLIP_LEN_S
+    if args.phase == 2 and not args.chain:
         # Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
-        # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 (V14JointExperiment).
-        # Phase 3 is NO LONGER gated here — its module/experiment are wired
-        # (WS-F: V14Phase3DistillModule / V14Phase3Experiment) and the live
-        # dispatch hits the precise whisper_target data blocker below (after the
-        # dry-run short-circuit) rather than a blanket gate. (phase=1 falls
-        # through to construct V14JointExperiment; its B2.x sister-gating fires
-        # at construction in model_post_init, see above.)
+        # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 --jepa-phase p2
+        # (V14JointExperiment). --phase 1 falls through to construct
+        # V14JointExperiment; its B2.x sister-gating fires at construction in
+        # model_post_init. (--chain builds its own P2 via --jepa-phase p2, so it
+        # is exempt from this single-phase guard.) Phase 3 (#21, WS-F) is no
+        # longer gated — --phase 3 routes to V14Phase3Experiment now that the
+        # whisper_target emission (WS-H, #20) has landed.
         raise NotImplementedError(
             f"--phase 2 dispatch is gated on unresolved blockers: "
             f"{_PHASE2_BLOCKERS}. See docs/neuroprobe/v14_blockers.md."
@@ -1163,10 +1938,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  eval_mode={args.eval_mode} test=({args.test_subject_id},{args.test_trial_id})")
     print(f"  d_model={args.d_model} depth={args.depth} n_heads={args.n_heads} "
           f"M={args.m_sub_slots} eps={args.eps}")
-    print(f"  K=80 DK parcels, batch_size={args.batch_size}, n_epochs={args.n_epochs}")
+    print(f"  K=80 DK parcels, c_max={args.c_max}, batch_size={args.batch_size}, "
+          f"n_epochs={args.n_epochs}")
     print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
           f"mains_notch_hz={args.mains_notch_hz}")
+    print(f"  lof_bad_channels={args.lof_bad_channels} lof_threshold={args.lof_threshold} "
+          f"lof_n_neighbors={args.lof_n_neighbors} lof_report_path={args.lof_report_path}")
     print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
+          f"frontend_lr_scale={args.frontend_lr_scale} neural_lag_s={args.neural_lag_s} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
@@ -1174,12 +1953,28 @@ def main(argv: list[str] | None = None) -> int:
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
           f"readout={args.readout} "
           f"gradient_checkpointing={args.gradient_checkpointing}")
+    print(f"  optim: name={args.optimizer_name} lr={args.lr} "
+          f"lr_schedule={args.lr_schedule} warmup_steps={args.warmup_steps} "
+          f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
+          f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip} "
+          f"accumulate_grad_batches={args.accumulate_grad_batches}")
     if args.cluster == "slurm":
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "
               f"gpus_per_node={args.gpus_per_node} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
     print(f"  precision={args.precision}")
+    # #21 phase routing + cross-phase handoff (recorded so the run YAML never
+    # silently rides the wrong phase / checkpoint).
+    print(f"  phase={args.phase} chain={args.chain} p3_stage={args.p3_stage} "
+          f"frozen_probe={args.frozen_probe} clip_len={args.clip_len} "
+          f"exca_mode={args.exca_mode}")
+    print(f"  whisper_target_cache_dir={args.whisper_target_cache_dir!r} "
+          f"whisper_layer_merge={args.whisper_layer_merge} "
+          f"target_standardize={args.target_standardize} "
+          f"channel_stats_path={args.channel_stats_path!r}")
+    print(f"  resume_from={args.resume_from!r} "
+          f"snapshot_ckpt_to={args.snapshot_ckpt_to!r} work_dir={args.work_dir!r}")
     _resolved_xc = args.extractor_cache_folder or os.environ.get(
         "EXCA_EXTRACTOR_CACHE_FOLDER"
     )
@@ -1196,57 +1991,89 @@ def main(argv: list[str] | None = None) -> int:
               "default electrode-tokens extractor = MultiStftView)")
         return 0
 
-    if args.phase == 3:
-        # WS-F: the Phase-3 distillation module + experiment are wired
-        # (V14Phase3DistillModule / V14Phase3Experiment) and unit-tested
-        # (test_v14_phase3.py). Full P3 end-to-end construction is the WS-I2
-        # capstone (pending). The LIVE dispatch path still needs the
-        # whisper_target data emission (WS-H); fail fast + precise rather than
-        # silently building a Phase-4 CE classifier.
-        raise NotImplementedError(
-            f"--phase 3 (stage {args.p3_stage}) dispatch: {_PHASE3_BLOCKERS} "
-            "See docs/neuroprobe/v14_blockers.md."
+    if args.chain:
+        # #21: full P1->P2->P3a->P3b->P4 pipeline in one process with ckpt
+        # handoff (run_phase_pipeline). Overrides --phase.
+        from speech_decoding.experiments.v14_phase_pipeline import (
+            run_phase_pipeline,
         )
 
+        phases = _build_v14_chain(args, cross_attn_positions=cross_attn_positions)
+        print(f"  chain: {len(phases)} phases (P1,P2,P3a,P3b,P4) "
+              f"work_dir={args.work_dir}")
+        results = run_phase_pipeline(phases, work_dir=args.work_dir)
+        print(f"V14 chain results: {results}")
+        return 0
+
+    # WS-F/WS-G #21: single-phase routing. phase 1 -> joint (V14JointExperiment);
+    # phase 3 -> V14Phase3Experiment (Whisper distill); phase 4 -> base
+    # supervised Experiment, or V14Phase4ReadoutExperiment (frozen probe) when
+    # --frozen-probe / --resume-from is set so it can warm-start from P3.
+    if args.phase == 3 and args.whisper_target_cache_dir is None:
+        # Operator-level guard, independent of BT-data presence: P3 distills
+        # against the whisper_target stream, so the cache dir is mandatory.
+        raise ValueError(
+            "--phase 3 (Whisper distillation, V14Phase3Experiment) needs "
+            "--whisper-target-cache-dir; the P3 SmoothL1 loss has no target "
+            "without it. Add it (and --channel-stats-path unless "
+            "--no-target-standardize)."
+        )
+    # --resume-from (warm-start) AND --snapshot-ckpt-to (hand off downstream)
+    # both require the transferable-state protocol, which only the frozen-probe
+    # V14Phase4ReadoutExperiment carries — the base supervised Experiment would
+    # TypeError at runtime (after a full train) on either. So either flag, like
+    # --frozen-probe, selects the readout experiment on P4.
+    phase4_frozen_probe = args.phase == 4 and (
+        args.frozen_probe
+        or args.resume_from is not None
+        or args.snapshot_ckpt_to is not None
+    )
+    # #39 (audit 2026-06-03): mirror the chain's per-phase budget gating onto the
+    # single-phase path (it previously reached only --chain). --ssl-max-steps is an
+    # SSL/distill-phase step budget (P1/P2-via-jepa, P3a/3b); P4 ignores it and
+    # uses --n-epochs + early-stop. --p4-early-stop-patience is P4-only (val_loss is
+    # the right signal only there). Defaults stay None → prior epoch-budget behavior
+    # is byte-identical; these fire only when the flags are passed. The single-phase
+    # --phase 4 rerun is the next gate, so this closes the gap that would otherwise
+    # silently ignore --p4-early-stop-patience there.
+    single_max_steps = args.ssl_max_steps if args.phase in (1, 3) else None
+    # #54: same step-budget-ends-mid-epoch fix as the chain, for a single SSL
+    # phase. Only meaningful when this phase carries a step budget.
+    single_val_check = args.ssl_val_check_interval
+    if single_val_check is None and single_max_steps is not None:
+        single_val_check = max(50, single_max_steps // 10)
+    single_p4_patience = (
+        (args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None)
+        if args.phase == 4
+        else None
+    )
+    print(
+        f"  single-phase budget: max_steps={single_max_steps} "
+        f"val_check_interval={single_val_check} "
+        f"early_stopping_patience={single_p4_patience}"
+    )
     xp = build_v14_experiment(
-        mode=args.mode, task=args.task, seed=args.seed,
-        eval_mode=args.eval_mode,
-        test_subject_id=args.test_subject_id,
-        test_trial_id=args.test_trial_id,
-        binary_tasks=args.binary_tasks,
-        eps=args.eps, d_model=args.d_model, depth=args.depth,
-        n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
+        **_common_build_kwargs(args, cross_attn_positions=cross_attn_positions),
         clip_len=args.clip_len,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        n_epochs=args.n_epochs,
-        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
-        slurm_partition=args.slurm_partition,
-        slurm_account=args.slurm_account,
-        mem_gb=args.mem_gb,
-        gpus_per_node=args.gpus_per_node,
-        cpus_per_task=args.cpus_per_task,
-        timeout_min=args.timeout_min,
-        precision=args.precision,
-        extractor_cache_folder=args.extractor_cache_folder,
-        dkoleo_mode=args.dkoleo_mode,
-        cross_attn_positions=cross_attn_positions,
-        mains_notch_hz=args.mains_notch_hz,
-        subtype_embed_enabled=args.subtype_embed_enabled,
-        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
-        subtype_embed_vocab=args.subtype_embed_vocab,
-        ref_embed_enabled=args.ref_embed_enabled,
-        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
-        phase_mode=args.phase_mode,
-        ref_operator_alpha=args.ref_operator_alpha,
+        neural_lag_s=args.neural_lag_s,
+        max_steps=single_max_steps,
+        val_check_interval=single_val_check,
+        early_stopping_patience=single_p4_patience,
+        # #54 audit M1: guard is SSL/distill-only; a single --phase 4 probe run
+        # disables it (EarlyStopping + real metric already cover it).
+        collapse_guard=(args.phase != 4),
         joint_phase=(args.phase == 1),
-        include_ajile12=args.include_ajile12,
-        ffn_variant=args.ffn_variant,
-        latent_valid_override=args.latent_valid_override,
-        sa_mask_mode=args.sa_mask_mode,
-        loss_variant=args.loss_variant,
+        p3_distill=(args.phase == 3),
+        p3_stage=args.p3_stage,
+        whisper_target_cache_dir=args.whisper_target_cache_dir,
+        whisper_layer_merge=args.whisper_layer_merge,
+        channel_stats_path=args.channel_stats_path,
+        target_standardize=args.target_standardize,
+        phase4_frozen_probe=phase4_frozen_probe,
+        pretrained_ckpt=args.resume_from,
+        snapshot_ckpt_to=args.snapshot_ckpt_to,
         jepa_phase=args.jepa_phase,
-        readout=args.readout,
-        gradient_checkpointing=args.gradient_checkpointing,
+        frontend_lr_scale=args.frontend_lr_scale,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

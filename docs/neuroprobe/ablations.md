@@ -216,8 +216,11 @@ B36 (2026-06-01) replaces the §4 self-distill loss surface and the §4b joint p
 | **R-l2-loss** | Pure L2 over masked cells instead of L1 (Brain-JEPA / data2vec-2.0 form). Falsifies the V-JEPA-2-canonical L1 choice at v14 scale (= the §4 R-l2-loss cell, re-anchored to the B36 masked objective). | **P0** (carried) |
 | **R-m4-slots** | M=1 → M=4 (320 slots) under the B36 pool (= the §4b R-m4-slots cell; tests per-parcel sub-slot capacity under hard routing). | **P0** (B29 Item 13, carried) |
 | **R-p2-m2-aux** | P2 adds the M2 front-end masked-JEPA aux loss back (vs B36's "LR/10 alone, no M2-aux" default). Fires if the front-end drifts under P2 fine-tuning. | P1 (B36 §7) |
-| **R-p2-freeze-frontend** | P2 freezes the front-end entirely (LR 0) vs the LR/10 default — lower bracket of the discriminative-unfreeze knob. | P1 (B36 §7) |
-| **R-p2-frontend-full-lr** | P2 trains the front-end at full LR (no discriminative scaling) — upper bracket. | P1 (B36 §7) |
+| **R-p2-freeze-frontend** | P2 freezes the front-end entirely (`frontend_lr_scale=0.0` → front-end `requires_grad=False`, dropped from the optimizer, parcel side + predictor train alone) vs the base/10 default — lower bracket of the discriminative-unfreeze knob. | P1 (B36 §7) |
+| **R-p2-frontend-lr-5** | P2 front-end at `frontend_lr_scale=0.2` (base/5) — intermediate bracket between the base/10 default and full LR. The less-conservative point if P1 under-trains the front-end on the small SSL corpus. | P1 (B36 §7) |
+| **R-p2-frontend-full-lr** | P2 trains the front-end at full LR (`frontend_lr_scale=1.0`, no discriminative scaling) — upper bracket. | P1 (B36 §7) |
+
+**P2 front-end LR is a wired hyperparameter** (`frontend_lr_scale`, default `0.1` = base/10): `V14JointExperiment.frontend_lr_scale` field (sweepable via `run_grid`) and `dispatch_v14.py --p2-frontend-lr-scale` (live `--phase 1 --jepa-phase p2` path). Range `[0.0, 1.0]`; `0.0` freezes the front-end. The three rows above are the named bracket points of this continuous knob.
 
 **`R-coverage-robust-pool` — held out of first pass (deliberate).** A variant not a gate; nothing to measure it against until the default runs; and it carries a *specific* risk the predictor does NOT fix — its invariance minimum drives within-parcel electrode-value homogeneity, collapsing intra-parcel signal the eventual speech task needs (predictor + stop-grad stop *generic* collapse only). **Trigger:** run the B36 default + `R-no-bottleneck` under LOSO first; only if `R-no-bottleneck` beats the pool on CSubject (= the pool is leaking subject coverage structure) is coverage-robustness a live problem worth this cell. **Guard if run:** small drop (≤⌊nₖ/2⌋ electrodes, ≥2-electrode parcels only), low weight, + within-parcel value-diversity monitor. Mechanism = BYOL/SimSiam (predictor + stop-grad + EMA), NOT DINO (no centering/softmax).
 
@@ -305,6 +308,12 @@ Source: `docs/neuroprobe/v14_blockers.md §B13`.
 | **R-pool-wide** | Triangular pool **base = 500 ms / FWHM = 250 ms** (2× the default base; sinc² null drops to 2 Hz, ~4-bucket overlap) — tests whether extra target smoothing helps vs the minimal-distortion default (base 250 ms / FWHM 125 ms). Ratified default chosen on first principles 2026-06-03; B05 flagged for P3-preflight revisit. | P2 pool-width falsification |
 | **R-event-locked** | MFA-aligned variable-width buckets at syllable / word / phoneme onsets, vs uniform rate-r\* triangular pool | P2 |
 | **R-adapter-linear** | Single-linear adapter instead of 2-layer MLP | P1 (fallback) |
+| **R-3b-lr-uniform** | Phase-3b discriminative-LR off: front-end + parcel side + connector all at full base LR (`frontend_lr_scale=parcel_lr_scale=1.0`) vs the default ladder (front-end base/10, parcel base/3, connector base). Falsifies the "more-pretrained → slower" ladder. | P1 (B33 §5) |
+| **R-3b-frontend-frozen** | Phase-3b freezes the front-end (`frontend_lr_scale=0.0` → front-end `requires_grad=False`, group dropped); parcel side + connector adapt. Tests whether the front-end needs to move at all under Whisper distillation. | P1 (B33 §5) |
+| **R-3b-parcel-frozen** | Phase-3b freezes the parcel side (`parcel_lr_scale=0.0`); only the front-end (base/10) + connector adapt. | P2 (B33 §5) |
+| **R-distill-lag-75ms** | Δlag neural-response lag = **0.075 s**: slide the neural clip start +75 ms so the lagged cortical response aligns to the stimulus-time Whisper teacher (default Δlag=0 = 1:1 baseline / falsifier null). Audio-keyed teacher ⇒ no recache, pure re-slice. | **P1** (B36 6/03) |
+| **R-distill-lag-150ms** | Δlag = **0.15 s** (mid higher-order auditory / associative range). | **P1** (B36 6/03) |
+| **R-distill-lag-300ms** | Δlag = **0.30 s** (higher-order / late response upper bracket). | P2 (B36 6/03) |
 | **R-pool-then-probe** | Phase-4: DIVER-1-style mean-over-T → 256-dim → linear | P1 (reported, not headline) |
 | **R-no-time-pool** (DEFAULT) | Phase-4: PMA k=1 → (T, d) → flatten T·d → linear | — |
 | **R-flatten-with-parcels** | Phase-4: skip parcel-collapse; flatten (320 × T × d) ≈ 1.2M-dim → linear | P2 (capacity stress test) |
@@ -312,6 +321,10 @@ Source: `docs/neuroprobe/v14_blockers.md §B13`.
 | **F-CQT** | Constant-Q transform front-end (Q ≈ 6 ⅓-octave) vs Multi-STFT default | P1 |
 | **F-single-STFT** | Best single-STFT vs Multi-STFT default | P1 |
 | **F-log-amplitude** | `log(|STFT|)` vs raw `|STFT|` (5/25 default swap; sister falsifier) | P1 |
+
+**Phase-3b discriminative LR is a wired hyperparameter** (`V14Phase3Experiment.frontend_lr_scale` default `0.1` = base/10; `parcel_lr_scale` default `1/3` = base/3; connector always full base). Range `[0.0, 1.0]`; `0.0` freezes that encoder sub-group. The three rows above are the named bracket points; B33 §5's prior "pinned, not a sweep axis" note is superseded.
+
+**Δlag neural-response lag is a wired hyperparameter** (`dispatch_v14.py --neural-lag-s` / builder `neural_lag_s`, default `0.0` = 1:1 stimulus-onset baseline / falsifier null; range `[0.0, 1.0]` s). It slides the segmenter clip `start` so neural-frame *t* (the lagged cortical response) matches the stimulus-time teacher frame instead of being a fixed ~1–2-frame offset ahead of it — PMA(k=1) is per-frame and cannot absorb a temporal offset, so the lag is real to the Smooth-L1. **Because the teacher cache is keyed by audio movie-time and immutable, the lag sweep is a pure neural re-slice with no teacher recache** — cheap, so sweep it rather than argue it (empirical-iteration). No-op for P1/P2 (student + EMA-teacher shift together); a non-zero value raises on the supervised Phase-4 path (leaderboard-parity probe window). The Phase-3-preflight ridge `lag` sweep (doc-specced below) *would* supply the prior for which brackets to run — but that preflight `lag` axis is not yet wired in `phase3_preflight.py` (layer × rate × alpha only); until it is, run the bracketed `R-distill-lag-*` sisters directly off the Δlag=0 baseline.
 
 **Phase-3 preflight (operational gate)**: dual ~1 GPU-h preflights before Phase-3 lock — (a) brain-fit ridge sweep `k ∈ {L4, L6, L8, L10, L12, L16, L20}` × `rate ∈ {5, 10, 20}` Hz × short lag sweep, picks (k, r, lag) by cross-validated speech-cortex r²; (b) task-fit ceiling = same grid, mean-pool → LogReg on gate tasks (= L.7.B0/C0/S-layer/S-combine). Convergent ⇒ lock k\* / r\*; divergent ⇒ resolve at top-2 by Phase-4 probe. **No Goldstein default; both layer and rate are empirical on sEEG.**
 

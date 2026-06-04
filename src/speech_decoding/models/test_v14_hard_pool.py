@@ -178,6 +178,7 @@ def test_a1_model_forward_uses_one_hot_support_as_hard_assignment() -> None:
     kw = dict(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=0, m_sub_slots=1,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
     )
     model = V14ParcelPerceiverModel(**kw).eval()
     B, C = 1, 4

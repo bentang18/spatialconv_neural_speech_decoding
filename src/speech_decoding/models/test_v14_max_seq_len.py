@@ -23,6 +23,7 @@ def test_max_seq_len_default_matches_n_time_bins() -> None:
         n_freq_bins=4, n_time_bins=8, k_parcels=4,
         d_model=32, n_heads=4, depth_self_attn=1,
         m_sub_slots=1, n_token_blocks=1,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=4 config
     )
     assert model.max_seq_len == 8
     expected_T_p = model.patch_stem.n_time_patches(8)
@@ -36,6 +37,7 @@ def test_max_seq_len_overrides_rope_table_size() -> None:
         d_model=32, n_heads=4, depth_self_attn=1,
         m_sub_slots=1, n_token_blocks=1,
         max_seq_len=64,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=4 config
     )
     assert model.max_seq_len == 64
     expected_T_p = model.patch_stem.n_time_patches(64)
@@ -58,6 +60,7 @@ def test_forward_accepts_smaller_T_than_n_time_bins() -> None:
         d_model=32, n_heads=4, depth_self_attn=1,
         m_sub_slots=1, n_token_blocks=1,
         max_seq_len=n_time,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=4 config
     )
     B, C = 2, 3
     for T_in in (2, 4, n_time):
@@ -74,6 +77,7 @@ def test_forward_rejects_T_above_max_seq_len() -> None:
         d_model=32, n_heads=4, depth_self_attn=1,
         m_sub_slots=1, n_token_blocks=1,
         max_seq_len=8,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=4 config
     )
     tokens = torch.randn(1, 2, 9, 4)
     support = torch.rand(1, 2, 4) + 0.1

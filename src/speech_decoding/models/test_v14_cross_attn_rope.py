@@ -32,6 +32,7 @@ def _kwargs(**overrides) -> dict:
         "n_heads": 4,
         "depth_self_attn": 1,
         "m_sub_slots": 2,
+        "patch_kernel_freq": 3,  # FE-RAW-1: kernel-3 path for the tiny F=4 config
     }
     base.update(overrides)
     return base

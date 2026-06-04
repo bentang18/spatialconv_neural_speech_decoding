@@ -42,6 +42,7 @@ def _build_model() -> torch.nn.Module:
     return V14ParcelPerceiverModel(
         n_freq_bins=F_BINS, n_time_bins=T_BINS, k_parcels=K_PARCELS,
         d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
     )
 
 

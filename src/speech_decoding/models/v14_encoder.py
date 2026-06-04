@@ -388,6 +388,12 @@ class _PatchStem(nn.Module):
     construction. Replaces the v3 per-cell Linear(1, d) projection. Trunc-
     normal init std=0.02 per recipe §1 "Init policy (uniform)".
 
+    FE-RAW-1 (2026-06-04): the default freq kernel/stride is **5** (was 3) to
+    absorb the F=50 raw-|STFT| front end into the same F_p=10 token grid as the
+    old F=30 filterbank — ``F_p = (50−5)//5 + 1 = 10``, byte-shape-identical to
+    ``(30−3)//3 + 1 = 10``. The time kernel/stride is unchanged at 2. The F=30
+    const-Q sister passes ``kernel_freq=3`` explicitly.
+
     Output shape contract::
 
         input  : (B, C, F_bins, T_bins)
@@ -400,7 +406,7 @@ class _PatchStem(nn.Module):
         self,
         d_model: int,
         *,
-        kernel_freq: int = 3,
+        kernel_freq: int = 5,
         kernel_time: int = 2,
         stride_freq: int | None = None,
         stride_time: int | None = None,
@@ -696,11 +702,14 @@ class V14ParcelPerceiverModel(nn.Module):
         m_sub_slots: int = 1,
         # FE-04: N=6 joint token blocks (was N=4 factorized t×f under v3).
         n_token_blocks: int = 6,
-        # FE-02: non-overlap Conv2d patch stem kernel/stride. v4 spec
-        # defaults: (k_f=3, k_t=2). Strides default to kernel size (non-
-        # overlap). Override only for tiny smoke configs where n_freq_bins
-        # < k_f would collapse F_p to zero.
-        patch_kernel_freq: int = 3,
+        # FE-02 / FE-RAW-1: non-overlap Conv2d patch stem kernel/stride.
+        # Default freq kernel/stride = 5 (FE-RAW-1, 2026-06-04) so the F=50 raw
+        # |STFT| front end maps to F_p=10 (= (50−5)//5+1), byte-shape-identical
+        # to the old F=30 filterbank's F_p=10 at kernel 3. Time kernel/stride
+        # stays 2. Strides default to kernel size (non-overlap). Override
+        # (e.g. kernel_freq=3) for the F=30 const-Q sister or tiny smoke
+        # configs where n_freq_bins < k_f would collapse F_p to zero.
+        patch_kernel_freq: int = 5,
         patch_kernel_time: int = 2,
         patch_stride_freq: Optional[int] = None,
         patch_stride_time: Optional[int] = None,
@@ -786,6 +795,16 @@ class V14ParcelPerceiverModel(nn.Module):
             stride_freq=patch_stride_freq,
             stride_time=patch_stride_time,
         )
+        # FE-RAW-1 (2026-06-04): the raw |STFT| front end (kernel_freq=5, the
+        # default) requires exactly F=50 bins so the patch stem tiles it
+        # leftover-free into F_p=10. A mismatch is a front-end/encoder wiring
+        # bug (e.g. an F=30 filterbank fed under the kernel-5 default).
+        if patch_kernel_freq == 5 and n_freq_bins != 50:
+            raise ValueError(
+                f"FE-RAW-1 raw front end (patch_kernel_freq=5) requires "
+                f"n_freq_bins=50; got {n_freq_bins}. Pass patch_kernel_freq=3 "
+                f"for the F=30 const-Q filterbank sister."
+            )
         n_freq_patches = self.patch_stem.n_freq_patches(n_freq_bins)
         max_n_time_patches = self.patch_stem.n_time_patches(max_seq_len)
         if n_freq_patches < 1 or max_n_time_patches < 1:
@@ -2129,8 +2148,10 @@ class V14ParcelPerceiver(BaseModelConfig):
     m_sub_slots: int = 1
     # FE-04: N=6 joint token blocks (was N=4 factorized t×f under v3).
     n_token_blocks: int = 6
-    # FE-02: non-overlap Conv2d patch stem kernel/stride.
-    patch_kernel_freq: int = 3
+    # FE-02 / FE-RAW-1: non-overlap Conv2d patch stem kernel/stride. Default
+    # freq kernel/stride = 5 (FE-RAW-1, 2026-06-04) for the F=50 raw |STFT|
+    # front end → F_p=10. The F=30 const-Q filterbank sister sets this to 3.
+    patch_kernel_freq: int = 5
     patch_kernel_time: int = 2
     patch_stride_freq: int | None = None
     patch_stride_time: int | None = None

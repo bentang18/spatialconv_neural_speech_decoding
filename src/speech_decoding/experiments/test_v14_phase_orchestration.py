@@ -47,16 +47,20 @@ from speech_decoding.models.v14_encoder import V14ParcelPerceiverModel
 _ENC_KW = dict(
     n_freq_bins=10, n_time_bins=16, k_parcels=6,
     d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=1,
+    patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=10 config
 )
 _BASE_LR = 1e-3
 
 
-def _module(phase: str, *, seed: int = 0) -> V14JointBrainModule:
+def _module(
+    phase: str, *, seed: int = 0, frontend_lr_scale: float = 0.1,
+) -> V14JointBrainModule:
     torch.manual_seed(seed)
     return V14JointBrainModule(
         encoder=V14ParcelPerceiverModel(**_ENC_KW),
         optim_config=LightningOptimizer(optimizer=AdamW(lr=_BASE_LR)),
         phase=phase,
+        frontend_lr_scale=frontend_lr_scale,
     )
 
 
@@ -126,6 +130,48 @@ def test_e2_p2_frontend_group_holds_exactly_the_frontend_params() -> None:
     # The parcel group is the encoder-parcel params PLUS the predictor.
     expected_parcel = {id(p) for p in parcel} | {id(p) for p in m.predictor.parameters()}
     assert parcel_group_ids == expected_parcel
+
+
+def test_e2_p2_frontend_lr_scale_is_a_hyperparameter() -> None:
+    # R-p2-frontend-lr-5: scale 0.2 → front-end at base/5, ratio 5:1.
+    m = _module("p2", frontend_lr_scale=0.2)
+    opt = _opt(m)
+    assert len(opt.param_groups) == 2
+    front_lr, parcel_lr = opt.param_groups[0]["lr"], opt.param_groups[1]["lr"]
+    assert front_lr == pytest.approx(_BASE_LR * 0.2)
+    assert parcel_lr == pytest.approx(_BASE_LR)
+    assert parcel_lr / front_lr == pytest.approx(5.0)
+
+
+def test_e2_p2_frontend_frozen_falsifier_single_group() -> None:
+    # R-p2-freeze-frontend: scale 0.0 → front-end frozen + dropped from the
+    # optimizer, leaving one base-LR group over the parcel side + predictor.
+    m = _module("p2", frontend_lr_scale=0.0)
+    frontend, parcel = m.student.encoder.partition_parameters_for_staging()
+    assert all(not p.requires_grad for p in frontend)
+    assert all(p.requires_grad for p in parcel)
+    opt = _opt(m)
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["lr"] == pytest.approx(_BASE_LR)
+    group_ids = {id(p) for p in opt.param_groups[0]["params"]}
+    expected = {id(p) for p in parcel} | {id(p) for p in m.predictor.parameters()}
+    assert group_ids == expected
+
+
+def test_e2_p2_frontend_frozen_backward_leaves_frontend_grad_free() -> None:
+    # The frozen front-end gets no gradient; the parcel side still trains.
+    m = _module("p2", frontend_lr_scale=0.0)
+    loss = m._step(_synthetic_batch()).total
+    loss.backward()
+    frontend, parcel = m.student.encoder.partition_parameters_for_staging()
+    assert all(p.grad is None for p in frontend)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in parcel)
+
+
+def test_e2_frontend_lr_scale_out_of_range_raises() -> None:
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match="frontend_lr_scale"):
+            _module("p2", frontend_lr_scale=bad)
 
 
 def test_partition_raises_on_unassigned_param() -> None:
@@ -269,6 +315,19 @@ def test_e3_snapshot_requires_transferable_protocol() -> None:
 def test_e3_load_requires_transferable_protocol() -> None:
     with pytest.raises(TypeError):
         Experiment._load_pretrained(None, torch.nn.Linear(2, 2), "/tmp/x.ckpt")  # type: ignore[arg-type]
+
+
+def test_e3_load_missing_snapshot_raises_actionable_error() -> None:
+    # Gate-D F4: the snapshot write lives INSIDE the exca-cached run() body, so a
+    # cache-hit phase on a purged work_dir leaves no .ckpt for the next phase to
+    # warm-start from. A protocol-valid module + a missing ckpt must raise an
+    # actionable FileNotFoundError (NOT the opaque bare torch.load one, and NOT
+    # the earlier protocol TypeError — the module HAS the protocol here).
+    dst = _module("p2", seed=2)  # has load_transferable_state
+    with tempfile.TemporaryDirectory() as td:
+        missing = str(Path(td) / "never_written" / "phase_0.ckpt")
+        with pytest.raises(FileNotFoundError, match="cache-hit"):
+            Experiment._load_pretrained(None, dst, missing)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------

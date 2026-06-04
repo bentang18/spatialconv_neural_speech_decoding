@@ -136,7 +136,7 @@ S26   710 s (11.8 min)   S58  1021 s (17.0 min)
 
 **Continuous / epoched ratio ≈ 1.04× median** (range 0.85× S33 → 2.43× S14). The response-locked 2.5 s trial windows already cover nearly all recording — "continuous SSL beyond epoched" is marginal for most patients. SSL at this scale is a representation-structure bet, not a data-expansion play; the real expansion lever for Phase 1.5 is the lexical corpus below.
 
-## sEEG D-cohort Corpus (Stage-3 ceiling, 2026-04-24)
+## sEEG D-cohort Corpus (4-speech-task subset; 2026-04-24, re-derived 2026-06-03)
 
 Audited via `scripts/seeg_corpus_audit.py` (JSON-first: `RecordingDuration` read from each `*_ieeg.json` sidecar; all 674 EDFs resolved from sidecar, zero EDF-header fallbacks, zero failures). Source: `reports/seeg_corpus_audit_2026_04_24/{per_run,per_patient,summary}.{csv,md}`.
 
@@ -146,9 +146,11 @@ Audited via `scripts/seeg_corpus_audit.py` (JSON-first: `RecordingDuration` read
 | Lexical decision + delay      | **65.87 h** | 52 | `BIDS-1.0_LexicalDecRepDelay/BIDS/sub-D*` |
 | Lexical decision, no delay    | **31.68 h** | 26 | `BIDS-1.0_LexicalDecRepNoDelay/BIDS/sub-D*` |
 | Sentence repetition           | **42.31 h** | 34 | `BIDS-1.4_SentenceRep/BIDS/sub-D*` |
-| **Grand total (union)**       | **180.59 h** | **87 unique** | — |
+| **Grand total (4-task union)** | **180.59 h** | **87 unique** | — |
 
-**Ratio to uECoG corpus**: 180.59 h / 6.79 h ≈ **26.6× more raw data**, **87 / 27 ≈ 3.2× more patients**. This is the Stage-3 SSL-pretrain ceiling.
+**Ratio to uECoG corpus**: 180.59 h / 6.79 h ≈ **26.6× more raw data**, **87 / 27 ≈ 3.2× more patients**.
+
+> **Re-derived 2026-06-03** (`memory/project_d_cohort_data_inventory_2026_06_03.md`): the 87 / 180.59 h above is the **4-speech-task subset**, NOT the ceiling. Across all **14 BIDS paradigms** the union is **113 D-subjects / 384.7 h**; **134 distinct patients have FS recons** (max D146). Corrected facts: native sample rate is **mixed, predominantly 2048 Hz** (574 runs / 147 h; also 2000/1024/1000 — not a flat 2000); **recorded** EDF channels max **251** (the manifest's "366" = recon-localized contacts, not recorded); **DK is directly in the recons** (`aparc+aseg`, plus Destrieux `a2009s` + BNA at radii 1–10 mm), so no BNA→DK derivation needed; `iEEGReference` is `n/a` in every sidecar. Each task run is continuous-within-block (tileable for SSL); whole-session raw (`Natus/`) exists for only ~8 subjects (D108–D116, unconverted `.erd`).
 
 Top-10 by total hours: D22 (6.09 h, PS+SR), D24 (5.75 h, all 4), D71 (5.05 h, all 4), D29 (4.96 h, all 4), D57 (4.62 h, all 4), D23 (4.56 h, PS+Lex+SR), D79 (4.05 h, PS+LexDelay), D59 (4.00 h, PS+LexDelay+SR), D53 (3.98 h, all 4), D28 (3.91 h, all 4). Five of the top-10 have coverage across all four speech tasks.
 

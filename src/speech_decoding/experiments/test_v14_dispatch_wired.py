@@ -16,6 +16,7 @@ from speech_decoding.experiments import dispatch_v14
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import LogStftView, MultiStftView
+from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
 
 
 def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
@@ -32,7 +33,9 @@ def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
     assert ext.car == "shaft"
     assert ext.notch_filter == 60.0
     assert ext.hop_length == 128  # hop=128 re-lock 2026-06-03 (iMINDBench-standard)
-    assert ext.n_fbank_bins == 30
+    # FE-RAW-1 (2026-06-04): the default front end is the raw |STFT| F=50 path
+    # (the const-Q F=30 filterbank is the demoted front_end="fbank" sister).
+    assert ext.front_end == "raw"
     assert ext.apply_log is False
     # C4 HPF: 0.5 Hz high-pass (None upper edge → high-pass only).
     assert ext.filter == (0.5, None)
@@ -40,18 +43,178 @@ def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
     assert ext.scaler is None
 
 
-def test_dispatch_default_n_freq_bins_30_gives_encoder_f_p_10(
-    tmp_path, monkeypatch,
-) -> None:
-    """WS-C / C2: ``DEFAULT_N_FREQ_BINS`` flips 38 → 30 (Multi-STFT filterbank);
-    the (3,3)-freq-stride patch stem maps F=30 → F_p=10."""
-    from speech_decoding.models.v14_encoder import _PatchStem
+def test_dispatch_lof_off_by_default_leaves_view_unperturbed(tmp_path, monkeypatch) -> None:
+    """#17: with LOF off (the default) the Multi-STFT view carries NO lof config —
+    ``lof_bad_channels``/``drop_bads`` False, no report path — so the multi-TB STFT
+    cache uid is bit-identical to pre-#17."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    ext = dispatch_v14.build_v14_experiment(mode="nano").data.segmenter.extractors[
+        "electrode_tokens"
+    ]
+    assert ext.lof_bad_channels is False
+    assert ext.drop_bads is False
+    assert ext.lof_report_path is None
 
-    assert dispatch_v14.DEFAULT_N_FREQ_BINS == 30
+
+def test_dispatch_lof_threshold_inert_when_lof_off(tmp_path, monkeypatch) -> None:
+    """#17 cache-uid footgun: a non-default ``lof_threshold`` passed WITHOUT
+    enabling LOF must NOT reach the view (else it lands in the cache uid and forces
+    a needless multi-TB rebuild while LOF does nothing). The view keeps its
+    default threshold."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    ext = dispatch_v14.build_v14_experiment(
+        mode="nano", lof_bad_channels=False, lof_threshold=2.0, lof_n_neighbors=42,
+    ).data.segmenter.extractors["electrode_tokens"]
+    assert ext.lof_bad_channels is False
+    assert ext.lof_threshold == 1.5  # view default, NOT the passed 2.0
+    assert ext.lof_n_neighbors == 20  # view default, NOT the passed 42
+
+
+def test_dispatch_lof_on_wires_drop_and_report(tmp_path, monkeypatch) -> None:
+    """#17: enabling LOF forces ``drop_bads=True`` (view validator requires it) and
+    threads threshold / n_neighbors / report_path through to the view."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    report = tmp_path / "lof_drops.json"
+    ext = dispatch_v14.build_v14_experiment(
+        mode="nano",
+        lof_bad_channels=True,
+        lof_threshold=1.8,
+        lof_n_neighbors=15,
+        lof_report_path=str(report),
+    ).data.segmenter.extractors["electrode_tokens"]
+    assert ext.lof_bad_channels is True
+    assert ext.drop_bads is True
+    assert ext.lof_threshold == 1.8
+    assert ext.lof_n_neighbors == 15
+    assert ext.lof_report_path == str(report)
+
+
+def test_dispatch_lof_on_without_report_path_raises(tmp_path, monkeypatch) -> None:
+    """#17 Ben-review gate: LOF on without a report path is a hard build error —
+    the per-subject drop counts MUST be written for review before a scored run."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match="lof_report_path"):
+        dispatch_v14.build_v14_experiment(mode="nano", lof_bad_channels=True)
+
+
+def test_dispatch_warmup_cosine_reaches_experiment_optim(tmp_path, monkeypatch) -> None:
+    """#37 (audit follow-up): the warmup_cosine optim config must survive the real
+    Experiment construction — not just _build_optim_cfg / stubbed-chain capture. A
+    regression in the ``optim=optim_cfg`` hand-off would otherwise go unseen."""
+    from speech_decoding.experiments.lr_schedule import WarmupCosine
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", lr_schedule="warmup_cosine", warmup_steps=2000,
+        min_lr_ratio=0.0, optimizer_name="AdamW",
+    )
+    assert isinstance(xp.optim.scheduler, WarmupCosine)
+    assert xp.optim.scheduler.warmup_steps == 2000
+    assert xp.optim.interval == "step"
+    # optimizer is a BaseTorchOptimizer subclass auto-named by class (`name` is
+    # the discriminator, resolved from __name__, not a stored attribute).
+    assert type(xp.optim.optimizer).__name__ == "AdamW"
+
+
+def test_dispatch_default_optim_has_no_scheduler(tmp_path, monkeypatch) -> None:
+    """#37: the default (constant) build leaves scheduler None — prior plain-Adam."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano")
-    assert xp.brain_model_config.n_freq_bins == 30
-    assert _PatchStem(8).n_freq_patches(30) == 10
+    assert xp.optim.scheduler is None
+    assert type(xp.optim.optimizer).__name__ == "Adam"
+
+
+def test_dispatch_adamw_does_not_leak_torch_default_weight_decay(
+    tmp_path, monkeypatch
+) -> None:
+    """Re-audit 2026-06-03 (chunk-gate FAIL): torch ``AdamW`` defaults weight_decay
+    to 0.01. Building the REAL optimizer for an ``--optimizer AdamW`` run (wd guarded
+    to 0) must yield param_groups with weight_decay 0.0 — not the implicit 0.01,
+    which would silently decay the §7 no-WD params (biases / LN γβ / freq_embed).
+    A cfg-level kwargs check would miss a regression that re-omits the pin, so this
+    builds the actual torch optimizer and inspects its param_groups."""
+    import torch
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano", optimizer_name="AdamW")
+    built = xp.optim.build([torch.nn.Parameter(torch.zeros(2))])
+    optim = built["optimizer"] if isinstance(built, dict) else built
+    assert type(optim).__name__ == "AdamW"
+    assert all(g["weight_decay"] == 0.0 for g in optim.param_groups)
+
+
+def test_dispatch_c_max_defaults_to_384_across_extractors(tmp_path, monkeypatch) -> None:
+    """#35: the default c_max (384, multi-corpus) reaches every c_max-padded
+    extractor."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    exts = dispatch_v14.build_v14_experiment(mode="nano").data.segmenter.extractors
+    assert exts["electrode_tokens"].c_max == 384
+    assert exts["support"].c_max == 384
+    assert exts["valid_mask"].c_max == 384
+
+
+def test_dispatch_c_max_256_threads_to_all_padded_extractors(tmp_path, monkeypatch) -> None:
+    """#35: --c-max 256 must reach ALL four c_max-padded extractors — including the
+    joint-phase shaft_mask — or the per-electrode tensors mismatch in the encoder.
+    256 is BT's exact safe floor (raw max=256); the build must not raise."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    exts = dispatch_v14.build_v14_experiment(
+        mode="nano", c_max=256, joint_phase=True, jepa_phase="p1",
+    ).data.segmenter.extractors
+    assert exts["electrode_tokens"].c_max == 256
+    assert exts["support"].c_max == 256
+    assert exts["valid_mask"].c_max == 256
+    assert exts["shaft_mask"].c_max == 256  # joint-phase extractor must match
+
+
+def test_dispatch_omits_whisper_target_by_default(tmp_path, monkeypatch) -> None:
+    """WS-H: P1/P2/P4 never carry the 1280-d teacher stream — the extractor is
+    built only when a teacher-cache dir is passed (P3)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert "whisper_target" not in xp.data.segmenter.extractors
+
+
+def test_dispatch_wires_whisper_target_when_cache_dir_set(tmp_path, monkeypatch) -> None:
+    """WS-H / T20: ``whisper_target_cache_dir`` inserts a WhisperTargetExtractor
+    into the segmenter, with its clip window pinned to the dispatch ``clip_len``
+    (5 s SSL → 250 teacher frames) and the locked mean_all merge."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", whisper_target_cache_dir="/cache/bt_teacher",
+    )
+    ext = xp.data.segmenter.extractors["whisper_target"]
+    assert isinstance(ext, WhisperTargetExtractor)
+    assert ext.cache_dir == "/cache/bt_teacher"
+    assert ext.layer_merge == "mean_all"
+    assert ext.clip_s == dispatch_v14.DEFAULT_CLIP_LEN_S  # 5.0 -> n_frames 250
+    assert ext.n_frames == 250
+    assert ext.event_types == "Word"
+    assert ext.aggregation == "trigger"
+
+
+def test_dispatch_whisper_layer_merge_threads_to_extractor(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", whisper_target_cache_dir="/cache/bt_teacher",
+        whisper_layer_merge="8",
+    )
+    assert xp.data.segmenter.extractors["whisper_target"].layer_merge == "8"
+
+
+def test_dispatch_default_n_freq_bins_50_gives_encoder_f_p_10(
+    tmp_path, monkeypatch,
+) -> None:
+    """WS-C / C2 + FE-RAW-1 (2026-06-04): ``DEFAULT_N_FREQ_BINS`` flips 30 → 50
+    (raw |STFT| front end); the kernel-5-freq-stride patch stem maps F=50 →
+    F_p=10 — byte-shape-identical to the old F=30/kernel-3 grid."""
+    from speech_decoding.models.v14_encoder import _PatchStem
+
+    assert dispatch_v14.DEFAULT_N_FREQ_BINS == 50
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp.brain_model_config.n_freq_bins == 50
+    assert _PatchStem(8).n_freq_patches(50) == 10  # kernel-5 default
 
 
 def test_dispatch_clip_len_threads_to_segmenter_duration_and_time_bins(
@@ -85,6 +248,102 @@ def test_dispatch_default_clip_len_is_5s(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano")
     assert xp.data.segmenter.duration == 5.0
+
+
+def test_b36_default_neural_lag_is_zero_1to1_baseline(tmp_path, monkeypatch) -> None:
+    """Δlag default = 0.0: the 1:1 stimulus-onset baseline / falsifier null.
+    The segmenter clip ``start`` is 0.0 so the neural clip begins exactly at
+    the word onset (current behavior)."""
+    assert dispatch_v14.DEFAULT_NEURAL_LAG_S == 0.0
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp.data.segmenter.start == 0.0
+
+
+def test_b36_neural_lag_threads_to_segmenter_start(tmp_path, monkeypatch) -> None:
+    """A non-zero Δlag slides the neural clip ``start`` forward by that lag
+    (joint/SSL path) so the lagged response aligns to the stimulus-time
+    teacher. The teacher cache is audio-keyed and untouched — a lag sweep is a
+    pure re-slice, no recache."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, neural_lag_s=0.15,
+    )
+    assert xp.data.segmenter.start == 0.15
+    # duration (clip window) is unchanged — only the start offset moves.
+    assert xp.data.segmenter.duration == dispatch_v14.DEFAULT_CLIP_LEN_S
+
+
+def test_b36_neural_lag_out_of_range_raises(tmp_path, monkeypatch) -> None:
+    """Δlag must be causal and bounded: negative (acausal — neural window
+    before the stimulus) and > 1 s (unphysical) both raise."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    # match= pins the RANGE guard specifically (not the P4 supervised guard,
+    # which also mentions "neural_lag_s").
+    with pytest.raises(ValueError, match=r"must lie in \[0\.0, 1\.0\]"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, neural_lag_s=-0.05,
+        )
+    with pytest.raises(ValueError, match=r"must lie in \[0\.0, 1\.0\]"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=True, neural_lag_s=1.5,
+        )
+
+
+def test_b36_neural_lag_rejected_on_supervised_p4_path(tmp_path, monkeypatch) -> None:
+    """A non-zero Δlag on the supervised Phase-4 path raises: it WOULD shift the
+    probe window, breaking the leaderboard-parity [onset, onset+1 s] window."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    # match= pins the SUPERVISED-P4 guard specifically ("joint_phase=False"
+    # never appears in the range-check message).
+    with pytest.raises(ValueError, match=r"joint_phase=False"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", joint_phase=False, neural_lag_s=0.15,
+        )
+
+
+def test_b36_neural_lag_rejected_on_frozen_probe_p4_path(tmp_path, monkeypatch) -> None:
+    """Gate-D fix: the frozen-probe Phase-4 readout (the canonical P4 path —
+    chain P4 + every --resume-from / --frozen-probe run) must ALSO reject a
+    non-zero Δlag. Its branch short-circuits the base-P4 guard, so a separate
+    guard re-asserts the leaderboard-parity [onset, onset+1 s] window."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match=r"frozen-probe path"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", phase4_frozen_probe=True, neural_lag_s=0.15,
+        )
+
+
+def test_b36_frozen_probe_p4_accepts_zero_lag(tmp_path, monkeypatch) -> None:
+    """The zero-lag frozen probe (the maiden-run config) builds cleanly through
+    the new guard."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", phase4_frozen_probe=True, neural_lag_s=0.0, clip_len=1.0,
+    )
+    assert xp.data.segmenter.start == 0.0
+    assert xp.data.segmenter.duration == 1.0
+
+
+def test_b36_neural_lag_cli_arg_parses() -> None:
+    """The ``--neural-lag-s`` CLI flag exists, defaults to the 0.0 baseline, and
+    parses an explicit lag through to ``args.neural_lag_s`` (covers the argparse
+    wiring + ``main`` build-call that the builder-level tests above skip)."""
+    parser = dispatch_v14._parser()
+    assert parser.parse_args([]).neural_lag_s == dispatch_v14.DEFAULT_NEURAL_LAG_S
+    assert parser.parse_args([]).neural_lag_s == 0.0
+    assert parser.parse_args(["--neural-lag-s", "0.15"]).neural_lag_s == 0.15
+
+
+def test_b36_neural_lag_inclusive_upper_bound_accepted(tmp_path, monkeypatch) -> None:
+    """The range is INCLUSIVE [0.0, 1.0]: the 1.0 s upper edge is accepted and
+    threads through to the segmenter (guards a ``<=`` → ``<`` mutation that
+    would reject the boundary)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, neural_lag_s=1.0,
+    )
+    assert xp.data.segmenter.start == 1.0
 
 
 def test_c4_hpf_0_5hz_removes_dc_and_slow_drift_keeps_passband() -> None:
@@ -316,6 +575,7 @@ def test_encoder_time_last_input_transposes_correctly() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=3, n_time_bins=5, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=3 config
         time_last_input=True,
     )
     model = cfg.build(n_outputs=2)
