@@ -59,14 +59,20 @@ selects 38 bins.
 from __future__ import annotations
 
 import functools
+import json
+import logging
 import typing as tp
+from pathlib import Path
 
 import numpy as np
 import torch
 from neuralset.base import TimedArray
 
+from speech_decoding.extractors.quality import lof_bad_channel_mask
 from speech_decoding.extractors.reference import CARIeegExtractor
 from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +463,29 @@ class MultiStftView(CARIeegExtractor):
     # clips run with it True, so a genuinely-missing session still fails loud.
     _stats_ready: bool = False
 
+    # D2 (T1.7, project_v14_preproc_recipe_2026_05_12 L.0 amendment): per-session
+    # MNE-LOF bad-channel detection. When True, ``prepare`` runs
+    # ``find_bad_channels_lof(threshold, n_neighbors)`` once per session over that
+    # session's FILTERED, PRE-CAR voltage (recipe order HPF → notch → LOF →
+    # shaftCAR: a bad channel must not pollute the CAR reference, and CAR's
+    # rank-deficiency would distort LOF's neighbor structure), records the flagged
+    # channels, and ``_preprocess_raw`` then stamps ``raw.info["bads"]`` per clip so
+    # the inherited ``drop_bads`` step removes them BEFORE shaft-CAR. Requires
+    # ``drop_bads=True``. Default False so the synthetic capstone / fast_dev_run
+    # smoke is untouched; the BT dispatch flips it True. BEN REVIEW GATE: the
+    # per-session/per-subject drop counts are logged loud and (if
+    # ``lof_report_path`` is set) written to JSON for review before this is relied
+    # on in a scored run ("report back how many channels are dropped").
+    lof_bad_channels: bool = False
+    lof_threshold: float = 1.5
+    lof_n_neighbors: int = 20
+    lof_ch_type: str = "seeg"
+    lof_report_path: str | None = None
+    # session key (``event._splittable_event_uid()``) -> LOF-flagged bad channel
+    # names. Mirrors the ``_session_stats`` fill-in-prepare / read-per-clip pattern.
+    _session_bads: dict[str, list[str]] = {}
+    _bads_ready: bool = False
+
     def n_time_bins_for_duration(self, duration_s: float) -> int:
         """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
         ``L = round(duration_s · sample_rate_hz)`` (``torch.stft(center=True)``).
@@ -556,6 +585,13 @@ class MultiStftView(CARIeegExtractor):
         # with ``_stats_ready`` still False so it skips robust-z safely. Only
         # after the fit do we arm ``_stats_ready`` so real clips normalize.
         super().prepare(obj)
+        # LOF first (and arm it) so the robust-z fit below already sees the
+        # good-channel set its clips will: bad channels are dropped before CAR in
+        # both the fit's ``_get_data`` and the per-clip apply, keeping the two
+        # byte-identical.
+        if self.lof_bad_channels:
+            self._fit_session_bads(obj)
+            self._bads_ready = True
         if self.session_robust_z:
             self._fit_session_robust_z(obj)
             self._stats_ready = True
@@ -638,3 +674,125 @@ class MultiStftView(CARIeegExtractor):
         global_sigma[idx] = session_sigma
         normalizer.median = global_median
         normalizer.sigma = global_sigma
+
+    # ------------------------------------------------------------------ #
+    # D2: per-session MNE-LOF bad-channel detection (T1.7)                #
+    # ------------------------------------------------------------------ #
+    def _stamp_lof_bads(self, raw, event) -> None:
+        """Set ``raw.info["bads"]`` to this session's LOF-flagged channels that
+        are present in ``raw`` so the inherited ``drop_bads`` step removes them
+        before shaft-CAR. No-op until the fit has armed ``_bads_ready`` (the
+        prepare shape-probe runs through here first)."""
+        if not (self._bads_ready and self.lof_bad_channels):
+            return
+        key = event._splittable_event_uid()
+        bads = self._session_bads.get(key)
+        if bads is None:
+            raise KeyError(
+                f"MultiStftView.lof_bad_channels is on but no fitted bad-channel "
+                f"set for session {key!r}. prepare() must run (and see this "
+                f"session) before clips are drawn. Have bads for: "
+                f"{sorted(self._session_bads)[:8]}..."
+            )
+        # Union, not overwrite: keep any bads the upstream loader pre-marked and
+        # ADD the LOF-flagged ones (never drop fewer channels than before).
+        present = set(raw.ch_names)
+        existing = list(raw.info["bads"])
+        raw.info["bads"] = existing + [
+            b for b in bads if b in present and b not in existing
+        ]
+
+    def _preprocess_raw(self, raw, event):  # type: ignore[override]
+        self._stamp_lof_bads(raw, event)
+        return super()._preprocess_raw(raw, event)
+
+    def _fit_session_bads(self, obj) -> None:
+        """Flag bad channels per session via MNE LOF over that session's FILTERED,
+        PRE-CAR voltage. Loads each session once through a ``car=None`` sibling
+        view (CAR's rank-deficiency would distort LOF's neighbor structure and a
+        bad channel must not be in the CAR average — the recipe runs LOF before
+        shaft-CAR). Runs on the main process inside ``Data.build``; the per-session
+        bad sets are inherited by forked DataLoader workers. Drop counts are logged
+        loud and (if ``lof_report_path`` is set) written to JSON — the Ben gate."""
+        if not self.drop_bads:
+            raise ValueError(
+                "MultiStftView.lof_bad_channels=True requires drop_bads=True so the "
+                "LOF-flagged channels are actually removed before shaft-CAR."
+            )
+        # car=None sibling for the fit load. model_copy carries the prepared
+        # private state (_channels) so _get_data works; _bads_ready is still False
+        # on the copy (set after this method returns) so its _preprocess_raw passes
+        # through and LOF sees every channel — it is the detector, not a consumer.
+        precar = self.model_copy(update={"car": None})
+        events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
+        report: list[dict] = []
+        seen: set[str] = set()
+        for event in events:
+            key = event._splittable_event_uid()
+            if key in seen:
+                continue
+            seen.add(key)
+            raw_ta = next(precar._get_data([event]))
+            voltage = np.asarray(raw_ta.data)
+            ch_names = list(raw_ta.ch_names)
+            sample_rate = float(raw_ta.frequency)
+            mask = lof_bad_channel_mask(
+                voltage,
+                sample_rate_hz=sample_rate,
+                threshold=self.lof_threshold,
+                n_neighbors=self.lof_n_neighbors,
+                ch_names=ch_names,
+                ch_type=self.lof_ch_type,
+            )
+            bad_names = [ch_names[i] for i in range(len(ch_names)) if bool(mask[i])]
+            self._session_bads[key] = bad_names
+            try:
+                subject_id = int(event._get_field_or_extra("subject_id"))
+            except Exception:
+                subject_id = -1
+            report.append({
+                "session": key,
+                "subject_id": subject_id,
+                "n_channels": len(ch_names),
+                "n_bad": len(bad_names),
+                "bad_channels": bad_names,
+            })
+            logger.warning(
+                "MNE-LOF session %s (subject %s): %d/%d channels flagged bad %s",
+                key, subject_id, len(bad_names), len(ch_names), bad_names,
+            )
+            del raw_ta, voltage
+        self._log_and_write_lof_report(report)
+
+    def _log_and_write_lof_report(self, report: list[dict]) -> None:
+        total_bad = sum(r["n_bad"] for r in report)
+        total_ch = sum(r["n_channels"] for r in report)
+        by_subject: dict[int, list[int]] = {}
+        for r in report:
+            agg = by_subject.setdefault(r["subject_id"], [0, 0])
+            agg[0] += r["n_bad"]
+            agg[1] += r["n_channels"]
+        logger.warning(
+            "MNE-LOF SUMMARY (threshold=%.2f, n_neighbors=%d): %d sessions, "
+            "%d/%d channels dropped (%.2f%%). Per-subject n_bad/n_ch: %s",
+            self.lof_threshold, self.lof_n_neighbors, len(report),
+            total_bad, total_ch, 100.0 * total_bad / max(total_ch, 1),
+            {s: f"{b}/{t}" for s, (b, t) in sorted(by_subject.items())},
+        )
+        if self.lof_report_path:
+            payload = {
+                "threshold": self.lof_threshold,
+                "n_neighbors": self.lof_n_neighbors,
+                "total_sessions": len(report),
+                "total_bad": total_bad,
+                "total_channels": total_ch,
+                "by_subject": {
+                    str(s): {"n_bad": b, "n_channels": t}
+                    for s, (b, t) in sorted(by_subject.items())
+                },
+                "sessions": report,
+            }
+            path = Path(self.lof_report_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2))
+            logger.warning("MNE-LOF drop-count report written -> %s", path)
