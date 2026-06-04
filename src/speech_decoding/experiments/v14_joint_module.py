@@ -620,6 +620,33 @@ class V14JointBrainModule(pl.LightningModule):
             on_epoch=True,
         )
 
+    def _rankme_subsample(self, flat: Tensor) -> Tensor:
+        """Evenly-strided subsample to <=``_RANKME_N_MAX`` rows for a cheap SVD.
+
+        Strided (NOT a head slice) so the sample spans all batches/electrodes
+        rather than biasing to the first rows of batch 0 — RankMe's spectrum is
+        permutation-invariant over ALL rows, but a head slice of rows sorted by
+        (batch, position) is a biased subsample. Deterministic → resume-stable.
+        Shared by the M4 and M2 front-end probes so they subsample identically.
+        """
+        if flat.shape[0] > self._RANKME_N_MAX:
+            stride = flat.shape[0] // self._RANKME_N_MAX
+            flat = flat[::stride][: self._RANKME_N_MAX]
+        return flat
+
+    def _log_rankme(self, verdict, *, step_name: str, key: str = "") -> None:
+        """Emit the 4 RankMe health metrics under ``{step_name}_mon_{key}rankme*``.
+
+        Shared by the M4 (``key=""`` → ``mon_rankme*``) and M2 front-end
+        (``key="frontend_"`` → ``mon_frontend_rankme*``) probes so the
+        warn/alarm/normalised key family can't drift between the two phases.
+        """
+        prefix = f"{step_name}_mon_{key}rankme"
+        self.log(prefix, verdict.rankme, on_epoch=True)
+        self.log(f"{prefix}_normalised", verdict.rankme_normalised, on_epoch=True)
+        self.log(f"{prefix}_warn", 1.0 if verdict.is_warn else 0.0, on_epoch=True)
+        self.log(f"{prefix}_alarm", 1.0 if verdict.is_alarm else 0.0, on_epoch=True)
+
     def _run_teacher_rank_monitor(
         self,
         *,
@@ -650,31 +677,44 @@ class V14JointBrainModule(pl.LightningModule):
         expanded = latent_valid.unsqueeze(-1).expand(B, L, T)
         flat = teacher_m4.reshape(B * L * T, d)
         mask_flat = expanded.reshape(B * L * T)
-        valid_rows = flat[mask_flat]
-        if valid_rows.shape[0] > self._RANKME_N_MAX:
-            # Deterministic head-slice keeps the probe reproducible
-            # across resumes; the rank estimate is permutation-invariant.
-            valid_rows = valid_rows[: self._RANKME_N_MAX]
-
+        valid_rows = self._rankme_subsample(flat[mask_flat])
         verdict = teacher_rank_monitor(valid_rows.detach())
-        self.log(
-            f"{step_name}_mon_rankme", verdict.rankme, on_epoch=True,
-        )
-        self.log(
-            f"{step_name}_mon_rankme_normalised",
-            verdict.rankme_normalised,
-            on_epoch=True,
-        )
-        self.log(
-            f"{step_name}_mon_rankme_warn",
-            1.0 if verdict.is_warn else 0.0,
-            on_epoch=True,
-        )
-        self.log(
-            f"{step_name}_mon_rankme_alarm",
-            1.0 if verdict.is_alarm else 0.0,
-            on_epoch=True,
-        )
+        self._log_rankme(verdict, step_name=step_name, key="")
+
+    def _run_frontend_rank_monitor(
+        self,
+        *,
+        teacher_m2: Tensor,
+        valid_mask: Tensor | None,
+        step_name: str,
+    ) -> None:
+        """MON-FRONTEND-FEATURE-RANK (B36 WS-I, P1 collapse probe).
+
+        RankMe on the EMA teacher's M2 tap (post ``frontend_ln``, shape
+        ``(B, C, F_p, T_p, d)``) over VALID electrodes — the representation
+        P1 actually trains. Replaces the M4 RankMe in P1: the pool +
+        inter-parcel stack that produce M4 carry no P1 gradient, so M4 RankMe
+        in P1 reads random-init layers and fires a false collapse alarm from
+        step 0 (the 2026-06-03 mis-scope). Logged as ``mon_frontend_rankme*``
+        — a distinct key from the P2 M4 ``mon_rankme*`` so the two phases'
+        health signals never alias on the same metric name.
+        """
+        if teacher_m2.dim() != 5:
+            return  # not a (B, C, F_p, T_p, d) tap — skip rather than crash
+        B, C, F_p, T_p, d = teacher_m2.shape
+        flat = teacher_m2.reshape(B * C * F_p * T_p, d)
+        if valid_mask is not None and tuple(valid_mask.shape[:2]) == (B, C):
+            keep = (
+                valid_mask.reshape(B, C, 1, 1)
+                .expand(B, C, F_p, T_p)
+                .reshape(-1)
+            )
+            flat = flat[keep]
+        # No row-count early-return: teacher_rank_monitor returns a healthy
+        # placeholder for N<2, so a degenerate (all-invalid) step still logs —
+        # parity with the M4 probe, which always emits its keys.
+        verdict = teacher_rank_monitor(self._rankme_subsample(flat).detach())
+        self._log_rankme(verdict, step_name=step_name, key="frontend_")
 
     def _run_mask_orphan_monitor(
         self,
@@ -775,16 +815,21 @@ class V14JointBrainModule(pl.LightningModule):
         ~5% of steps (Lightning's val cadence). For training_step the
         caller can override the cadence by gating the call.
 
-        Monitors fired here:
+        Monitors fired here (the feature-rank/orphan ones are PHASE-SCOPED —
+        see the body comment; each phase probes only the representation it
+        trains):
 
         * MON-PARCEL-COVERAGE-VARIANCE (5/28 P0) — cheap; no forward
-          needed. Runs on every step.
-        * MON-MASK-002 (B03d) — requires ``shaft_mask`` in the batch.
-        * MON-TEACHER-FEATURE-RANK (5/28 P0) — RankMe on the EMA
+          needed. Phase-independent (DK-support geometry), runs every step.
+        * MON-FRONTEND-FEATURE-RANK (B36 WS-I, P1) — RankMe on the EMA
+          teacher's M2 tap (post ``frontend_ln``), masked by electrode
+          ``valid_mask``. The P1 collapse probe.
+        * MON-MASK-002 (B03d) — P2 only; fires only if the batch carries a
+          ``shaft_mask``. B36 (WS-H5) drops ``shaft_mask`` from the default SSL
+          path, so this probe is inert unless the data pipeline still emits it.
+        * MON-TEACHER-FEATURE-RANK (5/28 P0) — P2 only; RankMe on the EMA
           teacher's post-``encoder_ln`` M4 tap (the canonical terminal-LN
-          target, B6 — there is no separate ``ln_frame`` head any more),
-          masked by ``latent_valid``. Fired from TRAIN step 0 (I1) plus
-          every val/test step.
+          target, B6), masked by ``latent_valid``. The P2 collapse probe.
         """
         student_kwargs = self._extract_student_kwargs(batch_data)
 
@@ -793,42 +838,57 @@ class V14JointBrainModule(pl.LightningModule):
             valid_mask=student_kwargs.get("valid_mask"),
             m_sub_slots=self._m_sub_slots,
         )
+        # Parcel-coverage variance is a property of the DK support assignment,
+        # not of any trained representation, so it is phase-independent and
+        # always fires.
         self._run_parcel_coverage_monitor(
             latent_valid=latent_valid, step_name=step_name,
         )
 
-        needs_orphan = "shaft_mask" in batch_data
-        # I1 (B36 WS-I): RankMe fires from TRAIN step 0, not just val/test, so a
-        # teacher-feature collapse is caught the moment pretraining starts rather
-        # than at the first validation epoch. The train caller already gates the
-        # whole monitor pass to ``log_every_n_steps`` cadence (batch_idx 0
-        # included), so this only adds one capped SVD per logging step.
-        needs_rankme = True
-        if not (needs_orphan or needs_rankme):
-            return
-
-        # The M4 tap is already post-``encoder_ln`` (B6 canonical terminal
-        # LN) — the monitors read it directly; there is no separate
-        # ``ln_frame`` head any more. The monitor forwards are FULL-input
-        # (no JEPA mask) so they measure the unmasked feature geometry.
+        # 2026-06-03 mis-scope fix: the trained representation is PHASE-
+        # DEPENDENT, so the feature-health monitors must be too. P1 (paradigm
+        # A) trains ONLY the front-end token blocks that produce M2; the hard
+        # pool + inter-parcel stack that produce M4 receive NO P1 gradient (the
+        # encoder's ``m2_only`` early-exit at v14_encoder.py never even builds
+        # them in P1). The previous code ran a FULL teacher forward and probed
+        # RankMe/orphan on M4 every step including P1 — i.e. it measured the
+        # random-init pool output and fired a false ``mon_rankme_alarm`` from
+        # step 0. Fix: probe M2 (the thing P1 trains) in P1, and keep the M4
+        # monitors for P2, where M4 IS the trained target.
+        # I1 (B36 WS-I): the relevant probe fires from TRAIN step 0 (the train
+        # caller gates this whole pass to ``log_every_n_steps`` cadence), so a
+        # genuine collapse is caught the moment pretraining starts.
         with torch.no_grad():
-            teacher_taps = self.teacher.model(**student_kwargs)
-            m4_t = teacher_taps["M4"]
+            if self._phase == "p1":
+                teacher_m2 = self.teacher.model(
+                    **student_kwargs, m2_only=True
+                )["M2"]
+                self._run_frontend_rank_monitor(
+                    teacher_m2=teacher_m2,
+                    valid_mask=student_kwargs.get("valid_mask"),
+                    step_name=step_name,
+                )
+                return
 
-            if needs_orphan:
-                student_taps = self.student(**student_kwargs)
+            # P2: M4 (post-``encoder_ln``, the B6 canonical terminal-LN target)
+            # is trained, so the FULL-input teacher forward + M4 monitors are
+            # in-scope. The orphan monitor additionally needs a ``shaft_mask``,
+            # which B36 (WS-H5) drops from the default SSL path — hence the
+            # ``in batch_data`` key guard (inert unless the pipeline emits it).
+            teacher_m4 = self.teacher.model(**student_kwargs)["M4"]
+            if "shaft_mask" in batch_data:
+                student_m4 = self.student(**student_kwargs)["M4"]
                 self._run_mask_orphan_monitor(
                     batch_data=batch_data,
-                    student_m4=student_taps["M4"],
-                    teacher_m4=m4_t,
+                    student_m4=student_m4,
+                    teacher_m4=teacher_m4,
                     step_name=step_name,
                 )
-            if needs_rankme:
-                self._run_teacher_rank_monitor(
-                    teacher_m4=m4_t,
-                    latent_valid=latent_valid,
-                    step_name=step_name,
-                )
+            self._run_teacher_rank_monitor(
+                teacher_m4=teacher_m4,
+                latent_valid=latent_valid,
+                step_name=step_name,
+            )
 
     def on_before_optimizer_step(
         self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature

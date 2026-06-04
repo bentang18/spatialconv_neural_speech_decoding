@@ -35,6 +35,7 @@ import neuralset as ns
 
 import speech_decoding.models  # noqa: F401  # registers V14ParcelPerceiver with BaseModelConfig
 from speech_decoding.experiments import Data, Experiment
+from speech_decoding.experiments.lr_schedule import WarmupCosine  # noqa: F401  # registers WarmupCosine BaseLRScheduler for the optim discriminator
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
 from speech_decoding.extractors.ref_aug import (
     REF_MODES,
@@ -94,6 +95,13 @@ DEFAULT_BATCH_SIZE = 32
 # with GPU compute; pair with --cpus-per-task >= num_workers + 1.
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_N_EPOCHS = 100
+# P4 frozen-probe early-stop patience (epochs on val_loss). P4 is a tiny
+# supervised readout (≤3500 samples, ~514–2570 trainable params); it converges
+# in a handful of epochs and the --n-epochs cap (100) would otherwise overfit
+# it. Early-stopping on val_loss is correct ONLY for P4 (the actual downstream
+# task); the SSL/distill phases never early-stop. Patience 10 is the operative
+# limit; the epoch cap is a safety ceiling. <=0 disables (run to the cap).
+DEFAULT_P4_EARLY_STOP_PATIENCE = 10
 # Ship-first task default — `speech` is the highest-signal binary task
 # requiring zero transcript enrichment (Sentence Onset = 0.780 CS-SOTA,
 # Speech = 0.751; full ship-first set is {onset, speech, delta_volume,
@@ -262,6 +270,78 @@ def _apply_extractor_cache(
     extractor.infra.folder = folder
 
 
+def _build_optim_cfg(
+    *,
+    lr: float,
+    lr_schedule: str,
+    warmup_steps: int,
+    min_lr_ratio: float,
+    weight_decay: float,
+    optimizer_name: str,
+    adam_betas: tuple[float, float] | None,
+) -> dict[str, tp.Any]:
+    """Assemble the ``LightningOptimizer`` config dict (#37, audit 2026-06-03).
+
+    ``fused=True`` keeps the 2026-05-30 speedup; ``betas`` / ``weight_decay`` are
+    added ONLY when set, so the default (Adam, lr=1e-3, no β/wd) is the prior
+    plain-Adam config bit-for-bit. With ``lr_schedule="warmup_cosine"`` the §7
+    locked linear-warmup → cosine→0 shape is attached via the custom
+    ``WarmupCosine`` scheduler — fields are TOP-LEVEL (it is a plain
+    ``BaseLRScheduler``, NOT a ``kwargs``-dict ``BaseTorchLRScheduler``); its
+    ``total_steps`` is supplied at ``configure_optimizers`` time from
+    ``trainer.estimated_stepping_batches`` (which ``--ssl-max-steps`` pins).
+    """
+    _validate_choice("lr_schedule", lr_schedule, ("constant", "warmup_cosine"))
+    _validate_choice("optimizer_name", optimizer_name, ("Adam", "AdamW"))
+    # §7 LOCK GUARD (audit 2026-06-03, lens-2 FAIL): the B01 recipe locks TWO
+    # param groups — no weight-decay on biases, LayerNorm/RMSNorm γβ, and the
+    # freq embedding. The phase modules' ``_phase_param_groups`` split by stage
+    # for discriminative LR but do NOT yet carry a ``weight_decay: 0.0`` override
+    # for that no-WD subset, so a non-zero ``weight_decay`` here would be applied
+    # UNIFORMLY to every param — a silent lock violation. Refuse loudly until the
+    # no-WD groups are implemented (a Ben-gated training-orchestration follow-up,
+    # paired with the M0 weight_decay value). wd=0.0 (the default) is unaffected
+    # and a valid first-pass center; this never fires on the maiden run.
+    if weight_decay:
+        raise ValueError(
+            f"weight_decay={weight_decay} is not yet supported: the §7 no-WD "
+            "param-group split (biases / LayerNorm γβ / freq_embed exempt) is "
+            "NOT implemented in the phase modules' configure_optimizers, so a "
+            "non-zero weight_decay would decay those params too — violating the "
+            "B01 lock. Pass --weight-decay 0 (the locked-shape-compliant first "
+            "pass), or implement the no-WD groups first. See "
+            "reports/b01_lr_schedule_unimplemented_lock_2026_06_03.md."
+        )
+    optim_kwargs: dict[str, tp.Any] = {"fused": True}
+    if weight_decay:
+        # Unreachable while the guard above stands (wd is falsy here); retained as
+        # the exact post-guard-removal path — when the no-WD groups land (task #40)
+        # the guard is deleted and this forwards the M0 weight_decay to either
+        # optimizer family.
+        optim_kwargs["weight_decay"] = weight_decay
+    elif optimizer_name == "AdamW":
+        # AdamW's torch default is weight_decay=0.01 — pin it to 0.0 EXPLICITLY so
+        # the §7 no-WD lock is not violated via the torch family default on the
+        # lock-recommended ``--optimizer AdamW`` path (the guard only sees the flag
+        # value, which is 0.0 here; without this pin AdamW would decay biases / LN
+        # γβ / freq_embed at 0.01 uniformly). Adam's torch default is already 0.0,
+        # so its kwargs stay ``{"fused": True}`` bit-for-bit.
+        optim_kwargs["weight_decay"] = 0.0
+    if adam_betas is not None:
+        optim_kwargs["betas"] = list(adam_betas)
+    cfg: dict[str, tp.Any] = {
+        "optimizer": {"name": optimizer_name, "lr": lr, "kwargs": optim_kwargs}
+    }
+    if lr_schedule == "warmup_cosine":
+        cfg["scheduler"] = {
+            "name": "WarmupCosine",
+            "warmup_steps": warmup_steps,
+            "min_lr_ratio": min_lr_ratio,
+        }
+        cfg["interval"] = "step"
+    return cfg
+
+
 def build_v14_experiment(
     *,
     bt_root: str | None = None,
@@ -281,6 +361,33 @@ def build_v14_experiment(
     # flag on that extractor directly).
     session_robust_z: bool = True,
     mains_notch_hz: float = DEFAULT_MAINS_NOTCH_HZ,
+    # #17 (D2 / T1.7): per-session MNE-LOF bad-channel drop on the default
+    # MultiStftView. Default OFF so the existing multi-TB STFT cache uid is
+    # untouched (the lof_* fields sit out of the uid via exclude_defaults). When
+    # flipped True the dispatch also forces ``drop_bads=True`` (the view validator
+    # requires it) and a ``lof_report_path`` so the per-subject drop counts are
+    # written to JSON for the BEN REVIEW GATE ("report back how many channels are
+    # dropped") before the run is scored. ``lof_threshold`` / ``lof_n_neighbors``
+    # enter the cache uid (they change which channels drop) — only passed when LOF
+    # is on. Ignored when a custom ``electrode_tokens_extractor`` is supplied (set
+    # lof_* on that extractor directly). The 1.5 / 20 defaults MIRROR the
+    # MultiStftView field defaults (extractors/view.py — the single source of
+    # truth; the CLI defaults mirror them too, so all three must move in
+    # lock-step. test_dispatch_lof_threshold_inert_when_lof_off pins the match).
+    lof_bad_channels: bool = False,
+    lof_threshold: float = 1.5,
+    lof_n_neighbors: int = 20,
+    lof_report_path: str | None = None,
+    # #35: padded electrode-slot count C. Default 384 (DEFAULT_C_MAX) covers all
+    # four Phase-1 corpora (D-cohort max=366) so the multi-corpus cache is shared.
+    # BT-only runs can pass 256 (BT raw max=256, the exact safe floor — the
+    # extractors raise if any subject's n_real > c_max) to drop the 128 pure-pad
+    # slots the per-electrode front-end would otherwise process (~33% wasted
+    # FLOPs/activations, an OOM lever). c_max is in the extractor-cache uid
+    # (MultiStftView/dk_support/valid_mask/shaft_mask) → a non-default value forces
+    # a fresh STFT cache and is a recipe-amendment (HB02 re-cost). When a custom
+    # ``electrode_tokens_extractor`` is supplied its c_max must match this value.
+    c_max: int = DEFAULT_C_MAX,
     eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
@@ -305,6 +412,14 @@ def build_v14_experiment(
     # CPU STFT with GPU compute; pass --cpus-per-task >= num_workers + 1.
     num_workers: int = DEFAULT_NUM_WORKERS,
     n_epochs: int = DEFAULT_N_EPOCHS,
+    # Step budget (SSL/distill phases). None → epoch budget (``n_epochs``).
+    max_steps: int | None = None,
+    # Early-stopping patience on ``val_loss``. None → no early-stop (the SSL /
+    # distill phases train to a fixed budget; their val loss is a pretext
+    # reconstruction/distill objective, NOT the downstream metric, so val-loss-min
+    # is the wrong stop signal). The supervised P4 probe sets this — there
+    # val_loss IS the downstream task, so val-loss-min is correct.
+    early_stopping_patience: int | None = None,
     seed: int = 33,
     exca_folder: str | None = None,
     # B1.5 (task #120, 2026-05-29) two-tier extractor cache root. When set,
@@ -455,6 +570,28 @@ def build_v14_experiment(
     # ``BrainModule`` with no handoff. The chain / any ``--resume-from`` P4 run
     # uses the frozen probe. Mutually exclusive with ``joint_phase`` / ``p3_distill``.
     phase4_frozen_probe: bool = False,
+    # Optimizer / LR-schedule (#37, 4-agent audit 2026-06-03). The v14 §7 recipe
+    # (closed B01 lock) fixes the LR *shape* as linear-warmup → cosine→0 + AdamW
+    # + β=(0.9, 0.95) + grad_clip=1.0 as non-swept universals; the peak-LR value
+    # and weight_decay were re-classified to M0-measured sweep centers on
+    # 2026-06-01. Defaults here REPRODUCE the prior constant-Adam behavior bit-
+    # for-bit (lr=1e-3, schedule="constant", optimizer="Adam", wd=0, no β
+    # override) so nothing silently changes; the locked warmup+cosine+AdamW path
+    # is opt-in via ``lr_schedule="warmup_cosine"``. ``gradient_clip_val`` is the
+    # one exception — the CLI defaults it to 1.0 (restoring the locked-universal
+    # that was silently OFF), but this function-level default stays None for the
+    # tiny test experiments. EMA τ is fixed at 0.99925 (B26/B27); the §9 EMA
+    # ramp is DEAD and is NOT wired here.
+    lr: float = 1e-3,
+    lr_schedule: tp.Literal["constant", "warmup_cosine"] = "constant",
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.0,
+    weight_decay: float = 0.0,
+    optimizer_name: tp.Literal["Adam", "AdamW"] = "Adam",
+    # None → torch optimizer default betas (Adam (0.9, 0.999)). Pass (0.9, 0.95)
+    # for the locked v14 SSL β2. Kept None by default for behavior parity.
+    adam_betas: tuple[float, float] | None = None,
+    gradient_clip_val: float | None = None,
     # B36 WS-E (E3/E4) cross-phase checkpoint handoff, threaded onto the
     # Experiment so the multi-phase chain (``run_phase_pipeline``) or a manual
     # per-phase ``--resume-from`` warm-starts / snapshots the transferable
@@ -487,6 +624,12 @@ def build_v14_experiment(
     _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
     _validate_choice("loss_variant", loss_variant, LOSS_VARIANTS)
     _validate_choice("jepa_phase", jepa_phase, JEPA_PHASES)
+    optim_cfg = _build_optim_cfg(
+        lr=lr, lr_schedule=lr_schedule, warmup_steps=warmup_steps,
+        min_lr_ratio=min_lr_ratio, weight_decay=weight_decay,
+        optimizer_name=optimizer_name, adam_betas=adam_betas,
+    )
+
     if ffn_variant != "dense":
         # MoE-FFN audit 2026-05-28: ``soft_moe_4`` is reserved as a P2
         # if-budget sister and requires ``models/soft_moe.py``. Fail
@@ -569,7 +712,7 @@ def build_v14_experiment(
         # removes DC + slow drift before the STFT. C3: StandardScaler dropped
         # (scaler=None) — robust-z normalizes the filterbank output downstream
         # of the view (see Nv14RobustZTransform / SessionRobustZNormalizer).
-        electrode_tokens_extractor = MultiStftView(
+        mstft_kwargs: dict[str, tp.Any] = dict(
             event_types="Ieeg",
             car="shaft",
             notch_filter=effective_bt_notch_hz,
@@ -577,9 +720,27 @@ def build_v14_experiment(
             scaler=None,
             apply_log=False,
             channel_order="original",
-            c_max=DEFAULT_C_MAX,
+            c_max=c_max,
             session_robust_z=session_robust_z,
         )
+        # #17: only attach the lof_* kwargs when LOF is ON. Off → none of them are
+        # forwarded, so the view keeps its field defaults and the multi-TB STFT
+        # cache uid is untouched. NOTE the load-bearing protection is this NOT-
+        # passing, not exclude_defaults: a stray ``--lof-threshold 2.0`` without
+        # ``--lof-bad-channels`` would, IF forwarded, be a non-default value that
+        # exclude_defaults does NOT drop → it would perturb the cache. Not
+        # forwarding it is what keeps the cache stable. On → drop_bads=True is
+        # forced (the view validator requires it; default-False = the prior
+        # no-drop behaviour) and threshold/n_neighbors/report_path flow through.
+        if lof_bad_channels:
+            mstft_kwargs.update(
+                lof_bad_channels=True,
+                drop_bads=True,
+                lof_threshold=lof_threshold,
+                lof_n_neighbors=lof_n_neighbors,
+                lof_report_path=lof_report_path,
+            )
+        electrode_tokens_extractor = MultiStftView(**mstft_kwargs)
     _apply_extractor_cache(
         electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
     )
@@ -652,11 +813,11 @@ def build_v14_experiment(
 
     dk_extractor = V14DKHardSupportExtractor(
         event_types="Ieeg", bt_root=bt_root, unmapped_policy="zero",
-        c_max=DEFAULT_C_MAX,
+        c_max=c_max,
     )
     _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(
-        event_types="Ieeg", bt_root=bt_root, c_max=DEFAULT_C_MAX,
+        event_types="Ieeg", bt_root=bt_root, c_max=c_max,
         unmapped_policy="zero",
     )
     _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
@@ -694,7 +855,7 @@ def build_v14_experiment(
         shaft_mask_extractor = BTShaftMaskExtractor(
             event_types="Ieeg",
             bt_root=bt_root,
-            c_max=DEFAULT_C_MAX,
+            c_max=c_max,
             seed=seed,
         )
         _apply_extractor_cache(
@@ -930,16 +1091,13 @@ def build_v14_experiment(
             # via the Experiment-level snapshot.
         },
         loss={"name": "CrossEntropyLoss"},
-        # ``fused=True`` Adam (2026-05-30 speedup audit Tier-1): one fused
-        # kernel for the whole step instead of a per-tensor foreach loop.
-        # neuraltrain BaseTorchOptimizer forwards ``kwargs`` verbatim to
-        # ``torch.optim.Adam``; ``fused`` is valid on CPU + CUDA in the
-        # pinned torch 2.10, so the laptop test path is unaffected. Applies
-        # to BOTH the supervised Phase-4 and the joint SSL optimizer (same
-        # ``self.optim``). Same Adam math as the foreach impl, equivalent
-        # within fp tolerance — NOT bit-identical (the fused kernel uses a
-        # different reduction order, esp. under bf16-mixed on CUDA).
-        optim={"optimizer": {"name": "Adam", "lr": 1e-3, "kwargs": {"fused": True}}},
+        # #37: optimizer/LR-schedule config built above from the optim flags.
+        # ``fused=True`` Adam (2026-05-30 speedup audit Tier-1) is preserved in
+        # the default; neuraltrain BaseTorchOptimizer forwards ``kwargs``
+        # verbatim to ``torch.optim.{Adam,AdamW}`` (``fused`` valid on CPU+CUDA
+        # in pinned torch 2.10, so the laptop test path is unaffected). Applies
+        # to BOTH the supervised Phase-4 and the joint SSL optimizer.
+        optim=optim_cfg,
         metrics=[
             {
                 "name": "Accuracy",
@@ -948,6 +1106,12 @@ def build_v14_experiment(
             }
         ],
         n_epochs=n_epochs,
+        max_steps=max_steps,
+        early_stopping_patience=early_stopping_patience,
+        # #37: Lightning gradient clipping. v14 §7 locks grad_clip=1.0 as a
+        # non-swept universal; the CLI defaults --grad-clip to 1.0, but this
+        # function default is None (the tiny test experiments don't clip).
+        gradient_clip_val=gradient_clip_val,
         seed=seed,
         # B36 WS-E (E3/E4) cross-phase handoff. On a standalone phase both are
         # None (no-op); the chain driver (run_phase_pipeline) rewrites them via
@@ -999,7 +1163,66 @@ def _parser() -> argparse.ArgumentParser:
                    help="DataLoader worker processes (B1.4e, 2026-05-29). "
                         "0 starves the GPU on the per-sample CPU STFT; default "
                         "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
-    p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS)
+    p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS,
+                   help="Epoch budget for the SSL/distill phases (P1/P2/P3a/P3b) "
+                        "and the P4 cap. The SSL phases train to this fixed "
+                        "budget; no early-stop.")
+    p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, default=None,
+                   help="Optional step budget for the SSL/distill phases "
+                        "(P1/P2/P3a/P3b). When set it overrides --n-epochs for "
+                        "those phases: training stops at this many optimizer "
+                        "steps (max_epochs=-1). Real SSL runs over the "
+                        "multi-hundred-hour joint corpus are budgeted in steps, "
+                        "not epochs. P4 ignores this.")
+    p.add_argument("--p4-early-stop-patience", dest="p4_early_stop_patience",
+                   type=int, default=DEFAULT_P4_EARLY_STOP_PATIENCE,
+                   help="Early-stopping patience (epochs) on val_loss for the "
+                        "P4 frozen probe ONLY — the one phase where val_loss-min "
+                        "is the right signal (P4 IS the supervised task). The "
+                        "SSL/distill phases never early-stop. Pass a value <= 0 "
+                        "to disable and run P4 to the --n-epochs cap.")
+    # #37 optimizer / LR-schedule flags (4-agent audit 2026-06-03). Defaults
+    # reproduce the prior constant-Adam config bit-for-bit EXCEPT --grad-clip,
+    # which defaults to 1.0 to restore the §7 locked-universal that was silently
+    # OFF. The locked linear-warmup → cosine→0 + AdamW path is opt-in via
+    # --lr-schedule warmup-cosine (peak --lr + β2=0.95 + wd are M0-sweep choices,
+    # so they are NOT auto-flipped — the launcher sets them explicitly).
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="Peak/base LR (constant value, or warmup-cosine peak). "
+                        "1e-3 default = prior behavior; the §7 M0 sweep centers "
+                        "are 5e-4 (P1) / 3e-4 (P2) @ batch 1024/512 (√-rule-"
+                        "rescale for the live bs=8 before a real run).")
+    p.add_argument("--lr-schedule", dest="lr_schedule",
+                   choices=("constant", "warmup_cosine"), default="constant",
+                   help="constant (default, prior behavior) or warmup_cosine "
+                        "(§7 locked shape: linear warmup → cosine → "
+                        "min_lr_ratio·peak). warmup_cosine reads its horizon from "
+                        "estimated_stepping_batches (--ssl-max-steps pins it).")
+    p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=0,
+                   help="Linear-warmup optimizer steps for --lr-schedule "
+                        "warmup_cosine (§7: 20k P1 / 5k P2 @ full corpus; scale "
+                        "to the actual step budget). Clamped below total_steps.")
+    p.add_argument("--min-lr-ratio", dest="min_lr_ratio", type=float, default=0.0,
+                   help="Cosine floor as a fraction of peak LR (0.0 = →0, the "
+                        "§7 lock). Per-group-proportional, so P2/P3 "
+                        "discriminative-LR ratios survive a non-zero floor.")
+    p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.0,
+                   help="AdamW weight decay (0.0 default = prior plain-Adam). §7 "
+                        "M0 sweep center is 0.05; only added to the optimizer "
+                        "kwargs when > 0 (use --optimizer adamw for decoupled WD).")
+    p.add_argument("--optimizer", dest="optimizer_name",
+                   choices=("Adam", "AdamW"), default="Adam",
+                   help="Adam (default, prior behavior) or AdamW (§7 locked "
+                        "family, decoupled weight decay).")
+    p.add_argument("--adam-beta2", dest="adam_beta2", type=float, default=None,
+                   help="When set, optimizer betas = (0.9, beta2). §7 locks "
+                        "β2=0.95 for the SSL phases; unset → torch default "
+                        "(Adam (0.9, 0.999)) for behavior parity.")
+    p.add_argument("--grad-clip", dest="grad_clip", type=float, default=1.0,
+                   help="Lightning gradient_clip_val. Defaults to 1.0 to restore "
+                        "the §7 locked-universal grad_clip that was silently OFF "
+                        "(top divergence-risk fix per the 6/03 run-health audit). "
+                        "Pass <= 0 to disable clipping.")
     p.add_argument("--clip-len", type=float, default=None,
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
                         "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
@@ -1026,6 +1249,39 @@ def _parser() -> argparse.ArgumentParser:
                    help="Emit the RAW (un-normalized) filterbank. Only for "
                         "plumbing smokes / fast-dev-run — encoder LN absorbs "
                         "scale there; NOT valid for a science run.")
+    p.add_argument("--lof-bad-channels", dest="lof_bad_channels",
+                   action="store_true", default=False,
+                   help="#17 (D2/T1.7): per-session MNE-LOF bad-channel drop on "
+                        "the default Multi-STFT front-end (filtered, pre-CAR "
+                        "voltage; flagged channels dropped before shaft-CAR). OFF "
+                        "by default (cache uid untouched). ON forces drop_bads=True "
+                        "and REQUIRES --lof-report-path: the per-subject drop "
+                        "counts are written to JSON for Ben review before a scored "
+                        "run ('report back how many channels are dropped'). "
+                        "Changes the STFT cache uid → forces a rebuild.")
+    p.add_argument("--lof-threshold", dest="lof_threshold", type=float,
+                   default=1.5,
+                   help="MNE-LOF z-score threshold (default 1.5, the L.0 recipe "
+                        "amendment value). Lower = more aggressive. In the cache "
+                        "uid. Inert unless --lof-bad-channels.")
+    p.add_argument("--lof-n-neighbors", dest="lof_n_neighbors", type=int,
+                   default=20,
+                   help="MNE-LOF neighbor count (default 20). In the cache uid. "
+                        "Inert unless --lof-bad-channels.")
+    p.add_argument("--lof-report-path", dest="lof_report_path", default=None,
+                   help="Where to write the per-session/per-subject LOF drop-count "
+                        "JSON (the Ben review gate). REQUIRED when "
+                        "--lof-bad-channels is set. Output-location only — NOT in "
+                        "the cache uid.")
+    p.add_argument("--c-max", dest="c_max", type=int, default=DEFAULT_C_MAX,
+                   help=f"#35: padded electrode-slot count C (default "
+                        f"{DEFAULT_C_MAX}, covers all 4 Phase-1 corpora / shared "
+                        "multi-corpus cache). Pass 256 for BT-only runs (BT raw "
+                        "max=256, the exact safe floor) to drop the 128 pure-pad "
+                        "slots the per-electrode front-end would otherwise process "
+                        "(~33%% wasted FLOPs, an OOM lever). In the extractor-cache "
+                        "uid → a non-default value forces a fresh STFT cache "
+                        "(recipe-amendment, HB02 re-cost).")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
@@ -1439,6 +1695,15 @@ def _common_build_kwargs(
         dkoleo_mode=args.dkoleo_mode,
         cross_attn_positions=cross_attn_positions,
         mains_notch_hz=args.mains_notch_hz,
+        # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
+        # one dict so the chain + single-phase builds stay in lock-step.
+        lof_bad_channels=args.lof_bad_channels,
+        lof_threshold=args.lof_threshold,
+        lof_n_neighbors=args.lof_n_neighbors,
+        lof_report_path=args.lof_report_path,
+        # #35: padded electrode-slot count. Reaches every phase via this one dict
+        # so the chain's 4 c_max-padded extractors stay in lock-step.
+        c_max=args.c_max,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
         subtype_embed_vocab=args.subtype_embed_vocab,
@@ -1453,6 +1718,17 @@ def _common_build_kwargs(
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
+        # #37 optim / LR-schedule (audit 2026-06-03). --adam-beta2 → (0.9, β2)
+        # tuple; --grad-clip <= 0 → None (disable). Reaches every phase via this
+        # one dict, so the chain and single-phase builds stay in lock-step.
+        lr=args.lr,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer_name,
+        adam_betas=(0.9, args.adam_beta2) if args.adam_beta2 is not None else None,
+        gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
     )
 
 
@@ -1493,28 +1769,39 @@ def _build_v14_chain(
         channel_stats_path=args.channel_stats_path,
         target_standardize=args.target_standardize,
     )
+    # SSL/distill phases (P1/P2/P3a/P3b): fixed budget, NEVER early-stop (their
+    # val loss is a pretext objective, not the downstream metric).
+    # ``--ssl-max-steps`` (when set) budgets them in steps instead of --n-epochs.
+    ssl_budget = dict(max_steps=args.ssl_max_steps)
     p1 = build_v14_experiment(
-        **common, joint_phase=True, jepa_phase="p1", clip_len=5.0,
+        **common, **ssl_budget, joint_phase=True, jepa_phase="p1", clip_len=5.0,
         neural_lag_s=args.neural_lag_s,
     )
     p2 = build_v14_experiment(
-        **common, joint_phase=True, jepa_phase="p2", clip_len=5.0,
+        **common, **ssl_budget, joint_phase=True, jepa_phase="p2", clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     p3a = build_v14_experiment(
-        **common, **whisper, p3_distill=True, p3_stage="3a", clip_len=5.0,
+        **common, **ssl_budget, **whisper, p3_distill=True, p3_stage="3a",
+        clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     p3b = build_v14_experiment(
-        **common, **whisper, p3_distill=True, p3_stage="3b", clip_len=5.0,
+        **common, **ssl_budget, **whisper, p3_distill=True, p3_stage="3b",
+        clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     # binary_tasks now rides in `common` (reaches every phase, so the SSL /
     # distill clip population matches the P4 eval set); P4 only overrides the
-    # parity window + zero lag.
+    # parity window + zero lag. P4 is the one phase that early-stops on val_loss
+    # (it IS the supervised task); <=0 disables and runs to the --n-epochs cap.
+    p4_patience = (
+        args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None
+    )
     p4 = build_v14_experiment(
         **common, phase4_frozen_probe=True,
         clip_len=1.0, neural_lag_s=0.0,
+        early_stopping_patience=p4_patience,
     )
     return [p1, p2, p3a, p3b, p4]
 
@@ -1546,9 +1833,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  eval_mode={args.eval_mode} test=({args.test_subject_id},{args.test_trial_id})")
     print(f"  d_model={args.d_model} depth={args.depth} n_heads={args.n_heads} "
           f"M={args.m_sub_slots} eps={args.eps}")
-    print(f"  K=80 DK parcels, batch_size={args.batch_size}, n_epochs={args.n_epochs}")
+    print(f"  K=80 DK parcels, c_max={args.c_max}, batch_size={args.batch_size}, "
+          f"n_epochs={args.n_epochs}")
     print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
           f"mains_notch_hz={args.mains_notch_hz}")
+    print(f"  lof_bad_channels={args.lof_bad_channels} lof_threshold={args.lof_threshold} "
+          f"lof_n_neighbors={args.lof_n_neighbors} lof_report_path={args.lof_report_path}")
     print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
           f"frontend_lr_scale={args.frontend_lr_scale} neural_lag_s={args.neural_lag_s} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
@@ -1558,6 +1848,10 @@ def main(argv: list[str] | None = None) -> int:
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
           f"readout={args.readout} "
           f"gradient_checkpointing={args.gradient_checkpointing}")
+    print(f"  optim: name={args.optimizer_name} lr={args.lr} "
+          f"lr_schedule={args.lr_schedule} warmup_steps={args.warmup_steps} "
+          f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
+          f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip}")
     if args.cluster == "slurm":
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "
@@ -1627,10 +1921,30 @@ def main(argv: list[str] | None = None) -> int:
         or args.resume_from is not None
         or args.snapshot_ckpt_to is not None
     )
+    # #39 (audit 2026-06-03): mirror the chain's per-phase budget gating onto the
+    # single-phase path (it previously reached only --chain). --ssl-max-steps is an
+    # SSL/distill-phase step budget (P1/P2-via-jepa, P3a/3b); P4 ignores it and
+    # uses --n-epochs + early-stop. --p4-early-stop-patience is P4-only (val_loss is
+    # the right signal only there). Defaults stay None → prior epoch-budget behavior
+    # is byte-identical; these fire only when the flags are passed. The single-phase
+    # --phase 4 rerun is the next gate, so this closes the gap that would otherwise
+    # silently ignore --p4-early-stop-patience there.
+    single_max_steps = args.ssl_max_steps if args.phase in (1, 3) else None
+    single_p4_patience = (
+        (args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None)
+        if args.phase == 4
+        else None
+    )
+    print(
+        f"  single-phase budget: max_steps={single_max_steps} "
+        f"early_stopping_patience={single_p4_patience}"
+    )
     xp = build_v14_experiment(
         **_common_build_kwargs(args, cross_attn_positions=cross_attn_positions),
         clip_len=args.clip_len,
         neural_lag_s=args.neural_lag_s,
+        max_steps=single_max_steps,
+        early_stopping_patience=single_p4_patience,
         joint_phase=(args.phase == 1),
         p3_distill=(args.phase == 3),
         p3_stage=args.p3_stage,

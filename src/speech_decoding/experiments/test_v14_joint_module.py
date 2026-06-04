@@ -451,10 +451,12 @@ def test_monitor_logs_parcel_coverage_on_every_step() -> None:
 
 
 def test_monitor_logs_teacher_rank_on_train_from_step0_and_val() -> None:
-    """I1 (B36 WS-I): RankMe now fires on the TRAIN loop from step 0 (the
+    """I1 (B36 WS-I): the M4 RankMe fires on the TRAIN loop from step 0 (the
     val/test gate was dropped) so a teacher-feature collapse is caught at the
-    start of pretraining, not only at the first val epoch."""
-    module = _make_module()
+    start of pretraining, not only at the first val epoch. M4 is the P2 target,
+    so this is the P2-phase probe (2026-06-03 phase-scope fix moved M4 RankMe
+    out of P1, where M4 is untrained random-init)."""
+    module = _make_module(phase="p2")
     train_logged: dict[str, float] = {}
     module.log = lambda key, value, **_kw: train_logged.update({key: float(value)})  # type: ignore[method-assign]
     module._monitor_from_step(_make_synthetic_batch().data, step_name="train")
@@ -493,12 +495,54 @@ def test_rankme_reads_post_encoder_ln_tap_not_ln_frame() -> None:
 
 def test_training_step_at_batch_idx_0_logs_rankme() -> None:
     """I1 end-to-end: driving ``training_step`` at global step 0 (monitor-due
-    with no trainer attached → every-step cadence) emits ``train_mon_rankme``."""
-    module = _make_module()
-    logged: dict[str, float] = {}
-    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
-    module.training_step(_make_synthetic_batch(), 0)
-    assert "train_mon_rankme" in logged
+    with no trainer attached → every-step cadence) emits the PHASE-APPROPRIATE
+    feature-rank probe — ``train_mon_frontend_rankme`` in P1 (M2), and
+    ``train_mon_rankme`` in P2 (M4)."""
+    p1 = _make_module(phase="p1")
+    p1_logged: dict[str, float] = {}
+    p1.log = lambda key, value, **_kw: p1_logged.update({key: float(value)})  # type: ignore[method-assign]
+    p1.training_step(_make_synthetic_batch(), 0)
+    assert "train_mon_frontend_rankme" in p1_logged
+    assert "train_mon_rankme" not in p1_logged
+
+    p2 = _make_module(phase="p2")
+    p2_logged: dict[str, float] = {}
+    p2.log = lambda key, value, **_kw: p2_logged.update({key: float(value)})  # type: ignore[method-assign]
+    p2.training_step(_make_synthetic_batch(), 0)
+    assert "train_mon_rankme" in p2_logged
+    assert "train_mon_frontend_rankme" not in p2_logged
+
+
+def test_monitor_rank_probe_is_phase_scoped() -> None:
+    """2026-06-03 mis-scope fix: each phase probes ONLY the representation it
+    trains. P1 trains M2 (front-end) and never gradients the hard pool /
+    inter-parcel stack that build M4, so probing M4 RankMe in P1 reads
+    random-init layers and fires a false collapse alarm from step 0. So P1 ->
+    front-end (M2) rank only; P2 -> M4 rank only. The two never alias on the
+    same metric key."""
+    p1 = _make_module(phase="p1")
+    p1_logged: dict[str, float] = {}
+    p1.log = lambda key, value, **_kw: p1_logged.update({key: float(value)})  # type: ignore[method-assign]
+    p1._monitor_from_step(_make_synthetic_batch().data, step_name="train")
+    for key in (
+        "train_mon_frontend_rankme",
+        "train_mon_frontend_rankme_normalised",
+        "train_mon_frontend_rankme_warn",
+        "train_mon_frontend_rankme_alarm",
+    ):
+        assert key in p1_logged, key
+    # P1 must NOT emit the M4 probes (random-init M4 -> false alarm) ...
+    assert "train_mon_rankme" not in p1_logged
+    assert "train_mon_rankme_alarm" not in p1_logged
+    # ... nor the M4-based orphan ratio.
+    assert "train_mon_mask_002_ratio" not in p1_logged
+
+    p2 = _make_module(phase="p2")
+    p2_logged: dict[str, float] = {}
+    p2.log = lambda key, value, **_kw: p2_logged.update({key: float(value)})  # type: ignore[method-assign]
+    p2._monitor_from_step(_make_synthetic_batch().data, step_name="train")
+    assert "train_mon_rankme_alarm" in p2_logged
+    assert "train_mon_frontend_rankme" not in p2_logged
 
 
 def _perturb_student_for_nonzero_grad(module: V14JointBrainModule) -> None:

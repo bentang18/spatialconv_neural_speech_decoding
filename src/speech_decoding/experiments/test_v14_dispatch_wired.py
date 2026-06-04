@@ -41,6 +41,130 @@ def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
     assert ext.scaler is None
 
 
+def test_dispatch_lof_off_by_default_leaves_view_unperturbed(tmp_path, monkeypatch) -> None:
+    """#17: with LOF off (the default) the Multi-STFT view carries NO lof config —
+    ``lof_bad_channels``/``drop_bads`` False, no report path — so the multi-TB STFT
+    cache uid is bit-identical to pre-#17."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    ext = dispatch_v14.build_v14_experiment(mode="nano").data.segmenter.extractors[
+        "electrode_tokens"
+    ]
+    assert ext.lof_bad_channels is False
+    assert ext.drop_bads is False
+    assert ext.lof_report_path is None
+
+
+def test_dispatch_lof_threshold_inert_when_lof_off(tmp_path, monkeypatch) -> None:
+    """#17 cache-uid footgun: a non-default ``lof_threshold`` passed WITHOUT
+    enabling LOF must NOT reach the view (else it lands in the cache uid and forces
+    a needless multi-TB rebuild while LOF does nothing). The view keeps its
+    default threshold."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    ext = dispatch_v14.build_v14_experiment(
+        mode="nano", lof_bad_channels=False, lof_threshold=2.0, lof_n_neighbors=42,
+    ).data.segmenter.extractors["electrode_tokens"]
+    assert ext.lof_bad_channels is False
+    assert ext.lof_threshold == 1.5  # view default, NOT the passed 2.0
+    assert ext.lof_n_neighbors == 20  # view default, NOT the passed 42
+
+
+def test_dispatch_lof_on_wires_drop_and_report(tmp_path, monkeypatch) -> None:
+    """#17: enabling LOF forces ``drop_bads=True`` (view validator requires it) and
+    threads threshold / n_neighbors / report_path through to the view."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    report = tmp_path / "lof_drops.json"
+    ext = dispatch_v14.build_v14_experiment(
+        mode="nano",
+        lof_bad_channels=True,
+        lof_threshold=1.8,
+        lof_n_neighbors=15,
+        lof_report_path=str(report),
+    ).data.segmenter.extractors["electrode_tokens"]
+    assert ext.lof_bad_channels is True
+    assert ext.drop_bads is True
+    assert ext.lof_threshold == 1.8
+    assert ext.lof_n_neighbors == 15
+    assert ext.lof_report_path == str(report)
+
+
+def test_dispatch_lof_on_without_report_path_raises(tmp_path, monkeypatch) -> None:
+    """#17 Ben-review gate: LOF on without a report path is a hard build error —
+    the per-subject drop counts MUST be written for review before a scored run."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match="lof_report_path"):
+        dispatch_v14.build_v14_experiment(mode="nano", lof_bad_channels=True)
+
+
+def test_dispatch_warmup_cosine_reaches_experiment_optim(tmp_path, monkeypatch) -> None:
+    """#37 (audit follow-up): the warmup_cosine optim config must survive the real
+    Experiment construction — not just _build_optim_cfg / stubbed-chain capture. A
+    regression in the ``optim=optim_cfg`` hand-off would otherwise go unseen."""
+    from speech_decoding.experiments.lr_schedule import WarmupCosine
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", lr_schedule="warmup_cosine", warmup_steps=2000,
+        min_lr_ratio=0.0, optimizer_name="AdamW",
+    )
+    assert isinstance(xp.optim.scheduler, WarmupCosine)
+    assert xp.optim.scheduler.warmup_steps == 2000
+    assert xp.optim.interval == "step"
+    # optimizer is a BaseTorchOptimizer subclass auto-named by class (`name` is
+    # the discriminator, resolved from __name__, not a stored attribute).
+    assert type(xp.optim.optimizer).__name__ == "AdamW"
+
+
+def test_dispatch_default_optim_has_no_scheduler(tmp_path, monkeypatch) -> None:
+    """#37: the default (constant) build leaves scheduler None — prior plain-Adam."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp.optim.scheduler is None
+    assert type(xp.optim.optimizer).__name__ == "Adam"
+
+
+def test_dispatch_adamw_does_not_leak_torch_default_weight_decay(
+    tmp_path, monkeypatch
+) -> None:
+    """Re-audit 2026-06-03 (chunk-gate FAIL): torch ``AdamW`` defaults weight_decay
+    to 0.01. Building the REAL optimizer for an ``--optimizer AdamW`` run (wd guarded
+    to 0) must yield param_groups with weight_decay 0.0 — not the implicit 0.01,
+    which would silently decay the §7 no-WD params (biases / LN γβ / freq_embed).
+    A cfg-level kwargs check would miss a regression that re-omits the pin, so this
+    builds the actual torch optimizer and inspects its param_groups."""
+    import torch
+
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano", optimizer_name="AdamW")
+    built = xp.optim.build([torch.nn.Parameter(torch.zeros(2))])
+    optim = built["optimizer"] if isinstance(built, dict) else built
+    assert type(optim).__name__ == "AdamW"
+    assert all(g["weight_decay"] == 0.0 for g in optim.param_groups)
+
+
+def test_dispatch_c_max_defaults_to_384_across_extractors(tmp_path, monkeypatch) -> None:
+    """#35: the default c_max (384, multi-corpus) reaches every c_max-padded
+    extractor."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    exts = dispatch_v14.build_v14_experiment(mode="nano").data.segmenter.extractors
+    assert exts["electrode_tokens"].c_max == 384
+    assert exts["support"].c_max == 384
+    assert exts["valid_mask"].c_max == 384
+
+
+def test_dispatch_c_max_256_threads_to_all_padded_extractors(tmp_path, monkeypatch) -> None:
+    """#35: --c-max 256 must reach ALL four c_max-padded extractors — including the
+    joint-phase shaft_mask — or the per-electrode tensors mismatch in the encoder.
+    256 is BT's exact safe floor (raw max=256); the build must not raise."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    exts = dispatch_v14.build_v14_experiment(
+        mode="nano", c_max=256, joint_phase=True, jepa_phase="p1",
+    ).data.segmenter.extractors
+    assert exts["electrode_tokens"].c_max == 256
+    assert exts["support"].c_max == 256
+    assert exts["valid_mask"].c_max == 256
+    assert exts["shaft_mask"].c_max == 256  # joint-phase extractor must match
+
+
 def test_dispatch_omits_whisper_target_by_default(tmp_path, monkeypatch) -> None:
     """WS-H: P1/P2/P4 never carry the 1280-d teacher stream — the extractor is
     built only when a teacher-cache dir is passed (P3)."""

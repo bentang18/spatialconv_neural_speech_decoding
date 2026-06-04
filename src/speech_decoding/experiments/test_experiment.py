@@ -145,3 +145,103 @@ def test_substrate_smoke_full_fit_caches(tmp_path) -> None:
     assert second == first  # exca cache hit
     uid_dirs_after = sorted(p for p in run_root.rglob("*") if p.is_dir())
     assert uid_dirs_before == uid_dirs_after
+
+
+def test_checkpoints_namespaced_per_run(tmp_path) -> None:
+    """Two distinct-config runs into one folder must not collide on checkpoints.
+
+    Pre-fix both wrote to ``<folder>/checkpoints/`` with filename ``best`` +
+    ``save_last``; Lightning auto-incremented the second to ``last-v1.ckpt`` /
+    ``best-v1.ckpt``, so a P1→P2→P3→P4 chain (each phase a distinct exca UID
+    sharing one folder) silently shuffled which phase owned which file. The
+    per-run ``uid_folder`` routing gives each its own ``checkpoints/last.ckpt``.
+    """
+    import speech_decoding.models  # noqa: F401  # registers TinyMLP discriminator
+    run_root = tmp_path / "runs"
+
+    _tiny_mlp_xp(run_root, n_epochs=1).run()  # seed=33 (default) -> UID A
+    # clone_obj rebinds infra so the diff lands in the cached run() body and the
+    # second config gets a distinct UID (model_copy would not — see
+    # v14_phase_pipeline.configure_phase_handoff).
+    _tiny_mlp_xp(run_root, n_epochs=1).infra.clone_obj({"seed": 7}).run()  # UID B
+
+    # No flat shared checkpoints dir, and no Lightning -v auto-increment.
+    assert not (run_root / "checkpoints").exists()
+    last_ckpts = sorted(run_root.rglob("last.ckpt"))
+    assert len(last_ckpts) == 2, [str(p) for p in last_ckpts]
+    assert not list(run_root.rglob("last-v*.ckpt"))
+    assert not list(run_root.rglob("best-v*.ckpt"))
+
+
+def _trainer_only_xp(*, n_epochs: int, max_steps: int | None) -> Experiment:
+    import speech_decoding.models  # noqa: F401  # registers TinyMLP discriminator
+
+    return Experiment(
+        data=tiny_data(),
+        brain_model_config={"name": "TinyMLP", "hidden": 8},
+        loss={"name": "CrossEntropyLoss"},
+        optim={"optimizer": {"name": "Adam", "lr": 1e-2}},
+        metrics=[
+            {
+                "name": "Accuracy",
+                "log_name": "acc",
+                "kwargs": {"task": "multiclass", "num_classes": 2},
+            }
+        ],
+        n_epochs=n_epochs,
+        max_steps=max_steps,
+        accelerator="cpu",
+        devices=1,
+        infra={"folder": None, "cluster": None},
+    )
+
+
+def test_max_steps_overrides_epoch_cap() -> None:
+    """#32: a step budget caps optimizer steps and disables the epoch cap, so the
+    cosine LR horizon (estimated_stepping_batches) == max_steps."""
+    trainer = _trainer_only_xp(n_epochs=100, max_steps=7)._trainer()
+    assert trainer.max_steps == 7
+    assert trainer.max_epochs == -1
+
+
+def test_no_max_steps_keeps_epoch_cap() -> None:
+    """Default (max_steps=None) keeps the epoch budget; Lightning's max_steps=-1."""
+    trainer = _trainer_only_xp(n_epochs=3, max_steps=None)._trainer()
+    assert trainer.max_epochs == 3
+    assert trainer.max_steps == -1
+
+
+def test_gradient_clip_val_passed_to_trainer() -> None:
+    """#37: gradient_clip_val reaches the Lightning trainer when set; default
+    None leaves clipping off (back-compat for the tiny test experiments)."""
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+    assert base._trainer().gradient_clip_val is None  # default: no clipping
+
+    clipped = base.model_copy(update={"gradient_clip_val": 1.0})
+    assert clipped._trainer().gradient_clip_val == 1.0
+
+
+class _StubCkptCb:
+    def __init__(self, best_model_path: str) -> None:
+        self.best_model_path = best_model_path
+
+
+class _StubTrainer:
+    def __init__(self, best_model_path: str = "") -> None:
+        self.checkpoint_callback = _StubCkptCb(best_model_path)
+
+
+def test_test_ckpt_path_best_only_for_early_stopping_phase() -> None:
+    """#32 audit follow-up: EarlyStopping doesn't restore best weights, so the
+    one phase that early-stops (the supervised P4 probe) tests its val-best
+    checkpoint; SSL phases (no early-stop) test in-memory last-epoch weights —
+    which the cross-phase handoff also snapshots, so that path is unchanged."""
+    ssl = _trainer_only_xp(n_epochs=3, max_steps=None)  # early_stopping_patience=None
+    # No early-stop -> in-memory, even if a best ckpt happens to exist.
+    assert ssl._test_ckpt_path(_StubTrainer("/x/best.ckpt")) is None
+
+    p4 = ssl.model_copy(update={"early_stopping_patience": 10})
+    # Early-stop + a written best.ckpt -> evaluate best.
+    assert p4._test_ckpt_path(_StubTrainer("/x/best.ckpt")) == "best"
+    # Early-stop but no best written (stopped before first validation) -> in-memory.
+    assert p4._test_ckpt_path(_StubTrainer("")) is None
