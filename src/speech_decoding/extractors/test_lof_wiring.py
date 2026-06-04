@@ -156,15 +156,33 @@ def test_fit_bads_armed_before_super_prepare(monkeypatch) -> None:
 
 
 def test_precar_sibling_disables_car_and_carries_private_state() -> None:
-    # Load-bearing assumption of the pre-CAR fit: model_copy(update=) flips car
-    # off (so _get_data returns filtered PRE-CAR voltage) while carrying the
-    # prepared private state (e.g. _channels) so _get_data still works.
+    # Load-bearing assumption of the pre-CAR fit: model_copy(update=, deep=True)
+    # flips car off (so _get_data returns filtered PRE-CAR voltage) while carrying
+    # the private state so _get_data still works.
     v = _view(car="shaft", lof_bad_channels=True, drop_bads=True)
     v._session_bads = {"keep": ["X1"]}
-    sib = v.model_copy(update={"car": None})
+    sib = v.model_copy(update={"car": None}, deep=True)
     assert sib.car is None
     assert v.car == "shaft"  # original untouched
     assert sib._session_bads == {"keep": ["X1"]}  # private state carried over
+
+
+def test_precar_sibling_has_distinct_cache_namespace() -> None:
+    # GATE-C RE-AUDIT SHOWSTOPPER PIN: the pre-CAR fit MUST read+cache under a
+    # DIFFERENT exca uid than self, or it poisons self's (car=shaft) production
+    # cache with a no-drop entry. A SHALLOW model_copy shares the infra object
+    # (infra._obj stays bound to self=car=shaft -> SAME uid -> poison); deep=True
+    # forks it. Pin at the infra/uid layer, where the bug actually lives — the
+    # pydantic `car` field flips either way and would mask this.
+    v = _view(car="shaft", lof_bad_channels=True, drop_bads=True)
+    shallow = v.model_copy(update={"car": None})
+    deep = v.model_copy(update={"car": None}, deep=True)
+    assert shallow.infra.uid() == v.infra.uid(), "shallow shares self's uid (the bug)"
+    assert deep.infra.uid() != v.infra.uid(), "deep MUST fork the cache namespace"
+    # ...and lands in the genuine car=None namespace, not some third bucket.
+    indep = _view(car=None, lof_bad_channels=True, drop_bads=True)
+    assert deep.infra.uid() == indep.infra.uid()
+    assert deep.infra._obj.car is None  # the sibling preprocesses PRE-CAR
 
 
 def test_report_aggregates_and_writes_json(tmp_path: Path) -> None:

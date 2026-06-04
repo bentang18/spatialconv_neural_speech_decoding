@@ -765,11 +765,18 @@ class MultiStftView(CARIeegExtractor):
                 "MultiStftView.lof_bad_channels=True requires drop_bads=True so the "
                 "LOF-flagged channels are actually removed before shaft-CAR."
             )
-        # car=None sibling for the fit load. model_copy carries the prepared
-        # private state (_channels) so _get_data works; _bads_ready is still False
-        # on the copy (set after this method returns) so its _preprocess_raw passes
-        # through and LOF sees every channel — it is the detector, not a consumer.
-        precar = self.model_copy(update={"car": None})
+        # car=None sibling for the fit load. deep=True IS LOAD-BEARING (Gate-C
+        # re-audit, 2026-06-03): a SHALLOW model_copy shares the exca infra object,
+        # whose ``_obj`` stays bound to self (car=shaft) — the sibling would then
+        # (1) preprocess with CAR after all (wrong LOF input) and (2) materialize a
+        # car=shaft NO-DROP entry under self's production cache uid before bads are
+        # armed, re-seeding the very poison this whole ordering kills. deep=True
+        # forks the infra so the sibling gets the distinct car=None uid (verified ==
+        # an independently-built car=None view) and preprocesses pre-CAR. The copy
+        # carries the private state (_event_types_helper, _session_bads); _bads_ready
+        # is still False on it so its _preprocess_raw passes through and LOF sees
+        # every channel — it is the detector, not a consumer.
+        precar = self.model_copy(update={"car": None}, deep=True)
         events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
         report: list[dict] = []
         seen: set[str] = set()
