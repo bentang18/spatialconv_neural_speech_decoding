@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from speech_decoding.extractors.view import MultiStftView
 
@@ -39,6 +40,10 @@ class _StubEvent:
 
 
 def _view(**kw) -> MultiStftView:
+    # LOF-on now requires a report path (model_validator); inject one for the
+    # wiring tests that aren't specifically exercising that guard.
+    if kw.get("lof_bad_channels") and kw.get("drop_bads") and "lof_report_path" not in kw:
+        kw["lof_report_path"] = "/tmp/_lof_wiring_test.json"
     v = MultiStftView(event_types="Ieeg", **kw)
     v._session_bads = {}  # don't inherit any mutable-default sharing
     return v
@@ -90,11 +95,64 @@ def test_stamp_missing_session_raises_loud() -> None:
         v._stamp_lof_bads(raw, _StubEvent("UNSEEN"))
 
 
-def test_fit_requires_drop_bads() -> None:
-    # lof on but drop_bads off would silently flag-and-never-drop — fail loud.
-    v = _view(lof_bad_channels=True, drop_bads=False)
-    with pytest.raises(ValueError, match="requires drop_bads=True"):
-        v._fit_session_bads(obj=None)  # check fires before any data load
+def test_construction_requires_drop_bads() -> None:
+    # lof on but drop_bads off would silently flag-and-never-drop — fail at
+    # construction, before any run starts.
+    with pytest.raises(ValidationError, match="requires drop_bads=True"):
+        MultiStftView(
+            event_types="Ieeg", lof_bad_channels=True, drop_bads=False,
+            lof_report_path="/tmp/x.json",
+        )
+
+
+def test_construction_requires_report_path() -> None:
+    # lof on but no report path would drop-but-never-report — defeats the Ben
+    # review gate. Fail at construction.
+    with pytest.raises(ValidationError, match="requires lof_report_path"):
+        MultiStftView(event_types="Ieeg", lof_bad_channels=True, drop_bads=True)
+
+
+def test_lof_off_needs_no_report_path() -> None:
+    # The default (LOF off) must construct freely with no report path — the
+    # maiden run depends on this.
+    v = MultiStftView(event_types="Ieeg")
+    assert v.lof_bad_channels is False
+    assert v.lof_report_path is None
+
+
+def test_report_path_excluded_from_cache_uid_but_data_knobs_kept() -> None:
+    # lof_report_path is output-location only → must NOT perturb the STFT cache
+    # uid; the data-determining lof_* knobs MUST stay in it.
+    v = _view(lof_bad_channels=True, drop_bads=True)
+    excluded = v._exclude_from_cache_uid()
+    assert "lof_report_path" in excluded
+    for data_knob in ("lof_bad_channels", "lof_threshold", "lof_n_neighbors", "lof_ch_type"):
+        assert data_knob not in excluded
+
+
+def test_fit_bads_armed_before_super_prepare(monkeypatch) -> None:
+    # THE GATE-C SHOWSTOPPER PIN: _fit_session_bads + _bads_ready=True must run
+    # BEFORE super().prepare(), or super().prepare()'s _get_data materialization
+    # memoizes the pre-LOF (no-drop) raw under a key blind to _bads_ready and the
+    # drop is silently defeated. Record call order; assert fit-then-super and that
+    # bads are armed by the time super().prepare runs.
+    from neuralset.extractors import neuro
+
+    v = _view(lof_bad_channels=True, drop_bads=True)
+    calls: list[str] = []
+
+    def fake_fit(_obj):
+        calls.append("fit")
+
+    def fake_super_prepare(self, _obj):
+        # the invariant super().prepare relies on: bads already armed here.
+        calls.append(f"super(bads_ready={self._bads_ready})")
+
+    monkeypatch.setattr(v, "_fit_session_bads", fake_fit)
+    monkeypatch.setattr(neuro.MneRaw, "prepare", fake_super_prepare)
+    v.prepare(obj=None)
+
+    assert calls == ["fit", "super(bads_ready=True)"]
 
 
 def test_precar_sibling_disables_car_and_carries_private_state() -> None:

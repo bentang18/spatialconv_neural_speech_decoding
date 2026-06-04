@@ -67,6 +67,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from neuralset.base import TimedArray
+from pydantic import model_validator
 
 from speech_decoding.extractors.quality import lof_bad_channel_mask
 from speech_decoding.extractors.reference import CARIeegExtractor
@@ -466,16 +467,21 @@ class MultiStftView(CARIeegExtractor):
     # D2 (T1.7, project_v14_preproc_recipe_2026_05_12 L.0 amendment): per-session
     # MNE-LOF bad-channel detection. When True, ``prepare`` runs
     # ``find_bad_channels_lof(threshold, n_neighbors)`` once per session over that
-    # session's FILTERED, PRE-CAR voltage (recipe order HPF → notch → LOF →
-    # shaftCAR: a bad channel must not pollute the CAR reference, and CAR's
-    # rank-deficiency would distort LOF's neighbor structure), records the flagged
-    # channels, and ``_preprocess_raw`` then stamps ``raw.info["bads"]`` per clip so
-    # the inherited ``drop_bads`` step removes them BEFORE shaft-CAR. Requires
-    # ``drop_bads=True``. Default False so the synthetic capstone / fast_dev_run
-    # smoke is untouched; the BT dispatch flips it True. BEN REVIEW GATE: the
-    # per-session/per-subject drop counts are logged loud and (if
-    # ``lof_report_path`` is set) written to JSON for review before this is relied
-    # on in a scored run ("report back how many channels are dropped").
+    # session's FILTERED, PRE-CAR voltage (the fit loads a ``car=None`` sibling, so
+    # LOF input = notch+HPF applied, no CAR: a bad channel must not pollute the CAR
+    # reference, and CAR's rank-deficiency would distort LOF's neighbor structure),
+    # records the flagged channels, and ``_preprocess_raw`` then stamps
+    # ``raw.info["bads"]`` per clip so the inherited ``drop_bads`` step removes them
+    # BEFORE shaft-CAR. So the LOF-relevant order holds: filtered → LOF → drop →
+    # shaftCAR. NOTE the inherited clip path (CARIeegExtractor._preprocess_raw)
+    # applies shaft-CAR BEFORE notch/HPF (pick → drop_bads → CAR → MneRaw filter) —
+    # a pre-existing CAR-before-filter ordering, harmless because CAR and the linear
+    # notch/HPF commute, flagged to Ben separately. Requires ``drop_bads=True`` and
+    # ``lof_report_path`` (model_validator). Default False so the synthetic capstone
+    # / fast_dev_run smoke is untouched; the BT dispatch flips it True. BEN REVIEW
+    # GATE: the per-session/per-subject drop counts are logged loud and written to
+    # JSON for review before this is relied on in a scored run ("report back how
+    # many channels are dropped").
     lof_bad_channels: bool = False
     lof_threshold: float = 1.5
     lof_n_neighbors: int = 20
@@ -485,6 +491,35 @@ class MultiStftView(CARIeegExtractor):
     # names. Mirrors the ``_session_stats`` fill-in-prepare / read-per-clip pattern.
     _session_bads: dict[str, list[str]] = {}
     _bads_ready: bool = False
+
+    @model_validator(mode="after")
+    def _validate_lof_config(self) -> "MultiStftView":
+        # Fail at construction, not silently mid-run. LOF that flags-but-never-
+        # drops, or drops-but-never-reports, both defeat the point.
+        if self.lof_bad_channels:
+            if not self.drop_bads:
+                raise ValueError(
+                    "MultiStftView.lof_bad_channels=True requires drop_bads=True "
+                    "so the LOF-flagged channels are actually removed before "
+                    "shaft-CAR (otherwise LOF flags but never drops)."
+                )
+            if not self.lof_report_path:
+                raise ValueError(
+                    "MultiStftView.lof_bad_channels=True requires lof_report_path "
+                    "set: the per-session/per-subject drop counts MUST be written "
+                    "to JSON for the Ben review gate ('report back how many "
+                    "channels are dropped'). Set a run-scoped path."
+                )
+        return self
+
+    def _exclude_from_cache_uid(self) -> list[str]:
+        # ``lof_report_path`` is an OUTPUT-LOCATION knob, not data-determining: two
+        # runs writing the report to different paths must hit the SAME multi-TB
+        # STFT cache. The other ``lof_*`` fields DO determine which channels get
+        # dropped, so they stay in the uid. (Default-OFF ``lof_bad_channels`` is
+        # excluded by exclude_defaults, so for the maiden run none of this perturbs
+        # the existing cache uid at all.)
+        return super()._exclude_from_cache_uid() + ["lof_report_path"]
 
     def n_time_bins_for_duration(self, duration_s: float) -> int:
         """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
@@ -580,18 +615,29 @@ class MultiStftView(CARIeegExtractor):
         return normalizer.transform(spec)
 
     def prepare(self, obj) -> None:  # type: ignore[override]
-        # ``super().prepare`` populates ``_channels`` (needed by the fit's
-        # global-channel scatter) and fires a shape-probe clip; the probe runs
-        # with ``_stats_ready`` still False so it skips robust-z safely. Only
-        # after the fit do we arm ``_stats_ready`` so real clips normalize.
-        super().prepare(obj)
-        # LOF first (and arm it) so the robust-z fit below already sees the
-        # good-channel set its clips will: bad channels are dropped before CAR in
-        # both the fit's ``_get_data`` and the per-clip apply, keeping the two
-        # byte-identical.
+        # ORDER IS LOAD-BEARING (Gate-C showstopper, 2026-06-03). ``self._get_data``
+        # is an exca-cached property; ``super().prepare`` materializes it for EVERY
+        # session (to populate ``_channels`` and fire a shape-probe). The cache key
+        # does NOT include ``_bads_ready``, so if that first materialization ran
+        # with bads un-armed it would memoize the PRE-LOF (no-drop) raw per session
+        # and every later apply/robust-z fit would read it stale — LOF detected,
+        # logged, but never actually dropped. So fit + ARM the bad sets FIRST: then
+        # the very first ``self._get_data`` already stamps+drops, and the cache,
+        # ``_channels``, the robust-z fit, and per-clip apply are all consistent.
+        # The fit itself reads a ``car=None`` SIBLING (distinct cache namespace —
+        # ``car`` is in the uid), so it cannot poison self's cache. It needs only
+        # ``_event_types_helper`` (set in __init__) and ``_get_data`` (works pre-
+        # prepare — prepare is its own first caller), NOT ``_channels``, so it is
+        # safe to run before ``super().prepare``.
         if self.lof_bad_channels:
             self._fit_session_bads(obj)
             self._bads_ready = True
+        # ``super().prepare`` populates ``_channels`` (needed by the robust-z fit's
+        # global-channel scatter) and fires a shape-probe clip; the probe runs with
+        # ``_stats_ready`` still False so it skips robust-z safely (it DOES drop LOF
+        # bads now, which is exactly what we want cached). Only after the fit do we
+        # arm ``_stats_ready`` so real clips normalize.
+        super().prepare(obj)
         if self.session_robust_z:
             self._fit_session_robust_z(obj)
             self._stats_ready = True
@@ -748,8 +794,15 @@ class MultiStftView(CARIeegExtractor):
             self._session_bads[key] = bad_names
             try:
                 subject_id = int(event._get_field_or_extra("subject_id"))
-            except Exception:
+            except (KeyError, AttributeError, ValueError, TypeError) as exc:
+                # Don't silently bucket under -1: a missing/garbled subject_id
+                # corrupts the per-subject drop attribution the Ben gate reads.
                 subject_id = -1
+                logger.warning(
+                    "MNE-LOF: could not resolve subject_id for session %s (%s); "
+                    "its %d bad channels are attributed to subject_id=-1",
+                    key, exc, len(bad_names),
+                )
             report.append({
                 "session": key,
                 "subject_id": subject_id,
