@@ -86,6 +86,7 @@ def test_rope_prefix_property_across_phases() -> None:
     common = dict(
         d_model=8, n_freq_bins=6, k_parcels=6,
         n_heads=2, depth_self_attn=1,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
     )
     big = V14ParcelPerceiverModel(n_time_bins=8, **common).eval()
     small = V14ParcelPerceiverModel(n_time_bins=4, **common).eval()

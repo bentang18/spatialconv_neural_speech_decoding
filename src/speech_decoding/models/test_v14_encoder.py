@@ -31,8 +31,11 @@ from speech_decoding.studies.braintreebank.anatomy import DEFAULT_SUPPORT_BIAS_E
 
 
 def _tiny_kwargs() -> dict:
-    # FE-02: defaults give F_p=2, T_p=2 with kernel=(3,2), stride=(3,2).
+    # FE-02: tiny config uses kernel=(3,2), stride=(3,2) → F_p=2, T_p=2.
     # n_freq_bins=6: F_p = (6-3)/3 + 1 = 2.  n_time_bins=4: T_p = (4-2)/2 + 1 = 2.
+    # patch_kernel_freq=3 explicit: the FE-RAW-1 default is 5 (for the F=50 raw
+    # |STFT| front end, which requires n_freq_bins=50) — these smoke configs run
+    # the kernel-3 path on a tiny F.
     return {
         "n_freq_bins": 6,
         "n_time_bins": 4,
@@ -41,6 +44,7 @@ def _tiny_kwargs() -> dict:
         "n_heads": 4,
         "depth_self_attn": 2,
         "m_sub_slots": 2,
+        "patch_kernel_freq": 3,
     }
 
 
@@ -77,6 +81,50 @@ def test_v14_fe02_patch_stem_shape_and_non_overlap() -> None:
     assert stem.conv.stride == (3, 2)
     assert stem.conv.kernel_size == (3, 2)
     assert stem.conv.padding == (0, 0)
+
+
+def test_v14_fe_raw1_stem_f50_kernel5_gives_fp10_tp8_parity_with_f30() -> None:
+    """FE-RAW-1: the raw front end (F=50) with a freq kernel/stride of 5 yields
+    F_p = (50-5)//5 + 1 = 10 — byte-shape-identical to the demoted F=30 const-Q
+    stem (kernel 3 → F_p = (30-3)//3 + 1 = 10). The token grid F_p × T_p is
+    unchanged, so every downstream shape (freq_embed, token blocks, RoPE) is
+    preserved across the front-end swap.
+    """
+    raw_stem = _PatchStem(d_model=32, kernel_freq=5, kernel_time=2)
+    fbank_stem = _PatchStem(d_model=32, kernel_freq=3, kernel_time=2)
+    assert raw_stem.conv.kernel_size == (5, 2)
+    assert raw_stem.conv.stride == (5, 2)
+    assert raw_stem.n_freq_patches(50) == 10
+    assert fbank_stem.n_freq_patches(30) == 10
+    assert raw_stem.n_freq_patches(50) == fbank_stem.n_freq_patches(30)
+
+    B, C, T = 2, 5, 17  # 1 s @ hop=128, 2048 Hz
+    raw_out = raw_stem(torch.randn(B, C, 50, T))
+    fbank_out = fbank_stem(torch.randn(B, C, 30, T))
+    assert raw_out.shape == fbank_out.shape == (B, C, 10, 8, 32)
+
+
+def test_v14_fe_raw1_model_default_kernel5_requires_f50() -> None:
+    """FE-RAW-1: the production default ``patch_kernel_freq=5`` is paired with
+    ``n_freq_bins=50``. A mismatched F must raise (catches a stale F=30 config
+    silently feeding the raw stem), and the F=50 raw default builds + forwards."""
+    with pytest.raises(ValueError, match="n_freq_bins=50"):
+        V14ParcelPerceiverModel(
+            n_freq_bins=30, n_time_bins=8, k_parcels=6,
+            d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=1,
+        )
+
+    model = V14ParcelPerceiverModel(
+        n_freq_bins=50, n_time_bins=8, k_parcels=6,
+        d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=1,
+    )
+    assert model.n_freq_patches == 10
+    B, C = 2, 4
+    electrodes = torch.randn(B, C, 8, 50)
+    support = torch.zeros(B, C, 6)
+    support[..., 0] = 1.0
+    out = model(electrodes, support)
+    assert out.shape == (B, 6 * 1, 4, 32)
 
 
 def test_v14_fe03_per_patch_freq_embedding() -> None:
@@ -142,13 +190,17 @@ def test_v14_fe04_token_blocks_default_to_six() -> None:
     Verifies the V14ParcelPerceiver config + the model defaults agree on
     n_token_blocks=6 (was N=4 under v3 factorized t×f).
     """
-    cfg = V14ParcelPerceiver(n_freq_bins=12, n_time_bins=8, k_parcels=6)
+    cfg = V14ParcelPerceiver(
+        n_freq_bins=12, n_time_bins=8, k_parcels=6, patch_kernel_freq=3,
+    )
     assert cfg.n_token_blocks == 6, (
         f"FE-04: V14ParcelPerceiver default n_token_blocks=6; got "
         f"{cfg.n_token_blocks}"
     )
     # Constructed model carries the same default.
-    model = V14ParcelPerceiverModel(n_freq_bins=12, n_time_bins=8, k_parcels=6)
+    model = V14ParcelPerceiverModel(
+        n_freq_bins=12, n_time_bins=8, k_parcels=6, patch_kernel_freq=3,
+    )
     assert len(model.token_blocks) == 6
 
 
@@ -621,6 +673,7 @@ def test_v14_config_build_default_readout_is_pma_mean_linear() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
     )
     assert cfg.readout == "pma_mean_linear"
     model = cfg.build(n_classes=3)
@@ -638,6 +691,7 @@ def test_v14_config_build_pma_flatten_readout_sister() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
         readout="pma_flatten_linear",
     )
     model = cfg.build(n_classes=3)
@@ -655,6 +709,7 @@ def test_v14_config_build_pma_timeattn_readout_sister() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
         readout="pma_timeattn_linear",
     )
     model = cfg.build(n_classes=3)
@@ -671,6 +726,7 @@ def test_v14_config_build_attentive_readout_sister() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
         readout="attentive",
     )
     model = cfg.build(n_classes=3)
@@ -686,6 +742,7 @@ def test_v14_config_build_meanpool_readout_baseline() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
         readout="meanpool",
     )
     model = cfg.build(n_classes=3)
@@ -704,11 +761,13 @@ def test_v14_config_build_meanpool_readout_baseline() -> None:
 
 def test_v14_config_build_param_budget_at_first_pass_defaults() -> None:
     """First-pass defaults: d=256, heads=8, depth=6, M=1 (B29 Item 13 default;
-    was M=4 pre-B29), K=80, T=17, F=38, n_classes=10 → ~13M params, comfortably
-    under the 30M cap (also under the 25M Stage-2-mid-sweep cell of the
-    13/25/40M sizing sweep per project_v14_scaling_law_param_sizing_2026_05_20)."""
+    was M=4 pre-B29), K=80, T=17, n_classes=10 → ~13M params, comfortably under
+    the 30M cap (also under the 25M Stage-2-mid-sweep cell of the 13/25/40M
+    sizing sweep per project_v14_scaling_law_param_sizing_2026_05_20). FE-RAW-1
+    (2026-06-04): F=50 raw |STFT| front end at the kernel-5 patch-stem default
+    (F_p=10) — the freq_embed table is F_p·d, so the budget is unchanged."""
     cfg = V14ParcelPerceiver(
-        n_freq_bins=38,
+        n_freq_bins=50,
         n_time_bins=17,
         k_parcels=80,
     )
@@ -741,6 +800,7 @@ def test_v14_config_build_returns_callable_module() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
     )
     model = cfg.build(n_classes=3)
     assert isinstance(model, V14ParcelPerceiverWithHead)
@@ -760,6 +820,7 @@ def test_v14_head_wrapper_forwards_b29_conditioning_to_encoder() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
         subtype_embed_enabled=True,                  # post 5/28 flip: opt in
         ref_embed_enabled=True,                      # post B32 flip: opt in
     )
@@ -851,6 +912,7 @@ def test_v14_b28_cross_attn_config_propagates_through_build() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=4, m_sub_slots=2,
+        patch_kernel_freq=3,
         cross_attn_positions=[0, 3],
     )
     model = cfg.build(n_classes=3)
@@ -1142,7 +1204,7 @@ def test_v14_b29_subtype_ref_config_propagates_through_build() -> None:
     survives the cfg → encoder boundary)."""
     cfg = V14ParcelPerceiver(
         n_freq_bins=6, n_time_bins=4, k_parcels=6,
-        d_model=32, n_heads=4, depth_self_attn=2,
+        d_model=32, n_heads=4, depth_self_attn=2, patch_kernel_freq=3,
         subtype_vocab=3, subtype_embed_enabled=False,
         ref_embed_enabled=True, ref_embed_reuse_kv=False,
     )
@@ -1442,6 +1504,7 @@ def _c5_fixture():
     kw = {
         "n_freq_bins": 30, "n_time_bins": 8, "k_parcels": 6,
         "d_model": 32, "n_heads": 4, "depth_self_attn": 2, "m_sub_slots": 2,
+        "patch_kernel_freq": 3,  # FE-RAW-1: F=30 const-Q sister kernel-3 path
     }
     model = V14ParcelPerceiverModel(**kw)
     model.eval()

@@ -195,6 +195,7 @@ def test_encoder_covered_latents_invariant_to_invalid_parcel_embeddings() -> Non
     encoder = V14ParcelPerceiverModel(
         n_freq_bins=3, n_time_bins=5, k_parcels=3,
         d_model=D_MODEL, n_heads=N_HEADS, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=3 config
     )
     encoder.eval()
 
@@ -242,6 +243,7 @@ def test_wrapper_output_invariant_to_invalid_parcel_embeddings() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=3, n_time_bins=5, k_parcels=3,
         d_model=D_MODEL, n_heads=N_HEADS, depth_self_attn=2, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=3 config
     )
     model = cfg.build(n_outputs=3)
     model.eval()

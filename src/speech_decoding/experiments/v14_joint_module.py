@@ -30,9 +30,10 @@ separate ``ln_frame`` head (B6 / B36 §4 canonical V-JEPA target-norm). The
 predictor is student-only (never EMA-mirrored).
 
 EMA discipline (B26 lock 2026-05-27 PM): fixed τ=0.99925 via
-:func:`speech_decoding.ssl.ema.fixed_ema_schedule`; ``on_train_batch_end``
-applies :meth:`EmaTeacher.update_from` so the teacher trails the student
-exactly one optimiser step behind.
+:func:`speech_decoding.ssl.ema.fixed_ema_schedule`; ``on_before_zero_grad``
+applies :meth:`EmaTeacher.update_from` once per optimiser step (#46 — moved
+off the per-micro-batch ``on_train_batch_end`` so accumulation can't apply
+τ^K) so the teacher trails the student exactly one optimiser step behind.
 
 Batch contract (B30 single source of truth) — ``batch.data`` keys read::
 
@@ -933,14 +934,31 @@ class V14JointBrainModule(pl.LightningModule):
             on_step=True,
         )
 
-    def on_train_batch_end(
-        self,
-        outputs: tp.Any,           # noqa: ARG002 — Lightning hook signature
-        batch: tp.Any,             # noqa: ARG002
-        batch_idx: int,            # noqa: ARG002
+    def on_before_zero_grad(
+        self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature
     ) -> None:
-        # B26 EMA step. ``update_from`` advances the schedule step
-        # internally; coeff is fixed at τ=0.99925 under the B26 lock.
+        # B26 EMA step, fired once per OPTIMISER step. Lightning's
+        # ``on_before_zero_grad`` runs inside the optimiser closure and is
+        # SKIPPED on the non-stepping micro-batches of an accumulation window
+        # (``automatic.py``: the zero-grad fn is ``None`` unless the batch
+        # closes a step), so it fires exactly once per optimiser step
+        # regardless of ``accumulate_grad_batches``. It runs BEFORE the
+        # current step's parameter update, so it reads the most-recent
+        # fully-updated student (the prior optimiser step's post-update
+        # weights) — the teacher trails exactly one optimiser step behind,
+        # even under accumulation. (The final step is folded in at the next
+        # hook / phase-boundary re-sync; negligible at 1−τ=7.5e-4.)
+        #
+        # #46: this used to live in ``on_train_batch_end``, which fires once
+        # per MICRO-batch. At ``accumulate_grad_batches=K`` that applied K EMA
+        # updates per optimiser step, making the effective momentum τ^K instead
+        # of τ (the teacher trailed K× too fast) — silently changing the SSL
+        # dynamics under accumulation. At accum=1 the two hooks are equivalent
+        # (both fire once, after the step), so this is a no-op for the
+        # non-accumulating runs.
+        #
+        # ``update_from`` advances the schedule step internally; coeff is fixed
+        # at τ=0.99925 under the B26 lock.
         self.teacher.update_from(self.student)
 
     def _phase_param_groups(self) -> list[tp.Any]:

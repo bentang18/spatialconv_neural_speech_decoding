@@ -106,6 +106,71 @@ MULTI_STFT_HALF_BW_OCTAVES: float = 0.5            # triangular kernel half-widt
 MULTI_STFT_ROUTING: tuple[int, ...] = tuple([0] * 15 + [1] * 7 + [2] * 8)
 
 
+# ---------------------------------------------------------------------------
+# FE-RAW-1 (2026-06-04): raw |STFT| bins replace the const-Q filterbank as the
+# live front end. Spec: reports/fe_raw_frontend_handoff_2026_06_04.md §4.2.
+#
+# Non-overlapping crossovers at 32 / 152 Hz, drop-delta floor 4 Hz, cap 192 Hz.
+# Each (nperseg, k_start, k_end) selects the inclusive rfft-bin slice for one
+# source STFT; ``k = f / Δf`` with Δf = sample_rate / nperseg. At 2048 Hz:
+#   low  (Δf=2)  k2 (4 Hz)  … k15 (30 Hz)   → 14 bins
+#   mid  (Δf=4)  k8 (32 Hz) … k37 (148 Hz)  → 30 bins
+#   hi   (Δf=8)  k19 (152)  … k24 (192 Hz)  → 6 bins
+# Concatenation order low → mid → hi gives a strictly-increasing, piecewise-
+# uniform (2/4/8 Hz) freq axis of length F_RAW = 50.
+# ---------------------------------------------------------------------------
+F_RAW: int = 50
+# (stft_idx, k_start, k_end inclusive). stft_idx 0=low(1024) 1=mid(512) 2=hi(256).
+MULTI_STFT_RAW_BINS: tuple[tuple[int, int, int], ...] = (
+    (0, 2, 15),
+    (1, 8, 37),
+    (2, 19, 24),
+)
+
+
+def multi_stft_raw_bin_freqs_hz(
+    *,
+    sample_rate: int = 2048,
+    nperseg_low: int = 1024,
+    nperseg_mid: int = 512,
+    nperseg_hi: int = 256,
+    raw_bins: tuple[tuple[int, int, int], ...] = MULTI_STFT_RAW_BINS,
+) -> torch.Tensor:
+    """Center frequencies of the F=50 raw-|STFT| bins, in concat order
+    (low → mid → hi). Strictly increasing by construction (§4.2)."""
+    nperseg_by_stft = {0: nperseg_low, 1: nperseg_mid, 2: nperseg_hi}
+    freqs: list[float] = []
+    for s_idx, k0, k1 in raw_bins:
+        rfftfreq = torch.fft.rfftfreq(nperseg_by_stft[s_idx], d=1.0 / sample_rate)
+        freqs.extend(float(rfftfreq[k]) for k in range(k0, k1 + 1))
+    return torch.tensor(freqs)
+
+
+def multi_stft_raw_valid_bin_mask(
+    *,
+    passband_low_hz: float,
+    passband_high_hz: float,
+    sample_rate: int = 2048,
+    nperseg_low: int = 1024,
+    nperseg_mid: int = 512,
+    nperseg_hi: int = 256,
+    raw_bins: tuple[tuple[int, int, int], ...] = MULTI_STFT_RAW_BINS,
+) -> torch.Tensor:
+    """Per-corpus valid-bin mask for the raw front end (FE-RAW-1 §4.4) — the
+    raw analog of :func:`multi_stft_valid_bin_mask`. A raw bin is valid iff its
+    center frequency lies in ``[passband_low_hz, passband_high_hz]`` (point-
+    frequency test, replacing the filterbank's triangular-overlap criterion).
+
+    BT / D-cohort (broadband) → all 50 valid. SWEC / AJILE12 (≤ 120 Hz) → 37
+    valid (low 14 + mid k8–k30 = 32–120 Hz) / 13 invalid (mid k31–k37 + hi).
+    """
+    freqs = multi_stft_raw_bin_freqs_hz(
+        sample_rate=sample_rate, nperseg_low=nperseg_low,
+        nperseg_mid=nperseg_mid, nperseg_hi=nperseg_hi, raw_bins=raw_bins,
+    )
+    return (freqs >= passband_low_hz) & (freqs <= passband_high_hz)
+
+
 def multi_stft_bin_centers_hz(
     *,
     n_bins: int = MULTI_STFT_N_BINS,
@@ -287,6 +352,62 @@ def _multi_stft_view(
     return out
 
 
+def _multi_stft_raw_view(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    hop_length: int,
+    nperseg_low: int,
+    nperseg_mid: int,
+    nperseg_hi: int,
+    raw_bins: tuple[tuple[int, int, int], ...],
+    log_eps: float,
+    apply_log: bool = False,
+) -> torch.Tensor:
+    """FE-RAW-1 (§4.2): raw |STFT| bins, no filterbank.
+
+    Runs the same three STFTs as :func:`_multi_stft_view` (Hann, ``center=True``,
+    ``normalized=False``, value axis = raw ``|STFT|``) and concatenates the
+    exact rfft-bin slices in ``raw_bins`` (inclusive k ranges), low → mid → hi.
+    Input ``(..., C, T_samples)`` → output ``(..., C, F_RAW, T_bin)`` with
+    ``T_bin`` shared across STFTs (common hop). The STFT call is byte-identical
+    to the const-Q path; only the bin *selection* differs.
+    """
+    nps_by_stft = {0: nperseg_low, 1: nperseg_mid, 2: nperseg_hi}
+    mag_stfts: dict[int, torch.Tensor] = {}
+    for s_idx, nps in nps_by_stft.items():
+        win = torch.hann_window(nps, device=waveform.device)
+        wf = waveform
+        if wf.shape[-1] < nps:
+            # NeuralSet's prepare() probes with sub-second inputs — pad so
+            # torch.stft(center=True) can reflect-pad without crashing. Real
+            # 1 s windows never hit this branch.
+            wf = torch.nn.functional.pad(wf, (0, nps - wf.shape[-1]))
+        spec = torch.stft(
+            wf,
+            n_fft=nps,
+            hop_length=hop_length,
+            win_length=nps,
+            window=win,
+            return_complex=True,
+            normalized=False,
+            center=True,
+        )
+        mag_stfts[s_idx] = torch.abs(spec)                                # (..., F_stft, T)
+
+    # Common-hop time axes should match; trim the rare center-pad off-by-one.
+    T = min(int(mag_stfts[s].shape[-1]) for s in (0, 1, 2))
+
+    bands: list[torch.Tensor] = []
+    for s_idx, k0, k1 in raw_bins:
+        bands.append(mag_stfts[s_idx][..., k0 : k1 + 1, :T])              # (..., k1-k0+1, T)
+    out = torch.cat(bands, dim=-2)                                        # (..., F_RAW, T)
+
+    if apply_log:
+        return torch.log(out + log_eps)
+    return out
+
+
 def _log_stft_view(
     waveform: torch.Tensor,
     *,
@@ -406,26 +527,39 @@ class LogStftView(CARIeegExtractor):
 
 
 class MultiStftView(CARIeegExtractor):
-    """v14 5/22 Multi-STFT front-end on top of CARIeegExtractor's waveform
-    pipeline. Replaces ``LogStftView`` as the v14 default; single-STFT lives
-    on as the F-single-STFT sister cell.
+    """v14 Multi-STFT front-end on top of CARIeegExtractor's waveform pipeline.
+    Replaces ``LogStftView`` as the v14 default; single-STFT lives on as the
+    F-single-STFT sister cell.
 
-    Per-event output: ``(C, F=30, T_bin)`` magnitude filterbank, time-last.
-    Three internal STFTs at common hop=128 @ 2048 Hz (Nperseg=1024/512/256)
-    feed a 30-bin ⅓-octave filterbank centered at ``2^(k/3)`` Hz for
-    ``k ∈ [0, 30)`` (~1 Hz → ~813 Hz). Routing: k0–k14 from low, k15–k21 from
-    mid, k22–k29 from hi (see ``MULTI_STFT_ROUTING``). Hop=128 matches
-    iMINDBench's standardized Multi-STFT (hop=128 across all three nperseg) and
-    yields a 16 Hz front-end frame rate; the downstream (3,2)-stride patch stem
-    halves the time axis to an 8 Hz latent, matching the Whisper teacher (50→8
-    Hz pool, B33) with identity passthrough at Phase-3 (hop=128 re-lock
-    2026-06-03, reverses the B20 v4 hop=256 token-halving choice).
+    FE-RAW-1 (2026-06-04, ``reports/fe_raw_frontend_handoff_2026_06_04.md``):
+    ``front_end="raw"`` (default) emits the §4.2 RAW ``|STFT|`` bins — F=50, no
+    filterbank — non-overlapping crossovers at 32/152 Hz, drop-delta 4 Hz, cap
+    192 Hz. The FE-filterbank-sweep (2026-06-03) showed the const-Q filterbank
+    hurts cross-subject transfer (RANK4 −0.013…−0.019), so the lossy pooling is
+    dropped and the learned Conv2d patch stem does the pooling instead. The
+    const-Q ⅓-octave filterbank is DEMOTED, not deleted — ``front_end="fbank"``
+    recovers it (the F=30 P1 low-data-regularizer sister, handoff §8).
+
+    Per-event output:
+      * raw   → ``(C, F=50, T_bin)`` raw |STFT| bins, time-last.
+      * fbank → ``(C, F=30, T_bin)`` ⅓-octave magnitude filterbank, time-last
+                (k0–k14 from low, k15–k21 from mid, k22–k29 from hi; centered at
+                ``2^(k/3)`` Hz, ~1 → ~813 Hz; see ``MULTI_STFT_ROUTING``).
+
+    Three internal STFTs at common hop=128 @ 2048 Hz (Nperseg=1024/512/256).
+    Hop=128 matches iMINDBench's standardized Multi-STFT and yields a 16 Hz
+    front-end frame rate; the downstream patch stem halves the time axis to an
+    8 Hz latent, matching the Whisper teacher (50→8 Hz pool, B33) with identity
+    passthrough at Phase-3 (hop=128 re-lock 2026-06-03).
 
     5/25 swap: ``apply_log`` defaults to ``False`` — iMINDBench-parity raw
     magnitude. Set ``apply_log=True`` for the F-log-amplitude sister cell
     (pre-5/25 default behavior).
     """
 
+    # FE-RAW-1: front-end mode. "raw" (default) = F=50 raw |STFT| bins; "fbank"
+    # = the demoted F=30 const-Q filterbank sister.
+    front_end: tp.Literal["raw", "fbank"] = "raw"
     sample_rate_hz: int = 2048
     # FE-01 (hop=128 re-lock 2026-06-03, reverses B20 v4 hop=256): hop=128 @
     # 2048 Hz → 16 Hz front-end frame rate. Matches iMINDBench's standardized
@@ -467,6 +601,9 @@ class MultiStftView(CARIeegExtractor):
     # Pydantic doesn't allow tuple[int, ...] as a default freely — keep
     # the routing as a class-level constant pulled from the module.
     fbank_routing: tp.ClassVar[tuple[int, ...]] = MULTI_STFT_ROUTING
+    # FE-RAW-1: raw-bin selection (stft_idx, k_start, k_end inclusive) for the
+    # ``front_end="raw"`` path. Class-level (data-determining but fixed).
+    raw_bins: tp.ClassVar[tuple[tuple[int, int, int], ...]] = MULTI_STFT_RAW_BINS
     # Per-session frozen normalizers, keyed by ``event._splittable_event_uid()``
     # (the session key the cached raw is keyed on). Mutated once in ``prepare`` on
     # the main process, read per-clip in ``_get_timed_array`` — the same
@@ -553,10 +690,23 @@ class MultiStftView(CARIeegExtractor):
     def _spec_from_waveform(
         self, waveform_t: torch.Tensor, sample_rate: int,
     ) -> torch.Tensor:
-        """``(C, T)`` waveform → ``(C, F, T_bin)`` filterbank, with this view's
-        exact STFT/routing config. Single source of truth shared by the per-clip
-        path and the session-stat fit, so fit-time and apply-time features are
-        byte-identical."""
+        """``(C, T)`` waveform → ``(C, F, T_bin)``, with this view's exact
+        STFT config. ``front_end="raw"`` (default) emits the F=50 raw |STFT|
+        bins; ``front_end="fbank"`` the demoted F=30 const-Q filterbank. Single
+        source of truth shared by the per-clip path and the session-stat fit, so
+        fit-time and apply-time features are byte-identical."""
+        if self.front_end == "raw":
+            return _multi_stft_raw_view(
+                waveform_t,
+                sample_rate=sample_rate,
+                hop_length=self.hop_length,
+                nperseg_low=self.nperseg_low,
+                nperseg_mid=self.nperseg_mid,
+                nperseg_hi=self.nperseg_hi,
+                raw_bins=self.raw_bins,
+                log_eps=self.log_eps,
+                apply_log=self.apply_log,
+            )
         return _multi_stft_view(
             waveform_t,
             sample_rate=sample_rate,

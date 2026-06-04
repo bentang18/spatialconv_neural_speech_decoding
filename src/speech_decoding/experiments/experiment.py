@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from neuraltrain import BaseLoss, BaseMetric, BaseModelConfig, LightningOptimizer
 from neuraltrain.utils import BaseExperiment, CsvLoggerConfig, WandbLoggerConfig
 
+from speech_decoding.experiments.collapse_guard import CollapseGuardCallback
 from speech_decoding.experiments.data import Data
 from speech_decoding.experiments.experiment_logging import ExperimentLogger
 from speech_decoding.experiments.module import BrainModule
@@ -91,6 +92,13 @@ class Experiment(BaseExperiment):
     limit_test_batches: int | float | None = None
     early_stopping_patience: int | None = None
     checkpoint_monitor: str = "val_loss"
+    collapse_guard: bool = True
+    # Validation cadence as a step count. On a ``max_steps``-budgeted SSL
+    # phase that ends mid-epoch (1500 steps < one BT-lite epoch), epoch-
+    # boundary validation never runs, so the collapse-guard soft panel
+    # would never evaluate. Setting this forces validation every N steps.
+    # ``None`` → Lightning's default (epoch-boundary only).
+    val_check_interval: int | float | None = None
     csv_config: CsvLoggerConfig | None = None
     wandb_config: WandbLoggerConfig | None = None
     # B36 WS-E (E3/E4): cross-phase checkpoint handoff. ``pretrained_ckpt``
@@ -190,6 +198,14 @@ class Experiment(BaseExperiment):
                     patience=self.early_stopping_patience,
                 )
             )
+        # #54: active collapse/divergence kill switch. Disarmed under
+        # fast_dev_run (a 1-batch smoke would never reach the sustain
+        # window and the soft alarms are noisy on a single batch); the
+        # non-finite-loss catch is irrelevant there too. Writes its
+        # diagnosis JSON next to the checkpoints (``root`` may be None on
+        # an infra-less run — the guard still aborts, just skips the file).
+        if self.collapse_guard and not self.fast_dev_run:
+            callbacks.append(CollapseGuardCallback(artifact_root=root))
         return callbacks
 
     def _trainer(self) -> pl.Trainer:
@@ -208,6 +224,10 @@ class Experiment(BaseExperiment):
             # the full max_steps (estimated_stepping_batches == max_steps).
             kwargs["max_steps"] = self.max_steps
             kwargs["max_epochs"] = -1
+        if self.val_check_interval is not None:
+            # A step-count cadence so the collapse-guard soft panel runs on
+            # a max_steps phase that never reaches an epoch boundary.
+            kwargs["val_check_interval"] = self.val_check_interval
         if self.limit_train_batches is not None:
             kwargs["limit_train_batches"] = self.limit_train_batches
         if self.limit_val_batches is not None:

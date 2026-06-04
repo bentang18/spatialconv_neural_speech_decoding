@@ -12,7 +12,8 @@ import torch
 
 from speech_decoding.bt_alignment.teacher_cache import (
     WhisperFeatureExtractor, write_clip_cache, write_movie_cache,
-    fit_channel_stats, TargetStandardizer,
+    fit_channel_stats, fit_and_save_channel_stats, movie_cache_path,
+    TargetStandardizer,
     DEFAULT_LAYER_MERGE, SINGLE_LAYER_SISTER_INDEX, DEFAULT_TEACHER_HZ, WHISPER_SR,
     WHISPER_ENCODER_WINDOW_S,
 )
@@ -369,6 +370,63 @@ def test_target_standardizer_rejects_mismatched_shapes():
 def test_fit_channel_stats_empty_raises():
     with pytest.raises(ValueError, match="no frames"):
         fit_channel_stats([], d_model=8)
+
+
+def test_fit_and_save_channel_stats_globs_full_corpus_and_saves(tmp_path):
+    """#44 (Ben 2026-06-04): globs the movie_cache_path layout, fits the FULL
+    corpus, saves a loadable {mean, inv_std} == a direct fit over the same
+    caches, and the result feeds TargetStandardizer."""
+    torch.manual_seed(3)
+    model, merge, d = "openai/whisper-large-v3", "mean_all", 16
+    paths = []
+    for m in ("megamind", "venom", "spiderman"):
+        p = movie_cache_path(tmp_path, model, merge, m)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _save_features(p, torch.randn(250, d))
+        paths.append(p)
+
+    out = tmp_path / "channel_stats.pt"
+    stats = fit_and_save_channel_stats(
+        tmp_path, model=model, layer_merge=merge, out_path=out, d_model=d,
+    )
+    assert out.exists()
+    loaded = torch.load(out, weights_only=True)
+    assert torch.equal(loaded["mean"], stats["mean"])
+    # Full-corpus == a direct fit over the same movie caches (all movies).
+    direct = fit_channel_stats(sorted(paths), d_model=d)
+    assert torch.allclose(stats["mean"], direct["mean"])
+    assert torch.allclose(stats["inv_std"], direct["inv_std"])
+    std = TargetStandardizer(loaded["mean"], loaded["inv_std"])
+    assert std(torch.randn(2, 40, d)).shape == (2, 40, d)
+
+
+def test_fit_and_save_channel_stats_excludes_output_file_from_glob(tmp_path):
+    """A re-run must not ingest the saved channel_stats.pt as a movie cache,
+    even when out_path lives in the same dir as the caches (no 'features' key
+    → would KeyError if globbed)."""
+    torch.manual_seed(4)
+    model, merge, d = "m", "mean_all", 8
+    for i in range(2):
+        p = movie_cache_path(tmp_path, model, merge, f"movie_{i}")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _save_features(p, torch.randn(250, d))
+    out = movie_cache_path(tmp_path, model, merge, "movie_0").parent / "channel_stats.pt"
+    first = fit_and_save_channel_stats(
+        tmp_path, model=model, layer_merge=merge, out_path=out, d_model=d,
+    )
+    second = fit_and_save_channel_stats(  # out now exists in the glob dir
+        tmp_path, model=model, layer_merge=merge, out_path=out, d_model=d,
+    )
+    assert torch.equal(first["mean"], second["mean"])
+    assert torch.equal(first["inv_std"], second["inv_std"])
+
+
+def test_fit_and_save_channel_stats_no_caches_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="no movie caches"):
+        fit_and_save_channel_stats(
+            tmp_path, model="absent", layer_merge="mean_all",
+            out_path=tmp_path / "x.pt", d_model=8,
+        )
 
 
 # --- whole-movie teacher cache (T14) -----------------------------------------

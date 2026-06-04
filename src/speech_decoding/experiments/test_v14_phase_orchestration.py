@@ -47,6 +47,7 @@ from speech_decoding.models.v14_encoder import V14ParcelPerceiverModel
 _ENC_KW = dict(
     n_freq_bins=10, n_time_bins=16, k_parcels=6,
     d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=1,
+    patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=10 config
 )
 _BASE_LR = 1e-3
 

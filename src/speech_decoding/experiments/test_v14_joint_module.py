@@ -420,6 +420,40 @@ def test_ema_step_updates_teacher_fixed_tau() -> None:
     torch.testing.assert_close(post, 0.99925 * pre + 0.00075 * 2.0)
 
 
+def test_ema_fires_once_per_optimizer_step_not_per_microbatch() -> None:
+    """#46: the EMA update must live on ``on_before_zero_grad`` — Lightning's
+    once-per-optimiser-step hook (after ``optimizer.step()``, before grads are
+    zeroed) — NOT ``on_train_batch_end``, which fires once per micro-batch.
+
+    Under ``accumulate_grad_batches=K`` the per-micro-batch placement applied K
+    EMA updates per optimiser step, so the effective momentum became τ^K and the
+    teacher trailed K× too fast — silently changing the SSL dynamics. This guards
+    against a revert to the per-micro-batch hook."""
+    module = _make_module()
+    calls = {"n": 0}
+    orig = module.teacher.update_from
+
+    def _counting_update_from(student, **kw):  # instance attr: no self-binding
+        calls["n"] += 1
+        return orig(student, **kw)
+
+    module.teacher.update_from = _counting_update_from  # type: ignore[method-assign]
+
+    # The EMA lives on the once-per-optimiser-step hook.
+    module.on_before_zero_grad(optimizer=None)
+    assert calls["n"] == 1, "on_before_zero_grad must apply exactly one EMA step"
+
+    # It must NOT also fire per micro-batch: the base-class ``on_train_batch_end``
+    # is a no-op, so driving it (as Lightning does every micro-batch) leaves the
+    # teacher untouched. A revert that re-adds the EMA call here would trip this.
+    before = calls["n"]
+    module.on_train_batch_end(outputs=None, batch=None, batch_idx=0)
+    assert calls["n"] == before, (
+        "on_train_batch_end must not apply an EMA step — per-micro-batch updates "
+        "break gradient accumulation (#46): K updates/step ⇒ effective τ^K"
+    )
+
+
 def test_trainable_parameters_include_predictor() -> None:
     """The optimizer scope (``_trainable_parameters``) covers the student
     encoder + the predictor, and excludes the frozen teacher."""

@@ -43,6 +43,7 @@ def _make_tiny_model() -> tuple:
         depth_self_attn=2,
         m_sub_slots=M,
         n_token_blocks=1,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=8 config
     )
     model = cfg.build(n_classes=3)
     model.eval()  # deterministic; we still get grads via .backward()

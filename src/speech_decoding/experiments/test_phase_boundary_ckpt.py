@@ -31,6 +31,7 @@ from speech_decoding.models.v14_encoder import V14ParcelPerceiverModel
 _TINY = dict(
     n_freq_bins=6, n_time_bins=4, k_parcels=6,
     d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+    patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=6 config
 )
 
 

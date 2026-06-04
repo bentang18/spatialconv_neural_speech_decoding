@@ -68,8 +68,11 @@ DEFAULT_N_HEADS = 8
 DEFAULT_M_SUB_SLOTS = 1
 DEFAULT_K_PARCELS = len(V14_DK_PARCEL_LABELS)  # 80
 # WS-C / C2 (B36): default front-end flips single-STFT → Multi-STFT.
-# F=30 ⅓-octave filterbank bins (≈1–813 Hz) → encoder F_p = (30−3)//3+1 = 10.
-DEFAULT_N_FREQ_BINS = 30
+# FE-RAW-1 (2026-06-04): the Multi-STFT default front end is the RAW |STFT|
+# bins (F=50, §4.2), not the const-Q filterbank — encoder F_p = (50−5)//5+1
+# = 10 at the kernel-5 patch stem (byte-shape-identical to the old F=30/kernel-3
+# grid). The F=30 filterbank is the demoted ``front_end="fbank"`` sister.
+DEFAULT_N_FREQ_BINS = 50
 # WS-C / C1 (B36, hop=128 re-lock 2026-06-03): phase-conditional clip window.
 # 5 s SSL clips (P1/P2/P3) → T_p=40; the P4 readout driver passes clip_len=1.0
 # → T_p=8. n_time_bins (the RoPE ceiling) is derived from clip_len × the
@@ -427,14 +430,36 @@ def build_v14_experiment(
     n_epochs: int = DEFAULT_N_EPOCHS,
     # Step budget (SSL/distill phases). None → epoch budget (``n_epochs``).
     max_steps: int | None = None,
+    # Validation cadence as a step count (#54). On a ``max_steps`` SSL phase
+    # that ends mid-epoch, epoch-boundary validation never runs, so the
+    # collapse-guard soft panel would never evaluate. The chain sets this for
+    # the SSL phases; None → Lightning default (epoch-boundary only).
+    val_check_interval: int | float | None = None,
     # Early-stopping patience on ``val_loss``. None → no early-stop (the SSL /
     # distill phases train to a fixed budget; their val loss is a pretext
     # reconstruction/distill objective, NOT the downstream metric, so val-loss-min
     # is the wrong stop signal). The supervised P4 probe sets this — there
     # val_loss IS the downstream task, so val-loss-min is correct.
     early_stopping_patience: int | None = None,
+    # #54 audit M1: the collapse guard is an SSL/distill kill-switch. P4 is a
+    # frozen linear probe that cannot "collapse" in the SSL sense and already
+    # has EarlyStopping on its real downstream val_loss, so the chain disables
+    # the guard there (its loss-blowup criterion would only duplicate
+    # EarlyStopping while risking an exca-cache-poisoning abort on benign
+    # probe over-fit). True for P1/P2/P3a/P3b.
+    collapse_guard: bool = True,
     seed: int = 33,
     exca_folder: str | None = None,
+    # #54 audit C1: exca's default ``mode="cached"`` re-RAISES a stored failure
+    # (e.g. a CollapseStop abort) on a same-config relaunch instead of
+    # recomputing — so a code-level fix (which does not change the config-derived
+    # uid) would never actually run. ``retry`` recomputes on a cached *error*
+    # while keeping cached *successes*; it is the correct mode for the abort →
+    # diagnose → fix → relaunch loop. This builder default stays ``cached``
+    # (back-compat for direct callers); ``main()`` resolves an unset
+    # ``--exca-mode`` to ``retry`` for ``--chain`` and ``cached`` otherwise, so
+    # the capstone chain is C1-safe by default.
+    exca_mode: str = "cached",
     # B1.5 (task #120, 2026-05-29) two-tier extractor cache root. When set,
     # each extractor's ``infra.folder`` is pointed at
     # ``{extractor_cache_folder}/{extractor_name}/`` so its outputs survive
@@ -725,11 +750,12 @@ def build_v14_experiment(
     )
 
     if electrode_tokens_extractor is None:
-        # WS-C / C2 (B36): Multi-STFT front-end (F=30 ⅓-octave filterbank,
-        # hop=128 → 16 Hz (8 Hz latent), raw |X| via apply_log=False). C4: 0.5 Hz HPF
-        # removes DC + slow drift before the STFT. C3: StandardScaler dropped
-        # (scaler=None) — robust-z normalizes the filterbank output downstream
-        # of the view (see Nv14RobustZTransform / SessionRobustZNormalizer).
+        # WS-C / C2 (B36) + FE-RAW-1 (2026-06-04): Multi-STFT front-end, RAW
+        # |STFT| bins (F=50, front_end="raw" default), hop=128 → 16 Hz (8 Hz
+        # latent), raw |X| via apply_log=False. C4: 0.5 Hz HPF removes DC + slow
+        # drift before the STFT. C3: StandardScaler dropped (scaler=None) —
+        # robust-z normalizes the front-end output downstream of the view (see
+        # Nv14RobustZTransform / SessionRobustZNormalizer).
         mstft_kwargs: dict[str, tp.Any] = dict(
             event_types="Ieeg",
             car="shaft",
@@ -935,6 +961,10 @@ def build_v14_experiment(
     infra_cfg: dict[str, tp.Any] = {}
     if exca_folder is not None:
         infra_cfg["folder"] = exca_folder
+    # #54 audit C1: exca cache mode. Not part of the config-derived uid, so it
+    # does not perturb cache hits — it only governs how a stored FAILURE is
+    # handled on relaunch (cached → re-raise; retry → recompute).
+    infra_cfg["mode"] = exca_mode
     if cluster is not None:
         infra_cfg["cluster"] = cluster
     if slurm_partition is not None:
@@ -1126,6 +1156,8 @@ def build_v14_experiment(
         ],
         n_epochs=n_epochs,
         max_steps=max_steps,
+        val_check_interval=val_check_interval,
+        collapse_guard=collapse_guard,
         early_stopping_patience=early_stopping_patience,
         # #37: Lightning gradient clipping. v14 §7 locks grad_clip=1.0 as a
         # non-swept universal; the CLI defaults --grad-clip to 1.0, but this
@@ -1194,6 +1226,14 @@ def _parser() -> argparse.ArgumentParser:
                         "steps (max_epochs=-1). Real SSL runs over the "
                         "multi-hundred-hour joint corpus are budgeted in steps, "
                         "not epochs. P4 ignores this.")
+    p.add_argument("--ssl-val-check-interval", dest="ssl_val_check_interval",
+                   type=int, default=None,
+                   help="Validation cadence (optimizer steps) for the SSL/"
+                        "distill phases (#54). A step-budgeted phase ends mid-"
+                        "epoch, so without this the collapse-guard soft panel "
+                        "(RankMe/coverage/no-masking/loss-blowup) never fires. "
+                        "Default when --ssl-max-steps is set: max(50, steps//10) "
+                        "(~10 checks/phase). Ignored on an epoch budget.")
     p.add_argument("--p4-early-stop-patience", dest="p4_early_stop_patience",
                    type=int, default=DEFAULT_P4_EARLY_STOP_PATIENCE,
                    help="Early-stopping patience (epochs) on val_loss for the "
@@ -1313,6 +1353,18 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
+    p.add_argument("--exca-mode", dest="exca_mode", default=None,
+                   choices=("cached", "retry", "force", "read-only"),
+                   help="Exca TaskInfra cache mode (#54 audit C1). 'cached' "
+                        "RE-RAISES a stored failure on a same-config relaunch "
+                        "instead of recomputing — so a collapse-guard abort "
+                        "followed by a code-level fix would never re-run. "
+                        "'retry' recomputes a cached *error* while keeping "
+                        "cached *successes*, so the abort → fix → relaunch loop "
+                        "works. DEFAULT (unset): 'retry' for --chain, 'cached' "
+                        "for a single phase — a chained capstone is C1-safe "
+                        "without the operator remembering the flag. An explicit "
+                        "value always wins. Not part of the uid.")
     # Slurm resource knobs (B1.4a, 2026-05-29). Only used when
     # --cluster=slurm; otherwise ignored. Defaults are conservative
     # (None = inherit submitit defaults) — pass explicit values for any
@@ -1703,6 +1755,7 @@ def _common_build_kwargs(
     return dict(
         mode=args.mode, task=args.task, seed=args.seed,
         eval_mode=args.eval_mode,
+        exca_mode=args.exca_mode,
         test_subject_id=args.test_subject_id,
         test_trial_id=args.test_trial_id,
         binary_tasks=args.binary_tasks,
@@ -1801,7 +1854,17 @@ def _build_v14_chain(
     # SSL/distill phases (P1/P2/P3a/P3b): fixed budget, NEVER early-stop (their
     # val loss is a pretext objective, not the downstream metric).
     # ``--ssl-max-steps`` (when set) budgets them in steps instead of --n-epochs.
-    ssl_budget = dict(max_steps=args.ssl_max_steps)
+    # #54: a step-budgeted phase ends mid-epoch, so force a validation cadence
+    # (≈10 checks across the phase) — else the collapse-guard soft panel, which
+    # fires on validation, never evaluates. Resolved here so the run summary is
+    # honest; --ssl-val-check-interval overrides. Stays None on an epoch budget
+    # (epoch-boundary validation already runs).
+    ssl_val_check = args.ssl_val_check_interval
+    if ssl_val_check is None and args.ssl_max_steps is not None:
+        ssl_val_check = max(50, args.ssl_max_steps // 10)
+    ssl_budget: dict[str, tp.Any] = dict(
+        max_steps=args.ssl_max_steps, val_check_interval=ssl_val_check,
+    )
     p1 = build_v14_experiment(
         **common, **ssl_budget, joint_phase=True, jepa_phase="p1", clip_len=5.0,
         neural_lag_s=args.neural_lag_s,
@@ -1831,12 +1894,25 @@ def _build_v14_chain(
         **common, phase4_frozen_probe=True,
         clip_len=1.0, neural_lag_s=0.0,
         early_stopping_patience=p4_patience,
+        # #54 audit M1: no collapse guard on the supervised frozen probe — it
+        # has EarlyStopping on the real downstream val_loss, and a frozen linear
+        # head can't dimensionally collapse.
+        collapse_guard=False,
     )
     return [p1, p2, p3a, p3b, p4]
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # #54 audit C1: a chained run that aborts a phase (collapse-guard) and is
+    # then relaunched with a code fix would, under the 'cached' default,
+    # re-raise the stored failure instead of recomputing. Default an unset
+    # --exca-mode to 'retry' for --chain (recompute cached errors, keep cached
+    # successes) so the abort → fix → relaunch loop is safe without the
+    # operator remembering the flag; a single phase stays 'cached'. An explicit
+    # --exca-mode always wins.
+    if args.exca_mode is None:
+        args.exca_mode = "retry" if args.chain else "cached"
     # Gate-B flag 3 / Gate-D fix: phase-couple the clip window when the operator
     # leaves --clip-len unset. A single --phase 4 run that defaulted to 5 s would
     # silently run the readout off the leaderboard-parity 1 s window. --chain
@@ -1891,7 +1967,8 @@ def main(argv: list[str] | None = None) -> int:
     # #21 phase routing + cross-phase handoff (recorded so the run YAML never
     # silently rides the wrong phase / checkpoint).
     print(f"  phase={args.phase} chain={args.chain} p3_stage={args.p3_stage} "
-          f"frozen_probe={args.frozen_probe} clip_len={args.clip_len}")
+          f"frozen_probe={args.frozen_probe} clip_len={args.clip_len} "
+          f"exca_mode={args.exca_mode}")
     print(f"  whisper_target_cache_dir={args.whisper_target_cache_dir!r} "
           f"whisper_layer_merge={args.whisper_layer_merge} "
           f"target_standardize={args.target_standardize} "
@@ -1960,6 +2037,11 @@ def main(argv: list[str] | None = None) -> int:
     # --phase 4 rerun is the next gate, so this closes the gap that would otherwise
     # silently ignore --p4-early-stop-patience there.
     single_max_steps = args.ssl_max_steps if args.phase in (1, 3) else None
+    # #54: same step-budget-ends-mid-epoch fix as the chain, for a single SSL
+    # phase. Only meaningful when this phase carries a step budget.
+    single_val_check = args.ssl_val_check_interval
+    if single_val_check is None and single_max_steps is not None:
+        single_val_check = max(50, single_max_steps // 10)
     single_p4_patience = (
         (args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None)
         if args.phase == 4
@@ -1967,6 +2049,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"  single-phase budget: max_steps={single_max_steps} "
+        f"val_check_interval={single_val_check} "
         f"early_stopping_patience={single_p4_patience}"
     )
     xp = build_v14_experiment(
@@ -1974,7 +2057,11 @@ def main(argv: list[str] | None = None) -> int:
         clip_len=args.clip_len,
         neural_lag_s=args.neural_lag_s,
         max_steps=single_max_steps,
+        val_check_interval=single_val_check,
         early_stopping_patience=single_p4_patience,
+        # #54 audit M1: guard is SSL/distill-only; a single --phase 4 probe run
+        # disables it (EarlyStopping + real metric already cover it).
+        collapse_guard=(args.phase != 4),
         joint_phase=(args.phase == 1),
         p3_distill=(args.phase == 3),
         p3_stage=args.p3_stage,

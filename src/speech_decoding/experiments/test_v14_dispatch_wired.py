@@ -33,7 +33,9 @@ def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
     assert ext.car == "shaft"
     assert ext.notch_filter == 60.0
     assert ext.hop_length == 128  # hop=128 re-lock 2026-06-03 (iMINDBench-standard)
-    assert ext.n_fbank_bins == 30
+    # FE-RAW-1 (2026-06-04): the default front end is the raw |STFT| F=50 path
+    # (the const-Q F=30 filterbank is the demoted front_end="fbank" sister).
+    assert ext.front_end == "raw"
     assert ext.apply_log is False
     # C4 HPF: 0.5 Hz high-pass (None upper edge → high-pass only).
     assert ext.filter == (0.5, None)
@@ -200,18 +202,19 @@ def test_dispatch_whisper_layer_merge_threads_to_extractor(tmp_path, monkeypatch
     assert xp.data.segmenter.extractors["whisper_target"].layer_merge == "8"
 
 
-def test_dispatch_default_n_freq_bins_30_gives_encoder_f_p_10(
+def test_dispatch_default_n_freq_bins_50_gives_encoder_f_p_10(
     tmp_path, monkeypatch,
 ) -> None:
-    """WS-C / C2: ``DEFAULT_N_FREQ_BINS`` flips 38 → 30 (Multi-STFT filterbank);
-    the (3,3)-freq-stride patch stem maps F=30 → F_p=10."""
+    """WS-C / C2 + FE-RAW-1 (2026-06-04): ``DEFAULT_N_FREQ_BINS`` flips 30 → 50
+    (raw |STFT| front end); the kernel-5-freq-stride patch stem maps F=50 →
+    F_p=10 — byte-shape-identical to the old F=30/kernel-3 grid."""
     from speech_decoding.models.v14_encoder import _PatchStem
 
-    assert dispatch_v14.DEFAULT_N_FREQ_BINS == 30
+    assert dispatch_v14.DEFAULT_N_FREQ_BINS == 50
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(mode="nano")
-    assert xp.brain_model_config.n_freq_bins == 30
-    assert _PatchStem(8).n_freq_patches(30) == 10
+    assert xp.brain_model_config.n_freq_bins == 50
+    assert _PatchStem(8).n_freq_patches(50) == 10  # kernel-5 default
 
 
 def test_dispatch_clip_len_threads_to_segmenter_duration_and_time_bins(
@@ -572,6 +575,7 @@ def test_encoder_time_last_input_transposes_correctly() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=3, n_time_bins=5, k_parcels=6,
         d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F=3 config
         time_last_input=True,
     )
     model = cfg.build(n_outputs=2)

@@ -44,6 +44,7 @@ def test_v14_config_build_accepts_neuraltrain_kwargs() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=F_BINS, n_time_bins=T_BINS, k_parcels=K_PARCELS,
         d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F_BINS config
     )
     model = cfg.build(n_in_channels=C_MAX, n_outputs=7)
 
@@ -68,6 +69,7 @@ def test_brain_module_unpacks_tuple_x_name_for_v14() -> None:
     cfg = V14ParcelPerceiver(
         n_freq_bins=F_BINS, n_time_bins=T_BINS, k_parcels=K_PARCELS,
         d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F_BINS config
     )
     model = cfg.build(n_in_channels=C_MAX, n_outputs=3)
 
@@ -179,6 +181,7 @@ def test_v14_experiment_dry_run_end_to_end(tmp_path) -> None:
             "n_heads": 4,
             "depth_self_attn": 1,
             "m_sub_slots": 2,
+            "patch_kernel_freq": 3,  # FE-RAW-1: kernel-3 for the tiny F_BINS
         },
         loss={"name": "CrossEntropyLoss"},
         optim={"optimizer": {"name": "Adam", "lr": 1e-2}},
@@ -215,6 +218,7 @@ def test_v14_config_eps_is_vestigial_under_b36_hard_pool() -> None:
     base_kwargs = dict(
         n_freq_bins=F_BINS, n_time_bins=T_BINS, k_parcels=K_PARCELS,
         d_model=32, n_heads=4, depth_self_attn=1, m_sub_slots=2,
+        patch_kernel_freq=3,  # FE-RAW-1: kernel-3 path for the tiny F_BINS config
     )
     cfg_strong = V14ParcelPerceiver(**base_kwargs, eps=1e-4)
     cfg_weak = V14ParcelPerceiver(**base_kwargs, eps=1e-1)

@@ -283,6 +283,115 @@ def test_multi_stft_valid_bin_mask_swec_passband_22_bins() -> None:
     assert not mask[25:].any(), "bins 25+ must be invalid for a 120 Hz cap"
 
 
+# ---------------------------------------------------------------------------
+# FE-RAW-1 (2026-06-04): raw |STFT| bins (F=50) replace the const-Q filterbank
+# ---------------------------------------------------------------------------
+
+_RAW_FREQS_HZ = [
+    4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0,
+    30.0,  # low (Δf=2), k2–k15
+    32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0, 64.0, 68.0, 72.0, 76.0,
+    80.0, 84.0, 88.0, 92.0, 96.0, 100.0, 104.0, 108.0, 112.0, 116.0, 120.0,
+    124.0, 128.0, 132.0, 136.0, 140.0, 144.0, 148.0,  # mid (Δf=4), k8–k37
+    152.0, 160.0, 168.0, 176.0, 184.0, 192.0,  # hi (Δf=8), k19–k24
+]
+
+
+def test_multi_stft_raw_bin_freqs_are_the_exact_f50_axis() -> None:
+    """FE-RAW-1 §4.2: 14 low + 30 mid + 6 hi = 50 raw |STFT| bins, concat
+    low→mid→hi, on a strictly-increasing piecewise-uniform (2/4/8 Hz) axis
+    spanning 4–192 Hz with non-overlapping crossovers at 32/152 Hz."""
+    from speech_decoding.extractors.view import F_RAW, multi_stft_raw_bin_freqs_hz
+
+    assert F_RAW == 50
+    freqs = multi_stft_raw_bin_freqs_hz()
+    assert freqs.shape == (50,)
+    assert freqs.tolist() == _RAW_FREQS_HZ
+    assert (freqs[1:] > freqs[:-1]).all(), "raw freq axis must be strictly increasing"
+
+
+def test_multi_stft_raw_valid_bin_mask_swec_is_37_valid_13_invalid() -> None:
+    """FE-RAW-1 §4.4: SWEC/AJILE12 (≤120 Hz) keep 37 bins (low 14 + mid k8–k30
+    = 32–120 Hz = 23), drop 13 (mid 124–148 Hz = 7 + hi 6). BT/D-cohort
+    (broadband) keep all 50. Raw analog of multi_stft_valid_bin_mask."""
+    from speech_decoding.extractors.view import multi_stft_raw_valid_bin_mask
+
+    swec = multi_stft_raw_valid_bin_mask(passband_low_hz=0.5, passband_high_hz=120.0)
+    assert swec.shape == (50,)
+    assert int(swec.sum()) == 37
+    assert int((~swec).sum()) == 13
+    assert swec[:37].all(), "first 37 raw bins (≤120 Hz) must be valid for SWEC"
+    assert not swec[37:].any(), "raw bins 37+ (124–192 Hz) must be invalid for SWEC"
+
+    bt = multi_stft_raw_valid_bin_mask(passband_low_hz=0.0, passband_high_hz=1024.0)
+    assert bt.all(), "BT/D-cohort broadband → all 50 raw bins valid"
+
+
+def test_multi_stft_raw_view_shape_is_50_freq_17_time_at_1s_2048hz() -> None:
+    """FE-RAW-1 §4.2: the raw view runs the same 3 STFTs (nperseg 1024/512/256,
+    hop=128) as the filterbank path, then selects the 50 raw |STFT| bins —
+    (C, 50, 17) for a 1 s, 2048 Hz clip. Frame geometry (17) is unchanged."""
+    from speech_decoding.extractors.view import (
+        MULTI_STFT_RAW_BINS,
+        _multi_stft_raw_view,
+    )
+
+    waveform = torch.zeros(4, 2048)
+    out = _multi_stft_raw_view(
+        waveform,
+        sample_rate=2048,
+        hop_length=128,
+        nperseg_low=1024,
+        nperseg_mid=512,
+        nperseg_hi=256,
+        raw_bins=MULTI_STFT_RAW_BINS,
+        log_eps=1e-6,
+    )
+    assert out.shape == (4, 50, 17)
+
+
+def test_multi_stft_raw_view_routes_tone_to_correct_raw_bin() -> None:
+    """A pure 100-Hz tone must peak in the raw bin centered at exactly 100 Hz.
+    Implicitly validates the cross-STFT bin selection + concat order."""
+    from speech_decoding.extractors.view import (
+        MULTI_STFT_RAW_BINS,
+        _multi_stft_raw_view,
+        multi_stft_raw_bin_freqs_hz,
+    )
+
+    sr = 2048
+    t = torch.arange(sr).float() / sr
+    tone_100hz = torch.sin(2 * torch.pi * 100.0 * t).unsqueeze(0)
+    out = _multi_stft_raw_view(
+        tone_100hz,
+        sample_rate=sr,
+        hop_length=128,
+        nperseg_low=1024,
+        nperseg_mid=512,
+        nperseg_hi=256,
+        raw_bins=MULTI_STFT_RAW_BINS,
+        log_eps=1e-6,
+    )
+    freqs = multi_stft_raw_bin_freqs_hz()
+    peak_bin = int(out.mean(dim=-1)[0].argmax().item())
+    assert abs(freqs[peak_bin].item() - 100.0) < 4.0, (
+        f"100 Hz tone peaked at raw bin {peak_bin} (center {freqs[peak_bin].item():.1f} Hz)"
+    )
+
+
+def test_multi_stft_view_raw_is_default_and_emits_f50() -> None:
+    """The live MultiStftView default front end is ``raw`` (F=50); the const-Q
+    filterbank is the demoted ``fbank`` opt-in sister (F=30)."""
+    from speech_decoding.extractors.view import MultiStftView
+
+    raw_view = MultiStftView(event_types="Ieeg", car="shaft")
+    assert raw_view.front_end == "raw"
+
+    fbank_view = MultiStftView(event_types="Ieeg", car="shaft", front_end="fbank")
+    assert fbank_view.front_end == "fbank"
+    assert fbank_view.n_fbank_bins == 30
+
+
 def test_multi_stft_view_shape_is_30_freq_17_time_at_1s_2048hz() -> None:
     """FE-01 (hop=128 re-lock 2026-06-03): Common hop=128 @ 2048 Hz with
     Nperseg ∈ {1024, 512, 256} and 1-s input yields 17 frames at a 16 Hz

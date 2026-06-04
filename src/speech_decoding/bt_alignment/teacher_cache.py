@@ -418,15 +418,20 @@ def fit_channel_stats(
     would erase the onset/temporal structure the student must predict) — and
     returns ``{'mean': (d,), 'inv_std': (d,)}``.
 
-    Train-only: pass ONLY the training-split clip paths; the returned stats are
-    frozen and reused for val/test, so no val/test clip enters the statistics
-    (same discipline as the ceiling probe's ``StandardScaler.fit(train)``).
+    Corpus-agnostic: fits over whatever paths it is given. The shipped caller
+    (:func:`fit_and_save_channel_stats`) passes the FULL corpus (all movies,
+    train+test) — Ben 2026-06-04: leakage is second-order because the
+    standardizer is consumed entirely within P3 distillation and is GONE at the
+    frozen-probe P4 eval (no Whisper target at readout; audit-confirmed). The
+    2560 label-free scalars cannot inflate the grouped-by-token CV metric. Pass
+    ONLY the training-split paths for the ``R-train-only-stats`` sister (the
+    original B33 discipline, ≡ the ceiling probe's ``StandardScaler.fit(train)``).
     Zero-variance guard: a channel with ``σ ≈ 0`` gets ``inv_std = 1`` (passes
     through unscaled), mirroring sklearn ``_handle_zeros_in_scale``.
 
     Two-pass (mean, then sum of squared deviations) for numerical stability —
-    avoids the ``E[x²] − E[x]²`` catastrophic cancellation of a single pass. The
-    caller saves the result alongside the cache as ``channel_stats.pt``;
+    avoids the ``E[x²] − E[x]²`` catastrophic cancellation of a single pass.
+    Save via :func:`fit_and_save_channel_stats` as ``channel_stats.pt``;
     :class:`TargetStandardizer` consumes it at load/train time. Falsifier
     ``R-no-target-standardize`` skips standardization (raw 1280-d target).
     """
@@ -460,6 +465,44 @@ def fit_channel_stats(
     # Zero-variance guard: σ≈0 → pass channel through unscaled.
     inv_std = torch.where(var <= eps, torch.ones_like(inv_std), inv_std)
     return {"mean": mean, "inv_std": inv_std}
+
+
+def fit_and_save_channel_stats(
+    cache_dir: Path | str,
+    *,
+    model: str,
+    layer_merge: int | str,
+    out_path: Path | str,
+    d_model: int = 1280,
+    eps: float = 1e-8,
+) -> dict[str, Tensor]:
+    """Fit ONE global per-channel z-score over every whole-movie teacher cache
+    and save it as ``channel_stats.pt`` for :class:`TargetStandardizer`.
+
+    Globs the full ``movie_cache_path`` layout
+    (``cache_dir/<model_slug>/<merge_slug>/*.pt``) and fits the FULL corpus
+    (all movies) via :func:`fit_channel_stats` — the shipped P3 default (Ben
+    2026-06-04; full-corpus, not train-only, leakage second-order per that
+    function's docstring). The output file is excluded from its own glob so a
+    re-run cannot ingest the stats as a movie cache. Returns the saved
+    ``{'mean', 'inv_std'}``.
+    """
+    out_path = Path(out_path)
+    movie_dir = Path(cache_dir) / model.replace("/", "_") / merge_slug(layer_merge)
+    feature_paths = sorted(
+        p for p in movie_dir.glob("*.pt") if p.resolve() != out_path.resolve()
+    )
+    if not feature_paths:
+        raise FileNotFoundError(
+            f"fit_and_save_channel_stats: no movie caches under {movie_dir} "
+            f"(model={model!r}, layer_merge={layer_merge!r}). Build the teacher "
+            "cache first (write_movie_cache), or run the R-no-target-standardize "
+            "sister (target_standardize=False)."
+        )
+    stats = fit_channel_stats(feature_paths, d_model=d_model, eps=eps)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(stats, out_path)
+    return stats
 
 
 class TargetStandardizer(nn.Module):

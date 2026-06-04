@@ -55,6 +55,40 @@ def _structure_components(mask_bc: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return row_full, col_full
 
 
+def test_m2_band_mask_runs_at_fe_raw1_f_p_10_grid() -> None:
+    """FE-RAW-1: the M2 mask operates on the POST-PATCH token grid
+    ``(B, C, F_p, T_p)``, which the raw F=50 stem (freq kernel 5) floors to
+    F_p=10 — identical to the demoted F=30 stem (kernel 3). The sampler is
+    F-agnostic: it sees only F_p, so swapping the front end changes nothing.
+
+    Verified end-to-end: the raw stem's actual F_p drives the mask shape, and
+    the SWEC raw valid-bin prefix (37 valid bins → F_p prefix) confines the
+    freq-bands without error."""
+    from speech_decoding.models.v14_encoder import _PatchStem
+
+    raw_stem = _PatchStem(d_model=8, kernel_freq=5, kernel_time=2)
+    F_p = raw_stem.n_freq_patches(50)
+    assert F_p == 10  # raw F=50 → F_p=10 (== F=30 const-Q stem)
+
+    g = torch.Generator().manual_seed(0)
+    B, C, T_p = 4, 6, 20
+    mask = sample_m2_mask((B, C, F_p, T_p), held_out_ratio=0.50, generator=g)
+    assert tuple(mask.shape) == (B, C, F_p, T_p)
+    assert mask.dtype == torch.bool
+
+    # SWEC: 37 of 50 raw bins valid → the valid F_p prefix is the patches whose
+    # 5-bin window lies fully inside the 37-valid prefix → floor(37/5)=7.
+    valid_fp = torch.zeros(F_p, dtype=torch.bool)
+    valid_fp[:7] = True
+    masked = sample_m2_mask(
+        (B, C, F_p, T_p), held_out_ratio=0.50, generator=g, freq_patch_valid=valid_fp,
+    )
+    # No freq-band may touch an invalid patch row.
+    assert not masked[..., 7:, :].all(dim=-1).any(), (
+        "M2 freq-bands must stay inside the SWEC-valid F_p prefix"
+    )
+
+
 def test_band_mask_held_out_fraction_is_exact_union() -> None:
     """Non-overlapping placement → the union held-out fraction is the exact
     ``1-(1-a)(1-b)``. On a 10×20 grid at r=0.50 (a=b=0.293) the per-axis counts
