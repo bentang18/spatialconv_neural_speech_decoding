@@ -185,6 +185,27 @@ def test_precar_sibling_has_distinct_cache_namespace() -> None:
     assert deep.infra._obj.car is None  # the sibling preprocesses PRE-CAR
 
 
+def test_precar_fork_survives_precomputed_uid() -> None:
+    # LATENT-POISON PIN (Gate-C re-audit): model_copy(deep=True) deep-copies exca's
+    # MEMOIZED uid, so if self.infra.uid() was computed BEFORE the fit's copy (a
+    # future pre-build uid log would do this), a bare deep copy silently inherits
+    # self's car=shaft uid -> pre-CAR voltage written to the production folder.
+    # _fit_session_bads resets the sibling's uid memo to make the fork order-
+    # independent. Simulate the real fit's copy+reset in the poison order.
+    from speech_decoding.extractors.view import _reset_infra_uid_cache
+
+    v = _view(car="shaft", lof_bad_channels=True, drop_bads=True)
+    _ = v.infra.uid()  # poison precondition: memoize self's car=shaft uid first
+    bare = v.model_copy(update={"car": None}, deep=True)
+    assert bare.infra.uid() == v.infra.uid(), "bare deep copy inherits stale uid"
+
+    fixed = v.model_copy(update={"car": None}, deep=True)
+    _reset_infra_uid_cache(fixed.infra)
+    indep = _view(car=None, lof_bad_channels=True, drop_bads=True)
+    assert fixed.infra.uid() != v.infra.uid()
+    assert fixed.infra.uid() == indep.infra.uid()  # genuine car=None namespace
+
+
 def test_report_aggregates_and_writes_json(tmp_path: Path) -> None:
     out = tmp_path / "nested" / "lof.json"
     v = _view(lof_threshold=1.5, lof_n_neighbors=20, lof_report_path=str(out))

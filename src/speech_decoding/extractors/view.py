@@ -76,6 +76,23 @@ from speech_decoding.extractors.normalize import SessionRobustZNormalizer
 logger = logging.getLogger(__name__)
 
 
+def _reset_infra_uid_cache(infra) -> None:
+    """Clear exca's MEMOIZED uid on a freshly model_copy(deep=True)'d infra so it
+    recomputes from its own (post-update) config. ``model_copy(deep=True)`` deep-
+    copies the memo (``_uid`` and ``_state.uid``); if the source infra's uid was
+    ever computed before the copy, the copy would otherwise return the SOURCE's
+    stale uid — silently writing to the wrong cache namespace. Touches only ``_uid``
+    and ``_state.uid`` (NOT ``_uid_string``, the format template, which ``uid()``
+    needs). Defensive: a no-op if exca's internals move, never raises — worst case
+    reverts to the order-dependent behavior that is correct on today's path."""
+    priv = getattr(infra, "__pydantic_private__", None) or {}
+    if "_uid" in priv:
+        priv["_uid"] = None
+    state = priv.get("_state")
+    if state is not None and hasattr(state, "uid"):
+        state.uid = None
+
+
 # ---------------------------------------------------------------------------
 # Multi-STFT helpers (T1.5)
 # ---------------------------------------------------------------------------
@@ -777,6 +794,10 @@ class MultiStftView(CARIeegExtractor):
         # is still False on it so its _preprocess_raw passes through and LOF sees
         # every channel — it is the detector, not a consumer.
         precar = self.model_copy(update={"car": None}, deep=True)
+        # deep=True ALSO deep-copies exca's memoized uid; reset it so the sibling
+        # recomputes its car=None uid instead of inheriting self's car=shaft one if
+        # self.infra.uid() was computed earlier (see _reset_infra_uid_cache).
+        _reset_infra_uid_cache(precar.infra)
         events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
         report: list[dict] = []
         seen: set[str] = set()
