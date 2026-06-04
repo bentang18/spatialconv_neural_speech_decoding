@@ -1,8 +1,11 @@
-"""T3.1: --phase flag scaffold.
+"""--phase flag + --chain dispatch routing (T3.1 scaffold → #21 chain driver).
 
-Phases 1/2/3 must raise NotImplementedError citing the gating blocker IDs;
-Phase 4 (default) must fall through to the existing Phase-4 dispatch path
-(here exercised with --dry-run so no Experiment is built)."""
+Phase 2 stays gated (collapsed into the joint phase, B29 Item 1). Phases 1/3/4
+route to their experiment classes (V14JointExperiment / V14Phase3Experiment /
+base Experiment or V14Phase4ReadoutExperiment). --chain assembles the staged
+P1→P2→P3a→P3b→P4 pipeline. Most tests use --dry-run (short-circuits before any
+Experiment is built); the chain-assembly tests monkeypatch build_v14_experiment
+to capture per-phase kwargs without touching BT data."""
 
 from __future__ import annotations
 
@@ -27,8 +30,8 @@ def test_phase_3_dry_run_no_longer_gated(
 ) -> None:
     """WS-F: --phase 3 is no longer blanket-gated. --dry-run short-circuits
     before any build, so it exits 0 (the module/experiment are wired); the
-    live (non-dry-run) path raises the precise whisper_target data blocker —
-    see :func:`test_phase_3_live_raises_whisper_target_data_blocker`."""
+    live (non-dry-run) path raises the precise operator error —
+    see :func:`test_phase_3_live_without_cache_raises_operator_error`."""
     rc = main(["--phase", "3", "--dry-run"])
     assert rc == 0
     assert "V14 dispatch" in capsys.readouterr().out
@@ -184,3 +187,151 @@ def test_invalid_jepa_phase_rejected_by_argparse() -> None:
     never drifts to a typo'd sub-phase."""
     with pytest.raises(SystemExit):
         main(["--jepa-phase", "p3", "--dry-run"])
+
+
+# --- Gate-D fixes: chain assembly + sister-flag threading + P4 guards --------
+#
+# These monkeypatch build_v14_experiment to capture per-phase kwargs without
+# touching BT data, closing the coverage gap the Gate-D audit found (the chain
+# assembly + the common-dict flag drift were both untested).
+
+
+class _StubXp:
+    def run(self):  # noqa: D401 - the dispatch only calls .run()
+        return {}
+
+
+def _capture_builds(monkeypatch) -> list[dict]:
+    """Replace dispatch_v14.build_v14_experiment with a kwargs-capturing stub."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls: list[dict] = []
+
+    def fake_build(**kw):
+        calls.append(kw)
+        return _StubXp()
+
+    monkeypatch.setattr(dv, "build_v14_experiment", fake_build)
+    return calls
+
+
+def _parse(argv: list[str]):
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    return dv._parser().parse_args(argv)
+
+
+def test_chain_assembly_shape_and_handoff(monkeypatch, tmp_path) -> None:
+    """#21 / Gate-D: --chain assembles exactly [P1, P2, P3a, P3b, P4] with the
+    right phase selectors, 5 s SSL/distill + 1 s P4 clip windows, zero P4 lag,
+    and the Whisper teacher stream on ONLY the two P3 stages. This mirrors the
+    must-pass capstone ordering; without it a `common`-dict edit could ship a
+    wrong maiden run undetected."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+    ])
+    phases = dv._build_v14_chain(args, cross_attn_positions=None)
+    assert len(calls) == len(phases) == 5
+    assert calls[0]["joint_phase"] and calls[0]["jepa_phase"] == "p1"
+    assert calls[1]["joint_phase"] and calls[1]["jepa_phase"] == "p2"
+    assert calls[2]["p3_distill"] and calls[2]["p3_stage"] == "3a"
+    assert calls[3]["p3_distill"] and calls[3]["p3_stage"] == "3b"
+    assert calls[4]["phase4_frozen_probe"]
+    assert [c["clip_len"] for c in calls] == [5.0, 5.0, 5.0, 5.0, 1.0]
+    assert calls[4]["neural_lag_s"] == 0.0
+    assert calls[2]["whisper_target_cache_dir"] == "/c"
+    assert calls[3]["whisper_target_cache_dir"] == "/c"
+    for non_p3 in (0, 1, 4):
+        assert "whisper_target_cache_dir" not in calls[non_p3]
+
+
+def test_chain_threads_sister_flags(monkeypatch, tmp_path) -> None:
+    """Gate-D HIGH regression: loss_variant / latent_valid_override /
+    sa_mask_mode reach the chain's joint phases, and binary_tasks reaches EVERY
+    phase (so the SSL/distill clip population matches the P4 eval set). Before
+    the _common_build_kwargs refactor these silently fell back to defaults while
+    the run summary printed the sister as applied."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--loss-variant", "b31_plus_m3",
+        "--latent-valid-override", "all_true",
+        "--sa-mask-mode", "key_only",
+        "--no-binary-tasks",
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    for i in (0, 1):  # the joint SSL phases carry the sisters
+        assert calls[i]["loss_variant"] == "b31_plus_m3"
+        assert calls[i]["latent_valid_override"] == "all_true"
+        assert calls[i]["sa_mask_mode"] == "key_only"
+    assert all(c["binary_tasks"] is False for c in calls)  # all 5 phases
+
+
+def test_single_phase_passes_sister_flags(monkeypatch) -> None:
+    """The single-phase build must keep passing the same sisters (the shared
+    _common_build_kwargs helper feeds both call sites)."""
+    calls = _capture_builds(monkeypatch)
+    main([
+        "--phase", "1", "--loss-variant", "b31_plus_utt",
+        "--latent-valid-override", "all_true", "--no-binary-tasks",
+    ])
+    assert len(calls) == 1
+    assert calls[0]["loss_variant"] == "b31_plus_utt"
+    assert calls[0]["latent_valid_override"] == "all_true"
+    assert calls[0]["binary_tasks"] is False
+    assert calls[0]["joint_phase"] is True
+
+
+def test_p4_clip_len_defaults_to_one_second(monkeypatch, capsys) -> None:
+    """Gate-B flag 3 / Gate-D: a single --phase 4 with no --clip-len resolves to
+    the 1 s leaderboard-parity window, not the 5 s SSL default."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "4", "--frozen-probe"])
+    assert calls[0]["clip_len"] == 1.0
+    assert "clip_len=1.0" in capsys.readouterr().out
+
+
+def test_non_p4_clip_len_defaults_to_five_seconds(monkeypatch) -> None:
+    """SSL/distill phases keep the 5 s default when --clip-len is unset."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "1"])
+    assert calls[0]["clip_len"] == 5.0
+
+
+def test_explicit_clip_len_overrides_phase_default(monkeypatch) -> None:
+    """An explicit --clip-len is honored on any phase."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "4", "--frozen-probe", "--clip-len", "2.0"])
+    assert calls[0]["clip_len"] == 2.0
+
+
+def test_snapshot_ckpt_to_implies_frozen_probe_on_p4(monkeypatch) -> None:
+    """Gate-D: --snapshot-ckpt-to needs the transferable protocol, which only
+    the frozen-probe readout carries; on P4 it must select that experiment so it
+    doesn't TypeError at runtime after a full train."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "4", "--snapshot-ckpt-to", "/tmp/p4.ckpt"])
+    assert calls[0]["phase4_frozen_probe"] is True
+    assert calls[0]["snapshot_ckpt_to"] == "/tmp/p4.ckpt"
+
+
+def test_resume_from_implies_frozen_probe_on_p4(monkeypatch) -> None:
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "4", "--resume-from", "/tmp/p3b.ckpt"])
+    assert calls[0]["phase4_frozen_probe"] is True
+    assert calls[0]["pretrained_ckpt"] == "/tmp/p3b.ckpt"
+
+
+def test_plain_p4_is_not_frozen_probe(monkeypatch) -> None:
+    """A bare --phase 4 (no resume / snapshot / frozen flag) stays the base
+    supervised path."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "4"])
+    assert calls[0]["phase4_frozen_probe"] is False

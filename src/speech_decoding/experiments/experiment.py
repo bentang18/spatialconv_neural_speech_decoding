@@ -191,6 +191,20 @@ class Experiment(BaseExperiment):
                 f"{type(brain_module).__name__} has no load_transferable_state; "
                 "pretrained_ckpt handoff needs the transferable-state protocol."
             )
+        # Gate-D fix: `_snapshot` runs INSIDE the exca-cached `run()` body, so a
+        # cache-HIT phase returns its stored result without re-writing its
+        # snapshot. If the prior phase's `.ckpt` was purged (e.g. a `--work-dir`
+        # on /work's 75-day-purge tier while the exca metadata cache persists)
+        # the bare torch.load below would raise an opaque FileNotFoundError on a
+        # re-run. Fail with an actionable message instead.
+        if not Path(ckpt_path).is_file():
+            raise FileNotFoundError(
+                f"pretrained_ckpt {ckpt_path!r} is missing. The prior phase's "
+                "snapshot is written inside its exca-cached run(), so a cache-hit "
+                "on a purged/cleared work_dir leaves no .ckpt to warm-start from. "
+                "Re-run the prior phase with its exca cache cleared, or keep "
+                "--work-dir on the same persistence tier as EXCA_CACHE_FOLDER."
+            )
         # weights_only=True: the snapshot is a pure dict-of-tensor-dicts
         # (``transferable_state``); load it under the safe unpickler.
         state = torch.load(ckpt_path, map_location="cpu", weights_only=True)

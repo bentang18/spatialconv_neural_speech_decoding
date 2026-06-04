@@ -175,6 +175,29 @@ def test_b36_neural_lag_rejected_on_supervised_p4_path(tmp_path, monkeypatch) ->
         )
 
 
+def test_b36_neural_lag_rejected_on_frozen_probe_p4_path(tmp_path, monkeypatch) -> None:
+    """Gate-D fix: the frozen-probe Phase-4 readout (the canonical P4 path —
+    chain P4 + every --resume-from / --frozen-probe run) must ALSO reject a
+    non-zero Δlag. Its branch short-circuits the base-P4 guard, so a separate
+    guard re-asserts the leaderboard-parity [onset, onset+1 s] window."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match=r"frozen-probe path"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", phase4_frozen_probe=True, neural_lag_s=0.15,
+        )
+
+
+def test_b36_frozen_probe_p4_accepts_zero_lag(tmp_path, monkeypatch) -> None:
+    """The zero-lag frozen probe (the maiden-run config) builds cleanly through
+    the new guard."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", phase4_frozen_probe=True, neural_lag_s=0.0, clip_len=1.0,
+    )
+    assert xp.data.segmenter.start == 0.0
+    assert xp.data.segmenter.duration == 1.0
+
+
 def test_b36_neural_lag_cli_arg_parses() -> None:
     """The ``--neural-lag-s`` CLI flag exists, defaults to the 0.0 baseline, and
     parses an explicit lag through to ``args.neural_lag_s`` (covers the argparse

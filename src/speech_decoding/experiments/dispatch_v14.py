@@ -838,6 +838,18 @@ def build_v14_experiment(
         # WS-G B35 frozen-encoder readout probe. Carries the transferable-state
         # protocol (encoder + PMA strict load, projector dropped) so it can
         # warm-start from a P3 snapshot; the base supervised Experiment cannot.
+        # Gate-D fix: the neural_lag parity guard below lives in the *base*-P4
+        # elif, which this branch short-circuits — so re-assert it here. The
+        # frozen probe IS the canonical P4 readout (chain P4 + every
+        # --resume-from / --frozen-probe run), exactly the path that must keep
+        # the leaderboard-parity [onset, onset+1 s] window.
+        if neural_lag_s != DEFAULT_NEURAL_LAG_S:
+            raise ValueError(
+                "neural_lag_s must stay 0.0 on the Phase-4 frozen-probe path: a "
+                f"non-zero probe offset (got {neural_lag_s!r}) shifts the "
+                "segmenter clip start off the leaderboard-parity "
+                "[onset, onset+1 s] window."
+            )
         from speech_decoding.experiments.v14_phase4 import (
             V14Phase4ReadoutExperiment,
         )
@@ -988,10 +1000,12 @@ def _parser() -> argparse.ArgumentParser:
                         "0 starves the GPU on the per-sample CPU STFT; default "
                         "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
     p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS)
-    p.add_argument("--clip-len", type=float, default=DEFAULT_CLIP_LEN_S,
+    p.add_argument("--clip-len", type=float, default=None,
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
                         "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
-                        "encoder n_time_bins / RoPE ceiling.")
+                        "encoder n_time_bins / RoPE ceiling. Unset → resolves "
+                        "to 1.0 for --phase 4 (leaderboard parity, Gate-B "
+                        "flag 3) and 5.0 otherwise.")
     p.add_argument("--neural-lag-s", dest="neural_lag_s", type=float,
                    default=DEFAULT_NEURAL_LAG_S,
                    help="B36 Δlag: neural-response lag (s) added to the clip "
@@ -1384,6 +1398,64 @@ def construct_v14_joint_callbacks(
     return callbacks
 
 
+def _common_build_kwargs(
+    args, *, cross_attn_positions: list[int] | None,
+) -> dict[str, tp.Any]:
+    """Knobs identical across every phase in BOTH the single-phase ``main()``
+    build and the ``--chain`` builds.
+
+    Centralized after the Gate-D audit: ``binary_tasks`` / ``latent_valid_override``
+    / ``sa_mask_mode`` / ``loss_variant`` had drifted OUT of the chain's inline
+    ``common`` dict while the single-phase call still passed them, so a
+    ``--chain --loss-variant X`` (or any of those) silently ran the DEFAULT arm
+    while the run summary printed the sister as applied. Both call sites consume
+    this one dict, so a forgotten flag is now structurally impossible.
+
+    Excludes the per-phase selectors (``joint_phase`` / ``p3_distill`` /
+    ``phase4_frozen_probe`` / ``p3_stage`` / ``jepa_phase`` / ``clip_len`` /
+    ``neural_lag_s`` / ``frontend_lr_scale`` / the whisper + handoff knobs),
+    which each call site sets explicitly.
+    """
+    return dict(
+        mode=args.mode, task=args.task, seed=args.seed,
+        eval_mode=args.eval_mode,
+        test_subject_id=args.test_subject_id,
+        test_trial_id=args.test_trial_id,
+        binary_tasks=args.binary_tasks,
+        session_robust_z=args.session_robust_z,
+        eps=args.eps, d_model=args.d_model, depth=args.depth,
+        n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        n_epochs=args.n_epochs,
+        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
+        slurm_partition=args.slurm_partition,
+        slurm_account=args.slurm_account,
+        mem_gb=args.mem_gb,
+        gpus_per_node=args.gpus_per_node,
+        cpus_per_task=args.cpus_per_task,
+        timeout_min=args.timeout_min,
+        precision=args.precision,
+        extractor_cache_folder=args.extractor_cache_folder,
+        dkoleo_mode=args.dkoleo_mode,
+        cross_attn_positions=cross_attn_positions,
+        mains_notch_hz=args.mains_notch_hz,
+        subtype_embed_enabled=args.subtype_embed_enabled,
+        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
+        subtype_embed_vocab=args.subtype_embed_vocab,
+        ref_embed_enabled=args.ref_embed_enabled,
+        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
+        phase_mode=args.phase_mode,
+        ref_operator_alpha=args.ref_operator_alpha,
+        include_ajile12=args.include_ajile12,
+        ffn_variant=args.ffn_variant,
+        gradient_checkpointing=args.gradient_checkpointing,
+        readout=args.readout,
+        latent_valid_override=args.latent_valid_override,
+        sa_mask_mode=args.sa_mask_mode,
+        loss_variant=args.loss_variant,
+    )
+
+
 def _build_v14_chain(
     args, *, cross_attn_positions: list[int] | None,
 ) -> list[Experiment]:
@@ -1414,40 +1486,7 @@ def _build_v14_chain(
             "against the raw 1280-d target instead."
         )
 
-    common: dict[str, tp.Any] = dict(
-        mode=args.mode, task=args.task, seed=args.seed,
-        eval_mode=args.eval_mode,
-        test_subject_id=args.test_subject_id,
-        test_trial_id=args.test_trial_id,
-        session_robust_z=args.session_robust_z,
-        eps=args.eps, d_model=args.d_model, depth=args.depth,
-        n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        n_epochs=args.n_epochs,
-        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
-        slurm_partition=args.slurm_partition,
-        slurm_account=args.slurm_account,
-        mem_gb=args.mem_gb,
-        gpus_per_node=args.gpus_per_node,
-        cpus_per_task=args.cpus_per_task,
-        timeout_min=args.timeout_min,
-        precision=args.precision,
-        extractor_cache_folder=args.extractor_cache_folder,
-        dkoleo_mode=args.dkoleo_mode,
-        cross_attn_positions=cross_attn_positions,
-        mains_notch_hz=args.mains_notch_hz,
-        subtype_embed_enabled=args.subtype_embed_enabled,
-        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
-        subtype_embed_vocab=args.subtype_embed_vocab,
-        ref_embed_enabled=args.ref_embed_enabled,
-        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
-        phase_mode=args.phase_mode,
-        ref_operator_alpha=args.ref_operator_alpha,
-        include_ajile12=args.include_ajile12,
-        ffn_variant=args.ffn_variant,
-        gradient_checkpointing=args.gradient_checkpointing,
-        readout=args.readout,
-    )
+    common = _common_build_kwargs(args, cross_attn_positions=cross_attn_positions)
     whisper = dict(
         whisper_target_cache_dir=args.whisper_target_cache_dir,
         whisper_layer_merge=args.whisper_layer_merge,
@@ -1470,8 +1509,11 @@ def _build_v14_chain(
         **common, **whisper, p3_distill=True, p3_stage="3b", clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
+    # binary_tasks now rides in `common` (reaches every phase, so the SSL /
+    # distill clip population matches the P4 eval set); P4 only overrides the
+    # parity window + zero lag.
     p4 = build_v14_experiment(
-        **common, phase4_frozen_probe=True, binary_tasks=args.binary_tasks,
+        **common, phase4_frozen_probe=True,
         clip_len=1.0, neural_lag_s=0.0,
     )
     return [p1, p2, p3a, p3b, p4]
@@ -1479,6 +1521,13 @@ def _build_v14_chain(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # Gate-B flag 3 / Gate-D fix: phase-couple the clip window when the operator
+    # leaves --clip-len unset. A single --phase 4 run that defaulted to 5 s would
+    # silently run the readout off the leaderboard-parity 1 s window. --chain
+    # ignores this (it sets each phase's clip explicitly), but resolving here
+    # keeps the run summary honest.
+    if args.clip_len is None:
+        args.clip_len = 1.0 if args.phase == 4 else DEFAULT_CLIP_LEN_S
     if args.phase == 2 and not args.chain:
         # Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
         # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 --jepa-phase p2
@@ -1568,41 +1617,20 @@ def main(argv: list[str] | None = None) -> int:
             "without it. Add it (and --channel-stats-path unless "
             "--no-target-standardize)."
         )
+    # --resume-from (warm-start) AND --snapshot-ckpt-to (hand off downstream)
+    # both require the transferable-state protocol, which only the frozen-probe
+    # V14Phase4ReadoutExperiment carries — the base supervised Experiment would
+    # TypeError at runtime (after a full train) on either. So either flag, like
+    # --frozen-probe, selects the readout experiment on P4.
     phase4_frozen_probe = args.phase == 4 and (
-        args.frozen_probe or args.resume_from is not None
+        args.frozen_probe
+        or args.resume_from is not None
+        or args.snapshot_ckpt_to is not None
     )
     xp = build_v14_experiment(
-        mode=args.mode, task=args.task, seed=args.seed,
-        eval_mode=args.eval_mode,
-        test_subject_id=args.test_subject_id,
-        test_trial_id=args.test_trial_id,
-        binary_tasks=args.binary_tasks,
-        session_robust_z=args.session_robust_z,
-        eps=args.eps, d_model=args.d_model, depth=args.depth,
-        n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
+        **_common_build_kwargs(args, cross_attn_positions=cross_attn_positions),
         clip_len=args.clip_len,
         neural_lag_s=args.neural_lag_s,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        n_epochs=args.n_epochs,
-        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
-        slurm_partition=args.slurm_partition,
-        slurm_account=args.slurm_account,
-        mem_gb=args.mem_gb,
-        gpus_per_node=args.gpus_per_node,
-        cpus_per_task=args.cpus_per_task,
-        timeout_min=args.timeout_min,
-        precision=args.precision,
-        extractor_cache_folder=args.extractor_cache_folder,
-        dkoleo_mode=args.dkoleo_mode,
-        cross_attn_positions=cross_attn_positions,
-        mains_notch_hz=args.mains_notch_hz,
-        subtype_embed_enabled=args.subtype_embed_enabled,
-        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
-        subtype_embed_vocab=args.subtype_embed_vocab,
-        ref_embed_enabled=args.ref_embed_enabled,
-        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
-        phase_mode=args.phase_mode,
-        ref_operator_alpha=args.ref_operator_alpha,
         joint_phase=(args.phase == 1),
         p3_distill=(args.phase == 3),
         p3_stage=args.p3_stage,
@@ -1613,15 +1641,8 @@ def main(argv: list[str] | None = None) -> int:
         phase4_frozen_probe=phase4_frozen_probe,
         pretrained_ckpt=args.resume_from,
         snapshot_ckpt_to=args.snapshot_ckpt_to,
-        include_ajile12=args.include_ajile12,
-        ffn_variant=args.ffn_variant,
-        latent_valid_override=args.latent_valid_override,
-        sa_mask_mode=args.sa_mask_mode,
-        loss_variant=args.loss_variant,
         jepa_phase=args.jepa_phase,
         frontend_lr_scale=args.frontend_lr_scale,
-        readout=args.readout,
-        gradient_checkpointing=args.gradient_checkpointing,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")
