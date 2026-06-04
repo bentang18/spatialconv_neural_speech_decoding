@@ -431,6 +431,36 @@ def build_v14_experiment(
     # brain-model config; the encoder forward gates it on training + grad
     # so the no_grad teacher pass is never checkpointed. Numerics-safe.
     gradient_checkpointing: bool = False,
+    # WS-F / B33 Phase-3 distillation routing (#21). ``p3_distill=True`` returns
+    # a :class:`V14Phase3Experiment` (Whisper all-layer-mean SmoothL1 distill)
+    # instead of the joint / supervised path; ``p3_stage`` picks 3a (encoder
+    # frozen, PMA+projector connector warmup) or 3b (encoder unfrozen,
+    # discriminative LR). P3 REQUIRES ``whisper_target_cache_dir`` (the teacher
+    # stream) and, when ``target_standardize`` (B33 default), a
+    # ``channel_stats_path`` (train-only per-channel z-score stats from
+    # fit_channel_stats). Mutually exclusive with ``joint_phase``.
+    p3_distill: bool = False,
+    p3_stage: tp.Literal["3a", "3b"] = "3a",
+    channel_stats_path: str | None = None,
+    target_standardize: bool = True,
+    projector_mode: tp.Literal["mlp", "linear"] = "mlp",
+    # B33 §5 3b parcel-side discriminative-LR scale (base/3 lock). No effect
+    # under 3a / the non-P3 paths; persisted onto the run record either way.
+    parcel_lr_scale: float = 1.0 / 3.0,
+    # WS-G B35 Phase-4 frozen-probe routing (#21). ``phase4_frozen_probe=True``
+    # returns a :class:`V14Phase4ReadoutExperiment` (frozen encoder + frozen
+    # P3-PMA → mean → trainable Linear, the B35 readout) carrying the
+    # transferable-state protocol so it can warm-start from a P3 snapshot — the
+    # base supervised ``Experiment`` (default P4) builds a from-scratch CE
+    # ``BrainModule`` with no handoff. The chain / any ``--resume-from`` P4 run
+    # uses the frozen probe. Mutually exclusive with ``joint_phase`` / ``p3_distill``.
+    phase4_frozen_probe: bool = False,
+    # B36 WS-E (E3/E4) cross-phase checkpoint handoff, threaded onto the
+    # Experiment so the multi-phase chain (``run_phase_pipeline``) or a manual
+    # per-phase ``--resume-from`` warm-starts / snapshots the transferable
+    # encoder (+PMA from P3). Both default off — inert for a standalone phase.
+    pretrained_ckpt: str | None = None,
+    snapshot_ckpt_to: str | None = None,
 ) -> Experiment:
     """Compose a v14 first-pass Experiment ready for ``.run()`` dispatch.
 
@@ -741,6 +771,17 @@ def build_v14_experiment(
     if timeout_min is not None:
         infra_cfg["timeout_min"] = timeout_min
 
+    # #21: phase routing is exclusive — joint (P1/P2), P3 distill, and the
+    # P4 frozen probe each replace the brain module differently and cannot
+    # co-select. Fail at construction rather than silently letting the first
+    # branch win.
+    if sum((joint_phase, p3_distill, phase4_frozen_probe)) > 1:
+        raise ValueError(
+            "joint_phase / p3_distill / phase4_frozen_probe are mutually "
+            f"exclusive phase selectors; got joint_phase={joint_phase}, "
+            f"p3_distill={p3_distill}, phase4_frozen_probe={phase4_frozen_probe}."
+        )
+
     experiment_cls: type[Experiment] = Experiment
     extra_experiment_kwargs: dict[str, tp.Any] = {}
     if joint_phase:
@@ -767,6 +808,42 @@ def build_v14_experiment(
             # B36 WS-E E2: P2 front-end discriminative-LR scale.
             "frontend_lr_scale": frontend_lr_scale,
         }
+    elif p3_distill:
+        # WS-F P3 Whisper distillation. The teacher stream is mandatory — the
+        # SmoothL1 loss consumes ``whisper_target``; without it the segmenter
+        # emits no target and the P3 step crashes downstream. Fail early + loud.
+        if whisper_target_cache_dir is None:
+            raise ValueError(
+                "p3_distill=True needs whisper_target_cache_dir (the whole-movie "
+                "Whisper teacher cache); the P3 SmoothL1 loss has no target "
+                "without it. Pass --whisper-target-cache-dir."
+            )
+        from speech_decoding.experiments.v14_phase3 import V14Phase3Experiment
+
+        experiment_cls = V14Phase3Experiment
+        extra_experiment_kwargs = {
+            "phase": p3_stage,
+            "projector_mode": projector_mode,
+            "target_standardize": target_standardize,
+            # Validated by V14Phase3Experiment.model_post_init (required when
+            # target_standardize=True; the R-no-target-standardize sister sets
+            # target_standardize=False and may leave this None).
+            "channel_stats_path": channel_stats_path,
+            # B33 §5 3b discriminative-LR scales (front-end base·scale, parcel
+            # base·scale, connector base). No effect under 3a.
+            "frontend_lr_scale": frontend_lr_scale,
+            "parcel_lr_scale": parcel_lr_scale,
+        }
+    elif phase4_frozen_probe:
+        # WS-G B35 frozen-encoder readout probe. Carries the transferable-state
+        # protocol (encoder + PMA strict load, projector dropped) so it can
+        # warm-start from a P3 snapshot; the base supervised Experiment cannot.
+        from speech_decoding.experiments.v14_phase4 import (
+            V14Phase4ReadoutExperiment,
+        )
+
+        experiment_cls = V14Phase4ReadoutExperiment
+        extra_experiment_kwargs = {"phase": 4}
     elif (
         latent_valid_override != "support"
         or sa_mask_mode != "bidirectional"
@@ -860,6 +937,12 @@ def build_v14_experiment(
         ],
         n_epochs=n_epochs,
         seed=seed,
+        # B36 WS-E (E3/E4) cross-phase handoff. On a standalone phase both are
+        # None (no-op); the chain driver (run_phase_pipeline) rewrites them via
+        # infra.clone_obj, and a manual incremental launch sets them from
+        # --resume-from / --snapshot-ckpt-to.
+        pretrained_ckpt=pretrained_ckpt,
+        snapshot_ckpt_to=snapshot_ckpt_to,
         # Per-clip metadata reaches the encoder forward as additional
         # kwargs alongside (tokens, support, valid_mask).
         x_name=(
@@ -1183,6 +1266,49 @@ def _parser() -> argparse.ArgumentParser:
                         "'3b' unfreezes it with a discriminative LR "
                         "(front-end base/10, parcel base/3, connector base). "
                         "Default 3a.")
+    # WS-F P3 distillation data (#21). The teacher cache is the whole-movie
+    # Whisper stream; channel stats are the train-only per-channel z-score.
+    p.add_argument("--whisper-target-cache-dir", default=None,
+                   help="Root of the whole-movie Whisper teacher cache "
+                        "(scripts/neuroprobe/build_bt_teacher_cache.py). REQUIRED "
+                        "for --phase 3 / --chain; the P3 SmoothL1 loss consumes "
+                        "the per-clip whisper_target it slices.")
+    p.add_argument("--whisper-layer-merge", choices=("mean_all", "8"),
+                   default="mean_all",
+                   help="Whisper teacher layer merge; must match the cache build. "
+                        "'mean_all' (locked default) / '8' = R-whisper-single-layer-L8.")
+    p.add_argument("--channel-stats-path", default=None,
+                   help="Train-only per-channel target z-score stats "
+                        "({'mean','inv_std'} from fit_channel_stats). REQUIRED for "
+                        "--phase 3 / --chain unless --no-target-standardize.")
+    p.add_argument("--no-target-standardize", dest="target_standardize",
+                   action="store_false", default=True,
+                   help="R-no-target-standardize sister: distill against the raw "
+                        "1280-d Whisper target (no per-channel z-score).")
+    # WS-G P4 frozen probe + cross-phase handoff (#21).
+    p.add_argument("--frozen-probe", action="store_true", default=False,
+                   help="--phase 4 only: build the B35 frozen-encoder readout "
+                        "probe (V14Phase4ReadoutExperiment, transferable-state "
+                        "protocol) instead of the from-scratch supervised CE "
+                        "classifier. Implied when --resume-from is set on P4.")
+    p.add_argument("--resume-from", default=None,
+                   help="Warm-start this phase's encoder (+PMA from P3) from a "
+                        "prior phase's transferable-state snapshot "
+                        "(Experiment.pretrained_ckpt). Lets the chain run "
+                        "incrementally, one verified sbatch per phase.")
+    p.add_argument("--snapshot-ckpt-to", default=None,
+                   help="After test, write this phase's transferable state to PATH "
+                        "(Experiment.snapshot_ckpt_to) for the next phase to load.")
+    # #21 full in-process chain driver.
+    p.add_argument("--chain", action="store_true", default=False,
+                   help="Run the full P1->P2->P3a->P3b->P4 pipeline in one "
+                        "process with checkpoint handoff (run_phase_pipeline). "
+                        "Overrides --phase. Needs --work-dir, "
+                        "--whisper-target-cache-dir, and --channel-stats-path "
+                        "(unless --no-target-standardize).")
+    p.add_argument("--work-dir", default=None,
+                   help="Directory for the --chain per-phase ckpt handoff "
+                        "(phase_{i}.ckpt). Required with --chain.")
     return p
 
 
@@ -1204,22 +1330,11 @@ _PHASE2_BLOCKERS = (
     "Sister R-keep-phase-split keeps explicit P1/P2 via the parent "
     "V14Experiment — see docs/neuroprobe/v14_blockers.md."
 )
-_PHASE3_BLOCKERS = (
-    # WS-F closed the Phase-3 readout/distillation wiring: the
-    # V14Phase3DistillModule (frozen-or-discriminative encoder → PMA → 256→1280
-    # projector → Smooth-L1 vs pooled+standardized Whisper target) and the
-    # V14Phase3Experiment are built and unit-tested (module forward/loss/freeze
-    # + the experiment's model_post_init guards + _build_standardizer in
-    # test_v14_phase3.py). Full P3 end-to-end construction is the WS-I2 capstone
-    # (pending). The one remaining LIVE-dispatch blocker is the whisper_target
-    # data emission: the segmenter has no extractor for the cached 50 Hz
-    # all-layer-mean Whisper feature ((B, 250, 1280)) yet — that is WS-H.
-    "Phase-3 distillation (V14Phase3DistillModule / V14Phase3Experiment) is "
-    "wired and unit-tested; the live dispatch path still needs the "
-    "whisper_target segmenter extractor (cached 50 Hz Whisper all-layer-mean "
-    "feature, (B, 250, 1280)) — the P3 data-layer emission is the remaining "
-    "WS-H blocker. See ssl/distill.py + experiments/v14_phase3.py."
-)
+# E5/WS-F/#21 2026-06-03: ``_PHASE3_BLOCKERS`` removed. The whisper_target
+# segmenter emission (WS-H, #20) landed, so --phase 3 now routes to
+# V14Phase3Experiment via build_v14_experiment(p3_distill=True) and the chain
+# driver runs P3a/P3b end-to-end. (``_PHASE1_BLOCKERS`` was removed in E5; only
+# ``_PHASE2_BLOCKERS`` survives — phase 2 is the collapsed legacy split.)
 
 
 def construct_v14_joint_callbacks(
@@ -1269,17 +1384,110 @@ def construct_v14_joint_callbacks(
     return callbacks
 
 
+def _build_v14_chain(
+    args, *, cross_attn_positions: list[int] | None,
+) -> list[Experiment]:
+    """Assemble the 5 staged experiments [P1, P2, P3a, P3b, P4] for the chain.
+
+    Every phase shares the model/eval/cluster knobs from ``args``; only the
+    phase selector, clip window, and (for P3) the teacher stream differ. The
+    cross-phase ckpt handoff is NOT set here — ``run_phase_pipeline`` rewrites
+    ``snapshot_ckpt_to`` / ``pretrained_ckpt`` per boundary via
+    ``infra.clone_obj`` so each phase snapshots to / loads from its neighbour.
+
+    Clip window: 5 s (T_p=40) for the SSL + distill phases so the student grid
+    meets the Whisper teacher's 40-frame pool; 1 s (T_p=8) for the P4 readout
+    (leaderboard parity). P4 forces ``neural_lag_s=0.0`` — a non-zero probe
+    offset breaks the [onset, onset+1 s] parity window (Gate-B flag 3).
+    """
+    if args.work_dir is None:
+        raise ValueError("--chain needs --work-dir for the per-phase ckpt handoff.")
+    if args.whisper_target_cache_dir is None:
+        raise ValueError(
+            "--chain needs --whisper-target-cache-dir (the P3 stages distill "
+            "against the Whisper teacher stream)."
+        )
+    if args.target_standardize and args.channel_stats_path is None:
+        raise ValueError(
+            "--chain with target standardization (B33 default) needs "
+            "--channel-stats-path; pass --no-target-standardize to distill "
+            "against the raw 1280-d target instead."
+        )
+
+    common: dict[str, tp.Any] = dict(
+        mode=args.mode, task=args.task, seed=args.seed,
+        eval_mode=args.eval_mode,
+        test_subject_id=args.test_subject_id,
+        test_trial_id=args.test_trial_id,
+        session_robust_z=args.session_robust_z,
+        eps=args.eps, d_model=args.d_model, depth=args.depth,
+        n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        n_epochs=args.n_epochs,
+        cluster=args.cluster, fast_dev_run=args.fast_dev_run,
+        slurm_partition=args.slurm_partition,
+        slurm_account=args.slurm_account,
+        mem_gb=args.mem_gb,
+        gpus_per_node=args.gpus_per_node,
+        cpus_per_task=args.cpus_per_task,
+        timeout_min=args.timeout_min,
+        precision=args.precision,
+        extractor_cache_folder=args.extractor_cache_folder,
+        dkoleo_mode=args.dkoleo_mode,
+        cross_attn_positions=cross_attn_positions,
+        mains_notch_hz=args.mains_notch_hz,
+        subtype_embed_enabled=args.subtype_embed_enabled,
+        subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
+        subtype_embed_vocab=args.subtype_embed_vocab,
+        ref_embed_enabled=args.ref_embed_enabled,
+        ref_embed_reuse_kv=args.ref_embed_reuse_kv,
+        phase_mode=args.phase_mode,
+        ref_operator_alpha=args.ref_operator_alpha,
+        include_ajile12=args.include_ajile12,
+        ffn_variant=args.ffn_variant,
+        gradient_checkpointing=args.gradient_checkpointing,
+        readout=args.readout,
+    )
+    whisper = dict(
+        whisper_target_cache_dir=args.whisper_target_cache_dir,
+        whisper_layer_merge=args.whisper_layer_merge,
+        channel_stats_path=args.channel_stats_path,
+        target_standardize=args.target_standardize,
+    )
+    p1 = build_v14_experiment(
+        **common, joint_phase=True, jepa_phase="p1", clip_len=5.0,
+        neural_lag_s=args.neural_lag_s,
+    )
+    p2 = build_v14_experiment(
+        **common, joint_phase=True, jepa_phase="p2", clip_len=5.0,
+        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+    )
+    p3a = build_v14_experiment(
+        **common, **whisper, p3_distill=True, p3_stage="3a", clip_len=5.0,
+        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+    )
+    p3b = build_v14_experiment(
+        **common, **whisper, p3_distill=True, p3_stage="3b", clip_len=5.0,
+        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+    )
+    p4 = build_v14_experiment(
+        **common, phase4_frozen_probe=True, binary_tasks=args.binary_tasks,
+        clip_len=1.0, neural_lag_s=0.0,
+    )
+    return [p1, p2, p3a, p3b, p4]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.phase == 2:
+    if args.phase == 2 and not args.chain:
         # Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
-        # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 (V14JointExperiment).
-        # Phase 3 is NO LONGER gated here — its module/experiment are wired
-        # (WS-F: V14Phase3DistillModule / V14Phase3Experiment) and the live
-        # dispatch hits the precise whisper_target data blocker below (after the
-        # dry-run short-circuit) rather than a blanket gate. (phase=1 falls
-        # through to construct V14JointExperiment; its B2.x sister-gating fires
-        # at construction in model_post_init, see above.)
+        # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 --jepa-phase p2
+        # (V14JointExperiment). --phase 1 falls through to construct
+        # V14JointExperiment; its B2.x sister-gating fires at construction in
+        # model_post_init. (--chain builds its own P2 via --jepa-phase p2, so it
+        # is exempt from this single-phase guard.) Phase 3 (#21, WS-F) is no
+        # longer gated — --phase 3 routes to V14Phase3Experiment now that the
+        # whisper_target emission (WS-H, #20) has landed.
         raise NotImplementedError(
             f"--phase 2 dispatch is gated on unresolved blockers: "
             f"{_PHASE2_BLOCKERS}. See docs/neuroprobe/v14_blockers.md."
@@ -1307,6 +1515,16 @@ def main(argv: list[str] | None = None) -> int:
               f"gpus_per_node={args.gpus_per_node} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
     print(f"  precision={args.precision}")
+    # #21 phase routing + cross-phase handoff (recorded so the run YAML never
+    # silently rides the wrong phase / checkpoint).
+    print(f"  phase={args.phase} chain={args.chain} p3_stage={args.p3_stage} "
+          f"frozen_probe={args.frozen_probe} clip_len={args.clip_len}")
+    print(f"  whisper_target_cache_dir={args.whisper_target_cache_dir!r} "
+          f"whisper_layer_merge={args.whisper_layer_merge} "
+          f"target_standardize={args.target_standardize} "
+          f"channel_stats_path={args.channel_stats_path!r}")
+    print(f"  resume_from={args.resume_from!r} "
+          f"snapshot_ckpt_to={args.snapshot_ckpt_to!r} work_dir={args.work_dir!r}")
     _resolved_xc = args.extractor_cache_folder or os.environ.get(
         "EXCA_EXTRACTOR_CACHE_FOLDER"
     )
@@ -1323,18 +1541,36 @@ def main(argv: list[str] | None = None) -> int:
               "default electrode-tokens extractor = MultiStftView)")
         return 0
 
-    if args.phase == 3:
-        # WS-F: the Phase-3 distillation module + experiment are wired
-        # (V14Phase3DistillModule / V14Phase3Experiment) and unit-tested
-        # (test_v14_phase3.py). Full P3 end-to-end construction is the WS-I2
-        # capstone (pending). The LIVE dispatch path still needs the
-        # whisper_target data emission (WS-H); fail fast + precise rather than
-        # silently building a Phase-4 CE classifier.
-        raise NotImplementedError(
-            f"--phase 3 (stage {args.p3_stage}) dispatch: {_PHASE3_BLOCKERS} "
-            "See docs/neuroprobe/v14_blockers.md."
+    if args.chain:
+        # #21: full P1->P2->P3a->P3b->P4 pipeline in one process with ckpt
+        # handoff (run_phase_pipeline). Overrides --phase.
+        from speech_decoding.experiments.v14_phase_pipeline import (
+            run_phase_pipeline,
         )
 
+        phases = _build_v14_chain(args, cross_attn_positions=cross_attn_positions)
+        print(f"  chain: {len(phases)} phases (P1,P2,P3a,P3b,P4) "
+              f"work_dir={args.work_dir}")
+        results = run_phase_pipeline(phases, work_dir=args.work_dir)
+        print(f"V14 chain results: {results}")
+        return 0
+
+    # WS-F/WS-G #21: single-phase routing. phase 1 -> joint (V14JointExperiment);
+    # phase 3 -> V14Phase3Experiment (Whisper distill); phase 4 -> base
+    # supervised Experiment, or V14Phase4ReadoutExperiment (frozen probe) when
+    # --frozen-probe / --resume-from is set so it can warm-start from P3.
+    if args.phase == 3 and args.whisper_target_cache_dir is None:
+        # Operator-level guard, independent of BT-data presence: P3 distills
+        # against the whisper_target stream, so the cache dir is mandatory.
+        raise ValueError(
+            "--phase 3 (Whisper distillation, V14Phase3Experiment) needs "
+            "--whisper-target-cache-dir; the P3 SmoothL1 loss has no target "
+            "without it. Add it (and --channel-stats-path unless "
+            "--no-target-standardize)."
+        )
+    phase4_frozen_probe = args.phase == 4 and (
+        args.frozen_probe or args.resume_from is not None
+    )
     xp = build_v14_experiment(
         mode=args.mode, task=args.task, seed=args.seed,
         eval_mode=args.eval_mode,
@@ -1368,6 +1604,15 @@ def main(argv: list[str] | None = None) -> int:
         phase_mode=args.phase_mode,
         ref_operator_alpha=args.ref_operator_alpha,
         joint_phase=(args.phase == 1),
+        p3_distill=(args.phase == 3),
+        p3_stage=args.p3_stage,
+        whisper_target_cache_dir=args.whisper_target_cache_dir,
+        whisper_layer_merge=args.whisper_layer_merge,
+        channel_stats_path=args.channel_stats_path,
+        target_standardize=args.target_standardize,
+        phase4_frozen_probe=phase4_frozen_probe,
+        pretrained_ckpt=args.resume_from,
+        snapshot_ckpt_to=args.snapshot_ckpt_to,
         include_ajile12=args.include_ajile12,
         ffn_variant=args.ffn_variant,
         latent_valid_override=args.latent_valid_override,

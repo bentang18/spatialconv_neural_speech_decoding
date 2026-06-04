@@ -34,20 +34,56 @@ def test_phase_3_dry_run_no_longer_gated(
     assert "V14 dispatch" in capsys.readouterr().out
 
 
-def test_phase_3_live_raises_whisper_target_data_blocker() -> None:
-    """WS-F: a real --phase 3 run (no --dry-run) fails fast with the precise
-    remaining blocker — the whisper_target data emission (WS-H) — rather than
-    silently building a Phase-4 CE classifier. The module + experiment
-    themselves are wired (V14Phase3DistillModule / V14Phase3Experiment) and
-    unit-tested in test_v14_phase3.py; full P3 end-to-end construction is the
-    WS-I2 capstone (pending)."""
-    with pytest.raises(NotImplementedError) as exc_info:
+def test_phase_3_live_without_cache_raises_operator_error() -> None:
+    """#21 (WS-H landed): --phase 3 is no longer blanket-gated. A live run
+    without --whisper-target-cache-dir fails fast with a clear operator error
+    (the P3 SmoothL1 loss has no target stream), NOT the old WS-H blocker."""
+    with pytest.raises(ValueError) as exc_info:
         main(["--phase", "3"])
     message = str(exc_info.value)
-    for token in (
-        "whisper_target", "V14Phase3DistillModule", "WS-H", "v14_phase3.py",
-    ):
-        assert token in message, f"phase 3: missing blocker token {token}"
+    assert "--whisper-target-cache-dir" in message
+    assert "Whisper distillation" in message
+
+
+def test_phase_3_live_with_cache_routes_into_p3_build(monkeypatch) -> None:
+    """#21: with the teacher cache supplied, --phase 3 routes into the P3 build
+    (V14Phase3Experiment) rather than raising at the phase switch. With
+    ROOT_DIR_BRAINTREEBANK unset the build raises the early data-root error —
+    proof the dispatch reached build_v14_experiment, i.e. P3 is wired, not
+    gated. (Full P3 construction is exercised by the synthetic-BT capstone.)"""
+    monkeypatch.delenv("ROOT_DIR_BRAINTREEBANK", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        main([
+            "--phase", "3",
+            "--whisper-target-cache-dir", "/nonexistent/teacher_cache",
+            "--no-target-standardize",
+        ])
+    assert "ROOT_DIR_BRAINTREEBANK" in str(exc_info.value)
+
+
+def test_chain_without_work_dir_raises() -> None:
+    """#21: --chain needs --work-dir for the per-phase ckpt handoff; fail fast
+    at the operator boundary before any (data-bound) build."""
+    with pytest.raises(ValueError) as exc_info:
+        main(["--chain", "--whisper-target-cache-dir", "/x", "--no-target-standardize"])
+    assert "--work-dir" in str(exc_info.value)
+
+
+def test_chain_without_whisper_cache_raises(tmp_path) -> None:
+    """#21: --chain runs the P3 distill stages, so the teacher cache is required."""
+    with pytest.raises(ValueError) as exc_info:
+        main(["--chain", "--work-dir", str(tmp_path), "--no-target-standardize"])
+    assert "--whisper-target-cache-dir" in str(exc_info.value)
+
+
+def test_chain_standardize_without_channel_stats_raises(tmp_path) -> None:
+    """#21: --chain with B33 default standardization needs --channel-stats-path."""
+    with pytest.raises(ValueError) as exc_info:
+        main([
+            "--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/x",
+        ])
+    assert "--channel-stats-path" in str(exc_info.value)
 
 
 def test_phase_1_dry_run_constructs_joint_experiment_path(
