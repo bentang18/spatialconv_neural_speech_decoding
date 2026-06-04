@@ -316,6 +316,19 @@ def test_e3_load_requires_transferable_protocol() -> None:
         Experiment._load_pretrained(None, torch.nn.Linear(2, 2), "/tmp/x.ckpt")  # type: ignore[arg-type]
 
 
+def test_e3_load_missing_snapshot_raises_actionable_error() -> None:
+    # Gate-D F4: the snapshot write lives INSIDE the exca-cached run() body, so a
+    # cache-hit phase on a purged work_dir leaves no .ckpt for the next phase to
+    # warm-start from. A protocol-valid module + a missing ckpt must raise an
+    # actionable FileNotFoundError (NOT the opaque bare torch.load one, and NOT
+    # the earlier protocol TypeError — the module HAS the protocol here).
+    dst = _module("p2", seed=2)  # has load_transferable_state
+    with tempfile.TemporaryDirectory() as td:
+        missing = str(Path(td) / "never_written" / "phase_0.ckpt")
+        with pytest.raises(FileNotFoundError, match="cache-hit"):
+            Experiment._load_pretrained(None, dst, missing)  # type: ignore[arg-type]
+
+
 # --------------------------------------------------------------------------
 # E5 — dead _PHASE1_BLOCKERS removed + docstrings match the call graph
 # --------------------------------------------------------------------------
