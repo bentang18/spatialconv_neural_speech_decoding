@@ -62,6 +62,14 @@ class Experiment(BaseExperiment):
     # (back-compat for the tiny test experiments). The v14 §7 recipe locks
     # ``grad_clip = 1.0`` as a non-swept universal; the v14 dispatch sets it.
     gradient_clip_val: float | None = None
+    # Lightning ``accumulate_grad_batches``. 1 (default) → no accumulation, bit
+    # -for-bit the prior behavior. >1 sums grads over N micro-batches before each
+    # optimizer step → effective batch = batch_size * N, at N× the wall-clock per
+    # step (it does NOT reduce the per-step horizon — ``max_steps`` still counts
+    # optimizer steps, so ``estimated_stepping_batches`` already tracks the right
+    # cosine horizon). The effective-batch lever for the 32 GB card when a bigger
+    # GPU is unavailable; a larger physical batch on a 48 GB+ card is preferred.
+    accumulate_grad_batches: int = 1
     x_name: str | tuple[str, ...] = "input"
     y_name: str = "target"
     target_field: str = "code"
@@ -210,6 +218,8 @@ class Experiment(BaseExperiment):
             kwargs["precision"] = self.precision
         if self.gradient_clip_val is not None:
             kwargs["gradient_clip_val"] = self.gradient_clip_val
+        if self.accumulate_grad_batches != 1:
+            kwargs["accumulate_grad_batches"] = self.accumulate_grad_batches
         return pl.Trainer(**kwargs)
 
     def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:

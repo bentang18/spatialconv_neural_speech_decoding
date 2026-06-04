@@ -221,6 +221,17 @@ def test_gradient_clip_val_passed_to_trainer() -> None:
     assert clipped._trainer().gradient_clip_val == 1.0
 
 
+def test_accumulate_grad_batches_passed_to_trainer() -> None:
+    """#42: accumulate_grad_batches reaches the trainer when >1; the default 1
+    is omitted so the trainer keeps its own default (bit-for-bit prior run)."""
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+    assert base.accumulate_grad_batches == 1  # default: no accumulation
+    assert base._trainer().accumulate_grad_batches == 1  # Lightning default
+
+    accum = base.model_copy(update={"accumulate_grad_batches": 8})
+    assert accum._trainer().accumulate_grad_batches == 8
+
+
 class _StubCkptCb:
     def __init__(self, best_model_path: str) -> None:
         self.best_model_path = best_model_path

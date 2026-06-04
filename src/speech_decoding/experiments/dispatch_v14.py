@@ -282,9 +282,18 @@ def _build_optim_cfg(
 ) -> dict[str, tp.Any]:
     """Assemble the ``LightningOptimizer`` config dict (#37, audit 2026-06-03).
 
-    ``fused=True`` keeps the 2026-05-30 speedup; ``betas`` / ``weight_decay`` are
-    added ONLY when set, so the default (Adam, lr=1e-3, no β/wd) is the prior
-    plain-Adam config bit-for-bit. With ``lr_schedule="warmup_cosine"`` the §7
+    NOT fused: a fused torch optimizer sets ``_step_supports_amp_scaling=True``,
+    which makes Lightning's bf16-mixed AMP precision plugin REFUSE gradient
+    clipping (``precision/amp.py`` raises "does not allow for gradient clipping
+    because it performs unscaling of gradients internally"). The §7 recipe locks
+    BOTH ``grad_clip=1.0`` and ``bf16-mixed``, so fused is incompatible and must
+    stay off (verified live: job 47686013 crashed at the first optimizer step on
+    exactly this combo; pre-#37 runs only got away with fused because grad-clip
+    was silently OFF). fused was a 2026-05-30 speedup, never a recipe lock — the
+    non-fused path is the standard, with negligible cost at this model size.
+    ``betas`` / ``weight_decay`` are added ONLY when set, so the default (Adam,
+    lr=1e-3, no β/wd) is the prior plain-Adam config (sans the fused speedup).
+    With ``lr_schedule="warmup_cosine"`` the §7
     locked linear-warmup → cosine→0 shape is attached via the custom
     ``WarmupCosine`` scheduler — fields are TOP-LEVEL (it is a plain
     ``BaseLRScheduler``, NOT a ``kwargs``-dict ``BaseTorchLRScheduler``); its
@@ -312,7 +321,11 @@ def _build_optim_cfg(
             "pass), or implement the no-WD groups first. See "
             "reports/b01_lr_schedule_unimplemented_lock_2026_06_03.md."
         )
-    optim_kwargs: dict[str, tp.Any] = {"fused": True}
+    # NOT fused — fused optimizers are incompatible with Lightning's bf16-mixed
+    # AMP gradient clipping (see docstring; both are §7 locks). Empty default →
+    # standard non-fused torch optimizer, which clears _step_supports_amp_scaling
+    # so the AMP clip guard does not fire.
+    optim_kwargs: dict[str, tp.Any] = {}
     if weight_decay:
         # Unreachable while the guard above stands (wd is falsy here); retained as
         # the exact post-guard-removal path — when the no-WD groups land (task #40)
@@ -325,7 +338,7 @@ def _build_optim_cfg(
         # lock-recommended ``--optimizer AdamW`` path (the guard only sees the flag
         # value, which is 0.0 here; without this pin AdamW would decay biases / LN
         # γβ / freq_embed at 0.01 uniformly). Adam's torch default is already 0.0,
-        # so its kwargs stay ``{"fused": True}`` bit-for-bit.
+        # so its kwargs stay empty.
         optim_kwargs["weight_decay"] = 0.0
     if adam_betas is not None:
         optim_kwargs["betas"] = list(adam_betas)
@@ -592,6 +605,11 @@ def build_v14_experiment(
     # for the locked v14 SSL β2. Kept None by default for behavior parity.
     adam_betas: tuple[float, float] | None = None,
     gradient_clip_val: float | None = None,
+    # Lightning ``accumulate_grad_batches`` (effective-batch lever). 1 → no
+    # accumulation (default; bit-for-bit prior behavior). >1 → effective batch =
+    # batch_size * N at N× wall-clock/step. Prefer a larger physical batch on a
+    # 48 GB+ card; this is the fallback for the 32 GB coganlab-gpu cards.
+    accumulate_grad_batches: int = 1,
     # B36 WS-E (E3/E4) cross-phase checkpoint handoff, threaded onto the
     # Experiment so the multi-phase chain (``run_phase_pipeline``) or a manual
     # per-phase ``--resume-from`` warm-starts / snapshots the transferable
@@ -1092,11 +1110,12 @@ def build_v14_experiment(
         },
         loss={"name": "CrossEntropyLoss"},
         # #37: optimizer/LR-schedule config built above from the optim flags.
-        # ``fused=True`` Adam (2026-05-30 speedup audit Tier-1) is preserved in
-        # the default; neuraltrain BaseTorchOptimizer forwards ``kwargs``
-        # verbatim to ``torch.optim.{Adam,AdamW}`` (``fused`` valid on CPU+CUDA
-        # in pinned torch 2.10, so the laptop test path is unaffected). Applies
-        # to BOTH the supervised Phase-4 and the joint SSL optimizer.
+        # NOT fused — fused sets _step_supports_amp_scaling=True, which makes
+        # Lightning's bf16-mixed AMP plugin refuse the §7-locked grad_clip=1.0
+        # (verified: job 47686013 crashed on this combo at the first opt step).
+        # neuraltrain BaseTorchOptimizer forwards ``kwargs`` verbatim to
+        # ``torch.optim.{Adam,AdamW}``. Applies to BOTH the supervised Phase-4
+        # and the joint SSL optimizer.
         optim=optim_cfg,
         metrics=[
             {
@@ -1112,6 +1131,7 @@ def build_v14_experiment(
         # non-swept universal; the CLI defaults --grad-clip to 1.0, but this
         # function default is None (the tiny test experiments don't clip).
         gradient_clip_val=gradient_clip_val,
+        accumulate_grad_batches=accumulate_grad_batches,
         seed=seed,
         # B36 WS-E (E3/E4) cross-phase handoff. On a standalone phase both are
         # None (no-op); the chain driver (run_phase_pipeline) rewrites them via
@@ -1223,6 +1243,14 @@ def _parser() -> argparse.ArgumentParser:
                         "the §7 locked-universal grad_clip that was silently OFF "
                         "(top divergence-risk fix per the 6/03 run-health audit). "
                         "Pass <= 0 to disable clipping.")
+    p.add_argument("--accumulate-grad-batches", dest="accumulate_grad_batches",
+                   type=int, default=1,
+                   help="Lightning accumulate_grad_batches. 1 (default) = no "
+                        "accumulation. >1 sums grads over N micro-batches → "
+                        "effective batch = --batch-size * N at N× wall-clock per "
+                        "optimizer step. The effective-batch lever for the 32 GB "
+                        "coganlab-gpu cards; a larger physical --batch-size on a "
+                        "48 GB+ card is preferred.")
     p.add_argument("--clip-len", type=float, default=None,
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
                         "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
@@ -1729,6 +1757,7 @@ def _common_build_kwargs(
         optimizer_name=args.optimizer_name,
         adam_betas=(0.9, args.adam_beta2) if args.adam_beta2 is not None else None,
         gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
 
 
@@ -1851,7 +1880,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  optim: name={args.optimizer_name} lr={args.lr} "
           f"lr_schedule={args.lr_schedule} warmup_steps={args.warmup_steps} "
           f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
-          f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip}")
+          f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip} "
+          f"accumulate_grad_batches={args.accumulate_grad_batches}")
     if args.cluster == "slurm":
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "

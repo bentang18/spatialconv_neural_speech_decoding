@@ -422,9 +422,33 @@ def test_grad_clip_zero_disables(monkeypatch) -> None:
     assert calls[0]["gradient_clip_val"] is None
 
 
+def test_accumulate_grad_batches_reaches_every_phase(monkeypatch, tmp_path) -> None:
+    """#42: --accumulate-grad-batches threads to all chain phases via
+    _common_build_kwargs (effective batch = --batch-size * N)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--accumulate-grad-batches", "8",
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    assert calls and all(c["accumulate_grad_batches"] == 8 for c in calls)
+
+
+def test_accumulate_grad_batches_default_is_one(monkeypatch) -> None:
+    """No flag → accumulate_grad_batches=1 (no accumulation, prior behavior)."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "1"])
+    assert calls[0]["accumulate_grad_batches"] == 1
+
+
 def test_build_optim_cfg_default_matches_prior_and_validates() -> None:
-    """The default optim dict is the prior plain-fused-Adam (no scheduler, no
-    β/wd) and validates as a LightningOptimizer with scheduler is None."""
+    """The default optim dict is the prior plain-Adam (no scheduler, no β/wd, and
+    — post live-crash fix 2026-06-04 — NOT fused; see
+    test_optim_not_amp_scaling_so_grad_clip_works) and validates as a
+    LightningOptimizer with scheduler is None."""
     import speech_decoding.experiments.dispatch_v14 as dv
     from neuraltrain.optimizers.base import LightningOptimizer
 
@@ -432,7 +456,7 @@ def test_build_optim_cfg_default_matches_prior_and_validates() -> None:
         lr=1e-3, lr_schedule="constant", warmup_steps=0, min_lr_ratio=0.0,
         weight_decay=0.0, optimizer_name="Adam", adam_betas=None,
     )
-    assert cfg == {"optimizer": {"name": "Adam", "lr": 1e-3, "kwargs": {"fused": True}}}
+    assert cfg == {"optimizer": {"name": "Adam", "lr": 1e-3, "kwargs": {}}}
     assert LightningOptimizer.model_validate(cfg).scheduler is None
 
 
@@ -475,7 +499,7 @@ def test_build_optim_cfg_adamw_pins_weight_decay_zero_no_torch_default_leak() ->
     guard sees a falsy flag and would otherwise OMIT weight_decay, letting AdamW's
     0.01 decay biases / LN γβ / freq_embed uniformly — the exact silent violation
     the guard exists to stop. So AdamW must pin weight_decay=0.0 explicitly; Adam
-    (torch default already 0.0) must stay ``{"fused": True}`` bit-for-bit."""
+    (torch default already 0.0) carries empty kwargs (non-fused, post-crash fix)."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     adamw = dv._build_optim_cfg(
@@ -483,11 +507,42 @@ def test_build_optim_cfg_adamw_pins_weight_decay_zero_no_torch_default_leak() ->
         weight_decay=0.0, optimizer_name="AdamW", adam_betas=None,
     )
     assert adamw["optimizer"]["kwargs"]["weight_decay"] == 0.0
+    assert "fused" not in adamw["optimizer"]["kwargs"]
     adam = dv._build_optim_cfg(
         lr=1e-3, lr_schedule="constant", warmup_steps=0, min_lr_ratio=0.0,
         weight_decay=0.0, optimizer_name="Adam", adam_betas=None,
     )
-    assert adam["optimizer"]["kwargs"] == {"fused": True}
+    assert adam["optimizer"]["kwargs"] == {}
+
+
+def test_optim_not_amp_scaling_so_grad_clip_works() -> None:
+    """Regression — live BT crash 2026-06-04 (job 47686013): a *fused* torch
+    optimizer sets ``_step_supports_amp_scaling=True``, which makes Lightning's
+    bf16-mixed AMP precision plugin REFUSE gradient clipping (``precision/amp.py``:
+    "does not allow for gradient clipping because it performs unscaling of
+    gradients internally"). The §7 recipe locks BOTH ``grad_clip=1.0`` and
+    ``bf16-mixed``, so ``_build_optim_cfg`` must build a NON-fused optimizer.
+    Assert the actual torch optimizer our cfg builds clears the exact flag
+    Lightning checks, for both families on the locked warmup-cosine + β2 path."""
+    import torch
+    import speech_decoding.experiments.dispatch_v14 as dv
+    from neuraltrain.optimizers.base import LightningOptimizer
+
+    for name in ("Adam", "AdamW"):
+        cfg = dv._build_optim_cfg(
+            lr=5e-4, lr_schedule="warmup_cosine", warmup_steps=10,
+            min_lr_ratio=0.1, weight_decay=0.0, optimizer_name=name,
+            adam_betas=(0.9, 0.95),
+        )
+        assert cfg["optimizer"]["kwargs"].get("fused") is not True
+        out = LightningOptimizer.model_validate(cfg).build(
+            [torch.zeros(1, requires_grad=True)], total_steps=100
+        )
+        opt = out["optimizer"]
+        # The exact check Lightning's AMP clip guard performs.
+        assert getattr(opt, "_step_supports_amp_scaling", False) is False, (
+            f"{name} would trip the bf16-mixed AMP grad-clip guard"
+        )
 
 
 def test_single_phase_passes_sister_flags(monkeypatch) -> None:
