@@ -176,6 +176,238 @@ def test_experiment_exposes_predictor_sizing_fields() -> None:
     assert fields["predictor_n_heads"].default == 4
 
 
+# ---------------------------------------------------------------------------
+# MON-TEACHER-FEATURE-RANK thresholds (task #74) — CLI-exposed, defaults locked
+# ---------------------------------------------------------------------------
+def test_rankme_thresholds_default_resolve_and_validate() -> None:
+    """P1 (M2 front-end probe): None → the canonical 0.5/0.25 (single-sourced
+    in teacher_rank.py); overrides are stored; a bad order or out-of-range
+    value raises at construction (not at step 0)."""
+    from speech_decoding.experiments.monitors import (
+        RANKME_NORMALISED_ALARM,
+        RANKME_NORMALISED_WARN,
+    )
+
+    m = _make_module()  # defaults (phase="p1")
+    assert m._rankme_warn_threshold == RANKME_NORMALISED_WARN
+    assert m._rankme_alarm_threshold == RANKME_NORMALISED_ALARM
+
+    m2 = _make_module(rankme_warn_threshold=0.4, rankme_alarm_threshold=0.3)
+    assert m2._rankme_warn_threshold == 0.4
+    assert m2._rankme_alarm_threshold == 0.3
+
+    # alarm >= warn is rejected.
+    with pytest.raises(ValueError, match="rankme_alarm"):
+        _make_module(rankme_warn_threshold=0.3, rankme_alarm_threshold=0.4)
+    # alarm must be > 0.
+    with pytest.raises(ValueError, match="rankme_alarm"):
+        _make_module(rankme_warn_threshold=0.5, rankme_alarm_threshold=0.0)
+
+
+def test_rankme_thresholds_partial_override() -> None:
+    """Only one flag set → the other resolves to its canonical default, and the
+    0<alarm<warn<=1 check runs AFTER resolution (the real sweep surface: a sweep
+    lowers warn alone toward the ~0.31 floor while alarm stays 0.25)."""
+    from speech_decoding.experiments.monitors import (
+        RANKME_NORMALISED_ALARM,
+        RANKME_NORMALISED_WARN,
+    )
+
+    # warn-only: alarm falls back to 0.25; 0.25 < 0.4 holds → constructs.
+    m = _make_module(rankme_warn_threshold=0.4)
+    assert m._rankme_warn_threshold == 0.4
+    assert m._rankme_alarm_threshold == RANKME_NORMALISED_ALARM
+    # alarm-only: warn falls back to 0.5; 0.2 < 0.5 holds → constructs.
+    m2 = _make_module(rankme_alarm_threshold=0.2)
+    assert m2._rankme_alarm_threshold == 0.2
+    assert m2._rankme_warn_threshold == RANKME_NORMALISED_WARN
+    # warn-only BELOW the default alarm → post-resolution order is violated
+    # (warn=0.2 < alarm=0.25) and construction must raise, not silently pass.
+    with pytest.raises(ValueError, match="rankme_alarm"):
+        _make_module(rankme_warn_threshold=0.2)
+
+
+def test_rankme_thresholds_phase_keyed_default() -> None:
+    """The canonical default is phase-keyed: P2 runs the M4 parcel-token probe,
+    whose effective rank ≈ active-parcel count → floor ~0.05, so an unset P2
+    resolves to the empirical M4 band (0.04/0.02), NOT the M2 |STFT| band
+    (0.5/0.25) that false-positives on M4. P1/P3/P4 keep the M2 band. An
+    explicit override still wins for either phase."""
+    from speech_decoding.experiments.monitors import (
+        RANKME_M4_NORMALISED_ALARM,
+        RANKME_M4_NORMALISED_WARN,
+        RANKME_NORMALISED_ALARM,
+        RANKME_NORMALISED_WARN,
+    )
+
+    # P2 unset → M4 band, well below the M4 ~0.05 floor.
+    p2 = _make_module(phase="p2")
+    assert p2._rankme_warn_threshold == RANKME_M4_NORMALISED_WARN == 0.04
+    assert p2._rankme_alarm_threshold == RANKME_M4_NORMALISED_ALARM == 0.02
+    # P1 unset → M2 band (regression guard: phase keying didn't leak to P1).
+    p1 = _make_module(phase="p1")
+    assert p1._rankme_warn_threshold == RANKME_NORMALISED_WARN
+    assert p1._rankme_alarm_threshold == RANKME_NORMALISED_ALARM
+    # Explicit override beats the phase default on P2 (the manual sweep lever).
+    p2o = _make_module(phase="p2", rankme_warn_threshold=0.3,
+                       rankme_alarm_threshold=0.1)
+    assert p2o._rankme_warn_threshold == 0.3
+    assert p2o._rankme_alarm_threshold == 0.1
+
+
+def test_rankme_thresholds_forwarded_to_both_monitor_call_sites(monkeypatch) -> None:
+    """The stored thresholds reach BOTH RankMe probes: the M4 teacher-rank path
+    (P2 health) and the M2 front-end path (P1 health). Spying on the monitor is
+    the strongest proof the call sites pass them (not the module defaults)."""
+    import speech_decoding.experiments.v14_joint_module as jm
+
+    captured: list[tuple] = []
+
+    def _spy(features, *, valid_mask=None, warn_threshold=None, alarm_threshold=None):
+        captured.append((warn_threshold, alarm_threshold))
+        return SimpleNamespace(
+            rankme=8.0, rankme_normalised=0.5, n_samples=10, d_feature=8,
+            is_warn=False, is_alarm=False,
+        )
+
+    monkeypatch.setattr(jm, "teacher_rank_monitor", _spy)
+
+    m = _make_module(rankme_warn_threshold=0.45, rankme_alarm_threshold=0.35)
+    m.log = lambda *a, **k: None  # type: ignore[method-assign]  # _log_rankme uses self.log
+
+    # M4 teacher-rank path: (B, L, T, d) + (B, L) latent_valid.
+    m._run_teacher_rank_monitor(
+        teacher_m4=torch.randn(2, 5, 3, 8),
+        latent_valid=torch.ones(2, 5, dtype=torch.bool),
+        step_name="train",
+    )
+    # M2 front-end path: (B, C, F_p, T_p, d) + (B, C) valid_mask.
+    m._run_frontend_rank_monitor(
+        teacher_m2=torch.randn(2, 5, 2, 3, 8),
+        valid_mask=torch.ones(2, 5, dtype=torch.bool),
+        step_name="train",
+    )
+
+    assert captured == [(0.45, 0.35), (0.45, 0.35)]
+
+
+def test_unset_p2_m4_probe_receives_empirical_band(monkeypatch) -> None:
+    """End-to-end: an UNSET phase="p2" module forwards the empirical M4 band
+    (0.04/0.02) all the way to the M4 probe call site — not the M2 0.5/0.25
+    band that false-positived on M4. Closes the composition gap between the
+    phase-keyed-default test and the forwarding test."""
+    import speech_decoding.experiments.v14_joint_module as jm
+
+    captured: list[tuple] = []
+
+    def _spy(features, *, valid_mask=None, warn_threshold=None, alarm_threshold=None):
+        captured.append((warn_threshold, alarm_threshold))
+        return SimpleNamespace(
+            rankme=12.0, rankme_normalised=0.047, n_samples=100, d_feature=256,
+            is_warn=True, is_alarm=False,
+        )
+
+    monkeypatch.setattr(jm, "teacher_rank_monitor", _spy)
+
+    m = _make_module(phase="p2")  # unset thresholds → M4 phase default
+    m.log = lambda *a, **k: None  # type: ignore[method-assign]
+    m._run_teacher_rank_monitor(
+        teacher_m4=torch.randn(2, 5, 3, 8),
+        latent_valid=torch.ones(2, 5, dtype=torch.bool),
+        step_name="val",
+    )
+    assert captured == [(0.04, 0.02)]
+
+
+# ---------------------------------------------------------------------------
+# §7/B01 no-WD param-group split (task #40) — configure_optimizers integration
+# ---------------------------------------------------------------------------
+def _adamw_optim(weight_decay: float) -> LightningOptimizer:
+    return LightningOptimizer(
+        optimizer={"name": "AdamW", "lr": 1e-3,
+                   "kwargs": {"weight_decay": weight_decay}}
+    )
+
+
+def _built_param_groups(module: V14JointBrainModule):
+    out = module.configure_optimizers()
+    opt = out["optimizer"] if isinstance(out, dict) else out
+    return opt.param_groups
+
+
+def test_configure_optimizers_no_wd_split_applied_at_positive_wd() -> None:
+    """P1 wd>0 + wd_exclude_norms (default) → the built optimizer carries a
+    weight_decay==0.0 group for the exempt params (biases / LN γβ / embeds) and
+    a weight_decay==wd group for the matmul weights."""
+    module = V14JointBrainModule(
+        encoder=_make_tiny_encoder(), optim_config=_adamw_optim(0.1),
+        phase="p1",  # type: ignore[arg-type]
+    )
+    groups = _built_param_groups(module)
+    wds = {g["weight_decay"] for g in groups}
+    assert 0.0 in wds and 0.1 in wds
+    # Every exempt-by-id param sits in a wd==0.0 group; no decay param does.
+    from speech_decoding.experiments.optim_param_groups import no_decay_param_ids
+    exempt = no_decay_param_ids(module)
+    optimized = {id(p) for g in groups for p in g["params"]}
+    for g in groups:
+        for p in g["params"]:
+            if id(p) in exempt:
+                assert g["weight_decay"] == 0.0
+            else:
+                assert g["weight_decay"] == 0.1
+    # The split partitions, never drops: optimized set == the P1 param ids.
+    assert optimized  # non-empty
+
+
+def test_configure_optimizers_bit_identical_at_zero_wd() -> None:
+    """wd=0 → no split (single inherited group), bit-identical to pre-#40."""
+    module = V14JointBrainModule(
+        encoder=_make_tiny_encoder(), optim_config=_adamw_optim(0.0),
+        phase="p1",  # type: ignore[arg-type]
+    )
+    groups = _built_param_groups(module)
+    assert len(groups) == 1
+    assert groups[0]["weight_decay"] == 0.0
+
+
+def test_configure_optimizers_no_split_when_exclude_off() -> None:
+    """--no-wd-exclude-norms (wd_exclude_norms=False) decays ALL params: one
+    group at the swept wd, even with wd>0 (the R-uniform-wd falsifier)."""
+    module = V14JointBrainModule(
+        encoder=_make_tiny_encoder(), optim_config=_adamw_optim(0.1),
+        phase="p1", wd_exclude_norms=False,  # type: ignore[arg-type]
+    )
+    groups = _built_param_groups(module)
+    assert len(groups) == 1
+    assert groups[0]["weight_decay"] == 0.1
+
+
+def test_configure_optimizers_p2_discriminative_lr_survives_split() -> None:
+    """P2 returns two discriminative-LR groups (front-end @ base/10, parcel +
+    predictor @ base). With wd>0 each splits into decay/no-decay, and BOTH halves
+    keep their group's lr — the no-WD split must not flatten the discriminative
+    schedule."""
+    base_lr = 1e-3
+    module = V14JointBrainModule(
+        encoder=_make_tiny_encoder(), optim_config=_adamw_optim(0.1),
+        phase="p2", frontend_lr_scale=0.1,  # type: ignore[arg-type]
+    )
+    groups = _built_param_groups(module)
+    lrs = {round(g["lr"], 8) for g in groups}
+    # Front-end group at base/10 and the parcel/predictor group at base both
+    # present (each possibly split into a wd / wd=0 pair sharing the lr).
+    assert round(base_lr * 0.1, 8) in lrs
+    assert round(base_lr, 8) in lrs
+    # Within each lr tier, an exempt param only ever lands in a wd==0.0 group.
+    from speech_decoding.experiments.optim_param_groups import no_decay_param_ids
+    exempt = no_decay_param_ids(module)
+    for g in groups:
+        for p in g["params"]:
+            if id(p) in exempt:
+                assert g["weight_decay"] == 0.0
+
+
 def test_rejects_b30_sister_latent_valid_override() -> None:
     with pytest.raises(NotImplementedError, match="B30"):
         _make_module(latent_valid_override="all_true")

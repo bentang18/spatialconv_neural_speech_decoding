@@ -57,3 +57,13 @@ class V14Experiment(Experiment):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     phase: V14Phase
+
+    # §7 / B01 no-weight-decay split (task #40). When True (default), and a
+    # non-zero optimizer weight_decay is configured, biases / LayerNorm γβ /
+    # named embedding tables are placed in a ``weight_decay: 0.0`` param group
+    # (nanoGPT / timm convention) while matmul weights take the swept decay.
+    # ``--no-wd-exclude-norms`` flips this off (decay every param uniformly) so
+    # the M0 sweep can falsify whether the exclusion matters. No effect while
+    # weight_decay == 0 (the split is a no-op there — see
+    # ``optim_param_groups.maybe_split_no_decay``).
+    wd_exclude_norms: bool = True

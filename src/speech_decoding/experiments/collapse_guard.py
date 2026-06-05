@@ -438,9 +438,12 @@ class CollapseGuardCallback(pl.Callback):
                 self._sustain,
             )
 
-        # 2. RankMe collapse (phase-scoped). Hard alarm (<0.25) at the
-        #    base sustain; soft warn (<0.5) at the longer warn-sustain to
-        #    catch a slow decline before it crosses the alarm line.
+        # 2. RankMe collapse (phase-scoped). Hard alarm at the base sustain;
+        #    soft warn at the longer warn-sustain to catch a slow decline
+        #    before it crosses the alarm line. The numeric thresholds are
+        #    phase-keyed and live in the module (M2 front-end 0.5/0.25, M4
+        #    parcel 0.04/0.02); the guard only sees the pre-thresholded 0/1
+        #    flags, so the messages stay threshold-agnostic.
         for base, label in (
             ("val_mon_rankme", "M4 parcel-token"),
             ("val_mon_frontend_rankme", "front-end M2"),
@@ -452,8 +455,8 @@ class CollapseGuardCallback(pl.Callback):
                     alarm >= self._alarm_fraction,
                     alarm,
                     f"RankMe ALARM on the {label} representation "
-                    f"(normalised effective rank < 0.25 on "
-                    f"{alarm * 100:.0f}% of probed steps)",
+                    f"(normalised effective rank below its phase collapse "
+                    f"threshold on {alarm * 100:.0f}% of probed steps)",
                     "Representation is collapsing to a low-rank subspace — "
                     "check the EMA τ, the predictor warm-start, and that "
                     "the mask leaves targets (see no-masking).",
@@ -466,9 +469,9 @@ class CollapseGuardCallback(pl.Callback):
                     warn >= self._alarm_fraction,
                     warn,
                     f"RankMe WARN on the {label} representation "
-                    f"(normalised effective rank < 0.5 on "
-                    f"{warn * 100:.0f}% of probed steps) sustained — a slow "
-                    "rank decline before the 0.25 alarm",
+                    f"(normalised effective rank below its phase warn "
+                    f"threshold on {warn * 100:.0f}% of probed steps) "
+                    "sustained — a slow rank decline before the hard alarm",
                     "Same as the rank alarm but caught earlier; inspect the "
                     "rank trend and EMA τ before it hard-collapses.",
                     self._warn_sustain,

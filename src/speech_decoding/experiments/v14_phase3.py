@@ -53,6 +53,7 @@ from neuraltrain.optimizers import BaseOptimizer
 
 from speech_decoding.bt_alignment.teacher_cache import TargetStandardizer
 from speech_decoding.experiments.monitors import grad_spike_monitor
+from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.experiments.v14_experiment import V14Experiment
 from speech_decoding.experiments.v14_joint_module import _maybe_drop_singleton_trailing
 from speech_decoding.extractors.whisper_teacher_pool import triangular_pool_50_to_8_hz
@@ -106,6 +107,7 @@ class V14Phase3DistillModule(pl.LightningModule):
         projector: tp.Optional[StudentWhisperProjector] = None,
         frontend_lr_scale: float = 0.1,
         parcel_lr_scale: float = 1.0 / 3.0,
+        wd_exclude_norms: bool = True,
     ) -> None:
         super().__init__()
         if stage not in tp.get_args(_Stage):
@@ -126,6 +128,7 @@ class V14Phase3DistillModule(pl.LightningModule):
         self.encoder = encoder
         self._frontend_lr_scale = frontend_lr_scale
         self._parcel_lr_scale = parcel_lr_scale
+        self._wd_exclude_norms = bool(wd_exclude_norms)
         # Default freeze=False ⇒ the P3 connector trains; the encoder freeze
         # is applied separately by stage below so 3a/3b share one construction.
         self.pma = pma or V14ParcelCollapsePMA(encoder.d_model, pma_n_heads)
@@ -423,6 +426,14 @@ class V14Phase3DistillModule(pl.LightningModule):
 
     def configure_optimizers(self):  # type: ignore[override]
         params = self._phase_param_groups()
+        # §7/B01 no-WD split (task #40): exempt biases / LN γβ / embeds from a
+        # non-zero weight_decay. No-op at wd=0 or under --no-wd-exclude-norms.
+        params = maybe_split_no_decay(
+            params,
+            modules=(self,),
+            optim_config=self.optim_config,
+            exclude=self._wd_exclude_norms,
+        )
         total_steps = self._estimated_total_steps()
         if total_steps is None:
             return self.optim_config.build(params)
@@ -521,6 +532,7 @@ class V14Phase3Experiment(V14Experiment):
             standardizer=self._build_standardizer(),
             frontend_lr_scale=self.frontend_lr_scale,
             parcel_lr_scale=self.parcel_lr_scale,
+            wd_exclude_norms=self.wd_exclude_norms,
         )
 
 

@@ -530,9 +530,9 @@ def test_chain_c_max_default_and_override(monkeypatch, tmp_path) -> None:
 def test_chain_warmup_cosine_optim_reaches_every_phase(monkeypatch, tmp_path) -> None:
     """#37: the locked warmup-cosine + AdamW + β2=0.95 path threads to all phases
     via _common_build_kwargs; --adam-beta2 becomes a (0.9, β2) tuple. weight_decay
-    is held at 0.0 — wd>0 is guarded at the optim-build until the §7 no-WD param
-    groups land (see test_build_optim_cfg_rejects_weight_decay_until_no_wd_groups);
-    the threading itself is exercised here."""
+    is held at 0.0 here purely to isolate the threading check — wd>0 is now
+    accepted (the §7 no-WD param groups landed, #40; see
+    test_build_optim_cfg_forwards_weight_decay_no_wd_groups_landed)."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
@@ -587,6 +587,94 @@ def test_accumulate_grad_batches_default_is_one(monkeypatch) -> None:
     assert calls[0]["accumulate_grad_batches"] == 1
 
 
+def test_wd_exclude_norms_reaches_every_phase(monkeypatch, tmp_path) -> None:
+    """#40: --wd-exclude-norms / --no-wd-exclude-norms threads to ALL chain
+    phases via _common_build_kwargs (the no-WD split is uniform across the
+    stack). Default is True."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    base = ["--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
+
+    calls = _capture_builds(monkeypatch)
+    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    assert calls and all(c["wd_exclude_norms"] is True for c in calls)
+
+    calls.clear()
+    dv._build_v14_chain(_parse(base + ["--no-wd-exclude-norms"]),
+                        cross_attn_positions=None)
+    assert calls and all(c["wd_exclude_norms"] is False for c in calls)
+
+
+def test_wd_exclude_norms_default_single_phase(monkeypatch) -> None:
+    """No flag → wd_exclude_norms=True on a single-phase build."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "1", "--warmup-steps", "100"])
+    assert calls[0]["wd_exclude_norms"] is True
+
+
+def test_parcel_lr_scale_reaches_p3_phases(monkeypatch, tmp_path) -> None:
+    """#78: --parcel-lr-scale (P3-3b parcel-side discriminative LR) threads to the
+    two chain P3 stages; the default is 1/3. Mirrors --p2-frontend-lr-scale —
+    set explicitly on the P3 call sites, not in the shared `common` dict."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    base = ["--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
+
+    calls = _capture_builds(monkeypatch)
+    dv._build_v14_chain(_parse(base + ["--parcel-lr-scale", "0.25"]),
+                        cross_attn_positions=None)
+    # calls[2]=P3a, calls[3]=P3b carry the override.
+    assert calls[2]["parcel_lr_scale"] == 0.25
+    assert calls[3]["parcel_lr_scale"] == 0.25
+
+    calls.clear()
+    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    assert calls[2]["parcel_lr_scale"] == 1.0 / 3.0
+
+
+def test_parcel_lr_scale_reaches_single_phase(monkeypatch) -> None:
+    """--parcel-lr-scale reaches a single --phase 3 build too."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "3", "--p3-stage", "3b",
+          "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+          "--parcel-lr-scale", "0.5", "--warmup-steps", "100"])
+    assert calls[0]["parcel_lr_scale"] == 0.5
+
+
+def test_rankme_thresholds_reach_every_phase(monkeypatch, tmp_path) -> None:
+    """#74: --rankme-warn/alarm-threshold thread to ALL chain builds via
+    _common_build_kwargs (build_v14_experiment uses them only on the joint
+    branch). Default is None (→ canonical 0.5/0.25 resolved in the module)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    base = ["--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
+
+    calls = _capture_builds(monkeypatch)
+    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    assert calls and all(c["rankme_warn_threshold"] is None for c in calls)
+    assert all(c["rankme_alarm_threshold"] is None for c in calls)
+
+    calls.clear()
+    dv._build_v14_chain(
+        _parse(base + ["--rankme-warn-threshold", "0.4",
+                       "--rankme-alarm-threshold", "0.3"]),
+        cross_attn_positions=None,
+    )
+    assert calls and all(c["rankme_warn_threshold"] == 0.4 for c in calls)
+    assert all(c["rankme_alarm_threshold"] == 0.3 for c in calls)
+
+
+def test_rankme_thresholds_default_single_phase(monkeypatch) -> None:
+    """No flag → both thresholds None on a single-phase build (joint P1)."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "1", "--warmup-steps", "100"])
+    assert calls[0]["rankme_warn_threshold"] is None
+    assert calls[0]["rankme_alarm_threshold"] is None
+
+
 def test_build_optim_cfg_default_matches_prior_and_validates() -> None:
     """The default optim dict is the prior plain-Adam (no scheduler, no β/wd, and
     — post live-crash fix 2026-06-04 — NOT fused; see
@@ -622,26 +710,29 @@ def test_build_optim_cfg_warmup_cosine_validates_with_scheduler() -> None:
     assert isinstance(lopt.scheduler, WarmupCosine)
 
 
-def test_build_optim_cfg_rejects_weight_decay_until_no_wd_groups() -> None:
-    """§7 lock guard (audit 2026-06-03): a non-zero weight_decay is refused loudly
-    because the no-WD param-group split (biases / LN γβ / freq_embed exempt) is not
-    yet implemented — uniform wd would violate the B01 lock. wd=0.0 is allowed."""
+def test_build_optim_cfg_forwards_weight_decay_no_wd_groups_landed() -> None:
+    """§7 no-WD param-group split (#40) LANDED: a non-zero weight_decay is now
+    FORWARDED as the top-level optimizer wd, and the phase modules'
+    configure_optimizers ride the no-WD-group override (biases / LN γβ / embeds
+    in a weight_decay:0.0 group) — see test_optim_param_groups +
+    test_v14_joint_module::test_configure_optimizers_no_wd_split_applied_at_positive_wd.
+    The earlier guard that refused wd>0 is removed."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
-    with pytest.raises(ValueError, match="no-WD param-group"):
-        dv._build_optim_cfg(
-            lr=5e-4, lr_schedule="warmup_cosine", warmup_steps=2000,
-            min_lr_ratio=0.0, weight_decay=0.05, optimizer_name="AdamW",
-            adam_betas=(0.9, 0.95),
-        )
+    cfg = dv._build_optim_cfg(
+        lr=5e-4, lr_schedule="warmup_cosine", warmup_steps=2000,
+        min_lr_ratio=0.0, weight_decay=0.05, optimizer_name="AdamW",
+        adam_betas=(0.9, 0.95),
+    )
+    assert cfg["optimizer"]["kwargs"]["weight_decay"] == 0.05
 
 
 def test_build_optim_cfg_adamw_pins_weight_decay_zero_no_torch_default_leak() -> None:
-    """§7 lock guard, re-audit 2026-06-03: torch ``AdamW`` defaults weight_decay to
+    """§7/B01 lock, re-audit 2026-06-03: torch ``AdamW`` defaults weight_decay to
     0.01. On the lock-recommended ``--optimizer AdamW --weight-decay 0`` path the
-    guard sees a falsy flag and would otherwise OMIT weight_decay, letting AdamW's
+    build sees a falsy flag and would otherwise OMIT weight_decay, letting AdamW's
     0.01 decay biases / LN γβ / freq_embed uniformly — the exact silent violation
-    the guard exists to stop. So AdamW must pin weight_decay=0.0 explicitly; Adam
+    the §7 no-WD lock forbids. So AdamW must pin weight_decay=0.0 explicitly; Adam
     (torch default already 0.0) carries empty kwargs (non-fused, post-crash fix)."""
     import speech_decoding.experiments.dispatch_v14 as dv
 

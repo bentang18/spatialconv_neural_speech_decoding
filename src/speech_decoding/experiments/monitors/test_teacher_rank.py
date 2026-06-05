@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from speech_decoding.experiments.monitors import (
+    RANKME_M4_NORMALISED_ALARM,
+    RANKME_M4_NORMALISED_WARN,
     RANKME_NORMALISED_ALARM,
     RANKME_NORMALISED_WARN,
     teacher_rank_monitor,
@@ -13,9 +15,21 @@ from speech_decoding.experiments.monitors import (
 
 
 def test_teacher_rank_thresholds_match_dinov3_band() -> None:
-    """DINOv3 §3.3 + RankMe §4.2 band: warn at 0.5, alarm at 0.25."""
+    """DINOv3 §3.3 + RankMe §4.2 band: warn at 0.5, alarm at 0.25 (M2
+    front-end, |STFT| floor ~0.31)."""
     assert RANKME_NORMALISED_WARN == 0.5
     assert RANKME_NORMALISED_ALARM == 0.25
+
+
+def test_teacher_rank_m4_band_below_parcel_floor() -> None:
+    """M4 parcel-token band sits below its structural floor (~0.05, raw rank
+    ≈ active-parcel count). warn 0.04 / alarm 0.02, with the 2:1 warn:alarm
+    structure preserved and both strictly below the M2 band."""
+    assert RANKME_M4_NORMALISED_WARN == 0.04
+    assert RANKME_M4_NORMALISED_ALARM == 0.02
+    assert 0.0 < RANKME_M4_NORMALISED_ALARM < RANKME_M4_NORMALISED_WARN
+    assert RANKME_M4_NORMALISED_WARN < RANKME_NORMALISED_WARN
+    assert RANKME_M4_NORMALISED_ALARM < RANKME_NORMALISED_ALARM
 
 
 def test_teacher_rank_isotropic_gaussian_near_full_rank() -> None:

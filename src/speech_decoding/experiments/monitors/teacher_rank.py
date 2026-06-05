@@ -44,9 +44,25 @@ from torch import Tensor
 
 # DINOv3 §3.3 reports healthy RankMe / d > 0.6 across pretraining; the
 # warning band starts around 0.5 (recoverable), hard alarm < 0.25
-# (collapse signature; needs intervention per RankMe §4.2).
+# (collapse signature; needs intervention per RankMe §4.2). This band fits
+# the M2 front-end |STFT| representation, whose floor sits ~0.31 (measured,
+# guard-OFF diagnostic job 47723576).
 RANKME_NORMALISED_WARN: float = 0.5
 RANKME_NORMALISED_ALARM: float = 0.25
+
+# M4 parcel-token band. The M4 representation's effective rank is bounded by
+# the active-parcel count (~14 for BT-lite-9), so its normalised RankMe floor
+# is structurally ~0.05 (measured: chain 47725245 P2, raw rank oscillating
+# 12.3–16.8 / 256 ≈ 0.047–0.066, born flat at init, val_loss falling). The
+# DINOv3 0.5/0.25 band sits ~5× above this floor and fires from birth (the
+# false-positive that killed that chain at P2 step 452). Anchored to the floor:
+# warn 0.04 sits just below the oscillation minimum (advisory, log-only); alarm
+# 0.02 (raw rank ~5, a >2.5× crater from the floor) still hard-kills a genuine
+# collapse toward rank 1 (normalised ~0.004) with ~2.4× margin below the floor.
+# See [[project_v14_gate_cadence_guard_response_lock_2026_06_05]].
+RANKME_M4_NORMALISED_WARN: float = 0.04
+RANKME_M4_NORMALISED_ALARM: float = 0.02
+
 RANKME_EPS: float = 1e-7
 
 

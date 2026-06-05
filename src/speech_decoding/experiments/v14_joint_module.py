@@ -70,12 +70,17 @@ from torch import Tensor, nn
 from neuraltrain.optimizers import BaseOptimizer
 
 from speech_decoding.experiments.monitors import (
+    RANKME_M4_NORMALISED_ALARM,
+    RANKME_M4_NORMALISED_WARN,
+    RANKME_NORMALISED_ALARM,
+    RANKME_NORMALISED_WARN,
     compute_orphan_parcels,
     grad_spike_monitor,
     mask_orphan_ratio_monitor,
     parcel_coverage_monitor,
     teacher_rank_monitor,
 )
+from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.models.v14_encoder import (
     JepaPredictor,
     V14ParcelPerceiverModel,
@@ -221,6 +226,9 @@ class V14JointBrainModule(pl.LightningModule):
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
         frontend_lr_scale: float = 0.1,
+        wd_exclude_norms: bool = True,
+        rankme_warn_threshold: tp.Optional[float] = None,
+        rankme_alarm_threshold: tp.Optional[float] = None,
     ) -> None:
         super().__init__()
         # B30 sister-flag runtime gates. Drift row B30-dispatch-sister-flags
@@ -315,6 +323,39 @@ class V14JointBrainModule(pl.LightningModule):
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
         self._frontend_lr_scale = frontend_lr_scale
+        self._wd_exclude_norms = bool(wd_exclude_norms)
+        # MON-*-FEATURE-RANK thresholds (#74), phase-keyed canonical defaults.
+        # A module instance runs exactly ONE rank probe: P1 the M2 front-end
+        # probe (|STFT| floor ~0.31 → DINOv3 0.5/0.25 band), P2 the M4 parcel
+        # probe whose effective rank ≈ active-parcel count (~14 BT-lite-9) →
+        # a structurally lower floor ~0.05, so P2 defaults to the empirical M4
+        # band 0.04/0.02. The M2 band on M4 fires from birth (the false
+        # positive that killed chain 47725245 at P2 step 452); see
+        # [[project_v14_gate_cadence_guard_response_lock_2026_06_05]]. None →
+        # the phase default (single source of truth in teacher_rank.py); a
+        # dispatch override (#74a CLI) wins for this phase's probe and feeds
+        # the recalibration sweep. The collapse-guard reads the per-step
+        # *_alarm / *_warn flags these set, so they decide what kills a run.
+        _warn_default, _alarm_default = (
+            (RANKME_M4_NORMALISED_WARN, RANKME_M4_NORMALISED_ALARM)
+            if phase == "p2"
+            else (RANKME_NORMALISED_WARN, RANKME_NORMALISED_ALARM)
+        )
+        self._rankme_warn_threshold = (
+            _warn_default if rankme_warn_threshold is None
+            else float(rankme_warn_threshold)
+        )
+        self._rankme_alarm_threshold = (
+            _alarm_default if rankme_alarm_threshold is None
+            else float(rankme_alarm_threshold)
+        )
+        # teacher_rank_monitor enforces 0 < alarm < warn <= 1 per call; validate
+        # once here so a bad dispatch override fails at construction, not step 0.
+        if not 0.0 < self._rankme_alarm_threshold < self._rankme_warn_threshold <= 1.0:
+            raise ValueError(
+                "need 0 < rankme_alarm < rankme_warn <= 1; got alarm="
+                f"{self._rankme_alarm_threshold}, warn={self._rankme_warn_threshold}"
+            )
 
         # R-p2-freeze-frontend falsifier: a 0.0 scale freezes the
         # P1-pretrained front-end in P2 so the parcel side + predictor train
@@ -718,7 +759,11 @@ class V14JointBrainModule(pl.LightningModule):
         flat = teacher_m4.reshape(B * L * T, d)
         mask_flat = expanded.reshape(B * L * T)
         valid_rows = self._rankme_subsample(flat[mask_flat])
-        verdict = teacher_rank_monitor(valid_rows.detach())
+        verdict = teacher_rank_monitor(
+            valid_rows.detach(),
+            warn_threshold=self._rankme_warn_threshold,
+            alarm_threshold=self._rankme_alarm_threshold,
+        )
         self._log_rankme(verdict, step_name=step_name, key="")
 
     def _run_frontend_rank_monitor(
@@ -753,7 +798,11 @@ class V14JointBrainModule(pl.LightningModule):
         # No row-count early-return: teacher_rank_monitor returns a healthy
         # placeholder for N<2, so a degenerate (all-invalid) step still logs —
         # parity with the M4 probe, which always emits its keys.
-        verdict = teacher_rank_monitor(self._rankme_subsample(flat).detach())
+        verdict = teacher_rank_monitor(
+            self._rankme_subsample(flat).detach(),
+            warn_threshold=self._rankme_warn_threshold,
+            alarm_threshold=self._rankme_alarm_threshold,
+        )
         self._log_rankme(verdict, step_name=step_name, key="frontend_")
 
     def _run_mask_orphan_monitor(
@@ -1065,6 +1114,14 @@ class V14JointBrainModule(pl.LightningModule):
         # two-group discriminative LR). The teacher is EMA-frozen and never
         # optimised.
         params = self._phase_param_groups()
+        # §7/B01 no-WD split (task #40): exempt biases / LN γβ / embeds from a
+        # non-zero weight_decay. No-op at wd=0 or under --no-wd-exclude-norms.
+        params = maybe_split_no_decay(
+            params,
+            modules=(self,),
+            optim_config=self.optim_config,
+            exclude=self._wd_exclude_norms,
+        )
         total_steps = self._estimated_total_steps()
         if total_steps is None:
             return self.optim_config.build(params)

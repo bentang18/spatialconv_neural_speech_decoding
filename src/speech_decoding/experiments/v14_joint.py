@@ -229,6 +229,15 @@ class V14JointExperiment(V14Experiment):
     # front-end is the only trained group there).
     frontend_lr_scale: float = pydantic.Field(default=0.1, ge=0.0, le=1.0)
 
+    # MON-TEACHER-FEATURE-RANK thresholds (#74), joint-only (P1/P2 run RankMe;
+    # P3/P4 do not). None → the canonical teacher_rank defaults (0.5 warn / 0.25
+    # alarm); the module resolves + validates 0 < alarm < warn <= 1. Exposed so
+    # the recalibration sweep can lower them toward the measured ~0.31 BT floor
+    # without editing the source constants. The collapse-guard kills on the
+    # per-step alarm/warn flags these set, so they are run-gating.
+    rankme_warn_threshold: float | None = pydantic.Field(default=None, gt=0.0, le=1.0)
+    rankme_alarm_threshold: float | None = pydantic.Field(default=None, gt=0.0, le=1.0)
+
     # B31 ``loss_variant`` field RETAINED for dispatch config-record
     # compatibility (``dispatch_v14`` passes it through), but B36 WS-B
     # replaced the multi-term aggregator path with the single-term masked
@@ -357,6 +366,9 @@ class V14JointExperiment(V14Experiment):
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
             frontend_lr_scale=self.frontend_lr_scale,
+            wd_exclude_norms=self.wd_exclude_norms,
+            rankme_warn_threshold=self.rankme_warn_threshold,
+            rankme_alarm_threshold=self.rankme_alarm_threshold,
         )
 
 

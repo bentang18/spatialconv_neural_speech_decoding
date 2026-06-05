@@ -307,43 +307,30 @@ def _build_optim_cfg(
     """
     _validate_choice("lr_schedule", lr_schedule, ("constant", "warmup_cosine"))
     _validate_choice("optimizer_name", optimizer_name, ("Adam", "AdamW"))
-    # §7 LOCK GUARD (audit 2026-06-03, lens-2 FAIL): the B01 recipe locks TWO
-    # param groups — no weight-decay on biases, LayerNorm/RMSNorm γβ, and the
-    # freq embedding. The phase modules' ``_phase_param_groups`` split by stage
-    # for discriminative LR but do NOT yet carry a ``weight_decay: 0.0`` override
-    # for that no-WD subset, so a non-zero ``weight_decay`` here would be applied
-    # UNIFORMLY to every param — a silent lock violation. Refuse loudly until the
-    # no-WD groups are implemented (a Ben-gated training-orchestration follow-up,
-    # paired with the M0 weight_decay value). wd=0.0 (the default) is unaffected
-    # and a valid first-pass center; this never fires on the maiden run.
-    if weight_decay:
-        raise ValueError(
-            f"weight_decay={weight_decay} is not yet supported: the §7 no-WD "
-            "param-group split (biases / LayerNorm γβ / freq_embed exempt) is "
-            "NOT implemented in the phase modules' configure_optimizers, so a "
-            "non-zero weight_decay would decay those params too — violating the "
-            "B01 lock. Pass --weight-decay 0 (the locked-shape-compliant first "
-            "pass), or implement the no-WD groups first. See "
-            "reports/b01_lr_schedule_unimplemented_lock_2026_06_03.md."
-        )
+    # §7/B01 no-WD param-group split is now implemented in the phase modules'
+    # configure_optimizers (task #40, ``optim_param_groups.maybe_split_no_decay``):
+    # a non-zero ``weight_decay`` is the top-level default and biases / LayerNorm
+    # γβ / named embeds ride in a ``weight_decay: 0.0`` group (default
+    # ``wd_exclude_norms=True``; ``--no-wd-exclude-norms`` decays them too). The
+    # earlier guard that refused a non-zero ``weight_decay`` is therefore removed.
     # NOT fused — fused optimizers are incompatible with Lightning's bf16-mixed
     # AMP gradient clipping (see docstring; both are §7 locks). Empty default →
     # standard non-fused torch optimizer, which clears _step_supports_amp_scaling
     # so the AMP clip guard does not fire.
     optim_kwargs: dict[str, tp.Any] = {}
     if weight_decay:
-        # Unreachable while the guard above stands (wd is falsy here); retained as
-        # the exact post-guard-removal path — when the no-WD groups land (task #40)
-        # the guard is deleted and this forwards the M0 weight_decay to either
-        # optimizer family.
+        # Forwarded as the top-level optimizer weight_decay; the phase modules'
+        # configure_optimizers carry the no-WD-group override for the exempt
+        # subset (biases / LN γβ / embeds) when wd_exclude_norms is set.
         optim_kwargs["weight_decay"] = weight_decay
     elif optimizer_name == "AdamW":
         # AdamW's torch default is weight_decay=0.01 — pin it to 0.0 EXPLICITLY so
-        # the §7 no-WD lock is not violated via the torch family default on the
-        # lock-recommended ``--optimizer AdamW`` path (the guard only sees the flag
-        # value, which is 0.0 here; without this pin AdamW would decay biases / LN
-        # γβ / freq_embed at 0.01 uniformly). Adam's torch default is already 0.0,
-        # so its kwargs stay empty.
+        # the intended weight_decay=0 default is not silently overridden by the
+        # torch family default on the recommended ``--optimizer AdamW`` path
+        # (without this pin AdamW would decay biases / LN γβ / freq_embed at 0.01
+        # uniformly even though the user asked for no decay). Adam's torch default
+        # is already 0.0, so its kwargs stay empty. (The wd VALUE is M0-swept, not
+        # locked; only the no-WD param-group EXEMPTION is the §7/B01 convention.)
         optim_kwargs["weight_decay"] = 0.0
     if adam_betas is not None:
         optim_kwargs["betas"] = list(adam_betas)
@@ -641,6 +628,22 @@ def build_v14_experiment(
     # B33 §5 3b parcel-side discriminative-LR scale (base/3 lock). No effect
     # under 3a / the non-P3 paths; persisted onto the run record either way.
     parcel_lr_scale: float = 1.0 / 3.0,
+    # §7/B01 no-WD param-group split (#40). True (default) exempts biases +
+    # LayerNorm/RMSNorm γβ (ndim<=1) + named embeds from weight decay — the
+    # nanoGPT/timm convention. Inert when weight_decay<=0 (the wd=0 path stays
+    # bit-identical). ``--no-wd-exclude-norms`` flips it False (uniform decay,
+    # the uniform-decay falsifier). Threaded onto every V14 phase experiment
+    # (joint P1/P2, P3, P4 frozen probe); the base supervised CE path ignores it
+    # (it builds a neuraltrain BrainModule with no custom optimizer split).
+    wd_exclude_norms: bool = True,
+    # MON-TEACHER-FEATURE-RANK collapse thresholds (#74), joint-only (P1/P2 run
+    # RankMe; P3/P4 don't). None → the canonical 0.5 warn / 0.25 alarm defaults
+    # (single-sourced in monitors/teacher_rank.py). Exposed so the recalibration
+    # sweep can lower them toward the measured ~0.31 BT floor without editing the
+    # constants; the module validates 0 < alarm < warn <= 1. Run-gating: the
+    # collapse-guard kills on the per-step alarm/warn flags these set.
+    rankme_warn_threshold: float | None = None,
+    rankme_alarm_threshold: float | None = None,
     # WS-G B35 Phase-4 frozen-probe routing (#21). ``phase4_frozen_probe=True``
     # returns a :class:`V14Phase4ReadoutExperiment` (frozen encoder + frozen
     # P3-PMA → mean → trainable Linear, the B35 readout) carrying the
@@ -1070,6 +1073,12 @@ def build_v14_experiment(
             "jepa_phase": jepa_phase,
             # B36 WS-E E2: P2 front-end discriminative-LR scale.
             "frontend_lr_scale": frontend_lr_scale,
+            # §7/B01 no-WD param-group split (#40).
+            "wd_exclude_norms": wd_exclude_norms,
+            # MON-TEACHER-FEATURE-RANK thresholds (#74), joint-only. None → the
+            # canonical 0.5/0.25 defaults; lowered for the recalibration sweep.
+            "rankme_warn_threshold": rankme_warn_threshold,
+            "rankme_alarm_threshold": rankme_alarm_threshold,
         }
     elif p3_distill:
         # WS-F P3 Whisper distillation. The teacher stream is mandatory — the
@@ -1096,6 +1105,8 @@ def build_v14_experiment(
             # base·scale, connector base). No effect under 3a.
             "frontend_lr_scale": frontend_lr_scale,
             "parcel_lr_scale": parcel_lr_scale,
+            # §7/B01 no-WD param-group split (#40).
+            "wd_exclude_norms": wd_exclude_norms,
         }
     elif phase4_frozen_probe:
         # WS-G B35 frozen-encoder readout probe. Carries the transferable-state
@@ -1118,7 +1129,9 @@ def build_v14_experiment(
         )
 
         experiment_cls = V14Phase4ReadoutExperiment
-        extra_experiment_kwargs = {"phase": 4}
+        # §7/B01 no-WD param-group split (#40): the trainable Linear has its bias
+        # exempted (ndim<=1) when weight_decay>0.
+        extra_experiment_kwargs = {"phase": 4, "wd_exclude_norms": wd_exclude_norms}
     elif (
         latent_valid_override != "support"
         or sa_mask_mode != "bidirectional"
@@ -1323,6 +1336,20 @@ def _parser() -> argparse.ArgumentParser:
                         "the full RankMe trajectory past the soft-warn streak "
                         "instead of aborting (to confirm a born-low-rank floor "
                         "vs a true decline). P4 never carries the guard anyway.")
+    p.add_argument("--rankme-warn-threshold", dest="rankme_warn_threshold",
+                   type=float, default=None,
+                   help="MON-TEACHER-FEATURE-RANK soft-warn band on normalised "
+                        "RankMe (rankme/d) for the SSL phases (#74). None (default) "
+                        "= the canonical 0.5. Must satisfy 0 < alarm < warn <= 1. "
+                        "The measured BT floor is ~0.31, so 0.5 sits ABOVE it — "
+                        "recalibration is Ben-gated; this flag is the sweep lever.")
+    p.add_argument("--rankme-alarm-threshold", dest="rankme_alarm_threshold",
+                   type=float, default=None,
+                   help="MON-TEACHER-FEATURE-RANK hard-alarm threshold on "
+                        "normalised RankMe (#74); below this the collapse-guard "
+                        "KILLS the run. None (default) = the canonical 0.25. The "
+                        "~0.31 BT floor sits just above 0.25, so the default is "
+                        "tight — recalibration Ben-gated; this is the sweep lever.")
     p.add_argument("--p4-early-stop-patience", dest="p4_early_stop_patience",
                    type=int, default=DEFAULT_P4_EARLY_STOP_PATIENCE,
                    help="Early-stopping patience (epochs) on val_loss for the "
@@ -1363,13 +1390,28 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.0,
                    help="AdamW weight decay (0.0 default = prior plain-Adam). §7 "
                         "M0 sweep center is 0.05; only added to the optimizer "
-                        "kwargs when > 0 (use --optimizer adamw for decoupled WD).")
+                        "kwargs when > 0 (use --optimizer AdamW for decoupled WD). "
+                        "When > 0 the no-WD param-group split (#40) exempts biases "
+                        "/ LayerNorm γβ / embeds — see --no-wd-exclude-norms.")
+    p.add_argument("--wd-exclude-norms", dest="wd_exclude_norms",
+                   action="store_true", default=True,
+                   help="§7/B01 no-WD split (DEFAULT ON): exempt biases + "
+                        "LayerNorm/RMSNorm γβ (ndim<=1, nanoGPT) + named embed/"
+                        "identity/query tokens (timm/ViT/V-JEPA-2) from weight "
+                        "decay. Inert when --weight-decay<=0 (the wd=0 path is "
+                        "bit-identical).")
+    p.add_argument("--no-wd-exclude-norms", dest="wd_exclude_norms",
+                   action="store_false",
+                   help="Flip the no-WD split OFF: decay ALL params uniformly "
+                        "(the uniform-decay falsifier). Only changes behavior "
+                        "when --weight-decay>0.")
     p.add_argument("--optimizer", dest="optimizer_name",
                    choices=("Adam", "AdamW"), default="AdamW",
                    help="AdamW (DEFAULT 2026-06-04, §7 locked family, decoupled "
-                        "weight decay pinned to 0.0 until the no-WD groups land) "
-                        "or Adam (the prior unimplemented-default — refused on a "
-                        "real SSL/distill run by the main() launch guard).")
+                        "weight decay; pinned to 0.0 when --weight-decay is unset, "
+                        "else the no-WD param-group split (#40) applies) or Adam "
+                        "(the prior unimplemented-default — refused on a real "
+                        "SSL/distill run by the main() launch guard).")
     p.add_argument("--adam-beta2", dest="adam_beta2", type=float, default=0.95,
                    help="optimizer betas = (0.9, beta2). DEFAULT 0.95 (2026-06-04, "
                         "§7 SSL lock). Pass 0.999 to recover the torch default — "
@@ -1646,6 +1688,15 @@ def _parser() -> argparse.ArgumentParser:
              "R-p2-frontend-lr-5 (base/5); 0.0 = R-p2-freeze-frontend "
              "(front-end frozen, parcel side trains alone). A non-default "
              "raises under --phase 4.",
+    )
+    p.add_argument(
+        "--parcel-lr-scale", dest="parcel_lr_scale", type=float,
+        default=1.0 / 3.0,
+        help="B33 §5 P3-3b parcel-side discriminative-LR scale (--phase 3 "
+             "p3-stage 3b only). 1/3 (default) = base/3 lock; the front-end "
+             "rides --p2-frontend-lr-scale and the connector trains at base. "
+             "No effect under 3a / P1 / P2 / P4 (persisted onto the run record "
+             "either way). Folded into the M0 optimizer sweep (#45/#78).",
     )
     p.add_argument(
         "--latent-valid-override",
@@ -1925,6 +1976,15 @@ def _common_build_kwargs(
         adam_betas=(0.9, args.adam_beta2) if args.adam_beta2 is not None else None,
         gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
         accumulate_grad_batches=args.accumulate_grad_batches,
+        # §7/B01 no-WD param-group split (#40). Uniform across every phase
+        # (joint P1/P2, P3, P4 frozen probe) — reaches both the single-phase
+        # main() build and the --chain builds via this one dict.
+        wd_exclude_norms=args.wd_exclude_norms,
+        # MON-TEACHER-FEATURE-RANK thresholds (#74). Joint-only inside
+        # build_v14_experiment; passing them on every build is harmless (P3/P4
+        # branches don't forward them). None preserves the canonical 0.5/0.25.
+        rankme_warn_threshold=args.rankme_warn_threshold,
+        rankme_alarm_threshold=args.rankme_alarm_threshold,
     )
 
 
@@ -2019,8 +2079,13 @@ def _build_v14_chain(
     # parcel count ~16, normalised by d=256) — that is what false-positived the
     # M2-calibrated alarm and killed chain 47725245 at P2, so `--no-collapse-
     # guard` disarms ONLY P2/P3a/P3b. P4 keeps its own explicit
-    # collapse_guard=False (frozen probe, #54 audit M1). The proper long-term fix
-    # is per-monitor (M2 vs M4) threshold recalibration — Ben-gated.
+    # collapse_guard=False (frozen probe, #54 audit M1). The per-monitor (M2 vs
+    # M4) threshold recalibration that this comment used to call the long-term
+    # fix has LANDED: the M4 probe now defaults to its own empirical band
+    # (0.04/0.02) phase-keyed inside V14JointBrainModule, so P2 stays ARMED at a
+    # floor-anchored alarm without needing `--no-collapse-guard`. The flag and
+    # this per-phase split are retained as the diagnostic escape hatch.
+    # See [[project_v14_gate_cadence_guard_response_lock_2026_06_05]].
     ssl_budget: dict[str, tp.Any] = dict(
         max_steps=args.ssl_max_steps,
         val_check_interval=ssl_val_check,
@@ -2039,13 +2104,15 @@ def _build_v14_chain(
         **common, **ssl_budget, collapse_guard=args.collapse_guard, **whisper,
         p3_distill=True, p3_stage="3a",
         clip_len=5.0,
-        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+        frontend_lr_scale=args.frontend_lr_scale,
+        parcel_lr_scale=args.parcel_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     p3b = build_v14_experiment(
         **common, **ssl_budget, collapse_guard=args.collapse_guard, **whisper,
         p3_distill=True, p3_stage="3b",
         clip_len=5.0,
-        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+        frontend_lr_scale=args.frontend_lr_scale,
+        parcel_lr_scale=args.parcel_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     # binary_tasks now rides in `common` (reaches every phase, so the SSL /
     # distill clip population matches the P4 eval set); P4 only overrides the
@@ -2219,12 +2286,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  optim: name={args.optimizer_name} lr={args.lr} "
           f"lr_schedule={args.lr_schedule} warmup_steps={args.warmup_steps} "
           f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
+          f"wd_exclude_norms={args.wd_exclude_norms} "
           f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip} "
           f"accumulate_grad_batches={args.accumulate_grad_batches}")
+    print(f"  disc-lr: frontend_lr_scale={args.frontend_lr_scale} "
+          f"parcel_lr_scale={args.parcel_lr_scale} (P2/P3 discriminative-LR)")
     print(f"  guard: collapse_guard={args.collapse_guard} (SSL phases; #68 "
           f"--no-collapse-guard disarms) "
           f"ssl_val_check_interval={args.ssl_val_check_interval} (opt-steps, "
           f"×accum at Trainer #66) ssl_limit_val_batches={args.ssl_limit_val_batches}")
+    _warn_disp = ("phase-default (P1/M2 0.5, P2/M4 0.04)"
+                  if args.rankme_warn_threshold is None
+                  else args.rankme_warn_threshold)
+    _alarm_disp = ("phase-default (P1/M2 0.25, P2/M4 0.02)"
+                   if args.rankme_alarm_threshold is None
+                   else args.rankme_alarm_threshold)
+    print(f"  rankme: warn={_warn_disp} alarm={_alarm_disp} "
+          f"(joint P1/P2; normalised RankMe; alarm kills, #74)")
     if args.cluster == "slurm":
         # Same source of truth build_v14_experiment uses (no drift). In --chain,
         # the SSL/distill phases run with this strategy; the P4 probe is forced
@@ -2387,6 +2465,7 @@ def main(argv: list[str] | None = None) -> int:
         snapshot_ckpt_to=args.snapshot_ckpt_to,
         jepa_phase=args.jepa_phase,
         frontend_lr_scale=args.frontend_lr_scale,
+        parcel_lr_scale=args.parcel_lr_scale,
     )
     result = xp.run()
     print(f"V14 dispatch result: {result}")

@@ -49,6 +49,7 @@ from torchmetrics.functional.classification import binary_auroc, multiclass_accu
 
 from neuraltrain.optimizers import BaseOptimizer
 
+from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.experiments.v14_experiment import V14Experiment
 from speech_decoding.models.v14_encoder import (
     V14ParcelPerceiverWithHead,
@@ -144,6 +145,7 @@ class V14Phase4ReadoutModule(pl.LightningModule):
         optim_config: BaseOptimizer,
         x_name: str | tuple[str, ...] = "input",
         y_name: str = "target",
+        wd_exclude_norms: bool = True,
     ) -> None:
         super().__init__()
         if not isinstance(model.readout, V14PmaReadout):
@@ -159,6 +161,7 @@ class V14Phase4ReadoutModule(pl.LightningModule):
         self.optim_config = optim_config
         self.x_name = x_name
         self.y_name = y_name
+        self._wd_exclude_norms = bool(wd_exclude_norms)
         self._n_classes = int(model.readout.classifier.out_features)
         self._apply_freeze()
         # Test-epoch accumulators: the Neuroprobe metric is computed once over
@@ -303,6 +306,15 @@ class V14Phase4ReadoutModule(pl.LightningModule):
 
     def configure_optimizers(self):  # type: ignore[override]
         params = self._trainable_parameters()
+        # §7/B01 no-WD split (task #40): the readout Linear's bias rides in a
+        # weight_decay:0.0 group when a non-zero wd is set. No-op at wd=0 or
+        # under --no-wd-exclude-norms.
+        params = maybe_split_no_decay(
+            params,
+            modules=(self,),
+            optim_config=self.optim_config,
+            exclude=self._wd_exclude_norms,
+        )
         total_steps = self._estimated_total_steps()
         if total_steps is None:
             return self.optim_config.build(params)
@@ -357,6 +369,7 @@ class V14Phase4ReadoutExperiment(V14Experiment):
             optim_config=self.optim,
             x_name=self.x_name,
             y_name=self.y_name,
+            wd_exclude_norms=self.wd_exclude_norms,
         )
 
 
