@@ -232,6 +232,56 @@ def test_accumulate_grad_batches_passed_to_trainer() -> None:
     assert accum._trainer().accumulate_grad_batches == 8
 
 
+def test_val_check_interval_converted_optsteps_to_microbatches() -> None:
+    """#66: our val_check_interval is in OPTIMIZER steps, but Lightning counts
+    an int val_check_interval in training MICRO-batches. Under grad-accum the
+    Trainer kwarg must be (opt-steps × accumulate_grad_batches) — else with
+    accum=16 it validates ~16× too often (the gate-47722655 cadence bug)."""
+    base = _trainer_only_xp(n_epochs=100, max_steps=1500)
+    # accum=1: opt-step == micro-batch, value passes through unchanged.
+    no_accum = base.model_copy(update={"val_check_interval": 150})
+    assert no_accum._trainer().val_check_interval == 150
+    # accum=16: 150 opt-steps → 2400 micro-batches (the gate config).
+    accum = base.model_copy(
+        update={"val_check_interval": 150, "accumulate_grad_batches": 16}
+    )
+    assert accum._trainer().val_check_interval == 2400
+
+
+def test_int_val_check_interval_disables_epoch_gate() -> None:
+    """#66 M1: an int step-cadence is a GLOBAL step count, so the per-epoch
+    gate must be disabled — else Lightning raises ``val_check_interval >
+    batches-per-epoch`` before step 0 on the locked gate (2400 micro-batches >
+    ~1752/epoch at bs=2). A float cadence keeps the default epoch gate (1)."""
+    base = _trainer_only_xp(n_epochs=100, max_steps=1500)
+    accum = base.model_copy(
+        update={"val_check_interval": 150, "accumulate_grad_batches": 16}
+    )
+    assert accum._trainer().check_val_every_n_epoch is None
+    # No accum: still an int cadence → still disabled.
+    no_accum = base.model_copy(update={"val_check_interval": 150})
+    assert no_accum._trainer().check_val_every_n_epoch is None
+
+
+def test_val_check_interval_float_not_converted() -> None:
+    """A FLOAT val_check_interval is Lightning-native fraction-of-epoch and
+    must pass through unscaled regardless of grad-accum; the per-epoch gate
+    stays at its Lightning default (1, validate within every epoch)."""
+    base = _trainer_only_xp(n_epochs=3, max_steps=None)
+    frac = base.model_copy(
+        update={"val_check_interval": 0.5, "accumulate_grad_batches": 16}
+    )
+    assert frac._trainer().val_check_interval == 0.5
+    assert frac._trainer().check_val_every_n_epoch == 1
+
+
+def test_guard_warmup_min_step_default_zero() -> None:
+    """#67: the guard warmup-step gate defaults to 0 (check-count grace only),
+    so prior behaviour is unchanged when the dispatch does not set it."""
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+    assert base.guard_warmup_min_step == 0
+
+
 class _StubCkptCb:
     def __init__(self, best_model_path: str) -> None:
         self.best_model_path = best_model_path

@@ -886,11 +886,14 @@ class V14JointBrainModule(pl.LightningModule):
         )
 
         # 2026-06-03 mis-scope fix: the trained representation is PHASE-
-        # DEPENDENT, so the feature-health monitors must be too. P1 (paradigm
-        # A) trains ONLY the front-end token blocks that produce M2; the hard
-        # pool + inter-parcel stack that produce M4 receive NO P1 gradient (the
+        # DEPENDENT, so the feature-health monitors must be too. P1 trains
+        # ONLY the front-end token blocks that produce M2; the hard pool +
+        # inter-parcel stack that produce M4 receive NO P1 gradient (the
         # encoder's ``m2_only`` early-exit at v14_encoder.py never even builds
-        # them in P1). The previous code ran a FULL teacher forward and probed
+        # them in P1). (Both phases are paradigm-B JEPA with their own
+        # predictor since #63 — the predictor paradigm governs how the masked
+        # loss is formed, not WHICH representation each phase trains, so this
+        # phase-scoping is unchanged by it.) The previous code ran a FULL teacher forward and probed
         # RankMe/orphan on M4 every step including P1 — i.e. it measured the
         # random-init pool output and fired a false ``mon_rankme_alarm`` from
         # step 0. Fix: probe M2 (the thing P1 trains) in P1, and keep the M4

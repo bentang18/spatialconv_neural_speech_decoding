@@ -125,6 +125,11 @@ class Experiment(BaseExperiment):
     early_stopping_patience: int | None = None
     checkpoint_monitor: str = "val_loss"
     collapse_guard: bool = True
+    # Optimizer-step count of LR warmup, handed to the collapse guard so its
+    # soft criteria (RankMe/coverage/loss-blowup) are not believed while the LR
+    # is still ramping (representations legitimately look low-rank early). 0 →
+    # the guard's check-count grace only. Set by the dispatch from --warmup-steps.
+    guard_warmup_min_step: int = 0
     # Validation cadence as a step count. On a ``max_steps``-budgeted SSL
     # phase that ends mid-epoch (1500 steps < one BT-lite epoch), epoch-
     # boundary validation never runs, so the collapse-guard soft panel
@@ -237,7 +242,12 @@ class Experiment(BaseExperiment):
         # diagnosis JSON next to the checkpoints (``root`` may be None on
         # an infra-less run — the guard still aborts, just skips the file).
         if self.collapse_guard and not self.fast_dev_run:
-            callbacks.append(CollapseGuardCallback(artifact_root=root))
+            callbacks.append(
+                CollapseGuardCallback(
+                    artifact_root=root,
+                    warmup_min_step=self.guard_warmup_min_step,
+                )
+            )
         return callbacks
 
     def _trainer(self) -> pl.Trainer:
@@ -261,7 +271,30 @@ class Experiment(BaseExperiment):
         if self.val_check_interval is not None:
             # A step-count cadence so the collapse-guard soft panel runs on
             # a max_steps phase that never reaches an epoch boundary.
-            kwargs["val_check_interval"] = self.val_check_interval
+            #
+            # UNIT FIX (#66, 2026-06-05): Lightning counts an INT
+            # ``val_check_interval`` in training MICRO-batches, not optimizer
+            # steps. Our value is specified in OPTIMIZER steps (the
+            # ``--ssl-val-check-interval`` flag + the collapse-guard cadence
+            # intent), so under grad-accumulation convert: 1 optimizer step ==
+            # ``accumulate_grad_batches`` micro-batches. Without this, accum=16
+            # made validation fire 16× too often (~9 opt-steps apart, ~160
+            # checks/phase) and consumed ~80% of wall-clock. A FLOAT value
+            # (fraction-of-epoch) is Lightning-native and passes through.
+            vci = self.val_check_interval
+            if isinstance(vci, int):
+                if self.accumulate_grad_batches > 1:
+                    vci = vci * self.accumulate_grad_batches
+                # An int cadence is a GLOBAL step count, not a within-epoch
+                # offset. Lightning otherwise enforces ``val_check_interval <=
+                # batches-per-epoch`` (because ``check_val_every_n_epoch``
+                # defaults to 1) and raises before step 0 when the converted
+                # cadence exceeds one epoch — which it does on the locked gate
+                # (2400 micro-batches > ~1752/epoch at bs=2). Disabling the
+                # epoch gate makes validation fire every ``vci`` batches across
+                # epoch boundaries, the intended step-cadence semantics.
+                kwargs["check_val_every_n_epoch"] = None
+            kwargs["val_check_interval"] = vci
         if self.limit_train_batches is not None:
             kwargs["limit_train_batches"] = self.limit_train_batches
         if self.limit_val_batches is not None:

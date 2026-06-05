@@ -86,14 +86,26 @@ Threshold philosophy:
     The *verdict* thresholds (RankMe normalised < 0.25 alarm / < 0.5 warn,
     coverage degenerate-fraction > 0.10) are already locked in the monitor
     modules (5/28 P0) — this guard does not re-derive them, it consumes
-    their 0/1 flags. The only knobs this guard owns are the **debounce**
-    parameters, deliberately LOOSE: firing one check late costs a little
-    compute; firing on a transient is a false abort of a healthy multi-day
-    run. So non-finite aborts immediately, the hard alarms need
-    ``sustain_checks`` consecutive bad validations after a
-    ``warmup_checks`` grace, and the softer ``*_warn`` streak (which
-    catches a slow rank decline before it crosses the 0.25 alarm) needs a
-    longer ``warn_sustain_checks``.
+    their 0/1 flags. The only knobs this guard owns are the
+    **debounce/response** parameters, deliberately LOOSE: firing one check
+    late costs a little compute; firing on a transient is a false abort of a
+    healthy multi-day run. So non-finite aborts immediately; the hard alarms
+    need ``sustain_checks`` consecutive bad validations after a
+    ``warmup_checks`` (and optional ``warmup_min_step``) grace.
+
+    Soft-warn is advisory by default (2026-06-05). The ``*_warn`` tier
+    (RankMe normalised < 0.5) originally aborted on a longer
+    ``warn_sustain_checks`` streak — to catch a slow decline before it
+    crossed the 0.25 alarm. But its 0.5 line is a DINOv3 image-ViT value
+    (§3.3), and this iEEG |STFT| front-end's *healthy* born-state sits at
+    ~0.32 normalised rank (gate-47722655 diagnosis: rank flat at 0.319 from
+    init while val_loss fell — a floor, not a decline). So ``warn_aborts``
+    defaults False: the warn tier logs + streaks for trend visibility but
+    does NOT abort; the hard < 0.25 alarm (below the born-state) is the kill.
+    This changes only the guard's *response* to the soft tier — the
+    threshold VALUES (0.25/0.5) stay locked in the monitor modules (5/28
+    P0). Recalibrating those values to this modality is a separate,
+    lock-owning decision.
 """
 
 from __future__ import annotations
@@ -218,6 +230,15 @@ class CollapseGuardCallback(pl.Callback):
     warn_sustain_checks:
         Debounce knobs (see module constants for the rationale). Exposed
         for tests; the production defaults are the module constants.
+    warmup_min_step:
+        Optimizer-step count of LR warmup. Soft criteria are ignored while
+        ``trainer.global_step < warmup_min_step`` (on top of the check-count
+        grace), so a still-warming low-rank representation can't trip them.
+        Default 0 → check-count grace only.
+    warn_aborts:
+        Whether a sustained soft ``*_warn`` (RankMe < 0.5) aborts. Default
+        False — warn is advisory (logs + streaks, no abort); the hard < 0.25
+        alarm is the kill. See the module "Threshold philosophy".
     """
 
     def __init__(
@@ -230,6 +251,8 @@ class CollapseGuardCallback(pl.Callback):
         sustain_checks: int = SUSTAIN_CHECKS,
         warmup_checks: int = WARMUP_CHECKS,
         warn_sustain_checks: int = WARN_SUSTAIN_CHECKS,
+        warmup_min_step: int = 0,
+        warn_aborts: bool = False,
     ) -> None:
         super().__init__()
         self._artifact_root = Path(artifact_root) if artifact_root is not None else None
@@ -239,6 +262,19 @@ class CollapseGuardCallback(pl.Callback):
         self._sustain = sustain_checks
         self._warmup = warmup_checks
         self._warn_sustain = warn_sustain_checks
+        # Optimizer-step count of LR warmup. Soft criteria are not believed
+        # until ``trainer.global_step >= warmup_min_step`` (in addition to the
+        # check-count grace) — a still-warming representation legitimately
+        # looks low-rank. 0 → check-count grace only (prior behaviour).
+        self._warmup_min_step = warmup_min_step
+        # Whether a sustained soft ``*_warn`` (RankMe < 0.5) aborts. Default
+        # False: the 0.5 warn threshold is an image-ViT value (DINOv3 §3.3),
+        # not calibrated to this iEEG front-end whose healthy born-state is
+        # ~0.32 normalised rank — so warn is ADVISORY (logs + streaks for
+        # trend visibility) and the hard < 0.25 alarm is the kill. The
+        # threshold VALUES stay locked (5/28 P0); this only governs the guard's
+        # *response* to the soft tier (a guard-owned debounce/policy knob).
+        self._warn_aborts = warn_aborts
         # Per-criterion consecutive-bad-check counters.
         self._streak: dict[str, int] = collections.defaultdict(int)
         self._best_val_loss: float = math.inf
@@ -330,8 +366,14 @@ class CollapseGuardCallback(pl.Callback):
                 self._best_val_loss = min(self._best_val_loss, val_loss)
 
         # Update every criterion's streak (so they accumulate/reset), and
-        # take the first that reaches its sustain as the local verdict.
-        past_warmup = self._n_checks > self._warmup
+        # take the first that reaches its sustain as the local verdict. Soft
+        # criteria are believed only after BOTH the check-count grace AND the
+        # LR-warmup window — ``global_step`` and ``warmup_min_step`` are both
+        # in optimizer steps. (Default warmup_min_step=0 → check-count only.)
+        past_warmup = (
+            self._n_checks > self._warmup
+            and int(trainer.global_step) >= self._warmup_min_step
+        )
         for name, (is_bad, value, detail, action, sustain) in self._soft_checks(
             metrics, val_loss, snapshot
         ).items():
@@ -339,6 +381,21 @@ class CollapseGuardCallback(pl.Callback):
                 self._streak[name] += 1
             else:
                 self._streak[name] = 0
+            # Soft ``*_warn`` (RankMe < 0.5) is ADVISORY by default: its 0.5
+            # threshold is an image-ViT value, not calibrated to this iEEG
+            # front-end whose healthy born-state is ~0.32 (2026-06-05 gate
+            # diagnosis: rank flat at 0.319 from init while val_loss fell — a
+            # floor, not a decline). It streaks + logs for trend visibility but
+            # does not abort; the hard < 0.25 alarm (below the born-state) is
+            # the kill. ``warn_aborts=True`` restores the abort.
+            if name.endswith("_warn") and not self._warn_aborts:
+                if self._streak[name] == self._warn_sustain:
+                    trainer.print(
+                        f"[CollapseGuard] ADVISORY: {name} sustained "
+                        f"{self._warn_sustain} checks (value={value:.3g}); "
+                        "soft warn is NOT aborting (hard <0.25 alarm armed)."
+                    )
+                continue
             if local_verdict is None and self._streak[name] >= sustain:
                 local_verdict = self._verdict(trainer, name, detail, value, action)
 

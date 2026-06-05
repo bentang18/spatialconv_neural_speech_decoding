@@ -462,6 +462,12 @@ def build_v14_experiment(
     # collapse-guard soft panel would never evaluate. The chain sets this for
     # the SSL phases; None → Lightning default (epoch-boundary only).
     val_check_interval: int | float | None = None,
+    # Cap on validation batches per check (#66). An uncapped SSL val set
+    # (~875 batches) made each collapse-guard validation ~8 min → ~80% of
+    # wall-clock under the (now-fixed) over-frequent cadence. The guard panel
+    # estimates RankMe/coverage from a small sample, so a cap is lossless for
+    # it. None → full val set (correct for P4, where val_loss IS the metric).
+    limit_val_batches: int | float | None = None,
     # Early-stopping patience on ``val_loss``. None → no early-stop (the SSL /
     # distill phases train to a fixed budget; their val loss is a pretext
     # reconstruction/distill objective, NOT the downstream metric, so val-loss-min
@@ -1217,7 +1223,11 @@ def build_v14_experiment(
         n_epochs=n_epochs,
         max_steps=max_steps,
         val_check_interval=val_check_interval,
+        limit_val_batches=limit_val_batches,
         collapse_guard=collapse_guard,
+        # #66/#67: LR-warmup step count → the guard ignores soft criteria
+        # while the LR is still ramping (warmup_steps reaches the optim above).
+        guard_warmup_min_step=warmup_steps,
         early_stopping_patience=early_stopping_patience,
         # #37: Lightning gradient clipping. v14 §7 locks grad_clip=1.0 as a
         # non-swept universal; the CLI defaults --grad-clip to 1.0, but this
@@ -1294,7 +1304,25 @@ def _parser() -> argparse.ArgumentParser:
                         "epoch, so without this the collapse-guard soft panel "
                         "(RankMe/coverage/no-masking/loss-blowup) never fires. "
                         "Default when --ssl-max-steps is set: max(50, steps//10) "
-                        "(~10 checks/phase). Ignored on an epoch budget.")
+                        "(~10 checks/phase). Ignored on an epoch budget. NOTE: "
+                        "specified in OPTIMIZER steps; the Trainer converts to "
+                        "Lightning's micro-batch unit via accumulate_grad_batches "
+                        "(#66).")
+    p.add_argument("--ssl-limit-val-batches", dest="ssl_limit_val_batches",
+                   type=int, default=32,
+                   help="Cap each SSL/distill validation to this many batches "
+                        "(#66). The collapse-guard panel estimates RankMe/"
+                        "coverage from a small sample, so an uncapped val set "
+                        "(~875 batches, ~8 min/check) is pure wall-clock waste. "
+                        "P4 is uncapped (its val_loss IS the downstream metric). "
+                        "<=0 = uncapped.")
+    p.add_argument("--no-collapse-guard", dest="collapse_guard",
+                   action="store_false", default=True,
+                   help="Disarm the collapse/divergence kill-switch (#54) on the "
+                        "SSL/distill phases — DIAGNOSTIC ONLY. Lets a run record "
+                        "the full RankMe trajectory past the soft-warn streak "
+                        "instead of aborting (to confirm a born-low-rank floor "
+                        "vs a true decline). P4 never carries the guard anyway.")
     p.add_argument("--p4-early-stop-patience", dest="p4_early_stop_patience",
                    type=int, default=DEFAULT_P4_EARLY_STOP_PATIENCE,
                    help="Early-stopping patience (epochs) on val_loss for the "
@@ -1974,8 +2002,20 @@ def _build_v14_chain(
     ssl_val_check = args.ssl_val_check_interval
     if ssl_val_check is None and args.ssl_max_steps is not None:
         ssl_val_check = max(50, args.ssl_max_steps // 10)
+    # #66: cap each SSL validation (P4 stays uncapped — built separately below).
+    ssl_limit_val = (
+        args.ssl_limit_val_batches
+        if args.ssl_limit_val_batches and args.ssl_limit_val_batches > 0
+        else None
+    )
+    # Shared SSL/distill-phase kwargs (P1/P2/P3a/P3b — NOT P4). collapse_guard
+    # rides here so --no-collapse-guard disarms all four at once; P4 keeps its
+    # own explicit collapse_guard=False (frozen probe, #54 audit M1).
     ssl_budget: dict[str, tp.Any] = dict(
-        max_steps=args.ssl_max_steps, val_check_interval=ssl_val_check,
+        max_steps=args.ssl_max_steps,
+        val_check_interval=ssl_val_check,
+        limit_val_batches=ssl_limit_val,
+        collapse_guard=args.collapse_guard,
     )
     p1 = build_v14_experiment(
         **common, **ssl_budget, joint_phase=True, jepa_phase="p1", clip_len=5.0,
@@ -2169,6 +2209,10 @@ def main(argv: list[str] | None = None) -> int:
           f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
           f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip} "
           f"accumulate_grad_batches={args.accumulate_grad_batches}")
+    print(f"  guard: collapse_guard={args.collapse_guard} (SSL phases; #68 "
+          f"--no-collapse-guard disarms) "
+          f"ssl_val_check_interval={args.ssl_val_check_interval} (opt-steps, "
+          f"×accum at Trainer #66) ssl_limit_val_batches={args.ssl_limit_val_batches}")
     if args.cluster == "slurm":
         # Same source of truth build_v14_experiment uses (no drift). In --chain,
         # the SSL/distill phases run with this strategy; the P4 probe is forced
@@ -2286,6 +2330,15 @@ def main(argv: list[str] | None = None) -> int:
     single_val_check = args.ssl_val_check_interval
     if single_val_check is None and single_max_steps is not None:
         single_val_check = max(50, single_max_steps // 10)
+    # #66: cap SSL/distill validation; the P4 probe stays uncapped (its
+    # val_loss is the downstream metric).
+    single_limit_val = (
+        args.ssl_limit_val_batches
+        if args.phase in (1, 3)
+        and args.ssl_limit_val_batches
+        and args.ssl_limit_val_batches > 0
+        else None
+    )
     single_p4_patience = (
         (args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None)
         if args.phase == 4
@@ -2293,7 +2346,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"  single-phase budget: max_steps={single_max_steps} "
-        f"val_check_interval={single_val_check} "
+        f"val_check_interval={single_val_check} (opt-steps) "
+        f"limit_val_batches={single_limit_val} "
+        f"collapse_guard={(args.phase != 4) and args.collapse_guard} "
         f"early_stopping_patience={single_p4_patience}"
     )
     xp = build_v14_experiment(
@@ -2302,10 +2357,12 @@ def main(argv: list[str] | None = None) -> int:
         neural_lag_s=args.neural_lag_s,
         max_steps=single_max_steps,
         val_check_interval=single_val_check,
+        limit_val_batches=single_limit_val,
         early_stopping_patience=single_p4_patience,
         # #54 audit M1: guard is SSL/distill-only; a single --phase 4 probe run
-        # disables it (EarlyStopping + real metric already cover it).
-        collapse_guard=(args.phase != 4),
+        # disables it (EarlyStopping + real metric already cover it). #68:
+        # --no-collapse-guard further disarms it for a diagnostic SSL run.
+        collapse_guard=(args.phase != 4) and args.collapse_guard,
         joint_phase=(args.phase == 1),
         p3_distill=(args.phase == 3),
         p3_stage=args.p3_stage,

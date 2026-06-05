@@ -63,6 +63,11 @@ class _FakeTrainer:
         self.global_rank = global_rank
         self.strategy = strategy or _FakeStrategy()
 
+    def print(self, *args: tp.Any, **kwargs: tp.Any) -> None:  # noqa: A003
+        # Real Lightning Trainer.print is rank-zero stdout; the advisory
+        # soft-warn log calls it. Tests just no-op.
+        pass
+
 
 def _drive_val(
     guard: CollapseGuardCallback,
@@ -253,33 +258,43 @@ def test_nonfinite_val_loss_aborts_immediately() -> None:
         _drive_val(guard, [{"val_loss": float("nan")}])
 
 
-def test_sustained_rankme_warn_aborts_on_slow_decline() -> None:
-    # A rank that drifts below 0.5 (warn) but never crosses 0.25 (alarm)
-    # must still be caught — after the longer warn sustain.
+def test_sustained_rankme_warn_is_advisory_by_default() -> None:
+    # 2026-06-05 (gate-47722655 diagnosis): the soft warn (<0.5) is ADVISORY
+    # by default. A sustained warn that never crosses the 0.25 alarm must NOT
+    # abort — its 0.5 line is a DINOv3 image-ViT value, below which this iEEG
+    # front-end is born healthy (~0.32). It still streaks (for the diagnosis
+    # JSON / advisory log), it just does not raise.
     guard = CollapseGuardCallback(
         warmup_checks=0, sustain_checks=2, warn_sustain_checks=3
     )
+    _drive_val(guard, [{"val_mon_rankme_warn": 1.0}] * 5)  # no raise
+    assert guard._streak["val_mon_rankme_warn"] == 5  # noqa: SLF001 — still streaks
+
+
+def test_sustained_rankme_warn_aborts_when_warn_aborts_enabled() -> None:
+    # Opt-in: warn_aborts=True restores the early abort on a sustained slow
+    # decline (after the longer warn sustain).
+    guard = CollapseGuardCallback(
+        warmup_checks=0, sustain_checks=2, warn_sustain_checks=3, warn_aborts=True
+    )
     with pytest.raises(CollapseStop, match="val_mon_rankme_warn"):
-        _drive_val(
-            guard,
-            [{"val_mon_rankme_warn": 1.0}] * 3,
-        )
+        _drive_val(guard, [{"val_mon_rankme_warn": 1.0}] * 3)
 
 
 def test_rankme_warn_below_warn_sustain_is_healthy() -> None:
-    # Two warn checks < warn_sustain=4 → no abort (slow-decline debounce).
+    # With warn_aborts=True, two warn checks < warn_sustain=4 → no abort.
     guard = CollapseGuardCallback(
-        warmup_checks=0, sustain_checks=2, warn_sustain_checks=4
+        warmup_checks=0, sustain_checks=2, warn_sustain_checks=4, warn_aborts=True
     )
     _drive_val(guard, [{"val_mon_rankme_warn": 1.0}, {"val_mon_rankme_warn": 1.0}])
 
 
 def test_rankme_warn_one_below_sustain_at_same_threshold_is_healthy() -> None:
-    # Pins the warn-streak boundary at a FIXED threshold: at warn_sustain=3,
-    # 3 warns abort (test_sustained_rankme_warn_aborts_on_slow_decline) but
-    # exactly 2 must NOT — so a >=/> off-by-one in the warn streak is caught.
+    # Boundary pin (warn_aborts=True): at warn_sustain=3, 3 warns abort
+    # (test_sustained_rankme_warn_aborts_when_warn_aborts_enabled) but exactly
+    # 2 must NOT — so a >=/> off-by-one in the warn streak is caught.
     guard = CollapseGuardCallback(
-        warmup_checks=0, sustain_checks=2, warn_sustain_checks=3
+        warmup_checks=0, sustain_checks=2, warn_sustain_checks=3, warn_aborts=True
     )
     _drive_val(guard, [{"val_mon_rankme_warn": 1.0}, {"val_mon_rankme_warn": 1.0}])
 
@@ -320,6 +335,26 @@ def test_alarm_after_warmup_aborts() -> None:
                 {"val_mon_rankme_alarm": 1.0},  # n=3 > 2 → streak=1 → abort
             ],
         )
+
+
+def test_warmup_min_step_suppresses_alarm_during_lr_warmup() -> None:
+    # #67: a hard alarm while global_step < warmup_min_step must NOT abort —
+    # the representation is legitimately low-rank while the LR ramps.
+    # _drive_val sets global_step = epoch*100 → 0, 100, 200 all < 250.
+    guard = CollapseGuardCallback(
+        warmup_checks=0, sustain_checks=1, warmup_min_step=250
+    )
+    _drive_val(guard, [{"val_mon_rankme_alarm": 1.0}] * 3)  # no raise
+
+
+def test_alarm_after_warmup_min_step_aborts() -> None:
+    # Past the LR-warmup window (epoch 3 → global_step 300 >= 250) the same
+    # alarm counts and aborts. Pins warmup_min_step as a step gate, not a mute.
+    guard = CollapseGuardCallback(
+        warmup_checks=0, sustain_checks=1, warmup_min_step=250
+    )
+    with pytest.raises(CollapseStop, match="val_mon_rankme_alarm"):
+        _drive_val(guard, [{"val_mon_rankme_alarm": 1.0}] * 4)
 
 
 def test_alarm_fraction_below_threshold_is_healthy() -> None:
