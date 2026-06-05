@@ -190,18 +190,6 @@ DEFAULT_JEPA_PHASE: str = "p1"
 # 0.2 = R-p2-frontend-lr-5; 0.0 = R-p2-freeze-frontend (front-end frozen).
 DEFAULT_FRONTEND_LR_SCALE: float = 0.1
 
-# P1 VICReg variance-floor anti-collapse term (2026-06-04 — fixes the capstone
-# P1 RankMe collapse; ssl/variance.py has the why). coeff=0.0 ⇒ exact B26/B27
-# pure-L1 P1 (the collapsing falsifier); 1.0 = ON. gamma = std floor (≈1 for
-# post-frontend_ln). P1-only. DEVIATION from the B26/B27 pure-L1 lock — flagged.
-DEFAULT_P1_VAR_COEFF: float = 1.0
-DEFAULT_P1_VAR_GAMMA: float = 1.0
-# VICReg covariance decorrelation (same student M2, P1 only) — closes the
-# dimensional-collapse hole the variance floor is blind to (4-agent audit
-# reproduced it). 0.04 = VICReg 25:1 var:cov ratio at coeff 1.0. BOTH
-# var+cov coeffs 0.0 ⇒ exact B26/B27 pure-L1. DEVIATION — flagged.
-DEFAULT_P1_COV_COEFF: float = 0.04
-
 # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical loss simplification):
 # joint SSL default is a 2-term surface (L_pre_frame @ M2 + L_post_frame
 # @ LN_frame(M4), both pure L1 per V-JEPA 2 §2.1 Eq 1). The three
@@ -602,12 +590,6 @@ def build_v14_experiment(
     # ``jepa_phase="p2"`` only (no effect at P1, where the front-end is the
     # sole trained group).
     frontend_lr_scale: float = DEFAULT_FRONTEND_LR_SCALE,
-    # P1 VICReg variance-floor anti-collapse term (2026-06-04). coeff=0.0 ⇒
-    # exact B26/B27 pure-L1 P1 (the collapsing falsifier); 1.0 = ON. Effective
-    # under joint_phase=True + jepa_phase="p1" only.
-    p1_var_coeff: float = DEFAULT_P1_VAR_COEFF,
-    p1_var_gamma: float = DEFAULT_P1_VAR_GAMMA,
-    p1_cov_coeff: float = DEFAULT_P1_COV_COEFF,
     # WS-H / T20 (B33 P3 distillation): root of the whole-movie Whisper teacher
     # cache built by scripts/neuroprobe/build_bt_teacher_cache.py. When set, the
     # segmenter emits a per-clip ``whisper_target`` (B, 250, 1280) the P3 loss
@@ -1073,10 +1055,6 @@ def build_v14_experiment(
             "jepa_phase": jepa_phase,
             # B36 WS-E E2: P2 front-end discriminative-LR scale.
             "frontend_lr_scale": frontend_lr_scale,
-            # P1 variance+covariance anti-collapse terms (2026-06-04). P1-only.
-            "p1_var_coeff": p1_var_coeff,
-            "p1_var_gamma": p1_var_gamma,
-            "p1_cov_coeff": p1_cov_coeff,
         }
     elif p3_distill:
         # WS-F P3 Whisper distillation. The teacher stream is mandatory — the
@@ -1625,30 +1603,6 @@ def _parser() -> argparse.ArgumentParser:
              "raises under --phase 4.",
     )
     p.add_argument(
-        "--p1-var-coeff", dest="p1_var_coeff", type=float,
-        default=DEFAULT_P1_VAR_COEFF,
-        help="P1 VICReg variance-floor anti-collapse coefficient (joint SSL / "
-             "--phase 1, jepa-phase p1 only; 2026-06-04, fixes the capstone P1 "
-             "RankMe collapse). 1.0 (default) = ON; 0.0 = exact B26/B27 pure-L1 "
-             "P1 (the collapsing falsifier). DEVIATION from the pure-L1 lock.",
-    )
-    p.add_argument(
-        "--p1-var-gamma", dest="p1_var_gamma", type=float,
-        default=DEFAULT_P1_VAR_GAMMA,
-        help="P1 variance-floor std target (per-dim cross-token std hinged up "
-             "to this). ~1.0 (default) is calibrated to post-frontend_ln; watch "
-             "the logged val_repr_std to retune. Only active with --p1-var-coeff>0.",
-    )
-    p.add_argument(
-        "--p1-cov-coeff", dest="p1_cov_coeff", type=float,
-        default=DEFAULT_P1_COV_COEFF,
-        help="P1 VICReg covariance decorrelation coefficient (joint SSL / "
-             "--phase 1, jepa-phase p1 only). Closes the dimensional-collapse "
-             "hole the variance floor is blind to. 0.04 (default) = VICReg 25:1 "
-             "var:cov ratio at --p1-var-coeff 1.0; 0.0 = off. BOTH var+cov "
-             "coeffs 0.0 = exact B26/B27 pure-L1. DEVIATION from the pure-L1 lock.",
-    )
-    p.add_argument(
         "--latent-valid-override",
         choices=("support", "all_true", "parcels_supervised"),
         default="support",
@@ -1914,12 +1868,6 @@ def _common_build_kwargs(
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
-        # P1 variance-floor anti-collapse (2026-06-04). Joint-only effect
-        # (P1); the P3/P4 build branches accept-and-ignore it, same as
-        # loss_variant. Threaded here so chain + single-phase stay in lock-step.
-        p1_var_coeff=args.p1_var_coeff,
-        p1_var_gamma=args.p1_var_gamma,
-        p1_cov_coeff=args.p1_cov_coeff,
         # #37 optim / LR-schedule (audit 2026-06-03). --adam-beta2 → (0.9, β2)
         # tuple; --grad-clip <= 0 → None (disable). Reaches every phase via this
         # one dict, so the chain and single-phase builds stay in lock-step.
@@ -2114,10 +2062,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
           f"frontend_lr_scale={args.frontend_lr_scale} neural_lag_s={args.neural_lag_s} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
-    _anti_collapse_on = args.p1_var_coeff > 0 or args.p1_cov_coeff > 0
-    print(f"  p1_var_coeff={args.p1_var_coeff} p1_var_gamma={args.p1_var_gamma} "
-          f"p1_cov_coeff={args.p1_cov_coeff}"
-          f"{'  [DEVIATION: B26/B27 pure-L1 + VICReg var/cov floor]' if _anti_collapse_on else '  [pure-L1 B26/B27]'}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "

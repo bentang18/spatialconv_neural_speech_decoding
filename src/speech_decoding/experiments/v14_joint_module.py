@@ -91,7 +91,6 @@ from speech_decoding.ssl.masked_jepa import (
     p1_frontend_m2_loss,
     p2_parcel_m4_loss,
 )
-from speech_decoding.ssl.variance import covariance_loss, variance_floor_loss
 
 
 _LossForm = tp.Literal["l1", "mse"]
@@ -213,9 +212,6 @@ class V14JointBrainModule(pl.LightningModule):
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
         frontend_lr_scale: float = 0.1,
-        p1_var_coeff: float = 1.0,
-        p1_var_gamma: float = 1.0,
-        p1_cov_coeff: float = 0.04,
     ) -> None:
         super().__init__()
         # B30 sister-flag runtime gates. Drift row B30-dispatch-sister-flags
@@ -249,26 +245,6 @@ class V14JointBrainModule(pl.LightningModule):
                 "frontend_lr_scale must lie in [0.0, 1.0]; got "
                 f"{frontend_lr_scale}"
             )
-        # P1 VICReg variance-floor anti-collapse term (2026-06-04 — fixes the
-        # capstone P1 RankMe collapse; see ssl/variance.py for the full why).
-        # coeff=0.0 ⇒ exact B26/B27 pure-L1 P1 (the collapsing falsifier);
-        # >0 adds coeff·relu(gamma - per-dim-cross-token-std) on the student
-        # M2. gamma is a std floor (>0); calibrated to ≈1 for post-frontend_ln.
-        # NO effect under P2 (paradigm B already has the predictor asymmetry).
-        if p1_var_coeff < 0.0:
-            raise ValueError(f"p1_var_coeff must be >= 0.0; got {p1_var_coeff}")
-        if p1_var_gamma <= 0.0:
-            raise ValueError(f"p1_var_gamma must be > 0.0; got {p1_var_gamma}")
-        # >0 adds coeff·(off-diag feature covariance)² on the same student M2.
-        # The variance floor is blind to DIMENSIONAL collapse (a rank-k≪d
-        # subspace can keep every per-dim std ≥ gamma yet sit deep in the
-        # RankMe alarm band — reproduced by the 4-agent audit); the covariance
-        # term penalises the feature correlations such a subspace forces, so
-        # it is what arrests dimensional collapse. coeff=0.04 = VICReg's 25:1
-        # var:cov ratio applied to p1_var_coeff=1.0; empirically ~0.003 on a
-        # healthy rep (≈2% of L1, negligible) and ~1.3 at a rank-8 collapse.
-        if p1_cov_coeff < 0.0:
-            raise ValueError(f"p1_cov_coeff must be >= 0.0; got {p1_cov_coeff}")
         # 6/03 masking lock: mask shape ↔ predictor scope must move as a pair,
         # or the M4 SSL task leaks (time_block+cross_time = the H1 leak). Cheap
         # insurance at construction, before any step runs.
@@ -310,9 +286,6 @@ class V14JointBrainModule(pl.LightningModule):
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
         self._frontend_lr_scale = frontend_lr_scale
-        self._p1_var_coeff = p1_var_coeff
-        self._p1_var_gamma = p1_var_gamma
-        self._p1_cov_coeff = p1_cov_coeff
 
         # R-p2-freeze-frontend falsifier: a 0.0 scale freezes the
         # P1-pretrained front-end in P2 so the parcel side + predictor train
@@ -529,43 +502,11 @@ class V14JointBrainModule(pl.LightningModule):
         if self._phase == "p1":
             # freq_patch_valid omitted (all-valid) — WS-H threads the SWEC
             # corpus-valid prefix here alongside the sampler/encoder (C5).
-            l1 = p1_frontend_m2_loss(
+            return p1_frontend_m2_loss(
                 student_m2=student_taps["M2"],
                 teacher_m2=teacher_taps["M2"],
                 token_mask=mask_kwargs["token_mask"],
                 loss_form=self._loss_form,
-            )
-            if self._p1_var_coeff <= 0.0 and self._p1_cov_coeff <= 0.0:
-                return l1  # exact B26/B27 pure-L1 (the collapsing falsifier)
-            # VICReg variance+covariance on the STUDENT M2 (the representation
-            # P1 trains; the student-side analog of the M2 rows the EMA-teacher
-            # RankMe monitor scores). The L1 target stays the detached EMA
-            # teacher; these terms touch only the student, so they add an
-            # anti-collapse penalty, not a new target. Variance kills the
-            # paradigm-A constant-collapse; covariance kills the dimensional
-            # collapse the variance floor is blind to. `flat` is cast to fp32
-            # once and shared by both terms.
-            flat = self._frontend_repr_rows(
-                student_m2=student_taps["M2"],
-                valid_mask=student_kwargs.get("valid_mask"),
-            )
-            var_loss, repr_std = variance_floor_loss(
-                flat, gamma=self._p1_var_gamma,
-            )
-            total = l1.total
-            aux: dict[str, Tensor] = {
-                "l1": l1.total.detach(),
-                "var": var_loss.detach(),
-                "repr_std": repr_std,
-            }
-            if self._p1_var_coeff > 0.0:
-                total = total + self._p1_var_coeff * var_loss
-            if self._p1_cov_coeff > 0.0:
-                cov_loss = covariance_loss(flat)
-                total = total + self._p1_cov_coeff * cov_loss
-                aux["cov"] = cov_loss.detach()
-            return MaskedJepaBreakdown(
-                total=total, phase="p1", n_masked=l1.n_masked, aux=aux,
             )
 
         # ── P2: B8 three-way latent_valid → visible context + masked targets ──
@@ -632,12 +573,6 @@ class V14JointBrainModule(pl.LightningModule):
         self.log(
             f"{step_name}_n_masked", float(breakdown.n_masked), on_epoch=True,
         )
-        # Variance-floor diagnostics when P1 runs with the anti-collapse term
-        # on: the L1 component, the variance hinge, and the mean per-dim std
-        # (``repr_std`` — healthy ≈ gamma, collapse → 0; the direct collapse
-        # readout to watch alongside the M2 RankMe alarm).
-        for name, value in breakdown.aux.items():
-            self.log(f"{step_name}_{name}", value, on_epoch=True)
 
     # MON-TEACHER-FEATURE-RANK validation-time subsample cap. The SVD
     # cost is O(min(N, d) * N * d); capping N at 4096 keeps it under
@@ -746,35 +681,6 @@ class V14JointBrainModule(pl.LightningModule):
         valid_rows = self._rankme_subsample(flat[mask_flat])
         verdict = teacher_rank_monitor(valid_rows.detach())
         self._log_rankme(verdict, step_name=step_name, key="")
-
-    def _frontend_repr_rows(
-        self,
-        *,
-        student_m2: Tensor,
-        valid_mask: Tensor | None,
-    ) -> Tensor:
-        """The student-M2 rows the P1 anti-collapse terms act on.
-
-        Flattens ``student_m2`` ``(B, C, F_p, T_p, d)`` to ``(N, d)`` over the
-        VALID electrodes — the student-side analog of the rows
-        :meth:`_run_frontend_rank_monitor` scores on the EMA teacher, so the
-        terms regularise the representation whose rank collapsed. Cast to fp32
-        ONCE here so :func:`variance_floor_loss` and :func:`covariance_loss`
-        share a single fp32 copy (their internal ``.float()`` is then a no-op).
-        No subsample: variance is O(N·d) and the covariance ``zᵀz`` is O(N·d²)
-        with d=256 — both far cheaper than the probe's SVD, so all valid rows
-        are used for a denser estimate.
-        """
-        B, C, F_p, T_p, d = student_m2.shape
-        flat = student_m2.reshape(B * C * F_p * T_p, d)
-        if valid_mask is not None and tuple(valid_mask.shape[:2]) == (B, C):
-            keep = (
-                valid_mask.reshape(B, C, 1, 1)
-                .expand(B, C, F_p, T_p)
-                .reshape(-1)
-            )
-            flat = flat[keep]
-        return flat.float()
 
     def _run_frontend_rank_monitor(
         self,
