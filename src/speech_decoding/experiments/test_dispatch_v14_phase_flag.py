@@ -297,6 +297,40 @@ def test_chain_assembly_shape_and_handoff(monkeypatch, tmp_path) -> None:
         assert "whisper_target_cache_dir" not in calls[non_p3]
 
 
+def test_chain_p1_always_armed_default(monkeypatch, tmp_path) -> None:
+    """Default chain (guard armed): all four SSL/distill phases carry the guard;
+    P4 keeps its own collapse_guard=False (frozen probe)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    assert [c["collapse_guard"] for c in calls] == [True, True, True, True, False]
+
+
+def test_chain_no_collapse_guard_keeps_p1_armed(monkeypatch, tmp_path) -> None:
+    """--no-collapse-guard disarms ONLY the parcel/distill phases (P2/P3a/P3b).
+    P1 STAYS armed: its M2 front-end RankMe floor (~0.31) is above the 0.25 hard
+    alarm so it can't false-positive, and keeping it armed pins P1's exca UID so
+    a guard-off relaunch reuses the cached P1 instead of re-running it. The M4
+    parcel phases (floor ~0.05) are the ones that false-positive, so only they
+    are disarmed. P4 is always collapse_guard=False (frozen probe, #54 M1)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--no-collapse-guard",
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    # P1 armed; P2/P3a/P3b disarmed; P4 always off.
+    assert [c["collapse_guard"] for c in calls] == [True, False, False, False, False]
+
+
 def test_chain_threads_sister_flags(monkeypatch, tmp_path) -> None:
     """Gate-D HIGH regression: loss_variant / latent_valid_override /
     sa_mask_mode reach the chain's joint phases, and binary_tasks reaches EVERY

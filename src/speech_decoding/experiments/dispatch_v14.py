@@ -2008,30 +2008,42 @@ def _build_v14_chain(
         if args.ssl_limit_val_batches and args.ssl_limit_val_batches > 0
         else None
     )
-    # Shared SSL/distill-phase kwargs (P1/P2/P3a/P3b — NOT P4). collapse_guard
-    # rides here so --no-collapse-guard disarms all four at once; P4 keeps its
-    # own explicit collapse_guard=False (frozen probe, #54 audit M1).
+    # Shared SSL/distill-phase budget (P1/P2/P3a/P3b — NOT P4). collapse_guard is
+    # set PER PHASE below, NOT here: P1's front-end RankMe floor (~0.31 on the M2
+    # |STFT| representation, measured by the guard-OFF diagnostic 47723576) sits
+    # above the 0.25 hard alarm and its soft warn is already advisory, so P1 can
+    # never false-positive — it ALWAYS keeps the guard. That also pins P1's exca
+    # UID, so a `--no-collapse-guard` relaunch reuses the cached P1 instead of
+    # re-running it (~6 h). The parcel/distill phases operate on the M4 parcel-
+    # token representation, whose floor is ~0.05 (raw effective rank ~ active-
+    # parcel count ~16, normalised by d=256) — that is what false-positived the
+    # M2-calibrated alarm and killed chain 47725245 at P2, so `--no-collapse-
+    # guard` disarms ONLY P2/P3a/P3b. P4 keeps its own explicit
+    # collapse_guard=False (frozen probe, #54 audit M1). The proper long-term fix
+    # is per-monitor (M2 vs M4) threshold recalibration — Ben-gated.
     ssl_budget: dict[str, tp.Any] = dict(
         max_steps=args.ssl_max_steps,
         val_check_interval=ssl_val_check,
         limit_val_batches=ssl_limit_val,
-        collapse_guard=args.collapse_guard,
     )
     p1 = build_v14_experiment(
-        **common, **ssl_budget, joint_phase=True, jepa_phase="p1", clip_len=5.0,
-        neural_lag_s=args.neural_lag_s,
+        **common, **ssl_budget, collapse_guard=True, joint_phase=True,
+        jepa_phase="p1", clip_len=5.0, neural_lag_s=args.neural_lag_s,
     )
     p2 = build_v14_experiment(
-        **common, **ssl_budget, joint_phase=True, jepa_phase="p2", clip_len=5.0,
+        **common, **ssl_budget, collapse_guard=args.collapse_guard,
+        joint_phase=True, jepa_phase="p2", clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     p3a = build_v14_experiment(
-        **common, **ssl_budget, **whisper, p3_distill=True, p3_stage="3a",
+        **common, **ssl_budget, collapse_guard=args.collapse_guard, **whisper,
+        p3_distill=True, p3_stage="3a",
         clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     p3b = build_v14_experiment(
-        **common, **ssl_budget, **whisper, p3_distill=True, p3_stage="3b",
+        **common, **ssl_budget, collapse_guard=args.collapse_guard, **whisper,
+        p3_distill=True, p3_stage="3b",
         clip_len=5.0,
         frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
     )
