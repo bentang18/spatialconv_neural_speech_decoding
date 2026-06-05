@@ -31,6 +31,24 @@ from speech_decoding.experiments.experiment_logging import ExperimentLogger
 from speech_decoding.experiments.module import BrainModule
 
 
+def _is_global_zero() -> bool:
+    """True on the rank-0 worker (or any single-process run).
+
+    Under srun-DDP (``--cluster slurm`` + ``tasks_per_node>1``) the exca task
+    body ``run()`` executes once per rank, BEFORE any Lightning Trainer exists,
+    so rank must be read from the launcher environment. ``srun`` exports
+    ``SLURM_PROCID`` for every task; Lightning's own subprocess launcher exports
+    ``RANK``. A run with neither (exca local, or a single srun task) is rank 0.
+    Used to gate file-writing side effects (run-log sidecars) that share a fixed
+    path across ranks and would otherwise race.
+    """
+    for var in ("SLURM_PROCID", "RANK"):
+        v = os.environ.get(var)
+        if v is not None:
+            return v == "0"
+    return True
+
+
 class Experiment(BaseExperiment):
     """NeuralTrain/Exca experiment contract for speech decoding runs.
 
@@ -317,7 +335,13 @@ class Experiment(BaseExperiment):
             brain_module, loaders["test"], ckpt_path=self._test_ckpt_path(trainer),
         )
         # B36 WS-E (E3): snapshot this phase's transferable state for the next.
-        if self.snapshot_ckpt_to is not None:
+        # Under DDP the weights are kept in sync across ranks, so only global-
+        # zero writes the handoff ckpt — 4 ranks torch.save-ing the same path
+        # would corrupt it (and break the next phase's strict load). torch.save
+        # has no collective, so a rank-gated write needs no barrier; the next
+        # phase is a separate submitit job that starts only after this job's
+        # ranks have all exited.
+        if self.snapshot_ckpt_to is not None and trainer.is_global_zero:
             self._snapshot(brain_module, self.snapshot_ckpt_to)
         return dict(results[0]) if results else {}
 
@@ -342,7 +366,12 @@ class Experiment(BaseExperiment):
     @infra.apply
     def run(self) -> dict[str, float | None]:
         artifact_dir, exca_uid = self._artifact_dir_and_uid()
-        if artifact_dir is None:
+        # Under srun-DDP this body runs once per rank. The ExperimentLogger
+        # writes fixed-name sidecars into the shared artifact_dir, so only
+        # global-zero may write them — concurrent rank writers would race on the
+        # same file. Non-zero ranks still run the full train/test so they join
+        # every DDP collective; they just skip the run-log.
+        if artifact_dir is None or not _is_global_zero():
             return self._train_and_test()
         with ExperimentLogger(
             artifact_dir=artifact_dir,

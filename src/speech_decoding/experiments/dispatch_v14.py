@@ -481,6 +481,14 @@ def build_v14_experiment(
     gpus_per_node: int | None = None,
     cpus_per_task: int | None = None,
     timeout_min: int | None = None,
+    # 4-GPU DDP (#33). exca/submitit default tasks_per_node=1, so a bare
+    # gpus_per_node>1 gives N GPUs to ONE srun task and Lightning hangs waiting
+    # for N ranks. Real DDP needs one srun rank per GPU (tasks_per_node=N); exca
+    # requires slurm_use_srun=True whenever tasks_per_node>1. main() auto-derives
+    # both from gpus_per_node for a slurm run; left None/False here so single-GPU
+    # and local paths are byte-for-byte unchanged.
+    tasks_per_node: int | None = None,
+    slurm_use_srun: bool = False,
     # Lightning trainer precision. v14 first-pass default is bf16-mixed
     # per 2026-05-29 OOM diagnosis on RTX 5000 Ada (31 GiB): factorized
     # per-electrode SA over C=384 padded electrodes at d=256 exhausts
@@ -979,6 +987,12 @@ def build_v14_experiment(
         infra_cfg["cpus_per_task"] = cpus_per_task
     if timeout_min is not None:
         infra_cfg["timeout_min"] = timeout_min
+    # 4-GPU DDP (#33): one srun rank per GPU. exca raises if tasks_per_node>1
+    # without slurm_use_srun, so always pair them.
+    if tasks_per_node is not None:
+        infra_cfg["tasks_per_node"] = tasks_per_node
+    if slurm_use_srun:
+        infra_cfg["slurm_use_srun"] = slurm_use_srun
 
     # #21: phase routing is exclusive — joint (P1/P2), P3 distill, and the
     # P4 frozen probe each replace the brain module differently and cannot
@@ -1388,6 +1402,19 @@ def _parser() -> argparse.ArgumentParser:
                         "parallelism).")
     p.add_argument("--timeout-min", type=int, default=None,
                    help="Slurm timeout in minutes (e.g. 720 = 12h).")
+    # 4-GPU DDP (#33). One srun rank per GPU is required for Lightning DDP; a
+    # bare --gpus-per-node N leaves tasks_per_node=1 (exca default) → N GPUs in
+    # one rank → NCCL-init hang. Leave --tasks-per-node unset and main()
+    # auto-sets it = --gpus-per-node (and --slurm-use-srun) for any slurm run
+    # with >1 GPU. Pass --tasks-per-node 1 to force the legacy single-rank path.
+    p.add_argument("--tasks-per-node", type=int, default=None,
+                   help="srun ranks per node (DDP: =--gpus-per-node). Auto-set "
+                        "for multi-GPU slurm runs. For a true single-GPU run use "
+                        "--gpus-per-node 1 (NOT --tasks-per-node 1, which leaves "
+                        "all GPUs in one rank → NCCL hang).")
+    p.add_argument("--slurm-use-srun", action="store_true",
+                   help="Launch under srun (exca requires it when "
+                        "tasks_per_node>1). Auto-enabled for multi-GPU DDP.")
     # Lightning trainer precision. Default 'bf16-mixed' was chosen 2026-05-29
     # after the B31 Lite Phase-4 baseline OOM'd on RTX 5000 Ada (31 GiB) at
     # every batch size tried — factorized per-electrode SA over C=384 padded
@@ -1771,6 +1798,10 @@ def _common_build_kwargs(
         gpus_per_node=args.gpus_per_node,
         cpus_per_task=args.cpus_per_task,
         timeout_min=args.timeout_min,
+        # 4-GPU DDP (#33): reaches every phase via this one dict so the chain +
+        # single-phase builds stay in lock-step on the srun-rank topology.
+        tasks_per_node=args.tasks_per_node,
+        slurm_use_srun=args.slurm_use_srun,
         precision=args.precision,
         extractor_cache_folder=args.extractor_cache_folder,
         dkoleo_mode=args.dkoleo_mode,
@@ -1913,6 +1944,37 @@ def main(argv: list[str] | None = None) -> int:
     # --exca-mode always wins.
     if args.exca_mode is None:
         args.exca_mode = "retry" if args.chain else "cached"
+    # 4-GPU DDP enablement (#33). exca/submitit default tasks_per_node=1, so a
+    # bare --gpus-per-node N allocates N GPUs to ONE srun task; Lightning's
+    # SLURMEnvironment then waits for N ranks that never start and hangs at NCCL
+    # init. Real DDP needs one srun rank per GPU: tasks_per_node = gpus_per_node
+    # and slurm_use_srun=True (exca hard-requires the latter when
+    # tasks_per_node>1). Only applies to a slurm run with >1 GPU; single-GPU and
+    # local paths keep tasks_per_node=1 / no-srun. An explicit --tasks-per-node
+    # wins. (The TRUE single-GPU escape hatch is --gpus-per-node 1, NOT
+    # --tasks-per-node 1: the latter leaves N GPUs in one rank → the NCCL hang.)
+    if args.cluster == "slurm" and args.gpus_per_node and args.gpus_per_node > 1:
+        if args.tasks_per_node is None:
+            args.tasks_per_node = args.gpus_per_node
+        if args.tasks_per_node > 1:
+            args.slurm_use_srun = True
+    # Safety net (audit 2026-06-04): warn loudly if a multi-GPU run that submits
+    # to slurm did NOT end up with real DDP topology (tasks_per_node>1 + srun).
+    # The auto-resolve above fires only for --cluster slurm; --cluster auto and
+    # an explicit --tasks-per-node 1 both leave N GPUs in ONE rank → Lightning
+    # hangs at NCCL init. A loud line beats a silent multi-hour hang.
+    if (args.cluster in ("slurm", "auto") and args.gpus_per_node
+            and args.gpus_per_node > 1
+            and not (args.tasks_per_node and args.tasks_per_node > 1
+                     and args.slurm_use_srun)):
+        print(
+            f"WARNING: --gpus-per-node {args.gpus_per_node} but DDP topology is "
+            f"NOT enabled (tasks_per_node={args.tasks_per_node}, "
+            f"slurm_use_srun={args.slurm_use_srun}). All {args.gpus_per_node} "
+            "GPUs would go to ONE rank → Lightning hangs at NCCL init. Use "
+            "--cluster slurm (auto-enables DDP) or --gpus-per-node 1 for a true "
+            "single-GPU run."
+        )
     # Gate-B flag 3 / Gate-D fix: phase-couple the clip window when the operator
     # leaves --clip-len unset. A single --phase 4 run that defaulted to 5 s would
     # silently run the readout off the leaderboard-parity 1 s window. --chain
@@ -1962,6 +2024,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "
               f"gpus_per_node={args.gpus_per_node} "
+              f"tasks_per_node={args.tasks_per_node} "
+              f"slurm_use_srun={args.slurm_use_srun} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
     print(f"  precision={args.precision}")
     # #21 phase routing + cross-phase handoff (recorded so the run YAML never
