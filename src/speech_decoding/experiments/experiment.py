@@ -97,6 +97,20 @@ class Experiment(BaseExperiment):
     fast_dev_run: bool | int = False
     accelerator: str = "auto"
     devices: int | str = "auto"
+    # Lightning ``strategy``. ``None`` (default) → Lightning auto-selects
+    # (single-device on 1 GPU; plain DDP under multi-rank srun). The staged
+    # B36 SSL phases leave whole submodules out of the active loss by design
+    # (P1 trains the front-end only — the pool / inter-parcel encoder /
+    # predictor carry ``requires_grad=True`` but get no gradient; the
+    # predictor is P2-only). Plain DDP's reducer rejects that on the 2nd
+    # iteration ("parameters that were not used in producing the loss"), so a
+    # multi-rank run MUST pass ``"ddp_find_unused_parameters_true"``. Set only
+    # under DDP (tasks_per_node>1) so the single-GPU path stays non-DDP. The
+    # strategy itself is numerically inert (AdamW skips grad=None params, wd=0);
+    # the only multi-rank delta is the standard DDP mean-of-means reweighting of
+    # the per-element masked loss (see dispatch_v14._resolve_ddp_strategy call
+    # site). The string variant keeps the config pydantic-serialisable.
+    ddp_strategy: str | None = None
     # Lightning trainer precision. Default ``None`` → fp32 (back-compat).
     # Pass ``"bf16-mixed"`` for activation-half precision on Ada/Hopper
     # GPUs; pass ``"16-mixed"`` for older fp16 mixed (requires GradScaler
@@ -237,6 +251,8 @@ class Experiment(BaseExperiment):
             "enable_checkpointing": self.infra.folder is not None,
             "fast_dev_run": self.fast_dev_run,
         }
+        if self.ddp_strategy is not None:
+            kwargs["strategy"] = self.ddp_strategy
         if self.max_steps is not None:
             # Step budget overrides the epoch cap; max_epochs=-1 lets the run go
             # the full max_steps (estimated_stepping_batches == max_steps).

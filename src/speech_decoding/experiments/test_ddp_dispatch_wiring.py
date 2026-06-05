@@ -77,6 +77,63 @@ def test_cluster_auto_multigpu_warns(capsys) -> None:
     assert "WARNING" in out and "DDP topology is NOT enabled" in out
 
 
+def test_four_gpu_resolves_find_unused_parameters_strategy(capsys) -> None:
+    """A multi-rank DDP run MUST request the find-unused DDP strategy. The
+    staged B36 SSL phases leave whole submodules out of the active loss (P1
+    front-end-only; predictor is P2-only) while keeping them grad-requiring, so
+    plain DDP crashes on the 2nd iteration. ``--fast-dev-run`` (1 batch) could
+    not catch this in the live gate — the reducer only rebuilds buckets from
+    the 2nd forward — so it is pinned here at the config layer."""
+    rc = main([
+        "--cluster", "slurm", "--gpus-per-node", "4",
+        "--slurm-partition", "coganlab-gpu", "--dry-run",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ddp_strategy=ddp_find_unused_parameters_true" in out
+
+
+def test_single_gpu_stays_no_ddp_strategy(capsys) -> None:
+    """One GPU must NOT request a DDP strategy — it would force DDP on a
+    single-device run. Lightning auto-selects single-device."""
+    rc = main([
+        "--cluster", "slurm", "--gpus-per-node", "1",
+        "--slurm-partition", "coganlab-gpu", "--dry-run",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ddp_strategy=None" in out
+
+
+def test_build_threads_ddp_strategy_to_experiment() -> None:
+    """The find-unused strategy must reach the constructed Experiment (so its
+    ``_trainer`` passes ``strategy=`` to the Lightning Trainer). Builds a real
+    multi-rank (``tasks_per_node>1``) joint-SSL Experiment (config only, no data
+    load) and reads the field off the pydantic object. The build succeeding at
+    all also proves the field is accepted (``extra='forbid'`` would reject it)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    exp = dv.build_v14_experiment(
+        mode="lite", joint_phase=True, bt_root="/tmp/bt", tasks_per_node=4,
+        slurm_use_srun=True, cluster="slurm", slurm_partition="coganlab-gpu",
+        exca_folder="/tmp/exca",
+    )
+    assert exp.ddp_strategy == "ddp_find_unused_parameters_true"
+
+
+def test_build_single_gpu_no_ddp_strategy() -> None:
+    """A single-rank build must leave ``ddp_strategy=None`` so Lightning stays
+    on its single-device auto strategy (no forced DDP)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    exp = dv.build_v14_experiment(
+        mode="lite", joint_phase=True, bt_root="/tmp/bt", tasks_per_node=None,
+        slurm_use_srun=False, cluster="slurm", slurm_partition="coganlab-gpu",
+        exca_folder="/tmp/exca",
+    )
+    assert exp.ddp_strategy is None
+
+
 def test_four_gpu_slurm_no_hang_warning(capsys) -> None:
     """The happy path (--cluster slurm --gpus-per-node 4) auto-enables real DDP,
     so the hang warning must NOT fire."""
@@ -101,10 +158,10 @@ def test_local_run_has_no_slurm_ddp_fields(capsys) -> None:
 # --- chain threading: the DDP pair must reach every phase --------------------
 
 
-def test_chain_threads_ddp_fields(monkeypatch, tmp_path) -> None:
-    """Post-resolution ``tasks_per_node`` / ``slurm_use_srun`` must thread to ALL
-    five chain phases via _common_build_kwargs; if one phase fell back to the
-    exca default it would hang the moment that phase's array task launched."""
+def _capture_chain_calls(monkeypatch, tmp_path, *, gpus_per_node=4):
+    """Build the 5-phase chain with a stubbed ``build_v14_experiment`` and return
+    the captured per-phase kwargs. Simulates main()'s post-parse DDP resolution
+    for a multi-GPU slurm run."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls: list[dict] = []
@@ -120,17 +177,56 @@ def test_chain_threads_ddp_fields(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(dv, "build_v14_experiment", fake_build)
     args = dv._parser().parse_args([
-        "--chain", "--work-dir", str(tmp_path),
+        "--chain", "--cluster", "slurm", "--work-dir", str(tmp_path),
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--gpus-per-node", str(gpus_per_node),
     ])
-    # Simulate main()'s post-parse DDP resolution for a 4-GPU slurm run.
-    args.tasks_per_node = 4
-    args.slurm_use_srun = True
+    # Mirror main()'s post-parse DDP resolution exactly: only gpus_per_node>1
+    # auto-derives one srun rank per GPU; 1-GPU keeps the parser defaults.
+    if gpus_per_node > 1:
+        args.tasks_per_node = gpus_per_node
+        args.slurm_use_srun = True
     phases = dv._build_v14_chain(args, cross_attn_positions=None)
+    return calls, phases
+
+
+def test_chain_threads_ddp_fields_to_ssl_phases(monkeypatch, tmp_path) -> None:
+    """Post-resolution ``tasks_per_node`` / ``slurm_use_srun`` must thread to the
+    four SSL/distill phases (P1,P2,P3a,P3b) via _common_build_kwargs; if one
+    phase fell back to the exca default it would hang the moment that phase's
+    array task launched. (P4 is the deliberate exception — see the next test.)"""
+    calls, phases = _capture_chain_calls(monkeypatch, tmp_path)
     assert len(calls) == len(phases) == 5
-    for c in calls:
+    for c in calls[:4]:  # P1, P2, P3a, P3b
         assert c["tasks_per_node"] == 4
         assert c["slurm_use_srun"] is True
+        assert c["gpus_per_node"] == 4
+
+
+def test_chain_forces_p4_probe_single_gpu(monkeypatch, tmp_path) -> None:
+    """The P4 frozen-probe phase MUST run single-GPU even when the SSL phases run
+    4-GPU DDP. Under multi-rank DDP, trainer.test() computes AUROC over only
+    rank-0's ~1/N shard (no all_gather) and AUROC is non-decomposable, so the
+    reported leaderboard number would be wrong. Single-GPU ⇒ full test set, no
+    DistributedSampler, ddp_strategy=None inside build."""
+    calls, _ = _capture_chain_calls(monkeypatch, tmp_path)
+    p4 = calls[-1]  # P4 is built last in _build_v14_chain
+    assert p4["phase4_frozen_probe"] is True
+    assert p4["gpus_per_node"] == 1
+    assert p4["tasks_per_node"] is None
+    assert p4["slurm_use_srun"] is False
+
+
+def test_chain_single_gpu_leaves_p4_identical(monkeypatch, tmp_path) -> None:
+    """A single-GPU chain (no DDP) must NOT special-case P4 — the override only
+    fires under real multi-rank DDP, so a 1-GPU chain leaves every phase on the
+    same topology (no behaviour change)."""
+    calls, _ = _capture_chain_calls(monkeypatch, tmp_path, gpus_per_node=1)
+    for c in calls:
+        assert c["gpus_per_node"] == 1
+        assert c["tasks_per_node"] is None
+        assert c["slurm_use_srun"] is False
+        # tasks_per_node None ⇒ no find-unused strategy anywhere (incl. P4).
 
 
 # --- rank-0 write gate -------------------------------------------------------

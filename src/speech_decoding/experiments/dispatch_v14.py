@@ -358,6 +358,31 @@ def _build_optim_cfg(
     return cfg
 
 
+def _resolve_ddp_strategy(tasks_per_node: int | None) -> str | None:
+    """The Lightning ``strategy`` for a given srun-rank topology.
+
+    A multi-rank run (``tasks_per_node>1``) MUST use the find-unused DDP
+    strategy: the staged B36 SSL phases leave whole submodules out of the
+    active loss (P1 trains the front-end only; the pool / inter-parcel encoder /
+    predictor stay ``requires_grad=True`` but get no gradient — the predictor is
+    P2-only). Plain DDP's reducer rejects unused grad-requiring params on the
+    2nd iteration ("parameters that were not used in producing the loss"); a
+    1-batch ``--fast-dev-run`` cannot catch it (the reducer only rebuilds
+    buckets from the 2nd forward). Single-GPU/local stays non-DDP (``None`` →
+    Lightning auto-selects single-device).
+
+    Single source of truth: both ``build_v14_experiment`` (what actually
+    reaches the Trainer) and ``main()``'s run summary (what gets printed)
+    derive the strategy here, so the printed value can never drift from the
+    applied one.
+    """
+    return (
+        "ddp_find_unused_parameters_true"
+        if tasks_per_node is not None and tasks_per_node > 1
+        else None
+    )
+
+
 def build_v14_experiment(
     *,
     bt_root: str | None = None,
@@ -1109,6 +1134,18 @@ def build_v14_experiment(
             "(neural_lag_s must stay 0.0 on the Phase-4 probe path)."
         )
 
+    # 4-GPU DDP (#33 follow-up): a multi-rank run needs the find-unused DDP
+    # strategy (see _resolve_ddp_strategy for the staged-phase rationale).
+    # The strategy itself changes no numerics — AdamW skips grad=None params,
+    # wd=0 (§7-locked, hard-guarded above). The only multi-rank delta is the
+    # standard DDP mean-of-means reweighting of the per-element masked JEPA
+    # loss (per-rank masked-cell counts differ): that makes the 4-GPU grad
+    # equal to the validated single-GPU + grad-accum fallback (NOT a true
+    # bs=N*batch single mean), and it is zero-mean over training. P4's
+    # downstream metric is NOT computed under DDP — the chain forces the probe
+    # single-GPU (see _build_v14_chain) so trainer.test() sees the full set.
+    ddp_strategy = _resolve_ddp_strategy(tasks_per_node)
+
     return experiment_cls(
         data=data,
         infra=infra_cfg,
@@ -1193,6 +1230,7 @@ def build_v14_experiment(
         ),
         accelerator="auto",
         devices="auto",
+        ddp_strategy=ddp_strategy,
         precision=precision,
         fast_dev_run=fast_dev_run,
         **extra_experiment_kwargs,
@@ -1921,8 +1959,23 @@ def _build_v14_chain(
     p4_patience = (
         args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None
     )
+    # 4-GPU DDP audit (2026-06-04, 4-agent): force the P4 probe single-GPU when
+    # the SSL phases run multi-rank DDP. P4 is a frozen-encoder linear probe and
+    # its AUROC/acc is the one number the chain produces — but under multi-rank
+    # DDP, trainer.test() computes the metric over only rank-0's ~1/N shard (no
+    # all_gather / sync_dist), and AUROC is non-decomposable, so the reported
+    # value != the full-set metric. The probe is tiny, so multi-GPU buys nothing;
+    # single-GPU gives the full test set (no DistributedSampler) and a correct
+    # number. ``tasks_per_node=None`` makes _resolve_ddp_strategy return None
+    # inside build. Only diverges from the SSL phases under real DDP — a
+    # single-GPU / local chain leaves P4 identical (no behaviour change).
+    p4_common = dict(common)
+    if common.get("tasks_per_node") and common["tasks_per_node"] > 1:
+        p4_common["gpus_per_node"] = 1
+        p4_common["tasks_per_node"] = None
+        p4_common["slurm_use_srun"] = False
     p4 = build_v14_experiment(
-        **common, phase4_frozen_probe=True,
+        **p4_common, phase4_frozen_probe=True,
         clip_len=1.0, neural_lag_s=0.0,
         early_stopping_patience=p4_patience,
         # #54 audit M1: no collapse guard on the supervised frozen probe — it
@@ -2021,11 +2074,17 @@ def main(argv: list[str] | None = None) -> int:
           f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip} "
           f"accumulate_grad_batches={args.accumulate_grad_batches}")
     if args.cluster == "slurm":
+        # Same source of truth build_v14_experiment uses (no drift). In --chain,
+        # the SSL/distill phases run with this strategy; the P4 probe is forced
+        # single-GPU (ddp_strategy=None) for a full-test-set metric.
+        _ddp_strategy = _resolve_ddp_strategy(args.tasks_per_node)
+        _p4_note = " (P4 probe forced single-GPU)" if args.chain and _ddp_strategy else ""
         print(f"  slurm: partition={args.slurm_partition} "
               f"account={args.slurm_account} mem_gb={args.mem_gb} "
               f"gpus_per_node={args.gpus_per_node} "
               f"tasks_per_node={args.tasks_per_node} "
               f"slurm_use_srun={args.slurm_use_srun} "
+              f"ddp_strategy={_ddp_strategy}{_p4_note} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
     print(f"  precision={args.precision}")
     # #21 phase routing + cross-phase handoff (recorded so the run YAML never
