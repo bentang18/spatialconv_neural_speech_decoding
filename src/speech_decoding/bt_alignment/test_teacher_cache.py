@@ -349,6 +349,52 @@ def test_target_standardizer_gives_unit_variance_on_pooled_target(tmp_path):
     assert (z_raw.var(dim=(0, 1), unbiased=False) > 2.0).all()
 
 
+def test_fit_channel_stats_pools_whole_movie_caches(tmp_path):
+    """Regression (2026-06-04): the shipped teacher cache is WHOLE-MOVIE
+    (~350k frames), not 250-frame clips. fit_channel_stats must tile each movie
+    into non-overlapping 250-frame clips and batch-pool them (the same op
+    training applies per clip) — feeding the whole movie to the 250-locked pool
+    used to raise 'expected 250 Whisper frames'. The fitted stats must equal a
+    reference computed by chunk+pool over the SAME frames; the ≤249-frame tail
+    is dropped."""
+    from speech_decoding.extractors.whisper_teacher_pool import (
+        triangular_pool_50_to_8_hz,
+    )
+
+    torch.manual_seed(7)
+    d = 12
+    # 630 frames → 2 full 250-clips (500), 130-frame tail dropped.
+    movie = torch.randn(630, d) * 2.0 + 1.0
+    p = tmp_path / "whole_movie.pt"
+    _save_features(p, movie)
+
+    stats = fit_channel_stats([p], d_model=d)
+    assert stats["mean"].shape == (d,) and stats["inv_std"].shape == (d,)
+
+    # Reference: chunk to [0:250],[250:500], pool each 250→40, concat → (80, d).
+    fp32 = movie.to(torch.float16).float()  # mirror the cache fp16 round-trip
+    ref_pooled = torch.cat(
+        [
+            triangular_pool_50_to_8_hz(fp32[s : s + 250].unsqueeze(0)).squeeze(0)
+            for s in (0, 250)
+        ],
+        dim=0,
+    )
+    assert ref_pooled.shape == (80, d)
+    assert torch.allclose(stats["mean"], ref_pooled.mean(dim=0), atol=1e-4)
+    ref_var = ref_pooled.var(dim=0, unbiased=False)
+    assert torch.allclose(stats["inv_std"], 1.0 / torch.sqrt(ref_var + 1e-8), atol=1e-3)
+
+
+def test_fit_channel_stats_rejects_subclip_movie(tmp_path):
+    """A movie shorter than one 250-frame clip can't be pooled to 8 Hz — fail
+    loudly rather than silently drop it to zero frames."""
+    p = tmp_path / "tiny.pt"
+    _save_features(p, torch.randn(120, 8))
+    with pytest.raises(ValueError, match="< one 250-frame clip"):
+        fit_channel_stats([p], d_model=8)
+
+
 def test_target_standardizer_buffers_not_params_and_preserves_shape():
     standardizer = TargetStandardizer(torch.zeros(1280), torch.ones(1280))
     assert sum(p.numel() for p in standardizer.parameters()) == 0  # non-trainable
@@ -419,6 +465,33 @@ def test_fit_and_save_channel_stats_excludes_output_file_from_glob(tmp_path):
     )
     assert torch.equal(first["mean"], second["mean"])
     assert torch.equal(first["inv_std"], second["inv_std"])
+
+
+def test_fit_and_save_channel_stats_skips_stray_stats_file(tmp_path):
+    """Fitting to a DIFFERENT out_path while a prior channel_stats.pt sits in the
+    cache dir must NOT ingest it as a movie cache (keys {mean, inv_std}, no
+    'features' → KeyError). The reserved 'channel_stats*' stem is always skipped,
+    not just this call's own out_path."""
+    torch.manual_seed(5)
+    model, merge, d = "m", "mean_all", 8
+    paths = []
+    for i in range(2):
+        p = movie_cache_path(tmp_path, model, merge, f"movie_{i}")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _save_features(p, torch.randn(250, d))
+        paths.append(p)
+    in_dir = paths[0].parent
+    # A leftover stats file from a prior fit, in the same dir as the caches.
+    torch.save({"mean": torch.zeros(d), "inv_std": torch.ones(d)},
+               in_dir / "channel_stats.pt")
+    # Fit to a DIFFERENT location — the stray channel_stats.pt must be ignored.
+    stats = fit_and_save_channel_stats(
+        tmp_path, model=model, layer_merge=merge,
+        out_path=tmp_path / "other_stats.pt", d_model=d,
+    )
+    direct = fit_channel_stats(sorted(paths), d_model=d)
+    assert torch.equal(stats["mean"], direct["mean"])
+    assert torch.equal(stats["inv_std"], direct["inv_std"])
 
 
 def test_fit_and_save_channel_stats_no_caches_raises(tmp_path):

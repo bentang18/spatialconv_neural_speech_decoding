@@ -61,17 +61,22 @@ def main() -> None:
 
 
 def build_sbatch(out_dir: Path | None, log_dir: Path, args: argparse.Namespace) -> str:
+    # --fit-only fits channel_stats over an already-built cache: no Whisper load,
+    # so a CPU job (no GPU) on `common` (there is no coganlab CPU partition).
     lines = [
         "#!/bin/bash",
-        "#SBATCH -J bt_teacher_cache",
-        f"#SBATCH -p {args.gpu_partition}",
+        f"#SBATCH -J {'bt_channel_stats' if args.fit_only else 'bt_teacher_cache'}",
+        f"#SBATCH -p {args.cpu_partition if args.fit_only else args.gpu_partition}",
     ]
     if args.account:
         lines.append(f"#SBATCH --account={args.account}")
     lines.extend([
         f"#SBATCH --cpus-per-task={args.cpus}",
         f"#SBATCH --mem={args.mem}",
-        "#SBATCH --gres=gpu:1",
+    ])
+    if not args.fit_only:
+        lines.append("#SBATCH --gres=gpu:1")
+    lines.extend([
         f"#SBATCH -t {args.time}",
         f"#SBATCH -o {log_dir.resolve()}/build-%j.out",
         f"#SBATCH -e {log_dir.resolve()}/build-%j.err",
@@ -106,7 +111,11 @@ def build_sbatch(out_dir: Path | None, log_dir: Path, args: argparse.Namespace) 
         cmd.append(f"    --limit {args.limit} \\")
     if args.overwrite:
         cmd.append("    --overwrite \\")
-    cmd.append("    --device cuda")
+    if args.fit_channel_stats or args.fit_only:
+        cmd.append("    --fit-channel-stats \\")
+    if args.channel_stats_out is not None:
+        cmd.append(f"    --channel-stats-out {shlex.quote(str(args.channel_stats_out))} \\")
+    cmd.append(f"    --device {'cpu' if args.fit_only else 'cuda'}")
     lines.extend(cmd)
     lines.append("")
     return "\n".join(lines)
@@ -148,9 +157,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--account", default="coganlab")
     p.add_argument("--gpu-partition", default="coganlab-gpu",
                    help="Production default: no preemption, RTX 5000 Ada.")
+    p.add_argument("--cpu-partition", default="common",
+                   help="Partition for --fit-only (CPU; no coganlab CPU partition exists).")
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--mem", default="64G")
     p.add_argument("--time", default="02:00:00")
+    p.add_argument(
+        "--fit-channel-stats", action="store_true",
+        help="Pass --fit-channel-stats to the build (fit + save channel_stats.pt "
+             "after the movie cache).",
+    )
+    p.add_argument(
+        "--channel-stats-out", type=Path, default=None,
+        help="Pass-through destination for channel_stats.pt.",
+    )
+    p.add_argument(
+        "--fit-only", action="store_true",
+        help="Fit channel_stats over an already-complete cache: CPU job (no GPU), "
+             "implies --fit-channel-stats. Use when every movie is already cached.",
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 

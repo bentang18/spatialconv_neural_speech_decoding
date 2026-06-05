@@ -440,13 +440,32 @@ def fit_channel_stats(
     """
     from speech_decoding.extractors.whisper_teacher_pool import (
         triangular_pool_50_to_8_hz,
+        _EXPECTED_N_IN as _CLIP_FRAMES_50HZ,  # 250 = 5 s × 50 Hz (pool's locked input)
     )
 
     def _load_pooled(path: Path) -> Tensor:
         # Fit at the rate the standardizer is applied: the 8 Hz pooled target,
-        # not the 50 Hz cache (H2). fp32 (cache is fp16); pool 250→40.
+        # not the 50 Hz cache (H2). The shipped teacher cache is WHOLE-MOVIE
+        # (~350k frames per movie), but triangular_pool_50_to_8_hz is locked to
+        # the per-clip 250→40 contract (it rejects other lengths by design). So
+        # tile the movie into non-overlapping 250-frame clips and batch-pool each
+        # — the IDENTICAL op training applies per clip (same zero-padded edges),
+        # so the fitted per-channel stats match the 8 Hz target distribution the
+        # standardizer sees. The ≤249-frame tail is dropped (<0.02% of a movie).
+        # A 250-frame input (the unit-test clip) is n_clips=1 → unchanged. fp32
+        # (cache is fp16). (Whole-movie caller never hit before #44 was run live.)
         feat = torch.load(path, weights_only=False)["features"].to(torch.float32)
-        return triangular_pool_50_to_8_hz(feat.unsqueeze(0)).squeeze(0)
+        n_clips = feat.shape[0] // _CLIP_FRAMES_50HZ
+        if n_clips == 0:
+            raise ValueError(
+                f"fit_channel_stats: {path.name} has {feat.shape[0]} frames "
+                f"(< one {_CLIP_FRAMES_50HZ}-frame clip); cannot pool to 8 Hz."
+            )
+        clips = feat[: n_clips * _CLIP_FRAMES_50HZ].reshape(
+            n_clips, _CLIP_FRAMES_50HZ, -1,
+        )
+        pooled = triangular_pool_50_to_8_hz(clips)        # (n_clips, 40, d)
+        return pooled.reshape(-1, pooled.shape[-1])       # (n_clips·40, d)
 
     # Pass 1 — per-channel mean over (clips × 8 Hz frames), fp32.
     total = torch.zeros(d_model, dtype=torch.float32)
@@ -486,14 +505,19 @@ def fit_and_save_channel_stats(
     (``cache_dir/<model_slug>/<merge_slug>/*.pt``) and fits the FULL corpus
     (all movies) via :func:`fit_channel_stats` — the shipped P3 default (Ben
     2026-06-04; full-corpus, not train-only, leakage second-order per that
-    function's docstring). The output file is excluded from its own glob so a
-    re-run cannot ingest the stats as a movie cache. Returns the saved
-    ``{'mean', 'inv_std'}``.
+    function's docstring). Any ``channel_stats*.pt`` is excluded from the glob —
+    not just this call's own ``out_path`` — because the default ``out_path`` lives
+    IN this same dir, so a re-fit to a different location would otherwise ingest a
+    prior stats file (keys ``{mean, inv_std}``, no ``features``) as a movie cache
+    and crash. ``channel_stats`` is a reserved artifact name, never a movie slug.
+    Returns the saved ``{'mean', 'inv_std'}``.
     """
     out_path = Path(out_path)
     movie_dir = Path(cache_dir) / model.replace("/", "_") / merge_slug(layer_merge)
     feature_paths = sorted(
-        p for p in movie_dir.glob("*.pt") if p.resolve() != out_path.resolve()
+        p for p in movie_dir.glob("*.pt")
+        if p.resolve() != out_path.resolve()
+        and not p.stem.startswith("channel_stats")
     )
     if not feature_paths:
         raise FileNotFoundError(

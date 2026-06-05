@@ -41,6 +41,7 @@ from speech_decoding.bt_alignment.teacher_cache import (
     WHISPER_SR,
     MovieCacheEntry,
     WhisperFeatureExtractor,
+    fit_and_save_channel_stats,
     merge_slug,
     movie_cache_path,
     write_movie_cache,
@@ -76,6 +77,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Re-encode movies whose cache file already exists.")
     p.add_argument("--dry-run", action="store_true",
                    help="List movies + output paths; load no model.")
+    p.add_argument(
+        "--fit-channel-stats", action="store_true",
+        help="After the build, fit + save the B33 full-corpus per-channel "
+             "channel_stats.pt over every cached movie (TargetStandardizer input "
+             "for P3 distillation). Skips the Whisper load entirely when every "
+             "requested movie is already cached, so a fit-only re-run needs no GPU.",
+    )
+    p.add_argument(
+        "--channel-stats-out", type=Path, default=None,
+        help="Destination for channel_stats.pt (only with --fit-channel-stats). "
+             "Default <out_dir>/<model_slug>/<merge_slug>/channel_stats.pt, "
+             "config-keyed so two teacher configs never share a stats file.",
+    )
     return p.parse_args(argv)
 
 
@@ -156,86 +170,118 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit is not None:
         slugs = slugs[: args.limit]
 
+    # Cache + stats paths share the SAME <model>/<merge_slug>/ dir as the .pt
+    # files (keying by model alone let a `mean_all` and an `L8` build clobber
+    # each other's manifest while their caches sat side by side).
+    cache_dir = out_dir / args.model.replace("/", "_") / merge_slug(merge)
+    stats_out = args.channel_stats_out or (cache_dir / "channel_stats.pt")
+
     print(f"BT teacher-cache build — {len(slugs)} movie(s)")
     print(f"  wav_dir={args.wav_dir}")
     print(f"  out_dir={out_dir}")
     print(f"  model={args.model} layer_merge={merge!r} chunk_s={args.chunk_s} "
           f"device={args.device}")
     print(f"  movies={slugs}")
+    if args.fit_channel_stats:
+        print(f"  fit_channel_stats -> {stats_out}")
 
     if args.dry_run:
         for movie in slugs:
             print(f"  [dry] {movie} -> {_expected_path(out_dir, args.model, merge, movie)}")
+        if args.fit_channel_stats:
+            print(f"  [dry] fit channel_stats over {cache_dir}/*.pt -> {stats_out}")
         return 0
 
-    # Load Whisper only for a real build (keeps --dry-run a login-node preflight).
-    import torch
-    from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        print("  WARNING: cuda requested but unavailable; falling back to cpu.")
-        device = "cpu"
-    # Force fp32. transformers v5 loads a checkpoint in its NATIVE dtype, and
-    # large-v3's HF weights are fp16 — but the teacher target is a mean over all
-    # 32 encoder layers, and accumulating that in fp16 drifts from the fp32
-    # ceiling-probe that validated `mean_all`. fp32 large-v3 ≈6 GB, well within
-    # the 32 GB RTX 5000 Ada; the dense stream is still stored fp16 downstream.
-    model = (
-        WhisperForConditionalGeneration.from_pretrained(args.model)
-        .eval().float().to(device)
-    )
-    proc = WhisperProcessor.from_pretrained(args.model)
-    fe = WhisperFeatureExtractor(model, proc, layer_merge=merge)
+    to_build = [
+        m for m in slugs
+        if args.overwrite or not _expected_path(out_dir, args.model, merge, m).exists()
+    ]
 
     entries: list[MovieCacheEntry] = []
-    try:
-        for i, movie in enumerate(slugs, 1):
-            dest = _expected_path(out_dir, args.model, merge, movie)
-            if dest.exists() and not args.overwrite:
-                print(f"  [{i}/{len(slugs)}] {movie}: cache exists, skip "
-                      f"(--overwrite to rebuild)")
-                continue
-            wav = _load_mono_16k(args.wav_dir / f"{movie}.wav")
-            entry = write_movie_cache(
-                fe, wav, sample_rate=WHISPER_SR, movie=movie,
-                out_dir=out_dir, chunk_s=args.chunk_s,
-            )
-            entries.append(entry)
-            print(f"  [{i}/{len(slugs)}] {movie}: {entry.duration_s:.1f}s "
-                  f"-> {entry.n_frames} frames @ {entry.rate_hz}Hz, d={entry.d_model} "
-                  f"({entry.out_path})")
-            sys.stdout.flush()
-    finally:
-        fe.close()
+    if to_build:
+        # Load Whisper only when there is something to build — a fit-only re-run
+        # over a complete cache needs no model (no GPU).
+        import torch
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    # Manifest lives in the SAME <model>/<merge_slug>/ dir as the .pt files it
-    # describes — keying by model alone let a `mean_all` and an `L8` build clobber
-    # each other's manifest while their caches sat side by side.
-    cache_dir = out_dir / args.model.replace("/", "_") / merge_slug(merge)
+        device = args.device
+        if device == "cuda" and not torch.cuda.is_available():
+            print("  WARNING: cuda requested but unavailable; falling back to cpu.")
+            device = "cpu"
+        # Force fp32. transformers v5 loads a checkpoint in its NATIVE dtype, and
+        # large-v3's HF weights are fp16 — but the teacher target is a mean over
+        # all 32 encoder layers, and accumulating that in fp16 drifts from the
+        # fp32 ceiling-probe that validated `mean_all`. fp32 large-v3 ≈6 GB, well
+        # within the 32 GB RTX 5000 Ada; the dense stream is still stored fp16.
+        model = (
+            WhisperForConditionalGeneration.from_pretrained(args.model)
+            .eval().float().to(device)
+        )
+        proc = WhisperProcessor.from_pretrained(args.model)
+        fe = WhisperFeatureExtractor(model, proc, layer_merge=merge)
+        try:
+            for i, movie in enumerate(to_build, 1):
+                wav = _load_mono_16k(args.wav_dir / f"{movie}.wav")
+                entry = write_movie_cache(
+                    fe, wav, sample_rate=WHISPER_SR, movie=movie,
+                    out_dir=out_dir, chunk_s=args.chunk_s,
+                )
+                entries.append(entry)
+                print(f"  [{i}/{len(to_build)}] {movie}: {entry.duration_s:.1f}s "
+                      f"-> {entry.n_frames} frames @ {entry.rate_hz}Hz, "
+                      f"d={entry.d_model} ({entry.out_path})")
+                sys.stdout.flush()
+        finally:
+            fe.close()
+    else:
+        print(f"  all {len(slugs)} requested movie(s) already cached; nothing to build.")
+
     manifest_path = cache_dir / "build_manifest.json"
-    if not entries:
+    if entries:
+        # channel_stats.pt shares this dir but is NOT a movie cache — exclude it.
+        cached_total = sorted(
+            p.stem for p in cache_dir.glob("*.pt") if p.stem != "channel_stats"
+        )
+        manifest = {
+            "built_at": datetime.now().isoformat(timespec="seconds"),
+            "git_commit": _git_commit(),
+            "model": args.model,
+            "layer_merge": merge,
+            "chunk_s": args.chunk_s,
+            "rate_hz": 50,
+            "wav_dir": str(args.wav_dir),
+            "movies_built": [e.movie for e in entries],         # this run only
+            "movies_cached_total": cached_total,                # full cache state (filenames)
+            "entries": [vars(e) for e in entries],
+        }
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        print(f"Built {len(entries)} movie(s); cached total {len(cached_total)}; "
+              f"manifest -> {manifest_path}")
+    else:
         # A pure-skip resume built nothing — do NOT clobber a good manifest with
         # an empty one (the bug a skip-only re-run would otherwise cause).
         print(f"Built 0 new movie(s); manifest unchanged -> {manifest_path}")
-        return 0
-    cached_total = sorted(p.stem for p in cache_dir.glob("*.pt"))
-    manifest = {
-        "built_at": datetime.now().isoformat(timespec="seconds"),
-        "git_commit": _git_commit(),
-        "model": args.model,
-        "layer_merge": merge,
-        "chunk_s": args.chunk_s,
-        "rate_hz": 50,
-        "wav_dir": str(args.wav_dir),
-        "movies_built": [e.movie for e in entries],         # this run only
-        "movies_cached_total": cached_total,                # full cache state (filenames)
-        "entries": [vars(e) for e in entries],
-    }
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"Built {len(entries)} movie(s); cached total {len(cached_total)}; "
-          f"manifest -> {manifest_path}")
+
+    if args.fit_channel_stats:
+        import torch
+
+        print(f"Fitting channel_stats over {cache_dir}/*.pt ...")
+        stats = fit_and_save_channel_stats(
+            out_dir, model=args.model, layer_merge=merge, out_path=stats_out,
+        )
+        mean, inv_std = stats["mean"], stats["inv_std"]
+        ok = bool(
+            torch.isfinite(mean).all()
+            and torch.isfinite(inv_std).all()
+            and (inv_std > 0).all()
+        )
+        print(f"  channel_stats: mean{tuple(mean.shape)} inv_std{tuple(inv_std.shape)} "
+              f"finite_and_positive={ok} "
+              f"inv_std[min={inv_std.min():.4g}, max={inv_std.max():.4g}] -> {stats_out}")
+        if not ok:
+            raise SystemExit("channel_stats failed finiteness/positivity check")
+
     return 0
 
 
