@@ -218,6 +218,23 @@ class V14JointExperiment(V14Experiment):
     # front-end is the only trained group there).
     frontend_lr_scale: float = pydantic.Field(default=0.1, ge=0.0, le=1.0)
 
+    # P1 VICReg variance-floor anti-collapse term (2026-06-04 — fixes the
+    # capstone P1 RankMe collapse; ssl/variance.py has the full why). Adds
+    # ``p1_var_coeff · relu(p1_var_gamma − per-dim-cross-token-std)`` on the
+    # student M2 in P1 only. ``p1_var_coeff=0.0`` recovers the exact B26/B27
+    # pure-L1 P1 (the collapsing falsifier sister); default 1.0 = ON. NO effect
+    # under jepa_phase="p2" (paradigm B already has the predictor asymmetry).
+    # DEVIATION from the B26/B27 pure-L1 lock — flagged; empirically motivated.
+    p1_var_coeff: float = pydantic.Field(default=1.0, ge=0.0)
+    p1_var_gamma: float = pydantic.Field(default=1.0, gt=0.0)
+    # VICReg covariance decorrelation, same student M2, P1 only. The variance
+    # floor is blind to dimensional collapse (low-rank-but-per-dim-variance-OK);
+    # this term penalises the feature correlations such a subspace forces — the
+    # 4-agent audit reproduced the variance-only hole by gradient descent.
+    # default 0.04 = VICReg 25:1 var:cov ratio at p1_var_coeff=1.0. BOTH
+    # coeffs 0.0 ⇒ exact B26/B27 pure-L1. Also a flagged DEVIATION.
+    p1_cov_coeff: float = pydantic.Field(default=0.04, ge=0.0)
+
     # B31 ``loss_variant`` field RETAINED for dispatch config-record
     # compatibility (``dispatch_v14`` passes it through), but B36 WS-B
     # replaced the multi-term aggregator path with the single-term masked
@@ -341,6 +358,9 @@ class V14JointExperiment(V14Experiment):
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
             frontend_lr_scale=self.frontend_lr_scale,
+            p1_var_coeff=self.p1_var_coeff,
+            p1_var_gamma=self.p1_var_gamma,
+            p1_cov_coeff=self.p1_cov_coeff,
         )
 
 

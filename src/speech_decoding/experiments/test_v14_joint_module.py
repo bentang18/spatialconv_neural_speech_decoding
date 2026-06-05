@@ -221,9 +221,13 @@ def test_p2_grad_reaches_encoder_and_predictor() -> None:
 
 
 def test_p1_empty_mask_gives_exact_zero_no_nan() -> None:
-    """B6 masked-empty contract: ratio 0 → no masked cell → total is an
-    exact 0 (graph-connected, no NaN)."""
-    module = _make_module(phase="p1", m2_mask_ratio=0.0)
+    """B6 masked-empty contract: ratio 0 → no masked cell → the L1 term is an
+    exact 0 (graph-connected, no NaN). Tested on the pure-L1 path (both
+    anti-collapse coeffs 0) — the variance/covariance terms are representation
+    terms independent of the mask, so they are not part of this contract."""
+    module = _make_module(
+        phase="p1", m2_mask_ratio=0.0, p1_var_coeff=0.0, p1_cov_coeff=0.0,
+    )
     breakdown = module._step(_make_synthetic_batch().data)
     assert breakdown.n_masked == 0
     assert float(breakdown.total.detach()) == 0.0
@@ -284,6 +288,144 @@ def test_b6_l1_gradient_magnitude_constant_in_error() -> None:
     # The discriminator: L1's grad is identical across error scales (MSE's
     # would be 0.1× vs 5×). Constant ⇒ pure L1.
     torch.testing.assert_close(grads[0], grads[-1])
+
+
+# ---------------------------------------------------------------------------
+# P1 VICReg variance+covariance anti-collapse terms (2026-06-04 capstone fix;
+# covariance added after the 4-agent audit reproduced the variance-only hole)
+# ---------------------------------------------------------------------------
+
+
+def test_p1_both_coeffs_zero_is_exact_pure_l1() -> None:
+    """``p1_var_coeff=0`` AND ``p1_cov_coeff=0`` reproduce the B26/B27 pure-L1
+    falsifier bit-for-bit: the returned breakdown IS the L1 breakdown (empty
+    aux). Either coeff alone would keep an anti-collapse term active, so the
+    pure-L1 path requires both off."""
+    batch = _make_synthetic_batch()
+    enc = _make_tiny_encoder()
+    pure = _make_module(
+        enc, phase="p1", p1_var_coeff=0.0, p1_cov_coeff=0.0,
+    )._step(batch.data)
+    assert pure.aux == {}
+    enc2 = _make_tiny_encoder()
+    enc2.load_state_dict(enc.state_dict())
+    again = _make_module(
+        enc2, phase="p1", p1_var_coeff=0.0, p1_cov_coeff=0.0,
+    )._step(batch.data)
+    torch.testing.assert_close(pure.total, again.total)
+
+
+def test_p1_var_only_keeps_a_term_when_cov_off() -> None:
+    """``p1_var_coeff>0`` with cov off is still NOT pure-L1 (var-only sister):
+    aux has var/repr_std but no cov, and total = l1 + coeff·var."""
+    batch = _make_synthetic_batch()
+    enc = _make_tiny_encoder()
+    on = _make_module(
+        enc, phase="p1", p1_var_coeff=1.0, p1_cov_coeff=0.0,
+    )._step(batch.data)
+    assert set(on.aux.keys()) == {"l1", "var", "repr_std"}
+    torch.testing.assert_close(on.total, on.aux["l1"] + on.aux["var"])
+
+
+def test_p1_default_populates_var_and_cov_aux_and_adds_both() -> None:
+    """The default (var 1.0 + cov 0.04) folds BOTH terms into total and exposes
+    l1/var/cov/repr_std diagnostics for separate logging."""
+    batch = _make_synthetic_batch()
+    enc = _make_tiny_encoder()
+    on = _make_module(
+        enc, phase="p1", p1_var_coeff=1.0, p1_cov_coeff=0.04,
+    )._step(batch.data)
+    assert set(on.aux.keys()) == {"l1", "var", "cov", "repr_std"}
+    torch.testing.assert_close(
+        on.total, on.aux["l1"] + 1.0 * on.aux["var"] + 0.04 * on.aux["cov"],
+    )
+    for v in on.aux.values():
+        assert v.grad_fn is None  # detached diagnostics
+    assert on.total.requires_grad  # only total carries the graph
+
+
+def test_p1_cov_only_keeps_a_term_when_var_off() -> None:
+    """``p1_cov_coeff>0`` with var off (the var-floor's complement): aux has
+    cov (plus var/repr_std diagnostics, still computed for logging) and
+    total = l1 + cov_coeff·cov (the var term is NOT added)."""
+    batch = _make_synthetic_batch()
+    enc = _make_tiny_encoder()
+    on = _make_module(
+        enc, phase="p1", p1_var_coeff=0.0, p1_cov_coeff=0.04,
+    )._step(batch.data)
+    assert "cov" in on.aux
+    torch.testing.assert_close(on.total, on.aux["l1"] + 0.04 * on.aux["cov"])
+
+
+def test_p1_anti_collapse_strictly_raises_total() -> None:
+    """The default anti-collapse terms are > 0 on a randn-init front-end, so the
+    default total strictly exceeds the pure-L1 total."""
+    batch = _make_synthetic_batch()
+    enc = _make_tiny_encoder()
+    enc2 = _make_tiny_encoder()
+    enc2.load_state_dict(enc.state_dict())
+    pure = _make_module(
+        enc, phase="p1", p1_var_coeff=0.0, p1_cov_coeff=0.0,
+    )._step(batch.data)
+    on = _make_module(enc2, phase="p1")._step(batch.data)  # defaults: var+cov on
+    assert float(on.aux["cov"]) > 0.0
+    assert float(on.total.detach()) > float(pure.total.detach())
+
+
+def test_p1_anti_collapse_grad_reaches_frontend_only() -> None:
+    """Both terms are computed on the student M2 (post ``frontend_ln``), so —
+    like the L1 term — gradient reaches ``frontend_ln`` but neither the
+    downstream ``encoder_ln`` nor the predictor. The default run keeps the P1
+    grad-scope contract."""
+    module = _make_module(phase="p1")  # defaults: var+cov on
+    breakdown = module._step(_make_synthetic_batch().data)
+    breakdown.total.backward()
+    enc = module.student.encoder
+    assert enc.frontend_ln.weight.grad is not None
+    assert torch.isfinite(enc.frontend_ln.weight.grad).all()
+    assert enc.encoder_ln.weight.grad is None
+    for p in module.predictor.parameters():
+        assert p.grad is None
+
+
+def test_p1_cov_coeff_scales_the_term() -> None:
+    """``total = l1 + var_coeff·var + cov_coeff·cov`` — doubling cov_coeff
+    doubles the covariance contribution (the var part is unchanged)."""
+    batch = _make_synthetic_batch()
+    enc = _make_tiny_encoder()
+    enc2 = _make_tiny_encoder()
+    enc2.load_state_dict(enc.state_dict())
+    one = _make_module(
+        enc, phase="p1", p1_var_coeff=1.0, p1_cov_coeff=0.04,
+    )._step(batch.data)
+    two = _make_module(
+        enc2, phase="p1", p1_var_coeff=1.0, p1_cov_coeff=0.08,
+    )._step(batch.data)
+    torch.testing.assert_close(one.aux["cov"], two.aux["cov"])
+    torch.testing.assert_close(
+        two.total, one.aux["l1"] + 1.0 * one.aux["var"] + 0.08 * one.aux["cov"],
+    )
+
+
+def test_p2_is_unaffected_by_anti_collapse_coeffs() -> None:
+    """The anti-collapse terms are P1-only — the P2 branch returns its plain
+    single-term breakdown (empty aux) before any variance/covariance logic
+    runs, even with both coeffs on."""
+    module = _make_module(phase="p2", p1_var_coeff=1.0, p1_cov_coeff=0.04)
+    breakdown = module._step(_make_synthetic_batch().data)
+    assert breakdown.phase == "p2"
+    assert breakdown.aux == {}
+    assert breakdown.n_masked > 0
+    assert torch.isfinite(breakdown.total)
+
+
+def test_rejects_bad_anti_collapse_params() -> None:
+    with pytest.raises(ValueError, match="p1_var_coeff"):
+        _make_module(phase="p1", p1_var_coeff=-0.1)
+    with pytest.raises(ValueError, match="p1_var_gamma"):
+        _make_module(phase="p1", p1_var_gamma=0.0)
+    with pytest.raises(ValueError, match="p1_cov_coeff"):
+        _make_module(phase="p1", p1_cov_coeff=-0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -376,11 +518,13 @@ def test_b9_module_does_not_import_retired_aggregator_helpers() -> None:
 
 
 def test_b9_breakdown_exposes_exactly_one_scalar_term() -> None:
-    """B9: the breakdown carries a single ``total`` scalar + its phase tag —
-    there are no per-term sub-fields (l_mid_slot / l_post_utterance / ...)."""
+    """B9: the optimizer steps on a single ``total`` scalar + its phase tag —
+    there are no per-term *loss* sub-fields (l_mid_slot / l_post_utterance /
+    ...). ``aux`` is a logging-only dict (never re-added to ``total``), so its
+    presence does not reintroduce a multi-term loss surface."""
     breakdown = _make_module(phase="p1")._step(_make_synthetic_batch().data)
     fields = set(vars(breakdown).keys())
-    assert fields == {"total", "phase", "n_masked"}
+    assert fields == {"total", "phase", "n_masked", "aux"}
 
 
 def test_b9_layer_avg_with_instance_norm_retired_from_runtime() -> None:

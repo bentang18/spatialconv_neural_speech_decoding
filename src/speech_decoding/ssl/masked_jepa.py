@@ -26,7 +26,7 @@ and normalized only by the encoder's own terminal LayerNorm — NO separate
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -43,11 +43,19 @@ class MaskedJepaBreakdown:
     ``total`` is the scalar the optimizer steps on. ``phase`` is ``"p1"`` or
     ``"p2"``; ``n_masked`` is the number of masked cells scored this step
     (0 → ``total`` is an exact 0, no NaN — B6 masked-empty contract).
+
+    ``aux`` carries extra (detached) scalars for logging only — they are NOT
+    re-added to ``total`` (the caller folds any aux term into ``total`` before
+    constructing the breakdown). P1 with the variance floor on populates
+    ``{"l1": ..., "var": ..., "repr_std": ...}`` so the L1 component, the
+    variance hinge, and the mean per-dim std can be watched separately from
+    the combined ``total``. Empty for the pure-L1 path and for P2.
     """
 
     total: Tensor
     phase: str
     n_masked: int
+    aux: tp.Mapping[str, Tensor] = field(default_factory=dict)
 
 
 def _l1_or_zero(pred: Tensor, target: Tensor, loss_form: _LossForm) -> Tensor:
