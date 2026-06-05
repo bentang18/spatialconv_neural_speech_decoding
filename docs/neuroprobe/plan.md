@@ -43,33 +43,23 @@ These commitments are the scaffolding. Change one and you are writing a differen
 5. **Leaderboard-parity cells are not architecture-selection defaults.** S2/trial-4 CrossSubject and the 120-electrode Lite cap are leaderboard-parity cells. Pooled multi-source CrossSubject multiclass is the scientific generalization default.
 6. **No legacy reuse.** Old loaders, old training loops, old sbatch tooling stay in git history. Active path is the NeuroAI substrate (`Study → Events DataFrame → Transforms/Chain → Segmenter → Dataset → NeuralTrain Experiment → Exca`).
 
-## Architecture (v14, ~15.1M params)
+## Architecture (v14 B36, ≤30M params)
 
-Canonical: `memory/project_v14_arch_post_v3_amendment_2026_05_19.md` (the v4 state — wins on conflict) + the 2026-05-22 amendment in `memory/project_v14_imindbench_multistft_pivot_2026_05_22.md` + 2026-05-25 B19/B21/B22/B03 lock chain. Factorized latent stack; `d=256`, heads=8, N=6, L=6, M=4, ~15.1M params (post-B19/B21/B22 SSL stack + identity-anchored init + dense-feature supervision; within ≤30M cap). No open architectural blockers — B1 (SWEC sampling rate) closed by the 2026-05-19 SWEC audit.
+Canonical: `MEMORY.md §Status canonical-source table` (per-lock detail; **it wins on conflict** — this block is a navigational summary). The Perceiver-IO arch was **thrown away**; current arch = **B36 hard per-parcel attention pool** ([[project_v14_b36_perparcel_pool_structured_jepa_2026_06_01]]) + FE-RAW-1 raw-|STFT| front-end ([[project_v14_fe_raw_frontend_f50_2026_06_04]]). `d=256`, heads=8, N=6. SSL = staged P1 front-end / P2 parcel, **both paradigm-B masked JEPA with their own predictor** ([[project_v14_predictor_design_rope_lock_2026_06_04]]); P3 Whisper all-layer-mean distill, project-up ([[project_v14_b33_project_up_phase3_2026_05_30]]); P4 frozen-PMA→mean→linear ([[project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31]]). Within ≤30M cap (per-lock param accounting in the B35/B36 memos). No open architectural blockers — B1 (SWEC sampling rate) closed by the 2026-05-19 SWEC audit.
 
 ```
-Preproc (BT 2048 Hz): HPF 0.5 Hz → comb @ mains_hz (per-corpus) → MNE-LOF flag → **ref draw** {shaftCAR, bipolar, Laplacian} per-clip (5/27 PM ref-aug; SWEC degenerates to global-CAR) → slice
-  → Multi-STFT (iMINDBench Appendix E + v14 high-band extension):
-       STFT_low  Nperseg=1024 (~2–40 Hz),  STFT_mid Nperseg=512 (~20–148 Hz),
-       STFT_hi   Nperseg=256  (~80–813 Hz, extended past iMINDBench's 248 Hz cap)
-       common hop = 256 samples @ 2048 Hz → 8 Hz frame rate (B20 v4 lock 2026-05-24)
-  → triangular ⅓-octave filterbank (30 log-SPACED bins, mel-style edges)
-       k0–k14 from STFT_low, k15–k21 from STFT_mid, k22–k29 from STFT_hi
-  → Nv14 robust-z per (electrode, freq-bin, session)
-       (5/25 swap: post-filterbank `log(energy+ε)` step dropped; raw filterbank magnitude is the default.
-        F-log-amplitude sister re-enables `log` via `apply_log=True`.)
-       invalid bins (per-corpus valid-bin mask) skipped → input-filled 0
-  → (C, F=30, T = clip_length × 8)
-❶  A1 Conv2d (3,2) patches + per-patch freq embed (10 vec) + ref_embed (3, d) additive (5/27 PM ref-aug)
-❷  Token block × N=6   per electrode, JOINT t·f attention (B20 v4 lock 2026-05-24; supersedes N=4 factorized): RoPE on time only · pre-norm · GeLU · MLP 4×
-❺  Cross-attn   pools (electrode, freq) → parcels, strict 1:1 per time-step
-      320 free Perceiver-IO latents (K=80 DK parcels × M=4 slots), bias = log(support+ε)
-      2 cross-attn layers @ stack positions {0, 3}        → latents (320, T, d)
-❻  Latent stack × L=6   factorized (time × parcel): time SA (RoPE) · parcel SA · MLP
-❼  Readout (phase-asymmetric — see ablations.md §6 readout cells):
-      parcel-collapse: PMA k=1 frozen seed → (T, d)
-      Phase-3 SSL:    triangular-window pool over T → T_r* buckets @ rate r* vs Whisper layer k* (Goldstein search-range anchors (acoustic-phonetic L8) inform the grid only; **B06 PM lock 2026-05-25**: r* = 8 Hz, k* = L8 with `R-rate-{5,10,16}Hz` falsifiers)
-      Phase-4 probe:  NO time pool — flatten (T, d) → T·d → per-task Linear (iMINDBench-parity)
+Preproc (BT 2048 Hz): HPF 0.5 Hz → comb @ mains_hz (per-corpus) → MNE-LOF flag → ref draw {shaftCAR, bipolar, Laplacian} per-clip (5/27 PM ref-aug; default ref_embed OFF per B32; SWEC degenerates to global-CAR) → slice
+  → Multi-STFT (3 windows: low Nperseg=1024 ~2–40 Hz, mid 512 ~20–148 Hz, hi 256 ~80–813 Hz), hop=128 @ 2048 Hz → 16 Hz frame rate
+  → FE-RAW-1 (front_end="raw", default): raw |STFT| bins, F=50 (low k2–15=14 + mid k8–37=30 + hi k19–24=6); F=30 ⅓-octave filterbank demoted to front_end="fbank" / R-filterbank-30bin sister
+  → Nv14 robust-z per (electrode, freq-bin, session); invalid bins (per-corpus valid-bin mask) skipped → 0
+  → (C, F=50, T = clip_length × 16)
+❶  A1 Conv2d (5,2) patch stem + per-patch freq embed (10 vec); ref_embed default OFF (B32) → (C, F_p=10, T_p, d)
+❷  Token block × N=6   per electrode, JOINT t·f attention: RoPE on time only · pre-norm · GeLU · MLP 4×
+❺  Hard per-parcel attention pool (B36): each electrode → its single BT-DK parcel; query reads ONLY that parcel's electrodes (replaces Perceiver-IO 320 free latents + soft log(support+ε) bias)
+❻  Parcel-token stack: inter-parcel self-attn + time SA (RoPE) · MLP
+❼  Readout (phase-asymmetric):
+      P3 SSL:   PMA → Whisper distill (project-up 256→1280 MLP; all-layer-mean target)
+      P4 probe: frozen-PMA → mean-over-time → per-task Linear
 ```
 
 **Latents keep a time axis** `(320, T, d)` — v3's time-collapsed latents broke Phase-3 SSL (the cross-modal target is a 50-token syllable-rate sequence) and killed cross-parcel temporal dynamics. Multi-STFT is the patch embedding (replaces single-STFT 2026-05-22 — resolves the post-v3 low-frequency-floor TODO honestly; preserves the 30-bin log-SPACED ⅓-octave filterbank on top, value-axis is raw magnitude post-5/25). Latent init is a free `nn.Parameter` (parcel identity carried by the cross-attn bias, not the latent vector).

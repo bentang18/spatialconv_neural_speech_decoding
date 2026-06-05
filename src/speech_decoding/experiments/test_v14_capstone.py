@@ -197,21 +197,26 @@ def test_p1_p2_p3_p4_end_to_end_on_bt(tmp_path) -> None:
     ckpt_p3b = tmp_path / "phase_p3b.ckpt"
 
     # ===================================================================
-    # P1 — front-end masked JEPA (M2, BT-only, paradigm A)
+    # P1 — front-end masked JEPA (M2, BT-only, paradigm B)
     # ===================================================================
     m1 = V14JointBrainModule(encoder=_encoder(), optim_config=_optim(), phase="p1")
 
     # (a) finite loss + (c) M2 gradient scope. Done via an explicit backward
     # (robust — a trainer would zero the grads before we could inspect them):
-    # only the front-end is supervised at P1; the pool / inter-parcel encoder /
-    # predictor are downstream of M2 (m2_only=True) and must get NO gradient.
+    # P1 is paradigm B (exact parity with P2) — the visible-only front-end
+    # produces the M2 context that feeds the P1 predictor, so the front-end AND
+    # the predictor get gradient; the pool / inter-parcel encoder is downstream
+    # of M2 (m2_only=True) and must get NO gradient.
     brk = m1._step(_ssl_batch(T=40).copy())
     assert torch.isfinite(brk.total)                                  # (a)
     brk.total.backward()
     frontend, parcel = m1.student.encoder.partition_parameters_for_staging()
     assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in frontend)  # (c)
     assert all(p.grad is None for p in parcel)
-    assert all(p.grad is None for p in m1.predictor.parameters())
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in m1.predictor.parameters()
+    )
     m1.zero_grad(set_to_none=True)
 
     # (d) EMA teacher moves under the fixed-τ rule during the real fit.

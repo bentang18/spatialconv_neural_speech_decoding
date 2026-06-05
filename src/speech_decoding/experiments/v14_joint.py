@@ -40,8 +40,8 @@ Lineage of the loss form:
     predictor) is REPLACED by real paradigm-B masked JEPA, staged into two
     phases with exactly one term each (B9):
 
-      P1  L = L1(student M2[masked], sg teacher M2[masked])      (paradigm A)
-      P2  L = L1(predictor(masked parcel-times), sg teacher M4[masked])  (B)
+      P1  L = L1(predictor(masked freq×time), sg teacher M2[masked])    (B)
+      P2  L = L1(predictor(masked parcel×time), sg teacher M4[masked])  (B)
 
     both **pure L1** (V-JEPA-2 §2.1 Eq 1); the target is the EMA teacher's
     own terminal LayerNorm (``frontend_ln`` at M2 / ``encoder_ln`` at M4),
@@ -188,8 +188,9 @@ class V14JointExperiment(V14Experiment):
     sa_mask_mode: SaMaskMode = "bidirectional"
 
     # B36 WS-B masked-JEPA phase + mask config. ``jepa_phase`` selects which
-    # single term is active (B9): ``"p1"`` = front-end M2 (paradigm A),
-    # ``"p2"`` = parcel M4 (paradigm B). The staged P1→P2 handoff is WS-E
+    # single term is active (B9): ``"p1"`` = front-end M2 (paradigm B,
+    # unconstrained-scope predictor), ``"p2"`` = parcel M4 (paradigm B,
+    # cross-time predictor). The staged P1→P2 handoff is WS-E
     # (phase orchestration); this field is the surface WS-E threads.
     #
     # Mask config carries the 6/03 masking-lock defaults
@@ -209,6 +210,16 @@ class V14JointExperiment(V14Experiment):
     m4_n_min_visible: int = 3
     predictor_scope: Literal["cross_time", "co_temporal"] = "cross_time"
     mask_seed: int = 0
+
+    # B36 §5/§14 paradigm-B predictor sizing. Default 3 blocks @ hidden=128,
+    # 4 heads (the locked P0 center). These knobs make the mandated P0 depth
+    # sweep {2,3,4} AND the ``R-p1-predictor-large`` (16@512) underfit-recovery
+    # sister launchable from dispatch
+    # ([[project_v14_predictor_design_rope_lock_2026_06_04]]). The predictor is
+    # discarded after SSL, so its size does not count toward the ≤30M readout.
+    predictor_depth: int = pydantic.Field(default=3, ge=1)
+    predictor_hidden: int = pydantic.Field(default=128, ge=1)
+    predictor_n_heads: int = pydantic.Field(default=4, ge=1)
 
     # B36 WS-E E2 LR-staging hyperparameter (P2 only). The front-end was
     # pretrained in P1; in P2 it rides at ``base_lr · frontend_lr_scale`` while
@@ -290,9 +301,11 @@ class V14JointExperiment(V14Experiment):
         :class:`speech_decoding.experiments.v14_joint_module.V14JointBrainModule`,
         which owns the EMA teacher + the student-only ``JepaPredictor`` and
         composes the single active masked-JEPA term for ``jepa_phase`` (B9):
-        P1 front-end M2 (paradigm A) or P2 parcel M4 (paradigm B). Targets
-        are the EMA teacher's own terminal-LN taps (``frontend_ln`` /
-        ``encoder_ln``) — there is no separate LN head (B6).
+        P1 front-end M2 or P2 parcel M4 — both paradigm B (exact parity:
+        visible-only student + own predictor + EMA full-input teacher + L1;
+        only the predictor's identity axis + scope differ). Targets are the
+        EMA teacher's own terminal-LN taps (``frontend_ln`` / ``encoder_ln``)
+        — there is no separate LN head (B6).
 
         The parent's ``brain_model_config.build(n_in_channels, n_outputs)``
         returns a :class:`V14ParcelPerceiverWithHead` (encoder + frozen
@@ -335,6 +348,9 @@ class V14JointExperiment(V14Experiment):
             m4_mask_ratio=self.m4_mask_ratio,
             m4_n_min_visible=self.m4_n_min_visible,
             predictor_scope=self.predictor_scope,
+            predictor_depth=self.predictor_depth,
+            predictor_hidden=self.predictor_hidden,
+            predictor_n_heads=self.predictor_n_heads,
             mask_seed=self.mask_seed,
             ema_tau=0.99925,
             loss_form="l1",

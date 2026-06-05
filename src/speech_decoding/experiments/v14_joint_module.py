@@ -5,14 +5,20 @@ B9 — see [[project_v14_b36_perparcel_pool_structured_jepa_2026_06_01]]),
 replacing the inert B31 2-term self-distill (full input both sides, no mask,
 no predictor):
 
-* **P1 (``phase="p1"``)** — front-end M2 masked JEPA. A structured 1D
-  spectro-temporal band ``token_mask`` (6/03 lock, held-out 0.50: whole
-  time-columns ∪ whole freq-rows) zeroes the masked front-end cells UPSTREAM
-  of the token blocks (paradigm A — the token blocks self-predict). Loss = L1
-  between the student's masked M2 tokens and the EMA teacher's full-input M2
-  (post-``frontend_ln``). The pool / inter-parcel encoder / predictor are
-  downstream of M2 → no gradient. The per-cell Bernoulli ``"random"`` shape is
-  the R-m2-random must-beat sister.
+* **P1 (``phase="p1"``)** — front-end M2 masked JEPA (paradigm B, exact parity
+  with P2). A structured 1D spectro-temporal band ``token_mask`` (6/03 lock,
+  held-out 0.50: whole time-columns ∪ whole freq-rows) zeroes the masked
+  front-end cells UPSTREAM of the token blocks, so the student M2 is
+  visible-only. The P1
+  :class:`~speech_decoding.models.v14_encoder.JepaPredictor` (unconstrained
+  scope, per-electrode) predicts the masked M2 cells from the visible cells of
+  the same electrode; loss = L1 between the prediction and the EMA teacher's
+  full-input M2 (post-``frontend_ln``). The front-end AND the predictor get
+  gradient; the pool / inter-parcel encoder are downstream of M2 → none. The
+  per-cell Bernoulli ``"random"`` shape is the R-m2-random must-beat sister.
+  (P1 was wrongly built predictor-free paradigm-A before — the cause of the
+  P1 collapse; see
+  [[project_v14_p1_predictor_paradigm_b_regression_2026_06_04]].)
 * **P2 (``phase="p2"``)** — parcel M4 masked JEPA (paradigm B). A parcel
   ``"tube"`` mask (6/03 lock: a uniform-random 0.20 subset of COVERED parcels,
   each masked across ALL time-patches) drops the masked parcels' electrodes
@@ -119,7 +125,7 @@ class _V14StudentBundle(nn.Module):
         if not isinstance(out, dict):
             raise RuntimeError(
                 "V14ParcelPerceiverModel returned a single tensor under "
-                "return_taps=True; expected the M2/M3/M4 tap dict."
+                "return_taps=True; expected the M2/M4 tap dict (M3 opt-in via return_m3)."
             )
         return out
 
@@ -165,9 +171,9 @@ class V14JointBrainModule(pl.LightningModule):
     * ``teacher`` — :class:`EmaTeacher` deepcopy of ``student``,
       ``requires_grad=False`` on every parameter, τ=0.99925 fixed.
     * ``predictor`` — the student-only :class:`JepaPredictor` (paradigm-B
-      parcel predictor). Constructed here if not supplied; used only in P2
-      (P1 is paradigm A — the front-end token blocks self-predict). Never
-      EMA-mirrored.
+      masked predictor). Constructed here if not supplied; used in BOTH phases
+      with EXACT parity (P1 = unconstrained / per-electrode over freq-patch ids,
+      P2 = cross-time over parcel-slot ids). Never EMA-mirrored.
 
     ``phase`` selects which single term is active (B9):
     ``"p1"`` → front-end M2 (``m2_mask_type`` bands/random, held-out
@@ -209,6 +215,9 @@ class V14JointBrainModule(pl.LightningModule):
         ema_tau: float = 0.99925,
         loss_form: _LossForm = "l1",
         predictor: tp.Optional[JepaPredictor] = None,
+        predictor_depth: int = 3,
+        predictor_hidden: int = 128,
+        predictor_n_heads: int = 4,
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
         frontend_lr_scale: float = 0.1,
@@ -269,7 +278,27 @@ class V14JointBrainModule(pl.LightningModule):
             self.student, coeff_schedule=fixed_ema_schedule(tau=ema_tau),
         )
         # Student-only paradigm-B predictor (B2). NOT part of the teacher.
-        self.predictor = predictor or JepaPredictor(encoder.d_model)
+        # Phase-appropriate non-time identity cardinality: P1 tags masked
+        # queries by freq-patch (F_p), P2 by parcel-slot (L = K·M); RoPE carries
+        # the shared time axis. Both phases are paradigm B with EXACT parity —
+        # only the identity axis (and the mask geometry) differs
+        # ([[project_v14_predictor_design_rope_lock_2026_06_04]]).
+        if phase == "p1":
+            n_identity = encoder.n_freq_patches
+        else:  # p2
+            n_identity = encoder.k_parcels * encoder.m_sub_slots
+        # Predictor sizing is a config knob: default 3@128/4-head (the locked
+        # P0 center), so the depth sweep {2,3,4} and the R-p1-predictor-large
+        # (16@512) underfit-recovery sister are launchable from dispatch
+        # ([[project_v14_predictor_design_rope_lock_2026_06_04]], B36 §5/§14).
+        self.predictor = predictor or JepaPredictor(
+            encoder.d_model,
+            n_identity=n_identity,
+            hidden=predictor_hidden,
+            n_heads=predictor_n_heads,
+            depth=predictor_depth,
+            max_time_patches=encoder.max_n_time_patches,
+        )
         self.optim_config = optim_config
         self._phase: _Phase = phase
         self._m2_mask_type = m2_mask_type
@@ -290,7 +319,8 @@ class V14JointBrainModule(pl.LightningModule):
         # R-p2-freeze-frontend falsifier: a 0.0 scale freezes the
         # P1-pretrained front-end in P2 so the parcel side + predictor train
         # alone (front-end gets no update and is dropped from the optimizer).
-        # P1 is unaffected — there the front-end is the only trained group.
+        # P1 is unaffected — there the front-end + P1 predictor are the trained
+        # groups (the front-end is never frozen in P1).
         if self._phase == "p2" and self._frontend_lr_scale == 0.0:
             frontend, _parcel = self.student.encoder.partition_parameters_for_staging()
             for p in frontend:
@@ -469,14 +499,22 @@ class V14JointBrainModule(pl.LightningModule):
     def _step(self, batch_data: dict[str, Tensor]) -> MaskedJepaBreakdown:
         """One masked-JEPA forward + loss pass (B36 WS-B, B5/B6/B7/B8).
 
-        P1 (paradigm A): the front-end masked cells are zeroed UPSTREAM of
-        the token blocks, so the blocks self-predict masked M2; loss =
-        L1(student M2[masked], sg teacher M2[masked]) — pool / inter-parcel
-        encoder / predictor are downstream of M2 and get no gradient.
+        P1 (paradigm B): the front-end masked cells are zeroed UPSTREAM of the
+        token blocks, so the student M2 is visible-only; the P1
+        :class:`JepaPredictor` (unconstrained scope, per-electrode) predicts the
+        masked M2 cells from the visible cells of the same electrode; loss =
+        L1(prediction, sg teacher M2[masked]). The pool / inter-parcel encoder
+        are downstream of M2 and get no gradient.
 
-        P2 (paradigm B): the visible-only student encoder produces M4; the
-        :class:`JepaPredictor` predicts the masked parcel-time M4 cells from
-        the visible parcel tokens; loss = L1(prediction, sg teacher M4[masked]).
+        P2 (paradigm B): the visible-only student encoder produces M4; the P2
+        :class:`JepaPredictor` (cross-time scope) predicts the masked
+        parcel-time M4 cells from the visible parcel tokens; loss =
+        L1(prediction, sg teacher M4[masked]).
+
+        EXACT PARITY — both phases are paradigm B (visible-only student +
+        own predictor + EMA full-input teacher target + L1); only the
+        predictor's identity axis and attention scope differ
+        ([[project_v14_predictor_design_rope_lock_2026_06_04]]).
 
         Exactly one term is active per phase (B9). The teacher always
         encodes the FULL input (B7 — :func:`assert_teacher_full_input`).
@@ -487,10 +525,10 @@ class V14JointBrainModule(pl.LightningModule):
             support=student_kwargs["support"],
         )
 
-        # P1 (paradigm A) reads ONLY M2, so skip the downstream pool /
-        # inter-parcel encoder on both the student and teacher forwards
-        # (M2 is taken pre-pool and carries no downstream P1 gradient). P2
-        # (paradigm B) needs the full encoder output M4.
+        # P1 reads ONLY M2 (the P1 predictor operates on the M2 tap), so skip
+        # the downstream pool / inter-parcel encoder on both the student and
+        # teacher forwards (M2 is taken pre-pool and carries no downstream P1
+        # gradient into the pool). P2 needs the full encoder output M4.
         m2_only = self._phase == "p1"
 
         # ── Student forward (masked / visible-only) ──
@@ -503,6 +541,7 @@ class V14JointBrainModule(pl.LightningModule):
             # freq_patch_valid omitted (all-valid) — WS-H threads the SWEC
             # corpus-valid prefix here alongside the sampler/encoder (C5).
             return p1_frontend_m2_loss(
+                predictor=self.predictor,
                 student_m2=student_taps["M2"],
                 teacher_m2=teacher_taps["M2"],
                 token_mask=mask_kwargs["token_mask"],
@@ -552,8 +591,8 @@ class V14JointBrainModule(pl.LightningModule):
             teacher_taps = self.teacher.model(**teacher_kwargs, m2_only=m2_only)
         if not isinstance(teacher_taps, dict):
             raise RuntimeError(
-                "EMA teacher returned a single tensor; expected the M2/M3/M4 "
-                "tap dict (return_taps=True)."
+                "EMA teacher returned a single tensor; expected the M2/M4 "
+                "tap dict (M3 opt-in via return_m3)."
             )
         return teacher_taps
 
@@ -909,8 +948,8 @@ class V14JointBrainModule(pl.LightningModule):
             (), device=self._grad_ema_l2.device, dtype=torch.float32,
         )
         # Student encoder + predictor both carry grads (the teacher is
-        # frozen). P1 leaves the predictor grad-free (paradigm A); P2
-        # exercises it — iterating both keeps the L2 correct either way.
+        # frozen). BOTH phases exercise the predictor (paradigm-B parity) —
+        # iterating student + predictor keeps the global grad-L2 correct.
         for p in self._trainable_parameters():
             if p.grad is not None:
                 sq_sum = sq_sum + p.grad.detach().to(torch.float32).pow(2).sum()
@@ -964,11 +1003,11 @@ class V14JointBrainModule(pl.LightningModule):
     def _phase_param_groups(self) -> list[tp.Any]:
         """Phase-conditional optimizer parameters (B36 WS-E, E1/E2).
 
-        * **P1** — front-end params ONLY (E1). The masked-JEPA loss flows
-          only through the M2 tap (``m2_only``), so the pool / inter-parcel
-          encoder / predictor are already grad-free; excluding them from the
-          optimizer makes "front-end only" the explicit, update-level
-          contract (no stray weight-decay drift on a grad-free param).
+        * **P1** — front-end params + the P1 predictor (E1, amended for the
+          paradigm-B P1 build). The masked-JEPA loss flows through the M2 tap
+          (``m2_only``) AND the student-only predictor, so both must be
+          optimised; the pool / inter-parcel encoder remain grad-free and are
+          excluded (no stray weight-decay drift on a grad-free param).
         * **P2** — discriminative LR (E2). The front-end (pretrained in P1)
           rides at ``base_lr · frontend_lr_scale`` (default 0.1 = base/10)
           while the parcel side + the student predictor get the full base LR.
@@ -979,9 +1018,9 @@ class V14JointBrainModule(pl.LightningModule):
           downstream scheduler scales every group proportionally.
         """
         frontend, parcel = self.student.encoder.partition_parameters_for_staging()
-        if self._phase == "p1":
-            return frontend
         predictor_params = list(self.predictor.parameters())
+        if self._phase == "p1":
+            return frontend + predictor_params
         base_lr = self._base_lr()
         if self._frontend_lr_scale == 0.0:
             # R-p2-freeze-frontend: front-end frozen above → one base-LR group.

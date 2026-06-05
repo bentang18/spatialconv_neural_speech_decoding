@@ -16,8 +16,11 @@ whisper_adapter are unchanged below the layer-merge step, and the mel-bin
 change is still invisible to the contract. The probe did NOT per-layer
 normalize before averaging — its win rode a downstream per-channel
 StandardScaler. Under B33 project-up (2026-05-30) that StandardScaler role is
-filled by an explicit, mandatory, train-only per-channel z-score
-(``TargetStandardizer`` / ``fit_channel_stats`` in ``bt_alignment.teacher_cache``);
+filled by an explicit, mandatory, full-corpus per-channel z-score
+(``TargetStandardizer`` / ``fit_channel_stats`` in ``bt_alignment.teacher_cache``;
+full-corpus ratified 2026-06-04, ``project_v14_b33_channel_stats_full_corpus_2026_06_04`` —
+not a leak, transductive norm of a frozen-model target; train-only kept as the
+``R-train-only-stats`` sister);
 the teacher carries NO trainable adapter (``WhisperAdapter`` is demoted to the
 ``R-project-down`` sister, and the student projects 256→1280 via
 ``StudentWhisperProjector``). v3 was a drop-in noisy-speech robustness upgrade
@@ -40,7 +43,7 @@ WHISPER_CONTRACT = {
     "native_rate_hz": 50,
     # B33 project-up (2026-05-30): student projects 256→1280, no teacher-side adapter.
     "project_direction": "up",
-    "target_standardization": "per_channel_zscore_train_only",  # mandatory
+    "target_standardization": "per_channel_zscore_full_corpus",  # mandatory; full-corpus per 2026-06-04 lock
     "teacher_down_adapter": False,        # True only for the R-project-down sister
     "student_head": "mlp_256_1280",       # R-head-linear sister = "linear_256_1280"
 }

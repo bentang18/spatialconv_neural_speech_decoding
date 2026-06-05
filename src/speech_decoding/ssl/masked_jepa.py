@@ -2,21 +2,31 @@
 
 Replaces the inert B31 2-term self-distill (`ssl/aggregator.py`, full input
 both sides, no mask, no predictor) with two staged masked-prediction terms,
-exactly one of which is active per phase (B9):
+exactly one of which is active per phase (B9). **Both phases are paradigm B**
+— a visible-only student, a separate student-only
+:class:`~speech_decoding.models.v14_encoder.JepaPredictor`, an EMA full-input
+teacher target, and L1 at masked positions only. EXACT PARITY; only the
+predictor's attention SCOPE differs, because the mask geometry differs (6/02
+masking rederivation M2/M4 contract — ``reports/b36_masking_rederivation_2026_06_02.md``;
+the predictor + stop-grad is the canonical anti-collapse mechanism, B36 §5 /
+Tian 2021). See ``memory/project_v14_p1_predictor_paradigm_b_regression_2026_06_04.md``
+for why P1 was (wrongly) paradigm-A before:
 
-* **P1 — front-end M2 (paradigm A, no separate predictor).** The masked
-  ``(electrode, freq-patch, time-patch)`` cells were zeroed UPSTREAM of the
-  token blocks (`v14_encoder` B5), so a masked position's M2 is a pure
-  function of the visible context — the token blocks ARE the predictor. Loss
-  = L1 between the student's masked M2 tokens and the EMA teacher's
-  full-input M2 (post-``frontend_ln``) at the same positions.
+* **P1 — front-end M2 (predictor scope UNCONSTRAINED).** The visible-only
+  student front-end produces M2 (masked ``(electrode, freq-patch, time-patch)``
+  cells zeroed UPSTREAM of the token blocks, `v14_encoder` B5). The predictor
+  predicts the masked cells from the VISIBLE cells of the SAME electrode
+  (per-electrode — no cross-electrode path), tagged by a fixed
+  (freq-patch, time-patch) sinusoid; target = EMA teacher full-input M2
+  (post-``frontend_ln``). Scope is unconstrained because the structured
+  whole-row/column band mask is its own shortcut guard.
 
-* **P2 — parcel M4 (paradigm B, separate predictor).** The visible-only
-  student encoder produces M4 at visible parcel-time cells; the
-  :class:`~speech_decoding.models.v14_encoder.JepaPredictor` predicts the
-  masked parcel-time cells from those visible tokens (mask-token queries
-  tagged by a fixed parcel/time sinusoid); target = EMA teacher full-input
-  M4 (post-``encoder_ln``). Loss = L1 at masked positions only.
+* **P2 — parcel M4 (predictor scope cross-time).** The visible-only student
+  encoder produces M4 at visible parcel-time cells; the predictor predicts the
+  masked parcel-time cells from those visible tokens (mask-token queries tagged
+  by a fixed parcel/time sinusoid); target = EMA teacher full-input M4
+  (post-``encoder_ln``). The tube mask ↔ cross-time scope coupling is
+  shortcut-free (``validate_m4_coupling``).
 
 Both targets are ``detach()``ed (stop-grad on the EMA teacher, V-JEPA 2 §2.1)
 and normalized only by the encoder's own terminal LayerNorm — NO separate
@@ -30,8 +40,6 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-
-from speech_decoding.models.v14_encoder import factored_sinusoidal_pos_emb
 
 _LossForm = tp.Literal["l1", "mse"]
 
@@ -70,28 +78,47 @@ def _l1_or_zero(pred: Tensor, target: Tensor, loss_form: _LossForm) -> Tensor:
 
 def p1_frontend_m2_loss(
     *,
-    student_m2: Tensor,   # (B, C, F_p, T_p, d) post-frontend_ln, masked cells zeroed upstream
+    predictor: torch.nn.Module,  # JepaPredictor (P1, n_identity = F_p)
+    student_m2: Tensor,   # (B, C, F_p, T_p, d) post-frontend_ln, visible-only student
     teacher_m2: Tensor,   # (B, C, F_p, T_p, d) EMA full-input, post-frontend_ln
     token_mask: Tensor,   # (B, C, F_p, T_p) bool, True = masked
     loss_form: _LossForm = "l1",
     freq_patch_valid: tp.Optional[Tensor] = None,  # (F_p,) or (B, F_p) bool
 ) -> MaskedJepaBreakdown:
-    """P1 front-end masked JEPA (paradigm A — token blocks self-predict).
+    """P1 front-end masked JEPA (paradigm B — separate predictor, UNCONSTRAINED
+    scope; exact parity with :func:`p2_parcel_m4_loss`).
+
+    Per-electrode (electrodes batched into the leading dim — the front-end has
+    no cross-electrode path), the predictor reads the VISIBLE ``(freq-patch,
+    time-patch)`` M2 cells of an electrode as context and predicts that
+    electrode's MASKED cells. Each masked query slot = a learnable mask token +
+    a learned freq-patch ``id_embed`` (the unordered freq identity), with the
+    time-patch carried by RoPE inside the blocks. Target = EMA teacher
+    full-input M2 at the masked cells (detached). Scope is "unconstrained"
+    (no cross-time restriction) because the structured whole-row/column band
+    mask is its own shortcut guard — vs P2's cross-time scope coupled to the
+    tube mask ([[project_v14_predictor_design_rope_lock_2026_06_04]]).
 
     B36 C5: ``freq_patch_valid`` (per-corpus freq-patch validity, True = valid)
     excludes invalid freq-patch cells (e.g. SWEC k22–29 → F-patches 7–9) from
-    the L1 target — a masked cell on an invalid freq patch is never a
-    reconstruction target. ``None`` (BT, all valid) → every masked cell scored,
-    byte-identical to the pre-C5 loss. P2's M4 is parcel-pooled (no freq axis),
-    so this exclusion is P1-only.
+    BOTH the visible context keys and the L1 target — an invalid freq patch is
+    neither attended nor reconstructed. ``None`` (BT, all valid) → every cell
+    participates. P2's M4 is parcel-pooled (no freq axis), so this is P1-only.
     """
     if token_mask.shape != student_m2.shape[:-1]:
         raise ValueError(
             f"token_mask {tuple(token_mask.shape)} must match M2 grid "
             f"{tuple(student_m2.shape[:-1])}"
         )
+    B, C, F_p, T_p, d = student_m2.shape
+    device = student_m2.device
+    BC = B * C
+    N = F_p * T_p
+
+    mask_flat = token_mask.reshape(BC, N)          # True = masked target
+    visible_flat = ~mask_flat                      # True = visible context
+    target_flat = mask_flat
     if freq_patch_valid is not None:
-        B, C, F_p, T_p = token_mask.shape
         fpv = freq_patch_valid.to(torch.bool)
         if fpv.shape not in {(F_p,), (B, F_p)}:
             raise ValueError(
@@ -100,29 +127,51 @@ def p1_frontend_m2_loss(
             )
         if fpv.dim() == 1:
             fpv = fpv.unsqueeze(0).expand(B, F_p)
-        # Broadcast (B, F_p) over (C, T_p): a masked cell counts only on a valid
-        # freq patch.
-        token_mask = token_mask & fpv.view(B, 1, F_p, 1)
-    pred = student_m2[token_mask]               # (n_masked, d)
-    target = teacher_m2[token_mask].detach()    # (n_masked, d)
+        # (B, F_p) → per-cell (BC, N) in the (F_p outer, T_p inner) flat order.
+        fpv_cell = (
+            fpv.view(B, 1, F_p, 1)
+            .expand(B, C, F_p, T_p)
+            .reshape(BC, N)
+        )
+        visible_flat = visible_flat & fpv_cell
+        target_flat = target_flat & fpv_cell
+
+    ctx = student_m2.reshape(BC, N, d)             # visible used as keys (kpm below)
+    # (freq-patch, time-patch) ids for the (F_p outer, T_p inner) flat order:
+    # flat index i = f_p · T_p + t_p. Shared across the BC batch (grid-identical).
+    f_ids = torch.arange(N, device=device) // T_p  # freq-patch id ∈ [0, F_p)
+    t_ids = torch.arange(N, device=device) % T_p   # time-patch id ∈ [0, T_p)
+
+    pred = predictor(
+        ctx,
+        context_time_ids=t_ids,
+        query_time_ids=t_ids,
+        query_id=f_ids,
+        context_key_padding_mask=~visible_flat,
+        query_valid=target_flat,
+    )                                              # (n_masked, d)
+    target = teacher_m2.reshape(BC, N, d)[target_flat].detach()  # (n_masked, d)
     loss = _l1_or_zero(pred, target, loss_form)
-    return MaskedJepaBreakdown(total=loss, phase="p1", n_masked=int(token_mask.sum()))
+    return MaskedJepaBreakdown(total=loss, phase="p1", n_masked=int(target_flat.sum()))
 
 
 def p2_parcel_m4_loss(
     *,
-    predictor: torch.nn.Module,  # JepaPredictor
+    predictor: torch.nn.Module,  # JepaPredictor (P2, n_identity = L)
     student_m4: Tensor,   # (B, L, T_p, d) post-encoder_ln, visible-only encoder
     teacher_m4: Tensor,   # (B, L, T_p, d) EMA full-input, post-encoder_ln
     visible: Tensor,      # (B, L, T_p) bool — covered & ~masked
     target_mask: Tensor,  # (B, L, T_p) bool — covered & masked
     loss_form: _LossForm = "l1",
 ) -> MaskedJepaBreakdown:
-    """P2 parcel masked JEPA (paradigm B — separate predictor).
+    """P2 parcel masked JEPA (paradigm B — separate predictor, CROSS-TIME scope).
 
     The predictor reads the VISIBLE parcel-time tokens as context and predicts
-    the masked parcel-time cells; ``query_pos`` tags each masked slot by a
-    fixed (slot-id, time) sinusoid. Target = EMA teacher full-input M4.
+    the masked parcel-time cells; each masked query slot = a learnable mask
+    token + a learned parcel-slot ``id_embed`` (the unordered parcel identity),
+    with the time-patch carried by RoPE inside the blocks. Target = EMA teacher
+    full-input M4 (detached). Cross-time scope is coupled to the tube mask
+    (``validate_m4_coupling``).
     """
     B, L, T_p, d = student_m4.shape
     if visible.shape != (B, L, T_p) or target_mask.shape != (B, L, T_p):
@@ -138,30 +187,23 @@ def p2_parcel_m4_loss(
     visible_flat = visible.reshape(B, N)
     target_flat = target_mask.reshape(B, N)
 
-    # (slot-id, time) position ids for every grid cell, flatten order (L outer,
-    # T_p inner) matching the reshape above. Slot id == parcel*M + subslot, so
-    # it is the parcel id at M=1 (the B36 default) — the §5 "parcel-id + time"
-    # tag, generalized to M>1.
+    # (slot-id, time) ids for the (L outer, T_p inner) flat order: flat index
+    # i = l · T_p + t_p. Slot id == parcel*M + subslot, so it is the parcel id
+    # at M=1 (the B36 default), generalized to M>1. Shared across the batch.
     l_ids = (
         torch.arange(L, device=device).view(L, 1).expand(L, T_p).reshape(N)
     )
     t_ids = (
         torch.arange(T_p, device=device).view(1, T_p).expand(L, T_p).reshape(N)
     )
-    l_ids = l_ids.unsqueeze(0).expand(B, N)
-    t_ids = t_ids.unsqueeze(0).expand(B, N)
-    # The sinusoid is built in fp32; cast to the feature dtype so the
-    # predictor's ``mask_token + query_pos`` stays single-dtype under
-    # bf16/fp16 autocast (LayerNorm rejects mixed dtype on CPU).
-    query_pos = factored_sinusoidal_pos_emb(
-        [l_ids, t_ids], predictor.hidden,
-    ).to(student_m4.dtype)
 
     pred = predictor(
         ctx,
-        query_pos,
-        query_valid=target_flat,
+        context_time_ids=t_ids,
+        query_time_ids=t_ids,
+        query_id=l_ids,
         context_key_padding_mask=~visible_flat,
+        query_valid=target_flat,
     )                                                # (n_masked, d)
     target = teacher_m4.reshape(B, N, d)[target_flat].detach()  # (n_masked, d)
     loss = _l1_or_zero(pred, target, loss_form)

@@ -27,10 +27,12 @@ Output (Phase-4 wrapper):
 
 Pipeline (B20 v4-invisible-frontend lock 2026-05-24; FE-01..04;
 B28 cross-attn collapse 2026-05-27 PM):
-    Conv2d(1, d, kernel=(3, 2), stride=(3, 2)) non-overlap patch stem  [FE-02]
+    Conv2d(1, d, kernel=(5, 2), stride=(5, 2)) non-overlap patch stem  [FE-02]
+      (kernel_freq 3→5 under FE-RAW-1, F=50 raw |STFT| 2026-06-04;
+       fbank F=30 sister keeps kernel_freq=3)
       + per-patch freq embedding (F_p=10 d-vectors, additive)           [FE-03]
       + NO time PE at input (RoPE in ❷)
-    → (B, C, F_p, T_p, d)   where F_p = floor(F/3), T_p = floor(T/2)
+    → (B, C, F_p, T_p, d)   where F_p = floor(F/5)=10, T_p = floor(T/2)
     → N=6 JOINT (t_p·f_p) token blocks per electrode (RoPE on time-axis [FE-04]
       only, hard cross-electrode mask via batch-dim isolation):
       single multi-head SA over flat (F_p·T_p) tokens per electrode
@@ -1059,6 +1061,13 @@ class V14ParcelPerceiverModel(nn.Module):
         # routing sister) but unused on the default hard-pool path.
         eps: float = DEFAULT_SUPPORT_BIAS_EPS,
         return_taps: bool = False,
+        # M3 (first-routing latent, pre-LN_mid) is OPT-IN. B31 dropped the
+        # ``L_mid_slot`` arm from the default SSL surface (B22 superseded) and
+        # the live B36 masked-JEPA path reads only M2 (P1) / M4 (P2), so the
+        # M3 reshape would be pure dead compute on every P2 forward. It is
+        # computed + returned ONLY for the retained ``R-add-m3-loss`` /
+        # ``b31_plus_m3`` P0 sister, which passes ``return_m3=True``.
+        return_m3: bool = False,
         # MASK-03 (B03 mask-discipline lock 2026-05-25 PM): per-electrode
         # SHAFT mask (B, C) bool — True = DROP. A dropped electrode is
         # non-attendable by every parcel (folded into the hard-pool
@@ -1089,7 +1098,8 @@ class V14ParcelPerceiverModel(nn.Module):
         #     latent self-attention keys (visible-only encoder).
         token_mask: Optional[Tensor] = None,
         parcel_time_mask: Optional[Tensor] = None,
-        # B36 WS-B efficiency (P1 paradigm A reads ONLY M2): when True, return
+        # B36 WS-B efficiency (P1 reads ONLY M2 — the P1 predictor operates on
+        # the M2 tap): when True, return
         # ``{"M2": frontend_ln(token-block output)}`` and skip the entire
         # downstream pool / inter-parcel encoder / encoder_ln. M2 is computed
         # upstream of the pool, so the returned tap is byte-identical to the
@@ -1346,10 +1356,11 @@ class V14ParcelPerceiverModel(nn.Module):
                    .contiguous()
         )                                                            # (B, C, F_p, T_p, d)
 
-        # B36 WS-B P1 efficiency early-exit: paradigm A reads ONLY M2, so the
-        # hard pool + inter-parcel encoder + encoder_ln below are dead compute
-        # in P1 (they build M3/M4, which the P1 loss never reads and which
-        # carry no P1 gradient — M2 is taken pre-pool). Skip them. The
+        # B36 WS-B P1 efficiency early-exit: P1 reads ONLY M2 (the P1 predictor
+        # operates on the M2 tap), so the hard pool + inter-parcel encoder +
+        # encoder_ln below are dead compute in P1 (they build M3/M4, which the
+        # P1 loss never reads and which carry no P1 gradient — M2 is taken
+        # pre-pool). Skip them. The
         # returned M2 == ``frontend_ln(x)`` is identical to the full-forward
         # tap below; the monitors run their own full-input forward (no
         # ``m2_only``) so RankMe still sees M4.
@@ -1522,7 +1533,8 @@ class V14ParcelPerceiverModel(nn.Module):
         )
         # LAT-05 tap M3: first-routing post cross-attn-0 / pre self-attn-0.
         # Captured BEFORE LN_mid so the loss head owns the normalization.
-        m3_bt = latents_bt if return_taps else None
+        # Opt-in (``return_m3``) — dead on the live B36 path (see signature).
+        m3_bt = latents_bt if (return_taps and return_m3) else None
 
         interior_cross_attn = {
             pos: blk
@@ -1556,20 +1568,22 @@ class V14ParcelPerceiverModel(nn.Module):
         out = latents_bt.reshape(B, T_p, L, self.d_model).transpose(1, 2).contiguous()
         if not return_taps:
             return out
-        # LAT-05: re-shape M3 to (B, L, T_p, d) for symmetry with M4.
-        assert m3_bt is not None  # Pyright: return_taps=True ⇒ m3_bt was captured above.
-        m3 = m3_bt.reshape(B, T_p, L, self.d_model).transpose(1, 2).contiguous()
-        return {
+        taps = {
             # M2: per-electrode-patch state post token blocks, returned
             #     post-``frontend_ln`` (B36 B1 — the V-JEPA-2-canonical
             #     terminal-LN target convention; teacher mirrors this LN).
             #     (B, C, F_p, T_p, d).
             "M2": self.frontend_ln(x),
-            # M3: first post-routing latent state, pre LN_mid.
-            "M3": m3,
             # M4: final encoder output, post encoder_ln (no task-head LN).
             "M4": out,
         }
+        # M3 (first post-routing latent, pre LN_mid) only on the opt-in
+        # ``R-add-m3-loss`` sister path — see ``return_m3`` in the signature.
+        if return_m3:
+            assert m3_bt is not None  # return_taps=True ⇒ captured above.
+            # LAT-05: re-shape M3 to (B, L, T_p, d) for symmetry with M4.
+            taps["M3"] = m3_bt.reshape(B, T_p, L, self.d_model).transpose(1, 2).contiguous()
+        return taps
 
 
 def _sinusoidal_1d(positions: Tensor, dim: int) -> Tensor:
@@ -1615,74 +1629,106 @@ class JepaPredictor(nn.Module):
     **visible** encoder tokens (V-JEPA / Brain-JEPA paradigm B). Default =
     **3 blocks @ d=128, 4 heads, MLP 4×, terminal ``Linear → d_model``, NO
     per-head LN** (~0.6M params), discarded after SSL. Depth is a config knob
-    (D2 center 3; sweep {2, 3, 4}).
+    (D2 center 3; sweep {2, 3, 4}). ``R-p1-predictor-large`` = 16@512.
+
+    **Positional scheme — RoPE-on-time-only** (Ben 2026-06-04,
+    [[project_v14_predictor_design_rope_lock_2026_06_04]]). RoPE assumes an
+    ordered/metric axis; our parcel axis is *unordered anatomy*, so RoPE is
+    applied to the TIME axis only (on both context and query tokens, inside
+    the block self-attention — the encoder-consistent ``_JointTokenBlock`` path)
+    and the non-time identity (freq-patch for P1, parcel-id for P2) is carried
+    by a **learned additive ``id_embed``** on the query. Context carries its
+    identity through content (the encoded token), so it gets RoPE-time only.
+    This fixes the pre-fix ``context_pos=None`` time-blindness and mirrors the
+    encoder (RoPE time + learned ``freq_embed`` / ``ParcelEmbed``). Sisters:
+    ``R-pred-2d-rope-freq`` (P1 freq also rotary), ``R-pred-additive-sincos``
+    (the pre-fix fixed-sinusoid scheme, a must-beat falsifier — its builder
+    ``factored_sinusoidal_pos_emb`` is retained).
 
     The predictor consumes:
 
     * ``context`` ``(B, N_ctx, d_model)`` — visible encoder tokens (P1: visible
       front-end M2 tokens; P2: visible parcel M4 tokens), projected to ``hidden``.
-    * ``query_pos`` ``(B, N_qry, hidden)`` — fixed positional embeddings
-      (``factored_sinusoidal_pos_emb``) for the masked target slots. The single
-      learnable ``mask_token`` is broadcast-added to these → the queries are
-      "learnable mask tokens tagged by (id/parcel + position) embed" (B2).
+    * ``context_time_ids`` / ``query_time_ids`` ``(N_ctx,)`` / ``(N_qry,)`` long
+      — the time-patch index of every context / query token (shared across the
+      batch; the P1/P2 grids are batch-identical). Drive the per-token RoPE.
+    * ``query_id`` ``(N_qry,)`` long — the non-time identity index of every
+      masked target slot (freq-patch ∈ [0, F_p) for P1, parcel-slot ∈ [0, L)
+      for P2). Looked up in ``id_embed`` and added to the single learnable
+      ``mask_token`` → "learnable mask tokens tagged by (RoPE-time + learned
+      identity)" (B2).
 
-    Context and queries are concatenated into one sequence; ``depth`` pre-norm
-    transformer blocks attend over both (bidirectional, padding-masked); the
+    Context and queries are concatenated into one sequence; ``depth``
+    encoder-consistent pre-norm ``_JointTokenBlock`` blocks (RoPE-time SA +
+    GELU MLP 4×) attend over both (bidirectional, key-padding-masked); the
     query slice is read out and projected back to ``d_model``. With a
     ``query_valid`` mask the predictions are gathered to ``(n_masked, d_model)``
-    — exactly the masked positions the L1 loss scores (B6).
+    — exactly the masked positions the L1 loss scores (B6). The raw projection
+    is returned with NO LN (only the EMA-teacher target is normed, by the
+    encoder's own terminal LN — V-JEPA-2 §2.1).
     """
 
     def __init__(
         self,
         d_model: int,
         *,
+        n_identity: int,
         hidden: int = 128,
         n_heads: int = 4,
         depth: int = 3,
-        mlp_ratio: int = 4,
-        dropout: float = 0.0,
+        max_time_patches: int = 64,
     ) -> None:
         super().__init__()
         if hidden % n_heads != 0:
             raise ValueError(f"hidden={hidden} not divisible by n_heads={n_heads}")
         if depth < 1:
             raise ValueError(f"depth must be >= 1; got {depth}")
+        if n_identity < 1:
+            raise ValueError(f"n_identity must be >= 1; got {n_identity}")
         self.d_model = d_model
         self.hidden = hidden
         self.depth = depth
+        self.n_identity = n_identity
         self.input_proj = nn.Linear(d_model, hidden)
         # Single learnable mask token (V-JEPA): every masked query starts from
-        # this vector, then gets its position via the fixed sinusoid added by
-        # the caller / forward.
+        # this vector, then gets its identity via ``id_embed`` and its time via
+        # RoPE inside the blocks.
         self.mask_token = nn.Parameter(torch.zeros(hidden))
+        # Learned additive embedding for the UNORDERED non-time identity axis
+        # (freq-patch for P1, parcel-slot for P2). Replaces the pre-fix fixed
+        # ``factored_sinusoidal_pos_emb`` tag — the parcel axis has no metric,
+        # so a learned table (not a sinusoid / not RoPE) is the right prior.
+        self.id_embed = nn.Embedding(n_identity, hidden)
+        # Encoder-consistent RoPE-time blocks (pre-norm, RoPE on Q+K time axis,
+        # GELU MLP 4×, no per-head LN). Reuses the exact ``_JointTokenBlock``
+        # the front-end token blocks use, so the autocast/dtype behaviour is
+        # identical to the proven encoder path.
         self.blocks = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=hidden,
-                    nhead=n_heads,
-                    dim_feedforward=hidden * mlp_ratio,
-                    dropout=dropout,
-                    activation="gelu",
-                    norm_first=True,
-                    batch_first=True,
-                )
-                for _ in range(depth)
-            ]
+            [_JointTokenBlock(hidden, n_heads) for _ in range(depth)]
         )
         self.output_proj = nn.Linear(hidden, d_model)
+        # RoPE table over the time axis, precomputed to ``max_time_patches`` and
+        # gathered per-token by time index at forward time (supports any T_p ≤
+        # max without recompute, incl. P4's shorter grid). Non-persistent: a
+        # pure function of (head_dim, max_time_patches).
+        head_dim = hidden // n_heads
+        self.register_buffer(
+            "_rope_base", _rope_freqs(head_dim, max_time_patches), persistent=False,
+        )
         nn.init.trunc_normal_(self.input_proj.weight, std=0.02)
         nn.init.zeros_(self.input_proj.bias)
         nn.init.trunc_normal_(self.output_proj.weight, std=0.02)
         nn.init.zeros_(self.output_proj.bias)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
+        nn.init.trunc_normal_(self.id_embed.weight, std=0.02)
 
     def forward(
         self,
         context: Tensor,                            # (B, N_ctx, d_model)
-        query_pos: Tensor,                          # (B, N_qry, hidden)
         *,
-        context_pos: Optional[Tensor] = None,       # (B, N_ctx, hidden)
+        context_time_ids: Tensor,                   # (N_ctx,) long
+        query_time_ids: Tensor,                     # (N_qry,) long
+        query_id: Tensor,                           # (N_qry,) long
         context_key_padding_mask: Optional[Tensor] = None,  # (B, N_ctx) True=ignore
         query_valid: Optional[Tensor] = None,       # (B, N_qry) True=real masked slot
     ) -> Tensor:
@@ -1690,43 +1736,47 @@ class JepaPredictor(nn.Module):
 
         Returns ``(n_masked, d_model)`` (gathered at ``query_valid``) when
         ``query_valid`` is given, else ``(B, N_qry, d_model)``. Padded query
-        slots (``~query_valid``) are excluded as attention keys so they never
-        leak into a real prediction; if every slot is padded the gathered
-        return is the empty ``(0, d_model)`` (→ the masked-empty loss == 0).
+        slots (``~query_valid``) and padded context cells are excluded as
+        attention keys so they never leak into a real prediction; if every
+        token in a row is padded the row is un-padded (its outputs are gathered
+        away anyway) so the SDPA softmax never sees an all-masked key set (NaN).
         """
         B, n_ctx, _ = context.shape
-        n_qry = query_pos.shape[1]
+        n_qry = query_time_ids.shape[0]
         h_ctx = self.input_proj(context)                        # (B, N_ctx, h)
-        if context_pos is not None:
-            h_ctx = h_ctx + context_pos
-        q = self.mask_token.view(1, 1, -1) + query_pos          # (B, N_qry, h)
-        seq = torch.cat([h_ctx, q], dim=1)                      # (B, N_ctx+N_qry, h)
+        q = self.mask_token.view(1, 1, -1) + self.id_embed(query_id).unsqueeze(0)
+        q = q.expand(B, n_qry, -1)                              # (B, N_qry, h)
+        seq = torch.cat([h_ctx, q], dim=1)                     # (B, N_ctx+N_qry, h)
 
-        # Combined key-padding mask: True = position is ignored as a key.
-        kpm: Optional[Tensor] = None
-        if context_key_padding_mask is not None or query_valid is not None:
-            ctx_pad = (
-                context_key_padding_mask
-                if context_key_padding_mask is not None
-                else torch.zeros(B, n_ctx, dtype=torch.bool, device=seq.device)
-            )
-            qry_pad = (
-                ~query_valid
-                if query_valid is not None
-                else torch.zeros(B, n_qry, dtype=torch.bool, device=seq.device)
-            )
-            kpm_t = torch.cat([ctx_pad, qry_pad], dim=1)        # (B, N_ctx+N_qry)
-            # A fully-padded row would make softmax over keys all -inf → NaN.
-            # Guard by un-padding such rows (their outputs are gathered away by
-            # query_valid anyway, so the un-pad is numerically inert).
-            all_pad = kpm_t.all(dim=1)
-            if bool(all_pad.any()):
-                kpm_t = kpm_t.clone()
-                kpm_t[all_pad] = False
-            kpm = kpm_t
+        # Per-token RoPE-time table for the concatenated sequence: gather the
+        # precomputed base table at each token's time index (context then
+        # query). ``_apply_rope`` (inside the blocks) reads it positionally.
+        time_ids = torch.cat([context_time_ids, query_time_ids])  # (N_total,)
+        rope = self._rope_base.index_select(1, time_ids)        # (2, N_total, head_dim)
+
+        # Key-keep mask (SDPA bool convention inside _JointTokenBlock: True =
+        # participate). Visible context cells + real masked query slots are
+        # keepable keys; padded context + padded query slots are not.
+        ctx_pad = (
+            context_key_padding_mask
+            if context_key_padding_mask is not None
+            else torch.zeros(B, n_ctx, dtype=torch.bool, device=seq.device)
+        )
+        qry_pad = (
+            ~query_valid
+            if query_valid is not None
+            else torch.zeros(B, n_qry, dtype=torch.bool, device=seq.device)
+        )
+        keep = ~torch.cat([ctx_pad, qry_pad], dim=1)            # (B, N_total) True=keep
+        # All-padded row → softmax over an empty key set → NaN. Un-pad such rows
+        # (their query outputs are gathered away by query_valid, so inert).
+        none_keep = ~keep.any(dim=1)
+        if bool(none_keep.any()):
+            keep = keep.clone()
+            keep[none_keep] = True
 
         for block in self.blocks:
-            seq = block(seq, src_key_padding_mask=kpm)
+            seq = block(seq, rope, keep)
         out = self.output_proj(seq[:, n_ctx:, :])               # (B, N_qry, d_model)
         if query_valid is not None:
             return out[query_valid]                             # (n_masked, d_model)

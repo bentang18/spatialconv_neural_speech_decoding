@@ -27,10 +27,13 @@ def test_whisper_contract_large_v3():
 
 def test_whisper_contract_project_up_b33():
     """B33 (2026-05-30): student projects 256→1280, no teacher-side adapter,
-    mandatory per-channel train-only z-score, MLP student head."""
+    mandatory per-channel z-score, MLP student head. Channel-stats scope flipped
+    train-only → FULL-CORPUS 2026-06-04 (project_v14_b33_channel_stats_full_corpus
+    — transductive norm of a frozen-model target, not a leak; R-train-only-stats
+    is the purist sister)."""
     c = WHISPER_CONTRACT
     assert c["project_direction"] == "up"
-    assert c["target_standardization"] == "per_channel_zscore_train_only"
+    assert c["target_standardization"] == "per_channel_zscore_full_corpus"
     assert c["teacher_down_adapter"] is False
     assert c["student_head"] == "mlp_256_1280"
 

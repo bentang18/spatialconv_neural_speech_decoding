@@ -42,7 +42,7 @@ def test_phase_3_live_without_cache_raises_operator_error() -> None:
     without --whisper-target-cache-dir fails fast with a clear operator error
     (the P3 SmoothL1 loss has no target stream), NOT the old WS-H blocker."""
     with pytest.raises(ValueError) as exc_info:
-        main(["--phase", "3"])
+        main(["--phase", "3", "--warmup-steps", "100"])
     message = str(exc_info.value)
     assert "--whisper-target-cache-dir" in message
     assert "Whisper distillation" in message
@@ -59,7 +59,7 @@ def test_phase_3_live_with_cache_routes_into_p3_build(monkeypatch) -> None:
         main([
             "--phase", "3",
             "--whisper-target-cache-dir", "/nonexistent/teacher_cache",
-            "--no-target-standardize",
+            "--no-target-standardize", "--warmup-steps", "100",
         ])
     assert "ROOT_DIR_BRAINTREEBANK" in str(exc_info.value)
 
@@ -68,14 +68,16 @@ def test_chain_without_work_dir_raises() -> None:
     """#21: --chain needs --work-dir for the per-phase ckpt handoff; fail fast
     at the operator boundary before any (data-bound) build."""
     with pytest.raises(ValueError) as exc_info:
-        main(["--chain", "--whisper-target-cache-dir", "/x", "--no-target-standardize"])
+        main(["--chain", "--whisper-target-cache-dir", "/x", "--no-target-standardize",
+              "--warmup-steps", "100"])
     assert "--work-dir" in str(exc_info.value)
 
 
 def test_chain_without_whisper_cache_raises(tmp_path) -> None:
     """#21: --chain runs the P3 distill stages, so the teacher cache is required."""
     with pytest.raises(ValueError) as exc_info:
-        main(["--chain", "--work-dir", str(tmp_path), "--no-target-standardize"])
+        main(["--chain", "--work-dir", str(tmp_path), "--no-target-standardize",
+              "--warmup-steps", "100"])
     assert "--whisper-target-cache-dir" in str(exc_info.value)
 
 
@@ -84,9 +86,55 @@ def test_chain_standardize_without_channel_stats_raises(tmp_path) -> None:
     with pytest.raises(ValueError) as exc_info:
         main([
             "--chain", "--work-dir", str(tmp_path),
-            "--whisper-target-cache-dir", "/x",
+            "--whisper-target-cache-dir", "/x", "--warmup-steps", "100",
         ])
     assert "--channel-stats-path" in str(exc_info.value)
+
+
+def test_chain_standardize_with_missing_channel_stats_path_raises(tmp_path) -> None:
+    """B33 default standardization + a --channel-stats-path that doesn't exist
+    must fast-fail at dispatch (audit A4-HIGH#2b), NOT hours into the chain at
+    P3a's torch.load. Pins the _validate_channel_stats_path guard so a refactor
+    can't silently drop it."""
+    with pytest.raises(ValueError) as exc_info:
+        main([
+            "--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/x",
+            "--channel-stats-path", str(tmp_path / "missing.pt"),
+            "--warmup-steps", "100",
+        ])
+    assert "is not a file" in str(exc_info.value)
+
+
+def test_chain_standardize_rejects_channel_stats_directory(tmp_path) -> None:
+    """A directory passed where the .pt is expected (operator passes the cache
+    dir, not the file) must ALSO fast-fail — .is_file() catches it where
+    .exists() would let it through to a late torch.load crash."""
+    with pytest.raises(ValueError) as exc_info:
+        main([
+            "--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/x",
+            "--channel-stats-path", str(tmp_path),  # a directory, not a .pt
+            "--warmup-steps", "100",
+        ])
+    assert "is not a file" in str(exc_info.value)
+
+
+def test_chain_no_standardize_skips_channel_stats_check(monkeypatch, tmp_path) -> None:
+    """The fast-fail is gated on target-std ON: --no-target-standardize with a
+    bad channel-stats path must NOT raise (the path is unused). Pins the
+    exemption so the guard can't over-fire."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    _capture_builds(monkeypatch)
+    # Reaches _build_v14_chain directly (bypasses main()'s launch guard) and must
+    # assemble all 5 phases without raising on the nonexistent path.
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/x", "--no-target-standardize",
+        "--channel-stats-path", str(tmp_path / "missing.pt"),
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)  # no raise
 
 
 def test_phase_1_dry_run_constructs_joint_experiment_path(
@@ -314,11 +362,13 @@ def test_chain_default_budget_and_patience_disable(monkeypatch, tmp_path) -> Non
     assert calls[4]["early_stopping_patience"] is None  # 0 disables
 
 
-def test_chain_default_optim_is_prior_constant_adam_plus_gradclip(monkeypatch, tmp_path) -> None:
-    """#37: with no optim flags every phase gets the prior constant-Adam config
-    (lr=1e-3, schedule=constant, Adam, no β/wd override) — EXCEPT grad_clip,
-    which defaults to 1.0 (restoring the §7 locked-universal that was silently
-    OFF). This is the "nothing silently changes but the bug-fix" guarantee."""
+def test_chain_default_optim_is_locked_b01_config(monkeypatch, tmp_path) -> None:
+    """Default FLIPPED 2026-06-04 (project_v14_optimizer_default_b01_config): with
+    no optim flags every chain phase gets the §7/B01-locked config — lr=1e-3,
+    warmup_cosine, AdamW, β2=0.95, grad_clip=1.0, wd=0.0. constant-Adam/β2=0.999
+    was the unimplemented-default *bug*, never a chosen config, so it is no longer
+    the default (and a real SSL/distill run refuses it — see
+    test_launch_guard_refuses_real_ssl_on_unimplemented_default_optim)."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
@@ -329,11 +379,66 @@ def test_chain_default_optim_is_prior_constant_adam_plus_gradclip(monkeypatch, t
     dv._build_v14_chain(args, cross_attn_positions=None)
     for c in calls:  # all 5 phases
         assert c["lr"] == 1e-3
-        assert c["lr_schedule"] == "constant"
-        assert c["optimizer_name"] == "Adam"
+        assert c["lr_schedule"] == "warmup_cosine"
+        assert c["optimizer_name"] == "AdamW"
         assert c["weight_decay"] == 0.0
-        assert c["adam_betas"] is None
+        assert c["adam_betas"] == (0.9, 0.95)
         assert c["gradient_clip_val"] == 1.0
+
+
+def test_launch_guard_refuses_real_ssl_on_unimplemented_default_optim(monkeypatch) -> None:
+    """§7 launch guard (2026-06-04): a real (non-fast-dev-run) SSL/distill run
+    (P1/P2/P3 or --chain) refuses constant LR / plain Adam / β2≥0.999 so the
+    unimplemented-default config can't ship silently on a multi-hour run.
+    --fast-dev-run is the smoke escape hatch; --phase 4 is the supervised probe,
+    not SSL/distill, so it is exempt."""
+    _capture_builds(monkeypatch)
+    # Each optim-clause case carries a valid --warmup-steps so it isolates ONE
+    # clause (otherwise the default warmup_steps=0 co-fires the warmup-floor
+    # clause and the match= could pass on the wrong message). --lr-schedule
+    # constant ignores warmup, so its case needs no warmup flag. The match= uses
+    # the clause-specific _bad fragment (not "AdamW"/"warmup_cosine"/"0.95", which
+    # also appear in the guard's unconditional boilerplate) so each case pins THAT
+    # clause, not merely "some clause fired".
+    with pytest.raises(SystemExit, match="--lr-schedule constant"):
+        main(["--phase", "1", "--lr-schedule", "constant"])
+    with pytest.raises(SystemExit, match="--optimizer Adam"):
+        main(["--phase", "1", "--optimizer", "Adam", "--warmup-steps", "100"])
+    with pytest.raises(SystemExit, match=r"β2=0\.999"):
+        main(["--phase", "1", "--adam-beta2", "0.999", "--warmup-steps", "100"])
+    # warmup_cosine + a too-short warmup ramps to peak LR within the first step
+    # of a cold-init SSL model (readiness-audit finding b). The default schedule
+    # IS warmup_cosine, so the bare default (--warmup-steps 0) is refused...
+    with pytest.raises(SystemExit, match="too short to ramp"):
+        main(["--phase", "1", "--warmup-steps", "0"])
+    # ...AND --warmup-steps 1 must ALSO be refused: the (step+1)/warmup_steps
+    # ramp puts it at peak on step 0 too — a bare `> 0` check would let it
+    # through (audit finding A1). The 1%-of-budget floor catches it.
+    with pytest.raises(SystemExit, match="too short to ramp"):
+        main(["--phase", "1", "--warmup-steps", "1", "--ssl-max-steps", "1500"])
+    # The locked 150/1500 (=10%) is well above the floor and must NOT raise.
+    main(["--phase", "1", "--warmup-steps", "150", "--ssl-max-steps", "1500"])
+    # --fast-dev-run exempts the smoke even on constant+Adam (must NOT raise).
+    main(["--phase", "1", "--lr-schedule", "constant", "--optimizer", "Adam",
+          "--fast-dev-run"])
+    # --fast-dev-run also exempts warmup_steps=0 (smoke needs no LR ramp).
+    main(["--phase", "1", "--warmup-steps", "0", "--fast-dev-run"])
+
+
+def test_dry_run_exempts_real_ssl_default_config(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The §7 launch guard exempts --dry-run, same as --fast-dev-run: a dry-run
+    prints the run summary and short-circuits BEFORE any build/train, so it is a
+    config preview, not a real launch. A real SSL phase / --chain on the bare
+    default (warmup_cosine + warmup_steps=0) must dry-run to rc=0, NOT raise
+    SystemExit — else the operator can't even preview the locked config. This
+    pins the exemption directly (it was only covered incidentally before)."""
+    assert main(["--phase", "1", "--dry-run"]) == 0
+    assert "V14 dispatch" in capsys.readouterr().out
+    # --chain exercises the other half of `_is_ssl_distill`; --dry-run short-
+    # circuits before the chain's --work-dir/cache/channel-stats validation too.
+    assert main(["--chain", "--dry-run"]) == 0
 
 
 def test_chain_lof_off_by_default(monkeypatch, tmp_path) -> None:
@@ -418,7 +523,11 @@ def test_chain_warmup_cosine_optim_reaches_every_phase(monkeypatch, tmp_path) ->
 def test_grad_clip_zero_disables(monkeypatch) -> None:
     """--grad-clip <= 0 → gradient_clip_val=None (clipping off)."""
     calls = _capture_builds(monkeypatch)
-    main(["--phase", "1", "--grad-clip", "0"])
+    # --warmup-steps is required on a real (non-fast-dev-run) SSL phase by the §7
+    # launch guard (warmup_cosine + warmup_steps=0 is refused). The single-phase
+    # config-capture tests below all carry a valid nonzero warmup so the build is
+    # reached; the value itself is irrelevant to what each test asserts.
+    main(["--phase", "1", "--grad-clip", "0", "--warmup-steps", "100"])
     assert calls[0]["gradient_clip_val"] is None
 
 
@@ -440,7 +549,7 @@ def test_accumulate_grad_batches_reaches_every_phase(monkeypatch, tmp_path) -> N
 def test_accumulate_grad_batches_default_is_one(monkeypatch) -> None:
     """No flag → accumulate_grad_batches=1 (no accumulation, prior behavior)."""
     calls = _capture_builds(monkeypatch)
-    main(["--phase", "1"])
+    main(["--phase", "1", "--warmup-steps", "100"])
     assert calls[0]["accumulate_grad_batches"] == 1
 
 
@@ -552,6 +661,7 @@ def test_single_phase_passes_sister_flags(monkeypatch) -> None:
     main([
         "--phase", "1", "--loss-variant", "b31_plus_utt",
         "--latent-valid-override", "all_true", "--no-binary-tasks",
+        "--warmup-steps", "100",
     ])
     assert len(calls) == 1
     assert calls[0]["loss_variant"] == "b31_plus_utt"
@@ -572,7 +682,7 @@ def test_p4_clip_len_defaults_to_one_second(monkeypatch, capsys) -> None:
 def test_non_p4_clip_len_defaults_to_five_seconds(monkeypatch) -> None:
     """SSL/distill phases keep the 5 s default when --clip-len is unset."""
     calls = _capture_builds(monkeypatch)
-    main(["--phase", "1"])
+    main(["--phase", "1", "--warmup-steps", "100"])
     assert calls[0]["clip_len"] == 5.0
 
 
@@ -580,7 +690,7 @@ def test_single_phase_p1_threads_ssl_max_steps(monkeypatch) -> None:
     """#39 (audit 2026-06-03): --ssl-max-steps reaches the single-phase P1 build
     (it previously reached only --chain), and P1 carries no P4 early-stop."""
     calls = _capture_builds(monkeypatch)
-    main(["--phase", "1", "--ssl-max-steps", "5000"])
+    main(["--phase", "1", "--ssl-max-steps", "5000", "--warmup-steps", "100"])
     assert calls[0]["max_steps"] == 5000
     assert calls[0]["early_stopping_patience"] is None
 
@@ -591,6 +701,7 @@ def test_single_phase_p3_threads_ssl_max_steps(monkeypatch) -> None:
     main([
         "--phase", "3", "--ssl-max-steps", "5000",
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--warmup-steps", "100",
     ])
     assert calls[0]["max_steps"] == 5000
     assert calls[0]["early_stopping_patience"] is None
@@ -618,7 +729,7 @@ def test_single_phase_budget_defaults_match_chain(monkeypatch) -> None:
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
-    main(["--phase", "1"])
+    main(["--phase", "1", "--warmup-steps", "100"])
     assert calls[0]["max_steps"] is None
     assert calls[0]["early_stopping_patience"] is None
     calls.clear()

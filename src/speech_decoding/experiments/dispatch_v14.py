@@ -14,9 +14,11 @@ Smoke-test (laptop, no BT data):
     .venv/bin/python -m speech_decoding.experiments.dispatch_v14 --dry-run
 
 Default electrode-tokens extractor is :class:`MultiStftView` (WS-C / C2,
-B36): F=30 ⅓-octave filterbank, hop=128 → 16 Hz (8 Hz latent), ``apply_log=False`` (raw
-|X|), 0.5 Hz HPF, and ``scaler=None`` (robust-z normalizes downstream).
-:class:`LogStftView` is the demoted ``F-single-STFT`` sister; ``apply_log``
+B36): **F=50 raw ``|STFT|`` bins (FE-RAW-1, ``front_end="raw"`` default; LANDED
+2026-06-04)**, hop=128 → 16 Hz (8 Hz latent), ``apply_log=False`` (raw |X|),
+0.5 Hz HPF, and ``scaler=None`` (robust-z normalizes downstream). The F=30
+⅓-octave filterbank is the demoted ``front_end="fbank"`` / ``R-filterbank-30bin``
+sister; :class:`LogStftView` is the ``F-single-STFT`` sister; ``apply_log``
 recovers the log-amplitude sister. Default support is
 :class:`V14DKHardSupportExtractor` (K=80 DK, ``c_max=384`` padded), default
 valid-mask is :class:`ElectrodeValidMask` (``c_max=384``). Caller can pass
@@ -654,13 +656,20 @@ def build_v14_experiment(
     # tiny test experiments. EMA τ is fixed at 0.99925 (B26/B27); the §9 EMA
     # ramp is DEAD and is NOT wired here.
     lr: float = 1e-3,
+    # Same CLI-vs-function split as gradient_clip_val (above): the CLI flipped
+    # these to the §7/B01 lock (warmup_cosine + AdamW + β2=0.95) on 2026-06-04
+    # ([[project_v14_optimizer_default_b01_config_2026_06_04]]) and a main() launch
+    # guard refuses constant-Adam/β2=0.999 on a real SSL/distill run — but these
+    # function-level defaults stay at parity (constant / Adam / None betas) for the
+    # tiny test experiments and nano smokes, which never go through the CLI guard.
     lr_schedule: tp.Literal["constant", "warmup_cosine"] = "constant",
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.0,
     weight_decay: float = 0.0,
     optimizer_name: tp.Literal["Adam", "AdamW"] = "Adam",
-    # None → torch optimizer default betas (Adam (0.9, 0.999)). Pass (0.9, 0.95)
-    # for the locked v14 SSL β2. Kept None by default for behavior parity.
+    # None → torch optimizer default betas (Adam (0.9, 0.999)). The CLI defaults
+    # this to (0.9, 0.95) (the locked v14 SSL β2); this function-level default
+    # stays None for behavior parity (see the split note above).
     adam_betas: tuple[float, float] | None = None,
     gradient_clip_val: float | None = None,
     # Lightning ``accumulate_grad_batches`` (effective-batch lever). 1 → no
@@ -1293,23 +1302,28 @@ def _parser() -> argparse.ArgumentParser:
                         "is the right signal (P4 IS the supervised task). The "
                         "SSL/distill phases never early-stop. Pass a value <= 0 "
                         "to disable and run P4 to the --n-epochs cap.")
-    # #37 optimizer / LR-schedule flags (4-agent audit 2026-06-03). Defaults
-    # reproduce the prior constant-Adam config bit-for-bit EXCEPT --grad-clip,
-    # which defaults to 1.0 to restore the §7 locked-universal that was silently
-    # OFF. The locked linear-warmup → cosine→0 + AdamW path is opt-in via
-    # --lr-schedule warmup-cosine (peak --lr + β2=0.95 + wd are M0-sweep choices,
-    # so they are NOT auto-flipped — the launcher sets them explicitly).
+    # #37 optimizer / LR-schedule flags (4-agent audit 2026-06-03). Production
+    # default FLIPPED 2026-06-04 to the §7 / B01-locked config — AdamW + β2=0.95
+    # + linear-warmup → cosine→0 + grad-clip 1.0 — because constant-Adam/β2=0.999
+    # was the *unimplemented-default bug*, never a chosen config
+    # ([[project_v14_optimizer_default_b01_config_2026_06_04]]). Peak --lr,
+    # --warmup-steps, and --weight-decay stay M0-sweep params (reasonable
+    # capstone defaults; consolidate/sweep later, #45). A launch guard in main()
+    # refuses a real (non-fast-dev-run) SSL/distill run on constant-Adam/β2=0.999
+    # so the §7 config can never be silently omitted.
     p.add_argument("--lr", type=float, default=1e-3,
                    help="Peak/base LR (constant value, or warmup-cosine peak). "
                         "1e-3 default = prior behavior; the §7 M0 sweep centers "
                         "are 5e-4 (P1) / 3e-4 (P2) @ batch 1024/512 (√-rule-"
                         "rescale for the live bs=8 before a real run).")
     p.add_argument("--lr-schedule", dest="lr_schedule",
-                   choices=("constant", "warmup_cosine"), default="constant",
-                   help="constant (default, prior behavior) or warmup_cosine "
-                        "(§7 locked shape: linear warmup → cosine → "
-                        "min_lr_ratio·peak). warmup_cosine reads its horizon from "
-                        "estimated_stepping_batches (--ssl-max-steps pins it).")
+                   choices=("constant", "warmup_cosine"), default="warmup_cosine",
+                   help="warmup_cosine (DEFAULT 2026-06-04, §7 locked shape: "
+                        "linear warmup → cosine → min_lr_ratio·peak; reads its "
+                        "horizon from estimated_stepping_batches, --ssl-max-steps "
+                        "pins it) or constant (the prior unimplemented-default "
+                        "behavior — refused on a real SSL/distill run by the "
+                        "main() launch guard).")
     p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=0,
                    help="Linear-warmup optimizer steps for --lr-schedule "
                         "warmup_cosine (§7: 20k P1 / 5k P2 @ full corpus; scale "
@@ -1323,13 +1337,16 @@ def _parser() -> argparse.ArgumentParser:
                         "M0 sweep center is 0.05; only added to the optimizer "
                         "kwargs when > 0 (use --optimizer adamw for decoupled WD).")
     p.add_argument("--optimizer", dest="optimizer_name",
-                   choices=("Adam", "AdamW"), default="Adam",
-                   help="Adam (default, prior behavior) or AdamW (§7 locked "
-                        "family, decoupled weight decay).")
-    p.add_argument("--adam-beta2", dest="adam_beta2", type=float, default=None,
-                   help="When set, optimizer betas = (0.9, beta2). §7 locks "
-                        "β2=0.95 for the SSL phases; unset → torch default "
-                        "(Adam (0.9, 0.999)) for behavior parity.")
+                   choices=("Adam", "AdamW"), default="AdamW",
+                   help="AdamW (DEFAULT 2026-06-04, §7 locked family, decoupled "
+                        "weight decay pinned to 0.0 until the no-WD groups land) "
+                        "or Adam (the prior unimplemented-default — refused on a "
+                        "real SSL/distill run by the main() launch guard).")
+    p.add_argument("--adam-beta2", dest="adam_beta2", type=float, default=0.95,
+                   help="optimizer betas = (0.9, beta2). DEFAULT 0.95 (2026-06-04, "
+                        "§7 SSL lock). Pass 0.999 to recover the torch default — "
+                        "but a real SSL/distill run refuses β2≥0.999 via the "
+                        "main() launch guard.")
     p.add_argument("--grad-clip", dest="grad_clip", type=float, default=1.0,
                    help="Lightning gradient_clip_val. Defaults to 1.0 to restore "
                         "the §7 locked-universal grad_clip that was silently OFF "
@@ -1883,6 +1900,31 @@ def _common_build_kwargs(
     )
 
 
+def _validate_channel_stats_path(args) -> None:
+    """Fast-fail a missing/non-file channel-stats PATH at dispatch.
+
+    The stats are only ``torch.load``-ed in ``V14Phase3Experiment.
+    _build_standardizer`` — i.e. at P3a, which on a --chain run is hours into
+    P1+P2 — so a missing/typo'd path (or the stats *directory* passed instead of
+    the .pt file) would otherwise burn the whole run before crashing (audit
+    A4-HIGH#2b). ``.is_file()`` (not ``.exists()``) matches the codebase's
+    loadable-file convention (experiment.py ckpt, whisper_target cache) and
+    catches the directory mistake too. Only meaningful with target-std ON and a
+    path supplied (the ``is None`` case is each caller's separate guard).
+    """
+    if (
+        args.target_standardize
+        and args.channel_stats_path is not None
+        and not Path(args.channel_stats_path).is_file()
+    ):
+        raise ValueError(
+            f"--channel-stats-path {args.channel_stats_path!r} is not a file. "
+            "Target standardization (B33 default) loads it at P3a; a missing or "
+            "directory path would crash hours into the chain. Build the .pt with "
+            "the channel_stats fit helper, or pass --no-target-standardize."
+        )
+
+
 def _build_v14_chain(
     args, *, cross_attn_positions: list[int] | None,
 ) -> list[Experiment]:
@@ -1912,6 +1954,7 @@ def _build_v14_chain(
             "--channel-stats-path; pass --no-target-standardize to distill "
             "against the raw 1280-d target instead."
         )
+    _validate_channel_stats_path(args)
 
     common = _common_build_kwargs(args, cross_attn_positions=cross_attn_positions)
     whisper = dict(
@@ -1988,6 +2031,59 @@ def _build_v14_chain(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # §7 launch guard (2026-06-04, project_v14_optimizer_default_b01_config). A
+    # real SSL/distill run MUST use the locked optimizer config — constant-Adam /
+    # β2=0.999 was the unimplemented-default *bug*, never a chosen config. A
+    # non-fast-dev-run P1/P2/P3 (or any --chain) refuses to launch on it. This is
+    # a backstop on top of the now-locked dispatch defaults (warmup_cosine +
+    # AdamW + β2=0.95): it stops a stale launcher or copy-pasted flag from
+    # silently shipping the §7-violating config on a multi-hour run.
+    # --fast-dev-run is the smoke escape hatch (config shape is irrelevant to a
+    # 1-step sanity run); --dry-run never trains (it prints the run summary and
+    # short-circuits before any build), so it is a config preview, not a real
+    # launch — both are exempt, matching Ben's "real (non-fast-dev-run) run"
+    # framing. --phase 4 is the supervised probe, not SSL/distill.
+    _is_ssl_distill = bool(args.chain) or args.phase in (1, 2, 3)
+    if _is_ssl_distill and not args.fast_dev_run and not args.dry_run:
+        _eff_beta2 = args.adam_beta2 if args.adam_beta2 is not None else 0.999
+        _bad: list[str] = []
+        if args.optimizer_name == "Adam":
+            _bad.append("--optimizer Adam (use AdamW)")
+        if args.lr_schedule == "constant":
+            _bad.append("--lr-schedule constant (use warmup_cosine)")
+        if _eff_beta2 >= 0.999:
+            _bad.append(f"β2={_eff_beta2} (use --adam-beta2 0.95)")
+        # warmup_cosine with too-short a warmup ramps to PEAK LR within the first
+        # optimizer step of a cold-init SSL model — the §7 lock specifies a linear
+        # warmup, and a near-instant ramp is the genuine divergence risk
+        # (readiness-audit finding b). The ramp multiplier is (step+1)/warmup_steps,
+        # so warmup_steps in {0,1} both put the model at peak on step 0 — a bare
+        # `> 0` check is bypassable by --warmup-steps 1 (audit finding A1). Enforce
+        # a real ramp: when the step budget is known, require >= 1% of it (the
+        # locked recipe is 10% = 150/1500, so this admits the M0-sweep range and
+        # rejects the step-1-peak pathology); else an absolute floor of 10 steps.
+        # The length stays an M0-sweep param above the floor. --fast-dev-run /
+        # --dry-run are already exempt (outer guard).
+        if args.lr_schedule == "warmup_cosine":
+            _warmup_floor = (
+                max(10, args.ssl_max_steps // 100) if args.ssl_max_steps else 10
+            )
+            if args.warmup_steps < _warmup_floor:
+                _bad.append(
+                    f"warmup_cosine + --warmup-steps {args.warmup_steps} is too "
+                    f"short to ramp (< {_warmup_floor}; a cold-init SSL model hits "
+                    "peak LR within the first optimizer step → divergence risk; "
+                    "pass ~10% of --ssl-max-steps)"
+                )
+        if _bad:
+            raise SystemExit(
+                "refusing a real SSL/distill run on the unimplemented-default "
+                "optimizer config (the §7/B01 lock would be violated): "
+                + "; ".join(_bad)
+                + ". The dispatch defaults are AdamW + warmup_cosine + β2=0.95 — "
+                "pass them explicitly, or --fast-dev-run for a smoke. See "
+                "project_v14_optimizer_default_b01_config_2026_06_04."
+            )
     # #54 audit C1: a chained run that aborts a phase (collapse-guard) and is
     # then relaunched with a code fix would, under the 'cached' default,
     # re-raise the stored failure instead of recomputing. Default an unset
@@ -2141,6 +2237,12 @@ def main(argv: list[str] | None = None) -> int:
             "without it. Add it (and --channel-stats-path unless "
             "--no-target-standardize)."
         )
+    # Same dispatch-time channel-stats fast-fail as the chain (audit 2026-06-04):
+    # a single --phase 3 with a missing/typo'd --channel-stats-path would crash at
+    # _build_standardizer (build time) instead of at parse — cheap to catch here,
+    # and keeps the single-phase M0/debug path consistent with --chain.
+    if args.phase == 3:
+        _validate_channel_stats_path(args)
     # --resume-from (warm-start) AND --snapshot-ckpt-to (hand off downstream)
     # both require the transferable-state protocol, which only the frozen-probe
     # V14Phase4ReadoutExperiment carries — the base supervised Experiment would
@@ -2151,6 +2253,25 @@ def main(argv: list[str] | None = None) -> int:
         or args.resume_from is not None
         or args.snapshot_ckpt_to is not None
     )
+    # Fix-1 guard (#65, 2026-06-04): a bare --phase 4 with no --frozen-probe and
+    # no checkpoint to resume from is the from-scratch supervised-CE path with the
+    # ENCODER + PMA UNFROZEN (trained from random init). That is a smoke/debug
+    # path only — it is NOT the B35 scientific readout (frozen P3 encoder + frozen
+    # PMA → mean-over-time → linear), which B35 adopted precisely because a
+    # trainable encoder is untrainable at Neuroprobe's ≤3500-sample/task budget.
+    # Warn loudly (mirrors the DDP-topology WARNING above) so a real run can't
+    # silently report a meaningless from-random-init number as a "P4 result".
+    # --fast-dev-run (the supervised smoke) is exempt.
+    if args.phase == 4 and not phase4_frozen_probe and not args.fast_dev_run:
+        print(
+            "WARNING: bare --phase 4 with no --frozen-probe and no "
+            "--resume-from/--snapshot-ckpt-to → the FROM-SCRATCH supervised path "
+            "with the encoder + PMA UNFROZEN (random init). This is a smoke/debug "
+            "config, NOT the B35 readout (frozen encoder + frozen PMA → mean → "
+            "linear). For the scientific P4, pass --frozen-probe with --resume-from "
+            "<SSL/distill encoder ckpt>. See "
+            "project_v14_b35_p4_frozen_pma_mean_linear_2026_05_31."
+        )
     # #39 (audit 2026-06-03): mirror the chain's per-phase budget gating onto the
     # single-phase path (it previously reached only --chain). --ssl-max-steps is an
     # SSL/distill-phase step budget (P1/P2-via-jepa, P3a/3b); P4 ignores it and

@@ -2,8 +2,9 @@
 
 Covers the five WS-E deliverables (``docs/neuroprobe/b36_implementation_plan.md``):
 
-* **E1** P1 optimizer = front-end params ONLY; a P1 backward leaves the pool /
-  inter-parcel encoder / predictor grad-free.
+* **E1** P1 optimizer = front-end params + the P1 predictor (paradigm B, exact
+  parity with P2's predictor); a P1 backward reaches the front-end AND the
+  predictor but leaves the pool / inter-parcel encoder grad-free.
 * **E2** P2 optimizer = two param groups with the front-end at base_lr/10.
 * **E3** the multi-phase driver wires each phase's snapshot to the next phase's
   ``pretrained_ckpt``; the base ``Experiment`` snapshot↔load round-trips.
@@ -80,30 +81,35 @@ def _synthetic_batch(B: int = 2, C: int = 5, T: int = 16, Fb: int = 10, K: int =
 # E1 — P1 front-end-only optimizer + grad flow
 # --------------------------------------------------------------------------
 
-def test_e1_p1_optimizer_is_frontend_only() -> None:
+def test_e1_p1_optimizer_is_frontend_plus_predictor() -> None:
     m = _module("p1")
     opt = _opt(m)
     assert len(opt.param_groups) == 1
     n_opt = sum(len(g["params"]) for g in opt.param_groups)
-    frontend, _parcel = m.student.encoder.partition_parameters_for_staging()
-    assert n_opt == len(frontend)
-    # No parcel / predictor param is in the P1 optimizer.
+    frontend, parcel = m.student.encoder.partition_parameters_for_staging()
+    predictor_params = list(m.predictor.parameters())
+    # Paradigm B: P1 trains the front-end AND its own predictor (exact parity
+    # with P2's predictor); the pool / inter-parcel encoder (parcel) is not.
+    assert n_opt == len(frontend) + len(predictor_params)
     opt_ids = {id(p) for g in opt.param_groups for p in g["params"]}
-    _fe, parcel = m.student.encoder.partition_parameters_for_staging()
     assert opt_ids.isdisjoint({id(p) for p in parcel})
-    assert opt_ids.isdisjoint({id(p) for p in m.predictor.parameters()})
+    assert {id(p) for p in predictor_params}.issubset(opt_ids)
+    assert {id(p) for p in frontend}.issubset(opt_ids)
 
 
-def test_e1_p1_backward_leaves_downstream_grad_free() -> None:
+def test_e1_p1_backward_reaches_frontend_and_predictor_not_parcel() -> None:
     m = _module("p1")
     loss = m._step(_synthetic_batch()).total
     loss.backward()
     frontend, parcel = m.student.encoder.partition_parameters_for_staging()
-    # Front-end gets real gradient; pool/encoder/predictor get none (P1 is
-    # paradigm A — only the M2 tap is supervised, m2_only=True).
+    # Paradigm B: the visible-only front-end produces the M2 context that feeds
+    # the predictor, so BOTH get real gradient; the pool / inter-parcel encoder
+    # (parcel) is off the M2 loss path → grad-free. (The predictor-free
+    # paradigm-A self-distill here was the P1-collapse regression.)
     assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in frontend)
     assert all(p.grad is None for p in parcel)
-    assert all(p.grad is None for p in m.predictor.parameters())
+    assert m.predictor.output_proj.weight.grad is not None
+    assert m.predictor.output_proj.weight.grad.abs().sum() > 0
 
 
 # --------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # B33 Project-Up Phase-3 — Engineer Memo / Implementation Handoff
 
-**Date:** 2026-05-30 · **Status:** doc-locked, code unwired · **Owner of decision:** Ben
+**Date:** 2026-05-30 · **Status:** ✅ LANDED in `src/v14_phase3.py` (verified 2026-06-03, #30 — `StudentWhisperProjector` 256→1280, SmoothL1 in 1280-d, 3a-freeze/3b-unfreeze, per-channel target z-score); this memo is now historical provenance · **Owner of decision:** Ben
 **Locks:** [[project_v14_b33_project_up_phase3_2026_05_30]] (B33), [[project_v14_whisper_teacher_all_layer_mean_2026_05_30]] (teacher = all-layer mean, already landed), [[project_v14_b31_vjepa2_canonical_loss_2026_05_28]] (B31, PMA trained at P3 only)
 **Spec:** `docs/neuroprobe/training_recipe.md` §5 (Phase 3) + §6 (Phase 4 banner)
 
@@ -126,7 +126,7 @@ Add fields and fix the stale standardization sentence in the module docstring (i
 WHISPER_CONTRACT = {
     ...                                    # existing: variant, n_mels, d_model=1280, etc.
     "project_direction": "up",             # B33: student 256→1280, no teacher-side adapter
-    "target_standardization": "per_channel_zscore_train_only",  # mandatory
+    "target_standardization": "per_channel_zscore_full_corpus",  # mandatory (flipped train_only→full_corpus 2026-06-04 per B33 channel-stats lock; transductive norm of a frozen target, not a leak)
     "teacher_down_adapter": False,         # R-project-down sister only
     "student_head": "mlp_256_1280",        # R-head-linear sister = "linear_256_1280"
 }

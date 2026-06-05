@@ -15,9 +15,12 @@ the 32 post-block hidden states (same forward-hook capture used here). The
 per-channel standardization that made ``mean_all`` win lived DOWNSTREAM, in the
 probe's per-channel train-fit ``StandardScaler`` on the merged vector — a
 property of the *consumer*, not the feature. Under B33 project-up (2026-05-30)
-that ``StandardScaler`` role is filled by an explicit, mandatory, train-only
+that ``StandardScaler`` role is filled by an explicit, mandatory, full-corpus
 per-channel z-score — :func:`fit_channel_stats` + :class:`TargetStandardizer`
-below — applied to the 1280-d target before the distillation loss. The teacher
+below — applied to the 1280-d target before the distillation loss (full-corpus
+ratified 2026-06-04, ``project_v14_b33_channel_stats_full_corpus_2026_06_04``:
+not a leak, transductive norm of a frozen-model target; train-only kept as the
+``R-train-only-stats`` sister). The teacher
 carries NO trainable adapter (``WhisperAdapter`` is demoted to the
 ``R-project-down`` sister; the student projects 256→1280 instead). So we store
 the raw mean here and do not pre-normalize. (A pre-norm residual stream grows

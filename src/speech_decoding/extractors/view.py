@@ -1,11 +1,15 @@
 """V14 view extractors: single-STFT (legacy) + Multi-STFT (T1.5, 5/22 pivot).
 
-T1.5 / 5/22 spec lock (project_v14_imindbench_multistft_pivot_2026_05_22.md):
+T1.5 / 5/22 spec lock (project_v14_imindbench_multistft_pivot_2026_05_22.md),
+FE-RAW-1 amendment (project_v14_fe_raw_frontend_f50_2026_06_04, LANDED):
 v14's front-end-of-record is ``MultiStftView`` — 3 STFTs at common
-hop=128 @ 2048 Hz (16 Hz front-end rate → 8 Hz latent after the (3,2)
+hop=128 @ 2048 Hz (16 Hz front-end rate → 8 Hz latent after the (5,2)
 patch stem; iMINDBench-standard hop, hop=128 re-lock 2026-06-03;
-Nperseg=1024/512/256) feeding a 30-bin ⅓-octave filterbank with per-bin
-STFT routing (k0–k14 from low, k15–k21 from mid, k22–k29 from hi).
+Nperseg=1024/512/256). ``front_end="raw"`` (DEFAULT) keeps the RAW
+``|STFT|`` bins — F=50 (low k2–15 + mid k8–37 + hi k19–24) — and is the
+executed front-end of record. The 30-bin ⅓-octave filterbank with per-bin
+STFT routing (k0–k14 low, k15–k21 mid, k22–k29 hi) is DEMOTED to
+``front_end="fbank"`` (the ``R-filterbank-30bin`` P1 low-data sister).
 ``LogStftView`` (single-STFT) is preserved as the F-single-STFT sister
 cell and the fast smoke-test front-end; per B32 it is still the wired
 dispatch default ``electrode_tokens_extractor`` until the Multi-STFT
@@ -19,8 +23,10 @@ input-scale-matching rationale that motivated log compression died on 5/22
 hidden state, not the log-mel input). ``F-log-amplitude`` is the demoted
 sister cell — set ``apply_log=True`` to recover the pre-5/25 behavior.
 
-Per-corpus valid-bin mask: ``multi_stft_valid_bin_mask(low_hz, high_hz)`` —
-boolean (F=30,) tensor flagging which filterbank bins are spanned by a
+Per-corpus valid-bin mask: ``multi_stft_raw_valid_bin_mask(low_hz, high_hz)``
+— boolean (F=50,) tensor for the ``front_end="raw"`` default
+(``multi_stft_valid_bin_mask`` is the (F=30,) ⅓-octave-filterbank analog for
+the ``front_end="fbank"`` sister) — flagging which bins are spanned by a
 corpus's recording passband. Used by SSL losses (input fill 0, key mask
 −∞, L_recon target mask excludes invalid bins).
 
@@ -43,9 +49,10 @@ helper ``preprocess_stft(..., preprocess="stft_abs")``. Log compression
 per 1-s @ 2048 Hz Ieeg trigger window (nperseg=512, hop=128). Time-last
 per NeuralSet's :class:`~neuralset.base.TimedArray` convention
 (``frequency = T_bin / duration = 17 Hz``). ``MultiStftView`` instead
-emits ``(C, F=30, T_bin)`` at the common hop=128 → 16 Hz front-end rate
-(hop=128 re-lock 2026-06-03). The v14 encoder transposes to ``(C, T_bin, F_bin)`` internally
-via its ``time_last_input`` flag.
+emits ``(C, F=50, T_bin)`` (``front_end="raw"`` default; the demoted
+``front_end="fbank"`` sister emits ``(C, F=30, T_bin)``) at the common
+hop=128 → 16 Hz front-end rate (hop=128 re-lock 2026-06-03). The v14 encoder
+transposes to ``(C, T_bin, F_bin)`` internally via its ``time_last_input`` flag.
 
 STFT params source: Neuroprobe Section D (page 18) — ``nperseg=512``,
 ``poverlap=0.75``, ``window=hann``, freq range ``0-150 Hz``, sample rate

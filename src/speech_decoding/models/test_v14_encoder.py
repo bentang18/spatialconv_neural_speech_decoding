@@ -267,61 +267,93 @@ def _n_params(m: torch.nn.Module) -> int:
 
 def test_v14_b2_jepa_predictor_depth_default_and_param_budget() -> None:
     """B36 B2 — ``JepaPredictor`` default depth = 3; param count at depth 3
-    within ±2% of the locked target (~0.66M); depth knob {2,3,4} monotone;
-    depth-2 ≠ the B36 default (regression guard against the old
-    ``Predictor2Block`` depth-2 spec)."""
-    # Analytical target for d_model=256, hidden=128, heads=4, MLP 4×, depth 3.
-    # per block (TransformerEncoderLayer, norm_first):
-    #   attn in_proj 3·128·128+3·128 + out_proj 128·128+128
-    #   + ff 128·512+512 + 512·128+128 + 2·LN(2·128) = 198_272
-    # + input_proj(256·128+128) + output_proj(128·256+256) + mask_token(128)
-    target = 198_272 * 3 + (256 * 128 + 128) + (128 * 256 + 256) + 128
-    assert target == 660_864  # pins the arithmetic
+    within budget (~0.67M); depth knob {2,3,4} monotone; depth-2 ≠ the B36
+    default (regression guard against the old ``Predictor2Block`` depth-2 spec).
 
-    pred3 = JepaPredictor(d_model=256)          # default depth
+    Post-2026-06-04 RoPE rebuild: blocks are encoder ``_JointTokenBlock``s
+    (RoPE-time SA, bias-free qkv/out, GELU MLP 4×) and identity is a learned
+    ``id_embed`` (the RoPE table is a non-persistent buffer, not a param)."""
+    # Analytical target for d_model=256, hidden=128, heads=4, MLP 4×, depth 3,
+    # n_identity=80. Per _JointTokenBlock:
+    #   ln_attn 2·128 + attn(qkv 128·384 + out 128·128, bias-free)
+    #   + ln_ffn 2·128 + ffn(128·512+512 + 512·128+128) = 197_760
+    # + input_proj(256·128+128) + output_proj(128·256+256) + mask_token(128)
+    # + id_embed(80·128)
+    n_identity = 80
+    per_block = 2 * 128 + (128 * 384 + 128 * 128) + 2 * 128 + (
+        128 * 512 + 512 + 512 * 128 + 128
+    )
+    target = (
+        per_block * 3
+        + (256 * 128 + 128)
+        + (128 * 256 + 256)
+        + 128
+        + n_identity * 128
+    )
+    assert per_block == 197_760  # pins per-block arithmetic
+    assert target == 669_568     # pins total arithmetic
+
+    pred3 = JepaPredictor(d_model=256, n_identity=n_identity)   # default depth
     assert pred3.depth == 3, "B36 default predictor depth must be 3 (D2)"
     n3 = _n_params(pred3)
-    assert abs(n3 - target) <= 0.02 * target, (
-        f"depth-3 param count {n3:,} not within ±2% of target {target:,}"
-    )
-    assert 500_000 < n3 < 800_000, f"~0.6M budget violated: {n3:,}"
+    assert n3 == target, f"depth-3 param count {n3:,} != target {target:,}"
+    assert 500_000 < n3 < 800_000, f"~0.67M budget violated: {n3:,}"
 
-    n2 = _n_params(JepaPredictor(d_model=256, depth=2))
-    n4 = _n_params(JepaPredictor(d_model=256, depth=4))
+    n2 = _n_params(JepaPredictor(d_model=256, n_identity=n_identity, depth=2))
+    n4 = _n_params(JepaPredictor(d_model=256, n_identity=n_identity, depth=4))
     assert n2 < n3 < n4, f"depth knob not monotone: {n2:,} {n3:,} {n4:,}"
     assert n2 != target, "depth-2 must differ from the B36 default (depth-3)"
+
+
+def _ctx_query_ids(n_ctx: int, n_qry: int, n_identity: int):
+    """Shared (context_time, query_time, query_id) for a flat test grid."""
+    context_time_ids = torch.arange(n_ctx)
+    query_time_ids = torch.arange(n_qry)
+    query_id = torch.arange(n_qry) % n_identity
+    return context_time_ids, query_time_ids, query_id
 
 
 def test_v14_b2_jepa_predictor_output_at_masked_positions_only() -> None:
     """B36 B2 — predictor returns ``(n_masked, d_model)`` gathered at the
     masked query slots; the ungathered path returns ``(B, N_qry, d_model)``;
-    gradients flow to every param including the learnable mask token."""
+    gradients flow to the block params, the mask token, and ``id_embed``."""
     torch.manual_seed(0)
-    d_model, hidden = 256, 128
+    d_model, hidden, n_identity = 256, 128, 6
     B, n_ctx, n_qry = 2, 10, 6
-    pred = JepaPredictor(d_model=d_model, hidden=hidden, depth=3)
+    pred = JepaPredictor(
+        d_model=d_model, hidden=hidden, depth=3, n_identity=n_identity,
+        max_time_patches=16,
+    )
     context = torch.randn(B, n_ctx, d_model)
-    query_pos = torch.randn(B, n_qry, hidden)
+    ctx_t, qry_t, qry_id = _ctx_query_ids(n_ctx, n_qry, n_identity)
     query_valid = torch.tensor(
         [[True, True, False, True, False, False],
          [True, False, False, False, False, False]]
     )
     n_masked = int(query_valid.sum())
 
-    out = pred(context, query_pos, query_valid=query_valid)
+    out = pred(
+        context, context_time_ids=ctx_t, query_time_ids=qry_t, query_id=qry_id,
+        query_valid=query_valid,
+    )
     assert out.shape == (n_masked, d_model), (
         f"gathered output {tuple(out.shape)} != ({n_masked}, {d_model})"
     )
     assert torch.isfinite(out).all()
 
     # Ungathered path → (B, N_qry, d_model).
-    out_full = pred(context, query_pos)
+    out_full = pred(
+        context, context_time_ids=ctx_t, query_time_ids=qry_t, query_id=qry_id,
+    )
     assert out_full.shape == (B, n_qry, d_model)
 
     loss = out.pow(2).mean()
     loss.backward()
     assert pred.mask_token.grad is not None
+    assert pred.id_embed.weight.grad is not None  # active query-id rows updated
     for name, p in pred.named_parameters():
+        if "id_embed" in name:
+            continue  # only the sampled query-id rows receive gradient
         assert p.grad is not None and torch.isfinite(p.grad).all(), (
             f"JepaPredictor {name} did not receive finite gradient"
         )
@@ -330,11 +362,14 @@ def test_v14_b2_jepa_predictor_output_at_masked_positions_only() -> None:
 def test_v14_b2_jepa_predictor_empty_mask_returns_empty() -> None:
     """B36 B6 precondition — all-padded query rows → gathered ``(0, d_model)``
     (no NaN), so the masked-empty L1 term is exactly 0."""
-    pred = JepaPredictor(d_model=256, depth=2)
+    pred = JepaPredictor(d_model=256, depth=2, n_identity=8, max_time_patches=16)
     context = torch.randn(2, 8, 256)
-    query_pos = torch.randn(2, 5, 128)
+    ctx_t, qry_t, qry_id = _ctx_query_ids(8, 5, 8)
     query_valid = torch.zeros(2, 5, dtype=torch.bool)
-    out = pred(context, query_pos, query_valid=query_valid)
+    out = pred(
+        context, context_time_ids=ctx_t, query_time_ids=qry_t, query_id=qry_id,
+        query_valid=query_valid,
+    )
     assert out.shape == (0, 256)
     assert torch.isfinite(out).all()  # vacuously true; no NaN from empty softmax
 
@@ -367,13 +402,16 @@ def test_v14_b29_item12_supervised_slot_mask_kwarg_dropped() -> None:
 
 def test_v14_lat05_return_taps_yields_m2_m3_m4_dict() -> None:
     """LAT-05 (B22 collapse-prevention dense-features 2026-05-25):
-    ``forward(..., return_taps=True)`` returns a dict with three intermediate
+    ``forward(..., return_taps=True)`` returns a dict of the intermediate
     streams used by the SSL loss heads.
 
     Contract:
       - ``M2``: per-electrode-patch state, shape ``(B, C, F_p, T_p, d)``.
-      - ``M3``: post cross-attn-0 / pre LN_mid, shape ``(B, K*M, T_p, d)``.
       - ``M4``: post encoder_ln, pre task-head LN, shape ``(B, K*M, T_p, d)``.
+      - ``M3``: post cross-attn-0 / pre LN_mid, shape ``(B, K*M, T_p, d)`` —
+        OPT-IN via ``return_m3=True`` (the ``R-add-m3-loss`` sister); ABSENT on
+        the default live B36 path (B31 dropped the L_mid_slot arm, so computing
+        it on every P2 forward would be dead work).
 
     The default ``return_taps=False`` path is unchanged: returns a single
     ``(B, K*M, T_p, d)`` tensor.
@@ -393,8 +431,9 @@ def test_v14_lat05_return_taps_yields_m2_m3_m4_dict() -> None:
     out_taps = model(electrodes, support, return_taps=True)
 
     assert isinstance(out_taps, dict), "return_taps=True must return a dict"
-    assert set(out_taps.keys()) == {"M2", "M3", "M4"}, (
-        f"return_taps=True must return keys {{M2, M3, M4}}; got "
+    # Default live path: M3 is OPT-IN, so it is absent (B31 dropped L_mid_slot).
+    assert set(out_taps.keys()) == {"M2", "M4"}, (
+        f"return_taps=True (default) must return keys {{M2, M4}}; got "
         f"{set(out_taps.keys())}"
     )
 
@@ -407,14 +446,21 @@ def test_v14_lat05_return_taps_yields_m2_m3_m4_dict() -> None:
         f"LAT-05 M2 shape mismatch: got {tuple(out_taps['M2'].shape)}, "
         f"expected (B={B}, C={C}, F_p={F_p}, T_p={T_p}, d={d})"
     )
-    assert out_taps["M3"].shape == (B, K * M, T_p, d), (
-        f"LAT-05 M3 shape mismatch: got {tuple(out_taps['M3'].shape)}, "
-        f"expected (B={B}, L={K * M}, T_p={T_p}, d={d})"
-    )
     assert out_taps["M4"].shape == (B, K * M, T_p, d)
 
     # Default path is byte-identical to taps["M4"].
     torch.testing.assert_close(out_default, out_taps["M4"], atol=0.0, rtol=0.0)
+
+    # Opt-in M3 (the R-add-m3-loss sister): return_m3=True adds M3 with the
+    # LAT-05 shape, leaving M2/M4 unchanged.
+    out_m3 = model(electrodes, support, return_taps=True, return_m3=True)
+    assert set(out_m3.keys()) == {"M2", "M3", "M4"}, (
+        f"return_m3=True must add M3; got {set(out_m3.keys())}"
+    )
+    assert out_m3["M3"].shape == (B, K * M, T_p, d), (
+        f"LAT-05 M3 shape mismatch: got {tuple(out_m3['M3'].shape)}, "
+        f"expected (B={B}, L={K * M}, T_p={T_p}, d={d})"
+    )
 
 
 def test_v14_encoder_lat01_identity_anchored_init() -> None:

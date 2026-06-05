@@ -7,11 +7,13 @@ unit tests live in ``models/test_v14_encoder.py``):
   encoder-only (no ``ln_frame`` / ``ln_mid`` / ``ln_utt`` / PMA heads); a
   student-only :class:`JepaPredictor` is built and is NOT EMA-mirrored.
 * B30 sister-flag runtime gates + invalid ``phase`` raise at construction.
-* P1 (``phase="p1"``, paradigm A): ``_step`` returns a single-term
+* P1 (``phase="p1"``, paradigm B): ``_step`` returns a single-term
   ``MaskedJepaBreakdown(phase="p1")``; gradient reaches the front-end
-  (``frontend_ln``) but NOT the terminal ``encoder_ln`` or the predictor.
+  (``frontend_ln``) AND the predictor, but NOT the terminal ``encoder_ln``.
 * P2 (``phase="p2"``, paradigm B): single-term ``MaskedJepaBreakdown(
   phase="p2")``; gradient reaches both the encoder and the predictor.
+  P1/P2 are EXACT-PARITY paradigm B — only the predictor's attention scope
+  differs ([[project_v14_predictor_design_rope_lock_2026_06_04]]).
 * B6: empty mask → exact-0 total (no NaN); target is detached (teacher
   accumulates no grad); the loss is L1, not MSE.
 * B7: the EMA teacher always encodes the FULL input — the guard fires if a
@@ -138,6 +140,42 @@ def test_predictor_is_jepa_predictor_and_not_ema_mirrored() -> None:
     assert not hasattr(module.teacher.model, "predictor")
 
 
+def test_predictor_sizing_is_a_dispatch_reachable_knob() -> None:
+    """B36 §5/§14: the predictor's depth/hidden/heads are config knobs so the P0
+    depth sweep {2, 3, 4} and ``R-p1-predictor-large`` (16@512) are launchable.
+    The default is the locked 3@128/4-head center; overrides flow through to the
+    built :class:`JepaPredictor`. (The defaults are bit-identical to the prior
+    hard-coded build — see the default-case asserts.)"""
+    default = _make_module(phase="p1")
+    assert default.predictor.depth == 3
+    assert default.predictor.hidden == 128
+    assert len(default.predictor.blocks) == 3
+
+    large = _make_module(
+        phase="p1", predictor_depth=16, predictor_hidden=512, predictor_n_heads=8,
+    )
+    assert large.predictor.depth == 16
+    assert large.predictor.hidden == 512
+    assert len(large.predictor.blocks) == 16
+
+    # P0 depth-sweep endpoints construct.
+    for depth in (2, 4):
+        m = _make_module(phase="p1", predictor_depth=depth)
+        assert len(m.predictor.blocks) == depth
+
+
+def test_experiment_exposes_predictor_sizing_fields() -> None:
+    """The sizing knobs are reachable from the dispatch surface
+    (:class:`V14JointExperiment`), with the locked 3@128/4-head defaults — so
+    the depth sweep / R-p1-predictor-large are launchable without a code edit."""
+    from speech_decoding.experiments.v14_joint import V14JointExperiment
+
+    fields = V14JointExperiment.model_fields
+    assert fields["predictor_depth"].default == 3
+    assert fields["predictor_hidden"].default == 128
+    assert fields["predictor_n_heads"].default == 4
+
+
 def test_rejects_b30_sister_latent_valid_override() -> None:
     with pytest.raises(NotImplementedError, match="B30"):
         _make_module(latent_valid_override="all_true")
@@ -154,7 +192,7 @@ def test_rejects_unknown_phase() -> None:
 
 
 # ---------------------------------------------------------------------------
-# B5/B6/B9: P1 paradigm-A front-end masked JEPA
+# B5/B6/B9: P1 paradigm-B front-end masked JEPA
 # ---------------------------------------------------------------------------
 
 
@@ -169,11 +207,14 @@ def test_p1_step_returns_single_term_p1_breakdown() -> None:
     assert float(breakdown.total.detach()) >= 0.0  # L1 is non-negative
 
 
-def test_p1_grad_reaches_frontend_not_terminal_ln_or_predictor() -> None:
-    """B36 §7 P1 grad-scope: the front-end token blocks self-predict the
-    masked M2, so gradient reaches ``frontend_ln`` (front-end terminal LN)
-    but the downstream pool / inter-parcel encoder (``encoder_ln``) and the
-    predictor get NO gradient — the loss is computed entirely at M2."""
+def test_p1_grad_reaches_frontend_and_predictor_not_terminal_ln() -> None:
+    """B36 §7 P1 grad-scope (paradigm B): the visible-only front-end produces
+    the M2 context that feeds the separate predictor, so gradient reaches
+    ``frontend_ln`` (front-end terminal LN) AND the predictor (``output_proj``)
+    — exact parity with P2. The downstream pool / inter-parcel encoder
+    (``encoder_ln``) is off the M2 loss path → NO grad (the loss is computed
+    entirely at M2). The predictor-free paradigm-A self-distill here was the
+    P1-collapse regression ([[project_v14_p1_predictor_paradigm_b_regression_2026_06_04]])."""
     module = _make_module(phase="p1")
     breakdown = module._step(_make_synthetic_batch().data)
     breakdown.total.backward()
@@ -182,8 +223,9 @@ def test_p1_grad_reaches_frontend_not_terminal_ln_or_predictor() -> None:
     assert torch.isfinite(enc.frontend_ln.weight.grad).all()
     # Downstream of M2 → off the loss path → no grad.
     assert enc.encoder_ln.weight.grad is None
-    for p in module.predictor.parameters():
-        assert p.grad is None
+    # Paradigm B: the predictor IS on the P1 loss path.
+    assert module.predictor.output_proj.weight.grad is not None
+    assert torch.isfinite(module.predictor.output_proj.weight.grad).all()
 
 
 # ---------------------------------------------------------------------------
@@ -255,30 +297,30 @@ def test_loss_is_l1_not_mse() -> None:
 
 
 def test_b6_l1_gradient_magnitude_constant_in_error() -> None:
-    """B6 (canonical V-JEPA target-norm) — the masked loss is *pure L1*, so
-    ``d|s-t|/ds = sign(s-t)``: the per-element gradient magnitude is a
-    constant ``1/(n_masked·d)`` regardless of the error scale. (MSE / Smooth-L1
-    grads scale with the error and would NOT be constant.) This is the
-    "gradient magnitude constant in error" check the B6 TEST clause demands,
-    stronger than the L1≠MSE scalar comparison above."""
-    from speech_decoding.ssl.masked_jepa import p1_frontend_m2_loss
+    """B6 (canonical V-JEPA target-norm) — the masked loss *kernel* is pure L1,
+    so ``d|p-t|/dp = sign(p-t)``: the per-element gradient magnitude is a
+    constant ``1/numel`` regardless of the error scale. (MSE / Smooth-L1 grads
+    scale with the error and would NOT be constant.)
 
-    B, C, F_p, T_p, d = 1, 1, 1, 1, 4
-    token_mask = torch.ones(B, C, F_p, T_p, dtype=torch.bool)  # every cell masked
-    teacher_m2 = torch.zeros(B, C, F_p, T_p, d)
+    Under paradigm B (both phases) the loss is ``L1(predictor_output,
+    sg teacher_target)`` — the masked STUDENT cells are padding-masked out of
+    the predictor context, so the L1-form property lives on the gradient w.r.t.
+    the predictor OUTPUT, scored by the shared ``_l1_or_zero`` kernel both
+    ``p1_frontend_m2_loss`` and ``p2_parcel_m4_loss`` call. Probing that kernel
+    is the phase-agnostic "gradient magnitude constant in error" check the B6
+    TEST clause demands, stronger than the L1≠MSE scalar comparison above."""
+    from speech_decoding.ssl.masked_jepa import _l1_or_zero
+
+    n, d = 5, 4
+    target = torch.zeros(n, d)  # detached teacher target stand-in
 
     grads = []
     for scale in (0.1, 1.0, 5.0):
-        student_m2 = torch.full(
-            (B, C, F_p, T_p, d), float(scale), requires_grad=True,
-        )
-        bd = p1_frontend_m2_loss(
-            student_m2=student_m2, teacher_m2=teacher_m2, token_mask=token_mask,
-        )
-        bd.total.backward()
-        g = student_m2.grad[token_mask].abs()  # (n_masked, d)
-        # student > teacher ⇒ sign = +1 ⇒ |grad| == 1/(n_masked·d) everywhere.
-        expected = 1.0 / g.numel()
+        pred = torch.full((n, d), float(scale), requires_grad=True)
+        _l1_or_zero(pred, target, "l1").backward()
+        g = pred.grad.abs()
+        # pred > target ⇒ sign = +1 ⇒ |grad| == 1/numel everywhere.
+        expected = 1.0 / pred.numel()
         torch.testing.assert_close(g, torch.full_like(g, expected))
         grads.append(g)
     # The discriminator: L1's grad is identical across error scales (MSE's

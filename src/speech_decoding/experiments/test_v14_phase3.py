@@ -257,6 +257,70 @@ def test_3b_grad_reaches_encoder_and_connector() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-step grad-divergence monitor (readiness-audit finding c) — P3a/P3b now
+# mirror V14JointBrainModule.on_before_optimizer_step so the already-armed
+# CollapseGuardCallback's per-step train_mon_grad_diverged abort is live in the
+# two longest phases too.
+# ---------------------------------------------------------------------------
+
+
+def test_p3_on_before_optimizer_step_logs_grad_divergence() -> None:
+    module = _make_module(stage="3a", standardizer=_identity_standardizer())
+    module._step(_make_synthetic_batch().data).backward()
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+    for key in (
+        "train_mon_grad_l2",
+        "train_mon_grad_ema_l2",
+        "train_mon_grad_spike_ratio",
+        "train_mon_grad_spike",
+        "train_mon_grad_diverged",
+    ):
+        assert key in logged, key
+    # First call seeds the EMA baseline at 0; the live grad-L2 must be positive.
+    assert logged["train_mon_grad_ema_l2"] == pytest.approx(0.0)
+    assert logged["train_mon_grad_l2"] > 0.0
+    assert float(module._grad_ema_l2.item()) > 0.0
+
+
+def test_p3_grad_ema_buffer_persists_across_calls() -> None:
+    module = _make_module(stage="3a", standardizer=_identity_standardizer())
+    batch = _make_synthetic_batch()
+    module._step(batch.data).backward()
+    module.on_before_optimizer_step(optimizer=None)
+    first_ema = float(module._grad_ema_l2.item())
+    assert first_ema > 0.0
+
+    for p in module.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+    module._step(batch.data).backward()
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+    # The EMA baseline carries over (persistent buffer survives the second step).
+    assert logged["train_mon_grad_ema_l2"] == pytest.approx(first_ema)
+
+
+def test_p3_grad_monitor_flags_nonfinite_grad() -> None:
+    """Load-bearing behavior: a non-finite gradient sets train_mon_grad_diverged
+    =1.0 — the exact key + value the (P3-armed) CollapseGuardCallback reads to
+    abort the phase. Without this, the monitor would log the key but never trip,
+    so this is the assertion that proves the hook does its job (not just that it
+    logs)."""
+    module = _make_module(stage="3a", standardizer=_identity_standardizer())
+    module._step(_make_synthetic_batch().data).backward()
+    # Poison one trainable grad with inf → grad-L2 is non-finite → diverged.
+    poisoned = next(p for p in module.parameters() if p.grad is not None)
+    poisoned.grad[...] = float("inf")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+    assert logged["train_mon_grad_diverged"] == 1.0
+
+
+# ---------------------------------------------------------------------------
 # F2 — 3a/3b optimizer param groups
 # ---------------------------------------------------------------------------
 

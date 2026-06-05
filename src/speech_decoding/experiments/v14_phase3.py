@@ -52,6 +52,7 @@ from torch import Tensor, nn
 from neuraltrain.optimizers import BaseOptimizer
 
 from speech_decoding.bt_alignment.teacher_cache import TargetStandardizer
+from speech_decoding.experiments.monitors import grad_spike_monitor
 from speech_decoding.experiments.v14_experiment import V14Experiment
 from speech_decoding.experiments.v14_joint_module import _maybe_drop_singleton_trailing
 from speech_decoding.extractors.whisper_teacher_pool import triangular_pool_50_to_8_hz
@@ -140,6 +141,17 @@ class V14Phase3DistillModule(pl.LightningModule):
         self._d_model = encoder.d_model
 
         self._apply_stage_freeze()
+
+        # Per-step grad-divergence monitor (readiness-audit finding c). P3a/P3b
+        # previously had only val-cadence guarding; mirror P1/P2's
+        # on_before_optimizer_step so the CollapseGuardCallback's per-step
+        # train_mon_grad_diverged abort is live in the two longest phases too.
+        # Persisted so the EMA baseline survives a fit-loop restart.
+        self.register_buffer(
+            "_grad_ema_l2",
+            torch.zeros((), dtype=torch.float32),
+            persistent=True,
+        )
 
     # ------------------------------------------------------------------
     # Stage freeze
@@ -258,7 +270,7 @@ class V14Phase3DistillModule(pl.LightningModule):
         if not isinstance(taps, dict):
             raise RuntimeError(
                 "V14ParcelPerceiverModel returned a single tensor under "
-                "return_taps=True; expected the M2/M3/M4 tap dict."
+                "return_taps=True; expected the M2/M4 tap dict (M3 opt-in via return_m3)."
             )
         return taps["M4"]
 
@@ -328,6 +340,41 @@ class V14Phase3DistillModule(pl.LightningModule):
     def test_step(self, batch, batch_idx: int) -> None:  # noqa: ARG002
         loss = self._step(batch.data)
         self.log("test_loss", loss, on_epoch=True)
+
+    def on_before_optimizer_step(
+        self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature
+    ) -> None:
+        """Per-step grad-L2 + divergence probe (readiness-audit finding c).
+
+        Mirrors :meth:`V14JointBrainModule.on_before_optimizer_step` so the
+        CollapseGuardCallback's per-step ``train_mon_grad_diverged`` abort is
+        live in P3a/P3b (which otherwise only validate-cadence guard). Frozen
+        params (the 3a encoder; 3b ``0.0``-scale sub-groups) carry no grad and
+        are skipped, so the global L2 is over the actually-trained params.
+        """
+        sq_sum = torch.zeros(
+            (), device=self._grad_ema_l2.device, dtype=torch.float32,
+        )
+        for p in self.parameters():
+            if p.grad is not None:
+                sq_sum = sq_sum + p.grad.detach().to(torch.float32).pow(2).sum()
+        grad_l2 = float(sq_sum.sqrt().item())
+        verdict = grad_spike_monitor(
+            grad_l2=grad_l2,
+            prior_ema_l2=float(self._grad_ema_l2.item()),
+        )
+        self._grad_ema_l2.fill_(verdict.new_grad_ema_l2)
+        self.log("train_mon_grad_l2", verdict.grad_l2, on_step=True)
+        self.log("train_mon_grad_ema_l2", verdict.grad_ema_l2, on_step=True)
+        self.log("train_mon_grad_spike_ratio", verdict.spike_ratio, on_step=True)
+        self.log(
+            "train_mon_grad_spike", 1.0 if verdict.is_spike else 0.0, on_step=True,
+        )
+        self.log(
+            "train_mon_grad_diverged",
+            1.0 if verdict.is_diverged else 0.0,
+            on_step=True,
+        )
 
     # ------------------------------------------------------------------
     # Optimizer (3a connector-only; 3b discriminative LR)

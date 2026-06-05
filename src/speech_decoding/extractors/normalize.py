@@ -127,10 +127,16 @@ class SessionRobustZNormalizer:
     This is the stateful fit/apply form of :func:`robust_z` (which fits its
     stats per call over its own time axis). Fitting at session granularity is
     what the v14 N_v14 recipe specifies: stable stats (the full recording, not a
-    noisy ~20-frame clip) and a clean train-only contract — ``fit`` on the train
-    split, ``transform`` every split with those stats, so test clips never leak
-    into normalization. Gain-invariant: a pure ×k per-channel gain scales both
-    median and σ by k, so it cancels exactly in linear space.
+    noisy ~20-frame clip). Per B13 (``v14_blockers.md``) this is a
+    per-session-OWN-recording contract — ``fit`` over each session's WHOLE
+    recording and ``transform`` that session's clips with those stats,
+    computed IDENTICALLY at train and eval (NO train/eval split filter). It is
+    physical-unit calibration (impedance × amp-gain), so there is no leak:
+    stats are per-session-own and never pooled across sessions, so a test
+    session's clips are normalized only by that test session's own moments.
+    The cohort-pooled variant is the ``R-norm-cohort-pooled`` P1 sister.
+    Gain-invariant: a pure ×k per-channel gain scales both median and σ by k,
+    so it cancels exactly in linear space.
 
     Scope note (WS-C / C3): this object only fits/applies the (C, F) stats. The
     "where the stats get fit" wiring — a per-session precompute over each
