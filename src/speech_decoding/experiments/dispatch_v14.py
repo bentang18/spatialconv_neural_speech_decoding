@@ -388,17 +388,23 @@ def _resolve_corpus_mode(
     has no Whisper teacher cache); routing P3 to ``"pretrain"`` would crash
     lazily on the first (8,0) clip. Both corpora are disjoint from the 12 eval
     sessions. ONLY the supervised P4 probe trains/tests on the eval split, so it
-    keeps the CLI ``mode``/``eval_mode`` (CrossSession/CrossSubject). This is the
-    single safety-critical branch that prevents eval data from reaching
-    pretraining; the runtime leakage guard is the fail-closed backstop. Pure +
-    isolated so BOTH regression directions are unit-testable (SSL→eval = leakage
-    caught by the guard; P4→pretrain = silent wrong eval, NOT caught — only this
-    test)."""
+    runs the leaderboard protocol — its study universe is always BT_LITE (the 12
+    Neuroprobe eval sessions; ``"nano"`` only for tiny smokes), NEVER BT_FULL.
+    ``--mode`` selects only the SSL clip budget; routing P4 to ``"full"`` would
+    (a) load BT_FULL incl excluded subject 5 (no data on disk → crash) and (b)
+    turn CrossSession's train set into the test subject's *pretrain* trials — a
+    silently wrong, non-leaderboard eval the (P4-exempt) leakage guard would NOT
+    catch. The eval split TYPE (CrossSession/CrossSubject) is always preserved.
+    This is the single safety-critical branch that prevents eval data from
+    reaching pretraining AND keeps the P4 eval leaderboard-faithful; the runtime
+    leakage guard is the fail-closed backstop. Pure + isolated so BOTH regression
+    directions are unit-testable (SSL→eval = leakage caught by the guard;
+    P4→pretrain/full = silent wrong eval, NOT caught — only this test)."""
     if p3_distill:
         return "p3_distill", "Pretrain"
     if joint_phase:
         return "pretrain", "Pretrain"
-    return mode, eval_mode
+    return ("nano" if mode == "nano" else "lite"), eval_mode
 
 
 def build_v14_experiment(
@@ -947,6 +953,11 @@ def build_v14_experiment(
         joint_phase=joint_phase, p3_distill=p3_distill,
         mode=mode, eval_mode=eval_mode,
     )
+    # Clip-sampling budget: SSL phases keep the raw --mode budget (lite=3500/class
+    # gate vs full=all); the P4 probe uses its own leaderboard protocol, so the
+    # cap follows the RESOLVED P4 universe (study_mode lite/nano) — a `--mode full`
+    # run still evaluates P4 on the capped Lite eval, a consistent parity cell.
+    budget_mode = mode if study_mode in ("pretrain", "p3_distill") else study_mode
     if study_mode in ("pretrain", "p3_distill"):
         corpus = (
             "V14_PRETRAIN_SESSIONS (13 sess)" if study_mode == "pretrain"
@@ -958,6 +969,13 @@ def build_v14_experiment(
             f"holdout={pretrain_holdout_fraction}; clip-sampling budget from "
             f"--mode={mode!r}"
         )
+    else:
+        print(
+            f"[decouple #82] P4 probe → study mode={study_mode!r} "
+            f"(BT_LITE leaderboard eval, S5-free), eval_mode={chain_eval_mode!r}, "
+            f"clip-budget lite={budget_mode == 'lite'}/nano={budget_mode == 'nano'} "
+            f"(from resolved universe, NOT --mode={mode!r})"
+        )
     study = Wang2024Treebank(
         path=Path(bt_root), mode=study_mode,
         infra_timelines={"cluster": None},
@@ -965,8 +983,8 @@ def build_v14_experiment(
     word_events = BTWordEvents(
         tasks=(task,),
         binary_tasks=binary_tasks,
-        lite=(mode == "lite"),
-        nano=(mode == "nano"),
+        lite=(budget_mode == "lite"),
+        nano=(budget_mode == "nano"),
         eval_mode=chain_eval_mode,
         test_subject_id=test_subject_id,
         test_trial_id=test_trial_id,

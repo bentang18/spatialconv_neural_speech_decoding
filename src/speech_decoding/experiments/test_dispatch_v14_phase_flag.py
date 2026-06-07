@@ -13,6 +13,8 @@ import pytest
 
 from speech_decoding.experiments.dispatch_v14 import _resolve_corpus_mode, main
 from speech_decoding.studies.braintreebank.manifest import (
+    BT_LITE_SESSIONS,
+    BT_NANO_SESSIONS,
     NO_TEACHER_CACHE_SESSIONS,
     V14_P3_DISTILL_SESSIONS,
     V14_PRETRAIN_SESSIONS,
@@ -108,16 +110,46 @@ def test_ssl_study_sessions_invariant_to_cli_mode(tmp_path) -> None:
         assert emitted == expected
 
 
-def test_resolve_corpus_mode_p4_keeps_eval_split() -> None:
-    # The supervised P4 probe (neither joint nor distill) IS the Neuroprobe
-    # probe and must keep the CLI eval mode/split. A regression that forced P4
-    # to "pretrain" would silently evaluate on the wrong data and the leakage
-    # guard (P4-exempt) would NOT catch it — this is the only guard against it.
-    for mode in ("lite", "full", "nano"):
-        for ev in ("CrossSession", "CrossSubject"):
-            assert _resolve_corpus_mode(
-                joint_phase=False, p3_distill=False, mode=mode, eval_mode=ev,
-            ) == (mode, ev)
+def test_resolve_corpus_mode_p4_routes_to_leaderboard_eval() -> None:
+    # The supervised P4 probe (neither joint nor distill) IS the Neuroprobe eval,
+    # so it ALWAYS runs the leaderboard protocol: study universe = BT_LITE (the 12
+    # eval sessions, S5-free), with "nano" reserved for tiny smokes. --mode picks
+    # the SSL clip budget ONLY; routing P4 to "full" would (a) load BT_FULL incl
+    # excluded subject 5 (no data → crash) and (b) make CrossSession train on the
+    # subject's *pretrain* trials — a silently wrong, non-leaderboard eval the
+    # (P4-exempt) leakage guard would NOT catch. The eval split TYPE is preserved.
+    for ev in ("CrossSession", "CrossSubject"):
+        assert _resolve_corpus_mode(
+            joint_phase=False, p3_distill=False, mode="full", eval_mode=ev,
+        ) == ("lite", ev)
+        assert _resolve_corpus_mode(
+            joint_phase=False, p3_distill=False, mode="lite", eval_mode=ev,
+        ) == ("lite", ev)
+        assert _resolve_corpus_mode(
+            joint_phase=False, p3_distill=False, mode="nano", eval_mode=ev,
+        ) == ("nano", ev)
+
+
+def test_p4_study_universe_is_bt_lite_for_all_cli_modes(tmp_path) -> None:
+    # Positive guard: whatever clip budget --mode selects for SSL, the P4 probe's
+    # realized study universe is exactly BT_LITE (the 12 Neuroprobe eval sessions,
+    # S5-free) — never BT_FULL. This is the regression net for the sub_5 crash +
+    # the CrossSession-trains-on-pretrain leaderboard contamination.
+    for cli_mode, expected in (
+        ("full", set(BT_LITE_SESSIONS)),
+        ("lite", set(BT_LITE_SESSIONS)),
+        ("nano", set(BT_NANO_SESSIONS)),
+    ):
+        p4_study, _ = _resolve_corpus_mode(
+            joint_phase=False, p3_distill=False,
+            mode=cli_mode, eval_mode="CrossSession",
+        )
+        study = Wang2024Treebank(path=str(tmp_path), mode=p4_study)
+        emitted = {
+            (int(tl["subject_id"]), int(tl["trial_id"]))
+            for tl in study.iter_timelines()
+        }
+        assert emitted == expected, f"P4 universe wrong for --mode {cli_mode}"
 
 
 def test_phase_2_raises_with_blocker_ids() -> None:
