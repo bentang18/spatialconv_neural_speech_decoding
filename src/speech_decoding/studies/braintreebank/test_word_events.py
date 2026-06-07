@@ -14,9 +14,14 @@ from speech_decoding.studies.braintreebank.labels import (
     ordered_dataset_labels,
     ordered_dataset_source_indices,
 )
+from speech_decoding.studies.braintreebank.manifest import (
+    BT_LITE_SESSIONS,
+    V14_PRETRAIN_SESSIONS,
+)
 from speech_decoding.studies.braintreebank.word_events import (
     BTWordEvents,
     _assign_cross_session_split,
+    _assign_pretrain_split,
     _word_event_rows,
 )
 
@@ -288,3 +293,137 @@ def test_btwordevents_run_raises_on_empty_match(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match="matched zero usable timelines"):
         step(_synthetic_ieeg_events())
+
+
+# --- Pretrain (leakage-decouple #82) split ---------------------------------
+
+def _pretrain_df(sessions_rows: list[tuple[tuple[int, int], int]]) -> pd.DataFrame:
+    """Rows for ``_assign_pretrain_split``: subject_id/trial_id as strings
+    (the production dtype), one ``task`` so grouping is per-session."""
+    rows: list[dict] = []
+    for (s, t), n in sessions_rows:
+        for i in range(n):
+            rows.append(
+                {"subject_id": str(s), "trial_id": str(t), "task": "speech",
+                 "label": i % 2}
+            )
+    return pd.DataFrame(rows)
+
+
+def test_assign_pretrain_split_holds_out_positional_tail_per_session() -> None:
+    df = _pretrain_df([((1, 0), 10), ((2, 1), 10)])
+    out = _assign_pretrain_split(df, holdout_fraction=0.2)
+    # n_hold = min(round(10*0.2)=2, (10-1)//2=4) = 2 → 6 train / 2 val / 2 test
+    # PER session, so 12 / 4 / 4 globally.
+    assert (out["split"] == "train").sum() == 12
+    assert (out["split"] == "val").sum() == 4
+    assert (out["split"] == "test").sum() == 4
+    # Tail ordering within each session: last 2 → test, preceding 2 → val.
+    for s, t in [("1", "0"), ("2", "1")]:
+        grp = out[(out["subject_id"] == s) & (out["trial_id"] == t)]
+        splits = list(grp["split"])
+        assert splits == ["train"] * 6 + ["val"] * 2 + ["test"] * 2
+
+
+def test_assign_pretrain_split_keeps_at_least_one_train_per_session() -> None:
+    # n=3, frac=0.49 would round to 1 hold each; (n-1)//2 = 1 caps it → 1/1/1.
+    out = _assign_pretrain_split(_pretrain_df([((1, 0), 3)]), holdout_fraction=0.49)
+    assert sorted(out["split"]) == ["test", "train", "val"]
+
+
+def test_assign_pretrain_split_small_session_stays_train() -> None:
+    # A < 3-row session can't yield all three splits → it stays entirely in
+    # train, while the rest of the corpus still supplies global val/test.
+    out = _assign_pretrain_split(
+        _pretrain_df([((1, 0), 2), ((2, 1), 20)]), holdout_fraction=0.2
+    )
+    small = out[(out["subject_id"] == "1") & (out["trial_id"] == "0")]
+    assert set(small["split"]) == {"train"}
+    # corpus-global val/test come from the large session.
+    assert {"val", "test"} <= set(out["split"])
+
+
+def test_assign_pretrain_split_rejects_out_of_range_fraction() -> None:
+    for bad in (0.0, 0.5, 0.6, -0.1):
+        with pytest.raises(ValueError, match="holdout_fraction"):
+            _assign_pretrain_split(_pretrain_df([((1, 0), 10)]), holdout_fraction=bad)
+    # Validation precedes the empty short-circuit: same contract for empty input.
+    empty = _pretrain_df([((1, 0), 1)]).iloc[0:0]
+    with pytest.raises(ValueError, match="holdout_fraction"):
+        _assign_pretrain_split(empty, holdout_fraction=0.9)
+
+
+def test_assign_pretrain_split_raises_clear_error_when_corpus_too_small() -> None:
+    # Every session < 3 rows → global val/test empty → Data.build would crash
+    # with a misdirected message. The splitter must fail here with the real cause.
+    tiny = _pretrain_df([((1, 0), 2), ((2, 1), 2)])
+    with pytest.raises(ValueError, match="whole corpus"):
+        _assign_pretrain_split(tiny, holdout_fraction=0.2)
+
+
+def test_assign_pretrain_split_robust_to_nonunique_index() -> None:
+    # A non-unique index must not cross-assign between sessions (label-based
+    # .loc hazard). reset_index at entry makes the positional tail correct.
+    df = _pretrain_df([((1, 0), 10), ((2, 1), 4)])
+    df.index = [0] * len(df)  # pathological: all-identical index labels
+    out = _assign_pretrain_split(df, holdout_fraction=0.25)
+    for s, t, n in [("1", "0", 10), ("2", "1", 4)]:
+        grp = out[(out["subject_id"] == s) & (out["trial_id"] == t)]
+        assert (grp["split"] == "train").sum() >= 1
+        assert (grp["split"] == "val").sum() >= 1
+        assert (grp["split"] == "test").sum() >= 1
+        assert len(grp) == n
+
+
+def test_assign_pretrain_split_never_emits_eval_session() -> None:
+    # Even if (defensively) an eval pair reached the splitter, the corpus it
+    # operates on is legal-only; this asserts the OUTPUT carries no eval session.
+    df = _pretrain_df([(sess, 8) for sess in V14_PRETRAIN_SESSIONS[:3]])
+    out = _assign_pretrain_split(df, holdout_fraction=0.25)
+    seen = {(int(s), int(t)) for s, t in zip(out["subject_id"], out["trial_id"])}
+    assert seen.isdisjoint(set(BT_LITE_SESSIONS))
+
+
+def _pretrain_ieeg_events() -> pd.DataFrame:
+    """Two legal pretrain sessions + one eval session — the eval session must be
+    dropped by ``_timeline_is_used`` under eval_mode='Pretrain'."""
+    legal = list(V14_PRETRAIN_SESSIONS[:2])  # e.g. (1,0), (2,1)
+    eval_sess = BT_LITE_SESSIONS[2]  # (2, 0) — off-limits
+    rows = []
+    for s, t in [*legal, eval_sess]:
+        rows.append(
+            {
+                "type": "Ieeg", "start": 0.0, "duration": 100.0,
+                "frequency": 2048.0, "subject": f"Wang2024Treebank/btbank{s}",
+                "subject_id": str(s), "trial_id": str(t),
+                "timeline": f"tl{s}_{t}",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_btwordevents_pretrain_mode_drops_eval_sessions(monkeypatch) -> None:
+    """End-to-end: eval_mode='Pretrain' keeps only V14_PRETRAIN_SESSIONS, splits
+    them train/val/test, and never emits an off-limits eval session."""
+    monkeypatch.setattr(
+        we,
+        "_load_words_and_nonverbal",
+        lambda subject_id, trial_id, *, bt_root, enrich: (
+            _stub_words_df(), _stub_nonverbal_df(),
+        ),
+    )
+    step = BTWordEvents(
+        tasks=("speech",),
+        binary_tasks=True,
+        eval_mode="Pretrain",
+        pretrain_holdout_fraction=0.25,
+        bt_root="/dev/null",
+    )
+    out = step(_pretrain_ieeg_events())
+    words = out.loc[out["type"] == "Word"]
+    assert len(words) > 0
+    seen = {(int(s), int(t)) for s, t in zip(words["subject_id"], words["trial_id"])}
+    # Only the two legal sessions; the eval session (2,0) is gone.
+    assert seen == set(V14_PRETRAIN_SESSIONS[:2])
+    assert seen.isdisjoint(set(BT_LITE_SESSIONS))
+    assert set(words["split"]) == {"train", "val", "test"}

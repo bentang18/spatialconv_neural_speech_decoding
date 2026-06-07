@@ -108,4 +108,67 @@ V14_TRAIN_SESSIONS: tuple[tuple[int, int], ...] = tuple(
     for subject_id, trial_id in BT_FULL_SESSIONS
     if subject_id in V14_TRAIN_SUBJECT_IDS
 )
-"""BT full-session list restricted to the v14 training cohort."""
+"""BT full-session list restricted to the v14 training cohort.
+
+WARNING: this list is NOT leaderboard-legal for SSL pretraining — it still
+contains the 12 Neuroprobe eval sessions (== BT_LITE_SESSIONS). For a
+leaderboard-legal foundation-model pretraining corpus use
+``V14_PRETRAIN_SESSIONS`` below, which is the Neuroprobe pretraining-allowed
+set restricted to the cohort.
+"""
+
+
+# --- Neuroprobe leaderboard pretraining contract -------------------------
+# Source of truth: upstream `.cache/neuroprobe_upstream/SUBMIT.md` section
+# "Pretraining guidelines". The 12 off-limits eval sessions are EXACTLY
+# BT_LITE_SESSIONS (== neuroprobe.config.NEUROPROBE_LITE_SUBJECT_TRIALS); a
+# leaderboard-legal model "was not pretrained on any data that intersects with
+# any data of Neuroprobe", so SSL/pretraining may use ONLY the disjoint
+# allowed set below. The dispatch's eval-split data path (BTWordEvents +
+# Wang2024Treebank mode) does NOT yet read these — the SSL corpus is currently
+# coupled to the eval split (see docs/neuroprobe/v14_blockers.md). These
+# constants codify the legal contract for the decoupling fix + a leakage guard.
+
+BT_PRETRAIN_ALLOWED_SESSIONS: tuple[tuple[int, int], ...] = (
+    (1, 0),
+    (2, 1), (2, 2), (2, 3), (2, 5), (2, 6),
+    (3, 2),
+    (4, 2),
+    (5, 0),
+    (6, 0), (6, 1), (6, 4),
+    (8, 0),
+    (9, 0),
+)
+"""Neuroprobe pretraining-allowed STANDARD sessions (SUBMIT.md). Exactly
+``BT_FULL_SESSIONS - BT_LITE_SESSIONS``: 14 sessions over subjects
+{1,2,3,4,5,6,8,9}. Disjoint from BT_LITE_SESSIONS (the eval set). Subjects 7
+and 10 have NO standard allowed session — both their trials are eval trials."""
+
+BT_PRETRAIN_PARTIAL_SESSIONS: tuple[tuple[int, int], ...] = (
+    (7, 100), (7, 101), (7, 102),
+    (10, 100), (10, 101),
+)
+"""Special non-eval-intersecting "partial" pretraining sessions for subjects 7
+and 10 (SUBMIT.md): ~20 min each, carved from the times of their two trials
+that do NOT intersect the Neuroprobe eval indices. NOT bundled with the corpus
+— distributed via a separate Google-Drive download and ABSENT on DCC as of
+2026-06-06. Without these, subjects 7 and 10 have zero legal pretraining data."""
+
+V14_PRETRAIN_SESSIONS: tuple[tuple[int, int], ...] = tuple(
+    (s, t) for (s, t) in BT_PRETRAIN_ALLOWED_SESSIONS
+    if s not in V14_EXCLUDED_SUBJECT_IDS
+)
+"""Leaderboard-legal SSL pretraining sessions for the v14 cohort (S5 dropped).
+13 standard sessions over subjects {1,2,3,4,6,8,9}. Subjects 7 and 10
+contribute zero sessions here (their only legal data is
+``BT_PRETRAIN_PARTIAL_SESSIONS``, not yet on DCC).
+
+DCC data availability (verified 2026-06-06, #26 closed):
+  - Raw h5: all 13 sessions present (incl. 6/8/9).
+  - Transcripts (word-event clip boundaries → P1/P2): all 13 present.
+  → P1 (front-end) + P2 (parcel) run on the full 13-session legal corpus.
+  - Whisper teacher cache (P3 distill target): 12/13 movies present. The
+    sole gap is session (8,0) "Sesame Street Episode 3990" — no teacher .pt.
+  → P3 runs on 12 sessions / subjects {1,2,3,4,6,9}; subject 8 drops from P3
+    ONLY until its teacher target is backfilled (port 16 kHz audio + Whisper).
+    P4 readout is unaffected (it evals on BT_LITE_SESSIONS, not this corpus)."""

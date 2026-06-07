@@ -59,6 +59,14 @@ class Experiment(BaseExperiment):
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
+    # Neuroprobe pretraining-leakage guard (#82). Base = OFF: the supervised P4
+    # readout IS the Neuroprobe probe and legitimately trains on the eval-split
+    # train portion. The SSL/distill experiment classes (V14JointExperiment /
+    # V14Phase3Experiment) flip this to True so a corpus coupled to the eval
+    # split aborts fail-closed before the first gradient. ClassVar so pydantic
+    # keeps it off the configurable-field set (not part of the run uid).
+    enforces_pretrain_leakage_guard: tp.ClassVar[bool] = False
+
     data: Data
     brain_model_config: BaseModelConfig
     loss: BaseLoss
@@ -365,6 +373,29 @@ class Experiment(BaseExperiment):
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(snap(), str(path))
 
+    def _assert_no_pretrain_leakage(self, loaders: dict[str, DataLoader]) -> None:
+        """#82: fail-closed guard against pretraining on Neuroprobe eval data.
+
+        Inert unless the concrete experiment class sets
+        ``enforces_pretrain_leakage_guard`` (the SSL/distill phases). The check
+        itself is corpus-scoped (BrainTreebank only) and inspects the realized
+        train/val loaders, so it catches an eval-coupled split regardless of how
+        the dispatch *intended* to slice the corpus. Imported lazily to keep the
+        base experiment free of the BrainTreebank dependency on the P4 path."""
+        if not self.enforces_pretrain_leakage_guard:
+            return
+        from speech_decoding.studies.braintreebank.leakage import (
+            assert_no_eval_leakage,
+        )
+
+        # Check EVERY realized split (train/val/test): an SSL phase must not see
+        # an off-limits eval session in any split — train takes gradients, val/
+        # test are observed. (P4, which legitimately tests on the eval split, is
+        # exempt via enforces_pretrain_leakage_guard=False.)
+        assert_no_eval_leakage(
+            loaders, study=self.data.study, phases=tuple(loaders.keys()),
+        )
+
     def _train_and_test(self) -> dict[str, float | None]:
         pl.seed_everything(self.seed, workers=True)
         # CR01: pl.seed_everything may miss some CUDA RNG init paths in
@@ -372,6 +403,10 @@ class Experiment(BaseExperiment):
         torch.cuda.manual_seed_all(self.seed)
         # CR02: per-worker numpy + random + torch RNG seeded as seed+worker_id.
         loaders = self.data.build(worker_seed=self.seed)
+        # #82 fail-closed leakage guard: SSL/distill phases must not pretrain on
+        # any Neuroprobe off-limits eval session. No-op unless the experiment
+        # class opts in (enforces_pretrain_leakage_guard) AND the study is BT.
+        self._assert_no_pretrain_leakage(loaders)
         brain_module = self._build_brain_module(loaders["train"])
         # B36 WS-E (E4): warm-start the encoder (+PMA from P3) from the prior
         # phase BEFORE fit, so the optimizer/scheduler see the loaded weights.

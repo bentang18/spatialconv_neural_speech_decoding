@@ -53,7 +53,7 @@ Lineage of the loss form:
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import ClassVar, Literal
 
 import pydantic
 import torch
@@ -179,6 +179,10 @@ class V14JointExperiment(V14Experiment):
     """
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    # #82: P1/P2 SSL must never pretrain on a Neuroprobe off-limits eval
+    # session. Enforced fail-closed in Experiment._train_and_test.
+    enforces_pretrain_leakage_guard: ClassVar[bool] = True
 
     # B30 sister selectors. Pinned to the locked defaults; sister values
     # are accepted by the field but rejected at construction until the

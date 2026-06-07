@@ -55,7 +55,10 @@ from speech_decoding.studies.braintreebank.anatomy import (
 )
 from speech_decoding.studies.braintreebank.manifest import V14_TRAIN_SUBJECT_IDS
 from speech_decoding.studies.braintreebank.study import Wang2024Treebank
-from speech_decoding.studies.braintreebank.word_events import BTWordEvents
+from speech_decoding.studies.braintreebank.word_events import (
+    BTWordEvents,
+    DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
+)
 
 
 # v4 amendment defaults (5/19 §3) + B28 (5/27 PM) + B29 Item 13 (5/27 PM-late):
@@ -372,6 +375,26 @@ def _resolve_ddp_strategy(tasks_per_node: int | None) -> str | None:
     )
 
 
+def _resolve_corpus_mode(
+    *, joint_phase: bool, p3_distill: bool, mode: str, eval_mode: str,
+) -> tuple[str, str]:
+    """Leakage decouple (#82): pick the (study session-mode, BTWordEvents
+    eval-mode) for a phase.
+
+    The SSL/distill phases (P1/P2 joint, P3 distill) pretrain on the
+    Neuroprobe-legal corpus — study ``"pretrain"`` (V14_PRETRAIN_SESSIONS,
+    disjoint from the 12 eval sessions) + ``"Pretrain"`` split. ONLY the
+    supervised P4 probe trains/tests on the eval split, so it keeps the CLI
+    ``mode``/``eval_mode`` (CrossSession/CrossSubject). This is the single
+    safety-critical branch that prevents eval data from reaching pretraining;
+    the runtime leakage guard is the fail-closed backstop. Pure + isolated so
+    BOTH regression directions are unit-testable (SSL→eval = leakage caught by
+    the guard; P4→pretrain = silent wrong eval, NOT caught — only this test)."""
+    if joint_phase or p3_distill:
+        return "pretrain", "Pretrain"
+    return mode, eval_mode
+
+
 def build_v14_experiment(
     *,
     bt_root: str | None = None,
@@ -380,6 +403,12 @@ def build_v14_experiment(
     eval_mode: tp.Literal["CrossSession", "CrossSubject"] = DEFAULT_EVAL_MODE,
     test_subject_id: int = DEFAULT_TEST_SUBJECT_ID,
     test_trial_id: int = DEFAULT_TEST_TRIAL_ID,
+    # Leakage decouple (#82): per-legal-session monitoring tail held out for the
+    # SSL/distill "Pretrain" split (val AND test). Applies only on the SSL
+    # phases (joint_phase / p3_distill), where the corpus is overridden to
+    # V14_PRETRAIN_SESSIONS; ignored on the P4 eval path. NOT a leaderboard
+    # quantity — it never partitions eval data.
+    pretrain_holdout_fraction: float = DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
     binary_tasks: bool = True,
     electrode_tokens_extractor: tp.Any | None = None,
     # C3 (WS-C, B13): per-(electrode, freq, session) robust-z on the default
@@ -890,8 +919,31 @@ def build_v14_experiment(
             )
         n_time_bins = electrode_tokens_extractor.n_time_bins_for_duration(clip_len)
 
+    # Leakage decouple (#82): the SSL/distill phases (P1/P2 joint, P3 distill)
+    # pretrain on the Neuroprobe-legal corpus (V14_PRETRAIN_SESSIONS, disjoint
+    # from the 12 eval sessions) under a "Pretrain" split that sends every legal
+    # session to train minus a per-session monitoring tail. Only the supervised
+    # P4 probe (phase4_frozen_probe) trains/tests on the eval split
+    # (CrossSession/CrossSubject). Before this, all phases shared one chain, so
+    # the CrossSession coupling pretrained SSL on the held-out eval subject's
+    # other (also-eval) trial. ``--mode``/``--eval-mode`` now apply to the P4
+    # eval ONLY; for SSL they are overridden here and ``mode`` instead controls
+    # the clip-SAMPLING budget (lite=3500/class gate vs full=all). The runtime
+    # leakage guard (V14Joint/Phase3Experiment.enforces_pretrain_leakage_guard)
+    # is the fail-closed backstop on the realized loaders.
+    study_mode, chain_eval_mode = _resolve_corpus_mode(
+        joint_phase=joint_phase, p3_distill=p3_distill,
+        mode=mode, eval_mode=eval_mode,
+    )
+    if study_mode == "pretrain":
+        print(
+            f"[decouple #82] SSL phase → study mode={study_mode!r} "
+            f"(V14_PRETRAIN_SESSIONS, leakage-free), eval_mode={chain_eval_mode!r}, "
+            f"holdout={pretrain_holdout_fraction}; clip-sampling budget from "
+            f"--mode={mode!r}"
+        )
     study = Wang2024Treebank(
-        path=Path(bt_root), mode=mode,
+        path=Path(bt_root), mode=study_mode,
         infra_timelines={"cluster": None},
     )
     word_events = BTWordEvents(
@@ -899,10 +951,11 @@ def build_v14_experiment(
         binary_tasks=binary_tasks,
         lite=(mode == "lite"),
         nano=(mode == "nano"),
-        eval_mode=eval_mode,
+        eval_mode=chain_eval_mode,
         test_subject_id=test_subject_id,
         test_trial_id=test_trial_id,
         bt_root=bt_root,
+        pretrain_holdout_fraction=pretrain_holdout_fraction,
     )
     chain = ns.Chain(steps=[study, word_events])
 
@@ -1282,6 +1335,14 @@ def _parser() -> argparse.ArgumentParser:
                         "CrossSubject = scientific generalization).")
     p.add_argument("--test-subject-id", type=int, default=DEFAULT_TEST_SUBJECT_ID)
     p.add_argument("--test-trial-id", type=int, default=DEFAULT_TEST_TRIAL_ID)
+    p.add_argument(
+        "--pretrain-holdout-fraction", dest="pretrain_holdout_fraction",
+        type=float, default=DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
+        help="Leakage decouple (#82): per-legal-session tail fraction held out "
+        "for SSL pretext-loss monitoring (val AND test) on the SSL phases. Only "
+        "partitions legal pretraining data (V14_PRETRAIN_SESSIONS); never the "
+        "leaderboard eval split.",
+    )
     p.add_argument("--binary-tasks", action="store_true", default=True,
                    help="(default) Binary label derivation per Neuroprobe leaderboard. "
                         "Pass --no-binary-tasks to switch to 3-class multiclass.")
@@ -1919,6 +1980,7 @@ def _common_build_kwargs(
         exca_mode=args.exca_mode,
         test_subject_id=args.test_subject_id,
         test_trial_id=args.test_trial_id,
+        pretrain_holdout_fraction=args.pretrain_holdout_fraction,
         binary_tasks=args.binary_tasks,
         session_robust_z=args.session_robust_z,
         eps=args.eps, d_model=args.d_model, depth=args.depth,

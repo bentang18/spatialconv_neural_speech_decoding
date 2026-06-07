@@ -11,7 +11,35 @@ from __future__ import annotations
 
 import pytest
 
-from speech_decoding.experiments.dispatch_v14 import main
+from speech_decoding.experiments.dispatch_v14 import _resolve_corpus_mode, main
+
+
+# --- leakage decouple (#82): study/eval corpus-mode routing -----------------
+
+def test_resolve_corpus_mode_ssl_phases_force_pretrain() -> None:
+    # P1/P2 (joint) and P3 (distill) ALWAYS pretrain on the legal corpus, even
+    # when the CLI passes an eval mode/split — this is what prevents leakage.
+    for joint, p3 in [(True, False), (False, True)]:
+        assert _resolve_corpus_mode(
+            joint_phase=joint, p3_distill=p3,
+            mode="full", eval_mode="CrossSession",
+        ) == ("pretrain", "Pretrain")
+        assert _resolve_corpus_mode(
+            joint_phase=joint, p3_distill=p3,
+            mode="lite", eval_mode="CrossSubject",
+        ) == ("pretrain", "Pretrain")
+
+
+def test_resolve_corpus_mode_p4_keeps_eval_split() -> None:
+    # The supervised P4 probe (neither joint nor distill) IS the Neuroprobe
+    # probe and must keep the CLI eval mode/split. A regression that forced P4
+    # to "pretrain" would silently evaluate on the wrong data and the leakage
+    # guard (P4-exempt) would NOT catch it — this is the only guard against it.
+    for mode in ("lite", "full", "nano"):
+        for ev in ("CrossSession", "CrossSubject"):
+            assert _resolve_corpus_mode(
+                joint_phase=False, p3_distill=False, mode=mode, eval_mode=ev,
+            ) == (mode, ev)
 
 
 def test_phase_2_raises_with_blocker_ids() -> None:

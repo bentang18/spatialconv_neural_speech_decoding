@@ -48,13 +48,28 @@ from speech_decoding.studies.braintreebank.labels import (
     ordered_dataset_labels,
     ordered_dataset_source_indices,
 )
+from speech_decoding.studies.braintreebank.manifest import V14_PRETRAIN_SESSIONS
 
 
-EvalMode = tp.Literal["CrossSession", "CrossSubject"]
+# "Pretrain" is the leakage-free SSL/distill split: every legal pretraining
+# session (V14_PRETRAIN_SESSIONS, disjoint from the eval set) goes to train,
+# minus a deterministic per-session positional tail held out for pretext-loss
+# monitoring (val/test). It carries NO Neuroprobe eval session, so the SSL
+# corpus is fully decoupled from the leaderboard eval split. The supervised P4
+# probe keeps CrossSession/CrossSubject; routed per-phase by dispatch_v14.
+EvalMode = tp.Literal["CrossSession", "CrossSubject", "Pretrain"]
 
 
 _UPSTREAM_TRAIN_SUBJECT_ID = 2
 _UPSTREAM_TRAIN_TRIAL_ID = 4
+
+# Default fraction of each legal session's clips held out for SSL pretext-loss
+# monitoring — applied to val AND to test (so ~2× this is held out per session,
+# the remainder is train). NOT a leaderboard quantity: it only carves legal
+# pretraining data into train vs. monitoring, never touches eval sessions.
+DEFAULT_PRETRAIN_HOLDOUT_FRACTION = 0.05
+
+_PRETRAIN_SESSION_SET = frozenset(V14_PRETRAIN_SESSIONS)
 
 
 def _neural_sample_rate() -> float:
@@ -272,6 +287,66 @@ def _assign_cross_subject_split(
     return out.loc[out["split"] != ""].reset_index(drop=True)
 
 
+def _assign_pretrain_split(
+    df: pd.DataFrame,
+    *,
+    holdout_fraction: float,
+) -> pd.DataFrame:
+    """Leakage-free SSL split over the legal pretraining corpus.
+
+    Every row is a clip anchor from a ``V14_PRETRAIN_SESSIONS`` session (the
+    study emits only those under ``mode="pretrain"``). For each (subject, trial)
+    we carve a deterministic positional tail — the last ``holdout_fraction`` of
+    that session's rows → ``test``, the preceding ``holdout_fraction`` → ``val``,
+    the rest → ``train``. Unlike the CrossSession/CrossSubject splits this does
+    NOT interleave by task or balance classes: SSL is label-free, so the only
+    requirements are determinism and that no eval session is present (guaranteed
+    by the corpus, re-checked by the leakage guard). Sessions too small to give
+    all three splits (< 3 rows) stay entirely in ``train``.
+    """
+    # Validate before the empty short-circuit so the contract is identical for
+    # empty and non-empty input (audit D3).
+    if not 0.0 < holdout_fraction < 0.5:
+        raise ValueError(
+            "pretrain holdout_fraction must be in (0, 0.5); got "
+            f"{holdout_fraction}"
+        )
+    if df.empty:
+        df = df.copy()
+        df["split"] = pd.Series(dtype=str)
+        return df
+    # reset_index so the positional tail is assigned by position regardless of
+    # the caller's index (audit D2: label-based .loc mis-assigns on a non-unique
+    # index; production feeds a clean RangeIndex, but the helper must be robust).
+    out = df.reset_index(drop=True)
+    out["split"] = "train"
+    groups = out.groupby(["subject_id", "trial_id"], sort=False).groups
+    for positions in groups.values():
+        idx = list(positions)
+        n = len(idx)
+        if n < 3:
+            continue  # too small to hold out — keep all as train
+        # >=1 each: cap the per-split holdout so train keeps at least one row.
+        n_hold = max(1, min(round(n * holdout_fraction), (n - 1) // 2))
+        test_rows = idx[n - n_hold:]
+        val_rows = idx[n - 2 * n_hold: n - n_hold]
+        out.loc[test_rows, "split"] = "test"
+        out.loc[val_rows, "split"] = "val"
+    # Global non-emptiness: Data.build requires every split to have >=1 segment
+    # across the whole corpus; otherwise it raises a misdirected "Split has no
+    # segments" far from the cause (audit D1). Fail here with the real reason.
+    missing = {"val", "test"} - set(out["split"])
+    if missing:
+        raise ValueError(
+            f"pretrain split produced no {sorted(missing)} rows across the "
+            "whole corpus (every session had < 3 clips at "
+            f"holdout_fraction={holdout_fraction}). Downstream Data.build "
+            "requires non-empty train/val/test; raise holdout_fraction or "
+            "check the corpus."
+        )
+    return out
+
+
 class BTWordEvents(EventsTransform):
     """Emit Neuroprobe-parity Word events with chronological splits.
 
@@ -293,6 +368,9 @@ class BTWordEvents(EventsTransform):
     bt_root: str | None = None
     duration: float = 1.0
     random_seed: int = 42
+    # eval_mode="Pretrain" only: per-session tail fraction held out for SSL
+    # pretext-loss monitoring (val AND test). Ignored for CrossSession/Subject.
+    pretrain_holdout_fraction: float = DEFAULT_PRETRAIN_HOLDOUT_FRACTION
 
     @classmethod
     def _exclude_from_cls_uid(cls) -> list[str]:
@@ -363,6 +441,11 @@ class BTWordEvents(EventsTransform):
                 test_subject_id=self.test_subject_id,
                 test_trial_id=self.test_trial_id,
             )
+        elif self.eval_mode == "Pretrain":
+            words = _assign_pretrain_split(
+                words,
+                holdout_fraction=self.pretrain_holdout_fraction,
+            )
         else:  # CrossSubject
             words = _assign_cross_subject_split(
                 words,
@@ -374,6 +457,12 @@ class BTWordEvents(EventsTransform):
         return pd.concat([events, words], ignore_index=True)
 
     def _timeline_is_used(self, subject_id: int, trial_id: int) -> bool:
+        if self.eval_mode == "Pretrain":
+            # Defense-in-depth: only legal pretraining sessions are usable, even
+            # if an eval session somehow reaches this transform. The study's
+            # mode="pretrain" already restricts the corpus; this is the second
+            # gate before the runtime leakage guard.
+            return (subject_id, trial_id) in _PRETRAIN_SESSION_SET
         if self.eval_mode == "CrossSession":
             return subject_id == self.test_subject_id
         is_train = (subject_id == self.train_subject_id and

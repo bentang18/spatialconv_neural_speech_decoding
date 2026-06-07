@@ -34,6 +34,7 @@ from speech_decoding.studies.braintreebank.manifest import (
     BT_FULL_SESSIONS,
     BT_LITE_SESSIONS,
     BT_NANO_SESSIONS,
+    V14_PRETRAIN_SESSIONS,
 )
 
 
@@ -41,13 +42,19 @@ _SESSIONS_BY_MODE: dict[str, tuple[tuple[int, int], ...]] = {
     "lite": BT_LITE_SESSIONS,
     "nano": BT_NANO_SESSIONS,
     "full": BT_FULL_SESSIONS,
+    # SSL/distill pretraining corpus: the Neuroprobe pretraining-allowed
+    # sessions (BT_FULL − BT_LITE) restricted to the v14 cohort. DISJOINT from
+    # BT_LITE_SESSIONS (the 12 leaderboard eval sessions), so pretraining on
+    # this corpus never sees eval data. Paired with BTWordEvents
+    # eval_mode="Pretrain"; routed by dispatch for the SSL phases only.
+    "pretrain": V14_PRETRAIN_SESSIONS,
 }
 
 
 class Wang2024Treebank(study.Study):
     """BrainTreebank: sEEG from 10 participants watching narrated movies."""
 
-    mode: tp.Literal["lite", "nano", "full"] = "lite"
+    mode: tp.Literal["lite", "nano", "full", "pretrain"] = "lite"
 
     aliases: tp.ClassVar[tuple[str, ...]] = (
         "BrainTreebank",

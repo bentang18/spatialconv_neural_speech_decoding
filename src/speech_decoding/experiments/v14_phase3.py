@@ -460,6 +460,10 @@ class V14Phase3Experiment(V14Experiment):
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
+    # #82: P3 distillation must never pretrain on a Neuroprobe off-limits eval
+    # session. Enforced fail-closed in Experiment._train_and_test.
+    enforces_pretrain_leakage_guard: tp.ClassVar[bool] = True
+
     projector_mode: tp.Literal["mlp", "linear"] = "mlp"
     # B33: per-channel target standardization is mandatory by default; the
     # falsifier R-no-target-standardize sets this False (raw 1280-d target).
