@@ -183,6 +183,9 @@ class V14JointExperiment(V14Experiment):
     # #82: P1/P2 SSL must never pretrain on a Neuroprobe off-limits eval
     # session. Enforced fail-closed in Experiment._train_and_test.
     enforces_pretrain_leakage_guard: ClassVar[bool] = True
+    # Anti-starvation floor: P1/P2 span the full V14_PRETRAIN_SESSIONS cohort
+    # (7 subjects {1,2,3,4,6,8,9} / 13 sessions).
+    pretrain_cohort_floor: ClassVar[tuple[int, int] | None] = (7, 13)
 
     # B30 sister selectors. Pinned to the locked defaults; sister values
     # are accepted by the field but rejected at construction until the

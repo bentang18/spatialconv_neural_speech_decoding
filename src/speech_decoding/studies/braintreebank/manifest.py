@@ -172,3 +172,21 @@ DCC data availability (verified 2026-06-06, #26 closed):
   → P3 runs on 12 sessions / subjects {1,2,3,4,6,9}; subject 8 drops from P3
     ONLY until its teacher target is backfilled (port 16 kHz audio + Whisper).
     P4 readout is unaffected (it evals on BT_LITE_SESSIONS, not this corpus)."""
+
+
+NO_TEACHER_CACHE_SESSIONS: tuple[tuple[int, int], ...] = ((8, 0),)
+"""Pretrain-legal sessions with NO Whisper teacher cache on DCC (data gap, not a
+contract change). (8,0) "Sesame Street Episode 3990" is subject 8's only session
+and has no teacher .pt as of 2026-06-06. These are excluded from the P3 distill
+corpus (P3 needs a teacher target per clip); P1/P2 — which need no teacher — keep
+the full ``V14_PRETRAIN_SESSIONS``. Backfilling (8,0)'s teacher restores S8 to P3.
+"""
+
+V14_P3_DISTILL_SESSIONS: tuple[tuple[int, int], ...] = tuple(
+    (s, t) for (s, t) in V14_PRETRAIN_SESSIONS if (s, t) not in NO_TEACHER_CACHE_SESSIONS
+)
+"""Leaderboard-legal P3 (Whisper-distill) corpus: ``V14_PRETRAIN_SESSIONS`` minus
+the no-teacher sessions. 12 sessions over subjects {1,2,3,4,6,9} (subject 8 drops
+because its only session (8,0) has no teacher cache). Without an explicit P3
+corpus the distill phase routes to the full 13-session pretrain set and crashes
+lazily on the first (8,0) clip (whisper_target FileNotFoundError)."""

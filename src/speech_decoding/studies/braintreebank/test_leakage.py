@@ -5,6 +5,7 @@ import pytest
 
 from speech_decoding.studies.braintreebank.leakage import (
     assert_no_eval_leakage,
+    assert_pretrain_corpus_spans_cohort,
     study_is_braintreebank,
 )
 from speech_decoding.studies.braintreebank.manifest import (
@@ -153,3 +154,64 @@ def test_missing_phase_loader_is_skipped():
     # A phase absent from the mapping (e.g. no val) is skipped, not an error.
     loaders = {"train": _FakeLoader(_triggers(list(V14_PRETRAIN_SESSIONS[:1])))}
     assert_no_eval_leakage(loaders, study=_Chain(Wang2024Treebank()))
+
+
+# --- anti-starvation cardinality guard (LC3) -------------------------------
+
+def test_full_pretrain_corpus_spans_cohort_passes():
+    # 7 subjects / 13 sessions == the V14 cohort floor — must NOT raise.
+    legal = list(V14_PRETRAIN_SESSIONS)
+    loaders = _loaders(train=legal, val=legal[:1])
+    assert_pretrain_corpus_spans_cohort(loaders, study=_Chain(Wang2024Treebank()))
+
+
+def test_single_subject_train_trips_anti_starvation():
+    # The un-caught half of the venom bug: a legal-but-degenerate single-subject
+    # train split (zero eval intersection) PASSES the leak guard but must TRIP
+    # the anti-starvation guard. Both directions on one corpus.
+    single = [V14_PRETRAIN_SESSIONS[0]]  # one legal session, one subject
+    assert single[0] not in BT_LITE_SESSIONS
+    loaders = _loaders(train=single, val=single)
+    # leak guard is silent on this legal corpus...
+    assert_no_eval_leakage(loaders, study=_Chain(Wang2024Treebank()))
+    # ...but the cardinality guard catches the starvation.
+    with pytest.raises(RuntimeError, match="ANTI-STARVATION GUARD TRIPPED"):
+        assert_pretrain_corpus_spans_cohort(
+            loaders, study=_Chain(Wang2024Treebank())
+        )
+
+
+def test_anti_starvation_counts_only_train_split():
+    # Cardinality is asserted on the gradient-bearing train split. A starved
+    # train split trips even if val happens to span the full cohort.
+    starved = [V14_PRETRAIN_SESSIONS[0]]
+    loaders = _loaders(train=starved, val=list(V14_PRETRAIN_SESSIONS))
+    with pytest.raises(RuntimeError, match="ANTI-STARVATION GUARD TRIPPED"):
+        assert_pretrain_corpus_spans_cohort(
+            loaders, study=_Chain(Wang2024Treebank())
+        )
+
+
+def test_anti_starvation_fail_closed_on_missing_columns():
+    df = pd.DataFrame({"split": ["train"]})  # no subject_id / trial_id
+    loaders = {"train": _FakeLoader(df)}
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        assert_pretrain_corpus_spans_cohort(
+            loaders, study=_Chain(Wang2024Treebank())
+        )
+
+
+def test_anti_starvation_fail_closed_on_missing_train_loader():
+    loaders = {"val": _FakeLoader(_triggers(list(V14_PRETRAIN_SESSIONS)))}
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        assert_pretrain_corpus_spans_cohort(
+            loaders, study=_Chain(Wang2024Treebank())
+        )
+
+
+def test_anti_starvation_non_bt_study_exempt():
+    # The cohort floor is BrainTreebank-specific; a non-BT study is exempt even
+    # with a single-session train split.
+    single = [V14_PRETRAIN_SESSIONS[0]]
+    loaders = _loaders(train=single, val=single)
+    assert_pretrain_corpus_spans_cohort(loaders, study=_OtherStudy())

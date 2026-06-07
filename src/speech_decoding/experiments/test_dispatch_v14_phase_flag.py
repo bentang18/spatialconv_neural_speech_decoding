@@ -12,22 +12,100 @@ from __future__ import annotations
 import pytest
 
 from speech_decoding.experiments.dispatch_v14 import _resolve_corpus_mode, main
+from speech_decoding.studies.braintreebank.manifest import (
+    NO_TEACHER_CACHE_SESSIONS,
+    V14_P3_DISTILL_SESSIONS,
+    V14_PRETRAIN_SESSIONS,
+)
+from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 
 
 # --- leakage decouple (#82): study/eval corpus-mode routing -----------------
 
-def test_resolve_corpus_mode_ssl_phases_force_pretrain() -> None:
-    # P1/P2 (joint) and P3 (distill) ALWAYS pretrain on the legal corpus, even
-    # when the CLI passes an eval mode/split — this is what prevents leakage.
-    for joint, p3 in [(True, False), (False, True)]:
-        assert _resolve_corpus_mode(
-            joint_phase=joint, p3_distill=p3,
-            mode="full", eval_mode="CrossSession",
-        ) == ("pretrain", "Pretrain")
-        assert _resolve_corpus_mode(
-            joint_phase=joint, p3_distill=p3,
-            mode="lite", eval_mode="CrossSubject",
-        ) == ("pretrain", "Pretrain")
+def test_resolve_corpus_mode_joint_forces_pretrain() -> None:
+    # P1/P2 (joint) ALWAYS pretrain on the full legal corpus ("pretrain" =
+    # V14_PRETRAIN_SESSIONS), even when the CLI passes an eval mode/split — this
+    # is what prevents leakage. (No teacher is needed, so all 13 sessions stay.)
+    assert _resolve_corpus_mode(
+        joint_phase=True, p3_distill=False,
+        mode="full", eval_mode="CrossSession",
+    ) == ("pretrain", "Pretrain")
+    assert _resolve_corpus_mode(
+        joint_phase=True, p3_distill=False,
+        mode="lite", eval_mode="CrossSubject",
+    ) == ("pretrain", "Pretrain")
+
+
+def test_resolve_corpus_mode_p3_routes_to_distill_corpus() -> None:
+    # LC4: P3 (distill) routes to "p3_distill" (V14_P3_DISTILL_SESSIONS = the 13
+    # pretrain sessions minus (8,0), which has no Whisper teacher cache), NOT the
+    # full "pretrain" corpus — routing P3 to "pretrain" crashes lazily on the
+    # first (8,0) clip. Still the leakage-free "Pretrain" split, any CLI mode.
+    assert _resolve_corpus_mode(
+        joint_phase=False, p3_distill=True,
+        mode="full", eval_mode="CrossSession",
+    ) == ("p3_distill", "Pretrain")
+    assert _resolve_corpus_mode(
+        joint_phase=False, p3_distill=True,
+        mode="lite", eval_mode="CrossSubject",
+    ) == ("p3_distill", "Pretrain")
+
+
+def test_p3_distill_corpus_excludes_session_8_0_no_teacher() -> None:
+    # LC4: the P3 distill corpus EXCLUDES (8,0) / subject 8 (no teacher cache):
+    # 12 sessions over subjects {1,2,3,4,6,9}. Was the confirmed defect — P3 ran
+    # on the full 13-session set and crashed on (8,0).
+    assert (8, 0) in NO_TEACHER_CACHE_SESSIONS
+    assert (8, 0) in V14_PRETRAIN_SESSIONS  # legal to pretrain on (P1/P2)...
+    assert (8, 0) not in V14_P3_DISTILL_SESSIONS  # ...but no teacher for P3.
+    assert 8 not in {s for s, _ in V14_P3_DISTILL_SESSIONS}
+    assert set(V14_P3_DISTILL_SESSIONS) == set(V14_PRETRAIN_SESSIONS) - {(8, 0)}
+    assert len(V14_P3_DISTILL_SESSIONS) == 12
+    assert sorted({s for s, _ in V14_P3_DISTILL_SESSIONS}) == [1, 2, 3, 4, 6, 9]
+
+
+def test_p3_study_mode_emits_exactly_distill_corpus(tmp_path) -> None:
+    # LC4 end-to-end: the study with mode="p3_distill" emits exactly the 12
+    # teacher-backed sessions — the disk->emission wiring the runtime guard
+    # cannot see (it only checks the realized loaders don't LEAK). iter_timelines
+    # yields plain dicts (no data read); a tmp dir satisfies the study's path.
+    study = Wang2024Treebank(path=str(tmp_path), mode="p3_distill")
+    emitted = {
+        (int(tl["subject_id"]), int(tl["trial_id"]))
+        for tl in study.iter_timelines()
+    }
+    assert emitted == set(V14_P3_DISTILL_SESSIONS)
+    assert (8, 0) not in emitted
+    assert len(emitted) == 12
+
+
+def test_ssl_study_sessions_invariant_to_cli_mode(tmp_path) -> None:
+    # LC9: under SSL the realized study session set is the legal corpus
+    # regardless of --mode (the #82 decouple). _resolve_corpus_mode returns the
+    # same study mode for every CLI mode, and iter_timelines is identical across
+    # them (it cannot depend on the CLI clip-sampling --mode).
+    for cli_mode in ("lite", "full", "nano"):
+        joint_study, _ = _resolve_corpus_mode(
+            joint_phase=True, p3_distill=False,
+            mode=cli_mode, eval_mode="CrossSession",
+        )
+        assert joint_study == "pretrain"
+        p3_study, _ = _resolve_corpus_mode(
+            joint_phase=False, p3_distill=True,
+            mode=cli_mode, eval_mode="CrossSession",
+        )
+        assert p3_study == "p3_distill"
+    # The emitted session set is identical across CLI modes for each SSL study.
+    for study_mode, expected in (
+        ("pretrain", set(V14_PRETRAIN_SESSIONS)),
+        ("p3_distill", set(V14_P3_DISTILL_SESSIONS)),
+    ):
+        study = Wang2024Treebank(path=str(tmp_path), mode=study_mode)
+        emitted = {
+            (int(tl["subject_id"]), int(tl["trial_id"]))
+            for tl in study.iter_timelines()
+        }
+        assert emitted == expected
 
 
 def test_resolve_corpus_mode_p4_keeps_eval_split() -> None:

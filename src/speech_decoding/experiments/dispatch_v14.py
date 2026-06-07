@@ -381,16 +381,22 @@ def _resolve_corpus_mode(
     """Leakage decouple (#82): pick the (study session-mode, BTWordEvents
     eval-mode) for a phase.
 
-    The SSL/distill phases (P1/P2 joint, P3 distill) pretrain on the
-    Neuroprobe-legal corpus — study ``"pretrain"`` (V14_PRETRAIN_SESSIONS,
-    disjoint from the 12 eval sessions) + ``"Pretrain"`` split. ONLY the
-    supervised P4 probe trains/tests on the eval split, so it keeps the CLI
-    ``mode``/``eval_mode`` (CrossSession/CrossSubject). This is the single
-    safety-critical branch that prevents eval data from reaching pretraining;
-    the runtime leakage guard is the fail-closed backstop. Pure + isolated so
-    BOTH regression directions are unit-testable (SSL→eval = leakage caught by
-    the guard; P4→pretrain = silent wrong eval, NOT caught — only this test)."""
-    if joint_phase or p3_distill:
+    The SSL/distill phases pretrain on the Neuroprobe-legal corpus + the
+    ``"Pretrain"`` split. P1/P2 (joint) use study ``"pretrain"``
+    (V14_PRETRAIN_SESSIONS — 13 sessions, no teacher needed). P3 (distill) uses
+    study ``"p3_distill"`` (V14_P3_DISTILL_SESSIONS — those 12 minus (8,0), which
+    has no Whisper teacher cache); routing P3 to ``"pretrain"`` would crash
+    lazily on the first (8,0) clip. Both corpora are disjoint from the 12 eval
+    sessions. ONLY the supervised P4 probe trains/tests on the eval split, so it
+    keeps the CLI ``mode``/``eval_mode`` (CrossSession/CrossSubject). This is the
+    single safety-critical branch that prevents eval data from reaching
+    pretraining; the runtime leakage guard is the fail-closed backstop. Pure +
+    isolated so BOTH regression directions are unit-testable (SSL→eval = leakage
+    caught by the guard; P4→pretrain = silent wrong eval, NOT caught — only this
+    test)."""
+    if p3_distill:
+        return "p3_distill", "Pretrain"
+    if joint_phase:
         return "pretrain", "Pretrain"
     return mode, eval_mode
 
@@ -935,10 +941,14 @@ def build_v14_experiment(
         joint_phase=joint_phase, p3_distill=p3_distill,
         mode=mode, eval_mode=eval_mode,
     )
-    if study_mode == "pretrain":
+    if study_mode in ("pretrain", "p3_distill"):
+        corpus = (
+            "V14_PRETRAIN_SESSIONS (13 sess)" if study_mode == "pretrain"
+            else "V14_P3_DISTILL_SESSIONS (12 sess, S8 dropped: no teacher)"
+        )
         print(
             f"[decouple #82] SSL phase → study mode={study_mode!r} "
-            f"(V14_PRETRAIN_SESSIONS, leakage-free), eval_mode={chain_eval_mode!r}, "
+            f"({corpus}, leakage-free), eval_mode={chain_eval_mode!r}, "
             f"holdout={pretrain_holdout_fraction}; clip-sampling budget from "
             f"--mode={mode!r}"
         )

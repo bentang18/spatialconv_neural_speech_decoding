@@ -1,17 +1,61 @@
 from __future__ import annotations
 
+import importlib.util
+
+import pytest
+
 from speech_decoding.studies.braintreebank.manifest import (
     BT_FULL_SESSIONS,
     BT_LITE_SESSIONS,
     BT_NANO_SESSIONS,
     BT_PRETRAIN_ALLOWED_SESSIONS,
     BT_PRETRAIN_PARTIAL_SESSIONS,
+    NO_TEACHER_CACHE_SESSIONS,
     V14_EXCLUDED_SUBJECT_IDS,
     V14_LEADERBOARD_SUBJECT_IDS,
+    V14_P3_DISTILL_SESSIONS,
     V14_PRETRAIN_SESSIONS,
     V14_TRAIN_SESSIONS,
     V14_TRAIN_SUBJECT_IDS,
 )
+
+
+def _load_upstream_neuroprobe_config(monkeypatch, tmp_path):
+    """Load the installed upstream ``neuroprobe.config`` module in isolation.
+
+    ``neuroprobe/__init__`` pulls in ``braintreebank_subject`` (heavy, data-
+    bound); ``config.py`` itself only needs ``ROOT_DIR_BRAINTREEBANK`` set at
+    import and otherwise defines pure literals. We load the file directly via
+    importlib so the parity check depends on the pinned upstream constant, not on
+    BT data being present. importorskip when neuroprobe isn't installed."""
+    spec = importlib.util.find_spec("neuroprobe")
+    if spec is None or not spec.submodule_search_locations:
+        pytest.skip("upstream neuroprobe not installed")
+    cfg_path = next(
+        p for loc in spec.submodule_search_locations
+        for p in [__import__("pathlib").Path(loc) / "config.py"]
+        if p.exists()
+    )
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    cfg_spec = importlib.util.spec_from_file_location(
+        "_neuroprobe_config_parity_probe", cfg_path
+    )
+    module = importlib.util.module_from_spec(cfg_spec)
+    cfg_spec.loader.exec_module(module)
+    return module
+
+
+def test_bt_lite_sessions_match_upstream_neuroprobe_lite(monkeypatch, tmp_path) -> None:
+    """LC6: BT_LITE_SESSIONS is bit-identical to the pinned upstream
+    NEUROPROBE_LITE_SUBJECT_TRIALS (12 sessions). This is the ONLY place that
+    ties our internal off-limits set to the external eval set every guard
+    subtracts against — an upstream re-pin or a local literal drift would
+    otherwise pass all internal-consistency tests while silently changing the
+    leakage boundary."""
+    cfg = _load_upstream_neuroprobe_config(monkeypatch, tmp_path)
+    upstream = {(int(s), int(t)) for s, t in cfg.NEUROPROBE_LITE_SUBJECT_TRIALS}
+    assert upstream == set(BT_LITE_SESSIONS)
+    assert len(BT_LITE_SESSIONS) == 12 == len(upstream)
 
 
 def test_v14_cohort_excludes_s5() -> None:
@@ -72,6 +116,20 @@ def test_v14_pretrain_sessions_legal_and_cohort_scoped() -> None:
     assert len(V14_PRETRAIN_SESSIONS) == 13
     # Standard legal coverage spans {1,2,3,4,6,8,9}; 7 and 10 are blind here.
     assert sorted({s for s, _ in V14_PRETRAIN_SESSIONS}) == [1, 2, 3, 4, 6, 8, 9]
+
+
+def test_v14_p3_distill_sessions_drop_no_teacher_session() -> None:
+    """LC4: the P3 distill corpus is the pretrain corpus minus the no-teacher
+    sessions ((8,0)). 12 sessions over {1,2,3,4,6,9}; subject 8 drops because its
+    only session has no Whisper teacher cache. Still leakage-free (a subset of
+    the legal pretrain set, disjoint from the eval set)."""
+    assert NO_TEACHER_CACHE_SESSIONS == ((8, 0),)
+    distill = set(V14_P3_DISTILL_SESSIONS)
+    assert distill == set(V14_PRETRAIN_SESSIONS) - set(NO_TEACHER_CACHE_SESSIONS)
+    assert distill.isdisjoint(set(BT_LITE_SESSIONS))
+    assert len(V14_P3_DISTILL_SESSIONS) == 12
+    assert sorted({s for s, _ in V14_P3_DISTILL_SESSIONS}) == [1, 2, 3, 4, 6, 9]
+    assert (8, 0) not in distill
 
 
 def test_bt_nano_carries_two_trials_for_default_test_subject() -> None:

@@ -384,6 +384,24 @@ def test_assign_pretrain_split_never_emits_eval_session() -> None:
     assert seen.isdisjoint(set(BT_LITE_SESSIONS))
 
 
+def test_pretrain_split_train_spans_every_subject_of_corpus() -> None:
+    """LC3b: the pretrain SPLITTER routes every legal session into train (only a
+    per-session positional tail goes to val/test), so the train split
+    structurally spans every subject AND every session of the corpus. This is the
+    splitter-side anti-starvation property — the structural reason the realized
+    train loader isn't starved — complementing the realized-loader guard (LC3).
+    5 rows/session keeps the 0.2 holdout tail from consuming a whole session."""
+    df = _pretrain_df([(sess, 5) for sess in V14_PRETRAIN_SESSIONS])
+    out = _assign_pretrain_split(df, holdout_fraction=0.2)
+    train = out[out["split"] == "train"]
+    train_sessions = {
+        (int(s), int(t)) for s, t in zip(train["subject_id"], train["trial_id"])
+    }
+    # Every corpus session appears in train; train spans all 7 cohort subjects.
+    assert train_sessions == set(V14_PRETRAIN_SESSIONS)
+    assert sorted({s for s, _ in train_sessions}) == [1, 2, 3, 4, 6, 8, 9]
+
+
 def _pretrain_ieeg_events() -> pd.DataFrame:
     """Two legal pretrain sessions + one eval session — the eval session must be
     dropped by ``_timeline_is_used`` under eval_mode='Pretrain'."""
@@ -427,3 +445,33 @@ def test_btwordevents_pretrain_mode_drops_eval_sessions(monkeypatch) -> None:
     assert seen == set(V14_PRETRAIN_SESSIONS[:2])
     assert seen.isdisjoint(set(BT_LITE_SESSIONS))
     assert set(words["split"]) == {"train", "val", "test"}
+
+
+def test_btwordevents_emits_string_subject_trial_id_schema(monkeypatch) -> None:
+    """LC8: realized BT Word-row triggers carry subject_id/trial_id as STRING.
+    Both leakage guards depend on this schema — the column-presence fail-closed
+    branch and the int()-cast used to compare against the (int,int) eval/cohort
+    sets. A silent switch to int columns would make `int(v)` still work but a
+    switch to a different label (e.g. dropping the column) must fail loudly; this
+    pins the dtype the guards were written against."""
+    monkeypatch.setattr(
+        we,
+        "_load_words_and_nonverbal",
+        lambda subject_id, trial_id, *, bt_root, enrich: (
+            _stub_words_df(), _stub_nonverbal_df(),
+        ),
+    )
+    step = BTWordEvents(
+        tasks=("speech",),
+        binary_tasks=True,
+        eval_mode="Pretrain",
+        pretrain_holdout_fraction=0.25,
+        bt_root="/dev/null",
+    )
+    out = step(_pretrain_ieeg_events())
+    words = out.loc[out["type"] == "Word"]
+    assert len(words) > 0
+    for col in ("subject_id", "trial_id"):
+        assert all(isinstance(v, str) for v in words[col]), f"{col} must be str-typed"
+        # Round-trips through int() — the exact cast both guards perform.
+        assert all(int(v) >= 0 for v in words[col])

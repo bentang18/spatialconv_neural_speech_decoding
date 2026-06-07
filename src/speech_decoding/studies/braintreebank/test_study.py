@@ -17,6 +17,7 @@ import neuralset as ns
 from speech_decoding.studies.braintreebank.manifest import (
     BT_FULL_SESSIONS,
     BT_LITE_SESSIONS,
+    V14_PRETRAIN_SESSIONS,
 )
 from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 
@@ -42,6 +43,25 @@ def test_wang2024treebank_defaults_to_lite_manifest(tmp_path) -> None:
 
     assert len(timelines) == len(BT_LITE_SESSIONS)
     assert timelines[0] == {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
+
+
+def test_wang2024treebank_pretrain_mode_emits_exactly_legal_corpus(tmp_path) -> None:
+    """LC2/LC5: mode='pretrain' emits EXACTLY V14_PRETRAIN_SESSIONS (13 sessions,
+    subjects {1,2,3,4,6,8,9}, disjoint from BT_LITE) — the disk->emission wiring
+    the runtime leakage guard cannot see (it only checks realized loaders for the
+    LEAK). Re-pointing _SESSIONS_BY_MODE['pretrain'] to the eval-containing
+    V14_TRAIN_SESSIONS would fail here immediately. The subject set IS the
+    S7/S10-zero-shot pin (both absent from the standard legal corpus)."""
+    study = Wang2024Treebank(path=tmp_path, mode="pretrain")
+    emitted = {(tl["subject_id"], tl["trial_id"]) for tl in study.iter_timelines()}
+    assert emitted == set(V14_PRETRAIN_SESSIONS)
+    assert len(emitted) == 13
+    assert sorted({s for s, _ in emitted}) == [1, 2, 3, 4, 6, 8, 9]
+    # S7/S10 contribute zero standard legal sessions (zero-shot, deferred).
+    assert 7 not in {s for s, _ in emitted}
+    assert 10 not in {s for s, _ in emitted}
+    # Disjoint from the eval set — the leakage boundary at the emission layer.
+    assert emitted.isdisjoint(set(BT_LITE_SESSIONS))
 
 
 def test_wang2024treebank_mode_excluded_from_cls_kwargs(tmp_path) -> None:

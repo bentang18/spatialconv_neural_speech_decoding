@@ -67,6 +67,12 @@ class Experiment(BaseExperiment):
     # keeps it off the configurable-field set (not part of the run uid).
     enforces_pretrain_leakage_guard: tp.ClassVar[bool] = False
 
+    # Anti-starvation cohort floor (min_subjects, min_sessions) the realized SSL
+    # train corpus must span — the complement of the leak guard (#82). Set by the
+    # SSL/distill classes: V14Joint = (7, 13) = V14_PRETRAIN_SESSIONS; V14Phase3 =
+    # (6, 12) = that set minus (8,0), the no-teacher session. None = no floor.
+    pretrain_cohort_floor: tp.ClassVar[tuple[int, int] | None] = None
+
     data: Data
     brain_model_config: BaseModelConfig
     loss: BaseLoss
@@ -386,6 +392,7 @@ class Experiment(BaseExperiment):
             return
         from speech_decoding.studies.braintreebank.leakage import (
             assert_no_eval_leakage,
+            assert_pretrain_corpus_spans_cohort,
         )
 
         # Check EVERY realized split (train/val/test): an SSL phase must not see
@@ -395,6 +402,20 @@ class Experiment(BaseExperiment):
         assert_no_eval_leakage(
             loaders, study=self.data.study, phases=tuple(loaders.keys()),
         )
+        # Anti-starvation (the complement of the leak check): the realized train
+        # corpus must span the V14 cross-subject cohort. A legal-but-degenerate
+        # single-subject train split passes the leak guard but voids the
+        # cross-subject claim — the un-caught half of the venom bug. The floor is
+        # phase-specific (P3 drops S8's no-teacher session), so each SSL/distill
+        # class declares it.
+        if self.pretrain_cohort_floor is not None:
+            min_subjects, min_sessions = self.pretrain_cohort_floor
+            assert_pretrain_corpus_spans_cohort(
+                loaders,
+                study=self.data.study,
+                min_subjects=min_subjects,
+                min_sessions=min_sessions,
+            )
 
     def _train_and_test(self) -> dict[str, float | None]:
         pl.seed_everything(self.seed, workers=True)

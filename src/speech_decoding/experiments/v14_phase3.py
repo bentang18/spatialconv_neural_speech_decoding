@@ -463,6 +463,10 @@ class V14Phase3Experiment(V14Experiment):
     # #82: P3 distillation must never pretrain on a Neuroprobe off-limits eval
     # session. Enforced fail-closed in Experiment._train_and_test.
     enforces_pretrain_leakage_guard: tp.ClassVar[bool] = True
+    # Anti-starvation floor: P3 drops (8,0) (subject 8's only session, no Whisper
+    # teacher cache), so the distill corpus is 6 subjects {1,2,3,4,6,9} / 12
+    # sessions = V14_P3_DISTILL_SESSIONS.
+    pretrain_cohort_floor: tp.ClassVar[tuple[int, int] | None] = (6, 12)
 
     projector_mode: tp.Literal["mlp", "linear"] = "mlp"
     # B33: per-channel target standardization is mandatory by default; the

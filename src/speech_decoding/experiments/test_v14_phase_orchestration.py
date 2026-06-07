@@ -355,3 +355,128 @@ def test_e5_joint_experiment_overrides_neither_run_nor_train_and_test() -> None:
     assert "_train_and_test" not in vars(V14JointExperiment)
     assert "_build_brain_module" in vars(V14JointExperiment)
     assert "model_post_init" in vars(V14JointExperiment)
+
+
+# --- #82 leakage-guard call site + per-phase gating (LC1, LC7/EM2) -----------
+
+
+def test_guard_call_runs_after_build_before_trainer_fit() -> None:
+    """LC1: the leakage guard call is ordered AFTER the loaders are built and
+    BEFORE the first gradient step in ``Experiment._train_and_test``. Deleting
+    the call or moving it after ``trainer.fit`` would let gradients flow on a
+    leaking/starved corpus — and currently breaks no other test."""
+    import inspect
+
+    src = inspect.getsource(Experiment._train_and_test)
+    i_build = src.index("self.data.build(")
+    i_guard = src.index("_assert_no_pretrain_leakage(")
+    i_fit = src.index("trainer.fit(")
+    assert i_build < i_guard < i_fit, (
+        "leakage guard must run after data.build and before trainer.fit"
+    )
+
+
+def test_leakage_guard_gating_classvars_per_phase() -> None:
+    """LC7 + EM2: the guard is ARMED on the SSL/distill phases and EXEMPT on the
+    supervised P4 readout + the base Experiment. P4 legitimately trains/tests on
+    the eval split, so arming it there would falsely abort; leaving it off the
+    SSL/distill phases would let eval data pretrain unverified."""
+    from speech_decoding.experiments.v14_joint import V14JointExperiment
+    from speech_decoding.experiments.v14_phase3 import V14Phase3Experiment
+    from speech_decoding.experiments.v14_phase4 import (
+        V14Phase4ReadoutExperiment,
+    )
+
+    assert V14JointExperiment.enforces_pretrain_leakage_guard is True
+    assert V14Phase3Experiment.enforces_pretrain_leakage_guard is True
+    assert V14Phase4ReadoutExperiment.enforces_pretrain_leakage_guard is False
+    assert Experiment.enforces_pretrain_leakage_guard is False
+
+
+def test_anti_starvation_cohort_floor_per_phase() -> None:
+    """The anti-starvation floor is phase-specific: P1/P2 (joint) span the full
+    cohort (7 subjects / 13 sessions); P3 drops (8,0) (no teacher) → (6, 12). P4
+    + base carry no floor (None) so the guard is inert there."""
+    from speech_decoding.experiments.v14_joint import V14JointExperiment
+    from speech_decoding.experiments.v14_phase3 import V14Phase3Experiment
+    from speech_decoding.experiments.v14_phase4 import (
+        V14Phase4ReadoutExperiment,
+    )
+
+    assert V14JointExperiment.pretrain_cohort_floor == (7, 13)
+    assert V14Phase3Experiment.pretrain_cohort_floor == (6, 12)
+    assert V14Phase4ReadoutExperiment.pretrain_cohort_floor is None
+    assert Experiment.pretrain_cohort_floor is None
+
+
+def test_guard_invoked_at_runtime_with_all_realized_split_keys(monkeypatch) -> None:
+    """G2-audit finding-2 + LC1(runtime): at execution ``_assert_no_pretrain_leakage``
+    passes BOTH guards the FULL realized split tuple (train, val, test), not a
+    narrowed ('train',) literal, and forwards the per-phase cohort floor. A
+    regression to ``phases=('train',)`` would stop checking the val/test
+    monitoring splits for eval leakage (Neuroprobe forbids eval data in ANY
+    pretraining split); the source-order test pins WHEN the guard runs, this pins
+    WHAT it checks. Spies the lazily-imported guards (``from ... import`` re-reads
+    the module attribute at call time, so a module-level monkeypatch is seen)."""
+    from types import SimpleNamespace
+
+    from speech_decoding.studies.braintreebank import leakage as lk
+
+    seen: dict[str, object] = {}
+
+    def _spy_leak(loaders, *, study, phases):
+        seen["leak_phases"] = tuple(phases)
+        seen["leak_study"] = study
+
+    def _spy_cohort(loaders, *, study, min_subjects, min_sessions):
+        seen["cohort"] = (min_subjects, min_sessions)
+        seen["cohort_study"] = study
+
+    monkeypatch.setattr(lk, "assert_no_eval_leakage", _spy_leak)
+    monkeypatch.setattr(lk, "assert_pretrain_corpus_spans_cohort", _spy_cohort)
+
+    study = object()
+    stub = SimpleNamespace(
+        enforces_pretrain_leakage_guard=True,
+        pretrain_cohort_floor=(7, 13),
+        data=SimpleNamespace(study=study),
+    )
+    loaders = {"train": object(), "val": object(), "test": object()}
+    Experiment._assert_no_pretrain_leakage(stub, loaders)  # type: ignore[arg-type]
+
+    # The leak guard must see EVERY realized split, not a narrowed literal.
+    assert seen["leak_phases"] == ("train", "val", "test")
+    assert seen["leak_study"] is study
+    # The anti-starvation floor is forwarded verbatim from the per-phase ClassVar.
+    assert seen["cohort"] == (7, 13)
+    assert seen["cohort_study"] is study
+
+
+def test_guard_inert_at_runtime_when_phase_does_not_enforce(monkeypatch) -> None:
+    """G2-audit finding-1 complement: ``enforces_pretrain_leakage_guard=False``
+    (the P4 readout + base Experiment) makes the method return BEFORE importing or
+    calling either guard, so P4 can legitimately train+test on the eval split.
+    Neither spy fires."""
+    from types import SimpleNamespace
+
+    from speech_decoding.studies.braintreebank import leakage as lk
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        lk, "assert_no_eval_leakage",
+        lambda *a, **k: seen.setdefault("leak", True),
+    )
+    monkeypatch.setattr(
+        lk, "assert_pretrain_corpus_spans_cohort",
+        lambda *a, **k: seen.setdefault("cohort", True),
+    )
+
+    stub = SimpleNamespace(
+        enforces_pretrain_leakage_guard=False,
+        pretrain_cohort_floor=None,
+        data=SimpleNamespace(study=object()),
+    )
+    loaders = {"train": object(), "val": object(), "test": object()}
+    Experiment._assert_no_pretrain_leakage(stub, loaders)  # type: ignore[arg-type]
+
+    assert seen == {}, "P4/base must invoke neither guard"
