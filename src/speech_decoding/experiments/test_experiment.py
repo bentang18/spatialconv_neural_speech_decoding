@@ -306,3 +306,36 @@ def test_test_ckpt_path_best_only_for_early_stopping_phase() -> None:
     assert p4._test_ckpt_path(_StubTrainer("/x/best.ckpt")) == "best"
     # Early-stop but no best written (stopped before first validation) -> in-memory.
     assert p4._test_ckpt_path(_StubTrainer("")) is None
+
+
+def test_periodic_last_ckpt_is_metric_independent_on_step_cadence(tmp_path) -> None:
+    """C5: on a step-cadence (max_steps SSL/distill) run, last.ckpt must advance on
+    a fixed OPTIMIZER-step cadence regardless of whether val_loss improved, so a
+    SLURM-requeue resume never rolls back more than one val window. Lightning gates
+    last.ckpt on metric improvement in on_validation_end (model_checkpoint.py:516),
+    so a second metric-INDEPENDENT ModelCheckpoint (every_n_train_steps) owns
+    last.ckpt while the best.ckpt callback keeps best-by-metric only (save_last off
+    -> exactly one owner, no Lightning -v auto-increment). On an epoch-cadence run
+    the single callback owns last.ckpt as before (unchanged)."""
+    from lightning.pytorch.callbacks import ModelCheckpoint
+
+    base = _tiny_mlp_xp(tmp_path / "runs", n_epochs=1)
+
+    stepped = base.model_copy(update={"val_check_interval": 150})
+    ckpts = [c for c in stepped._callbacks() if isinstance(c, ModelCheckpoint)]
+    assert len(ckpts) == 2
+    best = [c for c in ckpts if c.monitor is not None]
+    last = [c for c in ckpts if c.monitor is None]
+    assert len(best) == 1 and len(last) == 1
+    # best.ckpt: top-1 by the monitor; save_last OFF so it never fights for last.ckpt.
+    assert best[0].save_top_k == 1 and best[0].save_last is False
+    assert best[0].monitor == stepped.checkpoint_monitor
+    # last.ckpt: metric-independent, fired purely on the OPTIMIZER-step cadence
+    # (val_check_interval is already in optimizer steps == every_n_train_steps unit).
+    assert last[0].save_last is True and last[0].save_top_k == 0
+    assert last[0]._every_n_train_steps == 150
+
+    # epoch-cadence (val_check_interval=None): single callback owns last.ckpt.
+    epoch_ckpts = [c for c in base._callbacks() if isinstance(c, ModelCheckpoint)]
+    assert len(epoch_ckpts) == 1
+    assert epoch_ckpts[0].save_last is True and epoch_ckpts[0].save_top_k == 1

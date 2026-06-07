@@ -544,6 +544,12 @@ def build_v14_experiment(
     # and local paths are byte-for-byte unchanged.
     tasks_per_node: int | None = None,
     slurm_use_srun: bool = False,
+    # C5 resilience: emit ``#SBATCH --requeue`` so a SLURM-preempted job is
+    # auto-resubmitted; combined with the within-phase ``last.ckpt`` resume
+    # (Experiment._within_phase_resume_ckpt) the requeued job continues from the
+    # last checkpoint instead of restarting the phase. Off by default (smokes /
+    # single-shot runs); set for the long full chain.
+    requeue: bool = False,
     # Lightning trainer precision. v14 first-pass default is bf16-mixed
     # per 2026-05-29 OOM diagnosis on RTX 5000 Ada (31 GiB): factorized
     # per-electrode SA over C=384 padded electrodes at d=256 exhausts
@@ -1099,6 +1105,10 @@ def build_v14_experiment(
         infra_cfg["tasks_per_node"] = tasks_per_node
     if slurm_use_srun:
         infra_cfg["slurm_use_srun"] = slurm_use_srun
+    # C5: SLURM-level requeue on preemption (submitit renders bool True as a bare
+    # ``#SBATCH --requeue``). The within-phase last.ckpt resume does the rest.
+    if requeue:
+        infra_cfg["slurm_additional_parameters"] = {"requeue": True}
 
     # #21: phase routing is exclusive — joint (P1/P2), P3 distill, and the
     # P4 frozen probe each replace the brain module differently and cannot
@@ -1611,6 +1621,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--slurm-use-srun", action="store_true",
                    help="Launch under srun (exca requires it when "
                         "tasks_per_node>1). Auto-enabled for multi-GPU DDP.")
+    p.add_argument("--slurm-requeue", action="store_true",
+                   help="C5: emit '#SBATCH --requeue' so a preempted job is "
+                        "auto-resubmitted; the within-phase last.ckpt resume "
+                        "continues from the last checkpoint. Set for the long "
+                        "full chain; leave off for smokes.")
     # Lightning trainer precision. Default 'bf16-mixed' was chosen 2026-05-29
     # after the B31 Lite Phase-4 baseline OOM'd on RTX 5000 Ada (31 GiB) at
     # every batch size tried — factorized per-electrode SA over C=384 padded
@@ -2008,6 +2023,7 @@ def _common_build_kwargs(
         # single-phase builds stay in lock-step on the srun-rank topology.
         tasks_per_node=args.tasks_per_node,
         slurm_use_srun=args.slurm_use_srun,
+        requeue=args.slurm_requeue,
         precision=args.precision,
         extractor_cache_folder=args.extractor_cache_folder,
         dkoleo_mode=args.dkoleo_mode,

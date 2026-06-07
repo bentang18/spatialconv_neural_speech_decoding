@@ -999,3 +999,53 @@ def test_plain_p4_is_not_frozen_probe(monkeypatch) -> None:
     calls = _capture_builds(monkeypatch)
     main(["--phase", "4"])
     assert calls[0]["phase4_frozen_probe"] is False
+
+
+# --- C5 resilience: --slurm-requeue (preemption auto-resubmit) ---------------
+
+
+def test_slurm_requeue_threads_to_every_chain_phase(monkeypatch, tmp_path) -> None:
+    """C5: --slurm-requeue reaches EVERY chain phase via _common_build_kwargs, so
+    the whole P1→P4 chain is requeue-resilient (not just the first phase). Default
+    is False (smokes / single-shot runs don't requeue)."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    base = ["--chain", "--work-dir", str(tmp_path),
+            "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
+
+    calls = _capture_builds(monkeypatch)
+    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    assert calls and all(c["requeue"] is False for c in calls)
+
+    calls.clear()
+    dv._build_v14_chain(_parse(base + ["--slurm-requeue"]), cross_attn_positions=None)
+    assert calls and all(c["requeue"] is True for c in calls)
+
+
+def test_slurm_requeue_default_false_single_phase(monkeypatch) -> None:
+    """No flag → requeue=False on a single-phase build."""
+    calls = _capture_builds(monkeypatch)
+    main(["--phase", "1", "--warmup-steps", "100"])
+    assert calls[0]["requeue"] is False
+
+
+def test_requeue_emits_slurm_additional_parameters(monkeypatch, tmp_path) -> None:
+    """C5 end-to-end: requeue=True on a slurm build sets
+    infra.slurm_additional_parameters={'requeue': True}, which submitit renders as
+    a bare '#SBATCH --requeue' (bool True -> flag, verified against submitit's
+    _as_sbatch_flag). False leaves it None so a smoke never auto-resubmits. Pins
+    the flag→infra mapping the _capture_builds threading tests can't see."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp_on = build_v14_experiment(
+        joint_phase=True, cluster="slurm", exca_folder=str(tmp_path),
+        requeue=True, warmup_steps=100, max_steps=1500,
+    )
+    assert xp_on.infra.slurm_additional_parameters == {"requeue": True}
+
+    xp_off = build_v14_experiment(
+        joint_phase=True, cluster="slurm", exca_folder=str(tmp_path),
+        requeue=False, warmup_steps=100, max_steps=1500,
+    )
+    assert xp_off.infra.slurm_additional_parameters is None

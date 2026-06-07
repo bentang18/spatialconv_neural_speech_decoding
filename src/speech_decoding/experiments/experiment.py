@@ -232,15 +232,47 @@ class Experiment(BaseExperiment):
         callbacks: list[pl.Callback] = [LearningRateMonitor(logging_interval="epoch")]
         root = self._artifact_root()
         if root is not None:
+            ckpt_dir = str(root / "checkpoints")
+            # C5 resilience — metric-INDEPENDENT last.ckpt on step-cadence runs.
+            # On a max_steps SSL/distill phase Lightning gates last.ckpt on the
+            # monitored metric IMPROVING: on_validation_end only calls
+            # _save_last_checkpoint when _last_global_step_saved == global_step,
+            # which the monitor top-k save sets ONLY when val_loss improves
+            # (model_checkpoint.py:516). On a val-loss plateau last.ckpt goes
+            # stale, so a SLURM-requeue resume (--slurm-requeue) would roll back
+            # further than one validation window — undercutting C5. So when a step
+            # cadence is configured a second checkpoint owns last.ckpt via
+            # every_n_train_steps: its on_train_batch_end save_last path is
+            # unguarded by metric improvement (model_checkpoint.py:485), bounding
+            # lost progress to one val cadence regardless of the loss curve. The
+            # best.ckpt callback then keeps best-by-metric only (save_last off, so
+            # exactly one callback owns last.ckpt — no Lightning -v auto-increment).
+            # val_check_interval is in OPTIMIZER steps, same unit as
+            # every_n_train_steps (global_step), so it passes through unconverted.
+            step_cadence = (
+                self.val_check_interval
+                if isinstance(self.val_check_interval, int)
+                else None
+            )
             callbacks.append(
                 ModelCheckpoint(
-                    dirpath=str(root / "checkpoints"),
+                    dirpath=ckpt_dir,
                     filename="best",
                     monitor=self.checkpoint_monitor,
-                    save_last=True,
+                    save_last=step_cadence is None,
                     save_top_k=1,
                 )
             )
+            if step_cadence is not None:
+                callbacks.append(
+                    ModelCheckpoint(
+                        dirpath=ckpt_dir,
+                        monitor=None,
+                        save_top_k=0,
+                        save_last=True,
+                        every_n_train_steps=step_cadence,
+                    )
+                )
         if self.early_stopping_patience is not None:
             callbacks.append(
                 EarlyStopping(
@@ -429,13 +461,22 @@ class Experiment(BaseExperiment):
         # class opts in (enforces_pretrain_leakage_guard) AND the study is BT.
         self._assert_no_pretrain_leakage(loaders)
         brain_module = self._build_brain_module(loaders["train"])
+        # C5 resilience: if THIS phase's own last.ckpt exists, a prior run of the
+        # same exca UID was preempted mid-fit — resume Lightning's full training
+        # state from it (None on a fresh phase).
+        resume_ckpt = None if self.test_only else self._within_phase_resume_ckpt()
         # B36 WS-E (E4): warm-start the encoder (+PMA from P3) from the prior
         # phase BEFORE fit, so the optimizer/scheduler see the loaded weights.
-        if self.pretrained_ckpt is not None:
+        # Skipped on resume: last.ckpt already carries the (warm-started, then
+        # partially-trained) full state and supersedes the cross-phase seed.
+        if self.pretrained_ckpt is not None and resume_ckpt is None:
             self._load_pretrained(brain_module, self.pretrained_ckpt)
         trainer = self._trainer()
         if not self.test_only:
-            trainer.fit(brain_module, loaders["train"], loaders["val"])
+            trainer.fit(
+                brain_module, loaders["train"], loaders["val"],
+                ckpt_path=resume_ckpt,
+            )
         results = trainer.test(
             brain_module, loaders["test"], ckpt_path=self._test_ckpt_path(trainer),
         )
@@ -449,6 +490,26 @@ class Experiment(BaseExperiment):
         if self.snapshot_ckpt_to is not None and trainer.is_global_zero:
             self._snapshot(brain_module, self.snapshot_ckpt_to)
         return dict(results[0]) if results else {}
+
+    def _within_phase_resume_ckpt(self) -> str | None:
+        """C5: this phase's own ``last.ckpt`` if a prior same-UID run was
+        preempted mid-fit, else None.
+
+        Distinct from the cross-phase ``pretrained_ckpt`` warm-start (which only
+        seeds encoder/PMA weights into a FRESH phase): this resumes Lightning's
+        full training state — optimizer momentum, LR schedule, EMA buffers,
+        global step — so a SLURM requeue (``--slurm-requeue``) continues from the
+        last checkpoint instead of restarting the phase from step 0. The
+        checkpoint lives under this config's exca ``uid_folder``
+        (:meth:`_artifact_root`), so it is unique to this phase/cell; a *completed*
+        phase, whose result exca has cached, never re-enters ``_train_and_test``
+        and so never reaches this code. Returns None on an infra-less run (no
+        artifact root) or before the first checkpoint has been written."""
+        root = self._artifact_root()
+        if root is None:
+            return None
+        last = root / "checkpoints" / "last.ckpt"
+        return str(last) if last.exists() else None
 
     def _test_ckpt_path(self, trainer: pl.Trainer) -> str | None:
         """Which weights the test pass evaluates: val-best when early-stopping

@@ -480,3 +480,103 @@ def test_guard_inert_at_runtime_when_phase_does_not_enforce(monkeypatch) -> None
     Experiment._assert_no_pretrain_leakage(stub, loaders)  # type: ignore[arg-type]
 
     assert seen == {}, "P4/base must invoke neither guard"
+
+
+# --- C5 resilience: within-phase last.ckpt resume ---------------------------
+#
+# Across-phase resume is exca's job (a completed phase returns its cached result;
+# only the incomplete phase re-runs). Within a phase, a preemption must NOT throw
+# away the partial training — _within_phase_resume_ckpt finds this phase's own
+# last.ckpt so trainer.fit resumes the full training state. These pin the
+# decision logic and the call-site wiring (fit gets the resume path AND the
+# cross-phase warm-start is skipped on resume — last.ckpt already carries it).
+
+
+def test_within_phase_resume_ckpt_none_when_no_artifact_root() -> None:
+    """Infra-less run (no exca uid_folder) → None → a normal cold start."""
+    from types import SimpleNamespace
+
+    stub = SimpleNamespace(_artifact_root=lambda: None)
+    assert Experiment._within_phase_resume_ckpt(stub) is None  # type: ignore[arg-type]
+
+
+def test_within_phase_resume_ckpt_none_when_no_last_ckpt(tmp_path) -> None:
+    """A fresh phase (artifact root exists, no checkpoint written yet) → None, so
+    the cross-phase pretrained_ckpt warm-start applies as usual."""
+    from types import SimpleNamespace
+
+    (tmp_path / "checkpoints").mkdir()
+    stub = SimpleNamespace(_artifact_root=lambda: tmp_path)
+    assert Experiment._within_phase_resume_ckpt(stub) is None  # type: ignore[arg-type]
+
+
+def test_within_phase_resume_ckpt_returns_last_when_present(tmp_path) -> None:
+    """A prior same-UID run was preempted mid-fit → last.ckpt exists under this
+    phase's checkpoints dir → return its path so fit resumes from it."""
+    from types import SimpleNamespace
+
+    ckpt_dir = tmp_path / "checkpoints"
+    ckpt_dir.mkdir()
+    last = ckpt_dir / "last.ckpt"
+    last.write_bytes(b"x")
+    stub = SimpleNamespace(_artifact_root=lambda: tmp_path)
+    assert Experiment._within_phase_resume_ckpt(stub) == str(last)  # type: ignore[arg-type]
+
+
+class _FakeTrainer:
+    is_global_zero = True
+
+    def __init__(self, rec: dict) -> None:
+        self._rec = rec
+
+    def fit(self, module, train, val, ckpt_path=None):  # noqa: D401
+        self._rec["fit_ckpt_path"] = ckpt_path
+
+    def test(self, module, test, ckpt_path=None):  # noqa: D401
+        return [{"test_loss": 0.0}]
+
+
+def _resume_wiring_stub(rec: dict, *, resume: str | None, pretrained: str | None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        seed=0,
+        test_only=False,
+        pretrained_ckpt=pretrained,
+        snapshot_ckpt_to=None,
+        data=SimpleNamespace(
+            build=lambda worker_seed: {"train": "TR", "val": "VA", "test": "TE"},
+        ),
+        _assert_no_pretrain_leakage=lambda loaders: None,
+        _build_brain_module=lambda train: "BM",
+        _within_phase_resume_ckpt=lambda: resume,
+        _load_pretrained=lambda module, ckpt: rec.__setitem__(
+            "warm_start", (module, ckpt)
+        ),
+        _trainer=lambda: _FakeTrainer(rec),
+        _test_ckpt_path=lambda trainer: None,
+    )
+
+
+def test_train_and_test_resumes_fit_from_last_ckpt_and_skips_warmstart() -> None:
+    """On resume (this phase's last.ckpt present) trainer.fit receives that path,
+    and the cross-phase pretrained_ckpt warm-start is SKIPPED — last.ckpt already
+    holds the (warm-started, then partially-trained) full state, so re-seeding the
+    encoder would be wasted and could mask a resume bug."""
+    rec: dict = {}
+    resume_path = "/work/run/phase_0/checkpoints/last.ckpt"
+    stub = _resume_wiring_stub(rec, resume=resume_path, pretrained="/work/prev.ckpt")
+    Experiment._train_and_test(stub)  # type: ignore[arg-type]
+    assert rec["fit_ckpt_path"] == resume_path
+    assert "warm_start" not in rec, "warm-start must be skipped on resume"
+
+
+def test_train_and_test_cold_start_warmstarts_and_passes_no_ckpt() -> None:
+    """Fresh phase (no last.ckpt) with a prior-phase pretrained_ckpt: fit gets
+    ckpt_path=None (cold start) AND the encoder warm-start IS applied — the
+    cross-phase handoff still works when there is nothing to resume."""
+    rec: dict = {}
+    stub = _resume_wiring_stub(rec, resume=None, pretrained="/work/prev.ckpt")
+    Experiment._train_and_test(stub)  # type: ignore[arg-type]
+    assert rec["fit_ckpt_path"] is None
+    assert rec["warm_start"] == ("BM", "/work/prev.ckpt")
