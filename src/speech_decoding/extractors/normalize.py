@@ -154,6 +154,27 @@ class SessionRobustZNormalizer:
         self.sigma: tp.Optional[torch.Tensor] = None
         self._valid_bin_mask: tp.Optional[torch.Tensor] = None
 
+    @classmethod
+    def from_stats(
+        cls,
+        *,
+        median: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_floor: float = 1e-6,
+        valid_bin_mask: tp.Optional[torch.Tensor] = None,
+    ) -> "SessionRobustZNormalizer":
+        """Rebuild a fitted normalizer from already-computed ``median``/``sigma``
+        (e.g. loaded from a stats cache) — skips refitting over the frames. The
+        stats are a deterministic function of the frames + reduce axis, so a
+        ``from_stats`` normalizer is identical to a ``fit`` one. ``sigma_floor``
+        is applied at ``transform`` (not baked into ``sigma``), so it may differ
+        from the floor used when the stats were originally fit."""
+        obj = cls(sigma_floor=sigma_floor)
+        obj.median = median
+        obj.sigma = sigma
+        obj._valid_bin_mask = valid_bin_mask
+        return obj
+
     def fit(
         self,
         frames: torch.Tensor,

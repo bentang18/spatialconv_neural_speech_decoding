@@ -1129,6 +1129,109 @@ def test_spec_cache_hit_reuses_disk_and_matches_robust_z(tmp_path, monkeypatch) 
     )
 
 
+def test_robust_z_from_stats_matches_fit() -> None:
+    """``from_stats`` rebuilds a normalizer that transforms IDENTICALLY to one
+    produced by ``fit`` — the guarantee that lets the stats sidecar replace the
+    refit. Stats are a deterministic function of the frames, so the round-trip is
+    bit-exact (rtol=atol=0), independent of the (transform-time) sigma_floor."""
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+    rng = np.random.default_rng(3)
+    frames = torch.from_numpy(rng.standard_normal((4, 6, 200)).astype(np.float32))
+    fitted = SessionRobustZNormalizer(sigma_floor=1e-3).fit(frames)
+    rebuilt = SessionRobustZNormalizer.from_stats(
+        median=fitted.median.clone(), sigma=fitted.sigma.clone(), sigma_floor=1e-3,
+    )
+    probe = torch.from_numpy(rng.standard_normal((4, 6, 20)).astype(np.float32))
+    torch.testing.assert_close(
+        fitted.transform(probe), rebuilt.transform(probe), rtol=0, atol=0,
+    )
+
+
+def test_spec_cache_stats_sidecar_skips_reload_and_refit(tmp_path, monkeypatch) -> None:
+    """The robust-z stats sidecar (#80 warm-prepare speedup) lets a cache hit skip
+    BOTH the full-frame .npy reload and the median refit: a second view must
+    rebuild bit-identical stats from the ~200KB sidecar without ever calling
+    np.load on the frames .npy or fit()."""
+    from speech_decoding.extractors import view as view_mod
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+    view1 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
+    )
+    ch = ["e0", "e1", "e2"]
+    rng = np.random.default_rng(7)
+    n = 2048 * 30
+    rec = (rng.standard_normal((3, n)) * np.array([1.0, 4.0, 0.5])[:, None]).astype(np.float32)
+    event1, _ = _cache_view_harness(view1, rec, ch, monkeypatch)
+    view1.prepare([event1])
+
+    # The build wrote exactly one stats sidecar next to the frames.
+    assert len(list(tmp_path.rglob("*.stats.npz"))) == 1
+
+    view2 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
+    )
+    event2, _ = _cache_view_harness(view2, rec, ch, monkeypatch)
+
+    real_np_load = np.load
+    loaded: list[str] = []
+
+    def spy_load(path, *a, **k):
+        loaded.append(str(path))
+        return real_np_load(path, *a, **k)
+
+    def boom(self, *a, **k):
+        raise AssertionError("fit() must not run when the stats sidecar is present")
+
+    monkeypatch.setattr(view_mod.np, "load", spy_load)
+    monkeypatch.setattr(SessionRobustZNormalizer, "fit", boom)
+
+    view2.prepare([event2])
+
+    # Read the tiny sidecar, never the frames .npy.
+    assert any(p.endswith(".stats.npz") for p in loaded)
+    assert not any(p.endswith(".npy") for p in loaded)
+    # Stats bit-identical to the building view (sidecar == refit).
+    np.testing.assert_array_equal(
+        view1._session_stats["s"].median.numpy(),
+        view2._session_stats["s"].median.numpy(),
+    )
+    np.testing.assert_array_equal(
+        view1._session_stats["s"].sigma.numpy(),
+        view2._session_stats["s"].sigma.numpy(),
+    )
+
+
+def test_spec_cache_stats_sidecar_self_heals_legacy_cache(tmp_path, monkeypatch) -> None:
+    """A frames-only cache built before the sidecar existed must upgrade in place:
+    the first hit with no sidecar reloads + refits AND writes the sidecar, so the
+    NEXT hit skips both. Simulate the legacy state by deleting the sidecar after
+    the build."""
+    view1 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
+    )
+    ch = ["e0", "e1"]
+    rng = np.random.default_rng(9)
+    rec = rng.standard_normal((2, 2048 * 30)).astype(np.float32)
+    event1, _ = _cache_view_harness(view1, rec, ch, monkeypatch)
+    view1.prepare([event1])
+    next(tmp_path.rglob("*.stats.npz")).unlink()  # → legacy frames-only cache
+    assert list(tmp_path.rglob("*.stats.npz")) == []
+
+    view2 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
+    )
+    event2, _ = _cache_view_harness(view2, rec, ch, monkeypatch)
+    view2.prepare([event2])  # legacy hit: refit from frames + write sidecar
+
+    assert len(list(tmp_path.rglob("*.stats.npz"))) == 1
+    np.testing.assert_array_equal(
+        view1._session_stats["s"].sigma.numpy(),
+        view2._session_stats["s"].sigma.numpy(),
+    )
+
+
 def test_spec_cache_scatter_to_noncontiguous_global(monkeypatch) -> None:
     """``_scatter_spec_to_global`` places each session row at the global index
     ``_get_channels`` assigns (mirroring the base waveform scatter, neuro.py:453),

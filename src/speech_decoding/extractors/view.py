@@ -1350,6 +1350,46 @@ class MultiStftView(CARIeegExtractor):
                 "cache write — refusing to poison the cache."
             )
 
+    @staticmethod
+    def _write_stats_sidecar(
+        stats_path: Path, normalizer: SessionRobustZNormalizer,
+    ) -> None:
+        """Persist the fitted robust-z stats (per-(channel, freq) median + σ) next
+        to the frames cache. These are a deterministic function of the cached
+        frames, so caching them lets a warm hit skip BOTH the full-frame reload
+        and the median refit — the dominant warm-prepare cost. ~200 KB/session vs
+        the multi-GB frames. ``sigma_floor`` is NOT stored: it is applied at
+        ``transform`` (not baked into σ), so the reader rebuilds with the live
+        config's floor."""
+        assert normalizer.median is not None and normalizer.sigma is not None
+        median = normalizer.median.cpu().numpy()
+        sigma = normalizer.sigma.cpu().numpy()
+        MultiStftView._atomic_write(
+            stats_path,
+            lambda fh: np.savez(fh, median=median, sigma=sigma),
+        )
+
+    def _load_stats_sidecar(
+        self, stats_path: Path, meta: dict,
+    ) -> tp.Optional[SessionRobustZNormalizer]:
+        """Rebuild a normalizer from the stats sidecar, or return None (→ caller
+        refits) when the stored geometry disagrees with the frames meta — a stale
+        or corrupt sidecar must never silently scale features by the wrong stats."""
+        with np.load(stats_path) as z:
+            median = torch.from_numpy(z["median"])
+            sigma = torch.from_numpy(z["sigma"])
+        exp_c = int(meta.get("n_channels", -1))
+        exp_f = int(meta.get("f_bins", -1))
+        if tuple(median.shape[:2]) != (exp_c, exp_f) or tuple(
+            sigma.shape[:2]
+        ) != (exp_c, exp_f):
+            return None
+        return SessionRobustZNormalizer.from_stats(
+            median=median,
+            sigma=sigma,
+            sigma_floor=self.session_z_sigma_floor,
+        )
+
     def _build_spec_cache_and_fit(self, obj) -> None:
         """Materialize each session's seam-free whole-recording raw |STFT| to the
         fp32 memmap cache (skipping sessions already on disk → cross-job reuse)
@@ -1367,6 +1407,7 @@ class MultiStftView(CARIeegExtractor):
         seen: set[str] = set()
         n_hit = 0
         n_build = 0
+        n_stats_hit = 0
         build_secs = 0.0
         load_secs = 0.0
         fit_secs = 0.0
@@ -1378,7 +1419,9 @@ class MultiStftView(CARIeegExtractor):
             stem = self._spec_cache_stem(key)
             npy_path = cache_root / f"{stem}.npy"
             json_path = cache_root / f"{stem}.json"
+            stats_path = cache_root / f"{stem}.stats.npz"
             hit = npy_path.exists() and json_path.exists()
+            stats_cached = False
             if hit:
                 n_hit += 1
                 meta = json.loads(json_path.read_text())
@@ -1389,10 +1432,12 @@ class MultiStftView(CARIeegExtractor):
                 # geometry disagrees with the live config is a stale/corrupt spec —
                 # fail loud rather than slice mismatched features.
                 self._assert_cache_meta(key, meta, expected_f, ch_names)
-                # Only pay the full read when the stats fit needs the frames; the
-                # median fit needs the whole recording in RAM anyway, so load it
-                # fully (writable) rather than via a read-only memmap.
-                if self.session_robust_z:
+                # With a robust-z stats sidecar present we can skip the full-frame
+                # reload entirely — the stats are all prepare() needs (per-clip
+                # reads memmap-slice the .npy lazily at train time). Only reload the
+                # frames when we must (re)fit: no robust-z, or no sidecar yet.
+                stats_cached = self.session_robust_z and stats_path.exists()
+                if self.session_robust_z and not stats_cached:
                     _tl = time.perf_counter()
                     frames = torch.from_numpy(np.load(npy_path))
                     load_secs += time.perf_counter() - _tl
@@ -1448,12 +1493,28 @@ class MultiStftView(CARIeegExtractor):
                     "ceiling both assume a single rate. Resample upstream."
                 )
             if self.session_robust_z:
-                assert frames is not None
-                _tf = time.perf_counter()
-                normalizer = SessionRobustZNormalizer(
-                    sigma_floor=self.session_z_sigma_floor,
-                ).fit(frames.float())
-                fit_secs += time.perf_counter() - _tf
+                normalizer = None
+                if stats_cached:
+                    normalizer = self._load_stats_sidecar(stats_path, meta)
+                    if normalizer is not None:
+                        n_stats_hit += 1
+                if normalizer is None:
+                    # No usable sidecar (fresh build, legacy frames-only cache, or a
+                    # geometry-mismatched sidecar): fit from frames. If the sidecar
+                    # was present-but-invalid we skipped the frame load above, so
+                    # pull them now before fitting.
+                    if frames is None:
+                        _tl = time.perf_counter()
+                        frames = torch.from_numpy(np.load(npy_path))
+                        load_secs += time.perf_counter() - _tl
+                    _tf = time.perf_counter()
+                    normalizer = SessionRobustZNormalizer(
+                        sigma_floor=self.session_z_sigma_floor,
+                    ).fit(frames.float())
+                    fit_secs += time.perf_counter() - _tf
+                    # Self-healing: write the sidecar so the NEXT prepare skips the
+                    # reload + refit. Existing frames-only caches upgrade in place.
+                    self._write_stats_sidecar(stats_path, normalizer)
                 self._scatter_stats_to_global(normalizer, ch_names)
                 self._session_stats[key] = normalizer
             self._spec_cache_index[key] = _SpecCacheEntry(
@@ -1464,12 +1525,13 @@ class MultiStftView(CARIeegExtractor):
             )
             del frames
         logger.warning(
-            "spec cache (#80): %d/%d sessions hit, %d built "
-            "(%.1fs whole-movie |STFT| build tax; %.1fs npy load + %.1fs "
-            "robust-z fit on hits) -> %s",
+            "spec cache (#80): %d/%d sessions hit, %d built, %d robust-z stats "
+            "from sidecar (%.1fs whole-movie |STFT| build tax; %.1fs npy load + "
+            "%.1fs robust-z fit on stats-cold sessions) -> %s",
             n_hit,
             n_hit + n_build,
             n_build,
+            n_stats_hit,
             build_secs,
             load_secs,
             fit_secs,
