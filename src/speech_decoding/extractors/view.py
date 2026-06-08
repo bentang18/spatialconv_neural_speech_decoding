@@ -1458,7 +1458,7 @@ class MultiStftView(CARIeegExtractor):
                 sample_rate=sample_rate,
             )
             del frames
-        logger.info(
+        logger.warning(
             "spec cache (#80): %d/%d sessions hit, %d built "
             "(%.1fs whole-movie |STFT| build tax) -> %s",
             n_hit,
