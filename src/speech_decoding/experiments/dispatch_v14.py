@@ -422,9 +422,16 @@ def build_v14_experiment(
     bt_root: str | None = None,
     mode: tp.Literal["nano", "lite", "full"] = "lite",
     task: str = DEFAULT_TASK,
-    eval_mode: tp.Literal["CrossSession", "CrossSubject"] = DEFAULT_EVAL_MODE,
+    eval_mode: tp.Literal[
+        "WithinSession", "CrossSession", "CrossSubject"
+    ] = DEFAULT_EVAL_MODE,
     test_subject_id: int = DEFAULT_TEST_SUBJECT_ID,
     test_trial_id: int = DEFAULT_TEST_TRIAL_ID,
+    # WithinSession only: which KFold fold (0..n_folds-1, n_folds=2 for Lite)
+    # this P4 eval cell scores. Forwarded to BTWordEvents.fold_index; ignored
+    # for CrossSession/CrossSubject/Pretrain. Default 0 is the BTWordEvents
+    # default, so the exca cache uid is unchanged for the non-WithinSession path.
+    fold_index: int = 0,
     # Leakage decouple (#82): per-legal-session monitoring tail held out for the
     # SSL/distill "Pretrain" split (val AND test). Applies only on the SSL
     # phases (joint_phase / p3_distill), where the corpus is overridden to
@@ -1042,6 +1049,7 @@ def build_v14_experiment(
         nano=(budget_mode == "nano"),
         balance=(not ssl_phase),
         eval_mode=chain_eval_mode,
+        fold_index=fold_index,
         test_subject_id=test_subject_id,
         test_trial_id=test_trial_id,
         bt_root=bt_root,
@@ -1432,12 +1440,18 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=("nano", "lite", "full"), default="full")
     p.add_argument("--task", default=DEFAULT_TASK,
                    help="Neuroprobe task name (event field for the target).")
-    p.add_argument("--eval-mode", choices=("CrossSession", "CrossSubject"),
+    p.add_argument("--eval-mode",
+                   choices=("WithinSession", "CrossSession", "CrossSubject"),
                    default=DEFAULT_EVAL_MODE,
-                   help="Split policy (CrossSession = submission gate, "
+                   help="Split policy (WithinSession = KFold within one trial, "
+                        "CrossSession = submission gate, "
                         "CrossSubject = scientific generalization).")
     p.add_argument("--test-subject-id", type=int, default=DEFAULT_TEST_SUBJECT_ID)
     p.add_argument("--test-trial-id", type=int, default=DEFAULT_TEST_TRIAL_ID)
+    p.add_argument("--fold-index", dest="fold_index", type=int, default=0,
+                   help="WithinSession only: which KFold fold (0 or 1 for Lite) "
+                        "this P4 eval cell scores. Ignored for CrossSession/"
+                        "CrossSubject.")
     p.add_argument(
         "--pretrain-holdout-fraction", dest="pretrain_holdout_fraction",
         type=float, default=DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
@@ -2834,6 +2848,7 @@ def main(argv: list[str] | None = None) -> int:
         channel_stats_path=args.channel_stats_path,
         target_standardize=args.target_standardize,
         phase4_frozen_probe=phase4_frozen_probe,
+        fold_index=args.fold_index,
         pretrained_ckpt=args.resume_from,
         snapshot_ckpt_to=args.snapshot_ckpt_to,
         jepa_phase=args.jepa_phase,

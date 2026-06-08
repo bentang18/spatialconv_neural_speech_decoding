@@ -152,6 +152,43 @@ def test_p4_study_universe_is_bt_lite_for_all_cli_modes(tmp_path) -> None:
         assert emitted == expected, f"P4 universe wrong for --mode {cli_mode}"
 
 
+def _p4_word_events(tmp_path, **kw):
+    """Build a P4 frozen-probe experiment and return its BTWordEvents step."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", phase4_frozen_probe=True, **kw
+    )
+    return xp.data.study.steps[1]
+
+
+def test_build_threads_within_session_fold_index(tmp_path) -> None:
+    # The P4 full-eval submitter scores WithinSession by KFold fold; build_v14_experiment
+    # must forward eval_mode + fold_index to BTWordEvents (the only WithinSession
+    # plumbing gap — eval_mode already flows through _resolve_corpus_mode).
+    we0 = _p4_word_events(
+        tmp_path, eval_mode="WithinSession", test_subject_id=3, test_trial_id=0,
+        fold_index=0,
+    )
+    we1 = _p4_word_events(
+        tmp_path, eval_mode="WithinSession", test_subject_id=3, test_trial_id=0,
+        fold_index=1,
+    )
+    assert we0.eval_mode == "WithinSession" and we0.fold_index == 0
+    assert we1.eval_mode == "WithinSession" and we1.fold_index == 1
+    # Distinct folds must be distinct exca cells (different serialized config).
+    assert we0.model_dump() != we1.model_dump()
+
+
+def test_build_fold_index_default_is_uid_transparent(tmp_path) -> None:
+    # Default fold_index=0 is the BTWordEvents default, so a CrossSession build is
+    # byte-identical to one that never knew about fold_index (cache uid unchanged).
+    we = _p4_word_events(
+        tmp_path, eval_mode="CrossSession", test_subject_id=2, test_trial_id=4,
+    )
+    assert we.fold_index == 0
+
+
 def test_phase_2_raises_with_blocker_ids() -> None:
     """Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
     phase by B29 Item 1; it stays gated at the dispatch level with the
