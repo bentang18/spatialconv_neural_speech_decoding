@@ -206,19 +206,38 @@ def _our_electrode_labels(test_subject_id: int) -> list[str] | None:
         return None
 
 
-def _compare(label: str, ours: list, theirs: list) -> list[str]:
-    """Return a list of human-readable mismatch lines (empty == exact match)."""
+def _compare(label: str, ours: list, theirs: list) -> tuple[list[str], bool]:
+    """Compare one split's clip list against upstream.
+
+    The Neuroprobe parity contract is **per-split clip-set + label identity**:
+    the leaderboard metric is computed over the whole split, the model is
+    order-agnostic at eval, and train is shuffled by the DataLoader — so the
+    load-bearing invariant is *which* (window_from, window_to, label) clips land
+    in each split, NOT their order. We assign splits over the interleaved frame
+    (matching upstream's KFold/slice boundary) and the chain re-sorts rows by
+    neural time downstream, so a clean run is set-identical but order-different.
+    Multiset equality still catches a real interleave/cut bug: a wrong boundary
+    surfaces as differing *members*, not just order.
+
+    Returns (mismatch_lines, ordered_match). ``mismatch_lines`` empty == set parity.
+    """
+    from collections import Counter
+
     errs: list[str] = []
-    if len(ours) != len(theirs):
-        errs.append(f"{label}: COUNT ours={len(ours)} upstream={len(theirs)}")
-        return errs  # length mismatch — element diff would be noise
-    for i, (a, b) in enumerate(zip(ours, theirs)):
-        if a != b:
-            errs.append(f"{label}: item {i} ours={a} upstream={b}")
-            if len(errs) >= 6:
-                errs.append(f"{label}: … (further diffs suppressed)")
-                break
-    return errs
+    co, ct = Counter(ours), Counter(theirs)
+    if co != ct:
+        if len(ours) != len(theirs):
+            errs.append(f"{label}: COUNT ours={len(ours)} upstream={len(theirs)}")
+        only_ours = sorted(co - ct)[:5]
+        only_up = sorted(ct - co)[:5]
+        errs.append(
+            f"{label}: SET mismatch n_ours_only={sum((co - ct).values())} "
+            f"n_up_only={sum((ct - co).values())} "
+            f"ours_only={only_ours} up_only={only_up}"
+        )
+        return errs, False
+    ordered_match = list(ours) == list(theirs)
+    return errs, ordered_match
 
 
 def main() -> int:
@@ -273,6 +292,7 @@ def main() -> int:
                     tag = (f"{eval_mode} S{subj}T{trial}"
                            f"{f' fold{fold}' if n_folds > 1 else ''} {task}")
                     our_windows = None
+                    order_diffs: list[str] = []
                     try:
                         up_windows, up_elabels = _upstream_split_windows(
                             eval_mode=eval_mode, task=task,
@@ -288,10 +308,13 @@ def main() -> int:
                         )
                         cell_errs: list[str] = []
                         for split in ("train", "val", "test"):
-                            cell_errs += _compare(
+                            split_errs, ordered = _compare(
                                 f"{tag} [{split}]",
                                 our_windows[split], up_windows[split],
                             )
+                            cell_errs += split_errs
+                            if not split_errs and not ordered:
+                                order_diffs.append(split)
                         if args.check_electrodes:
                             ours_e = _our_electrode_labels(subj)
                             if ours_e is None:
@@ -317,6 +340,8 @@ def main() -> int:
                         n_pass += 1
                         note = " (electrodes PENDING)" if any(
                             "PENDING" in e for e in cell_errs) else ""
+                        if order_diffs:
+                            note += f" (set-parity; order-only diff in {','.join(order_diffs)})"
                         counts = (
                             "/".join(str(len(our_windows[s]))
                                      for s in ("train", "val", "test"))
