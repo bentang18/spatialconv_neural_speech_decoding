@@ -547,6 +547,17 @@ def build_v14_experiment(
     # ``EXCA_EXTRACTOR_CACHE_FOLDER`` if unset; ``None`` means no caching
     # (laptop dry-runs / tests).
     extractor_cache_folder: str | None = None,
+    # #80 whole-movie raw-|STFT| feature cache. Default ON (derived from
+    # ``extractor_cache_folder`` below) so the ~9-min-per-run session_robust_z
+    # whole-movie STFT over the 13-session pretrain corpus is paid ONCE and every
+    # later same-front-end-config run memmap-slices it instead of recomputing.
+    # Location-only knob (excluded from the extractor cache uid), so arming it is
+    # identity-transparent: same run uid, byte-identical features (parity-tested).
+    # ``disable_spec_cache=True`` forces the per-run recompute. Only armed on the
+    # default raw MultiStftView path (a custom electrode_tokens_extractor sets its
+    # own spec_cache_dir).
+    spec_cache_dir: str | None = None,
+    disable_spec_cache: bool = False,
     cluster: str | None = None,
     # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
     # they only override exca's TaskInfra / submitit defaults when set.
@@ -863,6 +874,17 @@ def build_v14_experiment(
     extractor_cache_folder = extractor_cache_folder or os.environ.get(
         "EXCA_EXTRACTOR_CACHE_FOLDER"
     )
+    # #80 whole-movie raw-|STFT| cache root. Default ON: when an extractor-cache
+    # root exists (DCC) and the caller hasn't overridden, derive a sibling
+    # ``v14_spec_cache`` dir so the per-run session_robust_z whole-movie STFT is
+    # materialized to an fp16 memmap ONCE and every later same-front-end-config run
+    # slices it (no 9-min recompute). OFF on laptop/tests (no cache root) and when
+    # ``disable_spec_cache``. Armed only on the default raw MultiStftView built
+    # below; a custom electrode_tokens_extractor manages its own spec_cache_dir.
+    if disable_spec_cache:
+        spec_cache_dir = None
+    elif spec_cache_dir is None and extractor_cache_folder is not None:
+        spec_cache_dir = str(Path(extractor_cache_folder) / "v14_spec_cache")
 
     if electrode_tokens_extractor is None:
         # WS-C / C2 (B36) + FE-RAW-1 (2026-06-04): Multi-STFT front-end, RAW
@@ -881,6 +903,7 @@ def build_v14_experiment(
             channel_order="original",
             c_max=c_max,
             session_robust_z=session_robust_z,
+            spec_cache_dir=spec_cache_dir,
         )
         # #17: only attach the lof_* kwargs when LOF is ON. Off → none of them are
         # forwarded, so the view keeps its field defaults and the multi-TB STFT
@@ -1711,6 +1734,19 @@ def _parser() -> argparse.ArgumentParser:
                         "Locally pass --extractor-cache-folder /tmp/v14_cache "
                         "to reproduce the behavior, or leave unset for no "
                         "caching.")
+    p.add_argument("--spec-cache-dir", default=None,
+                   help="Whole-movie raw-|STFT| feature cache root (#80). "
+                        "Default {extractor-cache-folder}/v14_spec_cache when an "
+                        "extractor cache root is set, so the ~9-min-per-run "
+                        "session_robust_z whole-movie STFT over the 13-session "
+                        "pretrain corpus is paid ONCE and every later same-front-"
+                        "end-config run memmap-slices it. Location-only knob "
+                        "(excluded from the cache uid; features byte-identical to "
+                        "the recompute path). Pass a path to override the location.")
+    p.add_argument("--no-spec-cache", dest="no_spec_cache", action="store_true",
+                   help="Disable the #80 whole-movie |STFT| cache (forces the "
+                        "per-run recompute of the session_robust_z whole-movie "
+                        "STFT). Default OFF (cache armed when a cache root exists).")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
@@ -2201,6 +2237,10 @@ def _common_build_kwargs(
         requeue=args.slurm_requeue,
         precision=args.precision,
         extractor_cache_folder=args.extractor_cache_folder,
+        # #80 whole-movie |STFT| cache (default ON; build derives the path from the
+        # extractor cache root). Reaches every phase via this one dict.
+        spec_cache_dir=args.spec_cache_dir,
+        disable_spec_cache=args.no_spec_cache,
         dkoleo_mode=args.dkoleo_mode,
         cross_attn_positions=cross_attn_positions,
         mains_notch_hz=args.mains_notch_hz,
@@ -2616,6 +2656,16 @@ def main(argv: list[str] | None = None) -> int:
         "EXCA_EXTRACTOR_CACHE_FOLDER"
     )
     print(f"  extractor_cache_folder={_resolved_xc!r}")
+    _resolved_spec = (
+        None
+        if args.no_spec_cache
+        else (
+            args.spec_cache_dir
+            or (f"{_resolved_xc}/v14_spec_cache" if _resolved_xc else None)
+        )
+    )
+    print(f"  spec_cache_dir={_resolved_spec!r} (#80 whole-movie |STFT| cache; "
+          f"paid once, then memmap-sliced)")
 
     cross_attn_positions: list[int] | None = None
     if args.cross_attn_positions is not None:

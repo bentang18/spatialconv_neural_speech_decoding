@@ -844,13 +844,18 @@ class MultiStftView(CARIeegExtractor):
         return self
 
     def _exclude_from_cache_uid(self) -> list[str]:
-        # ``lof_report_path`` is an OUTPUT-LOCATION knob, not data-determining: two
-        # runs writing the report to different paths must hit the SAME multi-TB
-        # STFT cache. The other ``lof_*`` fields DO determine which channels get
-        # dropped, so they stay in the uid. (Default-OFF ``lof_bad_channels`` is
-        # excluded by exclude_defaults, so for the maiden run none of this perturbs
-        # the existing cache uid at all.)
-        return super()._exclude_from_cache_uid() + ["lof_report_path"]
+        # ``lof_report_path`` and ``spec_cache_dir`` are OUTPUT / FEATURE-CACHE
+        # LOCATION knobs, not data-determining: two runs pointing them at different
+        # paths must hit the SAME multi-TB STFT cache AND produce the SAME run uid.
+        # ``lof_report_path`` is where the LOF drop counts are written;
+        # ``spec_cache_dir`` (#80) is where the whole-movie raw-|STFT| memmap lives
+        # — the per-clip features it slices are byte-identical to the recompute path
+        # (parity-tested), so arming the cache is identity-transparent (same uid,
+        # just skips the per-run whole-movie recompute). The other ``lof_*`` fields
+        # DO determine which channels get dropped, so they stay in the uid.
+        # (Default-OFF ``lof_bad_channels`` / default-None ``spec_cache_dir`` are
+        # excluded by exclude_defaults, so an un-armed run perturbs nothing.)
+        return super()._exclude_from_cache_uid() + ["lof_report_path", "spec_cache_dir"]
 
     def n_time_bins_for_duration(self, duration_s: float) -> int:
         """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where

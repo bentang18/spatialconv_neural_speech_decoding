@@ -1151,6 +1151,19 @@ def test_spec_cache_scatter_to_noncontiguous_global(monkeypatch) -> None:
     assert torch.all(out[pad_rows] == 0)
 
 
+def test_spec_cache_dir_excluded_from_cache_uid() -> None:
+    """#80: ``spec_cache_dir`` is a feature-cache LOCATION knob, not data-
+    determining. Like ``lof_report_path`` it MUST be excluded from the extractor
+    cache uid so arming the whole-movie |STFT| cache is identity-transparent — the
+    run keeps the SAME uid and the per-clip features it slices are byte-identical
+    to the recompute path. Two views differing ONLY in spec_cache_dir must share
+    one uid; the STFT/preproc knobs stay in it."""
+    bare = _make_multi_stft_view()
+    armed = _make_multi_stft_view(spec_cache_dir="/work/whatever/v14_spec_cache")
+    assert "spec_cache_dir" in armed._exclude_from_cache_uid()
+    assert armed.infra.uid() == bare.infra.uid()
+
+
 def test_spec_cache_stem_is_filesystem_safe(tmp_path, monkeypatch) -> None:
     """A session uid containing path separators (joint D-cohort/SWEC) or JSON
     metacharacters (BT) must NOT be used verbatim as a filename: it would escape
