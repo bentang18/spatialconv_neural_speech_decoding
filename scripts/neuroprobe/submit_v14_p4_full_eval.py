@@ -156,6 +156,13 @@ def build_cell_experiment(*, cell: dict[str, tp.Any], args: argparse.Namespace,
         seed=args.seed,
         exca_folder=str(base_folder / EXP_NAME),
         cluster=args.cluster,
+        # P4 is a frozen-encoder CPU probe (no GPU requested), so it leaves the
+        # coganlab-gpu cards free for nano intuition runs. The frozen encoder
+        # forward still runs each step, so it needs real RAM — the submitit 2 GB
+        # default OOM-thrashes. Route to the 'common' CPU partition.
+        mem_gb=args.mem_gb,
+        cpus_per_task=args.cpus_per_task,
+        slurm_partition=args.slurm_partition,
     )
 
 
@@ -181,6 +188,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="Build all per-cell Experiments + print the matrix; do not submit.")
     p.add_argument("--max-workers", type=int, default=64,
                    help="Slurm array parallelism cap (job_array max_workers).")
+    p.add_argument("--mem-gb", dest="mem_gb", type=float, default=16.0,
+                   help="Per-cell RAM. Frozen-encoder forward + 169 MB ckpt OOMs "
+                        "at the submitit 2 GB default; 16 GB is the safe floor.")
+    p.add_argument("--cpus-per-task", dest="cpus_per_task", type=int, default=2,
+                   help="Per-cell CPUs (CPU-only probe).")
+    p.add_argument("--slurm-partition", dest="slurm_partition", default="common",
+                   help="Slurm partition. Default 'common' (CPU) keeps P4 off the "
+                        "GPU nodes so coganlab-gpu stays free for nano runs.")
     p.add_argument("--bt-root", default=None)
     p.add_argument("--exca-folder", default=None,
                    help="Base cache folder. Falls back to $EXCA_CACHE_FOLDER. On "
