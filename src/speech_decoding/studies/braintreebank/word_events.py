@@ -57,11 +57,17 @@ from speech_decoding.studies.braintreebank.manifest import V14_PRETRAIN_SESSIONS
 # monitoring (val/test). It carries NO Neuroprobe eval session, so the SSL
 # corpus is fully decoupled from the leaderboard eval split. The supervised P4
 # probe keeps CrossSession/CrossSubject; routed per-phase by dispatch_v14.
-EvalMode = tp.Literal["CrossSession", "CrossSubject", "Pretrain"]
+EvalMode = tp.Literal["WithinSession", "CrossSession", "CrossSubject", "Pretrain"]
 
 
 _UPSTREAM_TRAIN_SUBJECT_ID = 2
 _UPSTREAM_TRAIN_TRIAL_ID = 4
+
+# Mirrors neuroprobe.config.NEUROPROBE_LITE_N_FOLDS (== NEUROPROBE_NANO_N_FOLDS
+# == 2). WithinSession runs KFold(n_splits=_LITE_N_FOLDS, shuffle=False) over
+# each task's interleaved item order, exactly as upstream
+# generate_splits_within_session.
+_LITE_N_FOLDS = 2
 
 # Default fraction of each legal session's clips held out for SSL pretext-loss
 # monitoring — applied to val AND to test (so ~2× this is held out per session,
@@ -252,6 +258,59 @@ def _word_event_rows(
     return out.reset_index(drop=True)
 
 
+def _assign_within_session_split(
+    df: pd.DataFrame,
+    *,
+    test_subject_id: int,
+    test_trial_id: int,
+    fold_index: int,
+    n_folds: int = _LITE_N_FOLDS,
+) -> pd.DataFrame:
+    """Single-trial K-fold split, emitting ONE fold (``fold_index``).
+
+    Mirrors upstream ``generate_splits_within_session`` exactly: for each task's
+    interleaved item order on (``test_subject_id``, ``test_trial_id``), run
+    ``KFold(n_splits=n_folds, shuffle=False)`` (the same call upstream makes; the
+    shuffle=False contiguity is what avoids correlated train/test). The selected
+    fold's held-out indices are then halved — first half → ``val``, second half →
+    ``test`` — and the complementary fold indices become ``train``. Dispatch runs
+    one cell per fold; the collector means metrics over folds. Other subjects /
+    trials are dropped (``_timeline_is_used`` already restricts to the one
+    timeline, but we re-mask here for safety).
+    """
+    from sklearn.model_selection import KFold
+
+    if not 0 <= fold_index < n_folds:
+        raise ValueError(
+            f"within_session fold_index must be in [0, {n_folds}); got {fold_index}"
+        )
+    if df.empty:
+        df = df.copy()
+        df["split"] = pd.Series(dtype=str)
+        return df
+    out = df.copy()
+    out["split"] = ""
+    s = out["subject_id"].astype(int)
+    t = out["trial_id"].astype(int)
+    is_test_st = (s == test_subject_id) & (t == test_trial_id)
+    for task in out.loc[is_test_st, "task"].unique():
+        sub_idx = out.index[is_test_st & (out["task"] == task)]
+        n = len(sub_idx)
+        if n < n_folds:
+            continue  # too few items to form the requested folds (upstream skips)
+        kf = KFold(n_splits=n_folds, shuffle=False)
+        train_pos, test_pos = list(kf.split(range(n)))[fold_index]
+        if len(train_pos) == 0 or len(test_pos) == 0:
+            continue  # upstream `continue`s on empty folds
+        val_size = len(test_pos) // 2
+        val_pos = test_pos[:val_size]
+        test_only_pos = test_pos[val_size:]
+        out.loc[sub_idx[train_pos], "split"] = "train"
+        out.loc[sub_idx[val_pos], "split"] = "val"
+        out.loc[sub_idx[test_only_pos], "split"] = "test"
+    return out.loc[out["split"] != ""].reset_index(drop=True)
+
+
 def _assign_cross_session_split(
     df: pd.DataFrame,
     *,
@@ -394,6 +453,9 @@ class BTWordEvents(EventsTransform):
     # ~96-99% movie coverage instead of the minority-class-bottlenecked subset.
     balance: bool = True
     eval_mode: EvalMode = "CrossSession"
+    # WithinSession only: which KFold fold (0..n_folds-1) this cell emits.
+    # Ignored for CrossSession/CrossSubject/Pretrain.
+    fold_index: int = 0
     test_subject_id: int = _UPSTREAM_TRAIN_SUBJECT_ID
     test_trial_id: int = _UPSTREAM_TRAIN_TRIAL_ID
     train_subject_id: int = _UPSTREAM_TRAIN_SUBJECT_ID
@@ -469,7 +531,14 @@ class BTWordEvents(EventsTransform):
             )
         words = pd.concat(all_word_rows, ignore_index=True)
 
-        if self.eval_mode == "CrossSession":
+        if self.eval_mode == "WithinSession":
+            words = _assign_within_session_split(
+                words,
+                test_subject_id=self.test_subject_id,
+                test_trial_id=self.test_trial_id,
+                fold_index=self.fold_index,
+            )
+        elif self.eval_mode == "CrossSession":
             words = _assign_cross_session_split(
                 words,
                 test_subject_id=self.test_subject_id,
@@ -480,7 +549,7 @@ class BTWordEvents(EventsTransform):
                 words,
                 holdout_fraction=self.pretrain_holdout_fraction,
             )
-        else:  # CrossSubject
+        elif self.eval_mode == "CrossSubject":
             words = _assign_cross_subject_split(
                 words,
                 test_subject_id=self.test_subject_id,
@@ -488,6 +557,8 @@ class BTWordEvents(EventsTransform):
                 train_subject_id=self.train_subject_id,
                 train_trial_id=self.train_trial_id,
             )
+        else:  # pragma: no cover - guarded by the EvalMode Literal
+            raise ValueError(f"BTWordEvents: unknown eval_mode {self.eval_mode!r}")
         return pd.concat([events, words], ignore_index=True)
 
     def _timeline_is_used(self, subject_id: int, trial_id: int) -> bool:
@@ -497,6 +568,9 @@ class BTWordEvents(EventsTransform):
             # mode="pretrain" already restricts the corpus; this is the second
             # gate before the runtime leakage guard.
             return (subject_id, trial_id) in _PRETRAIN_SESSION_SET
+        if self.eval_mode == "WithinSession":
+            return (subject_id == self.test_subject_id and
+                    trial_id == self.test_trial_id)
         if self.eval_mode == "CrossSession":
             return subject_id == self.test_subject_id
         is_train = (subject_id == self.train_subject_id and
