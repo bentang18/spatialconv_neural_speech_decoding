@@ -1065,7 +1065,6 @@ def test_spec_cache_clip_matches_whole_movie_slice(tmp_path, monkeypatch) -> Non
     assert view._get_channels(ch) == [0, 1, 2, 3]
 
     whole = view._spec_from_waveform(torch.from_numpy(rec), 2048).numpy()
-    whole_fp16 = whole.astype(np.float16).astype(np.float32)  # cache stores fp16
     total = whole.shape[-1]
     hop = view.hop_length
 
@@ -1075,19 +1074,20 @@ def test_spec_cache_clip_matches_whole_movie_slice(tmp_path, monkeypatch) -> Non
         s0 = int(round(start * 2048.0))
         g0 = int(round(s0 / hop))
         g0 = max(0, min(g0, max(0, total - n_frames)))
-        expected = whole_fp16[:, :, g0 : g0 + n_frames]
+        expected = whole[:, :, g0 : g0 + n_frames]
         assert out.data.shape == expected.shape == (4, view._spec_from_waveform(
             torch.from_numpy(rec[:, :2048]), 2048).shape[1], n_frames)
-        # Both sides are the SAME fp16 values (chunked == un-chunked pre-cast),
-        # so this is near-exact; a wrong slice / channel / off-by-one frame moves
-        # values by >> fp16 quantization and is caught.
-        np.testing.assert_allclose(out.data, expected, rtol=2e-3, atol=1e-2)
+        # The fp32 cache stores |STFT| verbatim, so the only gap vs this
+        # un-chunked reference is the seam-free chunked build (chunked ==
+        # un-chunked to f32 round-off); a wrong slice / channel / off-by-one
+        # frame moves values far beyond that and is caught.
+        np.testing.assert_allclose(out.data, expected, rtol=1e-4, atol=1e-3)
 
 
 def test_spec_cache_hit_reuses_disk_and_matches_robust_z(tmp_path, monkeypatch) -> None:
     """Cross-job reuse: a second view with the same config + cache dir must HIT
     the on-disk spec (no waveform read, file not rewritten) AND fit robust-z stats
-    bit-identical to the building view — because both fit on the fp16-cast frames
+    bit-identical to the building view — because both fit on the fp32 frames
     that actually live on disk."""
     view1 = _make_multi_stft_view(
         spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
@@ -1198,9 +1198,10 @@ def test_spec_cache_stem_is_filesystem_safe(tmp_path, monkeypatch) -> None:
     assert out.data.shape[0] == 2
 
 
-def test_spec_cache_rejects_fp16_overflow(tmp_path, monkeypatch) -> None:
-    """A whole-movie spec that exceeds the fp16 range must fail loud at build,
-    not silently store inf where the f32 recompute path stays finite."""
+def test_spec_cache_stores_large_finite_fp32(tmp_path, monkeypatch) -> None:
+    """The fp32 cache stores |STFT| magnitudes beyond the old fp16 range (65504)
+    verbatim — FE-RAW-1 raw magnitudes routinely exceed it (~117k on btbank1) —
+    so a large but finite spec must round-trip exactly, not overflow to inf."""
     view = _make_multi_stft_view(
         spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
     )
@@ -1208,10 +1209,32 @@ def test_spec_cache_rejects_fp16_overflow(tmp_path, monkeypatch) -> None:
     rec = np.ones((2, 2048 * 3), dtype=np.float32)
     event, _ = _cache_view_harness(view, rec, ch, monkeypatch)
 
-    big = torch.full((2, 50, 48), 70000.0)  # > 65504 = fp16 max
+    big = torch.full((2, 50, 48), 117000.0)  # > 65504 = old fp16 max
     monkeypatch.setattr(view, "_whole_movie_spec", lambda w, sr: big, raising=True)
+    view.prepare([event])
 
-    with pytest.raises(ValueError, match="fp16 range"):
+    meta_path = next(tmp_path.rglob("*.json"))
+    assert json.loads(meta_path.read_text())["dtype"] == "float32"
+    stored = np.load(next(tmp_path.rglob("*.npy")))
+    assert stored.dtype == np.float32
+    assert np.isfinite(stored).all()
+    assert float(stored.max()) == 117000.0  # exact, no overflow
+
+
+def test_spec_cache_rejects_non_finite(tmp_path, monkeypatch) -> None:
+    """A non-finite whole-movie spec must fail loud at build, not store inf/nan
+    where the f32 recompute path stays finite."""
+    view = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    ch = ["e0", "e1"]
+    rec = np.ones((2, 2048 * 3), dtype=np.float32)
+    event, _ = _cache_view_harness(view, rec, ch, monkeypatch)
+
+    bad = torch.full((2, 50, 48), float("inf"))
+    monkeypatch.setattr(view, "_whole_movie_spec", lambda w, sr: bad, raising=True)
+
+    with pytest.raises(ValueError, match="non-finite"):
         view.prepare([event])
 
 

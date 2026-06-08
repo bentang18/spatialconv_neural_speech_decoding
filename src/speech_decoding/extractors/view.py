@@ -763,7 +763,7 @@ class MultiStftView(CARIeegExtractor):
     # this is set. When set, ``prepare`` materializes each session's
     # SESSION-channel-order whole-recording raw |STFT| once (seam-free via
     # ``_multi_stft_raw_view_chunked``) under
-    # ``{spec_cache_dir}/{infra.uid()}/{session_uid}.npy`` (fp16 + ``.json``
+    # ``{spec_cache_dir}/{infra.uid()}/{session_uid}.npy`` (fp32 + ``.json``
     # sidecar) and ``_get_timed_array`` slices that memmap per clip instead of
     # re-STFT'ing. The namespace is ``infra.uid()`` (the data-determining pydantic
     # fields: notch/filter/car/lof/STFT config) PLUS a digest of the
@@ -779,7 +779,7 @@ class MultiStftView(CARIeegExtractor):
     # or -positive): (1) clip edges read real neighbouring audio rather than
     # ``torch.stft`` center-reflect padding; (2) clip frames snap to the global
     # hop grid (≤ hop/2 = 31 ms at hop=128); (3) the robust-z fit is seam-free.
-    # Stats are fit on the fp16-cast frames in BOTH the build and the cross-job
+    # Stats are fit on the on-disk fp32 frames in BOTH the build and the cross-job
     # cache-hit path, so every sweep job's stats are bit-identical regardless of
     # who built the cache. Only supported for the v14 default front_end="raw",
     # apply_log=False, and no waveform-domain transforms (baseline/scale/clamp),
@@ -1336,30 +1336,27 @@ class MultiStftView(CARIeegExtractor):
             )
 
     @staticmethod
-    def _assert_fp16_safe(key: str, spec_f32: torch.Tensor) -> None:
-        """Refuse to fp16-cast a session whose raw |STFT| is non-finite or exceeds
-        the fp16 range (65504): the cast would store inf where the f32 recompute
-        path stays finite."""
+    def _assert_cache_finite(key: str, spec_f32: torch.Tensor) -> None:
+        """Refuse to cache a session whose raw |STFT| is non-finite: an inf/nan
+        would land on disk where the f32 recompute path stays finite — a silent
+        feature divergence. The cache is fp32 (FE-RAW-1 raw |STFT| routinely
+        exceeds the fp16 65504 range, e.g. ~117k on btbank1; fp32 stores it
+        verbatim and makes the cached path bit-identical to the recompute path),
+        so only finiteness is in question, not dynamic range."""
         if not torch.isfinite(spec_f32).all():
             raise ValueError(
                 f"whole-movie spec for session {key!r} is non-finite before the "
-                "fp16 cache write — refusing to poison the cache."
-            )
-        max_mag = float(spec_f32.abs().max())
-        if max_mag >= 65504.0:
-            raise ValueError(
-                f"whole-movie spec for session {key!r} exceeds fp16 range "
-                f"(max |.|={max_mag:.1f} >= 65504); the cache would store inf. "
-                "Enable a scaler or reduce the raw |STFT| magnitude."
+                "cache write — refusing to poison the cache."
             )
 
     def _build_spec_cache_and_fit(self, obj) -> None:
         """Materialize each session's seam-free whole-recording raw |STFT| to the
-        fp16 memmap cache (skipping sessions already on disk → cross-job reuse)
+        fp32 memmap cache (skipping sessions already on disk → cross-job reuse)
         and, when ``session_robust_z`` is on, fit that session's robust-z stats
-        from the SAME fp16 frames the per-clip path will read. Fitting on the
-        fp16-cast frames in BOTH the build branch and the cache-hit branch makes
-        every sweep job's stats bit-identical regardless of who built the cache.
+        from the SAME fp32 frames the per-clip path will read. Fitting on the
+        on-disk fp32 frames in BOTH the build branch and the cache-hit branch
+        makes every sweep job's stats bit-identical regardless of who built the
+        cache — and identical to the f32 recompute path (no fp16 quantization).
         Runs on the main process inside ``Data.build``; the index + stats are
         inherited by forked DataLoader workers."""
         events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
@@ -1400,15 +1397,15 @@ class MultiStftView(CARIeegExtractor):
                 ch_names = list(raw_ta.ch_names)
                 spec_f32 = self._whole_movie_spec(waveform, sample_rate)
                 del waveform
-                # fp16 overflow guard: the production default is scaler=None, so a
-                # large raw |STFT| could cast to inf where the f32 recompute path
-                # stays finite — a silent feature divergence. Fail loud with the
-                # offending session instead of poisoning the cache.
-                self._assert_fp16_safe(key, spec_f32)
-                # f32 STFT → fp16 cast: the fp16 values ARE what lands on disk and
-                # what the per-clip path reads, so fit the stats on them too.
-                frames = spec_f32.to(torch.float16)
-                del spec_f32
+                # Finite guard only: the fp32 cache holds the raw |STFT| exactly
+                # (FE-RAW-1 magnitudes exceed the old fp16 range), but a non-finite
+                # STFT would still poison the cache and diverge from a finite
+                # recompute, so fail loud on the offending session.
+                self._assert_cache_finite(key, spec_f32)
+                # The f32 STFT lands on disk verbatim; the per-clip read upcasts
+                # trivially and fits robust-z on these SAME f32 frames, so the
+                # cache and recompute paths are bit-identical.
+                frames = spec_f32
                 total_frames = int(frames.shape[-1])
                 meta = {
                     "key": key,
@@ -1417,7 +1414,7 @@ class MultiStftView(CARIeegExtractor):
                     "sample_rate": sample_rate,
                     "f_bins": int(frames.shape[1]),
                     "n_channels": int(frames.shape[0]),
-                    "dtype": "float16",
+                    "dtype": "float32",
                 }
                 # Commit order: json FIRST, npy LAST, each atomic. The hit check is
                 # (npy AND json), so a reader only sees a hit once npy lands — by
@@ -1490,7 +1487,7 @@ class MultiStftView(CARIeegExtractor):
                 f"before clips are drawn. Have specs for: "
                 f"{sorted(self._spec_cache_index)[:8]}..."
             )
-        spec_mm = np.load(entry.path, mmap_mode="r")  # (C_session, F, T_total) fp16
+        spec_mm = np.load(entry.path, mmap_mode="r")  # (C_session, F, T_total) fp32
         freq = float(entry.sample_rate)
         # Sample offset of the clip in the _get_data array (base relocates that
         # array so sample 0 == event.start; the base also adds self.offset to
