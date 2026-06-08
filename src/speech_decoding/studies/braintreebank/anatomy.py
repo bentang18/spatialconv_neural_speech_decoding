@@ -244,6 +244,47 @@ def voltage_electrode_order(
     )
 
 
+def lite_voltage_mask(bt_root: str | Path, subject_id: int) -> np.ndarray:
+    """Boolean mask over :func:`voltage_electrode_order` selecting the Neuroprobe
+    Lite electrodes for this subject.
+
+    Reproduces upstream ``BrainTreebankSubjectTrialBenchmarkDataset`` Lite
+    subsetting (``datasets.py``: ``[full.index(e) for e in lite if e in full]``)
+    as a **set**: the realized Lite subset is ``voltage_order ∩ lite_labels``.
+    Upstream keeps the subset in Lite-list order; we keep voltage order, which is
+    equivalent for the v14 encoder because the block-diagonal per-parcel pool is
+    permutation-invariant within a parcel — only the *set* of electrodes feeding
+    each parcel matters, not their order. Applying this one mask in lockstep to
+    the study's voltage rows AND the DK support / valid-mask extractors keeps
+    ``support[c]`` ↔ ``electrode_tokens[c]`` aligned after subsetting.
+
+    Lite labels are already cleaned (no ``*``/``#``); we clean defensively so the
+    intersection is in the same label space as ``voltage_electrode_order``.
+    """
+    from ._neuroprobe_lite_tables import NEUROPROBE_LITE_ELECTRODES
+
+    sid = int(subject_id)
+    key = f"btbank{sid}"
+    if key not in NEUROPROBE_LITE_ELECTRODES:
+        raise KeyError(
+            f"subject {sid} ({key}) absent from vendored NEUROPROBE_LITE_ELECTRODES"
+        )
+    lite_set = {
+        clean_bt_electrode_label(e) for e in NEUROPROBE_LITE_ELECTRODES[key]
+    }
+    order = voltage_electrode_order(bt_root, sid)
+    return np.array([e in lite_set for e in order], dtype=bool)
+
+
+def lite_voltage_order(bt_root: str | Path, subject_id: int) -> tuple[str, ...]:
+    """The subject's Lite electrodes in voltage order (``voltage_order`` filtered
+    to the Lite set). Set-equal to upstream's realized ``electrode_labels`` for
+    the Lite Dataset; see :func:`lite_voltage_mask` for why order is free."""
+    order = voltage_electrode_order(bt_root, subject_id)
+    mask = lite_voltage_mask(bt_root, subject_id)
+    return tuple(e for e, keep in zip(order, mask) if keep)
+
+
 DEFAULT_SUPPORT_BIAS_EPS: float = 1e-2
 """Anatomy-prior strength for the soft ``log(support + ε)`` routing bias.
 

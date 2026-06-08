@@ -14,6 +14,9 @@ from speech_decoding.studies.braintreebank.anatomy import (
     aligned_voltage_support,
     build_hard_public_bt_label_support,
     bt_label_vocabulary,
+    clean_bt_electrode_label,
+    lite_voltage_mask,
+    lite_voltage_order,
     load_public_bt_anatomy,
     support_attention_bias,
     voltage_electrode_order,
@@ -233,6 +236,68 @@ def test_aligned_voltage_support_sub4_interior_unmapped() -> None:
     # valid[c] <=> support[c] nonzero, for every row
     np.testing.assert_array_equal(result.valid, result.support.sum(axis=1) > 0)
 
+
+
+# --- Neuroprobe-Lite electrode-set parity (L1 local + L2 upstream drift) -----
+
+
+@pytest.mark.parametrize("subject_id", _VENDORED_SUBJECTS)
+def test_lite_voltage_mask_aligns_and_subsets(subject_id: int) -> None:
+    """L1 (local): ``lite_voltage_mask`` is over the SAME voltage order as
+    ``voltage_electrode_order`` (row-for-row), and the realized Lite order
+    set-equals the Lite list intersected with the montage — reproducing
+    upstream's ``[full.index(e) for e in lite if e in full]`` subset as a set."""
+    _require_vendored(subject_id)
+    from speech_decoding.studies.braintreebank._neuroprobe_lite_tables import (
+        NEUROPROBE_LITE_ELECTRODES,
+    )
+
+    order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    mask = lite_voltage_mask(str(_BT_CACHE), subject_id)
+    assert mask.shape == (len(order),)
+
+    lite_labels = [
+        clean_bt_electrode_label(e)
+        for e in NEUROPROBE_LITE_ELECTRODES[f"btbank{subject_id}"]
+    ]
+    lite_set = set(lite_labels)
+    # mask[c] True iff voltage electrode c is in the Lite set, at its true index.
+    expected_mask = np.array([e in lite_set for e in order], dtype=bool)
+    np.testing.assert_array_equal(mask, expected_mask)
+
+    realized = lite_voltage_order(str(_BT_CACHE), subject_id)
+    # Set-parity with upstream's Lite-order subset (intersection of lite list
+    # with the montage); order differs (we keep voltage order — pool-invariant).
+    upstream_subset = [e for e in lite_labels if e in set(order)]
+    assert set(realized) == set(upstream_subset)
+    assert len(realized) == len(set(realized))  # no dupes
+
+
+def test_vendored_lite_table_matches_upstream() -> None:
+    """L2 (drift guard): the vendored ``NEUROPROBE_LITE_ELECTRODES`` must equal
+    the pinned upstream ``neuroprobe.config.NEUROPROBE_LITE_ELECTRODES`` exactly.
+    Skips off-DCC / when the upstream clone is absent."""
+    if not _NEUROPROBE_UPSTREAM.exists():
+        pytest.skip(f"vendored neuroprobe_upstream absent: {_NEUROPROBE_UPSTREAM}")
+    os.environ.setdefault("ROOT_DIR_BRAINTREEBANK", str(_BT_CACHE))
+    if str(_NEUROPROBE_UPSTREAM) not in sys.path:
+        sys.path.insert(0, str(_NEUROPROBE_UPSTREAM))
+    try:
+        from neuroprobe.config import NEUROPROBE_LITE_ELECTRODES as UPSTREAM
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        pytest.skip(f"neuroprobe upstream config not importable: {exc}")
+    from speech_decoding.studies.braintreebank._neuroprobe_lite_tables import (
+        NEUROPROBE_LITE_ELECTRODES as VENDORED,
+        UPSTREAM_PIN,
+    )
+
+    # Compare as plain dicts of lists (upstream may use tuples/lists).
+    vend = {k: list(v) for k, v in VENDORED.items()}
+    up = {k: list(v) for k, v in UPSTREAM.items()}
+    assert vend == up, (
+        f"vendored Lite table drifted from upstream pin {UPSTREAM_PIN}; "
+        "regenerate _neuroprobe_lite_tables.py"
+    )
 
 
 def test_support_attention_bias_is_log_support_plus_eps() -> None:

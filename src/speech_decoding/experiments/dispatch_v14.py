@@ -469,6 +469,15 @@ def build_v14_experiment(
     # a fresh STFT cache and is a recipe-amendment (HB02 re-cost). When a custom
     # ``electrode_tokens_extractor`` is supplied its c_max must match this value.
     c_max: int = DEFAULT_C_MAX,
+    # Electrode subset fed to the per-parcel pool. "all" (default) keeps every
+    # parcel-mapped voltage electrode — BT-FULL pretraining. "lite" ANDs the
+    # ElectrodeValidMask down to the Neuroprobe-Lite electrode set, so non-Lite
+    # electrodes are dropped from the pool (drop_electrode = ~valid_mask). The
+    # chain pins the P4 eval phase to "lite" (leaderboard parity = same Lite
+    # electrode count) while the SSL phases stay "all"; --electrode-set overrides
+    # for a standalone build. Distinct exca cache-uid only when "lite" (the
+    # default serialises unchanged → existing valid_mask cache reused). BT-only.
+    electrode_set: tp.Literal["all", "lite"] = "all",
     eps: float = DEFAULT_SUPPORT_BIAS_EPS,
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
@@ -1047,7 +1056,7 @@ def build_v14_experiment(
     _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(
         event_types="Ieeg", bt_root=bt_root, c_max=c_max,
-        unmapped_policy="zero",
+        unmapped_policy="zero", electrode_set=electrode_set,
     )
     _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
 
@@ -1656,6 +1665,14 @@ def _parser() -> argparse.ArgumentParser:
                         "(~33%% wasted FLOPs, an OOM lever). In the extractor-cache "
                         "uid → a non-default value forces a fresh STFT cache "
                         "(recipe-amendment, HB02 re-cost).")
+    p.add_argument("--electrode-set", dest="electrode_set",
+                   choices=("auto", "all", "lite"), default="auto",
+                   help="Electrode subset for a SINGLE-phase build (the --chain "
+                        "path always pins P4 to 'lite' and the SSL phases to "
+                        "'all'). 'auto' (default) → 'lite' for --phase 4 (the "
+                        "leaderboard eval cell, Neuroprobe-Lite electrode count) "
+                        "else 'all' (full montage = BT-FULL pretraining). 'all'/"
+                        "'lite' force the subset. 'lite' is BT-only.")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
@@ -2453,6 +2470,13 @@ def _build_v14_chain(
         # has EarlyStopping on the real downstream val_loss, and a frozen linear
         # head can't dimensionally collapse.
         collapse_guard=False,
+        # Eval = BT-Lite: the P4 probe is the leaderboard cell, so it pools over
+        # the Neuroprobe-Lite electrode subset (parity on electrode count). The
+        # SSL phases above pretrain on the full montage (BT-FULL). The frozen
+        # encoder is permutation/montage-invariant by construction (zero-per-
+        # subject per-parcel pool), so dropping to the Lite subset at eval is the
+        # intended generalization, not a distribution break.
+        electrode_set="lite",
     )
     return [p1, p2, p3a, p3b, p4]
 
@@ -2780,9 +2804,19 @@ def main(argv: list[str] | None = None) -> int:
         f"collapse_guard={(args.phase != 4) and args.collapse_guard} "
         f"early_stopping_patience={single_p4_patience}"
     )
+    # --electrode-set auto → 'lite' for the P4 eval cell, 'all' otherwise. The
+    # --chain path ignores this (P4 hardcoded 'lite', SSL 'all'); only standalone
+    # single-phase builds read it (e.g. a --phase 4 --resume-from leaderboard cell).
+    single_electrode_set = (
+        ("lite" if args.phase == 4 else "all")
+        if args.electrode_set == "auto"
+        else args.electrode_set
+    )
+    print(f"  electrode_set={single_electrode_set} (--electrode-set {args.electrode_set})")
     xp = build_v14_experiment(
         **_common_build_kwargs(args, cross_attn_positions=cross_attn_positions),
         clip_len=args.clip_len,
+        electrode_set=single_electrode_set,
         neural_lag_s=args.neural_lag_s,
         max_steps=single_max_steps,
         val_check_interval=single_val_check,

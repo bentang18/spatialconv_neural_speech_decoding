@@ -37,17 +37,33 @@ from speech_decoding.extractors.dk_support import _coerce_subject_id
 from speech_decoding.studies.braintreebank.anatomy import (
     V14_DK_PARCEL_LABELS,
     aligned_voltage_support,
+    lite_voltage_mask,
 )
 
 
 class ElectrodeValidMask(BaseStatic):
-    """Per-event ``(c_max,) bool`` valid-mask aligned to the voltage electrode order."""
+    """Per-event ``(c_max,) bool`` valid-mask aligned to the voltage electrode order.
+
+    ``electrode_set`` selects the electrode subset:
+
+      * ``"all"`` (default) — every parcel-mapped voltage electrode is valid.
+        Byte-identical to the pre-Lite extractor; exca cache-uid unchanged.
+      * ``"lite"`` — additionally AND in the Neuroprobe-Lite electrode set
+        (``lite_voltage_mask``), flipping non-Lite electrodes to ``valid=False``.
+        The encoder's per-parcel pool then excludes them entirely (``drop_electrode
+        = ~valid_mask`` → ``NEG_INF_MASK_VALUE`` cross-attn bias → exact-zero
+        weight; ``v14_encoder.py`` forward). This reproduces upstream's Lite
+        electrode subset as a *set* (the pool is permutation-invariant within a
+        parcel), so P4 eval runs at 100% electrode parity with the Neuroprobe
+        Lite leaderboard. BT-only — raises ``KeyError`` on a non-BT subject.
+    """
 
     event_types: tp.Literal["Ieeg"] = "Ieeg"
     bt_root: str
     c_max: int = 384
     unmapped_policy: tp.Literal["raise", "zero"] = "raise"
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS
+    electrode_set: tp.Literal["all", "lite"] = "all"
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
@@ -70,6 +86,17 @@ class ElectrodeValidMask(BaseStatic):
             raise ValueError(
                 f"subject {subject_id} has {n_voltage} electrodes which exceeds c_max={self.c_max}"
             )
+
+        if self.electrode_set == "lite":
+            # AND in the Neuroprobe-Lite subset. ``lite_voltage_mask`` is over the
+            # SAME voltage electrode order as ``valid`` (both from
+            # ``voltage_electrode_order``), so the row alignment that
+            # ``effective_support = support * valid_mask`` relies on is preserved.
+            # A non-Lite electrode flips True→False; a Lite-but-unmapped electrode
+            # stays False. ``&`` builds a new tensor — the lru_cached ``valid``
+            # array is never mutated.
+            lite = torch.from_numpy(lite_voltage_mask(self.bt_root, subject_id))
+            valid = valid & lite
 
         mask = torch.zeros(self.c_max, dtype=torch.bool)
         mask[:n_voltage] = valid

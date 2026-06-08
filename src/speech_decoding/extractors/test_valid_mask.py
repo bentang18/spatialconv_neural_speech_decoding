@@ -176,6 +176,78 @@ def test_valid_mask_subject_coercion_btbank_prefix(tmp_path: Path) -> None:
     assert (~out[1:]).all().item() is True
 
 
+def test_electrode_set_defaults_to_all(tmp_path: Path) -> None:
+    """Default ``electrode_set='all'`` — byte-identical to the pre-Lite extractor."""
+    _write_bt(tmp_path, 6, voltage=["E1"], anatomy=[("E1", "ctx-lh-precentral")])
+    ext = ElectrodeValidMask(event_types="Ieeg", bt_root=str(tmp_path), c_max=4)
+    assert ext.electrode_set == "all"
+    out = ext.get_static(SimpleNamespace(subject="6"))  # type: ignore[arg-type]
+    assert out[0].item() is True
+
+
+def test_electrode_set_lite_subsets_in_place(tmp_path: Path, monkeypatch) -> None:
+    """``electrode_set='lite'`` ANDs in the vendored Lite set, preserving row
+    alignment: a non-Lite electrode flips True->False at its true voltage index,
+    Lite electrodes after it stay True (no re-pack)."""
+    import speech_decoding.studies.braintreebank._neuroprobe_lite_tables as lt
+
+    _write_bt(
+        tmp_path, 2,
+        voltage=["E1", "E2", "E3", "E4"],
+        anatomy=[
+            ("E1", "ctx-lh-superiortemporal"),
+            ("E2", "ctx-rh-bankssts"),
+            ("E3", "Left-Hippocampus"),
+            ("E4", "ctx-lh-precentral"),
+        ],
+    )
+    # Lite keeps E1 and E3 only (drop the interior E2 and the trailing E4).
+    monkeypatch.setattr(lt, "NEUROPROBE_LITE_ELECTRODES", {"btbank2": ["E1", "E3"]})
+
+    out = ElectrodeValidMask(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=8, electrode_set="lite",
+    ).get_static(SimpleNamespace(subject="2"))  # type: ignore[arg-type]
+
+    assert out.tolist() == [True, False, True, False, False, False, False, False]
+
+
+def test_electrode_set_lite_unmapped_stays_false(tmp_path: Path, monkeypatch) -> None:
+    """A Lite-listed electrode that is unmapped (no parcel) stays False — the Lite
+    mask only ever removes, never resurrects an invalid slot."""
+    import speech_decoding.studies.braintreebank._neuroprobe_lite_tables as lt
+
+    _write_bt(
+        tmp_path, 2,
+        voltage=["E1", "E2", "E3"],
+        anatomy=[
+            ("E1", "ctx-lh-superiortemporal"),
+            ("E2", "Left-Inf-Lat-Vent"),  # out-of-vocab -> unmapped
+            ("E3", "ctx-rh-bankssts"),
+        ],
+    )
+    # Lite lists E2 (unmapped) and E3 (mapped); E1 dropped by Lite.
+    monkeypatch.setattr(lt, "NEUROPROBE_LITE_ELECTRODES", {"btbank2": ["E2", "E3"]})
+
+    out = ElectrodeValidMask(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=6, electrode_set="lite",
+        unmapped_policy="zero",
+    ).get_static(SimpleNamespace(subject="2"))  # type: ignore[arg-type]
+
+    # E1: mapped but not Lite -> False; E2: Lite but unmapped -> False; E3: both -> True.
+    assert out.tolist() == [False, False, True, False, False, False]
+
+
+def test_electrode_set_lite_cache_uid_distinct_from_all(tmp_path: Path) -> None:
+    """The Lite extractor must not collide with the 'all' extractor in exca's
+    config-keyed cache (different electrode_set -> different serialized config)."""
+    all_ext = ElectrodeValidMask(event_types="Ieeg", bt_root=str(tmp_path), c_max=8)
+    lite_ext = ElectrodeValidMask(
+        event_types="Ieeg", bt_root=str(tmp_path), c_max=8, electrode_set="lite",
+    )
+    assert all_ext.model_dump() != lite_ext.model_dump()
+    assert all_ext.model_dump()["electrode_set"] == "all"
+
+
 def test_valid_mask_missing_depth_wm_raises(tmp_path: Path) -> None:
     labels_path = tmp_path / "electrode_labels" / "sub_99" / "electrode_labels.json"
     labels_path.parent.mkdir(parents=True, exist_ok=True)
