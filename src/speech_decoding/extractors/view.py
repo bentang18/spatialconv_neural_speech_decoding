@@ -1368,6 +1368,8 @@ class MultiStftView(CARIeegExtractor):
         n_hit = 0
         n_build = 0
         build_secs = 0.0
+        load_secs = 0.0
+        fit_secs = 0.0
         for event in events:
             key = event._splittable_event_uid()
             if key in seen:
@@ -1390,11 +1392,12 @@ class MultiStftView(CARIeegExtractor):
                 # Only pay the full read when the stats fit needs the frames; the
                 # median fit needs the whole recording in RAM anyway, so load it
                 # fully (writable) rather than via a read-only memmap.
-                frames = (
-                    torch.from_numpy(np.load(npy_path))
-                    if self.session_robust_z
-                    else None
-                )
+                if self.session_robust_z:
+                    _tl = time.perf_counter()
+                    frames = torch.from_numpy(np.load(npy_path))
+                    load_secs += time.perf_counter() - _tl
+                else:
+                    frames = None
             else:
                 n_build += 1
                 _t0 = time.perf_counter()
@@ -1446,9 +1449,11 @@ class MultiStftView(CARIeegExtractor):
                 )
             if self.session_robust_z:
                 assert frames is not None
+                _tf = time.perf_counter()
                 normalizer = SessionRobustZNormalizer(
                     sigma_floor=self.session_z_sigma_floor,
                 ).fit(frames.float())
+                fit_secs += time.perf_counter() - _tf
                 self._scatter_stats_to_global(normalizer, ch_names)
                 self._session_stats[key] = normalizer
             self._spec_cache_index[key] = _SpecCacheEntry(
@@ -1460,11 +1465,14 @@ class MultiStftView(CARIeegExtractor):
             del frames
         logger.warning(
             "spec cache (#80): %d/%d sessions hit, %d built "
-            "(%.1fs whole-movie |STFT| build tax) -> %s",
+            "(%.1fs whole-movie |STFT| build tax; %.1fs npy load + %.1fs "
+            "robust-z fit on hits) -> %s",
             n_hit,
             n_hit + n_build,
             n_build,
             build_secs,
+            load_secs,
+            fit_secs,
             cache_root,
         )
 
