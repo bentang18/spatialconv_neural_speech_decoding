@@ -70,6 +70,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import typing as tp
 import uuid
 from pathlib import Path
@@ -1364,6 +1365,9 @@ class MultiStftView(CARIeegExtractor):
         cache_root.mkdir(parents=True, exist_ok=True)
         expected_f = self._expected_raw_f_bins()
         seen: set[str] = set()
+        n_hit = 0
+        n_build = 0
+        build_secs = 0.0
         for event in events:
             key = event._splittable_event_uid()
             if key in seen:
@@ -1374,6 +1378,7 @@ class MultiStftView(CARIeegExtractor):
             json_path = cache_root / f"{stem}.json"
             hit = npy_path.exists() and json_path.exists()
             if hit:
+                n_hit += 1
                 meta = json.loads(json_path.read_text())
                 ch_names = list(meta["ch_names"])
                 total_frames = int(meta["total_frames"])
@@ -1391,11 +1396,14 @@ class MultiStftView(CARIeegExtractor):
                     else None
                 )
             else:
+                n_build += 1
+                _t0 = time.perf_counter()
                 raw_ta = next(self._get_data([event]))
                 waveform = torch.from_numpy(np.asarray(raw_ta.data)).float()
                 sample_rate = int(float(raw_ta.frequency))
                 ch_names = list(raw_ta.ch_names)
                 spec_f32 = self._whole_movie_spec(waveform, sample_rate)
+                build_secs += time.perf_counter() - _t0
                 del waveform
                 # Finite guard only: the fp32 cache holds the raw |STFT| exactly
                 # (FE-RAW-1 magnitudes exceed the old fp16 range), but a non-finite
@@ -1450,6 +1458,15 @@ class MultiStftView(CARIeegExtractor):
                 sample_rate=sample_rate,
             )
             del frames
+        logger.info(
+            "spec cache (#80): %d/%d sessions hit, %d built "
+            "(%.1fs whole-movie |STFT| build tax) -> %s",
+            n_hit,
+            n_hit + n_build,
+            n_build,
+            build_secs,
+            cache_root,
+        )
 
     def _scatter_spec_to_global(
         self, spec_session: torch.Tensor, ch_names: list[str],
