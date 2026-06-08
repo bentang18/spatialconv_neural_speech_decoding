@@ -43,10 +43,13 @@ from neuralset.events.study import EventsTransform
 
 from speech_decoding.studies.braintreebank.labels import (
     NEUROPROBE_TASKS,
+    NEW_PITCH_VOLUME_COLUMNS,
     derive_label_indices,
     enrich_words_with_transcript_features,
+    load_pitch_volume_features,
     ordered_dataset_labels,
     ordered_dataset_source_indices,
+    remap_task_column,
 )
 from speech_decoding.studies.braintreebank.manifest import V14_PRETRAIN_SESSIONS
 
@@ -106,6 +109,29 @@ def _movie_name(subject_id: int, trial_id: int) -> str:
     return BRAINTREEBANK_SUBJECT_TRIAL_MOVIE_NAME_MAPPING[f"btbank{subject_id}_{trial_id}"]
 
 
+def _tasks_need_pitch_volume(tasks: tp.Sequence[str]) -> bool:
+    """True if any task's feature column lives in Neuroprobe's packaged
+    pitch/volume JSON (``enhanced_pitch`` etc.) rather than the transcript
+    ``features.csv``. Among the 15 leaderboard tasks only ``pitch`` qualifies,
+    but route generically off the column set so a future ``raw_pitch``-style
+    task is covered."""
+    return any(remap_task_column(t) in NEW_PITCH_VOLUME_COLUMNS for t in tasks)
+
+
+def _load_pitch_volume_features(
+    subject_id: int, trial_id: int
+) -> dict[str, dict[str, tp.Any]]:
+    """Load Neuroprobe's packaged ``{movie}_pitch_volume_features.json`` for this
+    trial (5-dp ``start``-time keyed). Mirrors upstream ``datasets.py``: the file
+    ships inside the neuroprobe package (``PITCH_VOLUME_FEATURES_DIR``), NOT under
+    the BT data root."""
+    from neuroprobe.config import PITCH_VOLUME_FEATURES_DIR
+
+    movie = _movie_name(subject_id, trial_id)
+    path = Path(PITCH_VOLUME_FEATURES_DIR) / f"{movie}_pitch_volume_features.json"
+    return load_pitch_volume_features(path)
+
+
 def _load_words_and_nonverbal(
     subject_id: int,
     trial_id: int,
@@ -152,6 +178,7 @@ def _word_event_rows(
     random_seed: int,
     duration: float,
     balance: bool = True,
+    pitch_volume_features: dict[str, dict[str, tp.Any]] | None = None,
 ) -> pd.DataFrame:
     """Build per-task Word rows.
 
@@ -194,6 +221,7 @@ def _word_event_rows(
             nano=nano,
             random_seed=random_seed,
             balance=balance,
+            pitch_volume_features=pitch_volume_features,
         )
         if balance:
             # Eval parity: interleave classes in upstream Dataset item order.
@@ -507,6 +535,11 @@ class BTWordEvents(EventsTransform):
             words_df, nonverbal_df = _load_words_and_nonverbal(
                 subject_id, trial_id, bt_root=bt_root, enrich=enrich,
             )
+            pitch_volume_features = (
+                _load_pitch_volume_features(subject_id, trial_id)
+                if _tasks_need_pitch_volume(self.tasks)
+                else None
+            )
             timeline_rows = _word_event_rows(
                 subject_id=subject_id,
                 trial_id=trial_id,
@@ -520,6 +553,7 @@ class BTWordEvents(EventsTransform):
                 random_seed=self.random_seed,
                 duration=self.duration,
                 balance=self.balance,
+                pitch_volume_features=pitch_volume_features,
             )
             all_word_rows.append(timeline_rows)
 
