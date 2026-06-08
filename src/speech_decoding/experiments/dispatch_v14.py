@@ -95,13 +95,19 @@ DEFAULT_CLIP_LEN_S = 5.0
 # frame-for-frame distill. The P4 probe MUST keep 0.0 (leaderboard parity) — a
 # non-default raises under --phase 4 (guard below).
 DEFAULT_NEURAL_LAG_S = 0.0
-DEFAULT_BATCH_SIZE = 32
+# Per-GPU batch. 4 is the validated production value: it fits the 32 GB
+# coganlab-gpu / RTX-5000-Ada cards WITH gradient_checkpointing ON, and the live
+# BT chain (jobs 47811938/47829858) ran 6 h clean at bs=4 × accum=8 × 4-GPU =
+# eff-128 ([[project_bt_chain_run_2026_06_07]]). Raise on a 48 GB+ card.
+DEFAULT_BATCH_SIZE = 4
 # DataLoader worker count (B1.4e, 2026-05-29). The per-sample extractor stack
 # (CAR + torch.stft in LogStftView is recomputed per __getitem__; only the raw
 # waveform load is MapInfra-cached) is CPU-bound, so num_workers=0 starves the
-# GPU (1.48 it/s on the 5/29 Lite baseline). 4 workers overlap that CPU STFT
-# with GPU compute; pair with --cpus-per-task >= num_workers + 1.
-DEFAULT_NUM_WORKERS = 4
+# GPU (1.48 it/s on the 5/29 Lite baseline). 15 workers (paired with the live
+# run's cpus_per_task=16) keep the data path fed and did NOT fork-deadlock — the
+# "nw=4 hang" was a launch-blocker hypothesis the production run disproved
+# ([[project_bt_chain_run_2026_06_07]]). Pair with --cpus-per-task >= num_workers + 1.
+DEFAULT_NUM_WORKERS = 15
 DEFAULT_N_EPOCHS = 100
 # P4 frozen-probe early-stop patience (epochs on val_loss). P4 is a tiny
 # supervised readout (≤3500 samples, ~514–2570 trainable params); it converges
@@ -118,12 +124,15 @@ DEFAULT_TASK = "speech"
 DEFAULT_EVAL_MODE = "CrossSession"
 DEFAULT_TEST_SUBJECT_ID = 2
 DEFAULT_TEST_TRIAL_ID = 4
-DEFAULT_C_MAX = 384  # Locked 2026-05-23 PM per CQ12/B14 close. Covers all four
-                     # Phase-1 corpora: D-cohort max=366 (n=128 manifest),
-                     # AJILE12 max≈200 (146 surface + ~50 depth per Peterson
-                     # 2022), BT max=256 (Wang2024Treebank raw), SWEC max=128.
-                     # ValueError already raised in dk_support.py, view.py,
-                     # valid_mask.py if any subject's n_real > c_max.
+DEFAULT_C_MAX = 256  # BT-only default (2026-06-07). BT max electrodes = 256
+                     # (Wang2024Treebank raw) → lossless for the current BT-only
+                     # chain, and drops 33% of the 384 padding slots (front-end
+                     # FLOPs + activation memory are C-linear). The JOINT corpus
+                     # (SWEC+AJILE12+D) needs --c-max 384: D-cohort max=366,
+                     # AJILE12 max≈200, SWEC max=128. dk_support.py / view.py /
+                     # valid_mask.py RAISE (fail loud, not lossy) if any
+                     # subject's n_real > c_max — so 256 can never silently clip
+                     # a >256-electrode subject; it errors at dispatch instead.
 
 # MASK-01 per-corpus mains-notch field (v14_implementation_fix_list.md §A.3).
 # Lifted from the formerly hardcoded `notch_filter=60.0`. SWEC pretrain (CH
@@ -238,10 +247,11 @@ DEFAULT_CORPUS_MIX: dict[str, float] = {
     "braintreebank": 12.0 / 87.0,
 }
 
-# B29 AJILE12 inclusion: re-included after being dropped in earlier
-# memos (sensor-gap was reversed same-day per Agent 2's
-# Charmander/DIVER-1 evidence).
-DEFAULT_INCLUDE_AJILE12: bool = True
+# AJILE12 inclusion. Default OFF (2026-06-07): the active chain is BT-only
+# (swec_frac=0, no SWEC/AJILE12/D in the mix). B29 re-included AJILE12 for the
+# full JOINT corpus; pass --include-ajile12 to restore it when the joint
+# escalation runs ([[project_bt_chain_run_2026_06_07]]).
+DEFAULT_INCLUDE_AJILE12: bool = False
 
 
 def _validate_choice(name: str, value: str, choices: tuple[str, ...]) -> None:
@@ -509,6 +519,13 @@ def build_v14_experiment(
     # EarlyStopping while risking an exca-cache-poisoning abort on benign
     # probe over-fit). True for P1/P2/P3a/P3b.
     collapse_guard: bool = True,
+    # --live nano learning-dynamics dashboard (near-free graphs: loss/val-loss,
+    # RankMe, LR-curve). Defaults reproduce non-live behavior; at default values
+    # they stay out of the exca cache uid. See
+    # reports/nano_dynamics_dashboard_handoff_2026_06_07.md.
+    wandb_config: tp.Any | None = None,
+    lr_log_interval: str = "epoch",
+    log_every_n_steps: int = 10,
     seed: int = 33,
     exca_folder: str | None = None,
     # #54 audit C1: exca's default ``mode="cached"`` re-RAISES a stored failure
@@ -980,11 +997,18 @@ def build_v14_experiment(
         path=Path(bt_root), mode=study_mode,
         infra_timelines={"cluster": None},
     )
+    # Class-balance only the P4 eval (Neuroprobe parity). SSL phases
+    # (pretrain/p3_distill) are label-free → keep EVERY word + nonverbal anchor
+    # (no minority-class bottleneck), lifting movie coverage from the balanced
+    # subset to ~96-99%. See _resolve_corpus_mode + the BTWordEvents.balance
+    # field. --mode still bounds the SSL anchor count (lite/nano cap per class).
+    ssl_phase = study_mode in ("pretrain", "p3_distill")
     word_events = BTWordEvents(
         tasks=(task,),
         binary_tasks=binary_tasks,
         lite=(budget_mode == "lite"),
         nano=(budget_mode == "nano"),
+        balance=(not ssl_phase),
         eval_mode=chain_eval_mode,
         test_subject_id=test_subject_id,
         test_trial_id=test_trial_id,
@@ -1325,6 +1349,9 @@ def build_v14_experiment(
             }
         ],
         n_epochs=n_epochs,
+        log_every_n_steps=log_every_n_steps,
+        lr_log_interval=lr_log_interval,
+        wandb_config=wandb_config,
         max_steps=max_steps,
         val_check_interval=val_check_interval,
         limit_val_batches=limit_val_batches,
@@ -1364,7 +1391,13 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="V14 first-pass DCC dispatch (BT cohort, K=80 DK parcels)."
     )
-    p.add_argument("--mode", choices=("nano", "lite", "full"), default="lite")
+    # Default 'full' (2026-06-07): a no-flag SSL run (P1/P2/P3) should train on
+    # ALL clips, not the 3500/class Lite gate — Lite is a leaderboard-parity
+    # budget that has no reason to throttle label-free pretraining. P4 is exempt:
+    # _resolve_corpus_mode forces the P4 universe to 'lite' for any --mode except
+    # 'nano' (never 'full'), so the eval stays Neuroprobe-faithful regardless.
+    # 'nano' = tiny smoke (applies to SSL budget AND P4 universe).
+    p.add_argument("--mode", choices=("nano", "lite", "full"), default="full")
     p.add_argument("--task", default=DEFAULT_TASK,
                    help="Neuroprobe task name (event field for the target).")
     p.add_argument("--eval-mode", choices=("CrossSession", "CrossSubject"),
@@ -1397,18 +1430,20 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS,
                    help="DataLoader worker processes (B1.4e, 2026-05-29). "
                         "0 starves the GPU on the per-sample CPU STFT; default "
-                        "4 overlaps it. Set --cpus-per-task >= num_workers + 1.")
+                        "15 overlaps it (production value, cpus_per_task=16). "
+                        "Set --cpus-per-task >= num_workers + 1.")
     p.add_argument("--n-epochs", type=int, default=DEFAULT_N_EPOCHS,
                    help="Epoch budget for the SSL/distill phases (P1/P2/P3a/P3b) "
                         "and the P4 cap. The SSL phases train to this fixed "
                         "budget; no early-stop.")
-    p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, default=None,
-                   help="Optional step budget for the SSL/distill phases "
-                        "(P1/P2/P3a/P3b). When set it overrides --n-epochs for "
-                        "those phases: training stops at this many optimizer "
-                        "steps (max_epochs=-1). Real SSL runs over the "
-                        "multi-hundred-hour joint corpus are budgeted in steps, "
-                        "not epochs. P4 ignores this.")
+    p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, default=1500,
+                   help="Step budget for the SSL/distill phases (P1/P2/P3a/P3b). "
+                        "Default 1500/phase = the validated production budget "
+                        "(P1 converged clean in 1500; val L1 plateaued ~step 900, "
+                        "so #79 will transfer-score a cut). Overrides --n-epochs "
+                        "for those phases (max_epochs=-1): training stops at this "
+                        "many OPTIMIZER steps. Pass <=0 to fall back to the "
+                        "--n-epochs budget. P4 ignores this.")
     p.add_argument("--ssl-val-check-interval", dest="ssl_val_check_interval",
                    type=int, default=None,
                    help="Validation cadence (optimizer steps) for the SSL/"
@@ -1465,11 +1500,15 @@ def _parser() -> argparse.ArgumentParser:
     # capstone defaults; consolidate/sweep later, #45). A launch guard in main()
     # refuses a real (non-fast-dev-run) SSL/distill run on constant-Adam/β2=0.999
     # so the §7 config can never be silently omitted.
-    p.add_argument("--lr", type=float, default=1e-3,
+    p.add_argument("--lr", type=float, default=None,
                    help="Peak/base LR (constant value, or warmup-cosine peak). "
-                        "1e-3 default = prior behavior; the §7 M0 sweep centers "
-                        "are 5e-4 (P1) / 3e-4 (P2) @ batch 1024/512 (√-rule-"
-                        "rescale for the live bs=8 before a real run).")
+                        "DEFAULT = AUTO √-rule: lr = 5e-4·√(eff/1024), eff = "
+                        "batch_size × accumulate_grad_batches × gpus_per_node "
+                        "(e.g. eff-128 → 1.76e-4, eff-32 → 8.8e-5). The anchor "
+                        "5e-4 @ 1024 is the §7 SSL center; the rule is the "
+                        "validated production LR (live chain ran 1.76e-4 @ "
+                        "eff-128). Pass an explicit value to override (M0 #45 "
+                        "sweeps around it). The resolved LR is printed at launch.")
     p.add_argument("--lr-schedule", dest="lr_schedule",
                    choices=("constant", "warmup_cosine"), default="warmup_cosine",
                    help="warmup_cosine (DEFAULT 2026-06-04, §7 locked shape: "
@@ -1478,20 +1517,24 @@ def _parser() -> argparse.ArgumentParser:
                         "pins it) or constant (the prior unimplemented-default "
                         "behavior — refused on a real SSL/distill run by the "
                         "main() launch guard).")
-    p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=0,
+    p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=150,
                    help="Linear-warmup optimizer steps for --lr-schedule "
-                        "warmup_cosine (§7: 20k P1 / 5k P2 @ full corpus; scale "
-                        "to the actual step budget). Clamped below total_steps.")
+                        "warmup_cosine. Default 150 = 10%% of the 1500-step "
+                        "production budget (the live chain's value; §7 anchor is "
+                        "20k P1 / 5k P2 @ full corpus — scale to the step "
+                        "budget). Clamped below total_steps.")
     p.add_argument("--min-lr-ratio", dest="min_lr_ratio", type=float, default=0.0,
                    help="Cosine floor as a fraction of peak LR (0.0 = →0, the "
                         "§7 lock). Per-group-proportional, so P2/P3 "
                         "discriminative-LR ratios survive a non-zero floor.")
-    p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.0,
-                   help="AdamW weight decay (0.0 default = prior plain-Adam). §7 "
-                        "M0 sweep center is 0.05; only added to the optimizer "
-                        "kwargs when > 0 (use --optimizer AdamW for decoupled WD). "
-                        "When > 0 the no-WD param-group split (#40) exempts biases "
-                        "/ LayerNorm γβ / embeds — see --no-wd-exclude-norms.")
+    p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.05,
+                   help="AdamW weight decay. Default 0.05 = the live-chain / §7 M0 "
+                        "sweep center (M0 #45 sweeps it; the fixed-data regime may "
+                        "argue higher). Only added to the optimizer kwargs when "
+                        "> 0 (use --optimizer AdamW for decoupled WD). When > 0 the "
+                        "no-WD param-group split (#40) exempts biases / LayerNorm "
+                        "γβ / embeds — see --no-wd-exclude-norms. Pass 0.0 for the "
+                        "plain-Adam falsifier.")
     p.add_argument("--wd-exclude-norms", dest="wd_exclude_norms",
                    action="store_true", default=True,
                    help="§7/B01 no-WD split (DEFAULT ON): exempt biases + "
@@ -1522,13 +1565,15 @@ def _parser() -> argparse.ArgumentParser:
                         "(top divergence-risk fix per the 6/03 run-health audit). "
                         "Pass <= 0 to disable clipping.")
     p.add_argument("--accumulate-grad-batches", dest="accumulate_grad_batches",
-                   type=int, default=1,
-                   help="Lightning accumulate_grad_batches. 1 (default) = no "
-                        "accumulation. >1 sums grads over N micro-batches → "
-                        "effective batch = --batch-size * N at N× wall-clock per "
-                        "optimizer step. The effective-batch lever for the 32 GB "
-                        "coganlab-gpu cards; a larger physical --batch-size on a "
-                        "48 GB+ card is preferred.")
+                   type=int, default=8,
+                   help="Lightning accumulate_grad_batches. Default 8 = the "
+                        "validated production value (bs=4 × accum=8 × 4-GPU = "
+                        "eff-128). Sums grads over N micro-batches → effective "
+                        "batch = batch_size × N × gpus_per_node at N× wall-clock "
+                        "per optimizer step. The effective-batch lever for the "
+                        "32 GB coganlab-gpu cards (EMA is gated once-per-optimizer-"
+                        "step so accum is correct, #46). 8-GPU recipe holds eff-128 "
+                        "at accum=4 (faster); pass 1 for no accumulation.")
     p.add_argument("--clip-len", type=float, default=None,
                    help="Segmenter clip window (s): 5.0 for SSL P1/P2/P3 "
                         "(T_p=40), 1.0 for the P4 readout (T_p=8). Sizes the "
@@ -1670,6 +1715,31 @@ def _parser() -> argparse.ArgumentParser:
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
                    help="Lightning fast-dev-run: 1 batch train+val+test, no checkpoints.")
+    # --live nano learning-dynamics dashboard (Weights & Biases). Near-free
+    # graphs only: train/val loss, RankMe, LR-schedule curve — no per-group
+    # grad-norm / teacher-student gap / heatmap yet (those are the deferred
+    # phase-2 of reports/nano_dynamics_dashboard_handoff_2026_06_07.md).
+    p.add_argument("--live", action="store_true",
+                   help="Stream live training metrics to Weights & Biases for the "
+                        "nano learning-dynamics dashboard: per-step "
+                        "LearningRateMonitor + log_every_n_steps=1 so the loss / "
+                        "RankMe / LR curves update live and overlay across runs. "
+                        "Needs `wandb` + a wandb login (or --wandb-offline). Pair "
+                        "with --mode nano --ssl-max-steps ~150-300 for a ~30-60 s "
+                        "loop. See reports/nano_dynamics_dashboard_handoff_2026_06_07.md.")
+    p.add_argument("--wandb-project", dest="wandb_project",
+                   default="v14-nano-dynamics",
+                   help="W&B project for --live runs (default v14-nano-dynamics).")
+    p.add_argument("--wandb-group", dest="wandb_group", default=None,
+                   help="W&B group for --live runs (default <task>_<mode>).")
+    p.add_argument("--wandb-run-name", dest="wandb_run_name", default=None,
+                   help="W&B run name / overlay legend label for --live runs "
+                        "(default <task>_<mode>_p<phase>). Set per predict-then-"
+                        "check rung so the overlay legend reads clearly, e.g. "
+                        "--wandb-run-name p1-lr1e-4.")
+    p.add_argument("--wandb-offline", dest="wandb_offline", action="store_true",
+                   help="Log --live runs offline (no wandb login/network); sync "
+                        "later with `wandb sync`.")
     # Phase-2 shaft-mask 5/27 PM final spec. Default is
     # ``K = 1 if N_shafts >= 2 else 0`` with ``extent_blocks=("alpha",)``.
     # Supersedes the original ``K=3`` spec and the same-day AM
@@ -1763,10 +1833,48 @@ def _parser() -> argparse.ArgumentParser:
     # bind on memory. Numerics-safe (bit-identical loss + grads).
     p.add_argument(
         "--gradient-checkpointing", dest="gradient_checkpointing",
-        action="store_true", default=False,
+        action="store_true", default=True,
         help="Enable activation checkpointing on the encoder token-block and "
-             "latent-block stacks. Off by default; gated on training + grad "
-             "so the no_grad EMA-teacher pass is never checkpointed.",
+             "latent-block stacks. ON by default (2026-06-07): it is what lets "
+             "bs=4 fit the 32 GB coganlab-gpu cards (the live chain ran with it). "
+             "Gated on training + grad so the no_grad EMA-teacher pass is never "
+             "checkpointed. Bit-identical loss + grads. Pass "
+             "--no-gradient-checkpointing on a 48 GB+ card to trade the recompute "
+             "for speed.",
+    )
+    p.add_argument(
+        "--no-gradient-checkpointing", dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable activation checkpointing (faster, more memory) — only safe "
+             "on a card with headroom for full activations at the chosen "
+             "--batch-size.",
+    )
+    # 2026-06-07 speedup-fanout C1: torch.compile the student/teacher encoder
+    # forward. OFF by default (eager path byte-identical). The toggle is the
+    # ``V14_COMPILE`` env var read inside V14JointBrainModule.__init__ (an env
+    # var, not a pydantic field, so it never forks the exca run uid — a compiled
+    # and an uncompiled run share a cache namespace). This flag is the
+    # discoverable front-door: it sets that env var in main() before exca submits,
+    # so it propagates to the slurm job (submitit captures the driver env). The
+    # compile wraps only the forward callable in a plain dict → no nn.Module
+    # re-registration, no ``_orig_mod.`` state_dict prefix → EMA name-match
+    # intact. PHASE-CONDITIONAL in practice (net-positive on the full-encoder
+    # P2/P3b passes, can be net-negative on short P1/P3a/P4 after cold-start) and
+    # GPU-validation-gated — benchmark on one freed GPU before a full relaunch.
+    p.add_argument(
+        "--compile", dest="compile_encoder",
+        action="store_true", default=False,
+        help="torch.compile the student/teacher encoder forward (sets "
+             "V14_COMPILE=1). Off by default = byte-identical eager path. "
+             "GPU-validation-gated; benchmark on one freed GPU first.",
+    )
+    p.add_argument(
+        "--compile-mode", dest="compile_mode", default=None,
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode (sets V14_COMPILE_MODE). Default inductor mode "
+             "if unset. NOTE: 'reduce-overhead' (CUDA graphs) is unsafe here — "
+             "DDP AccumulateGrad cross-stream comm + find_unused_parameters break "
+             "graph capture (shape-independent); use 'default'.",
     )
     p.add_argument(
         "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
@@ -1838,11 +1946,17 @@ def _parser() -> argparse.ArgumentParser:
         help="α-hierarchical corpus sampler weight (B29 Item 5). Default 0.3.",
     )
     p.add_argument(
+        "--include-ajile12", dest="include_ajile12",
+        action="store_true", default=DEFAULT_INCLUDE_AJILE12,
+        help="Include AJILE12 in the pretraining mix. Default OFF (2026-06-07): "
+             "the active chain is BT-only. Turn ON for the joint-corpus "
+             "escalation (B29 mix). Paired falsifier: --no-include-ajile12.",
+    )
+    p.add_argument(
         "--no-include-ajile12", dest="include_ajile12",
-        action="store_false", default=DEFAULT_INCLUDE_AJILE12,
-        help="Drop AJILE12 from the pretraining mix (sister "
-             "R-no-ajile12). Default is to include it (B29 reversal of the "
-             "5/27 PM-late same-day sensor-gap drop).",
+        action="store_false",
+        help="Force AJILE12 out of the pretraining mix (explicit BT-only / "
+             "sister R-no-ajile12). Redundant with the current default-OFF.",
     )
     p.add_argument(
         "--ffn-variant",
@@ -1866,7 +1980,7 @@ def _parser() -> argparse.ArgumentParser:
              "AJILE12). Pass 50.0 for SWEC (Swiss site). Per-corpus map "
              "lives in MAINS_NOTCH_BY_CORPUS.",
     )
-    p.add_argument("--phase", type=int, choices=(1, 2, 3, 4), default=4,
+    p.add_argument("--phase", type=int, choices=(1, 2, 3, 4), default=1,
                    help="Training phase per docs/neuroprobe/plan.md §staged. "
                         "1 = masked-JEPA SSL (V14JointExperiment); B36 staged "
                         "P1->P2 selected via --jepa-phase (p1 front-end M2 / "
@@ -1999,6 +2113,43 @@ def construct_v14_joint_callbacks(
     return callbacks
 
 
+def _resolve_lr(args) -> float:
+    """Peak/base LR for every phase.
+
+    ``--lr`` (default ``None``) resolves to the AUTO √-rule:
+    ``lr = 5e-4 · √(eff / 1024)`` with ``eff = batch_size ×
+    accumulate_grad_batches × gpus_per_node`` (the linear-scaling-anchor for
+    SSL; 5e-4 @ 1024 is the §7 center, validated at eff-128 → 1.76e-4). An
+    explicit ``--lr`` overrides. Idempotent + pure in ``args`` so the chain,
+    the single-phase build, and the direct-call tests all resolve identically.
+    """
+    if args.lr is not None:
+        return float(args.lr)
+    n_gpu = args.gpus_per_node or 1
+    eff = args.batch_size * args.accumulate_grad_batches * n_gpu
+    return 5e-4 * (eff / 1024) ** 0.5
+
+
+def _build_wandb_config(args) -> tp.Any | None:
+    """W&B logger config for the --live nano learning-dynamics dashboard.
+
+    None unless --live is set. Run name defaults to ``<task>_<mode>_p<phase>`` so a
+    predict-then-check ladder overlays cleanly; override per rung with
+    --wandb-run-name. See reports/nano_dynamics_dashboard_handoff_2026_06_07.md.
+    """
+    if not getattr(args, "live", False):
+        return None
+    from neuraltrain.utils import WandbLoggerConfig
+
+    phase = getattr(args, "phase", "?")
+    name = args.wandb_run_name or f"{args.task}_{args.mode}_p{phase}"
+    group = args.wandb_group or f"{args.task}_{args.mode}"
+    return WandbLoggerConfig(
+        name=name, group=group, project=args.wandb_project,
+        offline=args.wandb_offline,
+    )
+
+
 def _common_build_kwargs(
     args, *, cross_attn_positions: list[int] | None,
 ) -> dict[str, tp.Any]:
@@ -2030,6 +2181,12 @@ def _common_build_kwargs(
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         batch_size=args.batch_size, num_workers=args.num_workers,
         n_epochs=args.n_epochs,
+        # --live nano learning-dynamics dashboard. Non-live → all three at their
+        # Experiment defaults, so the cache uid + behavior are unchanged.
+        # reports/nano_dynamics_dashboard_handoff_2026_06_07.md.
+        wandb_config=_build_wandb_config(args),
+        lr_log_interval="step" if getattr(args, "live", False) else "epoch",
+        log_every_n_steps=1 if getattr(args, "live", False) else 10,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
         slurm_partition=args.slurm_partition,
         slurm_account=args.slurm_account,
@@ -2073,7 +2230,7 @@ def _common_build_kwargs(
         # #37 optim / LR-schedule (audit 2026-06-03). --adam-beta2 → (0.9, β2)
         # tuple; --grad-clip <= 0 → None (disable). Reaches every phase via this
         # one dict, so the chain and single-phase builds stay in lock-step.
-        lr=args.lr,
+        lr=_resolve_lr(args),
         lr_schedule=args.lr_schedule,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
@@ -2165,9 +2322,15 @@ def _build_v14_chain(
     # fires on validation, never evaluates. Resolved here so the run summary is
     # honest; --ssl-val-check-interval overrides. Stays None on an epoch budget
     # (epoch-boundary validation already runs).
+    # <=0 → None = fall back to the --n-epochs budget (the default 1500 is the
+    # production step budget; 0/negative is the documented epoch-budget escape).
+    ssl_max_steps = (
+        args.ssl_max_steps if (args.ssl_max_steps and args.ssl_max_steps > 0)
+        else None
+    )
     ssl_val_check = args.ssl_val_check_interval
-    if ssl_val_check is None and args.ssl_max_steps is not None:
-        ssl_val_check = max(50, args.ssl_max_steps // 10)
+    if ssl_val_check is None and ssl_max_steps is not None:
+        ssl_val_check = max(50, ssl_max_steps // 10)
     # #66: cap each SSL validation (P4 stays uncapped — built separately below).
     ssl_limit_val = (
         args.ssl_limit_val_batches
@@ -2193,7 +2356,7 @@ def _build_v14_chain(
     # this per-phase split are retained as the diagnostic escape hatch.
     # See [[project_v14_gate_cadence_guard_response_lock_2026_06_05]].
     ssl_budget: dict[str, tp.Any] = dict(
-        max_steps=args.ssl_max_steps,
+        max_steps=ssl_max_steps,
         val_check_interval=ssl_val_check,
         limit_val_batches=ssl_limit_val,
     )
@@ -2256,6 +2419,14 @@ def _build_v14_chain(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # speedup-fanout C1: --compile is a front-door for the V14_COMPILE env var
+    # that V14JointBrainModule reads at construction. Set it here (before exca
+    # submits) so submitit captures it into the slurm job env. An explicit env
+    # var the operator already exported still wins when the flag is absent.
+    if args.compile_encoder:
+        os.environ["V14_COMPILE"] = "1"
+    if args.compile_mode:
+        os.environ["V14_COMPILE_MODE"] = args.compile_mode
     # §7 launch guard (2026-06-04, project_v14_optimizer_default_b01_config). A
     # real SSL/distill run MUST use the locked optimizer config — constant-Adam /
     # β2=0.999 was the unimplemented-default *bug*, never a chosen config. A
@@ -2389,7 +2560,14 @@ def main(argv: list[str] | None = None) -> int:
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
           f"readout={args.readout} "
           f"gradient_checkpointing={args.gradient_checkpointing}")
-    print(f"  optim: name={args.optimizer_name} lr={args.lr} "
+    _resolved_lr = _resolve_lr(args)
+    _lr_disp = (
+        f"{_resolved_lr:.3e} (AUTO √-rule: 5e-4·√(eff/1024), "
+        f"eff={args.batch_size}×{args.accumulate_grad_batches}×"
+        f"{args.gpus_per_node or 1})"
+        if args.lr is None else f"{_resolved_lr:.3e} (explicit)"
+    )
+    print(f"  optim: name={args.optimizer_name} lr={_lr_disp} "
           f"lr_schedule={args.lr_schedule} warmup_steps={args.warmup_steps} "
           f"min_lr_ratio={args.min_lr_ratio} weight_decay={args.weight_decay} "
           f"wd_exclude_norms={args.wd_exclude_norms} "
@@ -2520,7 +2698,12 @@ def main(argv: list[str] | None = None) -> int:
     # is byte-identical; these fire only when the flags are passed. The single-phase
     # --phase 4 rerun is the next gate, so this closes the gap that would otherwise
     # silently ignore --p4-early-stop-patience there.
-    single_max_steps = args.ssl_max_steps if args.phase in (1, 3) else None
+    # <=0 → None = epoch-budget escape (see --ssl-max-steps help / chain path).
+    _ssl_steps = (
+        args.ssl_max_steps if (args.ssl_max_steps and args.ssl_max_steps > 0)
+        else None
+    )
+    single_max_steps = _ssl_steps if args.phase in (1, 3) else None
     # #54: same step-budget-ends-mid-epoch fix as the chain, for a single SSL
     # phase. Only meaningful when this phase carries a step budget.
     single_val_check = args.ssl_val_check_interval

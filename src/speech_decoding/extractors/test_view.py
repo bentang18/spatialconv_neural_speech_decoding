@@ -14,7 +14,10 @@ Contract:
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pytest
 import torch
 
 from speech_decoding.extractors.view import LogStftView
@@ -386,10 +389,83 @@ def test_multi_stft_view_raw_is_default_and_emits_f50() -> None:
 
     raw_view = MultiStftView(event_types="Ieeg", car="shaft")
     assert raw_view.front_end == "raw"
-
     fbank_view = MultiStftView(event_types="Ieeg", car="shaft", front_end="fbank")
     assert fbank_view.front_end == "fbank"
     assert fbank_view.n_fbank_bins == 30
+
+
+def test_multi_stft_raw_view_chunked_matches_unchunked() -> None:
+    """The whole-movie feature cache slices a chunked spectrogram instead of
+    re-STFT-ing per clip; that chunked build MUST be byte-identical to one
+    un-chunked ``_multi_stft_raw_view`` over the full recording, or cached clips
+    would silently diverge from the live path's interior. Pins overlap-save
+    correctness across lengths that straddle chunk seams, the single-pass
+    fast path, and a realistic tone+noise signal."""
+    from speech_decoding.extractors.view import (
+        MULTI_STFT_RAW_BINS,
+        _multi_stft_raw_view,
+        _multi_stft_raw_view_chunked,
+    )
+
+    sr = 2048
+    torch.manual_seed(0)
+    # Lengths chosen to exercise: shorter than a chunk (single-pass), exactly a
+    # few chunks, and lengths that land mid-chunk so seams fall in the interior.
+    for n_samples in (4096, 60_000, 122_880, 200_003, 350_000):
+        for chunk_frames in (64, 200, 960):
+            # tone + broadband noise: non-trivial across all 50 bins
+            t = torch.arange(n_samples).float() / sr
+            sig = (
+                torch.sin(2 * torch.pi * 73.0 * t)
+                + 0.5 * torch.sin(2 * torch.pi * 11.0 * t)
+                + 0.1 * torch.randn(n_samples)
+            )
+            wav = torch.stack([sig, sig.flip(0)], dim=0)  # (C=2, T)
+            kw = dict(
+                sample_rate=sr,
+                hop_length=128,
+                nperseg_low=1024,
+                nperseg_mid=512,
+                nperseg_hi=256,
+                raw_bins=MULTI_STFT_RAW_BINS,
+                log_eps=1e-6,
+            )
+            full = _multi_stft_raw_view(wav, **kw)
+            chunked = _multi_stft_raw_view_chunked(wav, chunk_frames=chunk_frames, **kw)
+            assert chunked.shape == full.shape, (
+                f"shape mismatch n={n_samples} chunk={chunk_frames}: "
+                f"{chunked.shape} vs {full.shape}"
+            )
+            max_abs_delta = (chunked - full).abs().max().item()
+            assert torch.allclose(chunked, full, atol=1e-5, rtol=1e-4), (
+                f"chunked != unchunked at n={n_samples} chunk={chunk_frames}: "
+                f"max|delta|={max_abs_delta:.3e}"
+            )
+
+
+def test_multi_stft_raw_view_chunked_rejects_non_hop_divisible_window() -> None:
+    """Overlap-save alignment requires nperseg_low % hop == 0 (segment starts on
+    the global hop grid). A non-divisible config must fail loudly, not silently
+    emit misaligned frames."""
+    import pytest
+
+    from speech_decoding.extractors.view import (
+        MULTI_STFT_RAW_BINS,
+        _multi_stft_raw_view_chunked,
+    )
+
+    with pytest.raises(ValueError, match="divisible by hop_length"):
+        _multi_stft_raw_view_chunked(
+            torch.zeros(2, 300_000),
+            sample_rate=2048,
+            hop_length=100,  # 1024 % 100 != 0
+            nperseg_low=1024,
+            nperseg_mid=512,
+            nperseg_hi=256,
+            raw_bins=MULTI_STFT_RAW_BINS,
+            log_eps=1e-6,
+            chunk_frames=200,
+        )
 
 
 def test_multi_stft_view_shape_is_30_freq_17_time_at_1s_2048hz() -> None:
@@ -905,3 +981,248 @@ def test_c3_normalizer_is_robust_median_mad_not_mean_std() -> None:
     assert (t.mean(dim=-1) > 0.4).all()  # mean dragged up by the +60 spikes
     assert (norm.sigma < 2.0 * SCALE_TO_SIGMA).all()  # MAD-σ stays ~O(1)
     assert (t.std(dim=-1) > 5.0).all()  # std blown out by the spikes
+
+
+# --------------------------------------------------------------------------- #
+# Whole-movie raw-|STFT| feature cache (Ben-approved 2026-06-05)              #
+# --------------------------------------------------------------------------- #
+def _cache_view_harness(view, rec, ch, monkeypatch, key="s"):
+    """Wire a real ``MultiStftView`` for an end-to-end prepare over one synthetic
+    session: fake ``_get_data`` (the cached preprocessed waveform), event
+    extraction, and a ``super().prepare`` that only populates ``_channels`` (the
+    cache build and per-clip scatter need it). Returns the single fake event.
+    ``key`` is the session uid the cache files are named after — pass a path-like
+    or JSON-metachar value to exercise the filesystem-safe stem."""
+    import types
+
+    from speech_decoding.extractors.view import MultiStftView
+
+    n = rec.shape[-1]
+
+    class _E:
+        start = 0.0
+
+        def _splittable_event_uid(self):
+            return key
+
+    state = {"get_data_calls": 0}
+
+    def _fake_get_data(self, evs):
+        state["get_data_calls"] += 1
+        for _e in evs:
+            yield types.SimpleNamespace(
+                frequency=2048.0, start=0.0, duration=float(n) / 2048.0,
+                data=rec, ch_names=list(ch),
+            )
+
+    monkeypatch.setattr(
+        MultiStftView, "_get_data",
+        property(lambda self: types.MethodType(_fake_get_data, self)), raising=False,
+    )
+    monkeypatch.setattr(
+        MultiStftView, "_event_types_helper",
+        property(lambda self: types.SimpleNamespace(extract=lambda obj: obj)),
+        raising=False,
+    )
+
+    def _fake_super_prepare(self, obj):
+        for ta in self._get_data(self._event_types_helper.extract(obj)):
+            self._update_channels(ta.ch_names)
+
+    monkeypatch.setattr(
+        MultiStftView.__mro__[1], "prepare", _fake_super_prepare, raising=False,
+    )
+    return _E(), state
+
+
+def test_spec_cache_clip_matches_whole_movie_slice(tmp_path, monkeypatch) -> None:
+    """Core read-path correctness. The cached clip must equal an INDEPENDENT
+    reference: the un-chunked whole-movie ``_spec_from_waveform``, fp16-quantized
+    (the cache stores fp16), sliced at the global hop grid ``g0:g0+n_frames``.
+    This bakes in the three Ben-accepted forks (real-neighbour edges, global hop
+    grid) — the clip is NOT compared to the reflect-padded per-clip recompute.
+    The 70 s recording forces the build's chunked branch (total_frames 1120 >
+    chunk_frames 960), and the last window exercises the end-of-recording clamp."""
+    from speech_decoding.extractors.view import MultiStftView
+
+    view = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    ch = ["e0", "e1", "e2", "e3"]
+    rng = np.random.default_rng(123)
+    n = 2048 * 70  # 70 s → total_frames 1120 > chunk_frames 960 → real chunking
+    t = np.arange(n, dtype=np.float32) / 2048.0
+    base = rng.standard_normal((4, n)).astype(np.float32)
+    rec = (base + 0.5 * np.sin(2 * np.pi * 40.0 * t)[None, :]).astype(np.float32)
+
+    event, _ = _cache_view_harness(view, rec, ch, monkeypatch)
+    view.prepare([event])
+
+    assert view._spec_ready is True
+    assert len(list(tmp_path.rglob("*.npy"))) == 1
+    assert len(list(tmp_path.rglob("*.json"))) == 1
+    # _channels is identity here, so global order == session order.
+    assert view._get_channels(ch) == [0, 1, 2, 3]
+
+    whole = view._spec_from_waveform(torch.from_numpy(rec), 2048).numpy()
+    whole_fp16 = whole.astype(np.float16).astype(np.float32)  # cache stores fp16
+    total = whole.shape[-1]
+    hop = view.hop_length
+
+    for start, dur in [(0.0, 1.0), (5.0, 1.0), (10.3, 2.0), (70.0 - 1.0, 1.0)]:
+        out = view._get_timed_array(event, start=start, duration=dur)
+        n_frames = view.n_time_bins_for_duration(dur)
+        s0 = int(round(start * 2048.0))
+        g0 = int(round(s0 / hop))
+        g0 = max(0, min(g0, max(0, total - n_frames)))
+        expected = whole_fp16[:, :, g0 : g0 + n_frames]
+        assert out.data.shape == expected.shape == (4, view._spec_from_waveform(
+            torch.from_numpy(rec[:, :2048]), 2048).shape[1], n_frames)
+        # Both sides are the SAME fp16 values (chunked == un-chunked pre-cast),
+        # so this is near-exact; a wrong slice / channel / off-by-one frame moves
+        # values by >> fp16 quantization and is caught.
+        np.testing.assert_allclose(out.data, expected, rtol=2e-3, atol=1e-2)
+
+
+def test_spec_cache_hit_reuses_disk_and_matches_robust_z(tmp_path, monkeypatch) -> None:
+    """Cross-job reuse: a second view with the same config + cache dir must HIT
+    the on-disk spec (no waveform read, file not rewritten) AND fit robust-z stats
+    bit-identical to the building view — because both fit on the fp16-cast frames
+    that actually live on disk."""
+    view1 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
+    )
+    ch = ["e0", "e1", "e2"]
+    rng = np.random.default_rng(7)
+    n = 2048 * 30
+    rec = (rng.standard_normal((3, n)) * np.array([1.0, 4.0, 0.5])[:, None]).astype(np.float32)
+
+    event1, state1 = _cache_view_harness(view1, rec, ch, monkeypatch)
+    view1.prepare([event1])
+    # MISS: super().prepare reads the waveform once (channels), the build reads it
+    # again to compute + write the STFT → 2 reads.
+    assert state1["get_data_calls"] == 2
+    npy = next(tmp_path.rglob("*.npy"))
+    mtime1 = npy.stat().st_mtime_ns
+
+    view2 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=True, c_max=None,
+    )
+    event2, state2 = _cache_view_harness(view2, rec, ch, monkeypatch)
+    view2.prepare([event2])
+
+    # HIT: super().prepare still reads the waveform once for channels, but the
+    # build SKIPS the STFT recompute (no second read) and the file is untouched —
+    # that skipped recompute is the cross-job win.
+    assert state2["get_data_calls"] == 1
+    assert npy.stat().st_mtime_ns == mtime1
+    # Same exca uid namespace → exactly one cached spec for both views.
+    assert len(list(tmp_path.rglob("*.npy"))) == 1
+    # Bit-identical robust-z stats across the build and the cache-hit job.
+    np.testing.assert_array_equal(
+        view1._session_stats["s"].median.numpy(),
+        view2._session_stats["s"].median.numpy(),
+    )
+    np.testing.assert_array_equal(
+        view1._session_stats["s"].sigma.numpy(),
+        view2._session_stats["s"].sigma.numpy(),
+    )
+
+
+def test_spec_cache_scatter_to_noncontiguous_global(monkeypatch) -> None:
+    """``_scatter_spec_to_global`` places each session row at the global index
+    ``_get_channels`` assigns (mirroring the base waveform scatter, neuro.py:453),
+    NOT ``range(len)``. Non-contiguous, non-identity rows would expose a wrong-
+    index scatter; absent global rows stay exactly 0 (= |STFT|(0) for raw)."""
+    view = _make_multi_stft_view(spec_cache_dir="/tmp/spec_cache_unit")
+    cohort = {"e0": 0, "e9": 1, "e2": 2, "e7": 3, "e1": 4, "e5": 5, "e3": 6, "e8": 7}
+    view._channels.update(cohort)
+    sess_ch = ["e7", "e2", "e8", "e1"]  # → global rows [3, 2, 7, 4]
+    g_idx = view._get_channels(sess_ch)
+    assert g_idx == [3, 2, 7, 4]
+
+    rng = np.random.default_rng(11)
+    spec_session = torch.from_numpy(rng.standard_normal((4, 5, 6)).astype(np.float32))
+    out = view._scatter_spec_to_global(spec_session, sess_ch)
+    assert out.shape == (8, 5, 6)
+    for i, g in enumerate(g_idx):
+        torch.testing.assert_close(out[g], spec_session[i])
+    pad_rows = [r for r in range(8) if r not in g_idx]
+    assert torch.all(out[pad_rows] == 0)
+
+
+def test_spec_cache_stem_is_filesystem_safe(tmp_path, monkeypatch) -> None:
+    """A session uid containing path separators (joint D-cohort/SWEC) or JSON
+    metacharacters (BT) must NOT be used verbatim as a filename: it would escape
+    the cache dir / hit a missing parent / overrun the 255-byte limit. The hashed
+    stem sidesteps all three, and the build still produces exactly one npy/json
+    with no leftover temp files, readable end-to-end."""
+    from speech_decoding.extractors.view import MultiStftView
+
+    # path separator + JSON metachars + length, all in one nasty key.
+    nasty_key = 'sub-D146/ses-01/run-1_{"a":1,"b":2}_' + "x" * 300
+    stem = MultiStftView._spec_cache_stem(nasty_key)
+    assert "/" not in stem and len(stem) == 40  # sha1 hex
+
+    view = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    ch = ["e0", "e1"]
+    rng = np.random.default_rng(5)
+    rec = rng.standard_normal((2, 2048 * 3)).astype(np.float32)
+    event, _ = _cache_view_harness(view, rec, ch, monkeypatch, key=nasty_key)
+
+    view.prepare([event])  # would FileNotFoundError if the key were used raw
+
+    assert len(list(tmp_path.rglob("*.npy"))) == 1
+    assert len(list(tmp_path.rglob("*.json"))) == 1
+    assert list(tmp_path.rglob("*.tmp")) == []  # atomic writes leave no temps
+    # The raw key is preserved in the sidecar for provenance.
+    meta = json.loads(next(tmp_path.rglob("*.json")).read_text())
+    assert meta["key"] == nasty_key
+    # And the clip read works against the hashed-stem file.
+    out = view._get_timed_array(event, start=0.0, duration=1.0)
+    assert out.data.shape[0] == 2
+
+
+def test_spec_cache_rejects_fp16_overflow(tmp_path, monkeypatch) -> None:
+    """A whole-movie spec that exceeds the fp16 range must fail loud at build,
+    not silently store inf where the f32 recompute path stays finite."""
+    view = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    ch = ["e0", "e1"]
+    rec = np.ones((2, 2048 * 3), dtype=np.float32)
+    event, _ = _cache_view_harness(view, rec, ch, monkeypatch)
+
+    big = torch.full((2, 50, 48), 70000.0)  # > 65504 = fp16 max
+    monkeypatch.setattr(view, "_whole_movie_spec", lambda w, sr: big, raising=True)
+
+    with pytest.raises(ValueError, match="fp16 range"):
+        view.prepare([event])
+
+
+def test_spec_cache_hit_validates_f_bins(tmp_path, monkeypatch) -> None:
+    """A cache hit whose stored ``f_bins`` disagrees with the live config (stale
+    spec / hash collision) must raise rather than slice mismatched features."""
+    view1 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    ch = ["e0", "e1"]
+    rng = np.random.default_rng(9)
+    rec = rng.standard_normal((2, 2048 * 3)).astype(np.float32)
+    event1, _ = _cache_view_harness(view1, rec, ch, monkeypatch)
+    view1.prepare([event1])
+
+    # Corrupt the sidecar's f_bins, simulating a stale/colliding cache entry.
+    json_path = next(tmp_path.rglob("*.json"))
+    meta = json.loads(json_path.read_text())
+    meta["f_bins"] = meta["f_bins"] + 1
+    json_path.write_text(json.dumps(meta))
+
+    view2 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    event2, _ = _cache_view_harness(view2, rec, ch, monkeypatch)
+    with pytest.raises(ValueError, match="f_bins"):
+        view2.prepare([event2])

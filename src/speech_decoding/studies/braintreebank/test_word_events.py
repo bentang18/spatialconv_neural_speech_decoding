@@ -133,6 +133,48 @@ def test_word_event_rows_matches_upstream_interleaved_order() -> None:
         assert rows.iloc[row_i]["start"] == float(src_df.iloc[int(src)]["est_idx"]) / sr
 
 
+def test_word_event_rows_balance_false_keeps_all_anchors_chronological() -> None:
+    """SSL (balance=False): every word + every nonverbal anchor is emitted (no
+    minority-class bottleneck) in chronological est_idx order, so the positional
+    pretrain split is a clean temporal holdout. balance=True (P4) stays the
+    minority-class-balanced, interleaved set."""
+    n_words, n_nonverbal = 10, 3
+    words = pd.DataFrame(
+        {
+            "start": [float(i) for i in range(n_words)],
+            "end": [float(i) + 1.0 for i in range(n_words)],
+            "est_idx": [round((i + 200.0) * 2048.0) for i in range(n_words)],
+            "original_index": list(range(n_words)),
+            "full_word": list("ABCDEFGHIJ"),
+        }
+    )
+    nv_starts = [0.5, 4.5, 8.5]
+    nonverbal = pd.DataFrame(
+        {
+            "start": nv_starts,
+            "end": [s + 1.0 for s in nv_starts],
+            "est_idx": [round((s + 200.0) * 2048.0) for s in nv_starts],
+        }
+    )
+    balanced = _word_event_rows(
+        subject_id=2, trial_id=4, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=True,
+    )
+    assert len(balanced) == 2 * n_nonverbal  # min(10, 3) per class
+
+    unbalanced = _word_event_rows(
+        subject_id=2, trial_id=4, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=False,
+    )
+    assert len(unbalanced) == n_words + n_nonverbal  # every anchor kept
+    assert (unbalanced["label"] == 1).sum() == n_words
+    assert (unbalanced["label"] == 0).sum() == n_nonverbal
+    starts = unbalanced["start"].to_numpy()
+    assert np.all(starts[:-1] <= starts[1:])  # chronological
+
+
 def test_assign_cross_session_split_halves_test_trial_chronologically() -> None:
     df = pd.DataFrame(
         {

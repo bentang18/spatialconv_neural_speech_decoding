@@ -229,6 +229,87 @@ def test_chain_single_gpu_leaves_p4_identical(monkeypatch, tmp_path) -> None:
         # tasks_per_node None ⇒ no find-unused strategy anywhere (incl. P4).
 
 
+# --- 8-GPU scale-out (C3): the 4->8 path is airtight at the config layer ------
+
+
+def test_eight_gpu_slurm_resolves_ddp(capsys) -> None:
+    """C3 scale-out: ``--gpus-per-node 8`` on the single coganlab node must
+    resolve one srun rank per GPU (tasks_per_node=8 + srun) and the find-unused
+    strategy, with NO hang warning. The resolution is generic
+    (tasks_per_node = gpus_per_node) so 8 is the same code path as 4 — this pins
+    it so a future edit can't regress the 8-GPU launch we relaunch on."""
+    rc = main([
+        "--cluster", "slurm", "--gpus-per-node", "8",
+        "--slurm-partition", "coganlab-gpu", "--dry-run",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "tasks_per_node=8" in out
+    assert "slurm_use_srun=True" in out
+    assert "ddp_strategy=ddp_find_unused_parameters_true" in out
+    assert "DDP topology is NOT enabled" not in out
+
+
+def test_eight_gpu_chain_holds_eff_batch_with_accum_4(monkeypatch, tmp_path) -> None:
+    """C3 eff-batch invariant: the 8-GPU recipe holds effective batch = 128 by
+    halving accum 8->4 (8 GPU x bs 4 x accum 4 = 128, same as 4 x 4 x 8). The LR
+    (1.76e-4) and all opt-step-unit budgets are therefore unchanged → identical
+    science. This pins that the SSL phases receive accumulate_grad_batches=4 and
+    the 8-GPU topology together, so the copy-paste recipe stays correct."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls: list[dict] = []
+
+    def fake_build(**kw):
+        calls.append(kw)
+
+        class _Stub:
+            def run(self):
+                return {}
+
+        return _Stub()
+
+    monkeypatch.setattr(dv, "build_v14_experiment", fake_build)
+    args = dv._parser().parse_args([
+        "--chain", "--cluster", "slurm", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--gpus-per-node", "8", "--accumulate-grad-batches", "4",
+    ])
+    args.tasks_per_node = 8  # mirror main()'s post-parse DDP resolution
+    args.slurm_use_srun = True
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    assert len(calls) == 5
+    for c in calls[:4]:  # P1, P2, P3a, P3b run multi-GPU DDP
+        assert c["gpus_per_node"] == 8
+        assert c["tasks_per_node"] == 8
+        assert c["accumulate_grad_batches"] == 4
+    # 8 GPU x (per-rank bs) x accum 4 holds eff-batch == 4-GPU x accum 8 path.
+
+
+# --- speedup launch flags (C1: torch.compile front-door) ---------------------
+
+
+def test_compile_flag_sets_env_var(monkeypatch) -> None:
+    """``--compile`` must set V14_COMPILE in the dispatch process so submitit
+    captures it into the slurm job env (the module reads it at construction).
+    Default-OFF: no flag leaves the env var unset → eager path."""
+    monkeypatch.delenv("V14_COMPILE", raising=False)
+    monkeypatch.delenv("V14_COMPILE_MODE", raising=False)
+    import os
+
+    rc = main(["--gpus-per-node", "1", "--dry-run"])
+    assert rc == 0
+    assert "V14_COMPILE" not in os.environ
+
+    rc = main([
+        "--compile", "--compile-mode", "default",
+        "--gpus-per-node", "1", "--dry-run",
+    ])
+    assert rc == 0
+    assert os.environ["V14_COMPILE"] == "1"
+    assert os.environ["V14_COMPILE_MODE"] == "default"
+
+
 # --- rank-0 write gate -------------------------------------------------------
 
 

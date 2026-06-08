@@ -145,8 +145,17 @@ def _word_event_rows(
     nano: bool,
     random_seed: int,
     duration: float,
+    balance: bool = True,
 ) -> pd.DataFrame:
-    """Build per-task balanced Word rows in upstream Dataset item order.
+    """Build per-task Word rows.
+
+    ``balance=True`` (P4 eval): class-balanced rows in upstream Dataset item
+    order — see the interleaving note below. ``balance=False`` (label-free SSL):
+    EVERY word + nonverbal anchor (no cross-class down-sampling), emitted in
+    chronological ``start`` order so the per-session positional pretrain split
+    (:func:`_assign_pretrain_split`) is a clean temporal holdout. The
+    item-order/majority-class hazard below applies only to the balanced eval
+    splits, never to the label-free SSL split.
 
     Mirrors :meth:`BrainTreebankSubjectTrialBenchmarkDataset.__getitem__`
     exactly: items strictly interleave classes via ``(idx + 1) % n_classes``
@@ -178,10 +187,24 @@ def _word_event_rows(
             lite=lite,
             nano=nano,
             random_seed=random_seed,
+            balance=balance,
         )
-        ordered_labels = ordered_dataset_labels(label_indices)
-        ordered_source_indices = ordered_dataset_source_indices(label_indices)
-        for class_id_arr, src_idx_arr in zip(ordered_labels, ordered_source_indices):
+        if balance:
+            # Eval parity: interleave classes in upstream Dataset item order.
+            ordered_pairs = zip(
+                ordered_dataset_labels(label_indices),
+                ordered_dataset_source_indices(label_indices),
+            )
+        else:
+            # SSL: every anchor, no balanced interleaving (it assumes equal
+            # class sizes). Order is irrelevant here — rows are sorted by
+            # ``start`` before return for the temporal pretrain split.
+            ordered_pairs = (
+                (label, src)
+                for label, idxs in label_indices.items()
+                for src in idxs
+            )
+        for class_id_arr, src_idx_arr in ordered_pairs:
             class_id = int(class_id_arr)
             src_idx = int(src_idx_arr)
             is_nonverbal = task in {"onset", "speech"} and class_id == 0
@@ -221,7 +244,12 @@ def _word_event_rows(
                 "subject_id", "trial_id", "timeline", "movie_onset_s",
             )}
         )
-    return pd.DataFrame(rows).reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    if not balance:
+        # Chronological so the positional pretrain split is a temporal holdout
+        # (test = movie tail). Stable sort keeps determinism across tasks.
+        out = out.sort_values("start", kind="stable")
+    return out.reset_index(drop=True)
 
 
 def _assign_cross_session_split(
@@ -360,6 +388,11 @@ class BTWordEvents(EventsTransform):
     binary_tasks: bool = True
     lite: bool = True
     nano: bool = False
+    # Class-balance the emitted anchors. True (P4 eval): Neuroprobe-parity
+    # balanced + interleaved. False (label-free SSL P1/P2/P3): keep EVERY word +
+    # nonverbal anchor (no cross-class min, no eval-parity interleave) →
+    # ~96-99% movie coverage instead of the minority-class-bottlenecked subset.
+    balance: bool = True
     eval_mode: EvalMode = "CrossSession"
     test_subject_id: int = _UPSTREAM_TRAIN_SUBJECT_ID
     test_trial_id: int = _UPSTREAM_TRAIN_TRIAL_ID
@@ -424,6 +457,7 @@ class BTWordEvents(EventsTransform):
                 nano=self.nano,
                 random_seed=self.random_seed,
                 duration=self.duration,
+                balance=self.balance,
             )
             all_word_rows.append(timeline_rows)
 

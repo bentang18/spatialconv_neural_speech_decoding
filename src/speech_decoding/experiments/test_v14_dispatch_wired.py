@@ -143,14 +143,14 @@ def test_dispatch_adamw_does_not_leak_torch_default_weight_decay(
     assert all(g["weight_decay"] == 0.0 for g in optim.param_groups)
 
 
-def test_dispatch_c_max_defaults_to_384_across_extractors(tmp_path, monkeypatch) -> None:
-    """#35: the default c_max (384, multi-corpus) reaches every c_max-padded
-    extractor."""
+def test_dispatch_c_max_defaults_to_256_across_extractors(tmp_path, monkeypatch) -> None:
+    """Default c_max = 256 (2026-06-07 BT-only default; BT max electrodes = 256)
+    reaches every c_max-padded extractor. The joint corpus uses --c-max 384."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     exts = dispatch_v14.build_v14_experiment(mode="nano").data.segmenter.extractors
-    assert exts["electrode_tokens"].c_max == 384
-    assert exts["support"].c_max == 384
-    assert exts["valid_mask"].c_max == 384
+    assert exts["electrode_tokens"].c_max == 256
+    assert exts["support"].c_max == 256
+    assert exts["valid_mask"].c_max == 256
 
 
 def test_dispatch_c_max_256_threads_to_all_padded_extractors(tmp_path, monkeypatch) -> None:
@@ -408,8 +408,8 @@ def test_dispatch_default_wires_valid_mask_and_support_with_c_max(
     extractors = xp.data.segmenter.extractors
     assert isinstance(extractors["support"], V14DKHardSupportExtractor)
     assert isinstance(extractors["valid_mask"], ElectrodeValidMask)
-    assert extractors["support"].c_max == 384
-    assert extractors["valid_mask"].c_max == 384
+    assert extractors["support"].c_max == 256
+    assert extractors["valid_mask"].c_max == 256
 
 
 def test_dispatch_default_sets_x_name_tuple_with_mask(
@@ -818,8 +818,13 @@ def test_b29_dispatch_corpus_mix_must_sum_to_one(tmp_path, monkeypatch) -> None:
     bad = {"swec": 0.5, "ajile12": 0.5, "d_cohort": 0.5, "braintreebank": 0.5}
     import pytest
 
+    # include_ajile12=True keeps all four corpora so the sum-to-1 guard fires;
+    # with the default (now False) the ajile12-drop renormalizes the remaining
+    # three (covered by test_b29_dispatch_corpus_mix_renormalizes_when_ajile12_excluded).
     with pytest.raises(ValueError, match="corpus_mix must sum to 1.0"):
-        dispatch_v14.build_v14_experiment(mode="nano", corpus_mix=bad)
+        dispatch_v14.build_v14_experiment(
+            mode="nano", corpus_mix=bad, include_ajile12=True,
+        )
 
 
 def test_b29_dispatch_corpus_mix_renormalizes_when_ajile12_excluded(
@@ -857,10 +862,13 @@ def test_b36_dispatch_phase_mode_default_is_split_p1_p2() -> None:
     assert args.phase_mode == "split_p1_p2"
 
 
-def test_b29_dispatch_default_includes_ajile12() -> None:
+def test_dispatch_default_excludes_ajile12() -> None:
+    """Default OFF (2026-06-07): the active chain is BT-only. --include-ajile12
+    restores the B29 joint mix; --no-include-ajile12 is the explicit falsifier."""
     parser = dispatch_v14._parser()
-    args = parser.parse_args([])
-    assert args.include_ajile12 is True
+    assert parser.parse_args([]).include_ajile12 is False
+    assert parser.parse_args(["--include-ajile12"]).include_ajile12 is True
+    assert parser.parse_args(["--no-include-ajile12"]).include_ajile12 is False
 
 
 def test_b29_dispatch_default_ref_operator_alpha_is_0p3() -> None:

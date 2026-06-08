@@ -66,9 +66,12 @@ selects 38 bins.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
+import os
 import typing as tp
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -415,6 +418,93 @@ def _multi_stft_raw_view(
     return out
 
 
+def _multi_stft_raw_view_chunked(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    hop_length: int,
+    nperseg_low: int,
+    nperseg_mid: int,
+    nperseg_hi: int,
+    raw_bins: tuple[tuple[int, int, int], ...],
+    log_eps: float,
+    apply_log: bool = False,
+    chunk_frames: int = 960,
+) -> torch.Tensor:
+    """Memory-bounded whole-recording raw |STFT|, byte-identical to one
+    un-chunked :func:`_multi_stft_raw_view` over the full ``waveform``.
+
+    Computing a single ``torch.stft`` over a multi-hour recording allocates
+    ``O(C · F · T)`` for the complex spectrogram (tens of GB). This processes
+    the recording in ``chunk_frames``-wide output blocks via overlap-save: each
+    block reads ``half = nperseg_low // 2`` extra REAL samples of context on
+    each side, runs the standard ``_multi_stft_raw_view`` on that padded
+    segment, then keeps only the frames whose full analysis window was real
+    (trimming the ``center=True`` reflect-contaminated boundary frames). The
+    only reflect frames retained are at the TRUE recording ends, where the
+    segment edge coincides with the global edge and the reflection is exactly
+    what the un-chunked call produces.
+
+    Correctness hinges on ``half`` being a multiple of ``hop_length`` (true for
+    the 1024/512/256 @ hop=128 lock: 512 = 4·128) so every segment starts on a
+    sample that is a multiple of ``hop_length`` — only then does segment frame
+    ``g`` map to global frame ``seg_start // hop + g``. Pinned to the un-chunked
+    result by ``test_multi_stft_raw_view_chunked_matches_unchunked``.
+
+    Input ``(..., C, T_samples)`` → output ``(..., C, F_RAW, T_bin)`` with
+    ``T_bin = 1 + T_samples // hop_length`` (the ``center=True`` frame count).
+    """
+    if hop_length <= 0 or nperseg_low % hop_length != 0:
+        raise ValueError(
+            f"chunked whole-movie STFT needs nperseg_low ({nperseg_low}) "
+            f"divisible by hop_length ({hop_length}) so segment starts land on "
+            "the global hop grid"
+        )
+    n_samples = int(waveform.shape[-1])
+    total_frames = 1 + n_samples // hop_length
+    half = nperseg_low // 2  # widest window's reach; a multiple of hop_length
+
+    def _view(seg: torch.Tensor) -> torch.Tensor:
+        return _multi_stft_raw_view(
+            seg,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            nperseg_low=nperseg_low,
+            nperseg_mid=nperseg_mid,
+            nperseg_hi=nperseg_hi,
+            raw_bins=raw_bins,
+            log_eps=log_eps,
+            apply_log=apply_log,
+        )
+
+    # Whole recording fits in one pass (or is too short to chunk): direct call.
+    if total_frames <= chunk_frames or n_samples <= 2 * half + nperseg_low:
+        return _view(waveform)
+
+    blocks: list[torch.Tensor] = []
+    f = 0
+    while f < total_frames:
+        f_end = min(f + chunk_frames, total_frames)
+        # Real-sample span covering output frames [f, f_end), padded by `half`
+        # of REAL context each side; clamp to the recording (true-edge reflect
+        # then matches the global call). lo stays a multiple of hop_length.
+        lo = max(0, (f * hop_length) - half)
+        hi = min(n_samples, (f_end - 1) * hop_length + half + 1)
+        # A short tail segment (< nperseg_low) would trip _multi_stft_raw_view's
+        # zero-pad probe branch, corrupting the widest window. Grow the segment
+        # leftward (staying on the hop grid so frame alignment holds) so every
+        # window sees a full-length input.
+        if hi - lo < nperseg_low:
+            lo = ((max(0, hi - nperseg_low)) // hop_length) * hop_length
+        seg = waveform[..., lo:hi]
+        spec_seg = _view(seg)  # (..., F, 1 + (hi-lo)//hop)
+        g0 = f - lo // hop_length
+        g1 = f_end - lo // hop_length
+        blocks.append(spec_seg[..., g0:g1])
+        f = f_end
+    return torch.cat(blocks, dim=-1)
+
+
 def _log_stft_view(
     waveform: torch.Tensor,
     *,
@@ -531,6 +621,17 @@ class LogStftView(CARIeegExtractor):
             duration=duration,
             data=spec.cpu().numpy(),
         )
+
+
+class _SpecCacheEntry(tp.NamedTuple):
+    """One session's whole-movie raw-|STFT| memmap-cache record. Immutable +
+    picklable so it survives both Linux fork and pydantic's spawn pickling of
+    private attrs (the ``_session_stats`` inheritance pattern)."""
+
+    path: str
+    ch_names: tuple[str, ...]
+    total_frames: int
+    sample_rate: int
 
 
 class MultiStftView(CARIeegExtractor):
@@ -653,6 +754,75 @@ class MultiStftView(CARIeegExtractor):
     _session_bads: dict[str, list[str]] = {}
     _bads_ready: bool = False
 
+    # ------------------------------------------------------------------ #
+    # Whole-movie raw-|STFT| feature cache (Ben-approved 2026-06-05).      #
+    # ------------------------------------------------------------------ #
+    # Default None = OFF: the per-clip path recomputes the STFT and the
+    # robust-z fit uses the seam-chunked ``_fit_session_robust_z`` loop — both
+    # byte-for-byte the pre-cache behavior, so live runs are untouched unless
+    # this is set. When set, ``prepare`` materializes each session's
+    # SESSION-channel-order whole-recording raw |STFT| once (seam-free via
+    # ``_multi_stft_raw_view_chunked``) under
+    # ``{spec_cache_dir}/{infra.uid()}/{session_uid}.npy`` (fp16 + ``.json``
+    # sidecar) and ``_get_timed_array`` slices that memmap per clip instead of
+    # re-STFT'ing. The namespace is ``infra.uid()`` (the data-determining pydantic
+    # fields: notch/filter/car/lof/STFT config) PLUS a digest of the
+    # data-determining ClassVars ``raw_bins``/``fbank_routing`` (which infra.uid()
+    # cannot see) — see ``_spec_cache_namespace``, so an FE-RAW bin change cannot
+    # silently hit a stale spec. The M0 optimizer sweep (#45) thus computes the
+    # spec ONCE and every later same-config job memmaps it; sessions already on
+    # disk are skipped (cross-job reuse), each per-session file keyed by the
+    # SHA-1 of the session uid (``_spec_cache_stem``) so path separators / JSON
+    # metacharacters / the 255-byte filename limit can never break the write.
+    #
+    # Three Ben-accepted feature forks vs the per-clip path (benign / SSL-neutral
+    # or -positive): (1) clip edges read real neighbouring audio rather than
+    # ``torch.stft`` center-reflect padding; (2) clip frames snap to the global
+    # hop grid (≤ hop/2 = 31 ms at hop=128); (3) the robust-z fit is seam-free.
+    # Stats are fit on the fp16-cast frames in BOTH the build and the cross-job
+    # cache-hit path, so every sweep job's stats are bit-identical regardless of
+    # who built the cache. Only supported for the v14 default front_end="raw",
+    # apply_log=False, and no waveform-domain transforms (baseline/scale/clamp),
+    # which ``_validate_spec_cache_config`` enforces at construction.
+    spec_cache_dir: str | None = None
+    # session key (``event._splittable_event_uid()``) -> cache record, filled in
+    # ``prepare`` on the main process and inherited by forked DataLoader workers
+    # (the same fill-in-prepare / read-per-clip pattern as ``_session_stats``).
+    _spec_cache_index: dict[str, _SpecCacheEntry] = {}
+    _spec_ready: bool = False
+
+    @model_validator(mode="after")
+    def _validate_spec_cache_config(self) -> "MultiStftView":
+        # The cache path bypasses ``super()._get_timed_array`` (the waveform read
+        # + scatter + STFT) and slices a precomputed |STFT| instead. That is only
+        # equivalent to the per-clip path for the v14 default config: raw bins,
+        # no log (so the global-channel scatter background |STFT|(0)=0 matches the
+        # per-clip path's STFT-of-zero rows), and no waveform-domain transforms
+        # (baseline subtraction / scale_factor / clamp all act pre-STFT on the
+        # waveform, which the cache never sees). Fail loud at construction rather
+        # than silently desync features.
+        if self.spec_cache_dir is not None:
+            if self.front_end != "raw":
+                raise ValueError(
+                    "MultiStftView.spec_cache_dir is only supported for "
+                    f"front_end='raw' (got {self.front_end!r}): the fbank scatter "
+                    "background is not implemented for the cache path."
+                )
+            if self.apply_log:
+                raise ValueError(
+                    "MultiStftView.spec_cache_dir requires apply_log=False: the "
+                    "global-channel scatter fills absent rows with |STFT|(0)=0, "
+                    "which only matches the per-clip path when log is off."
+                )
+            for field in ("baseline", "scale_factor", "clamp"):
+                if getattr(self, field, None) is not None:
+                    raise ValueError(
+                        f"MultiStftView.spec_cache_dir does not support {field!r}: "
+                        "it is a waveform-domain transform applied before the STFT, "
+                        "which the precomputed-spectrogram cache path bypasses."
+                    )
+        return self
+
     @model_validator(mode="after")
     def _validate_lof_config(self) -> "MultiStftView":
         # Fail at construction, not silently mid-run. LOF that flags-but-never-
@@ -733,11 +903,29 @@ class MultiStftView(CARIeegExtractor):
     def _get_timed_array(
         self, event, start: float, duration: float,
     ) -> TimedArray:
+        if self.spec_cache_dir is not None and self._spec_ready:
+            # Whole-movie cache armed: slice the precomputed memmap instead of
+            # reading the waveform and re-STFT'ing it. _stats_ready/_spec_ready
+            # are both False during the prepare shape-probe, so the probe still
+            # falls through to the recompute path below (it needs the real STFT
+            # only to learn the output shape).
+            return self._cached_clip(event, start, duration)
         waveform_ta = super()._get_timed_array(event, start, duration)
         waveform_t = torch.from_numpy(np.asarray(waveform_ta.data)).float()
         spec = self._spec_from_waveform(
             waveform_t, int(float(waveform_ta.frequency)),
         )
+        return self._finalize_clip(event, spec, start, duration)
+
+    def _finalize_clip(
+        self, event, spec: torch.Tensor, start: float, duration: float,
+    ) -> TimedArray:
+        """Shared clip tail for both the recompute and cache read paths: frozen
+        robust-z (global-channel order), c_max pad, and the TimedArray wrap. Spec
+        arrives in ``(C_global, F, T)`` global-channel order in BOTH paths (the
+        recompute path scatters the waveform pre-STFT; the cache path scatters the
+        sliced spec), so the robust-z stats (also scattered to global) broadcast
+        identically and the two paths share one finalization."""
         if self.session_robust_z:
             # Apply BEFORE c_max padding: stats cover the real C electrodes only;
             # padded channels stay exactly 0 (normalizing them would map 0 →
@@ -812,7 +1000,16 @@ class MultiStftView(CARIeegExtractor):
         # bads now, which is exactly what we want cached). Only after the fit do we
         # arm ``_stats_ready`` so real clips normalize.
         super().prepare(obj)
-        if self.session_robust_z:
+        if self.spec_cache_dir is not None:
+            # The cache build drives BOTH the materialized whole-movie spec AND
+            # (when on) the robust-z fit, from the SAME seam-free frames, so the
+            # per-clip slice and the stats can never diverge (fork 3). Replaces
+            # the seam-chunked ``_fit_session_robust_z`` on the cache path.
+            self._build_spec_cache_and_fit(obj)
+            self._spec_ready = True
+            if self.session_robust_z:
+                self._stats_ready = True
+        elif self.session_robust_z:
             self._fit_session_robust_z(obj)
             self._stats_ready = True
 
@@ -1034,3 +1231,285 @@ class MultiStftView(CARIeegExtractor):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(payload, indent=2))
             logger.warning("MNE-LOF drop-count report written -> %s", path)
+
+    # ------------------------------------------------------------------ #
+    # Whole-movie raw-|STFT| feature cache (Ben-approved 2026-06-05)      #
+    # ------------------------------------------------------------------ #
+    def _whole_movie_spec(
+        self, waveform: torch.Tensor, sample_rate: int,
+    ) -> torch.Tensor:
+        """``(C_session, T)`` waveform → seam-free whole-recording raw |STFT|
+        ``(C_session, F, T_total)``, byte-identical to one un-chunked
+        ``_multi_stft_raw_view`` (pinned by ``test_multi_stft_raw_view_chunked_
+        matches_unchunked``). This is the single source the cache slices and the
+        robust-z stats are fit on, so fit-time and apply-time features agree by
+        construction."""
+        return _multi_stft_raw_view_chunked(
+            waveform,
+            sample_rate=sample_rate,
+            hop_length=self.hop_length,
+            nperseg_low=self.nperseg_low,
+            nperseg_mid=self.nperseg_mid,
+            nperseg_hi=self.nperseg_hi,
+            raw_bins=self.raw_bins,
+            log_eps=self.log_eps,
+            apply_log=self.apply_log,
+        )
+
+    def _expected_raw_f_bins(self) -> int:
+        """F (frequency bins) the ``front_end="raw"`` spec must have for the
+        current ``raw_bins``: the inclusive bin count summed over the three
+        windows. Used to fail loud if a cache hit's stored ``f_bins`` disagrees
+        with the live config (defence in depth behind the namespace digest)."""
+        return sum(ke - ks + 1 for (_, ks, ke) in self.raw_bins)
+
+    def _spec_cache_namespace(self) -> str:
+        """Cache namespace = ``infra.uid()`` PLUS a digest of the data-determining
+        ClassVars. ``raw_bins`` and ``fbank_routing`` are ``ClassVar``s, not
+        pydantic fields, so exca's field-hash ``infra.uid()`` cannot see them — an
+        FE-RAW F-bin recost (HB02) that changes ``raw_bins`` would otherwise reuse
+        a stale spec built with different bins. Fold them into the namespace so
+        different bin configs land in different directories. The STFT/preproc
+        pydantic fields are already covered by ``infra.uid()``."""
+        sig = repr((
+            tuple(self.raw_bins),
+            tuple(self.fbank_routing),
+            self.front_end,
+            bool(self.apply_log),
+        )).encode()
+        digest = hashlib.sha1(sig).hexdigest()[:12]
+        return f"{self.infra.uid()}-fe{digest}"  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _spec_cache_stem(key: str) -> str:
+        """Filesystem-safe fixed-length stem for a session ``key``. The raw key is
+        ``event._splittable_event_uid()`` — for BT a 120-byte JSON full of
+        ``{}":,`` metacharacters (legal on ext4 but fragile and near the 255-byte
+        filename limit), and for the joint D-cohort/SWEC corpus a real file path
+        containing ``/`` (which would escape the cache dir / hit a missing parent).
+        Hashing sidesteps separators, metacharacters, and length in one move; the
+        raw key is preserved inside the ``.json`` sidecar for provenance."""
+        return hashlib.sha1(key.encode()).hexdigest()
+
+    @staticmethod
+    def _atomic_write(path: Path, write_fn) -> None:
+        """Write ``path`` via a process-unique temp file + ``os.replace`` so two
+        M0-sweep builders materializing the SAME session never share a temp path
+        (a fixed ``.tmp`` name would let them tear each other's bytes), and a
+        crash mid-write never leaves a half-file that looks complete. ``write_fn``
+        receives the open binary handle."""
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "wb") as fh:
+                write_fn(fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    def _assert_cache_meta(
+        self, key: str, meta: dict, expected_f: int, ch_names: list[str],
+    ) -> None:
+        """Validate a cache hit's stored geometry against the live config. The
+        namespace digest already separates ``raw_bins``/STFT configs, so a hit
+        with the wrong ``f_bins`` means the cache was corrupted or a hash collided
+        — either way slicing it would silently desync features, so raise."""
+        f_bins = int(meta.get("f_bins", -1))
+        if f_bins != expected_f:
+            raise ValueError(
+                f"cached spec for {key!r} has f_bins={f_bins} but the live "
+                f"raw_bins config expects {expected_f}. Stale/corrupt cache — "
+                f"clear {self.spec_cache_dir!r} or check raw_bins."
+            )
+        n_channels = int(meta.get("n_channels", -1))
+        if n_channels != len(ch_names):
+            raise ValueError(
+                f"cached spec for {key!r} has n_channels={n_channels} but its "
+                f"sidecar lists {len(ch_names)} ch_names — corrupt cache."
+            )
+
+    @staticmethod
+    def _assert_fp16_safe(key: str, spec_f32: torch.Tensor) -> None:
+        """Refuse to fp16-cast a session whose raw |STFT| is non-finite or exceeds
+        the fp16 range (65504): the cast would store inf where the f32 recompute
+        path stays finite."""
+        if not torch.isfinite(spec_f32).all():
+            raise ValueError(
+                f"whole-movie spec for session {key!r} is non-finite before the "
+                "fp16 cache write — refusing to poison the cache."
+            )
+        max_mag = float(spec_f32.abs().max())
+        if max_mag >= 65504.0:
+            raise ValueError(
+                f"whole-movie spec for session {key!r} exceeds fp16 range "
+                f"(max |.|={max_mag:.1f} >= 65504); the cache would store inf. "
+                "Enable a scaler or reduce the raw |STFT| magnitude."
+            )
+
+    def _build_spec_cache_and_fit(self, obj) -> None:
+        """Materialize each session's seam-free whole-recording raw |STFT| to the
+        fp16 memmap cache (skipping sessions already on disk → cross-job reuse)
+        and, when ``session_robust_z`` is on, fit that session's robust-z stats
+        from the SAME fp16 frames the per-clip path will read. Fitting on the
+        fp16-cast frames in BOTH the build branch and the cache-hit branch makes
+        every sweep job's stats bit-identical regardless of who built the cache.
+        Runs on the main process inside ``Data.build``; the index + stats are
+        inherited by forked DataLoader workers."""
+        events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
+        cache_root = Path(self.spec_cache_dir) / self._spec_cache_namespace()  # type: ignore[arg-type]
+        cache_root.mkdir(parents=True, exist_ok=True)
+        expected_f = self._expected_raw_f_bins()
+        seen: set[str] = set()
+        for event in events:
+            key = event._splittable_event_uid()
+            if key in seen:
+                continue
+            seen.add(key)
+            stem = self._spec_cache_stem(key)
+            npy_path = cache_root / f"{stem}.npy"
+            json_path = cache_root / f"{stem}.json"
+            hit = npy_path.exists() and json_path.exists()
+            if hit:
+                meta = json.loads(json_path.read_text())
+                ch_names = list(meta["ch_names"])
+                total_frames = int(meta["total_frames"])
+                sample_rate = int(meta["sample_rate"])
+                # Defence in depth behind the namespace digest: a hit whose stored
+                # geometry disagrees with the live config is a stale/corrupt spec —
+                # fail loud rather than slice mismatched features.
+                self._assert_cache_meta(key, meta, expected_f, ch_names)
+                # Only pay the full read when the stats fit needs the frames; the
+                # median fit needs the whole recording in RAM anyway, so load it
+                # fully (writable) rather than via a read-only memmap.
+                frames = (
+                    torch.from_numpy(np.load(npy_path))
+                    if self.session_robust_z
+                    else None
+                )
+            else:
+                raw_ta = next(self._get_data([event]))
+                waveform = torch.from_numpy(np.asarray(raw_ta.data)).float()
+                sample_rate = int(float(raw_ta.frequency))
+                ch_names = list(raw_ta.ch_names)
+                spec_f32 = self._whole_movie_spec(waveform, sample_rate)
+                del waveform
+                # fp16 overflow guard: the production default is scaler=None, so a
+                # large raw |STFT| could cast to inf where the f32 recompute path
+                # stays finite — a silent feature divergence. Fail loud with the
+                # offending session instead of poisoning the cache.
+                self._assert_fp16_safe(key, spec_f32)
+                # f32 STFT → fp16 cast: the fp16 values ARE what lands on disk and
+                # what the per-clip path reads, so fit the stats on them too.
+                frames = spec_f32.to(torch.float16)
+                del spec_f32
+                total_frames = int(frames.shape[-1])
+                meta = {
+                    "key": key,
+                    "ch_names": ch_names,
+                    "total_frames": total_frames,
+                    "sample_rate": sample_rate,
+                    "f_bins": int(frames.shape[1]),
+                    "n_channels": int(frames.shape[0]),
+                    "dtype": "float16",
+                }
+                # Commit order: json FIRST, npy LAST, each atomic. The hit check is
+                # (npy AND json), so a reader only sees a hit once npy lands — by
+                # which time json is already complete. A crash between the two
+                # leaves an orphan json (hit=False → recompute, self-healing).
+                self._atomic_write(
+                    json_path,
+                    lambda fh, m=meta: fh.write(json.dumps(m).encode()),
+                )
+                self._atomic_write(
+                    npy_path,
+                    lambda fh, fr=frames: np.save(fh, fr.cpu().numpy()),
+                )
+                del raw_ta
+            if sample_rate != int(self.sample_rate_hz):
+                raise ValueError(
+                    f"cached session {key!r} sample_rate {sample_rate} != "
+                    f"view.sample_rate_hz {int(self.sample_rate_hz)}: the per-clip "
+                    "frame grid (n_time_bins_for_duration) and the encoder RoPE "
+                    "ceiling both assume a single rate. Resample upstream."
+                )
+            if self.session_robust_z:
+                assert frames is not None
+                normalizer = SessionRobustZNormalizer(
+                    sigma_floor=self.session_z_sigma_floor,
+                ).fit(frames.float())
+                self._scatter_stats_to_global(normalizer, ch_names)
+                self._session_stats[key] = normalizer
+            self._spec_cache_index[key] = _SpecCacheEntry(
+                path=str(npy_path),
+                ch_names=tuple(ch_names),
+                total_frames=total_frames,
+                sample_rate=sample_rate,
+            )
+            del frames
+
+    def _scatter_spec_to_global(
+        self, spec_session: torch.Tensor, ch_names: list[str],
+    ) -> torch.Tensor:
+        """``(C_session, F, T)`` session-order spec → ``(C_global, F, T)`` global
+        order, the session's rows placed at the SAME global indices
+        ``_get_channels(ch_names)`` assigns the waveform clip in the base
+        ``_get_timed_array`` (neuro.py:453). Background rows stay 0, which equals
+        the recompute path's STFT-of-zero rows because ``front_end="raw"`` +
+        ``apply_log=False`` (enforced by ``_validate_spec_cache_config``) make
+        |STFT|(0) = 0. So scatter-then-STFT (cache) and STFT-of-scatter (recompute)
+        agree row-for-row."""
+        channel_idx = self._get_channels(ch_names)  # type: ignore[attr-defined]
+        c_global = max(self._channels.values()) + 1  # type: ignore[attr-defined]
+        f_bins = int(spec_session.shape[1])
+        t_bins = int(spec_session.shape[2])
+        out = torch.zeros(c_global, f_bins, t_bins, dtype=spec_session.dtype)
+        idx = torch.as_tensor(channel_idx, dtype=torch.long)
+        out[idx] = spec_session
+        return out
+
+    def _cached_clip(self, event, start: float, duration: float) -> TimedArray:
+        """Per-clip read off the whole-movie memmap: map [start, start+duration]
+        to the global hop grid, slice the session memmap, scatter to global, then
+        share ``_finalize_clip`` (robust-z + c_max + wrap) with the recompute
+        path. The three Ben-accepted forks live here: the slice reads real
+        neighbouring frames at the edges (no reflect pad), and the start snaps to
+        the global hop grid (``round(s0/hop)``, ≤ hop/2 shift)."""
+        key = event._splittable_event_uid()
+        entry = self._spec_cache_index.get(key)
+        if entry is None:
+            raise KeyError(
+                f"MultiStftView.spec_cache_dir is on but no cached spec for "
+                f"session {key!r}. prepare() must run (and see this session) "
+                f"before clips are drawn. Have specs for: "
+                f"{sorted(self._spec_cache_index)[:8]}..."
+            )
+        spec_mm = np.load(entry.path, mmap_mode="r")  # (C_session, F, T_total) fp16
+        freq = float(entry.sample_rate)
+        # Sample offset of the clip in the _get_data array (base relocates that
+        # array so sample 0 == event.start; the base also adds self.offset to
+        # start before windowing — replicate both). center=True frame g is
+        # centered at sample g*hop → g0 = round(s0/hop) (fork 2: global grid).
+        s0 = int(round((float(start) + float(self.offset) - float(event.start)) * freq))
+        g0 = int(round(s0 / self.hop_length))
+        n_frames = self.n_time_bins_for_duration(duration)
+        total = int(entry.total_frames)
+        # Clamp the window inside the recording (clips drawn within bounds keep
+        # their grid position; a window past the end is pulled back, matching the
+        # whole-movie spec's own boundary frames).
+        g0 = max(0, min(g0, max(0, total - n_frames)))
+        sliced = np.asarray(spec_mm[:, :, g0 : g0 + n_frames]).astype(np.float32)
+        del spec_mm
+        if sliced.shape[-1] < n_frames:
+            # Recording shorter than one clip window: zero-pad the tail (the same
+            # absent-frame convention as a too-short recompute window).
+            pad = np.zeros(
+                (sliced.shape[0], sliced.shape[1], n_frames - sliced.shape[-1]),
+                dtype=np.float32,
+            )
+            sliced = np.concatenate([sliced, pad], axis=-1)
+        spec = self._scatter_spec_to_global(
+            torch.from_numpy(sliced), list(entry.ch_names),
+        )
+        return self._finalize_clip(event, spec, start, duration)

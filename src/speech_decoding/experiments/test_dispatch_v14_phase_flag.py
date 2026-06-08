@@ -518,7 +518,7 @@ def test_chain_budget_and_early_stop_wiring(monkeypatch, tmp_path) -> None:
 
 
 def test_chain_default_budget_and_patience_disable(monkeypatch, tmp_path) -> None:
-    """#32 defaults: no SSL step budget (epoch budget via --n-epochs); a P4
+    """Default SSL budget = 1500 steps/phase (2026-06-07 production default); a P4
     patience <= 0 disables early-stop and runs P4 to the --n-epochs cap."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
@@ -530,17 +530,35 @@ def test_chain_default_budget_and_patience_disable(monkeypatch, tmp_path) -> Non
     ])
     dv._build_v14_chain(args, cross_attn_positions=None)
     for i in (0, 1, 2, 3):
-        assert calls[i]["max_steps"] is None  # default -> epoch budget
+        assert calls[i]["max_steps"] == 1500  # default step budget
     assert calls[4]["early_stopping_patience"] is None  # 0 disables
 
 
+def test_chain_ssl_max_steps_zero_falls_back_to_epoch_budget(
+    monkeypatch, tmp_path,
+) -> None:
+    """--ssl-max-steps <=0 is the documented epoch-budget escape: max_steps→None
+    so the SSL/distill phases fall back to the --n-epochs budget."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--ssl-max-steps", "0",
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    for i in (0, 1, 2, 3):
+        assert calls[i]["max_steps"] is None  # <=0 -> epoch budget
+
+
 def test_chain_default_optim_is_locked_b01_config(monkeypatch, tmp_path) -> None:
-    """Default FLIPPED 2026-06-04 (project_v14_optimizer_default_b01_config): with
-    no optim flags every chain phase gets the §7/B01-locked config — lr=1e-3,
-    warmup_cosine, AdamW, β2=0.95, grad_clip=1.0, wd=0.0. constant-Adam/β2=0.999
-    was the unimplemented-default *bug*, never a chosen config, so it is no longer
-    the default (and a real SSL/distill run refuses it — see
-    test_launch_guard_refuses_real_ssl_on_unimplemented_default_optim)."""
+    """Production default (2026-06-07): with no optim flags every chain phase gets
+    the validated config — lr=AUTO √-rule (5e-4·√(eff/1024); default eff = bs 4 ×
+    accum 8 × 1 gpu = 32 → 8.8e-5), warmup_cosine, AdamW, β2=0.95, grad_clip=1.0,
+    wd=0.05. constant-Adam/β2=0.999 was the unimplemented-default *bug*, never a
+    chosen config, so it is refused on a real SSL/distill run — see
+    test_launch_guard_refuses_real_ssl_on_unimplemented_default_optim."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
@@ -549,13 +567,35 @@ def test_chain_default_optim_is_locked_b01_config(monkeypatch, tmp_path) -> None
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
     ])
     dv._build_v14_chain(args, cross_attn_positions=None)
+    expected_lr = 5e-4 * (4 * 8 * 1 / 1024) ** 0.5
     for c in calls:  # all 5 phases
-        assert c["lr"] == 1e-3
+        assert c["lr"] == pytest.approx(expected_lr)
         assert c["lr_schedule"] == "warmup_cosine"
         assert c["optimizer_name"] == "AdamW"
-        assert c["weight_decay"] == 0.0
+        assert c["weight_decay"] == 0.05
         assert c["adam_betas"] == (0.9, 0.95)
         assert c["gradient_clip_val"] == 1.0
+
+
+def test_resolve_lr_auto_sqrt_rule() -> None:
+    """--lr default None → auto √-rule lr = 5e-4·√(eff/1024), eff = bs × accum ×
+    gpus_per_node. An explicit --lr overrides. Pure function so the chain, the
+    single-phase build, and direct-call tests all resolve identically."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    a = _parse(["--phase", "1"])
+    assert a.lr is None  # default = auto
+    assert dv._resolve_lr(a) == pytest.approx(5e-4 * (4 * 8 * 1 / 1024) ** 0.5)
+    # eff scales with gpus_per_node (4-GPU production = eff-128 → 1.76e-4)
+    a = _parse(["--phase", "1", "--gpus-per-node", "4"])
+    assert dv._resolve_lr(a) == pytest.approx(5e-4 * (4 * 8 * 4 / 1024) ** 0.5)
+    # and with bs/accum
+    a = _parse(["--phase", "1", "--batch-size", "2",
+                "--accumulate-grad-batches", "16"])
+    assert dv._resolve_lr(a) == pytest.approx(5e-4 * (32 / 1024) ** 0.5)
+    # explicit override wins
+    a = _parse(["--phase", "1", "--lr", "3e-4"])
+    assert dv._resolve_lr(a) == pytest.approx(3e-4)
 
 
 def test_launch_guard_refuses_real_ssl_on_unimplemented_default_optim(monkeypatch) -> None:
@@ -718,11 +758,12 @@ def test_accumulate_grad_batches_reaches_every_phase(monkeypatch, tmp_path) -> N
     assert calls and all(c["accumulate_grad_batches"] == 8 for c in calls)
 
 
-def test_accumulate_grad_batches_default_is_one(monkeypatch) -> None:
-    """No flag → accumulate_grad_batches=1 (no accumulation, prior behavior)."""
+def test_accumulate_grad_batches_default_is_eight(monkeypatch) -> None:
+    """No flag → accumulate_grad_batches=8 (2026-06-07 production default: bs 4 ×
+    accum 8 × 4 gpu = eff-128)."""
     calls = _capture_builds(monkeypatch)
     main(["--phase", "1", "--warmup-steps", "100"])
-    assert calls[0]["accumulate_grad_batches"] == 1
+    assert calls[0]["accumulate_grad_batches"] == 8
 
 
 def test_wd_exclude_norms_reaches_every_phase(monkeypatch, tmp_path) -> None:
@@ -986,18 +1027,19 @@ def test_single_phase_p4_threads_early_stop_and_ignores_ssl_max_steps(
 
 
 def test_single_phase_budget_defaults_match_chain(monkeypatch) -> None:
-    """#39: with no budget flags, P1 gets no step budget / no early-stop, and a
-    default --phase 4 inherits DEFAULT_P4_EARLY_STOP_PATIENCE (=10) — the same
-    values the chain applies, so single-phase and chain stay in lock-step."""
+    """#39: with no budget flags, P1 gets the default 1500-step budget / no
+    early-stop, and a default --phase 4 inherits DEFAULT_P4_EARLY_STOP_PATIENCE
+    (=10) and ignores the SSL step budget — the same values the chain applies, so
+    single-phase and chain stay in lock-step."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
     main(["--phase", "1", "--warmup-steps", "100"])
-    assert calls[0]["max_steps"] is None
+    assert calls[0]["max_steps"] == 1500
     assert calls[0]["early_stopping_patience"] is None
     calls.clear()
     main(["--phase", "4", "--frozen-probe"])
-    assert calls[0]["max_steps"] is None
+    assert calls[0]["max_steps"] is None  # P4 ignores the SSL step budget
     assert calls[0]["early_stopping_patience"] == dv.DEFAULT_P4_EARLY_STOP_PATIENCE
 
 
@@ -1081,3 +1123,52 @@ def test_requeue_emits_slurm_additional_parameters(monkeypatch, tmp_path) -> Non
         requeue=False, warmup_steps=100, max_steps=1500,
     )
     assert xp_off.infra.slurm_additional_parameters is None
+
+
+def test_live_flag_threads_wandb_and_step_cadence() -> None:
+    """--live wires the near-free nano-dashboard graphs (loss/val-loss, RankMe,
+    LR-curve): a WandbLoggerConfig + per-step LR cadence + log_every_n_steps=1,
+    reaching every phase via _common_build_kwargs. Off (default) → no wandb,
+    epoch cadence, log_every_n_steps=10 (prior behavior, so the exca cache uid is
+    unchanged). reports/nano_dynamics_dashboard_handoff_2026_06_07.md."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    live = dv._common_build_kwargs(
+        _parse(["--phase", "1", "--mode", "nano", "--live"]),
+        cross_attn_positions=None,
+    )
+    assert live["lr_log_interval"] == "step"
+    assert live["log_every_n_steps"] == 1
+    assert live["wandb_config"] is not None
+    assert live["wandb_config"].project == "v14-nano-dynamics"
+
+    off = dv._common_build_kwargs(
+        _parse(["--phase", "1", "--mode", "nano"]),
+        cross_attn_positions=None,
+    )
+    assert off["lr_log_interval"] == "epoch"
+    assert off["log_every_n_steps"] == 10
+    assert off["wandb_config"] is None
+
+
+def test_live_run_name_defaults_and_override() -> None:
+    """Overlay legend label defaults to <task>_<mode>_p<phase>; --wandb-run-name /
+    --wandb-group override per predict-then-check rung. _build_wandb_config returns
+    None unless --live is set."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    default = dv._build_wandb_config(_parse(["--phase", "1", "--mode", "nano", "--live"]))
+    assert default is not None
+    assert default.name == "speech_nano_p1"
+    assert default.group == "speech_nano"
+
+    named = dv._build_wandb_config(_parse([
+        "--phase", "1", "--mode", "nano", "--live",
+        "--wandb-run-name", "p1-lr1e-4", "--wandb-group", "ladderA",
+        "--wandb-offline",
+    ]))
+    assert named is not None
+    assert named.name == "p1-lr1e-4" and named.group == "ladderA"
+    assert named.offline is True
+
+    assert dv._build_wandb_config(_parse(["--phase", "1", "--mode", "nano"])) is None

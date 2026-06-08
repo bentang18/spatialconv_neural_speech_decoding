@@ -115,8 +115,15 @@ def derive_label_indices(
     lite: bool = True,
     nano: bool = False,
     max_samples: int | None = None,
+    balance: bool = True,
 ) -> dict[int, np.ndarray]:
-    """Return Neuroprobe-compatible balanced label indices for one task."""
+    """Return Neuroprobe-compatible balanced label indices for one task.
+
+    ``balance=False`` (label-free SSL): keep EVERY index per class — no
+    cross-class ``min()`` down-sampling. The lite/nano cap, if set, still bounds
+    each class so a smoke budget stays small. P4 eval keeps ``balance=True`` for
+    leaderboard parity.
+    """
     if task not in NEUROPROBE_TASKS:
         raise KeyError(f"unknown Neuroprobe task: {task}")
     task_column = remap_task_column(task)
@@ -205,6 +212,7 @@ def derive_label_indices(
         lite=lite,
         nano=nano,
         max_samples=max_samples,
+        balance=balance,
     )
 
 
@@ -282,14 +290,33 @@ def _balance_label_indices(
     lite: bool,
     nano: bool,
     max_samples: int | None,
+    balance: bool = True,
 ) -> dict[int, np.ndarray]:
     rng = np.random.RandomState(random_seed)
     n_classes = len(label_indices)
-    n_samples_each = min(len(indices) for indices in label_indices.values())
+    cap: int | None = None
     if lite:
-        n_samples_each = min(n_samples_each, LITE_MAX_SAMPLES // n_classes)
+        cap = LITE_MAX_SAMPLES // n_classes
     elif nano:
-        n_samples_each = min(n_samples_each, NANO_MAX_SAMPLES // n_classes)
+        cap = NANO_MAX_SAMPLES // n_classes
+
+    if not balance:
+        # Label-free SSL: keep EVERY index per class (no cross-class min). A
+        # set lite/nano cap still bounds each class so smoke budgets stay small.
+        out: dict[int, np.ndarray] = {}
+        for label in list(label_indices.keys()):
+            idxs = label_indices[label]
+            if cap is not None and len(idxs) > cap:
+                idxs = rng.choice(idxs, size=cap, replace=False)
+            idxs = np.sort(idxs)
+            if max_samples is not None:
+                idxs = idxs[: max_samples // n_classes]
+            out[label] = idxs
+        return out
+
+    n_samples_each = min(len(indices) for indices in label_indices.values())
+    if cap is not None:
+        n_samples_each = min(n_samples_each, cap)
 
     balanced: dict[int, np.ndarray] = {}
     for label in list(label_indices.keys()):

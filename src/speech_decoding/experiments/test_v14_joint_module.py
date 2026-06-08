@@ -914,3 +914,68 @@ def test_train_monitor_due_falls_back_to_every_step() -> None:
     module = _make_module()  # no trainer attached → property raises
     for idx in (0, 1, 2, 3, 7, 50):
         assert module._train_monitor_due(idx) is True, idx
+
+
+# ---------------------------------------------------------------------------
+# Speedup C1/C2: torch.compile forward override (default OFF, env-gated)
+# ---------------------------------------------------------------------------
+
+
+def test_compile_flag_off_default_keeps_eager_forward(monkeypatch) -> None:
+    """``V14_COMPILE`` unset (default) → no compile, the eager modules are
+    called → byte-identical → zero blast radius on the running config."""
+    monkeypatch.delenv("V14_COMPILE", raising=False)
+    m = _make_module(phase="p1")
+    assert m._compiled_fwd == {}
+    # the routing helpers fall through to the uncompiled modules
+    assert m._compiled_fwd.get("student", m.student) is m.student
+    assert m._compiled_fwd.get("teacher", m.teacher.model) is m.teacher.model
+
+
+def test_compile_flag_does_not_double_register_params(monkeypatch) -> None:
+    """EMA-safety invariant: the compiled wrappers SHARE parameters with
+    ``self.student`` / ``self.teacher.model``. They are stored in a plain dict
+    (not a submodule) so nn.Module never double-registers those tensors — else
+    the optimizer + EMA param zip would be corrupted and checkpoint keys would
+    gain the ``_orig_mod.`` prefix that breaks the EMA name-match."""
+    monkeypatch.delenv("V14_COMPILE", raising=False)
+    eager = _make_module(phase="p1")
+
+    monkeypatch.setenv("V14_COMPILE", "1")
+    compiled = _make_module(phase="p1")
+    assert set(compiled._compiled_fwd) == {"student", "teacher"}
+
+    # Same architecture → identical param COUNT iff compile added nothing.
+    assert len(list(compiled.parameters())) == len(list(eager.parameters()))
+    # state_dict keys are unchanged (no ``_orig_mod.`` prefix anywhere).
+    assert set(compiled.state_dict()) == set(eager.state_dict())
+    assert not any("_orig_mod" in k for k in compiled.state_dict())
+    # the compiled student wrapper exposes the SAME tensors as self.student.
+    assert {id(p) for p in compiled._compiled_fwd["student"].parameters()} == {
+        id(p) for p in compiled.student.parameters()
+    }
+
+
+def test_compiled_step_matches_eager_within_tol(monkeypatch) -> None:
+    """C2 correctness: compiled ``_step`` loss ≈ eager within tolerance on a
+    synthetic CPU batch (identical weights via load_state_dict; the per-step
+    mask is sampled OUTSIDE the compiled region → identical for both)."""
+    batch = _make_synthetic_batch().data
+
+    monkeypatch.delenv("V14_COMPILE", raising=False)
+    eager = _make_module(_make_tiny_encoder(), phase="p1")
+    eager.eval()
+    with torch.no_grad():
+        eager_loss = float(eager._step(batch).total.detach())
+
+    monkeypatch.setenv("V14_COMPILE", "1")
+    compiled = _make_module(_make_tiny_encoder(), phase="p1")
+    compiled.load_state_dict(eager.state_dict())  # identical weights
+    compiled.eval()
+    try:
+        with torch.no_grad():
+            compiled_loss = float(compiled._step(batch).total.detach())
+    except Exception as exc:  # pragma: no cover - backend-dependent
+        pytest.skip(f"torch.compile backend unavailable on this host: {exc}")
+
+    assert compiled_loss == pytest.approx(eager_loss, abs=1e-3, rel=1e-3)

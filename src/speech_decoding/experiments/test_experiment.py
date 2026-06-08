@@ -232,6 +232,22 @@ def test_accumulate_grad_batches_passed_to_trainer() -> None:
     assert accum._trainer().accumulate_grad_batches == 8
 
 
+def test_profiler_env_var_attaches_lightning_profiler(monkeypatch) -> None:
+    """Speedup MISS-1: nothing in the stack measures where the step goes. The
+    V14_PROFILER env var (operational, NOT a config field → no exca uid change,
+    no cache fork) attaches the matching Lightning profiler. Unset (default)
+    leaves the trainer byte-identical — Lightning's no-op PassThroughProfiler."""
+    from lightning.pytorch.profilers import PassThroughProfiler, SimpleProfiler
+
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+
+    monkeypatch.delenv("V14_PROFILER", raising=False)
+    assert isinstance(base._trainer().profiler, PassThroughProfiler)
+
+    monkeypatch.setenv("V14_PROFILER", "simple")
+    assert isinstance(base._trainer().profiler, SimpleProfiler)
+
+
 def test_val_check_interval_converted_optsteps_to_microbatches() -> None:
     """#66: our val_check_interval is in OPTIMIZER steps, but Lightning counts
     an int val_check_interval in training MICRO-batches. Under grad-accum the
@@ -339,3 +355,40 @@ def test_periodic_last_ckpt_is_metric_independent_on_step_cadence(tmp_path) -> N
     epoch_ckpts = [c for c in base._callbacks() if isinstance(c, ModelCheckpoint)]
     assert len(epoch_ckpts) == 1
     assert epoch_ckpts[0].save_last is True and epoch_ckpts[0].save_top_k == 1
+
+
+def test_lr_log_interval_default_epoch(tmp_path) -> None:
+    """Default LearningRateMonitor cadence is per-epoch (unchanged)."""
+    from lightning.pytorch.callbacks import LearningRateMonitor
+
+    xp = _tiny_mlp_xp(tmp_path / "runs", n_epochs=1)
+    lrm = [c for c in xp._callbacks() if isinstance(c, LearningRateMonitor)]
+    assert len(lrm) == 1 and lrm[0].logging_interval == "epoch"
+
+
+def test_lr_log_interval_step_when_set(tmp_path) -> None:
+    """--live sets lr_log_interval='step' so the LR-schedule curve is dense for
+    the nano learning-dynamics dashboard.
+    reports/nano_dynamics_dashboard_handoff_2026_06_07.md."""
+    from lightning.pytorch.callbacks import LearningRateMonitor
+
+    xp = _tiny_mlp_xp(tmp_path / "runs", n_epochs=1).model_copy(
+        update={"lr_log_interval": "step"}
+    )
+    lrm = [c for c in xp._callbacks() if isinstance(c, LearningRateMonitor)]
+    assert len(lrm) == 1 and lrm[0].logging_interval == "step"
+
+
+def test_logger_builds_config_with_save_dir(tmp_path) -> None:
+    """neuraltrain's Csv/WandbLoggerConfig.build() REQUIRE save_dir; _logger must
+    pass it. The prior no-arg .build() was a latent TypeError on any configured
+    logger (e.g. every --live wandb run)."""
+    from lightning.pytorch.loggers import CSVLogger
+    from neuraltrain.utils import CsvLoggerConfig
+
+    xp = _tiny_mlp_xp(tmp_path / "runs", n_epochs=1).model_copy(
+        update={"csv_config": CsvLoggerConfig()}
+    )
+    loggers = xp._logger()
+    loggers = loggers if isinstance(loggers, list) else [loggers]
+    assert any(isinstance(lg, CSVLogger) for lg in loggers)

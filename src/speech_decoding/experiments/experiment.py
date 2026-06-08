@@ -133,6 +133,12 @@ class Experiment(BaseExperiment):
     # [[feedback_dcc_partition_default_coganlab_gpu_2026_05_29]].
     precision: str | None = None
     log_every_n_steps: int = 10
+    # LearningRateMonitor cadence ("epoch" | "step"). --live sets "step" so the
+    # LR-schedule curve is dense for the nano learning-dynamics dashboard; the
+    # default "epoch" reproduces prior behavior and, being the default, stays out
+    # of the exca cache uid. See
+    # reports/nano_dynamics_dashboard_handoff_2026_06_07.md.
+    lr_log_interval: str = "epoch"
     limit_train_batches: int | float | None = None
     limit_val_batches: int | float | None = None
     limit_test_batches: int | float | None = None
@@ -216,20 +222,25 @@ class Experiment(BaseExperiment):
         return Path(uid_folder) if uid_folder is not None else Path(self.infra.folder)
 
     def _logger(self) -> Logger | list[Logger]:
+        # neuraltrain's Csv/WandbLoggerConfig.build() both REQUIRE save_dir; the
+        # artifact root is that dir (wandb writes its run under {root}/wandb).
+        root = self._artifact_root()
+        save_dir = str(root) if root is not None else "."
         loggers: list[Logger] = []
         if self.csv_config is not None:
-            loggers.append(self.csv_config.build())
+            loggers.append(self.csv_config.build(save_dir=save_dir))
         if self.wandb_config is not None:
-            loggers.append(self.wandb_config.build())
+            loggers.append(self.wandb_config.build(save_dir=save_dir))
         if loggers:
             return loggers
-        root = self._artifact_root()
         if root is not None:
             return CSVLogger(save_dir=str(root / "lightning"))
         return DummyLogger()
 
     def _callbacks(self) -> list[pl.Callback]:
-        callbacks: list[pl.Callback] = [LearningRateMonitor(logging_interval="epoch")]
+        callbacks: list[pl.Callback] = [
+            LearningRateMonitor(logging_interval=self.lr_log_interval)
+        ]
         root = self._artifact_root()
         if root is not None:
             ckpt_dir = str(root / "checkpoints")
@@ -353,6 +364,19 @@ class Experiment(BaseExperiment):
             kwargs["gradient_clip_val"] = self.gradient_clip_val
         if self.accumulate_grad_batches != 1:
             kwargs["accumulate_grad_batches"] = self.accumulate_grad_batches
+        # Operational profiling toggle (observability only). Read from the
+        # environment, NOT a pydantic field, so it never perturbs the exca run
+        # uid / artifact namespace — a profiled run shares the cache of an
+        # unprofiled one and the default path stays byte-identical. Unset
+        # (default) → no profiler. ``V14_PROFILER={simple,pytorch,advanced}``
+        # attaches the matching Lightning profiler so a lite run emits a
+        # per-phase action/kernel breakdown; nothing else in the stack measures
+        # where the step time goes. Use ``simple`` for cheap action-level
+        # timings over a full run, or ``pytorch`` with a SHORT --ssl-max-steps
+        # (e.g. 20-40) for the kernel table without a multi-GB trace.
+        profiler = os.environ.get("V14_PROFILER")
+        if profiler:
+            kwargs["profiler"] = profiler
         return pl.Trainer(**kwargs)
 
     def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:

@@ -61,6 +61,7 @@ values (``"support"`` / ``"bidirectional"``); non-default values raise
 
 from __future__ import annotations
 
+import os
 import typing as tp
 
 import torch
@@ -308,6 +309,29 @@ class V14JointBrainModule(pl.LightningModule):
             max_time_patches=encoder.max_n_time_patches,
         )
         self.optim_config = optim_config
+        # ── torch.compile forward override (Speedup C1; default OFF) ──
+        # ``V14_COMPILE`` truthy → wrap the student + EMA-teacher FORWARD
+        # callables with torch.compile. Stored in a PLAIN DICT (not an
+        # attribute) so nn.Module never registers the OptimizedModule as a
+        # submodule: its parameters are SHARED with ``self.student`` /
+        # ``self.teacher.model`` and double-registration would corrupt the
+        # optimizer + EMA param zip. Module identity (state_dict, named params,
+        # EMA name-match, checkpoint keys) is untouched, so the ``_orig_mod.``
+        # key-prefix hazard never arises; unset (default) → the eager path,
+        # byte-identical → zero blast radius on the running config. An env
+        # toggle, NOT a pydantic field, so it never forks the exca run uid (a
+        # compiled run shares an eager run's cache; checkpoints interchange).
+        # Compile is phase-conditional in practice — cold-start + per-step
+        # mask-shape recompiles can exceed the win on the short phases, so
+        # measure per phase (P2/P3b first) before trusting it.
+        self._compiled_fwd: dict[str, tp.Callable[..., tp.Any]] = {}
+        _compile_flag = os.environ.get("V14_COMPILE", "").strip().lower()
+        if _compile_flag not in ("", "0", "false", "no", "off"):
+            _mode = os.environ.get("V14_COMPILE_MODE") or "default"
+            self._compiled_fwd["student"] = torch.compile(self.student, mode=_mode)
+            self._compiled_fwd["teacher"] = torch.compile(
+                self.teacher.model, mode=_mode,
+            )
         self._phase: _Phase = phase
         self._m2_mask_type = m2_mask_type
         self._m2_mask_ratio = m2_mask_ratio
@@ -537,6 +561,18 @@ class V14JointBrainModule(pl.LightningModule):
         )
         return {"parcel_time_mask": parcel_time_mask}
 
+    def _call_student(self, **kwargs: tp.Any) -> dict[str, Tensor]:
+        """Student forward, routed through the compiled wrapper when
+        ``V14_COMPILE`` is set (else the eager module — byte-identical). The
+        wrapper shares ``self.student``'s parameters, so EMA / optimizer /
+        state_dict all keep using the uncompiled module."""
+        return self._compiled_fwd.get("student", self.student)(**kwargs)
+
+    def _call_teacher(self, **kwargs: tp.Any) -> dict[str, Tensor]:
+        """EMA-teacher forward, routed through the compiled wrapper when set
+        (else the eager ``self.teacher.model`` — byte-identical)."""
+        return self._compiled_fwd.get("teacher", self.teacher.model)(**kwargs)
+
     def _step(self, batch_data: dict[str, Tensor]) -> MaskedJepaBreakdown:
         """One masked-JEPA forward + loss pass (B36 WS-B, B5/B6/B7/B8).
 
@@ -573,7 +609,9 @@ class V14JointBrainModule(pl.LightningModule):
         m2_only = self._phase == "p1"
 
         # ── Student forward (masked / visible-only) ──
-        student_taps = self.student(**student_kwargs, **mask_kwargs, m2_only=m2_only)
+        student_taps = self._call_student(
+            **student_kwargs, **mask_kwargs, m2_only=m2_only,
+        )
 
         # ── Teacher forward (FULL input — no mask, no shaft). B26 / B7 ──
         teacher_taps = self._teacher_forward(dict(student_kwargs), m2_only=m2_only)
@@ -629,7 +667,7 @@ class V14JointBrainModule(pl.LightningModule):
             shaft_mask=None if _t_par is None else ~_t_par,
         )
         with torch.no_grad():
-            teacher_taps = self.teacher.model(**teacher_kwargs, m2_only=m2_only)
+            teacher_taps = self._call_teacher(**teacher_kwargs, m2_only=m2_only)
         if not isinstance(teacher_taps, dict):
             raise RuntimeError(
                 "EMA teacher returned a single tensor; expected the M2/M4 "
@@ -952,7 +990,7 @@ class V14JointBrainModule(pl.LightningModule):
         # genuine collapse is caught the moment pretraining starts.
         with torch.no_grad():
             if self._phase == "p1":
-                teacher_m2 = self.teacher.model(
+                teacher_m2 = self._call_teacher(
                     **student_kwargs, m2_only=True
                 )["M2"]
                 self._run_frontend_rank_monitor(
@@ -967,9 +1005,9 @@ class V14JointBrainModule(pl.LightningModule):
             # in-scope. The orphan monitor additionally needs a ``shaft_mask``,
             # which B36 (WS-H5) drops from the default SSL path — hence the
             # ``in batch_data`` key guard (inert unless the pipeline emits it).
-            teacher_m4 = self.teacher.model(**student_kwargs)["M4"]
+            teacher_m4 = self._call_teacher(**student_kwargs)["M4"]
             if "shaft_mask" in batch_data:
-                student_m4 = self.student(**student_kwargs)["M4"]
+                student_m4 = self._call_student(**student_kwargs)["M4"]
                 self._run_mask_orphan_monitor(
                     batch_data=batch_data,
                     student_m4=student_m4,
