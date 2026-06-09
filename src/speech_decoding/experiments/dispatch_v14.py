@@ -709,6 +709,14 @@ def build_v14_experiment(
     # brain-model config; the encoder forward gates it on training + grad
     # so the no_grad teacher pass is never checkpointed. Numerics-safe.
     gradient_checkpointing: bool = False,
+    # 2026-06-08 ragged front-end (#91): default-off. When True, the encoder's
+    # per-electrode token blocks run only over valid electrodes (pad rows
+    # gathered out, scattered back as zeros before the pool) and the P1 M2 loss
+    # drops pad electrodes. Valid-electrode M2/M4 + P2 loss are bit-identical;
+    # only the P1 loss mean changes (no longer dilutes on pad). Cuts the
+    # token-block + predictor FFN by the pad fraction (~50% at BT-Lite c_max=256
+    # ⇒ unblocks raw bs=8 + ~halves front-end step time on padded batches).
+    ragged_frontend: bool = False,
     # WS-F / B33 Phase-3 distillation routing (#21). ``p3_distill=True`` returns
     # a :class:`V14Phase3Experiment` (Whisper all-layer-mean SmoothL1 distill)
     # instead of the joint / supervised path; ``p3_stage`` picks 3a (encoder
@@ -1366,6 +1374,9 @@ def build_v14_experiment(
             # 2026-05-30 speedup audit (Tier-2, #119): default-off
             # activation checkpointing on the encoder block stacks.
             "gradient_checkpointing": gradient_checkpointing,
+            # 2026-06-08 ragged front-end (#91): default-off; skip pad
+            # electrodes in the per-electrode token blocks (+ P1 loss).
+            "ragged_frontend": ragged_frontend,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
             # supervised downstream classifier path does not branch on
@@ -1933,6 +1944,21 @@ def _parser() -> argparse.ArgumentParser:
              "on a card with headroom for full activations at the chosen "
              "--batch-size.",
     )
+    # 2026-06-08 ragged front-end (#91): OFF by default (dense path
+    # byte-identical to pre-#91). When ON, the encoder's per-electrode token
+    # blocks run only over valid electrodes (pad rows gathered out, scattered
+    # back as zeros before the pool) and the P1 M2 loss drops pad electrodes.
+    p.add_argument(
+        "--ragged-frontend", dest="ragged_frontend",
+        action="store_true", default=False,
+        help="Skip pad electrodes in the per-electrode token blocks + P1 loss "
+             "(needs valid_mask in the batch — i.e. a padded c_max). "
+             "Valid-electrode M2/M4 and the P2 loss stay bit-identical; only the "
+             "P1 loss mean changes (it no longer dilutes on zero-input pad "
+             "electrodes). Cuts the token-block + predictor FFN by the pad "
+             "fraction (~50%% at BT-Lite c_max=256) — unblocks raw bs=8 and "
+             "~halves front-end step time on padded batches. OFF by default.",
+    )
     # 2026-06-07 speedup-fanout C1: torch.compile the student/teacher encoder
     # forward. OFF by default (eager path byte-identical). The toggle is the
     # ``V14_COMPILE`` env var read inside V14JointBrainModule.__init__ (an env
@@ -2311,6 +2337,7 @@ def _common_build_kwargs(
         include_ajile12=args.include_ajile12,
         ffn_variant=args.ffn_variant,
         gradient_checkpointing=args.gradient_checkpointing,
+        ragged_frontend=args.ragged_frontend,
         readout=args.readout,
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
@@ -2654,7 +2681,8 @@ def main(argv: list[str] | None = None) -> int:
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
           f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
           f"readout={args.readout} "
-          f"gradient_checkpointing={args.gradient_checkpointing}")
+          f"gradient_checkpointing={args.gradient_checkpointing} "
+          f"ragged_frontend={args.ragged_frontend}")
     _resolved_lr = _resolve_lr(args)
     _lr_disp = (
         f"{_resolved_lr:.3e} (AUTO √-rule: 5e-4·√(eff/1024), "

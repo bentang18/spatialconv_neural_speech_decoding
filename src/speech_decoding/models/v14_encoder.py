@@ -766,9 +766,25 @@ class V14ParcelPerceiverModel(nn.Module):
         # encoder blocks contain no dropout, so the recomputed forward is
         # bit-identical.
         gradient_checkpointing: bool = False,
+        # 2026-06-08 ragged front-end (#91): when True AND a ``valid_mask`` is
+        # passed, the per-electrode token blocks run only over the VALID
+        # electrodes (gathered out of the ``B·C`` rows) and the masked-out pad
+        # rows are scattered back as zeros before the cross-attn pool. The token
+        # blocks are per-electrode (no cross-electrode path), so every valid
+        # electrode's M2/M4 is BIT-IDENTICAL to the dense path; only the dropped
+        # pad rows — which the pool already masks via ``key_mask`` and the P1
+        # loss already drops via ``valid_mask`` — change (zeros instead of
+        # token-block(masked-stem)). Cuts the dominant token-block FFN
+        # activation + FLOPs by the pad fraction (~50% at BT-Lite c_max=256).
+        # Default OFF (dense path byte-identical to pre-#91). The pad rows are
+        # NOT read downstream: the P1 ``p1_frontend_m2_loss`` must be passed
+        # ``valid_mask`` (the joint module gates that on this flag) so the M2
+        # loss never reconstructs pad electrodes. See test_v14_ragged_frontend.
+        ragged_frontend: bool = False,
     ) -> None:
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
+        self.ragged_frontend = ragged_frontend
         self.n_freq_bins = n_freq_bins
         self.n_time_bins = n_time_bins
         self.k_parcels = k_parcels
@@ -1341,14 +1357,51 @@ class V14ParcelPerceiverModel(nn.Module):
         use_ckpt = (
             self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         )
-        for token_block in self.token_blocks:
-            if use_ckpt:
-                x_joint = checkpoint(
-                    token_block, x_joint, rope_token, token_key_mask,
-                    use_reentrant=False,
-                )
+
+        def _run_token_blocks(xj: Tensor, kpm: Optional[Tensor]) -> Tensor:
+            for token_block in self.token_blocks:
+                if use_ckpt:
+                    xj = checkpoint(
+                        token_block, xj, rope_token, kpm,
+                        use_reentrant=False,
+                    )
+                else:
+                    xj = token_block(xj, rope_token, kpm)
+            return xj
+
+        # #91 ragged front-end: the token blocks are per-electrode (the flat
+        # ``B·C`` leading dim has no cross-electrode attention — each row is one
+        # electrode's (t_p, f_p) plane), so dropping the pad rows leaves every
+        # VALID row's output bit-identical while cutting the dominant token-block
+        # FFN activation/FLOPs by the pad fraction. Gather the valid rows, run
+        # the blocks, scatter back into a zero-filled (B·C, …) buffer. The pad
+        # rows become zeros — harmless: the cross-attn pool masks them via
+        # ``key_mask`` (support=0 | ~valid_mask) and the P1 M2 loss drops them
+        # via ``valid_mask``. Default OFF / no valid_mask → the dense loop runs.
+        ragged = self.ragged_frontend and valid_mask is not None
+        if ragged:
+            assert valid_mask is not None  # narrowed by ``ragged``
+            valid_rows = valid_mask.reshape(BC)                      # (B·C,) bool
+            valid_idx = valid_rows.nonzero(as_tuple=True)[0]         # (N_valid,)
+            if valid_idx.numel() == 0:
+                # Whole-batch all-pad (no real electrode anywhere). Unreachable
+                # under normal loading, but the gather would feed a 0-row tensor
+                # to the token blocks' SDPA and crash; the scatter result IS all
+                # zeros, so produce it directly and skip the blocks. The pool's
+                # no-coverage path then zeros every parcel (matching dense).
+                x_joint = x_joint.new_zeros(BC, T_p * F_p, self.d_model)
             else:
-                x_joint = token_block(x_joint, rope_token, token_key_mask)
+                xj_v = x_joint.index_select(0, valid_idx)            # (N_valid, T_p·F_p, d)
+                kpm_v = (
+                    token_key_mask.index_select(0, valid_idx)
+                    if token_key_mask is not None else None
+                )
+                xj_v = _run_token_blocks(xj_v, kpm_v)
+                x_joint = xj_v.new_zeros(
+                    BC, T_p * F_p, self.d_model
+                ).index_copy(0, valid_idx, xj_v)
+        else:
+            x_joint = _run_token_blocks(x_joint, token_key_mask)
         # Reshape back to (B, C, F_p, T_p, d) for cross-attn consumption.
         x = (
             x_joint.reshape(B, C, T_p, F_p, self.d_model)
@@ -2258,6 +2311,15 @@ class V14ParcelPerceiver(BaseModelConfig):
     # gate).
     gradient_checkpointing: bool = False
 
+    # 2026-06-08 ragged front-end (#91): skip pad electrodes in the per-electrode
+    # token blocks (gather valid rows → run blocks → scatter pad rows as zeros).
+    # Default OFF (dense path byte-identical). Pairs with the P1 loss's
+    # ``valid_mask`` exclusion (gated on this flag in the joint module) so the M2
+    # loss never reconstructs pad electrodes. Cuts the token-block FFN activation
+    # + FLOPs by the pad fraction (~50% at BT-Lite c_max=256 ⇒ unblocks raw bs=8
+    # and ~halves front-end step time on padded batches).
+    ragged_frontend: bool = False
+
     # SSL-pretrain dispatch flags persisted on the model config so they
     # ride along with the run-record YAML. The encoder ``build`` does
     # not branch on them — they are metadata for sister-cell rollouts
@@ -2311,6 +2373,7 @@ class V14ParcelPerceiver(BaseModelConfig):
             ref_embed_enabled=self.ref_embed_enabled,
             ref_embed_reuse_kv=self.ref_embed_reuse_kv,
             gradient_checkpointing=self.gradient_checkpointing,
+            ragged_frontend=self.ragged_frontend,
         )
         # B35: P4 readout. The "pma_*" options collapse parcels with a
         # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only

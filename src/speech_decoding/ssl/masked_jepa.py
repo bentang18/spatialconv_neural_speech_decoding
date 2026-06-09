@@ -84,9 +84,23 @@ def p1_frontend_m2_loss(
     token_mask: Tensor,   # (B, C, F_p, T_p) bool, True = masked
     loss_form: _LossForm = "l1",
     freq_patch_valid: tp.Optional[Tensor] = None,  # (F_p,) or (B, F_p) bool
+    valid_mask: tp.Optional[Tensor] = None,  # (B, C) bool, True = real electrode
 ) -> MaskedJepaBreakdown:
     """P1 front-end masked JEPA (paradigm B — separate predictor, UNCONSTRAINED
     scope; exact parity with :func:`p2_parcel_m4_loss`).
+
+    #91 ``valid_mask`` (B, C): True = real electrode. When provided, PAD
+    electrodes are dropped from the per-electrode predictor batch entirely — no
+    visible context, no target, no contribution to the ``mean`` L1. ``None``
+    (the pre-#91 default) reconstructs every ``B·C`` row, INCLUDING pad
+    electrodes, whose zero-input M2 dilutes the mean and wastes ~half the
+    predictor batch at BT-Lite c_max=256. Pad exclusion is the correct semantics
+    (a pad electrode carries no data) AND is REQUIRED for parity with the
+    encoder's ragged front-end, which zeroes pad rows: the joint module passes
+    ``valid_mask`` here exactly when ``encoder.ragged_frontend`` is on. Because
+    the predictor is per-electrode (each row is one electrode), every VALID
+    electrode's loss term is bit-identical with or without ``valid_mask``; only
+    the pad terms (and hence the mean's denominator) change.
 
     Per-electrode (electrodes batched into the leading dim — the front-end has
     no cross-electrode path), the predictor reads the VISIBLE ``(freq-patch,
@@ -137,8 +151,26 @@ def p1_frontend_m2_loss(
         target_flat = target_flat & fpv_cell
 
     ctx = student_m2.reshape(BC, N, d)             # visible used as keys (kpm below)
+    teacher_ctx = teacher_m2.reshape(BC, N, d)
+    # #91: drop PAD electrodes from the per-electrode predictor batch. Each row
+    # is one electrode (the front-end has no cross-electrode path), so removing
+    # pad rows leaves every valid row's prediction + target bit-identical; only
+    # the dropped pad terms (and the mean's denominator) change. None → every
+    # B·C row participates (pre-#91 behavior, incl. pad).
+    if valid_mask is not None:
+        if valid_mask.shape != (B, C):
+            raise ValueError(
+                f"valid_mask {tuple(valid_mask.shape)} must be (B, C) = "
+                f"({B}, {C})"
+            )
+        keep = valid_mask.reshape(BC).to(torch.bool)       # (BC,) True = real
+        ctx = ctx[keep]                                    # (N_valid, N, d)
+        teacher_ctx = teacher_ctx[keep]
+        visible_flat = visible_flat[keep]                  # (N_valid, N)
+        target_flat = target_flat[keep]
     # (freq-patch, time-patch) ids for the (F_p outer, T_p inner) flat order:
-    # flat index i = f_p · T_p + t_p. Shared across the BC batch (grid-identical).
+    # flat index i = f_p · T_p + t_p. Shared across the batch (grid-identical;
+    # one entry per cell, NOT per row — so row dropping above leaves them intact).
     f_ids = torch.arange(N, device=device) // T_p  # freq-patch id ∈ [0, F_p)
     t_ids = torch.arange(N, device=device) % T_p   # time-patch id ∈ [0, T_p)
 
@@ -150,7 +182,7 @@ def p1_frontend_m2_loss(
         context_key_padding_mask=~visible_flat,
         query_valid=target_flat,
     )                                              # (n_masked, d)
-    target = teacher_m2.reshape(BC, N, d)[target_flat].detach()  # (n_masked, d)
+    target = teacher_ctx[target_flat].detach()     # (n_masked, d)
     loss = _l1_or_zero(pred, target, loss_form)
     return MaskedJepaBreakdown(total=loss, phase="p1", n_masked=int(target_flat.sum()))
 

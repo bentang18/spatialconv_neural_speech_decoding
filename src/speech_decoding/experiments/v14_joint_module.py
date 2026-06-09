@@ -619,12 +619,23 @@ class V14JointBrainModule(pl.LightningModule):
         if self._phase == "p1":
             # freq_patch_valid omitted (all-valid) — WS-H threads the SWEC
             # corpus-valid prefix here alongside the sampler/encoder (C5).
+            # #91: when the encoder runs the ragged front-end it zeroes the pad
+            # electrodes' M2, so the P1 loss MUST drop them too (pass
+            # ``valid_mask``) or it would score zeros against the teacher's
+            # full-input pad M2. With the ragged front-end OFF, ``valid_mask`` is
+            # None here → the dense pre-#91 loss (every B·C row, incl. pad).
+            p1_valid_mask = (
+                student_kwargs.get("valid_mask")
+                if self.student.encoder.ragged_frontend
+                else None
+            )
             return p1_frontend_m2_loss(
                 predictor=self.predictor,
                 student_m2=student_taps["M2"],
                 teacher_m2=teacher_taps["M2"],
                 token_mask=mask_kwargs["token_mask"],
                 loss_form=self._loss_form,
+                valid_mask=p1_valid_mask,
             )
 
         # ── P2: B8 three-way latent_valid → visible context + masked targets ──
