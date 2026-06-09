@@ -32,20 +32,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# SINGLE SOURCE OF TRUTH: import the verified (subject, trial) -> movie mapping
+# from run_extract_per_trial (which is itself verified against the authoritative
+# upstream neuroprobe/config.py BRAINTREEBANK_SUBJECT_TRIAL_MOVIE_NAME_MAPPING).
+# Python adds this script's directory to sys.path[0], so the bare import works
+# both when this file is run as a script and when run_probe_ceiling imports it.
+# Do NOT keep a second copy here — a drifted duplicate previously mispaired
+# (2,4)->black-panther (correct: avengers-infinity-war) and (10,1)->ant-man
+# (correct: spider-man-far-from-home), feeding wrong-movie audio into extraction.
+from run_extract_per_trial import SUBJECT_TRIAL_MOVIE
 
 NEUROPROBE_LITE_SUBJECT_TRIALS = [
     (1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
     (4, 0), (4, 1), (7, 0), (7, 1), (10, 0), (10, 1),
 ]
-
-SUBJECT_TRIAL_MOVIE = {
-    (1, 1): "the-martian", (1, 2): "thor-ragnarok",
-    (2, 0): "venom", (2, 4): "black-panther",
-    (3, 0): "cars-2", (3, 1): "lotr-1",
-    (4, 0): "shrek-the-third", (4, 1): "megamind",
-    (7, 0): "cars-2", (7, 1): "megamind",
-    (10, 0): "cars-2", (10, 1): "ant-man",
-}
 
 
 def parse_subject_trial(s: str) -> tuple[int, int]:
