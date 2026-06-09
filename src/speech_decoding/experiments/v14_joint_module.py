@@ -224,6 +224,7 @@ class V14JointBrainModule(pl.LightningModule):
         predictor_depth: int = 3,
         predictor_hidden: int = 128,
         predictor_n_heads: int = 4,
+        ragged_predictor: bool = False,
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
         frontend_lr_scale: float = 0.1,
@@ -307,6 +308,7 @@ class V14JointBrainModule(pl.LightningModule):
             n_heads=predictor_n_heads,
             depth=predictor_depth,
             max_time_patches=encoder.max_n_time_patches,
+            ragged_predictor=ragged_predictor,
         )
         self.optim_config = optim_config
         # ── torch.compile forward override (Speedup C1) ──
@@ -334,9 +336,25 @@ class V14JointBrainModule(pl.LightningModule):
         _compile_flag = os.environ.get("V14_COMPILE", "").strip().lower()
         if _compile_flag not in ("", "0", "false", "no", "off"):
             _mode = os.environ.get("V14_COMPILE_MODE") or "default"
-            self._compiled_fwd["student"] = torch.compile(self.student, mode=_mode)
+            # ``V14_COMPILE_DYNAMIC=1`` → compile ONCE with symbolic shapes so the
+            # ragged front-end's per-batch-varying electrode count is absorbed by
+            # a single dynamic-shape graph, instead of triggering a fresh
+            # recompile for every distinct subject electrode count (the dominant
+            # warm-start cost on the ragged+compile path — tens of seconds × N
+            # shapes). None (default) keeps torch's auto-dynamic heuristic, which
+            # only marks a dim dynamic AFTER it has already recompiled for it a
+            # couple of times. Per-step may be a hair slower under symbolic
+            # shapes; the win is the eliminated recompile storm. FLOPs/numerics-
+            # neutral; the ±5% loss tripwire is the backstop.
+            _dyn_flag = os.environ.get("V14_COMPILE_DYNAMIC", "").strip().lower()
+            _dynamic: bool | None = (
+                True if _dyn_flag not in ("", "0", "false", "no", "off") else None
+            )
+            self._compiled_fwd["student"] = torch.compile(
+                self.student, mode=_mode, dynamic=_dynamic,
+            )
             self._compiled_fwd["teacher"] = torch.compile(
-                self.teacher.model, mode=_mode,
+                self.teacher.model, mode=_mode, dynamic=_dynamic,
             )
         self._phase: _Phase = phase
         self._m2_mask_type = m2_mask_type
@@ -396,6 +414,33 @@ class V14JointBrainModule(pl.LightningModule):
             frontend, _parcel = self.student.encoder.partition_parameters_for_staging()
             for p in frontend:
                 p.requires_grad_(False)
+
+        # Throughput lever (P1 only, env-gated by ``V14_P1_FREEZE_PARCEL=1``;
+        # default OFF → behaviour unchanged). P1's optimizer trains EXACTLY the
+        # front-end + the P1 predictor (see ``_phase_param_groups`` P1 branch);
+        # every OTHER ``requires_grad`` param in the module — the parcel side
+        # (pool / inter-parcel encoder / encoder_ln / parcel embed), any P3-only
+        # PMA / Whisper-projector / dormant heads, AND the EMA *teacher* deepcopy
+        # (whose params are updated by ``teacher.update_from`` under no_grad, NOT
+        # by gradient) — is never optimised and never receives a gradient in P1.
+        # Freezing the full COMPLEMENT of the P1-trainable set (not just the
+        # parcel partition) is therefore BIT-NEUTRAL for the trained P1 model, yet
+        # it leaves DDP's grad set == {front-end, predictor}, every member of
+        # which gets a grad each step. That removes the per-backward find-unused
+        # graph traversal (``find_unused_parameters=False``) AND clears the
+        # ``static_graph=True`` ``expect_autograd_hooks_`` reducer assert, which
+        # fires whenever ANY ``requires_grad`` param (here: the teacher copy, or a
+        # dormant non-encoder head) produces no grad. The freeze-PARCEL-only first
+        # cut missed the teacher + non-encoder modules, so static_graph still
+        # asserted. The ±5% loss tripwire vs the find_unused reference is the
+        # arbiter that this is genuinely neutral.
+        if self._phase == "p1" and os.environ.get("V14_P1_FREEZE_PARCEL") == "1":
+            frontend, _parcel = self.student.encoder.partition_parameters_for_staging()
+            keep = {id(p) for p in frontend}
+            keep |= {id(p) for p in self.predictor.parameters()}
+            for p in self.parameters():
+                if id(p) not in keep:
+                    p.requires_grad_(False)
 
         # MON-GRAD-SPIKE-DIVERGENCE persistent EMA buffer. ``0.0`` seeds
         # the first step (the monitor skips spike detection until the
@@ -704,7 +749,16 @@ class V14JointBrainModule(pl.LightningModule):
     ) -> None:
         # B9: exactly one active term per phase — log the scalar + the
         # masked-cell count (n_masked == 0 ⇒ total is an exact 0).
-        self.log(f"{step_name}_loss", breakdown.total, on_epoch=True, prog_bar=True)
+        # on_step only for training (→ ``{train}_loss_step`` in metrics.csv, the
+        # per-step throughput/tripwire curve at ``log_every_n_steps`` cadence);
+        # val/test keep on_epoch-only as before. Logging-only, training-inert.
+        self.log(
+            f"{step_name}_loss",
+            breakdown.total,
+            on_step=(step_name == "train"),
+            on_epoch=True,
+            prog_bar=True,
+        )
         self.log(
             f"{step_name}_n_masked", float(breakdown.n_masked), on_epoch=True,
         )

@@ -242,7 +242,12 @@ class Experiment(BaseExperiment):
             LearningRateMonitor(logging_interval=self.lr_log_interval)
         ]
         root = self._artifact_root()
-        if root is not None:
+        # Throughput lever (env-gated): V14_NO_TRAINER_CKPT=1 suppresses the
+        # ModelCheckpoint callbacks for a throw-away run. Must move together with
+        # enable_checkpointing=False in _trainer() — Lightning raises if that flag
+        # is False while a ModelCheckpoint is still in the callbacks list.
+        no_trainer_ckpt = os.environ.get("V14_NO_TRAINER_CKPT") == "1"
+        if root is not None and not no_trainer_ckpt:
             ckpt_dir = str(root / "checkpoints")
             # C5 resilience — metric-INDEPENDENT last.ckpt on step-cadence runs.
             # On a max_steps SSL/distill phase Lightning gates last.ckpt on the
@@ -314,12 +319,38 @@ class Experiment(BaseExperiment):
             "devices": self.devices,
             "logger": self._logger(),
             "callbacks": self._callbacks(),
-            "log_every_n_steps": self.log_every_n_steps,
+            "log_every_n_steps": int(
+                os.environ.get("V14_LOG_EVERY_N") or self.log_every_n_steps
+            ),
             "enable_checkpointing": self.infra.folder is not None,
             "fast_dev_run": self.fast_dev_run,
         }
         if self.ddp_strategy is not None:
             kwargs["strategy"] = self.ddp_strategy
+            # Throughput lever (env-gated, uid-transparent): drop the per-backward
+            # find-unused graph traversal. The default strategy is
+            # ``find_unused_parameters_true`` because P1 has dormant requires_grad
+            # modules (parcel side / PMA / projector / EMA teacher). When
+            # ``V14_P1_FREEZE_PARCEL`` froze the COMPLEMENT of the P1-trained set,
+            # the ONLY remaining requires_grad params are the front-end + the
+            # predictor, and BOTH get a gradient every step — so
+            # ``find_unused_parameters=False`` is safe and DDP skips the traversal.
+            # FLOPs/numerics-neutral; the ±5% loss tripwire is the backstop.
+            #
+            # NOTE: ``static_graph=True`` is NOT usable on this path. The ragged
+            # front-end varies the per-batch electrode count, hence the autograd
+            # graph STRUCTURE varies batch-to-batch — exactly what static_graph
+            # forbids (it fires the ``expect_autograd_hooks_`` reducer assert).
+            # The earlier ``V14_DDP_STATIC_GRAPH`` lever is therefore retired; the
+            # env var is read here only to no-op cleanly if an old caller sets it.
+            _want_find_unused_false = (
+                os.environ.get("V14_P1_FREEZE_PARCEL") == "1"
+                or os.environ.get("V14_DDP_STATIC_GRAPH") == "1"
+            )
+            if _want_find_unused_false and str(self.ddp_strategy).startswith("ddp"):
+                from lightning.pytorch.strategies import DDPStrategy
+
+                kwargs["strategy"] = DDPStrategy(find_unused_parameters=False)
         if self.max_steps is not None:
             # Step budget overrides the epoch cap; max_epochs=-1 lets the run go
             # the full max_steps (estimated_stepping_batches == max_steps).
@@ -377,6 +408,16 @@ class Experiment(BaseExperiment):
         profiler = os.environ.get("V14_PROFILER")
         if profiler:
             kwargs["profiler"] = profiler
+        # Throughput levers (env-gated like V14_PROFILER so they never perturb the
+        # exca uid / artifact namespace; default OFF → byte-identical standard path).
+        # V14_NO_SANITY_VAL=1 skips Lightning's always-on 2-step sanity-validation
+        # pass — pure startup overhead, zero training effect. V14_NO_TRAINER_CKPT=1
+        # disables checkpoint writing for a throw-away throughput run. Neither
+        # touches the model / optimizer / data, so the loss curve is unchanged.
+        if os.environ.get("V14_NO_SANITY_VAL") == "1":
+            kwargs["num_sanity_val_steps"] = 0
+        if os.environ.get("V14_NO_TRAINER_CKPT") == "1":
+            kwargs["enable_checkpointing"] = False
         return pl.Trainer(**kwargs)
 
     def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:
@@ -501,9 +542,19 @@ class Experiment(BaseExperiment):
                 brain_module, loaders["train"], loaders["val"],
                 ckpt_path=resume_ckpt,
             )
-        results = trainer.test(
-            brain_module, loaders["test"], ckpt_path=self._test_ckpt_path(trainer),
-        )
+        # Throughput lever (env-gated): V14_NO_TEST=1 skips the post-fit test()
+        # eval pass entirely. test() is a *diagnostic* (test_loss + monitors), not
+        # part of producing the trained model or its training loss curve, yet it
+        # carries a fixed ~30 s DDP sampler/dataloader-setup cost on every run.
+        # Skipping the CALL (rather than ``limit_test_batches=0``) avoids the
+        # NCCL desync hang a 0-batch test loop triggers. Default OFF → unchanged.
+        if os.environ.get("V14_NO_TEST") == "1":
+            results = []
+        else:
+            results = trainer.test(
+                brain_module, loaders["test"],
+                ckpt_path=self._test_ckpt_path(trainer),
+            )
         # B36 WS-E (E3): snapshot this phase's transferable state for the next.
         # Under DDP the weights are kept in sync across ranks, so only global-
         # zero writes the handoff ckpt — 4 ranks torch.save-ing the same path

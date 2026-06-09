@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 
 import numpy as np
@@ -8,6 +9,19 @@ import torch
 from torch.utils.data import DataLoader
 
 import neuralset as ns
+
+
+# Warm dataset-OBJECT cache (throughput lever, env-gated by ``V14_WARM_DATASET_CACHE``).
+# In-process memo of the built split-DataLoader dict, keyed on the full Data config +
+# worker_seed, so a warm worker skips dataset RE-MATERIALIZATION on repeat runs of the
+# same data config — ``study.run()`` + ``segmenter.apply()`` + ``dataset.prepare()`` +
+# per-split ``select`` + DataLoader/worker construction are the ~tens-of-seconds the
+# warm-worker startup can't otherwise amortize. LRU size 1 (the warm 4-GPU worker runs
+# one data config repeatedly). FLOPs- and LOSS-neutral: the returned loaders still draw
+# a REAL fresh batch every step (nothing is cached at the batch level; the shuffle
+# generator continues its RNG across reuse). Off by default → byte-identical to the
+# uncached path.
+_DATASET_CACHE: dict[str, dict] = {}
 
 
 def _make_worker_init_fn(seed: int):
@@ -65,6 +79,19 @@ class Data(pydantic.BaseModel):
         loader also receives a seeded ``Generator`` so shuffle order is
         deterministic across runs. Pass ``Experiment.seed`` from the caller.
         """
+        # Warm dataset-OBJECT cache (env-gated). On a hit, return the already-built
+        # loaders so the warm worker pays zero dataset-materialization on repeat runs
+        # of the same data config. The loaders still yield fresh batches per step.
+        cache_on = os.environ.get("V14_WARM_DATASET_CACHE") == "1"
+        cache_key: str | None = None
+        if cache_on:
+            try:
+                cache_key = f"{self.model_dump_json()}|worker_seed={worker_seed}"
+            except Exception:
+                cache_key = None  # unserializable config → build normally, no cache
+            if cache_key is not None and cache_key in _DATASET_CACHE:
+                return _DATASET_CACHE[cache_key]
+
         events = self.study.run()
         dataset = self.segmenter.apply(events)
         if self.prepare:
@@ -101,4 +128,8 @@ class Data(pydantic.BaseModel):
                 loader_kwargs["persistent_workers"] = self.persistent_workers
                 loader_kwargs["prefetch_factor"] = self.prefetch_factor
             loaders[split] = DataLoader(selected, **loader_kwargs)
+
+        if cache_on and cache_key is not None:
+            _DATASET_CACHE.clear()  # LRU size 1
+            _DATASET_CACHE[cache_key] = loaders
         return loaders

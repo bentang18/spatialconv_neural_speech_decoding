@@ -490,6 +490,56 @@ def test_p2_grad_reaches_encoder_and_predictor() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #94: predictor context+query drop (V-JEPA-2 visible-only predictor)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("phase", ["p1", "p2"])
+def test_ragged_predictor_step_loss_bit_identical(phase: str) -> None:
+    """End-to-end: toggling ``ragged_predictor`` on the LIVE ``_step`` (real
+    ``p1_frontend_m2_loss`` / ``p2_parcel_m4_loss`` call sites that pass
+    ``query_valid``) yields a BIT-identical loss + masked count for BOTH phases.
+
+    The mask is seeded by ``mask_seed + global_step`` (=0 with no trainer), and
+    ``_step`` is forward-only (no weight mutation), so the two passes differ ONLY
+    in whether the predictor gathers visible-context/real-query (ragged) or feeds
+    the full grid key-padded (dense). The padded slots are masked out of
+    attention either way (``exp(NEG_INF)`` → 0), so the prediction — and the L1
+    loss — match up to ~1e-6 matmul reassociation (the #91/#93 standard)."""
+    module = _make_module(phase=phase)
+    batch = _make_synthetic_batch().data
+
+    module.predictor.ragged_predictor = False
+    dense = module._step(batch)
+    module.predictor.ragged_predictor = True
+    ragged = module._step(batch)
+
+    assert ragged.n_masked == dense.n_masked > 0
+    torch.testing.assert_close(ragged.total, dense.total, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("phase", ["p1", "p2"])
+def test_ragged_predictor_step_grad_bit_identical(phase: str) -> None:
+    """The ragged predictor must also produce a bit-identical GRADIENT into the
+    predictor's terminal ``output_proj`` (the masked-position prediction is what
+    backprops), confirming the drop is loss- AND grad-neutral. One module, one
+    batch, one mask (seed+step=0): toggling the flag is the ONLY difference."""
+    module = _make_module(phase=phase)
+    batch = _make_synthetic_batch().data
+
+    module.predictor.ragged_predictor = False
+    module._step(batch).total.backward()
+    g_dense = module.predictor.output_proj.weight.grad.clone()
+
+    module.zero_grad(set_to_none=True)
+    module.predictor.ragged_predictor = True
+    module._step(batch).total.backward()
+    g_ragged = module.predictor.output_proj.weight.grad
+
+    torch.testing.assert_close(g_ragged, g_dense, rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
 # B6: masked-empty exact 0, detached target, L1 form
 # ---------------------------------------------------------------------------
 

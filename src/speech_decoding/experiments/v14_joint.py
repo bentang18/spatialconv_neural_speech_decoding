@@ -228,6 +228,15 @@ class V14JointExperiment(V14Experiment):
     predictor_hidden: int = pydantic.Field(default=128, ge=1)
     predictor_n_heads: int = pydantic.Field(default=4, ge=1)
 
+    # #94 predictor context+query drop (V-JEPA-2 visible-only predictor). When
+    # True the predictor gathers ONLY the visible context cells + ONLY the real
+    # masked query slots (pad-to-per-batch-max) instead of feeding the full grid
+    # and key-padding the rest. BIT-identical to the dense path (padded slots are
+    # key-masked out → exp(NEG_INF)=0), a pure FLOP cut on the predictor's
+    # attention/FFN at high mask ratio. Default OFF (dense path). Covers BOTH P1
+    # and P2 (one predictor per joint phase).
+    ragged_predictor: bool = pydantic.Field(default=False)
+
     # B36 WS-E E2 LR-staging hyperparameter (P2 only). The front-end was
     # pretrained in P1; in P2 it rides at ``base_lr · frontend_lr_scale`` while
     # the fresh parcel side + predictor get full base LR. Default 0.1 (base/10).
@@ -367,6 +376,7 @@ class V14JointExperiment(V14Experiment):
             predictor_depth=self.predictor_depth,
             predictor_hidden=self.predictor_hidden,
             predictor_n_heads=self.predictor_n_heads,
+            ragged_predictor=self.ragged_predictor,
             mask_seed=self.mask_seed,
             ema_tau=0.99925,
             loss_form="l1",

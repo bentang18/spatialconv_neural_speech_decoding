@@ -118,11 +118,36 @@ _POOL_RENORM_EPS: float = 1e-6
 
 
 def _apply_rope(x: Tensor, rope: Tensor) -> Tensor:
-    """Apply RoPE to ``x`` of shape ``(..., T, head_dim)`` using cached table."""
-    cos, sin = rope[0], rope[1]  # (T, head_dim) each
-    T = x.shape[-2]
-    cos = cos[:T]
-    sin = sin[:T]
+    """Apply RoPE to ``x`` of shape ``(..., T, head_dim)`` using a cached table.
+
+    Two table layouts are accepted, distinguished by rank:
+
+    * **Shared** ``rope`` of shape ``(2, T_max, head_dim)`` (``cos``/``sin`` each
+      ``(T_max, head_dim)``): the same rotation table is sliced to ``x``'s
+      sequence length and broadcast over every leading axis (batch, heads).
+      This is the original path used by every dense caller.
+    * **Per-row** ``rope`` of shape ``(2, B', T, head_dim)`` (``cos``/``sin``
+      each ``(B', T, head_dim)``): each row carries its OWN length-``T`` table,
+      used by the #93 ragged-token drop path where every (electrode) row keeps a
+      different subset of time positions, so the rotation per kept token differs
+      across rows. A head axis is inserted so it broadcasts over the heads of
+      ``x = (B', H, T, head_dim)``. Because the table is gathered directly from
+      the shared time-RoPE table (which already maps flat token ``i`` →
+      time-patch ``i // F_p``), a kept token gets exactly the rotation it would
+      have had in the dense sequence — only its neighbours have been dropped.
+    """
+    cos, sin = rope[0], rope[1]
+    if cos.dim() == 2:
+        # Shared (T_max, head_dim) table: slice to x's seq len, broadcast over
+        # all leading dims (batch, heads).
+        T = x.shape[-2]
+        cos = cos[:T]
+        sin = sin[:T]
+    else:
+        # Per-row (B', T, head_dim) table: insert a head axis so it broadcasts
+        # over the heads of x = (B', H, T, head_dim).
+        cos = cos.unsqueeze(-3)
+        sin = sin.unsqueeze(-3)
     x_paired = x.unflatten(-1, (-1, 2))
     x_rotated = torch.stack(
         [-x_paired[..., 1], x_paired[..., 0]], dim=-1
@@ -781,10 +806,54 @@ class V14ParcelPerceiverModel(nn.Module):
         # ``valid_mask`` (the joint module gates that on this flag) so the M2
         # loss never reconstructs pad electrodes. See test_v14_ragged_frontend.
         ragged_frontend: bool = False,
+        # MASK-04 (P2 parcel drop, V-JEPA-2 visible-only on the parcel axis):
+        # when True, the cross-attn pool + latent stack run ONLY over the
+        # COVERED (and, under a ``parcel_time_mask``, non-masked = VISIBLE)
+        # parcel slots — gathered out of the ``L = K·M`` slots, padded to the
+        # per-batch max kept count, then scattered back into the full ``L``
+        # layout (dropped slots → zeros) before the M4 reshape. The pool is
+        # block-diagonal (each parcel attends only to its own electrodes) and
+        # the latent stack already key-masks uncovered/masked parcels out of
+        # parcel-SA via ``latent_valid`` (NEG_INF → softmax weight underflows to
+        # exactly 0; time-SA is per-parcel), so every KEPT parcel's M4 is
+        # BIT-IDENTICAL to the dense path — this is a pure FLOP cut, not a
+        # representation change (contrast the P1 token drop, which IS a change).
+        # The dropped slots are never read downstream (loss/PMA mask them via
+        # ``latent_valid``). No RoPE change: every kept parcel retains its full,
+        # in-order T_p time axis (the time RoPE is unaffected). Requires the tube
+        # masking contract (a covered parcel is masked at all-or-no time patches)
+        # so a per-parcel keep decision is well-defined. Default OFF (dense path
+        # byte-identical). See test_v14_ragged_parcel.
+        ragged_parcel: bool = False,
+        # #93 (P1 token drop, V-JEPA-2 visible-only on the front-end token axis):
+        # when True AND a JEPA mask is present (``token_mask`` in P1, or the
+        # ``parcel_time_mask``-derived electrode-time drop in P2), the
+        # per-electrode joint token blocks run ONLY over the VISIBLE (non-masked,
+        # valid, freq-valid-kept) (t_p, f_p) tokens — gathered out of the
+        # ``F_p·T_p`` flat sequence per electrode row, padded to the per-batch max
+        # kept count, then scattered back into the full sequence (dropped tokens →
+        # zeros) before the cross-attn pool. Unlike #91/#92 this is NOT
+        # loss-neutral: the dense path ZEROES masked tokens but still lets them
+        # attend as keys/values (a zero vector LayerNorm-normalises to ``beta``, a
+        # constant non-zero key), so a visible token's output depends on the
+        # PRESENCE of masked tokens. Dropping them makes the encoder truly
+        # visible-only (canonical V-JEPA 2 §2.1) — bit-identical to KEY-MASKING
+        # the masked tokens out of attention (``exp(NEG_INF)`` underflows to
+        # exactly 0), but a representation change vs the zero-in-place default, so
+        # it is gated behind a P4 transfer ablation. RoPE: each kept token gathers
+        # its rotation from the shared time-RoPE table (flat token ``i`` →
+        # time-patch ``i//F_p``), producing a per-row time-RoPE table — exactly
+        # the rotation it had in the dense sequence. Requires a padded ``valid_mask``
+        # only to also fold pad electrodes into the drop when ``ragged_frontend``;
+        # otherwise it operates per electrode row independently. Default OFF (dense
+        # path byte-identical). See test_v14_ragged_token.
+        ragged_token: bool = False,
     ) -> None:
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
         self.ragged_frontend = ragged_frontend
+        self.ragged_parcel = ragged_parcel
+        self.ragged_token = ragged_token
         self.n_freq_bins = n_freq_bins
         self.n_time_bins = n_time_bins
         self.k_parcels = k_parcels
@@ -1358,15 +1427,17 @@ class V14ParcelPerceiverModel(nn.Module):
             self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         )
 
-        def _run_token_blocks(xj: Tensor, kpm: Optional[Tensor]) -> Tensor:
+        def _run_token_blocks(
+            xj: Tensor, kpm: Optional[Tensor], rope_arg: Tensor = rope_token,
+        ) -> Tensor:
             for token_block in self.token_blocks:
                 if use_ckpt:
                     xj = checkpoint(
-                        token_block, xj, rope_token, kpm,
+                        token_block, xj, rope_arg, kpm,
                         use_reentrant=False,
                     )
                 else:
-                    xj = token_block(xj, rope_token, kpm)
+                    xj = token_block(xj, rope_arg, kpm)
             return xj
 
         # #91 ragged front-end: the token blocks are per-electrode (the flat
@@ -1378,8 +1449,68 @@ class V14ParcelPerceiverModel(nn.Module):
         # rows become zeros — harmless: the cross-attn pool masks them via
         # ``key_mask`` (support=0 | ~valid_mask) and the P1 M2 loss drops them
         # via ``valid_mask``. Default OFF / no valid_mask → the dense loop runs.
+        S = T_p * F_p
+        ragged_token = self.ragged_token and token_drop is not None
         ragged = self.ragged_frontend and valid_mask is not None
-        if ragged:
+        if ragged_token:
+            assert token_drop is not None  # narrowed by ``ragged_token``
+            # #93 token drop: gather the VISIBLE tokens per electrode row, run the
+            # blocks over the reduced sequence, scatter back into the full
+            # (BC, S, d) layout (dropped tokens → zeros). Bit-identical to
+            # key-masking the masked tokens out of attention (the dense path's
+            # masked_fill above zeroes them, but they would still attend; here
+            # they are GONE), with the per-row time-RoPE gathered from the shared
+            # table so every kept token keeps its dense rotation.
+            #
+            # Keep order matches x_joint's flat layout (t_p outer, f_p inner):
+            # token i = t_p·F_p + f_p, so permute token_drop (B,C,F_p,T_p) →
+            # (B,C,T_p,F_p) before the reshape.
+            keep_flat = (~token_drop).permute(0, 1, 3, 2).reshape(BC, S)  # True=visible
+            if ragged:
+                # Fold pad electrodes (no valid_mask row) into the drop so they
+                # contribute zero kept tokens → scattered zeros, exactly matching
+                # the #91 whole-row drop (and avoiding a separate row gather).
+                assert valid_mask is not None
+                keep_flat = keep_flat & valid_mask.reshape(BC, 1)
+            n_keep = keep_flat.sum(dim=1)                            # (BC,)
+            Lk = int(n_keep.max().clamp(min=1).item())
+            ar = torch.arange(S, device=keep_flat.device)
+            # Stable partition: kept tokens (key = original flat idx) sort ahead of
+            # dropped/pad tokens (key = idx + S), preserving in-row time order.
+            sort_key = torch.where(keep_flat, ar.unsqueeze(0), ar.unsqueeze(0) + S)
+            order = torch.argsort(sort_key, dim=1)                   # (BC, S)
+            keep_idx = order[:, :Lk]                                 # (BC, Lk) flat positions
+            keep_real = torch.gather(keep_flat, 1, keep_idx)         # (BC, Lk) real|pad
+            gi = keep_idx.unsqueeze(-1).expand(BC, Lk, self.d_model)
+            xj_v = torch.gather(x_joint, 1, gi)                      # (BC, Lk, d)
+            # Per-row time-RoPE: rope_token (2, S, hd) → gather kept columns →
+            # (2, BC, Lk, hd). Each kept token i carries the same time rotation
+            # (i // F_p) it had densely; only its neighbours were dropped.
+            rope_v = rope_token[:, keep_idx, :]                      # (2, BC, Lk, hd)
+            # Block key mask: a kept token is attendable iff it is REAL (not pad)
+            # AND freq-valid (the corpus freq-patch mask, gathered to kept slots).
+            kpm_v = keep_real
+            if token_key_mask is not None:
+                kpm_v = kpm_v & torch.gather(token_key_mask, 1, keep_idx)
+            # NaN guard: a row with zero attendable keys (fully-masked electrode,
+            # or pad row when ``ragged``) would make SDPA softmax over an empty
+            # set → NaN, poisoning the SHARED qkv grads (0·NaN = NaN) even though
+            # the row's output is discarded. Force such rows to attend their
+            # slot-0 (a zeroed/pad token) → finite output, discarded downstream.
+            empty_row = ~kpm_v.any(dim=1, keepdim=True)              # (BC, 1)
+            if empty_row.any():
+                slot0 = ar[:Lk].unsqueeze(0) == 0                   # (1, Lk) True at col 0
+                kpm_v = kpm_v | (empty_row & slot0)
+            xj_v = _run_token_blocks(xj_v, kpm_v, rope_v)
+            # Scatter back: real kept tokens → their flat slot; pad slots → a
+            # scratch slot S that is trimmed off (never read).
+            scatter_idx = torch.where(
+                keep_real, keep_idx, torch.full_like(keep_idx, S)
+            ).unsqueeze(-1).expand(BC, Lk, self.d_model)
+            scratch = xj_v.new_zeros(BC, S + 1, self.d_model)
+            scratch.scatter_(1, scatter_idx, xj_v)
+            x_joint = scratch[:, :S, :]
+        elif ragged:
             assert valid_mask is not None  # narrowed by ``ragged``
             valid_rows = valid_mask.reshape(BC)                      # (B·C,) bool
             valid_idx = valid_rows.nonzero(as_tuple=True)[0]         # (N_valid,)
@@ -1389,7 +1520,7 @@ class V14ParcelPerceiverModel(nn.Module):
                 # to the token blocks' SDPA and crash; the scatter result IS all
                 # zeros, so produce it directly and skip the blocks. The pool's
                 # no-coverage path then zeros every parcel (matching dense).
-                x_joint = x_joint.new_zeros(BC, T_p * F_p, self.d_model)
+                x_joint = x_joint.new_zeros(BC, S, self.d_model)
             else:
                 xj_v = x_joint.index_select(0, valid_idx)            # (N_valid, T_p·F_p, d)
                 kpm_v = (
@@ -1398,7 +1529,7 @@ class V14ParcelPerceiverModel(nn.Module):
                 )
                 xj_v = _run_token_blocks(xj_v, kpm_v)
                 x_joint = xj_v.new_zeros(
-                    BC, T_p * F_p, self.d_model
+                    BC, S, self.d_model
                 ).index_copy(0, valid_idx, xj_v)
         else:
             x_joint = _run_token_blocks(x_joint, token_key_mask)
@@ -1575,6 +1706,54 @@ class V14ParcelPerceiverModel(nn.Module):
         else:
             latent_valid_bt = latent_valid.unsqueeze(1).expand(B, T_p, L).reshape(B * T_p, L)
 
+        # === MASK-04 P2 parcel drop (visible-only encoder on the parcel axis). ===
+        # Gather the COVERED (and, under a tube ``parcel_time_mask``, non-masked
+        # = VISIBLE) parcel slots so the pool + latent stack run on ``Lk ≤ L``
+        # slots instead of all ``L = K·M``; scatter back to the full ``L`` after
+        # ``encoder_ln``. Every kept slot's M4 is bit-identical to the dense path
+        # (block-diagonal pool + parcel-SA already key-masks the rest out; time-SA
+        # is per-parcel) — a pure FLOP cut. See __init__ ``ragged_parcel``.
+        parcel_keep_idx_bt: Optional[Tensor] = None
+        parcel_keep_valid_bt: Optional[Tensor] = None
+        L_run = L
+        if self.ragged_parcel:
+            keep_bl = latent_valid.clone()                              # (B, L) covered
+            if parcel_time_mask is not None:
+                # Tube contract: a covered parcel is masked at all-or-no time
+                # patches, so "masked at any t" == "masked" — drop it whole.
+                ptm_keep = parcel_time_mask.repeat_interleave(
+                    self.m_sub_slots, dim=1
+                )                                                       # (B, L, T_p)
+                keep_bl = keep_bl & ~ptm_keep.any(dim=2)                # (B, L) visible
+            Lk = int(keep_bl.sum(dim=1).max().clamp(min=1).item())
+            # Stable partition: kept slots first (ascending original index),
+            # dropped after. Keys are distinct (idx for kept, idx+L for dropped),
+            # so the argsort is fully determined and preserves kept-slot order →
+            # the parcel-SA sum runs over the same terms in the same order.
+            ar = torch.arange(L, device=keep_bl.device)
+            sort_key = torch.where(keep_bl, ar.unsqueeze(0), ar.unsqueeze(0) + L)
+            order = torch.argsort(sort_key, dim=1)                      # (B, L)
+            keep_idx = order[:, :Lk]                                    # (B, Lk)
+            keep_valid = torch.gather(keep_bl, 1, keep_idx)            # (B, Lk) real|pad
+            parcel_keep_idx_bt = (
+                keep_idx.unsqueeze(1).expand(B, T_p, Lk).reshape(B * T_p, Lk)
+            )
+            parcel_keep_valid_bt = (
+                keep_valid.unsqueeze(1).expand(B, T_p, Lk).reshape(B * T_p, Lk)
+            )
+            gi = parcel_keep_idx_bt.unsqueeze(-1)                       # (B*T_p, Lk, 1)
+            latents_bt = torch.gather(
+                latents_bt, 1, gi.expand(B * T_p, Lk, self.d_model)
+            )
+            key_mask_bt_n = key_mask_bt.shape[-1]
+            key_mask_bt = torch.gather(
+                key_mask_bt, 1, gi.expand(B * T_p, Lk, key_mask_bt_n)
+            )
+            # Kept slots are all visible (tube) so the gathered ``latent_valid_bt``
+            # is exactly ``keep_valid`` (constant over t); pad slots → invalid.
+            latent_valid_bt = parcel_keep_valid_bt
+            L_run = Lk
+
         # B28 lock 2026-05-27 PM: cross-attn fires at position 0 ONLY by
         # default (was {0, 3} under v4 amendment 5/19 §5). Position 0
         # (pre-stack routing) ALWAYS runs, even at depth=0. Interior
@@ -1603,7 +1782,7 @@ class V14ParcelPerceiverModel(nn.Module):
                 latents_bt = checkpoint(
                     block,
                     latents_bt,
-                    B=B, T=T_p, L=L,
+                    B=B, T=T_p, L=L_run,
                     latent_valid=latent_valid_bt,
                     rope_t=self.key_rope,
                     use_reentrant=False,
@@ -1611,12 +1790,31 @@ class V14ParcelPerceiverModel(nn.Module):
             else:
                 latents_bt = block(
                     latents_bt,
-                    B=B, T=T_p, L=L,
+                    B=B, T=T_p, L=L_run,
                     latent_valid=latent_valid_bt,
                     rope_t=self.key_rope,
                 )
 
         latents_bt = self.encoder_ln(latents_bt)
+        # MASK-04: scatter the kept parcels back into the full ``L`` layout.
+        # Dropped slots → 0 (never read downstream: the loss/PMA mask them via
+        # ``latent_valid``). Pad rows (keep_valid=False, from the per-batch max)
+        # dump into a scratch slot ``L`` that is then trimmed, so they cannot
+        # clobber a real parcel.
+        if parcel_keep_idx_bt is not None:
+            assert parcel_keep_valid_bt is not None
+            scatter_idx = torch.where(
+                parcel_keep_valid_bt,
+                parcel_keep_idx_bt,
+                torch.full_like(parcel_keep_idx_bt, L),
+            ).unsqueeze(-1).expand(B * T_p, L_run, self.d_model)
+            scratch = latents_bt.new_zeros(B * T_p, L + 1, self.d_model)
+            scratch.scatter_(1, scatter_idx, latents_bt)
+            latents_bt = scratch[:, :L, :]
+            if m3_bt is not None:
+                m3_scratch = m3_bt.new_zeros(B * T_p, L + 1, self.d_model)
+                m3_scratch.scatter_(1, scatter_idx, m3_bt)
+                m3_bt = m3_scratch[:, :L, :]
         # Unflatten T_p back out → (B, L, T_p, d).
         out = latents_bt.reshape(B, T_p, L, self.d_model).transpose(1, 2).contiguous()
         if not return_taps:
@@ -1675,6 +1873,28 @@ def factored_sinusoidal_pos_emb(axis_ids: Sequence[Tensor], dim: int) -> Tensor:
     return torch.cat(parts, dim=-1)                   # (B, N, dim)
 
 
+def _ragged_gather_idx(keep: Tensor) -> tuple[Tensor, Tensor, int]:
+    """Stable per-row partition for pad-to-max ragged gathers.
+
+    Packs each row's kept (``True``) positions to the front in their original
+    in-row order, padding to the per-batch-max kept count ``Lk`` (≥1). Returns
+    ``(idx, real, Lk)``: ``idx`` (B, Lk) gathers kept-then-pad flat positions,
+    ``real`` (B, Lk) is ``True`` only at genuinely-kept slots. Identical
+    semantics to the inline #91/#93 token-drop partition.
+    """
+    B, N = keep.shape
+    n_keep = keep.sum(dim=1)
+    Lk = int(n_keep.max().clamp(min=1).item())
+    ar = torch.arange(N, device=keep.device)
+    # Kept tokens (key = original idx) sort ahead of pad tokens (key = idx + N),
+    # preserving in-row order within each group.
+    sort_key = torch.where(keep, ar.unsqueeze(0), ar.unsqueeze(0) + N)
+    order = torch.argsort(sort_key, dim=1)                  # (B, N)
+    idx = order[:, :Lk]                                     # (B, Lk)
+    real = torch.gather(keep, 1, idx)                       # (B, Lk)
+    return idx, real, Lk
+
+
 class JepaPredictor(nn.Module):
     """B36 §5 paradigm-B masked-JEPA predictor (replaces ``Predictor2Block``).
 
@@ -1730,6 +1950,19 @@ class JepaPredictor(nn.Module):
         n_heads: int = 4,
         depth: int = 3,
         max_time_patches: int = 64,
+        # #94 predictor context+query drop (V-JEPA-2 visible-only predictor):
+        # when True, the forward gathers ONLY the visible context cells + ONLY
+        # the real masked query slots (pad-to-per-batch-max) instead of feeding
+        # the full grid and key-padding the rest. Because the padded context /
+        # query slots are key-masked out (``exp(NEG_INF)`` → exactly 0), the kept
+        # tokens' attention is identical, so the prediction is BIT-identical (up
+        # to ~1e-6 matmul reassociation) — a pure FLOP cut on the predictor's
+        # attention + FFN (the dominant SSL predictor cost at high mask ratio).
+        # Reuses the per-row time-RoPE path in ``_apply_rope`` (#93). Requires
+        # ``query_valid`` (the loss always passes it); falls back to the dense
+        # key-padded path when ``query_valid`` is None. Default OFF (dense path
+        # bit-identical). See test_v14_ragged_predictor.
+        ragged_predictor: bool = False,
     ) -> None:
         super().__init__()
         if hidden % n_heads != 0:
@@ -1742,6 +1975,7 @@ class JepaPredictor(nn.Module):
         self.hidden = hidden
         self.depth = depth
         self.n_identity = n_identity
+        self.ragged_predictor = ragged_predictor
         self.input_proj = nn.Linear(d_model, hidden)
         # Single learnable mask token (V-JEPA): every masked query starts from
         # this vector, then gets its identity via ``id_embed`` and its time via
@@ -1794,6 +2028,15 @@ class JepaPredictor(nn.Module):
         token in a row is padded the row is un-padded (its outputs are gathered
         away anyway) so the SDPA softmax never sees an all-masked key set (NaN).
         """
+        if self.ragged_predictor and query_valid is not None:
+            return self._forward_ragged(
+                context,
+                context_time_ids=context_time_ids,
+                query_time_ids=query_time_ids,
+                query_id=query_id,
+                context_key_padding_mask=context_key_padding_mask,
+                query_valid=query_valid,
+            )
         B, n_ctx, _ = context.shape
         n_qry = query_time_ids.shape[0]
         h_ctx = self.input_proj(context)                        # (B, N_ctx, h)
@@ -1834,6 +2077,71 @@ class JepaPredictor(nn.Module):
         if query_valid is not None:
             return out[query_valid]                             # (n_masked, d_model)
         return out
+
+    def _forward_ragged(
+        self,
+        context: Tensor,
+        *,
+        context_time_ids: Tensor,
+        query_time_ids: Tensor,
+        query_id: Tensor,
+        context_key_padding_mask: Optional[Tensor],
+        query_valid: Tensor,
+    ) -> Tensor:
+        """#94 visible-only predictor: gather the VISIBLE context cells + the
+        REAL masked query slots (pad-to-per-batch-max) instead of feeding the
+        full grid and key-padding the rest.
+
+        Bit-identical to the dense key-padded path: a padded context / query
+        token is key-masked out (``exp(NEG_INF)`` → exactly 0), so the kept
+        tokens' attention — and hence every real prediction — is unchanged; only
+        the matmul reduction-tree size shrinks (~1e-6 float reassociation). The
+        returned ``(n_masked, d_model)`` keeps the SAME row-major masked order as
+        ``out[query_valid]`` (the stable argsort preserves in-row order), so it
+        lines up with the loss's ``teacher[target_flat]`` target exactly.
+        """
+        B, n_ctx, _ = context.shape
+        n_qry = query_time_ids.shape[0]
+        device = context.device
+
+        # ── gather VISIBLE context per row (pad-to-max) ──
+        if context_key_padding_mask is not None:
+            ctx_keep = ~context_key_padding_mask                 # (B, N_ctx) True=visible
+        else:
+            ctx_keep = torch.ones(B, n_ctx, dtype=torch.bool, device=device)
+        c_idx, c_real, Cmax = _ragged_gather_idx(ctx_keep)       # (B, Cmax) each
+        h_ctx_full = self.input_proj(context)                    # (B, N_ctx, h)
+        h_ctx = torch.gather(
+            h_ctx_full, 1, c_idx.unsqueeze(-1).expand(B, Cmax, self.hidden)
+        )                                                        # (B, Cmax, h)
+        ctx_time_bc = context_time_ids.unsqueeze(0).expand(B, n_ctx)
+        ctx_time = torch.gather(ctx_time_bc, 1, c_idx)           # (B, Cmax)
+
+        # ── gather REAL masked query slots per row (pad-to-max) ──
+        q_idx, q_real, Qmax = _ragged_gather_idx(query_valid)    # (B, Qmax) each
+        qid_bc = query_id.unsqueeze(0).expand(B, n_qry)
+        qid_g = torch.gather(qid_bc, 1, q_idx)                   # (B, Qmax)
+        q = self.mask_token.view(1, 1, -1) + self.id_embed(qid_g)  # (B, Qmax, h)
+        qtime_bc = query_time_ids.unsqueeze(0).expand(B, n_qry)
+        q_time = torch.gather(qtime_bc, 1, q_idx)                # (B, Qmax)
+
+        seq = torch.cat([h_ctx, q], dim=1)                       # (B, Cmax+Qmax, h)
+        # per-row time-RoPE: gather the base table at each row's token times.
+        time_ids = torch.cat([ctx_time, q_time], dim=1)          # (B, Cmax+Qmax)
+        rope = self._rope_base[:, time_ids, :]                   # (2, B, T_total, hd)
+        keep = torch.cat([c_real, q_real], dim=1)                # (B, T_total) True=keep
+        # All-padded row → SDPA softmax over an empty key set → NaN (poisons the
+        # SHARED qkv grads even though the row's outputs are gathered away). Force
+        # such rows to keep their slot-0 (a pad token) → finite, discarded.
+        none_keep = ~keep.any(dim=1)
+        if bool(none_keep.any()):
+            keep = keep.clone()
+            keep[none_keep, 0] = True
+
+        for block in self.blocks:
+            seq = block(seq, rope, keep)
+        out = self.output_proj(seq[:, Cmax:, :])                 # (B, Qmax, d_model)
+        return out[q_real]                                       # (n_masked, d_model)
 
 
 class V14ParcelCollapsePMA(nn.Module):
@@ -2320,6 +2628,27 @@ class V14ParcelPerceiver(BaseModelConfig):
     # and ~halves front-end step time on padded batches).
     ragged_frontend: bool = False
 
+    # MASK-04 P2 parcel drop (2026-06-09): run the cross-attn pool + latent
+    # stack over only the COVERED (& non-masked = VISIBLE under a tube
+    # ``parcel_time_mask``) parcel slots — gather → pad-to-per-batch-max →
+    # scatter back as zeros. Default OFF (dense path bit-identical). Every kept
+    # parcel's M4 is bit-identical to the dense path (block-diagonal pool +
+    # parcel-SA key-masks the rest out; time-SA is per-parcel) — a pure FLOP
+    # cut, NOT a representation change. Cuts the latent-stack FLOPs by the
+    # uncovered+masked fraction (~5-9× fewer parcels at BT: ~11 visible of 80).
+    ragged_parcel: bool = False
+
+    # #93 P1 token drop (2026-06-09): run the per-electrode joint token blocks
+    # over only the VISIBLE (non-masked, valid, freq-valid-kept) (t_p, f_p)
+    # tokens — gather → pad-to-per-batch-max → scatter back as zeros — with a
+    # per-row time-RoPE gathered from the shared table. Unlike ragged_parcel this
+    # is a representation change (the dense path zeroes masked tokens but lets
+    # them attend; dropping them makes the encoder truly visible-only, canonical
+    # V-JEPA 2 §2.1) — bit-identical to key-masking the masked tokens out of
+    # attention, but distinct from the zero-in-place default, so it is gated
+    # behind a P4 transfer ablation. Default OFF. See test_v14_ragged_token.
+    ragged_token: bool = False
+
     # SSL-pretrain dispatch flags persisted on the model config so they
     # ride along with the run-record YAML. The encoder ``build`` does
     # not branch on them — they are metadata for sister-cell rollouts
@@ -2374,6 +2703,8 @@ class V14ParcelPerceiver(BaseModelConfig):
             ref_embed_reuse_kv=self.ref_embed_reuse_kv,
             gradient_checkpointing=self.gradient_checkpointing,
             ragged_frontend=self.ragged_frontend,
+            ragged_parcel=self.ragged_parcel,
+            ragged_token=self.ragged_token,
         )
         # B35: P4 readout. The "pma_*" options collapse parcels with a
         # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only
