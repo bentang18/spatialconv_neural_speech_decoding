@@ -1,40 +1,61 @@
-# Cross-Patient Neural Speech Decoding
+# Cross-Patient Neural Speech Decoding from Intracranial Recordings
 
-Atlas-grounded parcel-token architecture for decoding speech from intra-operative intracranial recordings across patients and sensor types. Extending Spalding 2025 (PCA+CCA, 8 patients, 9 phonemes, 0.31 balanced accuracy) with a scalable transformer architecture grounded in the Brainnetome parcellation on fsaverage.
+Atlas-anchored, parcel-token transformer for decoding speech-related neural
+activity across patients and recording setups.
 
-Cogan Lab, Duke University · Ben Tang · with Greg Cogan (PI) and Zac Spalding
+Cogan Lab, Duke University · **Ben Tang** · with Greg Cogan (PI) and Zac Spalding
 
-## Program hypothesis
+## Overview
 
-**Parcels, not electrodes, are the shared representation across patients and sensors.** Atlas-grounded parcel tokens should transfer cross-patient (within a sensor), cross-sensor (within an anatomy), and cross-lab (within a modality). No iEEG foundation model has tested cross-sensor representational transfer rigorously; that is the destination.
+Intracranial speech decoders are usually trained per-patient: every subject has a
+unique electrode layout, so models learn channel-specific weights that do not
+transfer to anyone else. This project tests a different hypothesis — that
+**anatomical parcels, not electrodes, are the shared unit of representation across
+subjects.** Each electrode is mapped onto a cortical atlas (Desikan–Killiany on
+fsaverage) and pooled into parcel tokens, so a single transformer with *zero
+per-subject parameters* can be trained and evaluated across many subjects and
+electrode geometries.
 
-## Docs (Sun Tzu triad)
+The architecture extends PopT (a zero-per-subject population transformer) with a
+multi-foundation-model self-supervised pretraining stage and an anatomy-grounded
+parcel readout. Current work validates the approach on a public cross-subject
+intracranial benchmark before returning to the lab's intra-operative
+micro-ECoG speech cohort.
 
-- [**Objectives**](docs/objectives.md) — program hypothesis, stage roadmap, evaluation philosophy, advance gates
-- [**Strategy**](docs/strategy.md) — per-stage default architecture, frozen contract, live scoreboard (current: [`stage_1.md`](docs/strategy/stage_1.md))
-- [**Tactics**](docs/tactics.md) — concrete task list, in-flight jobs, blockers
+Background: extends Spalding 2025 (PCA+CCA, 8 patients, 9 phonemes).
 
-Full docs index: [`docs/README.md`](docs/README.md). Project conventions + code structure: [`CLAUDE.md`](CLAUDE.md).
+## Repository layout
 
-## Current focus
+Active code lives under `src/speech_decoding/`:
 
-**Stage 1 (Phase 1)** — single-sensor supervised correctness pass on intra-op uECoG, 7 LH patients (~7 min supervised). Architectural ablation wave in flight on DCC; Stage 2 (in-sensor scaling + SSL) blocked on 13 missing lexical FreeSurfer recons pending from Zac.
+- `studies/` — dataset adapters (NeuralFetch-style `Study` classes, e.g. BrainTreebank)
+- `extractors/` — signal front-ends and parcel-metadata extraction
+- `atlas/` — cortical atlas + parcel-token infrastructure (fsaverage projection,
+  electrode → parcel support)
+- `ssl/` — self-supervised pretraining primitives (EMA teacher, masked
+  reconstruction, distillation)
+- `models/` — encoder and readout
+- `experiments/` — training and evaluation scaffolding (NeuralTrain / Exca)
+- `whisper_ceiling/`, `vjepa_ceiling/` — analysis probes
 
-## Environment
+`scripts/` holds operational and audit utilities. Tests are colocated next to the
+modules they cover under `src/`.
 
-Python ≥ 3.11 managed via `uv`. `pyproject.toml` + `uv.lock` are authoritative.
+## Setup
+
+Python ≥ 3.12, managed with [`uv`](https://github.com/astral-sh/uv).
+`pyproject.toml` + `uv.lock` are authoritative.
 
 ```bash
-uv sync                                      # bootstrap .venv/
-.venv/bin/python -m pytest tests/v14 -q      # run test suite (338 tests)
+uv sync                              # create .venv/ from uv.lock
+.venv/bin/python -m pytest -q        # run the test suite
 ```
 
-All training runs on Duke's DCC cluster, never local. See [`docs/references/dcc_setup.md`](docs/references/dcc_setup.md).
+All model training runs on Duke's DCC cluster, never locally — this repository
+holds code, not data. Datasets (intracranial recordings, electrode coordinates,
+atlas bakes) are stored separately and are not part of the repo.
 
-## Layout
+## Status
 
-- `src/speech_decoding/v14/` — active per-phoneme Stage-1 implementation
-- `scripts/v14_core/` — DCC sbatch wrappers + ablation log aggregator
-- `scripts/ablation/` — default DCC tooling (submit / status / logs / collect / peek / query / sync)
-- `docs/` — triad + references + experiment log
-- `tests/v14/` — test suite
+Active research; manuscript in preparation. Design notes, experiment logs, and the
+draft are kept outside this public tree.

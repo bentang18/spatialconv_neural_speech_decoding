@@ -1,3 +1,11 @@
+# Internal working docs / drafts — kept local, not for the public remote.
+# Anchored to repo root so nested same-named dirs are unaffected.
+/CLAUDE.md
+/AGENTS.md
+/paper/
+/reports/
+/docs/
+
 # Data directories (large BIDS datasets + patient electrode data).
 # IMPORTANT: `/data/` is anchored to the repo root so it does NOT match
 # `src/speech_decoding/data/` or `src/speech_decoding/archive/legacy/data/`.
