@@ -159,6 +159,8 @@ def build_extract_sbatch(
         "",
         "set -euo pipefail",
         f"cd {args.repo_root}",
+        "# Compute nodes are offline; load the FM from the shared home HF cache.",
+        "export HF_HUB_OFFLINE=1",
         "",
         "# Read line ${SLURM_ARRAY_TASK_ID}+1 (skip header) from cohort.tsv",
         f"COHORT={shlex.quote(str(cohort_file))}",
