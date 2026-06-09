@@ -1,0 +1,253 @@
+{
+  "fps": 23.976023976023978,
+  "pass_r_threshold": 0.55,
+  "n_films": 3,
+  "n_pass": 3,
+  "films": [
+    "the-martian",
+    "lotr-1",
+    "coraline"
+  ],
+  "per_film_brightness_r": {
+    "the-martian": 0.9256,
+    "lotr-1": 0.8809,
+    "coraline": 0.9423
+  },
+  "all_pass": true,
+  "results": [
+    {
+      "slug": "the-martian",
+      "rip_path": "/Users/bentang/Documents/Code/speech/movies_proxy/the-martian.mp4",
+      "n_words_total": 10792,
+      "n_words_sampled": 350,
+      "n_frames_decoded": 350,
+      "fps": 23.976023976023978,
+      "brightness_r": 0.9256,
+      "brightness_offset_scan": {
+        "curve": {
+          "-48": 0.48593198287954387,
+          "-24": 0.6727135291053473,
+          "-12": 0.8508871859926518,
+          "-6": 0.8812925437491564,
+          "-2": 0.8990692078761681,
+          "-1": 0.9204411433847755,
+          "0": 0.9256473533293663,
+          "1": 0.9338846031504194,
+          "2": 0.9368573566884209,
+          "6": 0.952568865354062,
+          "12": 0.915384299534031,
+          "24": 0.788058636850115,
+          "48": 0.6024326850255405
+        },
+        "best_offset": 6,
+        "best_r": 0.952568865354062
+      },
+      "brightness_drift_windows": [
+        {
+          "window": 0,
+          "frac_start": 0.0,
+          "frac_end": 0.166,
+          "r": 0.9423,
+          "n": 58
+        },
+        {
+          "window": 1,
+          "frac_start": 0.166,
+          "frac_end": 0.331,
+          "r": 0.8678,
+          "n": 58
+        },
+        {
+          "window": 2,
+          "frac_start": 0.331,
+          "frac_end": 0.5,
+          "r": 0.9311,
+          "n": 59
+        },
+        {
+          "window": 3,
+          "frac_start": 0.5,
+          "frac_end": 0.666,
+          "r": 0.974,
+          "n": 58
+        },
+        {
+          "window": 4,
+          "frac_start": 0.666,
+          "frac_end": 0.831,
+          "r": 0.9268,
+          "n": 58
+        },
+        {
+          "window": 5,
+          "frac_start": 0.831,
+          "frac_end": 1.0,
+          "r": 0.9518,
+          "n": 59
+        }
+      ],
+      "optical_flow_r": 0.2698,
+      "n_optical_flow": 70,
+      "face_num_r": null,
+      "misaligned_regions": [],
+      "passed": true,
+      "notes": "best offset 6 frames (+0.25s) -- possible drift; "
+    },
+    {
+      "slug": "lotr-1",
+      "rip_path": "/Users/bentang/Documents/Code/speech/movies/The.Lord.of.the.Rings.The.Fellowship.of.the.Ring.2001.EXTENDED.1080p.BluRay.DDP5.1.x265.10bit-GalaxyRG265[TGx]/The.Lord.of.the.Rings.The.Fellowship.of.the.Ring.2001.EXTENDED.1080p.BluRay.DDP5.1.x265.10bit-GalaxyRG265.mkv",
+      "n_words_total": 10209,
+      "n_words_sampled": 350,
+      "n_frames_decoded": 350,
+      "fps": 23.976023976023978,
+      "brightness_r": 0.8809,
+      "brightness_offset_scan": {
+        "curve": {
+          "-48": 0.6691301104015827,
+          "-24": 0.78758364720106,
+          "-12": 0.8151000609525565,
+          "-6": 0.8599373068604936,
+          "-2": 0.8680626207191328,
+          "-1": 0.8711263272423858,
+          "0": 0.8809164039703805,
+          "1": 0.8845774531193481,
+          "2": 0.8856410686046111,
+          "6": 0.8913732084512775,
+          "12": 0.8762974749134365,
+          "24": 0.7856136129270289,
+          "48": 0.6815508084343467
+        },
+        "best_offset": 6,
+        "best_r": 0.8913732084512775
+      },
+      "brightness_drift_windows": [
+        {
+          "window": 0,
+          "frac_start": 0.0,
+          "frac_end": 0.166,
+          "r": 0.8126,
+          "n": 58
+        },
+        {
+          "window": 1,
+          "frac_start": 0.166,
+          "frac_end": 0.331,
+          "r": 0.7342,
+          "n": 58
+        },
+        {
+          "window": 2,
+          "frac_start": 0.331,
+          "frac_end": 0.5,
+          "r": 0.9573,
+          "n": 59
+        },
+        {
+          "window": 3,
+          "frac_start": 0.5,
+          "frac_end": 0.666,
+          "r": 0.8552,
+          "n": 58
+        },
+        {
+          "window": 4,
+          "frac_start": 0.666,
+          "frac_end": 0.831,
+          "r": 0.8808,
+          "n": 58
+        },
+        {
+          "window": 5,
+          "frac_start": 0.831,
+          "frac_end": 1.0,
+          "r": 0.9589,
+          "n": 59
+        }
+      ],
+      "optical_flow_r": 0.4821,
+      "n_optical_flow": 70,
+      "face_num_r": null,
+      "misaligned_regions": [],
+      "passed": true,
+      "notes": "best offset 6 frames (+0.25s) -- possible drift; "
+    },
+    {
+      "slug": "coraline",
+      "rip_path": "/Users/bentang/Documents/Code/speech/movies/Coraline 2009 1080p BluRay HEVC H265 5.1 BONE.mp4",
+      "n_words_total": 5058,
+      "n_words_sampled": 350,
+      "n_frames_decoded": 350,
+      "fps": 23.976023976023978,
+      "brightness_r": 0.9423,
+      "brightness_offset_scan": {
+        "curve": {
+          "-48": 0.858253564969939,
+          "-24": 0.8796556190236614,
+          "-12": 0.9142516346561951,
+          "-6": 0.9320972282859037,
+          "-2": 0.9389783951038901,
+          "-1": 0.941503874710928,
+          "0": 0.9423062176076952,
+          "1": 0.9445725890140426,
+          "2": 0.9455656677599287,
+          "6": 0.945531209165903,
+          "12": 0.9390531466919028,
+          "24": 0.8966475416998616,
+          "48": 0.8636748850118268
+        },
+        "best_offset": 2,
+        "best_r": 0.9455656677599287
+      },
+      "brightness_drift_windows": [
+        {
+          "window": 0,
+          "frac_start": 0.0,
+          "frac_end": 0.166,
+          "r": 0.9041,
+          "n": 58
+        },
+        {
+          "window": 1,
+          "frac_start": 0.166,
+          "frac_end": 0.331,
+          "r": 0.9697,
+          "n": 58
+        },
+        {
+          "window": 2,
+          "frac_start": 0.331,
+          "frac_end": 0.5,
+          "r": 0.9016,
+          "n": 59
+        },
+        {
+          "window": 3,
+          "frac_start": 0.5,
+          "frac_end": 0.666,
+          "r": 0.9696,
+          "n": 58
+        },
+        {
+          "window": 4,
+          "frac_start": 0.666,
+          "frac_end": 0.831,
+          "r": 0.9345,
+          "n": 58
+        },
+        {
+          "window": 5,
+          "frac_start": 0.831,
+          "frac_end": 1.0,
+          "r": 0.9721,
+          "n": 59
+        }
+      ],
+      "optical_flow_r": 0.3571,
+      "n_optical_flow": 70,
+      "face_num_r": null,
+      "misaligned_regions": [],
+      "passed": true,
+      "notes": ""
+    }
+  ]
+}

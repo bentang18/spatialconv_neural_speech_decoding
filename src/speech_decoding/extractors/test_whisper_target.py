@@ -134,6 +134,61 @@ def test_keys_off_movie_onset_not_neural_start(tmp_path: Path, monkeypatch) -> N
     assert not torch.allclose(out, dense[25:275].float())
 
 
+def test_movie_clock_offset_helper() -> None:
+    """Piecewise-constant per-film rip↔BT offset lookup."""
+    # unlisted movie -> no correction
+    assert wt._movie_clock_offset("the-grand-budapest-hotel", 100.0) == 0.0
+    # fox: constant +1.75 at every onset
+    assert wt._movie_clock_offset("fantastic-mr-fox", 0.0) == 1.75
+    assert wt._movie_clock_offset("fantastic-mr-fox", 4000.0) == 1.75
+    # lotr-2: +0.1 before the ~100-min reel join, +1.0 after
+    assert wt._movie_clock_offset("lotr-2", 0.0) == 0.1
+    assert wt._movie_clock_offset("lotr-2", 5999.9) == 0.1
+    assert wt._movie_clock_offset("lotr-2", 6000.0) == 1.0
+    assert wt._movie_clock_offset("lotr-2", 9000.0) == 1.0
+
+
+def test_offset_film_shifts_slice(tmp_path: Path, monkeypatch) -> None:
+    """A listed film's teacher slice is taken at ``onset + offset``, not ``onset``.
+
+    fox carries a +1.75 s rip lead-in, so the slice shifts by 1.75 s × 50 frames."""
+    dense = _write_cache(tmp_path, n_frames=2000, movie="fantastic-mr-fox")
+    monkeypatch.setattr(wt, "_resolve_movie", lambda s, t: "fantastic-mr-fox")
+    ext = WhisperTargetExtractor(cache_dir=str(tmp_path))
+    onset = 10.0
+    out = ext.get_static(_event(onset))
+    f0 = round((onset + 1.75) * ext.rate_hz)   # offset applied (== code's frame0)
+    f0_raw = round(onset * ext.rate_hz)         # what the uncorrected slice would be
+    assert f0 != f0_raw
+    torch.testing.assert_close(out, dense[f0:f0 + 250].float())
+    assert not torch.allclose(out, dense[f0_raw:f0_raw + 250].float())
+
+
+def test_offset_lotr2_applied(tmp_path: Path, monkeypatch) -> None:
+    """lotr-2's front-half +0.1 offset is applied by the extractor (the
+    +0.1→+1.0 step at 6000 s is unit-tested in ``test_movie_clock_offset_helper``;
+    kept here at a small onset so float16 ramp values stay frame-distinguishable)."""
+    dense = _write_cache(tmp_path, n_frames=2000, movie="lotr-2")
+    monkeypatch.setattr(wt, "_resolve_movie", lambda s, t: "lotr-2")
+    ext = WhisperTargetExtractor(cache_dir=str(tmp_path))
+    onset = 10.0  # < 6000 s -> +0.1
+    out = ext.get_static(_event(onset))
+    f0 = round((onset + 0.1) * ext.rate_hz)
+    f0_raw = round(onset * ext.rate_hz)
+    assert f0 != f0_raw
+    torch.testing.assert_close(out, dense[f0:f0 + 250].float())
+    assert not torch.allclose(out, dense[f0_raw:f0_raw + 250].float())
+
+
+def test_unlisted_film_unchanged(tmp_path: Path, monkeypatch) -> None:
+    """A film with no offset entry slices exactly at the raw onset (regression:
+    the offset path must not perturb the 10 uncorrected movies)."""
+    dense = _write_cache(tmp_path, n_frames=2000)  # _MOVIE = grand-budapest (unlisted)
+    ext = _ext(tmp_path, monkeypatch)
+    out = ext.get_static(_event(10.0))  # frame0 = round(10*50) = 500, no shift
+    torch.testing.assert_close(out, dense[500:750].float())
+
+
 def test_tail_clamp_keeps_exactly_250_frames(tmp_path: Path, monkeypatch) -> None:
     dense = _write_cache(tmp_path, n_frames=300)
     ext = _ext(tmp_path, monkeypatch)

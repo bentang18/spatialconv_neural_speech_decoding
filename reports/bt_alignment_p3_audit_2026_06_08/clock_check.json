@@ -1,0 +1,258 @@
+{
+  "audit": "v14 P3 clock gate (movie<->neural alignment)",
+  "sample_rate_hz": 2048,
+  "method": "Recompute movie_time->neural_index from subject_timings (monotonic movie_time anchors, keep max index per movie_time to absorb pauses); compare words_df.est_idx to interp(start) and to round(start*2048).",
+  "overall_verdict": "est_idx is TRIGGER-OFFSET-MAPPED (matches interp(start) within a few samples) and is NOT naive round(start*2048) in every session",
+  "sessions": {
+    "subject1_trial1": {
+      "movie": "the-martian",
+      "n_words": 10723,
+      "n_timing_triggers": 87391,
+      "n_pauses": 4,
+      "n_pause_artifact_words": 0,
+      "trigger_mapping_residual_samples": {
+        "median": -0.04575042799115181,
+        "mean": 2.7217336954477096,
+        "std": 275.2942021712675,
+        "median_abs": 5.1249497486278415,
+        "p95_abs": 25.277911731041964,
+        "p99_abs": 34.69352907735858,
+        "max_abs": 28484.695928016677,
+        "frac_within_1_sample": 0.1932295066679101,
+        "frac_within_20_samples": 0.9144828872517019,
+        "corr_residual_vs_movie_time": -0.0059876600667097294
+      },
+      "trigger_mapping_residual_seconds": {
+        "median_abs": 0.0025024168694471882,
+        "p99_abs": 0.016940199744803996
+      },
+      "naive_round_start_x2048_residual_samples": {
+        "median": 204998.0,
+        "min": 157077.0,
+        "max": 1264494.0,
+        "median_abs_seconds": 100.0966796875
+      },
+      "clock_offset_seconds": {
+        "first_word_neural_minus_movie": 76.71629792227704,
+        "last_word_neural_minus_movie": 617.4031156901292,
+        "drift_across_trial": 540.6868177678522
+      },
+      "playback_slope_samples_per_s": {
+        "median": 2037.9600020442626,
+        "expected": 2048
+      },
+      "verdict": {
+        "est_idx_is_trigger_offset_mapped": true,
+        "est_idx_is_naive_round_start_x2048": false
+      }
+    },
+    "subject2_trial4": {
+      "movie": "avengers-infinity-war",
+      "n_words": 7844,
+      "n_timing_triggers": 82634,
+      "n_pauses": 18,
+      "n_pause_artifact_words": 0,
+      "trigger_mapping_residual_samples": {
+        "median": -0.029288284480571747,
+        "mean": -43.05475213336244,
+        "std": 3813.8474731345905,
+        "median_abs": 4.962282341672108,
+        "p95_abs": 25.476153669971964,
+        "p99_abs": 33.901123071599244,
+        "max_abs": 337798.6290722592,
+        "frac_within_1_sample": 0.2312595614482407,
+        "frac_within_20_samples": 0.9203212646608873,
+        "corr_residual_vs_movie_time": 0.0039991482266785216
+      },
+      "trigger_mapping_residual_seconds": {
+        "median_abs": 0.0024229894246445838,
+        "p99_abs": 0.01655328274980432
+      },
+      "naive_round_start_x2048_residual_samples": {
+        "median": 5209693.5,
+        "min": 805344.0,
+        "max": 6520132.0,
+        "median_abs_seconds": 2543.795654296875
+      },
+      "clock_offset_seconds": {
+        "first_word_neural_minus_movie": 393.240760905944,
+        "last_word_neural_minus_movie": 3183.63754948554,
+        "drift_across_trial": 2790.396788579596
+      },
+      "playback_slope_samples_per_s": {
+        "median": 2049.950041754386,
+        "expected": 2048
+      },
+      "verdict": {
+        "est_idx_is_trigger_offset_mapped": true,
+        "est_idx_is_naive_round_start_x2048": false
+      }
+    },
+    "subject3_trial1": {
+      "movie": "lotr-1",
+      "n_words": 7597,
+      "n_timing_triggers": 80829,
+      "n_pauses": 5,
+      "n_pause_artifact_words": 0,
+      "trigger_mapping_residual_samples": {
+        "median": -0.019228740129619837,
+        "mean": -0.912203880184711,
+        "std": 83.75048485897793,
+        "median_abs": 5.255486715584993,
+        "p95_abs": 25.361539854481816,
+        "p99_abs": 35.28158727142959,
+        "max_abs": 7230.639280086383,
+        "frac_within_1_sample": 0.19902593128866658,
+        "frac_within_20_samples": 0.9120705541661182,
+        "corr_residual_vs_movie_time": 0.004982648450223798
+      },
+      "trigger_mapping_residual_seconds": {
+        "median_abs": 0.002566155622844235,
+        "p99_abs": 0.01722733753487773
+      },
+      "naive_round_start_x2048_residual_samples": {
+        "median": 2313125.0,
+        "min": 2079539.0,
+        "max": 4113311.0,
+        "median_abs_seconds": 1129.45556640625
+      },
+      "clock_offset_seconds": {
+        "first_word_neural_minus_movie": 1015.4171528679113,
+        "last_word_neural_minus_movie": 2008.4363830371403,
+        "drift_across_trial": 993.019230169229
+      },
+      "playback_slope_samples_per_s": {
+        "median": 2049.9480020451124,
+        "expected": 2048
+      },
+      "verdict": {
+        "est_idx_is_trigger_offset_mapped": true,
+        "est_idx_is_naive_round_start_x2048": false
+      }
+    },
+    "subject4_trial1": {
+      "movie": "megamind",
+      "n_words": 8223,
+      "n_timing_triggers": 51655,
+      "n_pauses": 8,
+      "n_pause_artifact_words": 0,
+      "trigger_mapping_residual_samples": {
+        "median": 0.0633501629345119,
+        "mean": -8.638318947186375,
+        "std": 780.156898059567,
+        "median_abs": 4.75716645270586,
+        "p95_abs": 25.652953379042433,
+        "p99_abs": 36.39643089389426,
+        "max_abs": 70740.7893157485,
+        "frac_within_1_sample": 0.2654748875106409,
+        "frac_within_20_samples": 0.9208318132068588,
+        "corr_residual_vs_movie_time": 0.007972282860301027
+      },
+      "trigger_mapping_residual_seconds": {
+        "median_abs": 0.0023228351819852833,
+        "p99_abs": 0.017771694772409308
+      },
+      "naive_round_start_x2048_residual_samples": {
+        "median": 1280197.0,
+        "min": 481549.0,
+        "max": 1852288.0,
+        "median_abs_seconds": 625.09619140625
+      },
+      "clock_offset_seconds": {
+        "first_word_neural_minus_movie": 235.13667715038036,
+        "last_word_neural_minus_movie": 904.4249971513864,
+        "drift_across_trial": 669.288320001006
+      },
+      "playback_slope_samples_per_s": {
+        "median": 2049.9480020507,
+        "expected": 2048
+      },
+      "verdict": {
+        "est_idx_is_trigger_offset_mapped": true,
+        "est_idx_is_naive_round_start_x2048": false
+      }
+    },
+    "subject10_trial0": {
+      "movie": "cars-2",
+      "n_words": 8796,
+      "n_timing_triggers": 47996,
+      "n_pauses": 7,
+      "n_pause_artifact_words": 0,
+      "trigger_mapping_residual_samples": {
+        "median": -0.12488303263671696,
+        "mean": 4.853691246068225,
+        "std": 328.82708531497474,
+        "median_abs": 5.165922131156549,
+        "p95_abs": 24.956940586678684,
+        "p99_abs": 33.94823243536516,
+        "max_abs": 23359.72819894459,
+        "frac_within_1_sample": 0.20259208731241474,
+        "frac_within_20_samples": 0.9142792178262846,
+        "corr_residual_vs_movie_time": 0.0012428176239489112
+      },
+      "trigger_mapping_residual_seconds": {
+        "median_abs": 0.0025224229156037836,
+        "p99_abs": 0.016576285368830646
+      },
+      "naive_round_start_x2048_residual_samples": {
+        "median": 388144.0,
+        "min": 148638.0,
+        "max": 1112532.0,
+        "median_abs_seconds": 189.5234375
+      },
+      "clock_offset_seconds": {
+        "first_word_neural_minus_movie": 72.5931640625,
+        "last_word_neural_minus_movie": 543.2018793305715,
+        "drift_across_trial": 470.6087152680715
+      },
+      "playback_slope_samples_per_s": {
+        "median": 2037.9600020442626,
+        "expected": 2048
+      },
+      "verdict": {
+        "est_idx_is_trigger_offset_mapped": true,
+        "est_idx_is_naive_round_start_x2048": false
+      }
+    }
+  },
+  "wav_transcript_clock_check": {
+    "description": "Cross-check that the Whisper-cache audio source (audio/bt_16k/<movie>.wav) shares the transcript movie clock. WAV RMS in each word [start,end] window vs transcript per-word rms, log-space corr. High at offset 0 + collapse at nonzero offsets => WAV and transcript (movie_onset_s) are on the same clock, so the teacher slice at round(movie_onset_s*50) lands on the correct word audio.",
+    "movies": {
+      "the-martian": {
+        "wav_duration_s": 9080.672,
+        "last_transcript_word_end_s": 8694.676864778621,
+        "corr_log_wavrms_vs_transcriptrms_at_offset0": 0.8774251159661464,
+        "corr_at_offset_+10s": 0.46680134532819895,
+        "corr_at_offset_-30s": 0.381865767860045
+      },
+      "avengers-infinity-war": {
+        "wav_duration_s": 8961.2586875,
+        "last_transcript_word_end_s": 8925.969155446757,
+        "corr_log_wavrms_vs_transcriptrms_at_offset0": 0.8326914012514974,
+        "corr_at_offset_+10s": 0.28896050458288414,
+        "corr_at_offset_-30s": 0.2599386824344165
+      },
+      "lotr-1": {
+        "wav_duration_s": 13698.368,
+        "last_transcript_word_end_s": 12014.41325878594,
+        "corr_log_wavrms_vs_transcriptrms_at_offset0": 0.8823551274874377,
+        "corr_at_offset_+10s": 0.49797693426219475,
+        "corr_at_offset_-30s": 0.2742798668435874
+      },
+      "megamind": {
+        "wav_duration_s": 5734.6875,
+        "last_transcript_word_end_s": 5322.166005983541,
+        "corr_log_wavrms_vs_transcriptrms_at_offset0": 0.8368366503222177,
+        "corr_at_offset_+10s": 0.19177205198192968,
+        "corr_at_offset_-30s": 0.14198644732557286
+      },
+      "cars-2": {
+        "wav_duration_s": 6376.4693125,
+        "last_transcript_word_end_s": 5891.649361022364,
+        "corr_log_wavrms_vs_transcriptrms_at_offset0": 0.9284890624656505,
+        "corr_at_offset_+10s": 0.3768734084717663,
+        "corr_at_offset_-30s": 0.19893063886412046
+      }
+    }
+  }
+}

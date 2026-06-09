@@ -72,13 +72,17 @@ def _stub_words_df() -> pd.DataFrame:
 
 
 def _stub_nonverbal_df() -> pd.DataFrame:
-    """8 nonverbal rows interleaved with the word starts (+ offset ``est_idx``)."""
-    starts = [15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0]
+    """8 nonverbal rows mirroring REAL ``nonverbal_df``: ``start`` IS the neural
+    clock (``== est_idx/SR``) and there is NO movie-clock column (unlike
+    ``words_df``). Neural times sit inside the words' neural span [210, 280] s so
+    the movie-onset re-key interpolates rather than clamps. (Fixed 2026-06-08: the
+    old fixture gave nonverbal a fake +200 s movie clock, masking the P3 bug.)"""
+    neural_s = [215.0, 225.0, 235.0, 245.0, 255.0, 265.0, 270.0, 275.0]
     return pd.DataFrame(
         {
-            "start": starts,
-            "end": [s + 1.0 for s in starts],
-            "est_idx": [round((s + 200.0) * 2048.0) for s in starts],
+            "start": neural_s,  # neural clock, == est_idx/SR (no movie clock)
+            "end": [s + 1.0 for s in neural_s],
+            "est_idx": [round(s * 2048.0) for s in neural_s],
         }
     )
 
@@ -131,6 +135,148 @@ def test_word_event_rows_matches_upstream_interleaved_order() -> None:
     for row_i, (lbl, src) in enumerate(zip(expected_labels, expected_src_indices)):
         src_df = nonverbal if int(lbl) == 0 else words
         assert rows.iloc[row_i]["start"] == float(src_df.iloc[int(src)]["est_idx"]) / sr
+
+
+def test_nonverbal_movie_onset_is_rekeyed_from_words_df() -> None:
+    """REGRESSION (P3 nonverbal clock bug, 2026-06-08).
+
+    ``nonverbal_df`` carries only the neural clock (``start == est_idx/SR``, no
+    movie column). The P3 Whisper teacher is keyed by ``movie_onset_s``, so
+    nonverbal anchors MUST be re-keyed onto the movie clock via the same-session
+    ``words_df`` (est_idx → start) map — never emitted with their neural ``start``
+    (which would key the teacher hundreds of seconds off-movie)."""
+    words = _stub_words_df()
+    nonverbal = _stub_nonverbal_df()
+    sr = we._neural_sample_rate()
+    # Precondition: the fixture mirrors real data — nonverbal start IS the neural
+    # clock, and nonverbal has no movie-clock column distinct from est_idx/SR.
+    assert np.allclose(
+        nonverbal["start"].to_numpy(), nonverbal["est_idx"].to_numpy() / sr
+    )
+    rows = _word_event_rows(
+        subject_id=2, trial_id=4, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=False,
+    )
+    xp = words.sort_values("est_idx")["est_idx"].to_numpy(dtype=float)
+    fp = words.sort_values("est_idx")["start"].to_numpy(dtype=float)
+    nv_rows = rows[rows["text"] == "<nonverbal>"]
+    assert len(nv_rows) == len(nonverbal)
+    for _, r in nv_rows.iterrows():
+        est_idx = r["start"] * sr  # neural-clock onset back to samples
+        expected_movie = float(np.interp(est_idx, xp, fp))
+        # Re-keyed onto the movie clock (here neural − 200 s by construction)…
+        assert r["movie_onset_s"] == pytest.approx(expected_movie)
+        # …and decidedly NOT the neural-clock value it would have been pre-fix.
+        assert abs(r["movie_onset_s"] - r["start"]) > 100.0
+
+
+def test_movie_onset_unified_via_trigger_track() -> None:
+    """Unified clock map: when the BT trigger track is supplied, BOTH verbal and
+    nonverbal anchors key the Whisper teacher via the SAME np.interp(est_idx) over
+    the trigger track — not words_df.start (verbal) nor the sparse words map
+    (nonverbal). The trigger track is BT's authoritative neural↔movie alignment."""
+    words = _stub_words_df()
+    nonverbal = _stub_nonverbal_df()
+    sr = we._neural_sample_rate()
+    # Linear trigger map over the whole neural span: movie = neural − 50 s. The
+    # −50 (vs the stubs' +200 s est_idx offset) makes the map's verbal answer
+    # differ from words_df.start, so a pass proves the trigger track was used.
+    trig_index = np.array([0.0, 600.0]) * sr
+    trig_movie = np.array([0.0, 600.0]) - 50.0
+    rows = _word_event_rows(
+        subject_id=2, trial_id=4, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=False,
+        neural_to_movie=(trig_index, trig_movie),
+    )
+    for _, r in rows.iterrows():
+        est_idx = r["start"] * sr
+        assert r["movie_onset_s"] == pytest.approx(est_idx / sr - 50.0)
+    # Verbal onsets come from the trigger map (neural−50), NOT words_df.start.
+    vb = rows[rows["text"] != "<nonverbal>"]
+    for _, r in vb.iterrows():
+        src = words[words["est_idx"] == round(r["start"] * sr)].iloc[0]
+        assert abs(r["movie_onset_s"] - float(src["start"])) == pytest.approx(150.0)
+    # Nonverbal onsets are the movie clock (neural−50), NOT the neural start.
+    nv = rows[rows["text"] == "<nonverbal>"]
+    for _, r in nv.iterrows():
+        assert r["movie_onset_s"] == pytest.approx(r["start"] - 50.0)
+
+
+def test_movie_onset_freezes_across_pause() -> None:
+    """THE pause-bridging regression (2026-06-08, found by the bytes→gradient
+    audit). A nonverbal anchor INSIDE a recording pause must key the teacher at the
+    FROZEN movie time the trigger track records — not the value a sparse words map
+    bridges linearly across the word-free pause gap (was up to 89 s off-movie)."""
+    sr = we._neural_sample_rate()
+    # Trigger track with a pause: movie_time freezes at 100 s while the neural index
+    # advances from 100 s to 400 s of neural, then resumes at movie 200 s.
+    trig_index = np.array([0.0, 100.0, 400.0, 500.0]) * sr
+    trig_movie = np.array([0.0, 100.0, 100.0, 200.0])  # frozen across the gap
+    # One nonverbal anchor at neural 250 s — squarely inside the pause.
+    nonverbal = pd.DataFrame(
+        {"start": [250.0], "end": [251.0], "est_idx": [round(250.0 * sr)]}
+    )
+    # Words bracket the pause but have NO samples inside it (no speech while paused)
+    # — exactly the sparse-map blind spot. Word "b" sits at neural 500 s / movie
+    # 200 s (the pause added 300 s of neural time to the same movie content).
+    words = pd.DataFrame(
+        {
+            "start": [100.0, 200.0],
+            "end": [101.0, 201.0],
+            "est_idx": [round(100.0 * sr), round(500.0 * sr)],
+            "original_index": [0, 1],
+            "full_word": ["a", "b"],
+        }
+    )
+    rows = _word_event_rows(
+        subject_id=2, trial_id=4, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=False,
+        neural_to_movie=(trig_index, trig_movie),
+    )
+    nv = rows[rows["text"] == "<nonverbal>"]
+    assert len(nv) == 1
+    onset = float(nv.iloc[0]["movie_onset_s"])
+    # Trigger track freezes at 100 s across the pause — the correct teacher slice.
+    assert onset == pytest.approx(100.0, abs=1e-6)
+    # The sparse words map would have BRIDGED: interp(neural 250 s) over the two
+    # words (neural 100→movie 100, neural 500→movie 200) = 137.5 s — wrong scene.
+    bridged = float(
+        np.interp(
+            250.0 * sr,
+            words["est_idx"].to_numpy(float),
+            words["start"].to_numpy(float),
+        )
+    )
+    assert bridged == pytest.approx(137.5, abs=0.5)
+    assert abs(onset - bridged) > 30.0  # the residual the trigger track removes
+
+
+def test_load_neural_to_movie_map_strict_and_dedup(tmp_path) -> None:
+    """The trigger-track loader: None when no bt_root (laptop tests); raises when
+    bt_root is set but the file is missing (loud on a misconfigured BT root); and
+    returns a sorted, index-deduplicated map (np.interp needs strictly-increasing
+    xp, and pause boundaries duplicate an index)."""
+    assert we._load_neural_to_movie_map(2, 4, None) is None
+    with pytest.raises(FileNotFoundError):
+        we._load_neural_to_movie_map(2, 4, tmp_path)
+    d = tmp_path / "subject_timings"
+    d.mkdir()
+    (d / "sub_2_trial004_timings.csv").write_text(
+        "type,movie_time,index\n"
+        "trigger,2.0,2000\n"
+        "trigger,0.0,0\n"  # out of order on disk
+        "trigger,1.0,1000\n"
+        "pause,1.95,2000\n"  # duplicate index 2000 → keep last (the pause row)
+    )
+    result = we._load_neural_to_movie_map(2, 4, tmp_path)
+    assert result is not None
+    idx, mt = result
+    assert np.all(np.diff(idx) > 0)  # strictly increasing xp
+    np.testing.assert_array_equal(idx, [0.0, 1000.0, 2000.0])
+    assert mt[-1] == pytest.approx(1.95)  # duplicate index → last row's movie_time
 
 
 def test_word_event_rows_balance_false_keeps_all_anchors_chronological() -> None:
@@ -243,6 +389,12 @@ def test_btwordevents_run_appends_word_rows_with_split(monkeypatch) -> None:
             _stub_words_df(), _stub_nonverbal_df(),
         ),
     )
+    # No real trigger track for the synthetic /dev/null root: exercise the sparse
+    # words_df movie-onset fallback (these tests cover splits/schema, not onset).
+    monkeypatch.setattr(
+        we, "_load_neural_to_movie_map",
+        lambda subject_id, trial_id, bt_root: None,
+    )
     step = BTWordEvents(
         tasks=("speech",),
         binary_tasks=True,
@@ -286,6 +438,12 @@ def test_btwordevents_real_vendored_csvs_balanced_val_test_halves(monkeypatch) -
         return words, nonverbal
 
     monkeypatch.setattr(we, "_load_words_and_nonverbal", _load)
+    # Balanced eval doesn't consume movie_onset_s; skip the trigger track (the
+    # /dev/null root has none) and use the sparse words_df fallback.
+    monkeypatch.setattr(
+        we, "_load_neural_to_movie_map",
+        lambda subject_id, trial_id, bt_root: None,
+    )
 
     ieeg = pd.DataFrame(
         [
@@ -472,6 +630,12 @@ def test_btwordevents_pretrain_mode_drops_eval_sessions(monkeypatch) -> None:
             _stub_words_df(), _stub_nonverbal_df(),
         ),
     )
+    # No real trigger track for the synthetic /dev/null root: exercise the sparse
+    # words_df movie-onset fallback (these tests cover splits/schema, not onset).
+    monkeypatch.setattr(
+        we, "_load_neural_to_movie_map",
+        lambda subject_id, trial_id, bt_root: None,
+    )
     step = BTWordEvents(
         tasks=("speech",),
         binary_tasks=True,
@@ -502,6 +666,12 @@ def test_btwordevents_emits_string_subject_trial_id_schema(monkeypatch) -> None:
         lambda subject_id, trial_id, *, bt_root, enrich: (
             _stub_words_df(), _stub_nonverbal_df(),
         ),
+    )
+    # No real trigger track for the synthetic /dev/null root: exercise the sparse
+    # words_df movie-onset fallback (these tests cover splits/schema, not onset).
+    monkeypatch.setattr(
+        we, "_load_neural_to_movie_map",
+        lambda subject_id, trial_id, bt_root: None,
     )
     step = BTWordEvents(
         tasks=("speech",),

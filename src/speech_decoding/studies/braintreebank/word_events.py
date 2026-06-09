@@ -37,6 +37,7 @@ import os
 import typing as tp
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from neuralset.events.study import EventsTransform
@@ -164,6 +165,54 @@ def _load_words_and_nonverbal(
     return words_df, nonverbal_df
 
 
+def _load_neural_to_movie_map(
+    subject_id: int, trial_id: int, bt_root: str | Path | None
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """BT trigger-track neural→movie map for ``(subject, trial)``.
+
+    Returns sorted, index-deduplicated ``(neural_sample_index, movie_time_s)``
+    arrays for ``np.interp(est_idx) -> movie_onset_s``. This is BT's AUTHORITATIVE
+    frame-trigger alignment — ``{bt_root}/subject_timings/sub_{N}_trial{T:03d}_timings.csv``,
+    the SAME file BT's own ``trial_data_reader.estimate_sample_index`` inverts to
+    derive ``words_df.est_idx`` — so interpolating it is the most authoritative
+    neural↔movie source that exists (it reproduces ``words_df.start`` to ~2.5 ms).
+
+    Unlike the sparse ``words_df`` (est_idx→start) map, the trigger track carries
+    explicit ``pause``/``unpause`` rows, so ``movie_time`` FREEZES across a
+    recording pause instead of being linearly bridged. That freeze is exactly the
+    fix for the nonverbal pause-bridging residual (sparse-words interp was up to
+    89 s off-movie for ~21% of nonverbal anchors, which live in the word-free
+    pause stretches the sparse map cannot bracket).
+
+    ``bt_root is None`` (laptop unit tests, no BT mounted) → ``None``; the caller
+    then falls back to the sparse words map. ``bt_root`` set but the file missing
+    → raises, so a misconfigured BT data root fails LOUDLY rather than silently
+    regressing every nonverbal teacher target to the pause-bridging path.
+    """
+    if bt_root is None:
+        return None
+    path = (
+        Path(bt_root)
+        / "subject_timings"
+        / f"sub_{subject_id}_trial{trial_id:03d}_timings.csv"
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"BTWordEvents: trigger track missing for (subject {subject_id}, "
+            f"trial {trial_id}): {path}. It keys the Whisper teacher on the movie "
+            "clock (movie_onset_s); check ROOT_DIR_BRAINTREEBANK/subject_timings/."
+        )
+    df = pd.read_csv(path)[["index", "movie_time"]].dropna().sort_values("index")
+    # np.interp needs strictly-increasing xp. Some rows share an `index` (a pause
+    # boundary collapses a trigger and the pause row onto one sample; a few sessions
+    # also carry plain trigger-row index ties). keep="last" leaves xp strictly
+    # increasing for all 26 sessions; the dropped twin's movie_time differs by at
+    # most one trigger spacing (~85 ms), and both bracket the same sample, so either
+    # is a valid knot — the choice is sub-frame at the 8 Hz teacher rate.
+    df = df.drop_duplicates(subset="index", keep="last")
+    return df["index"].to_numpy(dtype=float), df["movie_time"].to_numpy(dtype=float)
+
+
 def _word_event_rows(
     *,
     subject_id: int,
@@ -179,6 +228,7 @@ def _word_event_rows(
     duration: float,
     balance: bool = True,
     pitch_volume_features: dict[str, dict[str, tp.Any]] | None = None,
+    neural_to_movie: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> pd.DataFrame:
     """Build per-task Word rows.
 
@@ -211,6 +261,38 @@ def _word_event_rows(
     # `duration=1.0`. Emitting transcript `start` would slice every BT clip
     # 235–900 s off-target (C3).
     sample_rate = _neural_sample_rate()
+    # Movie-clock onset for the P3 Whisper-teacher join, computed by ONE mechanism
+    # for BOTH verbal and nonverbal anchors. AUTHORITATIVE source = the BT trigger
+    # track (`neural_to_movie`): np.interp(est_idx) -> movie_time. It is the same
+    # map BT inverts to derive words_df.est_idx, the only source that FREEZES
+    # movie_time across recording pauses, and strictly more correct than words_df
+    # for the half-rate S9 session. The fallback (no trigger track — laptop tests
+    # without BT mounted) is the sparse words_df map: exact for verbal (== start)
+    # but it linearly BRIDGES pauses for nonverbal, the residual the trigger track
+    # is here to remove.
+    if (
+        neural_to_movie is None
+        and len(words_df)
+        and {"est_idx", "start"} <= set(words_df.columns)
+    ):
+        _wsort = (
+            words_df[["est_idx", "start"]]
+            .dropna()
+            .sort_values("est_idx")
+            .drop_duplicates(subset="est_idx", keep="last")
+        )
+        _fb_x = _wsort["est_idx"].to_numpy(dtype=float)
+        _fb_y = _wsort["start"].to_numpy(dtype=float)
+    else:
+        _fb_x = _fb_y = None
+
+    def _movie_onset(est_idx: float, is_nonverbal: bool, source: pd.Series) -> float:
+        if neural_to_movie is not None:  # authoritative trigger track (all anchors)
+            nm_idx, nm_t = neural_to_movie
+            return float(np.interp(est_idx, nm_idx, nm_t))
+        if is_nonverbal and _fb_x is not None:  # fallback: sparse words_df interp
+            return float(np.interp(est_idx, _fb_x, _fb_y))
+        return float(source["start"])  # fallback verbal: words_df start IS movie clock
     for task in tasks:
         label_indices = derive_label_indices(
             words_df=words_df,
@@ -249,10 +331,12 @@ def _word_event_rows(
                 source = words_df.iloc[src_idx]
                 raw_text = source.get("full_word", "")
                 text = str(raw_text) if pd.notna(raw_text) and str(raw_text) else "<word>"
+            est_idx = float(source["est_idx"])
+            movie_onset = _movie_onset(est_idx, is_nonverbal, source)
             rows.append(
                 {
                     "type": "Word",
-                    "start": float(source["est_idx"]) / sample_rate,
+                    "start": est_idx / sample_rate,
                     "duration": float(duration),
                     "text": text,
                     "task": task,
@@ -260,15 +344,19 @@ def _word_event_rows(
                     "subject_id": str(subject_id),
                     "trial_id": str(trial_id),
                     "timeline": timeline,
-                    # MOVIE-clock onset (seconds into the movie audio), for the
-                    # P3 Whisper-teacher join (WS-H / WhisperTargetExtractor). This
-                    # is the transcript `start`, NOT `est_idx/SR` above: the two
-                    # diverge by the per-trial neural-vs-movie drift (235-904 s,
-                    # FLAG 9). The neural window slices at `start` (neural clock);
-                    # the audio-keyed teacher cache is indexed by movie time, so
-                    # it MUST slice at `movie_onset_s`. Both words_df and
-                    # nonverbal_df carry the movie-clock column `start`.
-                    "movie_onset_s": float(source["start"]),
+                    # MOVIE-clock onset (seconds into the movie audio), for the P3
+                    # Whisper-teacher join (WS-H / WhisperTargetExtractor). The
+                    # neural window slices at `start` (neural clock, est_idx/SR);
+                    # the audio-keyed teacher cache is indexed by movie time, so it
+                    # MUST slice at `movie_onset_s`. Computed for BOTH verbal and
+                    # nonverbal anchors by `_movie_onset` above — interp over the BT
+                    # trigger track (authoritative; freezes across pauses) when it is
+                    # available, else the sparse words_df map. The two clocks diverge
+                    # by the per-trial neural-vs-movie drift (235-904 s, FLAG 9).
+                    # (Legacy NONVERBAL note: nonverbal_df has no movie
+                    # clock, so emitting its own `start` here would key the teacher
+                    # 235-904 s off-movie (the 2026-06-08 P3 alignment bug).
+                    "movie_onset_s": movie_onset,
                 }
             )
     if not rows:
@@ -535,6 +623,7 @@ class BTWordEvents(EventsTransform):
             words_df, nonverbal_df = _load_words_and_nonverbal(
                 subject_id, trial_id, bt_root=bt_root, enrich=enrich,
             )
+            neural_to_movie = _load_neural_to_movie_map(subject_id, trial_id, bt_root)
             pitch_volume_features = (
                 _load_pitch_volume_features(subject_id, trial_id)
                 if _tasks_need_pitch_volume(self.tasks)
@@ -554,6 +643,7 @@ class BTWordEvents(EventsTransform):
                 duration=self.duration,
                 balance=self.balance,
                 pitch_volume_features=pitch_volume_features,
+                neural_to_movie=neural_to_movie,
             )
             all_word_rows.append(timeline_rows)
 
