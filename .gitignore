@@ -62,3 +62,8 @@ docs/*.pdf
 
 # Claude Code worktrees (transient agent worktrees)
 .claude/worktrees/
+
+# Secrets — never commit (wandb API key etc.)
+reports/wandb.md
+**/wandb_key*
+*.secret

@@ -522,6 +522,12 @@ def build_v14_experiment(
     # estimates RankMe/coverage from a small sample, so a cap is lossless for
     # it. None → full val set (correct for P4, where val_loss IS the metric).
     limit_val_batches: int | float | None = None,
+    # Cap the final ``trainer.test()`` pass the same way ``limit_val_batches``
+    # caps validation. The end-of-phase test computes the monitor panel
+    # (RankMe/coverage) over the full holdout (~160 batches → ~2.5 min on a
+    # nano run, dwarfing the training steps). For an intuition run a 2-batch
+    # estimate is plenty; None → full test set (the prior, unchanged default).
+    limit_test_batches: int | float | None = None,
     # Early-stopping patience on ``val_loss``. None → no early-stop (the SSL /
     # distill phases train to a fixed budget; their val loss is a pretext
     # reconstruction/distill objective, NOT the downstream metric, so val-loss-min
@@ -1395,6 +1401,7 @@ def build_v14_experiment(
         max_steps=max_steps,
         val_check_interval=val_check_interval,
         limit_val_batches=limit_val_batches,
+        limit_test_batches=limit_test_batches,
         collapse_guard=collapse_guard,
         # #66/#67: LR-warmup step count → the guard ignores soft criteria
         # while the LR is still ramping (warmup_steps reaches the optim above).
@@ -1509,6 +1516,16 @@ def _parser() -> argparse.ArgumentParser:
                         "(~875 batches, ~8 min/check) is pure wall-clock waste. "
                         "P4 is uncapped (its val_loss IS the downstream metric). "
                         "<=0 = uncapped.")
+    p.add_argument("--ssl-limit-test-batches", dest="ssl_limit_test_batches",
+                   type=int, default=None,
+                   help="Cap the final SSL/distill trainer.test() pass to this "
+                        "many batches. The end-of-phase test recomputes the "
+                        "monitor panel (RankMe/coverage) over the full holdout "
+                        "(~160 batches → ~2.5 min on a nano run, dwarfing the "
+                        "training steps). A nano intuition run wants the live "
+                        "training dynamics, not a full held-out eval — pass 2. "
+                        "None (default) = uncapped (unchanged for real runs). "
+                        "P4 is left uncapped (its test metric is load-bearing).")
     p.add_argument("--no-collapse-guard", dest="collapse_guard",
                    action="store_false", default=True,
                    help="Disarm the collapse/divergence kill-switch (#54) on the "
@@ -2806,6 +2823,15 @@ def main(argv: list[str] | None = None) -> int:
         and args.ssl_limit_val_batches > 0
         else None
     )
+    # Cap the final test pass on SSL/distill phases only; P4's test metric is
+    # the downstream leaderboard number, so it stays uncapped.
+    single_limit_test = (
+        args.ssl_limit_test_batches
+        if args.phase in (1, 3)
+        and args.ssl_limit_test_batches
+        and args.ssl_limit_test_batches > 0
+        else None
+    )
     single_p4_patience = (
         (args.p4_early_stop_patience if args.p4_early_stop_patience > 0 else None)
         if args.phase == 4
@@ -2815,6 +2841,7 @@ def main(argv: list[str] | None = None) -> int:
         f"  single-phase budget: max_steps={single_max_steps} "
         f"val_check_interval={single_val_check} (opt-steps) "
         f"limit_val_batches={single_limit_val} "
+        f"limit_test_batches={single_limit_test} "
         f"collapse_guard={(args.phase != 4) and args.collapse_guard} "
         f"early_stopping_patience={single_p4_patience}"
     )
@@ -2835,6 +2862,7 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=single_max_steps,
         val_check_interval=single_val_check,
         limit_val_batches=single_limit_val,
+        limit_test_batches=single_limit_test,
         early_stopping_patience=single_p4_patience,
         # #54 audit M1: guard is SSL/distill-only; a single --phase 4 probe run
         # disables it (EarlyStopping + real metric already cover it). #68:
