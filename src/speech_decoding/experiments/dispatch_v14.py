@@ -600,6 +600,13 @@ def build_v14_experiment(
     # and local paths are byte-for-byte unchanged.
     tasks_per_node: int | None = None,
     slurm_use_srun: bool = False,
+    # Warm 4-GPU worker (nano_worker_ddp): the process is ALREADY one of N srun
+    # ranks (the worker launched ``srun --ntasks=N``), so exca must NOT submit —
+    # it runs the experiment in-process (``cluster=None`` → local) while Lightning
+    # picks up the live srun ranks via SLURMEnvironment. This flag only forces the
+    # find-unused DDP strategy ON (a multi-rank staged-phase run needs it; see
+    # _resolve_ddp_strategy); no slurm infra fields are set, so exca stays local.
+    in_allocation_ddp: bool = False,
     # C5 resilience: emit ``#SBATCH --requeue`` so a SLURM-preempted job is
     # auto-resubmitted; combined with the within-phase ``last.ckpt`` resume
     # (Experiment._within_phase_resume_ckpt) the requeued job continues from the
@@ -1341,7 +1348,19 @@ def build_v14_experiment(
     # bs=N*batch single mean), and it is zero-mean over training. P4's
     # downstream metric is NOT computed under DDP — the chain forces the probe
     # single-GPU (see _build_v14_chain) so trainer.test() sees the full set.
-    ddp_strategy = _resolve_ddp_strategy(tasks_per_node)
+    # in_allocation_ddp: the worker is already an srun rank → force the
+    # multi-rank strategy regardless of tasks_per_node (which stays None so exca
+    # runs local, not via submitit). cluster must be None on this path.
+    if in_allocation_ddp and cluster is not None:
+        raise ValueError(
+            "in_allocation_ddp runs the experiment in-process under the worker's "
+            f"own srun; it cannot also submit via --cluster {cluster!r}."
+        )
+    ddp_strategy = (
+        "ddp_find_unused_parameters_true"
+        if in_allocation_ddp
+        else _resolve_ddp_strategy(tasks_per_node)
+    )
 
     return experiment_cls(
         data=data,
@@ -1766,6 +1785,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--slurm-use-srun", action="store_true",
                    help="Launch under srun (exca requires it when "
                         "tasks_per_node>1). Auto-enabled for multi-GPU DDP.")
+    p.add_argument("--in-allocation-ddp", action="store_true",
+                   help="The process is ALREADY one of N srun ranks (warm "
+                        "nano_worker_ddp). Run the experiment in-process (exca "
+                        "local, no submitit) with DDP across the live srun "
+                        "ranks. Forces ddp_find_unused; pass NO --cluster / "
+                        "--gpus-per-node / --tasks-per-node with it.")
     p.add_argument("--slurm-requeue", action="store_true",
                    help="C5: emit '#SBATCH --requeue' so a preempted job is "
                         "auto-resubmitted; the within-phase last.ckpt resume "
@@ -2308,6 +2333,7 @@ def _common_build_kwargs(
         # single-phase builds stay in lock-step on the srun-rank topology.
         tasks_per_node=args.tasks_per_node,
         slurm_use_srun=args.slurm_use_srun,
+        in_allocation_ddp=args.in_allocation_ddp,
         requeue=args.slurm_requeue,
         precision=args.precision,
         extractor_cache_folder=args.extractor_cache_folder,
@@ -2723,6 +2749,10 @@ def main(argv: list[str] | None = None) -> int:
               f"slurm_use_srun={args.slurm_use_srun} "
               f"ddp_strategy={_ddp_strategy}{_p4_note} "
               f"cpus_per_task={args.cpus_per_task} timeout_min={args.timeout_min}")
+    elif args.in_allocation_ddp:
+        # Warm 4-GPU worker: exca local, DDP across the live srun ranks.
+        print(f"  in-allocation DDP: WORLD_SIZE={os.environ.get('SLURM_NTASKS', '?')} "
+              f"ddp_strategy=ddp_find_unused_parameters_true (exca local, no submitit)")
     print(f"  precision={args.precision}")
     # #21 phase routing + cross-phase handoff (recorded so the run YAML never
     # silently rides the wrong phase / checkpoint).

@@ -1,0 +1,47 @@
+#!/bin/bash
+# Submit one nano run to the warm 4-GPU DDP worker and stream rank-0's log until
+# it finishes. The DDP analog of ``nano_submit``.
+#
+#   nano_ddp_submit --mode nano --phase 1 --ssl-max-steps 60 \
+#                   --accumulate-grad-batches 1 --ragged-frontend \
+#                   --ssl-limit-val-batches 2 --ssl-limit-test-batches 2 \
+#                   --live --wandb-run-name p1-4gpu-iter
+#
+# The worker (nano_worker_ddp.py, 4 srun ranks) must already be running and have
+# written $NANO_DDP_WORKER_DIR/READY. ``--in-allocation-ddp`` is injected (the
+# worker also enforces it); do NOT pass --cluster / --gpus-per-node. Effective
+# batch = batch_size × accumulate_grad_batches × 4 (the 4 DDP ranks).
+set -euo pipefail
+WORKER_DIR="${NANO_DDP_WORKER_DIR:-$HOME/.nano_worker_ddp}"
+QUEUE="$WORKER_DIR/queue"
+LOGS="$WORKER_DIR/logs"
+mkdir -p "$QUEUE" "$LOGS"
+
+if [[ ! -f "$WORKER_DIR/READY" ]]; then
+  echo "nano_ddp_submit: no worker READY at $WORKER_DIR — start nano_worker_ddp_start.sh first." >&2
+  exit 2
+fi
+
+ID="$(date +%Y%m%d_%H%M%S)_$$"
+TMP="$QUEUE/.$ID.tmp"
+: > "$TMP"
+# Inject --in-allocation-ddp so the run is always DDP-in-process.
+printf '%s\n' "--in-allocation-ddp" >> "$TMP"
+for a in "$@"; do printf '%s\n' "$a" >> "$TMP"; done
+mv "$TMP" "$QUEUE/$ID.cmd"   # atomic publish — every rank reads the same file
+
+LOG="$LOGS/$ID.rank0.log"    # rank-0 carries Lightning logs + the result line
+RC="$LOGS/$ID.rc"
+echo "nano_ddp_submit: queued $ID — waiting for workers to pick it up ..."
+SUBMIT_TS=$(date +%s)
+while [[ ! -f "$LOG" && ! -f "$RC" ]]; do sleep 0.2; done
+
+tail -n +1 -f "$LOG" 2>/dev/null &
+TAIL_PID=$!
+while [[ ! -f "$RC" ]]; do sleep 0.3; done
+sleep 0.3
+kill "$TAIL_PID" 2>/dev/null || true
+
+echo "----"
+echo "nano_ddp_submit: $ID finished rc=$(cat "$RC") in $(( $(date +%s) - SUBMIT_TS ))s (submit→done, warm 4-GPU)"
+exit "$(cat "$RC")"
