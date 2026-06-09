@@ -1985,23 +1985,35 @@ def _parser() -> argparse.ArgumentParser:
              "~halves front-end step time on padded batches. OFF by default.",
     )
     # 2026-06-07 speedup-fanout C1: torch.compile the student/teacher encoder
-    # forward. OFF by default (eager path byte-identical). The toggle is the
-    # ``V14_COMPILE`` env var read inside V14JointBrainModule.__init__ (an env
-    # var, not a pydantic field, so it never forks the exca run uid — a compiled
-    # and an uncompiled run share a cache namespace). This flag is the
-    # discoverable front-door: it sets that env var in main() before exca submits,
-    # so it propagates to the slurm job (submitit captures the driver env). The
-    # compile wraps only the forward callable in a plain dict → no nn.Module
-    # re-registration, no ``_orig_mod.`` state_dict prefix → EMA name-match
-    # intact. PHASE-CONDITIONAL in practice (net-positive on the full-encoder
-    # P2/P3b passes, can be net-negative on short P1/P3a/P4 after cold-start) and
-    # GPU-validation-gated — benchmark on one freed GPU before a full relaunch.
+    # forward. The toggle is the ``V14_COMPILE`` env var read inside
+    # V14JointBrainModule.__init__ (an env var, not a pydantic field, so it never
+    # forks the exca run uid — a compiled and an uncompiled run share a cache
+    # namespace). This flag is the discoverable front-door: it sets that env var
+    # in main() before exca submits, so it propagates to the slurm job (submitit
+    # captures the driver env). The compile wraps only the forward callable in a
+    # plain dict → no nn.Module re-registration, no ``_orig_mod.`` state_dict
+    # prefix → EMA name-match intact.
+    #
+    # 2026-06-09: DEFAULT FLIPPED ON. Static torch.compile is loss-neutral
+    # (P1 ±5% tripwire PASS: max 2.56%, mean 0.81% over 50 steps — compile only
+    # reassociates fp ops) and net-POSITIVE on the long production passes
+    # (P1 ~1500 steps + the full-encoder P2): it cuts steady per-step ~35%
+    # (1.68→~1.09 s/step on 4× RTX 5000 Ada), and the cold-start + ragged
+    # recompile-storm overhead (~first ~200 steps) amortizes over a long run.
+    # STATIC, not dynamic: the storm amortizes, whereas a dynamic-shape compile
+    # carries a permanent per-step penalty that only pays off on short runs.
+    # ESCAPE: ``--no-compile`` for runs where the cold-start does NOT amortize —
+    # the M0 sweep's short BT-lite cells (#45), smoke/debug runs, and anything
+    # under a few-hundred steps. P3/P4 are separate modules and ignore this flag.
+    # Still GPU-validation-gated for the full P2 cold/gc-on path — smoke one cell
+    # before a full relaunch (the P1 warm-worker path is the one measured).
     p.add_argument(
-        "--compile", dest="compile_encoder",
-        action="store_true", default=False,
+        "--compile", "--no-compile", dest="compile_encoder",
+        action=argparse.BooleanOptionalAction, default=True,
         help="torch.compile the student/teacher encoder forward (sets "
-             "V14_COMPILE=1). Off by default = byte-identical eager path. "
-             "GPU-validation-gated; benchmark on one freed GPU first.",
+             "V14_COMPILE). ON by default (static; ~35%% per-step cut on long "
+             "P1/P2 runs, loss-neutral). Pass --no-compile for short runs "
+             "(M0 sweep cells, smoke/debug) where cold-start won't amortize.",
     )
     p.add_argument(
         "--compile-mode", dest="compile_mode", default=None,
@@ -2567,12 +2579,13 @@ def _build_v14_chain(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    # speedup-fanout C1: --compile is a front-door for the V14_COMPILE env var
-    # that V14JointBrainModule reads at construction. Set it here (before exca
-    # submits) so submitit captures it into the slurm job env. An explicit env
-    # var the operator already exported still wins when the flag is absent.
-    if args.compile_encoder:
-        os.environ["V14_COMPILE"] = "1"
+    # speedup-fanout C1: --compile/--no-compile is a front-door for the
+    # V14_COMPILE env var that V14JointBrainModule reads at construction. Set it
+    # here (before exca submits) so submitit captures it into the slurm job env.
+    # 2026-06-09: default ON. Set EXPLICITLY to "0"/"1" so --no-compile is
+    # authoritative and a prior run's value in a long-lived warm worker process
+    # can never leak into this run's read.
+    os.environ["V14_COMPILE"] = "1" if args.compile_encoder else "0"
     if args.compile_mode:
         os.environ["V14_COMPILE_MODE"] = args.compile_mode
     # §7 launch guard (2026-06-04, project_v14_optimizer_default_b01_config). A

@@ -309,7 +309,13 @@ class V14JointBrainModule(pl.LightningModule):
             max_time_patches=encoder.max_n_time_patches,
         )
         self.optim_config = optim_config
-        # ── torch.compile forward override (Speedup C1; default OFF) ──
+        # ── torch.compile forward override (Speedup C1) ──
+        # Reads the ``V14_COMPILE`` env var. dispatch_v14 sets it EXPLICITLY
+        # ("1"/"0") and DEFAULTS IT ON as of 2026-06-09 (static compile,
+        # loss-neutral, ~35% per-step cut on the long P1/P2 production passes;
+        # --no-compile escapes for short runs). An UNSET env (direct module
+        # instantiation / unit tests) still falls through to the eager path —
+        # byte-identical, zero blast radius.
         # ``V14_COMPILE`` truthy → wrap the student + EMA-teacher FORWARD
         # callables with torch.compile. Stored in a PLAIN DICT (not an
         # attribute) so nn.Module never registers the OptimizedModule as a
