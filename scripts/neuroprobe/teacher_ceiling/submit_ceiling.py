@@ -166,7 +166,7 @@ def build_extract_sbatch(
         'IFS=$\'\\t\' read -r SID TID MOVIE WAV <<< "$LINE"',
         'echo "[extract] sub_${SID} trial${TID} movie=${MOVIE} wav=${WAV}"',
         "",
-        ".venv/bin/python scripts/neuroprobe/teacher_ceiling/run_extract_per_trial.py \\",
+        f".venv/bin/python {args.extract_script} \\",
         '    --subject-id "$SID" --trial-id "$TID" \\',
         '    --wav-path "$WAV" \\',
         f'    --out-dir {shlex.quote(str(feature_cache))} \\',
@@ -232,6 +232,11 @@ def parse_args() -> argparse.Namespace:
         help="persistent /hpc tier dir for per-trial NPZ features",
     )
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
+    p.add_argument(
+        "--extract-script",
+        default="scripts/neuroprobe/teacher_ceiling/run_extract_per_trial.py",
+        help="per-trial extractor entry point (swap for the wav2vec2 sibling)",
+    )
     p.add_argument("--model", default="openai/whisper-large-v3")
     p.add_argument(
         "--subject-trials", nargs="*", default=None,
