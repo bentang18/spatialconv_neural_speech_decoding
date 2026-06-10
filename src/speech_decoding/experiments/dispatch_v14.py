@@ -3242,12 +3242,17 @@ def main(argv: list[str] | None = None) -> int:
           f"--no-collapse-guard disarms) "
           f"ssl_val_check_interval={args.ssl_val_check_interval} (opt-steps, "
           f"×accum at Trainer #66) ssl_limit_val_batches={args.ssl_limit_val_batches}")
-    _warn_disp = ("phase-default (P1/M2 0.5, P2/M4 0.04)"
-                  if args.rankme_warn_threshold is None
-                  else args.rankme_warn_threshold)
-    _alarm_disp = ("phase-default (P1/M2 0.25, P2/M4 0.02)"
-                   if args.rankme_alarm_threshold is None
-                   else args.rankme_alarm_threshold)
+    _joint = args.ssl_mode == "joint"
+    _warn_disp = (
+        ("joint-default (M2=M4 0.020)" if _joint
+         else "phase-default (P1/M2 0.5, P2/M4 0.04)")
+        if args.rankme_warn_threshold is None
+        else args.rankme_warn_threshold)
+    _alarm_disp = (
+        ("joint-default (M2=M4 0.010)" if _joint
+         else "phase-default (P1/M2 0.25, P2/M4 0.02)")
+        if args.rankme_alarm_threshold is None
+        else args.rankme_alarm_threshold)
     print(f"  rankme: warn={_warn_disp} alarm={_alarm_disp} "
           f"(joint P1/P2; normalised RankMe; alarm kills, #74)")
     if args.cluster == "slurm":
