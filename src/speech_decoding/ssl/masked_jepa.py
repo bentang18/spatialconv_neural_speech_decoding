@@ -242,8 +242,97 @@ def p2_parcel_m4_loss(
     return MaskedJepaBreakdown(total=loss, phase="p2", n_masked=n_masked)
 
 
+def b37_m4_freq_loss(
+    *,
+    predictor: torch.nn.Module,  # JepaPredictor (n_identity = K·M parcel, n_identity_2 = F_p freq)
+    student_m4: Tensor,   # (B, K, F_p, T_p, d) post-encoder_ln, visible-only encoder
+    teacher_m4: Tensor,   # (B, K, F_p, T_p, d) EMA full-input, post-encoder_ln
+    visible: Tensor,      # (B, K, T_p) bool — surviving (non-tubed) covered parcel-times
+    target_mask: Tensor,  # (B, K, T_p) bool — tube-masked covered parcel-times
+    loss_form: _LossForm = "l1",
+) -> MaskedJepaBreakdown:
+    """B37 M4 masked JEPA — the freq-PRESERVING parcel reconstruction (D3/D9).
+
+    Unlike :func:`p2_parcel_m4_loss` (whose M4 latent is parcel-pooled with NO
+    freq axis), the B37 mean-pool latent is ``parcel × freq × time``, so a masked
+    M4 query token is identified by THREE axes: parcel (learned ``query_id``, the
+    unordered parcel identity), freq-patch (sinusoidal ``query_id_2``, the ordered
+    freq identity), and time-patch (RoPE inside the blocks). The predictor reads
+    the full ``(F_p, T_p)`` field of every VISIBLE (surviving, band-masked) parcel
+    as context and reconstructs the full ``(F_p, T_p, d)`` field of every TUBED
+    parcel. Target = EMA teacher full-input M4 at the tubed cells (detached).
+
+    Tube is whole-parcel-all-time, so ``visible``/``target_mask`` are constant
+    over the time axis within a parcel (a parcel is either surviving → context,
+    or tubed → target — mutually exclusive); they are accepted at parcel-time
+    granularity ``(B, K, T_p)`` for parity with the encoder's ``latent_valid``
+    bookkeeping and broadcast over the freq axis here.
+
+    Cost note (NOT silently capped): the context is every surviving parcel's
+    full ``F_p·T_p`` field, so ``n_ctx ≈ K_visible·F_p·T_p`` — heavy at
+    production scale (the ``R-pred-2d-rope-freq`` / #112-class ragged-gather
+    optimizations are deferred). The predictor is discarded after SSL, so this
+    only costs pretraining wall-clock, never inference.
+
+    ``freq_patch_valid`` (per-corpus freq-patch validity, P1's B36-C5) is NOT
+    threaded here — inert for BT/capstone (all freq patches valid) and SWEC is
+    still ``NotImplementedError``; a follow-up if a partial-freq corpus lands.
+    """
+    if student_m4.dim() != 5:
+        raise ValueError(
+            f"student_m4 must be (B, K, F_p, T_p, d); got {tuple(student_m4.shape)}"
+        )
+    if teacher_m4.shape != student_m4.shape:
+        raise ValueError(
+            f"teacher_m4 {tuple(teacher_m4.shape)} != student_m4 "
+            f"{tuple(student_m4.shape)}"
+        )
+    B, K, F_p, T_p, d = student_m4.shape
+    if visible.shape != (B, K, T_p) or target_mask.shape != (B, K, T_p):
+        raise ValueError(
+            f"visible/target_mask must be (B, K, T_p)=({B},{K},{T_p}); got "
+            f"{tuple(visible.shape)} / {tuple(target_mask.shape)}"
+        )
+    device = student_m4.device
+    N = K * F_p * T_p
+
+    ctx = student_m4.reshape(B, N, d)               # visible used as keys (kpm below)
+    # parcel-time visibility broadcast over the freq axis → per-cell (B, N) in the
+    # (K outer, F_p mid, T_p inner) flat order: flat index i = k·(F_p·T_p) + f·T_p + t.
+    visible_cell = (
+        visible.unsqueeze(2).expand(B, K, F_p, T_p).reshape(B, N)
+    )
+    target_cell = (
+        target_mask.unsqueeze(2).expand(B, K, F_p, T_p).reshape(B, N)
+    )
+
+    # (parcel, freq, time) ids for the flat order. Shared across the batch
+    # (grid-identical; one entry per cell). l_ids == parcel*M + subslot → the
+    # parcel id at M=1 (the B37 default), generalized to M>1.
+    base = torch.arange(K * F_p * T_p, device=device)
+    l_ids = base // (F_p * T_p)              # parcel id ∈ [0, K)  → query_id (learned)
+    f_ids = (base // T_p) % F_p              # freq-patch id ∈ [0, F_p) → query_id_2 (sincos)
+    t_ids = base % T_p                       # time-patch id ∈ [0, T_p) → RoPE
+
+    pred = predictor(
+        ctx,
+        context_time_ids=t_ids,
+        query_time_ids=t_ids,
+        query_id=l_ids,
+        query_id_2=f_ids,
+        context_key_padding_mask=~visible_cell,
+        query_valid=target_cell,
+    )                                                # (n_target, d)
+    target = teacher_m4.reshape(B, N, d)[target_cell].detach()  # (n_target, d)
+    loss = _l1_or_zero(pred, target, loss_form)
+    return MaskedJepaBreakdown(
+        total=loss, phase="m4_freq", n_masked=int(target_cell.sum())
+    )
+
+
 __all__ = [
     "MaskedJepaBreakdown",
     "p1_frontend_m2_loss",
     "p2_parcel_m4_loss",
+    "b37_m4_freq_loss",
 ]

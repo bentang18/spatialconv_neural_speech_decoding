@@ -1054,6 +1054,18 @@ class V14ParcelPerceiverModel(nn.Module):
             torch.randn(k_parcels, m_sub_slots, d_model) * 0.02,
             persistent=True,
         )
+        # B37: the learned latent INIT (parcel/sub-slot embeds + ε) seeds the
+        # cross-attn pool's query slots (the ``pool == "cross_attn"`` branch at
+        # ``_pool_to_parcels``). The ``pool == "mean"`` path replaces that learned
+        # pool with a HARD electrode→parcel mean and never reads these embeds, so
+        # they would otherwise be dead-but-trainable: no gradient (a DDP
+        # static-graph unused-param hazard) yet drifting under weight decay.
+        # Freeze them on the mean path — kept in the state_dict (frozen) so
+        # cross-attn↔mean checkpoints still round-trip, just not optimized.
+        if pool == "mean":
+            self.learnable_parcel_embed.requires_grad_(False)
+            if self.learnable_subslot_embed is not None:
+                self.learnable_subslot_embed.requires_grad_(False)
 
         if d_model % n_heads != 0:
             raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
@@ -1366,18 +1378,34 @@ class V14ParcelPerceiverModel(nn.Module):
         *,
         return_taps: bool = False,
         m2_only: bool = False,
+        # B37 D7 composite mask (visible-only student). Both default ``None`` →
+        # byte-identical to the unmasked forward.
+        #   ``token_mask``: (B, K, F_p, T_p) bool, True = masked — the M2
+        #     per-PARCEL band mask (mean-before ⇒ the stem runs per parcel, so
+        #     the M2 token grid is parcel×freq×time, NOT electrode×freq×time).
+        #     Masked post-stem tokens are zeroed before the token blocks.
+        #   ``parcel_time_mask``: (B, K, T_p) bool, True = masked — the M4 tube
+        #     mask (whole covered parcels). Tubed parcels are zeroed upstream
+        #     AND excluded (bidirectionally) from the parcel-SA latent, so a
+        #     surviving parcel's M4 never depends on a tubed parcel's content.
+        token_mask: Optional[Tensor] = None,
+        parcel_time_mask: Optional[Tensor] = None,
     ) -> Tensor | dict[str, Tensor]:
         """B37 encoder forward (``pool="mean"``).
 
-        Chunk A delivers the unmasked encoder up to ``M2``: pool → per-parcel
-        stem → per-parcel token blocks → ``frontend_ln``. The thin
-        parcel-self-attention-only latent (D5) lands in Chunk B; here the
-        latent is IDENTITY, so ``M4 = encoder_ln(M2)`` — a real, testable
-        config (the spec's "freq carried bit-exact when the latent is
-        identity" baseline). Composite masking (D7) lands in Chunk D.
+        Pool → per-parcel stem → (D7 visible-only mask) → per-parcel token
+        blocks → ``frontend_ln`` (M2) → thin parcel-SA latent (D5) →
+        ``encoder_ln`` (M4). Frequency is preserved throughout (D3), so the
+        taps are ``(B, K, F_p, T_p, d)`` and ``latent_valid`` is ``(B, K)``.
 
-        Taps (``return_taps=True``): ``M2``/``M4`` are ``(B, K, F_p, T_p, d)``
-        (frequency preserved per D3) and ``latent_valid`` is ``(B, K)``.
+        D7 composite masking (when ``token_mask`` / ``parcel_time_mask`` are
+        passed): masked M2 band cells AND whole tubed parcels are zeroed
+        upstream of the token blocks (paradigm B — visible tokens never encode
+        masked content); tubed parcels are additionally dropped from the
+        parcel-SA context so the surviving parcels' M4 is a visible-only
+        representation. The returned ``latent_valid`` is still the COVERED
+        mask (B, K) — the caller derives ``visible = latent_valid & ~tubed``
+        and ``target = latent_valid & tubed`` from its own ``parcel_time_mask``.
         """
         if self.time_last_input:
             x_in = electrode_tokens                              # (B, C, F, T)
@@ -1418,6 +1446,34 @@ class V14ParcelPerceiverModel(nn.Module):
                 f"{self.n_freq_patches}"
             )
         x = x + self.freq_embed.unsqueeze(1)                     # broadcast over K, T_p
+
+        # D7 visible-only masking. Zero masked M2 band cells (per-parcel) AND
+        # whole tubed parcels (all freq, all time) on the post-stem tokens
+        # BEFORE the token blocks, so a visible token never encodes masked
+        # content (the leakage-free paradigm-B contract). ``tubed`` (B, K) also
+        # gates the parcel-SA below. Both None → no-op (unmasked forward).
+        tubed: Optional[Tensor] = None                           # (B, K) bool
+        token_drop: Optional[Tensor] = None                      # (B, K, F_p, T_p)
+        if token_mask is not None:
+            if token_mask.shape != (B, K, F_p, T_p):
+                raise ValueError(
+                    f"token_mask shape {tuple(token_mask.shape)} does not match "
+                    f"(B, K, F_p, T_p) = ({B}, {K}, {F_p}, {T_p})"
+                )
+            token_drop = token_mask
+        if parcel_time_mask is not None:
+            if parcel_time_mask.shape != (B, K, T_p):
+                raise ValueError(
+                    f"parcel_time_mask shape {tuple(parcel_time_mask.shape)} "
+                    f"does not match (B, K, T_p) = ({B}, {K}, {T_p})"
+                )
+            tubed = parcel_time_mask.any(dim=-1)                 # (B, K)
+            tube_grid = (
+                parcel_time_mask.unsqueeze(2).expand(B, K, F_p, T_p)
+            )                                                    # (B, K, F_p, T_p)
+            token_drop = tube_grid if token_drop is None else (token_drop | tube_grid)
+        if token_drop is not None:
+            x = x.masked_fill(token_drop.unsqueeze(-1), 0.0)
 
         # Per-parcel JOINT (t_p·f_p) token blocks, batched over B·K parcels.
         # Flatten t_p outer / f_p inner to match the tiled time-RoPE.
@@ -1467,10 +1523,12 @@ class V14ParcelPerceiverModel(nn.Module):
             return {"M2": m2, "latent_valid": latent_valid}
 
         # D5 thin parcel-SA-only latent: the ONLY cross-parcel op. freq×time
-        # ride in the batch dim (never attended); uncovered parcels are excluded
-        # bidirectionally via latent_valid, so covered M4 is independent of any
-        # uncovered parcel's (don't-care) M2 content.
-        z = self._parcel_latent(m2, latent_valid, use_ckpt)      # (B, K, F_p, T_p, d)
+        # ride in the batch dim (never attended); uncovered AND tubed parcels
+        # are excluded bidirectionally so a surviving parcel's M4 is independent
+        # of any uncovered (don't-care) OR tubed (masked) parcel's content — the
+        # visible-only encoder contract. ``tubed`` None → just the covered mask.
+        visible_parcels = latent_valid if tubed is None else (latent_valid & ~tubed)
+        z = self._parcel_latent(m2, visible_parcels, use_ckpt)   # (B, K, F_p, T_p, d)
         m4 = self.encoder_ln(z)                                  # M4 tap + readout input
         if not return_taps:
             return m4
@@ -1581,16 +1639,13 @@ class V14ParcelPerceiverModel(nn.Module):
         """
         # B37 pool dispatch. The mean-pool path (D1/D2) is a structurally
         # different forward (electrode axis consumed up front, frequency
-        # preserved into the latent), so it lives in its own method. Chunk A
-        # ships the unmasked encoder; the composite-mask / shaft / cond-embed
-        # / M3 / freq_patch_valid args land in later chunks and are rejected
-        # loudly here until then rather than silently ignored.
+        # preserved into the latent), so it lives in its own method. The B37
+        # composite mask uses a PARCEL-shaped ``token_mask`` (B, K, F_p, T_p) —
+        # distinct from the cross_attn path's electrode-shaped (B, C, F_p, T_p);
+        # ``_forward_meanpool`` validates against (B, K, ...). The cond-embed /
+        # shaft / M3 / freq_patch_valid args are dropped/deferred by B37 and
+        # rejected loudly here rather than silently ignored.
         if self.pool == "mean":
-            if token_mask is not None or parcel_time_mask is not None:
-                raise NotImplementedError(
-                    "B37 mean-pool composite masking (M2 band / M4 tube) lands "
-                    "in Chunk D; do not pass token_mask/parcel_time_mask yet."
-                )
             if (
                 subject_subtype is not None
                 or ref_idx is not None
@@ -1609,6 +1664,8 @@ class V14ParcelPerceiverModel(nn.Module):
                 valid_mask,
                 return_taps=return_taps,
                 m2_only=m2_only,
+                token_mask=token_mask,
+                parcel_time_mask=parcel_time_mask,
             )
 
         # Normalize input to (B, C, F, T) — what _PatchStem wants.
@@ -2356,6 +2413,16 @@ class JepaPredictor(nn.Module):
         # (P1+encoder.freq_pos=="sinusoidal" → "sinusoidal"; P2 always
         # "learned").
         id_pos: tp.Literal["learned", "sinusoidal"] = "learned",
+        # B37 D9: an OPTIONAL second additive identity axis for the masked query.
+        # The B37 M4 latent CARRIES FREQUENCY — masked tokens are (parcel, freq,
+        # time) — so the M4 predictor tags each query slot by parcel (the primary
+        # ``query_id``, learned/unordered) AND freq-patch (this second axis,
+        # ``query_id_2``, sinusoidal/ordered), with time on RoPE. ``None`` (the
+        # default, M2/P1/legacy-P2) → single-identity, byte-identical to before.
+        # The freq axis is ORDERED, so the default ``id_pos_2="sinusoidal"`` is
+        # the A-JEPA/MAE absolute code (sister ``R-pred-2d-rope-freq`` = rotary).
+        n_identity_2: tp.Optional[int] = None,
+        id_pos_2: tp.Literal["learned", "sinusoidal"] = "sinusoidal",
     ) -> None:
         super().__init__()
         if hidden % n_heads != 0:
@@ -2364,6 +2431,8 @@ class JepaPredictor(nn.Module):
             raise ValueError(f"depth must be >= 1; got {depth}")
         if n_identity < 1:
             raise ValueError(f"n_identity must be >= 1; got {n_identity}")
+        if n_identity_2 is not None and n_identity_2 < 1:
+            raise ValueError(f"n_identity_2 must be >= 1 or None; got {n_identity_2}")
         self.d_model = d_model
         self.hidden = hidden
         self.depth = depth
@@ -2393,6 +2462,25 @@ class JepaPredictor(nn.Module):
         else:
             raise ValueError(
                 f"id_pos must be 'learned' or 'sinusoidal', got {id_pos!r}"
+            )
+        # B37 D9 second identity axis (freq-patch for M4). Same learned/sincos
+        # dispatch; absent (``n_identity_2 is None``) → no second tag.
+        self.n_identity_2 = n_identity_2
+        self.id_pos_2 = id_pos_2
+        if n_identity_2 is None:
+            self.id_embed_2 = None
+            self._id_table_2 = None
+        elif id_pos_2 == "sinusoidal":
+            self.register_buffer(
+                "_id_table_2", _sincos_1d(n_identity_2, hidden), persistent=False,
+            )
+            self.id_embed_2 = None
+        elif id_pos_2 == "learned":
+            self.id_embed_2 = nn.Embedding(n_identity_2, hidden)
+            self._id_table_2 = None
+        else:
+            raise ValueError(
+                f"id_pos_2 must be 'learned' or 'sinusoidal', got {id_pos_2!r}"
             )
         # Encoder-consistent RoPE-time blocks (pre-norm, RoPE on Q+K time axis,
         # GELU MLP 4×, no per-head LN). Reuses the exact ``_JointTokenBlock``
@@ -2428,6 +2516,19 @@ class JepaPredictor(nn.Module):
             return self._id_table[ids]
         return self.id_embed(ids)
 
+    def _id_tag_2(self, ids: Tensor) -> Tensor:
+        """Additive tag for the SECOND identity axis (freq-patch for M4). Mirrors
+        :meth:`_id_tag`; only callable when the predictor was built with
+        ``n_identity_2`` (else there is no second table)."""
+        if self.n_identity_2 is None:
+            raise RuntimeError(
+                "query_id_2 was passed but this predictor was built without a "
+                "second identity axis (n_identity_2=None)."
+            )
+        if self.id_pos_2 == "sinusoidal":
+            return self._id_table_2[ids]
+        return self.id_embed_2(ids)
+
     def forward(
         self,
         context: Tensor,                            # (B, N_ctx, d_model)
@@ -2435,6 +2536,7 @@ class JepaPredictor(nn.Module):
         context_time_ids: Tensor,                   # (N_ctx,) long
         query_time_ids: Tensor,                     # (N_qry,) long
         query_id: Tensor,                           # (N_qry,) long
+        query_id_2: Optional[Tensor] = None,        # (N_qry,) long — B37 M4 freq
         context_key_padding_mask: Optional[Tensor] = None,  # (B, N_ctx) True=ignore
         query_valid: Optional[Tensor] = None,       # (B, N_qry) True=real masked slot
     ) -> Tensor:
@@ -2453,13 +2555,18 @@ class JepaPredictor(nn.Module):
                 context_time_ids=context_time_ids,
                 query_time_ids=query_time_ids,
                 query_id=query_id,
+                query_id_2=query_id_2,
                 context_key_padding_mask=context_key_padding_mask,
                 query_valid=query_valid,
             )
         B, n_ctx, _ = context.shape
         n_qry = query_time_ids.shape[0]
         h_ctx = self.input_proj(context)                        # (B, N_ctx, h)
-        q = self.mask_token.view(1, 1, -1) + self._id_tag(query_id).unsqueeze(0)
+        # Mask token + primary identity tag (+ optional second freq tag, D9).
+        id_tag = self._id_tag(query_id)
+        if query_id_2 is not None:
+            id_tag = id_tag + self._id_tag_2(query_id_2)
+        q = self.mask_token.view(1, 1, -1) + id_tag.unsqueeze(0)
         q = q.expand(B, n_qry, -1)                              # (B, N_qry, h)
         seq = torch.cat([h_ctx, q], dim=1)                     # (B, N_ctx+N_qry, h)
 
@@ -2504,6 +2611,7 @@ class JepaPredictor(nn.Module):
         context_time_ids: Tensor,
         query_time_ids: Tensor,
         query_id: Tensor,
+        query_id_2: Optional[Tensor] = None,
         context_key_padding_mask: Optional[Tensor],
         query_valid: Tensor,
     ) -> Tensor:
@@ -2540,7 +2648,13 @@ class JepaPredictor(nn.Module):
         q_idx, q_real, Qmax = _ragged_gather_idx(query_valid)    # (B, Qmax) each
         qid_bc = query_id.unsqueeze(0).expand(B, n_qry)
         qid_g = torch.gather(qid_bc, 1, q_idx)                   # (B, Qmax)
-        q = self.mask_token.view(1, 1, -1) + self._id_tag(qid_g)  # (B, Qmax, h)
+        id_tag = self._id_tag(qid_g)                            # (B, Qmax, h)
+        if query_id_2 is not None:
+            qid2_g = torch.gather(
+                query_id_2.unsqueeze(0).expand(B, n_qry), 1, q_idx
+            )                                                    # (B, Qmax)
+            id_tag = id_tag + self._id_tag_2(qid2_g)
+        q = self.mask_token.view(1, 1, -1) + id_tag             # (B, Qmax, h)
         qtime_bc = query_time_ids.unsqueeze(0).expand(B, n_qry)
         q_time = torch.gather(qtime_bc, 1, q_idx)                # (B, Qmax)
 

@@ -399,6 +399,99 @@ def sample_m4_mask(
 
 
 # ----------------------------------------------------------------------------
+# B37 composite mask — M2 band ∧ M4 tube in ONE sampler (D7)
+# ----------------------------------------------------------------------------
+
+
+def sample_composite_mask(
+    support: Tensor,
+    *,
+    n_freq_patches: int,
+    n_time_patches: int,
+    m2_held_out_ratio: float = 0.50,
+    m4_mask_ratio: float = 0.20,
+    m2_mask_type: str = "bands",
+    m4_mask_type: str = "tube",
+    m4_n_min_visible: int = 3,
+    generator: torch.Generator,
+    m2_time_band_floor: int = 2,
+    m2_freq_band_floor: int = 1,
+    m2_time_freq_split: tuple[float, float] | None = None,
+    device: torch.device | str | None = None,
+) -> tuple[Tensor, Tensor]:
+    """B37 joint composite mask (D7): one masked student forward, deep-supervised
+    at M2 (within-parcel bands) AND M4 (whole-parcel tubes).
+
+    The mean-before pool runs the stem PER-PARCEL (D2), so the M2 band mask is
+    per-PARCEL — ``(B, K, F_p, T_p)`` — NOT per-electrode. Sampling order:
+
+    1. **tube (M4):** drop a uniform-random subset of COVERED parcels @
+       ``m4_mask_ratio`` across ALL time (:func:`sample_m4_mask`). A tubed parcel
+       is masked for every ``(f, t)``.
+    2. **band (M2):** within each SURVIVING (non-tubed) parcel, drop structured
+       1-D spectro-temporal bands @ ``m2_held_out_ratio`` over the ``(F_p, T_p)``
+       plane (:func:`sample_m2_mask` over the per-parcel grid). Bands on TUBED
+       parcels are zeroed — a tubed parcel is wholly an M4 target, never an M2
+       one (the M2 predictor would have no visible context there).
+
+    Effective visible content ≈ ``(1 - m4_mask_ratio) · (1 - m2_held_out_ratio)``
+    ≈ 0.80 × 0.50 ≈ **40%** of the field (ratio compounding; lower the ratios if
+    the encoder starves — spec §3 caveat). One shared ``generator`` drives both
+    draws sequentially, so a fixed seed is fully reproducible.
+
+    Returns
+    -------
+    token_mask
+        ``(B, K, F_p, T_p)`` bool — M2 band targets (``True`` = masked), nonzero
+        only on surviving parcels. Fed to the encoder to zero the masked cells
+        upstream of the per-parcel token blocks AND scored by the M2 loss.
+    parcel_time_mask
+        ``(B, K, T_p)`` bool — M4 tube targets (``True`` = masked whole parcel).
+        Fed to the encoder to drop the tubed parcels (and exclude them from the
+        cross-parcel latent) AND scored by the M4 loss.
+    """
+    if support.dim() != 3:
+        raise ValueError(f"support must be (B, C, K); got shape {tuple(support.shape)}")
+    B, _C, K = support.shape
+    F_p, T_p = n_freq_patches, n_time_patches
+
+    # 1. tube — which covered parcels are dropped whole (all freq, all time).
+    parcel_time_mask, _drop = sample_m4_mask(
+        support,
+        n_time_patches=T_p,
+        mask_type=m4_mask_type,
+        mask_ratio=m4_mask_ratio,
+        n_min_visible=m4_n_min_visible,
+        generator=generator,
+    )
+    # A tube is whole-time, so ``any`` == ``all`` over t for a tubed parcel.
+    tubed = parcel_time_mask.any(dim=-1)  # (B, K) bool
+    # SURVIVING = covered AND not tubed: the only parcels the M2 task touches.
+    # Uncovered K-slots carry no signal; tubed parcels are wholly M4 targets.
+    covered = support.sum(dim=1) > 0  # (B, K) bool
+    surviving = covered & ~tubed      # (B, K) bool
+
+    # 2. band — per-parcel spectro-temporal bands over (F_p, T_p), then confine
+    #    to SURVIVING parcels (the band sampler is per-row axis-agnostic, so the
+    #    parcel axis K substitutes for the electrode axis C cleanly).
+    token_mask = sample_m2_mask(
+        (B, K, F_p, T_p),
+        mask_type=m2_mask_type,
+        held_out_ratio=m2_held_out_ratio,
+        generator=generator,
+        time_band_floor=m2_time_band_floor,
+        freq_band_floor=m2_freq_band_floor,
+        time_freq_split=m2_time_freq_split,
+        device=device,
+    )
+    token_mask = token_mask & surviving.to(token_mask.device).view(B, K, 1, 1)
+    # Return both masks on one device. ``token_mask`` honors ``device=``; the
+    # tube (built from ``support``) rides ``support.device`` — mirror it so a
+    # caller passing ``device != support.device`` gets a same-device pair.
+    return token_mask, parcel_time_mask.to(token_mask.device)
+
+
+# ----------------------------------------------------------------------------
 # Coupling guard (M4 mask shape ↔ predictor scope)
 # ----------------------------------------------------------------------------
 
@@ -433,5 +526,6 @@ __all__ = [
     "sample_parcel_tube_mask",
     "sample_parcel_time_block_mask",
     "sample_m4_mask",
+    "sample_composite_mask",
     "validate_m4_coupling",
 ]

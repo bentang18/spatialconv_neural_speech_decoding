@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 
 from speech_decoding.models.v14_encoder import JepaPredictor
-from speech_decoding.ssl.masked_jepa import p1_frontend_m2_loss
+from speech_decoding.ssl.masked_jepa import b37_m4_freq_loss, p1_frontend_m2_loss
 
 
 def _p1_predictor(d: int, f_p: int, t_p: int) -> JepaPredictor:
@@ -179,3 +179,136 @@ def test_c5_p1_loss_accepts_batched_freq_patch_valid() -> None:
     )
     expected = C * 7 * T_p + C * F_p * T_p  # clip0 valid patches + clip1 all
     assert bd.n_masked == expected
+
+
+# --------------------------------------------------------------------------- #
+# B37 M4 freq-preserving loss (D3/D9) — the freq-carrying parcel reconstruction
+# --------------------------------------------------------------------------- #
+def _m4_predictor(d: int, K: int, F_p: int, T_p: int) -> JepaPredictor:
+    """B37 M4 predictor: parcel id (learned ``query_id``) + freq id (sinusoidal
+    ``query_id_2``) + time RoPE. Depth 2 per D9. Eval mode for determinism."""
+    torch.manual_seed(11)
+    pred = JepaPredictor(
+        d_model=d, n_identity=K, hidden=16, n_heads=2, depth=2,
+        max_time_patches=T_p, id_pos="learned",
+        n_identity_2=F_p, id_pos_2="sinusoidal",
+    )
+    return pred.eval()
+
+
+def _tube_one_parcel(B: int, K: int, T_p: int, tubed: int = 0):
+    """Tube a single parcel (all covered): that parcel = target (whole field),
+    the rest = visible context. Returns ``(visible, target_mask)`` (B, K, T_p)."""
+    target_mask = torch.zeros(B, K, T_p, dtype=torch.bool)
+    target_mask[:, tubed, :] = True
+    visible = torch.zeros(B, K, T_p, dtype=torch.bool)
+    visible[:, [k for k in range(K) if k != tubed], :] = True
+    return visible, target_mask
+
+
+def test_b37_m4_reconstructs_full_freq_and_time_field() -> None:
+    """A tubed parcel's WHOLE ``(F_p, T_p)`` field is reconstructed — n_masked
+    counts every freq × time cell of the tubed parcel, proving the freq axis is
+    carried (vs the parcel-pooled :func:`p2_parcel_m4_loss`, which would only
+    count T_p cells per tubed parcel)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 5, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    pred = _m4_predictor(d, K, F_p, T_p)
+
+    bd = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+    )
+    assert bd.phase == "m4_freq"
+    # one tubed parcel × all freq × all time, for every clip in the batch.
+    assert bd.n_masked == B * F_p * T_p
+    assert torch.isfinite(bd.total)
+
+
+def test_b37_m4_loss_predictor_gets_gradient() -> None:
+    """Paradigm B: the M4 prediction comes from the predictor, so its params
+    receive a finite gradient (and the loss is not a bare self-distill)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 4, 3, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d, requires_grad=True)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=1)
+    pred = _m4_predictor(d, K, F_p, T_p)
+
+    bd = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+    )
+    bd.total.backward()
+    got_grad = [
+        p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+        for n, p in pred.named_parameters()
+        if "id_embed" not in n  # learned id rows only update for sampled ids
+    ]
+    assert got_grad and all(got_grad), "M4 predictor params did not receive gradient"
+    # gradient also reaches the student (the visible context), not just teacher.
+    assert student.grad is not None and student.grad.abs().sum() > 0
+
+
+def test_b37_m4_visible_target_split_is_wired() -> None:
+    """The tube split is honored exactly:
+
+    (a) garbaging a TUBED parcel's STUDENT value is a no-op — tubed parcels are
+        excluded from the visible context (kpm) and the target is the TEACHER;
+    (b) garbaging a VISIBLE parcel's STUDENT value DOES move the loss — visible
+        parcels are the predictor's context;
+    (c) garbaging the TUBED parcel's TEACHER value moves the loss — it is the
+        reconstruction target;
+    (d) garbaging a VISIBLE parcel's TEACHER value is a no-op — only tubed cells
+        are targets, and the teacher is never used as context.
+    """
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 5, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    pred = _m4_predictor(d, K, F_p, T_p)
+
+    def run(s, t):
+        return b37_m4_freq_loss(
+            predictor=pred, student_m4=s, teacher_m4=t,
+            visible=visible, target_mask=target_mask,
+        ).total
+
+    base = run(student, teacher)
+
+    # (a) tubed-parcel student perturbation → no change.
+    s_tube = student.clone(); s_tube[:, 0] += 9.0
+    torch.testing.assert_close(run(s_tube, teacher), base, atol=0, rtol=0)
+    # (b) visible-parcel student perturbation → change.
+    s_vis = student.clone(); s_vis[:, 1] += 9.0
+    assert not torch.allclose(run(s_vis, teacher), base)
+    # (c) tubed-parcel teacher perturbation → change (it is the target).
+    t_tube = teacher.clone(); t_tube[:, 0] += 9.0
+    assert not torch.allclose(run(student, t_tube), base)
+    # (d) visible-parcel teacher perturbation → no change.
+    t_vis = teacher.clone(); t_vis[:, 1] += 9.0
+    torch.testing.assert_close(run(student, t_vis), base, atol=0, rtol=0)
+
+
+def test_b37_m4_empty_tube_is_exact_zero() -> None:
+    """No tubed parcels (all visible) → an exact-0 loss graph-connected to the
+    predictor (B6 masked-empty contract — no NaN)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 4, 3, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d, requires_grad=True)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible = torch.ones(B, K, T_p, dtype=torch.bool)
+    target_mask = torch.zeros(B, K, T_p, dtype=torch.bool)
+    pred = _m4_predictor(d, K, F_p, T_p)
+
+    bd = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+    )
+    assert bd.n_masked == 0
+    assert float(bd.total.detach()) == 0.0
+    bd.total.backward()  # must not raise / NaN

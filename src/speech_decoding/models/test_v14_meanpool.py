@@ -16,7 +16,11 @@ Pinned here:
   * the ragged stem is bit-identical to dense on covered parcels;
   * the ``pool="cross_attn"`` sister (the B36 learned pool) is the default and
     is untouched;
-  * the not-yet-wired masking / conditioning args fail loud on the mean path.
+  * the D7 composite mask (token_mask band / parcel_time_mask tube) zeroes
+    masked tokens upstream of the token blocks and drops tubed parcels from the
+    parcel-SA context (visible-only student);
+  * the dropped conditioning args (shaft/subtype/ref/M3/freq_patch_valid) still
+    fail loud on the mean path.
 """
 
 from __future__ import annotations
@@ -522,28 +526,150 @@ def test_invalid_pool_raises() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# not-yet-wired args fail loud on the mean path (Chunk A guards)
+# dropped conditioning args fail loud on the mean path (B37 drops these)
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"token_mask": True},
-        {"parcel_time_mask": True},
-        {"return_m3": True},
-    ],
-)
-def test_meanpool_unsupported_args_raise(kwargs: dict) -> None:
+@pytest.mark.parametrize("arg", ["return_m3", "shaft_mask", "subject_subtype", "ref_idx", "freq_patch_valid"])
+def test_meanpool_dropped_args_raise(arg: str) -> None:
     enc = _make().eval()
     kw = _mp_kw()
-    et, support, valid = _inputs(2, 8, kw)
-    T_p = enc.patch_stem.n_time_patches(kw["n_time_bins"])
-    F_p = enc.n_freq_patches
+    B, C = 2, 8
+    et, support, valid = _inputs(B, C, kw)
     call: dict = {"return_taps": True}
-    if kwargs.get("token_mask"):
-        call["token_mask"] = torch.zeros(2, 8, F_p, T_p, dtype=torch.bool)
-    if kwargs.get("parcel_time_mask"):
-        call["parcel_time_mask"] = torch.zeros(2, kw["k_parcels"], T_p, dtype=torch.bool)
-    if kwargs.get("return_m3"):
+    if arg == "return_m3":
         call["return_m3"] = True
+    elif arg == "shaft_mask":
+        call["shaft_mask"] = torch.zeros(B, C, dtype=torch.bool)
+    elif arg == "subject_subtype":
+        call["subject_subtype"] = torch.zeros(B, dtype=torch.long)
+    elif arg == "ref_idx":
+        call["ref_idx"] = torch.zeros(B, dtype=torch.long)
+    elif arg == "freq_patch_valid":
+        call["freq_patch_valid"] = torch.ones(enc.n_freq_patches, dtype=torch.bool)
     with pytest.raises(NotImplementedError):
         enc(et, support, valid_mask=valid, **call)
+
+
+# --------------------------------------------------------------------------- #
+# D7 composite mask: visible-only student (token_mask band / parcel_time tube)
+# --------------------------------------------------------------------------- #
+def _mask_inputs(enc, kw, *, B=2, C=8, seed=1):
+    et, support, valid = _inputs(B, C, kw, seed=seed)
+    T_p = enc.patch_stem.n_time_patches(kw["n_time_bins"])
+    F_p, K = enc.n_freq_patches, kw["k_parcels"]
+    return et, support, valid, F_p, T_p, K
+
+
+def test_meanpool_masks_thread_and_finite() -> None:
+    """Both composite masks thread through the forward → finite, freq-preserving
+    taps; the band-only and tube-only sub-cases also run."""
+    enc = _make().eval()
+    kw = _mp_kw()
+    et, support, valid, F_p, T_p, K = _mask_inputs(enc, kw)
+    g = torch.Generator().manual_seed(2)
+    token_mask = torch.rand(2, K, F_p, T_p, generator=g) < 0.5
+    ptm = torch.zeros(2, K, T_p, dtype=torch.bool)
+    ptm[:, 0] = True                                            # tube parcel 0
+    for tm, pm in [(token_mask, ptm), (token_mask, None), (None, ptm)]:
+        out = enc(et, support, valid_mask=valid, return_taps=True,
+                  token_mask=tm, parcel_time_mask=pm)
+        d = kw["d_model"]
+        assert out["M2"].shape == (2, K, F_p, T_p, d)
+        assert out["M4"].shape == (2, K, F_p, T_p, d)
+        assert torch.isfinite(out["M2"]).all() and torch.isfinite(out["M4"]).all()
+
+
+def test_meanpool_no_masks_byte_identical() -> None:
+    """token_mask=None and parcel_time_mask=None → byte-identical to the plain
+    unmasked forward (the backward-compat / no-op contract)."""
+    enc = _make().eval()
+    kw = _mp_kw()
+    et, support, valid, _, _, _ = _mask_inputs(enc, kw)
+    base = enc(et, support, valid_mask=valid, return_taps=True)
+    nun = enc(et, support, valid_mask=valid, return_taps=True,
+              token_mask=None, parcel_time_mask=None)
+    torch.testing.assert_close(base["M2"], nun["M2"], atol=0, rtol=0)
+    torch.testing.assert_close(base["M4"], nun["M4"], atol=0, rtol=0)
+
+
+def test_meanpool_tube_zeros_parcel_m2_upstream() -> None:
+    """A tube on parcel j zeroes ALL of parcel j's tokens BEFORE the token
+    blocks → parcel j's M2 is independent of its own electrode input (the
+    upstream-zeroing visible-only contract)."""
+    kw = _mp_kw()
+    enc = _make(ragged_frontend=False).eval()
+    B, C, K = 2, 8, kw["k_parcels"]
+    # electrode 0 → parcel 0 (the tubed one); perturbing it must not move M2[0].
+    et, support, valid = _inputs(B, C, kw, seed=5)
+    ptm = torch.zeros(B, K, kw_T(enc, kw), dtype=torch.bool)
+    ptm[:, 0] = True
+    out0 = enc(et, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    et2 = et.clone()
+    et2[:, support[0, :, 0] > 0] += 7.0          # bump every electrode in parcel 0
+    out1 = enc(et2, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    torch.testing.assert_close(out0["M2"][:, 0], out1["M2"][:, 0], atol=1e-6, rtol=1e-5)
+
+
+def test_meanpool_tube_excludes_parcel_from_latent_context() -> None:
+    """A tube on parcel j drops it from the parcel-SA context → every surviving
+    parcel's M4 is independent of parcel j's electrode input (visible-only M4)."""
+    kw = _mp_kw()
+    enc = _make(ragged_frontend=False).eval()
+    B, C, K = 2, 8, kw["k_parcels"]
+    et, support, valid = _inputs(B, C, kw, seed=6)
+    ptm = torch.zeros(B, K, kw_T(enc, kw), dtype=torch.bool)
+    ptm[:, 0] = True                              # tube parcel 0
+    out0 = enc(et, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    et2 = et.clone()
+    et2[:, support[0, :, 0] > 0] += 9.0           # perturb tubed parcel's electrodes
+    out1 = enc(et, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    out1b = enc(et2, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    # surviving parcels = all covered except the tubed parcel 0.
+    surviving = out0["latent_valid"].clone()
+    surviving[:, 0] = False
+    torch.testing.assert_close(out0["M4"][surviving], out1b["M4"][surviving],
+                               atol=1e-6, rtol=1e-5)
+    del out1
+
+
+def test_meanpool_band_mask_is_local_to_its_parcel_m2() -> None:
+    """M2 is pre-parcel-SA (per-parcel), so a band token_mask on parcel j moves
+    parcel j's M2 but leaves every other parcel's M2 byte-identical."""
+    kw = _mp_kw()
+    enc = _make(ragged_frontend=False).eval()
+    B, C, K = 2, 8, kw["k_parcels"]
+    et, support, valid = _inputs(B, C, kw, seed=7)
+    F_p, T_p = enc.n_freq_patches, kw_T(enc, kw)
+    base = enc(et, support, valid_mask=valid, return_taps=True)
+    tm = torch.zeros(B, K, F_p, T_p, dtype=torch.bool)
+    tm[:, 1, : F_p // 2, :] = True                # band-mask only parcel 1
+    out = enc(et, support, valid_mask=valid, return_taps=True, token_mask=tm)
+    assert (out["M2"][:, 1] - base["M2"][:, 1]).abs().max() > 1e-5   # parcel 1 moved
+    others = [k for k in range(K) if k != 1]
+    torch.testing.assert_close(out["M2"][:, others], base["M2"][:, others],
+                               atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("bad", [(2, 8, 99, 99), (2, 5, 99, 99)])
+def test_meanpool_token_mask_wrong_shape_raises(bad: tuple) -> None:
+    """token_mask must be PARCEL-shaped (B, K, F_p, T_p) — an electrode-shaped
+    (B, C, ...) or wrong-K mask is rejected loudly (desync guard)."""
+    kw = _mp_kw()
+    enc = _make().eval()
+    et, support, valid = _inputs(2, 8, kw)
+    F_p, T_p = enc.n_freq_patches, kw_T(enc, kw)
+    tm = torch.zeros(bad[0], bad[1], F_p, T_p, dtype=torch.bool)
+    with pytest.raises(ValueError, match="token_mask"):
+        enc(et, support, valid_mask=valid, return_taps=True, token_mask=tm)
+
+
+def test_meanpool_parcel_time_mask_wrong_shape_raises() -> None:
+    kw = _mp_kw()
+    enc = _make().eval()
+    et, support, valid = _inputs(2, 8, kw)
+    bad = torch.zeros(2, kw["k_parcels"] + 1, kw_T(enc, kw), dtype=torch.bool)
+    with pytest.raises(ValueError, match="parcel_time_mask"):
+        enc(et, support, valid_mask=valid, return_taps=True, parcel_time_mask=bad)
+
+
+def kw_T(enc, kw) -> int:
+    return enc.patch_stem.n_time_patches(kw["n_time_bins"])

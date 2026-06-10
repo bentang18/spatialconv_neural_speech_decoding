@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from speech_decoding.ssl.mask import (
+    sample_composite_mask,
     sample_m2_mask,
     sample_m4_mask,
     sample_parcel_time_block_mask,
@@ -518,3 +519,106 @@ def test_coupling_guard_h1_leak_and_overhard_rejected() -> None:
     # tube + co_temporal = over-hard (nothing co-temporal to attend).
     with pytest.raises(ValueError):
         validate_m4_coupling("tube", "co_temporal")
+
+
+# ══════════════════════ B37 D7: composite mask (band ∧ tube) ═════════════════
+
+
+def test_composite_mask_shapes_and_dtypes() -> None:
+    support = _cover_n_parcels(14, k_parcels=20, B=3)
+    g = torch.Generator().manual_seed(0)
+    token_mask, parcel_time_mask = sample_composite_mask(
+        support, n_freq_patches=10, n_time_patches=8, generator=g,
+    )
+    assert token_mask.shape == (3, 20, 10, 8)        # (B, K, F_p, T_p) per-parcel
+    assert parcel_time_mask.shape == (3, 20, 8)      # (B, K, T_p) tube
+    assert token_mask.dtype == torch.bool
+    assert parcel_time_mask.dtype == torch.bool
+
+
+def test_composite_tube_is_whole_parcel_all_time() -> None:
+    """A tubed parcel is masked across EVERY time-patch (whole tube)."""
+    support = _cover_n_parcels(14, k_parcels=20, B=2)
+    g = torch.Generator().manual_seed(1)
+    _tok, ptm = sample_composite_mask(
+        support, n_freq_patches=6, n_time_patches=8, generator=g,
+    )
+    tubed = ptm.any(dim=-1)                           # (B, K)
+    # every tubed parcel is masked at ALL T_p, every surviving at none.
+    assert torch.equal(ptm, tubed.unsqueeze(-1).expand_as(ptm))
+
+
+def test_composite_bands_only_on_surviving_parcels() -> None:
+    """The M2 band mask is zero on tubed parcels (a tube is wholly an M4
+    target — the M2 predictor has no visible context there)."""
+    support = _cover_n_parcels(14, k_parcels=20, B=4)
+    g = torch.Generator().manual_seed(2)
+    token_mask, ptm = sample_composite_mask(
+        support, n_freq_patches=10, n_time_patches=8, generator=g,
+    )
+    tubed = ptm.any(dim=-1)                           # (B, K)
+    # no band cell survives on a tubed parcel.
+    assert token_mask[tubed].sum() == 0
+    # surviving covered parcels DO carry bands (the @0.50 mask is non-trivial).
+    surviving_covered = (~tubed) & (support.sum(dim=1) > 0)
+    assert token_mask[surviving_covered].any()
+
+
+def test_composite_uncovered_parcels_never_masked() -> None:
+    """Uncovered K-slots are neither tubed nor band-masked (no signal there)."""
+    support = _cover_n_parcels(10, k_parcels=20, B=3)
+    g = torch.Generator().manual_seed(3)
+    token_mask, ptm = sample_composite_mask(
+        support, n_freq_patches=8, n_time_patches=6, generator=g,
+    )
+    covered = support.sum(dim=1) > 0                  # (B, K)
+    assert ptm[~covered].sum() == 0
+    assert token_mask[~covered].sum() == 0
+
+
+def test_composite_tube_ratio_matches_sample_m4() -> None:
+    """The tube half is exactly ``sample_m4_mask`` with the same seed (the
+    composite sampler draws the tube first, sharing the generator)."""
+    support = _cover_n_parcels(20, k_parcels=24, B=4)
+    g1 = torch.Generator().manual_seed(9)
+    g2 = torch.Generator().manual_seed(9)
+    _tok, ptm = sample_composite_mask(
+        support, n_freq_patches=10, n_time_patches=8, generator=g1,
+    )
+    ref_ptm, _drop = sample_m4_mask(
+        support, n_time_patches=8, mask_type="tube", mask_ratio=0.20, generator=g2,
+    )
+    assert torch.equal(ptm, ref_ptm)
+    # @0.20 of 20 covered ≈ 4 tubed parcels per clip.
+    assert torch.equal(ptm.any(dim=-1).sum(dim=1), torch.full((4,), 4))
+
+
+def test_composite_effective_visible_around_40pct() -> None:
+    """Visible field ≈ (1-0.20)·(1-0.50) ≈ 40% of covered (B,K,F_p,T_p) cells."""
+    support = _cover_n_parcels(20, k_parcels=24, B=8)
+    g = torch.Generator().manual_seed(5)
+    token_mask, ptm = sample_composite_mask(
+        support, n_freq_patches=10, n_time_patches=8, generator=g,
+    )
+    covered = (support.sum(dim=1) > 0)                            # (B, K)
+    cov_cells = covered.view(8, 24, 1, 1).expand_as(token_mask)
+    tubed = ptm.any(dim=-1)                                       # (B, K)
+    tubed_cells = tubed.view(8, 24, 1, 1).expand_as(token_mask)
+    # visible = covered ∧ ~tubed ∧ ~band.
+    visible = cov_cells & ~tubed_cells & ~token_mask
+    frac = visible.sum().float() / cov_cells.sum().float()
+    assert 0.30 < frac.item() < 0.50                              # ≈0.40, band-rounding slack
+
+
+def test_composite_same_seed_reproducible() -> None:
+    support = _cover_n_parcels(14, k_parcels=20, B=3)
+    g1 = torch.Generator().manual_seed(11)
+    g2 = torch.Generator().manual_seed(11)
+    tok1, ptm1 = sample_composite_mask(
+        support, n_freq_patches=10, n_time_patches=8, generator=g1,
+    )
+    tok2, ptm2 = sample_composite_mask(
+        support, n_freq_patches=10, n_time_patches=8, generator=g2,
+    )
+    assert torch.equal(tok1, tok2)
+    assert torch.equal(ptm1, ptm2)
