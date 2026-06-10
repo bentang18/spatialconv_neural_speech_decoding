@@ -50,12 +50,49 @@ def test_bt_load_raw_returns_raw_voltage_at_native_rate() -> None:
         electrode_labels=[f"E{i:03d}" for i in range(n_ch)],
     )
 
-    data, ch_names, sfreq = bt_load_raw(fake, trial_id=1)
+    data, ch_names, sfreq = bt_load_raw(fake, trial_id=1, subject_id=1)
 
     assert data.shape == (n_ch, n_t)
     assert data.dtype == np.float32  # cast from float64
     assert ch_names == [f"E{i:03d}" for i in range(n_ch)]
     assert sfreq == 2048.0
+
+
+def test_bt_load_raw_resamples_s9_native_1024_to_2048() -> None:
+    """LG1: S9 is distributed at 1024 Hz; the loader polyphase-resamples it UP to
+    the pipeline's 2048 Hz. The sample count doubles, wall-clock duration is
+    preserved, returned sfreq is 2048, and the result is a faithful interpolation
+    (not zero-stuffing/hold) — a low-freq sinusoid below both Nyquists must land on
+    the analytic 2048-grid waveform."""
+    native_rate, n_native = 1024, 4096  # 4 s at 1024 Hz
+    t_native = np.arange(n_native) / native_rate
+    sine = np.sin(2 * np.pi * 10.0 * t_native).astype(np.float64)  # 10 Hz, 1 channel
+    fake = _FakeBT(data=sine[None, :], electrode_labels=["E000"])
+
+    data, ch_names, sfreq = bt_load_raw(fake, trial_id=1, subject_id=9)
+
+    assert sfreq == 2048.0
+    assert data.shape == (1, 2 * n_native)  # 1024 -> 2048 doubles the samples
+    assert data.dtype == np.float32
+    # Wall-clock duration preserved: n_native/1024 == n_resampled/2048.
+    assert n_native / native_rate == data.shape[1] / sfreq
+    # Faithful interpolation: interior samples (away from FIR edges) match the
+    # analytic 10 Hz sine on the 2048 grid.
+    t_2048 = np.arange(data.shape[1]) / sfreq
+    analytic = np.sin(2 * np.pi * 10.0 * t_2048)
+    interior = slice(256, -256)
+    assert np.max(np.abs(data[0, interior] - analytic[interior])) < 1e-2
+
+
+def test_bt_load_raw_requires_subject_id() -> None:
+    """`subject_id` is a required keyword (no silent default) so a non-2048
+    subject can never slip through un-resampled — the S9 failure mode."""
+    fake = _FakeBT(
+        data=np.zeros((2, 100), dtype=np.float32),
+        electrode_labels=["a", "b"],
+    )
+    with pytest.raises(TypeError):
+        bt_load_raw(fake, trial_id=1)  # type: ignore[call-arg]
 
 
 def test_bt_load_raw_rejects_label_count_mismatch() -> None:
@@ -64,7 +101,7 @@ def test_bt_load_raw_rejects_label_count_mismatch() -> None:
         electrode_labels=["only_two", "labels"],
     )
     with pytest.raises(ValueError, match="electrode_labels len"):
-        bt_load_raw(fake, trial_id=1)
+        bt_load_raw(fake, trial_id=1, subject_id=1)
 
 
 def test_bt_load_raw_rejects_non_2d_voltage() -> None:
@@ -73,7 +110,7 @@ def test_bt_load_raw_rejects_non_2d_voltage() -> None:
         electrode_labels=["x", "y", "z", "w"],
     )
     with pytest.raises(ValueError, match="expected"):
-        bt_load_raw(fake, trial_id=1)
+        bt_load_raw(fake, trial_id=1, subject_id=1)
 
 
 # --- WS-D1: `*`/`#` mark -> singleton shaft -> shaft-CAR zeroing regression ---
@@ -106,7 +143,7 @@ def test_d1b_loader_chnames_equal_independent_expected_no_mark_survives() -> Non
         data=np.zeros((len(labels), 16), dtype=np.float32),
         electrode_labels=labels,
     )
-    _, ch_names, _ = bt_load_raw(fake, trial_id=1)
+    _, ch_names, _ = bt_load_raw(fake, trial_id=1, subject_id=1)
 
     assert ch_names == expected
     assert not any("*" in n or "#" in n for n in ch_names)
@@ -125,7 +162,7 @@ def test_d1c_loader_clean_prevents_shaft_car_zeroing() -> None:
     assert np.all(np.isclose(raw_out._data, 0.0))  # positive control: the bug
 
     fake = _FakeBT(data=data, electrode_labels=list(_SUB2_RAW_LABELS))
-    _, ch_names, _ = bt_load_raw(fake, trial_id=1)
+    _, ch_names, _ = bt_load_raw(fake, trial_id=1, subject_id=1)
     fixed_out = CARIeegExtractor(car="shaft")._apply_car(_make_raw(ch_names, data.copy()))
     all_zero = np.all(np.isclose(fixed_out._data, 0.0), axis=1)
     assert not all_zero.any()  # the fix: the 34 zeroed contacts are gone
@@ -156,7 +193,7 @@ def test_d1d_loader_cleans_every_mark_across_all_real_subjects() -> None:
             data=np.zeros((len(raw), 4), dtype=np.float32),
             electrode_labels=list(raw),
         )
-        _, ch_names, _ = bt_load_raw(fake, trial_id=1)
+        _, ch_names, _ = bt_load_raw(fake, trial_id=1, subject_id=1)
         assert ch_names == expected
         assert not any("*" in n or "#" in n for n in ch_names)
         checked += 1

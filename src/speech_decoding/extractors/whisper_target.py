@@ -11,7 +11,9 @@ into the movie). So the join MUST use the movie-clock onset — ``movie_onset_s`
 threaded onto the event by ``word_events`` from BT's trigger track
 (``np.interp(est_idx -> movie_time)``; == ``words_df['start']`` to ~ms for verbal
 anchors, and the only correct source for nonverbal anchors and across pauses) —
-NOT the neural-clock ``est_idx / 2048`` (the event's ``start``). The two diverge
+NOT the neural-clock ``est_idx / native_rate`` (the event's ``start``; native_rate
+is 2048 for all subjects except S9 = 1024 — see ``BT_SUBJECT_NATIVE_RATE_HZ``).
+The neural-clock and movie-clock onsets diverge
 235-904 s within a single BT trial. Δlag slides only the NEURAL response window;
 the audio-keyed teacher is unshifted, so this extractor never sees ``neural_lag_s``.
 

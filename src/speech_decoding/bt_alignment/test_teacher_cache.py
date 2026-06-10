@@ -807,10 +807,10 @@ def test_resume_guard_raises_on_manifest_wav_dir_mismatch(tmp_path):
     model, merge = "openai/whisper-tiny", "mean_all"
     p = _fake_movie_cache(tmp_path, model, merge, "venom", chunk_s=30.0)
     (p.parent / "build_manifest.json").write_text(
-        json.dumps({"chunk_s": 30.0, "wav_dir": "/data/wav_old"})
+        json.dumps({"chunk_s": 30.0, "wav_dir": "/persistent/cache/wav_old"})
     )
     with pytest.raises(ValueError, match="CN-A1"):
         assert_movie_cache_resume_config(
             tmp_path, model, merge, ["venom"],
-            chunk_s=30.0, wav_dir="/data/wav_new",
+            chunk_s=30.0, wav_dir="/persistent/cache/wav_new",
         )

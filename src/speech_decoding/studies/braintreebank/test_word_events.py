@@ -131,10 +131,48 @@ def test_word_event_rows_matches_upstream_interleaved_order() -> None:
     # And the emitted `start` is the NEURAL-clock onset `est_idx / SR` (C3), not
     # the transcript `start` — the fixtures offset est_idx +200 s, so asserting
     # against transcript `start` would now fail.
-    sr = we._neural_sample_rate()
+    sr = we._neural_sample_rate(2)
     for row_i, (lbl, src) in enumerate(zip(expected_labels, expected_src_indices)):
         src_df = nonverbal if int(lbl) == 0 else words
         assert rows.iloc[row_i]["start"] == float(src_df.iloc[int(src)]["est_idx"]) / sr
+
+
+def test_neural_sample_rate_is_subject_aware_s9_is_half() -> None:
+    """LG1: the neural-clock rate is per-subject (single source =
+    ``BT_SUBJECT_NATIVE_RATE_HZ``) — 2048 for a default subject, 1024 for S9. So
+    the SAME ``est_idx`` (native grid for both ``words_df`` and ``nonverbal_df``,
+    verified by est_idx span ≤ native h5 length) yields an onset that is exactly
+    2× larger in seconds for S9 than a 2048 subject. The voltage loader resamples
+    S9 1024→2048, preserving wall-clock time, so this doubled onset is correct."""
+    assert we._neural_sample_rate(2) == 2048.0
+    assert we._neural_sample_rate(9) == 1024.0
+
+    words = _stub_words_df()
+    nonverbal = _stub_nonverbal_df()
+    rows_2048 = _word_event_rows(
+        subject_id=2, trial_id=0, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=False,
+    )
+    rows_1024 = _word_event_rows(
+        subject_id=9, trial_id=0, timeline="tl", words_df=words,
+        nonverbal_df=nonverbal, tasks=("speech",), binary_tasks=True,
+        lite=False, nano=False, random_seed=42, duration=1.0, balance=False,
+    )
+
+    # Match rows by est_idx (start * native_rate) and assert S9 onset == 2× the
+    # 2048-subject onset == est_idx / 1024 — never est_idx / 2048.
+    by_text_2048 = {r["text"]: r for _, r in rows_2048.iterrows()}
+    n_verbal = 0
+    for _, r9 in rows_1024.iterrows():
+        if r9["text"] == "<nonverbal>":
+            continue
+        r2 = by_text_2048[r9["text"]]
+        est_idx = round(r2["start"] * 2048.0)  # recover the native est_idx
+        assert r9["start"] == pytest.approx(est_idx / 1024.0)
+        assert r9["start"] == pytest.approx(2.0 * r2["start"])
+        n_verbal += 1
+    assert n_verbal > 0
 
 
 def test_nonverbal_movie_onset_is_rekeyed_from_words_df() -> None:
@@ -147,7 +185,7 @@ def test_nonverbal_movie_onset_is_rekeyed_from_words_df() -> None:
     (which would key the teacher hundreds of seconds off-movie)."""
     words = _stub_words_df()
     nonverbal = _stub_nonverbal_df()
-    sr = we._neural_sample_rate()
+    sr = we._neural_sample_rate(2)
     # Precondition: the fixture mirrors real data — nonverbal start IS the neural
     # clock, and nonverbal has no movie-clock column distinct from est_idx/SR.
     assert np.allclose(
@@ -178,7 +216,7 @@ def test_movie_onset_unified_via_trigger_track() -> None:
     (nonverbal). The trigger track is BT's authoritative neural↔movie alignment."""
     words = _stub_words_df()
     nonverbal = _stub_nonverbal_df()
-    sr = we._neural_sample_rate()
+    sr = we._neural_sample_rate(2)
     # Linear trigger map over the whole neural span: movie = neural − 50 s. The
     # −50 (vs the stubs' +200 s est_idx offset) makes the map's verbal answer
     # differ from words_df.start, so a pass proves the trigger track was used.
@@ -209,7 +247,7 @@ def test_movie_onset_freezes_across_pause() -> None:
     audit). A nonverbal anchor INSIDE a recording pause must key the teacher at the
     FROZEN movie time the trigger track records — not the value a sparse words map
     bridges linearly across the word-free pause gap (was up to 89 s off-movie)."""
-    sr = we._neural_sample_rate()
+    sr = we._neural_sample_rate(2)
     # Trigger track with a pause: movie_time freezes at 100 s while the neural index
     # advances from 100 s to 400 s of neural, then resumes at movie 200 s.
     trig_index = np.array([0.0, 100.0, 400.0, 500.0]) * sr

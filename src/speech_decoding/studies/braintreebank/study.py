@@ -31,11 +31,13 @@ from neuralset.events import study
 
 from speech_decoding.studies.braintreebank.loader import bt_load_raw
 from speech_decoding.studies.braintreebank.manifest import (
+    BT_DEFAULT_SAMPLE_RATE_HZ,
     BT_FULL_SESSIONS,
     BT_LITE_SESSIONS,
     BT_NANO_SESSIONS,
     V14_P3_DISTILL_SESSIONS,
     V14_PRETRAIN_SESSIONS,
+    bt_subject_native_rate_hz,
 )
 
 
@@ -123,7 +125,7 @@ class Wang2024Treebank(study.Study):
                     "type": "Ieeg",
                     "start": 0.0,
                     "duration": self._trial_duration_seconds(timeline),
-                    "frequency": 2048.0,
+                    "frequency": float(BT_DEFAULT_SAMPLE_RATE_HZ),
                     "filepath": filepath,
                 }
             ]
@@ -139,13 +141,13 @@ class Wang2024Treebank(study.Study):
             cache=False,
             coordinates_type="cortical",
         )
-        data, ch_names, sfreq = bt_load_raw(bt, trial_id=trial_id)
+        data, ch_names, sfreq = bt_load_raw(bt, trial_id=trial_id, subject_id=subject_id)
         info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="seeg")
         return mne.io.RawArray(data, info, verbose=False)
 
     def _trial_duration_seconds(self, timeline: dict[str, tp.Any]) -> float:
         from neuroprobe.braintreebank_subject import BrainTreebankSubject
-        from neuroprobe.config import ROOT_DIR, SAMPLING_RATE
+        from neuroprobe.config import ROOT_DIR
 
         subject_id = int(timeline["subject_id"])
         trial_id = int(timeline["trial_id"])
@@ -159,4 +161,8 @@ class Wang2024Treebank(study.Study):
         first_key = bt.h5_neural_data_keys[first_label]
         with h5py.File(trial_path, "r") as h5:
             n_samples = int(h5["data"][first_key].shape[0])
-        return n_samples / float(SAMPLING_RATE)
+        # `n_samples` is on the subject's NATIVE grid (h5 is the raw distributed
+        # file), so wall-clock duration divides by the native rate — not the global
+        # 2048. The loader resamples the voltage to 2048, which preserves this
+        # duration; `frequency` in the Ieeg row is 2048 (post-resample) accordingly.
+        return n_samples / float(bt_subject_native_rate_hz(subject_id))

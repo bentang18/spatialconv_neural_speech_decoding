@@ -52,7 +52,10 @@ from speech_decoding.studies.braintreebank.labels import (
     ordered_dataset_source_indices,
     remap_task_column,
 )
-from speech_decoding.studies.braintreebank.manifest import V14_PRETRAIN_SESSIONS
+from speech_decoding.studies.braintreebank.manifest import (
+    V14_PRETRAIN_SESSIONS,
+    bt_subject_native_rate_hz,
+)
 
 
 # "Pretrain" is the leakage-free SSL/distill split: every legal pretraining
@@ -82,19 +85,22 @@ DEFAULT_PRETRAIN_HOLDOUT_FRACTION = 0.05
 _PRETRAIN_SESSION_SET = frozenset(V14_PRETRAIN_SESSIONS)
 
 
-def _neural_sample_rate() -> float:
-    """BT neural-clock sample rate (2048 Hz). ``est_idx`` is indexed on this
-    clock, so word-onset seconds = ``est_idx / _neural_sample_rate()``.
+def _neural_sample_rate(subject_id: int) -> float:
+    """BT neural-clock sample rate for ``subject_id`` — the NATIVE distributed-h5
+    rate (2048 Hz for every subject except S9 = 1024 Hz). Single source =
+    ``BT_SUBJECT_NATIVE_RATE_HZ``.
 
-    Mirrors ``loader._sampling_rate``: reads ``neuroprobe.config.SAMPLING_RATE``
-    when available, else falls back to 2048.0 (``neuroprobe.config`` reads
-    ``os.environ['ROOT_DIR_BRAINTREEBANK']`` at import, so it raises ``KeyError``
-    on laptops without BT data mounted — the unit tests' path)."""
-    try:
-        from neuroprobe.config import SAMPLING_RATE
-    except (ImportError, KeyError):
-        return 2048.0
-    return float(SAMPLING_RATE)
+    ``est_idx`` (both ``words_df`` and ``nonverbal_df``) is indexed on this native
+    clock — verified by the est_idx span: S9 max est_idx 7.10M (words) / 6.90M
+    (nonverbal) both sit inside the 7.376M-sample native h5, i.e. the 1024 grid,
+    NOT a 2048 grid (which would reach ~14.7M). So onset seconds =
+    ``est_idx / _neural_sample_rate(subject_id)``. ``loader.bt_load_raw`` resamples
+    a non-2048 subject UP to 2048 while preserving wall-clock time, so slicing the
+    resampled stream at these native-derived seconds lands on the right sample.
+
+    Pure registry lookup (no ``neuroprobe.config`` import) → works on laptops
+    without BT data mounted, the unit-test path."""
+    return float(bt_subject_native_rate_hz(subject_id))
 
 
 def _vendored_csv_dir() -> Path:
@@ -260,7 +266,7 @@ def _word_event_rows(
     # after=1 s, which is exactly `start=est_idx/SR` with the default
     # `duration=1.0`. Emitting transcript `start` would slice every BT clip
     # 235–900 s off-target (C3).
-    sample_rate = _neural_sample_rate()
+    sample_rate = _neural_sample_rate(subject_id)
     # Movie-clock onset for the P3 Whisper-teacher join, computed by ONE mechanism
     # for BOTH verbal and nonverbal anchors. AUTHORITATIVE source = the BT trigger
     # track (`neural_to_movie`): np.interp(est_idx) -> movie_time. It is the same
