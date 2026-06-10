@@ -399,6 +399,63 @@ def write_movie_cache(
     )
 
 
+def assert_movie_cache_resume_config(
+    out_dir: Path | str,
+    model: str,
+    layer_merge: int | str,
+    skipped: list[str],
+    *,
+    chunk_s: float,
+    wav_dir: Path | str | None = None,
+) -> None:
+    """CN-A1 guard: a resume (build skip-if-exists) that changes a byte-determinant
+    NOT folded into the cache PATH — ``chunk_s`` or the wav source — would silently
+    mix old- and new-config teacher streams.
+
+    A clip straddling a ``chunk_s`` seam draws frames from two context-truncated
+    Whisper passes, so a different ``chunk_s`` changes the per-frame target near
+    every seam. The :func:`write_movie_cache` frame-count invariant does NOT catch
+    this: both chunk sizes total ``round(duration·rate_hz)`` frames, so the count
+    matches while the bytes near each seam differ. The cache path keys only
+    ``model``/``layer_merge``/``movie`` (:func:`movie_cache_path`), so a re-run
+    with a new ``--chunk-s`` but no ``--overwrite`` reuses the stale stream.
+
+    ``chunk_s`` is stamped into every movie payload; ``wav_dir`` is recorded only
+    in the build_manifest (otherwise write-only). Raises :class:`ValueError` on any
+    mismatch among the reused (``skipped``) movies. No-op when nothing is skipped
+    (full rebuild / empty cache) so it never invalidates a legitimately fresh run."""
+    if not skipped:
+        return
+    cache_dir = movie_cache_path(out_dir, model, layer_merge, "_").parent
+    manifest_path = cache_dir / "build_manifest.json"
+    if manifest_path.is_file():
+        import json
+        man = json.loads(manifest_path.read_text())
+        if "chunk_s" in man and float(man["chunk_s"]) != float(chunk_s):
+            raise ValueError(
+                f"resume mismatch: existing teacher cache built with "
+                f"chunk_s={man['chunk_s']} but requested chunk_s={chunk_s}. The "
+                f"teacher stream near every chunk seam differs — pass --overwrite "
+                f"or a fresh --out-dir (CN-A1)."
+            )
+        if wav_dir is not None and "wav_dir" in man and str(man["wav_dir"]) != str(wav_dir):
+            raise ValueError(
+                f"resume mismatch: existing teacher cache built from "
+                f"wav_dir={man['wav_dir']!r} but requested wav_dir={str(wav_dir)!r}. "
+                f"Same movie slug, different rip — pass --overwrite or a fresh "
+                f"--out-dir (CN-A1)."
+            )
+    for movie in skipped:  # authoritative per-file check (catches a stale/missing manifest)
+        p = movie_cache_path(out_dir, model, layer_merge, movie)
+        meta = torch.load(p, map_location="cpu", mmap=True, weights_only=False)
+        cs = meta.get("chunk_s")
+        if cs is not None and float(cs) != float(chunk_s):
+            raise ValueError(
+                f"resume mismatch: {p.name} cached chunk_s={cs} but requested "
+                f"chunk_s={chunk_s} — pass --overwrite or a fresh --out-dir (CN-A1)."
+            )
+
+
 def fit_channel_stats(
     feature_paths: list[Path],
     d_model: int = 1280,
@@ -510,7 +567,13 @@ def fit_and_save_channel_stats(
     IN this same dir, so a re-fit to a different location would otherwise ingest a
     prior stats file (keys ``{mean, inv_std}``, no ``features``) as a movie cache
     and crash. ``channel_stats`` is a reserved artifact name, never a movie slug.
-    Returns the saved ``{'mean', 'inv_std'}``.
+
+    The on-disk file ALSO carries ``{"model", "layer_merge"}`` provenance so the
+    consumer can fail loud if a stats file fit on one ``(model, layer_merge)`` is
+    wired to a teacher cache built for a different one — the per-channel affine is
+    the same width (1280-d) across merges, so a mismatch otherwise z-scores the
+    distillation target with the WRONG frozen affine, silently (CN-3). Returns the
+    bare ``{'mean', 'inv_std'}`` (callers index those two keys).
     """
     out_path = Path(out_path)
     movie_dir = Path(cache_dir) / model.replace("/", "_") / merge_slug(layer_merge)
@@ -528,7 +591,8 @@ def fit_and_save_channel_stats(
         )
     stats = fit_channel_stats(feature_paths, d_model=d_model, eps=eps)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(stats, out_path)
+    record = {**stats, "model": model, "layer_merge": layer_merge}
+    torch.save(record, out_path)
     return stats
 
 

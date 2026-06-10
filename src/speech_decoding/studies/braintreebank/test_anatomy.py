@@ -198,6 +198,7 @@ def _upstream_electrode_labels_or_skip(subject_id: int) -> tuple[str, ...]:
     return tuple(subject.electrode_labels)
 
 
+@pytest.mark.must_pass_before_dispatch
 @pytest.mark.parametrize("subject_id", _VENDORED_SUBJECTS)
 def test_voltage_order_matches_upstream(subject_id: int) -> None:
     """Drift guard: our replicated ``voltage_electrode_order`` must equal the
@@ -207,6 +208,45 @@ def test_voltage_order_matches_upstream(subject_id: int) -> None:
     expected = _upstream_electrode_labels_or_skip(subject_id)
     actual = voltage_electrode_order(str(_BT_CACHE), subject_id)
     assert actual == expected
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_voltage_order_raises_on_duplicate_labels(tmp_path: Path) -> None:
+    """L4 fail-loud single-source guard: a duplicate electrode label surviving
+    cleaning/drop is ambiguous row identity (the DP2 collision precondition) — row
+    c would name two physical contacts — and must RAISE, not silently propagate to
+    support / valid_mask / the front-end scatter."""
+    import json
+
+    d = tmp_path / "electrode_labels" / "sub_77"
+    d.mkdir(parents=True)
+    (d / "electrode_labels.json").write_text(json.dumps(["LA1", "LA2", "LA1"]))
+    with pytest.raises(ValueError, match="duplicate electrode"):
+        voltage_electrode_order(str(tmp_path), 77)
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_aligned_voltage_support_propagates_duplicate_guard(tmp_path: Path) -> None:
+    """The single-source guard must protect the whole support/valid path:
+    ``aligned_voltage_support`` derives order from ``voltage_electrode_order``
+    first, so an ambiguous montage raises before any anatomy is loaded."""
+    import json
+
+    d = tmp_path / "electrode_labels" / "sub_77"
+    d.mkdir(parents=True)
+    (d / "electrode_labels.json").write_text(json.dumps(["LA1", "LA1"]))
+    with pytest.raises(ValueError, match="duplicate electrode"):
+        aligned_voltage_support(str(tmp_path), 77)
+
+
+@pytest.mark.must_pass_before_dispatch
+@pytest.mark.parametrize("subject_id", _VENDORED_SUBJECTS)
+def test_voltage_order_unique_for_all_vendored_subjects(subject_id: int) -> None:
+    """The dup guard must not trip on any real subject (0/10 have ambiguous
+    labels) — the live cohort passes the single-source ambiguity check."""
+    _require_vendored(subject_id)
+    order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    assert len(set(order)) == len(order)
 
 
 def test_aligned_voltage_support_sub4_interior_unmapped() -> None:

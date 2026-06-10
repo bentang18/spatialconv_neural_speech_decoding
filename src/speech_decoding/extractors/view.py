@@ -906,6 +906,53 @@ class MultiStftView(CARIeegExtractor):
             apply_log=self.apply_log,
         )
 
+    # ------------------------------------------------------------------ #
+    # Electrode-row alignment (DP1/DP2 fix, 2026-06-09)                   #
+    # ------------------------------------------------------------------ #
+    def _update_channels(self, ch_names: list[str]) -> None:  # type: ignore[override]
+        """Row-alignment fix (DP1/DP2). See :meth:`_get_channels`.
+
+        ``_channels`` is consumed downstream of this fix in exactly two ways: by
+        :meth:`_get_channels` (overridden to ignore its *contents*) and by
+        ``max(self._channels.values()) + 1`` — the global row count of the
+        scatter output (neuro.py:455, :meth:`_scatter_spec_to_global`,
+        :meth:`_scatter_stats_to_global`). Key it by integer POSITION so that the
+        row count equals the LONGEST session's electrode count, immune to the
+        cross-subject name collisions that ``channel_order='original'``
+        (name-keyed, last-writer-wins) can suffer: a collision on the longest
+        session's tail name could otherwise shrink the count below that session's
+        own length and make the per-session ``range(len(ch_names))`` scatter index
+        out of bounds. Single-subject behaviour is unchanged (one session →
+        ``{0:0, …, n-1:n-1}`` → ``max+1 == n``, exactly the base count)."""
+        for i in range(len(ch_names)):
+            self._channels[i] = i  # type: ignore[index]
+
+    def _get_channels(self, ch_names: list[str]) -> list[int]:  # type: ignore[override]
+        """Row-alignment fix (DP1/DP2): emit electrode_tokens in THIS event's own
+        per-subject voltage order.
+
+        The neuralset base scatters each clip into the global row index assigned by
+        a SHARED ``_channels`` dict (``channel_order='original'`` fills it
+        last-writer-wins across the whole pooled corpus in one ``prepare()``). For
+        more than one subject that dict permutes rows (DP1), and when two of a
+        subject's own electrodes alias one global row it silently drops one
+        electrode's signal (DP2) — so ``electrode_tokens[c]`` stops equalling
+        ``voltage_electrode_order(subject)[c]`` and desyncs from the DK
+        ``support`` / ``valid_mask`` extractors (built per-subject in voltage
+        order, with no remap).
+
+        Scattering each session to its own ``enumerate(ch_names)`` position removes
+        the cross-subject remap entirely: ``electrode_tokens[c] == ch_names[c] ==
+        voltage_electrode_order(subject)[c]`` by construction at all three scatter
+        sites (apply path neuro.py:453; spec cache :meth:`_scatter_spec_to_global`;
+        robust-z stats :meth:`_scatter_stats_to_global`). Byte-identical to the
+        base for single-subject runs, where the shared dict already assigns global
+        index == voltage position. Supersedes ``channel_order`` for this view.
+        See reports/bt_alignment/electrode_desync_damage_2026_06_09.md."""
+        if not self._channels:
+            self._update_channels(ch_names)
+        return list(range(len(ch_names)))
+
     def _get_timed_array(
         self, event, start: float, duration: float,
     ) -> TimedArray:
@@ -1315,6 +1362,40 @@ class MultiStftView(CARIeegExtractor):
             if tmp.exists():
                 tmp.unlink()
 
+    def _spec_cache_geometry(self) -> dict:
+        """The STFT-geometry fields that DETERMINE the cached frames for this
+        config but are invisible to the cache key (LG4): they are pydantic
+        *fields with defaults*, so ``infra.uid()`` (which calls
+        ``config(exclude_defaults=True)``) drops them when left at default, and
+        ``_spec_cache_namespace`` folds only ``raw_bins``/``fbank_routing``/
+        ``front_end``/``apply_log`` — NOT these. Result: editing a geometry
+        DEFAULT in code (e.g. ``hop_length`` 128→256) leaves the cache key
+        unchanged and a stale ``/work`` spec gets sliced silently.
+
+        These are written into the ``.json`` sidecar and asserted-if-present in
+        :meth:`_assert_cache_meta`, so a default edit fails loud on any cache
+        built after this fix. Folding them into the namespace instead would be
+        cleaner but invalidate every existing ``/work`` cache, so the
+        record+assert path is used (legacy caches lack the keys → skipped, not
+        invalidated). Only the fields that actually shape THIS config's frames
+        are listed, so the assert never false-positives on an irrelevant default
+        (``log_eps`` only when ``apply_log``; fbank params only off the raw path).
+        """
+        geom: dict[str, int | float] = {
+            "hop_length": int(self.hop_length),
+            "nperseg_low": int(self.nperseg_low),
+            "nperseg_mid": int(self.nperseg_mid),
+            "nperseg_hi": int(self.nperseg_hi),
+        }
+        if self.apply_log:
+            geom["log_eps"] = float(self.log_eps)
+        if self.front_end != "raw":
+            geom["n_fbank_bins"] = int(self.n_fbank_bins)
+            geom["fbank_f0_hz"] = float(self.fbank_f0_hz)
+            geom["fbank_octave_step"] = float(self.fbank_octave_step)
+            geom["fbank_half_bw_octaves"] = float(self.fbank_half_bw_octaves)
+        return geom
+
     def _assert_cache_meta(
         self, key: str, meta: dict, expected_f: int, ch_names: list[str],
     ) -> None:
@@ -1335,6 +1416,26 @@ class MultiStftView(CARIeegExtractor):
                 f"cached spec for {key!r} has n_channels={n_channels} but its "
                 f"sidecar lists {len(ch_names)} ch_names — corrupt cache."
             )
+        # Geometry assert-if-present (LG4): an STFT-geometry default edit is
+        # invisible to the cache key; catch it here on any post-fix cache. Legacy
+        # caches predate these keys → skipped (not invalidated).
+        for field, expected in self._spec_cache_geometry().items():
+            if field not in meta:
+                continue
+            stored = meta[field]
+            same = (
+                abs(float(stored) - float(expected)) <= 1e-12
+                if isinstance(expected, float)
+                else int(stored) == int(expected)
+            )
+            if not same:
+                raise ValueError(
+                    f"cached spec for {key!r} has {field}={stored} but the live "
+                    f"config expects {expected}: an STFT-geometry default changed "
+                    f"since this cache was built and infra.uid() (exclude_defaults) "
+                    f"did not see it. Slicing it would desync the feature grid — "
+                    f"clear {self.spec_cache_dir!r}."
+                )
 
     @staticmethod
     def _assert_cache_finite(key: str, spec_f32: torch.Tensor) -> None:
@@ -1471,6 +1572,9 @@ class MultiStftView(CARIeegExtractor):
                     "f_bins": int(frames.shape[1]),
                     "n_channels": int(frames.shape[0]),
                     "dtype": "float32",
+                    # STFT geometry the cache key can't see (LG4) — asserted-if-
+                    # present on the next hit so a default edit fails loud.
+                    **self._spec_cache_geometry(),
                 }
                 # Commit order: json FIRST, npy LAST, each atomic. The hit check is
                 # (npy AND json), so a reader only sees a hit once npy lands — by

@@ -70,30 +70,30 @@ def test_dispatch_lof_threshold_inert_when_lof_off(tmp_path, monkeypatch) -> Non
     assert ext.lof_n_neighbors == 20  # view default, NOT the passed 42
 
 
-def test_dispatch_lof_on_wires_drop_and_report(tmp_path, monkeypatch) -> None:
-    """#17: enabling LOF forces ``drop_bads=True`` (view validator requires it) and
-    threads threshold / n_neighbors / report_path through to the view."""
+def test_dispatch_lof_on_is_gated_off(tmp_path, monkeypatch) -> None:
+    """DP4 (2026-06-09): enabling LOF at dispatch is a hard build error. LOF drops
+    electrodes per-trial before the scatter, but support/valid_mask are per-subject
+    static, so electrode_tokens would desync from them. The dispatch gates LOF off
+    until per-event support/valid_mask plumbing lands. (The view-level LOF
+    mechanism itself stays covered by extractors/test_lof_wiring.py.)"""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     report = tmp_path / "lof_drops.json"
-    ext = dispatch_v14.build_v14_experiment(
-        mode="nano",
-        lof_bad_channels=True,
-        lof_threshold=1.8,
-        lof_n_neighbors=15,
-        lof_report_path=str(report),
-    ).data.segmenter.extractors["electrode_tokens"]
-    assert ext.lof_bad_channels is True
-    assert ext.drop_bads is True
-    assert ext.lof_threshold == 1.8
-    assert ext.lof_n_neighbors == 15
-    assert ext.lof_report_path == str(report)
+    with pytest.raises(ValueError, match="gated OFF"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano",
+            lof_bad_channels=True,
+            lof_threshold=1.8,
+            lof_n_neighbors=15,
+            lof_report_path=str(report),
+        )
 
 
-def test_dispatch_lof_on_without_report_path_raises(tmp_path, monkeypatch) -> None:
-    """#17 Ben-review gate: LOF on without a report path is a hard build error —
-    the per-subject drop counts MUST be written for review before a scored run."""
+def test_dispatch_lof_on_gate_fires_before_report_path_check(tmp_path, monkeypatch) -> None:
+    """DP4: the gate fires for LOF-on regardless of report_path (it precedes the
+    view's report-path validator), so no LOF config can slip a per-trial drop into
+    a scored build."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
-    with pytest.raises(ValueError, match="lof_report_path"):
+    with pytest.raises(ValueError, match="gated OFF"):
         dispatch_v14.build_v14_experiment(mode="nano", lof_bad_channels=True)
 
 
@@ -1389,3 +1389,110 @@ def test_b15_extractor_cache_joint_phase_wires_shaft_mask(
     shaft = xp.data.segmenter.extractors["shaft_mask"]
     if hasattr(shaft, "infra"):
         assert str(shaft.infra.folder) == str(cache_root / "shaft_mask")
+
+
+# ---------------------------------------------------------------------------
+# DP9 — support/valid_mask electrode-config agreement (data-integrity L4).
+# These two extractors are joined by bare positional electrode index
+# downstream, so a config divergence silently desyncs row identity. The
+# pairing-site guard makes that fail loud. Pre-dispatch gate.
+# ---------------------------------------------------------------------------
+
+
+def _dk(**kw):
+    base = dict(event_types="Ieeg", bt_root="/x", unmapped_policy="zero", c_max=384)
+    base.update(kw)
+    return V14DKHardSupportExtractor(**base)
+
+
+def _vm(**kw):
+    base = dict(
+        event_types="Ieeg", bt_root="/x", unmapped_policy="zero", c_max=384,
+        electrode_set="all",
+    )
+    base.update(kw)
+    return ElectrodeValidMask(**base)
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_passes_on_matched_config() -> None:
+    """The production pairing (identical parcel_labels / unmapped_policy / c_max
+    / bt_root / event_types) must pass — the guard is false-positive-free on the
+    convention dispatch follows today."""
+    dispatch_v14._assert_support_valid_config_agree(_dk(), _vm())  # no raise
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_raises_on_unmapped_policy_divergence() -> None:
+    with pytest.raises(ValueError, match="DP9"):
+        dispatch_v14._assert_support_valid_config_agree(
+            _dk(unmapped_policy="zero"), _vm(unmapped_policy="raise"),
+        )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_raises_on_c_max_divergence() -> None:
+    with pytest.raises(ValueError, match="DP9"):
+        dispatch_v14._assert_support_valid_config_agree(_dk(c_max=384), _vm(c_max=256))
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_raises_on_parcel_labels_divergence() -> None:
+    with pytest.raises(ValueError, match="DP9"):
+        dispatch_v14._assert_support_valid_config_agree(
+            _dk(), _vm(parcel_labels=("ctx-lh-bankssts",)),
+        )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_wired_into_build_v14_experiment(tmp_path, monkeypatch) -> None:
+    """The guard runs on the real dispatch path — a nano build (matched config)
+    succeeds, proving the call site is reached without raising."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
+    assert xp is not None
+
+
+# --- CN-3: channel-stats (model, layer_merge) provenance guard ----------------
+
+def _stats_args(path, whisper_layer_merge):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        target_standardize=True,
+        channel_stats_path=str(path),
+        whisper_layer_merge=whisper_layer_merge,
+    )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_channel_stats_merge_mismatch_raises(tmp_path) -> None:
+    """CN-3: a stats file fit on layer_merge=8 wired to --whisper-layer-merge
+    mean_all must fail loud — the 1280-d affine is the same width across merges,
+    so a mismatch would otherwise silently z-score the distill target wrong."""
+    p = tmp_path / "channel_stats.pt"
+    torch.save(
+        {"mean": torch.zeros(1280), "inv_std": torch.ones(1280),
+         "model": "openai/whisper-large-v3", "layer_merge": 8}, p,
+    )
+    with pytest.raises(ValueError, match="CN-3"):
+        dispatch_v14._validate_channel_stats_path(_stats_args(p, "mean_all"))
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_channel_stats_merge_match_passes(tmp_path) -> None:
+    p = tmp_path / "channel_stats.pt"
+    torch.save(
+        {"mean": torch.zeros(1280), "inv_std": torch.ones(1280),
+         "model": "openai/whisper-large-v3", "layer_merge": "mean_all"}, p,
+    )
+    dispatch_v14._validate_channel_stats_path(_stats_args(p, "mean_all"))  # no raise
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_channel_stats_legacy_no_provenance_is_not_blocked(tmp_path) -> None:
+    """A legacy stats file (no model/layer_merge keys) must NOT be invalidated —
+    assert-if-present, so existing /work caches keep working (no recompute)."""
+    p = tmp_path / "channel_stats.pt"
+    torch.save({"mean": torch.zeros(1280), "inv_std": torch.ones(1280)}, p)
+    dispatch_v14._validate_channel_stats_path(_stats_args(p, "8"))  # no raise

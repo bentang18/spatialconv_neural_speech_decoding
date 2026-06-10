@@ -190,3 +190,32 @@ the no-teacher sessions. 12 sessions over subjects {1,2,3,4,6,9} (subject 8 drop
 because its only session (8,0) has no teacher cache). Without an explicit P3
 corpus the distill phase routes to the full 13-session pretrain set and crashes
 lazily on the first (8,0) clip (whisper_target FileNotFoundError)."""
+
+
+BT_DEFAULT_SAMPLE_RATE_HZ: int = 2048
+"""The sample rate the entire BT pipeline ASSUMES (``neuroprobe.config.SAMPLING_RATE``,
+"do not change this"). Voltage load, est_idx→seconds, STFT Δf, and the FE-RAW-1
+bin↔Hz map all derive from it."""
+
+BT_SUBJECT_NATIVE_RATE_HZ: dict[int, int] = {9: 1024}
+"""Single source of truth for any subject whose DISTRIBUTED h5 native sample rate
+differs from ``BT_DEFAULT_SAMPLE_RATE_HZ``. Default (absent key) = 2048.
+
+**Subject 9 is natively 1024 Hz** — confirmed on DCC 2026-06-10: ``sub_9_trial000``
+h5 = 7,376,000 samples; its trigger track maps sample-index 7.117M → movie-time
+6462 s; at 2048 Hz the whole recording would be 3601 s < 6462 s of movie, which is
+impossible, so the native grid is 1024. Its trigger track and ``words_df.est_idx``
+sit on the 1024 grid; ``nonverbal_df.est_idx`` is on a stale 2048 grid. The pipeline
+assumes 2048 everywhere and does NOT resample, so S9 is currently MISHANDLED
+(2× time-stretch + STFT freq axis 2× mislabeled). See
+``reports/bt_alignment/data_pipeline_bug_ledger.md`` LG1. Remediation (resample to
+2048 / exclude from cohort) is a science/compute decision — gated.
+
+``test_subject_native_rate.py`` measures every vendored subject's true rate from its
+trigger track and fails if it disagrees with this registry — so S9 is locked and any
+future added subject with a non-2048 recording fails loud instead of corrupting silently."""
+
+
+def bt_subject_native_rate_hz(subject_id: int) -> int:
+    """The subject's true distributed-h5 sample rate (1024 for S9, else 2048)."""
+    return BT_SUBJECT_NATIVE_RATE_HZ.get(int(subject_id), BT_DEFAULT_SAMPLE_RATE_HZ)

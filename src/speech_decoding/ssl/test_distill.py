@@ -78,6 +78,7 @@ def test_shape_mismatch_raises() -> None:
         phase3_distillation_loss(s, t, beta=1.0)
 
 
+@pytest.mark.must_pass_before_dispatch
 def test_gradient_flows_to_student_only_when_teacher_detached() -> None:
     s = torch.randn(4, 50, 256, requires_grad=True)
     t = torch.randn(4, 50, 256)  # no grad

@@ -239,9 +239,25 @@ def voltage_electrode_order(
         for e in _BT_MISSING_COORDINATE_ELECTRODES.get(sid, ())
     )
 
-    return tuple(
+    order = tuple(
         e for e in cleaned if e not in drop and not _is_trigger_label(e)
     )
+    # Fail-loud on ambiguity (L4 single-source guard). This is THE single source
+    # of electrode-row identity: support / valid_mask / the front-end scatter all
+    # key off this order positionally. A duplicate label here means two physical
+    # contacts are indistinguishable by name — exactly the precondition that lets a
+    # name-keyed scatter collide rows (DP2). Raise rather than silently let row c
+    # name two electrodes. See reports/bt_alignment/electrode_desync_damage_2026_06_09.md.
+    if len(set(order)) != len(order):
+        seen: set[str] = set()
+        dups = sorted({e for e in order if e in seen or seen.add(e)})  # type: ignore[func-returns-value]
+        raise ValueError(
+            f"subject {sid}: voltage_electrode_order has duplicate electrode "
+            f"labels {dups[:10]} after cleaning/drop — ambiguous row identity. "
+            "Two contacts share a name; positional support/valid_mask/front-end "
+            "alignment is undefined."
+        )
+    return order
 
 
 def lite_voltage_mask(bt_root: str | Path, subject_id: int) -> np.ndarray:

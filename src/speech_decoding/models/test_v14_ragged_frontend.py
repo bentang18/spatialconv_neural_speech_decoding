@@ -108,6 +108,15 @@ def test_ragged_default_off_dataclass_and_model() -> None:
 # --------------------------------------------------------------------------- #
 def test_ragged_all_valid_bit_identical() -> None:
     kw, et, support, _ = _batch()
+    # All electrodes valid ⇒ honor the support/valid contract: give EVERY
+    # electrode (incl. the slots _batch left empty for the mixed-valid case) a
+    # one-hot parcel, else the L2 alignment guard correctly rejects a valid-but-
+    # empty-support row (electrode_desync_damage_2026_06_09.md).
+    B, C, K = support.shape
+    support = torch.zeros(B, C, K)
+    for b in range(B):
+        for c in range(C):
+            support[b, c, c % K] = 1.0
     all_valid = torch.ones(et.shape[0], et.shape[1], dtype=torch.bool)
     torch.manual_seed(7)
     model = V14ParcelPerceiverModel(**kw).eval()
