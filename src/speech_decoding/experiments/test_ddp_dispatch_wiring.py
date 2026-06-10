@@ -290,17 +290,26 @@ def test_eight_gpu_chain_holds_eff_batch_with_accum_4(monkeypatch, tmp_path) -> 
 
 
 def test_compile_flag_sets_env_var(monkeypatch) -> None:
-    """``--compile`` must set V14_COMPILE in the dispatch process so submitit
-    captures it into the slurm job env (the module reads it at construction).
-    Default-OFF: no flag leaves the env var unset → eager path."""
+    """The dispatch ALWAYS writes an explicit V14_COMPILE ("1"/"0") so submitit
+    captures a definite value into the slurm job env (the module reads it at
+    construction). ``--compile`` is DEFAULT-ON since 8a697c4, so a bare run sets
+    V14_COMPILE=="1"; ``--no-compile`` selects the eager path (V14_COMPILE=="0").
+    """
     monkeypatch.delenv("V14_COMPILE", raising=False)
     monkeypatch.delenv("V14_COMPILE_MODE", raising=False)
     import os
 
+    # Default (no flag) = compile ON (8a697c4) → V14_COMPILE=="1".
     rc = main(["--gpus-per-node", "1", "--dry-run"])
     assert rc == 0
-    assert "V14_COMPILE" not in os.environ
+    assert os.environ["V14_COMPILE"] == "1"
 
+    # Explicit --no-compile = eager (what the nano runs use) → V14_COMPILE=="0".
+    rc = main(["--no-compile", "--gpus-per-node", "1", "--dry-run"])
+    assert rc == 0
+    assert os.environ["V14_COMPILE"] == "0"
+
+    # --compile --compile-mode default → V14_COMPILE=="1", mode propagated.
     rc = main([
         "--compile", "--compile-mode", "default",
         "--gpus-per-node", "1", "--dry-run",

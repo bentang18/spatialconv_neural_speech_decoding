@@ -2255,7 +2255,7 @@ def _parser() -> argparse.ArgumentParser:
              "varying dim into one graph at no measured warm per-step cost "
              "(matrix: dynamic==static warm). ON by default; --no-compile-dynamic "
              "for fixed-shape runs. No effect when --no-compile. Loss-neutral "
-             "(±5% tripwire is the backstop).",
+             "(±5%% tripwire is the backstop).",
     )
     # 2026-06-09 throughput levers — front-doors for env vars read in data.py /
     # experiment.py (env, not pydantic fields → never fork the exca uid). All
