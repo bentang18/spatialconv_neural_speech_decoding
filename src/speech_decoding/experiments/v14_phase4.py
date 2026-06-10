@@ -52,9 +52,17 @@ from neuraltrain.optimizers import BaseOptimizer
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.experiments.v14_experiment import V14Experiment
 from speech_decoding.models.v14_encoder import (
+    V14FreqPreservingPmaReadout,
     V14ParcelPerceiverWithHead,
     V14PmaReadout,
 )
+
+# The two frozen-P3-PMA → temporal → Linear P4 readouts the module accepts:
+# the B35 cross_attn head (:class:`V14PmaReadout`) and the B37 mean-pool
+# freq-preserving head (:class:`V14FreqPreservingPmaReadout`). Both expose
+# ``.pma`` (the P3-trained query, loaded + frozen here) and ``.classifier``
+# (the only trainable P4 linear), which is all this module touches.
+_PMA_READOUTS: tp.Tuple[type, ...] = (V14PmaReadout, V14FreqPreservingPmaReadout)
 
 _Electrode = tp.Tuple[tp.Hashable, tp.Hashable]
 
@@ -148,11 +156,12 @@ class V14Phase4ReadoutModule(pl.LightningModule):
         wd_exclude_norms: bool = True,
     ) -> None:
         super().__init__()
-        if not isinstance(model.readout, V14PmaReadout):
+        if not isinstance(model.readout, _PMA_READOUTS):
             raise TypeError(
-                "V14Phase4ReadoutModule requires a V14PmaReadout (the B35 "
-                "frozen-PMA → temporal → Linear head; the P3-PMA loads into "
-                f"readout.pma). Got readout={type(model.readout).__name__}. The "
+                "V14Phase4ReadoutModule requires a frozen-PMA readout — "
+                "V14PmaReadout (B35 cross_attn) or V14FreqPreservingPmaReadout "
+                "(B37 mean-pool freq-preserving); the P3-PMA loads into "
+                f"readout.pma. Got readout={type(model.readout).__name__}. The "
                 "meanpool / attentive B34 sisters have no PMA to load — run them "
                 "through the supervised BrainModule, not this P4 module."
             )

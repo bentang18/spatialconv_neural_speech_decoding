@@ -2880,6 +2880,78 @@ class V14PmaReadout(nn.Module):
         return self.classifier(pooled)                            # (B, n_classes)
 
 
+class V14FreqPreservingPmaReadout(nn.Module):
+    """B37 D6 Phase-4 readout for the ``pool="mean"`` path
+    (reports/b37_meanpool_freq_latent_spec_2026_06_10.md §2.1). The B37
+    latent PRESERVES frequency — M4 is ``(B, K, F_p, T_p, d)`` — so the
+    **frozen** P3-PMA collapses the PARCEL axis ONLY (frequency × time
+    survive), then mean-over-time, flatten the freq axis, and a per-task
+    ``Linear(F_p·d, n_classes)``::
+
+        M4 (B, K, F_p, T_p, d)
+          → frozen PMA over K (key-masked by latent_valid) → (B, F_p, T_p, d)
+          → mean over T_p                                   → (B, F_p, d)
+          → flatten freq                                    → (B, F_p·d)
+          → Linear(F_p·d, n_classes)                        → (B, n_classes)
+
+    The PMA is the SAME module as the cross_attn path
+    (:class:`V14ParcelCollapsePMA`, **frozen** here) — it collapses one axis
+    keyed by per-parcel validity, so feeding it the ``(F_p·T_p)``-batched M4
+    collapses ``K`` at every ``(f, t)`` identically (the single learned query
+    attends over parcels, independent of which freq/time slice it sits in).
+    Loaded from the P3 checkpoint into ``readout.pma.*`` and re-frozen by the
+    P4 module, exactly like :class:`V14PmaReadout`.
+
+    Vs the B35 cross_attn readout the P4 ``Linear`` input grows ``×F_p``
+    (``d`` → ``F_p·d``; e.g. 256 → 2560): binary head ``2560·2+2 ≈ 5.1k``,
+    10-way ``≈ 25.7k`` — still ≪ 30 M, and the ONLY trainable P4 param.
+    Frequency must survive to the readout (D3/D6); the freq-collapse-ORDER
+    sisters ``R-p4-meanfreq-then-pma`` (mean freq before PMA) and
+    ``R-p4-freq-pool`` are deferred ablations (not built here).
+    """
+
+    def __init__(
+        self,
+        pma: "V14ParcelCollapsePMA",
+        d_model: int,
+        n_freq_patches: int,
+        n_classes: int,
+    ) -> None:
+        super().__init__()
+        self.pma = pma
+        self.pma.requires_grad_(False)                  # frozen P3-PMA at P4
+        self.n_freq_patches = n_freq_patches
+        self.d_model = d_model
+        # The freq axis flattens into the classifier (D6): input is F_p·d.
+        self.classifier = nn.Linear(n_freq_patches * d_model, n_classes)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(
+        self,
+        m4: Tensor,                              # (B, K, F_p, T_p, d)
+        latent_valid: Optional[Tensor] = None,   # (B, K) bool
+    ) -> Tensor:
+        B, K, F_p, T_p, d = m4.shape
+        if F_p != self.n_freq_patches:
+            raise ValueError(
+                f"freq-preserving readout built for F_p={self.n_freq_patches} "
+                f"but M4 has F_p={F_p}"
+            )
+        # Collapse PARCEL only: batch freq×time into the PMA's "time" axis so
+        # the single frozen query attends over K at every (f, t), keeping
+        # frequency resolved. V14ParcelCollapsePMA takes (B, L, S, d) and
+        # collapses L=K → (B, S, d). M4 is contiguous today (encoder_ln output)
+        # so these reshapes are views; correctness does NOT depend on it —
+        # ``.reshape`` copies if M4 is ever non-contiguous. s = f·T_p + t throughout.
+        s = m4.reshape(B, K, F_p * T_p, d)                    # (B, K, F_p·T_p, d)
+        collapsed = self.pma(s, latent_valid=latent_valid)    # (B, F_p·T_p, d)
+        collapsed = collapsed.reshape(B, F_p, T_p, d)         # (B, F_p, T_p, d)
+        pooled = collapsed.mean(dim=2)                        # (B, F_p, d) — P4 mean-t
+        flat = pooled.reshape(B, F_p * d)                     # (B, F_p·d)
+        return self.classifier(flat)                          # (B, n_classes)
+
+
 # Phase-3 distillation pool + projection live on the TEACHER side, not here.
 # Per the B05/B06 lock (2026-05-25 PM) the v14 student is an identity
 # passthrough at its 8 Hz native rate; the Whisper-L8 teacher is pooled
@@ -2937,6 +3009,27 @@ class V14ParcelPerceiverWithHead(nn.Module):
         ref_idx: Optional[Tensor] = None,
     ) -> Tensor:
         eps_used = self.eps if eps is None else eps
+        if self.encoder.pool == "mean":
+            # B37 mean path: the encoder consumes the electrode axis up front
+            # and keeps frequency, so the readout reads M4 = (B, K, F_p, T_p, d)
+            # and the per-parcel ``latent_valid`` straight from the encoder taps
+            # — no separate _compute_latent_valid (the pool already computed it).
+            # B37 drops shaft/subtype/ref (B36 cross_attn conditioning), so
+            # reject them loudly rather than silently ignore — mirroring the
+            # encoder's own mean-path guard.
+            if (
+                shaft_mask is not None
+                or subject_subtype is not None
+                or ref_idx is not None
+            ):
+                raise NotImplementedError(
+                    "B37 mean-pool readout drops shaft/subtype/ref conditioning; "
+                    "do not pass them with a pool='mean' encoder."
+                )
+            taps = self.encoder(
+                electrode_tokens, support, valid_mask, return_taps=True,
+            )
+            return self.readout(taps["M4"], latent_valid=taps["latent_valid"])
         latents = self.encoder(
             electrode_tokens,
             support,

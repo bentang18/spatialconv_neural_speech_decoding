@@ -42,8 +42,10 @@ from speech_decoding.experiments.v14_phase4 import (
     leave_two_subjects_out,
 )
 from speech_decoding.models.v14_encoder import (
+    V14FreqPreservingPmaReadout,
     V14ParcelCollapsePMA,
     V14ParcelPerceiver,
+    V14ParcelPerceiverModel,
     V14ParcelPerceiverWithHead,
     V14PmaReadout,
 )
@@ -61,7 +63,15 @@ _X_NAME = ("electrode_tokens", "support", "valid_mask")
 # at near-parity param count. If the encoder topology drifts, the structural
 # asserts (frozen == encoder + PMA; total == frozen + trainable) still hold and
 # this pin must be updated deliberately.
-_EXPECTED_FULL_SCALE_TOTAL = 12_119_810
+#
+# 2026-06-10 update (−2560): #95 (27dd1b2) flipped the ORDERED freq-patch
+# positional encoding default from "learned" → fixed sinusoidal (A-JEPA,
+# arXiv 2311.15830). The learned table was (F_p=10, d=256) = 2560 params; the
+# sinusoidal default is a non-learned buffer → the full-scale total dropped from
+# 12_119_810 to 12_117_250. The pin had not been updated when #95 landed; it is
+# corrected here (re-measured, still depth-6 d=256 dominated). The "learned"
+# sister still adds those 2560 back.
+_EXPECTED_FULL_SCALE_TOTAL = 12_117_250
 
 
 def _optim_config(lr: float = 1e-3) -> LightningOptimizer:
@@ -266,6 +276,116 @@ def test_rejects_non_pma_readout() -> None:
             model=head, loss=nn.CrossEntropyLoss(), optim_config=_optim_config(),
             x_name=_X_NAME, y_name="target",
         )
+
+
+# ---------------------------------------------------------------------------
+# B37 — the freq-preserving mean-pool readout (D6) is also a valid P4 head
+# ---------------------------------------------------------------------------
+
+
+def _make_freq_head(
+    *,
+    n_classes: int = 2,
+    n_time_bins: int = 8,
+    n_freq_bins: int = 6,
+    k_parcels: int = 5,
+    d_model: int = 16,
+    n_heads: int = 4,
+) -> V14ParcelPerceiverWithHead:
+    """A pool='mean' encoder + B37 freq-preserving readout, assembled directly
+    (the cfg.build / --readout wiring lands in Chunk E). Mirrors the manual
+    construction the dispatch layer will do once threaded."""
+    torch.manual_seed(0)
+    encoder = V14ParcelPerceiverModel(
+        n_freq_bins=n_freq_bins,
+        n_time_bins=n_time_bins,
+        k_parcels=k_parcels,
+        d_model=d_model,
+        n_heads=n_heads,
+        depth_self_attn=1,
+        m_sub_slots=1,
+        n_token_blocks=1,
+        patch_kernel_freq=2,
+        patch_kernel_time=2,
+        pool="mean",
+    )
+    pma = V14ParcelCollapsePMA(d_model=d_model, n_heads=n_heads)
+    readout = V14FreqPreservingPmaReadout(
+        pma=pma,
+        d_model=d_model,
+        n_freq_patches=encoder.n_freq_patches,
+        n_classes=n_classes,
+    )
+    return V14ParcelPerceiverWithHead(encoder, readout)
+
+
+def test_accepts_freq_preserving_readout_and_freezes() -> None:
+    """The P4 module accepts the B37 V14FreqPreservingPmaReadout (it exposes
+    .pma + .classifier, all the module touches), freezes encoder + PMA, and
+    leaves only the freq-readout Linear trainable."""
+    head = _make_freq_head()
+    m = V14Phase4ReadoutModule(
+        model=head, loss=nn.CrossEntropyLoss(), optim_config=_optim_config(),
+        x_name=_X_NAME, y_name="target",
+    )
+    assert isinstance(m.model.readout, V14FreqPreservingPmaReadout)
+    assert all(not p.requires_grad for p in m.model.encoder.parameters())
+    assert all(not p.requires_grad for p in m.model.readout.pma.parameters())
+    trainable = {id(p) for p in m._trainable_parameters()}
+    classifier = {id(p) for p in m.model.readout.classifier.parameters()}
+    assert trainable == classifier
+
+
+def test_freq_readout_p4_forward_and_metric_finite() -> None:
+    """End-to-end P4 step on the mean path: logits are (B, n_classes), finite,
+    and the loss backprops only into the freq-readout Linear."""
+    head = _make_freq_head(n_classes=2)
+    m = V14Phase4ReadoutModule(
+        model=head, loss=nn.CrossEntropyLoss(), optim_config=_optim_config(),
+        x_name=_X_NAME, y_name="target",
+    )
+    batch = _make_batch(B=2, C=5, K=5, n_time_bins=8, n_freq_bins=6, n_classes=2)
+    logits = m.forward(batch)
+    assert logits.shape == (2, 2)
+    assert torch.isfinite(logits).all()
+    loss = m.loss(logits, batch.data["target"])
+    loss.backward()
+    # Only the classifier saw gradient (encoder + PMA frozen).
+    assert all(
+        p.grad is not None for p in m.model.readout.classifier.parameters()
+    )
+    assert all(p.grad is None for p in m.model.readout.pma.parameters())
+
+
+def test_freq_readout_transferable_state_roundtrip() -> None:
+    """transferable_state is {encoder, pma} and round-trips into a fresh
+    freq-readout P4 clone (the E4 handoff works for the B37 head too)."""
+    src = _make_freq_head()
+    src_m = V14Phase4ReadoutModule(
+        model=src, loss=nn.CrossEntropyLoss(), optim_config=_optim_config(),
+        x_name=_X_NAME, y_name="target",
+    )
+    with torch.no_grad():
+        src_m.model.readout.pma.query.fill_(0.25)
+        src_m.model.encoder.encoder_ln.weight.fill_(2.0)
+    state = src_m.transferable_state()
+    assert set(state.keys()) == {"encoder", "pma"}
+
+    dst_m = V14Phase4ReadoutModule(
+        model=_make_freq_head(), loss=nn.CrossEntropyLoss(),
+        optim_config=_optim_config(), x_name=_X_NAME, y_name="target",
+    )
+    dst_m.load_transferable_state(state)
+    torch.testing.assert_close(
+        dst_m.model.readout.pma.query.detach(),
+        torch.full_like(dst_m.model.readout.pma.query, 0.25),
+    )
+    torch.testing.assert_close(
+        dst_m.model.encoder.encoder_ln.weight.detach(),
+        torch.full_like(dst_m.model.encoder.encoder_ln.weight, 2.0),
+    )
+    assert all(not p.requires_grad for p in dst_m.model.encoder.parameters())
+    assert all(not p.requires_grad for p in dst_m.model.readout.pma.parameters())
 
 
 # ---------------------------------------------------------------------------
