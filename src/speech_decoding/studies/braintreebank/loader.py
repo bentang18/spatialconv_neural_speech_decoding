@@ -1,12 +1,15 @@
-"""Raw 2048 Hz voltage reader for BrainTreebank h5 trials.
+"""Voltage reader for BrainTreebank h5 trials, resampled to the pipeline rate.
 
 `bt_load_raw()` returns voltage in the shape NeuralSet's `Ieeg._read()` wants:
 `(data: np.ndarray (n_ch, n_samples) float32, ch_names: list[str], sfreq: float)`.
 
-Native sample rate is 2048 Hz. **No re-reference applied** — CAR / Laplacian
-and HG envelope are Stage-1 ablation cells, not loader behavior. Matches
-Neuroprobe `__getitem__` native output exactly so PopT-comparability and
-multi-FM SSL hold.
+Most BT subjects are distributed at 2048 Hz; a few are not (S9 = 1024 Hz — see
+`BT_SUBJECT_NATIVE_RATE_HZ`). The whole downstream pipeline (est_idx→seconds,
+STFT Δf, FE-RAW-1 bin↔Hz) assumes a single `BT_DEFAULT_SAMPLE_RATE_HZ`, so any
+subject recorded at a different native rate is polyphase-resampled UP to it here,
+at the loader boundary — the one place voltage enters. Returned `sfreq` is
+therefore always `BT_DEFAULT_SAMPLE_RATE_HZ`. **No re-reference applied** — CAR /
+Laplacian and HG envelope are Stage-1 ablation cells, not loader behavior.
 
 The `BrainTreebankSubject` import stays outside this module so tests can use a
 small protocol stub. Real h5 reads only fire on DCC or another machine with
@@ -16,10 +19,16 @@ BrainTreebank data and `ROOT_DIR_BRAINTREEBANK` configured.
 from __future__ import annotations
 
 import typing as tp
+from math import gcd
 
 import numpy as np
+from scipy.signal import resample_poly
 
 from speech_decoding.studies.braintreebank.anatomy import clean_bt_electrode_label
+from speech_decoding.studies.braintreebank.manifest import (
+    BT_DEFAULT_SAMPLE_RATE_HZ,
+    bt_subject_native_rate_hz,
+)
 
 
 class _BrainTreebankSubjectLike(tp.Protocol):
@@ -34,8 +43,16 @@ class _BrainTreebankSubjectLike(tp.Protocol):
 def bt_load_raw(
     bt: _BrainTreebankSubjectLike,
     trial_id: int,
+    *,
+    subject_id: int,
 ) -> tuple[np.ndarray, list[str], float]:
-    """Pull `(data, ch_names, sfreq)` from a `BrainTreebankSubject`-shaped object."""
+    """Pull `(data, ch_names, sfreq)` from a `BrainTreebankSubject`-shaped object,
+    resampled to `BT_DEFAULT_SAMPLE_RATE_HZ` when the subject's native rate differs.
+
+    `subject_id` selects the native rate from `BT_SUBJECT_NATIVE_RATE_HZ`. It is a
+    required keyword (no silent default) so a non-2048 subject can never slip
+    through un-resampled — the exact failure that left S9 2× time-stretched.
+    """
 
     raw_data = bt.get_all_electrode_data(trial_id)
     if hasattr(raw_data, "detach"):
@@ -56,13 +73,13 @@ def bt_load_raw(
         raise ValueError(
             f"electrode_labels len {len(ch_names)} != n_channels {data.shape[0]}"
         )
-    sfreq = _sampling_rate()
-    return data, ch_names, sfreq
-
-
-def _sampling_rate() -> float:
-    try:
-        from neuroprobe.config import SAMPLING_RATE
-    except (ImportError, KeyError):  # local unit tests do not set BT data root
-        return 2048.0
-    return float(SAMPLING_RATE)
+    native_rate = bt_subject_native_rate_hz(subject_id)
+    if native_rate != BT_DEFAULT_SAMPLE_RATE_HZ:
+        # Polyphase-resample native → pipeline rate (S9: 1024→2048, up/down = 2/1).
+        # Wall-clock duration is preserved, so `est_idx` (native grid) → seconds
+        # still divides by the NATIVE rate (word_events._neural_sample_rate); a
+        # window at native sample i then lands at resampled sample i·(target/native).
+        g = gcd(BT_DEFAULT_SAMPLE_RATE_HZ, native_rate)
+        up, down = BT_DEFAULT_SAMPLE_RATE_HZ // g, native_rate // g
+        data = resample_poly(data, up, down, axis=1).astype(np.float32, copy=False)
+    return data, ch_names, float(BT_DEFAULT_SAMPLE_RATE_HZ)

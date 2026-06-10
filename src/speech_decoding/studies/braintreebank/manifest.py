@@ -204,12 +204,19 @@ differs from ``BT_DEFAULT_SAMPLE_RATE_HZ``. Default (absent key) = 2048.
 **Subject 9 is natively 1024 Hz** — confirmed on DCC 2026-06-10: ``sub_9_trial000``
 h5 = 7,376,000 samples; its trigger track maps sample-index 7.117M → movie-time
 6462 s; at 2048 Hz the whole recording would be 3601 s < 6462 s of movie, which is
-impossible, so the native grid is 1024. Its trigger track and ``words_df.est_idx``
-sit on the 1024 grid; ``nonverbal_df.est_idx`` is on a stale 2048 grid. The pipeline
-assumes 2048 everywhere and does NOT resample, so S9 is currently MISHANDLED
-(2× time-stretch + STFT freq axis 2× mislabeled). See
-``reports/bt_alignment/data_pipeline_bug_ledger.md`` LG1. Remediation (resample to
-2048 / exclude from cohort) is a science/compute decision — gated.
+impossible, so the native grid is 1024. The trigger track AND both ``est_idx``
+columns sit on this 1024 grid — verified from real CSV bytes 2026-06-10: S9
+``words_df`` max est_idx 7.10M and ``nonverbal_df`` max est_idx 6.90M both sit
+inside the 7.376M-sample native h5 (a true 2048 grid spanning the movie would reach
+~14.7M). What IS 2048-derived is the ``nonverbal_df.start`` COLUMN (upstream divides
+est_idx by the global 2048, so for S9 it reports half the true neural seconds) — but
+that column is UNUSED for windowing: ``word_events`` recomputes ``start = est_idx /
+native_rate`` and the P3 teacher re-keys nonverbal via trigger-track
+``interp(est_idx)``. **Resampled to 2048 at the loader 2026-06-10** (LG1 fix,
+Ben-approved): ``loader.bt_load_raw`` polyphase-resamples S9 1024→2048 while
+``_neural_sample_rate``/``_trial_duration_seconds`` divide est_idx by the native
+1024. Pre-fix S9 was 2× time-stretched + STFT freq axis 2× mislabeled. See
+``reports/bt_alignment/data_pipeline_bug_ledger.md`` LG1.
 
 ``test_subject_native_rate.py`` measures every vendored subject's true rate from its
 trigger track and fails if it disagrees with this registry — so S9 is locked and any
