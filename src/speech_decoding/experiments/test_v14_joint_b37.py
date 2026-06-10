@@ -142,7 +142,11 @@ def test_joint_rejects_injected_single_predictor() -> None:
 # --------------------------------------------------------------------------- #
 def test_joint_step_returns_joint_breakdown() -> None:
     m = _joint_module()
-    bd = m._step(_batch())
+    # Defense-in-depth (audit follow-up 2026-06-10): the PRIMARY workhorse joint
+    # step runs with the production conditioning keys present, so a regression of
+    # the mean-pool subtype/ref strip breaks this central test too — not only the
+    # one dedicated ``test_joint_step_drops_subtype_ref_on_meanpool``.
+    bd = m._step(_batch_with_conditioning())
     assert isinstance(bd, JointJepaBreakdown)
     assert bd.phase == "joint"
     assert torch.isfinite(bd.total) and torch.isfinite(bd.m2_total)
