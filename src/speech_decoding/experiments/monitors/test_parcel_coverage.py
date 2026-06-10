@@ -8,15 +8,17 @@ import torch
 from speech_decoding.experiments.monitors import (
     DEGENERATE_CLIP_FRACTION_ALARM,
     DEGENERATE_SLOT_COUNT_MAX,
-    SLOT_USAGE_VARIANCE_ALARM,
     parcel_coverage_monitor,
+)
+from speech_decoding.experiments.monitors.parcel_coverage import (
+    _SLOT_USAGE_VARIANCE_REFERENCE,
 )
 
 
 def test_parcel_coverage_thresholds_match_lock() -> None:
     assert DEGENERATE_CLIP_FRACTION_ALARM == 0.10
     assert DEGENERATE_SLOT_COUNT_MAX == 1
-    assert SLOT_USAGE_VARIANCE_ALARM == 0.05
+    assert _SLOT_USAGE_VARIANCE_REFERENCE == 0.05
 
 
 def _make_latent_valid(rows: list[list[int]]) -> torch.Tensor:
@@ -90,7 +92,7 @@ def test_parcel_coverage_mixed_swec_and_bt_excludes_swec_from_stats() -> None:
     assert v.degenerate_clip_fraction == 0.0
     # Per-slot usage fraction across only 4 anatomy-bearing clips with
     # random ~30/80 selection should land well below the alarm.
-    assert v.slot_usage_fraction_var < SLOT_USAGE_VARIANCE_ALARM
+    assert v.slot_usage_fraction_var < _SLOT_USAGE_VARIANCE_REFERENCE
     assert v.is_alarm is False
 
 
@@ -105,7 +107,7 @@ def test_parcel_coverage_high_slot_usage_variance_logged_but_no_alarm() -> None:
     latent_valid = torch.zeros(B, L, dtype=torch.bool)
     latent_valid[:, :10] = True
     v = parcel_coverage_monitor(latent_valid)
-    assert v.slot_usage_fraction_var > SLOT_USAGE_VARIANCE_ALARM
+    assert v.slot_usage_fraction_var > _SLOT_USAGE_VARIANCE_REFERENCE
     assert v.degenerate_clip_fraction == 0.0
     assert v.is_alarm is False
 

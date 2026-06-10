@@ -51,7 +51,6 @@ from speech_decoding.experiments.monitors.mask_orphan_ratio import (
 from speech_decoding.experiments.monitors.parcel_coverage import (
     DEGENERATE_CLIP_FRACTION_ALARM,
     DEGENERATE_SLOT_COUNT_MAX,
-    SLOT_USAGE_VARIANCE_ALARM,
     ParcelCoverageVerdict,
     parcel_coverage_monitor,
 )
@@ -118,7 +117,6 @@ __all__ = [
     "REF_TYPE_CANARY_F1_THRESHOLD",
     "RefTypeCanaryVerdict",
     "SENSOR_TYPE_CANARY_F1_THRESHOLD",
-    "SLOT_USAGE_VARIANCE_ALARM",
     "SUBJECT_ID_LEAKAGE_F1_THRESHOLD",
     "SensorTypeCanaryVerdict",
     "SlotRedundancyVerdict",

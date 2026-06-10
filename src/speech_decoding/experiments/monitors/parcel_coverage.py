@@ -55,7 +55,12 @@ from torch import Tensor
 # Hard alarms (instantaneous; sustain logic is dispatch-side).
 DEGENERATE_CLIP_FRACTION_ALARM: float = 0.10
 DEGENERATE_SLOT_COUNT_MAX: int = 1
-SLOT_USAGE_VARIANCE_ALARM: float = 0.05
+
+# Reference value ONLY — NOT an alarm threshold (``is_alarm`` never reads it).
+# Under K=80 sparse DK coverage the per-slot usage-fraction variance sits
+# structurally above this (≈ p(1-p)), so it is non-discriminative; kept for the
+# documented-regime assertions in tests. See ``ParcelCoverageVerdict.is_alarm``.
+_SLOT_USAGE_VARIANCE_REFERENCE: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -95,7 +100,7 @@ class ParcelCoverageVerdict:
         coverage the per-slot usage fraction is structurally bimodal
         (a parcel is either wired or never wired across the sub-batch),
         so its variance sits ≈ p(1-p) — well above
-        ``SLOT_USAGE_VARIANCE_ALARM`` by construction — and is
+        ``_SLOT_USAGE_VARIANCE_REFERENCE`` by construction — and is
         non-discriminative. ``degenerate_clip_fraction`` is the
         load-bearing degeneracy signal.
     """
@@ -184,7 +189,7 @@ def parcel_coverage_monitor(
     # slot_usage_var is computed and reported (below) but is NOT an alarm
     # trigger: under K=80 sparse per-clip DK coverage the per-slot usage
     # fraction is structurally bimodal, so its variance ≈ p(1-p) exceeds
-    # SLOT_USAGE_VARIANCE_ALARM by construction and is non-discriminative.
+    # _SLOT_USAGE_VARIANCE_REFERENCE by construction and is non-discriminative.
     # degenerate_clip_fraction is the load-bearing degeneracy signal.
     is_alarm = degenerate_clip_fraction > degenerate_clip_fraction_alarm
 
