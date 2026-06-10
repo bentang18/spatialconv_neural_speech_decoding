@@ -3180,6 +3180,16 @@ class V14ParcelPerceiver(BaseModelConfig):
     d_model: int = 256
     n_heads: int = 8
     depth_self_attn: int = 6
+    # B37 D1/D5 (2026-06-10): electrode→parcel pooling strategy + the
+    # freq-preserving parcel-SA latent depth. ``pool="cross_attn"`` (default)
+    # is the B36 learned per-parcel cross-attn pool over ``depth_self_attn``
+    # blocks. ``pool="mean"`` is the B37 hard electrode→parcel MEAN pool
+    # feeding a THIN ``latent_parcel_depth``-block parcel-SA-only latent
+    # (parcel×freq×time preserved); it is the path the joint SSL mode
+    # (``ssl_mode="joint"``) requires. ``latent_parcel_depth`` is inert under
+    # the cross-attn pool (that path rides ``depth_self_attn``).
+    pool: tp.Literal["mean", "cross_attn"] = "cross_attn"
+    latent_parcel_depth: int = 2
     # B29 Item 13 lock 2026-05-27 PM-late: default M=1. Sister
     # ``R-m4-slots`` P0 sets this to 4 to restore the prior 320-slot stack.
     m_sub_slots: int = 1
@@ -3339,6 +3349,8 @@ class V14ParcelPerceiver(BaseModelConfig):
             ragged_parcel=self.ragged_parcel,
             ragged_token=self.ragged_token,
             freq_pos=self.freq_pos,
+            pool=self.pool,
+            latent_parcel_depth=self.latent_parcel_depth,
         )
         # B35: P4 readout. The "pma_*" options collapse parcels with a
         # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only
@@ -3346,7 +3358,32 @@ class V14ParcelPerceiver(BaseModelConfig):
         # the trainer level). "attentive"/"meanpool" consume the full
         # (B, L, T, d) field directly (B34 sisters).
         readout: nn.Module
-        if self.readout in (
+        if self.pool == "mean":
+            # B37 D6: the mean-pool latent PRESERVES frequency — M4 is
+            # (B, K, F_p, T_p, d), 5-D — so the B35 readouts (which unpack the
+            # cross_attn 4-D (B, L, T, d)) cannot consume it. The freq-preserving
+            # head collapses PARCEL only (frozen P3-PMA, key-masked by
+            # latent_valid) → mean-over-time → flatten freq → Linear(F_p·d).
+            # Only "pma_mean_linear" is wired (the D6 lock); the flatten/timeattn
+            # temporal variants + the attentive/meanpool B34 sisters are not
+            # freq-aware and are deferred ablations — fail loud rather than crash
+            # one batch into the forward (which is what the 4-D readouts would do).
+            if self.readout != "pma_mean_linear":
+                raise ValueError(
+                    f"pool='mean' (B37 D6) wires only readout='pma_mean_linear' "
+                    f"(frozen PMA over parcels → mean-over-time → Linear(F_p·d)); "
+                    f"got readout={self.readout!r}. The flatten/timeattn temporal "
+                    "variants + the attentive/meanpool B34 sisters are not "
+                    "freq-aware (deferred). See V14FreqPreservingPmaReadout."
+                )
+            pma = V14ParcelCollapsePMA(d_model=self.d_model, n_heads=self.n_heads)
+            readout = V14FreqPreservingPmaReadout(
+                pma=pma,
+                d_model=self.d_model,
+                n_freq_patches=encoder.n_freq_patches,
+                n_classes=n_classes,
+            )
+        elif self.readout in (
             "pma_mean_linear", "pma_flatten_linear", "pma_timeattn_linear",
         ):
             pma = V14ParcelCollapsePMA(

@@ -262,6 +262,7 @@ class V14JointBrainModule(pl.LightningModule):
         latent_valid_override: str = "support",
         sa_mask_mode: str = "bidirectional",
         frontend_lr_scale: float = 0.1,
+        parcel_lr_scale: float = 1.0,
         wd_exclude_norms: bool = True,
         rankme_warn_threshold: tp.Optional[float] = None,
         rankme_alarm_threshold: tp.Optional[float] = None,
@@ -312,6 +313,16 @@ class V14JointBrainModule(pl.LightningModule):
             raise ValueError(
                 "frontend_lr_scale must lie in [0.0, 1.0]; got "
                 f"{frontend_lr_scale}"
+            )
+        # B37 D8 discriminative LR (joint only). The parcel side (+ both
+        # predictors) rides at ``base_lr · parcel_lr_scale`` while the front-end
+        # rides at ``base_lr · frontend_lr_scale``. Both default 1.0 in the B37
+        # config layer (no discrimination); the knobs let a run rebalance the
+        # two stages that mix at different depths. >1.0 rejected for symmetry
+        # with the front-end scale.
+        if not 0.0 <= parcel_lr_scale <= 1.0:
+            raise ValueError(
+                f"parcel_lr_scale must lie in [0.0, 1.0]; got {parcel_lr_scale}"
             )
         # 6/03 masking lock (STAGED only): mask shape ↔ predictor scope must
         # move as a pair, or the M4 SSL task leaks (time_block+cross_time = the
@@ -468,6 +479,7 @@ class V14JointBrainModule(pl.LightningModule):
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
         self._frontend_lr_scale = frontend_lr_scale
+        self._parcel_lr_scale = parcel_lr_scale
         self._wd_exclude_norms = bool(wd_exclude_norms)
         # MON-*-FEATURE-RANK thresholds (#74), phase-keyed canonical defaults.
         # A module instance runs exactly ONE rank probe: P1 the M2 front-end
@@ -506,8 +518,13 @@ class V14JointBrainModule(pl.LightningModule):
         # P1-pretrained front-end in P2 so the parcel side + predictor train
         # alone (front-end gets no update and is dropped from the optimizer).
         # P1 is unaffected — there the front-end + P1 predictor are the trained
-        # groups (the front-end is never frozen in P1).
-        if self._phase == "p2" and self._frontend_lr_scale == 0.0:
+        # groups (the front-end is never frozen in P1). B37 joint (D8) honors
+        # the same convention: a 0.0 front-end scale freezes the front-end so
+        # the parcel side + both predictors train alone.
+        freeze_frontend = self._frontend_lr_scale == 0.0 and (
+            self._phase == "p2" or self._ssl_mode == "joint"
+        )
+        if freeze_frontend:
             frontend, _parcel = self.student.encoder.partition_parameters_for_staging()
             for p in frontend:
                 p.requires_grad_(False)
@@ -1472,17 +1489,33 @@ class V14JointBrainModule(pl.LightningModule):
         frontend, parcel = self.student.encoder.partition_parameters_for_staging()
         predictor_params = self._predictor_parameters()
         if self._ssl_mode == "joint":
-            # B37 joint: the WHOLE encoder + both predictors train together
-            # under one composite loss. D8 discriminative LR (a per-stage LR
-            # split) is layered on in Chunk E; Chunk D is a single base-LR group
-            # so the joint loss path is exercised end-to-end first. Drop frozen
-            # params (the mean-pool path freezes the cross-attn latent-init
-            # embeds, which it never reads) so no grad-free param sits in the
-            # optimizer collecting weight decay.
-            joint_params = [
-                p for p in frontend + parcel + predictor_params if p.requires_grad
+            # B37 joint (D8 discriminative LR): the WHOLE encoder + both
+            # predictors train together under one composite loss, but the
+            # front-end and the parcel side mix at different depths, so each
+            # rides its own LR scale — front-end @ base·frontend_lr_scale, the
+            # parcel side + both predictors @ base·parcel_lr_scale. Both scales
+            # default 1.0 in the B37 config layer (no discrimination). Drop
+            # frozen params (the mean-pool path freezes the cross-attn
+            # latent-init embeds it never reads; a 0.0 front-end scale freezes
+            # the whole front-end) so no grad-free param sits in the optimizer
+            # collecting weight decay.
+            base_lr = self._base_lr()
+            parcel_side = [
+                p for p in parcel + predictor_params if p.requires_grad
             ]
-            return [{"params": joint_params}]
+            front_trainable = [p for p in frontend if p.requires_grad]
+            groups: list[dict[str, tp.Any]] = []
+            if front_trainable:
+                groups.append(
+                    {
+                        "params": front_trainable,
+                        "lr": base_lr * self._frontend_lr_scale,
+                    }
+                )
+            groups.append(
+                {"params": parcel_side, "lr": base_lr * self._parcel_lr_scale}
+            )
+            return groups
         if self._phase == "p1":
             return frontend + predictor_params
         base_lr = self._base_lr()

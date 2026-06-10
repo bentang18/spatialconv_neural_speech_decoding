@@ -29,6 +29,7 @@ from speech_decoding.models.v14_encoder import (
     V14FreqPreservingPmaReadout,
     V14MeanPoolLinearHead,
     V14ParcelCollapsePMA,
+    V14ParcelPerceiver,
     V14ParcelPerceiverModel,
     V14ParcelPerceiverWithHead,
 )
@@ -252,3 +253,64 @@ def test_withhead_cross_attn_path_unaffected() -> None:
     et, support, valid = _inputs(2, 6, dict(_enc_kw(), k_parcels=6))
     out = head(et, support, valid_mask=valid)
     assert out.shape == (2, 2)
+
+
+# --------------------------------------------------------------------------- #
+# config-layer V14ParcelPerceiver.build() — readout selection MUST be
+# pool-aware (the Chunk-E CRITICAL fix). A pool='mean' encoder emits 5-D M4
+# (B, K, F_p, T_p, d); the B35 4-D readouts would crash one batch into the
+# forward (`too many values to unpack`). build() must hand a pool='mean'
+# config the freq-preserving head — and refuse the non-wired readouts loud.
+# --------------------------------------------------------------------------- #
+def _build_cfg_kw() -> dict:
+    return {
+        "n_freq_bins": 6,
+        "n_time_bins": 4,
+        "k_parcels": 6,
+        "d_model": 16,
+        "n_heads": 4,
+        "depth_self_attn": 2,
+        "m_sub_slots": 1,
+        "n_token_blocks": 2,
+        "patch_kernel_freq": 2,
+    }
+
+
+def test_build_pool_mean_selects_freq_preserving_readout() -> None:
+    cfg = V14ParcelPerceiver(pool="mean", readout="pma_mean_linear", **_build_cfg_kw())
+    model = cfg.build(n_classes=3)
+    assert isinstance(model, V14ParcelPerceiverWithHead)
+    assert isinstance(model.readout, V14FreqPreservingPmaReadout)
+    # the classifier flattens the freq axis: in_features == F_p · d (D6).
+    assert model.readout.classifier.in_features == model.encoder.n_freq_patches * 16
+    assert model.readout.classifier.out_features == 3
+
+
+def test_build_pool_mean_forward_no_unpack_crash() -> None:
+    """The auditor repro: a built pool='mean' probe must forward end-to-end —
+    the 4-D B35 readouts crashed here with `too many values to unpack`."""
+    cfg = V14ParcelPerceiver(pool="mean", readout="pma_mean_linear", **_build_cfg_kw())
+    model = cfg.build(n_classes=2)
+    model.eval()
+    et, support, valid = _inputs(2, 8, _build_cfg_kw())
+    out = model(et, support, valid_mask=valid)
+    assert out.shape == (2, 2)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize(
+    "readout",
+    ["pma_flatten_linear", "pma_timeattn_linear", "attentive", "meanpool"],
+)
+def test_build_pool_mean_rejects_non_freq_readouts(readout: str) -> None:
+    cfg = V14ParcelPerceiver(pool="mean", readout=readout, **_build_cfg_kw())
+    with pytest.raises(ValueError, match="pool='mean'.*pma_mean_linear"):
+        cfg.build(n_classes=2)
+
+
+def test_build_cross_attn_default_unaffected_by_fix() -> None:
+    """A cross_attn config still routes to the 4-D V14PmaReadout, untouched."""
+    cfg = V14ParcelPerceiver(readout="pma_mean_linear", **_build_cfg_kw())
+    assert cfg.pool == "cross_attn"
+    model = cfg.build(n_classes=2)
+    assert not isinstance(model.readout, V14FreqPreservingPmaReadout)

@@ -412,6 +412,168 @@ def test_invalid_jepa_phase_rejected_by_argparse() -> None:
         main(["--jepa-phase", "p3", "--dry-run"])
 
 
+# --- B37 (2026-06-10) --pool / --ssl-mode joint SSL + D8 discriminative LR ----
+
+
+def test_b37_default_is_cross_attn_staged_byte_identical(tmp_path) -> None:
+    """No B37 flags → the joint experiment keeps the B36 surface: cross_attn
+    pool + staged SSL + the staged frontend_lr_scale. The new joint fields take
+    their no-op defaults (lambda_m4=1.0, predictor depths 3/2). Behavior is
+    byte-identical to pre-B37; only the persisted config grows the new fields."""
+    from speech_decoding.experiments.dispatch_v14 import (
+        DEFAULT_FRONTEND_LR_SCALE,
+        build_v14_experiment,
+    )
+
+    xp = build_v14_experiment(bt_root=str(tmp_path), mode="lite", joint_phase=True)
+    assert xp.ssl_mode == "staged"
+    assert xp.brain_model_config.pool == "cross_attn"
+    # staged keeps the B36 P2 base/10 frontend scale (NOT the joint 1.0 override)
+    assert xp.frontend_lr_scale == DEFAULT_FRONTEND_LR_SCALE
+    assert xp.lambda_m4 == 1.0
+    assert xp.m2_predictor_depth == 3 and xp.m4_predictor_depth == 2
+
+
+def test_b37_joint_threads_pool_ssl_mode_and_d8_scales(tmp_path) -> None:
+    """--pool mean joint build threads pool → brain config, ssl_mode/lambda_m4/
+    per-tap predictor depths → the joint experiment, and the D8 joint LR scales
+    OVERRIDE the staged frontend scale + are distinct from the B33 P3
+    parcel_lr_scale."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True,
+        pool="mean", ssl_mode="joint", latent_depth=3,
+        lambda_m4=0.7, m2_predictor_depth=4, m4_predictor_depth=3,
+        joint_frontend_lr_scale=0.5, joint_parcel_lr_scale=0.25,
+        m2_mask_ratio=0.4, m4_mask_ratio=0.3,
+        m2_mask_type="random", m4_mask_type="tube",
+        predictor_hidden=256, predictor_n_heads=8,
+    )
+    assert xp.ssl_mode == "joint"
+    assert xp.lambda_m4 == 0.7
+    assert xp.m2_predictor_depth == 4 and xp.m4_predictor_depth == 3
+    # D8: the joint scales win (the staged frontend scale + P3 parcel scale do
+    # NOT apply in joint mode). The joint field is named ``joint_parcel_lr_scale``
+    # to stay distinct from V14Phase3Experiment.parcel_lr_scale (the B33 knob).
+    assert xp.frontend_lr_scale == 0.5
+    assert xp.joint_parcel_lr_scale == 0.25
+    # masking + predictor sizing thread through
+    assert xp.m2_mask_ratio == 0.4 and xp.m4_mask_ratio == 0.3
+    assert xp.m2_mask_type == "random"
+    assert xp.predictor_hidden == 256 and xp.predictor_n_heads == 8
+    # encoder config carries the mean pool + thin latent depth
+    assert xp.brain_model_config.pool == "mean"
+    assert xp.brain_model_config.latent_parcel_depth == 3
+
+
+def test_b37_pool_mean_auto_resolves_ssl_mode_joint(monkeypatch) -> None:
+    """--pool mean with no --ssl-mode resolves to joint and reaches the build
+    with pool=mean + ssl_mode=joint (the #108 nano-launch default path)."""
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--pool", "mean", "--fast-dev-run"])
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0]["pool"] == "mean"
+    assert calls[0]["ssl_mode"] == "joint"
+    assert calls[0]["joint_phase"] is True
+    # joint LR scales ride along (default 1.0 = no discrimination)
+    assert calls[0]["joint_frontend_lr_scale"] == 1.0
+    assert calls[0]["joint_parcel_lr_scale"] == 1.0
+
+
+def test_b37_pool_cross_attn_auto_resolves_ssl_mode_staged(monkeypatch) -> None:
+    """The default --pool cross_attn with no --ssl-mode resolves to staged
+    (the B36 path) — the other half of the 'auto' resolution table."""
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run"])   # cross_attn is the default
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0]["pool"] == "cross_attn"
+    assert calls[0]["ssl_mode"] == "staged"
+
+
+def test_b37_ssl_mode_joint_requires_mean_pool() -> None:
+    """ssl_mode=joint on a cross_attn encoder fails fast at dispatch (the module
+    rejects it too, but the dispatch catches it before any build)."""
+    with pytest.raises(SystemExit, match="requires --pool mean"):
+        main(["--phase", "1", "--ssl-mode", "joint", "--pool", "cross_attn",
+              "--fast-dev-run"])
+
+
+def test_b37_pool_mean_ssl_phase_requires_joint() -> None:
+    """--pool mean on an SSL phase with an explicit --ssl-mode staged is
+    rejected: the freq-preserving mean-pool latent has no staged path."""
+    with pytest.raises(SystemExit, match="no staged single-term path"):
+        main(["--phase", "1", "--pool", "mean", "--ssl-mode", "staged",
+              "--fast-dev-run"])
+
+
+def test_b37_chain_with_joint_rejected(tmp_path) -> None:
+    """--chain --pool mean (→ ssl_mode joint) is rejected: the chain builder
+    still uses the staged p1→p2 split and would run the joint objective twice."""
+    with pytest.raises(SystemExit, match="not wired yet"):
+        main(["--chain", "--pool", "mean", "--work-dir", str(tmp_path),
+              "--fast-dev-run"])
+
+
+def test_b37_phase3_pool_mean_rejected() -> None:
+    """--phase 3 --pool mean fails loud at config: the P3 distill student
+    readout unpacks a 4-D latent and has no freq-preserving variant for the 5-D
+    mean-pool latent yet (else it crashes one batch into the forward)."""
+    with pytest.raises(SystemExit, match="phase 3 is not wired"):
+        main(["--phase", "3", "--pool", "mean", "--fast-dev-run"])
+
+
+def test_b37_config_layer_rejects_staged_mean(tmp_path) -> None:
+    """The config-layer guard holds regardless of entry point: a programmatic
+    build_v14_experiment(pool='mean') that takes the staged ssl_mode default
+    must raise at construction (not crash one batch into the forward)."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    with pytest.raises(ValueError, match="only the joint SSL path consumes"):
+        build_v14_experiment(
+            bt_root=str(tmp_path), mode="lite", joint_phase=True,
+            pool="mean", ssl_mode="staged",
+        )
+
+
+def test_b37_joint_honors_time_block_m4_mask(tmp_path) -> None:
+    """The 6/03 tube↔cross_time coupling gate is STAGED-only: joint's
+    freq-carrying M4 predictor has full visible-context attention, so the
+    R-time-block joint sister (--m4-mask-type time_block) builds without the
+    H1-leak rejection (matching the module gate + the --m4-mask-type help)."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True,
+        pool="mean", ssl_mode="joint", m4_mask_type="time_block",
+    )
+    assert xp.ssl_mode == "joint"
+    assert xp.m4_mask_type == "time_block"
+
+
+def test_b37_invalid_pool_and_ssl_mode_rejected_by_argparse() -> None:
+    """argparse ``choices`` reject typo'd --pool / --ssl-mode so the run record
+    never drifts."""
+    with pytest.raises(SystemExit):
+        main(["--pool", "meanpool", "--dry-run"])
+    with pytest.raises(SystemExit):
+        main(["--ssl-mode", "jointly", "--dry-run"])
+
+
+def test_b37_summary_prints_pool_and_ssl_mode(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The dispatch summary records pool + the resolved ssl_mode so the run
+    record never silently rides the wrong encoder / SSL objective."""
+    rc = main(["--phase", "1", "--pool", "mean", "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "pool=mean" in out
+    assert "ssl_mode=joint" in out
+
+
 # --- Gate-D fixes: chain assembly + sister-flag threading + P4 guards --------
 #
 # These monkeypatch build_v14_experiment to capture per-phase kwargs without

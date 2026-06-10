@@ -237,8 +237,7 @@ def test_joint_module_composite_mask_band_only_on_surviving() -> None:
 def test_joint_param_groups_cover_encoder_and_both_predictors() -> None:
     m = _joint_module()
     groups = m._phase_param_groups()
-    assert len(groups) == 1                              # single base-LR group (D8 in Chunk E)
-    ids = {id(p) for p in groups[0]["params"]}
+    ids = {id(p) for g in groups for p in g["params"]}    # union over LR groups
     for p in m.m2_predictor.parameters():
         assert id(p) in ids
     for p in m.m4_predictor.parameters():
@@ -250,8 +249,65 @@ def test_joint_param_groups_cover_encoder_and_both_predictors() -> None:
             assert id(p) in ids, n
         else:
             assert id(p) not in ids, f"frozen {n} leaked into the optimizer"
-    # No frozen param sits in the group at all.
-    assert all(p.requires_grad for p in groups[0]["params"])
+    # No frozen param sits in any group.
+    assert all(p.requires_grad for g in groups for p in g["params"])
+
+
+def test_joint_discriminative_lr_splits_frontend_and_parcel() -> None:
+    """D8: front-end @ base·frontend_lr_scale, parcel side + both predictors @
+    base·parcel_lr_scale — two LR groups with the right scales."""
+    m = _joint_module(frontend_lr_scale=0.1, parcel_lr_scale=1.0)
+    base = m._base_lr()
+    groups = m._phase_param_groups()
+    assert len(groups) == 2
+    by_lr = {round(g["lr"], 12): g for g in groups}
+    front = by_lr[round(base * 0.1, 12)]
+    parcel = by_lr[round(base * 1.0, 12)]
+    # The front-end group is EXACTLY the front-end params.
+    fe_ids = {id(p) for p in m.student.encoder.partition_parameters_for_staging()[0]
+              if p.requires_grad}
+    assert {id(p) for p in front["params"]} == fe_ids
+    # The parcel group carries both predictors.
+    pc_ids = {id(p) for p in parcel["params"]}
+    for pred in (m.m2_predictor, m.m4_predictor):
+        for p in pred.parameters():
+            assert id(p) in pc_ids
+
+
+def test_joint_equal_scales_still_two_groups_same_lr() -> None:
+    m = _joint_module(frontend_lr_scale=1.0, parcel_lr_scale=1.0)
+    base = m._base_lr()
+    groups = m._phase_param_groups()
+    assert len(groups) == 2
+    assert all(abs(g["lr"] - base) < 1e-12 for g in groups)
+
+
+def test_joint_parcel_lr_scale_scales_parcel_group() -> None:
+    m = _joint_module(frontend_lr_scale=1.0, parcel_lr_scale=0.25)
+    base = m._base_lr()
+    lrs = sorted(g["lr"] for g in m._phase_param_groups())
+    assert abs(lrs[0] - base * 0.25) < 1e-12
+    assert abs(lrs[1] - base * 1.0) < 1e-12
+
+
+def test_joint_freeze_frontend_drops_its_group() -> None:
+    """frontend_lr_scale=0.0 freezes the front-end (no grad) and drops it from
+    the optimizer → a single parcel-side group."""
+    m = _joint_module(frontend_lr_scale=0.0, parcel_lr_scale=1.0)
+    frontend = m.student.encoder.partition_parameters_for_staging()[0]
+    assert all(not p.requires_grad for p in frontend)
+    groups = m._phase_param_groups()
+    assert len(groups) == 1
+    ids = {id(p) for p in groups[0]["params"]}
+    assert not any(id(p) in ids for p in frontend)
+    # Still trains end-to-end on the parcel side (M4 reaches the parcel-SA).
+    m._step(_batch()).total.backward()
+    assert any(p.grad is not None for p in m.m4_predictor.parameters())
+
+
+def test_joint_parcel_lr_scale_out_of_range_raises() -> None:
+    with pytest.raises(ValueError, match="parcel_lr_scale"):
+        _joint_module(parcel_lr_scale=1.5)
 
 
 def test_meanpool_freezes_unused_latent_init_embeds() -> None:

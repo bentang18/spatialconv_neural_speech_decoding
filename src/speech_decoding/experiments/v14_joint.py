@@ -144,6 +144,21 @@ raises :class:`NotImplementedError` at construction until the
 encoder-side branch lands.
 """
 
+SslMode = Literal["staged", "joint"]
+"""B37 D7 SSL-objective mode selector.
+
+``staged`` (default): the B36 single-term-per-phase path — one masked-JEPA
+term (M2 front-end OR M4 parcel, picked by ``jepa_phase``) per experiment,
+byte-identical to before B37 (the ``R-staged-ssl`` falsifier).
+
+``joint`` (B37 D7/D9): ONE masked student forward produces BOTH the M2
+front-end and M4 parcel taps under a single composite (band ∧ tube) mask,
+scored by TWO predictors (M2 @ ``m2_predictor_depth``, M4 @
+``m4_predictor_depth``) against one EMA full-input teacher pass —
+``L = L_M2 + λ·L_M4``. Requires the freq-preserving mean-pool encoder
+(``pool="mean"``); the module rejects ``joint`` on a cross-attn encoder.
+"""
+
 
 class V14JointExperiment(V14Experiment):
     """Joint-by-default v14 SSL experiment (B29 Item 1).
@@ -228,6 +243,36 @@ class V14JointExperiment(V14Experiment):
     predictor_hidden: int = pydantic.Field(default=128, ge=1)
     predictor_n_heads: int = pydantic.Field(default=4, ge=1)
 
+    # B37 D7/D9 joint SSL (2026-06-10). ``ssl_mode="joint"`` runs ONE masked
+    # student forward producing BOTH the M2 + M4 taps under a composite
+    # (band ∧ tube) mask, scored by TWO predictors against one EMA teacher pass
+    # (``L = L_M2 + λ·L_M4``). It requires the freq-preserving mean-pool encoder
+    # (``pool="mean"``) — validated below + re-checked in the BrainModule.
+    # ``"staged"`` (default) preserves the B36 single-term-per-phase path
+    # byte-identical (``R-staged-ssl``). ``m{2,4}_predictor_depth`` are the
+    # per-tap predictor depths (D9: M2 @ 3, M4 @ 2; the shared
+    # ``predictor_hidden`` / ``predictor_n_heads`` size both). ``lambda_m4`` is
+    # the M4 term weight (D7, default 1.0). ``predictor_depth`` (above) stays
+    # the STAGED single-predictor depth and is ignored under ``joint``.
+    ssl_mode: SslMode = "staged"
+    lambda_m4: float = pydantic.Field(default=1.0, ge=0.0)
+    m2_predictor_depth: int = pydantic.Field(default=3, ge=1)
+    m4_predictor_depth: int = pydantic.Field(default=2, ge=1)
+
+    # B37 D8 parcel-side discriminative-LR scale (joint only). The parcel side
+    # (+ both predictors) rides at ``base_lr · joint_parcel_lr_scale``; the
+    # front-end rides at ``base_lr · frontend_lr_scale``. Both default 1.0 (no
+    # discrimination). NOTE the two zeros are NOT symmetric: a 0.0 *front-end*
+    # scale HARD-freezes the front-end (``requires_grad_(False)`` + dropped from
+    # the optimizer), whereas a 0.0 *parcel* scale only sets the parcel group's
+    # LR to 0 (no update, but the params + Adam state stay allocated). The hard
+    # freeze is the R-p2-freeze-frontend ablation; a frozen parcel side has no
+    # such falsifier, so it is left as a zero-LR group. Named ``joint_*`` to stay
+    # distinct from the B33 P3-3b ``V14Phase3Experiment.parcel_lr_scale`` (a
+    # different phase, same bare name) — dispatch wires this one only on the
+    # joint phase via ``--joint-parcel-lr-scale``.
+    joint_parcel_lr_scale: float = pydantic.Field(default=1.0, ge=0.0, le=1.0)
+
     # #94 predictor context+query drop (V-JEPA-2 visible-only predictor). When
     # True the predictor gathers ONLY the visible context cells + ONLY the real
     # masked query slots (pad-to-per-batch-max) instead of feeding the full grid
@@ -289,12 +334,18 @@ class V14JointExperiment(V14Experiment):
                 "latent-SA key-only branch — see "
                 "docs/neuroprobe/v14_blockers.md row B30-dispatch-sister-flags."
             )
-        # 6/03 masking lock: M4 mask shape ↔ predictor scope must couple, or
-        # the SSL task leaks (time_block+cross_time = H1). Fail at config time
-        # (before dispatch), not just when the BrainModule is built.
+        # 6/03 masking lock (STAGED only): M4 mask shape ↔ predictor scope must
+        # couple, or the SSL task leaks (time_block+cross_time = H1). Fail at
+        # config time (before dispatch), not just when the BrainModule is built.
+        # The B37 JOINT M4 predictor is freq-carrying with full visible-context
+        # attention (no cross-time restriction), so the coupling gate does NOT
+        # apply there — this MUST match the module's ``ssl_mode == "staged"``
+        # gate (v14_joint_module.py), or joint + ``--m4-mask-type time_block``
+        # (a valid R-time-block joint sister) is wrongly rejected at config time.
         from speech_decoding.ssl.mask import validate_m4_coupling
 
-        validate_m4_coupling(self.m4_mask_type, self.predictor_scope)
+        if self.ssl_mode == "staged":
+            validate_m4_coupling(self.m4_mask_type, self.predictor_scope)
         # B9 (B36 WS-B): the masked-JEPA default is single-term per phase.
         # The B31 multi-term sisters (``b31_plus_m3`` / ``b31_plus_utt`` /
         # ``b31_plus_both``) are quarantined — re-adding the M3 / utterance
@@ -306,6 +357,36 @@ class V14JointExperiment(V14Experiment):
                 "WS-B sister (B9 single-term masked-JEPA default). The "
                 "b31_plus_* multi-term aggregator path was retired with the "
                 "masked-JEPA rewrite — see docs/neuroprobe/v14_blockers.md."
+            )
+        # B37 D7: joint SSL ⟺ the freq-preserving mean-pool encoder. The
+        # coupling is BIDIRECTIONAL — enforce BOTH directions here so the
+        # contract holds regardless of entry point (CLI or a programmatic
+        # ``build_v14_experiment(pool="mean")`` that takes the staged default):
+        #   * joint  ⇒ pool must be "mean"   (the 5-D M2/M4 taps need it), and
+        #   * mean   ⇒ ssl_mode must be "joint" (the staged single-predictor
+        #     path unpacks a 4-D cross_attn latent and would crash one batch
+        #     into the forward on the 5-D mean-pool latent).
+        # The BrainModule re-checks the joint⇒mean half; catching both here
+        # gives the dispatch a clear pre-build error instead of a late crash.
+        # ``brain_model_config`` may be absent on bare test fixtures (default
+        # ssl_mode='staged' on a cross_attn encoder needs no pool check) — guard
+        # the attribute access so those constructions stay valid.
+        _brain_cfg = getattr(self, "brain_model_config", None)
+        pool = getattr(_brain_cfg, "pool", None) if _brain_cfg is not None else None
+        if self.ssl_mode == "joint" and pool is not None and pool != "mean":
+            raise ValueError(
+                "ssl_mode='joint' (B37 D7) is the freq-preserving mean-pool "
+                f"path; it requires the encoder pool='mean', got pool={pool!r}. "
+                "Launch with --pool mean (which defaults --ssl-mode to joint)."
+            )
+        if pool == "mean" and self.ssl_mode != "joint":
+            raise ValueError(
+                f"pool='mean' (B37) emits a freq-preserving 5-D parcel×freq×time "
+                f"latent that only the joint SSL path consumes; got "
+                f"ssl_mode={self.ssl_mode!r}. The staged single-predictor path "
+                "unpacks a 4-D cross_attn latent and would crash one batch in. "
+                "Use ssl_mode='joint' with pool='mean' (--pool mean defaults "
+                "--ssl-mode to joint)."
             )
         # B29 Item 1: ``V14JointExperiment`` is *only* the joint phase,
         # which is pinned to ``phase == 1`` (the canonical collapsed
@@ -365,6 +446,11 @@ class V14JointExperiment(V14Experiment):
             encoder=encoder,
             optim_config=self.optim,
             phase=self.jepa_phase,
+            ssl_mode=self.ssl_mode,
+            lambda_m4=self.lambda_m4,
+            m2_predictor_depth=self.m2_predictor_depth,
+            m4_predictor_depth=self.m4_predictor_depth,
+            parcel_lr_scale=self.joint_parcel_lr_scale,
             m2_mask_type=self.m2_mask_type,
             m2_mask_ratio=self.m2_mask_ratio,
             m2_time_band_floor=self.m2_time_band_floor,

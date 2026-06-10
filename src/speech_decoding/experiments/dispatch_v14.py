@@ -204,6 +204,28 @@ DEFAULT_JEPA_PHASE: str = "p1"
 # 0.2 = R-p2-frontend-lr-5; 0.0 = R-p2-freeze-frontend (front-end frozen).
 DEFAULT_FRONTEND_LR_SCALE: float = 0.1
 
+# B37 (2026-06-10) encoder + joint-SSL defaults. Single source for both the
+# ``build_v14_experiment`` signature and the argparse layer so the two cannot
+# drift. ``pool``/``latent_depth`` ride the brain-model config; the rest are
+# joint-SSL (``ssl_mode``) + masking/predictor knobs (#75/#76). The mask
+# ratios/types mirror the 6/03 masking lock (ssl/mask.py signature defaults);
+# the predictor sizes mirror the V14JointExperiment pydantic field defaults.
+DEFAULT_POOL: str = "cross_attn"
+DEFAULT_LATENT_DEPTH: int = 2
+DEFAULT_SSL_MODE: str = "staged"          # main() resolves "auto" per pool
+DEFAULT_LAMBDA_M4: float = 1.0            # D7 M4 term weight
+DEFAULT_M2_PREDICTOR_DEPTH: int = 3       # D9 per-tap (front-end M2)
+DEFAULT_M4_PREDICTOR_DEPTH: int = 2       # D9 per-tap (parcel M4)
+DEFAULT_JOINT_FRONTEND_LR_SCALE: float = 1.0   # D8 (no discrimination)
+DEFAULT_JOINT_PARCEL_LR_SCALE: float = 1.0     # D8 (no discrimination)
+DEFAULT_M2_MASK_TYPE: str = "bands"       # 6/03 masking lock
+DEFAULT_M2_MASK_RATIO: float = 0.50       # 6/03 masking lock
+DEFAULT_M4_MASK_TYPE: str = "tube"        # 6/03 masking lock
+DEFAULT_M4_MASK_RATIO: float = 0.20       # 6/03 masking lock
+DEFAULT_PREDICTOR_DEPTH: int = 3          # staged single predictor
+DEFAULT_PREDICTOR_HIDDEN: int = 128
+DEFAULT_PREDICTOR_N_HEADS: int = 4
+
 # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical loss simplification):
 # joint SSL default is a 2-term surface (L_pre_frame @ M2 + L_post_frame
 # @ LN_frame(M4), both pure L1 per V-JEPA 2 §2.1 Eq 1). The three
@@ -689,6 +711,37 @@ def build_v14_experiment(
     # ``jepa_phase="p2"`` only (no effect at P1, where the front-end is the
     # sole trained group).
     frontend_lr_scale: float = DEFAULT_FRONTEND_LR_SCALE,
+    # B37 (2026-06-10) encoder + joint-SSL knobs. ``pool`` picks the
+    # electrode→parcel pooling: "cross_attn" (default, B36 learned pool) or
+    # "mean" (B37 hard mean pool → freq-preserving thin parcel-SA latent).
+    # ``latent_depth`` is the mean-pool latent's parcel-SA block count (D5,
+    # inert under cross_attn). Both ride the brain-model config → every phase
+    # shares one encoder. ``ssl_mode`` selects the SSL objective on the
+    # ``joint_phase`` experiment: "staged" (default, B36 single-term-per-phase,
+    # byte-identical) or "joint" (B37 D7 composite-mask M2+M4 single forward).
+    # ``--pool mean`` defaults ``ssl_mode`` to "joint" in main(); the joint path
+    # requires pool="mean". Joint-only knobs (inert on staged / P3 / P4):
+    # ``lambda_m4`` (M4 term weight), ``m{2,4}_predictor_depth`` (D9 per-tap
+    # predictor depths), ``joint_frontend_lr_scale`` / ``joint_parcel_lr_scale``
+    # (D8 discriminative LR, both default 1.0 = no discrimination — distinct
+    # from the B33 P3 ``parcel_lr_scale`` knob below). ``m{2,4}_mask_{type,ratio}``
+    # + ``predictor_{depth,hidden,n_heads}`` expose the masking + STAGED-predictor
+    # sizing (the joint M2/M4 predictors share hidden/n_heads, depths per-tap).
+    pool: tp.Literal["cross_attn", "mean"] = DEFAULT_POOL,
+    latent_depth: int = DEFAULT_LATENT_DEPTH,
+    ssl_mode: tp.Literal["staged", "joint"] = DEFAULT_SSL_MODE,
+    lambda_m4: float = DEFAULT_LAMBDA_M4,
+    m2_predictor_depth: int = DEFAULT_M2_PREDICTOR_DEPTH,
+    m4_predictor_depth: int = DEFAULT_M4_PREDICTOR_DEPTH,
+    joint_frontend_lr_scale: float = DEFAULT_JOINT_FRONTEND_LR_SCALE,
+    joint_parcel_lr_scale: float = DEFAULT_JOINT_PARCEL_LR_SCALE,
+    m2_mask_type: str = DEFAULT_M2_MASK_TYPE,
+    m2_mask_ratio: float = DEFAULT_M2_MASK_RATIO,
+    m4_mask_type: str = DEFAULT_M4_MASK_TYPE,
+    m4_mask_ratio: float = DEFAULT_M4_MASK_RATIO,
+    predictor_depth: int = DEFAULT_PREDICTOR_DEPTH,
+    predictor_hidden: int = DEFAULT_PREDICTOR_HIDDEN,
+    predictor_n_heads: int = DEFAULT_PREDICTOR_N_HEADS,
     # WS-H / T20 (B33 P3 distillation): root of the whole-movie Whisper teacher
     # cache built by scripts/neuroprobe/build_bt_teacher_cache.py. When set, the
     # segmenter emits a per-clip ``whisper_target`` (B, 250, 1280) the P3 loss
@@ -1276,6 +1329,12 @@ def build_v14_experiment(
             V14JointExperiment,
         )
         experiment_cls = V14JointExperiment
+        # B37 D8: in joint SSL the front-end + parcel side ride their own
+        # discriminative-LR scales (both default 1.0 = no discrimination). The
+        # staged ``frontend_lr_scale`` (B36 P2 base/10) does not apply, so swap
+        # in the joint scale here; staged keeps the B36 value.
+        _joint = ssl_mode == "joint"
+        _frontend_lr_scale = joint_frontend_lr_scale if _joint else frontend_lr_scale
         extra_experiment_kwargs = {
             "phase": JOINT_PHASE_VALUE,
             # B30-dispatch-sister-flags persisted onto the joint
@@ -1288,9 +1347,29 @@ def build_v14_experiment(
             "loss_variant": loss_variant,
             # B36 staged masked-JEPA sub-phase (H4): p1 front-end M2 / p2
             # parcel M4. The staged P1->P2 handoff is WS-E; this picks the stage.
+            # Inert under ssl_mode="joint" (the joint forward trains BOTH taps).
             "jepa_phase": jepa_phase,
-            # B36 WS-E E2: P2 front-end discriminative-LR scale.
-            "frontend_lr_scale": frontend_lr_scale,
+            # B36 WS-E E2 (staged) / B37 D8 (joint): front-end discriminative-LR
+            # scale (resolved above per ssl_mode).
+            "frontend_lr_scale": _frontend_lr_scale,
+            # B37 D7/D9 joint SSL: objective mode + per-tap predictor depths + M4
+            # term weight + D8 parcel-side LR scale. Inert under ssl_mode="staged".
+            "ssl_mode": ssl_mode,
+            "lambda_m4": lambda_m4,
+            "m2_predictor_depth": m2_predictor_depth,
+            "m4_predictor_depth": m4_predictor_depth,
+            "joint_parcel_lr_scale": joint_parcel_lr_scale,
+            # #75/#76 masking + predictor sizing (staged + joint). The joint M2/M4
+            # predictors share hidden/n_heads; their depths come from
+            # m{2,4}_predictor_depth above. predictor_depth is the staged single
+            # predictor's depth.
+            "m2_mask_type": m2_mask_type,
+            "m2_mask_ratio": m2_mask_ratio,
+            "m4_mask_type": m4_mask_type,
+            "m4_mask_ratio": m4_mask_ratio,
+            "predictor_depth": predictor_depth,
+            "predictor_hidden": predictor_hidden,
+            "predictor_n_heads": predictor_n_heads,
             # #94 V-JEPA-2 visible-only predictor (context+query drop). Joint-only.
             "ragged_predictor": ragged_predictor,
             # §7/B01 no-WD param-group split (#40).
@@ -1455,6 +1534,15 @@ def build_v14_experiment(
             # R-freq-learned-embed sister. Threaded to the encoder + mirrored
             # to the P1 predictor freq id-tag by the joint module.
             "freq_pos": freq_pos,
+            # B37 D1/D5 (2026-06-10): electrode->parcel pooling + the
+            # freq-preserving parcel-SA latent depth. "cross_attn" (default,
+            # B36 learned pool) rides depth_self_attn; "mean" (B37 hard mean
+            # pool) feeds a thin latent_parcel_depth-block parcel-SA latent
+            # (parcel x freq x time preserved) and is the path ssl_mode="joint"
+            # requires. latent_parcel_depth is inert under cross_attn. Both ride
+            # this one config -> every phase shares the encoder.
+            "pool": pool,
+            "latent_parcel_depth": latent_depth,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
             # supervised downstream classifier path does not branch on
@@ -2262,6 +2350,111 @@ def _parser() -> argparse.ArgumentParser:
              "No effect under 3a / P1 / P2 / P4 (persisted onto the run record "
              "either way). Folded into the M0 optimizer sweep (#45/#78).",
     )
+    # ----- B37 (2026-06-10) encoder + joint-SSL flags -------------------------
+    p.add_argument(
+        "--pool", dest="pool", choices=("cross_attn", "mean"),
+        default=DEFAULT_POOL,
+        help="B37 D1 electrode->parcel pooling. 'cross_attn' (default) = B36 "
+             "learned per-parcel cross-attn pool. 'mean' = B37 hard mean pool "
+             "feeding the freq-preserving thin parcel-SA latent; it DEFAULTS "
+             "--ssl-mode to 'joint' (B37 D7) and is required by joint SSL.",
+    )
+    p.add_argument(
+        "--latent-depth", dest="latent_depth", type=int,
+        default=DEFAULT_LATENT_DEPTH,
+        help="B37 D5 parcel-SA latent block count for the mean-pool path "
+             "(default 2 = the thin latent). Inert under --pool cross_attn "
+             "(that path rides --depth).",
+    )
+    p.add_argument(
+        "--ssl-mode", dest="ssl_mode", choices=("auto", "staged", "joint"),
+        default="auto",
+        help="B37 D7 SSL objective (joint SSL / --phase 1). 'auto' (default) "
+             "resolves to 'joint' when --pool mean else 'staged'. 'staged' = "
+             "B36 single-term-per-phase (byte-identical). 'joint' = B37 "
+             "composite-mask M2+M4 single forward (requires --pool mean).",
+    )
+    p.add_argument(
+        "--m4-loss-weight", dest="lambda_m4", type=float,
+        default=DEFAULT_LAMBDA_M4,
+        help="B37 D7 joint M4 term weight lambda in L = L_M2 + lambda*L_M4 "
+             "(default 1.0). Joint-only.",
+    )
+    p.add_argument(
+        "--m2-predictor-depth", dest="m2_predictor_depth", type=int,
+        default=DEFAULT_M2_PREDICTOR_DEPTH,
+        help="B37 D9 M2 (front-end) predictor depth (default 3). Joint-only; "
+             "shares --predictor-hidden / --predictor-n-heads with the M4 "
+             "predictor.",
+    )
+    p.add_argument(
+        "--m4-predictor-depth", dest="m4_predictor_depth", type=int,
+        default=DEFAULT_M4_PREDICTOR_DEPTH,
+        help="B37 D9 M4 (parcel) predictor depth (default 2). Joint-only.",
+    )
+    p.add_argument(
+        "--joint-frontend-lr-scale", dest="joint_frontend_lr_scale", type=float,
+        default=DEFAULT_JOINT_FRONTEND_LR_SCALE,
+        help="B37 D8 joint front-end discriminative-LR scale (default 1.0 = no "
+             "discrimination; 0.0 freezes the front-end). Joint-only — distinct "
+             "from the staged --p2-frontend-lr-scale.",
+    )
+    p.add_argument(
+        "--joint-parcel-lr-scale", dest="joint_parcel_lr_scale", type=float,
+        default=DEFAULT_JOINT_PARCEL_LR_SCALE,
+        help="B37 D8 joint parcel-side (+ both predictors) discriminative-LR "
+             "scale (default 1.0 = no discrimination; 0.0 = zero-LR, no update "
+             "but optimizer state retained — unlike --joint-frontend-lr-scale 0.0 "
+             "which hard-freezes the front-end). Joint-only — distinct from the "
+             "B33 P3-3b --parcel-lr-scale.",
+    )
+    p.add_argument(
+        "--m2-mask-ratio", dest="m2_mask_ratio", type=float,
+        default=DEFAULT_M2_MASK_RATIO,
+        help="#75 M2 front-end held-out band ratio (default 0.50, the 6/03 "
+             "masking lock).",
+    )
+    p.add_argument(
+        "--m2-mask-type", dest="m2_mask_type", choices=("bands", "random"),
+        default=DEFAULT_M2_MASK_TYPE,
+        help="#75 M2 mask shape. 'bands' (default, 6/03 lock) = structured 1D "
+             "spectro-temporal bands; 'random' = R-m2-random must-beat sister.",
+    )
+    p.add_argument(
+        "--m4-mask-ratio", dest="m4_mask_ratio", type=float,
+        default=DEFAULT_M4_MASK_RATIO,
+        help="#75 M4 parcel tube ratio (default 0.20, the 6/03 masking lock).",
+    )
+    p.add_argument(
+        "--m4-mask-type", dest="m4_mask_type", choices=("tube", "time_block"),
+        default=DEFAULT_M4_MASK_TYPE,
+        help="#75 M4 mask shape. 'tube' (default, 6/03 lock) = whole covered "
+             "parcel; 'time_block' = R-time-block sister. In STAGED mode "
+             "'time_block' couples to a co_temporal predictor (not yet landed → "
+             "fails loud). In JOINT mode the freq-carrying M4 predictor has full "
+             "visible-context attention, so 'time_block' is honored as a plain "
+             "mask shape (the staged coupling gate does not apply).",
+    )
+    p.add_argument(
+        "--predictor-depth", dest="predictor_depth", type=int,
+        default=DEFAULT_PREDICTOR_DEPTH,
+        help="#76 STAGED single-predictor depth (default 3, the locked P0 "
+             "center). Ignored under --ssl-mode joint (use --m2/m4-predictor-"
+             "depth).",
+    )
+    p.add_argument(
+        "--predictor-hidden", dest="predictor_hidden", type=int,
+        default=DEFAULT_PREDICTOR_HIDDEN,
+        help="#76 predictor hidden width (default 128). Shared by the staged "
+             "predictor and BOTH joint predictors.",
+    )
+    p.add_argument(
+        "--predictor-n-heads", dest="predictor_n_heads", type=int,
+        default=DEFAULT_PREDICTOR_N_HEADS,
+        help="#76 predictor attention head count (default 4). Shared by the "
+             "staged predictor and BOTH joint predictors.",
+    )
+    # --------------------------------------------------------------------------
     p.add_argument(
         "--latent-valid-override",
         choices=("support", "all_true", "parcels_supervised"),
@@ -2586,6 +2779,25 @@ def _common_build_kwargs(
         ragged_predictor=args.ragged_predictor,
         freq_pos=args.freq_pos,
         readout=args.readout,
+        # B37 (2026-06-10) encoder + joint-SSL knobs. pool/latent_depth ride the
+        # brain-model config (shared encoder, every phase); the rest are
+        # joint-only inside build_v14_experiment (inert on P3/P4). ssl_mode is
+        # resolved from "auto" in main() before this dict is built.
+        pool=args.pool,
+        latent_depth=args.latent_depth,
+        ssl_mode=args.ssl_mode,
+        lambda_m4=args.lambda_m4,
+        m2_predictor_depth=args.m2_predictor_depth,
+        m4_predictor_depth=args.m4_predictor_depth,
+        joint_frontend_lr_scale=args.joint_frontend_lr_scale,
+        joint_parcel_lr_scale=args.joint_parcel_lr_scale,
+        m2_mask_type=args.m2_mask_type,
+        m2_mask_ratio=args.m2_mask_ratio,
+        m4_mask_type=args.m4_mask_type,
+        m4_mask_ratio=args.m4_mask_ratio,
+        predictor_depth=args.predictor_depth,
+        predictor_hidden=args.predictor_hidden,
+        predictor_n_heads=args.predictor_n_heads,
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
@@ -2874,6 +3086,56 @@ def main(argv: list[str] | None = None) -> int:
     # --exca-mode always wins.
     if args.exca_mode is None:
         args.exca_mode = "retry" if args.chain else "cached"
+    # B37 D7 (2026-06-10): resolve --ssl-mode auto → 'joint' when --pool mean
+    # else 'staged', then enforce the pool↔ssl-mode coupling. The B37 joint
+    # objective is the freq-preserving mean-pool path: a cross-attn encoder
+    # cannot run it (the module rejects it too), and on an SSL phase the
+    # mean-pool freq-preserving latent has no staged single-term path — so the
+    # two must move together. Scoped: the 'mean ⇒ joint' direction is enforced
+    # only on the SSL phases (--phase 1 / --chain); --phase 4 may build a
+    # mean-pool encoder for a downstream probe where ssl_mode is irrelevant.
+    if args.ssl_mode == "auto":
+        args.ssl_mode = "joint" if args.pool == "mean" else "staged"
+    if args.ssl_mode == "joint" and args.pool != "mean":
+        raise SystemExit(
+            "--ssl-mode joint (B37 D7) requires --pool mean (the "
+            f"freq-preserving mean-pool encoder); got --pool {args.pool}."
+        )
+    _ssl_phase = bool(args.chain) or args.phase in (1, 2)
+    if _ssl_phase and args.pool == "mean" and args.ssl_mode != "joint":
+        raise SystemExit(
+            "--pool mean (B37) on an SSL phase is the joint-SSL encoder; its "
+            "freq-preserving latent has no staged single-term path. Got "
+            f"--ssl-mode {args.ssl_mode}; use joint (or omit --ssl-mode to "
+            "auto-resolve)."
+        )
+    # B37: the mean-pool encoder emits a 5-D parcel×freq×time latent. P4 has a
+    # freq-preserving readout (V14FreqPreservingPmaReadout, wired in build());
+    # P3 distill does NOT yet — V14Phase3DistillModule._student_readout feeds the
+    # M4 tap straight to a V14ParcelCollapsePMA that unpacks a 4-D (B,K,T,d)
+    # latent, so --phase 3 --pool mean would crash one batch into the forward.
+    # Fail loud at config time until the P3 freq-preserving distill readout lands
+    # (deferred — same status as the non-default P4 readouts the build() guard
+    # rejects). The full B37 P1(joint)→P3→P4 pipeline is blocked on that readout.
+    if args.phase == 3 and args.pool == "mean":
+        raise SystemExit(
+            "--pool mean (B37) on --phase 3 is not wired: the P3 distill student "
+            "readout consumes a 4-D cross_attn latent and has no freq-preserving "
+            "variant for the 5-D mean-pool latent yet (it would crash one batch "
+            "into the forward). Run P3 with the default --pool cross_attn, or "
+            "launch the joint SSL phase with --phase 1 --pool mean."
+        )
+    # The B37 joint chain (one joint-SSL phase → P3 → P4) is NOT yet wired:
+    # _build_v14_chain hardcodes the B36 staged p1→p2 split, which would run the
+    # full joint M2+M4 objective TWICE (once per staged sub-phase). Run the
+    # joint SSL phase on its own with --phase 1 --pool mean for now.
+    if args.chain and args.ssl_mode == "joint":
+        raise SystemExit(
+            "--chain with --ssl-mode joint (B37 D7) is not wired yet — the chain "
+            "builder still uses the B36 staged p1→p2 split and would run the "
+            "joint objective twice. Launch the joint SSL phase standalone with "
+            "--phase 1 --pool mean."
+        )
     # 4-GPU DDP enablement (#33). exca/submitit default tasks_per_node=1, so a
     # bare --gpus-per-node N allocates N GPUs to ONE srun task; Lightning's
     # SLURMEnvironment then waits for N ranks that never start and hangs at NCCL
@@ -2939,6 +3201,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
           f"frontend_lr_scale={args.frontend_lr_scale} neural_lag_s={args.neural_lag_s} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
+    # B37 (2026-06-10) encoder + joint-SSL config (ssl_mode already resolved from
+    # 'auto'). Surfaced so the persisted run record never silently rides the
+    # wrong pool / SSL objective / discriminative-LR split.
+    print(f"  pool={args.pool} latent_depth={args.latent_depth} ssl_mode={args.ssl_mode} "
+          f"lambda_m4={args.lambda_m4} predictor_depth=(m2={args.m2_predictor_depth},"
+          f"m4={args.m4_predictor_depth},staged={args.predictor_depth},"
+          f"hidden={args.predictor_hidden},heads={args.predictor_n_heads}) "
+          f"joint_lr_scale=(frontend={args.joint_frontend_lr_scale},"
+          f"parcel={args.joint_parcel_lr_scale}) "
+          f"mask=(m2={args.m2_mask_type}@{args.m2_mask_ratio},"
+          f"m4={args.m4_mask_type}@{args.m4_mask_ratio})")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
