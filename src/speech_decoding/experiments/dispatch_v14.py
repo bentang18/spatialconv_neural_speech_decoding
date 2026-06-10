@@ -3062,6 +3062,26 @@ def _build_v14_chain(
     return [p1, p2, p3a, p3b, p4]
 
 
+def _effective_compile_encoder(in_allocation_ddp: bool, compile_encoder: bool) -> bool:
+    """Resolve the effective ``torch.compile`` flag.
+
+    torch.compile is force-disabled on the ``--in-allocation-ddp`` warm-worker
+    path. That path runs the experiment IN-PROCESS (``cluster=None``, see the
+    ``in_allocation_ddp`` branch above) and exca pickles the live job graph — to
+    coordinate the DDP ranks and to cache the result — but the compiled forward
+    carries ``torch._dynamo`` guard weakrefs that cloudpickle cannot serialize,
+    so the job-pickle dies with ``TypeError: cannot pickle
+    'weakref.ReferenceType'`` at job creation (observed 2026-06-10, warm-worker
+    nano). The cluster path (``--cluster slurm``, submitit) is UNAFFECTED: there
+    exca pickles only the pydantic config and the model is built remotely, so
+    real/full runs keep compile's per-step win (~6x dense, 1.80->0.30 s/step).
+    Compile never amortizes its ~105 s trace tax on the short nano runs the warm
+    worker exists for anyway, so disabling it here costs nothing. Use
+    ``--cluster slurm`` to get compile on a full run.
+    """
+    return compile_encoder and not in_allocation_ddp
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     # speedup-fanout C1: --compile/--no-compile is a front-door for the
@@ -3070,6 +3090,18 @@ def main(argv: list[str] | None = None) -> int:
     # 2026-06-09: default ON. Set EXPLICITLY to "0"/"1" (like the throughput
     # levers below) so --no-compile is authoritative and a prior run's value in a
     # long-lived warm worker process can never leak into this run's read.
+    _requested_compile = args.compile_encoder
+    args.compile_encoder = _effective_compile_encoder(
+        args.in_allocation_ddp, args.compile_encoder
+    )
+    if _requested_compile and not args.compile_encoder:
+        print(
+            "[dispatch] --in-allocation-ddp: forcing --no-compile — torch.compile's "
+            "dynamo weakrefs break exca's in-process job-pickle on this path, and "
+            "compile does not amortize on nano runs anyway. Use --cluster slurm to "
+            "get compile on a full run.",
+            flush=True,
+        )
     os.environ["V14_COMPILE"] = "1" if args.compile_encoder else "0"
     if args.compile_mode:
         os.environ["V14_COMPILE_MODE"] = args.compile_mode
