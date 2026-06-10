@@ -1337,7 +1337,7 @@ class V14ParcelPerceiverModel(nn.Module):
     def _parcel_latent(
         self,
         m2: Tensor,            # (B, K, F_p, T_p, d) — frontend_ln tap
-        latent_valid: Tensor,  # (B, K) bool — covered parcels
+        latent_valid: Tensor,  # (B, K) bool — visible (covered & ~tubed) parcels
         use_ckpt: bool,
     ) -> Tensor:
         """B37 D5 thin parcel-SA-only latent → ``z`` (B, K, F_p, T_p, d).
@@ -1348,27 +1348,75 @@ class V14ParcelPerceiverModel(nn.Module):
         rows of each batch element) excludes uncovered parcels as both query and
         key — so covered parcels' output never depends on uncovered parcels'
         (don't-care) content, and the dense vs ragged-stem paths agree on
-        covered M4. NOTE (memory): the key-masked attention runs over the full
-        ``K`` (union 80), not the covered ``K_c`` — a covered-parcel ragged
-        gather is a deferred FLOP/memory optimization (see #112).
+        covered M4.
+
+        #112 memory/FLOP opt (gated on ``self.ragged_parcel`` — encoder-default
+        OFF, flipped ON by dispatch for production): the dense path keys the
+        parcel-SA over the full ``K`` (union 80) even though only ``K_c≈20``
+        parcels are visible per BT clip (one subject per clip), so the
+        ``(R, n_heads, K, K)`` attn scores blow up to ~655 MB at production scale
+        (bs=8, T_p=40, K=80). When ``ragged_parcel`` is set we gather the visible
+        parcels to a pad-to-per-batch-max ``Kk``, run the blocks over ``Kk``,
+        then scatter the kept parcels back into the full ``K`` (pad rows → a
+        trimmed scratch slot; dropped parcels → 0). Mathematically a pure FLOP
+        cut — uncovered/masked parcels contribute exact-0 softmax weight to every
+        visible parcel — so every VISIBLE parcel's z equals the dense path up to
+        float32 reduction re-tiling (~1e-6, the #91 standard; exactly
+        bit-identical only when ``Kk==K``), and dropped parcels (never read
+        downstream) go to 0 instead of dense's FFN garbage. Cuts the latent
+        attention scores ~``(K/Kk)²``≈16×. See test_v14_meanpool.
         """
         B, K, F_p, T_p, d = m2.shape
         ft = F_p * T_p
         r = B * ft
-        # (B,K,F_p,T_p,d) → (B,F_p,T_p,K,d) → (R, K, d).
-        z = m2.permute(0, 2, 3, 1, 4).reshape(r, K, d)
-        # (B,K) → bidirectional (B,K,K), broadcast to the F_p·T_p rows per b.
-        pmask_b = latent_valid.unsqueeze(2) & latent_valid.unsqueeze(1)  # (B,K,K)
+
+        # #112 ragged parcel gather: pack the visible parcels per batch element
+        # to the front (pad-to-per-batch-max ``Kk``) so the parcel-SA runs over
+        # ``Kk≤K`` keys. ``keep_idx`` (B,Kk) gathers visible-then-pad K-positions,
+        # ``keep_real`` (B,Kk) is True only at genuinely-visible slots.
+        keep_idx: Optional[Tensor] = None
+        keep_real: Optional[Tensor] = None
+        if self.ragged_parcel:
+            keep_idx, keep_real, Kk = _ragged_gather_idx(latent_valid)
+            gi = keep_idx.view(B, Kk, 1, 1, 1).expand(B, Kk, F_p, T_p, d)
+            m2 = torch.gather(m2, 1, gi)                     # (B, Kk, F_p, T_p, d)
+            valid = keep_real                                # (B, Kk) real|pad
+            k_run = Kk
+        else:
+            valid = latent_valid
+            k_run = K
+
+        # (B,k_run,F_p,T_p,d) → (B,F_p,T_p,k_run,d) → (R, k_run, d).
+        z = m2.permute(0, 2, 3, 1, 4).reshape(r, k_run, d)
+        # (B,k_run) → bidirectional (B,k_run,k_run), broadcast to the F_p·T_p
+        # rows per b. Pad slots (keep_real False) are all-masked as both query
+        # and key, so a visible parcel attends to exactly the visible set.
+        pmask_b = valid.unsqueeze(2) & valid.unsqueeze(1)               # (B,k,k)
         attn_mask = (
-            pmask_b.unsqueeze(1).expand(B, ft, K, K).reshape(r, K, K)
-        )                                                               # (R,K,K)
+            pmask_b.unsqueeze(1).expand(B, ft, k_run, k_run).reshape(r, k_run, k_run)
+        )                                                              # (R,k,k)
         for block in self.latent_parcel_blocks:
             if use_ckpt:
                 z = checkpoint(block, z, attn_mask, use_reentrant=False)
             else:
                 z = block(z, attn_mask)
-        # (R, K, d) → (B, F_p, T_p, K, d) → (B, K, F_p, T_p, d).
-        return z.reshape(B, F_p, T_p, K, d).permute(0, 3, 1, 2, 4).contiguous()
+        # (R, k_run, d) → (B, F_p, T_p, k_run, d) → (B, k_run, F_p, T_p, d).
+        z = z.reshape(B, F_p, T_p, k_run, d).permute(0, 3, 1, 2, 4)
+        if not self.ragged_parcel:
+            return z.contiguous()
+
+        # Scatter the kept parcels back into the full ``K``. Pad rows
+        # (keep_real False, from the per-batch max) dump into scratch slot ``K``
+        # which is then trimmed, so they cannot clobber a real parcel; dropped
+        # parcels stay 0 (never read downstream — loss/PMA mask via latent_valid).
+        assert keep_idx is not None and keep_real is not None  # ragged_parcel branch
+        Kk = keep_idx.shape[1]
+        scatter_idx = torch.where(
+            keep_real, keep_idx, torch.full_like(keep_idx, K)
+        ).view(B, Kk, 1, 1, 1).expand(B, Kk, F_p, T_p, d)
+        scratch = z.new_zeros(B, K + 1, F_p, T_p, d)
+        scratch.scatter_(1, scatter_idx, z)
+        return scratch[:, :K, :, :, :].contiguous()
 
     def _forward_meanpool(
         self,
@@ -3272,6 +3320,10 @@ class V14ParcelPerceiver(BaseModelConfig):
     # parcel-SA key-masks the rest out; time-SA is per-parcel) — a pure FLOP
     # cut, NOT a representation change. Cuts the latent-stack FLOPs by the
     # uncovered+masked fraction (~5-9× fewer parcels at BT: ~11 visible of 80).
+    # #112: in ``pool="mean"`` (B37) this SAME flag also gates ``_parcel_latent``
+    # (gather the visible parcels K_c≪K before the thin parcel-SA, scatter back)
+    # — the two pool modes are mutually exclusive at build time, so one flag
+    # cleanly means "ragged the parcel-axis cross-parcel op" in either mode.
     ragged_parcel: bool = False
 
     # #93 P1 token drop (2026-06-09): run the per-electrode joint token blocks

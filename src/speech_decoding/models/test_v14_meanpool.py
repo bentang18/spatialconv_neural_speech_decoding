@@ -373,6 +373,217 @@ def test_parcel_latent_checkpoint_matches_and_backprops() -> None:
         assert p.grad is not None and torch.isfinite(p.grad).all()
 
 
+# --------------------------------------------------------------------------- #
+# #112 ragged parcel latent == dense on VISIBLE parcels (memory/FLOP opt)
+# --------------------------------------------------------------------------- #
+# Gated on ``ragged_parcel`` (default OFF). The parcel-SA already key-masks
+# uncovered/masked parcels out with an exact-0 softmax weight, so gathering the
+# visible parcels to a pad-to-batch-max Kk and scattering back is a pure FLOP
+# cut: every VISIBLE parcel's z is bit-identical to dense up to float32
+# reduction re-tiling (~1e-6, the #91 standard), and dropped parcels go to 0.
+def _parcel_latent_dense_vs_ragged(enc, m2, lv, *, use_ckpt: bool = False):
+    enc.ragged_parcel = False
+    zd = enc._parcel_latent(m2, lv, use_ckpt=use_ckpt)
+    enc.ragged_parcel = True
+    zr = enc._parcel_latent(m2, lv, use_ckpt=use_ckpt)
+    enc.ragged_parcel = False
+    return zd, zr
+
+
+def test_ragged_parcel_default_off_on_mean_model() -> None:
+    assert _make().ragged_parcel is False
+
+
+def test_parcel_latent_ragged_all_covered_bit_identical() -> None:
+    """All parcels visible ⇒ identity gather/scatter ⇒ BIT-identical to dense
+    (the gather index is the identity permutation, no reduction-size change)."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=2, T_p=5, seed=0)
+    lv = torch.ones(2, K, dtype=torch.bool)
+    zd, zr = _parcel_latent_dense_vs_ragged(enc, m2, lv)
+    assert torch.equal(zr, zd)
+
+
+def test_parcel_latent_ragged_mixed_coverage_at_visible() -> None:
+    """Mixed (per-clip-varying) coverage ⇒ visible-parcel z matches dense up to
+    float32 reduction re-tiling (~1e-6); dropped parcels go to exactly 0."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=3, T_p=4, seed=1)
+    lv = torch.ones(3, K, dtype=torch.bool)
+    lv[0, 3:] = False                     # clip 0: 3 visible
+    lv[1, 5] = False                      # clip 1: 5 visible
+    lv[2, 2:] = False                     # clip 2: 2 visible (Kk = per-batch max = 5)
+    zd, zr = _parcel_latent_dense_vs_ragged(enc, m2, lv)
+    torch.testing.assert_close(zr[lv], zd[lv], atol=1e-5, rtol=1e-5)   # visible parity
+    drop = ~lv
+    assert drop.any()
+    assert (zr[drop] == 0).all()          # dropped → exactly 0 (scratch scatter)
+    # dense leaves FFN garbage at dropped parcels (don't-care) ⇒ they differ.
+    assert not torch.equal(zr[drop], zd[drop])
+
+
+def test_parcel_latent_ragged_all_uncovered_is_zero_and_finite() -> None:
+    """All parcels masked ⇒ Kk clamps to 1, every row is a pad ⇒ scratch stays
+    zero everywhere; finite, correctly-shaped, all-zero (don't-care rows)."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=2, T_p=3, seed=3)
+    lv = torch.zeros(2, K, dtype=torch.bool)
+    enc.ragged_parcel = True
+    z = enc._parcel_latent(m2, lv, use_ckpt=False)
+    assert z.shape == m2.shape
+    assert torch.isfinite(z).all()
+    assert (z == 0).all()
+
+
+def test_parcel_latent_ragged_checkpoint_matches() -> None:
+    """The checkpointed ragged path is bit-equal to the non-checkpointed ragged
+    path and yields finite, matching input gradients (incl. a fully-uncovered
+    batch element exercising the Kk-clamp)."""
+    enc = _make().train()
+    enc.ragged_parcel = True
+    m2, K = _rand_m2(enc, B=2, T_p=3, seed=4)
+    lv = torch.ones(2, K, dtype=torch.bool)
+    lv[1] = False                          # one all-uncovered element
+    base = m2.clone().requires_grad_(True)
+    ckpt = m2.clone().requires_grad_(True)
+    zb = enc._parcel_latent(base, lv, use_ckpt=False)
+    zc = enc._parcel_latent(ckpt, lv, use_ckpt=True)
+    torch.testing.assert_close(zc, zb)
+    zb.sum().backward()
+    gb = base.grad.clone()
+    enc.zero_grad(set_to_none=True)
+    zc.sum().backward()
+    assert torch.isfinite(gb).all() and torch.isfinite(ckpt.grad).all()
+    torch.testing.assert_close(ckpt.grad, gb)
+
+
+def test_parcel_latent_ragged_gradients_match_dense() -> None:
+    """Param + (visible) input grads through the ragged latent match the dense
+    latent — the visible parcels drive an identical learning signal."""
+    enc = _make().train()
+    m2, K = _rand_m2(enc, B=2, T_p=4, seed=8)
+    lv = torch.ones(2, K, dtype=torch.bool)
+    lv[0, 3:] = False
+    lv[1, 4:] = False
+
+    def run(ragged: bool):
+        enc.ragged_parcel = ragged
+        x = m2.clone().requires_grad_(True)
+        z = enc._parcel_latent(x, lv, use_ckpt=False)
+        enc.zero_grad(set_to_none=True)
+        # Sum VISIBLE parcels only — dropped parcels differ (dense FFN garbage
+        # vs ragged 0), so including them would inject a spurious dense-only grad.
+        z[lv].sum().backward()
+        pg = {n: p.grad.detach().clone()
+              for n, p in enc.named_parameters() if p.grad is not None}
+        return x.grad.detach().clone(), pg
+
+    gxd, pgd = run(False)
+    gxr, pgr = run(True)
+    enc.ragged_parcel = False
+    torch.testing.assert_close(gxr[lv], gxd[lv], atol=1e-5, rtol=1e-4)
+    keys = set(pgd) & set(pgr)
+    assert keys, "no grad-bearing latent params"
+    for k in keys:
+        torch.testing.assert_close(pgr[k], pgd[k], atol=1e-5, rtol=1e-4,
+                                   msg=f"grad mismatch @ {k}")
+
+
+def test_meanpool_ragged_parcel_equals_dense_on_covered() -> None:
+    """Full forward: ``ragged_parcel`` True vs False ⇒ M2 untouched (pre-latent)
+    and M4 bit-identical at covered parcels (mixed coverage, real drop)."""
+    kw = _mp_kw()
+    B, C = 2, 4
+    g = torch.Generator().manual_seed(3)
+    et = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"], generator=g)
+    support = torch.zeros(B, C, kw["k_parcels"])
+    for c in range(C):
+        support[:, c, c] = 1.0                 # parcels 0..3 covered, 4-5 empty
+    valid = torch.ones(B, C, dtype=torch.bool)
+    dense = _make(ragged_parcel=False).eval()
+    ragged = _make(ragged_parcel=True).eval()
+    ragged.load_state_dict(dense.state_dict())
+    od = dense(et, support, valid_mask=valid, return_taps=True)
+    orr = ragged(et, support, valid_mask=valid, return_taps=True)
+    cov = od["latent_valid"]
+    assert not cov.all()                       # the ragged drop is exercised
+    assert torch.equal(od["M2"], orr["M2"])    # the latent drop never touches M2
+    torch.testing.assert_close(od["M4"][cov], orr["M4"][cov], rtol=1e-5, atol=1e-5)
+
+
+def test_meanpool_ragged_parcel_tube_visible_parity() -> None:
+    """Full forward under a tube ``parcel_time_mask``: the tubed parcel is the
+    one the ragged latent drops, and every VISIBLE parcel's M4 matches dense."""
+    kw = _mp_kw()
+    B, C, K = 2, 8, kw["k_parcels"]
+    et, support, valid = _inputs(B, C, kw, seed=6)
+    dense = _make(ragged_parcel=False).eval()
+    ragged = _make(ragged_parcel=True).eval()
+    ragged.load_state_dict(dense.state_dict())
+    T_p = kw_T(dense, kw)
+    ptm = torch.zeros(B, K, T_p, dtype=torch.bool)
+    ptm[:, 0] = True                           # tube parcel 0
+    od = dense(et, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    orr = ragged(et, support, valid_mask=valid, return_taps=True, parcel_time_mask=ptm)
+    visible = od["latent_valid"].clone()
+    visible[:, 0] = False                      # parcel 0 tubed ⇒ not visible
+    assert visible.any()
+    torch.testing.assert_close(od["M4"][visible], orr["M4"][visible],
+                               atol=1e-5, rtol=1e-5)
+
+
+def test_meanpool_ragged_parcel_fully_uncovered_clip_mixed() -> None:
+    """End-to-end: a fully-uncovered clip (all-pad) batched with a covered clip
+    exercises the Kk-clamp + pad scatter on the real forward (not just the
+    _parcel_latent unit) — the covered clip's M4 still matches dense, the
+    uncovered clip's don't-care rows stay finite."""
+    kw = _mp_kw()
+    B, C = 2, 4
+    g = torch.Generator().manual_seed(5)
+    et = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"], generator=g)
+    support = torch.zeros(B, C, kw["k_parcels"])
+    for c in range(C):
+        support[:, c, c] = 1.0                 # parcels 0..3 covered
+    valid = torch.ones(B, C, dtype=torch.bool)
+    valid[1] = False                           # clip 1: every electrode pad → uncovered
+    dense = _make(ragged_parcel=False).eval()
+    ragged = _make(ragged_parcel=True).eval()
+    ragged.load_state_dict(dense.state_dict())
+    od = dense(et, support, valid_mask=valid, return_taps=True)
+    orr = ragged(et, support, valid_mask=valid, return_taps=True)
+    cov = od["latent_valid"]
+    assert cov[0, :4].all() and not cov[1].any()   # clip0 covered, clip1 all-uncovered
+    torch.testing.assert_close(od["M4"][cov], orr["M4"][cov], atol=1e-5, rtol=1e-5)
+    assert torch.isfinite(orr["M4"]).all()         # uncovered clip don't-care rows finite
+
+
+def test_meanpool_m_sub_slots_does_not_leak_into_parcel_latent() -> None:
+    """The mean path's parcel axis is ``k_parcels`` (K), NOT the cross-attn
+    ``L = K·m_sub_slots`` slot expansion — so m_sub_slots must not change the M4
+    axis or the ragged gather. Build a mean model with m_sub_slots=4 (the
+    R-m4-slots sister value) and confirm M4 is (B, K, F_p, T_p, d) and the
+    ragged latent still matches dense on covered parcels."""
+    kw = _mp_kw()
+    B, C = 2, 4
+    g = torch.Generator().manual_seed(9)
+    et = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"], generator=g)
+    support = torch.zeros(B, C, kw["k_parcels"])
+    for c in range(C):
+        support[:, c, c] = 1.0                 # parcels 0..3 covered, 4-5 empty
+    valid = torch.ones(B, C, dtype=torch.bool)
+    dense = _make(m_sub_slots=4, ragged_parcel=False).eval()
+    ragged = _make(m_sub_slots=4, ragged_parcel=True).eval()
+    ragged.load_state_dict(dense.state_dict())
+    od = dense(et, support, valid_mask=valid, return_taps=True)
+    orr = ragged(et, support, valid_mask=valid, return_taps=True)
+    K = kw["k_parcels"]
+    assert od["M4"].shape[1] == K                  # K = k_parcels, NOT K·4
+    assert od["latent_valid"].shape == (B, K)
+    cov = od["latent_valid"]
+    assert not cov.all()                           # ragged drop exercised
+    torch.testing.assert_close(od["M4"][cov], orr["M4"][cov], atol=1e-5, rtol=1e-5)
+
+
 def test_meanpool_default_return_is_m4_tensor() -> None:
     enc = _make().eval()
     kw = _mp_kw()
