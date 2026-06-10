@@ -1,8 +1,0 @@
-{
-  "max_test_roc_auc": 0.971073306122449,
-  "mean_test_accuracy": 0.4652057175528874,
-  "mean_test_roc_auc": 0.6425187264766122,
-  "min_test_roc_auc": 0.5007816277274836,
-  "n_rows": 15,
-  "n_tasks": 15
-}
