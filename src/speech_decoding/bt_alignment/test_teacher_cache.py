@@ -13,6 +13,7 @@ import torch
 from speech_decoding.bt_alignment.teacher_cache import (
     WhisperFeatureExtractor, write_clip_cache, write_movie_cache,
     fit_channel_stats, fit_and_save_channel_stats, movie_cache_path,
+    assert_movie_cache_resume_config,
     TargetStandardizer,
     DEFAULT_LAYER_MERGE, SINGLE_LAYER_SISTER_INDEX, DEFAULT_TEACHER_HZ, WHISPER_SR,
     WHISPER_ENCODER_WINDOW_S,
@@ -502,6 +503,28 @@ def test_fit_and_save_channel_stats_no_caches_raises(tmp_path):
         )
 
 
+def test_fit_and_save_channel_stats_writes_model_layer_merge_provenance(tmp_path):
+    """CN-3: the saved channel_stats.pt must record (model, layer_merge) so a
+    mismatched stats file applied to a teacher cache built for a different merge
+    fails loud instead of silently z-scoring the distill target with the wrong
+    1280-d affine. The bare return stays {mean, inv_std} (callers index those)."""
+    torch.manual_seed(11)
+    model, merge, d = "openai/whisper-large-v3", 8, 16
+    for m in ("a", "b"):
+        p = movie_cache_path(tmp_path, model, merge, m)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _save_features(p, torch.randn(250, d))
+    out = tmp_path / "channel_stats.pt"
+    ret = fit_and_save_channel_stats(
+        tmp_path, model=model, layer_merge=merge, out_path=out, d_model=d,
+    )
+    assert set(ret.keys()) == {"mean", "inv_std"}  # return unchanged
+    rec = torch.load(out, weights_only=True)
+    assert rec["model"] == model
+    assert rec["layer_merge"] == merge
+    assert torch.equal(rec["mean"], ret["mean"])  # file is a superset
+
+
 # --- whole-movie teacher cache (T14) -----------------------------------------
 
 
@@ -717,3 +740,77 @@ def test_write_movie_cache_detects_corrupt_save(whisper_tiny, tmp_path, monkeypa
             write_movie_cache(fe, _movie_wav(5.0), WHISPER_SR, "corrupt", tmp_path)
     finally:
         fe.close()
+
+
+# --- CN-A1: resume guard for byte-determinants not folded into the cache path ---
+
+def _fake_movie_cache(out_dir, model, merge, movie, *, chunk_s=None):
+    """Write a minimal movie cache .pt at the canonical path. chunk_s stamped only
+    when given (None mimics a legacy pre-stamp file)."""
+    p = movie_cache_path(out_dir, model, merge, movie)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"features": torch.zeros((3, 4), dtype=torch.float16)}
+    if chunk_s is not None:
+        payload["chunk_s"] = float(chunk_s)
+    torch.save(payload, p)
+    return p
+
+
+def test_resume_guard_noop_when_nothing_skipped(tmp_path):
+    # Empty skip list == full rebuild / fresh cache: never raises.
+    assert assert_movie_cache_resume_config(
+        tmp_path, "openai/whisper-tiny", "mean_all", [], chunk_s=30.0
+    ) is None
+
+
+def test_resume_guard_raises_on_per_file_chunk_s_mismatch(tmp_path):
+    model, merge = "openai/whisper-tiny", "mean_all"
+    _fake_movie_cache(tmp_path, model, merge, "venom", chunk_s=25.0)
+    with pytest.raises(ValueError, match="CN-A1"):
+        assert_movie_cache_resume_config(
+            tmp_path, model, merge, ["venom"], chunk_s=30.0
+        )
+
+
+def test_resume_guard_passes_on_matching_chunk_s(tmp_path):
+    model, merge = "openai/whisper-tiny", "mean_all"
+    _fake_movie_cache(tmp_path, model, merge, "venom", chunk_s=30.0)
+    assert_movie_cache_resume_config(
+        tmp_path, model, merge, ["venom"], chunk_s=30.0
+    )  # no raise
+
+
+def test_resume_guard_ignores_legacy_unstamped_file(tmp_path):
+    # assert-if-present: a pre-stamp file (no chunk_s key) must not block a resume
+    # — same no-cache-invalidation contract as the CN-3 legacy path.
+    model, merge = "openai/whisper-tiny", "mean_all"
+    _fake_movie_cache(tmp_path, model, merge, "venom", chunk_s=None)
+    assert_movie_cache_resume_config(
+        tmp_path, model, merge, ["venom"], chunk_s=30.0
+    )  # no raise
+
+
+def test_resume_guard_raises_on_manifest_chunk_s_mismatch(tmp_path):
+    import json
+    model, merge = "openai/whisper-tiny", "mean_all"
+    # File itself unstamped (legacy), but the manifest records the build chunk_s.
+    p = _fake_movie_cache(tmp_path, model, merge, "venom", chunk_s=None)
+    (p.parent / "build_manifest.json").write_text(json.dumps({"chunk_s": 25.0}))
+    with pytest.raises(ValueError, match="CN-A1"):
+        assert_movie_cache_resume_config(
+            tmp_path, model, merge, ["venom"], chunk_s=30.0
+        )
+
+
+def test_resume_guard_raises_on_manifest_wav_dir_mismatch(tmp_path):
+    import json
+    model, merge = "openai/whisper-tiny", "mean_all"
+    p = _fake_movie_cache(tmp_path, model, merge, "venom", chunk_s=30.0)
+    (p.parent / "build_manifest.json").write_text(
+        json.dumps({"chunk_s": 30.0, "wav_dir": "/data/wav_old"})
+    )
+    with pytest.raises(ValueError, match="CN-A1"):
+        assert_movie_cache_resume_config(
+            tmp_path, model, merge, ["venom"],
+            chunk_s=30.0, wav_dir="/data/wav_new",
+        )

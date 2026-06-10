@@ -754,6 +754,46 @@ def compute_latent_valid_3way(
     return visible, target, teacher
 
 
+def assert_electrode_alignment_integrity(
+    support: Tensor, valid_mask: Optional[Tensor],
+) -> None:
+    """Always-on electrode-row data-integrity guard (L2, 2026-06-09).
+
+    Cheap and false-positive-free on EVERY forward path — the masked-JEPA path
+    zeroes ``electrode_tokens``, never ``support`` / ``valid_mask`` (static
+    per-subject), and the Lite electrode set flips ``valid`` False on mapped
+    electrodes without touching ``support`` (both handled below). Catches
+    corruption / row-desync of the anatomy lane the hard pool routes on:
+
+      * DK ``support`` must be one-hot-or-zero (the hard parcel assignment): a row
+        summing > 1 means two parcels claim one electrode.
+      * every ``valid`` electrode must map to exactly one parcel: a valid row with
+        empty support is a ``support`` / ``valid_mask`` row desync.
+
+    The ``electrode_tokens`` ↔ ``support`` (DP1 permutation) cross-check needs
+    per-row identity carried with the front-end tokens (L1) and is tracked
+    separately. See reports/bt_alignment/electrode_desync_damage_2026_06_09.md.
+    """
+    if valid_mask is None:
+        return
+    if tuple(valid_mask.shape) != tuple(support.shape[:2]):
+        raise ValueError(
+            f"valid_mask shape {tuple(valid_mask.shape)} != (B, C) "
+            f"{tuple(support.shape[:2])} — electrode-axis row desync"
+        )
+    sup_per_row = support.sum(dim=-1)
+    if bool((sup_per_row > 1.0 + 1e-4).any()):
+        raise ValueError(
+            "DK support is not one-hot-or-zero (a row assigns >1 parcel) — "
+            "corrupted support lane / electrode-row desync"
+        )
+    if bool((valid_mask.bool() & (sup_per_row < 0.5)).any()):
+        raise ValueError(
+            "a valid electrode maps to empty support — support/valid_mask row "
+            "desync (electrode-row alignment contract violated)"
+        )
+
+
 class V14ParcelPerceiverModel(nn.Module):
     """v14 Perceiver-IO encoder with parcel-id-tagged latents.
 
@@ -1736,6 +1776,8 @@ class V14ParcelPerceiverModel(nn.Module):
                 f"support shape {tuple(support.shape)} does not match "
                 f"(B, C, K) = ({B}, {C}, {self.k_parcels})"
             )
+        # L2 always-on electrode-row data-integrity guard (2026-06-09).
+        assert_electrode_alignment_integrity(support, valid_mask)
 
         # FE-02: non-overlap Conv2d patch stem. (B, C, F, T) → (B, C, F_p, T_p, d).
         x = self.patch_stem(x_in)                                   # (B, C, F_p, T_p, d)

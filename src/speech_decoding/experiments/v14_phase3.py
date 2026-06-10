@@ -51,7 +51,11 @@ from torch import Tensor, nn
 
 from neuraltrain.optimizers import BaseOptimizer
 
-from speech_decoding.bt_alignment.teacher_cache import TargetStandardizer
+from speech_decoding.bt_alignment.teacher_cache import (
+    DEFAULT_LAYER_MERGE,
+    TargetStandardizer,
+    merge_slug,
+)
 from speech_decoding.experiments.monitors import grad_spike_monitor
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.experiments.v14_experiment import V14Experiment
@@ -475,6 +479,13 @@ class V14Phase3Experiment(V14Experiment):
     # Path to the train-only channel stats ({"mean", "inv_std"}) saved by
     # fit_channel_stats. Required when target_standardize is True.
     channel_stats_path: str | None = None
+    # CN-3 consumer self-check: the channel-stats affine is 1280-d wide for BOTH
+    # mean_all and L8, so a stats file fit under the wrong layer merge would
+    # silently z-score the distill target with the wrong frozen affine (no shape
+    # error). The dispatch CLI guards this at the junction, but a directly
+    # constructed experiment (tests/notebook/alternate dispatcher) bypasses that;
+    # _build_standardizer asserts the loaded stats' provenance matches this.
+    whisper_layer_merge: int | str = DEFAULT_LAYER_MERGE
     distill: PhaseThreeDistillationConfig = pydantic.Field(
         default_factory=PhaseThreeDistillationConfig,
     )
@@ -507,6 +518,19 @@ class V14Phase3Experiment(V14Experiment):
         stats = torch.load(
             self.channel_stats_path, map_location="cpu", weights_only=True,
         )
+        # CN-3: assert-if-present provenance match (legacy untagged stats pass →
+        # no cache invalidation, same contract as the dispatch-junction guard).
+        stats_merge = stats.get("layer_merge") if isinstance(stats, dict) else None
+        if stats_merge is not None and merge_slug(stats_merge) != merge_slug(self.whisper_layer_merge):
+            raise ValueError(
+                f"channel_stats_path {self.channel_stats_path!r} was fit on "
+                f"layer_merge={stats_merge!r} ({merge_slug(stats_merge)}) but the "
+                f"experiment's whisper_layer_merge={self.whisper_layer_merge!r} "
+                f"({merge_slug(self.whisper_layer_merge)}) — the 1280-d affine "
+                "would z-score the distill target with the wrong frozen stats. "
+                "Re-fit channel stats for this merge, or set whisper_layer_merge "
+                "to match (CN-3)."
+            )
         return TargetStandardizer(stats["mean"], stats["inv_std"])
 
     def _build_brain_module(self, train_loader):  # type: ignore[override]

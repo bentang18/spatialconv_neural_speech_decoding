@@ -57,6 +57,7 @@ def _attn_with_block_diag_mask(dtype: torch.dtype = torch.float32):
     return attn, latents, electrodes, key_mask, (B, L, N)
 
 
+@pytest.mark.must_pass_before_dispatch
 def test_a1_off_parcel_pool_weight_is_exactly_zero() -> None:
     """Every blocked (slot, token) pooling weight is 0.0 EXACTLY (not ≤ tol)."""
     attn, latents, electrodes, key_mask, (B, L, N) = _attn_with_block_diag_mask()
@@ -168,6 +169,7 @@ def test_a1_no_coverage_row_keeps_forward_and_backward_finite() -> None:
     assert torch.equal(nocov_out, torch.zeros_like(nocov_out))
 
 
+@pytest.mark.must_pass_before_dispatch
 def test_a1_model_forward_uses_one_hot_support_as_hard_assignment() -> None:
     """End-to-end: with a one-hot DK ``support``, ablating an electrode's
     input changes ONLY its own parcel's pre-self-attn latent — off-parcel
@@ -200,6 +202,52 @@ def test_a1_model_forward_uses_one_hot_support_as_hard_assignment() -> None:
     assert delta_off == 0.0, (
         f"off-parcel latents must be bit-identical under the hard pool; "
         f"got max |Δ| = {delta_off:.3e}"
+    )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_a1_parcel_slot_order_is_parcel_major_under_subslots() -> None:
+    """Golden-tracer for the cross-cutting parcel-slot invariant ``l = p·M + s``
+    (parcel-major). With ``m_sub_slots`` > 1 the encoder output slot axis is
+    ``L = K·M``; ablating an electrode assigned to parcel ``p`` must move ONLY
+    that parcel's contiguous slot block ``[p·M, p·M+M)`` and leave every other
+    parcel's slots bit-identical. The transposed order ``l = s·K + p`` would
+    scatter parcel ``p`` across slots ``{p, K+p, …}`` and fail this — exactly the
+    silent reshape-transpose risk flagged in the architecture join audit. Run at
+    ``depth_self_attn=0`` so latent self-attn doesn't diffuse the routing."""
+    torch.manual_seed(0)
+    K = 4  # parcels
+    M = 2  # sub-slots — deliberately >1 (B29 default is 1) to exercise slot order
+    kw = dict(
+        n_freq_bins=6, n_time_bins=4, k_parcels=K,
+        d_model=32, n_heads=4, depth_self_attn=0, m_sub_slots=M,
+        patch_kernel_freq=3,
+    )
+    model = V14ParcelPerceiverModel(**kw).eval()
+    B, C = 1, 4
+    electrodes = torch.randn(B, C, kw["n_time_bins"], kw["n_freq_bins"])
+    support = torch.zeros(B, C, K)
+    for c in range(C):
+        support[0, c, c] = 1.0  # electrode c → parcel c (one-hot)
+
+    target_p = 2  # ablate electrode 2 → parcel 2 → slots [2·M, 2·M+M) = [4, 6)
+    with torch.no_grad():
+        base = model(electrodes, support)        # (B, L=K·M, T_p, d)
+        ablated = electrodes.clone()
+        ablated[0, target_p] = 0.0
+        pert = model(ablated, support)
+
+    assert base.shape[1] == K * M, "slot axis must be L = K·M"
+    own = slice(target_p * M, target_p * M + M)
+    delta_own = (base[:, own] - pert[:, own]).abs().max().item()
+    off_mask = torch.ones(K * M, dtype=torch.bool)
+    off_mask[own] = False
+    delta_off = (base[:, off_mask] - pert[:, off_mask]).abs().max().item()
+    assert delta_own > 0.0, "ablating parcel p's electrode must move its own slots"
+    assert delta_off == 0.0, (
+        f"only parcel {target_p}'s contiguous slot block [{target_p*M}, "
+        f"{target_p*M+M}) may move — a transposed slot order leaks elsewhere; "
+        f"got off-block max |Δ| = {delta_off:.3e}"
     )
 
 

@@ -310,6 +310,33 @@ def _apply_extractor_cache(
     extractor.infra.folder = folder
 
 
+def _assert_support_valid_config_agree(
+    dk_extractor: V14DKHardSupportExtractor,
+    valid_mask_extractor: ElectrodeValidMask,
+) -> None:
+    """DP9 fail-loud (data-integrity doctrine L4). ``support`` and ``valid_mask``
+    are joined downstream by bare positional electrode index (``v14_encoder``),
+    so they MUST be built over the SAME electrode-defining config — same parcel
+    vocabulary, same unmapped policy, same padding, same corpus root, same event
+    type. They are matched by hand at the construction site today; a silent edit
+    to one would make row ``c`` of ``support`` and row ``c`` of ``valid_mask``
+    describe different electrodes with no error. Enforce the convention here.
+    See reports/bt_alignment/electrode_desync_damage_2026_06_09.md (DP9)."""
+    shared = ("parcel_labels", "unmapped_policy", "c_max", "bt_root", "event_types")
+    mismatched = {
+        field: (getattr(dk_extractor, field), getattr(valid_mask_extractor, field))
+        for field in shared
+        if getattr(dk_extractor, field) != getattr(valid_mask_extractor, field)
+    }
+    if mismatched:
+        raise ValueError(
+            "support/valid_mask electrode-config disagree — rows would describe "
+            f"different electrodes (DP9): {mismatched}. Build both extractors "
+            "with identical parcel_labels / unmapped_policy / c_max / bt_root / "
+            "event_types."
+        )
+
+
 def _build_optim_cfg(
     *,
     lr: float,
@@ -1009,7 +1036,7 @@ def build_v14_experiment(
     # #80 whole-movie raw-|STFT| cache root. Default ON: when an extractor-cache
     # root exists (DCC) and the caller hasn't overridden, derive a sibling
     # ``v14_spec_cache`` dir so the per-run session_robust_z whole-movie STFT is
-    # materialized to an fp16 memmap ONCE and every later same-front-end-config run
+    # materialized to an fp32 memmap ONCE and every later same-front-end-config run
     # slices it (no 9-min recompute). OFF on laptop/tests (no cache root) and when
     # ``disable_spec_cache``. Armed only on the default raw MultiStftView built
     # below; a custom electrode_tokens_extractor manages its own spec_cache_dir.
@@ -1037,22 +1064,27 @@ def build_v14_experiment(
             session_robust_z=session_robust_z,
             spec_cache_dir=spec_cache_dir,
         )
-        # #17: only attach the lof_* kwargs when LOF is ON. Off → none of them are
-        # forwarded, so the view keeps its field defaults and the multi-TB STFT
-        # cache uid is untouched. NOTE the load-bearing protection is this NOT-
-        # passing, not exclude_defaults: a stray ``--lof-threshold 2.0`` without
-        # ``--lof-bad-channels`` would, IF forwarded, be a non-default value that
-        # exclude_defaults does NOT drop → it would perturb the cache. Not
-        # forwarding it is what keeps the cache stable. On → drop_bads=True is
-        # forced (the view validator requires it; default-False = the prior
-        # no-drop behaviour) and threshold/n_neighbors/report_path flow through.
+        # DP4 (2026-06-09): MNE-LOF bad-channel drop is GATED OFF at dispatch.
+        # LOF (drop_bads) removes electrodes PER-TRIAL inside the front-end before
+        # the scatter, packing the survivors into rows 0..k-1. But the DK
+        # ``support`` / ``valid_mask`` extractors are per-SUBJECT static tensors
+        # built from the full ``voltage_electrode_order`` — they cannot represent a
+        # per-trial drop. So electrode_tokens (LOF-packed) would desync from
+        # support/valid_mask (full voltage order) and silently route voltages into
+        # the wrong parcels, even for a single subject. Re-enable only after
+        # support/valid_mask are made per-event and drop the same LOF survivors in
+        # lockstep (the removed kwargs-forwarding wiring lives in git history; the
+        # view-level LOF mechanism stays covered by extractors/test_lof_wiring.py).
+        # See reports/bt_alignment/electrode_desync_damage_2026_06_09.md.
         if lof_bad_channels:
-            mstft_kwargs.update(
-                lof_bad_channels=True,
-                drop_bads=True,
-                lof_threshold=lof_threshold,
-                lof_n_neighbors=lof_n_neighbors,
-                lof_report_path=lof_report_path,
+            raise ValueError(
+                "lof_bad_channels is gated OFF (DP4 row-alignment hazard): LOF "
+                "drops electrodes per-trial before the front-end scatter, but the "
+                "DK support / valid_mask extractors are per-subject static and "
+                "cannot mirror a per-trial drop, so electrode_tokens would desync "
+                "from support/valid_mask (voltages routed to the wrong parcels). "
+                "Keep LOF off until per-event support/valid_mask plumbing lands. "
+                "See reports/bt_alignment/electrode_desync_damage_2026_06_09.md."
             )
         electrode_tokens_extractor = MultiStftView(**mstft_kwargs)
     _apply_extractor_cache(
@@ -1183,6 +1215,7 @@ def build_v14_experiment(
         unmapped_policy="zero", electrode_set=electrode_set,
     )
     _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
+    _assert_support_valid_config_agree(dk_extractor, valid_mask_extractor)
 
     # B29 Item 11/12 per-clip metadata extractors. Each emits a
     # 1-element TimedArray that the Lightning collator stacks into a
@@ -1400,6 +1433,9 @@ def build_v14_experiment(
             # target_standardize=True; the R-no-target-standardize sister sets
             # target_standardize=False and may leave this None).
             "channel_stats_path": channel_stats_path,
+            # CN-3 consumer self-check: lets _build_standardizer assert the loaded
+            # channel-stats provenance matches the merge used for the teacher.
+            "whisper_layer_merge": whisper_layer_merge,
             # B33 §5 3b discriminative-LR scales (front-end base·scale, parcel
             # base·scale, connector base). No effect under 3a.
             "frontend_lr_scale": frontend_lr_scale,
@@ -2837,17 +2873,45 @@ def _validate_channel_stats_path(args) -> None:
     catches the directory mistake too. Only meaningful with target-std ON and a
     path supplied (the ``is None`` case is each caller's separate guard).
     """
-    if (
-        args.target_standardize
-        and args.channel_stats_path is not None
-        and not Path(args.channel_stats_path).is_file()
-    ):
+    if not (args.target_standardize and args.channel_stats_path is not None):
+        return
+    if not Path(args.channel_stats_path).is_file():
         raise ValueError(
             f"--channel-stats-path {args.channel_stats_path!r} is not a file. "
             "Target standardization (B33 default) loads it at P3a; a missing or "
             "directory path would crash hours into the chain. Build the .pt with "
             "the channel_stats fit helper, or pass --no-target-standardize."
         )
+    # CN-3: the per-channel affine is the SAME width (1280-d) across layer-merges,
+    # so a stats file fit on one merge applied to a teacher cache built for another
+    # z-scores the distillation target with the WRONG frozen affine SILENTLY (no
+    # shape error). channel_stats_path / whisper_layer_merge are independent free
+    # args — guard their coupling here, at the one junction both are known.
+    # Assert-if-present: legacy stats files (no provenance) and unreadable metadata
+    # are skipped (no new failure mode), so this only fires on a true mismatch.
+    stats_merge = None
+    try:
+        import torch
+
+        rec = torch.load(
+            args.channel_stats_path, map_location="cpu", weights_only=True,
+        )
+        stats_merge = rec.get("layer_merge") if isinstance(rec, dict) else None
+    except Exception:
+        stats_merge = None
+    if stats_merge is not None:
+        from speech_decoding.bt_alignment.teacher_cache import merge_slug
+
+        want = merge_slug(args.whisper_layer_merge)
+        got = merge_slug(stats_merge)
+        if got != want:
+            raise ValueError(
+                f"--channel-stats-path was fit on layer_merge={stats_merge!r} "
+                f"({got}) but --whisper-layer-merge={args.whisper_layer_merge!r} "
+                f"({want}). The 1280-d per-channel affine would silently z-score "
+                "the distillation target with the wrong frozen stats (CN-3). Re-fit "
+                "channel stats for this layer_merge, or pass the matching cache."
+            )
 
 
 def _build_v14_chain(

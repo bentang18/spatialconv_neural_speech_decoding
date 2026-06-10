@@ -552,3 +552,42 @@ def test_build_standardizer_roundtrips_train_only_stats(tmp_path: Path) -> None:
     assert standardizer is not None
     x = torch.randn(2, _T_P, _WHISPER_D)
     torch.testing.assert_close(standardizer(x), x)
+
+
+def test_build_standardizer_raises_on_layer_merge_mismatch(tmp_path: Path) -> None:
+    """CN-3 consumer self-check: a stats file fit under a different layer merge
+    than the experiment's whisper_layer_merge would silently z-score the distill
+    target with the wrong 1280-d affine (no shape error). _build_standardizer
+    must fail loud regardless of entry path (this bypasses the dispatch guard)."""
+    stats_path = tmp_path / "channel_stats.pt"
+    torch.save(
+        {
+            "mean": torch.zeros(_WHISPER_D),
+            "inv_std": torch.ones(_WHISPER_D),
+            "layer_merge": 8,  # fit on single-layer L8
+        },
+        stats_path,
+    )
+    xp = V14Phase3Experiment.model_construct(
+        phase="3a", target_standardize=True, channel_stats_path=str(stats_path),
+        whisper_layer_merge="mean_all",  # but the run uses mean_all
+    )
+    with pytest.raises(ValueError, match="CN-3"):
+        xp._build_standardizer()
+
+
+def test_build_standardizer_passes_on_matching_layer_merge(tmp_path: Path) -> None:
+    stats_path = tmp_path / "channel_stats.pt"
+    torch.save(
+        {
+            "mean": torch.zeros(_WHISPER_D),
+            "inv_std": torch.ones(_WHISPER_D),
+            "layer_merge": "mean_all",
+        },
+        stats_path,
+    )
+    xp = V14Phase3Experiment.model_construct(
+        phase="3a", target_standardize=True, channel_stats_path=str(stats_path),
+        whisper_layer_merge="mean_all",
+    )
+    assert xp._build_standardizer() is not None  # no raise

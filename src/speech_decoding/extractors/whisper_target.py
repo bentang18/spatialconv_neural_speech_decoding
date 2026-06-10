@@ -7,11 +7,18 @@ collated to ``(B, 250, 1280)``).
 
 THE CLOCK TRAP (FLAG 9). The teacher cache is one dense stream PER MOVIE indexed
 by movie-audio time (``t0_movie_s == 0``; frame ``f`` ↔ ``f / rate_hz`` seconds
-into the movie). So the join MUST use the movie-clock onset — the transcript
-``words_df['start']``, threaded onto the event as ``movie_onset_s`` — NOT the
-neural-clock ``est_idx / 2048`` (the event's ``start``). The two diverge 235-904 s
-within a single BT trial. Δlag slides only the NEURAL response window; the
-audio-keyed teacher is unshifted, so this extractor never sees ``neural_lag_s``.
+into the movie). So the join MUST use the movie-clock onset — ``movie_onset_s``,
+threaded onto the event by ``word_events`` from BT's trigger track
+(``np.interp(est_idx -> movie_time)``; == ``words_df['start']`` to ~ms for verbal
+anchors, and the only correct source for nonverbal anchors and across pauses) —
+NOT the neural-clock ``est_idx / 2048`` (the event's ``start``). The two diverge
+235-904 s within a single BT trial. Δlag slides only the NEURAL response window;
+the audio-keyed teacher is unshifted, so this extractor never sees ``neural_lag_s``.
+
+RIP↔BT OFFSET. A second, smaller clock skew is between OUR rip audio (which the
+cache is built from) and BT's transcript clock: a per-film lead-in. Two films
+exceed tolerance and are corrected by ``_movie_clock_offset`` before slicing
+(see ``_MOVIE_CLOCK_OFFSET_S``); the other 10 are within ~1 frame.
 
 The dense stream is memory-mapped (``mmap=True``) and memoised per movie: a slice
 reads only its 250×1280 window off disk, so workers share the OS page cache
@@ -45,6 +52,36 @@ def _resolve_movie(subject_id: int, trial_id: int) -> str:
     from neuroprobe.config import BRAINTREEBANK_SUBJECT_TRIAL_MOVIE_NAME_MAPPING
 
     return BRAINTREEBANK_SUBJECT_TRIAL_MOVIE_NAME_MAPPING[f"btbank{subject_id}_{trial_id}"]
+
+
+# Per-movie rip↔BT clock offset (seconds; ADDED to ``movie_onset_s`` before the
+# teacher slice). OUR rip files under ``audio/bt_16k`` — the source the teacher
+# cache is built from (cache WAVs are md5-identical to the rips) — carry a
+# film-specific lead-in vs BT's transcript movie clock, so cache frame
+# ``round(movie_onset_s·rate)`` lands earlier than the matching audio. Two of the
+# 12 P3 movies exceed the ~1-frame@8 Hz pooling tolerance; both are the right
+# content at the wrong offset (NOT corrupt), derived and dual-verified (scalar-RMS
+# AND 128-d-mel alignment gates, broken/fixed/control cleanly separated) in
+# ``reports/bt_alignment_p3_audit_2026_06_08/`` (``run_scale_gate.py`` +
+# ``verify_offsets_mel.py``). Each value is a piecewise-constant schedule
+# ``((threshold_s, offset_s), …)`` sorted by movie time; the offset applied to an
+# onset is the last segment whose ``threshold_s ≤ onset``. Films not listed need
+# no correction. NOTE: tied to the CURRENT rip files — re-rip ⇒ re-measure.
+_MOVIE_CLOCK_OFFSET_S: dict[str, tuple[tuple[float, float], ...]] = {
+    "fantastic-mr-fox": ((0.0, 1.75),),          # constant +1.75 s lead-in
+    "lotr-2": ((0.0, 0.1), (6000.0, 1.0)),       # reel-join step at ~100 min
+}
+
+
+def _movie_clock_offset(movie: str, onset_s: float) -> float:
+    """Rip↔BT clock offset (s) to ADD to ``onset_s`` for ``movie`` (0.0 if none)."""
+    offset = 0.0
+    for threshold, value in _MOVIE_CLOCK_OFFSET_S.get(movie, ()):  # sorted by threshold
+        if onset_s >= threshold:
+            offset = value
+        else:
+            break
+    return offset
 
 
 class WhisperTargetExtractor(BaseStatic):
@@ -137,8 +174,11 @@ class WhisperTargetExtractor(BaseStatic):
                 "movie shorter than the clip length?"
             )
 
+        # Correct OUR rip's per-film clock offset vs BT's transcript clock — the
+        # teacher cache inherits the rip lead-in (see _MOVIE_CLOCK_OFFSET_S).
+        onset_s = movie_onset_s + _movie_clock_offset(movie, movie_onset_s)
         # t0_movie_s == 0 (asserted on load) ⇒ frame index = round(onset · rate).
-        frame0 = round(movie_onset_s * self.rate_hz)
+        frame0 = round(onset_s * self.rate_hz)
         clamped = min(max(frame0, 0), total - n)
         if clamped != frame0:
             # A word within the last clip_s of the cached stream: clamp back so
@@ -149,7 +189,7 @@ class WhisperTargetExtractor(BaseStatic):
             logger.warning(
                 "WhisperTargetExtractor: clamped teacher window for %s "
                 "(onset=%.2fs, frame0=%d, total=%d, clamped_to=%d); count=%d",
-                movie, movie_onset_s, frame0, total, clamped, self._n_clamped,
+                movie, onset_s, frame0, total, clamped, self._n_clamped,
             )
 
         # Exactly (n, d_model) by construction: clamped ∈ [0, total-n] (so the

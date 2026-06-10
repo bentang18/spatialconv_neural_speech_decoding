@@ -75,3 +75,10 @@ docs/*.pdf
 reports/wandb.md
 **/wandb_key*
 *.secret
+
+# P3 alignment "become one with the data" viz (large mp4/npz — local-only deliverable)
+p3_alignment_viz/
+
+# Internal audit/handoff reports — keep OFF the public repo (public-main policy).
+# Point-in-time audit artifacts live locally only; never publish to public main.
+reports/

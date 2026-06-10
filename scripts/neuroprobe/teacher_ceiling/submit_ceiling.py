@@ -32,20 +32,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# SINGLE SOURCE OF TRUTH: import the verified (subject, trial) -> movie mapping
+# from run_extract_per_trial (which is itself verified against the authoritative
+# upstream neuroprobe/config.py BRAINTREEBANK_SUBJECT_TRIAL_MOVIE_NAME_MAPPING).
+# Python adds this script's directory to sys.path[0], so the bare import works
+# both when this file is run as a script and when run_probe_ceiling imports it.
+# Do NOT keep a second copy here — a drifted duplicate previously mispaired
+# (2,4)->black-panther (correct: avengers-infinity-war) and (10,1)->ant-man
+# (correct: spider-man-far-from-home), feeding wrong-movie audio into extraction.
+from run_extract_per_trial import SUBJECT_TRIAL_MOVIE
 
 NEUROPROBE_LITE_SUBJECT_TRIALS = [
     (1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
     (4, 0), (4, 1), (7, 0), (7, 1), (10, 0), (10, 1),
 ]
-
-SUBJECT_TRIAL_MOVIE = {
-    (1, 1): "the-martian", (1, 2): "thor-ragnarok",
-    (2, 0): "venom", (2, 4): "black-panther",
-    (3, 0): "cars-2", (3, 1): "lotr-1",
-    (4, 0): "shrek-the-third", (4, 1): "megamind",
-    (7, 0): "cars-2", (7, 1): "megamind",
-    (10, 0): "cars-2", (10, 1): "ant-man",
-}
 
 
 def parse_subject_trial(s: str) -> tuple[int, int]:
@@ -159,6 +159,8 @@ def build_extract_sbatch(
         "",
         "set -euo pipefail",
         f"cd {args.repo_root}",
+        "# Compute nodes are offline; load the FM from the shared home HF cache.",
+        "export HF_HUB_OFFLINE=1",
         "",
         "# Read line ${SLURM_ARRAY_TASK_ID}+1 (skip header) from cohort.tsv",
         f"COHORT={shlex.quote(str(cohort_file))}",
@@ -166,7 +168,7 @@ def build_extract_sbatch(
         'IFS=$\'\\t\' read -r SID TID MOVIE WAV <<< "$LINE"',
         'echo "[extract] sub_${SID} trial${TID} movie=${MOVIE} wav=${WAV}"',
         "",
-        ".venv/bin/python scripts/neuroprobe/teacher_ceiling/run_extract_per_trial.py \\",
+        f".venv/bin/python {args.extract_script} \\",
         '    --subject-id "$SID" --trial-id "$TID" \\',
         '    --wav-path "$WAV" \\',
         f'    --out-dir {shlex.quote(str(feature_cache))} \\',
@@ -232,6 +234,11 @@ def parse_args() -> argparse.Namespace:
         help="persistent /hpc tier dir for per-trial NPZ features",
     )
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
+    p.add_argument(
+        "--extract-script",
+        default="scripts/neuroprobe/teacher_ceiling/run_extract_per_trial.py",
+        help="per-trial extractor entry point (swap for the wav2vec2 sibling)",
+    )
     p.add_argument("--model", default="openai/whisper-large-v3")
     p.add_argument(
         "--subject-trials", nargs="*", default=None,

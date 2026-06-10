@@ -41,6 +41,7 @@ from speech_decoding.bt_alignment.teacher_cache import (
     WHISPER_SR,
     MovieCacheEntry,
     WhisperFeatureExtractor,
+    assert_movie_cache_resume_config,
     fit_and_save_channel_stats,
     merge_slug,
     movie_cache_path,
@@ -196,6 +197,11 @@ def main(argv: list[str] | None = None) -> int:
         m for m in slugs
         if args.overwrite or not _expected_path(out_dir, args.model, merge, m).exists()
     ]
+    skipped = [m for m in slugs if m not in set(to_build)]
+    assert_movie_cache_resume_config(
+        out_dir, args.model, merge, skipped,
+        chunk_s=args.chunk_s, wav_dir=args.wav_dir,
+    )
 
     entries: list[MovieCacheEntry] = []
     if to_build:

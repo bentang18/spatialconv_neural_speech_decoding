@@ -883,20 +883,23 @@ def test_c3_prepare_fits_per_session(monkeypatch) -> None:
     assert 6.0 < float(ratio) < 13.0
 
 
-def test_c3_scatter_to_noncontiguous_global_indices(monkeypatch) -> None:
-    """BUG #1 regression, hardened against a wrong-index scatter.
+def test_c3_scatter_to_per_subject_voltage_rows(monkeypatch) -> None:
+    """Robust-z scatter regression, hardened against a wrong-index scatter
+    (post DP1/DP2 fix, 2026-06-09).
 
     A session with FEWER electrodes than the cohort-global dimension must apply
     (the apply path scatters every clip into a ``(C_global, F, T)`` array; fit-side
-    stats are session-indexed). Critically, this session's channels map to
-    NON-CONTIGUOUS, NON-IDENTITY global rows (``_get_channels`` from a shuffled
-    cohort), so a scatter that used ``range(len)`` or reversed indices instead of
-    ``_get_channels`` would place stats on the WRONG electrodes and be caught.
+    stats are session-indexed). Per the row-alignment fix, this session's channels
+    scatter to their OWN per-subject voltage positions ``range(len(ch_names))`` —
+    NOT the shared last-writer-wins global ``_channels`` index, which permuted rows
+    across subjects and was the desync bug. ``C_global`` is still the cohort row
+    count ``max(_channels.values())+1``, so the 4 real rows land at 0..3 and the
+    remaining cohort rows are zero pad.
 
-    The expected output is built INDEPENDENTLY — each global row's stats come
-    from that channel's own session-indexed median/σ at the row ``_get_channels``
-    assigns — NOT by re-running ``norm.transform`` (which would be tautological
-    against a wrong-index scatter)."""
+    The expected output is built INDEPENDENTLY — each output row's stats come from
+    that channel's own session-indexed median/σ at the row the scatter assigns —
+    NOT by re-running ``norm.transform`` (which would be tautological against a
+    wrong-index scatter)."""
     from neuralset.base import TimedArray
     from speech_decoding.extractors.normalize import SessionRobustZNormalizer
     from speech_decoding.extractors.reference import CARIeegExtractor
@@ -904,12 +907,14 @@ def test_c3_scatter_to_noncontiguous_global_indices(monkeypatch) -> None:
     view = _make_multi_stft_view(session_robust_z=True)
     view._stats_ready = True
     floor = view.session_z_sigma_floor
-    # Cohort-global = 8 rows; this session owns 4 channels at scrambled rows.
+    # Cohort-global = 8 rows; this session owns 4 channels. The cohort dict only
+    # sets C_global=8; with the fix the session always scatters to voltage rows
+    # 0..3, independent of the (here scrambled) global name→index map.
     cohort = {"e0": 0, "e9": 1, "e2": 2, "e7": 3, "e1": 4, "e5": 5, "e3": 6, "e8": 7}
     view._channels.update(cohort)
-    sess_ch = ["e7", "e2", "e8", "e1"]  # → global rows [3, 2, 7, 4]
+    sess_ch = ["e7", "e2", "e8", "e1"]  # → per-subject voltage rows [0, 1, 2, 3]
     g_idx = view._get_channels(sess_ch)
-    assert g_idx == [3, 2, 7, 4]  # non-contiguous, non-identity
+    assert g_idx == [0, 1, 2, 3]  # per-subject voltage order, not the global remap
 
     rng = np.random.default_rng(7)
     # Distinct per-channel scale so a mis-routed scatter changes the numbers.
@@ -1232,17 +1237,21 @@ def test_spec_cache_stats_sidecar_self_heals_legacy_cache(tmp_path, monkeypatch)
     )
 
 
-def test_spec_cache_scatter_to_noncontiguous_global(monkeypatch) -> None:
-    """``_scatter_spec_to_global`` places each session row at the global index
-    ``_get_channels`` assigns (mirroring the base waveform scatter, neuro.py:453),
-    NOT ``range(len)``. Non-contiguous, non-identity rows would expose a wrong-
-    index scatter; absent global rows stay exactly 0 (= |STFT|(0) for raw)."""
+@pytest.mark.must_pass_before_dispatch
+def test_spec_cache_scatter_to_per_subject_voltage_rows(monkeypatch) -> None:
+    """``_scatter_spec_to_global`` places each session row at its OWN per-subject
+    voltage position ``range(len(ch_names))`` (post DP1/DP2 fix, 2026-06-09) — NOT
+    the shared last-writer-wins global ``_channels`` index, which permuted rows
+    across subjects and was the desync bug. ``C_global`` is still
+    ``max(_channels.values())+1``; absent global rows stay exactly 0
+    (= |STFT|(0) for raw). Mirrors the apply-path and robust-z scatters row-for-
+    row so cache and recompute agree."""
     view = _make_multi_stft_view(spec_cache_dir="/tmp/spec_cache_unit")
     cohort = {"e0": 0, "e9": 1, "e2": 2, "e7": 3, "e1": 4, "e5": 5, "e3": 6, "e8": 7}
-    view._channels.update(cohort)
-    sess_ch = ["e7", "e2", "e8", "e1"]  # → global rows [3, 2, 7, 4]
+    view._channels.update(cohort)  # only sets C_global=8
+    sess_ch = ["e7", "e2", "e8", "e1"]  # → per-subject voltage rows [0, 1, 2, 3]
     g_idx = view._get_channels(sess_ch)
-    assert g_idx == [3, 2, 7, 4]
+    assert g_idx == [0, 1, 2, 3]
 
     rng = np.random.default_rng(11)
     spec_session = torch.from_numpy(rng.standard_normal((4, 5, 6)).astype(np.float32))
@@ -1365,3 +1374,257 @@ def test_spec_cache_hit_validates_f_bins(tmp_path, monkeypatch) -> None:
     event2, _ = _cache_view_harness(view2, rec, ch, monkeypatch)
     with pytest.raises(ValueError, match="f_bins"):
         view2.prepare([event2])
+
+
+def test_spec_cache_hit_validates_stft_geometry(tmp_path, monkeypatch) -> None:
+    """LG4: an STFT-geometry default edit is invisible to the cache key
+    (``infra.uid()`` excludes default-valued fields; the namespace digest folds
+    only raw_bins/front_end/apply_log). A post-fix cache records the geometry in
+    its sidecar, so a hit whose stored ``hop_length`` disagrees with the live
+    config must raise rather than slice a stale feature grid."""
+    view1 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    # Sanity: the build records the geometry the guard will check.
+    assert "hop_length" in view1._spec_cache_geometry()
+    ch = ["e0", "e1"]
+    rng = np.random.default_rng(11)
+    rec = rng.standard_normal((2, 2048 * 3)).astype(np.float32)
+    event1, _ = _cache_view_harness(view1, rec, ch, monkeypatch)
+    view1.prepare([event1])
+
+    json_path = next(tmp_path.rglob("*.json"))
+    meta = json.loads(json_path.read_text())
+    assert int(meta["hop_length"]) == view1.hop_length  # geometry made it to disk
+    meta["hop_length"] = int(meta["hop_length"]) * 2  # simulate a default edit
+    json_path.write_text(json.dumps(meta))
+
+    view2 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    event2, _ = _cache_view_harness(view2, rec, ch, monkeypatch)
+    with pytest.raises(ValueError, match="hop_length"):
+        view2.prepare([event2])
+
+
+def test_spec_cache_legacy_meta_without_geometry_is_not_invalidated(
+    tmp_path, monkeypatch
+) -> None:
+    """LG4 non-invalidation: a legacy sidecar predating the geometry keys must
+    still hit (the guard is assert-IF-present), so existing ``/work`` caches are
+    not silently torched by shipping the fix."""
+    view1 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    ch = ["e0", "e1"]
+    rng = np.random.default_rng(12)
+    rec = rng.standard_normal((2, 2048 * 3)).astype(np.float32)
+    event1, _ = _cache_view_harness(view1, rec, ch, monkeypatch)
+    view1.prepare([event1])
+
+    # Strip the geometry keys to mimic a cache built before this fix.
+    json_path = next(tmp_path.rglob("*.json"))
+    meta = json.loads(json_path.read_text())
+    for k in ("hop_length", "nperseg_low", "nperseg_mid", "nperseg_hi", "log_eps"):
+        meta.pop(k, None)
+    json_path.write_text(json.dumps(meta))
+
+    view2 = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path), session_robust_z=False, c_max=None,
+    )
+    event2, _ = _cache_view_harness(view2, rec, ch, monkeypatch)
+    view2.prepare([event2])  # must NOT raise — legacy cache still served
+
+
+# --------------------------------------------------------------------------- #
+# Electrode-row alignment (DP1/DP2 fix, 2026-06-09)                            #
+#                                                                             #
+# MultiStftView must scatter each event's electrode_tokens into THAT event's   #
+# own per-subject voltage order (enumerate(ch_names)), NOT the shared          #
+# last-writer-wins global ``_channels`` index. The global index permutes rows  #
+# across subjects in a pooled prepare() (DP1) and silently drops a subject's   #
+# own electrodes when two alias one global row (DP2) — desyncing               #
+# electrode_tokens[c] from voltage_electrode_order(subject)[c], and so from    #
+# the DK support / valid_mask extractors. Regression for                       #
+# reports/bt_alignment/electrode_desync_damage_2026_06_09.md.                  #
+# --------------------------------------------------------------------------- #
+
+import pathlib as _pathlib
+
+_BT_CACHE_VIEW = (
+    _pathlib.Path(__file__).resolve().parents[3] / ".cache" / "braintreebank"
+)
+
+
+def _real_two_subject_orders():
+    """sub_1 + sub_8 voltage orders from the vendored fixtures. The pair shares
+    12 electrode names at DIFFERENT positions, so the buggy shared-dict scatter
+    mis-places exactly those rows (DP1) and collides them (DP2)."""
+    from speech_decoding.studies.braintreebank.anatomy import voltage_electrode_order
+
+    if not (_BT_CACHE_VIEW / "electrode_labels" / "sub_1").exists():
+        pytest.skip("vendored braintreebank electrode_labels not present")
+    o1 = list(voltage_electrode_order(str(_BT_CACHE_VIEW), 1))
+    o8 = list(voltage_electrode_order(str(_BT_CACHE_VIEW), 8))
+    return o1, o8
+
+
+def _pooled_view_two_subjects(order_first, order_last):
+    """A MultiStftView whose ``_channels`` is populated exactly as the neuralset
+    pooled ``prepare()`` loop populates it (``_update_channels`` per session, in
+    order), with ``order_last`` written last (last-writer-wins). ``channel_order``
+    is pinned to ``'original'`` to match the production dispatch
+    (dispatch_v14.py:940) — the config under which the desync occurs."""
+    view = _make_multi_stft_view(channel_order="original")
+    view._update_channels(list(order_first))
+    view._update_channels(list(order_last))
+    return view
+
+
+def test_get_channels_emits_per_subject_voltage_order_real_cohort() -> None:
+    """DP1: after a pooled sub_1+sub_8 prepare, ``_get_channels`` for each
+    subject's clip must return that subject's own voltage positions (``range``),
+    so electrode_tokens[c] == voltage_electrode_order(subject)[c]."""
+    o1, o8 = _real_two_subject_orders()
+    view = _pooled_view_two_subjects(o1, o8)  # sub_8 last writer
+    assert view._get_channels(o1) == list(range(len(o1)))
+    assert view._get_channels(o8) == list(range(len(o8)))
+
+
+def test_get_channels_no_within_subject_row_collision_real_cohort() -> None:
+    """DP2: no two of a subject's own electrodes may scatter to one output row
+    (that silently overwrites one electrode's signal). 12 sub_1 electrodes
+    collide under the buggy shared-dict scatter."""
+    o1, o8 = _real_two_subject_orders()
+    view = _pooled_view_two_subjects(o1, o8)
+    idx1 = view._get_channels(o1)
+    assert len(set(idx1)) == len(idx1), "within-subject row collision -> data loss"
+
+
+def test_scatter_spec_to_global_preserves_per_subject_order() -> None:
+    """The spec-cache re-scatter must place session row i at output row i (no
+    permutation, no loss) for a pooled cohort. Tracer spec: row i is the constant
+    i, so any misplacement is visible."""
+    o1, o8 = _real_two_subject_orders()
+    view = _pooled_view_two_subjects(o1, o8)
+    n = len(o1)
+    tracer = (
+        torch.arange(n, dtype=torch.float32)
+        .reshape(n, 1, 1)
+        .expand(n, 2, 3)
+        .contiguous()
+    )
+    out = view._scatter_spec_to_global(tracer, o1)
+    np.testing.assert_array_equal(
+        out[:n, 0, 0].numpy(), np.arange(n, dtype=np.float32)
+    )
+
+
+def test_scatter_stats_to_global_preserves_per_subject_order() -> None:
+    """Robust-z stat scatter (median/sigma) must land session row i at output row
+    i for a pooled cohort, matching the spec scatter row-for-row."""
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+    o1, o8 = _real_two_subject_orders()
+    view = _pooled_view_two_subjects(o1, o8)
+    n = len(o1)
+    norm = SessionRobustZNormalizer()
+    norm.median = torch.arange(n, dtype=torch.float32).reshape(n, 1, 1).clone()
+    norm.sigma = torch.ones(n, 1, 1)
+    view._scatter_stats_to_global(norm, o1)
+    np.testing.assert_array_equal(
+        norm.median[:n, 0, 0].numpy(), np.arange(n, dtype=np.float32)
+    )
+
+
+def test_update_channels_row_count_covers_longest_session() -> None:
+    """C_global = max(_channels.values())+1 must be >= every session's electrode
+    count, so the per-session range(len) scatter never indexes out of bounds —
+    even when the longest session's tail electrode name collides with a shorter
+    later session (name-keyed last-writer-wins would shrink the count below the
+    longest session's length and crash the scatter)."""
+    long_sess = [f"E{i}" for i in range(10)]  # 10 electrodes, tail "E9"
+    short_sess = ["E9", "X0", "X1"]  # reuses tail name "E9" at position 0
+    view = _make_multi_stft_view(channel_order="original")
+    view._update_channels(long_sess)
+    view._update_channels(short_sess)  # last writer
+    c_global = max(view._channels.values()) + 1
+    assert c_global >= len(long_sess)
+
+
+def test_single_subject_scatter_is_byte_identical_to_base() -> None:
+    """Byte-identical guard: for a single subject the per-session emit equals the
+    neuralset channel_order='original' base (global index == voltage position when
+    there is exactly one writer), so single-subject runs are unchanged."""
+    o1, _ = _real_two_subject_orders()
+    view = _make_multi_stft_view(channel_order="original")
+    view._update_channels(o1)  # single subject
+    assert view._get_channels(o1) == list(range(len(o1)))
+    assert max(view._channels.values()) + 1 == len(o1)
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_spec_cache_stores_session_order_not_global_order(tmp_path, monkeypatch) -> None:
+    """L7 cache-key row-identity audit (open Q5). The #80 whole-movie spec cache
+    must persist frames + robust-z stats in PER-SESSION order (``C_session`` rows),
+    never the c_max-padded / cohort-scattered GLOBAL layout. That is exactly what
+    makes the cache order-transparent: the corrected per-subject-voltage scatter is
+    re-applied by ``_get_channels`` at every clip read, so a cache built BEFORE the
+    electrode-row-desync fix holds bit-identical session-order frames and is reused
+    correctly AFTER the fix — NO cache invalidation needed (the fix is a method
+    override, leaving ``infra.uid()`` / the cache namespace unchanged). A regression
+    that baked global/cohort order into the .npy/.stats would desync every reuse;
+    this fails loud on it. See electrode_desync_damage_2026_06_09.md."""
+    view = _make_multi_stft_view(
+        spec_cache_dir=str(tmp_path),
+        session_robust_z=True,
+        c_max=384,  # >> C_session, so session vs global layout is unambiguous
+        channel_order="original",
+    )
+    ch = ["e0", "e1", "e2"]  # C_session = 3
+    rng = np.random.default_rng(11)
+    rec = rng.standard_normal((3, 2048 * 20)).astype(np.float32)
+    event, _ = _cache_view_harness(view, rec, ch, monkeypatch)
+    view.prepare([event])
+
+    # (1) frames stored in session order: 3 rows, NOT c_max=384 / C_global.
+    npy = next(tmp_path.rglob("*.npy"))
+    frames = np.load(npy)
+    assert frames.shape[0] == len(ch) == 3, "spec frames not in session order"
+    # (2) meta records session geometry.
+    meta = json.loads(next(tmp_path.rglob("*.json")).read_text())
+    assert meta["n_channels"] == 3
+    assert list(meta["ch_names"]) == ch
+    # (3) robust-z sidecar stats are session-order too (median has C_session rows).
+    stats = np.load(next(tmp_path.rglob("*.stats.npz")))
+    assert stats["median"].shape[0] == 3, "robust-z stats not in session order"
+
+    # (4) order-transparency: re-scattering the cached session frames depends only
+    # on the LIVE _channels (via _get_channels), placing this session's rows at its
+    # own per-subject voltage positions [0,3) and zero-padding the rest — nothing
+    # global is baked into the cache.
+    scattered = view._scatter_spec_to_global(torch.from_numpy(frames), ch)
+    assert scattered.shape[0] == max(view._channels.values()) + 1 == 3
+    np.testing.assert_array_equal(scattered.numpy(), frames)
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_spec_cache_session_order_independent_of_c_max(tmp_path, monkeypatch) -> None:
+    """L7: the stored spec row count is the session electrode count regardless of
+    ``c_max`` — proving c_max (the global pad width) is NOT baked into the cache.
+    Two builds with different c_max must store the same session-order n_channels."""
+    out = {}
+    for tag, c_max in (("a", 384), ("b", None)):
+        d = tmp_path / tag
+        d.mkdir()
+        view = _make_multi_stft_view(
+            spec_cache_dir=str(d), session_robust_z=False,
+            c_max=c_max, channel_order="original",
+        )
+        ch = ["e0", "e1", "e2", "e3"]
+        rng = np.random.default_rng(5)
+        rec = rng.standard_normal((4, 2048 * 12)).astype(np.float32)
+        event, _ = _cache_view_harness(view, rec, ch, monkeypatch)
+        view.prepare([event])
+        out[tag] = np.load(next(d.rglob("*.npy"))).shape[0]
+    assert out["a"] == out["b"] == 4, "spec cache row count depends on c_max"

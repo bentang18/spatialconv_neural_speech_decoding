@@ -544,6 +544,7 @@ def test_ragged_predictor_step_grad_bit_identical(phase: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.must_pass_before_dispatch
 def test_p1_empty_mask_gives_exact_zero_no_nan() -> None:
     """B6 masked-empty contract: ratio 0 → no masked cell → total is an
     exact 0 (graph-connected, no NaN)."""
@@ -554,6 +555,7 @@ def test_p1_empty_mask_gives_exact_zero_no_nan() -> None:
     assert torch.isfinite(breakdown.total)
 
 
+@pytest.mark.must_pass_before_dispatch
 def test_teacher_accumulates_no_grad_target_is_detached() -> None:
     """B6/B26: the teacher target is ``detach()``ed and the teacher forward
     runs under ``no_grad`` — no teacher parameter accumulates gradient."""

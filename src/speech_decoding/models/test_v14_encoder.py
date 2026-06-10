@@ -1565,6 +1565,7 @@ def _c5_fixture():
     return model, electrodes, support, fpv
 
 
+@pytest.mark.must_pass_before_dispatch
 def test_c5_freq_patch_excluded_from_keys_protects_valid_outputs() -> None:
     """With freq_patch_valid masking F-patches 7–9, BOTH the parcel latents
     (M4) and the valid-freq-patch M2 tokens are invariant to the CONTENT of
@@ -1616,3 +1617,41 @@ def test_c5_freq_patch_valid_rejects_bad_shape() -> None:
             electrodes, support, return_taps=True,
             freq_patch_valid=torch.ones(5, dtype=torch.bool),  # F_p is 10
         )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_token_rope_table_is_time_only_freq_inner() -> None:
+    """Golden-tracer for the token flat-order invariant ``i = t·F_p + f`` (time
+    outer, freq inner) on the TIME axis — the half C5 cannot see. C5 pins the
+    flatten <-> key-mask coupling on the freq axis; this pins the flatten <->
+    RoPE-table coupling. The forward flattens ``(B,C,F_p,T_p,d)`` to
+    ``(B*C, T_p*F_p, d)`` (encoder ~line 1374) and applies ``rope_joint_token``,
+    whose flat position ``i`` MUST carry the time rotation ``i // F_p`` (encoder
+    ~line 933). So the table is **time-only**: within one time block
+    ``[t*F_p, (t+1)*F_p)`` all F_p freq tokens share an IDENTICAL rotation (freq
+    is unmodulated, carried only by the additive freq_embed), and consecutive
+    time blocks DIFFER (time advances). A freq-outer refactor (``i // T_p`` or
+    ``i % F_p``) type-checks AND passes C5 (the key mask is independent of the
+    table), yet silently gives every token the wrong time rotation. This fails
+    it. Built on the real FE-RAW-1 front end (n_freq_bins=50, default kernel)."""
+    torch.manual_seed(0)
+    model = V14ParcelPerceiverModel(
+        n_freq_bins=50, n_time_bins=8, k_parcels=6, d_model=32, n_heads=4,
+        depth_self_attn=0,
+    ).eval()
+    F_p = model.n_freq_patches
+    max_T = model.max_n_time_patches
+    rope = model.rope_joint_token  # (2, F_p * max_T, head_dim)
+    assert rope.shape[1] == F_p * max_T
+    assert F_p > 1 and max_T > 1  # else the invariant is vacuous
+
+    # (a) time-only / freq-inner: within each time block, every freq row equal.
+    for t in range(max_T):
+        block = rope[:, t * F_p : (t + 1) * F_p, :]      # (2, F_p, head_dim)
+        spread = (block - block[:, :1, :]).abs().max().item()
+        assert spread == 0.0, f"time block {t} varies across freq -> not time-only"
+
+    # (b) time advances: block 0 is the RoPE identity (angle 0), block 1 a real
+    #     rotation, so consecutive time blocks must differ.
+    delta_time = (rope[:, 0, :] - rope[:, F_p, :]).abs().max().item()
+    assert delta_time > 0.0, "consecutive time blocks identical -> time not tiled"

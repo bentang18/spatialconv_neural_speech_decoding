@@ -21,10 +21,23 @@ leaderboard clip) and ``label`` is the per-task class. Upstream is queried with
 voltage (lightweight); it still reads ``transcripts/*/features.csv`` in
 ``__init__``, so this MUST run on DCC with ``ROOT_DIR_BRAINTREEBANK`` set.
 
-ELECTRODE-SET parity (the Lite-120 subset) is checked when ``--check-electrodes``
-is passed AND our chain has electrode subsetting wired; until then it is reported
-as ``PENDING`` (the split/window/label parity above is electrode-independent and
-verified regardless).
+ELECTRODE-SET parity is checked when ``--check-electrodes`` is passed. It now
+reports TWO distinct quantities, because they are different invariants:
+
+  1. **Montage parity** — our ``lite_voltage_order`` vs upstream's realized
+     ``electrode_labels``. This is the data-loading-order check; a SET mismatch
+     here is a real FAIL (we load a different Lite montage than upstream).
+  2. **Realized-consumed set** — what the v14 encoder ACTUALLY pools over =
+     ``aligned_voltage_support(...).valid & lite_voltage_mask(...)``. Lite
+     electrodes whose DK parcel is outside the K=80 vocab (e.g. sub_4's two
+     ``Left-Inf-Lat-Vent`` electrodes) are ``valid=False`` → pool-dropped, so the
+     realized set can be SMALLER than the Lite montage. The montage check alone
+     hid this (ledger LG3 — it falsified the "numerically exact S4=120" claim:
+     the model consumes 118). Any gap is reported loudly as ``[ELEC-GAP]`` and
+     counted in the summary, but does NOT set the exit code — whether to keep the
+     gap or remap the out-of-vocab electrodes is a science decision (Ben-gated).
+
+The split/window/label parity is electrode-independent and verified regardless.
 
 Exit code: 0 iff every (mode, session, task) cell is an EXACT match.
 
@@ -206,6 +219,38 @@ def _our_electrode_labels(test_subject_id: int) -> list[str] | None:
         return None
 
 
+def _our_realized_electrode_labels(
+    test_subject_id: int,
+) -> tuple[list[str], list[str]] | None:
+    """The electrode set the v14 encoder ACTUALLY pools over for Lite eval =
+    ``voltage_order ∩ lite ∩ valid`` (DK-parcel-mapped).
+
+    Returns ``(realized_labels, dropped_from_lite_labels)`` or ``None`` if the
+    anatomy isn't available. ``dropped_from_lite_labels`` are electrodes IN the
+    Lite montage but pool-dropped because their DK parcel is out-of-vocab
+    (``valid=False``) — the realized-vs-montage gap the montage check hides
+    (ledger LG3).
+    """
+    try:
+        from speech_decoding.studies.braintreebank.anatomy import (
+            aligned_voltage_support,
+            lite_voltage_mask,
+            voltage_electrode_order,
+        )
+    except ImportError:
+        return None
+    try:
+        root = os.environ["ROOT_DIR_BRAINTREEBANK"]
+        order = voltage_electrode_order(root, test_subject_id)
+        valid = aligned_voltage_support(root, test_subject_id).valid
+        lite = lite_voltage_mask(root, test_subject_id)
+        realized = [e for e, v, l in zip(order, valid, lite) if v and l]
+        dropped = [e for e, v, l in zip(order, valid, lite) if l and not v]
+        return realized, dropped
+    except Exception:
+        return None
+
+
 def _compare(label: str, ours: list, theirs: list) -> tuple[list[str], bool]:
     """Compare one split's clip list against upstream.
 
@@ -276,6 +321,7 @@ def main() -> int:
 
     n_pass = n_fail = 0
     failures: list[str] = []
+    elec_gaps: list[str] = []  # realized-consumed < Lite montage (LG3; reported, not a FAIL)
 
     for eval_mode in modes:
         if eval_mode == "CrossSubject":
@@ -316,10 +362,11 @@ def main() -> int:
                             if not split_errs and not ordered:
                                 order_diffs.append(split)
                         if args.check_electrodes:
+                            # (1) montage parity — data-loading order; SET mismatch = FAIL
                             ours_e = _our_electrode_labels(subj)
                             if ours_e is None:
                                 cell_errs.append(
-                                    f"{tag} [electrodes]: PENDING (subsetting not wired)")
+                                    f"{tag} [electrodes]: PENDING (anatomy unavailable)")
                             elif set(ours_e) != set(up_elabels):
                                 only_ours = sorted(set(ours_e) - set(up_elabels))[:5]
                                 only_up = sorted(set(up_elabels) - set(ours_e))[:5]
@@ -327,6 +374,18 @@ def main() -> int:
                                     f"{tag} [electrodes]: SET mismatch "
                                     f"|ours|={len(ours_e)} |up|={len(up_elabels)} "
                                     f"ours_only={only_ours} up_only={only_up}")
+                            # (2) realized-consumed set — what the encoder pools over.
+                            # A gap (out-of-vocab DK parcel) is reported, NOT a FAIL
+                            # (remediation is Ben-gated). LG3.
+                            realized = _our_realized_electrode_labels(subj)
+                            if realized is not None:
+                                rset, dropped = realized
+                                if dropped:
+                                    elec_gaps.append(
+                                        f"{tag}: REALIZED-CONSUMED {len(rset)} < Lite "
+                                        f"montage {len(up_elabels)} — {len(dropped)} "
+                                        f"Lite electrode(s) pool-dropped (out-of-vocab DK "
+                                        f"parcel): {sorted(dropped)[:6]}")
                     except Exception:
                         cell_errs = [f"{tag}: EXCEPTION\n{traceback.format_exc()}"]
 
@@ -352,6 +411,13 @@ def main() -> int:
     print("\n=== PARITY SUMMARY ===")
     print(f"cells passed: {n_pass}")
     print(f"cells failed: {n_fail}")
+    if elec_gaps:
+        print(
+            f"\n[ELEC-GAP] {len(elec_gaps)} cell(s) where the encoder pools FEWER "
+            f"electrodes than the Lite montage (LG3 — out-of-vocab DK parcel; "
+            f"montage parity still exact, remediation Ben-gated):")
+        for line in elec_gaps[:20]:
+            print(f"       {line}")
     if n_fail:
         print("\nFIRST FAILURES:")
         for line in failures[:20]:
