@@ -636,6 +636,34 @@ class _LatentSelfAttnBlock(nn.Module):
         return x_bt + self.ffn(self.ln_ffn(x_bt))
 
 
+class _ParcelSelfAttnBlock(nn.Module):
+    """B37 thin latent block (D5): parcel-self-attention ONLY, then FFN, pre-LN.
+
+    The B37 latent does the one thing the per-parcel stem structurally cannot —
+    cross-parcel integration — and nothing else. Working shape ``(R, K, d)``
+    with ``R = B·F_p·T_p``: frequency and time ride in the batch dim ``R`` and
+    are NEVER attended (carried untouched to the readout); attention is over the
+    parcel axis ``K`` alone. Parcels are unordered anatomy, so there is no
+    positional code on ``K`` (identity rides in the per-parcel features). The
+    optional ``attn_mask: (R, K, K) bool`` (True = allowed) is the B30
+    bidirectional no-coverage mask: uncovered parcels neither query nor key, and
+    a fully-masked query row yields a zero SA output (``_PlainMultiHeadSelfAttention``
+    bypass) so the residual leaves it unchanged. See
+    reports/b37_meanpool_freq_latent_spec_2026_06_10.md (D5).
+    """
+
+    def __init__(self, d_model: int, n_heads: int) -> None:
+        super().__init__()
+        self.ln_attn = nn.LayerNorm(d_model)
+        self.attn = _PlainMultiHeadSelfAttention(d_model, n_heads)
+        self.ln_ffn = nn.LayerNorm(d_model)
+        self.ffn = _ffn(d_model)
+
+    def forward(self, x: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
+        x = x + self.attn(self.ln_attn(x), attn_mask=attn_mask)
+        return x + self.ffn(self.ln_ffn(x))
+
+
 class _CrossAttnBlock(nn.Module):
     """Latent ← electrode hard block-diagonal parcel pool, then FFN, pre-LN."""
 
@@ -895,11 +923,24 @@ class V14ParcelPerceiverModel(nn.Module):
         #                  Chunk-E dispatch/joint/phase4 wiring.
         # See reports/b37_meanpool_freq_latent_spec_2026_06_10.md (D1/D2/D4).
         pool: tp.Literal["mean", "cross_attn"] = "cross_attn",
+        # B37 D5 (2026-06-10): depth of the thin parcel-SA-only latent stack on
+        # the ``pool="mean"`` path (the ONLY cross-parcel op; the stem + token
+        # blocks are strictly per-parcel). Center thin and swept {1,2,4,6} via
+        # R-latent-depth-*; full attention over ~20 covered parcels reaches every
+        # parcel in one layer, so depth buys refinement rounds, not receptive
+        # field. The M4 predictor depth tracks this (D9). Unused on the
+        # cross_attn path (which uses ``depth_self_attn``).
+        latent_parcel_depth: int = 2,
     ) -> None:
         super().__init__()
         if pool not in ("mean", "cross_attn"):
             raise ValueError(f"pool must be 'mean' or 'cross_attn', got {pool!r}")
+        if latent_parcel_depth < 1:
+            raise ValueError(
+                f"latent_parcel_depth must be ≥ 1, got {latent_parcel_depth}"
+            )
         self.pool = pool
+        self.latent_parcel_depth = latent_parcel_depth
         self.gradient_checkpointing = gradient_checkpointing
         self.ragged_frontend = ragged_frontend
         self.ragged_parcel = ragged_parcel
@@ -1080,17 +1121,41 @@ class V14ParcelPerceiverModel(nn.Module):
                     f"> {p}; got depth_self_attn={depth_self_attn}"
                 )
         self._cross_attn_at_block: tuple[int, ...] = tuple(positions)
-        self.cross_attns = nn.ModuleList(
-            [_CrossAttnBlock(d_model, n_heads) for _ in self._cross_attn_at_block]
-        )
-        # Legacy single-block alias — older code pokes at `model.cross_attn`
-        # to mean "the pre-stack routing block". Production callers should
-        # use `model.cross_attns`.
-        self.cross_attn = self.cross_attns[0]
-
-        self.latent_blocks = nn.ModuleList(
-            [_LatentSelfAttnBlock(d_model, n_heads) for _ in range(depth_self_attn)]
-        )
+        # Each pool builds ONLY its own per-parcel pool + inter-parcel latent,
+        # so a mean-pool run never carries the cross_attn routing blocks or
+        # latent (and a cross_attn run never carries the B37 parcel latent) as
+        # dead EMA-shadowed / optimizer-tracked params. The cross_attn sister
+        # builds exactly the modules it built before, in the same order (so
+        # init-RNG consumption is identical) → every existing cross_attn
+        # checkpoint/test stays byte-identical.
+        if self.pool == "cross_attn":
+            # B36 hard per-parcel pool = the routing cross-attn block(s)
+            # (position 0 pre-stack + any interior positions) AND the
+            # factorized time-SA × parcel-SA latent.
+            self.cross_attns = nn.ModuleList(
+                [_CrossAttnBlock(d_model, n_heads)
+                 for _ in self._cross_attn_at_block]
+            )
+            # Legacy single-block alias — older code pokes at `model.cross_attn`
+            # to mean "the pre-stack routing block". Production callers should
+            # use `model.cross_attns`.
+            self.cross_attn = self.cross_attns[0]
+            self.latent_blocks = nn.ModuleList(
+                [_LatentSelfAttnBlock(d_model, n_heads)
+                 for _ in range(depth_self_attn)]
+            )
+        elif self.pool == "mean":
+            # B37: the hard electrode→parcel MEAN (D1/D2) replaces the learned
+            # routing pool entirely (NO cross_attns), and D5's thin
+            # parcel-SA-only latent replaces the factorized latent. Frequency ×
+            # time ride in the batch dim (never attended); parcel-SA over K is
+            # the only cross-parcel op.
+            self.latent_parcel_blocks = nn.ModuleList(
+                [_ParcelSelfAttnBlock(d_model, n_heads)
+                 for _ in range(latent_parcel_depth)]
+            )
+        else:  # pool is validated to {"mean","cross_attn"} above — unreachable
+            raise AssertionError(f"unhandled pool {self.pool!r}")
         self.encoder_ln = nn.LayerNorm(d_model)
 
         # Per-loss-head LayerNorms live on the SSL student bundle
@@ -1156,10 +1221,12 @@ class V14ParcelPerceiverModel(nn.Module):
     # belong to each staging group. The FRONT-END produces the M2 tap (patch
     # stem → per-patch freq embed → joint token blocks → frontend_ln); P1
     # trains it alone. The PARCEL side is everything downstream of M2 — the
-    # per-parcel pool (``cross_attns``), the inter-parcel self-attention
-    # (``latent_blocks``), the terminal ``encoder_ln``, and the learnable
-    # latent-slot tables; P2 trains these (plus the student-only predictor,
-    # which lives on the BrainModule) while the front-end rides at LR/10.
+    # per-parcel pool (``cross_attns``, cross_attn pool only), the inter-parcel
+    # self-attention (``latent_blocks`` for cross_attn / ``latent_parcel_blocks``
+    # for the B37 mean pool — exactly one exists per build), the terminal
+    # ``encoder_ln``, and the learnable latent-slot tables; P2 trains these
+    # (plus the student-only predictor, which lives on the BrainModule) while
+    # the front-end rides at LR/10.
     # Per-clip conditioning embeds (``subtype_embed`` / ``ref_embed``,
     # default OFF per B32) inject at the front-end ``cond_emb`` upstream of
     # the token blocks, so they group with the front-end. ``latent_init_noise``
@@ -1169,7 +1236,7 @@ class V14ParcelPerceiverModel(nn.Module):
          "subtype_embed", "ref_embed"}
     )
     _PARCEL_PARAM_TOPS: tp.ClassVar[frozenset[str]] = frozenset(
-        {"cross_attns", "latent_blocks", "encoder_ln",
+        {"cross_attns", "latent_blocks", "latent_parcel_blocks", "encoder_ln",
          "learnable_parcel_embed", "learnable_subslot_embed"}
     )
 
@@ -1254,6 +1321,42 @@ class V14ParcelPerceiverModel(nn.Module):
             else:
                 xj = token_block(xj, rope, key_mask)
         return xj
+
+    def _parcel_latent(
+        self,
+        m2: Tensor,            # (B, K, F_p, T_p, d) — frontend_ln tap
+        latent_valid: Tensor,  # (B, K) bool — covered parcels
+        use_ckpt: bool,
+    ) -> Tensor:
+        """B37 D5 thin parcel-SA-only latent → ``z`` (B, K, F_p, T_p, d).
+
+        Fold freq×time into the batch dim (``R = B·F_p·T_p``) so attention is
+        over the parcel axis ``K`` ALONE; freq and time are carried untouched.
+        The B30 bidirectional no-coverage mask (shared across the ``F_p·T_p``
+        rows of each batch element) excludes uncovered parcels as both query and
+        key — so covered parcels' output never depends on uncovered parcels'
+        (don't-care) content, and the dense vs ragged-stem paths agree on
+        covered M4. NOTE (memory): the key-masked attention runs over the full
+        ``K`` (union 80), not the covered ``K_c`` — a covered-parcel ragged
+        gather is a deferred FLOP/memory optimization (see #112).
+        """
+        B, K, F_p, T_p, d = m2.shape
+        ft = F_p * T_p
+        r = B * ft
+        # (B,K,F_p,T_p,d) → (B,F_p,T_p,K,d) → (R, K, d).
+        z = m2.permute(0, 2, 3, 1, 4).reshape(r, K, d)
+        # (B,K) → bidirectional (B,K,K), broadcast to the F_p·T_p rows per b.
+        pmask_b = latent_valid.unsqueeze(2) & latent_valid.unsqueeze(1)  # (B,K,K)
+        attn_mask = (
+            pmask_b.unsqueeze(1).expand(B, ft, K, K).reshape(r, K, K)
+        )                                                               # (R,K,K)
+        for block in self.latent_parcel_blocks:
+            if use_ckpt:
+                z = checkpoint(block, z, attn_mask, use_reentrant=False)
+            else:
+                z = block(z, attn_mask)
+        # (R, K, d) → (B, F_p, T_p, K, d) → (B, K, F_p, T_p, d).
+        return z.reshape(B, F_p, T_p, K, d).permute(0, 3, 1, 2, 4).contiguous()
 
     def _forward_meanpool(
         self,
@@ -1363,8 +1466,11 @@ class V14ParcelPerceiverModel(nn.Module):
                 raise ValueError("m2_only=True requires return_taps=True")
             return {"M2": m2, "latent_valid": latent_valid}
 
-        # Chunk A: IDENTITY latent (D5 thin parcel-SA-only lands in Chunk B).
-        z = m2
+        # D5 thin parcel-SA-only latent: the ONLY cross-parcel op. freq×time
+        # ride in the batch dim (never attended); uncovered parcels are excluded
+        # bidirectionally via latent_valid, so covered M4 is independent of any
+        # uncovered parcel's (don't-care) M2 content.
+        z = self._parcel_latent(m2, latent_valid, use_ckpt)      # (B, K, F_p, T_p, d)
         m4 = self.encoder_ln(z)                                  # M4 tap + readout input
         if not return_taps:
             return m4
@@ -1438,6 +1544,12 @@ class V14ParcelPerceiverModel(nn.Module):
     ) -> Tensor | dict[str, Tensor]:
         """Returns parcel latents shaped ``(B, K*M, T_p, d)`` where ``T_p``
         is the post-patch frame count from the Conv2d patch stem.
+
+        NOTE — this contract is the ``pool="cross_attn"`` (B36) path. The
+        ``pool="mean"`` (B37) path is a structurally different forward routed
+        to ``_forward_meanpool`` (see the dispatch + that method's docstring):
+        frequency is preserved, so its taps are ``(B, K, F_p, T_p, d)`` and
+        there is NO ``M3`` (the readout is the freq-preserving D6 head).
 
         v4 amendment (5/19) §1 — "THE BIG CORRECTION": latents keep the time
         axis. Cross-attn is strict per-time-patch: latents at t_p attend only

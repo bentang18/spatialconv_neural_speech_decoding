@@ -192,13 +192,181 @@ def test_meanpool_forward_taps_preserve_frequency() -> None:
     assert torch.isfinite(out["M4"]).all()
 
 
-def test_meanpool_identity_latent_m4_is_ln_of_m2() -> None:
-    """Chunk A baseline: with the latent identity, M4 = encoder_ln(M2)."""
+# --------------------------------------------------------------------------- #
+# D5 thin parcel-SA-only latent
+# --------------------------------------------------------------------------- #
+def test_latent_parcel_blocks_only_built_for_mean_pool() -> None:
+    # Each pool builds ONLY its own per-parcel pool + inter-parcel latent: the
+    # mean path carries the thin parcel-SA stack and NOT the B36 cross_attn
+    # routing pool OR latent (no dead EMA/optimizer-tracked params), and the
+    # cross_attn sister is byte-identical to before B37.
+    mean = _make()
+    assert hasattr(mean, "latent_parcel_blocks")
+    assert len(mean.latent_parcel_blocks) == 2              # default depth (D5)
+    assert not hasattr(mean, "latent_blocks")               # no dead B36 latent on mean
+    assert not hasattr(mean, "cross_attns")                 # hard mean replaces the pool
+    assert not hasattr(mean, "cross_attn")                  # ...incl. the legacy alias
+    # The dead params are GENUINELY gone, not just unused: no cross_attns / B36
+    # latent params appear anywhere in the mean model's parameter set.
+    mean_param_tops = {n.split(".", 1)[0] for n, _ in mean.named_parameters()}
+    assert "cross_attns" not in mean_param_tops
+    assert "latent_blocks" not in mean_param_tops
+    ca = V14ParcelPerceiverModel(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6, d_model=32, n_heads=4,
+        depth_self_attn=2, m_sub_slots=1, patch_kernel_freq=3,  # cross_attn default
+    )
+    assert not hasattr(ca, "latent_parcel_blocks")          # sister param set untouched
+    assert hasattr(ca, "latent_blocks")                     # cross_attn keeps its latent
+    assert len(ca.latent_blocks) == 2                       # == depth_self_attn
+    assert hasattr(ca, "cross_attns")                       # ...and its routing pool
+    assert ca.cross_attn is ca.cross_attns[0]               # ...and the legacy alias
+
+
+def test_partition_parameters_assigns_latent_parcel_to_parcel() -> None:
+    """The B37 parcel-SA latent is the mean-path inter-parcel op, so its params
+    must land in the PARCEL staging bucket (the D8 discriminative-LR group) —
+    and ``partition_parameters_for_staging`` must NOT raise on a mean model."""
+    enc = _make()
+    frontend, parcel = enc.partition_parameters_for_staging()  # no raise
+    parcel_ids = {id(p) for p in parcel}
+    frontend_ids = {id(p) for p in frontend}
+    lp_params = list(enc.latent_parcel_blocks.parameters())
+    assert lp_params                                            # has trainable params
+    for p in lp_params:
+        assert id(p) in parcel_ids                             # → parcel group
+        assert id(p) not in frontend_ids                       # → not front-end
+    # Every parameter is partitioned exactly once (the guard's whole point).
+    assert len(frontend) + len(parcel) == len(list(enc.parameters()))
+
+    # The shared guard must ALSO still partition the cross_attn pool (the B36
+    # latent → parcel) without raising — the fix touched the shared frozenset.
+    ca = V14ParcelPerceiverModel(
+        n_freq_bins=6, n_time_bins=4, k_parcels=6, d_model=32, n_heads=4,
+        depth_self_attn=2, m_sub_slots=1, patch_kernel_freq=3,  # cross_attn default
+    )
+    ca_frontend, ca_parcel = ca.partition_parameters_for_staging()  # no raise
+    ca_parcel_ids = {id(p) for p in ca_parcel}
+    for p in ca.latent_blocks.parameters():
+        assert id(p) in ca_parcel_ids                          # B36 latent → parcel
+    for p in ca.cross_attns.parameters():
+        assert id(p) in ca_parcel_ids                          # routing pool → parcel
+    assert len(ca_frontend) + len(ca_parcel) == len(list(ca.parameters()))
+
+
+def test_latent_depth_param_controls_block_count() -> None:
+    for depth in (1, 3):
+        assert len(_make(latent_parcel_depth=depth).latent_parcel_blocks) == depth
+
+
+def test_latent_depth_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="latent_parcel_depth"):
+        _make(latent_parcel_depth=0)
+
+
+def test_latent_is_no_longer_identity() -> None:
+    """The real parcel-SA latent mixes parcels, so M4 != encoder_ln(M2)
+    (the Chunk-A identity placeholder is gone)."""
     enc = _make().eval()
     kw = _mp_kw()
     et, support, valid = _inputs(2, 8, kw)
     out = enc(et, support, valid_mask=valid, return_taps=True)
-    torch.testing.assert_close(out["M4"], enc.encoder_ln(out["M2"]))
+    assert (out["M4"] - enc.encoder_ln(out["M2"])).abs().max() > 1e-4
+
+
+def _rand_m2(enc: V14ParcelPerceiverModel, *, B: int, T_p: int, seed: int):
+    F_p, K, d = enc.n_freq_patches, enc.k_parcels, enc.d_model
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(B, K, F_p, T_p, d, generator=g), K
+
+
+def _perturb(t: torch.Tensor, seed: int) -> torch.Tensor:
+    # A VARIANCE-bearing perturbation: a constant added to all d channels is
+    # invisible to the pre-LN attention (LayerNorm is shift-invariant), so the
+    # mixing/exclusion probes must move the post-LN signal, not just the mean.
+    g = torch.Generator().manual_seed(seed)
+    return t + torch.randn(t.shape, generator=g)
+
+
+def test_parcel_latent_freq_time_ride_in_batch_dim() -> None:
+    """freq×time are folded into the batch dim and NEVER attended: perturbing
+    m2 at one (f,t) slice changes z only at that slice (covered parcels)."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=2, T_p=5, seed=0)
+    lv = torch.ones(2, K, dtype=torch.bool)
+    z0 = enc._parcel_latent(m2, lv, use_ckpt=False)
+    m2p = m2.clone()
+    m2p[:, :, 1, 2, :] = _perturb(m2p[:, :, 1, 2, :], seed=11)   # one (f=1,t=2) slice
+    z1 = enc._parcel_latent(m2p, lv, use_ckpt=False)
+    delta = (z1 - z0).abs()
+    assert delta[:, :, 1, 2, :].max() > 1e-5                    # that slice moved
+    delta[:, :, 1, 2, :] = 0.0
+    assert delta.max() < 1e-6                                    # every other (f,t) untouched
+
+
+def test_parcel_latent_mixes_across_covered_parcels() -> None:
+    """Perturbing covered parcel j changes a different covered parcel i's z —
+    cross-parcel integration is the latent's whole job."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=1, T_p=4, seed=1)
+    lv = torch.ones(1, K, dtype=torch.bool)
+    z0 = enc._parcel_latent(m2, lv, use_ckpt=False)
+    m2p = m2.clone()
+    m2p[:, 3] = _perturb(m2p[:, 3], seed=12)                     # perturb parcel 3
+    z1 = enc._parcel_latent(m2p, lv, use_ckpt=False)
+    assert (z1 - z0).abs()[:, 0].max() > 1e-5                  # parcel 0 (≠3) moved
+
+
+def test_parcel_latent_excludes_uncovered_parcels_as_keys() -> None:
+    """An uncovered parcel is bidirectionally excluded: perturbing its m2 does
+    NOT change any covered parcel's z (so covered M4 is desync-proof)."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=1, T_p=4, seed=2)
+    lv = torch.ones(1, K, dtype=torch.bool)
+    lv[:, 5] = False                                            # parcel 5 uncovered
+    z0 = enc._parcel_latent(m2, lv, use_ckpt=False)
+    m2p = m2.clone()
+    m2p[:, 5] = _perturb(m2p[:, 5], seed=13)                     # perturb uncovered parcel
+    z1 = enc._parcel_latent(m2p, lv, use_ckpt=False)
+    delta = (z1 - z0).abs()
+    assert delta[0, lv[0]].max() < 1e-6                         # every covered parcel unchanged
+
+
+def test_parcel_latent_all_uncovered_is_finite() -> None:
+    """All parcels masked → fully-masked query rows → zero SA output (bypass),
+    no NaN; FFN still applies (don't-care rows)."""
+    enc = _make().eval()
+    m2, K = _rand_m2(enc, B=2, T_p=3, seed=3)
+    lv = torch.zeros(2, K, dtype=torch.bool)
+    z = enc._parcel_latent(m2, lv, use_ckpt=False)
+    assert z.shape == m2.shape
+    assert torch.isfinite(z).all()
+
+
+def test_parcel_latent_checkpoint_matches_and_backprops() -> None:
+    """The ``use_ckpt=True`` branch (gradient-checkpointed parcel blocks, with
+    the non-differentiable bool ``attn_mask`` passed positionally) is bit-equal
+    to the non-checkpointed path and yields finite, non-zero grads — including
+    when a batch element is fully uncovered (softmax over finite NEG_INF)."""
+    enc = _make().train()
+    m2, K = _rand_m2(enc, B=2, T_p=3, seed=4)
+    lv = torch.ones(2, K, dtype=torch.bool)
+    lv[1] = False                                              # one all-uncovered element
+    base = m2.clone().requires_grad_(True)
+    ckpt = m2.clone().requires_grad_(True)
+    z_base = enc._parcel_latent(base, lv, use_ckpt=False)
+    z_ckpt = enc._parcel_latent(ckpt, lv, use_ckpt=True)
+    torch.testing.assert_close(z_ckpt, z_base)                 # recompute is exact
+    z_base.sum().backward()
+    z_base_grad = base.grad.clone()
+    # Reset before the second backward so the block-param-grad check below
+    # reflects ONLY the checkpointed path (no cross-path accumulation).
+    enc.zero_grad(set_to_none=True)
+    z_ckpt.sum().backward()
+    assert torch.isfinite(z_base_grad).all() and torch.isfinite(ckpt.grad).all()
+    torch.testing.assert_close(ckpt.grad, z_base_grad)         # same input gradient
+    # The checkpointed path actually trained the block params (finite grads).
+    for p in enc.latent_parcel_blocks.parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all()
 
 
 def test_meanpool_default_return_is_m4_tensor() -> None:
