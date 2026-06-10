@@ -63,6 +63,29 @@ RANKME_NORMALISED_ALARM: float = 0.25
 RANKME_M4_NORMALISED_WARN: float = 0.04
 RANKME_M4_NORMALISED_ALARM: float = 0.02
 
+# B37 joint mean-pool band — used ONLY on the ``ssl_mode == "joint"`` path
+# (B37 mean-pool encoder). The B37 mean-pool + thin parcel-SA latent produces a
+# COMPACT representation: BOTH the M2 front-end and M4 parcel teacher taps hold a
+# stable normalised-RankMe floor ~0.028–0.030 (raw effective rank ~7.3–7.6 / 256),
+# MEASURED over a 16-checkpoint guard-OFF nano trajectory (job 20260610_090818 —
+# P1 joint, 9-subj BT-lite, bs=4, 400 steps, val every 25) during which val_loss
+# fell ~5× (1.573 → 0.31) and the rank held flat / rose SLIGHTLY (0.0278 → 0.0284
+# M2; 0.0297 → 0.0299 M4) — the canonical no-collapse signature (collapse would
+# crater toward rank 1, normalised ~0.004, with the loss stalling). The B36 bands
+# above (M2 0.5/0.25, M4 0.04/0.02) are anchored to the PRE-B37 floors (M2 ~0.31,
+# M4 ~0.05) and false-fire from birth on B37 (the M2 alarm tripped at EVERY one of
+# the 16 checkpoints — it would insta-kill a guard-ON B37 run at step 24). Anchored
+# to the measured B37 floor and unified across M2/M4 (same freq-preserving 5-D
+# latent family, same floor): warn 0.020 (~0.7× floor; advisory / log-only — sits
+# just under the healthy floor) and alarm 0.010 (~0.36× floor; ~2.6× above a
+# genuine rank-1 collapse at 1/256 = 0.0039) hard-kills real collapse with margin
+# while never firing on the healthy floor. NANO-DERIVED — confirm the floor holds
+# on the full-scale capstone (larger batch / full cohort, ≫400 steps) before
+# trusting the alarm to gate a long run; the ~7/256 absolute rank is itself a
+# yellow flag (the thin latent may over-compress) worth a longer-run check.
+RANKME_JOINT_NORMALISED_WARN: float = 0.020
+RANKME_JOINT_NORMALISED_ALARM: float = 0.010
+
 RANKME_EPS: float = 1e-7
 
 

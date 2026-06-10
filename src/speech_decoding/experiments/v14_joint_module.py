@@ -72,6 +72,8 @@ from torch import Tensor, nn
 from neuraltrain.optimizers import BaseOptimizer
 
 from speech_decoding.experiments.monitors import (
+    RANKME_JOINT_NORMALISED_ALARM,
+    RANKME_JOINT_NORMALISED_WARN,
     RANKME_M4_NORMALISED_ALARM,
     RANKME_M4_NORMALISED_WARN,
     RANKME_NORMALISED_ALARM,
@@ -1359,24 +1361,33 @@ class V14JointBrainModule(pl.LightningModule):
         with torch.no_grad():
             if self._ssl_mode == "joint":
                 # B37 joint trains BOTH M2 (front-end) and M4 (parcel), so probe
-                # BOTH the EMA teacher's M2 (front-end rank, M2 thresholds) and
-                # M4 (parcel rank, M4 thresholds) from one full teacher forward.
-                # The mean-pool M2/M4 lead with the PARCEL axis (B, K, ...), so
-                # parcel coverage (``latent_valid``) is the valid mask for both.
+                # BOTH the EMA teacher's M2 (front-end rank) and M4 (parcel rank)
+                # from one full teacher forward. The mean-pool M2/M4 lead with the
+                # PARCEL axis (B, K, ...), so parcel coverage (``latent_valid``) is
+                # the valid mask for both.
+                #
+                # Both taps use the B37 JOINT band (RANKME_JOINT_*), NOT the B36
+                # M2/M4 bands: the B37 mean-pool + thin parcel-SA latent is COMPACT
+                # — both taps sit at a stable normalised-RankMe floor ~0.028–0.030
+                # (vs the pre-B37 floors M2 ~0.31 / M4 ~0.05 the B36 bands were cut
+                # for). Reusing the B36 M2 0.5/0.25 band here false-fired the M2
+                # alarm at EVERY checkpoint of the calibration nano (job
+                # 20260610_090818) — it would insta-kill a guard-ON B37 run. See
+                # the RANKME_JOINT_* derivation in monitors/teacher_rank.py.
                 t = self._call_teacher(**student_kwargs)
                 self._run_frontend_rank_monitor(
                     teacher_m2=t["M2"],
                     valid_mask=latent_valid,
                     step_name=step_name,
-                    warn=RANKME_NORMALISED_WARN,
-                    alarm=RANKME_NORMALISED_ALARM,
+                    warn=RANKME_JOINT_NORMALISED_WARN,
+                    alarm=RANKME_JOINT_NORMALISED_ALARM,
                 )
                 self._run_teacher_rank_monitor(
                     teacher_m4=t["M4"],
                     latent_valid=latent_valid,
                     step_name=step_name,
-                    warn=RANKME_M4_NORMALISED_WARN,
-                    alarm=RANKME_M4_NORMALISED_ALARM,
+                    warn=RANKME_JOINT_NORMALISED_WARN,
+                    alarm=RANKME_JOINT_NORMALISED_ALARM,
                 )
                 return
 

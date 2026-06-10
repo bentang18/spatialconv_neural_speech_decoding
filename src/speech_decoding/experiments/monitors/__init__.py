@@ -80,6 +80,8 @@ from speech_decoding.experiments.monitors.subject_id_leakage import (
     subject_id_leakage_monitor,
 )
 from speech_decoding.experiments.monitors.teacher_rank import (
+    RANKME_JOINT_NORMALISED_ALARM,
+    RANKME_JOINT_NORMALISED_WARN,
     RANKME_M4_NORMALISED_ALARM,
     RANKME_M4_NORMALISED_WARN,
     RANKME_NORMALISED_ALARM,
@@ -107,6 +109,8 @@ __all__ = [
     "PER_CLIP_COS_PCT95_THRESHOLD",
     "PROBE_BATCH_SIZE_M1_DEFAULT",
     "ParcelCoverageVerdict",
+    "RANKME_JOINT_NORMALISED_ALARM",
+    "RANKME_JOINT_NORMALISED_WARN",
     "RANKME_M4_NORMALISED_ALARM",
     "RANKME_M4_NORMALISED_WARN",
     "RANKME_NORMALISED_ALARM",

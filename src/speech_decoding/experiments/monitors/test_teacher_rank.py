@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from speech_decoding.experiments.monitors import (
+    RANKME_JOINT_NORMALISED_ALARM,
+    RANKME_JOINT_NORMALISED_WARN,
     RANKME_M4_NORMALISED_ALARM,
     RANKME_M4_NORMALISED_WARN,
     RANKME_NORMALISED_ALARM,
@@ -30,6 +32,27 @@ def test_teacher_rank_m4_band_below_parcel_floor() -> None:
     assert 0.0 < RANKME_M4_NORMALISED_ALARM < RANKME_M4_NORMALISED_WARN
     assert RANKME_M4_NORMALISED_WARN < RANKME_NORMALISED_WARN
     assert RANKME_M4_NORMALISED_ALARM < RANKME_NORMALISED_ALARM
+
+
+def test_teacher_rank_joint_band_below_b37_meanpool_floor() -> None:
+    """B37 joint mean-pool band (RANKME_JOINT_*) — used only on the
+    ``ssl_mode == "joint"`` path. Anchored to the MEASURED B37 floor ~0.028–0.030
+    (16-checkpoint guard-OFF nano trajectory, job 20260610_090818): warn 0.020
+    (~0.7× floor, advisory) / alarm 0.010 (~0.36× floor; ~2.6× above a rank-1
+    collapse at 1/256). Unified across M2/M4 (same freq-preserving 5-D latent),
+    and strictly below BOTH B36 bands (the B36 M2 0.5/0.25 band false-fired the
+    B37 alarm at every checkpoint)."""
+    assert RANKME_JOINT_NORMALISED_WARN == 0.020
+    assert RANKME_JOINT_NORMALISED_ALARM == 0.010
+    # valid band (0 < alarm < warn <= 1) — mirrors the constructor guard
+    assert 0.0 < RANKME_JOINT_NORMALISED_ALARM < RANKME_JOINT_NORMALISED_WARN <= 1.0
+    # below both B36 bands (the recalibration target: B36 bars insta-kill B37)
+    assert RANKME_JOINT_NORMALISED_WARN < RANKME_M4_NORMALISED_WARN
+    assert RANKME_JOINT_NORMALISED_WARN < RANKME_NORMALISED_WARN
+    # alarm clears a genuine rank-1 collapse (1/256 ≈ 0.0039) with margin
+    assert RANKME_JOINT_NORMALISED_ALARM > 2.0 / 256.0
+    # warn sits below the measured healthy floor (0.0278 min observed)
+    assert RANKME_JOINT_NORMALISED_WARN < 0.0278
 
 
 def test_teacher_rank_isotropic_gaussian_near_full_rank() -> None:
