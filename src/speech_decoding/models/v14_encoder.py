@@ -882,8 +882,24 @@ class V14ParcelPerceiverModel(nn.Module):
         # RoPE (relative); the parcel axis stays a learned table (unordered
         # anatomy — sincos would impose a false metric).
         freq_pos: tp.Literal["sinusoidal", "learned"] = "sinusoidal",
+        # B37 (2026-06-10): electrode→parcel pooling mode.
+        #   "mean"       — D1/D2: a HARD masked-mean over each parcel's
+        #                  electrodes taken BEFORE the token blocks (on raw
+        #                  |STFT|). The electrode axis is consumed once, in the
+        #                  mean; the stem + token blocks + latent are all
+        #                  per-parcel. This is the B37 architecture.
+        #   "cross_attn" — the B36 learned per-parcel cross-attention pool
+        #                  (R-cross-attn-pool sister). DEFAULT through the B37
+        #                  build (keeps the existing test surface green per
+        #                  chunk); the production default flips to "mean" in the
+        #                  Chunk-E dispatch/joint/phase4 wiring.
+        # See reports/b37_meanpool_freq_latent_spec_2026_06_10.md (D1/D2/D4).
+        pool: tp.Literal["mean", "cross_attn"] = "cross_attn",
     ) -> None:
         super().__init__()
+        if pool not in ("mean", "cross_attn"):
+            raise ValueError(f"pool must be 'mean' or 'cross_attn', got {pool!r}")
+        self.pool = pool
         self.gradient_checkpointing = gradient_checkpointing
         self.ragged_frontend = ragged_frontend
         self.ragged_parcel = ragged_parcel
@@ -1185,6 +1201,175 @@ class V14ParcelPerceiverModel(nn.Module):
                 )
         return frontend, parcel
 
+    # ------------------------------------------------------------------ #
+    # B37 mean-pool path (D1/D2/D4 + D3/D5). The HARD electrode→parcel
+    # MEAN is taken BEFORE the token blocks, on the raw |STFT|; it is the
+    # ONLY use of the electrode axis. Because the patch stem is a linear
+    # Conv2d with electrode-shared weights and the per-parcel pooling
+    # weights sum to 1, ``stem(parcel_raw) ≡ mean_c stem(x_in_c)`` exactly
+    # (bias included) — so mean-before is equivalent to a per-parcel
+    # stem-then-mean, and frequency rides through to the latent untouched.
+    # The B36 learned cross-attention pool is preserved as the
+    # ``pool="cross_attn"`` / R-cross-attn-pool sister (the original
+    # ``forward`` body below). See
+    # reports/b37_meanpool_freq_latent_spec_2026_06_10.md (D1/D2/D4).
+    # ------------------------------------------------------------------ #
+    def _mean_pool_electrodes(
+        self,
+        x_in: Tensor,                  # (B, C, F, T) raw |STFT|
+        support: Tensor,               # (B, C, K) one-hot DK assignment
+        valid_mask: Optional[Tensor],  # (B, C) bool, or None
+    ) -> tuple[Tensor, Tensor]:
+        """D2 mean-before: average raw |STFT| across each parcel's electrodes.
+
+        ``parcel_raw[b,k] = (Σ_c w[b,c,k]·x_in[b,c]) / (Σ_c w[b,c,k])`` with
+        ``w[b,c,k] = (support[b,c,k] > 0) ∧ valid_mask[b,c]``. Uncovered
+        parcels (``Σ_c w = 0``) → ``parcel_raw = 0`` and ``latent_valid =
+        False``. Returns ``(parcel_raw (B,K,F,T), latent_valid (B,K))``.
+        """
+        assigned = support > 0                                   # (B, C, K) bool
+        if valid_mask is not None:
+            assigned = assigned & valid_mask.unsqueeze(-1)
+        w = assigned.to(x_in.dtype)                              # (B, C, K)
+        num = torch.einsum("bck,bcft->bkft", w, x_in)           # (B, K, F, T)
+        denom = w.sum(dim=1)                                     # (B, K)
+        latent_valid = denom > 0                                 # (B, K)
+        # Uncovered parcels: num=0, denom→clamp(1) ⇒ 0/1 = 0 (kept, masked
+        # out downstream via latent_valid). Covered: Σ w / Σ w = 1, so the
+        # bias-carrying linearity equivalence holds exactly.
+        parcel_raw = num / denom.clamp(min=1.0).unsqueeze(-1).unsqueeze(-1)
+        return parcel_raw, latent_valid
+
+    def _token_block_stack(
+        self,
+        xj: Tensor,                    # (rows, S, d)
+        key_mask: Optional[Tensor],
+        rope: Tensor,
+        use_ckpt: bool,
+    ) -> Tensor:
+        """Run the per-row joint (t_p·f_p) token-block stack."""
+        for token_block in self.token_blocks:
+            if use_ckpt:
+                xj = checkpoint(token_block, xj, rope, key_mask, use_reentrant=False)
+            else:
+                xj = token_block(xj, rope, key_mask)
+        return xj
+
+    def _forward_meanpool(
+        self,
+        electrode_tokens: Tensor,
+        support: Tensor,
+        valid_mask: Optional[Tensor] = None,
+        *,
+        return_taps: bool = False,
+        m2_only: bool = False,
+    ) -> Tensor | dict[str, Tensor]:
+        """B37 encoder forward (``pool="mean"``).
+
+        Chunk A delivers the unmasked encoder up to ``M2``: pool → per-parcel
+        stem → per-parcel token blocks → ``frontend_ln``. The thin
+        parcel-self-attention-only latent (D5) lands in Chunk B; here the
+        latent is IDENTITY, so ``M4 = encoder_ln(M2)`` — a real, testable
+        config (the spec's "freq carried bit-exact when the latent is
+        identity" baseline). Composite masking (D7) lands in Chunk D.
+
+        Taps (``return_taps=True``): ``M2``/``M4`` are ``(B, K, F_p, T_p, d)``
+        (frequency preserved per D3) and ``latent_valid`` is ``(B, K)``.
+        """
+        if self.time_last_input:
+            x_in = electrode_tokens                              # (B, C, F, T)
+        else:
+            x_in = electrode_tokens.transpose(-1, -2)            # (B, C, T, F) → (B, C, F, T)
+        B, C, F, T = x_in.shape
+        if F != self.n_freq_bins:
+            raise ValueError(f"expected {self.n_freq_bins} freq bins, got {F}")
+        if T > self.max_seq_len:
+            raise ValueError(
+                f"got T={T} but max_seq_len={self.max_seq_len}; rebuild with a "
+                f"larger max_seq_len"
+            )
+        if support.shape != (B, C, self.k_parcels):
+            raise ValueError(
+                f"support shape {tuple(support.shape)} does not match (B, C, K) "
+                f"= ({B}, {C}, {self.k_parcels})"
+            )
+        # Under the HARD mean-pool a (support ↔ valid_mask) shape desync would
+        # silently corrupt the per-parcel average (cf. the electrode-row-desync
+        # doctrine), so validate the shape loudly rather than mis-broadcast.
+        if valid_mask is not None and valid_mask.shape != (B, C):
+            raise ValueError(
+                f"valid_mask shape {tuple(valid_mask.shape)} does not match "
+                f"(B, C) = ({B}, {C})"
+            )
+
+        # D2 mean-before: the ONLY use of the electrode axis.
+        parcel_raw, latent_valid = self._mean_pool_electrodes(x_in, support, valid_mask)
+        K = self.k_parcels
+
+        # D4 per-parcel stem (electrode-shared Conv2d) + freq embed (#95).
+        x = self.patch_stem(parcel_raw)                          # (B, K, F_p, T_p, d)
+        F_p, T_p = x.shape[2], x.shape[3]
+        if F_p != self.n_freq_patches:
+            raise ValueError(
+                f"patch stem produced F_p={F_p} but init-time n_freq_patches="
+                f"{self.n_freq_patches}"
+            )
+        x = x + self.freq_embed.unsqueeze(1)                     # broadcast over K, T_p
+
+        # Per-parcel JOINT (t_p·f_p) token blocks, batched over B·K parcels.
+        # Flatten t_p outer / f_p inner to match the tiled time-RoPE.
+        BK = B * K
+        S = T_p * F_p
+        # Flatten t_p OUTER / f_p INNER (the (B,K,T_p,F_p,d) order) so the flat
+        # token index i carries time-patch i//F_p — matching rope_joint_token's
+        # tiling and the cross-attn path's convention.
+        x_joint = x.permute(0, 1, 3, 2, 4).reshape(BK, S, self.d_model)
+        rope_token = self.rope_joint_token[:, :S, :]
+        use_ckpt = (
+            self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        )
+        # D4 ragged stem: run covered parcels only (uncovered are all-zero
+        # and masked downstream via latent_valid) — a pure FLOP cut that is
+        # bit-identical to dense on covered rows. freq_patch_valid is NOT
+        # threaded here (B36-C5 deferred gap; inert for BT/capstone). Gated on
+        # the flag ALONE (not ``latent_valid.all()``) to avoid a per-forward
+        # device→host sync on every student/teacher pass; the data-dependent
+        # nonzero() below is the single (unavoidable) sync, matching the
+        # cross-attn ragged path. Coverage is always partial here (K_c≪K), so
+        # the gather always has real work.
+        ragged = self.ragged_frontend
+        if ragged:
+            valid_rows = latent_valid.reshape(BK)
+            valid_idx = valid_rows.nonzero(as_tuple=True)[0]
+            if valid_idx.numel() == 0:
+                x_joint = x_joint.new_zeros(BK, S, self.d_model)
+            else:
+                xj_v = x_joint.index_select(0, valid_idx)
+                xj_v = self._token_block_stack(xj_v, None, rope_token, use_ckpt)
+                x_joint = xj_v.new_zeros(BK, S, self.d_model).index_copy(
+                    0, valid_idx, xj_v
+                )
+        else:
+            x_joint = self._token_block_stack(x_joint, None, rope_token, use_ckpt)
+
+        x = (
+            x_joint.reshape(B, K, T_p, F_p, self.d_model)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )                                                        # (B, K, F_p, T_p, d)
+        m2 = self.frontend_ln(x)                                 # M2 tap
+        if m2_only:
+            if not return_taps:
+                raise ValueError("m2_only=True requires return_taps=True")
+            return {"M2": m2, "latent_valid": latent_valid}
+
+        # Chunk A: IDENTITY latent (D5 thin parcel-SA-only lands in Chunk B).
+        z = m2
+        m4 = self.encoder_ln(z)                                  # M4 tap + readout input
+        if not return_taps:
+            return m4
+        return {"M2": m2, "M4": m4, "latent_valid": latent_valid}
+
     def forward(
         self,
         electrode_tokens: Tensor,   # (B, C, T_bins, F_bins) or (B, C, F_bins, T_bins) if time_last_input
@@ -1282,6 +1467,38 @@ class V14ParcelPerceiverModel(nn.Module):
         single-tensor ``(B, K*M, T_p, d)`` return for downstream callers
         (``V14ParcelPerceiverWithHead``, ``V14ParcelCollapsePMA``).
         """
+        # B37 pool dispatch. The mean-pool path (D1/D2) is a structurally
+        # different forward (electrode axis consumed up front, frequency
+        # preserved into the latent), so it lives in its own method. Chunk A
+        # ships the unmasked encoder; the composite-mask / shaft / cond-embed
+        # / M3 / freq_patch_valid args land in later chunks and are rejected
+        # loudly here until then rather than silently ignored.
+        if self.pool == "mean":
+            if token_mask is not None or parcel_time_mask is not None:
+                raise NotImplementedError(
+                    "B37 mean-pool composite masking (M2 band / M4 tube) lands "
+                    "in Chunk D; do not pass token_mask/parcel_time_mask yet."
+                )
+            if (
+                subject_subtype is not None
+                or ref_idx is not None
+                or shaft_mask is not None
+                or return_m3
+                or freq_patch_valid is not None
+            ):
+                raise NotImplementedError(
+                    "B37 mean-pool drops shaft/subtype/ref/M3 and defers "
+                    "freq_patch_valid (B36-C5); these args are unsupported on "
+                    "the mean-pool path."
+                )
+            return self._forward_meanpool(
+                electrode_tokens,
+                support,
+                valid_mask,
+                return_taps=return_taps,
+                m2_only=m2_only,
+            )
+
         # Normalize input to (B, C, F, T) — what _PatchStem wants.
         if self.time_last_input:
             x_in = electrode_tokens                              # (B, C, F, T)
