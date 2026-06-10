@@ -483,23 +483,36 @@ class V14JointBrainModule(pl.LightningModule):
         self._frontend_lr_scale = frontend_lr_scale
         self._parcel_lr_scale = parcel_lr_scale
         self._wd_exclude_norms = bool(wd_exclude_norms)
-        # MON-*-FEATURE-RANK thresholds (#74), phase-keyed canonical defaults.
-        # A module instance runs exactly ONE rank probe: P1 the M2 front-end
-        # probe (|STFT| floor ~0.31 → DINOv3 0.5/0.25 band), P2 the M4 parcel
-        # probe whose effective rank ≈ active-parcel count (~14 BT-lite-9) →
-        # a structurally lower floor ~0.05, so P2 defaults to the empirical M4
-        # band 0.04/0.02. The M2 band on M4 fires from birth (the false
-        # positive that killed chain 47725245 at P2 step 452); see
-        # [[project_v14_gate_cadence_guard_response_lock_2026_06_05]]. None →
-        # the phase default (single source of truth in teacher_rank.py); a
-        # dispatch override (#74a CLI) wins for this phase's probe and feeds
-        # the recalibration sweep. The collapse-guard reads the per-step
-        # *_alarm / *_warn flags these set, so they decide what kills a run.
-        _warn_default, _alarm_default = (
-            (RANKME_M4_NORMALISED_WARN, RANKME_M4_NORMALISED_ALARM)
-            if phase == "p2"
-            else (RANKME_NORMALISED_WARN, RANKME_NORMALISED_ALARM)
-        )
+        # MON-*-FEATURE-RANK thresholds (#74), mode/phase-keyed canonical
+        # defaults. A STAGED module runs exactly ONE rank probe: P1 the M2
+        # front-end probe (|STFT| floor ~0.31 → DINOv3 0.5/0.25 band), P2 the
+        # M4 parcel probe whose effective rank ≈ active-parcel count (~14
+        # BT-lite-9) → a structurally lower floor ~0.05, so P2 defaults to the
+        # empirical M4 band 0.04/0.02. The M2 band on M4 fires from birth (the
+        # false positive that killed chain 47725245 at P2 step 452); see
+        # [[project_v14_gate_cadence_guard_response_lock_2026_06_05]]. A B37
+        # JOINT module (#109) runs BOTH probes, but the mean-pool + thin
+        # parcel-SA latent floors BOTH taps at the SAME ~0.028–0.030 (vs the
+        # pre-B37 M2 ~0.31 / M4 ~0.05) — so ssl_mode=="joint" sources the
+        # unified RANKME_JOINT band 0.020/0.010 (ssl_mode wins over phase; the
+        # joint floors are tap-independent, so one band serves both probes).
+        # None → the mode/phase default (single source of truth in
+        # teacher_rank.py); a dispatch override (#74a CLI) wins for ALL modes
+        # incl. joint and feeds the recalibration sweep the capstone re-tune
+        # needs. The collapse-guard reads the per-step *_alarm / *_warn flags
+        # these set, so they decide what kills a run.
+        if ssl_mode == "joint":
+            _warn_default, _alarm_default = (
+                RANKME_JOINT_NORMALISED_WARN, RANKME_JOINT_NORMALISED_ALARM,
+            )
+        elif phase == "p2":
+            _warn_default, _alarm_default = (
+                RANKME_M4_NORMALISED_WARN, RANKME_M4_NORMALISED_ALARM,
+            )
+        else:
+            _warn_default, _alarm_default = (
+                RANKME_NORMALISED_WARN, RANKME_NORMALISED_ALARM,
+            )
         self._rankme_warn_threshold = (
             _warn_default if rankme_warn_threshold is None
             else float(rankme_warn_threshold)
@@ -1366,28 +1379,29 @@ class V14JointBrainModule(pl.LightningModule):
                 # PARCEL axis (B, K, ...), so parcel coverage (``latent_valid``) is
                 # the valid mask for both.
                 #
-                # Both taps use the B37 JOINT band (RANKME_JOINT_*), NOT the B36
-                # M2/M4 bands: the B37 mean-pool + thin parcel-SA latent is COMPACT
-                # — both taps sit at a stable normalised-RankMe floor ~0.028–0.030
-                # (vs the pre-B37 floors M2 ~0.31 / M4 ~0.05 the B36 bands were cut
-                # for). Reusing the B36 M2 0.5/0.25 band here false-fired the M2
-                # alarm at EVERY checkpoint of the calibration nano (job
-                # 20260610_090818) — it would insta-kill a guard-ON B37 run. See
-                # the RANKME_JOINT_* derivation in monitors/teacher_rank.py.
+                # Both taps read the instance thresholds self._rankme_* (warn/
+                # alarm=None), which the constructor sourced from the B37 JOINT
+                # band (RANKME_JOINT 0.020/0.010), NOT the B36 M2/M4 bands: the
+                # B37 mean-pool + thin parcel-SA latent is COMPACT — both taps
+                # sit at a stable normalised-RankMe floor ~0.028–0.030 (vs the
+                # pre-B37 floors M2 ~0.31 / M4 ~0.05 the B36 bands were cut for).
+                # Reusing the B36 M2 0.5/0.25 band here false-fired the M2 alarm
+                # at EVERY checkpoint of the calibration nano (job 20260610_090818)
+                # — it would insta-kill a guard-ON B37 run. Sourcing from the
+                # constructor (vs hardcoding here) keeps a single read path and
+                # restores the --rankme-*-threshold CLI override on the joint
+                # path for the capstone re-tune. See the RANKME_JOINT_*
+                # derivation in monitors/teacher_rank.py.
                 t = self._call_teacher(**student_kwargs)
                 self._run_frontend_rank_monitor(
                     teacher_m2=t["M2"],
                     valid_mask=latent_valid,
                     step_name=step_name,
-                    warn=RANKME_JOINT_NORMALISED_WARN,
-                    alarm=RANKME_JOINT_NORMALISED_ALARM,
                 )
                 self._run_teacher_rank_monitor(
                     teacher_m4=t["M4"],
                     latent_valid=latent_valid,
                     step_name=step_name,
-                    warn=RANKME_JOINT_NORMALISED_WARN,
-                    alarm=RANKME_JOINT_NORMALISED_ALARM,
                 )
                 return
 

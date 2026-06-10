@@ -389,6 +389,79 @@ def test_joint_monitors_emit_both_m2_and_m4_rank() -> None:
     assert "train_mon_coverage_active_mean" in logged
 
 
+def _ranked_5d(*, B, n_parcels, F_p, T, d, rank, seed):
+    """A ``(B, n_parcels, F_p, T, d)`` teacher tap whose flattened ``(N, d)``
+    rows span ~``rank`` directions → RankMe ≈ rank, normalised ≈ rank/d. ``d``
+    is pinned to a realistic 256 (the test encoder runs ``d_model=32``, which
+    would put even a rank-1 collapse at 1/32 ≫ the 0.010 alarm) so the
+    joint-vs-B36 band gap is exercised honestly."""
+    torch.manual_seed(seed)
+    n = B * n_parcels * F_p * T
+    rows = torch.randn(n, rank) @ torch.randn(rank, d)
+    return rows.reshape(B, n_parcels, F_p, T, d)
+
+
+def test_joint_branch_uses_joint_band_not_b36_band() -> None:
+    """F4 wiring guard (#109 / 332afbf follow-up): the joint branch must drive
+    ``is_alarm`` off the B37 JOINT band (alarm 0.010), NOT the B36 M2/M4 bands.
+    The constant test pins the literals; this pins that the BRANCH passes them.
+
+    A healthy B37 floor (effective rank ≈ 10/256 ≈ 0.04) sits in the GAP
+    between the joint alarm (0.010) and the B36 M2 alarm (0.25): had the branch
+    kept the B36 band the alarm would fire, so ``alarm == 0`` AND
+    ``normalised < B36 alarm`` at the floor is the wiring proof. A rank-1
+    collapse (≈ 1/256 ≈ 0.004 < 0.010) must still fire. Defends the kill switch
+    against a refactor that reintroduces the exact pre-332afbf bug (which would
+    pass every constant test)."""
+    from speech_decoding.experiments.monitors import (
+        RANKME_JOINT_NORMALISED_WARN,
+        RANKME_NORMALISED_ALARM,
+    )
+    from speech_decoding.experiments.v14_joint_module import (
+        _latent_valid_from_batch,
+    )
+
+    d, B, F_p, T = 256, 2, 10, 8
+    probe = _joint_module()
+    kw = probe._extract_student_kwargs(_batch(B=B))
+    n_parcels = _latent_valid_from_batch(
+        support=kw["support"], valid_mask=kw.get("valid_mask"),
+        m_sub_slots=probe._m_sub_slots,
+    ).shape[1]
+
+    def _run(*, rank: int, seed0: int) -> dict[str, float]:
+        mod = _joint_module()
+        teacher = {
+            "M2": _ranked_5d(B=B, n_parcels=n_parcels, F_p=F_p, T=T, d=d,
+                             rank=rank, seed=seed0),
+            "M4": _ranked_5d(B=B, n_parcels=n_parcels, F_p=F_p, T=T, d=d,
+                             rank=rank, seed=seed0 + 1),
+        }
+        mod._call_teacher = lambda **_kw: teacher  # type: ignore[method-assign]
+        log: dict[str, float] = {}
+        mod.log = lambda key, value, **_kw: log.update(  # type: ignore[method-assign]
+            {key: float(value.detach() if hasattr(value, "detach") else value)})
+        mod._monitor_from_step(_batch(B=B), step_name="train")
+        return log
+
+    # healthy floor: both taps ≈ rank 10/256 → no alarm under the joint band,
+    # and BELOW the B36 0.25 alarm (so a B36-banded branch WOULD have fired).
+    healthy = _run(rank=10, seed0=2)
+    assert healthy["train_mon_frontend_rankme_normalised"] > RANKME_JOINT_NORMALISED_WARN
+    assert healthy["train_mon_rankme_normalised"] > RANKME_JOINT_NORMALISED_WARN
+    assert healthy["train_mon_frontend_rankme_alarm"] == 0.0
+    assert healthy["train_mon_rankme_alarm"] == 0.0
+    # the floor sits below the B36 band → that band WOULD have false-fired here;
+    # alarm==0 therefore proves the branch is on the joint band, not B36.
+    assert healthy["train_mon_frontend_rankme_normalised"] < RANKME_NORMALISED_ALARM
+    assert healthy["train_mon_rankme_normalised"] < RANKME_NORMALISED_ALARM
+
+    # rank-1 collapse: normalised ≈ 1/256 ≈ 0.004 < joint alarm 0.010 → fire.
+    collapsed = _run(rank=1, seed0=20)
+    assert collapsed["train_mon_frontend_rankme_alarm"] == 1.0
+    assert collapsed["train_mon_rankme_alarm"] == 1.0
+
+
 def test_joint_training_step_logs_component_losses() -> None:
     m = _joint_module()
     logged: dict[str, float] = {}
