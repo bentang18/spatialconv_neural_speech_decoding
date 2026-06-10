@@ -680,16 +680,28 @@ class V14JointBrainModule(pl.LightningModule):
             kwargs["valid_mask"] = batch_data["valid_mask"]
 
         # Per-clip conditioning is looked up by the encoder itself; the
-        # encoder forward tolerates ``None``. Trailing NeuralSet-collated
-        # singleton axes get stripped to match the encoder's handling.
-        if "subject_subtype" in batch_data:
-            kwargs["subject_subtype"] = _maybe_drop_singleton_trailing(
-                batch_data["subject_subtype"],
-            )
-        if "ref_idx" in batch_data:
-            kwargs["ref_idx"] = _maybe_drop_singleton_trailing(
-                batch_data["ref_idx"],
-            )
+        # cross_attn encoder forward tolerates ``None``. Trailing
+        # NeuralSet-collated singleton axes get stripped to match the
+        # encoder's handling.
+        #
+        # B37 (D1): the mean-pool encoder DROPS per-clip conditioning
+        # (subtype/ref) — its forward REJECTS these args loudly (the
+        # ``pool == "mean"`` guard in ``v14_encoder.py``) rather than
+        # silently ignoring them. The production BT batch ALWAYS carries
+        # them (the subtype/ref extractors run unconditionally regardless of
+        # whether the embeds are enabled), so they MUST be stripped here on
+        # the mean-pool path or every joint forward trips that guard. Gate on
+        # the encoder's OWN pool (not ``ssl_mode``) so the condition mirrors
+        # the guard exactly — correct for any pool×ssl_mode combination.
+        if self.student.encoder.pool != "mean":
+            if "subject_subtype" in batch_data:
+                kwargs["subject_subtype"] = _maybe_drop_singleton_trailing(
+                    batch_data["subject_subtype"],
+                )
+            if "ref_idx" in batch_data:
+                kwargs["ref_idx"] = _maybe_drop_singleton_trailing(
+                    batch_data["ref_idx"],
+                )
 
         return kwargs
 

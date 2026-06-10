@@ -80,6 +80,22 @@ def _batch(*, B: int = 2, C: int = 6, T_bins: int = 10, F_bins: int = 15, K: int
     }
 
 
+def _batch_with_conditioning(**kw):
+    """A batch that ALSO carries the per-clip conditioning keys the production
+    BT pipeline always emits — the ``SubjectSubtypeExtractor`` and
+    ``RefIdxExtractor`` run unconditionally regardless of whether the embeds
+    are enabled. The B37 mean-pool encoder forward REJECTS these (D1 drops
+    per-clip conditioning), so the joint module must STRIP them before the
+    encoder call. This fixture reproduces the exact field set the nano P1+P2
+    joint run tripped over (2026-06-10). NeuralSet collates a per-clip scalar
+    with a trailing singleton axis, so ``subject_subtype`` is ``(B, 1)``."""
+    data = _batch(**kw)
+    B, C = data["electrode_tokens"].shape[:2]
+    data["subject_subtype"] = torch.zeros(B, 1, dtype=torch.long)
+    data["ref_idx"] = torch.zeros(B, C, dtype=torch.long)
+    return data
+
+
 # --------------------------------------------------------------------------- #
 # construction — two predictors, D9 config
 # --------------------------------------------------------------------------- #
@@ -134,6 +150,39 @@ def test_joint_step_returns_joint_breakdown() -> None:
     assert bd.n_masked_m2 > 0, "no band-masked M2 cells — composite mask empty"
     assert bd.n_masked_m4 > 0, "no tube-masked M4 cells — tube empty"
     assert bd.n_masked == bd.n_masked_m2 + bd.n_masked_m4
+
+
+def test_joint_step_drops_subtype_ref_on_meanpool() -> None:
+    """Regression (nano P1+P2 joint, 2026-06-10): the production batch carries
+    ``subject_subtype`` + ``ref_idx`` (their extractors run unconditionally),
+    but the B37 mean-pool encoder forward REJECTS them (D1 drops per-clip
+    conditioning) at the ``pool == "mean"`` guard. The joint module must STRIP
+    them in ``_extract_student_kwargs`` before the encoder call — otherwise
+    every joint forward raises ``NotImplementedError``. Pre-fix this raised at
+    the first (sanity-check) forward; post-fix the full step runs."""
+    m = _joint_module()
+    kwargs = m._extract_student_kwargs(_batch_with_conditioning())
+    assert "subject_subtype" not in kwargs, "subtype leaked to the mean-pool encoder"
+    assert "ref_idx" not in kwargs, "ref_idx leaked to the mean-pool encoder"
+    # End-to-end: the composite student forward must NOT trip the pool guard.
+    bd = m._step(_batch_with_conditioning())
+    assert isinstance(bd, JointJepaBreakdown)
+    assert torch.isfinite(bd.total)
+
+
+def test_cross_attn_step_keeps_subtype_ref() -> None:
+    """The cross_attn (staged) path is byte-identical and DOES thread
+    subtype/ref (the cross_attn encoder tolerates + looks them up), so the
+    mean-pool drop must be gated on the encoder's own pool and never leak into
+    the staged path."""
+    m = V14JointBrainModule(
+        encoder=_cross_attn_encoder(), optim_config=_optim_config(),  # staged
+    )
+    kwargs = m._extract_student_kwargs(_batch_with_conditioning())
+    assert "subject_subtype" in kwargs, "staged path must keep subtype"
+    assert "ref_idx" in kwargs, "staged path must keep ref_idx"
+    # NeuralSet trailing-singleton strip still applies: (B, 1) -> (B,).
+    assert kwargs["subject_subtype"].dim() == 1
 
 
 def test_joint_total_is_m2_plus_lambda_m4() -> None:
