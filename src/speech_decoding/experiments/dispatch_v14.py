@@ -758,6 +758,14 @@ def build_v14_experiment(
     # default-on. Escape: ``--no-ragged-predictor``. Covers BOTH P1 and P2 (one
     # predictor per joint phase). Joint-only (no effect on P3/P4).
     ragged_predictor: bool = True,
+    # 2026-06-09 freq-pos lock (A-JEPA, arXiv 2311.15830): positional encoding
+    # for the ORDERED freq-patch axis. "sinusoidal" (default) = fixed MAE sincos
+    # (absolute code + smoothness/ordering prior), matching how A-JEPA/AudioMAE
+    # position the spectral axis; threaded to the encoder front-end AND mirrored
+    # to the P1 predictor's freq id-tag. "learned" = R-freq-learned-embed sister
+    # (pre-lock learned table). NOT bit-identical (a representation change) —
+    # joint-phase only; time stays RoPE, parcel stays learned.
+    freq_pos: str = "sinusoidal",
     # WS-F / B33 Phase-3 distillation routing (#21). ``p3_distill=True`` returns
     # a :class:`V14Phase3Experiment` (Whisper all-layer-mean SmoothL1 distill)
     # instead of the joint / supervised path; ``p3_stage`` picks 3a (encoder
@@ -1442,6 +1450,11 @@ def build_v14_experiment(
             # (t_p, f_p) tokens only (pad-to-max, scatter). P4-transfer confirm
             # runs in parallel as a regression check, not a gate.
             "ragged_token": ragged_token,
+            # 2026-06-09 freq-pos lock (A-JEPA): "sinusoidal" (default) =
+            # fixed MAE sincos on the ordered freq-patch axis; "learned" =
+            # R-freq-learned-embed sister. Threaded to the encoder + mirrored
+            # to the P1 predictor freq id-tag by the joint module.
+            "freq_pos": freq_pos,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
             # supervised downstream classifier path does not branch on
@@ -2081,6 +2094,19 @@ def _parser() -> argparse.ArgumentParser:
              "BOTH P1 and P2. ON by default; --no-ragged-predictor restores the "
              "dense path.",
     )
+    # 2026-06-09 freq-pos lock (A-JEPA): positional encoding for the ordered
+    # freq-patch axis (encoder front-end + P1 predictor freq id-tag). Default
+    # "sinusoidal" (fixed MAE sincos); "learned" = R-freq-learned-embed sister.
+    p.add_argument(
+        "--freq-pos", dest="freq_pos",
+        choices=["sinusoidal", "learned"], default="sinusoidal",
+        help="Positional encoding for the ORDERED freq-patch axis. 'sinusoidal' "
+             "(default) = fixed A-JEPA/MAE sincos (absolute code + smoothness/"
+             "ordering prior), applied to the encoder front-end AND the P1 "
+             "predictor freq id-tag. 'learned' = R-freq-learned-embed sister "
+             "(the pre-lock learned table). Time stays RoPE; parcels stay "
+             "learned. REPRESENTATION CHANGE (joint-phase only).",
+    )
     # 2026-06-07 speedup-fanout C1: torch.compile the student/teacher encoder
     # forward. The toggle is the ``V14_COMPILE`` env var read inside
     # V14JointBrainModule.__init__ (an env var, not a pydantic field, so it never
@@ -2558,6 +2584,7 @@ def _common_build_kwargs(
         ragged_parcel=args.ragged_parcel,
         ragged_token=args.ragged_token,
         ragged_predictor=args.ragged_predictor,
+        freq_pos=args.freq_pos,
         readout=args.readout,
         latent_valid_override=args.latent_valid_override,
         sa_mask_mode=args.sa_mask_mode,
@@ -2921,7 +2948,8 @@ def main(argv: list[str] | None = None) -> int:
           f"ragged_frontend={args.ragged_frontend} "
           f"ragged_parcel={args.ragged_parcel} "
           f"ragged_token={args.ragged_token} "
-          f"ragged_predictor={args.ragged_predictor}")
+          f"ragged_predictor={args.ragged_predictor} "
+          f"freq_pos={args.freq_pos}")
     _resolved_lr = _resolve_lr(args)
     _lr_disp = (
         f"{_resolved_lr:.3e} (AUTO √-rule: 5e-4·√(eff/1024), "

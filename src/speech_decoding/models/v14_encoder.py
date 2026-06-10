@@ -97,6 +97,31 @@ def _rope_freqs(head_dim: int, max_seq_len: int, base: float = 10_000.0) -> Tens
     return torch.stack([cos, sin], dim=0)  # (2, T, head_dim)
 
 
+def _sincos_1d(n_pos: int, dim: int, *, base: float = 10_000.0) -> Tensor:
+    """Fixed 1-D sinusoidal positional table of shape ``(n_pos, dim)``.
+
+    The standard MAE / Vaswani sincos: ``omega_i = base^{-i/(dim/2)}`` for
+    ``i ∈ [0, dim/2)``, then ``embed[p] = [sin(p·omega) ; cos(p·omega)]``
+    (sin half concatenated with cos half). Deterministic, NON-learned.
+
+    Used for the **frequency axis only** (A-JEPA, arXiv 2311.15830,
+    §"Input spectrogram": the spectral axis is an ordered metric axis carrying
+    fixed sinusoidal absolute position encoding — exactly like image rows). This
+    gives an absolute per-position code AND a free smoothness/ordering prior
+    (``embed[p]·embed[q]`` varies smoothly with ``|p−q|``) that a learned table
+    does not impose. Time stays RoPE (relative — the time grid varies in
+    length); parcels stay a learned table (anatomy is unordered — sincos would
+    impose a false metric). See the 2026-06-09 freq-pos lock.
+    """
+    if dim % 2 != 0:
+        raise ValueError(f"_sincos_1d dim must be even, got {dim}")
+    half = dim // 2
+    omega = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) / half))
+    pos = torch.arange(n_pos, dtype=torch.float32)
+    out = torch.outer(pos, omega)  # (n_pos, half)
+    return torch.cat([out.sin(), out.cos()], dim=1)  # (n_pos, dim)
+
+
 # Sentinel used by masked_fill on attention logits. `torch.finfo(bf16).min`
 # (~-3.4e38) leaves softmax leakage at masked positions because bf16's
 # mantissa precision makes `exp(-3.4e38)` non-zero after rescaling — about
@@ -848,12 +873,22 @@ class V14ParcelPerceiverModel(nn.Module):
         # otherwise it operates per electrode row independently. Default OFF (dense
         # path byte-identical). See test_v14_ragged_token.
         ragged_token: bool = False,
+        # 2026-06-09 freq-pos lock (A-JEPA, arXiv 2311.15830): positional
+        # encoding for the ORDERED frequency-patch axis. "sinusoidal" (default)
+        # = fixed 1-D MAE sincos (non-learned buffer), giving an absolute
+        # per-patch code + a free smoothness/ordering prior — exactly how
+        # A-JEPA/AudioMAE position the spectral axis. "learned" =
+        # R-freq-learned-embed sister (the pre-lock learned table). Time stays
+        # RoPE (relative); the parcel axis stays a learned table (unordered
+        # anatomy — sincos would impose a false metric).
+        freq_pos: tp.Literal["sinusoidal", "learned"] = "sinusoidal",
     ) -> None:
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
         self.ragged_frontend = ragged_frontend
         self.ragged_parcel = ragged_parcel
         self.ragged_token = ragged_token
+        self.freq_pos = freq_pos
         self.n_freq_bins = n_freq_bins
         self.n_time_bins = n_time_bins
         self.k_parcels = k_parcels
@@ -905,12 +940,28 @@ class V14ParcelPerceiverModel(nn.Module):
         self.n_freq_patches = n_freq_patches
         self.max_n_time_patches = max_n_time_patches
 
-        # FE-03: per-patch learnable freq embedding (one d-vector per freq
-        # patch). Replaces v3's per-bin freq_embed of shape (F, d). Same name
-        # so SSL contracts that ref freq_embed by name still resolve, but
-        # the first dim is now F_p (post-patch), not F (raw bins).
-        self.freq_embed = nn.Parameter(torch.empty(n_freq_patches, d_model))
-        nn.init.trunc_normal_(self.freq_embed, std=0.02)
+        # FE-03: per-patch freq positional encoding (one d-vector per freq
+        # patch, broadcast over T_p, additive — see forward). The first dim is
+        # F_p (post-patch), not F (raw bins). Same attribute name (``freq_embed``)
+        # under both modes so SSL contracts that ref it resolve either way.
+        # freq-pos lock (2026-06-09): the freq-patch axis is ORDERED, so the
+        # default is fixed A-JEPA/MAE sincos (a non-learned buffer — an absolute
+        # code + a built-in smoothness/ordering prior); the learned table is the
+        # R-freq-learned-embed sister. (Parcels use a learned table elsewhere —
+        # anatomy is unordered; time uses RoPE — relative.)
+        if freq_pos == "sinusoidal":
+            self.register_buffer(
+                "freq_embed",
+                _sincos_1d(n_freq_patches, d_model),
+                persistent=False,
+            )
+        elif freq_pos == "learned":
+            self.freq_embed = nn.Parameter(torch.empty(n_freq_patches, d_model))
+            nn.init.trunc_normal_(self.freq_embed, std=0.02)
+        else:
+            raise ValueError(
+                f"freq_pos must be 'sinusoidal' or 'learned', got {freq_pos!r}"
+            )
 
         # LAT-01 (B21 collapse-prevention lock 2026-05-25; recipe §1 "Latent init").
         # The latent-slot tensor (80 at the B29 M=1 default; 320 under the M=4
@@ -1904,19 +1955,23 @@ class JepaPredictor(nn.Module):
     per-head LN** (~0.6M params), discarded after SSL. Depth is a config knob
     (D2 center 3; sweep {2, 3, 4}). ``R-p1-predictor-large`` = 16@512.
 
-    **Positional scheme — RoPE-on-time-only** (Ben 2026-06-04,
-    [[project_v14_predictor_design_rope_lock_2026_06_04]]). RoPE assumes an
-    ordered/metric axis; our parcel axis is *unordered anatomy*, so RoPE is
-    applied to the TIME axis only (on both context and query tokens, inside
-    the block self-attention — the encoder-consistent ``_JointTokenBlock`` path)
-    and the non-time identity (freq-patch for P1, parcel-id for P2) is carried
-    by a **learned additive ``id_embed``** on the query. Context carries its
-    identity through content (the encoded token), so it gets RoPE-time only.
-    This fixes the pre-fix ``context_pos=None`` time-blindness and mirrors the
-    encoder (RoPE time + learned ``freq_embed`` / ``ParcelEmbed``). Sisters:
-    ``R-pred-2d-rope-freq`` (P1 freq also rotary), ``R-pred-additive-sincos``
-    (the pre-fix fixed-sinusoid scheme, a must-beat falsifier — its builder
-    ``factored_sinusoidal_pos_emb`` is retained).
+    **Positional scheme — RoPE-on-time + identity tag** (Ben 2026-06-04,
+    [[project_v14_predictor_design_rope_lock_2026_06_04]]; freq-pos refined
+    2026-06-09). RoPE (relative) is applied to the TIME axis only (on both
+    context and query tokens, inside the block self-attention — the
+    encoder-consistent ``_JointTokenBlock`` path, because the time grid varies
+    in length). The non-time identity is carried by an additive tag on the
+    query (``_id_tag``), whose form matches the axis: **PARCEL (P2) is unordered
+    anatomy → a learned ``id_embed`` table** (RoPE/sincos would impose a false
+    metric); **FREQ-PATCH (P1) is ordered → a fixed A-JEPA/MAE sincos table**
+    (``id_pos="sinusoidal"``, the 2026-06-09 default — an absolute code + a
+    smoothness/ordering prior), matching the encoder front-end's freq
+    positional. Context carries its identity through content (the encoded
+    token), so it gets RoPE-time only. Sisters: ``R-freq-learned-embed``
+    (P1 freq back to a learned table, ``id_pos="learned"``),
+    ``R-pred-2d-rope-freq`` (P1 freq rotary instead of sincos),
+    ``R-pred-additive-sincos`` (the pre-fix factored-sinusoid scheme — its
+    builder ``factored_sinusoidal_pos_emb`` is retained).
 
     The predictor consumes:
 
@@ -1963,6 +2018,15 @@ class JepaPredictor(nn.Module):
         # key-padded path when ``query_valid`` is None. Default OFF (dense path
         # bit-identical). See test_v14_ragged_predictor.
         ragged_predictor: bool = False,
+        # 2026-06-09 freq-pos lock: positional scheme for the non-time identity
+        # axis. "learned" (default) = a learned ``nn.Embedding`` table — the
+        # right prior for the UNORDERED parcel axis (P2). "sinusoidal" = a fixed
+        # 1-D MAE sincos table (A-JEPA), used for the ORDERED freq-patch axis
+        # (P1) so the predictor tags freq the same ordered way the encoder
+        # positions it. The joint module sets this per phase
+        # (P1+encoder.freq_pos=="sinusoidal" → "sinusoidal"; P2 always
+        # "learned").
+        id_pos: tp.Literal["learned", "sinusoidal"] = "learned",
     ) -> None:
         super().__init__()
         if hidden % n_heads != 0:
@@ -1981,11 +2045,26 @@ class JepaPredictor(nn.Module):
         # this vector, then gets its identity via ``id_embed`` and its time via
         # RoPE inside the blocks.
         self.mask_token = nn.Parameter(torch.zeros(hidden))
-        # Learned additive embedding for the UNORDERED non-time identity axis
-        # (freq-patch for P1, parcel-slot for P2). Replaces the pre-fix fixed
-        # ``factored_sinusoidal_pos_emb`` tag — the parcel axis has no metric,
-        # so a learned table (not a sinusoid / not RoPE) is the right prior.
-        self.id_embed = nn.Embedding(n_identity, hidden)
+        # Additive tag for the non-time identity axis (freq-patch for P1,
+        # parcel-slot for P2), looked up via ``_id_tag``. PARCEL is unordered →
+        # a learned table is the right prior (RoPE/sincos would impose a false
+        # metric). FREQ-PATCH is ordered → "sinusoidal" uses a fixed A-JEPA/MAE
+        # sincos table (absolute code + smoothness prior), matching the encoder
+        # front-end's freq positional under the 2026-06-09 freq-pos lock; the
+        # pre-fix ``factored_sinusoidal_pos_emb`` tag is retired.
+        self.id_pos = id_pos
+        if id_pos == "sinusoidal":
+            self.register_buffer(
+                "_id_table", _sincos_1d(n_identity, hidden), persistent=False,
+            )
+            self.id_embed = None
+        elif id_pos == "learned":
+            self.id_embed = nn.Embedding(n_identity, hidden)
+            self._id_table = None
+        else:
+            raise ValueError(
+                f"id_pos must be 'learned' or 'sinusoidal', got {id_pos!r}"
+            )
         # Encoder-consistent RoPE-time blocks (pre-norm, RoPE on Q+K time axis,
         # GELU MLP 4×, no per-head LN). Reuses the exact ``_JointTokenBlock``
         # the front-end token blocks use, so the autocast/dtype behaviour is
@@ -2007,7 +2086,18 @@ class JepaPredictor(nn.Module):
         nn.init.trunc_normal_(self.output_proj.weight, std=0.02)
         nn.init.zeros_(self.output_proj.bias)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.id_embed.weight, std=0.02)
+        if self.id_embed is not None:  # learned table; sincos buffer is fixed
+            nn.init.trunc_normal_(self.id_embed.weight, std=0.02)
+
+    def _id_tag(self, ids: Tensor) -> Tensor:
+        """Additive identity tag for the masked-query slots ``ids`` (any shape).
+
+        Returns ``(*ids.shape, hidden)`` — the learned ``id_embed`` lookup, or
+        the fixed sincos table gather under ``id_pos="sinusoidal"`` (freq axis).
+        """
+        if self.id_pos == "sinusoidal":
+            return self._id_table[ids]
+        return self.id_embed(ids)
 
     def forward(
         self,
@@ -2040,7 +2130,7 @@ class JepaPredictor(nn.Module):
         B, n_ctx, _ = context.shape
         n_qry = query_time_ids.shape[0]
         h_ctx = self.input_proj(context)                        # (B, N_ctx, h)
-        q = self.mask_token.view(1, 1, -1) + self.id_embed(query_id).unsqueeze(0)
+        q = self.mask_token.view(1, 1, -1) + self._id_tag(query_id).unsqueeze(0)
         q = q.expand(B, n_qry, -1)                              # (B, N_qry, h)
         seq = torch.cat([h_ctx, q], dim=1)                     # (B, N_ctx+N_qry, h)
 
@@ -2121,7 +2211,7 @@ class JepaPredictor(nn.Module):
         q_idx, q_real, Qmax = _ragged_gather_idx(query_valid)    # (B, Qmax) each
         qid_bc = query_id.unsqueeze(0).expand(B, n_qry)
         qid_g = torch.gather(qid_bc, 1, q_idx)                   # (B, Qmax)
-        q = self.mask_token.view(1, 1, -1) + self.id_embed(qid_g)  # (B, Qmax, h)
+        q = self.mask_token.view(1, 1, -1) + self._id_tag(qid_g)  # (B, Qmax, h)
         qtime_bc = query_time_ids.unsqueeze(0).expand(B, n_qry)
         q_time = torch.gather(qtime_bc, 1, q_idx)                # (B, Qmax)
 
@@ -2649,6 +2739,13 @@ class V14ParcelPerceiver(BaseModelConfig):
     # behind a P4 transfer ablation. Default OFF. See test_v14_ragged_token.
     ragged_token: bool = False
 
+    # 2026-06-09 freq-pos lock (A-JEPA): freq-patch axis positional encoding.
+    # "sinusoidal" (default) = fixed MAE sincos (ordered freq axis, like
+    # A-JEPA/AudioMAE); "learned" = R-freq-learned-embed sister (pre-lock
+    # learned table). Threaded to the encoder; the joint module mirrors it to
+    # the P1 predictor's freq id-tag (P2 parcel stays learned).
+    freq_pos: tp.Literal["sinusoidal", "learned"] = "sinusoidal"
+
     # SSL-pretrain dispatch flags persisted on the model config so they
     # ride along with the run-record YAML. The encoder ``build`` does
     # not branch on them — they are metadata for sister-cell rollouts
@@ -2705,6 +2802,7 @@ class V14ParcelPerceiver(BaseModelConfig):
             ragged_frontend=self.ragged_frontend,
             ragged_parcel=self.ragged_parcel,
             ragged_token=self.ragged_token,
+            freq_pos=self.freq_pos,
         )
         # B35: P4 readout. The "pma_*" options collapse parcels with a
         # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only

@@ -297,6 +297,20 @@ class V14JointBrainModule(pl.LightningModule):
             n_identity = encoder.n_freq_patches
         else:  # p2
             n_identity = encoder.k_parcels * encoder.m_sub_slots
+        # 2026-06-09 freq-pos lock: the P1 predictor tags masked queries by the
+        # ORDERED freq-patch axis, so it mirrors the encoder's freq positional
+        # (``encoder.freq_pos`` — sincos by default; "learned" under the
+        # R-freq-learned-embed sister). The P2 predictor tags by the UNORDERED
+        # parcel axis → always a learned table (sincos would impose a false
+        # anatomical metric).
+        id_pos: tp.Literal["learned", "sinusoidal"] = (
+            tp.cast(
+                tp.Literal["learned", "sinusoidal"],
+                getattr(encoder, "freq_pos", "learned"),
+            )
+            if phase == "p1"
+            else "learned"
+        )
         # Predictor sizing is a config knob: default 3@128/4-head (the locked
         # P0 center), so the depth sweep {2,3,4} and the R-p1-predictor-large
         # (16@512) underfit-recovery sister are launchable from dispatch
@@ -309,6 +323,7 @@ class V14JointBrainModule(pl.LightningModule):
             depth=predictor_depth,
             max_time_patches=encoder.max_n_time_patches,
             ragged_predictor=ragged_predictor,
+            id_pos=id_pos,
         )
         self.optim_config = optim_config
         # ── torch.compile forward override (Speedup C1) ──
