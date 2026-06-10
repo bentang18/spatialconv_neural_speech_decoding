@@ -724,34 +724,40 @@ def build_v14_experiment(
     # token-block + predictor FFN by the pad fraction (~50% at BT-Lite c_max=256
     # ⇒ unblocks raw bs=8 + ~halves front-end step time on padded batches).
     ragged_frontend: bool = False,
-    # 2026-06-09 ragged parcel drop (#92): default-off. When ON, the P2 parcel
-    # encoder gathers only covered-&-visible parcels (pad-to-max per sample),
-    # runs the parcel/time SA over them, and scatters back as zeros. Because the
-    # dense path already key-masks uncovered/masked parcels out of attention,
-    # the kept-parcel M4 is loss-neutral (bit-identical up to ~1e-6 matmul
-    # reassociation); the win is cutting the parcel-SA + predictor FFN by the
-    # dropped fraction. Independent of ``ragged_frontend`` (front-end vs parcel).
-    ragged_parcel: bool = False,
-    # 2026-06-09 P1 token drop (#93, V-JEPA-2 visible-only front-end): default-off.
+    # 2026-06-09 ragged parcel drop (#92): DEFAULT-ON (flipped after the
+    # warm-4-GPU throughput matrix). When ON, the P2 parcel encoder gathers only
+    # covered-&-visible parcels (pad-to-max per sample), runs the parcel/time SA
+    # over them, and scatters back as zeros. Because the dense path already
+    # key-masks uncovered/masked parcels out of attention, the kept-parcel M4 is
+    # loss-neutral (bit-identical up to ~1e-6 matmul reassociation); the win is
+    # cutting the parcel-SA + predictor FFN by the dropped fraction. Bit-identical
+    # ⇒ safe to default-on. Escape: ``--no-ragged-parcel``. Independent of
+    # ``ragged_frontend`` (front-end vs parcel).
+    ragged_parcel: bool = True,
+    # 2026-06-09 P1 token drop (#93, V-JEPA-2 visible-only front-end): DEFAULT-ON.
     # When ON, the per-electrode joint token blocks run ONLY over the VISIBLE
     # (non-masked, valid, freq-valid-kept) (t_p, f_p) tokens — gather → pad-to-max
     # → scatter back as zeros — with a per-row time-RoPE. Unlike ragged_frontend/
     # ragged_parcel this is a REPRESENTATION CHANGE: the dense path zeroes masked
     # tokens but still lets them attend (a zero LayerNorm-normalises to a constant
-    # key), so dropping them makes the encoder truly visible-only (canonical
-    # V-JEPA 2 §2.1) — bit-identical to key-masking the masked tokens out, but
-    # distinct from the zero-in-place default, hence gated behind a P4 transfer
-    # ablation. Independent of ragged_frontend/ragged_parcel (token vs row vs
-    # parcel axis).
-    ragged_token: bool = False,
+    # key), so dropping them makes the encoder truly visible-only — which IS the
+    # canonical V-JEPA 2 §2.1 design (the zero-and-attend dense path was the
+    # deviation, not the spec). On those grounds #93 is the default; the P4
+    # transfer ablation is a CONFIRM (canonical ≥ legacy) run in parallel, NOT a
+    # gate that blocks the default. Bit-identical to key-masking the masked tokens
+    # out. Escape: ``--no-ragged-token``. Independent of ragged_frontend/
+    # ragged_parcel (token vs row vs parcel axis). Dominant throughput lever in P1:
+    # ~3× per-step compute (1.80→0.60 s/step, no-compile, warm 4-GPU matrix).
+    ragged_token: bool = True,
     # 2026-06-09 predictor context+query drop (#94, V-JEPA-2 visible-only
-    # predictor): default-off. When ON, the JEPA predictor gathers ONLY the
+    # predictor): DEFAULT-ON. When ON, the JEPA predictor gathers ONLY the
     # visible context cells + ONLY the real masked query slots (pad-to-max)
     # instead of feeding the full grid and key-padding the rest. BIT-identical to
     # the dense path (padded slots are key-masked out → exp(NEG_INF)=0), a pure
-    # FLOP cut on the predictor attention/FFN at high mask ratio. Covers BOTH P1
-    # and P2 (one predictor per joint phase). Joint-only (no effect on P3/P4).
-    ragged_predictor: bool = False,
+    # FLOP cut on the predictor attention/FFN at high mask ratio ⇒ safe to
+    # default-on. Escape: ``--no-ragged-predictor``. Covers BOTH P1 and P2 (one
+    # predictor per joint phase). Joint-only (no effect on P3/P4).
+    ragged_predictor: bool = True,
     # WS-F / B33 Phase-3 distillation routing (#21). ``p3_distill=True`` returns
     # a :class:`V14Phase3Experiment` (Whisper all-layer-mean SmoothL1 distill)
     # instead of the joint / supervised path; ``p3_stage`` picks 3a (encoder
@@ -1426,11 +1432,15 @@ def build_v14_experiment(
             # 2026-06-08 ragged front-end (#91): default-off; skip pad
             # electrodes in the per-electrode token blocks (+ P1 loss).
             "ragged_frontend": ragged_frontend,
-            # 2026-06-09 ragged parcel drop (#92): default-off; gather covered-&-
-            # visible parcels only in the P2 encoder (pad-to-max, scatter back).
+            # 2026-06-09 ragged parcel drop (#92): default-ON (dispatch threads the
+            # real value, overriding the conservative encoder-library default);
+            # gather covered-&-visible parcels only in the P2 encoder (pad-to-max,
+            # scatter back). Bit-identical to the dense key-masked path.
             "ragged_parcel": ragged_parcel,
-            # 2026-06-09 P1 token drop (#93): default-off; run the front-end token
-            # blocks over visible (t_p, f_p) tokens only (pad-to-max, scatter).
+            # 2026-06-09 P1 token drop (#93): default-ON (canonical V-JEPA-2
+            # visible-only front-end); run the front-end token blocks over visible
+            # (t_p, f_p) tokens only (pad-to-max, scatter). P4-transfer confirm
+            # runs in parallel as a regression check, not a gate.
             "ragged_token": ragged_token,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
@@ -2020,52 +2030,56 @@ def _parser() -> argparse.ArgumentParser:
              "fraction (~50%% at BT-Lite c_max=256) — unblocks raw bs=8 and "
              "~halves front-end step time on padded batches. OFF by default.",
     )
-    # 2026-06-09 ragged parcel drop (#92): OFF by default (dense path
-    # bit-identical up to ~1e-6 matmul reassociation). When ON, the P2 parcel
-    # encoder gathers covered-&-visible parcels only (pad-to-max), runs SA over
-    # them, and scatters back as zeros — cutting the parcel-SA + predictor FFN
-    # by the dropped fraction. Independent of --ragged-frontend.
+    # 2026-06-09 ragged parcel drop (#92): ON by default (dense path
+    # bit-identical up to ~1e-6 matmul reassociation, so safe). When ON, the P2
+    # parcel encoder gathers covered-&-visible parcels only (pad-to-max), runs SA
+    # over them, and scatters back as zeros — cutting the parcel-SA + predictor
+    # FFN by the dropped fraction. Independent of --ragged-frontend.
     p.add_argument(
-        "--ragged-parcel", dest="ragged_parcel",
-        action="store_true", default=False,
+        "--ragged-parcel", "--no-ragged-parcel", dest="ragged_parcel",
+        action=argparse.BooleanOptionalAction, default=True,
         help="Gather covered-&-visible parcels only in the P2 encoder "
              "(pad-to-max per sample, scatter back as zeros). The dense path "
              "already key-masks uncovered/masked parcels out of attention, so "
              "the kept-parcel M4 is loss-neutral (bit-identical up to ~1e-6 "
              "matmul reassociation); the win is cutting the parcel-SA + "
-             "predictor FFN by the dropped fraction. OFF by default.",
+             "predictor FFN by the dropped fraction. ON by default; "
+             "--no-ragged-parcel restores the dense path.",
     )
-    # 2026-06-09 P1 token drop (#93): OFF by default. A REPRESENTATION CHANGE
-    # (not loss-neutral): drops masked (t_p, f_p) tokens from the front-end token
-    # blocks (vs zeroing-but-still-attending), making the encoder truly
-    # visible-only (canonical V-JEPA 2). Bit-identical to key-masking the masked
-    # tokens out, but distinct from the zero-in-place default → gate behind a P4
-    # transfer ablation before enabling on a production run.
+    # 2026-06-09 P1 token drop (#93): ON by default. The canonical V-JEPA 2
+    # visible-only front-end — drops masked (t_p, f_p) tokens from the token
+    # blocks (vs zeroing-but-still-attending), so the encoder is truly
+    # visible-only (V-JEPA 2 §2.1). The zero-and-attend dense path was the
+    # deviation, not the spec, so #93 is the default. A REPRESENTATION CHANGE
+    # (not loss-neutral vs the legacy dense path), so the P4 transfer ablation
+    # runs in parallel as a CONFIRM (canonical ≥ legacy), NOT a gate. Dominant P1
+    # throughput lever: ~3× per-step compute (warm 4-GPU matrix 2026-06-09).
     p.add_argument(
-        "--ragged-token", dest="ragged_token",
-        action="store_true", default=False,
+        "--ragged-token", "--no-ragged-token", dest="ragged_token",
+        action=argparse.BooleanOptionalAction, default=True,
         help="Run the front-end token blocks over VISIBLE (t_p, f_p) tokens only "
              "(pad-to-max per electrode row, per-row time-RoPE, scatter back as "
-             "zeros). REPRESENTATION CHANGE vs the zero-in-place default (the "
-             "encoder becomes truly visible-only, canonical V-JEPA 2) — "
-             "bit-identical to key-masking masked tokens out, but distinct from "
-             "the default, so gate behind a P4 transfer ablation. OFF by default.",
+             "zeros) — the canonical V-JEPA 2 visible-only encoder. REPRESENTATION "
+             "CHANGE vs the legacy zero-and-attend path (bit-identical to "
+             "key-masking masked tokens out). ON by default; --no-ragged-token "
+             "restores the legacy dense path. Dominant P1 throughput lever (~3×).",
     )
-    # 2026-06-09 predictor context+query drop (#94): OFF by default (dense path
-    # bit-identical up to ~1e-6 matmul reassociation). When ON, the JEPA
+    # 2026-06-09 predictor context+query drop (#94): ON by default (dense path
+    # bit-identical up to ~1e-6 matmul reassociation, so safe). When ON, the JEPA
     # predictor consumes ONLY the visible context + ONLY the real masked query
     # (pad-to-max), instead of feeding the full grid and key-padding the rest.
     # Joint-only (P1 + P2). Independent of the encoder ragged flags.
     p.add_argument(
-        "--ragged-predictor", dest="ragged_predictor",
-        action="store_true", default=False,
+        "--ragged-predictor", "--no-ragged-predictor", dest="ragged_predictor",
+        action=argparse.BooleanOptionalAction, default=True,
         help="Feed the JEPA predictor ONLY the visible context cells + ONLY the "
              "real masked query slots (pad-to-max per sample), instead of the "
              "full grid with the rest key-padded. The padded slots are masked "
              "out of attention either way (exp(NEG_INF)=0), so the prediction is "
              "bit-identical (up to ~1e-6 matmul reassociation); the win is a pure "
              "FLOP cut on the predictor attention/FFN at high mask ratio. Covers "
-             "BOTH P1 and P2. OFF by default.",
+             "BOTH P1 and P2. ON by default; --no-ragged-predictor restores the "
+             "dense path.",
     )
     # 2026-06-07 speedup-fanout C1: torch.compile the student/teacher encoder
     # forward. The toggle is the ``V14_COMPILE`` env var read inside
@@ -2080,11 +2094,13 @@ def _parser() -> argparse.ArgumentParser:
     # 2026-06-09: DEFAULT FLIPPED ON. Static torch.compile is loss-neutral
     # (P1 ±5% tripwire PASS: max 2.56%, mean 0.81% over 50 steps — compile only
     # reassociates fp ops) and net-POSITIVE on the long production passes
-    # (P1 ~1500 steps + the full-encoder P2): it cuts steady per-step ~35%
-    # (1.68→~1.09 s/step on 4× RTX 5000 Ada), and the cold-start + ragged
-    # recompile-storm overhead (~first ~200 steps) amortizes over a long run.
-    # STATIC, not dynamic: the storm amortizes, whereas --compile-dynamic carries
-    # a permanent per-step penalty that only pays off on short runs.
+    # (P1 ~1500 steps + the full-encoder P2): it cuts steady per-step ~6× the
+    # eager kernels (1.80→0.30 s/step dense, warm 4-GPU matrix 2026-06-09), and
+    # the ~105s/job compile re-trace tax amortizes over a long run. Paired with
+    # --compile-dynamic (now also default-ON): with ragged ON the per-batch shape
+    # varies, and the matrix showed dynamic==static warm (no per-step penalty)
+    # while dynamic eliminates the static recompile storm — so dynamic is the
+    # better default here (see --compile-dynamic).
     # ESCAPE: ``--no-compile`` for runs where the cold-start does NOT amortize —
     # the M0 sweep's short BT-lite cells (#45), smoke/debug runs, and anything
     # under a few-hundred steps. P3/P4 are separate modules and ignore this flag.
@@ -2106,16 +2122,26 @@ def _parser() -> argparse.ArgumentParser:
              "DDP AccumulateGrad cross-stream comm + find_unused_parameters break "
              "graph capture (shape-independent); use 'default'.",
     )
+    # 2026-06-09: DEFAULT FLIPPED ON. The warm 4-GPU matrix measured dynamic ==
+    # static warm (150-step submit→done 121s == 121s) — i.e. NO per-step penalty,
+    # contradicting the earlier "marginally slower" worry. With ragged ON the
+    # per-batch pad-to-max electrode count varies, so STATIC recompiles for every
+    # distinct shape — a recompile storm that recurs across a long run as new
+    # max-counts appear (and a 301s vs 121s cold storm on the first ragged job).
+    # dynamic=True compiles ONCE with symbolic shapes and absorbs all of it at no
+    # warm cost ⇒ strictly better here. ESCAPE: ``--no-compile-dynamic`` for
+    # fixed-shape (non-ragged) runs where static specialization is marginally
+    # tighter. No effect when --no-compile.
     p.add_argument(
-        "--compile-dynamic", dest="compile_dynamic",
-        action="store_true", default=False,
-        help="Compile ONCE with symbolic shapes (sets V14_COMPILE_DYNAMIC=1). On "
-             "the ragged front-end the per-batch electrode count varies, so the "
-             "default static compile recompiles for every distinct shape — a "
-             "warm-start cost that GROWS with step count (recompile storm). "
-             "dynamic=True absorbs the varying dim into one graph. Per-step may be "
-             "marginally slower; net win is the eliminated recompiles. Pair with "
-             "--compile; loss-neutral (±5% tripwire is the backstop).",
+        "--compile-dynamic", "--no-compile-dynamic", dest="compile_dynamic",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Compile ONCE with symbolic shapes (sets V14_COMPILE_DYNAMIC=1). "
+             "With ragged ON the per-batch electrode count varies, so static "
+             "compile recompiles per distinct shape (storm); dynamic absorbs the "
+             "varying dim into one graph at no measured warm per-step cost "
+             "(matrix: dynamic==static warm). ON by default; --no-compile-dynamic "
+             "for fixed-shape runs. No effect when --no-compile. Loss-neutral "
+             "(±5% tripwire is the backstop).",
     )
     # 2026-06-09 throughput levers — front-doors for env vars read in data.py /
     # experiment.py (env, not pydantic fields → never fork the exca uid). All
