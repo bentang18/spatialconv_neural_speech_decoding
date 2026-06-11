@@ -428,11 +428,38 @@ class CollapseGuardCallback(pl.Callback):
             and self._best_val_loss > self._blowup_min_floor
         ):
             ratio = val_loss / self._best_val_loss
+            # Gate loss_blowup on RankMe ALSO collapsing. Under V-JEPA EMA
+            # self-distillation a RISING L1 loss with HEALTHY/rising RankMe is
+            # the DE-COLLAPSE signature, not divergence: the early loss minimum
+            # is the collapsed-target regime (low-variance EMA target trivially
+            # nailed by the predictor), so as representation rank recovers the
+            # target becomes rich and L1 NECESSARILY climbs. Anchoring the
+            # blow-up ratio to that collapsed minimum false-killed recovery
+            # (longconst20k step 6003: 11.0× the collapsed best). Only fire when
+            # loss climbs AND the representation is LOSING rank.
+            rank_alarms = [
+                _as_float(metrics.get(f"{b}_alarm"))
+                for b in ("val_mon_rankme", "val_mon_frontend_rankme")
+            ]
+            rank_alarms = [a for a in rank_alarms if a is not None]
+            # No rank signal at all -> fall back to loss-only (fail-safe: keep
+            # the guard armed for run types that don't log RankMe).
+            rank_collapsing = (
+                max(rank_alarms) >= self._alarm_fraction
+                if rank_alarms
+                else True
+            )
             out["loss_blowup"] = (
-                ratio > self._blowup_factor,
+                (ratio > self._blowup_factor) and rank_collapsing,
                 ratio,
                 f"val_loss {val_loss:.4g} is {ratio:.1f}× the best "
-                f"{self._best_val_loss:.4g} seen this phase",
+                f"{self._best_val_loss:.4g} seen this phase"
+                + (
+                    ""
+                    if rank_collapsing
+                    else " — but RankMe is healthy/rising (de-collapse, not "
+                    "divergence): suppressed"
+                ),
                 "Loss is climbing, not NaN — lower the LR or revert to the "
                 "last healthy checkpoint and resume with a smaller step.",
                 self._sustain,

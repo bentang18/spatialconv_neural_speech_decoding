@@ -144,7 +144,10 @@ class Experiment(BaseExperiment):
     limit_test_batches: int | float | None = None
     early_stopping_patience: int | None = None
     checkpoint_monitor: str = "val_loss"
-    collapse_guard: bool = True
+    # OFF by default (Ben 2026-06-11: NEVER auto-kill a run). RankMe/loss are
+    # still logged module-side for post-hoc checkpoint selection; opt IN with
+    # --collapse-guard if a specific run wants the #54 kill-switch armed.
+    collapse_guard: bool = False
     # Optimizer-step count of LR warmup, handed to the collapse guard so its
     # soft criteria (RankMe/coverage/loss-blowup) are not believed while the LR
     # is still ramping (representations legitimately look low-rank early). 0 →
@@ -289,6 +292,23 @@ class Experiment(BaseExperiment):
                         every_n_train_steps=step_cadence,
                     )
                 )
+            # Ladder capture (Ben 2026-06-11): keep ALL step-tagged checkpoints
+            # so (a) the probe-vs-steps curve has dense rungs and (b) a DDP/NCCL
+            # hang or SLURM preemption loses <=1000 steps instead of the whole
+            # run. The best/last callbacks above overwrite IN PLACE (save_top_k
+            # 1 and 0); this one never does (save_top_k=-1). ~115 MB each, ~20
+            # for a 20k-step run = ~2 GB — cheap insurance against lost compute.
+            callbacks.append(
+                ModelCheckpoint(
+                    dirpath=ckpt_dir,
+                    filename="ladder-{step}",
+                    auto_insert_metric_name=False,
+                    monitor=None,
+                    save_top_k=-1,
+                    save_last=False,
+                    every_n_train_steps=500,
+                )
+            )
         if self.early_stopping_patience is not None:
             callbacks.append(
                 EarlyStopping(
