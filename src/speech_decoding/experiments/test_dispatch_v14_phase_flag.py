@@ -543,6 +543,72 @@ def test_ssl_sweep_cli_flags_default_none_and_parse(monkeypatch) -> None:
     assert calls2[0]["m4_mask_ratio"] == 0.3
 
 
+# ---------------------------------------------------------------------------
+# #127 M2 band-WIDTH knobs: --m2-time-band-floor / --m2-freq-band-floor. Unlike
+# the ratio/τ flags these carry a non-None default (the 6/03 lock: time 2,
+# freq 1) and thread through V14JointExperiment → ssl/mask.py::sample_m2_mask.
+# Widening the bands (larger floor) is the "1D bands too narrow" sweep lever.
+# ---------------------------------------------------------------------------
+
+
+def test_band_floor_defaults_reproduce_lock(tmp_path) -> None:
+    """Unset band floors resolve to the 6/03 lock (time 2 / freq 1) on the
+    joint experiment — byte-identical to the prior hardcoded mask grid."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+    )
+    assert xp.m2_time_band_floor == 2
+    assert xp.m2_freq_band_floor == 1
+
+
+def test_band_floor_overrides_thread_onto_joint_experiment(tmp_path) -> None:
+    """Wider band floors reach the V14JointExperiment fields sample_m2_mask
+    reads, so the swept (harder) mask grid actually takes effect."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+        m2_time_band_floor=4, m2_freq_band_floor=2,
+    )
+    assert xp.m2_time_band_floor == 4
+    assert xp.m2_freq_band_floor == 2
+
+
+def test_band_floor_below_one_raises_at_dispatch(tmp_path) -> None:
+    """A < 1 band width fails at build (fail-at-dispatch), not by silently
+    snapping to a 1-cell band hours into a run."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    base = dict(bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1")
+    with pytest.raises(ValueError, match="m2_time_band_floor"):
+        build_v14_experiment(**base, m2_time_band_floor=0)
+    with pytest.raises(ValueError, match="m2_freq_band_floor"):
+        build_v14_experiment(**base, m2_freq_band_floor=0)
+
+
+def test_band_floor_cli_flags_default_and_parse(monkeypatch) -> None:
+    """The CLI exposes --m2-time-band-floor / --m2-freq-band-floor; unset →
+    the locked defaults (2 / 1) reach the builder, a passed int reaches it
+    verbatim. These are non-None-default ints (cf. the None-sentinel ratio
+    flags), so the default itself is asserted."""
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run"])
+    assert rc == 0 and len(calls) == 1
+    assert calls[0]["m2_time_band_floor"] == 2
+    assert calls[0]["m2_freq_band_floor"] == 1
+
+    calls2 = _capture_builds(monkeypatch)
+    rc2 = main([
+        "--phase", "1", "--fast-dev-run",
+        "--m2-time-band-floor", "4", "--m2-freq-band-floor", "2",
+    ])
+    assert rc2 == 0 and len(calls2) == 1
+    assert calls2[0]["m2_time_band_floor"] == 4
+    assert calls2[0]["m2_freq_band_floor"] == 2
+
+
 def test_b37_pool_mean_auto_resolves_ssl_mode_joint(monkeypatch) -> None:
     """--pool mean with no --ssl-mode resolves to joint and reaches the build
     with pool=mean + ssl_mode=joint (the #108 nano-launch default path)."""

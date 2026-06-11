@@ -222,6 +222,8 @@ DEFAULT_M2_MASK_TYPE: str = "bands"       # 6/03 masking lock
 DEFAULT_M2_MASK_RATIO: float = 0.50       # 6/03 masking lock
 DEFAULT_M4_MASK_TYPE: str = "tube"        # 6/03 masking lock
 DEFAULT_M4_MASK_RATIO: float = 0.20       # 6/03 masking lock
+DEFAULT_M2_TIME_BAND_FLOOR: int = 2       # 6/03 masking lock (M2 band width along T_p)
+DEFAULT_M2_FREQ_BAND_FLOOR: int = 1       # 6/03 masking lock (M2 band width along F_p)
 # EMA teacher momentum τ (B26 lock; mirrors ssl/ema.py P1_EMA_TAU == P2_EMA_TAU).
 # The SSL-sweep CLI flags (--ema-tau / --m{2,4}-mask-ratio) default to None and
 # resolve to these constants inside build_v14_experiment, so an UNSET flag is
@@ -751,6 +753,15 @@ def build_v14_experiment(
     m2_mask_ratio: float | None = None,
     m4_mask_type: str = DEFAULT_M4_MASK_TYPE,
     m4_mask_ratio: float | None = None,
+    # M2 structured-band WIDTH along each axis (#sweep, 2026-06-11). The 6/03
+    # mask holds the masked FRACTION fixed and varies granularity: a LARGER floor
+    # = wider, fewer bands = harder reconstruction (the predictor can no longer
+    # copy the immediate spectro-temporal neighbour). Tests Ben's "1D bands too
+    # narrow → widen" hypothesis. Defaults reproduce the lock (time 2 / freq 1)
+    # exactly. NB: the realized masked fraction rounds DOWN when the width does
+    # not divide round(frac·n_valid) (see ssl/mask.py::_sample_axis_bands).
+    m2_time_band_floor: int = DEFAULT_M2_TIME_BAND_FLOOR,
+    m2_freq_band_floor: int = DEFAULT_M2_FREQ_BAND_FLOOR,
     # EMA teacher momentum τ override (#sweep). ``None`` resolves to
     # DEFAULT_EMA_TAU (== ssl/ema.py P1_EMA_TAU/P2_EMA_TAU, B26 lock) so an unset
     # flag reproduces the prior hardcoded 0.99925 exactly; a float in (0, 1)
@@ -963,6 +974,13 @@ def build_v14_experiment(
         m4_mask_ratio = DEFAULT_M4_MASK_RATIO
     elif not 0.0 <= m4_mask_ratio < 1.0:
         raise ValueError(f"m4_mask_ratio must lie in [0.0, 1.0); got {m4_mask_ratio}")
+    # Band WIDTHS are a positive count of grid cells; ssl/mask.py clamps width to
+    # [1, n_valid] internally, but reject < 1 here so a typo fails at dispatch
+    # rather than silently snapping to a 1-cell band.
+    if m2_time_band_floor < 1:
+        raise ValueError(f"m2_time_band_floor must be >= 1; got {m2_time_band_floor}")
+    if m2_freq_band_floor < 1:
+        raise ValueError(f"m2_freq_band_floor must be >= 1; got {m2_freq_band_floor}")
 
     optim_cfg = _build_optim_cfg(
         lr=lr, lr_schedule=lr_schedule, warmup_steps=warmup_steps,
@@ -1406,6 +1424,10 @@ def build_v14_experiment(
             "m2_mask_ratio": m2_mask_ratio,
             "m4_mask_type": m4_mask_type,
             "m4_mask_ratio": m4_mask_ratio,
+            # M2 band WIDTHS (#sweep). Forwarded to V14JointExperiment, which
+            # passes them to ssl/mask.py::sample_m2_mask (time/freq band floors).
+            "m2_time_band_floor": m2_time_band_floor,
+            "m2_freq_band_floor": m2_freq_band_floor,
             # SSL-sweep EMA τ override (#sweep). Resolved above (None →
             # DEFAULT_EMA_TAU == 0.99925, the B26 lock); threads onto
             # V14JointExperiment.ema_tau, which feeds the EmaTeacher schedule.
@@ -2490,6 +2512,22 @@ def _parser() -> argparse.ArgumentParser:
              "mask shape (the staged coupling gate does not apply).",
     )
     p.add_argument(
+        "--m2-time-band-floor", dest="m2_time_band_floor", type=int,
+        default=DEFAULT_M2_TIME_BAND_FLOOR,
+        help="#127 M2 masked-band WIDTH along time (T_p). Default 2 (6/03 lock). "
+             "LARGER = wider, fewer bands = harder reconstruction (predictor "
+             "cannot copy the adjacent time bin) — tests the 'bands too narrow' "
+             "hypothesis. The masked fraction is held fixed; realized fraction "
+             "rounds DOWN if width does not divide round(frac·T_p).",
+    )
+    p.add_argument(
+        "--m2-freq-band-floor", dest="m2_freq_band_floor", type=int,
+        default=DEFAULT_M2_FREQ_BAND_FLOOR,
+        help="#127 M2 masked-band WIDTH along frequency (F_p). Default 1 (6/03 "
+             "lock). LARGER = wider spectral bands = harder reconstruction. Same "
+             "fixed-fraction / round-down semantics as --m2-time-band-floor.",
+    )
+    p.add_argument(
         "--predictor-depth", dest="predictor_depth", type=int,
         default=DEFAULT_PREDICTOR_DEPTH,
         help="#76 STAGED single-predictor depth (default 3, the locked P0 "
@@ -2849,6 +2887,8 @@ def _common_build_kwargs(
         m2_mask_ratio=args.m2_mask_ratio,
         m4_mask_type=args.m4_mask_type,
         m4_mask_ratio=args.m4_mask_ratio,
+        m2_time_band_floor=args.m2_time_band_floor,
+        m2_freq_band_floor=args.m2_freq_band_floor,
         # SSL-sweep EMA τ override (#sweep). None → build_v14_experiment resolves
         # it to 0.99925 (the B26 lock); joint-only inside the builder, so passing
         # it on every phase (incl. P3/P4) is inert off the SSL path.
@@ -3308,6 +3348,7 @@ def main(argv: list[str] | None = None) -> int:
           f"{DEFAULT_M2_MASK_RATIO if args.m2_mask_ratio is None else args.m2_mask_ratio},"
           f"m4={args.m4_mask_type}@"
           f"{DEFAULT_M4_MASK_RATIO if args.m4_mask_ratio is None else args.m4_mask_ratio}) "
+          f"m2_band_floor=(t{args.m2_time_band_floor},f{args.m2_freq_band_floor}) "
           f"ema_tau={DEFAULT_EMA_TAU if args.ema_tau is None else args.ema_tau}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
