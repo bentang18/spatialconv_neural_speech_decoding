@@ -776,9 +776,12 @@ def test_chain_assembly_shape_and_handoff(monkeypatch, tmp_path) -> None:
         assert "whisper_target_cache_dir" not in calls[non_p3]
 
 
-def test_chain_p1_always_armed_default(monkeypatch, tmp_path) -> None:
-    """Default chain (guard armed): all four SSL/distill phases carry the guard;
-    P4 keeps its own collapse_guard=False (frozen probe)."""
+def test_chain_guard_off_by_default(monkeypatch, tmp_path) -> None:
+    """Never-kill default ([[feedback_never_kill_runs_save_every_500_2026_06_11]]):
+    the collapse guard is OFF for EVERY phase by default. No phase auto-kills a run
+    — Ben stops diverging runs himself; the monitors still log for post-hoc
+    checkpoint selection. P4 is always off (frozen probe, #54 M1). Supersedes the
+    pre-run-ops 'P1 always armed by default' contract."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
@@ -787,27 +790,26 @@ def test_chain_p1_always_armed_default(monkeypatch, tmp_path) -> None:
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
     ])
     dv._build_v14_chain(args, cross_attn_positions=None)
+    assert [c["collapse_guard"] for c in calls] == [False, False, False, False, False]
+
+
+def test_chain_collapse_guard_opt_in_arms_ssl_phases(monkeypatch, tmp_path) -> None:
+    """--collapse-guard is strictly opt-IN (never-kill directive). When armed it
+    enables the guard on all four SSL/distill phases (P1/P2/P3a/P3b); P4 is always
+    collapse_guard=False (frozen probe, #54 M1). The old 'P1 specially armed even
+    under --no-collapse-guard' asymmetry is gone — P1 now follows the flag like
+    every other phase, so a guard-off relaunch keeps a single stable exca UID."""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
+    calls = _capture_builds(monkeypatch)
+    args = _parse([
+        "--chain", "--work-dir", str(tmp_path),
+        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
+        "--collapse-guard",
+    ])
+    dv._build_v14_chain(args, cross_attn_positions=None)
+    # Opt-in arms P1/P2/P3a/P3b; P4 always off.
     assert [c["collapse_guard"] for c in calls] == [True, True, True, True, False]
-
-
-def test_chain_no_collapse_guard_keeps_p1_armed(monkeypatch, tmp_path) -> None:
-    """--no-collapse-guard disarms ONLY the parcel/distill phases (P2/P3a/P3b).
-    P1 STAYS armed: its M2 front-end RankMe floor (~0.31) is above the 0.25 hard
-    alarm so it can't false-positive, and keeping it armed pins P1's exca UID so
-    a guard-off relaunch reuses the cached P1 instead of re-running it. The M4
-    parcel phases (floor ~0.05) are the ones that false-positive, so only they
-    are disarmed. P4 is always collapse_guard=False (frozen probe, #54 M1)."""
-    import speech_decoding.experiments.dispatch_v14 as dv
-
-    calls = _capture_builds(monkeypatch)
-    args = _parse([
-        "--chain", "--work-dir", str(tmp_path),
-        "--whisper-target-cache-dir", "/c", "--no-target-standardize",
-        "--no-collapse-guard",
-    ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
-    # P1 armed; P2/P3a/P3b disarmed; P4 always off.
-    assert [c["collapse_guard"] for c in calls] == [True, False, False, False, False]
 
 
 def test_chain_threads_sister_flags(monkeypatch, tmp_path) -> None:

@@ -332,17 +332,24 @@ def test_periodic_last_ckpt_is_metric_independent_on_step_cadence(tmp_path) -> N
     so a second metric-INDEPENDENT ModelCheckpoint (every_n_train_steps) owns
     last.ckpt while the best.ckpt callback keeps best-by-metric only (save_last off
     -> exactly one owner, no Lightning -v auto-increment). On an epoch-cadence run
-    the single callback owns last.ckpt as before (unchanged)."""
+    the single best callback owns last.ckpt as before. A THIRD metric-independent
+    'ladder' callback (save_top_k=-1, every 500 steps) keeps EVERY checkpoint on
+    both cadences for post-hoc probe selection + resume insurance (never-kill
+    directive, [[feedback_never_kill_runs_save_every_500_2026_06_11]])."""
     from lightning.pytorch.callbacks import ModelCheckpoint
 
     base = _tiny_mlp_xp(tmp_path / "runs", n_epochs=1)
 
     stepped = base.model_copy(update={"val_check_interval": 150})
     ckpts = [c for c in stepped._callbacks() if isinstance(c, ModelCheckpoint)]
-    assert len(ckpts) == 2
+    # best + last + ladder.
+    assert len(ckpts) == 3
     best = [c for c in ckpts if c.monitor is not None]
-    last = [c for c in ckpts if c.monitor is None]
-    assert len(best) == 1 and len(last) == 1
+    # last (save_top_k=0, save_last) and ladder (save_top_k=-1) are both metric-independent.
+    metric_indep = [c for c in ckpts if c.monitor is None]
+    last = [c for c in metric_indep if c.save_top_k == 0]
+    ladder = [c for c in metric_indep if c.save_top_k == -1]
+    assert len(best) == 1 and len(last) == 1 and len(ladder) == 1
     # best.ckpt: top-1 by the monitor; save_last OFF so it never fights for last.ckpt.
     assert best[0].save_top_k == 1 and best[0].save_last is False
     assert best[0].monitor == stepped.checkpoint_monitor
@@ -350,11 +357,17 @@ def test_periodic_last_ckpt_is_metric_independent_on_step_cadence(tmp_path) -> N
     # (val_check_interval is already in optimizer steps == every_n_train_steps unit).
     assert last[0].save_last is True and last[0].save_top_k == 0
     assert last[0]._every_n_train_steps == 150
+    # ladder.ckpt: keep EVERY checkpoint on a fixed 500-step cadence (never-kill).
+    assert ladder[0].save_top_k == -1 and ladder[0].save_last is False
+    assert ladder[0]._every_n_train_steps == 500
 
-    # epoch-cadence (val_check_interval=None): single callback owns last.ckpt.
+    # epoch-cadence (val_check_interval=None): best owns last.ckpt; ladder still present.
     epoch_ckpts = [c for c in base._callbacks() if isinstance(c, ModelCheckpoint)]
-    assert len(epoch_ckpts) == 1
-    assert epoch_ckpts[0].save_last is True and epoch_ckpts[0].save_top_k == 1
+    assert len(epoch_ckpts) == 2
+    epoch_best = [c for c in epoch_ckpts if c.monitor is not None]
+    epoch_ladder = [c for c in epoch_ckpts if c.monitor is None and c.save_top_k == -1]
+    assert len(epoch_best) == 1 and len(epoch_ladder) == 1
+    assert epoch_best[0].save_last is True and epoch_best[0].save_top_k == 1
 
 
 def test_lr_log_interval_default_epoch(tmp_path) -> None:
