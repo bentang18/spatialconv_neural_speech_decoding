@@ -467,6 +467,148 @@ def test_b37_joint_threads_pool_ssl_mode_and_d8_scales(tmp_path) -> None:
     assert xp.brain_model_config.latent_parcel_depth == 3
 
 
+# ---------------------------------------------------------------------------
+# SSL-sweep override flags: --ema-tau / --m2-mask-ratio / --m4-mask-ratio
+# (None sentinels resolve to the locked constants; non-default values thread
+# onto V14JointExperiment → V14JointBrainModule). These knobs feed tonight's GPU
+# sweep, so a default-changing regression would silently invalidate the baseline.
+# ---------------------------------------------------------------------------
+
+
+def test_ssl_sweep_defaults_reproduce_locked_values(tmp_path) -> None:
+    """Unset --ema-tau / --m{2,4}-mask-ratio (None) resolve to the locked
+    constants (0.99925 / 0.50 / 0.20) on the joint experiment — byte-identical
+    to the prior hardcoded values."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+    )
+    assert xp.ema_tau == 0.99925
+    assert xp.m2_mask_ratio == 0.50
+    assert xp.m4_mask_ratio == 0.20
+
+
+def test_ssl_sweep_overrides_thread_onto_joint_experiment(tmp_path) -> None:
+    """Passed --ema-tau / --m{2,4}-mask-ratio reach the V14JointExperiment
+    fields the BrainModule reads (EMA schedule + mask samplers)."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+        ema_tau=0.9999, m2_mask_ratio=0.65, m4_mask_ratio=0.30,
+    )
+    assert xp.ema_tau == 0.9999
+    assert xp.m2_mask_ratio == 0.65
+    assert xp.m4_mask_ratio == 0.30
+
+
+def test_ssl_sweep_out_of_range_raises_at_dispatch(tmp_path) -> None:
+    """A bad swept value fails at build (fail-at-dispatch, not hours into a run):
+    τ is open (0, 1); held-out ratios are [0, 1)."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    base = dict(bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1")
+    for bad in (dict(ema_tau=1.0), dict(ema_tau=0.0)):
+        with pytest.raises(ValueError, match="ema_tau"):
+            build_v14_experiment(**base, **bad)
+    with pytest.raises(ValueError, match="m2_mask_ratio"):
+        build_v14_experiment(**base, m2_mask_ratio=1.0)
+    with pytest.raises(ValueError, match="m4_mask_ratio"):
+        build_v14_experiment(**base, m4_mask_ratio=-0.1)
+
+
+def test_ssl_sweep_cli_flags_default_none_and_parse(monkeypatch) -> None:
+    """The CLI exposes --ema-tau / --m{2,4}-mask-ratio (default None) and a
+    passed value reaches build_v14_experiment as a float; unset → None (the
+    builder resolves it to the locked constant). Mirrors the example invocation
+    ``--phase 1 ... --ema-tau 0.9999 --m2-mask-ratio 0.65``."""
+    # default: the three flags arrive at the builder as None (resolved inside)
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run"])
+    assert rc == 0 and len(calls) == 1
+    assert calls[0]["ema_tau"] is None
+    assert calls[0]["m2_mask_ratio"] is None
+    assert calls[0]["m4_mask_ratio"] is None
+
+    # override: the parsed floats reach the builder verbatim
+    calls2 = _capture_builds(monkeypatch)
+    rc2 = main([
+        "--phase", "1", "--fast-dev-run",
+        "--ema-tau", "0.9999", "--m2-mask-ratio", "0.65", "--m4-mask-ratio", "0.3",
+    ])
+    assert rc2 == 0 and len(calls2) == 1
+    assert calls2[0]["ema_tau"] == 0.9999
+    assert calls2[0]["m2_mask_ratio"] == 0.65
+    assert calls2[0]["m4_mask_ratio"] == 0.3
+
+
+# ---------------------------------------------------------------------------
+# #127 M2 band-WIDTH knobs: --m2-time-band-floor / --m2-freq-band-floor. Unlike
+# the ratio/τ flags these carry a non-None default (the 6/03 lock: time 2,
+# freq 1) and thread through V14JointExperiment → ssl/mask.py::sample_m2_mask.
+# Widening the bands (larger floor) is the "1D bands too narrow" sweep lever.
+# ---------------------------------------------------------------------------
+
+
+def test_band_floor_defaults_reproduce_lock(tmp_path) -> None:
+    """Unset band floors resolve to the 6/03 lock (time 2 / freq 1) on the
+    joint experiment — byte-identical to the prior hardcoded mask grid."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+    )
+    assert xp.m2_time_band_floor == 2
+    assert xp.m2_freq_band_floor == 1
+
+
+def test_band_floor_overrides_thread_onto_joint_experiment(tmp_path) -> None:
+    """Wider band floors reach the V14JointExperiment fields sample_m2_mask
+    reads, so the swept (harder) mask grid actually takes effect."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+        m2_time_band_floor=4, m2_freq_band_floor=2,
+    )
+    assert xp.m2_time_band_floor == 4
+    assert xp.m2_freq_band_floor == 2
+
+
+def test_band_floor_below_one_raises_at_dispatch(tmp_path) -> None:
+    """A < 1 band width fails at build (fail-at-dispatch), not by silently
+    snapping to a 1-cell band hours into a run."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    base = dict(bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1")
+    with pytest.raises(ValueError, match="m2_time_band_floor"):
+        build_v14_experiment(**base, m2_time_band_floor=0)
+    with pytest.raises(ValueError, match="m2_freq_band_floor"):
+        build_v14_experiment(**base, m2_freq_band_floor=0)
+
+
+def test_band_floor_cli_flags_default_and_parse(monkeypatch) -> None:
+    """The CLI exposes --m2-time-band-floor / --m2-freq-band-floor; unset →
+    the locked defaults (2 / 1) reach the builder, a passed int reaches it
+    verbatim. These are non-None-default ints (cf. the None-sentinel ratio
+    flags), so the default itself is asserted."""
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run"])
+    assert rc == 0 and len(calls) == 1
+    assert calls[0]["m2_time_band_floor"] == 2
+    assert calls[0]["m2_freq_band_floor"] == 1
+
+    calls2 = _capture_builds(monkeypatch)
+    rc2 = main([
+        "--phase", "1", "--fast-dev-run",
+        "--m2-time-band-floor", "4", "--m2-freq-band-floor", "2",
+    ])
+    assert rc2 == 0 and len(calls2) == 1
+    assert calls2[0]["m2_time_band_floor"] == 4
+    assert calls2[0]["m2_freq_band_floor"] == 2
+
+
 def test_b37_pool_mean_auto_resolves_ssl_mode_joint(monkeypatch) -> None:
     """--pool mean with no --ssl-mode resolves to joint and reaches the build
     with pool=mean + ssl_mode=joint (the #108 nano-launch default path)."""

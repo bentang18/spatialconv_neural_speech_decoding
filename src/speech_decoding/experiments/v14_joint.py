@@ -233,6 +233,14 @@ class V14JointExperiment(V14Experiment):
     predictor_scope: Literal["cross_time", "co_temporal"] = "cross_time"
     mask_seed: int = 0
 
+    # EMA teacher momentum τ (B26 lock; V-JEPA 2 §2.4 fixed/no-ramp). Default
+    # 0.99925 == ssl/ema.py P1_EMA_TAU/P2_EMA_TAU — so the field default is
+    # byte-identical to the prior hardcoded ``_build_brain_module`` value. The
+    # dispatch ``--ema-tau`` sweep flag threads an override here (R-ema-tau-{...});
+    # the BrainModule re-validates 0 < τ < 1 at construction. The ema.py constants
+    # are NOT mutated.
+    ema_tau: float = pydantic.Field(default=0.99925, gt=0.0, lt=1.0)
+
     # B36 §5/§14 paradigm-B predictor sizing. Default 3 blocks @ hidden=128,
     # 4 heads (the locked P0 center). These knobs make the mandated P0 depth
     # sweep {2,3,4} AND the ``R-p1-predictor-large`` (16@512) underfit-recovery
@@ -464,7 +472,7 @@ class V14JointExperiment(V14Experiment):
             predictor_n_heads=self.predictor_n_heads,
             ragged_predictor=self.ragged_predictor,
             mask_seed=self.mask_seed,
-            ema_tau=0.99925,
+            ema_tau=self.ema_tau,
             loss_form="l1",
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,

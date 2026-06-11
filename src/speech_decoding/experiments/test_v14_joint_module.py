@@ -746,6 +746,90 @@ def test_ema_step_updates_teacher_fixed_tau() -> None:
     torch.testing.assert_close(post, 0.99925 * pre + 0.00075 * 2.0)
 
 
+def test_ema_tau_override_changes_teacher_coefficient() -> None:
+    """SSL-sweep knob: a non-default ``ema_tau`` reaches the EmaTeacher schedule
+    so ``update_from`` blends at the swept τ — and the default reproduces the
+    B26-locked 0.99925 byte-for-byte (the same EMA-step contract as
+    ``test_ema_step_updates_teacher_fixed_tau``, parametrized by the new flag)."""
+    # default: unchanged locked behaviour
+    default_module = _make_module()
+    assert default_module.teacher.update_from(default_module.student) == pytest.approx(
+        0.99925
+    )
+
+    # override: the coefficient + the realized blend both move to the swept τ
+    tau = 0.9999
+    module = _make_module(ema_tau=tau)
+    with torch.no_grad():
+        module.student.encoder.encoder_ln.weight.fill_(2.0)
+    pre = module.teacher.model.encoder.encoder_ln.weight.detach().clone()
+    coeff = module.teacher.update_from(module.student)
+    post = module.teacher.model.encoder.encoder_ln.weight.detach().clone()
+    assert coeff == pytest.approx(tau)
+    torch.testing.assert_close(post, tau * pre + (1.0 - tau) * 2.0)
+
+
+def test_ema_tau_out_of_range_raises() -> None:
+    """The module re-validates τ ∈ (0, 1) at construction (open interval), so a
+    bad swept value fails loud rather than freezing/decaying the teacher."""
+    for bad in (0.0, 1.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="ema_tau"):
+            _make_module(ema_tau=bad)
+
+
+def test_mask_ratio_overrides_reach_samplers(monkeypatch) -> None:
+    """SSL-sweep knobs: ``m2_mask_ratio`` / ``m4_mask_ratio`` are stored on the
+    module and forwarded as the held-out/mask ratio at the actual sampler call
+    site in ``_sample_phase_mask``. Defaults reproduce the 6/03 masking lock
+    (0.50 / 0.20); a passed value overrides it. Spying the sampler ratio kwarg
+    is grid-independent (a count inequality saturates on the tiny test grid)."""
+    import speech_decoding.experiments.v14_joint_module as jm
+
+    # defaults: the locked held-out ratios are stored verbatim
+    default_module = _make_module()
+    assert default_module._m2_mask_ratio == 0.50
+    assert default_module._m4_mask_ratio == 0.20
+
+    batch = _make_synthetic_batch()
+    et = batch.data["electrode_tokens"]
+    support = batch.data["support"]
+
+    # P1 (M2): the configured held_out_ratio reaches sample_m2_mask. Spy the
+    # call, returning the real mask so the rest of the path is untouched.
+    seen_m2: dict[str, float] = {}
+    real_m2 = jm.sample_m2_mask
+
+    def _spy_m2(shape, **kw):
+        seen_m2["ratio"] = kw["held_out_ratio"]
+        return real_m2(shape, **kw)
+
+    monkeypatch.setattr(jm, "sample_m2_mask", _spy_m2)
+    for ratio in (0.50, 0.80):
+        m = _make_module(_make_tiny_encoder(), phase="p1", m2_mask_ratio=ratio)
+        assert m._m2_mask_ratio == ratio
+        m._sample_phase_mask(electrode_tokens=et, support=support)
+        assert seen_m2["ratio"] == ratio, (
+            f"m2_mask_ratio={ratio} must reach sample_m2_mask.held_out_ratio"
+        )
+
+    # P2 (M4): the configured mask_ratio reaches sample_m4_mask.
+    seen_m4: dict[str, float] = {}
+    real_m4 = jm.sample_m4_mask
+
+    def _spy_m4(support_arg, **kw):
+        seen_m4["ratio"] = kw["mask_ratio"]
+        return real_m4(support_arg, **kw)
+
+    monkeypatch.setattr(jm, "sample_m4_mask", _spy_m4)
+    for ratio in (0.20, 0.40):
+        m = _make_module(_make_tiny_encoder(), phase="p2", m4_mask_ratio=ratio)
+        assert m._m4_mask_ratio == ratio
+        m._sample_phase_mask(electrode_tokens=et, support=support)
+        assert seen_m4["ratio"] == ratio, (
+            f"m4_mask_ratio={ratio} must reach sample_m4_mask.mask_ratio"
+        )
+
+
 def test_ema_fires_once_per_optimizer_step_not_per_microbatch() -> None:
     """#46: the EMA update must live on ``on_before_zero_grad`` — Lightning's
     once-per-optimiser-step hook (after ``optimizer.step()``, before grads are
