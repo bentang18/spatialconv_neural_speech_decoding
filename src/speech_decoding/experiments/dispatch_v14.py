@@ -566,8 +566,9 @@ def build_v14_experiment(
     # has EarlyStopping on its real downstream val_loss, so the chain disables
     # the guard there (its loss-blowup criterion would only duplicate
     # EarlyStopping while risking an exca-cache-poisoning abort on benign
-    # probe over-fit). True for P1/P2/P3a/P3b.
-    collapse_guard: bool = True,
+    # probe over-fit). OFF by default everywhere now (Ben 2026-06-11: never
+    # auto-kill); opt IN per-run via --collapse-guard.
+    collapse_guard: bool = False,
     # --live nano learning-dynamics dashboard (near-free graphs: loss/val-loss,
     # RankMe, LR-curve). Defaults reproduce non-live behavior; at default values
     # they stay out of the exca cache uid. See
@@ -1592,13 +1593,19 @@ def _parser() -> argparse.ArgumentParser:
                         "training dynamics, not a full held-out eval — pass 2. "
                         "None (default) = uncapped (unchanged for real runs). "
                         "P4 is left uncapped (its test metric is load-bearing).")
+    # Collapse guard OFF by default (Ben 2026-06-11: NEVER auto-kill a run; he
+    # stops diverging runs himself). RankMe/loss are still logged module-side
+    # for post-hoc checkpoint selection — only the auto-TERMINATE is disarmed.
+    p.add_argument("--collapse-guard", dest="collapse_guard",
+                   action="store_true", default=False,
+                   help="OPT IN to the collapse/divergence kill-switch (#54) on "
+                        "the SSL/distill phases. OFF BY DEFAULT — a run is never "
+                        "terminated for you; RankMe/loss monitoring still logs. "
+                        "Only arm this for a specific run you WANT auto-aborted.")
     p.add_argument("--no-collapse-guard", dest="collapse_guard",
-                   action="store_false", default=True,
-                   help="Disarm the collapse/divergence kill-switch (#54) on the "
-                        "SSL/distill phases — DIAGNOSTIC ONLY. Lets a run record "
-                        "the full RankMe trajectory past the soft-warn streak "
-                        "instead of aborting (to confirm a born-low-rank floor "
-                        "vs a true decline). P4 never carries the guard anyway.")
+                   action="store_false", default=False,
+                   help="No-op alias: the guard is already OFF by default. Kept "
+                        "for backward compatibility with older launch scripts.")
     p.add_argument("--rankme-warn-threshold", dest="rankme_warn_threshold",
                    type=float, default=None,
                    help="MON-TEACHER-FEATURE-RANK soft-warn band on normalised "
@@ -1893,6 +1900,14 @@ def _parser() -> argparse.ArgumentParser:
                         "(default <task>_<mode>_p<phase>). Set per predict-then-"
                         "check rung so the overlay legend reads clearly, e.g. "
                         "--wandb-run-name p1-lr1e-4.")
+    p.add_argument("--wandb-run-id", dest="wandb_run_id", default=None,
+                   help="Resume an EXISTING W&B run by id (e.g. pf5e66wp) "
+                        "instead of minting a new one each launch. Threads into "
+                        "WandbLoggerConfig.id (resume='allow'), so an auto/"
+                        "--resume continuation appends to the ORIGINAL run line "
+                        "rather than starting a fresh, disconnected one. "
+                        "Excluded from the exca cell UID (wandb config is not "
+                        "hashed), so it does NOT fork the cache cell.")
     p.add_argument("--wandb-offline", dest="wandb_offline", action="store_true",
                    help="Log --live runs offline (no wandb login/network); sync "
                         "later with `wandb sync`.")
@@ -2318,6 +2333,7 @@ def _build_wandb_config(args) -> tp.Any | None:
     return WandbLoggerConfig(
         name=name, group=group, project=args.wandb_project,
         offline=args.wandb_offline,
+        id=getattr(args, "wandb_run_id", None),
     )
 
 
@@ -2566,7 +2582,8 @@ def _build_v14_chain(
         limit_val_batches=ssl_limit_val,
     )
     p1 = build_v14_experiment(
-        **common, **ssl_budget, collapse_guard=True, joint_phase=True,
+        **common, **ssl_budget, collapse_guard=args.collapse_guard,
+        joint_phase=True,
         jepa_phase="p1", clip_len=5.0, neural_lag_s=args.neural_lag_s,
     )
     p2 = build_v14_experiment(
@@ -2788,8 +2805,8 @@ def main(argv: list[str] | None = None) -> int:
           f"accumulate_grad_batches={args.accumulate_grad_batches}")
     print(f"  disc-lr: frontend_lr_scale={args.frontend_lr_scale} "
           f"parcel_lr_scale={args.parcel_lr_scale} (P2/P3 discriminative-LR)")
-    print(f"  guard: collapse_guard={args.collapse_guard} (SSL phases; #68 "
-          f"--no-collapse-guard disarms) "
+    print(f"  guard: collapse_guard={args.collapse_guard} (OFF by default — "
+          f"never auto-kills; --collapse-guard opts in) "
           f"ssl_val_check_interval={args.ssl_val_check_interval} (opt-steps, "
           f"×accum at Trainer #66) ssl_limit_val_batches={args.ssl_limit_val_batches}")
     _warn_disp = ("phase-default (P1/M2 0.5, P2/M4 0.04)"
