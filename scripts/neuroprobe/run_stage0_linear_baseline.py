@@ -532,6 +532,30 @@ def run_eval(
                     )
                     y_test = np.array([item[1] for item in test_dataset])
                     gc.collect()
+                    if args.pool_parcel_mean and splits_type != "CrossSubject":
+                        # Diagnostic mean-before pool (the encoder's D2 op, NO encoder):
+                        # masked-mean electrodes -> DK parcels. Within/CrossSession share
+                        # the electrode set between train_subject and subject, so a region
+                        # union keeps train/test columns aligned. Delta vs per-electrode =
+                        # the pure cost of the pool; --parcel-collapse-freq adds the freq
+                        # A/B (resolved (N,K,F,T) vs collapsed (N,K,T)).
+                        regions_tr = _resolve_regions_for_subject(
+                            train_subject, args, upstream_helpers, get_region_labels,
+                        )
+                        regions_te = _resolve_regions_for_subject(
+                            subject, args, upstream_helpers, get_region_labels,
+                        )
+                        target = sorted(set(regions_tr.tolist()) | set(regions_te.tolist()))
+                        _stats = {
+                            "mean": ("mean",),
+                            "mean_std": ("mean", "std"),
+                            "mean_std_max": ("mean", "std", "max"),
+                        }[getattr(args, "region_pool_stats", "mean")]
+                        X_train = _pool_to_target_regions(X_train, regions_tr, target, stats=_stats)
+                        X_test = _pool_to_target_regions(X_test, regions_te, target, stats=_stats)
+                        if args.parcel_collapse_freq and X_train.ndim == 4:
+                            X_train = X_train.mean(axis=2)   # (N,K,F,T) -> (N,K,T)
+                            X_test = X_test.mean(axis=2)
                     if splits_type == "CrossSubject":
                         regions_train = _resolve_regions_for_subject(
                             train_subject, args, upstream_helpers, get_region_labels,
@@ -742,22 +766,43 @@ def _resolve_regions_for_subject(
 
 def _pool_to_target_regions(
     X: np.ndarray, regions: np.ndarray, target_regions: list[str],
+    stats: tuple[str, ...] = ("mean",),
 ) -> np.ndarray:
-    """Mean-pool channels per region; zero-fill regions absent from `regions`.
+    """Symmetric set-pool channels per region; zero-fill regions absent from `regions`.
 
     X has shape (B, C, ...) — any trailing time/feature dims preserved.
-    Output shape (B, len(target_regions), ...). Channels with `regions[i] == r`
-    are mean-aggregated for each target region r; if no channel matches r the
-    column is filled with zeros.
+    `stats` is the (permutation/count-invariant) set-summary to keep per region,
+    each computed over the electrode axis at every trailing (e.g. freq,time) bin:
+      - ("mean",)              -> order-1 centroid (the default; byte-identical to
+                                  the old mean-only pool). Output (B, len(target), ...).
+      - ("mean","std")         -> + within-region dispersion (order-2).
+      - ("mean","std","max")   -> + the strongest responder (an order statistic).
+    Output shape (B, len(target_regions)*len(stats), ...): the stats for region j
+    occupy columns [j*n_stats : (j+1)*n_stats]. Regions with no channel are zero.
+    Every stat is a symmetric function of the electrode set (no identity / order),
+    so each is cross-subject-transferable in principle; the within-session gap over
+    ("mean",) upper-bounds how much per-electrode CONTENT a richer pool can reclaim.
     """
     if X.ndim < 2:
         raise ValueError(f"_pool_to_target_regions expects (B, C, ...), got shape {X.shape}")
-    out_shape = (X.shape[0], len(target_regions)) + X.shape[2:]
+    n_stats = len(stats)
+    out_shape = (X.shape[0], len(target_regions) * n_stats) + X.shape[2:]
     out = np.zeros(out_shape, dtype=X.dtype)
     for j, r in enumerate(target_regions):
         mask = regions == r
-        if mask.any():
-            out[:, j, ...] = X[:, mask, ...].mean(axis=1)
+        if not mask.any():
+            continue
+        sub = X[:, mask, ...]  # (B, n_elec_in_region, ...)
+        for s, stat in enumerate(stats):
+            col = j * n_stats + s
+            if stat == "mean":
+                out[:, col, ...] = sub.mean(axis=1)
+            elif stat == "std":
+                out[:, col, ...] = sub.std(axis=1)
+            elif stat == "max":
+                out[:, col, ...] = sub.max(axis=1)
+            else:
+                raise ValueError(f"unknown region-pool stat {stat!r}")
     return out
 
 
@@ -987,6 +1032,30 @@ def _parse_args() -> argparse.Namespace:
                    help="Filterbank bin spacing in octaves.")
     p.add_argument("--fbank-half-bw", type=float, default=0.5,
                    help="Triangular kernel half-width in octaves.")
+    p.add_argument(
+        "--pool-parcel-mean",
+        action="store_true",
+        help="Diagnostic: masked-mean electrodes->DK parcels before the linear fit "
+             "(the encoder's D2 mean-before pool, with NO encoder). WithinSession/"
+             "CrossSession only. Delta vs per-electrode = the pure cost of the pool.",
+    )
+    p.add_argument(
+        "--parcel-collapse-freq",
+        action="store_true",
+        help="With --pool-parcel-mean: additionally mean over the freq axis "
+             "(N,K,F,T)->(N,K,T). Gap vs freq-resolved upper-bounds the freq-collapse cost.",
+    )
+    p.add_argument(
+        "--region-pool-stats",
+        choices=["mean", "mean_std", "mean_std_max"],
+        default="mean",
+        help="With --pool-parcel-mean: which symmetric set-statistics to keep per "
+             "region (over the electrode axis, per freq/time bin). 'mean'=order-1 "
+             "centroid (default, = current behaviour); 'mean_std' adds within-region "
+             "dispersion; 'mean_std_max' adds the strongest responder. Within-session "
+             "gain over 'mean' upper-bounds the per-electrode CONTENT a richer "
+             "cross-subject-safe pool can reclaim (vs the 0.833 mean / 0.884 per-elec).",
+    )
     p.add_argument(
         "--run-nuisance-probes",
         action="store_true",
