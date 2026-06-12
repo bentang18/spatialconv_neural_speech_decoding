@@ -78,6 +78,12 @@ from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
 )
 
+# B37+ RGB-style mean|std pool: variance floor for the per-parcel std channel.
+# σ = sqrt(clamp(E[x²]−μ², 0) + eps) — keeps the gradient of sqrt finite at
+# σ→0 (a covered parcel with a single electrode, or all-equal electrodes) and
+# guarantees no NaN on the uncovered-parcel (0/0-guarded) path.
+_MEAN_POOL_STD_EPS = 1e-8
+
 
 def _rope_freqs(head_dim: int, max_seq_len: int, base: float = 10_000.0) -> Tensor:
     """Pre-compute RoPE cos/sin tables of shape ``(max_seq_len, head_dim)``.
@@ -462,18 +468,22 @@ class _PatchStem(nn.Module):
         kernel_time: int = 2,
         stride_freq: int | None = None,
         stride_time: int | None = None,
+        in_channels: int = 1,
     ) -> None:
         super().__init__()
         if stride_freq is None:
             stride_freq = kernel_freq
         if stride_time is None:
             stride_time = kernel_time
+        if in_channels not in (1, 2):
+            raise ValueError(f"in_channels must be 1 or 2, got {in_channels}")
         self.kernel_freq = kernel_freq
         self.kernel_time = kernel_time
         self.stride_freq = stride_freq
         self.stride_time = stride_time
+        self.in_channels = in_channels
         self.conv = nn.Conv2d(
-            in_channels=1,
+            in_channels=in_channels,
             out_channels=d_model,
             kernel_size=(kernel_freq, kernel_time),
             stride=(stride_freq, stride_time),
@@ -484,6 +494,13 @@ class _PatchStem(nn.Module):
         # convention; uniform across the whole model).
         nn.init.trunc_normal_(self.conv.weight, std=0.02)
         nn.init.zeros_(self.conv.bias)
+        # B37+ RGB-style 2-channel stem (mean | std): the STD channel (index 1)
+        # is ZERO-INIT so the stem starts byte-identical to the 1-channel
+        # mean-only stem (the std contributes exactly 0 at init). Gradient still
+        # flows into it (σ≠0), so it can learn to use the per-parcel std. The
+        # mean channel (index 0) keeps the trunc-normal init above.
+        if in_channels == 2:
+            nn.init.zeros_(self.conv.weight[:, 1])
 
     def n_freq_patches(self, n_freq_bins: int) -> int:
         return (n_freq_bins - self.kernel_freq) // self.stride_freq + 1
@@ -492,13 +509,31 @@ class _PatchStem(nn.Module):
         return (n_time_bins - self.kernel_time) // self.stride_time + 1
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: (B, C, F, T) → (B*C, 1, F, T) → Conv2d → (B*C, d, F_p, T_p)
-        B, C, F, T = x.shape
-        x_bc = x.reshape(B * C, 1, F, T)
-        out = self.conv(x_bc)                                 # (B*C, d, F_p, T_p)
+        # 1-channel: x (B, C, F, T) → (B*C, 1, F, T) → Conv2d → (B*C, d, F_p, T_p).
+        # 2-channel (B37+ RGB-style mean|std): x (B, K, 2, F, T) → (B*K, 2, F, T).
+        # Either way the channel axis is consumed by the conv; the per-parcel /
+        # per-electrode axis rides in the batch dim and the output is
+        # (B, ·, F_p, T_p, d).
+        if x.ndim == 5:
+            B, U, Cin, F, T = x.shape
+            if Cin != self.in_channels:
+                raise ValueError(
+                    f"patch stem built for in_channels={self.in_channels} but got "
+                    f"a {Cin}-channel input"
+                )
+            x_bc = x.reshape(B * U, Cin, F, T)
+        else:
+            B, U, F, T = x.shape
+            if self.in_channels != 1:
+                raise ValueError(
+                    f"patch stem built for in_channels={self.in_channels} requires a "
+                    f"5-D (B, ·, {self.in_channels}, F, T) input; got 4-D"
+                )
+            x_bc = x.reshape(B * U, 1, F, T)
+        out = self.conv(x_bc)                                 # (B*U, d, F_p, T_p)
         F_p, T_p = out.shape[-2], out.shape[-1]
-        # → (B, C, F_p, T_p, d)
-        return out.permute(0, 2, 3, 1).reshape(B, C, F_p, T_p, -1)
+        # → (B, U, F_p, T_p, d)
+        return out.permute(0, 2, 3, 1).reshape(B, U, F_p, T_p, -1)
 
 
 def freq_patch_valid_mask(
@@ -971,16 +1006,40 @@ class V14ParcelPerceiverModel(nn.Module):
         # field. The M4 predictor depth tracks this (D9). Unused on the
         # cross_attn path (which uses ``depth_self_attn``).
         latent_parcel_depth: int = 2,
+        # B37+ (2026-06-11, Ben): latent cross-parcel mode on the ``pool="mean"``
+        # path. "parcel" = the thin parcel-SA-ONLY latent (freq AND time both ride
+        # in the batch dim; cross-parcel at a single (freq,time) cell — the
+        # shipped B37 default). "joint" = JOINT parcel×time, freq BATCHED: fold
+        # freq into the batch and attend over the ~K_c·T_p parcel×time tokens
+        # jointly with RoPE-on-time + an additive learned parcel tag, filling the
+        # cross-region TEMPORAL gap the parcel-only latent structurally cannot
+        # (→ [[project_v14_b37_meanpath_arch_temporal_gap_2026_06_11]]). Default
+        # "parcel" keeps the existing test surface byte-identical; production
+        # flips to "joint" via ``--latent-mode``. Inert on the cross_attn path.
+        latent_mode: tp.Literal["parcel", "joint"] = "parcel",
+        # B37+ (2026-06-11, Ben): RGB-style second input channel to the per-parcel
+        # stem on the ``pool="mean"`` path — the masked per-parcel STD of the raw
+        # |STFT| alongside the mean, computed in the SAME masked reduction (same
+        # ``w``/``denom``) so mean and std describe the identical electrode set
+        # (no electrode-row desync). False → 1-channel stem, byte-identical. True
+        # → Conv2d(2→d) with the std-channel weights ZERO-INIT (no-op at init,
+        # gradient still flows since σ≠0). Inert on the cross_attn path.
+        mean_pool_std: bool = False,
     ) -> None:
         super().__init__()
         if pool not in ("mean", "cross_attn"):
             raise ValueError(f"pool must be 'mean' or 'cross_attn', got {pool!r}")
+        if latent_mode not in ("parcel", "joint"):
+            raise ValueError(f"latent_mode must be 'parcel' or 'joint', got {latent_mode!r}")
         if latent_parcel_depth < 1:
             raise ValueError(
                 f"latent_parcel_depth must be ≥ 1, got {latent_parcel_depth}"
             )
         self.pool = pool
         self.latent_parcel_depth = latent_parcel_depth
+        self.latent_mode = latent_mode
+        # std channel only has meaning on the mean path's per-parcel stem.
+        self.mean_pool_std = bool(mean_pool_std) and pool == "mean"
         self.gradient_checkpointing = gradient_checkpointing
         self.ragged_frontend = ragged_frontend
         self.ragged_parcel = ragged_parcel
@@ -1013,6 +1072,11 @@ class V14ParcelPerceiverModel(nn.Module):
             kernel_time=patch_kernel_time,
             stride_freq=patch_stride_freq,
             stride_time=patch_stride_time,
+            # B37+ RGB-style mean|std → 2-channel stem on the mean path. Safe to
+            # branch in_channels on ``mean_pool_std`` here because the cross_attn
+            # forward (which feeds a 1-channel (B,C,F,T) input) is never reached
+            # when pool=="mean"; F_p/T_p depend only on kernel/stride, not Cin.
+            in_channels=2 if self.mean_pool_std else 1,
         )
         # FE-RAW-1 (2026-06-04): the raw |STFT| front end (kernel_freq=5, the
         # default) requires exactly F=50 bins so the patch stem tiles it
@@ -1198,14 +1262,39 @@ class V14ParcelPerceiverModel(nn.Module):
             )
         elif self.pool == "mean":
             # B37: the hard electrode→parcel MEAN (D1/D2) replaces the learned
-            # routing pool entirely (NO cross_attns), and D5's thin
-            # parcel-SA-only latent replaces the factorized latent. Frequency ×
-            # time ride in the batch dim (never attended); parcel-SA over K is
-            # the only cross-parcel op.
-            self.latent_parcel_blocks = nn.ModuleList(
-                [_ParcelSelfAttnBlock(d_model, n_heads)
-                 for _ in range(latent_parcel_depth)]
-            )
+            # routing pool entirely (NO cross_attns).
+            if self.latent_mode == "joint":
+                # B37+ (2026-06-11): JOINT parcel×time latent, freq BATCHED. The
+                # latent attends over the flattened ~K_c·T_p parcel×time token
+                # sequence (per freq, freq ride in the batch dim), filling the
+                # cross-region TEMPORAL gap the parcel-only latent cannot. Reuse
+                # the per-electrode _JointTokenBlock (joint SA + RoPE-on-time +
+                # key-pad mask + FFN) — identical mechanism, here the flat axis
+                # is parcel×time and RoPE carries the TIME index (built per
+                # forward); parcel identity is the additive ``latent_parcel_tag``
+                # below (parcels are unordered → a learned tag, NOT a positional
+                # code). depth = ``latent_parcel_depth`` (same knob).
+                self.latent_parcel_blocks = nn.ModuleList(
+                    [_JointTokenBlock(d_model, n_heads)
+                     for _ in range(latent_parcel_depth)]
+                )
+                # Additive learned per-parcel tag for the joint latent. Distinct
+                # from ``learnable_parcel_embed`` (the cross-attn pool's frozen
+                # query init) so the mean-path freeze logic is untouched. Same
+                # trunc-normal(0.02) init convention.
+                self.latent_parcel_tag = nn.Parameter(
+                    torch.empty(k_parcels, d_model)
+                )
+                nn.init.trunc_normal_(self.latent_parcel_tag, std=0.02)
+            else:
+                # D5 thin parcel-SA-only latent: frequency × time ride in the
+                # batch dim (never attended); parcel-SA over K is the only
+                # cross-parcel op.
+                self.latent_parcel_blocks = nn.ModuleList(
+                    [_ParcelSelfAttnBlock(d_model, n_heads)
+                     for _ in range(latent_parcel_depth)]
+                )
+                self.latent_parcel_tag = None
         else:  # pool is validated to {"mean","cross_attn"} above — unreachable
             raise AssertionError(f"unhandled pool {self.pool!r}")
         self.encoder_ln = nn.LayerNorm(d_model)
@@ -1289,7 +1378,9 @@ class V14ParcelPerceiverModel(nn.Module):
     )
     _PARCEL_PARAM_TOPS: tp.ClassVar[frozenset[str]] = frozenset(
         {"cross_attns", "latent_blocks", "latent_parcel_blocks", "encoder_ln",
-         "learnable_parcel_embed", "learnable_subslot_embed"}
+         "learnable_parcel_embed", "learnable_subslot_embed",
+         # B37+ joint-latent per-parcel tag (mean path, latent_mode="joint").
+         "latent_parcel_tag"}
     )
 
     def partition_parameters_for_staging(
@@ -1344,7 +1435,15 @@ class V14ParcelPerceiverModel(nn.Module):
         ``parcel_raw[b,k] = (Σ_c w[b,c,k]·x_in[b,c]) / (Σ_c w[b,c,k])`` with
         ``w[b,c,k] = (support[b,c,k] > 0) ∧ valid_mask[b,c]``. Uncovered
         parcels (``Σ_c w = 0``) → ``parcel_raw = 0`` and ``latent_valid =
-        False``. Returns ``(parcel_raw (B,K,F,T), latent_valid (B,K))``.
+        False``. Returns ``(parcel_raw, latent_valid (B,K))``.
+
+        B37+ RGB-style mean|std (``self.mean_pool_std``): the per-parcel STD of
+        the raw |STFT| is computed in the SAME masked reduction (same ``w``,
+        same ``denom``) and returned as a second channel →
+        ``parcel_raw (B, K, 2, F, T)`` ([mean, std]). Reusing ``w``/``denom``
+        is the integrity invariant: mean and std necessarily describe the
+        identical electrode set, so the electrode-row desync cannot reappear.
+        With the std OFF the return is the legacy ``(B, K, F, T)``.
         """
         assigned = support > 0                                   # (B, C, K) bool
         if valid_mask is not None:
@@ -1356,7 +1455,20 @@ class V14ParcelPerceiverModel(nn.Module):
         # Uncovered parcels: num=0, denom→clamp(1) ⇒ 0/1 = 0 (kept, masked
         # out downstream via latent_valid). Covered: Σ w / Σ w = 1, so the
         # bias-carrying linearity equivalence holds exactly.
-        parcel_raw = num / denom.clamp(min=1.0).unsqueeze(-1).unsqueeze(-1)
+        denom_safe = denom.clamp(min=1.0).unsqueeze(-1).unsqueeze(-1)  # (B,K,1,1)
+        mean = num / denom_safe                                  # (B, K, F, T)
+        if not self.mean_pool_std:
+            return mean, latent_valid
+        # Second moment in the SAME reduction (same w, same denom_safe). The
+        # denom guard MUST be mirrored onto E[x²]: for an uncovered parcel
+        # (denom=0) num2=0 → E[x²]=0/1=0, mean=0 → var=0 → σ=√eps (finite, NOT
+        # NaN). A raw num2/denom would give 0/0=NaN and one NaN poisons the
+        # whole batch's gradient. latent_valid masks these parcels downstream
+        # regardless, so the value never matters — but it must be finite.
+        ex2 = torch.einsum("bck,bcft->bkft", w, x_in * x_in) / denom_safe
+        var = (ex2 - mean * mean).clamp(min=0.0)                 # numerical floor
+        std = torch.sqrt(var + _MEAN_POOL_STD_EPS)               # (B, K, F, T)
+        parcel_raw = torch.stack([mean, std], dim=2)             # (B, K, 2, F, T)
         return parcel_raw, latent_valid
 
     def _token_block_stack(
@@ -1380,40 +1492,45 @@ class V14ParcelPerceiverModel(nn.Module):
         latent_valid: Tensor,  # (B, K) bool — visible (covered & ~tubed) parcels
         use_ckpt: bool,
     ) -> Tensor:
-        """B37 D5 thin parcel-SA-only latent → ``z`` (B, K, F_p, T_p, d).
+        """B37 thin cross-parcel latent → ``z`` (B, K, F_p, T_p, d).
 
-        Fold freq×time into the batch dim (``R = B·F_p·T_p``) so attention is
-        over the parcel axis ``K`` ALONE; freq and time are carried untouched.
-        The B30 bidirectional no-coverage mask (shared across the ``F_p·T_p``
-        rows of each batch element) excludes uncovered parcels as both query and
-        key — so covered parcels' output never depends on uncovered parcels'
-        (don't-care) content, and the dense vs ragged-stem paths agree on
-        covered M4.
+        Two modes (``self.latent_mode``), sharing the #112 ragged-parcel
+        gather/scatter and producing the SAME ``(B, K, F_p, T_p, d)`` M4 shape
+        (so the SSL target + readout are mode-agnostic):
+
+        * ``"parcel"`` (D5 default) — fold freq×time into the batch
+          (``R = B·F_p·T_p``); attention is over the parcel axis ``K`` ALONE,
+          freq and time carried untouched. The B30 bidirectional no-coverage
+          mask excludes uncovered/tubed parcels as both query and key.
+        * ``"joint"`` (2026-06-11, Ben) — fold ONLY freq into the batch
+          (``B·F_p`` rows); attention is JOINT over the ``k_run·T_p``
+          parcel×time tokens (parcel-OUTER / time-INNER), with RoPE on the TIME
+          axis and an additive learned per-parcel TAG keyed by the GLOBAL parcel
+          id (so it transfers cross-subject — parcel ``k`` always gets
+          ``tag[k]`` regardless of which subject's covered set packs it where,
+          matching the M4 predictor's ``query_id`` convention). The key-padding
+          mask drops pad/uncovered/tubed parcels as keys, so a surviving
+          parcel's M4 never depends on a masked parcel's content. Fills the
+          cross-region TEMPORAL gap the parcel-only latent cannot
+          (→ [[project_v14_b37_meanpath_arch_temporal_gap_2026_06_11]]).
 
         #112 memory/FLOP opt (gated on ``self.ragged_parcel`` — encoder-default
-        OFF, flipped ON by dispatch for production): the dense path keys the
-        parcel-SA over the full ``K`` (union 80) even though only ``K_c≈20``
-        parcels are visible per BT clip (one subject per clip), so the
-        ``(R, n_heads, K, K)`` attn scores blow up to ~655 MB at production scale
-        (bs=8, T_p=40, K=80). When ``ragged_parcel`` is set we gather the visible
-        parcels to a pad-to-per-batch-max ``Kk``, run the blocks over ``Kk``,
-        then scatter the kept parcels back into the full ``K`` (pad rows → a
-        trimmed scratch slot; dropped parcels → 0). Mathematically a pure FLOP
-        cut — uncovered/masked parcels contribute exact-0 softmax weight to every
-        visible parcel — so every VISIBLE parcel's z equals the dense path up to
-        float32 reduction re-tiling (~1e-6, the #91 standard; exactly
-        bit-identical only when ``Kk==K``), and dropped parcels (never read
-        downstream) go to 0 instead of dense's FFN garbage. Cuts the latent
-        attention scores ~``(K/Kk)²``≈16×. See test_v14_meanpool.
+        OFF, flipped ON by dispatch for production): gather the visible parcels
+        to a pad-to-per-batch-max ``Kk``, run the blocks over ``Kk``, then
+        scatter the kept parcels back into the full ``K`` (pad rows → a trimmed
+        scratch slot; dropped parcels → 0). A pure FLOP cut — masked parcels
+        contribute exact-0 attention weight to every visible parcel — so every
+        VISIBLE parcel's z equals the dense path up to float32 reduction
+        re-tiling (~1e-6, the #91 standard; exactly bit-identical only when
+        ``Kk==K``). See test_v14_meanpool.
         """
         B, K, F_p, T_p, d = m2.shape
-        ft = F_p * T_p
-        r = B * ft
 
         # #112 ragged parcel gather: pack the visible parcels per batch element
-        # to the front (pad-to-per-batch-max ``Kk``) so the parcel-SA runs over
-        # ``Kk≤K`` keys. ``keep_idx`` (B,Kk) gathers visible-then-pad K-positions,
-        # ``keep_real`` (B,Kk) is True only at genuinely-visible slots.
+        # to the front (pad-to-per-batch-max ``Kk``). ``keep_idx`` (B,Kk) holds
+        # the GLOBAL K-position of each packed slot (always in [0,K), even at pad
+        # slots — so the joint parcel-tag gather is in-range); ``keep_real``
+        # (B,Kk) is True only at genuinely-visible slots.
         keep_idx: Optional[Tensor] = None
         keep_real: Optional[Tensor] = None
         if self.ragged_parcel:
@@ -1421,27 +1538,15 @@ class V14ParcelPerceiverModel(nn.Module):
             gi = keep_idx.view(B, Kk, 1, 1, 1).expand(B, Kk, F_p, T_p, d)
             m2 = torch.gather(m2, 1, gi)                     # (B, Kk, F_p, T_p, d)
             valid = keep_real                                # (B, Kk) real|pad
-            k_run = Kk
         else:
-            valid = latent_valid
-            k_run = K
+            valid = latent_valid                             # (B, K)
 
-        # (B,k_run,F_p,T_p,d) → (B,F_p,T_p,k_run,d) → (R, k_run, d).
-        z = m2.permute(0, 2, 3, 1, 4).reshape(r, k_run, d)
-        # (B,k_run) → bidirectional (B,k_run,k_run), broadcast to the F_p·T_p
-        # rows per b. Pad slots (keep_real False) are all-masked as both query
-        # and key, so a visible parcel attends to exactly the visible set.
-        pmask_b = valid.unsqueeze(2) & valid.unsqueeze(1)               # (B,k,k)
-        attn_mask = (
-            pmask_b.unsqueeze(1).expand(B, ft, k_run, k_run).reshape(r, k_run, k_run)
-        )                                                              # (R,k,k)
-        for block in self.latent_parcel_blocks:
-            if use_ckpt:
-                z = checkpoint(block, z, attn_mask, use_reentrant=False)
-            else:
-                z = block(z, attn_mask)
-        # (R, k_run, d) → (B, F_p, T_p, k_run, d) → (B, k_run, F_p, T_p, d).
-        z = z.reshape(B, F_p, T_p, k_run, d).permute(0, 3, 1, 2, 4)
+        if self.latent_mode == "joint":
+            z = self._latent_attn_joint(m2, valid, keep_idx, use_ckpt)
+        else:
+            z = self._latent_attn_parcel(m2, valid, use_ckpt)
+        # z: (B, k_run, F_p, T_p, d), k_run = Kk (ragged) or K (dense).
+
         if not self.ragged_parcel:
             return z.contiguous()
 
@@ -1457,6 +1562,91 @@ class V14ParcelPerceiverModel(nn.Module):
         scratch = z.new_zeros(B, K + 1, F_p, T_p, d)
         scratch.scatter_(1, scatter_idx, z)
         return scratch[:, :K, :, :, :].contiguous()
+
+    def _latent_attn_parcel(
+        self, m2: Tensor, valid: Tensor, use_ckpt: bool
+    ) -> Tensor:
+        """D5 parcel-SA-only latent middle. ``m2`` (B, k_run, F_p, T_p, d),
+        ``valid`` (B, k_run) → ``z`` (B, k_run, F_p, T_p, d). Freq×time ride in
+        the batch dim; the bidirectional ``pmask_b`` excludes masked parcels as
+        both query and key."""
+        B, k_run, F_p, T_p, d = m2.shape
+        ft = F_p * T_p
+        r = B * ft
+        # (B,k_run,F_p,T_p,d) → (B,F_p,T_p,k_run,d) → (R, k_run, d).
+        z = m2.permute(0, 2, 3, 1, 4).reshape(r, k_run, d)
+        # (B,k_run) → bidirectional (B,k_run,k_run), broadcast to the F_p·T_p
+        # rows per b. Masked slots (valid False) are all-masked as both query
+        # and key, so a visible parcel attends to exactly the visible set.
+        pmask_b = valid.unsqueeze(2) & valid.unsqueeze(1)               # (B,k,k)
+        attn_mask = (
+            pmask_b.unsqueeze(1).expand(B, ft, k_run, k_run).reshape(r, k_run, k_run)
+        )                                                              # (R,k,k)
+        for block in self.latent_parcel_blocks:
+            if use_ckpt:
+                z = checkpoint(block, z, attn_mask, use_reentrant=False)
+            else:
+                z = block(z, attn_mask)
+        # (R, k_run, d) → (B, F_p, T_p, k_run, d) → (B, k_run, F_p, T_p, d).
+        return z.reshape(B, F_p, T_p, k_run, d).permute(0, 3, 1, 2, 4)
+
+    def _latent_attn_joint(
+        self,
+        m2: Tensor,                    # (B, k_run, F_p, T_p, d)
+        valid: Tensor,                 # (B, k_run) bool — real (surviving) slot
+        keep_idx: Optional[Tensor],    # (B, k_run) global parcel id, or None (dense)
+        use_ckpt: bool,
+    ) -> Tensor:
+        """JOINT parcel×time latent middle (freq batched) → ``z``
+        (B, k_run, F_p, T_p, d).
+
+        Token order is parcel-OUTER / time-INNER: the flat token ``n`` in a
+        ``(b, f)`` row carries time ``n % T_p`` (→ per-token time-RoPE) and
+        parcel slot ``n // T_p`` (→ the additive global-id tag). Freq rides in
+        the batch dim (``B·F_p`` rows) and is never attended. The key-padding
+        mask drops masked parcels as keys (a surviving parcel's M4 stays
+        independent of any masked parcel's content)."""
+        B, k_run, F_p, T_p, d = m2.shape
+        S = k_run * T_p
+        device = m2.device
+
+        # (B,k_run,F_p,T_p,d) → (B,F_p,k_run,T_p,d): freq to the batch dim,
+        # parcel-outer/time-inner kept for the joint sequence.
+        x = m2.permute(0, 2, 1, 3, 4)                        # (B, F_p, k_run, T_p, d)
+
+        # Additive learned PARCEL TAG keyed by the GLOBAL parcel id — so it
+        # transfers cross-subject (same convention as the M4 predictor's learned
+        # ``query_id`` id_embed and the cross-attn pool's parcel embed). On the
+        # dense path the packed slot index IS the global id (arange K); on the
+        # ragged path we gather the tag by ``keep_idx`` (pad slots gather a real
+        # tag but are dropped as keys + discarded by the scatter, so the value
+        # never reaches a surviving parcel).
+        assert self.latent_parcel_tag is not None  # built iff latent_mode=="joint"
+        if keep_idx is None:
+            tag = self.latent_parcel_tag[:k_run].unsqueeze(0).expand(B, k_run, d)
+        else:
+            tag = self.latent_parcel_tag[keep_idx]           # (B, k_run, d) by global id
+        x = x + tag[:, None, :, None, :]                     # broadcast over F_p, T_p
+        x = x.reshape(B * F_p, S, d)                         # (B·F_p, k_run·T_p, d)
+
+        # Per-token time-RoPE: token n carries time ``n % T_p`` (parcel-outer /
+        # time-inner). ``key_rope`` is the (2, max_T_p, head_dim) base table.
+        tok_time = torch.arange(S, device=device) % T_p      # (S,)
+        rope = self.key_rope[:, tok_time, :]                 # (2, S, head_dim)
+
+        # Key-padding mask: a token is a keepable KEY iff its parcel slot is real.
+        # Broadcast over freq + time in the parcel-outer/time-inner order.
+        key_mask = (
+            valid[:, None, :, None].expand(B, F_p, k_run, T_p).reshape(B * F_p, S)
+        )                                                    # (B·F_p, S) bool
+
+        for block in self.latent_parcel_blocks:              # _JointTokenBlock
+            if use_ckpt:
+                x = checkpoint(block, x, rope, key_mask, use_reentrant=False)
+            else:
+                x = block(x, rope, key_mask)
+        # (B·F_p, k_run·T_p, d) → (B, F_p, k_run, T_p, d) → (B, k_run, F_p, T_p, d).
+        return x.reshape(B, F_p, k_run, T_p, d).permute(0, 2, 1, 3, 4)
 
     def _forward_meanpool(
         self,
@@ -3280,6 +3470,17 @@ class V14ParcelPerceiver(BaseModelConfig):
     # the cross-attn pool (that path rides ``depth_self_attn``).
     pool: tp.Literal["mean", "cross_attn"] = "cross_attn"
     latent_parcel_depth: int = 2
+    # B37+ (2026-06-11, Ben): mean-path latent cross-parcel mode. "parcel"
+    # (default, byte-identical) = the thin parcel-SA-only latent. "joint" = the
+    # JOINT parcel×time freq-batched latent (RoPE-on-time + a learned
+    # global-parcel-id tag), filling the cross-region temporal gap. Inert on the
+    # cross_attn path. → [[project_v14_b37_meanpath_arch_temporal_gap_2026_06_11]].
+    latent_mode: tp.Literal["parcel", "joint"] = "parcel"
+    # B37+ (2026-06-11, Ben): RGB-style 2nd stem input channel = the masked
+    # per-parcel STD of the raw |STFT| alongside the mean (same masked reduction,
+    # std-channel conv zero-init → no-op at init). False (default) = 1-channel,
+    # byte-identical. Inert on the cross_attn path.
+    mean_pool_std: bool = False
     # B29 Item 13 lock 2026-05-27 PM-late: default M=1. Sister
     # ``R-m4-slots`` P0 sets this to 4 to restore the prior 320-slot stack.
     m_sub_slots: int = 1
@@ -3445,6 +3646,8 @@ class V14ParcelPerceiver(BaseModelConfig):
             freq_pos=self.freq_pos,
             pool=self.pool,
             latent_parcel_depth=self.latent_parcel_depth,
+            latent_mode=self.latent_mode,
+            mean_pool_std=self.mean_pool_std,
         )
         # B35: P4 readout. The "pma_*" options collapse parcels with a
         # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only

@@ -212,6 +212,8 @@ DEFAULT_FRONTEND_LR_SCALE: float = 0.1
 # the predictor sizes mirror the V14JointExperiment pydantic field defaults.
 DEFAULT_POOL: str = "cross_attn"
 DEFAULT_LATENT_DEPTH: int = 2
+DEFAULT_LATENT_MODE: str = "parcel"       # B37+ "joint" = parcel×time freq-batched
+DEFAULT_MEAN_POOL_STD: bool = False       # B37+ RGB-style mean|std stem channel
 DEFAULT_SSL_MODE: str = "staged"          # main() resolves "auto" per pool
 DEFAULT_LAMBDA_M4: float = 1.0            # D7 M4 term weight
 DEFAULT_M2_PREDICTOR_DEPTH: int = 3       # D9 per-tap (front-end M2)
@@ -765,6 +767,12 @@ def build_v14_experiment(
     # sizing (the joint M2/M4 predictors share hidden/n_heads, depths per-tap).
     pool: tp.Literal["cross_attn", "mean"] = DEFAULT_POOL,
     latent_depth: int = DEFAULT_LATENT_DEPTH,
+    # B37+ (2026-06-11): mean-path latent cross-parcel mode ("parcel" default /
+    # "joint" parcel×time freq-batched) + RGB-style mean|std stem channel. Both
+    # ride the brain-model config (every phase shares the encoder); inert under
+    # cross_attn. → [[project_v14_b37_meanpath_arch_temporal_gap_2026_06_11]].
+    latent_mode: tp.Literal["parcel", "joint"] = DEFAULT_LATENT_MODE,
+    mean_pool_std: bool = DEFAULT_MEAN_POOL_STD,
     ssl_mode: tp.Literal["staged", "joint"] = DEFAULT_SSL_MODE,
     lambda_m4: float = DEFAULT_LAMBDA_M4,
     m2_predictor_depth: int = DEFAULT_M2_PREDICTOR_DEPTH,
@@ -1645,6 +1653,11 @@ def build_v14_experiment(
             # this one config -> every phase shares the encoder.
             "pool": pool,
             "latent_parcel_depth": latent_depth,
+            # B37+ (2026-06-11): "parcel" (default, byte-identical) vs "joint"
+            # parcel×time freq-batched latent; RGB-style mean|std stem channel
+            # (std-channel zero-init → no-op at init). Inert under cross_attn.
+            "latent_mode": latent_mode,
+            "mean_pool_std": mean_pool_std,
             # SSL-pretrain dispatch flags threaded onto the model config
             # so they ride along with the persisted run record. The
             # supervised downstream classifier path does not branch on
@@ -2483,6 +2496,23 @@ def _parser() -> argparse.ArgumentParser:
              "(that path rides --depth).",
     )
     p.add_argument(
+        "--latent-mode", dest="latent_mode", choices=("parcel", "joint"),
+        default=DEFAULT_LATENT_MODE,
+        help="B37+ mean-path latent cross-parcel mode. 'parcel' (default, "
+             "byte-identical) = thin parcel-SA-only latent (freq+time batched). "
+             "'joint' = JOINT parcel×time, freq batched — attends the K_c·T_p "
+             "parcel×time tokens with RoPE-on-time + a learned global-parcel-id "
+             "tag (cross-subject), filling the cross-region temporal gap. Inert "
+             "under --pool cross_attn.",
+    )
+    p.add_argument(
+        "--mean-pool-std", dest="mean_pool_std", action="store_true",
+        help="B37+ feed the masked per-parcel STD as a 2nd stem input channel "
+             "(RGB-style mean|std), computed in the SAME masked reduction as the "
+             "mean (no electrode-row desync). Conv std-channel is zero-init → "
+             "no-op at init, learns from there. Inert under --pool cross_attn.",
+    )
+    p.add_argument(
         "--ssl-mode", dest="ssl_mode", choices=("auto", "staged", "joint"),
         default="auto",
         help="B37 D7 SSL objective (joint SSL / --phase 1). 'auto' (default) "
@@ -2929,6 +2959,8 @@ def _common_build_kwargs(
         # resolved from "auto" in main() before this dict is built.
         pool=args.pool,
         latent_depth=args.latent_depth,
+        latent_mode=args.latent_mode,
+        mean_pool_std=args.mean_pool_std,
         ssl_mode=args.ssl_mode,
         lambda_m4=args.lambda_m4,
         m2_predictor_depth=args.m2_predictor_depth,

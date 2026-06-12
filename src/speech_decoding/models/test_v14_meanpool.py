@@ -884,3 +884,294 @@ def test_meanpool_parcel_time_mask_wrong_shape_raises() -> None:
 
 def kw_T(enc, kw) -> int:
     return enc.patch_stem.n_time_patches(kw["n_time_bins"])
+
+
+# --------------------------------------------------------------------------- #
+# B37+ RGB-style mean|std second channel (mean_pool_std)
+# --------------------------------------------------------------------------- #
+# The per-parcel STD of the raw |STFT| is added as a SECOND Conv2d input channel
+# (like the G/B planes of an RGB image). Three invariants are pinned:
+#   (1) the std is computed in the SAME masked reduction as the mean (same w,
+#       same denom) — it necessarily describes the identical electrode set, so
+#       the electrode-row desync cannot reappear via a parallel std path;
+#   (2) the std channel is ZERO-INIT, so the 2-channel stem is byte-identical to
+#       the legacy 1-channel mean-only stem at init (strict superset / no-op) yet
+#       still LEARNABLE (σ≠0 ⇒ gradient flows into the zero-init weights);
+#   (3) the denom guard is mirrored onto E[x²] so an uncovered parcel gives a
+#       FINITE std (√eps), not a 0/0 NaN that would poison the batch gradient.
+def _meanonly_matching(std_enc: V14ParcelPerceiverModel) -> V14ParcelPerceiverModel:
+    """A mean-only (1-channel) model whose params equal ``std_enc`` on the mean
+    channel. With the std-channel conv weight zero-init, the two stems are
+    byte-identical at init, so any forward difference would be a real bug."""
+    nonstd = _make()                                    # default mean_pool_std=False
+    sd = dict(std_enc.state_dict())
+    sd["patch_stem.conv.weight"] = sd["patch_stem.conv.weight"][:, :1].clone()
+    nonstd.load_state_dict(sd)
+    return nonstd
+
+
+def test_mean_pool_std_default_off_returns_4d() -> None:
+    enc = _make()
+    assert enc.mean_pool_std is False
+    assert enc.patch_stem.in_channels == 1
+    B, C, F, T = 1, 6, 6, 4
+    x_in = torch.randn(B, C, F, T)
+    support = torch.zeros(B, C, 6)
+    support[:, 0, 0] = 1.0
+    parcel_raw, _ = enc._mean_pool_electrodes(
+        x_in, support, torch.ones(B, C, dtype=torch.bool)
+    )
+    assert parcel_raw.shape == (B, 6, F, T)             # legacy 4-D, no channel axis
+
+
+def test_mean_pool_std_on_returns_5d_mean_then_std() -> None:
+    enc = _make(mean_pool_std=True)
+    assert enc.mean_pool_std is True
+    assert enc.patch_stem.in_channels == 2
+    B, C, F, T = 1, 6, 6, 4
+    x_in = torch.randn(B, C, F, T)
+    support = torch.zeros(B, C, 6)
+    support[:, 0, 0] = support[:, 1, 0] = support[:, 2, 0] = 1.0   # parcel 0 = {0,1,2}
+    support[:, 3, 1] = 1.0                                          # parcel 1 = {3}
+    parcel_raw, _ = enc._mean_pool_electrodes(
+        x_in, support, torch.ones(B, C, dtype=torch.bool)
+    )
+    assert parcel_raw.shape == (B, 6, 2, F, T)          # (B, K, [mean|std], F, T)
+    mean_ch, std_ch = parcel_raw[:, :, 0], parcel_raw[:, :, 1]
+    # channel 0 == the legacy masked mean (unchanged by adding the std channel).
+    torch.testing.assert_close(mean_ch[:, 0], x_in[:, :3].mean(dim=1))
+    # channel 1 == POPULATION std of the SAME electrode set {0,1,2} the mean used.
+    ref_var = x_in[:, :3].var(dim=1, unbiased=False)
+    torch.testing.assert_close(
+        std_ch[:, 0], torch.sqrt(ref_var + 1e-8), atol=1e-4, rtol=1e-3
+    )
+    # single-electrode parcel ⇒ variance 0 ⇒ std = √eps (finite).
+    torch.testing.assert_close(
+        std_ch[:, 1], torch.full_like(std_ch[:, 1], 1e-8 ** 0.5), atol=1e-5, rtol=1e-3
+    )
+
+
+def test_mean_pool_std_excludes_pad_electrodes() -> None:
+    """The std reuses the SAME w (assigned & valid), so a pad electrode is
+    dropped from the std exactly as it is from the mean — no separate path that
+    could re-include it."""
+    enc = _make(mean_pool_std=True)
+    B, C, F, T = 1, 6, 6, 4
+    x_in = torch.randn(B, C, F, T)
+    support = torch.zeros(B, C, 6)
+    support[:, 0, 0] = support[:, 1, 0] = support[:, 2, 0] = 1.0
+    valid = torch.ones(B, C, dtype=torch.bool)
+    valid[:, 2] = False                                 # electrode 2 is a pad
+    parcel_raw, _ = enc._mean_pool_electrodes(x_in, support, valid)
+    ref_var = x_in[:, :2].var(dim=1, unbiased=False)    # std of {0,1} ONLY
+    torch.testing.assert_close(
+        parcel_raw[:, 0, 1], torch.sqrt(ref_var + 1e-8), atol=1e-4, rtol=1e-3
+    )
+
+
+def test_mean_pool_std_uncovered_parcel_is_finite_not_nan() -> None:
+    """Denom guard mirrored onto E[x²]: an uncovered parcel (denom=0) must give a
+    finite √eps std, NOT a 0/0 NaN — one NaN would poison the whole batch grad."""
+    enc = _make(mean_pool_std=True)
+    B, C, F, T = 2, 4, 6, 4
+    x_in = torch.randn(B, C, F, T)
+    support = torch.zeros(B, C, 6)
+    support[:, 0, 0] = support[:, 1, 0] = 1.0           # only parcel 0 covered
+    support[:, 2, 0] = support[:, 3, 0] = 1.0
+    parcel_raw, lv = enc._mean_pool_electrodes(
+        x_in, support, torch.ones(B, C, dtype=torch.bool)
+    )
+    assert torch.isfinite(parcel_raw).all()             # the whole point: no NaN
+    assert not lv[:, 1:].any()                          # parcels 1-5 uncovered
+    torch.testing.assert_close(
+        parcel_raw[:, 1:, 1], torch.full_like(parcel_raw[:, 1:, 1], 1e-8 ** 0.5)
+    )
+
+
+def test_mean_pool_std_channel_zero_init_ignores_std_value() -> None:
+    """Zero-init std channel: at init the stem output does not depend on the std
+    plane AT ALL — feeding wildly different std values gives an identical stem."""
+    enc = _make(mean_pool_std=True).eval()
+    assert torch.equal(
+        enc.patch_stem.conv.weight[:, 1],
+        torch.zeros_like(enc.patch_stem.conv.weight[:, 1]),
+    )
+    B, K, F, T = 2, enc.k_parcels, enc.n_freq_bins, enc.n_time_bins
+    g = torch.Generator().manual_seed(0)
+    mean = torch.randn(B, K, F, T, generator=g)
+    std_a = torch.rand(B, K, F, T, generator=g)
+    std_b = torch.rand(B, K, F, T, generator=g) + 5.0   # wildly different std plane
+    out_a = enc.patch_stem(torch.stack([mean, std_a], dim=2))
+    out_b = enc.patch_stem(torch.stack([mean, std_b], dim=2))
+    assert torch.equal(out_a, out_b)                    # std plane is a no-op at init
+
+
+def test_mean_pool_std_zero_init_byte_identical_to_mean_only() -> None:
+    """Strict-superset: a std-ON model with the std channel zero-init produces
+    a forward byte-identical to the legacy mean-only model (same mean weights)."""
+    std_enc = _make(mean_pool_std=True).eval()
+    nonstd = _meanonly_matching(std_enc).eval()
+    kw = _mp_kw()
+    et, support, valid = _inputs(2, 8, kw)
+    o_std = std_enc(et, support, valid_mask=valid, return_taps=True)
+    o_non = nonstd(et, support, valid_mask=valid, return_taps=True)
+    torch.testing.assert_close(o_std["M2"], o_non["M2"])
+    torch.testing.assert_close(o_std["M4"], o_non["M4"])
+    assert torch.equal(o_std["latent_valid"], o_non["latent_valid"])
+
+
+def test_mean_pool_std_channel_is_learnable() -> None:
+    """Zero-init ≠ dead: σ≠0 so gradient reaches the std-channel conv weights,
+    which can therefore learn to USE the per-parcel spread."""
+    enc = _make(mean_pool_std=True).train()
+    kw = _mp_kw()
+    et, support, valid = _inputs(2, 8, kw)
+    out = enc(et, support, valid_mask=valid, return_taps=True)
+    out["M4"].sum().backward()
+    g_std = enc.patch_stem.conv.weight.grad[:, 1]
+    assert g_std is not None and torch.isfinite(g_std).all()
+    assert g_std.abs().sum() > 0                         # gradient actually flows
+
+
+# --------------------------------------------------------------------------- #
+# B37+ JOINT parcel×time latent mode (latent_mode="joint")
+# --------------------------------------------------------------------------- #
+# The default "parcel" latent folds freq×time into the batch and attends over
+# the parcel axis alone — it CANNOT couple two regions across time. The "joint"
+# mode (2026-06-11, Ben) folds only freq into the batch and attends jointly over
+# the k·T_p parcel×time tokens (parcel-outer/time-inner, time-RoPE + an additive
+# learned per-GLOBAL-parcel-id tag). Pinned: default is parcel; joint is shape-
+# parity with parcel (mode-agnostic SSL target/readout); joint COUPLES across
+# time where parcel does not; freq never leaks; the tag is keyed by GLOBAL parcel
+# id (ragged==dense on visible) so it transfers cross-subject; masked parcels are
+# excluded as keys (leakage-free); the checkpointed path matches.
+def test_latent_mode_default_is_parcel() -> None:
+    from speech_decoding.models.v14_encoder import _ParcelSelfAttnBlock
+
+    enc = _make()
+    assert enc.latent_mode == "parcel"
+    assert enc.latent_parcel_tag is None
+    assert all(isinstance(b, _ParcelSelfAttnBlock) for b in enc.latent_parcel_blocks)
+
+
+def test_latent_joint_builds_per_global_parcel_tag_and_joint_blocks() -> None:
+    from speech_decoding.models.v14_encoder import _JointTokenBlock
+
+    enc = _make(latent_mode="joint")
+    assert enc.latent_mode == "joint"
+    assert isinstance(enc.latent_parcel_tag, torch.nn.Parameter)
+    assert enc.latent_parcel_tag.shape == (enc.k_parcels, enc.d_model)
+    assert all(isinstance(b, _JointTokenBlock) for b in enc.latent_parcel_blocks)
+
+
+def test_latent_joint_forward_shape_parity() -> None:
+    """joint mode produces the SAME (B,K,F_p,T_p,d) M2/M4 as parcel mode, so the
+    SSL target + readout are latent-mode-agnostic."""
+    kw = _mp_kw()
+    et, support, valid = _inputs(2, 8, kw)
+    op = _make(latent_mode="parcel").eval()(et, support, valid_mask=valid, return_taps=True)
+    oj = _make(latent_mode="joint").eval()(et, support, valid_mask=valid, return_taps=True)
+    assert oj["M2"].shape == op["M2"].shape
+    assert oj["M4"].shape == op["M4"].shape
+    assert torch.isfinite(oj["M2"]).all() and torch.isfinite(oj["M4"]).all()
+
+
+def test_latent_joint_couples_across_time_unlike_parcel() -> None:
+    """The reason joint mode exists. Perturbing (parcel j=0, freq f=1, time t'=3)
+    must move a DIFFERENT parcel i=1 at a DIFFERENT time t=0 in joint mode
+    (cross-region temporal coupling) but NOT in parcel mode (time is batched).
+    In BOTH modes a DIFFERENT freq row f=0 is untouched (freq is never attended).
+    """
+    # max_seq_len=10 ⇒ max_T_p=5 so the joint time-RoPE table covers the
+    # fabricated T_p=4 (production always has T_p ≤ max_T_p; parcel mode ignores
+    # the table, joint mode indexes it per token).
+    for mode, expect_cross_time in (("parcel", False), ("joint", True)):
+        enc = _make(latent_mode=mode, max_seq_len=10).eval()
+        m2, K = _rand_m2(enc, B=1, T_p=4, seed=2)       # F_p=2, T_p=4
+        lv = torch.ones(1, K, dtype=torch.bool)
+        z0 = enc._parcel_latent(m2, lv, use_ckpt=False)
+        m2p = m2.clone()
+        m2p[:, 0, 1, 3, :] = _perturb(m2p[:, 0, 1, 3, :], seed=7)   # (j=0, f=1, t'=3)
+        z1 = enc._parcel_latent(m2p, lv, use_ckpt=False)
+        delta = (z1 - z0).abs()
+        cross_time = delta[:, 1, 1, 0, :].max().item()  # i=1, f=1, t=0 (≠ t'=3)
+        if expect_cross_time:
+            assert cross_time > 1e-5, f"{mode}: expected cross-time coupling"
+        else:
+            assert cross_time < 1e-6, f"{mode}: parcel mode must NOT couple across time"
+        assert delta[:, :, 0, :, :].max().item() < 1e-6, f"{mode}: freq row leaked"
+
+
+def test_latent_joint_ragged_equals_dense_global_id_tag() -> None:
+    """Cross-subject requirement: the additive parcel tag is keyed by GLOBAL
+    parcel id, so the ragged-packed path (gather tag by ``keep_idx``) gives a
+    visible parcel the SAME ``tag[k]`` as dense (where slot index == global id).
+    A packed-slot-keyed tag would give parcel k a different tag once it packs to
+    a different slot, breaking this. Visible-parcel z matches dense up to fp
+    reduction; dropped parcels go to exactly 0."""
+    enc = _make(latent_mode="joint", max_seq_len=10).eval()   # max_T_p=5 ≥ T_p=4
+    m2, K = _rand_m2(enc, B=3, T_p=4, seed=5)
+    lv = torch.ones(3, K, dtype=torch.bool)
+    lv[0, 3:] = False                                   # clip 0: 3 visible
+    lv[1, 5] = False                                    # clip 1: 5 visible
+    lv[2, 2:] = False                                   # clip 2: 2 visible (Kk=5)
+    zd, zr = _parcel_latent_dense_vs_ragged(enc, m2, lv)
+    torch.testing.assert_close(zr[lv], zd[lv], atol=1e-5, rtol=1e-5)
+    drop = ~lv
+    assert drop.any()
+    assert (zr[drop] == 0).all()
+
+
+def test_latent_joint_visible_z_independent_of_masked_parcel_content() -> None:
+    """Leakage-free: a surviving parcel's joint z does not depend on a MASKED
+    parcel's content — the key-padding mask drops masked parcels as keys."""
+    enc = _make(latent_mode="joint", max_seq_len=10).eval()   # max_T_p=5 ≥ T_p=4
+    m2, K = _rand_m2(enc, B=1, T_p=4, seed=6)
+    lv = torch.ones(1, K, dtype=torch.bool)
+    lv[0, K - 1] = False                                # last parcel masked
+    z0 = enc._parcel_latent(m2, lv, use_ckpt=False)
+    m2p = m2.clone()
+    m2p[:, K - 1] = _perturb(m2p[:, K - 1], seed=9)     # change ONLY the masked parcel
+    z1 = enc._parcel_latent(m2p, lv, use_ckpt=False)
+    torch.testing.assert_close(z1[:, : K - 1], z0[:, : K - 1])   # visible unchanged
+
+
+def test_latent_joint_checkpoint_matches_and_backprops() -> None:
+    enc = _make(latent_mode="joint", max_seq_len=10).train()   # max_T_p=5 ≥ T_p=3
+    enc.ragged_parcel = True
+    m2, K = _rand_m2(enc, B=2, T_p=3, seed=4)
+    lv = torch.ones(2, K, dtype=torch.bool)
+    lv[1, 4:] = False
+    base = m2.clone().requires_grad_(True)
+    ckpt = m2.clone().requires_grad_(True)
+    zb = enc._parcel_latent(base, lv, use_ckpt=False)
+    zc = enc._parcel_latent(ckpt, lv, use_ckpt=True)
+    torch.testing.assert_close(zc, zb)
+    zb.sum().backward()
+    gb = base.grad.clone()
+    enc.zero_grad(set_to_none=True)
+    zc.sum().backward()
+    assert torch.isfinite(gb).all() and torch.isfinite(ckpt.grad).all()
+    torch.testing.assert_close(ckpt.grad, gb)
+    assert enc.latent_parcel_tag.grad is not None       # the tag actually trains
+    enc.ragged_parcel = False
+
+
+def test_meanpool_std_and_joint_compose() -> None:
+    """Production config: std channel ON + joint latent ON forward clean, correct
+    shape, finite, and backprop reaches BOTH the std channel and the parcel tag."""
+    enc = _make(mean_pool_std=True, latent_mode="joint").train()
+    enc.ragged_parcel = True
+    kw = _mp_kw()
+    et, support, valid = _inputs(2, 8, kw)
+    out = enc(et, support, valid_mask=valid, return_taps=True)
+    F_p, T_p, d = enc.n_freq_patches, kw_T(enc, kw), kw["d_model"]
+    assert out["M4"].shape == (2, kw["k_parcels"], F_p, T_p, d)
+    assert torch.isfinite(out["M4"]).all()
+    out["M4"].sum().backward()
+    assert enc.patch_stem.conv.weight.grad[:, 1].abs().sum() > 0   # std learns
+    assert (
+        enc.latent_parcel_tag.grad is not None
+        and enc.latent_parcel_tag.grad.abs().sum() > 0             # tag learns
+    )
+    enc.ragged_parcel = False
