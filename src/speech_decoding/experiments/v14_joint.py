@@ -267,6 +267,18 @@ class V14JointExperiment(V14Experiment):
     m2_predictor_depth: int = pydantic.Field(default=3, ge=1)
     m4_predictor_depth: int = pydantic.Field(default=2, ge=1)
 
+    # Heteroscedastic / inverse-variance M4 (P2) loss weighting (joint only;
+    # project_v14_heteroscedastic_ssl_loss). ``m4_precision_weight`` multiplies
+    # each masked M4 cell's L1 by a DETACHED, mean-1-normalized precision
+    # ``w = n_k^α / (σ²+ε)`` (n_k = parcel electrode count, σ = the mean|std
+    # pool's per-cell std) so the gradient down-weights shaky low-n/high-σ parcel
+    # targets. OFF by default (opt-in → the landed baseline is byte-identical);
+    # requires ssl_mode="joint" + mean_pool_std (the σ source), re-validated in
+    # the BrainModule. ``m4_precision_alpha`` is the ``n^α`` exponent (α=1 = raw
+    # count; α<1 damps high-n since spatially-correlated electrodes give n_eff<n).
+    m4_precision_weight: bool = False
+    m4_precision_alpha: float = pydantic.Field(default=1.0, ge=0.0)
+
     # B37 D8 parcel-side discriminative-LR scale (joint only). The parcel side
     # (+ both predictors) rides at ``base_lr · joint_parcel_lr_scale``; the
     # front-end rides at ``base_lr · frontend_lr_scale``. Both default 1.0 (no
@@ -474,6 +486,8 @@ class V14JointExperiment(V14Experiment):
             mask_seed=self.mask_seed,
             ema_tau=self.ema_tau,
             loss_form="l1",
+            m4_precision_weight=self.m4_precision_weight,
+            m4_precision_alpha=self.m4_precision_alpha,
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
             frontend_lr_scale=self.frontend_lr_scale,

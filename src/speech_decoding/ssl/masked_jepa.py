@@ -76,6 +76,64 @@ def _l1_or_zero(pred: Tensor, target: Tensor, loss_form: _LossForm) -> Tensor:
     raise ValueError(f"unknown loss_form={loss_form!r}")
 
 
+# Heteroscedastic (precision-weighted) M4 loss — project_v14_heteroscedastic_ssl_loss
+# floor on σ²+ε so a near-zero-variance parcel cell can't blow the weight up. With
+# the production session-robust-z'd |STFT| the pooled σ lands ~O(1), so ε is purely a
+# div-by-zero guard, not a scale knob (the mean-1 normalization sets the scale).
+_M4_PRECISION_EPS = 1e-6
+
+
+def _weighted_l1_or_zero(
+    pred: Tensor,            # (n_target, d)
+    target: Tensor,          # (n_target, d)
+    weight: Tensor,          # (n_target,) detached, mean-1 over the scored cells
+    loss_form: _LossForm,
+) -> Tensor:
+    """Precision-weighted per-cell L1/MSE: weight each masked cell's d-dim error
+    by ``weight`` (mean-1 → preserves the loss scale of the unweighted form), then
+    mean over cells. Empty masked set → exact graph-connected 0 (B6 contract)."""
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"pred.shape {tuple(pred.shape)} != target.shape {tuple(target.shape)}"
+        )
+    if pred.numel() == 0:
+        return pred.sum() * 0.0
+    if weight.shape != (pred.shape[0],):
+        raise ValueError(
+            f"weight shape {tuple(weight.shape)} != (n_target,)=({pred.shape[0]},)"
+        )
+    if loss_form == "l1":
+        per_cell = (pred - target).abs().mean(dim=-1)        # (n_target,)
+    elif loss_form == "mse":
+        per_cell = (pred - target).pow(2).mean(dim=-1)       # (n_target,)
+    else:
+        raise ValueError(f"unknown loss_form={loss_form!r}")
+    return (per_cell * weight).mean()
+
+
+def _m4_precision_weight(
+    precision_std: Tensor,   # (B, K, F_p, T_p) per-cell pooled σ (raw |STFT| std)
+    precision_n: Tensor,     # (B, K) electrode count per parcel
+    target_cell: Tensor,     # (B, N) bool, N = K·F_p·T_p, flat (K outer, F_p, T_p inner)
+    alpha: float,
+    eps: float,
+) -> Tensor:
+    """Inverse-variance precision weight ``w = n_k^α / (σ²+ε)`` gathered at the
+    masked cells and normalized to mean 1 (DETACHED — σ/n are data-derived, no
+    grad path, and detaching guarantees the model can't inflate σ to dodge its
+    own hard cells). Mean-1 → uniform-weight limit recovers plain L1."""
+    B, K, F_p, T_p = precision_std.shape
+    N = K * F_p * T_p
+    n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
+    n_cell = n_pow.unsqueeze(-1).unsqueeze(-1).expand(B, K, F_p, T_p).reshape(B, N)
+    sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
+    w_full = n_cell / (sigma2 + eps)                         # (B, N)
+    w = w_full[target_cell].detach()                        # (n_target,)
+    if w.numel() == 0:
+        return w
+    return w / w.mean().clamp(min=eps)
+
+
 def p1_frontend_m2_loss(
     *,
     predictor: torch.nn.Module,  # JepaPredictor (P1, n_identity = F_p)
@@ -250,6 +308,11 @@ def b37_m4_freq_loss(
     visible: Tensor,      # (B, K, T_p) bool — surviving (non-tubed) covered parcel-times
     target_mask: Tensor,  # (B, K, T_p) bool — tube-masked covered parcel-times
     loss_form: _LossForm = "l1",
+    # Heteroscedastic / inverse-variance precision weighting (OPT-IN; both None →
+    # byte-identical to the plain-L1 path). project_v14_heteroscedastic_ssl_loss.
+    precision_std: tp.Optional[Tensor] = None,  # (B, K, F_p, T_p) pooled σ (raw |STFT| std)
+    precision_n: tp.Optional[Tensor] = None,    # (B, K) electrode count per parcel
+    precision_alpha: float = 1.0,
 ) -> MaskedJepaBreakdown:
     """B37 M4 masked JEPA — the freq-PRESERVING parcel reconstruction (D3/D9).
 
@@ -324,7 +387,31 @@ def b37_m4_freq_loss(
         query_valid=target_cell,
     )                                                # (n_target, d)
     target = teacher_m4.reshape(B, N, d)[target_cell].detach()  # (n_target, d)
-    loss = _l1_or_zero(pred, target, loss_form)
+    if precision_std is None and precision_n is None:
+        loss = _l1_or_zero(pred, target, loss_form)
+    else:
+        if precision_std is None or precision_n is None:
+            raise ValueError(
+                "precision weighting needs BOTH precision_std and precision_n; got "
+                f"std={precision_std is not None}, n={precision_n is not None}"
+            )
+        if precision_std.shape != (B, K, F_p, T_p):
+            raise ValueError(
+                f"precision_std shape {tuple(precision_std.shape)} != "
+                f"(B, K, F_p, T_p)=({B},{K},{F_p},{T_p})"
+            )
+        if precision_n.shape != (B, K):
+            raise ValueError(
+                f"precision_n shape {tuple(precision_n.shape)} != (B, K)=({B},{K})"
+            )
+        weight = _m4_precision_weight(
+            precision_std=precision_std,
+            precision_n=precision_n,
+            target_cell=target_cell,
+            alpha=precision_alpha,
+            eps=_M4_PRECISION_EPS,
+        )
+        loss = _weighted_l1_or_zero(pred, target, weight, loss_form)
     return MaskedJepaBreakdown(
         total=loss, phase="m4_freq", n_masked=int(target_cell.sum())
     )

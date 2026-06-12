@@ -16,6 +16,7 @@ import pytest
 
 from speech_decoding.models.v14_encoder import JepaPredictor
 from speech_decoding.ssl.masked_jepa import (
+    _m4_precision_weight,
     b37_m4_freq_loss,
     p1_frontend_m2_loss,
     p2_parcel_m4_loss,
@@ -328,6 +329,108 @@ def test_b37_m4_empty_tube_is_exact_zero() -> None:
     assert bd.n_masked == 0
     assert float(bd.total.detach()) == 0.0
     bd.total.backward()  # must not raise / NaN
+
+
+# ---------------------------------------------------------------------------
+# Heteroscedastic / inverse-variance precision weighting on M4
+# (project_v14_heteroscedastic_ssl_loss). w = n_k^α / (σ²+ε), DETACHED, mean-1.
+# ---------------------------------------------------------------------------
+
+
+def test_m4_precision_weight_is_mean1_detached_and_ordered() -> None:
+    """The gathered weight is mean-1, detached, finite, and orders cells by
+    precision: high-n/low-σ parcels outweigh low-n/high-σ parcels."""
+    B, K, F_p, T_p = 1, 3, 2, 2
+    N = K * F_p * T_p
+    n = torch.tensor([[10.0, 4.0, 1.0]])          # parcel 0 high n → parcel 2 low n
+    std = torch.ones(B, K, F_p, T_p)
+    std[0, 0] = 0.1                                # parcel 0 low σ (most reliable)
+    std[0, 2] = 2.0                                # parcel 2 high σ (least reliable)
+    target_cell = torch.ones(B, N, dtype=torch.bool)  # score every cell
+    w = _m4_precision_weight(std, n, target_cell, alpha=1.0, eps=1e-6)
+
+    assert torch.isfinite(w).all()
+    assert not w.requires_grad                     # detached — no grad path via σ/n
+    assert abs(w.mean().item() - 1.0) < 1e-5       # mean-1 normalized (scale-preserving)
+    w_grid = w.reshape(K, F_p, T_p)
+    assert w_grid[0].mean() > w_grid[1].mean() > w_grid[2].mean()
+
+
+def test_m4_precision_weight_alpha_zero_drops_count_term() -> None:
+    """α=0 → n^0=1, so the weight depends only on 1/(σ²+ε): two parcels with
+    equal σ but different n get equal weight."""
+    B, K, F_p, T_p = 1, 2, 1, 1
+    N = K * F_p * T_p
+    n = torch.tensor([[8.0, 1.0]])                 # different counts
+    std = torch.full((B, K, F_p, T_p), 0.5)        # equal σ
+    target_cell = torch.ones(B, N, dtype=torch.bool)
+    w = _m4_precision_weight(std, n, target_cell, alpha=0.0, eps=1e-6)
+    assert torch.allclose(w, torch.ones_like(w), atol=1e-6)
+
+
+def test_b37_m4_precision_uniform_stats_recovers_plain_l1() -> None:
+    """Uniform σ + uniform n → mean-1 weight is all-ones → the weighted loss is
+    byte-identical to the plain-L1 path (the safe-ship uniform-weight limit)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 5, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    pred = _m4_predictor(d, K, F_p, T_p)           # eval → deterministic
+
+    plain = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+    )
+    std = torch.full((B, K, F_p, T_p), 0.37)
+    n = torch.full((B, K), 5.0)
+    weighted = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+        precision_std=std, precision_n=n, precision_alpha=1.0,
+    )
+    assert torch.allclose(plain.total, weighted.total, atol=1e-6)
+
+
+def test_b37_m4_precision_nonuniform_changes_loss() -> None:
+    """Non-uniform σ across the tubed parcel's cells re-weights the L1 → the
+    weighted loss differs from plain L1 (the weighting is actually applied)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 5, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    pred = _m4_predictor(d, K, F_p, T_p)
+
+    plain = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+    )
+    std = torch.rand(B, K, F_p, T_p) + 0.1         # non-uniform σ
+    n = torch.full((B, K), 5.0)
+    weighted = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+        precision_std=std, precision_n=n, precision_alpha=1.0,
+    )
+    assert torch.isfinite(weighted.total)
+    assert not torch.allclose(plain.total, weighted.total, atol=1e-4)
+
+
+def test_b37_m4_precision_requires_both_std_and_n() -> None:
+    """Passing only one of (std, n) is a usage error (both or neither)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 1, 3, 2, 2, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    pred = _m4_predictor(d, K, F_p, T_p)
+    std = torch.ones(B, K, F_p, T_p)
+    with pytest.raises(ValueError, match="BOTH"):
+        b37_m4_freq_loss(
+            predictor=pred, student_m4=student, teacher_m4=teacher,
+            visible=visible, target_mask=target_mask, precision_std=std,
+        )
 
 
 # ---------------------------------------------------------------------------

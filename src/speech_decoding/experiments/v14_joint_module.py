@@ -256,6 +256,12 @@ class V14JointBrainModule(pl.LightningModule):
         mask_seed: int = 0,
         ema_tau: float = 0.99925,
         loss_form: _LossForm = "l1",
+        # Heteroscedastic / inverse-variance precision weighting on the M4 (P2)
+        # masked-JEPA loss (project_v14_heteroscedastic_ssl_loss). OFF by default
+        # (opt-in → the landed baseline + every existing test is byte-identical).
+        # Requires ssl_mode="joint" + the encoder's mean|std pool (the σ source).
+        m4_precision_weight: bool = False,
+        m4_precision_alpha: float = 1.0,
         predictor: tp.Optional[JepaPredictor] = None,
         predictor_depth: int = 3,
         predictor_hidden: int = 128,
@@ -307,6 +313,20 @@ class V14JointBrainModule(pl.LightningModule):
                 )
             if lambda_m4 < 0.0:
                 raise ValueError(f"lambda_m4 must be >= 0; got {lambda_m4}")
+            if m4_precision_weight and not getattr(encoder, "mean_pool_std", False):
+                raise ValueError(
+                    "m4_precision_weight needs the encoder's mean|std pool as the "
+                    "σ source — set mean_pool_std=True (the B37 RGB-style pool)."
+                )
+        elif m4_precision_weight:
+            raise ValueError(
+                "m4_precision_weight is the heteroscedastic M4 (P2) loss weight; "
+                f"it only applies to ssl_mode='joint', got ssl_mode={ssl_mode!r}."
+            )
+        if m4_precision_alpha < 0.0:
+            raise ValueError(
+                f"m4_precision_alpha must be >= 0; got {m4_precision_alpha}"
+            )
         # B36 WS-E E2 hyperparameter (P2 only). 0.0 = R-p2-freeze-frontend
         # (front-end frozen, parcel side trains alone); 0.1 = base/10 default;
         # 0.2 = R-p2-frontend-lr-5 (base/5). >1.0 would let the pretrained
@@ -500,6 +520,8 @@ class V14JointBrainModule(pl.LightningModule):
         self._m_sub_slots = encoder.m_sub_slots
         self._d_model = encoder.d_model
         self._loss_form: _LossForm = loss_form
+        self._m4_precision_weight = bool(m4_precision_weight)
+        self._m4_precision_alpha = float(m4_precision_alpha)
         self._frontend_lr_scale = frontend_lr_scale
         self._parcel_lr_scale = parcel_lr_scale
         self._wd_exclude_norms = bool(wd_exclude_norms)
@@ -980,6 +1002,14 @@ class V14JointBrainModule(pl.LightningModule):
             valid_mask=visible_parcels,
         )
         # M4: tube reconstruction (freq carried) from surviving parcels' context.
+        # Heteroscedastic precision weighting (opt-in): σ/n are properties of the
+        # raw input pool (mask-independent → student and teacher carry identical
+        # stats); take them from the student taps. project_v14_heteroscedastic_ssl_loss.
+        precision_std = None
+        precision_n = None
+        if self._m4_precision_weight:
+            precision_std = student_taps["M4_precision_std"]
+            precision_n = student_taps["M4_precision_n"]
         m4_bd = b37_m4_freq_loss(
             predictor=self.m4_predictor,
             student_m4=student_taps["M4"],
@@ -987,6 +1017,9 @@ class V14JointBrainModule(pl.LightningModule):
             visible=visible_pt,
             target_mask=target_pt,
             loss_form=self._loss_form,
+            precision_std=precision_std,
+            precision_n=precision_n,
+            precision_alpha=self._m4_precision_alpha,
         )
         total = m2_bd.total + self._lambda_m4 * m4_bd.total
         return JointJepaBreakdown(

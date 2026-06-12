@@ -805,6 +805,12 @@ def build_v14_experiment(
     # builder (P3/P4 use no EMA teacher), so passing it on every phase is inert
     # off the SSL path. The ema.py constants are NOT mutated.
     ema_tau: float | None = None,
+    # Heteroscedastic / inverse-variance M4 (P2) loss weighting (joint +
+    # mean_pool_std only; project_v14_heteroscedastic_ssl_loss). OFF by default;
+    # ``--m4-precision-weight`` enables it and ``--m4-precision-alpha`` sets the
+    # ``n^α`` exponent (α=1 raw count; α<1 damps high-n electrode redundancy).
+    m4_precision_weight: bool = False,
+    m4_precision_alpha: float = 1.0,
     predictor_depth: int = DEFAULT_PREDICTOR_DEPTH,
     predictor_hidden: int = DEFAULT_PREDICTOR_HIDDEN,
     predictor_n_heads: int = DEFAULT_PREDICTOR_N_HEADS,
@@ -1017,6 +1023,22 @@ def build_v14_experiment(
         raise ValueError(f"m2_time_band_floor must be >= 1; got {m2_time_band_floor}")
     if m2_freq_band_floor < 1:
         raise ValueError(f"m2_freq_band_floor must be >= 1; got {m2_freq_band_floor}")
+    # Heteroscedastic M4 precision weighting (project_v14_heteroscedastic_ssl_loss):
+    # fail fast at dispatch (the BrainModule re-validates) — it needs the σ source
+    # (mean|std pool) and the joint B37 path. α >= 0 (α=1 raw count, α<1 damps high-n).
+    if m4_precision_weight:
+        if not mean_pool_std:
+            raise ValueError(
+                "--m4-precision-weight needs the mean|std pool as the σ source; "
+                "pass --mean-pool-std (the B37 RGB-style pool)."
+            )
+        if ssl_mode != "joint":
+            raise ValueError(
+                "--m4-precision-weight is the heteroscedastic M4 (P2) loss weight "
+                f"and only applies to the joint B37 path; got ssl_mode={ssl_mode!r}."
+            )
+    if m4_precision_alpha < 0.0:
+        raise ValueError(f"m4_precision_alpha must be >= 0; got {m4_precision_alpha}")
 
     optim_cfg = _build_optim_cfg(
         lr=lr, lr_schedule=lr_schedule, warmup_steps=warmup_steps,
@@ -1474,6 +1496,11 @@ def build_v14_experiment(
             # DEFAULT_EMA_TAU == 0.99925, the B26 lock); threads onto
             # V14JointExperiment.ema_tau, which feeds the EmaTeacher schedule.
             "ema_tau": ema_tau,
+            # Heteroscedastic / inverse-variance M4 (P2) loss weighting (joint +
+            # mean_pool_std only; project_v14_heteroscedastic_ssl_loss). OFF by
+            # default — opt-in via --m4-precision-weight on the run.
+            "m4_precision_weight": m4_precision_weight,
+            "m4_precision_alpha": m4_precision_alpha,
             "predictor_depth": predictor_depth,
             "predictor_hidden": predictor_hidden,
             "predictor_n_heads": predictor_n_heads,
@@ -2583,6 +2610,22 @@ def _parser() -> argparse.ArgumentParser:
              "None is byte-identical to the prior hardcoded value.",
     )
     p.add_argument(
+        "--m4-precision-weight", dest="m4_precision_weight", action="store_true",
+        help="Heteroscedastic / inverse-variance weighting on the M4 (P2) masked-"
+             "JEPA loss (project_v14_heteroscedastic_ssl_loss): multiply each "
+             "masked M4 cell's L1 by a DETACHED, mean-1-normalized precision "
+             "w = n_k^α / (σ²+ε) (n_k = parcel electrode count, σ = the mean|std "
+             "pool's per-cell std) so the gradient down-weights shaky low-n/high-σ "
+             "parcel targets. OFF by default (opt-in); REQUIRES --mean-pool-std "
+             "(σ source) AND the joint B37 path. Uniform-weight limit = plain L1.",
+    )
+    p.add_argument(
+        "--m4-precision-alpha", dest="m4_precision_alpha", type=float, default=1.0,
+        help="The n^α exponent for --m4-precision-weight. 1.0 (default) = raw "
+             "electrode count; α<1 damps high-n parcels (spatially-correlated "
+             "electrodes give effective n_eff<n, so plain count over-trusts them).",
+    )
+    p.add_argument(
         "--m4-mask-type", dest="m4_mask_type", choices=("tube", "time_block"),
         default=DEFAULT_M4_MASK_TYPE,
         help="#75 M4 mask shape. 'tube' (default, 6/03 lock) = whole covered "
@@ -2977,6 +3020,8 @@ def _common_build_kwargs(
         # it to 0.99925 (the B26 lock); joint-only inside the builder, so passing
         # it on every phase (incl. P3/P4) is inert off the SSL path.
         ema_tau=args.ema_tau,
+        m4_precision_weight=args.m4_precision_weight,
+        m4_precision_alpha=args.m4_precision_alpha,
         predictor_depth=args.predictor_depth,
         predictor_hidden=args.predictor_hidden,
         predictor_n_heads=args.predictor_n_heads,

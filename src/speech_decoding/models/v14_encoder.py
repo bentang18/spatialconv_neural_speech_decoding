@@ -1429,13 +1429,14 @@ class V14ParcelPerceiverModel(nn.Module):
         x_in: Tensor,                  # (B, C, F, T) raw |STFT|
         support: Tensor,               # (B, C, K) one-hot DK assignment
         valid_mask: Optional[Tensor],  # (B, C) bool, or None
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
         """D2 mean-before: average raw |STFT| across each parcel's electrodes.
 
         ``parcel_raw[b,k] = (Σ_c w[b,c,k]·x_in[b,c]) / (Σ_c w[b,c,k])`` with
         ``w[b,c,k] = (support[b,c,k] > 0) ∧ valid_mask[b,c]``. Uncovered
         parcels (``Σ_c w = 0``) → ``parcel_raw = 0`` and ``latent_valid =
-        False``. Returns ``(parcel_raw, latent_valid (B,K))``.
+        False``. Returns ``(parcel_raw, latent_valid (B,K), denom (B,K),
+        std_raw (B,K,F,T) | None)``.
 
         B37+ RGB-style mean|std (``self.mean_pool_std``): the per-parcel STD of
         the raw |STFT| is computed in the SAME masked reduction (same ``w``,
@@ -1444,6 +1445,13 @@ class V14ParcelPerceiverModel(nn.Module):
         is the integrity invariant: mean and std necessarily describe the
         identical electrode set, so the electrode-row desync cannot reappear.
         With the std OFF the return is the legacy ``(B, K, F, T)``.
+
+        ``denom`` (= per-parcel electrode count ``n_k``) and ``std_raw`` (the
+        raw-resolution per-(parcel,freq,time) σ, ``None`` when ``mean_pool_std``
+        is OFF) are surfaced for the heteroscedastic precision-weighted M4 loss
+        (project_v14_heteroscedastic_ssl_loss). ``denom`` is the integer count
+        before the ``clamp(min=1)`` div-by-zero guard, so uncovered parcels read
+        0 (the loss masks them out via ``latent_valid`` anyway).
         """
         assigned = support > 0                                   # (B, C, K) bool
         if valid_mask is not None:
@@ -1458,7 +1466,7 @@ class V14ParcelPerceiverModel(nn.Module):
         denom_safe = denom.clamp(min=1.0).unsqueeze(-1).unsqueeze(-1)  # (B,K,1,1)
         mean = num / denom_safe                                  # (B, K, F, T)
         if not self.mean_pool_std:
-            return mean, latent_valid
+            return mean, latent_valid, denom, None
         # Second moment in the SAME reduction (same w, same denom_safe). The
         # denom guard MUST be mirrored onto E[x²]: for an uncovered parcel
         # (denom=0) num2=0 → E[x²]=0/1=0, mean=0 → var=0 → σ=√eps (finite, NOT
@@ -1469,7 +1477,7 @@ class V14ParcelPerceiverModel(nn.Module):
         var = (ex2 - mean * mean).clamp(min=0.0)                 # numerical floor
         std = torch.sqrt(var + _MEAN_POOL_STD_EPS)               # (B, K, F, T)
         parcel_raw = torch.stack([mean, std], dim=2)             # (B, K, 2, F, T)
-        return parcel_raw, latent_valid
+        return parcel_raw, latent_valid, denom, std
 
     def _token_block_stack(
         self,
@@ -1712,7 +1720,9 @@ class V14ParcelPerceiverModel(nn.Module):
             )
 
         # D2 mean-before: the ONLY use of the electrode axis.
-        parcel_raw, latent_valid = self._mean_pool_electrodes(x_in, support, valid_mask)
+        parcel_raw, latent_valid, parcel_n, parcel_std_raw = self._mean_pool_electrodes(
+            x_in, support, valid_mask
+        )
         K = self.k_parcels
 
         # D4 per-parcel stem (electrode-shared Conv2d) + freq embed (#95).
@@ -1724,6 +1734,23 @@ class V14ParcelPerceiverModel(nn.Module):
                 f"{self.n_freq_patches}"
             )
         x = x + self.freq_embed.unsqueeze(1)                     # broadcast over K, T_p
+
+        # Heteroscedastic precision stats (project_v14_heteroscedastic_ssl_loss).
+        # Average-pool the raw-resolution σ over each Conv2d patch's (freq,time)
+        # receptive field down to the latent (F_p, T_p) grid so it aligns 1:1
+        # with the M4 target cells; ``parcel_n`` (= n_k) is per-parcel. Both are
+        # surfaced in the taps for the (opt-in) precision-weighted M4 loss; with
+        # ``mean_pool_std`` OFF, ``parcel_std_raw`` is None and only ``n`` rides
+        # along (the loss requires BOTH, so it is gated on mean_pool_std upstream).
+        m4_precision_std: Optional[Tensor] = None
+        if parcel_std_raw is not None:
+            Fr, Tr = parcel_std_raw.shape[2], parcel_std_raw.shape[3]
+            # NB: ``F`` is shadowed by the local freq-bin count above — call the
+            # functional through ``torch.nn.functional`` directly, not the ``F``
+            # module alias.
+            m4_precision_std = torch.nn.functional.adaptive_avg_pool2d(
+                parcel_std_raw.reshape(B * K, 1, Fr, Tr), (F_p, T_p)
+            ).reshape(B, K, F_p, T_p)
 
         # D7 visible-only masking. Zero masked M2 band cells (per-parcel) AND
         # whole tubed parcels (all freq, all time) on the post-stem tokens
@@ -1810,7 +1837,16 @@ class V14ParcelPerceiverModel(nn.Module):
         m4 = self.encoder_ln(z)                                  # M4 tap + readout input
         if not return_taps:
             return m4
-        return {"M2": m2, "M4": m4, "latent_valid": latent_valid}
+        return {
+            "M2": m2,
+            "M4": m4,
+            "latent_valid": latent_valid,
+            # Heteroscedastic precision stats for the (opt-in) precision-weighted
+            # M4 loss. ``M4_precision_std`` is None when mean_pool_std is OFF;
+            # ``M4_precision_n`` (n_k, B×K) always rides along.
+            "M4_precision_std": m4_precision_std,
+            "M4_precision_n": parcel_n,
+        }
 
     def forward(
         self,
