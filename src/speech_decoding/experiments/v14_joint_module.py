@@ -1456,6 +1456,56 @@ class V14JointBrainModule(pl.LightningModule):
                 step_name=step_name,
             )
 
+    def _grad_routing_norms(
+        self,
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor], Tensor]:
+        """GRAD-ROUTING (#119) — per-group grad-L2² + weight-L2², single pass.
+
+        Partitions the trainable params into three buckets that **exactly
+        tile** the trainable set (so their squared norms sum to the global,
+        a true decomposition rather than an approximation):
+
+        * ``frontend`` — the conv/|STFT| stem (``partition_…_for_staging``'s
+          front-end split): where the gradient lands on the input front-end.
+        * ``predictor`` — the M2/M4 paradigm-B predictor heads.
+        * ``latent``   — everything else trainable (the parcel-pool + latent
+          self-attention blocks), i.e. ``student.parameters()`` minus the
+          front-end, plus nothing else.
+
+        Mirrors the optimiser partition (``_phase_param_groups`` uses the same
+        ``partition_parameters_for_staging`` + ``_predictor_parameters``), so
+        the routing metric reflects exactly the groups that carry their own LR
+        scale. Returns ``(grad_sq, weight_sq, total_grad_sq)`` with the squared
+        L2s per group; callers ``sqrt`` for the reported norm. Weight norms are
+        over the param values (watches the wd=0.1-vs-2.0 effect per group)."""
+        frontend, _parcel = self.student.encoder.partition_parameters_for_staging()
+        front_ids = {id(p) for p in frontend}
+        pred_ids = {id(p) for p in self._predictor_parameters()}
+        dev = self._grad_ema_l2.device
+
+        def _z() -> Tensor:
+            return torch.zeros((), device=dev, dtype=torch.float32)
+
+        grad_sq = {"frontend": _z(), "latent": _z(), "predictor": _z()}
+        weight_sq = {"frontend": _z(), "latent": _z(), "predictor": _z()}
+        for p in self._trainable_parameters():
+            key = (
+                "frontend" if id(p) in front_ids
+                else "predictor" if id(p) in pred_ids
+                else "latent"
+            )
+            weight_sq[key] = weight_sq[key] + p.detach().to(
+                torch.float32
+            ).pow(2).sum()
+            if p.grad is not None:
+                grad_sq[key] = grad_sq[key] + p.grad.detach().to(
+                    torch.float32
+                ).pow(2).sum()
+        total_grad_sq = (
+            grad_sq["frontend"] + grad_sq["latent"] + grad_sq["predictor"]
+        )
+        return grad_sq, weight_sq, total_grad_sq
+
     def on_before_optimizer_step(
         self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature
     ) -> None:
@@ -1469,17 +1519,19 @@ class V14JointBrainModule(pl.LightningModule):
         Done before the optimiser step so a flagged step still gets the
         update (the alarm is informational; the dispatch callback owns
         any rollback / LR backoff escalation per SPAM §3.1).
+
+        #119 GRAD-ROUTING + CLIP: also emits per-group grad-L2 (front-end /
+        latent / predictor), per-group weight-L2, and the clip metrics
+        (``train_mon_grad_clipped`` / ``train_mon_grad_clip_scale``) so the
+        grad-clip fraction and the front-end-vs-latent gradient balance are
+        first-class wandb traces. Pure observability — no training-math
+        effect; this hook still only reads grads + buffers.
         """
-        sq_sum = torch.zeros(
-            (), device=self._grad_ema_l2.device, dtype=torch.float32,
-        )
-        # Student encoder + predictor both carry grads (the teacher is
-        # frozen). BOTH phases exercise the predictor (paradigm-B parity) —
-        # iterating student + predictor keeps the global grad-L2 correct.
-        for p in self._trainable_parameters():
-            if p.grad is not None:
-                sq_sum = sq_sum + p.grad.detach().to(torch.float32).pow(2).sum()
-        grad_l2 = float(sq_sum.sqrt().item())
+        # Single pass: global grad-L2² + the per-group routing breakdown.
+        # (BOTH phases exercise the predictor — paradigm-B parity — so the
+        # student + predictor iteration keeps the global grad-L2 correct.)
+        grad_sq, weight_sq, total_grad_sq = self._grad_routing_norms()
+        grad_l2 = float(total_grad_sq.sqrt().item())
         verdict = grad_spike_monitor(
             grad_l2=grad_l2,
             prior_ema_l2=float(self._grad_ema_l2.item()),
@@ -1498,6 +1550,38 @@ class V14JointBrainModule(pl.LightningModule):
             1.0 if verdict.is_diverged else 0.0,
             on_step=True,
         )
+        # Per-group grad-L2 + weight-L2 (the #119 routing trace).
+        for group in ("frontend", "latent", "predictor"):
+            self.log(
+                f"train_mon_grad_l2_{group}",
+                float(grad_sq[group].sqrt().item()),
+                on_step=True,
+            )
+            self.log(
+                f"train_mon_wnorm_{group}",
+                float(weight_sq[group].sqrt().item()),
+                on_step=True,
+            )
+        # Clip metrics — derived from the (pre-clip) global grad-L2 vs the
+        # trainer's clip ceiling. ``on_before_optimizer_step`` fires BEFORE
+        # Lightning's gradient clipping, so ``grad_l2`` is the pre-clip norm
+        # and the clip fires iff it exceeds ``gradient_clip_val``. Guarded:
+        # unit tests call this hook with no trainer attached.
+        try:
+            clip_val = float(self.trainer.gradient_clip_val or 0.0)
+        except (RuntimeError, AttributeError):
+            clip_val = 0.0
+        if clip_val > 0.0:
+            self.log(
+                "train_mon_grad_clipped",
+                1.0 if grad_l2 > clip_val else 0.0,
+                on_step=True,
+            )
+            self.log(
+                "train_mon_grad_clip_scale",
+                min(1.0, clip_val / (grad_l2 + 1e-12)),
+                on_step=True,
+            )
 
     def on_before_zero_grad(
         self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature

@@ -1018,6 +1018,57 @@ def test_on_before_optimizer_step_logs_grad_spike() -> None:
     assert float(module._grad_ema_l2.item()) > 0.0
 
 
+def test_on_before_optimizer_step_logs_grad_routing_and_clip() -> None:
+    """#119 GRAD-ROUTING + CLIP — per-group grad/weight norms decompose the
+    global, and the clip metrics fire when a trainer clip ceiling is set."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    # A trainer with a clip ceiling so the clip metrics are emitted.
+    module.trainer = SimpleNamespace(gradient_clip_val=1.0)  # type: ignore[assignment]
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+
+    for group in ("frontend", "latent", "predictor"):
+        assert f"train_mon_grad_l2_{group}" in logged
+        assert f"train_mon_wnorm_{group}" in logged
+        assert logged[f"train_mon_wnorm_{group}"] > 0.0
+    # The three group grad-L2² must sum to the global grad-L2² (exact tiling).
+    per_group_sq = sum(
+        logged[f"train_mon_grad_l2_{g}"] ** 2
+        for g in ("frontend", "latent", "predictor")
+    )
+    assert per_group_sq == pytest.approx(logged["train_mon_grad_l2"] ** 2, rel=1e-4)
+    # P1: the latent (parcel-SA) side is grad-free → ~zero; the front-end +
+    # predictor carry the gradient.
+    assert logged["train_mon_grad_l2_latent"] == pytest.approx(0.0, abs=1e-6)
+    assert logged["train_mon_grad_l2_frontend"] > 0.0
+    # Clip metrics present + self-consistent with the global grad-L2.
+    assert "train_mon_grad_clipped" in logged
+    assert "train_mon_grad_clip_scale" in logged
+    expected_scale = min(1.0, 1.0 / (logged["train_mon_grad_l2"] + 1e-12))
+    assert logged["train_mon_grad_clip_scale"] == pytest.approx(expected_scale, rel=1e-4)
+    assert logged["train_mon_grad_clipped"] == (
+        1.0 if logged["train_mon_grad_l2"] > 1.0 else 0.0
+    )
+
+
+def test_on_before_optimizer_step_skips_clip_metrics_without_trainer() -> None:
+    """No trainer attached (unit-test path) → clip metrics are silently
+    skipped, not a crash."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+    assert "train_mon_grad_clipped" not in logged
+    assert "train_mon_grad_clip_scale" not in logged
+    # Routing metrics do NOT need a trainer.
+    assert "train_mon_grad_l2_frontend" in logged
+
+
 def test_grad_ema_buffer_persists_across_calls() -> None:
     module = _make_module(phase="p1")
     _perturb_student_for_nonzero_grad(module)
