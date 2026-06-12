@@ -384,6 +384,98 @@ def extract_features(
     return X, Y
 
 
+@torch.no_grad()
+def encode_tokens(
+    encoder: torch.nn.Module,
+    batch_data: Dict[str, Tensor],
+    *,
+    pool: str,
+    m_sub_slots: int,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor]:
+    """Forward one batch, return EVERY parcel x freq x time token (NO pooling)
+    plus a per-token valid mask. Decouples feature construction from pooling so
+    the flatten / attentive readouts can keep parcels + time (+ freq).
+
+    mean path:  tokens (B, K*F_p*T_p, d), valid (B, K*F_p*T_p)
+    cross_attn: tokens (B, L*T_p, d),     valid (B, L*T_p)   (freq pre-collapsed)
+    """
+    electrode_tokens = batch_data["electrode_tokens"].to(device)
+    support = batch_data["support"].to(device)
+    valid_mask = batch_data.get("valid_mask")
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device)
+
+    if pool == "mean":
+        out = encoder(
+            electrode_tokens=electrode_tokens,
+            support=support,
+            valid_mask=valid_mask,
+            return_taps=True,
+        )
+        m4 = out["M4"]                       # (B, K, F_p, T_p, d)
+        latent_valid = out["latent_valid"]   # (B, K) bool
+        B, K, F_p, T_p, d = m4.shape
+        tokens = m4.reshape(B, K * F_p * T_p, d)
+        valid = latent_valid.view(B, K, 1, 1).expand(B, K, F_p, T_p).reshape(B, K * F_p * T_p)
+        return tokens, valid.bool()
+
+    latent = encoder(
+        electrode_tokens=electrode_tokens,
+        support=support,
+        valid_mask=valid_mask,
+        return_taps=False,
+    )
+    if isinstance(latent, dict):
+        latent = latent["M4"]
+    B, L, T_p, d = latent.shape
+    latent_valid = _compute_latent_valid_cross_attn(support, valid_mask, m_sub_slots)  # (B, L)
+    tokens = latent.reshape(B, L * T_p, d)
+    valid = latent_valid.view(B, L, 1).expand(B, L, T_p).reshape(B, L * T_p)
+    return tokens, valid.bool()
+
+
+@torch.no_grad()
+def extract_tokens(
+    encoder: torch.nn.Module,
+    loader,
+    *,
+    pool: str,
+    m_sub_slots: int,
+    device: torch.device,
+    keep: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Run all batches -> (T (N, N_keep, d) fp16 CPU, Y (N,) long, keep (N_tok,) bool).
+
+    Drops tokens invalid for EVERY sample -- the padding parcels under the fixed
+    within-(subject,trial) montage. Because the montage is constant across clips,
+    a parcel is valid for all clips or none, so the surviving tokens need no
+    per-sample mask downstream. `keep` (from the train split) is reused on test
+    so the columns line up. fp16 keeps ~20x10x8x384 tokens x 3500 clips ~ 4 GB CPU.
+    """
+    toks: List[Tensor] = []
+    vals: List[Tensor] = []
+    labels: List[Tensor] = []
+    for batch in loader:
+        data = batch.data
+        t, v = encode_tokens(
+            encoder, data, pool=pool, m_sub_slots=m_sub_slots, device=device
+        )
+        y = data["target"]
+        while y.ndim > 1 and y.shape[-1] == 1:
+            y = y.squeeze(-1)
+        toks.append(t.half().cpu())
+        vals.append(v.cpu())
+        labels.append(y.long().cpu())
+    T = torch.cat(toks)        # (N, N_tok, d) fp16
+    V = torch.cat(vals)        # (N, N_tok) bool
+    Y = torch.cat(labels)
+    if keep is None:
+        keep = V.any(dim=0)    # valid for >=1 clip => valid for all (fixed montage)
+    T = T[:, keep, :].contiguous()
+    return T, Y, keep
+
+
 # ---------------------------------------------------------------------------
 # Linear probe (sklearn L2 LogReg; torch fallback)
 # ---------------------------------------------------------------------------
@@ -453,6 +545,183 @@ def _rank_auroc(y_true: np.ndarray, scores: np.ndarray) -> float:
         return float("nan")
     auc = (ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
+
+
+# ---------------------------------------------------------------------------
+# Token readouts: flatten-linear + lightweight->full attentive pooler
+#
+# The speech signal lives in a FEW parcels (selection beats averaging) and is
+# structured in time (onset). Mean-over-parcels+time dilutes both. These heads
+# keep that structure:
+#   flatten : keep every valid parcel x freq x time token, one strong-L2 linear
+#             (~N_keep*d weights -- ridge-like at p>>n, val early-stop regularizes).
+#   attn    : a learned-query attentive pool. ONE module spanning a capacity axis:
+#             - minimal "attention pool"  (queries=1, no qkv proj, no MLP,
+#               pre_blocks=0): score_i = q.x_i/sqrt(d), softmax over tokens,
+#               weighted sum -> LN -> linear.  ~ d + d*C params  (~1.2k).
+#             - V-JEPA-2 attentive pooler (pre_blocks>0 self-attn refine tokens,
+#               qkv_proj multi-head cross-attn, mlp_ratio>0 MLP).  ~1.5-2M params.
+#             3500 clips tells us where on this axis the signal saturates.
+# Param count is independent of N tokens for `attn` -- what overfits 3500 clips
+# is PROBE PARAMS, not token count. That's why the attentive pool is the
+# tractable way to "keep parcels and time" (flatten is ~N_keep*d-dim).
+# ---------------------------------------------------------------------------
+
+class FlattenLinear(torch.nn.Module):
+    """Keep parcels+freq+time: flatten valid tokens -> a single strong-L2 linear.
+    ~N_keep*d weights, trained with weight decay + val early-stop (ridge at p>>n)."""
+
+    def __init__(self, n_tok: int, d: int, n_classes: int = 1):
+        super().__init__()
+        self.head = torch.nn.Linear(n_tok * d, n_classes)
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:  # x (B,N,d)
+        B = x.shape[0]
+        return self.head(x.reshape(B, -1)).squeeze(-1)
+
+
+class AttnProbe(torch.nn.Module):
+    """Lightweight-to-full attentive pooler over (parcel x freq x time) tokens.
+
+    Capacity knobs (minimal -> V-JEPA-2):
+      n_queries  : learned query tokens that each pool the sequence (>1 => richer
+                   readout, head sees n_queries*d).
+      n_heads    : attention heads (qkv_proj path; also the pre-block heads).
+      qkv_proj   : False => raw learned-query scoring (no k/v projections, ~d
+                   params); True => projected multi-head cross-attention (~4d^2).
+      mlp_ratio  : >0 adds a residual MLP (hidden = ratio*d) after pooling.
+      pre_blocks : self-attention transformer blocks that refine the tokens
+                   BEFORE pooling (the "two layers before cross-attn" in V-JEPA-2;
+                   ~12*d^2 params each -- the heavy end, watch overfit on 3500).
+    Tokens here are pre-filtered to valid parcels, so no padding mask is needed.
+    """
+
+    def __init__(
+        self,
+        d: int,
+        n_classes: int = 1,
+        *,
+        n_queries: int = 1,
+        n_heads: int = 1,
+        qkv_proj: bool = False,
+        mlp_ratio: float = 0.0,
+        pre_blocks: int = 0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d = d
+        self.n_queries = n_queries
+        self.qkv_proj = qkv_proj
+        self.drop = torch.nn.Dropout(dropout)
+        self.pre = torch.nn.ModuleList([
+            torch.nn.TransformerEncoderLayer(
+                d_model=d,
+                nhead=n_heads,
+                dim_feedforward=int((mlp_ratio or 2.0) * d),
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(pre_blocks)
+        ])
+        self.query = torch.nn.Parameter(torch.randn(n_queries, d) * (d ** -0.5))
+        if qkv_proj:
+            self.attn = torch.nn.MultiheadAttention(
+                embed_dim=d, num_heads=n_heads, dropout=dropout, batch_first=True
+            )
+        self.ln = torch.nn.LayerNorm(d)
+        if mlp_ratio and mlp_ratio > 0:
+            h = int(mlp_ratio * d)
+            self.mlp = torch.nn.Sequential(
+                torch.nn.Linear(d, h), torch.nn.GELU(),
+                torch.nn.Dropout(dropout), torch.nn.Linear(h, d),
+            )
+        else:
+            self.mlp = None
+        self.head = torch.nn.Linear(d * n_queries, n_classes)
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        # x (B, N, d); mask (B, N) True=valid (None => all valid)
+        pad = (~mask) if mask is not None else None
+        for blk in self.pre:
+            x = blk(x, src_key_padding_mask=pad)
+        B = x.shape[0]
+        q = self.query.unsqueeze(0).expand(B, -1, -1)            # (B, Q, d)
+        if self.qkv_proj:
+            pooled, _ = self.attn(q, x, x, key_padding_mask=pad, need_weights=False)
+        else:
+            scores = torch.einsum("bqd,bnd->bqn", q, x) * (self.d ** -0.5)  # (B,Q,N)
+            if pad is not None:
+                scores = scores.masked_fill(pad.unsqueeze(1), float("-inf"))
+            attn = self.drop(torch.softmax(scores, dim=-1))
+            pooled = torch.einsum("bqn,bnd->bqd", attn, x)        # (B, Q, d)
+        pooled = self.ln(pooled)
+        if self.mlp is not None:
+            pooled = pooled + self.mlp(pooled)
+        pooled = self.drop(pooled)
+        return self.head(pooled.reshape(B, -1)).squeeze(-1)       # (B,) binary
+
+
+def fit_torch_probe_auroc(
+    model: torch.nn.Module,
+    T_tr: Tensor, y_tr: Tensor,
+    T_te: Tensor, y_te: Tensor,
+    *,
+    epochs: int, lr: float, wd: float, patience: int,
+    val_frac: float, batch: int, seed: int, device: torch.device,
+) -> Tuple[float, float]:
+    """Train a token-readout head: per-d-channel standardize (TRAIN stats),
+    AdamW + BCE, minibatch, early-stop on a held-out val AUROC, restore the
+    best-val weights, return (test AUROC, best val AUROC). Deterministic."""
+    g = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
+    N, _, d = T_tr.shape
+    flat = T_tr.reshape(-1, d).float()
+    mu = flat.mean(0); sd = flat.std(0) + 1e-6
+
+    def norm(T: Tensor) -> Tensor:
+        return (T.float() - mu) / sd
+
+    perm = torch.randperm(N, generator=g)
+    n_val = max(1, int(round(val_frac * N)))
+    val_idx, tr_idx = perm[:n_val], perm[n_val:]
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    bce = torch.nn.BCEWithLogitsLoss()
+    yt = y_tr.float()
+
+    best_auc, best_state, bad = -1.0, None, 0
+    for _ep in range(epochs):
+        model.train()
+        order = tr_idx[torch.randperm(tr_idx.numel(), generator=g)]
+        for i in range(0, order.numel(), batch):
+            bi = order[i:i + batch]
+            xb = norm(T_tr[bi]).to(device)
+            yb = yt[bi].to(device)
+            opt.zero_grad()
+            loss = bce(model(xb), yb)
+            loss.backward()
+            opt.step()
+        model.eval()
+        with torch.no_grad():
+            vs = [model(norm(T_tr[val_idx[i:i + batch]]).to(device)).float().cpu()
+                  for i in range(0, val_idx.numel(), batch)]
+        vauc = _rank_auroc(y_tr[val_idx].numpy(), torch.cat(vs).numpy())
+        if vauc > best_auc + 1e-4:
+            best_auc, bad = vauc, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        ts = [model(norm(T_te[i:i + batch]).to(device)).float().cpu()
+              for i in range(0, T_te.shape[0], batch)]
+    test_auc = _rank_auroc(y_te.numpy(), torch.cat(ts).numpy())
+    return test_auc, best_auc
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +831,30 @@ def main() -> None:
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=33)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- readout head ----
+    ap.add_argument("--readout", choices=("mean", "flatten", "attn"), default="mean",
+                    help="mean: pool parcels+time, keep freq -> sklearn L2 logistic "
+                         "(baseline). flatten: keep every valid parcel x freq x time "
+                         "token -> strong-L2 torch linear. attn: learned-query "
+                         "attentive pool (capacity via --attn-* knobs).")
+    # attentive-probe capacity knobs (minimal attention-pool -> V-JEPA-2 pooler)
+    ap.add_argument("--attn-queries", type=int, default=1)
+    ap.add_argument("--attn-heads", type=int, default=1)
+    ap.add_argument("--attn-qkv-proj", action="store_true",
+                    help="projected multi-head cross-attn (else raw learned-query scoring)")
+    ap.add_argument("--attn-mlp-ratio", type=float, default=0.0)
+    ap.add_argument("--attn-pre-blocks", type=int, default=0,
+                    help="self-attn blocks refining tokens before pooling (V-JEPA-2 style)")
+    ap.add_argument("--attn-dropout", type=float, default=0.1)
+    # torch-probe training (shared by flatten + attn)
+    ap.add_argument("--probe-epochs", type=int, default=200)
+    ap.add_argument("--probe-lr", type=float, default=3e-3)
+    ap.add_argument("--probe-wd", type=float, default=1e-2,
+                    help="weight decay -- the main regularizer at p>>n on 3500 clips")
+    ap.add_argument("--probe-patience", type=int, default=25)
+    ap.add_argument("--probe-val-frac", type=float, default=0.2)
+    ap.add_argument("--probe-batch", type=int, default=256)
     args = ap.parse_args()
 
     # ---- env (mirror nano_worker_ddp_start.sh) ----
@@ -615,20 +908,51 @@ def main() -> None:
             encoder = encoder.to(device)
             print(f"[encoder] info={info}")
 
-        X_tr, y_tr = extract_features(
-            encoder, loaders["train"], pool=args.pool,
-            m_sub_slots=args.m_sub_slots, device=device,
-        )
-        X_te, y_te = extract_features(
-            encoder, loaders["test"], pool=args.pool,
-            m_sub_slots=args.m_sub_slots, device=device,
-        )
-        print(f"[features] train X={X_tr.shape} y(+={int(y_tr.sum())}/{len(y_tr)}) "
-              f"| test X={X_te.shape} y(+={int(y_te.sum())}/{len(y_te)})")
-
-        auroc = fit_probe_auroc(X_tr, y_tr, X_te, y_te, seed=args.seed)
+        if args.readout == "mean":
+            X_tr, y_tr = extract_features(
+                encoder, loaders["train"], pool=args.pool,
+                m_sub_slots=args.m_sub_slots, device=device,
+            )
+            X_te, y_te = extract_features(
+                encoder, loaders["test"], pool=args.pool,
+                m_sub_slots=args.m_sub_slots, device=device,
+            )
+            print(f"[features] train X={X_tr.shape} y(+={int(y_tr.sum())}/{len(y_tr)}) "
+                  f"| test X={X_te.shape} y(+={int(y_te.sum())}/{len(y_te)})")
+            auroc = fit_probe_auroc(X_tr, y_tr, X_te, y_te, seed=args.seed)
+            print(f"[result] {task}: AUROC = {auroc:.4f}")
+        else:
+            T_tr, yt_tr, keep = extract_tokens(
+                encoder, loaders["train"], pool=args.pool,
+                m_sub_slots=args.m_sub_slots, device=device,
+            )
+            T_te, yt_te, _ = extract_tokens(
+                encoder, loaders["test"], pool=args.pool,
+                m_sub_slots=args.m_sub_slots, device=device, keep=keep,
+            )
+            n_tok, d = T_tr.shape[1], T_tr.shape[2]
+            print(f"[features] {args.readout} tokens kept={n_tok}/{keep.numel()} d={d} "
+                  f"| train N={T_tr.shape[0]} (+={int(yt_tr.sum())}) "
+                  f"test N={T_te.shape[0]} (+={int(yt_te.sum())})")
+            torch.manual_seed(args.seed)  # reproducible head init, independent of task order
+            if args.readout == "flatten":
+                model = FlattenLinear(n_tok, d)
+            else:
+                model = AttnProbe(
+                    d, n_queries=args.attn_queries, n_heads=args.attn_heads,
+                    qkv_proj=args.attn_qkv_proj, mlp_ratio=args.attn_mlp_ratio,
+                    pre_blocks=args.attn_pre_blocks, dropout=args.attn_dropout,
+                )
+            n_params = sum(p.numel() for p in model.parameters())
+            auroc, vauc = fit_torch_probe_auroc(
+                model, T_tr, yt_tr, T_te, yt_te,
+                epochs=args.probe_epochs, lr=args.probe_lr, wd=args.probe_wd,
+                patience=args.probe_patience, val_frac=args.probe_val_frac,
+                batch=args.probe_batch, seed=args.seed, device=device,
+            )
+            print(f"[result] {task}: AUROC = {auroc:.4f}  "
+                  f"(val={vauc:.4f}, probe_params={n_params:,})")
         results[task] = auroc
-        print(f"[result] {task}: AUROC = {auroc:.4f}")
 
     print("\n========== SUMMARY ==========")
     for task, auroc in results.items():
