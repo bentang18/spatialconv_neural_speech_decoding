@@ -460,6 +460,26 @@ class V14JointBrainModule(pl.LightningModule):
             _dynamic: bool | None = (
                 True if _dyn_flag not in ("", "0", "false", "no", "off") else None
             )
+            # ── DDPOptimizer × dynamic-shapes fix (2026-06-11) ──
+            # Dynamo's DDPOptimizer splits the compiled graph at gradient-bucket
+            # boundaries to overlap allreduce with backward. Under dynamic=True the
+            # ragged latent_parcel_blocks emit symbolic-shape SymInts, and a split
+            # subgraph hands one back as a BARE python int → inductor crashes in
+            # ``fakified_out_wrapper.pre_compile`` with
+            # ``AttributeError: 'int' object has no attribute 'meta'`` (the whole
+            # compile+DDP+dynamic path dies at the first step). Disabling the
+            # bucket-split optimizer compiles the forward as a SINGLE graph; the
+            # only cost is losing allreduce/compute overlap, negligible for this
+            # ~24M-param model over single-node 4-GPU DDP (~182 MB of grads, one
+            # fast bus-local allreduce). Env-overridable via V14_COMPILE_DDP_OPTIMIZER
+            # (default OFF = disabled, because the production sweep IS compile+DDP+
+            # dynamic). Set only inside the compile branch + only read by Dynamo when
+            # compiling a DDP-wrapped module → zero effect on the eager / 1-GPU path.
+            import torch._dynamo as _dynamo_mod
+            _ddp_opt = os.environ.get(
+                "V14_COMPILE_DDP_OPTIMIZER", "").strip().lower()
+            _dynamo_mod.config.optimize_ddp = _ddp_opt in (
+                "1", "true", "yes", "on")
             self._compiled_fwd["student"] = torch.compile(
                 self.student, mode=_mode, dynamic=_dynamic,
             )
