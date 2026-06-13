@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import pandas as pd
 
@@ -109,6 +110,50 @@ def test_word_gap_indices_skip_sentence_boundaries() -> None:
         lite=False,
     )
     assert set(labels) == {0, 1, 2}
+
+
+@pytest.mark.parametrize(
+    "task,column",
+    [
+        ("face_num", "face_num"),
+        ("word_index", "idx_in_sentence"),
+        ("word_head_pos", "bin_head"),
+    ],
+)
+def test_integer_categorical_label_nan_fails_loud(task: str, column: str) -> None:
+    """A NaN in an enrich-joined integer-categorical column must RAISE, not
+    silently ``astype(int)`` -> 0 and mislabel the clip (ledger LG14 integer
+    analogue). The NaN is the ``original_index``-keyed features.csv join-miss.
+    """
+    words = _words(value=list(range(6)), enhanced_pitch=list(range(6)))
+    col = words[column].astype(float)
+    col.iloc[2] = np.nan
+    words[column] = col
+    with pytest.raises(ValueError, match="non-finite"):
+        derive_label_indices(
+            words_df=words,
+            nonverbal_df=_nonverbal(),
+            task=task,
+            binary_tasks=True,
+            lite=False,
+        )
+
+
+def test_integer_categorical_clean_data_unchanged() -> None:
+    """Parity: the finite guard is a no-op on fully-covered data — face_num
+    labels match the raw ``astype(int)`` thresholding the guard wraps."""
+    words = _words(value=list(range(9)), enhanced_pitch=list(range(9)))
+    labels = derive_label_indices(
+        words_df=words,
+        nonverbal_df=_nonverbal(),
+        task="face_num",
+        binary_tasks=True,
+        lite=False,
+        balance=False,
+    )
+    face = np.asarray(words["face_num"].to_numpy(), dtype=int)
+    assert set(labels[1].tolist()) == set(np.where(face > 0)[0].tolist())
+    assert set(labels[0].tolist()) == set(np.where(face == 0)[0].tolist())
 
 
 def _words(**columns: list[object]) -> pd.DataFrame:

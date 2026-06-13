@@ -154,7 +154,7 @@ def derive_label_indices(
             0: np.arange(len(nonverbal_df)),
         }
     elif task == "face_num":
-        face_nums = words_df["face_num"].to_numpy().astype(int)
+        face_nums = _finite_int_column(words_df, "face_num", task)
         if binary_tasks:
             label_indices = {
                 1: np.where(face_nums > 0)[0],
@@ -167,7 +167,7 @@ def derive_label_indices(
                 0: np.where(face_nums == 0)[0],
             }
     elif task == "word_index":
-        word_indices = words_df["idx_in_sentence"].to_numpy().astype(int)
+        word_indices = _finite_int_column(words_df, "idx_in_sentence", task)
         if binary_tasks:
             label_indices = {
                 1: np.where(word_indices == 0)[0],
@@ -180,7 +180,7 @@ def derive_label_indices(
                 0: np.where(word_indices == 0)[0],
             }
     elif task == "word_head_pos":
-        head_pos = words_df[task_column].to_numpy().astype(int)
+        head_pos = _finite_int_column(words_df, task_column, task)
         label_indices = {
             1: np.where(head_pos == 0)[0],
             0: np.where(head_pos == 1)[0],
@@ -272,6 +272,38 @@ def _assert_finite_labels(arr: np.ndarray, task_column: str, source: str) -> np.
             "and mislabel clips (ledger LG14). Verify the source file row coverage."
         )
     return arr
+
+
+def _finite_int_column(words_df: pd.DataFrame, column: str, task: str) -> np.ndarray:
+    """Pull an integer-categorical label column as ``int``, failing loud on NaN/inf.
+
+    The integer-categorical analogue of :func:`_assert_finite_labels` (ledger LG14).
+    ``face_num`` / ``idx_in_sentence`` / ``bin_head`` are NOT in the base vendored
+    ``words_df`` — they arrive via the ``original_index``-keyed ``.map(features[col])``
+    enrich join (:func:`enrich_words_with_transcript_features`, mirroring upstream
+    ``neuroprobe.datasets``). That ``.map`` emits NaN for any word with no matching
+    ``features.csv`` row (a truncated / row-swapped / short CSV — the per-session
+    S9-class corruption). The downstream ``np.astype(int)`` then turns that NaN into
+    0 SILENTLY (a RuntimeWarning, not an error), routing the clip into the ``==0`` /
+    ``not >0`` class — a plausible, non-crashing MISLABEL.
+
+    Parity-safe: it fires only on the join-miss that would EQUALLY corrupt upstream's
+    identical unguarded ``.astype(int)``; on clean (fully-covered) data the finite
+    check is a no-op and the returned integer labels are byte-identical to the old
+    ``words_df[column].to_numpy().astype(int)``.
+    """
+    arr = np.asarray(words_df[column].to_numpy(), dtype=float)
+    n_bad = int((~np.isfinite(arr)).sum())
+    if n_bad:
+        raise ValueError(
+            f"categorical label column '{column}' (task '{task}') has "
+            f"{n_bad}/{arr.size} non-finite values. A NaN/inf means the "
+            "original_index-keyed features.csv enrich join produced an unmatched/"
+            "corrupt row; np.astype(int) would silently turn it into 0 and mislabel "
+            "the clip (ledger LG14, integer-categorical analogue). Verify the "
+            "features.csv row coverage for this session."
+        )
+    return arr.astype(int)
 
 
 def _word_gap_indices(words_df: pd.DataFrame, *, binary_tasks: bool) -> dict[int, np.ndarray]:
