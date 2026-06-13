@@ -12,7 +12,7 @@ exercises the parts that anatomy can't:
   or that re-orders the loaded channels, moves these hashes.
 * the **neural→voltage windowing**: ``onset_sample = round(est_idx/native * 2048)``.
   This is the exact crop production applies (``start = est_idx/native`` seconds,
-  1.0 s window on the 2048 Hz stream). The S9-class failure — slicing a native
+  5 s window on the 2048 Hz stream, the production SSL clip). The S9-class failure — slicing a native
   ``est_idx`` against the wrong rate — lands the window on the wrong samples and
   changes the clip hash, even though nothing crashes.
 
@@ -50,8 +50,12 @@ import pytest
 # subject 9 = native-1024 → exercises the resample_poly S9 path (the S9-class case).
 _VOLTAGE_TARGETS: tuple[tuple[int, int], ...] = ((1, 0), (9, 0))
 _N_CLIPS = 8  # first N word events of the trial
-_CLIP_LEN = 2048  # 1.0 s window on the 2048 Hz (post-resample) stream
 _TARGET_RATE = 2048  # global rate every subject is resampled UP to
+# Production SSL clip length: P1/P2/P3 ingest 5 s windows (dispatch DEFAULT_CLIP_LEN_S
+# = 5.0; neural_lag_s defaults 0.0), so the window is [est_idx/native, +5 s]. Mirror
+# that exact span so the golden locks the clip the model actually sees, not a proxy.
+_CLIP_S = 5.0
+_CLIP_LEN = round(_CLIP_S * _TARGET_RATE)  # 10240 samples on the 2048 Hz stream
 
 _GOLDEN_PATH = Path(__file__).resolve().parent / "_golden_voltage.json"
 
