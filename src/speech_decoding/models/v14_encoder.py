@@ -2129,10 +2129,18 @@ class V14ParcelPerceiverModel(nn.Module):
 
         # Joint token-block self-attention, batched over B·K parcels (attention
         # is WITHIN each parcel's S tokens — no cross-parcel path here, so every
-        # parcel is independent). Uncovered parcels (latent_valid False) ride
-        # along producing junk rows that the SSL contract masks downstream via
-        # latent_valid (the dense path mirrors _forward_meanpool's unmasked
-        # branch; a ragged-parcel gather is a future FLOP opt, not correctness).
+        # parcel is independent). Uncovered parcels (latent_valid False) thus
+        # CANNOT contaminate a covered parcel's M2 here: their junk rows attend
+        # only to their own tokens. The sole cross-parcel stage is the M4
+        # parcel-latent below, which drops uncovered parcels via ``cell_keep``
+        # (so they never enter cross-parcel attention as key OR query, never
+        # reach the loss, and receive ZERO gradient). On the live ragged path
+        # they are additionally gathered OUT of THIS block too (``keep_flat &=
+        # latent_valid`` when ``ragged_frontend``); only the EMA-teacher forward
+        # (``drop is None`` → dense, no key-pad) still runs their junk rows, and
+        # that forward is detached (no gradient) + per-parcel-independent +
+        # parcel-latent-masked, so the junk is inert. Their M2 tap rows are
+        # masked downstream by ``latent_valid`` (loss + the RankMe probe).
         x_joint = x_tok.reshape(B * K, S, self.d_model)
         use_ckpt = (
             self.gradient_checkpointing and self.training and torch.is_grad_enabled()

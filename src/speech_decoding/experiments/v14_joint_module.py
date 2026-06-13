@@ -1445,25 +1445,55 @@ class V14JointBrainModule(pl.LightningModule):
     ) -> None:
         """MON-FRONTEND-FEATURE-RANK (B36 WS-I, P1 collapse probe).
 
-        RankMe on the EMA teacher's M2 tap (post ``frontend_ln``, shape
-        ``(B, C, F_p, T_p, d)``) over VALID electrodes — the representation
-        P1 actually trains. Replaces the M4 RankMe in P1: the pool +
-        inter-parcel stack that produce M4 carry no P1 gradient, so M4 RankMe
-        in P1 reads random-init layers and fires a false collapse alarm from
-        step 0 (the 2026-06-03 mis-scope). Logged as ``mon_frontend_rankme*``
-        — a distinct key from the P2 M4 ``mon_rankme*`` so the two phases'
-        health signals never alias on the same metric name.
+        RankMe on the EMA teacher's M2 tap (post ``frontend_ln``) over the
+        VALID positions on axis 1 — the representation P1 actually trains.
+        Three tap layouts reach this probe; all fold every non-(batch, axis-1,
+        feature) dim into RankMe rows and gate axis 1 by ``valid_mask``:
+
+          * P1 / cross_attn  ``(B, C, F_p, T_p, d)`` → axis 1 = electrodes,
+            ``valid_mask`` = per-electrode ``(B, C)``.
+          * B37 joint mean-pool ``(B, K, F_p, T_p, d)`` → axis 1 = parcels,
+            ``valid_mask`` = parcel coverage ``latent_valid (B, K)``.
+          * 2STFT dual-band   ``(B, K, S, d)`` → axis 1 = parcels,
+            ``valid_mask`` = ``latent_valid (B, K)`` (4-D flat-token tap).
+
+        Replaces the M4 RankMe in P1: the pool + inter-parcel stack that
+        produce M4 carry no P1 gradient, so M4 RankMe in P1 reads random-init
+        layers and fires a false collapse alarm from step 0 (the 2026-06-03
+        mis-scope). Logged as ``mon_frontend_rankme*`` — a distinct key from
+        the P2 M4 ``mon_rankme*`` so the two phases' health signals never
+        alias on the same metric name.
+
+        The mask gates axis 1 *generically* (off its actual length), not the
+        hard-coded electrode axis the prior code assumed. Two latent bugs are
+        closed: (1) the ``dim() != 5`` guard skipped the 4-D dual-band tap
+        wholesale, so 2STFT never logged a front-end rank at all; (2) joint
+        mode hands parcel coverage ``(B, K)`` while the code checked for the
+        electrode shape ``(B, C)`` — it only happened to apply because the
+        parcel tap's axis 1 equals K, and would have silently dropped the mask
+        the moment the parcel/electrode axes differed in size.
         """
-        if teacher_m2.dim() != 5:
-            return  # not a (B, C, F_p, T_p, d) tap — skip rather than crash
-        B, C, F_p, T_p, d = teacher_m2.shape
-        flat = teacher_m2.reshape(B * C * F_p * T_p, d)
-        if valid_mask is not None and tuple(valid_mask.shape[:2]) == (B, C):
-            keep = (
-                valid_mask.reshape(B, C, 1, 1)
-                .expand(B, C, F_p, T_p)
-                .reshape(-1)
-            )
+        if teacher_m2.dim() == 4:
+            # 2STFT dual-band: (B, K, S, d) flat per-parcel token sequence.
+            B, A, S, d = teacher_m2.shape
+            flat = teacher_m2.reshape(B * A * S, d)
+            keep = None
+            if valid_mask is not None and tuple(valid_mask.shape[:2]) == (B, A):
+                keep = valid_mask.reshape(B, A, 1).expand(B, A, S).reshape(-1)
+        elif teacher_m2.dim() == 5:
+            # P1/cross_attn (B, C, F_p, T_p, d) or B37 joint (B, K, F_p, T_p, d).
+            B, A, F_p, T_p, d = teacher_m2.shape
+            flat = teacher_m2.reshape(B * A * F_p * T_p, d)
+            keep = None
+            if valid_mask is not None and tuple(valid_mask.shape[:2]) == (B, A):
+                keep = (
+                    valid_mask.reshape(B, A, 1, 1)
+                    .expand(B, A, F_p, T_p)
+                    .reshape(-1)
+                )
+        else:
+            return  # not a (B, axis1, …, d) M2 tap — skip rather than crash
+        if keep is not None:
             flat = flat[keep]
         # No row-count early-return: teacher_rank_monitor returns a healthy
         # placeholder for N<2, so a degenerate (all-invalid) step still logs —

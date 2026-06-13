@@ -291,6 +291,59 @@ def test_rankme_thresholds_forwarded_to_both_monitor_call_sites(monkeypatch) -> 
     assert captured == [(0.45, 0.35), (0.45, 0.35)]
 
 
+@pytest.mark.parametrize("dual_band", [True, False])
+def test_frontend_rank_monitor_logs_and_masks_parcels_in_joint_mode(
+    dual_band, monkeypatch
+) -> None:
+    """Front-end RankMe must (a) reach the monitor for BOTH the 2STFT dual-band
+    4-D tap ``(B, K, S, d)`` — the prior ``dim() != 5`` guard skipped it
+    wholesale, so 2STFT never logged a front-end rank — and the B37 joint 5-D
+    tap ``(B, K, F_p, T_p, d)``, and (b) gate axis 1 by parcel coverage
+    ``latent_valid (B, K)``, dropping invalid parcels' rows. The mask keys off
+    the actual axis-1 length, so it applies in joint mode (parcel coverage)
+    instead of silently requiring the electrode shape ``(B, C)``."""
+    import speech_decoding.experiments.v14_joint_module as jm
+
+    captured: list = []
+
+    def _spy(features, **_kw):
+        captured.append(features)
+        return SimpleNamespace(
+            rankme=8.0, rankme_normalised=0.5, n_samples=int(features.shape[0]),
+            d_feature=int(features.shape[1]), is_warn=False, is_alarm=False,
+        )
+
+    monkeypatch.setattr(jm, "teacher_rank_monitor", _spy)
+
+    m = _make_module()
+    logged: dict[str, float] = {}
+    m.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+
+    B, K, d = 2, 4, 8
+    valid = torch.ones(B, K, dtype=torch.bool)
+    valid[0, 0] = False  # one invalid parcel in batch 0 → its rows must drop
+    if dual_band:
+        cells_per_parcel = 6  # S
+        tap = torch.randn(B, K, cells_per_parcel, d)
+    else:
+        F_p, T_p = 2, 3
+        cells_per_parcel = F_p * T_p
+        tap = torch.randn(B, K, F_p, T_p, d)
+
+    m._run_frontend_rank_monitor(
+        teacher_m2=tap, valid_mask=valid, step_name="train"
+    )
+
+    # (a) it logged for BOTH tap ranks (the 4-D dual-band tap no longer skipped).
+    assert any(k.startswith("train_mon_frontend_rankme") for k in logged)
+    assert len(captured) == 1
+    # (b) exactly one parcel-worth of cells was removed by the parcel mask
+    # (B*K cells total, one invalid → that parcel's cells_per_parcel rows gone).
+    assert captured[0].shape[0] == (B * K - 1) * cells_per_parcel
+    assert captured[0].shape[1] == d
+
+
 def test_unset_p2_m4_probe_receives_empirical_band(monkeypatch) -> None:
     """End-to-end: an UNSET phase="p2" module forwards the empirical M4 band
     (0.04/0.02) all the way to the M4 probe call site — not the M2 0.5/0.25
