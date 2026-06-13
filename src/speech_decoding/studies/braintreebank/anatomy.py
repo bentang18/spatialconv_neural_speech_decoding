@@ -427,6 +427,49 @@ def parse_dk_label(label: str) -> tuple[str, str, str]:
     raise ValueError(f"unrecognised DK label: {label!r}")
 
 
+_MIN_PARCEL_VALID_FRACTION: float = 0.5
+"""Per-subject floor on the fraction of voltage electrodes that map to an
+in-vocab DK parcel. MEASURED 2026-06-13 across all 10 vendored BT subjects:
+9/10 map at 1.000, sub_4 at 0.989 (2 ``Left-Inf-Lat-Vent`` ventricle contacts
+legitimately outside the K=80 cortical+subcortical vocab), and 0 missing-anatomy
+rows anywhere. The 0.5 floor sits ~18x below the worst real subject, so it never
+false-fires on the live cohort but catches an S9-class silent collapse: a
+per-subject ``depth-wm.csv`` namespace shift / re-rip / new subject whose DK
+labels stop matching the ``electrode_labels.json`` voltage namespace would drop
+most/all electrodes to ``valid=False`` (a zero support row each) with NO error
+under ``unmapped_policy='zero'``, silently erasing that subject's entire
+parcel-pool routing. See reports/bt_alignment/data_pipeline_bug_ledger.md LG15."""
+
+
+def _assert_parcel_support_coverage(
+    result: HardLabelSupport, subject_id: int
+) -> None:
+    """Fail loud if a subject's DK-parcel coverage collapses (ledger LG15).
+
+    Under ``unmapped_policy='zero'`` an electrode with no anatomy row or an
+    out-of-vocab DK label is silently zeroed (``valid=False``). A catastrophic
+    drop — far below the measured 0.989-1.000 live range — means the electrode
+    label namespace diverged for this subject, not a few stray ventricle
+    contacts, so the whole subject's pooled features would be degenerate.
+    """
+    n_total = int(result.valid.shape[0])
+    if n_total == 0:
+        return
+    n_valid = int(result.valid.sum())
+    fraction = n_valid / n_total
+    if fraction < _MIN_PARCEL_VALID_FRACTION:
+        raise ValueError(
+            f"subject {subject_id}: only {n_valid}/{n_total} voltage electrodes "
+            f"({fraction:.3f}) mapped to an in-vocab DK parcel — below the "
+            f"{_MIN_PARCEL_VALID_FRACTION:.2f} floor (live cohort is 0.989-1.000). "
+            "The depth-wm.csv DK labels likely stopped matching the voltage "
+            "electrode namespace for this subject (S9-class); its parcel-pool "
+            "routing would be silently zeroed under unmapped_policy='zero'. "
+            f"Rebuild/verify localization/sub_{subject_id}/depth-wm.csv. "
+            "See data_pipeline_bug_ledger.md LG15."
+        )
+
+
 @functools.lru_cache(maxsize=64)
 def aligned_voltage_support(
     bt_root: str | Path,
@@ -444,15 +487,21 @@ def aligned_voltage_support(
     ``valid=False`` in place under ``unmapped_policy="zero"`` (no re-pack). The
     result is memoized per ``(bt_root, subject_id, parcel_labels, policy)``;
     callers must not mutate the returned arrays.
+
+    Fails loud (ledger LG15) if per-subject parcel coverage collapses below
+    :data:`_MIN_PARCEL_VALID_FRACTION` — the S9-class silent-degradation guard.
+    ``lru_cache`` does not cache exceptions, so the guard re-checks every call.
     """
     order = voltage_electrode_order(bt_root, subject_id)
     anatomy = load_public_bt_anatomy(
         bt_root, int(subject_id), label_column=label_column
     )
-    return build_hard_public_bt_label_support(
+    result = build_hard_public_bt_label_support(
         order,
         anatomy,
         parcel_labels,
         label_column=label_column,
         unmapped_policy=unmapped_policy,
     )
+    _assert_parcel_support_coverage(result, int(subject_id))
+    return result

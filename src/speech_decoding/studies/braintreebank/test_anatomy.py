@@ -11,6 +11,7 @@ import pytest
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
+    _MIN_PARCEL_VALID_FRACTION,
     aligned_voltage_support,
     build_hard_public_bt_label_support,
     bt_label_vocabulary,
@@ -275,6 +276,59 @@ def test_aligned_voltage_support_sub4_interior_unmapped() -> None:
     assert result.support[unmapped_idx].sum() == 0.0
     # valid[c] <=> support[c] nonzero, for every row
     np.testing.assert_array_equal(result.valid, result.support.sum(axis=1) > 0)
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_aligned_voltage_support_fails_loud_on_coverage_collapse(
+    tmp_path: Path,
+) -> None:
+    """LG15: an S9-class namespace divergence (depth-wm.csv electrode labels stop
+    matching the electrode_labels.json voltage namespace) drops most/all
+    electrodes to valid=False under ``unmapped_policy='zero'``. The per-subject
+    coverage floor must convert that silent collapse into a loud failure."""
+    import json
+
+    labels_dir = tmp_path / "electrode_labels" / "sub_88"
+    labels_dir.mkdir(parents=True)
+    (labels_dir / "electrode_labels.json").write_text(
+        json.dumps(["X1", "X2", "X3", "X4"])
+    )
+    loc_dir = tmp_path / "localization" / "sub_88"
+    loc_dir.mkdir(parents=True)
+    # depth-wm.csv names a DISJOINT electrode namespace (Y* vs the X* montage):
+    # every voltage electrode misses its anatomy row -> 0/4 valid.
+    (loc_dir / "depth-wm.csv").write_text(
+        "Electrode,DesikanKilliany,Hemisphere\n"
+        "Y1,insula,L\nY2,superiortemporal,L\nY3,insula,R\nY4,insula,R\n"
+    )
+
+    with pytest.raises(ValueError, match=r"below the 0\.50 floor"):
+        aligned_voltage_support(str(tmp_path), 88, unmapped_policy="zero")
+    # message names the ledger entry for traceability
+    with pytest.raises(ValueError, match="LG15"):
+        aligned_voltage_support(str(tmp_path), 88, unmapped_policy="zero")
+
+
+@pytest.mark.must_pass_before_dispatch
+@pytest.mark.parametrize("subject_id", _VENDORED_SUBJECTS)
+def test_parcel_support_coverage_holds_for_all_vendored_subjects(
+    subject_id: int,
+) -> None:
+    """Real-cohort negative control for LG15: every live subject maps well above
+    the floor (measured 2026-06-13: 9/10 at 1.000, sub_4 at 0.989). Pinning >=0.98
+    catches even a partial coverage regression, not just a catastrophic collapse;
+    the production guard floor stays conservative at 0.5 to never false-fire."""
+    _require_vendored(subject_id)
+    result = aligned_voltage_support(
+        str(_BT_CACHE), subject_id, unmapped_policy="zero"
+    )
+    n_total = int(result.valid.shape[0])
+    fraction = int(result.valid.sum()) / n_total
+    assert fraction >= 0.98, (
+        f"sub_{subject_id}: parcel coverage {fraction:.3f} dropped below the "
+        f"measured live range — possible depth-wm.csv namespace drift (LG15)"
+    )
+    assert fraction >= _MIN_PARCEL_VALID_FRACTION
 
 
 
