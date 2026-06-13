@@ -276,8 +276,15 @@ class V14JointExperiment(V14Experiment):
     # requires ssl_mode="joint" + mean_pool_std (the σ source), re-validated in
     # the BrainModule. ``m4_precision_alpha`` is the ``n^α`` exponent (α=1 = raw
     # count; α<1 damps high-n since spatially-correlated electrodes give n_eff<n).
+    # ``m4_precision_floor_pct`` sets the empirical-Bayes shrinkage prior σ²₀ = the
+    # p{floor_pct} percentile of in-batch scored σ² (the load-bearing fix — without
+    # it, the ~12.5% degenerate σ²≈0 cells swamp the loss and starve the
+    # informative cells; measured 2026-06-13). ``m4_precision_cap`` bounds the
+    # post-normalization weight (cheap insurance on top of the shrinkage floor).
     m4_precision_weight: bool = False
     m4_precision_alpha: float = pydantic.Field(default=1.0, ge=0.0)
+    m4_precision_floor_pct: float = pydantic.Field(default=25.0, ge=0.0, le=100.0)
+    m4_precision_cap: float = pydantic.Field(default=10.0, ge=0.0)
 
     # B37 D8 parcel-side discriminative-LR scale (joint only). The parcel side
     # (+ both predictors) rides at ``base_lr · joint_parcel_lr_scale``; the
@@ -488,6 +495,8 @@ class V14JointExperiment(V14Experiment):
             loss_form="l1",
             m4_precision_weight=self.m4_precision_weight,
             m4_precision_alpha=self.m4_precision_alpha,
+            m4_precision_floor_pct=self.m4_precision_floor_pct,
+            m4_precision_cap=self.m4_precision_cap,
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
             frontend_lr_scale=self.frontend_lr_scale,

@@ -77,10 +77,22 @@ def _l1_or_zero(pred: Tensor, target: Tensor, loss_form: _LossForm) -> Tensor:
 
 
 # Heteroscedastic (precision-weighted) M4 loss — project_v14_heteroscedastic_ssl_loss
-# floor on σ²+ε so a near-zero-variance parcel cell can't blow the weight up. With
-# the production session-robust-z'd |STFT| the pooled σ lands ~O(1), so ε is purely a
-# div-by-zero guard, not a scale knob (the mean-1 normalization sets the scale).
+# ``ε`` is ONLY a div-by-zero / NaN guard — NOT the variance floor. The real floor
+# is an empirical-Bayes SHRINKAGE prior ``σ²₀`` (an in-batch percentile of the
+# scored σ²; see ``_m4_precision_weight``). Measured on a real nano batch
+# (2026-06-13): ~12.5% of scored cells are degenerate (σ²≈1e-8 — single-electrode
+# parcels and near-equal-electrode cells), seven orders below the typical σ²≈0.5.
+# With the old bare ``σ²+ε`` those 12.5% soaked up the loss mass and mean-1
+# normalization drove the informative 87.5% of cells to ~3e-5 weight (max/median
+# ≈1.07e5 — the loss trained on flat, information-free cells). A max-cap alone does
+# NOT fix this (the mass is bulk, not a few outliers); the additive shrinkage floor
+# does (max/median → ~4.7). σ²₀ is an in-batch statistic so it auto-recalibrates if
+# the front-end scale changes (e.g. the 2-STFT redesign). The cap is cheap insurance
+# on top. project_v14_heteroscedastic_ssl_loss.
 _M4_PRECISION_EPS = 1e-6
+# Default shrinkage percentile (p25 of in-batch scored σ²) and post-norm weight cap.
+_M4_PRECISION_FLOOR_PCT = 25.0
+_M4_PRECISION_CAP = 10.0
 
 
 def _weighted_l1_or_zero(
@@ -117,21 +129,42 @@ def _m4_precision_weight(
     target_cell: Tensor,     # (B, N) bool, N = K·F_p·T_p, flat (K outer, F_p, T_p inner)
     alpha: float,
     eps: float,
+    floor_pct: float,        # percentile (0-100) of in-batch scored σ² → shrinkage prior σ²₀
+    cap: float,              # max weight after mean-1 norm (<=0 disables the cap)
 ) -> Tensor:
-    """Inverse-variance precision weight ``w = n_k^α / (σ²+ε)`` gathered at the
-    masked cells and normalized to mean 1 (DETACHED — σ/n are data-derived, no
-    grad path, and detaching guarantees the model can't inflate σ to dodge its
-    own hard cells). Mean-1 → uniform-weight limit recovers plain L1."""
+    """Shrinkage-regularized inverse-variance precision weight
+    ``w = n_k^α / (σ² + σ²₀)`` gathered at the masked cells and normalized to
+    mean 1 (DETACHED — σ/n are data-derived, no grad path, and detaching
+    guarantees the model can't inflate σ to dodge its own hard cells).
+
+    ``σ²₀`` is an empirical-Bayes shrinkage prior: the ``floor_pct`` percentile of
+    the *scored* σ² in this batch (NOT the bare ``ε``). It pulls degenerate cells
+    (σ²→0 at single-electrode / near-equal-electrode parcels — which are the
+    SHAKIEST, lowest-coverage targets, yet under bare ``1/(σ²+ε)`` get the HIGHEST
+    weight and swamp the informative cells) back toward a typical-cell weight. See
+    the module-level note for the measured pathology. Being an in-batch statistic,
+    σ²₀ auto-recalibrates if the front-end magnitude scale changes. ``cap`` is a
+    cheap post-normalization belt-and-suspenders. Mean-1 ⇒ uniform-weight limit
+    recovers plain L1."""
     B, K, F_p, T_p = precision_std.shape
     N = K * F_p * T_p
     n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
     n_cell = n_pow.unsqueeze(-1).unsqueeze(-1).expand(B, K, F_p, T_p).reshape(B, N)
     sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
-    w_full = n_cell / (sigma2 + eps)                         # (B, N)
+    s2_scored = sigma2[target_cell].detach()                # (n_target,)
+    if s2_scored.numel() == 0:
+        return s2_scored
+    # Empirical-Bayes shrinkage prior σ²₀ = p{floor_pct} of in-batch scored σ²,
+    # floored at ε so an all-degenerate batch can't divide by ~0.
+    q = max(0.0, min(1.0, floor_pct / 100.0))
+    s2_floor = torch.quantile(s2_scored, q).clamp(min=eps)
+    w_full = n_cell / (sigma2 + s2_floor)                    # (B, N)
     w = w_full[target_cell].detach()                        # (n_target,)
-    if w.numel() == 0:
-        return w
-    return w / w.mean().clamp(min=eps)
+    w = w / w.mean().clamp(min=eps)                         # mean-1
+    if cap > 0.0:
+        w = w.clamp(max=cap)
+        w = w / w.mean().clamp(min=eps)                    # re-normalize after cap
+    return w
 
 
 def p1_frontend_m2_loss(
@@ -313,6 +346,8 @@ def b37_m4_freq_loss(
     precision_std: tp.Optional[Tensor] = None,  # (B, K, F_p, T_p) pooled σ (raw |STFT| std)
     precision_n: tp.Optional[Tensor] = None,    # (B, K) electrode count per parcel
     precision_alpha: float = 1.0,
+    precision_floor_pct: float = _M4_PRECISION_FLOOR_PCT,
+    precision_cap: float = _M4_PRECISION_CAP,
 ) -> MaskedJepaBreakdown:
     """B37 M4 masked JEPA — the freq-PRESERVING parcel reconstruction (D3/D9).
 
@@ -410,6 +445,8 @@ def b37_m4_freq_loss(
             target_cell=target_cell,
             alpha=precision_alpha,
             eps=_M4_PRECISION_EPS,
+            floor_pct=precision_floor_pct,
+            cap=precision_cap,
         )
         loss = _weighted_l1_or_zero(pred, target, weight, loss_form)
     return MaskedJepaBreakdown(

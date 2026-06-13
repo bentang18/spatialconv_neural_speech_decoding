@@ -333,7 +333,8 @@ def test_b37_m4_empty_tube_is_exact_zero() -> None:
 
 # ---------------------------------------------------------------------------
 # Heteroscedastic / inverse-variance precision weighting on M4
-# (project_v14_heteroscedastic_ssl_loss). w = n_k^α / (σ²+ε), DETACHED, mean-1.
+# (project_v14_heteroscedastic_ssl_loss). w = n_k^α / (σ²+σ²₀), DETACHED, mean-1,
+# σ²₀ = in-batch shrinkage prior (p{floor_pct} of scored σ²), capped.
 # ---------------------------------------------------------------------------
 
 
@@ -347,7 +348,9 @@ def test_m4_precision_weight_is_mean1_detached_and_ordered() -> None:
     std[0, 0] = 0.1                                # parcel 0 low σ (most reliable)
     std[0, 2] = 2.0                                # parcel 2 high σ (least reliable)
     target_cell = torch.ones(B, N, dtype=torch.bool)  # score every cell
-    w = _m4_precision_weight(std, n, target_cell, alpha=1.0, eps=1e-6)
+    w = _m4_precision_weight(
+        std, n, target_cell, alpha=1.0, eps=1e-6, floor_pct=25.0, cap=10.0,
+    )
 
     assert torch.isfinite(w).all()
     assert not w.requires_grad                     # detached — no grad path via σ/n
@@ -357,15 +360,57 @@ def test_m4_precision_weight_is_mean1_detached_and_ordered() -> None:
 
 
 def test_m4_precision_weight_alpha_zero_drops_count_term() -> None:
-    """α=0 → n^0=1, so the weight depends only on 1/(σ²+ε): two parcels with
+    """α=0 → n^0=1, so the weight depends only on 1/(σ²+σ²₀): two parcels with
     equal σ but different n get equal weight."""
     B, K, F_p, T_p = 1, 2, 1, 1
     N = K * F_p * T_p
     n = torch.tensor([[8.0, 1.0]])                 # different counts
     std = torch.full((B, K, F_p, T_p), 0.5)        # equal σ
     target_cell = torch.ones(B, N, dtype=torch.bool)
-    w = _m4_precision_weight(std, n, target_cell, alpha=0.0, eps=1e-6)
+    w = _m4_precision_weight(
+        std, n, target_cell, alpha=0.0, eps=1e-6, floor_pct=25.0, cap=10.0,
+    )
     assert torch.allclose(w, torch.ones_like(w), atol=1e-6)
+
+
+def test_m4_precision_shrinkage_floor_tames_degenerate_cells() -> None:
+    """THE fix (2026-06-13): single-electrode / near-equal-electrode parcels have
+    σ²≈0 — they are the SHAKIEST targets, yet bare 1/(σ²+ε) gives them runaway
+    weight that swamps the informative cells. The in-batch shrinkage prior σ²₀
+    must bound the max/median weight ratio to O(1), where a bare-ε floor leaves it
+    at O(1e4+). Also asserts the cap alone is NOT the fix (bulk mass, not outliers)."""
+    B, K, F_p, T_p = 1, 8, 2, 2
+    N = K * F_p * T_p
+    n = torch.full((B, K), 6.0)                    # all parcels well-covered on n
+    std = torch.full((B, K, F_p, T_p), 0.7)        # typical σ (σ²≈0.49)
+    std[0, 0] = 1e-4                               # parcel 0: degenerate σ→0 (σ²=1e-8)
+    std[0, 1] = 1e-4                               # parcel 1: degenerate too (~12.5% of cells)
+    target_cell = torch.ones(B, N, dtype=torch.bool)
+
+    # Bare ε floor (old behavior: floor_pct=0 → σ²₀=min≈ε, cap off): degenerate
+    # cells dominate → enormous max/median.
+    w_bare = _m4_precision_weight(
+        std, n, target_cell, alpha=0.5, eps=1e-6, floor_pct=0.0, cap=0.0,
+    )
+    ratio_bare = w_bare.max() / w_bare.median()
+    # Cap alone (still bare floor): does NOT fix it — the bulk degenerate mass
+    # drives the median to ~0, so max/median stays huge even after capping max.
+    w_cap = _m4_precision_weight(
+        std, n, target_cell, alpha=0.5, eps=1e-6, floor_pct=0.0, cap=10.0,
+    )
+    ratio_cap = w_cap.max() / w_cap.median()
+    # Shrinkage floor (the fix): σ²₀ = p25 of in-batch σ² ≈ 0.49 → degenerate
+    # cells pulled back to a typical-cell weight → bounded ratio.
+    w_fix = _m4_precision_weight(
+        std, n, target_cell, alpha=0.5, eps=1e-6, floor_pct=25.0, cap=10.0,
+    )
+    ratio_fix = w_fix.max() / w_fix.median()
+
+    assert ratio_bare > 1e3                        # the pathology is real
+    assert ratio_cap > 1e3                         # cap alone does NOT fix it
+    assert ratio_fix < 20.0                        # shrinkage floor tames it
+    assert torch.isfinite(w_fix).all()
+    assert abs(w_fix.mean().item() - 1.0) < 1e-5   # still mean-1 after cap+renorm
 
 
 def test_b37_m4_precision_uniform_stats_recovers_plain_l1() -> None:

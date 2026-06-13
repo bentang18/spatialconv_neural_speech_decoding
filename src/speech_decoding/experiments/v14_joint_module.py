@@ -262,6 +262,8 @@ class V14JointBrainModule(pl.LightningModule):
         # Requires ssl_mode="joint" + the encoder's mean|std pool (the σ source).
         m4_precision_weight: bool = False,
         m4_precision_alpha: float = 1.0,
+        m4_precision_floor_pct: float = 25.0,
+        m4_precision_cap: float = 10.0,
         predictor: tp.Optional[JepaPredictor] = None,
         predictor_depth: int = 3,
         predictor_hidden: int = 128,
@@ -522,6 +524,8 @@ class V14JointBrainModule(pl.LightningModule):
         self._loss_form: _LossForm = loss_form
         self._m4_precision_weight = bool(m4_precision_weight)
         self._m4_precision_alpha = float(m4_precision_alpha)
+        self._m4_precision_floor_pct = float(m4_precision_floor_pct)
+        self._m4_precision_cap = float(m4_precision_cap)
         self._frontend_lr_scale = frontend_lr_scale
         self._parcel_lr_scale = parcel_lr_scale
         self._wd_exclude_norms = bool(wd_exclude_norms)
@@ -1020,6 +1024,8 @@ class V14JointBrainModule(pl.LightningModule):
             precision_std=precision_std,
             precision_n=precision_n,
             precision_alpha=self._m4_precision_alpha,
+            precision_floor_pct=self._m4_precision_floor_pct,
+            precision_cap=self._m4_precision_cap,
         )
         total = m2_bd.total + self._lambda_m4 * m4_bd.total
         return JointJepaBreakdown(
