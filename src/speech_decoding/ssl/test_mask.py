@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from speech_decoding.ssl.mask import (
+    _sample_axis_anchor_dilate,
     _sample_axis_band_multiset,
     sample_composite_mask,
     sample_m2_dual_band_mask,
@@ -818,3 +819,80 @@ def test_axis_band_multiset_rejects_overflow() -> None:
         _sample_axis_band_multiset(
             1, 1, axis_len=5, widths=(3, 3, 2), generator=g, device=g.device,
         )
+
+
+# --- _sample_axis_anchor_dilate (Ben 2026-06-13 high-band anchor regime) ---
+
+
+def test_axis_anchor_dilate_count_bounds_and_overlap_union() -> None:
+    """Anchor-dilate masks the UNION of ``round(frac·N)`` dilated anchors, so the
+    realized per-row count lands in ``[n_anchor, min(n_anchor·width, N)]``: the
+    low end when every block overlaps a neighbour, the high end when none touch.
+    With width≥2 the masked set is strictly the union (overlaps fold in), so a
+    row can mask FEWER than n_anchor·width — that is the whole point of
+    'overlaps allowed'."""
+    g = torch.Generator().manual_seed(7)
+    N, frac, width = 80, 0.30, 2
+    band = _sample_axis_anchor_dilate(
+        6, 11, axis_len=N, anchor_frac=frac, width=width,
+        generator=g, device=g.device,
+    )
+    assert tuple(band.shape) == (6, 11, N)
+    n_anchor = round(frac * N)  # 24
+    counts = band.sum(dim=-1)
+    assert torch.all(counts >= n_anchor)
+    assert torch.all(counts <= min(n_anchor * width, N))
+    # Overlaps DO occur somewhere across the batch (so it is a real union, not a
+    # disguised disjoint placement): at least one row masks < n_anchor·width.
+    assert torch.any(counts < n_anchor * width)
+
+
+def test_axis_anchor_dilate_positions_randomized() -> None:
+    """Positions are drawn per ``(B, C)`` from the generator → different rows get
+    different anchor sets (Ben's 'make sure the positions are randomized')."""
+    g = torch.Generator().manual_seed(3)
+    band = _sample_axis_anchor_dilate(
+        4, 4, axis_len=16, anchor_frac=0.30, width=2, generator=g, device=g.device,
+    )
+    # No two of the 16 rows are identical (overwhelmingly likely; fixed seed).
+    flat = band.reshape(-1, 16)
+    uniq = {tuple(r.tolist()) for r in flat}
+    assert len(uniq) > 1, "anchor positions are not randomized across rows"
+
+
+def test_axis_anchor_dilate_boundary_anchor_clamps() -> None:
+    """An anchor at the last position has no 'next' — the union clamps at
+    ``axis_len`` (idx never reaches axis_len) rather than wrapping, so width-2 at
+    the end masks just the one cell. Forcing frac=1.0 masks every position."""
+    g = torch.Generator().manual_seed(0)
+    band = _sample_axis_anchor_dilate(
+        1, 1, axis_len=5, anchor_frac=1.0, width=2, generator=g, device=g.device,
+    )
+    # Every position is an anchor → the whole axis is masked, no overflow/wrap.
+    assert torch.all(band)
+    assert band.shape[-1] == 5
+
+
+def test_dual_band_high_anchor_mode_replaces_multiset() -> None:
+    """Passing BOTH anchor params switches the HIGH band to anchor-dilate (data-
+    dependent count, overlaps) instead of the disjoint {3,3,2} multiset; the LOW
+    band is unchanged. The high masked fraction tracks ~1-(1-frac)^width."""
+    g = torch.Generator().manual_seed(2)
+    B, K = 8, 16
+    mask = sample_m2_dual_band_mask(
+        B, K, F_p_low=_F_LOW, T_low_p=_T_LOW, F_p_high=_F_HIGH, T_high_p=_T_HIGH,
+        low_freq_floor=2, low_freq_frac=2 / _F_LOW,
+        high_time_anchor_frac=0.30, high_time_anchor_width=2,
+        generator=g,
+    )
+    high = mask[..., _S_LOW:].view(B, K, _T_HIGH, _F_HIGH)  # time-OUTER/freq-INNER
+    # Each masked time-col spans ALL freq (it is a time tube), so the per-parcel
+    # high count is a multiple of F_p_high — never the fixed multiset's 24.
+    high_counts = mask[..., _S_LOW:].sum(dim=-1)
+    assert torch.all(high_counts % _F_HIGH == 0)
+    assert not torch.all(high_counts == 24), "anchor mode should not reproduce the multiset count"
+    # Masked time-cols are constant across freq (a tube).
+    for b in range(B):
+        for k in range(K):
+            grid = high[b, k]  # (T_high_p, F_p_high)
+            assert torch.all(grid == grid[..., 0:1]), "high tube not constant over freq"

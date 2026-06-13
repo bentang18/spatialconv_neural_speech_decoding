@@ -397,6 +397,32 @@ def test_dual_band_mask_knobs_forward_to_sampler(monkeypatch) -> None:
     assert captured["high_time_widths"] == (2,) * 21
 
 
+def test_dual_band_high_anchor_knobs_forward_to_sampler(monkeypatch) -> None:
+    """The high-band anchor-dilate knobs map onto ``sample_m2_dual_band_mask``'s
+    ``high_time_anchor_frac`` / ``high_time_anchor_width`` (the Ben 2026-06-13
+    overlap-allowed high regime), and do NOT emit the disjoint multiset's
+    ``high_time_widths``."""
+    grid = (7, 40, 3, 80)
+    captured = _stub_dual_band_samplers(monkeypatch, grid=grid)
+
+    m = _make_module(
+        m2_low_freq_width=2, m2_low_freq_nbands=1,
+        m2_high_anchor_frac=0.30, m2_high_anchor_width=2,
+    )
+    m.student.encoder.dual_band_grid_shape = lambda _x: grid  # type: ignore[assignment]
+
+    B, C, K = 2, 5, m.student.encoder.k_parcels
+    m._sample_dual_band_mask(
+        electrode_tokens_high=torch.randn(B, 1, 1, 1),
+        support=torch.zeros(B, C, K),
+    )
+    assert captured["high_time_anchor_frac"] == 0.30
+    assert captured["high_time_anchor_width"] == 2
+    assert "high_time_widths" not in captured  # not the disjoint-multiset path
+    # low band still forwards its freq tube
+    assert captured["low_freq_floor"] == 2
+
+
 def test_dual_band_mask_knobs_unset_keeps_sampler_defaults(monkeypatch) -> None:
     """Unset knobs (the default) pass NO geometry override to the sampler, so the
     dual-band path is byte-identical to the un-flagged version (sampler defaults:

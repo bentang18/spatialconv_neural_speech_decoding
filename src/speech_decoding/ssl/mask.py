@@ -308,6 +308,52 @@ def _sample_axis_band_multiset(
     return band.any(dim=2)  # (B, C, axis_len)
 
 
+def _sample_axis_anchor_dilate(
+    B: int,
+    C: int,
+    *,
+    axis_len: int,
+    anchor_frac: float,
+    width: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """``(B, C, axis_len)`` bool: anchor-dilate mask with OVERLAPS allowed (Ben
+    2026-06-13 high-band regime). Pick ``round(anchor_frac·axis_len)`` DISTINCT
+    anchor positions uniformly at random per ``(B, C)``, then mask the half-open
+    block ``[a, a+width)`` at every anchor ``a`` — "mask the position and the
+    next ``width-1``". Anchor blocks MAY overlap (two adjacent anchors share a
+    cell); the returned mask is their UNION, so the realized masked count is
+    DATA-DEPENDENT in ``[n_anchor, min(n_anchor·width, axis_len)]`` (it equals
+    ``n_anchor·width`` only when no two blocks touch). A block running off the
+    end is clamped by the union (``idx < axis_len``), so an anchor at the last
+    position masks just itself ("the next" does not exist).
+
+    The sibling of :func:`_sample_axis_band_multiset` (disjoint, exact count):
+    there the high-band lock fixes non-overlapping widths; here the anchor
+    regime samples a fixed FRACTION of positions and dilates with overlap, which
+    is closer to a SpecAugment time-mask than a tiled block layout. Positions
+    are fully randomized per row (independent draw from ``generator``).
+    """
+    if axis_len <= 0 or anchor_frac <= 0.0 or width <= 0:
+        return torch.zeros((B, C, axis_len), dtype=torch.bool, device=device)
+    width = min(int(width), axis_len)
+    n_anchor = int(round(anchor_frac * axis_len))
+    n_anchor = max(1, min(n_anchor, axis_len))
+    # DISTINCT anchors per (B, C): argsort of uniform noise is a random
+    # permutation; its first n_anchor entries are a uniform random subset.
+    perm = torch.argsort(
+        torch.rand((B, C, axis_len), generator=generator, device=device), dim=-1
+    )
+    anchors = perm[..., :n_anchor]                       # (B, C, n_anchor)
+    idx = torch.arange(axis_len, device=device).view(1, 1, 1, axis_len)
+    lo = anchors.unsqueeze(-1)                            # (B, C, n_anchor, 1)
+    # mask [a, a+width); the union (.any) folds in any overlap and clamps the
+    # tail at axis_len (idx never reaches axis_len), so no boundary wrap.
+    block = (idx >= lo) & (idx < lo + width)             # (B, C, n_anchor, axis_len)
+    return block.any(dim=2)                              # (B, C, axis_len)
+
+
 def sample_m2_dual_band_mask(
     B: int,
     K: int,
@@ -319,6 +365,8 @@ def sample_m2_dual_band_mask(
     low_freq_frac: float = 0.43,
     low_freq_floor: int = 3,
     high_time_widths: tuple[int, ...] = (3, 3, 2),
+    high_time_anchor_frac: float | None = None,
+    high_time_anchor_width: int | None = None,
     generator: torch.Generator,
     device: torch.device | str | None = None,
 ) -> Tensor:
@@ -332,9 +380,15 @@ def sample_m2_dual_band_mask(
       * **low** (slow STFT — spectral resolution) — a *freq-block tube*: one
         contiguous freq-block of width ``low_freq_floor`` (default 3 of
         ``F_p_low``=7) masked across ALL ``T_low_p`` time-patches (≈ 3/7).
-      * **high** (fast STFT — temporal resolution) — a *time-block tube*: blocks
-        of the ``high_time_widths`` multiset (default {3,3,2} = 8 of 16) masked
-        across ALL ``F_p_high`` freq-patches (= 8/16).
+      * **high** (fast STFT — temporal resolution) — a *time-block tube* across
+        ALL ``F_p_high`` freq-patches, in ONE of two styles:
+          - DEFAULT (disjoint multiset): blocks of the ``high_time_widths``
+            multiset (default {3,3,2} = 8 of 16), non-overlapping.
+          - ANCHOR-DILATE (Ben 2026-06-13, opt-in via BOTH
+            ``high_time_anchor_frac`` + ``high_time_anchor_width``): sample that
+            FRACTION of time positions as anchors, dilate each to ``width`` (mask
+            the position and the next ``width-1``), OVERLAPS allowed → union.
+            e.g. frac 0.30 + width 2 on T_high_p=80 masks ~50% of time-cols.
 
     Sampled INDEPENDENTLY PER PARCEL — Ben override 2026-06-12 of the handoff's
     per-electrode wording: the M2 tap is already post-pool, so there is no
@@ -359,11 +413,20 @@ def sample_m2_dual_band_mask(
         .reshape(B, K, T_low_p * F_p_low)        # (B, K, S_low)
     )
 
-    # --- high band: time-block multiset across ALL high freq-patches ---
-    high_time_band = _sample_axis_band_multiset(
-        B, K, axis_len=T_high_p, widths=high_time_widths,
-        generator=generator, device=g_dev,
-    )  # (B, K, T_high_p) — True time-cols masked at every freq
+    # --- high band: time-block tube across ALL high freq-patches ---
+    # ANCHOR-DILATE (overlaps allowed) when BOTH anchor params are set, else the
+    # locked disjoint multiset. Anchor mode is the Ben 2026-06-13 regime: sample
+    # `frac` of time positions, dilate each to `width`, union the overlaps.
+    if high_time_anchor_frac is not None and high_time_anchor_width is not None:
+        high_time_band = _sample_axis_anchor_dilate(
+            B, K, axis_len=T_high_p, anchor_frac=high_time_anchor_frac,
+            width=high_time_anchor_width, generator=generator, device=g_dev,
+        )  # (B, K, T_high_p) — overlap union of dilated anchors
+    else:
+        high_time_band = _sample_axis_band_multiset(
+            B, K, axis_len=T_high_p, widths=high_time_widths,
+            generator=generator, device=g_dev,
+        )  # (B, K, T_high_p) — True time-cols masked at every freq
     high_flat = (
         high_time_band.unsqueeze(-1)             # (B, K, T_high_p, 1)
         .expand(B, K, T_high_p, F_p_high)        # (B, K, T_high_p, F_p_high)

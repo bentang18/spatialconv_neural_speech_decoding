@@ -819,6 +819,14 @@ def build_v14_experiment(
     m2_low_freq_nbands: int | None = None,
     m2_high_time_width: int | None = None,
     m2_high_time_nbands: int | None = None,
+    # High-band ANCHOR-DILATE mode (Ben 2026-06-13 easier-mask regime; both → on).
+    # Instead of the disjoint width/nbands multiset, the high band samples
+    # ``frac`` of time positions and dilates each to ``width`` (mask the position
+    # + the next width-1), OVERLAPS allowed → union. e.g. frac 0.30 + width 2 on
+    # T_high_p=80 masks ~51% of high time-cols. Mutually exclusive with the
+    # disjoint high knobs above (validated below).
+    m2_high_anchor_frac: float | None = None,
+    m2_high_anchor_width: int | None = None,
     # EMA teacher momentum τ override (#sweep). ``None`` resolves to
     # DEFAULT_EMA_TAU (== ssl/ema.py P1_EMA_TAU/P2_EMA_TAU, B26 lock) so an unset
     # flag reproduces the prior hardcoded 0.99925 exactly; a float in (0, 1)
@@ -1071,6 +1079,29 @@ def build_v14_experiment(
             raise ValueError(f"m2_{_name}_width must be >= 1; got {_w}")
         if _n is not None and _n < 1:
             raise ValueError(f"m2_{_name}_nbands must be >= 1; got {_n}")
+    # High-band ANCHOR-DILATE: frac/width are a pair, and the anchor mode is
+    # mutually exclusive with the disjoint high-time multiset (two different
+    # high-band placements; setting both is ambiguous → fail loud).
+    if (m2_high_anchor_frac is None) != (m2_high_anchor_width is None):
+        raise ValueError(
+            "m2_high_anchor_frac and m2_high_anchor_width must be set together "
+            f"(got frac={m2_high_anchor_frac}, width={m2_high_anchor_width})."
+        )
+    if m2_high_anchor_frac is not None:
+        if not 0.0 < m2_high_anchor_frac <= 1.0:
+            raise ValueError(
+                f"m2_high_anchor_frac must lie in (0.0, 1.0]; got {m2_high_anchor_frac}"
+            )
+        if m2_high_anchor_width is not None and m2_high_anchor_width < 1:
+            raise ValueError(
+                f"m2_high_anchor_width must be >= 1; got {m2_high_anchor_width}"
+            )
+        if m2_high_time_width is not None or m2_high_time_nbands is not None:
+            raise ValueError(
+                "high-band anchor mode (--m2-high-anchor-frac/-width) and the "
+                "disjoint multiset (--m2-high-time-width/-nbands) are mutually "
+                "exclusive high-band placements; set only one."
+            )
     # Heteroscedastic M4 precision weighting (project_v14_heteroscedastic_ssl_loss):
     # fail fast at dispatch (the BrainModule re-validates) — it needs the σ source
     # (mean|std pool) and the joint B37 path. α >= 0 (α=1 raw count, α<1 damps high-n).
@@ -1635,6 +1666,9 @@ def build_v14_experiment(
             "m2_low_freq_nbands": m2_low_freq_nbands,
             "m2_high_time_width": m2_high_time_width,
             "m2_high_time_nbands": m2_high_time_nbands,
+            # High-band anchor-dilate (both → on; mutually exclusive w/ multiset).
+            "m2_high_anchor_frac": m2_high_anchor_frac,
+            "m2_high_anchor_width": m2_high_anchor_width,
             # SSL-sweep EMA τ override (#sweep). Resolved above (None →
             # DEFAULT_EMA_TAU == 0.99925, the B26 lock); threads onto
             # V14JointExperiment.ema_tau, which feeds the EmaTeacher schedule.
@@ -2841,6 +2875,21 @@ def _parser() -> argparse.ArgumentParser:
              "must be <= T_high_p. Requires --m2-high-time-width.",
     )
     p.add_argument(
+        "--m2-high-anchor-frac", dest="m2_high_anchor_frac", type=float, default=None,
+        help="2STFT dual-band HIGH band, ANCHOR-DILATE mode (Ben 2026-06-13 "
+             "easier-mask regime). Fraction of high-band TIME positions sampled "
+             "as anchors; each anchor masks the position + the next "
+             "(--m2-high-anchor-width - 1), OVERLAPS allowed → union. e.g. 0.30 "
+             "+ width 2 on T_high_p=80 ≈ 51%% of time-cols. Requires "
+             "--m2-high-anchor-width; mutually exclusive with --m2-high-time-*.",
+    )
+    p.add_argument(
+        "--m2-high-anchor-width", dest="m2_high_anchor_width", type=int, default=None,
+        help="2STFT dual-band HIGH band anchor dilation WIDTH (mask the anchor + "
+             "the next width-1 time-patches). Default regime uses 2. Requires "
+             "--m2-high-anchor-frac.",
+    )
+    p.add_argument(
         "--predictor-hidden", dest="predictor_hidden", type=int,
         default=DEFAULT_PREDICTOR_HIDDEN,
         help="#76 predictor hidden width (default 192 = d/2 for the canonical "
@@ -3169,6 +3218,8 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         m2_low_freq_nbands=args.m2_low_freq_nbands,
         m2_high_time_width=args.m2_high_time_width,
         m2_high_time_nbands=args.m2_high_time_nbands,
+        m2_high_anchor_frac=args.m2_high_anchor_frac,
+        m2_high_anchor_width=args.m2_high_anchor_width,
         # SSL-sweep EMA τ override (#sweep). None → build_v14_experiment resolves
         # it to 0.99925 (the B26 lock); joint-only inside the builder, so passing
         # it on every phase (incl. P3/P4) is inert off the SSL path.
@@ -3673,10 +3724,15 @@ def main(argv: list[str] | None = None) -> int:
         f"{args.m2_low_freq_width}x{args.m2_low_freq_nbands}"
         if args.m2_low_freq_width is not None else "default(3x1)"
     )
-    _high_dual = (
-        f"{args.m2_high_time_width}x{args.m2_high_time_nbands}"
-        if args.m2_high_time_width is not None else "default({3,3,2})"
-    )
+    if args.m2_high_anchor_frac is not None:
+        _high_dual = (
+            f"anchor(frac={args.m2_high_anchor_frac},width={args.m2_high_anchor_width},"
+            "overlaps)"
+        )
+    elif args.m2_high_time_width is not None:
+        _high_dual = f"multiset({args.m2_high_time_width}x{args.m2_high_time_nbands})"
+    else:
+        _high_dual = "default({3,3,2})"
     print(f"  m2_dual_band(2STFT only): low_freq={_low_dual} high_time={_high_dual}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "

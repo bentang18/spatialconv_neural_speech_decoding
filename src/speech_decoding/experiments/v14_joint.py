@@ -234,6 +234,11 @@ class V14JointExperiment(V14Experiment):
     m2_low_freq_nbands: int | None = None
     m2_high_time_width: int | None = None
     m2_high_time_nbands: int | None = None
+    # High-band ANCHOR-DILATE mode (Ben 2026-06-13): set BOTH → high band masks
+    # `frac` of time positions (each dilated `width`-wide, overlaps allowed)
+    # instead of the disjoint width/nbands multiset.
+    m2_high_anchor_frac: float | None = None
+    m2_high_anchor_width: int | None = None
     m4_mask_type: Literal["tube", "time_block"] = "tube"
     m4_mask_ratio: float = 0.20
     m4_n_min_visible: int = 3
@@ -493,6 +498,8 @@ class V14JointExperiment(V14Experiment):
             m2_low_freq_nbands=self.m2_low_freq_nbands,
             m2_high_time_width=self.m2_high_time_width,
             m2_high_time_nbands=self.m2_high_time_nbands,
+            m2_high_anchor_frac=self.m2_high_anchor_frac,
+            m2_high_anchor_width=self.m2_high_anchor_width,
             m4_mask_type=self.m4_mask_type,
             m4_mask_ratio=self.m4_mask_ratio,
             m4_n_min_visible=self.m4_n_min_visible,

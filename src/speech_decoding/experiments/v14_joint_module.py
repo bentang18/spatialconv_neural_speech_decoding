@@ -266,6 +266,11 @@ class V14JointBrainModule(pl.LightningModule):
         m2_low_freq_nbands: tp.Optional[int] = None,
         m2_high_time_width: tp.Optional[int] = None,
         m2_high_time_nbands: tp.Optional[int] = None,
+        # High-band ANCHOR-DILATE mode (Ben 2026-06-13): when BOTH are set, the
+        # high band masks `frac` of time positions (each dilated to `width`,
+        # overlaps allowed) instead of the disjoint width/nbands multiset above.
+        m2_high_anchor_frac: tp.Optional[float] = None,
+        m2_high_anchor_width: tp.Optional[int] = None,
         m4_mask_type: str = "tube",
         m4_mask_ratio: float = 0.20,
         m4_n_min_visible: int = 3,
@@ -558,6 +563,8 @@ class V14JointBrainModule(pl.LightningModule):
         self._m2_low_freq_nbands = m2_low_freq_nbands
         self._m2_high_time_width = m2_high_time_width
         self._m2_high_time_nbands = m2_high_time_nbands
+        self._m2_high_anchor_frac = m2_high_anchor_frac
+        self._m2_high_anchor_width = m2_high_anchor_width
         self._m4_mask_type = m4_mask_type
         self._m4_mask_ratio = m4_mask_ratio
         self._m4_n_min_visible = m4_n_min_visible
@@ -1143,6 +1150,15 @@ class V14JointBrainModule(pl.LightningModule):
             mask_kw["high_time_widths"] = (
                 self._m2_high_time_width,
             ) * self._m2_high_time_nbands
+        # High-band ANCHOR-DILATE override (takes precedence over the disjoint
+        # multiset when set): sample `frac` of time positions, dilate each to
+        # `width`, overlaps fold into the union (Ben 2026-06-13 high regime).
+        if (
+            self._m2_high_anchor_frac is not None
+            and self._m2_high_anchor_width is not None
+        ):
+            mask_kw["high_time_anchor_frac"] = self._m2_high_anchor_frac
+            mask_kw["high_time_anchor_width"] = self._m2_high_anchor_width
         token_mask = sample_m2_dual_band_mask(
             B, K,
             F_p_low=F_p_low, T_low_p=T_low_p,

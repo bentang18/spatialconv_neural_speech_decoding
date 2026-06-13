@@ -312,7 +312,18 @@ def test_v14_dispatch_dry_run_surfaces_dual_band_mask_geometry(capsys) -> None:
     ])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "m2_dual_band(2STFT only): low_freq=2x1 high_time=2x21" in out
+    assert "m2_dual_band(2STFT only): low_freq=2x1 high_time=multiset(2x21)" in out
+
+    # Anchor-dilate high mode (Ben 2026-06-13 exact regime): low one 2-wide freq
+    # band + high 30%-anchor / width-2 overlap-allowed.
+    rc = dispatch_v14.main([
+        "--dry-run",
+        "--m2-low-freq-width", "2", "--m2-low-freq-nbands", "1",
+        "--m2-high-anchor-frac", "0.30", "--m2-high-anchor-width", "2",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "low_freq=2x1 high_time=anchor(frac=0.3,width=2,overlaps)" in out
 
 
 def test_v14_dispatch_dual_band_half_spec_rejected() -> None:
@@ -329,6 +340,15 @@ def test_v14_dispatch_dual_band_half_spec_rejected() -> None:
         build_v14_experiment(bt_root="/dummy", m2_low_freq_width=2)  # nbands missing
     with pytest.raises(ValueError, match="must be set together"):
         build_v14_experiment(bt_root="/dummy", m2_high_time_nbands=4)  # width missing
+    # Anchor mode: frac/width are a pair, AND it is mutually exclusive with the
+    # disjoint high multiset (two different high-band placements).
+    with pytest.raises(ValueError, match="must be set together"):
+        build_v14_experiment(bt_root="/dummy", m2_high_anchor_frac=0.3)  # width missing
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build_v14_experiment(
+            bt_root="/dummy", m2_high_anchor_frac=0.3, m2_high_anchor_width=2,
+            m2_high_time_width=3, m2_high_time_nbands=2,
+        )
 
 
 # Removed: ``test_v14_dispatch_raises_until_electrode_tokens_extractor_wired``.
