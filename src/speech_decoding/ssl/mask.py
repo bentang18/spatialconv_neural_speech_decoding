@@ -250,6 +250,133 @@ def sample_m2_mask(
 
 
 # ----------------------------------------------------------------------------
+# M2 — 2STFT dual-band front-end mask (FE 2STFT, 6/12 lock)
+# ----------------------------------------------------------------------------
+
+
+def _sample_axis_band_multiset(
+    B: int,
+    C: int,
+    *,
+    axis_len: int,
+    widths: tuple[int, ...],
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """``(B, C, axis_len)`` bool: place ``len(widths)`` NON-overlapping blocks of
+    the GIVEN ``widths`` (a multiset; per-``(B, C)`` ORDER and POSITIONS both
+    randomized) at random offsets in ``[0, axis_len)``. The realized masked count
+    is EXACTLY ``sum(widths)`` — blocks never overlap (touching allowed).
+
+    This is the variable-width sibling of :func:`_sample_axis_bands`: there the
+    6/03 lock fixes a single floor and lets ``n_bands`` float; here the 2STFT
+    high-band lock (6/12) fixes the block-width MULTISET ({3,3,2} = 8 of 16) and
+    so the placement must honor those exact widths rather than a uniform floor.
+    """
+    widths = tuple(int(w) for w in widths)
+    n_blocks = len(widths)
+    total = sum(widths)
+    if n_blocks == 0 or total <= 0:
+        return torch.zeros((B, C, axis_len), dtype=torch.bool, device=device)
+    if total > axis_len:
+        raise ValueError(
+            f"sum(widths)={total} exceeds axis_len={axis_len}: blocks cannot be "
+            f"placed non-overlapping (widths={widths})"
+        )
+    # Random ORDER per (B, C): argsort of uniform noise == a random permutation.
+    order = torch.argsort(
+        torch.rand((B, C, n_blocks), generator=generator, device=device), dim=-1
+    )
+    w_all = torch.tensor(widths, dtype=torch.long, device=device)  # (n_blocks,)
+    w = w_all[order]  # (B, C, n_blocks) — widths in random per-row order
+    prefix = torch.cumsum(w, dim=-1) - w  # (B, C, n_blocks) exclusive cumulative width
+    # Random POSITIONS: with t_i = start_i - prefix_i, non-overlap holds iff the
+    # t_i are non-decreasing and t_{n-1} ≤ free; so draw n_blocks values in
+    # [0, free], sort, and set start_i = t_i + prefix_i. Then
+    # start_{i+1} - (start_i + w_i) = t_{i+1} - t_i ≥ 0 (gap) and the last block
+    # ends at t_{n-1} + total ≤ free + total = axis_len.
+    free = axis_len - total
+    t = torch.randint(
+        0, free + 1, (B, C, n_blocks), generator=generator, device=device
+    )
+    t, _ = t.sort(dim=-1)
+    starts = t + prefix  # (B, C, n_blocks)
+    idx = torch.arange(axis_len, device=device).view(1, 1, 1, axis_len)
+    lo = starts.unsqueeze(-1)  # (B, C, n_blocks, 1)
+    hi = (starts + w).unsqueeze(-1)  # (B, C, n_blocks, 1)
+    band = (idx >= lo) & (idx < hi)  # (B, C, n_blocks, axis_len)
+    return band.any(dim=2)  # (B, C, axis_len)
+
+
+def sample_m2_dual_band_mask(
+    B: int,
+    K: int,
+    *,
+    F_p_low: int,
+    T_low_p: int,
+    F_p_high: int,
+    T_high_p: int,
+    low_freq_frac: float = 0.43,
+    low_freq_floor: int = 3,
+    high_time_widths: tuple[int, ...] = (3, 3, 2),
+    generator: torch.Generator,
+    device: torch.device | str | None = None,
+) -> Tensor:
+    """2STFT M2 front-end mask over the FLAT per-parcel token sequence
+    ``(B, K, S)`` with ``S = F_p_low·T_low_p + F_p_high·T_high_p`` (the union tap
+    built by ``V14Encoder._forward_dual_band`` — low block first, then high, each
+    laid out time-OUTER / freq-INNER). ``True`` == masked.
+
+    The two baskets carry DIFFERENT masking styles (handoff §5):
+
+      * **low** (slow STFT — spectral resolution) — a *freq-block tube*: one
+        contiguous freq-block of width ``low_freq_floor`` (default 3 of
+        ``F_p_low``=7) masked across ALL ``T_low_p`` time-patches (≈ 3/7).
+      * **high** (fast STFT — temporal resolution) — a *time-block tube*: blocks
+        of the ``high_time_widths`` multiset (default {3,3,2} = 8 of 16) masked
+        across ALL ``F_p_high`` freq-patches (= 8/16).
+
+    Sampled INDEPENDENTLY PER PARCEL — Ben override 2026-06-12 of the handoff's
+    per-electrode wording: the M2 tap is already post-pool, so there is no
+    electrode axis to mask; the parcel grid is the finest available, and each
+    ``(B, K)`` parcel draws its own placement from ``generator`` (seed-
+    reproducible). The low tube contributes ``low_freq_floor·T_low_p`` masked
+    tokens and the high tube ``sum(high_time_widths)·F_p_high`` — on the locked
+    grid both are 24, the balanced ~24/24 the §6 pooled-mean loss expects.
+    """
+    g_dev = generator.device
+
+    # --- low band: ONE freq-block (width=floor) across ALL low time-patches ---
+    low_freq_band = _sample_axis_bands(
+        B, K, axis_len=F_p_low, n_valid=F_p_low, frac=low_freq_frac,
+        floor=low_freq_floor, generator=generator, device=g_dev,
+    )  # (B, K, F_p_low) — True freq-rows masked at every time
+    # Flat low layout is time-OUTER / freq-INNER (i = t·F_p_low + f). Masking ALL
+    # time ⇒ broadcast the freq-band over T_low_p, then flatten t-outer/f-inner.
+    low_flat = (
+        low_freq_band.unsqueeze(2)               # (B, K, 1, F_p_low)
+        .expand(B, K, T_low_p, F_p_low)          # (B, K, T_low_p, F_p_low)
+        .reshape(B, K, T_low_p * F_p_low)        # (B, K, S_low)
+    )
+
+    # --- high band: time-block multiset across ALL high freq-patches ---
+    high_time_band = _sample_axis_band_multiset(
+        B, K, axis_len=T_high_p, widths=high_time_widths,
+        generator=generator, device=g_dev,
+    )  # (B, K, T_high_p) — True time-cols masked at every freq
+    high_flat = (
+        high_time_band.unsqueeze(-1)             # (B, K, T_high_p, 1)
+        .expand(B, K, T_high_p, F_p_high)        # (B, K, T_high_p, F_p_high)
+        .reshape(B, K, T_high_p * F_p_high)      # (B, K, S_high)
+    )
+
+    mask = torch.cat([low_flat, high_flat], dim=2)  # (B, K, S)
+    if device is not None:
+        mask = mask.to(device)
+    return mask
+
+
+# ----------------------------------------------------------------------------
 # M4 — P2 parcel×time mask (WS-B4)
 # ----------------------------------------------------------------------------
 

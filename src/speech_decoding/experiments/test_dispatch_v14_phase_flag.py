@@ -22,6 +22,27 @@ from speech_decoding.studies.braintreebank.manifest import (
 from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 
 
+@pytest.fixture(autouse=True)
+def _restore_v14_compile_env():
+    """main() sets a global os.environ["V14_COMPILE"] for its submitit subprocess
+    (default compile-ON). The --dry-run dispatch tests call main() in-process, so
+    without cleanup that flag leaks into later tests in the same pytest process —
+    forcing torch.compile on the numerical-correctness joint tests, which then hit
+    a cross-test torch-inductor symbolic-shape cache conflict. Snapshot + restore
+    so each dispatch test leaves the compile env exactly as it found it."""
+    import os
+
+    sentinel = object()
+    prev = os.environ.get("V14_COMPILE", sentinel)
+    try:
+        yield
+    finally:
+        if prev is sentinel:
+            os.environ.pop("V14_COMPILE", None)
+        else:
+            os.environ["V14_COMPILE"] = prev  # type: ignore[assignment]
+
+
 # --- leakage decouple (#82): study/eval corpus-mode routing -----------------
 
 def test_resolve_corpus_mode_joint_forces_pretrain() -> None:
@@ -189,15 +210,13 @@ def test_build_fold_index_default_is_uid_transparent(tmp_path) -> None:
     assert we.fold_index == 0
 
 
-def test_phase_2_raises_with_blocker_ids() -> None:
-    """Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
-    phase by B29 Item 1; it stays gated at the dispatch level with the
-    redirect-to-``--phase 1`` message."""
-    with pytest.raises(NotImplementedError) as exc_info:
+def test_phase_2_choice_removed() -> None:
+    """Phase 2 was the legacy split-P2 entry-point, collapsed into the joint
+    phase by B29 Item 1. Its --phase choice was culled (2026-06-13): argparse
+    now only accepts {1, 3, 4}, so --phase 2 is rejected at parse time
+    (SystemExit code 2)."""
+    with pytest.raises(SystemExit):
         main(["--phase", "2", "--dry-run"])
-    message = str(exc_info.value)
-    for token in ("B29 Item 1", "joint phase", "V14JointExperiment"):
-        assert token in message, f"phase 2: missing blocker id {token}"
 
 
 def test_phase_3_dry_run_no_longer_gated(
@@ -207,7 +226,7 @@ def test_phase_3_dry_run_no_longer_gated(
     before any build, so it exits 0 (the module/experiment are wired); the
     live (non-dry-run) path raises the precise operator error —
     see :func:`test_phase_3_live_without_cache_raises_operator_error`."""
-    rc = main(["--phase", "3", "--dry-run"])
+    rc = main(["--phase", "3", "--pool", "cross_attn", "--dry-run"])
     assert rc == 0
     assert "V14 dispatch" in capsys.readouterr().out
 
@@ -217,7 +236,7 @@ def test_phase_3_live_without_cache_raises_operator_error() -> None:
     without --whisper-target-cache-dir fails fast with a clear operator error
     (the P3 SmoothL1 loss has no target stream), NOT the old WS-H blocker."""
     with pytest.raises(ValueError) as exc_info:
-        main(["--phase", "3", "--warmup-steps", "100"])
+        main(["--phase", "3", "--pool", "cross_attn", "--warmup-steps", "100"])
     message = str(exc_info.value)
     assert "--whisper-target-cache-dir" in message
     assert "Whisper distillation" in message
@@ -232,7 +251,7 @@ def test_phase_3_live_with_cache_routes_into_p3_build(monkeypatch) -> None:
     monkeypatch.delenv("ROOT_DIR_BRAINTREEBANK", raising=False)
     with pytest.raises(RuntimeError) as exc_info:
         main([
-            "--phase", "3",
+            "--phase", "3", "--pool", "cross_attn",
             "--whisper-target-cache-dir", "/nonexistent/teacher_cache",
             "--no-target-standardize", "--warmup-steps", "100",
         ])
@@ -241,28 +260,45 @@ def test_phase_3_live_with_cache_routes_into_p3_build(monkeypatch) -> None:
 
 def test_chain_without_work_dir_raises() -> None:
     """#21: --chain needs --work-dir for the per-phase ckpt handoff; fail fast
-    at the operator boundary before any (data-bound) build."""
+    at the operator boundary before any (data-bound) build. (Asserted against
+    _build_v14_chain directly: main() gates the B37 chain SSL path upstream
+    — chain+joint is "not wired yet" — before reaching the builder's own
+    operator-boundary validation, which is what this test pins.)"""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
     with pytest.raises(ValueError) as exc_info:
-        main(["--chain", "--whisper-target-cache-dir", "/x", "--no-target-standardize",
-              "--warmup-steps", "100"])
+        dv._build_v14_chain(_parse([
+            "--chain", "--whisper-target-cache-dir", "/x",
+            "--no-target-standardize", "--warmup-steps", "100",
+        ]))
     assert "--work-dir" in str(exc_info.value)
 
 
 def test_chain_without_whisper_cache_raises(tmp_path) -> None:
-    """#21: --chain runs the P3 distill stages, so the teacher cache is required."""
+    """#21: --chain runs the P3 distill stages, so the teacher cache is
+    required. (Asserted against _build_v14_chain directly — see
+    test_chain_without_work_dir_raises for why main() can't reach it.)"""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
     with pytest.raises(ValueError) as exc_info:
-        main(["--chain", "--work-dir", str(tmp_path), "--no-target-standardize",
-              "--warmup-steps", "100"])
+        dv._build_v14_chain(_parse([
+            "--chain", "--work-dir", str(tmp_path),
+            "--no-target-standardize", "--warmup-steps", "100",
+        ]))
     assert "--whisper-target-cache-dir" in str(exc_info.value)
 
 
 def test_chain_standardize_without_channel_stats_raises(tmp_path) -> None:
-    """#21: --chain with B33 default standardization needs --channel-stats-path."""
+    """#21: --chain with B33 default standardization needs --channel-stats-path.
+    (Asserted against _build_v14_chain directly — see
+    test_chain_without_work_dir_raises for why main() can't reach it.)"""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
     with pytest.raises(ValueError) as exc_info:
-        main([
+        dv._build_v14_chain(_parse([
             "--chain", "--work-dir", str(tmp_path),
             "--whisper-target-cache-dir", "/x", "--warmup-steps", "100",
-        ])
+        ]))
     assert "--channel-stats-path" in str(exc_info.value)
 
 
@@ -270,28 +306,35 @@ def test_chain_standardize_with_missing_channel_stats_path_raises(tmp_path) -> N
     """B33 default standardization + a --channel-stats-path that doesn't exist
     must fast-fail at dispatch (audit A4-HIGH#2b), NOT hours into the chain at
     P3a's torch.load. Pins the _validate_channel_stats_path guard so a refactor
-    can't silently drop it."""
+    can't silently drop it. (Asserted against _build_v14_chain directly — see
+    test_chain_without_work_dir_raises for why main() can't reach it.)"""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
     with pytest.raises(ValueError) as exc_info:
-        main([
+        dv._build_v14_chain(_parse([
             "--chain", "--work-dir", str(tmp_path),
             "--whisper-target-cache-dir", "/x",
             "--channel-stats-path", str(tmp_path / "missing.pt"),
             "--warmup-steps", "100",
-        ])
+        ]))
     assert "is not a file" in str(exc_info.value)
 
 
 def test_chain_standardize_rejects_channel_stats_directory(tmp_path) -> None:
     """A directory passed where the .pt is expected (operator passes the cache
     dir, not the file) must ALSO fast-fail — .is_file() catches it where
-    .exists() would let it through to a late torch.load crash."""
+    .exists() would let it through to a late torch.load crash. (Asserted against
+    _build_v14_chain directly — see test_chain_without_work_dir_raises for why
+    main() can't reach it.)"""
+    import speech_decoding.experiments.dispatch_v14 as dv
+
     with pytest.raises(ValueError) as exc_info:
-        main([
+        dv._build_v14_chain(_parse([
             "--chain", "--work-dir", str(tmp_path),
             "--whisper-target-cache-dir", "/x",
             "--channel-stats-path", str(tmp_path),  # a directory, not a .pt
             "--warmup-steps", "100",
-        ])
+        ]))
     assert "is not a file" in str(exc_info.value)
 
 
@@ -309,7 +352,7 @@ def test_chain_no_standardize_skips_channel_stats_check(monkeypatch, tmp_path) -
         "--whisper-target-cache-dir", "/x", "--no-target-standardize",
         "--channel-stats-path", str(tmp_path / "missing.pt"),
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)  # no raise
+    dv._build_v14_chain(args)  # no raise
 
 
 def test_phase_1_dry_run_constructs_joint_experiment_path(
@@ -415,25 +458,6 @@ def test_invalid_jepa_phase_rejected_by_argparse() -> None:
 # --- B37 (2026-06-10) --pool / --ssl-mode joint SSL + D8 discriminative LR ----
 
 
-def test_b37_default_is_cross_attn_staged_byte_identical(tmp_path) -> None:
-    """No B37 flags → the joint experiment keeps the B36 surface: cross_attn
-    pool + staged SSL + the staged frontend_lr_scale. The new joint fields take
-    their no-op defaults (lambda_m4=1.0, predictor depths 3/2). Behavior is
-    byte-identical to pre-B37; only the persisted config grows the new fields."""
-    from speech_decoding.experiments.dispatch_v14 import (
-        DEFAULT_FRONTEND_LR_SCALE,
-        build_v14_experiment,
-    )
-
-    xp = build_v14_experiment(bt_root=str(tmp_path), mode="lite", joint_phase=True)
-    assert xp.ssl_mode == "staged"
-    assert xp.brain_model_config.pool == "cross_attn"
-    # staged keeps the B36 P2 base/10 frontend scale (NOT the joint 1.0 override)
-    assert xp.frontend_lr_scale == DEFAULT_FRONTEND_LR_SCALE
-    assert xp.lambda_m4 == 1.0
-    assert xp.m2_predictor_depth == 3 and xp.m4_predictor_depth == 2
-
-
 def test_b37_joint_threads_pool_ssl_mode_and_d8_scales(tmp_path) -> None:
     """--pool mean joint build threads pool → brain config, ssl_mode/lambda_m4/
     per-tap predictor depths → the joint experiment, and the D8 joint LR scales
@@ -465,6 +489,146 @@ def test_b37_joint_threads_pool_ssl_mode_and_d8_scales(tmp_path) -> None:
     # encoder config carries the mean pool + thin latent depth
     assert xp.brain_model_config.pool == "mean"
     assert xp.brain_model_config.latent_parcel_depth == 3
+
+
+# --- atlas (DK / DKT) + single-electrode-parcel exclusion (2026-06-13) -------
+
+
+def test_atlas_default_is_dk_k80(tmp_path) -> None:
+    """No-flag default keeps the canonical DK atlas → encoder k_parcels = 80."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(bt_root=str(tmp_path), mode="lite", joint_phase=True)
+    assert xp.brain_model_config.k_parcels == 80
+
+
+def test_atlas_dkt_sets_encoder_k_parcels_74(tmp_path) -> None:
+    """--atlas dkt threads anatomy.atlas_spec → encoder k_parcels = 74 (DKT)."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, atlas="dkt"
+    )
+    assert xp.brain_model_config.k_parcels == 74
+
+
+def test_atlas_and_exclusion_reach_support_and_valid_mask_extractors(tmp_path) -> None:
+    """atlas + exclude-single-electrode-parcels thread to BOTH the support and the
+    valid-mask extractors with the MATCHED (column, vocabulary) pair, so support /
+    valid_mask stay row-aligned (the C1/C2 desync poisoning guard)."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+    from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
+    from speech_decoding.extractors.valid_mask import ElectrodeValidMask
+    from speech_decoding.studies.braintreebank.anatomy import V14_DKT_PARCEL_LABELS
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True,
+        atlas="dkt", exclude_single_electrode_parcels=True,
+    )
+    extractors = xp.data.segmenter.extractors
+    support = extractors["support"]
+    valid_mask = extractors["valid_mask"]
+    assert isinstance(support, V14DKHardSupportExtractor)
+    assert isinstance(valid_mask, ElectrodeValidMask)
+    for e in (support, valid_mask):
+        assert e.parcel_labels == V14_DKT_PARCEL_LABELS
+        assert e.label_column == "DKT"
+        assert e.exclude_single_electrode_parcels is True
+
+
+# --- 2STFT dual-band front end (--frontend 2stft) ----------------------------
+
+
+def test_frontend_default_is_raw_single_grid(tmp_path) -> None:
+    """No-flag default keeps the single-grid raw F=50 front end — one batch key,
+    per_band_stem False."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    xp = build_v14_experiment(bt_root=str(tmp_path), mode="lite", joint_phase=True)
+    assert xp.brain_model_config.per_band_stem is False
+    assert "electrode_tokens_high" not in xp.data.segmenter.extractors
+
+
+def test_frontend_2stft_builds_dual_band_views_and_per_band_stem(tmp_path) -> None:
+    """--frontend 2stft builds TWO single-band views (low → electrode_tokens, high
+    → electrode_tokens_high) at the locked band configs, and threads per_band_stem
+    + view-derived band geometry to the encoder config."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+    from speech_decoding.extractors.view import MultiStftView
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True,
+        frontend="2stft", pool="mean", clip_len=5.0,
+    )
+    ext = xp.data.segmenter.extractors
+    low, high = ext["electrode_tokens"], ext["electrode_tokens_high"]
+    assert isinstance(low, MultiStftView) and isinstance(high, MultiStftView)
+    # band configs (committed STFT_2BAND_LOW / HIGH)
+    assert (low.front_end, low.band_nperseg, low.band_hop) == ("band", 512, 256)
+    assert (high.front_end, high.band_nperseg, high.band_hop) == ("band", 128, 64)
+    assert low.hop_length == 256 and high.hop_length == 64
+    # encoder config: per_band_stem + view-DERIVED bin counts (no drift)
+    c = xp.brain_model_config
+    assert c.per_band_stem is True
+    assert c.band_low_n_freq_bins == 14 and c.band_high_n_freq_bins == 9
+    # 5 s @ 2048 Hz: low 1+10240//256=41, high 1+10240//64=161
+    assert c.band_low_n_time_bins == 41 and c.band_high_n_time_bins == 161
+
+
+def test_frontend_2stft_rejects_non_mean_pool(tmp_path) -> None:
+    """The dual-band stem is the B37 mean-pool path; cross_attn must fail loud."""
+    import pytest
+
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    with pytest.raises(ValueError, match="requires --pool mean"):
+        build_v14_experiment(
+            bt_root=str(tmp_path), mode="lite", joint_phase=True,
+            frontend="2stft", pool="cross_attn",
+        )
+
+
+def test_cache_session_index_subsets_study_to_one_pretrain_session(tmp_path) -> None:
+    """--cache-session-index N restricts the SSL study to exactly the Nth session
+    of the resolved corpus (so a SLURM array builds one session's spec cache per
+    task). The subset rides the study's timeline list only — k_parcels and the
+    rest of the build are unchanged."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+    from speech_decoding.studies.braintreebank.study import _SESSIONS_BY_MODE
+
+    xp = build_v14_experiment(
+        bt_root=str(tmp_path), mode="nano", joint_phase=True,
+        frontend="2stft", pool="mean", atlas="dkt",
+        cache_session_index=5,
+    )
+    # study is a Chain; the BT study is its first step
+    bt = xp.data.study.steps[0]
+    assert bt.session_subset == (tuple(_SESSIONS_BY_MODE["pretrain"][5]),)
+    assert xp.brain_model_config.k_parcels == 74
+
+
+def test_cache_session_index_out_of_range_raises(tmp_path) -> None:
+    """An index past the corpus size fails loud (one source of truth for N)."""
+    import pytest
+
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    with pytest.raises(ValueError, match="out of range"):
+        build_v14_experiment(
+            bt_root=str(tmp_path), mode="nano", joint_phase=True,
+            frontend="2stft", pool="mean", cache_session_index=99,
+        )
+
+
+def test_cache_only_flags_parse_via_main(monkeypatch, tmp_path) -> None:
+    """--cache-only + --cache-session-index are accepted by argparse and reach
+    args. (--dry-run short-circuits before the build, so this only proves the
+    CLI surface exists; the build-path subsetting is covered above.)"""
+    rc = main(
+        ["--phase", "1", "--frontend", "2stft", "--cache-only",
+         "--cache-session-index", "3", "--dry-run"]
+    )
+    assert rc == 0
 
 
 # ---------------------------------------------------------------------------
@@ -624,15 +788,15 @@ def test_b37_pool_mean_auto_resolves_ssl_mode_joint(monkeypatch) -> None:
     assert calls[0]["joint_parcel_lr_scale"] == 1.0
 
 
-def test_b37_pool_cross_attn_auto_resolves_ssl_mode_staged(monkeypatch) -> None:
-    """The default --pool cross_attn with no --ssl-mode resolves to staged
-    (the B36 path) — the other half of the 'auto' resolution table."""
-    calls = _capture_builds(monkeypatch)
-    rc = main(["--phase", "1", "--fast-dev-run"])   # cross_attn is the default
-    assert rc == 0
-    assert len(calls) == 1
-    assert calls[0]["pool"] == "cross_attn"
-    assert calls[0]["ssl_mode"] == "staged"
+def test_b37_pool_cross_attn_ssl_phase_rejected(monkeypatch) -> None:
+    """The B36 'staged' SSL CLI surface was culled (2026-06-13): 'auto' now
+    always resolves to 'joint', and the joint objective is the freq-preserving
+    mean-pool path, so an SSL phase on a cross_attn encoder fails fast at
+    dispatch (before any build). (cross_attn remains a valid encoder for the P4
+    probe, where ssl_mode is irrelevant — see test_b37_phase4_pool_cross_attn.)"""
+    _capture_builds(monkeypatch)
+    with pytest.raises(SystemExit, match="requires --pool mean"):
+        main(["--phase", "1", "--pool", "cross_attn", "--fast-dev-run"])
 
 
 def test_b37_ssl_mode_joint_requires_mean_pool() -> None:
@@ -643,10 +807,12 @@ def test_b37_ssl_mode_joint_requires_mean_pool() -> None:
               "--fast-dev-run"])
 
 
-def test_b37_pool_mean_ssl_phase_requires_joint() -> None:
-    """--pool mean on an SSL phase with an explicit --ssl-mode staged is
-    rejected: the freq-preserving mean-pool latent has no staged path."""
-    with pytest.raises(SystemExit, match="no staged single-term path"):
+def test_b37_ssl_mode_staged_choice_removed() -> None:
+    """The B36 'staged' --ssl-mode choice was culled (2026-06-13): argparse now
+    only accepts {auto, joint}, so an explicit --ssl-mode staged is rejected at
+    parse time (SystemExit code 2). The mean-pool SSL phase has only the joint
+    objective now."""
+    with pytest.raises(SystemExit):
         main(["--phase", "1", "--pool", "mean", "--ssl-mode", "staged",
               "--fast-dev-run"])
 
@@ -761,7 +927,7 @@ def test_chain_assembly_shape_and_handoff(monkeypatch, tmp_path) -> None:
         "--chain", "--work-dir", str(tmp_path),
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
     ])
-    phases = dv._build_v14_chain(args, cross_attn_positions=None)
+    phases = dv._build_v14_chain(args)
     assert len(calls) == len(phases) == 5
     assert calls[0]["joint_phase"] and calls[0]["jepa_phase"] == "p1"
     assert calls[1]["joint_phase"] and calls[1]["jepa_phase"] == "p2"
@@ -789,7 +955,7 @@ def test_chain_guard_off_by_default(monkeypatch, tmp_path) -> None:
         "--chain", "--work-dir", str(tmp_path),
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     assert [c["collapse_guard"] for c in calls] == [False, False, False, False, False]
 
 
@@ -807,17 +973,19 @@ def test_chain_collapse_guard_opt_in_arms_ssl_phases(monkeypatch, tmp_path) -> N
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--collapse-guard",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     # Opt-in arms P1/P2/P3a/P3b; P4 always off.
     assert [c["collapse_guard"] for c in calls] == [True, True, True, True, False]
 
 
 def test_chain_threads_sister_flags(monkeypatch, tmp_path) -> None:
-    """Gate-D HIGH regression: loss_variant / latent_valid_override /
-    sa_mask_mode reach the chain's joint phases, and binary_tasks reaches EVERY
-    phase (so the SSL/distill clip population matches the P4 eval set). Before
-    the _common_build_kwargs refactor these silently fell back to defaults while
-    the run summary printed the sister as applied."""
+    """Gate-D HIGH regression: loss_variant reaches the chain's joint phases,
+    and binary_tasks reaches EVERY phase (so the SSL/distill clip population
+    matches the P4 eval set). Before the _common_build_kwargs refactor these
+    silently fell back to defaults while the run summary printed the sister as
+    applied. (The --latent-valid-override / --sa-mask-mode CLI sisters were
+    culled 2026-06-13; both are now hardcoded to "support" / "bidirectional"
+    inside build_v14_experiment, off the dispatch threading surface.)"""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
@@ -825,15 +993,11 @@ def test_chain_threads_sister_flags(monkeypatch, tmp_path) -> None:
         "--chain", "--work-dir", str(tmp_path),
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--loss-variant", "b31_plus_m3",
-        "--latent-valid-override", "all_true",
-        "--sa-mask-mode", "key_only",
         "--no-binary-tasks",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
-    for i in (0, 1):  # the joint SSL phases carry the sisters
+    dv._build_v14_chain(args)
+    for i in (0, 1):  # the joint SSL phases carry the sister
         assert calls[i]["loss_variant"] == "b31_plus_m3"
-        assert calls[i]["latent_valid_override"] == "all_true"
-        assert calls[i]["sa_mask_mode"] == "key_only"
     assert all(c["binary_tasks"] is False for c in calls)  # all 5 phases
 
 
@@ -850,7 +1014,7 @@ def test_chain_budget_and_early_stop_wiring(monkeypatch, tmp_path) -> None:
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--ssl-max-steps", "5000",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     # SSL/distill phases: step-budgeted, never early-stop.
     for i in (0, 1, 2, 3):
         assert calls[i]["max_steps"] == 5000
@@ -871,7 +1035,7 @@ def test_chain_default_budget_and_patience_disable(monkeypatch, tmp_path) -> Non
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--p4-early-stop-patience", "0",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     for i in (0, 1, 2, 3):
         assert calls[i]["max_steps"] == 1500  # default step budget
     assert calls[4]["early_stopping_patience"] is None  # 0 disables
@@ -890,26 +1054,27 @@ def test_chain_ssl_max_steps_zero_falls_back_to_epoch_budget(
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--ssl-max-steps", "0",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     for i in (0, 1, 2, 3):
         assert calls[i]["max_steps"] is None  # <=0 -> epoch budget
 
 
 def test_chain_default_optim_is_locked_b01_config(monkeypatch, tmp_path) -> None:
-    """Production default (2026-06-07): with no optim flags every chain phase gets
-    the validated config — lr=AUTO √-rule (5e-4·√(eff/1024); default eff = bs 4 ×
+    """Production default: with no optim flags every chain phase gets the
+    validated config — lr=AUTO √-rule (5e-4·√(eff/1024); default eff = bs 4 ×
     accum 8 × 1 gpu = 32 → 8.8e-5), warmup_cosine, AdamW, β2=0.95, grad_clip=1.0,
-    wd=0.05. constant-Adam/β2=0.999 was the unimplemented-default *bug*, never a
-    chosen config, so it is refused on a real SSL/distill run — see
+    wd=0.05.
+    constant-Adam/β2=0.999 was the unimplemented-default *bug*, never a chosen
+    config, so it is refused on a real SSL/distill run — see
     test_launch_guard_refuses_real_ssl_on_unimplemented_default_optim."""
     import speech_decoding.experiments.dispatch_v14 as dv
 
     calls = _capture_builds(monkeypatch)
     args = _parse([
-        "--chain", "--work-dir", str(tmp_path),
+        "--chain", "--pool", "mean", "--work-dir", str(tmp_path),
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     expected_lr = 5e-4 * (4 * 8 * 1 / 1024) ** 0.5
     for c in calls:  # all 5 phases
         assert c["lr"] == pytest.approx(expected_lr)
@@ -991,9 +1156,14 @@ def test_dry_run_exempts_real_ssl_default_config(
     pins the exemption directly (it was only covered incidentally before)."""
     assert main(["--phase", "1", "--dry-run"]) == 0
     assert "V14 dispatch" in capsys.readouterr().out
-    # --chain exercises the other half of `_is_ssl_distill`; --dry-run short-
-    # circuits before the chain's --work-dir/cache/channel-stats validation too.
-    assert main(["--chain", "--dry-run"]) == 0
+    # --phase 3 exercises the other branch of `_is_ssl_distill` (the distill
+    # phase); --dry-run short-circuits before any build/train there too. P3 is
+    # the cross_attn-encoder distill phase (the 5-D mean-pool readout is not
+    # wired), so request --pool cross_attn. (The B37 chain SSL path is gated
+    # upstream — chain+joint is "not wired yet" — so the chain can no longer
+    # reach the dry-run short-circuit; the distill phase is the remaining
+    # `_is_ssl_distill` arm whose exemption is observable.)
+    assert main(["--phase", "3", "--pool", "cross_attn", "--dry-run"]) == 0
 
 
 def test_chain_lof_off_by_default(monkeypatch, tmp_path) -> None:
@@ -1005,7 +1175,7 @@ def test_chain_lof_off_by_default(monkeypatch, tmp_path) -> None:
         "--chain", "--work-dir", str(tmp_path),
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     for c in calls:  # all 5 phases
         assert c["lof_bad_channels"] is False
         assert c["lof_report_path"] is None
@@ -1024,7 +1194,7 @@ def test_chain_lof_flags_reach_every_phase(monkeypatch, tmp_path) -> None:
         "--lof-bad-channels", "--lof-threshold", "1.8",
         "--lof-n-neighbors", "15", "--lof-report-path", str(tmp_path / "lof.json"),
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     for c in calls:
         assert c["lof_bad_channels"] is True
         assert c["lof_threshold"] == 1.8
@@ -1040,11 +1210,11 @@ def test_chain_c_max_default_and_override(monkeypatch, tmp_path) -> None:
     calls = _capture_builds(monkeypatch)
     base = ["--chain", "--work-dir", str(tmp_path),
             "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
-    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base))
     assert all(c["c_max"] == dv.DEFAULT_C_MAX for c in calls)
 
     calls.clear()
-    dv._build_v14_chain(_parse(base + ["--c-max", "256"]), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base + ["--c-max", "256"]))
     assert all(c["c_max"] == 256 for c in calls)
 
 
@@ -1064,7 +1234,7 @@ def test_chain_warmup_cosine_optim_reaches_every_phase(monkeypatch, tmp_path) ->
         "--lr", "5e-4", "--warmup-steps", "2000", "--weight-decay", "0.0",
         "--adam-beta2", "0.95", "--min-lr-ratio", "0.0", "--grad-clip", "1.0",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     for c in calls:
         assert c["lr_schedule"] == "warmup_cosine"
         assert c["optimizer_name"] == "AdamW"
@@ -1097,7 +1267,7 @@ def test_accumulate_grad_batches_reaches_every_phase(monkeypatch, tmp_path) -> N
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--accumulate-grad-batches", "8",
     ])
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     assert calls and all(c["accumulate_grad_batches"] == 8 for c in calls)
 
 
@@ -1119,12 +1289,11 @@ def test_wd_exclude_norms_reaches_every_phase(monkeypatch, tmp_path) -> None:
             "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
 
     calls = _capture_builds(monkeypatch)
-    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base))
     assert calls and all(c["wd_exclude_norms"] is True for c in calls)
 
     calls.clear()
-    dv._build_v14_chain(_parse(base + ["--no-wd-exclude-norms"]),
-                        cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base + ["--no-wd-exclude-norms"]))
     assert calls and all(c["wd_exclude_norms"] is False for c in calls)
 
 
@@ -1145,21 +1314,21 @@ def test_parcel_lr_scale_reaches_p3_phases(monkeypatch, tmp_path) -> None:
             "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
 
     calls = _capture_builds(monkeypatch)
-    dv._build_v14_chain(_parse(base + ["--parcel-lr-scale", "0.25"]),
-                        cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base + ["--parcel-lr-scale", "0.25"]))
     # calls[2]=P3a, calls[3]=P3b carry the override.
     assert calls[2]["parcel_lr_scale"] == 0.25
     assert calls[3]["parcel_lr_scale"] == 0.25
 
     calls.clear()
-    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base))
     assert calls[2]["parcel_lr_scale"] == 1.0 / 3.0
 
 
 def test_parcel_lr_scale_reaches_single_phase(monkeypatch) -> None:
-    """--parcel-lr-scale reaches a single --phase 3 build too."""
+    """--parcel-lr-scale reaches a single --phase 3 build too. (P3 is the
+    cross_attn distill path; mean is the default now, so request it explicitly.)"""
     calls = _capture_builds(monkeypatch)
-    main(["--phase", "3", "--p3-stage", "3b",
+    main(["--phase", "3", "--pool", "cross_attn", "--p3-stage", "3b",
           "--whisper-target-cache-dir", "/c", "--no-target-standardize",
           "--parcel-lr-scale", "0.5", "--warmup-steps", "100"])
     assert calls[0]["parcel_lr_scale"] == 0.5
@@ -1175,7 +1344,7 @@ def test_rankme_thresholds_reach_every_phase(monkeypatch, tmp_path) -> None:
             "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
 
     calls = _capture_builds(monkeypatch)
-    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base))
     assert calls and all(c["rankme_warn_threshold"] is None for c in calls)
     assert all(c["rankme_alarm_threshold"] is None for c in calls)
 
@@ -1183,7 +1352,6 @@ def test_rankme_thresholds_reach_every_phase(monkeypatch, tmp_path) -> None:
     dv._build_v14_chain(
         _parse(base + ["--rankme-warn-threshold", "0.4",
                        "--rankme-alarm-threshold", "0.3"]),
-        cross_attn_positions=None,
     )
     assert calls and all(c["rankme_warn_threshold"] == 0.4 for c in calls)
     assert all(c["rankme_alarm_threshold"] == 0.3 for c in calls)
@@ -1307,12 +1475,11 @@ def test_single_phase_passes_sister_flags(monkeypatch) -> None:
     calls = _capture_builds(monkeypatch)
     main([
         "--phase", "1", "--loss-variant", "b31_plus_utt",
-        "--latent-valid-override", "all_true", "--no-binary-tasks",
+        "--no-binary-tasks",
         "--warmup-steps", "100",
     ])
     assert len(calls) == 1
     assert calls[0]["loss_variant"] == "b31_plus_utt"
-    assert calls[0]["latent_valid_override"] == "all_true"
     assert calls[0]["binary_tasks"] is False
     assert calls[0]["joint_phase"] is True
 
@@ -1343,10 +1510,11 @@ def test_single_phase_p1_threads_ssl_max_steps(monkeypatch) -> None:
 
 
 def test_single_phase_p3_threads_ssl_max_steps(monkeypatch) -> None:
-    """#39: --ssl-max-steps reaches the single-phase P3 distill build too."""
+    """#39: --ssl-max-steps reaches the single-phase P3 distill build too.
+    (P3 is the cross_attn distill path; mean is the default now.)"""
     calls = _capture_builds(monkeypatch)
     main([
-        "--phase", "3", "--ssl-max-steps", "5000",
+        "--phase", "3", "--pool", "cross_attn", "--ssl-max-steps", "5000",
         "--whisper-target-cache-dir", "/c", "--no-target-standardize",
         "--warmup-steps", "100",
     ])
@@ -1431,11 +1599,11 @@ def test_slurm_requeue_threads_to_every_chain_phase(monkeypatch, tmp_path) -> No
             "--whisper-target-cache-dir", "/c", "--no-target-standardize"]
 
     calls = _capture_builds(monkeypatch)
-    dv._build_v14_chain(_parse(base), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base))
     assert calls and all(c["requeue"] is False for c in calls)
 
     calls.clear()
-    dv._build_v14_chain(_parse(base + ["--slurm-requeue"]), cross_attn_positions=None)
+    dv._build_v14_chain(_parse(base + ["--slurm-requeue"]))
     assert calls and all(c["requeue"] is True for c in calls)
 
 
@@ -1478,7 +1646,6 @@ def test_live_flag_threads_wandb_and_step_cadence() -> None:
 
     live = dv._common_build_kwargs(
         _parse(["--phase", "1", "--mode", "nano", "--live"]),
-        cross_attn_positions=None,
     )
     assert live["lr_log_interval"] == "step"
     assert live["log_every_n_steps"] == 1
@@ -1487,7 +1654,6 @@ def test_live_flag_threads_wandb_and_step_cadence() -> None:
 
     off = dv._common_build_kwargs(
         _parse(["--phase", "1", "--mode", "nano"]),
-        cross_attn_positions=None,
     )
     assert off["lr_log_interval"] == "epoch"
     assert off["log_every_n_steps"] == 10

@@ -409,6 +409,64 @@ V14_DK_PARCEL_LABELS: tuple[str, ...] = (
 keeps unpopulated parcels alive for cross-cohort portability."""
 
 
+# --- DKT (Desikan-Killiany-Tourville) atlas -------------------------------- #
+# The BT depth-wm.csv carries a NATIVE ``DKT`` column (FreeSurfer aparc.DKTatlas),
+# parcellated directly — NOT derivable by dropping DK electrodes. The DKT protocol
+# removes three DK gyral labels whose boundaries it could not define reliably
+# (bankssts, frontalpole, temporalpole) and REASSIGNS those vertices to neighbouring
+# gyri, so an electrode DK-labelled e.g. ``temporalpole`` re-appears under a DKT
+# neighbour label — it is not lost. Same string format as the DK column.
+_DKT_DROPPED_BASES: frozenset[str] = frozenset(
+    {"bankssts", "frontalpole", "temporalpole"}
+)
+_DKT_APARC_BASE_LABELS: tuple[str, ...] = tuple(
+    b for b in _DK_APARC_BASE_LABELS if b not in _DKT_DROPPED_BASES
+)
+"""31 DKT cortical base regions = the 34 DK aparc bases minus the 3 DKT drops."""
+
+V14_DKT_PARCEL_LABELS_CORTICAL: tuple[str, ...] = tuple(
+    f"ctx-{hemi}-{base}" for hemi in ("lh", "rh") for base in _DKT_APARC_BASE_LABELS
+)
+"""62 FreeSurfer DKT aparc cortical labels (hemis-distinct), BT depth-wm.csv format."""
+
+V14_DKT_PARCEL_LABELS_SUBCORTICAL: tuple[str, ...] = V14_DK_PARCEL_LABELS_SUBCORTICAL
+"""12 aseg subcortical labels — identical to DK (DKT only changes cortical gyri)."""
+
+V14_DKT_PARCEL_LABELS: tuple[str, ...] = (
+    V14_DKT_PARCEL_LABELS_CORTICAL + V14_DKT_PARCEL_LABELS_SUBCORTICAL
+)
+"""Canonical K=74 v14 DKT parcel vocabulary (62 cortical + 12 subcortical).
+Atlas-fixed, not cohort-derived — keeps unpopulated parcels alive for
+cross-cohort portability (mirrors :data:`V14_DK_PARCEL_LABELS`)."""
+
+
+# Atlas registry — the SINGLE source pairing each atlas's CSV column with its
+# parcel vocabulary. They MUST move together: using the DKT vocabulary against the
+# ``DesikanKilliany`` column (or vice versa) silently mis-routes every electrode
+# (a temporalpole DK label would land out-of-vocab, etc.). Thread an atlas name,
+# never a bare (column, labels) pair, so the two can never desync.
+_ATLAS_SPECS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "dk": ("DesikanKilliany", V14_DK_PARCEL_LABELS),
+    "dkt": ("DKT", V14_DKT_PARCEL_LABELS),
+}
+
+
+def atlas_spec(atlas: str) -> tuple[str, tuple[str, ...]]:
+    """Resolve an atlas name to its ``(label_column, parcel_labels)`` pair.
+
+    The ONLY sanctioned way to pick an atlas — guarantees the depth-wm.csv column
+    and the parcel vocabulary are the matched pair (``"dk"`` → DesikanKilliany /
+    K=80, ``"dkt"`` → DKT / K=74). Raises on an unknown name rather than silently
+    falling back to DK.
+    """
+    key = str(atlas).lower()
+    if key not in _ATLAS_SPECS:
+        raise ValueError(
+            f"unknown atlas {atlas!r}; expected one of {sorted(_ATLAS_SPECS)}"
+        )
+    return _ATLAS_SPECS[key]
+
+
 def parse_dk_label(label: str) -> tuple[str, str, str]:
     """Parse a BT depth-wm DK label into ``(kind, hemi, base)``.
 
@@ -460,14 +518,54 @@ def _assert_parcel_support_coverage(
     if fraction < _MIN_PARCEL_VALID_FRACTION:
         raise ValueError(
             f"subject {subject_id}: only {n_valid}/{n_total} voltage electrodes "
-            f"({fraction:.3f}) mapped to an in-vocab DK parcel — below the "
-            f"{_MIN_PARCEL_VALID_FRACTION:.2f} floor (live cohort is 0.989-1.000). "
-            "The depth-wm.csv DK labels likely stopped matching the voltage "
-            "electrode namespace for this subject (S9-class); its parcel-pool "
-            "routing would be silently zeroed under unmapped_policy='zero'. "
+            f"({fraction:.3f}) mapped to an in-vocab {result.label_column} parcel "
+            f"— below the {_MIN_PARCEL_VALID_FRACTION:.2f} floor (DK cohort is "
+            "0.989-1.000; DKT 0.888-1.000, measured 2026-06-13). "
+            f"The depth-wm.csv {result.label_column} labels likely stopped matching "
+            "the voltage electrode namespace for this subject (S9-class); its "
+            "parcel-pool routing would be silently zeroed under "
+            "unmapped_policy='zero'. "
             f"Rebuild/verify localization/sub_{subject_id}/depth-wm.csv. "
             "See data_pipeline_bug_ledger.md LG15."
         )
+
+
+def _drop_single_electrode_parcels(result: HardLabelSupport) -> HardLabelSupport:
+    """Exclude single-electrode parcels (Ben 2026-06-13): a parcel covered by
+    exactly ONE valid electrode is dropped ENTIRELY — the lone electrode's support
+    row is zeroed and ``valid[c]=False``, leaving the parcel uncovered for this
+    subject.
+
+    Why: a parcel pooled from a single electrode has a degenerate within-parcel
+    statistic — its mean IS that electrode and its std is identically 0, which
+    poisons the heteroscedastic M4 precision weight (σ²→0 ⇒ unbounded weight). The
+    parcel stays in the K-vocabulary (cross-subject parcel embeddings must align),
+    so this changes only this subject's coverage, never the global K. Operates on
+    the post-``unmapped_policy`` support, so already-invalid electrodes (zero rows)
+    do not count toward a parcel's electrode tally. One-hot routing guarantees no
+    cascade — dropping a parcel's lone electrode empties only that parcel.
+    """
+    support = result.support
+    valid = result.valid
+    # Per-parcel valid-electrode count (invalid electrodes already have zero rows).
+    per_parcel = support.sum(axis=0)                       # (K,)
+    single = np.flatnonzero(per_parcel == 1.0)             # parcels with exactly 1
+    if single.size == 0:
+        return result
+    support = support.copy()
+    valid = valid.copy()
+    for k in single:
+        rows = np.flatnonzero(support[:, k] != 0.0)        # the lone electrode row
+        support[rows, :] = 0.0
+        valid[rows] = False
+    return HardLabelSupport(
+        kind=result.kind,
+        electrode_labels=result.electrode_labels,
+        parcel_labels=result.parcel_labels,
+        support=support,
+        valid=valid,
+        label_column=result.label_column,
+    )
 
 
 @functools.lru_cache(maxsize=64)
@@ -478,15 +576,27 @@ def aligned_voltage_support(
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS,
     unmapped_policy: tp.Literal["raise", "zero"] = "raise",
     label_column: str = DEFAULT_BT_LABEL_COLUMN,
+    exclude_single_electrode_parcels: bool = False,
 ) -> HardLabelSupport:
-    """DK support aligned to the VOLTAGE electrode order.
+    """DK/DKT support aligned to the VOLTAGE electrode order.
 
     ``result.support[c]`` and ``result.valid[c]`` describe the same physical
     electrode as ``electrode_tokens[c]`` (= ``voltage_electrode_order(...)[c]``).
-    Electrodes with no anatomy row or an out-of-vocab DK label get a zero row +
+    Electrodes with no anatomy row or an out-of-vocab label get a zero row +
     ``valid=False`` in place under ``unmapped_policy="zero"`` (no re-pack). The
-    result is memoized per ``(bt_root, subject_id, parcel_labels, policy)``;
-    callers must not mutate the returned arrays.
+    result is memoized per ``(bt_root, subject_id, parcel_labels, policy,
+    label_column, exclude_single_electrode_parcels)``; callers must not mutate
+    the returned arrays.
+
+    ``label_column`` selects the depth-wm.csv atlas column ("DesikanKilliany" or
+    "DKT"); it MUST be the partner of ``parcel_labels`` (use :func:`atlas_spec` to
+    get the matched pair — never mix a column with the wrong vocabulary).
+
+    ``exclude_single_electrode_parcels`` (Ben 2026-06-13): after mapping, drop any
+    parcel covered by exactly one valid electrode — zero that electrode's row and
+    mark it invalid (see :func:`_drop_single_electrode_parcels`). Applied AFTER the
+    coverage guard so the guard measures true anatomy health, not the intentional
+    single-electrode drop.
 
     Fails loud (ledger LG15) if per-subject parcel coverage collapses below
     :data:`_MIN_PARCEL_VALID_FRACTION` — the S9-class silent-degradation guard.
@@ -504,4 +614,6 @@ def aligned_voltage_support(
         unmapped_policy=unmapped_policy,
     )
     _assert_parcel_support_coverage(result, int(subject_id))
+    if exclude_single_electrode_parcels:
+        result = _drop_single_electrode_parcels(result)
     return result

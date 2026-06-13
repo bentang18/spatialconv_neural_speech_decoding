@@ -24,7 +24,15 @@ import torch
 from torch import Tensor
 
 
-_VARIABLE_FIELDS = ("electrode_tokens", "support", "valid_mask")
+# ``electrode_tokens_high`` is the 2STFT (per_band_stem) HIGH band — present ONLY
+# on the dual-band frontend. It shares the SAME electrodes (and therefore the same
+# per-sample C and valid_mask/support) as ``electrode_tokens`` (the LOW band), so
+# it is padded to the SAME ``C_max`` but keeps its OWN freq/time axes (F_high,
+# T_high differ from the low band — different nperseg/hop). Absent on every
+# non-2STFT path; handled separately below so it round-trips freq-major
+# ``(C, F_high, T_high)`` untransposed (the encoder consumes it via
+# ``_forward_dual_band`` with ``time_last_input``-style freq-major orientation).
+_VARIABLE_FIELDS = ("electrode_tokens", "electrode_tokens_high", "support", "valid_mask")
 
 
 def _stack_target(samples: Sequence[dict], key: str) -> Tensor:
@@ -99,6 +107,40 @@ def v14_variable_tc_collate(samples: Sequence[dict[str, Any]]) -> dict[str, Tens
         "support": support,
         "valid_mask": valid_mask,
     }
+
+    # 2STFT HIGH band (per_band_stem): same electrodes as the low band, so pad to
+    # the SAME ``C_max`` (per-sample C_i must match the low band's), but keep its
+    # own freq/time axes. Freq-major ``(C, F_high, T_high)`` round-trips untransposed.
+    if "electrode_tokens_high" in samples[0]:
+        eh0 = samples[0]["electrode_tokens_high"]
+        F_high = eh0.shape[-1]
+        A1_high = max(s["electrode_tokens_high"].shape[1] for s in samples)
+        for i, s in enumerate(samples):
+            if "electrode_tokens_high" not in s:
+                raise ValueError(
+                    f"sample {i}: electrode_tokens_high missing while batch-leader "
+                    "carries it (all-or-none per batch)"
+                )
+            eh = s["electrode_tokens_high"]
+            if eh.shape[-1] != F_high:
+                raise ValueError(
+                    f"sample {i}: high-band freq-bin count mismatch "
+                    f"{eh.shape[-1]} != batch-leader {F_high}"
+                )
+            if eh.shape[0] != samples[i]["electrode_tokens"].shape[0]:
+                raise ValueError(
+                    f"sample {i}: high-band electrode count {eh.shape[0]} != "
+                    f"low-band {samples[i]['electrode_tokens'].shape[0]} "
+                    "(the two 2STFT bands must share electrodes)"
+                )
+        electrode_tokens_high = torch.zeros(
+            B, C_max, A1_high, F_high, dtype=eh0.dtype
+        )
+        for b, sample in enumerate(samples):
+            eh = sample["electrode_tokens_high"]
+            C_i, A1_i = eh.shape[0], eh.shape[1]
+            electrode_tokens_high[b, :C_i, :A1_i, :] = eh
+        out["electrode_tokens_high"] = electrode_tokens_high
 
     # Any non-variable field round-trips via plain stack.
     other_keys = set(samples[0].keys()) - set(_VARIABLE_FIELDS)

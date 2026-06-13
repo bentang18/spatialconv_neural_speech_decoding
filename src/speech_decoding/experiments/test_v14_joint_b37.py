@@ -473,3 +473,118 @@ def test_joint_training_step_logs_component_losses() -> None:
     for key in ("train_loss", "train_loss_m2", "train_loss_m4",
                 "train_n_masked_m2", "train_n_masked_m4"):
         assert key in logged, key
+
+
+# --------------------------------------------------------------------------- #
+# 2STFT dual-band (per_band_stem) joint step — end-to-end #153 smoke
+# --------------------------------------------------------------------------- #
+# Geometry mirrors test_v14_2stft_frontend @ a 1 s clip: low raw 9 frames
+# (conv fk2,tk1 → 7 freq / 8 time after even-trim), high raw 33 (fk3,tk2 →
+# 3 freq / 16 time). Flat per-parcel S = 7×8 + 3×16 = 104.
+_DB_LOW_T_1S = 9
+_DB_HIGH_T_1S = 33
+
+
+def _dual_encoder(**over) -> V14ParcelPerceiverModel:
+    kw = dict(
+        n_freq_bins=14, n_time_bins=_DB_LOW_T_1S, k_parcels=6, d_model=32,
+        n_heads=4, depth_self_attn=2, m_sub_slots=1, n_token_blocks=2,
+        pool="mean", per_band_stem=True,
+        band_low_n_freq_bins=14, band_high_n_freq_bins=9,
+        band_low_kernel_freq=2, band_low_kernel_time=1,
+        band_high_kernel_freq=3, band_high_kernel_time=2,
+        band_low_n_time_bins=_DB_LOW_T_1S, band_high_n_time_bins=_DB_HIGH_T_1S,
+    )
+    kw.update(over)
+    torch.manual_seed(0)
+    return V14ParcelPerceiverModel(**kw)  # type: ignore[arg-type]
+
+
+def _dual_batch(*, B: int = 2, C: int = 6, K: int = 6,
+                t_low: int = _DB_LOW_T_1S, t_high: int = _DB_HIGH_T_1S):
+    """Freq-major dual-band batch — the exact orientation the production
+    extractor + collate emit (low (B,C,F_low,T_low), high (B,C,F_high,T_high)),
+    diagonal support so all K parcels are covered."""
+    g = torch.Generator().manual_seed(1)
+    low = torch.randn(B, C, 14, t_low, generator=g)
+    high = torch.randn(B, C, 9, t_high, generator=g)
+    support = torch.zeros(B, C, K)
+    for i in range(min(C, K)):
+        support[:, i, i] = 1.0
+    valid_mask = torch.ones(B, C, dtype=torch.bool)
+    return {
+        "electrode_tokens": low,
+        "electrode_tokens_high": high,
+        "support": support,
+        "valid_mask": valid_mask,
+    }
+
+
+def test_joint_dual_band_step_dispatches_and_returns_breakdown() -> None:
+    m = _joint_module(_dual_encoder())
+    bd = m._step(_dual_batch())
+    assert isinstance(bd, JointJepaBreakdown)
+    assert bd.phase == "joint"
+    assert torch.isfinite(bd.total) and torch.isfinite(bd.m2_total)
+    assert torch.isfinite(bd.m4_total)
+    assert bd.n_masked_m2 > 0, "no band-masked M2 cells on the dual-band path"
+    assert bd.n_masked_m4 > 0, "no whole-parcel tube cells on the dual-band path"
+    assert bd.n_masked == bd.n_masked_m2 + bd.n_masked_m4
+
+
+def test_joint_dual_band_requires_high_band_in_batch() -> None:
+    m = _joint_module(_dual_encoder())
+    batch = _dual_batch()
+    del batch["electrode_tokens_high"]
+    with pytest.raises(KeyError, match="electrode_tokens_high"):
+        m._step(batch)
+
+
+def test_joint_dual_band_grad_reaches_stem_and_both_predictors() -> None:
+    m = _joint_module(_dual_encoder())
+    bd = m._step(_dual_batch())
+    bd.total.backward()
+    # both band stems get gradient (M2/M4 both flow back through the encoder)
+    low_stem_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in m.student.encoder.patch_stem_low.parameters()
+    )
+    high_stem_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in m.student.encoder.patch_stem_high.parameters()
+    )
+    assert low_stem_grad, "low-band stem got no gradient"
+    assert high_stem_grad, "high-band stem got no gradient"
+    m2_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in m.m2_predictor.parameters())
+    m4_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in m.m4_predictor.parameters())
+    assert m2_grad and m4_grad, "a predictor received no gradient"
+
+
+def test_joint_dual_band_heteroscedastic_m4_runs() -> None:
+    """The locked overnight config: mean|std stem + heteroscedastic M4 (α=0.75).
+    The dual-band M4 loss must pull σ/n from the student taps and stay finite."""
+    enc = _dual_encoder(mean_pool_std=True)
+    m = _joint_module(enc, m4_precision_weight=True, m4_precision_alpha=0.75)
+    bd = m._step(_dual_batch())
+    assert torch.isfinite(bd.total) and torch.isfinite(bd.m4_total)
+    assert bd.n_masked_m4 > 0
+    bd.total.backward()  # precision weight is detached → graph still connects
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in enc.patch_stem_high.parameters())
+
+
+def test_joint_dual_band_m4_predictor_depth_one() -> None:
+    """Overnight config pins SEPARATE predictors: M2 depth 3, M4 depth 1."""
+    m = _joint_module(_dual_encoder(), m2_predictor_depth=3, m4_predictor_depth=1)
+    assert len(m.m2_predictor.blocks) == 3
+    assert len(m.m4_predictor.blocks) == 1
+    # M2 predictor on the dual-band path is the 2-axis (parcel learned + freq
+    # sinusoidal) identity — the flat-S M2 tap is per-parcel, not per-electrode.
+    assert m.m2_predictor.n_identity == m.student.encoder.k_parcels
+    assert m.m2_predictor.id_pos == "learned"
+    assert m.m2_predictor.n_identity_2 == m.student.encoder.n_freq_patches
+    assert m.m2_predictor.id_pos_2 == "sinusoidal"
+    bd = m._step(_dual_batch())
+    assert torch.isfinite(bd.total)

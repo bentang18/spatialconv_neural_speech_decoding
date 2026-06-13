@@ -186,7 +186,7 @@ def _capture_chain_calls(monkeypatch, tmp_path, *, gpus_per_node=4):
     if gpus_per_node > 1:
         args.tasks_per_node = gpus_per_node
         args.slurm_use_srun = True
-    phases = dv._build_v14_chain(args, cross_attn_positions=None)
+    phases = dv._build_v14_chain(args)
     return calls, phases
 
 
@@ -277,7 +277,7 @@ def test_eight_gpu_chain_holds_eff_batch_with_accum_4(monkeypatch, tmp_path) -> 
     ])
     args.tasks_per_node = 8  # mirror main()'s post-parse DDP resolution
     args.slurm_use_srun = True
-    dv._build_v14_chain(args, cross_attn_positions=None)
+    dv._build_v14_chain(args)
     assert len(calls) == 5
     for c in calls[:4]:  # P1, P2, P3a, P3b run multi-GPU DDP
         assert c["gpus_per_node"] == 8

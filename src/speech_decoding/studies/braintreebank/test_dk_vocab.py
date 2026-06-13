@@ -17,6 +17,10 @@ from speech_decoding.studies.braintreebank.anatomy import (
     V14_DK_PARCEL_LABELS,
     V14_DK_PARCEL_LABELS_CORTICAL,
     V14_DK_PARCEL_LABELS_SUBCORTICAL,
+    V14_DKT_PARCEL_LABELS,
+    V14_DKT_PARCEL_LABELS_CORTICAL,
+    V14_DKT_PARCEL_LABELS_SUBCORTICAL,
+    atlas_spec,
     parse_dk_label,
 )
 
@@ -116,3 +120,58 @@ def test_parse_dk_label_rejects_malformed() -> None:
         parse_dk_label("superiortemporal")  # no hemisphere prefix
     with pytest.raises(ValueError, match="unrecognised DK label"):
         parse_dk_label("ctx-zh-bankssts")  # bad hemi prefix
+
+
+# --- DKT (Desikan-Killiany-Tourville) vocabulary ---------------------------- #
+_DKT_DROPPED = {"bankssts", "frontalpole", "temporalpole"}
+
+
+def test_v14_dkt_parcel_labels_has_canonical_length_74() -> None:
+    assert len(V14_DKT_PARCEL_LABELS) == 74
+    assert len(V14_DKT_PARCEL_LABELS_CORTICAL) == 62
+    assert len(V14_DKT_PARCEL_LABELS_SUBCORTICAL) == 12
+    assert (
+        tuple(V14_DKT_PARCEL_LABELS_CORTICAL)
+        + tuple(V14_DKT_PARCEL_LABELS_SUBCORTICAL)
+        == V14_DKT_PARCEL_LABELS
+    )
+
+
+def test_v14_dkt_all_unique() -> None:
+    assert len(set(V14_DKT_PARCEL_LABELS)) == 74
+
+
+def test_v14_dkt_cortical_is_dk_minus_three_dropped_bases() -> None:
+    """DKT = DK aparc bases minus {bankssts, frontalpole, temporalpole}, per hemi."""
+    dk_bases = {s.removeprefix("ctx-lh-") for s in V14_DK_PARCEL_LABELS_CORTICAL
+                if s.startswith("ctx-lh-")}
+    dkt_bases = {s.removeprefix("ctx-lh-") for s in V14_DKT_PARCEL_LABELS_CORTICAL
+                 if s.startswith("ctx-lh-")}
+    assert dkt_bases == dk_bases - _DKT_DROPPED
+    assert len(dkt_bases) == 31
+    # the dropped three never appear under DKT (either hemi)
+    for label in V14_DKT_PARCEL_LABELS_CORTICAL:
+        base = label.removeprefix("ctx-lh-").removeprefix("ctx-rh-")
+        assert base not in _DKT_DROPPED
+
+
+def test_v14_dkt_subcortical_identical_to_dk() -> None:
+    """DKT only re-parcellates cortex; the aseg subcortical 12 are unchanged."""
+    assert V14_DKT_PARCEL_LABELS_SUBCORTICAL == V14_DK_PARCEL_LABELS_SUBCORTICAL
+
+
+def test_atlas_spec_pairs_column_with_vocabulary() -> None:
+    """atlas_spec is the only sanctioned (column, vocab) source — they move together."""
+    dk_col, dk_vocab = atlas_spec("dk")
+    assert dk_col == "DesikanKilliany"
+    assert dk_vocab == V14_DK_PARCEL_LABELS
+    dkt_col, dkt_vocab = atlas_spec("dkt")
+    assert dkt_col == "DKT"
+    assert dkt_vocab == V14_DKT_PARCEL_LABELS
+    # case-insensitive
+    assert atlas_spec("DKT") == atlas_spec("dkt")
+
+
+def test_atlas_spec_rejects_unknown_atlas() -> None:
+    with pytest.raises(ValueError, match="unknown atlas"):
+        atlas_spec("destrieux")

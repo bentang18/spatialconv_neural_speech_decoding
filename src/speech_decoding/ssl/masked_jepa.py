@@ -123,19 +123,19 @@ def _weighted_l1_or_zero(
     return (per_cell * weight).mean()
 
 
-def _m4_precision_weight(
-    precision_std: Tensor,   # (B, K, F_p, T_p) per-cell pooled σ (raw |STFT| std)
-    precision_n: Tensor,     # (B, K) electrode count per parcel
-    target_cell: Tensor,     # (B, N) bool, N = K·F_p·T_p, flat (K outer, F_p, T_p inner)
-    alpha: float,
+def _precision_weight_core(
+    sigma2: Tensor,      # (B, N) per-cell σ² in flat order
+    n_cell: Tensor,      # (B, N) per-cell n_k^α (electrode-count weight, broadcast)
+    target_cell: Tensor, # (B, N) bool, True = scored (masked target) cell
     eps: float,
-    floor_pct: float,        # percentile (0-100) of in-batch scored σ² → shrinkage prior σ²₀
-    cap: float,              # max weight after mean-1 norm (<=0 disables the cap)
+    floor_pct: float,    # percentile (0-100) of in-batch scored σ² → shrinkage prior σ²₀
+    cap: float,          # max weight after mean-1 norm (<=0 disables the cap)
 ) -> Tensor:
     """Shrinkage-regularized inverse-variance precision weight
     ``w = n_k^α / (σ² + σ²₀)`` gathered at the masked cells and normalized to
     mean 1 (DETACHED — σ/n are data-derived, no grad path, and detaching
-    guarantees the model can't inflate σ to dodge its own hard cells).
+    guarantees the model can't inflate σ to dodge its own hard cells). Layout-
+    agnostic: callers flatten their (parcel × …) grid to ``(B, N)`` cells.
 
     ``σ²₀`` is an empirical-Bayes shrinkage prior: the ``floor_pct`` percentile of
     the *scored* σ² in this batch (NOT the bare ``ε``). It pulls degenerate cells
@@ -146,11 +146,6 @@ def _m4_precision_weight(
     σ²₀ auto-recalibrates if the front-end magnitude scale changes. ``cap`` is a
     cheap post-normalization belt-and-suspenders. Mean-1 ⇒ uniform-weight limit
     recovers plain L1."""
-    B, K, F_p, T_p = precision_std.shape
-    N = K * F_p * T_p
-    n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
-    n_cell = n_pow.unsqueeze(-1).unsqueeze(-1).expand(B, K, F_p, T_p).reshape(B, N)
-    sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
     s2_scored = sigma2[target_cell].detach()                # (n_target,)
     if s2_scored.numel() == 0:
         return s2_scored
@@ -165,6 +160,48 @@ def _m4_precision_weight(
         w = w.clamp(max=cap)
         w = w / w.mean().clamp(min=eps)                    # re-normalize after cap
     return w
+
+
+def _m4_precision_weight(
+    precision_std: Tensor,   # (B, K, F_p, T_p) per-cell pooled σ (raw |STFT| std)
+    precision_n: Tensor,     # (B, K) electrode count per parcel
+    target_cell: Tensor,     # (B, N) bool, N = K·F_p·T_p, flat (K outer, F_p, T_p inner)
+    alpha: float,
+    eps: float,
+    floor_pct: float,        # percentile (0-100) of in-batch scored σ² → shrinkage prior σ²₀
+    cap: float,              # max weight after mean-1 norm (<=0 disables the cap)
+) -> Tensor:
+    """Inverse-variance precision weight for the B37 ``(F_p, T_p)`` M4 grid —
+    builds the flat ``(B, N)`` σ²/n cells (K outer, F_p, T_p inner) and delegates
+    to :func:`_precision_weight_core`."""
+    B, K, F_p, T_p = precision_std.shape
+    N = K * F_p * T_p
+    n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
+    n_cell = n_pow.unsqueeze(-1).unsqueeze(-1).expand(B, K, F_p, T_p).reshape(B, N)
+    sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
+    return _precision_weight_core(sigma2, n_cell, target_cell, eps, floor_pct, cap)
+
+
+def _m4_precision_weight_flat(
+    precision_std: Tensor,   # (B, K, S) per-cell pooled σ (raw |STFT| std), flat dual-band S
+    precision_n: Tensor,     # (B, K) electrode count per parcel
+    target_cell: Tensor,     # (B, N) bool, N = K·S, flat (K outer, S inner)
+    alpha: float,
+    eps: float,
+    floor_pct: float,
+    cap: float,
+) -> Tensor:
+    """Inverse-variance precision weight for the 2STFT flat-S M4 latent — builds
+    the flat ``(B, N=K·S)`` σ²/n cells (K outer, S inner) and delegates to
+    :func:`_precision_weight_core`. The whole-parcel tube means a target parcel's
+    σ/n weight is shared across all its ``S`` slots (n is per-parcel; σ varies per
+    slot)."""
+    B, K, S = precision_std.shape
+    N = K * S
+    n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
+    n_cell = n_pow.unsqueeze(-1).expand(B, K, S).reshape(B, N)
+    sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
+    return _precision_weight_core(sigma2, n_cell, target_cell, eps, floor_pct, cap)
 
 
 def p1_frontend_m2_loss(
@@ -454,9 +491,255 @@ def b37_m4_freq_loss(
     )
 
 
+def m2_dual_band_loss(
+    *,
+    predictor: torch.nn.Module,  # JepaPredictor (n_identity = K parcel, n_identity_2 = F_p freq)
+    student_m2: Tensor,   # (B, K, S, d) post-frontend_ln, VISIBLE-only (drop-token) student
+    teacher_m2: Tensor,   # (B, K, S, d) post-frontend_ln, EMA full-input teacher
+    token_mask: Tensor,   # (B, K, S) bool, True = masked (the §5 dual-band sampler)
+    slot_ids: Tensor,     # (S,) long — per-token dual-rate real-time slot (layout["slot"])
+    freq_patch_ids: Tensor,  # (S,) long — per-token freq-patch id / "Hz tag" (layout["freq_patch_idx"])
+    latent_valid: Tensor,  # (B, K) bool — covered parcels (gate context + targets)
+    loss_form: _LossForm = "l1",
+) -> MaskedJepaBreakdown:
+    """2STFT M2 front-end masked JEPA (FE 2STFT §6 — ONE shared predictor).
+
+    The 2STFT M2 tap is a FLAT per-parcel token sequence ``(B, K, S, d)`` (the two
+    STFT bands carry different time rates, so they cannot share an ``(F_p, T_p)``
+    grid — ``S = F_p_low·T_low_p + F_p_high·T_high_p``). The drop-token student
+    encoded the VISIBLE tokens only (masked tokens key-padded out of its
+    token-block self-attention — :meth:`V14ParcelPerceiverModel._forward_dual_band`
+    with ``token_mask``); ``teacher_m2`` is the EMA full-input forward.
+
+    **ONE shared predictor** reconstructs ALL masked slots — both baskets, both
+    rates — in a single call (the §6 "one predictor" lock). Each masked query slot
+    = a learnable mask token + a learned PARCEL tag (``query_id`` ∈ [0, K),
+    unordered anatomy → ``id_pos="learned"``) + a sinusoidal FREQ/"Hz" tag
+    (``query_id_2`` = freq-patch ∈ [0, F_p), ordered → ``id_pos_2="sinusoidal"``;
+    **basket identity is implicit** — low freq-patches index ≤ the low count, high
+    above) + the dual-rate real-time **RoPE** slot (``query_time_ids``, the §4
+    keying, so a low token at time-patch ``t`` and a high token at ``2t`` share
+    rotation). This is structurally :func:`b37_m4_freq_loss` (parcel + freq + time)
+    on the FRONT-END M2 tap with the dual-rate slot in place of a single time grid.
+
+    Target = EMA teacher full-input M2 at the masked slots, post the encoder's own
+    ``frontend_ln`` (canonical V-JEPA target-norm — no separate head), detached
+    (stop-grad). **Pure L1, pooled mean over all masked tokens** (no per-basket
+    normalization — the §5 sampler balances the baskets ~24/24 and L1's per-token
+    gradient is unit regardless of basket). ``latent_valid`` gates BOTH the visible
+    context keys and the targets to COVERED parcels — an uncovered parcel's junk M2
+    (zero-pooled) is never a context key nor a reconstruction target.
+
+    Cost note (NOT silently capped): the context is every covered parcel's full
+    ``S`` visible tokens, so ``n_ctx ≈ K_visible·S`` — heavy at production scale
+    (a ragged-gather optimization is deferred, as in ``b37_m4_freq_loss``). The
+    predictor is discarded after SSL, so this is pretraining wall-clock only.
+    """
+    if student_m2.dim() != 4:
+        raise ValueError(
+            f"student_m2 must be (B, K, S, d); got {tuple(student_m2.shape)}"
+        )
+    if teacher_m2.shape != student_m2.shape:
+        raise ValueError(
+            f"teacher_m2 {tuple(teacher_m2.shape)} != student_m2 "
+            f"{tuple(student_m2.shape)}"
+        )
+    B, K, S, d = student_m2.shape
+    if token_mask.shape != (B, K, S):
+        raise ValueError(
+            f"token_mask {tuple(token_mask.shape)} must be (B, K, S)=({B},{K},{S})"
+        )
+    if latent_valid.shape != (B, K):
+        raise ValueError(
+            f"latent_valid {tuple(latent_valid.shape)} must be (B, K)=({B},{K})"
+        )
+    if slot_ids.shape != (S,) or freq_patch_ids.shape != (S,):
+        raise ValueError(
+            f"slot_ids / freq_patch_ids must be (S,)=({S},); got "
+            f"{tuple(slot_ids.shape)} / {tuple(freq_patch_ids.shape)}"
+        )
+    device = student_m2.device
+    N = K * S
+
+    ctx = student_m2.reshape(B, N, d)               # visible used as keys (kpm below)
+    # Gate by covered parcels: an uncovered parcel's M2 is zero-pooled junk, so
+    # it must be neither a context key nor a target. covered broadcast over S →
+    # per-cell (B, N) in the (K outer, S inner) flat order: flat index i = k·S + s.
+    covered_cell = latent_valid.unsqueeze(-1).expand(B, K, S).reshape(B, N)
+    mask_flat = token_mask.reshape(B, N)
+    target_cell = mask_flat & covered_cell          # True = masked target (covered)
+    visible_cell = (~mask_flat) & covered_cell      # True = visible context (covered)
+
+    # (parcel, freq-patch, slot) ids for the flat (K outer, S inner) order. Parcel
+    # is per-ROW (k) → learned query_id; freq-patch + slot are per-TOKEN (s),
+    # tiled across the K parcels → sinusoidal query_id_2 / RoPE query_time_ids.
+    parcel_ids = (
+        torch.arange(K, device=device).view(K, 1).expand(K, S).reshape(N)
+    )
+    freq_ids = freq_patch_ids.to(device=device).view(1, S).expand(K, S).reshape(N)
+    time_ids = slot_ids.to(device=device).view(1, S).expand(K, S).reshape(N)
+
+    pred = predictor(
+        ctx,
+        context_time_ids=time_ids,
+        query_time_ids=time_ids,
+        query_id=parcel_ids,
+        query_id_2=freq_ids,
+        context_key_padding_mask=~visible_cell,
+        query_valid=target_cell,
+    )                                                # (n_masked, d)
+    target = teacher_m2.reshape(B, N, d)[target_cell].detach()  # (n_masked, d)
+    loss = _l1_or_zero(pred, target, loss_form)
+    return MaskedJepaBreakdown(
+        total=loss, phase="m2_dual_band", n_masked=int(target_cell.sum())
+    )
+
+
+def m4_dual_band_loss(
+    *,
+    predictor: torch.nn.Module,  # M4 predictor (SEPARATE from M2; depth 1 locked config)
+    student_m4: Tensor,   # (B, K, S, d) post-encoder_ln, VISIBLE-PARCEL-only latent
+    teacher_m4: Tensor,   # (B, K, S, d) post-encoder_ln, EMA full-input teacher
+    tubed: Tensor,        # (B, K) bool — True = tubed parcel (whole-parcel M4 target)
+    latent_valid: Tensor, # (B, K) bool — covered parcels (gate context + targets)
+    slot_ids: Tensor,     # (S,) long — per-token dual-rate real-time RoPE slot
+    freq_patch_ids: Tensor,  # (S,) long — per-token freq-patch id / "Hz tag"
+    loss_form: _LossForm = "l1",
+    # Heteroscedastic / inverse-variance precision weighting (OPT-IN; both None →
+    # byte-identical to the plain-L1 path). project_v14_heteroscedastic_ssl_loss.
+    precision_std: tp.Optional[Tensor] = None,  # (B, K, S) pooled σ (raw |STFT| std)
+    precision_n: tp.Optional[Tensor] = None,    # (B, K) electrode count per parcel
+    precision_alpha: float = 1.0,
+    precision_floor_pct: float = _M4_PRECISION_FLOOR_PCT,
+    precision_cap: float = _M4_PRECISION_CAP,
+) -> MaskedJepaBreakdown:
+    """2STFT M4 latent masked JEPA — the WHOLE-PARCEL tube on the flat-S latent.
+
+    The 2STFT M4 tap is a FLAT per-parcel latent sequence ``(B, K, S, d)`` (the
+    parcel-only self-attention output, rate-agnostic — the two STFT bands carry
+    different time rates so they cannot share an ``(F_p, T_p)`` grid;
+    ``S = F_p_low·T_low_p + F_p_high·T_high_p``). This is the dual-band sibling of
+    :func:`b37_m4_freq_loss` (whose latent is ``parcel × freq × time``) — the tube
+    is the ATOMIC PARCEL: a covered parcel is EITHER surviving (whole ``S`` field is
+    context) OR tubed (whole ``S`` field is the target), mutually exclusive. So
+    ``tubed`` is per-parcel ``(B, K)`` (no time axis) — Ben's lock: "M4 tube = whole
+    parcel, all time AND all freq; reconstruct each tubed parcel from the co-located
+    activity of all surviving parcels."
+
+    Drop-token V-JEPA: the visible-parcel-only student encoded M4 of the SURVIVING
+    parcels (tubed parcels excluded from the parcel self-attention upstream —
+    :meth:`V14ParcelPerceiverModel._forward_dual_band` with ``dual_band_parcel_mask``;
+    the tubed rows of ``student_m4`` are junk and are read as NEITHER keys NOR query
+    sources). ``teacher_m4`` is the EMA full-input forward (all parcels). **ONE M4
+    predictor** (separate from M2, depth 1 in the locked config) reads every
+    surviving parcel's full ``S`` field as context and reconstructs every tubed
+    parcel's full ``S`` field. Each masked query slot = a learnable mask token + a
+    learned PARCEL tag (``query_id`` ∈ [0, K), ``id_pos="learned"``) + a sinusoidal
+    FREQ/"Hz" tag (``query_id_2`` = freq-patch, ``id_pos_2="sinusoidal"``; basket
+    identity implicit in the Hz order) + the dual-rate real-time **RoPE** slot
+    (``query_time_ids``). Target = EMA teacher full-input M4 at the tubed slots,
+    post the encoder's own ``encoder_ln`` (canonical V-JEPA target-norm), detached.
+
+    ``latent_valid`` gates BOTH context and targets to COVERED parcels (an uncovered
+    parcel's zero-pooled junk M4 is never a key nor a target). Heteroscedastic
+    precision weighting is opt-in (``precision_std``/``precision_n`` from the encoder
+    taps): both ``None`` → plain pooled-mean L1; both set → inverse-variance weight
+    ``w = n_k^α / (σ² + σ²₀)`` over the scored cells (project_v14_heteroscedastic_ssl_loss).
+
+    Cost note (NOT silently capped): the context is every surviving parcel's full
+    ``S`` tokens, so ``n_ctx ≈ K_visible·S`` — heavy at scale (a ragged-gather
+    optimization is deferred, as in :func:`b37_m4_freq_loss`). The predictor is
+    discarded after SSL → pretraining wall-clock only, never inference.
+    """
+    if student_m4.dim() != 4:
+        raise ValueError(
+            f"student_m4 must be (B, K, S, d); got {tuple(student_m4.shape)}"
+        )
+    if teacher_m4.shape != student_m4.shape:
+        raise ValueError(
+            f"teacher_m4 {tuple(teacher_m4.shape)} != student_m4 "
+            f"{tuple(student_m4.shape)}"
+        )
+    B, K, S, d = student_m4.shape
+    if tubed.shape != (B, K):
+        raise ValueError(f"tubed {tuple(tubed.shape)} must be (B, K)=({B},{K})")
+    if latent_valid.shape != (B, K):
+        raise ValueError(
+            f"latent_valid {tuple(latent_valid.shape)} must be (B, K)=({B},{K})"
+        )
+    if slot_ids.shape != (S,) or freq_patch_ids.shape != (S,):
+        raise ValueError(
+            f"slot_ids / freq_patch_ids must be (S,)=({S},); got "
+            f"{tuple(slot_ids.shape)} / {tuple(freq_patch_ids.shape)}"
+        )
+    device = student_m4.device
+    N = K * S
+
+    ctx = student_m4.reshape(B, N, d)               # surviving used as keys (kpm below)
+    # A covered parcel is EITHER surviving (context) OR tubed (target) — mutually
+    # exclusive. Broadcast each per-parcel bool over S → per-cell (B, N) in the
+    # (K outer, S inner) flat order: flat index i = k·S + s.
+    target_parcel = latent_valid & tubed            # (B, K) tube targets
+    visible_parcel = latent_valid & ~tubed          # (B, K) surviving context
+    target_cell = target_parcel.unsqueeze(-1).expand(B, K, S).reshape(B, N)
+    visible_cell = visible_parcel.unsqueeze(-1).expand(B, K, S).reshape(B, N)
+
+    # (parcel, freq-patch, slot) ids for the flat (K outer, S inner) order. Parcel
+    # is per-ROW (k) → learned query_id; freq-patch + slot are per-TOKEN (s), tiled
+    # across the K parcels → sinusoidal query_id_2 / dual-rate RoPE query_time_ids.
+    parcel_ids = (
+        torch.arange(K, device=device).view(K, 1).expand(K, S).reshape(N)
+    )
+    freq_ids = freq_patch_ids.to(device=device).view(1, S).expand(K, S).reshape(N)
+    time_ids = slot_ids.to(device=device).view(1, S).expand(K, S).reshape(N)
+
+    pred = predictor(
+        ctx,
+        context_time_ids=time_ids,
+        query_time_ids=time_ids,
+        query_id=parcel_ids,
+        query_id_2=freq_ids,
+        context_key_padding_mask=~visible_cell,
+        query_valid=target_cell,
+    )                                                # (n_target, d)
+    target = teacher_m4.reshape(B, N, d)[target_cell].detach()  # (n_target, d)
+    if precision_std is None and precision_n is None:
+        loss = _l1_or_zero(pred, target, loss_form)
+    else:
+        if precision_std is None or precision_n is None:
+            raise ValueError(
+                "precision weighting needs BOTH precision_std and precision_n; got "
+                f"std={precision_std is not None}, n={precision_n is not None}"
+            )
+        if precision_std.shape != (B, K, S):
+            raise ValueError(
+                f"precision_std shape {tuple(precision_std.shape)} != "
+                f"(B, K, S)=({B},{K},{S})"
+            )
+        if precision_n.shape != (B, K):
+            raise ValueError(
+                f"precision_n shape {tuple(precision_n.shape)} != (B, K)=({B},{K})"
+            )
+        weight = _m4_precision_weight_flat(
+            precision_std=precision_std,
+            precision_n=precision_n,
+            target_cell=target_cell,
+            alpha=precision_alpha,
+            eps=_M4_PRECISION_EPS,
+            floor_pct=precision_floor_pct,
+            cap=precision_cap,
+        )
+        loss = _weighted_l1_or_zero(pred, target, weight, loss_form)
+    return MaskedJepaBreakdown(
+        total=loss, phase="m4_dual_band", n_masked=int(target_cell.sum())
+    )
+
+
 __all__ = [
     "MaskedJepaBreakdown",
     "p1_frontend_m2_loss",
     "p2_parcel_m4_loss",
     "b37_m4_freq_loss",
+    "m2_dual_band_loss",
+    "m4_dual_band_loss",
 ]

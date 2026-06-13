@@ -98,13 +98,17 @@ from speech_decoding.ssl.ema import (
 )
 from speech_decoding.ssl.mask import (
     sample_composite_mask,
+    sample_m2_dual_band_mask,
     sample_m2_mask,
     sample_m4_mask,
+    sample_parcel_tube_mask,
     validate_m4_coupling,
 )
 from speech_decoding.ssl.masked_jepa import (
     MaskedJepaBreakdown,
     b37_m4_freq_loss,
+    m2_dual_band_loss,
+    m4_dual_band_loss,
     p1_frontend_m2_loss,
     p2_parcel_m4_loss,
 )
@@ -395,16 +399,39 @@ class V14JointBrainModule(pl.LightningModule):
             # parcel (learned, unordered ``query_id``) + freq (sinusoidal,
             # ordered ``query_id_2``), with time on RoPE (depth 2). Neither is
             # EMA-mirrored.
-            self.m2_predictor = JepaPredictor(
-                encoder.d_model,
-                n_identity=encoder.n_freq_patches,
-                hidden=predictor_hidden,
-                n_heads=predictor_n_heads,
-                depth=m2_predictor_depth,
-                max_time_patches=encoder.max_n_time_patches,
-                ragged_predictor=ragged_predictor,
-                id_pos=freq_id_pos,
-            )
+            #
+            # 2STFT dual-band M2 (per_band_stem): the M2 tap is a FLAT per-parcel
+            # token sequence (B, K, S) — NOT a per-electrode (B, C, F_p, T_p)
+            # grid — so its predictor needs the SAME 2-axis identity as M4: parcel
+            # (learned ``query_id`` ∈ [0, K)) + freq-patch (sinusoidal
+            # ``query_id_2`` ∈ [0, F_p), basket implicit in the Hz order) + the
+            # dual-rate slot on RoPE (spec §6). The single-grid B37 M2 is instead
+            # per-electrode freq-only (identity = freq-patch). max_time_patches
+            # covers the high-band common-grid slot (T_high_p ≤ max_n_time_patches).
+            if encoder.per_band_stem:
+                self.m2_predictor = JepaPredictor(
+                    encoder.d_model,
+                    n_identity=encoder.k_parcels,          # parcel (learned)
+                    hidden=predictor_hidden,
+                    n_heads=predictor_n_heads,
+                    depth=m2_predictor_depth,
+                    max_time_patches=encoder.max_n_time_patches,
+                    ragged_predictor=ragged_predictor,
+                    id_pos="learned",
+                    n_identity_2=encoder.n_freq_patches,    # freq (sinusoidal)
+                    id_pos_2="sinusoidal",
+                )
+            else:
+                self.m2_predictor = JepaPredictor(
+                    encoder.d_model,
+                    n_identity=encoder.n_freq_patches,
+                    hidden=predictor_hidden,
+                    n_heads=predictor_n_heads,
+                    depth=m2_predictor_depth,
+                    max_time_patches=encoder.max_n_time_patches,
+                    ragged_predictor=ragged_predictor,
+                    id_pos=freq_id_pos,
+                )
             self.m4_predictor = JepaPredictor(
                 encoder.d_model,
                 n_identity=encoder.k_parcels,          # parcel (learned)
@@ -740,6 +767,19 @@ class V14JointBrainModule(pl.LightningModule):
         if "valid_mask" in batch_data:
             kwargs["valid_mask"] = batch_data["valid_mask"]
 
+        # 2STFT dual-band frontend (per_band_stem): ``electrode_tokens`` is the LOW
+        # band and the batch MUST also carry the HIGH band. Thread it into every
+        # forward (student + teacher); the single-grid path never sets it and the
+        # encoder rejects a stray high band when per_band_stem is off.
+        if self.student.encoder.per_band_stem:
+            if "electrode_tokens_high" not in batch_data:
+                raise KeyError(
+                    "per_band_stem=True (2STFT) but the batch is missing "
+                    "'electrode_tokens_high'; the dual-band data pipeline must "
+                    "emit BOTH the low band ('electrode_tokens') and the high band."
+                )
+            kwargs["electrode_tokens_high"] = batch_data["electrode_tokens_high"]
+
         # Per-clip conditioning is looked up by the encoder itself; the
         # cross_attn encoder forward tolerates ``None``. Trailing
         # NeuralSet-collated singleton axes get stripped to match the
@@ -966,7 +1006,14 @@ class V14JointBrainModule(pl.LightningModule):
         tubed + uncovered parcels from the per-parcel predictor batch); the M4
         loss reconstructs the TUBED parcels' full (freq, time) field from the
         surviving parcels' visible context.
+
+        In 2STFT mode (``per_band_stem``) the M2 tap is a flat per-parcel token
+        sequence (the two STFT bands carry different time rates) and the masks are
+        the dual-band §5/§6 ones, so this dispatches to
+        :meth:`_joint_step_dual_band`.
         """
+        if self.student.encoder.per_band_stem:
+            return self._joint_step_dual_band(batch_data)
         student_kwargs = self._extract_student_kwargs(batch_data)
         token_mask, parcel_time_mask = self._sample_composite_mask(
             electrode_tokens=student_kwargs["electrode_tokens"],
@@ -1020,6 +1067,150 @@ class V14JointBrainModule(pl.LightningModule):
             teacher_m4=teacher_taps["M4"],
             visible=visible_pt,
             target_mask=target_pt,
+            loss_form=self._loss_form,
+            precision_std=precision_std,
+            precision_n=precision_n,
+            precision_alpha=self._m4_precision_alpha,
+            precision_floor_pct=self._m4_precision_floor_pct,
+            precision_cap=self._m4_precision_cap,
+        )
+        total = m2_bd.total + self._lambda_m4 * m4_bd.total
+        return JointJepaBreakdown(
+            total=total,
+            m2_total=m2_bd.total,
+            m4_total=m4_bd.total,
+            n_masked_m2=m2_bd.n_masked,
+            n_masked_m4=m4_bd.n_masked,
+            lambda_m4=self._lambda_m4,
+        )
+
+    def _sample_dual_band_mask(
+        self, *, electrode_tokens_high: Tensor, support: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """2STFT §5/§6 composite mask for the dual-band joint step.
+
+        Returns ``(dual_band_token_mask (B, K, S), dual_band_parcel_mask (B, K))``:
+        the per-parcel flat-S M2 front-end mask (low freq-block tube + high
+        time-block tube, sampled independently per parcel) and the whole-parcel M4
+        tube (the atomic-parcel target — Ben 2026-06-13). The tube is drawn with
+        ``n_time_patches=1`` (the parcel is the unit; no time axis) and reduced to
+        ``(B, K)``. Same per-step ``(mask_seed, global_step)`` determinism as
+        :meth:`_sample_composite_mask`.
+        """
+        device = electrode_tokens_high.device
+        F_p_low, T_low_p, F_p_high, T_high_p = (
+            self.student.encoder.dual_band_grid_shape(electrode_tokens_high)
+        )
+        B = electrode_tokens_high.shape[0]
+        try:
+            step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            step = 0
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self._mask_seed + step)
+        K = self.student.encoder.k_parcels
+        token_mask = sample_m2_dual_band_mask(
+            B, K,
+            F_p_low=F_p_low, T_low_p=T_low_p,
+            F_p_high=F_p_high, T_high_p=T_high_p,
+            generator=gen, device=device,
+        )
+        # Whole-parcel M4 tube: parcel is the atomic unit → n_time_patches=1, then
+        # squeeze the time axis to the (B, K) per-parcel tube selection (coverage +
+        # n_min_visible respected by the sampler).
+        parcel_time_mask, _drop = sample_parcel_tube_mask(
+            support,
+            n_time_patches=1,
+            mask_ratio=self._m4_mask_ratio,
+            n_min_visible=self._m4_n_min_visible,
+            generator=gen,
+        )
+        parcel_mask = parcel_time_mask[..., 0]                  # (B, K)
+        return token_mask, parcel_mask
+
+    def _joint_step_dual_band(self, batch_data: dict[str, Tensor]) -> JointJepaBreakdown:
+        """2STFT dual-band joint masked-JEPA step (§5/§6 + Ben's 2026-06-13 M4
+        whole-parcel tube) — the per_band_stem sibling of :meth:`_joint_step`.
+
+        ONE masked student forward (visible-token / visible-parcel) over the two
+        STFT bands → M2 (flat per-parcel token sequence) + M4 (parcel-only latent)
+        taps; ONE full-input EMA-teacher forward → targets; scored by the two
+        SEPARATE predictors (``total = L_M2 + λ·L_M4``). The M2 mask is a flat
+        ``(B, K, S)`` band mask sampled per parcel; the M4 mask is a whole-parcel
+        ``(B, K)`` tube. The dual-rate token geometry (slot / freq-patch ids) comes
+        from the encoder's :meth:`dual_band_token_layout` so the predictor's RoPE
+        slot + sinusoidal Hz tag align 1:1 with the encoder's token order.
+
+        M2 reconstructs the band-masked slots of SURVIVING (covered, non-tubed)
+        parcels from their own visible slots (``latent_valid=visible_parcels``);
+        M4 reconstructs the TUBED parcels' full S field from the surviving parcels'
+        co-located activity (``latent_valid=covered``, ``tubed=tubed``).
+        """
+        student_kwargs = self._extract_student_kwargs(batch_data)
+        et_high = student_kwargs["electrode_tokens_high"]
+        token_mask, parcel_mask = self._sample_dual_band_mask(
+            electrode_tokens_high=et_high,
+            support=student_kwargs["support"],
+        )
+
+        # ── ONE student forward (masked / visible-only), both taps. The dual-band
+        # masks are passed ONLY to the student (NOT folded into student_kwargs), so
+        # the teacher's copy stays full-input (B7). ──
+        student_taps = self._call_student(
+            **student_kwargs,
+            dual_band_token_mask=token_mask,
+            dual_band_parcel_mask=parcel_mask,
+            m2_only=False,
+        )
+        # ── ONE teacher forward (FULL input — no mask). B26 / B7. ──
+        teacher_taps = self._teacher_forward(dict(student_kwargs), m2_only=False)
+
+        # Per-token dual-rate geometry (pure geometry — same call the encoder made
+        # internally, so slot/freq ids align with the M2/M4 token order).
+        _F_p_low, T_low_p, _F_p_high, T_high_p = (
+            self.student.encoder.dual_band_grid_shape(et_high)
+        )
+        layout = self.student.encoder.dual_band_token_layout(
+            T_low_p, T_high_p, device=et_high.device,
+        )
+        slot_ids = layout["slot"]
+        freq_patch_ids = layout["freq_patch_idx"]
+
+        # Three-way parcel split: surviving (M2 + M4 context) vs tubed (M4 target)
+        # vs uncovered. ``covered`` is the encoder's OWN coverage mask.
+        covered = student_taps["latent_valid"]                 # (B, K) bool
+        tubed = parcel_mask & covered                          # covered tube targets
+        visible_parcels = covered & ~parcel_mask               # surviving (M2 + M4 ctx)
+
+        # M2: band reconstruction on SURVIVING parcels only (tubed + uncovered are
+        # gated out of context AND targets by latent_valid=visible_parcels — a
+        # tubed parcel has no visible token to predict from).
+        m2_bd = m2_dual_band_loss(
+            predictor=self.m2_predictor,
+            student_m2=student_taps["M2"],
+            teacher_m2=teacher_taps["M2"],
+            token_mask=token_mask,
+            slot_ids=slot_ids,
+            freq_patch_ids=freq_patch_ids,
+            latent_valid=visible_parcels,
+            loss_form=self._loss_form,
+        )
+        # M4: whole-parcel tube reconstruction from surviving parcels' context.
+        # Heteroscedastic precision (opt-in): σ/n are mask-independent properties
+        # of the raw pool → take them from the student taps.
+        precision_std = None
+        precision_n = None
+        if self._m4_precision_weight:
+            precision_std = student_taps["M4_precision_std"]
+            precision_n = student_taps["M4_precision_n"]
+        m4_bd = m4_dual_band_loss(
+            predictor=self.m4_predictor,
+            student_m4=student_taps["M4"],
+            teacher_m4=teacher_taps["M4"],
+            tubed=tubed,
+            latent_valid=covered,
+            slot_ids=slot_ids,
+            freq_patch_ids=freq_patch_ids,
             loss_form=self._loss_form,
             precision_std=precision_std,
             precision_n=precision_n,

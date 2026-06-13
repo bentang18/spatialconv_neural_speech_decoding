@@ -1025,6 +1025,34 @@ class V14ParcelPerceiverModel(nn.Module):
         # → Conv2d(2→d) with the std-channel weights ZERO-INIT (no-op at init,
         # gradient still flows since σ≠0). Inert on the cross_attn path.
         mean_pool_std: bool = False,
+        # 2STFT dual-band front end (PROVISIONAL, reports/fe_2stft_handoff_
+        # 2026_06_12.md §3b/§4). When True (requires pool="mean"), the encoder
+        # consumes TWO single-band STFT inputs (low + high) instead of one F=50
+        # grid: each band is electrode→parcel mean-pooled, runs its OWN Conv2d
+        # patch stem (low kernel (2,1), high (3,2)), and the two bands' tokens
+        # are unioned into ONE per-parcel freq×time token block with dual-rate
+        # RoPE (§4: low on every-other 62.5 ms slot, high on every slot). This is
+        # the FRONT-END only (§9): it returns the M2 tap (post-token-block,
+        # post-frontend_ln) and STOPS before the latent stack — the latent
+        # dual-rate reconciliation is out of scope. Default OFF → byte-identical
+        # to the single-grid mean-pool path. Off-path falsifier = R-fe-single-stft.
+        per_band_stem: bool = False,
+        # 2STFT band geometry (only consulted when per_band_stem=True). Spec
+        # defaults: low 14 bins (k1..k14) / kernel (2,1) → 7 freq-patches @ 8 Hz;
+        # high 9 bins (k4..k12) / kernel (3,2) → 3 freq-patches @ 16 Hz. The
+        # kernels are exposed so the §7 falsifier sisters (R-hg-fk1/R-hg-tk1/...)
+        # can re-point them. ``band_*_n_time_bins`` are the per-band MAX STFT
+        # frame counts (low 1+L//256, high 1+L//64) used to size the dual-rate
+        # RoPE table; default = a 1 s clip (9 / 33). The dispatch passes the real
+        # clip-length maxima.
+        band_low_n_freq_bins: int = 14,
+        band_high_n_freq_bins: int = 9,
+        band_low_kernel_freq: int = 2,
+        band_low_kernel_time: int = 1,
+        band_high_kernel_freq: int = 3,
+        band_high_kernel_time: int = 2,
+        band_low_n_time_bins: int = 9,
+        band_high_n_time_bins: int = 33,
     ) -> None:
         super().__init__()
         if pool not in ("mean", "cross_attn"):
@@ -1066,38 +1094,86 @@ class V14ParcelPerceiverModel(nn.Module):
             patch_stride_freq = patch_kernel_freq
         if patch_stride_time is None:
             patch_stride_time = patch_kernel_time
-        self.patch_stem = _PatchStem(
-            d_model,
-            kernel_freq=patch_kernel_freq,
-            kernel_time=patch_kernel_time,
-            stride_freq=patch_stride_freq,
-            stride_time=patch_stride_time,
-            # B37+ RGB-style mean|std → 2-channel stem on the mean path. Safe to
-            # branch in_channels on ``mean_pool_std`` here because the cross_attn
-            # forward (which feeds a 1-channel (B,C,F,T) input) is never reached
-            # when pool=="mean"; F_p/T_p depend only on kernel/stride, not Cin.
-            in_channels=2 if self.mean_pool_std else 1,
-        )
-        # FE-RAW-1 (2026-06-04): the raw |STFT| front end (kernel_freq=5, the
-        # default) requires exactly F=50 bins so the patch stem tiles it
-        # leftover-free into F_p=10. A mismatch is a front-end/encoder wiring
-        # bug (e.g. an F=30 filterbank fed under the kernel-5 default).
-        if patch_kernel_freq == 5 and n_freq_bins != 50:
-            raise ValueError(
-                f"FE-RAW-1 raw front end (patch_kernel_freq=5) requires "
-                f"n_freq_bins=50; got {n_freq_bins}. Pass patch_kernel_freq=3 "
-                f"for the F=30 const-Q filterbank sister."
+        self.per_band_stem = bool(per_band_stem)
+        if self.per_band_stem:
+            # 2STFT dual-band front end (§3b): TWO single-band Conv2d stems
+            # instead of one F=50 grid. ``in_channels`` follows ``mean_pool_std``
+            # (the mean|std RGB-style stem, B37). The single-grid ``patch_stem``
+            # is None — never built so there are no dead, undecayed-but-untrained
+            # params (a DDP unused-param hazard); the single-grid forward paths
+            # that read ``self.patch_stem`` are unreachable when per_band_stem.
+            if pool != "mean":
+                raise ValueError(
+                    "per_band_stem=True requires pool='mean' (the 2STFT front end "
+                    "is the B37 mean-pool path; the cross_attn pool is single-grid)"
+                )
+            in_ch = 2 if self.mean_pool_std else 1
+            self.patch_stem = None
+            self.patch_stem_low = _PatchStem(
+                d_model, kernel_freq=band_low_kernel_freq,
+                kernel_time=band_low_kernel_time, in_channels=in_ch,
             )
-        n_freq_patches = self.patch_stem.n_freq_patches(n_freq_bins)
-        max_n_time_patches = self.patch_stem.n_time_patches(max_seq_len)
-        if n_freq_patches < 1 or max_n_time_patches < 1:
-            raise ValueError(
-                f"patch stem produced degenerate output: n_freq_patches="
-                f"{n_freq_patches}, max_n_time_patches={max_n_time_patches} "
-                f"for n_freq_bins={n_freq_bins}, max_seq_len={max_seq_len}, "
-                f"kernel=({patch_kernel_freq},{patch_kernel_time}), stride="
-                f"({patch_stride_freq},{patch_stride_time})"
+            self.patch_stem_high = _PatchStem(
+                d_model, kernel_freq=band_high_kernel_freq,
+                kernel_time=band_high_kernel_time, in_channels=in_ch,
             )
+            self.band_low_n_freq_bins = int(band_low_n_freq_bins)
+            self.band_high_n_freq_bins = int(band_high_n_freq_bins)
+            F_p_low = self.patch_stem_low.n_freq_patches(self.band_low_n_freq_bins)
+            F_p_high = self.patch_stem_high.n_freq_patches(self.band_high_n_freq_bins)
+            # Per-band MAX time-patch counts size the dual-rate RoPE table (§4).
+            max_T_low_p = self.patch_stem_low.n_time_patches(int(band_low_n_time_bins))
+            max_T_high_p = self.patch_stem_high.n_time_patches(int(band_high_n_time_bins))
+            if min(F_p_low, F_p_high, max_T_low_p, max_T_high_p) < 1:
+                raise ValueError(
+                    f"2STFT band stems produced a degenerate grid: F_p_low={F_p_low}, "
+                    f"F_p_high={F_p_high}, max_T_low_p={max_T_low_p}, "
+                    f"max_T_high_p={max_T_high_p}"
+                )
+            self.F_p_low = F_p_low
+            self.F_p_high = F_p_high
+            self.max_T_low_p = max_T_low_p
+            self.max_T_high_p = max_T_high_p
+            # F_p is the TOTAL freq-patch count (low + high) — the freq_embed /
+            # mask freq dims "re-point, do not re-size" (spec §2: still 10).
+            n_freq_patches = F_p_low + F_p_high
+            # ``max_n_time_patches`` (used to size the single-grid RoPE buffers
+            # below, which are harmless-but-unused on the dual-band path) is the
+            # larger band's patch count.
+            max_n_time_patches = max(max_T_low_p, max_T_high_p)
+        else:
+            self.patch_stem = _PatchStem(
+                d_model,
+                kernel_freq=patch_kernel_freq,
+                kernel_time=patch_kernel_time,
+                stride_freq=patch_stride_freq,
+                stride_time=patch_stride_time,
+                # B37+ RGB-style mean|std → 2-channel stem on the mean path. Safe to
+                # branch in_channels on ``mean_pool_std`` here because the cross_attn
+                # forward (which feeds a 1-channel (B,C,F,T) input) is never reached
+                # when pool=="mean"; F_p/T_p depend only on kernel/stride, not Cin.
+                in_channels=2 if self.mean_pool_std else 1,
+            )
+            # FE-RAW-1 (2026-06-04): the raw |STFT| front end (kernel_freq=5, the
+            # default) requires exactly F=50 bins so the patch stem tiles it
+            # leftover-free into F_p=10. A mismatch is a front-end/encoder wiring
+            # bug (e.g. an F=30 filterbank fed under the kernel-5 default).
+            if patch_kernel_freq == 5 and n_freq_bins != 50:
+                raise ValueError(
+                    f"FE-RAW-1 raw front end (patch_kernel_freq=5) requires "
+                    f"n_freq_bins=50; got {n_freq_bins}. Pass patch_kernel_freq=3 "
+                    f"for the F=30 const-Q filterbank sister."
+                )
+            n_freq_patches = self.patch_stem.n_freq_patches(n_freq_bins)
+            max_n_time_patches = self.patch_stem.n_time_patches(max_seq_len)
+            if n_freq_patches < 1 or max_n_time_patches < 1:
+                raise ValueError(
+                    f"patch stem produced degenerate output: n_freq_patches="
+                    f"{n_freq_patches}, max_n_time_patches={max_n_time_patches} "
+                    f"for n_freq_bins={n_freq_bins}, max_seq_len={max_seq_len}, "
+                    f"kernel=({patch_kernel_freq},{patch_kernel_time}), stride="
+                    f"({patch_stride_freq},{patch_stride_time})"
+                )
         self.n_freq_patches = n_freq_patches
         self.max_n_time_patches = max_n_time_patches
 
@@ -1182,13 +1258,23 @@ class V14ParcelPerceiverModel(nn.Module):
         # _PlainMultiHeadSelfAttentionRoPE indexer (which slices `[:T]`)
         # Just Works on shorter T_p < max_n_time_patches at forward time.
         base_rope = _rope_freqs(head_dim, max_n_time_patches)  # (2, max_T_p, head_dim)
-        flat_pos = torch.arange(n_freq_patches * max_n_time_patches)
-        time_patch_idx = flat_pos // n_freq_patches            # i // F_p
-        tiled_rope = base_rope[:, time_patch_idx, :]
-        self.register_buffer("rope_joint_token", tiled_rope, persistent=False)
+        if not self.per_band_stem:
+            flat_pos = torch.arange(n_freq_patches * max_n_time_patches)
+            time_patch_idx = flat_pos // n_freq_patches        # i // F_p
+            tiled_rope = base_rope[:, time_patch_idx, :]
+            self.register_buffer("rope_joint_token", tiled_rope, persistent=False)
+        else:
+            # 2STFT (§4): the two bands carry DIFFERENT time-patch counts
+            # (low 8 / high 16 per 1 s), so a single ``i // F_p`` tiling is
+            # meaningless. The dual-band forward instead RE-KEYS each token to
+            # the common 62.5 ms grid and gathers ``key_rope`` per token at
+            # forward time (``_dual_band_token_rope``). No pre-tiled buffer.
+            self.rope_joint_token = None  # type: ignore[assignment]
         # RoPE table for the latent stack time-SA (per recipe §1, RoPE on
         # latent-stack time axis Q+K). This table is indexed in T_p
         # (post-patch frame count) since the latent stack operates over T_p.
+        # In 2STFT mode it is the common 62.5 ms-grid table the dual-rate
+        # re-key gathers from (max_T_high_p slots).
         self.register_buffer("key_rope", base_rope, persistent=False)
 
         # FE-04: N=6 JOINT (t_p·f_p) self-attention token blocks per electrode.
@@ -1350,6 +1436,12 @@ class V14ParcelPerceiverModel(nn.Module):
         ``(B, C, T_bins, F_bins)`` (or ``(B, C, F_bins, T_bins)`` under
         ``time_last_input``); returns the post-patch ``(C, F_p, T_p)``.
         """
+        if self.per_band_stem:
+            raise NotImplementedError(
+                "patch_grid_shape is single-grid; the 2STFT dual-band frontend "
+                "has no single (C, F_p, T_p) grid — use dual_band_token_layout."
+            )
+        assert self.patch_stem is not None  # non-None on the single-grid path
         if self.time_last_input:
             _B, C, _F, T = electrode_tokens.shape
         else:
@@ -1374,7 +1466,11 @@ class V14ParcelPerceiverModel(nn.Module):
     # and the RoPE tables are buffers (no grad) and never appear here.
     _FRONTEND_PARAM_TOPS: tp.ClassVar[frozenset[str]] = frozenset(
         {"patch_stem", "freq_embed", "token_blocks", "frontend_ln",
-         "subtype_embed", "ref_embed"}
+         "subtype_embed", "ref_embed",
+         # 2STFT dual-band stems (per_band_stem). Both replace the single
+         # ``patch_stem`` (which is None in that mode); they sit on the
+         # front-end side of the staging split, same as ``patch_stem``.
+         "patch_stem_low", "patch_stem_high"}
     )
     _PARCEL_PARAM_TOPS: tp.ClassVar[frozenset[str]] = frozenset(
         {"cross_attns", "latent_blocks", "latent_parcel_blocks", "encoder_ln",
@@ -1598,6 +1694,82 @@ class V14ParcelPerceiverModel(nn.Module):
         # (R, k_run, d) → (B, F_p, T_p, k_run, d) → (B, k_run, F_p, T_p, d).
         return z.reshape(B, F_p, T_p, k_run, d).permute(0, 3, 1, 2, 4)
 
+    def _parcel_latent_flat(
+        self,
+        m2: Tensor,            # (B, K, S, d) — flat dual-band frontend_ln tap
+        latent_valid: Tensor,  # (B, K) bool — visible (covered & ~tubed) parcels
+        use_ckpt: bool,
+    ) -> Tensor:
+        """Flat-S analogue of :meth:`_parcel_latent` for the 2STFT dual-band tap.
+
+        The dual-band M2 tap is a FLAT per-parcel token sequence ``(B, K, S, d)``
+        (``S = S_low + S_high``); the two bands carry different time rates so the
+        tokens do NOT factor into a single ``(F_p, T_p)`` grid. The JOINT
+        parcel×time latent RoPE-keys one shared time axis, so it has no clean
+        grid here and is unsupported — only the parcel-SA-only mode applies. That
+        mode folds the per-parcel token axis ``S`` into the batch and attends over
+        the parcel axis ``K`` ALONE (rate-agnostic), carrying the dual-rate flat
+        sequence untouched and producing the SAME ``(B, K, S, d)`` M4 shape. #112
+        ragged gather/scatter mirrors the 5D path (visible parcels packed to a
+        per-batch-max ``Kk``, blocks run over ``Kk``, kept parcels scattered back;
+        dropped/pad parcels → 0, never read downstream).
+        """
+        if self.latent_mode == "joint":
+            raise NotImplementedError(
+                "2STFT dual-band latent supports latent_mode='parcel' only: the "
+                "joint parcel×time latent RoPE-keys a single time axis, which the "
+                "dual-rate flat token sequence has no clean (F_p, T_p) grid for."
+            )
+        B, K, S, d = m2.shape
+        keep_idx: Optional[Tensor] = None
+        keep_real: Optional[Tensor] = None
+        if self.ragged_parcel:
+            keep_idx, keep_real, Kk = _ragged_gather_idx(latent_valid)
+            gi = keep_idx.view(B, Kk, 1, 1).expand(B, Kk, S, d)
+            m2 = torch.gather(m2, 1, gi)                     # (B, Kk, S, d)
+            valid = keep_real                                # (B, Kk) real|pad
+        else:
+            valid = latent_valid                             # (B, K)
+
+        z = self._latent_attn_parcel_flat(m2, valid, use_ckpt)
+        # z: (B, k_run, S, d), k_run = Kk (ragged) or K (dense).
+
+        if not self.ragged_parcel:
+            return z.contiguous()
+
+        assert keep_idx is not None and keep_real is not None  # ragged_parcel branch
+        Kk = keep_idx.shape[1]
+        scatter_idx = torch.where(
+            keep_real, keep_idx, torch.full_like(keep_idx, K)
+        ).view(B, Kk, 1, 1).expand(B, Kk, S, d)
+        scratch = z.new_zeros(B, K + 1, S, d)
+        scratch.scatter_(1, scatter_idx, z)
+        return scratch[:, :K, :, :].contiguous()
+
+    def _latent_attn_parcel_flat(
+        self, m2: Tensor, valid: Tensor, use_ckpt: bool
+    ) -> Tensor:
+        """Flat-S analogue of :meth:`_latent_attn_parcel`. ``m2`` (B, k_run, S, d),
+        ``valid`` (B, k_run) → ``z`` (B, k_run, S, d). The per-parcel token axis
+        ``S`` rides in the batch dim (never attended); the bidirectional
+        ``pmask_b`` excludes masked parcels as both query and key, so a visible
+        parcel attends to exactly the visible set."""
+        B, k_run, S, d = m2.shape
+        r = B * S
+        # (B,k_run,S,d) → (B,S,k_run,d) → (R, k_run, d).
+        z = m2.permute(0, 2, 1, 3).reshape(r, k_run, d)
+        pmask_b = valid.unsqueeze(2) & valid.unsqueeze(1)               # (B,k,k)
+        attn_mask = (
+            pmask_b.unsqueeze(1).expand(B, S, k_run, k_run).reshape(r, k_run, k_run)
+        )                                                              # (R,k,k)
+        for block in self.latent_parcel_blocks:
+            if use_ckpt:
+                z = checkpoint(block, z, attn_mask, use_reentrant=False)
+            else:
+                z = block(z, attn_mask)
+        # (R, k_run, d) → (B, S, k_run, d) → (B, k_run, S, d).
+        return z.reshape(B, S, k_run, d).permute(0, 2, 1, 3)
+
     def _latent_attn_joint(
         self,
         m2: Tensor,                    # (B, k_run, F_p, T_p, d)
@@ -1655,6 +1827,355 @@ class V14ParcelPerceiverModel(nn.Module):
                 x = block(x, rope, key_mask)
         # (B·F_p, k_run·T_p, d) → (B, F_p, k_run, T_p, d) → (B, k_run, F_p, T_p, d).
         return x.reshape(B, F_p, k_run, T_p, d).permute(0, 2, 1, 3, 4)
+
+    # ------------------------------------------------------------------ #
+    # 2STFT dual-band FRONTEND (per_band_stem, spec §3b/§4). Two STFT bands
+    # at DIFFERENT latent rates (low 8 Hz / high 16 Hz) are mean|std-pooled
+    # per parcel, stemmed separately, and UNIONED into one per-parcel flat
+    # token sequence with dual-rate real-time RoPE. Stops at the M2 tap; the
+    # latent stack that would reconcile the two rates onto a common grid is
+    # OUT OF SCOPE (spec §9). See reports/fe_2stft_handoff_2026_06_12.md.
+    # ------------------------------------------------------------------ #
+    def _dual_band_low_t_patches(self, t_high_p: int) -> int:
+        """Low-band time-patch count reconciled to the common 62.5 ms grid.
+
+        The high band (tk=2, stride-2) absorbs the STFT centre-pad boundary
+        frame and lands on exactly ``t_high_p = 16·sec`` patches (an EVEN
+        count). The low band (tk=1) does NOT absorb it, so its raw conv output
+        carries one trailing boundary patch (``8·sec + 1``). The dual-rate grid
+        closes only when ``t_high_p == 2·t_low_p``, so the canonical low count
+        is ``t_high_p // 2`` and the trailing low patch is trimmed (it sits at
+        real time ``sec·1000 ms``, past the last high slot — it has no high
+        counterpart). Requiring an even ``t_high_p`` surfaces a mis-framed clip
+        loudly rather than silently shearing the grid.
+        """
+        if t_high_p % 2 != 0:
+            raise ValueError(
+                f"2STFT high-band time-patch count must be even (the low band "
+                f"keys to every other high slot); got t_high_p={t_high_p}"
+            )
+        return t_high_p // 2
+
+    def dual_band_token_layout(
+        self, t_low_p: int, t_high_p: int, device: tp.Any = None,
+    ) -> dict[str, Tensor]:
+        """Per-token geometry of the unioned 2STFT token sequence (§4).
+
+        The flat sequence is ``[low block | high block]``; each block is
+        flattened time-patch OUTER / freq-patch INNER (matching the single-grid
+        ``rope_joint_token`` convention). For a sequence of ``S = S_low +
+        S_high`` tokens (``S_low = F_p_low·t_low_p``, ``S_high =
+        F_p_high·t_high_p``) returns 1-D ``(S,)`` tensors:
+
+        * ``slot``  — common 62.5 ms-grid index (low time-patch ``t`` → ``2t``,
+          high time-patch ``t`` → ``t``). Keys the dual-rate RoPE so a low and a
+          high token at the same real time share rotation (acceptance §8.5).
+        * ``freq_patch_idx`` — index into the size-``F_p`` ``freq_embed`` table
+          (low patches 0..F_p_low-1, high patches F_p_low..F_p-1 — "re-point,
+          not re-size").
+        * ``t_idx`` — the band-native time-patch index (low in [0,t_low_p),
+          high in [0,t_high_p)).
+        * ``is_high`` — bool, True on the high block (basket identity; the §5
+          mask sampler + §6 predictor Hz tag key off it).
+
+        Pure geometry — reused by the mask sampler (§5) and the SSL predictor
+        query builder (§6); the forward consumes only ``slot``.
+        """
+        f_low, f_high = self.F_p_low, self.F_p_high
+        s_low = f_low * t_low_p
+        s_high = f_high * t_high_p
+        ar_low = torch.arange(s_low, device=device)
+        ar_high = torch.arange(s_high, device=device)
+        # low token i → time-patch i // f_low, freq-patch i % f_low, slot 2·t.
+        low_t = ar_low // f_low
+        low_f = ar_low % f_low
+        # high token j → time-patch j // f_high, freq-patch j % f_high, slot t.
+        high_t = ar_high // f_high
+        high_f = ar_high % f_high
+        slot = torch.cat([2 * low_t, high_t])
+        freq_patch_idx = torch.cat([low_f, f_low + high_f])
+        t_idx = torch.cat([low_t, high_t])
+        is_high = torch.cat([
+            torch.zeros(s_low, dtype=torch.bool, device=device),
+            torch.ones(s_high, dtype=torch.bool, device=device),
+        ])
+        return {
+            "slot": slot,
+            "freq_patch_idx": freq_patch_idx,
+            "t_idx": t_idx,
+            "is_high": is_high,
+            "S_low": torch.tensor(s_low, device=device),
+        }
+
+    def dual_band_grid_shape(
+        self, electrode_tokens_high: Tensor,
+    ) -> tuple[int, int, int, int]:
+        """2STFT analogue of :meth:`patch_grid_shape` — the post-stem token grid
+        ``(F_p_low, T_low_p, F_p_high, T_high_p)`` for a batch.
+
+        Lets the SSL trainer size the §5 dual-band M2 mask ``(B, K, S)`` (via
+        :func:`sample_m2_dual_band_mask`) and build the §4 token layout (slot /
+        freq-patch ids via :meth:`dual_band_token_layout`) without re-deriving the
+        per-band stem arithmetic. ``electrode_tokens_high`` is the raw HIGH-band
+        ``(B, C, F_high, T_high)`` (freq-major). ``T_high_p`` drives the common
+        62.5 ms grid; ``T_low_p = T_high_p // 2`` is the boundary-trimmed
+        reconciliation (:meth:`_dual_band_low_t_patches`). The bands' freq-patch
+        counts are the fixed init-time ``F_p_low`` / ``F_p_high``.
+        """
+        if not self.per_band_stem:
+            raise NotImplementedError(
+                "dual_band_grid_shape is the 2STFT dual-band path; it requires "
+                "per_band_stem=True (the single-grid path uses patch_grid_shape)."
+            )
+        if electrode_tokens_high.dim() != 4:
+            raise ValueError(
+                "electrode_tokens_high must be (B, C, F_high, T_high) freq-major; "
+                f"got {tuple(electrode_tokens_high.shape)}"
+            )
+        assert self.patch_stem_high is not None  # non-None when per_band_stem
+        T_high = int(electrode_tokens_high.shape[-1])
+        T_high_p = self.patch_stem_high.n_time_patches(T_high)
+        T_low_p = self._dual_band_low_t_patches(T_high_p)
+        return self.F_p_low, T_low_p, self.F_p_high, T_high_p
+
+    def _forward_dual_band(
+        self,
+        electrode_tokens_low: Tensor,   # (B, C, F_low, T_low) raw |STFT|, freq-major
+        electrode_tokens_high: Tensor,  # (B, C, F_high, T_high) raw |STFT|, freq-major
+        support: Tensor,                # (B, C, K) one-hot DK assignment
+        valid_mask: Optional[Tensor],   # (B, C) bool, or None
+        *,
+        return_taps: bool,
+        m2_only: bool,
+        # §6 drop-token M2 mask: (B, K, S) bool, True = masked, on the FLAT
+        # per-parcel token sequence (the §5 dual-band sampler's output). When
+        # present, the student's token-block self-attention KEY-PADS the masked
+        # tokens out (visible tokens attend only to visible keys — a true V-JEPA
+        # drop, NOT the single-grid path's MAE zero-in-place); the teacher passes
+        # ``None`` for the full-input target. ``None`` → unmasked forward.
+        token_mask: Optional[Tensor] = None,
+        # M4 whole-parcel tube mask: (B, K) bool, True = tubed (the masked
+        # reconstruction target — ALL of that parcel's S tokens, every freq and
+        # every time). The parcel is the atomic M4 masking unit (Ben 2026-06-13):
+        # a tubed parcel is dropped as both an attendable token (key-padded out of
+        # the within-parcel token block) AND as a parcel-latent query/key (via
+        # ``visible_parcels``), so a surviving parcel's M4 never depends on a
+        # tubed parcel's content and each tubed parcel is reconstructed from the
+        # co-located activity of the surviving parcels. ``None`` → no tube (M2
+        # forward, or the EMA teacher's full-input pass).
+        tubed: Optional[Tensor] = None,
+    ) -> Tensor | dict[str, Tensor]:
+        """2STFT dual-band frontend forward → M2 + M4 (spec §3b/§4; M4 latent per
+        Ben's 2026-06-13 lock — latent_mode='parcel', the dual-rate flat-S path).
+
+        Mean|std-pools each band's electrodes into its parcels (the SAME hard
+        pool as ``_forward_meanpool``, run once per band), stems each band with
+        its own Conv2d, trims the low band to the common grid, adds the
+        per-patch ``freq_embed`` (low → rows 0..6, high → rows 7..9), unions the
+        two bands into one per-parcel flat token sequence, runs the joint token
+        blocks with dual-rate real-time RoPE, and returns the ``frontend_ln``
+        M2 tap.
+
+        Because the bands carry different time rates, the M2 tap is a FLAT
+        per-parcel token sequence ``(B, K, S, d)`` (``S = S_low + S_high``), NOT
+        a ``(B, K, F_p, T_p, d)`` grid. The caller reads per-token geometry via
+        ``dual_band_token_layout``. The M4 latent (``m2_only=False``) runs the
+        parcel-SA-only middle on this flat sequence (folding ``S`` into the batch,
+        attending over the parcel axis ``K`` alone — rate-agnostic) → the
+        ``encoder_ln`` M4 tap, mirroring ``_forward_meanpool``'s M4 path. Returns
+        the full taps dict when ``return_taps`` (``M2``/``M4``/``latent_valid`` +
+        heteroscedastic ``M4_precision_std``/``M4_precision_n``), or the bare M4
+        tap when not.
+        """
+        if m2_only and not return_taps:
+            raise ValueError("m2_only=True requires return_taps=True")
+        if electrode_tokens_low.dim() != 4 or electrode_tokens_high.dim() != 4:
+            raise ValueError(
+                "2STFT bands must be (B, C, F, T) freq-major; got "
+                f"low={tuple(electrode_tokens_low.shape)}, "
+                f"high={tuple(electrode_tokens_high.shape)}"
+            )
+        B, C, F_low, T_low = electrode_tokens_low.shape
+        Bh, Ch, F_high, T_high = electrode_tokens_high.shape
+        if (Bh, Ch) != (B, C):
+            raise ValueError(
+                f"2STFT bands disagree on (B, C): low=({B}, {C}) "
+                f"high=({Bh}, {Ch})"
+            )
+        if F_low != self.band_low_n_freq_bins or F_high != self.band_high_n_freq_bins:
+            raise ValueError(
+                f"2STFT freq-bin mismatch: low F={F_low} (want "
+                f"{self.band_low_n_freq_bins}), high F={F_high} (want "
+                f"{self.band_high_n_freq_bins})"
+            )
+        if support.shape != (B, C, self.k_parcels):
+            raise ValueError(
+                f"support shape {tuple(support.shape)} does not match (B, C, K) "
+                f"= ({B}, {C}, {self.k_parcels})"
+            )
+        if valid_mask is not None and valid_mask.shape != (B, C):
+            raise ValueError(
+                f"valid_mask shape {tuple(valid_mask.shape)} does not match "
+                f"(B, C) = ({B}, {C})"
+            )
+        K = self.k_parcels
+
+        # D2 mean|std-before, run ONCE PER BAND (the electrode axis is consumed
+        # here). ``latent_valid`` / ``parcel_n`` are band-invariant (same
+        # electrodes, same support), so the low band's are canonical.
+        parcel_raw_low, latent_valid, parcel_n, parcel_std_low = self._mean_pool_electrodes(
+            electrode_tokens_low, support, valid_mask
+        )
+        parcel_raw_high, _lv_h, _n_h, parcel_std_high = self._mean_pool_electrodes(
+            electrode_tokens_high, support, valid_mask
+        )
+
+        # D4 per-band stem (electrode-shared Conv2d). low (fk2,tk1) high (fk3,tk2).
+        x_low = self.patch_stem_low(parcel_raw_low)              # (B,K,F_p_low,T_low_p,d)
+        x_high = self.patch_stem_high(parcel_raw_high)           # (B,K,F_p_high,T_high_p,d)
+        F_p_low, T_low_p_raw = x_low.shape[2], x_low.shape[3]
+        F_p_high, T_high_p = x_high.shape[2], x_high.shape[3]
+        if F_p_low != self.F_p_low or F_p_high != self.F_p_high:
+            raise ValueError(
+                f"2STFT stem freq-patch mismatch: low F_p={F_p_low} (want "
+                f"{self.F_p_low}), high F_p={F_p_high} (want {self.F_p_high})"
+            )
+        # Reconcile the low band to the common 62.5 ms grid (trim trailing
+        # boundary patch so T_high_p == 2·T_low_p — see _dual_band_low_t_patches).
+        T_low_p = self._dual_band_low_t_patches(T_high_p)
+        if T_low_p_raw < T_low_p or T_low_p_raw - T_low_p > 1:
+            raise ValueError(
+                f"2STFT low-band time-patch count {T_low_p_raw} is not the "
+                f"common-grid count {T_low_p} (+0/+1 boundary trim); the bands' "
+                f"clip lengths or hops are mis-aligned"
+            )
+        x_low = x_low[:, :, :, :T_low_p, :]                      # drop trailing patch
+
+        # FE-03 per-patch freq embed — "re-point, not re-size": the size-F_p
+        # table feeds rows 0..F_p_low-1 to low, F_p_low..F_p-1 to high. Broadcast
+        # over (K, T_p). ``freq_embed`` is (F_p, d).
+        x_low = x_low + self.freq_embed[:F_p_low].view(1, 1, F_p_low, 1, self.d_model)
+        x_high = x_high + self.freq_embed[F_p_low:].view(1, 1, F_p_high, 1, self.d_model)
+
+        # Union into one per-parcel flat token sequence [low block | high block],
+        # each flattened time-patch OUTER / freq-patch INNER (the (K,T_p,F_p,d)
+        # order) so the flat index matches dual_band_token_layout.
+        tok_low = x_low.permute(0, 1, 3, 2, 4).reshape(B, K, T_low_p * F_p_low, self.d_model)
+        tok_high = x_high.permute(0, 1, 3, 2, 4).reshape(B, K, T_high_p * F_p_high, self.d_model)
+        x_tok = torch.cat([tok_low, tok_high], dim=2)            # (B, K, S, d)
+        S = x_tok.shape[2]
+
+        # §4 dual-rate real-time RoPE: gather the common-grid table per token.
+        layout = self.dual_band_token_layout(T_low_p, T_high_p, device=x_tok.device)
+        rope = self.key_rope[:, layout["slot"], :]               # (2, S, head_dim)
+
+        # Joint token-block self-attention, batched over B·K parcels (attention
+        # is WITHIN each parcel's S tokens — no cross-parcel path here, so every
+        # parcel is independent). Uncovered parcels (latent_valid False) ride
+        # along producing junk rows that the SSL contract masks downstream via
+        # latent_valid (the dense path mirrors _forward_meanpool's unmasked
+        # branch; a ragged-parcel gather is a future FLOP opt, not correctness).
+        x_joint = x_tok.reshape(B * K, S, self.d_model)
+        use_ckpt = (
+            self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        )
+        # §6 drop-token: when masked (student forward), KEY-PAD the masked tokens
+        # out of the token-block self-attention so a visible token's M2 never
+        # depends on a masked token's content (canonical V-JEPA drop — visible
+        # tokens attend only to visible keys — NOT the single-grid path's MAE
+        # zero-in-place, which leaves a zero token attendable). Masked positions
+        # still produce (discarded) reps; the §6 loss reads the VISIBLE student
+        # tokens as predictor context and predicts the masked slots from the EMA
+        # teacher. Dense key-pad — a per-parcel ragged gather is a future FLOP
+        # opt, bit-identical on the kept tokens. ``None`` → teacher/unmasked
+        # forward (all tokens attendable).
+        # Composite token-drop = §6 M2-band mask (B, K, S) on surviving parcels
+        # OR every token of an M4-tubed parcel (B, K) broadcast over S. Both are
+        # KEY-PADDED out of the within-parcel token block so a visible token's M2
+        # never depends on a masked-band or tubed token's content (the tube is
+        # the M4 reconstruction target — its tokens must not be attendable). The
+        # tube ALSO gates ``visible_parcels`` below. ``None``/``None`` →
+        # teacher/unmasked forward.
+        if token_mask is not None and token_mask.shape != (B, K, S):
+            raise ValueError(
+                f"token_mask shape {tuple(token_mask.shape)} does not match "
+                f"the flat dual-band grid (B, K, S) = ({B}, {K}, {S})"
+            )
+        if tubed is not None and tubed.shape != (B, K):
+            raise ValueError(
+                f"tubed shape {tuple(tubed.shape)} does not match (B, K) = "
+                f"({B}, {K})"
+            )
+        drop: Optional[Tensor] = token_mask
+        if tubed is not None:
+            tube_tok = tubed.unsqueeze(-1).expand(B, K, S)       # (B, K, S)
+            drop = tube_tok if drop is None else (drop | tube_tok)
+        kpm: Optional[Tensor] = None
+        if drop is not None:
+            keep = (~drop).reshape(B * K, S)                     # True = attendable key
+            # NaN guard: a fully-masked row → SDPA softmax over an empty key set
+            # → NaN poisoning the SHARED qkv grads even though the row's masked
+            # positions are read from the teacher. Force such rows to keep slot-0
+            # (a token whose output is unused for that row). Mirrors the
+            # single-grid ragged_token guard. A fully-tubed parcel hits this too.
+            empty_row = ~keep.any(dim=1, keepdim=True)           # (B·K, 1)
+            if bool(empty_row.any()):
+                slot0 = torch.arange(S, device=keep.device).unsqueeze(0) == 0
+                keep = keep | (empty_row & slot0)
+            kpm = keep
+        x_joint = self._token_block_stack(x_joint, kpm, rope, use_ckpt)
+        x = x_joint.reshape(B, K, S, self.d_model)
+        m2 = self.frontend_ln(x)                                 # M2 tap (B, K, S, d)
+        if m2_only:
+            return {"M2": m2, "latent_valid": latent_valid}
+
+        # M4 latent (Ben 2026-06-13 lock): parcel-SA-only middle over the flat
+        # dual-band tokens (S folded into the batch, attention over the parcel
+        # axis K alone — rate-agnostic). Uncovered AND tubed parcels excluded
+        # bidirectionally so a surviving parcel's M4 is independent of any
+        # don't-care/masked parcel; each tubed parcel is reconstructed from the
+        # surviving parcels' co-located activity.
+        visible_parcels = latent_valid if tubed is None else (latent_valid & ~tubed)
+        z = self._parcel_latent_flat(m2, visible_parcels, use_ckpt)  # (B, K, S, d)
+        m4 = self.encoder_ln(z)                                  # M4 tap + readout input
+
+        # Heteroscedastic precision stats (project_v14_heteroscedastic_ssl_loss),
+        # flat-S: average-pool each band's raw-resolution σ over its Conv2d patch
+        # receptive field down to the band's patch grid (mirroring the single-grid
+        # adaptive_avg_pool2d), then flatten time-OUTER / freq-INNER and concat in
+        # the SAME [low | high] order as the M2 tokens so σ aligns 1:1 with the M4
+        # target cells. ``parcel_n`` (= n_k) is per-parcel and band-invariant.
+        # None when ``mean_pool_std`` is OFF (the loss requires both → gated
+        # upstream).
+        m4_precision_std: Optional[Tensor] = None
+        if parcel_std_low is not None and parcel_std_high is not None:
+            std_low = torch.nn.functional.adaptive_avg_pool2d(
+                parcel_std_low.reshape(B * K, 1, F_low, T_low), (F_p_low, T_low_p_raw)
+            )[:, 0, :, :T_low_p]                                 # (B·K, F_p_low, T_low_p)
+            std_low = (
+                std_low.reshape(B, K, F_p_low, T_low_p)
+                .permute(0, 1, 3, 2)
+                .reshape(B, K, T_low_p * F_p_low)
+            )
+            std_high = torch.nn.functional.adaptive_avg_pool2d(
+                parcel_std_high.reshape(B * K, 1, F_high, T_high), (F_p_high, T_high_p)
+            )[:, 0, :, :]                                        # (B·K, F_p_high, T_high_p)
+            std_high = (
+                std_high.reshape(B, K, F_p_high, T_high_p)
+                .permute(0, 1, 3, 2)
+                .reshape(B, K, T_high_p * F_p_high)
+            )
+            m4_precision_std = torch.cat([std_low, std_high], dim=2)  # (B, K, S)
+
+        if not return_taps:
+            return m4
+        return {
+            "M2": m2,
+            "M4": m4,
+            "latent_valid": latent_valid,
+            "M4_precision_std": m4_precision_std,
+            "M4_precision_n": parcel_n,
+        }
 
     def _forward_meanpool(
         self,
@@ -1724,6 +2245,10 @@ class V14ParcelPerceiverModel(nn.Module):
             x_in, support, valid_mask
         )
         K = self.k_parcels
+        # Single-grid mean path: the 2STFT dual-band frontend routes to
+        # _forward_dual_band upstream, so the single ``patch_stem`` /
+        # ``rope_joint_token`` are built (non-None) here.
+        assert self.patch_stem is not None and self.rope_joint_token is not None
 
         # D4 per-parcel stem (electrode-shared Conv2d) + freq embed (#95).
         x = self.patch_stem(parcel_raw)                          # (B, K, F_p, T_p, d)
@@ -1954,6 +2479,29 @@ class V14ParcelPerceiverModel(nn.Module):
         # → every freq patch valid (the BT all-30-bins-valid default), making
         # this path byte-identical to the pre-C5 forward.
         freq_patch_valid: Optional[Tensor] = None,
+        # 2STFT (per_band_stem, spec §3b/§4): the HIGH band's raw |STFT|
+        # ``(B, C, F_high, T_high)`` (freq-major). In 2STFT mode ``electrode_tokens``
+        # is the LOW band and this is REQUIRED; both route to
+        # ``_forward_dual_band`` (M2-only — the latent stack is §9 out of scope).
+        # ``None`` on every non-2STFT path.
+        electrode_tokens_high: Optional[Tensor] = None,
+        # 2STFT §6 drop-token M2 mask: (B, K, S) bool, True = masked, on the FLAT
+        # per-parcel token sequence (the §5 dual-band sampler). The student SSL
+        # forward passes it (visible tokens attend only to visible keys); the
+        # teacher passes ``None`` (full-input target). Distinct from the
+        # single-grid ``token_mask`` (B, K, F_p, T_p) — the dual-band tap is a
+        # flat sequence, not a grid — so the per_band path rejects ``token_mask``
+        # and consumes this instead. Only valid with ``per_band_stem=True``.
+        dual_band_token_mask: Optional[Tensor] = None,
+        # 2STFT M4 whole-parcel tube mask: (B, K) bool, True = tubed. The parcel
+        # is the atomic M4 masking unit (Ben 2026-06-13) — a tubed parcel's ENTIRE
+        # flat token sequence (every freq, every time) is the reconstruction
+        # target, dropped from the within-parcel token block AND excluded from the
+        # parcel latent, so it is rebuilt from the surviving parcels' co-located
+        # activity. Threaded to ``_forward_dual_band(tubed=...)``; the student SSL
+        # forward passes it, the teacher passes ``None``. Only valid with
+        # ``per_band_stem=True``.
+        dual_band_parcel_mask: Optional[Tensor] = None,
     ) -> Tensor | dict[str, Tensor]:
         """Returns parcel latents shaped ``(B, K*M, T_p, d)`` where ``T_p``
         is the post-patch frame count from the Conv2d patch stem.
@@ -1992,6 +2540,20 @@ class V14ParcelPerceiverModel(nn.Module):
         single-tensor ``(B, K*M, T_p, d)`` return for downstream callers
         (``V14ParcelPerceiverWithHead``, ``V14ParcelCollapsePMA``).
         """
+        # 2STFT high band is valid ONLY on the dual-band frontend (which itself
+        # requires pool=="mean"); reject it everywhere else rather than silently
+        # ignore it.
+        if electrode_tokens_high is not None and not self.per_band_stem:
+            raise ValueError(
+                "electrode_tokens_high is only valid with per_band_stem=True "
+                "(the 2STFT dual-band frontend)."
+            )
+        if dual_band_token_mask is not None and not self.per_band_stem:
+            raise ValueError(
+                "dual_band_token_mask is only valid with per_band_stem=True "
+                "(the 2STFT dual-band frontend); the single-grid path masks via "
+                "token_mask (B, K, F_p, T_p)."
+            )
         # B37 pool dispatch. The mean-pool path (D1/D2) is a structurally
         # different forward (electrode axis consumed up front, frequency
         # preserved into the latent), so it lives in its own method. The B37
@@ -2012,6 +2574,35 @@ class V14ParcelPerceiverModel(nn.Module):
                     "B37 mean-pool drops shaft/subtype/ref/M3 and defers "
                     "freq_patch_valid (B36-C5); these args are unsupported on "
                     "the mean-pool path."
+                )
+            # 2STFT dual-band frontend (§3b/§4): ``electrode_tokens`` is the LOW
+            # band, ``electrode_tokens_high`` the HIGH band. M2 + M4 (the M4
+            # latent runs the parcel-SA-only middle per Ben's 2026-06-13 lock).
+            # The single-grid mean path rejects a stray high band, and the
+            # dual-band path requires it — neither silently mis-routes. Dual-band
+            # masking is the FLAT (B, K, S) M2 token mask + the (B, K) M4 tube
+            # mask, NOT the single-grid token_mask/parcel_time_mask.
+            if self.per_band_stem:
+                if electrode_tokens_high is None:
+                    raise ValueError(
+                        "per_band_stem=True requires electrode_tokens_high (the "
+                        "2STFT high band); got None."
+                    )
+                if token_mask is not None or parcel_time_mask is not None:
+                    raise NotImplementedError(
+                        "2STFT masking is the FLAT (B, K, S) dual_band_token_mask + "
+                        "(B, K) dual_band_parcel_mask (spec §5/§6), not the "
+                        "single-grid token_mask/parcel_time_mask."
+                    )
+                return self._forward_dual_band(
+                    electrode_tokens,
+                    electrode_tokens_high,
+                    support,
+                    valid_mask,
+                    return_taps=return_taps,
+                    m2_only=m2_only,
+                    token_mask=dual_band_token_mask,
+                    tubed=dual_band_parcel_mask,
                 )
             return self._forward_meanpool(
                 electrode_tokens,
@@ -2045,6 +2636,9 @@ class V14ParcelPerceiverModel(nn.Module):
             )
         # L2 always-on electrode-row data-integrity guard (2026-06-09).
         assert_electrode_alignment_integrity(support, valid_mask)
+        # cross_attn pool never sets per_band_stem (it requires pool=="mean"),
+        # so the single ``patch_stem`` / ``rope_joint_token`` are built here.
+        assert self.patch_stem is not None and self.rope_joint_token is not None
 
         # FE-02: non-overlap Conv2d patch stem. (B, C, F, T) → (B, C, F_p, T_p, d).
         x = self.patch_stem(x_in)                                   # (B, C, F_p, T_p, d)
@@ -3664,6 +4258,23 @@ class V14ParcelPerceiver(BaseModelConfig):
     # the P1 predictor's freq id-tag (P2 parcel stays learned).
     freq_pos: tp.Literal["sinusoidal", "learned"] = "sinusoidal"
 
+    # 2STFT dual-band front end (§3b, Ben 2026-06-12). When ``per_band_stem`` the
+    # encoder builds TWO single-band Conv2d stems (low + high) instead of the
+    # single F=50 grid and consumes ``electrode_tokens`` (LOW) + the second batch
+    # key ``electrode_tokens_high`` (HIGH). The band freq/time bin counts are set
+    # by the dispatch from the band VIEWS (no drift); the Conv2d kernels default to
+    # the spec (low fk2/tk1 → 7 freq-patches @ 8 Hz; high fk3/tk2 → 3 @ 16 Hz;
+    # F_p=10) and the §7 falsifier sisters re-point them. Requires pool="mean".
+    per_band_stem: bool = False
+    band_low_n_freq_bins: int = 14
+    band_high_n_freq_bins: int = 9
+    band_low_kernel_freq: int = 2
+    band_low_kernel_time: int = 1
+    band_high_kernel_freq: int = 3
+    band_high_kernel_time: int = 2
+    band_low_n_time_bins: int = 9
+    band_high_n_time_bins: int = 33
+
     # SSL-pretrain dispatch flags persisted on the model config so they
     # ride along with the run-record YAML. The encoder ``build`` does
     # not branch on them — they are metadata for sister-cell rollouts
@@ -3725,6 +4336,15 @@ class V14ParcelPerceiver(BaseModelConfig):
             latent_parcel_depth=self.latent_parcel_depth,
             latent_mode=self.latent_mode,
             mean_pool_std=self.mean_pool_std,
+            per_band_stem=self.per_band_stem,
+            band_low_n_freq_bins=self.band_low_n_freq_bins,
+            band_high_n_freq_bins=self.band_high_n_freq_bins,
+            band_low_kernel_freq=self.band_low_kernel_freq,
+            band_low_kernel_time=self.band_low_kernel_time,
+            band_high_kernel_freq=self.band_high_kernel_freq,
+            band_high_kernel_time=self.band_high_kernel_time,
+            band_low_n_time_bins=self.band_low_n_time_bins,
+            band_high_n_time_bins=self.band_high_n_time_bins,
         )
         # B35: P4 readout. The "pma_*" options collapse parcels with a
         # FROZEN P3-PMA, then mean/flatten/timeattn over T_p → Linear (only

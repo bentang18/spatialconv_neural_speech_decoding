@@ -112,3 +112,37 @@ def test_s9_native_rate_is_measured_half() -> None:
         "If this changed, the vendored fixture or the dataset itself changed — verify."
     )
     assert bt_subject_native_rate_hz(9) == 1024
+
+
+# --- P5 mutation testing: prove the rate guard is NOT tautological --------------
+# The two tests above pin "S9 measures ~1024 AND registry says 1024". Neither
+# proves the guard would FIRE if the registry were wrong — a check that only ever
+# compares equal-to-equal is tautological. These positive controls inject the
+# bug (a registry that disagrees with the measured bytes) and assert it is caught.
+
+
+def test_native_rate_tolerance_catches_2x_error() -> None:
+    """Pure-logic control (CI-independent): the registry-vs-measured tolerance
+    must FLAG a 2× error (the exact S9 signature) and ACCEPT a real within-grid
+    match. If `_REL_TOL` were ever widened past 0.5 this fails, exposing a guard
+    that could no longer distinguish a 1024 subject from a 2048 one."""
+    fires = abs(1024.0 - 2048.0) > _REL_TOL * 2048.0
+    passes = abs(2047.9 - 2048.0) <= _REL_TOL * 2048.0
+    assert fires, "rate guard would NOT fire on a 2× error — tautology"
+    assert passes, "rate guard would false-positive on a real 2048 grid"
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_native_rate_guard_fires_on_wrong_registry_s9() -> None:
+    """Integration control: measure the REAL S9 trigger track and confirm it would
+    be flagged against the pre-LG1 wrong assumption (registry=2048). This is the
+    measured-bytes proof that the S9-class guard catches the S9-class bug."""
+    s9 = [t for t in _trigger_tracks() if re.match(r"sub_9_trial", t.name)]
+    if not s9:
+        pytest.skip("vendored S9 trigger track absent (CI)")
+    measured = _measure_native_rate_hz(s9[0])
+    wrong_expected = 2048  # the assumption that produced the S9 2× time-stretch
+    assert abs(measured - wrong_expected) > _REL_TOL * wrong_expected, (
+        f"guard would NOT fire: measured {measured:.1f} Hz vs wrong registry "
+        f"{wrong_expected} Hz is within tolerance — the S9-class guard is tautological."
+    )

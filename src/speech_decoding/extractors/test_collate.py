@@ -103,3 +103,55 @@ def test_collate_rejects_parcel_count_mismatch() -> None:
     s2 = _sample(C=2, T=4, F=4, K=8)
     with pytest.raises(ValueError, match="parcel"):
         v14_variable_tc_collate([s1, s2])
+
+
+# --- 2STFT dual-band (electrode_tokens_high) -------------------------------
+
+
+def _dual_sample(C: int, *, t_low: int = 8, t_high: int = 16, K: int = 6) -> dict:
+    """Freq-major dual-band sample: low (C, F_low=14, t_low), high (C, F_high=9,
+    t_high). Same electrodes/support/valid_mask across both bands."""
+    return {
+        "electrode_tokens": torch.randn(C, 14, t_low),
+        "electrode_tokens_high": torch.randn(C, 9, t_high),
+        "support": torch.zeros(C, K),
+        "valid_mask": torch.ones(C, dtype=torch.bool),
+    }
+
+
+def test_collate_dual_band_pads_high_to_same_C_max() -> None:
+    """High band is padded to the SAME C_max as the low band (shared electrodes),
+    keeping its own freq/time axes."""
+    s1 = _dual_sample(C=4)
+    s2 = _dual_sample(C=7)
+    batch = v14_variable_tc_collate([s1, s2])
+    assert batch["electrode_tokens"].shape == (2, 7, 14, 8)
+    assert batch["electrode_tokens_high"].shape == (2, 7, 9, 16)
+    # Sample-1's padded electrodes (4..6) on the high band are zero.
+    assert torch.all(batch["electrode_tokens_high"][0, 4:] == 0)
+    # Real electrodes preserved.
+    assert torch.equal(batch["electrode_tokens_high"][0, :4], s1["electrode_tokens_high"])
+
+
+def test_collate_dual_band_absent_high_is_noop() -> None:
+    """Non-2STFT batches (no high band) never grow an electrode_tokens_high key."""
+    s1 = _sample(C=2, T=4, F=4, K=6)
+    batch = v14_variable_tc_collate([s1])
+    assert "electrode_tokens_high" not in batch
+
+
+def test_collate_dual_band_rejects_high_freq_mismatch() -> None:
+    """High-band F mismatch within a batch is a config error."""
+    s1 = _dual_sample(C=2)
+    s2 = _dual_sample(C=2)
+    s2["electrode_tokens_high"] = torch.randn(2, 9, 15)  # t_high differs (last axis)
+    with pytest.raises(ValueError, match="high-band freq"):
+        v14_variable_tc_collate([s1, s2])
+
+
+def test_collate_dual_band_rejects_electrode_count_mismatch() -> None:
+    """The two bands must share electrodes (same per-sample C)."""
+    s1 = _dual_sample(C=3)
+    s1["electrode_tokens_high"] = torch.randn(2, 9, 16)  # C=2 != low-band C=3
+    with pytest.raises(ValueError, match="share electrodes"):
+        v14_variable_tc_collate([s1])

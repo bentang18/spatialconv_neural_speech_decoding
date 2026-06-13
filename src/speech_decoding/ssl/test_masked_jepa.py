@@ -18,6 +18,8 @@ from speech_decoding.models.v14_encoder import JepaPredictor
 from speech_decoding.ssl.masked_jepa import (
     _m4_precision_weight,
     b37_m4_freq_loss,
+    m2_dual_band_loss,
+    m4_dual_band_loss,
     p1_frontend_m2_loss,
     p2_parcel_m4_loss,
 )
@@ -557,3 +559,423 @@ def test_p2_loss_reads_exactly_the_masked_target_set() -> None:
         "P2 loss did not respond to the masked parcel-time target — wrong-cell "
         "gather or visible leak"
     )
+
+
+# ═══════════════════ FE 2STFT §6 — M2 dual-band drop-token loss ═══════════════
+#
+# The 2STFT M2 tap is a FLAT per-parcel sequence (B, K, S, d) — the two bands
+# carry different time rates, so no shared (F_p, T_p) grid. ONE predictor
+# reconstructs all masked slots: parcel = learned query_id, freq-patch = sincos
+# query_id_2 (the "Hz tag", basket implicit), slot = dual-rate RoPE time. Loss =
+# pure L1 pooled mean over masked tokens; latent_valid gates uncovered parcels.
+
+# Small synthetic dual-band geometry for the loss unit tests:
+#   low  F_p_low=2 × T_low_p=2 → S_low=4 (flat t-outer/f-inner)
+#   high F_p_high=1 × T_high_p=4 → S_high=4 ; S=8, F_p=3 (low 0,1 / high 2)
+# slot: low t→2t, high t→t ; freq-patch: low f∈{0,1}, high f=2.
+_M2DB_S = 8
+_M2DB_FP = 3
+_M2DB_SLOT = torch.tensor([0, 0, 2, 2, 0, 1, 2, 3])        # (S,) dual-rate slots
+_M2DB_FREQ = torch.tensor([0, 1, 0, 1, 2, 2, 2, 2])        # (S,) freq-patch / Hz tag
+
+
+def _m2_dual_predictor(d: int, K: int) -> JepaPredictor:
+    """2STFT M2 predictor — built IDENTICALLY to the B37 M4 predictor: parcel
+    (learned query_id) + freq-patch (sinusoidal query_id_2) + time RoPE. ONE
+    predictor for both baskets. Eval mode for determinism."""
+    torch.manual_seed(13)
+    pred = JepaPredictor(
+        d_model=d, n_identity=K, hidden=16, n_heads=2, depth=2,
+        max_time_patches=8, id_pos="learned",
+        n_identity_2=_M2DB_FP, id_pos_2="sinusoidal",
+    )
+    return pred.eval()
+
+
+def _m2db_call(pred, student, teacher, token_mask, latent_valid):
+    return m2_dual_band_loss(
+        predictor=pred, student_m2=student, teacher_m2=teacher,
+        token_mask=token_mask, slot_ids=_M2DB_SLOT, freq_patch_ids=_M2DB_FREQ,
+        latent_valid=latent_valid,
+    )
+
+
+def test_m2_dual_band_n_masked_counts_covered_masked_only() -> None:
+    """n_masked = (token_mask & covered) — uncovered parcels contribute no
+    targets even where masked; phase tag is ``m2_dual_band``."""
+    torch.manual_seed(0)
+    B, K, d = 2, 4, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    token_mask = torch.zeros(B, K, _M2DB_S, dtype=torch.bool)
+    token_mask[:, :, [0, 2, 5]] = True                     # 3 tokens / parcel masked
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    latent_valid[:, K - 1] = False                         # last parcel uncovered
+    pred = _m2_dual_predictor(d, K)
+
+    bd = _m2db_call(pred, student, teacher, token_mask, latent_valid)
+    assert bd.phase == "m2_dual_band"
+    # 3 masked tokens × (K-1) covered parcels × B clips.
+    assert bd.n_masked == B * (K - 1) * 3
+    assert torch.isfinite(bd.total)
+
+
+def test_m2_dual_band_predictor_and_student_get_gradient() -> None:
+    """Paradigm B: the prediction is the predictor's, so its params get a finite
+    gradient, and the student (visible context) does too — not a bare distill."""
+    torch.manual_seed(0)
+    B, K, d = 2, 4, 8
+    student = torch.randn(B, K, _M2DB_S, d, requires_grad=True)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    token_mask = torch.zeros(B, K, _M2DB_S, dtype=torch.bool)
+    token_mask[:, :, [1, 3, 6]] = True
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    pred = _m2_dual_predictor(d, K)
+
+    bd = _m2db_call(pred, student, teacher, token_mask, latent_valid)
+    bd.total.backward()
+    got = [
+        p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+        for n, p in pred.named_parameters()
+        if "id_embed" not in n  # learned parcel rows only update for sampled ids
+    ]
+    assert got and all(got), "M2 dual-band predictor params did not get gradient"
+    assert student.grad is not None and student.grad.abs().sum() > 0
+
+
+def test_m2_dual_band_visible_target_split_and_detach() -> None:
+    """The drop-token split is honored exactly (mirrors the B37 M4 split test):
+
+    (a) garbaging a MASKED slot's STUDENT value → no-op (masked tokens are
+        key-padded out of the predictor context; the target is the TEACHER);
+    (b) garbaging a VISIBLE slot's STUDENT value → moves the loss (it is context);
+    (c) garbaging a MASKED slot's TEACHER value → moves the loss (it is target);
+    (d) garbaging a VISIBLE slot's TEACHER value → no-op (only masked = target,
+        teacher never context);
+    (e) garbaging an UNCOVERED parcel (either side) → no-op (latent_valid gate).
+    """
+    torch.manual_seed(0)
+    B, K, d = 2, 5, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    token_mask = torch.zeros(B, K, _M2DB_S, dtype=torch.bool)
+    masked_tok = [0, 2, 5]
+    vis_tok = [1, 4, 7]
+    token_mask[:, :, masked_tok] = True
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    latent_valid[:, K - 1] = False                         # uncovered parcel
+    pred = _m2_dual_predictor(d, K)
+
+    def run(s, t):
+        return _m2db_call(pred, s, t, token_mask, latent_valid).total
+
+    base = run(student, teacher)
+    # (a) masked-slot student perturbation → no change.
+    s = student.clone(); s[:, 0, masked_tok] += 9.0
+    torch.testing.assert_close(run(s, teacher), base, atol=0, rtol=0)
+    # (b) visible-slot student perturbation → change.
+    s = student.clone(); s[:, 0, vis_tok] += 9.0
+    assert not torch.allclose(run(s, teacher), base)
+    # (c) masked-slot teacher perturbation → change (the target).
+    t = teacher.clone(); t[:, 0, masked_tok] += 9.0
+    assert not torch.allclose(run(student, t), base)
+    # (d) visible-slot teacher perturbation → no change.
+    t = teacher.clone(); t[:, 0, vis_tok] += 9.0
+    torch.testing.assert_close(run(student, t), base, atol=0, rtol=0)
+    # (e) uncovered parcel, either side → no change.
+    s = student.clone(); s[:, K - 1] += 9.0
+    torch.testing.assert_close(run(s, teacher), base, atol=0, rtol=0)
+    t = teacher.clone(); t[:, K - 1] += 9.0
+    torch.testing.assert_close(run(student, t), base, atol=0, rtol=0)
+
+
+def test_m2_dual_band_empty_mask_is_exact_graph_connected_zero() -> None:
+    """No masked slot → exact 0 loss still connected to the predictor graph
+    (B6 masked-empty contract — no NaN, optimizer sees a real zero)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 3, 8
+    student = torch.randn(B, K, _M2DB_S, d, requires_grad=True)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    token_mask = torch.zeros(B, K, _M2DB_S, dtype=torch.bool)  # nothing masked
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    pred = _m2_dual_predictor(d, K)
+
+    bd = _m2db_call(pred, student, teacher, token_mask, latent_valid)
+    assert bd.n_masked == 0
+    assert float(bd.total.detach()) == 0.0
+    bd.total.backward()  # must not raise / NaN
+
+
+def test_m2_dual_band_shape_guards() -> None:
+    torch.manual_seed(0)
+    B, K, d = 2, 3, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    lv = torch.ones(B, K, dtype=torch.bool)
+    pred = _m2_dual_predictor(d, K)
+    good = torch.zeros(B, K, _M2DB_S, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="token_mask"):
+        _m2db_call(pred, student, teacher, torch.zeros(B, K, _M2DB_S + 1, dtype=torch.bool), lv)
+    with pytest.raises(ValueError, match="latent_valid"):
+        _m2db_call(pred, student, teacher, good, torch.ones(B, K + 1, dtype=torch.bool))
+    with pytest.raises(ValueError, match="teacher_m2"):
+        m2_dual_band_loss(
+            predictor=pred, student_m2=student, teacher_m2=teacher[:, :, :-1],
+            token_mask=good, slot_ids=_M2DB_SLOT, freq_patch_ids=_M2DB_FREQ,
+            latent_valid=lv,
+        )
+    with pytest.raises(ValueError, match="slot_ids"):
+        m2_dual_band_loss(
+            predictor=pred, student_m2=student, teacher_m2=teacher,
+            token_mask=good, slot_ids=_M2DB_SLOT[:-1], freq_patch_ids=_M2DB_FREQ,
+            latent_valid=lv,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 2STFT M4 latent loss (m4_dual_band_loss): WHOLE-PARCEL tube on the flat-S latent.
+# Sibling of b37_m4_freq_loss (F_p×T_p grid) and m2_dual_band_loss (flat-S M2).
+# SEPARATE M4 predictor (depth 1 in the locked config) + opt-in heteroscedastic
+# precision weight (project_v14_heteroscedastic_ssl_loss).
+# ---------------------------------------------------------------------------
+
+
+def _m4_dual_predictor(d: int, K: int) -> JepaPredictor:
+    """2STFT M4 predictor — built like the M2 dual-band predictor (parcel learned
+    query_id + freq-patch sinusoidal query_id_2 + slot RoPE) but DEPTH 1 (the
+    locked-config M4 predictor depth; M2 is depth 3). Eval for determinism."""
+    torch.manual_seed(17)
+    pred = JepaPredictor(
+        d_model=d, n_identity=K, hidden=16, n_heads=2, depth=1,
+        max_time_patches=8, id_pos="learned",
+        n_identity_2=_M2DB_FP, id_pos_2="sinusoidal",
+    )
+    return pred.eval()
+
+
+def _tube_bk(B: int, K: int, tubed: int = 0) -> torch.Tensor:
+    """Whole-parcel tube: parcel ``tubed`` is the target (all S), the rest survive.
+    Returns the per-parcel ``(B, K)`` bool tube mask (no time axis — the parcel is
+    the atomic masking unit)."""
+    m = torch.zeros(B, K, dtype=torch.bool)
+    m[:, tubed] = True
+    return m
+
+
+def _m4db_call(pred, student, teacher, tubed, latent_valid, **kw):
+    return m4_dual_band_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        tubed=tubed, latent_valid=latent_valid,
+        slot_ids=_M2DB_SLOT, freq_patch_ids=_M2DB_FREQ, **kw,
+    )
+
+
+def test_m4_dual_band_n_masked_counts_tubed_covered_only() -> None:
+    """A tubed parcel's WHOLE flat-S field is the target — n_masked counts every S
+    slot of each covered tubed parcel; an uncovered parcel contributes nothing even
+    if tubed. Phase tag is ``m4_dual_band``."""
+    torch.manual_seed(0)
+    B, K, d = 2, 4, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = torch.zeros(B, K, dtype=torch.bool)
+    tubed[:, 0] = True                                     # parcel 0 tubed
+    tubed[:, K - 1] = True                                 # last parcel tubed but...
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    latent_valid[:, K - 1] = False                         # ...uncovered → no target
+    pred = _m4_dual_predictor(d, K)
+
+    bd = _m4db_call(pred, student, teacher, tubed, latent_valid)
+    assert bd.phase == "m4_dual_band"
+    # one covered tubed parcel × all S slots × B clips (the uncovered tubed parcel
+    # is gated out).
+    assert bd.n_masked == B * _M2DB_S
+    assert torch.isfinite(bd.total)
+
+
+def test_m4_dual_band_predictor_and_student_get_gradient() -> None:
+    """Paradigm B: the tubed-parcel reconstruction is the predictor's, so its
+    params get a finite gradient and the surviving-parcel student context does
+    too (not a bare self-distill)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 5, 8
+    student = torch.randn(B, K, _M2DB_S, d, requires_grad=True)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = _tube_bk(B, K, tubed=1)
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)
+
+    bd = _m4db_call(pred, student, teacher, tubed, latent_valid)
+    bd.total.backward()
+    got = [
+        p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+        for n, p in pred.named_parameters()
+        if "id_embed" not in n  # learned parcel rows only update for sampled ids
+    ]
+    assert got and all(got), "M4 dual-band predictor params did not get gradient"
+    assert student.grad is not None and student.grad.abs().sum() > 0
+
+
+def test_m4_dual_band_visible_target_split_and_detach() -> None:
+    """The whole-parcel tube split is honored exactly (mirrors the B37 M4 split):
+
+    (a) garbaging a TUBED parcel's STUDENT value → no-op (tubed parcels are
+        key-padded out of the predictor context; the target is the TEACHER);
+    (b) garbaging a SURVIVING parcel's STUDENT value → moves the loss (context);
+    (c) garbaging a TUBED parcel's TEACHER value → moves the loss (the target);
+    (d) garbaging a SURVIVING parcel's TEACHER value → no-op (only tubed = target,
+        teacher never context);
+    (e) garbaging an UNCOVERED parcel (either side) → no-op (latent_valid gate).
+    """
+    torch.manual_seed(0)
+    B, K, d = 2, 6, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = _tube_bk(B, K, tubed=0)
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    latent_valid[:, K - 1] = False                         # uncovered parcel
+    pred = _m4_dual_predictor(d, K)
+
+    def run(s, t):
+        return _m4db_call(pred, s, t, tubed, latent_valid).total
+
+    base = run(student, teacher)
+    # (a) tubed-parcel student perturbation → no change.
+    s = student.clone(); s[:, 0] += 9.0
+    torch.testing.assert_close(run(s, teacher), base, atol=0, rtol=0)
+    # (b) surviving-parcel student perturbation → change.
+    s = student.clone(); s[:, 1] += 9.0
+    assert not torch.allclose(run(s, teacher), base)
+    # (c) tubed-parcel teacher perturbation → change (the target).
+    t = teacher.clone(); t[:, 0] += 9.0
+    assert not torch.allclose(run(student, t), base)
+    # (d) surviving-parcel teacher perturbation → no change.
+    t = teacher.clone(); t[:, 1] += 9.0
+    torch.testing.assert_close(run(student, t), base, atol=0, rtol=0)
+    # (e) uncovered parcel, either side → no change.
+    s = student.clone(); s[:, K - 1] += 9.0
+    torch.testing.assert_close(run(s, teacher), base, atol=0, rtol=0)
+    t = teacher.clone(); t[:, K - 1] += 9.0
+    torch.testing.assert_close(run(student, t), base, atol=0, rtol=0)
+
+
+def test_m4_dual_band_empty_tube_is_exact_graph_connected_zero() -> None:
+    """No tubed parcel → exact 0 loss still connected to the predictor graph
+    (B6 masked-empty contract — no NaN)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 3, 8
+    student = torch.randn(B, K, _M2DB_S, d, requires_grad=True)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = torch.zeros(B, K, dtype=torch.bool)            # nothing tubed
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)
+
+    bd = _m4db_call(pred, student, teacher, tubed, latent_valid)
+    assert bd.n_masked == 0
+    assert float(bd.total.detach()) == 0.0
+    bd.total.backward()  # must not raise / NaN
+
+
+def test_m4_dual_band_precision_uniform_recovers_plain_l1() -> None:
+    """Uniform σ + uniform n → mean-1 weight is all-ones → the weighted loss is
+    byte-identical to the plain-L1 path (the safe-ship uniform-weight limit)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 5, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = _tube_bk(B, K, tubed=0)
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)                        # eval → deterministic
+
+    plain = _m4db_call(pred, student, teacher, tubed, latent_valid)
+    std = torch.full((B, K, _M2DB_S), 0.37)
+    n = torch.full((B, K), 5.0)
+    weighted = _m4db_call(
+        pred, student, teacher, tubed, latent_valid,
+        precision_std=std, precision_n=n, precision_alpha=0.75,
+    )
+    torch.testing.assert_close(weighted.total, plain.total, atol=1e-6, rtol=1e-5)
+
+
+def test_m4_dual_band_precision_nonuniform_changes_loss() -> None:
+    """Non-uniform σ/n → the weight is not all-ones → the weighted loss differs
+    from plain L1 (the heteroscedastic term is actually doing something)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 5, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    # tube TWO parcels so there are >1 scored parcels with different σ/n.
+    tubed = torch.zeros(B, K, dtype=torch.bool)
+    tubed[:, [0, 2]] = True
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)
+
+    plain = _m4db_call(pred, student, teacher, tubed, latent_valid)
+    std = torch.full((B, K, _M2DB_S), 0.5)
+    std[:, 0] = 0.05                                       # parcel 0 reliable
+    std[:, 2] = 3.0                                        # parcel 2 shaky
+    n = torch.full((B, K), 6.0)
+    n[:, 0] = 12.0                                         # parcel 0 well covered
+    n[:, 2] = 2.0                                          # parcel 2 low coverage
+    weighted = _m4db_call(
+        pred, student, teacher, tubed, latent_valid,
+        precision_std=std, precision_n=n, precision_alpha=0.75,
+    )
+    assert not torch.allclose(weighted.total, plain.total)
+    assert torch.isfinite(weighted.total)
+
+
+def test_m4_dual_band_precision_requires_both_std_and_n() -> None:
+    """Precision weighting needs BOTH precision_std and precision_n — passing one
+    without the other is a hard error (no silent half-weighting)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 4, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = _tube_bk(B, K, tubed=0)
+    lv = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)
+    std = torch.full((B, K, _M2DB_S), 0.4)
+    n = torch.full((B, K), 5.0)
+    with pytest.raises(ValueError, match="needs BOTH"):
+        _m4db_call(pred, student, teacher, tubed, lv, precision_std=std)
+    with pytest.raises(ValueError, match="needs BOTH"):
+        _m4db_call(pred, student, teacher, tubed, lv, precision_n=n)
+
+
+def test_m4_dual_band_shape_guards() -> None:
+    torch.manual_seed(0)
+    B, K, d = 2, 3, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = _tube_bk(B, K, tubed=0)
+    lv = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)
+
+    with pytest.raises(ValueError, match="student_m4 must be"):
+        _m4db_call(pred, student[..., 0], teacher, tubed, lv)
+    with pytest.raises(ValueError, match="teacher_m4"):
+        _m4db_call(pred, student, teacher[:, :, :-1], tubed, lv)
+    with pytest.raises(ValueError, match="tubed"):
+        _m4db_call(pred, student, teacher, torch.zeros(B, K + 1, dtype=torch.bool), lv)
+    with pytest.raises(ValueError, match="latent_valid"):
+        _m4db_call(pred, student, teacher, tubed, torch.ones(B, K + 1, dtype=torch.bool))
+    with pytest.raises(ValueError, match="slot_ids"):
+        m4_dual_band_loss(
+            predictor=pred, student_m4=student, teacher_m4=teacher,
+            tubed=tubed, latent_valid=lv,
+            slot_ids=_M2DB_SLOT[:-1], freq_patch_ids=_M2DB_FREQ,
+        )
+    with pytest.raises(ValueError, match="precision_std shape"):
+        _m4db_call(
+            pred, student, teacher, tubed, lv,
+            precision_std=torch.full((B, K, _M2DB_S + 1), 0.4),
+            precision_n=torch.full((B, K), 5.0),
+        )
+    with pytest.raises(ValueError, match="precision_n shape"):
+        _m4db_call(
+            pred, student, teacher, tubed, lv,
+            precision_std=torch.full((B, K, _M2DB_S), 0.4),
+            precision_n=torch.full((B, K + 1), 5.0),
+        )

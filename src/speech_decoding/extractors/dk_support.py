@@ -31,6 +31,7 @@ from neuralset.events.etypes import Event
 from neuralset.extractors.base import BaseStatic
 
 from speech_decoding.studies.braintreebank.anatomy import (
+    DEFAULT_BT_LABEL_COLUMN,
     V14_DK_PARCEL_LABELS,
     aligned_voltage_support,
 )
@@ -49,6 +50,15 @@ class V14DKHardSupportExtractor(BaseStatic):
     bt_root: str
     unmapped_policy: tp.Literal["raise", "zero"] = "raise"
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS
+    # Atlas column in depth-wm.csv: "DesikanKilliany" (DK, K=80) or "DKT" (K=74).
+    # MUST be the partner of ``parcel_labels`` (dispatch sets both from
+    # ``anatomy.atlas_spec`` so they cannot desync).
+    label_column: str = DEFAULT_BT_LABEL_COLUMN
+    # Ben 2026-06-13: drop parcels covered by exactly one valid electrode — the
+    # lone electrode is zeroed + marked invalid (degenerate within-parcel σ poisons
+    # the heteroscedastic M4 weight). Global K unchanged. Must match the valid-mask
+    # extractor (enforced by ``_assert_support_valid_config_agree``).
+    exclude_single_electrode_parcels: bool = False
     c_max: int | None = None
 
     def get_static(self, event: Event) -> torch.Tensor:
@@ -64,6 +74,8 @@ class V14DKHardSupportExtractor(BaseStatic):
                 subject_id,
                 parcel_labels=self.parcel_labels,
                 unmapped_policy=self.unmapped_policy,
+                label_column=self.label_column,
+                exclude_single_electrode_parcels=self.exclude_single_electrode_parcels,
             ).support
         )
         if self.c_max is not None:

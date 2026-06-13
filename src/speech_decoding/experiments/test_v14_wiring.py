@@ -254,10 +254,9 @@ def test_v14_dispatch_script_imports() -> None:
 def test_v14_dispatch_dry_run_prints_config(capsys) -> None:
     """`--dry-run` prints the resolved config without dispatching or touching BT data."""
     from speech_decoding.experiments import dispatch_v14
-    rc = dispatch_v14.main(["--dry-run", "--eps", "0.05", "--m-sub-slots", "8"])
+    rc = dispatch_v14.main(["--dry-run", "--m-sub-slots", "8"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "eps=0.05" in out
     assert "M=8" in out
     assert "S5 excluded" in out
 

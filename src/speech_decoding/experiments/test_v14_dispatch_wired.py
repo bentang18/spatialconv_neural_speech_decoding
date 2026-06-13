@@ -600,21 +600,27 @@ def test_b28_dispatch_default_dkoleo_mode_is_off(tmp_path, monkeypatch) -> None:
     assert xp is not None
 
 
-def test_b28_dispatch_rejects_unknown_dkoleo_mode(tmp_path, monkeypatch) -> None:
+def test_b28_dkoleo_mode_build_kwarg_removed(tmp_path, monkeypatch) -> None:
+    """The ``--dkoleo-mode`` CLI selector + the build_v14_experiment kwarg were
+    culled 2026-06-13 (B28-demoted). Passing it now raises TypeError; the
+    encoder keeps its own ``dkoleo_mode="off"`` internal default."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     import pytest
-    with pytest.raises(ValueError, match="dkoleo_mode"):
-        dispatch_v14.build_v14_experiment(mode="nano", dkoleo_mode="bogus")
+    with pytest.raises(TypeError):
+        dispatch_v14.build_v14_experiment(mode="nano", dkoleo_mode="off")
 
 
-def test_b28_dispatch_propagates_cross_attn_positions(tmp_path, monkeypatch) -> None:
-    """`cross_attn_positions=[0, 3]` (R-perceiver-original-2-cross-attns)
-    flows from build kwargs into the V14ParcelPerceiver config."""
+def test_b28_cross_attn_positions_build_kwarg_removed(tmp_path, monkeypatch) -> None:
+    """The ``--cross-attn-positions`` CLI flag + the build_v14_experiment kwarg
+    were culled 2026-06-13 (Perceiver, thrown away). Passing it now raises
+    TypeError; the encoder keeps its own ``cross_attn_positions`` (→ [0])
+    internal default (see test_b28_dispatch_default_cross_attn_positions_is_none)."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
-    xp = dispatch_v14.build_v14_experiment(
-        mode="nano", cross_attn_positions=[0, 3], depth=6,
-    )
-    assert xp.brain_model_config.cross_attn_positions == [0, 3]
+    import pytest
+    with pytest.raises(TypeError):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", cross_attn_positions=[0, 3], depth=6,
+        )
 
 
 def test_b28_dispatch_default_cross_attn_positions_is_none(
@@ -645,23 +651,23 @@ def test_b28_dispatch_mains_notch_kwarg_overrides_default(
     assert ext.notch_filter == 50.0
 
 
-def test_b28_cli_parses_cross_attn_positions() -> None:
-    """`--cross-attn-positions 0,3` parses to ``"0,3"``."""
+def test_b28_cli_cross_attn_positions_flag_removed() -> None:
+    """`--cross-attn-positions` was culled 2026-06-13 (Perceiver, thrown away);
+    argparse now rejects it (SystemExit code 2)."""
+    import pytest
     parser = dispatch_v14._parser()
-    args = parser.parse_args(["--cross-attn-positions", "0,3"])
-    assert args.cross_attn_positions == "0,3"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--cross-attn-positions", "0,3"])
 
 
-def test_b28_cli_parses_dkoleo_mode() -> None:
+def test_b28_cli_dkoleo_mode_flag_removed() -> None:
+    """`--dkoleo-mode` was culled 2026-06-13 (B28-demoted); argparse now rejects
+    it (SystemExit code 2). The encoder keeps its own ``dkoleo_mode="off"``
+    internal default."""
+    import pytest
     parser = dispatch_v14._parser()
-    args = parser.parse_args(["--dkoleo-mode", "intra_clip_slots"])
-    assert args.dkoleo_mode == "intra_clip_slots"
-
-
-def test_b28_cli_default_dkoleo_mode_is_off() -> None:
-    parser = dispatch_v14._parser()
-    args = parser.parse_args([])
-    assert args.dkoleo_mode == "off"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--dkoleo-mode", "intra_clip_slots"])
 
 
 def test_b28_cli_default_mains_notch_is_60() -> None:
@@ -852,23 +858,26 @@ def test_b29_dispatch_ref_operator_alpha_must_be_in_open_unit_interval(
         dispatch_v14.build_v14_experiment(mode="nano", ref_operator_alpha=1.0)
 
 
-def test_b36_dispatch_phase_mode_default_is_split_p1_p2() -> None:
-    """B36 relabel (2026-06-03): the recorded-only run-record default regime
-    is now ``split_p1_p2`` (staged P1 front-end M2 -> P2 parcel M4); the
-    behavioral stage is selected via --jepa-phase. ``joint_b29`` survives
-    only as the R-joint-ssl falsifier sister."""
+def test_b36_dispatch_phase_mode_flag_removed() -> None:
+    """The ``--phase-mode`` CLI axis was culled 2026-06-13; argparse no longer
+    exposes it (the parsed Namespace has no ``phase_mode``), and passing the flag
+    is rejected (SystemExit code 2). The encoder keeps its own ``phase_mode``
+    internal default."""
+    import pytest
     parser = dispatch_v14._parser()
     args = parser.parse_args([])
-    assert args.phase_mode == "split_p1_p2"
+    assert not hasattr(args, "phase_mode")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--phase-mode", "split_p1_p2"])
 
 
 def test_dispatch_default_excludes_ajile12() -> None:
     """Default OFF (2026-06-07): the active chain is BT-only. --include-ajile12
-    restores the B29 joint mix; --no-include-ajile12 is the explicit falsifier."""
+    restores the B29 joint mix. (The redundant --no-include-ajile12 store_false
+    alias was culled 2026-06-13 — the default is already OFF.)"""
     parser = dispatch_v14._parser()
     assert parser.parse_args([]).include_ajile12 is False
     assert parser.parse_args(["--include-ajile12"]).include_ajile12 is True
-    assert parser.parse_args(["--no-include-ajile12"]).include_ajile12 is False
 
 
 def test_b29_dispatch_default_ref_operator_alpha_is_0p3() -> None:
@@ -877,44 +886,45 @@ def test_b29_dispatch_default_ref_operator_alpha_is_0p3() -> None:
     assert args.ref_operator_alpha == 0.3
 
 
-def test_b29_dispatch_default_ffn_variant_is_dense() -> None:
+def test_b29_dispatch_ffn_variant_flag_removed() -> None:
+    """The ``--ffn-variant`` CLI flag + the build_v14_experiment kwarg were
+    culled 2026-06-13 (MoE audit-rejected; the dense FFN is hardcoded). argparse
+    no longer exposes it and the build kwarg is gone."""
+    import pytest
     parser = dispatch_v14._parser()
     args = parser.parse_args([])
-    assert args.ffn_variant == "dense"
+    assert not hasattr(args, "ffn_variant")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--ffn-variant", "dense"])
 
 
-def test_b29_dispatch_soft_moe_4_raises_not_implemented(
+def test_b29_dispatch_ffn_variant_build_kwarg_removed(
     tmp_path, monkeypatch,
 ) -> None:
-    """B29 MoE audit 2026-05-28: soft_moe_4 must fail-closed until
-    ``models/soft_moe.py`` lands."""
+    """B29 MoE audit 2026-05-28: MoE was rejected, the dense FFN preserved. The
+    ``ffn_variant`` build_v14_experiment kwarg was culled 2026-06-13, so passing
+    it (e.g. soft_moe_4) now raises TypeError instead of NotImplementedError."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     import pytest
 
-    with pytest.raises(NotImplementedError, match="soft_moe_4"):
+    with pytest.raises(TypeError):
         dispatch_v14.build_v14_experiment(mode="nano", ffn_variant="soft_moe_4")
 
 
-def test_b29_dispatch_dkoleo_vicreg_slot_variance_mode_accepted(
+def test_b29_dispatch_dkoleo_mode_build_kwarg_removed(
     tmp_path, monkeypatch,
 ) -> None:
+    """The ``dkoleo_mode`` build_v14_experiment kwarg (+ its CLI flag and
+    back-compat alias map) was culled 2026-06-13 (B28-demoted), so passing it
+    now raises TypeError. The encoder keeps its own ``dkoleo_mode="off"``
+    internal default."""
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
-    xp = dispatch_v14.build_v14_experiment(
-        mode="nano", dkoleo_mode="vicreg_slot_variance",
-    )
-    assert xp is not None
+    import pytest
 
-
-def test_b29_dispatch_dkoleo_batch_cls_alias_maps_to_unit(
-    tmp_path, monkeypatch,
-) -> None:
-    """Back-compat: ``batch_cls`` is aliased to ``batch_cls_unit`` so existing
-    pre-B29 dispatch scripts still validate."""
-    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
-    xp = dispatch_v14.build_v14_experiment(
-        mode="nano", dkoleo_mode="batch_cls",
-    )
-    assert xp is not None
+    with pytest.raises(TypeError):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", dkoleo_mode="vicreg_slot_variance",
+        )
 
 
 def test_b29_dispatch_invalid_subtype_vocab_rejected(
@@ -960,10 +970,13 @@ def test_b29_cli_no_ref_embed_reuse_kv_flag_disables_reuse() -> None:
     assert args.ref_embed_enabled is False  # B32 default; ``--ref-embed`` not passed
 
 
-def test_b29_cli_no_include_ajile12_flag() -> None:
+def test_b29_cli_no_include_ajile12_flag_removed() -> None:
+    """The redundant ``--no-include-ajile12`` store_false alias was culled
+    2026-06-13 (the default is already OFF); argparse now rejects it."""
+    import pytest
     parser = dispatch_v14._parser()
-    args = parser.parse_args(["--no-include-ajile12"])
-    assert args.include_ajile12 is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--no-include-ajile12"])
 
 
 # ---------------------------------------------------------------------------
@@ -1252,26 +1265,31 @@ def test_r3_bug_4_v14_parcel_perceiver_rejects_bogus_ssl_modes() -> None:
         )
 
 
-def test_b_cr_3_brain_model_config_carries_ssl_dispatch_flags(
+def test_b_cr_3_brain_model_config_keeps_internal_ssl_defaults(
     tmp_path, monkeypatch,
 ) -> None:
-    """``dkoleo_mode`` / ``phase_mode`` were validated by
-    ``build_v14_experiment`` then silently dropped on the floor — the
-    downstream supervised path and the SSL trainer alike never saw them in
-    the persisted config. Lock them as named fields on the
-    ``V14ParcelPerceiver`` config so they ride along with the run record.
+    """The ``--dkoleo-mode`` (B28-demoted) / ``--phase-mode`` (B36) CLI selectors
+    and their ``build_v14_experiment`` kwargs were culled 2026-06-13: passing
+    either now raises TypeError, and a default build records the
+    ``V14ParcelPerceiver`` config's own internal defaults
+    (``dkoleo_mode="off"`` / ``phase_mode="joint_b29"``) on the run record.
     (``anatomy_bias_mode`` was removed with the soft routing bias by the B36
     hard pool, 2026-06-01.)
     """
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
-    xp = dispatch_v14.build_v14_experiment(
-        mode="nano",
-        dkoleo_mode="vicreg_slot_variance",
-        phase_mode="split_p1_p2",
-    )
+    import pytest
+
+    with pytest.raises(TypeError):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", dkoleo_mode="vicreg_slot_variance",
+        )
+    with pytest.raises(TypeError):
+        dispatch_v14.build_v14_experiment(mode="nano", phase_mode="split_p1_p2")
+
+    xp = dispatch_v14.build_v14_experiment(mode="nano")
     cfg = xp.brain_model_config
-    assert cfg.dkoleo_mode == "vicreg_slot_variance"
-    assert cfg.phase_mode == "split_p1_p2"
+    assert cfg.dkoleo_mode == "off"
+    assert cfg.phase_mode == "joint_b29"
 
 
 def test_b23_dispatch_joint_phase_wires_shaft_mask_extractor(
@@ -1441,6 +1459,32 @@ def test_dp9_guard_raises_on_parcel_labels_divergence() -> None:
     with pytest.raises(ValueError, match="DP9"):
         dispatch_v14._assert_support_valid_config_agree(
             _dk(), _vm(parcel_labels=("ctx-lh-bankssts",)),
+        )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_raises_on_label_column_divergence() -> None:
+    """Atlas-column-only divergence (one extractor on the DK column, the other on
+    DKT) must fail loud. The two K-vocabularies can even share a length, so a
+    silent column mismatch would route row ``c`` through different anatomy with no
+    error — exactly the C1/C2 desync the guard exists to catch. Pins the
+    ``label_column`` axis the DKT swap (#155) introduced. (audit gap, 2026-06-13)"""
+    with pytest.raises(ValueError, match="DP9"):
+        dispatch_v14._assert_support_valid_config_agree(
+            _dk(label_column="DKT"), _vm(label_column="DesikanKilliany"),
+        )
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_dp9_guard_raises_on_exclude_single_electrode_divergence() -> None:
+    """The single-electrode-parcel drop (#154) zeroes a support row AND flips its
+    valid flag; if only ONE extractor excludes, that row's support and valid_mask
+    describe different coverage. The shared-config tuple includes the exclusion
+    flag, so a one-sided setting must fail loud. (audit gap, 2026-06-13)"""
+    with pytest.raises(ValueError, match="DP9"):
+        dispatch_v14._assert_support_valid_config_agree(
+            _dk(exclude_single_electrode_parcels=True),
+            _vm(exclude_single_electrode_parcels=False),
         )
 
 

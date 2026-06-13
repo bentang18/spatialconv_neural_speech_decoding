@@ -35,6 +35,7 @@ from neuralset.extractors.base import BaseStatic
 
 from speech_decoding.extractors.dk_support import _coerce_subject_id
 from speech_decoding.studies.braintreebank.anatomy import (
+    DEFAULT_BT_LABEL_COLUMN,
     V14_DK_PARCEL_LABELS,
     aligned_voltage_support,
     lite_voltage_mask,
@@ -63,6 +64,13 @@ class ElectrodeValidMask(BaseStatic):
     c_max: int = 384
     unmapped_policy: tp.Literal["raise", "zero"] = "raise"
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS
+    # Atlas column partner of ``parcel_labels`` — see V14DKHardSupportExtractor.
+    # Must match the support extractor (``_assert_support_valid_config_agree``).
+    label_column: str = DEFAULT_BT_LABEL_COLUMN
+    # Single-electrode-parcel drop (Ben 2026-06-13): the lone electrode's
+    # ``valid`` flips to False here too, so the mask stays row-aligned with the
+    # support extractor's zeroed row. Must match the support extractor.
+    exclude_single_electrode_parcels: bool = False
     electrode_set: tp.Literal["all", "lite"] = "all"
 
     def get_static(self, event: Event) -> torch.Tensor:
@@ -79,6 +87,8 @@ class ElectrodeValidMask(BaseStatic):
                 subject_id,
                 parcel_labels=self.parcel_labels,
                 unmapped_policy=self.unmapped_policy,
+                label_column=self.label_column,
+                exclude_single_electrode_parcels=self.exclude_single_electrode_parcels,
             ).valid
         )
         n_voltage = int(valid.shape[0])

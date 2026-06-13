@@ -7,7 +7,7 @@ locked in ``memory/project_v14_encoder_design_2026_05_13.md``.
 DCC invocation (via ``scripts/dcc/dispatch``):
 
     scripts/dcc/dispatch -m speech_decoding.experiments.dispatch_v14 \\
-        --mode lite --eps 1e-2 --m-sub-slots 4 --d-model 128 --depth 6
+        --mode lite --m-sub-slots 4 --d-model 128 --depth 6
 
 Smoke-test (laptop, no BT data):
 
@@ -47,14 +47,21 @@ from speech_decoding.extractors.ref_aug import (
 from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 from speech_decoding.extractors.subtype_meta import SubjectSubtypeExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
-from speech_decoding.extractors.view import MultiStftView
+from speech_decoding.extractors.view import (
+    STFT_2BAND_HIGH,
+    STFT_2BAND_LOW,
+    MultiStftView,
+)
 from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
 from speech_decoding.studies.braintreebank.anatomy import (
-    DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
+    atlas_spec,
 )
 from speech_decoding.studies.braintreebank.manifest import V14_TRAIN_SUBJECT_IDS
-from speech_decoding.studies.braintreebank.study import Wang2024Treebank
+from speech_decoding.studies.braintreebank.study import (
+    _SESSIONS_BY_MODE,
+    Wang2024Treebank,
+)
 from speech_decoding.studies.braintreebank.word_events import (
     BTWordEvents,
     DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
@@ -149,48 +156,23 @@ MAINS_NOTCH_BY_CORPUS: dict[str, float] = {
     "swec": 50.0,
 }
 
-# B28 DKoleo demotion 2026-05-27 PM (B28 Item 1) + B29 sister-set
-# expansion 2026-05-27 PM-late: DKoleo @ M4 is OFF by default; the four
-# modes select which collapse-prevention sister arms the loss.
-#
-#   * ``off`` (default) — the B31 2-term base loss; no DKoleo arm at all.
-#   * ``intra_clip_slots`` — B21-original per-clip × 80 slots (was 320
-#     under M=4) unit, kept as the falsifier sister ``R-dkoleo-intra-clip-slots``.
-#   * ``batch_cls_unit`` — DINOv2-faithful per-batch × CLS-analog
-#     (utterance PMA-pooled vectors) unit (``R-dkoleo-batch-cls-unit``).
-#   * ``vicreg_slot_variance`` — per-dim variance hinge per VICReg
-#     (Bardes 2022), gated by MON-SLOT-REDUNDANCY's diag-zeroed mean
-#     threshold (``R-vicreg-slot-variance``).
-#
-# Pre-B29 alias: ``batch_cls`` is accepted and silently maps to
-# ``batch_cls_unit`` for back-compat with the 2026-05-27 PM (pre-late)
-# dispatch surface. The composer in ``ssl/total_loss.py`` applies the
-# locked ``W_DKOLEO_M4=0.1`` weight when a tensor is supplied; the unit
-# choice is made upstream of the composer.
-DKOLEO_MODES: tuple[str, ...] = (
-    "off", "intra_clip_slots", "batch_cls_unit", "vicreg_slot_variance",
-)
-_DKOLEO_MODE_ALIASES: dict[str, str] = {"batch_cls": "batch_cls_unit"}
-DEFAULT_DKOLEO_MODE: str = "off"
+# B28 DKoleo demotion 2026-05-27 PM (B28 Item 1): DKoleo @ M4 is OFF by default.
+# The ``--dkoleo-mode`` CLI sister-selector was culled 2026-06-13 (B28-demoted);
+# the encoder keeps its own ``dkoleo_mode="off"`` internal default, so dispatch
+# no longer threads a value.
 
 # B29 Item 11 lock 2026-05-27 PM-late: subtype embed vocab choice.
 SUBTYPE_EMBED_VOCABS: tuple[str, ...] = ("binary", "three_way")
 DEFAULT_SUBTYPE_EMBED_VOCAB: str = "binary"
 
-# B29 Item 14 lock 2026-05-27 PM-late + MoE-FFN audit 2026-05-28: dense
-# FFN preserved (default); ``soft_moe_4`` is the P2-if-budget sister
-# pending a separate ``models/soft_moe.py`` build (Puigcerver 2024).
-FFN_VARIANTS: tuple[str, ...] = ("dense", "soft_moe_4")
-DEFAULT_FFN_VARIANT: str = "dense"
+# MoE-FFN audit 2026-05-28: dense FFN preserved. The ``--ffn-variant`` CLI flag
+# (and its ``soft_moe_4`` audit-rejected sister) was culled 2026-06-13 — the
+# encoder is always dense; dispatch no longer threads a variant.
 
-# B36 phase-mode relabel 2026-06-03: B36 reverses the B29 joint phase back
-# to a staged P1 (front-end M2, all corpora) -> P2 (parcel M4, anatomy
-# corpora, front-end LR/10) regime, so the recorded-only default regime is
-# now ``split_p1_p2``. Behavioral stage selection is via ``--jepa-phase``
-# (p1/p2), not this axis. ``joint_b29`` survives as the B29-collapse
-# falsifier sister (R-joint-ssl).
-PHASE_MODES: tuple[str, ...] = ("joint_b29", "split_p1_p2")
-DEFAULT_PHASE_MODE: str = "split_p1_p2"
+# B36 phase-mode relabel 2026-06-03: the ``--phase-mode`` CLI axis was
+# recorded-only run-record metadata (joint_b29 / split_p1_p2 falsifier) and was
+# culled 2026-06-13. The encoder keeps its own ``phase_mode`` internal default;
+# the behavioral stage is selected via ``--jepa-phase``.
 
 # B36 staged masked-JEPA sub-phase (within the joint SSL experiment, --phase 1).
 # ``p1`` = front-end M2 masked prediction (all corpora); ``p2`` = parcel M4
@@ -210,13 +192,26 @@ DEFAULT_FRONTEND_LR_SCALE: float = 0.1
 # joint-SSL (``ssl_mode``) + masking/predictor knobs (#75/#76). The mask
 # ratios/types mirror the 6/03 masking lock (ssl/mask.py signature defaults);
 # the predictor sizes mirror the V14JointExperiment pydantic field defaults.
-DEFAULT_POOL: str = "cross_attn"
+# NOTE (2026-06-13): pool=mean + ssl_mode=joint are KEPT at the B37 values
+# because they are interlocked with the committed B36-staged-SSL cull (auto now
+# always resolves to joint, which requires the freq-preserving mean pool). The
+# geometry/hyperparam knobs (d_model / latent_depth / predictor sizes /
+# weight_decay) are left at their pre-B37 values — the in-flux capstone geometry
+# is configured per-run via explicit CLI flags, not pinned here, so the code
+# default can't drift back into "lying" about a specific production recipe.
+DEFAULT_POOL: str = "mean"                 # B37 mean-pool (interlocked w/ joint SSL default + staged cull)
 DEFAULT_LATENT_DEPTH: int = 2
 DEFAULT_LATENT_MODE: str = "parcel"       # B37+ "joint" = parcel×time freq-batched
 DEFAULT_MEAN_POOL_STD: bool = False       # B37+ RGB-style mean|std stem channel
-DEFAULT_SSL_MODE: str = "staged"          # main() resolves "auto" per pool
+DEFAULT_SSL_MODE: str = "joint"           # B37 single-forward joint SSL (interlocked w/ pool=mean + staged cull)
 DEFAULT_LAMBDA_M4: float = 1.0            # D7 M4 term weight
-DEFAULT_M2_PREDICTOR_DEPTH: int = 3       # D9 per-tap (front-end M2)
+# Predictor depth auto-rule (Ben 2026-06-12): when --m2/m4-predictor-depth is
+# left unset, each predictor defaults to HALF the depth of the encoder it
+# predicts from — M2 (front-end) tracks --depth, M4 (parcel) tracks
+# --latent-depth (see main()). These constants are the fallback for direct
+# build_v14_experiment() callers (tests); the CLI resolves None via the
+# half-rule so a depth sweep auto-scales its predictor.
+DEFAULT_M2_PREDICTOR_DEPTH: int = 3       # D9 per-tap (front-end M2) = depth//2 @ depth=6
 DEFAULT_M4_PREDICTOR_DEPTH: int = 2       # D9 per-tap (parcel M4)
 DEFAULT_JOINT_FRONTEND_LR_SCALE: float = 1.0   # D8 (no discrimination)
 DEFAULT_JOINT_PARCEL_LR_SCALE: float = 1.0     # D8 (no discrimination)
@@ -232,7 +227,6 @@ DEFAULT_M2_FREQ_BAND_FLOOR: int = 1       # 6/03 masking lock (M2 band width alo
 # byte-identical to the prior hardcoded value (the ema.py / ssl.mask constants
 # are NOT touched). A passed value overrides the τ / held-out ratio.
 DEFAULT_EMA_TAU: float = 0.99925          # B26 EMA τ lock (V-JEPA 2 §2.4)
-DEFAULT_PREDICTOR_DEPTH: int = 3          # staged single predictor
 DEFAULT_PREDICTOR_HIDDEN: int = 128
 DEFAULT_PREDICTOR_N_HEADS: int = 4
 
@@ -332,7 +326,10 @@ def _assert_support_valid_config_agree(
     to one would make row ``c`` of ``support`` and row ``c`` of ``valid_mask``
     describe different electrodes with no error. Enforce the convention here.
     See reports/bt_alignment/electrode_desync_damage_2026_06_09.md (DP9)."""
-    shared = ("parcel_labels", "unmapped_policy", "c_max", "bt_root", "event_types")
+    shared = (
+        "parcel_labels", "label_column", "exclude_single_electrode_parcels",
+        "unmapped_policy", "c_max", "bt_root", "event_types",
+    )
     mismatched = {
         field: (getattr(dk_extractor, field), getattr(valid_mask_extractor, field))
         for field in shared
@@ -499,6 +496,24 @@ def build_v14_experiment(
     pretrain_holdout_fraction: float = DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
     binary_tasks: bool = True,
     electrode_tokens_extractor: tp.Any | None = None,
+    # Front-end family for the DEFAULT (no custom extractor) path.
+    #   "raw"   — single F=50 raw |STFT| grid (FE-RAW-1, B36 default).
+    #   "2stft" — dual-band 2STFT (Ben 2026-06-12): TWO single-band MultiStftViews
+    #             (front_end="band") at DIFFERENT native hops, carried as separate
+    #             batch keys electrode_tokens (LOW, N=512/hop256, 14 bins @ 8 Hz)
+    #             + electrode_tokens_high (HIGH, N=128/hop64, 9 bins @ 16 Hz). Sets
+    #             the encoder per_band_stem=True with the two Conv2d band stems;
+    #             band freq-bin counts are DERIVED from the views (no drift) and
+    #             time-bin counts from clip_len. Requires pool="mean".
+    # Ignored when a custom ``electrode_tokens_extractor`` is supplied.
+    frontend: tp.Literal["raw", "2stft"] = "raw",
+    # Cache-build parallelism (--cache-only): restrict the SSL/study corpus to a
+    # single session by its index in ``_SESSIONS_BY_MODE[study_mode]`` so a SLURM
+    # array builds one session's spec cache per task. None = full corpus. The
+    # subset rides the study's timeline list ONLY — it does not change the
+    # extractor uid or the per-session spec-cache key, so a cache built under one
+    # index is byte-identical to what the full run reads back.
+    cache_session_index: int | None = None,
     # C3 (WS-C, B13): per-(electrode, freq, session) robust-z on the default
     # MultiStftView. True (the real-run default) fits frozen median/MAD per
     # session over its own full recording in prepare() and applies it per clip;
@@ -544,7 +559,19 @@ def build_v14_experiment(
     # for a standalone build. Distinct exca cache-uid only when "lite" (the
     # default serialises unchanged → existing valid_mask cache reused). BT-only.
     electrode_set: tp.Literal["all", "lite"] = "all",
-    eps: float = DEFAULT_SUPPORT_BIAS_EPS,
+    # Parcellation atlas. "dk" (default) = FreeSurfer Desikan-Killiany, K=80;
+    # "dkt" = Desikan-Killiany-Tourville, K=74 (native depth-wm.csv DKT column,
+    # 62 cortical = DK 34 bases minus {bankssts,frontalpole,temporalpole} per
+    # hemi + 12 aseg subcortical). Selecting an atlas moves the depth-wm column
+    # AND the parcel vocabulary together (anatomy.atlas_spec) — they can never
+    # desync — and sets the encoder's k_parcels = len(vocabulary).
+    atlas: tp.Literal["dk", "dkt"] = "dk",
+    # Ben 2026-06-13: drop parcels covered by exactly ONE valid electrode — the
+    # lone electrode is zeroed + marked invalid, the parcel left uncovered for
+    # that subject (global K unchanged). A single-electrode parcel has a
+    # degenerate within-parcel std (=0) that poisons the heteroscedastic M4
+    # precision weight. Applied identically to the support + valid_mask extractors.
+    exclude_single_electrode_parcels: bool = False,
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
     n_heads: int = DEFAULT_N_HEADS,
@@ -680,14 +707,6 @@ def build_v14_experiment(
     # at the standard transformer-training precision floor.
     precision: str | None = "bf16-mixed",
     fast_dev_run: bool | int = False,
-    # B28 DKoleo demotion 2026-05-27 PM: select the DKoleo @ M4 unit
-    # (or disable). Plumbed onto the brain-model config so the SSL
-    # training loop sees it; the downstream Phase-4 path treats it as
-    # informational.
-    dkoleo_mode: str = DEFAULT_DKOLEO_MODE,
-    # B28 cross-attn collapse 2026-05-27 PM: ``[0]`` Perceiver IO default,
-    # ``[0, 3]`` opt-in via ``R-perceiver-original-2-cross-attns`` sister.
-    cross_attn_positions: list[int] | None = None,
     # B29 Item 11 + 5/28 PM precedent-audit flip 2026-05-28: subtype default
     # ON → OFF (Agent 2 found M3AE precedent net-neutral on iEEG via DIVER-1
     # §4.1).
@@ -703,15 +722,11 @@ def build_v14_experiment(
     subtype_embed_vocab: str = DEFAULT_SUBTYPE_EMBED_VOCAB,
     ref_embed_enabled: bool = False,
     ref_embed_reuse_kv: bool = True,
-    # B29 phase-mode + corpus mix lock 2026-05-27 PM-late.
-    phase_mode: str = DEFAULT_PHASE_MODE,
+    # B29 corpus mix lock 2026-05-27 PM-late.
     include_ajile12: bool = DEFAULT_INCLUDE_AJILE12,
     ref_operator_alpha: float = DEFAULT_REF_OPERATOR_ALPHA,
     corpus_mix: dict[str, float] | None = None,
     notch_filter_hz_by_corpus: dict[str, float] | None = None,
-    # B29 Item 14 + MoE-FFN audit 2026-05-28: dense default; soft_moe_4
-    # is the P2-if-budget sister.
-    ffn_variant: str = DEFAULT_FFN_VARIANT,
     # B2.1 (#96) phase-switch hook. When ``joint_phase=True`` the builder
     # returns a :class:`V14JointExperiment` (pinned to ``phase=1`` via its
     # ``model_post_init`` check, B29 Item 1 P1+P2 collapse) instead of a
@@ -723,14 +738,6 @@ def build_v14_experiment(
     # raise at *construction* (model_post_init), so wiring the dispatch never
     # silently downgrades to Phase-4 CE.
     joint_phase: bool = False,
-    # B30-dispatch-sister-flags (drift-table row added 2026-05-28 by R12
-    # wiring audit). Default values match the B30 lock; non-default
-    # values flag :class:`NotImplementedError` from
-    # :class:`V14JointExperiment.model_post_init` until the corresponding
-    # runtime branch (B2.2 aggregator-call / encoder latent-SA key-only)
-    # lands. Persisted onto the run record so the choice is grep-able.
-    latent_valid_override: str = "support",
-    sa_mask_mode: str = "bidirectional",
     # B31 lock 2026-05-28 PM-late (V-JEPA-2-canonical 2-term joint SSL
     # default). ``"b31_default"`` is the locked first-pass shape; the
     # three sisters reinstate the B28/B29 dropped terms for
@@ -811,7 +818,8 @@ def build_v14_experiment(
     # ``n^α`` exponent (α=1 raw count; α<1 damps high-n electrode redundancy).
     m4_precision_weight: bool = False,
     m4_precision_alpha: float = 1.0,
-    predictor_depth: int = DEFAULT_PREDICTOR_DEPTH,
+    m4_precision_floor_pct: float = 25.0,
+    m4_precision_cap: float = 10.0,
     predictor_hidden: int = DEFAULT_PREDICTOR_HIDDEN,
     predictor_n_heads: int = DEFAULT_PREDICTOR_N_HEADS,
     # WS-H / T20 (B33 P3 distillation): root of the whole-movie Whisper teacher
@@ -841,14 +849,19 @@ def build_v14_experiment(
     # brain-model config; the encoder forward gates it on training + grad
     # so the no_grad teacher pass is never checkpointed. Numerics-safe.
     gradient_checkpointing: bool = False,
-    # 2026-06-08 ragged front-end (#91): default-off. When True, the encoder's
-    # per-electrode token blocks run only over valid electrodes (pad rows
-    # gathered out, scattered back as zeros before the pool) and the P1 M2 loss
-    # drops pad electrodes. Valid-electrode M2/M4 + P2 loss are bit-identical;
-    # only the P1 loss mean changes (no longer dilutes on pad). Cuts the
-    # token-block + predictor FFN by the pad fraction (~50% at BT-Lite c_max=256
-    # ⇒ unblocks raw bs=8 + ~halves front-end step time on padded batches).
-    ragged_frontend: bool = False,
+    # 2026-06-08 ragged front-end (#91): DEFAULT-ON (flipped 2026-06-12 — Ben:
+    # "all ragged optimizations default on"). When ON, the encoder's per-row
+    # token blocks run only over valid rows (cross_attn: valid electrodes;
+    # mean-pool: COVERED parcels) — pad/uncovered rows gathered out, scattered
+    # back as zeros before the pool — and the P1 M2 loss drops pad rows.
+    # Valid-row M2/M4 + P2 loss are bit-identical; only the P1 loss mean changes
+    # (no longer dilutes on pad). Cuts the token-block + predictor FFN by the pad
+    # fraction (~50% at BT-Lite c_max=256 ⇒ unblocks raw bs=8 + ~halves
+    # front-end step time on padded batches). On the mean path with masking
+    # active the uncovered-parcel drop is FOLDED into ragged_token's visible-token
+    # gather (one combined gather, no double-drop). --no-ragged-frontend restores
+    # the dense path.
+    ragged_frontend: bool = True,
     # 2026-06-09 ragged parcel drop (#92): DEFAULT-ON (flipped after the
     # warm-4-GPU throughput matrix). When ON, the P2 parcel encoder gathers only
     # covered-&-visible parcels (pad-to-max per sample), runs the parcel/time SA
@@ -989,12 +1002,16 @@ def build_v14_experiment(
             "ROOT_DIR_BRAINTREEBANK must be set or bt_root passed explicitly"
         )
 
-    dkoleo_mode = _DKOLEO_MODE_ALIASES.get(dkoleo_mode, dkoleo_mode)
-    _validate_choice("dkoleo_mode", dkoleo_mode, DKOLEO_MODES)
+    # Resolve the atlas to its matched (depth-wm column, parcel vocabulary) pair —
+    # the SINGLE source so the column and vocabulary can never desync — and derive
+    # k_parcels from the vocabulary length (DK→80, DKT→74). Both the support and
+    # the valid_mask extractor are built from THIS pair (verified by
+    # _assert_support_valid_config_agree below).
+    atlas_label_column, atlas_parcel_labels = atlas_spec(atlas)
+    k_parcels = len(atlas_parcel_labels)
+
     _validate_choice("subtype_embed_vocab", subtype_embed_vocab, SUBTYPE_EMBED_VOCABS)
     subtype_vocab_size = 2 if subtype_embed_vocab == "binary" else 3
-    _validate_choice("phase_mode", phase_mode, PHASE_MODES)
-    _validate_choice("ffn_variant", ffn_variant, FFN_VARIANTS)
     _validate_choice("loss_variant", loss_variant, LOSS_VARIANTS)
     _validate_choice("jepa_phase", jepa_phase, JEPA_PHASES)
 
@@ -1045,15 +1062,6 @@ def build_v14_experiment(
         min_lr_ratio=min_lr_ratio, weight_decay=weight_decay,
         optimizer_name=optimizer_name, adam_betas=adam_betas,
     )
-
-    if ffn_variant != "dense":
-        # MoE-FFN audit 2026-05-28: ``soft_moe_4`` is reserved as a P2
-        # if-budget sister and requires ``models/soft_moe.py``. Fail
-        # closed until that lands.
-        raise NotImplementedError(
-            f"ffn_variant={ffn_variant!r} requires models/soft_moe.py "
-            "(R-moe-ffn-soft-4 P2 if-budget sister; not yet built)."
-        )
 
     # B29 corpus mix sum-to-1.0 assertion.
     corpus_mix = dict(corpus_mix) if corpus_mix is not None else dict(DEFAULT_CORPUS_MIX)
@@ -1133,25 +1141,12 @@ def build_v14_experiment(
     elif spec_cache_dir is None and extractor_cache_folder is not None:
         spec_cache_dir = str(Path(extractor_cache_folder) / "v14_spec_cache")
 
+    # 2STFT dual-band front-end emits a SECOND batch key (electrode_tokens_high).
+    # None on the single-grid raw/fbank path + when a custom extractor is supplied.
+    high_band_extractor: tp.Any | None = None
+    # True only for the dual-band path → threads to the encoder's per_band_stem.
+    per_band_stem = False
     if electrode_tokens_extractor is None:
-        # WS-C / C2 (B36) + FE-RAW-1 (2026-06-04): Multi-STFT front-end, RAW
-        # |STFT| bins (F=50, front_end="raw" default), hop=128 → 16 Hz (8 Hz
-        # latent), raw |X| via apply_log=False. C4: 0.5 Hz HPF removes DC + slow
-        # drift before the STFT. C3: StandardScaler dropped (scaler=None) —
-        # robust-z normalizes the front-end output downstream of the view (see
-        # Nv14RobustZTransform / SessionRobustZNormalizer).
-        mstft_kwargs: dict[str, tp.Any] = dict(
-            event_types="Ieeg",
-            car="shaft",
-            notch_filter=effective_bt_notch_hz,
-            filter=(0.5, None),
-            scaler=None,
-            apply_log=False,
-            channel_order="original",
-            c_max=c_max,
-            session_robust_z=session_robust_z,
-            spec_cache_dir=spec_cache_dir,
-        )
         # DP4 (2026-06-09): MNE-LOF bad-channel drop is GATED OFF at dispatch.
         # LOF (drop_bads) removes electrodes PER-TRIAL inside the front-end before
         # the scatter, packing the survivors into rows 0..k-1. But the DK
@@ -1174,10 +1169,67 @@ def build_v14_experiment(
                 "Keep LOF off until per-event support/valid_mask plumbing lands. "
                 "See reports/bt_alignment/electrode_desync_damage_2026_06_09.md."
             )
-        electrode_tokens_extractor = MultiStftView(**mstft_kwargs)
+        # Front-end config shared by every default view (raw + both 2STFT bands):
+        # WS-C / C2 (B36) + FE-RAW-1 — RAW |STFT| (apply_log=False), C4 0.5 Hz HPF
+        # removes DC + slow drift, C3 StandardScaler dropped (robust-z downstream).
+        common_fe_kwargs: dict[str, tp.Any] = dict(
+            event_types="Ieeg",
+            car="shaft",
+            notch_filter=effective_bt_notch_hz,
+            filter=(0.5, None),
+            scaler=None,
+            apply_log=False,
+            channel_order="original",
+            c_max=c_max,
+            session_robust_z=session_robust_z,
+        )
+        if frontend == "2stft":
+            # The dual-band stems live on the B37 mean-pool path only (the encoder
+            # raises the same check at build, but fail at dispatch for a clear msg).
+            if pool != "mean":
+                raise ValueError(
+                    f"--frontend 2stft requires --pool mean (the 2STFT dual-band "
+                    f"stem is the B37 mean-pool path); got pool={pool!r}."
+                )
+            # Dual-band 2STFT (Ben 2026-06-12): TWO single-band MultiStftViews at
+            # DIFFERENT native hops (no common time grid). LOW (N=512/hop256, 4-56
+            # Hz, 14 bins @ 8 Hz) → ``electrode_tokens``; HIGH (N=128/hop64, 64-192
+            # Hz, 9 bins @ 16 Hz) → ``electrode_tokens_high``. Each band runs its
+            # OWN session-robust-z fit (per-band display + cache). Separate spec
+            # caches (distinct STFT config → distinct whole-movie memmap), kept in
+            # sibling subdirs so the two never collide. The encoder's two Conv2d
+            # band stems reconcile them onto one 62.5 ms token grid (per_band_stem).
+            low_spec_cache = (
+                str(Path(spec_cache_dir) / "band_low")
+                if spec_cache_dir is not None else None
+            )
+            high_spec_cache = (
+                str(Path(spec_cache_dir) / "band_high")
+                if spec_cache_dir is not None else None
+            )
+            electrode_tokens_extractor = MultiStftView(
+                **common_fe_kwargs, front_end="band", **STFT_2BAND_LOW,
+                hop_length=int(STFT_2BAND_LOW["band_hop"]),
+                spec_cache_dir=low_spec_cache,
+            )
+            high_band_extractor = MultiStftView(
+                **common_fe_kwargs, front_end="band", **STFT_2BAND_HIGH,
+                hop_length=int(STFT_2BAND_HIGH["band_hop"]),
+                spec_cache_dir=high_spec_cache,
+            )
+            per_band_stem = True
+        else:
+            # FE-RAW-1 single F=50 raw |STFT| grid (hop=128 → 16 Hz, 8 Hz latent).
+            electrode_tokens_extractor = MultiStftView(
+                **common_fe_kwargs, spec_cache_dir=spec_cache_dir,
+            )
     _apply_extractor_cache(
         electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
     )
+    if high_band_extractor is not None:
+        _apply_extractor_cache(
+            high_band_extractor, "electrode_tokens_high", extractor_cache_folder
+        )
 
     # The encoder's ``ref_idx`` token must label the operator the
     # waveform actually saw. When the caller hands in a
@@ -1229,6 +1281,31 @@ def build_v14_experiment(
             )
         n_time_bins = electrode_tokens_extractor.n_time_bins_for_duration(clip_len)
 
+    # 2STFT band geometry → encoder per_band_stem (§3b). Derived from the band
+    # VIEWS so the stem grid can never drift from the data: freq-bin counts from
+    # each view's authoritative ``_band_bins()`` (physical-edge → rfft-k slice;
+    # low 14, high 9), time-bin counts (STFT frame counts) from clip_len at each
+    # band's native hop. The encoder floors these onto the patch grid (low fk2/tk1
+    # → 7 patches @ 8 Hz; high fk3/tk2 → 3 patches @ 16 Hz; F_p=7+3=10). None on
+    # the single-grid raw path. ``n_time_bins`` above already reflects the LOW
+    # band (electrode_tokens) — the top-level RoPE ceiling is harmless-unused on
+    # the dual-band path (the encoder sizes the dual-rate RoPE from these maxima).
+    band_geometry: dict[str, int] = {}
+    if per_band_stem:
+        assert high_band_extractor is not None  # set together with per_band_stem
+        k0_lo, k1_lo = electrode_tokens_extractor._band_bins()
+        k0_hi, k1_hi = high_band_extractor._band_bins()
+        band_geometry = {
+            "band_low_n_freq_bins": k1_lo - k0_lo + 1,
+            "band_high_n_freq_bins": k1_hi - k0_hi + 1,
+            "band_low_n_time_bins": electrode_tokens_extractor.n_time_bins_for_duration(
+                clip_len
+            ),
+            "band_high_n_time_bins": high_band_extractor.n_time_bins_for_duration(
+                clip_len
+            ),
+        }
+
     # Leakage decouple (#82): the SSL/distill phases (P1/P2 joint, P3 distill)
     # pretrain on the Neuroprobe-legal corpus (V14_PRETRAIN_SESSIONS, disjoint
     # from the 12 eval sessions) under a "Pretrain" split that sends every legal
@@ -1268,9 +1345,25 @@ def build_v14_experiment(
             f"clip-budget lite={budget_mode == 'lite'}/nano={budget_mode == 'nano'} "
             f"(from resolved universe, NOT --mode={mode!r})"
         )
+    session_subset: tuple[tuple[int, int], ...] | None = None
+    if cache_session_index is not None:
+        corpus_sessions = list(_SESSIONS_BY_MODE[study_mode])
+        if not 0 <= cache_session_index < len(corpus_sessions):
+            raise ValueError(
+                f"--cache-session-index {cache_session_index} out of range for "
+                f"study mode={study_mode!r} ({len(corpus_sessions)} sessions: "
+                f"valid 0..{len(corpus_sessions) - 1})"
+            )
+        s_id, t_id = corpus_sessions[cache_session_index]
+        session_subset = ((int(s_id), int(t_id)),)
+        print(
+            f"[cache-only] session-index {cache_session_index} → "
+            f"({s_id}, {t_id}) (of {len(corpus_sessions)} in mode={study_mode!r})"
+        )
     study = Wang2024Treebank(
         path=Path(bt_root), mode=study_mode,
         infra_timelines={"cluster": None},
+        session_subset=session_subset,
     )
     # Class-balance only the P4 eval (Neuroprobe parity). SSL phases
     # (pretrain/p3_distill) are label-free → keep EVERY word + nonverbal anchor
@@ -1296,11 +1389,15 @@ def build_v14_experiment(
     dk_extractor = V14DKHardSupportExtractor(
         event_types="Ieeg", bt_root=bt_root, unmapped_policy="zero",
         c_max=c_max,
+        parcel_labels=atlas_parcel_labels, label_column=atlas_label_column,
+        exclude_single_electrode_parcels=exclude_single_electrode_parcels,
     )
     _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(
         event_types="Ieeg", bt_root=bt_root, c_max=c_max,
         unmapped_policy="zero", electrode_set=electrode_set,
+        parcel_labels=atlas_parcel_labels, label_column=atlas_label_column,
+        exclude_single_electrode_parcels=exclude_single_electrode_parcels,
     )
     _apply_extractor_cache(valid_mask_extractor, "valid_mask", extractor_cache_folder)
     _assert_support_valid_config_agree(dk_extractor, valid_mask_extractor)
@@ -1334,6 +1431,12 @@ def build_v14_experiment(
         "ref_idx": ref_idx_extractor,
         "subject_subtype": subtype_extractor,
     }
+    # 2STFT: the HIGH band is a SECOND batch key sharing electrodes/support/
+    # valid_mask with the low band (electrode_tokens). The collate pads it to the
+    # same C_max with its own (F_high, T_high) axes; the encoder per_band_stem
+    # consumes both. Present only on the dual-band path.
+    if high_band_extractor is not None:
+        segmenter_extractors["electrode_tokens_high"] = high_band_extractor
     if joint_phase:
         shaft_mask_extractor = BTShaftMaskExtractor(
             event_types="Ieeg",
@@ -1458,12 +1561,14 @@ def build_v14_experiment(
         _frontend_lr_scale = joint_frontend_lr_scale if _joint else frontend_lr_scale
         extra_experiment_kwargs = {
             "phase": JOINT_PHASE_VALUE,
-            # B30-dispatch-sister-flags persisted onto the joint
-            # experiment so the run-record YAML records the sister
-            # choice; the field validators in V14JointExperiment refuse
-            # non-default values until the runtime branch lands.
-            "latent_valid_override": latent_valid_override,
-            "sa_mask_mode": sa_mask_mode,
+            # B30-dispatch-sister-flags: the ``--latent-valid-override`` /
+            # ``--sa-mask-mode`` CLI selectors were culled 2026-06-13 (their
+            # non-"support"/non-"bidirectional" choices were always
+            # NotImplementedError sisters). Hardcode the B30-lock values so the
+            # run-record YAML still records them; the V14JointExperiment field
+            # validators keep raising on any non-default that reaches them.
+            "latent_valid_override": "support",
+            "sa_mask_mode": "bidirectional",
             # B31 loss-variant selector: 2-term default + 3 sister arms.
             "loss_variant": loss_variant,
             # B36 staged masked-JEPA sub-phase (H4): p1 front-end M2 / p2
@@ -1480,10 +1585,11 @@ def build_v14_experiment(
             "m2_predictor_depth": m2_predictor_depth,
             "m4_predictor_depth": m4_predictor_depth,
             "joint_parcel_lr_scale": joint_parcel_lr_scale,
-            # #75/#76 masking + predictor sizing (staged + joint). The joint M2/M4
-            # predictors share hidden/n_heads; their depths come from
-            # m{2,4}_predictor_depth above. predictor_depth is the staged single
-            # predictor's depth.
+            # #75/#76 masking + predictor sizing. The joint M2/M4 predictors
+            # share hidden/n_heads; their depths come from m{2,4}_predictor_depth
+            # above. The staged single predictor's depth (V14JointExperiment
+            # ``predictor_depth`` field) keeps its own default — dispatch no
+            # longer threads a CLI value for it (staged CLI path culled).
             "m2_mask_type": m2_mask_type,
             "m2_mask_ratio": m2_mask_ratio,
             "m4_mask_type": m4_mask_type,
@@ -1501,7 +1607,8 @@ def build_v14_experiment(
             # default — opt-in via --m4-precision-weight on the run.
             "m4_precision_weight": m4_precision_weight,
             "m4_precision_alpha": m4_precision_alpha,
-            "predictor_depth": predictor_depth,
+            "m4_precision_floor_pct": m4_precision_floor_pct,
+            "m4_precision_cap": m4_precision_cap,
             "predictor_hidden": predictor_hidden,
             "predictor_n_heads": predictor_n_heads,
             # #94 V-JEPA-2 visible-only predictor (context+query drop). Joint-only.
@@ -1569,27 +1676,21 @@ def build_v14_experiment(
         # exempted (ndim<=1) when weight_decay>0.
         extra_experiment_kwargs = {"phase": 4, "wd_exclude_norms": wd_exclude_norms}
     elif (
-        latent_valid_override != "support"
-        or sa_mask_mode != "bidirectional"
-        or loss_variant != DEFAULT_LOSS_VARIANT
+        loss_variant != DEFAULT_LOSS_VARIANT
         or jepa_phase != DEFAULT_JEPA_PHASE
         or frontend_lr_scale != DEFAULT_FRONTEND_LR_SCALE
         or neural_lag_s != DEFAULT_NEURAL_LAG_S
     ):
-        # B30 + B31 + B36 joint-only flags have semantic effect under the
-        # joint phase only. The supervised Phase-4 path doesn't run the SSL
-        # aggregator, the bidirectional-mask latent-SA branch, a staged
-        # masked-JEPA phase, or the P2 discriminative-LR split, so a non-default
-        # flag here would silently mis-record the sister / stage. neural_lag_s
-        # is blocked here for a different reason: it DOES shift the segmenter
-        # window on this path, and a non-zero P4 probe offset breaks the
-        # leaderboard-parity [onset, onset+1 s] window.
+        # B31 + B36 joint-only flags have semantic effect under the joint phase
+        # only. The supervised Phase-4 path doesn't run the SSL aggregator, a
+        # staged masked-JEPA phase, or the P2 discriminative-LR split, so a
+        # non-default flag here would silently mis-record the sister / stage.
+        # neural_lag_s is blocked here for a different reason: it DOES shift the
+        # segmenter window on this path, and a non-zero P4 probe offset breaks
+        # the leaderboard-parity [onset, onset+1 s] window.
         raise ValueError(
-            "latent_valid_override / sa_mask_mode / loss_variant / jepa_phase "
-            "/ frontend_lr_scale / neural_lag_s are B30/B31/B36 joint-phase / "
-            "distill selectors only; got "
-            f"latent_valid_override={latent_valid_override!r}, "
-            f"sa_mask_mode={sa_mask_mode!r}, "
+            "loss_variant / jepa_phase / frontend_lr_scale / neural_lag_s are "
+            "B31/B36 joint-phase / distill selectors only; got "
             f"loss_variant={loss_variant!r}, "
             f"jepa_phase={jepa_phase!r}, "
             f"frontend_lr_scale={frontend_lr_scale!r}, "
@@ -1630,16 +1731,25 @@ def build_v14_experiment(
             "name": "V14ParcelPerceiver",
             "n_freq_bins": n_freq_bins,
             "n_time_bins": n_time_bins,
-            "k_parcels": DEFAULT_K_PARCELS,
+            "k_parcels": k_parcels,
             "d_model": d_model,
             "n_heads": n_heads,
             "depth_self_attn": depth,
             "m_sub_slots": m_sub_slots,
-            "eps": eps,
             "time_last_input": True,
-            # B28 cross-attn collapse (default ``[0]``; sister opt-in
-            # ``[0, 3]`` for ``R-perceiver-original-2-cross-attns``).
-            "cross_attn_positions": cross_attn_positions,
+            # 2STFT dual-band front end (§3b, Ben 2026-06-12): two Conv2d band
+            # stems instead of the single F=50 grid. ``band_geometry`` (freq/time
+            # bin counts) is derived above from the band VIEWS so the stem grid
+            # matches the cached data exactly. Empty on the single-grid raw path
+            # → per_band_stem=False and the band_* kwargs fall to encoder defaults
+            # (inert). The band Conv2d kernels stay at the encoder defaults
+            # (low fk2/tk1, high fk3/tk2) — the §7 falsifier sisters re-point them.
+            "per_band_stem": per_band_stem,
+            **band_geometry,
+            # B28 cross-attn collapse: ``--cross-attn-positions`` was culled
+            # 2026-06-13 (Perceiver, thrown away). The encoder keeps its own
+            # ``cross_attn_positions=None`` (→ [0]) and ``eps`` internal
+            # defaults; dispatch no longer threads either.
             # B29 Item 11 lock 2026-05-27 PM-late: subtype + ref embeds.
             "subtype_vocab": subtype_vocab_size,
             "subtype_embed_enabled": subtype_embed_enabled,
@@ -1685,12 +1795,11 @@ def build_v14_experiment(
             # (std-channel zero-init → no-op at init). Inert under cross_attn.
             "latent_mode": latent_mode,
             "mean_pool_std": mean_pool_std,
-            # SSL-pretrain dispatch flags threaded onto the model config
-            # so they ride along with the persisted run record. The
-            # supervised downstream classifier path does not branch on
-            # them; the SSL trainer reads them from this same snapshot.
-            "dkoleo_mode": dkoleo_mode,
-            "phase_mode": phase_mode,
+            # NOTE: ``dkoleo_mode`` (B28) + ``phase_mode`` (B36) were
+            # recorded-only model-config metadata threaded from the now-culled
+            # ``--dkoleo-mode`` / ``--phase-mode`` CLI flags (2026-06-13). The
+            # encoder keeps its own internal defaults ("off" / "joint_b29"), so
+            # dispatch no longer threads them.
             # NOTE: ``loss_variant`` (B31) lives on the V14JointExperiment
             # field via ``extra_experiment_kwargs`` below, NOT on the
             # brain-model config — the brain-model Pydantic schema is
@@ -1790,10 +1899,6 @@ def _parser() -> argparse.ArgumentParser:
                    help="(default) Binary label derivation per Neuroprobe leaderboard. "
                         "Pass --no-binary-tasks to switch to 3-class multiclass.")
     p.add_argument("--no-binary-tasks", dest="binary_tasks", action="store_false")
-    p.add_argument("--eps", type=float, default=DEFAULT_SUPPORT_BIAS_EPS,
-                   help="Vestigial under the B36 hard pool (reserved for the "
-                        "gated R-bna-soft routing sister); ignored on the "
-                        "default hard-pool path.")
     p.add_argument("--d-model", type=int, default=DEFAULT_D_MODEL)
     p.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
     p.add_argument("--m-sub-slots", type=int, default=DEFAULT_M_SUB_SLOTS)
@@ -1854,10 +1959,6 @@ def _parser() -> argparse.ArgumentParser:
                         "the SSL/distill phases. OFF BY DEFAULT — a run is never "
                         "terminated for you; RankMe/loss monitoring still logs. "
                         "Only arm this for a specific run you WANT auto-aborted.")
-    p.add_argument("--no-collapse-guard", dest="collapse_guard",
-                   action="store_false", default=False,
-                   help="No-op alias: the guard is already OFF by default. Kept "
-                        "for backward compatibility with older launch scripts.")
     p.add_argument("--rankme-warn-threshold", dest="rankme_warn_threshold",
                    type=float, default=None,
                    help="MON-TEACHER-FEATURE-RANK soft-warn band on normalised "
@@ -1916,9 +2017,9 @@ def _parser() -> argparse.ArgumentParser:
                         "§7 lock). Per-group-proportional, so P2/P3 "
                         "discriminative-LR ratios survive a non-zero floor.")
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.05,
-                   help="AdamW weight decay. Default 0.05 = the live-chain / §7 M0 "
-                        "sweep center (M0 #45 sweeps it; the fixed-data regime may "
-                        "argue higher). Only added to the optimizer kwargs when "
+                   help="AdamW weight decay. Default 2.0 = the canonical B37 joint "
+                        "capstone run (ojok37j3; the fixed-data regime argues high "
+                        "WD; M0 #45 still sweeps it). Only added to the optimizer kwargs when "
                         "> 0 (use --optimizer AdamW for decoupled WD). When > 0 the "
                         "no-WD param-group split (#40) exempts biases / LayerNorm "
                         "γβ / embeds — see --no-wd-exclude-norms. Pass 0.0 for the "
@@ -2029,6 +2130,42 @@ def _parser() -> argparse.ArgumentParser:
                         "leaderboard eval cell, Neuroprobe-Lite electrode count) "
                         "else 'all' (full montage = BT-FULL pretraining). 'all'/"
                         "'lite' force the subset. 'lite' is BT-only.")
+    p.add_argument("--frontend", dest="frontend", choices=("raw", "2stft"),
+                   default="raw",
+                   help="Front-end family. 'raw' (default) = single F=50 raw |STFT| "
+                        "grid (FE-RAW-1). '2stft' = dual-band 2STFT (Ben 2026-06-12): "
+                        "two single-band STFTs (low N=512/hop256 4-56Hz 14 bins @ "
+                        "8Hz → electrode_tokens; high N=128/hop64 64-192Hz 9 bins @ "
+                        "16Hz → electrode_tokens_high) reconciled by the encoder's "
+                        "two Conv2d band stems (per_band_stem). Requires --pool mean.")
+    p.add_argument("--atlas", dest="atlas", choices=("dk", "dkt"), default="dk",
+                   help="Parcellation atlas. 'dk' (default) = Desikan-Killiany "
+                        "(K=80); 'dkt' = Desikan-Killiany-Tourville (K=74, native "
+                        "depth-wm.csv DKT column). Moves the depth-wm column AND "
+                        "the parcel vocabulary together (anatomy.atlas_spec) and "
+                        "sets the encoder k_parcels = len(vocabulary).")
+    p.add_argument("--exclude-single-electrode-parcels",
+                   dest="exclude_single_electrode_parcels", action="store_true",
+                   help="Drop parcels covered by exactly ONE valid electrode (the "
+                        "lone electrode is zeroed + marked invalid, parcel left "
+                        "uncovered for that subject; global K unchanged). Avoids "
+                        "degenerate within-parcel std poisoning the heteroscedastic "
+                        "M4 precision weight. Applied to support + valid_mask alike.")
+    p.add_argument("--cache-only", dest="cache_only", action="store_true",
+                   help="Build the front-end spec cache for the (subset of the) "
+                        "SSL corpus, then exit 0 BEFORE constructing the trainer "
+                        "(no GPU, no training). Drives the SAME study.run() → "
+                        "segmenter.apply() → dataset.prepare() path the real run "
+                        "uses, so the materialized cache is byte-identical to what "
+                        "training reads back. Pair with --cache-session-index for a "
+                        "massively-parallel per-session SLURM array on a CPU node.")
+    p.add_argument("--cache-session-index", dest="cache_session_index", type=int,
+                   default=None,
+                   help="With --cache-only: build ONLY the session at this index in "
+                        "the resolved study corpus (_SESSIONS_BY_MODE[study_mode]; "
+                        "pretrain has 13). One array task per index. None (default) "
+                        "= the whole corpus in a single job. Subsets the study's "
+                        "timeline list only — never changes the spec-cache key.")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--cluster", default=None,
                    help="Exca TaskInfra cluster ('slurm' or None for local).")
@@ -2163,39 +2300,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb-offline", dest="wandb_offline", action="store_true",
                    help="Log --live runs offline (no wandb login/network); sync "
                         "later with `wandb sync`.")
-    # Phase-2 shaft-mask 5/27 PM final spec. Default is
-    # ``K = 1 if N_shafts >= 2 else 0`` with ``extent_blocks=("alpha",)``.
-    # Supersedes the original ``K=3`` spec and the same-day AM
-    # ``min(2, ceil(0.25 * N_shafts))`` fraction spec. Sisters reach K=2
-    # / K=3 via ``--shaft-mask-k-override`` together with
-    # ``--shaft-mask-extent-blocks``.
-    p.add_argument(
-        "--shaft-mask-k-override", type=int, default=None,
-        help="Override the default ``K = 1 if N_shafts >= 2 else 0`` formula "
-             "with a fixed K. Sister R-shaft-K1-explicit: 1 (matches default). "
-             "Sister R-shaft-K2: 2. Sister R-shaft-K3-mixed-3block: 3.",
-    )
-    p.add_argument(
-        "--shaft-mask-extent-blocks", default="alpha",
-        help="Comma-separated list of active block extents. Default 'alpha'. "
-             "Sister R-shaft-K2: 'alpha,beta'. "
-             "Sister R-shaft-K3-mixed-3block: 'alpha,beta,gamma'.",
-    )
-    # B28 DKoleo demotion 2026-05-27 PM + B29 sister-set expansion
-    # 2026-05-27 PM-late. ``batch_cls`` is accepted as a pre-B29 alias
-    # of ``batch_cls_unit``.
-    p.add_argument(
-        "--dkoleo-mode",
-        choices=(*DKOLEO_MODES, *_DKOLEO_MODE_ALIASES.keys()),
-        default=DEFAULT_DKOLEO_MODE,
-        help="DKoleo @ M4 unit (B28 2026-05-27 PM demotion + B29 expansion). "
-             "'off' (default) drops the term. Sisters: 'intra_clip_slots' "
-             "(B21 per-clip × 80 slots), 'batch_cls_unit' (DINOv2-faithful "
-             "per-batch × CLS-analog utterance vectors), and "
-             "'vicreg_slot_variance' (per-dim VICReg variance hinge gated "
-             "on MON-SLOT-REDUNDANCY). 'batch_cls' is a pre-B29 alias of "
-             "'batch_cls_unit'.",
-    )
+    # NOTE: ``--shaft-mask-k-override`` / ``--shaft-mask-extent-blocks`` (shaft
+    # mask) and ``--dkoleo-mode`` (B28-demoted) were culled 2026-06-13 — the
+    # shaft mask is dropped (no downstream consumers) and DKoleo defaults OFF
+    # via the encoder's own internal default.
     # B29 Item 11 + 5/28 PM flip: subtype default OFF, so CLI flag enables.
     p.add_argument(
         "--subtype-embed", dest="subtype_embed_enabled",
@@ -2272,20 +2380,24 @@ def _parser() -> argparse.ArgumentParser:
              "on a card with headroom for full activations at the chosen "
              "--batch-size.",
     )
-    # 2026-06-08 ragged front-end (#91): OFF by default (dense path
-    # byte-identical to pre-#91). When ON, the encoder's per-electrode token
-    # blocks run only over valid electrodes (pad rows gathered out, scattered
-    # back as zeros before the pool) and the P1 M2 loss drops pad electrodes.
+    # 2026-06-08 ragged front-end (#91): DEFAULT-ON (flipped 2026-06-12 — Ben:
+    # "all ragged optimizations default on"). When ON, the encoder's per-row
+    # token blocks run only over valid rows (cross_attn: valid electrodes;
+    # mean-pool: covered parcels) — pad/uncovered rows gathered out, scattered
+    # back as zeros before the pool — and the P1 M2 loss drops pad rows. On the
+    # mean path with masking active the uncovered-parcel drop is folded into
+    # ragged_token's visible-token gather (one combined gather).
     p.add_argument(
-        "--ragged-frontend", dest="ragged_frontend",
-        action="store_true", default=False,
-        help="Skip pad electrodes in the per-electrode token blocks + P1 loss "
+        "--ragged-frontend", "--no-ragged-frontend", dest="ragged_frontend",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Skip pad/uncovered rows in the per-row token blocks + P1 loss "
              "(needs valid_mask in the batch — i.e. a padded c_max). "
-             "Valid-electrode M2/M4 and the P2 loss stay bit-identical; only the "
+             "Valid-row M2/M4 and the P2 loss stay bit-identical; only the "
              "P1 loss mean changes (it no longer dilutes on zero-input pad "
-             "electrodes). Cuts the token-block + predictor FFN by the pad "
+             "rows). Cuts the token-block + predictor FFN by the pad "
              "fraction (~50%% at BT-Lite c_max=256) — unblocks raw bs=8 and "
-             "~halves front-end step time on padded batches. OFF by default.",
+             "~halves front-end step time on padded batches. ON by default; "
+             "--no-ragged-frontend restores the dense path.",
     )
     # 2026-06-09 ragged parcel drop (#92): ON by default (dense path
     # bit-identical up to ~1e-6 matmul reassociation, so safe). When ON, the P2
@@ -2473,14 +2585,6 @@ def _parser() -> argparse.ArgumentParser:
              "metrics.csv without --live/wandb.",
     )
     p.add_argument(
-        "--phase-mode", choices=PHASE_MODES, default=DEFAULT_PHASE_MODE,
-        help="B36 staged regime: split P1 (front-end M2) -> P2 (parcel M4) "
-             "('split_p1_p2', default) vs the B29 single-joint-phase falsifier "
-             "('joint_b29', sister R-joint-ssl). Recorded-only run-record "
-             "metadata; the behavioral stage is selected via --jepa-phase, "
-             "not this axis.",
-    )
-    p.add_argument(
         "--jepa-phase", choices=JEPA_PHASES, default=DEFAULT_JEPA_PHASE,
         help="B36 staged masked-JEPA sub-phase (joint SSL / --phase 1 only). "
              "'p1' (default) = front-end M2 masked prediction (all corpora); "
@@ -2489,22 +2593,14 @@ def _parser() -> argparse.ArgumentParser:
              "selects which stage trains. A non-default raises under --phase 4.",
     )
     p.add_argument(
-        "--p2-frontend-lr-scale", dest="frontend_lr_scale", type=float,
-        default=DEFAULT_FRONTEND_LR_SCALE,
-        help="B36 WS-E E2: P2 front-end discriminative-LR scale (joint SSL / "
-             "--phase 1, jepa-phase p2 only). 0.1 (default) = base/10; 0.2 = "
-             "R-p2-frontend-lr-5 (base/5); 0.0 = R-p2-freeze-frontend "
-             "(front-end frozen, parcel side trains alone). A non-default "
-             "raises under --phase 4.",
-    )
-    p.add_argument(
         "--parcel-lr-scale", dest="parcel_lr_scale", type=float,
         default=1.0 / 3.0,
         help="B33 §5 P3-3b parcel-side discriminative-LR scale (--phase 3 "
              "p3-stage 3b only). 1/3 (default) = base/3 lock; the front-end "
-             "rides --p2-frontend-lr-scale and the connector trains at base. "
-             "No effect under 3a / P1 / P2 / P4 (persisted onto the run record "
-             "either way). Folded into the M0 optimizer sweep (#45/#78).",
+             "rides its internal frontend_lr_scale and the connector trains "
+             "at base. No effect under 3a / P1 / P2 / P4 (persisted onto the "
+             "run record either way). Folded into the M0 optimizer sweep "
+             "(#45/#78).",
     )
     # ----- B37 (2026-06-10) encoder + joint-SSL flags -------------------------
     p.add_argument(
@@ -2519,33 +2615,39 @@ def _parser() -> argparse.ArgumentParser:
         "--latent-depth", dest="latent_depth", type=int,
         default=DEFAULT_LATENT_DEPTH,
         help="B37 D5 parcel-SA latent block count for the mean-pool path "
-             "(default 2 = the thin latent). Inert under --pool cross_attn "
-             "(that path rides --depth).",
+             "(default 6 = the canonical B37 joint run; was 2 thin). Inert "
+             "under --pool cross_attn (that path rides --depth).",
     )
     p.add_argument(
         "--latent-mode", dest="latent_mode", choices=("parcel", "joint"),
         default=DEFAULT_LATENT_MODE,
-        help="B37+ mean-path latent cross-parcel mode. 'parcel' (default, "
-             "byte-identical) = thin parcel-SA-only latent (freq+time batched). "
-             "'joint' = JOINT parcel×time, freq batched — attends the K_c·T_p "
+        help="B37+ mean-path latent cross-parcel mode. 'parcel' = thin "
+             "parcel-SA-only latent (freq+time batched). 'joint' (default, "
+             "canonical B37 run) = JOINT parcel×time, freq batched — attends the K_c·T_p "
              "parcel×time tokens with RoPE-on-time + a learned global-parcel-id "
              "tag (cross-subject), filling the cross-region temporal gap. Inert "
              "under --pool cross_attn.",
     )
     p.add_argument(
         "--mean-pool-std", dest="mean_pool_std", action="store_true",
+        default=DEFAULT_MEAN_POOL_STD,
         help="B37+ feed the masked per-parcel STD as a 2nd stem input channel "
              "(RGB-style mean|std), computed in the SAME masked reduction as the "
              "mean (no electrode-row desync). Conv std-channel is zero-init → "
-             "no-op at init, learns from there. Inert under --pool cross_attn.",
+             "no-op at init, learns from there. Inert under --pool cross_attn. "
+             "DEFAULT ON (canonical B37 run); pass --no-mean-pool-std to disable.",
     )
     p.add_argument(
-        "--ssl-mode", dest="ssl_mode", choices=("auto", "staged", "joint"),
+        "--no-mean-pool-std", dest="mean_pool_std", action="store_false",
+        help="Disable the RGB-style mean|std 2nd stem channel (mean-only pool).",
+    )
+    p.add_argument(
+        "--ssl-mode", dest="ssl_mode", choices=("auto", "joint"),
         default="auto",
         help="B37 D7 SSL objective (joint SSL / --phase 1). 'auto' (default) "
-             "resolves to 'joint' when --pool mean else 'staged'. 'staged' = "
-             "B36 single-term-per-phase (byte-identical). 'joint' = B37 "
-             "composite-mask M2+M4 single forward (requires --pool mean).",
+             "resolves to 'joint'. 'joint' = B37 composite-mask M2+M4 single "
+             "forward (requires --pool mean). The B36 'staged' single-term "
+             "per-phase CLI surface was culled 2026-06-13.",
     )
     p.add_argument(
         "--m4-loss-weight", dest="lambda_m4", type=float,
@@ -2555,22 +2657,27 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--m2-predictor-depth", dest="m2_predictor_depth", type=int,
-        default=DEFAULT_M2_PREDICTOR_DEPTH,
-        help="B37 D9 M2 (front-end) predictor depth (default 3). Joint-only; "
-             "shares --predictor-hidden / --predictor-n-heads with the M4 "
-             "predictor.",
+        default=None,
+        help="B37 D9 M2 (front-end) predictor depth. DEFAULT = AUTO = "
+             "max(1, --depth // 2) (the half-rule: predictor tracks its "
+             "front-end encoder; 3 @ canonical depth=6). Pass an int to pin. "
+             "Joint-only; shares --predictor-hidden / --predictor-n-heads with "
+             "the M4 predictor.",
     )
     p.add_argument(
         "--m4-predictor-depth", dest="m4_predictor_depth", type=int,
-        default=DEFAULT_M4_PREDICTOR_DEPTH,
-        help="B37 D9 M4 (parcel) predictor depth (default 2). Joint-only.",
+        default=None,
+        help="B37 M4 (parcel) predictor depth. DEFAULT = AUTO = "
+             "max(1, --latent-depth // 2) (the half-rule: predictor tracks its "
+             "parcel-latent encoder; 3 @ canonical latent_depth=6). Pass an int "
+             "to pin. Joint-only.",
     )
     p.add_argument(
         "--joint-frontend-lr-scale", dest="joint_frontend_lr_scale", type=float,
         default=DEFAULT_JOINT_FRONTEND_LR_SCALE,
         help="B37 D8 joint front-end discriminative-LR scale (default 1.0 = no "
              "discrimination; 0.0 freezes the front-end). Joint-only — distinct "
-             "from the staged --p2-frontend-lr-scale.",
+             "from the staged internal frontend_lr_scale.",
     )
     p.add_argument(
         "--joint-parcel-lr-scale", dest="joint_parcel_lr_scale", type=float,
@@ -2626,6 +2733,21 @@ def _parser() -> argparse.ArgumentParser:
              "electrodes give effective n_eff<n, so plain count over-trusts them).",
     )
     p.add_argument(
+        "--m4-precision-floor-pct", dest="m4_precision_floor_pct", type=float,
+        default=25.0,
+        help="Empirical-Bayes shrinkage prior for --m4-precision-weight: σ²₀ = the "
+             "p{this} percentile of in-batch scored σ², ADDED to σ² before "
+             "inverting. THE load-bearing fix — without it the ~12.5%% degenerate "
+             "(σ²≈0, single-/equal-electrode) cells swamp the loss and starve the "
+             "informative cells (measured max/median ≈1e5 → ~4.7). Default p25.",
+    )
+    p.add_argument(
+        "--m4-precision-cap", dest="m4_precision_cap", type=float, default=10.0,
+        help="Max per-cell weight (after mean-1 normalization) for "
+             "--m4-precision-weight; cheap insurance on top of the shrinkage "
+             "floor. <=0 disables the cap. Default 10.",
+    )
+    p.add_argument(
         "--m4-mask-type", dest="m4_mask_type", choices=("tube", "time_block"),
         default=DEFAULT_M4_MASK_TYPE,
         help="#75 M4 mask shape. 'tube' (default, 6/03 lock) = whole covered "
@@ -2652,44 +2774,22 @@ def _parser() -> argparse.ArgumentParser:
              "fixed-fraction / round-down semantics as --m2-time-band-floor.",
     )
     p.add_argument(
-        "--predictor-depth", dest="predictor_depth", type=int,
-        default=DEFAULT_PREDICTOR_DEPTH,
-        help="#76 STAGED single-predictor depth (default 3, the locked P0 "
-             "center). Ignored under --ssl-mode joint (use --m2/m4-predictor-"
-             "depth).",
-    )
-    p.add_argument(
         "--predictor-hidden", dest="predictor_hidden", type=int,
         default=DEFAULT_PREDICTOR_HIDDEN,
-        help="#76 predictor hidden width (default 128). Shared by the staged "
-             "predictor and BOTH joint predictors.",
+        help="#76 predictor hidden width (default 192 = d/2 for the canonical "
+             "B37 d=384 run; was 128). Shared by BOTH joint predictors.",
     )
     p.add_argument(
         "--predictor-n-heads", dest="predictor_n_heads", type=int,
         default=DEFAULT_PREDICTOR_N_HEADS,
-        help="#76 predictor attention head count (default 4). Shared by the "
-             "staged predictor and BOTH joint predictors.",
+        help="#76 predictor attention head count (default 4). Shared by BOTH "
+             "joint predictors.",
     )
     # --------------------------------------------------------------------------
-    p.add_argument(
-        "--latent-valid-override",
-        choices=("support", "all_true", "parcels_supervised"),
-        default="support",
-        help="B30 sister selector for the latent-validity mask source. "
-             "'support' (default) is the B30 lock; 'all_true' is "
-             "R-item-12-all-true P0; 'parcels_supervised' is "
-             "R-parcels-supervised-gating (retired-into-default falsifier). "
-             "Sisters raise NotImplementedError until B2.2 lands.",
-    )
-    p.add_argument(
-        "--sa-mask-mode",
-        choices=("bidirectional", "key_only"),
-        default="bidirectional",
-        help="B30 sister selector for the latent self-attention mask "
-             "shape. 'bidirectional' (default) is the B30 lock; "
-             "'key_only' is R-sa-key-only P1. Sister raises "
-             "NotImplementedError until the encoder branch lands.",
-    )
+    # NOTE: ``--latent-valid-override`` / ``--sa-mask-mode`` (B30 sister
+    # selectors) were culled 2026-06-13 — their only non-default choices were
+    # always NotImplementedError sisters. The B30-lock values ("support" /
+    # "bidirectional") are hardcoded at the joint-experiment build site.
     p.add_argument(
         "--loss-variant",
         choices=LOSS_VARIANTS, default=DEFAULT_LOSS_VARIANT,
@@ -2711,29 +2811,13 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true", default=DEFAULT_INCLUDE_AJILE12,
         help="Include AJILE12 in the pretraining mix. Default OFF (2026-06-07): "
              "the active chain is BT-only. Turn ON for the joint-corpus "
-             "escalation (B29 mix). Paired falsifier: --no-include-ajile12.",
+             "escalation (B29 mix).",
     )
-    p.add_argument(
-        "--no-include-ajile12", dest="include_ajile12",
-        action="store_false",
-        help="Force AJILE12 out of the pretraining mix (explicit BT-only / "
-             "sister R-no-ajile12). Redundant with the current default-OFF.",
-    )
-    p.add_argument(
-        "--ffn-variant",
-        choices=FFN_VARIANTS, default=DEFAULT_FFN_VARIANT,
-        help="FFN variant. Default 'dense' (B29 Item 14 + MoE audit "
-             "2026-05-28). 'soft_moe_4' raises NotImplementedError until "
-             "models/soft_moe.py lands (R-moe-ffn-soft-4 P2 if-budget).",
-    )
-    # B28 cross-attn collapse 2026-05-27 PM.
-    p.add_argument(
-        "--cross-attn-positions", default=None,
-        help="Comma-separated latent-stack positions for cross-attn blocks. "
-             "Default (omitted) = [0] (Perceiver IO canonical). Sister "
-             "R-perceiver-original-2-cross-attns: '0,3'. Position 0 is "
-             "required; interior positions must satisfy p < depth_self_attn.",
-    )
+    # NOTE: ``--no-include-ajile12`` (redundant store_false alias of the
+    # default-OFF), ``--ffn-variant`` (MoE audit-rejected; always dense), and
+    # ``--cross-attn-positions`` (Perceiver, thrown away) were culled
+    # 2026-06-13. The encoder keeps its own ``cross_attn_positions`` (→ [0])
+    # internal default.
     # MASK-01 per-corpus mains-notch field.
     p.add_argument(
         "--mains-notch-hz", type=float, default=DEFAULT_MAINS_NOTCH_HZ,
@@ -2741,12 +2825,11 @@ def _parser() -> argparse.ArgumentParser:
              "AJILE12). Pass 50.0 for SWEC (Swiss site). Per-corpus map "
              "lives in MAINS_NOTCH_BY_CORPUS.",
     )
-    p.add_argument("--phase", type=int, choices=(1, 2, 3, 4), default=1,
+    p.add_argument("--phase", type=int, choices=(1, 3, 4), default=1,
                    help="Training phase per docs/neuroprobe/plan.md §staged. "
                         "1 = masked-JEPA SSL (V14JointExperiment); B36 staged "
                         "P1->P2 selected via --jepa-phase (p1 front-end M2 / "
                         "p2 parcel M4). "
-                        "2 = legacy split-P2 (raises — use --phase 1 --jepa-phase p2). "
                         "3 = Whisper all-layer-mean distillation (module wired; "
                         "raises the whisper_target data blocker until WS-H). "
                         "4 = downstream linear/finetune probe (current behavior).")
@@ -2810,21 +2893,13 @@ def _parser() -> argparse.ArgumentParser:
 # does not define. The dispatch path is thus the construction gate only.
 # (E5 2026-06-03: removed the dead ``_PHASE1_BLOCKERS`` tuple — never
 # referenced from the dispatch.)
-_PHASE2_BLOCKERS = (
-    # B29 Item 1 collapsed P1 + P2 into a single joint phase; dispatch
-    # via ``--phase 1`` (V14JointExperiment is pinned to ``phase=1``).
-    # The R-keep-phase-split sister keeps explicit P1/P2 via the parent
-    # V14Experiment — but is not exposed through this dispatch.
-    "B29 Item 1 collapsed P1 + P2 into a single joint phase; "
-    "dispatch via --phase 1 (V14JointExperiment). "
-    "Sister R-keep-phase-split keeps explicit P1/P2 via the parent "
-    "V14Experiment — see docs/neuroprobe/v14_blockers.md."
-)
 # E5/WS-F/#21 2026-06-03: ``_PHASE3_BLOCKERS`` removed. The whisper_target
 # segmenter emission (WS-H, #20) landed, so --phase 3 now routes to
 # V14Phase3Experiment via build_v14_experiment(p3_distill=True) and the chain
-# driver runs P3a/P3b end-to-end. (``_PHASE1_BLOCKERS`` was removed in E5; only
-# ``_PHASE2_BLOCKERS`` survives — phase 2 is the collapsed legacy split.)
+# driver runs P3a/P3b end-to-end. 2026-06-13: ``--phase 2`` (the legacy
+# split-P2 entry) was dropped from the CLI ``--phase`` choices, so the
+# ``_PHASE2_BLOCKERS`` tuple + its main() guard are gone too — dispatch P2 via
+# ``--phase 1 --jepa-phase p2``.
 
 
 def construct_v14_joint_callbacks(
@@ -2912,18 +2987,16 @@ def _build_wandb_config(args) -> tp.Any | None:
     )
 
 
-def _common_build_kwargs(
-    args, *, cross_attn_positions: list[int] | None,
-) -> dict[str, tp.Any]:
+def _common_build_kwargs(args) -> dict[str, tp.Any]:
     """Knobs identical across every phase in BOTH the single-phase ``main()``
     build and the ``--chain`` builds.
 
-    Centralized after the Gate-D audit: ``binary_tasks`` / ``latent_valid_override``
-    / ``sa_mask_mode`` / ``loss_variant`` had drifted OUT of the chain's inline
-    ``common`` dict while the single-phase call still passed them, so a
-    ``--chain --loss-variant X`` (or any of those) silently ran the DEFAULT arm
-    while the run summary printed the sister as applied. Both call sites consume
-    this one dict, so a forgotten flag is now structurally impossible.
+    Centralized after the Gate-D audit: ``binary_tasks`` / ``loss_variant`` had
+    drifted OUT of the chain's inline ``common`` dict while the single-phase
+    call still passed them, so a ``--chain --loss-variant X`` silently ran the
+    DEFAULT arm while the run summary printed the sister as applied. Both call
+    sites consume this one dict, so a forgotten flag is now structurally
+    impossible.
 
     Excludes the per-phase selectors (``joint_phase`` / ``p3_distill`` /
     ``phase4_frozen_probe`` / ``p3_stage`` / ``jepa_phase`` / ``clip_len`` /
@@ -2939,7 +3012,7 @@ def _common_build_kwargs(
         pretrain_holdout_fraction=args.pretrain_holdout_fraction,
         binary_tasks=args.binary_tasks,
         session_robust_z=args.session_robust_z,
-        eps=args.eps, d_model=args.d_model, depth=args.depth,
+        d_model=args.d_model, depth=args.depth,
         n_heads=args.n_heads, m_sub_slots=args.m_sub_slots,
         batch_size=args.batch_size, num_workers=args.num_workers,
         n_epochs=args.n_epochs,
@@ -2968,8 +3041,6 @@ def _common_build_kwargs(
         # extractor cache root). Reaches every phase via this one dict.
         spec_cache_dir=args.spec_cache_dir,
         disable_spec_cache=args.no_spec_cache,
-        dkoleo_mode=args.dkoleo_mode,
-        cross_attn_positions=cross_attn_positions,
         mains_notch_hz=args.mains_notch_hz,
         # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
         # one dict so the chain + single-phase builds stay in lock-step.
@@ -2980,16 +3051,26 @@ def _common_build_kwargs(
         # #35: padded electrode-slot count. Reaches every phase via this one dict
         # so the chain's 4 c_max-padded extractors stay in lock-step.
         c_max=args.c_max,
+        # Parcellation atlas + single-electrode-parcel exclusion ride this dict so
+        # the chain's 4 phases share ONE vocabulary (k_parcels) and ONE support /
+        # valid-mask config — a per-phase atlas mismatch would misalign the
+        # cross-subject parcel embedding. Both reach the support + valid_mask
+        # extractors inside build_v14_experiment.
+        atlas=args.atlas,
+        exclude_single_electrode_parcels=args.exclude_single_electrode_parcels,
+        # Front-end family (raw single-grid vs 2STFT dual-band). Rides this dict
+        # so every chain phase shares ONE front end — a per-phase mismatch would
+        # feed the P4 probe a different token geometry than the SSL encoder saw.
+        frontend=args.frontend,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
         subtype_embed_vocab=args.subtype_embed_vocab,
         ref_embed_enabled=args.ref_embed_enabled,
         ref_embed_reuse_kv=args.ref_embed_reuse_kv,
-        phase_mode=args.phase_mode,
         ref_operator_alpha=args.ref_operator_alpha,
         include_ajile12=args.include_ajile12,
-        ffn_variant=args.ffn_variant,
         gradient_checkpointing=args.gradient_checkpointing,
+        cache_session_index=args.cache_session_index,
         ragged_frontend=args.ragged_frontend,
         ragged_parcel=args.ragged_parcel,
         ragged_token=args.ragged_token,
@@ -3022,11 +3103,10 @@ def _common_build_kwargs(
         ema_tau=args.ema_tau,
         m4_precision_weight=args.m4_precision_weight,
         m4_precision_alpha=args.m4_precision_alpha,
-        predictor_depth=args.predictor_depth,
+        m4_precision_floor_pct=args.m4_precision_floor_pct,
+        m4_precision_cap=args.m4_precision_cap,
         predictor_hidden=args.predictor_hidden,
         predictor_n_heads=args.predictor_n_heads,
-        latent_valid_override=args.latent_valid_override,
-        sa_mask_mode=args.sa_mask_mode,
         loss_variant=args.loss_variant,
         # #37 optim / LR-schedule (audit 2026-06-03). --adam-beta2 → (0.9, β2)
         # tuple; --grad-clip <= 0 → None (disable). Reaches every phase via this
@@ -3105,9 +3185,7 @@ def _validate_channel_stats_path(args) -> None:
             )
 
 
-def _build_v14_chain(
-    args, *, cross_attn_positions: list[int] | None,
-) -> list[Experiment]:
+def _build_v14_chain(args) -> list[Experiment]:
     """Assemble the 5 staged experiments [P1, P2, P3a, P3b, P4] for the chain.
 
     Every phase shares the model/eval/cluster knobs from ``args``; only the
@@ -3136,7 +3214,7 @@ def _build_v14_chain(
         )
     _validate_channel_stats_path(args)
 
-    common = _common_build_kwargs(args, cross_attn_positions=cross_attn_positions)
+    common = _common_build_kwargs(args)
     whisper = dict(
         whisper_target_cache_dir=args.whisper_target_cache_dir,
         whisper_layer_merge=args.whisper_layer_merge,
@@ -3197,20 +3275,18 @@ def _build_v14_chain(
     p2 = build_v14_experiment(
         **common, **ssl_budget, collapse_guard=args.collapse_guard,
         joint_phase=True, jepa_phase="p2", clip_len=5.0,
-        frontend_lr_scale=args.frontend_lr_scale, neural_lag_s=args.neural_lag_s,
+        neural_lag_s=args.neural_lag_s,
     )
     p3a = build_v14_experiment(
         **common, **ssl_budget, collapse_guard=args.collapse_guard, **whisper,
         p3_distill=True, p3_stage="3a",
         clip_len=5.0,
-        frontend_lr_scale=args.frontend_lr_scale,
         parcel_lr_scale=args.parcel_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     p3b = build_v14_experiment(
         **common, **ssl_budget, collapse_guard=args.collapse_guard, **whisper,
         p3_distill=True, p3_stage="3b",
         clip_len=5.0,
-        frontend_lr_scale=args.frontend_lr_scale,
         parcel_lr_scale=args.parcel_lr_scale, neural_lag_s=args.neural_lag_s,
     )
     # binary_tasks now rides in `common` (reaches every phase, so the SSL /
@@ -3276,6 +3352,17 @@ def _effective_compile_encoder(in_allocation_ddp: bool, compile_encoder: bool) -
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # Predictor depth half-rule (Ben 2026-06-12). Each JEPA predictor defaults to
+    # HALF the depth of the encoder stack it predicts from: M2 (front-end) tracks
+    # --depth, M4 (parcel/latent) tracks --latent-depth. At the canonical B37
+    # depth-6/latent_depth-6 this resolves to 3/3 — byte-identical to the old
+    # hard 3/3 default — but a depth sweep (e.g. --latent-depth 2) now auto-scales
+    # its predictor (-> M4 depth 1) instead of leaving an over-deep predictor on a
+    # shrunk encoder. An explicit --m2/m4-predictor-depth overrides the rule.
+    if args.m2_predictor_depth is None:
+        args.m2_predictor_depth = max(1, args.depth // 2)
+    if args.m4_predictor_depth is None:
+        args.m4_predictor_depth = max(1, args.latent_depth // 2)
     # speedup-fanout C1: --compile/--no-compile is a front-door for the
     # V14_COMPILE env var that V14JointBrainModule reads at construction. Set it
     # here (before exca submits) so submitit captures it into the slurm job env.
@@ -3324,7 +3411,7 @@ def main(argv: list[str] | None = None) -> int:
     # short-circuits before any build), so it is a config preview, not a real
     # launch — both are exempt, matching Ben's "real (non-fast-dev-run) run"
     # framing. --phase 4 is the supervised probe, not SSL/distill.
-    _is_ssl_distill = bool(args.chain) or args.phase in (1, 2, 3)
+    _is_ssl_distill = bool(args.chain) or args.phase in (1, 3)
     if _is_ssl_distill and not args.fast_dev_run and not args.dry_run:
         _eff_beta2 = args.adam_beta2 if args.adam_beta2 is not None else 0.999
         _bad: list[str] = []
@@ -3382,20 +3469,21 @@ def main(argv: list[str] | None = None) -> int:
     # two must move together. Scoped: the 'mean ⇒ joint' direction is enforced
     # only on the SSL phases (--phase 1 / --chain); --phase 4 may build a
     # mean-pool encoder for a downstream probe where ssl_mode is irrelevant.
+    # 2026-06-13: the B36 'staged' SSL CLI surface was culled. 'auto' now always
+    # resolves to 'joint' (the B37 D7 single-forward composite-mask objective);
+    # the joint objective is the freq-preserving mean-pool path, so an SSL phase
+    # requires --pool mean. (P4 may build a cross_attn encoder for a downstream
+    # probe where ssl_mode is irrelevant — the joint⇒mean coupling is scoped to
+    # the SSL phases.)
     if args.ssl_mode == "auto":
-        args.ssl_mode = "joint" if args.pool == "mean" else "staged"
-    if args.ssl_mode == "joint" and args.pool != "mean":
+        args.ssl_mode = "joint"
+    _ssl_phase = bool(args.chain) or args.phase == 1
+    if _ssl_phase and args.ssl_mode == "joint" and args.pool != "mean":
         raise SystemExit(
             "--ssl-mode joint (B37 D7) requires --pool mean (the "
-            f"freq-preserving mean-pool encoder); got --pool {args.pool}."
-        )
-    _ssl_phase = bool(args.chain) or args.phase in (1, 2)
-    if _ssl_phase and args.pool == "mean" and args.ssl_mode != "joint":
-        raise SystemExit(
-            "--pool mean (B37) on an SSL phase is the joint-SSL encoder; its "
-            "freq-preserving latent has no staged single-term path. Got "
-            f"--ssl-mode {args.ssl_mode}; use joint (or omit --ssl-mode to "
-            "auto-resolve)."
+            f"freq-preserving mean-pool encoder); got --pool {args.pool}. The "
+            "B36 staged cross_attn SSL path was culled — run the joint SSL "
+            "phase with --pool mean."
         )
     # B37: the mean-pool encoder emits a 5-D parcel×freq×time latent. P4 has a
     # freq-preserving readout (V14FreqPreservingPmaReadout, wired in build());
@@ -3462,39 +3550,27 @@ def main(argv: list[str] | None = None) -> int:
     # keeps the run summary honest.
     if args.clip_len is None:
         args.clip_len = 1.0 if args.phase == 4 else DEFAULT_CLIP_LEN_S
-    if args.phase == 2 and not args.chain:
-        # Phase 2 is the legacy split-P2 entry-point, collapsed into the joint
-        # phase by B29 Item 1; dispatch P1∪P2 via --phase 1 --jepa-phase p2
-        # (V14JointExperiment). --phase 1 falls through to construct
-        # V14JointExperiment; its B2.x sister-gating fires at construction in
-        # model_post_init. (--chain builds its own P2 via --jepa-phase p2, so it
-        # is exempt from this single-phase guard.) Phase 3 (#21, WS-F) is no
-        # longer gated — --phase 3 routes to V14Phase3Experiment now that the
-        # whisper_target emission (WS-H, #20) has landed.
-        raise NotImplementedError(
-            f"--phase 2 dispatch is gated on unresolved blockers: "
-            f"{_PHASE2_BLOCKERS}. See docs/neuroprobe/v14_blockers.md."
-        )
+    # 2026-06-13: --phase 2 (legacy split-P2) was dropped from the --phase
+    # choices; dispatch P2 via --phase 1 --jepa-phase p2 (V14JointExperiment).
     print(f"V14 dispatch — cohort subject_ids = {V14_TRAIN_SUBJECT_IDS} (9 subjects, S5 excluded)")
     print(f"  mode={args.mode} task={args.task} binary_tasks={args.binary_tasks} seed={args.seed}")
     print(f"  eval_mode={args.eval_mode} test=({args.test_subject_id},{args.test_trial_id})")
     print(f"  d_model={args.d_model} depth={args.depth} n_heads={args.n_heads} "
-          f"M={args.m_sub_slots} eps={args.eps}")
+          f"M={args.m_sub_slots}")
     print(f"  K=80 DK parcels, c_max={args.c_max}, batch_size={args.batch_size}, "
           f"n_epochs={args.n_epochs}")
-    print(f"  dkoleo_mode={args.dkoleo_mode} cross_attn_positions={args.cross_attn_positions} "
-          f"mains_notch_hz={args.mains_notch_hz}")
+    print(f"  mains_notch_hz={args.mains_notch_hz}")
     print(f"  lof_bad_channels={args.lof_bad_channels} lof_threshold={args.lof_threshold} "
           f"lof_n_neighbors={args.lof_n_neighbors} lof_report_path={args.lof_report_path}")
-    print(f"  phase_mode={args.phase_mode} jepa_phase={args.jepa_phase} "
-          f"frontend_lr_scale={args.frontend_lr_scale} neural_lag_s={args.neural_lag_s} "
+    print(f"  jepa_phase={args.jepa_phase} "
+          f"neural_lag_s={args.neural_lag_s} "
           f"include_ajile12={args.include_ajile12} ref_operator_alpha={args.ref_operator_alpha}")
     # B37 (2026-06-10) encoder + joint-SSL config (ssl_mode already resolved from
     # 'auto'). Surfaced so the persisted run record never silently rides the
     # wrong pool / SSL objective / discriminative-LR split.
     print(f"  pool={args.pool} latent_depth={args.latent_depth} ssl_mode={args.ssl_mode} "
           f"lambda_m4={args.lambda_m4} predictor_depth=(m2={args.m2_predictor_depth},"
-          f"m4={args.m4_predictor_depth},staged={args.predictor_depth},"
+          f"m4={args.m4_predictor_depth},"
           f"hidden={args.predictor_hidden},heads={args.predictor_n_heads}) "
           f"joint_lr_scale=(frontend={args.joint_frontend_lr_scale},"
           f"parcel={args.joint_parcel_lr_scale}) "
@@ -3511,7 +3587,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "
-          f"ffn_variant={args.ffn_variant} loss_variant={args.loss_variant} "
+          f"loss_variant={args.loss_variant} "
           f"readout={args.readout} "
           f"gradient_checkpointing={args.gradient_checkpointing} "
           f"ragged_frontend={args.ragged_frontend} "
@@ -3532,8 +3608,8 @@ def main(argv: list[str] | None = None) -> int:
           f"wd_exclude_norms={args.wd_exclude_norms} "
           f"adam_beta2={args.adam_beta2} grad_clip={args.grad_clip} "
           f"accumulate_grad_batches={args.accumulate_grad_batches}")
-    print(f"  disc-lr: frontend_lr_scale={args.frontend_lr_scale} "
-          f"parcel_lr_scale={args.parcel_lr_scale} (P2/P3 discriminative-LR)")
+    print(f"  disc-lr: parcel_lr_scale={args.parcel_lr_scale} "
+          f"(P2/P3 discriminative-LR)")
     print(f"  guard: collapse_guard={args.collapse_guard} (OFF by default — "
           f"never auto-kills; --collapse-guard opts in) "
           f"ssl_val_check_interval={args.ssl_val_check_interval} (opt-steps, "
@@ -3595,12 +3671,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  spec_cache_dir={_resolved_spec!r} (#80 whole-movie |STFT| cache; "
           f"paid once, then memmap-sliced)")
 
-    cross_attn_positions: list[int] | None = None
-    if args.cross_attn_positions is not None:
-        cross_attn_positions = [
-            int(x) for x in args.cross_attn_positions.split(",") if x.strip()
-        ]
-
     if args.dry_run:
         print("  (dry-run: not building Experiment; "
               "default electrode-tokens extractor = MultiStftView)")
@@ -3613,7 +3683,7 @@ def main(argv: list[str] | None = None) -> int:
             run_phase_pipeline,
         )
 
-        phases = _build_v14_chain(args, cross_attn_positions=cross_attn_positions)
+        phases = _build_v14_chain(args)
         print(f"  chain: {len(phases)} phases (P1,P2,P3a,P3b,P4) "
               f"work_dir={args.work_dir}")
         results = run_phase_pipeline(phases, work_dir=args.work_dir)
@@ -3728,7 +3798,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"  electrode_set={single_electrode_set} (--electrode-set {args.electrode_set})")
     xp = build_v14_experiment(
-        **_common_build_kwargs(args, cross_attn_positions=cross_attn_positions),
+        **_common_build_kwargs(args),
         clip_len=args.clip_len,
         electrode_set=single_electrode_set,
         neural_lag_s=args.neural_lag_s,
@@ -3753,9 +3823,27 @@ def main(argv: list[str] | None = None) -> int:
         pretrained_ckpt=args.resume_from,
         snapshot_ckpt_to=args.snapshot_ckpt_to,
         jepa_phase=args.jepa_phase,
-        frontend_lr_scale=args.frontend_lr_scale,
         parcel_lr_scale=args.parcel_lr_scale,
     )
+    if args.cache_only:
+        # Build the front-end spec cache then EXIT before the trainer (no GPU).
+        # Drives the exact study.run() -> segmenter.apply() -> dataset.prepare()
+        # path Data.build() uses, so the materialized whole-movie |STFT| memmap
+        # is byte-identical to what the real run memmap-slices. dataset.prepare()
+        # fans out per session present in the (subset) corpus and, for the 2STFT
+        # frontend, builds BOTH band caches (low + high spec_cache_dir subdirs).
+        import time as _time
+
+        data = xp.data
+        t0 = _time.time()
+        print("[cache-only] building spec cache "
+              f"(session_index={args.cache_session_index}) ...")
+        events = data.study.run()
+        dataset = data.segmenter.apply(events)
+        dataset.prepare()
+        print(f"[cache-only] DONE in {_time.time() - t0:.1f}s — "
+              "spec cache materialized; exiting before trainer (no GPU used).")
+        return 0
     result = xp.run()
     print(f"V14 dispatch result: {result}")
     return 0

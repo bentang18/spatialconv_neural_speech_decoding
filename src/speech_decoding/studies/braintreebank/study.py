@@ -64,6 +64,14 @@ class Wang2024Treebank(study.Study):
 
     mode: tp.Literal["lite", "nano", "full", "pretrain", "p3_distill"] = "lite"
 
+    # Optional cache-build subset: restrict the emitted timelines to this exact
+    # set of ``(subject_id, trial_id)`` pairs (a SUBSET of the ``mode`` corpus).
+    # Used ONLY by dispatch ``--cache-only --cache-session-index`` so a SLURM
+    # array can build one session's spec cache per task. Like ``mode`` it lives
+    # in the timeline list, not the class uid (see ``_cls_kwargs``), so it never
+    # changes the per-session spec-cache key (extractor-uid + session-uid).
+    session_subset: tp.Optional[tp.Tuple[tp.Tuple[int, int], ...]] = None
+
     aliases: tp.ClassVar[tuple[str, ...]] = (
         "BrainTreebank",
         "Braintreebank",
@@ -101,7 +109,8 @@ class Wang2024Treebank(study.Study):
         kwargs: dict[str, tp.Any] = self.model_dump(
             serialize_as_any=True, exclude_defaults=True,
         )
-        for p in ("infra", "infra_timelines", "path", "name", "query", "mode"):
+        for p in ("infra", "infra_timelines", "path", "name", "query", "mode",
+                  "session_subset"):
             kwargs.pop(p, None)
         if kwargs:
             raise RuntimeError(
@@ -110,7 +119,17 @@ class Wang2024Treebank(study.Study):
         return kwargs
 
     def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
-        for subject_id, trial_id in _SESSIONS_BY_MODE[self.mode]:
+        sessions = _SESSIONS_BY_MODE[self.mode]
+        if self.session_subset is not None:
+            subset = {tuple(p) for p in self.session_subset}
+            unknown = subset - set(sessions)
+            if unknown:
+                raise ValueError(
+                    f"session_subset {sorted(unknown)} not in mode={self.mode!r} "
+                    f"corpus {sorted(sessions)}"
+                )
+            sessions = [p for p in sessions if p in subset]
+        for subject_id, trial_id in sessions:
             yield {
                 "subject": f"btbank{subject_id}",
                 "subject_id": subject_id,

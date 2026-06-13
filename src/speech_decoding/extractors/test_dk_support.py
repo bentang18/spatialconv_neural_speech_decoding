@@ -316,3 +316,124 @@ def test_dk_extractor_accepts_study_qualified_subject(tmp_path: Path) -> None:
         SimpleNamespace(subject="Wang2024Treebank/btbank2"),
     )
     torch.testing.assert_close(out_plain, out_qualified)
+
+
+# --- single-electrode-parcel exclusion (#154, Ben 2026-06-13) --------------- #
+def test_exclude_single_electrode_parcels_drops_lone_electrode(tmp_path: Path) -> None:
+    """A parcel covered by exactly one electrode → that electrode's support row is
+    zeroed (and it becomes invalid); a 2-electrode parcel is untouched."""
+    _write_bt(
+        tmp_path, 1,
+        voltage=["E1", "E2", "E3"],
+        anatomy=[
+            ("E1", "ctx-lh-superiortemporal"),  # parcel A
+            ("E2", "ctx-lh-superiortemporal"),  # parcel A (2 electrodes → kept)
+            ("E3", "ctx-lh-insula"),            # parcel B (1 electrode → dropped)
+        ],
+    )
+    base = V14DKHardSupportExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), unmapped_policy="zero",
+    )
+    excl = V14DKHardSupportExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), unmapped_policy="zero",
+        exclude_single_electrode_parcels=True,
+    )
+    out_base = base.get_static(SimpleNamespace(subject=1))  # type: ignore[arg-type]
+    out_excl = excl.get_static(SimpleNamespace(subject=1))  # type: ignore[arg-type]
+    a = _PARCEL_INDEX["ctx-lh-superiortemporal"]
+    b = _PARCEL_INDEX["ctx-lh-insula"]
+    # baseline: all three electrodes mapped
+    assert out_base[0, a] == 1.0 and out_base[1, a] == 1.0 and out_base[2, b] == 1.0
+    # excluded: the 2-electrode parcel A rows stay; the lone parcel-B row is zeroed
+    assert out_excl[0, a] == 1.0 and out_excl[1, a] == 1.0
+    assert out_excl[2].sum() == 0.0, "lone-electrode parcel-B row not zeroed"
+    # parcel A still covered by 2; parcel B now uncovered
+    assert out_excl[:, a].sum() == 2.0
+    assert out_excl[:, b].sum() == 0.0
+
+
+def test_exclude_single_electrode_parcels_off_by_default(tmp_path: Path) -> None:
+    _write_bt(
+        tmp_path, 1,
+        voltage=["E1", "E2"],
+        anatomy=[("E1", "ctx-lh-superiortemporal"), ("E2", "ctx-lh-insula")],
+    )
+    ext = V14DKHardSupportExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), unmapped_policy="zero",
+    )
+    out = ext.get_static(SimpleNamespace(subject=1))  # type: ignore[arg-type]
+    # both are single-electrode parcels but exclusion is OFF → both kept
+    assert out[0].sum() == 1.0 and out[1].sum() == 1.0
+
+
+def test_exclude_single_electrode_keeps_support_valid_mask_row_aligned(
+    tmp_path: Path,
+) -> None:
+    """Under exclusion the support extractor's zeroed lone-electrode row and the
+    ElectrodeValidMask's False flag must describe the SAME electrode row — the
+    load-bearing ``effective_support = support * valid_mask`` invariant (``valid[c]``
+    True iff support row ``c`` is nonzero) for EVERY electrode. Both extractors
+    derive from one memoized ``aligned_voltage_support`` call, but nothing pinned
+    that they stay row-aligned once the single-electrode drop fires. C1/C2 contract
+    under the #154 drop. (audit gap, 2026-06-13)"""
+    from speech_decoding.extractors.valid_mask import ElectrodeValidMask
+
+    _write_bt(
+        tmp_path, 1,
+        voltage=["E1", "E2", "E3"],
+        anatomy=[
+            ("E1", "ctx-lh-superiortemporal"),  # parcel A (2 electrodes → kept)
+            ("E2", "ctx-lh-superiortemporal"),
+            ("E3", "ctx-lh-insula"),            # parcel B (1 electrode → dropped)
+        ],
+    )
+    kw = dict(
+        event_types="Ieeg", bt_root=str(tmp_path), unmapped_policy="zero",
+        exclude_single_electrode_parcels=True,
+    )
+    support = V14DKHardSupportExtractor(**kw).get_static(
+        SimpleNamespace(subject=1))  # type: ignore[arg-type]
+    valid = ElectrodeValidMask(**kw).get_static(
+        SimpleNamespace(subject=1))  # type: ignore[arg-type]
+    n = support.shape[0]
+    support_nonzero = support.sum(dim=1) > 0  # (n,) bool
+    # The invariant the encoder relies on: valid[c] iff support row c survives.
+    assert torch.equal(valid[:n], support_nonzero)
+    # E3 (lone parcel-B electrode) is dropped on BOTH sides, in lockstep.
+    assert support[2].sum() == 0.0 and not bool(valid[2])
+    # The 2-electrode parcel A rows stay valid on both sides.
+    assert bool(valid[0]) and bool(valid[1])
+    # Padding slots past the real electrodes are False.
+    assert not valid[n:].any()
+
+
+# --- DKT atlas column (#155) ------------------------------------------------ #
+def _write_dkt_depth_wm(
+    bt_root: Path, subject_id: int, rows: list[tuple[str, str]]
+) -> None:
+    """Write a depth-wm.csv carrying the native DKT column (+ a DK column so the
+    file is realistic; the extractor reads only the selected ``label_column``)."""
+    path = bt_root / "localization" / f"sub_{subject_id}" / "depth-wm.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        f.write("Electrode,DesikanKilliany,DKT\n")
+        for electrode, dkt_label in rows:
+            f.write(f"{electrode},Unknown,{dkt_label}\n")
+
+
+def test_dkt_atlas_routes_over_k74_vocabulary(tmp_path: Path) -> None:
+    from speech_decoding.studies.braintreebank.anatomy import V14_DKT_PARCEL_LABELS
+    _write_electrode_labels(tmp_path, 1, ["E1", "E2"])
+    _write_dkt_depth_wm(tmp_path, 1, [
+        ("E1", "ctx-lh-superiortemporal"),
+        ("E2", "Left-Hippocampus"),
+    ])
+    ext = V14DKHardSupportExtractor(
+        event_types="Ieeg", bt_root=str(tmp_path), unmapped_policy="zero",
+        label_column="DKT", parcel_labels=V14_DKT_PARCEL_LABELS,
+    )
+    out = ext.get_static(SimpleNamespace(subject=1))  # type: ignore[arg-type]
+    assert out.shape == (2, 74), "DKT support must be K=74 wide"
+    dkt_index = {l: i for i, l in enumerate(V14_DKT_PARCEL_LABELS)}
+    assert out[0, dkt_index["ctx-lh-superiortemporal"]] == 1.0
+    assert out[1, dkt_index["Left-Hippocampus"]] == 1.0

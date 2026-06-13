@@ -18,7 +18,9 @@ import pytest
 import torch
 
 from speech_decoding.ssl.mask import (
+    _sample_axis_band_multiset,
     sample_composite_mask,
+    sample_m2_dual_band_mask,
     sample_m2_mask,
     sample_m4_mask,
     sample_parcel_time_block_mask,
@@ -622,3 +624,197 @@ def test_composite_same_seed_reproducible() -> None:
     )
     assert torch.equal(tok1, tok2)
     assert torch.equal(ptm1, ptm2)
+
+
+# ═══════════════════ 2STFT dual-band M2 mask (FE 2STFT, 6/12) ════════════════
+#
+# Locked grid: low F_p=7 × T=8 (S_low=56), high F_p=3 × T=16 (S_high=48),
+# S=104. Low = freq-block tube (one width-3 block × all 8 time = 24). High =
+# time-block tube (widths {3,3,2}=8 × all 3 freq = 24). Sampled independently
+# PER PARCEL (Ben override 2026-06-12). Default knobs match the handoff.
+
+_F_LOW, _T_LOW, _F_HIGH, _T_HIGH = 7, 8, 3, 16
+_S_LOW = _F_LOW * _T_LOW  # 56
+_S = _S_LOW + _F_HIGH * _T_HIGH  # 104
+
+
+def _dual(
+    B: int,
+    K: int,
+    *,
+    generator: torch.Generator,
+    low_freq_frac: float = 0.43,
+    low_freq_floor: int = 3,
+    high_time_widths: tuple[int, ...] = (3, 3, 2),
+) -> torch.Tensor:
+    """Locked-grid wrapper (typed kwargs → no dict-spread inference noise)."""
+    return sample_m2_dual_band_mask(
+        B, K, F_p_low=_F_LOW, T_low_p=_T_LOW, F_p_high=_F_HIGH, T_high_p=_T_HIGH,
+        low_freq_frac=low_freq_frac, low_freq_floor=low_freq_floor,
+        high_time_widths=high_time_widths, generator=generator,
+    )
+
+
+def _runs(row: torch.Tensor) -> list[int]:
+    """Lengths of contiguous True runs in a 1-D bool tensor."""
+    out: list[int] = []
+    n = 0
+    for v in row.tolist():
+        if v:
+            n += 1
+        elif n:
+            out.append(n)
+            n = 0
+    if n:
+        out.append(n)
+    return out
+
+
+def test_dual_band_shape_dtype_and_balanced_counts() -> None:
+    """S=104 flat per-parcel sequence; low tube 24 + high tube 24 = 48 masked
+    per parcel — the balanced ~24/24 the §6 pooled-mean loss expects."""
+    g = torch.Generator().manual_seed(0)
+    B, K = 3, 12
+    mask = _dual(B, K, generator=g)
+    assert tuple(mask.shape) == (B, K, _S)
+    assert mask.dtype == torch.bool
+    low, high = mask[..., :_S_LOW], mask[..., _S_LOW:]
+    # Every parcel: exactly 24 low + 24 high masked tokens.
+    assert torch.all(low.sum(dim=-1) == 24)
+    assert torch.all(high.sum(dim=-1) == 24)
+
+
+def test_dual_band_low_is_one_width3_freq_tube() -> None:
+    """Low band = ONE contiguous freq-block of width 3 masked across ALL 8 time
+    patches (a freq tube). Reshape the low block to (T_low_p, F_p_low) and check
+    per parcel: constant over time, a single width-3 freq run."""
+    g = torch.Generator().manual_seed(1)
+    B, K = 4, 8
+    mask = _dual(B, K, generator=g)
+    low = mask[..., :_S_LOW].view(B, K, _T_LOW, _F_LOW)  # time-OUTER/freq-INNER
+    for b in range(B):
+        for k in range(K):
+            grid = low[b, k]  # (T_low_p, F_p_low)
+            # Masked freq-rows identical at every time → it is a freq tube.
+            assert torch.all(grid == grid[0:1]), "low tube not constant over time"
+            freq_row = grid[0]  # (F_p_low,)
+            assert _runs(freq_row) == [3], "low freq-block must be one width-3 run"
+
+
+def test_dual_band_high_is_time_tube_multiset_332() -> None:
+    """High band = time-blocks of the multiset {3,3,2} (=8 of 16) masked across
+    ALL 3 freq patches (a time tube). Reshape to (T_high_p, F_p_high): constant
+    over freq, 8 masked time-cols, ≤3 runs (touching blocks merge)."""
+    g = torch.Generator().manual_seed(2)
+    B, K = 4, 8
+    mask = _dual(B, K, generator=g)
+    high = mask[..., _S_LOW:].view(B, K, _T_HIGH, _F_HIGH)
+    for b in range(B):
+        for k in range(K):
+            grid = high[b, k]  # (T_high_p, F_p_high)
+            # Each masked time-col is masked at every freq → a time tube.
+            time_col = grid[:, 0]
+            assert torch.all(grid == time_col.unsqueeze(-1)), "high tube not constant over freq"
+            assert int(time_col.sum()) == 8, "high must mask 8 of 16 time-cols"
+            assert len(_runs(time_col)) <= 3, "≤3 time-blocks (touching merges)"
+
+
+def test_dual_band_independent_per_parcel() -> None:
+    """Per Ben's override the mask is drawn independently for each (B, K)
+    parcel: across a wide parcel axis the low freq-block start is NOT all the
+    same value (would be astronomically unlikely if independent)."""
+    g = torch.Generator().manual_seed(3)
+    B, K = 2, 64
+    mask = _dual(B, K, generator=g)
+    low = mask[..., :_S_LOW].view(B, K, _T_LOW, _F_LOW)
+    # Block start = first masked freq index at t=0, per parcel.
+    starts = low[:, :, 0, :].float().argmax(dim=-1)  # (B, K)
+    # Independence ⇒ the 64 parcels must not collapse to a single start.
+    assert starts[0].unique().numel() > 1
+    assert starts[1].unique().numel() > 1
+
+
+def test_dual_band_matches_encoder_token_layout() -> None:
+    """Cross-check the flat mask against the encoder's authoritative
+    ``dual_band_token_layout``: low tokens must be constant over ``t_idx`` (full
+    freq-rows) and high tokens constant over ``freq_patch_idx`` (full time-cols),
+    and ``S_low`` must agree."""
+    from speech_decoding.models.v14_encoder import V14ParcelPerceiverModel
+
+    torch.manual_seed(0)
+    enc = V14ParcelPerceiverModel(
+        n_freq_bins=14, n_time_bins=9, k_parcels=5, d_model=16, n_heads=2,
+        depth_self_attn=1, m_sub_slots=1, n_token_blocks=2, pool="mean",
+        per_band_stem=True, band_low_n_freq_bins=14, band_high_n_freq_bins=9,
+        band_low_kernel_freq=2, band_low_kernel_time=1,
+        band_high_kernel_freq=3, band_high_kernel_time=2,
+        band_low_n_time_bins=9, band_high_n_time_bins=33,
+    )
+    layout = enc.dual_band_token_layout(_T_LOW, _T_HIGH)
+    is_high = layout["is_high"]
+    t_idx = layout["t_idx"]
+    fp_idx = layout["freq_patch_idx"]
+    assert int(layout["S_low"]) == _S_LOW
+
+    g = torch.Generator().manual_seed(4)
+    mask = _dual(2, 5, generator=g)[0, 0]  # (S,)
+
+    # Low: group flat tokens by freq_patch_idx; mask constant across that group's
+    # t_idx values (a freq tube). High: group by t_idx; constant across freq.
+    lo = ~is_high
+    for f in fp_idx[lo].unique():
+        sel = lo & (fp_idx == f)
+        assert mask[sel].unique().numel() == 1, "low freq-row not a tube over time"
+    hi = is_high
+    for t in t_idx[hi].unique():
+        sel = hi & (t_idx == t)
+        assert mask[sel].unique().numel() == 1, "high time-col not a tube over freq"
+
+
+def test_dual_band_same_seed_reproducible_and_knobs() -> None:
+    """Seed-reproducible; R-low-2plus2 (two width-2 freq blocks) and
+    R-high-width2 (widths {2,2,2,2}) sisters reachable via knobs."""
+    g1 = torch.Generator().manual_seed(9)
+    g2 = torch.Generator().manual_seed(9)
+    assert torch.equal(_dual(3, 6, generator=g1), _dual(3, 6, generator=g2))
+
+    # R-low-2plus2: frac 0.57, floor 2 → two width-2 freq blocks = 4 rows × 8.
+    g = torch.Generator().manual_seed(0)
+    sis = _dual(4, 8, generator=g, low_freq_frac=0.57, low_freq_floor=2)
+    low = sis[..., :_S_LOW].view(4, 8, _T_LOW, _F_LOW)
+    assert torch.all(low.flatten(2).sum(dim=-1) == 4 * 8)  # 4 freq rows × 8 time
+    # each masked time row has exactly 4 masked freq (= two width-2 blocks)
+    assert torch.all(low.sum(dim=-1) == 4)
+
+    # R-high-width2: 4×width-2 = still 8 of 16 → 24 high tokens.
+    g = torch.Generator().manual_seed(0)
+    sis = _dual(4, 8, generator=g, high_time_widths=(2, 2, 2, 2))
+    high = sis[..., _S_LOW:]
+    assert torch.all(high.sum(dim=-1) == 24)
+
+
+# --- _sample_axis_band_multiset (variable-width band placement) ---
+
+
+def test_axis_band_multiset_exact_count_and_non_overlapping() -> None:
+    """The helper masks EXACTLY ``sum(widths)`` cells (non-overlapping) and
+    realizes ≤ ``len(widths)`` runs (touching blocks merge, never overlap)."""
+    g = torch.Generator().manual_seed(5)
+    widths = (3, 3, 2)
+    band = _sample_axis_band_multiset(
+        4, 10, axis_len=16, widths=widths, generator=g, device=g.device,
+    )
+    assert tuple(band.shape) == (4, 10, 16)
+    assert torch.all(band.sum(dim=-1) == sum(widths))  # exactly 8, always
+    for b in range(4):
+        for c in range(10):
+            assert len(_runs(band[b, c])) <= len(widths)
+
+
+def test_axis_band_multiset_rejects_overflow() -> None:
+    """sum(widths) > axis_len cannot be placed non-overlapping → ValueError."""
+    g = torch.Generator().manual_seed(0)
+    with pytest.raises(ValueError, match="exceeds axis_len"):
+        _sample_axis_band_multiset(
+            1, 1, axis_len=5, widths=(3, 3, 2), generator=g, device=g.device,
+        )
