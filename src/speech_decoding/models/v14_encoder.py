@@ -109,6 +109,26 @@ def _pool_parcel_std(std_bk: Tensor, out_f: int, out_t: int) -> Tensor:
     return pooled.reshape(B, K, out_f, out_t)
 
 
+@torch.compiler.disable
+def _ckpt(fn: tp.Callable[..., tp.Any], *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+    """Activation-checkpoint ``fn(*args, **kwargs)`` (``use_reentrant=False``),
+    held OUT of the ``torch.compile`` graph (``torch.compiler.disable``).
+
+    torch.compile cannot trace THROUGH ``torch.utils.checkpoint`` on this model:
+    Dynamo's activation-checkpoint higher-order-op hits ``AssertionError:
+    lift_tracked_freevar_to_input should not be called on root SubgraphTracer``
+    while tracing the masked-fill self-attention inside a checkpointed transformer
+    block (torch 2.10, the ragged ``--compile-dynamic`` path), killing the run at
+    the first compiled step. Routing every ``checkpoint(...)`` call through this
+    disabled wrapper graph-breaks ONLY at the checkpoint boundary: the
+    checkpointed block runs eager (so activation checkpointing still recomputes
+    for memory) while the surrounding stem/glue stays compiled — measured
+    ``frames_ok>0`` vs ``suppress_errors``'s full-frame eager fallback. A clean,
+    deterministic graph break, numerically EXACT; a no-op on the eager
+    (``--no-compile``) path → byte-identical there too."""
+    return checkpoint(fn, *args, use_reentrant=False, **kwargs)
+
+
 def _rope_freqs(head_dim: int, max_seq_len: int, base: float = 10_000.0) -> Tensor:
     """Pre-compute RoPE cos/sin tables of shape ``(max_seq_len, head_dim)``.
 
@@ -1609,7 +1629,7 @@ class V14ParcelPerceiverModel(nn.Module):
         """Run the per-row joint (t_p·f_p) token-block stack."""
         for token_block in self.token_blocks:
             if use_ckpt:
-                xj = checkpoint(token_block, xj, rope, key_mask, use_reentrant=False)
+                xj = _ckpt(token_block, xj, rope, key_mask)
             else:
                 xj = token_block(xj, rope, key_mask)
         return xj
@@ -1712,7 +1732,7 @@ class V14ParcelPerceiverModel(nn.Module):
         )                                                              # (R,k,k)
         for block in self.latent_parcel_blocks:
             if use_ckpt:
-                z = checkpoint(block, z, attn_mask, use_reentrant=False)
+                z = _ckpt(block, z, attn_mask)
             else:
                 z = block(z, attn_mask)
         # (R, k_run, d) → (B, F_p, T_p, k_run, d) → (B, k_run, F_p, T_p, d).
@@ -1788,7 +1808,7 @@ class V14ParcelPerceiverModel(nn.Module):
         )                                                              # (R,k,k)
         for block in self.latent_parcel_blocks:
             if use_ckpt:
-                z = checkpoint(block, z, attn_mask, use_reentrant=False)
+                z = _ckpt(block, z, attn_mask)
             else:
                 z = block(z, attn_mask)
         # (R, k_run, d) → (B, S, k_run, d) → (B, k_run, S, d).
@@ -1846,7 +1866,7 @@ class V14ParcelPerceiverModel(nn.Module):
 
         for block in self.latent_parcel_blocks:              # _JointTokenBlock
             if use_ckpt:
-                x = checkpoint(block, x, rope, key_mask, use_reentrant=False)
+                x = _ckpt(block, x, rope, key_mask)
             else:
                 x = block(x, rope, key_mask)
         # (B·F_p, k_run·T_p, d) → (B, F_p, k_run, T_p, d) → (B, k_run, F_p, T_p, d).
@@ -2836,10 +2856,7 @@ class V14ParcelPerceiverModel(nn.Module):
         ) -> Tensor:
             for token_block in self.token_blocks:
                 if use_ckpt:
-                    xj = checkpoint(
-                        token_block, xj, rope_arg, kpm,
-                        use_reentrant=False,
-                    )
+                    xj = _ckpt(token_block, xj, rope_arg, kpm)
                 else:
                     xj = token_block(xj, rope_arg, kpm)
             return xj
@@ -3183,13 +3200,12 @@ class V14ParcelPerceiverModel(nn.Module):
                     latents_bt, electrodes_bt, key_mask_bt,
                 )
             if use_ckpt:
-                latents_bt = checkpoint(
+                latents_bt = _ckpt(
                     block,
                     latents_bt,
                     B=B, T=T_p, L=L_run,
                     latent_valid=latent_valid_bt,
                     rope_t=self.key_rope,
-                    use_reentrant=False,
                 )
             else:
                 latents_bt = block(

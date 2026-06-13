@@ -666,3 +666,57 @@ def test_pool_parcel_std_compiles_under_dynamic_spatial_dims() -> None:
         x.reshape(10, 1, 14, 9), (7, 9)
     ).reshape(2, 5, 7, 9)
     assert torch.allclose(_pool_parcel_std(x, 7, 9), ref, atol=0, rtol=0)
+
+
+# --------------------------------------------------------------------------- #
+# --compile regression: torch.compile must not trace THROUGH gradient
+# checkpointing. The encoder wraps each transformer block in
+# torch.utils.checkpoint(use_reentrant=False); the block's self-attention does a
+# masked_fill on the attention logits. When torch.compile (Dynamo) tries to trace
+# into the checkpoint's higher-order op it crashes with
+# `AssertionError: lift_tracked_freevar_to_input should not be called on root
+# SubgraphTracer` (a Dynamo front-end bug, so it reproduces on CPU — unlike the
+# CUDA-only σ-pool lowering bug above). The fix routes every checkpoint() call
+# through `_ckpt`, which is @torch.compiler.disable: compile graph-breaks ONLY at
+# the checkpoint boundary, leaving the expensive stem compiled and the blocks
+# eager (numerically identical, activation-checkpoint memory savings preserved).
+# --------------------------------------------------------------------------- #
+def test_ckpt_compiles_through_checkpointed_attention_block() -> None:
+    from speech_decoding.models.v14_encoder import _ParcelSelfAttnBlock, _ckpt
+
+    d, n_heads, R, K = 32, 4, 8, 6
+
+    class _CkptLoop(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(
+                [_ParcelSelfAttnBlock(d, n_heads) for _ in range(2)]
+            )
+
+        def forward(self, z: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+            for blk in self.blocks:
+                z = _ckpt(blk, z, attn_mask)
+            return z
+
+    torch.manual_seed(0)
+    model = _CkptLoop().train()
+    z = torch.randn(R, K, d, requires_grad=True)
+    attn_mask = torch.ones(R, K, K, dtype=torch.bool)
+
+    # Eager reference (same blocks, no checkpoint / no compile).
+    z_ref = z.detach().clone()
+    o_ref = z_ref
+    for blk in model.blocks:
+        o_ref = blk(o_ref, attn_mask)
+
+    try:
+        compiled = torch.compile(model, dynamic=True)
+        out = compiled(z, attn_mask)
+        out.sum().backward()  # checkpoint recompute path must also survive
+    finally:
+        torch._dynamo.reset()
+
+    assert out.shape == (R, K, d)
+    assert z.grad is not None and torch.isfinite(z.grad).all()
+    # The disabled checkpoint wrapper is a no-op vs running the blocks inline.
+    assert torch.allclose(out.detach(), o_ref, atol=1e-5)
