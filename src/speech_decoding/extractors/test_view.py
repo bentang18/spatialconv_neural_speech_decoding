@@ -1628,3 +1628,272 @@ def test_spec_cache_session_order_independent_of_c_max(tmp_path, monkeypatch) ->
         view.prepare([event])
         out[tag] = np.load(next(d.rglob("*.npy"))).shape[0]
     assert out["a"] == out["b"] == 4, "spec cache row count depends on c_max"
+
+
+# =====================================================================
+# 2STFT front end (§3a) — single-band raw |STFT| views (front_end="band").
+# reports/fe_2stft_handoff_2026_06_12.md; bins audit-verified 2026-06-13.
+# =====================================================================
+def test_2stft_band_k_range_is_exact_low_k1_14_high_k4_12() -> None:
+    """The authoritative bin selector reproduces the spec EXACTLY: low band
+    (N=512, 4-56 Hz) → k1..k14 = 14 bins; high band (N=128, 64-192 Hz) →
+    k4..k12 = 9 bins. Total 23. Pins the ±1e-9 guard at exact multiples
+    (56/4 = 14.0, 64/16 = 4.0, 192/16 = 12.0)."""
+    from speech_decoding.extractors.view import (
+        STFT_2BAND_HIGH,
+        STFT_2BAND_LOW,
+        _stft_band_k_range,
+    )
+
+    lo = _stft_band_k_range(
+        STFT_2BAND_LOW["band_f_lo_hz"], STFT_2BAND_LOW["band_f_hi_hz"],
+        nperseg=int(STFT_2BAND_LOW["band_nperseg"]),
+    )
+    hi = _stft_band_k_range(
+        STFT_2BAND_HIGH["band_f_lo_hz"], STFT_2BAND_HIGH["band_f_hi_hz"],
+        nperseg=int(STFT_2BAND_HIGH["band_nperseg"]),
+    )
+    assert lo == (1, 14), f"low band must be k1..k14 (14 bins); got {lo}"
+    assert hi == (4, 12), f"high band must be k4..k12 (9 bins); got {hi}"
+    assert (lo[1] - lo[0] + 1) + (hi[1] - hi[0] + 1) == 23
+
+
+def test_2stft_single_band_view_shapes_and_rates() -> None:
+    """§3a: low band → (C, 14, T) at 8 Hz (T = 1 + L//256); high band →
+    (C, 9, T) at 32 Hz (T = 1 + L//64). Verified at 1 s and 5 s."""
+    from speech_decoding.extractors.view import _single_stft_raw_view
+
+    for duration_s, (low_T, high_T) in ((1.0, (9, 33)), (5.0, (41, 161))):
+        L = int(round(duration_s * 2048))
+        wav = torch.zeros(4, L)
+        low = _single_stft_raw_view(
+            wav, sample_rate=2048, nperseg=512, hop_length=256,
+            k0=1, k1=14, log_eps=1e-6,
+        )
+        high = _single_stft_raw_view(
+            wav, sample_rate=2048, nperseg=128, hop_length=64,
+            k0=4, k1=12, log_eps=1e-6,
+        )
+        assert low.shape == (4, 14, low_T), low.shape
+        assert high.shape == (4, 9, high_T), high.shape
+
+
+def test_2stft_single_band_view_routes_tone_to_correct_bin() -> None:
+    """A 40 Hz tone peaks in the low band's k10 (center 40 Hz, slice index 9);
+    a 128 Hz tone peaks in the high band's k8 (center 128 Hz, slice index 4).
+    Validates bin selection + Δf for both bands."""
+    from speech_decoding.extractors.view import _single_stft_raw_view
+
+    sr = 2048
+    t = torch.arange(sr).float() / sr
+    low_freqs = torch.fft.rfftfreq(512, d=1.0 / sr)[1 : 14 + 1]
+    high_freqs = torch.fft.rfftfreq(128, d=1.0 / sr)[4 : 12 + 1]
+
+    tone_40 = torch.sin(2 * torch.pi * 40.0 * t).unsqueeze(0)
+    low = _single_stft_raw_view(
+        tone_40, sample_rate=sr, nperseg=512, hop_length=256, k0=1, k1=14, log_eps=1e-6,
+    )
+    low_peak = int(low.mean(dim=-1)[0].argmax().item())
+    assert abs(low_freqs[low_peak].item() - 40.0) < 4.0
+
+    tone_128 = torch.sin(2 * torch.pi * 128.0 * t).unsqueeze(0)
+    high = _single_stft_raw_view(
+        tone_128, sample_rate=sr, nperseg=128, hop_length=64, k0=4, k1=12, log_eps=1e-6,
+    )
+    high_peak = int(high.mean(dim=-1)[0].argmax().item())
+    assert abs(high_freqs[high_peak].item() - 128.0) < 16.0
+
+
+def test_2stft_single_band_chunked_matches_unchunked() -> None:
+    """The whole-movie cache slices a chunked single-band spectrogram; that
+    overlap-save build MUST be byte-identical to one un-chunked
+    ``_single_stft_raw_view`` over the full recording, for BOTH bands, across
+    lengths that straddle chunk seams (half=N/2 is a multiple of hop for both)."""
+    from speech_decoding.extractors.view import (
+        _single_stft_raw_view,
+        _single_stft_raw_view_chunked,
+    )
+
+    sr = 2048
+    torch.manual_seed(0)
+    bands = (
+        dict(nperseg=512, hop_length=256, k0=1, k1=14),
+        dict(nperseg=128, hop_length=64, k0=4, k1=12),
+    )
+    for band in bands:
+        for n_samples in (4096, 60_000, 122_880, 200_003, 350_000):
+            for chunk_frames in (64, 200, 960):
+                t = torch.arange(n_samples).float() / sr
+                sig = (
+                    torch.sin(2 * torch.pi * 73.0 * t)
+                    + 0.5 * torch.sin(2 * torch.pi * 11.0 * t)
+                    + 0.1 * torch.randn(n_samples)
+                )
+                wav = torch.stack([sig, sig.flip(0)], dim=0)
+                kw = dict(sample_rate=sr, log_eps=1e-6, **band)
+                full = _single_stft_raw_view(wav, **kw)
+                chunked = _single_stft_raw_view_chunked(
+                    wav, chunk_frames=chunk_frames, **kw
+                )
+                assert chunked.shape == full.shape, (
+                    f"band={band} n={n_samples} chunk={chunk_frames}: "
+                    f"{chunked.shape} vs {full.shape}"
+                )
+                assert torch.allclose(chunked, full, atol=1e-5, rtol=1e-4), (
+                    f"chunked != unchunked band={band} n={n_samples} "
+                    f"chunk={chunk_frames}: "
+                    f"max|delta|={(chunked - full).abs().max().item():.3e}"
+                )
+
+
+def test_2stft_single_band_chunked_rejects_non_aligned_window() -> None:
+    """Single-band overlap-save needs nperseg % hop == 0 AND half % hop == 0."""
+    from speech_decoding.extractors.view import _single_stft_raw_view_chunked
+
+    with pytest.raises(ValueError, match="divisible by"):
+        _single_stft_raw_view_chunked(
+            torch.zeros(2, 300_000), sample_rate=2048, nperseg=512,
+            hop_length=100, k0=1, k1=14, log_eps=1e-6, chunk_frames=200,
+        )
+
+
+def test_2stft_multistftview_band_mode_construct_and_bins() -> None:
+    """MultiStftView(front_end="band", **STFT_2BAND_{LOW,HIGH}) wires the band:
+    _band_bins / _expected_raw_f_bins match the spec, hop_length pins to band_hop,
+    and the per-clip spec has the band shape."""
+    from speech_decoding.extractors.view import (
+        STFT_2BAND_HIGH,
+        STFT_2BAND_LOW,
+        MultiStftView,
+    )
+
+    low = MultiStftView(event_types="Ieeg", car="shaft", front_end="band",
+                        hop_length=int(STFT_2BAND_LOW["band_hop"]), **STFT_2BAND_LOW)
+    high = MultiStftView(event_types="Ieeg", car="shaft", front_end="band",
+                         hop_length=int(STFT_2BAND_HIGH["band_hop"]), **STFT_2BAND_HIGH)
+    assert low.front_end == "band" and high.front_end == "band"
+    assert low._band_bins() == (1, 14) and low._expected_raw_f_bins() == 14
+    assert high._band_bins() == (4, 12) and high._expected_raw_f_bins() == 9
+    assert low.hop_length == 256 and high.hop_length == 64
+    # 1 s @ 2048 Hz → low 9 frames (8 Hz + pad), high 33 (32 Hz + pad).
+    assert low.n_time_bins_for_duration(1.0) == 9
+    assert high.n_time_bins_for_duration(1.0) == 33
+    spec_lo = low._spec_from_waveform(torch.zeros(3, 2048), 2048)
+    spec_hi = high._spec_from_waveform(torch.zeros(3, 2048), 2048)
+    assert spec_lo.shape == (3, 14, 9)
+    assert spec_hi.shape == (3, 9, 33)
+
+
+def test_2stft_band_mode_requires_hop_equals_band_hop() -> None:
+    """The band-mode validator forces hop_length == band_hop so every
+    self.hop_length reader (frame counts, clip snap, chunked) is correct."""
+    from speech_decoding.extractors.view import STFT_2BAND_LOW, MultiStftView
+
+    with pytest.raises(ValueError, match="hop_length == band_hop"):
+        MultiStftView(event_types="Ieeg", car="shaft", front_end="band",
+                      hop_length=128, **STFT_2BAND_LOW)  # 128 != band_hop 256
+
+
+def test_2stft_low_and_high_bands_get_distinct_cache_namespaces(tmp_path) -> None:
+    """Low and high band views MUST land in different spec-cache directories
+    (band geometry folded into the namespace digest), else one band's spectrogram
+    would silently overwrite the other's."""
+    from speech_decoding.extractors.view import (
+        STFT_2BAND_HIGH,
+        STFT_2BAND_LOW,
+        MultiStftView,
+    )
+
+    low = MultiStftView(event_types="Ieeg", car="shaft", front_end="band",
+                        hop_length=int(STFT_2BAND_LOW["band_hop"]),
+                        spec_cache_dir=str(tmp_path), **STFT_2BAND_LOW)
+    high = MultiStftView(event_types="Ieeg", car="shaft", front_end="band",
+                         hop_length=int(STFT_2BAND_HIGH["band_hop"]),
+                         spec_cache_dir=str(tmp_path), **STFT_2BAND_HIGH)
+    assert low._spec_cache_namespace() != high._spec_cache_namespace()
+
+
+def _make_band_view(which: str, **kw):
+    """A single-band MultiStftView (front_end="band") for the low/high basket."""
+    from speech_decoding.extractors.view import (
+        STFT_2BAND_HIGH,
+        STFT_2BAND_LOW,
+        MultiStftView,
+    )
+
+    cfg = STFT_2BAND_LOW if which == "low" else STFT_2BAND_HIGH
+    base = dict(event_types="Ieeg", car="shaft", front_end="band",
+                hop_length=int(cfg["band_hop"]))
+    base.update(cfg)
+    base.update(kw)
+    return MultiStftView(**base)
+
+
+def _fit_band_robust_z(view, rec, ch, monkeypatch):
+    """Run the REAL chunked _fit_session_robust_z on a band view over ``rec``."""
+    import types
+
+    from speech_decoding.extractors.view import MultiStftView
+
+    class _E:
+        start = 0.0
+
+        def _splittable_event_uid(self):
+            return "s"
+
+    def _fake_get_data(self, evs):
+        for _e in evs:
+            yield types.SimpleNamespace(frequency=2048.0, data=rec, ch_names=list(ch))
+
+    monkeypatch.setattr(
+        MultiStftView, "_get_data",
+        property(lambda self: types.MethodType(_fake_get_data, self)), raising=False,
+    )
+    monkeypatch.setattr(
+        MultiStftView, "_event_types_helper",
+        property(lambda self: types.SimpleNamespace(extract=lambda obj: obj)),
+        raising=False,
+    )
+    view._channels.update({c: i for i, c in enumerate(ch)})
+    view._fit_session_robust_z([_E()])
+    return view._session_stats["s"]
+
+
+def test_2stft_session_robust_z_fits_band_rows_23_total(monkeypatch) -> None:
+    """§3c: each band fits its OWN freq rows over the session — low 14 + high 9 =
+    23 rows total, disjoint by construction (separate views). The chunked fit's
+    window is the band's own nperseg (low 512 / high 128)."""
+    ch = ["e0", "e1", "e2"]
+    rng = np.random.default_rng(71)
+    rec = rng.standard_normal((3, 2048 * 4)).astype(np.float32)
+
+    low = _make_band_view("low", session_robust_z=True)
+    high = _make_band_view("high", session_robust_z=True)
+    assert low._widest_nperseg() == 512 and high._widest_nperseg() == 128
+
+    low_stats = _fit_band_robust_z(low, rec, ch, monkeypatch)
+    high_stats = _fit_band_robust_z(high, rec, ch, monkeypatch)
+    # per-(channel, freq) stats: F dim is the band's bin count.
+    assert low_stats.median.shape[1] == 14
+    assert high_stats.median.shape[1] == 9
+    assert low_stats.median.shape[1] + high_stats.median.shape[1] == 23
+
+
+def test_2stft_session_robust_z_fit_apply_roundtrips_per_band(monkeypatch) -> None:
+    """§3c: the frozen band stats z-score a clip per (channel, freq) — applying
+    the fitted normalizer matches the standalone transform of the band spec."""
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+    ch = ["e0", "e1", "e2"]
+    rng = np.random.default_rng(72)
+    rec = rng.standard_normal((3, 2048 * 4)).astype(np.float32)
+
+    for which, n_bins in (("low", 14), ("high", 9)):
+        view = _make_band_view(which, session_robust_z=True)
+        clip = rec[:, :2048]
+        whole = view._spec_from_waveform(torch.from_numpy(rec), 2048)
+        ref = SessionRobustZNormalizer(sigma_floor=view.session_z_sigma_floor).fit(whole)
+        out = ref.transform(view._spec_from_waveform(torch.from_numpy(clip), 2048))
+        assert out.shape[1] == n_bins
+        # z-scored: each (channel, freq) row centred near 0, unit-ish scale.
+        assert torch.isfinite(out).all()

@@ -69,6 +69,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 import typing as tp
@@ -137,6 +138,51 @@ MULTI_STFT_RAW_BINS: tuple[tuple[int, int, int], ...] = (
     (1, 8, 37),
     (2, 19, 24),
 )
+
+
+# ---------------------------------------------------------------------------
+# 2-STFT front end (PROVISIONAL, reports/fe_2stft_{config,handoff}_2026_06_12.md;
+# Ben likes it 2026-06-12; masking override 2026-06-13 = independent PARCEL mask).
+#
+# Two STFT bands at DIFFERENT native hops (no common time grid). Each band is
+# carried by its OWN single-band MultiStftView (front_end="band") into a
+# separate batch key (electrode_tokens_low / electrode_tokens_high); the model
+# stem (§3b) + RoPE (§4) reconcile them onto one 62.5 ms token grid. The cache
+# stays a single (C, n_bins, T) array PER BAND, reusing the whole-movie cache
+# machinery verbatim, which also gives per-band session-robust-z (§3c) for free.
+#
+#   band  N    hop  Δf=fs/N  f_lo f_hi  k0 k1  n_bins  frame_rate  fk tk
+#   low   512  256  4 Hz     4    56     1  14   14      8 Hz       2  1
+#   high  128   64  16 Hz    64   192    4  12    9      32 Hz      3  2
+#
+# 56–64 Hz gap is deliberate (brackets the 60 Hz mains harmonic). hop = N/2 is
+# COLA-clean for Hann. Bins are DERIVED from physical edges via
+# _stft_band_k_range (one source of truth, no hand-typed k that can drift);
+# audit-verified EXACT 2026-06-13 (low → k1..k14, high → k4..k12).
+# ---------------------------------------------------------------------------
+STFT_2BAND_FS_HZ: int = 2048
+# Splat directly into MultiStftView(front_end="band", **STFT_2BAND_LOW, ...).
+STFT_2BAND_LOW: dict[str, float] = {
+    "band_nperseg": 512, "band_hop": 256, "band_f_lo_hz": 4.0, "band_f_hi_hz": 56.0,
+}
+STFT_2BAND_HIGH: dict[str, float] = {
+    "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 192.0,
+}
+
+
+def _stft_band_k_range(
+    f_lo_hz: float, f_hi_hz: float, *, nperseg: int, sample_rate: int = STFT_2BAND_FS_HZ,
+) -> tuple[int, int]:
+    """Inclusive rfft-bin slice ``[k0, k1]`` covering ``[f_lo_hz, f_hi_hz]`` for
+    an ``nperseg``-point STFT at ``sample_rate``. Authoritative bin selector,
+    byte-identical to ``scripts/neuroprobe/fe_stft_bin_designer.k_range``: with
+    ``Δf = fs / nperseg``, ``k0 = ceil(f_lo/Δf - 1e-9)``, ``k1 = floor(f_hi/Δf
+    + 1e-9)``. The ±1e-9 guard pins exact multiples to the intended integer
+    (e.g. 56/4 = 14.0 → 14, not 13 from float drift)."""
+    df = sample_rate / nperseg
+    k0 = int(math.ceil(f_lo_hz / df - 1e-9))
+    k1 = int(math.floor(f_hi_hz / df + 1e-9))
+    return k0, k1
 
 
 def multi_stft_raw_bin_freqs_hz(
@@ -506,6 +552,123 @@ def _multi_stft_raw_view_chunked(
     return torch.cat(blocks, dim=-1)
 
 
+def _single_stft_raw_view(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    nperseg: int,
+    hop_length: int,
+    k0: int,
+    k1: int,
+    log_eps: float,
+    apply_log: bool = False,
+) -> torch.Tensor:
+    """2STFT single-band raw |STFT| (§3a): ONE Hann STFT, keep the inclusive
+    rfft-bin slice ``[k0, k1]``.
+
+    Same STFT call as :func:`_multi_stft_raw_view` (``center=True``,
+    ``normalized=False``, value axis = raw ``|STFT|``) — only the bin selection
+    differs. Input ``(..., C, T_samples)`` → output ``(..., C, k1-k0+1, T_bin)``
+    with ``T_bin = 1 + T_samples // hop_length``.
+    """
+    win = torch.hann_window(nperseg, device=waveform.device)
+    wf = waveform
+    if wf.shape[-1] < nperseg:
+        # NeuralSet's prepare() probes with sub-second inputs — pad so
+        # torch.stft(center=True) can reflect-pad without crashing. Real
+        # 1 s windows never hit this branch.
+        wf = torch.nn.functional.pad(wf, (0, nperseg - wf.shape[-1]))
+    spec = torch.stft(
+        wf,
+        n_fft=nperseg,
+        hop_length=hop_length,
+        win_length=nperseg,
+        window=win,
+        return_complex=True,
+        normalized=False,
+        center=True,
+    )
+    mag = torch.abs(spec)[..., k0 : k1 + 1, :]                            # (..., n_bins, T)
+    if apply_log:
+        return torch.log(mag + log_eps)
+    return mag
+
+
+def _single_stft_raw_view_chunked(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    nperseg: int,
+    hop_length: int,
+    k0: int,
+    k1: int,
+    log_eps: float,
+    apply_log: bool = False,
+    chunk_frames: int = 960,
+) -> torch.Tensor:
+    """Memory-bounded whole-recording single-band raw |STFT|, byte-identical to
+    one un-chunked :func:`_single_stft_raw_view` over the full ``waveform``.
+
+    The single-band analog of :func:`_multi_stft_raw_view_chunked`: overlap-save
+    in ``chunk_frames``-wide output blocks, each reading ``half = nperseg // 2``
+    extra REAL samples of context per side, then keeping only the frames whose
+    full analysis window was real (the ``center=True`` reflect frames survive
+    only at the TRUE recording ends, exactly as the un-chunked call produces).
+
+    Correctness needs ``half`` to be a multiple of ``hop_length`` so every
+    segment starts on the global hop grid — true for both 2STFT bands
+    (low 256 = 1·256; high 64 = 1·64). Pinned by the acceptance test.
+
+    Input ``(..., C, T_samples)`` → ``(..., C, k1-k0+1, T_bin)`` with
+    ``T_bin = 1 + T_samples // hop_length``.
+    """
+    if hop_length <= 0 or nperseg % hop_length != 0:
+        raise ValueError(
+            f"chunked single-band STFT needs nperseg ({nperseg}) divisible by "
+            f"hop_length ({hop_length}) so segment starts land on the hop grid"
+        )
+    half = nperseg // 2
+    if half % hop_length != 0:
+        raise ValueError(
+            f"chunked single-band STFT needs half=nperseg//2 ({half}) divisible "
+            f"by hop_length ({hop_length}) for segment→global frame alignment"
+        )
+    n_samples = int(waveform.shape[-1])
+    total_frames = 1 + n_samples // hop_length
+
+    def _view(seg: torch.Tensor) -> torch.Tensor:
+        return _single_stft_raw_view(
+            seg,
+            sample_rate=sample_rate,
+            nperseg=nperseg,
+            hop_length=hop_length,
+            k0=k0,
+            k1=k1,
+            log_eps=log_eps,
+            apply_log=apply_log,
+        )
+
+    # Whole recording fits in one pass (or is too short to chunk): direct call.
+    if total_frames <= chunk_frames or n_samples <= 2 * half + nperseg:
+        return _view(waveform)
+
+    blocks: list[torch.Tensor] = []
+    f = 0
+    while f < total_frames:
+        f_end = min(f + chunk_frames, total_frames)
+        lo = max(0, (f * hop_length) - half)
+        hi = min(n_samples, (f_end - 1) * hop_length + half + 1)
+        if hi - lo < nperseg:
+            lo = ((max(0, hi - nperseg)) // hop_length) * hop_length
+        seg = waveform[..., lo:hi]
+        spec_seg = _view(seg)
+        g0 = f - lo // hop_length
+        g1 = f_end - lo // hop_length
+        blocks.append(spec_seg[..., g0:g1])
+        f = f_end
+    return torch.cat(blocks, dim=-1)
+
+
 def _log_stft_view(
     waveform: torch.Tensor,
     *,
@@ -667,8 +830,11 @@ class MultiStftView(CARIeegExtractor):
     """
 
     # FE-RAW-1: front-end mode. "raw" (default) = F=50 raw |STFT| bins; "fbank"
-    # = the demoted F=30 const-Q filterbank sister.
-    front_end: tp.Literal["raw", "fbank"] = "raw"
+    # = the demoted F=30 const-Q filterbank sister. "band" (2STFT, §3a) = ONE
+    # single-band raw |STFT| at this view's own (band_nperseg, band_hop), keeping
+    # the inclusive rfft-bin slice spanning [band_f_lo_hz, band_f_hi_hz]; the
+    # 2STFT front end runs TWO such views (low + high) into separate batch keys.
+    front_end: tp.Literal["raw", "fbank", "band"] = "raw"
     sample_rate_hz: int = 2048
     # FE-01 (hop=128 re-lock 2026-06-03, reverses B20 v4 hop=256): hop=128 @
     # 2048 Hz → 16 Hz front-end frame rate. Matches iMINDBench's standardized
@@ -688,6 +854,17 @@ class MultiStftView(CARIeegExtractor):
     fbank_half_bw_octaves: float = MULTI_STFT_HALF_BW_OCTAVES
     log_eps: float = 1e-6
     apply_log: bool = False
+    # 2STFT single-band geometry (front_end="band", §3a). Defaults = the LOW band
+    # (512/256, 4-56 Hz); the dispatch builds the HIGH band by splatting
+    # STFT_2BAND_HIGH (128/64, 64-192 Hz). Bins are DERIVED from the physical
+    # edges via _stft_band_k_range (one source of truth), so band_f_*_hz — not a
+    # hand-typed k — determine the inclusive rfft-bin slice. ``hop_length`` is
+    # forced to ``band_hop`` in band mode (model_validator) so every frame-count /
+    # clip-snap helper that reads ``self.hop_length`` is correct without a fork.
+    band_nperseg: int = 512
+    band_hop: int = 256
+    band_f_lo_hz: float = 4.0
+    band_f_hi_hz: float = 56.0
     c_max: int | None = None
     # C3 (WS-C, B13 lock): per-(electrode, freq-bin, session) robust-z over the
     # filterbank output. When True, ``prepare`` fits a ``SessionRobustZNormalizer``
@@ -803,11 +980,13 @@ class MultiStftView(CARIeegExtractor):
         # waveform, which the cache never sees). Fail loud at construction rather
         # than silently desync features.
         if self.spec_cache_dir is not None:
-            if self.front_end != "raw":
+            if self.front_end not in ("raw", "band"):
                 raise ValueError(
                     "MultiStftView.spec_cache_dir is only supported for "
-                    f"front_end='raw' (got {self.front_end!r}): the fbank scatter "
-                    "background is not implemented for the cache path."
+                    f"front_end in ('raw','band') (got {self.front_end!r}): the "
+                    "fbank scatter background is not implemented for the cache "
+                    "path. Both raw and band emit a single-STFT |STFT| whose "
+                    "scatter background |STFT|(0)=0 matches the per-clip path."
                 )
             if self.apply_log:
                 raise ValueError(
@@ -822,6 +1001,39 @@ class MultiStftView(CARIeegExtractor):
                         "it is a waveform-domain transform applied before the STFT, "
                         "which the precomputed-spectrogram cache path bypasses."
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_band_config(self) -> "MultiStftView":
+        # 2STFT band mode (§3a): pin ``hop_length`` to ``band_hop`` so the single
+        # hop-reading helpers (n_time_bins_for_duration, _cached_clip frame snap,
+        # chunked overlap-save) are all correct for this band without a per-method
+        # fork — there is exactly one hop in band mode. Also enforce the chunked-
+        # STFT alignment preconditions up front (nperseg % hop == 0 AND
+        # half=nperseg//2 % hop == 0) so a bad band geometry fails at construction,
+        # not deep in the whole-movie build. Both 2STFT bands satisfy these
+        # (low 512/256: half 256; high 128/64: half 64), so the COLA hop=N/2 choice
+        # is also the alignment-clean choice.
+        if self.front_end == "band":
+            if self.hop_length != self.band_hop:
+                raise ValueError(
+                    f"front_end='band' requires hop_length == band_hop; got "
+                    f"hop_length={self.hop_length}, band_hop={self.band_hop}. "
+                    "Set hop_length=band_hop when building a band view (the "
+                    "STFT_2BAND_LOW/HIGH dicts and the dispatch do this)."
+                )
+            if self.band_hop <= 0 or self.band_nperseg % self.band_hop != 0:
+                raise ValueError(
+                    f"front_end='band' needs band_nperseg ({self.band_nperseg}) "
+                    f"divisible by band_hop ({self.band_hop})."
+                )
+            half = self.band_nperseg // 2
+            if half % self.band_hop != 0:
+                raise ValueError(
+                    f"front_end='band' needs half=band_nperseg//2 ({half}) "
+                    f"divisible by band_hop ({self.band_hop}) for chunked "
+                    "segment→global frame alignment."
+                )
         return self
 
     @model_validator(mode="after")
@@ -870,14 +1082,45 @@ class MultiStftView(CARIeegExtractor):
         n_samples = int(round(duration_s * self.sample_rate_hz))
         return 1 + n_samples // self.hop_length
 
+    def _widest_nperseg(self) -> int:
+        """The largest STFT window this view runs — ``band_nperseg`` in band
+        mode, else ``nperseg_low``. Used by the chunked robust-z fit to size the
+        chunk floor and drop too-short tails against the *actual* window, not the
+        inert multi-STFT default."""
+        return self.band_nperseg if self.front_end == "band" else self.nperseg_low
+
+    def _band_bins(self) -> tuple[int, int]:
+        """Inclusive rfft-bin slice ``(k0, k1)`` for this view's band, derived
+        from ``band_f_lo_hz``/``band_f_hi_hz`` at ``band_nperseg`` via the
+        authoritative :func:`_stft_band_k_range`. One source of truth — the band
+        is defined by physical edges, never a hand-typed k. Low → (1, 14) [14
+        bins]; high → (4, 12) [9 bins]."""
+        return _stft_band_k_range(
+            self.band_f_lo_hz, self.band_f_hi_hz,
+            nperseg=self.band_nperseg, sample_rate=self.sample_rate_hz,
+        )
+
     def _spec_from_waveform(
         self, waveform_t: torch.Tensor, sample_rate: int,
     ) -> torch.Tensor:
         """``(C, T)`` waveform → ``(C, F, T_bin)``, with this view's exact
         STFT config. ``front_end="raw"`` (default) emits the F=50 raw |STFT|
-        bins; ``front_end="fbank"`` the demoted F=30 const-Q filterbank. Single
+        bins; ``front_end="fbank"`` the demoted F=30 const-Q filterbank;
+        ``front_end="band"`` (2STFT §3a) one single-band raw |STFT|. Single
         source of truth shared by the per-clip path and the session-stat fit, so
         fit-time and apply-time features are byte-identical."""
+        if self.front_end == "band":
+            k0, k1 = self._band_bins()
+            return _single_stft_raw_view(
+                waveform_t,
+                sample_rate=sample_rate,
+                nperseg=self.band_nperseg,
+                hop_length=self.band_hop,
+                k0=k0,
+                k1=k1,
+                log_eps=self.log_eps,
+                apply_log=self.apply_log,
+            )
         if self.front_end == "raw":
             return _multi_stft_raw_view(
                 waveform_t,
@@ -1084,14 +1327,15 @@ class MultiStftView(CARIeegExtractor):
             raw_ta = next(self._get_data([event]))
             waveform = torch.from_numpy(np.asarray(raw_ta.data)).float()
             sample_rate = int(float(raw_ta.frequency))
+            widest = self._widest_nperseg()
             chunk = max(
-                int(round(self.session_z_chunk_s * sample_rate)), self.nperseg_low,
+                int(round(self.session_z_chunk_s * sample_rate)), widest,
             )
             n_samples = int(waveform.shape[-1])
             specs: list[torch.Tensor] = []
             for c0 in range(0, n_samples, chunk):
                 seg = waveform[:, c0 : c0 + chunk]
-                if int(seg.shape[-1]) < self.nperseg_low:
+                if int(seg.shape[-1]) < widest:
                     continue  # too short for the largest STFT window — drop tail
                 specs.append(self._spec_from_waveform(seg, sample_rate))
             if not specs:
@@ -1297,6 +1541,18 @@ class MultiStftView(CARIeegExtractor):
         matches_unchunked``). This is the single source the cache slices and the
         robust-z stats are fit on, so fit-time and apply-time features agree by
         construction."""
+        if self.front_end == "band":
+            k0, k1 = self._band_bins()
+            return _single_stft_raw_view_chunked(
+                waveform,
+                sample_rate=sample_rate,
+                nperseg=self.band_nperseg,
+                hop_length=self.band_hop,
+                k0=k0,
+                k1=k1,
+                log_eps=self.log_eps,
+                apply_log=self.apply_log,
+            )
         return _multi_stft_raw_view_chunked(
             waveform,
             sample_rate=sample_rate,
@@ -1310,10 +1566,14 @@ class MultiStftView(CARIeegExtractor):
         )
 
     def _expected_raw_f_bins(self) -> int:
-        """F (frequency bins) the ``front_end="raw"`` spec must have for the
-        current ``raw_bins``: the inclusive bin count summed over the three
-        windows. Used to fail loud if a cache hit's stored ``f_bins`` disagrees
-        with the live config (defence in depth behind the namespace digest)."""
+        """F (frequency bins) the raw/band spec must have for the current config.
+        ``front_end="raw"`` = the inclusive bin count summed over the three
+        windows; ``front_end="band"`` = k1-k0+1 for the single band. Used to fail
+        loud if a cache hit's stored ``f_bins`` disagrees with the live config
+        (defence in depth behind the namespace digest)."""
+        if self.front_end == "band":
+            k0, k1 = self._band_bins()
+            return k1 - k0 + 1
         return sum(ke - ks + 1 for (_, ks, ke) in self.raw_bins)
 
     def _spec_cache_namespace(self) -> str:
@@ -1329,6 +1589,14 @@ class MultiStftView(CARIeegExtractor):
             tuple(self.fbank_routing),
             self.front_end,
             bool(self.apply_log),
+            # 2STFT band geometry: band_nperseg/band_hop/band_f_*_hz are pydantic
+            # fields with LOW-band defaults, so exclude_defaults drops them from
+            # infra.uid() on the low band — fold them in here so the low and high
+            # band views (and any band re-point) land in DIFFERENT cache dirs.
+            int(self.band_nperseg) if self.front_end == "band" else None,
+            int(self.band_hop) if self.front_end == "band" else None,
+            float(self.band_f_lo_hz) if self.front_end == "band" else None,
+            float(self.band_f_hi_hz) if self.front_end == "band" else None,
         )).encode()
         digest = hashlib.sha1(sig).hexdigest()[:12]
         return f"{self.infra.uid()}-fe{digest}"  # type: ignore[attr-defined]
@@ -1381,7 +1649,22 @@ class MultiStftView(CARIeegExtractor):
         are listed, so the assert never false-positives on an irrelevant default
         (``log_eps`` only when ``apply_log``; fbank params only off the raw path).
         """
-        geom: dict[str, int | float] = {
+        if self.front_end == "band":
+            # In band mode only band_* shapes the frames (hop_length == band_hop
+            # by validator); the multi-STFT nperseg_* are inert. List exactly the
+            # band geometry so the assert never false-positives on an irrelevant
+            # multi-STFT default and a band re-point fails loud.
+            geom: dict[str, int | float] = {
+                "hop_length": int(self.hop_length),
+                "band_nperseg": int(self.band_nperseg),
+                "band_hop": int(self.band_hop),
+                "band_f_lo_hz": float(self.band_f_lo_hz),
+                "band_f_hi_hz": float(self.band_f_hi_hz),
+            }
+            if self.apply_log:
+                geom["log_eps"] = float(self.log_eps)
+            return geom
+        geom = {
             "hop_length": int(self.hop_length),
             "nperseg_low": int(self.nperseg_low),
             "nperseg_mid": int(self.nperseg_mid),
