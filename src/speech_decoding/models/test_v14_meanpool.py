@@ -82,7 +82,7 @@ def test_mean_pool_is_masked_normalized_mean() -> None:
     support[:, 4, 2] = support[:, 5, 2] = 1.0
     valid = torch.ones(B, C, dtype=torch.bool)
 
-    parcel_raw, latent_valid = enc._mean_pool_electrodes(x_in, support, valid)
+    parcel_raw, latent_valid, _, _ = enc._mean_pool_electrodes(x_in, support, valid)
     assert parcel_raw.shape == (B, 6, F, T)
     assert latent_valid.shape == (B, 6)
     # parcel 0 = mean of electrodes 0,1,2 (a true mean, not a sum).
@@ -105,7 +105,7 @@ def test_mean_pool_excludes_pad_electrodes() -> None:
     valid = torch.ones(B, C, dtype=torch.bool)
     valid[:, 1] = False                          # electrode 1 is a pad
 
-    parcel_raw, latent_valid = enc._mean_pool_electrodes(x_in, support, valid)
+    parcel_raw, latent_valid, _, _ = enc._mean_pool_electrodes(x_in, support, valid)
     # parcel 0 = electrode 0 ONLY (pad electrode 1 dropped, not averaged in).
     torch.testing.assert_close(parcel_raw[:, 0], x_in[:, 0])
     assert latent_valid[:, 0].all()
@@ -120,7 +120,7 @@ def test_mean_pool_all_pad_parcel_is_uncovered() -> None:
     valid = torch.ones(B, C, dtype=torch.bool)
     valid[:, 0] = False                          # the only electrode in parcel 0 is pad
 
-    parcel_raw, latent_valid = enc._mean_pool_electrodes(x_in, support, valid)
+    parcel_raw, latent_valid, _, _ = enc._mean_pool_electrodes(x_in, support, valid)
     assert not latent_valid[:, 0].any()
     torch.testing.assert_close(parcel_raw[:, 0], torch.zeros(B, F, T))
 
@@ -131,8 +131,8 @@ def test_mean_pool_none_valid_mask_includes_all() -> None:
     x_in = torch.randn(B, C, F, T)
     support = torch.zeros(B, C, 6)
     support[:, 0, 0] = support[:, 1, 0] = 1.0
-    pr_none, lv_none = enc._mean_pool_electrodes(x_in, support, None)
-    pr_all, lv_all = enc._mean_pool_electrodes(
+    pr_none, lv_none, _, _ = enc._mean_pool_electrodes(x_in, support, None)
+    pr_all, lv_all, _, _ = enc._mean_pool_electrodes(
         x_in, support, torch.ones(B, C, dtype=torch.bool)
     )
     torch.testing.assert_close(pr_none, pr_all)
@@ -161,7 +161,7 @@ def test_stem_mean_before_equals_mean_after_stem() -> None:
     support[:, 4, 2] = support[:, 5, 2] = 1.0
     valid = torch.ones(B, C, dtype=torch.bool)
 
-    parcel_raw, latent_valid = enc._mean_pool_electrodes(x_in, support, valid)
+    parcel_raw, latent_valid, _, _ = enc._mean_pool_electrodes(x_in, support, valid)
     mean_before = enc.patch_stem(parcel_raw)                  # (B, K, F_p, T_p, d)
 
     # mean-AFTER: stem every electrode, then average over each parcel's set.
@@ -188,7 +188,13 @@ def test_meanpool_forward_taps_preserve_frequency() -> None:
     out = enc(et, support, valid_mask=valid, return_taps=True)
     K, F_p, d = kw["k_parcels"], enc.n_freq_patches, kw["d_model"]
     T_p = enc.patch_stem.n_time_patches(kw["n_time_bins"])
-    assert set(out) == {"M2", "M4", "latent_valid"}
+    # The full forward always rides the heteroscedastic precision stats
+    # (M4_precision_n always; M4_precision_std None when mean_pool_std OFF).
+    assert set(out) == {
+        "M2", "M4", "latent_valid", "M4_precision_std", "M4_precision_n",
+    }
+    assert out["M4_precision_std"] is None                # mean_pool_std OFF here
+    assert out["M4_precision_n"].shape == (B, K)
     assert out["M2"].shape == (B, K, F_p, T_p, d)
     assert out["M4"].shape == (B, K, F_p, T_p, d)        # frequency preserved (D3)
     assert out["latent_valid"].shape == (B, K)
@@ -918,7 +924,7 @@ def test_mean_pool_std_default_off_returns_4d() -> None:
     x_in = torch.randn(B, C, F, T)
     support = torch.zeros(B, C, 6)
     support[:, 0, 0] = 1.0
-    parcel_raw, _ = enc._mean_pool_electrodes(
+    parcel_raw, _, _, _ = enc._mean_pool_electrodes(
         x_in, support, torch.ones(B, C, dtype=torch.bool)
     )
     assert parcel_raw.shape == (B, 6, F, T)             # legacy 4-D, no channel axis
@@ -933,7 +939,7 @@ def test_mean_pool_std_on_returns_5d_mean_then_std() -> None:
     support = torch.zeros(B, C, 6)
     support[:, 0, 0] = support[:, 1, 0] = support[:, 2, 0] = 1.0   # parcel 0 = {0,1,2}
     support[:, 3, 1] = 1.0                                          # parcel 1 = {3}
-    parcel_raw, _ = enc._mean_pool_electrodes(
+    parcel_raw, _, _, _ = enc._mean_pool_electrodes(
         x_in, support, torch.ones(B, C, dtype=torch.bool)
     )
     assert parcel_raw.shape == (B, 6, 2, F, T)          # (B, K, [mean|std], F, T)
@@ -962,7 +968,7 @@ def test_mean_pool_std_excludes_pad_electrodes() -> None:
     support[:, 0, 0] = support[:, 1, 0] = support[:, 2, 0] = 1.0
     valid = torch.ones(B, C, dtype=torch.bool)
     valid[:, 2] = False                                 # electrode 2 is a pad
-    parcel_raw, _ = enc._mean_pool_electrodes(x_in, support, valid)
+    parcel_raw, _, _, _ = enc._mean_pool_electrodes(x_in, support, valid)
     ref_var = x_in[:, :2].var(dim=1, unbiased=False)    # std of {0,1} ONLY
     torch.testing.assert_close(
         parcel_raw[:, 0, 1], torch.sqrt(ref_var + 1e-8), atol=1e-4, rtol=1e-3
@@ -978,7 +984,7 @@ def test_mean_pool_std_uncovered_parcel_is_finite_not_nan() -> None:
     support = torch.zeros(B, C, 6)
     support[:, 0, 0] = support[:, 1, 0] = 1.0           # only parcel 0 covered
     support[:, 2, 0] = support[:, 3, 0] = 1.0
-    parcel_raw, lv = enc._mean_pool_electrodes(
+    parcel_raw, lv, _, _ = enc._mean_pool_electrodes(
         x_in, support, torch.ones(B, C, dtype=torch.bool)
     )
     assert torch.isfinite(parcel_raw).all()             # the whole point: no NaN
