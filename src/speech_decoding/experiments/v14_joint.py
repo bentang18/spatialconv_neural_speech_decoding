@@ -227,6 +227,13 @@ class V14JointExperiment(V14Experiment):
     m2_mask_ratio: float = 0.50
     m2_time_band_floor: int = 2
     m2_freq_band_floor: int = 1
+    # 2STFT dual-band M2 mask block geometry (FE-2STFT; None → sampler default:
+    # low one 3-wide freq block, high {3,3,2} time cols). width = contiguous
+    # patches per block, nbands = #blocks; a band overrides only when BOTH set.
+    m2_low_freq_width: int | None = None
+    m2_low_freq_nbands: int | None = None
+    m2_high_time_width: int | None = None
+    m2_high_time_nbands: int | None = None
     m4_mask_type: Literal["tube", "time_block"] = "tube"
     m4_mask_ratio: float = 0.20
     m4_n_min_visible: int = 3
@@ -482,6 +489,10 @@ class V14JointExperiment(V14Experiment):
             m2_mask_ratio=self.m2_mask_ratio,
             m2_time_band_floor=self.m2_time_band_floor,
             m2_freq_band_floor=self.m2_freq_band_floor,
+            m2_low_freq_width=self.m2_low_freq_width,
+            m2_low_freq_nbands=self.m2_low_freq_nbands,
+            m2_high_time_width=self.m2_high_time_width,
+            m2_high_time_nbands=self.m2_high_time_nbands,
             m4_mask_type=self.m4_mask_type,
             m4_mask_ratio=self.m4_mask_ratio,
             m4_n_min_visible=self.m4_n_min_visible,

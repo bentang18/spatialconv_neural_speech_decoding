@@ -805,6 +805,20 @@ def build_v14_experiment(
     # not divide round(frac·n_valid) (see ssl/mask.py::_sample_axis_bands).
     m2_time_band_floor: int = DEFAULT_M2_TIME_BAND_FLOOR,
     m2_freq_band_floor: int = DEFAULT_M2_FREQ_BAND_FLOOR,
+    # 2STFT dual-band M2 mask block geometry (FE-2STFT only; inert on the
+    # single-band path). ``None`` → the dual-band sampler defaults (low: one
+    # 3-wide freq block across all time; high: {3,3,2} time cols across all
+    # freq). Each band overrides only when BOTH its width and nbands are set:
+    # ``width`` = contiguous patches per block, ``nbands`` = #blocks. Low band
+    # → ``low_freq_floor=width`` + ``low_freq_frac=width*nbands/F_p_low`` (the
+    # sampler scales frac to n_bands); high band → ``high_time_widths`` =
+    # ``(width,) * nbands`` (fixed absolute cols, does NOT scale with T). Lets
+    # us soften the dual-band masking (Ben's "≤2-wide / ~40%" easier-mask run)
+    # without touching the single-band locks above.
+    m2_low_freq_width: int | None = None,
+    m2_low_freq_nbands: int | None = None,
+    m2_high_time_width: int | None = None,
+    m2_high_time_nbands: int | None = None,
     # EMA teacher momentum τ override (#sweep). ``None`` resolves to
     # DEFAULT_EMA_TAU (== ssl/ema.py P1_EMA_TAU/P2_EMA_TAU, B26 lock) so an unset
     # flag reproduces the prior hardcoded 0.99925 exactly; a float in (0, 1)
@@ -1040,6 +1054,23 @@ def build_v14_experiment(
         raise ValueError(f"m2_time_band_floor must be >= 1; got {m2_time_band_floor}")
     if m2_freq_band_floor < 1:
         raise ValueError(f"m2_freq_band_floor must be >= 1; got {m2_freq_band_floor}")
+    # 2STFT dual-band block geometry: width/nbands override a band only as a PAIR
+    # (one without the other is an ambiguous half-spec → fail fast rather than
+    # silently fall back to the sampler default). Both must be >= 1 cells/blocks.
+    for _w, _n, _name in (
+        (m2_low_freq_width, m2_low_freq_nbands, "low_freq"),
+        (m2_high_time_width, m2_high_time_nbands, "high_time"),
+    ):
+        if (_w is None) != (_n is None):
+            raise ValueError(
+                f"m2_{_name}_width and m2_{_name}_nbands must be set together "
+                f"(got width={_w}, nbands={_n}); set both to override the "
+                "dual-band default, or neither to keep it."
+            )
+        if _w is not None and _w < 1:
+            raise ValueError(f"m2_{_name}_width must be >= 1; got {_w}")
+        if _n is not None and _n < 1:
+            raise ValueError(f"m2_{_name}_nbands must be >= 1; got {_n}")
     # Heteroscedastic M4 precision weighting (project_v14_heteroscedastic_ssl_loss):
     # fail fast at dispatch (the BrainModule re-validates) — it needs the σ source
     # (mean|std pool) and the joint B37 path. α >= 0 (α=1 raw count, α<1 damps high-n).
@@ -1598,6 +1629,12 @@ def build_v14_experiment(
             # passes them to ssl/mask.py::sample_m2_mask (time/freq band floors).
             "m2_time_band_floor": m2_time_band_floor,
             "m2_freq_band_floor": m2_freq_band_floor,
+            # 2STFT dual-band block geometry (#sweep; None → sampler default).
+            # Forwarded to V14JointExperiment → ssl/mask.py::sample_m2_dual_band_mask.
+            "m2_low_freq_width": m2_low_freq_width,
+            "m2_low_freq_nbands": m2_low_freq_nbands,
+            "m2_high_time_width": m2_high_time_width,
+            "m2_high_time_nbands": m2_high_time_nbands,
             # SSL-sweep EMA τ override (#sweep). Resolved above (None →
             # DEFAULT_EMA_TAU == 0.99925, the B26 lock); threads onto
             # V14JointExperiment.ema_tau, which feeds the EmaTeacher schedule.
@@ -2773,6 +2810,36 @@ def _parser() -> argparse.ArgumentParser:
              "lock). LARGER = wider spectral bands = harder reconstruction. Same "
              "fixed-fraction / round-down semantics as --m2-time-band-floor.",
     )
+    # 2STFT dual-band M2 mask block geometry (FE-2STFT only; inert on single-band).
+    # Softens the dual-band masking without touching the single-band locks above.
+    # Each band overrides only when BOTH width and nbands are passed; unset → the
+    # sampler default (low one 3-wide freq tube; high {3,3,2} time cols).
+    p.add_argument(
+        "--m2-low-freq-width", dest="m2_low_freq_width", type=int, default=None,
+        help="2STFT dual-band: LOW-band masked freq-block WIDTH (contiguous "
+             "F-patches per block). Default (unset) = sampler's 3-wide single "
+             "tube. Requires --m2-low-freq-nbands. e.g. width 2 + nbands 1 → one "
+             "2-of-7 freq tube across all time.",
+    )
+    p.add_argument(
+        "--m2-low-freq-nbands", dest="m2_low_freq_nbands", type=int, default=None,
+        help="2STFT dual-band: LOW-band number of freq blocks. The realized "
+             "low masked frac = width*nbands/F_p_low (sampler scales to n_bands). "
+             "Requires --m2-low-freq-width.",
+    )
+    p.add_argument(
+        "--m2-high-time-width", dest="m2_high_time_width", type=int, default=None,
+        help="2STFT dual-band: HIGH-band masked time-block WIDTH (contiguous "
+             "T-patches per block, fixed ABSOLUTE cols — does NOT scale with T). "
+             "Default (unset) = sampler's {3,3,2}. Requires --m2-high-time-nbands. "
+             "e.g. width 2 + nbands 16 → 16 disjoint 2-wide time cols across all freq.",
+    )
+    p.add_argument(
+        "--m2-high-time-nbands", dest="m2_high_time_nbands", type=int, default=None,
+        help="2STFT dual-band: HIGH-band number of time blocks (each "
+             "--m2-high-time-width wide). High masked cols = width*nbands; "
+             "must be <= T_high_p. Requires --m2-high-time-width.",
+    )
     p.add_argument(
         "--predictor-hidden", dest="predictor_hidden", type=int,
         default=DEFAULT_PREDICTOR_HIDDEN,
@@ -3097,6 +3164,11 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         m4_mask_ratio=args.m4_mask_ratio,
         m2_time_band_floor=args.m2_time_band_floor,
         m2_freq_band_floor=args.m2_freq_band_floor,
+        # 2STFT dual-band M2 block geometry (None → sampler default; inert single-band).
+        m2_low_freq_width=args.m2_low_freq_width,
+        m2_low_freq_nbands=args.m2_low_freq_nbands,
+        m2_high_time_width=args.m2_high_time_width,
+        m2_high_time_nbands=args.m2_high_time_nbands,
         # SSL-sweep EMA τ override (#sweep). None → build_v14_experiment resolves
         # it to 0.99925 (the B26 lock); joint-only inside the builder, so passing
         # it on every phase (incl. P3/P4) is inert off the SSL path.
@@ -3594,6 +3666,18 @@ def main(argv: list[str] | None = None) -> int:
           f"{DEFAULT_M4_MASK_RATIO if args.m4_mask_ratio is None else args.m4_mask_ratio}) "
           f"m2_band_floor=(t{args.m2_time_band_floor},f{args.m2_freq_band_floor}) "
           f"ema_tau={DEFAULT_EMA_TAU if args.ema_tau is None else args.ema_tau}")
+    # 2STFT dual-band M2 block geometry (only meaningful on the FE-2STFT path).
+    # Print the resolved override or "default" per band so the persisted summary
+    # never implies the locked single-band geometry on a dual-band run.
+    _low_dual = (
+        f"{args.m2_low_freq_width}x{args.m2_low_freq_nbands}"
+        if args.m2_low_freq_width is not None else "default(3x1)"
+    )
+    _high_dual = (
+        f"{args.m2_high_time_width}x{args.m2_high_time_nbands}"
+        if args.m2_high_time_width is not None else "default({3,3,2})"
+    )
+    print(f"  m2_dual_band(2STFT only): low_freq={_low_dual} high_time={_high_dual}")
     print(f"  subtype_embed=(enabled={args.subtype_embed_enabled},reuse_kv={args.subtype_embed_reuse_kv},"
           f"vocab={args.subtype_embed_vocab}) "
           f"ref_embed=(enabled={args.ref_embed_enabled},reuse_kv={args.ref_embed_reuse_kv}) "

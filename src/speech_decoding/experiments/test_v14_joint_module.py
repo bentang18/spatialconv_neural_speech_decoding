@@ -344,6 +344,99 @@ def test_frontend_rank_monitor_logs_and_masks_parcels_in_joint_mode(
     assert captured[0].shape[1] == d
 
 
+def _stub_dual_band_samplers(monkeypatch, *, grid):
+    """Stub the two dual-band mask samplers and capture the M2 sampler's kwargs.
+
+    Returns the ``captured`` dict (filled when ``_sample_dual_band_mask`` runs).
+    ``grid = (F_p_low, T_low_p, F_p_high, T_high_p)``.
+    """
+    import speech_decoding.experiments.v14_joint_module as jm
+
+    F_p_low, T_low_p, F_p_high, T_high_p = grid
+    captured: dict = {}
+
+    def _spy_m2(B, K, *, F_p_low, T_low_p, F_p_high, T_high_p,
+                generator, device=None, **kw):
+        captured.update(kw)
+        S = F_p_low * T_low_p + F_p_high * T_high_p
+        return torch.zeros(B, K, S, dtype=torch.bool, device=device)
+
+    def _spy_tube(support, *, n_time_patches, mask_ratio, n_min_visible, generator):
+        B, _, K = support.shape
+        return torch.zeros(B, K, n_time_patches, dtype=torch.bool), None
+
+    monkeypatch.setattr(jm, "sample_m2_dual_band_mask", _spy_m2)
+    monkeypatch.setattr(jm, "sample_parcel_tube_mask", _spy_tube)
+    return captured
+
+
+def test_dual_band_mask_knobs_forward_to_sampler(monkeypatch) -> None:
+    """The 4 dual-band M2 block-geometry knobs map onto
+    ``sample_m2_dual_band_mask``: low ``(width, nbands)`` →
+    ``low_freq_floor=width`` + ``low_freq_frac=width*nbands/F_p_low`` (so the
+    sampler's ``round(frac·F_p_low)//width`` lands exactly ``nbands`` blocks of
+    ``width``); high ``(width, nbands)`` → ``high_time_widths=(width,)*nbands``
+    (a fixed uniform width multiset). This is the only behavioral coupling the
+    easier-masking 6e-4 run depends on."""
+    grid = (7, 40, 3, 80)  # F_p_low, T_low_p, F_p_high, T_high_p (lr6e4 5s clip)
+    captured = _stub_dual_band_samplers(monkeypatch, grid=grid)
+
+    m = _make_module(
+        m2_low_freq_width=2, m2_low_freq_nbands=1,
+        m2_high_time_width=2, m2_high_time_nbands=21,
+    )
+    m.student.encoder.dual_band_grid_shape = lambda _x: grid  # type: ignore[assignment]
+
+    B, C, K = 2, 5, m.student.encoder.k_parcels
+    et_high = torch.randn(B, 1, 1, 1)
+    support = torch.zeros(B, C, K)
+    m._sample_dual_band_mask(electrode_tokens_high=et_high, support=support)
+
+    assert captured["low_freq_floor"] == 2
+    assert captured["low_freq_frac"] == pytest.approx(2 * 1 / grid[0])
+    assert captured["high_time_widths"] == (2,) * 21
+
+
+def test_dual_band_mask_knobs_unset_keeps_sampler_defaults(monkeypatch) -> None:
+    """Unset knobs (the default) pass NO geometry override to the sampler, so the
+    dual-band path is byte-identical to the un-flagged version (sampler defaults:
+    low one 3-wide freq tube; high {3,3,2} time cols)."""
+    grid = (7, 40, 3, 80)
+    captured = _stub_dual_band_samplers(monkeypatch, grid=grid)
+
+    m = _make_module()  # no knobs
+    m.student.encoder.dual_band_grid_shape = lambda _x: grid  # type: ignore[assignment]
+
+    B, C, K = 2, 5, m.student.encoder.k_parcels
+    m._sample_dual_band_mask(
+        electrode_tokens_high=torch.randn(B, 1, 1, 1),
+        support=torch.zeros(B, C, K),
+    )
+    for k in ("low_freq_floor", "low_freq_frac", "high_time_widths"):
+        assert k not in captured, f"{k} should not be forwarded when unset"
+
+
+def test_dual_band_mask_half_spec_keeps_sampler_default(monkeypatch) -> None:
+    """A half-spec at the MODULE layer (width without nbands) is treated as
+    'unset' for that band — the override only applies when BOTH are set, so a
+    stray single knob can never silently half-configure the sampler. (Dispatch
+    rejects the half-spec loudly before this; the module is the last-line
+    defense if a module is built directly.)"""
+    grid = (7, 40, 3, 80)
+    captured = _stub_dual_band_samplers(monkeypatch, grid=grid)
+
+    m = _make_module(m2_low_freq_width=2)  # nbands missing
+    m.student.encoder.dual_band_grid_shape = lambda _x: grid  # type: ignore[assignment]
+
+    B, C, K = 2, 5, m.student.encoder.k_parcels
+    m._sample_dual_band_mask(
+        electrode_tokens_high=torch.randn(B, 1, 1, 1),
+        support=torch.zeros(B, C, K),
+    )
+    assert "low_freq_floor" not in captured
+    assert "low_freq_frac" not in captured
+
+
 def test_unset_p2_m4_probe_receives_empirical_band(monkeypatch) -> None:
     """End-to-end: an UNSET phase="p2" module forwards the empirical M4 band
     (0.04/0.02) all the way to the M4 probe call site — not the M2 0.5/0.25

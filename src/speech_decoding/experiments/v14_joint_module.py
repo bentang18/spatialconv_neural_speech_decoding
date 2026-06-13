@@ -253,6 +253,19 @@ class V14JointBrainModule(pl.LightningModule):
         m2_time_band_floor: int = 2,
         m2_freq_band_floor: int = 1,
         m2_time_freq_split: tp.Optional[tuple[float, float]] = None,
+        # 2STFT dual-band M2 mask block-geometry overrides (FE-2STFT). Each None
+        # → the sample_m2_dual_band_mask defaults (low: one 3-wide freq block ≈
+        # 43% of the low band; high: {3,3,2} time cols ≈ 10% on the T_high_p=80
+        # grid → ~28% overall). Set width+nbands per band to reshape the tubes
+        # for the "easier masking" sweep: low_freq_* drive the freq tube
+        # (width = contiguous freq patches per block, nbands = #blocks), high_
+        # time_* the time tube (width = contiguous time patches, nbands =
+        # #blocks). Only consulted on the dual-band (per_band_stem) path; a band
+        # is overridden only when BOTH its width and nbands are given.
+        m2_low_freq_width: tp.Optional[int] = None,
+        m2_low_freq_nbands: tp.Optional[int] = None,
+        m2_high_time_width: tp.Optional[int] = None,
+        m2_high_time_nbands: tp.Optional[int] = None,
         m4_mask_type: str = "tube",
         m4_mask_ratio: float = 0.20,
         m4_n_min_visible: int = 3,
@@ -541,6 +554,10 @@ class V14JointBrainModule(pl.LightningModule):
         self._m2_time_band_floor = m2_time_band_floor
         self._m2_freq_band_floor = m2_freq_band_floor
         self._m2_time_freq_split = m2_time_freq_split
+        self._m2_low_freq_width = m2_low_freq_width
+        self._m2_low_freq_nbands = m2_low_freq_nbands
+        self._m2_high_time_width = m2_high_time_width
+        self._m2_high_time_nbands = m2_high_time_nbands
         self._m4_mask_type = m4_mask_type
         self._m4_mask_ratio = m4_mask_ratio
         self._m4_n_min_visible = m4_n_min_visible
@@ -1109,11 +1126,29 @@ class V14JointBrainModule(pl.LightningModule):
         gen = torch.Generator(device=device)
         gen.manual_seed(self._mask_seed + step)
         K = self.student.encoder.k_parcels
+        # Optional per-band block-geometry overrides (each band overridden only
+        # when BOTH its width and nbands are set; else the sampler defaults
+        # stand → byte-identical to the un-flagged dual-band path). Low band:
+        # map (width, nbands) onto the freq-tube sampler's (floor, frac) —
+        # frac = width·nbands / F_p_low lands round(frac·F_p_low)=width·nbands so
+        # //width == nbands blocks of exactly `width`. High band: an explicit
+        # uniform width multiset (width repeated nbands times).
+        mask_kw: dict[str, tp.Any] = {}
+        if self._m2_low_freq_width is not None and self._m2_low_freq_nbands is not None:
+            mask_kw["low_freq_floor"] = self._m2_low_freq_width
+            mask_kw["low_freq_frac"] = (
+                self._m2_low_freq_width * self._m2_low_freq_nbands
+            ) / F_p_low
+        if self._m2_high_time_width is not None and self._m2_high_time_nbands is not None:
+            mask_kw["high_time_widths"] = (
+                self._m2_high_time_width,
+            ) * self._m2_high_time_nbands
         token_mask = sample_m2_dual_band_mask(
             B, K,
             F_p_low=F_p_low, T_low_p=T_low_p,
             F_p_high=F_p_high, T_high_p=T_high_p,
             generator=gen, device=device,
+            **mask_kw,
         )
         # Whole-parcel M4 tube: parcel is the atomic unit → n_time_patches=1, then
         # squeeze the time axis to the (B, K) per-parcel tube selection (coverage +

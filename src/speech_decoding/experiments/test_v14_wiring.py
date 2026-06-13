@@ -289,6 +289,48 @@ def test_v14_dispatch_dry_run_summary_tracks_atlas_and_hetero_m4(capsys) -> None
     assert "cap=10.0" in out
 
 
+def test_v14_dispatch_dry_run_surfaces_dual_band_mask_geometry(capsys) -> None:
+    """The 2STFT dual-band M2 block-geometry knobs must reach the launch summary.
+
+    The easier-masking 6e-4 run softens the dual-band mask via
+    ``--m2-low-freq-width/-nbands`` + ``--m2-high-time-width/-nbands``; the
+    persisted summary must print the resolved override (not imply the locked
+    single-band geometry on a dual-band run). Unset → it prints ``default``."""
+    from speech_decoding.experiments import dispatch_v14
+
+    # Unset: both bands report the sampler default.
+    rc = dispatch_v14.main(["--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "m2_dual_band(2STFT only): low_freq=default(3x1) high_time=default({3,3,2})" in out
+
+    # Override: the easier-mask geometry is echoed verbatim.
+    rc = dispatch_v14.main([
+        "--dry-run",
+        "--m2-low-freq-width", "2", "--m2-low-freq-nbands", "1",
+        "--m2-high-time-width", "2", "--m2-high-time-nbands", "21",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "m2_dual_band(2STFT only): low_freq=2x1 high_time=2x21" in out
+
+
+def test_v14_dispatch_dual_band_half_spec_rejected() -> None:
+    """A half-specified band (width without nbands, or vice versa) must fail loud
+    in ``build_v14_experiment`` rather than silently fall back to the sampler
+    default — an ambiguous half-spec is almost always a typo."""
+    import pytest
+
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    # bt_root is a non-None dummy so the builder gets past the env-root check to
+    # the pure config-validation block (no BT data is touched before it raises).
+    with pytest.raises(ValueError, match="must be set together"):
+        build_v14_experiment(bt_root="/dummy", m2_low_freq_width=2)  # nbands missing
+    with pytest.raises(ValueError, match="must be set together"):
+        build_v14_experiment(bt_root="/dummy", m2_high_time_nbands=4)  # width missing
+
+
 # Removed: ``test_v14_dispatch_raises_until_electrode_tokens_extractor_wired``.
 # Gate closed by ``LogStftView`` (see ``test_v14_dispatch_wired.py``). The
 # inverse assertion — that ``build_v14_experiment`` defaults to LogStftView when
