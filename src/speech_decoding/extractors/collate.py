@@ -110,11 +110,20 @@ def v14_variable_tc_collate(samples: Sequence[dict[str, Any]]) -> dict[str, Tens
 
     # 2STFT HIGH band (per_band_stem): same electrodes as the low band, so pad to
     # the SAME ``C_max`` (per-sample C_i must match the low band's), but keep its
-    # own freq/time axes. Freq-major ``(C, F_high, T_high)`` round-trips untransposed.
+    # own freq/time axes. The high band is FREQ-MAJOR ``(C, F_high, T_high)``
+    # (encoder contract: ``_forward_dual_band`` reads ``F_high, T_high`` off the
+    # last two axes, last = time), so -- unlike the time-major low band -- its
+    # FIXED axis is freq (axis 1, a front-end constant) and its VARIABLE axis is
+    # TIME (last), padded to per-batch ``T_high_max``. (Pre-fix this branch padded
+    # the freq axis and equality-checked time -- the low band's time-major pattern
+    # applied to a transposed tensor: a no-op while clip duration is constant, but
+    # a false "freq mismatch" crash once duration -- hence T_high -- varies across
+    # a batch. NOTE: the LOW band's shared main path above has the symmetric gap
+    # in 2STFT mode but is gated for Ben; see the data-pipeline ledger.)
     if "electrode_tokens_high" in samples[0]:
         eh0 = samples[0]["electrode_tokens_high"]
-        F_high = eh0.shape[-1]
-        A1_high = max(s["electrode_tokens_high"].shape[1] for s in samples)
+        F_high = eh0.shape[1]
+        T_high_max = max(s["electrode_tokens_high"].shape[-1] for s in samples)
         for i, s in enumerate(samples):
             if "electrode_tokens_high" not in s:
                 raise ValueError(
@@ -122,10 +131,10 @@ def v14_variable_tc_collate(samples: Sequence[dict[str, Any]]) -> dict[str, Tens
                     "carries it (all-or-none per batch)"
                 )
             eh = s["electrode_tokens_high"]
-            if eh.shape[-1] != F_high:
+            if eh.shape[1] != F_high:
                 raise ValueError(
                     f"sample {i}: high-band freq-bin count mismatch "
-                    f"{eh.shape[-1]} != batch-leader {F_high}"
+                    f"{eh.shape[1]} != batch-leader {F_high}"
                 )
             if eh.shape[0] != samples[i]["electrode_tokens"].shape[0]:
                 raise ValueError(
@@ -134,12 +143,12 @@ def v14_variable_tc_collate(samples: Sequence[dict[str, Any]]) -> dict[str, Tens
                     "(the two 2STFT bands must share electrodes)"
                 )
         electrode_tokens_high = torch.zeros(
-            B, C_max, A1_high, F_high, dtype=eh0.dtype
+            B, C_max, F_high, T_high_max, dtype=eh0.dtype
         )
         for b, sample in enumerate(samples):
             eh = sample["electrode_tokens_high"]
-            C_i, A1_i = eh.shape[0], eh.shape[1]
-            electrode_tokens_high[b, :C_i, :A1_i, :] = eh
+            C_i, T_i = eh.shape[0], eh.shape[-1]
+            electrode_tokens_high[b, :C_i, :, :T_i] = eh
         out["electrode_tokens_high"] = electrode_tokens_high
 
     # Any non-variable field round-trips via plain stack.

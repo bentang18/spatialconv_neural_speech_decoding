@@ -141,12 +141,37 @@ def test_collate_dual_band_absent_high_is_noop() -> None:
 
 
 def test_collate_dual_band_rejects_high_freq_mismatch() -> None:
-    """High-band F mismatch within a batch is a config error."""
+    """High-band F_high mismatch (axis 1, the FIXED freq axis) within a batch is a
+    config error. The high band is freq-major (C, F_high, T_high); freq is the
+    fixed front-end constant, so it must agree across the batch."""
     s1 = _dual_sample(C=2)
     s2 = _dual_sample(C=2)
-    s2["electrode_tokens_high"] = torch.randn(2, 9, 15)  # t_high differs (last axis)
+    s2["electrode_tokens_high"] = torch.randn(2, 8, 16)  # F_high=8 differs (axis 1)
     with pytest.raises(ValueError, match="high-band freq"):
         v14_variable_tc_collate([s1, s2])
+
+
+def test_collate_dual_band_pads_high_variable_time() -> None:
+    """The high band is freq-major (C, F_high, T_high): differing T_high (the last
+    axis -- it tracks clip duration) is PADDED to the per-batch max, NOT rejected.
+    (Regression: pre-fix this branch treated time as the fixed axis and raised a
+    false 'freq mismatch'.)
+
+    ``t_low`` is held CONSTANT here to isolate the high-band branch: the low band's
+    shared main path has the symmetric variable-T gap in 2STFT mode (it would raise
+    on a differing ``t_low``), which is tracked as a separate gated item in the
+    data-pipeline ledger rather than fixed in this shared path."""
+    s1 = _dual_sample(C=2, t_low=8, t_high=16)
+    s2 = _dual_sample(C=2, t_low=8, t_high=8)
+    batch = v14_variable_tc_collate([s1, s2])
+    # High-band time padded to the batch max (16); freq axis stays fixed at 9.
+    assert batch["electrode_tokens_high"].shape == (2, 2, 9, 16)
+    # Sample-2's high band (t_high=8) is zero-padded in the tail time frames.
+    assert torch.all(batch["electrode_tokens_high"][1, :, :, 8:] == 0)
+    # Real time frames are preserved untransposed.
+    assert torch.equal(
+        batch["electrode_tokens_high"][1, :, :, :8], s2["electrode_tokens_high"]
+    )
 
 
 def test_collate_dual_band_rejects_electrode_count_mismatch() -> None:
