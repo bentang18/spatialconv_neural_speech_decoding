@@ -1801,8 +1801,49 @@ class V14ParcelPerceiverModel(nn.Module):
         # nonzero() below is the single (unavoidable) sync, matching the
         # cross-attn ragged path. Coverage is always partial here (K_c≪K), so
         # the gather always has real work.
+        ragged_token = self.ragged_token and token_drop is not None
         ragged = self.ragged_frontend
-        if ragged:
+        if ragged_token:
+            # #93 token drop on the mean path (per-parcel rows): gather the
+            # VISIBLE (t_p, f_p) tokens per parcel, run the blocks over the
+            # reduced sequence, scatter back (dropped → zeros). Truly visible-only
+            # (masked tokens are GONE, not zero-in-place) — canonical V-JEPA 2
+            # §2.1; a REPRESENTATION change vs the dense zero-fill above, gated on
+            # the flag. When ``ragged_frontend`` is also on, fold the
+            # uncovered-parcel drop INTO the token keep so it is ONE combined
+            # gather — no overlap with the parcel-row gather in the ``elif``.
+            # Keep order matches x_joint's flat layout (t_p OUTER, f_p INNER):
+            # permute token_drop (B,K,F_p,T_p) → (B,K,T_p,F_p) before the reshape.
+            assert token_drop is not None  # narrowed by ``ragged_token``
+            keep_flat = (~token_drop).permute(0, 1, 3, 2).reshape(BK, S)  # True=visible
+            if ragged:
+                keep_flat = keep_flat & latent_valid.reshape(BK, 1)
+            keep_idx, keep_real, Lk = _ragged_gather_idx(keep_flat)
+            gi = keep_idx.unsqueeze(-1).expand(BK, Lk, self.d_model)
+            xj_v = torch.gather(x_joint, 1, gi)                  # (BK, Lk, d)
+            # Per-row time-RoPE: each kept token keeps the dense rotation it had
+            # (rope_token gathered at the kept flat columns); only its dropped
+            # neighbours are gone.
+            rope_v = rope_token[:, keep_idx, :]                  # (2, BK, Lk, hd)
+            kpm_v = keep_real                                    # True=attendable key
+            # NaN guard: a fully-dropped row (uncovered / tubed parcel → zero kept
+            # tokens) would attend an empty key set → SDPA softmax NaN poisoning
+            # the SHARED qkv grads even though the row is scattered away. Force
+            # such rows to keep slot-0 (a pad token); finite, discarded.
+            empty_row = ~kpm_v.any(dim=1, keepdim=True)          # (BK, 1)
+            if bool(empty_row.any()):
+                slot0 = torch.arange(Lk, device=kpm_v.device).unsqueeze(0) == 0
+                kpm_v = kpm_v | (empty_row & slot0)
+            xj_v = self._token_block_stack(xj_v, kpm_v, rope_v, use_ckpt)
+            # Scatter back: real kept tokens → their flat slot; pad slots → a
+            # scratch slot ``S`` that is trimmed off (never read).
+            scatter_idx = torch.where(
+                keep_real, keep_idx, torch.full_like(keep_idx, S)
+            ).unsqueeze(-1).expand(BK, Lk, self.d_model)
+            scratch = xj_v.new_zeros(BK, S + 1, self.d_model)
+            scratch.scatter_(1, scatter_idx, xj_v)
+            x_joint = scratch[:, :S, :]
+        elif ragged:
             valid_rows = latent_valid.reshape(BK)
             valid_idx = valid_rows.nonzero(as_tuple=True)[0]
             if valid_idx.numel() == 0:
