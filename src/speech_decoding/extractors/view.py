@@ -1452,6 +1452,47 @@ class MultiStftView(CARIeegExtractor):
             )
 
     @staticmethod
+    def _assert_cache_read_sane(
+        sliced: np.ndarray, n_frames: int, total_frames: int, key: str,
+    ) -> None:
+        """Guard the per-clip cache READ path (ledger LG14c + LG14g).
+
+        ``_assert_cache_finite`` only runs on the cache BUILD; a cache HIT
+        (:meth:`_cached_clip`) memmap-slices the ``.npy`` and validates only the
+        ``.json`` sidecar geometry, never the payload values or length. Two silent
+        corruptions slip through, both the S9 class (plausible, non-crashing):
+
+        * **LG14g (length):** ``_cached_clip`` clamps ``g0`` inside the recording
+          before slicing, so a short slice means ``total_frames < n_frames`` — the
+          whole-movie spec is itself shorter than a single clip window. That is a
+          truncated/corrupt cache or a session mismatch, NOT a recording-edge clip
+          (the clamp already handles real edges). The old code zero-padded the tail
+          and fed fabricated silence to the encoder; fail loud instead.
+        * **LG14c (finiteness):** a post-write disk byte-flip, or an ``.npy`` whose
+          payload diverged from a still-passing sidecar, would feed NaN/inf STFT
+          frames straight to the encoder. The check is over the sliced clip only
+          (~C*F*n_frames elements), so it scales with clip size, not recording
+          length, and never false-fires on a healthy cache (build-time finiteness
+          is already asserted).
+        """
+        if int(sliced.shape[-1]) < int(n_frames):
+            raise ValueError(
+                f"cached spec for session {key!r} has only {total_frames} total "
+                f"frames, fewer than one {n_frames}-frame clip window — the "
+                "whole-movie spec is shorter than a single clip (truncated/corrupt "
+                "cache, or a session mismatch). The g0 clamp already handles real "
+                "recording edges, so this is not an edge clip; refusing to zero-pad "
+                "fabricated silence (ledger LG14g)."
+            )
+        if not np.isfinite(sliced).all():
+            raise ValueError(
+                f"cached spec slice for session {key!r} is non-finite — the .npy "
+                "payload is corrupt or has diverged from its .json sidecar (only "
+                "sidecar geometry is validated on the read path). Rebuild the spec "
+                "cache (ledger LG14c)."
+            )
+
+    @staticmethod
     def _write_stats_sidecar(
         stats_path: Path, normalizer: SessionRobustZNormalizer,
     ) -> None:
@@ -1694,14 +1735,11 @@ class MultiStftView(CARIeegExtractor):
         g0 = max(0, min(g0, max(0, total - n_frames)))
         sliced = np.asarray(spec_mm[:, :, g0 : g0 + n_frames]).astype(np.float32)
         del spec_mm
-        if sliced.shape[-1] < n_frames:
-            # Recording shorter than one clip window: zero-pad the tail (the same
-            # absent-frame convention as a too-short recompute window).
-            pad = np.zeros(
-                (sliced.shape[0], sliced.shape[1], n_frames - sliced.shape[-1]),
-                dtype=np.float32,
-            )
-            sliced = np.concatenate([sliced, pad], axis=-1)
+        # LG14c/LG14g: validate the memmap payload (finiteness) and length on the
+        # per-clip read path. The old code silently zero-padded a too-short slice;
+        # that case only arises when the whole-movie spec is shorter than one clip
+        # (corruption), so it now fails loud. See _assert_cache_read_sane.
+        self._assert_cache_read_sane(sliced, n_frames, total, key)
         spec = self._scatter_spec_to_global(
             torch.from_numpy(sliced), list(entry.ch_names),
         )

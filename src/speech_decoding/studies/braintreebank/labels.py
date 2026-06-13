@@ -245,8 +245,33 @@ def _continuous_labels(
         labels = []
         for start_time in words_df["start"].to_list():
             labels.append(pitch_volume_features[f"{start_time:.5f}"][task_column])
-        return np.asarray(labels)
-    return words_df[task_column].to_numpy()
+        return _assert_finite_labels(np.asarray(labels, dtype=float), task_column, "pitch_volume_features")
+    return _assert_finite_labels(
+        np.asarray(words_df[task_column].to_numpy(), dtype=float), task_column, "features.csv"
+    )
+
+
+def _assert_finite_labels(arr: np.ndarray, task_column: str, source: str) -> np.ndarray:
+    """Fail loud if a continuous label vector carries NaN/inf (ledger LG14).
+
+    A continuous task label is never legitimately non-finite. NaN enters silently
+    two ways: the ``original_index``-keyed ``.map(features[col])`` join
+    (``enrich_words_with_transcript_features``) emits NaN for any word with no
+    matching ``features.csv`` row (truncated/row-swapped CSV), and a corrupt
+    ``pitch_volume_features`` value passes straight through. Either way the NaN
+    then drops out of every ``np.mean(all_labels < value)`` percentile bucket,
+    silently mislabeling/dropping clips. This is the precise consumption-point
+    guard: it fires only when the vector the model actually uses is corrupt.
+    """
+    n_bad = int((~np.isfinite(arr)).sum())
+    if n_bad:
+        raise ValueError(
+            f"continuous label column '{task_column}' has {n_bad}/{arr.size} non-finite "
+            f"values (source: {source}). A NaN/inf label means the {source} join produced "
+            "an unmatched/corrupt row — it would silently fall out of percentile bucketing "
+            "and mislabel clips (ledger LG14). Verify the source file row coverage."
+        )
+    return arr
 
 
 def _word_gap_indices(words_df: pd.DataFrame, *, binary_tasks: bool) -> dict[int, np.ndarray]:

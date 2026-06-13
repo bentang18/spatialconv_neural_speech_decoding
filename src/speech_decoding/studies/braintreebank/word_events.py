@@ -216,7 +216,57 @@ def _load_neural_to_movie_map(
     # most one trigger spacing (~85 ms), and both bracket the same sample, so either
     # is a valid knot — the choice is sub-frame at the 8 Hz teacher rate.
     df = df.drop_duplicates(subset="index", keep="last")
-    return df["index"].to_numpy(dtype=float), df["movie_time"].to_numpy(dtype=float)
+    xp = df["index"].to_numpy(dtype=float)
+    yp = df["movie_time"].to_numpy(dtype=float)
+    _assert_trigger_track_sane(xp, yp, path)
+    return xp, yp
+
+
+# This map keys the Whisper teacher on the movie clock (`np.interp(est_idx)->yp`).
+# `dropna()` above strips NaN knots but NOT inf, and never checks that the movie
+# axis is sane — a content-corrupted, truncated, or wrongly-concatenated trigger
+# CSV would otherwise yield a wrong-but-finite `movie_onset_s` that silently
+# mis-aligns every P3 teacher target (the alignment S9-class: plausible, no
+# crash). These bounds are calibrated against all 26 vendored tracks: every one
+# is finite, has strictly-increasing `index`, spans >30 s of movie, and its
+# `movie_time` never steps backward by more than ~57 ms (trigger jitter; one
+# spacing ~85 ms). We tolerate sub-second jitter but fail loud on seconds-scale
+# non-monotonicity / inf / truncation.
+_MAX_TRIGGER_BACKSTEP_S = 1.0  # >> 57 ms real jitter, << any real corruption
+_MIN_TRIGGER_ROWS = 100
+_MIN_TRIGGER_SPAN_S = 30.0
+
+
+def _assert_trigger_track_sane(xp: np.ndarray, yp: np.ndarray, path: Path) -> None:
+    """Fail loud on a content-corrupt trigger track (see ledger LG14)."""
+    if len(xp) < _MIN_TRIGGER_ROWS:
+        raise ValueError(
+            f"BT trigger track {path} has only {len(xp)} usable rows "
+            f"(< {_MIN_TRIGGER_ROWS}) — truncated/corrupt; it keys the P3 movie clock."
+        )
+    if not (np.isfinite(xp).all() and np.isfinite(yp).all()):
+        raise ValueError(
+            f"BT trigger track {path} has non-finite index/movie_time knots after "
+            "dropna (inf survives dropna) — corrupt clock map."
+        )
+    if not np.all(np.diff(xp) > 0):
+        raise ValueError(
+            f"BT trigger track {path} 'index' axis is not strictly increasing after "
+            "sort+dedup — np.interp would misbehave; the dedup contract broke."
+        )
+    backstep = float(-np.diff(yp).min()) if len(yp) > 1 else 0.0
+    if backstep > _MAX_TRIGGER_BACKSTEP_S:
+        raise ValueError(
+            f"BT trigger track {path} 'movie_time' steps backward by {backstep:.3f}s "
+            f"(> {_MAX_TRIGGER_BACKSTEP_S}s tolerance) — the movie clock is non-monotone "
+            "(corrupt/concatenated track); P3 teacher targets would mis-align."
+        )
+    span = float(yp[-1] - yp[0])
+    if span < _MIN_TRIGGER_SPAN_S:
+        raise ValueError(
+            f"BT trigger track {path} movie_time spans only {span:.1f}s "
+            f"(< {_MIN_TRIGGER_SPAN_S}s) — a real film clock is minutes long; truncated."
+        )
 
 
 def _word_event_rows(
@@ -338,6 +388,19 @@ def _word_event_rows(
                 raw_text = source.get("full_word", "")
                 text = str(raw_text) if pd.notna(raw_text) and str(raw_text) else "<word>"
             est_idx = float(source["est_idx"])
+            if not np.isfinite(est_idx):
+                # est_idx is the NEURAL clock: it sets both the voltage window onset
+                # (`start = est_idx/SR`) and the movie-onset interp. A NaN/inf est_idx
+                # (corrupt words_df/nonverbal_df) would silently mis-window every clip
+                # for this anchor. Real data has ZERO non-finite est_idx across all 26
+                # words_df (202792 rows) + nonverbal_df (115990) so this never false-
+                # fires; the upstream `.dropna()` is defensive only (ledger LG14h).
+                raise ValueError(
+                    f"non-finite est_idx for {'nonverbal' if is_nonverbal else 'word'} "
+                    f"row {src_idx} (subject {subject_id}, trial {trial_id}, task {task}): "
+                    "a corrupt words_df/nonverbal_df est_idx silently mis-windows the "
+                    "neural clip AND the P3 teacher onset (ledger LG14h)."
+                )
             movie_onset = _movie_onset(est_idx, is_nonverbal, source)
             rows.append(
                 {
