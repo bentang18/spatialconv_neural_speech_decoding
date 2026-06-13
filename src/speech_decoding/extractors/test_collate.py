@@ -155,12 +155,7 @@ def test_collate_dual_band_pads_high_variable_time() -> None:
     """The high band is freq-major (C, F_high, T_high): differing T_high (the last
     axis -- it tracks clip duration) is PADDED to the per-batch max, NOT rejected.
     (Regression: pre-fix this branch treated time as the fixed axis and raised a
-    false 'freq mismatch'.)
-
-    ``t_low`` is held CONSTANT here to isolate the high-band branch: the low band's
-    shared main path has the symmetric variable-T gap in 2STFT mode (it would raise
-    on a differing ``t_low``), which is tracked as a separate gated item in the
-    data-pipeline ledger rather than fixed in this shared path."""
+    false 'freq mismatch'.) ``t_low`` is held constant to isolate the high band."""
     s1 = _dual_sample(C=2, t_low=8, t_high=16)
     s2 = _dual_sample(C=2, t_low=8, t_high=8)
     batch = v14_variable_tc_collate([s1, s2])
@@ -172,6 +167,33 @@ def test_collate_dual_band_pads_high_variable_time() -> None:
     assert torch.equal(
         batch["electrode_tokens_high"][1, :, :, :8], s2["electrode_tokens_high"]
     )
+
+
+def test_collate_dual_band_pads_low_variable_time() -> None:
+    """LG20 low-band fix: in 2STFT mode the LOW band (``electrode_tokens``) is also
+    freq-major (C, F_low, T_low). Differing T_low (the last axis, tracks clip
+    duration) is PADDED to the per-batch max with freq (axis 1) held fixed -- NOT
+    routed through the single-band time-major path (which pre-fix raised a false
+    'freq mismatch' on the low band once T_low varied across a batch)."""
+    s1 = _dual_sample(C=2, t_low=9, t_high=16)
+    s2 = _dual_sample(C=2, t_low=5, t_high=16)
+    batch = v14_variable_tc_collate([s1, s2])
+    # Low-band freq axis fixed at 14; time padded to the batch max (9).
+    assert batch["electrode_tokens"].shape == (2, 2, 14, 9)
+    # Sample-2's low band (t_low=5) is zero-padded in the tail time frames.
+    assert torch.all(batch["electrode_tokens"][1, :, :, 5:] == 0)
+    # Real low-band frames preserved untransposed (freq-major).
+    assert torch.equal(batch["electrode_tokens"][1, :, :, :5], s2["electrode_tokens"])
+
+
+def test_collate_dual_band_rejects_low_freq_mismatch() -> None:
+    """In 2STFT mode the low band's FIXED axis is freq (axis 1); a within-batch
+    F_low mismatch is a config error (symmetric with the high-band freq guard)."""
+    s1 = _dual_sample(C=2)
+    s2 = _dual_sample(C=2)
+    s2["electrode_tokens"] = torch.randn(2, 13, 8)  # F_low=13 differs (axis 1)
+    with pytest.raises(ValueError, match="low-band freq"):
+        v14_variable_tc_collate([s1, s2])
 
 
 def test_collate_dual_band_rejects_electrode_count_mismatch() -> None:

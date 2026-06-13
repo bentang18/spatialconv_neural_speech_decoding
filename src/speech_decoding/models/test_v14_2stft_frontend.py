@@ -631,3 +631,38 @@ def test_m2_dual_band_contract_end_to_end() -> None:
         for p in m.patch_stem_low.parameters()
     ]
     assert any(enc_grad), "student encoder (low stem) got no gradient"
+
+
+# --------------------------------------------------------------------------- #
+# --compile-dynamic regression: the heteroscedastic σ pool must stay OUT of the
+# compiled graph. Under --compile-dynamic the per-parcel σ spatial dims (Fr, Tr)
+# are marked symbolic; an INLINE adaptive_avg_pool2d then fails (its window_size
+# is a SymInt — Inductor's `if window_size > 25` lowering branch is undecidable,
+# or the dim specialization that would avoid it violates the dynamic constraint).
+# `_pool_parcel_std` is @torch.compiler.disable, so the pool runs eager and the
+# surrounding graph compiles cleanly even when the spatial dims are dynamic.
+# --------------------------------------------------------------------------- #
+def test_pool_parcel_std_compiles_under_dynamic_spatial_dims() -> None:
+    from speech_decoding.models.v14_encoder import _pool_parcel_std
+
+    def caller(std: torch.Tensor) -> torch.Tensor:
+        # +0.0 keeps a compiled op around the graph-break so this exercises a
+        # real compiled graph (mirroring the pool embedded in the encoder fwd).
+        return _pool_parcel_std(std, 7, 9) + 0.0
+
+    x = torch.randn(2, 5, 14, 9)  # (B, K, Fr, Tr)
+    # Force the σ spatial dims symbolic — the exact --compile-dynamic condition
+    # that crashes an inline adaptive_avg_pool2d.
+    torch._dynamo.mark_dynamic(x, 2)
+    torch._dynamo.mark_dynamic(x, 3)
+    try:
+        compiled = torch.compile(caller, dynamic=True)
+        out = compiled(x)
+    finally:
+        torch._dynamo.reset()
+    assert out.shape == (2, 5, 7, 9)
+    # Eager parity: the disabled helper is numerically exact vs adaptive pool.
+    ref = torch.nn.functional.adaptive_avg_pool2d(
+        x.reshape(10, 1, 14, 9), (7, 9)
+    ).reshape(2, 5, 7, 9)
+    assert torch.allclose(_pool_parcel_std(x, 7, 9), ref, atol=0, rtol=0)

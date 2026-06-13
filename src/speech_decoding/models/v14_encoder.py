@@ -85,6 +85,30 @@ from speech_decoding.studies.braintreebank.anatomy import (
 _MEAN_POOL_STD_EPS = 1e-8
 
 
+@torch.compiler.disable
+def _pool_parcel_std(std_bk: Tensor, out_f: int, out_t: int) -> Tensor:
+    """Average-pool per-parcel σ ``(B, K, Fr, Tr)`` over each band's Conv2d patch
+    receptive field down to ``(B, K, out_f, out_t)`` — the M4 token grid — so the
+    heteroscedastic σ aligns 1:1 with the M4 target cells (precision-weighted loss,
+    ``project_v14_heteroscedastic_ssl_loss``).
+
+    Held OUT of the ``torch.compile`` graph (``torch.compiler.disable``). Under
+    ``--compile-dynamic`` the raw σ spatial dims (Fr, Tr) — runtime-CONSTANT
+    (front-end + clip_len fixed) but marked symbolic by full-dynamic compilation —
+    turn ``adaptive_avg_pool2d``'s lowering branch ``if window_size > 25`` into an
+    undecidable SymInt comparison (``(((2*s1+12)//s1))*(((2*s92+39)//s92)) > 25``),
+    crashing Inductor at the first step on the dual-band ``mean|std`` path. This is
+    a tiny tail aux op (one pool per band, off the representation path), so running
+    it eagerly is numerically EXACT and the single graph-break costs nothing while
+    the expensive stem/token/latent path stays fully compiled. The decorator is a
+    no-op on the eager (``--no-compile``) path → byte-identical there too."""
+    B, K, Fr, Tr = std_bk.shape
+    pooled = torch.nn.functional.adaptive_avg_pool2d(
+        std_bk.reshape(B * K, 1, Fr, Tr), (out_f, out_t)
+    )
+    return pooled.reshape(B, K, out_f, out_t)
+
+
 def _rope_freqs(head_dim: int, max_seq_len: int, base: float = 10_000.0) -> Tensor:
     """Pre-compute RoPE cos/sin tables of shape ``(max_seq_len, head_dim)``.
 
@@ -2149,22 +2173,16 @@ class V14ParcelPerceiverModel(nn.Module):
         # upstream).
         m4_precision_std: Optional[Tensor] = None
         if parcel_std_low is not None and parcel_std_high is not None:
-            std_low = torch.nn.functional.adaptive_avg_pool2d(
-                parcel_std_low.reshape(B * K, 1, F_low, T_low), (F_p_low, T_low_p_raw)
-            )[:, 0, :, :T_low_p]                                 # (B·K, F_p_low, T_low_p)
-            std_low = (
-                std_low.reshape(B, K, F_p_low, T_low_p)
-                .permute(0, 1, 3, 2)
-                .reshape(B, K, T_low_p * F_p_low)
-            )
-            std_high = torch.nn.functional.adaptive_avg_pool2d(
-                parcel_std_high.reshape(B * K, 1, F_high, T_high), (F_p_high, T_high_p)
-            )[:, 0, :, :]                                        # (B·K, F_p_high, T_high_p)
-            std_high = (
-                std_high.reshape(B, K, F_p_high, T_high_p)
-                .permute(0, 1, 3, 2)
-                .reshape(B, K, T_high_p * F_p_high)
-            )
+            # Pool each band's σ to its (F_p, T_p) token grid via the compile-
+            # disabled helper (see _pool_parcel_std), then flatten time-OUTER /
+            # freq-INNER and concat in the SAME [low | high] order as the M2 tokens
+            # so σ aligns 1:1 with the M4 target cells.
+            std_low = _pool_parcel_std(parcel_std_low, F_p_low, T_low_p_raw)[
+                :, :, :, :T_low_p
+            ]                                                    # (B, K, F_p_low, T_low_p)
+            std_low = std_low.permute(0, 1, 3, 2).reshape(B, K, T_low_p * F_p_low)
+            std_high = _pool_parcel_std(parcel_std_high, F_p_high, T_high_p)
+            std_high = std_high.permute(0, 1, 3, 2).reshape(B, K, T_high_p * F_p_high)
             m4_precision_std = torch.cat([std_low, std_high], dim=2)  # (B, K, S)
 
         if not return_taps:
@@ -2269,13 +2287,11 @@ class V14ParcelPerceiverModel(nn.Module):
         # along (the loss requires BOTH, so it is gated on mean_pool_std upstream).
         m4_precision_std: Optional[Tensor] = None
         if parcel_std_raw is not None:
-            Fr, Tr = parcel_std_raw.shape[2], parcel_std_raw.shape[3]
-            # NB: ``F`` is shadowed by the local freq-bin count above — call the
-            # functional through ``torch.nn.functional`` directly, not the ``F``
-            # module alias.
-            m4_precision_std = torch.nn.functional.adaptive_avg_pool2d(
-                parcel_std_raw.reshape(B * K, 1, Fr, Tr), (F_p, T_p)
-            ).reshape(B, K, F_p, T_p)
+            # Pool raw-resolution σ to the (F_p, T_p) token grid via the compile-
+            # disabled helper (see _pool_parcel_std for the --compile-dynamic
+            # adaptive_avg_pool2d SymInt-window rationale). Held out of the graph,
+            # so the ``F`` module-alias shadow hazard is moot here too.
+            m4_precision_std = _pool_parcel_std(parcel_std_raw, F_p, T_p)
 
         # D7 visible-only masking. Zero masked M2 band cells (per-parcel) AND
         # whole tubed parcels (all freq, all time) on the post-stem tokens
