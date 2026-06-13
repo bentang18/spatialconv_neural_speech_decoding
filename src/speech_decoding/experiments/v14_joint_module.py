@@ -1209,6 +1209,7 @@ class V14JointBrainModule(pl.LightningModule):
             teacher_m4=teacher_taps["M4"],
             tubed=tubed,
             latent_valid=covered,
+            token_mask=token_mask,
             slot_ids=slot_ids,
             freq_patch_ids=freq_patch_ids,
             loss_form=self._loss_form,

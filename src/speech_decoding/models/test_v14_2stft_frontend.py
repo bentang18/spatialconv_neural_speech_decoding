@@ -582,6 +582,99 @@ def test_dual_band_token_mask_wrong_shape_raises() -> None:
         _fwd_masked(m, low, high, sup, val, bad)
 
 
+# --------------------------------------------------------------------------- #
+# "NEVER READ ZEROS" (Ben 2026-06-13): masked tokens are DROPPED at every stage.
+#   E1 — ragged-token drop in the token blocks (FLOP cut, bit-identical visible);
+#   E2 — per-(parcel, slot) M4-latent key mask (no surviving parcel reads another
+#        parcel's dropped/masked zero cell).
+# --------------------------------------------------------------------------- #
+def _fwd_combined(model, low, high, support, valid, token_mask, tubed):
+    """ONE masked student forward (both the M2 band mask AND the M4 tube) → taps."""
+    return model(
+        low, support, valid, electrode_tokens_high=high,
+        dual_band_token_mask=token_mask, dual_band_parcel_mask=tubed,
+        return_taps=True, m2_only=False,
+    )
+
+
+def test_dual_band_ragged_token_matches_dense_on_visible() -> None:
+    """E1: the ragged-token drop is a pure FLOP cut. Every VISIBLE token's M2 — and
+    every surviving parcel's M4 at its visible cells — equals the dense key-pad path
+    up to float32 re-tiling (~1e-4). Masked/tubed cells are dropped either way; only
+    the FLOP count differs (the missing gather made 2STFT ~5× slower than single
+    grid at matched capacity)."""
+    K = 6
+    low, high, sup, val = _band_inputs(2, 6, K, t_low=_LOW_T_1S, t_high=_HIGH_T_1S)
+    tubed = torch.zeros(2, K, dtype=torch.bool); tubed[:, 0] = True
+    g = torch.Generator().manual_seed(3)
+    mask = sample_m2_dual_band_mask(
+        2, K, F_p_low=7, T_low_p=8, F_p_high=3, T_high_p=16, generator=g,
+    )
+    dense = _fwd_combined(_make(ragged_token=False).eval(), low, high, sup, val, mask, tubed)
+    rag = _fwd_combined(_make(ragged_token=True).eval(), low, high, sup, val, mask, tubed)
+    surv = slice(1, None)                                    # surviving parcels 1..5
+    visible = ~mask[:, surv]                                 # (B, K-1, S) visible cells
+    torch.testing.assert_close(
+        dense["M2"][:, surv][visible], rag["M2"][:, surv][visible], atol=1e-4, rtol=1e-4,
+    )
+    torch.testing.assert_close(
+        dense["M4"][:, surv][visible], rag["M4"][:, surv][visible], atol=1e-4, rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("ragged_parcel", [False, True])
+def test_dual_band_m4_latent_never_reads_dropped_cells(ragged_parcel: bool) -> None:
+    """E2 / "NEVER READ ZEROS": the M4 parcel-latent keys a PER-(parcel, slot)
+    visible mask, so a surviving parcel's M4 at a visible cell is INVARIANT to
+    perturbing a DROPPED cell (another parcel's M2-masked / tubed / uncovered
+    token) — that cell is never an attendable key. Sanity (non-vacuous): perturbing
+    a VISIBLE cell of another parcel at a shared slot DOES move the kept reps."""
+    m = _make(ragged_parcel=ragged_parcel).eval()
+    B, K, S, d = 2, 6, 104, 32
+    torch.manual_seed(0)
+    m2 = torch.randn(B, K, S, d)
+    cell_keep = torch.ones(B, K, S, dtype=torch.bool)
+    cell_keep[:, 5] = False                                  # parcel 5 fully dropped
+    cell_keep[:, 1, 10] = False                              # parcel 1, slot 10 dropped
+    z0 = m._parcel_latent_flat(m2, cell_keep, use_ckpt=False)
+
+    m2b = m2.clone()
+    m2b[:, 5] += 100.0                                       # perturb the dropped parcel
+    m2b[:, 1, 10] += 100.0                                   # perturb the dropped cell
+    z1 = m._parcel_latent_flat(m2b, cell_keep, use_ckpt=False)
+    torch.testing.assert_close(z1[cell_keep], z0[cell_keep])  # kept cells unchanged
+
+    m2c = m2.clone()
+    m2c[:, 2, 10] += 100.0                                   # parcel 2 slot 10 IS visible
+    zc = m._parcel_latent_flat(m2c, cell_keep, use_ckpt=False)
+    assert not torch.allclose(zc[cell_keep], z0[cell_keep]), (
+        "perturbing a visible cell was inert — the per-slot attention is vacuous"
+    )
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_dual_band_combined_mask_finite_and_grads_clean(ragged: bool) -> None:
+    """E1+E2 combined NaN-safety: a fully-M2-masked surviving parcel, a tubed
+    parcel, and an UNCOVERED parcel coexist in ONE masked forward. The ragged-token
+    + per-cell M4-latent drops must stay FINITE (empty-key SDPA guarded) and
+    backprop through the survivors must not poison the shared grads — in BOTH the
+    dense and ragged paths."""
+    m = _make(ragged_token=ragged, ragged_parcel=ragged, mean_pool_std=True).train()
+    K = 6
+    # C=5 electrodes → parcels 0..4 covered, parcel 5 UNCOVERED (no support row).
+    low, high, sup, val = _band_inputs(2, 5, K, t_low=_LOW_T_1S, t_high=_HIGH_T_1S)
+    tubed = torch.zeros(2, K, dtype=torch.bool); tubed[:, 0] = True   # parcel 0 tubed
+    mask = torch.zeros(2, K, 104, dtype=torch.bool)
+    mask[:, 1, :] = True                                     # parcel 1 fully M2-masked
+    out = _fwd_combined(m, low, high, sup, val, mask, tubed)
+    assert torch.isfinite(out["M2"]).all()
+    assert torch.isfinite(out["M4"]).all()
+    out["M4"][:, 2:5].pow(2).mean().backward()              # survivors 2,3,4
+    for p in m.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
+
+
 def test_m2_dual_band_contract_end_to_end() -> None:
     """Full §6 contract: drop-token student + EMA-style full teacher + ONE
     predictor (parcel=query_id, freq-patch=query_id_2, slot=RoPE) + L1. The loss

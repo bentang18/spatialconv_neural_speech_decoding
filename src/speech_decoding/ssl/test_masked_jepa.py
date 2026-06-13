@@ -764,6 +764,13 @@ def _tube_bk(B: int, K: int, tubed: int = 0) -> torch.Tensor:
 
 
 def _m4db_call(pred, student, teacher, tubed, latent_valid, **kw):
+    # Default token_mask = all-False (nothing M2-band-masked) → visible_cell =
+    # visible_parcel & ~False = visible_parcel, i.e. the pre-"never read zeros"
+    # per-parcel context. Tests that exercise the band drop pass their own.
+    kw.setdefault(
+        "token_mask",
+        torch.zeros(student.shape[0], student.shape[1], _M2DB_S, dtype=torch.bool),
+    )
     return m4_dual_band_loss(
         predictor=pred, student_m4=student, teacher_m4=teacher,
         tubed=tubed, latent_valid=latent_valid,
@@ -961,10 +968,16 @@ def test_m4_dual_band_shape_guards() -> None:
         _m4db_call(pred, student, teacher, torch.zeros(B, K + 1, dtype=torch.bool), lv)
     with pytest.raises(ValueError, match="latent_valid"):
         _m4db_call(pred, student, teacher, tubed, torch.ones(B, K + 1, dtype=torch.bool))
+    with pytest.raises(ValueError, match="token_mask"):
+        _m4db_call(
+            pred, student, teacher, tubed, lv,
+            token_mask=torch.zeros(B, K, _M2DB_S + 1, dtype=torch.bool),
+        )
     with pytest.raises(ValueError, match="slot_ids"):
         m4_dual_band_loss(
             predictor=pred, student_m4=student, teacher_m4=teacher,
             tubed=tubed, latent_valid=lv,
+            token_mask=torch.zeros(B, K, _M2DB_S, dtype=torch.bool),
             slot_ids=_M2DB_SLOT[:-1], freq_patch_ids=_M2DB_FREQ,
         )
     with pytest.raises(ValueError, match="precision_std shape"):
@@ -979,3 +992,69 @@ def test_m4_dual_band_shape_guards() -> None:
             precision_std=torch.full((B, K, _M2DB_S), 0.4),
             precision_n=torch.full((B, K + 1), 5.0),
         )
+
+
+def test_m4_dual_band_predictor_reads_only_unmasked_untubed() -> None:
+    """L1 / "NEVER READ ZEROS" (Ben 2026-06-13): the M4 predictor reads ONLY the
+    UNMASKED tokens of the UNTUBED (surviving) parcels as context, and predicts the
+    TUBED parcels at ALL S=(freq×time) spots. So corrupting ``student_m4`` at
+    (a) M2-band-masked cells of a surviving parcel, or (b) ANY tubed-parcel cell,
+    leaves the loss UNCHANGED (neither is read as context); corrupting an UNMASKED
+    surviving cell MOVES it (non-vacuous)."""
+    torch.manual_seed(0)
+    B, K, d = 2, 4, 8
+    S = _M2DB_S
+    student = torch.randn(B, K, S, d)
+    teacher = torch.randn(B, K, S, d)
+    tubed = _tube_bk(B, K, tubed=0)                          # parcel 0 = tube target
+    lv = torch.ones(B, K, dtype=torch.bool)
+    token_mask = torch.zeros(B, K, S, dtype=torch.bool)
+    token_mask[:, :, [1, 3]] = True                          # band-mask slots {1,3}
+    pred = _m4_dual_predictor(d, K)
+
+    base = _m4db_call(pred, student, teacher, tubed, lv, token_mask=token_mask).total
+    # (a) corrupt the M2-masked cells of a surviving parcel → NOT context → no move.
+    s_a = student.clone(); s_a[:, 1, [1, 3]] += 100.0
+    torch.testing.assert_close(
+        _m4db_call(pred, s_a, teacher, tubed, lv, token_mask=token_mask).total, base
+    )
+    # (b) corrupt the TUBED parcel's student cells → NOT context → no move.
+    s_b = student.clone(); s_b[:, 0] += 100.0
+    torch.testing.assert_close(
+        _m4db_call(pred, s_b, teacher, tubed, lv, token_mask=token_mask).total, base
+    )
+    # (c) corrupt an UNMASKED surviving cell → IS context → loss moves.
+    s_c = student.clone(); s_c[:, 1, 2] += 100.0             # slot 2 visible on parcel 1
+    assert not torch.allclose(
+        _m4db_call(pred, s_c, teacher, tubed, lv, token_mask=token_mask).total, base
+    )
+
+
+def test_m4_dual_band_target_is_tubed_at_all_s() -> None:
+    """The M4 target = the TUBED parcels at ALL S spots (whole-parcel tube), drawn
+    from the EMA teacher. n_masked = (#tubed covered parcels)·S; corrupting the
+    teacher at a tubed cell moves the loss, at a surviving cell does not."""
+    torch.manual_seed(1)
+    B, K, d = 2, 4, 8
+    S = _M2DB_S
+    student = torch.randn(B, K, S, d)
+    teacher = torch.randn(B, K, S, d)
+    tubed = _tube_bk(B, K, tubed=0)
+    lv = torch.ones(B, K, dtype=torch.bool)
+    token_mask = torch.zeros(B, K, S, dtype=torch.bool)
+    token_mask[:, :, [1, 3]] = True
+    pred = _m4_dual_predictor(d, K)
+
+    bd = _m4db_call(pred, student, teacher, tubed, lv, token_mask=token_mask)
+    assert bd.n_masked == B * S                              # parcel 0 at all S spots
+    base = bd.total
+    # teacher corruption at a tubed cell (a target) moves the loss.
+    t_t = teacher.clone(); t_t[:, 0, 4] += 100.0
+    assert not torch.allclose(
+        _m4db_call(pred, student, t_t, tubed, lv, token_mask=token_mask).total, base
+    )
+    # teacher corruption at a surviving (non-target) cell does NOT.
+    t_s = teacher.clone(); t_s[:, 2, 4] += 100.0
+    torch.testing.assert_close(
+        _m4db_call(pred, student, t_s, tubed, lv, token_mask=token_mask).total, base
+    )

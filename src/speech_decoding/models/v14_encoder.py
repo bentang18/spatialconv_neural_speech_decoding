@@ -1740,8 +1740,8 @@ class V14ParcelPerceiverModel(nn.Module):
 
     def _parcel_latent_flat(
         self,
-        m2: Tensor,            # (B, K, S, d) — flat dual-band frontend_ln tap
-        latent_valid: Tensor,  # (B, K) bool — visible (covered & ~tubed) parcels
+        m2: Tensor,          # (B, K, S, d) — flat dual-band frontend_ln tap
+        cell_valid: Tensor,  # (B, K, S) bool — per-(parcel, slot) VISIBLE cell
         use_ckpt: bool,
     ) -> Tensor:
         """Flat-S analogue of :meth:`_parcel_latent` for the 2STFT dual-band tap.
@@ -1753,10 +1753,16 @@ class V14ParcelPerceiverModel(nn.Module):
         grid here and is unsupported — only the parcel-SA-only mode applies. That
         mode folds the per-parcel token axis ``S`` into the batch and attends over
         the parcel axis ``K`` ALONE (rate-agnostic), carrying the dual-rate flat
-        sequence untouched and producing the SAME ``(B, K, S, d)`` M4 shape. #112
-        ragged gather/scatter mirrors the 5D path (visible parcels packed to a
-        per-batch-max ``Kk``, blocks run over ``Kk``, kept parcels scattered back;
-        dropped/pad parcels → 0, never read downstream).
+        sequence untouched and producing the SAME ``(B, K, S, d)`` M4 shape.
+
+        ``cell_valid`` is the PER-(parcel, slot) visible mask (Ben "NEVER READ
+        ZEROS" 2026-06-13): cell (k, s) is True iff parcel k is covered AND its
+        slot-s token is neither M2-band-masked nor tubed. A parcel contributes to
+        the latent iff it has ≥1 visible cell (surviving / covered) — tubed +
+        uncovered parcels are all-False → dropped. #112 ragged gather/scatter
+        packs the surviving parcels to a per-batch-max ``Kk`` (the per-cell mask
+        gathered alongside), blocks run over ``Kk``, kept parcels scattered back;
+        dropped/pad parcels → 0, never read downstream.
         """
         if self.latent_mode == "joint":
             raise NotImplementedError(
@@ -1765,17 +1771,21 @@ class V14ParcelPerceiverModel(nn.Module):
                 "dual-rate flat token sequence has no clean (F_p, T_p) grid for."
             )
         B, K, S, d = m2.shape
+        # A parcel participates iff it has ≥1 visible cell (surviving, covered);
+        # tubed / uncovered parcels have cell_valid all-False → dropped.
+        parcel_valid = cell_valid.any(dim=-1)                # (B, K)
         keep_idx: Optional[Tensor] = None
         keep_real: Optional[Tensor] = None
         if self.ragged_parcel:
-            keep_idx, keep_real, Kk = _ragged_gather_idx(latent_valid)
+            keep_idx, keep_real, Kk = _ragged_gather_idx(parcel_valid)
             gi = keep_idx.view(B, Kk, 1, 1).expand(B, Kk, S, d)
-            m2 = torch.gather(m2, 1, gi)                     # (B, Kk, S, d)
-            valid = keep_real                                # (B, Kk) real|pad
+            m2 = torch.gather(m2, 1, gi)                      # (B, Kk, S, d)
+            ci = keep_idx.view(B, Kk, 1).expand(B, Kk, S)
+            cell_v = torch.gather(cell_valid, 1, ci) & keep_real.unsqueeze(-1)
         else:
-            valid = latent_valid                             # (B, K)
+            cell_v = cell_valid                              # (B, K, S)
 
-        z = self._latent_attn_parcel_flat(m2, valid, use_ckpt)
+        z = self._latent_attn_parcel_flat(m2, cell_v, use_ckpt)
         # z: (B, k_run, S, d), k_run = Kk (ragged) or K (dense).
 
         if not self.ragged_parcel:
@@ -1791,21 +1801,25 @@ class V14ParcelPerceiverModel(nn.Module):
         return scratch[:, :K, :, :].contiguous()
 
     def _latent_attn_parcel_flat(
-        self, m2: Tensor, valid: Tensor, use_ckpt: bool
+        self, m2: Tensor, cell_valid: Tensor, use_ckpt: bool
     ) -> Tensor:
         """Flat-S analogue of :meth:`_latent_attn_parcel`. ``m2`` (B, k_run, S, d),
-        ``valid`` (B, k_run) → ``z`` (B, k_run, S, d). The per-parcel token axis
-        ``S`` rides in the batch dim (never attended); the bidirectional
-        ``pmask_b`` excludes masked parcels as both query and key, so a visible
-        parcel attends to exactly the visible set."""
+        ``cell_valid`` (B, k_run, S) → ``z`` (B, k_run, S, d). The per-parcel token
+        axis ``S`` rides in the batch dim (never attended). The bidirectional mask
+        is PER-(parcel, slot): a query parcel at slot ``s`` attends ONLY to parcels
+        whose slot-``s`` cell is visible — so a surviving parcel's M4 never reads
+        another parcel's dropped (M2-band-masked / tubed) zero token ("NEVER READ
+        ZEROS", Ben 2026-06-13). A fully-invalid query row (parcel masked at slot
+        ``s``) yields a zero-SA bypass (``_ParcelSelfAttnBlock`` is NaN-safe); a
+        valid query always keeps itself → never empty."""
         B, k_run, S, d = m2.shape
         r = B * S
         # (B,k_run,S,d) → (B,S,k_run,d) → (R, k_run, d).
         z = m2.permute(0, 2, 1, 3).reshape(r, k_run, d)
-        pmask_b = valid.unsqueeze(2) & valid.unsqueeze(1)               # (B,k,k)
-        attn_mask = (
-            pmask_b.unsqueeze(1).expand(B, S, k_run, k_run).reshape(r, k_run, k_run)
-        )                                                              # (R,k,k)
+        # Per-slot bidirectional parcel mask: cv (B, S, k_run) → (R, k_run, k_run).
+        cv = cell_valid.permute(0, 2, 1)                                # (B, S, k_run)
+        pmask_b = cv.unsqueeze(3) & cv.unsqueeze(2)                     # (B,S,k,k)
+        attn_mask = pmask_b.reshape(r, k_run, k_run)                    # (R,k,k)
         for block in self.latent_parcel_blocks:
             if use_ckpt:
                 z = _ckpt(block, z, attn_mask)
@@ -2130,16 +2144,17 @@ class V14ParcelPerceiverModel(nn.Module):
         # zero-in-place, which leaves a zero token attendable). Masked positions
         # still produce (discarded) reps; the §6 loss reads the VISIBLE student
         # tokens as predictor context and predicts the masked slots from the EMA
-        # teacher. Dense key-pad — a per-parcel ragged gather is a future FLOP
-        # opt, bit-identical on the kept tokens. ``None`` → teacher/unmasked
-        # forward (all tokens attendable).
+        # teacher. ``ragged_token`` GATHERS the visible tokens (FLOP cut,
+        # bit-identical on the kept tokens); the dense branch key-pads. ``None`` →
+        # teacher/unmasked forward (all tokens attendable).
         # Composite token-drop = §6 M2-band mask (B, K, S) on surviving parcels
         # OR every token of an M4-tubed parcel (B, K) broadcast over S. Both are
-        # KEY-PADDED out of the within-parcel token block so a visible token's M2
+        # DROPPED from the within-parcel token block so a visible token's M2
         # never depends on a masked-band or tubed token's content (the tube is
         # the M4 reconstruction target — its tokens must not be attendable). The
-        # tube ALSO gates ``visible_parcels`` below. ``None``/``None`` →
-        # teacher/unmasked forward.
+        # same per-(parcel, slot) visible mask drives the M4 parcel-latent key
+        # mask below (``cell_keep``) so NO attention stage ever reads a dropped
+        # token's zero content. ``None``/``None`` → teacher/unmasked forward.
         if token_mask is not None and token_mask.shape != (B, K, S):
             raise ValueError(
                 f"token_mask shape {tuple(token_mask.shape)} does not match "
@@ -2154,20 +2169,55 @@ class V14ParcelPerceiverModel(nn.Module):
         if tubed is not None:
             tube_tok = tubed.unsqueeze(-1).expand(B, K, S)       # (B, K, S)
             drop = tube_tok if drop is None else (drop | tube_tok)
-        kpm: Optional[Tensor] = None
-        if drop is not None:
-            keep = (~drop).reshape(B * K, S)                     # True = attendable key
-            # NaN guard: a fully-masked row → SDPA softmax over an empty key set
-            # → NaN poisoning the SHARED qkv grads even though the row's masked
-            # positions are read from the teacher. Force such rows to keep slot-0
-            # (a token whose output is unused for that row). Mirrors the
-            # single-grid ragged_token guard. A fully-tubed parcel hits this too.
-            empty_row = ~keep.any(dim=1, keepdim=True)           # (B·K, 1)
+        BK = B * K
+        ragged_token = self.ragged_token and drop is not None
+        ragged = self.ragged_frontend
+        if ragged_token:
+            # §6 drop-token, ragged: GATHER the visible tokens to the front and run
+            # the token blocks over the per-batch-max visible count Lk (≈ S/2 for a
+            # surviving parcel — masked+tubed+uncovered tokens are NEVER gathered, so
+            # they are neither keys nor query sources, and the FLOP drops ~(S/Lk)²).
+            # Bit-identical to the dense key-pad on the kept tokens; this is the
+            # dual-band port of _forward_meanpool's ragged_token branch. (Previously
+            # this path ran a DENSE key-pad over all S — the missing ragged gather
+            # made 2STFT ~5× slower than the single-grid path at matched capacity.)
+            keep_flat = (~drop).reshape(BK, S)                   # True = attendable
+            if ragged:
+                keep_flat = keep_flat & latent_valid.reshape(BK, 1)
+            keep_idx, keep_real, Lk = _ragged_gather_idx(keep_flat)
+            gi = keep_idx.unsqueeze(-1).expand(BK, Lk, self.d_model)
+            xj_v = torch.gather(x_joint, 1, gi)                  # (BK, Lk, d)
+            rope_v = rope[:, keep_idx, :]                        # (2, BK, Lk, hd)
+            kpm_v = keep_real
+            # NaN guard: a fully-dropped row (uncovered / fully-tubed parcel) → SDPA
+            # softmax over an empty key set → NaN poisoning the SHARED qkv grads.
+            # Force such rows to keep slot-0 (its output is discarded downstream via
+            # latent_valid). Mirrors the single-grid ragged_token guard.
+            empty_row = ~kpm_v.any(dim=1, keepdim=True)
             if bool(empty_row.any()):
-                slot0 = torch.arange(S, device=keep.device).unsqueeze(0) == 0
-                keep = keep | (empty_row & slot0)
-            kpm = keep
-        x_joint = self._token_block_stack(x_joint, kpm, rope, use_ckpt)
+                slot0 = torch.arange(Lk, device=kpm_v.device).unsqueeze(0) == 0
+                kpm_v = kpm_v | (empty_row & slot0)
+            xj_v = self._token_block_stack(xj_v, kpm_v, rope_v, use_ckpt)
+            scatter_idx = torch.where(
+                keep_real, keep_idx, torch.full_like(keep_idx, S)
+            ).unsqueeze(-1).expand(BK, Lk, self.d_model)
+            scratch = xj_v.new_zeros(BK, S + 1, self.d_model)
+            scratch.scatter_(1, scatter_idx, xj_v)
+            x_joint = scratch[:, :S, :]
+        else:
+            # Dense fallback (ragged_token OFF, or teacher/unmasked drop=None). Masked
+            # tokens are KEY-PADDED out of the within-parcel block (still produce
+            # discarded reps). Uncovered parcels ride along as junk masked downstream.
+            kpm: Optional[Tensor] = None
+            if drop is not None:
+                keep = (~drop).reshape(BK, S)                    # True = attendable key
+                # NaN guard (see ragged branch): fully-masked row → keep slot-0.
+                empty_row = ~keep.any(dim=1, keepdim=True)       # (B·K, 1)
+                if bool(empty_row.any()):
+                    slot0 = torch.arange(S, device=keep.device).unsqueeze(0) == 0
+                    keep = keep | (empty_row & slot0)
+                kpm = keep
+            x_joint = self._token_block_stack(x_joint, kpm, rope, use_ckpt)
         x = x_joint.reshape(B, K, S, self.d_model)
         m2 = self.frontend_ln(x)                                 # M2 tap (B, K, S, d)
         if m2_only:
@@ -2175,12 +2225,22 @@ class V14ParcelPerceiverModel(nn.Module):
 
         # M4 latent (Ben 2026-06-13 lock): parcel-SA-only middle over the flat
         # dual-band tokens (S folded into the batch, attention over the parcel
-        # axis K alone — rate-agnostic). Uncovered AND tubed parcels excluded
-        # bidirectionally so a surviving parcel's M4 is independent of any
-        # don't-care/masked parcel; each tubed parcel is reconstructed from the
-        # surviving parcels' co-located activity.
-        visible_parcels = latent_valid if tubed is None else (latent_valid & ~tubed)
-        z = self._parcel_latent_flat(m2, visible_parcels, use_ckpt)  # (B, K, S, d)
+        # axis K alone — rate-agnostic). Per Ben's "NEVER READ ZEROS" (2026-06-13):
+        # the latent keys a PER-(parcel, slot) visible mask ``cell_keep`` (B, K, S),
+        # NOT a per-parcel broadcast — at each slot a surviving parcel attends ONLY
+        # to the OTHER parcels whose co-located cell is itself visible (un-dropped).
+        # So a surviving parcel's M4 never reads another parcel's M2-band-masked /
+        # tubed / uncovered token (those cells were DROPPED to zero by the token
+        # blocks above). cell_keep = (~drop) & covered; teacher/unmasked (drop=None)
+        # → all covered cells visible (per-parcel behaviour, unchanged). Tubed +
+        # uncovered parcels have cell_keep all-False → dropped from the latent
+        # entirely; each tubed parcel is reconstructed by the M4 PREDICTOR from the
+        # surviving parcels' visible cells.
+        if drop is None:
+            cell_keep = latent_valid.unsqueeze(-1).expand(B, K, S)
+        else:
+            cell_keep = (~drop) & latent_valid.unsqueeze(-1)     # (B, K, S)
+        z = self._parcel_latent_flat(m2, cell_keep, use_ckpt)    # (B, K, S, d)
         m4 = self.encoder_ln(z)                                  # M4 tap + readout input
 
         # Heteroscedastic precision stats (project_v14_heteroscedastic_ssl_loss),

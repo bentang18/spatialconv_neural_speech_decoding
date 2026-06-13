@@ -602,6 +602,7 @@ def m4_dual_band_loss(
     teacher_m4: Tensor,   # (B, K, S, d) post-encoder_ln, EMA full-input teacher
     tubed: Tensor,        # (B, K) bool — True = tubed parcel (whole-parcel M4 target)
     latent_valid: Tensor, # (B, K) bool — covered parcels (gate context + targets)
+    token_mask: Tensor,   # (B, K, S) bool, True = M2-band-masked (drop from M4 ctx)
     slot_ids: Tensor,     # (S,) long — per-token dual-rate real-time RoPE slot
     freq_patch_ids: Tensor,  # (S,) long — per-token freq-patch id / "Hz tag"
     loss_form: _LossForm = "l1",
@@ -667,6 +668,10 @@ def m4_dual_band_loss(
         raise ValueError(
             f"latent_valid {tuple(latent_valid.shape)} must be (B, K)=({B},{K})"
         )
+    if token_mask.shape != (B, K, S):
+        raise ValueError(
+            f"token_mask {tuple(token_mask.shape)} must be (B, K, S)=({B},{K},{S})"
+        )
     if slot_ids.shape != (S,) or freq_patch_ids.shape != (S,):
         raise ValueError(
             f"slot_ids / freq_patch_ids must be (S,)=({S},); got "
@@ -681,8 +686,16 @@ def m4_dual_band_loss(
     # (K outer, S inner) flat order: flat index i = k·S + s.
     target_parcel = latent_valid & tubed            # (B, K) tube targets
     visible_parcel = latent_valid & ~tubed          # (B, K) surviving context
+    # Queries = every tubed parcel at ALL S=(freq×time) spots (whole-parcel tube).
     target_cell = target_parcel.unsqueeze(-1).expand(B, K, S).reshape(B, N)
-    visible_cell = visible_parcel.unsqueeze(-1).expand(B, K, S).reshape(B, N)
+    # Context = the surviving (untubed, covered) parcels' UN-DROPPED cells only:
+    # the encoder DROPPED the M2-band-masked tokens to zero in the token blocks, so
+    # the M4 predictor must read ONLY the M2-visible cells of the surviving parcels
+    # — never a dropped token's zero content (Ben "NEVER READ ZEROS" 2026-06-13;
+    # matches the encoder's per-(parcel, slot) M4-latent key mask ``cell_keep``).
+    visible_cell = (
+        visible_parcel.unsqueeze(-1) & ~token_mask
+    ).reshape(B, N)                                  # (B, N) M2-visible surviving
 
     # (parcel, freq-patch, slot) ids for the flat (K outer, S inner) order. Parcel
     # is per-ROW (k) → learned query_id; freq-patch + slot are per-TOKEN (s), tiled
