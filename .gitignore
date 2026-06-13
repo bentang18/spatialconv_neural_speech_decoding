@@ -11,6 +11,11 @@
 # `src/speech_decoding/data/` or `src/speech_decoding/archive/legacy/data/`.
 BIDS_1.0_*/
 /data/
+# Vendored BrainTreebank metadata + neuroprobe upstream tables (~2.2 GB, public
+# but heavy). Read by the pipeline at a fixed path; never committed. Root-anchored
+# so a nested `.cache/` elsewhere is unaffected. (Golden fixtures over this
+# metadata live in test_golden_metadata.py; only the tiny hashes are committed.)
+/.cache/
 *.fif
 *.edf
 *.mat
