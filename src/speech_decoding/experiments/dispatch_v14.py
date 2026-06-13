@@ -3557,7 +3557,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  eval_mode={args.eval_mode} test=({args.test_subject_id},{args.test_trial_id})")
     print(f"  d_model={args.d_model} depth={args.depth} n_heads={args.n_heads} "
           f"M={args.m_sub_slots}")
-    print(f"  K=80 DK parcels, c_max={args.c_max}, batch_size={args.batch_size}, "
+    # Resolve K from the SELECTED atlas (not a hard-coded "K=80 DK") so the run
+    # record can never silently claim DK/K=80 while a --atlas dkt (K=74) run is
+    # actually building — atlas_spec is the same source build_v14_experiment uses.
+    _atlas_k = len(atlas_spec(args.atlas)[1])
+    _excl_note = (
+        ", single-electrode parcels excluded"
+        if args.exclude_single_electrode_parcels
+        else ""
+    )
+    print(f"  atlas={args.atlas.upper()} (K={_atlas_k} parcels{_excl_note}), "
+          f"c_max={args.c_max}, batch_size={args.batch_size}, "
           f"n_epochs={args.n_epochs}")
     print(f"  mains_notch_hz={args.mains_notch_hz}")
     print(f"  lof_bad_channels={args.lof_bad_channels} lof_threshold={args.lof_threshold} "
@@ -3627,6 +3637,17 @@ def main(argv: list[str] | None = None) -> int:
         else args.rankme_alarm_threshold)
     print(f"  rankme: warn={_warn_disp} alarm={_alarm_disp} "
           f"(joint P1/P2; normalised RankMe; alarm kills, #74)")
+    # Heteroscedastic (precision-weighted) M4 SSL loss (#140; OFF by default).
+    # Surfaced so the run record shows whether the M4 L1 was inverse-variance
+    # weighted (and with what α / floor-pct / cap) instead of silently riding
+    # the uniform-weight default.
+    if args.m4_precision_weight:
+        print(f"  m4_precision: ON alpha={args.m4_precision_alpha} "
+              f"floor_pct={args.m4_precision_floor_pct} "
+              f"cap={args.m4_precision_cap} "
+              f"(inverse-variance weighted M4 L1, #140)")
+    else:
+        print("  m4_precision: OFF (uniform-weight M4 L1)")
     if args.cluster == "slurm":
         # Same source of truth build_v14_experiment uses (no drift). In --chain,
         # the SSL/distill phases run with this strategy; the P4 probe is forced

@@ -259,6 +259,34 @@ def test_v14_dispatch_dry_run_prints_config(capsys) -> None:
     assert rc == 0
     assert "M=8" in out
     assert "S5 excluded" in out
+    # #168: the default atlas summary must report the RESOLVED atlas + K, not a
+    # hard-coded "K=80 DK parcels" string, and must surface the (default-OFF)
+    # heteroscedastic M4 precision-loss state rather than omit it silently.
+    assert "atlas=DK (K=80 parcels)" in out
+    assert "m4_precision: OFF" in out
+
+
+def test_v14_dispatch_dry_run_summary_tracks_atlas_and_hetero_m4(capsys) -> None:
+    """#168 regression: the launch summary must never lie about the atlas or the
+    M4 loss. Selecting ``--atlas dkt`` (K=74) must flip the printed atlas/K, and
+    ``--m4-precision-weight`` must surface the precision config (α/floor/cap) —
+    the pre-fix summary hard-coded ``K=80 DK parcels`` and omitted the
+    heteroscedastic-M4 knobs entirely, so the persisted run record lied."""
+    from speech_decoding.experiments import dispatch_v14
+    rc = dispatch_v14.main([
+        "--dry-run", "--atlas", "dkt", "--exclude-single-electrode-parcels",
+        "--m4-precision-weight", "--m4-precision-alpha", "0.75",
+        "--m4-precision-floor-pct", "25.0", "--m4-precision-cap", "10.0",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # atlas: DKT / K=74, with the single-electrode-exclusion note.
+    assert "atlas=DKT (K=74 parcels, single-electrode parcels excluded)" in out
+    assert "K=80 DK parcels" not in out  # the old hard-coded lie is gone
+    # heteroscedastic M4 loss surfaced with its α / floor / cap.
+    assert "m4_precision: ON alpha=0.75" in out
+    assert "floor_pct=25.0" in out
+    assert "cap=10.0" in out
 
 
 # Removed: ``test_v14_dispatch_raises_until_electrode_tokens_extractor_wired``.
