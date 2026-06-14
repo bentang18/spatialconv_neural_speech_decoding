@@ -1310,6 +1310,14 @@ class V14JointBrainModule(pl.LightningModule):
                 "EMA teacher returned a single tensor; expected the M2/M4 "
                 "tap dict (M3 opt-in via return_m3)."
             )
+        # MON-CACHE (2026-06-13 throughput audit): when this step's diagnostic
+        # monitor is due, stash the FULL-input teacher taps so _monitor_from_step
+        # reuses them instead of re-running the teacher encoder. Same batch, same
+        # frozen EMA weights, both under no_grad ⇒ byte-identical to a fresh forward.
+        # The redundant monitor forward fired EVERY step under --live
+        # (log_every_n_steps=1) — a whole extra teacher forward per step.
+        if getattr(self, "_want_teacher_cache", False):
+            self._cached_teacher_taps = teacher_taps
         return teacher_taps
 
     # ------------------------------------------------------------------
@@ -1603,8 +1611,6 @@ class V14JointBrainModule(pl.LightningModule):
             )
 
     def training_step(self, batch, batch_idx: int) -> Tensor:
-        breakdown = self._step(batch.data)
-        self._log_breakdown(breakdown, step_name="train")
         # 2026-05-30 speedup audit (Tier-2): cadence-gate the per-step
         # monitors on the train loop. ``_monitor_from_step`` re-runs the
         # (no_grad) teacher + student encoder forwards every step — ~2
@@ -1613,11 +1619,24 @@ class V14JointBrainModule(pl.LightningModule):
         # monitors are diagnostic-log-only (never enter loss/grads), so
         # firing them every ``log_every_n_steps`` steps instead of every
         # step removes the redundant compute with ZERO effect on the B31
-        # loss path (``_step`` above is untouched). The
+        # loss path (``_step`` below is untouched). The
         # ``_monitor_from_step`` docstring explicitly blesses this gating.
         # val/test monitor every step (their cadence is already sparse).
-        if self._train_monitor_due(batch_idx):
+        #
+        # MON-CACHE (2026-06-13): when the monitor IS due this step, ask ``_step``
+        # to stash its full-input teacher taps so the monitor reuses them rather
+        # than re-running the teacher encoder (one whole extra forward, every step
+        # under --live). Flag set BEFORE ``_step`` (the producer); cache cleared
+        # after (bounds the held activation to this step, and only when consumed).
+        due = self._train_monitor_due(batch_idx)
+        self._cached_teacher_taps = None
+        self._want_teacher_cache = due
+        breakdown = self._step(batch.data)
+        self._log_breakdown(breakdown, step_name="train")
+        if due:
             self._monitor_from_step(batch.data, step_name="train")
+        self._cached_teacher_taps = None
+        self._want_teacher_cache = False
         return breakdown.total
 
     def _train_monitor_due(self, batch_idx: int) -> bool:
@@ -1638,14 +1657,40 @@ class V14JointBrainModule(pl.LightningModule):
         return batch_idx % max(cadence, 1) == 0
 
     def validation_step(self, batch, batch_idx: int) -> None:  # noqa: ARG002
+        self._cached_teacher_taps = None
+        self._want_teacher_cache = True            # monitor fires every val step
         breakdown = self._step(batch.data)
         self._log_breakdown(breakdown, step_name="val")
         self._monitor_from_step(batch.data, step_name="val")
+        self._cached_teacher_taps = None
+        self._want_teacher_cache = False
 
     def test_step(self, batch, batch_idx: int) -> None:  # noqa: ARG002
+        self._cached_teacher_taps = None
+        self._want_teacher_cache = True            # monitor fires every test step
         breakdown = self._step(batch.data)
         self._log_breakdown(breakdown, step_name="test")
         self._monitor_from_step(batch.data, step_name="test")
+        self._cached_teacher_taps = None
+        self._want_teacher_cache = False
+
+    def _monitor_teacher_taps(
+        self, student_kwargs: dict[str, tp.Any], *, need_m4: bool,
+    ) -> dict[str, Tensor]:
+        """Teacher taps for the diagnostic monitors, reusing this step's cache.
+
+        MON-CACHE: ``_teacher_forward`` (called by ``_step`` earlier in the same
+        train/val/test step) stashes its FULL-input teacher taps on
+        ``self._cached_teacher_taps`` when the monitor is due. We reuse them here —
+        same batch, same frozen EMA weights, both under ``no_grad`` ⇒ byte-identical
+        to a fresh forward — instead of re-running the teacher encoder. Falls back
+        to a fresh forward when there is no compatible cache (no producer ran, or a
+        ``m2_only=True`` cache when ``need_m4``)."""
+        cached = getattr(self, "_cached_teacher_taps", None)
+        if cached is not None and ("M4" in cached or not need_m4):
+            return cached
+        with torch.no_grad():
+            return self._call_teacher(**student_kwargs, m2_only=not need_m4)
 
     def _monitor_from_step(
         self, batch_data: dict[str, Tensor], *, step_name: str,
@@ -1724,7 +1769,7 @@ class V14JointBrainModule(pl.LightningModule):
                 # restores the --rankme-*-threshold CLI override on the joint
                 # path for the capstone re-tune. See the RANKME_JOINT_*
                 # derivation in monitors/teacher_rank.py.
-                t = self._call_teacher(**student_kwargs)
+                t = self._monitor_teacher_taps(student_kwargs, need_m4=True)
                 self._run_frontend_rank_monitor(
                     teacher_m2=t["M2"],
                     valid_mask=latent_valid,
@@ -1738,8 +1783,8 @@ class V14JointBrainModule(pl.LightningModule):
                 return
 
             if self._phase == "p1":
-                teacher_m2 = self._call_teacher(
-                    **student_kwargs, m2_only=True
+                teacher_m2 = self._monitor_teacher_taps(
+                    student_kwargs, need_m4=False
                 )["M2"]
                 self._run_frontend_rank_monitor(
                     teacher_m2=teacher_m2,
@@ -1753,7 +1798,9 @@ class V14JointBrainModule(pl.LightningModule):
             # in-scope. The orphan monitor additionally needs a ``shaft_mask``,
             # which B36 (WS-H5) drops from the default SSL path — hence the
             # ``in batch_data`` key guard (inert unless the pipeline emits it).
-            teacher_m4 = self._call_teacher(**student_kwargs)["M4"]
+            teacher_m4 = self._monitor_teacher_taps(
+                student_kwargs, need_m4=True
+            )["M4"]
             if "shaft_mask" in batch_data:
                 student_m4 = self._call_student(**student_kwargs)["M4"]
                 self._run_mask_orphan_monitor(

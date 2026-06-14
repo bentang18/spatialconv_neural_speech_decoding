@@ -622,6 +622,111 @@ def test_dual_band_ragged_token_matches_dense_on_visible() -> None:
     )
 
 
+def test_dual_band_ragged_frontend_matches_dense_on_covered() -> None:
+    """THE 2STFT throughput fix (Ben 2026-06-13, #176): ``ragged_frontend`` gathers
+    the COVERED DKT parcels out of the B·K token-block batch before running the
+    per-parcel token blocks. Without it the blocks ran over ALL K parcels — incl.
+    the ~K−K_c uncovered junk rows per subject (live: ~13 of 74 covered) — for BOTH
+    the masked student key-pad AND the DENSE EMA teacher, the dominant ~K/K_c≈5.7×
+    2STFT slowdown vs the single-grid path (which already compacts via
+    ``_forward_meanpool``'s ``elif ragged:`` branch). #173 had cut only the TOKEN
+    axis, not the PARCEL axis.
+
+    The token blocks are per-parcel INDEPENDENT (attention is WITHIN each parcel's
+    S tokens; the dual-band RoPE is shared, no cross-parcel path), so compacting to
+    the covered rows and scattering back is bit-identical (to float-reduction order)
+    on every COVERED parcel — for BOTH the unmasked TEACHER (drop=None, the half Ben
+    flagged: "Make SURE THE teacher path is also FULLY RAGGED") and the masked
+    STUDENT (M2 band mask + M4 tube). Uncovered parcels scatter to 0 (never read:
+    ``latent_valid`` masks them in the loss/RankMe/M4-latent). Holds ragged_token /
+    ragged_parcel ON in both arms so ONLY the parcel-compaction toggles."""
+    K = 6
+    # C=4 electrodes → parcels 0..3 COVERED, 4,5 UNCOVERED — the junk rows the fix
+    # gathers out of the token-block batch (so the two arms actually diverge in what
+    # rows the blocks see, while staying equal on the covered output).
+    low, high, sup, val = _band_inputs(2, 4, K, t_low=_LOW_T_1S, t_high=_HIGH_T_1S)
+    covered = slice(0, 4)
+
+    # identical weights (``_make`` reseeds to 0), toggle ONLY ragged_frontend.
+    common = dict(ragged_token=True, ragged_parcel=True)
+    dense = _make(ragged_frontend=False, **common).eval()
+    rag = _make(ragged_frontend=True, **common).eval()
+
+    # (1) unmasked TEACHER forward (drop=None) — the dense EMA pass.
+    t_dense = _fwd(dense, low, high, sup, val)["M2"]
+    t_rag = _fwd(rag, low, high, sup, val)["M2"]
+    torch.testing.assert_close(
+        t_dense[:, covered], t_rag[:, covered], atol=1e-4, rtol=1e-4
+    )
+
+    # (2) masked STUDENT forward (M2 band mask + M4 tube parcel 0) → M2 + M4. The
+    # ON arm ALSO sheds the tubed parcel at the frontend (it is the M4 target, never
+    # read), so the equivalence holds on the SURVIVING (covered & ~tubed) parcels —
+    # exactly the set the M2 loss + M4 latent/predictor read. (The dense OFF arm
+    # still runs the tubed parcel's block to slot-0 junk; that parcel is not read.)
+    g = torch.Generator().manual_seed(7)
+    mask = sample_m2_dual_band_mask(
+        2, K, F_p_low=7, T_low_p=8, F_p_high=3, T_high_p=16, generator=g,
+    )
+    tubed = torch.zeros(2, K, dtype=torch.bool)
+    tubed[:, 0] = True                                          # covered parcel 0 tubed
+    s_dense = _fwd_combined(dense, low, high, sup, val, mask, tubed)
+    s_rag = _fwd_combined(rag, low, high, sup, val, mask, tubed)
+    surv = slice(1, 4)                                          # covered & ~tubed (1..3)
+    torch.testing.assert_close(
+        s_dense["M2"][:, surv], s_rag["M2"][:, surv], atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        s_dense["M4"][:, surv], s_rag["M4"][:, surv], atol=1e-4, rtol=1e-4
+    )
+
+
+def test_dual_band_ragged_frontend_sheds_tubed_on_student() -> None:
+    """Completing the symmetry: the STUDENT frontend also sheds TUBED parcels (the
+    M4 reconstruction targets — their M2 is never read by the M2 loss or the M4
+    latent/predictor), so their token block is never run. A tubed parcel's M2 is
+    then the SAME shed-to-0 constant (frontend_ln(0)) as an UNCOVERED parcel — they
+    both skip the blocks. (The TEACHER keeps them: drop=None ⇒ no tube ⇒ keep_row =
+    covered, so it still produces the tube-location targets.)"""
+    m = _make(ragged_frontend=True, ragged_token=True, ragged_parcel=True).eval()
+    K = 6
+    # C=5 → parcels 0..4 covered, parcel 5 UNCOVERED.
+    low, high, sup, val = _band_inputs(2, 5, K, t_low=_LOW_T_1S, t_high=_HIGH_T_1S)
+    tubed = torch.zeros(2, K, dtype=torch.bool)
+    tubed[:, 0] = True                                          # covered parcel 0 tubed
+    g = torch.Generator().manual_seed(2)
+    mask = sample_m2_dual_band_mask(
+        2, K, F_p_low=7, T_low_p=8, F_p_high=3, T_high_p=16, generator=g,
+    )
+    out = _fwd_combined(m, low, high, sup, val, mask, tubed)
+    # tubed parcel 0 and uncovered parcel 5 are BOTH shed → identical frontend_ln(0).
+    torch.testing.assert_close(out["M2"][:, 0], out["M2"][:, 5])
+    # and that shed constant is independent of the tubed parcel's OWN input.
+    low2 = low.clone()
+    low2[:, 0, :, :] += 50.0                                    # perturb parcel-0 electrode
+    out2 = _fwd_combined(m, low2, high, sup, val, mask, tubed)
+    torch.testing.assert_close(out2["M2"][:, 0], out["M2"][:, 0])
+
+
+def test_dual_band_ragged_frontend_zeros_uncovered_m2() -> None:
+    """The compaction scatters UNCOVERED parcels to exactly 0 (they are never run
+    through the token blocks) — the ``new_zeros(...).index_copy`` path. This is the
+    "never read junk" guarantee: an uncovered parcel's M2 is a deterministic 0
+    (frontend_ln of 0), and ``latent_valid`` marks it False so the loss/RankMe/M4
+    latent skip it. (Dense ragged_frontend=OFF would instead leave per-parcel-stem
+    junk there — harmless, but more FLOPs.)"""
+    m = _make(ragged_frontend=True, ragged_token=True, ragged_parcel=True).eval()
+    # parcels 4,5 uncovered (C=4).
+    low, high, sup, val = _band_inputs(2, 4, 6, t_low=_LOW_T_1S, t_high=_HIGH_T_1S)
+    out = _fwd(m, low, high, sup, val)
+    assert not out["latent_valid"][:, 4:].any()                # uncovered
+    # frontend_ln(0) is a constant per channel; the uncovered M2 rows are identical
+    # across the (B, K, S) batch and finite (no junk, no NaN).
+    unc = out["M2"][:, 4:]
+    assert torch.isfinite(unc).all()
+    assert torch.equal(unc[0, 0, 0], unc[1, 1, 5])             # deterministic constant
+
+
 @pytest.mark.parametrize("ragged_parcel", [False, True])
 def test_dual_band_m4_latent_never_reads_dropped_cells(ragged_parcel: bool) -> None:
     """E2 / "NEVER READ ZEROS": the M4 parcel-latent keys a PER-(parcel, slot)

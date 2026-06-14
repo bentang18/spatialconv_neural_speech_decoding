@@ -1634,6 +1634,59 @@ class V14ParcelPerceiverModel(nn.Module):
                 xj = token_block(xj, rope, key_mask)
         return xj
 
+    def _dual_band_token_blocks(
+        self,
+        xj: Tensor,             # (R, S, d) — per-parcel-row flat dual-band tokens
+        drop: Optional[Tensor], # (R, S) bool True = masked/tubed, or None (unmasked)
+        rope: Tensor,           # (2, S, head_dim) shared dual-band RoPE
+        use_ckpt: bool,
+    ) -> Tensor:
+        """Run the dual-band per-parcel token-block stack over a row batch.
+
+        Operates on a generic ``(R, S, d)`` row batch — ``R`` is the covered
+        parcels after the #91 ragged-PARCEL compaction (or ``B·K`` when
+        ``ragged_frontend`` is OFF) — so the SAME within-row §6 drop-token logic
+        serves BOTH the masked student and the unmasked EMA teacher. When
+        ``ragged_token`` is on (and ``drop`` is present) the VISIBLE tokens are
+        GATHERED per row to the per-batch-max ``Lk`` (a FLOP cut, bit-identical to
+        the dense key-pad on the kept tokens); otherwise masked tokens are
+        KEY-PADDED dense. ``drop`` None → unmasked forward (all tokens attendable).
+        Factored out of ``_forward_dual_band`` so the parcel-compaction wrapper can
+        reuse it for the student and teacher passes alike.
+        """
+        R, S, d = xj.shape
+        if self.ragged_token and drop is not None:
+            keep_flat = ~drop                                   # (R, S) True = visible
+            keep_idx, keep_real, Lk = _ragged_gather_idx(keep_flat)
+            gi = keep_idx.unsqueeze(-1).expand(R, Lk, d)
+            xj_v = torch.gather(xj, 1, gi)                       # (R, Lk, d)
+            rope_v = rope[:, keep_idx, :]                        # (2, R, Lk, hd)
+            kpm_v = keep_real
+            # NaN guard: a fully-dropped row (a fully-tubed covered parcel) → SDPA
+            # softmax over an empty key set → NaN poisoning the SHARED qkv grads.
+            # Force such rows to keep slot-0 (discarded downstream via latent_valid).
+            empty_row = ~kpm_v.any(dim=1, keepdim=True)
+            if bool(empty_row.any()):
+                slot0 = torch.arange(Lk, device=kpm_v.device).unsqueeze(0) == 0
+                kpm_v = kpm_v | (empty_row & slot0)
+            xj_v = self._token_block_stack(xj_v, kpm_v, rope_v, use_ckpt)
+            scatter_idx = torch.where(
+                keep_real, keep_idx, torch.full_like(keep_idx, S)
+            ).unsqueeze(-1).expand(R, Lk, d)
+            scratch = xj_v.new_zeros(R, S + 1, d)
+            scratch.scatter_(1, scatter_idx, xj_v)
+            return scratch[:, :S, :]
+        kpm: Optional[Tensor] = None
+        if drop is not None:
+            keep = ~drop                                         # (R, S) attendable key
+            # NaN guard (see ragged branch): fully-masked row → keep slot-0.
+            empty_row = ~keep.any(dim=1, keepdim=True)
+            if bool(empty_row.any()):
+                slot0 = torch.arange(S, device=keep.device).unsqueeze(0) == 0
+                keep = keep | (empty_row & slot0)
+            kpm = keep
+        return self._token_block_stack(xj, kpm, rope, use_ckpt)
+
     def _parcel_latent(
         self,
         m2: Tensor,            # (B, K, F_p, T_p, d) — frontend_ln tap
@@ -2178,54 +2231,54 @@ class V14ParcelPerceiverModel(nn.Module):
             tube_tok = tubed.unsqueeze(-1).expand(B, K, S)       # (B, K, S)
             drop = tube_tok if drop is None else (drop | tube_tok)
         BK = B * K
-        ragged_token = self.ragged_token and drop is not None
-        ragged = self.ragged_frontend
-        if ragged_token:
-            # §6 drop-token, ragged: GATHER the visible tokens to the front and run
-            # the token blocks over the per-batch-max visible count Lk (≈ S/2 for a
-            # surviving parcel — masked+tubed+uncovered tokens are NEVER gathered, so
-            # they are neither keys nor query sources, and the FLOP drops ~(S/Lk)²).
-            # Bit-identical to the dense key-pad on the kept tokens; this is the
-            # dual-band port of _forward_meanpool's ragged_token branch. (Previously
-            # this path ran a DENSE key-pad over all S — the missing ragged gather
-            # made 2STFT ~5× slower than the single-grid path at matched capacity.)
-            keep_flat = (~drop).reshape(BK, S)                   # True = attendable
-            if ragged:
-                keep_flat = keep_flat & latent_valid.reshape(BK, 1)
-            keep_idx, keep_real, Lk = _ragged_gather_idx(keep_flat)
-            gi = keep_idx.unsqueeze(-1).expand(BK, Lk, self.d_model)
-            xj_v = torch.gather(x_joint, 1, gi)                  # (BK, Lk, d)
-            rope_v = rope[:, keep_idx, :]                        # (2, BK, Lk, hd)
-            kpm_v = keep_real
-            # NaN guard: a fully-dropped row (uncovered / fully-tubed parcel) → SDPA
-            # softmax over an empty key set → NaN poisoning the SHARED qkv grads.
-            # Force such rows to keep slot-0 (its output is discarded downstream via
-            # latent_valid). Mirrors the single-grid ragged_token guard.
-            empty_row = ~kpm_v.any(dim=1, keepdim=True)
-            if bool(empty_row.any()):
-                slot0 = torch.arange(Lk, device=kpm_v.device).unsqueeze(0) == 0
-                kpm_v = kpm_v | (empty_row & slot0)
-            xj_v = self._token_block_stack(xj_v, kpm_v, rope_v, use_ckpt)
-            scatter_idx = torch.where(
-                keep_real, keep_idx, torch.full_like(keep_idx, S)
-            ).unsqueeze(-1).expand(BK, Lk, self.d_model)
-            scratch = xj_v.new_zeros(BK, S + 1, self.d_model)
-            scratch.scatter_(1, scatter_idx, xj_v)
-            x_joint = scratch[:, :S, :]
+        # Parcel-compaction selector for the frontend token blocks. Always drop
+        # UNCOVERED parcels (``latent_valid`` False). On the STUDENT (``tubed`` not
+        # None) ALSO drop the TUBED parcels: a tube is the M4 reconstruction TARGET,
+        # so its M2 is never read — the M2 loss scores only SURVIVING (covered,
+        # non-tubed) parcels, and the M4 parcel-latent + M4 predictor exclude tubed
+        # parcels as both query and key (``_parcel_latent_flat`` drops any parcel
+        # with no visible cell). Running a tubed parcel's S-token block is therefore
+        # pure waste. The TEACHER (``tubed`` None, full unmasked input) keeps ALL
+        # covered parcels — it must produce the M2 + M4 TARGETS at the would-be-tubed
+        # locations. So the selector is the natural per-forward one: student =
+        # covered & ~tubed (surviving), teacher = covered.
+        keep_row = latent_valid if tubed is None else (latent_valid & ~tubed)
+        row_keep = keep_row.reshape(BK)                          # (BK,) rows to run
+        drop_bk: Optional[Tensor] = None if drop is None else drop.reshape(BK, S)
+        if self.ragged_frontend:
+            # #91 ragged-PARCEL on the dual-band frontend token blocks — THE 2STFT
+            # throughput fix (Ben 2026-06-13). The token blocks are per-parcel
+            # INDEPENDENT (attention is WITHIN each parcel's S tokens; the dual-band
+            # RoPE is shared across parcels — no cross-parcel path), so gathering ONLY
+            # the run rows (covered, and non-tubed on the student) out of the B·K
+            # batch, running the blocks over the ~K_c≪K of them, and scattering back
+            # is bit-identical (to float-reduction order) on every SURVIVING parcel.
+            # Previously #173 cut the TOKEN axis (visible-only gather) but NOT the
+            # PARCEL axis: the student key-padded AND the EMA teacher ran DENSELY over
+            # all K=74 DKT parcels (incl. ~61 uncovered junk rows / subject) at S=520
+            # → the dominant ~K/K_c≈5.7× 2STFT slowdown vs the single-grid path, which
+            # already compacts here via _forward_meanpool's ``elif ragged:`` branch.
+            # Applies to BOTH the masked student and the unmasked teacher (drop None);
+            # the student additionally sheds its tubed targets here. The per-batch-max
+            # ``Lk`` inside the helper is unchanged by the compaction (uncovered/tubed
+            # rows contributed 0 visible tokens, so they never raised the max).
+            valid_idx = row_keep.nonzero(as_tuple=True)[0]        # (N,) rows to run
+            if valid_idx.numel() == 0:
+                x_joint = x_joint.new_zeros(BK, S, self.d_model)
+            else:
+                xj = x_joint.index_select(0, valid_idx)           # (N, S, d)
+                drop_v = (
+                    None if drop_bk is None else drop_bk.index_select(0, valid_idx)
+                )
+                xj = self._dual_band_token_blocks(xj, drop_v, rope, use_ckpt)
+                x_joint = x_joint.new_zeros(BK, S, self.d_model).index_copy(
+                    0, valid_idx, xj
+                )
         else:
-            # Dense fallback (ragged_token OFF, or teacher/unmasked drop=None). Masked
-            # tokens are KEY-PADDED out of the within-parcel block (still produce
-            # discarded reps). Uncovered parcels ride along as junk masked downstream.
-            kpm: Optional[Tensor] = None
-            if drop is not None:
-                keep = (~drop).reshape(BK, S)                    # True = attendable key
-                # NaN guard (see ragged branch): fully-masked row → keep slot-0.
-                empty_row = ~keep.any(dim=1, keepdim=True)       # (B·K, 1)
-                if bool(empty_row.any()):
-                    slot0 = torch.arange(S, device=keep.device).unsqueeze(0) == 0
-                    keep = keep | (empty_row & slot0)
-                kpm = keep
-            x_joint = self._token_block_stack(x_joint, kpm, rope, use_ckpt)
+            # ragged_frontend OFF (tests / fallback): no parcel compaction — run the
+            # token blocks over the full B·K batch (uncovered parcels ride along as
+            # junk, masked downstream via latent_valid), exactly as before this fix.
+            x_joint = self._dual_band_token_blocks(x_joint, drop_bk, rope, use_ckpt)
         x = x_joint.reshape(B, K, S, self.d_model)
         m2 = self.frontend_ln(x)                                 # M2 tap (B, K, S, d)
         if m2_only:
@@ -3688,10 +3741,18 @@ class JepaPredictor(nn.Module):
         else:
             ctx_keep = torch.ones(B, n_ctx, dtype=torch.bool, device=device)
         c_idx, c_real, Cmax = _ragged_gather_idx(ctx_keep)       # (B, Cmax) each
-        h_ctx_full = self.input_proj(context)                    # (B, N_ctx, h)
-        h_ctx = torch.gather(
-            h_ctx_full, 1, c_idx.unsqueeze(-1).expand(B, Cmax, self.hidden)
-        )                                                        # (B, Cmax, h)
+        # #94b FLOP cut (Ben 2026-06-13 audit): gather the RAW visible context FIRST,
+        # then project the compact (B, Cmax, ·) set — ``input_proj`` is a per-token
+        # ``nn.Linear`` so gather∘proj == proj∘gather EXACTLY on the kept rows (no
+        # float reassociation: each output token depends only on its own input token).
+        # The old order projected the FULL grid (B, N_ctx=K·S≈38480, h) and threw away
+        # ~90% — a ~7-8× cut on this matmul + dropping the (B, N_ctx, h) activation
+        # that was immediately discarded. Bit-identical to the dense key-padded path.
+        d_in = context.shape[-1]
+        ctx_g = torch.gather(
+            context, 1, c_idx.unsqueeze(-1).expand(B, Cmax, d_in)
+        )                                                        # (B, Cmax, d_in)
+        h_ctx = self.input_proj(ctx_g)                           # (B, Cmax, h)
         ctx_time_bc = context_time_ids.unsqueeze(0).expand(B, n_ctx)
         ctx_time = torch.gather(ctx_time_bc, 1, c_idx)           # (B, Cmax)
 
