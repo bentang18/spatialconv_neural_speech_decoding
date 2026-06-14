@@ -1687,6 +1687,56 @@ class V14ParcelPerceiverModel(nn.Module):
             kpm = keep
         return self._token_block_stack(xj, kpm, rope, use_ckpt)
 
+    @torch.compiler.disable
+    def _dual_band_frontend_blocks(
+        self,
+        x_joint: Tensor,            # (BK, S, d) — flat dual-band per-parcel tokens
+        row_keep: Tensor,           # (BK,) bool — covered (& non-tubed student) rows
+        drop_bk: Optional[Tensor],  # (BK, S) bool drop, or None (teacher/unmasked)
+        rope: Tensor,               # (2, S, head_dim) shared dual-band RoPE
+        use_ckpt: bool,
+    ) -> Tensor:
+        """Run the dual-band frontend token blocks — HELD OUT of the compile graph.
+
+        This region carries TWO independent data-dependent shapes: the parcel-axis
+        compaction count ``N`` (``row_keep.nonzero()`` below) and the per-row
+        visible-token count ``Lk`` (``_ragged_gather_idx`` inside
+        ``_dual_band_token_blocks``). Under ``--compile-dynamic`` torch.compile
+        specializes/recompiles per distinct ``(N, Lk)`` pair → a combinatorial
+        recompile explosion that wedged the FIRST batch for >70 min with zero steps
+        (job 48245831; #176 added the parcel-axis ``nonzero`` on top of #173's
+        token-axis gather, giving the second free dim). ``@torch.compiler.disable``
+        runs the whole gather→blocks→scatter region EAGER as a SINGLE graph break
+        (no per-shape specialization); the rest of the encoder still compiles around
+        it. The #176/#173 FLOP cuts are preserved in eager (the heavy block matmuls
+        call cuBLAS/SDPA either way, and already run eager via the disabled ``_ckpt``
+        when activation checkpointing is on), so the eager cost is negligible vs the
+        recompile wall. Mirrors the in-file ``_ckpt`` / ``_pool_parcel_std``
+        compile-disable precedent. The single-grid ``_forward_meanpool`` frontend is
+        UNAFFECTED — it compiled fine because it folds the parcel drop into a single
+        token-keep dim, so this disable is scoped to the dual-band (2STFT) path only.
+        """
+        BK, S, _ = x_joint.shape
+        if not self.ragged_frontend:
+            # ragged_frontend OFF (tests / fallback): no parcel compaction — run the
+            # token blocks over the full B·K batch (uncovered parcels ride along as
+            # junk, masked downstream via latent_valid), exactly as before #176.
+            return self._dual_band_token_blocks(x_joint, drop_bk, rope, use_ckpt)
+        # #91 ragged-PARCEL on the dual-band frontend token blocks — THE 2STFT
+        # throughput fix (Ben 2026-06-13). The token blocks are per-parcel
+        # INDEPENDENT (attention is WITHIN each parcel's S tokens; the dual-band
+        # RoPE is shared across parcels — no cross-parcel path), so gathering ONLY
+        # the run rows (covered, and non-tubed on the student) out of the B·K batch,
+        # running the blocks over the ~K_c≪K of them, and scattering back is
+        # bit-identical (to float-reduction order) on every SURVIVING parcel.
+        valid_idx = row_keep.nonzero(as_tuple=True)[0]           # (N,) rows to run
+        if valid_idx.numel() == 0:
+            return x_joint.new_zeros(BK, S, self.d_model)
+        xj = x_joint.index_select(0, valid_idx)                  # (N, S, d)
+        drop_v = None if drop_bk is None else drop_bk.index_select(0, valid_idx)
+        xj = self._dual_band_token_blocks(xj, drop_v, rope, use_ckpt)
+        return x_joint.new_zeros(BK, S, self.d_model).index_copy(0, valid_idx, xj)
+
     def _parcel_latent(
         self,
         m2: Tensor,            # (B, K, F_p, T_p, d) — frontend_ln tap
@@ -1791,6 +1841,7 @@ class V14ParcelPerceiverModel(nn.Module):
         # (R, k_run, d) → (B, F_p, T_p, k_run, d) → (B, k_run, F_p, T_p, d).
         return z.reshape(B, F_p, T_p, k_run, d).permute(0, 3, 1, 2, 4)
 
+    @torch.compiler.disable
     def _parcel_latent_flat(
         self,
         m2: Tensor,          # (B, K, S, d) — flat dual-band frontend_ln tap
@@ -1798,6 +1849,17 @@ class V14ParcelPerceiverModel(nn.Module):
         use_ckpt: bool,
     ) -> Tensor:
         """Flat-S analogue of :meth:`_parcel_latent` for the 2STFT dual-band tap.
+
+        HELD OUT of the torch.compile graph (``@torch.compiler.disable``): the #112
+        ragged-parcel gather here carries a data-dependent compaction count ``Kk``
+        (``_ragged_gather_idx(parcel_valid)``). On the 2STFT path this composes with
+        the frontend's own data-dependent shapes; disabling it (alongside
+        :meth:`_dual_band_frontend_blocks`) guarantees NO data-dependent shape
+        remains in the compiled dual-band graph, so the --compile-dynamic recompile
+        wall (job 48245831) cannot recur from the latent. Eager cost is negligible —
+        the latent is parcel-SA-only over ~13 covered parcels. The single-grid
+        :meth:`_parcel_latent` is NOT decorated (it compiled fine); this is scoped to
+        the dual-band path.
 
         The dual-band M2 tap is a FLAT per-parcel token sequence ``(B, K, S, d)``
         (``S = S_low + S_high``); the two bands carry different time rates so the
@@ -2245,40 +2307,17 @@ class V14ParcelPerceiverModel(nn.Module):
         keep_row = latent_valid if tubed is None else (latent_valid & ~tubed)
         row_keep = keep_row.reshape(BK)                          # (BK,) rows to run
         drop_bk: Optional[Tensor] = None if drop is None else drop.reshape(BK, S)
-        if self.ragged_frontend:
-            # #91 ragged-PARCEL on the dual-band frontend token blocks — THE 2STFT
-            # throughput fix (Ben 2026-06-13). The token blocks are per-parcel
-            # INDEPENDENT (attention is WITHIN each parcel's S tokens; the dual-band
-            # RoPE is shared across parcels — no cross-parcel path), so gathering ONLY
-            # the run rows (covered, and non-tubed on the student) out of the B·K
-            # batch, running the blocks over the ~K_c≪K of them, and scattering back
-            # is bit-identical (to float-reduction order) on every SURVIVING parcel.
-            # Previously #173 cut the TOKEN axis (visible-only gather) but NOT the
-            # PARCEL axis: the student key-padded AND the EMA teacher ran DENSELY over
-            # all K=74 DKT parcels (incl. ~61 uncovered junk rows / subject) at S=520
-            # → the dominant ~K/K_c≈5.7× 2STFT slowdown vs the single-grid path, which
-            # already compacts here via _forward_meanpool's ``elif ragged:`` branch.
-            # Applies to BOTH the masked student and the unmasked teacher (drop None);
-            # the student additionally sheds its tubed targets here. The per-batch-max
-            # ``Lk`` inside the helper is unchanged by the compaction (uncovered/tubed
-            # rows contributed 0 visible tokens, so they never raised the max).
-            valid_idx = row_keep.nonzero(as_tuple=True)[0]        # (N,) rows to run
-            if valid_idx.numel() == 0:
-                x_joint = x_joint.new_zeros(BK, S, self.d_model)
-            else:
-                xj = x_joint.index_select(0, valid_idx)           # (N, S, d)
-                drop_v = (
-                    None if drop_bk is None else drop_bk.index_select(0, valid_idx)
-                )
-                xj = self._dual_band_token_blocks(xj, drop_v, rope, use_ckpt)
-                x_joint = x_joint.new_zeros(BK, S, self.d_model).index_copy(
-                    0, valid_idx, xj
-                )
-        else:
-            # ragged_frontend OFF (tests / fallback): no parcel compaction — run the
-            # token blocks over the full B·K batch (uncovered parcels ride along as
-            # junk, masked downstream via latent_valid), exactly as before this fix.
-            x_joint = self._dual_band_token_blocks(x_joint, drop_bk, rope, use_ckpt)
+        # #91 ragged-PARCEL frontend compaction (THE 2STFT throughput fix) +
+        # #173/#176 token/tube drop. The whole data-dependent gather→blocks→scatter
+        # region runs in ``_dual_band_frontend_blocks`` which is
+        # ``@torch.compiler.disable``-wrapped: its parcel-axis ``N`` and token-axis
+        # ``Lk`` are BOTH data-dependent, and under --compile-dynamic that pair would
+        # trigger a combinatorial recompile explosion (job 48245831 wedged >70 min on
+        # the first batch). See that method's docstring. The FLOP cut survives eager;
+        # the rest of the encoder still compiles around this single graph break.
+        x_joint = self._dual_band_frontend_blocks(
+            x_joint, row_keep, drop_bk, rope, use_ckpt
+        )
         x = x_joint.reshape(B, K, S, self.d_model)
         m2 = self.frontend_ln(x)                                 # M2 tap (B, K, S, d)
         if m2_only:
