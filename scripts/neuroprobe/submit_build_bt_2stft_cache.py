@@ -54,6 +54,8 @@ def main() -> None:
 
     print(f"[submit] spec_cache_dir = {args.spec_cache_dir}")
     print(f"[submit] array          = {args.array_range} (one task per session)")
+    print(f"[submit] phase/mode/elec = {args.phase} / {args.study_mode} / "
+          f"{args.electrode_set or 'auto'} (frozen_probe={args.frozen_probe})")
     print(f"[submit] partition       = {args.cpu_partition}")
     print(f"[submit] frontend/atlas  = {args.frontend} / {args.atlas} "
           f"(exclude_single_elec={args.exclude_single_electrode_parcels})")
@@ -118,9 +120,24 @@ def build_sbatch(log_dir: Path, args: argparse.Namespace) -> str:
     # uid (and therefore the spec-cache key) is identical.
     cmd = [
         f"{shlex.quote(args.python)} -m speech_decoding.experiments.dispatch_v14 \\",
-        "    --phase 1 --mode full \\",
+        f"    --phase {int(args.phase)} --mode {shlex.quote(args.study_mode)} \\",
         f"    --frontend {shlex.quote(args.frontend)} --pool mean \\",
     ]
+    # --electrode-set selects the PRE-CAR montage. For the P4-eval LITE cache pass
+    # 'lite' (with --phase 4): _resolve_corpus_mode routes phase 4 to study mode
+    # 'lite' (the 12 eval sessions) and bt_load_raw subsets to the Lite budget
+    # before shaftCAR, so the cache references zero out-of-budget electrodes. Left
+    # unset, dispatch's 'auto' default -> 'all' for SSL phases. The montage is part
+    # of the SpecialLoader timeline uid (study.py iter_timelines), so an 'all' vs
+    # 'lite' cache live in different keys and never collide.
+    if args.electrode_set is not None:
+        cmd.append(f"    --electrode-set {shlex.quote(args.electrode_set)} \\")
+    # --frozen-probe routes --phase 4 to the B35 readout experiment (the eval the
+    # real run uses), which makes build_v14_experiment apply the eval-always-lite
+    # guard. cache-only exits before the trainer, so NO checkpoint is needed here;
+    # passing it only makes the (cache-irrelevant) experiment match the eval build.
+    if args.frozen_probe:
+        cmd.append("    --frozen-probe \\")
     if args.mean_pool_std:
         cmd.append("    --mean-pool-std \\")
     cmd.append(f"    --atlas {shlex.quote(args.atlas)} \\")
@@ -176,6 +193,33 @@ def parse_args() -> argparse.Namespace:
         "--pythonpath", default=None,
         help="If set, exported as PYTHONPATH so a worktree's src shadows the "
              "editable install (e.g. /work/ht203/repo/speech_bt/src).",
+    )
+    # Phase / corpus / montage — pick which cache this array builds.
+    #   FULL pretrain (default): --phase 1 --study-mode full (electrode_set 'all').
+    #   LITE eval cache:        --phase 4 --study-mode lite --electrode-set lite
+    #                            --frozen-probe --array-range 0-11.
+    p.add_argument(
+        "--phase", type=int, default=1, choices=(1, 3, 4),
+        help="dispatch --phase. 1 = SSL pretrain corpus (13 sessions). 4 = P4 eval "
+             "corpus, which _resolve_corpus_mode forces to the 12 BT_LITE sessions.",
+    )
+    p.add_argument(
+        "--study-mode", dest="study_mode", default="full",
+        choices=("nano", "lite", "full"),
+        help="dispatch --mode (SSL clip budget). Phase 4 ignores this for the corpus "
+             "(always BT_LITE) but it is still passed for parity with the run.",
+    )
+    p.add_argument(
+        "--electrode-set", dest="electrode_set", default=None,
+        choices=("all", "lite", "auto"),
+        help="PRE-CAR montage. Pass 'lite' for the P4-eval cache (with --phase 4). "
+             "Unset = dispatch default 'auto' (-> 'all' for SSL). Part of the cache "
+             "uid, so 'all' and 'lite' caches never collide.",
+    )
+    p.add_argument(
+        "--frozen-probe", dest="frozen_probe", action="store_true",
+        help="Pass dispatch --frozen-probe (routes --phase 4 to the B35 readout = "
+             "the real eval build). No checkpoint needed under --cache-only.",
     )
     # Front-end / atlas / exclusion — MUST match the training run's flags.
     p.add_argument("--frontend", default="2stft", choices=("raw", "2stft"))
