@@ -605,6 +605,9 @@ def build_v14_experiment(
     # collapse-guard soft panel would never evaluate. The chain sets this for
     # the SSL phases; None → Lightning default (epoch-boundary only).
     val_check_interval: int | float | None = None,
+    # Cadence (opt-steps) of the keep-ALL ladder checkpoint. Default 500
+    # (run-ops policy); a long run thins it via --ckpt-ladder-every.
+    ckpt_ladder_every: int = 500,
     # Cap on validation batches per check (#66). An uncapped SSL val set
     # (~875 batches) made each collapse-guard validation ~8 min → ~80% of
     # wall-clock under the (now-fixed) over-frequent cadence. The guard panel
@@ -1930,6 +1933,7 @@ def build_v14_experiment(
         wandb_config=wandb_config,
         max_steps=max_steps,
         val_check_interval=val_check_interval,
+        ckpt_ladder_every=ckpt_ladder_every,
         limit_val_batches=limit_val_batches,
         limit_test_batches=limit_test_batches,
         collapse_guard=collapse_guard,
@@ -2034,6 +2038,15 @@ def _parser() -> argparse.ArgumentParser:
                         "specified in OPTIMIZER steps; the Trainer converts to "
                         "Lightning's micro-batch unit via accumulate_grad_batches "
                         "(#66).")
+    p.add_argument("--ckpt-ladder-every", dest="ckpt_ladder_every",
+                   type=int, default=500,
+                   help="Cadence (optimizer steps) of the keep-ALL ladder "
+                        "checkpoint (save_top_k=-1). Default 500 (Ben 2026-06-11 "
+                        "run-ops policy: keep every rung for dense probe curves + "
+                        "<=cadence-steps lost on preemption). A long run can thin "
+                        "it (e.g. 1000 → half the checkpoints / disk). The best + "
+                        "metric-independent last.ckpt still ride "
+                        "--ssl-val-check-interval, unaffected.")
     p.add_argument("--ssl-limit-val-batches", dest="ssl_limit_val_batches",
                    type=int, default=32,
                    help="Cap each SSL/distill validation to this many batches "
@@ -3212,6 +3225,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         wandb_config=_build_wandb_config(args),
         lr_log_interval="step" if getattr(args, "live", False) else "epoch",
         log_every_n_steps=1 if getattr(args, "live", False) else 10,
+        ckpt_ladder_every=args.ckpt_ladder_every,
         cluster=args.cluster, fast_dev_run=args.fast_dev_run,
         slurm_partition=args.slurm_partition,
         slurm_account=args.slurm_account,

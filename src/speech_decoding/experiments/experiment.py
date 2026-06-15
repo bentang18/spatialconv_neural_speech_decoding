@@ -159,6 +159,11 @@ class Experiment(BaseExperiment):
     # would never evaluate. Setting this forces validation every N steps.
     # ``None`` → Lightning's default (epoch-boundary only).
     val_check_interval: int | float | None = None
+    # Cadence (in optimizer steps) of the keep-ALL ladder checkpoint
+    # (``save_top_k=-1``). Default 500 (Ben 2026-06-11 run-ops policy); a long
+    # run can pass --ckpt-ladder-every to thin the ladder (e.g. 1000 → half the
+    # checkpoints). Trainer-only — never enters the extractor cache uid.
+    ckpt_ladder_every: int = 500
     csv_config: CsvLoggerConfig | None = None
     wandb_config: WandbLoggerConfig | None = None
     # B36 WS-E (E3/E4): cross-phase checkpoint handoff. ``pretrained_ckpt``
@@ -306,7 +311,7 @@ class Experiment(BaseExperiment):
                     monitor=None,
                     save_top_k=-1,
                     save_last=False,
-                    every_n_train_steps=500,
+                    every_n_train_steps=self.ckpt_ladder_every,
                 )
             )
         if self.early_stopping_patience is not None:

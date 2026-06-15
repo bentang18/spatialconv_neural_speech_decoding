@@ -370,6 +370,33 @@ def test_periodic_last_ckpt_is_metric_independent_on_step_cadence(tmp_path) -> N
     assert epoch_best[0].save_last is True and epoch_best[0].save_top_k == 1
 
 
+def test_ckpt_ladder_every_is_configurable(tmp_path) -> None:
+    """The keep-ALL ladder cadence honors ckpt_ladder_every (default 500). A long
+    run thins the ladder via --ckpt-ladder-every (e.g. 1000) without touching the
+    best/last callbacks, which keep riding val_check_interval."""
+    from lightning.pytorch.callbacks import ModelCheckpoint
+
+    base = _tiny_mlp_xp(tmp_path / "runs", n_epochs=1)
+
+    def _ladder(xp):
+        cks = [c for c in xp._callbacks() if isinstance(c, ModelCheckpoint)]
+        return [c for c in cks if c.monitor is None and c.save_top_k == -1]
+
+    # Default cadence is 500 (run-ops policy).
+    assert _ladder(base)[0]._every_n_train_steps == 500
+
+    # A non-default cadence flows through to the ladder only; best/last unaffected.
+    thinned = base.model_copy(
+        update={"val_check_interval": 1000, "ckpt_ladder_every": 1000}
+    )
+    cks = [c for c in thinned._callbacks() if isinstance(c, ModelCheckpoint)]
+    ladder = [c for c in cks if c.monitor is None and c.save_top_k == -1]
+    last = [c for c in cks if c.monitor is None and c.save_top_k == 0]
+    assert ladder[0]._every_n_train_steps == 1000
+    # last.ckpt still rides val_check_interval (here coincidentally also 1000).
+    assert last[0]._every_n_train_steps == 1000
+
+
 def test_lr_log_interval_default_epoch(tmp_path) -> None:
     """Default LearningRateMonitor cadence is per-epoch (unchanged)."""
     from lightning.pytorch.callbacks import LearningRateMonitor
