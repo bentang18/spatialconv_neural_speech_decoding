@@ -92,31 +92,33 @@ def _base_argv(args, *, phase: int) -> list[str]:
 
 
 # ----------------------------------------------------------------------------- helpers
+# Extractor-name substrings that are side-channels, NOT the front-end |STFT|-z the
+# encoder ingests (support weights, valid mask, target label, reference index, parcel id).
+_NON_FRONTEND = ("support", "valid", "mask", "target", "ref", "parcel", "id", "label")
+
+
+def _batch_data(item: tp.Any) -> dict[str, torch.Tensor]:
+    """The neuralset ``Batch.data`` dict (extractor-name -> batched tensor); a plain dict
+    item is returned as-is."""
+    data = getattr(item, "data", None)
+    if data is None and isinstance(item, dict):
+        data = item
+    return data or {}
+
+
 def _frontend_tensors(item: tp.Any) -> dict[str, torch.Tensor]:
-    """Pull the front-end voltage/|STFT|-z tensors out of one dataset item, whatever the
-    container shape (the 2STFT path packs the two bands; the support / target / mask
-    side-channels are NOT front-end and are excluded by name + by being int/bool)."""
+    """The front-end |STFT|-z tensors out of one dataset item (the 2STFT path emits the
+    low + high band under ``electrode_tokens*``). Side-channels (support / valid_mask /
+    target / ref_idx / parcel-id) are excluded by name and by non-float dtype, so the
+    max |.| we report is the per-cell robust-z the encoder actually sees."""
     out: dict[str, torch.Tensor] = {}
-
-    def _collect(prefix: str, obj: tp.Any) -> None:
-        if torch.is_tensor(obj):
-            if obj.is_floating_point() and obj.ndim >= 2:
-                out[prefix] = obj.detach().float()
-            return
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                _collect(f"{prefix}.{k}", v)
-        elif isinstance(obj, (list, tuple)):
-            for i, v in enumerate(obj):
-                _collect(f"{prefix}[{i}]", v)
-
-    # The item is typically (x, target) or a dict; x may itself be a (low, high) tuple.
-    _collect("item", item)
-    # Drop obvious non-front-end float channels by name (support weights, valid mask).
-    return {
-        k: v for k, v in out.items()
-        if not any(tok in k.lower() for tok in ("support", "valid", "mask", "target"))
-    }
+    for k, v in _batch_data(item).items():
+        if not torch.is_tensor(v) or not v.is_floating_point() or v.ndim < 2:
+            continue
+        if any(tok in k.lower() for tok in _NON_FRONTEND):
+            continue
+        out[k] = v.detach().float()
+    return out
 
 
 def _global_max_abs(tensors: dict[str, torch.Tensor]) -> float:
@@ -183,9 +185,13 @@ def main() -> int:
             st = trig["start"].to_numpy()
             print(f"start[:5] = {st[:5]}  (n={len(st)})", flush=True)
         item = sel[0]
-        print(f"item type = {type(item).__name__}; "
-              f"top-level = {list(item.keys()) if isinstance(item, dict) else 'tuple/len=' + str(len(item))}",
-              flush=True)
+        data = _batch_data(item)
+        print(f"item type = {type(item).__name__}; data keys = {list(data.keys())}", flush=True)
+        for k, v in data.items():
+            if torch.is_tensor(v):
+                mx = float(v.abs().max()) if v.is_floating_point() else None
+                print(f"  data[{k}] shape={tuple(v.shape)} dtype={v.dtype}"
+                      + (f" max|.|={mx:.2f}" if mx is not None else ""), flush=True)
         ft = _frontend_tensors(item)
         for k, v in ft.items():
             print(f"  frontend[{k}] shape={tuple(v.shape)} max|.|={float(v.abs().max()):.2f} "
