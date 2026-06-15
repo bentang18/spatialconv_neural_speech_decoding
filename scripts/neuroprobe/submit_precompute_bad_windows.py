@@ -86,6 +86,11 @@ def build_sbatch(log_dir: Path, args: argparse.Namespace) -> str:
         "",
         "set -euo pipefail",
         f"cd {args.repo_root}",
+        # The scan imports neuroprobe.config at runtime, which hard-requires
+        # ROOT_DIR_BRAINTREEBANK. Export it in the script so the job is hermetic
+        # regardless of the submitting shell's env (a bare non-interactive SSH
+        # submission won't have it, and sbatch --export=ALL would then drop it).
+        f"export ROOT_DIR_BRAINTREEBANK={shlex.quote(str(args.root_dir_braintreebank))}",
     ])
     if args.pythonpath:
         lines.append(f"export PYTHONPATH={shlex.quote(str(args.pythonpath))}")
@@ -124,6 +129,10 @@ def parse_args() -> argparse.Namespace:
         help="Where the .sbatch + slurm logs land (default reports/bt_bad_windows_precompute_<date>).",
     )
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
+    p.add_argument(
+        "--root-dir-braintreebank", default="/work/ht203/data/braintreebank",
+        help="Exported as ROOT_DIR_BRAINTREEBANK in the job (neuroprobe.config requires it).",
+    )
     p.add_argument(
         "--python", default=".venv/bin/python",
         help="Interpreter for the scan (relative to repo-root, or absolute).",
