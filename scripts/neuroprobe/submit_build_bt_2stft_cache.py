@@ -88,7 +88,25 @@ def build_sbatch(log_dir: Path, args: argparse.Namespace) -> str:
         "",
         "set -euo pipefail",
         f"cd {args.repo_root}",
+        # dispatch_v14 -> neuroprobe.config hard-requires ROOT_DIR_BRAINTREEBANK.
+        # Export it in the script so the job is hermetic regardless of the
+        # submitting shell (a bare non-interactive SSH submission won't have it,
+        # and sbatch --export=ALL would then drop it).
+        f"export ROOT_DIR_BRAINTREEBANK={shlex.quote(str(args.root_dir_braintreebank))}",
     ])
+    if args.extractor_cache_folder is not None:
+        # The RAW-waveform exca cache (electrode_tokens) is keyed by the extractor
+        # uid ONLY — it is BLIND to the bad-electrode set / loader code version. A
+        # static-exclusion change (anatomy._BT_V14_EXTRA_BAD_ELECTRODES) does NOT
+        # invalidate it, so a spec rebuild that reuses a stale electrode_tokens dir
+        # silently re-STFTs pre-drop waveforms (the 2026-06-15 no-op-rebuild bug).
+        # Pointing this at a FRESH dir forces raw _get_data through bt_load_raw so
+        # the static drop actually lands. MUST be fresh whenever the bad-electrode
+        # set changed; the run then reads BOTH this and --spec-cache-dir.
+        lines.append(
+            f"export EXCA_EXTRACTOR_CACHE_FOLDER="
+            f"{shlex.quote(str(args.extractor_cache_folder))}"
+        )
     if args.pythonpath:
         # Isolated-worktree runs reuse the MAIN clone's .venv binary but must
         # import the worktree's src, so PYTHONPATH wins over the editable install.
@@ -135,7 +153,21 @@ def parse_args() -> argparse.Namespace:
         "--log-dir", type=Path, default=None,
         help="Where the .sbatch + slurm logs land (default reports/bt_2stft_cache_build_<date>).",
     )
+    p.add_argument(
+        "--extractor-cache-folder", type=Path, default=None,
+        help="Exported as EXCA_EXTRACTOR_CACHE_FOLDER — the RAW-waveform exca cache "
+             "(electrode_tokens). It is keyed by the extractor uid ONLY and is BLIND "
+             "to the bad-electrode set, so it MUST point at a FRESH dir whenever the "
+             "static exclusion changed (else the spec rebuild reuses stale pre-drop "
+             "waveforms — the 2026-06-15 no-op-rebuild bug). The run reads both this "
+             "and --spec-cache-dir. Default None = inherit the env (only safe when the "
+             "electrode set is unchanged).",
+    )
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
+    p.add_argument(
+        "--root-dir-braintreebank", default="/work/ht203/data/braintreebank",
+        help="Exported as ROOT_DIR_BRAINTREEBANK in the job (neuroprobe.config requires it).",
+    )
     p.add_argument(
         "--python", default=".venv/bin/python",
         help="Interpreter for the build (relative to repo-root, or absolute).",
