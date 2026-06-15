@@ -35,14 +35,18 @@ Memory-frugal: one electrode's STFT at a time.
 READ-ONLY w.r.t. the dataset/cache. DCC-only: needs ``ROOT_DIR_BRAINTREEBANK`` + BT
 voltage. Array-parallel via ``SLURM_ARRAY_TASK_ID`` (one session per task).
 
-Usage
+Usage (DCC; scripts/ is not a package, so run by PATH not ``-m``)
 -----
-    # one session locally (laptop has no BT voltage; DCC only)
-    .venv/bin/python -m scripts.neuroprobe.precompute_bad_windows \
+    # one session (DCC only — laptop has no BT voltage)
+    ROOT_DIR_BRAINTREEBANK=/work/ht203/data/braintreebank \
+      .venv/bin/python scripts/neuroprobe/precompute_bad_windows.py \
         --out-dir /work/ht203/v14_bad_windows --session 2 1
 
-    # full pretrain corpus, one Slurm array task per session
-    #   sbatch --array=0-12 ... precompute_bad_windows.py --out-dir /work/ht203/v14_bad_windows
+    # full pretrain corpus, one Slurm array task per session (13 sessions -> 0-12)
+    #   sbatch --array=0-12 ... \
+    #     "ROOT_DIR_BRAINTREEBANK=/work/ht203/data/braintreebank \
+    #      .venv/bin/python scripts/neuroprobe/precompute_bad_windows.py \
+    #        --out-dir /work/ht203/v14_bad_windows"
 """
 
 from __future__ import annotations
