@@ -287,7 +287,21 @@ class Experiment(BaseExperiment):
                     save_top_k=1,
                 )
             )
-            if step_cadence is not None:
+            # When the ladder shares the periodic cadence, its latest rung already
+            # holds exactly what last.ckpt would (same step, same state), so a
+            # standalone periodic-last is pure duplication — AND it collides on
+            # Lightning's state_key, which is derived only from
+            # (monitor, mode, every_n_train_steps, every_n_epochs,
+            # train_time_interval): two metric-independent checkpoints at the same
+            # cadence are indistinguishable to it ("Found more than one stateful
+            # callback of type ModelCheckpoint"). So fold save_last into the ladder
+            # for that case and skip the standalone last callback. They stay
+            # separate only when the cadences differ (dense last.ckpt every val
+            # cadence + sparser kept rungs), where the state_keys are distinct.
+            ladder_owns_last = (
+                step_cadence is not None and step_cadence == self.ckpt_ladder_every
+            )
+            if step_cadence is not None and not ladder_owns_last:
                 callbacks.append(
                     ModelCheckpoint(
                         dirpath=ckpt_dir,
@@ -299,10 +313,12 @@ class Experiment(BaseExperiment):
                 )
             # Ladder capture (Ben 2026-06-11): keep ALL step-tagged checkpoints
             # so (a) the probe-vs-steps curve has dense rungs and (b) a DDP/NCCL
-            # hang or SLURM preemption loses <=1000 steps instead of the whole
-            # run. The best/last callbacks above overwrite IN PLACE (save_top_k
-            # 1 and 0); this one never does (save_top_k=-1). ~115 MB each, ~20
-            # for a 20k-step run = ~2 GB — cheap insurance against lost compute.
+            # hang or SLURM preemption loses <=ckpt_ladder_every steps instead of
+            # the whole run. The best/last callbacks above overwrite IN PLACE
+            # (save_top_k 1 and 0); this one never does (save_top_k=-1). ~115 MB
+            # each, ~20 for a 20k-step run = ~2 GB — cheap insurance against lost
+            # compute. When it also owns last.ckpt (ladder_owns_last) it both keeps
+            # every rung and maintains the fixed-name resume pointer.
             callbacks.append(
                 ModelCheckpoint(
                     dirpath=ckpt_dir,
@@ -310,7 +326,7 @@ class Experiment(BaseExperiment):
                     auto_insert_metric_name=False,
                     monitor=None,
                     save_top_k=-1,
-                    save_last=False,
+                    save_last=ladder_owns_last,
                     every_n_train_steps=self.ckpt_ladder_every,
                 )
             )
