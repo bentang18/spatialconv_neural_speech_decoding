@@ -15,6 +15,10 @@ the parity-locked train/test split. Three readouts are compared (``--reduction``
   meanall  (Ben 2026-06-15 "mean pool freq as well")
       mean over ALL S tokens → (K, d). keep valid → K_valid·d. sklearn L2-logistic.
 
+  flatten  (Ben 2026-06-15 "simple flatten all linear reg")
+      no pooling — keep every token. (K, S, d) → keep valid → K_valid·S·d
+      (425,984 for S1). sklearn L2-logistic (heavy L2 shrinkage; p/n ≈ 270).
+
   attentive  (Ben 2026-06-15 "attentive pool over all ~16×104 tokens")
       single-seed multihead PMA over the K_valid·S valid tokens → d → linear.
       TRAINABLE (gradient-trained head, NOT sklearn); ~263k pool params + linear.
@@ -62,7 +66,7 @@ _MODE_ALIASES = {
     "csession": "CrossSession",
     "csubject": "CrossSubject",
 }
-_REDUCTIONS = ("meantime_keepfreq", "meanall", "attentive")
+_REDUCTIONS = ("meantime_keepfreq", "meanall", "attentive", "flatten")
 
 
 def build_frozen_encoder(experiment, ckpt_path: str):
@@ -127,7 +131,7 @@ def extract_split(encoder, loader, reduction):
             red = reduce_meantime_keepfreq(m4, fpi, f_p).cpu().numpy()
         elif reduction == "meanall":
             red = m4.mean(dim=2, keepdim=True).cpu().numpy()   # (B,K,1,d)
-        else:  # attentive: keep raw tokens (fp16 to bound RAM)
+        else:  # attentive / flatten: keep raw tokens (fp16 to bound RAM)
             red = m4.half().cpu().numpy()                       # (B,K,S,d)
         feats.append(red)
         lvs.append(lv.cpu().numpy())
