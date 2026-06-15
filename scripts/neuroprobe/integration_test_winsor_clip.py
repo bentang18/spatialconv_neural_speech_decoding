@@ -165,6 +165,13 @@ def main() -> int:
                     help="Introspection only: build the Data, print dataset structure / "
                          "front-end tensor shapes (validates plumbing on any session, "
                          "incl. glitch-free ones). No assertions.")
+    ap.add_argument("--winsor-probe", action="store_true",
+                    help="ISOLATION probe: build ONE phase-1 dataset honoring the SHELL's "
+                         "V14_SESSION_Z_WINSOR env (set it BEFORE invoking, exactly like "
+                         "production sets it from --session-z-winsor before prepare()), scan "
+                         "the glitch clips, print max|z|. Run once per env state in a FRESH "
+                         "process so no prior build's normalizer state can leak — this is the "
+                         "production-faithful winsor check (one view, env set from the start).")
     args = ap.parse_args()
 
     from speech_decoding.experiments.bad_windows import (
@@ -181,6 +188,26 @@ def main() -> int:
     if not spans:
         print("WARNING: this session has NO bad spans — CLIP/WINSOR assertions cannot "
               "fire. Pick a glitchy --session-index (1,2,7,10).", flush=True)
+
+    if args.winsor_probe:
+        # ISOLATION probe: build ONE phase-1 dataset honoring whatever
+        # V14_SESSION_Z_WINSOR the SHELL exported (production sets it via
+        # --session-z-winsor BEFORE prepare()), scan the glitch clips, print the max
+        # |z| the encoder would ingest. Run in a FRESH process per env state so no
+        # prior build's in-process normalizer state can leak. This is the
+        # production-faithful winsor check (one view, env set from the start).
+        env_w = os.environ.get(_WINSOR_ENV)
+        data = _build_production_data(_base_argv(args, phase=1))
+        sel = data.build()["train"].dataset
+        trig = getattr(sel, "triggers", None)
+        seg_start = float(data.segmenter.start)
+        seg_dur = float(data.segmenter.duration)
+        gidx = [i for i, st in enumerate(trig["start"].to_numpy())
+                if _overlaps(float(st) + seg_start, float(st) + seg_start + seg_dur, spans)]
+        mx = max((_global_max_abs(_frontend_tensors(sel[i])) for i in gidx), default=0.0)
+        print(f"WINSOR_PROBE  V14_SESSION_Z_WINSOR={env_w!r}  glitch_clips={len(gidx)}  "
+              f"max|z|={mx:.1f}", flush=True)
+        return 0
 
     if args.diag:
         data = _build_production_data(_base_argv(args, phase=1))
