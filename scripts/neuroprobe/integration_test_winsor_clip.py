@@ -87,11 +87,17 @@ def _build_production_data(argv: list[str]):
     raise RuntimeError(f"capture failed (main returned without building) for argv={argv}")
 
 
-def _base_argv(args, *, phase: int) -> list[str]:
+def _base_argv(args, *, phase: int, winsor: float | None = None) -> list[str]:
     """The production cache-only argv (mirrors submit_build_bt_2stft_cache.py) for one
-    session. Extra flags (--bad-window-dir / --session-z-winsor) are appended by callers
-    so each defense is driven through its real CLI front-door."""
-    return [
+    session. WINSOR is driven through the REAL ``--session-z-winsor`` CLI flag (not a
+    manual env set): ``main()`` is authoritative over ``V14_SESSION_Z_WINSOR`` — it SETS
+    the env when the flag is present and POPS it when absent (dispatch_v14.py:3567-3570,
+    so a stale value never leaks). Setting the env by hand and omitting the flag would be
+    silently wiped by that pop — exactly the bug that made an earlier winsor check read
+    unclamped. Appending the flag makes the env identical to a real
+    ``--session-z-winsor`` run and immune to build-order contamination (each main() call
+    sets/pops per its own argv). ``--bad-window-dir`` is appended by CLIP callers."""
+    argv = [
         "--phase", str(phase), "--mode", "full",
         "--frontend", "2stft", "--pool", "mean", "--mean-pool-std",
         "--atlas", "dkt", "--exclude-single-electrode-parcels",
@@ -100,6 +106,9 @@ def _base_argv(args, *, phase: int) -> list[str]:
         "--num-workers", "0",
         "--cache-only", "--cache-session-index", str(args.session_index),
     ]
+    if winsor is not None:
+        argv += ["--session-z-winsor", str(winsor)]
+    return argv
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -165,6 +174,9 @@ def main() -> int:
                     help="Introspection only: build the Data, print dataset structure / "
                          "front-end tensor shapes (validates plumbing on any session, "
                          "incl. glitch-free ones). No assertions.")
+    ap.add_argument("--winsor-on", action="store_true",
+                    help="(with --winsor-probe) build with --session-z-winsor on; omit to "
+                         "build the no-winsor baseline.")
     ap.add_argument("--winsor-probe", action="store_true",
                     help="ISOLATION probe: build ONE phase-1 dataset honoring the SHELL's "
                          "V14_SESSION_Z_WINSOR env (set it BEFORE invoking, exactly like "
@@ -190,14 +202,14 @@ def main() -> int:
               "fire. Pick a glitchy --session-index (1,2,7,10).", flush=True)
 
     if args.winsor_probe:
-        # ISOLATION probe: build ONE phase-1 dataset honoring whatever
-        # V14_SESSION_Z_WINSOR the SHELL exported (production sets it via
-        # --session-z-winsor BEFORE prepare()), scan the glitch clips, print the max
-        # |z| the encoder would ingest. Run in a FRESH process per env state so no
-        # prior build's in-process normalizer state can leak. This is the
-        # production-faithful winsor check (one view, env set from the start).
-        env_w = os.environ.get(_WINSOR_ENV)
-        data = _build_production_data(_base_argv(args, phase=1))
+        # ISOLATION probe: build ONE phase-1 dataset in a FRESH process and scan the
+        # glitch clips for the max |z| the encoder would ingest. With --winsor-on the
+        # build appends --session-z-winsor (the REAL production front-door: main() sets
+        # V14_SESSION_Z_WINSOR before prepare()); without it the flag is absent and
+        # main() pops the env. Run once per state in separate processes so no prior
+        # build's normalizer can leak — the production-faithful winsor check.
+        w = args.winsor if args.winsor_on else None
+        data = _build_production_data(_base_argv(args, phase=1, winsor=w))
         sel = data.build()["train"].dataset
         trig = getattr(sel, "triggers", None)
         seg_start = float(data.segmenter.start)
@@ -205,7 +217,7 @@ def main() -> int:
         gidx = [i for i, st in enumerate(trig["start"].to_numpy())
                 if _overlaps(float(st) + seg_start, float(st) + seg_start + seg_dur, spans)]
         mx = max((_global_max_abs(_frontend_tensors(sel[i])) for i in gidx), default=0.0)
-        print(f"WINSOR_PROBE  V14_SESSION_Z_WINSOR={env_w!r}  glitch_clips={len(gidx)}  "
+        print(f"WINSOR_PROBE  --session-z-winsor={w}  glitch_clips={len(gidx)}  "
               f"max|z|={mx:.1f}", flush=True)
         return 0
 
@@ -293,25 +305,25 @@ def main() -> int:
     except Exception as exc:  # eval-mode session cache absent etc.
         rep.add("CLIP-4", None, f"phase-4 build unavailable here: {type(exc).__name__}: {exc}")
 
-    # ---- WINSOR: real read-time clamp via V14_SESSION_Z_WINSOR -------------------
-    # WINSOR's production mechanism is the V14_SESSION_Z_WINSOR env knob: the CLI flag
-    # --session-z-winsor's ONLY effect is os.environ["V14_SESSION_Z_WINSOR"]=value
-    # (dispatch_v14.py ~3568), read by SessionRobustZNormalizer.__init__ at read time
-    # (normalize.py:191-192) and clamped in transform() (line 265). We set that env
-    # ourselves — IDENTICAL read path — order-safely: env is set across BOTH the build
-    # AND the clip-pull for each variant (the normalizer reads the env at construction,
-    # so a stale env would mis-clamp). First confirm the flag->env wiring is the only
-    # effect, then drive the clamp.
+    # ---- WINSOR: real read-time clamp via the --session-z-winsor CLI flag ---------
+    # WINSOR's production mechanism: --session-z-winsor W -> main() sets
+    # V14_SESSION_Z_WINSOR=W (and POPS it when the flag is absent, so a stale value
+    # never leaks; dispatch_v14.py:3567-3570) -> SessionRobustZNormalizer reads it at
+    # construction (normalize.py:191-192) -> transform() clamps |z| (line 265). We drive
+    # the REAL flag through the argv (NOT a manual env set) so main() is authoritative:
+    # a hand-set env with the flag absent would be silently popped — the exact artifact
+    # that made an earlier check read unclamped (max|z| 13891 with "winsor on"). Driving
+    # the flag also makes the two passes contamination-proof: each _build_production_data
+    # re-runs main(), which sets/pops the env per ITS OWN argv.
     W = args.winsor
-    _wiring_argv = _base_argv(args, phase=1) + ["--session-z-winsor", str(W)]
+    os.environ.pop(_WINSOR_ENV, None)  # clean slate; main() owns the env from here
     from speech_decoding.experiments import dispatch_v14 as _d
-    _wiring_args = _d._parser().parse_args(_wiring_argv)
+    _wiring_args = _d._parser().parse_args(_base_argv(args, phase=1, winsor=W))
     rep.add("WINSOR-0", float(getattr(_wiring_args, "session_z_winsor", -1)) == W,
             f"--session-z-winsor parses to {getattr(_wiring_args, 'session_z_winsor', None)} "
-            f"(its sole effect is setting V14_SESSION_Z_WINSOR; we drive that env directly)")
+            f"(main() sets V14_SESSION_Z_WINSOR from it before prepare())")
 
-    # No-winsor pass: env unset across build + scan.
-    os.environ.pop(_WINSOR_ENV, None)
+    # No-winsor pass: flag absent -> main() pops the env -> no clamp.
     data_nw = _build_production_data(_base_argv(args, phase=1))
     sel_nowin = data_nw.build()["train"].dataset
     trig_nw = getattr(sel_nowin, "triggers", None)
@@ -331,7 +343,7 @@ def main() -> int:
         rep.add("WINSOR-2", None, "skipped (no glitch clip)")
         rep.add("WINSOR-3", None, "skipped (no glitch clip)")
     else:
-        # Scan glitch clips for the worst |z| (env still unset).
+        # Scan glitch clips for the worst |z| (no-winsor build).
         worst_i, max_nowin = glitch_idx[0], 0.0
         worst_tensors: dict[str, torch.Tensor] = {}
         for i in glitch_idx:
@@ -340,14 +352,12 @@ def main() -> int:
             if m > max_nowin:
                 max_nowin, worst_i, worst_tensors = m, i, ft
 
-        # Winsor pass: env=W across build + scan (order-safe; normalizer reads env at init).
-        os.environ[_WINSOR_ENV] = str(W)
-        try:
-            sel_win = _build_production_data(_base_argv(args, phase=1)).build()["train"].dataset
-            max_win = max(_global_max_abs(_frontend_tensors(sel_win[i])) for i in glitch_idx)
-            t_win = _frontend_tensors(sel_win[worst_i])
-        finally:
-            os.environ.pop(_WINSOR_ENV, None)
+        # Winsor pass: flag present -> main() sets the env=W before prepare().
+        sel_win = _build_production_data(
+            _base_argv(args, phase=1, winsor=W)
+        ).build()["train"].dataset
+        max_win = max(_global_max_abs(_frontend_tensors(sel_win[i])) for i in glitch_idx)
+        t_win = _frontend_tensors(sel_win[worst_i])
 
         print(f"glitch clips scanned={len(glitch_idx)}  "
               f"max|z| no-winsor={max_nowin:.1f}  winsor={max_win:.1f}  "
