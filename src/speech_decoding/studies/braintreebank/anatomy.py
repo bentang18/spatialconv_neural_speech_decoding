@@ -318,6 +318,35 @@ def voltage_electrode_order(
     return order
 
 
+def lite_electrode_set(subject_id: int) -> frozenset[str]:
+    """The subject's Neuroprobe-Lite electrodes as a cleaned label **set**, with
+    NO ``bt_root`` dependency (reads only the vendored ``NEUROPROBE_LITE_ELECTRODES``
+    table).
+
+    Used by the loader (:func:`bt_load_raw`) to subset voltage rows to the Lite
+    montage PRE-CAR by name membership, without re-reading ``electrode_labels.json``.
+    Because the loader's post-STATIC row order already equals
+    :func:`voltage_electrode_order`, filtering its rows to this set order-preserving
+    yields exactly :func:`lite_voltage_order` — so the loader lands byte-aligned with
+    the support / valid-mask extractors (which key off ``lite_voltage_order``) while
+    staying root-free.
+
+    Lite labels are already cleaned (no ``*``/``#``); we clean defensively so the
+    set is in the same label space as ``voltage_electrode_order``.
+    """
+    from ._neuroprobe_lite_tables import NEUROPROBE_LITE_ELECTRODES
+
+    sid = int(subject_id)
+    key = f"btbank{sid}"
+    if key not in NEUROPROBE_LITE_ELECTRODES:
+        raise KeyError(
+            f"subject {sid} ({key}) absent from vendored NEUROPROBE_LITE_ELECTRODES"
+        )
+    return frozenset(
+        clean_bt_electrode_label(e) for e in NEUROPROBE_LITE_ELECTRODES[key]
+    )
+
+
 def lite_voltage_mask(bt_root: str | Path, subject_id: int) -> np.ndarray:
     """Boolean mask over :func:`voltage_electrode_order` selecting the Neuroprobe
     Lite electrodes for this subject.
@@ -331,22 +360,9 @@ def lite_voltage_mask(bt_root: str | Path, subject_id: int) -> np.ndarray:
     each parcel matters, not their order. Applying this one mask in lockstep to
     the study's voltage rows AND the DK support / valid-mask extractors keeps
     ``support[c]`` ↔ ``electrode_tokens[c]`` aligned after subsetting.
-
-    Lite labels are already cleaned (no ``*``/``#``); we clean defensively so the
-    intersection is in the same label space as ``voltage_electrode_order``.
     """
-    from ._neuroprobe_lite_tables import NEUROPROBE_LITE_ELECTRODES
-
-    sid = int(subject_id)
-    key = f"btbank{sid}"
-    if key not in NEUROPROBE_LITE_ELECTRODES:
-        raise KeyError(
-            f"subject {sid} ({key}) absent from vendored NEUROPROBE_LITE_ELECTRODES"
-        )
-    lite_set = {
-        clean_bt_electrode_label(e) for e in NEUROPROBE_LITE_ELECTRODES[key]
-    }
-    order = voltage_electrode_order(bt_root, sid)
+    lite_set = lite_electrode_set(subject_id)
+    order = voltage_electrode_order(bt_root, subject_id)
     return np.array([e in lite_set for e in order], dtype=bool)
 
 
@@ -635,16 +651,27 @@ def aligned_voltage_support(
     unmapped_policy: tp.Literal["raise", "zero"] = "raise",
     label_column: str = DEFAULT_BT_LABEL_COLUMN,
     exclude_single_electrode_parcels: bool = False,
+    electrode_set: tp.Literal["all", "lite"] = "all",
 ) -> HardLabelSupport:
     """DK/DKT support aligned to the VOLTAGE electrode order.
 
     ``result.support[c]`` and ``result.valid[c]`` describe the same physical
-    electrode as ``electrode_tokens[c]`` (= ``voltage_electrode_order(...)[c]``).
+    electrode as ``electrode_tokens[c]``. ``electrode_set`` selects the montage
+    the support is aligned to:
+
+      * ``"all"`` (default) — full voltage montage
+        (= ``voltage_electrode_order(...)[c]``). Unchanged from the pre-Lite API.
+      * ``"lite"`` — the Neuroprobe-Lite montage (= ``lite_voltage_order(...)[c]``,
+        the PRE-CAR Lite subset). ``support``/``valid`` then have one row per Lite
+        electrode, row-aligned to the Lite voltage rows the loader emits under
+        ``electrode_set="lite"``. Used by the P4 eval cell so the Lite result
+        references zero out-of-budget electrodes (CAR over Lite contacts only).
+
     Electrodes with no anatomy row or an out-of-vocab label get a zero row +
     ``valid=False`` in place under ``unmapped_policy="zero"`` (no re-pack). The
     result is memoized per ``(bt_root, subject_id, parcel_labels, policy,
-    label_column, exclude_single_electrode_parcels)``; callers must not mutate
-    the returned arrays.
+    label_column, exclude_single_electrode_parcels, electrode_set)``; callers must
+    not mutate the returned arrays.
 
     ``label_column`` selects the depth-wm.csv atlas column ("DesikanKilliany" or
     "DKT"); it MUST be the partner of ``parcel_labels`` (use :func:`atlas_spec` to
@@ -660,7 +687,11 @@ def aligned_voltage_support(
     :data:`_MIN_PARCEL_VALID_FRACTION` — the S9-class silent-degradation guard.
     ``lru_cache`` does not cache exceptions, so the guard re-checks every call.
     """
-    order = voltage_electrode_order(bt_root, subject_id)
+    order = (
+        lite_voltage_order(bt_root, subject_id)
+        if electrode_set == "lite"
+        else voltage_electrode_order(bt_root, subject_id)
+    )
     anatomy = load_public_bt_anatomy(
         bt_root, int(subject_id), label_column=label_column
     )

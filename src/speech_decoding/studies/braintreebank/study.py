@@ -29,6 +29,7 @@ import mne
 import pandas as pd
 from neuralset.events import study
 
+from speech_decoding.studies.braintreebank.anatomy import extra_bad_electrodes
 from speech_decoding.studies.braintreebank.loader import bt_load_raw
 from speech_decoding.studies.braintreebank.manifest import (
     BT_DEFAULT_SAMPLE_RATE_HZ,
@@ -72,6 +73,16 @@ class Wang2024Treebank(study.Study):
     # changes the per-session spec-cache key (extractor-uid + session-uid).
     session_subset: tp.Optional[tp.Tuple[tp.Tuple[int, int], ...]] = None
 
+    # Electrode montage, applied at the voltage boundary (PRE-CAR). "all"
+    # (default) keeps the full montage minus STATIC bad contacts; "lite" subsets
+    # to the Neuroprobe-Lite electrodes so the P4 eval references zero
+    # out-of-budget contacts (shaft-CAR over Lite electrodes only). Like ``mode``
+    # it lives in the per-session timeline (``iter_timelines`` + ``_cls_kwargs``),
+    # not the class uid, but unlike ``mode`` it changes timeline CONTENT — so the
+    # RAW exca cache uid (= SpecialLoader.to_json over the timeline) distinguishes
+    # full-CAR from Lite-CAR. BT-only.
+    electrode_set: tp.Literal["all", "lite"] = "all"
+
     aliases: tp.ClassVar[tuple[str, ...]] = (
         "BrainTreebank",
         "Braintreebank",
@@ -110,7 +121,7 @@ class Wang2024Treebank(study.Study):
             serialize_as_any=True, exclude_defaults=True,
         )
         for p in ("infra", "infra_timelines", "path", "name", "query", "mode",
-                  "session_subset"):
+                  "session_subset", "electrode_set"):
             kwargs.pop(p, None)
         if kwargs:
             raise RuntimeError(
@@ -130,11 +141,28 @@ class Wang2024Treebank(study.Study):
                 )
             sessions = [p for p in sessions if p in subset]
         for subject_id, trial_id in sessions:
-            yield {
+            timeline: dict[str, tp.Any] = {
                 "subject": f"btbank{subject_id}",
                 "subject_id": subject_id,
                 "trial_id": trial_id,
             }
+            # Fold the montage + bad-electrode set into the per-session timeline so
+            # the RAW exca cache uid (= SpecialLoader.to_json over this dict, via
+            # _splittable_event_uid) depends on BOTH. Two guarantees: (1) full-CAR
+            # vs Lite-CAR can never collide; (2) any edit to
+            # _BT_V14_EXTRA_BAD_ELECTRODES auto-invalidates the stale raw cache —
+            # the exact class of bug behind the 2026-06-15 static-cache stale-raw
+            # trap, now closed because the cache KEY and the data LOAD both derive
+            # from this one dict. Injected CONDITIONALLY (electrode_set only when
+            # non-default, extra_bad only when non-empty) so a clean subject's
+            # existing "all" cache stays valid — absence ⟺ default/empty, read
+            # back symmetrically by _load_raw's .get(..., "all").
+            if self.electrode_set != "all":
+                timeline["electrode_set"] = self.electrode_set
+            extra_bad = sorted(extra_bad_electrodes(subject_id))
+            if extra_bad:
+                timeline["extra_bad"] = extra_bad
+            yield timeline
 
     def _load_timeline_events(self, timeline: dict[str, tp.Any]) -> pd.DataFrame:
         filepath = study.SpecialLoader(method=self._load_raw, timeline=timeline).to_json()
@@ -160,7 +188,10 @@ class Wang2024Treebank(study.Study):
             cache=False,
             coordinates_type="cortical",
         )
-        data, ch_names, sfreq = bt_load_raw(bt, trial_id=trial_id, subject_id=subject_id)
+        data, ch_names, sfreq = bt_load_raw(
+            bt, trial_id=trial_id, subject_id=subject_id,
+            electrode_set=timeline.get("electrode_set", "all"),
+        )
         info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="seeg")
         return mne.io.RawArray(data, info, verbose=False)
 

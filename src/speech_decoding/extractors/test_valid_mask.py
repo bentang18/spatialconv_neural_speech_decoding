@@ -185,10 +185,12 @@ def test_electrode_set_defaults_to_all(tmp_path: Path) -> None:
     assert out[0].item() is True
 
 
-def test_electrode_set_lite_subsets_in_place(tmp_path: Path, monkeypatch) -> None:
-    """``electrode_set='lite'`` ANDs in the vendored Lite set, preserving row
-    alignment: a non-Lite electrode flips True->False at its true voltage index,
-    Lite electrodes after it stay True (no re-pack)."""
+def test_electrode_set_lite_aligns_to_lite_montage(tmp_path: Path, monkeypatch) -> None:
+    """``electrode_set='lite'`` aligns the mask to the PRE-CAR Lite montage
+    (``lite_voltage_order``), NOT a pool-side AND-in. The loader subsets voltage
+    rows to the Lite set before CAR, so the mask has ONE row per Lite electrode
+    (packed, in voltage order): non-Lite electrodes are GONE (not False-in-place).
+    Every parcel-mapped Lite row is valid."""
     import speech_decoding.studies.braintreebank._neuroprobe_lite_tables as lt
 
     _write_bt(
@@ -208,12 +210,15 @@ def test_electrode_set_lite_subsets_in_place(tmp_path: Path, monkeypatch) -> Non
         event_types="Ieeg", bt_root=str(tmp_path), c_max=8, electrode_set="lite",
     ).get_static(SimpleNamespace(subject="2"))  # type: ignore[arg-type]
 
-    assert out.tolist() == [True, False, True, False, False, False, False, False]
+    # Lite montage = [E1, E3] (packed, voltage order); both mapped -> valid.
+    # E2/E4 are not rows at all (dropped pre-CAR). Rows 2.. are pad-False.
+    assert out.tolist() == [True, True, False, False, False, False, False, False]
 
 
 def test_electrode_set_lite_unmapped_stays_false(tmp_path: Path, monkeypatch) -> None:
-    """A Lite-listed electrode that is unmapped (no parcel) stays False — the Lite
-    mask only ever removes, never resurrects an invalid slot."""
+    """An unmapped (no parcel) electrode IN the Lite montage occupies its row but
+    is False — the Lite subset only removes non-Lite electrodes, it never
+    resurrects an invalid slot."""
     import speech_decoding.studies.braintreebank._neuroprobe_lite_tables as lt
 
     _write_bt(
@@ -225,7 +230,7 @@ def test_electrode_set_lite_unmapped_stays_false(tmp_path: Path, monkeypatch) ->
             ("E3", "ctx-rh-bankssts"),
         ],
     )
-    # Lite lists E2 (unmapped) and E3 (mapped); E1 dropped by Lite.
+    # Lite lists E2 (unmapped) and E3 (mapped); E1 dropped by Lite (non-Lite).
     monkeypatch.setattr(lt, "NEUROPROBE_LITE_ELECTRODES", {"btbank2": ["E2", "E3"]})
 
     out = ElectrodeValidMask(
@@ -233,8 +238,9 @@ def test_electrode_set_lite_unmapped_stays_false(tmp_path: Path, monkeypatch) ->
         unmapped_policy="zero",
     ).get_static(SimpleNamespace(subject="2"))  # type: ignore[arg-type]
 
-    # E1: mapped but not Lite -> False; E2: Lite but unmapped -> False; E3: both -> True.
-    assert out.tolist() == [False, False, True, False, False, False]
+    # Lite montage = [E2, E3] (E1 dropped pre-CAR). Row0 E2 unmapped -> False;
+    # row1 E3 mapped -> True. Rows 2.. pad-False.
+    assert out.tolist() == [False, True, False, False, False, False]
 
 
 def test_electrode_set_lite_cache_uid_distinct_from_all(tmp_path: Path) -> None:

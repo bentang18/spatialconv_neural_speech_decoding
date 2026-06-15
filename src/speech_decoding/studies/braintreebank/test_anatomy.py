@@ -509,6 +509,41 @@ def test_lite_voltage_mask_aligns_and_subsets(subject_id: int) -> None:
     assert len(realized) == len(set(realized))  # no dupes
 
 
+@pytest.mark.parametrize("subject_id", _VENDORED_SUBJECTS)
+def test_aligned_voltage_support_lite_equals_all_restricted_to_lite_rows(
+    subject_id: int,
+) -> None:
+    """``aligned_voltage_support(electrode_set="lite")`` aligns support + valid to
+    ``lite_voltage_order`` — exactly the "all" support/valid restricted to the
+    Lite rows (per-row parcel one-hot is montage-independent). This is the
+    load-bearing invariant: support[c] / valid[c] / electrode_tokens[c] all
+    describe the same Lite electrode (Lite voltage row c), so the pre-CAR Lite
+    loader subset stays row-for-row aligned with the Lite support extractor."""
+    _require_vendored(subject_id)
+
+    full_order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    lite_order = lite_voltage_order(str(_BT_CACHE), subject_id)
+    mask = lite_voltage_mask(str(_BT_CACHE), subject_id)
+
+    all_sup = aligned_voltage_support(
+        str(_BT_CACHE), subject_id, unmapped_policy="zero"
+    )
+    lite_sup = aligned_voltage_support(
+        str(_BT_CACHE), subject_id, unmapped_policy="zero", electrode_set="lite"
+    )
+
+    # Row count == Lite montage size; the masked full montage selects the same rows.
+    assert lite_sup.support.shape[0] == len(lite_order)
+    assert lite_sup.valid.shape[0] == len(lite_order)
+    assert mask.sum() == len(lite_order)
+    np.testing.assert_array_equal(lite_sup.support, all_sup.support[mask])
+    np.testing.assert_array_equal(lite_sup.valid, all_sup.valid[mask])
+    # Sanity: the Lite montage is a strict ordered subsequence of the full
+    # montage (same order, not just same set — stronger than the support/valid
+    # equality, which collapses same-parcel rows).
+    assert list(lite_order) == [e for e, keep in zip(full_order, mask) if keep]
+
+
 def test_vendored_lite_table_matches_upstream() -> None:
     """L2 (drift guard): the vendored ``NEUROPROBE_LITE_ELECTRODES`` must equal
     the pinned upstream ``neuroprobe.config.NEUROPROBE_LITE_ELECTRODES`` exactly.

@@ -110,3 +110,84 @@ def test_wang2024treebank_emits_ieeg_special_loader_without_reading_raw(
     assert loader["cls"] == "Wang2024Treebank"
     assert loader["method"] == "_load_raw"
     assert loader["timeline"] == {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
+
+
+# --- electrode_set / extra_bad folded into the RAW exca cache uid -------------
+#
+# The per-session timeline IS the SpecialLoader payload, and the raw exca cache
+# uid = _splittable_event_uid() over study_relative_path() == that JSON. So
+# anything injected into the timeline distinguishes the cache (full-CAR vs
+# Lite-CAR) AND auto-invalidates it on a bad-electrode edit — and because the
+# cache KEY and the data LOAD both read the SAME dict, they can never disagree
+# (the 2026-06-15 static-cache stale-raw trap, structurally closed). Injection
+# is CONDITIONAL so a clean subject's existing "all" cache stays byte-valid.
+
+
+def test_iter_timelines_injects_electrode_set_and_extra_bad_conditionally(
+    tmp_path,
+) -> None:
+    from speech_decoding.studies.braintreebank.anatomy import extra_bad_electrodes
+
+    all_tls = list(Wang2024Treebank(path=tmp_path, mode="lite").iter_timelines())
+    lite_tls = list(
+        Wang2024Treebank(path=tmp_path, mode="lite", electrode_set="lite").iter_timelines()
+    )
+
+    # electrode_set: absent under the "all" default (keeps the existing cache
+    # valid); present on every "lite" timeline.
+    assert all("electrode_set" not in tl for tl in all_tls)
+    assert all(tl.get("electrode_set") == "lite" for tl in lite_tls)
+
+    # extra_bad: present (sorted list) iff the subject has STATIC bad contacts,
+    # absent otherwise — same conditional under both montages.
+    for tl in all_tls + lite_tls:
+        bad = sorted(extra_bad_electrodes(tl["subject_id"]))
+        if bad:
+            assert tl["extra_bad"] == bad
+        else:
+            assert "extra_bad" not in tl
+
+
+def test_lite_special_loader_uid_differs_from_all(monkeypatch, tmp_path) -> None:
+    """full-CAR and Lite-CAR can never collide in the raw exca cache: the
+    SpecialLoader filepath (= the per-item cache uid) embeds the timeline, so
+    electrode_set='lite' yields a distinct key for the same session."""
+    monkeypatch.setattr(
+        Wang2024Treebank, "_trial_duration_seconds", lambda self, tl: 10.0
+    )
+
+    def first_filepath(electrode_set: str) -> str:
+        study = Wang2024Treebank(path=tmp_path, mode="lite", electrode_set=electrode_set)
+        tl = next(iter(study.iter_timelines()))
+        return study._load_timeline_events(tl).iloc[0]["filepath"]
+
+    all_uid = first_filepath("all")
+    lite_uid = first_filepath("lite")
+    assert all_uid != lite_uid
+    assert "electrode_set" not in ujson.loads(all_uid)["timeline"]
+    assert ujson.loads(lite_uid)["timeline"]["electrode_set"] == "lite"
+
+
+def test_extra_bad_edit_changes_special_loader_uid(monkeypatch, tmp_path) -> None:
+    """Editing the STATIC bad-electrode set auto-invalidates the raw cache: the
+    per-item SpecialLoader uid changes when extra_bad changes (closes the
+    2026-06-15 stale-raw-cache trap — KEY and LOAD share one timeline dict)."""
+    import speech_decoding.studies.braintreebank.study as study_mod
+
+    monkeypatch.setattr(
+        Wang2024Treebank, "_trial_duration_seconds", lambda self, tl: 10.0
+    )
+
+    def first_filepath(bad: set[str]) -> str:
+        monkeypatch.setattr(
+            study_mod, "extra_bad_electrodes", lambda subject_id: frozenset(bad)
+        )
+        study = Wang2024Treebank(path=tmp_path, mode="lite")
+        tl = next(iter(study.iter_timelines()))
+        return study._load_timeline_events(tl).iloc[0]["filepath"]
+
+    clean = first_filepath(set())
+    with_bad = first_filepath({"E9"})
+    assert clean != with_bad
+    assert "extra_bad" not in ujson.loads(clean)["timeline"]
+    assert ujson.loads(with_bad)["timeline"]["extra_bad"] == ["E9"]

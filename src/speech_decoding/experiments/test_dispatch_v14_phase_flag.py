@@ -181,7 +181,9 @@ def _p4_word_events(tmp_path, **kw):
     from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
 
     xp = build_v14_experiment(
-        bt_root=str(tmp_path), mode="lite", phase4_frozen_probe=True, **kw
+        bt_root=str(tmp_path), mode="lite", phase4_frozen_probe=True,
+        electrode_set="lite",  # P4 eval is always-lite (Neuroprobe-Lite cell)
+        **kw,
     )
     return xp.data.study.steps[1]
 
@@ -811,6 +813,7 @@ def test_bad_window_dir_ssl_only_gate(tmp_path) -> None:
 
     p4 = build_v14_experiment(
         bt_root=str(tmp_path), mode="lite", phase4_frozen_probe=True,
+        electrode_set="lite",  # P4 eval is always-lite (Neuroprobe-Lite cell)
         bad_window_dir="/w/bad",
     )
     assert p4.data.bad_window_dir is None

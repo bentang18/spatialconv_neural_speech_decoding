@@ -113,6 +113,66 @@ def test_bt_load_raw_rejects_non_2d_voltage() -> None:
         bt_load_raw(fake, trial_id=1, subject_id=1)
 
 
+# --- PRE-CAR Lite montage subset (electrode_set="lite") ----------------------
+
+
+def test_bt_load_raw_lite_subsets_to_lite_montage(monkeypatch) -> None:
+    """electrode_set="lite" applies the Neuroprobe-Lite subset at the voltage
+    boundary (PRE-CAR), order-preserving, so a Lite result references zero
+    out-of-budget contacts and the rows == lite_voltage_order (row-aligned with
+    the Lite support / valid_mask)."""
+    import speech_decoding.studies.braintreebank.loader as loader_mod
+
+    monkeypatch.setattr(loader_mod, "lite_electrode_set", lambda sid: frozenset({"E1", "E3"}))
+    data = np.arange(4 * 8, dtype=np.float64).reshape(4, 8)
+    fake = _FakeBT(data=data, electrode_labels=["E0", "E1", "E2", "E3"])
+
+    out, ch_names, sfreq = bt_load_raw(fake, trial_id=1, subject_id=1, electrode_set="lite")
+
+    assert ch_names == ["E1", "E3"]  # voltage order preserved, Lite subset
+    assert np.array_equal(out, data[[1, 3]].astype(np.float32))
+    assert sfreq == 2048.0
+
+
+def test_bt_load_raw_lite_composes_after_static_drop(monkeypatch) -> None:
+    """STATIC drop runs first, then the Lite subset over the survivors. A Lite
+    electrode that is also STATIC-bad is still dropped (STATIC wins), and the
+    composed order stays a subsequence of voltage_electrode_order — keeping the
+    front-end voltage rows in lockstep with lite_voltage_order."""
+    import speech_decoding.studies.braintreebank.loader as loader_mod
+
+    monkeypatch.setattr(loader_mod, "extra_bad_electrodes", lambda sid: frozenset({"E1"}))
+    monkeypatch.setattr(
+        loader_mod, "lite_electrode_set", lambda sid: frozenset({"E1", "E2", "E3"})
+    )
+    data = np.arange(4 * 8, dtype=np.float64).reshape(4, 8)
+    fake = _FakeBT(data=data, electrode_labels=["E0", "E1", "E2", "E3"])
+
+    out, ch_names, _ = bt_load_raw(fake, trial_id=1, subject_id=2, electrode_set="lite")
+
+    # E1 dropped by STATIC even though it is in the Lite set; E2, E3 survive both.
+    assert ch_names == ["E2", "E3"]
+    assert np.array_equal(out, data[[2, 3]].astype(np.float32))
+
+
+def test_bt_load_raw_all_is_byte_identical_default(monkeypatch) -> None:
+    """electrode_set defaults to "all" and never invokes the Lite subset — the
+    BT-FULL pretrain path is unchanged (its existing cache stays valid)."""
+    import speech_decoding.studies.braintreebank.loader as loader_mod
+
+    def _boom(sid):  # pragma: no cover - must never be called under "all"
+        raise AssertionError("lite_electrode_set called on the 'all' montage")
+
+    monkeypatch.setattr(loader_mod, "lite_electrode_set", _boom)
+    data = np.arange(4 * 8, dtype=np.float64).reshape(4, 8)
+    fake = _FakeBT(data=data, electrode_labels=["E0", "E1", "E2", "E3"])
+
+    out, ch_names, _ = bt_load_raw(fake, trial_id=1, subject_id=1)
+
+    assert ch_names == ["E0", "E1", "E2", "E3"]
+    assert np.array_equal(out, data.astype(np.float32))
+
+
 # --- WS-D1: `*`/`#` mark -> singleton shaft -> shaft-CAR zeroing regression ---
 
 

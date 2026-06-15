@@ -1563,6 +1563,48 @@ def test_single_subject_scatter_is_byte_identical_to_base() -> None:
     assert max(view._channels.values()) + 1 == len(o1)
 
 
+def test_c_max_pins_scatter_width_for_cold_fit() -> None:
+    """Cold-fit guard (2026-06-15): when ``c_max`` is set, the scatter width is
+    pinned to ``c_max`` even if ``_channels`` has only seen a SHORTER session
+    before a fit runs — so a stat/spec scatter never indexes out of bounds and
+    all three scatter sites (two fit-side + the vendored apply neuro.py:455, which
+    all read ``max(_channels)+1``) agree. Without the pin, a 200-channel session's
+    stat scatter against a ``_channels`` populated by a 5-channel probe would size
+    ``c_global=5`` and crash (``global_*[idx]`` out of bounds)."""
+    from speech_decoding.extractors.normalize import SessionRobustZNormalizer
+
+    view = _make_multi_stft_view(channel_order="original", c_max=256)
+    # Cold ordering: only a short 5-channel session has populated _channels.
+    view._update_channels([f"E{i}" for i in range(5)])
+    assert max(view._channels.values()) + 1 == 256  # pinned to c_max, not 5
+
+    n = 200
+    sess = [f"L{i}" for i in range(n)]
+    norm = SessionRobustZNormalizer()
+    norm.median = torch.arange(n, dtype=torch.float32).reshape(n, 1, 1).clone()
+    norm.sigma = torch.ones(n, 1, 1)
+    view._scatter_stats_to_global(norm, sess)  # must not raise
+    assert norm.median.shape[0] == 256
+    np.testing.assert_array_equal(
+        norm.median[:n, 0, 0].numpy(), np.arange(n, dtype=np.float32)
+    )
+    # No-source rows carry σ=0 → transform zeros them (no 0/0 NaN at apply).
+    assert float(norm.sigma[n:].abs().sum()) == 0.0
+
+    # The spec scatter lands at the SAME c_max width (matches stats + apply).
+    spec = (
+        torch.arange(n, dtype=torch.float32)
+        .reshape(n, 1, 1)
+        .expand(n, 2, 3)
+        .contiguous()
+    )
+    out = view._scatter_spec_to_global(spec, sess)
+    assert out.shape[0] == 256
+    np.testing.assert_array_equal(
+        out[:n, 0, 0].numpy(), np.arange(n, dtype=np.float32)
+    )
+
+
 @pytest.mark.must_pass_before_dispatch
 def test_spec_cache_stores_session_order_not_global_order(tmp_path, monkeypatch) -> None:
     """L7 cache-key row-identity audit (open Q5). The #80 whole-movie spec cache
@@ -1602,10 +1644,16 @@ def test_spec_cache_stores_session_order_not_global_order(tmp_path, monkeypatch)
     # (4) order-transparency: re-scattering the cached session frames depends only
     # on the LIVE _channels (via _get_channels), placing this session's rows at its
     # own per-subject voltage positions [0,3) and zero-padding the rest — nothing
-    # global is baked into the cache.
+    # global is baked into the cache (proven by (1)-(3): the .npy/.stats hold 3
+    # session rows). With c_max set, the live scatter width is pinned to c_max
+    # (cold-fit fix 2026-06-15: all three scatter sites + the vendored apply path
+    # agree on max(_channels)+1 == c_max, independent of arrival order); the FINAL
+    # clip is c_max-padded regardless, so this is output-identical to the old
+    # C_session scatter-then-pad.
     scattered = view._scatter_spec_to_global(torch.from_numpy(frames), ch)
-    assert scattered.shape[0] == max(view._channels.values()) + 1 == 3
-    np.testing.assert_array_equal(scattered.numpy(), frames)
+    assert scattered.shape[0] == max(view._channels.values()) + 1 == view.c_max
+    np.testing.assert_array_equal(scattered[: len(ch)].numpy(), frames)
+    assert float(np.abs(scattered[len(ch):].numpy()).sum()) == 0.0  # rest zero-pad
 
 
 @pytest.mark.must_pass_before_dispatch

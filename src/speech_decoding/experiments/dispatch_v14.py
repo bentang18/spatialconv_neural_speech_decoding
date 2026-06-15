@@ -328,7 +328,7 @@ def _assert_support_valid_config_agree(
     See reports/bt_alignment/electrode_desync_damage_2026_06_09.md (DP9)."""
     shared = (
         "parcel_labels", "label_column", "exclude_single_electrode_parcels",
-        "unmapped_policy", "c_max", "bt_root", "event_types",
+        "unmapped_policy", "c_max", "bt_root", "event_types", "electrode_set",
     )
     mismatched = {
         field: (getattr(dk_extractor, field), getattr(valid_mask_extractor, field))
@@ -550,14 +550,17 @@ def build_v14_experiment(
     # a fresh STFT cache and is a recipe-amendment (HB02 re-cost). When a custom
     # ``electrode_tokens_extractor`` is supplied its c_max must match this value.
     c_max: int = DEFAULT_C_MAX,
-    # Electrode subset fed to the per-parcel pool. "all" (default) keeps every
-    # parcel-mapped voltage electrode — BT-FULL pretraining. "lite" ANDs the
-    # ElectrodeValidMask down to the Neuroprobe-Lite electrode set, so non-Lite
-    # electrodes are dropped from the pool (drop_electrode = ~valid_mask). The
-    # chain pins the P4 eval phase to "lite" (leaderboard parity = same Lite
-    # electrode count) while the SSL phases stay "all"; --electrode-set overrides
-    # for a standalone build. Distinct exca cache-uid only when "lite" (the
-    # default serialises unchanged → existing valid_mask cache reused). BT-only.
+    # Electrode MONTAGE (applied PRE-CAR, threaded study→loader + support +
+    # valid_mask in lockstep). "all" (default) keeps the full montage minus STATIC
+    # bad contacts — BT-FULL pretraining. "lite" subsets to the Neuroprobe-Lite
+    # electrodes IN THE LOADER, before shaft-CAR, so the Lite result references
+    # zero out-of-budget contacts (CAR over Lite electrodes only → reproducible
+    # from the Lite budget; the honest leaderboard cell). This is NOT the old
+    # pool-side ~valid_mask drop — the montage itself is Lite. The chain pins the
+    # P4 eval phase to "lite" (enforced by the phase4_frozen_probe guard above)
+    # while the SSL phases stay "all"; --electrode-set overrides a standalone
+    # build. Distinct exca cache-uid when "lite" (timeline carries electrode_set +
+    # the loader/support/valid_mask align to lite_voltage_order). BT-only.
     electrode_set: tp.Literal["all", "lite"] = "all",
     # Parcellation atlas. "dk" (default) = FreeSurfer Desikan-Killiany, K=80;
     # "dkt" = Desikan-Killiany-Tourville, K=74 (native depth-wm.csv DKT column,
@@ -1428,10 +1431,24 @@ def build_v14_experiment(
             f"[cache-only] session-index {cache_session_index} → "
             f"({s_id}, {t_id}) (of {len(corpus_sessions)} in mode={study_mode!r})"
         )
+    # Eval-always-lite invariant (Ben 2026-06-15): the P4 frozen-probe IS the
+    # Neuroprobe-Lite leaderboard cell, so it MUST run the Lite montage — the Lite
+    # subset is applied PRE-CAR (loader), so shaft-CAR references Lite electrodes
+    # ONLY and the result depends on zero out-of-budget info (reproducible from the
+    # Lite budget). The chain pins electrode_set="lite" for P4 and "all" for SSL;
+    # --electrode-set auto resolves identically. Fail loud if a non-Lite montage
+    # ever routes into eval.
+    if phase4_frozen_probe and electrode_set != "lite":
+        raise ValueError(
+            "P4 frozen-probe eval must run electrode_set='lite' (Neuroprobe-Lite "
+            f"parity + reproducibility), got {electrode_set!r}. The eval cell may "
+            "never reference out-of-budget electrodes."
+        )
     study = Wang2024Treebank(
         path=Path(bt_root), mode=study_mode,
         infra_timelines={"cluster": None},
         session_subset=session_subset,
+        electrode_set=electrode_set,
     )
     # Class-balance only the P4 eval (Neuroprobe parity). SSL phases
     # (pretrain/p3_distill) are label-free → keep EVERY word + nonverbal anchor
@@ -1459,6 +1476,7 @@ def build_v14_experiment(
         c_max=c_max,
         parcel_labels=atlas_parcel_labels, label_column=atlas_label_column,
         exclude_single_electrode_parcels=exclude_single_electrode_parcels,
+        electrode_set=electrode_set,
     )
     _apply_extractor_cache(dk_extractor, "dk_support", extractor_cache_folder)
     valid_mask_extractor = ElectrodeValidMask(

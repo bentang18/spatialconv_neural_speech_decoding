@@ -38,25 +38,27 @@ from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_BT_LABEL_COLUMN,
     V14_DK_PARCEL_LABELS,
     aligned_voltage_support,
-    lite_voltage_mask,
 )
 
 
 class ElectrodeValidMask(BaseStatic):
     """Per-event ``(c_max,) bool`` valid-mask aligned to the voltage electrode order.
 
-    ``electrode_set`` selects the electrode subset:
+    ``electrode_set`` selects the montage (must match the loader + DK support
+    extractor — all three rebuild over the SAME electrode order):
 
-      * ``"all"`` (default) — every parcel-mapped voltage electrode is valid.
-        Byte-identical to the pre-Lite extractor; exca cache-uid unchanged.
-      * ``"lite"`` — additionally AND in the Neuroprobe-Lite electrode set
-        (``lite_voltage_mask``), flipping non-Lite electrodes to ``valid=False``.
-        The encoder's per-parcel pool then excludes them entirely (``drop_electrode
-        = ~valid_mask`` → ``NEG_INF_MASK_VALUE`` cross-attn bias → exact-zero
-        weight; ``v14_encoder.py`` forward). This reproduces upstream's Lite
-        electrode subset as a *set* (the pool is permutation-invariant within a
-        parcel), so P4 eval runs at 100% electrode parity with the Neuroprobe
-        Lite leaderboard. BT-only — raises ``KeyError`` on a non-BT subject.
+      * ``"all"`` (default) — every parcel-mapped voltage electrode is valid,
+        aligned to ``voltage_electrode_order``. Byte-identical to the pre-Lite
+        extractor; exca cache-uid unchanged.
+      * ``"lite"`` — the mask is aligned to the **Neuroprobe-Lite montage**
+        (``lite_voltage_order``), one row per Lite electrode. The Lite subset is
+        applied PRE-CAR in the loader (``bt_load_raw(electrode_set="lite")``), so
+        here it is NOT a pool-side AND-in — the montage already IS Lite, and every
+        parcel-mapped Lite row is simply valid. ``support[c]`` / ``valid[c]`` /
+        ``electrode_tokens[c]`` all describe the same Lite electrode, so P4 eval
+        runs at 100% electrode parity with the Neuroprobe Lite leaderboard while
+        referencing zero out-of-budget contacts (shaft-CAR over Lite electrodes
+        only). BT-only — raises ``KeyError`` on a non-BT subject.
     """
 
     event_types: tp.Literal["Ieeg"] = "Ieeg"
@@ -89,6 +91,7 @@ class ElectrodeValidMask(BaseStatic):
                 unmapped_policy=self.unmapped_policy,
                 label_column=self.label_column,
                 exclude_single_electrode_parcels=self.exclude_single_electrode_parcels,
+                electrode_set=self.electrode_set,
             ).valid
         )
         n_voltage = int(valid.shape[0])
@@ -96,17 +99,6 @@ class ElectrodeValidMask(BaseStatic):
             raise ValueError(
                 f"subject {subject_id} has {n_voltage} electrodes which exceeds c_max={self.c_max}"
             )
-
-        if self.electrode_set == "lite":
-            # AND in the Neuroprobe-Lite subset. ``lite_voltage_mask`` is over the
-            # SAME voltage electrode order as ``valid`` (both from
-            # ``voltage_electrode_order``), so the row alignment that
-            # ``effective_support = support * valid_mask`` relies on is preserved.
-            # A non-Lite electrode flips True→False; a Lite-but-unmapped electrode
-            # stays False. ``&`` builds a new tensor — the lru_cached ``valid``
-            # array is never mutated.
-            lite = torch.from_numpy(lite_voltage_mask(self.bt_root, subject_id))
-            valid = valid & lite
 
         mask = torch.zeros(self.c_max, dtype=torch.bool)
         mask[:n_voltage] = valid

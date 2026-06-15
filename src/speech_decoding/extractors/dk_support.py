@@ -60,6 +60,12 @@ class V14DKHardSupportExtractor(BaseStatic):
     # extractor (enforced by ``_assert_support_valid_config_agree``).
     exclude_single_electrode_parcels: bool = False
     c_max: int | None = None
+    # Montage selector — must match the loader (study.electrode_set) and the
+    # valid-mask extractor (enforced by ``_assert_support_valid_config_agree``).
+    # "lite" aligns support to ``lite_voltage_order`` so row ``c`` of support
+    # describes the same Lite electrode as Lite voltage row ``c``. As a pydantic
+    # field it is part of the extractor uid → a distinct exca cache for "lite".
+    electrode_set: tp.Literal["all", "lite"] = "all"
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
@@ -76,6 +82,7 @@ class V14DKHardSupportExtractor(BaseStatic):
                 unmapped_policy=self.unmapped_policy,
                 label_column=self.label_column,
                 exclude_single_electrode_parcels=self.exclude_single_electrode_parcels,
+                electrode_set=self.electrode_set,
             ).support
         )
         if self.c_max is not None:

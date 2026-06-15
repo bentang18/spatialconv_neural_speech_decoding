@@ -1166,8 +1166,30 @@ class MultiStftView(CARIeegExtractor):
         session's tail name could otherwise shrink the count below that session's
         own length and make the per-session ``range(len(ch_names))`` scatter index
         out of bounds. Single-subject behaviour is unchanged (one session →
-        ``{0:0, …, n-1:n-1}`` → ``max+1 == n``, exactly the base count)."""
-        for i in range(len(ch_names)):
+        ``{0:0, …, n-1:n-1}`` → ``max+1 == n``, exactly the base count).
+
+        Cold-fit width pin (2026-06-15): the global row count
+        ``max(_channels)+1`` must agree across ALL THREE scatter sites — the two
+        fit-side scatters here AND the vendored apply-path scatter (neuro.py:455),
+        which we cannot edit. The base ``prepare`` accumulates ``_channels`` over
+        every session BEFORE the shape-probe, so a single pooled prepare sizes the
+        count to the longest session. But when a robust-z stat scatter is reached
+        before the accumulation pass has seen a session that long — a reused view
+        instance across per-split builds, or a fit ordered ahead of a longer
+        session — ``c_global`` is too small and ``global_*[idx] = session_*``
+        indexes out of bounds (the cold-fit crash). When ``c_max`` is set (always,
+        on the live pipeline: 256 BT / 384 joint, and ``c_max`` already bounds
+        every session's electrode count from above), span ``_channels`` to ``c_max``
+        so all three sites yield ``c_max`` deterministically, independent of
+        session-arrival order. Output-preserving: the apply path already pads each
+        clip to ``c_max`` (``_finalize_clip``), and the extra global rows carry
+        σ=0 stats → ``SessionRobustZNormalizer.transform`` zeros them (same as the
+        no-source rows the longest-session count already produced). ``c_max=None``
+        (synthetic/smoke) keeps the exact prior behaviour."""
+        n_rows = len(ch_names)
+        if self.c_max is not None:
+            n_rows = max(n_rows, self.c_max)
+        for i in range(n_rows):
             self._channels[i] = i  # type: ignore[index]
 
     def _get_channels(self, ch_names: list[str]) -> list[int]:  # type: ignore[override]

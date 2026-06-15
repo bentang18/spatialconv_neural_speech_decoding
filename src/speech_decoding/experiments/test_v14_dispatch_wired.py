@@ -310,7 +310,10 @@ def test_b36_neural_lag_rejected_on_frozen_probe_p4_path(tmp_path, monkeypatch) 
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     with pytest.raises(ValueError, match=r"frozen-probe path"):
         dispatch_v14.build_v14_experiment(
+            # P4 eval is always-lite (the leaderboard cell); pass it so we reach
+            # the neural-lag guard rather than the eval-always-lite guard.
             mode="nano", phase4_frozen_probe=True, neural_lag_s=0.15,
+            electrode_set="lite",
         )
 
 
@@ -320,9 +323,35 @@ def test_b36_frozen_probe_p4_accepts_zero_lag(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
     xp = dispatch_v14.build_v14_experiment(
         mode="nano", phase4_frozen_probe=True, neural_lag_s=0.0, clip_len=1.0,
+        electrode_set="lite",  # P4 eval is always-lite (the leaderboard cell)
     )
     assert xp.data.segmenter.start == 0.0
     assert xp.data.segmenter.duration == 1.0
+
+
+def test_p4_frozen_probe_rejects_non_lite_montage(tmp_path, monkeypatch) -> None:
+    """Eval-always-lite invariant (Ben 2026-06-15): the P4 frozen-probe IS the
+    Neuroprobe-Lite leaderboard cell, so building it with electrode_set != "lite"
+    must fail loud — a full-montage eval CARs Lite contacts against out-of-budget
+    shaft-mates, making the result non-reproducible from the Lite budget."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    with pytest.raises(ValueError, match=r"must run electrode_set='lite'"):
+        dispatch_v14.build_v14_experiment(
+            mode="nano", phase4_frozen_probe=True, neural_lag_s=0.0, clip_len=1.0,
+            electrode_set="all",
+        )
+
+
+def test_ssl_path_accepts_all_montage(tmp_path, monkeypatch) -> None:
+    """The SSL (pretrain) path runs the full BT montage — electrode_set="all" is
+    NOT gated when phase4_frozen_probe is False (the eval-always-lite guard fires
+    on the eval path only)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", joint_phase=True, electrode_set="all",
+    )
+    # chain = ns.Chain(steps=[study, word_events]); the Wang study is steps[0].
+    assert xp.data.study.steps[0].electrode_set == "all"
 
 
 def test_b36_neural_lag_cli_arg_parses() -> None:

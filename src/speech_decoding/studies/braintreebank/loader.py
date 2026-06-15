@@ -27,6 +27,7 @@ from scipy.signal import resample_poly
 from speech_decoding.studies.braintreebank.anatomy import (
     clean_bt_electrode_label,
     extra_bad_electrodes,
+    lite_electrode_set,
 )
 from speech_decoding.studies.braintreebank.manifest import (
     BT_DEFAULT_SAMPLE_RATE_HZ,
@@ -48,6 +49,7 @@ def bt_load_raw(
     trial_id: int,
     *,
     subject_id: int,
+    electrode_set: tp.Literal["all", "lite"] = "all",
 ) -> tuple[np.ndarray, list[str], float]:
     """Pull `(data, ch_names, sfreq)` from a `BrainTreebankSubject`-shaped object,
     resampled to `BT_DEFAULT_SAMPLE_RATE_HZ` when the subject's native rate differs.
@@ -55,6 +57,17 @@ def bt_load_raw(
     `subject_id` selects the native rate from `BT_SUBJECT_NATIVE_RATE_HZ`. It is a
     required keyword (no silent default) so a non-2048 subject can never slip
     through un-resampled — the exact failure that left S9 2× time-stretched.
+
+    `electrode_set` selects the montage, applied at the voltage boundary BEFORE
+    re-reference so shaft-CAR (in the front-end view) operates over exactly the
+    returned rows:
+
+      * `"all"` (default) — full montage minus STATIC bad contacts (BT-FULL).
+      * `"lite"` — additionally subset to the Neuroprobe-Lite electrodes
+        (`lite_electrode_set`), so the P4 eval references zero out-of-budget
+        contacts (CAR over Lite electrodes only). The post-STATIC row order equals
+        `voltage_electrode_order`, so this name-membership filter yields exactly
+        `lite_voltage_order` → row-aligned with the Lite support / valid_mask.
     """
 
     raw_data = bt.get_all_electrode_data(trial_id)
@@ -88,6 +101,17 @@ def bt_load_raw(
         if len(keep) != len(ch_names):
             data = data[keep]
             ch_names = [ch_names[i] for i in keep]
+    # PRE-CAR Lite montage subset (P4 eval parity + reproducibility). Drop to the
+    # Neuroprobe-Lite electrodes HERE, before shaft-CAR, so the Lite result
+    # references zero out-of-budget contacts. The post-STATIC row order equals
+    # voltage_electrode_order, so this order-preserving membership filter yields
+    # exactly lite_voltage_order — keeping the front-end voltage rows in lockstep
+    # with the Lite support / valid_mask (which key off lite_voltage_order).
+    if electrode_set == "lite":
+        lite = lite_electrode_set(subject_id)
+        keep = [i for i, name in enumerate(ch_names) if name in lite]
+        data = data[keep]
+        ch_names = [ch_names[i] for i in keep]
     native_rate = bt_subject_native_rate_hz(subject_id)
     if native_rate != BT_DEFAULT_SAMPLE_RATE_HZ:
         # Polyphase-resample native → pipeline rate (S9: 1024→2048, up/down = 2/1).
