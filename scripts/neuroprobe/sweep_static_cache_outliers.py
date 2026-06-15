@@ -148,7 +148,13 @@ def main() -> int:
         npy_path = Path(f"{stem}.npy")
         stats_path = Path(f"{stem}.stats.npz")
         band = "high" if "band_high" in str(json_path) else "low"
-        key = json.loads(meta["key"]) if isinstance(meta.get("key"), str) and meta["key"].startswith("{") else {}
+        # meta["key"] = _splittable_event_uid() = "{json}_{offset}_{dur}" — NOT pure
+        # JSON (a trailing _0.000_5060.562). raw_decode parses just the JSON prefix.
+        raw = meta.get("key", "")
+        if isinstance(raw, str) and raw.startswith("{"):
+            key, _ = json.JSONDecoder().raw_decode(raw)
+        else:
+            key = {}
         tl = key.get("timeline", {}) if isinstance(key, dict) else {}
         subject_id = int(tl.get("subject_id", -1))
         trial_id = int(tl.get("trial_id", -1))
