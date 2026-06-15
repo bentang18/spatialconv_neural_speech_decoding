@@ -188,3 +188,96 @@ def test_session_robust_z_honors_valid_bin_mask() -> None:
     z = norm.transform(clip)
     assert torch.allclose(z[:, 22:], torch.zeros_like(z[:, 22:]), atol=1e-5)
     assert torch.isfinite(z[:, :22]).all()
+
+
+def test_session_robust_z_winsor_caps_transient_but_spares_signal() -> None:
+    """Winsor backstop: with ``winsor=W`` an artifact transient (numerator
+    unbounded -> huge finite z) is clamped to ±W, while in-range values pass
+    through untouched. Default (off) leaves the transient un-clamped — so the cap
+    is what bounds the SSL gradient contribution. Shares one fitted (median, σ)
+    so the only difference between the two normalizers is the cap."""
+    torch.manual_seed(7)
+    session = torch.randn(2, 4, 400)
+    fit = SessionRobustZNormalizer().fit(session)
+    med, sig = fit.median, fit.sigma  # (2,4,1)
+
+    # A clip at known signed multiples of σ above/below the median.
+    clip = med.expand(2, 4, 3).clone()
+    clip[..., 0] = (med + 5.0 * sig).squeeze(-1)
+    clip[..., 1] = (med + 5000.0 * sig).squeeze(-1)
+    clip[..., 2] = (med - 5000.0 * sig).squeeze(-1)
+
+    z_off = SessionRobustZNormalizer.from_stats(median=med, sigma=sig).transform(clip)
+    assert z_off[..., 1].abs().min() > 1000.0  # un-clamped: the artifact survives
+
+    z_w = SessionRobustZNormalizer.from_stats(
+        median=med, sigma=sig, winsor=20.0
+    ).transform(clip)
+    torch.testing.assert_close(z_w[..., 0], 5.0 * torch.ones_like(z_w[..., 0]),
+                               atol=1e-3, rtol=1e-3)  # in-range untouched
+    torch.testing.assert_close(z_w[..., 1], 20.0 * torch.ones_like(z_w[..., 1]),
+                               atol=1e-4, rtol=1e-4)  # +transient -> +W
+    torch.testing.assert_close(z_w[..., 2], -20.0 * torch.ones_like(z_w[..., 2]),
+                               atol=1e-4, rtol=1e-4)  # -transient -> -W
+    assert torch.isfinite(z_w).all()
+
+
+def test_session_robust_z_rejects_nonpositive_winsor() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="winsor"):
+        SessionRobustZNormalizer(winsor=0.0)
+    with pytest.raises(ValueError, match="winsor"):
+        SessionRobustZNormalizer(winsor=-3.0)
+
+
+def test_winsor_env_default_applied_when_arg_omitted(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """``V14_SESSION_Z_WINSOR`` activates the clamp for every normalizer built
+    WITHOUT an explicit ``winsor`` — this is how the view.py construction sites
+    (which pass no winsor) pick up the launch-time cap. An explicit arg still
+    overrides the env, and ``from_stats`` honors it too (the warm-cache path)."""
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR", "2500")
+    assert SessionRobustZNormalizer().winsor == 2500.0
+    assert SessionRobustZNormalizer.from_stats(
+        median=torch.zeros(1, 1), sigma=torch.ones(1, 1)
+    ).winsor == 2500.0
+    # explicit arg wins over the env
+    assert SessionRobustZNormalizer(winsor=20.0).winsor == 20.0
+
+
+def test_winsor_env_unset_or_blank_is_off(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """No env (or blank) → winsor stays ``None`` (clamp off), so the default build
+    is byte-identical to the pre-knob behavior."""
+    monkeypatch.delenv("V14_SESSION_Z_WINSOR", raising=False)
+    assert SessionRobustZNormalizer().winsor is None
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR", "   ")
+    assert SessionRobustZNormalizer().winsor is None
+
+
+def test_winsor_env_invalid_fails_loud(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """A typo'd cap must not silently pass as 'off' — a set-but-unparseable or
+    non-positive env value raises rather than disabling the backstop."""
+    import pytest
+
+    for bad in ("abc", "0", "-5"):
+        monkeypatch.setenv("V14_SESSION_Z_WINSOR", bad)
+        with pytest.raises(ValueError, match="V14_SESSION_Z_WINSOR"):
+            SessionRobustZNormalizer()
+
+
+def test_winsor_env_reaches_transform_clamp(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """End-to-end: with the env set, a normalizer built with no explicit winsor
+    clamps an artifact transient at read time — confirming the env value flows
+    all the way to ``transform`` (not merely stored on the object)."""
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR", "50")
+    med = torch.zeros(1, 1, 1)
+    sig = torch.ones(1, 1, 1)
+    clip = torch.tensor([[[5.0, 5000.0, -5000.0]]])  # in-range, +artifact, -artifact
+    z = SessionRobustZNormalizer.from_stats(median=med, sigma=sig).transform(clip)
+    torch.testing.assert_close(z, torch.tensor([[[5.0, 50.0, -50.0]]]))

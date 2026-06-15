@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 
@@ -9,6 +10,13 @@ import torch
 from torch.utils.data import DataLoader
 
 import neuralset as ns
+
+from speech_decoding.experiments.bad_windows import (
+    filter_events_by_bad_windows,
+    load_bad_windows,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # Warm dataset-OBJECT cache (throughput lever, env-gated by ``V14_WARM_DATASET_CACHE``).
@@ -70,6 +78,14 @@ class Data(pydantic.BaseModel):
     split_field: str = "split"
     splits: tuple[str, ...] = ("train", "val", "test")
     prepare: bool = True
+    # Layer-2 bad-electrode defense (pretrain-only): directory of per-session
+    # bad-time-window sidecars (``scripts/neuroprobe/precompute_bad_windows.py``). When
+    # set, clips whose neural window overlaps a glitch span are dropped BEFORE the
+    # segmenter, so they are never sampled. Default None = no filtering — the Phase-4
+    # eval datamodule leaves it unset so the Neuroprobe parity-locked clip sets are
+    # never altered. It removes events (rows), never electrodes, so DP4 row-alignment
+    # is untouched. Part of the warm-cache key (a different dir → a different cache).
+    bad_window_dir: str | None = None
 
     def build(self, *, worker_seed: int | None = None) -> dict[str, DataLoader]:
         """Build split DataLoaders.
@@ -93,6 +109,23 @@ class Data(pydantic.BaseModel):
                 return _DATASET_CACHE[cache_key]
 
         events = self.study.run()
+        if self.bad_window_dir is not None:
+            bad_windows = load_bad_windows(self.bad_window_dir)
+            n_before = len(events)
+            events = filter_events_by_bad_windows(
+                events,
+                bad_windows,
+                clip_start_s=float(self.segmenter.start),
+                clip_dur_s=float(self.segmenter.duration),
+            )
+            logger.info(
+                "bad-window clip filter (%s): dropped %d / %d events overlapping "
+                "%d session glitch spans",
+                self.bad_window_dir,
+                n_before - len(events),
+                n_before,
+                sum(len(v) for v in bad_windows.values()),
+            )
         dataset = self.segmenter.apply(events)
         if self.prepare:
             dataset.prepare()

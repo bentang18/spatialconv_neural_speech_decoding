@@ -191,6 +191,60 @@ v14 loader uses). Copied verbatim from the PINNED upstream
 not importable)."""
 
 
+_BT_V14_EXTRA_BAD_ELECTRODES: dict[int, tuple[str, ...]] = {
+    2: ("LT2aA2", "LT3a8"),
+    4: ("LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"),
+    7: ("LF3bOFb1",),
+    8: ("F3cIc8", "T3H12"),
+    9: ("P2e6", "P2e8"),
+}
+"""Per-subject flaky-contact electrodes v14 statically excludes ON TOP of the
+upstream corrupted / missing-coordinate / trigger drops.
+
+These contacts produce brief, intense **spectral** transients — huge finite
+``|STFT|`` robust-z (up to 1e4 σ) at isolated time-frequency bins — that spike
+the SSL gradient. They are NOT high-amplitude dead channels: their whole-session
+voltage MAD is ~subject-median, so the MNE-LOF voltage-domain guard (and any
+voltage-amplitude rule) MISSES them. The detector is the ``|STFT|`` robust-z the
+encoder actually sees, recurring above threshold across a MAJORITY of a subject's
+trials (single-trial subjects use a higher one-shot bar).
+
+Applied at BOTH electrode-order sites in lockstep so support / valid_mask stay
+row-aligned with the front-end voltage (the DP4 contract): folded into
+``voltage_electrode_order`` (support / valid_mask) AND dropped by ``bt_load_raw``
+(front-end voltage) — the latter BEFORE shaft-CAR, so a bad contact can no longer
+contaminate its shaft's CAR reference (which winsorising the cached output cannot
+undo). Labels are cleaned (``clean_bt_electrode_label``) before matching.
+
+Deliberate divergence from upstream ``BrainTreebankSubject.electrode_labels``;
+``test_voltage_order_matches_upstream`` subtracts this set so the drift guard
+still catches UNintended divergence.
+
+The 11 contacts below are the finalized list (Ben-approved 2026-06-14). Selection
+rule: an electrode is excluded iff it is separable from the clean population by
+**(a) recurrence** — pre-CAR voltage events_100/min above the clean ceiling
+(~0.14/min) in a MAJORITY of the subject's trials (single-trial subjects: the one
+trial) — **OR (b) catastrophic amplitude** — post-CAR |STFT| robust-z max above the
+clean ceiling (~2100), an event no biology reaches — **AND** the pre-CAR voltage
+robust-z breaches its floor in the same trial(s) (de-confounds CAR-halo and
+pure-spectral). The clean ceilings were measured across 25 BT sessions (voltage
+573, |STFT| 2094, events 0.14/min). sub_8 T2A13 was dropped (12→11) — below the
+clean ceiling on every axis, so the per-clip + winsor guards cover it instead.
+Populating this changes the cache key, so the cache is rebuilt (and re-scanned to
+confirm CAR-contaminated neighbors fall back to baseline)."""
+
+
+def extra_bad_electrodes(subject_id: int) -> frozenset[str]:
+    """Cleaned-label set of v14 statically-excluded flaky contacts for a subject
+    (:data:`_BT_V14_EXTRA_BAD_ELECTRODES`). THE single source both electrode-order
+    sites consult, so ``voltage_electrode_order`` (support/valid_mask) and
+    ``bt_load_raw`` (front-end voltage) drop exactly the same contacts."""
+    return frozenset(
+        clean_bt_electrode_label(e)
+        for e in _BT_V14_EXTRA_BAD_ELECTRODES.get(int(subject_id), ())
+    )
+
+
 def _is_trigger_label(electrode_label: str) -> bool:
     up = electrode_label.upper()
     return up.startswith("DC") or up.startswith("TRIG")
@@ -238,6 +292,10 @@ def voltage_electrode_order(
         clean_bt_electrode_label(e)
         for e in _BT_MISSING_COORDINATE_ELECTRODES.get(sid, ())
     )
+    # v14 flaky-contact static exclusion — kept in lockstep with bt_load_raw via
+    # the shared extra_bad_electrodes() source so support/valid_mask and the
+    # front-end voltage drop the SAME contacts (DP4 row-alignment).
+    drop.update(extra_bad_electrodes(sid))
 
     order = tuple(
         e for e in cleaned if e not in drop and not _is_trigger_label(e)

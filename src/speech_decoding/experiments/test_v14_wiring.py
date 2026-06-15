@@ -356,3 +356,71 @@ def test_v14_dispatch_dual_band_half_spec_rejected() -> None:
 # inverse assertion — that ``build_v14_experiment`` defaults to LogStftView when
 # ``electrode_tokens_extractor`` is omitted — is covered by
 # ``test_dispatch_default_wires_log_stft_view`` in that file.
+
+
+# ---------- Slice 4: bad-window clip filter wired into Data.build ---------
+
+
+class _SessionTaggedStudy(ns.Step):
+    """Stimulus events carrying the ``subject_id``/``trial_id``/``start`` columns the
+    bad-window filter keys on. 4 train + 2 val + 2 test events at 10 s spacing, all
+    session btbank2_t2 — so a single bad span can drop exactly one train clip."""
+
+    def _run(self) -> pd.DataFrame:
+        rows = []
+        splits = ["train"] * 4 + ["val"] * 2 + ["test"] * 2
+        for idx, split in enumerate(splits):
+            rows.append({
+                "type": "Stimulus",
+                "start": float(idx * 10),  # 0,10,20,30,40,50,60,70
+                "duration": 0.2,
+                "timeline": "run0",
+                "code": idx % 2,
+                "split": split,
+                "subject_id": "2",
+                "trial_id": "2",
+            })
+        return ns.events.standardize_events(pd.DataFrame(rows))
+
+
+def _session_tagged_data(bad_window_dir: str | None) -> Data:
+    return Data(
+        study=_SessionTaggedStudy(),
+        segmenter={
+            "extractors": {
+                "electrode_tokens": _ConstantTokensExtractor(),
+                "support": _ConstantSupportExtractor(),
+                "target": {
+                    "name": "EventField",
+                    "event_types": "Stimulus",
+                    "event_field": "code",
+                },
+            },
+            "trigger_query": "type == 'Stimulus'",
+            "start": 0.0,
+            "duration": 5.0,
+        },
+        batch_size=2,
+        bad_window_dir=bad_window_dir,
+    )
+
+
+def test_bad_window_dir_none_is_passthrough() -> None:
+    """Default (Phase-4 / no filter): every clip survives — the gate is off."""
+    loaders = _session_tagged_data(bad_window_dir=None).build()
+    assert len(loaders["train"].dataset) == 4
+
+
+def test_bad_window_dir_drops_overlapping_train_clips(tmp_path) -> None:
+    """With a sidecar, the clip at start=30 (window [30,35) under start=0/dur=5)
+    overlapping the bad span [32,34] is dropped; the other 3 train clips survive.
+    Confirms the segmenter's start/duration reach the overlap test through
+    Data.build, and that only rows are removed."""
+    (tmp_path / "btbank2_t2.json").write_text(
+        json.dumps({"session": "btbank2_t2", "bad_windows_s": [[32.0, 34.0]]})
+    )
+    loaders = _session_tagged_data(bad_window_dir=str(tmp_path)).build()
+    assert len(loaders["train"].dataset) == 3  # 0,10,20 survive; 30 dropped
+    # val/test untouched (their starts 40..70 miss the span)
+    assert len(loaders["val"].dataset) == 2
+    assert len(loaders["test"].dataset) == 2

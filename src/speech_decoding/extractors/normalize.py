@@ -26,6 +26,7 @@ should call until the transform is wired.
 
 from __future__ import annotations
 
+import os
 import typing as tp
 
 import torch
@@ -33,6 +34,38 @@ from pydantic import BaseModel, ConfigDict
 
 
 SCALE_TO_SIGMA: float = 1.4826  # consistency constant: σ ≈ k · MAD for Normal
+
+# Launch-time activation for the read-time winsor clamp. Set ``V14_SESSION_Z_WINSOR``
+# in the job environment to the |z| cap (e.g. ``2500``) and every
+# ``SessionRobustZNormalizer`` constructed WITHOUT an explicit ``winsor`` picks it up.
+# Deliberately an env knob, NOT a ``MultiStftView`` pydantic field: winsor is a pure
+# READ-time clamp (the cached |STFT| frames and the fitted median/σ stats are byte-
+# identical with or without it), so threading it as a config field would change
+# ``infra.uid()`` and fork the multi-TB spec cache for a value that does not alter a
+# single cached byte. Reading it here keeps the clamp cache-neutral and out of
+# ``view.py``/``dispatch_v14.py``. The launch env is recorded in the run-config ledger,
+# so the active value stays auditable.
+_WINSOR_ENV_VAR = "V14_SESSION_Z_WINSOR"
+
+
+def _winsor_from_env() -> tp.Optional[float]:
+    """Parse ``V14_SESSION_Z_WINSOR`` → positive ``float`` cap, or ``None`` when unset
+    or blank. A set-but-unparseable / non-positive value fails loud rather than
+    silently disabling the backstop (a typo'd cap must not pass as 'off')."""
+    raw = os.environ.get(_WINSOR_ENV_VAR)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_WINSOR_ENV_VAR}={raw!r} is not a float |z| cap (e.g. '2500')"
+        ) from exc
+    if not (value > 0):
+        raise ValueError(
+            f"{_WINSOR_ENV_VAR}={raw!r} must be a positive |z| cap, got {value}"
+        )
+    return value
 
 
 def robust_z(
@@ -148,8 +181,18 @@ class SessionRobustZNormalizer:
 
     _FLOAT_DTYPES = (torch.float16, torch.float32, torch.float64)
 
-    def __init__(self, *, sigma_floor: float = 1e-6) -> None:
+    def __init__(
+        self, *, sigma_floor: float = 1e-6, winsor: tp.Optional[float] = None
+    ) -> None:
         self.sigma_floor = sigma_floor
+        # An explicit ``winsor`` always wins; only fall back to the launch env when
+        # the caller passed nothing. The view.py construction sites pass no winsor,
+        # so this is where ``V14_SESSION_Z_WINSOR`` reaches the read path.
+        if winsor is None:
+            winsor = _winsor_from_env()
+        if winsor is not None and not (winsor > 0):
+            raise ValueError(f"winsor must be a positive |z| cap, got {winsor}")
+        self.winsor = winsor
         self.median: tp.Optional[torch.Tensor] = None
         self.sigma: tp.Optional[torch.Tensor] = None
         self._valid_bin_mask: tp.Optional[torch.Tensor] = None
@@ -161,15 +204,16 @@ class SessionRobustZNormalizer:
         median: torch.Tensor,
         sigma: torch.Tensor,
         sigma_floor: float = 1e-6,
+        winsor: tp.Optional[float] = None,
         valid_bin_mask: tp.Optional[torch.Tensor] = None,
     ) -> "SessionRobustZNormalizer":
         """Rebuild a fitted normalizer from already-computed ``median``/``sigma``
         (e.g. loaded from a stats cache) — skips refitting over the frames. The
         stats are a deterministic function of the frames + reduce axis, so a
         ``from_stats`` normalizer is identical to a ``fit`` one. ``sigma_floor``
-        is applied at ``transform`` (not baked into ``sigma``), so it may differ
-        from the floor used when the stats were originally fit."""
-        obj = cls(sigma_floor=sigma_floor)
+        and ``winsor`` are applied at ``transform`` (not baked into ``sigma``), so
+        they may differ from the values used when the stats were originally fit."""
+        obj = cls(sigma_floor=sigma_floor, winsor=winsor)
         obj.median = median
         obj.sigma = sigma
         obj._valid_bin_mask = valid_bin_mask
@@ -199,7 +243,17 @@ class SessionRobustZNormalizer:
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the frozen stats: ``z = (x − median) / max(σ, floor)``, with
-        constant-bin (σ < floor) and invalid-bin positions zeroed."""
+        constant-bin (σ < floor) and invalid-bin positions zeroed, and an optional
+        ``winsor`` clamp on ``|z|``.
+
+        The robust-z floors only the DENOMINATOR, so a brief intense ``|STFT|``
+        transient on a flaky contact yields a huge *finite* ``z`` (numerator
+        unbounded) that spikes the SSL gradient. Static bad-electrode exclusion
+        removes the contacts that RECUR across trials; ``winsor`` is the
+        complementary backstop for the residual single-trial transient (which the
+        recurrence rule deliberately does not exclude). Pick the cap ABOVE the
+        legitimate signal range and BELOW the artifact range; default ``None``
+        (off) so behavior is unchanged until set."""
         if self.median is None or self.sigma is None:
             raise RuntimeError(
                 "SessionRobustZNormalizer.transform called before fit()"
@@ -208,6 +262,8 @@ class SessionRobustZNormalizer:
         safe_sigma = self.sigma.clamp(min=self.sigma_floor)
         z = (x - self.median) / safe_sigma
         z = torch.where(self.sigma >= self.sigma_floor, z, torch.zeros_like(z))
+        if self.winsor is not None:
+            z = z.clamp(min=-self.winsor, max=self.winsor)
         if self._valid_bin_mask is not None:
             z = torch.where(
                 self._valid_bin_mask.to(dtype=torch.bool), z, torch.zeros_like(z),

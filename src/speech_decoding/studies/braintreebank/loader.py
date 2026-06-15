@@ -24,7 +24,10 @@ from math import gcd
 import numpy as np
 from scipy.signal import resample_poly
 
-from speech_decoding.studies.braintreebank.anatomy import clean_bt_electrode_label
+from speech_decoding.studies.braintreebank.anatomy import (
+    clean_bt_electrode_label,
+    extra_bad_electrodes,
+)
 from speech_decoding.studies.braintreebank.manifest import (
     BT_DEFAULT_SAMPLE_RATE_HZ,
     bt_subject_native_rate_hz,
@@ -73,6 +76,18 @@ def bt_load_raw(
         raise ValueError(
             f"electrode_labels len {len(ch_names)} != n_channels {data.shape[0]}"
         )
+    # v14 flaky-contact static exclusion (DP4-safe). Drop the bad contacts HERE —
+    # at the voltage boundary, BEFORE shaft-CAR in the view — so they can't
+    # contaminate their shaft's CAR reference, and so the front-end voltage rows
+    # stay in lockstep with support/valid_mask (both consult the same
+    # extra_bad_electrodes() source; voltage_electrode_order folds in the identical
+    # set). Done on axis-0 before resample; the two axes are independent.
+    extra_bad = extra_bad_electrodes(subject_id)
+    if extra_bad:
+        keep = [i for i, name in enumerate(ch_names) if name not in extra_bad]
+        if len(keep) != len(ch_names):
+            data = data[keep]
+            ch_names = [ch_names[i] for i in keep]
     native_rate = bt_subject_native_rate_hz(subject_id)
     if native_rate != BT_DEFAULT_SAMPLE_RATE_HZ:
         # Polyphase-resample native → pipeline rate (S9: 1024→2048, up/down = 2/1).

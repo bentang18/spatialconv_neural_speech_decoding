@@ -16,6 +16,7 @@ from speech_decoding.studies.braintreebank.anatomy import (
     build_hard_public_bt_label_support,
     bt_label_vocabulary,
     clean_bt_electrode_label,
+    extra_bad_electrodes,
     lite_voltage_mask,
     lite_voltage_order,
     load_public_bt_anatomy,
@@ -204,11 +205,75 @@ def _upstream_electrode_labels_or_skip(subject_id: int) -> tuple[str, ...]:
 def test_voltage_order_matches_upstream(subject_id: int) -> None:
     """Drift guard: our replicated ``voltage_electrode_order`` must equal the
     real upstream ``BrainTreebankSubject.electrode_labels`` (order + set) for
-    every vendored subject. Catches any divergence in the corrupted / trigger /
-    missing-coordinate filter copied from the pinned upstream."""
-    expected = _upstream_electrode_labels_or_skip(subject_id)
+    every vendored subject, MINUS the deliberate v14 flaky-contact exclusion
+    (``extra_bad_electrodes``). Subtracting the intentional drop keeps the guard
+    sensitive to UNintended divergence in the corrupted / trigger /
+    missing-coordinate filter while permitting the v14 static exclusion."""
+    bad = extra_bad_electrodes(subject_id)
+    expected = tuple(
+        e for e in _upstream_electrode_labels_or_skip(subject_id)
+        if clean_bt_electrode_label(e) not in bad
+    )
     actual = voltage_electrode_order(str(_BT_CACHE), subject_id)
     assert actual == expected
+
+
+_STATIC_EXCLUDED_SUBJECTS = (2, 4, 7, 8, 9)
+
+
+def test_extra_bad_electrodes_dict_is_the_locked_11() -> None:
+    """Pin the finalized Ben-approved static-exclusion list (2026-06-14) so an
+    accidental edit fails loud. The 11 contacts: their subjects, labels, and total
+    count. ``extra_bad_electrodes`` returns the cleaned set per subject and an
+    empty set for any subject not listed."""
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+
+    assert anatomy._BT_V14_EXTRA_BAD_ELECTRODES == {
+        2: ("LT2aA2", "LT3a8"),
+        4: ("LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"),
+        7: ("LF3bOFb1",),
+        8: ("F3cIc8", "T3H12"),
+        9: ("P2e6", "P2e8"),
+    }
+    total = sum(len(v) for v in anatomy._BT_V14_EXTRA_BAD_ELECTRODES.values())
+    assert total == 11
+    # the literal parametrize list below must track the dict keys
+    assert tuple(sorted(anatomy._BT_V14_EXTRA_BAD_ELECTRODES)) == _STATIC_EXCLUDED_SUBJECTS
+    assert extra_bad_electrodes(4) == frozenset(
+        {"LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"}
+    )
+    assert extra_bad_electrodes(99) == frozenset()  # unlisted subject → no drop
+
+
+@pytest.mark.must_pass_before_dispatch
+@pytest.mark.parametrize("subject_id", _STATIC_EXCLUDED_SUBJECTS)
+def test_static_excluded_contacts_are_real_and_actually_dropped(
+    subject_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TDD guard against a typo'd static-exclusion label: a label that matches no
+    real contact would drop NOTHING and silently leave the flaky electrode on the
+    encoder's input. For each listed subject, every named contact must (a) be
+    PRESENT in the real montage before the drop and (b) be ABSENT after — proving
+    the label is genuine and the exclusion bites. The post-drop order also shrinks
+    by exactly the number of named contacts (no over- or under-drop)."""
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+
+    _require_vendored(subject_id)
+    named = extra_bad_electrodes(subject_id)
+
+    # Pre-drop baseline: clear the static dict so voltage_electrode_order keeps the
+    # flaky contacts. Each named contact must appear here (else it's a typo).
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES", {})
+    full_order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    missing = named - set(full_order)
+    assert not missing, f"sub_{subject_id}: static labels not in montage: {missing}"
+
+    # Post-drop: restore the dict; assert each named contact is gone and the count
+    # dropped by exactly len(named).
+    monkeypatch.undo()
+    dropped_order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    assert named.isdisjoint(dropped_order)
+    assert len(dropped_order) == len(full_order) - len(named)
 
 
 @pytest.mark.must_pass_before_dispatch
@@ -250,6 +315,80 @@ def test_voltage_order_unique_for_all_vendored_subjects(subject_id: int) -> None
     assert len(set(order)) == len(order)
 
 
+@pytest.mark.must_pass_before_dispatch
+def test_extra_bad_electrodes_dropped_from_voltage_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v14 flaky-contact static exclusion: an electrode listed in
+    ``_BT_V14_EXTRA_BAD_ELECTRODES`` is removed from ``voltage_electrode_order``
+    (so support/valid_mask lose it), the surviving rows keep their relative order,
+    and ``extra_bad_electrodes`` returns the cleaned set. The mark (``*``) must be
+    matched after cleaning, not literally."""
+    import json
+
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+
+    d = tmp_path / "electrode_labels" / "sub_55"
+    d.mkdir(parents=True)
+    (d / "electrode_labels.json").write_text(
+        json.dumps(["LA1", "LA2*", "LA3", "LA4"])
+    )
+
+    # baseline: nothing excluded -> full cleaned order
+    assert voltage_electrode_order(str(tmp_path), 55) == ("LA1", "LA2", "LA3", "LA4")
+    assert extra_bad_electrodes(55) == frozenset()
+
+    # inject a bad contact (raw spelling; helper cleans before matching)
+    monkeypatch.setitem(anatomy._BT_V14_EXTRA_BAD_ELECTRODES, 55, ("LA2*",))
+    assert extra_bad_electrodes(55) == frozenset({"LA2"})
+    assert voltage_electrode_order(str(tmp_path), 55) == ("LA1", "LA3", "LA4")
+    # an unrelated subject is untouched
+    assert extra_bad_electrodes(56) == frozenset()
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_extra_bad_exclusion_keeps_loader_and_voltage_order_in_lockstep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DP4 lockstep: the SAME bad contact must drop from BOTH the front-end voltage
+    (``bt_load_raw``) and ``voltage_electrode_order`` (support/valid_mask), leaving
+    their channel orders byte-identical. A desync here routes voltages into the
+    wrong parcels."""
+    import json
+    from dataclasses import dataclass
+
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+    from speech_decoding.studies.braintreebank.loader import bt_load_raw
+
+    @dataclass
+    class _FakeBT:
+        data: np.ndarray
+        electrode_labels: list[str]
+
+        def get_all_electrode_data(self, trial_id: int) -> np.ndarray:
+            return self.data
+
+    labels = ["LA1", "LA2", "LA3", "LA4"]
+    d = tmp_path / "electrode_labels" / "sub_55"
+    d.mkdir(parents=True)
+    (d / "electrode_labels.json").write_text(json.dumps(labels))
+
+    # distinct per-row signal so a wrong-row drop is detectable
+    rows = np.arange(len(labels), dtype=np.float32)[:, None] * np.ones((1, 64), np.float32)
+    monkeypatch.setitem(anatomy._BT_V14_EXTRA_BAD_ELECTRODES, 55, ("LA3",))
+
+    data, ch_names, _ = bt_load_raw(
+        _FakeBT(data=rows.copy(), electrode_labels=list(labels)),
+        trial_id=1, subject_id=55,
+    )
+    order = voltage_electrode_order(str(tmp_path), 55)
+
+    assert ch_names == ["LA1", "LA2", "LA4"]
+    assert tuple(ch_names) == order  # byte-identical -> support/valid stay aligned
+    # the dropped row (LA3, value 2.0) is gone; survivors keep their values
+    np.testing.assert_array_equal(data[:, 0], np.array([0.0, 1.0, 3.0], np.float32))
+
+
 def test_aligned_voltage_support_sub4_interior_unmapped() -> None:
     """sub_4 has 2 voltage contacts (Inf-Lat-Vent) outside K=80 that sit in the
     interior of the voltage order. ``unmapped_policy='zero'`` must zero exactly
@@ -263,8 +402,11 @@ def test_aligned_voltage_support_sub4_interior_unmapped() -> None:
     )
     n_voltage = len(result.electrode_labels)
     n_mapped = int(result.valid.sum())
-    assert n_voltage == 183
-    assert n_mapped == 181  # exactly 2 unmapped
+    # 183 raw voltage contacts minus the 4 v14 flaky-contact static drops
+    # (LT2aA11, LT2bHb12, LF3cIc10, LF3aOFa16 — all previously mapped) = 179.
+    # The 2 interior-unmapped Inf-Lat-Vent contacts (LT2bHb3/4) are untouched.
+    assert n_voltage == 179
+    assert n_mapped == 177  # still exactly 2 unmapped
 
     unmapped_idx = np.flatnonzero(~result.valid)
     assert unmapped_idx.tolist() == [
