@@ -1,0 +1,185 @@
+{
+  "_schema": 1,
+  "clip_len": 10240,
+  "n_clips": 8,
+  "targets": {
+    "sub1_trial0": {
+      "ch_names_sha": "5bc306ebdd676b10f57d59ebc3789154005e7bc8",
+      "clips": [
+        {
+          "clip_sha": "7d5f2083ab95351a32228a11a168d69f749a0533",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 519389.0,
+          "onset_sample": 519389,
+          "word": "What'd"
+        },
+        {
+          "clip_sha": "0a9d78ef6932a2d85132cff3a22af9de4fd50db3",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 519673.0,
+          "onset_sample": 519673,
+          "word": "the"
+        },
+        {
+          "clip_sha": "cb65e3f03c9656eeb1963d38d4810a476eb33724",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 519823.0,
+          "onset_sample": 519823,
+          "word": "doctor"
+        },
+        {
+          "clip_sha": "ed31913e9d87a2f3e1c6340800376e7a6bee15cf",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 520472.0,
+          "onset_sample": 520472,
+          "word": "say"
+        },
+        {
+          "clip_sha": "558e05d91501142aa261b2eaaf4e60da8c3049b2",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 521410.0,
+          "onset_sample": 521410,
+          "word": "Nothing"
+        },
+        {
+          "clip_sha": "e6a0be6a9fae41775f0c4641df60eefa524c13a6",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 523400.0,
+          "onset_sample": 523400,
+          "word": "Supposedly"
+        },
+        {
+          "clip_sha": "1186de2ba1638d16cbad118b22066af1ec8bfe87",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 524540.0,
+          "onset_sample": 524540,
+          "word": "it's"
+        },
+        {
+          "clip_sha": "110f91c9ffaf1d04ed13857ac6f5bf889dfc9658",
+          "clip_shape": [
+            129,
+            10240
+          ],
+          "est_idx": 524810.0,
+          "onset_sample": 524810,
+          "word": "just"
+        }
+      ],
+      "n_ch": 129,
+      "n_samples_total": 14065377,
+      "native_rate": 2048,
+      "sfreq": 2048
+    },
+    "sub9_trial0": {
+      "ch_names_sha": "14d0d28a3f95151e793375b4110e93f150543193",
+      "clips": [
+        {
+          "clip_sha": "a6807bdf010d86cdbc9839c1c2a965c2dd208295",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 392827.0,
+          "onset_sample": 785654,
+          "word": "Stark"
+        },
+        {
+          "clip_sha": "825c924859f9dfd934609dc73348b6dd935522ec",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 394780.0,
+          "onset_sample": 789560,
+          "word": "He"
+        },
+        {
+          "clip_sha": "9cd7665deb53c1767d88c32557acbe498296c15a",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 394852.0,
+          "onset_sample": 789704,
+          "word": "doesn't"
+        },
+        {
+          "clip_sha": "d01a8739be4e417dd3285aae7787969cdfb63303",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 395018.0,
+          "onset_sample": 790036,
+          "word": "seem"
+        },
+        {
+          "clip_sha": "3e19a7aecb6dda904e782d753058a9b6d543fec0",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 395245.0,
+          "onset_sample": 790490,
+          "word": "happy"
+        },
+        {
+          "clip_sha": "75666d494b946ab99bfed61092c0ad8ddad7706e",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 396042.0,
+          "onset_sample": 792084,
+          "word": "Hello"
+        },
+        {
+          "clip_sha": "2dda073c68fd6e0e9ea2d6f988bf88775c3581b0",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 396262.0,
+          "onset_sample": 792524,
+          "word": "Hank"
+        },
+        {
+          "clip_sha": "5d39128ecc8eb735aba474bad9de69714e363527",
+          "clip_shape": [
+            94,
+            10240
+          ],
+          "est_idx": 399267.0,
+          "onset_sample": 798534,
+          "word": "you're"
+        }
+      ],
+      "n_ch": 94,
+      "n_samples_total": 14752000,
+      "native_rate": 1024,
+      "sfreq": 2048
+    }
+  }
+}
