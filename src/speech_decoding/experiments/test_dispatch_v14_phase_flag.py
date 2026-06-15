@@ -24,23 +24,26 @@ from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 
 @pytest.fixture(autouse=True)
 def _restore_v14_compile_env():
-    """main() sets a global os.environ["V14_COMPILE"] for its submitit subprocess
-    (default compile-ON). The --dry-run dispatch tests call main() in-process, so
-    without cleanup that flag leaks into later tests in the same pytest process —
-    forcing torch.compile on the numerical-correctness joint tests, which then hit
-    a cross-test torch-inductor symbolic-shape cache conflict. Snapshot + restore
-    so each dispatch test leaves the compile env exactly as it found it."""
+    """main() sets global os.environ flags for its submitit subprocess (default
+    compile-ON; --session-z-winsor sets V14_SESSION_Z_WINSOR). The --dry-run /
+    --fast-dev-run dispatch tests call main() in-process, so without cleanup those
+    flags leak into later tests in the same pytest process — V14_COMPILE forces
+    torch.compile on the numerical-correctness joint tests (cross-test inductor
+    symbolic-shape conflict); a stray V14_SESSION_Z_WINSOR silently clamps every
+    later session-robust-z read. Snapshot + restore both so each dispatch test
+    leaves the env exactly as it found it."""
     import os
 
     sentinel = object()
-    prev = os.environ.get("V14_COMPILE", sentinel)
+    saved = {k: os.environ.get(k, sentinel) for k in ("V14_COMPILE", "V14_SESSION_Z_WINSOR")}
     try:
         yield
     finally:
-        if prev is sentinel:
-            os.environ.pop("V14_COMPILE", None)
-        else:
-            os.environ["V14_COMPILE"] = prev  # type: ignore[assignment]
+        for k, prev in saved.items():
+            if prev is sentinel:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev  # type: ignore[assignment]
 
 
 # --- leakage decouple (#82): study/eval corpus-mode routing -----------------
@@ -771,6 +774,71 @@ def test_band_floor_cli_flags_default_and_parse(monkeypatch) -> None:
     assert rc2 == 0 and len(calls2) == 1
     assert calls2[0]["m2_time_band_floor"] == 4
     assert calls2[0]["m2_freq_band_floor"] == 2
+
+
+# ---------------------------------------------------------------------------
+# #180 bad-electrode defense CLI surface: --bad-window-dir (Layer-2 clip filter,
+# SSL-only) + --session-z-winsor (Layer-3 read-time cap, cache-neutral env knob).
+# ---------------------------------------------------------------------------
+
+
+def test_bad_window_dir_cli_flag_default_and_parse(monkeypatch) -> None:
+    """--bad-window-dir defaults None (no filtering) and a passed path reaches the
+    builder verbatim via _common_build_kwargs (so every phase sees it; the builder
+    self-gates it to the SSL phases — see test_bad_window_dir_ssl_only_gate)."""
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run"])
+    assert rc == 0 and len(calls) == 1
+    assert calls[0]["bad_window_dir"] is None
+
+    calls2 = _capture_builds(monkeypatch)
+    rc2 = main(["--phase", "1", "--fast-dev-run", "--bad-window-dir", "/w/bad"])
+    assert rc2 == 0 and len(calls2) == 1
+    assert calls2[0]["bad_window_dir"] == "/w/bad"
+
+
+def test_bad_window_dir_ssl_only_gate(tmp_path) -> None:
+    """The builder gates the clip filter to SSL phases: a P1 (joint) Data carries
+    the dir, a P4 (frozen probe) Data zeroes it to None so the Neuroprobe-Lite
+    parity clip set is never altered. DP4: removes rows only, never electrodes."""
+    from speech_decoding.experiments.dispatch_v14 import build_v14_experiment
+
+    p1 = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", joint_phase=True, jepa_phase="p1",
+        bad_window_dir="/w/bad",
+    )
+    assert p1.data.bad_window_dir == "/w/bad"
+
+    p4 = build_v14_experiment(
+        bt_root=str(tmp_path), mode="lite", phase4_frozen_probe=True,
+        bad_window_dir="/w/bad",
+    )
+    assert p4.data.bad_window_dir is None
+
+
+def test_session_z_winsor_cli_sets_and_clears_env(monkeypatch) -> None:
+    """--session-z-winsor is Layer-3 and cache-NEUTRAL: it must set the read-time
+    env knob V14_SESSION_Z_WINSOR (which normalize.SessionRobustZNormalizer reads),
+    NOT enter the build kwargs (a serialized field would re-fork the spec cache).
+    Unset → env popped (no clamp, no stale leak in a warm worker)."""
+    import os
+
+    # set: a passed cap reaches the env as a parseable float; absent from build
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run", "--session-z-winsor", "2500"])
+    assert rc == 0 and len(calls) == 1
+    assert os.environ["V14_SESSION_Z_WINSOR"] == "2500.0"
+    assert float(os.environ["V14_SESSION_Z_WINSOR"]) == 2500.0
+    # cache-neutrality contract: NOT threaded as a build/view field
+    assert "session_z_winsor" not in calls[0]
+    assert "winsor" not in calls[0]
+
+    # unset: env is explicitly popped (no clamp, no warm-worker leak)
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR", "999")  # pretend a stale value lingers
+    calls2 = _capture_builds(monkeypatch)
+    rc2 = main(["--phase", "1", "--fast-dev-run"])
+    assert rc2 == 0 and len(calls2) == 1
+    assert "V14_SESSION_Z_WINSOR" not in os.environ
 
 
 def test_b37_pool_mean_auto_resolves_ssl_mode_joint(monkeypatch) -> None:

@@ -667,6 +667,12 @@ def build_v14_experiment(
     # own spec_cache_dir).
     spec_cache_dir: str | None = None,
     disable_spec_cache: bool = False,
+    # Layer-2 bad-electrode defense (#180): directory of per-session bad-time-window
+    # sidecars from ``scripts/neuroprobe/precompute_bad_windows.py``. When set, SSL
+    # clips overlapping a glitch span are dropped before sampling. SSL-ONLY: gated to
+    # ``None`` for the P4 phase below so the Neuroprobe-Lite parity clip sets are never
+    # altered. Removes events (rows), never electrodes — DP4 row-alignment untouched.
+    bad_window_dir: str | None = None,
     cluster: str | None = None,
     # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
     # they only override exca's TaskInfra / submitit defaults when set.
@@ -1559,6 +1565,9 @@ def build_v14_experiment(
         },
         batch_size=batch_size,
         num_workers=num_workers,
+        # Layer-2 clip filter: SSL phases only. P4 (frozen probe, ssl_phase=False)
+        # keeps it None so the Neuroprobe-Lite parity clip set is never altered.
+        bad_window_dir=(bad_window_dir if ssl_phase else None),
     )
 
     exca_folder = exca_folder or os.environ.get("EXCA_CACHE_FOLDER")
@@ -2334,6 +2343,29 @@ def _parser() -> argparse.ArgumentParser:
                    help="Disable the #80 whole-movie |STFT| cache (forces the "
                         "per-run recompute of the session_robust_z whole-movie "
                         "STFT). Default OFF (cache armed when a cache root exists).")
+    # Layer-2 bad-electrode clip filter (#180). SSL-only: clips overlapping a
+    # precomputed glitch span are dropped before sampling. P4 eval untouched
+    # (build gates this to the SSL phases). Default None = no filtering.
+    p.add_argument("--bad-window-dir", default=None,
+                   help="Directory of per-session bad-time-window sidecars "
+                        "(scripts/neuroprobe/precompute_bad_windows.py). When set, "
+                        "SSL clips whose neural window overlaps a glitch span are "
+                        "dropped before sampling (Layer-2 of the bad-electrode "
+                        "defense, #180). Pretrain/distill only — the P4 eval "
+                        "datamodule never filters, so Neuroprobe parity is intact. "
+                        "Removes events (rows), never electrodes. Default None = off.")
+    # Layer-3 winsor cap (#180). Read-time per-cell |z| clamp on the session
+    # robust-z front-end. Cache-NEUTRAL by design: implemented as the env knob
+    # V14_SESSION_Z_WINSOR (NOT a serialized view field) so it never forks the
+    # multi-TB spec cache. This flag SETS that env var in main(); default None
+    # leaves the env untouched (no clamp).
+    p.add_argument("--session-z-winsor", type=float, default=None,
+                   help="Layer-3 winsor cap (#180): clamp the session robust-z "
+                        "front-end to +/- this |z| per cell at read time (e.g. "
+                        "2500). Caps spectral transients on flaky contacts that "
+                        "survive LOF. Cache-neutral — sets V14_SESSION_Z_WINSOR, "
+                        "not a cached view field, so it never re-forks the spec "
+                        "cache. Default None = no clamp.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
@@ -3157,6 +3189,9 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         # extractor cache root). Reaches every phase via this one dict.
         spec_cache_dir=args.spec_cache_dir,
         disable_spec_cache=args.no_spec_cache,
+        # Layer-2 bad-electrode clip filter (#180). Reaches every phase via this one
+        # dict; build_v14_experiment gates it to SSL phases (P4 self-zeroes to None).
+        bad_window_dir=args.bad_window_dir,
         mains_notch_hz=args.mains_notch_hz,
         # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
         # one dict so the chain + single-phase builds stay in lock-step.
@@ -3522,6 +3557,17 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["V14_LOG_EVERY_N"] = str(args.log_every_n_override)
     else:
         os.environ.pop("V14_LOG_EVERY_N", None)  # no stale leak in warm worker
+    # Layer-3 winsor cap (#180): front-door for V14_SESSION_Z_WINSOR, which
+    # extractors.normalize.SessionRobustZNormalizer reads at construction. Kept as
+    # an env knob (not a build_v14_experiment / view field) on purpose — it is a
+    # read-time clamp that must NOT enter the exca cache uid (a serialized field
+    # would re-fork the multi-TB spec cache). Set/pop EXPLICITLY (same warm-worker
+    # no-leak pattern as the levers above) so --session-z-winsor is authoritative
+    # and a prior run's value never leaks. Default None = unset = no clamp.
+    if args.session_z_winsor is not None:
+        os.environ["V14_SESSION_Z_WINSOR"] = str(args.session_z_winsor)
+    else:
+        os.environ.pop("V14_SESSION_Z_WINSOR", None)
     # §7 launch guard (2026-06-04, project_v14_optimizer_default_b01_config). A
     # real SSL/distill run MUST use the locked optimizer config — constant-Adam /
     # β2=0.999 was the unimplemented-default *bug*, never a chosen config. A
