@@ -44,7 +44,21 @@ import os
 from pathlib import Path
 
 import numpy as np
-import pytest
+
+# pytest is a dev-only dep: the DCC runtime venv lacks it, but the `--update`
+# capture path (run as `python -m ...test_golden_voltage --update` on DCC) needs
+# only numpy + the BT loader. Import lazily so the module loads without pytest;
+# the test function + skip helpers below are reached only under a pytest run
+# (where the import succeeds), so they keep their normal skip behavior.
+try:
+    import pytest
+except ModuleNotFoundError:  # DCC runtime venv — capture-only, no test collection
+    pytest = None  # type: ignore[assignment]
+
+    def _parametrize(*_a, **_k):
+        return lambda fn: fn
+else:
+    _parametrize = pytest.mark.parametrize
 
 # (subject_id, trial_id) targets. Subject 1 = native-2048 baseline (no resample);
 # subject 9 = native-1024 → exercises the resample_poly S9 path (the S9-class case).
@@ -185,7 +199,7 @@ def _load_golden() -> dict:
     return json.loads(_GOLDEN_PATH.read_text())
 
 
-@pytest.mark.parametrize("subject_id,trial_id", _VOLTAGE_TARGETS)
+@_parametrize("subject_id,trial_id", _VOLTAGE_TARGETS)
 def test_voltage_clip_matches_golden(subject_id: int, trial_id: int) -> None:
     """First ``_N_CLIPS`` raw voltage clips (windowed at production onsets) ==
     frozen golden — locks bt_load_raw (incl. S9 resample), channel order, and
