@@ -264,28 +264,40 @@ def main() -> int:
     n_fil = {s: len(loaders_fil[s].dataset) for s in loaders_fil}
     print(f"clip counts  unfiltered={n_unf}  filtered={n_fil}", flush=True)
 
-    dropped = n_unf.get("train", 0) - n_fil.get("train", 0)
-    rep.add("CLIP-1", dropped > 0,
-            f"train clips dropped by filter = {dropped} "
-            f"({n_unf.get('train')} -> {n_fil.get('train')})")
+    dropped_by_split = {s: n_unf[s] - n_fil.get(s, 0) for s in n_unf}
+    dropped_total = sum(dropped_by_split.values())
+    rep.add("CLIP-1", dropped_total > 0,
+            f"clips dropped by filter (any split) = {dropped_total} "
+            f"by-split {dropped_by_split} -- a session's glitches can land "
+            f"entirely in the val/test partition under the time-based holdout "
+            f"split, so train-only drops are NOT guaranteed; what must hold is "
+            f"that the filter removes overlapping clips wherever they fall")
 
     rep.add("CLIP-3", all(n_fil[s] <= n_unf[s] for s in n_fil),
             f"filter only removes rows per split: {n_fil} <= {n_unf}")
 
-    # CLIP-2: no surviving train clip overlaps any bad span.
-    sel_fil = loaders_fil["train"].dataset
-    trig = getattr(sel_fil, "triggers", None)
-    if trig is not None and "start" in getattr(trig, "columns", []):
-        seg_start = float(data_filtered.segmenter.start)
-        seg_dur = float(data_filtered.segmenter.duration)
+    # CLIP-2: no surviving clip in ANY split overlaps a bad span. (Train-only
+    # would miss sessions whose glitches land in the val/test holdout partition.)
+    seg_start = float(data_filtered.segmenter.start)
+    seg_dur = float(data_filtered.segmenter.duration)
+    leaks_by_split: dict[str, int] = {}
+    checked_any = False
+    for split, loader in loaders_fil.items():
+        trig = getattr(loader.dataset, "triggers", None)
+        if trig is None or "start" not in getattr(trig, "columns", []):
+            continue
+        checked_any = True
         leaks = 0
         for st in trig["start"].to_numpy():
             lo = float(st) + seg_start
             if _overlaps(lo, lo + seg_dur, spans):
                 leaks += 1
-        rep.add("CLIP-2", leaks == 0,
-                f"surviving train clips overlapping a bad span = {leaks} "
-                f"(of {len(trig)})")
+        leaks_by_split[split] = leaks
+    if checked_any:
+        total_leaks = sum(leaks_by_split.values())
+        rep.add("CLIP-2", total_leaks == 0,
+                f"surviving clips overlapping a bad span (all splits) = "
+                f"{total_leaks} by-split {leaks_by_split}")
     else:
         rep.add("CLIP-2", None, "dataset exposes no .triggers['start'] — cannot verify "
                                 "per-clip overlap directly")
@@ -323,45 +335,52 @@ def main() -> int:
             f"--session-z-winsor parses to {getattr(_wiring_args, 'session_z_winsor', None)} "
             f"(main() sets V14_SESSION_Z_WINSOR from it before prepare())")
 
-    # No-winsor pass: flag absent -> main() pops the env -> no clamp.
+    # No-winsor pass: flag absent -> main() pops the env -> no clamp. Locate
+    # glitch clips across ALL splits — a session's glitch can sit in any
+    # partition under the time-based holdout split (e.g. subj4 t2's glitches
+    # land entirely in the test partition).
     data_nw = _build_production_data(_base_argv(args, phase=1))
-    sel_nowin = data_nw.build()["train"].dataset
-    trig_nw = getattr(sel_nowin, "triggers", None)
-    glitch_idx: list[int] = []
-    if trig_nw is not None and "start" in getattr(trig_nw, "columns", []):
-        seg_start = float(data_nw.segmenter.start)
-        seg_dur = float(data_nw.segmenter.duration)
-        starts = trig_nw["start"].to_numpy()
-        for i, st in enumerate(starts):
+    loaders_nw = data_nw.build()
+    seg_start = float(data_nw.segmenter.start)
+    seg_dur = float(data_nw.segmenter.duration)
+    glitch: list[tuple[str, int]] = []
+    for split, loader in loaders_nw.items():
+        trig = getattr(loader.dataset, "triggers", None)
+        if trig is None or "start" not in getattr(trig, "columns", []):
+            continue
+        for i, st in enumerate(trig["start"].to_numpy()):
             lo = float(st) + seg_start
             if _overlaps(lo, lo + seg_dur, spans):
-                glitch_idx.append(i)
+                glitch.append((split, i))
 
-    if not glitch_idx:
-        rep.add("WINSOR-1", None, "no train clip overlaps a bad span on this session — "
-                                  "cannot locate a giant |z| clip")
+    if not glitch:
+        rep.add("WINSOR-1", None, "no clip in any split overlaps a bad span on this "
+                                  "session — cannot locate a giant |z| clip")
         rep.add("WINSOR-2", None, "skipped (no glitch clip)")
         rep.add("WINSOR-3", None, "skipped (no glitch clip)")
     else:
         # Scan glitch clips for the worst |z| (no-winsor build).
-        worst_i, max_nowin = glitch_idx[0], 0.0
+        worst, max_nowin = glitch[0], 0.0
         worst_tensors: dict[str, torch.Tensor] = {}
-        for i in glitch_idx:
-            ft = _frontend_tensors(sel_nowin[i])
+        for split, i in glitch:
+            ft = _frontend_tensors(loaders_nw[split].dataset[i])
             m = _global_max_abs(ft)
             if m > max_nowin:
-                max_nowin, worst_i, worst_tensors = m, i, ft
+                max_nowin, worst, worst_tensors = m, (split, i), ft
 
         # Winsor pass: flag present -> main() sets the env=W before prepare().
-        sel_win = _build_production_data(
+        loaders_win = _build_production_data(
             _base_argv(args, phase=1, winsor=W)
-        ).build()["train"].dataset
-        max_win = max(_global_max_abs(_frontend_tensors(sel_win[i])) for i in glitch_idx)
-        t_win = _frontend_tensors(sel_win[worst_i])
+        ).build()
+        max_win = max(
+            _global_max_abs(_frontend_tensors(loaders_win[split].dataset[i]))
+            for split, i in glitch
+        )
+        t_win = _frontend_tensors(loaders_win[worst[0]].dataset[worst[1]])
 
-        print(f"glitch clips scanned={len(glitch_idx)}  "
+        print(f"glitch clips scanned={len(glitch)}  "
               f"max|z| no-winsor={max_nowin:.1f}  winsor={max_win:.1f}  "
-              f"worst clip idx={worst_i}", flush=True)
+              f"worst clip={worst}", flush=True)
 
         rep.add("WINSOR-1", max_nowin > W,
                 f"max |z| over glitch clips (no winsor) = {max_nowin:.1f} > W={W:.0f} "
