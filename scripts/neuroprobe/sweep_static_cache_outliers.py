@@ -125,13 +125,11 @@ def main() -> int:
     from speech_decoding.studies.braintreebank.anatomy import (
         _BT_V14_EXTRA_BAD_ELECTRODES,
     )
-    bad_windows = {}
-    if args.bad_window_dir:
-        from speech_decoding.experiments.bad_windows import (
-            bad_window_session_key,
-            load_bad_windows,
-        )
-        bad_windows = load_bad_windows(args.bad_window_dir)
+    from speech_decoding.experiments.bad_windows import (
+        bad_window_session_key,
+        load_bad_windows,
+    )
+    bad_windows = load_bad_windows(args.bad_window_dir) if args.bad_window_dir else {}
 
     root = Path(args.spec_cache_dir)
     metas = sorted(root.rglob("*.json"))
