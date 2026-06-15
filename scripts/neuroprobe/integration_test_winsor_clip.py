@@ -43,37 +43,48 @@ Exit code 0 iff every (non-skipped) check passes.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import typing as tp
 
 import torch
 
+# Production winsor knob: the CLI flag --session-z-winsor sets only this env var
+# (dispatch_v14.py ~3568), read by SessionRobustZNormalizer (normalize.py). We drive it
+# directly so the read path is byte-identical to a real --session-z-winsor run.
+_WINSOR_ENV = "V14_SESSION_Z_WINSOR"
+
 
 # ----------------------------------------------------------------------------- capture
+class _Captured(Exception):
+    """Carries the production Data out of ``main()`` and aborts it before the
+    cache-only prepare()/trainer runs (``Data.build()`` does its own prepare())."""
+
+    def __init__(self, data: tp.Any) -> None:
+        self.data = data
+
+
 def _build_production_data(argv: list[str]):
-    """Run ``dispatch_v14.main(argv)`` (with --cache-only so it returns before the
-    trainer) and return the production ``Data`` it built — captured by wrapping
-    ``build_v14_experiment`` so we inherit its exact kwarg mapping verbatim."""
+    """Return the production ``Data`` that ``dispatch_v14.main(argv)`` would build,
+    captured by wrapping ``build_v14_experiment`` so we inherit its exact 80-kwarg
+    mapping verbatim. We raise right after the Experiment is built to abort main()
+    before it prepares/trains — so this is cheap even for phases whose cache is absent
+    (the phase-4 gating check never touches an eval-mode cache)."""
     from speech_decoding.experiments import dispatch_v14
 
-    captured: list[tp.Any] = []
     orig = dispatch_v14.build_v14_experiment
 
     def _wrap(*a, **k):
-        xp = orig(*a, **k)
-        captured.append(xp)
-        return xp
+        raise _Captured(orig(*a, **k).data)
 
     dispatch_v14.build_v14_experiment = _wrap
     try:
-        rc = dispatch_v14.main(argv)
+        dispatch_v14.main(argv)
+    except _Captured as c:
+        return c.data
     finally:
         dispatch_v14.build_v14_experiment = orig
-    if rc != 0:
-        raise RuntimeError(f"dispatch_v14.main returned {rc} for argv={argv}")
-    if not captured:
-        raise RuntimeError("build_v14_experiment was never called — capture failed")
-    return captured[-1].data
+    raise RuntimeError(f"capture failed (main returned without building) for argv={argv}")
 
 
 def _base_argv(args, *, phase: int) -> list[str]:
@@ -200,6 +211,7 @@ def main() -> int:
         return 0
 
     rep = Report()
+    os.environ.pop(_WINSOR_ENV, None)  # CLIP is winsor-independent; start clean
 
     # ---- CLIP: real Data.build() with/without the sidecar dir --------------------
     data_unfiltered = _build_production_data(_base_argv(args, phase=1))
@@ -254,22 +266,32 @@ def main() -> int:
     except Exception as exc:  # eval-mode session cache absent etc.
         rep.add("CLIP-4", None, f"phase-4 build unavailable here: {type(exc).__name__}: {exc}")
 
-    # ---- WINSOR: real --session-z-winsor through the read path -------------------
-    # Use the UNFILTERED phase-1 dataset (glitch clips present) twice: no-winsor and
-    # winsor. Scan ONLY the clips overlapping a bad span (fast + targeted).
+    # ---- WINSOR: real read-time clamp via V14_SESSION_Z_WINSOR -------------------
+    # WINSOR's production mechanism is the V14_SESSION_Z_WINSOR env knob: the CLI flag
+    # --session-z-winsor's ONLY effect is os.environ["V14_SESSION_Z_WINSOR"]=value
+    # (dispatch_v14.py ~3568), read by SessionRobustZNormalizer.__init__ at read time
+    # (normalize.py:191-192) and clamped in transform() (line 265). We set that env
+    # ourselves — IDENTICAL read path — order-safely: env is set across BOTH the build
+    # AND the clip-pull for each variant (the normalizer reads the env at construction,
+    # so a stale env would mis-clamp). First confirm the flag->env wiring is the only
+    # effect, then drive the clamp.
     W = args.winsor
-    data_nowin = _build_production_data(_base_argv(args, phase=1))
-    data_win = _build_production_data(
-        _base_argv(args, phase=1) + ["--session-z-winsor", str(W)]
-    )
-    sel_nowin = data_nowin.build()["train"].dataset
-    sel_win = data_win.build()["train"].dataset
+    _wiring_argv = _base_argv(args, phase=1) + ["--session-z-winsor", str(W)]
+    from speech_decoding.experiments import dispatch_v14 as _d
+    _wiring_args = _d._parser().parse_args(_wiring_argv)
+    rep.add("WINSOR-0", float(getattr(_wiring_args, "session_z_winsor", -1)) == W,
+            f"--session-z-winsor parses to {getattr(_wiring_args, 'session_z_winsor', None)} "
+            f"(its sole effect is setting V14_SESSION_Z_WINSOR; we drive that env directly)")
 
+    # No-winsor pass: env unset across build + scan.
+    os.environ.pop(_WINSOR_ENV, None)
+    data_nw = _build_production_data(_base_argv(args, phase=1))
+    sel_nowin = data_nw.build()["train"].dataset
     trig_nw = getattr(sel_nowin, "triggers", None)
     glitch_idx: list[int] = []
     if trig_nw is not None and "start" in getattr(trig_nw, "columns", []):
-        seg_start = float(data_nowin.segmenter.start)
-        seg_dur = float(data_nowin.segmenter.duration)
+        seg_start = float(data_nw.segmenter.start)
+        seg_dur = float(data_nw.segmenter.duration)
         starts = trig_nw["start"].to_numpy()
         for i, st in enumerate(starts):
             lo = float(st) + seg_start
@@ -282,29 +304,37 @@ def main() -> int:
         rep.add("WINSOR-2", None, "skipped (no glitch clip)")
         rep.add("WINSOR-3", None, "skipped (no glitch clip)")
     else:
-        # Global max |z| over glitch clips, no-winsor vs winsor; and the single worst.
-        worst_i, worst_max = glitch_idx[0], -1.0
-        max_nowin = 0.0
+        # Scan glitch clips for the worst |z| (env still unset).
+        worst_i, max_nowin = glitch_idx[0], 0.0
+        worst_tensors: dict[str, torch.Tensor] = {}
         for i in glitch_idx:
-            m = _global_max_abs(_frontend_tensors(sel_nowin[i]))
-            max_nowin = max(max_nowin, m)
-            if m > worst_max:
-                worst_max, worst_i = m, i
-        max_win = max(
-            _global_max_abs(_frontend_tensors(sel_win[i])) for i in glitch_idx
-        )
+            ft = _frontend_tensors(sel_nowin[i])
+            m = _global_max_abs(ft)
+            if m > max_nowin:
+                max_nowin, worst_i, worst_tensors = m, i, ft
+
+        # Winsor pass: env=W across build + scan (order-safe; normalizer reads env at init).
+        os.environ[_WINSOR_ENV] = str(W)
+        try:
+            sel_win = _build_production_data(_base_argv(args, phase=1)).build()["train"].dataset
+            max_win = max(_global_max_abs(_frontend_tensors(sel_win[i])) for i in glitch_idx)
+            t_win = _frontend_tensors(sel_win[worst_i])
+        finally:
+            os.environ.pop(_WINSOR_ENV, None)
+
         print(f"glitch clips scanned={len(glitch_idx)}  "
               f"max|z| no-winsor={max_nowin:.1f}  winsor={max_win:.1f}  "
               f"worst clip idx={worst_i}", flush=True)
 
         rep.add("WINSOR-1", max_nowin > W,
-                f"max |z| over glitch clips (no winsor) = {max_nowin:.1f} > W={W:.0f}")
+                f"max |z| over glitch clips (no winsor) = {max_nowin:.1f} > W={W:.0f} "
+                "(a real giant cell exists to clamp)")
         rep.add("WINSOR-2", max_win <= W + 1e-3,
-                f"max |z| over glitch clips (winsor W={W:.0f}) = {max_win:.1f} <= W")
+                f"max |z| over glitch clips (winsor W={W:.0f}) = {max_win:.1f} <= W "
+                "(every cell the encoder ingests is bounded)")
 
         # WINSOR-3: elementwise clamp identity on the worst clip.
-        t_nowin = _frontend_tensors(sel_nowin[worst_i])
-        t_win = _frontend_tensors(sel_win[worst_i])
+        t_nowin = worst_tensors
         keys = sorted(set(t_nowin) & set(t_win))
         if not keys:
             rep.add("WINSOR-3", None, "no comparable front-end tensor keys")
