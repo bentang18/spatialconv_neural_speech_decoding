@@ -16,7 +16,10 @@ import pytest
 
 from speech_decoding.models.v14_encoder import JepaPredictor
 from speech_decoding.ssl.masked_jepa import (
+    _jepa_pred_target_stats,
+    _m4_precision_monitor_stats,
     _m4_precision_weight,
+    _precision_weight_downweight,
     b37_m4_freq_loss,
     m2_dual_band_loss,
     m4_dual_band_loss,
@@ -352,6 +355,7 @@ def test_m4_precision_weight_is_mean1_detached_and_ordered() -> None:
     target_cell = torch.ones(B, N, dtype=torch.bool)  # score every cell
     w = _m4_precision_weight(
         std, n, target_cell, alpha=1.0, eps=1e-6, floor_pct=25.0, cap=10.0,
+        mode="mean1_invvar",  # the mean-1 inverse-variance form (R-precision-mean1)
     )
 
     assert torch.isfinite(w).all()
@@ -371,6 +375,7 @@ def test_m4_precision_weight_alpha_zero_drops_count_term() -> None:
     target_cell = torch.ones(B, N, dtype=torch.bool)
     w = _m4_precision_weight(
         std, n, target_cell, alpha=0.0, eps=1e-6, floor_pct=25.0, cap=10.0,
+        mode="mean1_invvar",
     )
     assert torch.allclose(w, torch.ones_like(w), atol=1e-6)
 
@@ -393,18 +398,21 @@ def test_m4_precision_shrinkage_floor_tames_degenerate_cells() -> None:
     # cells dominate → enormous max/median.
     w_bare = _m4_precision_weight(
         std, n, target_cell, alpha=0.5, eps=1e-6, floor_pct=0.0, cap=0.0,
+        mode="mean1_invvar",
     )
     ratio_bare = w_bare.max() / w_bare.median()
     # Cap alone (still bare floor): does NOT fix it — the bulk degenerate mass
     # drives the median to ~0, so max/median stays huge even after capping max.
     w_cap = _m4_precision_weight(
         std, n, target_cell, alpha=0.5, eps=1e-6, floor_pct=0.0, cap=10.0,
+        mode="mean1_invvar",
     )
     ratio_cap = w_cap.max() / w_cap.median()
     # Shrinkage floor (the fix): σ²₀ = p25 of in-batch σ² ≈ 0.49 → degenerate
     # cells pulled back to a typical-cell weight → bounded ratio.
     w_fix = _m4_precision_weight(
         std, n, target_cell, alpha=0.5, eps=1e-6, floor_pct=25.0, cap=10.0,
+        mode="mean1_invvar",
     )
     ratio_fix = w_fix.max() / w_fix.median()
 
@@ -435,6 +443,7 @@ def test_b37_m4_precision_uniform_stats_recovers_plain_l1() -> None:
         predictor=pred, student_m4=student, teacher_m4=teacher,
         visible=visible, target_mask=target_mask,
         precision_std=std, precision_n=n, precision_alpha=1.0,
+        precision_mode="mean1_invvar",  # mean-1 form: uniform stats → all-ones
     )
     assert torch.allclose(plain.total, weighted.total, atol=1e-6)
 
@@ -459,6 +468,7 @@ def test_b37_m4_precision_nonuniform_changes_loss() -> None:
         predictor=pred, student_m4=student, teacher_m4=teacher,
         visible=visible, target_mask=target_mask,
         precision_std=std, precision_n=n, precision_alpha=1.0,
+        precision_mode="mean1_invvar",  # σ re-weighting is a mean1-form property
     )
     assert torch.isfinite(weighted.total)
     assert not torch.allclose(plain.total, weighted.total, atol=1e-4)
@@ -478,6 +488,136 @@ def test_b37_m4_precision_requires_both_std_and_n() -> None:
             predictor=pred, student_m4=student, teacher_m4=teacher,
             visible=visible, target_mask=target_mask, precision_std=std,
         )
+
+
+# ---------------------------------------------------------------------------
+# Downweight-only electrode-dof precision weight — the NEW default
+# (reports/m4_precision_downweight_handoff_2026_06_15.md). w = min(1, ((n-1)/
+# (n_ref-1))^α): n-only, NOT mean-1 (sub-1 mean by design ≈ a principled λ_m4),
+# 0 at n=1, saturates at n_ref. σ is NOT read.
+# ---------------------------------------------------------------------------
+
+
+def test_precision_downweight_weight_table() -> None:
+    """The acceptance table (n_ref=11, α=1.0): w = min(1, (n-1)/10) for
+    n ∈ {1,2,3,6,11,15} → [0.0, 0.1, 0.2, 0.5, 1.0, 1.0] (n≥n_ref caps at 1)."""
+    n_cell = torch.tensor([[1.0, 2.0, 3.0, 6.0, 11.0, 15.0]])
+    target = torch.ones_like(n_cell, dtype=torch.bool)
+    w = _precision_weight_downweight(n_cell, target, n_ref=11.0, alpha=1.0)
+    expected = torch.tensor([0.0, 0.1, 0.2, 0.5, 1.0, 1.0])
+    torch.testing.assert_close(w, expected, atol=1e-6, rtol=0.0)
+    assert not w.requires_grad                          # detached
+
+
+def test_precision_downweight_zero_at_n1_and_caps_at_nref() -> None:
+    """Passes through 0 at n=1 (single-electrode parcels carry no std → excluded
+    upstream) and saturates at exactly 1.0 for n ≥ n_ref."""
+    n_cell = torch.tensor([[1.0, 11.0, 50.0]])
+    target = torch.ones_like(n_cell, dtype=torch.bool)
+    w = _precision_weight_downweight(n_cell, target, n_ref=11.0, alpha=1.0)
+    assert w[0].item() == 0.0
+    assert w[1].item() == 1.0
+    assert w[2].item() == 1.0                           # min(1, 49/10) = 1
+
+
+def test_precision_downweight_mean_below_one_no_renorm() -> None:
+    """The defining contrast with the mean-1 core: a mixed-n batch (all < n_ref)
+    yields weight.mean() < 1 — shaky parcels contribute less and are NOT
+    compensated by upweighting others (no mean-1 renormalization)."""
+    n_cell = torch.tensor([[2.0, 3.0, 4.0, 5.0]])       # all < n_ref → all < 1
+    target = torch.ones_like(n_cell, dtype=torch.bool)
+    w = _precision_weight_downweight(n_cell, target, n_ref=11.0, alpha=1.0)
+    assert w.mean().item() < 1.0
+    assert abs(w.mean().item() - 0.25) < 1e-6           # (0.1+0.2+0.3+0.4)/4
+
+
+def test_precision_downweight_ignores_sigma() -> None:
+    """σ-independence: in downweight_dof, two batches with different precision_std
+    but identical precision_n give identical weights (n-only form)."""
+    B, K, F_p, T_p = 1, 3, 2, 2
+    N = K * F_p * T_p
+    n = torch.tensor([[10.0, 4.0, 2.0]])
+    target = torch.ones(B, N, dtype=torch.bool)
+    std_a = torch.rand(B, K, F_p, T_p) + 0.1
+    std_b = torch.rand(B, K, F_p, T_p) + 5.0            # wildly different σ
+    kw = dict(alpha=1.0, eps=1e-6, floor_pct=25.0, cap=10.0,
+              mode="downweight_dof", n_ref=11.0)
+    w_a = _m4_precision_weight(std_a, n, target, **kw)
+    w_b = _m4_precision_weight(std_b, n, target, **kw)
+    torch.testing.assert_close(w_a, w_b)
+
+
+def test_precision_downweight_differs_from_mean1_and_is_subone() -> None:
+    """Mode divergence + mean1 regression sanity: the two forms produce DIFFERENT
+    weights; mean1_invvar stays mean-1 (its defining property — the byte-identical
+    R-precision-mean1 path), downweight_dof is sub-1."""
+    B, K, F_p, T_p = 1, 4, 2, 2
+    N = K * F_p * T_p
+    n = torch.tensor([[10.0, 6.0, 3.0, 2.0]])
+    std = torch.rand(B, K, F_p, T_p) + 0.2
+    target = torch.ones(B, N, dtype=torch.bool)
+    kw = dict(alpha=1.0, eps=1e-6, floor_pct=25.0, cap=10.0, n_ref=11.0)
+    w_dof = _m4_precision_weight(std, n, target, mode="downweight_dof", **kw)
+    w_m1 = _m4_precision_weight(std, n, target, mode="mean1_invvar", **kw)
+    assert abs(w_m1.mean().item() - 1.0) < 1e-5         # mean1 path stays mean-1
+    assert w_dof.mean().item() < 1.0                    # downweight is sub-1
+    assert not torch.allclose(w_dof, w_m1)              # the two forms diverge
+
+
+def test_precision_downweight_alpha_robust_overlay() -> None:
+    """α>1 is the risk-averse overlay: α=1.15 at n=2 gives (1/10)^1.15 ≈ 0.0708."""
+    n_cell = torch.tensor([[2.0]])
+    target = torch.ones_like(n_cell, dtype=torch.bool)
+    w = _precision_weight_downweight(n_cell, target, n_ref=11.0, alpha=1.15)
+    assert abs(w.item() - 0.1 ** 1.15) < 1e-6
+
+
+def test_b37_m4_precision_downweight_default_smaller_than_plain() -> None:
+    """End-to-end (b37): the DEFAULT downweight_dof on an all-low-n fixture yields a
+    finite loss strictly smaller than the unweighted path (sub-1 weights scale the
+    L1 down — the principled λ_m4 effect)."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 5, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    pred = _m4_predictor(d, K, F_p, T_p)
+
+    plain = b37_m4_freq_loss(
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+    )
+    std = torch.full((B, K, F_p, T_p), 0.4)
+    n = torch.full((B, K), 3.0)                          # low n → w = (3-1)/10 = 0.2
+    weighted = b37_m4_freq_loss(                         # default mode = downweight_dof
+        predictor=pred, student_m4=student, teacher_m4=teacher,
+        visible=visible, target_mask=target_mask,
+        precision_std=std, precision_n=n,
+    )
+    assert torch.isfinite(weighted.total)
+    assert weighted.total < plain.total
+
+
+def test_m4_dual_band_precision_downweight_default_smaller_than_plain() -> None:
+    """End-to-end (2STFT dual-band M4): same as the b37 case — the default
+    downweight_dof on a low-n fixture is finite and smaller than the plain L1."""
+    torch.manual_seed(0)
+    B, K, d = 2, 5, 8
+    student = torch.randn(B, K, _M2DB_S, d)
+    teacher = torch.randn(B, K, _M2DB_S, d)
+    tubed = _tube_bk(B, K, tubed=0)
+    lv = torch.ones(B, K, dtype=torch.bool)
+    pred = _m4_dual_predictor(d, K)
+
+    plain = _m4db_call(pred, student, teacher, tubed, lv)
+    std = torch.full((B, K, _M2DB_S), 0.4)
+    n = torch.full((B, K), 3.0)
+    weighted = _m4db_call(                               # default mode = downweight_dof
+        pred, student, teacher, tubed, lv,
+        precision_std=std, precision_n=n,
+    )
+    assert torch.isfinite(weighted.total)
+    assert weighted.total < plain.total
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1041,7 @@ def test_m4_dual_band_precision_uniform_recovers_plain_l1() -> None:
     weighted = _m4db_call(
         pred, student, teacher, tubed, latent_valid,
         precision_std=std, precision_n=n, precision_alpha=0.75,
+        precision_mode="mean1_invvar",  # mean-1 form: uniform stats → all-ones
     )
     torch.testing.assert_close(weighted.total, plain.total, atol=1e-6, rtol=1e-5)
 
@@ -928,6 +1069,7 @@ def test_m4_dual_band_precision_nonuniform_changes_loss() -> None:
     weighted = _m4db_call(
         pred, student, teacher, tubed, latent_valid,
         precision_std=std, precision_n=n, precision_alpha=0.75,
+        precision_mode="mean1_invvar",  # σ/n re-weighting is a mean1-form property
     )
     assert not torch.allclose(weighted.total, plain.total)
     assert torch.isfinite(weighted.total)
@@ -1058,3 +1200,183 @@ def test_m4_dual_band_target_is_tubed_at_all_s() -> None:
     torch.testing.assert_close(
         _m4db_call(pred, student, t_s, tubed, lv, token_mask=token_mask).total, base
     )
+
+
+# ---------------------------------------------------------------------------
+# Collapse/quality monitor scalars — target_var / target_norm / pred_var /
+# explained_var. RankMe is scale-INVARIANT so it can't see target-magnitude
+# collapse; these can (monitor-stats handoff). Pure observability, detached.
+# ---------------------------------------------------------------------------
+
+
+def test_jepa_stats_target_var_detects_constant_target() -> None:
+    """A constant-across-tokens target (the magnitude-collapse signature) has
+    ~0 target_var; a varied target has a clearly positive target_var."""
+    d = 8
+    pred = torch.randn(32, d)
+    const_target = torch.ones(32, d) * 0.5            # identical across tokens
+    varied_target = torch.randn(32, d)
+    tv_const, _, _, _ = _jepa_pred_target_stats(pred, const_target)
+    tv_varied, _, _, _ = _jepa_pred_target_stats(pred, varied_target)
+    assert float(tv_const) < 1e-6
+    assert float(tv_varied) > 0.1
+
+
+def test_jepa_stats_explained_var_one_for_perfect_pred() -> None:
+    """Perfect prediction → explained_var == 1 (zero error)."""
+    t = torch.randn(40, 8)
+    _, _, _, ev = _jepa_pred_target_stats(t.clone(), t)
+    assert abs(float(ev) - 1.0) < 1e-5
+
+
+def test_jepa_stats_explained_var_decreases_as_pred_worsens() -> None:
+    """EV is monotone in prediction quality: a closer prediction scores higher
+    than a worse one on the same target."""
+    torch.manual_seed(0)
+    t = torch.randn(64, 8)
+    close = t + 0.1 * torch.randn(64, 8)
+    far = t + 1.0 * torch.randn(64, 8)
+    _, _, _, ev_close = _jepa_pred_target_stats(close, t)
+    _, _, _, ev_far = _jepa_pred_target_stats(far, t)
+    assert float(ev_close) > float(ev_far)
+
+
+def test_jepa_stats_pred_var_zero_when_predictor_hedges_to_mean() -> None:
+    """A predictor that outputs a constant (hedges to one value) has ~0
+    pred_var even when the target varies — the soft-collapse readout that
+    target_var alone misses."""
+    torch.manual_seed(0)
+    t = torch.randn(50, 8)
+    const_pred = torch.full((50, 8), 0.3)
+    tv, _, pv, _ = _jepa_pred_target_stats(const_pred, t)
+    assert float(pv) < 1e-6
+    assert float(tv) > 0.1
+
+
+def test_jepa_stats_nan_when_fewer_than_two_tokens() -> None:
+    """< 2 scored tokens → variance undefined → all NaN (logger skips)."""
+    for n in (0, 1):
+        tv, tn, pv, ev = _jepa_pred_target_stats(
+            torch.randn(n, 8), torch.randn(n, 8)
+        )
+        assert all(torch.isnan(x) for x in (tv, tn, pv, ev))
+
+
+def test_jepa_stats_target_norm_tracks_magnitude() -> None:
+    """target_norm is the mean per-token L2 norm — scaling the target scales it."""
+    t = torch.randn(30, 8)
+    _, tn1, _, _ = _jepa_pred_target_stats(torch.zeros(30, 8), t)
+    _, tn2, _, _ = _jepa_pred_target_stats(torch.zeros(30, 8), t * 3.0)
+    assert abs(float(tn2) - 3.0 * float(tn1)) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# M4 precision-weight monitor stats — the observable proof the downweight-dof
+# weight down-weights low-n parcels (low-n: higher raw loss, lower weighted
+# contribution).
+# ---------------------------------------------------------------------------
+
+
+def test_m4_precision_monitor_weight_stats_and_tier_split() -> None:
+    """weight mean/min/max are the applied-weight summary; the low-n tier
+    (n < n_ref) carries a strictly smaller weighted contribution-per-cell than
+    its raw loss implies, vs the high-n (full-trust) tier."""
+    torch.manual_seed(0)
+    n_target, d = 100, 8
+    pred = torch.randn(n_target, d)
+    target = torch.randn(n_target, d)
+    # half the cells are low-n (n=3, downweighted), half full-trust (n=11).
+    n_at_target = torch.cat([torch.full((50,), 3.0), torch.full((50,), 11.0)])
+    # downweight-dof weights: n=3 → 0.2, n=11 → 1.0.
+    weight = torch.where(n_at_target < 11.0, torch.tensor(0.2), torch.tensor(1.0))
+    stats = _m4_precision_monitor_stats(
+        pred=pred, target=target, weight=weight,
+        n_at_target=n_at_target, n_ref=11.0, loss_form="l1",
+    )
+    assert abs(float(stats["weight_max"]) - 1.0) < 1e-6
+    assert abs(float(stats["weight_min"]) - 0.2) < 1e-6
+    # low-n weighted contribution is its raw loss scaled by 0.2; high-n by 1.0,
+    # so the low-n weighted contribution is well below its raw loss.
+    assert float(stats["wcontrib_lown"]) < float(stats["loss_lown"])
+    assert abs(float(stats["wcontrib_highn"]) - float(stats["loss_highn"])) < 1e-5
+    assert torch.isfinite(
+        torch.tensor([float(stats[k]) for k in stats])
+    ).all()
+
+
+def test_m4_precision_monitor_tier_nan_when_a_tier_is_empty() -> None:
+    """If every cell is full-trust, the low-n tier mean is NaN (skipped) and the
+    high-n tier is finite."""
+    n_target, d = 20, 4
+    pred = torch.randn(n_target, d)
+    target = torch.randn(n_target, d)
+    n_at_target = torch.full((n_target,), 11.0)       # all full-trust
+    weight = torch.ones(n_target)
+    stats = _m4_precision_monitor_stats(
+        pred=pred, target=target, weight=weight,
+        n_at_target=n_at_target, n_ref=11.0, loss_form="l1",
+    )
+    assert torch.isnan(stats["loss_lown"])
+    assert torch.isfinite(stats["loss_highn"])
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: every per-term loss fn surfaces the collapse scalars on its
+# breakdown; the weighted M4 fns additionally surface the precision-tier stats
+# only when precision weighting is ON.
+# ---------------------------------------------------------------------------
+
+
+def test_b37_m4_breakdown_carries_collapse_stats() -> None:
+    """The M4 freq loss fills the four collapse scalars (finite) and leaves the
+    precision-tier fields None when precision weighting is OFF."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 5, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    bd = b37_m4_freq_loss(
+        predictor=_m4_predictor(d, K, F_p, T_p), student_m4=student,
+        teacher_m4=teacher, visible=visible, target_mask=target_mask,
+    )
+    for f in ("target_var", "target_norm", "pred_var", "explained_var"):
+        assert getattr(bd, f) is not None and torch.isfinite(getattr(bd, f))
+    assert bd.weight_mean is None and bd.loss_lown is None
+
+
+def test_b37_m4_breakdown_carries_precision_stats_when_weighted() -> None:
+    """With precision weighting ON, the breakdown also carries the weight
+    distribution + the low/high-n tier split."""
+    torch.manual_seed(0)
+    B, K, F_p, T_p, d = 2, 6, 4, 4, 8
+    student = torch.randn(B, K, F_p, T_p, d)
+    teacher = torch.randn(B, K, F_p, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    std = torch.rand(B, K, F_p, T_p) + 0.1
+    n = torch.full((B, K), 3.0)                        # low-n → downweighted
+    bd = b37_m4_freq_loss(
+        predictor=_m4_predictor(d, K, F_p, T_p), student_m4=student,
+        teacher_m4=teacher, visible=visible, target_mask=target_mask,
+        precision_std=std, precision_n=n,              # default downweight_dof
+    )
+    assert bd.weight_mean is not None and torch.isfinite(bd.weight_mean)
+    assert bd.weight_max is not None and float(bd.weight_max) <= 1.0
+    # the tubed parcel has n=3 < n_ref=11 → every scored cell is low-n.
+    assert bd.loss_lown is not None and torch.isfinite(bd.loss_lown)
+    assert bd.loss_highn is not None and torch.isnan(bd.loss_highn)
+
+
+def test_p2_and_m2_dual_band_breakdowns_carry_collapse_stats() -> None:
+    """The staged P2 and the 2STFT M2 dual-band losses both fill the collapse
+    scalars — so the joint logger surfaces them for every active term."""
+    torch.manual_seed(0)
+    B, K, T_p, d = 2, 5, 4, 8
+    student = torch.randn(B, K, T_p, d)
+    teacher = torch.randn(B, K, T_p, d)
+    visible, target_mask = _tube_one_parcel(B, K, T_p, tubed=0)
+    bd = p2_parcel_m4_loss(
+        predictor=_p2_predictor(d, K, T_p), student_m4=student,
+        teacher_m4=teacher, visible=visible, target_mask=target_mask,
+    )
+    for f in ("target_var", "target_norm", "pred_var", "explained_var"):
+        assert getattr(bd, f) is not None and torch.isfinite(getattr(bd, f))

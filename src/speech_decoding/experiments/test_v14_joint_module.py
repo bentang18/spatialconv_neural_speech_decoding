@@ -37,6 +37,7 @@ from neuraltrain.optimizers import LightningOptimizer
 from speech_decoding.experiments.v14_joint_module import (
     V14JointBrainModule,
     _V14StudentBundle,
+    _infer_batch_size,
 )
 from speech_decoding.models.v14_encoder import JepaPredictor, V14ParcelPerceiverModel
 from speech_decoding.ssl.masked_jepa import MaskedJepaBreakdown
@@ -874,11 +875,21 @@ def test_b9_module_does_not_import_retired_aggregator_helpers() -> None:
 
 
 def test_b9_breakdown_exposes_exactly_one_scalar_term() -> None:
-    """B9: the breakdown carries a single ``total`` scalar + its phase tag —
-    there are no per-term sub-fields (l_mid_slot / l_post_utterance / ...)."""
+    """B9: the breakdown carries a single ``total`` LOSS scalar + its phase /
+    count tags. The only other fields are additive observability monitor-stats
+    (collapse triad + M4 precision-tier split, 2026-06-15) — never per-term
+    LOSS sub-fields (l_mid_slot / l_post_utterance / l_recon / ...)."""
     breakdown = _make_module(phase="p1")._step(_make_synthetic_batch().data)
     fields = set(vars(breakdown).keys())
-    assert fields == {"total", "phase", "n_masked"}
+    core = {"total", "phase", "n_masked"}
+    monitor_stats = {
+        "target_var", "target_norm", "pred_var", "explained_var",
+        "weight_mean", "weight_min", "weight_max",
+        "loss_lown", "loss_highn", "wcontrib_lown", "wcontrib_highn",
+    }
+    assert fields == core | monitor_stats
+    for retired in ("l_mid_slot", "l_post_utterance", "l_recon", "l_distill"):
+        assert retired not in fields
 
 
 def test_b9_layer_avg_with_instance_norm_retired_from_runtime() -> None:
@@ -1338,3 +1349,361 @@ def test_compiled_step_matches_eager_within_tol(monkeypatch) -> None:
         pytest.skip(f"torch.compile backend unavailable on this host: {exc}")
 
     assert compiled_loss == pytest.approx(eager_loss, abs=1e-3, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Monitor additions (2026-06-15): JEPA magnitude-collapse + predictor-hedging
+# term stats, LR update-to-weight ratio, non-finite sentinel, EMA weight gap,
+# per-dim feature std / VICReg cov off-diag, throughput + GPU mem.
+# ---------------------------------------------------------------------------
+
+
+def test_infer_batch_size_dict_tensor_and_indeterminate() -> None:
+    """Leading-dim batch size off a NeuralSet dict-of-tensors or a bare tensor;
+    None when no tensor leads (throughput then logs step-time only)."""
+    assert _infer_batch_size({"electrode_tokens": torch.randn(3, 4, 5)}) == 3
+    assert _infer_batch_size(torch.randn(7, 2)) == 7
+    # First tensor value wins; non-tensor values are skipped.
+    assert _infer_batch_size({"meta": "x", "x": torch.randn(5, 1)}) == 5
+    assert _infer_batch_size({"meta": "no tensors"}) is None
+    assert _infer_batch_size(torch.tensor(3.0)) is None  # 0-d → no leading dim
+    assert _infer_batch_size(None) is None
+
+
+def test_log_feature_stats_emits_std_and_cov_offdiag() -> None:
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    torch.manual_seed(0)
+    rows = torch.randn(128, 8)
+    module._log_feature_stats(rows, step_name="train", key="")
+    for name in ("std_mean", "std_min", "cov_offdiag"):
+        assert f"train_mon_feat_{name}" in logged
+    assert logged["train_mon_feat_std_mean"] > 0.0
+    assert logged["train_mon_feat_std_min"] > 0.0
+
+
+def test_log_feature_stats_detects_dead_dim() -> None:
+    """A constant (dead) feature dim drives ``feat_std_min`` → 0 even while the
+    mean per-dim std stays healthy — the per-dim readout RankMe's spectrum
+    shape can wash out."""
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    torch.manual_seed(1)
+    rows = torch.randn(128, 8)
+    rows[:, 3] = 2.5  # one collapsed dim
+    module._log_feature_stats(rows, step_name="train", key="frontend_")
+    assert logged["train_mon_frontend_feat_std_min"] == pytest.approx(0.0, abs=1e-6)
+    assert logged["train_mon_frontend_feat_std_mean"] > 0.0
+
+
+def test_log_feature_stats_noop_below_two_rows() -> None:
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module._log_feature_stats(torch.randn(1, 8), step_name="train", key="")
+    assert not any(k.startswith("train_mon_feat") for k in logged)
+
+
+def test_teacher_rank_monitor_also_emits_feature_stats() -> None:
+    """The feature-std / cov-offdiag readouts ride the same valid-rows the M4
+    RankMe probe already computes."""
+    module = _make_module(phase="p2")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    B, K, F_p, T, d = 2, 5, 2, 3, 16
+    teacher_m4 = torch.randn(B, K, F_p, T, d)
+    latent_valid = torch.ones(B, K, dtype=torch.bool)
+    module._run_teacher_rank_monitor(
+        teacher_m4=teacher_m4, latent_valid=latent_valid, step_name="train",
+    )
+    for name in ("std_mean", "std_min", "cov_offdiag"):
+        assert f"train_mon_feat_{name}" in logged
+    # and the RankMe keys still fire (feature stats are additive).
+    assert "train_mon_rankme" in logged
+
+
+def test_log_term_stats_emits_collapse_triad_and_ratio() -> None:
+    """``_log_term_stats`` surfaces the collapse triad + the pred/target
+    variance ratio for a term that carries them, NaN-skipping the precision
+    fields a plain (unweighted) term leaves None."""
+    module = _make_module(phase="p2")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    bd = MaskedJepaBreakdown(
+        total=torch.tensor(0.5), phase="p2", n_masked=4,
+        target_var=torch.tensor(2.0), target_norm=torch.tensor(3.0),
+        pred_var=torch.tensor(0.5), explained_var=torch.tensor(0.8),
+    )
+    module._log_term_stats(bd, step_name="train", prefix="m4_")
+    for name in ("target_var", "target_norm", "pred_var", "explained_var"):
+        assert f"train_m4_{name}" in logged
+    assert logged["train_m4_pred_target_var_ratio"] == pytest.approx(0.5 / 2.0)
+    # No precision weighting → tier/weight keys are absent (None → skipped).
+    assert "train_m4_weight_mean" not in logged
+    assert "train_m4_loss_lown" not in logged
+
+
+def test_log_term_stats_emits_precision_tier_split_when_weighted() -> None:
+    module = _make_module(phase="p2")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    bd = MaskedJepaBreakdown(
+        total=torch.tensor(0.5), phase="p2", n_masked=4,
+        weight_mean=torch.tensor(1.0), weight_min=torch.tensor(0.1),
+        weight_max=torch.tensor(2.0),
+        loss_lown=torch.tensor(0.7), loss_highn=torch.tensor(0.3),
+        wcontrib_lown=torch.tensor(0.2), wcontrib_highn=torch.tensor(0.4),
+    )
+    module._log_term_stats(bd, step_name="train", prefix="m4_")
+    for name in (
+        "weight_mean", "weight_min", "weight_max",
+        "loss_lown", "loss_highn", "wcontrib_lown", "wcontrib_highn",
+    ):
+        assert f"train_m4_{name}" in logged
+
+
+def test_log_term_stats_skips_nan_tier() -> None:
+    """An empty precision tier emits NaN; ``_log_term_stats`` skips it rather
+    than logging NaN."""
+    module = _make_module(phase="p2")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    bd = MaskedJepaBreakdown(
+        total=torch.tensor(0.5), phase="p2", n_masked=4,
+        weight_mean=torch.tensor(1.0), weight_min=torch.tensor(1.0),
+        weight_max=torch.tensor(1.0),
+        loss_lown=torch.tensor(float("nan")),  # all-high-n batch → low-n empty
+        loss_highn=torch.tensor(0.3),
+        wcontrib_lown=torch.tensor(float("nan")),
+        wcontrib_highn=torch.tensor(0.3),
+    )
+    module._log_term_stats(bd, step_name="train", prefix="m4_")
+    assert "train_m4_loss_lown" not in logged
+    assert "train_m4_loss_highn" in logged
+
+
+def test_log_term_stats_none_breakdown_is_noop() -> None:
+    module = _make_module(phase="p2")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module._log_term_stats(None, step_name="train", prefix="m4_")
+    assert logged == {}
+
+
+def test_on_before_optimizer_step_logs_nonfinite_and_ema_gap() -> None:
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+    # Finite grads + weights → sentinel reads 0.
+    assert logged["train_mon_nonfinite"] == pytest.approx(0.0)
+    # Student was perturbed off the EMA mirror → strictly positive weight gap.
+    assert logged["train_mon_ema_weight_gap"] > 0.0
+    # optimizer=None → no live lr → update ratios are skipped, not crashed.
+    assert not any(k.startswith("train_mon_update_ratio") for k in logged)
+
+
+def test_ema_weight_gap_zero_at_construction() -> None:
+    """Fresh module: teacher is a deepcopy of the student → identical weights
+    → ~0 gap. Perturbing the student opens it."""
+    module = _make_module(phase="p1")
+    assert module._ema_weight_gap() == pytest.approx(0.0, abs=1e-7)
+    _perturb_student_for_nonzero_grad(module)
+    assert module._ema_weight_gap() > 0.0
+
+
+def test_on_before_optimizer_step_logs_update_ratio_with_optimizer() -> None:
+    """With a live optimizer, the per-group update-to-weight ratio
+    ``‖lr·grad‖/‖w‖`` is logged for groups present in the optimizer; the
+    front-end (which carries the P1 gradient) has a strictly positive ratio."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    opt = torch.optim.SGD(list(module._trainable_parameters()), lr=0.1)
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=opt)
+    assert "train_mon_update_ratio_frontend" in logged
+    assert logged["train_mon_update_ratio_frontend"] > 0.0
+    # ratio = lr * grad_l2 / (wnorm + eps): reconstruct from the logged norms.
+    gl2 = logged["train_mon_grad_l2_frontend"]
+    wn = logged["train_mon_wnorm_frontend"]
+    assert logged["train_mon_update_ratio_frontend"] == pytest.approx(
+        0.1 * gl2 / (wn + 1e-12), rel=1e-4
+    )
+
+
+def test_true_update_ratio_measured_across_two_optimizer_steps() -> None:
+    """The TRUE post-step displacement ‖Δθ‖/‖θ‖ is measured across two
+    consecutive grad hooks bracketing exactly one ``optimizer.step()``. For
+    plain SGD the step is exactly ``−lr·grad``, so the true ratio ==
+    ``lr·‖grad‖/‖θ‖`` (the snapshot's θ is the denominator base). The first
+    hook only snapshots — nothing is logged until a step has actually run."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    opt = torch.optim.SGD(list(module._trainable_parameters()), lr=0.1)
+
+    logged1: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged1.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=opt)  # snapshot θ_N (+ grad logs)
+    assert "train_mon_true_update_ratio_frontend" not in logged1
+    g = logged1["train_mon_grad_l2_frontend"]
+    w = logged1["train_mon_wnorm_frontend"]
+
+    opt.step()  # θ_{N+1} = θ_N − 0.1·grad
+
+    logged2: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged2.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=opt)  # measures Δ = θ_{N+1} − θ_N
+    assert logged2["train_mon_true_update_ratio_frontend"] > 0.0
+    assert logged2["train_mon_true_update_ratio_frontend"] == pytest.approx(
+        0.1 * g / w, rel=1e-4
+    )
+
+
+def test_true_update_ratio_zero_without_optimizer_step() -> None:
+    """Two grad hooks with NO ``optimizer.step()`` between them → params
+    unchanged → zero displacement. The metric only moves when the optimizer
+    actually steps (a sanity floor; exercises the optimizer=None path)."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    module.on_before_optimizer_step(optimizer=None)  # snapshot θ
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)  # measure: no step happened
+    assert logged["train_mon_true_update_ratio_frontend"] == pytest.approx(
+        0.0, abs=1e-9
+    )
+
+
+def test_on_train_batch_end_logs_throughput_after_first_step() -> None:
+    """The first batch-end has no prior timestamp → no step-time; the second
+    logs a positive step-time + samples/sec (batch size off the dict's leading
+    dim). GPU-mem only when CUDA is present."""
+    import time as _time
+
+    module = _make_module(phase="p1")
+    batch = _make_synthetic_batch().data  # leading dim B=2
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+
+    module.on_train_batch_end(outputs=None, batch=batch, batch_idx=0)
+    assert "train_mon_step_time_s" not in logged  # first call: no delta yet
+    _time.sleep(0.005)
+    module.on_train_batch_end(outputs=None, batch=batch, batch_idx=1)
+    assert logged["train_mon_step_time_s"] > 0.0
+    assert logged["train_mon_steps_per_sec"] == pytest.approx(
+        1.0 / logged["train_mon_step_time_s"], rel=1e-4
+    )
+    assert logged["train_mon_samples_per_sec"] == pytest.approx(
+        2.0 / logged["train_mon_step_time_s"], rel=1e-4
+    )
+    if torch.cuda.is_available():
+        assert "train_mon_gpu_mem_gb" in logged
+
+
+# ---------------------------------------------------------------------------
+# MON-INPUT-STATS (2026-06-15): sanity stats on the model's actual inputs —
+# normalization drift / bad-electrode outlier / corrupt-cache guard.
+# ---------------------------------------------------------------------------
+
+
+def test_input_stats_monitor_logs_healthy_panel() -> None:
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    torch.manual_seed(0)
+    et = torch.randn(2, 5, 8, 4)
+    module._run_input_stats_monitor(
+        batch_data={"electrode_tokens": et}, step_name="train",
+    )
+    for name in ("mean", "std", "absmax", "nonfinite_frac"):
+        assert f"train_mon_input_{name}" in logged
+    assert logged["train_mon_input_nonfinite_frac"] == pytest.approx(0.0)
+    assert logged["train_mon_input_absmax"] == pytest.approx(
+        float(et.abs().max()), rel=1e-5
+    )
+    # No high band emitted when the batch is single-band.
+    assert not any(k.startswith("train_mon_input_high") for k in logged)
+
+
+def test_input_stats_monitor_flags_nonfinite_without_poisoning_reductions() -> None:
+    """A stray Inf/NaN drives ``nonfinite_frac`` > 0 but the mean/std/absmax
+    reduce over the FINITE values only (so one Inf can't blow up absmax)."""
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    et = torch.ones(2, 2, 2, 2)  # 16 finite values, all magnitude 1
+    et[0, 0, 0, 0] = float("inf")
+    et[0, 0, 0, 1] = float("nan")
+    module._run_input_stats_monitor(
+        batch_data={"electrode_tokens": et}, step_name="train",
+    )
+    assert logged["train_mon_input_nonfinite_frac"] == pytest.approx(2 / 16)
+    # absmax over the finite ones is 1.0, NOT inf.
+    assert logged["train_mon_input_absmax"] == pytest.approx(1.0)
+    assert logged["train_mon_input_mean"] == pytest.approx(1.0)
+
+
+def test_input_stats_monitor_all_nonfinite_logs_frac_only() -> None:
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    et = torch.full((2, 2, 2, 2), float("nan"))
+    module._run_input_stats_monitor(
+        batch_data={"electrode_tokens": et}, step_name="train",
+    )
+    assert logged["train_mon_input_nonfinite_frac"] == pytest.approx(1.0)
+    for name in ("mean", "std", "absmax"):
+        assert f"train_mon_input_{name}" not in logged
+
+
+def test_input_stats_monitor_emits_high_band_when_present() -> None:
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    torch.manual_seed(1)
+    module._run_input_stats_monitor(
+        batch_data={
+            "electrode_tokens": torch.randn(2, 5, 8, 4),
+            "electrode_tokens_high": torch.randn(2, 5, 8, 6),
+        },
+        step_name="train",
+    )
+    for name in ("absmax", "nonfinite_frac", "mean", "std"):
+        assert f"train_mon_input_high_{name}" in logged
+
+
+def test_input_stats_monitor_noop_without_input_tensor() -> None:
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module._run_input_stats_monitor(batch_data={}, step_name="train")
+    module._run_input_stats_monitor(
+        batch_data={"electrode_tokens": torch.zeros(0)}, step_name="train",
+    )
+    assert not any(k.startswith("train_mon_input") for k in logged)
+
+
+def test_monitor_from_step_emits_input_stats() -> None:
+    """End-to-end: the per-step monitor dispatch surfaces the input-sanity
+    panel alongside the coverage / rank probes."""
+    module = _make_module(phase="p1")
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update(  # type: ignore[method-assign]
+        {key: float(value.detach() if hasattr(value, "detach") else value)})
+    module._monitor_from_step(_make_synthetic_batch().data, step_name="train")
+    for name in ("mean", "std", "absmax", "nonfinite_frac"):
+        assert f"train_mon_input_{name}" in logged

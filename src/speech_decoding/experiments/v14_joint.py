@@ -297,6 +297,14 @@ class V14JointExperiment(V14Experiment):
     m4_precision_alpha: float = pydantic.Field(default=1.0, ge=0.0)
     m4_precision_floor_pct: float = pydantic.Field(default=25.0, ge=0.0, le=100.0)
     m4_precision_cap: float = pydantic.Field(default=10.0, ge=0.0)
+    # Precision-weight form (reports/m4_precision_downweight_handoff_2026_06_15.md).
+    # "downweight_dof" (default) = electrode-dof w=min(1,((n-1)/(n_ref-1))^α), n-only,
+    # sub-1 mean (acts as a principled λ_m4≈0.58); "mean1_invvar" = the prior mean-1
+    # inverse-variance form (the R-precision-mean1 falsifier). n_ref = full-trust
+    # electrode count (the min-cap; ~1+1/ρ, n_ref=11 ⇔ ρ≈0.1). floor_pct/cap are
+    # inert under downweight_dof. project_v14_heteroscedastic_ssl_loss.
+    m4_precision_mode: Literal["downweight_dof", "mean1_invvar"] = "downweight_dof"
+    m4_precision_nref: float = pydantic.Field(default=11.0, gt=1.0)
 
     # B37 D8 parcel-side discriminative-LR scale (joint only). The parcel side
     # (+ both predictors) rides at ``base_lr · joint_parcel_lr_scale``; the
@@ -515,6 +523,8 @@ class V14JointExperiment(V14Experiment):
             m4_precision_alpha=self.m4_precision_alpha,
             m4_precision_floor_pct=self.m4_precision_floor_pct,
             m4_precision_cap=self.m4_precision_cap,
+            m4_precision_mode=self.m4_precision_mode,
+            m4_precision_nref=self.m4_precision_nref,
             latent_valid_override=self.latent_valid_override,
             sa_mask_mode=self.sa_mask_mode,
             frontend_lr_scale=self.frontend_lr_scale,

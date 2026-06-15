@@ -289,6 +289,34 @@ def test_v14_dispatch_dry_run_summary_tracks_atlas_and_hetero_m4(capsys) -> None
     assert "cap=10.0" in out
 
 
+def test_v14_dispatch_dry_run_surfaces_m4_precision_mode(capsys) -> None:
+    """The precision-weight FORM + n_ref must reach the launch summary
+    (reports/m4_precision_downweight_handoff_2026_06_15.md): the new default is
+    'downweight_dof' n_ref=11, and the 'mean1_invvar' override (R-precision-mean1)
+    must flip the printed mode so the persisted run record is unambiguous."""
+    from speech_decoding.experiments import dispatch_v14
+    # Default form: downweight_dof, n_ref=11.0.
+    rc = dispatch_v14.main([
+        "--dry-run", "--atlas", "dkt", "--exclude-single-electrode-parcels",
+        "--m4-precision-weight",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "m4_precision: ON" in out
+    assert "mode=downweight_dof" in out
+    assert "nref=11.0" in out
+    # mean1_invvar override flips the printed mode + carries the looser n_ref.
+    rc2 = dispatch_v14.main([
+        "--dry-run", "--atlas", "dkt", "--exclude-single-electrode-parcels",
+        "--m4-precision-weight", "--m4-precision-mode", "mean1_invvar",
+        "--m4-precision-nref", "15",
+    ])
+    out2 = capsys.readouterr().out
+    assert rc2 == 0
+    assert "mode=mean1_invvar" in out2
+    assert "nref=15.0" in out2
+
+
 def test_v14_dispatch_dry_run_surfaces_dual_band_mask_geometry(capsys) -> None:
     """The 2STFT dual-band M2 block-geometry knobs must reach the launch summary.
 

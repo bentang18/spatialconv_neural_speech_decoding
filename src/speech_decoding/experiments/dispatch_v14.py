@@ -851,6 +851,8 @@ def build_v14_experiment(
     m4_precision_alpha: float = 1.0,
     m4_precision_floor_pct: float = 25.0,
     m4_precision_cap: float = 10.0,
+    m4_precision_mode: str = "downweight_dof",
+    m4_precision_nref: float = 11.0,
     predictor_hidden: int = DEFAULT_PREDICTOR_HIDDEN,
     predictor_n_heads: int = DEFAULT_PREDICTOR_N_HEADS,
     # WS-H / T20 (B33 P3 distillation): root of the whole-movie Whisper teacher
@@ -1707,6 +1709,8 @@ def build_v14_experiment(
             "m4_precision_alpha": m4_precision_alpha,
             "m4_precision_floor_pct": m4_precision_floor_pct,
             "m4_precision_cap": m4_precision_cap,
+            "m4_precision_mode": m4_precision_mode,
+            "m4_precision_nref": m4_precision_nref,
             "predictor_hidden": predictor_hidden,
             "predictor_n_heads": predictor_n_heads,
             # #94 V-JEPA-2 visible-only predictor (context+query drop). Joint-only.
@@ -2866,7 +2870,27 @@ def _parser() -> argparse.ArgumentParser:
         "--m4-precision-cap", dest="m4_precision_cap", type=float, default=10.0,
         help="Max per-cell weight (after mean-1 normalization) for "
              "--m4-precision-weight; cheap insurance on top of the shrinkage "
-             "floor. <=0 disables the cap. Default 10.",
+             "floor. <=0 disables the cap. mean1_invvar only (inert under "
+             "downweight_dof). Default 10.",
+    )
+    p.add_argument(
+        "--m4-precision-mode", dest="m4_precision_mode",
+        choices=("downweight_dof", "mean1_invvar"), default="downweight_dof",
+        help="Precision-weight FORM for --m4-precision-weight "
+             "(reports/m4_precision_downweight_handoff_2026_06_15.md). "
+             "'downweight_dof' (default) = electrode-dof "
+             "w=min(1,((n-1)/(n_ref-1))^α): n-only, NOT mean-1 (shaky low-n "
+             "parcels genuinely contribute less, sub-1 mean ≈ a principled "
+             "λ_m4≈0.58), 0 at n=1, no σ²₀ shrinkage needed. 'mean1_invvar' = "
+             "the prior mean-1 inverse-variance w=n^α/(σ²+σ²₀) form (the "
+             "R-precision-mean1 falsifier; floor-pct/cap apply only here).",
+    )
+    p.add_argument(
+        "--m4-precision-nref", dest="m4_precision_nref", type=float, default=11.0,
+        help="downweight_dof full-trust electrode count (the min(1,·) cap from "
+             "electrode-correlation saturation, n_ref≈1+1/ρ; n_ref=11 ⇔ ρ≈0.1). "
+             "n≥n_ref → weight 1.0. R-precision-nref-15 = gentler tail (ρ≈0.07). "
+             "Must be > 1.0. Inert under mean1_invvar. Default 11.",
     )
     p.add_argument(
         "--m4-mask-type", dest="m4_mask_type", choices=("tube", "time_block"),
@@ -3281,6 +3305,8 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         m4_precision_alpha=args.m4_precision_alpha,
         m4_precision_floor_pct=args.m4_precision_floor_pct,
         m4_precision_cap=args.m4_precision_cap,
+        m4_precision_mode=args.m4_precision_mode,
+        m4_precision_nref=args.m4_precision_nref,
         predictor_hidden=args.predictor_hidden,
         predictor_n_heads=args.predictor_n_heads,
         loss_variant=args.loss_variant,
@@ -3846,10 +3872,19 @@ def main(argv: list[str] | None = None) -> int:
     # weighted (and with what α / floor-pct / cap) instead of silently riding
     # the uniform-weight default.
     if args.m4_precision_weight:
+        if args.m4_precision_mode == "downweight_dof":
+            note = ("downweight-only electrode-dof w=min(1,((n-1)/(nref-1))^α); "
+                    "floor_pct/cap inert; sub-1 mean ≈ a principled λ_m4")
+        else:
+            note = ("mean-1 inverse-variance w=n^α/(σ²+σ²₀); nref inert; "
+                    "R-precision-mean1")
+        # alpha stays immediately after ON (run-record greppability); every knob's
+        # value is printed so the config is reconstructable, the note flags active.
         print(f"  m4_precision: ON alpha={args.m4_precision_alpha} "
+              f"mode={args.m4_precision_mode} nref={args.m4_precision_nref} "
               f"floor_pct={args.m4_precision_floor_pct} "
               f"cap={args.m4_precision_cap} "
-              f"(inverse-variance weighted M4 L1, #140)")
+              f"({note}, #140)")
     else:
         print("  m4_precision: OFF (uniform-weight M4 L1)")
     if args.cluster == "slurm":

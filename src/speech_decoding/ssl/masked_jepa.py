@@ -56,6 +56,105 @@ class MaskedJepaBreakdown:
     total: Tensor
     phase: str
     n_masked: int
+    # --- collapse/quality monitor scalars (None when < 2 scored cells) ---
+    # RankMe is scale-INVARIANT (it reads the latent spectrum's shape, not its
+    # size), so it cannot see the classic JEPA failure where the EMA teacher
+    # output shrinks toward a tiny-but-structured target (loss ↓ looks like
+    # learning). These detached scalars can: a healthy run has loss ↓ with
+    # ``explained_var`` ↑ and ``target_var`` flat; magnitude collapse is loss ↓
+    # with ``target_var`` ↓ and ``explained_var`` flat. project: monitor-stats.
+    target_var: tp.Optional[Tensor] = None
+    target_norm: tp.Optional[Tensor] = None
+    pred_var: tp.Optional[Tensor] = None
+    explained_var: tp.Optional[Tensor] = None
+    # --- M4 precision-weight monitor scalars (None unless precision ON) ---
+    # The observable proof the downweight-dof weight is doing its job: low-n
+    # parcels should carry HIGHER raw loss but LOWER weighted contribution.
+    weight_mean: tp.Optional[Tensor] = None
+    weight_min: tp.Optional[Tensor] = None
+    weight_max: tp.Optional[Tensor] = None
+    loss_lown: tp.Optional[Tensor] = None
+    loss_highn: tp.Optional[Tensor] = None
+    wcontrib_lown: tp.Optional[Tensor] = None
+    wcontrib_highn: tp.Optional[Tensor] = None
+
+
+# Monitor-stat numerical guards (separate from the loss math — these only feed
+# detached wandb scalars, never the gradient).
+_JEPA_STATS_EPS = 1e-8
+
+
+def _jepa_pred_target_stats(
+    pred: Tensor, target: Tensor, *, loss_form: _LossForm = "l1",
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Detached collapse/quality scalars for a masked-JEPA term.
+
+    Returns ``(target_var, target_norm, pred_var, explained_var)``:
+      * ``target_var``   — mean over feature dims of the target's per-dim
+        variance across the scored tokens (VICReg variance signal; → 0 when the
+        EMA teacher output collapses to a constant across tokens).
+      * ``target_norm``  — mean per-token L2 norm of the target (magnitude).
+      * ``pred_var``     — the same per-dim variance for the predictor output
+        (→ 0 when the predictor hedges to the batch-mean target — soft collapse
+        that ``target_var`` alone can't see; the ``pred_var/target_var`` ratio
+        is the readout).
+      * ``explained_var`` — ``1 − err / Var(target)`` over all scored elements;
+        scale-free "fraction of target structure captured" (``err`` matches the
+        loss form: squared for MSE, |·| for L1).
+
+    All NaN when fewer than 2 scored tokens (variance undefined) so the caller's
+    logger skips them. Pure observability — detached, never graph-connected.
+    """
+    if pred.shape[0] < 2:
+        nan = pred.new_full((), float("nan")).detach()
+        return nan, nan, nan, nan
+    p = pred.detach()
+    t = target.detach()
+    target_var = t.var(dim=0, unbiased=False).mean()
+    target_norm = t.norm(dim=-1).mean()
+    pred_var = p.var(dim=0, unbiased=False).mean()
+    if loss_form == "mse":
+        err = (p - t).pow(2).mean()
+    else:
+        err = (p - t).abs().mean()
+    explained_var = 1.0 - err / (t.var(unbiased=False) + _JEPA_STATS_EPS)
+    return target_var, target_norm, pred_var, explained_var
+
+
+def _m4_precision_monitor_stats(
+    *,
+    pred: Tensor,
+    target: Tensor,
+    weight: Tensor,         # (n_target,) the applied detached weight
+    n_at_target: Tensor,    # (n_target,) per-scored-cell electrode count
+    n_ref: float,           # tier split = the full-trust cap n_ref
+    loss_form: _LossForm,
+) -> dict[str, Tensor]:
+    """Per-cell raw vs weighted loss split by electrode-count tier, plus the
+    applied-weight distribution. Low-n cells (``n < n_ref``, the down-weighted
+    tier) vs high-n (full-trust). Detached observability only."""
+    p = pred.detach()
+    t = target.detach()
+    w = weight.detach()
+    if loss_form == "mse":
+        per_cell = (p - t).pow(2).mean(dim=-1)   # (n_target,)
+    else:
+        per_cell = (p - t).abs().mean(dim=-1)
+    low = n_at_target < n_ref
+    high = ~low
+
+    def _m(x: Tensor, m: Tensor) -> Tensor:
+        return x[m].mean() if bool(m.any()) else x.new_full((), float("nan"))
+
+    return {
+        "weight_mean": w.mean(),
+        "weight_min": w.min(),
+        "weight_max": w.max(),
+        "loss_lown": _m(per_cell, low),
+        "loss_highn": _m(per_cell, high),
+        "wcontrib_lown": _m(per_cell * w, low),
+        "wcontrib_highn": _m(per_cell * w, high),
+    }
 
 
 def _l1_or_zero(pred: Tensor, target: Tensor, loss_form: _LossForm) -> Tensor:
@@ -77,6 +176,11 @@ def _l1_or_zero(pred: Tensor, target: Tensor, loss_form: _LossForm) -> Tensor:
 
 
 # Heteroscedastic (precision-weighted) M4 loss — project_v14_heteroscedastic_ssl_loss
+# NOTE: the DEFAULT form is now ``downweight_dof`` (``_precision_weight_downweight``;
+# reports/m4_precision_downweight_handoff_2026_06_15.md) — n-only, NOT mean-1, no σ²₀,
+# 0 at n=1. The σ²₀ shrinkage machinery below documents the ``mean1_invvar`` path ONLY
+# (the R-precision-mean1 falsifier); ``downweight_dof`` sidesteps the degenerate-cell
+# pathology by construction (it never inverts σ², and downweights low-n parcels).
 # ``ε`` is ONLY a div-by-zero / NaN guard — NOT the variance floor. The real floor
 # is an empirical-Bayes SHRINKAGE prior ``σ²₀`` (an in-batch percentile of the
 # scored σ²; see ``_m4_precision_weight``). Measured on a real nano batch
@@ -162,6 +266,29 @@ def _precision_weight_core(
     return w
 
 
+def _precision_weight_downweight(
+    n_cell: Tensor,       # (B, N) per-cell electrode count (broadcast per parcel)
+    target_cell: Tensor,  # (B, N) bool, scored cells
+    *,
+    n_ref: float,         # full-trust electrode count (cap); ~ 1 + 1/rho
+    alpha: float,         # 1.0 = MMSE inverse-variance; >1 = risk-averse overlay
+) -> Tensor:
+    """Downweight-only electrode-dof precision weight (NO sigma, NO mean-1, NO floor).
+
+    ``w = min(1, ((n-1)/(n_ref-1))^alpha)`` gathered at the scored cells, DETACHED.
+    Linear-in-dof (alpha=1) is the MMSE inverse-variance weight; the min(1, .) cap is
+    the electrode-correlation saturation at n_ref ~ 1 + 1/rho. Passes through 0 at
+    n=1 (single-electrode parcels carry no std and are excluded upstream). The weight
+    mean is < 1 by design — shaky parcels contribute less and are NOT compensated by
+    upweighting others (the deliberate contrast with _precision_weight_core's mean-1).
+    project_v14_heteroscedastic_ssl_loss / reports/m4_precision_downweight_handoff_2026_06_15.md
+    """
+    ref = max(float(n_ref) - 1.0, _M4_PRECISION_EPS)
+    dof = (n_cell - 1.0).clamp(min=0.0)
+    w = (dof / ref).pow(alpha).clamp(max=1.0)
+    return w[target_cell].detach()
+
+
 def _m4_precision_weight(
     precision_std: Tensor,   # (B, K, F_p, T_p) per-cell pooled σ (raw |STFT| std)
     precision_n: Tensor,     # (B, K) electrode count per parcel
@@ -170,16 +297,29 @@ def _m4_precision_weight(
     eps: float,
     floor_pct: float,        # percentile (0-100) of in-batch scored σ² → shrinkage prior σ²₀
     cap: float,              # max weight after mean-1 norm (<=0 disables the cap)
+    mode: str = "downweight_dof",  # "downweight_dof" (default) | "mean1_invvar"
+    n_ref: float = 11.0,     # downweight_dof full-trust electrode count (cap; ~1+1/ρ)
 ) -> Tensor:
-    """Inverse-variance precision weight for the B37 ``(F_p, T_p)`` M4 grid —
-    builds the flat ``(B, N)`` σ²/n cells (K outer, F_p, T_p inner) and delegates
-    to :func:`_precision_weight_core`."""
+    """Precision weight for the B37 ``(F_p, T_p)`` M4 grid — builds the flat
+    ``(B, N)`` raw per-cell electrode count (K outer, F_p, T_p inner) and branches
+    on ``mode``: ``downweight_dof`` (electrode-dof, n-only, sub-1 mean — the
+    default, :func:`_precision_weight_downweight`) or ``mean1_invvar`` (the prior
+    mean-1 inverse-variance form, :func:`_precision_weight_core`; the
+    ``R-precision-mean1`` falsifier). ``precision_std``/``floor_pct``/``cap`` are
+    unused under ``downweight_dof`` (n-only)."""
     B, K, F_p, T_p = precision_std.shape
     N = K * F_p * T_p
-    n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
-    n_cell = n_pow.unsqueeze(-1).unsqueeze(-1).expand(B, K, F_p, T_p).reshape(B, N)
-    sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
-    return _precision_weight_core(sigma2, n_cell, target_cell, eps, floor_pct, cap)
+    n_cell = (
+        precision_n.unsqueeze(-1).unsqueeze(-1).expand(B, K, F_p, T_p).reshape(B, N)
+    )                                                       # (B, N) raw per-cell n
+    if mode == "downweight_dof":
+        return _precision_weight_downweight(
+            n_cell, target_cell, n_ref=n_ref, alpha=alpha
+        )
+    # mode == "mean1_invvar" — existing path (byte-identical to pre-change):
+    n_pow = n_cell.clamp(min=1.0).pow(alpha)                # (B, N)
+    sigma2 = precision_std.pow(2).reshape(B, N)             # (B, N)
+    return _precision_weight_core(sigma2, n_pow, target_cell, eps, floor_pct, cap)
 
 
 def _m4_precision_weight_flat(
@@ -190,18 +330,25 @@ def _m4_precision_weight_flat(
     eps: float,
     floor_pct: float,
     cap: float,
+    mode: str = "downweight_dof",  # "downweight_dof" (default) | "mean1_invvar"
+    n_ref: float = 11.0,     # downweight_dof full-trust electrode count (cap; ~1+1/ρ)
 ) -> Tensor:
-    """Inverse-variance precision weight for the 2STFT flat-S M4 latent — builds
-    the flat ``(B, N=K·S)`` σ²/n cells (K outer, S inner) and delegates to
-    :func:`_precision_weight_core`. The whole-parcel tube means a target parcel's
-    σ/n weight is shared across all its ``S`` slots (n is per-parcel; σ varies per
-    slot)."""
+    """Precision weight for the 2STFT flat-S M4 latent — builds the flat
+    ``(B, N=K·S)`` raw per-cell electrode count (K outer, S inner) and branches on
+    ``mode`` exactly as :func:`_m4_precision_weight`. The whole-parcel tube means a
+    target parcel's weight is shared across all its ``S`` slots (n is per-parcel; σ
+    — used only by ``mean1_invvar`` — varies per slot)."""
     B, K, S = precision_std.shape
     N = K * S
-    n_pow = precision_n.clamp(min=1.0).pow(alpha)            # (B, K)
-    n_cell = n_pow.unsqueeze(-1).expand(B, K, S).reshape(B, N)
-    sigma2 = precision_std.pow(2).reshape(B, N)              # (B, N)
-    return _precision_weight_core(sigma2, n_cell, target_cell, eps, floor_pct, cap)
+    n_cell = precision_n.unsqueeze(-1).expand(B, K, S).reshape(B, N)  # (B, N) raw n
+    if mode == "downweight_dof":
+        return _precision_weight_downweight(
+            n_cell, target_cell, n_ref=n_ref, alpha=alpha
+        )
+    # mode == "mean1_invvar" — existing path (byte-identical to pre-change):
+    n_pow = n_cell.clamp(min=1.0).pow(alpha)                # (B, N)
+    sigma2 = precision_std.pow(2).reshape(B, N)             # (B, N)
+    return _precision_weight_core(sigma2, n_pow, target_cell, eps, floor_pct, cap)
 
 
 def p1_frontend_m2_loss(
@@ -312,7 +459,13 @@ def p1_frontend_m2_loss(
     )                                              # (n_masked, d)
     target = teacher_ctx[target_flat].detach()     # (n_masked, d)
     loss = _l1_or_zero(pred, target, loss_form)
-    return MaskedJepaBreakdown(total=loss, phase="p1", n_masked=int(target_flat.sum()))
+    tvar, tnorm, pvar, evar = _jepa_pred_target_stats(
+        pred, target, loss_form=loss_form,
+    )
+    return MaskedJepaBreakdown(
+        total=loss, phase="p1", n_masked=int(target_flat.sum()),
+        target_var=tvar, target_norm=tnorm, pred_var=pvar, explained_var=evar,
+    )
 
 
 def p2_parcel_m4_loss(
@@ -367,7 +520,13 @@ def p2_parcel_m4_loss(
     )                                                # (n_masked, d)
     target = teacher_m4.reshape(B, N, d)[target_flat].detach()  # (n_masked, d)
     loss = _l1_or_zero(pred, target, loss_form)
-    return MaskedJepaBreakdown(total=loss, phase="p2", n_masked=n_masked)
+    tvar, tnorm, pvar, evar = _jepa_pred_target_stats(
+        pred, target, loss_form=loss_form,
+    )
+    return MaskedJepaBreakdown(
+        total=loss, phase="p2", n_masked=n_masked,
+        target_var=tvar, target_norm=tnorm, pred_var=pvar, explained_var=evar,
+    )
 
 
 def b37_m4_freq_loss(
@@ -385,6 +544,8 @@ def b37_m4_freq_loss(
     precision_alpha: float = 1.0,
     precision_floor_pct: float = _M4_PRECISION_FLOOR_PCT,
     precision_cap: float = _M4_PRECISION_CAP,
+    precision_mode: str = "downweight_dof",   # or "mean1_invvar" (R-precision-mean1)
+    precision_nref: float = 11.0,
 ) -> MaskedJepaBreakdown:
     """B37 M4 masked JEPA — the freq-PRESERVING parcel reconstruction (D3/D9).
 
@@ -459,6 +620,7 @@ def b37_m4_freq_loss(
         query_valid=target_cell,
     )                                                # (n_target, d)
     target = teacher_m4.reshape(B, N, d)[target_cell].detach()  # (n_target, d)
+    prec_stats: tp.Optional[dict[str, Tensor]] = None
     if precision_std is None and precision_n is None:
         loss = _l1_or_zero(pred, target, loss_form)
     else:
@@ -484,10 +646,28 @@ def b37_m4_freq_loss(
             eps=_M4_PRECISION_EPS,
             floor_pct=precision_floor_pct,
             cap=precision_cap,
+            mode=precision_mode,
+            n_ref=precision_nref,
         )
         loss = _weighted_l1_or_zero(pred, target, weight, loss_form)
+        if pred.shape[0] >= 1:
+            n_cells = (
+                precision_n.view(B, K, 1, 1)
+                .expand(B, K, F_p, T_p)
+                .reshape(B, N)
+            )
+            prec_stats = _m4_precision_monitor_stats(
+                pred=pred, target=target, weight=weight,
+                n_at_target=n_cells[target_cell],
+                n_ref=precision_nref, loss_form=loss_form,
+            )
+    tvar, tnorm, pvar, evar = _jepa_pred_target_stats(
+        pred, target, loss_form=loss_form,
+    )
     return MaskedJepaBreakdown(
-        total=loss, phase="m4_freq", n_masked=int(target_cell.sum())
+        total=loss, phase="m4_freq", n_masked=int(target_cell.sum()),
+        target_var=tvar, target_norm=tnorm, pred_var=pvar, explained_var=evar,
+        **(prec_stats or {}),
     )
 
 
@@ -590,8 +770,12 @@ def m2_dual_band_loss(
     )                                                # (n_masked, d)
     target = teacher_m2.reshape(B, N, d)[target_cell].detach()  # (n_masked, d)
     loss = _l1_or_zero(pred, target, loss_form)
+    tvar, tnorm, pvar, evar = _jepa_pred_target_stats(
+        pred, target, loss_form=loss_form,
+    )
     return MaskedJepaBreakdown(
-        total=loss, phase="m2_dual_band", n_masked=int(target_cell.sum())
+        total=loss, phase="m2_dual_band", n_masked=int(target_cell.sum()),
+        target_var=tvar, target_norm=tnorm, pred_var=pvar, explained_var=evar,
     )
 
 
@@ -613,6 +797,8 @@ def m4_dual_band_loss(
     precision_alpha: float = 1.0,
     precision_floor_pct: float = _M4_PRECISION_FLOOR_PCT,
     precision_cap: float = _M4_PRECISION_CAP,
+    precision_mode: str = "downweight_dof",   # or "mean1_invvar" (R-precision-mean1)
+    precision_nref: float = 11.0,
 ) -> MaskedJepaBreakdown:
     """2STFT M4 latent masked JEPA — the WHOLE-PARCEL tube on the flat-S latent.
 
@@ -716,6 +902,7 @@ def m4_dual_band_loss(
         query_valid=target_cell,
     )                                                # (n_target, d)
     target = teacher_m4.reshape(B, N, d)[target_cell].detach()  # (n_target, d)
+    prec_stats: tp.Optional[dict[str, Tensor]] = None
     if precision_std is None and precision_n is None:
         loss = _l1_or_zero(pred, target, loss_form)
     else:
@@ -741,10 +928,26 @@ def m4_dual_band_loss(
             eps=_M4_PRECISION_EPS,
             floor_pct=precision_floor_pct,
             cap=precision_cap,
+            mode=precision_mode,
+            n_ref=precision_nref,
         )
         loss = _weighted_l1_or_zero(pred, target, weight, loss_form)
+        if pred.shape[0] >= 1:
+            n_cells = (
+                precision_n.view(B, K, 1).expand(B, K, S).reshape(B, N)
+            )
+            prec_stats = _m4_precision_monitor_stats(
+                pred=pred, target=target, weight=weight,
+                n_at_target=n_cells[target_cell],
+                n_ref=precision_nref, loss_form=loss_form,
+            )
+    tvar, tnorm, pvar, evar = _jepa_pred_target_stats(
+        pred, target, loss_form=loss_form,
+    )
     return MaskedJepaBreakdown(
-        total=loss, phase="m4_dual_band", n_masked=int(target_cell.sum())
+        total=loss, phase="m4_dual_band", n_masked=int(target_cell.sum()),
+        target_var=tvar, target_norm=tnorm, pred_var=pvar, explained_var=evar,
+        **(prec_stats or {}),
     )
 
 

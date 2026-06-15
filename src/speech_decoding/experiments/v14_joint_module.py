@@ -62,6 +62,7 @@ values (``"support"`` / ``"bidirectional"``); non-default values raise
 from __future__ import annotations
 
 import os
+import time
 import typing as tp
 from dataclasses import dataclass
 
@@ -133,6 +134,11 @@ class JointJepaBreakdown:
     n_masked_m4: int
     lambda_m4: float
     phase: str = "joint"
+    # The per-term sub-breakdowns, so the shared logger can surface each term's
+    # collapse/quality + precision-weight monitor scalars (None on legacy paths
+    # that don't carry them).
+    m2: tp.Optional[MaskedJepaBreakdown] = None
+    m4: tp.Optional[MaskedJepaBreakdown] = None
 
     @property
     def n_masked(self) -> int:
@@ -177,6 +183,19 @@ def _maybe_drop_singleton_trailing(t: tp.Optional[Tensor]) -> tp.Optional[Tensor
     while out.dim() > 1 and out.shape[-1] == 1:
         out = out.squeeze(-1)
     return out
+
+
+def _infer_batch_size(batch: tp.Any) -> tp.Optional[int]:
+    """Leading-dim batch size from a NeuralSet batch (dict of tensors) or a
+    bare tensor; ``None`` if indeterminate (throughput then logs step-time
+    only). Used by the per-step throughput monitor."""
+    if isinstance(batch, dict):
+        for v in batch.values():
+            if isinstance(v, Tensor) and v.dim() >= 1:
+                return int(v.shape[0])
+    elif isinstance(batch, Tensor) and batch.dim() >= 1:
+        return int(batch.shape[0])
+    return None
 
 
 def _latent_valid_from_batch(
@@ -286,6 +305,13 @@ class V14JointBrainModule(pl.LightningModule):
         m4_precision_alpha: float = 1.0,
         m4_precision_floor_pct: float = 25.0,
         m4_precision_cap: float = 10.0,
+        # Precision-weight form (project_v14_heteroscedastic_ssl_loss /
+        # reports/m4_precision_downweight_handoff_2026_06_15.md). "downweight_dof"
+        # (default) = electrode-dof w=min(1,((n-1)/(n_ref-1))^α), n-only, sub-1
+        # mean. "mean1_invvar" = the prior mean-1 inverse-variance form
+        # (R-precision-mean1 falsifier). n_ref = full-trust electrode count (cap).
+        m4_precision_mode: str = "downweight_dof",
+        m4_precision_nref: float = 11.0,
         predictor: tp.Optional[JepaPredictor] = None,
         predictor_depth: int = 3,
         predictor_hidden: int = 128,
@@ -350,6 +376,15 @@ class V14JointBrainModule(pl.LightningModule):
         if m4_precision_alpha < 0.0:
             raise ValueError(
                 f"m4_precision_alpha must be >= 0; got {m4_precision_alpha}"
+            )
+        if m4_precision_mode not in ("downweight_dof", "mean1_invvar"):
+            raise ValueError(
+                "m4_precision_mode must be 'downweight_dof' or 'mean1_invvar'; "
+                f"got {m4_precision_mode!r}"
+            )
+        if m4_precision_nref <= 1.0:
+            raise ValueError(
+                f"m4_precision_nref must be > 1.0; got {m4_precision_nref}"
             )
         # B36 WS-E E2 hyperparameter (P2 only). 0.0 = R-p2-freeze-frontend
         # (front-end frozen, parcel side trains alone); 0.1 = base/10 default;
@@ -577,6 +612,8 @@ class V14JointBrainModule(pl.LightningModule):
         self._m4_precision_alpha = float(m4_precision_alpha)
         self._m4_precision_floor_pct = float(m4_precision_floor_pct)
         self._m4_precision_cap = float(m4_precision_cap)
+        self._m4_precision_mode = str(m4_precision_mode)
+        self._m4_precision_nref = float(m4_precision_nref)
         self._frontend_lr_scale = frontend_lr_scale
         self._parcel_lr_scale = parcel_lr_scale
         self._wd_exclude_norms = bool(wd_exclude_norms)
@@ -1097,6 +1134,8 @@ class V14JointBrainModule(pl.LightningModule):
             precision_alpha=self._m4_precision_alpha,
             precision_floor_pct=self._m4_precision_floor_pct,
             precision_cap=self._m4_precision_cap,
+            precision_mode=self._m4_precision_mode,
+            precision_nref=self._m4_precision_nref,
         )
         total = m2_bd.total + self._lambda_m4 * m4_bd.total
         return JointJepaBreakdown(
@@ -1106,6 +1145,8 @@ class V14JointBrainModule(pl.LightningModule):
             n_masked_m2=m2_bd.n_masked,
             n_masked_m4=m4_bd.n_masked,
             lambda_m4=self._lambda_m4,
+            m2=m2_bd,
+            m4=m4_bd,
         )
 
     def _sample_dual_band_mask(
@@ -1269,6 +1310,8 @@ class V14JointBrainModule(pl.LightningModule):
             precision_alpha=self._m4_precision_alpha,
             precision_floor_pct=self._m4_precision_floor_pct,
             precision_cap=self._m4_precision_cap,
+            precision_mode=self._m4_precision_mode,
+            precision_nref=self._m4_precision_nref,
         )
         total = m2_bd.total + self._lambda_m4 * m4_bd.total
         return JointJepaBreakdown(
@@ -1278,6 +1321,8 @@ class V14JointBrainModule(pl.LightningModule):
             n_masked_m2=m2_bd.n_masked,
             n_masked_m4=m4_bd.n_masked,
             lambda_m4=self._lambda_m4,
+            m2=m2_bd,
+            m4=m4_bd,
         )
 
     def _teacher_forward(
@@ -1365,6 +1410,63 @@ class V14JointBrainModule(pl.LightningModule):
                 f"{step_name}_n_masked_m4", float(breakdown.n_masked_m4),
                 on_epoch=True,
             )
+            # Per-term collapse/quality (+ M4 precision-weight) monitor scalars.
+            self._log_term_stats(breakdown.m2, step_name=step_name, prefix="m2_")
+            self._log_term_stats(breakdown.m4, step_name=step_name, prefix="m4_")
+        else:
+            # Staged single-term: surface the same scalars unprefixed.
+            self._log_term_stats(breakdown, step_name=step_name, prefix="")
+
+    def _log_term_stats(
+        self,
+        bd: tp.Optional[MaskedJepaBreakdown],
+        *,
+        step_name: str,
+        prefix: str,
+    ) -> None:
+        """Surface a masked-JEPA term's collapse/quality + precision-weight
+        monitor scalars (RankMe is scale-invariant; these catch the
+        magnitude-collapse + predictor-hedging failure modes RankMe can't).
+
+        Every scalar is detached and NaN-guarded (a term with < 2 scored cells
+        or an empty precision tier emits NaN, which we skip rather than log).
+        ``on_step`` for train (the tripwire curve), ``on_epoch`` for all."""
+        if bd is None:
+            return
+        on_step = step_name == "train"
+
+        def _emit(name: str, val: tp.Optional[Tensor]) -> tp.Optional[float]:
+            if val is None:
+                return None
+            v = float(val)
+            if v != v:  # NaN → undefined this step, skip
+                return None
+            self.log(
+                f"{step_name}_{prefix}{name}", v,
+                on_step=on_step, on_epoch=True,
+            )
+            return v
+
+        # Collapse triad: target magnitude/variance, predictor variance, and
+        # the scale-free fraction-of-structure-captured.
+        tvar = _emit("target_var", bd.target_var)
+        _emit("target_norm", bd.target_norm)
+        pvar = _emit("pred_var", bd.pred_var)
+        _emit("explained_var", bd.explained_var)
+        # pred/target variance ratio — the predictor-hedging-to-mean readout
+        # (≈1 healthy; ≪1 = predictor collapsing to the batch-mean target).
+        if tvar is not None and pvar is not None and tvar > 0.0:
+            self.log(
+                f"{step_name}_{prefix}pred_target_var_ratio", pvar / tvar,
+                on_step=on_step, on_epoch=True,
+            )
+        # M4 precision-weight distribution + low/high-n tier split (None unless
+        # precision weighting is ON for this term).
+        for name in (
+            "weight_mean", "weight_min", "weight_max",
+            "loss_lown", "loss_highn", "wcontrib_lown", "wcontrib_highn",
+        ):
+            _emit(name, getattr(bd, name))
 
     # MON-TEACHER-FEATURE-RANK validation-time subsample cap. The SVD
     # cost is O(min(N, d) * N * d); capping N at 4096 keeps it under
@@ -1413,6 +1515,64 @@ class V14JointBrainModule(pl.LightningModule):
             on_epoch=True,
         )
 
+    def _run_input_stats_monitor(
+        self, *, batch_data: dict[str, Tensor], step_name: str,
+    ) -> None:
+        """MON-INPUT-STATS — sanity stats on the model's ACTUAL input tensors.
+
+        Best-practice "always watch your inputs", and directly tied to the
+        bad-electrode / data-pipeline defenses: under the prod robust-z the
+        |STFT| input lands ~O(1) mean / std, so
+
+        * ``input_mean`` / ``input_std`` drifting off ~0 / ~1 flags a
+          normalization break,
+        * a giant ``input_absmax`` flags a bad-electrode spectral transient
+          that slipped past the STATIC drop / WINSOR cap (W=2500),
+        * a non-zero ``input_nonfinite_frac`` flags a corrupt-cache batch
+          BEFORE it silently zeros the loss.
+
+        Reductions run over the FINITE values only (a stray Inf can't poison
+        mean/std/absmax — the non-finite fraction is the separate alarm).
+        Cadence-gated by the caller (``log_every_n_steps`` on train)."""
+        on_step = step_name == "train"
+
+        def _band(tensor: tp.Optional[Tensor], suffix: str) -> None:
+            if not isinstance(tensor, Tensor):
+                return
+            if tensor.numel() == 0:
+                return
+            f = tensor.detach().to(torch.float32)
+            finite = torch.isfinite(f)
+            n = f.numel()
+            n_finite = int(finite.sum().item())
+            self.log(
+                f"{step_name}_mon_input{suffix}_nonfinite_frac",
+                float((n - n_finite) / n),
+                on_step=on_step, on_epoch=True,
+            )
+            if n_finite < 1:
+                return  # all non-finite → mean/std/absmax undefined
+            ff = f[finite]
+            self.log(
+                f"{step_name}_mon_input{suffix}_absmax", ff.abs().max(),
+                on_step=on_step, on_epoch=True,
+            )
+            if n_finite >= 2:
+                self.log(
+                    f"{step_name}_mon_input{suffix}_mean", ff.mean(),
+                    on_step=on_step, on_epoch=True,
+                )
+                self.log(
+                    f"{step_name}_mon_input{suffix}_std",
+                    ff.std(unbiased=False),
+                    on_step=on_step, on_epoch=True,
+                )
+
+        _band(batch_data.get("electrode_tokens"), "")
+        # 2STFT dual-band: the spectral transient on a flaky contact blows up
+        # in the high band, so probe it separately (absmax + non-finite).
+        _band(batch_data.get("electrode_tokens_high"), "_high")
+
     def _rankme_subsample(self, flat: Tensor) -> Tensor:
         """Evenly-strided subsample to <=``_RANKME_N_MAX`` rows for a cheap SVD.
 
@@ -1439,6 +1599,33 @@ class V14JointBrainModule(pl.LightningModule):
         self.log(f"{prefix}_normalised", verdict.rankme_normalised, on_epoch=True)
         self.log(f"{prefix}_warn", 1.0 if verdict.is_warn else 0.0, on_epoch=True)
         self.log(f"{prefix}_alarm", 1.0 if verdict.is_alarm else 0.0, on_epoch=True)
+
+    def _log_feature_stats(
+        self, rows: Tensor, *, step_name: str, key: str = "",
+    ) -> None:
+        """VICReg-style per-dim feature health on the ``(N, d)`` RankMe rows.
+
+        Two collapse readouts RankMe's (scale-invariant) spectrum shape can
+        miss at the per-dim level: ``feat_std_mean`` / ``feat_std_min`` (per-dim
+        std across rows — a dim whose std → 0 has died), and ``feat_cov_offdiag``
+        (mean squared off-diagonal covariance — dimensional redundancy /
+        informational collapse, the VICReg covariance term). Shares the M4
+        (``key=""``) / M2 front-end (``key="frontend_"``) namespace with the
+        RankMe probe. No-op when <2 rows or non-2-D (std/cov undefined)."""
+        rows = rows.detach()
+        if rows.dim() != 2 or rows.shape[0] < 2:
+            return
+        prefix = f"{step_name}_mon_{key}feat"
+        std = rows.std(dim=0, unbiased=False)
+        self.log(f"{prefix}_std_mean", std.mean(), on_epoch=True)
+        self.log(f"{prefix}_std_min", std.min(), on_epoch=True)
+        d = rows.shape[1]
+        denom = d * (d - 1)
+        if denom > 0:
+            centred = rows - rows.mean(dim=0, keepdim=True)
+            cov = (centred.t() @ centred) / (rows.shape[0] - 1)
+            off_sq = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+            self.log(f"{prefix}_cov_offdiag", off_sq / denom, on_epoch=True)
 
     def _run_teacher_rank_monitor(
         self,
@@ -1484,6 +1671,7 @@ class V14JointBrainModule(pl.LightningModule):
             return  # not an M4 tap — skip silently
 
         valid_rows = self._rankme_subsample(flat[mask_flat])
+        self._log_feature_stats(valid_rows, step_name=step_name, key="")
         verdict = teacher_rank_monitor(
             valid_rows.detach(),
             warn_threshold=self._rankme_warn_threshold if warn is None else warn,
@@ -1557,8 +1745,10 @@ class V14JointBrainModule(pl.LightningModule):
         # No row-count early-return: teacher_rank_monitor returns a healthy
         # placeholder for N<2, so a degenerate (all-invalid) step still logs —
         # parity with the M4 probe, which always emits its keys.
+        sub = self._rankme_subsample(flat)
+        self._log_feature_stats(sub, step_name=step_name, key="frontend_")
         verdict = teacher_rank_monitor(
-            self._rankme_subsample(flat).detach(),
+            sub.detach(),
             warn_threshold=self._rankme_warn_threshold if warn is None else warn,
             alarm_threshold=(
                 self._rankme_alarm_threshold if alarm is None else alarm
@@ -1731,6 +1921,12 @@ class V14JointBrainModule(pl.LightningModule):
         self._run_parcel_coverage_monitor(
             latent_valid=latent_valid, step_name=step_name,
         )
+        # Input sanity (normalization / bad-electrode / corrupt-cache) — a
+        # property of the batch, not of any trained representation, so it is
+        # phase-independent and runs before the per-phase teacher probes.
+        self._run_input_stats_monitor(
+            batch_data=batch_data, step_name=step_name,
+        )
 
         # 2026-06-03 mis-scope fix: the trained representation is PHASE-
         # DEPENDENT, so the feature-health monitors must be too. P1 trains
@@ -1865,6 +2061,141 @@ class V14JointBrainModule(pl.LightningModule):
         )
         return grad_sq, weight_sq, total_grad_sq
 
+    def _group_lrs(self, optimizer: tp.Any) -> dict[str, float]:
+        """Representative LIVE (scheduled) lr per grad-routing group, read off
+        ``optimizer.param_groups``. Mirrors ``_grad_routing_norms``'s
+        frontend/predictor/latent partition (so the ratio's lr matches the
+        group that carries that lr scale); a group absent from the optimizer
+        (frozen this phase) gets NaN so the caller skips its ratio. A missing
+        optimizer (unit-test path / no trainer) yields all-NaN → no ratios."""
+        if optimizer is None or not getattr(optimizer, "param_groups", None):
+            return {
+                "frontend": float("nan"),
+                "latent": float("nan"),
+                "predictor": float("nan"),
+            }
+        lr_by_id: dict[int, float] = {}
+        for pg in optimizer.param_groups:
+            lr = float(pg.get("lr", float("nan")))
+            for p in pg["params"]:
+                lr_by_id[id(p)] = lr
+        frontend, _parcel = (
+            self.student.encoder.partition_parameters_for_staging()
+        )
+        front_ids = {id(p) for p in frontend}
+        pred_ids = {id(p) for p in self._predictor_parameters()}
+        out = {
+            "frontend": float("nan"),
+            "latent": float("nan"),
+            "predictor": float("nan"),
+        }
+        for p in self._trainable_parameters():
+            key = (
+                "frontend" if id(p) in front_ids
+                else "predictor" if id(p) in pred_ids
+                else "latent"
+            )
+            if out[key] != out[key]:  # first param seen for this group
+                out[key] = lr_by_id.get(id(p), float("nan"))
+        return out
+
+    def _ema_weight_gap(self) -> float:
+        """``‖θ_student − θ_teacher‖₂ / ‖θ_student‖₂`` over the EMA-mirrored
+        encoder — how far the EMA teacher trails the live student. Reads the
+        teacher copy's params (``self.teacher.model``) vs the student bundle;
+        both are the encoder only (the predictor is never EMA-mirrored)."""
+        dev = self._grad_ema_l2.device
+        num = torch.zeros((), device=dev, dtype=torch.float32)
+        den = torch.zeros((), device=dev, dtype=torch.float32)
+        for ps, pt in zip(
+            self.student.parameters(), self.teacher.model.parameters()
+        ):
+            s = ps.detach().to(torch.float32)
+            num = num + (s - pt.detach().to(torch.float32)).pow(2).sum()
+            den = den + s.pow(2).sum()
+        return float((num.sqrt() / (den.sqrt() + 1e-12)).item())
+
+    def _update_ratio_due(self) -> bool:
+        """Cadence gate for the true-update-ratio snapshot — reuses the monitor
+        cadence (``log_every_n_steps``). No trainer (unit-test path) → True."""
+        try:
+            step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            step = 0
+        return self._train_monitor_due(step)
+
+    def _maybe_log_true_update_ratio(self) -> None:
+        """True per-group update-to-weight ratio ``‖θ_after − θ_before‖ / ‖θ_before‖``
+        — the LR-calibration readback that is MONOTONIC in LR.
+
+        Unlike ``train_mon_update_ratio_*`` (the pre-clip ``lr·‖grad‖/‖w‖``
+        proxy — grad-magnitude-contaminated, a spike detector), this measures
+        the ACTUAL optimizer step. Because AdamW normalises by √v̂, the real
+        step is grad-magnitude-invariant (≈ lr-scaled), so this ratio reads the
+        LR directly and points the right way on BOTH failure arms:
+
+          * ``≪ 1e-3`` → too cold: the model can't move (e.g. stuck thrashing in
+            a collapse basin) → raise LR,
+          * ``≫ 1e-2`` → too hot: overshoot → lower LR,
+          * ``~ 1e-3`` → healthy (Karpathy's rule).
+
+        It is robust to the collapse-thrash confound that makes grad-clip
+        fraction U-shaped (high at BOTH too-cold and too-hot).
+
+        Measured across two consecutive ``on_before_optimizer_step`` calls —
+        exactly one ``optimizer.step()`` runs between them by definition — so it
+        does not depend on the subtle ``on_before_zero_grad`` ordering. The
+        pre-step snapshot is cadence-gated, so the ~param-sized clone is held
+        for one step per ``log_every_n_steps`` window (negligible at ≤30M
+        params). Snapshot keyed by ``id(p)``; same-phase param set is stable, so
+        the ids match across the two hooks."""
+        snap = getattr(self, "_update_snapshot", None)
+        if snap is not None:
+            # Current params are post the snapshot step's optimizer.step().
+            frontend, _parcel = (
+                self.student.encoder.partition_parameters_for_staging()
+            )
+            front_ids = {id(p) for p in frontend}
+            pred_ids = {id(p) for p in self._predictor_parameters()}
+            dev = self._grad_ema_l2.device
+
+            def _z() -> Tensor:
+                return torch.zeros((), device=dev, dtype=torch.float32)
+
+            delta_sq = {"frontend": _z(), "latent": _z(), "predictor": _z()}
+            base_sq = {"frontend": _z(), "latent": _z(), "predictor": _z()}
+            for p in self._trainable_parameters():
+                before = snap.get(id(p))
+                if before is None:
+                    continue
+                key = (
+                    "frontend" if id(p) in front_ids
+                    else "predictor" if id(p) in pred_ids
+                    else "latent"
+                )
+                after = p.detach().to(torch.float32)
+                b = before.to(torch.float32)
+                delta_sq[key] = delta_sq[key] + (after - b).pow(2).sum()
+                base_sq[key] = base_sq[key] + b.pow(2).sum()
+            for group in ("frontend", "latent", "predictor"):
+                bn = float(base_sq[group].sqrt().item())
+                if bn > 0.0:
+                    self.log(
+                        f"train_mon_true_update_ratio_{group}",
+                        float(delta_sq[group].sqrt().item()) / (bn + 1e-12),
+                        on_step=True,
+                    )
+            self._update_snapshot = None
+        # The snapshot is logically None here (just cleared, or never set), so
+        # re-arm whenever due. Snapshot θ_before; the next optimiser-step hook
+        # measures Δθ. At cadence 1 this re-arms every step (full density); at
+        # cadence C it samples one single-step displacement per window.
+        if self._update_ratio_due():
+            self._update_snapshot = {
+                id(p): p.detach().clone()
+                for p in self._trainable_parameters()
+            }
+
     def on_before_optimizer_step(
         self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature
     ) -> None:
@@ -1921,6 +2252,41 @@ class V14JointBrainModule(pl.LightningModule):
                 float(weight_sq[group].sqrt().item()),
                 on_step=True,
             )
+        # Update-to-weight ratio per group — ‖lr·grad‖/‖w‖, the direct "is the
+        # LR in the healthy ~1e-3 band for this group" readout (Karpathy's
+        # rule). A proxy (the true AdamW step is lr·normalised-update), but it
+        # is exactly what flagged the LR-too-hot capstone before the clip
+        # fraction did. ``lr`` is the LIVE scheduled per-group lr.
+        group_lrs = self._group_lrs(optimizer)
+        for group in ("frontend", "latent", "predictor"):
+            lr_g = group_lrs[group]
+            if lr_g == lr_g:  # not NaN → group present in the optimizer
+                gl2 = float(grad_sq[group].sqrt().item())
+                wn = float(weight_sq[group].sqrt().item())
+                self.log(
+                    f"train_mon_update_ratio_{group}",
+                    lr_g * gl2 / (wn + 1e-12),
+                    on_step=True,
+                )
+        # Non-finite grad/weight sentinel — fires before a NaN/Inf silently
+        # zeros the loss (run-ops: never auto-kill ⇒ surface it in wandb so a
+        # diverged unattended run is visible at a glance).
+        w_total_sq = (
+            weight_sq["frontend"] + weight_sq["latent"] + weight_sq["predictor"]
+        )
+        all_finite = bool(torch.isfinite(total_grad_sq).item()) and bool(
+            torch.isfinite(w_total_sq).item()
+        )
+        self.log(
+            "train_mon_nonfinite", 0.0 if all_finite else 1.0, on_step=True,
+        )
+        # EMA teacher↔student weight-space gap — ‖θ_s−θ_t‖/‖θ_s‖ over the
+        # EMA-mirrored encoder: the direct "is the teacher tracking" readout.
+        # Free (no forward) and unconfounded by the visible-vs-full masking that
+        # makes a representation-space drift ambiguous.
+        self.log(
+            "train_mon_ema_weight_gap", self._ema_weight_gap(), on_step=True,
+        )
         # Clip metrics — derived from the (pre-clip) global grad-L2 vs the
         # trainer's clip ceiling. ``on_before_optimizer_step`` fires BEFORE
         # Lightning's gradient clipping, so ``grad_l2`` is the pre-clip norm
@@ -1941,6 +2307,47 @@ class V14JointBrainModule(pl.LightningModule):
                 min(1.0, clip_val / (grad_l2 + 1e-12)),
                 on_step=True,
             )
+        # True post-step displacement ‖Δθ‖/‖θ‖ per group — the monotonic
+        # LR-calibration readback (see _maybe_log_true_update_ratio). Snapshots
+        # θ_before now (cadence-gated); the next optimiser-step hook reads the
+        # post-step θ and logs the ratio. Robust to the collapse-thrash confound
+        # that the clip fraction and the raw-grad proxy above both suffer.
+        self._maybe_log_true_update_ratio()
+
+    def on_train_batch_end(
+        self,
+        outputs: tp.Any,   # noqa: ARG002 — Lightning hook signature
+        batch: tp.Any,
+        batch_idx: int,    # noqa: ARG002 — Lightning hook signature
+    ) -> None:
+        """Throughput + GPU-memory observability for the 5000 GH200-hr budget.
+
+        Cheap (a wall-clock delta + a CUDA peak query); fires per micro-batch.
+        The first batch has no prior timestamp ⇒ only the GPU-mem high-water
+        mark is logged that step. ``train_mon_step_time_s`` (sec/step),
+        ``_steps_per_sec`` (its reciprocal), and ``_samples_per_sec`` catch
+        dataloader stalls / GPU starvation; ``_gpu_mem_gb`` tracks the per-step
+        peak allocation (reset each step)."""
+        now = time.perf_counter()
+        prev = getattr(self, "_last_batch_end_time", None)
+        self._last_batch_end_time = now
+        if prev is not None:
+            dt = now - prev
+            if dt > 0.0:
+                self.log("train_mon_step_time_s", dt, on_step=True)
+                self.log("train_mon_steps_per_sec", 1.0 / dt, on_step=True)
+                bsz = _infer_batch_size(batch)
+                if bsz is not None:
+                    self.log(
+                        "train_mon_samples_per_sec", bsz / dt, on_step=True,
+                    )
+        if torch.cuda.is_available():
+            self.log(
+                "train_mon_gpu_mem_gb",
+                torch.cuda.max_memory_allocated() / 1e9,
+                on_step=True,
+            )
+            torch.cuda.reset_peak_memory_stats()
 
     def on_before_zero_grad(
         self, optimizer: tp.Any,   # noqa: ARG002 — Lightning hook signature
