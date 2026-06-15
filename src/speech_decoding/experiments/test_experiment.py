@@ -248,6 +248,24 @@ def test_profiler_env_var_attaches_lightning_profiler(monkeypatch) -> None:
     assert isinstance(base._trainer().profiler, SimpleProfiler)
 
 
+def test_overfit_batches_env_var_passed_to_trainer(monkeypatch) -> None:
+    """Overfit-one-batch sanity lever (operational, env-gated → no exca uid
+    change). V14_OVERFIT_BATCHES=N reuses the SAME N train batches every epoch;
+    unset (default) leaves Lightning's overfit_batches at 0.0 (off). An int stays
+    an int (N batches); a value with a '.' is read as a fraction."""
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+
+    monkeypatch.delenv("V14_OVERFIT_BATCHES", raising=False)
+    assert base._trainer().overfit_batches == 0.0  # off by default
+
+    monkeypatch.setenv("V14_OVERFIT_BATCHES", "1")
+    t1 = base._trainer()
+    assert t1.overfit_batches == 1 and isinstance(t1.overfit_batches, int)
+
+    monkeypatch.setenv("V14_OVERFIT_BATCHES", "0.1")
+    assert base._trainer().overfit_batches == 0.1
+
+
 def test_val_check_interval_converted_optsteps_to_microbatches() -> None:
     """#66: our val_check_interval is in OPTIMIZER steps, but Lightning counts
     an int val_check_interval in training MICRO-batches. Under grad-accum the

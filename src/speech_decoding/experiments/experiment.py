@@ -459,6 +459,17 @@ class Experiment(BaseExperiment):
             kwargs["num_sanity_val_steps"] = 0
         if os.environ.get("V14_NO_TRAINER_CKPT") == "1":
             kwargs["enable_checkpointing"] = False
+        # Overfit-one-batch sanity lever (env-gated, uid-transparent like the
+        # toggles above). V14_OVERFIT_BATCHES=N makes Lightning reuse the SAME N
+        # train batches every epoch with shuffling OFF (and reuse them for val) —
+        # the canonical "is the model wired end-to-end / can the optimizer drive
+        # the loss down" check. For V-JEPA, loss->0 alone is necessary-not-
+        # sufficient (the trivial minimiser is representational collapse), so read
+        # it alongside the rankme monitor. Unset (default) -> standard path,
+        # byte-identical. An int reuses N batches; a float reuses that fraction.
+        _overfit = os.environ.get("V14_OVERFIT_BATCHES")
+        if _overfit:
+            kwargs["overfit_batches"] = float(_overfit) if "." in _overfit else int(_overfit)
         return pl.Trainer(**kwargs)
 
     def _artifact_dir_and_uid(self) -> tuple[Path | None, str]:
