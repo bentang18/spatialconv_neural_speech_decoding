@@ -1569,6 +1569,97 @@ def test_true_update_ratio_measured_across_two_optimizer_steps() -> None:
     )
 
 
+def test_grad_noise_scale_from_adam_moments_exact() -> None:
+    """B_simple = n·Σ(v̂−m̂²)/Σm̂² read off AdamW's moment buffers. Inject known
+    m,v at a huge step (bias correction → 1) and check the exact value:
+    per-coord m²=0.01, v−m²=0.04, n=8 ⇒ B = 8·(0.04N)/(0.01N) = 32."""
+    module = _make_module(phase="p1")
+    params = list(module._trainable_parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3, betas=(0.9, 0.95))
+    for p in params:                       # populate state lazily via one step
+        p.grad = torch.ones_like(p)
+    opt.step()
+    numel = 0
+    for p in params:                       # overwrite with known moments
+        st = opt.state[p]
+        st["exp_avg"] = torch.full_like(p, 0.1)
+        st["exp_avg_sq"] = torch.full_like(p, 0.05)
+        st["step"] = torch.tensor(1.0e6)   # 0.9^1e6 == 0 ⇒ no bias correction
+        numel += p.numel()
+    module._last_micro_bsz = 8             # no trainer ⇒ accum=world=1 ⇒ n=8
+
+    b_noise, signal, var = module._grad_noise_scale(opt)
+    assert signal == pytest.approx(0.01 * numel, rel=1e-5)
+    assert var == pytest.approx(0.04 * numel, rel=1e-5)
+    assert b_noise == pytest.approx(32.0, rel=1e-5)
+
+
+def test_grad_noise_scale_eff_batch_scales_with_accum_and_world() -> None:
+    """n = micro×accum×world: B_simple scales linearly with the eff-batch the
+    same moments are interpreted at (trainer accum/world picked up)."""
+    module = _make_module(phase="p1")
+    params = list(module._trainable_parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3, betas=(0.9, 0.95))
+    for p in params:
+        p.grad = torch.ones_like(p)
+    opt.step()
+    for p in params:
+        st = opt.state[p]
+        st["exp_avg"] = torch.full_like(p, 0.1)
+        st["exp_avg_sq"] = torch.full_like(p, 0.05)
+        st["step"] = torch.tensor(1.0e6)
+    module._last_micro_bsz = 8
+    module.trainer = SimpleNamespace(  # type: ignore[assignment]
+        accumulate_grad_batches=2, world_size=4,
+    )
+    # n = 8·2·4 = 64 ⇒ B = 64·4 = 256.
+    b_noise, _signal, _var = module._grad_noise_scale(opt)
+    assert b_noise == pytest.approx(256.0, rel=1e-5)
+
+
+def test_on_before_optimizer_step_logs_grad_noise_scale() -> None:
+    """With AdamW moments built from VARYING grads + a known micro-batch, the
+    critical-batch estimate and its signal/var components log finite-positive.
+    (A single step gives v̂=m̂²=g² ⇒ zero variance ⇒ B=0 — the estimator being
+    faithful, not a bug — so the state needs a spread of gradients.)"""
+    module = _make_module(phase="p1")
+    params = list(module._trainable_parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3, betas=(0.9, 0.95))
+    for i in range(6):                      # varying grad magnitude ⇒ var > 0
+        for p in params:
+            p.grad = torch.full_like(p, 0.1 * (i + 1))
+        opt.step()
+    module._last_micro_bsz = 16
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=opt)
+    for key in (
+        "train_mon_grad_noise_scale",
+        "train_mon_grad_noise_signal",
+        "train_mon_grad_noise_var",
+    ):
+        assert key in logged
+    assert logged["train_mon_grad_noise_scale"] > 0.0
+    assert logged["train_mon_grad_noise_signal"] > 0.0
+    assert logged["train_mon_grad_noise_var"] > 0.0
+
+
+def test_grad_noise_scale_skipped_without_adam_state() -> None:
+    """No AdamW moments (optimizer=None / SGD / pre-first-step) ⇒ the noise-scale
+    keys are silently skipped, never a crash or a NaN log."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    module._last_micro_bsz = 16
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+    module.on_before_optimizer_step(optimizer=None)
+    assert "train_mon_grad_noise_scale" not in logged
+    # An un-stepped AdamW (state empty) is likewise skipped.
+    opt = torch.optim.AdamW(list(module._trainable_parameters()), lr=1e-3)
+    assert module._grad_noise_scale(opt)[0] != module._grad_noise_scale(opt)[0]
+
+
 def test_true_update_ratio_zero_without_optimizer_step() -> None:
     """Two grad hooks with NO ``optimizer.step()`` between them → params
     unchanged → zero displacement. The metric only moves when the optimizer

@@ -1819,6 +1819,10 @@ class V14JointBrainModule(pl.LightningModule):
         # under --live). Flag set BEFORE ``_step`` (the producer); cache cleared
         # after (bounds the held activation to this step, and only when consumed).
         due = self._train_monitor_due(batch_idx)
+        # Stash this rank's micro-batch for the gradient-noise-scale monitor's
+        # eff-batch n = micro×accum×world (see _eff_batch_size). Cheap leading-
+        # dim read; diagnostic-only, never touches the loss path below.
+        self._last_micro_bsz = _infer_batch_size(batch)
         self._cached_teacher_taps = None
         self._want_teacher_cache = due
         breakdown = self._step(batch.data)
@@ -2099,6 +2103,90 @@ class V14JointBrainModule(pl.LightningModule):
                 out[key] = lr_by_id.get(id(p), float("nan"))
         return out
 
+    def _eff_batch_size(self) -> int | None:
+        """Per-optimizer-step example count ``n = micro×accum×world`` — the unit
+        the gradient noise scale is expressed in. ``_last_micro_bsz`` is stashed
+        each ``training_step``; accum/world come off the trainer (both default 1
+        when no trainer is attached — the unit-test path). ``None`` when the
+        micro-batch is unknown (no training_step has run yet)."""
+        micro = getattr(self, "_last_micro_bsz", None)
+        if micro is None:
+            return None
+        try:
+            accum = int(self.trainer.accumulate_grad_batches)
+            world = int(self.trainer.world_size)
+        except (RuntimeError, AttributeError):
+            accum, world = 1, 1
+        return int(micro) * max(accum, 1) * max(world, 1)
+
+    def _grad_noise_scale(
+        self, optimizer: tp.Any,
+    ) -> tuple[float, float, float]:
+        """Gradient noise scale ``B_simple`` (McCandlish et al. 2018) — the
+        critical-batch estimate — read straight off AdamW's moment EMAs.
+
+            B_noise = tr(Σ)/|G|² ≈ n · Σ(v̂ − m̂²)₊ / Σ m̂²
+
+        ``exp_avg`` (m≈E[g]) and ``exp_avg_sq`` (v≈E[g²]) are AdamW's
+        per-parameter EMAs, so ``v − m²`` is the per-coordinate gradient
+        variance and ``m²`` the squared signal; the hats are the (1−βᵗ) bias
+        correction. ``n = micro×accum×world`` (``_eff_batch_size``) — the
+        algebra is accumulation-invariant (mean *and* sum reductions both land
+        on n), and DDP has already averaged the gradient into m,v so n is the
+        GLOBAL batch. No forward/backward and no cross-rank comms — pure
+        optimizer-state reads, one sweep like ``_grad_routing_norms``.
+
+        A *proxy*: the β₁≠β₂ EMA-window mismatch biases the absolute scale, so
+        read the TREND and the growth — B_noise rises as |G|²↓ near a basin (the
+        'critical batch grows late' signature that says whether to ramp the
+        batch in the back half). Returns ``(b_noise, signal=Σm̂², var=Σ(v̂−m̂²)₊)``;
+        all-NaN before the first optimizer step (no AdamW state yet), under a
+        non-Adam/None optimizer (no moments), or when n is unknown."""
+        # Unwrap to the innermost torch optimizer (LightningOptimizer / any
+        # neuraltrain wrapper expose the real one via ``.optimizer``).
+        inner = optimizer
+        seen_inner: set[int] = set()
+        while inner is not None and id(inner) not in seen_inner:
+            seen_inner.add(id(inner))
+            nxt = getattr(inner, "optimizer", None)
+            if nxt is None or nxt is inner:
+                break
+            inner = nxt
+        state = getattr(inner, "state", None)
+        if not state:
+            return (float("nan"), float("nan"), float("nan"))
+        betas_by_id: dict[int, tuple[float, float]] = {}
+        for pg in getattr(inner, "param_groups", []):
+            b = pg.get("betas", (0.9, 0.999))
+            for p in pg["params"]:
+                betas_by_id[id(p)] = (float(b[0]), float(b[1]))
+        dev = self._grad_ema_l2.device
+        signal = torch.zeros((), device=dev, dtype=torch.float32)
+        var = torch.zeros((), device=dev, dtype=torch.float32)
+        seen = False
+        for p in self._trainable_parameters():
+            st = state.get(p)
+            if st is None or "exp_avg" not in st or "exp_avg_sq" not in st:
+                continue
+            seen = True
+            b1, b2 = betas_by_id.get(id(p), (0.9, 0.999))
+            step = st.get("step", 0.0)
+            t = float(step.item()) if hasattr(step, "item") else float(step)
+            c1 = 1.0 - b1 ** t if t > 0.0 else 1.0
+            c2 = 1.0 - b2 ** t if t > 0.0 else 1.0
+            m_hat = st["exp_avg"].detach().to(torch.float32) / c1
+            v_hat = st["exp_avg_sq"].detach().to(torch.float32) / c2
+            signal = signal + m_hat.pow(2).sum()
+            var = var + (v_hat - m_hat.pow(2)).sum()
+        if not seen:
+            return (float("nan"), float("nan"), float("nan"))
+        sig = float(signal.item())
+        vr = max(0.0, float(var.item()))   # finite-EMA / β-mismatch ⇒ clamp ≥0
+        n = self._eff_batch_size()
+        if n is None or sig <= 0.0:
+            return (float("nan"), sig, vr)
+        return (n * vr / sig, sig, vr)
+
     def _ema_weight_gap(self) -> float:
         """``‖θ_student − θ_teacher‖₂ / ‖θ_student‖₂`` over the EMA-mirrored
         encoder — how far the EMA teacher trails the live student. Reads the
@@ -2287,6 +2375,17 @@ class V14JointBrainModule(pl.LightningModule):
         self.log(
             "train_mon_ema_weight_gap", self._ema_weight_gap(), on_step=True,
         )
+        # Gradient noise scale B_simple (McCandlish 2018) — the critical-batch
+        # estimate, off AdamW's moment EMAs (no forward, no comms). Reads how far
+        # below/above the critical batch we sit and — since it grows as |G|²↓ —
+        # whether to ramp batch in the back half. NaN (⇒ skipped) before the
+        # first AdamW step, under a non-Adam/None optimizer (no moments), or with
+        # no trainer (n unknown).
+        b_noise, gn_signal, gn_var = self._grad_noise_scale(optimizer)
+        if b_noise == b_noise:  # not NaN
+            self.log("train_mon_grad_noise_scale", b_noise, on_step=True)
+            self.log("train_mon_grad_noise_signal", gn_signal, on_step=True)
+            self.log("train_mon_grad_noise_var", gn_var, on_step=True)
         # Clip metrics — derived from the (pre-clip) global grad-L2 vs the
         # trainer's clip ceiling. ``on_before_optimizer_step`` fires BEFORE
         # Lightning's gradient clipping, so ``grad_l2`` is the pre-clip norm
