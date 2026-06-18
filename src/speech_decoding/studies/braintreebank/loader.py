@@ -50,6 +50,7 @@ def bt_load_raw(
     *,
     subject_id: int,
     electrode_set: tp.Literal["all", "lite"] = "all",
+    drop_static: bool = True,
 ) -> tuple[np.ndarray, list[str], float]:
     """Pull `(data, ch_names, sfreq)` from a `BrainTreebankSubject`-shaped object,
     resampled to `BT_DEFAULT_SAMPLE_RATE_HZ` when the subject's native rate differs.
@@ -95,12 +96,25 @@ def bt_load_raw(
     # stay in lockstep with support/valid_mask (both consult the same
     # extra_bad_electrodes() source; voltage_electrode_order folds in the identical
     # set). Done on axis-0 before resample; the two axes are independent.
-    extra_bad = extra_bad_electrodes(subject_id)
-    if extra_bad:
-        keep = [i for i, name in enumerate(ch_names) if name not in extra_bad]
-        if len(keep) != len(ch_names):
-            data = data[keep]
-            ch_names = [ch_names[i] for i in keep]
+    # drop_static=False keeps the FULL montage — the Guard-1 static precompute
+    # needs every contact present to re-derive which to drop (it would be circular
+    # to scan a montage from which the bad contacts were already removed). The
+    # cache/training path always uses the default (True) so its montage is unchanged.
+    if drop_static:
+        extra_bad = extra_bad_electrodes(subject_id)
+        if extra_bad:
+            keep = [i for i, name in enumerate(ch_names) if name not in extra_bad]
+            if len(keep) != len(ch_names):
+                data = data[keep]
+                ch_names = [ch_names[i] for i in keep]
+    elif electrode_set == "lite":
+        # Lite is defined over the post-STATIC survivors (`lite_voltage_order`), so
+        # a full-montage Lite subset would not be row-aligned with the Lite
+        # support/valid_mask. Forbid the contradictory combination outright.
+        raise ValueError(
+            "electrode_set='lite' requires drop_static=True (Lite is defined over "
+            "the post-STATIC survivors)"
+        )
     # PRE-CAR Lite montage subset (P4 eval parity + reproducibility). Drop to the
     # Neuroprobe-Lite electrodes HERE, before shaft-CAR, so the Lite result
     # references zero out-of-budget contacts. The post-STATIC row order equals

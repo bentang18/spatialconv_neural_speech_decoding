@@ -173,6 +173,42 @@ def test_bt_load_raw_all_is_byte_identical_default(monkeypatch) -> None:
     assert np.array_equal(out, data.astype(np.float32))
 
 
+# --- drop_static=False: full-montage load for the Guard-1 static re-derivation --
+
+
+def test_bt_load_raw_drop_static_false_keeps_full_montage(monkeypatch) -> None:
+    """drop_static=False bypasses the STATIC exclusion so the Guard-1 precompute
+    re-derives the bad set over the FULL montage (incl. the contacts it will later
+    drop). The default (True) still drops them, so the cache path is unchanged."""
+    import speech_decoding.studies.braintreebank.loader as loader_mod
+
+    monkeypatch.setattr(
+        loader_mod, "extra_bad_electrodes", lambda sid: frozenset({"E1"})
+    )
+    data = np.arange(4 * 8, dtype=np.float64).reshape(4, 8)
+    fake = _FakeBT(data=data, electrode_labels=["E0", "E1", "E2", "E3"])
+
+    out_d, names_d, _ = bt_load_raw(fake, trial_id=1, subject_id=2)
+    assert names_d == ["E0", "E2", "E3"]  # default drops the STATIC contact
+
+    out_f, names_f, _ = bt_load_raw(
+        fake, trial_id=1, subject_id=2, drop_static=False
+    )
+    assert names_f == ["E0", "E1", "E2", "E3"]  # full montage retained
+    assert np.array_equal(out_f, data.astype(np.float32))
+
+
+def test_bt_load_raw_lite_requires_static_drop() -> None:
+    """electrode_set="lite" is defined over the post-STATIC survivors, so the
+    drop_static=False full-montage mode is incompatible with it — guard against a
+    silently non-lite montage."""
+    fake = _FakeBT(data=np.zeros((2, 8)), electrode_labels=["E0", "E1"])
+    with pytest.raises(ValueError, match="drop_static"):
+        bt_load_raw(
+            fake, trial_id=1, subject_id=1, electrode_set="lite", drop_static=False
+        )
+
+
 # --- WS-D1: `*`/`#` mark -> singleton shaft -> shaft-CAR zeroing regression ---
 
 

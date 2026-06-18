@@ -157,6 +157,43 @@ def test_classify_from_signature_matches_live_scan() -> None:
     assert cls["dead"] == {"E13"}
 
 
+def test_session_signature_roundtrips_through_collector() -> None:
+    # The #207 scan side: static_bad_mask -> session_signature -> JSON must be
+    # consumable by the #208 collector and reproduce the same drop. Build a cohort
+    # with one of each pathology, run the live scan, serialize, then (a) assert the
+    # payload is JSON-clean with the collector-required keys, (b) classify_from_
+    # signature reproduces the fired sets, (c) collate_sessions recovers the static.
+    import json
+
+    fs = 512.0
+    v = _clean_cohort(40, 15, fs=fs, seed=6)
+    v[7] *= 10.0                            # noisy
+    v[13] *= 0.1                            # dead
+    _inject_spike(v, 9, [2, 7, 11], fs=fs)  # spike
+    sig = guard1.static_bad_mask(v, fs=fs)
+    labels = [f"E{i}" for i in range(40)]
+
+    payload = guard1.session_signature(2, 4, labels, sig)
+    json.dumps(payload)  # raises if any value is not JSON-serializable
+    for key in ("subject", "trial", "labels", "clip_frac", "rmad"):
+        assert key in payload
+    assert payload["subject"] == 2 and payload["trial"] == 4
+    assert payload["spike"] == ["E9"]
+    assert payload["noisy"] == ["E7"]
+    assert payload["dead"] == ["E13"]
+
+    cls = guard1.classify_from_signature(
+        payload["labels"], np.asarray(payload["clip_frac"]),
+        np.asarray(payload["rmad"]),
+    )
+    assert cls["spike"] == set(payload["spike"])
+    assert cls["noisy"] == set(payload["noisy"])
+    assert cls["dead"] == set(payload["dead"])
+
+    per_subject = guard1.collate_sessions([payload])
+    assert per_subject[2]["static"] == frozenset({"E7", "E9", "E13"})
+
+
 def test_classify_from_signature_thresholds_are_locked() -> None:
     # A signature straddling each bar: contact just over / just under fires / not.
     labels = ["a", "b", "c", "d"]

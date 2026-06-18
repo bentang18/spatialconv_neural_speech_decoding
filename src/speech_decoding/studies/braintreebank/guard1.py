@@ -143,6 +143,40 @@ def static_bad_mask(v_filt: np.ndarray, fs: float) -> dict[str, np.ndarray]:
     }
 
 
+def session_signature(
+    subject_id: int,
+    trial_id: int,
+    labels: list[str],
+    sig: dict[str, np.ndarray],
+) -> dict:
+    """Build the JSON-serializable per-session signature the #208 collector reads.
+
+    The scan side of the round-trip: takes one session's :func:`static_bad_mask`
+    output ``sig`` plus its contact ``labels`` and emits a plain-Python dict. It
+    carries the two diagnostics ``collate_sessions`` keys off (``clip_frac``,
+    ``rmad``) plus ``dead_ratio`` and the fired detector label-lists for
+    provenance. ``classify_from_signature(labels, clip_frac, rmad)`` reproduces
+    those label-lists exactly (same locked thresholds) — that identity is what
+    lets the collector re-derive the drop from JSON without re-reading voltage."""
+    labels = list(labels)
+
+    def _fired(mask: np.ndarray) -> list[str]:
+        return [labels[i] for i in np.flatnonzero(np.asarray(mask))]
+
+    return {
+        "subject": int(subject_id),
+        "trial": int(trial_id),
+        "labels": labels,
+        "clip_frac": [float(x) for x in np.asarray(sig["clip_frac"])],
+        "rmad": [float(x) for x in np.asarray(sig["rmad"])],
+        "dead_ratio": [float(x) for x in np.asarray(sig["dead_ratio"])],
+        "spike": _fired(sig["spike"]),
+        "noisy": _fired(sig["noisy"]),
+        "dead": _fired(sig["dead"]),
+        "static": _fired(sig["static"]),
+    }
+
+
 def classify_from_signature(
     labels: list[str],
     clip_frac: np.ndarray,
