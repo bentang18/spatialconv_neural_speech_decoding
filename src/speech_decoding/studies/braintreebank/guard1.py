@@ -298,7 +298,15 @@ def diff_static_drops(
     convention. ``would_be`` / ``locked`` map subject → static-drop labels.
     Returns ``{subject: {added, removed, unchanged}}`` (sorted lists) over the
     UNION of subjects in either map (so an all-clean subject that locked-11
-    dropped shows its removals)."""
+    dropped shows its removals).
+
+    NOTE: ``aggregate_subject`` / ``collate_sessions`` / ``diff_static_drops``
+    implemented the abandoned per-SUBJECT collapse (one drop per subject over all
+    trials, with chronic-vs-variable + a diff vs locked-11). The per-session
+    decision (Ben 2026-06-18) supersedes that — production uses
+    :func:`per_session_static_drops` instead (one drop per session, no
+    aggregation). These three are retained for the round-trip test + provenance
+    diagnostics; they are NOT on the bake path."""
     out: dict[int, dict[str, list[str]]] = {}
     for sid in sorted(set(would_be) | set(locked)):
         w = set(would_be.get(sid, frozenset()))
@@ -309,3 +317,54 @@ def diff_static_drops(
             "unchanged": sorted(w & lk),
         }
     return out
+
+
+def per_session_static_drops(
+    sessions: list[dict],
+) -> dict[tuple[int, int], list[str]]:
+    """Per-session STATIC drop assembler (#208 — the per-session decision).
+
+    Maps each scanned session to its classified STATIC set with NO cross-trial
+    aggregation: each ``(subject, trial)``'s union ``spike ∪ noisy ∪ dead`` IS its
+    drop (electrode quality drifts across a subject's sessions, so the drop is a
+    per-session decision applied to both the eval-Lite and pretrain paths). The
+    bars live in ONE place — ``spike/noisy/dead`` are re-derived from
+    ``clip_frac``/``rmad`` via :func:`classify_from_signature`, and the union is
+    asserted equal to the precompute's emitted ``static`` (identity guard: a
+    mismatch means the locked thresholds drifted between scan-time and
+    collect-time). Returns ``{(subject, trial): sorted(static labels)}`` — every
+    scanned session, including ``[]`` for clean ones."""
+    out: dict[tuple[int, int], list[str]] = {}
+    for s in sessions:
+        key = (int(s["subject"]), int(s["trial"]))
+        cls = classify_from_signature(
+            list(s["labels"]), np.asarray(s["clip_frac"]), np.asarray(s["rmad"]),
+        )
+        static = cls["spike"] | cls["noisy"] | cls["dead"]
+        if "static" in s and set(s["static"]) != static:
+            raise ValueError(
+                f"btbank{key[0]}_t{key[1]}: re-derived static {sorted(static)} "
+                f"!= precompute-emitted {sorted(s['static'])} "
+                f"(locked-threshold drift between scan and collect)"
+            )
+        out[key] = sorted(static)
+    return out
+
+
+def format_per_session_literal(
+    per_session: dict[tuple[int, int], list[str]],
+    var_name: str = "_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION",
+) -> str:
+    """Render a per-session drop dict as paste-ready Python source for anatomy.py.
+
+    Sorted by ``(subject, trial)``; single-element tuples carry the trailing
+    comma (``('E1',)``), empty stays ``()``. The output is the exact body of
+    ``anatomy._BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION`` (#213)."""
+    lines = [f"{var_name}: dict[tuple[int, int], tuple[str, ...]] = {{"]
+    for (s, t) in sorted(per_session):
+        labels = per_session[(s, t)]
+        body = ", ".join(repr(x) for x in labels)
+        suffix = f"({body},)" if len(labels) == 1 else f"({body})"
+        lines.append(f"    ({s}, {t}): {suffix},")
+    lines.append("}")
+    return "\n".join(lines)

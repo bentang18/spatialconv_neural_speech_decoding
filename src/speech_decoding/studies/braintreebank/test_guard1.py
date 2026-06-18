@@ -289,3 +289,70 @@ def test_diff_against_locked11_self_consistent() -> None:
     for sid, rec in d.items():
         assert rec["added"] == [] and rec["removed"] == [], sid
         assert set(rec["unchanged"]) == set(locked[sid])
+
+
+# ------------------------------- #208 per-session assembler (per-session decision)
+def test_per_session_static_drops_no_aggregation() -> None:
+    # Two trials of subject 2 spike on DIFFERENT contacts. The per-session
+    # decision keeps each session's drop SEPARATE (the antithesis of
+    # collate_sessions, whose spike-majority would discard both 1/2 detections).
+    labels = ["a", "b", "c", "d"]
+    rmad = [1.0, 1.0, 1.0, 1.0]
+    sess = [
+        _session(2, 0, labels, [0.02, 0.0, 0.0, 0.0], rmad),  # a spikes (2% > 1%)
+        _session(2, 1, labels, [0.0, 0.02, 0.0, 0.0], rmad),  # b spikes
+    ]
+    out = guard1.per_session_static_drops(sess)
+    assert out == {(2, 0): ["a"], (2, 1): ["b"]}
+
+
+def test_per_session_static_drops_clean_session_is_empty() -> None:
+    labels = ["a", "b"]
+    out = guard1.per_session_static_drops(
+        [_session(4, 0, labels, [0.0, 0.0], [1.0, 1.0])]
+    )
+    assert out == {(4, 0): []}
+
+
+def test_per_session_static_drops_identity_guard_catches_drift() -> None:
+    # If the payload's emitted ``static`` disagrees with the re-derived union
+    # (locked-threshold drift between scan and collect), the assembler raises.
+    labels = ["a", "b"]
+    rec = _session(9, 0, labels, [0.02, 0.0], [1.0, 1.0])  # a spikes
+    rec["static"] = ["b"]  # corrupt: emitted set disagrees with re-derived
+    with pytest.raises(ValueError, match="threshold drift|threshold"):
+        guard1.per_session_static_drops([rec])
+
+
+def test_per_session_static_drops_identity_guard_passes_on_match() -> None:
+    # When the emitted ``static`` matches the re-derived union, no raise.
+    labels = ["a", "b"]
+    rec = _session(9, 0, labels, [0.02, 0.0], [1.0, 1.0])
+    rec["static"] = ["a"]
+    out = guard1.per_session_static_drops([rec])
+    assert out == {(9, 0): ["a"]}
+
+
+def test_format_per_session_literal_roundtrips_via_literal_eval() -> None:
+    import ast
+
+    per_session = {
+        (2, 0): ["RT1aIa7", "RT1aIa8"],
+        (2, 1): [],
+        (9, 0): ["P2e6"],
+    }
+    src = guard1.format_per_session_literal(per_session)
+    # the rendered body must parse back to the SAME dict (single-element tuple
+    # trailing comma, empty (), sorted keys).
+    body = src.split("=", 1)[1].strip()
+    parsed = ast.literal_eval(body)
+    assert parsed == {
+        (2, 0): ("RT1aIa7", "RT1aIa8"),
+        (2, 1): (),
+        (9, 0): ("P2e6",),
+    }
+    # single-element entry carries the trailing comma (a real tuple, not a paren).
+    assert "(9, 0): ('P2e6',)," in src
+    assert "(2, 1): ()," in src
+    # keys emitted in (subject, trial) sorted order.
+    assert src.index("(2, 0)") < src.index("(2, 1)") < src.index("(9, 0)")
