@@ -887,6 +887,25 @@ class V14ConvergedSSL(nn.Module):
                         self.student_frontend.buffers()):
             t.copy_(s)
 
+    # ----------------------------------------------------------- eval feature taps
+    @torch.no_grad()
+    def encode_frontend(self, slow: Tensor, beta: Tensor, hg: Tensor) -> Tensor:
+        """Eval tap: student FRONTEND features on the FULL input, no mask. ``(B,C,38,d)``.
+        Electrode-isolated (no cross-electrode mixing) — the post-frontend probe tap."""
+        return self.student_frontend(slow, beta, hg)
+
+    @torch.no_grad()
+    def encode_latent(
+        self, slow: Tensor, beta: Tensor, hg: Tensor,
+        parcel_per_electrode: Tensor, *, electrode_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Eval tap: frontend→LATENT on the FULL input, no mask. ``(B,C,38,d)``.
+        Cross-electrode mixed (parcel-tagged global SA) — the post-latent probe tap.
+        The converged success criterion = a linear probe on this must beat one on
+        :meth:`encode_frontend`."""
+        feats = self.student_frontend(slow, beta, hg)
+        return self.latent(feats, parcel_per_electrode, electrode_mask=electrode_mask)
+
     def forward(
         self,
         slow: Tensor,
@@ -1037,3 +1056,21 @@ def sample_ssl_masks(
         "tubed_parcels": tubed_parcels,
         "tubed_parcel_mask": tubed_parcel_mask,
     }
+
+
+def probe_pool(feats: Tensor, electrode_mask: Tensor | None = None) -> Tensor:
+    """Parameter-free probe feature: masked mean of ``feats (B,C,38,d)`` over the
+    real electrodes and their 38 tokens → ``(B, d)``.
+
+    Used for the converged success criterion (post-latent linear probe MUST beat
+    post-frontend): applied identically to :meth:`V14ConvergedSSL.encode_frontend`
+    and :meth:`V14ConvergedSSL.encode_latent` outputs so the only thing that
+    differs between the two probe inputs is the encoder depth, NOT a learned pool.
+    """
+    if electrode_mask is None:
+        return feats.mean(dim=(1, 2))
+    S = feats.shape[2]
+    w = electrode_mask.to(feats.dtype)                       # (B,C)
+    summed = (feats * w[:, :, None, None]).sum(dim=(1, 2))   # (B,d)
+    denom = (w.sum(dim=1) * S).clamp_min(1.0)[:, None]       # (B,1)
+    return summed / denom

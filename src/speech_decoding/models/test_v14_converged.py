@@ -893,3 +893,51 @@ def test_sample_ssl_masks_padded_electrodes_get_no_mask() -> None:
     m = vc.sample_ssl_masks(pe, emask, g)
     assert not m["m2_mask"][0, 4:].any()      # padded electrodes never masked
     assert not m["tube_mask"][0, 4:].any()
+
+
+# ============================ eval feature taps + probe pool ==================
+# The converged success criterion: a linear probe on the post-LATENT tap must
+# beat one on the post-FRONTEND tap. These check the two taps exist, differ in
+# the right way (frontend isolated, latent mixed), and that the parameter-free
+# probe pool is an honest masked mean.
+def test_encode_frontend_is_electrode_isolated() -> None:
+    m = _ssl_model().eval()
+    slow, beta, hg, _, _, _ = _ssl_batch()
+    f0 = m.encode_frontend(slow, beta, hg)
+    assert f0.shape == (2, 6, 38, 32)
+    slow2 = slow.clone()
+    slow2[:, 0] += 5.0                                   # perturb electrode 0 only
+    f1 = m.encode_frontend(slow2, beta, hg)
+    assert not torch.allclose(f0[:, 0], f1[:, 0])        # its own output changed
+    assert torch.allclose(f0[:, 1:], f1[:, 1:])          # others untouched (isolated)
+
+
+def test_encode_latent_mixes_across_electrodes() -> None:
+    m = _ssl_model().eval()
+    slow, beta, hg, pe, emask, _ = _ssl_batch()
+    l0 = m.encode_latent(slow, beta, hg, pe, electrode_mask=emask)
+    assert l0.shape == (2, 6, 38, 32)
+    slow2 = slow.clone()
+    slow2[:, 0] += 5.0                                   # perturb electrode 0 only
+    l1 = m.encode_latent(slow2, beta, hg, pe, electrode_mask=emask)
+    # the latent's global SA propagates electrode 0's change to its parcel peers
+    assert not torch.allclose(l0[:, 1:], l1[:, 1:])
+
+
+def test_probe_taps_differ_frontend_vs_latent() -> None:
+    m = _ssl_model().eval()
+    slow, beta, hg, pe, emask, _ = _ssl_batch()
+    pf = vc.probe_pool(m.encode_frontend(slow, beta, hg), emask)
+    pl = vc.probe_pool(m.encode_latent(slow, beta, hg, pe, electrode_mask=emask), emask)
+    assert pf.shape == (2, 32) and pl.shape == (2, 32)
+    assert not torch.allclose(pf, pl), "the two probe taps must carry distinct signal"
+
+
+def test_probe_pool_masked_mean_excludes_padding() -> None:
+    feats = torch.randn(1, 4, 38, 8)
+    emask = torch.tensor([[True, True, False, False]])
+    got = vc.probe_pool(feats, emask)
+    want = feats[:, :2].mean(dim=(1, 2))                 # mean over the 2 real elecs
+    assert torch.allclose(got, want, atol=1e-6)
+    # no mask ⇒ plain mean over all electrodes+tokens
+    assert torch.allclose(vc.probe_pool(feats), feats.mean(dim=(1, 2)), atol=1e-6)
