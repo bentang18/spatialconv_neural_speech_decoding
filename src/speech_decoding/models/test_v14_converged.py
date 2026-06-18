@@ -522,6 +522,60 @@ def test_latent_ragged_key_mask_isolates_padding() -> None:
     assert torch.allclose(out4[:, :3], out3, atol=1e-5), "padding leaked into reals"
 
 
+# ------------------------------------------------- Stage 2 RAGGED latent (Ben 06-18)
+def _latent_vis(B: int, C: int, seed: int) -> torch.Tensor:
+    """A student SEE-set mask: ~1/3 electrodes fully tubed; the rest keep their
+    un-M2-masked tokens (token 0 forced visible). ≥1 visible token per sample."""
+    g = _gen(seed)
+    untubed = torch.rand(B, C, generator=g) > 0.33
+    untubed[:, 0] = True
+    vis = torch.zeros(B, C, 38, dtype=torch.bool)
+    for b in range(B):
+        for c in range(C):
+            if bool(untubed[b, c]):
+                v = ~vc.sample_m2_mask(_gen(seed * 97 + b * 13 + c))
+                v[0] = True
+                vis[b, c] = v
+    return vis
+
+
+def test_latent_ragged_equals_dense_on_visible() -> None:
+    # TDD veracity: the ragged cross-electrode gather is output-identical to the
+    # dense all-pairs key-masked oracle on every visible token. Masked keys add 0
+    # to the softmax and masked tokens are never read, so physically dropping them
+    # leaves the visible tokens' cross-electrode features unchanged.
+    torch.manual_seed(0)
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=3, n_parcels=74).eval()
+    B, C = 3, 6
+    feats = _fake_feats(B, C)
+    pe = torch.randint(0, 74, (B, C))
+    vis = _latent_vis(B, C, seed=5)
+    with torch.no_grad():
+        dense = lat(feats, pe, token_mask=vis)
+        ragged = lat.forward_ragged(feats, pe, vis)
+    assert torch.allclose(ragged[vis], dense[vis], atol=1e-5)
+    assert torch.count_nonzero(ragged[~vis]) == 0          # non-visible never built
+
+
+def test_latent_ragged_padding_independence() -> None:
+    # Ragged contract on the gather path: appending a fully-masked (padded/tubed)
+    # electrode cannot change the visible outputs — the gather skips it, so it is
+    # never built into the all-pairs set (no pad-to-max contamination).
+    torch.manual_seed(2)
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    feats3 = _fake_feats(1, 3)
+    pe3 = torch.tensor([[1, 2, 3]])
+    vis3 = torch.ones(1, 3, 38, dtype=torch.bool)
+    pad = torch.randn(1, 1, 38, 32) * 9.0
+    feats4 = torch.cat([feats3, pad], dim=1)
+    pe4 = torch.tensor([[1, 2, 3, 0]])
+    vis4 = torch.cat([vis3, torch.zeros(1, 1, 38, dtype=torch.bool)], dim=1)
+    with torch.no_grad():
+        out3 = lat.forward_ragged(feats3, pe3, vis3)
+        out4 = lat.forward_ragged(feats4, pe4, vis4)
+    assert torch.allclose(out4[:, :3], out3, atol=1e-5)
+
+
 def test_latent_construction_guards() -> None:
     with pytest.raises(ValueError, match="not divisible"):
         vc.LatentEncoder(d_model=30, n_heads=4, n_layers=1, n_parcels=8)

@@ -566,6 +566,45 @@ class LatentEncoder(nn.Module):
             x = blk(x, rope, key_mask)
         return self.ln_out(x).reshape(B, C, S, d)
 
+    def forward_ragged(
+        self,
+        feats: Tensor,
+        parcel_per_electrode: Tensor,
+        token_mask: Tensor,
+    ) -> Tensor:
+        """Ragged latent — **physically gather** the visible-un-tubed cross-
+        electrode token set, never run all-pairs over a dense padded/masked set.
+
+        ``token_mask``: ``(B, C, 38)`` bool, ``True`` = a token in the student's
+        SEE-set (``latent_vis = real & un-tubed & un-M2-masked``). Per sample the
+        True tokens are gathered across ALL electrodes into one set (pad to the
+        per-batch-max visible count), the all-pairs SA runs over only that set,
+        and the outputs scatter back to ``(B, C, 38, d)`` (zeros elsewhere).
+
+        Output-identical to the dense ``forward(token_mask=...)`` on the visible
+        tokens — a masked key contributes 0 to the cross-electrode softmax and
+        masked tokens are never read — but no padded/masked token is ever built
+        into the sequence. Each sample needs ≥1 visible token (guaranteed: a clip
+        keeps ≥1 un-tubed parcel and slow tokens are M2-exempt)."""
+        B, C, S, d = feats.shape
+        x = feats + self.parcel_embed(parcel_per_electrode)[:, :, None, :]
+        x = x.reshape(B, C * S, d)
+        vis = token_mask.reshape(B, C * S)                        # (B, C·38)
+        out = feats.new_zeros(B, C * S, d)
+
+        idx, real, Nv = _ragged_gather_idx(vis)                   # (B, Nv)
+        xv = torch.gather(x, 1, idx.unsqueeze(-1).expand(B, Nv, d))  # (B, Nv, d)
+        slot_full = self.time_slot.repeat(C)                      # (C·38,)
+        slot_v = slot_full[idx]                                   # (B, Nv)
+        rope = self.key_rope[:, slot_v, :]                        # (2, B, Nv, head_dim)
+        for blk in self.blocks:
+            xv = blk(xv, rope, real)
+        xv = self.ln_out(xv)                                      # (B, Nv, d)
+
+        rows = torch.arange(B, device=feats.device).unsqueeze(1).expand(B, Nv)
+        out[rows[real], idx[real]] = xv[real]
+        return out.reshape(B, C, S, d)
+
 
 class M4Predictor(nn.Module):
     """Paradigm-B own-predictor for M4 (the latent parcel JEPA).
