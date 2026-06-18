@@ -331,6 +331,105 @@ def test_frontend_construction_guards() -> None:
         vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1, freq_pos="bogus")
 
 
+# ------------------------------------------------ Stage 1 RAGGED frontend (Ben 06-18)
+def _keep_visible(B: int, C: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random kept-electrode + visible-token masks for ragged-frontend tests.
+
+    ``keep`` drops ~1/3 of electrodes (the student's tubed + padded set);
+    ``visible`` is the per-electrode un-M2-masked set. Every KEPT electrode keeps
+    ≥1 token (token 0 forced visible) — the slow-exempt guarantee in miniature —
+    so no ragged row is all-pad. Dropped electrodes are left all-visible so the
+    DENSE oracle never hits an empty-softmax NaN at rows we won't compare."""
+    g = _gen(seed)
+    keep = torch.rand(B, C, generator=g) > 0.33
+    keep[:, 0] = True                                    # ≥1 kept electrode / sample
+    visible = torch.ones(B, C, 38, dtype=torch.bool)
+    for b in range(B):
+        for c in range(C):
+            if bool(keep[b, c]):
+                m = vc.sample_m2_mask(_gen(seed * 131 + b * 17 + c))  # True = masked
+                vis = ~m
+                vis[0] = True                            # guarantee ≥1 visible
+                visible[b, c] = vis
+    return keep, visible
+
+
+def test_frontend_ragged_equals_dense_on_visible() -> None:
+    # TDD veracity: the ragged gather (production path) is OUTPUT-IDENTICAL to the
+    # dense key-masked oracle on the kept-electrode visible tokens. A masked key
+    # contributes 0 to the softmax and masked queries are never read, so dropping
+    # them physically cannot change a visible token's features.
+    torch.manual_seed(0)
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=3).eval()
+    B, C = 3, 6
+    slow, beta, hg = _fake_bands(B, C)
+    keep, visible = _keep_visible(B, C, seed=1)
+    with torch.no_grad():
+        dense = fe(slow, beta, hg, key_mask=visible)            # (B,C,38,d)
+        ragged = fe.forward_ragged(slow, beta, hg, keep, visible)
+    sel = keep[:, :, None] & visible                            # kept-visible tokens
+    assert torch.allclose(ragged[sel], dense[sel], atol=1e-5)
+
+
+def test_frontend_ragged_drops_tubed_padded_and_masked_to_zero() -> None:
+    # Structural: nothing dense is processed. Dropped electrodes (every token) and
+    # kept-but-M2-masked tokens come back EXACTLY zero — they were never encoded.
+    torch.manual_seed(0)
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=2).eval()
+    B, C = 2, 7
+    slow, beta, hg = _fake_bands(B, C)
+    keep, visible = _keep_visible(B, C, seed=2)
+    with torch.no_grad():
+        ragged = fe.forward_ragged(slow, beta, hg, keep, visible)
+    dropped = ~keep                                             # tubed/padded electrodes
+    assert torch.count_nonzero(ragged[dropped]) == 0
+    masked = keep[:, :, None] & ~visible                        # kept but M2-masked
+    assert torch.count_nonzero(ragged[masked]) == 0
+    kept_visible = keep[:, :, None] & visible
+    assert torch.count_nonzero(ragged[kept_visible]) > 0        # the rest IS encoded
+
+
+def test_frontend_ragged_is_per_electrode_never_dense_over_electrodes() -> None:
+    # Ben 06-18: "the SA is per each electrode's 38 token sequence — never dense
+    # over all electrodes — 38 tokens at a time only." Proof: encoding ONE kept
+    # electrode alone reproduces its slice of the full ragged pass bit-for-bit, so
+    # no electrode's output depends on any other (no cross-electrode K/V pathway).
+    torch.manual_seed(0)
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=2).eval()
+    B, C = 2, 5
+    slow, beta, hg = _fake_bands(B, C)
+    keep, visible = _keep_visible(B, C, seed=3)
+    with torch.no_grad():
+        full = fe.forward_ragged(slow, beta, hg, keep, visible)
+        for b in range(B):
+            for c in range(C):
+                if not bool(keep[b, c]):
+                    continue
+                solo = fe.forward_ragged(
+                    slow[b : b + 1, c : c + 1],
+                    beta[b : b + 1, c : c + 1],
+                    hg[b : b + 1, c : c + 1],
+                    keep[b : b + 1, c : c + 1],
+                    visible[b : b + 1, c : c + 1],
+                )                                              # (1,1,38,d)
+                assert torch.allclose(solo[0, 0], full[b, c], atol=1e-6)
+
+
+def test_frontend_ragged_teacher_full_set_equals_dense() -> None:
+    # The EMA teacher: full electrode set, all tokens visible, RAGGED not padded
+    # (here C electrodes, no padding) — must equal the dense unmasked frontend.
+    torch.manual_seed(0)
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=2).eval()
+    B, C = 2, 5
+    slow, beta, hg = _fake_bands(B, C)
+    keep = torch.ones(B, C, dtype=torch.bool)
+    visible = torch.ones(B, C, 38, dtype=torch.bool)
+    with torch.no_grad():
+        dense = fe(slow, beta, hg)                              # no mask = teacher
+        ragged = fe.forward_ragged(slow, beta, hg, keep, visible)
+    assert torch.allclose(ragged, dense, atol=1e-5)
+
+
 # ===================================================== LatentEncoder (Stage 2)
 def _fake_feats(B: int, C: int, d: int = 32) -> torch.Tensor:
     return torch.randn(B, C, 38, d)

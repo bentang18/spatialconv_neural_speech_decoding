@@ -33,6 +33,7 @@ from speech_decoding.models.v14_encoder import (
     _JointTokenBlock,
     _MultiHeadCrossAttention,
     _PatchStem,
+    _ragged_gather_idx,
     _rope_freqs,
     _sincos_1d,
 )
@@ -410,6 +411,68 @@ class FrontendEncoder(nn.Module):
         for blk in self.blocks:
             x = blk(x, rope, km)
         return self.ln_out(x).reshape(B, C, S, d)
+
+    def forward_ragged(
+        self,
+        slow: Tensor,
+        beta: Tensor,
+        hg: Tensor,
+        keep_elec: Tensor,
+        visible: Tensor,
+    ) -> Tensor:
+        """Ragged frontend — **physically gather**, never process a dense set.
+
+        Ben's directive (2026-06-18): "Always gather only visible/un-tubed
+        tokens. NEVER OVER DENSE NEVER." This is the production path; the dense
+        ``forward(key_mask=...)`` above survives only as the equivalence oracle
+        (a masked key contributes 0 to the softmax and masked queries are never
+        read, so the two are output-identical on the kept tokens — that identity
+        is the TDD veracity test).
+
+        ``keep_elec``: ``(B, C)`` bool, ``True`` = an electrode to encode (real
+        AND, for the student, un-tubed). Dropped electrodes (padded or tubed) are
+        never tokenized through the blocks. ``visible``: ``(B, C, 38)`` bool,
+        ``True`` = a token to keep (the student's un-M2-masked tokens; the
+        teacher passes all-``True``). Returns ``(B, C, 38, d)`` with kept-
+        electrode visible positions filled and everything else exactly zero.
+
+        Two-level ragged gather: electrodes are isolated (no cross-electrode
+        pathway in the frontend), so kept electrodes flatten into one batch with
+        **no electrode-axis padding**; within each kept electrode the visible
+        tokens pad to the per-batch-max count ``Lk`` (the ``_ragged_gather_idx``
+        2STFT primitive). Every kept electrode keeps ≥1 token (slow is M2-exempt
+        for the student; the teacher keeps all 38), so no row is all-pad → no
+        empty-softmax NaN.
+        """
+        tok = self.tokenizer(slow, beta, hg)                     # (B, C, 38, d)
+        B, C, S, d = tok.shape
+        tok = tok + self.freq_embed[self.tokenizer.freq_global_id]
+        elec = B * C
+        out = tok.new_zeros(elec, S, d)
+        keep_flat = keep_elec.reshape(elec)
+        if not bool(keep_flat.any()):
+            return out.reshape(B, C, S, d)
+
+        e_idx = keep_flat.nonzero(as_tuple=False).squeeze(1)     # (R,) kept electrodes
+        R = int(e_idx.numel())
+        toks = tok.reshape(elec, S, d)[e_idx]                    # (R, 38, d)
+        vis = visible.reshape(elec, S)[e_idx]                    # (R, 38) bool
+
+        t_idx, t_real, Lk = _ragged_gather_idx(vis)              # (R, Lk)
+        xv = torch.gather(toks, 1, t_idx.unsqueeze(-1).expand(R, Lk, d))  # (R, Lk, d)
+        slot_v = self.tokenizer.time_slot[t_idx]                 # (R, Lk)
+        rope = self.key_rope[:, slot_v, :]                       # (2, R, Lk, head_dim)
+        for blk in self.blocks:
+            xv = blk(xv, rope, t_real)
+        xv = self.ln_out(xv)                                     # (R, Lk, d)
+
+        # Scatter the genuinely-kept (real) outputs back to their (electrode,
+        # token) home; padded slots are dropped.
+        rows = torch.arange(R, device=tok.device).unsqueeze(1).expand(R, Lk)
+        e_sel = e_idx[rows][t_real]                              # (M,)
+        t_sel = t_idx[t_real]                                    # (M,)
+        out[e_sel, t_sel] = xv[t_real]
+        return out.reshape(B, C, S, d)
 
 
 class LatentEncoder(nn.Module):
