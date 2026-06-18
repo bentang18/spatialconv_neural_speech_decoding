@@ -939,10 +939,14 @@ class V14ConvergedSSL(nn.Module):
     tokens never attend masked/tubed tokens). The masks are sampled outside (see
     ``sample_ssl_masks``) and passed in, so the forward is deterministic/testable.
 
-    Compute note: this batched form key-MASKS the masked/tubed tokens rather than
-    physically dropping them (correctness-identical paradigm-B; the used visible
-    features match a physical drop). Reclaiming the ~2× by ragged token-drop is a
-    perf optimization over this correct baseline, to land in DCC run-prep."""
+    Compute structure (Ben 2026-06-18, HARD requirement — NOT a deferred perf
+    opt): :meth:`forward` PHYSICALLY GATHERS only the visible/un-tubed tokens at
+    every stage — the teacher (full real set, ragged, post-frontend only), the
+    student frontend (un-tubed real electrodes, visible tokens, 38-at-a-time per
+    electrode), the latent (visible cross-electrode set), and both predictors
+    (M2 one electrode at a time → its masked; M4 all-visible → tubed parcels).
+    Never a dense padded/masked set. The dense attention-key-masked path survives
+    only as :meth:`_forward_dense`, the output-identical equivalence oracle."""
 
     def __init__(
         self,
@@ -1034,13 +1038,66 @@ class V14ConvergedSSL(nn.Module):
         ``parcel_per_electrode (B,C)`` long; ``electrode_mask (B,C)`` bool real;
         ``m2_mask (B,C,38)`` bool (True = M2 target, only on un-tubed electrodes);
         ``tube_mask (B,C)`` bool (electrode in a tubed parcel); ``tubed_parcels
-        (B,P)`` long + ``tubed_parcel_mask (B,P)`` bool (real tubed parcels)."""
-        # ---- teacher: frontend-only, full input, stop-grad ------------------
+        (B,P)`` long + ``tubed_parcel_mask (B,P)`` bool (real tubed parcels).
+
+        RAGGED production path (Ben 2026-06-18): every stage **physically gathers**
+        only the visible/un-tubed tokens — never a dense padded/masked set.
+        - TEACHER: full REAL electrode set (incl tubed — M4 targets need them),
+          ragged (drops padding), STOPS post-frontend (the big compute saving).
+        - STUDENT frontend: only un-tubed real electrodes, only un-M2-masked
+          tokens (per-electrode, 38 tokens at a time, never dense over electrodes).
+        - LATENT: gathers the visible un-tubed cross-electrode token set.
+        - M2: one electrode at a time, its visible→its masked.
+        - M4: all visible tokens from all electrodes → only the tubed parcels.
+
+        Output-identical to :meth:`_forward_dense` (the equivalence oracle): a
+        masked key adds 0 to the softmax and masked tokens are never read."""
+        # ---- teacher: full REAL electrode set, RAGGED (drop padding), post-FE ---
+        teacher_vis = electrode_mask.new_ones(m2_mask.shape)       # (B,C,38) all True
+        with torch.no_grad():
+            t_f = self.teacher_frontend.forward_ragged(
+                slow, beta, hg, electrode_mask, teacher_vis)       # (B,C,38,d)
+        t_f = t_f.detach()
+
+        # ---- student: only un-tubed real electrodes, only visible tokens --------
+        student_vis = ~m2_mask                                     # (B,C,38) visible
+        student_keep = electrode_mask & ~tube_mask                 # drop tubed+padded
+        s_f = self.student_frontend.forward_ragged(
+            slow, beta, hg, student_keep, student_vis)
+        latent_vis = (
+            electrode_mask[:, :, None] & (~tube_mask)[:, :, None] & student_vis
+        )                                                          # (B,C,38)
+        s_l = self.latent.forward_ragged(s_f, parcel_per_electrode, latent_vis)
+
+        l_m2 = self._m2_loss_ragged(
+            s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
+        l_m4 = self._m4_loss_ragged(
+            s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
+            tubed_parcels, tubed_parcel_mask,
+        )
+        loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
+        return {"loss": loss, "l_m2": l_m2, "l_m4": l_m4}
+
+    def _forward_dense(
+        self,
+        slow: Tensor,
+        beta: Tensor,
+        hg: Tensor,
+        parcel_per_electrode: Tensor,
+        electrode_mask: Tensor,
+        m2_mask: Tensor,
+        tube_mask: Tensor,
+        tubed_parcels: Tensor,
+        tubed_parcel_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        """Dense attention-key-masked path — retained ONLY as the equivalence
+        oracle for the ragged :meth:`forward`. Mathematically output-identical
+        (a masked key contributes 0; masked outputs are never read), but it builds
+        the full padded/masked token set, which the production path must not do."""
         with torch.no_grad():
             t_f = self.teacher_frontend(slow, beta, hg)            # (B,C,38,d)
         t_f = t_f.detach()
 
-        # ---- student: one pass, M2-key-masked frontend then latent ----------
         student_vis = ~m2_mask                                     # (B,C,38) visible
         s_f = self.student_frontend(slow, beta, hg, key_mask=student_vis)
         latent_vis = (

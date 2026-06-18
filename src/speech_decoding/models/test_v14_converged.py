@@ -923,6 +923,41 @@ def _run(model, batch):
                  m["tubed_parcels"], m["tubed_parcel_mask"])
 
 
+def test_forward_ragged_equals_dense() -> None:
+    # Stage 5: the production forward (fully ragged: teacher/student/latent/M2/M4)
+    # is output-identical to the dense oracle _forward_dense across all 3 losses.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    slow, beta, hg, pe, emask, m = _ssl_batch(B=3, C=8, seed=2)
+    args = (slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+    with torch.no_grad():
+        ragged = model(*args)
+        dense = model._forward_dense(*args)
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.allclose(ragged[k], dense[k], atol=1e-5), k
+    assert float(dense["l_m2"]) > 0.0 and float(dense["l_m4"]) > 0.0   # non-trivial
+
+
+def test_forward_ragged_equals_dense_with_padding() -> None:
+    # With padded electrodes (emask False), the ragged forward still matches the
+    # dense oracle — padding is gathered away, never built into any stage.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    slow, beta, hg, pe, emask, _ = _ssl_batch(B=2, C=6, seed=5)
+    emask = emask.clone()
+    emask[:, -1] = False                                   # last electrode padded
+    g = torch.Generator().manual_seed(11)
+    m = vc.sample_ssl_masks(pe, emask, g)                  # masks respect emask
+    args = (slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+    with torch.no_grad():
+        ragged = model(*args)
+        dense = model._forward_dense(*args)
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.allclose(ragged[k], dense[k], atol=1e-5), k
+
+
 def test_m2_loss_ragged_equals_dense() -> None:
     # Stage 3 (Ben 06-18): the ragged M2 gathers only un-tubed target electrodes,
     # each electrode's visible context + masked queries — output-identical to the
