@@ -208,3 +208,70 @@ def aggregate_subject(
         "dead": frozenset(dead),
         "static": static,
     }
+
+
+def collate_sessions(
+    sessions: list[dict],
+) -> dict[int, dict]:
+    """Collapse per-session detector signatures into a per-subject static drop.
+
+    The #208 collector core: ``sessions`` is one entry per loaded (subject,
+    trial), each a dict with ``subject`` (int), ``trial`` (int), ``labels``
+    (list[str]), ``clip_frac`` and ``rmad`` (per-contact arrays = the
+    :func:`static_bad_mask` diagnostics the DCC precompute dumps). Each session
+    is classified with the locked thresholds via :func:`classify_from_signature`
+    (so the bars live in ONE place), grouped by subject, and aggregated with
+    :func:`aggregate_subject` (chronic noisy/dead any-trial, spike majority).
+
+    Also reports **chronic vs variable**: a contact is *chronic* if it fired
+    (any detector) in EVERY loaded trial of the subject, *variable* if in some
+    but not all. Returns ``{subject: {spike, noisy, dead, static (frozensets),
+    n_trials, chronic, variable}}``."""
+    by_subject: dict[int, list[dict[str, set[str]]]] = {}
+    fired_counts: dict[int, dict[str, int]] = {}
+    for s in sessions:
+        sid = int(s["subject"])
+        cls = classify_from_signature(
+            list(s["labels"]), np.asarray(s["clip_frac"]), np.asarray(s["rmad"]),
+        )
+        by_subject.setdefault(sid, []).append(cls)
+        fired = set(cls["spike"]) | set(cls["noisy"]) | set(cls["dead"])
+        counts = fired_counts.setdefault(sid, {})
+        for lbl in fired:
+            counts[lbl] = counts.get(lbl, 0) + 1
+
+    out: dict[int, dict] = {}
+    for sid, per_trial in by_subject.items():
+        agg = aggregate_subject(per_trial)
+        n = len(per_trial)
+        counts = fired_counts.get(sid, {})
+        chronic = frozenset(lbl for lbl, c in counts.items() if c == n)
+        variable = frozenset(lbl for lbl, c in counts.items() if 0 < c < n)
+        out[sid] = {
+            **agg,
+            "n_trials": n,
+            "chronic": chronic,
+            "variable": variable,
+        }
+    return out
+
+
+def diff_static_drops(
+    would_be: dict[int, frozenset[str]],
+    locked: dict[int, frozenset[str]],
+) -> dict[int, dict[str, list[str]]]:
+    """Per-subject diff of a self-calibrated static set against the locked-11
+    convention. ``would_be`` / ``locked`` map subject → static-drop labels.
+    Returns ``{subject: {added, removed, unchanged}}`` (sorted lists) over the
+    UNION of subjects in either map (so an all-clean subject that locked-11
+    dropped shows its removals)."""
+    out: dict[int, dict[str, list[str]]] = {}
+    for sid in sorted(set(would_be) | set(locked)):
+        w = set(would_be.get(sid, frozenset()))
+        lk = set(locked.get(sid, frozenset()))
+        out[sid] = {
+            "added": sorted(w - lk),
+            "removed": sorted(lk - w),
+            "unchanged": sorted(w & lk),
+        }
+    return out

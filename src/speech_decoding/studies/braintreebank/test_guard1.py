@@ -167,3 +167,88 @@ def test_classify_from_signature_thresholds_are_locked() -> None:
     assert cls["spike"] == {"a"}
     assert cls["dead"] == {"d"}
     assert cls["noisy"] == set()
+
+
+# ------------------------------------------- #208 collector: collate + diff
+def _session(subject: int, trial: int, labels, clip_frac, rmad) -> dict:
+    return {
+        "subject": subject, "trial": trial, "labels": list(labels),
+        "clip_frac": list(clip_frac), "rmad": list(rmad),
+    }
+
+
+def test_collate_sessions_aggregates_and_classifies_per_subject() -> None:
+    # Subject 2, two trials. rmad cohort median≈1.0 in both.
+    #   d: dead (ratio 0.2 < 0.35) in BOTH trials → chronic dead.
+    #   a: spike (2% > 1%) in BOTH trials → spike majority → static.
+    labels = ["a", "b", "c", "d"]
+    rmad = [1.0, 1.0, 1.0, 0.2]
+    s1 = _session(2, 0, labels, [0.02, 0.0, 0.0, 0.0], rmad)
+    s2 = _session(2, 1, labels, [0.02, 0.0, 0.0, 0.0], rmad)
+    out = guard1.collate_sessions([s1, s2])
+    assert set(out) == {2}
+    sub = out[2]
+    assert sub["n_trials"] == 2
+    assert sub["dead"] == frozenset({"d"})
+    assert sub["spike"] == frozenset({"a"})        # 2/2 majority
+    assert sub["static"] == frozenset({"a", "d"})
+    # both fired in every trial → chronic, none variable
+    assert sub["chronic"] == frozenset({"a", "d"})
+    assert sub["variable"] == frozenset()
+
+
+def test_collate_sessions_chronic_vs_variable_split() -> None:
+    # 'a' spikes in only 1 of 3 trials → variable AND below spike-majority (kept
+    # OUT of static); 'd' dead in all 3 → chronic + static.
+    labels = ["a", "b", "c", "d"]
+    rmad = [1.0, 1.0, 1.0, 0.2]
+    sess = [
+        _session(7, 0, labels, [0.02, 0.0, 0.0, 0.0], rmad),  # a spikes
+        _session(7, 1, labels, [0.0, 0.0, 0.0, 0.0], rmad),
+        _session(7, 2, labels, [0.0, 0.0, 0.0, 0.0], rmad),
+    ]
+    out = guard1.collate_sessions(sess)[7]
+    assert out["n_trials"] == 3
+    assert "a" in out["variable"] and "a" not in out["chronic"]
+    assert out["spike"] == frozenset()              # 1/3 < majority → not static
+    assert out["chronic"] == frozenset({"d"})
+    assert out["static"] == frozenset({"d"})
+
+
+def test_collate_sessions_groups_multiple_subjects() -> None:
+    labels = ["a", "b"]
+    rmad = [1.0, 0.2]                                # b dead in any trial it appears
+    sess = [
+        _session(2, 0, labels, [0.0, 0.0], rmad),
+        _session(4, 0, labels, [0.0, 0.0], rmad),
+    ]
+    out = guard1.collate_sessions(sess)
+    assert set(out) == {2, 4}
+    assert out[2]["dead"] == frozenset({"b"}) and out[4]["dead"] == frozenset({"b"})
+
+
+def test_diff_static_drops_added_removed_unchanged() -> None:
+    would_be = {2: frozenset({"X", "Y"}), 9: frozenset({"P2e6"})}
+    locked = {2: frozenset({"Y", "Z"}), 8: frozenset({"Q"})}
+    d = guard1.diff_static_drops(would_be, locked)
+    # union of subjects {2, 8, 9}
+    assert set(d) == {2, 8, 9}
+    assert d[2] == {"added": ["X"], "removed": ["Z"], "unchanged": ["Y"]}
+    # subject 8 only in locked → all removed
+    assert d[8] == {"added": [], "removed": ["Q"], "unchanged": []}
+    # subject 9 only in would_be → all added
+    assert d[9] == {"added": ["P2e6"], "removed": [], "unchanged": []}
+
+
+def test_diff_against_locked11_self_consistent() -> None:
+    # Reproduce the locked-11 set exactly → zero added/removed everywhere.
+    from speech_decoding.studies.braintreebank.anatomy import (
+        _BT_V14_EXTRA_BAD_ELECTRODES,
+        extra_bad_electrodes,
+    )
+
+    locked = {s: extra_bad_electrodes(s) for s in _BT_V14_EXTRA_BAD_ELECTRODES}
+    d = guard1.diff_static_drops(locked, locked)
+    for sid, rec in d.items():
+        assert rec["added"] == [] and rec["removed"] == [], sid
+        assert set(rec["unchanged"]) == set(locked[sid])
