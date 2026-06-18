@@ -187,6 +187,15 @@ def cs_auroc(
     return auroc(pred, y_test)
 
 
+def _finite_rows(z: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep only rows with a finite (covered) ±1 label. The shared probe window
+    set is forwarded once; each task labels only the windows it covers (continuous
+    tasks drop the middle 50% → NaN), so the fit masks those rows out per task."""
+    y = np.asarray(y, dtype=np.float64)
+    m = np.isfinite(y)
+    return z[m], y[m]
+
+
 # --------------------------------------------------------------------------- firewall
 
 
@@ -310,12 +319,15 @@ def run_probe(
         for k in k_list:
             sfx = "" if k == k_primary else f"_k{k}"
             for task in dataset.tasks:
-                # WS: per-subject contiguous 2-fold, mean over subjects
+                # WS: per-subject contiguous 2-fold, mean over subjects. A task's
+                # label is ±1 only on the windows it covers (continuous tasks drop
+                # the middle 50%; spec §5) — non-finite labels are masked out first.
                 ws_vals: list[float] = []
                 for s in dataset.ws_subjects:
                     p, present = pooled[s][tap][k]
                     z = feature_matrix(p, parcel_intersection(present, present)).numpy()
-                    ws_vals.append(ws_auroc_2fold(z, labels[s][task]))
+                    zf, yf = _finite_rows(z, labels[s][task])
+                    ws_vals.append(ws_auroc_2fold(zf, yf) if len(yf) >= 4 else float("nan"))
                 ws_mean = float(np.nanmean(ws_vals)) if ws_vals else float("nan")
 
                 # CS: sub2 anchor -> each test subject over intersection parcels
@@ -328,9 +340,12 @@ def run_probe(
                     if inter.numel() == 0:
                         cs_vals.append(float("nan"))
                         continue
-                    za = feature_matrix(pa, inter).numpy()
-                    zt = feature_matrix(pt, inter).numpy()
-                    cs_vals.append(cs_auroc(za, labels[a][task], zt, labels[t][task]))
+                    za, ya = _finite_rows(feature_matrix(pa, inter).numpy(), labels[a][task])
+                    zt, yt = _finite_rows(feature_matrix(pt, inter).numpy(), labels[t][task])
+                    if len(ya) < 2 or len(yt) < 1:
+                        cs_vals.append(float("nan"))
+                        continue
+                    cs_vals.append(cs_auroc(za, ya, zt, yt))
                 cs_mean = float(np.nanmean(cs_vals)) if cs_vals else float("nan")
 
                 metrics[f"val_probe/{tap}/ws/{task}{sfx}"] = ws_mean
