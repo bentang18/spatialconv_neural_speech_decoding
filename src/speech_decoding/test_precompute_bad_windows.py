@@ -64,20 +64,23 @@ def _quiet_loud(ne: int = 100, nw: int = 10):
     with nothing wrong. Under a single POOLED q (≈100) the quiet transient is
     invisible (10 ≪ 5·100); under per-band q it fires."""
     quiet = np.ones((ne, nw), np.float32)
-    quiet[:6, 3] = 10.0   # 6 electrodes hot in window 3  (10 > HOT_MULT·q=5)
-    quiet[0, 5] = 20.0    # one catastrophic cell window 5 (20 > CAT_MULT·q=12)
+    quiet[:6, 3] = 10.0   # 6 electrodes hot in window 3  (10 > the slow-band hot fence)
+    quiet[0, 5] = 20.0    # one catastrophic cell window 5 (20 > the slow-band cat fence)
     loud = np.full((ne, nw), 100.0, np.float32)
     return quiet, loud
 
 
 def test_per_band_q_catches_quiet_band_transient() -> None:
     """Decisive #231 check: a transient in the quiet band is flagged because that
-    band self-calibrates its own q_b — the loud band does not mask it."""
+    band self-calibrates its own q_b — the loud band does not mask it. Pins the
+    multipliers (5/12) so the rule is tested independent of the production defaults:
+    at q=1 the cell 10 is hot-only (>5, <12) and only the cell 20 is cat (>12)."""
     m = _mod()
     quiet, loud = _quiet_loud()
     n_flat = np.zeros(quiet.shape[1], np.int32)
     bad, diag = m._decide_bad_windows(
         {"slow": quiet, "beta": loud, "hg": loud}, n_flat, quiet.shape[0],
+        hot_mult=5.0, cat_mult=12.0,
     )
     assert diag["per_band"]["slow"]["q"] == pytest.approx(1.0)
     assert diag["per_band"]["beta"]["q"] == pytest.approx(100.0)
@@ -111,7 +114,9 @@ def test_hot_rule_needs_enough_electrodes() -> None:
     band[:4, 1] = 10.0                    # 4 hot < 5 → window 1 stays clean
     band[:5, 2] = 10.0                    # 5 hot == thresh → window 2 bad
     n_flat = np.zeros(nw, np.int32)
-    bad, diag = m._decide_bad_windows({"slow": band}, n_flat, ne)
+    # cat_mult=12 keeps the cell 10 below the cat fence (10 < 12·1) so this isolates
+    # the HOT rule — the production cat fence (8·1) would otherwise also flag it.
+    bad, diag = m._decide_bad_windows({"slow": band}, n_flat, ne, cat_mult=12.0)
     assert diag["per_band"]["slow"]["q"] == pytest.approx(1.0)  # transient didn't inflate q
     assert bad == [2]
     assert diag["hot_count_thresh"] == 5
@@ -123,7 +128,7 @@ def test_cat_rule_one_giant_cell() -> None:
     m = _mod()
     ne, nw = 100, 6
     band = np.ones((ne, nw), np.float32)
-    band[7, 4] = 50.0                     # 1 cell, 50 > 12·1 → window 4 bad on cat
+    band[7, 4] = 50.0                     # 1 cell, 50 > 8·1 → window 4 bad on cat
     n_flat = np.zeros(nw, np.int32)
     bad, diag = m._decide_bad_windows({"slow": band}, n_flat, ne)
     assert bad == [4]
@@ -165,13 +170,48 @@ def test_per_band_multiplier_override() -> None:
     band = np.ones((ne, nw), np.float32)
     band[:6, 2] = 10.0                    # ratio 10 vs q=1
     n_flat = np.zeros(nw, np.int32)
-    base, _ = m._decide_bad_windows({"slow": band}, n_flat, ne)
-    assert base == [2]                    # default HOT_MULT=5 → 10 > 5 → flagged
+    # cat_mult=12 keeps the cell 10 under the cat fence in both calls, so only the
+    # HOT-override is under test (the production cat fence 8·1 would mask it).
+    base, _ = m._decide_bad_windows({"slow": band}, n_flat, ne, cat_mult=12.0)
+    assert base == [2]                    # default HOT_MULT=4 → 10 > 4 → flagged
     loosened, diag = m._decide_bad_windows(
-        {"slow": band}, n_flat, ne, hot_mult_by_band={"slow": 12.0},
+        {"slow": band}, n_flat, ne, cat_mult=12.0, hot_mult_by_band={"slow": 12.0},
     )
     assert loosened == []                 # 10 < 12 → un-flagged
     assert diag["per_band"]["slow"]["hot_mult"] == 12.0
+
+
+# --------------------------------------------------------------- locked defaults
+def test_production_defaults_are_locked() -> None:
+    """The CLIP-aggressiveness sweep (job 48519544) locked these — guard against an
+    accidental drift back to the pre-sweep 5/12 fences or a dropped abs-floor."""
+    m = _mod()
+    assert m.HOT_MULT == 4.0
+    assert m.CAT_MULT == 8.0
+    assert m.ABS_FLOOR_MAD == 200.0
+    assert m.FRAC_HOT == 0.05
+    assert m.N_FLOOR == 3
+
+
+# --------------------------------------------------------------- absolute floor
+def test_abs_floor_catches_giant_the_relative_fence_misses() -> None:
+    """The q-INDEPENDENT backstop: on an artifact-inflated band (q≈100) a single
+    250-MAD cell sits UNDER the relative fences (hot 4·100=400, cat 8·100=800) but
+    ABOVE the absolute floor (200), so only the abs rule flags it. This is exactly
+    the failure mode the floor exists for — a ballooned q hiding a real giant."""
+    m = _mod()
+    ne, nw = 100, 10
+    band = np.full((ne, nw), 100.0, np.float32)   # inflated band → q≈100
+    band[0, 3] = 250.0                             # one giant: < 8·q but > 200
+    n_flat = np.zeros(nw, np.int32)
+    bad, diag = m._decide_bad_windows({"slow": band}, n_flat, ne)
+    assert diag["per_band"]["slow"]["q"] == pytest.approx(100.0)
+    assert bad == [3]
+    assert diag["n_cat_windows"] == 0 and diag["n_hot_windows"] == 0
+    assert diag["n_abs_windows"] == 1 and diag["abs_floor_mad"] == 200.0
+    # raising the floor above the giant un-flags it (nothing else fires)
+    clean, _ = m._decide_bad_windows({"slow": band}, n_flat, ne, abs_floor_mad=300.0)
+    assert clean == []
 
 
 # ----------------------------------------------------------- span merging

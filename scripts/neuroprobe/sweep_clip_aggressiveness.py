@@ -49,9 +49,17 @@ from precompute_bad_windows import (  # noqa: E402
 # aggressive lever value that keeps it at that floor is the safe answer.
 CANARY: str = "btbank3_t2"
 
-# Production fences (the OFAT origin — every lever holds these while one varies).
+# Pre-sweep fences (the OFAT origin — every lever holds these while one varies).
+# This is the OLD reference point the sweep measures AGAINST, NOT the locked answer.
 BASELINE: dict[str, float] = {
     "hot_mult": 5.0, "cat_mult": 12.0, "frac_hot": 0.05, "n_floor": 3,
+}
+# LOCKED fences (what the sweep chose, now the production defaults): hot 5→4,
+# cat 12→8, + the q-independent abs floor K=200. ``locked_combined`` reports the
+# REAL union drop (hot@4 ∪ cat@8 ∪ flat ∪ abs@200) — a union, not the sum of the
+# OFAT marginals — so it is the honest "% of clips dropped under the lock".
+LOCKED: dict[str, float] = {
+    "hot_mult": 4.0, "cat_mult": 8.0, "frac_hot": 0.05, "n_floor": 3,
 }
 # One-factor-at-a-time grid. Each value is swept with the OTHER three held at
 # BASELINE, so the marginal effect of that single lever is isolated. Values reach
@@ -96,7 +104,10 @@ def sweep_decision(
     n_windows = int(n_flat.shape[0])
 
     def n_bad(**over: float) -> int:
-        kw = {**BASELINE, **over}
+        # abs_floor_mad=inf disables the NEW production abs backstop so the OFAT grid
+        # measures the RELATIVE rules in isolation (the abs floor is swept separately
+        # below). Without this pin the relative levers would silently fold in abs@200.
+        kw = {**BASELINE, "abs_floor_mad": float("inf"), **over}
         bad_idx, _ = _decide_bad_windows(ewm_by_band, n_flat, n_elec, **kw)  # type: ignore[arg-type]
         return len(bad_idx)
 
@@ -105,10 +116,16 @@ def sweep_decision(
         lev: {_key(v): n_bad(**{lev: v}) for v in vals}
         for lev, vals in GRID.items()
     }
+    # The honest answer: the REAL union drop at the locked fences (relative AND the
+    # abs floor together), not the sum of OFAT marginals.
+    locked_idx, _ = _decide_bad_windows(ewm_by_band, n_flat, n_elec, **LOCKED)  # type: ignore[arg-type]
+    locked_combined = len(locked_idx)
 
     # Absolute floor = baseline-bad UNION (any band cell > K). Union (not replace)
     # because it's an ADDITIONAL backstop on top of the relative rules.
-    base_idx, _ = _decide_bad_windows(ewm_by_band, n_flat, n_elec, **BASELINE)  # type: ignore[arg-type]
+    base_idx, _ = _decide_bad_windows(
+        ewm_by_band, n_flat, n_elec, **BASELINE, abs_floor_mad=float("inf"),  # type: ignore[arg-type]
+    )
     base_set = set(base_idx)
     allband_cellmax = np.zeros(n_windows, np.float32)
     for ewm in ewm_by_band.values():
@@ -134,6 +151,7 @@ def sweep_decision(
 
     return {
         "baseline": int(baseline),
+        "locked_combined": int(locked_combined),
         "n_windows": int(n_windows),
         "n_elec": int(n_elec),
         "hot_count_thresh": int(
@@ -207,6 +225,9 @@ def _aggregate(recs: list[dict]) -> dict:
         "cohort_windows": cohort_windows,
         "canary_session": CANARY,
         "canary_baseline": (canary["baseline"] if canary else None),
+        "cohort_baseline": sum(r["baseline"] for r in recs),
+        "cohort_locked_combined": sum(r.get("locked_combined", 0) for r in recs),
+        "canary_locked_combined": (canary.get("locked_combined") if canary else None),
         "levers": levers,
         "abs_floor": abs_floor,
         "common_mode_ge_k": ge_k,
@@ -233,6 +254,14 @@ def summarize(out_dir: Path) -> dict:
     print(f"\n=== CLIP-aggressiveness sweep — {agg['n_sessions']} sessions, "
           f"{agg['cohort_windows']} windows total ===")
     print(f"canary = {CANARY} (baseline drops = {base_can})\n")
+
+    cw = agg["cohort_windows"]
+    cb, cl = agg["cohort_baseline"], agg["cohort_locked_combined"]
+    print("COMBINED drop (real union, not OFAT sum):")
+    print(f"  pre-sweep  (hot5/cat12, no abs) : {cb:>5}/{cw} "
+          f"({cb / cw:.2%})  canary={base_can}")
+    print(f"  LOCKED (hot4/cat8/abs200)       : {cl:>5}/{cw} "
+          f"({cl / cw:.2%})  canary={agg['canary_locked_combined']}\n")
 
     print("per-session baseline drops:")
     for r in sorted(recs, key=lambda r: r["session"]):

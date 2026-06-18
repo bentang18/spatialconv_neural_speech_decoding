@@ -76,10 +76,27 @@ def test_baseline_equals_decide_bad_windows() -> None:
     ewm, n_flat, n_elec = _synth()
     _events(ewm)
     res = m.sweep_decision(ewm, n_flat, n_elec)
-    bad_idx, _ = m._decide_bad_windows(ewm, n_flat, n_elec, **m.BASELINE)
+    bad_idx, _ = m._decide_bad_windows(
+        ewm, n_flat, n_elec, **m.BASELINE, abs_floor_mad=float("inf")
+    )
     assert res["baseline"] == len(bad_idx)
     # hand-known: win10 (6≥5 hot) + win20 (20>12 cat)
     assert res["baseline"] == 2
+
+
+def test_locked_combined_is_real_union_not_ofat_sum() -> None:
+    """``locked_combined`` is the production decision at the LOCKED fences
+    (hot4/cat8/abs200) — a UNION, strictly ≥ baseline. Hand-known on _events:
+    hot@4 fires win10 (6@8) + win30 (6@4.5); cat@8 fires win20/21/22 (20/11/9 > 8);
+    beta's 8.0 cells are NOT > 8, abs@200 fires nothing → {10,20,21,22,30} = 5."""
+    m = _mod()
+    ewm, n_flat, n_elec = _synth()
+    _events(ewm)
+    res = m.sweep_decision(ewm, n_flat, n_elec)
+    locked_idx, _ = m._decide_bad_windows(ewm, n_flat, n_elec, **m.LOCKED)
+    assert res["locked_combined"] == len(locked_idx)
+    assert res["locked_combined"] == 5
+    assert res["locked_combined"] >= res["baseline"]
 
 
 def test_clean_session_zero_everywhere() -> None:

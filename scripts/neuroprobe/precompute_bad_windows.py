@@ -104,18 +104,29 @@ from speech_decoding.studies.braintreebank.manifest import V14_PRETRAIN_SESSIONS
 # transient in a quieter band slips under the fence. One ``q_band`` per band lets each
 # band's fences ride just above its OWN clean ceiling.
 #
-# PRELIMINARY multipliers (Ben locks finals after profiling the rebuilt 3STFT cache):
-# carried over from the 2STFT knee sweep (healthy per-window ceiling ~7q, single-cell
-# ~11q → HOT_MULT 5 / CAT_MULT 12), applied per-band. ``HOT_MULT``/``CAT_MULT`` may be
-# overridden per band via the dicts below once each band's knee is measured.
+# LOCKED multipliers (13-session CLIP-aggressiveness sweep, job 48519544, 2026-06-18,
+# gated on the canary btbank3_t2 ≈ 0%): cat_mult 12→8 is the big safe win (+81 cohort,
+# canary 0); hot_mult 5→4 is the marginal one (+12 cohort, canary 0); frac_hot 0.05 and
+# n_floor 3 unchanged (n_floor never binds — frac_hot·n_elec ≥ 5 > 3 across the cohort).
+# ``HOT_MULT``/``CAT_MULT`` may still be overridden per band via the dicts below.
 CLIP_S: float = 5.0  # SSL clip length (dispatch clip_len); the window grid stride
 Q_PCT: float = 99.0  # per-(session,band) scale q = this pct of all (elec, window) |z|-max
 FRAC_HOT: float = 0.05  # >= this fraction of electrodes hot together -> common-mode drop
 FRAC_FLAT: float = 0.05  # >= this fraction of electrodes flat together -> dropout drop
 N_FLOOR: int = 3  # ...but never fewer than this many electrodes (small-array guard)
-HOT_MULT: float = 5.0  # an electrode is "hot" in a window if its |z|-max > HOT_MULT * q
-CAT_MULT: float = 12.0  # any single cell > CAT_MULT * q -> drop (poisons the batch alone)
+HOT_MULT: float = 4.0  # an electrode is "hot" in a window if its |z|-max > HOT_MULT * q
+CAT_MULT: float = 8.0  # any single cell > CAT_MULT * q -> drop (poisons the batch alone)
 FLAT_STD: float = 0.05  # an electrode is "flat" in a window if its slow-band z-std < this
+
+# Absolute backstop (q-INDEPENDENT): drop a window if ANY band cell exceeds this many
+# session-normalized MADs, no matter the per-session q. On an artifact-inflated session
+# the relative q (hence the CAT_MULT·q fence) rides up and lets physiologically-impossible
+# giants slip through; this floor catches them regardless. Data knee from the same sweep:
+# K=200 holds every relative-clean session at 0 dropped, K=150 starts dropping clean clips
+# (canary +9 at 150, +169 at 100). 200 >> every band's legit ceiling (q99 ~5-25 MADs), so a
+# cell above it is unambiguously an artifact, not neural signal. Kept even where CAT_MULT·q
+# already subsumes it (q<25) — it's the portable backstop for any future high-q session.
+ABS_FLOOR_MAD: float = 200.0
 
 # Per-band multiplier OVERRIDES (PRELIMINARY: empty → every band uses the scalar
 # HOT_MULT/CAT_MULT above). Ben fills these from the per-band knee sweep on the rebuilt
@@ -184,6 +195,7 @@ def _decide_bad_windows(
     n_floor: int = N_FLOOR,
     hot_mult: float = HOT_MULT,
     cat_mult: float = CAT_MULT,
+    abs_floor_mad: float = ABS_FLOOR_MAD,
     hot_mult_by_band: dict[str, float] | None = None,
     cat_mult_by_band: dict[str, float] | None = None,
 ) -> tuple[list[int], dict]:
@@ -193,8 +205,9 @@ def _decide_bad_windows(
     |z|-max WITHIN that band. ``n_flat`` is ``(n_windows,)``: the count of
     slow-band-flat electrodes per window. Each band self-calibrates its own scale
     ``q_band`` (P99 of its own (elec, window) |z|-max) and fences ride above it; a
-    window is BAD iff ANY band fires hot (common-mode) or cat (single-cell), OR the
-    slow band fires flat (dropout). Returns ``(sorted bad_idx, diagnostics)``."""
+    window is BAD iff ANY band fires hot (common-mode), cat (single-cell relative to
+    q), or abs (single-cell above the q-INDEPENDENT ``abs_floor_mad`` backstop), OR
+    the slow band fires flat (dropout). Returns ``(sorted bad_idx, diagnostics)``."""
     hot_mult_by_band = hot_mult_by_band or {}
     cat_mult_by_band = cat_mult_by_band or {}
     n_windows = int(n_flat.shape[0])
@@ -202,6 +215,7 @@ def _decide_bad_windows(
     flat_count_thresh = max(n_floor, int(np.ceil(frac_flat * n_elec)))
     hot_bad = np.zeros(n_windows, bool)
     cat_bad = np.zeros(n_windows, bool)
+    abs_bad = np.zeros(n_windows, bool)
     per_band: dict[str, dict] = {}
     for name, ewm in ewm_by_band.items():
         q = float(np.percentile(ewm, q_pct)) if ewm.size else 0.0
@@ -214,26 +228,30 @@ def _decide_bad_windows(
         n_hot = (ewm > hot_fence).sum(axis=0).astype(np.int32)
         hb = n_hot >= hot_count_thresh
         cb = win_cell_max > cat_fence
+        ab = win_cell_max > abs_floor_mad
         hot_bad |= hb
         cat_bad |= cb
+        abs_bad |= ab
         per_band[name] = {
             "q": q, "hot_mult": hm, "cat_mult": cm,
             "hot_fence": float(hot_fence), "cat_fence": float(cat_fence),
             "n_hot_windows": int(hb.sum()), "n_cat_windows": int(cb.sum()),
+            "n_abs_windows": int(ab.sum()),
             "max_n_hot": int(n_hot.max()) if n_windows else 0,
             "max_cell_max": float(win_cell_max.max()) if n_windows else 0.0,
         }
     flat_bad = n_flat >= flat_count_thresh
-    bad = hot_bad | cat_bad | flat_bad
+    bad = hot_bad | cat_bad | abs_bad | flat_bad
     bad_idx = [int(w) for w in np.nonzero(bad)[0]]
     diag = {
         "q_pct": q_pct, "frac_hot": frac_hot, "frac_flat": frac_flat,
-        "n_floor": n_floor, "flat_std": FLAT_STD,
+        "n_floor": n_floor, "flat_std": FLAT_STD, "abs_floor_mad": abs_floor_mad,
         "hot_count_thresh": int(hot_count_thresh),
         "flat_count_thresh": int(flat_count_thresh),
         "per_band": per_band,
         "n_hot_windows": int(hot_bad.sum()),
         "n_cat_windows": int(cat_bad.sum()),
+        "n_abs_windows": int(abs_bad.sum()),
         "n_flat_windows": int(flat_bad.sum()),
         "max_n_flat": int(n_flat.max()) if n_windows else 0,
     }
@@ -354,6 +372,7 @@ def scan_session(subject_id: int, trial_id: int) -> dict:
         "max_n_flat": int(n_flat.max()) if n_windows else 0,
         "n_hot_windows": decision["n_hot_windows"],
         "n_cat_windows": decision["n_cat_windows"],
+        "n_abs_windows": decision["n_abs_windows"],
         "n_flat_windows": decision["n_flat_windows"],
     }
 
