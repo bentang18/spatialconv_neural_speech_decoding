@@ -11,6 +11,7 @@ hard-pool lock) and ``memory/project_v14_arch_revision_2026_05_19_v3.md`` (base)
 """
 
 from speech_decoding.models.mlp import TinyMLP, TinyMLPModel
+from speech_decoding.models.v14_converged_config import V14Converged
 from speech_decoding.models.v14_encoder import (
     V14MeanPoolLinearHead,
     V14ParcelCollapsePMA,
@@ -25,6 +26,7 @@ from speech_decoding.models.v14_encoder import (
 __all__ = [
     "TinyMLP",
     "TinyMLPModel",
+    "V14Converged",
     "V14MeanPoolLinearHead",
     "V14ParcelCollapsePMA",
     "V14ParcelPerceiver",
