@@ -277,18 +277,21 @@ def test_diff_static_drops_added_removed_unchanged() -> None:
     assert d[9] == {"added": ["P2e6"], "removed": [], "unchanged": []}
 
 
-def test_diff_against_locked11_self_consistent() -> None:
-    # Reproduce the locked-11 set exactly → zero added/removed everywhere.
-    from speech_decoding.studies.braintreebank.anatomy import (
-        _BT_V14_EXTRA_BAD_ELECTRODES,
-        extra_bad_electrodes,
-    )
-
-    locked = {s: extra_bad_electrodes(s) for s in _BT_V14_EXTRA_BAD_ELECTRODES}
-    d = guard1.diff_static_drops(locked, locked)
+def test_diff_static_drops_self_consistent() -> None:
+    # diff_static_drops invariant: a per-subject set diffed against itself yields
+    # zero added/removed and unchanged == the set, for every subject. (The legacy
+    # locked-11 dict is retired + empty since the #213 per-session bake, so this
+    # exercises the helper against a fixed representative sample instead.)
+    sample = {
+        2: ("LT2aA2", "LT3a8"),
+        4: ("LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"),
+        9: ("P2e6", "P2e8"),
+    }
+    d = guard1.diff_static_drops(sample, sample)
+    assert set(d) == set(sample)
     for sid, rec in d.items():
         assert rec["added"] == [] and rec["removed"] == [], sid
-        assert set(rec["unchanged"]) == set(locked[sid])
+        assert set(rec["unchanged"]) == set(sample[sid])
 
 
 # ------------------------------- #208 per-session assembler (per-session decision)

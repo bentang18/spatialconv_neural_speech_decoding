@@ -218,60 +218,87 @@ def test_voltage_order_matches_upstream(subject_id: int) -> None:
     assert actual == expected
 
 
-_STATIC_EXCLUDED_SUBJECTS = (2, 4, 7, 8, 9)
+# Per-session GUARD-1 STATIC drop (baked 2026-06-18, #213). The (subject, trial)
+# sessions that drop ≥1 contact — the parametrize list for the realness guard.
+# Tracked against the baked per-session dict by
+# ``test_extra_bad_electrodes_per_session_is_the_baked_guard1_set``.
+_STATIC_DROPPING_SESSIONS = (
+    (1, 0), (1, 1), (1, 2),
+    (2, 0), (2, 1), (2, 2), (2, 6),
+    (3, 0), (3, 1), (3, 2),
+    (4, 1), (4, 2),
+    (6, 0), (6, 1), (6, 4),
+    (7, 0), (7, 1),
+    (8, 0),
+    (9, 0),
+    (10, 0), (10, 1),
+)
 
 
-def test_extra_bad_electrodes_dict_is_the_locked_11() -> None:
-    """Pin the finalized Ben-approved static-exclusion list (2026-06-14) so an
-    accidental edit fails loud. The 11 contacts: their subjects, labels, and total
-    count. ``extra_bad_electrodes`` returns the cleaned set per subject and an
-    empty set for any subject not listed."""
+def test_extra_bad_electrodes_per_session_is_the_baked_guard1_set() -> None:
+    """Pin the baked GUARD-1 per-session static-exclusion set (#213, 2026-06-18) so
+    an accidental edit fails loud. STATIC is now PER-SESSION ``(subject, trial)``:
+    25 scanned sessions, 81 dropped contacts, 21 sessions dropping ≥1 (the other 4
+    carry an explicit ``()`` clean-session entry). The legacy per-subject "locked-11"
+    dict is RETIRED + empty, so a call with no per-session entry (``trial_id=None``
+    or an unscanned session) drops nothing."""
     import speech_decoding.studies.braintreebank.anatomy as anatomy
 
-    assert anatomy._BT_V14_EXTRA_BAD_ELECTRODES == {
-        2: ("LT2aA2", "LT3a8"),
-        4: ("LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"),
-        7: ("LF3bOFb1",),
-        8: ("F3cIc8", "T3H12"),
-        9: ("P2e6", "P2e8"),
-    }
-    total = sum(len(v) for v in anatomy._BT_V14_EXTRA_BAD_ELECTRODES.values())
-    assert total == 11
-    # the literal parametrize list below must track the dict keys
-    assert tuple(sorted(anatomy._BT_V14_EXTRA_BAD_ELECTRODES)) == _STATIC_EXCLUDED_SUBJECTS
-    assert extra_bad_electrodes(4) == frozenset(
-        {"LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"}
-    )
-    assert extra_bad_electrodes(99) == frozenset()  # unlisted subject → no drop
+    # legacy per-subject fallback is retired + empty
+    assert anatomy._BT_V14_EXTRA_BAD_ELECTRODES == {}
+
+    ps = anatomy._BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION
+    assert len(ps) == 25
+    assert sum(len(v) for v in ps.values()) == 81
+    assert tuple(sorted(k for k, v in ps.items() if v)) == _STATIC_DROPPING_SESSIONS
+
+    # representative entries: drift across a subject's sessions + explicit clean entry
+    assert ps[(2, 2)] == ("LT3d7", "RT1aIa7", "RT1aIa8")
+    assert ps[(6, 4)] == ("T2A8",)
+    assert ps[(9, 0)] == ("P2e5", "P2e6", "P2e7", "P2e8", "T1c5")
+    assert ps[(2, 3)] == ()  # scanned-clean session → explicit empty entry
+
+    # extra_bad_electrodes returns the cleaned per-session set
+    assert extra_bad_electrodes(2, 2) == frozenset({"LT3d7", "RT1aIa7", "RT1aIa8"})
+    assert extra_bad_electrodes(2, 3) == frozenset()  # explicit clean session
+    # no trial / unscanned session → legacy (empty) fallback → no drop
+    assert extra_bad_electrodes(2) == frozenset()
+    assert extra_bad_electrodes(99, 0) == frozenset()
 
 
 @pytest.mark.must_pass_before_dispatch
-@pytest.mark.parametrize("subject_id", _STATIC_EXCLUDED_SUBJECTS)
+@pytest.mark.parametrize("subject_id,trial_id", _STATIC_DROPPING_SESSIONS)
 def test_static_excluded_contacts_are_real_and_actually_dropped(
-    subject_id: int, monkeypatch: pytest.MonkeyPatch
+    subject_id: int, trial_id: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """TDD guard against a typo'd static-exclusion label: a label that matches no
     real contact would drop NOTHING and silently leave the flaky electrode on the
-    encoder's input. For each listed subject, every named contact must (a) be
-    PRESENT in the real montage before the drop and (b) be ABSENT after — proving
-    the label is genuine and the exclusion bites. The post-drop order also shrinks
-    by exactly the number of named contacts (no over- or under-drop)."""
+    encoder's input. For each per-session ``(subject, trial)`` drop, every named
+    contact must (a) be PRESENT in the real montage before the drop and (b) be
+    ABSENT after — proving the label is genuine and the exclusion bites. The
+    post-drop order also shrinks by exactly the number of named contacts (no over-
+    or under-drop). The montage is per-subject (trial-independent); the per-session
+    DROP is what varies, so we thread ``trial_id`` through both ends."""
     import speech_decoding.studies.braintreebank.anatomy as anatomy
 
     _require_vendored(subject_id)
-    named = extra_bad_electrodes(subject_id)
+    named = extra_bad_electrodes(subject_id, trial_id)
+    assert named, f"sub_{subject_id} trial_{trial_id}: expected ≥1 named drop"
 
-    # Pre-drop baseline: clear the static dict so voltage_electrode_order keeps the
-    # flaky contacts. Each named contact must appear here (else it's a typo).
+    # Pre-drop baseline: clear BOTH dicts so voltage_electrode_order keeps the flaky
+    # contacts. Each named contact must appear here (else it's a typo).
     monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES", {})
-    full_order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION", {})
+    full_order = voltage_electrode_order(str(_BT_CACHE), subject_id, trial_id)
     missing = named - set(full_order)
-    assert not missing, f"sub_{subject_id}: static labels not in montage: {missing}"
+    assert not missing, (
+        f"sub_{subject_id} trial_{trial_id}: static labels not in montage: {missing}"
+    )
 
-    # Post-drop: restore the dict; assert each named contact is gone and the count
+    # Post-drop: restore the dicts; assert each named contact is gone and the count
     # dropped by exactly len(named).
     monkeypatch.undo()
-    dropped_order = voltage_electrode_order(str(_BT_CACHE), subject_id)
+    dropped_order = voltage_electrode_order(str(_BT_CACHE), subject_id, trial_id)
     assert named.isdisjoint(dropped_order)
     assert len(dropped_order) == len(full_order) - len(named)
 
@@ -507,11 +534,14 @@ def test_aligned_voltage_support_sub4_interior_unmapped() -> None:
     )
     n_voltage = len(result.electrode_labels)
     n_mapped = int(result.valid.sum())
-    # 183 raw voltage contacts minus the 4 v14 flaky-contact static drops
-    # (LT2aA11, LT2bHb12, LF3cIc10, LF3aOFa16 — all previously mapped) = 179.
-    # The 2 interior-unmapped Inf-Lat-Vent contacts (LT2bHb3/4) are untouched.
-    assert n_voltage == 179
-    assert n_mapped == 177  # still exactly 2 unmapped
+    # Called with no trial_id → the GUARD-1 static drop is PER-SESSION (#213) and
+    # the legacy per-subject fallback is retired + empty, so nothing is dropped:
+    # all 183 raw voltage contacts survive. (Per-session static-drop realness has
+    # its own guard, test_static_excluded_contacts_are_real_and_actually_dropped.)
+    # The 2 interior-unmapped Inf-Lat-Vent contacts (LT2bHb3/4) are the only
+    # unmapped rows — exactly what this test exercises.
+    assert n_voltage == 183
+    assert n_mapped == 181  # still exactly 2 unmapped
 
     unmapped_idx = np.flatnonzero(~result.valid)
     assert unmapped_idx.tolist() == [

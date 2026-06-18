@@ -28,13 +28,19 @@ def test_wang2024treebank_registers_with_neuralset_catalog() -> None:
     assert catalog["Wang2024Treebank"] is Wang2024Treebank
 
 
+def _session_id(tl: dict) -> dict:
+    """Session-identity subset of a timeline (drops the conditional per-session
+    ``extra_bad`` injection, which has its own dedicated contract test)."""
+    return {k: tl[k] for k in ("subject", "subject_id", "trial_id")}
+
+
 def test_wang2024treebank_iter_timelines_matches_full_manifest(tmp_path) -> None:
     study = Wang2024Treebank(path=tmp_path, mode="full")
     timelines = list(study.iter_timelines())
 
     assert len(timelines) == len(BT_FULL_SESSIONS)
-    assert timelines[0] == {"subject": "btbank1", "subject_id": 1, "trial_id": 0}
-    assert timelines[-1] == {"subject": "btbank10", "subject_id": 10, "trial_id": 1}
+    assert _session_id(timelines[0]) == {"subject": "btbank1", "subject_id": 1, "trial_id": 0}
+    assert _session_id(timelines[-1]) == {"subject": "btbank10", "subject_id": 10, "trial_id": 1}
 
 
 def test_wang2024treebank_defaults_to_lite_manifest(tmp_path) -> None:
@@ -42,7 +48,7 @@ def test_wang2024treebank_defaults_to_lite_manifest(tmp_path) -> None:
     timelines = list(study.iter_timelines())
 
     assert len(timelines) == len(BT_LITE_SESSIONS)
-    assert timelines[0] == {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
+    assert _session_id(timelines[0]) == {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
 
 
 def test_wang2024treebank_pretrain_mode_emits_exactly_legal_corpus(tmp_path) -> None:
@@ -97,8 +103,11 @@ def test_wang2024treebank_emits_ieeg_special_loader_without_reading_raw(
     assert event["type"] == "Ieeg"
     assert event["study"] == "Wang2024Treebank"
     assert event["subject"] == "Wang2024Treebank/btbank1"
+    # Session (1,1) drops F3dIe10 under the per-session GUARD-1 bake (#213), so the
+    # per-session static set is folded into the timeline string (= part of the raw
+    # exca cache uid — the bake intentionally re-keys the cache).
     assert event["timeline"] == (
-        "Wang2024Treebank:subject=btbank1,subject_id=1,trial_id=1"
+        "Wang2024Treebank:extra_bad=['F3dIe10'],subject=btbank1,subject_id=1,trial_id=1"
     )
     assert event["start"] == 0.0
     assert event["duration"] == 10449.71142578125
@@ -109,7 +118,12 @@ def test_wang2024treebank_emits_ieeg_special_loader_without_reading_raw(
     loader = ujson.loads(event["filepath"])
     assert loader["cls"] == "Wang2024Treebank"
     assert loader["method"] == "_load_raw"
-    assert loader["timeline"] == {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
+    assert loader["timeline"] == {
+        "extra_bad": ["F3dIe10"],
+        "subject": "btbank1",
+        "subject_id": 1,
+        "trial_id": 1,
+    }
 
 
 # --- electrode_set / extra_bad folded into the RAW exca cache uid -------------
@@ -138,10 +152,11 @@ def test_iter_timelines_injects_electrode_set_and_extra_bad_conditionally(
     assert all("electrode_set" not in tl for tl in all_tls)
     assert all(tl.get("electrode_set") == "lite" for tl in lite_tls)
 
-    # extra_bad: present (sorted list) iff the subject has STATIC bad contacts,
-    # absent otherwise — same conditional under both montages.
+    # extra_bad: present (sorted list) iff the session has STATIC bad contacts,
+    # absent otherwise — same conditional under both montages. STATIC is PER-SESSION
+    # (#213), so the expected set is keyed by (subject_id, trial_id).
     for tl in all_tls + lite_tls:
-        bad = sorted(extra_bad_electrodes(tl["subject_id"]))
+        bad = sorted(extra_bad_electrodes(tl["subject_id"], tl["trial_id"]))
         if bad:
             assert tl["extra_bad"] == bad
         else:

@@ -264,13 +264,23 @@ def test_d1c_loader_clean_prevents_shaft_car_zeroing() -> None:
     assert not all_zero.any()  # the fix: the 34 zeroed contacts are gone
 
 
-def test_d1d_loader_cleans_every_mark_across_all_real_subjects() -> None:
+def test_d1d_loader_cleans_every_mark_across_all_real_subjects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """(b, spec-literal "all subjects") Over the real per-subject
     `electrode_labels.json` for every vendored BT subject, `bt_load_raw` strips
     every `*`/`#` so its `ch_names` equal an INDEPENDENT in-test strip and no
     mark survives to the shaft parser / DK support table. Exercises the
     mid-label cohort (sub_7/9/10) the synthetic fixtures cannot. Skips when the
     untracked vendored cache is absent (CI without BT fixtures)."""
+    import speech_decoding.studies.braintreebank.loader as loader_mod
+
+    # Isolate the mark-cleaning contract from the orthogonal per-session GUARD-1
+    # static drop (#213): with the per-session dict baked, the hardcoded
+    # (subject_id=1, trial_id=1) below drops F3dIe10, which would otherwise mask
+    # the cleaned label list. The static drop's lockstep is tested separately.
+    monkeypatch.setattr(loader_mod, "extra_bad_electrodes", lambda *a, **k: frozenset())
+
     labels_root = _BT_CACHE / "electrode_labels"
     if not labels_root.exists():
         pytest.skip(f"vendored BT fixtures absent: {labels_root}")

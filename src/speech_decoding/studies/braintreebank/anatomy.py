@@ -191,45 +191,46 @@ v14 loader uses). Copied verbatim from the PINNED upstream
 not importable)."""
 
 
-_BT_V14_EXTRA_BAD_ELECTRODES: dict[int, tuple[str, ...]] = {
-    2: ("LT2aA2", "LT3a8"),
-    4: ("LT2aA11", "LT2bHb12", "LF3cIc10", "LF3aOFa16"),
-    7: ("LF3bOFb1",),
-    8: ("F3cIc8", "T3H12"),
-    9: ("P2e6", "P2e8"),
+_BT_V14_EXTRA_BAD_ELECTRODES: dict[int, tuple[str, ...]] = {}
+"""Per-subject flaky-contact FALLBACK set — RETIRED + EMPTY (baked out 2026-06-18).
+
+Was the LEGACY "locked-11" hand-tuned set. The GUARD-1 per-session scan
+(#207/#208) replaced it with the self-calibrated, per-session source
+:data:`_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION`, which is now baked. With this
+dict empty, a call with no per-session entry — ``trial_id=None`` (laptop audits /
+``SimpleNamespace`` test events) or a ``(subject, trial)`` outside the scanned
+v14 corpus — drops nothing. Every scanned v14 session has an explicit per-session
+entry (including ``()`` for clean sessions), so the production path never reaches
+this fallback. Kept as the override-with-fallback mechanism's empty default
+(restoring a per-subject entry here, e.g. for a new cohort, still works)."""
+
+_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION: dict[tuple[int, int], tuple[str, ...]] = {
+    (1, 0): ("F3dIe10",),
+    (1, 1): ("F3dIe10",),
+    (1, 2): ("F3dIe10",),
+    (2, 0): ("LT3bHa14",),
+    (2, 1): ("RT1aIa7", "RT1aIa8"),
+    (2, 2): ("LT3d7", "RT1aIa7", "RT1aIa8"),
+    (2, 3): (),
+    (2, 4): (),
+    (2, 5): (),
+    (2, 6): ("LT3cHb12", "RT2aA7", "RT2aA8", "RT3bHb10", "RT3bHb11", "RT3bHb12"),
+    (3, 0): ("F3d10", "F3d9", "O1bId2", "O1bId3", "O1bId4", "O1bId5", "O1bId8", "T1cIe1", "T1cIe2"),
+    (3, 1): ("O1bId2", "O1bId3", "O1bId4", "O1bId5", "O1bId8", "T1cIe1", "T1cIe2"),
+    (3, 2): ("O1bId2", "O1bId3", "O1bId4", "O1bId5", "O1bId8", "T1aIc5", "T1aIc6", "T1cIe1", "T1cIe2"),
+    (4, 0): (),
+    (4, 1): ("LF3cIc10", "LT2bHb12"),
+    (4, 2): ("LF3aOFa16", "LF3bIa7", "LT2aA11", "LT2aA12"),
+    (6, 0): ("T2A13", "T2A8"),
+    (6, 1): ("T2A13", "T2A8"),
+    (6, 4): ("T2A8",),
+    (7, 0): ("LF3bOFb1", "RF1bCb11", "RF3aOFa4", "RF3aOFa5"),
+    (7, 1): ("LF3bOFb1", "RF1aCaOF1", "RF1aCaOF2", "RF1bCb11", "RF3aOFa4", "RF3aOFa5"),
+    (8, 0): ("F3aOFa16", "T2A13"),
+    (9, 0): ("P2e5", "P2e6", "P2e7", "P2e8", "T1c5"),
+    (10, 0): ("F10Fa10", "F10Fa4", "F10Fa8", "F10Fa9", "F2bCa6", "F2bCa7", "F2bCa8"),
+    (10, 1): ("F10Fa10", "F10Fa8", "F10Fa9", "F2bCa6", "F2bCa7", "F2bCa8"),
 }
-"""Per-subject flaky-contact FALLBACK set (LEGACY "locked-11" — an artifact of
-earlier hand-tuning, NOT a finalized list).
-
-This dict is the transitional fallback only. The real source is
-:data:`_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION` (populated offline from the
-GUARD-1 per-session scan, #207/#208). While that override is empty, every
-``extra_bad_electrodes(subject_id, trial_id)`` call falls back here, so threading
-the per-session trial axis through production is byte-identical to the pre-
-per-session behavior (cache key + goldens unchanged). When the per-session set is
-baked, this dict is cleared and every session carries an explicit override entry
-(including ``()`` for clean sessions), so the fallback is never hit in production.
-
-The excluded contacts produce brief, intense **spectral** transients — huge finite
-``|STFT|`` robust-z (up to 1e4 σ) at isolated time-frequency bins — that spike the
-SSL gradient. They are NOT high-amplitude dead channels: their whole-session
-voltage MAD is ~subject-median, so the MNE-LOF voltage-domain guard (and any
-voltage-amplitude rule) MISSES them.
-
-Applied at BOTH electrode-order sites in lockstep so support / valid_mask stay
-row-aligned with the front-end voltage (the DP4 contract): folded into
-``voltage_electrode_order`` (support / valid_mask) AND dropped by ``bt_load_raw``
-(front-end voltage) — the latter BEFORE shaft-CAR, so a bad contact can no longer
-contaminate its shaft's CAR reference (which winsorising the cached output cannot
-undo). Labels are cleaned (``clean_bt_electrode_label``) before matching.
-
-Deliberate divergence from upstream ``BrainTreebankSubject.electrode_labels``;
-``test_voltage_order_matches_upstream`` subtracts this set so the drift guard
-still catches UNintended divergence. Populating either dict changes the cache
-key, so the cache is rebuilt (and re-scanned to confirm CAR-contaminated
-neighbors fall back to baseline)."""
-
-_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION: dict[tuple[int, int], tuple[str, ...]] = {}
 """Per-SESSION ``(subject_id, trial_id) -> bad-contact`` override, the active
 GUARD-1 static source (per-session drop, Ben 2026-06-18).
 
@@ -239,7 +240,8 @@ there is NO cross-trial aggregation heuristic (no any/majority/pool collapse).
 Populated offline by the #207 scan → #208 collector; an entry is the cleaned
 static set ``static_bad_mask`` flagged for that one session. An explicit entry
 (even ``()``) takes precedence over the per-subject fallback; a missing entry
-falls back to :data:`_BT_V14_EXTRA_BAD_ELECTRODES` (transitional). Both the cache
+falls back to :data:`_BT_V14_EXTRA_BAD_ELECTRODES` (retired + empty since the bake,
+so a missing entry drops nothing). Both the cache
 key (``study.iter_timelines`` folds ``extra_bad_electrodes(subject_id, trial_id)``
 into the per-session timeline) and the support order
 (``voltage_electrode_order(..., trial_id)``) read THIS dict with the SAME
@@ -260,8 +262,9 @@ def extra_bad_electrodes(
     ``(subject_id, trial_id)`` is returned verbatim (per-session REPLACES, does not
     union with, the subject fallback). A ``None`` trial, or a trial with no
     override entry, falls back to the per-subject
-    :data:`_BT_V14_EXTRA_BAD_ELECTRODES` (legacy/transitional) — so laptop audits
-    and the pre-bake production path keep today's behavior."""
+    :data:`_BT_V14_EXTRA_BAD_ELECTRODES` (retired + empty since the #213 bake, so
+    the fallback drops nothing) — laptop audits / drift guard pass ``None`` and get
+    no drop; every scanned production session has an explicit per-session entry."""
     sid = int(subject_id)
     if trial_id is not None:
         key = (sid, int(trial_id))
