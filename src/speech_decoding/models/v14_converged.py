@@ -91,6 +91,54 @@ N_TOKENS: int = sum(b.n_tokens for b in BANDS)            # 6 + 16 + 16 = 38
 N_FREQ_PATCHES: int = sum(b.n_freq_patches for b in BANDS)  # 3 + 2 + 1 = 6
 
 
+def band_slot_mults(bands: tuple[BandSpec, ...] = BANDS) -> list[int]:
+    """Per-band RoPE-clock multiplier = time-patch stride ÷ finest stride.
+
+    The shared clock unit is the finest band's time-patch stride (HG, 128
+    samples = 62.5 ms). Every band's stride must be an integer multiple of it,
+    else the 3 bands cannot share one clock (FE §7, load-bearing). Raises if not.
+    Locked 2/2/2 ⇒ slow 1024 / beta 256 / HG 128 = **8 : 2 : 1**."""
+    min_stride = min(b.time_patch_stride_samples for b in bands)
+    mults: list[int] = []
+    for b in bands:
+        mult, rem = divmod(b.time_patch_stride_samples, min_stride)
+        if rem != 0:
+            raise ValueError(
+                f"band {b.name!r} time-patch stride {b.time_patch_stride_samples} "
+                f"is not an integer multiple of the finest stride {min_stride}; "
+                f"the 3 bands cannot share one RoPE clock"
+            )
+        mults.append(mult)
+    return mults
+
+
+def token_metadata(bands: tuple[BandSpec, ...] = BANDS) -> tuple[Tensor, Tensor, Tensor]:
+    """Geometry-fixed per-token ``(band_id, freq_global_id, time_slot)`` longs.
+
+    Single source for the tokenizer AND the latent. Token order: bands concat
+    slow→beta→HG, each flattened ``(F_p, T_p)`` row-major (freq-patch-major,
+    time-minor). ``time_slot = mult · time_patch_idx`` puts all bands on the
+    shared HG-stride clock; ``freq_global_id ∈ [0, ΣF_p)`` indexes a shared
+    freq-pos table."""
+    mults = band_slot_mults(bands)
+    band_id: list[int] = []
+    freq_global_id: list[int] = []
+    time_slot: list[int] = []
+    freq_base = 0
+    for bi, (b, mult) in enumerate(zip(bands, mults)):
+        for fp in range(b.n_freq_patches):
+            for tp in range(b.n_time_patches):
+                band_id.append(bi)
+                freq_global_id.append(freq_base + fp)
+                time_slot.append(mult * tp)
+        freq_base += b.n_freq_patches
+    return (
+        torch.tensor(band_id, dtype=torch.long),
+        torch.tensor(freq_global_id, dtype=torch.long),
+        torch.tensor(time_slot, dtype=torch.long),
+    )
+
+
 @dataclass(frozen=True)
 class M2MaskConfig:
     """M2 within-electrode masking config (FE spec §8, locked starting point).
@@ -213,18 +261,8 @@ class ThreeBandTokenizer(nn.Module):
 
         # Shared RoPE clock unit = the finest band's time-patch stride. All
         # strides must be integer multiples of it, else the bands cannot share
-        # one clock (FE §7 — load-bearing; assert at construction).
-        min_stride = min(b.time_patch_stride_samples for b in bands)
-        self._slot_mult: list[int] = []
-        for b in bands:
-            mult, rem = divmod(b.time_patch_stride_samples, min_stride)
-            if rem != 0:
-                raise ValueError(
-                    f"band {b.name!r} time-patch stride {b.time_patch_stride_samples} "
-                    f"is not an integer multiple of the finest stride {min_stride}; "
-                    f"the 3 bands cannot share one RoPE clock"
-                )
-            self._slot_mult.append(mult)
+        # one clock (FE §7 — load-bearing; band_slot_mults asserts this).
+        band_slot_mults(bands)
 
         self.stems = nn.ModuleList(
             [
@@ -238,33 +276,10 @@ class ThreeBandTokenizer(nn.Module):
             ]
         )
 
-        band_id, freq_global_id, time_slot = self._build_token_metadata()
+        band_id, freq_global_id, time_slot = token_metadata(bands)
         self.register_buffer("band_id", band_id, persistent=False)
         self.register_buffer("freq_global_id", freq_global_id, persistent=False)
         self.register_buffer("time_slot", time_slot, persistent=False)
-
-    def _build_token_metadata(self) -> tuple[Tensor, Tensor, Tensor]:
-        """Geometry-fixed per-token (band, global-freq-patch, RoPE-slot) ids.
-
-        Token order within a band is the ``_PatchStem`` output flattened
-        ``(F_p, T_p)`` row-major → freq-patch-major, time-minor; bands concatenate
-        slow → beta → HG."""
-        band_id: list[int] = []
-        freq_global_id: list[int] = []
-        time_slot: list[int] = []
-        freq_base = 0
-        for bi, (b, mult) in enumerate(zip(self.bands, self._slot_mult)):
-            for fp in range(b.n_freq_patches):
-                for tp in range(b.n_time_patches):
-                    band_id.append(bi)
-                    freq_global_id.append(freq_base + fp)
-                    time_slot.append(mult * tp)
-            freq_base += b.n_freq_patches
-        return (
-            torch.tensor(band_id, dtype=torch.long),
-            torch.tensor(freq_global_id, dtype=torch.long),
-            torch.tensor(time_slot, dtype=torch.long),
-        )
 
     def forward(self, slow: Tensor, beta: Tensor, hg: Tensor) -> Tensor:
         """``(B,C,2,6,5) / (B,C,6,17) / (B,C,9,33)`` → tokens ``(B,C,38,d)``."""
@@ -351,4 +366,89 @@ class FrontendEncoder(nn.Module):
         x = tok.reshape(B * C, S, d)
         for blk in self.blocks:
             x = blk(x, rope)
+        return self.ln_out(x).reshape(B, C, S, d)
+
+
+class LatentEncoder(nn.Module):
+    """Stage 2 (converged arch): FLAT token-level cross-electrode latent.
+
+    The redesign's load-bearing piece — the stage that must finally earn its
+    keep (the prior B37 run showed no post-latent uplift over post-frontend).
+
+    Bridge (frontend→latent): add a learned **parcel-tag** per electrode,
+    broadcast across its 38 tokens. This is the **only additive/spatial PE**
+    (DK parcel ids, shared cross-subject vocab; **MNI BANNED**; **no distance
+    bias, no same-parcel boost** — either would re-open the co-shaft copy
+    shortcut and let M4 cheat). It is the PopT zero-per-subject bridge: subjects
+    align through parcels, never coordinates.
+
+    Then **global ALL-PAIRS self-attention** over the flattened ``C·38``
+    electrode-token set — electrodes now ride the **sequence** dim (cross-
+    electrode mixing, the opposite of the isolated frontend), **electrode-token
+    granularity preserved** (no pooling bottleneck in the SSL gradient; inter-
+    areal CFC gets a direct edge). RoPE keys off the **shared physical-time
+    clock** (``time_slot``, the same 8:2:1 grid the frontend uses), so the three
+    band grids align in the cross-electrode attention.
+
+    Ragged: variable electrode count per subject. ``electrode_mask`` (``True`` =
+    real electrode) becomes the per-token key mask so padded electrodes are
+    never attended to — the valid electrodes' outputs are independent of any
+    padding (no pad-to-max contamination).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        n_parcels: int,
+        *,
+        bands: tuple[BandSpec, ...] = BANDS,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        head_dim = d_model // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+
+        # The only additive spatial PE — learned DK parcel-tag (MNI banned).
+        self.parcel_embed = nn.Embedding(n_parcels, d_model)
+        nn.init.trunc_normal_(self.parcel_embed.weight, std=0.02)
+
+        _, _, time_slot = token_metadata(bands)
+        self.register_buffer("time_slot", time_slot, persistent=False)  # (38,)
+        n_slots = int(time_slot.max().item()) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
+        )
+        self.ln_out = nn.LayerNorm(d_model)
+        self.tokens_per_electrode = int(time_slot.numel())  # 38
+
+    def forward(
+        self,
+        feats: Tensor,
+        parcel_per_electrode: Tensor,
+        *,
+        electrode_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Cross-electrode latent over the frontend features.
+
+        ``feats``: ``(B, C, 38, d)`` per-electrode frontend features.
+        ``parcel_per_electrode``: ``(B, C)`` long — each electrode's DK parcel id.
+        ``electrode_mask``: ``(B, C)`` bool, ``True`` = real electrode (ragged
+        padding); ``None`` ⇒ all real. Output: ``(B, C, 38, d)`` (electrode-token
+        granularity preserved)."""
+        B, C, S, d = feats.shape
+        # Frontend→latent bridge: + parcel-tag (broadcast across the 38 tokens).
+        x = feats + self.parcel_embed(parcel_per_electrode)[:, :, None, :]
+        x = x.reshape(B, C * S, d)                                 # all-pairs token set
+        rope = self.key_rope[:, self.time_slot.repeat(C), :]       # (2, C·38, head_dim)
+        key_mask: Tensor | None = None
+        if electrode_mask is not None:
+            key_mask = electrode_mask[:, :, None].expand(B, C, S).reshape(B, C * S)
+        for blk in self.blocks:
+            x = blk(x, rope, key_mask)
         return self.ln_out(x).reshape(B, C, S, d)

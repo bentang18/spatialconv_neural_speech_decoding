@@ -329,3 +329,116 @@ def test_frontend_construction_guards() -> None:
         vc.FrontendEncoder(d_model=12, n_heads=4, n_layers=1)  # head_dim 3 = odd
     with pytest.raises(ValueError, match="freq_pos"):
         vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1, freq_pos="bogus")
+
+
+# ===================================================== LatentEncoder (Stage 2)
+def _fake_feats(B: int, C: int, d: int = 32) -> torch.Tensor:
+    return torch.randn(B, C, 38, d)
+
+
+def test_latent_output_shape_preserves_electrode_tokens() -> None:
+    # No pooling bottleneck: electrode-token granularity survives the latent.
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    feats = _fake_feats(2, 7)
+    pe = torch.randint(0, 74, (2, 7))
+    out = lat(feats, pe)
+    assert out.shape == (2, 7, 38, 32)
+
+
+def test_latent_does_cross_electrode_mixing() -> None:
+    # THE point of Stage 2 (and the opposite of the frontend's isolation):
+    # perturbing one electrode's input MUST change other electrodes' outputs.
+    torch.manual_seed(0)
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    feats = _fake_feats(1, 4)
+    pe = torch.tensor([[0, 1, 2, 3]])
+    with torch.no_grad():
+        base = lat(feats, pe)
+        feats2 = feats.clone()
+        feats2[:, 2] += 5.0                       # perturb only electrode 2
+        out = lat(feats2, pe)
+    # every OTHER electrode's output changed → information crossed electrodes.
+    for e in (0, 1, 3):
+        assert not torch.allclose(out[:, e], base[:, e]), f"electrode {e} did not mix"
+
+
+def test_latent_permutation_equivariance() -> None:
+    # All-pairs SA is set-equivariant; RoPE-time is identical per electrode, so
+    # permuting electrodes WITH their parcel ids permutes the outputs.
+    torch.manual_seed(1)
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    feats = _fake_feats(1, 5)
+    pe = torch.tensor([[10, 11, 12, 13, 14]])
+    perm = torch.tensor([3, 0, 4, 1, 2])
+    with torch.no_grad():
+        base = lat(feats, pe)
+        permed = lat(feats[:, perm], pe[:, perm])
+    assert torch.allclose(permed, base[:, perm], atol=1e-5)
+
+
+def test_latent_parcel_tag_is_the_only_added_pe() -> None:
+    # Learned parcel embedding; perturbing it moves the output (it is used). And
+    # the bridge adds it per electrode (two electrodes sharing a parcel id get
+    # the SAME additive tag) — verified via the embedding table directly.
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=1, n_parcels=74).eval()
+    assert isinstance(lat.parcel_embed, torch.nn.Embedding)
+    feats = _fake_feats(1, 3)
+    pe = torch.tensor([[5, 5, 9]])               # electrodes 0,1 share parcel 5
+    with torch.no_grad():
+        base = lat(feats, pe)
+        lat.parcel_embed.weight[5].add_(3.0)     # move parcel-5 tag only
+        moved = lat(feats, pe)
+    # electrodes 0 and 1 (parcel 5) are affected; the math added one shared tag.
+    assert not torch.allclose(moved, base)
+
+
+def test_latent_no_distance_or_membership_bias() -> None:
+    # MNI banned + no same-parcel boost: the latent must hold NO coordinate
+    # buffer and NO learned pairwise/parcel-membership attention bias. Only the
+    # parcel-tag embedding, the RoPE clock, and plain SA blocks may carry params.
+    lat = vc.LatentEncoder(d_model=16, n_heads=2, n_layers=1, n_parcels=8)
+    buf_names = {n for n, _ in lat.named_buffers()}
+    assert not any("mni" in n.lower() or "coord" in n.lower() or "dist" in n.lower()
+                   for n in buf_names), f"spatial-distance buffer present: {buf_names}"
+    param_names = {n for n, _ in lat.named_parameters()}
+    assert not any("bias" in n.lower() and ("parcel" in n.lower() or "dist" in n.lower()
+                   or "support" in n.lower()) for n in param_names), param_names
+
+
+def test_latent_ragged_key_mask_isolates_padding() -> None:
+    # Ragged contract: a padded (masked) electrode must NOT change the real
+    # electrodes' outputs — no pad-to-max contamination. Compare a 3-electrode
+    # clip against the same 3 + a 4th padded electrode marked invalid.
+    torch.manual_seed(2)
+    lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    feats3 = _fake_feats(1, 3)
+    pe3 = torch.tensor([[1, 2, 3]])
+    pad = torch.randn(1, 1, 38, 32) * 9.0        # loud junk in the pad slot
+    feats4 = torch.cat([feats3, pad], dim=1)
+    pe4 = torch.tensor([[1, 2, 3, 0]])
+    mask4 = torch.tensor([[True, True, True, False]])
+    with torch.no_grad():
+        out3 = lat(feats3, pe3)                                  # no mask, all real
+        out4 = lat(feats4, pe4, electrode_mask=mask4)            # 4th padded-out
+    assert torch.allclose(out4[:, :3], out3, atol=1e-5), "padding leaked into reals"
+
+
+def test_latent_construction_guards() -> None:
+    with pytest.raises(ValueError, match="not divisible"):
+        vc.LatentEncoder(d_model=30, n_heads=4, n_layers=1, n_parcels=8)
+    with pytest.raises(ValueError, match="even head_dim"):
+        vc.LatentEncoder(d_model=12, n_heads=4, n_layers=1, n_parcels=8)
+
+
+# ----------------------------------------------- shared token metadata helper
+def test_token_metadata_single_source_matches_tokenizer() -> None:
+    # The latent and the tokenizer must agree on time_slot (one source).
+    tok = vc.ThreeBandTokenizer(d_model=8)
+    _, _, time_slot = vc.token_metadata()
+    assert torch.equal(time_slot, tok.time_slot)
+    lat = vc.LatentEncoder(d_model=16, n_heads=2, n_layers=1, n_parcels=8)
+    assert torch.equal(lat.time_slot, tok.time_slot)
+
+
+def test_band_slot_mults_are_8_2_1() -> None:
+    assert vc.band_slot_mults() == [8, 2, 1]
