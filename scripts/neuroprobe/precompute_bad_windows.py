@@ -240,11 +240,20 @@ def _decide_bad_windows(
     return bad_idx, diag
 
 
-def scan_session(subject_id: int, trial_id: int) -> dict:
-    """Scan one (subject, trial) session and return its sidecar payload."""
+def compute_ewm_by_band(
+    subject_id: int, trial_id: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray, int, float, int]:
+    """Streaming pass — the EXPENSIVE part of the scan, factored out so the
+    aggressiveness sweep can pay it once per session and re-decide cheaply over a
+    fence grid (``_decide_bad_windows`` is pure numpy on these arrays).
+
+    BT load (static contacts already dropped pre-CAR, native→2048 Hz) → notch+HPF
+    → shaft-CAR → per-band STFT robust-z, accumulating each electrode's per-window
+    |z|-max WITHIN each band plus the per-window slow-band flat-electrode count.
+    Returns ``(ewm_by_band, n_flat, n_elec, total_s, n_windows)`` — byte-identical
+    to what ``scan_session`` fed ``_decide_bad_windows`` before the extraction."""
     from neuroprobe.braintreebank_subject import BrainTreebankSubject
 
-    tag = f"btbank{subject_id}_t{trial_id}"
     bt = BrainTreebankSubject(
         subject_id=subject_id, cache=False, coordinates_type="cortical"
     )
@@ -314,6 +323,15 @@ def scan_session(subject_id: int, trial_id: int) -> dict:
     del filt
     gc.collect()
 
+    return ewm_by_band, n_flat, n_elec, total_s, n_windows
+
+
+def scan_session(subject_id: int, trial_id: int) -> dict:
+    """Scan one (subject, trial) session and return its sidecar payload."""
+    tag = f"btbank{subject_id}_t{trial_id}"
+    ewm_by_band, n_flat, n_elec, total_s, n_windows = compute_ewm_by_band(
+        subject_id, trial_id,
+    )
     bad_idx, decision = _decide_bad_windows(
         ewm_by_band, n_flat, n_elec,
         hot_mult_by_band=HOT_MULT_BY_BAND, cat_mult_by_band=CAT_MULT_BY_BAND,
