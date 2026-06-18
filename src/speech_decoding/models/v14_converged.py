@@ -30,6 +30,7 @@ from torch import Tensor, nn
 
 from speech_decoding.models.v14_encoder import (
     _JointTokenBlock,
+    _MultiHeadCrossAttention,
     _PatchStem,
     _rope_freqs,
     _sincos_1d,
@@ -690,3 +691,78 @@ class M2Predictor(nn.Module):
         for blk in self.blocks:
             tokens = blk(tokens, rope, full_mask)
         return self.head(tokens[:, N:])                            # (B', M, d_model)
+
+
+class ParcelReadout(nn.Module):
+    """Stage 3: hard-PMA k=1/parcel readout (downstream; encoder FROZEN).
+
+    One learned **seed query per parcel** (PMA, Set Transformer). Parcel ``p``'s
+    query attends ONLY to the tokens of electrodes assigned to parcel ``p`` — a
+    **hard one-hot DK grouping** (NO support bias: under hard membership
+    ``log(support)`` ≡ a hard mask, so the support table's job is *grouping*, not
+    biasing; bias would only matter under the gated soft-BNA path). Empty parcels
+    pool to a **zero** slot (missing token). The fixed ``K``-parcel rep is
+    flattened and linearly mapped to the task logits — **montage-invariant**: any
+    electrode montage maps to the same ``K`` slots, so no per-subject params.
+
+    Reuses the B36 ``_MultiHeadCrossAttention`` hard block-diagonal pool (its
+    no-coverage row → exactly-zero context is the empty-parcel handling)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_parcels: int,
+        n_classes: int,
+        n_heads: int,
+        *,
+        bands: tuple[BandSpec, ...] = BANDS,
+    ) -> None:
+        super().__init__()
+        self.n_parcels = n_parcels
+        self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 38
+        # k=1 learned seed query per parcel group.
+        self.seed = nn.Parameter(torch.empty(n_parcels, d_model))
+        nn.init.trunc_normal_(self.seed, std=0.02)
+        self.pool = _MultiHeadCrossAttention(d_model, n_heads)
+        self.head = nn.Linear(n_parcels * d_model, n_classes)
+        self.register_buffer(
+            "_parcel_ids", torch.arange(n_parcels), persistent=False
+        )
+
+    def forward(
+        self,
+        feats: Tensor,
+        parcel_per_electrode: Tensor,
+        *,
+        electrode_mask: Tensor | None = None,
+    ) -> Tensor:
+        """``feats`` ``(B, C, 38, d)`` encoder output → task logits ``(B, n_classes)``.
+
+        ``parcel_per_electrode`` ``(B, C)`` long; ``electrode_mask`` ``(B, C)``
+        bool (``True`` = real). Pools each parcel's tokens with its seed query,
+        flattens the K-parcel rep, and linearly reads out."""
+        B = feats.shape[0]
+        pooled = self.pool_parcels(feats, parcel_per_electrode, electrode_mask=electrode_mask)
+        return self.head(pooled.reshape(B, -1))                    # (B, n_classes)
+
+    def pool_parcels(
+        self,
+        feats: Tensor,
+        parcel_per_electrode: Tensor,
+        *,
+        electrode_mask: Tensor | None = None,
+    ) -> Tensor:
+        """The fixed ``(B, K, d)`` K-parcel representation (pre-readout, reusable
+        for analysis). Each slot is the hard-PMA pool of its parcel's tokens;
+        absent parcels are exactly zero."""
+        B, C, S, d = feats.shape
+        tokens = feats.reshape(B, C * S, d)
+        token_parcel = (
+            parcel_per_electrode[:, :, None].expand(B, C, S).reshape(B, C * S)
+        )
+        membership = token_parcel[:, None, :] == self._parcel_ids[None, :, None]
+        if electrode_mask is not None:
+            token_valid = electrode_mask[:, :, None].expand(B, C, S).reshape(B, C * S)
+            membership = membership & token_valid[:, None, :]      # (B, K, C·38)
+        seed = self.seed[None].expand(B, self.n_parcels, d)        # (B, K, d)
+        return self.pool(seed, tokens, membership)                 # (B, K, d)

@@ -683,3 +683,61 @@ def test_m2_predictor_construction_guards() -> None:
         vc.M2Predictor(d_model=32, pred_dim=12, n_heads=4, n_layers=1)
     with pytest.raises(ValueError, match="freq_pos"):
         vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1, freq_pos="x")
+
+
+# ==================================================== ParcelReadout (Stage 3)
+def test_parcel_readout_output_shape() -> None:
+    ro = vc.ParcelReadout(d_model=32, n_parcels=10, n_classes=9, n_heads=4).eval()
+    feats = _fake_feats(2, 6)
+    pe = torch.randint(0, 10, (2, 6))
+    assert ro(feats, pe).shape == (2, 9)
+
+
+def test_parcel_readout_empty_parcel_is_zero_slot() -> None:
+    # A parcel with no electrodes pools to an exactly-zero slot (missing token).
+    ro = vc.ParcelReadout(d_model=32, n_parcels=8, n_classes=9, n_heads=4).eval()
+    feats = _fake_feats(1, 4)
+    pe = torch.tensor([[1, 2, 1, 3]])           # parcels {1,2,3} present; 0,4..7 empty
+    with torch.no_grad():
+        pooled = ro.pool_parcels(feats, pe)     # (1, 8, 32)
+    for empty in (0, 4, 5, 6, 7):
+        assert torch.count_nonzero(pooled[0, empty]) == 0, f"parcel {empty} not zero"
+    assert torch.count_nonzero(pooled[0, 1]) > 0    # present parcel is non-zero
+
+
+def test_parcel_readout_hard_grouping_no_cross_parcel_leak() -> None:
+    # Parcel p's slot pools ONLY parcel-p tokens: perturbing a parcel-q electrode
+    # must not change parcel-p's slot (hard one-hot grouping, no soft bias).
+    torch.manual_seed(0)
+    ro = vc.ParcelReadout(d_model=32, n_parcels=8, n_classes=9, n_heads=4).eval()
+    feats = _fake_feats(1, 4)
+    pe = torch.tensor([[1, 2, 1, 2]])           # elec 0,2 → parcel 1; 1,3 → parcel 2
+    with torch.no_grad():
+        base = ro.pool_parcels(feats, pe)
+        feats2 = feats.clone()
+        feats2[:, 1] += 9.0                      # perturb a parcel-2 electrode
+        out = ro.pool_parcels(feats2, pe)
+    assert torch.allclose(out[0, 1], base[0, 1], atol=1e-6)   # parcel-1 slot untouched
+    assert not torch.allclose(out[0, 2], base[0, 2])          # parcel-2 slot moved
+
+
+def test_parcel_readout_is_montage_invariant() -> None:
+    # Permuting electrodes (with their parcel ids) leaves the K-parcel rep AND
+    # the logits unchanged — the readout keys off parcel membership, not montage.
+    torch.manual_seed(1)
+    ro = vc.ParcelReadout(d_model=32, n_parcels=10, n_classes=9, n_heads=4).eval()
+    feats = _fake_feats(1, 6)
+    pe = torch.tensor([[3, 3, 5, 1, 5, 1]])
+    perm = torch.tensor([4, 0, 5, 2, 1, 3])
+    with torch.no_grad():
+        base = ro(feats, pe)
+        permed = ro(feats[:, perm], pe[:, perm])
+    assert torch.allclose(permed, base, atol=1e-5)
+
+
+def test_parcel_readout_no_support_bias_param() -> None:
+    # No support / distance / anatomy bias anywhere — only seed, pool, head.
+    ro = vc.ParcelReadout(d_model=16, n_parcels=8, n_classes=4, n_heads=2)
+    names = {n for n, _ in ro.named_parameters()}
+    assert not any("support" in n.lower() or "bias_anat" in n.lower()
+                   or "dist" in n.lower() for n in names), names
