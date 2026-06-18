@@ -52,6 +52,12 @@ class V14Converged(BaseModelConfig):
     lambda_m2: float = 1.0
     lambda_m4: float = 1.0
     freq_pos: tp.Literal["learned", "sinusoidal"] = "learned"
+    # M4 heteroscedastic down-weight (Ben 2026-06-18): electrode-MEAN parcel target
+    # variance ∝ 1/n → down-weight low-n parcels. ON by default with the B37 lock
+    # (α=1.0, n_ref=11); the `--converged-m4-precision-off` sister disables it.
+    m4_precision_weight: bool = True
+    m4_precision_alpha: float = 1.0
+    m4_precision_n_ref: float = 11.0
 
     def build(self, n_in_channels: int, n_outputs: int) -> nn.Module:  # noqa: ARG002
         return V14ConvergedSSL(
@@ -67,6 +73,9 @@ class V14Converged(BaseModelConfig):
             lambda_m2=self.lambda_m2,
             lambda_m4=self.lambda_m4,
             freq_pos=self.freq_pos,
+            m4_precision_weight=self.m4_precision_weight,
+            m4_precision_alpha=self.m4_precision_alpha,
+            m4_precision_n_ref=self.m4_precision_n_ref,
         )
 
 

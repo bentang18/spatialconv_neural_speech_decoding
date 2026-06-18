@@ -35,7 +35,9 @@ def _restore_v14_compile_env():
     import os
 
     sentinel = object()
-    saved = {k: os.environ.get(k, sentinel) for k in ("V14_COMPILE", "V14_SESSION_Z_WINSOR")}
+    _winsor_keys = ("V14_SESSION_Z_WINSOR", "V14_SESSION_Z_WINSOR_SLOW",
+                    "V14_SESSION_Z_WINSOR_BETA", "V14_SESSION_Z_WINSOR_HG")
+    saved = {k: os.environ.get(k, sentinel) for k in ("V14_COMPILE", *_winsor_keys)}
     try:
         yield
     finally:
@@ -842,6 +844,35 @@ def test_session_z_winsor_cli_sets_and_clears_env(monkeypatch) -> None:
     rc2 = main(["--phase", "1", "--fast-dev-run"])
     assert rc2 == 0 and len(calls2) == 1
     assert "V14_SESSION_Z_WINSOR" not in os.environ
+
+
+def test_session_z_winsor_per_band_cli_sets_and_clears_env(monkeypatch) -> None:
+    """--session-z-winsor-{slow,beta,hg} (#230) each set a band-specific env knob
+    that overrides the global scalar for that band. Same cache-neutral mechanism:
+    never threaded into the build kwargs; popped when absent (no warm-worker leak)."""
+    import os
+
+    calls = _capture_builds(monkeypatch)
+    rc = main(["--phase", "1", "--fast-dev-run",
+               "--session-z-winsor", "2500",
+               "--session-z-winsor-slow", "300",
+               "--session-z-winsor-hg", "5000"])
+    assert rc == 0 and len(calls) == 1
+    assert os.environ["V14_SESSION_Z_WINSOR"] == "2500.0"
+    assert os.environ["V14_SESSION_Z_WINSOR_SLOW"] == "300.0"
+    assert os.environ["V14_SESSION_Z_WINSOR_HG"] == "5000.0"
+    assert "V14_SESSION_Z_WINSOR_BETA" not in os.environ  # not passed → unset
+    # cache-neutrality: no per-band cap leaks into build/view kwargs
+    for k in ("session_z_winsor_slow", "session_z_winsor_hg", "winsor"):
+        assert k not in calls[0]
+
+    # unset: stale per-band values are popped on the next launch
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_BETA", "777")
+    calls2 = _capture_builds(monkeypatch)
+    rc2 = main(["--phase", "1", "--fast-dev-run"])
+    assert rc2 == 0 and len(calls2) == 1
+    for b in ("SLOW", "BETA", "HG"):
+        assert f"V14_SESSION_Z_WINSOR_{b}" not in os.environ
 
 
 def test_b37_pool_mean_auto_resolves_ssl_mode_joint(monkeypatch) -> None:

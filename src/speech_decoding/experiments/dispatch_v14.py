@@ -616,6 +616,20 @@ def build_v14_experiment(
     # λ sister sweeps override). Inert on raw/2stft.
     converged_lambda_m2: float = 1.0,
     converged_lambda_m4: float = 1.0,
+    # Converged MASK GEOMETRY (FE-spec §8 / Ben 2026-06-18 "tuned often"). None →
+    # the V14ConvergedExperiment / M2MaskConfig / M4MaskConfig LOCKED defaults
+    # (hg_start_rate 0.20, hg_span 3, beta_span 4, parcel_mask_ratio 0.20); a value
+    # overrides. Inert on raw/2stft.
+    converged_m2_hg_start_rate: float | None = None,
+    converged_m2_hg_span: int | None = None,
+    converged_m2_beta_span: int | None = None,
+    converged_m4_parcel_mask_ratio: float | None = None,
+    # Converged M4 heteroscedastic down-weight (Ben 2026-06-18). ON by default
+    # (α=1.0, n_ref=11 — the B37 downweight_dof lock); --converged-m4-precision-off
+    # disables it (the R-precision-off sister). α/n_ref None → the config defaults.
+    converged_m4_precision_off: bool = False,
+    converged_m4_precision_alpha: float | None = None,
+    converged_m4_precision_n_ref: float | None = None,
     m_sub_slots: int = DEFAULT_M_SUB_SLOTS,
     n_freq_bins: int = DEFAULT_N_FREQ_BINS,
     # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
@@ -1979,6 +1993,25 @@ def build_v14_experiment(
         from speech_decoding.experiments.v14_converged_experiment import (
             V14ConvergedExperiment,
         )
+        # Mask-geometry overrides: only forward the ones the caller named; None
+        # falls through to the V14ConvergedExperiment LOCKED pydantic defaults
+        # (single source of truth — no default duplicated here).
+        _converged_mask = {
+            k: v for k, v in {
+                "m2_hg_start_rate": converged_m2_hg_start_rate,
+                "m2_hg_span": converged_m2_hg_span,
+                "m2_beta_span": converged_m2_beta_span,
+                "m4_parcel_mask_ratio": converged_m4_parcel_mask_ratio,
+            }.items() if v is not None
+        }
+        # M4 precision-weight model config: the off-switch is explicit; α/n_ref
+        # overrides only when named (None → V14Converged config defaults).
+        _converged_m4_prec = {
+            k: v for k, v in {
+                "m4_precision_alpha": converged_m4_precision_alpha,
+                "m4_precision_n_ref": converged_m4_precision_n_ref,
+            }.items() if v is not None
+        }
         return V14ConvergedExperiment(
             data=data,
             infra=infra_cfg,
@@ -1997,11 +2030,14 @@ def build_v14_experiment(
                 **_converged_shape,
                 "lambda_m2": converged_lambda_m2,
                 "lambda_m4": converged_lambda_m4,
+                "m4_precision_weight": not converged_m4_precision_off,
+                **_converged_m4_prec,
             },
             # EMA τ: caller override (--ema-tau) or the ema.py-locked 0.99925.
             ema_tau=(ema_tau if ema_tau is not None else 0.99925),
             # Per-step mask RNG = the run seed (reproducible with the run).
             mask_seed=seed,
+            **_converged_mask,
             wd_exclude_norms=wd_exclude_norms,
             # SSL computes its own loss; this satisfies the required field and is
             # never read by V14ConvergedBrainModule. No accuracy metric (no head).
@@ -2490,6 +2526,36 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--converged-lambda-m4", dest="converged_lambda_m4",
                    type=float, default=1.0,
                    help="3stft: M4 loss-term weight (neutral 1.0).")
+    # --- converged MASK GEOMETRY (Ben 2026-06-18: tuned often) -------------
+    # None → the LOCKED defaults (hg_start_rate 0.20 / hg_span 3 / beta_span 4 /
+    # parcel_mask_ratio 0.20). The §8.7 sister sweeps set these.
+    p.add_argument("--converged-m2-hg-start-rate", dest="converged_m2_hg_start_rate",
+                   type=float, default=None,
+                   help="3stft: HG M2 coverage dial — fraction of HG time positions "
+                        "that start a width-hg_span span (default 0.20).")
+    p.add_argument("--converged-m2-hg-span", dest="converged_m2_hg_span",
+                   type=int, default=None,
+                   help="3stft: HG M2 span width in time patches (default 3).")
+    p.add_argument("--converged-m2-beta-span", dest="converged_m2_beta_span",
+                   type=int, default=None,
+                   help="3stft: beta M2 freq-tube width in time patches (default 4; "
+                        "§8.3 bleed floor ≥ 3).")
+    p.add_argument("--converged-m4-parcel-mask-ratio",
+                   dest="converged_m4_parcel_mask_ratio", type=float, default=None,
+                   help="3stft: M4 whole-parcel tube ratio (default 0.20).")
+    # --- converged M4 heteroscedastic down-weight (Ben 2026-06-18) ---------
+    p.add_argument("--converged-m4-precision-off", dest="converged_m4_precision_off",
+                   action="store_true",
+                   help="3stft: DISABLE the M4 electrode-dof down-weight (the "
+                        "R-precision-off sister). Default ON with α=1.0, n_ref=11.")
+    p.add_argument("--converged-m4-precision-alpha", dest="converged_m4_precision_alpha",
+                   type=float, default=None,
+                   help="3stft: M4 down-weight exponent α (default 1.0; >1 = "
+                        "risk-averse overlay on low-n parcels).")
+    p.add_argument("--converged-m4-precision-n-ref", dest="converged_m4_precision_n_ref",
+                   type=float, default=None,
+                   help="3stft: M4 down-weight full-trust electrode count n_ref "
+                        "(default 11; the w=1 saturation point).")
     p.add_argument("--cache-band", dest="cache_band",
                    choices=("slow", "beta", "hg"), default=None,
                    help="3STFT per-band cache build (--cache-only only). Build ONE "
@@ -2647,7 +2713,19 @@ def _parser() -> argparse.ArgumentParser:
                         "2500). Caps spectral transients on flaky contacts that "
                         "survive LOF. Cache-neutral — sets V14_SESSION_Z_WINSOR, "
                         "not a cached view field, so it never re-forks the spec "
-                        "cache. Default None = no clamp.")
+                        "cache. Default None = no clamp. The 3STFT path can OVERRIDE "
+                        "per band with the flags below; this stays the fallback.")
+    # Per-band winsor caps (#230): the slow/beta/HG bands have different |z|
+    # distributions, so one scalar cap mis-clamps two of them. Each sets a
+    # band-specific V14_SESSION_Z_WINSOR_<BAND> env knob that wins over the global
+    # scalar for that band only — same cache-neutral env mechanism. Preliminary
+    # caps are tuned per-band on the rebuilt 3STFT cache (Ben locks finals);
+    # default None = fall back to --session-z-winsor for that band.
+    for _b in ("slow", "beta", "hg"):
+        p.add_argument(f"--session-z-winsor-{_b}", type=float, default=None,
+                       help=f"Per-band winsor cap for the {_b} 3STFT band "
+                            f"(sets V14_SESSION_Z_WINSOR_{_b.upper()}); overrides "
+                            f"--session-z-winsor for {_b} only. Default None.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
     p.add_argument("--fast-dev-run", action="store_true",
@@ -3524,6 +3602,13 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_m4_pred_layers=args.converged_m4_pred_layers,
         converged_lambda_m2=args.converged_lambda_m2,
         converged_lambda_m4=args.converged_lambda_m4,
+        converged_m2_hg_start_rate=args.converged_m2_hg_start_rate,
+        converged_m2_hg_span=args.converged_m2_hg_span,
+        converged_m2_beta_span=args.converged_m2_beta_span,
+        converged_m4_parcel_mask_ratio=args.converged_m4_parcel_mask_ratio,
+        converged_m4_precision_off=args.converged_m4_precision_off,
+        converged_m4_precision_alpha=args.converged_m4_precision_alpha,
+        converged_m4_precision_n_ref=args.converged_m4_precision_n_ref,
         cache_band=args.cache_band,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
@@ -3892,6 +3977,16 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["V14_SESSION_Z_WINSOR"] = str(args.session_z_winsor)
     else:
         os.environ.pop("V14_SESSION_Z_WINSOR", None)
+    # Per-band winsor caps (#230): same front-door pattern, one env knob per band.
+    # A band-specific cap wins over the global scalar for that band only; set/pop
+    # explicitly so a warm worker never inherits a prior run's per-band value.
+    for _b in ("slow", "beta", "hg"):
+        _cap = getattr(args, f"session_z_winsor_{_b}")
+        _env = f"V14_SESSION_Z_WINSOR_{_b.upper()}"
+        if _cap is not None:
+            os.environ[_env] = str(_cap)
+        else:
+            os.environ.pop(_env, None)
     # §7 launch guard (2026-06-04, project_v14_optimizer_default_b01_config). A
     # real SSL/distill run MUST use the locked optimizer config — constant-Adam /
     # β2=0.999 was the unimplemented-default *bug*, never a chosen config. A

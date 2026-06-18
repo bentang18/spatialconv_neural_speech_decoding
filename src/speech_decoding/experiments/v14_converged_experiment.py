@@ -65,7 +65,7 @@ class V14ConvergedExperiment(V14Experiment):
     # equal to the M2MaskConfig / M4MaskConfig frozen defaults). Exposed so the
     # §8.7 sisters (hg_start_rate coverage, beta_span redundancy) sweep from
     # dispatch. These are mask GEOMETRY, not run hyperparameters.
-    m2_hg_start_rate: float = pydantic.Field(default=0.15, ge=0.0, le=1.0)
+    m2_hg_start_rate: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     m2_hg_span: int = pydantic.Field(default=3, ge=1)
     m2_beta_span: int = pydantic.Field(default=4, ge=1)
     m4_parcel_mask_ratio: float = pydantic.Field(default=0.20, gt=0.0, le=1.0)

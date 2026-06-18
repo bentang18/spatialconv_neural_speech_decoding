@@ -153,18 +153,19 @@ def test_m2_beta_freq_tube_is_50pct_both_subbands() -> None:
 
 
 def test_m2_hg_span_mask_coverage() -> None:
-    # FE §8.5: HG = round(0.15·16)=2 distinct starts × width 3, overlaps allowed
-    # (distinct starts ⇒ union ∈ [4,6]); each masked run is contiguous.
+    # FE §8.5 (Ben 2026-06-18 → 20% default): HG = round(0.20·16)=3 distinct starts
+    # × width 3, overlaps allowed. Distinct starts ⇒ union ∈ [5,9] (5 when the 3
+    # starts are consecutive → one run of 5; 9 when disjoint).
     for seed in range(25):
         hg = vc.sample_m2_mask(_gen(seed))[22:38]
-        assert 4 <= hg.sum().item() <= 6, f"HG coverage {hg.sum()} out of [4,6]"
+        assert 5 <= hg.sum().item() <= 9, f"HG coverage {hg.sum()} out of [5,9]"
 
 
 def test_m2_total_in_maskable_pool_range() -> None:
-    # FE §8.6: pool = 32 (beta+HG); realized ~beta 8 + HG 4–6 ≈ 12–14.
+    # FE §8.6: pool = 32 (beta+HG); realized ~beta 8 + HG 5–9 ≈ 13–17 (20% default).
     counts = [vc.sample_m2_mask(_gen(s)).sum().item() for s in range(60)]
-    assert all(12 <= c <= 14 for c in counts)
-    assert 12 <= sum(counts) / len(counts) <= 14
+    assert all(13 <= c <= 17 for c in counts)
+    assert 13 <= sum(counts) / len(counts) <= 17
 
 
 def test_m2_determinism() -> None:
@@ -934,7 +935,10 @@ def test_forward_ragged_equals_dense() -> None:
     with torch.no_grad():
         ragged = model(*args)
         dense = model._forward_dense(*args)
-    for k in ("loss", "l_m2", "l_m4"):
+    # equivalence across ALL emitted scalars, including the per-band diagnostics
+    # (same valid cell set in either layout ⇒ same per-band means).
+    for k in ("loss", "l_m2", "l_m4", "l_m2_beta", "l_m2_hg",
+              "l_m4_slow", "l_m4_beta", "l_m4_hg"):
         assert torch.allclose(ragged[k], dense[k], atol=1e-5), k
     assert float(dense["l_m2"]) > 0.0 and float(dense["l_m4"]) > 0.0   # non-trivial
 
@@ -969,9 +973,9 @@ def test_m2_loss_ragged_equals_dense() -> None:
         t_f = model.teacher_frontend(slow, beta, hg).detach()
         student_vis = ~m["m2_mask"]
         s_f = model.student_frontend(slow, beta, hg, key_mask=student_vis)
-        dense = model._m2_loss(
+        dense, _ = model._m2_loss(
             s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
-        ragged = model._m2_loss_ragged(
+        ragged, _ = model._m2_loss_ragged(
             s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
     assert float(dense) > 0.0                      # the batch carries real targets
     assert torch.allclose(ragged, dense, atol=1e-5)
@@ -987,7 +991,7 @@ def test_m2_loss_ragged_ignores_padded_electrodes() -> None:
         t_f = model.teacher_frontend(slow, beta, hg).detach()
         student_vis = ~m["m2_mask"]
         s_f = model.student_frontend(slow, beta, hg, key_mask=student_vis)
-        base = model._m2_loss_ragged(
+        base, _ = model._m2_loss_ragged(
             s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
         # pad with a junk electrode marked unreal + (defensively) M2-masked nowhere
         B, C = emask.shape
@@ -997,7 +1001,7 @@ def test_m2_loss_ragged_ignores_padded_electrodes() -> None:
         vis2 = ~m2_2
         emask2 = torch.cat([emask, torch.zeros(B, 1, dtype=torch.bool)], dim=1)
         tube2 = torch.cat([m["tube_mask"], torch.zeros(B, 1, dtype=torch.bool)], dim=1)
-        padded = model._m2_loss_ragged(s_f2, t_f2, m2_2, vis2, emask2, tube2)
+        padded, _ = model._m2_loss_ragged(s_f2, t_f2, m2_2, vis2, emask2, tube2)
     assert torch.allclose(padded, base, atol=1e-6)
 
 
@@ -1022,10 +1026,10 @@ def test_m4_loss_ragged_equals_dense() -> None:
     _, _, _, pe, emask, m = batch
     with torch.no_grad():
         s_l, t_f, latent_vis = _m4_pieces(model, batch)
-        dense = model._m4_loss(
+        dense, _ = model._m4_loss(
             s_l, t_f, pe, emask, latent_vis,
             m["tubed_parcels"], m["tubed_parcel_mask"])
-        ragged = model._m4_loss_ragged(
+        ragged, _ = model._m4_loss_ragged(
             s_l, t_f, pe, emask, latent_vis,
             m["tubed_parcels"], m["tubed_parcel_mask"])
     assert float(dense) > 0.0                      # the batch tubes real parcels
@@ -1042,7 +1046,7 @@ def test_m4_loss_ragged_ignores_padded_electrodes() -> None:
     _, _, _, pe, emask, m = batch
     with torch.no_grad():
         s_l, t_f, latent_vis = _m4_pieces(model, batch)
-        base = model._m4_loss_ragged(
+        base, _ = model._m4_loss_ragged(
             s_l, t_f, pe, emask, latent_vis,
             m["tubed_parcels"], m["tubed_parcel_mask"])
         B, C, S, d = s_l.shape
@@ -1051,7 +1055,7 @@ def test_m4_loss_ragged_ignores_padded_electrodes() -> None:
         pe2 = torch.cat([pe, torch.zeros(B, 1, dtype=torch.long)], dim=1)
         emask2 = torch.cat([emask, torch.zeros(B, 1, dtype=torch.bool)], dim=1)
         lv2 = torch.cat([latent_vis, torch.zeros(B, 1, S, dtype=torch.bool)], dim=1)
-        padded = model._m4_loss_ragged(
+        padded, _ = model._m4_loss_ragged(
             s_l2, t_f2, pe2, emask2, lv2,
             m["tubed_parcels"], m["tubed_parcel_mask"])
     assert torch.allclose(padded, base, atol=1e-6)
@@ -1228,3 +1232,96 @@ def test_probe_pool_masked_mean_excludes_padding() -> None:
     assert torch.allclose(got, want, atol=1e-6)
     # no mask ⇒ plain mean over all electrodes+tokens
     assert torch.allclose(vc.probe_pool(feats), feats.mean(dim=(1, 2)), atol=1e-6)
+
+
+# ============================ M4 heteroscedastic down-weight (Ben 2026-06-18) ===
+def test_downweight_dof_formula() -> None:
+    # w = min(1, (n-1)/(n_ref-1)) at α=1 — the B37 downweight_dof ported to the
+    # converged electrode-MEAN target (n = real electrodes per parcel).
+    n = torch.tensor([1.0, 2.0, 3.0, 6.0, 11.0, 20.0])
+    w = vc._downweight_dof(n, n_ref=11.0, alpha=1.0)
+    assert torch.allclose(w, torch.tensor([0.0, 0.1, 0.2, 0.5, 1.0, 1.0]), atol=1e-6)
+    assert not w.requires_grad        # a fixed, detached weight (never learned)
+
+
+def test_downweight_dof_alpha_sharpens() -> None:
+    # α>1 is the risk-averse overlay: it pushes sub-n_ref parcels further down.
+    n = torch.tensor([6.0])
+    assert vc._downweight_dof(n, n_ref=11.0, alpha=1.0).item() == pytest.approx(0.5)
+    assert vc._downweight_dof(n, n_ref=11.0, alpha=2.0).item() == pytest.approx(0.25)
+
+
+def test_m4_precision_defaults_locked() -> None:
+    m = _ssl_model()
+    assert m.m4_precision_weight is True       # ON by default (Ben 2026-06-18)
+    assert m.m4_precision_alpha == 1.0
+    assert m.m4_precision_n_ref == 11.0
+
+
+def test_m4_precision_downweights_loss_vs_off() -> None:
+    # Same weights, only the M4 precision toggle differs. Every parcel weight ∈
+    # [0,1] ⇒ weighted M4 ≤ unweighted; the small-n parcels of a C=8 montage
+    # (most parcels carry 1–2 electrodes) make it STRICTLY smaller. M2 untouched.
+    torch.manual_seed(0)
+    batch = _ssl_batch(B=3, C=8, seed=2)
+    on = _ssl_model().eval()
+    off = _ssl_model(m4_precision_weight=False).eval()
+    off.load_state_dict(on.state_dict())       # identical params ⇒ isolate the toggle
+    assert on.m4_precision_weight is True and off.m4_precision_weight is False
+    o_on, o_off = _run(on, batch), _run(off, batch)
+    assert o_on["l_m4"].item() <= o_off["l_m4"].item() + 1e-6
+    assert o_on["l_m4"].item() < o_off["l_m4"].item()
+    assert torch.allclose(o_on["l_m2"], o_off["l_m2"])   # M4 weight never touches M2
+
+
+def test_m4_precision_n_ref_controls_strictness() -> None:
+    # n_ref is the saturation point: a LARGER n_ref down-weights MORE parcels
+    # (every n in 2..n_ref-1 sits below 1), so n_ref=11 ≤ n_ref=2 ≤ OFF. (n=1
+    # parcels carry w=0 for ANY n_ref — dof=n-1=0 — so n_ref never recovers the
+    # OFF loss; it only sets where 2≤n saturates to 1.)
+    torch.manual_seed(0)
+    batch = _ssl_batch(B=3, C=8, seed=2)
+    off = _ssl_model(m4_precision_weight=False).eval()
+    strict = _ssl_model(m4_precision_n_ref=11.0).eval()
+    loose = _ssl_model(m4_precision_n_ref=2.0).eval()
+    strict.load_state_dict(off.state_dict())
+    loose.load_state_dict(off.state_dict())
+    l_off = _run(off, batch)["l_m4"].item()
+    l_strict = _run(strict, batch)["l_m4"].item()
+    l_loose = _run(loose, batch)["l_m4"].item()
+    assert l_strict <= l_loose + 1e-6
+    assert l_loose <= l_off + 1e-6
+    assert l_strict < l_off          # n_ref=11 genuinely down-weights this montage
+
+
+# ================================ per-band M2/M4 loss diagnostics (Ben 06-18) ===
+def test_per_band_l1_helper_isolates_each_band() -> None:
+    # Craft a (rows, queries, d) set where beta cells are perfect and hg cells err
+    # by 1 ⇒ the per-band raw L1 separates them exactly.
+    d = 3
+    pred = torch.zeros(2, 4, d)
+    tgt = torch.zeros(2, 4, d)
+    band = torch.tensor([[1, 1, 2, 2], [1, 2, 1, 2]])     # 1=beta, 2=hg
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    tgt[band == 2] = 1.0                                   # hg cells |err|=1
+    out = vc._per_band_l1(pred, tgt, valid, band, vc._M2_BAND_IDS)
+    assert out["beta"].item() == 0.0
+    assert out["hg"].item() == pytest.approx(1.0)
+    assert not out["hg"].requires_grad                    # detached diagnostic
+
+
+def test_forward_emits_per_band_diagnostics() -> None:
+    model = _ssl_model().eval()
+    out = _run(model, _ssl_batch(B=3, C=8, seed=2))
+    for k in ("l_m2_beta", "l_m2_hg", "l_m4_slow", "l_m4_beta", "l_m4_hg"):
+        assert k in out, f"missing per-band diagnostic {k}"
+        assert torch.isfinite(out[k]).all() and out[k].item() >= 0.0
+    # slow is M2-EXEMPT ⇒ there is no M2 slow target (and no l_m2_slow key)
+    assert "l_m2_slow" not in out
+    # the per-band diagnostics are detached (never folded into the loss graph)
+    assert not out["l_m4_slow"].requires_grad
+
+
+def test_m2mask_default_hg_start_rate_is_20pct() -> None:
+    # Ben 2026-06-18: 20% is the HG coverage default (was 15%).
+    assert vc.M2MaskConfig().hg_start_rate == 0.20

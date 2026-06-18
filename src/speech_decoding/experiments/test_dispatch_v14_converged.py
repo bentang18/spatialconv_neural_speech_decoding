@@ -69,6 +69,44 @@ def test_3stft_ema_tau_threads(tmp_path) -> None:
     assert xp.ema_tau == pytest.approx(0.97)
 
 
+def test_3stft_mask_geometry_defaults(tmp_path) -> None:
+    # None at the CLI → the LOCKED experiment defaults (Ben 2026-06-18: HG 20%).
+    xp = _converged(tmp_path)
+    assert xp.m2_hg_start_rate == pytest.approx(0.20)
+    assert xp.m2_hg_span == 3
+    assert xp.m2_beta_span == 4
+    assert xp.m4_parcel_mask_ratio == pytest.approx(0.20)
+
+
+def test_3stft_mask_geometry_flags_thread(tmp_path) -> None:
+    # The §8.7 sister knobs override from dispatch (mask geometry, tuned often).
+    xp = _converged(
+        tmp_path, converged_m2_hg_start_rate=0.35, converged_m2_hg_span=5,
+        converged_m2_beta_span=6, converged_m4_parcel_mask_ratio=0.30,
+    )
+    assert xp.m2_hg_start_rate == pytest.approx(0.35)
+    assert xp.m2_hg_span == 5
+    assert xp.m2_beta_span == 6
+    assert xp.m4_parcel_mask_ratio == pytest.approx(0.30)
+
+
+def test_3stft_m4_precision_defaults_on(tmp_path) -> None:
+    cfg = _converged(tmp_path).brain_model_config
+    assert cfg.m4_precision_weight is True       # ON by default (Ben 2026-06-18)
+    assert cfg.m4_precision_alpha == pytest.approx(1.0)
+    assert cfg.m4_precision_n_ref == pytest.approx(11.0)
+
+
+def test_3stft_m4_precision_off_and_overrides(tmp_path) -> None:
+    cfg = _converged(
+        tmp_path, converged_m4_precision_off=True,
+        converged_m4_precision_alpha=1.15, converged_m4_precision_n_ref=15.0,
+    ).brain_model_config
+    assert cfg.m4_precision_weight is False       # R-precision-off sister
+    assert cfg.m4_precision_alpha == pytest.approx(1.15)
+    assert cfg.m4_precision_n_ref == pytest.approx(15.0)
+
+
 @pytest.mark.parametrize(
     "drop",
     ["converged_frontend_layers", "converged_latent_layers",

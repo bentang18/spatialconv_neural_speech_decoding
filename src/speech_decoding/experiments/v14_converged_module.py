@@ -99,7 +99,8 @@ class V14ConvergedBrainModule(pl.LightningModule):
 
     def _step(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
         """The pure loss path (testable without a trainer): ingest → sample masks
-        → `model.forward`. Returns `{loss, l_m2, l_m4}`."""
+        → `model.forward`. Returns `{loss, l_m2, l_m4}` plus the per-band
+        diagnostics `l_m2_{beta,hg}` / `l_m4_{slow,beta,hg}`."""
         slow, beta, hg, ppe, emask = self._converged_inputs(data)
         # Mask sampling runs on CPU (a CPU generator can't drive CUDA randperm);
         # move the masks back to the feature device for the forward.
@@ -123,7 +124,14 @@ class V14ConvergedBrainModule(pl.LightningModule):
     def _log_losses(
         self, out: dict[str, Tensor], name: str, *, on_step: bool, on_epoch: bool,
     ) -> None:
-        for key in ("loss", "l_m2", "l_m4"):
+        # loss + the two head scalars on the prog bar; per-band diagnostics logged
+        # for post-hoc monitoring (which band the SSL is/ isn't learning).
+        keys = (
+            "loss", "l_m2", "l_m4",
+            "l_m2_beta", "l_m2_hg",
+            "l_m4_slow", "l_m4_beta", "l_m4_hg",
+        )
+        for key in keys:
             self.log(
                 f"{name}_{key}", out[key],
                 on_step=on_step, on_epoch=on_epoch,

@@ -154,7 +154,7 @@ class M2MaskConfig:
     (redundancy knob, never < 3 per the §8.3 bleed floor).
     """
 
-    hg_start_rate: float = 0.15   # §8.5: 15–20% of HG time positions are starts
+    hg_start_rate: float = 0.20   # §8.5: 20% of HG time positions are starts (Ben 2026-06-18)
     hg_span: int = 3              # §8.4: HG span width 3 (event-scale, bleed-floor)
     beta_span: int = 4            # §8.4: beta tube width 4 (sustained-burst scale)
 
@@ -963,11 +963,22 @@ class V14ConvergedSSL(nn.Module):
         lambda_m2: float = 1.0,
         lambda_m4: float = 1.0,
         freq_pos: str = "learned",
+        m4_precision_weight: bool = True,
+        m4_precision_alpha: float = 1.0,
+        m4_precision_n_ref: float = 11.0,
         bands: tuple[BandSpec, ...] = BANDS,
     ) -> None:
         super().__init__()
         self.lambda_m2 = float(lambda_m2)
         self.lambda_m4 = float(lambda_m4)
+        # M4 heteroscedastic down-weight (Ben 2026-06-18): a parcel's electrode-MEAN
+        # target has sampling variance ∝ 1/n (n = real electrodes in the parcel), so
+        # low-n parcels carry a noisier target → down-weight. n-only (σ-free), so the
+        # B37 downweight_dof form (masked_jepa._precision_weight_downweight) ports
+        # unchanged. w(n=1)=0, w(n=n_ref)=1, capped at 1 above n_ref.
+        self.m4_precision_weight = bool(m4_precision_weight)
+        self.m4_precision_alpha = float(m4_precision_alpha)
+        self.m4_precision_n_ref = float(m4_precision_n_ref)
         self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 38
 
         self.student_frontend = FrontendEncoder(
@@ -987,7 +998,9 @@ class V14ConvergedSSL(nn.Module):
             d_model, m4_pred_dim, n_heads, m4_pred_layers, n_parcels,
             freq_pos=freq_pos, bands=bands,
         )
-        _, freq_global_id, time_slot = token_metadata(bands)
+        band_id, freq_global_id, time_slot = token_metadata(bands)
+        # band_id (38,) ∈ {0=slow,1=beta,2=hg} — the per-band loss-diagnostic axis.
+        self.register_buffer("band_id", band_id, persistent=False)
         self.register_buffer("freq_global_id", freq_global_id, persistent=False)
         self.register_buffer("time_slot", time_slot, persistent=False)
 
@@ -1069,14 +1082,14 @@ class V14ConvergedSSL(nn.Module):
         )                                                          # (B,C,38)
         s_l = self.latent.forward_ragged(s_f, parcel_per_electrode, latent_vis)
 
-        l_m2 = self._m2_loss_ragged(
+        l_m2, m2_bands = self._m2_loss_ragged(
             s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
-        l_m4 = self._m4_loss_ragged(
+        l_m4, m4_bands = self._m4_loss_ragged(
             s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
             tubed_parcels, tubed_parcel_mask,
         )
         loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
-        return {"loss": loss, "l_m2": l_m2, "l_m4": l_m4}
+        return _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
 
     def _forward_dense(
         self,
@@ -1105,19 +1118,20 @@ class V14ConvergedSSL(nn.Module):
         )                                                          # (B,C,38)
         s_l = self.latent(s_f, parcel_per_electrode, token_mask=latent_vis)
 
-        l_m2 = self._m2_loss(s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
-        l_m4 = self._m4_loss(
+        l_m2, m2_bands = self._m2_loss(
+            s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
+        l_m4, m4_bands = self._m4_loss(
             s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
             tubed_parcels, tubed_parcel_mask,
         )
         loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
-        return {"loss": loss, "l_m2": l_m2, "l_m4": l_m4}
+        return _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
 
     # --------------------------------------------------------------- M2 head
     def _m2_loss(
         self, s_f: Tensor, t_f: Tensor, m2_mask: Tensor, student_vis: Tensor,
         electrode_mask: Tensor, tube_mask: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         B, C, S, d = s_f.shape
         elec = B * C
         m2_flat = m2_mask.reshape(elec, S)
@@ -1125,7 +1139,7 @@ class V14ConvergedSSL(nn.Module):
         # un-tubed real electrodes that actually carry an M2 target
         elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & (m2_flat.any(dim=1))
         if max_m == 0 or not bool(elec_ok.any()):
-            return s_f.new_zeros(())
+            return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS)
 
         qidx, qvalid = _padded_true_indices(m2_flat, max_m)        # (elec, max_m)
         qvalid = qvalid & elec_ok[:, None]
@@ -1140,7 +1154,8 @@ class V14ConvergedSSL(nn.Module):
         tgt = torch.gather(
             t_f.reshape(elec, S, d), 1, qidx[:, :, None].expand(elec, max_m, d)
         )
-        return _masked_l1(pred, tgt, qvalid)
+        bands = _per_band_l1(pred, tgt, qvalid, self.band_id[qidx], _M2_BAND_IDS)
+        return _masked_l1(pred, tgt, qvalid), bands
 
     def _m2_loss_ragged(
         self, s_f: Tensor, t_f: Tensor, m2_mask: Tensor, student_vis: Tensor,
@@ -1165,7 +1180,7 @@ class V14ConvergedSSL(nn.Module):
         vis_flat = student_vis.reshape(elec, S)
         elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & m2_flat.any(dim=1)
         if not bool(elec_ok.any()):
-            return s_f.new_zeros(())
+            return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS)
 
         e_idx = elec_ok.nonzero(as_tuple=False).squeeze(1)         # (R,) target elecs
         R = int(e_idx.numel())
@@ -1183,17 +1198,18 @@ class V14ConvergedSSL(nn.Module):
             ctx, ctx_slot, q_freq, q_slot, ctx_mask=c_real, query_mask=q_real,
         )                                                          # (R, Mq, d)
         tgt = torch.gather(tf, 1, q_idx.unsqueeze(-1).expand(R, Mq, d))
-        return _masked_l1(pred, tgt, q_real)
+        bands = _per_band_l1(pred, tgt, q_real, self.band_id[q_idx], _M2_BAND_IDS)
+        return _masked_l1(pred, tgt, q_real), bands
 
     # --------------------------------------------------------------- M4 head
     def _m4_loss(
         self, s_l: Tensor, t_f: Tensor, parcel_per_electrode: Tensor,
         electrode_mask: Tensor, latent_vis: Tensor,
         tubed_parcels: Tensor, tubed_parcel_mask: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         B, C, S, d = s_l.shape
         if not bool(tubed_parcel_mask.any()):
-            return s_l.new_zeros(())
+            return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS)
 
         ctx = s_l.reshape(B, C * S, d)
         ctx_slot = self.time_slot.repeat(C)                        # (C·38,)
@@ -1206,11 +1222,14 @@ class V14ConvergedSSL(nn.Module):
         pe = torch.where(electrode_mask, parcel_per_electrode,
                          torch.full_like(parcel_per_electrode, -1))
         member = (tubed_parcels[:, :, None] == pe[:, None, :]).to(t_f.dtype)  # (B,P,C)
-        counts = member.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        tgt = (member @ t_f.reshape(B, C, S * d)) / counts          # (B,P,S·d)
-        tgt = tgt.reshape(B, -1, S, d).detach()
+        n_p = member.sum(dim=-1)                                    # (B,P) real elec/parcel
+        tgt = (member @ t_f.reshape(B, C, S * d)) / n_p.clamp_min(1.0)[:, :, None]
+        tgt = tgt.reshape(B, -1, S, d).detach()                     # (B,P,38,d)
         cell_valid = tubed_parcel_mask[:, :, None, None].expand_as(pred)
-        return _masked_l1(pred, tgt, cell_valid)
+        weight = self._m4_weight(n_p, tubed_parcel_mask)           # (B,P) or None
+        bands = _per_band_l1(
+            pred, tgt, cell_valid, self.band_id.view(1, 1, S, 1), _M4_BAND_IDS)
+        return _masked_l1(pred, tgt, cell_valid, weight=weight), bands
 
     def _m4_loss_ragged(
         self, s_l: Tensor, t_f: Tensor, parcel_per_electrode: Tensor,
@@ -1230,7 +1249,7 @@ class V14ConvergedSSL(nn.Module):
         the tubed parcels' teacher frontend grid)."""
         B, C, S, d = s_l.shape
         if not bool(tubed_parcel_mask.any()):
-            return s_l.new_zeros(())
+            return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS)
 
         vis = latent_vis.reshape(B, C * S)
         c_idx, c_real, Nv = _ragged_gather_idx(vis)                # (B, Nv)
@@ -1246,23 +1265,100 @@ class V14ConvergedSSL(nn.Module):
         pe = torch.where(electrode_mask, parcel_per_electrode,
                          torch.full_like(parcel_per_electrode, -1))
         member = (tubed_parcels[:, :, None] == pe[:, None, :]).to(t_f.dtype)  # (B,P,C)
-        counts = member.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        tgt = (member @ t_f.reshape(B, C, S * d)) / counts          # (B,P,S·d)
-        tgt = tgt.reshape(B, -1, S, d).detach()
+        n_p = member.sum(dim=-1)                                    # (B,P) real elec/parcel
+        tgt = (member @ t_f.reshape(B, C, S * d)) / n_p.clamp_min(1.0)[:, :, None]
+        tgt = tgt.reshape(B, -1, S, d).detach()                     # (B,P,38,d)
         cell_valid = tubed_parcel_mask[:, :, None, None].expand_as(pred)
-        return _masked_l1(pred, tgt, cell_valid)
+        weight = self._m4_weight(n_p, tubed_parcel_mask)           # (B,P) or None
+        bands = _per_band_l1(
+            pred, tgt, cell_valid, self.band_id.view(1, 1, S, 1), _M4_BAND_IDS)
+        return _masked_l1(pred, tgt, cell_valid, weight=weight), bands
+
+    def _m4_weight(self, n_p: Tensor, tubed_parcel_mask: Tensor) -> Tensor | None:
+        """Per-parcel M4 down-weight ``(B,P)`` (real-parcel cells only), or ``None``
+        when the precision weight is off. ``n_p`` = real electrode count per tubed
+        parcel; pad parcels are zeroed (cell_valid already drops them, this just
+        keeps the weight clean)."""
+        if not self.m4_precision_weight:
+            return None
+        w = _downweight_dof(
+            n_p, n_ref=self.m4_precision_n_ref, alpha=self.m4_precision_alpha)
+        return w * tubed_parcel_mask.to(w.dtype)
 
 
-def _masked_l1(pred: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+# Per-band diagnostic axes (band_id buffer ∈ {0=slow,1=beta,2=hg}). slow is M2-
+# EXEMPT so it never carries an M2 target; M4 predicts the whole 38-token grid so
+# all three bands appear there.
+_M2_BAND_IDS: tuple[tuple[str, int], ...] = (("beta", 1), ("hg", 2))
+_M4_BAND_IDS: tuple[tuple[str, int], ...] = (("slow", 0), ("beta", 1), ("hg", 2))
+
+
+def _downweight_dof(n: Tensor, *, n_ref: float, alpha: float) -> Tensor:
+    """M4 per-parcel down-weight ``w = min(1, ((n-1)/(n_ref-1))^alpha)``, DETACHED.
+
+    ``n`` = the real electrode count of each (tubed) parcel. Ports B37's
+    ``masked_jepa._precision_weight_downweight`` (the live default) to the
+    converged electrode-MEAN target: n-only (σ-free), so the form is unchanged.
+    Passes through 0 at n=1 (a single-electrode parcel's mean is just that
+    electrode — no aggregation, no cross-electrode structure to trust), reaches 1
+    at ``n_ref`` and saturates above it."""
+    ref = max(float(n_ref) - 1.0, 1e-6)
+    dof = (n - 1.0).clamp(min=0.0)
+    return (dof / ref).pow(alpha).clamp(max=1.0).detach()
+
+
+def _zero_bands(ref: Tensor, pairs: tuple[tuple[str, int], ...]) -> dict[str, Tensor]:
+    """Graph-free zero per-band diagnostics (the no-target early-return case)."""
+    return {name: ref.new_zeros(()) for name, _ in pairs}
+
+
+def _per_band_l1(
+    pred: Tensor, target: Tensor, valid: Tensor, band_of_cell: Tensor,
+    pairs: tuple[tuple[str, int], ...],
+) -> dict[str, Tensor]:
+    """Detached RAW (unweighted) masked-L1 restricted to each band's cells.
+    ``band_of_cell`` is broadcast against ``valid`` (M2: per-query band id; M4:
+    per-token-slot band id). Diagnostics only — never folded into the loss."""
+    return {
+        name: _masked_l1(pred, target, valid & (band_of_cell == bid)).detach()
+        for name, bid in pairs
+    }
+
+
+def _assemble_losses(
+    loss: Tensor, l_m2: Tensor, l_m4: Tensor,
+    m2_bands: dict[str, Tensor], m4_bands: dict[str, Tensor],
+) -> dict[str, Tensor]:
+    """Pack the scalar losses + per-band diagnostics into the forward return dict."""
+    out = {"loss": loss, "l_m2": l_m2, "l_m4": l_m4}
+    out.update({f"l_m2_{b}": v for b, v in m2_bands.items()})
+    out.update({f"l_m4_{b}": v for b, v in m4_bands.items()})
+    return out
+
+
+def _masked_l1(
+    pred: Tensor, target: Tensor, valid: Tensor, weight: Tensor | None = None,
+) -> Tensor:
     """Mean L1 over the ``valid`` entries; 0 if none. ``valid`` is broadcast over
-    any trailing feature dims, so the mean is per-element over (valid cells × d)."""
+    any trailing feature dims, so the mean is per-element over (valid cells × d).
+
+    ``weight`` (optional, detached) is a per-cell multiplier broadcast the same
+    way; the DENOMINATOR stays the **unweighted** valid-cell count, so a mean
+    weight < 1 genuinely shrinks the loss (the B37 ``downweight_dof`` semantics —
+    masked_jepa._weighted_l1_or_zero's ``(per_cell·w).mean()`` = sum / count).
+    ``weight=None`` ⇒ byte-identical to the plain masked mean (the M2 path)."""
     diff = (pred - target).abs()
     v = valid.to(diff.dtype)
     while v.dim() < diff.dim():
         v = v.unsqueeze(-1)
     v = v.expand_as(diff)
     denom = v.sum().clamp_min(1.0)
-    return (diff * v).sum() / denom
+    if weight is None:
+        return (diff * v).sum() / denom
+    w = weight.to(diff.dtype)
+    while w.dim() < diff.dim():
+        w = w.unsqueeze(-1)
+    return (diff * v * w.expand_as(diff)).sum() / denom
 
 
 def sample_ssl_masks(

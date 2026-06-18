@@ -94,6 +94,17 @@ def test_step_returns_finite_nonneg_losses() -> None:
         assert torch.isfinite(out[k]) and float(out[k]) >= 0.0
 
 
+def test_step_emits_per_band_diagnostics() -> None:
+    # Ben 2026-06-18: per-band M2 (beta/hg) + M4 (slow/beta/hg) loss breakdowns
+    # ride in the _step output so _log_losses can surface them.
+    m = _module()
+    out = m._step(_batch().data)
+    for k in ("l_m2_beta", "l_m2_hg", "l_m4_slow", "l_m4_beta", "l_m4_hg"):
+        assert k in out, f"missing per-band diagnostic {k}"
+        assert torch.isfinite(out[k]) and float(out[k]) >= 0.0
+    assert "l_m2_slow" not in out          # slow is M2-exempt
+
+
 def test_training_step_returns_scalar_loss() -> None:
     m = _module()
     loss = m.training_step(_batch(), 0)
@@ -202,14 +213,22 @@ def test_load_transferable_state_missing_component_raises() -> None:
 # ---------------------------------------------------------------- overfit check
 def test_overfits_one_batch_fixed_masks() -> None:
     """The decisive veracity check: with the mask draw frozen (re-seed each step)
-    the module's loss path must drive a single batch's loss steeply down."""
+    the shipped default config (M4 precision weight ON) must drive a single
+    batch's loss steeply down.
+
+    Seed BEFORE the build so the random init is fixed — otherwise the ratio is
+    flaky run-to-run. The M4 precision weight downweights the synthetic montage's
+    n=2 parcels to ((2-1)/(11-1))^1 = 0.1, so M4 contributes a 10×-attenuated
+    signal and the batch overfits mostly through M2; 150 steps clears 0.5 with a
+    comfortable margin (ratio ≈ 0.37)."""
+    torch.manual_seed(0)
     m = _module()
     batch = _batch()
     opt = torch.optim.Adam(
         [p for p in m.model.parameters() if p.requires_grad], lr=3e-3,
     )
     losses = []
-    for _ in range(60):
+    for _ in range(150):
         m._mask_gen.manual_seed(0)  # freeze the mask so the target is stationary
         opt.zero_grad()
         out = m._step(batch.data)

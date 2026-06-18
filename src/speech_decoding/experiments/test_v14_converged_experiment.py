@@ -60,7 +60,7 @@ def test_phase_is_inert_default_one() -> None:
 def test_locked_mask_and_ema_defaults() -> None:
     xp = V14ConvergedExperiment.model_construct()
     assert xp.ema_tau == 0.99925
-    assert xp.m2_hg_start_rate == 0.15
+    assert xp.m2_hg_start_rate == 0.20
     assert xp.m2_hg_span == 3
     assert xp.m2_beta_span == 4
     assert xp.m4_parcel_mask_ratio == 0.20
