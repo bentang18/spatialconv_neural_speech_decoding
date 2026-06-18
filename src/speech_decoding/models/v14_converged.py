@@ -691,6 +691,9 @@ class M4Predictor(nn.Module):
         ``ctx``: ``(B, N, d_model)`` visible un-tubed latent tokens (M4 SEE-set).
         ``ctx_slot``: ``(N,)`` long — each context token's RoPE time-slot.
         ``query_parcels``: ``(B, P)`` long — the tubed parcel ids to predict.
+        ``ctx_slot``: ``(N,)`` shared OR ``(B, N)`` per-row RoPE time-slots — the
+        ragged gather hands a different visible-token subset per sample, so each
+        row carries its own slots (the per-row RoPE path).
         ``key_mask``: ``(B, N)`` bool, ``True`` = real context token (ragged
         padding); ``None`` ⇒ all real. Output: ``(B, P, 38, d_model)`` predicted
         feature per (tubed parcel, freq-time cell), to be L1'd vs the stop-grad
@@ -703,8 +706,13 @@ class M4Predictor(nn.Module):
         tokens = torch.cat([c, q], dim=1)                             # (B, N+P·38, d)
 
         q_slot = self.time_slot.repeat(P)                             # (P·38,)
-        slots = torch.cat([ctx_slot.reshape(-1), q_slot])             # (N+P·38,)
-        rope = self.key_rope[:, slots, :]                             # (2, N+P·38, hd)
+        if ctx_slot.dim() == 1:                                       # shared (dense)
+            slots = torch.cat([ctx_slot.reshape(-1), q_slot])         # (N+P·38,)
+            rope = self.key_rope[:, slots, :]                         # (2, N+P·38, hd)
+        else:                                                         # per-row (ragged)
+            qs = q_slot[None, :].expand(B, P * S)                     # (B, P·38)
+            slots = torch.cat([ctx_slot, qs], dim=1)                  # (B, N+P·38)
+            rope = self.key_rope[:, slots, :]                         # (2, B, N+P·38, hd)
 
         # Context tokens carry the ragged mask; query tokens are always real keys.
         if key_mask is None:
@@ -1135,6 +1143,46 @@ class V14ConvergedSSL(nn.Module):
         pred = self.m4_predictor(
             ctx, ctx_slot, tubed_parcels.clamp_min(0),
             key_mask=latent_vis.reshape(B, C * S),
+        )                                                          # (B, P, 38, d)
+
+        # teacher electrode-MEAN target over each tubed parcel (padded elec → -1)
+        pe = torch.where(electrode_mask, parcel_per_electrode,
+                         torch.full_like(parcel_per_electrode, -1))
+        member = (tubed_parcels[:, :, None] == pe[:, None, :]).to(t_f.dtype)  # (B,P,C)
+        counts = member.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        tgt = (member @ t_f.reshape(B, C, S * d)) / counts          # (B,P,S·d)
+        tgt = tgt.reshape(B, -1, S, d).detach()
+        cell_valid = tubed_parcel_mask[:, :, None, None].expand_as(pred)
+        return _masked_l1(pred, tgt, cell_valid)
+
+    def _m4_loss_ragged(
+        self, s_l: Tensor, t_f: Tensor, parcel_per_electrode: Tensor,
+        electrode_mask: Tensor, latent_vis: Tensor,
+        tubed_parcels: Tensor, tubed_parcel_mask: Tensor,
+    ) -> Tensor:
+        """Ragged M4 (production) — Ben 2026-06-18: "the M4 PREDICTOR MUST GATHER
+        ALL THE VISIBLE TOKENS FROM ALL ELECTRODES — NEVER DENSE — AND ONLY
+        PREDICT THE TUBED PARCELS — NEVER DENSE AGAIN."
+
+        The visible un-tubed latent SEE-set (``latent_vis``) is **physically
+        gathered** across all electrodes (pad-to-batch-max), never the dense C·38
+        token set key-masked to visible. The queries are already only the tubed
+        parcels. Output-identical to the dense ``_m4_loss`` oracle (the visible
+        context attention set is the same; masked context keys add 0), with no
+        dense context ever built. Teacher target is unchanged (electrode-MEAN of
+        the tubed parcels' teacher frontend grid)."""
+        B, C, S, d = s_l.shape
+        if not bool(tubed_parcel_mask.any()):
+            return s_l.new_zeros(())
+
+        vis = latent_vis.reshape(B, C * S)
+        c_idx, c_real, Nv = _ragged_gather_idx(vis)                # (B, Nv)
+        ctx = torch.gather(
+            s_l.reshape(B, C * S, d), 1, c_idx.unsqueeze(-1).expand(B, Nv, d)
+        )                                                          # (B, Nv, d)
+        ctx_slot = self.time_slot.repeat(C)[c_idx]                 # (B, Nv) per-row
+        pred = self.m4_predictor(
+            ctx, ctx_slot, tubed_parcels.clamp_min(0), key_mask=c_real,
         )                                                          # (B, P, 38, d)
 
         # teacher electrode-MEAN target over each tubed parcel (padded elec → -1)

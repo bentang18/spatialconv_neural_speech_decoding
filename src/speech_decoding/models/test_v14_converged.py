@@ -966,6 +966,62 @@ def test_m2_loss_ragged_ignores_padded_electrodes() -> None:
     assert torch.allclose(padded, base, atol=1e-6)
 
 
+def _m4_pieces(model, batch):
+    """Compute (s_l, t_f, latent_vis) the way forward does, for M4-loss tests."""
+    slow, beta, hg, pe, emask, m = batch
+    t_f = model.teacher_frontend(slow, beta, hg).detach()
+    student_vis = ~m["m2_mask"]
+    s_f = model.student_frontend(slow, beta, hg, key_mask=student_vis)
+    latent_vis = emask[:, :, None] & (~m["tube_mask"])[:, :, None] & student_vis
+    s_l = model.latent(s_f, pe, token_mask=latent_vis)
+    return s_l, t_f, latent_vis
+
+
+def test_m4_loss_ragged_equals_dense() -> None:
+    # Stage 4 (Ben 06-18): the ragged M4 physically gathers the visible un-tubed
+    # latent SEE-set across all electrodes, predicts only the tubed parcels —
+    # output-identical to the dense oracle that key-masks the full C*38 context.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    batch = _ssl_batch(B=3, C=8, seed=2)
+    _, _, _, pe, emask, m = batch
+    with torch.no_grad():
+        s_l, t_f, latent_vis = _m4_pieces(model, batch)
+        dense = model._m4_loss(
+            s_l, t_f, pe, emask, latent_vis,
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+        ragged = model._m4_loss_ragged(
+            s_l, t_f, pe, emask, latent_vis,
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+    assert float(dense) > 0.0                      # the batch tubes real parcels
+    assert torch.allclose(ragged, dense, atol=1e-5)
+
+
+def test_m4_loss_ragged_ignores_padded_electrodes() -> None:
+    # Appending a padded electrode (emask False, latent_vis False, junk feats)
+    # cannot move the ragged M4 loss — the context gather skips it and pe=-1
+    # excludes it from every tubed parcel's electrode-mean target.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    batch = _ssl_batch(B=2, C=6, seed=3)
+    _, _, _, pe, emask, m = batch
+    with torch.no_grad():
+        s_l, t_f, latent_vis = _m4_pieces(model, batch)
+        base = model._m4_loss_ragged(
+            s_l, t_f, pe, emask, latent_vis,
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+        B, C, S, d = s_l.shape
+        s_l2 = torch.cat([s_l, torch.randn(B, 1, S, d) * 9.0], dim=1)
+        t_f2 = torch.cat([t_f, torch.randn(B, 1, S, t_f.shape[-1]) * 9.0], dim=1)
+        pe2 = torch.cat([pe, torch.zeros(B, 1, dtype=torch.long)], dim=1)
+        emask2 = torch.cat([emask, torch.zeros(B, 1, dtype=torch.bool)], dim=1)
+        lv2 = torch.cat([latent_vis, torch.zeros(B, 1, S, dtype=torch.bool)], dim=1)
+        padded = model._m4_loss_ragged(
+            s_l2, t_f2, pe2, emask2, lv2,
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+    assert torch.allclose(padded, base, atol=1e-6)
+
+
 def test_ssl_forward_returns_finite_nonneg_losses() -> None:
     model = _ssl_model().eval()
     out = _run(model, _ssl_batch())
