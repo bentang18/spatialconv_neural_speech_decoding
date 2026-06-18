@@ -442,3 +442,244 @@ def test_token_metadata_single_source_matches_tokenizer() -> None:
 
 def test_band_slot_mults_are_8_2_1() -> None:
     assert vc.band_slot_mults() == [8, 2, 1]
+
+
+# ============================================ M4 teacher target (electrode-mean)
+def test_parcel_electrode_mean_is_the_mean_over_a_parcels_electrodes() -> None:
+    # parcel 1 has electrodes {0,2}; target = their elementwise mean (keep 38×d).
+    feats = torch.zeros(3, 38, 4)
+    feats[0] = 1.0
+    feats[2] = 3.0          # parcel-1 electrodes 0,2 → mean 2.0
+    feats[1] = 99.0         # parcel 0 (ignored)
+    pe = torch.tensor([1, 0, 1])
+    out = vc.parcel_electrode_mean(feats, pe, torch.tensor([1]))
+    assert out.shape == (1, 38, 4)
+    assert torch.allclose(out[0], torch.full((38, 4), 2.0))
+
+
+def test_parcel_electrode_mean_single_electrode_parcel() -> None:
+    feats = torch.randn(4, 38, 6)
+    pe = torch.tensor([5, 6, 7, 8])           # all singletons
+    out = vc.parcel_electrode_mean(feats, pe, torch.tensor([7]))
+    assert torch.allclose(out[0], feats[2])   # mean of one = itself
+
+
+def test_parcel_electrode_mean_drops_std_not_just_smooths() -> None:
+    # Two electrodes ±5 around a mean of 10: target is exactly 10 everywhere —
+    # the spread (std) is DROPPED, only the mean survives (converged M4 lock).
+    feats = torch.empty(2, 38, 3)
+    feats[0] = 15.0
+    feats[1] = 5.0
+    out = vc.parcel_electrode_mean(feats, torch.tensor([2, 2]), torch.tensor([2]))
+    assert torch.allclose(out[0], torch.full((38, 3), 10.0))
+
+
+def test_parcel_electrode_mean_multiple_targets() -> None:
+    feats = torch.randn(6, 38, 8)
+    pe = torch.tensor([0, 0, 1, 1, 1, 2])
+    out = vc.parcel_electrode_mean(feats, pe, torch.tensor([0, 2]))
+    assert out.shape == (2, 38, 8)
+    assert torch.allclose(out[0], feats[:2].mean(0))    # parcel 0 = mean{0,1}
+    assert torch.allclose(out[1], feats[5])             # parcel 2 = singleton
+
+
+# ==================================================== M4Predictor (parcel JEPA)
+def _ctx(B: int, N: int, d: int = 32) -> torch.Tensor:
+    return torch.randn(B, N, d)
+
+
+def test_m4_predictor_output_shape() -> None:
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                          n_parcels=74).eval()
+    ctx = _ctx(2, 10)
+    ctx_slot = torch.randint(0, 16, (10,))
+    qp = torch.tensor([[3, 7], [1, 5]])
+    out = pred(ctx, ctx_slot, qp)
+    assert out.shape == (2, 2, 38, 32)        # (B, P, 38, d_model teacher dim)
+
+
+def test_m4_predictor_predicts_from_context() -> None:
+    # M4 SEES the visible context: perturbing it must move the prediction.
+    torch.manual_seed(0)
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                          n_parcels=74).eval()
+    ctx = _ctx(1, 8)
+    ctx_slot = torch.randint(0, 16, (8,))
+    qp = torch.tensor([[4]])
+    with torch.no_grad():
+        base = pred(ctx, ctx_slot, qp)
+        ctx2 = ctx.clone()
+        ctx2[:, 3] += 5.0
+        out = pred(ctx2, ctx_slot, qp)
+    assert not torch.allclose(out, base)      # context informs the prediction
+
+
+def test_m4_predictor_parcel_tag_addresses_the_target() -> None:
+    # Different tubed parcel ⇒ different query tag ⇒ different prediction.
+    torch.manual_seed(1)
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1,
+                          n_parcels=74).eval()
+    ctx = _ctx(1, 6)
+    ctx_slot = torch.randint(0, 16, (6,))
+    with torch.no_grad():
+        p3 = pred(ctx, ctx_slot, torch.tensor([[3]]))
+        p7 = pred(ctx, ctx_slot, torch.tensor([[7]]))
+    assert not torch.allclose(p3, p7)
+
+
+def test_m4_predictor_freq_time_cells_are_distinguished() -> None:
+    # The 38 predicted cells of one parcel must NOT collapse to one value —
+    # the freq-tag + RoPE-time give each cell a distinct query.
+    torch.manual_seed(2)
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                          n_parcels=74).eval()
+    ctx = _ctx(1, 8)
+    ctx_slot = torch.randint(0, 16, (8,))
+    with torch.no_grad():
+        out = pred(ctx, ctx_slot, torch.tensor([[5]]))[0, 0]   # (38, d)
+    spread = out.std(dim=0).mean().item()
+    assert spread > 1e-4, "all 38 cells collapsed — freq/time tag not addressing"
+
+
+def test_m4_predictor_ragged_context_key_mask_isolates_padding() -> None:
+    # A padded (masked) context token must not change the prediction.
+    torch.manual_seed(3)
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                          n_parcels=74).eval()
+    ctx = _ctx(1, 5)
+    ctx_slot = torch.randint(0, 16, (5,))
+    qp = torch.tensor([[2]])
+    pad = torch.randn(1, 1, 32) * 9.0
+    ctx_pad = torch.cat([ctx, pad], dim=1)
+    slot_pad = torch.cat([ctx_slot, torch.tensor([7])])
+    mask = torch.tensor([[True, True, True, True, True, False]])
+    with torch.no_grad():
+        base = pred(ctx, ctx_slot, qp)                              # all real, no mask
+        out = pred(ctx_pad, slot_pad, qp, key_mask=mask)           # 6th padded out
+    assert torch.allclose(out, base, atol=1e-5)
+
+
+def test_m4_predictor_independent_learned_params() -> None:
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1,
+                          n_parcels=74)
+    assert isinstance(pred.mask_token, torch.nn.Parameter)
+    assert isinstance(pred.parcel_embed, torch.nn.Embedding)
+    assert isinstance(pred.freq_embed, torch.nn.Parameter)        # learned default
+    assert pred.freq_embed.shape == (6, 16)
+    assert pred.head.out_features == 32                           # projects to teacher d
+
+
+def test_m4_predictor_construction_guards() -> None:
+    with pytest.raises(ValueError, match="not divisible"):
+        vc.M4Predictor(d_model=32, pred_dim=30, n_heads=4, n_layers=1, n_parcels=8)
+    with pytest.raises(ValueError, match="even head_dim"):
+        vc.M4Predictor(d_model=32, pred_dim=12, n_heads=4, n_layers=1, n_parcels=8)
+    with pytest.raises(ValueError, match="freq_pos"):
+        vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1,
+                       n_parcels=8, freq_pos="bogus")
+
+
+# ============================================ M2Predictor (frontend per-elec JEPA)
+def _m2_inputs(Bp: int, N: int, M: int, d: int = 32):
+    ctx = torch.randn(Bp, N, d)
+    ctx_slot = torch.randint(0, 16, (Bp, N))
+    qfreq = torch.randint(0, 6, (Bp, M))
+    qslot = torch.randint(0, 16, (Bp, M))
+    return ctx, ctx_slot, qfreq, qslot
+
+
+def test_m2_predictor_output_shape() -> None:
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2).eval()
+    ctx, cs, qf, qs = _m2_inputs(5, 20, 13)         # 5 electrodes, 20 vis, 13 masked
+    out = pred(ctx, cs, qf, qs)
+    assert out.shape == (5, 13, 32)                 # (B'=electrodes, M, teacher d)
+
+
+def test_m2_predictor_is_electrode_isolated() -> None:
+    # THE M2 contract: each electrode rides the batch dim, so perturbing one
+    # electrode's inputs CANNOT change another electrode's predictions.
+    torch.manual_seed(0)
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2).eval()
+    ctx, cs, qf, qs = _m2_inputs(3, 10, 8)
+    with torch.no_grad():
+        base = pred(ctx, cs, qf, qs)
+        ctx2 = ctx.clone()
+        ctx2[1] += 5.0                              # perturb only electrode 1
+        out = pred(ctx2, cs, qf, qs)
+    assert not torch.allclose(out[1], base[1])      # electrode 1 changed
+    assert torch.allclose(out[0], base[0], atol=1e-6)   # 0 and 2 untouched (isolated)
+    assert torch.allclose(out[2], base[2], atol=1e-6)
+
+
+def test_m2_predictor_predicts_from_own_visible_context() -> None:
+    torch.manual_seed(1)
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2).eval()
+    ctx, cs, qf, qs = _m2_inputs(2, 12, 8)
+    with torch.no_grad():
+        base = pred(ctx, cs, qf, qs)
+        ctx2 = ctx.clone()
+        ctx2[:, 4] += 4.0
+        out = pred(ctx2, cs, qf, qs)
+    assert not torch.allclose(out, base)
+
+
+def test_m2_predictor_freq_tag_addresses_masked_position() -> None:
+    # Two queries differing ONLY in freq-id must get different predictions.
+    torch.manual_seed(2)
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1).eval()
+    ctx = torch.randn(1, 8, 32)
+    cs = torch.randint(0, 16, (1, 8))
+    qs = torch.tensor([[4]])
+    with torch.no_grad():
+        a = pred(ctx, cs, torch.tensor([[1]]), qs)
+        b = pred(ctx, cs, torch.tensor([[4]]), qs)
+    assert not torch.allclose(a, b)
+
+
+def test_m2_predictor_rope_time_is_active() -> None:
+    # Same query freq, different time-slot ⇒ different prediction (RoPE-time on).
+    torch.manual_seed(3)
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2).eval()
+    ctx = torch.randn(1, 8, 32)
+    cs = torch.randint(0, 16, (1, 8))
+    qf = torch.tensor([[2]])
+    with torch.no_grad():
+        a = pred(ctx, cs, qf, torch.tensor([[0]]))
+        b = pred(ctx, cs, qf, torch.tensor([[15]]))
+    assert not torch.allclose(a, b)
+
+
+def test_m2_predictor_ragged_masks_isolate_padding() -> None:
+    # A padded context token (ctx_mask False) must not change the predictions.
+    torch.manual_seed(4)
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2).eval()
+    ctx = torch.randn(1, 6, 32)
+    cs = torch.randint(0, 16, (1, 6))
+    qf = torch.tensor([[1, 3]])
+    qs = torch.tensor([[5, 9]])
+    pad = torch.randn(1, 1, 32) * 9.0
+    ctx_pad = torch.cat([ctx, pad], dim=1)
+    cs_pad = torch.cat([cs, torch.tensor([[7]])], dim=1)
+    cmask = torch.tensor([[True, True, True, True, True, True, False]])
+    with torch.no_grad():
+        base = pred(ctx, cs, qf, qs)
+        out = pred(ctx_pad, cs_pad, qf, qs, ctx_mask=cmask)
+    assert torch.allclose(out, base, atol=1e-5)
+
+
+def test_m2_predictor_has_no_parcel_embed() -> None:
+    # M2 query is freq+time only — no parcel tag exists at the frontend stage.
+    pred = vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1)
+    names = {n for n, _ in pred.named_parameters()}
+    assert not any("parcel" in n.lower() for n in names), names
+    assert isinstance(pred.mask_token, torch.nn.Parameter)
+    assert isinstance(pred.freq_embed, torch.nn.Parameter)
+
+
+def test_m2_predictor_construction_guards() -> None:
+    with pytest.raises(ValueError, match="not divisible"):
+        vc.M2Predictor(d_model=32, pred_dim=30, n_heads=4, n_layers=1)
+    with pytest.raises(ValueError, match="even head_dim"):
+        vc.M2Predictor(d_model=32, pred_dim=12, n_heads=4, n_layers=1)
+    with pytest.raises(ValueError, match="freq_pos"):
+        vc.M2Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=1, freq_pos="x")

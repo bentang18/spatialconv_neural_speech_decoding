@@ -231,6 +231,33 @@ def electrode_tube_mask(parcel_per_electrode: Tensor, tubed_parcels: Tensor) -> 
     return torch.isin(pe, tubed)
 
 
+def parcel_electrode_mean(
+    feats: Tensor, parcel_per_electrode: Tensor, target_parcels: Tensor
+) -> Tensor:
+    """M4 teacher TARGET: per-parcel electrode-MEAN of the teacher frontend grid.
+
+    For one clip, given the EMA-teacher's **frontend** features ``feats``
+    ``(C, 38, d)`` (post-frontend, NOT post-latent — the teacher halts after the
+    frontend, converged memo Q1) and each electrode's parcel id, return the
+    electrode-MEAN over each target (tubed) parcel's electrodes, **keeping the
+    full 38-token freq-time grid** → ``(P, 38, d)``. **std dropped** — the mean
+    is the DeepSets-canonical permutation-invariant aggregation ``ρ(mean φ(eᵢ))``
+    and the only subject-invariant (montage-noise ~1/√n) region descriptor.
+
+    Caller passes the teacher features already **detached** (stop-grad target).
+    Mean over the electrode axis makes the ragged within-parcel electrode count
+    irrelevant; the output is rectangular ``(P, 38, d)``."""
+    if feats.dim() != 3:
+        raise ValueError(f"feats must be (C, 38, d); got {tuple(feats.shape)}")
+    C, S, d = feats.shape
+    pe = parcel_per_electrode.reshape(-1)
+    tp = target_parcels.reshape(-1)
+    membership = (pe[None, :] == tp[:, None]).to(feats.dtype)     # (P, C) one-hot
+    counts = membership.sum(dim=1, keepdim=True).clamp_min(1.0)   # (P, 1)
+    summed = membership @ feats.reshape(C, S * d)                 # (P, S·d)
+    return (summed / counts).reshape(-1, S, d)                    # (P, 38, d)
+
+
 class ThreeBandTokenizer(nn.Module):
     """3STFT per-electrode frontend tokenizer (Stage 1, FE spec §5).
 
@@ -452,3 +479,214 @@ class LatentEncoder(nn.Module):
         for blk in self.blocks:
             x = blk(x, rope, key_mask)
         return self.ln_out(x).reshape(B, C, S, d)
+
+
+class M4Predictor(nn.Module):
+    """Paradigm-B own-predictor for M4 (the latent parcel JEPA).
+
+    I-JEPA-style joint predictor (per [[project_v14_predictor_design_rope_lock_2026_06_04]]):
+    a shared learnable **mask token** + additive **parcel-tag** (which tubed
+    parcel) + additive **freq-tag** (which of the 38 freq-time cells), positioned
+    in time by **RoPE on the shared clock**. The query tokens are concatenated
+    with the visible latent **context** and run through ``n_layers`` joint self-
+    attention blocks, so each query attends to ALL visible un-tubed context (the
+    M4 SEE-set) and the queries co-resolve; the query positions are read out and
+    projected (raw, **no LN before L1**) to the teacher feature dim.
+
+    SEE = all visible un-tubed latent tokens (``ctx``). PREDICT = each tubed
+    parcel's 38-token electrode-mean teacher grid (``parcel_electrode_mean``).
+    Independent params from the M2 predictor. freq-tag LEARNED by default
+    (converged arch, 2026-06-18); ``"sinusoidal"`` sister retained.
+
+    Ragged: ``key_mask`` (``True`` = real context token) drops padded context;
+    only the requested ``query_parcels`` × 38 query tokens are ever built, so no
+    out-of-scope compute (the locked ragged-predictor contract)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        pred_dim: int,
+        n_heads: int,
+        n_layers: int,
+        n_parcels: int,
+        *,
+        freq_pos: str = "learned",
+        bands: tuple[BandSpec, ...] = BANDS,
+    ) -> None:
+        super().__init__()
+        if pred_dim % n_heads != 0:
+            raise ValueError(f"pred_dim={pred_dim} not divisible by n_heads={n_heads}")
+        head_dim = pred_dim // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+
+        self.ctx_proj = nn.Linear(d_model, pred_dim, bias=False)  # context → pred space
+        self.mask_token = nn.Parameter(torch.zeros(pred_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.parcel_embed = nn.Embedding(n_parcels, pred_dim)     # OWN parcel tag
+        nn.init.trunc_normal_(self.parcel_embed.weight, std=0.02)
+
+        _, freq_global_id, time_slot = token_metadata(bands)
+        self.register_buffer("freq_global_id", freq_global_id, persistent=False)  # (38,)
+        self.register_buffer("time_slot", time_slot, persistent=False)            # (38,)
+        n_fp = sum(b.n_freq_patches for b in bands)
+        if freq_pos == "learned":
+            self.freq_embed = nn.Parameter(torch.empty(n_fp, pred_dim))
+            nn.init.trunc_normal_(self.freq_embed, std=0.02)
+        elif freq_pos == "sinusoidal":
+            self.register_buffer("freq_embed", _sincos_1d(n_fp, pred_dim), persistent=False)
+        else:
+            raise ValueError(f"freq_pos must be 'learned' or 'sinusoidal', got {freq_pos!r}")
+
+        n_slots = int(time_slot.max().item()) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(pred_dim, n_heads) for _ in range(n_layers)]
+        )
+        self.head = nn.Linear(pred_dim, d_model, bias=False)      # raw pred, NO LN
+        self.tokens_per_electrode = int(time_slot.numel())        # 38
+
+    def _build_queries(self, query_parcels: Tensor) -> Tensor:
+        """``(B, P)`` tubed parcel ids → query tokens ``(B, P, 38, pred_dim)`` =
+        mask-token + parcel-tag + freq-tag (RoPE-time added in attention)."""
+        parcel = self.parcel_embed(query_parcels)[:, :, None, :]  # (B, P, 1, d)
+        freq = self.freq_embed[self.freq_global_id][None, None]   # (1, 1, 38, d)
+        return self.mask_token + parcel + freq                    # (B, P, 38, d)
+
+    def forward(
+        self,
+        ctx: Tensor,
+        ctx_slot: Tensor,
+        query_parcels: Tensor,
+        *,
+        key_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Predict each tubed parcel's teacher grid from the visible context.
+
+        ``ctx``: ``(B, N, d_model)`` visible un-tubed latent tokens (M4 SEE-set).
+        ``ctx_slot``: ``(N,)`` long — each context token's RoPE time-slot.
+        ``query_parcels``: ``(B, P)`` long — the tubed parcel ids to predict.
+        ``key_mask``: ``(B, N)`` bool, ``True`` = real context token (ragged
+        padding); ``None`` ⇒ all real. Output: ``(B, P, 38, d_model)`` predicted
+        feature per (tubed parcel, freq-time cell), to be L1'd vs the stop-grad
+        teacher ``parcel_electrode_mean`` target."""
+        B, N, _ = ctx.shape
+        P = query_parcels.shape[1]
+        S = self.tokens_per_electrode
+        q = self._build_queries(query_parcels).reshape(B, P * S, -1)  # (B, P·38, d)
+        c = self.ctx_proj(ctx)                                        # (B, N, d)
+        tokens = torch.cat([c, q], dim=1)                             # (B, N+P·38, d)
+
+        q_slot = self.time_slot.repeat(P)                             # (P·38,)
+        slots = torch.cat([ctx_slot.reshape(-1), q_slot])             # (N+P·38,)
+        rope = self.key_rope[:, slots, :]                             # (2, N+P·38, hd)
+
+        # Context tokens carry the ragged mask; query tokens are always real keys.
+        if key_mask is None:
+            full_mask: Tensor | None = None
+        else:
+            q_ok = torch.ones(B, P * S, dtype=torch.bool, device=key_mask.device)
+            full_mask = torch.cat([key_mask, q_ok], dim=1)           # (B, N+P·38)
+
+        for blk in self.blocks:
+            tokens = blk(tokens, rope, full_mask)
+        pred = self.head(tokens[:, N:])                              # (B, P·38, d_model)
+        return pred.reshape(B, P, S, -1)                            # (B, P, 38, d_model)
+
+
+class M2Predictor(nn.Module):
+    """Paradigm-B own-predictor for M2 (the frontend per-electrode JEPA).
+
+    ISOLATED per electrode (electrodes ride the batch dim): each electrode's
+    predictor SEES **only that electrode's own visible frontend tokens** and
+    PREDICTS **only that electrode's own masked frontend tokens** (no cross-
+    electrode pathway — the frontend isolation is what makes M2 shortcut-proof).
+
+    Query = a shared learnable **mask token** + additive **freq-tag** ONLY (per
+    [[project_v14_m2_m4_predictor_scopes_2026_06_18]]: the parcel tag does not
+    exist yet at the frontend stage), positioned by **RoPE on the shared clock**.
+    Because each electrode masks a different set of positions, both the context
+    and the query slots are **per-row** (the ragged-drop RoPE path). Independent
+    params from M4; freq-tag LEARNED by default, ``"sinusoidal"`` sister kept.
+
+    Ragged: ``ctx_mask`` / ``query_mask`` (``True`` = real) pad electrodes with
+    differing visible/masked counts to a rectangular batch without leakage."""
+
+    def __init__(
+        self,
+        d_model: int,
+        pred_dim: int,
+        n_heads: int,
+        n_layers: int,
+        *,
+        freq_pos: str = "learned",
+        bands: tuple[BandSpec, ...] = BANDS,
+    ) -> None:
+        super().__init__()
+        if pred_dim % n_heads != 0:
+            raise ValueError(f"pred_dim={pred_dim} not divisible by n_heads={n_heads}")
+        head_dim = pred_dim // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+
+        self.ctx_proj = nn.Linear(d_model, pred_dim, bias=False)
+        self.mask_token = nn.Parameter(torch.zeros(pred_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        _, _, time_slot = token_metadata(bands)
+        n_fp = sum(b.n_freq_patches for b in bands)
+        if freq_pos == "learned":
+            self.freq_embed = nn.Parameter(torch.empty(n_fp, pred_dim))
+            nn.init.trunc_normal_(self.freq_embed, std=0.02)
+        elif freq_pos == "sinusoidal":
+            self.register_buffer("freq_embed", _sincos_1d(n_fp, pred_dim), persistent=False)
+        else:
+            raise ValueError(f"freq_pos must be 'learned' or 'sinusoidal', got {freq_pos!r}")
+
+        n_slots = int(time_slot.max().item()) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(pred_dim, n_heads) for _ in range(n_layers)]
+        )
+        self.head = nn.Linear(pred_dim, d_model, bias=False)      # raw pred, NO LN
+
+    def forward(
+        self,
+        ctx: Tensor,
+        ctx_slot: Tensor,
+        query_freq: Tensor,
+        query_slot: Tensor,
+        *,
+        ctx_mask: Tensor | None = None,
+        query_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Predict one electrode-batch's masked frontend tokens from its visible.
+
+        ``ctx``: ``(B', N, d_model)`` per-electrode visible frontend tokens.
+        ``ctx_slot``: ``(B', N)`` long — visible tokens' RoPE time-slots (per row).
+        ``query_freq``: ``(B', M)`` long — global freq-patch id of each masked token.
+        ``query_slot``: ``(B', M)`` long — RoPE time-slot of each masked token.
+        ``ctx_mask`` / ``query_mask``: ``(B', N)`` / ``(B', M)`` bool, ``True`` =
+        real (ragged padding). Output: ``(B', M, d_model)`` predicted feature per
+        masked position, L1'd vs the stop-grad teacher frontend target there."""
+        B, N, _ = ctx.shape
+        q = self.mask_token + self.freq_embed[query_freq]            # (B', M, d)
+        c = self.ctx_proj(ctx)                                       # (B', N, d)
+        tokens = torch.cat([c, q], dim=1)                            # (B', N+M, d)
+
+        slots = torch.cat([ctx_slot, query_slot], dim=1)            # (B', N+M)
+        rope = self.key_rope[:, slots, :]                           # (2, B', N+M, hd)
+
+        if ctx_mask is None and query_mask is None:
+            full_mask: Tensor | None = None
+        else:
+            M = query_freq.shape[1]
+            cm = ctx_mask if ctx_mask is not None else torch.ones(
+                B, N, dtype=torch.bool, device=ctx.device)
+            qm = query_mask if query_mask is not None else torch.ones(
+                B, M, dtype=torch.bool, device=ctx.device)
+            full_mask = torch.cat([cm, qm], dim=1)                  # (B', N+M)
+
+        for blk in self.blocks:
+            tokens = blk(tokens, rope, full_mask)
+        return self.head(tokens[:, N:])                            # (B', M, d_model)
