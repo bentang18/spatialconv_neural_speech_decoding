@@ -188,6 +188,19 @@ STFT_3BAND_HG: dict[str, float] = {
     "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 192.0,
 }
 
+# Canonical winsor-band tag, keyed by the band's defining ``band_nperseg``. Used
+# ONLY to select a per-band ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (the
+# three bands' |z| distributions differ, so one scalar cap mis-clamps two of them).
+# Derived from ``band_nperseg`` — already a cache-key field — so it adds NO pydantic
+# field and never perturbs ``infra.uid()``; the per-band winsor stays cache-neutral.
+# 2STFT-HIGH shares HG's 128-sample window, so it also reads the HG cap when set;
+# 2STFT-LOW (512) has no per-band tag and falls back to the global scalar.
+_WINSOR_BAND_TAG: dict[int, str] = {
+    int(STFT_3BAND_SLOW["band_nperseg"]): "slow",
+    int(STFT_3BAND_BETA["band_nperseg"]): "beta",
+    int(STFT_3BAND_HG["band_nperseg"]): "hg",
+}
+
 
 def _stft_band_k_range(
     f_lo_hz: float, f_hi_hz: float, *, nperseg: int, sample_rate: int = STFT_2BAND_FS_HZ,
@@ -1146,6 +1159,14 @@ class MultiStftView(CARIeegExtractor):
         inert multi-STFT default."""
         return self.band_nperseg if self.front_end == "band" else self.nperseg_low
 
+    def _winsor_band_name(self) -> tp.Optional[str]:
+        """Canonical band tag (``"slow"``/``"beta"``/``"hg"``) for the per-band
+        winsor cap, or ``None`` (→ global scalar cap) for non-3STFT bands. Keyed
+        off ``band_nperseg`` so it is cache-neutral (no new cache-key field)."""
+        if self.front_end != "band":
+            return None
+        return _WINSOR_BAND_TAG.get(int(self.band_nperseg))
+
     def _band_bins(self) -> tuple[int, int]:
         """Inclusive rfft-bin slice ``(k0, k1)`` for this view's band, derived
         from ``band_f_lo_hz``/``band_f_hi_hz`` at ``band_nperseg`` via the
@@ -1430,6 +1451,7 @@ class MultiStftView(CARIeegExtractor):
             del specs  # torch.cat copied the data; the per-chunk specs are dead
             normalizer = SessionRobustZNormalizer(
                 sigma_floor=self.session_z_sigma_floor,
+                band=self._winsor_band_name(),
             ).fit(frames)
             # Scatter the session-indexed (C_session, F, 1) stats into the
             # GLOBAL channel index. ``_get_data`` yields the session's own
@@ -1899,6 +1921,7 @@ class MultiStftView(CARIeegExtractor):
             median=median,
             sigma=sigma,
             sigma_floor=self.session_z_sigma_floor,
+            band=self._winsor_band_name(),
         )
 
     def _fit_session_stats(
@@ -1917,6 +1940,7 @@ class MultiStftView(CARIeegExtractor):
         if self.band_channelization != "cartesian":
             return SessionRobustZNormalizer(
                 sigma_floor=self.session_z_sigma_floor,
+                band=self._winsor_band_name(),
             ).fit(frames.float())
         x = frames.float()
         n = x.shape[-2] // 2
@@ -1932,6 +1956,7 @@ class MultiStftView(CARIeegExtractor):
             median=median,
             sigma=sigma,
             sigma_floor=self.session_z_sigma_floor,
+            band=self._winsor_band_name(),
         )
 
     def _build_spec_cache_and_fit(self, obj) -> None:

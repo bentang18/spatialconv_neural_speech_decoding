@@ -220,3 +220,57 @@ def test_cartesian_validators() -> None:
     with pytest.raises(ValueError):
         MultiStftView(front_end="band", hop_length=512, apply_log=True,
                       **STFT_3BAND_SLOW)
+
+
+# ------------------------------------------------------- per-band winsor tag
+def test_winsor_band_name_per_band() -> None:
+    """Each 3STFT view reports its canonical winsor-band tag (keyed off
+    band_nperseg); a non-band (raw) view has no tag → global scalar cap."""
+    slow = MultiStftView(front_end="band", hop_length=512, **STFT_3BAND_SLOW)
+    beta = MultiStftView(front_end="band", hop_length=128, **STFT_3BAND_BETA)
+    hg = MultiStftView(front_end="band", hop_length=64, **STFT_3BAND_HG)
+    assert slow._winsor_band_name() == "slow"
+    assert beta._winsor_band_name() == "beta"
+    assert hg._winsor_band_name() == "hg"
+    assert MultiStftView(front_end="raw")._winsor_band_name() is None
+
+
+def test_winsor_band_tag_is_cache_neutral() -> None:
+    """The band tag is DERIVED from band_nperseg (already a cache-key field), so
+    it adds nothing to the spec-cache namespace — the per-band winsor must never
+    fork the multi-TB cache."""
+    common = dict(front_end="band", hop_length=512, band_nperseg=1024,
+                  band_hop=512, band_f_lo_hz=2.0, band_f_hi_hz=12.0,
+                  spec_cache_dir="/tmp/x", band_channelization="cartesian")
+    a = MultiStftView(**common)
+    b = MultiStftView(**common)
+    assert a._winsor_band_name() == b._winsor_band_name() == "slow"
+    assert a._spec_cache_namespace() == b._spec_cache_namespace()
+
+
+def test_winsor_band_reaches_fitted_normalizer(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Integration: a per-band env cap reaches the view's fitted normalizer — the
+    slow band's normalizer clamps at the SLOW cap while a beta normalizer (no beta
+    var here) falls back to the global cap."""
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR", "2500")
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_SLOW", "300")
+    torch.manual_seed(0)
+    x = torch.randn(4, CLIP)
+    slow = MultiStftView(front_end="band", hop_length=512, session_robust_z=True,
+                         **STFT_3BAND_SLOW)
+    ks0, ks1 = slow._band_bins()
+    slow_frames = _single_stft_raw_view(
+        x, sample_rate=FS, nperseg=1024, hop_length=512, k0=ks0, k1=ks1,
+        log_eps=1e-6, cartesian=True,
+    )
+    assert slow._fit_session_stats(slow_frames).winsor == 300.0  # slow override
+    beta = MultiStftView(front_end="band", hop_length=128, session_robust_z=True,
+                         **STFT_3BAND_BETA)
+    kb0, kb1 = beta._band_bins()
+    beta_frames = _single_stft_raw_view(
+        x, sample_rate=FS, nperseg=256, hop_length=128, k0=kb0, k1=kb1,
+        log_eps=1e-6, cartesian=False,
+    )
+    assert beta._fit_session_stats(beta_frames).winsor == 2500.0  # global

@@ -281,3 +281,56 @@ def test_winsor_env_reaches_transform_clamp(
     clip = torch.tensor([[[5.0, 5000.0, -5000.0]]])  # in-range, +artifact, -artifact
     z = SessionRobustZNormalizer.from_stats(median=med, sigma=sig).transform(clip)
     torch.testing.assert_close(z, torch.tensor([[[5.0, 50.0, -50.0]]]))
+
+
+# ----------------------------------------------------------- per-band winsor cap
+def test_winsor_per_band_env_overrides_global(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """A band-specific ``V14_SESSION_Z_WINSOR_<BAND>`` wins over the global scalar
+    for that band's normalizer; a band with no per-band var falls back to global.
+    This is how the three 3STFT bands get distinct caps from one launch."""
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR", "2500")     # global fallback
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_SLOW", "300")  # slow override
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_HG", "5000")   # hg override
+    # beta has no per-band var → global
+    assert SessionRobustZNormalizer(band="slow").winsor == 300.0
+    assert SessionRobustZNormalizer(band="hg").winsor == 5000.0
+    assert SessionRobustZNormalizer(band="beta").winsor == 2500.0
+    assert SessionRobustZNormalizer(band=None).winsor == 2500.0
+
+
+def test_winsor_per_band_without_global_is_band_only(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """With only a per-band var set (no global), that band is capped and the
+    others stay off — per-band caps do not require a global fallback."""
+    monkeypatch.delenv("V14_SESSION_Z_WINSOR", raising=False)
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_BETA", "1000")
+    assert SessionRobustZNormalizer(band="beta").winsor == 1000.0
+    assert SessionRobustZNormalizer(band="slow").winsor is None
+    assert SessionRobustZNormalizer(band=None).winsor is None
+
+
+def test_winsor_per_band_invalid_fails_loud(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """A typo'd per-band cap must fail loud (naming the band var), not silently
+    fall through to the global / off."""
+    import pytest
+
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_HG", "nope")
+    with pytest.raises(ValueError, match="V14_SESSION_Z_WINSOR_HG"):
+        SessionRobustZNormalizer(band="hg")
+
+
+def test_winsor_explicit_arg_beats_per_band_env(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """An explicit ``winsor=`` still wins over any env (band or global) — the
+    per-band env only fills the gap when the caller passes nothing."""
+    monkeypatch.setenv("V14_SESSION_Z_WINSOR_SLOW", "300")
+    assert SessionRobustZNormalizer(band="slow", winsor=42.0).winsor == 42.0
+    assert SessionRobustZNormalizer.from_stats(
+        median=torch.zeros(1, 1), sigma=torch.ones(1, 1), band="slow", winsor=42.0
+    ).winsor == 42.0

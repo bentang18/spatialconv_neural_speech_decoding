@@ -48,24 +48,39 @@ SCALE_TO_SIGMA: float = 1.4826  # consistency constant: σ ≈ k · MAD for Norm
 _WINSOR_ENV_VAR = "V14_SESSION_Z_WINSOR"
 
 
-def _winsor_from_env() -> tp.Optional[float]:
-    """Parse ``V14_SESSION_Z_WINSOR`` → positive ``float`` cap, or ``None`` when unset
+def _parse_winsor_env(name: str) -> tp.Optional[float]:
+    """Parse one ``|z|`` cap env var → positive ``float``, or ``None`` when unset
     or blank. A set-but-unparseable / non-positive value fails loud rather than
     silently disabling the backstop (a typo'd cap must not pass as 'off')."""
-    raw = os.environ.get(_WINSOR_ENV_VAR)
+    raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return None
     try:
         value = float(raw)
     except ValueError as exc:
         raise ValueError(
-            f"{_WINSOR_ENV_VAR}={raw!r} is not a float |z| cap (e.g. '2500')"
+            f"{name}={raw!r} is not a float |z| cap (e.g. '2500')"
         ) from exc
     if not (value > 0):
-        raise ValueError(
-            f"{_WINSOR_ENV_VAR}={raw!r} must be a positive |z| cap, got {value}"
-        )
+        raise ValueError(f"{name}={raw!r} must be a positive |z| cap, got {value}")
     return value
+
+
+def _winsor_from_env(band: tp.Optional[str] = None) -> tp.Optional[float]:
+    """Read the winsor cap from the launch env, with PER-BAND precedence.
+
+    The 3STFT bands (slow / beta / hg) have very different ``|z|`` distributions
+    — the Cartesian slow band, the |STFT| beta band, and the |STFT| HG band do
+    not share a clean-signal ceiling, so one scalar cap mis-clamps two of them.
+    When ``band`` is given, a band-specific ``V14_SESSION_Z_WINSOR_<BAND>`` wins;
+    if that band's var is unset, fall back to the global ``V14_SESSION_Z_WINSOR``
+    (so the 2STFT live path's single ``--session-z-winsor`` is unchanged). Each
+    var is parsed independently, so a typo'd band cap still fails loud."""
+    if band is not None:
+        per_band = _parse_winsor_env(f"{_WINSOR_ENV_VAR}_{band.upper()}")
+        if per_band is not None:
+            return per_band
+    return _parse_winsor_env(_WINSOR_ENV_VAR)
 
 
 def robust_z(
@@ -182,14 +197,20 @@ class SessionRobustZNormalizer:
     _FLOAT_DTYPES = (torch.float16, torch.float32, torch.float64)
 
     def __init__(
-        self, *, sigma_floor: float = 1e-6, winsor: tp.Optional[float] = None
+        self,
+        *,
+        sigma_floor: float = 1e-6,
+        winsor: tp.Optional[float] = None,
+        band: tp.Optional[str] = None,
     ) -> None:
         self.sigma_floor = sigma_floor
+        self.band = band
         # An explicit ``winsor`` always wins; only fall back to the launch env when
-        # the caller passed nothing. The view.py construction sites pass no winsor,
-        # so this is where ``V14_SESSION_Z_WINSOR`` reaches the read path.
+        # the caller passed nothing. The view.py construction sites pass no winsor
+        # (just the band tag), so this is where ``V14_SESSION_Z_WINSOR[_<BAND>]``
+        # reaches the read path.
         if winsor is None:
-            winsor = _winsor_from_env()
+            winsor = _winsor_from_env(band)
         if winsor is not None and not (winsor > 0):
             raise ValueError(f"winsor must be a positive |z| cap, got {winsor}")
         self.winsor = winsor
@@ -205,6 +226,7 @@ class SessionRobustZNormalizer:
         sigma: torch.Tensor,
         sigma_floor: float = 1e-6,
         winsor: tp.Optional[float] = None,
+        band: tp.Optional[str] = None,
         valid_bin_mask: tp.Optional[torch.Tensor] = None,
     ) -> "SessionRobustZNormalizer":
         """Rebuild a fitted normalizer from already-computed ``median``/``sigma``
@@ -212,8 +234,9 @@ class SessionRobustZNormalizer:
         stats are a deterministic function of the frames + reduce axis, so a
         ``from_stats`` normalizer is identical to a ``fit`` one. ``sigma_floor``
         and ``winsor`` are applied at ``transform`` (not baked into ``sigma``), so
-        they may differ from the values used when the stats were originally fit."""
-        obj = cls(sigma_floor=sigma_floor, winsor=winsor)
+        they may differ from the values used when the stats were originally fit.
+        ``band`` selects the per-band launch-env cap when ``winsor`` is omitted."""
+        obj = cls(sigma_floor=sigma_floor, winsor=winsor, band=band)
         obj.median = median
         obj.sigma = sigma
         obj._valid_bin_mask = valid_bin_mask

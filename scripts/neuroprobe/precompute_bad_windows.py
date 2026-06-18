@@ -6,24 +6,27 @@ contacts, dropped pre-CAR in the loader) changes each shaft's CAR reference and
 therefore the cached ``|STFT|`` robust-z, so the bad windows must be scanned on the
 REBUILT domain — a scan of the old cache would point at the wrong frames.
 
-For each pretrain session this reproduces the encoder's exact dual-band input:
+For each pretrain session this reproduces the encoder's exact 3-band input:
 
     bt_load_raw (already post-static-drop + native→2048 resample)
       → notch(60) + HPF(0.5) → shaft-CAR
-      → dual-band |STFT| cropped to the PRODUCTION freq bins (LOW k1..k14, HIGH k4..k12)
+      → 3-band |STFT| cropped to the PRODUCTION freq bins (slow / beta / HG, STFT_3BAND_*)
       → per-(electrode, freq-bin) SESSION robust-z  (== SessionRobustZNormalizer)
 
-then tiles the session into ``CLIP_S``-second windows and flags a window BAD iff
+then tiles the session into ``CLIP_S``-second windows and flags a window BAD iff, for
+ANY band b with its OWN self-calibrating scale ``q_b``,
 
-    #hot electrodes(|z|-max > HOT_MULT*q) >= max(N_FLOOR, FRAC_HOT*C)   (common-mode)
-    OR  win_cell_max > CAT_MULT*q                                       (catastrophic single cell)
-    OR  #flat electrodes(low-band z-std < FLAT_STD) >= max(N_FLOOR, FRAC_FLAT*C)  (dropout)
+    #hot electrodes(|z|-max > HOT_MULT*q_b) >= max(N_FLOOR, FRAC_HOT*C)   (common-mode)
+    OR  win_cell_max_b > CAT_MULT*q_b                                     (catastrophic single cell)
+    OR  #flat electrodes(slow-band z-std < FLAT_STD) >= max(N_FLOOR, FRAC_FLAT*C)  (dropout)
 
 Every threshold is PORTABLE — a fraction of the electrode count C, or a multiple of a
-per-session self-calibrating scale ``q`` (= the P99 of every electrode's per-window
-|z|-max). So the rule transfers to any cohort / electrode count / noise level without
-retuning: ``q`` tracks how loud a "normal" cell is on THIS recording, and the fences
-ride above it. The two HIGH-amplitude rules: a common-mode blow-up across many contacts
+per-(session, BAND) self-calibrating scale ``q_b`` (= the P99 of that band's per-window
+|z|-max). PER-BAND (#231) because the slow/beta/HG |z| distributions differ: a single
+pooled ``q`` is dominated by the loudest band, so a transient in a quieter band slips the
+fence. One ``q_b`` per band lets each band's fence ride just above its OWN clean ceiling.
+Badness is on |STFT| for ALL bands (incl. the Cartesian slow band — the magnitude
+transient is the artifact signal regardless of how the band is stored for the model). The two HIGH-amplitude rules: a common-mode blow-up across many contacts
 at once (a JOINT pattern the per-cell winsor cannot repair), OR a single cell so giant
 it poisons the micro-batch alone. The third is the complementary LOW-energy rule: a
 recording dropout flattens many contacts (low-band z-std -> 0); the loudest cell stays
@@ -36,11 +39,14 @@ in NEURAL seconds from recording start — the same clock as a Word event's ``st
 Detection is on the RAW (un-winsored) robust-z: the clip filter and the per-cell winsor
 clamp are COMPLEMENTARY layers. Winsor caps what survives inside a kept clip; this
 filter removes whole windows whose joint blow-up winsor cannot repair. The fences are
-intentionally AGGRESSIVE (Ben 2026-06-16): a 3-session knee sweep put the healthy
-window ceiling at ~q*7 and the healthy single-cell ceiling at ~q*11, so HOT_MULT=5 /
+intentionally AGGRESSIVE (Ben 2026-06-16): the 2STFT 3-session knee sweep put the healthy
+per-window ceiling at ~q*7 and the healthy single-cell ceiling at ~q*11, so HOT_MULT=5 /
 CAT_MULT=12 drop hard right up to those ceilings (clean session ~0.1% dropped, all
-genuine artifacts) — non-aggressive cleaning leaves rank-collapsing clips in and taxes
-scaling, which is the opposite of the goal.
+genuine artifacts). Those multipliers are carried over as PER-BAND PRELIMINARY defaults
+(applied to each band's own ``q_b``); Ben locks the per-band finals from the knee sweep
+on the rebuilt 3STFT cache (override via HOT_MULT_BY_BAND / CAT_MULT_BY_BAND). Non-
+aggressive cleaning leaves rank-collapsing clips in and taxes scaling — the opposite of
+the goal.
 
 CAR commutes with the per-channel linear filters (notch/HPF), so applying CAR after
 the filter in float32 is numerically equivalent to the production CAR-then-filter.
@@ -80,42 +86,64 @@ mne.set_log_level("ERROR")
 from speech_decoding.extractors.normalize import robust_z
 from speech_decoding.extractors.reference import parse_shaft
 from speech_decoding.extractors.view import (
-    STFT_2BAND_HIGH,
-    STFT_2BAND_LOW,
+    STFT_3BAND_BETA,
+    STFT_3BAND_HG,
+    STFT_3BAND_SLOW,
     _stft_band_k_range,
 )
 from speech_decoding.studies.braintreebank.loader import bt_load_raw
 from speech_decoding.studies.braintreebank.manifest import V14_PRETRAIN_SESSIONS
 
-# ---- portable, self-calibrating detection rule ----
+# ---- portable, self-calibrating, PER-BAND detection rule ----
 # Every threshold below is a FRACTION of the electrode count or a MULTIPLE of a
-# per-session scale ``q`` (= P99 of all per-(electrode, window) |z|-max), so the rule
-# transfers to any cohort / electrode count / noise level without retuning. Aggressive
-# by design (Ben 2026-06-16): a 3-session knee sweep put the healthy per-window ceiling
-# at ~7q and the healthy single-cell ceiling at ~11q, so the fences sit right below them.
+# per-(session, BAND) scale ``q_band`` (= P99 of all per-(electrode, window) |z|-max
+# WITHIN that band), so the rule transfers to any cohort / electrode count / noise
+# level without retuning. Going per-band (#231) fixes the 2STFT pooled-``q`` flaw: the
+# 3STFT bands (Cartesian slow, |STFT| beta, |STFT| HG) have very different |z|
+# distributions, so a single pooled ``q`` is dominated by the loudest band and a
+# transient in a quieter band slips under the fence. One ``q_band`` per band lets each
+# band's fences ride just above its OWN clean ceiling.
+#
+# PRELIMINARY multipliers (Ben locks finals after profiling the rebuilt 3STFT cache):
+# carried over from the 2STFT knee sweep (healthy per-window ceiling ~7q, single-cell
+# ~11q → HOT_MULT 5 / CAT_MULT 12), applied per-band. ``HOT_MULT``/``CAT_MULT`` may be
+# overridden per band via the dicts below once each band's knee is measured.
 CLIP_S: float = 5.0  # SSL clip length (dispatch clip_len); the window grid stride
-Q_PCT: float = 99.0  # per-session scale q = this percentile of all (elec, window) |z|-max
+Q_PCT: float = 99.0  # per-(session,band) scale q = this pct of all (elec, window) |z|-max
 FRAC_HOT: float = 0.05  # >= this fraction of electrodes hot together -> common-mode drop
 FRAC_FLAT: float = 0.05  # >= this fraction of electrodes flat together -> dropout drop
 N_FLOOR: int = 3  # ...but never fewer than this many electrodes (small-array guard)
 HOT_MULT: float = 5.0  # an electrode is "hot" in a window if its |z|-max > HOT_MULT * q
 CAT_MULT: float = 12.0  # any single cell > CAT_MULT * q -> drop (poisons the batch alone)
-FLAT_STD: float = 0.05  # an electrode is "flat" in a window if its low-band z-std < this
+FLAT_STD: float = 0.05  # an electrode is "flat" in a window if its slow-band z-std < this
+
+# Per-band multiplier OVERRIDES (PRELIMINARY: empty → every band uses the scalar
+# HOT_MULT/CAT_MULT above). Ben fills these from the per-band knee sweep on the rebuilt
+# cache, e.g. ``HOT_MULT_BY_BAND = {"slow": 6.0}``. Keys must be in {"slow","beta","hg"}.
+HOT_MULT_BY_BAND: dict[str, float] = {}
+CAT_MULT_BY_BAND: dict[str, float] = {}
 
 NOTCH_HZ: float = 60.0
 HPF_HZ: float = 0.5
 SIGMA_FLOOR: float = 1e-6  # == SessionRobustZNormalizer / view.session_z_sigma_floor
 
-# Production dual-band geometry (one source of truth = STFT_2BAND_LOW/HIGH in view.py).
-# Each entry: (nperseg, hop, k0, k1) with [k0, k1] the INCLUSIVE rfft-bin slice the
-# production cache stores (LOW 4-56 Hz -> k1..k14; HIGH 64-192 Hz -> k4..k12).
-_BAND_SPECS: list[tuple[int, int, int, int]] = []
-for _band in (STFT_2BAND_LOW, STFT_2BAND_HIGH):
+# Production 3-band geometry (one source of truth = STFT_3BAND_* in view.py). The flat
+# (dropout) rule runs on the FIRST band, so SLOW is listed first to keep the lowest band
+# as the dropout sentinel (its low-frequency z-std collapses first on a recording freeze).
+# Each entry: (name, nperseg, hop, k0, k1) with [k0, k1] the INCLUSIVE rfft-bin slice the
+# production cache stores. Badness is detected on |STFT| for ALL bands (incl. the Cartesian
+# slow band): the magnitude transient is the artifact signal regardless of how the band is
+# stored for the model — so no cartesian special-case is needed in the scan.
+_BAND_ORDER: tuple[str, ...] = ("slow", "beta", "hg")
+_BAND_DICTS = {"slow": STFT_3BAND_SLOW, "beta": STFT_3BAND_BETA, "hg": STFT_3BAND_HG}
+_BAND_SPECS: list[tuple[str, int, int, int, int]] = []
+for _name in _BAND_ORDER:
+    _band = _BAND_DICTS[_name]
     _nperseg, _hop = int(_band["band_nperseg"]), int(_band["band_hop"])
     _k0, _k1 = _stft_band_k_range(
-        _band["band_f_lo_hz"], _band["band_f_hi_hz"], nperseg=_nperseg
+        float(_band["band_f_lo_hz"]), float(_band["band_f_hi_hz"]), nperseg=_nperseg
     )
-    _BAND_SPECS.append((_nperseg, _hop, _k0, _k1))
+    _BAND_SPECS.append((_name, _nperseg, _hop, _k0, _k1))
 
 
 def _robust_z_perbin(mag: np.ndarray) -> np.ndarray:
@@ -143,6 +171,73 @@ def _merge_bad_windows(
         else:
             spans.append((lo, hi))
     return spans
+
+
+def _decide_bad_windows(
+    ewm_by_band: dict[str, np.ndarray],
+    n_flat: np.ndarray,
+    n_elec: int,
+    *,
+    q_pct: float = Q_PCT,
+    frac_hot: float = FRAC_HOT,
+    frac_flat: float = FRAC_FLAT,
+    n_floor: int = N_FLOOR,
+    hot_mult: float = HOT_MULT,
+    cat_mult: float = CAT_MULT,
+    hot_mult_by_band: dict[str, float] | None = None,
+    cat_mult_by_band: dict[str, float] | None = None,
+) -> tuple[list[int], dict]:
+    """Pure PER-BAND bad-window decision (#231) — the testable core, no I/O.
+
+    ``ewm_by_band[name]`` is ``(n_elec, n_windows)``: each electrode's per-window
+    |z|-max WITHIN that band. ``n_flat`` is ``(n_windows,)``: the count of
+    slow-band-flat electrodes per window. Each band self-calibrates its own scale
+    ``q_band`` (P99 of its own (elec, window) |z|-max) and fences ride above it; a
+    window is BAD iff ANY band fires hot (common-mode) or cat (single-cell), OR the
+    slow band fires flat (dropout). Returns ``(sorted bad_idx, diagnostics)``."""
+    hot_mult_by_band = hot_mult_by_band or {}
+    cat_mult_by_band = cat_mult_by_band or {}
+    n_windows = int(n_flat.shape[0])
+    hot_count_thresh = max(n_floor, int(np.ceil(frac_hot * n_elec)))
+    flat_count_thresh = max(n_floor, int(np.ceil(frac_flat * n_elec)))
+    hot_bad = np.zeros(n_windows, bool)
+    cat_bad = np.zeros(n_windows, bool)
+    per_band: dict[str, dict] = {}
+    for name, ewm in ewm_by_band.items():
+        q = float(np.percentile(ewm, q_pct)) if ewm.size else 0.0
+        hm = float(hot_mult_by_band.get(name, hot_mult))
+        cm = float(cat_mult_by_band.get(name, cat_mult))
+        hot_fence, cat_fence = hm * q, cm * q
+        win_cell_max = (
+            ewm.max(axis=0) if ewm.shape[0] else np.zeros(n_windows, np.float32)
+        )
+        n_hot = (ewm > hot_fence).sum(axis=0).astype(np.int32)
+        hb = n_hot >= hot_count_thresh
+        cb = win_cell_max > cat_fence
+        hot_bad |= hb
+        cat_bad |= cb
+        per_band[name] = {
+            "q": q, "hot_mult": hm, "cat_mult": cm,
+            "hot_fence": float(hot_fence), "cat_fence": float(cat_fence),
+            "n_hot_windows": int(hb.sum()), "n_cat_windows": int(cb.sum()),
+            "max_n_hot": int(n_hot.max()) if n_windows else 0,
+            "max_cell_max": float(win_cell_max.max()) if n_windows else 0.0,
+        }
+    flat_bad = n_flat >= flat_count_thresh
+    bad = hot_bad | cat_bad | flat_bad
+    bad_idx = [int(w) for w in np.nonzero(bad)[0]]
+    diag = {
+        "q_pct": q_pct, "frac_hot": frac_hot, "frac_flat": frac_flat,
+        "n_floor": n_floor, "flat_std": FLAT_STD,
+        "hot_count_thresh": int(hot_count_thresh),
+        "flat_count_thresh": int(flat_count_thresh),
+        "per_band": per_band,
+        "n_hot_windows": int(hot_bad.sum()),
+        "n_cat_windows": int(cat_bad.sum()),
+        "n_flat_windows": int(flat_bad.sum()),
+        "max_n_flat": int(n_flat.max()) if n_windows else 0,
+    }
+    return bad_idx, diag
 
 
 def scan_session(subject_id: int, trial_id: int) -> dict:
@@ -180,26 +275,28 @@ def scan_session(subject_id: int, trial_id: int) -> dict:
     total_s = n_samples / sfreq
     n_windows = int(np.ceil(total_s / CLIP_S))
     n_elec = int(filt.shape[0])
-    # full per-(electrode, window) |z|-max over BOTH bands, kept so the scale q (P99 over
-    # every pair) and the per-window hot count are exact rather than fixed-thresholded.
-    ewm = np.zeros((n_elec, n_windows), np.float32)
-    n_flat = np.zeros(n_windows, np.int32)  # electrodes flat (low-band z-std < FLAT_STD)
+    # per-(electrode, window) |z|-max kept PER BAND so each band self-calibrates its own
+    # scale q_band (#231) — the slow/beta/HG |z| distributions differ, so one pooled q
+    # would let a transient in a quieter band slip the fence.
+    ewm_by_band = {
+        name: np.zeros((n_elec, n_windows), np.float32) for name, *_ in _BAND_SPECS
+    }
+    n_flat = np.zeros(n_windows, np.int32)  # electrodes flat (slow-band z-std < FLAT_STD)
+    flat_band = _BAND_SPECS[0][0]  # SLOW: lowest band is the dropout sentinel
 
     for i in range(n_elec):
-        x = filt[i]
-        elec_win_max = np.zeros(n_windows, np.float32)
-        for bi, (nperseg, hop, k0, k1) in enumerate(_BAND_SPECS):
+        for name, nperseg, hop, k0, k1 in _BAND_SPECS:
             _, _, z_stft = stft(
-                x, fs=sfreq, nperseg=nperseg, noverlap=nperseg - hop,
+                filt[i], fs=sfreq, nperseg=nperseg, noverlap=nperseg - hop,
                 boundary=None, padded=False,  # type: ignore[arg-type]  # scipy: None disables boundary ext
             )
-            mag = np.abs(z_stft[k0 : k1 + 1]).astype(np.float32)  # crop to prod bins
+            mag = np.abs(z_stft[k0 : k1 + 1]).astype(np.float32)  # |STFT|, crop to prod bins
             z = _robust_z_perbin(mag)  # signed (F_band, T_frames)
             per_frame = np.abs(z).max(axis=0)
             t_start = (np.arange(per_frame.shape[0]) * hop) / sfreq
             win = np.clip((t_start / CLIP_S).astype(np.int64), 0, n_windows - 1)
-            np.maximum.at(elec_win_max, win, per_frame)
-            if bi == 0:  # LOW band: per-window z-std -> flat/dropout detection
+            np.maximum.at(ewm_by_band[name][i], win, per_frame)
+            if name == flat_band:  # slow band: per-window z-std -> flat/dropout detection
                 fsum = z.sum(axis=0, dtype=np.float64)
                 fsq = np.square(z, dtype=np.float64).sum(axis=0)
                 w_sum = np.zeros(n_windows, np.float64)
@@ -207,29 +304,20 @@ def scan_session(subject_id: int, trial_id: int) -> dict:
                 w_cnt = np.zeros(n_windows, np.float64)
                 np.add.at(w_sum, win, fsum)
                 np.add.at(w_sq, win, fsq)
-                np.add.at(w_cnt, win, float(z.shape[0]))  # F_low cells per frame
+                np.add.at(w_cnt, win, float(z.shape[0]))  # F_slow cells per frame
                 with np.errstate(invalid="ignore", divide="ignore"):
                     mean = w_sum / w_cnt
                     var = w_sq / w_cnt - mean * mean
                 elec_std = np.where(w_cnt > 0, np.sqrt(np.maximum(var, 0.0)), np.inf)
                 n_flat += (elec_std < FLAT_STD).astype(np.int32)
             del z_stft, mag, z, per_frame
-        ewm[i] = elec_win_max
     del filt
     gc.collect()
 
-    win_cell_max = ewm.max(axis=0) if n_elec else np.zeros(n_windows, np.float32)
-    q = float(np.percentile(ewm, Q_PCT)) if ewm.size else 0.0
-    hot_fence = HOT_MULT * q
-    cat_fence = CAT_MULT * q
-    n_hot = (ewm > hot_fence).sum(axis=0).astype(np.int32)  # hot electrodes per window
-    hot_count_thresh = max(N_FLOOR, int(np.ceil(FRAC_HOT * n_elec)))
-    flat_count_thresh = max(N_FLOOR, int(np.ceil(FRAC_FLAT * n_elec)))
-
-    hot_bad = n_hot >= hot_count_thresh
-    cat_bad = win_cell_max > cat_fence
-    flat_bad = n_flat >= flat_count_thresh
-    bad_idx = [int(w) for w in np.nonzero(hot_bad | cat_bad | flat_bad)[0]]
+    bad_idx, decision = _decide_bad_windows(
+        ewm_by_band, n_flat, n_elec,
+        hot_mult_by_band=HOT_MULT_BY_BAND, cat_mult_by_band=CAT_MULT_BY_BAND,
+    )
     bad_windows_s = _merge_bad_windows(bad_idx, CLIP_S, total_s)
 
     return {
@@ -237,34 +325,18 @@ def scan_session(subject_id: int, trial_id: int) -> dict:
         "subject_id": subject_id,
         "trial_id": trial_id,
         "bad_windows_s": [[float(lo), float(hi)] for lo, hi in bad_windows_s],
-        # diagnostics (ignored by load_bad_windows)
-        "rule": {
-            "clip_s": CLIP_S,
-            "q_pct": Q_PCT,
-            "q": q,
-            "frac_hot": FRAC_HOT,
-            "frac_flat": FRAC_FLAT,
-            "n_floor": N_FLOOR,
-            "hot_mult": HOT_MULT,
-            "cat_mult": CAT_MULT,
-            "flat_std": FLAT_STD,
-            "hot_fence": float(hot_fence),
-            "cat_fence": float(cat_fence),
-            "hot_count_thresh": int(hot_count_thresh),
-            "flat_count_thresh": int(flat_count_thresh),
-        },
+        # diagnostics (ignored by load_bad_windows) — now PER BAND (#231): every
+        # band's self-calibrated q + fences live under rule["per_band"][name].
+        "rule": {"clip_s": CLIP_S, **decision},
         "n_elec": n_elec,
         "duration_s": float(total_s),
         "n_windows": int(n_windows),
         "n_bad_windows": int(len(bad_idx)),
         "frac_bad": float(len(bad_idx) / n_windows) if n_windows else 0.0,
-        "max_cell_max": float(win_cell_max.max()) if n_windows else 0.0,
-        "min_cell_max": float(win_cell_max.min()) if n_windows else 0.0,
-        "max_n_hot": int(n_hot.max()) if n_windows else 0,
         "max_n_flat": int(n_flat.max()) if n_windows else 0,
-        "n_hot_windows": int(hot_bad.sum()) if n_windows else 0,
-        "n_cat_windows": int(cat_bad.sum()) if n_windows else 0,
-        "n_flat_windows": int(flat_bad.sum()) if n_windows else 0,
+        "n_hot_windows": decision["n_hot_windows"],
+        "n_cat_windows": decision["n_cat_windows"],
+        "n_flat_windows": decision["n_flat_windows"],
     }
 
 
@@ -304,16 +376,19 @@ def main() -> None:
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
         r = result["rule"]
+        bands = "  ".join(
+            f"{name}[q={pb['q']:.1f},cell_max={pb['max_cell_max']:.0f},"
+            f"nhot={pb['max_n_hot']}]"
+            for name, pb in r["per_band"].items()
+        )
         print(
             f"[{result['session']}] {result['duration_s']/60:.1f}min  "
             f"{result['n_windows']} win  bad={result['n_bad_windows']} "
-            f"({100*result['frac_bad']:.2f}%)  q={r['q']:.1f}  "
-            f"fence[hot={r['hot_fence']:.0f},cat={r['cat_fence']:.0f}]z  "
+            f"({100*result['frac_bad']:.2f}%)  "
             f"need[hot>={r['hot_count_thresh']},flat>={r['flat_count_thresh']}]/{result['n_elec']}elec  "
-            f"cell_max[{result['min_cell_max']:.1f},{result['max_cell_max']:.0f}]  "
             f"by_rule[hot={result['n_hot_windows']},cat={result['n_cat_windows']},"
-            f"flat={result['n_flat_windows']}]  max_n_hot={result['max_n_hot']}  "
-            f"max_n_flat={result['max_n_flat']}  -> {out_path}",
+            f"flat={result['n_flat_windows']}]  max_n_flat={result['max_n_flat']}  "
+            f"{bands}  -> {out_path}",
             flush=True,
         )
 
