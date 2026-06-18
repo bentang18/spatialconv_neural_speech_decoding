@@ -28,7 +28,12 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from speech_decoding.models.v14_encoder import _PatchStem
+from speech_decoding.models.v14_encoder import (
+    _JointTokenBlock,
+    _PatchStem,
+    _rope_freqs,
+    _sincos_1d,
+)
 
 # Reference sample rate (FE spec §1: 1 s clip @ 2048 Hz).
 FS_HZ: int = 2048
@@ -276,3 +281,74 @@ class ThreeBandTokenizer(nn.Module):
                 )
             per_band.append(out.reshape(B, C, F_p * T_p, d))  # (B, C, n_tok_b, d)
         return torch.cat(per_band, dim=2)                     # (B, C, 38, d)
+
+
+class FrontendEncoder(nn.Module):
+    """Stage 1 (converged arch): per-electrode ISOLATED 3STFT frontend transformer.
+
+    Tokenize → add the freq-tag → ``n_layers`` joint freq×time self-attention
+    blocks (RoPE on the shared physical-time clock) → LayerNorm. Electrodes ride
+    in the batch dim throughout: **no cross-electrode pathway** (Stage-1 isolation).
+
+    The freq-tag defaults to a **1-D LEARNABLE** table (Ben 2026-06-18,
+    [[project_v14_freq_pos_learned_decision_2026_06_18]]) indexed by the token's
+    global freq-patch id; the ``"sinusoidal"`` sister is retained.
+
+    **Multirate RoPE (the rigorous reuse of the 2STFT dual-rate handling):** every
+    token's rotation is gathered from one ``key_rope`` table at the token's
+    ``time_slot`` (8/2/1 × time-patch-idx) — identical to ``_forward_dual_band``'s
+    ``key_rope[:, slot, :]`` gather. Because the slots are physical-time indices on
+    the shared HG-stride (62.5 ms) grid, tokens at the same real time across the 3
+    bands receive the SAME rotation, and the RoPE attention between any two tokens
+    depends only on their physical-time difference — band-agnostic (proven in the
+    tests). Works precisely because the hops 512:128:64 are exact integer multiples
+    (asserted in :class:`ThreeBandTokenizer`).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        *,
+        freq_pos: str = "learned",
+        bands: tuple[BandSpec, ...] = BANDS,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        head_dim = d_model // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+        self.tokenizer = ThreeBandTokenizer(d_model, bands)
+        n_fp = sum(b.n_freq_patches for b in bands)
+
+        # Freq-tag (additive, indexed by global freq-patch id). Learned by default.
+        if freq_pos == "learned":
+            self.freq_embed = nn.Parameter(torch.empty(n_fp, d_model))
+            nn.init.trunc_normal_(self.freq_embed, std=0.02)
+        elif freq_pos == "sinusoidal":
+            self.register_buffer("freq_embed", _sincos_1d(n_fp, d_model), persistent=False)
+        else:
+            raise ValueError(f"freq_pos must be 'learned' or 'sinusoidal', got {freq_pos!r}")
+
+        # One RoPE table over the shared clock; gathered per token at time_slot.
+        n_slots = int(self.tokenizer.time_slot.max().item()) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
+        )
+        self.ln_out = nn.LayerNorm(d_model)
+
+    def forward(self, slow: Tensor, beta: Tensor, hg: Tensor) -> Tensor:
+        """``(B,C,2,6,5)/(B,C,6,17)/(B,C,9,33)`` → per-electrode frontend features
+        ``(B, C, 38, d)`` (the teacher's full-input output; M2/M4 targets read it)."""
+        tok = self.tokenizer(slow, beta, hg)                     # (B, C, 38, d)
+        B, C, S, d = tok.shape
+        tok = tok + self.freq_embed[self.tokenizer.freq_global_id]  # + (38, d)
+        rope = self.key_rope[:, self.tokenizer.time_slot, :]     # (2, 38, head_dim)
+        x = tok.reshape(B * C, S, d)
+        for blk in self.blocks:
+            x = blk(x, rope)
+        return self.ln_out(x).reshape(B, C, S, d)

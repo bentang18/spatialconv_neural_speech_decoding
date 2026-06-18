@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from speech_decoding.models import v14_converged as vc
+from speech_decoding.models.v14_encoder import _apply_rope
 
 
 # ----------------------------------------------------------- band geometry
@@ -228,3 +229,103 @@ def test_electrode_tube_mask_whole_parcel_together() -> None:
 def test_electrode_tube_mask_empty_tube() -> None:
     pe = torch.tensor([0, 1, 2])
     assert not vc.electrode_tube_mask(pe, torch.tensor([], dtype=torch.long)).any()
+
+
+# ====================================================== FrontendEncoder (Stage 1)
+def _rotate_at_slot(key_rope: torch.Tensor, slot: int, vec: torch.Tensor) -> torch.Tensor:
+    """Rotate one head-dim vector by the encoder's RoPE at ``slot`` (T=1 gather)."""
+    rope_slot = key_rope[:, slot : slot + 1, :]          # (2, 1, head_dim)
+    return _apply_rope(vec.reshape(1, -1), rope_slot).reshape(-1)
+
+
+def test_frontend_encoder_output_shape() -> None:
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=2).eval()
+    out = fe(*_fake_bands(2, 5))
+    assert out.shape == (2, 5, 38, 32)
+
+
+def test_frontend_encoder_rope_table_spans_the_clip() -> None:
+    # The shared clock is the HG stride; 16 slots (0..15) span the full 1 s clip.
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1)
+    assert fe.key_rope.shape == (2, 16, 8)               # (cos/sin, n_slots, head_dim)
+    assert int(fe.tokenizer.time_slot.max()) == 15
+
+
+def test_frontend_rope_relative_position_is_band_agnostic() -> None:
+    # THE multirate rigor proof. RoPE's relative-position identity:
+    # ⟨R_a q, R_b k⟩ depends ONLY on the slot difference (b−a). The slots are
+    # physical-time indices on the ONE shared 62.5 ms (HG-stride) grid, so a
+    # token-pair separated by the same real time gets the same rotated inner
+    # product NO MATTER which band each token lives in. Verify a fixed q,k pair
+    # at three different absolute slot positions but the same gap of 8:
+    #   gap 8 = 8 × 62.5 ms = 0.5 s — e.g. slow tp0→tp1, beta tp0→tp4, HG tp0→tp8.
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1)
+    kr = fe.key_rope
+    torch.manual_seed(0)
+    q = torch.randn(8)
+    k = torch.randn(8)
+
+    def ip(a: int, b: int) -> float:
+        return torch.dot(_rotate_at_slot(kr, a, q), _rotate_at_slot(kr, b, k)).item()
+
+    base = ip(0, 8)
+    assert abs(ip(4, 12) - base) < 1e-5    # same gap, shifted absolute position
+    assert abs(ip(7, 15) - base) < 1e-5
+    # A different gap gives a different inner product (rotation is real, not a no-op).
+    assert abs(ip(0, 4) - base) > 1e-3
+
+
+def test_frontend_same_physical_time_tokens_share_rope() -> None:
+    # The cross-band consequence: every token landing on physical-time slot 8
+    # (slow tp1, beta tp4, HG tp8) gets the IDENTICAL rope row — so the encoder
+    # treats them as the same time, which is the whole point of the shared clock.
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1)
+    rope = fe.key_rope[:, fe.tokenizer.time_slot, :]     # (2, 38, head_dim)
+    slot8 = (fe.tokenizer.time_slot == 8).nonzero().flatten()
+    bands_at_slot8 = set(fe.tokenizer.band_id[slot8].tolist())
+    assert bands_at_slot8 == {0, 1, 2}, "all three bands must reach physical slot 8"
+    ref = rope[:, slot8[0]]
+    for i in slot8[1:]:
+        assert torch.allclose(rope[:, i], ref), "same physical time ⇒ same rotation"
+
+
+def test_frontend_electrode_isolation_through_transformer() -> None:
+    # Stage-1 contract survives the self-attention stack: permuting electrodes
+    # permutes outputs (electrodes never attend to each other).
+    torch.manual_seed(0)
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=2).eval()
+    slow, beta, hg = _fake_bands(2, 6)
+    perm = torch.tensor([5, 2, 0, 4, 1, 3])
+    with torch.no_grad():
+        base = fe(slow, beta, hg)
+        permed = fe(slow[:, perm], beta[:, perm], hg[:, perm])
+    assert torch.allclose(permed, base[:, perm], atol=1e-5)
+
+
+def test_frontend_learned_freq_tag_is_a_used_parameter() -> None:
+    # freq_pos="learned" ⇒ a trainable (6, d) table that actually moves the output.
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1).eval()
+    assert isinstance(fe.freq_embed, torch.nn.Parameter)
+    assert fe.freq_embed.shape == (6, 32)
+    slow, beta, hg = _fake_bands(1, 3)
+    with torch.no_grad():
+        base = fe(slow, beta, hg)
+        fe.freq_embed.add_(1.0)                          # perturb the freq tag
+        moved = fe(slow, beta, hg)
+    assert not torch.allclose(moved, base)
+
+
+def test_frontend_sinusoidal_freq_tag_is_a_buffer() -> None:
+    fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1, freq_pos="sinusoidal")
+    assert not isinstance(fe.freq_embed, torch.nn.Parameter)
+    assert "freq_embed" in dict(fe.named_buffers())
+    assert fe.freq_embed.shape == (6, 32)
+
+
+def test_frontend_construction_guards() -> None:
+    with pytest.raises(ValueError, match="not divisible"):
+        vc.FrontendEncoder(d_model=30, n_heads=4, n_layers=1)
+    with pytest.raises(ValueError, match="even head_dim"):
+        vc.FrontendEncoder(d_model=12, n_heads=4, n_layers=1)  # head_dim 3 = odd
+    with pytest.raises(ValueError, match="freq_pos"):
+        vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=1, freq_pos="bogus")
