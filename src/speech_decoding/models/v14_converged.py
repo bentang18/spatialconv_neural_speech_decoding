@@ -23,6 +23,7 @@ the FE §1 reference grid). NB the freq-pos memo's "8/4/1" multipliers are stale
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 
 import torch
@@ -384,16 +385,30 @@ class FrontendEncoder(nn.Module):
         )
         self.ln_out = nn.LayerNorm(d_model)
 
-    def forward(self, slow: Tensor, beta: Tensor, hg: Tensor) -> Tensor:
+    def forward(
+        self,
+        slow: Tensor,
+        beta: Tensor,
+        hg: Tensor,
+        *,
+        key_mask: Tensor | None = None,
+    ) -> Tensor:
         """``(B,C,2,6,5)/(B,C,6,17)/(B,C,9,33)`` → per-electrode frontend features
-        ``(B, C, 38, d)`` (the teacher's full-input output; M2/M4 targets read it)."""
+        ``(B, C, 38, d)``.
+
+        ``key_mask``: optional ``(B, C, 38)`` bool, ``True`` = a token that may be
+        attended (the paradigm-B M2 visibility mask for the STUDENT; the teacher
+        passes ``None`` = full input). Masked tokens never serve as keys, so the
+        visible tokens' features are leakage-free — identical to physically
+        dropping the masked tokens, but batchable."""
         tok = self.tokenizer(slow, beta, hg)                     # (B, C, 38, d)
         B, C, S, d = tok.shape
         tok = tok + self.freq_embed[self.tokenizer.freq_global_id]  # + (38, d)
         rope = self.key_rope[:, self.tokenizer.time_slot, :]     # (2, 38, head_dim)
         x = tok.reshape(B * C, S, d)
+        km = None if key_mask is None else key_mask.reshape(B * C, S)
         for blk in self.blocks:
-            x = blk(x, rope)
+            x = blk(x, rope, km)
         return self.ln_out(x).reshape(B, C, S, d)
 
 
@@ -461,21 +476,28 @@ class LatentEncoder(nn.Module):
         parcel_per_electrode: Tensor,
         *,
         electrode_mask: Tensor | None = None,
+        token_mask: Tensor | None = None,
     ) -> Tensor:
         """Cross-electrode latent over the frontend features.
 
         ``feats``: ``(B, C, 38, d)`` per-electrode frontend features.
         ``parcel_per_electrode``: ``(B, C)`` long — each electrode's DK parcel id.
         ``electrode_mask``: ``(B, C)`` bool, ``True`` = real electrode (ragged
-        padding); ``None`` ⇒ all real. Output: ``(B, C, 38, d)`` (electrode-token
-        granularity preserved)."""
+        padding); broadcast to all 38 tokens.
+        ``token_mask``: ``(B, C, 38)`` bool, ``True`` = visible key — the finer
+        per-token mask the STUDENT uses (drop tubed electrodes AND the un-tubed
+        electrodes' M2-masked tokens, converged Q2). Takes precedence over
+        ``electrode_mask``; ``None`` for both ⇒ full attention. Output:
+        ``(B, C, 38, d)`` (electrode-token granularity preserved)."""
         B, C, S, d = feats.shape
         # Frontend→latent bridge: + parcel-tag (broadcast across the 38 tokens).
         x = feats + self.parcel_embed(parcel_per_electrode)[:, :, None, :]
         x = x.reshape(B, C * S, d)                                 # all-pairs token set
         rope = self.key_rope[:, self.time_slot.repeat(C), :]       # (2, C·38, head_dim)
         key_mask: Tensor | None = None
-        if electrode_mask is not None:
+        if token_mask is not None:
+            key_mask = token_mask.reshape(B, C * S)
+        elif electrode_mask is not None:
             key_mask = electrode_mask[:, :, None].expand(B, C, S).reshape(B, C * S)
         for blk in self.blocks:
             x = blk(x, rope, key_mask)
@@ -766,3 +788,252 @@ class ParcelReadout(nn.Module):
             membership = membership & token_valid[:, None, :]      # (B, K, C·38)
         seed = self.seed[None].expand(B, self.n_parcels, d)        # (B, K, d)
         return self.pool(seed, tokens, membership)                 # (B, K, d)
+
+
+def _padded_true_indices(mask: Tensor, max_m: int) -> tuple[Tensor, Tensor]:
+    """Per-row True-position gather for ragged masks.
+
+    ``mask`` ``(B', S)`` bool → ``(idx (B', max_m), valid (B', max_m))`` where
+    ``idx[r]`` lists the column indices where ``mask[r]`` is True (in original
+    order), right-padded to ``max_m`` (pad value 0), and ``valid`` flags the real
+    entries. Vectorized: a stable descending argsort floats the True columns to
+    the front; ``valid`` is ``rank < row_count``."""
+    order = torch.argsort(mask.to(torch.int8), dim=1, descending=True, stable=True)
+    idx = order[:, :max_m]
+    counts = mask.sum(dim=1)                                       # (B',)
+    ranks = torch.arange(max_m, device=mask.device)
+    valid = ranks[None, :] < counts[:, None]
+    return idx, valid & mask.any(dim=1, keepdim=True)
+
+
+class V14ConvergedSSL(nn.Module):
+    """The converged v14 SSL forward — ONE student pass, TWO heads, EMA teacher.
+
+    Wires [[project_v14_converged_arch_2026_06_17]] +
+    [[project_v14_m2_m4_predictor_scopes_2026_06_18]] into a single loss module:
+
+    * **Teacher = frontend-ONLY** (EMA of the student frontend; halts after the
+      frontend — never builds the parcel-embed or runs the latent, the single
+      biggest compute saving since BOTH targets are post-frontend). No grad.
+    * **Student = one pass.** frontend(visible, M2 key-masked) → +parcel-tag →
+      latent(visible un-tubed, M2-masked-also-hidden). slow is M2-EXEMPT, so
+      every electrode keeps ≥6 visible frontend tokens (no all-masked NaN).
+    * **M2 head** (frontend JEPA): per un-tubed electrode, predict its own masked
+      frontend tokens from its own visible (isolated). Target = stop-grad teacher
+      frontend features there.
+    * **M4 head** (latent parcel JEPA): predict each tubed parcel's electrode-MEAN
+      teacher-frontend grid from ALL visible un-tubed latent tokens. Target =
+      ``parcel_electrode_mean`` of the stop-grad teacher.
+
+    Both paradigm-B own-predictor, pure L1. Leakage-free by construction (visible
+    tokens never attend masked/tubed tokens). The masks are sampled outside (see
+    ``sample_ssl_masks``) and passed in, so the forward is deterministic/testable.
+
+    Compute note: this batched form key-MASKS the masked/tubed tokens rather than
+    physically dropping them (correctness-identical paradigm-B; the used visible
+    features match a physical drop). Reclaiming the ~2× by ragged token-drop is a
+    perf optimization over this correct baseline, to land in DCC run-prep."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_parcels: int,
+        *,
+        n_heads: int,
+        frontend_layers: int,
+        latent_layers: int,
+        m2_pred_dim: int,
+        m2_pred_layers: int,
+        m4_pred_dim: int,
+        m4_pred_layers: int,
+        lambda_m2: float = 1.0,
+        lambda_m4: float = 1.0,
+        freq_pos: str = "learned",
+        bands: tuple[BandSpec, ...] = BANDS,
+    ) -> None:
+        super().__init__()
+        self.lambda_m2 = float(lambda_m2)
+        self.lambda_m4 = float(lambda_m4)
+        self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 38
+
+        self.student_frontend = FrontendEncoder(
+            d_model, n_heads, frontend_layers, freq_pos=freq_pos, bands=bands
+        )
+        # Teacher = EMA shadow of the student frontend ONLY (no latent). Cloned so
+        # init matches exactly; never optimizer-trained.
+        self.teacher_frontend = copy.deepcopy(self.student_frontend)
+        for p in self.teacher_frontend.parameters():
+            p.requires_grad_(False)
+
+        self.latent = LatentEncoder(d_model, n_heads, latent_layers, n_parcels, bands=bands)
+        self.m2_predictor = M2Predictor(
+            d_model, m2_pred_dim, n_heads, m2_pred_layers, freq_pos=freq_pos, bands=bands
+        )
+        self.m4_predictor = M4Predictor(
+            d_model, m4_pred_dim, n_heads, m4_pred_layers, n_parcels,
+            freq_pos=freq_pos, bands=bands,
+        )
+        _, freq_global_id, time_slot = token_metadata(bands)
+        self.register_buffer("freq_global_id", freq_global_id, persistent=False)
+        self.register_buffer("time_slot", time_slot, persistent=False)
+
+    @torch.no_grad()
+    def update_teacher(self, tau: float) -> None:
+        """EMA: ``teacher ← τ·teacher + (1−τ)·student`` (frontend only)."""
+        for t, s in zip(self.teacher_frontend.parameters(),
+                        self.student_frontend.parameters()):
+            t.mul_(tau).add_(s.detach(), alpha=1.0 - tau)
+        for t, s in zip(self.teacher_frontend.buffers(),
+                        self.student_frontend.buffers()):
+            t.copy_(s)
+
+    def forward(
+        self,
+        slow: Tensor,
+        beta: Tensor,
+        hg: Tensor,
+        parcel_per_electrode: Tensor,
+        electrode_mask: Tensor,
+        m2_mask: Tensor,
+        tube_mask: Tensor,
+        tubed_parcels: Tensor,
+        tubed_parcel_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        """Run the one-pass two-head forward; return ``{loss, l_m2, l_m4}``.
+
+        Shapes — ``slow (B,C,2,6,5)`` / ``beta (B,C,6,17)`` / ``hg (B,C,9,33)``;
+        ``parcel_per_electrode (B,C)`` long; ``electrode_mask (B,C)`` bool real;
+        ``m2_mask (B,C,38)`` bool (True = M2 target, only on un-tubed electrodes);
+        ``tube_mask (B,C)`` bool (electrode in a tubed parcel); ``tubed_parcels
+        (B,P)`` long + ``tubed_parcel_mask (B,P)`` bool (real tubed parcels)."""
+        # ---- teacher: frontend-only, full input, stop-grad ------------------
+        with torch.no_grad():
+            t_f = self.teacher_frontend(slow, beta, hg)            # (B,C,38,d)
+        t_f = t_f.detach()
+
+        # ---- student: one pass, M2-key-masked frontend then latent ----------
+        student_vis = ~m2_mask                                     # (B,C,38) visible
+        s_f = self.student_frontend(slow, beta, hg, key_mask=student_vis)
+        latent_vis = (
+            electrode_mask[:, :, None] & (~tube_mask)[:, :, None] & student_vis
+        )                                                          # (B,C,38)
+        s_l = self.latent(s_f, parcel_per_electrode, token_mask=latent_vis)
+
+        l_m2 = self._m2_loss(s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
+        l_m4 = self._m4_loss(
+            s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
+            tubed_parcels, tubed_parcel_mask,
+        )
+        loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
+        return {"loss": loss, "l_m2": l_m2, "l_m4": l_m4}
+
+    # --------------------------------------------------------------- M2 head
+    def _m2_loss(
+        self, s_f: Tensor, t_f: Tensor, m2_mask: Tensor, student_vis: Tensor,
+        electrode_mask: Tensor, tube_mask: Tensor,
+    ) -> Tensor:
+        B, C, S, d = s_f.shape
+        elec = B * C
+        m2_flat = m2_mask.reshape(elec, S)
+        max_m = int(m2_flat.sum(dim=1).max().item())
+        # un-tubed real electrodes that actually carry an M2 target
+        elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & (m2_flat.any(dim=1))
+        if max_m == 0 or not bool(elec_ok.any()):
+            return s_f.new_zeros(())
+
+        qidx, qvalid = _padded_true_indices(m2_flat, max_m)        # (elec, max_m)
+        qvalid = qvalid & elec_ok[:, None]
+        ctx = s_f.reshape(elec, S, d)
+        ctx_slot = self.time_slot[None, :].expand(elec, S)
+        q_freq = self.freq_global_id[qidx]                         # (elec, max_m)
+        q_slot = self.time_slot[qidx]
+        pred = self.m2_predictor(
+            ctx, ctx_slot, q_freq, q_slot,
+            ctx_mask=student_vis.reshape(elec, S), query_mask=qvalid,
+        )                                                          # (elec, max_m, d)
+        tgt = torch.gather(
+            t_f.reshape(elec, S, d), 1, qidx[:, :, None].expand(elec, max_m, d)
+        )
+        return _masked_l1(pred, tgt, qvalid)
+
+    # --------------------------------------------------------------- M4 head
+    def _m4_loss(
+        self, s_l: Tensor, t_f: Tensor, parcel_per_electrode: Tensor,
+        electrode_mask: Tensor, latent_vis: Tensor,
+        tubed_parcels: Tensor, tubed_parcel_mask: Tensor,
+    ) -> Tensor:
+        B, C, S, d = s_l.shape
+        if not bool(tubed_parcel_mask.any()):
+            return s_l.new_zeros(())
+
+        ctx = s_l.reshape(B, C * S, d)
+        ctx_slot = self.time_slot.repeat(C)                        # (C·38,)
+        pred = self.m4_predictor(
+            ctx, ctx_slot, tubed_parcels.clamp_min(0),
+            key_mask=latent_vis.reshape(B, C * S),
+        )                                                          # (B, P, 38, d)
+
+        # teacher electrode-MEAN target over each tubed parcel (padded elec → -1)
+        pe = torch.where(electrode_mask, parcel_per_electrode,
+                         torch.full_like(parcel_per_electrode, -1))
+        member = (tubed_parcels[:, :, None] == pe[:, None, :]).to(t_f.dtype)  # (B,P,C)
+        counts = member.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        tgt = (member @ t_f.reshape(B, C, S * d)) / counts          # (B,P,S·d)
+        tgt = tgt.reshape(B, -1, S, d).detach()
+        cell_valid = tubed_parcel_mask[:, :, None, None].expand_as(pred)
+        return _masked_l1(pred, tgt, cell_valid)
+
+
+def _masked_l1(pred: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    """Mean L1 over the ``valid`` entries; 0 if none. ``valid`` is broadcast over
+    any trailing feature dims, so the mean is per-element over (valid cells × d)."""
+    diff = (pred - target).abs()
+    v = valid.to(diff.dtype)
+    while v.dim() < diff.dim():
+        v = v.unsqueeze(-1)
+    v = v.expand_as(diff)
+    denom = v.sum().clamp_min(1.0)
+    return (diff * v).sum() / denom
+
+
+def sample_ssl_masks(
+    parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    generator: torch.Generator,
+    *,
+    m2_cfg: M2MaskConfig = M2MaskConfig(),
+    m4_cfg: M4MaskConfig = M4MaskConfig(),
+) -> dict[str, Tensor]:
+    """Compose the per-clip mask draws for a batch (the data-path bridge).
+
+    Returns ``m2_mask (B,C,38)`` / ``tube_mask (B,C)`` / ``tubed_parcels (B,Pmax)``
+    / ``tubed_parcel_mask (B,Pmax)``. Per sample: tube whole parcels (M4), then
+    draw an M2 within-electrode mask for every un-tubed real electrode. Tubed and
+    padded electrodes get no M2 target. ``Pmax`` is the batch-max tubed count."""
+    B, C = parcel_per_electrode.shape
+    S = N_TOKENS
+    m2 = torch.zeros(B, C, S, dtype=torch.bool)
+    tube = torch.zeros(B, C, dtype=torch.bool)
+    tubed_lists: list[Tensor] = []
+    for b in range(B):
+        real = electrode_mask[b]
+        present = parcel_per_electrode[b][real].unique()
+        tubed = sample_parcel_tube(present, generator, m4_cfg)
+        tubed_lists.append(tubed)
+        tb = electrode_tube_mask(parcel_per_electrode[b], tubed) & real
+        tube[b] = tb
+        for e in range(C):
+            if real[e] and not tb[e]:
+                m2[b, e] = sample_m2_mask(generator, cfg=m2_cfg)
+    pmax = max(1, max(t.numel() for t in tubed_lists))
+    tubed_parcels = torch.zeros(B, pmax, dtype=torch.long)
+    tubed_parcel_mask = torch.zeros(B, pmax, dtype=torch.bool)
+    for b, t in enumerate(tubed_lists):
+        tubed_parcels[b, : t.numel()] = t
+        tubed_parcel_mask[b, : t.numel()] = True
+    return {
+        "m2_mask": m2,
+        "tube_mask": tube,
+        "tubed_parcels": tubed_parcels,
+        "tubed_parcel_mask": tubed_parcel_mask,
+    }

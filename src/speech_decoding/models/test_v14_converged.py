@@ -741,3 +741,155 @@ def test_parcel_readout_no_support_bias_param() -> None:
     names = {n for n, _ in ro.named_parameters()}
     assert not any("support" in n.lower() or "bias_anat" in n.lower()
                    or "dist" in n.lower() for n in names), names
+
+
+# ============================================ V14ConvergedSSL (integration)
+def _ssl_model(**kw):
+    base = dict(d_model=32, n_parcels=12, n_heads=4, frontend_layers=2,
+                latent_layers=2, m2_pred_dim=16, m2_pred_layers=2,
+                m4_pred_dim=16, m4_pred_layers=2)
+    base.update(kw)
+    return vc.V14ConvergedSSL(**base)
+
+
+def _ssl_batch(B: int = 2, C: int = 6, seed: int = 0):
+    g = torch.Generator().manual_seed(seed)
+    slow = torch.randn(B, C, 2, 6, 5, generator=g)
+    beta = torch.randn(B, C, 6, 17, generator=g)
+    hg = torch.randn(B, C, 9, 33, generator=g)
+    # parcels chosen so each clip has several parcels (M4 has a target + context)
+    pe = torch.randint(0, 5, (B, C), generator=g)
+    emask = torch.ones(B, C, dtype=torch.bool)
+    masks = vc.sample_ssl_masks(pe, emask, g)
+    return slow, beta, hg, pe, emask, masks
+
+
+def _run(model, batch):
+    slow, beta, hg, pe, emask, m = batch
+    return model(slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
+                 m["tubed_parcels"], m["tubed_parcel_mask"])
+
+
+def test_ssl_forward_returns_finite_nonneg_losses() -> None:
+    model = _ssl_model().eval()
+    out = _run(model, _ssl_batch())
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.isfinite(out[k]).all(), f"{k} not finite"
+        assert out[k].item() >= 0.0
+    assert out["loss"].item() > 0.0       # both heads active on this batch
+
+
+def test_ssl_teacher_is_frontend_only() -> None:
+    # The teacher halts after the frontend — no latent, no predictors, no parcel
+    # embed. Its param count equals a standalone FrontendEncoder's.
+    model = _ssl_model()
+    assert not hasattr(model.teacher_frontend, "latent")
+    fe = vc.FrontendEncoder(32, 4, 2)
+    n_teacher = sum(p.numel() for p in model.teacher_frontend.parameters())
+    n_fe = sum(p.numel() for p in fe.parameters())
+    assert n_teacher == n_fe
+
+
+def test_ssl_gradient_flows_to_student_not_teacher() -> None:
+    model = _ssl_model().train()
+    out = _run(model, _ssl_batch())
+    out["loss"].backward()
+    s_grad = [p.grad is not None for p in model.student_frontend.parameters()]
+    assert any(s_grad), "student frontend got no gradient"
+    assert all(p.grad is None for p in model.teacher_frontend.parameters()), \
+        "teacher must be grad-free (EMA only)"
+    # both predictors and the latent train too
+    assert any(p.grad is not None for p in model.m2_predictor.parameters())
+    assert any(p.grad is not None for p in model.m4_predictor.parameters())
+    assert any(p.grad is not None for p in model.latent.parameters())
+
+
+def test_ssl_ema_update_moves_teacher_toward_student() -> None:
+    model = _ssl_model()
+    # perturb the student so they differ
+    with torch.no_grad():
+        for p in model.student_frontend.parameters():
+            p.add_(torch.randn_like(p))
+    before = [t.clone() for t in model.teacher_frontend.parameters()]
+    model.update_teacher(tau=0.9)
+    moved = False
+    for t0, t1, s in zip(before, model.teacher_frontend.parameters(),
+                         model.student_frontend.parameters()):
+        # τ=0.9 EMA: teacher must move 10% toward student
+        expected = 0.9 * t0 + 0.1 * s
+        assert torch.allclose(t1, expected, atol=1e-6)
+        if not torch.allclose(t1, t0):
+            moved = True
+    assert moved
+
+
+def test_ssl_lambda_gates_each_head() -> None:
+    batch = _ssl_batch()
+    m4_only = _ssl_model(lambda_m2=0.0, lambda_m4=1.0).eval()
+    o = _run(m4_only, batch)
+    assert torch.allclose(o["loss"], o["l_m4"])           # M2 gated out
+    m2_only = _ssl_model(lambda_m2=1.0, lambda_m4=0.0).eval()
+    o2 = _run(m2_only, batch)
+    assert torch.allclose(o2["loss"], o2["l_m2"])         # M4 gated out
+
+
+def test_ssl_no_tube_zeroes_m4_no_mask_zeroes_m2() -> None:
+    slow, beta, hg, pe, emask, m = _ssl_batch()
+    # no tubed parcels → M4 has nothing to predict
+    no_tube = dict(m)
+    no_tube["tube_mask"] = torch.zeros_like(m["tube_mask"])
+    no_tube["tubed_parcel_mask"] = torch.zeros_like(m["tubed_parcel_mask"])
+    model = _ssl_model().eval()
+    o = model(slow, beta, hg, pe, emask, m["m2_mask"], no_tube["tube_mask"],
+              m["tubed_parcels"], no_tube["tubed_parcel_mask"])
+    assert o["l_m4"].item() == 0.0
+    # no M2 mask → M2 has nothing to predict
+    o2 = model(slow, beta, hg, pe, emask, torch.zeros_like(m["m2_mask"]),
+               m["tube_mask"], m["tubed_parcels"], m["tubed_parcel_mask"])
+    assert o2["l_m2"].item() == 0.0
+
+
+def test_ssl_overfits_one_batch() -> None:
+    # The whole pipeline trains: a few steps on ONE batch drive the loss down
+    # (CLAUDE.md overfit-one-batch sanity — proves grads connect end to end).
+    torch.manual_seed(0)
+    model = _ssl_model().train()
+    batch = _ssl_batch(seed=1)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    first = _run(model, batch)["loss"].item()
+    for _ in range(40):
+        opt.zero_grad()
+        loss = _run(model, batch)["loss"]
+        loss.backward()
+        opt.step()
+        model.update_teacher(tau=0.99)
+    last = _run(model, batch)["loss"].item()
+    assert last < 0.6 * first, f"no overfit: {first:.4f} -> {last:.4f}"
+
+
+# ----------------------------------------------------- sample_ssl_masks helper
+def test_sample_ssl_masks_shapes_and_invariants() -> None:
+    g = torch.Generator().manual_seed(3)
+    pe = torch.randint(0, 6, (2, 8), generator=g)
+    emask = torch.ones(2, 8, dtype=torch.bool)
+    m = vc.sample_ssl_masks(pe, emask, g)
+    assert m["m2_mask"].shape == (2, 8, 38)
+    assert m["tube_mask"].shape == (2, 8)
+    # slow tokens (0..5) are never M2-masked (exempt)
+    assert not m["m2_mask"][:, :, :6].any()
+    # tubed electrodes carry no M2 target
+    assert not m["m2_mask"][m["tube_mask"]].any()
+    # tubed parcels are present in the montage
+    for b in range(2):
+        for p, ok in zip(m["tubed_parcels"][b], m["tubed_parcel_mask"][b]):
+            if ok:
+                assert (pe[b] == p).any()
+
+
+def test_sample_ssl_masks_padded_electrodes_get_no_mask() -> None:
+    g = torch.Generator().manual_seed(4)
+    pe = torch.randint(0, 6, (1, 6), generator=g)
+    emask = torch.tensor([[True, True, True, True, False, False]])
+    m = vc.sample_ssl_masks(pe, emask, g)
+    assert not m["m2_mask"][0, 4:].any()      # padded electrodes never masked
+    assert not m["tube_mask"][0, 4:].any()
