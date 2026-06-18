@@ -124,16 +124,16 @@ class V14ConvergedBrainModule(pl.LightningModule):
     def _log_losses(
         self, out: dict[str, Tensor], name: str, *, on_step: bool, on_epoch: bool,
     ) -> None:
-        # loss + the two head scalars on the prog bar; per-band diagnostics logged
-        # for post-hoc monitoring (which band the SSL is/ isn't learning).
-        keys = (
-            "loss", "l_m2", "l_m4",
-            "l_m2_beta", "l_m2_hg",
-            "l_m4_slow", "l_m4_beta", "l_m4_hg",
-        )
-        for key in keys:
+        """Log every scalar the forward emits: loss + the two head scalars, the
+        per-band/aggregate monitor diagnostics (loss / explained_var / target_var
+        per band {slow,beta,hg}), and the per-band stem-output norms. Non-finite
+        scalars are skipped — ev/tv are NaN when a band has < 2 scored cells this
+        step, and an undefined-variance step must not poison the epoch mean."""
+        for key, val in out.items():
+            if val.dim() != 0 or not bool(torch.isfinite(val)):
+                continue
             self.log(
-                f"{name}_{key}", out[key],
+                f"{name}_{key}", val,
                 on_step=on_step, on_epoch=on_epoch,
                 prog_bar=(key == "loss"),
             )

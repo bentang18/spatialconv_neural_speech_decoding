@@ -1294,20 +1294,171 @@ def test_m4_precision_n_ref_controls_strictness() -> None:
     assert l_strict < l_off          # n_ref=11 genuinely down-weights this montage
 
 
-# ================================ per-band M2/M4 loss diagnostics (Ben 06-18) ===
-def test_per_band_l1_helper_isolates_each_band() -> None:
+# ============= per-band M2/M4 loss + explained_var/target_var monitor (Ben 06-18)
+def test_jepa_stats_on_cells_matches_hand_computed() -> None:
+    # The monitor stat (loss / explained_var / target_var) must match the canonical
+    # masked_jepa L1 definition to the digit. d=1, 4 valid cells, pred=0:
+    #   loss = mean|0-t| = (0+1+2+3)/4 = 1.5
+    #   target_var = Var(t)|unbiased=False = mean((t-1.5)^2) = 1.25
+    #   explained_var = 1 - loss/Var(t) = 1 - 1.5/1.25 = -0.2
+    pred = torch.zeros(4, 1)
+    tgt = torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+    valid = torch.ones(4, dtype=torch.bool)
+    loss, ev, tv = vc._jepa_stats_on_cells(pred, tgt, valid)
+    assert loss.item() == pytest.approx(1.5)
+    assert tv.item() == pytest.approx(1.25)
+    assert ev.item() == pytest.approx(-0.2, abs=1e-5)
+
+
+def test_jepa_stats_target_var_is_mean_over_feature_dims() -> None:
+    # d=2: target_var is the MEAN over feature dims of each dim's variance, NOT the
+    # sum. col0=[0,2,4] Var=8/3; col1=[0,0,0] Var=0 ⇒ tv=(8/3+0)/2=4/3.
+    # explained_var uses Var over ALL elements: t=[0,0,2,0,4,0] mean=1 Var=14/6;
+    # loss=(0+0+2+0+4+0)/6=1 ⇒ ev = 1 - 1/(14/6) = 1 - 3/7 = 4/7.
+    pred = torch.zeros(3, 2)
+    tgt = torch.tensor([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]])
+    valid = torch.ones(3, dtype=torch.bool)
+    loss, ev, tv = vc._jepa_stats_on_cells(pred, tgt, valid)
+    assert loss.item() == pytest.approx(1.0)
+    assert tv.item() == pytest.approx(4.0 / 3.0)
+    assert ev.item() == pytest.approx(4.0 / 7.0, abs=1e-5)
+
+
+def test_jepa_stats_nan_below_two_cells() -> None:
+    # variance is undefined with < 2 scored cells → ev/tv NaN (logger skips them);
+    # with 0 cells the loss is a graph-free 0 (no targets this step).
+    pred = torch.zeros(4, 1)
+    tgt = torch.ones(4, 1)
+    one = torch.tensor([True, False, False, False])
+    loss, ev, tv = vc._jepa_stats_on_cells(pred, tgt, one)
+    assert loss.item() == pytest.approx(1.0)           # 1 cell → loss defined
+    assert torch.isnan(ev) and torch.isnan(tv)         # variance undefined
+    zero = torch.zeros(4, dtype=torch.bool)
+    loss0, ev0, tv0 = vc._jepa_stats_on_cells(pred, tgt, zero)
+    assert loss0.item() == 0.0 and not loss0.requires_grad
+    assert torch.isnan(ev0) and torch.isnan(tv0)
+
+
+def test_band_diagnostics_isolates_each_band_loss() -> None:
     # Craft a (rows, queries, d) set where beta cells are perfect and hg cells err
-    # by 1 ⇒ the per-band raw L1 separates them exactly.
+    # by 1 ⇒ the per-band raw L1 separates them exactly (regression: the per-band
+    # loss is unchanged by the ev/tv refactor).
     d = 3
     pred = torch.zeros(2, 4, d)
     tgt = torch.zeros(2, 4, d)
     band = torch.tensor([[1, 1, 2, 2], [1, 2, 1, 2]])     # 1=beta, 2=hg
     valid = torch.ones(2, 4, dtype=torch.bool)
     tgt[band == 2] = 1.0                                   # hg cells |err|=1
-    out = vc._per_band_l1(pred, tgt, valid, band, vc._M2_BAND_IDS)
-    assert out["beta"].item() == 0.0
-    assert out["hg"].item() == pytest.approx(1.0)
-    assert not out["hg"].requires_grad                    # detached diagnostic
+    out = vc._band_diagnostics(pred, tgt, valid, band, vc._M2_BAND_IDS, "m2")
+    assert out["l_m2_beta"].item() == 0.0
+    assert out["l_m2_hg"].item() == pytest.approx(1.0)
+    assert not out["l_m2_hg"].requires_grad               # detached diagnostic
+    # the ev/tv keys ride alongside the per-band loss (aggregate + per band)
+    for k in ("ev_m2", "tv_m2", "ev_m2_beta", "tv_m2_beta", "ev_m2_hg", "tv_m2_hg"):
+        assert k in out, f"missing {k}"
+        assert not out[k].requires_grad
+
+
+def test_band_diagnostics_per_band_ev_tv_match_subset_stats() -> None:
+    # Each per-band ev/tv must equal _jepa_stats_on_cells restricted to that band's
+    # cells — i.e. the band split is an exact restriction of the aggregate stat.
+    torch.manual_seed(3)
+    d = 4
+    pred = torch.randn(2, 5, d)
+    tgt = torch.randn(2, 5, d)
+    band = torch.tensor([[0, 1, 2, 1, 2], [2, 2, 1, 0, 1]])
+    valid = torch.ones(2, 5, dtype=torch.bool)
+    out = vc._band_diagnostics(pred, tgt, valid, band, vc._M4_BAND_IDS, "m4")
+    for name, bid in vc._M4_BAND_IDS:
+        bl, bev, btv = vc._jepa_stats_on_cells(pred, tgt, valid & (band == bid))
+        assert out[f"l_m4_{name}"].item() == pytest.approx(bl.item())
+        assert out[f"ev_m4_{name}"].item() == pytest.approx(bev.item())
+        assert out[f"tv_m4_{name}"].item() == pytest.approx(btv.item())
+
+
+def test_zero_bands_key_set_matches_band_diagnostics() -> None:
+    # The no-target early-return must emit the SAME key set as the live path so the
+    # forward dict keys are batch-stable (epoch aggregation needs stable keys).
+    ref = torch.zeros(())
+    for pairs, head in ((vc._M2_BAND_IDS, "m2"), (vc._M4_BAND_IDS, "m4")):
+        pred = torch.zeros(2, 3, 4)
+        tgt = torch.zeros(2, 3, 4)
+        band = torch.zeros(2, 3, dtype=torch.long)
+        valid = torch.ones(2, 3, dtype=torch.bool)
+        live = set(vc._band_diagnostics(pred, tgt, valid, band, pairs, head))
+        zeroed = set(vc._zero_bands(ref, pairs, head))
+        assert live == zeroed, (head, live ^ zeroed)
+
+
+def test_forward_emits_aggregate_and_per_band_ev_tv() -> None:
+    model = _ssl_model().eval()
+    out = _run(model, _ssl_batch(B=3, C=8, seed=2))
+    # aggregate ev/tv pool all bands → well-defined (finite); detached monitors.
+    for k in ("ev_m2", "tv_m2", "ev_m4", "tv_m4"):
+        assert k in out and not out[k].requires_grad
+        assert torch.isfinite(out[k])
+    assert out["tv_m2"].item() >= 0.0 and out["tv_m4"].item() >= 0.0
+    # per-band ev/tv keys are always present (NaN-or-finite, detached). A band with
+    # < 2 scored cells this step is NaN — that is valid, _log_losses drops it.
+    per_band = (
+        "ev_m2_beta", "tv_m2_beta", "ev_m2_hg", "tv_m2_hg",
+        "ev_m4_slow", "tv_m4_slow", "ev_m4_beta", "tv_m4_beta", "ev_m4_hg", "tv_m4_hg",
+    )
+    for k in per_band:
+        assert k in out, f"missing {k}"
+        assert not out[k].requires_grad
+        v = out[k]
+        assert torch.isnan(v) or torch.isfinite(v)
+
+
+def test_forward_emits_per_band_stem_norms() -> None:
+    model = _ssl_model().eval()
+    out = _run(model, _ssl_batch(B=3, C=8, seed=2))
+    for k in ("stem_norm_slow", "stem_norm_beta", "stem_norm_hg"):
+        assert k in out, f"missing {k}"
+        assert out[k].dim() == 0 and torch.isfinite(out[k]) and out[k].item() > 0.0
+        assert not out[k].requires_grad                   # detached monitor
+
+
+def test_stem_norm_matches_true_stem_output() -> None:
+    # Veracity: the reported stem_norm_{band} EQUALS the band stem's true mean
+    # per-token L2 norm — it is the magnitude that would dominate the latent.
+    torch.manual_seed(0)
+    tok = vc.ThreeBandTokenizer(d_model=16).eval()
+    slow, beta, hg = _fake_bands(2, 5)
+    with torch.no_grad():
+        tok(slow, beta, hg)
+        norms = tok.last_band_token_norm
+        for b, stem, x in zip(vc.BANDS, tok.stems, (slow, beta, hg)):
+            expected = stem(x).norm(dim=-1).mean()
+            assert torch.allclose(norms[b.name], expected, atol=1e-6)
+
+
+def test_stem_norm_catches_hot_stem() -> None:
+    # The contract Ben asked for: one stem running 10× hotter must show up as a 10×
+    # larger stem_norm for THAT band, with the others unchanged — nothing else
+    # currently catches a single stem dominating the additive latent.
+    class _Scale(torch.nn.Module):
+        def __init__(self, inner: torch.nn.Module, k: float) -> None:
+            super().__init__()
+            self.inner = inner
+            self.k = k
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.inner(x) * self.k
+
+    torch.manual_seed(0)
+    tok = vc.ThreeBandTokenizer(d_model=16).eval()
+    slow, beta, hg = _fake_bands(2, 5)
+    with torch.no_grad():
+        tok(slow, beta, hg)
+        base = {k: v.clone() for k, v in tok.last_band_token_norm.items()}
+        tok.stems[2] = _Scale(tok.stems[2], 10.0)          # hg = band index 2
+        tok(slow, beta, hg)
+        hot = tok.last_band_token_norm
+    assert hot["hg"].item() == pytest.approx(10.0 * base["hg"].item(), rel=1e-5)
+    assert hot["slow"].item() == pytest.approx(base["slow"].item(), rel=1e-6)
+    assert hot["beta"].item() == pytest.approx(base["beta"].item(), rel=1e-6)
 
 
 def test_forward_emits_per_band_diagnostics() -> None:

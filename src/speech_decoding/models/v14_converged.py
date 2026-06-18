@@ -311,9 +311,17 @@ class ThreeBandTokenizer(nn.Module):
         self.register_buffer("freq_global_id", freq_global_id, persistent=False)
         self.register_buffer("time_slot", time_slot, persistent=False)
 
+        # Per-band stem-output magnitude, stashed each forward for the monitor
+        # (Ben 2026-06-18): with three SEPARATE stems, one running 10× hotter would
+        # silently dominate the additive latent. Mean per-token L2 norm of each
+        # band's raw stem output (pre freq-tag, pre blocks); a plain detached dict,
+        # not state. {band_name: scalar}; populated by ``forward``.
+        self.last_band_token_norm: dict[str, Tensor] = {}
+
     def forward(self, slow: Tensor, beta: Tensor, hg: Tensor) -> Tensor:
         """``(B,C,2,6,5) / (B,C,6,17) / (B,C,9,33)`` → tokens ``(B,C,38,d)``."""
         per_band = []
+        band_norms: dict[str, Tensor] = {}
         for b, stem, x in zip(self.bands, self.stems, (slow, beta, hg)):
             # _PatchStem: (B,C,Cin,F,T) [2ch] or (B,C,F,T) [1ch] → (B,C,F_p,T_p,d).
             out = stem(x)                                   # (B, C, F_p, T_p, d)
@@ -324,7 +332,11 @@ class ThreeBandTokenizer(nn.Module):
                     f"expected ({b.n_freq_patches},{b.n_time_patches}); check the input "
                     f"({b.n_freq_bins},{b.n_time_frames}) bins/frames"
                 )
+            # Mean per-token L2 norm of this band's stem output — the magnitude that
+            # would dominate the latent if one stem runs hot. Detached (monitor only).
+            band_norms[b.name] = out.detach().norm(dim=-1).mean()
             per_band.append(out.reshape(B, C, F_p * T_p, d))  # (B, C, n_tok_b, d)
+        self.last_band_token_norm = band_norms
         return torch.cat(per_band, dim=2)                     # (B, C, 38, d)
 
 
@@ -1014,6 +1026,17 @@ class V14ConvergedSSL(nn.Module):
                         self.student_frontend.buffers()):
             t.copy_(s)
 
+    # ----------------------------------------------------------- monitor diagnostics
+    def _stem_norm_diag(self) -> dict[str, Tensor]:
+        """Per-band STUDENT stem-output norm (Ben 2026-06-18): one of the three
+        separate stems running hot would silently dominate the additive latent.
+        Read from the student tokenizer's stash, populated by the just-completed
+        student frontend pass. ``{stem_norm_slow, stem_norm_beta, stem_norm_hg}``."""
+        return {
+            f"stem_norm_{k}": v.detach()
+            for k, v in self.student_frontend.tokenizer.last_band_token_norm.items()
+        }
+
     # ----------------------------------------------------------- eval feature taps
     @torch.no_grad()
     def encode_frontend(self, slow: Tensor, beta: Tensor, hg: Tensor) -> Tensor:
@@ -1089,7 +1112,9 @@ class V14ConvergedSSL(nn.Module):
             tubed_parcels, tubed_parcel_mask,
         )
         loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
-        return _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
+        out = _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
+        out.update(self._stem_norm_diag())
+        return out
 
     def _forward_dense(
         self,
@@ -1125,7 +1150,9 @@ class V14ConvergedSSL(nn.Module):
             tubed_parcels, tubed_parcel_mask,
         )
         loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
-        return _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
+        out = _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
+        out.update(self._stem_norm_diag())
+        return out
 
     # --------------------------------------------------------------- M2 head
     def _m2_loss(
@@ -1139,7 +1166,7 @@ class V14ConvergedSSL(nn.Module):
         # un-tubed real electrodes that actually carry an M2 target
         elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & (m2_flat.any(dim=1))
         if max_m == 0 or not bool(elec_ok.any()):
-            return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS)
+            return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS, "m2")
 
         qidx, qvalid = _padded_true_indices(m2_flat, max_m)        # (elec, max_m)
         qvalid = qvalid & elec_ok[:, None]
@@ -1154,7 +1181,8 @@ class V14ConvergedSSL(nn.Module):
         tgt = torch.gather(
             t_f.reshape(elec, S, d), 1, qidx[:, :, None].expand(elec, max_m, d)
         )
-        bands = _per_band_l1(pred, tgt, qvalid, self.band_id[qidx], _M2_BAND_IDS)
+        bands = _band_diagnostics(
+            pred, tgt, qvalid, self.band_id[qidx], _M2_BAND_IDS, "m2")
         return _masked_l1(pred, tgt, qvalid), bands
 
     def _m2_loss_ragged(
@@ -1180,7 +1208,7 @@ class V14ConvergedSSL(nn.Module):
         vis_flat = student_vis.reshape(elec, S)
         elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & m2_flat.any(dim=1)
         if not bool(elec_ok.any()):
-            return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS)
+            return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS, "m2")
 
         e_idx = elec_ok.nonzero(as_tuple=False).squeeze(1)         # (R,) target elecs
         R = int(e_idx.numel())
@@ -1198,7 +1226,8 @@ class V14ConvergedSSL(nn.Module):
             ctx, ctx_slot, q_freq, q_slot, ctx_mask=c_real, query_mask=q_real,
         )                                                          # (R, Mq, d)
         tgt = torch.gather(tf, 1, q_idx.unsqueeze(-1).expand(R, Mq, d))
-        bands = _per_band_l1(pred, tgt, q_real, self.band_id[q_idx], _M2_BAND_IDS)
+        bands = _band_diagnostics(
+            pred, tgt, q_real, self.band_id[q_idx], _M2_BAND_IDS, "m2")
         return _masked_l1(pred, tgt, q_real), bands
 
     # --------------------------------------------------------------- M4 head
@@ -1209,7 +1238,7 @@ class V14ConvergedSSL(nn.Module):
     ) -> tuple[Tensor, dict[str, Tensor]]:
         B, C, S, d = s_l.shape
         if not bool(tubed_parcel_mask.any()):
-            return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS)
+            return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS, "m4")
 
         ctx = s_l.reshape(B, C * S, d)
         ctx_slot = self.time_slot.repeat(C)                        # (C·38,)
@@ -1227,8 +1256,9 @@ class V14ConvergedSSL(nn.Module):
         tgt = tgt.reshape(B, -1, S, d).detach()                     # (B,P,38,d)
         cell_valid = tubed_parcel_mask[:, :, None, None].expand_as(pred)
         weight = self._m4_weight(n_p, tubed_parcel_mask)           # (B,P) or None
-        bands = _per_band_l1(
-            pred, tgt, cell_valid, self.band_id.view(1, 1, S, 1), _M4_BAND_IDS)
+        bands = _band_diagnostics(
+            pred, tgt, cell_valid[..., 0], self.band_id.view(1, 1, S),
+            _M4_BAND_IDS, "m4")
         return _masked_l1(pred, tgt, cell_valid, weight=weight), bands
 
     def _m4_loss_ragged(
@@ -1249,7 +1279,7 @@ class V14ConvergedSSL(nn.Module):
         the tubed parcels' teacher frontend grid)."""
         B, C, S, d = s_l.shape
         if not bool(tubed_parcel_mask.any()):
-            return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS)
+            return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS, "m4")
 
         vis = latent_vis.reshape(B, C * S)
         c_idx, c_real, Nv = _ragged_gather_idx(vis)                # (B, Nv)
@@ -1270,8 +1300,9 @@ class V14ConvergedSSL(nn.Module):
         tgt = tgt.reshape(B, -1, S, d).detach()                     # (B,P,38,d)
         cell_valid = tubed_parcel_mask[:, :, None, None].expand_as(pred)
         weight = self._m4_weight(n_p, tubed_parcel_mask)           # (B,P) or None
-        bands = _per_band_l1(
-            pred, tgt, cell_valid, self.band_id.view(1, 1, S, 1), _M4_BAND_IDS)
+        bands = _band_diagnostics(
+            pred, tgt, cell_valid[..., 0], self.band_id.view(1, 1, S),
+            _M4_BAND_IDS, "m4")
         return _masked_l1(pred, tgt, cell_valid, weight=weight), bands
 
     def _m4_weight(self, n_p: Tensor, tubed_parcel_mask: Tensor) -> Tensor | None:
@@ -1307,32 +1338,90 @@ def _downweight_dof(n: Tensor, *, n_ref: float, alpha: float) -> Tensor:
     return (dof / ref).pow(alpha).clamp(max=1.0).detach()
 
 
-def _zero_bands(ref: Tensor, pairs: tuple[tuple[str, int], ...]) -> dict[str, Tensor]:
-    """Graph-free zero per-band diagnostics (the no-target early-return case)."""
-    return {name: ref.new_zeros(()) for name, _ in pairs}
+# Monitor-stat eps — matches masked_jepa._JEPA_STATS_EPS (detached scalars only).
+_STATS_EPS = 1e-8
 
 
-def _per_band_l1(
-    pred: Tensor, target: Tensor, valid: Tensor, band_of_cell: Tensor,
-    pairs: tuple[tuple[str, int], ...],
+def _jepa_stats_on_cells(
+    pred: Tensor, target: Tensor, cell_valid: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """``(loss, explained_var, target_var)`` over the ``cell_valid`` scored cells.
+
+    ``cell_valid`` is the PER-CELL mask (``pred.shape[:-1]``-broadcastable, no
+    feature axis); the scored ``(n, d)`` rows are gathered and reduced. Matches
+    ``masked_jepa._jepa_pred_target_stats`` L1 semantics:
+      * ``loss`` = mean ``|pred − target|`` over scored cells×d (== the masked-L1).
+      * ``target_var`` = mean over feature dims of the target's per-dim variance
+        across scored cells (→ 0 on EMA-teacher collapse).
+      * ``explained_var`` = ``1 − err / Var(target)`` (scale-free structure captured).
+    ``ev``/``tv`` are ``NaN`` with < 2 scored cells (variance undefined → logger
+    skips them); ``loss`` is 0 with no scored cells. All detached — pure monitor."""
+    d = pred.shape[-1]
+    sel = cell_valid.detach().reshape(-1)
+    p = pred.detach().reshape(-1, d)[sel]
+    t = target.detach().reshape(-1, d)[sel]
+    if p.shape[0] == 0:
+        nan = pred.new_full((), float("nan"))
+        return pred.new_zeros(()), nan, nan
+    loss = (p - t).abs().mean()
+    if p.shape[0] < 2:
+        nan = pred.new_full((), float("nan"))
+        return loss, nan, nan
+    target_var = t.var(dim=0, unbiased=False).mean()
+    explained_var = 1.0 - loss / (t.var(unbiased=False) + _STATS_EPS)
+    return loss, explained_var, target_var
+
+
+def _band_diagnostics(
+    pred: Tensor, target: Tensor, cell_valid: Tensor, band_of_cell: Tensor,
+    pairs: tuple[tuple[str, int], ...], head: str,
 ) -> dict[str, Tensor]:
-    """Detached RAW (unweighted) masked-L1 restricted to each band's cells.
-    ``band_of_cell`` is broadcast against ``valid`` (M2: per-query band id; M4:
-    per-token-slot band id). Diagnostics only — never folded into the loss."""
-    return {
-        name: _masked_l1(pred, target, valid & (band_of_cell == bid)).detach()
-        for name, bid in pairs
-    }
+    """Aggregate + per-band ``loss``/``explained_var``/``target_var`` for one head.
+
+    Ben 2026-06-18: split the term's loss/explained_var/target_var by band {slow,
+    beta, hg} — the generalized slow-easiness guard (catches a trivial/low-grad
+    band, a dead band, or one band dominating). ``head`` ∈ {'m2','m4'} sets the key
+    prefix; ``cell_valid``/``band_of_cell`` are per-cell (``pred.shape[:-1]``).
+    Detached monitors — never folded into the loss. Keys: ``ev_{head}``/``tv_{head}``
+    (aggregate over all scored cells) and per band ``l_{head}_{b}``/``ev_{head}_{b}``
+    /``tv_{head}_{b}``. The per-band ``l_{head}_{b}`` is the unweighted masked-L1
+    (unchanged from the prior per-band loss diagnostic)."""
+    _, ev, tv = _jepa_stats_on_cells(pred, target, cell_valid)
+    out: dict[str, Tensor] = {f"ev_{head}": ev, f"tv_{head}": tv}
+    for name, bid in pairs:
+        bl, bev, btv = _jepa_stats_on_cells(
+            pred, target, cell_valid & (band_of_cell == bid)
+        )
+        out[f"l_{head}_{name}"] = bl
+        out[f"ev_{head}_{name}"] = bev
+        out[f"tv_{head}_{name}"] = btv
+    return out
+
+
+def _zero_bands(
+    ref: Tensor, pairs: tuple[tuple[str, int], ...], head: str,
+) -> dict[str, Tensor]:
+    """Graph-free zero/NaN diagnostics (the no-target early-return case) — SAME key
+    set as :func:`_band_diagnostics` so the forward dict keys are batch-stable."""
+    nan = ref.new_full((), float("nan"))
+    out: dict[str, Tensor] = {f"ev_{head}": nan, f"tv_{head}": nan}
+    for name, _ in pairs:
+        out[f"l_{head}_{name}"] = ref.new_zeros(())
+        out[f"ev_{head}_{name}"] = nan
+        out[f"tv_{head}_{name}"] = nan
+    return out
 
 
 def _assemble_losses(
     loss: Tensor, l_m2: Tensor, l_m4: Tensor,
-    m2_bands: dict[str, Tensor], m4_bands: dict[str, Tensor],
+    m2_diag: dict[str, Tensor], m4_diag: dict[str, Tensor],
 ) -> dict[str, Tensor]:
-    """Pack the scalar losses + per-band diagnostics into the forward return dict."""
+    """Pack the scalar losses + the full M2/M4 monitor diagnostics (per-band loss/
+    explained_var/target_var + aggregate ev/tv) into the forward return dict. The
+    diag dicts are already fully keyed (``l_m2_beta``, ``ev_m2``, ``tv_m4_slow`` …)."""
     out = {"loss": loss, "l_m2": l_m2, "l_m4": l_m4}
-    out.update({f"l_m2_{b}": v for b, v in m2_bands.items()})
-    out.update({f"l_m4_{b}": v for b, v in m4_bands.items()})
+    out.update(m2_diag)
+    out.update(m4_diag)
     return out
 
 

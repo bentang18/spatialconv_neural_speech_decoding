@@ -105,6 +105,36 @@ def test_step_emits_per_band_diagnostics() -> None:
     assert "l_m2_slow" not in out          # slow is M2-exempt
 
 
+def test_step_emits_ev_tv_and_stem_norms() -> None:
+    # Ben 2026-06-18 monitor: the aggregate + per-band explained_var/target_var and
+    # the per-band stem-output norms ride in _step's output too.
+    m = _module()
+    out = m._step(_batch().data)
+    for k in ("ev_m2", "tv_m2", "ev_m4", "tv_m4",
+              "stem_norm_slow", "stem_norm_beta", "stem_norm_hg"):
+        assert k in out, f"missing monitor key {k}"
+        assert not out[k].requires_grad
+    for k in ("stem_norm_slow", "stem_norm_beta", "stem_norm_hg"):
+        assert torch.isfinite(out[k]) and float(out[k]) > 0.0
+
+
+def test_log_losses_skips_nonfinite_and_nonscalar() -> None:
+    # ev/tv are NaN when a band has < 2 scored cells this step — an undefined-variance
+    # step must NOT poison the epoch mean, and a non-scalar must never be logged.
+    m = _module()
+    logged: dict[str, float] = {}
+    m.log = lambda name, val, **kw: logged.__setitem__(name, float(val))  # type: ignore[method-assign]
+    out = {
+        "loss": torch.tensor(1.0),
+        "tv_m4_slow": torch.tensor(2.0),
+        "ev_m2": torch.tensor(float("nan")),       # undefined variance → skip
+        "stem_norm_hg": torch.tensor(float("inf")),  # non-finite → skip
+        "vec": torch.zeros(3),                      # non-scalar → skip
+    }
+    m._log_losses(out, "train", on_step=True, on_epoch=False)
+    assert logged == {"train_loss": 1.0, "train_tv_m4_slow": 2.0}
+
+
 def test_training_step_returns_scalar_loss() -> None:
     m = _module()
     loss = m.training_step(_batch(), 0)
