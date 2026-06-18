@@ -1252,6 +1252,40 @@ def test_on_before_optimizer_step_skips_clip_metrics_without_trainer() -> None:
     assert "train_mon_grad_l2_frontend" in logged
 
 
+def test_on_before_optimizer_step_gated_off_log_cadence() -> None:
+    """Throughput gate (2026-06-16): the expensive grad-routing / weight-norm
+    sweep is skipped on off-cadence steps and re-fired on the logging cadence;
+    the spike-EMA buffer (training-inert) is untouched while skipped."""
+    module = _make_module(phase="p1")
+    _perturb_student_for_nonzero_grad(module)
+    module._step(_make_synthetic_batch().data).total.backward()
+    logged: dict[str, float] = {}
+    module.log = lambda key, value, **_kw: logged.update({key: float(value)})  # type: ignore[method-assign]
+
+    # Off-cadence step (7 % 10 != 0) → grad-routing diagnostics skipped.
+    module.trainer = SimpleNamespace(  # type: ignore[assignment]
+        log_every_n_steps=10, global_step=7, gradient_clip_val=1.0,
+    )
+    ema_before = float(module._grad_ema_l2.item())
+    module.on_before_optimizer_step(optimizer=None)
+    assert "train_mon_grad_l2" not in logged
+    for group in ("frontend", "latent", "predictor"):
+        assert f"train_mon_grad_l2_{group}" not in logged
+        assert f"train_mon_wnorm_{group}" not in logged
+    assert float(module._grad_ema_l2.item()) == pytest.approx(ema_before)
+
+    # Due step (10 % 10 == 0) → the full routing breakdown fires again.
+    logged.clear()
+    module.trainer = SimpleNamespace(  # type: ignore[assignment]
+        log_every_n_steps=10, global_step=10, gradient_clip_val=1.0,
+    )
+    module.on_before_optimizer_step(optimizer=None)
+    assert logged["train_mon_grad_l2"] > 0.0
+    assert logged["train_mon_grad_l2_frontend"] > 0.0
+    for group in ("frontend", "latent", "predictor"):
+        assert f"train_mon_wnorm_{group}" in logged
+
+
 def test_grad_ema_buffer_persists_across_calls() -> None:
     module = _make_module(phase="p1")
     _perturb_student_for_nonzero_grad(module)

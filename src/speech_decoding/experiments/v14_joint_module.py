@@ -2304,7 +2304,26 @@ class V14JointBrainModule(pl.LightningModule):
         grad-clip fraction and the front-end-vs-latent gradient balance are
         first-class wandb traces. Pure observability — no training-math
         effect; this hook still only reads grads + buffers.
+
+        Cadence-gated (2026-06-16 throughput audit): the per-param grad-L2 /
+        weight-L2 / spike sweep below was the dominant in-loop cost at
+        ``log_every_n_steps=1`` — it fired the few-hundred-param L2 loop on
+        EVERY optimizer step. It is pure observability (verified: no
+        ``p.grad`` / ``p.data`` / optimizer-state mutation, no forward ⇒ no
+        RNG, no clipping — Lightning clips after this hook), so throttling it
+        to the logging cadence is training-math-inert. The true-update-ratio
+        re-arm stays every-step (it self-gates its snapshot/measure window
+        across two consecutive optimizer steps, so it must observe each one).
         """
+        try:
+            _diag_step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            _diag_step = 0
+        if not self._train_monitor_due(_diag_step):
+            # Off-cadence: skip the expensive grad-routing diagnostics, but keep
+            # the true-update-ratio cadence machinery alive (it self-gates).
+            self._maybe_log_true_update_ratio()
+            return
         # Single pass: global grad-L2² + the per-group routing breakdown.
         # (BOTH phases exercise the predictor — paradigm-B parity — so the
         # student + predictor iteration keeps the global grad-L2 correct.)
