@@ -923,6 +923,49 @@ def _run(model, batch):
                  m["tubed_parcels"], m["tubed_parcel_mask"])
 
 
+def test_m2_loss_ragged_equals_dense() -> None:
+    # Stage 3 (Ben 06-18): the ragged M2 gathers only un-tubed target electrodes,
+    # each electrode's visible context + masked queries — output-identical to the
+    # dense oracle that runs all B*C rows with 38-token key-masked context.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    slow, beta, hg, pe, emask, m = _ssl_batch(B=3, C=7, seed=4)
+    with torch.no_grad():
+        t_f = model.teacher_frontend(slow, beta, hg).detach()
+        student_vis = ~m["m2_mask"]
+        s_f = model.student_frontend(slow, beta, hg, key_mask=student_vis)
+        dense = model._m2_loss(
+            s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
+        ragged = model._m2_loss_ragged(
+            s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
+    assert float(dense) > 0.0                      # the batch carries real targets
+    assert torch.allclose(ragged, dense, atol=1e-5)
+
+
+def test_m2_loss_ragged_ignores_padded_electrodes() -> None:
+    # Appending a padded electrode (emask False, loud junk) must not move the
+    # ragged M2 loss — the electrode gather drops it; it is never built.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    slow, beta, hg, pe, emask, m = _ssl_batch(B=2, C=6, seed=7)
+    with torch.no_grad():
+        t_f = model.teacher_frontend(slow, beta, hg).detach()
+        student_vis = ~m["m2_mask"]
+        s_f = model.student_frontend(slow, beta, hg, key_mask=student_vis)
+        base = model._m2_loss_ragged(
+            s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
+        # pad with a junk electrode marked unreal + (defensively) M2-masked nowhere
+        B, C = emask.shape
+        s_f2 = torch.cat([s_f, torch.randn(B, 1, 38, s_f.shape[-1]) * 9.0], dim=1)
+        t_f2 = torch.cat([t_f, torch.randn(B, 1, 38, t_f.shape[-1]) * 9.0], dim=1)
+        m2_2 = torch.cat([m["m2_mask"], torch.zeros(B, 1, 38, dtype=torch.bool)], dim=1)
+        vis2 = ~m2_2
+        emask2 = torch.cat([emask, torch.zeros(B, 1, dtype=torch.bool)], dim=1)
+        tube2 = torch.cat([m["tube_mask"], torch.zeros(B, 1, dtype=torch.bool)], dim=1)
+        padded = model._m2_loss_ragged(s_f2, t_f2, m2_2, vis2, emask2, tube2)
+    assert torch.allclose(padded, base, atol=1e-6)
+
+
 def test_ssl_forward_returns_finite_nonneg_losses() -> None:
     model = _ssl_model().eval()
     out = _run(model, _ssl_batch())

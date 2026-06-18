@@ -1077,6 +1077,49 @@ class V14ConvergedSSL(nn.Module):
         )
         return _masked_l1(pred, tgt, qvalid)
 
+    def _m2_loss_ragged(
+        self, s_f: Tensor, t_f: Tensor, m2_mask: Tensor, student_vis: Tensor,
+        electrode_mask: Tensor, tube_mask: Tensor,
+    ) -> Tensor:
+        """Ragged M2 (production) — Ben 2026-06-18: "the M2 PREDICTOR only
+        GATHERING ITS INDIVIDUAL ELECTRODE, PROCESSING EACH ELECTRODE ONE AT A
+        TIME ... ONLY PREDICTING THAT ONE ELECTRODE's masked tokens NEVER DENSE."
+
+        Two physical gathers, never a dense set: (1) ELECTRODE axis — only the
+        un-tubed real electrodes that carry an M2 target are batched (tubed/padded
+        electrodes are never run through the predictor); (2) TOKEN axis — each
+        electrode's visible context and its masked queries are gathered to their
+        own ragged lengths (the dense path passed all 38 context tokens key-masked
+        to visible). Output-identical to the dense ``_m2_loss`` oracle on the
+        per-electrode masked targets (the predictor is per-electrode in the batch
+        dim either way; masked context keys add 0 and no-target rows contribute 0
+        to the L1 mean), with no dense electrode/token set ever built."""
+        B, C, S, d = s_f.shape
+        elec = B * C
+        m2_flat = m2_mask.reshape(elec, S)
+        vis_flat = student_vis.reshape(elec, S)
+        elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & m2_flat.any(dim=1)
+        if not bool(elec_ok.any()):
+            return s_f.new_zeros(())
+
+        e_idx = elec_ok.nonzero(as_tuple=False).squeeze(1)         # (R,) target elecs
+        R = int(e_idx.numel())
+        sf = s_f.reshape(elec, S, d)[e_idx]                        # (R, 38, d)
+        tf = t_f.reshape(elec, S, d)[e_idx]                        # (R, 38, d)
+
+        c_idx, c_real, Nv = _ragged_gather_idx(vis_flat[e_idx])    # visible context
+        ctx = torch.gather(sf, 1, c_idx.unsqueeze(-1).expand(R, Nv, d))
+        ctx_slot = self.time_slot[c_idx]                           # (R, Nv)
+
+        q_idx, q_real, Mq = _ragged_gather_idx(m2_flat[e_idx])     # masked queries
+        q_freq = self.freq_global_id[q_idx]                        # (R, Mq)
+        q_slot = self.time_slot[q_idx]
+        pred = self.m2_predictor(
+            ctx, ctx_slot, q_freq, q_slot, ctx_mask=c_real, query_mask=q_real,
+        )                                                          # (R, Mq, d)
+        tgt = torch.gather(tf, 1, q_idx.unsqueeze(-1).expand(R, Mq, d))
+        return _masked_l1(pred, tgt, q_real)
+
     # --------------------------------------------------------------- M4 head
     def _m4_loss(
         self, s_l: Tensor, t_f: Tensor, parcel_per_electrode: Tensor,
