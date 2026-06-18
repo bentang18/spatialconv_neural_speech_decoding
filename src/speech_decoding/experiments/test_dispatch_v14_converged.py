@@ -128,6 +128,21 @@ def test_3stft_requires_converged_shape(tmp_path, drop: str) -> None:
         build_v14_experiment(**kw)
 
 
+# ------------------------------------------------------------- online probe knobs
+def test_3stft_online_probe_off_by_default(tmp_path) -> None:
+    """The diagnostic probe is OFF unless --online-probe is passed (inert default)."""
+    xp = _converged(tmp_path)
+    assert xp.online_probe_enabled is False
+    assert xp.online_probe_cadence == 1000
+
+
+def test_3stft_online_probe_flags_thread(tmp_path) -> None:
+    """--online-probe / --online-probe-cadence reach the converged experiment."""
+    xp = _converged(tmp_path, online_probe_enabled=True, online_probe_cadence=500)
+    assert xp.online_probe_enabled is True
+    assert xp.online_probe_cadence == 500
+
+
 # ----------------------------------------------------------------- regression
 def test_raw_path_unchanged_still_v14parcelperceiver(tmp_path) -> None:
     xp = build_v14_experiment(bt_root=str(tmp_path), mode="lite", joint_phase=True)

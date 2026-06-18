@@ -73,6 +73,49 @@ class V14ConvergedExperiment(V14Experiment):
     # Per-step mask RNG seed (own CPU generator in the module).
     mask_seed: int = 0
 
+    # --- online linear probe (diagnostic; spec reports/online_probe_spec_2026_06_18.md)
+    # OFF by default: registering the experiment can never perturb a live run. When
+    # enabled, _callbacks() builds the probe dataset IN-WORKER from (seed, manifest)
+    # so it is serialization-safe and deterministic across resume (spec §8); the
+    # build is DCC-only (BT voltage + the 3STFT cache). cadence/k/batch tune the
+    # callback; n_cap/seed feed the deterministic dataset build (Neuroprobe-Lite
+    # parity N_cap=3500). These are diagnostic knobs, not run hyperparameters.
+    online_probe_enabled: bool = False
+    online_probe_cadence: int = pydantic.Field(default=1000, gt=0)
+    online_probe_k_list: tuple[int, ...] = (2, 1)
+    online_probe_batch_size: int = pydantic.Field(default=256, gt=0)
+    online_probe_n_cap: int = pydantic.Field(default=3500, gt=0)
+    online_probe_seed: int = 0
+
+    def _callbacks(self):  # type: ignore[override]
+        """Base callbacks (LR monitor, checkpoints) plus the diagnostic online
+        probe when enabled. The probe append is the ONLY change vs the parent."""
+        callbacks = super()._callbacks()
+        callbacks.extend(self._online_probe_callbacks())
+        return callbacks
+
+    def _online_probe_callbacks(self) -> list:
+        """``[]`` unless ``online_probe_enabled`` (spec §1, OFF by default). When on,
+        build the probe dataset deterministically from ``(seed, n_cap, manifest)``
+        — DCC-only (BT voltage + 3STFT cache) — and return a single configured,
+        enabled :class:`OnlineLinearProbe`. Kept separate from ``_callbacks`` so the
+        decision logic is unit-testable without a full trainer assembly."""
+        if not self.online_probe_enabled:
+            return []
+        from speech_decoding.experiments.online_probe import OnlineLinearProbe
+        from speech_decoding.experiments.online_probe_dataset import build_probe_dataset
+
+        dataset = build_probe_dataset(n_cap=self.online_probe_n_cap, seed=self.online_probe_seed)
+        return [
+            OnlineLinearProbe(
+                dataset=dataset,
+                enabled=True,
+                cadence=self.online_probe_cadence,
+                k_list=self.online_probe_k_list,
+                batch_size=self.online_probe_batch_size,
+            )
+        ]
+
     def _build_brain_module(self, train_loader) -> BrainModule:  # type: ignore[override]
         """Build the converged Lightning module: resolve the model from the
         config, then wrap it with the optimizer + EMA τ + mask config. Replaces

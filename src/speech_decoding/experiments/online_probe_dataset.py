@@ -141,12 +141,15 @@ class InMemoryProbeDataset:
         return self._data[subject_id]
 
 
-def build_probe_dataset(*args: tp.Any, **kwargs: tp.Any) -> InMemoryProbeDataset:  # pragma: no cover
+def build_probe_dataset(
+    *, n_cap: int = N_CAP, seed: int = 0, **kwargs: tp.Any
+) -> InMemoryProbeDataset:  # pragma: no cover
     """DCC-only: extract 1 s word-onset windows for every cohort subject into
     encoder-ready 3STFT band tensors (via the real study + MultiStftView 3STFT
-    chain, ``clip_len=1.0`` / P4 neural-lag), select ``min(N_CAP, available)`` per
-    subject, derive ``parcel_per_electrode``/``electrode_mask`` from the DK support
-    + valid-mask extractors, and assemble an :class:`InMemoryProbeDataset`.
+    chain, ``clip_len=1.0`` / P4 neural-lag), select ``min(n_cap, available)`` per
+    subject (deterministic in ``seed`` — spec §8), derive ``parcel_per_electrode`` /
+    ``electrode_mask`` from the DK support + valid-mask extractors, and assemble an
+    :class:`InMemoryProbeDataset`.
 
     Not implemented on the laptop — needs BT voltage (``/work/ht203/data/
     braintreebank``) + the 3STFT spec cache. Wiring + DCC verification is Phase 2b;

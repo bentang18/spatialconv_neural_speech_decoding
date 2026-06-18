@@ -630,6 +630,12 @@ def build_v14_experiment(
     converged_m4_precision_off: bool = False,
     converged_m4_precision_alpha: float | None = None,
     converged_m4_precision_n_ref: float | None = None,
+    # Online linear probe (diagnostic; spec reports/online_probe_spec_2026_06_18.md).
+    # OFF by default — registering it is inert until turned on, so it can never
+    # perturb a live run. Converged-path only; inert on raw/2stft. The probe DATASET
+    # is built in-worker (DCC-only) when enabled; cadence tunes its firing period.
+    online_probe_enabled: bool = False,
+    online_probe_cadence: int = 1000,
     m_sub_slots: int = DEFAULT_M_SUB_SLOTS,
     n_freq_bins: int = DEFAULT_N_FREQ_BINS,
     # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
@@ -2039,6 +2045,11 @@ def build_v14_experiment(
             mask_seed=seed,
             **_converged_mask,
             wd_exclude_norms=wd_exclude_norms,
+            # Online linear probe (diagnostic, OFF by default). seed/n_cap stay at
+            # the V14ConvergedExperiment defaults (run seed feeds mask_seed above;
+            # the probe build reseeds deterministically from its own default).
+            online_probe_enabled=online_probe_enabled,
+            online_probe_cadence=online_probe_cadence,
             # SSL computes its own loss; this satisfies the required field and is
             # never read by V14ConvergedBrainModule. No accuracy metric (no head).
             loss={"name": "CrossEntropyLoss"},
@@ -3392,6 +3403,17 @@ def _parser() -> argparse.ArgumentParser:
                         "probe (V14Phase4ReadoutExperiment, transferable-state "
                         "protocol) instead of the from-scratch supervised CE "
                         "classifier. Implied when --resume-from is set on P4.")
+    # Online linear probe (diagnostic; spec reports/online_probe_spec_2026_06_18.md).
+    p.add_argument("--online-probe", dest="online_probe", action="store_true",
+                   default=False,
+                   help="--frontend 3stft only: register the diagnostic frozen "
+                        "online linear probe (frontend+latent taps, WS/CS AUROC "
+                        "every --online-probe-cadence steps). OFF by default; the "
+                        "probe dataset is built in-worker (DCC-only). Inert on "
+                        "raw/2stft.")
+    p.add_argument("--online-probe-cadence", type=int, default=1000,
+                   help="Steps between online-probe fires (default 1000; spec §3 "
+                        "keep if overhead <~3%%, else stretch).")
     p.add_argument("--resume-from", default=None,
                    help="Warm-start this phase's encoder (+PMA from P3) from a "
                         "prior phase's transferable-state snapshot "
@@ -3609,6 +3631,8 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_m4_precision_off=args.converged_m4_precision_off,
         converged_m4_precision_alpha=args.converged_m4_precision_alpha,
         converged_m4_precision_n_ref=args.converged_m4_precision_n_ref,
+        online_probe_enabled=args.online_probe,
+        online_probe_cadence=args.online_probe_cadence,
         cache_band=args.cache_band,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
