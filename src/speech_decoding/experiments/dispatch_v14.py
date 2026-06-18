@@ -50,6 +50,9 @@ from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import (
     STFT_2BAND_HIGH,
     STFT_2BAND_LOW,
+    STFT_3BAND_BETA,
+    STFT_3BAND_HG,
+    STFT_3BAND_SLOW,
     MultiStftView,
 )
 from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
@@ -507,6 +510,15 @@ def build_v14_experiment(
     #             time-bin counts from clip_len. Requires pool="mean".
     # Ignored when a custom ``electrode_tokens_extractor`` is supplied.
     frontend: tp.Literal["raw", "2stft"] = "raw",
+    # 3STFT per-band cache build (--cache-band, cache-only only). When set, ONE
+    # named band of the locked 3STFT 2/2/2 ladder (slow | beta | hg,
+    # ``reports/fe_3stft_2of2of2_spec_2026_06_17.md``) is built as a single-grid
+    # ``MultiStftView(front_end="band")`` riding the ``electrode_tokens`` slot
+    # (per_band_stem stays False). The band view is constructed identically to a
+    # future ``--frontend 3stft`` training run (shared ``STFT_3BAND_*`` constants
+    # + ``common_fe_kwargs``), so the spec-cache namespace matches → the run HITs
+    # this cache. Overrides ``frontend``. None = no 3STFT band build.
+    cache_band: tp.Literal["slow", "beta", "hg"] | None = None,
     # Cache-build parallelism (--cache-only): restrict the SSL/study corpus to a
     # single session by its index in ``_SESSIONS_BY_MODE[study_mode]`` so a SLURM
     # array builds one session's spec cache per task. None = full corpus. The
@@ -1259,7 +1271,31 @@ def build_v14_experiment(
             c_max=c_max,
             session_robust_z=session_robust_z,
         )
-        if frontend == "2stft":
+        if cache_band is not None:
+            # 3STFT per-band cache build (--cache-band, cache-only). ONE named band
+            # of the locked 2/2/2 ladder rides the single-grid electrode_tokens
+            # slot (per_band_stem stays False → no encoder dual/triple-band path is
+            # needed; --cache-only exits before the model is ever instantiated).
+            # Constructed EXACTLY like the future --frontend 3stft training run
+            # (same common_fe_kwargs + STFT_3BAND_* + band_<name> subdir naming),
+            # so the spec-cache namespace matches and the run HITs this cache. The
+            # slow band carries band_channelization="cartesian" (Re/Im); beta/HG
+            # default to "mag". band_hop is the band's native hop = hop_length.
+            band_const = {
+                "slow": STFT_3BAND_SLOW,
+                "beta": STFT_3BAND_BETA,
+                "hg": STFT_3BAND_HG,
+            }[cache_band]
+            band_spec_cache = (
+                str(Path(spec_cache_dir) / f"band_{cache_band}")
+                if spec_cache_dir is not None else None
+            )
+            electrode_tokens_extractor = MultiStftView(
+                **common_fe_kwargs, front_end="band", **band_const,
+                hop_length=int(band_const["band_hop"]),
+                spec_cache_dir=band_spec_cache,
+            )
+        elif frontend == "2stft":
             # The dual-band stems live on the B37 mean-pool path only (the encoder
             # raises the same check at build, but fail at dispatch for a clear msg).
             if pool != "mean":
@@ -2253,6 +2289,16 @@ def _parser() -> argparse.ArgumentParser:
                         "8Hz → electrode_tokens; high N=128/hop64 64-192Hz 9 bins @ "
                         "16Hz → electrode_tokens_high) reconciled by the encoder's "
                         "two Conv2d band stems (per_band_stem). Requires --pool mean.")
+    p.add_argument("--cache-band", dest="cache_band",
+                   choices=("slow", "beta", "hg"), default=None,
+                   help="3STFT per-band cache build (--cache-only only). Build ONE "
+                        "named band of the locked 2/2/2 ladder (slow N=1024/hop512 "
+                        "2-12Hz Cartesian Re/Im; beta N=256/hop128 16-56Hz |STFT|; "
+                        "hg N=128/hop64 64-192Hz |STFT|) into <spec-cache-dir>/band_"
+                        "<name>. Rides the single-grid electrode_tokens slot, so no "
+                        "encoder change is needed; the band view matches a future "
+                        "--frontend 3stft run → that run HITs this cache. Overrides "
+                        "--frontend.")
     p.add_argument("--atlas", dest="atlas", choices=("dk", "dkt"), default="dk",
                    help="Parcellation atlas. 'dk' (default) = Desikan-Killiany "
                         "(K=80); 'dkt' = Desikan-Killiany-Tourville (K=74, native "
@@ -3269,6 +3315,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         # so every chain phase shares ONE front end — a per-phase mismatch would
         # feed the P4 probe a different token geometry than the SSL encoder saw.
         frontend=args.frontend,
+        cache_band=args.cache_band,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
         subtype_embed_vocab=args.subtype_embed_vocab,
@@ -3568,6 +3615,16 @@ def _effective_compile_encoder(in_allocation_ddp: bool, compile_encoder: bool) -
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # --cache-band is a cache-build-only lever (it swaps the electrode_tokens
+    # extractor for one named 3STFT band and rides --cache-only's exit-before-
+    # trainer path). Running it without --cache-only would build a single-band
+    # model and train it — never intended; fail loudly instead.
+    if args.cache_band is not None and not args.cache_only:
+        raise ValueError(
+            f"--cache-band {args.cache_band!r} is a cache-build lever and requires "
+            "--cache-only (it builds one 3STFT band's spec cache, then exits before "
+            "the trainer). Add --cache-only, or drop --cache-band for a real run."
+        )
     # Predictor depth half-rule (Ben 2026-06-12). Each JEPA predictor defaults to
     # HALF the depth of the encoder stack it predicts from: M2 (front-end) tracks
     # --depth, M4 (parcel/latent) tracks --latent-depth. At the canonical B37

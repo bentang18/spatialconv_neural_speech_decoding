@@ -169,6 +169,25 @@ STFT_2BAND_HIGH: dict[str, float] = {
     "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 192.0,
 }
 
+# ---------------------------------------------------------------------------
+# 3-STFT ladder (reports/fe_3stft_2of2of2_spec_2026_06_17.md §2). Per electrode,
+# 38 tokens: slow 6 + beta_lowg 16 + HG 16. Each band is its OWN single-band
+# MultiStftView(front_end="band"); bins are DERIVED via _stft_band_k_range
+# (slow 1..6, beta 2..7, HG 4..12 — lo=16 and the designer's lo=13 both give
+# k0=2). Verified: the 38 tokens reproduce from the repo bin selector + real
+# torch.stft(center=True). The slow band is PHASE-bearing (Cartesian Re/Im, §4)
+# → band_channelization="cartesian"; beta/HG are |STFT| (default "mag").
+STFT_3BAND_SLOW: dict[str, float | str] = {
+    "band_nperseg": 1024, "band_hop": 512, "band_f_lo_hz": 2.0, "band_f_hi_hz": 12.0,
+    "band_channelization": "cartesian",
+}
+STFT_3BAND_BETA: dict[str, float] = {
+    "band_nperseg": 256, "band_hop": 128, "band_f_lo_hz": 16.0, "band_f_hi_hz": 56.0,
+}
+STFT_3BAND_HG: dict[str, float] = {
+    "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 192.0,
+}
+
 
 def _stft_band_k_range(
     f_lo_hz: float, f_hi_hz: float, *, nperseg: int, sample_rate: int = STFT_2BAND_FS_HZ,
@@ -562,9 +581,12 @@ def _single_stft_raw_view(
     k1: int,
     log_eps: float,
     apply_log: bool = False,
+    cartesian: bool = False,
 ) -> torch.Tensor:
     """2STFT single-band raw |STFT| (§3a): ONE Hann STFT, keep the inclusive
-    rfft-bin slice ``[k0, k1]``.
+    rfft-bin slice ``[k0, k1]``. ``cartesian=True`` (3STFT slow band, §4) instead
+    returns the two real components stacked on the freq axis ([Re ++ Im], F →
+    2·n_bins) to preserve phase; magnitude/log are bypassed.
 
     Same STFT call as :func:`_multi_stft_raw_view` (``center=True``,
     ``normalized=False``, value axis = raw ``|STFT|``) — only the bin selection
@@ -588,7 +610,13 @@ def _single_stft_raw_view(
         normalized=False,
         center=True,
     )
-    mag = torch.abs(spec)[..., k0 : k1 + 1, :]                            # (..., n_bins, T)
+    band = spec[..., k0 : k1 + 1, :]                                     # (..., n_bins, T) complex
+    if cartesian:
+        # Phase-bearing slow band (§4): two real channels stacked on the freq
+        # axis as [Re of n_bins ++ Im of n_bins] → F doubles to 2·n_bins. Keeps
+        # phase; apply_log is rejected for cartesian upstream so it never applies.
+        return torch.cat([band.real, band.imag], dim=-2)                 # (..., 2·n_bins, T)
+    mag = band.abs()                                                     # (..., n_bins, T)
     if apply_log:
         return torch.log(mag + log_eps)
     return mag
@@ -604,6 +632,7 @@ def _single_stft_raw_view_chunked(
     k1: int,
     log_eps: float,
     apply_log: bool = False,
+    cartesian: bool = False,
     chunk_frames: int = 960,
 ) -> torch.Tensor:
     """Memory-bounded whole-recording single-band raw |STFT|, byte-identical to
@@ -646,6 +675,7 @@ def _single_stft_raw_view_chunked(
             k1=k1,
             log_eps=log_eps,
             apply_log=apply_log,
+            cartesian=cartesian,
         )
 
     # Whole recording fits in one pass (or is too short to chunk): direct call.
@@ -865,6 +895,14 @@ class MultiStftView(CARIeegExtractor):
     band_hop: int = 256
     band_f_lo_hz: float = 4.0
     band_f_hi_hz: float = 56.0
+    # Per-band channelization (3STFT §4). "mag" = linear |STFT| (beta/HG and the
+    # 2STFT bands). "cartesian" = phase-bearing slow band: emit the two real
+    # components stacked on the freq axis ([Re bins ++ Im bins], F → 2·(k1-k0+1))
+    # and normalize SCALE-ONLY isotropically — one shared per-bin σ_p = MAD of
+    # |STFT| across Re/Im, NO centering (Re/Im are already zero-mean), realized as
+    # median=0 + σ_p replicated so the standard robust-z transform yields
+    # (Re/σ_p, Im/σ_p) with no read-path fork. apply_log is rejected for cartesian.
+    band_channelization: tp.Literal["mag", "cartesian"] = "mag"
     c_max: int | None = None
     # C3 (WS-C, B13 lock): per-(electrode, freq-bin, session) robust-z over the
     # filterbank output. When True, ``prepare`` fits a ``SessionRobustZNormalizer``
@@ -1037,6 +1075,25 @@ class MultiStftView(CARIeegExtractor):
         return self
 
     @model_validator(mode="after")
+    def _validate_channelization(self) -> "MultiStftView":
+        # Cartesian (phase-bearing Re/Im, §4) is a band sub-mode only, and is
+        # incompatible with the |STFT| log (log of a signed component is nonsense).
+        if self.band_channelization == "cartesian":
+            if self.front_end != "band":
+                raise ValueError(
+                    "band_channelization='cartesian' requires front_end='band' "
+                    f"(got {self.front_end!r}): cartesian is the slow-band phase "
+                    "mode of the 2STFT/3STFT family."
+                )
+            if self.apply_log:
+                raise ValueError(
+                    "band_channelization='cartesian' is incompatible with "
+                    "apply_log=True: Re/Im are signed, so an |STFT| log does not "
+                    "apply."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _validate_lof_config(self) -> "MultiStftView":
         # Fail at construction, not silently mid-run. LOF that flags-but-never-
         # drops, or drops-but-never-reports, both defeat the point.
@@ -1120,6 +1177,7 @@ class MultiStftView(CARIeegExtractor):
                 k1=k1,
                 log_eps=self.log_eps,
                 apply_log=self.apply_log,
+                cartesian=(self.band_channelization == "cartesian"),
             )
         if self.front_end == "raw":
             return _multi_stft_raw_view(
@@ -1574,6 +1632,7 @@ class MultiStftView(CARIeegExtractor):
                 k1=k1,
                 log_eps=self.log_eps,
                 apply_log=self.apply_log,
+                cartesian=(self.band_channelization == "cartesian"),
             )
         return _multi_stft_raw_view_chunked(
             waveform,
@@ -1595,7 +1654,9 @@ class MultiStftView(CARIeegExtractor):
         (defence in depth behind the namespace digest)."""
         if self.front_end == "band":
             k0, k1 = self._band_bins()
-            return k1 - k0 + 1
+            n = k1 - k0 + 1
+            # cartesian stores [Re ++ Im] on the freq axis → F doubles (§4).
+            return 2 * n if self.band_channelization == "cartesian" else n
         return sum(ke - ks + 1 for (_, ks, ke) in self.raw_bins)
 
     def _spec_cache_namespace(self) -> str:
@@ -1619,6 +1680,9 @@ class MultiStftView(CARIeegExtractor):
             int(self.band_hop) if self.front_end == "band" else None,
             float(self.band_f_lo_hz) if self.front_end == "band" else None,
             float(self.band_f_hi_hz) if self.front_end == "band" else None,
+            # cartesian (slow phase band) vs mag must NOT share a cache dir: same
+            # band geometry but a doubled freq axis + different stored values (§4).
+            self.band_channelization if self.front_end == "band" else None,
         )).encode()
         digest = hashlib.sha1(sig).hexdigest()[:12]
         return f"{self.infra.uid()}-fe{digest}"  # type: ignore[attr-defined]
@@ -1837,6 +1901,39 @@ class MultiStftView(CARIeegExtractor):
             sigma_floor=self.session_z_sigma_floor,
         )
 
+    def _fit_session_stats(
+        self, frames: torch.Tensor,
+    ) -> SessionRobustZNormalizer:
+        """Fit this session's frozen robust-z stats from its whole-recording
+        frames. Magnitude bands (default): the plain per-(C, F) median + MAD fit.
+
+        The cartesian slow band (§4) stores real ``[Re ++ Im]`` on the freq axis;
+        its scale must be the per-bin MAD of ``|STFT|`` SHARED across Re/Im
+        (isotropic → phase-preserving) with NO centering (Re/Im are already
+        zero-mean). So reconstruct ``|STFT| = √(Re²+Im²)`` per bin, fit its MAD,
+        and emit ``median = 0`` with ``σ = [σ_p ++ σ_p]`` — the standard
+        ``transform`` ``(x − median)/σ`` then yields the scale-only
+        ``(Re/σ_p, Im/σ_p)`` with no read-path fork."""
+        if self.band_channelization != "cartesian":
+            return SessionRobustZNormalizer(
+                sigma_floor=self.session_z_sigma_floor,
+            ).fit(frames.float())
+        x = frames.float()
+        n = x.shape[-2] // 2
+        re, im = x[..., :n, :], x[..., n:, :]
+        mag = torch.sqrt(re * re + im * im)                         # (C, n, T) |STFT|
+        mag_norm = SessionRobustZNormalizer(
+            sigma_floor=self.session_z_sigma_floor,
+        ).fit(mag)
+        assert mag_norm.sigma is not None
+        sigma = torch.cat([mag_norm.sigma, mag_norm.sigma], dim=-2)  # (C, 2n, 1)
+        median = torch.zeros_like(sigma)
+        return SessionRobustZNormalizer.from_stats(
+            median=median,
+            sigma=sigma,
+            sigma_floor=self.session_z_sigma_floor,
+        )
+
     def _build_spec_cache_and_fit(self, obj) -> None:
         """Materialize each session's seam-free whole-recording raw |STFT| to the
         fp32 memmap cache (skipping sessions already on disk → cross-job reuse)
@@ -1958,9 +2055,7 @@ class MultiStftView(CARIeegExtractor):
                         frames = torch.from_numpy(np.load(npy_path))
                         load_secs += time.perf_counter() - _tl
                     _tf = time.perf_counter()
-                    normalizer = SessionRobustZNormalizer(
-                        sigma_floor=self.session_z_sigma_floor,
-                    ).fit(frames.float())
+                    normalizer = self._fit_session_stats(frames)
                     fit_secs += time.perf_counter() - _tf
                     # Self-healing: write the sidecar so the NEXT prepare skips the
                     # reload + refit. Existing frames-only caches upgrade in place.
