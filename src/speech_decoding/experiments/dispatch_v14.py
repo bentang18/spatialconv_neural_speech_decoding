@@ -508,8 +508,18 @@ def build_v14_experiment(
     #             the encoder per_band_stem=True with the two Conv2d band stems;
     #             band freq-bin counts are DERIVED from the views (no drift) and
     #             time-bin counts from clip_len. Requires pool="mean".
+    #   "3stft" — converged-arch per-electrode triple-band 3STFT 2/2/2 frontend
+    #             (Ben 2026-06-17). THREE single-band MultiStftViews (front_end=
+    #             "band") at the slow/beta/HG native hops, carried as separate
+    #             batch keys electrode_tokens_slow/beta/hg. Routes the WHOLE
+    #             dispatch to V14ConvergedExperiment + the V14Converged model
+    #             config (self-contained M2/M4 SSL) instead of V14ParcelPerceiver;
+    #             requires the converged_* shape params above. The band views are
+    #             constructed identically to the --cache-band per-band builds
+    #             (shared STFT_3BAND_* + common_fe_kwargs + band_<name> spec-cache
+    #             subdirs) so a 3stft run HITs those caches.
     # Ignored when a custom ``electrode_tokens_extractor`` is supplied.
-    frontend: tp.Literal["raw", "2stft"] = "raw",
+    frontend: tp.Literal["raw", "2stft", "3stft"] = "raw",
     # 3STFT per-band cache build (--cache-band, cache-only only). When set, ONE
     # named band of the locked 3STFT 2/2/2 ladder (slow | beta | hg,
     # ``reports/fe_3stft_2of2of2_spec_2026_06_17.md``) is built as a single-grid
@@ -590,6 +600,22 @@ def build_v14_experiment(
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
     n_heads: int = DEFAULT_N_HEADS,
+    # Converged-arch (--frontend 3stft) shape. REQUIRED-when-3stft (no silent
+    # run defaults — the widths are Ben's to name at launch); raises a ValueError
+    # below if any is left None on the 3stft path. Inert on raw/2stft (the
+    # V14ParcelPerceiver path ignores them). The two predictor widths are the M2
+    # (own-electrode) and M4 (parcel-query) paradigm-B predictor hidden dims +
+    # depths from the converged FE spec §6.
+    converged_frontend_layers: int | None = None,
+    converged_latent_layers: int | None = None,
+    converged_m2_pred_dim: int | None = None,
+    converged_m2_pred_layers: int | None = None,
+    converged_m4_pred_dim: int | None = None,
+    converged_m4_pred_layers: int | None = None,
+    # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
+    # λ sister sweeps override). Inert on raw/2stft.
+    converged_lambda_m2: float = 1.0,
+    converged_lambda_m4: float = 1.0,
     m_sub_slots: int = DEFAULT_M_SUB_SLOTS,
     n_freq_bins: int = DEFAULT_N_FREQ_BINS,
     # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
@@ -1232,6 +1258,10 @@ def build_v14_experiment(
     # 2STFT dual-band front-end emits a SECOND batch key (electrode_tokens_high).
     # None on the single-grid raw/fbank path + when a custom extractor is supplied.
     high_band_extractor: tp.Any | None = None
+    # 3STFT converged front-end emits THREE band keys (electrode_tokens_slow rides
+    # the primary electrode_tokens_extractor; beta/hg here). None off the 3stft path.
+    beta_band_extractor: tp.Any | None = None
+    hg_band_extractor: tp.Any | None = None
     # True only for the dual-band path → threads to the encoder's per_band_stem.
     per_band_stem = False
     if electrode_tokens_extractor is None:
@@ -1330,17 +1360,64 @@ def build_v14_experiment(
                 spec_cache_dir=high_spec_cache,
             )
             per_band_stem = True
+        elif frontend == "3stft":
+            # Converged-arch triple-band 3STFT 2/2/2 (Ben 2026-06-17): THREE
+            # single-band MultiStftViews at the slow/beta/HG native hops, each its
+            # OWN session-robust-z fit + spec cache. The slow band rides the
+            # primary ``electrode_tokens_extractor`` (so the downstream ref_idx /
+            # n_time_bins derivation runs on it like any single-grid view); beta/HG
+            # are carried in the band locals. The three band views are built
+            # IDENTICALLY to the ``--cache-band`` per-band builds (same
+            # common_fe_kwargs + STFT_3BAND_* + ``band_<name>`` spec-cache subdir),
+            # so a 3stft run HITs caches a prior --cache-band sweep wrote. Note:
+            # ``per_band_stem`` stays False — the converged model owns its own
+            # per-electrode 3-band frontend; the encoder's dual-band stem path is
+            # NOT used here.
+            band_spec = lambda name: (  # noqa: E731
+                str(Path(spec_cache_dir) / f"band_{name}")
+                if spec_cache_dir is not None else None
+            )
+            electrode_tokens_extractor = MultiStftView(
+                **common_fe_kwargs, front_end="band", **STFT_3BAND_SLOW,
+                hop_length=int(STFT_3BAND_SLOW["band_hop"]),
+                spec_cache_dir=band_spec("slow"),
+            )
+            beta_band_extractor = MultiStftView(
+                **common_fe_kwargs, front_end="band", **STFT_3BAND_BETA,
+                hop_length=int(STFT_3BAND_BETA["band_hop"]),
+                spec_cache_dir=band_spec("beta"),
+            )
+            hg_band_extractor = MultiStftView(
+                **common_fe_kwargs, front_end="band", **STFT_3BAND_HG,
+                hop_length=int(STFT_3BAND_HG["band_hop"]),
+                spec_cache_dir=band_spec("hg"),
+            )
         else:
             # FE-RAW-1 single F=50 raw |STFT| grid (hop=128 → 16 Hz, 8 Hz latent).
             electrode_tokens_extractor = MultiStftView(
                 **common_fe_kwargs, spec_cache_dir=spec_cache_dir,
             )
+    # 3STFT: the primary extractor is the SLOW band, cached under its own
+    # ``electrode_tokens_slow`` key (NOT the single-grid ``electrode_tokens``) so
+    # the converged segmenter's three band keys stay namespaced apart. Beta/HG
+    # are cached below.
+    primary_token_key = (
+        "electrode_tokens_slow" if frontend == "3stft" else "electrode_tokens"
+    )
     _apply_extractor_cache(
-        electrode_tokens_extractor, "electrode_tokens", extractor_cache_folder
+        electrode_tokens_extractor, primary_token_key, extractor_cache_folder
     )
     if high_band_extractor is not None:
         _apply_extractor_cache(
             high_band_extractor, "electrode_tokens_high", extractor_cache_folder
+        )
+    if beta_band_extractor is not None:
+        _apply_extractor_cache(
+            beta_band_extractor, "electrode_tokens_beta", extractor_cache_folder
+        )
+    if hg_band_extractor is not None:
+        _apply_extractor_cache(
+            hg_band_extractor, "electrode_tokens_hg", extractor_cache_folder
         )
 
     # The encoder's ``ref_idx`` token must label the operator the
@@ -1551,13 +1628,26 @@ def build_v14_experiment(
     # does not exist on that path). The :class:`V14JointBrainModule`
     # routes ``batch.data["shaft_mask"]`` student-only per the B26
     # teacher full-input contract.
-    segmenter_extractors: dict[str, tp.Any] = {
-        "electrode_tokens": electrode_tokens_extractor,
-        "support": dk_extractor,
-        "valid_mask": valid_mask_extractor,
-        "ref_idx": ref_idx_extractor,
-        "subject_subtype": subtype_extractor,
-    }
+    if frontend == "3stft":
+        # Converged path: THREE band keys (no single-grid electrode_tokens). The
+        # converged module reads electrode_tokens_slow/beta/hg + support +
+        # valid_mask directly; ref_idx/subject_subtype are V14ParcelPerceiver
+        # encoder tokens the converged model never consumes, so they are omitted.
+        segmenter_extractors: dict[str, tp.Any] = {
+            "electrode_tokens_slow": electrode_tokens_extractor,
+            "electrode_tokens_beta": beta_band_extractor,
+            "electrode_tokens_hg": hg_band_extractor,
+            "support": dk_extractor,
+            "valid_mask": valid_mask_extractor,
+        }
+    else:
+        segmenter_extractors = {
+            "electrode_tokens": electrode_tokens_extractor,
+            "support": dk_extractor,
+            "valid_mask": valid_mask_extractor,
+            "ref_idx": ref_idx_extractor,
+            "subject_subtype": subtype_extractor,
+        }
     # 2STFT: the HIGH band is a SECOND batch key sharing electrodes/support/
     # valid_mask with the low band (electrode_tokens). The collate pads it to the
     # same C_max with its own (F_high, T_high) axes; the encoder per_band_stem
@@ -1863,6 +1953,86 @@ def build_v14_experiment(
         if in_allocation_ddp
         else _resolve_ddp_strategy(tasks_per_node)
     )
+
+    if frontend == "3stft":
+        # Converged-arch route (Ben 2026-06-17): the WHOLE experiment is the
+        # self-contained V14ConvergedSSL (its own frontend EMA teacher + the two
+        # paradigm-B M2/M4 predictors + the M2/M4 losses), wrapped by
+        # V14ConvergedExperiment. The V14ParcelPerceiver return below is NOT
+        # reached. The shape is REQUIRED here (no silent run defaults — the widths
+        # are Ben's to name at launch); a missing converged_* param is a hard
+        # ValueError, never a numerics-silent fallback.
+        _converged_shape = {
+            "frontend_layers": converged_frontend_layers,
+            "latent_layers": converged_latent_layers,
+            "m2_pred_dim": converged_m2_pred_dim,
+            "m2_pred_layers": converged_m2_pred_layers,
+            "m4_pred_dim": converged_m4_pred_dim,
+            "m4_pred_layers": converged_m4_pred_layers,
+        }
+        _missing = [k for k, v in _converged_shape.items() if v is None]
+        if _missing:
+            raise ValueError(
+                "--frontend 3stft requires the converged shape params (no silent "
+                f"run defaults): missing {_missing}. Pass converged_* widths."
+            )
+        from speech_decoding.experiments.v14_converged_experiment import (
+            V14ConvergedExperiment,
+        )
+        return V14ConvergedExperiment(
+            data=data,
+            infra=infra_cfg,
+            target_field="label",
+            brain_model_config={
+                "name": "V14Converged",
+                "d_model": d_model,
+                # DK atlas vocabulary length (K=80) — the parcel-tag embedding
+                # table; derived, never a run default.
+                "n_parcels": k_parcels,
+                "n_heads": n_heads,
+                # freq_pos is the LOCKED converged-arch decision (1d learnable freq
+                # tag), forced regardless of the V14ParcelPerceiver "sinusoidal"
+                # dispatch default.
+                "freq_pos": "learned",
+                **_converged_shape,
+                "lambda_m2": converged_lambda_m2,
+                "lambda_m4": converged_lambda_m4,
+            },
+            # EMA τ: caller override (--ema-tau) or the ema.py-locked 0.99925.
+            ema_tau=(ema_tau if ema_tau is not None else 0.99925),
+            # Per-step mask RNG = the run seed (reproducible with the run).
+            mask_seed=seed,
+            wd_exclude_norms=wd_exclude_norms,
+            # SSL computes its own loss; this satisfies the required field and is
+            # never read by V14ConvergedBrainModule. No accuracy metric (no head).
+            loss={"name": "CrossEntropyLoss"},
+            optim=optim_cfg,
+            metrics=[],
+            n_epochs=n_epochs,
+            log_every_n_steps=log_every_n_steps,
+            lr_log_interval=lr_log_interval,
+            wandb_config=wandb_config,
+            max_steps=max_steps,
+            val_check_interval=val_check_interval,
+            ckpt_ladder_every=ckpt_ladder_every,
+            limit_val_batches=limit_val_batches,
+            limit_test_batches=limit_test_batches,
+            collapse_guard=collapse_guard,
+            guard_warmup_min_step=warmup_steps,
+            early_stopping_patience=early_stopping_patience,
+            gradient_clip_val=gradient_clip_val,
+            accumulate_grad_batches=accumulate_grad_batches,
+            seed=seed,
+            pretrained_ckpt=pretrained_ckpt,
+            snapshot_ckpt_to=snapshot_ckpt_to,
+            # Only the C-peek key; the module reads all band keys from batch.data.
+            x_name="electrode_tokens_slow",
+            accelerator="auto",
+            devices="auto",
+            ddp_strategy=ddp_strategy,
+            precision=precision,
+            fast_dev_run=fast_dev_run,
+        )
 
     return experiment_cls(
         data=data,
@@ -2281,14 +2451,45 @@ def _parser() -> argparse.ArgumentParser:
                         "leaderboard eval cell, Neuroprobe-Lite electrode count) "
                         "else 'all' (full montage = BT-FULL pretraining). 'all'/"
                         "'lite' force the subset. 'lite' is BT-only.")
-    p.add_argument("--frontend", dest="frontend", choices=("raw", "2stft"),
-                   default="raw",
+    p.add_argument("--frontend", dest="frontend",
+                   choices=("raw", "2stft", "3stft"), default="raw",
                    help="Front-end family. 'raw' (default) = single F=50 raw |STFT| "
                         "grid (FE-RAW-1). '2stft' = dual-band 2STFT (Ben 2026-06-12): "
                         "two single-band STFTs (low N=512/hop256 4-56Hz 14 bins @ "
                         "8Hz → electrode_tokens; high N=128/hop64 64-192Hz 9 bins @ "
                         "16Hz → electrode_tokens_high) reconciled by the encoder's "
-                        "two Conv2d band stems (per_band_stem). Requires --pool mean.")
+                        "two Conv2d band stems (per_band_stem). Requires --pool mean. "
+                        "'3stft' = converged-arch triple-band 3STFT 2/2/2 (Ben "
+                        "2026-06-17): three single-band STFTs → electrode_tokens_"
+                        "slow/beta/hg, routing the run to the self-contained "
+                        "V14ConvergedSSL (M2/M4 SSL) instead of V14ParcelPerceiver. "
+                        "Requires the --converged-* shape flags.")
+    # --frontend 3stft converged-arch shape (REQUIRED on that path; no run
+    # defaults — the widths are named at launch). Inert on raw/2stft.
+    p.add_argument("--converged-frontend-layers", dest="converged_frontend_layers",
+                   type=int, default=None,
+                   help="3stft: per-electrode frontend joint freq×time SA depth.")
+    p.add_argument("--converged-latent-layers", dest="converged_latent_layers",
+                   type=int, default=None,
+                   help="3stft: flat token-level latent global-SA depth.")
+    p.add_argument("--converged-m2-pred-dim", dest="converged_m2_pred_dim",
+                   type=int, default=None,
+                   help="3stft: M2 (own-electrode) predictor hidden dim.")
+    p.add_argument("--converged-m2-pred-layers", dest="converged_m2_pred_layers",
+                   type=int, default=None,
+                   help="3stft: M2 predictor depth.")
+    p.add_argument("--converged-m4-pred-dim", dest="converged_m4_pred_dim",
+                   type=int, default=None,
+                   help="3stft: M4 (parcel-query) predictor hidden dim.")
+    p.add_argument("--converged-m4-pred-layers", dest="converged_m4_pred_layers",
+                   type=int, default=None,
+                   help="3stft: M4 predictor depth.")
+    p.add_argument("--converged-lambda-m2", dest="converged_lambda_m2",
+                   type=float, default=1.0,
+                   help="3stft: M2 loss-term weight (neutral 1.0).")
+    p.add_argument("--converged-lambda-m4", dest="converged_lambda_m4",
+                   type=float, default=1.0,
+                   help="3stft: M4 loss-term weight (neutral 1.0).")
     p.add_argument("--cache-band", dest="cache_band",
                    choices=("slow", "beta", "hg"), default=None,
                    help="3STFT per-band cache build (--cache-only only). Build ONE "
@@ -3315,6 +3516,14 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         # so every chain phase shares ONE front end — a per-phase mismatch would
         # feed the P4 probe a different token geometry than the SSL encoder saw.
         frontend=args.frontend,
+        converged_frontend_layers=args.converged_frontend_layers,
+        converged_latent_layers=args.converged_latent_layers,
+        converged_m2_pred_dim=args.converged_m2_pred_dim,
+        converged_m2_pred_layers=args.converged_m2_pred_layers,
+        converged_m4_pred_dim=args.converged_m4_pred_dim,
+        converged_m4_pred_layers=args.converged_m4_pred_layers,
+        converged_lambda_m2=args.converged_lambda_m2,
+        converged_lambda_m4=args.converged_lambda_m4,
         cache_band=args.cache_band,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,
@@ -3795,6 +4004,17 @@ def main(argv: list[str] | None = None) -> int:
             "builder still uses the B36 staged p1→p2 split and would run the "
             "joint objective twice. Launch the joint SSL phase standalone with "
             "--phase 1 --pool mean."
+        )
+    # --frontend 3stft routes the WHOLE run to the self-contained V14ConvergedSSL
+    # (its own M2/M4 SSL), which replaces the staged V14ParcelPerceiver pipeline.
+    # _build_v14_chain does not thread --frontend, so --chain would SILENTLY build
+    # raw V14ParcelPerceiver phases. Reject the combo loudly.
+    if args.chain and args.frontend == "3stft":
+        raise SystemExit(
+            "--chain with --frontend 3stft is not supported: the chain builder "
+            "assembles the V14ParcelPerceiver staged P1→P2→P3→P4 pipeline, which "
+            "the self-contained V14ConvergedSSL replaces. Launch the converged "
+            "SSL phase standalone (no --chain)."
         )
     # 4-GPU DDP enablement (#33). exca/submitit default tasks_per_node=1, so a
     # bare --gpus-per-node N allocates N GPUs to ONE srun task; Lightning's
