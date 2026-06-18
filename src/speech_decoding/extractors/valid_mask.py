@@ -33,7 +33,7 @@ import torch
 from neuralset.events.etypes import Event
 from neuralset.extractors.base import BaseStatic
 
-from speech_decoding.extractors.dk_support import _coerce_subject_id
+from speech_decoding.extractors.dk_support import _coerce_subject_id, _coerce_trial_id
 from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_BT_LABEL_COLUMN,
     V14_DK_PARCEL_LABELS,
@@ -77,16 +77,20 @@ class ElectrodeValidMask(BaseStatic):
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
-        # ``aligned_voltage_support`` is memoized per subject and keyed on the
-        # voltage electrode order; ``valid[c]`` is True iff voltage electrode
-        # ``c`` was assigned a parcel. ``from_numpy`` is a zero-copy view over
-        # its shared array; ``mask[:n] = valid`` copies, so the cached array is
-        # never mutated. FileNotFoundError + "absent from parcel vocabulary"
-        # KeyError flow through unchanged (lru_cache does not cache exceptions).
+        trial_id = _coerce_trial_id(event)
+        # ``aligned_voltage_support`` is memoized per (subject, trial) and keyed on
+        # the voltage electrode order; ``valid[c]`` is True iff voltage electrode
+        # ``c`` was assigned a parcel. ``trial_id`` threads the per-session STATIC
+        # drop so ``valid`` aligns to the front-end voltage rows FOR THIS session
+        # (DP4). ``from_numpy`` is a zero-copy view over its shared array;
+        # ``mask[:n] = valid`` copies, so the cached array is never mutated.
+        # FileNotFoundError + "absent from parcel vocabulary" KeyError flow through
+        # unchanged (lru_cache does not cache exceptions).
         valid = torch.from_numpy(
             aligned_voltage_support(
                 self.bt_root,
                 subject_id,
+                trial_id=trial_id,
                 parcel_labels=self.parcel_labels,
                 unmapped_policy=self.unmapped_policy,
                 label_column=self.label_column,

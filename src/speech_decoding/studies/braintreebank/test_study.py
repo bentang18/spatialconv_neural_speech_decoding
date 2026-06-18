@@ -180,7 +180,7 @@ def test_extra_bad_edit_changes_special_loader_uid(monkeypatch, tmp_path) -> Non
 
     def first_filepath(bad: set[str]) -> str:
         monkeypatch.setattr(
-            study_mod, "extra_bad_electrodes", lambda subject_id: frozenset(bad)
+            study_mod, "extra_bad_electrodes", lambda subject_id, trial_id=None: frozenset(bad)
         )
         study = Wang2024Treebank(path=tmp_path, mode="lite")
         tl = next(iter(study.iter_timelines()))

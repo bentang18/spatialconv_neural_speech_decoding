@@ -75,6 +75,46 @@ def _write_bt(
     _write_depth_wm(bt_root, subject_id, anatomy)
 
 
+def test_dk_extractor_per_session_static_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-session STATIC override threads through the support extractor: an
+    electrode dropped for ``(subject, trial)`` is gone from that session's support
+    rows, while a DIFFERENT trial keeps it — support[c] stays row-aligned with the
+    per-session voltage (DP4). The trial is recovered from ``event.extra``."""
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+
+    _write_bt(
+        tmp_path, 1,
+        voltage=["E1", "E2", "E3"],
+        anatomy=[
+            ("E1", "ctx-lh-superiortemporal"),
+            ("E2", "ctx-rh-bankssts"),
+            ("E3", "Left-Hippocampus"),
+        ],
+    )
+    anatomy.aligned_voltage_support.cache_clear()
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES", {})
+    monkeypatch.setitem(
+        anatomy._BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION, (1, 0), ("E2",)
+    )
+    ext = V14DKHardSupportExtractor(event_types="Ieeg", bt_root=str(tmp_path))
+
+    # trial 0: E2 dropped -> 2 support rows (E1, E3)
+    out0 = ext.get_static(
+        SimpleNamespace(subject="1", extra={"trial_id": "0"})  # type: ignore[arg-type]
+    )
+    assert out0.shape == (2, 80)
+    assert out0[0, _PARCEL_INDEX["ctx-lh-superiortemporal"]] == 1.0
+    assert out0[1, _PARCEL_INDEX["Left-Hippocampus"]] == 1.0
+
+    # trial 1: no override -> full 3 support rows
+    out1 = ext.get_static(
+        SimpleNamespace(subject="1", extra={"trial_id": "1"})  # type: ignore[arg-type]
+    )
+    assert out1.shape == (3, 80)
+
+
 def test_dk_extractor_emits_one_hot_support_80(tmp_path: Path) -> None:
     _write_bt(
         tmp_path, 1,

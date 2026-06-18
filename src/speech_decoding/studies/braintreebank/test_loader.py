@@ -141,7 +141,7 @@ def test_bt_load_raw_lite_composes_after_static_drop(monkeypatch) -> None:
     front-end voltage rows in lockstep with lite_voltage_order."""
     import speech_decoding.studies.braintreebank.loader as loader_mod
 
-    monkeypatch.setattr(loader_mod, "extra_bad_electrodes", lambda sid: frozenset({"E1"}))
+    monkeypatch.setattr(loader_mod, "extra_bad_electrodes", lambda sid, tid=None: frozenset({"E1"}))
     monkeypatch.setattr(
         loader_mod, "lite_electrode_set", lambda sid: frozenset({"E1", "E2", "E3"})
     )
@@ -183,7 +183,7 @@ def test_bt_load_raw_drop_static_false_keeps_full_montage(monkeypatch) -> None:
     import speech_decoding.studies.braintreebank.loader as loader_mod
 
     monkeypatch.setattr(
-        loader_mod, "extra_bad_electrodes", lambda sid: frozenset({"E1"})
+        loader_mod, "extra_bad_electrodes", lambda sid, tid=None: frozenset({"E1"})
     )
     data = np.arange(4 * 8, dtype=np.float64).reshape(4, 8)
     fake = _FakeBT(data=data, electrode_labels=["E0", "E1", "E2", "E3"])

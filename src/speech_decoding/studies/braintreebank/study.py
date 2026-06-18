@@ -159,7 +159,7 @@ class Wang2024Treebank(study.Study):
             # back symmetrically by _load_raw's .get(..., "all").
             if self.electrode_set != "all":
                 timeline["electrode_set"] = self.electrode_set
-            extra_bad = sorted(extra_bad_electrodes(subject_id))
+            extra_bad = sorted(extra_bad_electrodes(subject_id, trial_id))
             if extra_bad:
                 timeline["extra_bad"] = extra_bad
             yield timeline

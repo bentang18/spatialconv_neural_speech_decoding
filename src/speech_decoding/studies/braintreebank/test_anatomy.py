@@ -347,6 +347,59 @@ def test_extra_bad_electrodes_dropped_from_voltage_order(
 
 
 @pytest.mark.must_pass_before_dispatch
+def test_extra_bad_per_session_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-session STATIC: a contact listed in the per-session override for
+    ``(subject, trial)`` drops ONLY for that trial; a different trial of the same
+    subject is untouched. This is the per-session-drift granularity (each session
+    decides its own bad set — no cross-trial aggregation heuristic)."""
+    import json
+
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+
+    d = tmp_path / "electrode_labels" / "sub_55"
+    d.mkdir(parents=True)
+    (d / "electrode_labels.json").write_text(json.dumps(["LA1", "LA2", "LA3", "LA4"]))
+
+    # empty per-session override + empty per-subject -> no drop for any trial
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES", {})
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION", {})
+    assert extra_bad_electrodes(55, 0) == frozenset()
+    assert voltage_electrode_order(str(tmp_path), 55, 0) == ("LA1", "LA2", "LA3", "LA4")
+
+    # per-session override: drop LA2 in trial 0 only (raw spelling cleaned on match)
+    monkeypatch.setitem(
+        anatomy._BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION, (55, 0), ("LA2*",)
+    )
+    assert extra_bad_electrodes(55, 0) == frozenset({"LA2"})
+    assert extra_bad_electrodes(55, 1) == frozenset()  # other trial untouched
+    assert voltage_electrode_order(str(tmp_path), 55, 0) == ("LA1", "LA3", "LA4")
+    assert voltage_electrode_order(str(tmp_path), 55, 1) == ("LA1", "LA2", "LA3", "LA4")
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_extra_bad_trial_none_falls_back_to_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``trial_id=None`` (laptop audits / drift guard / pre-bake transition)
+    returns the per-subject fallback set, and an explicit trial with NO override
+    entry ALSO falls back to per-subject — so threading the trial through the
+    production path is byte-identical to today while the override is empty (the
+    cache/golden-preserving transition). An explicit trial WITH an override entry
+    takes precedence (per-session replaces, does not union with, the subject set)."""
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES", {55: ("LB1",)})
+    monkeypatch.setattr(
+        anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION", {(55, 0): ("LA2",)}
+    )
+    assert extra_bad_electrodes(55) == frozenset({"LB1"})  # no trial -> subject
+    assert extra_bad_electrodes(55, 0) == frozenset({"LA2"})  # override wins
+    assert extra_bad_electrodes(55, 9) == frozenset({"LB1"})  # no entry -> subject
+
+
+@pytest.mark.must_pass_before_dispatch
 def test_extra_bad_exclusion_keeps_loader_and_voltage_order_in_lockstep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -387,6 +440,58 @@ def test_extra_bad_exclusion_keeps_loader_and_voltage_order_in_lockstep(
     assert tuple(ch_names) == order  # byte-identical -> support/valid stay aligned
     # the dropped row (LA3, value 2.0) is gone; survivors keep their values
     np.testing.assert_array_equal(data[:, 0], np.array([0.0, 1.0, 3.0], np.float32))
+
+
+@pytest.mark.must_pass_before_dispatch
+def test_extra_bad_per_session_loader_voltage_order_lockstep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DP4 lockstep under PER-SESSION drop: the same trial's bad contact drops from
+    BOTH ``bt_load_raw(trial_id=t)`` and ``voltage_electrode_order(..., trial_id=t)``,
+    and a DIFFERENT trial keeps it — front-end voltage and support/valid_mask stay
+    row-aligned per session (a desync routes voltages into the wrong parcels)."""
+    import json
+    from dataclasses import dataclass
+
+    import speech_decoding.studies.braintreebank.anatomy as anatomy
+    from speech_decoding.studies.braintreebank.loader import bt_load_raw
+
+    @dataclass
+    class _FakeBT:
+        data: np.ndarray
+        electrode_labels: list[str]
+
+        def get_all_electrode_data(self, trial_id: int) -> np.ndarray:
+            return self.data
+
+    labels = ["LA1", "LA2", "LA3", "LA4"]
+    d = tmp_path / "electrode_labels" / "sub_55"
+    d.mkdir(parents=True)
+    (d / "electrode_labels.json").write_text(json.dumps(labels))
+    rows = np.arange(len(labels), dtype=np.float32)[:, None] * np.ones((1, 64), np.float32)
+
+    monkeypatch.setattr(anatomy, "_BT_V14_EXTRA_BAD_ELECTRODES", {})
+    # LA3 bad in trial 0 only
+    monkeypatch.setitem(
+        anatomy._BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION, (55, 0), ("LA3",)
+    )
+
+    # trial 0: LA3 dropped from both voltage and order
+    data0, ch0, _ = bt_load_raw(
+        _FakeBT(data=rows.copy(), electrode_labels=list(labels)),
+        trial_id=0, subject_id=55,
+    )
+    assert ch0 == ["LA1", "LA2", "LA4"]
+    assert tuple(ch0) == voltage_electrode_order(str(tmp_path), 55, 0)
+    np.testing.assert_array_equal(data0[:, 0], np.array([0.0, 1.0, 3.0], np.float32))
+
+    # trial 1: nothing dropped (full montage), both in lockstep
+    data1, ch1, _ = bt_load_raw(
+        _FakeBT(data=rows.copy(), electrode_labels=list(labels)),
+        trial_id=1, subject_id=55,
+    )
+    assert ch1 == labels
+    assert tuple(ch1) == voltage_electrode_order(str(tmp_path), 55, 1)
 
 
 def test_aligned_voltage_support_sub4_interior_unmapped() -> None:

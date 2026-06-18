@@ -69,15 +69,19 @@ class V14DKHardSupportExtractor(BaseStatic):
 
     def get_static(self, event: Event) -> torch.Tensor:
         subject_id = _coerce_subject_id(getattr(event, "subject"))
-        # ``aligned_voltage_support`` is memoized per subject and keyed on the
-        # voltage electrode order; ``from_numpy`` is a cheap zero-copy view over
-        # its shared array. The FileNotFoundError ("...depth-wm.csv" /
+        trial_id = _coerce_trial_id(event)
+        # ``aligned_voltage_support`` is memoized per (subject, trial) and keyed on
+        # the voltage electrode order; ``from_numpy`` is a cheap zero-copy view over
+        # its shared array. ``trial_id`` threads the per-session STATIC drop so
+        # support row ``c`` aligns to the front-end voltage row ``c`` FOR THIS
+        # session (DP4). The FileNotFoundError ("...depth-wm.csv" /
         # "...electrode_labels") and KeyError ("absent from parcel vocabulary")
         # paths flow through unchanged (lru_cache does not cache exceptions).
         support = torch.from_numpy(
             aligned_voltage_support(
                 self.bt_root,
                 subject_id,
+                trial_id=trial_id,
                 parcel_labels=self.parcel_labels,
                 unmapped_policy=self.unmapped_policy,
                 label_column=self.label_column,
@@ -116,3 +120,20 @@ def _coerce_subject_id(subject: tp.Any) -> int:
     if match is None:
         raise ValueError(f"unrecognised BT subject identifier: {subject!r}")
     return int(match.group(1))
+
+
+def _coerce_trial_id(event: tp.Any) -> int | None:
+    """Recover the BT trial id from an event, for the per-session STATIC override.
+
+    Production events (neuralset ``Ieeg``) carry the loader timeline's non-core
+    keys in ``event.extra`` as strings (``study._load_timelines`` projects every
+    timeline key into the event), so ``event.extra["trial_id"]`` is the trial.
+    Test events (e.g. ``SimpleNamespace(subject="1")``) have no ``extra`` →
+    ``None``, which falls back to the per-subject static set (byte-identical to the
+    legacy per-subject behavior). The support/valid_mask/shaft-mask extractors all
+    recover the trial this way so they align to the SAME per-session montage as the
+    front-end voltage (DP4)."""
+    extra = getattr(event, "extra", None)
+    if isinstance(extra, dict) and extra.get("trial_id") is not None:
+        return int(extra["trial_id"])
+    return None

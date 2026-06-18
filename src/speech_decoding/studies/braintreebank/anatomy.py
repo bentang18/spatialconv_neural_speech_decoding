@@ -198,16 +198,23 @@ _BT_V14_EXTRA_BAD_ELECTRODES: dict[int, tuple[str, ...]] = {
     8: ("F3cIc8", "T3H12"),
     9: ("P2e6", "P2e8"),
 }
-"""Per-subject flaky-contact electrodes v14 statically excludes ON TOP of the
-upstream corrupted / missing-coordinate / trigger drops.
+"""Per-subject flaky-contact FALLBACK set (LEGACY "locked-11" — an artifact of
+earlier hand-tuning, NOT a finalized list).
 
-These contacts produce brief, intense **spectral** transients — huge finite
-``|STFT|`` robust-z (up to 1e4 σ) at isolated time-frequency bins — that spike
-the SSL gradient. They are NOT high-amplitude dead channels: their whole-session
+This dict is the transitional fallback only. The real source is
+:data:`_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION` (populated offline from the
+GUARD-1 per-session scan, #207/#208). While that override is empty, every
+``extra_bad_electrodes(subject_id, trial_id)`` call falls back here, so threading
+the per-session trial axis through production is byte-identical to the pre-
+per-session behavior (cache key + goldens unchanged). When the per-session set is
+baked, this dict is cleared and every session carries an explicit override entry
+(including ``()`` for clean sessions), so the fallback is never hit in production.
+
+The excluded contacts produce brief, intense **spectral** transients — huge finite
+``|STFT|`` robust-z (up to 1e4 σ) at isolated time-frequency bins — that spike the
+SSL gradient. They are NOT high-amplitude dead channels: their whole-session
 voltage MAD is ~subject-median, so the MNE-LOF voltage-domain guard (and any
-voltage-amplitude rule) MISSES them. The detector is the ``|STFT|`` robust-z the
-encoder actually sees, recurring above threshold across a MAJORITY of a subject's
-trials (single-trial subjects use a higher one-shot bar).
+voltage-amplitude rule) MISSES them.
 
 Applied at BOTH electrode-order sites in lockstep so support / valid_mask stay
 row-aligned with the front-end voltage (the DP4 contract): folded into
@@ -218,30 +225,54 @@ undo). Labels are cleaned (``clean_bt_electrode_label``) before matching.
 
 Deliberate divergence from upstream ``BrainTreebankSubject.electrode_labels``;
 ``test_voltage_order_matches_upstream`` subtracts this set so the drift guard
-still catches UNintended divergence.
+still catches UNintended divergence. Populating either dict changes the cache
+key, so the cache is rebuilt (and re-scanned to confirm CAR-contaminated
+neighbors fall back to baseline)."""
 
-The 11 contacts below are the finalized list (Ben-approved 2026-06-14). Selection
-rule: an electrode is excluded iff it is separable from the clean population by
-**(a) recurrence** — pre-CAR voltage events_100/min above the clean ceiling
-(~0.14/min) in a MAJORITY of the subject's trials (single-trial subjects: the one
-trial) — **OR (b) catastrophic amplitude** — post-CAR |STFT| robust-z max above the
-clean ceiling (~2100), an event no biology reaches — **AND** the pre-CAR voltage
-robust-z breaches its floor in the same trial(s) (de-confounds CAR-halo and
-pure-spectral). The clean ceilings were measured across 25 BT sessions (voltage
-573, |STFT| 2094, events 0.14/min). sub_8 T2A13 was dropped (12→11) — below the
-clean ceiling on every axis, so the per-clip + winsor guards cover it instead.
-Populating this changes the cache key, so the cache is rebuilt (and re-scanned to
-confirm CAR-contaminated neighbors fall back to baseline)."""
+_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION: dict[tuple[int, int], tuple[str, ...]] = {}
+"""Per-SESSION ``(subject_id, trial_id) -> bad-contact`` override, the active
+GUARD-1 static source (per-session drop, Ben 2026-06-18).
+
+Electrode quality drifts across a subject's recording sessions, so STATIC is a
+per-session decision: each session's own GUARD-1 detector output IS its drop —
+there is NO cross-trial aggregation heuristic (no any/majority/pool collapse).
+Populated offline by the #207 scan → #208 collector; an entry is the cleaned
+static set ``static_bad_mask`` flagged for that one session. An explicit entry
+(even ``()``) takes precedence over the per-subject fallback; a missing entry
+falls back to :data:`_BT_V14_EXTRA_BAD_ELECTRODES` (transitional). Both the cache
+key (``study.iter_timelines`` folds ``extra_bad_electrodes(subject_id, trial_id)``
+into the per-session timeline) and the support order
+(``voltage_electrode_order(..., trial_id)``) read THIS dict with the SAME
+``(subject, trial)``, so per-session DP4 row-alignment holds by construction."""
 
 
-def extra_bad_electrodes(subject_id: int) -> frozenset[str]:
-    """Cleaned-label set of v14 statically-excluded flaky contacts for a subject
-    (:data:`_BT_V14_EXTRA_BAD_ELECTRODES`). THE single source both electrode-order
-    sites consult, so ``voltage_electrode_order`` (support/valid_mask) and
-    ``bt_load_raw`` (front-end voltage) drop exactly the same contacts."""
+def extra_bad_electrodes(
+    subject_id: int, trial_id: int | None = None
+) -> frozenset[str]:
+    """Cleaned-label set of v14 statically-excluded flaky contacts for a session.
+
+    THE single source both electrode-order sites consult, so
+    ``voltage_electrode_order`` (support/valid_mask) and ``bt_load_raw`` (front-end
+    voltage) drop exactly the same contacts for a given ``(subject, trial)``.
+
+    ``trial_id`` selects the per-session override
+    (:data:`_BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION`): an explicit entry for
+    ``(subject_id, trial_id)`` is returned verbatim (per-session REPLACES, does not
+    union with, the subject fallback). A ``None`` trial, or a trial with no
+    override entry, falls back to the per-subject
+    :data:`_BT_V14_EXTRA_BAD_ELECTRODES` (legacy/transitional) — so laptop audits
+    and the pre-bake production path keep today's behavior."""
+    sid = int(subject_id)
+    if trial_id is not None:
+        key = (sid, int(trial_id))
+        if key in _BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION:
+            return frozenset(
+                clean_bt_electrode_label(e)
+                for e in _BT_V14_EXTRA_BAD_ELECTRODES_PER_SESSION[key]
+            )
     return frozenset(
         clean_bt_electrode_label(e)
-        for e in _BT_V14_EXTRA_BAD_ELECTRODES.get(int(subject_id), ())
+        for e in _BT_V14_EXTRA_BAD_ELECTRODES.get(sid, ())
     )
 
 
@@ -251,7 +282,7 @@ def _is_trigger_label(electrode_label: str) -> bool:
 
 
 def voltage_electrode_order(
-    bt_root: str | Path, subject_id: int
+    bt_root: str | Path, subject_id: int, trial_id: int | None = None
 ) -> tuple[str, ...]:
     """Canonical voltage channel order — exactly the electrodes (and order) the
     v14 loader feeds the front-end.
@@ -265,6 +296,11 @@ def voltage_electrode_order(
     independent ``depth-wm.csv`` row order (C2 fix). Reading depth-wm row order
     instead silently routes every voltage into the wrong parcel for any subject
     whose corrupted/trigger/unmapped contacts shift the two orders apart.
+
+    ``trial_id`` selects the per-session STATIC override (see
+    :func:`extra_bad_electrodes`): the support/valid_mask order then drops exactly
+    the contacts the loader drops for the SAME session. ``None`` (laptop audits /
+    pre-bake) uses the per-subject fallback — byte-identical to the legacy order.
 
     Replicated (rather than imported) so laptop-side audits run against the
     vendored fixtures without neuroprobe; guarded against upstream drift by
@@ -292,10 +328,11 @@ def voltage_electrode_order(
         clean_bt_electrode_label(e)
         for e in _BT_MISSING_COORDINATE_ELECTRODES.get(sid, ())
     )
-    # v14 flaky-contact static exclusion — kept in lockstep with bt_load_raw via
-    # the shared extra_bad_electrodes() source so support/valid_mask and the
-    # front-end voltage drop the SAME contacts (DP4 row-alignment).
-    drop.update(extra_bad_electrodes(sid))
+    # v14 flaky-contact static exclusion (per-session) — kept in lockstep with
+    # bt_load_raw via the shared extra_bad_electrodes() source so support/valid_mask
+    # and the front-end voltage drop the SAME contacts for this (subject, trial)
+    # (DP4 row-alignment).
+    drop.update(extra_bad_electrodes(sid, trial_id))
 
     order = tuple(
         e for e in cleaned if e not in drop and not _is_trigger_label(e)
@@ -347,9 +384,12 @@ def lite_electrode_set(subject_id: int) -> frozenset[str]:
     )
 
 
-def lite_voltage_mask(bt_root: str | Path, subject_id: int) -> np.ndarray:
+def lite_voltage_mask(
+    bt_root: str | Path, subject_id: int, trial_id: int | None = None
+) -> np.ndarray:
     """Boolean mask over :func:`voltage_electrode_order` selecting the Neuroprobe
-    Lite electrodes for this subject.
+    Lite electrodes for this subject (``trial_id`` threads the per-session STATIC
+    drop so the mask aligns to the post-STATIC voltage order for that session).
 
     Reproduces upstream ``BrainTreebankSubjectTrialBenchmarkDataset`` Lite
     subsetting (``datasets.py``: ``[full.index(e) for e in lite if e in full]``)
@@ -362,16 +402,22 @@ def lite_voltage_mask(bt_root: str | Path, subject_id: int) -> np.ndarray:
     ``support[c]`` ↔ ``electrode_tokens[c]`` aligned after subsetting.
     """
     lite_set = lite_electrode_set(subject_id)
-    order = voltage_electrode_order(bt_root, subject_id)
+    order = voltage_electrode_order(bt_root, subject_id, trial_id)
     return np.array([e in lite_set for e in order], dtype=bool)
 
 
-def lite_voltage_order(bt_root: str | Path, subject_id: int) -> tuple[str, ...]:
+def lite_voltage_order(
+    bt_root: str | Path, subject_id: int, trial_id: int | None = None
+) -> tuple[str, ...]:
     """The subject's Lite electrodes in voltage order (``voltage_order`` filtered
     to the Lite set). Set-equal to upstream's realized ``electrode_labels`` for
-    the Lite Dataset; see :func:`lite_voltage_mask` for why order is free."""
-    order = voltage_electrode_order(bt_root, subject_id)
-    mask = lite_voltage_mask(bt_root, subject_id)
+    the Lite Dataset; see :func:`lite_voltage_mask` for why order is free.
+
+    ``trial_id`` threads the per-session STATIC drop so the Lite montage is the
+    post-STATIC survivors FOR THAT session (per-session drop applies to eval-Lite
+    too, Ben 2026-06-18)."""
+    order = voltage_electrode_order(bt_root, subject_id, trial_id)
+    mask = lite_voltage_mask(bt_root, subject_id, trial_id)
     return tuple(e for e, keep in zip(order, mask) if keep)
 
 
@@ -642,11 +688,12 @@ def _drop_single_electrode_parcels(result: HardLabelSupport) -> HardLabelSupport
     )
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=256)
 def aligned_voltage_support(
     bt_root: str | Path,
     subject_id: int,
     *,
+    trial_id: int | None = None,
     parcel_labels: tuple[str, ...] = V14_DK_PARCEL_LABELS,
     unmapped_policy: tp.Literal["raise", "zero"] = "raise",
     label_column: str = DEFAULT_BT_LABEL_COLUMN,
@@ -688,9 +735,9 @@ def aligned_voltage_support(
     ``lru_cache`` does not cache exceptions, so the guard re-checks every call.
     """
     order = (
-        lite_voltage_order(bt_root, subject_id)
+        lite_voltage_order(bt_root, subject_id, trial_id)
         if electrode_set == "lite"
-        else voltage_electrode_order(bt_root, subject_id)
+        else voltage_electrode_order(bt_root, subject_id, trial_id)
     )
     anatomy = load_public_bt_anatomy(
         bt_root, int(subject_id), label_column=label_column

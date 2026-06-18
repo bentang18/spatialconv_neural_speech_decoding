@@ -367,17 +367,23 @@ class BTShaftMaskExtractor(_BaseStatic):  # type: ignore[misc,valid-type]
         # Imports kept local so the module stays importable without
         # neuralset (tests import the inner ``ShaftMaskExtractor`` /
         # ``SubjectAnatomy`` directly).
-        from speech_decoding.extractors.dk_support import _coerce_subject_id
+        from speech_decoding.extractors.dk_support import (
+            _coerce_subject_id,
+            _coerce_trial_id,
+        )
         from speech_decoding.studies.braintreebank.anatomy import (
             voltage_electrode_order,
         )
 
         subject_id = _coerce_subject_id(getattr(event, "subject"))
+        trial_id = _coerce_trial_id(event)
         # Shaft membership is parsed from the physical label, so this aligns to
         # the VOLTAGE electrode order (same axis as support / valid_mask /
         # electrode_tokens) and needs no DK-vocab filter — an out-of-vocab
-        # electrode still sits on a physical shaft (C1/C2 fix).
-        electrode_labels = voltage_electrode_order(self.bt_root, subject_id)
+        # electrode still sits on a physical shaft (C1/C2 fix). ``trial_id`` threads
+        # the per-session STATIC drop so the shaft mask aligns to the same
+        # per-session montage as the front-end voltage (DP4).
+        electrode_labels = voltage_electrode_order(self.bt_root, subject_id, trial_id)
         n_real = len(electrode_labels)
         if n_real > self.c_max:
             raise ValueError(

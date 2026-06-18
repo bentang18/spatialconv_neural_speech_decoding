@@ -101,7 +101,7 @@ def bt_load_raw(
     # to scan a montage from which the bad contacts were already removed). The
     # cache/training path always uses the default (True) so its montage is unchanged.
     if drop_static:
-        extra_bad = extra_bad_electrodes(subject_id)
+        extra_bad = extra_bad_electrodes(subject_id, trial_id)
         if extra_bad:
             keep = [i for i, name in enumerate(ch_names) if name not in extra_bad]
             if len(keep) != len(ch_names):
