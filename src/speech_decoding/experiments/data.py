@@ -51,20 +51,53 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
 
     ``session_key`` is the positional per-segment session id (len == dataset). With
     ``shuffle`` the within-session order and the cross-session batch order are both
-    permuted from ``generator`` each epoch; without it the order is deterministic.
+    permuted each epoch (seeded by ``seed + epoch``); without it the order is
+    deterministic.
+
+    **DDP self-sharding.** A custom batch_sampler is NOT a ``BatchSampler`` subclass,
+    so Lightning cannot auto-inject a ``DistributedSampler`` on top of it — the owning
+    Trainer therefore sets ``use_distributed_sampler=False`` and the sampler shards
+    itself. Every rank builds the SAME full batch list (the shuffle is seeded by
+    ``seed + epoch``, rank-INDEPENDENT), then takes a disjoint ``[rank::world]`` stride
+    of an even-padded copy. So each rank draws an EQUAL count of session-homogeneous
+    batches (no DDP uneven-input hang) and every sample is still seen once per epoch
+    across the cohort. ``world`` / ``rank`` are read LAZILY from ``torch.distributed``
+    at iterate/len time, because the loader is built before the DDP process group
+    exists (so they cannot be captured at construction).
     """
 
-    def __init__(self, session_key, batch_size, *, shuffle, drop_last, generator):
+    def __init__(
+        self, session_key, batch_size, *, shuffle, drop_last,
+        seed=0, num_replicas=None, rank=None,
+    ):
         self._groups: dict = {}
         for idx, key in enumerate(session_key):
             self._groups.setdefault(key, []).append(idx)
         self._batch_size = int(batch_size)
         self._shuffle = bool(shuffle)
         self._drop_last = bool(drop_last)
-        self._generator = generator
+        self._seed = int(seed)
+        self._epoch = 0
+        # None => detect lazily from torch.distributed at iterate/len time.
+        self._num_replicas = num_replicas
+        self._rank = rank
 
-    def _build_batches(self) -> list[list[int]]:
-        g = self._generator
+    def set_epoch(self, epoch: int) -> None:
+        # Lightning calls this at each train-epoch start. Reshuffles
+        # deterministically AND identically across ranks (seed + epoch), so the
+        # disjoint sharding below stays a clean partition.
+        self._epoch = int(epoch)
+
+    def _dist(self) -> tuple[int, int]:
+        if self._num_replicas is not None:
+            return int(self._num_replicas), int(self._rank or 0)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_world_size(), torch.distributed.get_rank()
+        return 1, 0
+
+    def _all_batches(self) -> list[list[int]]:
+        # Rank-independent full list: same seed+epoch on every rank.
+        g = torch.Generator().manual_seed(self._seed + self._epoch)
         batches: list[list[int]] = []
         for idxs in self._groups.values():
             order = list(idxs)
@@ -81,8 +114,21 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
             batches = [batches[i] for i in perm]
         return batches
 
+    def _sharded(self) -> list[list[int]]:
+        batches = self._all_batches()
+        world, rank = self._dist()
+        if world <= 1:
+            return batches
+        n = len(batches)
+        per_rank = (n + world - 1) // world
+        padded_total = per_rank * world
+        if n > 0 and padded_total > n:
+            # wrap-around pad (like DistributedSampler) → equal count per rank.
+            batches = batches + [batches[i % n] for i in range(padded_total - n)]
+        return batches[rank:padded_total:world]
+
     def __iter__(self):
-        return iter(self._build_batches())
+        return iter(self._sharded())
 
     def __len__(self) -> int:
         total = 0
@@ -91,7 +137,10 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
                 total += len(idxs) // self._batch_size
             else:
                 total += (len(idxs) + self._batch_size - 1) // self._batch_size
-        return total
+        world, _ = self._dist()
+        if world <= 1:
+            return total
+        return (total + world - 1) // world
 
 
 def _make_worker_init_fn(seed: int):
@@ -251,7 +300,9 @@ class Data(pydantic.BaseModel):
                     self.batch_size,
                     shuffle=True,
                     drop_last=False,
-                    generator=train_generator,
+                    # rank-INDEPENDENT seed so every DDP rank builds the same
+                    # full batch list before self-sharding (see class docstring).
+                    seed=worker_seed if worker_seed is not None else 0,
                 )
             else:
                 loader_kwargs["batch_size"] = self.batch_size
