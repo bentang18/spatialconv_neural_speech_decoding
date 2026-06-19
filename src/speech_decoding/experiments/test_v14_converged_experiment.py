@@ -62,7 +62,8 @@ def test_locked_mask_and_ema_defaults() -> None:
     assert xp.ema_tau == 0.99925
     assert xp.m2_hg_start_rate == 0.20
     assert xp.m2_hg_span == 3
-    assert xp.m2_beta_span == 4
+    assert xp.m2_beta_start_rate == 0.30   # 2026-06-19: beta span-mask coverage dial
+    assert xp.m2_beta_span == 2            # 2026-06-19: span 2 on the coarse 250 ms grid
     assert xp.m4_parcel_mask_ratio == 0.20
     assert xp.mask_seed == 0
     assert xp.x_name == "electrode_tokens_slow"

@@ -74,7 +74,8 @@ def test_3stft_mask_geometry_defaults(tmp_path) -> None:
     xp = _converged(tmp_path)
     assert xp.m2_hg_start_rate == pytest.approx(0.20)
     assert xp.m2_hg_span == 3
-    assert xp.m2_beta_span == 4
+    assert xp.m2_beta_start_rate == pytest.approx(0.30)  # 2026-06-19 beta coverage dial
+    assert xp.m2_beta_span == 2                          # 2026-06-19 span 2 (coarse grid)
     assert xp.m4_parcel_mask_ratio == pytest.approx(0.20)
 
 
@@ -82,10 +83,12 @@ def test_3stft_mask_geometry_flags_thread(tmp_path) -> None:
     # The §8.7 sister knobs override from dispatch (mask geometry, tuned often).
     xp = _converged(
         tmp_path, converged_m2_hg_start_rate=0.35, converged_m2_hg_span=5,
-        converged_m2_beta_span=6, converged_m4_parcel_mask_ratio=0.30,
+        converged_m2_beta_start_rate=0.45, converged_m2_beta_span=6,
+        converged_m4_parcel_mask_ratio=0.30,
     )
     assert xp.m2_hg_start_rate == pytest.approx(0.35)
     assert xp.m2_hg_span == 5
+    assert xp.m2_beta_start_rate == pytest.approx(0.45)
     assert xp.m2_beta_span == 6
     assert xp.m4_parcel_mask_ratio == pytest.approx(0.30)
 

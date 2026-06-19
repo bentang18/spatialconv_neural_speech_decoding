@@ -1,7 +1,7 @@
 """Quantitative TDD for the online linear probe's pure core + callback gating.
 
 Spec: ``reports/online_probe_spec_2026_06_18.md``. Everything here is numpy/torch
-only — the load-bearing decision logic (time-binning on the real 38-token clock,
+only — the load-bearing decision logic (time-binning on the real 30-token clock,
 electrode→parcel pooling, dual-form ridge, contiguous 2-fold, parcel intersection,
 firewall) is checked with synthetic features against hand-computed expectations,
 no BT / DCC. ``run_probe`` + the callback are exercised with a fake tap-model so
@@ -21,17 +21,17 @@ from speech_decoding.models.v14_converged import token_metadata
 
 # --------------------------------------------------------------- time binning
 def test_time_bin_matches_real_converged_clock_k2() -> None:
-    """On the real 38-token clock (slow slots {0,8} / beta {0,2,…,14} / hg {0,…,15}),
+    """On the real 30-token clock (slow slots {0,8} / beta {0,4,8,12} / hg {0,…,15}),
     K=2 splits at 0.5 s = slot//8. Per-token counts scale by each band's freq-patch
-    count: slow 3 freq × (1+1) = (3,3), beta 2 × (4+4) = (8,8), hg 1 × (8+8) = (8,8)
-    → 19 early / 19 late of the 38 tokens."""
+    count: slow 3 freq × (1+1) = (3,3), beta 2 × (2+2) = (4,4), hg 1 × (8+8) = (8,8)
+    → 15 early / 15 late of the 30 tokens (beta tk=4: 8 beta tokens, slots {0,4,8,12})."""
     band_id, freq_id, time_slot = token_metadata()
     assert int(time_slot.max()) == 15  # span = 16 slots = 1 s on the HG clock
     tb = op.time_bin_of_slot(time_slot, 2)
-    for bi, (early, late) in {0: (3, 3), 1: (8, 8), 2: (8, 8)}.items():
+    for bi, (early, late) in {0: (3, 3), 1: (4, 4), 2: (8, 8)}.items():
         sel = tb[band_id == bi]
         assert int((sel == 0).sum()) == early and int((sel == 1).sum()) == late
-    assert int((tb == 0).sum()) == 19 and int((tb == 1).sum()) == 19
+    assert int((tb == 0).sum()) == 15 and int((tb == 1).sum()) == 15
 
 
 def test_time_bin_k1_collapses_all() -> None:

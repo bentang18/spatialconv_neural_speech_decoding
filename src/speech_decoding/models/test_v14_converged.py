@@ -2,7 +2,7 @@
 
 Component 1: the 3STFT per-electrode frontend tokenizer. Tests pin the LOCKED
 ladder geometry (FE spec §2/§5), the lossless-lift patch dims, electrode
-ISOLATION (Stage-1 contract), and the shared 8:2:1 RoPE clock.
+ISOLATION (Stage-1 contract), and the shared 8:4:1 RoPE clock.
 """
 
 from __future__ import annotations
@@ -16,27 +16,27 @@ from speech_decoding.models.v14_encoder import _apply_rope
 
 # ----------------------------------------------------------- band geometry
 def test_band_geometry_matches_locked_table() -> None:
-    # FE spec §2: slow 3×2=6, beta 2×8=16, HG 1×16=16 → 38 tokens; F_p 3+2+1=6.
+    # 1 s: slow 3×2=6, beta 2×4=8 (tk=4), HG 1×16=16 → 30 tokens; F_p 3+2+1=6.
     assert (vc.SLOW.n_freq_patches, vc.SLOW.n_time_patches, vc.SLOW.n_tokens) == (3, 2, 6)
-    assert (vc.BETA.n_freq_patches, vc.BETA.n_time_patches, vc.BETA.n_tokens) == (2, 8, 16)
+    assert (vc.BETA.n_freq_patches, vc.BETA.n_time_patches, vc.BETA.n_tokens) == (2, 4, 8)
     assert (vc.HG.n_freq_patches, vc.HG.n_time_patches, vc.HG.n_tokens) == (1, 16, 16)
-    assert vc.N_TOKENS == 38
+    assert vc.N_TOKENS == 30
     assert vc.N_FREQ_PATCHES == 6
 
 
 def test_patch_input_dims_are_lossless_lift() -> None:
-    # FE §5: patch input dim = fk·tk·channels = slow 8, beta 6, HG 18.
+    # FE §5: patch input dim = fk·tk·channels = slow 8, beta 12 (tk=4), HG 18.
     assert vc.SLOW.patch_input_dim == 8
-    assert vc.BETA.patch_input_dim == 6
+    assert vc.BETA.patch_input_dim == 12
     assert vc.HG.patch_input_dim == 18
 
 
-def test_time_patch_strides_are_8_2_1() -> None:
-    # FE §6: tk=2 everywhere → strides tk·hop = N → slow 1024 / beta 256 / HG 128.
+def test_time_patch_strides() -> None:
+    # strides = tk·hop: slow 2·512=1024 / beta 4·128=512 / HG 2·64=128.
     assert vc.SLOW.time_patch_stride_samples == 1024
-    assert vc.BETA.time_patch_stride_samples == 256
+    assert vc.BETA.time_patch_stride_samples == 512
     assert vc.HG.time_patch_stride_samples == 128
-    assert vc.SLOW.kernel_time == vc.BETA.kernel_time == vc.HG.kernel_time == 2
+    assert (vc.SLOW.kernel_time, vc.BETA.kernel_time, vc.HG.kernel_time) == (2, 4, 2)
 
 
 # ------------------------------------------------------------- tokenizer I/O
@@ -50,7 +50,7 @@ def _fake_bands(B: int, C: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
 def test_tokenizer_output_shape() -> None:
     tok = vc.ThreeBandTokenizer(d_model=32)
     out = tok(*_fake_bands(2, 7))
-    assert out.shape == (2, 7, 38, 32)
+    assert out.shape == (2, 7, 30, 32)
 
 
 def test_tokenizer_conv_fan_in_matches_patch_dims() -> None:
@@ -63,21 +63,21 @@ def test_tokenizer_conv_fan_in_matches_patch_dims() -> None:
 
 def test_tokenizer_metadata_band_layout() -> None:
     tok = vc.ThreeBandTokenizer(d_model=8)
-    assert tok.band_id.tolist() == [0] * 6 + [1] * 16 + [2] * 16
+    assert tok.band_id.tolist() == [0] * 6 + [1] * 8 + [2] * 16
     # freq_global_id spans [0,6); slow 0..2, beta 3..4, HG 5.
     assert set(tok.freq_global_id.tolist()) == set(range(6))
     assert tok.freq_global_id[:6].max().item() == 2          # slow uses 0..2
-    assert set(tok.freq_global_id[6:22].tolist()) == {3, 4}  # beta uses 3,4
-    assert set(tok.freq_global_id[22:].tolist()) == {5}      # HG uses 5
+    assert set(tok.freq_global_id[6:14].tolist()) == {3, 4}  # beta uses 3,4 (8 tok)
+    assert set(tok.freq_global_id[14:].tolist()) == {5}      # HG uses 5
 
 
-def test_tokenizer_time_slot_8_2_1_clock() -> None:
+def test_tokenizer_time_slot_8_4_1_clock() -> None:
     tok = vc.ThreeBandTokenizer(d_model=8)
     slow_slots = tok.time_slot[:6]                  # ×8, tp∈{0,1}
-    beta_slots = tok.time_slot[6:22]                # ×2, tp∈0..7
-    hg_slots = tok.time_slot[22:]                   # ×1, tp∈0..15
+    beta_slots = tok.time_slot[6:14]                # ×4, tp∈0..3 (tk=4)
+    hg_slots = tok.time_slot[14:]                   # ×1, tp∈0..15
     assert set(slow_slots.tolist()) == {0, 8}
-    assert set(beta_slots.tolist()) == {0, 2, 4, 6, 8, 10, 12, 14}
+    assert set(beta_slots.tolist()) == {0, 4, 8, 12}
     assert set(hg_slots.tolist()) == set(range(16))
     # HG defines the finest grid → max slot 15 spans the full 1 s clip.
     assert tok.time_slot.max().item() == 15
@@ -138,34 +138,35 @@ def test_m2_slow_always_exempt() -> None:
     # FE §8.2: slow is EXEMPT — never an M2 target, under any draw.
     for seed in range(25):
         m = vc.sample_m2_mask(_gen(seed))
-        assert m.shape == (38,)
+        assert m.shape == (30,)
         assert not m[:6].any(), f"slow masked at seed {seed} — must be exempt"
 
 
 def test_m2_beta_freq_tube_is_50pct_both_subbands() -> None:
-    # FE §8.5: beta = 1 start × width 4, BOTH freq-patches co-masked = 8/16 = 50%.
+    # 2026-06-19: beta = round(0.30·4)=1 start × span 2, BOTH freq co-masked = 4/8 = 50%.
     for seed in range(25):
-        beta = vc.sample_m2_mask(_gen(seed))[6:22].reshape(2, 8)  # (F_p, T_p)
-        assert beta.sum().item() == 8, "beta tube = 4 time × 2 freq = 8"
+        beta = vc.sample_m2_mask(_gen(seed))[6:14].reshape(2, 4)  # (F_p, T_p)
+        assert beta.sum().item() == 4, "beta = 2 time × 2 freq = 4"
         assert torch.equal(beta[0], beta[1]), "freq-tube: sub-bands co-masked"
         cols = beta[0].nonzero().flatten()
-        assert cols.numel() == 4 and (cols[-1] - cols[0]).item() == 3, "contiguous w=4"
+        assert cols.numel() == 2 and (cols[-1] - cols[0]).item() == 1, "contiguous w=2"
 
 
 def test_m2_hg_span_mask_coverage() -> None:
     # FE §8.5 (Ben 2026-06-18 → 20% default): HG = round(0.20·16)=3 distinct starts
     # × width 3, overlaps allowed. Distinct starts ⇒ union ∈ [5,9] (5 when the 3
-    # starts are consecutive → one run of 5; 9 when disjoint).
+    # starts are consecutive → one run of 5; 9 when disjoint). HG now at [14:30]
+    # (beta shrank to 8 tokens at tk=4).
     for seed in range(25):
-        hg = vc.sample_m2_mask(_gen(seed))[22:38]
+        hg = vc.sample_m2_mask(_gen(seed))[14:30]
         assert 5 <= hg.sum().item() <= 9, f"HG coverage {hg.sum()} out of [5,9]"
 
 
 def test_m2_total_in_maskable_pool_range() -> None:
-    # FE §8.6: pool = 32 (beta+HG); realized ~beta 8 + HG 5–9 ≈ 13–17 (20% default).
+    # pool = 24 (beta 8 + HG 16); realized ~beta 4 + HG 5–9 ≈ 9–13 (1 s).
     counts = [vc.sample_m2_mask(_gen(s)).sum().item() for s in range(60)]
-    assert all(13 <= c <= 17 for c in counts)
-    assert 13 <= sum(counts) / len(counts) <= 17
+    assert all(9 <= c <= 13 for c in counts)
+    assert 9 <= sum(counts) / len(counts) <= 13
 
 
 def test_m2_determinism() -> None:
@@ -173,10 +174,19 @@ def test_m2_determinism() -> None:
     assert not torch.equal(vc.sample_m2_mask(_gen(7)), vc.sample_m2_mask(_gen(8)))
 
 
-def test_m2_beta_width_sister() -> None:
-    # §8.3 bleed floor: min width 3 (the redundancy sister sets beta_span).
-    beta = vc.sample_m2_mask(_gen(0), cfg=vc.M2MaskConfig(beta_span=3))[6:22].reshape(2, 8)
+def test_m2_beta_span_sister() -> None:
+    # beta span width is a tunable sister (here 3 → 3 distinct time × 2 freq = 6).
+    beta = vc.sample_m2_mask(_gen(0), cfg=vc.M2MaskConfig(beta_span=3))[6:14].reshape(2, 4)
     assert beta.sum().item() == 6  # width 3 × 2 freq-patches
+
+
+def test_m2_beta_start_rate_is_coverage_dial() -> None:
+    # beta_start_rate is THE beta coverage knob — higher rate, more beta masked.
+    lo = [vc.sample_m2_mask(_gen(s), cfg=vc.M2MaskConfig(beta_start_rate=0.10))[6:14].sum().item()
+          for s in range(50)]
+    hi = [vc.sample_m2_mask(_gen(s), cfg=vc.M2MaskConfig(beta_start_rate=0.50))[6:14].sum().item()
+          for s in range(50)]
+    assert sum(hi) / 50 > sum(lo) / 50
 
 
 def test_m2_hg_start_rate_is_coverage_dial() -> None:
@@ -242,7 +252,7 @@ def _rotate_at_slot(key_rope: torch.Tensor, slot: int, vec: torch.Tensor) -> tor
 def test_frontend_encoder_output_shape() -> None:
     fe = vc.FrontendEncoder(d_model=32, n_heads=4, n_layers=2).eval()
     out = fe(*_fake_bands(2, 5))
-    assert out.shape == (2, 5, 38, 32)
+    assert out.shape == (2, 5, 30, 32)
 
 
 def test_frontend_encoder_rope_table_spans_the_clip() -> None:
@@ -344,7 +354,7 @@ def _keep_visible(B: int, C: int, seed: int) -> tuple[torch.Tensor, torch.Tensor
     g = _gen(seed)
     keep = torch.rand(B, C, generator=g) > 0.33
     keep[:, 0] = True                                    # ≥1 kept electrode / sample
-    visible = torch.ones(B, C, 38, dtype=torch.bool)
+    visible = torch.ones(B, C, 30, dtype=torch.bool)
     for b in range(B):
         for c in range(C):
             if bool(keep[b, c]):
@@ -391,8 +401,8 @@ def test_frontend_ragged_drops_tubed_padded_and_masked_to_zero() -> None:
 
 
 def test_frontend_ragged_is_per_electrode_never_dense_over_electrodes() -> None:
-    # Ben 06-18: "the SA is per each electrode's 38 token sequence — never dense
-    # over all electrodes — 38 tokens at a time only." Proof: encoding ONE kept
+    # Ben 06-18: "the SA is per each electrode's token sequence — never dense
+    # over all electrodes — one electrode's tokens at a time only." Proof: encoding ONE kept
     # electrode alone reproduces its slice of the full ragged pass bit-for-bit, so
     # no electrode's output depends on any other (no cross-electrode K/V pathway).
     torch.manual_seed(0)
@@ -412,7 +422,7 @@ def test_frontend_ragged_is_per_electrode_never_dense_over_electrodes() -> None:
                     hg[b : b + 1, c : c + 1],
                     keep[b : b + 1, c : c + 1],
                     visible[b : b + 1, c : c + 1],
-                )                                              # (1,1,38,d)
+                )                                              # (1,1,30,d)
                 assert torch.allclose(solo[0, 0], full[b, c], atol=1e-6)
 
 
@@ -424,7 +434,7 @@ def test_frontend_ragged_teacher_full_set_equals_dense() -> None:
     B, C = 2, 5
     slow, beta, hg = _fake_bands(B, C)
     keep = torch.ones(B, C, dtype=torch.bool)
-    visible = torch.ones(B, C, 38, dtype=torch.bool)
+    visible = torch.ones(B, C, 30, dtype=torch.bool)
     with torch.no_grad():
         dense = fe(slow, beta, hg)                              # no mask = teacher
         ragged = fe.forward_ragged(slow, beta, hg, keep, visible)
@@ -433,7 +443,7 @@ def test_frontend_ragged_teacher_full_set_equals_dense() -> None:
 
 # ===================================================== LatentEncoder (Stage 2)
 def _fake_feats(B: int, C: int, d: int = 32) -> torch.Tensor:
-    return torch.randn(B, C, 38, d)
+    return torch.randn(B, C, 30, d)
 
 
 def test_latent_output_shape_preserves_electrode_tokens() -> None:
@@ -442,7 +452,7 @@ def test_latent_output_shape_preserves_electrode_tokens() -> None:
     feats = _fake_feats(2, 7)
     pe = torch.randint(0, 74, (2, 7))
     out = lat(feats, pe)
-    assert out.shape == (2, 7, 38, 32)
+    assert out.shape == (2, 7, 30, 32)
 
 
 def test_latent_does_cross_electrode_mixing() -> None:
@@ -455,7 +465,11 @@ def test_latent_does_cross_electrode_mixing() -> None:
     with torch.no_grad():
         base = lat(feats, pe)
         feats2 = feats.clone()
-        feats2[:, 2] += 5.0                       # perturb only electrode 2
+        # Structured perturbation (NOT a constant: the input LayerNorm removes a
+        # per-token constant offset, so a flat `+= 5` is a near no-op even on the
+        # perturbed electrode). Random per-cell shift survives the norm.
+        g = _gen(99)
+        feats2[:, 2] += torch.randn(feats.shape[2], feats.shape[3], generator=g) * 5.0
         out = lat(feats2, pe)
     # every OTHER electrode's output changed → information crossed electrodes.
     for e in (0, 1, 3):
@@ -513,7 +527,7 @@ def test_latent_ragged_key_mask_isolates_padding() -> None:
     lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
     feats3 = _fake_feats(1, 3)
     pe3 = torch.tensor([[1, 2, 3]])
-    pad = torch.randn(1, 1, 38, 32) * 9.0        # loud junk in the pad slot
+    pad = torch.randn(1, 1, 30, 32) * 9.0        # loud junk in the pad slot
     feats4 = torch.cat([feats3, pad], dim=1)
     pe4 = torch.tensor([[1, 2, 3, 0]])
     mask4 = torch.tensor([[True, True, True, False]])
@@ -530,7 +544,7 @@ def _latent_vis(B: int, C: int, seed: int) -> torch.Tensor:
     g = _gen(seed)
     untubed = torch.rand(B, C, generator=g) > 0.33
     untubed[:, 0] = True
-    vis = torch.zeros(B, C, 38, dtype=torch.bool)
+    vis = torch.zeros(B, C, 30, dtype=torch.bool)
     for b in range(B):
         for c in range(C):
             if bool(untubed[b, c]):
@@ -566,11 +580,11 @@ def test_latent_ragged_padding_independence() -> None:
     lat = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
     feats3 = _fake_feats(1, 3)
     pe3 = torch.tensor([[1, 2, 3]])
-    vis3 = torch.ones(1, 3, 38, dtype=torch.bool)
-    pad = torch.randn(1, 1, 38, 32) * 9.0
+    vis3 = torch.ones(1, 3, 30, dtype=torch.bool)
+    pad = torch.randn(1, 1, 30, 32) * 9.0
     feats4 = torch.cat([feats3, pad], dim=1)
     pe4 = torch.tensor([[1, 2, 3, 0]])
-    vis4 = torch.cat([vis3, torch.zeros(1, 1, 38, dtype=torch.bool)], dim=1)
+    vis4 = torch.cat([vis3, torch.zeros(1, 1, 30, dtype=torch.bool)], dim=1)
     with torch.no_grad():
         out3 = lat.forward_ragged(feats3, pe3, vis3)
         out4 = lat.forward_ragged(feats4, pe4, vis4)
@@ -594,8 +608,9 @@ def test_token_metadata_single_source_matches_tokenizer() -> None:
     assert torch.equal(lat.time_slot, tok.time_slot)
 
 
-def test_band_slot_mults_are_8_2_1() -> None:
-    assert vc.band_slot_mults() == [8, 2, 1]
+def test_band_slot_mults_are_8_4_1() -> None:
+    # strides slow 1024 : beta 512 : HG 128 → mults 8 : 4 : 1 (beta tk=4).
+    assert vc.band_slot_mults() == [8, 4, 1]
 
 
 # ============================================ M4 teacher target (electrode-mean)
@@ -649,7 +664,7 @@ def test_m4_predictor_output_shape() -> None:
     ctx_slot = torch.randint(0, 16, (10,))
     qp = torch.tensor([[3, 7], [1, 5]])
     out = pred(ctx, ctx_slot, qp)
-    assert out.shape == (2, 2, 38, 32)        # (B, P, 38, d_model teacher dim)
+    assert out.shape == (2, 2, 30, 32)        # (B, P, 30, d_model teacher dim)
 
 
 def test_m4_predictor_predicts_from_context() -> None:
@@ -682,7 +697,7 @@ def test_m4_predictor_parcel_tag_addresses_the_target() -> None:
 
 
 def test_m4_predictor_freq_time_cells_are_distinguished() -> None:
-    # The 38 predicted cells of one parcel must NOT collapse to one value —
+    # The 30 predicted cells of one parcel must NOT collapse to one value —
     # the freq-tag + RoPE-time give each cell a distinct query.
     torch.manual_seed(2)
     pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
@@ -690,9 +705,9 @@ def test_m4_predictor_freq_time_cells_are_distinguished() -> None:
     ctx = _ctx(1, 8)
     ctx_slot = torch.randint(0, 16, (8,))
     with torch.no_grad():
-        out = pred(ctx, ctx_slot, torch.tensor([[5]]))[0, 0]   # (38, d)
+        out = pred(ctx, ctx_slot, torch.tensor([[5]]))[0, 0]   # (30, d)
     spread = out.std(dim=0).mean().item()
-    assert spread > 1e-4, "all 38 cells collapsed — freq/time tag not addressing"
+    assert spread > 1e-4, "all 30 cells collapsed — freq/time tag not addressing"
 
 
 def test_m4_predictor_ragged_context_key_mask_isolates_padding() -> None:
@@ -965,7 +980,7 @@ def test_forward_ragged_equals_dense_with_padding() -> None:
 def test_m2_loss_ragged_equals_dense() -> None:
     # Stage 3 (Ben 06-18): the ragged M2 gathers only un-tubed target electrodes,
     # each electrode's visible context + masked queries — output-identical to the
-    # dense oracle that runs all B*C rows with 38-token key-masked context.
+    # dense oracle that runs all B*C rows with 30-token key-masked context.
     torch.manual_seed(0)
     model = _ssl_model().eval()
     slow, beta, hg, pe, emask, m = _ssl_batch(B=3, C=7, seed=4)
@@ -995,9 +1010,9 @@ def test_m2_loss_ragged_ignores_padded_electrodes() -> None:
             s_f, t_f, m["m2_mask"], student_vis, emask, m["tube_mask"])
         # pad with a junk electrode marked unreal + (defensively) M2-masked nowhere
         B, C = emask.shape
-        s_f2 = torch.cat([s_f, torch.randn(B, 1, 38, s_f.shape[-1]) * 9.0], dim=1)
-        t_f2 = torch.cat([t_f, torch.randn(B, 1, 38, t_f.shape[-1]) * 9.0], dim=1)
-        m2_2 = torch.cat([m["m2_mask"], torch.zeros(B, 1, 38, dtype=torch.bool)], dim=1)
+        s_f2 = torch.cat([s_f, torch.randn(B, 1, 30, s_f.shape[-1]) * 9.0], dim=1)
+        t_f2 = torch.cat([t_f, torch.randn(B, 1, 30, t_f.shape[-1]) * 9.0], dim=1)
+        m2_2 = torch.cat([m["m2_mask"], torch.zeros(B, 1, 30, dtype=torch.bool)], dim=1)
         vis2 = ~m2_2
         emask2 = torch.cat([emask, torch.zeros(B, 1, dtype=torch.bool)], dim=1)
         tube2 = torch.cat([m["tube_mask"], torch.zeros(B, 1, dtype=torch.bool)], dim=1)
@@ -1019,7 +1034,7 @@ def _m4_pieces(model, batch):
 def test_m4_loss_ragged_equals_dense() -> None:
     # Stage 4 (Ben 06-18): the ragged M4 physically gathers the visible un-tubed
     # latent SEE-set across all electrodes, predicts only the tubed parcels —
-    # output-identical to the dense oracle that key-masks the full C*38 context.
+    # output-identical to the dense oracle that key-masks the full C*30 context.
     torch.manual_seed(0)
     model = _ssl_model().eval()
     batch = _ssl_batch(B=3, C=8, seed=2)
@@ -1148,7 +1163,7 @@ def test_ssl_overfits_one_batch() -> None:
     batch = _ssl_batch(seed=1)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     first = _run(model, batch)["loss"].item()
-    for _ in range(40):
+    for _ in range(60):  # 30-token geometry descends a touch slower/step than the old 38
         opt.zero_grad()
         loss = _run(model, batch)["loss"]
         loss.backward()
@@ -1164,7 +1179,7 @@ def test_sample_ssl_masks_shapes_and_invariants() -> None:
     pe = torch.randint(0, 6, (2, 8), generator=g)
     emask = torch.ones(2, 8, dtype=torch.bool)
     m = vc.sample_ssl_masks(pe, emask, g)
-    assert m["m2_mask"].shape == (2, 8, 38)
+    assert m["m2_mask"].shape == (2, 8, 30)
     assert m["tube_mask"].shape == (2, 8)
     # slow tokens (0..5) are never M2-masked (exempt)
     assert not m["m2_mask"][:, :, :6].any()
@@ -1195,7 +1210,7 @@ def test_encode_frontend_is_electrode_isolated() -> None:
     m = _ssl_model().eval()
     slow, beta, hg, _, _, _ = _ssl_batch()
     f0 = m.encode_frontend(slow, beta, hg)
-    assert f0.shape == (2, 6, 38, 32)
+    assert f0.shape == (2, 6, 30, 32)
     slow2 = slow.clone()
     slow2[:, 0] += 5.0                                   # perturb electrode 0 only
     f1 = m.encode_frontend(slow2, beta, hg)
@@ -1207,7 +1222,7 @@ def test_encode_latent_mixes_across_electrodes() -> None:
     m = _ssl_model().eval()
     slow, beta, hg, pe, emask, _ = _ssl_batch()
     l0 = m.encode_latent(slow, beta, hg, pe, electrode_mask=emask)
-    assert l0.shape == (2, 6, 38, 32)
+    assert l0.shape == (2, 6, 30, 32)
     slow2 = slow.clone()
     slow2[:, 0] += 5.0                                   # perturb electrode 0 only
     l1 = m.encode_latent(slow2, beta, hg, pe, electrode_mask=emask)
@@ -1225,7 +1240,7 @@ def test_probe_taps_differ_frontend_vs_latent() -> None:
 
 
 def test_probe_pool_masked_mean_excludes_padding() -> None:
-    feats = torch.randn(1, 4, 38, 8)
+    feats = torch.randn(1, 4, 30, 8)
     emask = torch.tensor([[True, True, False, False]])
     got = vc.probe_pool(feats, emask)
     want = feats[:, :2].mean(dim=(1, 2))                 # mean over the 2 real elecs
@@ -1491,13 +1506,14 @@ def test_bands_for_clip_len_5s_geometry() -> None:
     # slow(hop512)=21, beta(hop128)=81, HG(hop64)=161 (verified vs torch.stft).
     slow, beta, hg = vc.bands_for_clip_len(5.0)
     assert (slow.n_time_frames, beta.n_time_frames, hg.n_time_frames) == (21, 81, 161)
-    # time-patches = (frames - 2)//2 + 1 → 10 / 40 / 80
-    assert (slow.n_time_patches, beta.n_time_patches, hg.n_time_patches) == (10, 40, 80)
+    # time-patches = (frames - tk)//tk + 1 → slow (21-2)/2+1=10, beta (81-4)/4+1=20,
+    # HG (161-2)/2+1=80.
+    assert (slow.n_time_patches, beta.n_time_patches, hg.n_time_patches) == (10, 20, 80)
     # freq grid is clip-length INVARIANT (unchanged from the locked table)
     assert (slow.n_freq_patches, beta.n_freq_patches, hg.n_freq_patches) == (3, 2, 1)
-    # tokens = F_p · T_p → 30 + 80 + 80 = 190
-    assert (slow.n_tokens, beta.n_tokens, hg.n_tokens) == (30, 80, 80)
-    assert sum(b.n_tokens for b in (slow, beta, hg)) == 190
+    # tokens = F_p · T_p → 30 + 40 + 80 = 150
+    assert (slow.n_tokens, beta.n_tokens, hg.n_tokens) == (30, 40, 80)
+    assert sum(b.n_tokens for b in (slow, beta, hg)) == 150
     # the shared RoPE clock multipliers are preserved (time-only retime)
     assert vc.band_slot_mults((slow, beta, hg)) == vc.band_slot_mults(vc.BANDS)
 
@@ -1509,20 +1525,20 @@ def test_bands_for_clip_len_too_short_raises() -> None:
 
 
 def test_sample_ssl_masks_token_count_follows_bands() -> None:
-    # the per-clip M2 mask width = Σ band.n_tokens for the GIVEN bands (38 at 1 s,
-    # 190 at 5 s) — not the hardcoded N_TOKENS.
+    # the per-clip M2 mask width = Σ band.n_tokens for the GIVEN bands (30 at 1 s,
+    # 150 at 5 s) — not the hardcoded N_TOKENS.
     g = torch.Generator().manual_seed(0)
     pe = torch.randint(0, 5, (2, 6), generator=g)
     emask = torch.ones(2, 6, dtype=torch.bool)
     m1 = vc.sample_ssl_masks(pe, emask, g)                       # default 1 s
-    assert m1["m2_mask"].shape[-1] == 38
+    assert m1["m2_mask"].shape[-1] == 30
     m5 = vc.sample_ssl_masks(pe, emask, g, bands=vc.bands_for_clip_len(5.0))
-    assert m5["m2_mask"].shape[-1] == 190
+    assert m5["m2_mask"].shape[-1] == 150
 
 
 def _ssl_batch_5s(B: int = 2, C: int = 6, seed: int = 0):
     """A 5 s SSL batch: the slow/beta/HG time axes carry the 21/81/161 frame
-    counts, masks drawn for the 5 s (190-token) geometry."""
+    counts, masks drawn for the 5 s (150-token) geometry."""
     bands = vc.bands_for_clip_len(5.0)
     g = torch.Generator().manual_seed(seed)
     slow = torch.randn(B, C, 2, 6, 21, generator=g)
@@ -1535,10 +1551,10 @@ def _ssl_batch_5s(B: int = 2, C: int = 6, seed: int = 0):
 
 
 def test_ssl_model_clip_len_5s_bands_and_token_count() -> None:
-    # the model derives its bands from clip_len_s → 5 s gives the 190-token grid.
+    # the model derives its bands from clip_len_s → 5 s gives the 150-token grid.
     model = _ssl_model(clip_len_s=5.0)
     assert model.bands == vc.bands_for_clip_len(5.0)
-    assert model.tokens_per_electrode == 190
+    assert model.tokens_per_electrode == 150
 
 
 def test_ssl_model_forward_at_5s_returns_finite_losses() -> None:

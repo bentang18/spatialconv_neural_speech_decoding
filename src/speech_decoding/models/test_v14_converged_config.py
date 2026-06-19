@@ -30,7 +30,7 @@ def test_build_returns_converged_ssl() -> None:
     model = _cfg().build(n_in_channels=6, n_outputs=1)
     assert isinstance(model, V14ConvergedSSL)
     # the requested shape reached the model
-    assert model.tokens_per_electrode == 38
+    assert model.tokens_per_electrode == 30
     assert model.latent.parcel_embed.num_embeddings == 5
 
 
@@ -72,17 +72,17 @@ def test_neutral_and_locked_defaults() -> None:
 
 
 def test_clip_len_s_default_is_1s_geometry() -> None:
-    # default (None) → the 1 s eval geometry (38 tokens/electrode), back-compat.
+    # default (None) → the 1 s eval geometry (30 tokens/electrode), back-compat.
     model = _cfg().build(n_in_channels=6, n_outputs=1)
     assert model.clip_len_s is None
-    assert model.tokens_per_electrode == 38
+    assert model.tokens_per_electrode == 30
 
 
 def test_clip_len_s_5s_threads_into_model_geometry() -> None:
-    # SSL pretrain config (clip_len_s=5.0) → the model builds the 190-token grid.
+    # SSL pretrain config (clip_len_s=5.0) → the model builds the 150-token grid.
     model = _cfg(clip_len_s=5.0).build(n_in_channels=6, n_outputs=1)
     assert model.clip_len_s == 5.0
-    assert model.tokens_per_electrode == 190
+    assert model.tokens_per_electrode == 150
 
 
 def test_lambda_and_freq_pos_thread_into_model() -> None:

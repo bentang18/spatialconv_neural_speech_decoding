@@ -8,17 +8,19 @@ component-by-component with colocated TDD.
 
 Stage 1 here: the **3STFT per-electrode frontend tokenizer** (FE spec
 ``reports/fe_3stft_2of2of2_spec_2026_06_17.md`` §2/§5). Per electrode, per 1 s
-clip, three STFTs at different resolutions are patch-embedded into **38 tokens**
-(slow 6 + beta 16 + HG 16). Electrodes ride in the batch dim — the tokenizer has
+clip, three STFTs at different resolutions are patch-embedded into **30 tokens**
+(slow 6 + beta 8 + HG 16). Electrodes ride in the batch dim — the tokenizer has
 **no cross-electrode pathway** (Stage-1 isolation, load-bearing: ~10 co-shaft
 near-duplicate electrodes per parcel would give M2 a trivial copy shortcut).
 
-The 2/2/2 ladder geometry is LOCKED (FE spec §2). All hops are ``N/2`` (50%
-overlap); all ``tk=2`` (FE §6 window-tiling: ``tk·hop == N``). The three time-
-patch strides (``tk·hop``) are slow 1024 / beta 256 / HG 128 samples = **8:2:1**,
-so they share one RoPE clock in units of the HG stride (128 samples = 62.5 ms,
-the FE §1 reference grid). NB the freq-pos memo's "8/4/1" multipliers are stale
-(the 2/*4*/2 predecessor); the locked 2/2/2 is 8/2/1.
+The ladder geometry is LOCKED. All hops are ``N/2`` (50% overlap). slow and HG
+keep ``tk=2`` (FE §6 window-tiling: ``tk·hop == N``); **beta is ``tk=4``**
+(2026-06-19, Ben): a deliberate 2× coarsening to 250 ms beta patches — halves
+beta to 8 tokens AND lets a fixed-width span-mask hit ~50% of beta on the 5 s SSL
+clip (the old tk=2 width-4 tube was sized for 1 s and masked only ~10% at 5 s).
+HG is UNCHANGED (tk=2, 16 tokens). The three time-patch strides (``tk·hop``) are
+slow 1024 / beta **512** / HG 128 samples = **8:4:1**, so they share one RoPE
+clock in units of the HG stride (128 samples = 62.5 ms, the FE §1 reference grid).
 """
 
 from __future__ import annotations
@@ -84,13 +86,16 @@ class BandSpec:
         return self.kernel_freq * self.kernel_time * self.in_channels
 
 
-# The locked 2/2/2 ladder (FE spec §2, every number verified by verify_3stft.py).
+# The locked ladder (FE spec §2, every number verified by verify_3stft.py).
+# beta kernel_time=4 (2026-06-19): 2× coarser time patch (250 ms) halves beta's
+# token count at every clip length and re-grounds its 50% mask to the real grid.
+# HG stays kernel_time=2 (62.5 ms — phonetic resolution preserved, Ben's call).
 SLOW = BandSpec("slow", 1024, 512, 6, 5, kernel_freq=2, kernel_time=2, in_channels=2)
-BETA = BandSpec("beta", 256, 128, 6, 17, kernel_freq=3, kernel_time=2, in_channels=1)
+BETA = BandSpec("beta", 256, 128, 6, 17, kernel_freq=3, kernel_time=4, in_channels=1)
 HG = BandSpec("hg", 128, 64, 9, 33, kernel_freq=9, kernel_time=2, in_channels=1)
 BANDS: tuple[BandSpec, ...] = (SLOW, BETA, HG)
 
-N_TOKENS: int = sum(b.n_tokens for b in BANDS)            # 6 + 16 + 16 = 38
+N_TOKENS: int = sum(b.n_tokens for b in BANDS)            # 6 + 8 + 16 = 30
 N_FREQ_PATCHES: int = sum(b.n_freq_patches for b in BANDS)  # 3 + 2 + 1 = 6
 
 
@@ -107,8 +112,8 @@ def bands_for_clip_len(
     the freq grid, kernels, and channels are untouched, so token order and the
     RoPE clock multipliers are preserved — just more time-patches per band.
 
-    5 s ⇒ slow 21 / beta 81 / HG 161 frames → 10 / 40 / 80 time-patches →
-    30 + 80 + 80 = **190 tokens** (vs 38 at 1 s)."""
+    5 s ⇒ slow 21 / beta 81 / HG 161 frames → 10 / 20 / 80 time-patches (beta tk=4)
+    → 30 + 40 + 80 = **150 tokens** (vs 30 at 1 s)."""
     n_samples = int(round(clip_len_s * fs))
     out: list[BandSpec] = []
     for b in base:
@@ -174,17 +179,19 @@ def token_metadata(bands: tuple[BandSpec, ...] = BANDS) -> tuple[Tensor, Tensor,
 class M2MaskConfig:
     """M2 within-electrode masking config (FE spec §8, locked starting point).
 
-    slow is EXEMPT (never masked — always-visible forward-PAC context). beta is
-    one freq-tubed time-mask (both freq-patches co-masked across ``beta_span``
-    time columns = 50% of beta). HG is a wav2vec2 span mask: ``round(hg_start_rate
-    · T_p)`` distinct span starts × ``hg_span`` forward, overlaps allowed. The
-    §8.7 sisters tune ``hg_start_rate`` (coverage dial) and ``beta_span``
-    (redundancy knob, never < 3 per the §8.3 bleed floor).
+    slow is EXEMPT (never masked — always-visible forward-PAC context). beta and
+    HG both use the wav2vec2 span mask: ``round(start_rate · T_p)`` distinct span
+    starts × ``span`` forward, overlaps allowed (merge into longer runs), beta's
+    span freq-tubed (both freq-patches co-masked). beta defaults (rate 0.30,
+    span 2) realize ~50% of beta on the coarse 250 ms grid (2026-06-19 fix: the
+    old single width-4 tube was sized for the 1 s clip and only masked ~10% at
+    5 s). The §8.7 sisters tune the per-band start_rate (coverage dial).
     """
 
     hg_start_rate: float = 0.20   # §8.5: 20% of HG time positions are starts (Ben 2026-06-18)
     hg_span: int = 3              # §8.4: HG span width 3 (event-scale, bleed-floor)
-    beta_span: int = 4            # §8.4: beta tube width 4 (sustained-burst scale)
+    beta_start_rate: float = 0.30  # 2026-06-19: 30% of beta time positions are starts (~50%)
+    beta_span: int = 2            # 2026-06-19: beta span width 2 on the coarse 250 ms grid
 
 
 def sample_m2_mask(
@@ -201,10 +208,14 @@ def sample_m2_mask(
         if b.name == "slow":
             pass  # EXEMPT — never an M2 target
         elif b.name == "beta":
-            # One freq-tube: 1 random start, width beta_span, BOTH freq-patches.
-            hi = b.n_time_patches - cfg.beta_span + 1
-            start = int(torch.randint(0, max(hi, 1), (1,), generator=generator).item())
-            m[:, start : start + cfg.beta_span] = True
+            # wav2vec2 freq-tubed span mask: round(beta_start_rate·T_p) distinct
+            # starts × beta_span forward, overlaps allowed, BOTH freq-patches.
+            allowed = b.n_time_patches - cfg.beta_span + 1
+            n_starts = min(round(cfg.beta_start_rate * b.n_time_patches), allowed)
+            if n_starts > 0:
+                starts = torch.randperm(allowed, generator=generator)[:n_starts]
+                for s in starts.tolist():
+                    m[:, s : s + cfg.beta_span] = True
         elif b.name == "hg":
             # wav2vec2 span mask: distinct starts in [0, T_p−span], span forward,
             # overlaps allowed (merge into longer spans).
@@ -533,7 +544,7 @@ class LatentEncoder(nn.Module):
     electrode mixing, the opposite of the isolated frontend), **electrode-token
     granularity preserved** (no pooling bottleneck in the SSL gradient; inter-
     areal CFC gets a direct edge). RoPE keys off the **shared physical-time
-    clock** (``time_slot``, the same 8:2:1 grid the frontend uses), so the three
+    clock** (``time_slot``, the same 8:4:1 grid the frontend uses), so the three
     band grids align in the cross-electrode attention.
 
     Ragged: variable electrode count per subject. ``electrode_mask`` (``True`` =

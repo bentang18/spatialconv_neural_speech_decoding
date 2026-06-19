@@ -618,10 +618,11 @@ def build_v14_experiment(
     converged_lambda_m4: float = 1.0,
     # Converged MASK GEOMETRY (FE-spec §8 / Ben 2026-06-18 "tuned often"). None →
     # the V14ConvergedExperiment / M2MaskConfig / M4MaskConfig LOCKED defaults
-    # (hg_start_rate 0.20, hg_span 3, beta_span 4, parcel_mask_ratio 0.20); a value
-    # overrides. Inert on raw/2stft.
+    # (hg_start_rate 0.20, hg_span 3, beta_start_rate 0.30, beta_span 2,
+    # parcel_mask_ratio 0.20); a value overrides. Inert on raw/2stft.
     converged_m2_hg_start_rate: float | None = None,
     converged_m2_hg_span: int | None = None,
+    converged_m2_beta_start_rate: float | None = None,
     converged_m2_beta_span: int | None = None,
     converged_m4_parcel_mask_ratio: float | None = None,
     # Converged M4 heteroscedastic down-weight (Ben 2026-06-18). ON by default
@@ -2015,6 +2016,7 @@ def build_v14_experiment(
             k: v for k, v in {
                 "m2_hg_start_rate": converged_m2_hg_start_rate,
                 "m2_hg_span": converged_m2_hg_span,
+                "m2_beta_start_rate": converged_m2_beta_start_rate,
                 "m2_beta_span": converged_m2_beta_span,
                 "m4_parcel_mask_ratio": converged_m4_parcel_mask_ratio,
             }.items() if v is not None
@@ -2554,8 +2556,9 @@ def _parser() -> argparse.ArgumentParser:
                    type=float, default=1.0,
                    help="3stft: M4 loss-term weight (neutral 1.0).")
     # --- converged MASK GEOMETRY (Ben 2026-06-18: tuned often) -------------
-    # None → the LOCKED defaults (hg_start_rate 0.20 / hg_span 3 / beta_span 4 /
-    # parcel_mask_ratio 0.20). The §8.7 sister sweeps set these.
+    # None → the LOCKED defaults (hg_start_rate 0.20 / hg_span 3 /
+    # beta_start_rate 0.30 / beta_span 2 / parcel_mask_ratio 0.20). The §8.7
+    # sister sweeps set these.
     p.add_argument("--converged-m2-hg-start-rate", dest="converged_m2_hg_start_rate",
                    type=float, default=None,
                    help="3stft: HG M2 coverage dial — fraction of HG time positions "
@@ -2563,10 +2566,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--converged-m2-hg-span", dest="converged_m2_hg_span",
                    type=int, default=None,
                    help="3stft: HG M2 span width in time patches (default 3).")
+    p.add_argument("--converged-m2-beta-start-rate", dest="converged_m2_beta_start_rate",
+                   type=float, default=None,
+                   help="3stft: beta M2 coverage dial — fraction of beta time positions "
+                        "that start a width-beta_span freq-tube span (default 0.30 ≈ 50%%).")
     p.add_argument("--converged-m2-beta-span", dest="converged_m2_beta_span",
                    type=int, default=None,
-                   help="3stft: beta M2 freq-tube width in time patches (default 4; "
-                        "§8.3 bleed floor ≥ 3).")
+                   help="3stft: beta M2 freq-tube span width in time patches (default 2 "
+                        "on the coarse 250 ms grid).")
     p.add_argument("--converged-m4-parcel-mask-ratio",
                    dest="converged_m4_parcel_mask_ratio", type=float, default=None,
                    help="3stft: M4 whole-parcel tube ratio (default 0.20).")
@@ -3659,6 +3666,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_lambda_m4=args.converged_lambda_m4,
         converged_m2_hg_start_rate=args.converged_m2_hg_start_rate,
         converged_m2_hg_span=args.converged_m2_hg_span,
+        converged_m2_beta_start_rate=args.converged_m2_beta_start_rate,
         converged_m2_beta_span=args.converged_m2_beta_span,
         converged_m4_parcel_mask_ratio=args.converged_m4_parcel_mask_ratio,
         converged_m4_precision_off=args.converged_m4_precision_off,

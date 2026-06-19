@@ -444,7 +444,7 @@ def build_probe_dataset(
 
     Cohort lists are intersected with the subjects actually present, so a run on a
     sub-corpus simply probes fewer subjects instead of failing. DCC-only: needs BT
-    voltage (``/work/ht203/data/braintreebank``) + the 3STFT spec cache; the pure
+    voltage (the ``ROOT_DIR_BRAINTREEBANK`` root) + the 3STFT spec cache; the pure
     label/selection/filter logic it composes is laptop-TDD'd in
     ``test_online_probe_dataset``."""
     segmenter = _probe_segmenter(run_data)
