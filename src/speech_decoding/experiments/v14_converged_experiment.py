@@ -99,18 +99,32 @@ class V14ConvergedExperiment(V14Experiment):
         build the probe dataset deterministically from ``(seed, n_cap, manifest)``
         — DCC-only (BT voltage + 3STFT cache) — and return a single configured,
         enabled :class:`OnlineLinearProbe`. Kept separate from ``_callbacks`` so the
-        decision logic is unit-testable without a full trainer assembly."""
+        decision logic is unit-testable without a full trainer assembly.
+
+        **Fail-soft (spec §1):** the probe is a DIAGNOSTIC; building its dataset must
+        never abort a live training run. If the DCC-only extraction raises (a bad
+        cache path, a missing band key, an empty corpus), log the error and register
+        NO probe — the run proceeds exactly as if the probe were off."""
         if not self.online_probe_enabled:
             return []
+        import logging
+
         from speech_decoding.experiments.online_probe import OnlineLinearProbe
         from speech_decoding.experiments.online_probe_dataset import build_probe_dataset
 
         # Reuse THIS run's data chain (study + wired 3STFT/support extractors +
         # bad_window_dir) re-segmented at the 1 s probe contract — so the probe
         # respects the run's CLIP layer and never hand-copies the data config.
-        dataset = build_probe_dataset(
-            self.data, n_cap=self.online_probe_n_cap, seed=self.online_probe_seed
-        )
+        try:
+            dataset = build_probe_dataset(
+                self.data, n_cap=self.online_probe_n_cap, seed=self.online_probe_seed
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "online probe DISABLED: build_probe_dataset failed — training "
+                "continues without the diagnostic probe (it never perturbs the run)."
+            )
+            return []
         return [
             OnlineLinearProbe(
                 dataset=dataset,

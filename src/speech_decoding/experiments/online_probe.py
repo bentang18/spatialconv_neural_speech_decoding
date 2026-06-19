@@ -400,7 +400,11 @@ class OnlineLinearProbe(_CallbackBase):  # type: ignore[misc,valid-type]
 
     def fire(self, trainer: tp.Any, pl_module: tp.Any) -> dict[str, float]:
         """Run one probe and log it. Separated from the gate so tests can drive it
-        directly. Freezes the model for the probe, restores train() after."""
+        directly. Freezes the model for the probe, restores train() after.
+
+        **Fail-soft (spec §1):** the probe must never crash a live run. If a forward
+        or fit raises, log it, DISABLE the probe (so it does not re-raise every
+        cadence), restore ``train()``, and return ``{}`` — training is untouched."""
         assert self.dataset is not None, "OnlineLinearProbe.fire requires a dataset"
         model = getattr(pl_module, "model", pl_module)
         was_training = bool(getattr(model, "training", True))
@@ -410,6 +414,15 @@ class OnlineLinearProbe(_CallbackBase):  # type: ignore[misc,valid-type]
                 metrics = run_probe(
                     model, self.dataset, self.k_list, batch_size=self.batch_size
                 )
+        except Exception:
+            import logging
+
+            self.enabled = False  # disable so it never re-fires (no per-cadence spam)
+            logging.getLogger(__name__).exception(
+                "online probe DISABLED after a fire error — training continues "
+                "untouched (the probe is a diagnostic, never load-bearing)."
+            )
+            return {}
         finally:
             if was_training:
                 model.train()

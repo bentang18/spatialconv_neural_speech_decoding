@@ -170,3 +170,19 @@ def test_online_probe_enabled_registers_configured_callback(monkeypatch) -> None
     assert probe.batch_size == 128
     assert probe.dataset is sentinel
     assert seen == {"run_data": fake_data, "n_cap": 1000, "seed": 3}
+
+
+def test_online_probe_build_failure_is_fail_soft(monkeypatch) -> None:  # noqa: ANN001
+    """A diagnostic must never abort a run: if build_probe_dataset raises (bad cache
+    path, empty corpus), _online_probe_callbacks logs and registers NO probe so the
+    run proceeds exactly as if the probe were off (spec §1)."""
+    from speech_decoding.experiments import online_probe_dataset as opd
+
+    def _boom(run_data, *, n_cap, seed, **kw):
+        raise RuntimeError("simulated DCC cache miss")
+
+    monkeypatch.setattr(opd, "build_probe_dataset", _boom)
+    xp = V14ConvergedExperiment.model_construct(
+        data=object(), online_probe_enabled=True,
+    )
+    assert xp._online_probe_callbacks() == []        # no probe, no raise → run is safe

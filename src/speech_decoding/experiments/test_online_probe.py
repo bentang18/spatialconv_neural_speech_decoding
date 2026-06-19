@@ -294,3 +294,30 @@ def test_callback_fire_restores_train_and_logs() -> None:
     assert m.training is True                          # train() restored after eval()
     assert any(k.startswith("val_probe/latent/ws/") for k in logged)
     assert all(np.isfinite(v) for v in logged.values())  # only finite metrics logged
+
+
+def test_callback_fire_is_fail_soft_and_disables() -> None:
+    """A forward error inside the probe must NOT crash the run (spec §1): fire logs,
+    returns {} (logs nothing), restores train(), and DISABLES itself so it never
+    re-fires every cadence. The diagnostic is never load-bearing."""
+    logged: dict[str, float] = {}
+
+    class _BoomModel(_FakeModel):
+        def encode_latent(self, *a, **kw):
+            raise RuntimeError("simulated forward failure")
+
+    class _PL:
+        def __init__(self, model):
+            self.model = model
+
+        def log(self, name, value, **kw):
+            logged[name] = float(value)
+
+    m = _BoomModel()
+    m.train()
+    cb = op.OnlineLinearProbe(_FakeDataset(), enabled=True)
+    out = cb.fire(trainer=None, pl_module=_PL(m))
+    assert out == {}                                   # no metrics returned
+    assert logged == {}                                # nothing logged
+    assert m.training is True                          # train() restored despite the error
+    assert cb.enabled is False                         # disabled → won't re-fire
