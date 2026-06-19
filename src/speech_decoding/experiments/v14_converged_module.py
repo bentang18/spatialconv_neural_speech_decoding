@@ -31,6 +31,7 @@ the freq axis is invariant:
 
 from __future__ import annotations
 
+import os
 import typing as tp
 
 import torch
@@ -83,6 +84,55 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self._mask_gen = torch.Generator()
         self._mask_gen.manual_seed(self._mask_seed)
 
+        # ── torch.compile forward override (ported verbatim from the live
+        # V14JointBrainModule, 2026-06-18) ──
+        # The converged forward is ALSO ragged + DDP + find_unused: the M2/M4
+        # heads early-return a scalar zero on empty-target steps, so a predictor
+        # can be UNUSED on one rank and USED on another in the same step. Run
+        # eager, that data-dependent param-usage divergence + the AccumulateGrad
+        # cross-stream stash hangs DDP (observed: job 48523709 trained ~8 min then
+        # NCCL-watchdog-stuck). The joint module survives the SAME raggedness only
+        # because it compiles with DDPOptimizer DISABLED, which compiles the
+        # forward into ONE graph (no bucket-split reorder) and routes the backward
+        # through inductor (no AccumulateGrad cross-stream stash). So mirror it.
+        #
+        # Reads the env vars dispatch_v14 sets (V14_COMPILE / V14_COMPILE_MODE /
+        # V14_COMPILE_DYNAMIC / V14_COMPILE_DDP_OPTIMIZER) — env, NOT pydantic
+        # fields, so a compiled run shares the eager run's exca uid + cache. The
+        # OptimizedModule is stored in a PLAIN DICT (not an attribute) so the
+        # LightningModule never re-registers it as a submodule: params stay
+        # registered once via self.model (no `_orig_mod.` key-prefix on
+        # checkpoints, no double-registration of optimizer/EMA params). Unset env
+        # (unit tests / direct construction) → eager, byte-identical, zero blast.
+        self._compiled_fwd: dict[str, tp.Callable[..., tp.Any]] = {}
+        _compile_flag = os.environ.get("V14_COMPILE", "").strip().lower()
+        if _compile_flag not in ("", "0", "false", "no", "off"):
+            _mode = os.environ.get("V14_COMPILE_MODE") or "default"
+            _dyn_flag = os.environ.get("V14_COMPILE_DYNAMIC", "").strip().lower()
+            _dynamic: bool | None = (
+                True if _dyn_flag not in ("", "0", "false", "no", "off") else None
+            )
+            # DDPOptimizer × dynamic-shapes fix (2026-06-11): the bucket-split
+            # optimizer hands a symbolic-shape SymInt back as a bare python int and
+            # crashes inductor under dynamic=True; disabling it compiles a single
+            # graph (cost: lost allreduce/compute overlap, negligible for this
+            # ~16M-param model on single-node 4-GPU DDP). Default OFF = disabled,
+            # because the production sweep IS compile+DDP+dynamic.
+            import torch._dynamo as _dynamo_mod
+
+            _ddp_opt = os.environ.get(
+                "V14_COMPILE_DDP_OPTIMIZER", "").strip().lower()
+            _dynamo_mod.config.optimize_ddp = _ddp_opt in ("1", "true", "yes", "on")
+            self._compiled_fwd["model"] = torch.compile(
+                self.model, mode=_mode, dynamic=_dynamic,
+            )
+
+    def _call_model(self, *args: tp.Any, **kwargs: tp.Any) -> dict[str, Tensor]:
+        """Run the model forward through the compiled override when present, else
+        eager. Falls back to ``self.model`` when V14_COMPILE was unset (tests /
+        1-GPU), so the eager path is byte-identical to pre-compile."""
+        return self._compiled_fwd.get("model", self.model)(*args, **kwargs)
+
     # ------------------------------------------------------------------ ingest
     def _converged_inputs(
         self, data: dict[str, Tensor],
@@ -131,7 +181,7 @@ class V14ConvergedBrainModule(pl.LightningModule):
             m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
         )
         masks = {k: v.to(slow.device) for k, v in masks.items()}
-        return self.model(slow, beta, hg, ppe, emask, **masks)
+        return self._call_model(slow, beta, hg, ppe, emask, **masks)
 
     # ------------------------------------------------------------------- loops
     def training_step(self, batch: tp.Any, batch_idx: int) -> Tensor:  # noqa: ARG002

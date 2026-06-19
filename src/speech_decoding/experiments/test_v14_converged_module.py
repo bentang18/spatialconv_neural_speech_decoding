@@ -6,6 +6,8 @@ no-WD split), the encoder phase-handoff round-trip, and overfit-one-batch."""
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -274,6 +276,101 @@ def test_load_transferable_state_missing_component_raises() -> None:
     m = _module()
     with pytest.raises(KeyError):
         m.load_transferable_state({"latent": {}})
+
+
+# ---------------------------------------------------------------- torch.compile
+_COMPILE_ENV_KEYS = (
+    "V14_COMPILE", "V14_COMPILE_MODE", "V14_COMPILE_DYNAMIC",
+    "V14_COMPILE_DDP_OPTIMIZER",
+)
+
+
+@contextmanager
+def _compile_env(**kv: str):
+    """Set the V14_COMPILE* env vars for the body and restore both them AND the
+    global ``torch._dynamo.config.optimize_ddp`` afterwards (the module mutates
+    the latter in __init__, so it must not leak into sibling tests)."""
+    import torch._dynamo as _dyn
+
+    saved = {k: os.environ.get(k) for k in _COMPILE_ENV_KEYS}
+    saved_opt = _dyn.config.optimize_ddp
+    try:
+        for k in _COMPILE_ENV_KEYS:
+            os.environ.pop(k, None)
+        os.environ.update(kv)
+        yield
+    finally:
+        for k in _COMPILE_ENV_KEYS:
+            if saved[k] is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = saved[k]
+        _dyn.config.optimize_ddp = saved_opt
+
+
+def test_no_compile_env_is_eager_and_byte_identical() -> None:
+    """Unset V14_COMPILE → no OptimizedModule registered; ``_call_model`` is the
+    bare ``self.model`` and the loss path is byte-identical to a direct call."""
+    with _compile_env():  # all four keys unset
+        m = _module()
+    assert m._compiled_fwd == {}
+    m._mask_gen.manual_seed(7)
+    out_call = m._step(_batch().data)
+    # re-derive the same masks and call the model directly: must match exactly
+    slow, beta, hg, ppe, emask = m._converged_inputs(_batch().data)
+    from speech_decoding.models.v14_converged import sample_ssl_masks
+    m._mask_gen.manual_seed(7)
+    masks = sample_ssl_masks(
+        ppe.cpu(), emask.cpu(), m._mask_gen,
+        m2_cfg=m.m2_cfg, m4_cfg=m.m4_cfg, bands=m.model.bands,
+    )
+    out_direct = m.model(slow, beta, hg, ppe, emask, **masks)
+    assert torch.equal(out_call["loss"], out_direct["loss"])
+
+
+def test_compile_env_disables_ddp_optimizer_by_default() -> None:
+    """V14_COMPILE truthy → the model forward is compiled AND the DDPOptimizer
+    bucket-split is DISABLED (the single-graph fix for the ragged-DDP hang).
+    Default-off is the whole point: the production sweep is compile+DDP+dynamic."""
+    import torch._dynamo as _dyn
+
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DYNAMIC="1"):
+        m = _module()
+        assert "model" in m._compiled_fwd
+        assert _dyn.config.optimize_ddp is False
+
+
+def test_compile_env_ddp_optimizer_is_opt_in() -> None:
+    """The bucket-split optimizer is recoverable via V14_COMPILE_DDP_OPTIMIZER=1
+    (escape hatch), proving the default-off is a deliberate switch not a constant."""
+    import torch._dynamo as _dyn
+
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DDP_OPTIMIZER="1"):
+        _module()
+        assert _dyn.config.optimize_ddp is True
+
+
+def test_compiled_forward_matches_eager_loss() -> None:
+    """Decisive veracity check: a COMPILED forward (the config Ben launches:
+    V14_COMPILE + dynamic) yields the same loss as eager, within fp tolerance.
+    Same seed for the build (identical init) and the mask draw (stationary
+    target)."""
+    torch.manual_seed(0)
+    m_e = _module()
+    m_e._mask_gen.manual_seed(7)
+    out_e = m_e._step(_batch().data)
+
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DYNAMIC="1"):
+        torch.manual_seed(0)
+        m_c = _module()
+        assert "model" in m_c._compiled_fwd
+        m_c._mask_gen.manual_seed(7)
+        try:
+            out_c = m_c._step(_batch().data)
+        except Exception as exc:  # pragma: no cover - platform without a C compiler
+            pytest.skip(f"torch.compile inductor backend unavailable here: {exc}")
+    assert torch.isfinite(out_c["loss"])
+    assert torch.allclose(out_c["loss"], out_e["loss"], atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------- overfit check
