@@ -1409,6 +1409,29 @@ def _jepa_stats_on_cells(
     return loss, explained_var, target_var
 
 
+def _collapse_stats(
+    pred: Tensor, target: Tensor, cell_valid: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """``(pred_var, target_norm, pred_target_var_ratio)`` over scored cells — the
+    joint module's ``_log_term_stats`` collapse triad. ``pred_var`` → 0 when the
+    predictor hedges to a constant; ``target_norm`` is the mean target-row L2;
+    ``pred_target_var_ratio = pred_var/target_var`` (≈1 healthy, ≪1 = the
+    predictor collapsing to the batch-mean target). All NaN with < 2 scored
+    cells (variance undefined → logger skips). Detached — pure monitor."""
+    d = pred.shape[-1]
+    sel = cell_valid.detach().reshape(-1)
+    p = pred.detach().reshape(-1, d)[sel]
+    t = target.detach().reshape(-1, d)[sel]
+    nan = pred.new_full((), float("nan"))
+    if p.shape[0] < 2:
+        return nan, (t.norm(dim=-1).mean() if p.shape[0] else nan), nan
+    pred_var = p.var(dim=0, unbiased=False).mean()
+    target_var = t.var(dim=0, unbiased=False).mean()
+    target_norm = t.norm(dim=-1).mean()
+    ratio = pred_var / (target_var + _STATS_EPS)
+    return pred_var, target_norm, ratio
+
+
 def _band_diagnostics(
     pred: Tensor, target: Tensor, cell_valid: Tensor, band_of_cell: Tensor,
     pairs: tuple[tuple[str, int], ...], head: str,
@@ -1424,7 +1447,11 @@ def _band_diagnostics(
     /``tv_{head}_{b}``. The per-band ``l_{head}_{b}`` is the unweighted masked-L1
     (unchanged from the prior per-band loss diagnostic)."""
     _, ev, tv = _jepa_stats_on_cells(pred, target, cell_valid)
-    out: dict[str, Tensor] = {f"ev_{head}": ev, f"tv_{head}": tv}
+    pv, tn, ptvr = _collapse_stats(pred, target, cell_valid)
+    out: dict[str, Tensor] = {
+        f"ev_{head}": ev, f"tv_{head}": tv,
+        f"pv_{head}": pv, f"tn_{head}": tn, f"ptvr_{head}": ptvr,
+    }
     for name, bid in pairs:
         bl, bev, btv = _jepa_stats_on_cells(
             pred, target, cell_valid & (band_of_cell == bid)
@@ -1441,7 +1468,10 @@ def _zero_bands(
     """Graph-free zero/NaN diagnostics (the no-target early-return case) — SAME key
     set as :func:`_band_diagnostics` so the forward dict keys are batch-stable."""
     nan = ref.new_full((), float("nan"))
-    out: dict[str, Tensor] = {f"ev_{head}": nan, f"tv_{head}": nan}
+    out: dict[str, Tensor] = {
+        f"ev_{head}": nan, f"tv_{head}": nan,
+        f"pv_{head}": nan, f"tn_{head}": nan, f"ptvr_{head}": nan,
+    }
     for name, _ in pairs:
         out[f"l_{head}_{name}"] = ref.new_zeros(())
         out[f"ev_{head}_{name}"] = nan

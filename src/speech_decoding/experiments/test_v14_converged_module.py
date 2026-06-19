@@ -285,6 +285,21 @@ _COMPILE_ENV_KEYS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _eager_unless_opted_in(monkeypatch):
+    """Default every test to EAGER construction, independent of suite ordering.
+
+    ``test_ddp_dispatch_wiring`` invokes the dispatch arg path, which sets
+    ``os.environ["V14_COMPILE"] = "1"`` directly and does NOT restore it. Without
+    this guard that leak makes every later ``_module()`` build a *compiled* model,
+    whose forward hits the inductor backend and dies with ``CppCompileError`` on a
+    host with no C compiler. The compile tests re-enable compile within their own
+    body via ``_compile_env`` (a context manager), so they are unaffected;
+    ``monkeypatch`` restores the cleared keys after each test."""
+    for k in _COMPILE_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+
+
 @contextmanager
 def _compile_env(**kv: str):
     """Set the V14_COMPILE* env vars for the body and restore both them AND the
@@ -401,3 +416,189 @@ def test_overfits_one_batch_fixed_masks() -> None:
     assert losses[-1] < 0.5 * losses[0], (
         f"one-batch loss did not overfit: {losses[0]:.4f} → {losses[-1]:.4f}"
     )
+
+
+# ====================================================================
+# Monitor instrumentation — the full joint-module suite ported in. Each test
+# drives a hook with `self.log` captured and asserts the COMPLETE metric set is
+# emitted (so "every monitor is on" is verified, not assumed).
+# ====================================================================
+def _capture_logs(module) -> dict:
+    """Monkeypatch `module.log` to record every (name → value); returns the dict."""
+    logged: dict = {}
+
+    def _fake_log(name, value, **_kw):
+        logged[name] = float(value) if hasattr(value, "__float__") else value
+
+    module.log = _fake_log  # shadow the bound LightningModule.log
+    return logged
+
+
+def _fake_trainer(**kw):
+    base = dict(
+        log_every_n_steps=1, gradient_clip_val=1.0,
+        accumulate_grad_batches=1, world_size=1,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+_GROUPS = ("frontend", "latent", "m2_predictor", "m4_predictor")
+
+
+def test_grad_routing_splits_predictor_into_m2_and_m4() -> None:
+    """The converged routing tiles FOUR groups (not the joint's lumped
+    `predictor`): student_frontend / latent / m2_predictor / m4_predictor — and
+    the per-group squared grad norms sum to the global (an exact decomposition)."""
+    m = _module()
+    out = m._step(_batch().data)
+    out["loss"].backward()
+    grad_sq, weight_sq, total = m._grad_routing_norms()
+    assert set(grad_sq) == set(_GROUPS)
+    # m2 and m4 are SEPARATE buckets, each carrying real gradient.
+    assert float(grad_sq["m2_predictor"]) > 0.0
+    assert float(grad_sq["m4_predictor"]) > 0.0
+    summed = sum(float(grad_sq[g]) for g in _GROUPS)
+    assert summed == pytest.approx(float(total), rel=1e-5)
+    # The four weight buckets also tile the trainable weight norm.
+    w_global = sum(
+        float(p.detach().pow(2).sum()) for p in m._trainable_parameters()
+    )
+    assert sum(float(weight_sq[g]) for g in _GROUPS) == pytest.approx(
+        w_global, rel=1e-5
+    )
+
+
+def test_on_before_optimizer_step_emits_full_grad_suite() -> None:
+    m = _module()
+    m._trainer = _fake_trainer()
+    m._last_micro_bsz = 2
+    opt = torch.optim.AdamW(list(m._trainable_parameters()), lr=1e-3)
+    # One real step so the AdamW moment state exists (grad-noise-scale source).
+    out = m._step(_batch().data)
+    out["loss"].backward()
+    opt.step()
+    opt.zero_grad()
+    out = m._step(_batch().data)
+    out["loss"].backward()
+    logged = _capture_logs(m)
+    m.on_before_optimizer_step(opt)
+    expected = {
+        "train_mon_grad_l2", "train_mon_grad_ema_l2",
+        "train_mon_grad_spike_ratio", "train_mon_grad_spike",
+        "train_mon_grad_diverged", "train_mon_nonfinite",
+        "train_mon_ema_weight_gap", "train_mon_grad_clipped",
+        "train_mon_grad_clip_scale",
+        "train_mon_grad_noise_scale", "train_mon_grad_noise_signal",
+        "train_mon_grad_noise_var",
+    }
+    for g in _GROUPS:
+        expected |= {
+            f"train_mon_grad_l2_{g}", f"train_mon_wnorm_{g}",
+            f"train_mon_update_ratio_{g}",
+        }
+    missing = expected - set(logged)
+    assert not missing, f"missing grad metrics: {sorted(missing)}"
+
+
+def test_true_update_ratio_logged_per_group_across_two_steps() -> None:
+    """`‖Δθ‖/‖θ‖` per group: the first hook arms the snapshot, the second (after
+    an optimizer.step()) logs all four groups."""
+    m = _module()
+    m._trainer = _fake_trainer()
+    m._last_micro_bsz = 2
+    opt = torch.optim.AdamW(list(m._trainable_parameters()), lr=1e-2)
+    logged = _capture_logs(m)
+    # Step 1: backward + arm snapshot.
+    out = m._step(_batch().data)
+    out["loss"].backward()
+    m.on_before_optimizer_step(opt)   # arms _update_snapshot
+    opt.step(); opt.zero_grad()
+    # Step 2: backward + measure displacement.
+    out = m._step(_batch().data)
+    out["loss"].backward()
+    m.on_before_optimizer_step(opt)   # logs true_update_ratio_*
+    for g in _GROUPS:
+        name = f"train_mon_true_update_ratio_{g}"
+        assert name in logged, f"missing {name}"
+        assert logged[name] > 0.0   # params actually moved
+
+
+def test_on_train_batch_end_emits_throughput() -> None:
+    m = _module()
+    logged = _capture_logs(m)
+    batch = _batch()
+    m.on_train_batch_end(None, batch, 0)   # first call: no prior timestamp
+    m.on_train_batch_end(None, batch, 1)   # second: emits step time + rate
+    assert "train_mon_step_time_s" in logged
+    assert "train_mon_steps_per_sec" in logged
+    assert "train_mon_samples_per_sec" in logged
+    assert logged["train_mon_samples_per_sec"] > 0.0
+
+
+def test_monitor_from_step_emits_rankme_coverage_inputstats() -> None:
+    m = _module()
+    logged = _capture_logs(m)
+    m._monitor_from_step(_batch().data, step_name="train")
+    expected = set()
+    for band in ("slow", "beta", "hg"):
+        expected |= {
+            f"train_mon_input_{band}_nonfinite_frac",
+            f"train_mon_input_{band}_absmax",
+            f"train_mon_input_{band}_mean",
+            f"train_mon_input_{band}_std",
+        }
+    expected |= {
+        "train_mon_coverage_active_mean", "train_mon_coverage_active_cv",
+        "train_mon_coverage_slot_var", "train_mon_coverage_degenerate_frac",
+        "train_mon_coverage_swec_frac", "train_mon_coverage_alarm",
+    }
+    # RankMe on the latent (key="") AND teacher-frontend (key="frontend_").
+    for key in ("", "frontend_"):
+        expected |= {
+            f"train_mon_{key}rankme", f"train_mon_{key}rankme_normalised",
+            f"train_mon_{key}rankme_warn", f"train_mon_{key}rankme_alarm",
+            f"train_mon_{key}feat_std_mean", f"train_mon_{key}feat_std_min",
+            f"train_mon_{key}feat_cov_offdiag",
+        }
+    missing = expected - set(logged)
+    assert not missing, f"missing forward-tap metrics: {sorted(missing)}"
+
+
+def test_log_losses_emits_joint_canonical_panel_names() -> None:
+    """The converged forward dict is logged under the JOINT panel names so the
+    live 2STFT wandb panels populate: l_m2→loss_m2, ev_m4→m4_explained_var, …"""
+    m = _module()
+    logged = _capture_logs(m)
+    out = m._step(_batch().data)
+    m._log_losses(out, "train", on_step=True, on_epoch=False)
+    for name in (
+        "train_loss", "train_loss_m2", "train_loss_m4",
+        "train_m2_explained_var", "train_m2_target_var",
+        "train_m4_explained_var", "train_m4_target_var",
+        # collapse triad (joint _log_term_stats parity)
+        "train_m2_pred_var", "train_m2_target_norm",
+        "train_m2_pred_target_var_ratio",
+        "train_m4_pred_var", "train_m4_target_norm",
+        "train_m4_pred_target_var_ratio",
+    ):
+        assert name in logged, f"missing panel metric {name}"
+
+
+def test_ema_weight_gap_tracks_frontend_only() -> None:
+    """The EMA gap is over the frontend (the only EMA-mirrored module). Fresh
+    deepcopy → gap 0; after a student step the gap grows > 0."""
+    m = _module()
+    assert m._ema_weight_gap() == pytest.approx(0.0, abs=1e-6)
+    opt = torch.optim.AdamW(list(m.model.student_frontend.parameters()), lr=1e-2)
+    out = m._step(_batch().data)
+    out["loss"].backward()
+    opt.step()
+    assert m._ema_weight_gap() > 0.0
+
+
+def test_grad_ema_l2_buffer_persists_in_state_dict() -> None:
+    """The spike-monitor EMA buffer is a registered persistent buffer (survives
+    checkpoint round-trips)."""
+    m = _module()
+    assert "_grad_ema_l2" in m.state_dict()
