@@ -377,18 +377,37 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
 
     def forward(
         self, x: Tensor, rope: Tensor, *, key_mask: Optional[Tensor] = None,
+        n_query: Optional[int] = None,
     ) -> Tensor:
         # x: (B, T, d), rope: (2, T_max, head_dim) packed cos/sin
         # key_mask: (B, T) bool, True = keepable key (B36 C5 freq-patch
         #   exclusion; None → full attention, byte-identical to the no-mask
         #   path). The latent time-SA caller passes None.
+        # n_query: when set, compute attention OUTPUT only for the LAST n_query
+        #   rows (their Q), with K/V still over all T rows. SDPA over a query
+        #   subset returns exactly the same rows as the full pass, so the result
+        #   is BIT-IDENTICAL to ``forward(...)[:, T-n_query:]`` — but skips the
+        #   context rows' Q-projection, SDPA-query, and out-projection. Used by
+        #   the M4 predictor's last block, whose context outputs are discarded.
+        #   When set, ``rope``'s T axis must align with x's T (the M4 caller
+        #   passes a per-sequence-gathered table, so it does).
         B, T, _ = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)                     # (B, T, H, head_dim) each
         # Move T into a contiguous-last-but-one slot so `_apply_rope` picks it
         # up (it operates on the second-to-last axis). After RoPE, leave the
         # tensors in (B, H, T, head_dim) — the shape SDPA expects.
-        q = _apply_rope(q.transpose(1, 2), rope)        # (B, H, T, head_dim)
+        q_t = q.transpose(1, 2)                          # (B, H, T, head_dim)
+        if n_query is None:
+            q = _apply_rope(q_t, rope)
+        else:
+            q_t = q_t[:, :, T - n_query :, :]            # (B, H, n_query, hd)
+            rope_q = (
+                rope[:, T - n_query :, :]                # dense (2, T, hd)
+                if rope[0].dim() == 2
+                else rope[:, :, T - n_query :, :]         # per-row (2, B, T, hd)
+            )
+            q = _apply_rope(q_t, rope_q)                 # (B, H, n_query, head_dim)
         k = _apply_rope(k.transpose(1, 2), rope)        # (B, H, T, head_dim)
         v = v.transpose(1, 2)                           # (B, H, T, head_dim)
         attn_mask = None
@@ -403,8 +422,8 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
         # PyTorch autocast and OOM'd at C=384 padded electrodes × T~130 on
         # 31 GiB GPUs (see [[feedback_dcc_partition_default_coganlab_gpu_2026_05_29]]).
         ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        ctx = ctx.transpose(1, 2)                       # (B, T, H, head_dim)
-        return self.out(ctx.reshape(B, T, -1))
+        ctx = ctx.transpose(1, 2)                       # (B, T_q, H, head_dim)
+        return self.out(ctx.reshape(B, ctx.shape[1], -1))
 
 
 class _PlainMultiHeadSelfAttention(nn.Module):

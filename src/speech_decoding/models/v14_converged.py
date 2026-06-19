@@ -761,9 +761,23 @@ class M4Predictor(nn.Module):
             q_ok = torch.ones(B, P * S, dtype=torch.bool, device=key_mask.device)
             full_mask = torch.cat([key_mask, q_ok], dim=1)           # (B, N+P·38)
 
-        for blk in self.blocks:
+        # S3 (#248, bit-exact): the readout uses ONLY the query rows
+        # (``tokens[:, N:]``), so the last block's context-row outputs are
+        # discarded. Run all but the last block over the full sequence (context
+        # must update as keys/values), then compute the last block for the query
+        # rows only — SDPA over a query subset is bit-identical to the full pass
+        # sliced to those rows, but skips the N context rows' SDPA-query,
+        # out-projection, and FFN (the M4 predictor's largest single-layer cost).
+        for blk in self.blocks[:-1]:
             tokens = blk(tokens, rope, full_mask)
-        pred = self.head(tokens[:, N:])                              # (B, P·38, d_model)
+        last = self.blocks[-1]
+        n_q = P * S
+        attn_q = last.attn(
+            last.ln_attn(tokens), rope, key_mask=full_mask, n_query=n_q
+        )                                                            # (B, P·38, d)
+        xq = tokens[:, N:] + attn_q
+        xq = xq + last.ffn(last.ln_ffn(xq))
+        pred = self.head(xq)                                         # (B, P·38, d_model)
         return pred.reshape(B, P, S, -1)                            # (B, P, 38, d_model)
 
 
