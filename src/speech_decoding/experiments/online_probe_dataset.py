@@ -23,6 +23,7 @@ the NaN rows per task.
 
 from __future__ import annotations
 
+import os
 import typing as tp
 
 import numpy as np
@@ -38,7 +39,10 @@ from speech_decoding.studies.braintreebank.labels import (
     _assert_finite_labels,
     remap_task_column,
 )
-from speech_decoding.studies.braintreebank.manifest import BT_LITE_SESSIONS
+from speech_decoding.studies.braintreebank.manifest import (
+    BT_LITE_SESSIONS,
+    bt_subject_native_rate_hz,
+)
 
 if tp.TYPE_CHECKING:  # avoid importing the heavy Data/ns chain on the laptop test path
     from speech_decoding.experiments.data import Data
@@ -105,6 +109,102 @@ def pm1_labels(words_df: pd.DataFrame, task: str) -> np.ndarray:
         out[idx == 1.0] = -1.0
     else:
         raise KeyError(f"probe task {task!r} -> upstream {ut!r} is not supported")
+    return out
+
+
+def probe_feature_columns(tasks: tp.Sequence[str] = PROBE_TASKS) -> tuple[str, ...]:
+    """The transcript-feature columns :func:`pm1_labels` reads, derived from the
+    probe tasks (deduped, order-preserving). Continuous tasks map through
+    ``remap_task_column`` (``delta_volume`` → ``delta_rms``, ``word_length`` →
+    ``word_length``); ``word_position`` → upstream ``word_index`` → ``idx_in_sentence``.
+    This is the exact set :func:`attach_probe_features` must re-join onto the
+    forwarded windows before labelling."""
+    cols: list[str] = []
+    for task in tasks:
+        ut = _upstream_task(task)
+        col = remap_task_column(ut) if ut in SINGLE_FLOAT_TASK_COLUMNS else "idx_in_sentence"
+        if col not in cols:
+            cols.append(col)
+    return tuple(cols)
+
+
+# Recovered-est_idx tolerance (samples). ``start`` was emitted as the EXACT float
+# ``est_idx / native_rate`` (word_events.py), so ``start * native_rate`` round-trips
+# to the integer est_idx with float64 error << 1 sample. A larger residual means the
+# window's clock disagrees with the words_df clock — a real join bug, fail loud.
+_EST_IDX_TOL_SAMPLES: float = 1e-3
+
+
+def attach_probe_features(
+    windows: pd.DataFrame,
+    enriched_words: dict[tuple[int, int], pd.DataFrame],
+    *,
+    feature_columns: tp.Sequence[str] | None = None,
+    native_rate_hz: tp.Callable[[int], float] = bt_subject_native_rate_hz,
+) -> pd.DataFrame:
+    """Re-attach the probe's transcript-feature columns to each forwarded window.
+
+    The emitted ``Word`` events (``word_events.py``) carry only the binarized
+    ``label`` for the RUN's single training task — the raw feature columns the
+    probe binarizes itself (``delta_rms`` / ``word_length`` / ``idx_in_sentence``)
+    are dropped. This re-joins them WITHOUT touching the live event schema: each
+    window's neural-clock ``est_idx`` is recovered from its ``start``
+    (``= est_idx / native_rate``; native = 2048 Hz, S9 = 1024 Hz) and matched
+    against the per-session enriched ``words_df`` (carrying ``est_idx`` + every
+    ``features.csv`` column). Fails loud if a window's est_idx has no match
+    (broken join) or the recovered est_idx isn't integral (clock disagreement) —
+    a silent NaN here would corrupt the probe label set, exactly the class of bug
+    the data-pipeline bug-hunt guards against.
+
+    ``windows``: forwarded clips, one row each (``start`` neural-clock seconds,
+    ``subject_id``, ``trial_id``). ``enriched_words``: ``(subject_id, trial_id)`` →
+    enriched ``words_df``. Returns ``windows`` with ``feature_columns`` attached,
+    row order preserved."""
+    if feature_columns is None:
+        feature_columns = probe_feature_columns()
+    feature_columns = tuple(feature_columns)
+    out = windows.reset_index(drop=True).copy()
+    sid = _subject_id_int(out["subject_id"])
+    tid = np.asarray(out["trial_id"]).astype(int)
+    starts = out["start"].to_numpy(dtype=float)
+    for col in feature_columns:
+        out[col] = np.full(len(out), np.nan, dtype=float)
+    for s, t in {(int(a), int(b)) for a, b in zip(sid, tid)}:
+        rows = np.flatnonzero((sid == s) & (tid == t))
+        rate = float(native_rate_hz(s))
+        recovered = starts[rows] * rate
+        est_idx = np.rint(recovered).astype(np.int64)
+        drift = np.abs(recovered - est_idx)
+        if drift.max(initial=0.0) > _EST_IDX_TOL_SAMPLES:
+            bad = int(np.argmax(drift))
+            raise ValueError(
+                f"probe window in session ({s},{t}) has start={starts[rows][bad]} "
+                f"that does not round-trip to an integer est_idx at {rate} Hz "
+                f"(residual {drift[bad]:.4g} samples) — neural-clock mismatch."
+            )
+        ew = enriched_words.get((s, t))
+        if ew is None:
+            raise KeyError(
+                f"attach_probe_features: no enriched words_df supplied for session "
+                f"({s},{t}); cannot label its {len(rows)} probe windows."
+            )
+        lut = ew.drop_duplicates(subset="est_idx").set_index("est_idx")
+        missing_cols = [c for c in feature_columns if c not in lut.columns]
+        if missing_cols:
+            raise KeyError(
+                f"enriched words_df for session ({s},{t}) is missing probe feature "
+                f"columns {missing_cols}; was it loaded with enrich=True?"
+            )
+        missing = np.setdiff1d(est_idx, lut.index.to_numpy())
+        if missing.size:
+            raise KeyError(
+                f"{missing.size} probe windows in session ({s},{t}) have no matching "
+                f"est_idx in the enriched words_df (e.g. {int(missing[0])}) — the "
+                "neural→transcript join broke."
+            )
+        sub = lut.loc[est_idx, list(feature_columns)]
+        for col in feature_columns:
+            out.loc[rows, col] = sub[col].to_numpy()
     return out
 
 
@@ -244,8 +344,31 @@ def _probe_segmenter(run_data: "Data") -> tp.Any:
     )
 
 
+def _load_enriched_words(
+    sessions: tp.Iterable[tuple[int, int]], bt_root: str | None
+) -> dict[tuple[int, int], pd.DataFrame]:  # pragma: no cover - DCC-only (needs BT transcripts)
+    """Load each session's transcript-enriched ``words_df`` (``est_idx`` + every
+    ``features.csv`` column) for :func:`attach_probe_features`. Reuses the study's
+    own loader (``enrich=True``) so the feature columns are byte-identical to the
+    eval path. DCC-only: needs ``$ROOT_DIR_BRAINTREEBANK/transcripts``."""
+    from speech_decoding.studies.braintreebank.word_events import (
+        _load_words_and_nonverbal,
+    )
+
+    out: dict[tuple[int, int], pd.DataFrame] = {}
+    for s, t in {(int(a), int(b)) for a, b in sessions}:
+        words_df, _ = _load_words_and_nonverbal(s, t, bt_root=bt_root, enrich=True)
+        out[(s, t)] = words_df
+    return out
+
+
 def _materialize_subject(
-    dataset: tp.Any, triggers: pd.DataFrame, positions: np.ndarray, *, batch_size: int
+    dataset: tp.Any,
+    triggers: pd.DataFrame,
+    positions: np.ndarray,
+    *,
+    batch_size: int,
+    enriched_words: dict[tuple[int, int], pd.DataFrame],
 ) -> dict[str, tp.Any]:  # pragma: no cover - DCC-only (needs BT voltage)
     """Forward one subject's selected windows through the segmenter and collect the
     encoder-ready band tensors + per-electrode anatomy. Mirrors ``Data.build``'s
@@ -281,7 +404,9 @@ def _materialize_subject(
         "hg": torch.cat(bands["hg"], dim=0),
         "parcel_per_electrode": support0.argmax(dim=-1).long(),   # (C,)
         "electrode_mask": valid0.bool(),                          # (C,)
-        "words_df": triggers.iloc[positions].reset_index(drop=True),
+        "words_df": attach_probe_features(
+            triggers.iloc[positions].reset_index(drop=True), enriched_words
+        ),
         "sessions": sorted(
             {
                 (int(s), int(t))
@@ -332,6 +457,16 @@ def build_probe_dataset(
     present = present_subject_ids(triggers)
     per_subject: dict[int, dict[str, tp.Any]] = {}
     needed = {cs_anchor, *ws_subjects, *cs_test_subjects} & present
+    # The probe binarizes its OWN ±1 labels from the raw feature columns, which the
+    # emitted Word events drop — re-load the enriched words_df per session for the
+    # neural-clock est_idx join (attach_probe_features). bt_root from the study.
+    enriched_words = _load_enriched_words(
+        {
+            (int(s), int(t))
+            for s, t in zip(triggers["subject_id"], triggers["trial_id"])
+        },
+        bt_root=os.environ.get("ROOT_DIR_BRAINTREEBANK"),
+    )
     for sid in sorted(needed):
         positions = select_subject_window_positions(
             triggers, sid, n_cap=n_cap, seed=seed
@@ -339,7 +474,8 @@ def build_probe_dataset(
         if len(positions) == 0:
             continue
         per_subject[sid] = _materialize_subject(
-            dataset, triggers, positions, batch_size=batch_size
+            dataset, triggers, positions, batch_size=batch_size,
+            enriched_words=enriched_words,
         )
 
     if cs_anchor not in per_subject:
@@ -374,9 +510,11 @@ __all__ = [
     "PROBE_TASKS",
     "PROBE_TASK_ALIASES",
     "WS_SUBJECTS",
+    "attach_probe_features",
     "build_probe_dataset",
     "filter_probe_events",
     "pm1_labels",
+    "probe_feature_columns",
     "select_subject_window_positions",
     "select_window_indices",
 ]

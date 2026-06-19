@@ -148,6 +148,126 @@ def test_filter_probe_events_other_session_untouched(tmp_path) -> None:
     assert out["start"].tolist() == [10.0]              # kept (no sidecar for btbank3_t2)
 
 
+# ------------------------------------------- feature re-attach (est_idx neural-clock join)
+def test_probe_feature_columns_derived_from_tasks() -> None:
+    """The columns pm1_labels needs, deduped: delta_volume→delta_rms, word_length,
+    word_position→idx_in_sentence."""
+    assert opd.probe_feature_columns() == ("delta_rms", "word_length", "idx_in_sentence")
+
+
+def _enriched(est_idx, *, dr=None, wl=None, iis=None) -> pd.DataFrame:
+    n = len(est_idx)
+    rng = np.random.default_rng(int(est_idx[0]))
+    return pd.DataFrame({
+        "est_idx": np.asarray(est_idx, dtype=np.int64),
+        "delta_rms": rng.standard_normal(n) if dr is None else dr,
+        "word_length": (rng.integers(1, 10, n).astype(float) if wl is None else wl),
+        "idx_in_sentence": (rng.integers(0, 3, n).astype(float) if iis is None else iis),
+        "other_col": rng.standard_normal(n),   # extra features.csv column, ignored
+    })
+
+
+def test_attach_probe_features_joins_on_recovered_est_idx() -> None:
+    """start = est_idx/native_rate (2048 Hz) round-trips to est_idx; the join pulls
+    the right feature row per window, row order preserved."""
+    est = np.array([100, 5000, 73, 99999], dtype=np.int64)
+    ew = _enriched(est, dr=np.array([1., 2., 3., 4.]),
+                   wl=np.array([5., 6., 7., 8.]), iis=np.array([0., 1., 2., 0.]))
+    # windows in a DIFFERENT order than the enriched df, to prove the per-row join
+    order = [2, 0, 3, 1]
+    windows = pd.DataFrame({
+        "type": "Word",
+        "start": est[order] / 2048.0,
+        "subject_id": ["2"] * 4,        # string ids (real study dtype)
+        "trial_id": [1] * 4,
+    })
+    out = opd.attach_probe_features(windows, {(2, 1): ew})
+    assert out["delta_rms"].tolist() == [3., 1., 4., 2.]
+    assert out["word_length"].tolist() == [7., 5., 8., 6.]
+    assert out["idx_in_sentence"].tolist() == [2., 0., 0., 1.]
+    # the attached words_df labels correctly through pm1_labels
+    assert "other_col" not in out.columns
+
+
+def test_attach_probe_features_s9_half_rate() -> None:
+    """S9 est_idx is on the 1024 Hz native clock; recovery must use 1024, not 2048."""
+    est = np.array([1024, 2048, 3072], dtype=np.int64)
+    ew = _enriched(est, dr=np.array([10., 20., 30.]))
+    windows = pd.DataFrame({
+        "start": est / 1024.0, "subject_id": [9, 9, 9], "trial_id": [0, 0, 0],
+    })
+    out = opd.attach_probe_features(windows, {(9, 0): ew})
+    assert out["delta_rms"].tolist() == [10., 20., 30.]
+
+
+def test_attach_probe_features_multi_session() -> None:
+    """A subject spanning two trials joins each window against its own session's df."""
+    ew1 = _enriched(np.array([100, 200]), dr=np.array([1., 2.]))
+    ew2 = _enriched(np.array([100, 300]), dr=np.array([7., 9.]))   # est 100 reused across trials
+    windows = pd.DataFrame({
+        "start": np.array([100, 100, 300]) / 2048.0,
+        "subject_id": [2, 2, 2], "trial_id": [1, 2, 2],
+    })
+    out = opd.attach_probe_features(windows, {(2, 1): ew1, (2, 2): ew2})
+    assert out["delta_rms"].tolist() == [1., 7., 9.]               # (2,1):100 vs (2,2):100 differ
+
+
+def test_attach_probe_features_fails_loud_on_missing_est_idx() -> None:
+    """A window whose est_idx isn't in the enriched df = broken join → raise, never
+    a silent NaN label."""
+    ew = _enriched(np.array([100, 200]))
+    windows = pd.DataFrame({
+        "start": np.array([100, 999]) / 2048.0,
+        "subject_id": [2, 2], "trial_id": [1, 1],
+    })
+    with pytest.raises(KeyError, match="no matching"):
+        opd.attach_probe_features(windows, {(2, 1): ew})
+
+
+def test_attach_probe_features_fails_loud_on_clock_mismatch() -> None:
+    """A start that doesn't round-trip to an integer est_idx (wrong clock) → raise."""
+    ew = _enriched(np.array([100, 200]))
+    windows = pd.DataFrame({
+        "start": [100.4 / 2048.0, 200 / 2048.0],   # 100.4 not integral
+        "subject_id": [2, 2], "trial_id": [1, 1],
+    })
+    with pytest.raises(ValueError, match="neural-clock mismatch"):
+        opd.attach_probe_features(windows, {(2, 1): ew})
+
+
+def test_attach_probe_features_fails_loud_on_missing_session() -> None:
+    windows = pd.DataFrame({
+        "start": [100 / 2048.0], "subject_id": [2], "trial_id": [1],
+    })
+    with pytest.raises(KeyError, match="no enriched words_df"):
+        opd.attach_probe_features(windows, {})
+
+
+def test_attach_probe_features_fails_loud_on_missing_feature_column() -> None:
+    ew = pd.DataFrame({"est_idx": [100], "delta_rms": [1.0]})   # no word_length/idx
+    windows = pd.DataFrame({
+        "start": [100 / 2048.0], "subject_id": [2], "trial_id": [1],
+    })
+    with pytest.raises(KeyError, match="missing probe feature columns"):
+        opd.attach_probe_features(windows, {(2, 1): ew})
+
+
+def test_attach_probe_features_then_pm1_labels_end_to_end() -> None:
+    """The re-attached words_df feeds pm1_labels with no KeyError — the whole point
+    of #241: forwarded windows become labellable."""
+    est = np.arange(100, 100 + 200, dtype=np.int64)
+    rng = np.random.default_rng(3)
+    ew = _enriched(est, dr=rng.standard_normal(200))
+    windows = pd.DataFrame({
+        "start": est / 2048.0, "subject_id": ["2"] * 200, "trial_id": [1] * 200,
+    })
+    wdf = opd.attach_probe_features(windows, {(2, 1): ew})
+    for task in opd.PROBE_TASKS:
+        lab = opd.pm1_labels(wdf, task)
+        assert lab.shape == (200,)
+        assert set(np.unique(lab[np.isfinite(lab)])) <= {-1.0, 1.0}
+
+
 # ------------------------------------------------- per-subject window selection (n_cap)
 def test_select_subject_window_positions_filters_and_caps() -> None:
     """Positions are that subject's rows only, deterministically capped, in time
