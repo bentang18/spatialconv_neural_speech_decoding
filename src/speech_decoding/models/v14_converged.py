@@ -1053,6 +1053,18 @@ class V14ConvergedSSL(nn.Module):
         self.register_buffer("freq_global_id", freq_global_id, persistent=False)
         self.register_buffer("time_slot", time_slot, persistent=False)
 
+        # Forward-tap stash for the RankMe monitor (Ben 2026-06-19): the training
+        # forward already computes the teacher-frontend target and the student
+        # latent, so the monitor reads them HERE instead of re-running a dense
+        # full-input forward every step (the #245 double-forward). Detached, one
+        # step's worth, overwritten each forward — mirrors `last_band_token_norm`.
+        #   teacher_frontend: (B,C,38,d) full real set — byte-identical to a fresh
+        #     `teacher_frontend(slow,beta,hg)` (electrode-isolated, teacher_vis all-True).
+        #   student_latent: the latent representation as actually shaped this step
+        #     (ragged `forward` → (B,C,38,d) with zeros off the visible set; dense
+        #     oracle → (B,C,38,d) full). The monitor gates the zero/pad rows out.
+        self.last_rank_taps: dict[str, Tensor] = {}
+
     @torch.no_grad()
     def update_teacher(self, tau: float) -> None:
         """EMA: ``teacher ← τ·teacher + (1−τ)·student`` (frontend only)."""
@@ -1141,6 +1153,14 @@ class V14ConvergedSSL(nn.Module):
             electrode_mask[:, :, None] & (~tube_mask)[:, :, None] & student_vis
         )                                                          # (B,C,38)
         s_l = self.latent.forward_ragged(s_f, parcel_per_electrode, latent_vis)
+        # Stash the taps the RankMe monitor needs — t_f is already detached; s_l
+        # carries grad so detach. `latent_vis` (B,C,38) marks the rows the latent
+        # actually wrote (zeros elsewhere) so the monitor ranks only real tokens.
+        self.last_rank_taps = {
+            "teacher_frontend": t_f,
+            "student_latent": s_l.detach(),
+            "student_latent_valid": latent_vis,
+        }
 
         l_m2, m2_bands = self._m2_loss_ragged(
             s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
@@ -1179,6 +1199,11 @@ class V14ConvergedSSL(nn.Module):
             electrode_mask[:, :, None] & (~tube_mask)[:, :, None] & student_vis
         )                                                          # (B,C,38)
         s_l = self.latent(s_f, parcel_per_electrode, token_mask=latent_vis)
+        self.last_rank_taps = {
+            "teacher_frontend": t_f,
+            "student_latent": s_l.detach(),
+            "student_latent_valid": latent_vis,
+        }
 
         l_m2, m2_bands = self._m2_loss(
             s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)

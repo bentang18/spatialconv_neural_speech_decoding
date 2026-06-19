@@ -565,6 +565,65 @@ def test_monitor_from_step_emits_rankme_coverage_inputstats() -> None:
     assert not missing, f"missing forward-tap metrics: {sorted(missing)}"
 
 
+def test_forward_populates_rank_taps() -> None:
+    """The forward stashes the teacher-frontend target + student-latent rep (and
+    the per-token valid mask) so the monitor reads them instead of re-forwarding
+    (#247). Detached — the monitor must never hold the training graph."""
+    m = _module()
+    m._step(_batch(B=2, C=6).data)
+    taps = m.model.last_rank_taps
+    assert {"teacher_frontend", "student_latent", "student_latent_valid"} <= set(taps)
+    B, C, S, d = taps["teacher_frontend"].shape
+    assert (B, C) == (2, 6)
+    assert taps["student_latent"].shape == (B, C, S, d)
+    assert taps["student_latent_valid"].shape == (B, C, S)
+    assert taps["student_latent_valid"].dtype == torch.bool
+    assert not taps["teacher_frontend"].requires_grad
+    assert not taps["student_latent"].requires_grad
+    # The student-latent tap is masked-context: it writes zeros off the visible
+    # set, and the valid mask marks exactly the rows the latent wrote.
+    assert bool((~taps["student_latent_valid"]).any()), "M2/M4 masking leaves hidden rows"
+
+
+def _spy(obj, name: str, calls: list[str]):
+    """Wrap a bound method/attr so each call records and still delegates."""
+    real = getattr(obj, name)
+
+    def wrapper(*a, **k):
+        calls.append(name)
+        return real(*a, **k)
+
+    setattr(obj, name, wrapper)
+
+
+def test_monitor_reuses_taps_without_second_forward() -> None:
+    """After a forward, the monitor ranks the stashed taps — it must NOT call
+    encode_latent or the teacher frontend a second time (the #245 double-forward
+    that ~2.1×'d the step). Still emits both rank panels from the reused taps."""
+    m = _module()
+    m._step(_batch().data)                     # populates last_rank_taps
+    calls: list[str] = []
+    _spy(m.model, "encode_latent", calls)
+    _spy(m.model.teacher_frontend, "forward", calls)
+    logged = _capture_logs(m)
+    m._monitor_from_step(_batch().data, step_name="train")
+    assert calls == [], f"monitor re-forwarded instead of reusing taps: {calls}"
+    assert "train_mon_rankme" in logged and "train_mon_frontend_rankme" in logged
+
+
+def test_monitor_falls_back_to_encode_when_taps_absent() -> None:
+    """No prior forward (empty stash) ⇒ the monitor still works by recomputing a
+    dense encode — the fallback path keeps unit tests / val-only calls valid."""
+    m = _module()
+    m.model.last_rank_taps = {}
+    calls: list[str] = []
+    _spy(m.model, "encode_latent", calls)
+    logged = _capture_logs(m)
+    m._monitor_from_step(_batch().data, step_name="train")
+    assert calls == ["encode_latent"], "absent taps must fall back to a dense encode"
+    assert "train_mon_rankme" in logged
+
+
 def test_heavy_monitor_due_none_falls_back_to_log_cadence() -> None:
     # Default (None) ⇒ gate on the log cadence; with no trainer attached the log
     # cadence is 1, so the heavy monitor is due every step (pre-decouple behavior).

@@ -575,17 +575,23 @@ class V14ConvergedBrainModule(pl.LightningModule):
 
     def _run_rank_monitor(
         self, *, tap: Tensor, valid: Tensor, step_name: str, key: str,
+        token_valid: Tensor | None = None,
     ) -> None:
         """RankMe + feature stats on a per-electrode ``(B, C, S, d)`` tap, gating
-        the electrode axis by ``valid (B, C)`` so padded electrodes don't dilute
-        the rank. ``key="frontend_"`` → ``mon_frontend_rankme*`` (teacher frontend
-        M2 target); ``key=""`` → ``mon_rankme*`` (student latent — the converged
-        arch's deep representation the readout consumes)."""
+        out the non-real rows so padding/masked tokens don't dilute the rank.
+        ``key="frontend_"`` → ``mon_frontend_rankme*`` (teacher frontend M2 target,
+        gated per-ELECTRODE by ``valid (B, C)`` — every token of a real electrode
+        is real); ``key=""`` → ``mon_rankme*`` (student latent). When ``token_valid
+        (B, C, S)`` is given it gates per-TOKEN instead — the ragged latent writes
+        zeros off the visible set, so ranking those zero rows would corrupt the
+        spectrum; ``token_valid`` keeps only the rows the latent actually wrote."""
         if tap.dim() != 4:
             return
         B, C, S, d = tap.shape
         flat = tap.reshape(B * C * S, d)
-        if tuple(valid.shape[:2]) == (B, C):
+        if token_valid is not None and tuple(token_valid.shape) == (B, C, S):
+            flat = flat[token_valid.reshape(-1).bool()]
+        elif tuple(valid.shape[:2]) == (B, C):
             keep = valid.reshape(B, C, 1).expand(B, C, S).reshape(-1)
             flat = flat[keep]
         sub = self._rankme_subsample(flat)
@@ -687,9 +693,18 @@ class V14ConvergedBrainModule(pl.LightningModule):
     @torch.no_grad()
     def _monitor_from_step(self, data: dict[str, Tensor], *, step_name: str) -> None:
         """Forward-tap diagnostics (RankMe on the teacher-frontend M2 target + the
-        student-latent representation, parcel coverage, input stats). Re-runs the
-        full-input encode taps under no_grad — cadence-gated by the caller so the
-        extra forward only fires at the logging cadence."""
+        student-latent representation, parcel coverage, input stats).
+
+        The two RankMe taps REUSE the activations the just-run training forward
+        already produced (``model.last_rank_taps``) instead of re-running a second
+        dense full-input forward every step — that double-forward was the #245
+        throughput regression (Ben 2026-06-19). The teacher-frontend tap is
+        byte-identical to a fresh ``teacher_frontend(slow,beta,hg)`` (electrode-
+        isolated, teacher saw all tokens). The student-latent tap now reflects the
+        MASKED-context visible-token representation the loss actually shapes (vs
+        the old full-context dense pass) — the more faithful collapse tripwire, and
+        free. Falls back to a fresh dense encode only if the stash is empty (a
+        monitor call not preceded by a forward, e.g. a unit test)."""
         slow, beta, hg, ppe, emask = self._converged_inputs(data)
         self._run_input_stats_monitor(data=data, step_name=step_name)
         n_parcels = int(data["support"].shape[-1])
@@ -697,17 +712,25 @@ class V14ConvergedBrainModule(pl.LightningModule):
             parcel_per_electrode=ppe, electrode_mask=emask,
             n_parcels=n_parcels, step_name=step_name,
         )
+        taps = getattr(self.model, "last_rank_taps", {}) or {}
         # Frontend M2 rank on the EMA teacher (the post-frontend target P-space).
-        teacher_m2 = self.model.teacher_frontend(slow, beta, hg)
+        teacher_m2 = taps.get("teacher_frontend")
+        if teacher_m2 is None:
+            teacher_m2 = self.model.teacher_frontend(slow, beta, hg)
         self._run_rank_monitor(
             tap=teacher_m2, valid=emask, step_name=step_name, key="frontend_",
         )
-        # Deep-representation rank on the student latent (encode_latent tap).
-        student_latent = self.model.encode_latent(
-            slow, beta, hg, ppe, electrode_mask=emask,
-        )
+        # Deep-representation rank on the student latent.
+        student_latent = taps.get("student_latent")
+        latent_valid = taps.get("student_latent_valid")
+        if student_latent is None:
+            student_latent = self.model.encode_latent(
+                slow, beta, hg, ppe, electrode_mask=emask,
+            )
+            latent_valid = None
         self._run_rank_monitor(
-            tap=student_latent, valid=emask, step_name=step_name, key="",
+            tap=student_latent, valid=emask, token_valid=latent_valid,
+            step_name=step_name, key="",
         )
 
     # ----------------------------------------------------------- gradient hooks
