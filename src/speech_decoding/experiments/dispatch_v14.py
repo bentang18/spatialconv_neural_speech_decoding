@@ -745,6 +745,9 @@ def build_v14_experiment(
     # for P4 so the Neuroprobe-Lite parity clip/batch sets are byte-identical. See
     # ``Data.group_by_session`` / ``_SessionGroupedBatchSampler``.
     group_by_session: bool = False,
+    # #249 rank size-balancing (needs group_by_session): match the W DDP ranks'
+    # simultaneous batches by electrode count C to remove straggler idle. SSL-only.
+    balance_ranks: bool = False,
     cluster: str | None = None,
     # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
     # they only override exca's TaskInfra / submitit defaults when set.
@@ -1747,6 +1750,8 @@ def build_v14_experiment(
         bad_window_dir=(bad_window_dir if ssl_phase else None),
         # SSL-only: never group eval batches (P4 parity lock).
         group_by_session=(group_by_session if ssl_phase else False),
+        # SSL-only rank size-balancing; inert without group_by_session.
+        balance_ranks_by_size=(balance_ranks if ssl_phase else False),
     )
 
     exca_folder = exca_folder or os.environ.get("EXCA_CACHE_FOLDER")
@@ -2743,6 +2748,15 @@ def _parser() -> argparse.ArgumentParser:
                         "mixed batch up to the corpus max-C (the latent attention is "
                         "O(C^2) in electrode count). SSL phases only; P4 eval batches "
                         "are never grouped (Neuroprobe parity lock). Default off.")
+    p.add_argument("--balance-ranks", action="store_true",
+                   help="Throughput lever (#249, science-neutral; needs "
+                        "--group-by-session): bucket sessions by electrode count C so "
+                        "the W batches the W DDP ranks run simultaneously at each "
+                        "gradient all-reduce have matched C — the small-C ranks stop "
+                        "idling at the barrier while a big-C rank finishes its O(C^2) "
+                        "forward (removes DDP straggler idle). Cost proxy = the exact "
+                        "per-session post-static-drop electrode count; no-ops to the "
+                        "plain stride if BraintreeBank data is absent. Default off.")
     # Layer-3 winsor cap (#180). Read-time per-cell |z| clamp on the session
     # robust-z front-end. Cache-NEUTRAL by design: implemented as the env knob
     # V14_SESSION_Z_WINSOR (NOT a serialized view field) so it never forks the
@@ -3635,6 +3649,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         # dict; build_v14_experiment gates it to SSL phases (P4 self-zeroes to None).
         bad_window_dir=args.bad_window_dir,
         group_by_session=args.group_by_session,
+        balance_ranks=args.balance_ranks,
         mains_notch_hz=args.mains_notch_hz,
         # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
         # one dict so the chain + single-phase builds stay in lock-step.

@@ -64,12 +64,31 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
     across the cohort. ``world`` / ``rank`` are read LAZILY from ``torch.distributed``
     at iterate/len time, because the loader is built before the DDP process group
     exists (so they cannot be captured at construction).
+
+    **Rank size-balancing** (``balance_ranks`` + ``session_size``, OFF by default).
+    Session-homogeneous batches make compute *vary per batch*: the ragged forward's
+    O(C²) electrode attention costs the batch's true C, and sessions span ~94–179
+    electrodes. Under DDP the ``W`` ranks step in lockstep at the gradient all-reduce,
+    so when the ``[rank::world]`` stride hands different-C batches to the ranks of one
+    micro-step, the small-C ranks idle at the barrier (straggler). Balancing removes
+    it: sort all batches by cost (the session's electrode count), chunk the sorted
+    list into groups of ``W`` near-equal-cost batches, shuffle the GROUP ORDER
+    (rank-independent ``seed + epoch`` → SGD randomness preserved at group
+    granularity), then the SAME ``[rank::world]`` stride gives each rank one member of
+    each group. So the ``W`` batches that run simultaneously at micro-step ``j`` are
+    group ``j`` — cost-matched, no straggler. ``__len__`` is unchanged (one batch per
+    group == ``ceil(n_batches / W)``). Science-neutral: still every sample once/epoch
+    (the per-sample SSL loss has no cross-sample coupling). Needs a true cost proxy —
+    ``session_size`` maps ``(subject, trial) -> electrode count``; absent it (or
+    ``world <= 1``) the path no-ops back to the plain stride.
     """
 
     def __init__(
         self, session_key, batch_size, *, shuffle, drop_last,
         seed=0, num_replicas=None, rank=None,
+        session_size=None, balance_ranks=False,
     ):
+        self._session_key = list(session_key)
         self._groups: dict = {}
         for idx, key in enumerate(session_key):
             self._groups.setdefault(key, []).append(idx)
@@ -81,6 +100,8 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
         # None => detect lazily from torch.distributed at iterate/len time.
         self._num_replicas = num_replicas
         self._rank = rank
+        self._session_size = dict(session_size) if session_size is not None else None
+        self._balance_ranks = bool(balance_ranks)
 
     def set_epoch(self, epoch: int) -> None:
         # Lightning calls this at each train-epoch start. Reshuffles
@@ -114,9 +135,47 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
             batches = [batches[i] for i in perm]
         return batches
 
-    def _sharded(self) -> list[list[int]]:
+    def _batch_cost(self, batch: list[int]) -> int:
+        # Cost proxy = the batch's session electrode count (drives the O(C²)
+        # ragged forward). All samples share one session, so batch[0] suffices.
+        # Missing key -> 0 (degrades to the small end; never raises).
+        return int(self._session_size.get(self._session_key[batch[0]], 0))
+
+    def _balanced_groups(self, world: int) -> list[list[list[int]]] | None:
+        # Returns groups of exactly `world` cost-matched batches, or None to
+        # signal "fall back to the plain stride". Each group's W members run
+        # simultaneously across the W ranks at one micro-step.
+        if not self._balance_ranks or self._session_size is None or world <= 1:
+            return None
         batches = self._all_batches()
+        n = len(batches)
+        if n == 0:
+            return []
+        # Stable sort by cost; _all_batches already shuffled, so equal-cost
+        # batches keep a rank-independent random order (SGD noise within a tier).
+        order = sorted(range(n), key=lambda i: self._batch_cost(batches[i]))
+        sorted_batches = [batches[i] for i in order]
+        groups = [sorted_batches[g : g + world] for g in range(0, n, world)]
+        # Pad a partial final group (the largest-cost tail) by wrapping within
+        # itself, so it stays near-equal-cost and every rank gets one member.
+        last = groups[-1]
+        if len(last) < world:
+            k = len(last)
+            groups[-1] = last + [last[i % k] for i in range(world - k)]
+        # Shuffle GROUP ORDER only (rank-independent): preserves SGD randomness
+        # at group granularity while keeping each group cost-matched. Distinct
+        # generator stream from _all_batches so the two shuffles decorrelate.
+        gen = torch.Generator().manual_seed(self._seed + self._epoch + 0x5A1A)
+        perm = torch.randperm(len(groups), generator=gen).tolist()
+        return [groups[i] for i in perm]
+
+    def _sharded(self) -> list[list[int]]:
         world, rank = self._dist()
+        groups = self._balanced_groups(world)
+        if groups is not None:
+            # Stride is implicit: rank r takes the r-th member of every group.
+            return [grp[rank] for grp in groups]
+        batches = self._all_batches()
         if world <= 1:
             return batches
         n = len(batches)
@@ -208,6 +267,46 @@ class Data(pydantic.BaseModel):
     # Neuroprobe parity-locked clip sets stay byte-identical. See
     # ``_SessionGroupedBatchSampler``. Off by default = byte-identical loader.
     group_by_session: bool = False
+    # Throughput lever (DDP straggler removal; requires group_by_session). When True,
+    # the train sampler buckets sessions by electrode count C so the W batches the W
+    # DDP ranks run simultaneously at each gradient all-reduce have matched C — the
+    # small-C ranks no longer idle at the barrier while a big-C rank finishes its
+    # O(C²) forward. Science-neutral (still every sample once/epoch; only which ranks
+    # co-run which sessions changes). Needs a true cost proxy: built at loader time
+    # from ``voltage_electrode_order`` (the exact per-session post-static-drop count);
+    # if BraintreeBank data / ROOT_DIR_BRAINTREEBANK is absent the proxy can't be
+    # built and the sampler safely no-ops back to the plain stride. Off by default.
+    balance_ranks_by_size: bool = False
+
+    def _session_electrode_counts(self, sessions) -> dict | None:
+        """Map each ``(subject_id, trial_id)`` to its post-static-drop electrode
+        count C — the O(C²) cost proxy the rank-balancer sorts on. Reads only the
+        small per-session electrode tables via ``voltage_electrode_order``. Returns
+        ``None`` (balancing no-ops) if BraintreeBank data / the root env is absent,
+        so an accidentally-on flag in a non-DCC build degrades instead of crashing."""
+        bt_root = os.environ.get("ROOT_DIR_BRAINTREEBANK")
+        if not bt_root:
+            logger.warning(
+                "balance_ranks_by_size: ROOT_DIR_BRAINTREEBANK unset; cannot size "
+                "sessions — rank-balancing disabled (plain DDP stride)."
+            )
+            return None
+        from speech_decoding.studies.braintreebank.anatomy import (
+            voltage_electrode_order,
+        )
+        try:
+            sizes: dict = {}
+            for subject_id, trial_id in sessions:
+                sizes[(subject_id, trial_id)] = len(
+                    voltage_electrode_order(bt_root, int(subject_id), int(trial_id))
+                )
+            return sizes
+        except Exception as exc:  # missing files, etc. — degrade, don't crash
+            logger.warning(
+                "balance_ranks_by_size: failed to size sessions (%s) — "
+                "rank-balancing disabled (plain DDP stride).", exc,
+            )
+            return None
 
     def build(self, *, worker_seed: int | None = None) -> dict[str, DataLoader]:
         """Build split DataLoaders.
@@ -295,6 +394,11 @@ class Data(pydantic.BaseModel):
                 session_key = list(
                     zip(triggers["subject_id"].tolist(), triggers["trial_id"].tolist())
                 )
+                session_size = (
+                    self._session_electrode_counts(set(session_key))
+                    if self.balance_ranks_by_size
+                    else None
+                )
                 loader_kwargs["batch_sampler"] = _SessionGroupedBatchSampler(
                     session_key,
                     self.batch_size,
@@ -303,6 +407,8 @@ class Data(pydantic.BaseModel):
                     # rank-INDEPENDENT seed so every DDP rank builds the same
                     # full batch list before self-sharding (see class docstring).
                     seed=worker_seed if worker_seed is not None else 0,
+                    session_size=session_size,
+                    balance_ranks=self.balance_ranks_by_size,
                 )
             else:
                 loader_kwargs["batch_size"] = self.batch_size
