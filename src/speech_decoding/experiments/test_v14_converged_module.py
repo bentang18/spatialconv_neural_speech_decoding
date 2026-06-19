@@ -565,6 +565,35 @@ def test_monitor_from_step_emits_rankme_coverage_inputstats() -> None:
     assert not missing, f"missing forward-tap metrics: {sorted(missing)}"
 
 
+def test_heavy_monitor_due_none_falls_back_to_log_cadence() -> None:
+    # Default (None) ⇒ gate on the log cadence; with no trainer attached the log
+    # cadence is 1, so the heavy monitor is due every step (pre-decouple behavior).
+    m = _module()
+    assert m._monitor_every_n_steps is None
+    assert all(m._heavy_monitor_due(i) for i in (0, 1, 2, 5, 49, 50))
+
+
+def test_heavy_monitor_due_decoupled_cadence() -> None:
+    # An explicit cadence fires the expensive extra forward sparsely, independent
+    # of log_every_n_steps (which keeps loss curves per-step).
+    m = _module(monitor_every_n_steps=50)
+    assert m._monitor_every_n_steps == 50
+    assert [i for i in range(101) if m._heavy_monitor_due(i)] == [0, 50, 100]
+
+
+def test_training_step_gates_monitor_on_heavy_cadence() -> None:
+    # The gate is actually wired into training_step: with cadence 50 the extra
+    # forward (the step-doubling _monitor_from_step) fires at 0 and 50 but NOT at
+    # the per-step batches in between — while loss logging is unaffected.
+    m = _module(monitor_every_n_steps=50)
+    _capture_logs(m)   # stub self.log (no trainer attached)
+    fired: list[str] = []
+    m._monitor_from_step = lambda data, *, step_name: fired.append(step_name)  # type: ignore[assignment]
+    for i in (0, 1, 2, 49, 50, 51):
+        m.training_step(_batch(), i)
+    assert fired == ["train", "train"]   # exactly batch_idx 0 and 50
+
+
 def test_log_losses_emits_joint_canonical_panel_names() -> None:
     """The converged forward dict is logged under the JOINT panel names so the
     live 2STFT wandb panels populate: l_m2→loss_m2, ev_m4→m4_explained_var, …"""

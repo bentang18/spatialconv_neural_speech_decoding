@@ -636,6 +636,7 @@ def build_v14_experiment(
     # is built in-worker (DCC-only) when enabled; cadence tunes its firing period.
     online_probe_enabled: bool = False,
     online_probe_cadence: int = 1000,
+    monitor_every_n_steps: int | None = None,
     m_sub_slots: int = DEFAULT_M_SUB_SLOTS,
     n_freq_bins: int = DEFAULT_N_FREQ_BINS,
     # WS-C / C1: phase-conditional clip window (seconds). 5 s for the SSL
@@ -2056,6 +2057,7 @@ def build_v14_experiment(
             # the probe build reseeds deterministically from its own default).
             online_probe_enabled=online_probe_enabled,
             online_probe_cadence=online_probe_cadence,
+            monitor_every_n_steps=monitor_every_n_steps,
             # SSL computes its own loss; this satisfies the required field and is
             # never read by V14ConvergedBrainModule. No accuracy metric (no head).
             loss={"name": "CrossEntropyLoss"},
@@ -3420,6 +3422,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--online-probe-cadence", type=int, default=1000,
                    help="Steps between online-probe fires (default 1000; spec §3 "
                         "keep if overhead <~3%%, else stretch).")
+    p.add_argument("--monitor-every-n-steps", type=int, default=None,
+                   help="--frontend 3stft only: cadence for the EXPENSIVE forward-"
+                        "tap monitors (RankMe/coverage/input-stats — each re-runs a "
+                        "no_grad extra forward; the post-latent RankMe tap is a "
+                        "DENSE full-input latent pass). Default None ⇒ gate on "
+                        "--log-every-n-steps (firing every step at cadence 1 ~2.1x'd "
+                        "the step on 5000 Ada). Set e.g. 50 to keep loss curves "
+                        "per-step while the step-doubling extra forward fires "
+                        "sparsely.")
     p.add_argument("--resume-from", default=None,
                    help="Warm-start this phase's encoder (+PMA from P3) from a "
                         "prior phase's transferable-state snapshot "
@@ -3639,6 +3650,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_m4_precision_n_ref=args.converged_m4_precision_n_ref,
         online_probe_enabled=args.online_probe,
         online_probe_cadence=args.online_probe_cadence,
+        monitor_every_n_steps=args.monitor_every_n_steps,
         cache_band=args.cache_band,
         subtype_embed_enabled=args.subtype_embed_enabled,
         subtype_embed_reuse_kv=args.subtype_embed_reuse_kv,

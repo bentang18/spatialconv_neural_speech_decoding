@@ -73,6 +73,14 @@ class V14ConvergedExperiment(V14Experiment):
     # Per-step mask RNG seed (own CPU generator in the module).
     mask_seed: int = 0
 
+    # Heavy forward-tap monitor cadence (RankMe / coverage / input-stats — each
+    # re-runs a no_grad extra forward; the post-latent RankMe tap is a DENSE
+    # full-input latent pass over ~C·190 tokens). None ⇒ gate on log_every_n_steps
+    # (pre-decouple behavior). Set it to fire the step-doubling extra forward
+    # sparsely while loss curves stay per-step — measured ~2.1× step at cadence 1
+    # (reports/converged_3stft_throughput_profile_2026_06_19.md). Diagnostic knob.
+    monitor_every_n_steps: int | None = pydantic.Field(default=None, ge=1)
+
     # --- online linear probe (diagnostic; spec reports/online_probe_spec_2026_06_18.md)
     # OFF by default: registering the experiment can never perturb a live run. When
     # enabled, _callbacks() builds the probe dataset IN-WORKER from (seed, manifest)
@@ -172,6 +180,7 @@ class V14ConvergedExperiment(V14Experiment):
             m4_cfg=M4MaskConfig(parcel_mask_ratio=self.m4_parcel_mask_ratio),
             mask_seed=self.mask_seed,
             wd_exclude_norms=self.wd_exclude_norms,
+            monitor_every_n_steps=self.monitor_every_n_steps,
         )
 
 

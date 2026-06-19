@@ -110,6 +110,7 @@ class V14ConvergedBrainModule(pl.LightningModule):
         m4_cfg: M4MaskConfig = M4MaskConfig(),
         mask_seed: int = 0,
         wd_exclude_norms: bool = True,
+        monitor_every_n_steps: int | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -118,6 +119,16 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self.m2_cfg = m2_cfg
         self.m4_cfg = m4_cfg
         self._wd_exclude_norms = wd_exclude_norms
+        # Heavy forward-tap monitor cadence (RankMe / coverage / input-stats — each
+        # re-runs a no_grad extra forward, the post-latent RankMe tap being a DENSE
+        # full-input latent pass over ~C·190 tokens). Decoupled from
+        # log_every_n_steps: per-step loss logging stays cheap, but the extra
+        # forward roughly DOUBLES the step at cadence 1 (measured 2.1× on 5000 Ada,
+        # reports/converged_3stft_throughput_profile_2026_06_19.md). None ⇒ fall
+        # back to log_every_n_steps (byte-identical to the pre-decouple behavior).
+        self._monitor_every_n_steps = (
+            int(monitor_every_n_steps) if monitor_every_n_steps is not None else None
+        )
         # Mask RNG: own CPU generator so the per-step mask draws are reproducible
         # and independent of the global RNG (sample_ssl_masks loops in Python with
         # a torch.Generator). DDP rank-offset is a run-prep refinement, noted: a
@@ -379,6 +390,17 @@ class V14ConvergedBrainModule(pl.LightningModule):
             cadence = 1
         return batch_idx % max(cadence, 1) == 0
 
+    def _heavy_monitor_due(self, batch_idx: int) -> bool:
+        """Cadence for the EXPENSIVE forward-tap monitors (RankMe / coverage /
+        input-stats — each re-runs a no_grad extra forward). When
+        ``monitor_every_n_steps`` is set it gates these on that cadence
+        independently of ``log_every_n_steps`` (so loss curves stay per-step while
+        the step-doubling extra forward fires sparsely); ``None`` falls back to the
+        log cadence — byte-identical to the pre-decouple behavior."""
+        if self._monitor_every_n_steps is None:
+            return self._train_monitor_due(batch_idx)
+        return batch_idx % max(self._monitor_every_n_steps, 1) == 0
+
     def _update_ratio_due(self) -> bool:
         try:
             step = int(self.global_step)
@@ -482,8 +504,10 @@ class V14ConvergedBrainModule(pl.LightningModule):
         out = self._step(batch.data)
         self._log_losses(out, "train", on_step=True, on_epoch=False)
         # Forward-tap diagnostics (RankMe / coverage / input stats) re-run an
-        # extra no_grad forward, so fire them only at the logging cadence.
-        if self._train_monitor_due(batch_idx):
+        # extra no_grad forward (the post-latent RankMe tap is a DENSE full-input
+        # latent pass), so fire them on the heavy-monitor cadence — decoupled from
+        # the per-step loss logging above.
+        if self._heavy_monitor_due(batch_idx):
             self._monitor_from_step(batch.data, step_name="train")
         return out["loss"]
 
