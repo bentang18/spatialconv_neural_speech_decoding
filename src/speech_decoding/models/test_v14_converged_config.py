@@ -71,6 +71,20 @@ def test_neutral_and_locked_defaults() -> None:
     assert cfg.freq_pos == "learned"  # locked arch: 1d learnable freq tag
 
 
+def test_clip_len_s_default_is_1s_geometry() -> None:
+    # default (None) → the 1 s eval geometry (38 tokens/electrode), back-compat.
+    model = _cfg().build(n_in_channels=6, n_outputs=1)
+    assert model.clip_len_s is None
+    assert model.tokens_per_electrode == 38
+
+
+def test_clip_len_s_5s_threads_into_model_geometry() -> None:
+    # SSL pretrain config (clip_len_s=5.0) → the model builds the 190-token grid.
+    model = _cfg(clip_len_s=5.0).build(n_in_channels=6, n_outputs=1)
+    assert model.clip_len_s == 5.0
+    assert model.tokens_per_electrode == 190
+
+
 def test_lambda_and_freq_pos_thread_into_model() -> None:
     model = _cfg(lambda_m2=0.3, lambda_m4=0.7, freq_pos="sinusoidal").build(
         n_in_channels=6, n_outputs=1,

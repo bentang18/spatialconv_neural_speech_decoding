@@ -24,7 +24,7 @@ the FE §1 reference grid). NB the freq-pos memo's "8/4/1" multipliers are stale
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor, nn
@@ -92,6 +92,34 @@ BANDS: tuple[BandSpec, ...] = (SLOW, BETA, HG)
 
 N_TOKENS: int = sum(b.n_tokens for b in BANDS)            # 6 + 16 + 16 = 38
 N_FREQ_PATCHES: int = sum(b.n_freq_patches for b in BANDS)  # 3 + 2 + 1 = 6
+
+
+def bands_for_clip_len(
+    clip_len_s: float, fs: int = FS_HZ, base: tuple[BandSpec, ...] = BANDS,
+) -> tuple[BandSpec, ...]:
+    """The locked 2/2/2 ladder retimed for a ``clip_len_s``-second clip.
+
+    SSL pretraining runs on **5 s** clips; only Phase-4 eval uses the 1 s clip the
+    `BANDS` constants encode (``n_time_frames`` 5/17/33). Every BandSpec field is
+    clip-length-INVARIANT except ``n_time_frames`` — the per-band ``torch.stft``
+    frame count, which for ``center=True`` is exactly ``1 + n_samples // hop``
+    (verified against ``torch.stft`` at 1 s and 5 s). Only the TIME axis grows;
+    the freq grid, kernels, and channels are untouched, so token order and the
+    RoPE clock multipliers are preserved — just more time-patches per band.
+
+    5 s ⇒ slow 21 / beta 81 / HG 161 frames → 10 / 40 / 80 time-patches →
+    30 + 80 + 80 = **190 tokens** (vs 38 at 1 s)."""
+    n_samples = int(round(clip_len_s * fs))
+    out: list[BandSpec] = []
+    for b in base:
+        n_frames = 1 + n_samples // b.hop
+        if n_frames < b.kernel_time:
+            raise ValueError(
+                f"clip_len_s={clip_len_s}s gives band {b.name!r} only {n_frames} "
+                f"stft frames (< kernel_time {b.kernel_time}); clip too short"
+            )
+        out.append(replace(b, n_time_frames=n_frames))
+    return tuple(out)
 
 
 def band_slot_mults(bands: tuple[BandSpec, ...] = BANDS) -> list[int]:
@@ -979,8 +1007,17 @@ class V14ConvergedSSL(nn.Module):
         m4_precision_alpha: float = 1.0,
         m4_precision_n_ref: float = 11.0,
         bands: tuple[BandSpec, ...] = BANDS,
+        clip_len_s: float | None = None,
     ) -> None:
         super().__init__()
+        # SSL pretraining runs on 5 s clips; Phase-4 eval on 1 s. ``clip_len_s``
+        # (a serializable float threaded through the config) retimes the locked
+        # ladder's TIME axis; the default ``bands`` (BANDS) is the 1 s geometry.
+        # Passing both is contradictory, so clip_len_s wins and rebuilds bands.
+        if clip_len_s is not None:
+            bands = bands_for_clip_len(clip_len_s)
+        self.bands = bands
+        self.clip_len_s = clip_len_s
         self.lambda_m2 = float(lambda_m2)
         self.lambda_m4 = float(lambda_m4)
         # M4 heteroscedastic down-weight (Ben 2026-06-18): a parcel's electrode-MEAN
@@ -1457,15 +1494,18 @@ def sample_ssl_masks(
     *,
     m2_cfg: M2MaskConfig = M2MaskConfig(),
     m4_cfg: M4MaskConfig = M4MaskConfig(),
+    bands: tuple[BandSpec, ...] = BANDS,
 ) -> dict[str, Tensor]:
     """Compose the per-clip mask draws for a batch (the data-path bridge).
 
-    Returns ``m2_mask (B,C,38)`` / ``tube_mask (B,C)`` / ``tubed_parcels (B,Pmax)``
-    / ``tubed_parcel_mask (B,Pmax)``. Per sample: tube whole parcels (M4), then
-    draw an M2 within-electrode mask for every un-tubed real electrode. Tubed and
-    padded electrodes get no M2 target. ``Pmax`` is the batch-max tubed count."""
+    Returns ``m2_mask (B,C,S)`` / ``tube_mask (B,C)`` / ``tubed_parcels (B,Pmax)``
+    / ``tubed_parcel_mask (B,Pmax)`` where ``S = Σ band.n_tokens`` (38 at the 1 s
+    eval clip, 190 at the 5 s SSL clip — set by ``bands``). Per sample: tube whole
+    parcels (M4), then draw an M2 within-electrode mask for every un-tubed real
+    electrode. Tubed and padded electrodes get no M2 target. ``Pmax`` is the
+    batch-max tubed count."""
     B, C = parcel_per_electrode.shape
-    S = N_TOKENS
+    S = sum(b.n_tokens for b in bands)
     m2 = torch.zeros(B, C, S, dtype=torch.bool)
     tube = torch.zeros(B, C, dtype=torch.bool)
     tubed_lists: list[Tensor] = []
@@ -1478,7 +1518,7 @@ def sample_ssl_masks(
         tube[b] = tb
         for e in range(C):
             if real[e] and not tb[e]:
-                m2[b, e] = sample_m2_mask(generator, cfg=m2_cfg)
+                m2[b, e] = sample_m2_mask(generator, bands=bands, cfg=m2_cfg)
     pmax = max(1, max(t.numel() for t in tubed_lists))
     tubed_parcels = torch.zeros(B, pmax, dtype=torch.long)
     tubed_parcel_mask = torch.zeros(B, pmax, dtype=torch.bool)

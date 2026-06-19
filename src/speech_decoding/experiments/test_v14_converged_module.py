@@ -44,11 +44,17 @@ def _module(n_parcels: int = 3, **kw) -> V14ConvergedBrainModule:
 
 
 def _batch(B: int = 2, C: int = 6, K: int = 3, *, valid: torch.Tensor | None = None):
-    """Synthetic 3-band batch on the locked BandSpec geometry. ``support`` is a
-    one-hot assigning 2 electrodes to each of K parcels (so M4 tubes a real
-    multi-electrode parcel and the electrode-mean is non-trivial)."""
+    """Synthetic 3-band batch on the locked BandSpec geometry, in the REAL cache
+    layout: the cartesian slow band arrives as [Re(6) ++ Im(6)] on the freq axis
+    (B, C, 12, 5) — `_converged_inputs` splits it to (B, C, 2, 6, 5). ``support`` is
+    a one-hot assigning 2 electrodes to each of K parcels (so M4 tubes a real
+    multi-electrode parcel and the electrode-mean is non-trivial).
+
+    Note: ``randn(B, C, 12, 5)`` draws the same flat random stream as the old
+    ``randn(B, C, 2, 6, 5)``, so the post-split tensor is value-identical and the
+    downstream loss/overfit checks are unchanged — they now exercise the adapter."""
     torch.manual_seed(0)
-    slow = torch.randn(B, C, 2, 6, 5)
+    slow = torch.randn(B, C, 12, 5)
     beta = torch.randn(B, C, 6, 17)
     hg = torch.randn(B, C, 9, 33)
     support = torch.zeros(B, C, K)
@@ -84,6 +90,36 @@ def test_converged_inputs_honor_valid_mask() -> None:
     valid[0, 5] = False  # one padded electrode
     _, _, _, _, emask = m._converged_inputs(_batch(valid=valid).data)
     assert not bool(emask[0, 5]) and bool(emask[1, 5])
+
+
+def test_converged_inputs_splits_cartesian_slow_re_im() -> None:
+    """REGRESSION (3stft launch 2026-06-18): the cartesian slow band is cached as
+    [Re(6) ++ Im(6)] concatenated on the freq axis (B, C, 12, 5); the slow stem is
+    built for in_channels=2 and needs the (B, C, 2, 6, 5) channel form. The adapter
+    must split the BLOCK [Re then Im] (row-major), NOT interleave — pin the order
+    with distinguishable Re/Im fills. Without this split the stem saw a 4-D tensor
+    and the first forward died ('in_channels=2 requires a 5-D input; got 4-D')."""
+    m = _module()
+    B, C = 2, 6
+    slow = torch.empty(B, C, 12, 5)
+    slow[:, :, :6, :] = 1.0   # Re block (freq 0:6)
+    slow[:, :, 6:, :] = 2.0   # Im block (freq 6:12)
+    data = _batch(B=B, C=C).data
+    data["electrode_tokens_slow"] = slow
+    slow_out, *_ = m._converged_inputs(data)
+    assert slow_out.shape == (B, C, 2, 6, 5)
+    assert torch.all(slow_out[:, :, 0] == 1.0), "channel 0 must be the Re block"
+    assert torch.all(slow_out[:, :, 1] == 2.0), "channel 1 must be the Im block"
+
+
+def test_converged_inputs_rejects_odd_slow_freq_axis() -> None:
+    """An odd slow freq axis cannot be a [Re ++ Im] cartesian pair — fail loud
+    rather than silently mis-splitting."""
+    m = _module()
+    data = _batch().data
+    data["electrode_tokens_slow"] = torch.randn(2, 6, 11, 5)
+    with pytest.raises(ValueError, match="even freq axis"):
+        m._converged_inputs(data)
 
 
 # -------------------------------------------------------------------- loss path

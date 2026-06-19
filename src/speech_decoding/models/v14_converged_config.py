@@ -58,6 +58,12 @@ class V14Converged(BaseModelConfig):
     m4_precision_weight: bool = True
     m4_precision_alpha: float = 1.0
     m4_precision_n_ref: float = 11.0
+    # Clip length (seconds) retimes the 3STFT ladder's TIME axis: SSL pretrain
+    # passes 5.0 (slow 21 / beta 81 / HG 161 frames → 190 tokens); Phase-4 eval
+    # passes 1.0 (38 tokens). ``None`` → the 1 s ``BANDS`` constants (back-compat
+    # default; matches the eval geometry). Must equal the segmenter `duration`
+    # that sized the cached STFT, else the stem's patch-grid check raises.
+    clip_len_s: float | None = None
 
     def build(self, n_in_channels: int, n_outputs: int) -> nn.Module:  # noqa: ARG002
         return V14ConvergedSSL(
@@ -76,6 +82,7 @@ class V14Converged(BaseModelConfig):
             m4_precision_weight=self.m4_precision_weight,
             m4_precision_alpha=self.m4_precision_alpha,
             m4_precision_n_ref=self.m4_precision_n_ref,
+            clip_len_s=self.clip_len_s,
         )
 
 

@@ -14,10 +14,17 @@ required args supplied by the caller (dispatch). The mask configs default to the
 LOCKED structural `M2MaskConfig`/`M4MaskConfig` (the FE-spec §8 geometry), not
 run hyperparameters.
 
-Batch contract (NeuralSet `batch.data` dict):
-  electrode_tokens_slow : (B, C, 2, 6, 5)   slow band, Re/Im 2ch
-  electrode_tokens_beta : (B, C, 6, 17)     beta band
-  electrode_tokens_hg   : (B, C, 9, 33)     HG band
+Batch contract (NeuralSet `batch.data` dict). Time-axis frame counts below are
+the **1 s** Phase-4 eval geometry; SSL pretrain runs 5 s clips (slow 21 / beta 81
+/ HG 161 frames), so the trailing time dim scales with `clip_len` — the slow
+split and the stem patch-grid are clip-length-parameterized (`bands_for_clip_len`),
+the freq axis is invariant:
+  electrode_tokens_slow : (B, C, 12, T)     slow band, Re/Im as [Re(6) ++ Im(6)] on
+                                            the freq axis; `_converged_inputs` splits
+                                            it into the (B, C, 2, 6, T) channel form
+                                            the slow stem (in_channels=2) consumes
+  electrode_tokens_beta : (B, C, 6, T)      beta band (|STFT| mag, 1ch)
+  electrode_tokens_hg   : (B, C, 9, T)      HG band (|STFT| mag, 1ch)
   support               : (B, C, K)         DK one-hot → parcel_per_electrode = argmax
   valid_mask            : (B, C) bool        optional → electrode_mask (real electrodes)
 """
@@ -83,8 +90,23 @@ class V14ConvergedBrainModule(pl.LightningModule):
         """Map a batch dict to the model's `(slow, beta, hg, parcel_per_electrode,
         electrode_mask)`. `parcel_per_electrode = support.argmax(-1)` (DK support
         is one-hot, so argmax is the exact hard parcel id); `electrode_mask` =
-        `valid_mask` (all-real when absent)."""
+        `valid_mask` (all-real when absent).
+
+        The cartesian slow band is cached as the two real components CONCATENATED on
+        the freq axis (`[Re(F) ++ Im(F)]` → `(B, C, 2F, T)`; see
+        `view.py::_single_stft_raw_view` `cartesian=True`). The frontend slow stem is
+        built for `in_channels=2` and consumes a SEPARATE Re/Im channel axis
+        `(B, C, 2, F, T)`, so split the freq-concatenated pair back into that channel
+        axis (row-major → channel 0 = Re(F), channel 1 = Im(F)). Beta/HG are |STFT|
+        magnitude (1 channel) and pass through 4-D unchanged."""
         slow = data["electrode_tokens_slow"]
+        if slow.ndim != 4 or slow.shape[2] % 2 != 0:
+            raise ValueError(
+                "cartesian slow band must be (B, C, 2F, T) with an even freq axis "
+                f"([Re ++ Im]); got shape {tuple(slow.shape)}"
+            )
+        Bs, Cs, F2, Ts = slow.shape
+        slow = slow.reshape(Bs, Cs, 2, F2 // 2, Ts)
         beta = data["electrode_tokens_beta"]
         hg = data["electrode_tokens_hg"]
         support = data["support"]
@@ -106,7 +128,7 @@ class V14ConvergedBrainModule(pl.LightningModule):
         # move the masks back to the feature device for the forward.
         masks = sample_ssl_masks(
             ppe.cpu(), emask.cpu(), self._mask_gen,
-            m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg,
+            m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
         )
         masks = {k: v.to(slow.device) for k, v in masks.items()}
         return self.model(slow, beta, hg, ppe, emask, **masks)

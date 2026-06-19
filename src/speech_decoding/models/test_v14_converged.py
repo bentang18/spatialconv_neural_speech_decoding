@@ -1476,3 +1476,81 @@ def test_forward_emits_per_band_diagnostics() -> None:
 def test_m2mask_default_hg_start_rate_is_20pct() -> None:
     # Ben 2026-06-18: 20% is the HG coverage default (was 15%).
     assert vc.M2MaskConfig().hg_start_rate == 0.20
+
+
+# ===================================== clip-length parameterization (5s SSL)
+# SSL pretraining runs 5 s clips; only Phase-4 eval uses the 1 s locked BANDS.
+# The ladder retimes ONLY the time axis (1 + n_samples // hop frames per band).
+def test_bands_for_clip_len_1s_is_locked_bands() -> None:
+    # 1 s reproduces the locked constants exactly (the eval geometry).
+    assert vc.bands_for_clip_len(1.0) == vc.BANDS
+
+
+def test_bands_for_clip_len_5s_geometry() -> None:
+    # 5 s @ 2048 Hz = 10240 samples → frames 1 + 10240//hop:
+    # slow(hop512)=21, beta(hop128)=81, HG(hop64)=161 (verified vs torch.stft).
+    slow, beta, hg = vc.bands_for_clip_len(5.0)
+    assert (slow.n_time_frames, beta.n_time_frames, hg.n_time_frames) == (21, 81, 161)
+    # time-patches = (frames - 2)//2 + 1 → 10 / 40 / 80
+    assert (slow.n_time_patches, beta.n_time_patches, hg.n_time_patches) == (10, 40, 80)
+    # freq grid is clip-length INVARIANT (unchanged from the locked table)
+    assert (slow.n_freq_patches, beta.n_freq_patches, hg.n_freq_patches) == (3, 2, 1)
+    # tokens = F_p · T_p → 30 + 80 + 80 = 190
+    assert (slow.n_tokens, beta.n_tokens, hg.n_tokens) == (30, 80, 80)
+    assert sum(b.n_tokens for b in (slow, beta, hg)) == 190
+    # the shared RoPE clock multipliers are preserved (time-only retime)
+    assert vc.band_slot_mults((slow, beta, hg)) == vc.band_slot_mults(vc.BANDS)
+
+
+def test_bands_for_clip_len_too_short_raises() -> None:
+    # a clip so short a band yields < kernel_time stft frames is a hard error.
+    with pytest.raises(ValueError, match="clip too short"):
+        vc.bands_for_clip_len(0.01)
+
+
+def test_sample_ssl_masks_token_count_follows_bands() -> None:
+    # the per-clip M2 mask width = Σ band.n_tokens for the GIVEN bands (38 at 1 s,
+    # 190 at 5 s) — not the hardcoded N_TOKENS.
+    g = torch.Generator().manual_seed(0)
+    pe = torch.randint(0, 5, (2, 6), generator=g)
+    emask = torch.ones(2, 6, dtype=torch.bool)
+    m1 = vc.sample_ssl_masks(pe, emask, g)                       # default 1 s
+    assert m1["m2_mask"].shape[-1] == 38
+    m5 = vc.sample_ssl_masks(pe, emask, g, bands=vc.bands_for_clip_len(5.0))
+    assert m5["m2_mask"].shape[-1] == 190
+
+
+def _ssl_batch_5s(B: int = 2, C: int = 6, seed: int = 0):
+    """A 5 s SSL batch: the slow/beta/HG time axes carry the 21/81/161 frame
+    counts, masks drawn for the 5 s (190-token) geometry."""
+    bands = vc.bands_for_clip_len(5.0)
+    g = torch.Generator().manual_seed(seed)
+    slow = torch.randn(B, C, 2, 6, 21, generator=g)
+    beta = torch.randn(B, C, 6, 81, generator=g)
+    hg = torch.randn(B, C, 9, 161, generator=g)
+    pe = torch.randint(0, 5, (B, C), generator=g)
+    emask = torch.ones(B, C, dtype=torch.bool)
+    masks = vc.sample_ssl_masks(pe, emask, g, bands=bands)
+    return slow, beta, hg, pe, emask, masks
+
+
+def test_ssl_model_clip_len_5s_bands_and_token_count() -> None:
+    # the model derives its bands from clip_len_s → 5 s gives the 190-token grid.
+    model = _ssl_model(clip_len_s=5.0)
+    assert model.bands == vc.bands_for_clip_len(5.0)
+    assert model.tokens_per_electrode == 190
+
+
+def test_ssl_model_forward_at_5s_returns_finite_losses() -> None:
+    # the full ragged forward runs on a real 5 s batch and emits finite, non-neg
+    # M2/M4 losses — the end-to-end proof the arch is clip-length-parameterized.
+    torch.manual_seed(0)
+    model = _ssl_model(clip_len_s=5.0).eval()
+    slow, beta, hg, pe, emask, m = _ssl_batch_5s(B=3, C=8, seed=2)
+    with torch.no_grad():
+        out = model(slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
+                    m["tubed_parcels"], m["tubed_parcel_mask"])
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.isfinite(out[k]).all(), k
+        assert float(out[k]) >= 0.0, k
+    assert float(out["l_m2"]) > 0.0 and float(out["l_m4"]) > 0.0

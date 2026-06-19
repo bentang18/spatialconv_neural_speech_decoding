@@ -2033,6 +2033,12 @@ def build_v14_experiment(
                 # tag), forced regardless of the V14ParcelPerceiver "sinusoidal"
                 # dispatch default.
                 "freq_pos": "learned",
+                # Clip length retimes the 3STFT ladder's TIME axis: SSL pretrain
+                # runs 5 s clips (slow 21 / beta 81 / HG 161 frames → 190 tokens),
+                # Phase-4 eval 1 s (38 tokens). The model derives its bands from
+                # this float (bands_for_clip_len) — must match the segmenter's
+                # `duration` (= clip_len, line ~1733) that sized the cached STFT.
+                "clip_len_s": clip_len,
                 **_converged_shape,
                 "lambda_m2": converged_lambda_m2,
                 "lambda_m4": converged_lambda_m4,
