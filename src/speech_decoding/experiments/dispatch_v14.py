@@ -738,6 +738,12 @@ def build_v14_experiment(
     # ``None`` for the P4 phase below so the Neuroprobe-Lite parity clip sets are never
     # altered. Removes events (rows), never electrodes — DP4 row-alignment untouched.
     bad_window_dir: str | None = None,
+    # Throughput lever (science-neutral): session-homogeneous TRAIN batches so the
+    # ragged forward pays each batch's true electrode count C, not the corpus max-C
+    # (the latent attention is O(C²) in electrode count). SSL-ONLY: gated to False
+    # for P4 so the Neuroprobe-Lite parity clip/batch sets are byte-identical. See
+    # ``Data.group_by_session`` / ``_SessionGroupedBatchSampler``.
+    group_by_session: bool = False,
     cluster: str | None = None,
     # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
     # they only override exca's TaskInfra / submitit defaults when set.
@@ -1738,6 +1744,8 @@ def build_v14_experiment(
         # Layer-2 clip filter: SSL phases only. P4 (frozen probe, ssl_phase=False)
         # keeps it None so the Neuroprobe-Lite parity clip set is never altered.
         bad_window_dir=(bad_window_dir if ssl_phase else None),
+        # SSL-only: never group eval batches (P4 parity lock).
+        group_by_session=(group_by_session if ssl_phase else False),
     )
 
     exca_folder = exca_folder or os.environ.get("EXCA_CACHE_FOLDER")
@@ -2721,6 +2729,13 @@ def _parser() -> argparse.ArgumentParser:
                         "defense, #180). Pretrain/distill only — the P4 eval "
                         "datamodule never filters, so Neuroprobe parity is intact. "
                         "Removes events (rows), never electrodes. Default None = off.")
+    p.add_argument("--group-by-session", action="store_true",
+                   help="Throughput lever (#248, science-neutral): draw "
+                        "session-homogeneous TRAIN batches so the ragged forward pays "
+                        "each batch's true electrode count C instead of padding a "
+                        "mixed batch up to the corpus max-C (the latent attention is "
+                        "O(C^2) in electrode count). SSL phases only; P4 eval batches "
+                        "are never grouped (Neuroprobe parity lock). Default off.")
     # Layer-3 winsor cap (#180). Read-time per-cell |z| clamp on the session
     # robust-z front-end. Cache-NEUTRAL by design: implemented as the env knob
     # V14_SESSION_Z_WINSOR (NOT a serialized view field) so it never forks the
@@ -3612,6 +3627,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         # Layer-2 bad-electrode clip filter (#180). Reaches every phase via this one
         # dict; build_v14_experiment gates it to SSL phases (P4 self-zeroes to None).
         bad_window_dir=args.bad_window_dir,
+        group_by_session=args.group_by_session,
         mains_notch_hz=args.mains_notch_hz,
         # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
         # one dict so the chain + single-phase builds stay in lock-step.

@@ -32,6 +32,68 @@ logger = logging.getLogger(__name__)
 _DATASET_CACHE: dict[str, dict] = {}
 
 
+class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
+    """Yield batches whose samples all share one ``(subject_id, trial_id)`` session.
+
+    Every event in a BrainTreebank session has the **same** electrode count C, so a
+    session-homogeneous batch needs zero electrode padding. The ragged converged
+    forward then pays that session's true C — not the corpus max-C — and since the
+    latent encoder's all-pairs attention is O(C²) in electrode count, padding a
+    mixed batch up to the corpus max (179) is the dominant wasted FLOP. Grouping
+    removes it (throughput lever ``Data.group_by_session``).
+
+    Science-neutral for the per-sample SSL loss: over an epoch every sample is
+    drawn exactly once (no resampling, no dropping unless ``drop_last``); only the
+    intra-step batch composition changes, and grad-accum across the step's
+    microbatches restores cross-session mixing. The per-sample M2/M4 L1 losses have
+    no cross-sample coupling (LayerNorm only, no BatchNorm), so the per-step
+    gradient is the same mean-of-per-sample-grads regardless of batch composition.
+
+    ``session_key`` is the positional per-segment session id (len == dataset). With
+    ``shuffle`` the within-session order and the cross-session batch order are both
+    permuted from ``generator`` each epoch; without it the order is deterministic.
+    """
+
+    def __init__(self, session_key, batch_size, *, shuffle, drop_last, generator):
+        self._groups: dict = {}
+        for idx, key in enumerate(session_key):
+            self._groups.setdefault(key, []).append(idx)
+        self._batch_size = int(batch_size)
+        self._shuffle = bool(shuffle)
+        self._drop_last = bool(drop_last)
+        self._generator = generator
+
+    def _build_batches(self) -> list[list[int]]:
+        g = self._generator
+        batches: list[list[int]] = []
+        for idxs in self._groups.values():
+            order = list(idxs)
+            if self._shuffle:
+                perm = torch.randperm(len(order), generator=g).tolist()
+                order = [order[i] for i in perm]
+            for i in range(0, len(order), self._batch_size):
+                batch = order[i : i + self._batch_size]
+                if self._drop_last and len(batch) < self._batch_size:
+                    continue
+                batches.append(batch)
+        if self._shuffle:
+            perm = torch.randperm(len(batches), generator=g).tolist()
+            batches = [batches[i] for i in perm]
+        return batches
+
+    def __iter__(self):
+        return iter(self._build_batches())
+
+    def __len__(self) -> int:
+        total = 0
+        for idxs in self._groups.values():
+            if self._drop_last:
+                total += len(idxs) // self._batch_size
+            else:
+                total += (len(idxs) + self._batch_size - 1) // self._batch_size
+        return total
+
+
 def _make_worker_init_fn(seed: int):
     """Per-worker RNG seeding (CR02). Sets numpy + random + torch RNGs to
     ``seed + worker_id`` so augmentation / masking inside workers is
@@ -86,6 +148,17 @@ class Data(pydantic.BaseModel):
     # never altered. It removes events (rows), never electrodes, so DP4 row-alignment
     # is untouched. Part of the warm-cache key (a different dir → a different cache).
     bad_window_dir: str | None = None
+    # Throughput lever (science-neutral): when True, the TRAIN loader draws
+    # session-homogeneous batches (all samples share one subject_id/trial_id), so
+    # the ragged forward pays each batch's true electrode count C instead of padding
+    # a mixed batch up to the corpus max-C. The latent encoder's attention is O(C²)
+    # in electrode count, so this is the dominant wasted FLOP on a mixed batch.
+    # Per-sample SSL loss has no cross-sample coupling, so this changes only
+    # intra-step batch composition (grad-accum restores cross-session mixing), not
+    # the epoch-level sample set. Eval (val/test) splits are never grouped — the
+    # Neuroprobe parity-locked clip sets stay byte-identical. See
+    # ``_SessionGroupedBatchSampler``. Off by default = byte-identical loader.
+    group_by_session: bool = False
 
     def build(self, *, worker_seed: int | None = None) -> dict[str, DataLoader]:
         """Build split DataLoaders.
@@ -150,14 +223,42 @@ class Data(pydantic.BaseModel):
             if len(selected) == 0:
                 raise ValueError(f"Split {split!r} has no segments")
             loader_kwargs: dict = dict(
-                batch_size=self.batch_size,
-                shuffle=split == "train",
                 num_workers=self.num_workers,
                 collate_fn=selected.collate_fn,
                 worker_init_fn=worker_init_fn,
-                generator=train_generator if split == "train" else None,
                 pin_memory=self.pin_memory,
             )
+            if self.group_by_session and split == "train":
+                # Session-homogeneous TRAIN batches (zero electrode padding). Eval
+                # splits keep the parity-locked plain loader untouched.
+                triggers = selected.triggers
+                if len(triggers) != len(selected):
+                    raise ValueError(
+                        "group_by_session: triggers rows "
+                        f"({len(triggers)}) != segments ({len(selected)}); "
+                        "cannot positionally align session keys."
+                    )
+                if not {"subject_id", "trial_id"} <= set(triggers.columns):
+                    raise ValueError(
+                        "group_by_session needs subject_id/trial_id triggers; "
+                        f"got columns {list(triggers.columns)}"
+                    )
+                session_key = list(
+                    zip(triggers["subject_id"].tolist(), triggers["trial_id"].tolist())
+                )
+                loader_kwargs["batch_sampler"] = _SessionGroupedBatchSampler(
+                    session_key,
+                    self.batch_size,
+                    shuffle=True,
+                    drop_last=False,
+                    generator=train_generator,
+                )
+            else:
+                loader_kwargs["batch_size"] = self.batch_size
+                loader_kwargs["shuffle"] = split == "train"
+                loader_kwargs["generator"] = (
+                    train_generator if split == "train" else None
+                )
             # persistent_workers / prefetch_factor are only valid when workers
             # are spawned; torch raises ValueError if they are passed with
             # num_workers=0.
