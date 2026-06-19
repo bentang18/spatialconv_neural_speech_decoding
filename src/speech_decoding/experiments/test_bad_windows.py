@@ -117,6 +117,40 @@ def test_filter_empty_bad_windows_is_passthrough() -> None:
     assert out["text"].tolist() == ["x"]
 
 
+def test_filter_keeps_continuous_ieeg_row_with_trigger_query() -> None:
+    """Reproduces the 9964-missing-Ieeg orphaning bug: ``study.run()`` events carry the
+    continuous Ieeg recording row (``start==0``) alongside Word anchors. With a bad span
+    in the first clip_dur seconds, only the Word anchors that overlap must drop — the
+    Ieeg data row must SURVIVE (dropping it leaves the session with no neural source, so
+    the strict segmenter raises 'missing events of type Ieeg' for every Word)."""
+    events = _events([
+        {"type": "Ieeg", "subject_id": "2", "trial_id": "2", "start": 0.0, "text": "rec"},
+        {"type": "Word", "subject_id": "2", "trial_id": "2", "start": 2.0, "text": "hit"},   # [2,7) HITS [1,3)
+        {"type": "Word", "subject_id": "2", "trial_id": "2", "start": 100.0, "text": "ok"},   # miss
+    ])
+    bw = {"btbank2_t2": [(1.0, 3.0)]}  # early span: overlaps the start==0 clip window
+    out = filter_events_by_bad_windows(
+        events, bw, clip_start_s=0.0, clip_dur_s=5.0, trigger_query="type == 'Word'"
+    )
+    # Ieeg recording row kept (non-anchor); only the overlapping Word dropped.
+    assert out["text"].tolist() == ["rec", "ok"]
+    assert "Ieeg" in out["type"].tolist()
+
+
+def test_filter_without_trigger_query_drops_ieeg_row() -> None:
+    """The legacy ``trigger_query=None`` path treats EVERY row as an anchor, so the
+    start==0 Ieeg row is wrongly dropped — this is the pre-fix behavior the production
+    caller avoids by passing the segmenter's trigger query. Pinned so the guard can't
+    silently regress to dropping data rows."""
+    events = _events([
+        {"type": "Ieeg", "subject_id": "2", "trial_id": "2", "start": 0.0, "text": "rec"},
+        {"type": "Word", "subject_id": "2", "trial_id": "2", "start": 100.0, "text": "ok"},
+    ])
+    bw = {"btbank2_t2": [(1.0, 3.0)]}
+    out = filter_events_by_bad_windows(events, bw, clip_start_s=0.0, clip_dur_s=5.0)
+    assert out["text"].tolist() == ["ok"]  # Ieeg row dropped (the bug, when no anchor guard)
+
+
 def test_filter_missing_column_fails_loud() -> None:
     events = pd.DataFrame([{"subject_id": "2", "trial_id": "2"}])  # no 'start'
     with pytest.raises(KeyError, match="start"):

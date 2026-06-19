@@ -117,6 +117,10 @@ class Data(pydantic.BaseModel):
                 bad_windows,
                 clip_start_s=float(self.segmenter.start),
                 clip_dur_s=float(self.segmenter.duration),
+                # Only the segmenter's trigger (Word) rows are clip anchors. The
+                # continuous Ieeg data row (start=0) must survive — dropping it on an
+                # early bad span would orphan the whole session (missing-Ieeg error).
+                trigger_query=self.segmenter.trigger_query,
             )
             logger.info(
                 "bad-window clip filter (%s): dropped %d / %d events overlapping "

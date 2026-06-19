@@ -14,11 +14,14 @@ Contract
   a Word event's ``start`` (``est_idx / sample_rate``; see ``word_events.py``). The
   spans are produced offline by the per-window scan run on the rebuilt static cache
   (``scripts/neuroprobe/precompute_bad_windows.py``).
-* :func:`filter_events_by_bad_windows` drops every event whose neural clip window
-  ``[start + clip_start_s, start + clip_start_s + clip_dur_s]`` overlaps any bad span
-  for that event's session. It removes ROWS of the events DataFrame only — never an
-  electrode — so the DP4 electrode-row alignment (support / valid_mask vs the front-end
-  voltage) is untouched.
+* :func:`filter_events_by_bad_windows` drops every TRIGGER (clip-anchor) event whose
+  neural clip window ``[start + clip_start_s, start + clip_start_s + clip_dur_s]``
+  overlaps any bad span for that event's session. Only rows matching the segmenter's
+  ``trigger_query`` (the Word anchors) are eligible — the continuous ``Ieeg`` data row
+  (``start == 0``) is always kept, else an early bad span would orphan the whole
+  session. It removes ROWS of the events DataFrame only — never an electrode — so the
+  DP4 electrode-row alignment (support / valid_mask vs the front-end voltage) is
+  untouched.
 * **Pretrain-only.** The filter runs only when the datamodule is given a
   ``bad_window_dir``; the Phase-4 eval datamodule leaves it unset so the Neuroprobe
   parity-locked clip sets are never altered.
@@ -90,15 +93,28 @@ def filter_events_by_bad_windows(
     *,
     clip_start_s: float,
     clip_dur_s: float,
+    trigger_query: str | None = None,
 ) -> pd.DataFrame:
-    """Return ``events`` with every row dropped whose neural clip window overlaps a bad
-    span for its ``(subject_id, trial_id)`` session.
+    """Return ``events`` with every TRIGGER (clip-anchor) row dropped whose neural clip
+    window overlaps a bad span for its ``(subject_id, trial_id)`` session.
 
     ``clip_start_s`` / ``clip_dur_s`` are the segmenter's ``start`` (neural lag) and
     ``duration`` (clip length) — the window actually sliced from the neural stream is
-    ``[event.start + clip_start_s, event.start + clip_start_s + clip_dur_s]``. Rows for
-    sessions with no sidecar (or no bad spans) are kept unchanged. The returned frame
-    keeps the input column set and dtypes; only rows are removed (index reset)."""
+    ``[event.start + clip_start_s, event.start + clip_start_s + clip_dur_s]``.
+
+    ``trigger_query`` is the segmenter's ``trigger_query`` (e.g. ``"type == 'Word'"``).
+    ONLY rows matching it are clip anchors eligible for dropping; every other row is kept
+    unconditionally. This guard is load-bearing: ``study.run()`` events also carry the
+    continuous **Ieeg** recording row (one per session, ``start == 0.0``) that the
+    segmenter's extractors source from. Without the guard, that ``start==0`` row's
+    ``[0, clip_dur]`` window is tested against the session's bad spans, so a single early
+    bad window (a glitch in the first ``clip_dur`` seconds) DROPS the whole session's
+    Ieeg event — orphaning every Word in it ("N segments are missing events of type
+    Ieeg"). ``None`` (legacy) treats every row as an anchor; production callers pass the
+    segmenter's trigger query.
+
+    Rows for sessions with no sidecar (or no bad spans) are kept unchanged. The returned
+    frame keeps the input column set and dtypes; only rows are removed (index reset)."""
     if not bad_windows:
         return events.reset_index(drop=True)
     for col in ("start", "subject_id", "trial_id"):
@@ -108,10 +124,18 @@ def filter_events_by_bad_windows(
                 f"{list(events.columns)}"
             )
 
+    if trigger_query is None:
+        is_anchor: list[bool] = [True] * len(events)
+    else:
+        is_anchor = events.eval(trigger_query).to_numpy(dtype=bool).tolist()
+
     keep = []
-    for start, subject_id, trial_id in zip(
-        events["start"], events["subject_id"], events["trial_id"]
+    for anchor, start, subject_id, trial_id in zip(
+        is_anchor, events["start"], events["subject_id"], events["trial_id"]
     ):
+        if not anchor:
+            keep.append(True)  # non-anchor (continuous data) row — never dropped
+            continue
         spans = bad_windows.get(bad_window_session_key(subject_id, trial_id))
         if not spans:
             keep.append(True)

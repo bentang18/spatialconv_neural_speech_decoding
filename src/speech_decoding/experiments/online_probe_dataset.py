@@ -138,6 +138,9 @@ def filter_probe_events(
         load_bad_windows(bad_window_dir),
         clip_start_s=PROBE_CLIP_START_S,
         clip_dur_s=PROBE_CLIP_DUR_S,
+        # Only Word anchors are droppable; the continuous Ieeg row (start=0) must
+        # survive — see filter_events_by_bad_windows. Matches the probe segmenter.
+        trigger_query="type == 'Word'",
     )
 
 
