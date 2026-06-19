@@ -151,10 +151,28 @@ def select_subject_window_positions(
     that subject's rows, deterministically capped to ``min(n_cap, available)``
     (spec §2/§3). Time order is preserved (``select_window_indices`` returns sorted
     indices) so the WS contiguous 2-fold never straddles the same autocorrelated
-    stretch. An absent subject → empty array."""
-    pos = np.flatnonzero(np.asarray(triggers["subject_id"]) == subject_id)
+    stretch. An absent subject → empty array.
+
+    ``subject_id`` is compared as ``int``: the real BT study types the column as
+    strings ('2') while the cohort constants are ints — without coercion the
+    comparison is silently always-false (DCC #241 anchor-missing crash)."""
+    pos = np.flatnonzero(_subject_id_int(triggers["subject_id"]) == int(subject_id))
     keep = select_window_indices(len(pos), n_cap, seed)
     return pos[keep]
+
+
+def _subject_id_int(subject_id: tp.Any) -> np.ndarray:
+    """Subject-id column as an int array. BT subjects are integers 1–10 whether the
+    study stored them as ints or strings — one coercion point for every comparison."""
+    return np.asarray(subject_id).astype(int)
+
+
+def present_subject_ids(triggers: pd.DataFrame) -> set[int]:
+    """The int subject-ids present in ``triggers`` (dtype-robust). Intersect the int
+    cohort sets against THIS so a string-typed column still matches (DCC #241)."""
+    if len(triggers) == 0:
+        return set()
+    return set(np.unique(_subject_id_int(triggers["subject_id"])).tolist())
 
 
 class InMemoryProbeDataset:
@@ -311,7 +329,7 @@ def build_probe_dataset(
     dataset.prepare()
     triggers = dataset.triggers
 
-    present = set(np.unique(np.asarray(triggers["subject_id"])).tolist())
+    present = present_subject_ids(triggers)
     per_subject: dict[int, dict[str, tp.Any]] = {}
     needed = {cs_anchor, *ws_subjects, *cs_test_subjects} & present
     for sid in sorted(needed):

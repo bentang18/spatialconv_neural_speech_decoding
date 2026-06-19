@@ -171,6 +171,24 @@ def test_select_subject_window_positions_absent_subject_empty() -> None:
     assert opd.select_subject_window_positions(triggers, 7, n_cap=10, seed=0).tolist() == []
 
 
+def test_select_subject_window_positions_string_subject_ids() -> None:
+    """The real BT study emits ``subject_id`` as strings ('2'); the int cohort
+    constants must still match. Regression for the DCC #241 anchor-missing crash:
+    int(2) vs str('2') silently selected zero windows."""
+    triggers = pd.DataFrame({"subject_id": ["2", "3", "2", "2", "3", "2"]})
+    pos = opd.select_subject_window_positions(triggers, 2, n_cap=3500, seed=0)
+    assert pos.tolist() == [0, 2, 3, 5]                 # same as the int fixture
+
+
+def test_present_subjects_dtype_robust_to_string_ids() -> None:
+    """``present_subject_ids`` coerces to int so the int cohort set (CS_ANCHOR=2,
+    …) intersects a string-typed ``subject_id`` column instead of yielding ∅."""
+    triggers = pd.DataFrame({"subject_id": ["1", "2", "2", "9"]})
+    present = opd.present_subject_ids(triggers)
+    assert present == {1, 2, 9}
+    assert {opd.CS_ANCHOR} & present == {2}             # the failing intersection, now non-empty
+
+
 # ------------------------------------------------------- in-memory dataset + firewall
 def _subject_record(sid: int, sessions, nwin=40, c=3, n_parcels=4):
     rng = np.random.default_rng(sid)
