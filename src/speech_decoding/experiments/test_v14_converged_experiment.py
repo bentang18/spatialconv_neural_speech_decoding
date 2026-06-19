@@ -145,14 +145,17 @@ def test_online_probe_enabled_registers_configured_callback(monkeypatch) -> None
 
     sentinel = object()
     seen: dict[str, object] = {}
+    fake_data = object()  # the run's Data is reused; here it's an opaque sentinel
 
-    def _fake_build(*, n_cap, seed, **kw):
+    def _fake_build(run_data, *, n_cap, seed, **kw):
+        seen["run_data"] = run_data
         seen["n_cap"], seen["seed"] = n_cap, seed
         return sentinel
 
     monkeypatch.setattr(opd, "build_probe_dataset", _fake_build)
 
     xp = V14ConvergedExperiment.model_construct(
+        data=fake_data,
         online_probe_enabled=True, online_probe_cadence=500,
         online_probe_k_list=(2, 1), online_probe_batch_size=128,
         online_probe_n_cap=1000, online_probe_seed=3,
@@ -166,4 +169,4 @@ def test_online_probe_enabled_registers_configured_callback(monkeypatch) -> None
     assert probe.k_list == (2, 1)
     assert probe.batch_size == 128
     assert probe.dataset is sentinel
-    assert seen == {"n_cap": 1000, "seed": 3}
+    assert seen == {"run_data": fake_data, "n_cap": 1000, "seed": 3}

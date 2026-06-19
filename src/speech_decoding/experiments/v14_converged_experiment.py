@@ -105,7 +105,12 @@ class V14ConvergedExperiment(V14Experiment):
         from speech_decoding.experiments.online_probe import OnlineLinearProbe
         from speech_decoding.experiments.online_probe_dataset import build_probe_dataset
 
-        dataset = build_probe_dataset(n_cap=self.online_probe_n_cap, seed=self.online_probe_seed)
+        # Reuse THIS run's data chain (study + wired 3STFT/support extractors +
+        # bad_window_dir) re-segmented at the 1 s probe contract — so the probe
+        # respects the run's CLIP layer and never hand-copies the data config.
+        dataset = build_probe_dataset(
+            self.data, n_cap=self.online_probe_n_cap, seed=self.online_probe_seed
+        )
         return [
             OnlineLinearProbe(
                 dataset=dataset,

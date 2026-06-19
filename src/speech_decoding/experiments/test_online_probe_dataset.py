@@ -10,6 +10,8 @@ the §6 firewall assert on the in-memory dataset.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -96,6 +98,77 @@ def test_select_window_indices_seeded_sorted_subset() -> None:
     assert np.array_equal(a, b)                                       # deterministic
     assert not np.array_equal(a, c)                                   # seed-sensitive
     assert len(np.unique(a)) == 3500                                  # no repeats
+
+
+# ----------------------------------------------- bad-window (CLIP) respect at 1 s width
+def test_probe_clip_contract_is_zero_lag_one_second() -> None:
+    """Ben's Phase-2b answer: the probe forwards 1 s word-onset clips with NO
+    neural lag — so the bad-window overlap test uses start=0.0 / dur=1.0."""
+    assert opd.PROBE_CLIP_START_S == 0.0
+    assert opd.PROBE_CLIP_DUR_S == 1.0
+
+
+def _events(starts, *, subject=2, trial=1) -> pd.DataFrame:
+    return pd.DataFrame({
+        "type": ["Word"] * len(starts),
+        "start": list(starts),
+        "subject_id": [subject] * len(starts),
+        "trial_id": [trial] * len(starts),
+    })
+
+
+def test_filter_probe_events_uses_one_second_clip_width(tmp_path) -> None:
+    """The probe must respect the CLIP sidecars at its OWN 1 s clip width (not the
+    5 s SSL width). A word at start=9.2 s has a 1 s clip [9.2,10.2) that clears a
+    bad span [10.5,10.8) (kept), but its 5 s clip [9.2,14.2) would overlap — so this
+    row is the 1 s-vs-5 s discriminator. start=10.0 ([10.0,11.0)) overlaps → dropped;
+    start=8.0 ([8.0,9.0)) clears → kept."""
+    (tmp_path / "btbank2_t1.json").write_text(json.dumps(
+        {"session": "btbank2_t1", "bad_windows_s": [[10.5, 10.8]]}
+    ))
+    ev = _events([8.0, 9.2, 10.0])
+    out = opd.filter_probe_events(ev, str(tmp_path))
+    assert out["start"].tolist() == [8.0, 9.2]          # 10.0 dropped, 9.2 kept (1 s width)
+
+
+def test_filter_probe_events_noop_when_no_dir() -> None:
+    """No CLIP dir (run without the bad-window layer) → keep every window."""
+    ev = _events([1.0, 2.0, 3.0])
+    out = opd.filter_probe_events(ev, None)
+    assert out["start"].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_filter_probe_events_other_session_untouched(tmp_path) -> None:
+    """A sidecar for one session never drops another session's clips."""
+    (tmp_path / "btbank2_t1.json").write_text(json.dumps(
+        {"session": "btbank2_t1", "bad_windows_s": [[10.5, 10.8]]}
+    ))
+    ev = _events([10.0], subject=3, trial=2)            # different session, same time
+    out = opd.filter_probe_events(ev, str(tmp_path))
+    assert out["start"].tolist() == [10.0]              # kept (no sidecar for btbank3_t2)
+
+
+# ------------------------------------------------- per-subject window selection (n_cap)
+def test_select_subject_window_positions_filters_and_caps() -> None:
+    """Positions are that subject's rows only, deterministically capped, in time
+    order (sorted positional indices preserved for the contiguous WS fold)."""
+    triggers = pd.DataFrame({"subject_id": [2, 3, 2, 2, 3, 2]})
+    pos = opd.select_subject_window_positions(triggers, 2, n_cap=3500, seed=0)
+    assert pos.tolist() == [0, 2, 3, 5]                 # exactly subject-2 rows, in order
+
+
+def test_select_subject_window_positions_caps_deterministically() -> None:
+    triggers = pd.DataFrame({"subject_id": [2] * 1000})
+    a = opd.select_subject_window_positions(triggers, 2, n_cap=100, seed=5)
+    b = opd.select_subject_window_positions(triggers, 2, n_cap=100, seed=5)
+    assert a.shape == (100,) and np.array_equal(a, np.sort(a))
+    assert np.array_equal(a, b)                          # deterministic in seed
+    assert set(a.tolist()) <= set(range(1000))
+
+
+def test_select_subject_window_positions_absent_subject_empty() -> None:
+    triggers = pd.DataFrame({"subject_id": [2, 2, 3]})
+    assert opd.select_subject_window_positions(triggers, 7, n_cap=10, seed=0).tolist() == []
 
 
 # ------------------------------------------------------- in-memory dataset + firewall
