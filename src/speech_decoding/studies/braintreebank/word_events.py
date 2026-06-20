@@ -53,6 +53,7 @@ from speech_decoding.studies.braintreebank.labels import (
     remap_task_column,
 )
 from speech_decoding.studies.braintreebank.manifest import (
+    BT_LITE_SESSIONS,
     V14_PRETRAIN_SESSIONS,
     bt_subject_native_rate_hz,
 )
@@ -64,7 +65,14 @@ from speech_decoding.studies.braintreebank.manifest import (
 # monitoring (val/test). It carries NO Neuroprobe eval session, so the SSL
 # corpus is fully decoupled from the leaderboard eval split. The supervised P4
 # probe keeps CrossSession/CrossSubject; routed per-phase by dispatch_v14.
-EvalMode = tp.Literal["WithinSession", "CrossSession", "CrossSubject", "Pretrain"]
+# "AllCells" is a MATERIALIZATION-ONLY mode: emit every labeled word for every
+# BT_LITE eval session, no leaderboard split. The lite-eval raw baseline groups
+# by (subject, trial) and forms its own WS/CS/CrossSubject splits, so it needs all
+# 12 cells unfiltered — the per-mode _assign_* splits each keep only one test cell.
+# Never a training config (its split is all-"train" → fails loud if misrouted).
+EvalMode = tp.Literal[
+    "WithinSession", "CrossSession", "CrossSubject", "Pretrain", "AllCells"
+]
 
 
 _UPSTREAM_TRAIN_SUBJECT_ID = 2
@@ -83,6 +91,7 @@ _LITE_N_FOLDS = 2
 DEFAULT_PRETRAIN_HOLDOUT_FRACTION = 0.05
 
 _PRETRAIN_SESSION_SET = frozenset(V14_PRETRAIN_SESSIONS)
+_LITE_SESSION_SET = frozenset(tuple(c) for c in BT_LITE_SESSIONS)
 
 
 def _neural_sample_rate(subject_id: int) -> float:
@@ -559,6 +568,19 @@ def _assign_cross_subject_split(
     return out.loc[out["split"] != ""].reset_index(drop=True)
 
 
+def _assign_all_cells_split(df: pd.DataFrame) -> pd.DataFrame:
+    """Materialization-only mode: keep EVERY labeled word, no leaderboard split.
+
+    The lite-eval raw baseline groups the resulting events by (subject, trial) and
+    builds its own WS / CS / CrossSubject splits downstream, so the ``split`` column
+    is unused here. Set it to ``"train"`` for every row — a single all-train Data has
+    empty val/test, so this mode fails LOUD if it is ever misrouted into a real
+    training ``Data.build`` instead of the materialization-only baseline path."""
+    out = df.copy()
+    out["split"] = "train"
+    return out.reset_index(drop=True)
+
+
 def _assign_pretrain_split(
     df: pd.DataFrame,
     *,
@@ -750,6 +772,8 @@ class BTWordEvents(EventsTransform):
                 train_subject_id=self.train_subject_id,
                 train_trial_id=self.train_trial_id,
             )
+        elif self.eval_mode == "AllCells":
+            words = _assign_all_cells_split(words)
         else:  # pragma: no cover - guarded by the EvalMode Literal
             raise ValueError(f"BTWordEvents: unknown eval_mode {self.eval_mode!r}")
         return pd.concat([events, words], ignore_index=True)
@@ -761,6 +785,11 @@ class BTWordEvents(EventsTransform):
             # mode="pretrain" already restricts the corpus; this is the second
             # gate before the runtime leakage guard.
             return (subject_id, trial_id) in _PRETRAIN_SESSION_SET
+        if self.eval_mode == "AllCells":
+            # Every BT_LITE eval cell, nothing else — the study's mode="lite" universe
+            # is the 12 cells, but gate on the manifest so a wider study can't leak a
+            # non-lite timeline into the (firewalled) lite-eval baseline.
+            return (subject_id, trial_id) in _LITE_SESSION_SET
         if self.eval_mode == "WithinSession":
             return (subject_id == self.test_subject_id and
                     trial_id == self.test_trial_id)

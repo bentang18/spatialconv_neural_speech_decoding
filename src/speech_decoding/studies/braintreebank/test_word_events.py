@@ -18,8 +18,10 @@ from speech_decoding.studies.braintreebank.manifest import (
     BT_LITE_SESSIONS,
     V14_PRETRAIN_SESSIONS,
 )
+from speech_decoding.studies.braintreebank.manifest import BT_LITE_SESSIONS
 from speech_decoding.studies.braintreebank.word_events import (
     BTWordEvents,
+    _assign_all_cells_split,
     _assign_cross_session_split,
     _assign_pretrain_split,
     _word_event_rows,
@@ -407,6 +409,44 @@ def test_assign_cross_session_split_drops_other_subjects() -> None:
     out = _assign_cross_session_split(df, test_subject_id=2, test_trial_id=4)
     assert len(out) == 2
     assert (out["subject_id"] == "2").all()
+
+
+def test_assign_all_cells_split_keeps_every_row_as_train() -> None:
+    # AllCells (materialization-only) keeps every labeled word — no leaderboard
+    # split, no dropped subjects/trials — and stamps split="train" (the downstream
+    # baseline forms its own splits; all-train fails loud if misused for training).
+    df = pd.DataFrame(
+        {
+            "type": ["Word"] * 4,
+            "start": [10.0, 20.0, 30.0, 40.0],
+            "duration": [1.0] * 4,
+            "task": ["speech"] * 4,
+            "label": [0, 1, 0, 1],
+            "subject_id": ["1", "2", "3", "4"],
+            "trial_id": ["1", "4", "0", "1"],
+            "timeline": ["a", "b", "c", "d"],
+        }
+    )
+    out = _assign_all_cells_split(df)
+    assert len(out) == 4                                  # nothing dropped
+    assert (out["split"] == "train").all()                # every row train
+    assert set(zip(out["subject_id"], out["trial_id"])) == {
+        ("1", "1"), ("2", "4"), ("3", "0"), ("4", "1")
+    }
+
+
+def test_timeline_is_used_all_cells_gates_on_lite_set() -> None:
+    # _timeline_is_used must accept every BT_LITE eval cell and reject anything
+    # outside it, so a wider study universe can't leak a non-lite timeline into the
+    # (firewalled) lite-eval baseline.
+    step = BTWordEvents(tasks=("delta_volume",), eval_mode="AllCells")
+    for s, t in BT_LITE_SESSIONS:
+        assert step._timeline_is_used(int(s), int(t))
+    lite = {tuple(c) for c in BT_LITE_SESSIONS}
+    non_lite = next(
+        (s, t) for s in range(1, 11) for t in range(6) if (s, t) not in lite
+    )
+    assert not step._timeline_is_used(*non_lite)
 
 
 def test_btwordevents_rejects_unknown_task() -> None:

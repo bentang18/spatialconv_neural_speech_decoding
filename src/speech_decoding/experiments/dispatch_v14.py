@@ -482,7 +482,7 @@ def build_v14_experiment(
     mode: tp.Literal["nano", "lite", "full"] = "lite",
     task: str = DEFAULT_TASK,
     eval_mode: tp.Literal[
-        "WithinSession", "CrossSession", "CrossSubject"
+        "WithinSession", "CrossSession", "CrossSubject", "AllCells"
     ] = DEFAULT_EVAL_MODE,
     test_subject_id: int = DEFAULT_TEST_SUBJECT_ID,
     test_trial_id: int = DEFAULT_TEST_TRIAL_ID,
@@ -2258,11 +2258,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--task", default=DEFAULT_TASK,
                    help="Neuroprobe task name (event field for the target).")
     p.add_argument("--eval-mode",
-                   choices=("WithinSession", "CrossSession", "CrossSubject"),
+                   choices=("WithinSession", "CrossSession", "CrossSubject",
+                            "AllCells"),
                    default=DEFAULT_EVAL_MODE,
                    help="Split policy (WithinSession = KFold within one trial, "
                         "CrossSession = submission gate, "
-                        "CrossSubject = scientific generalization).")
+                        "CrossSubject = scientific generalization, "
+                        "AllCells = materialization-only: every BT_LITE eval cell "
+                        "unsplit, for the lite-eval raw baseline (piece 4)).")
     p.add_argument("--test-subject-id", type=int, default=DEFAULT_TEST_SUBJECT_ID)
     p.add_argument("--test-trial-id", type=int, default=DEFAULT_TEST_TRIAL_ID)
     p.add_argument("--fold-index", dest="fold_index", type=int, default=0,
