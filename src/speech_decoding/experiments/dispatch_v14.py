@@ -2801,6 +2801,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="lbfgs max_iter for the head-to-head logistic fits "
                         "(bounds the p>>n per-electrode d=256 fits; same cap per "
                         "tap so raw<->encoder stay comparable). Default 2000.")
+    p.add_argument("--probe-bench-pieces", type=str, default="ridge,headtohead",
+                   choices=["ridge,headtohead", "ridge", "headtohead"],
+                   help="Which probe-bench pieces to run. 'ridge' = piece 1 only; "
+                        "'headtohead' = piece 3 only; both (default) runs piece 1 then "
+                        "piece 3. Use 'headtohead' to re-run only the logistic when "
+                        "piece 1's ridge timing already landed.")
     p.add_argument("--lite-baseline-out", type=str, default=None,
                    help="JSON path for the raw |STFT| logistic baseline on the "
                         "Neuroprobe-Lite EVAL cells (piece 4). When set, build the "
@@ -4609,9 +4615,11 @@ def main(argv: list[str] | None = None) -> int:
         out = args.probe_bench_out or _os.path.join(
             _os.path.dirname(args.probe_bench_ckpt), "probe_bench.json"
         )
+        _pieces = set(args.probe_bench_pieces.split(","))
         run_probe_bench(
             xp, ckpt_path=args.probe_bench_ckpt, out_path=out,
             clip_len_s=1.0, max_iter=args.probe_bench_max_iter,
+            do_ridge="ridge" in _pieces, do_headtohead="headtohead" in _pieces,
         )
         return 0
     if args.lite_baseline_out is not None:

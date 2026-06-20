@@ -64,6 +64,7 @@ from speech_decoding.experiments.online_probe_raw_baseline import (
 
 __all__ = [
     "logistic_ws_cs_from_tokens",
+    "logistic_ws_cs_streaming",
     "bench_logistic_head_to_head",
     "bench_ridge_timing",
     "encode_tap_tokens",
@@ -139,6 +140,77 @@ def logistic_ws_cs_from_tokens(
     return metrics
 
 
+def logistic_ws_cs_streaming(
+    dataset: tp.Any,
+    build_tokens: tp.Callable[[int], Tensor],
+    sd: dict[int, SubjectProbeData],
+    *,
+    n_parcels: int,
+    tap: str,
+    max_iter: int = 2000,
+) -> dict[str, float]:
+    """Memory-frugal twin of :func:`logistic_ws_cs_from_tokens`.
+
+    Identical protocol and identical output names, but ``build_tokens(s)`` produces
+    one subject's ``(N,C,N_tok,d)`` on demand so the full per-electrode tensor is
+    held for ONE subject at a time — pool it to parcels (CS, tiny) and run its WS
+    per-electrode logistic immediately, then free it before the next subject. The
+    all-subjects-at-once form OOM'd at 120 G on the d=256 encoder taps (C·30·256 ≈
+    1 M features/window × 7 subjects). Raw (d=1) is cheap either way; this path makes
+    the encoder taps fit without changing any number."""
+    tasks = list(dataset.tasks)
+    a = dataset.cs_anchor
+    ws_set = list(dataset.ws_subjects)
+    cs_set = {a, *dataset.cs_test_subjects}
+    needed = sorted(set(ws_set) | cs_set)
+
+    pooled_cs: dict[int, tuple[Tensor, Tensor]] = {}
+    ws_by_task: dict[str, dict[int, float]] = {task: {} for task in tasks}
+
+    for s in needed:
+        tk = build_tokens(s)
+        if s in cs_set:
+            pooled_cs[s] = pool_electrodes_to_parcels(
+                tk, sd[s].parcel_per_electrode, sd[s].electrode_mask, n_parcels
+            )
+        if s in ws_set:
+            z = feature_matrix_per_electrode(tk, sd[s].electrode_mask).numpy()
+            for task in tasks:
+                zf, yf = _finite_rows(z, sd[s].labels[task])
+                ws_by_task[task][s] = (
+                    ws_auroc_2fold_logistic(zf, yf, max_iter=max_iter)
+                    if len(yf) >= 4 else float("nan")
+                )
+            del z
+        del tk
+
+    metrics: dict[str, float] = {}
+    for task in tasks:
+        ws_vals = [ws_by_task[task][s] for s in ws_set]
+        ws_mean = float(np.nanmean(ws_vals)) if ws_vals else float("nan")
+
+        pa, pres_a = pooled_cs[a]
+        cs_vals: list[float] = []
+        for t in dataset.cs_test_subjects:
+            pt, pres_t = pooled_cs[t]
+            inter = parcel_intersection(pres_a, pres_t)
+            if inter.numel() == 0:
+                cs_vals.append(float("nan"))
+                continue
+            za, ya = _finite_rows(feature_matrix(pa, inter).numpy(), sd[a].labels[task])
+            zt, yt = _finite_rows(feature_matrix(pt, inter).numpy(), sd[t].labels[task])
+            if len(ya) < 2 or len(yt) < 1:
+                cs_vals.append(float("nan"))
+                continue
+            cs_vals.append(cs_auroc_logistic(za, ya, zt, yt, max_iter=max_iter))
+        cs_mean = float(np.nanmean(cs_vals)) if cs_vals else float("nan")
+
+        metrics[f"val_probe/{tap}/ws/{task}"] = ws_mean
+        metrics[f"val_probe/{tap}/cs/{task}"] = cs_mean
+        metrics[f"val_probe/{tap}/gap/{task}"] = ws_mean - cs_mean
+    return metrics
+
+
 @torch.no_grad()
 def encode_tap_tokens(
     model: tp.Any,
@@ -180,9 +252,10 @@ def bench_logistic_head_to_head(
     max_iter: int = 2000,
 ) -> dict[str, tp.Any]:  # pragma: no cover - needs a real model + GPU
     """Piece 3: raw / frontend / latent logistic AUROC head-to-head + per-tap wall
-    times. Each tap is built once (raw tokens from the bands; encoder taps from a
-    forward) then scored through :func:`logistic_ws_cs_from_tokens`. Returns
-    ``{metrics: {...}, timings: {tap: {build_s, fit_s}}}``."""
+    times. Each tap is streamed one subject at a time through
+    :func:`logistic_ws_cs_streaming` (raw tokens from the bands; encoder taps from a
+    forward) so the d=256 per-electrode WS design never holds all subjects at once.
+    Returns ``{metrics: {...}, timings: {tap: {total_s}}}``."""
     dev = device or next(model.parameters()).device
     needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
     sd = {s: dataset.subject_data(s) for s in needed}
@@ -192,26 +265,22 @@ def bench_logistic_head_to_head(
     timings: dict[str, dict[str, float]] = {}
     for tap in ("raw", "frontend", "latent"):
         t0 = time.perf_counter()
-        if tap == "raw":
-            tokens = {
-                s: raw_tokens_from_bands(sd[s].slow, sd[s].beta, sd[s].hg,
-                                         clip_len_s=clip_len_s)
-                for s in needed
-            }
-        else:
-            tokens = {
-                s: encode_tap_tokens(model, sd[s], tap, batch_size=batch_size, device=dev)
-                for s in needed
-            }
-        t_build = time.perf_counter() - t0
-        t1 = time.perf_counter()
+
+        def build(s: int, _tap: str = tap) -> Tensor:
+            if _tap == "raw":
+                return raw_tokens_from_bands(
+                    sd[s].slow, sd[s].beta, sd[s].hg, clip_len_s=clip_len_s
+                )
+            return encode_tap_tokens(
+                model, sd[s], _tap, batch_size=batch_size, device=dev
+            )
+
         metrics.update(
-            logistic_ws_cs_from_tokens(
-                dataset, tokens, sd, n_parcels=n_parcels, tap=tap, max_iter=max_iter
+            logistic_ws_cs_streaming(
+                dataset, build, sd, n_parcels=n_parcels, tap=tap, max_iter=max_iter
             )
         )
-        timings[tap] = {"build_s": t_build, "fit_s": time.perf_counter() - t1}
-        del tokens
+        timings[tap] = {"total_s": time.perf_counter() - t0}
     return {"metrics": metrics, "timings": timings}
 
 

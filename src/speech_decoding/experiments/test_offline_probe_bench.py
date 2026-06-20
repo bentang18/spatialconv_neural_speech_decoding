@@ -14,7 +14,10 @@ import dataclasses
 import numpy as np
 import torch
 
-from speech_decoding.experiments.offline_probe_bench import logistic_ws_cs_from_tokens
+from speech_decoding.experiments.offline_probe_bench import (
+    logistic_ws_cs_from_tokens,
+    logistic_ws_cs_streaming,
+)
 from speech_decoding.experiments.online_probe import SubjectProbeData
 from speech_decoding.experiments.online_probe_raw_baseline import raw_tokens_from_bands
 from speech_decoding.models.v14_converged import BANDS, N_TOKENS
@@ -112,3 +115,17 @@ def test_encoder_shaped_d256_path_runs():
     }
     assert np.isfinite(out["val_probe/latent/ws/delta_volume"])
     assert 0.0 <= out["val_probe/latent/ws/delta_volume"] <= 1.0
+
+
+def test_streaming_matches_all_at_once():
+    # logistic_ws_cs_streaming holds one subject's tokens at a time (the memory fix
+    # for the d=256 encoder OOM) but must produce identical numbers to the
+    # all-at-once logistic_ws_cs_from_tokens. A builder that returns precomputed
+    # tokens isolates the streaming control flow from any token difference.
+    ds, sd = _fake()
+    tokens = _raw_tokens(sd)
+    ref = logistic_ws_cs_from_tokens(ds, tokens, sd, n_parcels=4, tap="raw")
+    streamed = logistic_ws_cs_streaming(
+        ds, lambda s: tokens[s], sd, n_parcels=4, tap="raw"
+    )
+    assert streamed == ref
