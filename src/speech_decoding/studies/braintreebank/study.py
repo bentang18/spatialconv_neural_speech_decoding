@@ -83,6 +83,16 @@ class Wang2024Treebank(study.Study):
     # full-CAR from Lite-CAR. BT-only.
     electrode_set: tp.Literal["all", "lite"] = "all"
 
+    # Optional precomputed trial-duration override, keyed ``"<subject_id>_<trial_id>"``
+    # -> native-grid sample count. When set, ``_trial_duration_seconds`` returns from
+    # this map instead of opening the raw h5 — the ONLY h5 touch in timeline building —
+    # so the ``spec_only`` redeploy (no h5 on the target, e.g. DeltaAI) reads zero
+    # neural data at ``study.run()``. Dropped from the class uid (see ``_cls_kwargs``);
+    # ``duration`` does not enter the per-session spec-cache key (that is the
+    # SpecialLoader timeline uid), so a JSON-sourced duration yields byte-identical
+    # caches + clips to the h5 path. Fails loud on a missing key. BT-only.
+    trial_durations: tp.Optional[tp.Dict[str, int]] = None
+
     aliases: tp.ClassVar[tuple[str, ...]] = (
         "BrainTreebank",
         "Braintreebank",
@@ -121,7 +131,7 @@ class Wang2024Treebank(study.Study):
             serialize_as_any=True, exclude_defaults=True,
         )
         for p in ("infra", "infra_timelines", "path", "name", "query", "mode",
-                  "session_subset", "electrode_set"):
+                  "session_subset", "electrode_set", "trial_durations"):
             kwargs.pop(p, None)
         if kwargs:
             raise RuntimeError(
@@ -196,11 +206,25 @@ class Wang2024Treebank(study.Study):
         return mne.io.RawArray(data, info, verbose=False)
 
     def _trial_duration_seconds(self, timeline: dict[str, tp.Any]) -> float:
+        subject_id = int(timeline["subject_id"])
+        trial_id = int(timeline["trial_id"])
+        # `n_samples` is on the subject's NATIVE grid (h5 is the raw distributed
+        # file), so wall-clock duration divides by the native rate — not the global
+        # 2048. The loader resamples the voltage to 2048, which preserves this
+        # duration; `frequency` in the Ieeg row is 2048 (post-resample) accordingly.
+        native_rate = float(bt_subject_native_rate_hz(subject_id))
+        if self.trial_durations is not None:
+            key = f"{subject_id}_{trial_id}"
+            if key not in self.trial_durations:
+                raise ValueError(
+                    f"trial_durations override is set but missing session {key!r} "
+                    f"(have {sorted(self.trial_durations)}); an h5-free / spec_only "
+                    "deploy cannot recover this trial's duration from raw h5."
+                )
+            return int(self.trial_durations[key]) / native_rate
         from neuroprobe.braintreebank_subject import BrainTreebankSubject
         from neuroprobe.config import ROOT_DIR
 
-        subject_id = int(timeline["subject_id"])
-        trial_id = int(timeline["trial_id"])
         bt = BrainTreebankSubject(
             subject_id=subject_id,
             cache=False,
@@ -211,8 +235,4 @@ class Wang2024Treebank(study.Study):
         first_key = bt.h5_neural_data_keys[first_label]
         with h5py.File(trial_path, "r") as h5:
             n_samples = int(h5["data"][first_key].shape[0])
-        # `n_samples` is on the subject's NATIVE grid (h5 is the raw distributed
-        # file), so wall-clock duration divides by the native rate — not the global
-        # 2048. The loader resamples the voltage to 2048, which preserves this
-        # duration; `frequency` in the Ieeg row is 2048 (post-resample) accordingly.
-        return n_samples / float(bt_subject_native_rate_hz(subject_id))
+        return n_samples / native_rate

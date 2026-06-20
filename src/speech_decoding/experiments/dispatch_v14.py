@@ -738,6 +738,12 @@ def build_v14_experiment(
     # default band view via ``common_fe_kwargs``; default off ⇒ DCC build path
     # byte-identical. Requires ``spec_cache_dir`` set + LOF off (view enforces).
     spec_only: bool = False,
+    # h5-free trial-duration override (DeltaAI/spec_only). Path to a JSON
+    # ``{"<subject_id>_<trial_id>": native_n_samples}``; when set, the study reads
+    # each trial's duration from it instead of opening raw h5 (the only h5 touch in
+    # timeline building). uid-invariant ⇒ byte-identical caches/clips. Default None
+    # ⇒ duration read from h5 (DCC).
+    trial_durations_path: str | None = None,
     # Layer-2 bad-electrode defense (#180): directory of per-session bad-time-window
     # sidecars from ``scripts/neuroprobe/precompute_bad_windows.py``. When set, SSL
     # clips overlapping a glitch span are dropped before sampling. SSL-ONLY: gated to
@@ -1599,11 +1605,18 @@ def build_v14_experiment(
             f"parity + reproducibility), got {electrode_set!r}. The eval cell may "
             "never reference out-of-budget electrodes."
         )
+    trial_durations: dict[str, int] | None = None
+    if trial_durations_path is not None:
+        import json
+
+        with open(trial_durations_path) as fh:
+            trial_durations = {str(k): int(v) for k, v in json.load(fh).items()}
     study = Wang2024Treebank(
         path=Path(bt_root), mode=study_mode,
         infra_timelines={"cluster": None},
         session_subset=session_subset,
         electrode_set=electrode_set,
+        trial_durations=trial_durations,
     )
     # Class-balance only the P4 eval (Neuroprobe parity). SSL phases
     # (pretrain/p3_distill) are label-free → keep EVERY word + nonverbal anchor
@@ -2748,6 +2761,14 @@ def _parser() -> argparse.ArgumentParser:
                         "model inputs byte-identical to the extractor-resident path. "
                         "Fails loud if any session's spec/stats sidecar is missing. "
                         "Default OFF.")
+    p.add_argument("--trial-durations", dest="trial_durations", default=None,
+                   help="Path to a JSON {\"<subject_id>_<trial_id>\": native_n_samples} "
+                        "trial-duration override (scripts/neuroprobe/dump_trial_"
+                        "durations.py). When set, the study reads each trial's duration "
+                        "from this map instead of opening raw h5 — the only h5 touch in "
+                        "timeline building — so --spec-only runs h5-free (DeltaAI). "
+                        "Duration is uid-invariant ⇒ byte-identical caches/clips to the "
+                        "h5 path. Default None = read duration from h5.")
     # Layer-2 bad-electrode clip filter (#180). SSL-only: clips overlapping a
     # precomputed glitch span are dropped before sampling. P4 eval untouched
     # (build gates this to the SSL phases). Default None = no filtering.
@@ -3699,6 +3720,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         spec_cache_dir=args.spec_cache_dir,
         disable_spec_cache=args.no_spec_cache,
         spec_only=args.spec_only,
+        trial_durations_path=args.trial_durations,
         # Layer-2 bad-electrode clip filter (#180). Reaches every phase via this one
         # dict; build_v14_experiment gates it to SSL phases (P4 self-zeroes to None).
         bad_window_dir=args.bad_window_dir,
@@ -4451,6 +4473,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"  spec_cache_dir={_resolved_spec!r} (#80 whole-movie |STFT| cache; "
           f"paid once, then memmap-sliced)")
+    print(f"  spec_only={args.spec_only} trial_durations={args.trial_durations!r} "
+          f"(h5-free deploy: serve clips + durations off the spec cache, no raw h5)")
 
     if args.dry_run:
         print("  (dry-run: not building Experiment; "

@@ -11,13 +11,16 @@ breaks later tests in this module.
 
 from __future__ import annotations
 
+import pytest
 import ujson
 import neuralset as ns
 
+from speech_decoding.studies.braintreebank import study as _study_mod
 from speech_decoding.studies.braintreebank.manifest import (
     BT_FULL_SESSIONS,
     BT_LITE_SESSIONS,
     V14_PRETRAIN_SESSIONS,
+    bt_subject_native_rate_hz,
 )
 from speech_decoding.studies.braintreebank.study import Wang2024Treebank
 
@@ -68,6 +71,55 @@ def test_wang2024treebank_pretrain_mode_emits_exactly_legal_corpus(tmp_path) -> 
     assert 10 not in {s for s, _ in emitted}
     # Disjoint from the eval set — the leakage boundary at the emission layer.
     assert emitted.isdisjoint(set(BT_LITE_SESSIONS))
+
+
+# --- trial_durations override (h5-free / spec_only / DeltaAI) -----------------
+#
+# _trial_duration_seconds is the ONLY h5 touch in timeline building. With a
+# trial_durations map set the study returns each duration from it instead of
+# opening h5, so --spec-only runs with no raw h5 on the target. The duration is
+# uid-invariant (dropped from _cls_kwargs; not in the SpecialLoader timeline), so
+# a JSON-sourced duration keys byte-identical caches/clips to the h5 path.
+
+
+def test_trial_durations_override_returns_without_reading_h5(
+    monkeypatch, tmp_path
+) -> None:
+    """With trial_durations set, the duration is n_samples/native_rate and the h5
+    layer is never opened (patched to raise)."""
+    def _boom(*args, **kwargs):
+        raise AssertionError("h5 opened despite trial_durations override")
+
+    monkeypatch.setattr(_study_mod.h5py, "File", _boom)
+    n_samples = 21401600
+    study = Wang2024Treebank(
+        path=tmp_path, mode="lite", trial_durations={"1_1": n_samples},
+    )
+    dur = study._trial_duration_seconds({"subject_id": 1, "trial_id": 1})
+    assert dur == n_samples / float(bt_subject_native_rate_hz(1))
+
+
+def test_trial_durations_override_missing_key_fails_loud(tmp_path) -> None:
+    """A deploy whose JSON lacks a session it must build cannot recover from h5 —
+    fail loud at study build, naming the missing key, never a silent mid-run read."""
+    study = Wang2024Treebank(
+        path=tmp_path, mode="lite", trial_durations={"1_1": 100},
+    )
+    with pytest.raises(ValueError, match="'2_0'"):
+        study._trial_duration_seconds({"subject_id": 2, "trial_id": 0})
+
+
+def test_trial_durations_excluded_from_cls_kwargs(tmp_path) -> None:
+    """uid-invariance: the override is a deploy convenience, not a cache key — it
+    must not appear in _cls_kwargs or the per-session timeline string."""
+    study = Wang2024Treebank(
+        path=tmp_path, mode="lite", trial_durations={"1_1": 100},
+    )
+    assert study._cls_kwargs() == {}
+    tl_str = study._to_timeline_string(
+        {"subject": "btbank1", "subject_id": 1, "trial_id": 1}
+    )
+    assert "trial_durations" not in tl_str
 
 
 def test_wang2024treebank_mode_excluded_from_cls_kwargs(tmp_path) -> None:
