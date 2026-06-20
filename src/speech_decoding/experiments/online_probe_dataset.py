@@ -338,7 +338,17 @@ def _probe_segmenter(run_data: "Data") -> tp.Any:
         )
     return ns.dataloader.Segmenter(
         extractors={k: src[k] for k in _PROBE_SEGMENTER_KEYS},
-        trigger_query="type == 'Word'",
+        # Exclude nonverbal anchors. The `speech`/`onset` SSL task emits its class-0
+        # silence anchors as `type=="Word"` with `text=="<nonverbal>"` and an est_idx
+        # drawn from `nonverbal_df` (word_events._word_event_rows). The probe's three
+        # tasks are all word-level transcript features (delta_volume / word_length /
+        # word_position) — nonverbal anchors carry none of them, so they would be
+        # all-NaN and masked by run_probe anyway. Forwarding them also trips the
+        # attach_probe_features est_idx join (their est_idx is in nonverbal_df, not the
+        # enriched words_df) — the "neural→transcript join broke" KeyError that disabled
+        # the probe on every --task speech run (#241). Filtering here keeps that loud-fail
+        # guard meaningful for REAL verbal-word clock mismatches.
+        trigger_query="type == 'Word' and text != '<nonverbal>'",
         start=PROBE_CLIP_START_S,
         duration=PROBE_CLIP_DUR_S,
     )

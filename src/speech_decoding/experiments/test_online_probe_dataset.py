@@ -415,3 +415,69 @@ def test_run_probe_with_in_memory_dataset_masks_nan_labels() -> None:
     dv = metrics["val_probe/latent/ws/delta_volume"]
     assert np.isfinite(dv) and dv > 0.9                       # covered windows decode
     assert np.isfinite(metrics["val_probe/latent/gap/delta_volume"])
+
+
+# ----------------------------------------- #241: nonverbal-anchor exclusion (segmenter)
+
+
+def _fake_run_data_with_segmenter_keys():
+    import types
+
+    extractors = {k: object() for k in opd._PROBE_SEGMENTER_KEYS}
+    return types.SimpleNamespace(
+        segmenter=types.SimpleNamespace(extractors=extractors)
+    )
+
+
+def _captured_trigger_query(monkeypatch) -> str:
+    """The ``trigger_query`` ``_probe_segmenter`` passes to ``ns.dataloader.Segmenter``.
+    Patching the Segmenter avoids constructing real (pydantic-validated) extractors —
+    the fix under test is the query string, not the segmenter object."""
+    import neuralset as ns
+
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(ns.dataloader, "Segmenter", _capture)
+    opd._probe_segmenter(_fake_run_data_with_segmenter_keys())
+    return captured["trigger_query"]  # type: ignore[return-value]
+
+
+def test_probe_segmenter_trigger_query_excludes_nonverbal(monkeypatch) -> None:
+    """#241: the probe segmenter must drop nonverbal (speech class-0) anchors. The SSL
+    word_events transform emits those as ``type=='Word'`` / ``text=='<nonverbal>'`` with
+    an est_idx from nonverbal_df; forwarding them tripped the attach_probe_features
+    est_idx join and self-disabled the probe on every ``--task speech`` run."""
+    q = _captured_trigger_query(monkeypatch)
+    assert "type == 'Word'" in q
+    assert "text != '<nonverbal>'" in q
+
+
+def test_probe_segmenter_trigger_query_semantics_drop_nonverbal(monkeypatch) -> None:
+    """The query string actually filters the rows (not merely contains the clause):
+    apply the real built query to a mixed events frame and confirm only verbal Word
+    rows survive — nonverbal-as-Word dropped, non-Word types dropped."""
+    q = _captured_trigger_query(monkeypatch)
+    events = pd.DataFrame(
+        {
+            "type": ["Word", "Word", "Word", "Sentence"],
+            "text": ["cat", "<nonverbal>", "dog", "<nonverbal>"],
+        }
+    )
+    kept = events.query(q)
+    assert kept["text"].tolist() == ["cat", "dog"]
+
+
+def test_probe_segmenter_missing_keys_raises() -> None:
+    """Loud-fail when the run's data is not the 3STFT segmenter (the probe only
+    supports ``--frontend 3stft``)."""
+    import types
+
+    bad = types.SimpleNamespace(
+        segmenter=types.SimpleNamespace(extractors={"support": object()})
+    )
+    with pytest.raises(KeyError):
+        opd._probe_segmenter(bad)
