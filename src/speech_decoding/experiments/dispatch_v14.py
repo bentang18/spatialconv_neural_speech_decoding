@@ -2807,6 +2807,11 @@ def _parser() -> argparse.ArgumentParser:
                         "'headtohead' = piece 3 only; both (default) runs piece 1 then "
                         "piece 3. Use 'headtohead' to re-run only the logistic when "
                         "piece 1's ridge timing already landed.")
+    p.add_argument("--probe-bench-taps", type=str, default="raw,frontend,latent",
+                   help="Comma-separated subset of raw/frontend/latent to score in "
+                        "the head-to-head (piece 3). Default all three. 'raw,frontend' "
+                        "skips the expensive latent forward; 'raw' never touches the "
+                        "model.")
     p.add_argument("--lite-baseline-out", type=str, default=None,
                    help="JSON path for the raw |STFT| logistic baseline on the "
                         "Neuroprobe-Lite EVAL cells (piece 4). When set, build the "
@@ -4616,10 +4621,12 @@ def main(argv: list[str] | None = None) -> int:
             _os.path.dirname(args.probe_bench_ckpt), "probe_bench.json"
         )
         _pieces = set(args.probe_bench_pieces.split(","))
+        _taps = tuple(t.strip() for t in args.probe_bench_taps.split(",") if t.strip())
         run_probe_bench(
             xp, ckpt_path=args.probe_bench_ckpt, out_path=out,
             clip_len_s=1.0, max_iter=args.probe_bench_max_iter,
             do_ridge="ridge" in _pieces, do_headtohead="headtohead" in _pieces,
+            taps=_taps,
         )
         return 0
     if args.lite_baseline_out is not None:

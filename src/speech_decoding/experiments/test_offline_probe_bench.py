@@ -14,7 +14,10 @@ import dataclasses
 import numpy as np
 import torch
 
+import pytest
+
 from speech_decoding.experiments.offline_probe_bench import (
+    bench_logistic_head_to_head,
     logistic_ws_cs_from_tokens,
     logistic_ws_cs_streaming,
 )
@@ -129,3 +132,24 @@ def test_streaming_matches_all_at_once():
         ds, lambda s: tokens[s], sd, n_parcels=4, tap="raw"
     )
     assert streamed == ref
+
+
+def test_head_to_head_taps_filter_raw_only():
+    # taps=("raw",) scores only the raw |STFT| baseline and never touches the model
+    # (the encoder taps are the expensive forwards). device is passed so the
+    # `next(model.parameters())` device probe is short-circuited → model=None is safe.
+    ds, _ = _fake()
+    out = bench_logistic_head_to_head(
+        None, ds, device=torch.device("cpu"), taps=("raw",)
+    )
+    assert set(out["timings"]) == {"raw"}
+    assert out["metrics"]
+    assert all(k.split("/")[1] == "raw" for k in out["metrics"])
+
+
+def test_head_to_head_rejects_unknown_tap():
+    ds, _ = _fake()
+    with pytest.raises(ValueError, match="unknown tap"):
+        bench_logistic_head_to_head(
+            None, ds, device=torch.device("cpu"), taps=("raw", "bogus")
+        )

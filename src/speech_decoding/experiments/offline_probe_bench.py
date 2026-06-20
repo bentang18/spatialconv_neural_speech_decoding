@@ -250,12 +250,17 @@ def bench_logistic_head_to_head(
     batch_size: int = 256,
     device: torch.device | None = None,
     max_iter: int = 2000,
+    taps: tp.Sequence[str] = ("raw", "frontend", "latent"),
 ) -> dict[str, tp.Any]:  # pragma: no cover - needs a real model + GPU
     """Piece 3: raw / frontend / latent logistic AUROC head-to-head + per-tap wall
     times. Each tap is streamed one subject at a time through
     :func:`logistic_ws_cs_streaming` (raw tokens from the bands; encoder taps from a
     forward) so the d=256 per-electrode WS design never holds all subjects at once.
-    Returns ``{metrics: {...}, timings: {tap: {total_s}}}``."""
+    ``taps`` selects which to score (default all three); a raw-only run never touches
+    the model. Returns ``{metrics: {...}, timings: {tap: {total_s}}}``."""
+    bad = [t for t in taps if t not in ("raw", "frontend", "latent")]
+    if bad:
+        raise ValueError(f"unknown tap(s) {bad}; choose from raw/frontend/latent")
     dev = device or next(model.parameters()).device
     needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
     sd = {s: dataset.subject_data(s) for s in needed}
@@ -263,7 +268,7 @@ def bench_logistic_head_to_head(
 
     metrics: dict[str, float] = {}
     timings: dict[str, dict[str, float]] = {}
-    for tap in ("raw", "frontend", "latent"):
+    for tap in taps:
         t0 = time.perf_counter()
 
         def build(s: int, _tap: str = tap) -> Tensor:
@@ -511,6 +516,7 @@ def run_probe_bench(
     max_iter: int = 2000,
     do_ridge: bool = True,
     do_headtohead: bool = True,
+    taps: tp.Sequence[str] = ("raw", "frontend", "latent"),
 ) -> dict[str, tp.Any]:  # pragma: no cover - DCC-only driver
     """Top-level: build the probe dataset from the run, load the model at 1 s, run
     piece 1 (ridge timing) and piece 3 (logistic head-to-head), write ``out_path``
@@ -561,7 +567,7 @@ def run_probe_bench(
         t = time.perf_counter()
         result["piece3_head_to_head"] = bench_logistic_head_to_head(
             model, dataset, clip_len_s=clip_len_s, batch_size=batch_size,
-            device=device, max_iter=max_iter,
+            device=device, max_iter=max_iter, taps=taps,
         )
         print(f"[probe-bench] piece 3 done in {time.perf_counter()-t:.1f}s: "
               f"{result['piece3_head_to_head']['timings']}")
