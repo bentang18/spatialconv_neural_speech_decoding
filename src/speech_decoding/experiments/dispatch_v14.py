@@ -2783,6 +2783,21 @@ def _parser() -> argparse.ArgumentParser:
                             f"--session-z-winsor for {_b} only. Default None.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print resolved config without dispatching.")
+    # Offline probe bench (pieces 1+3, Ben 2026-06-20): build the run exactly as a
+    # real dispatch would, then — instead of training — load a checkpoint at 1 s
+    # geometry and run the ridge-timing + logistic head-to-head bench
+    # (offline_probe_bench.run_probe_bench). Read-only; no trainer, single GPU.
+    p.add_argument("--probe-bench-ckpt", type=str, default=None,
+                   help="Path to a converged-SSL checkpoint (.ckpt). When set, build "
+                        "the experiment then run the offline probe bench at 1 s "
+                        "geometry instead of training. Pair with --probe-bench-out.")
+    p.add_argument("--probe-bench-out", type=str, default=None,
+                   help="JSON path for the offline probe bench results "
+                        "(default: <ckpt-dir>/probe_bench.json).")
+    p.add_argument("--probe-bench-max-iter", type=int, default=2000,
+                   help="lbfgs max_iter for the head-to-head logistic fits "
+                        "(bounds the p>>n per-electrode d=256 fits; same cap per "
+                        "tap so raw<->encoder stay comparable). Default 2000.")
     p.add_argument("--fast-dev-run", action="store_true",
                    help="Lightning fast-dev-run: 1 batch train+val+test, no checkpoints.")
     # --live nano learning-dynamics dashboard (Weights & Biases). Near-free
@@ -4570,6 +4585,22 @@ def main(argv: list[str] | None = None) -> int:
         dataset.prepare()
         print(f"[cache-only] DONE in {_time.time() - t0:.1f}s — "
               "spec cache materialized; exiting before trainer (no GPU used).")
+        return 0
+    if args.probe_bench_ckpt is not None:
+        # Offline probe bench (pieces 1+3): no trainer. The experiment is built the
+        # same way a real run is (same data chain / model config), so the 1 s probe
+        # dataset and the 5s->1s model load are byte-faithful to production.
+        import os as _os
+
+        from speech_decoding.experiments.offline_probe_bench import run_probe_bench
+
+        out = args.probe_bench_out or _os.path.join(
+            _os.path.dirname(args.probe_bench_ckpt), "probe_bench.json"
+        )
+        run_probe_bench(
+            xp, ckpt_path=args.probe_bench_ckpt, out_path=out,
+            clip_len_s=1.0, max_iter=args.probe_bench_max_iter,
+        )
         return 0
     result = xp.run()
     print(f"V14 dispatch result: {result}")

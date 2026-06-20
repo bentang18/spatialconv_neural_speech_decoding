@@ -40,6 +40,7 @@ def logistic_auroc(
     *,
     C: float = DEFAULT_C,
     seed: int = 0,
+    max_iter: int = 10000,
 ) -> float:
     """Fit ``StandardScaler`` + L2 ``LogisticRegression`` on ``(z_train, y_train)``,
     return test-set ROC-AUC (upstream-parity ``fit_sklearn`` recipe).
@@ -48,7 +49,13 @@ def logistic_auroc(
     tasks). Binary → ``roc_auc_score`` against the positive class (``classes_[1]``)
     using ``proba[:, 1]``; multiclass → OVR macro. Returns NaN when the train OR
     test fold is single-class (AUROC undefined) so callers nan-mean over
-    folds/subjects, matching :func:`online_probe.auroc`."""
+    folds/subjects, matching :func:`online_probe.auroc`.
+
+    ``max_iter`` bounds the lbfgs iterations. The default (10000) is the upstream
+    recipe and converges for the raw d=1 and parcel-pooled matrices; the offline
+    encoder head-to-head (:mod:`offline_probe_bench`) passes a smaller cap for the
+    p≫n per-electrode d=256 fits, applied identically across taps so the
+    raw↔encoder comparison stays apples-to-apples."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
     from sklearn.preprocessing import StandardScaler
@@ -59,7 +66,7 @@ def logistic_auroc(
         return float("nan")
 
     scaler = StandardScaler().fit(z_train)
-    clf = LogisticRegression(C=C, random_state=seed, max_iter=10000, tol=1e-3)
+    clf = LogisticRegression(C=C, random_state=seed, max_iter=max_iter, tol=1e-3)
     clf.fit(scaler.transform(z_train), y_train)
     proba = clf.predict_proba(scaler.transform(z_test))
 
@@ -72,7 +79,8 @@ def logistic_auroc(
 
 
 def ws_auroc_2fold_logistic(
-    z: np.ndarray, y: np.ndarray, *, C: float = DEFAULT_C, seed: int = 0, k_folds: int = 2
+    z: np.ndarray, y: np.ndarray, *, C: float = DEFAULT_C, seed: int = 0,
+    k_folds: int = 2, max_iter: int = 10000,
 ) -> float:
     """Within-session AUROC, logistic: contiguous (time-ordered) ``k_folds`` split,
     fit on each train half / score the held-out half, nan-mean the folds. Same
@@ -82,7 +90,10 @@ def ws_auroc_2fold_logistic(
     for train, test in contiguous_folds(len(y), k_folds):
         if len(train) == 0 or len(test) == 0:
             continue
-        scores.append(logistic_auroc(z[train], y[train], z[test], y[test], C=C, seed=seed))
+        scores.append(
+            logistic_auroc(z[train], y[train], z[test], y[test], C=C, seed=seed,
+                           max_iter=max_iter)
+        )
     return float(np.nanmean(scores)) if scores else float("nan")
 
 
@@ -94,8 +105,10 @@ def cs_auroc_logistic(
     *,
     C: float = DEFAULT_C,
     seed: int = 0,
+    max_iter: int = 10000,
 ) -> float:
     """Cross-subject/-session AUROC, logistic: fit on the anchor, score the test
     subject (caller restricts both to the shared parcel set). Logistic counterpart
     of :func:`online_probe.cs_auroc`."""
-    return logistic_auroc(z_anchor, y_anchor, z_test, y_test, C=C, seed=seed)
+    return logistic_auroc(z_anchor, y_anchor, z_test, y_test, C=C, seed=seed,
+                          max_iter=max_iter)
