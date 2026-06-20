@@ -372,6 +372,27 @@ def _load_enriched_words(
     return out
 
 
+def cartesian_slow_to_5d(slow: "np.ndarray | tp.Any") -> tp.Any:
+    """Split the cached cartesian slow band ``(B, C, 2F, T)`` → ``(B, C, 2, F, T)``.
+
+    The 3STFT slow band is cached as the two real components CONCATENATED on the freq
+    axis (``[Re(F) ++ Im(F)]``; ``view.py::_single_stft_raw_view`` ``cartesian=True``),
+    but the frontend slow stem (``in_channels=2``) and every probe consumer
+    (``encode_frontend`` / ``raw_tokens_from_bands``) want a SEPARATE Re/Im channel axis.
+    Row-major split → channel 0 = Re(F), channel 1 = Im(F) — byte-identical to the live
+    training path (``v14_converged_module._ingest``). ``_materialize_subject`` applies
+    this so the stored ``slow`` honors :class:`SubjectProbeData`'s 5-D contract; the
+    beta/HG magnitude bands stay 4-D. Fails loud on a non-even freq axis (a sign the
+    band was not cached cartesian)."""
+    if slow.ndim != 4 or slow.shape[2] % 2 != 0:
+        raise ValueError(
+            "cartesian slow band must be (B, C, 2F, T) with an even freq axis "
+            f"([Re ++ Im]); got shape {tuple(slow.shape)}"
+        )
+    b, c, f2, t = slow.shape
+    return slow.reshape(b, c, 2, f2 // 2, t)
+
+
 def _materialize_subject(
     dataset: tp.Any,
     triggers: pd.DataFrame,
@@ -409,7 +430,7 @@ def _materialize_subject(
     if support0 is None:
         raise RuntimeError("probe subject yielded no windows after selection")
     return {
-        "slow": torch.cat(bands["slow"], dim=0),
+        "slow": cartesian_slow_to_5d(torch.cat(bands["slow"], dim=0)),
         "beta": torch.cat(bands["beta"], dim=0),
         "hg": torch.cat(bands["hg"], dim=0),
         "parcel_per_electrode": support0.argmax(dim=-1).long(),   # (C,)

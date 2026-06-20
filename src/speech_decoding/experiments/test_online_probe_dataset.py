@@ -481,3 +481,24 @@ def test_probe_segmenter_missing_keys_raises() -> None:
     )
     with pytest.raises(KeyError):
         opd._probe_segmenter(bad)
+
+
+def test_cartesian_slow_to_5d_row_major_split() -> None:
+    # The cache delivers slow as (B, C, 2F, T) = [Re(F) ++ Im(F)] on the freq axis;
+    # the materializer must split it to (B, C, 2, F, T) with channel 0 = Re, 1 = Im
+    # (row-major), byte-identical to the live v14_converged_module._ingest reshape.
+    B, C, F, T = 2, 3, 6, 5
+    re = torch.arange(B * C * F * T, dtype=torch.float32).reshape(B, C, F, T)
+    im = -re - 1.0
+    cat = torch.cat([re, im], dim=2)                  # (B, C, 12, T)
+    out = opd.cartesian_slow_to_5d(cat)
+    assert tuple(out.shape) == (B, C, 2, F, T)
+    assert torch.equal(out[:, :, 0], re)              # channel 0 = Re(F)
+    assert torch.equal(out[:, :, 1], im)              # channel 1 = Im(F)
+
+
+def test_cartesian_slow_to_5d_fails_loud_on_bad_shape() -> None:
+    with pytest.raises(ValueError, match="even freq axis"):
+        opd.cartesian_slow_to_5d(torch.zeros(2, 3, 7, 5))   # odd freq axis
+    with pytest.raises(ValueError, match="2F"):
+        opd.cartesian_slow_to_5d(torch.zeros(2, 3, 2, 6, 5))  # already 5-D
