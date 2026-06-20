@@ -733,6 +733,11 @@ def build_v14_experiment(
     # own spec_cache_dir).
     spec_cache_dir: str | None = None,
     disable_spec_cache: bool = False,
+    # Lightweight-redeploy (Option B / DeltaAI): serve clips from the on-disk spec
+    # cache ALONE — no extractor cache, no raw h5 on the target. Threads to every
+    # default band view via ``common_fe_kwargs``; default off ⇒ DCC build path
+    # byte-identical. Requires ``spec_cache_dir`` set + LOF off (view enforces).
+    spec_only: bool = False,
     # Layer-2 bad-electrode defense (#180): directory of per-session bad-time-window
     # sidecars from ``scripts/neuroprobe/precompute_bad_windows.py``. When set, SSL
     # clips overlapping a glitch span are dropped before sampling. SSL-ONLY: gated to
@@ -1331,6 +1336,7 @@ def build_v14_experiment(
             channel_order="original",
             c_max=c_max,
             session_robust_z=session_robust_z,
+            spec_only=spec_only,
         )
         if cache_band is not None:
             # 3STFT per-band cache build (--cache-band, cache-only). ONE named band
@@ -2733,6 +2739,15 @@ def _parser() -> argparse.ArgumentParser:
                    help="Disable the #80 whole-movie |STFT| cache (forces the "
                         "per-run recompute of the session_robust_z whole-movie "
                         "STFT). Default OFF (cache armed when a cache root exists).")
+    p.add_argument("--spec-only", dest="spec_only", action="store_true",
+                   help="Lightweight-redeploy (Option B): serve clips from the "
+                        "on-disk spec cache ALONE — no extractor cache, no raw h5 on "
+                        "the target. prepare() builds the index/channels/robust-z "
+                        "stats from the .npy/.json/.stats.npz sidecars and skips the "
+                        "extractor/raw layer. Requires --spec-cache-dir + LOF off; "
+                        "model inputs byte-identical to the extractor-resident path. "
+                        "Fails loud if any session's spec/stats sidecar is missing. "
+                        "Default OFF.")
     # Layer-2 bad-electrode clip filter (#180). SSL-only: clips overlapping a
     # precomputed glitch span are dropped before sampling. P4 eval untouched
     # (build gates this to the SSL phases). Default None = no filtering.
@@ -3683,6 +3698,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         # extractor cache root). Reaches every phase via this one dict.
         spec_cache_dir=args.spec_cache_dir,
         disable_spec_cache=args.no_spec_cache,
+        spec_only=args.spec_only,
         # Layer-2 bad-electrode clip filter (#180). Reaches every phase via this one
         # dict; build_v14_experiment gates it to SSL phases (P4 self-zeroes to None).
         bad_window_dir=args.bad_window_dir,

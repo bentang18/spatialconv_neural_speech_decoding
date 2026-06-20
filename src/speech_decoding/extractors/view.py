@@ -1014,6 +1014,15 @@ class MultiStftView(CARIeegExtractor):
     # apply_log=False, and no waveform-domain transforms (baseline/scale/clamp),
     # which ``_validate_spec_cache_config`` enforces at construction.
     spec_cache_dir: str | None = None
+    # Lightweight-redeploy path (Option B / DeltaAI): serve clips from the on-disk
+    # spec cache ALONE — no extractor cache, no raw h5 on the target. ``prepare``
+    # then builds the index/channels/robust-z stats from the .npy/.json/.stats.npz
+    # sidecars and skips ``super().prepare`` (whose ``_get_data`` loop + shape-probe
+    # are the only extractor/raw readers at run start). Default off ⇒ the validated
+    # build path is byte-identical. Per-clip reads (``_cached_clip``) are unchanged,
+    # so model inputs match the extractor-resident path bit-for-bit. Requires
+    # ``spec_cache_dir`` set and ``lof_bad_channels`` off (enforced at construction).
+    spec_only: bool = False
     # session key (``event._splittable_event_uid()``) -> cache record, filled in
     # ``prepare`` on the main process and inherited by forked DataLoader workers
     # (the same fill-in-prepare / read-per-clip pattern as ``_session_stats``).
@@ -1052,6 +1061,26 @@ class MultiStftView(CARIeegExtractor):
                         "it is a waveform-domain transform applied before the STFT, "
                         "which the precomputed-spectrogram cache path bypasses."
                     )
+        if self.spec_only:
+            # spec_only serves clips from the on-disk spec cache with NO extractor
+            # cache / raw h5 on the target, so it MUST have a cache to read, and it
+            # cannot run the LOF fit (which reads a car=None extractor sibling the
+            # target never stages). Fail loud rather than fall through to a build
+            # that has nothing to build from. (front_end/apply_log/waveform-domain
+            # transforms are already gated above via the spec_cache_dir branch.)
+            if self.spec_cache_dir is None:
+                raise ValueError(
+                    "MultiStftView.spec_only=True requires spec_cache_dir to be "
+                    "set: spec_only reads clips from the on-disk spec cache and "
+                    "never touches the extractor cache or raw h5."
+                )
+            if self.lof_bad_channels:
+                raise ValueError(
+                    "MultiStftView.spec_only=True is incompatible with "
+                    "lof_bad_channels=True: the LOF fit reads a car=None extractor "
+                    "sibling, which a spec_only deploy does not stage. Disable LOF "
+                    "(the live v14 config already has lof_bad_channels=False)."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1138,7 +1167,14 @@ class MultiStftView(CARIeegExtractor):
         # DO determine which channels get dropped, so they stay in the uid.
         # (Default-OFF ``lof_bad_channels`` / default-None ``spec_cache_dir`` are
         # excluded by exclude_defaults, so an un-armed run perturbs nothing.)
-        return super()._exclude_from_cache_uid() + ["lof_report_path", "spec_cache_dir"]
+        # ``spec_only`` (Option B redeploy) is the same class of knob: it only
+        # changes HOW prepare populates the index (from the on-disk sidecars vs the
+        # extractor), never the cached features — so a spec_only deploy MUST share
+        # the namespace of the cache a normal build wrote, or it would look in an
+        # empty subdir. Exclude it for both uid stability and cache reuse.
+        return super()._exclude_from_cache_uid() + [
+            "lof_report_path", "spec_cache_dir", "spec_only",
+        ]
 
     def n_time_bins_for_duration(self, duration_s: float) -> int:
         """STFT frame count for a ``duration_s`` window: ``1 + L // hop`` where
@@ -1374,6 +1410,13 @@ class MultiStftView(CARIeegExtractor):
         return normalizer.transform(spec)
 
     def prepare(self, obj) -> None:  # type: ignore[override]
+        if self.spec_only:
+            # Lightweight-redeploy (Option B): build the index/channels/robust-z
+            # stats from the on-disk spec sidecars and skip the extractor/raw layer
+            # entirely. A SEPARATE top-of-prepare branch — never reorder the
+            # load-bearing normal body below.
+            self._prepare_spec_only(obj)
+            return
         # ORDER IS LOAD-BEARING (Gate-C showstopper, 2026-06-03). ``self._get_data``
         # is an exca-cached property; ``super().prepare`` materializes it for EVERY
         # session (to populate ``_channels`` and fire a shape-probe). The cache key
@@ -1409,6 +1452,98 @@ class MultiStftView(CARIeegExtractor):
         elif self.session_robust_z:
             self._fit_session_robust_z(obj)
             self._stats_ready = True
+
+    def _prepare_spec_only(self, obj) -> None:
+        """spec_only deploy: build the per-session spec index, positional channel
+        map, and robust-z stats ENTIRELY from the on-disk spec sidecars
+        (``.npy``/``.json``/``.stats.npz``) — zero extractor-cache or raw-h5 read.
+        Replaces ``super().prepare``'s ``_get_data`` loop + shape-probe AND
+        ``_build_spec_cache_and_fit``, both of which require the extractor/raw layer
+        a spec_only target does not stage. Reuses the same helpers as the cache-HIT
+        branch (``_spec_cache_stem``/``_assert_cache_meta``/``_load_stats_sidecar``/
+        ``_scatter_stats_to_global``) WITHOUT editing that load-bearing body. Per-clip
+        reads (``_cached_clip``) and ``_finalize_clip`` are untouched ⇒ model inputs
+        are byte-identical to the extractor-resident path.
+
+        Fails loud if any session's spec is missing (a spec_only deploy cannot build
+        it) or, under ``session_robust_z``, if its stats sidecar is missing/stale (it
+        cannot refit without the full frames). Channels are populated positionally
+        (``_update_channels`` spans to ``c_max``) exactly as the base prepare's
+        ``_get_data`` loop would, so ``_channels`` matches the normal path."""
+        # spec_cache_dir is guaranteed non-None here by _validate_spec_cache_config
+        # (spec_only=True requires it); assert narrows the type and documents it.
+        assert self.spec_cache_dir is not None
+        events = self._event_types_helper.extract(obj)  # type: ignore[attr-defined]
+        cache_root = Path(self.spec_cache_dir) / self._spec_cache_namespace()
+        expected_f = self._expected_raw_f_bins()
+        seen: set[str] = set()
+        missing: list[str] = []
+        for event in events:
+            key = event._splittable_event_uid()
+            if key in seen:
+                continue
+            seen.add(key)
+            stem = self._spec_cache_stem(key)
+            npy_path = cache_root / f"{stem}.npy"
+            json_path = cache_root / f"{stem}.json"
+            stats_path = cache_root / f"{stem}.stats.npz"
+            if not (npy_path.exists() and json_path.exists()):
+                missing.append(key)
+                continue
+            meta = json.loads(json_path.read_text())
+            ch_names = list(meta["ch_names"])
+            total_frames = int(meta["total_frames"])
+            sample_rate = int(meta["sample_rate"])
+            # Same defence-in-depth the cache-HIT branch runs: a stored geometry
+            # that disagrees with the live config is a stale/corrupt spec.
+            self._assert_cache_meta(key, meta, expected_f, ch_names)
+            if sample_rate != int(self.sample_rate_hz):
+                raise ValueError(
+                    f"spec_only session {key!r} sample_rate {sample_rate} != "
+                    f"view.sample_rate_hz {int(self.sample_rate_hz)}: the per-clip "
+                    "frame grid assumes a single rate. Stage a matching cache."
+                )
+            self._update_channels(ch_names)
+            if self.session_robust_z:
+                normalizer = (
+                    self._load_stats_sidecar(stats_path, meta)
+                    if stats_path.exists() else None
+                )
+                if normalizer is None:
+                    raise ValueError(
+                        f"spec_only session {key!r} has no usable robust-z stats "
+                        f"sidecar ({stats_path.name}): a spec_only deploy cannot "
+                        "refit (it has no frames/extractor). Stage the .stats.npz "
+                        "sidecars, or run with session_robust_z off."
+                    )
+                self._scatter_stats_to_global(normalizer, ch_names)
+                self._session_stats[key] = normalizer  # type: ignore[index]
+            self._spec_cache_index[key] = _SpecCacheEntry(  # type: ignore[index]
+                path=str(npy_path),
+                ch_names=tuple(ch_names),
+                total_frames=total_frames,
+                sample_rate=sample_rate,
+            )
+        if missing:
+            raise ValueError(
+                f"spec_only: {len(missing)} session(s) have no spec under "
+                f"{cache_root}: {missing[:8]}"
+                f"{'...' if len(missing) > 8 else ''}. A spec_only deploy cannot "
+                "build them (no extractor cache / raw h5 on the target). Stage the "
+                "full spec cache, or run with spec_only off."
+            )
+        self._spec_ready = True
+        if self.session_robust_z:
+            self._stats_ready = True
+        # Shape-probe AFTER arming (handoff: fire-after-arm): routes through
+        # ``_cached_clip`` (no extractor read) and sets ``_effective_frequency`` +
+        # ``_missing_default`` (the output-shape state the allow_missing path needs)
+        # exactly as the base prepare's probe would. duration=0.001 → n_frames=1, so
+        # the per-clip read-sanity guard is satisfied; robust-z (now armed) changes
+        # clip VALUES but not the zeros-shaped ``_missing_default``, so the probe
+        # state matches the normal path bit-for-bit.
+        if events:
+            self(events[0], start=events[0].start, duration=0.001, trigger=events[0])
 
     def _fit_session_robust_z(self, obj) -> None:
         """Fit one ``SessionRobustZNormalizer`` per session over that session's
