@@ -271,26 +271,40 @@ def _encode_and_pool(
     ppe = sd.parcel_per_electrode.to(dev)
     emask = sd.electrode_mask.to(dev)
 
-    front_chunks: list[Tensor] = []
-    lat_chunks: list[Tensor] = []
+    # Pool each chunk to (n, n_parcels, F, k, d) immediately and keep only the
+    # small pooled result on CPU — never hold all N windows' raw (N,C,30,d) feats
+    # on the GPU at once. At N_CAP=3500 windows the raw feats are ~14 GB per tap
+    # (>card); the pooled accumulant is parcel/time-binned and ~10x smaller. Output
+    # is byte-identical to a single full forward: pooling is per-window, so chunking
+    # the window axis and concatenating reassembles it exactly. `present` is
+    # window-invariant (electrode→parcel only), so any chunk's copy is the session's.
+    taps = ("frontend", "latent")
+    pooled_acc: dict[str, dict[int, list[Tensor]]] = {
+        tap: {k: [] for k in k_list} for tap in taps
+    }
+    present_acc: dict[str, dict[int, Tensor]] = {tap: {} for tap in taps}
     n = slow.shape[0]
     for i in range(0, n, batch_size):
         sl = slice(i, i + batch_size)
-        front_chunks.append(model.encode_frontend(slow[sl], beta[sl], hg[sl]))
-        lat_chunks.append(
-            model.encode_latent(slow[sl], beta[sl], hg[sl], ppe, electrode_mask=emask)
-        )
-    feats = {"frontend": torch.cat(front_chunks), "latent": torch.cat(lat_chunks)}
-
-    out: dict[str, dict[int, tuple[Tensor, Tensor]]] = {}
-    for tap, f in feats.items():
-        out[tap] = {}
-        for k in k_list:
-            pooled, present = pool_window_features(
-                f, freq_id, time_slot, ppe, emask, n_parcels, k
-            )
-            out[tap][k] = (pooled.float().cpu(), present.cpu())
-    return out
+        feats = {
+            "frontend": model.encode_frontend(slow[sl], beta[sl], hg[sl]),
+            "latent": model.encode_latent(
+                slow[sl], beta[sl], hg[sl], ppe, electrode_mask=emask
+            ),
+        }
+        for tap, f in feats.items():
+            for k in k_list:
+                pooled, present = pool_window_features(
+                    f, freq_id, time_slot, ppe, emask, n_parcels, k
+                )
+                pooled_acc[tap][k].append(pooled.float().cpu())
+                present_acc[tap][k] = present.cpu()
+    return {
+        tap: {
+            k: (torch.cat(pooled_acc[tap][k]), present_acc[tap][k]) for k in k_list
+        }
+        for tap in taps
+    }
 
 
 def run_probe(
