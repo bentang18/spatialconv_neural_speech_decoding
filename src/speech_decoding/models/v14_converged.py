@@ -1128,6 +1128,14 @@ class V14ConvergedSSL(nn.Module):
         The converged success criterion = a linear probe on this must beat one on
         :meth:`encode_frontend`."""
         feats = self.student_frontend(slow, beta, hg)
+        # The probe taps store per-electrode anatomy as (C,) (constant across a
+        # subject's windows); :meth:`latent` wants (B, C). Expand a 1-D map/mask to
+        # the batch — a no-op on the training path, which calls model.forward with
+        # (B, C) already, not this eval tap.
+        if parcel_per_electrode.ndim == 1:
+            parcel_per_electrode = parcel_per_electrode.unsqueeze(0).expand(feats.shape[0], -1)
+        if electrode_mask is not None and electrode_mask.ndim == 1:
+            electrode_mask = electrode_mask.unsqueeze(0).expand(feats.shape[0], -1)
         return self.latent(feats, parcel_per_electrode, electrode_mask=electrode_mask)
 
     def forward(

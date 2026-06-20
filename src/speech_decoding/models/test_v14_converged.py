@@ -1230,6 +1230,25 @@ def test_encode_latent_mixes_across_electrodes() -> None:
     assert not torch.allclose(l0[:, 1:], l1[:, 1:])
 
 
+def test_encode_latent_accepts_per_electrode_constant_maps() -> None:
+    # The probe taps store per-electrode anatomy as (C,) (constant across a subject's
+    # windows). encode_latent must expand a 1-D map/mask to the batch and match the
+    # (B, C) call the training path uses.
+    m = _ssl_model().eval()
+    slow, beta, hg, pe, emask, _ = _ssl_batch()
+    pe_c = pe[0]                                          # (C,) — same row for all B
+    emask_c = emask[0]
+    slow = slow.clone()
+    slow[1] = slow[0]                                     # make both clips share pe[0]
+    beta = beta.clone(); beta[1] = beta[0]
+    hg = hg.clone(); hg[1] = hg[0]
+    bc = m.encode_latent(slow, beta, hg, pe[0:1].expand(2, -1),
+                         electrode_mask=emask[0:1].expand(2, -1))
+    one_d = m.encode_latent(slow, beta, hg, pe_c, electrode_mask=emask_c)
+    assert one_d.shape == (2, 6, 30, 32)
+    assert torch.allclose(bc, one_d, atol=1e-6)
+
+
 def test_probe_taps_differ_frontend_vs_latent() -> None:
     m = _ssl_model().eval()
     slow, beta, hg, pe, emask, _ = _ssl_batch()
