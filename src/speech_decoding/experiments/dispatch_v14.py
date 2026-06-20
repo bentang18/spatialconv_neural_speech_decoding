@@ -2798,6 +2798,15 @@ def _parser() -> argparse.ArgumentParser:
                    help="lbfgs max_iter for the head-to-head logistic fits "
                         "(bounds the p>>n per-electrode d=256 fits; same cap per "
                         "tap so raw<->encoder stay comparable). Default 2000.")
+    p.add_argument("--lite-baseline-out", type=str, default=None,
+                   help="JSON path for the raw |STFT| logistic baseline on the "
+                        "Neuroprobe-Lite EVAL cells (piece 4). When set, build the "
+                        "(lite) experiment then run the three eval-mode baselines "
+                        "instead of training — no GPU. Pair with --mode lite "
+                        "--electrode-set lite and a fresh --spec-cache-dir.")
+    p.add_argument("--lite-baseline-max-iter", type=int, default=10000,
+                   help="lbfgs max_iter for the lite-baseline logistic fits "
+                        "(default 10000, the upstream-parity recipe).")
     p.add_argument("--fast-dev-run", action="store_true",
                    help="Lightning fast-dev-run: 1 batch train+val+test, no checkpoints.")
     # --live nano learning-dynamics dashboard (Weights & Biases). Near-free
@@ -4601,6 +4610,34 @@ def main(argv: list[str] | None = None) -> int:
             xp, ckpt_path=args.probe_bench_ckpt, out_path=out,
             clip_len_s=1.0, max_iter=args.probe_bench_max_iter,
         )
+        return 0
+    if args.lite_baseline_out is not None:
+        # Piece 4: raw |STFT| logistic baseline on the Neuroprobe-Lite eval cells.
+        # Model-free (no forward) — runs on a CPU scavenger node. Reuses the lite
+        # Data's study + 3STFT segmenter; the inverse firewall in build_lite_eval_cells
+        # asserts every materialized cell is a BT_LITE_SESSIONS member.
+        import json as _json
+        import os as _os
+
+        from speech_decoding.experiments.lite_eval_raw_baseline import (
+            build_lite_eval_cells,
+            run_lite_eval_raw_baseline,
+        )
+        from speech_decoding.experiments.online_probe_dataset import N_CAP, PROBE_TASKS
+
+        print("[lite-baseline] materializing Neuroprobe-Lite eval cells ...")
+        cells = build_lite_eval_cells(xp.data, n_cap=N_CAP, tasks=PROBE_TASKS)
+        print(f"[lite-baseline] materialized {len(cells)} cells: {sorted(cells)}")
+        result = run_lite_eval_raw_baseline(
+            cells, tasks=PROBE_TASKS, max_iter=args.lite_baseline_max_iter
+        )
+        out_dir = _os.path.dirname(args.lite_baseline_out)
+        if out_dir:
+            _os.makedirs(out_dir, exist_ok=True)
+        with open(args.lite_baseline_out, "w") as f:
+            _json.dump(result, f, indent=2)
+        print(f"[lite-baseline] wrote {args.lite_baseline_out}")
+        print(f"[lite-baseline] metrics: {result['metrics']}")
         return 0
     result = xp.run()
     print(f"V14 dispatch result: {result}")
