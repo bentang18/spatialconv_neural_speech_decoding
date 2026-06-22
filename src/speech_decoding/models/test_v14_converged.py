@@ -1169,6 +1169,40 @@ def test_forward_ragged_equals_dense_static_masks() -> None:
     assert float(dense["l_m2"]) > 0.0 and float(dense["l_m4"]) > 0.0
 
 
+def test_forward_static_equals_dense() -> None:
+    # Step B: the static-shape forward (CPU-known fixed gather lengths + maskless
+    # latent) is output-identical to the dense oracle. compute_static_shapes derives
+    # the constants from the same CPU masks; passing static= routes the latent through
+    # the fixed_nv / cuDNN-nomask path. Session-homogeneous batch (emask all-True at
+    # build) ⇒ uniform counts ⇒ the uniformity guards pass.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    slow, beta, hg, pe, emask, _ = _ssl_batch(B=3, C=10, seed=4)
+    assert bool(emask.all()), "static path needs a session-homogeneous batch"
+    g = torch.Generator().manual_seed(7)
+    cfg = vc.TightPackConfig(ratio=0.25)
+    m = vc.sample_ssl_masks_static(pe, emask, g, tube_cfg=cfg)
+    shapes = vc.compute_static_shapes(
+        emask, m["m2_mask"], m["tube_mask"], cfg.p_fixed)
+    args = (slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+    with torch.no_grad():
+        static_out = model(*args, static=shapes)
+        dense = model._forward_dense(*args)
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.allclose(static_out[k], dense[k], atol=1e-5), k
+    assert float(dense["l_m2"]) > 0.0 and float(dense["l_m4"]) > 0.0
+
+    # Negative control: a wrong fixed gather length MUST change the output — proves
+    # the static branches are load-bearing (the fixed_k slices actually drive the
+    # forward), not merely incidentally output-equivalent to the legacy path.
+    import dataclasses
+    bad = dataclasses.replace(shapes, n_mask=shapes.n_mask + 1)   # s_vis−1, latent_nv↓
+    with torch.no_grad():
+        bad_out = model(*args, static=bad)
+    assert not torch.allclose(bad_out["loss"], dense["loss"], atol=1e-5)
+
+
 def test_forward_ragged_equals_dense_with_padding() -> None:
     # With padded electrodes (emask False), the ragged forward still matches the
     # dense oracle — padding is gathered away, never built into any stage.

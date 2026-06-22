@@ -55,6 +55,7 @@ from speech_decoding.models.v14_converged import (
     M4MaskConfig,
     TightPackConfig,
     V14ConvergedSSL,
+    compute_static_shapes,
     cudnn_sdpa_context,
     sample_ssl_masks,
     sample_ssl_masks_static,
@@ -174,6 +175,7 @@ class V14ConvergedBrainModule(pl.LightningModule):
         m2_cfg: M2MaskConfig = M2MaskConfig(),
         m4_cfg: M4MaskConfig = M4MaskConfig(),
         tube_cfg: TightPackConfig | None = None,
+        static_forward: bool = False,
         mask_seed: int = 0,
         wd_exclude_norms: bool = True,
         monitor_every_n_steps: int | None = None,
@@ -195,6 +197,15 @@ class V14ConvergedBrainModule(pl.LightningModule):
         # V-JEPA-2 masks (`sample_ssl_masks_static`): tight-pack tube + rand_unmask
         # → constant n_vis/N_mask per session, one compiled graph per session.
         self.tube_cfg = tube_cfg
+        # Static-shape forward (step B / V-JEPA-2): when True AND tube_cfg is set,
+        # `_step` derives the CPU-known gather lengths (StaticShapes) from the CPU
+        # masks and threads them through `model.forward` → every ragged gather slices
+        # to a fixed length (no .item()/nonzero GPU sync) and the all-real sites run
+        # maskless (cuDNN-nomask). REQUIRES the session-homogeneous batch sampler
+        # (compute_static_shapes fails loud on a heterogeneous batch). OFF ⇒ legacy
+        # variable-count ragged forward (bit-identical). Default OFF until DTAI
+        # step-D validates the compiled step-time.
+        self.static_forward = bool(static_forward)
         self._wd_exclude_norms = wd_exclude_norms
         # Heavy forward-tap monitor cadence (RankMe / coverage / input-stats — each
         # re-runs a no_grad extra forward, the post-latent RankMe tap being a DENSE
@@ -628,8 +639,18 @@ class V14ConvergedBrainModule(pl.LightningModule):
                 ppe.cpu(), emask.cpu(), self._mask_gen,
                 m2_cfg=self.m2_cfg, tube_cfg=self.tube_cfg, bands=self.model.bands,
             )
+        # Static-shape forward: derive the CPU-known gather lengths from the CPU
+        # masks (cheap CPU reductions, no GPU sync) BEFORE the device move, then pass
+        # them through so every gather slices to a fixed length. Only when the static
+        # mask regime is active (tube_cfg set) and the flag is on.
+        static = None
+        if self.static_forward and self.tube_cfg is not None:
+            static = compute_static_shapes(
+                emask.cpu().to(torch.bool), masks["m2_mask"], masks["tube_mask"],
+                self.tube_cfg.p_fixed,
+            )
         masks = {k: v.to(slow.device) for k, v in masks.items()}
-        return self._call_model(slow, beta, hg, ppe, emask, **masks)
+        return self._call_model(slow, beta, hg, ppe, emask, **masks, static=static)
 
     # ------------------------------------------------------------------- loops
     def training_step(self, batch: tp.Any, batch_idx: int) -> Tensor:

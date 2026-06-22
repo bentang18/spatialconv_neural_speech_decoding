@@ -20,7 +20,7 @@ from speech_decoding.experiments.v14_converged_module import (
     _apply_sdpa_backend,
     _sdpa_forward_context,
 )
-from speech_decoding.models.v14_converged import V14ConvergedSSL
+from speech_decoding.models.v14_converged import TightPackConfig, V14ConvergedSSL
 
 
 # --------------------------------------------------------------------- fixtures
@@ -134,6 +134,27 @@ def test_step_returns_finite_nonneg_losses() -> None:
     out = m._step(_batch().data)
     for k in ("loss", "l_m2", "l_m4"):
         assert torch.isfinite(out[k]) and float(out[k]) >= 0.0
+
+
+def test_static_forward_matches_legacy_step() -> None:
+    # Step B: with the static mask regime active (tube_cfg set), `static_forward=True`
+    # routes `_step` through the fixed-K / maskless static forward; on a session-
+    # homogeneous batch it must produce losses identical to the legacy variable-count
+    # ragged forward (same mask_seed ⇒ same masks ⇒ output-equivalent paths).
+    # One module (identical weights) toggled across the two paths, with the mask RNG
+    # reset between calls so both draw the SAME masks — isolates the forward routing.
+    m = _module(tube_cfg=TightPackConfig(ratio=0.25), static_forward=False, mask_seed=3)
+    data = _batch(B=3, C=6).data                       # all-real ⇒ homogeneous
+    with torch.no_grad():
+        m.static_forward = False
+        m._mask_gen.manual_seed(3)
+        out_leg = m._step(data)
+        m.static_forward = True
+        m._mask_gen.manual_seed(3)
+        out_stat = m._step(data)
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.allclose(out_stat[k], out_leg[k], atol=1e-5), k
+    assert float(out_leg["l_m2"]) > 0.0 and float(out_leg["l_m4"]) > 0.0
 
 
 def test_step_emits_per_band_diagnostics() -> None:

@@ -507,8 +507,21 @@ class FrontendEncoder(nn.Module):
         hg: Tensor,
         keep_elec: Tensor,
         visible: Tensor,
+        *,
+        fixed_r: int | None = None,
+        fixed_lk: int | None = None,
     ) -> Tensor:
         """Ragged frontend — **physically gather**, never process a dense set.
+
+        ``fixed_r`` / ``fixed_lk`` (V-JEPA-2 static path, step B): CPU-known kept-
+        electrode count (``B·c_real`` teacher / ``B·n_vis`` student) and kept-token
+        count (``S`` teacher / ``s_vis`` student). When given, BOTH the electrode-
+        axis selection and the token-axis gather slice to fixed lengths — no
+        ``nonzero``/``.item()`` GPU sync, static shapes — and since every selected
+        row is then genuinely real (``fixed_r == keep.sum()``, ``fixed_lk ==``
+        per-row visible count), the blocks run **maskless** and the scatter-back is
+        a plain ``scatter_``. ``None`` = legacy ``nonzero`` + key-mask (bit-identical).
+
 
         Ben's directive (2026-06-18): "Always gather only visible/un-tubed
         tokens. NEVER OVER DENSE NEVER." This is the production path; the dense
@@ -538,28 +551,40 @@ class FrontendEncoder(nn.Module):
         elec = B * C
         out = tok.new_zeros(elec, S, d)
         keep_flat = keep_elec.reshape(elec)
-        if not bool(keep_flat.any()):
+        static = fixed_r is not None
+        if not static and not bool(keep_flat.any()):
             return out.reshape(B, C, S, d)
 
-        e_idx = keep_flat.nonzero(as_tuple=False).squeeze(1)     # (R,) kept electrodes
-        R = int(e_idx.numel())
+        if static:                                               # fixed kept count
+            e_sort, _, R = _ragged_gather_idx(keep_flat.unsqueeze(0), fixed_k=fixed_r)
+            e_idx = e_sort[0]                                     # (R,) kept electrodes
+        else:
+            e_idx = keep_flat.nonzero(as_tuple=False).squeeze(1)  # (R,) kept electrodes
+            R = int(e_idx.numel())
         toks = tok.reshape(elec, S, d)[e_idx]                    # (R, 38, d)
         vis = visible.reshape(elec, S)[e_idx]                    # (R, 38) bool
 
-        t_idx, t_real, Lk = _ragged_gather_idx(vis)              # (R, Lk)
+        t_idx, t_real, Lk = _ragged_gather_idx(vis, fixed_k=fixed_lk)  # (R, Lk)
         xv = torch.gather(toks, 1, t_idx.unsqueeze(-1).expand(R, Lk, d))  # (R, Lk, d)
         slot_v = self.tokenizer.time_slot[t_idx]                 # (R, Lk)
         rope = self.key_rope[:, slot_v, :]                       # (2, R, Lk, head_dim)
+        block_mask = None if static else t_real                  # static → maskless
         for blk in self.blocks:
-            xv = blk(xv, rope, t_real)
+            xv = blk(xv, rope, block_mask)
         xv = self.ln_out(xv)                                     # (R, Lk, d)
 
-        # Scatter the genuinely-kept (real) outputs back to their (electrode,
-        # token) home; padded slots are dropped.
-        rows = torch.arange(R, device=tok.device).unsqueeze(1).expand(R, Lk)
-        e_sel = e_idx[rows][t_real]                              # (M,)
-        t_sel = t_idx[t_real]                                    # (M,)
-        out[e_sel, t_sel] = xv[t_real]
+        if static:                       # both axes all-real ⇒ sync-free scatter_
+            e_full = e_idx.unsqueeze(1).expand(R, Lk)            # (R, Lk)
+            flat_dst = (e_full * S + t_idx).reshape(R * Lk)      # into (elec·S,)
+            out.reshape(elec * S, d).scatter_(
+                0, flat_dst.unsqueeze(-1).expand(R * Lk, d), xv.reshape(R * Lk, d))
+        else:
+            # Scatter the genuinely-kept (real) outputs back to their (electrode,
+            # token) home; padded slots are dropped.
+            rows = torch.arange(R, device=tok.device).unsqueeze(1).expand(R, Lk)
+            e_sel = e_idx[rows][t_real]                          # (M,)
+            t_sel = t_idx[t_real]                                # (M,)
+            out[e_sel, t_sel] = xv[t_real]
         return out.reshape(B, C, S, d)
 
 
@@ -674,9 +699,18 @@ class LatentEncoder(nn.Module):
         feats: Tensor,
         parcel_per_electrode: Tensor,
         token_mask: Tensor,
+        *,
+        fixed_nv: int | None = None,
     ) -> Tensor:
         """Ragged latent — **physically gather** the visible-un-tubed cross-
         electrode token set, never run all-pairs over a dense padded/masked set.
+
+        ``fixed_nv`` (V-JEPA-2 static path, step B): the CPU-known visible SEE-set
+        size. When given, the gather slices to exactly ``fixed_nv`` (no ``.item()``
+        sync, static shape) and — since every row is then genuinely visible
+        (``real`` all-True) — the all-pairs SA runs **maskless** (cuDNN-nomask) and
+        the scatter-back is a plain ``scatter_`` (no boolean-index sync). ``None`` =
+        legacy pad-to-batch-max + key-mask (bit-identical to before).
 
         ``token_mask``: ``(B, C, 38)`` bool, ``True`` = a token in the student's
         SEE-set (``latent_vis = real & un-tubed & un-M2-masked``). Per sample the
@@ -695,18 +729,22 @@ class LatentEncoder(nn.Module):
         vis = token_mask.reshape(B, C * S)                        # (B, C·38)
         out = feats.new_zeros(B, C * S, d)
 
-        idx, real, Nv = _ragged_gather_idx(vis)                   # (B, Nv)
+        idx, real, Nv = _ragged_gather_idx(vis, fixed_k=fixed_nv)  # (B, Nv)
         xv = torch.gather(x, 1, idx.unsqueeze(-1).expand(B, Nv, d))  # (B, Nv, d)
         slot_full = self.time_slot.repeat(C)                      # (C·38,)
         slot_v = slot_full[idx]                                   # (B, Nv)
         rope = self.key_rope[:, slot_v, :]                        # (2, B, Nv, head_dim)
+        block_mask = None if fixed_nv is not None else real       # static → maskless
         with cudnn_sdpa_context(self._force_cudnn):
             for blk in self.blocks:
-                xv = blk(xv, rope, real)
+                xv = blk(xv, rope, block_mask)
         xv = self.ln_out(xv)                                      # (B, Nv, d)
 
-        rows = torch.arange(B, device=feats.device).unsqueeze(1).expand(B, Nv)
-        out[rows[real], idx[real]] = xv[real]
+        if fixed_nv is not None:                                  # real all-True
+            out.scatter_(1, idx.unsqueeze(-1).expand(B, Nv, d), xv)
+        else:
+            rows = torch.arange(B, device=feats.device).unsqueeze(1).expand(B, Nv)
+            out[rows[real], idx[real]] = xv[real]
         return out.reshape(B, C, S, d)
 
 
@@ -1217,8 +1255,15 @@ class V14ConvergedSSL(nn.Module):
         tube_mask: Tensor,
         tubed_parcels: Tensor,
         tubed_parcel_mask: Tensor,
+        static: "StaticShapes | None" = None,
     ) -> dict[str, Tensor]:
         """Run the one-pass two-head forward; return ``{loss, l_m2, l_m4}``.
+
+        ``static`` (step B): when given, every ragged gather slices to a CPU-known
+        fixed length (no GPU sync, one compiled graph/session) and the maskless
+        sites drop their all-True key-mask → cuDNN-nomask. ``None`` = legacy
+        pad-to-batch-max ragged (bit-identical). Converted incrementally; sites not
+        yet wired ignore ``static`` and stay on the legacy path.
 
         Shapes — ``slow (B,C,2,6,5)`` / ``beta (B,C,6,17)`` / ``hg (B,C,9,33)``;
         ``parcel_per_electrode (B,C)`` long; ``electrode_mask (B,C)`` bool real;
@@ -1242,18 +1287,25 @@ class V14ConvergedSSL(nn.Module):
         teacher_vis = electrode_mask.new_ones(m2_mask.shape)       # (B,C,38) all True
         with torch.no_grad():
             t_f = self.teacher_frontend.forward_ragged(
-                slow, beta, hg, electrode_mask, teacher_vis)       # (B,C,38,d)
+                slow, beta, hg, electrode_mask, teacher_vis,       # (B,C,38,d)
+                fixed_r=None if static is None else static.teacher_elec_k,
+                fixed_lk=None if static is None else static.s)
         t_f = t_f.detach()
 
         # ---- student: only un-tubed real electrodes, only visible tokens --------
         student_vis = ~m2_mask                                     # (B,C,38) visible
         student_keep = electrode_mask & ~tube_mask                 # drop tubed+padded
         s_f = self.student_frontend.forward_ragged(
-            slow, beta, hg, student_keep, student_vis)
+            slow, beta, hg, student_keep, student_vis,
+            fixed_r=None if static is None else static.student_elec_k,
+            fixed_lk=None if static is None else static.s_vis)
         latent_vis = (
             electrode_mask[:, :, None] & (~tube_mask)[:, :, None] & student_vis
         )                                                          # (B,C,38)
-        s_l = self.latent.forward_ragged(s_f, parcel_per_electrode, latent_vis)
+        s_l = self.latent.forward_ragged(
+            s_f, parcel_per_electrode, latent_vis,
+            fixed_nv=None if static is None else static.latent_nv,
+        )
         # Stash the taps the RankMe monitor needs — t_f is already detached; s_l
         # carries grad so detach. `latent_vis` (B,C,38) marks the rows the latent
         # actually wrote (zeros elsewhere) so the monitor ranks only real tokens.
@@ -1264,10 +1316,11 @@ class V14ConvergedSSL(nn.Module):
         }
 
         l_m2, m2_bands = self._m2_loss_ragged(
-            s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask)
+            s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask,
+            static=static)
         l_m4, m4_bands = self._m4_loss_ragged(
             s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
-            tubed_parcels, tubed_parcel_mask,
+            tubed_parcels, tubed_parcel_mask, static=static,
         )
         loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
         out = _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
@@ -1351,6 +1404,7 @@ class V14ConvergedSSL(nn.Module):
     def _m2_loss_ragged(
         self, s_f: Tensor, t_f: Tensor, m2_mask: Tensor, student_vis: Tensor,
         electrode_mask: Tensor, tube_mask: Tensor,
+        static: "StaticShapes | None" = None,
     ) -> Tensor:
         """Ragged M2 (production) — Ben 2026-06-18: "the M2 PREDICTOR only
         GATHERING ITS INDIVIDUAL ELECTRODE, PROCESSING EACH ELECTRODE ONE AT A
@@ -1370,23 +1424,32 @@ class V14ConvergedSSL(nn.Module):
         m2_flat = m2_mask.reshape(elec, S)
         vis_flat = student_vis.reshape(elec, S)
         elec_ok = (electrode_mask & ~tube_mask).reshape(elec) & m2_flat.any(dim=1)
-        if not bool(elec_ok.any()):
+        if static is None and not bool(elec_ok.any()):
             return s_f.new_zeros(()), _zero_bands(s_f, _M2_BAND_IDS, "m2")
 
-        e_idx = elec_ok.nonzero(as_tuple=False).squeeze(1)         # (R,) target elecs
-        R = int(e_idx.numel())
+        if static is not None:    # fixed target-electrode count, no nonzero sync
+            e_sort, _, R = _ragged_gather_idx(
+                elec_ok.unsqueeze(0), fixed_k=static.student_elec_k)
+            e_idx = e_sort[0]                                       # (R,) target elecs
+        else:
+            e_idx = elec_ok.nonzero(as_tuple=False).squeeze(1)     # (R,) target elecs
+            R = int(e_idx.numel())
         sf = s_f.reshape(elec, S, d)[e_idx]                        # (R, 38, d)
         tf = t_f.reshape(elec, S, d)[e_idx]                        # (R, 38, d)
 
-        c_idx, c_real, Nv = _ragged_gather_idx(vis_flat[e_idx])    # visible context
+        f_ctx = None if static is None else static.s_vis
+        f_q = None if static is None else static.n_mask
+        c_idx, c_real, Nv = _ragged_gather_idx(vis_flat[e_idx], fixed_k=f_ctx)
         ctx = torch.gather(sf, 1, c_idx.unsqueeze(-1).expand(R, Nv, d))
         ctx_slot = self.time_slot[c_idx]                           # (R, Nv)
 
-        q_idx, q_real, Mq = _ragged_gather_idx(m2_flat[e_idx])     # masked queries
+        q_idx, q_real, Mq = _ragged_gather_idx(m2_flat[e_idx], fixed_k=f_q)
         q_freq = self.freq_global_id[q_idx]                        # (R, Mq)
         q_slot = self.time_slot[q_idx]
         pred = self.m2_predictor(
-            ctx, ctx_slot, q_freq, q_slot, ctx_mask=c_real, query_mask=q_real,
+            ctx, ctx_slot, q_freq, q_slot,
+            ctx_mask=None if static is not None else c_real,       # static → maskless
+            query_mask=None if static is not None else q_real,
         )                                                          # (R, Mq, d)
         tgt = torch.gather(tf, 1, q_idx.unsqueeze(-1).expand(R, Mq, d))
         bands = _band_diagnostics(
@@ -1429,6 +1492,7 @@ class V14ConvergedSSL(nn.Module):
         self, s_l: Tensor, t_f: Tensor, parcel_per_electrode: Tensor,
         electrode_mask: Tensor, latent_vis: Tensor,
         tubed_parcels: Tensor, tubed_parcel_mask: Tensor,
+        static: "StaticShapes | None" = None,
     ) -> Tensor:
         """Ragged M4 (production) — Ben 2026-06-18: "the M4 PREDICTOR MUST GATHER
         ALL THE VISIBLE TOKENS FROM ALL ELECTRODES — NEVER DENSE — AND ONLY
@@ -1442,17 +1506,19 @@ class V14ConvergedSSL(nn.Module):
         dense context ever built. Teacher target is unchanged (electrode-MEAN of
         the tubed parcels' teacher frontend grid)."""
         B, C, S, d = s_l.shape
-        if not bool(tubed_parcel_mask.any()):
+        if static is None and not bool(tubed_parcel_mask.any()):
             return s_l.new_zeros(()), _zero_bands(s_l, _M4_BAND_IDS, "m4")
 
         vis = latent_vis.reshape(B, C * S)
-        c_idx, c_real, Nv = _ragged_gather_idx(vis)                # (B, Nv)
+        f_nv = None if static is None else static.latent_nv
+        c_idx, c_real, Nv = _ragged_gather_idx(vis, fixed_k=f_nv)  # (B, Nv)
         ctx = torch.gather(
             s_l.reshape(B, C * S, d), 1, c_idx.unsqueeze(-1).expand(B, Nv, d)
         )                                                          # (B, Nv, d)
         ctx_slot = self.time_slot.repeat(C)[c_idx]                 # (B, Nv) per-row
         pred = self.m4_predictor(
-            ctx, ctx_slot, tubed_parcels.clamp_min(0), key_mask=c_real,
+            ctx, ctx_slot, tubed_parcels.clamp_min(0),
+            key_mask=None if static is not None else c_real,       # static → maskless ctx
             query_valid=tubed_parcel_mask,
         )                                                          # (B, P, 38, d)
 
@@ -1919,6 +1985,71 @@ def sample_ssl_masks_static(
         "tubed_parcels": tubed_parcels,
         "tubed_parcel_mask": tubed_parcel_mask,
     }
+
+
+@dataclass(frozen=True)
+class StaticShapes:
+    """CPU-known gather lengths for the V-JEPA-2 static forward (step B).
+
+    Under the tight-pack tube + rand_unmask M2 + the session-homogeneous batch
+    sampler, every per-forward gather length is constant across the batch and the
+    session. Passing these as Python ints lets each ragged gather slice to a fixed
+    column count — no ``.item()``/``nonzero`` GPU sync, one compiled graph per
+    session — and, where the gather has no padding (``real`` all-True), the caller
+    drops the key-mask → cuDNN-nomask kernel. Built by :func:`compute_static_shapes`."""
+
+    b: int          # batch size
+    c: int          # padded electrode count (token-axis width)
+    c_real: int     # real electrodes (teacher encode set)
+    n_vis: int      # un-tubed real electrodes (student encode set)
+    s: int          # tokens / electrode
+    s_vis: int      # visible tokens / kept electrode (S − n_mask)
+    n_mask: int     # masked tokens / kept electrode (M2 query count)
+    p_fixed: int    # M4 query parcel pad width
+
+    @property
+    def teacher_elec_k(self) -> int:
+        return self.b * self.c_real          # frontend flattens elec = B·C
+
+    @property
+    def student_elec_k(self) -> int:
+        return self.b * self.n_vis
+
+    @property
+    def latent_nv(self) -> int:
+        return self.n_vis * self.s_vis       # visible cross-electrode SEE-set
+
+
+def compute_static_shapes(
+    electrode_mask: Tensor, m2_mask: Tensor, tube_mask: Tensor, p_fixed: int,
+) -> StaticShapes:
+    """Derive :class:`StaticShapes` from the CPU masks. Fail loud if the batch is
+    not session-homogeneous (the counts MUST be uniform across ``B`` for a static
+    shape) or if a kept electrode's ``N_mask`` varies (rand_unmask guarantees it
+    does not). Cheap CPU reductions — run on the CPU masks before the device move."""
+    B, C, S = m2_mask.shape
+    c_real_v = electrode_mask.sum(dim=1)                  # (B,)
+    n_tube_v = tube_mask.sum(dim=1)                       # (B,)
+    keep = electrode_mask & ~tube_mask                    # (B, C) student-kept
+    nmask_v = m2_mask.sum(dim=2)                          # (B, C) per electrode
+    c_real, n_tube = int(c_real_v[0]), int(n_tube_v[0])
+    if not (torch.all(c_real_v == c_real) and torch.all(n_tube_v == n_tube)):
+        raise ValueError(
+            "static forward needs a session-homogeneous batch (uniform real / "
+            f"tubed electrode counts); got real={c_real_v.tolist()} "
+            f"tubed={n_tube_v.tolist()}")
+    if not bool(keep.any()):
+        raise ValueError("static forward: no un-tubed real electrodes in the batch")
+    kept_nmask = nmask_v[keep]
+    n_mask = int(kept_nmask[0])
+    if not torch.all(kept_nmask == n_mask):
+        raise ValueError(
+            "static forward needs a constant M2 N_mask per kept electrode "
+            "(rand_unmask should guarantee this)")
+    return StaticShapes(
+        b=B, c=C, c_real=c_real, n_vis=c_real - n_tube,
+        s=S, s_vis=S - n_mask, n_mask=n_mask, p_fixed=p_fixed,
+    )
 
 
 def probe_pool(feats: Tensor, electrode_mask: Tensor | None = None) -> Tensor:
