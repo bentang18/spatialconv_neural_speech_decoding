@@ -319,6 +319,30 @@ def test_compile_flag_sets_env_var(monkeypatch) -> None:
     assert os.environ["V14_COMPILE_MODE"] == "default"
 
 
+def test_static_forward_requires_tube_ratio_and_group_by_session() -> None:
+    """``--converged-static-forward`` is fail-fast: the static forward needs the
+    tight-pack tube's constant n_vis AND a session-homogeneous batch
+    (``compute_static_shapes`` fails loud on a hetero batch). main() must reject a
+    launch missing either, BEFORE the dry-run summary — a mid-run abort is worse.
+    With both present, the same launch dry-runs clean (rc 0)."""
+    import pytest
+
+    # missing tube_ratio → SystemExit
+    with pytest.raises(SystemExit):
+        main(["--converged-static-forward", "--group-by-session",
+              "--gpus-per-node", "1", "--dry-run"])
+
+    # has tube_ratio but missing group-by-session → SystemExit
+    with pytest.raises(SystemExit):
+        main(["--converged-static-forward", "--converged-tube-ratio", "0.25",
+              "--gpus-per-node", "1", "--dry-run"])
+
+    # both present → guard passes, dry-run returns 0
+    rc = main(["--converged-static-forward", "--converged-tube-ratio", "0.25",
+               "--group-by-session", "--gpus-per-node", "1", "--dry-run"])
+    assert rc == 0
+
+
 def test_effective_compile_encoder_is_passthrough_on_every_path() -> None:
     """``_effective_compile_encoder`` honors the requested flag on EVERY path,
     including ``--in-allocation-ddp``. The old force-disable (warm-worker

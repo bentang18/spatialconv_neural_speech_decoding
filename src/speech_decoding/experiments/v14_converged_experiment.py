@@ -82,6 +82,19 @@ class V14ConvergedExperiment(V14Experiment):
     # (reports/converged_3stft_throughput_profile_2026_06_19.md). Diagnostic knob.
     monitor_every_n_steps: int | None = pydantic.Field(default=None, ge=1)
 
+    # --- static-shape SSL (V-JEPA-2 throughput regime; step A/B/C) ---------------
+    # ``tube_ratio`` set ⇒ the module samples STATIC masks (tight-pack tube +
+    # rand_unmask): n_vis = C − round(ratio·C) and N_mask per kept electrode are
+    # constant per session. None ⇒ legacy variable-count masks (`sample_ssl_masks`),
+    # byte-identical to before. ``tube_p_fixed`` pads the M4 query-parcel axis
+    # (measured BT max 17 at ratio 0.25). ``static_forward`` then routes the forward
+    # through the fixed-K / maskless / sync-free path (one compiled graph per
+    # session geometry) — REQUIRES tube_ratio set AND group_by_session (the forward
+    # fails loud on a heterogeneous batch). All three default to the legacy regime.
+    tube_ratio: float | None = pydantic.Field(default=None, gt=0.0, lt=1.0)
+    tube_p_fixed: int = pydantic.Field(default=18, ge=1)
+    static_forward: bool = False
+
     # --- online linear probe (diagnostic; spec reports/online_probe_spec_2026_06_18.md)
     # OFF by default: registering the experiment can never perturb a live run. When
     # enabled, _callbacks() builds the probe dataset IN-WORKER from (seed, manifest)
@@ -154,6 +167,7 @@ class V14ConvergedExperiment(V14Experiment):
         from speech_decoding.models.v14_converged import (
             M2MaskConfig,
             M4MaskConfig,
+            TightPackConfig,
             V14ConvergedSSL,
         )
 
@@ -180,6 +194,11 @@ class V14ConvergedExperiment(V14Experiment):
                 beta_span=self.m2_beta_span,
             ),
             m4_cfg=M4MaskConfig(parcel_mask_ratio=self.m4_parcel_mask_ratio),
+            tube_cfg=(
+                TightPackConfig(ratio=self.tube_ratio, p_fixed=self.tube_p_fixed)
+                if self.tube_ratio is not None else None
+            ),
+            static_forward=self.static_forward,
             mask_seed=self.mask_seed,
             wd_exclude_norms=self.wd_exclude_norms,
             monitor_every_n_steps=self.monitor_every_n_steps,

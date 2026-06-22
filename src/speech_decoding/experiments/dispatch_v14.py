@@ -625,6 +625,14 @@ def build_v14_experiment(
     converged_m2_beta_start_rate: float | None = None,
     converged_m2_beta_span: int | None = None,
     converged_m4_parcel_mask_ratio: float | None = None,
+    # Static-shape SSL (V-JEPA-2 throughput regime). tube_ratio set ⇒ static
+    # tight-pack tube + rand_unmask masks (constant n_vis / N_mask per session);
+    # static_forward then routes the forward through the fixed-K / maskless /
+    # sync-free path (one compiled graph per session geometry). static_forward
+    # REQUIRES tube_ratio AND group_by_session. None/False ⇒ legacy variable masks.
+    converged_tube_ratio: float | None = None,
+    converged_tube_p_fixed: int = 18,
+    converged_static_forward: bool = False,
     # Converged M4 heteroscedastic down-weight (Ben 2026-06-18). ON by default
     # (α=1.0, n_ref=11 — the B37 downweight_dof lock); --converged-m4-precision-off
     # disables it (the R-precision-off sister). α/n_ref None → the config defaults.
@@ -2043,6 +2051,14 @@ def build_v14_experiment(
                 "m2_beta_start_rate": converged_m2_beta_start_rate,
                 "m2_beta_span": converged_m2_beta_span,
                 "m4_parcel_mask_ratio": converged_m4_parcel_mask_ratio,
+                # Static tube: only forward when the caller named a ratio (None ⇒
+                # legacy variable masks, the experiment's locked default). p_fixed
+                # rides along only when the tube is active.
+                "tube_ratio": converged_tube_ratio,
+                "tube_p_fixed": (
+                    converged_tube_p_fixed
+                    if converged_tube_ratio is not None else None
+                ),
             }.items() if v is not None
         }
         # M4 precision-weight model config: the off-switch is explicit; α/n_ref
@@ -2085,6 +2101,9 @@ def build_v14_experiment(
             # Per-step mask RNG = the run seed (reproducible with the run).
             mask_seed=seed,
             **_converged_mask,
+            # Static-shape forward (fixed-K / maskless). Bool, default False =
+            # legacy ragged forward; needs tube_ratio + group_by_session when ON.
+            static_forward=converged_static_forward,
             wd_exclude_norms=wd_exclude_norms,
             # Online linear probe (diagnostic, OFF by default). seed/n_cap stay at
             # the V14ConvergedExperiment defaults (run seed feeds mask_seed above;
@@ -2604,6 +2623,22 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--converged-m4-parcel-mask-ratio",
                    dest="converged_m4_parcel_mask_ratio", type=float, default=None,
                    help="3stft: M4 whole-parcel tube ratio (default 0.20).")
+    # --- static-shape SSL (V-JEPA-2 throughput regime; steps A/B/C) --------
+    p.add_argument("--converged-tube-ratio", dest="converged_tube_ratio",
+                   type=float, default=None,
+                   help="3stft: electrode-budget tight-pack tube ratio. Set ⇒ STATIC "
+                        "masks (constant n_vis / N_mask per session). None ⇒ legacy "
+                        "variable-count masks.")
+    p.add_argument("--converged-tube-p-fixed", dest="converged_tube_p_fixed",
+                   type=int, default=18,
+                   help="3stft: M4 query-parcel pad width for the static tube "
+                        "(measured BT max 17 at ratio 0.25 → 18).")
+    p.add_argument("--converged-static-forward", dest="converged_static_forward",
+                   action="store_true",
+                   help="3stft: route the forward through the fixed-K / maskless / "
+                        "sync-free static path (one compiled graph per session "
+                        "geometry). REQUIRES --converged-tube-ratio AND "
+                        "--group-by-session.")
     # --- converged M4 heteroscedastic down-weight (Ben 2026-06-18) ---------
     p.add_argument("--converged-m4-precision-off", dest="converged_m4_precision_off",
                    action="store_true",
@@ -3774,6 +3809,9 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_m2_beta_start_rate=args.converged_m2_beta_start_rate,
         converged_m2_beta_span=args.converged_m2_beta_span,
         converged_m4_parcel_mask_ratio=args.converged_m4_parcel_mask_ratio,
+        converged_tube_ratio=args.converged_tube_ratio,
+        converged_tube_p_fixed=args.converged_tube_p_fixed,
+        converged_static_forward=args.converged_static_forward,
         converged_m4_precision_off=args.converged_m4_precision_off,
         converged_m4_precision_alpha=args.converged_m4_precision_alpha,
         converged_m4_precision_n_ref=args.converged_m4_precision_n_ref,
@@ -4249,6 +4287,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.ssl_mode == "auto":
         args.ssl_mode = "joint"
     _ssl_phase = bool(args.chain) or args.phase == 1
+    # Static-shape forward needs BOTH the static tube masks and the session-
+    # homogeneous batch sampler (compute_static_shapes fails loud on a hetero
+    # batch). Catch a misconfigured launch here rather than mid-run.
+    if args.converged_static_forward:
+        if args.converged_tube_ratio is None:
+            raise SystemExit(
+                "--converged-static-forward requires --converged-tube-ratio "
+                "(the static forward needs the tight-pack tube's constant n_vis).")
+        if not args.group_by_session:
+            raise SystemExit(
+                "--converged-static-forward requires --group-by-session (the "
+                "forward needs a session-homogeneous batch; it fails loud "
+                "otherwise).")
     if _ssl_phase and args.ssl_mode == "joint" and args.pool != "mean":
         raise SystemExit(
             "--ssl-mode joint (B37 D7) requires --pool mean (the "

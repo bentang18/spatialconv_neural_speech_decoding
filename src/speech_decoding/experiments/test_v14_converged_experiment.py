@@ -94,6 +94,29 @@ def test_build_brain_module_threads_optim_and_ema_and_masks() -> None:
     assert bm._mask_seed == 7
 
 
+def test_build_brain_module_static_tube_off_by_default() -> None:
+    # No tube_ratio ⇒ legacy variable-count masks + legacy forward (tube_cfg None,
+    # static_forward False) — the locked default, byte-identical to before.
+    xp = V14ConvergedExperiment.model_construct(
+        brain_model_config=_config(), optim=_optim(),
+    )
+    bm = xp._build_brain_module(_fake_train_loader())
+    assert bm.tube_cfg is None
+    assert bm.static_forward is False
+
+
+def test_build_brain_module_threads_static_tube() -> None:
+    # tube_ratio + static_forward reach the module as a TightPackConfig + the flag.
+    xp = V14ConvergedExperiment.model_construct(
+        brain_model_config=_config(), optim=_optim(),
+        tube_ratio=0.25, tube_p_fixed=18, static_forward=True,
+    )
+    bm = xp._build_brain_module(_fake_train_loader())
+    assert bm.tube_cfg is not None
+    assert bm.tube_cfg.ratio == 0.25 and bm.tube_cfg.p_fixed == 18
+    assert bm.static_forward is True
+
+
 def test_build_brain_module_rejects_wrong_model_type() -> None:
     """If the config resolves to a non-converged model the build must fail loud
     (guards against a dispatch mis-wire pointing at V14ParcelPerceiver)."""
