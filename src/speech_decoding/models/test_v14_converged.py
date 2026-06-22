@@ -320,8 +320,9 @@ def test_sample_ssl_masks_static_constant_shape() -> None:
     m = vc.sample_ssl_masks_static(pe, emask, g)
     assert m["m2_mask"].shape == (B, C, 30)
     assert m["tube_mask"].shape == (B, C)
-    assert m["tubed_parcels"].shape == (B, 20)                      # padded to p_fixed
-    assert m["tubed_parcel_mask"].shape == (B, 20)
+    pf = vc.TightPackConfig().p_fixed                              # 18
+    assert m["tubed_parcels"].shape == (B, pf)                     # padded to p_fixed
+    assert m["tubed_parcel_mask"].shape == (B, pf)
     n_mask = vc.m2_fixed_col_targets()
     n_mask = n_mask["beta"] * 2 + n_mask["hg"]                      # 12
     for b in range(B):
@@ -893,6 +894,30 @@ def test_m4_predictor_ragged_context_key_mask_isolates_padding() -> None:
         base = pred(ctx, ctx_slot, qp)                              # all real, no mask
         out = pred(ctx_pad, slot_pad, qp, key_mask=mask)           # 6th padded out
     assert torch.allclose(out, base, atol=1e-5)
+
+
+def test_m4_predictor_query_pad_invariant() -> None:
+    # The point of query_valid: a real parcel's prediction must NOT change when
+    # we append P_FIXED pad-parcel query slots (else the joint self-attention
+    # leaks pad "parcel-0" queries into real predictions → P_FIXED-dependent).
+    torch.manual_seed(4)
+    pred = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                          n_parcels=74).eval()
+    ctx = _ctx(1, 6)
+    ctx_slot = torch.randint(0, 16, (6,))
+    real = torch.tensor([[3, 7]])                                   # 2 real parcels
+    # pad to P=5 with arbitrary parcel ids in the dead slots; mask them off.
+    padded = torch.tensor([[3, 7, 0, 0, 0]])
+    qvalid = torch.tensor([[True, True, False, False, False]])
+    with torch.no_grad():
+        base = pred(ctx, ctx_slot, real)                           # (1, 2, 30, 32)
+        out = pred(ctx, ctx_slot, padded, query_valid=qvalid)      # (1, 5, 30, 32)
+    # real parcels' predictions are identical regardless of the 3 pad slots.
+    assert torch.allclose(out[:, :2], base, atol=1e-5)
+    # without the mask, the pad queries DO leak (guards against a silent regress).
+    with torch.no_grad():
+        leak = pred(ctx, ctx_slot, padded)                         # no query_valid
+    assert not torch.allclose(leak[:, :2], base, atol=1e-5)
 
 
 def test_m4_predictor_independent_learned_params() -> None:

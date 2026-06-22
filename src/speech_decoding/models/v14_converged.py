@@ -789,6 +789,7 @@ class M4Predictor(nn.Module):
         query_parcels: Tensor,
         *,
         key_mask: Tensor | None = None,
+        query_valid: Tensor | None = None,
     ) -> Tensor:
         """Predict each tubed parcel's teacher grid from the visible context.
 
@@ -799,9 +800,15 @@ class M4Predictor(nn.Module):
         ragged gather hands a different visible-token subset per sample, so each
         row carries its own slots (the per-row RoPE path).
         ``key_mask``: ``(B, N)`` bool, ``True`` = real context token (ragged
-        padding); ``None`` ⇒ all real. Output: ``(B, P, 38, d_model)`` predicted
-        feature per (tubed parcel, freq-time cell), to be L1'd vs the stop-grad
-        teacher ``parcel_electrode_mean`` target."""
+        padding); ``None`` ⇒ all real.
+        ``query_valid``: ``(B, P)`` bool, ``True`` = a REAL tubed parcel, ``False``
+        = a ``P_FIXED`` pad slot. Pad-parcel query tokens are masked OUT of every
+        block's keys (Ben 2026-06-22) so a real parcel's prediction is INVARIANT
+        to how many pad slots were appended — otherwise the joint self-attention
+        lets pad "parcel-0" queries leak into real predictions, making the answer
+        depend on ``P_FIXED``. ``None`` ⇒ all queries real (legacy, pre-static).
+        Output: ``(B, P, 38, d_model)`` predicted feature per (tubed parcel,
+        freq-time cell), to be L1'd vs the stop-grad teacher target."""
         B, N, _ = ctx.shape
         P = query_parcels.shape[1]
         S = self.tokens_per_electrode
@@ -818,12 +825,20 @@ class M4Predictor(nn.Module):
             slots = torch.cat([ctx_slot, qs], dim=1)                  # (B, N+P·38)
             rope = self.key_rope[:, slots, :]                         # (2, B, N+P·38, hd)
 
-        # Context tokens carry the ragged mask; query tokens are always real keys.
-        if key_mask is None:
+        # Context tokens carry the ragged mask; pad-parcel query tokens are masked
+        # out of the keys (a real parcel must not attend a P_FIXED pad query).
+        if key_mask is None and query_valid is None:
             full_mask: Tensor | None = None
         else:
-            q_ok = torch.ones(B, P * S, dtype=torch.bool, device=key_mask.device)
-            full_mask = torch.cat([key_mask, q_ok], dim=1)           # (B, N+P·38)
+            ctx_keep = (
+                key_mask if key_mask is not None
+                else torch.ones(B, N, dtype=torch.bool, device=ctx.device)
+            )
+            if query_valid is None:
+                q_keep = torch.ones(B, P * S, dtype=torch.bool, device=ctx.device)
+            else:                                                     # (B,P) → (B,P·S)
+                q_keep = query_valid[:, :, None].expand(B, P, S).reshape(B, P * S)
+            full_mask = torch.cat([ctx_keep, q_keep], dim=1)         # (B, N+P·38)
 
         # S3 (#248, bit-exact): the readout uses ONLY the query rows
         # (``tokens[:, N:]``), so the last block's context-row outputs are
@@ -1393,6 +1408,7 @@ class V14ConvergedSSL(nn.Module):
         pred = self.m4_predictor(
             ctx, ctx_slot, tubed_parcels.clamp_min(0),
             key_mask=latent_vis.reshape(B, C * S),
+            query_valid=tubed_parcel_mask,
         )                                                          # (B, P, 38, d)
 
         # teacher electrode-MEAN target over each tubed parcel (padded elec → -1)
@@ -1437,6 +1453,7 @@ class V14ConvergedSSL(nn.Module):
         ctx_slot = self.time_slot.repeat(C)[c_idx]                 # (B, Nv) per-row
         pred = self.m4_predictor(
             ctx, ctx_slot, tubed_parcels.clamp_min(0), key_mask=c_real,
+            query_valid=tubed_parcel_mask,
         )                                                          # (B, P, 38, d)
 
         # teacher electrode-MEAN target over each tubed parcel (padded elec → -1)
@@ -1784,11 +1801,13 @@ class TightPackConfig:
     water-fill the residual from the largest visible (non-target) parcels → n_vis =
     C − round(ratio·C) constant per session. At ratio 0.25 every BT parcel fits
     (no coverage gap). ``floor`` = min electrodes a visible parcel keeps (inert on
-    BT). ``p_fixed`` pads the M4 query parcel axis (BT max 17 → 20)."""
+    BT). ``p_fixed`` pads the M4 query parcel axis (measured BT max 17 at ratio
+    0.25 → 18, +1 headroom; the small wasted query rows are noise vs the
+    latent — see [[project_v14_static_shape_ssl_2026_06_22]])."""
 
     ratio: float = 0.25
     floor: int = 1
-    p_fixed: int = 20
+    p_fixed: int = 18
 
 
 def tight_pack_tube(

@@ -3472,18 +3472,34 @@ def factored_sinusoidal_pos_emb(axis_ids: Sequence[Tensor], dim: int) -> Tensor:
     return torch.cat(parts, dim=-1)                   # (B, N, dim)
 
 
-def _ragged_gather_idx(keep: Tensor) -> tuple[Tensor, Tensor, int]:
+def _ragged_gather_idx(
+    keep: Tensor, fixed_k: int | None = None
+) -> tuple[Tensor, Tensor, int]:
     """Stable per-row partition for pad-to-max ragged gathers.
 
     Packs each row's kept (``True``) positions to the front in their original
-    in-row order, padding to the per-batch-max kept count ``Lk`` (≥1). Returns
+    in-row order, padding to the kept count ``Lk`` (≥1). Returns
     ``(idx, real, Lk)``: ``idx`` (B, Lk) gathers kept-then-pad flat positions,
     ``real`` (B, Lk) is ``True`` only at genuinely-kept slots. Identical
     semantics to the inline #91/#93 token-drop partition.
-    """
+
+    ``fixed_k`` (V-JEPA-2 static-shape path, Ben 2026-06-22): slice to EXACTLY
+    this many columns instead of the data-dependent ``n_keep.max().item()``.
+    Passing the CPU-known count means the gather neither syncs the GPU (no
+    ``.item()``) nor varies its output shape — torch.compile traces ONE graph
+    per session instead of recompiling on every distinct visible-count. Must be
+    ``1 ≤ fixed_k ≤ N``. When it equals every row's exact keep count, ``real``
+    is all-True (the caller can then drop the key-mask → cuDNN nomask kernel);
+    when larger (the M4 query parcel pad to ``P_FIXED``), ``real`` marks the
+    genuine slots exactly as the legacy pad-to-max did. ``None`` = legacy
+    pad-to-per-batch-max (bit-identical to before)."""
     B, N = keep.shape
-    n_keep = keep.sum(dim=1)
-    Lk = int(n_keep.max().clamp(min=1).item())
+    if fixed_k is None:
+        Lk = int(keep.sum(dim=1).max().clamp(min=1).item())
+    else:
+        if not 1 <= fixed_k <= N:
+            raise ValueError(f"fixed_k={fixed_k} out of range [1, {N}]")
+        Lk = fixed_k
     ar = torch.arange(N, device=keep.device)
     # Kept tokens (key = original idx) sort ahead of pad tokens (key = idx + N),
     # preserving in-row order within each group.
