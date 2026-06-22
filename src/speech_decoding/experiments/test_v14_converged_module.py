@@ -796,12 +796,15 @@ def test_apply_sdpa_backend_noop_without_cuda(monkeypatch) -> None:
     _apply_sdpa_backend("cudnn")  # must not raise, must not touch backends
 
 
-def test_apply_sdpa_backend_cudnn_adds_cudnn_keeps_fallbacks(monkeypatch) -> None:
-    """'cudnn' enables the Hopper-native cuDNN attention while keeping flash +
-    mem-efficient + math on the menu as fallbacks (math always on)."""
+def test_apply_sdpa_backend_cudnn_disables_mem_efficient(monkeypatch) -> None:
+    """'cudnn' enables cuDNN + flash + math but DISABLES mem-efficient: the SDPA
+    auto-dispatcher prefers mem-efficient over cuDNN for masked attention, so
+    mem-efficient must be off for masked calls to route to the faster cuDNN
+    kernel (probe 2026-06-21: cuDNN 0.55ms vs mem-efficient 0.80ms). Flash stays
+    on for the no-mask latent time-SA and auto-excludes itself when masked."""
     seen = _capture_sdpa_toggles(monkeypatch)
     _apply_sdpa_backend("cudnn")
-    assert seen == {"math": True, "cudnn": True, "flash": True, "mem_efficient": True}
+    assert seen == {"math": True, "cudnn": True, "flash": True, "mem_efficient": False}
 
 
 def test_apply_sdpa_backend_flash_only(monkeypatch) -> None:

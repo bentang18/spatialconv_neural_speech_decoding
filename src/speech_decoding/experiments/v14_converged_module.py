@@ -102,11 +102,18 @@ def _apply_sdpa_backend(name: str | None) -> None:
     ineligible and SDPA falls to the mem-efficient CUTLASS kernel — which ships
     only an ``sm80`` build, so on Hopper (GH200) it runs the Ampere kernel via
     compat (profiled 2026-06-21: attention = ~73% of GPU time, all
-    ``fmha_cutlass*_sm80``). ``"cudnn"`` adds the Hopper-native, mask-capable
-    cuDNN attention to the menu (highest priority on sm90 in torch ≥2.7) so the
-    masked SDPA can run a real sm90 kernel; flash + mem-efficient stay enabled as
-    fallbacks for any call cuDNN declines. Math is always kept as the last-resort
-    correct fallback. The ±5%% loss tripwire is the backstop.
+    ``fmha_cutlass*_sm80``). Standalone backend probe (2026-06-21, GH200 aarch64
+    torch 2.10) on our masked shapes: cuDNN runs the bool-mask AND float-bias
+    cases at 0.55ms vs mem-efficient 0.80ms (1.45×); flash returns "no available
+    kernel" for any mask. But the auto-dispatcher prefers mem-efficient over
+    cuDNN for masked SDPA, so merely *enabling* cuDNN is a no-op — mem-efficient
+    must be DISABLED for masked calls to route to cuDNN. ``"cudnn"`` therefore
+    disables mem-efficient and keeps flash (for the no-mask latent time-SA, where
+    flash 0.41ms beats cuDNN 0.49ms; flash auto-excludes itself when a mask is
+    present, so masked calls fall to cuDNN). cuDNN handled every shape/head-dim
+    we dispatch (all hd=64; nomask/bool/float all eligible), so math (always kept)
+    never fires in practice — it is only the formal last-resort fallback. Same
+    attention math throughout; the ±5%% loss tripwire is the backstop.
     """
     key = (name or "").strip().lower()
     if not key or key == "default":
@@ -123,7 +130,7 @@ def _apply_sdpa_backend(name: str | None) -> None:
     if key == "cudnn":
         be.enable_cudnn_sdp(True)
         be.enable_flash_sdp(True)
-        be.enable_mem_efficient_sdp(True)
+        be.enable_mem_efficient_sdp(False)
     elif key == "flash":
         be.enable_cudnn_sdp(False)
         be.enable_flash_sdp(True)
