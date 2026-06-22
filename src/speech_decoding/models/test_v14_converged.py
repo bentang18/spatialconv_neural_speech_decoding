@@ -779,6 +779,52 @@ def test_latent_scoped_cudnn_is_output_identical_on_cpu(monkeypatch) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        ("cudnn", True),
+        ("cudnn_m4", True),
+        ("CuDNN_M4", True),       # case/space-insensitive read
+        ("cudnn_latent", False),  # latent-scoped force does NOT wrap M4
+        (None, False),
+        ("", False),
+        ("default", False),
+        ("flash", False),
+    ],
+)
+def test_m4_force_cudnn_reads_env(monkeypatch, backend, expected) -> None:
+    if backend is None:
+        monkeypatch.delenv("V14_SDPA_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("V14_SDPA_BACKEND", backend)
+    pred = vc.M4Predictor(d_model=16, pred_dim=16, n_heads=2, n_layers=1, n_parcels=8)
+    assert pred._force_cudnn is expected
+
+
+def test_m4_scoped_cudnn_is_output_identical_on_cpu(monkeypatch) -> None:
+    # Same as the latent test: on CPU the cuDNN force degrades to nullcontext, so
+    # a 'cudnn_m4' predictor must be bit-identical to a default one given the same
+    # weights/inputs (kernel selection only, never a math change).
+    torch.manual_seed(11)
+    monkeypatch.delenv("V14_SDPA_BACKEND", raising=False)
+    base = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                          n_parcels=74).eval()
+    monkeypatch.setenv("V14_SDPA_BACKEND", "cudnn_m4")
+    scoped = vc.M4Predictor(d_model=32, pred_dim=16, n_heads=2, n_layers=2,
+                            n_parcels=74).eval()
+    scoped.load_state_dict(base.state_dict())
+    assert base._force_cudnn is False and scoped._force_cudnn is True
+    ctx = _ctx(2, 10)
+    ctx_slot = torch.randint(0, 16, (10,))
+    qp = torch.tensor([[3, 7], [1, 5]])
+    qv = torch.tensor([[True, True], [True, False]])  # exercise the query key-mask
+    with torch.no_grad():
+        assert torch.equal(
+            base(ctx, ctx_slot, qp, query_valid=qv),
+            scoped(ctx, ctx_slot, qp, query_valid=qv),
+        )
+
+
 # ----------------------------------------------- shared token metadata helper
 def test_token_metadata_single_source_matches_tokenizer() -> None:
     # The latent and the tokenizer must agree on time_slot (one source).

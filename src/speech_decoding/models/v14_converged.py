@@ -822,6 +822,18 @@ class M4Predictor(nn.Module):
         )
         self.head = nn.Linear(pred_dim, d_model, bias=False)      # raw pred, NO LN
         self.tokens_per_electrode = int(time_slot.numel())        # 38
+        # M4 joint self-attn is the SECOND large-L elephant (~8k context tokens,
+        # ≈ the latent's cost), the other case where cuDNN's masked sm90 kernel
+        # beats the sm80 mem-efficient fallback (~2.6× bakeoff). Scope the cuDNN
+        # force to THIS predictor's block loop, read once from V14_SDPA_BACKEND:
+        # ``cudnn`` (global force) and ``cudnn_m4`` (scoped to here only, for an
+        # isolating A/B vs ``cudnn_latent``) both opt in. The M4 context is fully
+        # real/gathered (drop-not-pad, ``key_mask=None`` under static); the only
+        # key-mask left is the padded P_FIXED parcel-query, which cuDNN handles.
+        self._force_cudnn = (os.environ.get("V14_SDPA_BACKEND") or "").strip().lower() in (
+            "cudnn",
+            "cudnn_m4",
+        )
 
     def _build_queries(self, query_parcels: Tensor) -> Tensor:
         """``(B, P)`` tubed parcel ids → query tokens ``(B, P, 38, pred_dim)`` =
@@ -895,13 +907,14 @@ class M4Predictor(nn.Module):
         # rows only — SDPA over a query subset is bit-identical to the full pass
         # sliced to those rows, but skips the N context rows' SDPA-query,
         # out-projection, and FFN (the M4 predictor's largest single-layer cost).
-        for blk in self.blocks[:-1]:
-            tokens = blk(tokens, rope, full_mask)
-        last = self.blocks[-1]
-        n_q = P * S
-        attn_q = last.attn(
-            last.ln_attn(tokens), rope, key_mask=full_mask, n_query=n_q
-        )                                                            # (B, P·38, d)
+        with cudnn_sdpa_context(self._force_cudnn):
+            for blk in self.blocks[:-1]:
+                tokens = blk(tokens, rope, full_mask)
+            last = self.blocks[-1]
+            n_q = P * S
+            attn_q = last.attn(
+                last.ln_attn(tokens), rope, key_mask=full_mask, n_query=n_q
+            )                                                        # (B, P·38, d)
         xq = tokens[:, N:] + attn_q
         xq = xq + last.ffn(last.ln_ffn(xq))
         pred = self.head(xq)                                         # (B, P·38, d_model)
