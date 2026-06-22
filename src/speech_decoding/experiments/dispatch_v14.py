@@ -3125,11 +3125,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--compile-mode", dest="compile_mode", default=None,
-        choices=["default", "reduce-overhead", "max-autotune"],
+        choices=["default", "reduce-overhead", "max-autotune",
+                 "max-autotune-no-cudagraphs"],
         help="torch.compile mode (sets V14_COMPILE_MODE). Default inductor mode "
-             "if unset. NOTE: 'reduce-overhead' (CUDA graphs) is unsafe here — "
-             "DDP AccumulateGrad cross-stream comm + find_unused_parameters break "
-             "graph capture (shape-independent); use 'default'.",
+             "if unset. 'max-autotune-no-cudagraphs' adds Triton/CUTLASS GEMM "
+             "autotuning (same math, faster kernels) WITHOUT the cudagraph capture. "
+             "NOTE: 'reduce-overhead' AND plain 'max-autotune' (both CUDA graphs) "
+             "are unsafe here — DDP AccumulateGrad cross-stream comm + "
+             "find_unused_parameters + the M2/M4 data-dependent early-returns break "
+             "graph capture (shape-independent); use 'max-autotune-no-cudagraphs'.",
+    )
+    p.add_argument(
+        "--fast-backends", "--no-fast-backends", dest="fast_backends",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Enable the loss-neutral matmul/conv fast paths (sets "
+             "V14_FAST_BACKENDS): TF32 for any residual fp32 matmul "
+             "(set_float32_matmul_precision('high') + allow_tf32 on cuda+cudnn) and "
+             "cudnn.benchmark autotuning for the static-shape conv stems. Off by "
+             "default (bit-exact); on for throughput runs.",
     )
     # 2026-06-09: DEFAULT FLIPPED ON. The warm 4-GPU matrix measured dynamic ==
     # static warm (150-step submit→done 121s == 121s) — i.e. NO per-step penalty,
@@ -4174,6 +4187,24 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["V14_SDPA_BACKEND"] = args.sdpa_backend
     else:
         os.environ.pop("V14_SDPA_BACKEND", None)
+    # Loss-neutral matmul/conv fast paths. --in-allocation-ddp runs main() in EACH
+    # rank (srun launches ntasks copies), so setting the process-global torch
+    # backend state here applies on every GPU before the model/trainer is built.
+    # TF32 only touches RESIDUAL fp32 matmuls (the bf16-mixed hot path is already
+    # bf16); cudnn.benchmark autotunes the static-shape conv stems. Env-gated +
+    # default OFF so the bit-exact path is unchanged and the exca uid is untouched.
+    os.environ["V14_FAST_BACKENDS"] = "1" if args.fast_backends else "0"
+    if args.fast_backends:
+        import torch
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        print(
+            "[dispatch] --fast-backends: matmul_precision=high, cuda/cudnn "
+            "allow_tf32=True, cudnn.benchmark=True (loss-neutral fast paths).",
+            flush=True,
+        )
     # 2026-06-09 throughput levers — same front-door pattern. Set EXPLICITLY to
     # "0"/"1" (not just on-true) so a prior run's value in a long-lived warm
     # worker process never leaks into this run's data.py / experiment.py reads.

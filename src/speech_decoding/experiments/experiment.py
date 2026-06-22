@@ -457,7 +457,32 @@ class Experiment(BaseExperiment):
         # timings over a full run, or ``pytorch`` with a SHORT --ssl-max-steps
         # (e.g. 20-40) for the kernel table without a multi-GB trace.
         profiler = os.environ.get("V14_PROFILER")
-        if profiler:
+        if profiler == "pytorch":
+            # Build the kernel-table profiler explicitly so a LONG run stays usable:
+            # export_to_chrome=False (no multi-GB trace, just the cuda_time_total
+            # table) and an OPTIONAL steady-window schedule. V14_PROFILER_WAIT=N
+            # skips the first N steps (compile warmup + ramp), then warms 2 and
+            # records V14_PROFILER_ACTIVE (default 8) steps once — the table then
+            # reflects STEADY kernels only. Unset wait → profile the whole run
+            # (fine on a short --ssl-max-steps). Other profilers pass through as a
+            # plain string.
+            from lightning.pytorch.profilers import PyTorchProfiler
+
+            pt_kwargs: dict[str, object] = dict(
+                export_to_chrome=False,
+                sort_by_key="cuda_time_total",
+                row_limit=40,
+            )
+            _wait = os.environ.get("V14_PROFILER_WAIT")
+            if _wait is not None:
+                import torch.profiler as _tprof
+
+                _active = int(os.environ.get("V14_PROFILER_ACTIVE", "8"))
+                pt_kwargs["schedule"] = _tprof.schedule(
+                    wait=int(_wait), warmup=2, active=_active, repeat=1,
+                )
+            kwargs["profiler"] = PyTorchProfiler(**pt_kwargs)
+        elif profiler:
             kwargs["profiler"] = profiler
         # Throughput levers (env-gated like V14_PROFILER so they never perturb the
         # exca uid / artifact namespace; default OFF → byte-identical standard path).

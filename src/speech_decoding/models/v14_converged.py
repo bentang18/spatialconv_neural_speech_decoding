@@ -1198,10 +1198,17 @@ class V14ConvergedSSL(nn.Module):
 
     @torch.no_grad()
     def update_teacher(self, tau: float) -> None:
-        """EMA: ``teacher ← τ·teacher + (1−τ)·student`` (frontend only)."""
-        for t, s in zip(self.teacher_frontend.parameters(),
-                        self.student_frontend.parameters()):
-            t.mul_(tau).add_(s.detach(), alpha=1.0 - tau)
+        """EMA: ``teacher ← τ·teacher + (1−τ)·student`` (frontend only).
+
+        Fused via ``torch._foreach_*``: the per-parameter ``mul_``/``add_`` loop
+        launched ~2 kernels per tensor (100+ tiny kernels/step); the foreach form
+        is numerically identical (same in-place ops, same order) but launches two
+        kernels total. Frontend params are uniform fp32 → one foreach group.
+        Buffers stay a loop (few, possibly mixed dtype — int counters etc.)."""
+        t_params = list(self.teacher_frontend.parameters())
+        s_params = list(self.student_frontend.parameters())
+        torch._foreach_mul_(t_params, tau)
+        torch._foreach_add_(t_params, s_params, alpha=1.0 - tau)
         for t, s in zip(self.teacher_frontend.buffers(),
                         self.student_frontend.buffers()):
             t.copy_(s)

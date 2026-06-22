@@ -248,6 +248,34 @@ def test_profiler_env_var_attaches_lightning_profiler(monkeypatch) -> None:
     assert isinstance(base._trainer().profiler, SimpleProfiler)
 
 
+def test_pytorch_profiler_is_table_only_and_schedulable(monkeypatch) -> None:
+    """V14_PROFILER=pytorch builds a kernel-table profiler usable on a LONG run:
+    export_to_chrome OFF (no multi-GB trace, just the cuda_time_total table). With
+    V14_PROFILER_WAIT set it attaches a steady-window torch.profiler schedule
+    (skip warmup, record a few steady steps) so the table reflects steady kernels."""
+    from lightning.pytorch.profilers import PyTorchProfiler
+    from torch.profiler import ProfilerAction
+
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+
+    monkeypatch.delenv("V14_PROFILER_WAIT", raising=False)
+    monkeypatch.setenv("V14_PROFILER", "pytorch")
+    prof = base._trainer().profiler
+    assert isinstance(prof, PyTorchProfiler)
+    assert prof._export_to_chrome is False         # table only, no giant trace
+    # No window → not recording in a far-out steady step under our schedule.
+    assert prof._schedule._schedule(35) is ProfilerAction.NONE
+
+    monkeypatch.setenv("V14_PROFILER_WAIT", "30")
+    monkeypatch.setenv("V14_PROFILER_ACTIVE", "8")
+    prof2 = base._trainer().profiler
+    assert isinstance(prof2, PyTorchProfiler)
+    assert prof2._export_to_chrome is False
+    # wait=30, warmup=2, active=8 → step 35 is inside the recorded steady window.
+    assert prof2._schedule._schedule(35) is ProfilerAction.RECORD
+    assert prof2._schedule._schedule(10) is ProfilerAction.NONE   # still in wait
+
+
 def test_no_progress_bar_env_var_disables_progress_bar(monkeypatch) -> None:
     """Throughput lever (operational, env-gated → no exca uid change). The
     RichProgressBar.on_train_batch_end metric-read forces a per-step CUDA sync
