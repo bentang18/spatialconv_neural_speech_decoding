@@ -1586,21 +1586,34 @@ def _jepa_stats_on_cells(
         across scored cells (→ 0 on EMA-teacher collapse).
       * ``explained_var`` = ``1 − err / Var(target)`` (scale-free structure captured).
     ``ev``/``tv`` are ``NaN`` with < 2 scored cells (variance undefined → logger
-    skips them); ``loss`` is 0 with no scored cells. All detached — pure monitor."""
+    skips them); ``loss`` is 0 with no scored cells. All detached — pure monitor.
+
+    MASKED-REDUCTION form (no boolean indexing): masked-out cells contribute 0 to
+    every sum, so the result is identical to gather-then-reduce on the valid cells,
+    but the shapes are static (no ``nonzero``) → torch.compile-traceable. NaN/zero
+    branches are tensor ``torch.where`` (the count drives them, not a python ``if``
+    on a data-dependent shape)."""
     d = pred.shape[-1]
-    sel = cell_valid.detach().reshape(-1)
-    p = pred.detach().reshape(-1, d)[sel]
-    t = target.detach().reshape(-1, d)[sel]
-    if p.shape[0] == 0:
-        nan = pred.new_full((), float("nan"))
-        return pred.new_zeros(()), nan, nan
-    loss = (p - t).abs().mean()
-    if p.shape[0] < 2:
-        nan = pred.new_full((), float("nan"))
-        return loss, nan, nan
-    target_var = t.var(dim=0, unbiased=False).mean()
-    explained_var = 1.0 - loss / (t.var(unbiased=False) + _STATS_EPS)
-    return loss, explained_var, target_var
+    m = cell_valid.detach().reshape(-1).to(pred.dtype)         # (N,) 0/1
+    mc = m[:, None]                                            # (N,1)
+    p = pred.detach().reshape(-1, d)
+    t = target.detach().reshape(-1, d)
+    n = m.sum()                                                # scored-cell count
+    nz = n.clamp_min(1.0)
+    nd = (n * d).clamp_min(1.0)
+    loss = ((p - t).abs() * mc).sum() / nd                     # masked-L1 over cells×d
+    mean_pd = (t * mc).sum(0) / nz                             # (d,) per-dim mean
+    target_var = ((t.pow(2) * mc).sum(0) / nz - mean_pd.pow(2)).mean()
+    mean_all = (t * mc).sum() / nd                             # flat mean over cells×d
+    var_all = (t.pow(2) * mc).sum() / nd - mean_all.pow(2)
+    explained_var = 1.0 - loss / (var_all + _STATS_EPS)
+    nan = pred.new_full((), float("nan"))
+    two = n >= 2
+    return (
+        torch.where(n >= 1, loss, pred.new_zeros(())),
+        torch.where(two, explained_var, nan),
+        torch.where(two, target_var, nan),
+    )
 
 
 def _collapse_stats(
@@ -1611,19 +1624,31 @@ def _collapse_stats(
     predictor hedges to a constant; ``target_norm`` is the mean target-row L2;
     ``pred_target_var_ratio = pred_var/target_var`` (≈1 healthy, ≪1 = the
     predictor collapsing to the batch-mean target). All NaN with < 2 scored
-    cells (variance undefined → logger skips). Detached — pure monitor."""
+    cells (variance undefined → logger skips). Detached — pure monitor.
+
+    MASKED-REDUCTION form (no boolean indexing) — see :func:`_jepa_stats_on_cells`:
+    identical to gather-then-reduce on the valid cells, but static-shaped so it
+    traces under torch.compile."""
     d = pred.shape[-1]
-    sel = cell_valid.detach().reshape(-1)
-    p = pred.detach().reshape(-1, d)[sel]
-    t = target.detach().reshape(-1, d)[sel]
-    nan = pred.new_full((), float("nan"))
-    if p.shape[0] < 2:
-        return nan, (t.norm(dim=-1).mean() if p.shape[0] else nan), nan
-    pred_var = p.var(dim=0, unbiased=False).mean()
-    target_var = t.var(dim=0, unbiased=False).mean()
-    target_norm = t.norm(dim=-1).mean()
+    m = cell_valid.detach().reshape(-1).to(pred.dtype)         # (N,) 0/1
+    mc = m[:, None]
+    p = pred.detach().reshape(-1, d)
+    t = target.detach().reshape(-1, d)
+    n = m.sum()
+    nz = n.clamp_min(1.0)
+    mean_p = (p * mc).sum(0) / nz
+    pred_var = ((p.pow(2) * mc).sum(0) / nz - mean_p.pow(2)).mean()
+    mean_t = (t * mc).sum(0) / nz
+    target_var = ((t.pow(2) * mc).sum(0) / nz - mean_t.pow(2)).mean()
+    target_norm = (t.norm(dim=-1) * m).sum() / nz
     ratio = pred_var / (target_var + _STATS_EPS)
-    return pred_var, target_norm, ratio
+    nan = pred.new_full((), float("nan"))
+    two = n >= 2
+    return (
+        torch.where(two, pred_var, nan),
+        torch.where(n >= 1, target_norm, nan),
+        torch.where(two, ratio, nan),
+    )
 
 
 def _band_diagnostics(

@@ -311,6 +311,17 @@ class V14ConvergedBrainModule(pl.LightningModule):
         import torch._dynamo as _dynamo_mod
 
         _dynamo_mod.config.optimize_ddp = _optimize_ddp
+        # Per-frame recompile cap. Under the static-shape forward (step B) +
+        # `dynamic=False`, dynamo compiles ONE concrete graph per distinct session
+        # geometry — a bounded, LEGITIMATE set (~one per BT session, not a dynamism
+        # bug). The default cap (8) is below the corpus session count (~19-25
+        # distinct n_vis), so without a raise dynamo silently falls back to eager
+        # past the 8th shape. Raise to cover the corpus + margin (env-tunable).
+        # torch 2.10 renamed cache_size_limit → recompile_limit (alias); set both.
+        _cap = int(os.environ.get("V14_COMPILE_CACHE_LIMIT", "64"))
+        for _attr in ("cache_size_limit", "recompile_limit"):
+            if hasattr(_dynamo_mod.config, _attr):
+                setattr(_dynamo_mod.config, _attr, _cap)
         self._compiled_fwd["model"] = torch.compile(
             self.model, mode=_mode, dynamic=_dynamic,
         )
