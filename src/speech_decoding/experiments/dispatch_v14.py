@@ -624,6 +624,7 @@ def build_v14_experiment(
     converged_m2_hg_span: int | None = None,
     converged_m2_beta_start_rate: float | None = None,
     converged_m2_beta_span: int | None = None,
+    converged_m2_slow_freq_tubes: int | None = None,
     converged_m4_parcel_mask_ratio: float | None = None,
     # Static-shape SSL (V-JEPA-2 throughput regime). tube_ratio set ⇒ static
     # tight-pack tube + rand_unmask masks (constant n_vis / N_mask per session);
@@ -2050,6 +2051,7 @@ def build_v14_experiment(
                 "m2_hg_span": converged_m2_hg_span,
                 "m2_beta_start_rate": converged_m2_beta_start_rate,
                 "m2_beta_span": converged_m2_beta_span,
+                "m2_slow_freq_tubes": converged_m2_slow_freq_tubes,
                 "m4_parcel_mask_ratio": converged_m4_parcel_mask_ratio,
                 # Static tube: only forward when the caller named a ratio (None ⇒
                 # legacy variable masks, the experiment's locked default). p_fixed
@@ -2620,6 +2622,10 @@ def _parser() -> argparse.ArgumentParser:
                    type=int, default=None,
                    help="3stft: beta M2 freq-tube span width in time patches (default 2 "
                         "on the coarse 250 ms grid).")
+    p.add_argument("--converged-m2-slow-freq-tubes",
+                   dest="converged_m2_slow_freq_tubes", type=int, default=None,
+                   help="3stft: # of slow freq-patches held out across ALL time "
+                        "(freq-tube). 0 (default) ⇒ slow exempt; 1 of 3 ⇒ ⅓ of slow masked.")
     p.add_argument("--converged-m4-parcel-mask-ratio",
                    dest="converged_m4_parcel_mask_ratio", type=float, default=None,
                    help="3stft: M4 whole-parcel tube ratio (default 0.20).")
@@ -3823,6 +3829,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_m2_hg_span=args.converged_m2_hg_span,
         converged_m2_beta_start_rate=args.converged_m2_beta_start_rate,
         converged_m2_beta_span=args.converged_m2_beta_span,
+        converged_m2_slow_freq_tubes=args.converged_m2_slow_freq_tubes,
         converged_m4_parcel_mask_ratio=args.converged_m4_parcel_mask_ratio,
         converged_tube_ratio=args.converged_tube_ratio,
         converged_tube_p_fixed=args.converged_tube_p_fixed,

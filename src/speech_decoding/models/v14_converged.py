@@ -216,7 +216,8 @@ def token_metadata(bands: tuple[BandSpec, ...] = BANDS) -> tuple[Tensor, Tensor,
 class M2MaskConfig:
     """M2 within-electrode masking config (FE spec §8, locked starting point).
 
-    slow is EXEMPT (never masked — always-visible forward-PAC context). beta and
+    slow defaults to EXEMPT (always-visible forward-PAC context) but takes an
+    optional ``slow_freq_tubes`` freq-tube mask (Ben 2026-06-22). beta and
     HG both use the wav2vec2 span mask: ``round(start_rate · T_p)`` distinct span
     starts × ``span`` forward, overlaps allowed (merge into longer runs), beta's
     span freq-tubed (both freq-patches co-masked). beta defaults (rate 0.30,
@@ -229,6 +230,9 @@ class M2MaskConfig:
     hg_span: int = 3              # §8.4: HG span width 3 (event-scale, bleed-floor)
     beta_start_rate: float = 0.30  # 2026-06-19: 30% of beta time positions are starts (~50%)
     beta_span: int = 2            # 2026-06-19: beta span width 2 on the coarse 250 ms grid
+    slow_freq_tubes: int = 0      # 2026-06-22 (Ben): # of slow freq-patches held out
+    #                               across ALL time (freq-tube). 0 ⇒ exempt (legacy);
+    #                               1 of slow's 3 freq-patches ⇒ ⅓ of slow masked.
 
 
 def sample_m2_mask(
@@ -243,7 +247,13 @@ def sample_m2_mask(
     for b in bands:
         m = torch.zeros(b.n_freq_patches, b.n_time_patches, dtype=torch.bool)
         if b.name == "slow":
-            pass  # EXEMPT — never an M2 target
+            # Optional freq-tube: hold out cfg.slow_freq_tubes of the freq-patches
+            # (chosen at random per electrode) across ALL time. 0 ⇒ exempt (legacy
+            # forward-PAC context); 1 of 3 ⇒ ⅓ of slow becomes an M2 target.
+            n_tube = min(cfg.slow_freq_tubes, b.n_freq_patches)
+            if n_tube > 0:
+                fps = torch.randperm(b.n_freq_patches, generator=generator)[:n_tube]
+                m[fps, :] = True
         elif b.name == "beta":
             # wav2vec2 freq-tubed span mask: round(beta_start_rate·T_p) distinct
             # starts × beta_span forward, overlaps allowed, BOTH freq-patches.

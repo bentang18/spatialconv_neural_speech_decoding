@@ -69,6 +69,7 @@ class V14ConvergedExperiment(V14Experiment):
     m2_hg_span: int = pydantic.Field(default=3, ge=1)
     m2_beta_start_rate: float = pydantic.Field(default=0.30, ge=0.0, le=1.0)
     m2_beta_span: int = pydantic.Field(default=2, ge=1)
+    m2_slow_freq_tubes: int = pydantic.Field(default=0, ge=0)
     m4_parcel_mask_ratio: float = pydantic.Field(default=0.20, gt=0.0, le=1.0)
 
     # Per-step mask RNG seed (own CPU generator in the module).
@@ -192,6 +193,7 @@ class V14ConvergedExperiment(V14Experiment):
                 hg_span=self.m2_hg_span,
                 beta_start_rate=self.m2_beta_start_rate,
                 beta_span=self.m2_beta_span,
+                slow_freq_tubes=self.m2_slow_freq_tubes,
             ),
             m4_cfg=M4MaskConfig(parcel_mask_ratio=self.m4_parcel_mask_ratio),
             tube_cfg=(

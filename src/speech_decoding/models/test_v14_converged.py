@@ -142,6 +142,19 @@ def test_m2_slow_always_exempt() -> None:
         assert not m[:6].any(), f"slow masked at seed {seed} — must be exempt"
 
 
+def test_m2_slow_freq_tube() -> None:
+    # 2026-06-22 (Ben): slow_freq_tubes=1 holds out 1 of slow's 3 freq-patches
+    # across ALL time (freq-tube) = ⅓ of slow. At 1 s slow is (3 F_p, 2 T_p).
+    cfg = vc.M2MaskConfig(slow_freq_tubes=1)
+    for seed in range(25):
+        slow = vc.sample_m2_mask(_gen(seed), cfg=cfg)[:6].reshape(3, 2)  # (F_p, T_p)
+        assert slow.sum().item() == 2, "1 freq-patch × 2 time = 2 tokens (⅓ of slow)"
+        rows = slow.any(dim=1).nonzero().flatten()
+        assert rows.numel() == 1, "exactly one freq-patch masked"
+        assert slow[rows[0]].all(), "tubed across ALL time"
+    # default (0) stays exempt — covered by test_m2_slow_always_exempt.
+
+
 def test_m2_beta_freq_tube_is_50pct_both_subbands() -> None:
     # 2026-06-19: beta = round(0.30·4)=1 start × span 2, BOTH freq co-masked = 4/8 = 50%.
     for seed in range(25):
