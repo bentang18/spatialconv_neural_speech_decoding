@@ -469,6 +469,13 @@ class Experiment(BaseExperiment):
             kwargs["num_sanity_val_steps"] = 0
         if os.environ.get("V14_NO_TRAINER_CKPT") == "1":
             kwargs["enable_checkpointing"] = False
+        # V14_NO_PROGRESS_BAR=1 disables the RichProgressBar. Its on_train_batch_end
+        # hook reads the logged metrics for the live postfix, forcing a per-step
+        # CUDA sync — profiled at ~0.66 s/step on the GH200 4-GPU eff-128 step (the
+        # only non-microsecond callback). Off in a non-interactive 40k slurm run it is
+        # both a throughput lever and log-hygiene. Training math is untouched.
+        if os.environ.get("V14_NO_PROGRESS_BAR") == "1":
+            kwargs["enable_progress_bar"] = False
         # Overfit-one-batch sanity lever (env-gated, uid-transparent like the
         # toggles above). V14_OVERFIT_BATCHES=N makes Lightning reuse the SAME N
         # train batches every epoch with shuffling OFF (and reuse them for val) —

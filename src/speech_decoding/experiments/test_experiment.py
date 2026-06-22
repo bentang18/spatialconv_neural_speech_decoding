@@ -248,6 +248,20 @@ def test_profiler_env_var_attaches_lightning_profiler(monkeypatch) -> None:
     assert isinstance(base._trainer().profiler, SimpleProfiler)
 
 
+def test_no_progress_bar_env_var_disables_progress_bar(monkeypatch) -> None:
+    """Throughput lever (operational, env-gated → no exca uid change). The
+    RichProgressBar.on_train_batch_end metric-read forces a per-step CUDA sync
+    (~0.66 s/step profiled on the GH200 4-GPU eff-128 step). V14_NO_PROGRESS_BAR=1
+    sets enable_progress_bar=False; unset (default) leaves it on (byte-identical)."""
+    base = _trainer_only_xp(n_epochs=1, max_steps=None)
+
+    monkeypatch.delenv("V14_NO_PROGRESS_BAR", raising=False)
+    assert base._trainer().progress_bar_callback is not None   # default: bar on
+
+    monkeypatch.setenv("V14_NO_PROGRESS_BAR", "1")
+    assert base._trainer().progress_bar_callback is None       # bar disabled
+
+
 def test_overfit_batches_env_var_passed_to_trainer(monkeypatch) -> None:
     """Overfit-one-batch sanity lever (operational, env-gated → no exca uid
     change). V14_OVERFIT_BATCHES=N reuses the SAME N train batches every epoch;
