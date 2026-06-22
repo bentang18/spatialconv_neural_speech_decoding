@@ -3119,15 +3119,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--sdpa-backend", dest="sdpa_backend",
-        choices=["default", "cudnn", "flash", "efficient", "math"],
+        choices=["default", "cudnn", "cudnn_latent", "flash", "efficient", "math"],
         default="default",
         help="Science-neutral SDPA kernel preference (sets V14_SDPA_BACKEND, read "
              "in V14ConvergedBrainModule). The masked latent/cross attention falls "
              "to the mem-efficient CUTLASS sm80 kernel on Hopper (profiled ~73%% of "
-             "GPU time); 'cudnn' adds the Hopper-native mask-capable cuDNN attention "
-             "so masked SDPA runs an sm90 kernel. Identical math (±5%% tripwire is "
-             "the backstop); 'default' ⇒ stock selection, byte-identical, no cache "
-             "blast (env, not a uid field).",
+             "GPU time); 'cudnn' forces the Hopper-native mask-capable sm90 cuDNN "
+             "kernel around the WHOLE forward; 'cudnn_latent' scopes that force to "
+             "just the large-L cross-electrode latent blocks (where the 2.7x GPU win "
+             "is, sparing small-L calls cuDNN's ~19ms/call host plan-building). "
+             "Identical math (±5%% tripwire is the backstop); 'default' ⇒ stock "
+             "selection, byte-identical, no cache blast (env, not a uid field).",
     )
     # 2026-06-09 throughput levers — front-doors for env vars read in data.py /
     # experiment.py (env, not pydantic fields → never fork the exca uid). All
