@@ -242,6 +242,109 @@ def test_electrode_tube_mask_empty_tube() -> None:
     assert not vc.electrode_tube_mask(pe, torch.tensor([], dtype=torch.long)).any()
 
 
+# =============================== static-shape SSL masks (V-JEPA-2, 2026-06-22)
+def _synthetic_montage(c: int = 100) -> torch.Tensor:
+    # 16 parcels of varied size summing to `c` (one ≈25% to exercise the budget).
+    sizes = [3, 5, 8, 2, 10, 7, 4, 6, 9, 1, 11, 5, 3, 8, 5]
+    sizes.append(c - sum(sizes))                          # last parcel fills to c
+    assert sizes[-1] >= 1
+    pe = torch.cat([torch.full((s,), p) for p, s in enumerate(sizes)])
+    return pe
+
+
+def test_m2_fixed_targets_keep_ratio() -> None:
+    # rand_unmask targets reproduce the realized ~40% ratio at both clip lengths.
+    t1 = vc.m2_fixed_col_targets()                                   # 1 s
+    assert t1 == {"slow": 0, "beta": 2, "hg": 8}                     # 4 + 8 = 12/30
+    b5 = vc.bands_for_clip_len(5.0)
+    t5 = vc.m2_fixed_col_targets(bands=b5)
+    assert t5 == {"slow": 0, "beta": 10, "hg": 39}                   # 20 + 39 = 59/150
+
+
+def test_m2_fixed_exact_count_and_freq_tube() -> None:
+    targets = vc.m2_fixed_col_targets()
+    n_mask = targets["beta"] * 2 + targets["hg"]                     # 4 + 8 = 12 tokens
+    for seed in range(40):
+        m = vc.sample_m2_mask_fixed(_gen(seed))
+        assert m.shape == (30,)
+        assert int(m.sum()) == n_mask, "rand_unmask must hit the EXACT N_mask"
+        assert not m[:6].any(), "slow exempt"
+        beta = m[6:14].reshape(2, 4)
+        assert torch.equal(beta[0], beta[1]), "freq-tube: beta sub-bands co-masked"
+        assert int(beta.sum()) == 4 and int(m[14:30].sum()) == 8
+
+
+def test_m2_fixed_determinism_and_no_positional_bias() -> None:
+    assert torch.equal(vc.sample_m2_mask_fixed(_gen(7)),
+                       vc.sample_m2_mask_fixed(_gen(7)))
+    # HG mask frequency should be ~uniform across interior columns (no end bias).
+    freq = torch.zeros(16)
+    for s in range(4000):
+        freq += vc.sample_m2_mask_fixed(_gen(s))[14:30].float()
+    freq /= 4000
+    interior = freq[3:13]                                            # drop span edges
+    assert (interior.max() - interior.min()) / interior.mean() < 0.25
+
+
+def test_tight_pack_constant_nvis_and_whole_targets() -> None:
+    pe = _synthetic_montage(100)
+    real = torch.ones(100, dtype=torch.bool)
+    cfg = vc.TightPackConfig(ratio=0.25)
+    d_target = round(0.25 * 100)                                     # 25 dropped → n_vis 75
+    for seed in range(200):
+        tube, tubed = vc.tight_pack_tube(pe, real, _gen(seed), cfg)
+        assert int(tube.sum()) == d_target, "dropped count must hit EXACT budget"
+        # every TARGET parcel is WHOLE (no co-shaft leak: no target parcel keeps a
+        # visible electrode).
+        visible = real & ~tube
+        for p in tubed.tolist():
+            assert tube[pe == p].all(), f"target parcel {p} not whole"
+            assert not visible[pe == p].any(), f"target parcel {p} leaks a visible elec"
+        # ≥1 target, ≥1 visible parcel; floor respected on visible parcels.
+        assert tubed.numel() >= 1 and int(visible.sum()) >= 1
+        _vp, vc_cnt = pe[visible].unique(return_counts=True)
+        assert int(vc_cnt.min()) >= cfg.floor
+
+
+def test_tight_pack_single_parcel_inert() -> None:
+    pe = torch.zeros(20, dtype=torch.long)                          # 1 parcel
+    tube, tubed = vc.tight_pack_tube(pe, torch.ones(20, dtype=torch.bool), _gen(0))
+    assert tubed.numel() == 0 and not tube.any()                    # M4 inert
+
+
+def test_sample_ssl_masks_static_constant_shape() -> None:
+    B, C = 4, 100
+    pe = _synthetic_montage(C).expand(B, C).contiguous()
+    emask = torch.ones(B, C, dtype=torch.bool)
+    g = _gen(0)
+    m = vc.sample_ssl_masks_static(pe, emask, g)
+    assert m["m2_mask"].shape == (B, C, 30)
+    assert m["tube_mask"].shape == (B, C)
+    assert m["tubed_parcels"].shape == (B, 20)                      # padded to p_fixed
+    assert m["tubed_parcel_mask"].shape == (B, 20)
+    n_mask = vc.m2_fixed_col_targets()
+    n_mask = n_mask["beta"] * 2 + n_mask["hg"]                      # 12
+    for b in range(B):
+        kept = emask[b] & ~m["tube_mask"][b]
+        assert int(kept.sum()) == 75, "n_vis constant per session (C - 25%)"
+        # every kept electrode carries EXACTLY N_mask; dropped carry none.
+        per_elec = m["m2_mask"][b].sum(dim=1)
+        assert torch.equal(per_elec[kept], torch.full((75,), n_mask))
+        assert not m["m2_mask"][b][~kept].any()
+        # padded tubed-parcel rows are masked-off and zero-filled.
+        n_t = int(m["tubed_parcel_mask"][b].sum())
+        assert not m["tubed_parcel_mask"][b][n_t:].any()
+
+
+def test_sample_ssl_masks_static_p_fixed_guard() -> None:
+    # fail-loud if a montage tubes more parcels than p_fixed.
+    pe = torch.arange(40).expand(1, 40).contiguous()               # 40 singleton parcels
+    emask = torch.ones(1, 40, dtype=torch.bool)
+    with pytest.raises(ValueError, match="exceed p_fixed"):
+        vc.sample_ssl_masks_static(
+            pe, emask, _gen(0), tube_cfg=vc.TightPackConfig(ratio=0.25, p_fixed=4))
+
+
 # ====================================================== FrontendEncoder (Stage 1)
 def _rotate_at_slot(key_rope: torch.Tensor, slot: int, vec: torch.Tensor) -> torch.Tensor:
     """Rotate one head-dim vector by the encoder's RoPE at ``slot`` (T=1 gather)."""
@@ -1020,6 +1123,25 @@ def test_forward_ragged_equals_dense() -> None:
               "l_m4_slow", "l_m4_beta", "l_m4_hg"):
         assert torch.allclose(ragged[k], dense[k], atol=1e-5), k
     assert float(dense["l_m2"]) > 0.0 and float(dense["l_m4"]) > 0.0   # non-trivial
+
+
+def test_forward_ragged_equals_dense_static_masks() -> None:
+    # The static (tight-pack + rand_unmask) masks must also satisfy the ragged ==
+    # dense equivalence oracle — the forward math is mask-distribution-agnostic.
+    torch.manual_seed(0)
+    model = _ssl_model().eval()
+    slow, beta, hg, pe, emask, _ = _ssl_batch(B=3, C=10, seed=4)
+    g = torch.Generator().manual_seed(7)
+    m = vc.sample_ssl_masks_static(
+        pe, emask, g, tube_cfg=vc.TightPackConfig(ratio=0.25))
+    args = (slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
+            m["tubed_parcels"], m["tubed_parcel_mask"])
+    with torch.no_grad():
+        ragged = model(*args)
+        dense = model._forward_dense(*args)
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.allclose(ragged[k], dense[k], atol=1e-5), k
+    assert float(dense["l_m2"]) > 0.0 and float(dense["l_m4"]) > 0.0
 
 
 def test_forward_ragged_equals_dense_with_padding() -> None:

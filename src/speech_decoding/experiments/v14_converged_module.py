@@ -53,9 +53,11 @@ from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.models.v14_converged import (
     M2MaskConfig,
     M4MaskConfig,
+    TightPackConfig,
     V14ConvergedSSL,
     cudnn_sdpa_context,
     sample_ssl_masks,
+    sample_ssl_masks_static,
 )
 
 
@@ -171,6 +173,7 @@ class V14ConvergedBrainModule(pl.LightningModule):
         ema_tau: float,
         m2_cfg: M2MaskConfig = M2MaskConfig(),
         m4_cfg: M4MaskConfig = M4MaskConfig(),
+        tube_cfg: TightPackConfig | None = None,
         mask_seed: int = 0,
         wd_exclude_norms: bool = True,
         monitor_every_n_steps: int | None = None,
@@ -188,6 +191,10 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self.ema_tau = float(ema_tau)
         self.m2_cfg = m2_cfg
         self.m4_cfg = m4_cfg
+        # None ⇒ legacy variable-count masks (`sample_ssl_masks`). Set ⇒ static
+        # V-JEPA-2 masks (`sample_ssl_masks_static`): tight-pack tube + rand_unmask
+        # → constant n_vis/N_mask per session, one compiled graph per session.
+        self.tube_cfg = tube_cfg
         self._wd_exclude_norms = wd_exclude_norms
         # Heavy forward-tap monitor cadence (RankMe / coverage / input-stats — each
         # re-runs a no_grad extra forward, the post-latent RankMe tap being a DENSE
@@ -611,10 +618,16 @@ class V14ConvergedBrainModule(pl.LightningModule):
         slow, beta, hg, ppe, emask = self._converged_inputs(data)
         # Mask sampling runs on CPU (a CPU generator can't drive CUDA randperm);
         # move the masks back to the feature device for the forward.
-        masks = sample_ssl_masks(
-            ppe.cpu(), emask.cpu(), self._mask_gen,
-            m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
-        )
+        if self.tube_cfg is None:
+            masks = sample_ssl_masks(
+                ppe.cpu(), emask.cpu(), self._mask_gen,
+                m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
+            )
+        else:
+            masks = sample_ssl_masks_static(
+                ppe.cpu(), emask.cpu(), self._mask_gen,
+                m2_cfg=self.m2_cfg, tube_cfg=self.tube_cfg, bands=self.model.bands,
+            )
         masks = {k: v.to(slow.device) for k, v in masks.items()}
         return self._call_model(slow, beta, hg, ppe, emask, **masks)
 

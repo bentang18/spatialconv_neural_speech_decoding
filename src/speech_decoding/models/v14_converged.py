@@ -29,7 +29,9 @@ import contextlib
 import copy
 import os
 import typing as tp
+from collections import defaultdict
 from dataclasses import dataclass, replace
+from math import comb
 
 import torch
 from torch import Tensor, nn
@@ -1664,6 +1666,234 @@ def sample_ssl_masks(
     for b, t in enumerate(tubed_lists):
         tubed_parcels[b, : t.numel()] = t
         tubed_parcel_mask[b, : t.numel()] = True
+    return {
+        "m2_mask": m2,
+        "tube_mask": tube,
+        "tubed_parcels": tubed_parcels,
+        "tubed_parcel_mask": tubed_parcel_mask,
+    }
+
+
+# ============================ static-shape SSL masks ==========================
+# V-JEPA-2 static regime (Ben 2026-06-22): a tight-pack tube + rand_unmask M2 make
+# the visible-electrode count (n_vis) AND the per-electrode visible-token count
+# (S − N_mask) CONSTANT per session, so every forward gather is a static shape →
+# one compiled graph per distinct n_vis (~19 across the BT corpus), no within-
+# session jitter, no batch-min, no bucketing. Drop-not-pad (the masked tokens are
+# physically removed, never padded+masked), so the latent runs the fast cuDNN
+# nomask kernel (step B). The old `sample_ssl_masks` variable-count path stays the
+# default until this is proven.
+
+
+def _m2_expected_cols(allowed: int, span: int, n_starts: int, n_time: int) -> float:
+    """E[|covered time columns|] when ``n_starts`` distinct uniform span starts in
+    ``[0, allowed)`` each cover ``span`` columns forward. Exact via per-column
+    coverage probability (deterministic — no Monte-Carlo)."""
+    if n_starts <= 0:
+        return 0.0
+    total = comb(allowed, n_starts)
+    e = 0.0
+    for p in range(n_time):
+        lo = max(0, p - span + 1)
+        hi = min(allowed - 1, p)
+        w = hi - lo + 1 if hi >= lo else 0           # starts that cover column p
+        if w <= 0:
+            continue
+        uncov = comb(allowed - w, n_starts) / total if allowed - w >= n_starts else 0.0
+        e += 1.0 - uncov
+    return e
+
+
+def m2_fixed_col_targets(
+    bands: tuple[BandSpec, ...] = BANDS, cfg: M2MaskConfig = M2MaskConfig(),
+) -> dict[str, int]:
+    """Per-band rand_unmask target = ``round(E[covered columns])`` under the
+    current span sampler, so the fixed-count mask keeps the realized ~40% ratio
+    (1 s: beta 2 / HG 8 cols → 12/30 tok; 5 s: beta 10 / HG 39 → 59/150). slow
+    is exempt (0)."""
+    targets: dict[str, int] = {}
+    for b in bands:
+        if b.name == "slow":
+            targets[b.name] = 0
+            continue
+        rate = cfg.beta_start_rate if b.name == "beta" else cfg.hg_start_rate
+        span = cfg.beta_span if b.name == "beta" else cfg.hg_span
+        allowed = b.n_time_patches - span + 1
+        n_starts = min(round(rate * b.n_time_patches), allowed)
+        targets[b.name] = round(
+            _m2_expected_cols(allowed, span, n_starts, b.n_time_patches))
+    return targets
+
+
+def _rand_unmask_columns(
+    allowed: int, span: int, n_starts: int, n_time: int, target: int,
+    generator: torch.Generator,
+) -> Tensor:
+    """Sample the span mask, then randomly unmask (overflow) or add (underflow) to
+    EXACTLY ``target`` covered columns. Exact count, no positional bias (the
+    overflow/deficit columns are chosen with uniform random identity)."""
+    cols = torch.zeros(n_time, dtype=torch.bool)
+    if n_starts > 0:
+        starts = torch.randperm(allowed, generator=generator)[:n_starts]
+        for s in starts.tolist():
+            cols[s : s + span] = True
+    cur = int(cols.sum())
+    if cur > target:
+        on = cols.nonzero(as_tuple=False).flatten()
+        drop = on[torch.randperm(on.numel(), generator=generator)[: cur - target]]
+        cols[drop] = False
+    elif cur < target:
+        off = (~cols).nonzero(as_tuple=False).flatten()
+        add = off[torch.randperm(off.numel(), generator=generator)[: target - cur]]
+        cols[add] = True
+    return cols
+
+
+def sample_m2_mask_fixed(
+    generator: torch.Generator,
+    bands: tuple[BandSpec, ...] = BANDS,
+    cfg: M2MaskConfig = M2MaskConfig(),
+    targets: dict[str, int] | None = None,
+) -> Tensor:
+    """rand_unmask M2: like :func:`sample_m2_mask` but every band hits an EXACT
+    column count (``targets``) → constant ``N_mask`` per electrode (static maskless
+    frontend shape). beta/HG mask whole time-columns (freq-tube preserved — both
+    freq patches co-masked); slow exempt. Returns ``(N_TOKENS,)`` bool in tokenizer
+    order; ``True`` = M2 target."""
+    if targets is None:
+        targets = m2_fixed_col_targets(bands, cfg)
+    parts: list[Tensor] = []
+    for b in bands:
+        m = torch.zeros(b.n_freq_patches, b.n_time_patches, dtype=torch.bool)
+        if b.name != "slow":
+            span = cfg.beta_span if b.name == "beta" else cfg.hg_span
+            rate = cfg.beta_start_rate if b.name == "beta" else cfg.hg_start_rate
+            allowed = b.n_time_patches - span + 1
+            n_starts = min(round(rate * b.n_time_patches), allowed)
+            cols = _rand_unmask_columns(
+                allowed, span, n_starts, b.n_time_patches, targets[b.name], generator)
+            m[:, cols] = True                        # freq-tube: all freq patches
+        parts.append(m.reshape(-1))
+    return torch.cat(parts)
+
+
+@dataclass(frozen=True)
+class TightPackConfig:
+    """Static-shape M4 tube (Ben 2026-06-22). ``ratio`` of the real electrodes are
+    dropped, hit EXACTLY: first-fit tight-pack whole parcels to ``≤`` budget then
+    water-fill the residual from the largest visible (non-target) parcels → n_vis =
+    C − round(ratio·C) constant per session. At ratio 0.25 every BT parcel fits
+    (no coverage gap). ``floor`` = min electrodes a visible parcel keeps (inert on
+    BT). ``p_fixed`` pads the M4 query parcel axis (BT max 17 → 20)."""
+
+    ratio: float = 0.25
+    floor: int = 1
+    p_fixed: int = 20
+
+
+def tight_pack_tube(
+    parcel_per_electrode: Tensor, real: Tensor, generator: torch.Generator,
+    cfg: TightPackConfig = TightPackConfig(),
+) -> tuple[Tensor, Tensor]:
+    """One clip's tube. Returns ``(tube_mask (C,), tubed_parcels (P,))``:
+    ``tube_mask`` = electrodes DROPPED from the student (whole tubed parcels ∪
+    water-fill residual); ``tubed_parcels`` = the WHOLE tubed parcel ids (M4
+    targets only — residual-trimmed electrodes are NOT here).
+
+    INVARIANT (shortcut-resistance): every tubed parcel is whole, and the residual
+    drops come only from VISIBLE (non-target) parcels — so no parcel ever has both
+    a target and a visible electrode (no co-shaft leak). Guards: ≥1 parcel tubed
+    (M4 needs a target) and ≥1 parcel visible (M4 needs context); a <2-parcel clip
+    tubes nothing (M4 inert)."""
+    C = parcel_per_electrode.shape[0]
+    tube = torch.zeros(C, dtype=torch.bool)
+    ridx = real.nonzero(as_tuple=False).flatten()
+    n_real = int(ridx.numel())
+    if n_real == 0:
+        return tube, parcel_per_electrode.new_zeros(0)
+    pe = parcel_per_electrode[ridx]
+    parcels, sizes = pe.unique(return_counts=True)
+    nP = int(parcels.numel())
+    if nP < 2:
+        return tube, parcel_per_electrode.new_zeros(0)        # M4 inert
+    D_target = round(cfg.ratio * n_real)
+    size_of = {int(parcels[i]): int(sizes[i]) for i in range(nP)}
+    order = torch.randperm(nP, generator=generator).tolist()
+    tubed: list[int] = []
+    cum = 0
+    for oi in order:                                          # first-fit, skip non-fitters
+        p = int(parcels[oi])
+        if cum + size_of[p] <= D_target:
+            tubed.append(p)
+            cum += size_of[p]
+    if not tubed:                                             # budget < smallest parcel
+        sp = int(parcels[int(torch.argmin(sizes))])
+        tubed = [sp]
+        cum = size_of[sp]
+    if len(tubed) == nP:                                      # never empty-visible
+        cum -= size_of[tubed.pop()]
+    tubed_t = torch.tensor(sorted(tubed), dtype=parcel_per_electrode.dtype)
+    in_tube = torch.isin(pe, tubed_t)                         # over real electrodes
+    tube[ridx[in_tube]] = True
+    # water-fill the residual to EXACTLY D_target dropped, from the largest visible
+    # parcels, random electrode identity, never below floor.
+    residual = D_target - cum
+    if residual > 0:
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for j in (~in_tube).nonzero(as_tuple=False).flatten().tolist():
+            buckets[int(pe[j])].append(int(ridx[j]))
+        for p in buckets:
+            perm = torch.randperm(len(buckets[p]), generator=generator).tolist()
+            buckets[p] = [buckets[p][k] for k in perm]        # random identity
+        for _ in range(residual):
+            maxn = max((len(lst) for lst in buckets.values()), default=0)
+            if maxn <= cfg.floor:
+                break                                         # floor blocks (inert on BT)
+            cand = [p for p, lst in buckets.items() if len(lst) == maxn]
+            p = cand[int(torch.randint(len(cand), (1,), generator=generator))]
+            tube[buckets[p].pop()] = True
+    return tube, tubed_t
+
+
+def sample_ssl_masks_static(
+    parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    generator: torch.Generator,
+    *,
+    m2_cfg: M2MaskConfig = M2MaskConfig(),
+    tube_cfg: TightPackConfig = TightPackConfig(),
+    bands: tuple[BandSpec, ...] = BANDS,
+) -> dict[str, Tensor]:
+    """Static-shape variant of :func:`sample_ssl_masks` (V-JEPA-2 regime). Same
+    return keys, but (1) the tube is tight-pack → ``n_vis = C − round(ratio·C)``
+    constant per session; (2) M2 is rand_unmask → constant ``N_mask`` per kept
+    electrode; (3) ``tubed_parcels`` padded to a FIXED ``p_fixed`` (not batch-max).
+    Those constants make every forward gather a static shape (step B). ``tube_mask``
+    = dropped-from-student (whole tubed ∪ residual); ``tubed_parcels`` = whole M4
+    targets only."""
+    B, C = parcel_per_electrode.shape
+    S = sum(b.n_tokens for b in bands)
+    targets = m2_fixed_col_targets(bands, m2_cfg)
+    P = tube_cfg.p_fixed
+    m2 = torch.zeros(B, C, S, dtype=torch.bool)
+    tube = torch.zeros(B, C, dtype=torch.bool)
+    tubed_parcels = torch.zeros(B, P, dtype=torch.long)
+    tubed_parcel_mask = torch.zeros(B, P, dtype=torch.bool)
+    for b in range(B):
+        real = electrode_mask[b]
+        tb, tparc = tight_pack_tube(parcel_per_electrode[b], real, generator, tube_cfg)
+        n_t = int(tparc.numel())
+        if n_t > P:
+            raise ValueError(
+                f"tubed parcels {n_t} exceed p_fixed {P}; raise TightPackConfig."
+                f"p_fixed (BT max measured 17 at ratio {tube_cfg.ratio})")
+        tube[b] = tb
+        tubed_parcels[b, :n_t] = tparc
+        tubed_parcel_mask[b, :n_t] = True
+        keep = real & ~tb
+        for e in range(C):
+            if bool(keep[e]):
+                m2[b, e] = sample_m2_mask_fixed(generator, bands, m2_cfg, targets)
     return {
         "m2_mask": m2,
         "tube_mask": tube,
