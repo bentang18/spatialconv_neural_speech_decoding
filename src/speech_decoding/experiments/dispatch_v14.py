@@ -3125,15 +3125,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--compile-mode", dest="compile_mode", default=None,
-        choices=["default", "reduce-overhead", "max-autotune",
-                 "max-autotune-no-cudagraphs"],
+        choices=["default", "max-autotune-no-cudagraphs"],
         help="torch.compile mode (sets V14_COMPILE_MODE). Default inductor mode "
              "if unset. 'max-autotune-no-cudagraphs' adds Triton/CUTLASS GEMM "
-             "autotuning (same math, faster kernels) WITHOUT the cudagraph capture. "
-             "NOTE: 'reduce-overhead' AND plain 'max-autotune' (both CUDA graphs) "
-             "are unsafe here — DDP AccumulateGrad cross-stream comm + "
+             "autotuning (same math, faster kernels) WITHOUT cudagraph capture. "
+             "The cudagraph modes ('reduce-overhead', plain 'max-autotune') are "
+             "deliberately NOT offered: DDP AccumulateGrad cross-stream comm + "
              "find_unused_parameters + the M2/M4 data-dependent early-returns break "
-             "graph capture (shape-independent); use 'max-autotune-no-cudagraphs'.",
+             "graph capture (shape-independent), so they would crash or corrupt "
+             "grads here.",
     )
     p.add_argument(
         "--fast-backends", "--no-fast-backends", dest="fast_backends",
@@ -3214,12 +3214,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ddp-static-graph", dest="ddp_static_graph",
         action="store_true", default=False,
-        help="Swap the find-unused DDP strategy for static_graph (sets "
-             "V14_DDP_STATIC_GRAPH=1). Valid when the unused-param set is static "
-             "across steps (P1: pool/encoder/encoder_ln/parcel_embed never "
-             "participate). DDP skips the per-backward graph traversal and "
-             "overlaps gradient all-reduce. FLOPs/numerics-neutral; loss tripwire "
-             "is the guard.",
+        help="Despite the legacy name, this sets find_unused_parameters=False "
+             "ONLY — it does NOT set torch static_graph (that was retired to a "
+             "no-op: the ragged front-end varies the autograd graph step-to-step, "
+             "tripping expect_autograd_hooks_). Sets V14_DDP_STATIC_GRAPH=1. Valid "
+             "when the unused-param set is empty/static across steps (P1: "
+             "pool/encoder/encoder_ln/parcel_embed never participate); DDP then "
+             "skips the per-backward graph traversal. FLOPs/numerics-neutral; loss "
+             "tripwire is the guard.",
     )
     p.add_argument(
         "--p1-freeze-parcel", dest="p1_freeze_parcel",
@@ -4109,28 +4111,6 @@ def _build_v14_chain(args) -> list[Experiment]:
     return [p1, p2, p3a, p3b, p4]
 
 
-def _effective_compile_encoder(in_allocation_ddp: bool, compile_encoder: bool) -> bool:
-    """Resolve the effective ``torch.compile`` flag — now a pass-through.
-
-    HISTORY: compile used to be force-disabled on the ``--in-allocation-ddp``
-    path. That path runs the experiment IN-PROCESS (``cluster=None``) and exca
-    pickles the live job graph, but the compiled forward carried
-    ``torch._dynamo`` guard weakrefs that cloudpickle cannot serialize, so the
-    job-pickle died with ``TypeError: cannot pickle 'weakref.ReferenceType'``
-    (observed 2026-06-10, warm-worker nano). FIXED 2026-06-21:
-    ``V14ConvergedBrainModule.__getstate__`` drops the OptimizedModule from the
-    pickled state and ``_call_model`` rebuilds it lazily on the first forward,
-    so a compiled module is cloudpickle-safe on every path. The force-disable is
-    obsolete: honor the requested flag. The warm-worker nano runs still pass an
-    explicit ``--no-compile`` (compile never amortizes its trace tax on a short
-    run), so this change only affects a caller that explicitly asks for compile
-    on the in-allocation path — i.e. the 4-GPU DeltaAI production run, which
-    needs it for the per-step win (~6x dense, 1.80->0.30 s/step on the cluster
-    path that already compiled).
-    """
-    return compile_encoder
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     # --cache-band is a cache-build-only lever (it swaps the electrode_tokens
@@ -4155,23 +4135,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.m4_predictor_depth is None:
         args.m4_predictor_depth = max(1, args.latent_depth // 2)
     # speedup-fanout C1: --compile/--no-compile is a front-door for the
-    # V14_COMPILE env var that V14JointBrainModule reads at construction. Set it
-    # here (before exca submits) so submitit captures it into the slurm job env.
-    # 2026-06-09: default ON. Set EXPLICITLY to "0"/"1" (like the throughput
-    # levers below) so --no-compile is authoritative and a prior run's value in a
-    # long-lived warm worker process can never leak into this run's read.
-    _requested_compile = args.compile_encoder
-    args.compile_encoder = _effective_compile_encoder(
-        args.in_allocation_ddp, args.compile_encoder
-    )
-    if _requested_compile and not args.compile_encoder:
-        print(
-            "[dispatch] --in-allocation-ddp: forcing --no-compile — torch.compile's "
-            "dynamo weakrefs break exca's in-process job-pickle on this path, and "
-            "compile does not amortize on nano runs anyway. Use --cluster slurm to "
-            "get compile on a full run.",
-            flush=True,
-        )
+    # V14_COMPILE env var the brain module reads at construction. Set it here
+    # (before exca submits) so submitit captures it into the slurm job env. Set
+    # EXPLICITLY to "0"/"1" so --no-compile is authoritative and a prior run's
+    # value in a long-lived warm worker can never leak into this run's read. The
+    # old --in-allocation-ddp force-disable was removed 2026-06-21 (compile is now
+    # cloudpickle-safe via the module __getstate__), so the requested flag is
+    # honored verbatim — the 4-GPU in-allocation run trains WITH compile on.
     os.environ["V14_COMPILE"] = "1" if args.compile_encoder else "0"
     if args.compile_mode:
         os.environ["V14_COMPILE_MODE"] = args.compile_mode

@@ -343,22 +343,6 @@ def test_static_forward_requires_tube_ratio_and_group_by_session() -> None:
     assert rc == 0
 
 
-def test_effective_compile_encoder_is_passthrough_on_every_path() -> None:
-    """``_effective_compile_encoder`` honors the requested flag on EVERY path,
-    including ``--in-allocation-ddp``. The old force-disable (warm-worker
-    exca-pickle crash on the compiled forward's ``torch._dynamo`` weakrefs) is
-    obsolete: ``V14ConvergedBrainModule.__getstate__`` now drops the
-    OptimizedModule from the pickled state and ``_call_model`` rebuilds it lazily,
-    so a compiled module is cloudpickle-safe on the in-allocation path too — the
-    4-GPU DeltaAI production run needs compile there."""
-    from speech_decoding.experiments.dispatch_v14 import _effective_compile_encoder
-
-    assert _effective_compile_encoder(in_allocation_ddp=True, compile_encoder=True) is True
-    assert _effective_compile_encoder(in_allocation_ddp=True, compile_encoder=False) is False
-    assert _effective_compile_encoder(in_allocation_ddp=False, compile_encoder=True) is True
-    assert _effective_compile_encoder(in_allocation_ddp=False, compile_encoder=False) is False
-
-
 def test_in_allocation_ddp_honors_compile(monkeypatch, capsys) -> None:
     """End-to-end: ``--in-allocation-ddp --compile`` now writes ``V14_COMPILE=="1"``
     (the __getstate__ pickle fix makes a compiled module DDP-safe), and does NOT

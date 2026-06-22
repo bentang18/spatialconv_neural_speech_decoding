@@ -639,15 +639,20 @@ class V14ConvergedBrainModule(pl.LightningModule):
         diagnostics `l_m2_{beta,hg}` / `l_m4_{slow,beta,hg}`."""
         slow, beta, hg, ppe, emask = self._converged_inputs(data)
         # Mask sampling runs on CPU (a CPU generator can't drive CUDA randperm);
-        # move the masks back to the feature device for the forward.
+        # move the masks back to the feature device for the forward. Copy ppe/emask
+        # to host ONCE and reuse for both mask sampling and the static-shape
+        # reduction below — same tensor + same CPU generator ⇒ bit-identical masks,
+        # one fewer D2H copy than the old per-call ``.cpu()`` form.
+        ppe_cpu = ppe.cpu()
+        emask_cpu = emask.cpu()
         if self.tube_cfg is None:
             masks = sample_ssl_masks(
-                ppe.cpu(), emask.cpu(), self._mask_gen,
+                ppe_cpu, emask_cpu, self._mask_gen,
                 m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
             )
         else:
             masks = sample_ssl_masks_static(
-                ppe.cpu(), emask.cpu(), self._mask_gen,
+                ppe_cpu, emask_cpu, self._mask_gen,
                 m2_cfg=self.m2_cfg, tube_cfg=self.tube_cfg, bands=self.model.bands,
             )
         # Static-shape forward: derive the CPU-known gather lengths from the CPU
@@ -657,7 +662,7 @@ class V14ConvergedBrainModule(pl.LightningModule):
         static = None
         if self.static_forward and self.tube_cfg is not None:
             static = compute_static_shapes(
-                emask.cpu().to(torch.bool), masks["m2_mask"], masks["tube_mask"],
+                emask_cpu.to(torch.bool), masks["m2_mask"], masks["tube_mask"],
                 self.tube_cfg.p_fixed,
             )
         masks = {k: v.to(slow.device) for k, v in masks.items()}
@@ -690,8 +695,20 @@ class V14ConvergedBrainModule(pl.LightningModule):
         per band {slow,beta,hg}), and the per-band stem-output norms. Non-finite
         scalars are skipped — ev/tv are NaN when a band has < 2 scored cells this
         step, and an undefined-variance step must not poison the epoch mean."""
-        for key, val in out.items():
-            if val.dim() != 0 or not bool(torch.isfinite(val)):
+        # Collapse the per-scalar ``bool(torch.isfinite(val))`` D2H syncs (one per
+        # logged scalar, ~10-30/step) into ONE: stack the 0-d scalars and read the
+        # finite mask in a single host transfer. ``.float()`` guards against a
+        # mixed-dtype stack; the ORIGINAL ``val`` is still what gets logged. Skip
+        # semantics are unchanged — a non-finite (e.g. <2-cell band variance) scalar
+        # is dropped so it can't poison the epoch mean.
+        scalars = [(k, v) for k, v in out.items() if v.dim() == 0]
+        if not scalars:
+            return
+        finite = torch.isfinite(
+            torch.stack([v.float() for _, v in scalars])
+        ).tolist()
+        for (key, val), ok in zip(scalars, finite):
+            if not ok:
                 continue
             metric = _LOSS_ALIASES.get(key, key)
             self.log(
