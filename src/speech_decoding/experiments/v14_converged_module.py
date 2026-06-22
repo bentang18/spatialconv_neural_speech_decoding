@@ -39,7 +39,6 @@ import typing as tp
 import torch
 from lightning import pytorch as pl
 from torch import Tensor, nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from neuraltrain.optimizers import BaseOptimizer
 
@@ -55,6 +54,7 @@ from speech_decoding.models.v14_converged import (
     M2MaskConfig,
     M4MaskConfig,
     V14ConvergedSSL,
+    cudnn_sdpa_context,
     sample_ssl_masks,
 )
 
@@ -94,37 +94,25 @@ _LOSS_ALIASES: dict[str, str] = {
 }
 
 
-# cuDNN-first priority for the masked attention. EFFICIENT is the graceful
-# fallback for any call cuDNN's runtime declines, so a declined call lands on
-# the sm80 mem-efficient CUTLASS kernel — NOT on MATH, whose dense (B,H,L,L)
-# score matrix OOMs at the latent's L (52.75 GiB at L≈10.5k). MATH stays last as
-# the formal correctness floor. Used via ``_sdpa_forward_context`` (a context
-# manager wrapping the forward), NOT the process-global enable flags: PyTorch's
-# auto-dispatcher rejects cuDNN for the masked+grad latent call and falls to the
-# sm80 mem-efficient kernel even with cuDNN globally enabled, so cuDNN must be
-# *forced* per-call with ``set_priority``.
-_CUDNN_SDPA_PRIORITY = [
-    SDPBackend.CUDNN_ATTENTION,
-    SDPBackend.EFFICIENT_ATTENTION,
-    SDPBackend.MATH,
-]
-
-
 def _sdpa_forward_context(name: str | None) -> tp.ContextManager[None]:
     """Context manager that selects the SDPA kernel for the wrapped forward.
 
-    ``"cudnn"`` forces the cuDNN-first priority list (``set_priority=True``):
-    masked attention runs the Hopper-native sm90 cuDNN kernel (probe 2026-06-21,
-    GH200: latent masked fwd+bwd 5.51ms vs mem-efficient sm80 14.94ms — 2.7×),
-    with mem-efficient as the graceful fallback for any call cuDNN declines.
-    Backward inherits the forward's chosen kernel, so wrapping only the forward
-    suffices. All other names / unset ⇒ ``nullcontext`` (the process-global flags
-    set by ``_apply_sdpa_backend`` govern). Identical attention math throughout.
+    ``"cudnn"`` forces the cuDNN-first priority list (``set_priority=True``)
+    around the WHOLE model forward: masked attention runs the Hopper-native sm90
+    cuDNN kernel (probe 2026-06-21, GH200: latent masked fwd+bwd 5.51ms vs
+    mem-efficient sm80 14.94ms — 2.7×), with mem-efficient as the graceful
+    fallback for any call cuDNN declines (NOT math, which OOMs at the latent's
+    L). Backward inherits the forward's chosen kernel, so wrapping only the
+    forward suffices. ``"cudnn_latent"`` returns ``nullcontext`` here — the
+    cuDNN force is instead scoped INSIDE ``LatentEncoder`` to just the large-L
+    cross-electrode block loops (the small-L frontend / predictor / time-SA
+    calls then keep the cheaper default dispatcher, avoiding cuDNN's
+    ~19 ms/call host plan-building where its GPU win is marginal). All other
+    names / unset ⇒ ``nullcontext`` (the process-global flags set by
+    ``_apply_sdpa_backend`` govern). Identical attention math throughout.
     """
     key = (name or "").strip().lower()
-    if key == "cudnn" and torch.cuda.is_available():
-        return sdpa_kernel(_CUDNN_SDPA_PRIORITY, set_priority=True)
-    return contextlib.nullcontext()
+    return cudnn_sdpa_context(key == "cudnn")
 
 
 def _apply_sdpa_backend(name: str | None) -> None:
@@ -132,20 +120,22 @@ def _apply_sdpa_backend(name: str | None) -> None:
     idempotent). Identical attention math — only swaps which fused kernel
     ``F.scaled_dot_product_attention`` dispatches to. Unset/``"default"`` ⇒ no-op.
 
-    ``"cudnn"`` is handled entirely by ``_sdpa_forward_context`` (forcing cuDNN
-    per-call beats the auto-dispatcher, which rejects cuDNN for the masked+grad
-    latent call) and is a NO-OP here — it must not touch the global flags
-    (disabling mem-efficient globally sends cuDNN-declined calls to MATH → OOM at
-    the latent's L). ``"flash"``/``"efficient"``/``"math"`` set the process-global
-    enable flags directly — diagnostic single-backend forcing for probe runs.
+    ``"cudnn"`` (global force, whole forward) and ``"cudnn_latent"`` (force
+    scoped inside ``LatentEncoder`` to the large-L cross-electrode blocks) are
+    both handled per-call by the cuDNN context (forcing cuDNN beats the
+    auto-dispatcher, which rejects cuDNN for the masked+grad latent call) and are
+    NO-OPs here — they must not touch the global flags (disabling mem-efficient
+    globally sends cuDNN-declined calls to MATH → OOM at the latent's L).
+    ``"flash"``/``"efficient"``/``"math"`` set the process-global enable flags
+    directly — diagnostic single-backend forcing for probe runs.
     """
     key = (name or "").strip().lower()
-    if not key or key in ("default", "cudnn"):
+    if not key or key in ("default", "cudnn", "cudnn_latent"):
         return
     if key not in ("flash", "efficient", "math"):
         raise ValueError(
             f"unknown V14_SDPA_BACKEND={name!r} "
-            "(expected one of: default, cudnn, flash, efficient, math)"
+            "(expected one of: default, cudnn, cudnn_latent, flash, efficient, math)"
         )
     if not torch.cuda.is_available():
         return

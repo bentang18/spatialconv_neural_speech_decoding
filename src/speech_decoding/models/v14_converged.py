@@ -25,11 +25,15 @@ clock in units of the HG stride (128 samples = 62.5 ms, the FE §1 reference gri
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import os
+import typing as tp
 from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from speech_decoding.models.v14_encoder import (
     _JointTokenBlock,
@@ -42,6 +46,37 @@ from speech_decoding.models.v14_encoder import (
 
 # Reference sample rate (FE spec §1: 1 s clip @ 2048 Hz).
 FS_HZ: int = 2048
+
+# Canonical SDPA kernel priority for the masked cross-electrode latent (the
+# large-L O(Nv²) all-pairs elephant). On sm90 (Hopper / GH200, aarch64,
+# torch-2.10) flash declines ANY mask, so the auto-dispatcher falls to the sm80
+# mem-efficient (CUTLASS) kernel for the masked+grad latent call even with cuDNN
+# globally enabled. Forcing this priority with ``set_priority=True`` runs the
+# Hopper-native sm90 cuDNN kernel instead (~2.7× the mem-efficient one on the
+# latent's shapes; probe 2026-06-21). EFFICIENT is the graceful fallback for any
+# call cuDNN declines — NOT math, which materialises the full (B,H,L,L) score
+# matrix and OOMs at the latent's L. Kernel selection only: identical attention
+# math, output-identical. The experiments module imports this for the global
+# ``cudnn`` path; the latent encoder uses it for the scoped ``cudnn_latent``
+# path (see ``LatentEncoder._force_cudnn``).
+_CUDNN_SDPA_PRIORITY = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+def cudnn_sdpa_context(enabled: bool) -> tp.ContextManager[None]:
+    """Force the cuDNN-first SDPA priority when ``enabled`` and CUDA is live.
+
+    Used to scope the cuDNN force to exactly the call(s) where its host-side
+    ~19 ms/call plan-building is repaid by the GPU win (the large-L masked
+    latent); small-L frontend / predictor / time-SA calls keep the cheaper
+    default dispatcher. Backward inherits the forward's chosen kernel, so
+    wrapping only the forward suffices. ``contextlib.nullcontext`` otherwise."""
+    if enabled and torch.cuda.is_available():
+        return sdpa_kernel(_CUDNN_SDPA_PRIORITY, set_priority=True)
+    return contextlib.nullcontext()
 
 
 @dataclass(frozen=True)
@@ -584,6 +619,20 @@ class LatentEncoder(nn.Module):
         self.ln_out = nn.LayerNorm(d_model)
         self.tokens_per_electrode = int(time_slot.numel())  # 38
 
+        # Kernel selection only (output-identical). This cross-electrode latent
+        # is the large-L all-pairs elephant where cuDNN's masked sm90 kernel is
+        # ~2.7× the sm80 mem-efficient fallback. Scope the cuDNN force to THIS
+        # encoder's block loops so the small-L frontend / predictor / time-SA
+        # calls keep the cheaper default dispatcher (cuDNN adds ~19 ms/call host
+        # plan-building not repaid at small L). Read once at construction from
+        # the run's V14_SDPA_BACKEND: ``cudnn`` (global force, also wraps here —
+        # nested same-priority context is a no-op) and ``cudnn_latent`` (scoped
+        # to here only) both opt in; any other value leaves the default kernel.
+        self._force_cudnn = (os.environ.get("V14_SDPA_BACKEND") or "").strip().lower() in (
+            "cudnn",
+            "cudnn_latent",
+        )
+
     def forward(
         self,
         feats: Tensor,
@@ -613,8 +662,9 @@ class LatentEncoder(nn.Module):
             key_mask = token_mask.reshape(B, C * S)
         elif electrode_mask is not None:
             key_mask = electrode_mask[:, :, None].expand(B, C, S).reshape(B, C * S)
-        for blk in self.blocks:
-            x = blk(x, rope, key_mask)
+        with cudnn_sdpa_context(self._force_cudnn):
+            for blk in self.blocks:
+                x = blk(x, rope, key_mask)
         return self.ln_out(x).reshape(B, C, S, d)
 
     def forward_ragged(
@@ -648,8 +698,9 @@ class LatentEncoder(nn.Module):
         slot_full = self.time_slot.repeat(C)                      # (C·38,)
         slot_v = slot_full[idx]                                   # (B, Nv)
         rope = self.key_rope[:, slot_v, :]                        # (2, B, Nv, head_dim)
-        for blk in self.blocks:
-            xv = blk(xv, rope, real)
+        with cudnn_sdpa_context(self._force_cudnn):
+            for blk in self.blocks:
+                xv = blk(xv, rope, real)
         xv = self.ln_out(xv)                                      # (B, Nv, d)
 
         rows = torch.arange(B, device=feats.device).unsqueeze(1).expand(B, Nv)

@@ -819,12 +819,25 @@ def test_sdpa_forward_context_cudnn_is_priority_kernel(monkeypatch) -> None:
         pass
 
 
-@pytest.mark.parametrize("name", [None, "", "default", "flash", "efficient", "math"])
+@pytest.mark.parametrize(
+    "name", [None, "", "default", "cudnn_latent", "flash", "efficient", "math"]
+)
 def test_sdpa_forward_context_non_cudnn_is_nullcontext(name, monkeypatch) -> None:
-    """Every non-'cudnn' mode ⇒ nullcontext (global flags govern those)."""
+    """Every non-'cudnn' mode ⇒ nullcontext at the WHOLE-forward scope (global
+    flags govern those). 'cudnn_latent' in particular is nullcontext HERE — its
+    cuDNN force is scoped inside LatentEncoder, not around the full forward."""
     import contextlib as _c
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     assert isinstance(_sdpa_forward_context(name), _c.nullcontext)
+
+
+def test_apply_sdpa_backend_cudnn_latent_touches_no_global_flags(monkeypatch) -> None:
+    """'cudnn_latent' is a NO-OP in _apply_sdpa_backend (same reasoning as
+    'cudnn'): the scoped force is per-call inside LatentEncoder; flipping global
+    flags would route cuDNN-declined calls to MATH and OOM at the latent's L."""
+    seen = _capture_sdpa_toggles(monkeypatch)
+    _apply_sdpa_backend("cudnn_latent")
+    assert seen == {}
 
 
 def test_sdpa_forward_context_cudnn_nullcontext_without_cuda(monkeypatch) -> None:

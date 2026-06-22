@@ -598,6 +598,70 @@ def test_latent_construction_guards() -> None:
         vc.LatentEncoder(d_model=12, n_heads=4, n_layers=1, n_parcels=8)
 
 
+# ------------------------------------- scoped cuDNN SDPA force (kernel-only)
+def test_cudnn_sdpa_context_disabled_is_nullcontext() -> None:
+    import contextlib as _c
+    assert isinstance(vc.cudnn_sdpa_context(False), _c.nullcontext)
+
+
+def test_cudnn_sdpa_context_without_cuda_is_nullcontext(monkeypatch) -> None:
+    import contextlib as _c
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert isinstance(vc.cudnn_sdpa_context(True), _c.nullcontext)
+
+
+def test_cudnn_sdpa_context_enabled_with_cuda_is_priority_kernel(monkeypatch) -> None:
+    import contextlib as _c
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    ctx = vc.cudnn_sdpa_context(True)
+    assert not isinstance(ctx, _c.nullcontext)
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        ("cudnn", True),
+        ("cudnn_latent", True),
+        ("CuDNN_Latent", True),  # case/space-insensitive read
+        (None, False),
+        ("", False),
+        ("default", False),
+        ("flash", False),
+        ("efficient", False),
+        ("math", False),
+    ],
+)
+def test_latent_force_cudnn_reads_env(monkeypatch, backend, expected) -> None:
+    if backend is None:
+        monkeypatch.delenv("V14_SDPA_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("V14_SDPA_BACKEND", backend)
+    lat = vc.LatentEncoder(d_model=16, n_heads=2, n_layers=1, n_parcels=8)
+    assert lat._force_cudnn is expected
+
+
+def test_latent_scoped_cudnn_is_output_identical_on_cpu(monkeypatch) -> None:
+    # The cuDNN force is kernel selection only: on CPU the context degrades to
+    # nullcontext, so a 'cudnn_latent' encoder must produce bit-identical output
+    # to a default one given identical weights/inputs.
+    torch.manual_seed(7)
+    monkeypatch.delenv("V14_SDPA_BACKEND", raising=False)
+    base = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    monkeypatch.setenv("V14_SDPA_BACKEND", "cudnn_latent")
+    scoped = vc.LatentEncoder(d_model=32, n_heads=4, n_layers=2, n_parcels=74).eval()
+    scoped.load_state_dict(base.state_dict())
+    assert base._force_cudnn is False and scoped._force_cudnn is True
+    feats = _fake_feats(2, 6)
+    pe = torch.randint(0, 74, (2, 6))
+    tok = torch.rand(2, 6, 30) > 0.3
+    with torch.no_grad():
+        assert torch.equal(base(feats, pe), scoped(feats, pe))
+        assert torch.equal(
+            base.forward_ragged(feats, pe, tok),
+            scoped.forward_ragged(feats, pe, tok),
+        )
+
+
 # ----------------------------------------------- shared token metadata helper
 def test_token_metadata_single_source_matches_tokenizer() -> None:
     # The latent and the tokenizer must agree on time_slot (one source).
