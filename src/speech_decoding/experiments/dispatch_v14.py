@@ -3117,6 +3117,18 @@ def _parser() -> argparse.ArgumentParser:
              "for fixed-shape runs. No effect when --no-compile. Loss-neutral "
              "(±5%% tripwire is the backstop).",
     )
+    p.add_argument(
+        "--sdpa-backend", dest="sdpa_backend",
+        choices=["default", "cudnn", "flash", "efficient", "math"],
+        default="default",
+        help="Science-neutral SDPA kernel preference (sets V14_SDPA_BACKEND, read "
+             "in V14ConvergedBrainModule). The masked latent/cross attention falls "
+             "to the mem-efficient CUTLASS sm80 kernel on Hopper (profiled ~73%% of "
+             "GPU time); 'cudnn' adds the Hopper-native mask-capable cuDNN attention "
+             "so masked SDPA runs an sm90 kernel. Identical math (±5%% tripwire is "
+             "the backstop); 'default' ⇒ stock selection, byte-identical, no cache "
+             "blast (env, not a uid field).",
+    )
     # 2026-06-09 throughput levers — front-doors for env vars read in data.py /
     # experiment.py (env, not pydantic fields → never fork the exca uid). All
     # loss-neutral: they touch startup/overhead, never the model/optimizer/data.
@@ -4115,6 +4127,13 @@ def main(argv: list[str] | None = None) -> int:
     # not the unset→None automatic-dynamic that still storms on torch 2.10/GH200.
     # Same no-stale-leak rationale as the throughput levers below.
     os.environ["V14_COMPILE_DYNAMIC"] = "1" if args.compile_dynamic else "0"
+    # Science-neutral SDPA kernel preference (front-door for V14_SDPA_BACKEND, read
+    # in V14ConvergedBrainModule). Set EXPLICITLY (set/pop) so a prior run's value
+    # in a long-lived warm worker never leaks; 'default' pops it (stock selection).
+    if args.sdpa_backend and args.sdpa_backend != "default":
+        os.environ["V14_SDPA_BACKEND"] = args.sdpa_backend
+    else:
+        os.environ.pop("V14_SDPA_BACKEND", None)
     # 2026-06-09 throughput levers — same front-door pattern. Set EXPLICITLY to
     # "0"/"1" (not just on-true) so a prior run's value in a long-lived warm
     # worker process never leaks into this run's data.py / experiment.py reads.

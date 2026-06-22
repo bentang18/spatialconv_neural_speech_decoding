@@ -92,6 +92,52 @@ _LOSS_ALIASES: dict[str, str] = {
 }
 
 
+def _apply_sdpa_backend(name: str | None) -> None:
+    """Science-neutral SDPA backend preference (env-gated, process-global,
+    idempotent). Identical attention math — only swaps which fused kernel
+    ``F.scaled_dot_product_attention`` dispatches to. Unset/``"default"`` ⇒ no-op
+    (byte-identical to the stock selection).
+
+    The latent/cross attention pass a key-mask, so PyTorch's flash SDPA is
+    ineligible and SDPA falls to the mem-efficient CUTLASS kernel — which ships
+    only an ``sm80`` build, so on Hopper (GH200) it runs the Ampere kernel via
+    compat (profiled 2026-06-21: attention = ~73% of GPU time, all
+    ``fmha_cutlass*_sm80``). ``"cudnn"`` adds the Hopper-native, mask-capable
+    cuDNN attention to the menu (highest priority on sm90 in torch ≥2.7) so the
+    masked SDPA can run a real sm90 kernel; flash + mem-efficient stay enabled as
+    fallbacks for any call cuDNN declines. Math is always kept as the last-resort
+    correct fallback. The ±5%% loss tripwire is the backstop.
+    """
+    key = (name or "").strip().lower()
+    if not key or key == "default":
+        return
+    if key not in ("cudnn", "flash", "efficient", "math"):
+        raise ValueError(
+            f"unknown V14_SDPA_BACKEND={name!r} "
+            "(expected one of: default, cudnn, flash, efficient, math)"
+        )
+    if not torch.cuda.is_available():
+        return
+    be = torch.backends.cuda
+    be.enable_math_sdp(True)
+    if key == "cudnn":
+        be.enable_cudnn_sdp(True)
+        be.enable_flash_sdp(True)
+        be.enable_mem_efficient_sdp(True)
+    elif key == "flash":
+        be.enable_cudnn_sdp(False)
+        be.enable_flash_sdp(True)
+        be.enable_mem_efficient_sdp(False)
+    elif key == "efficient":
+        be.enable_cudnn_sdp(False)
+        be.enable_flash_sdp(False)
+        be.enable_mem_efficient_sdp(True)
+    else:  # key == "math"
+        be.enable_cudnn_sdp(False)
+        be.enable_flash_sdp(False)
+        be.enable_mem_efficient_sdp(False)
+
+
 class V14ConvergedBrainModule(pl.LightningModule):
     """Thin Lightning shell around a self-contained `V14ConvergedSSL`.
 
@@ -113,6 +159,10 @@ class V14ConvergedBrainModule(pl.LightningModule):
         monitor_every_n_steps: int | None = None,
     ) -> None:
         super().__init__()
+        # Science-neutral SDPA kernel preference (env, NOT a pydantic/uid field, so
+        # a cudnn run shares the stock run's exca cache). Process-global + applied
+        # before any forward; unset ⇒ no-op. See `_apply_sdpa_backend`.
+        _apply_sdpa_backend(os.environ.get("V14_SDPA_BACKEND"))
         self.model = model
         self.optim_config = optim_config
         self.ema_tau = float(ema_tau)

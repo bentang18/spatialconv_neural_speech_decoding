@@ -15,7 +15,10 @@ import torch
 
 from neuraltrain.optimizers import LightningOptimizer
 
-from speech_decoding.experiments.v14_converged_module import V14ConvergedBrainModule
+from speech_decoding.experiments.v14_converged_module import (
+    V14ConvergedBrainModule,
+    _apply_sdpa_backend,
+)
 from speech_decoding.models.v14_converged import V14ConvergedSSL
 
 
@@ -757,3 +760,69 @@ def test_grad_ema_l2_buffer_persists_in_state_dict() -> None:
     checkpoint round-trips)."""
     m = _module()
     assert "_grad_ema_l2" in m.state_dict()
+
+
+# ----------------------------------------------------- SDPA backend lever (#249)
+def _capture_sdpa_toggles(monkeypatch) -> dict[str, bool]:
+    """Pretend CUDA is present and record every enable_*_sdp toggle into a dict."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    seen: dict[str, bool] = {}
+    for k in ("math", "flash", "mem_efficient", "cudnn"):
+        monkeypatch.setattr(
+            torch.backends.cuda, f"enable_{k}_sdp",
+            (lambda key: lambda v: seen.__setitem__(key, bool(v)))(k),
+        )
+    return seen
+
+
+@pytest.mark.parametrize("name", [None, "", "default", "DEFAULT", "  "])
+def test_apply_sdpa_backend_noop_is_byte_identical(name, monkeypatch) -> None:
+    """Unset / 'default' must touch NOTHING — the live run shares the stock path."""
+    seen = _capture_sdpa_toggles(monkeypatch)
+    _apply_sdpa_backend(name)
+    assert seen == {}
+
+
+def test_apply_sdpa_backend_rejects_unknown_even_without_cuda(monkeypatch) -> None:
+    """A typo fails fast on CPU too (validation precedes the CUDA gate)."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(ValueError, match="unknown V14_SDPA_BACKEND"):
+        _apply_sdpa_backend("flsah")
+
+
+def test_apply_sdpa_backend_noop_without_cuda(monkeypatch) -> None:
+    """No CUDA ⇒ silent no-op for a VALID backend (laptop / CI safe)."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    _apply_sdpa_backend("cudnn")  # must not raise, must not touch backends
+
+
+def test_apply_sdpa_backend_cudnn_adds_cudnn_keeps_fallbacks(monkeypatch) -> None:
+    """'cudnn' enables the Hopper-native cuDNN attention while keeping flash +
+    mem-efficient + math on the menu as fallbacks (math always on)."""
+    seen = _capture_sdpa_toggles(monkeypatch)
+    _apply_sdpa_backend("cudnn")
+    assert seen == {"math": True, "cudnn": True, "flash": True, "mem_efficient": True}
+
+
+def test_apply_sdpa_backend_flash_only(monkeypatch) -> None:
+    seen = _capture_sdpa_toggles(monkeypatch)
+    _apply_sdpa_backend("flash")
+    assert seen == {
+        "math": True, "flash": True, "cudnn": False, "mem_efficient": False,
+    }
+
+
+def test_apply_sdpa_backend_efficient_only(monkeypatch) -> None:
+    seen = _capture_sdpa_toggles(monkeypatch)
+    _apply_sdpa_backend("efficient")
+    assert seen == {
+        "math": True, "mem_efficient": True, "cudnn": False, "flash": False,
+    }
+
+
+def test_apply_sdpa_backend_math_only(monkeypatch) -> None:
+    seen = _capture_sdpa_toggles(monkeypatch)
+    _apply_sdpa_backend("math")
+    assert seen == {
+        "math": True, "cudnn": False, "flash": False, "mem_efficient": False,
+    }
