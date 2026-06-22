@@ -365,6 +365,20 @@ def test_compile_env_ddp_optimizer_is_opt_in() -> None:
         assert _dyn.config.optimize_ddp is True
 
 
+def test_compile_dynamic_three_states() -> None:
+    """V14_COMPILE_DYNAMIC resolves to THREE states in _compile_spec[1]:
+    "1"->True (symbolic, compile once), "0"->False (fully static, no symbolic
+    reasoning — the torch-2.10/GH200 storm escape), unset->None (automatic).
+    Distinguishing "0" from unset is the whole point: --no-compile-dynamic must
+    force static, not fall back to automatic-dynamic (which still goes symbolic)."""
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DYNAMIC="1"):
+        assert _module()._compile_spec[1] is True
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DYNAMIC="0"):
+        assert _module()._compile_spec[1] is False
+    with _compile_env(V14_COMPILE="1"):  # V14_COMPILE_DYNAMIC unset
+        assert _module()._compile_spec[1] is None
+
+
 def test_compiled_forward_matches_eager_loss() -> None:
     """Decisive veracity check: the COMPILED forward (the config Ben launches:
     V14_COMPILE + dynamic) yields the same loss as eager, within fp tolerance.
@@ -398,6 +412,47 @@ def test_compiled_forward_matches_eager_loss() -> None:
         out_c = m_c._step(_to(_batch().data))
     assert torch.isfinite(out_c["loss"])
     assert torch.allclose(out_c["loss"], out_e["loss"], atol=1e-4, rtol=1e-4)
+
+
+def test_getstate_drops_compiled_forward_and_rebuilds_lazily() -> None:
+    """A compiled module must survive the exca job-pickle. ``__getstate__`` drops
+    the un-picklable OptimizedModule (its ``torch._dynamo`` guard weakrefs break
+    cloudpickle) while keeping ``_compile_spec`` (a plain tuple), so the
+    unpickled module rebuilds the compiled forward lazily on the first forward.
+    This is what enables ``torch.compile`` on the ``--in-allocation-ddp`` 4-GPU
+    path (the pickle previously died with ``cannot pickle 'weakref.ReferenceType'``)."""
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DYNAMIC="1"):
+        m = _module()
+        assert "model" in m._compiled_fwd
+        spec = m._compile_spec
+        assert spec is not None
+        # __getstate__ returns a copy with the OptimizedModule dropped...
+        state = m.__getstate__()
+        assert state["_compiled_fwd"] == {}
+        assert state["_compile_spec"] == spec
+        # ...and the live original is untouched (getstate works on a copy), so a
+        # single-GPU / cluster run that never round-trips keeps its compiled fwd.
+        assert "model" in m._compiled_fwd
+        # Simulate the unpickled side: empty dict, spec retained → lazy rebuild.
+        m._compiled_fwd = {}
+        m._build_compiled_model()
+        assert "model" in m._compiled_fwd
+
+
+def test_compiled_module_cloudpickles_without_weakref_error() -> None:
+    """End-to-end: cloudpickle (what exca uses) round-trips a compiled module
+    with no ``weakref.ReferenceType`` crash, and the restored module has an empty
+    ``_compiled_fwd`` + a surviving ``_compile_spec`` ready for the lazy rebuild."""
+    import cloudpickle
+
+    with _compile_env(V14_COMPILE="1", V14_COMPILE_DYNAMIC="1"):
+        m = _module()
+        assert "model" in m._compiled_fwd
+        blob = cloudpickle.dumps(m)          # must NOT raise on dynamo weakrefs
+        assert "model" in m._compiled_fwd    # original still compiled
+    m2 = cloudpickle.loads(blob)
+    assert m2._compiled_fwd == {}
+    assert m2._compile_spec == m._compile_spec
 
 
 # ---------------------------------------------------------------- overfit check

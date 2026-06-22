@@ -175,32 +175,80 @@ class V14ConvergedBrainModule(pl.LightningModule):
         # checkpoints, no double-registration of optimizer/EMA params). Unset env
         # (unit tests / direct construction) → eager, byte-identical, zero blast.
         self._compiled_fwd: dict[str, tp.Callable[..., tp.Any]] = {}
+        # Resolved (mode, dynamic, optimize_ddp) when compile is requested, else
+        # None. Kept as a plain tuple so it survives the job-pickle (see
+        # __getstate__) and _call_model can rebuild the OptimizedModule lazily.
+        self._compile_spec: tuple[str, bool | None, bool] | None = None
         _compile_flag = os.environ.get("V14_COMPILE", "").strip().lower()
         if _compile_flag not in ("", "0", "false", "no", "off"):
             _mode = os.environ.get("V14_COMPILE_MODE") or "default"
+            # Three states, NOT two: True = symbolic-shapes (compile once), False
+            # = FULLY static (recompile per concrete shape, NO symbolic reasoning),
+            # unset = None = torch's automatic-dynamic (static on shape #1, then
+            # symbolic on shape #2). On torch 2.10 / GH200 both True AND None storm
+            # in the symbolic solver (`pow_by_natural([VR[.., int_oo], -1])` spam,
+            # never reaches a step) on this model's data-dependent gather; False is
+            # the escape that keeps every dim concrete. So "0"/"false" must map to
+            # False, not None.
             _dyn_flag = os.environ.get("V14_COMPILE_DYNAMIC", "").strip().lower()
-            _dynamic: bool | None = (
-                True if _dyn_flag not in ("", "0", "false", "no", "off") else None
-            )
+            if _dyn_flag in ("1", "true", "yes", "on"):
+                _dynamic: bool | None = True
+            elif _dyn_flag in ("0", "false", "no", "off"):
+                _dynamic = False
+            else:
+                _dynamic = None
             # DDPOptimizer × dynamic-shapes fix (2026-06-11): the bucket-split
             # optimizer hands a symbolic-shape SymInt back as a bare python int and
             # crashes inductor under dynamic=True; disabling it compiles a single
             # graph (cost: lost allreduce/compute overlap, negligible for this
             # ~16M-param model on single-node 4-GPU DDP). Default OFF = disabled,
             # because the production sweep IS compile+DDP+dynamic.
-            import torch._dynamo as _dynamo_mod
-
             _ddp_opt = os.environ.get(
                 "V14_COMPILE_DDP_OPTIMIZER", "").strip().lower()
-            _dynamo_mod.config.optimize_ddp = _ddp_opt in ("1", "true", "yes", "on")
-            self._compiled_fwd["model"] = torch.compile(
-                self.model, mode=_mode, dynamic=_dynamic,
+            self._compile_spec = (
+                _mode, _dynamic, _ddp_opt in ("1", "true", "yes", "on"),
             )
+            self._build_compiled_model()
+
+    def _build_compiled_model(self) -> None:
+        """Compile ``self.model`` per ``self._compile_spec`` and register it in the
+        (plain, non-submodule) ``_compiled_fwd`` dict. Re-applies the global
+        DDPOptimizer switch because unpickling bypasses ``__init__``: the
+        in-allocation-ddp / submitit job-pickle drops the un-picklable
+        OptimizedModule via ``__getstate__``, then ``_call_model`` calls this on
+        the first forward to rebuild it on the live (un-pickled) module."""
+        if self._compile_spec is None:
+            return
+        _mode, _dynamic, _optimize_ddp = self._compile_spec
+        import torch._dynamo as _dynamo_mod
+
+        _dynamo_mod.config.optimize_ddp = _optimize_ddp
+        self._compiled_fwd["model"] = torch.compile(
+            self.model, mode=_mode, dynamic=_dynamic,
+        )
+
+    def __getstate__(self) -> dict[str, tp.Any]:
+        """Make the module cloudpickle-safe even when compiled. exca pickles the
+        live job graph on the ``--in-allocation-ddp`` path (and submitit pickles
+        for the remote run), but the compiled forward carries ``torch._dynamo``
+        guard weakrefs that cloudpickle cannot serialize (``cannot pickle
+        'weakref.ReferenceType'``). Drop the OptimizedModule from the pickled
+        state — ``_compile_spec`` (a plain tuple) survives, so ``_call_model``
+        rebuilds it lazily on the first forward after unpickle. ``__getstate__``
+        operates on a copy, so the in-process original keeps its compiled forward
+        (single-GPU / cluster runs that never round-trip are unaffected)."""
+        state = self.__dict__.copy()
+        state["_compiled_fwd"] = {}
+        return state
 
     def _call_model(self, *args: tp.Any, **kwargs: tp.Any) -> dict[str, Tensor]:
         """Run the model forward through the compiled override when present, else
-        eager. Falls back to ``self.model`` when V14_COMPILE was unset (tests /
-        1-GPU), so the eager path is byte-identical to pre-compile."""
+        eager. Rebuilds the compiled forward lazily when ``_compile_spec`` is set
+        but the OptimizedModule is absent (first forward after an un-pickle).
+        Falls back to ``self.model`` when V14_COMPILE was unset (tests / 1-GPU),
+        so the eager path is byte-identical to pre-compile."""
+        if self._compile_spec is not None and "model" not in self._compiled_fwd:
+            self._build_compiled_model()
         return self._compiled_fwd.get("model", self.model)(*args, **kwargs)
 
     # ==================================================================

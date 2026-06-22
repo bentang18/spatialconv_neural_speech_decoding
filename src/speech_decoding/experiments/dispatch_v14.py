@@ -4045,23 +4045,25 @@ def _build_v14_chain(args) -> list[Experiment]:
 
 
 def _effective_compile_encoder(in_allocation_ddp: bool, compile_encoder: bool) -> bool:
-    """Resolve the effective ``torch.compile`` flag.
+    """Resolve the effective ``torch.compile`` flag — now a pass-through.
 
-    torch.compile is force-disabled on the ``--in-allocation-ddp`` warm-worker
-    path. That path runs the experiment IN-PROCESS (``cluster=None``, see the
-    ``in_allocation_ddp`` branch above) and exca pickles the live job graph — to
-    coordinate the DDP ranks and to cache the result — but the compiled forward
-    carries ``torch._dynamo`` guard weakrefs that cloudpickle cannot serialize,
-    so the job-pickle dies with ``TypeError: cannot pickle
-    'weakref.ReferenceType'`` at job creation (observed 2026-06-10, warm-worker
-    nano). The cluster path (``--cluster slurm``, submitit) is UNAFFECTED: there
-    exca pickles only the pydantic config and the model is built remotely, so
-    real/full runs keep compile's per-step win (~6x dense, 1.80->0.30 s/step).
-    Compile never amortizes its ~105 s trace tax on the short nano runs the warm
-    worker exists for anyway, so disabling it here costs nothing. Use
-    ``--cluster slurm`` to get compile on a full run.
+    HISTORY: compile used to be force-disabled on the ``--in-allocation-ddp``
+    path. That path runs the experiment IN-PROCESS (``cluster=None``) and exca
+    pickles the live job graph, but the compiled forward carried
+    ``torch._dynamo`` guard weakrefs that cloudpickle cannot serialize, so the
+    job-pickle died with ``TypeError: cannot pickle 'weakref.ReferenceType'``
+    (observed 2026-06-10, warm-worker nano). FIXED 2026-06-21:
+    ``V14ConvergedBrainModule.__getstate__`` drops the OptimizedModule from the
+    pickled state and ``_call_model`` rebuilds it lazily on the first forward,
+    so a compiled module is cloudpickle-safe on every path. The force-disable is
+    obsolete: honor the requested flag. The warm-worker nano runs still pass an
+    explicit ``--no-compile`` (compile never amortizes its trace tax on a short
+    run), so this change only affects a caller that explicitly asks for compile
+    on the in-allocation path — i.e. the 4-GPU DeltaAI production run, which
+    needs it for the per-step win (~6x dense, 1.80->0.30 s/step on the cluster
+    path that already compiled).
     """
-    return compile_encoder and not in_allocation_ddp
+    return compile_encoder
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4108,8 +4110,11 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["V14_COMPILE"] = "1" if args.compile_encoder else "0"
     if args.compile_mode:
         os.environ["V14_COMPILE_MODE"] = args.compile_mode
-    if args.compile_dynamic:
-        os.environ["V14_COMPILE_DYNAMIC"] = "1"
+    # Set EXPLICITLY "1"/"0" (not on-true only) so --no-compile-dynamic reaches
+    # the module as genuine dynamic=False (FULLY static, no symbolic reasoning) —
+    # not the unset→None automatic-dynamic that still storms on torch 2.10/GH200.
+    # Same no-stale-leak rationale as the throughput levers below.
+    os.environ["V14_COMPILE_DYNAMIC"] = "1" if args.compile_dynamic else "0"
     # 2026-06-09 throughput levers — same front-door pattern. Set EXPLICITLY to
     # "0"/"1" (not just on-true) so a prior run's value in a long-lived warm
     # worker process never leaks into this run's data.py / experiment.py reads.

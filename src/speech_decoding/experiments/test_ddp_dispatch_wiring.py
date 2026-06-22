@@ -319,33 +319,33 @@ def test_compile_flag_sets_env_var(monkeypatch) -> None:
     assert os.environ["V14_COMPILE_MODE"] == "default"
 
 
-def test_effective_compile_encoder_disables_on_in_allocation_ddp() -> None:
-    """torch.compile is force-OFF on the ``--in-allocation-ddp`` warm-worker path:
-    that path runs in-process and exca pickles the live job graph, but the
-    compiled forward's ``torch._dynamo`` guard weakrefs break cloudpickle
-    (``cannot pickle 'weakref.ReferenceType'``). Every other path is pass-through
-    so the cluster/submitit full runs keep compile's per-step win."""
+def test_effective_compile_encoder_is_passthrough_on_every_path() -> None:
+    """``_effective_compile_encoder`` honors the requested flag on EVERY path,
+    including ``--in-allocation-ddp``. The old force-disable (warm-worker
+    exca-pickle crash on the compiled forward's ``torch._dynamo`` weakrefs) is
+    obsolete: ``V14ConvergedBrainModule.__getstate__`` now drops the
+    OptimizedModule from the pickled state and ``_call_model`` rebuilds it lazily,
+    so a compiled module is cloudpickle-safe on the in-allocation path too — the
+    4-GPU DeltaAI production run needs compile there."""
     from speech_decoding.experiments.dispatch_v14 import _effective_compile_encoder
 
-    # warm-worker path: requested compile is dropped either way.
-    assert _effective_compile_encoder(in_allocation_ddp=True, compile_encoder=True) is False
+    assert _effective_compile_encoder(in_allocation_ddp=True, compile_encoder=True) is True
     assert _effective_compile_encoder(in_allocation_ddp=True, compile_encoder=False) is False
-    # cluster/local path: compile honored exactly as requested.
     assert _effective_compile_encoder(in_allocation_ddp=False, compile_encoder=True) is True
     assert _effective_compile_encoder(in_allocation_ddp=False, compile_encoder=False) is False
 
 
-def test_in_allocation_ddp_forces_v14_compile_off(monkeypatch, capsys) -> None:
-    """End-to-end: even with an explicit ``--compile``, the ``--in-allocation-ddp``
-    path writes ``V14_COMPILE=="0"`` (the warm-worker exca-pickle crash fix) and
-    announces the override on stdout."""
+def test_in_allocation_ddp_honors_compile(monkeypatch, capsys) -> None:
+    """End-to-end: ``--in-allocation-ddp --compile`` now writes ``V14_COMPILE=="1"``
+    (the __getstate__ pickle fix makes a compiled module DDP-safe), and does NOT
+    print the obsolete force-off override message."""
     monkeypatch.delenv("V14_COMPILE", raising=False)
     import os
 
     rc = main(["--in-allocation-ddp", "--compile", "--dry-run"])
     assert rc == 0
-    assert os.environ["V14_COMPILE"] == "0"
-    assert "forcing --no-compile" in capsys.readouterr().out
+    assert os.environ["V14_COMPILE"] == "1"
+    assert "forcing --no-compile" not in capsys.readouterr().out
 
 
 # --- rank-0 write gate -------------------------------------------------------
