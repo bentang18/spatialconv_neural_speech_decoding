@@ -419,6 +419,30 @@ def _build_optim_cfg(
     return cfg
 
 
+def _resolve_static_forward_cohesion(args: argparse.Namespace) -> None:
+    """In-place: fill the AUTO defaults the static-shape throughput regime implies
+    (Ben 2026-06-22: "make every confirmed throughput win default"). The V-JEPA
+    drop-not-pad forward (``--converged-static-forward``) has two PROVEN companions;
+    auto-enable them so a future launch can't silently leave a measured win off,
+    while an explicit flag still overrides:
+
+    * ``compile_dynamic``: AUTO (``None``) ⇒ static (``False``) under static-forward
+      — the maskless kernel wants one compiled graph per session geometry; symbolic
+      dynamic forfeits the specialization. Legacy ragged path stays ``True``
+      (byte-identical to the prior default).
+    * ``sdpa_backend``: ``"default"`` ⇒ ``"cudnn_latent"`` under static-forward —
+      routes the large-L masked cross-electrode attention (~50% of GPU time) to the
+      ~2.6x-faster cuDNN kernel, scoped so small-L calls keep the dispatcher.
+
+    ``find_unused_parameters=False`` (``--ddp-static-graph``) is deliberately NOT
+    auto-on: it is correctness-gated on the empty/static unused-param set, proven
+    per-arch by a short run (DTAI A/B 2543181/2543183), never assumed."""
+    if args.compile_dynamic is None:
+        args.compile_dynamic = not args.converged_static_forward
+    if args.converged_static_forward and args.sdpa_backend == "default":
+        args.sdpa_backend = "cudnn_latent"
+
+
 def _resolve_ddp_strategy(tasks_per_node: int | None) -> str | None:
     """The Lightning ``strategy`` for a given srun-rank topology.
 
@@ -3162,14 +3186,17 @@ def _parser() -> argparse.ArgumentParser:
     # tighter. No effect when --no-compile.
     p.add_argument(
         "--compile-dynamic", "--no-compile-dynamic", dest="compile_dynamic",
-        action=argparse.BooleanOptionalAction, default=True,
+        action=argparse.BooleanOptionalAction, default=None,
         help="Compile ONCE with symbolic shapes (sets V14_COMPILE_DYNAMIC=1). "
              "With ragged ON the per-batch electrode count varies, so static "
              "compile recompiles per distinct shape (storm); dynamic absorbs the "
              "varying dim into one graph at no measured warm per-step cost "
-             "(matrix: dynamic==static warm). ON by default; --no-compile-dynamic "
-             "for fixed-shape runs. No effect when --no-compile. Loss-neutral "
-             "(±5%% tripwire is the backstop).",
+             "(matrix: dynamic==static warm). DEFAULT IS AUTO (unset): dynamic ON "
+             "for the legacy ragged forward, OFF for --converged-static-forward "
+             "(its drop-not-pad kernel wants one static graph per session "
+             "geometry, not a symbolic one). An explicit --compile-dynamic / "
+             "--no-compile-dynamic overrides the auto-resolution. No effect when "
+             "--no-compile. Loss-neutral (±5%% tripwire is the backstop).",
     )
     p.add_argument(
         "--sdpa-backend", dest="sdpa_backend",
@@ -4141,6 +4168,7 @@ def main(argv: list[str] | None = None) -> int:
         args.m2_predictor_depth = max(1, args.depth // 2)
     if args.m4_predictor_depth is None:
         args.m4_predictor_depth = max(1, args.latent_depth // 2)
+    _resolve_static_forward_cohesion(args)
     # speedup-fanout C1: --compile/--no-compile is a front-door for the
     # V14_COMPILE env var the brain module reads at construction. Set it here
     # (before exca submits) so submitit captures it into the slurm job env. Set

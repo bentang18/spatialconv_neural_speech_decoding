@@ -161,3 +161,50 @@ def test_2stft_path_unchanged(tmp_path) -> None:
     assert type(xp.brain_model_config).__name__ == "V14ParcelPerceiver"
     keys = set(xp.data.segmenter.extractors)
     assert "electrode_tokens" in keys and "electrode_tokens_high" in keys
+
+
+# --- static-forward throughput-regime cohesion (Ben 2026-06-22) ----------------
+def _resolve(argv):
+    """Parse a converged argv and apply the static-forward cohesion, returning the
+    resolved (compile_dynamic, sdpa_backend)."""
+    from speech_decoding.experiments.dispatch_v14 import (
+        _parser,
+        _resolve_static_forward_cohesion,
+    )
+    a = _parser().parse_args(argv)
+    _resolve_static_forward_cohesion(a)
+    return a.compile_dynamic, a.sdpa_backend
+
+
+_BASE = [
+    "--frontend", "3stft",
+    "--converged-frontend-layers", "6", "--converged-latent-layers", "6",
+    "--converged-m2-pred-dim", "128", "--converged-m2-pred-layers", "4",
+    "--converged-m4-pred-dim", "128", "--converged-m4-pred-layers", "6",
+]
+_STATIC = ["--converged-static-forward", "--converged-tube-ratio", "0.25",
+           "--group-by-session"]
+
+
+def test_cohesion_legacy_path_unchanged() -> None:
+    # No static-forward: dynamic compile stays ON, SDPA stays at the dispatcher
+    # default — byte-identical to the prior hard defaults.
+    assert _resolve(_BASE) == (True, "default")
+
+
+def test_cohesion_static_forward_autofills_both_wins() -> None:
+    # Static-forward auto-resolves to static compile + cuDNN-latent.
+    assert _resolve(_BASE + _STATIC) == (False, "cudnn_latent")
+
+
+def test_cohesion_explicit_flags_override_autofill() -> None:
+    # An explicit --compile-dynamic / --sdpa-backend still wins under static-forward.
+    assert _resolve(_BASE + _STATIC + ["--compile-dynamic"]) == (True, "cudnn_latent")
+    assert _resolve(_BASE + _STATIC + ["--sdpa-backend", "flash"]) == (False, "flash")
+
+
+def test_cohesion_does_not_autofill_find_unused() -> None:
+    # find_unused=False (--ddp-static-graph) is NOT implied by static-forward.
+    from speech_decoding.experiments.dispatch_v14 import _parser
+    a = _parser().parse_args(_BASE + _STATIC)
+    assert a.ddp_static_graph is False
