@@ -31,6 +31,7 @@ the freq axis is invariant:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import typing as tp
@@ -38,6 +39,7 @@ import typing as tp
 import torch
 from lightning import pytorch as pl
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from neuraltrain.optimizers import BaseOptimizer
 
@@ -92,33 +94,55 @@ _LOSS_ALIASES: dict[str, str] = {
 }
 
 
+# cuDNN-first priority for the masked attention. EFFICIENT is the graceful
+# fallback for any call cuDNN's runtime declines, so a declined call lands on
+# the sm80 mem-efficient CUTLASS kernel — NOT on MATH, whose dense (B,H,L,L)
+# score matrix OOMs at the latent's L (52.75 GiB at L≈10.5k). MATH stays last as
+# the formal correctness floor. Used via ``_sdpa_forward_context`` (a context
+# manager wrapping the forward), NOT the process-global enable flags: PyTorch's
+# auto-dispatcher rejects cuDNN for the masked+grad latent call and falls to the
+# sm80 mem-efficient kernel even with cuDNN globally enabled, so cuDNN must be
+# *forced* per-call with ``set_priority``.
+_CUDNN_SDPA_PRIORITY = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+def _sdpa_forward_context(name: str | None) -> tp.ContextManager[None]:
+    """Context manager that selects the SDPA kernel for the wrapped forward.
+
+    ``"cudnn"`` forces the cuDNN-first priority list (``set_priority=True``):
+    masked attention runs the Hopper-native sm90 cuDNN kernel (probe 2026-06-21,
+    GH200: latent masked fwd+bwd 5.51ms vs mem-efficient sm80 14.94ms — 2.7×),
+    with mem-efficient as the graceful fallback for any call cuDNN declines.
+    Backward inherits the forward's chosen kernel, so wrapping only the forward
+    suffices. All other names / unset ⇒ ``nullcontext`` (the process-global flags
+    set by ``_apply_sdpa_backend`` govern). Identical attention math throughout.
+    """
+    key = (name or "").strip().lower()
+    if key == "cudnn" and torch.cuda.is_available():
+        return sdpa_kernel(_CUDNN_SDPA_PRIORITY, set_priority=True)
+    return contextlib.nullcontext()
+
+
 def _apply_sdpa_backend(name: str | None) -> None:
     """Science-neutral SDPA backend preference (env-gated, process-global,
     idempotent). Identical attention math — only swaps which fused kernel
-    ``F.scaled_dot_product_attention`` dispatches to. Unset/``"default"`` ⇒ no-op
-    (byte-identical to the stock selection).
+    ``F.scaled_dot_product_attention`` dispatches to. Unset/``"default"`` ⇒ no-op.
 
-    The latent/cross attention pass a key-mask, so PyTorch's flash SDPA is
-    ineligible and SDPA falls to the mem-efficient CUTLASS kernel — which ships
-    only an ``sm80`` build, so on Hopper (GH200) it runs the Ampere kernel via
-    compat (profiled 2026-06-21: attention = ~73% of GPU time, all
-    ``fmha_cutlass*_sm80``). Standalone backend probe (2026-06-21, GH200 aarch64
-    torch 2.10) on our masked shapes: cuDNN runs the bool-mask AND float-bias
-    cases at 0.55ms vs mem-efficient 0.80ms (1.45×); flash returns "no available
-    kernel" for any mask. But the auto-dispatcher prefers mem-efficient over
-    cuDNN for masked SDPA, so merely *enabling* cuDNN is a no-op — mem-efficient
-    must be DISABLED for masked calls to route to cuDNN. ``"cudnn"`` therefore
-    disables mem-efficient and keeps flash (for the no-mask latent time-SA, where
-    flash 0.41ms beats cuDNN 0.49ms; flash auto-excludes itself when a mask is
-    present, so masked calls fall to cuDNN). cuDNN handled every shape/head-dim
-    we dispatch (all hd=64; nomask/bool/float all eligible), so math (always kept)
-    never fires in practice — it is only the formal last-resort fallback. Same
-    attention math throughout; the ±5%% loss tripwire is the backstop.
+    ``"cudnn"`` is handled entirely by ``_sdpa_forward_context`` (forcing cuDNN
+    per-call beats the auto-dispatcher, which rejects cuDNN for the masked+grad
+    latent call) and is a NO-OP here — it must not touch the global flags
+    (disabling mem-efficient globally sends cuDNN-declined calls to MATH → OOM at
+    the latent's L). ``"flash"``/``"efficient"``/``"math"`` set the process-global
+    enable flags directly — diagnostic single-backend forcing for probe runs.
     """
     key = (name or "").strip().lower()
-    if not key or key == "default":
+    if not key or key in ("default", "cudnn"):
         return
-    if key not in ("cudnn", "flash", "efficient", "math"):
+    if key not in ("flash", "efficient", "math"):
         raise ValueError(
             f"unknown V14_SDPA_BACKEND={name!r} "
             "(expected one of: default, cudnn, flash, efficient, math)"
@@ -127,11 +151,7 @@ def _apply_sdpa_backend(name: str | None) -> None:
         return
     be = torch.backends.cuda
     be.enable_math_sdp(True)
-    if key == "cudnn":
-        be.enable_cudnn_sdp(True)
-        be.enable_flash_sdp(True)
-        be.enable_mem_efficient_sdp(False)
-    elif key == "flash":
+    if key == "flash":
         be.enable_cudnn_sdp(False)
         be.enable_flash_sdp(True)
         be.enable_mem_efficient_sdp(False)
@@ -167,9 +187,12 @@ class V14ConvergedBrainModule(pl.LightningModule):
     ) -> None:
         super().__init__()
         # Science-neutral SDPA kernel preference (env, NOT a pydantic/uid field, so
-        # a cudnn run shares the stock run's exca cache). Process-global + applied
-        # before any forward; unset ⇒ no-op. See `_apply_sdpa_backend`.
-        _apply_sdpa_backend(os.environ.get("V14_SDPA_BACKEND"))
+        # a cudnn run shares the stock run's exca cache). flash/efficient/math set
+        # process-global flags here; "cudnn" is applied per-forward via the
+        # priority context manager in `_call_model`. Unset ⇒ no-op. See
+        # `_apply_sdpa_backend` / `_sdpa_forward_context`.
+        self._sdpa_backend_name = os.environ.get("V14_SDPA_BACKEND")
+        _apply_sdpa_backend(self._sdpa_backend_name)
         self.model = model
         self.optim_config = optim_config
         self.ema_tau = float(ema_tau)
@@ -306,7 +329,10 @@ class V14ConvergedBrainModule(pl.LightningModule):
         so the eager path is byte-identical to pre-compile."""
         if self._compile_spec is not None and "model" not in self._compiled_fwd:
             self._build_compiled_model()
-        return self._compiled_fwd.get("model", self.model)(*args, **kwargs)
+        # "cudnn" forces the cuDNN-first SDPA priority for this forward (backward
+        # inherits the kernel); other modes ⇒ nullcontext. Science-neutral.
+        with _sdpa_forward_context(self._sdpa_backend_name):
+            return self._compiled_fwd.get("model", self.model)(*args, **kwargs)
 
     # ==================================================================
     # Monitor instrumentation — ported from V14JointBrainModule.

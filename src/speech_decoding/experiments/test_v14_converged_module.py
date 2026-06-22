@@ -18,6 +18,7 @@ from neuraltrain.optimizers import LightningOptimizer
 from speech_decoding.experiments.v14_converged_module import (
     V14ConvergedBrainModule,
     _apply_sdpa_backend,
+    _sdpa_forward_context,
 )
 from speech_decoding.models.v14_converged import V14ConvergedSSL
 
@@ -796,15 +797,41 @@ def test_apply_sdpa_backend_noop_without_cuda(monkeypatch) -> None:
     _apply_sdpa_backend("cudnn")  # must not raise, must not touch backends
 
 
-def test_apply_sdpa_backend_cudnn_disables_mem_efficient(monkeypatch) -> None:
-    """'cudnn' enables cuDNN + flash + math but DISABLES mem-efficient: the SDPA
-    auto-dispatcher prefers mem-efficient over cuDNN for masked attention, so
-    mem-efficient must be off for masked calls to route to the faster cuDNN
-    kernel (probe 2026-06-21: cuDNN 0.55ms vs mem-efficient 0.80ms). Flash stays
-    on for the no-mask latent time-SA and auto-excludes itself when masked."""
+def test_apply_sdpa_backend_cudnn_touches_no_global_flags(monkeypatch) -> None:
+    """'cudnn' is a NO-OP in _apply_sdpa_backend — it must not flip any global
+    flag. cuDNN is forced per-forward by _sdpa_forward_context (the dispatcher
+    rejects cuDNN for the masked+grad latent call when only globally enabled, and
+    disabling mem-efficient globally would send cuDNN-declined calls to MATH →
+    OOM at the latent's L)."""
     seen = _capture_sdpa_toggles(monkeypatch)
     _apply_sdpa_backend("cudnn")
-    assert seen == {"math": True, "cudnn": True, "flash": True, "mem_efficient": False}
+    assert seen == {}
+
+
+def test_sdpa_forward_context_cudnn_is_priority_kernel(monkeypatch) -> None:
+    """'cudnn' ⇒ a real sdpa_kernel priority context (not nullcontext)."""
+    import contextlib as _c
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    ctx = _sdpa_forward_context("cudnn")
+    assert not isinstance(ctx, _c.nullcontext)
+    # entering/exiting must not raise (the priority list is valid for torch ≥2.6)
+    with ctx:
+        pass
+
+
+@pytest.mark.parametrize("name", [None, "", "default", "flash", "efficient", "math"])
+def test_sdpa_forward_context_non_cudnn_is_nullcontext(name, monkeypatch) -> None:
+    """Every non-'cudnn' mode ⇒ nullcontext (global flags govern those)."""
+    import contextlib as _c
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert isinstance(_sdpa_forward_context(name), _c.nullcontext)
+
+
+def test_sdpa_forward_context_cudnn_nullcontext_without_cuda(monkeypatch) -> None:
+    """No CUDA ⇒ even 'cudnn' degrades to nullcontext (CPU CI safe)."""
+    import contextlib as _c
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert isinstance(_sdpa_forward_context("cudnn"), _c.nullcontext)
 
 
 def test_apply_sdpa_backend_flash_only(monkeypatch) -> None:
