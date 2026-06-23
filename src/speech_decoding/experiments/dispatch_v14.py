@@ -792,6 +792,10 @@ def build_v14_experiment(
     # #249 rank size-balancing (needs group_by_session): match the W DDP ranks'
     # simultaneous batches by electrode count C to remove straggler idle. SSL-only.
     balance_ranks: bool = False,
+    # raw-GPU-util bubble removal (needs group_by_session): all W ranks run the
+    # SAME session per micro-step ⇒ identical C ⇒ no all-reduce straggler. Stronger
+    # than balance_ranks; per-step diversity → 1, grad-accum restores mixing.
+    same_session_across_ranks: bool = False,
     cluster: str | None = None,
     # Slurm resource knobs (B1.4a, 2026-05-29). All default ``None`` so
     # they only override exca's TaskInfra / submitit defaults when set.
@@ -1804,6 +1808,8 @@ def build_v14_experiment(
         group_by_session=(group_by_session if ssl_phase else False),
         # SSL-only rank size-balancing; inert without group_by_session.
         balance_ranks_by_size=(balance_ranks if ssl_phase else False),
+        # SSL-only same-session-across-ranks bubble removal; inert w/o group_by_session.
+        same_session_across_ranks=(same_session_across_ranks if ssl_phase else False),
     )
 
     exca_folder = exca_folder or os.environ.get("EXCA_CACHE_FOLDER")
@@ -2861,6 +2867,18 @@ def _parser() -> argparse.ArgumentParser:
                         "forward (removes DDP straggler idle). Cost proxy = the exact "
                         "per-session post-static-drop electrode count; no-ops to the "
                         "plain stride if BraintreeBank data is absent. Default off.")
+    p.add_argument("--same-session-ranks", action="store_true",
+                   help="Throughput lever (raw-GPU-util bubble removal; needs "
+                        "--group-by-session; stronger than --balance-ranks): all W "
+                        "DDP ranks run the SAME session (different clips) at each "
+                        "micro-step, so their electrode count C is identical and no "
+                        "rank idles at the all-reduce barrier (flat raw GPU util) — "
+                        "vs --balance-ranks which only cost-matches W distinct "
+                        "sessions and still gates on the max-C rank. Per-step session "
+                        "diversity drops to 1; grad-accum restores cross-session "
+                        "mixing (each accum micro-step is a different session). "
+                        "Science-neutral; needs no cost proxy; takes precedence over "
+                        "--balance-ranks. SSL phases only. Default off.")
     # Layer-3 winsor cap (#180). Read-time per-cell |z| clamp on the session
     # robust-z front-end. Cache-NEUTRAL by design: implemented as the env knob
     # V14_SESSION_Z_WINSOR (NOT a serialized view field) so it never forks the
@@ -3846,6 +3864,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         bad_window_dir=args.bad_window_dir,
         group_by_session=args.group_by_session,
         balance_ranks=args.balance_ranks,
+        same_session_across_ranks=args.same_session_ranks,
         mains_notch_hz=args.mains_notch_hz,
         # #17 MNE-LOF bad-channel drop (default OFF). Reaches every phase via this
         # one dict so the chain + single-phase builds stay in lock-step.
@@ -4359,6 +4378,11 @@ def main(argv: list[str] | None = None) -> int:
                 "--converged-static-forward requires --group-by-session (the "
                 "forward needs a session-homogeneous batch; it fails loud "
                 "otherwise).")
+    if args.same_session_ranks and not args.group_by_session:
+        raise SystemExit(
+            "--same-session-ranks requires --group-by-session (it reorganizes "
+            "the session-homogeneous batches so all ranks share one session; "
+            "without grouping there are no per-session batches to align).")
     if _ssl_phase and args.ssl_mode == "joint" and args.pool != "mean":
         raise SystemExit(
             "--ssl-mode joint (B37 D7) requires --pool mean (the "

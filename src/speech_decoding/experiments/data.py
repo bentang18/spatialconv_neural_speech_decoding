@@ -86,7 +86,7 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
     def __init__(
         self, session_key, batch_size, *, shuffle, drop_last,
         seed=0, num_replicas=None, rank=None,
-        session_size=None, balance_ranks=False,
+        session_size=None, balance_ranks=False, same_session=False,
     ):
         self._session_key = list(session_key)
         self._groups: dict = {}
@@ -102,6 +102,7 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
         self._rank = rank
         self._session_size = dict(session_size) if session_size is not None else None
         self._balance_ranks = bool(balance_ranks)
+        self._same_session = bool(same_session)
 
     def set_epoch(self, epoch: int) -> None:
         # Lightning calls this at each train-epoch start. Reshuffles
@@ -169,9 +170,56 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
         perm = torch.randperm(len(groups), generator=gen).tolist()
         return [groups[i] for i in perm]
 
+    def _same_session_groups(self, world: int) -> list[list[list[int]]] | None:
+        # Returns micro-steps of exactly `world` batches that ALL belong to ONE
+        # session (different clips of it), or None to fall back. Because the W
+        # ranks then share one session, their electrode count C — and thus the
+        # O(C²) ragged-forward cost — is IDENTICAL, so no rank idles at the
+        # all-reduce barrier (flat raw GPU util). This is strictly stronger than
+        # _balanced_groups, which only cost-MATCHES W distinct sessions and still
+        # gates the barrier on the max-C rank (the residual intra-step util dip).
+        # Per-step session diversity drops to 1; cross-session mixing is recovered
+        # entirely by grad-accum (each accum micro-step is a different session
+        # after the shuffle). Needs no cost proxy — same session ⇒ same cost by
+        # construction — so it works even when session_size is unavailable.
+        if not self._same_session or world <= 1:
+            return None
+        g = torch.Generator().manual_seed(self._seed + self._epoch)
+        micro_steps: list[list[list[int]]] = []
+        for idxs in self._groups.values():
+            order = list(idxs)
+            if self._shuffle:
+                perm = torch.randperm(len(order), generator=g).tolist()
+                order = [order[i] for i in perm]
+            sbatches: list[list[int]] = []
+            for i in range(0, len(order), self._batch_size):
+                batch = order[i : i + self._batch_size]
+                if self._drop_last and len(batch) < self._batch_size:
+                    continue
+                sbatches.append(batch)
+            # Chunk this session's batches into micro-steps of `world`. Wrap-pad
+            # the partial final chunk within the SAME session so every rank gets a
+            # member and C stays identical (same spirit as _balanced_groups' tail).
+            for c in range(0, len(sbatches), world):
+                chunk = sbatches[c : c + world]
+                if len(chunk) < world:
+                    k = len(chunk)
+                    chunk = chunk + [chunk[i % k] for i in range(world - k)]
+                micro_steps.append(chunk)
+        if not micro_steps:
+            return []
+        # Shuffle micro-step ORDER (rank-independent) so consecutive optimizer
+        # steps see different sessions; distinct generator stream from the
+        # within-session shuffle so the two decorrelate.
+        gen = torch.Generator().manual_seed(self._seed + self._epoch + 0x5A5E)
+        perm = torch.randperm(len(micro_steps), generator=gen).tolist()
+        return [micro_steps[i] for i in perm]
+
     def _sharded(self) -> list[list[int]]:
         world, rank = self._dist()
-        groups = self._balanced_groups(world)
+        groups = self._same_session_groups(world)
+        if groups is None:
+            groups = self._balanced_groups(world)
         if groups is not None:
             # Stride is implicit: rank r takes the r-th member of every group.
             return [grp[rank] for grp in groups]
@@ -189,14 +237,23 @@ class _SessionGroupedBatchSampler(torch.utils.data.Sampler):
     def __iter__(self):
         return iter(self._sharded())
 
+    def _n_batches(self, idxs) -> int:
+        if self._drop_last:
+            return len(idxs) // self._batch_size
+        return (len(idxs) + self._batch_size - 1) // self._batch_size
+
     def __len__(self) -> int:
-        total = 0
-        for idxs in self._groups.values():
-            if self._drop_last:
-                total += len(idxs) // self._batch_size
-            else:
-                total += (len(idxs) + self._batch_size - 1) // self._batch_size
         world, _ = self._dist()
+        if self._same_session and world > 1:
+            # Each session is chunked independently into micro-steps of `world`
+            # (partial final chunk wrap-padded), so the per-rank count is the SUM
+            # of per-session ceil(n_batches / world) — not the global ceil.
+            return sum(
+                (self._n_batches(idxs) + world - 1) // world
+                for idxs in self._groups.values()
+                if self._n_batches(idxs) > 0
+            )
+        total = sum(self._n_batches(idxs) for idxs in self._groups.values())
         if world <= 1:
             return total
         return (total + world - 1) // world
@@ -277,6 +334,18 @@ class Data(pydantic.BaseModel):
     # if BraintreeBank data / ROOT_DIR_BRAINTREEBANK is absent the proxy can't be
     # built and the sampler safely no-ops back to the plain stride. Off by default.
     balance_ranks_by_size: bool = False
+    # Throughput lever (raw-GPU-util bubble removal; requires group_by_session).
+    # Strictly stronger than balance_ranks_by_size: rather than cost-MATCHING W
+    # distinct sessions per micro-step (which still gates the all-reduce barrier on
+    # the max-C rank — the residual intra-step raw-util dip), all W DDP ranks run
+    # the SAME session (different clips) each micro-step, so their electrode count C
+    # — and the O(C²) forward cost — is identical and no rank idles at the barrier
+    # (flat raw GPU util). Per-step session diversity drops to 1; cross-session
+    # mixing is recovered entirely by grad-accum (each accum micro-step is a
+    # different session). Science-neutral (every sample once/epoch; the per-sample
+    # SSL loss has no cross-sample coupling). Needs no cost proxy. Takes precedence
+    # over balance_ranks_by_size. Off by default. See _SessionGroupedBatchSampler.
+    same_session_across_ranks: bool = False
 
     def _session_electrode_counts(self, sessions) -> dict | None:
         """Map each ``(subject_id, trial_id)`` to its post-static-drop electrode
@@ -417,6 +486,7 @@ class Data(pydantic.BaseModel):
                     seed=worker_seed if worker_seed is not None else 0,
                     session_size=session_size,
                     balance_ranks=self.balance_ranks_by_size,
+                    same_session=self.same_session_across_ranks,
                 )
             else:
                 loader_kwargs["batch_size"] = self.batch_size

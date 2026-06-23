@@ -313,3 +313,137 @@ def test_balanced_missing_cost_key_does_not_raise():
         keys, 4, shuffle=True, drop_last=False, seed=20,
         num_replicas=2, rank=0, session_size=size, balance_ranks=True))
     assert all(len({keys[i] for i in b}) == 1 for b in out)
+
+
+# ---- same-session-across-ranks (raw-GPU-util bubble removal) ---------------
+
+
+def _same_session_simultaneous(keys, world, *, seed=4, batch_size=4,
+                               session_size=None, balance=False):
+    """The W batches that co-run at each micro-step (rank r's j-th batch is
+    group j's r-th member). same_session => every group shares ONE session."""
+    per_rank = [
+        list(_SessionGroupedBatchSampler(
+            keys, batch_size, shuffle=True, drop_last=False, seed=seed,
+            num_replicas=world, rank=r,
+            session_size=session_size, balance_ranks=balance, same_session=True))
+        for r in range(world)
+    ]
+    n = len(per_rank[0])
+    assert all(len(pr) == n for pr in per_rank)  # equal per-rank count (no hang)
+    return [[per_rank[r][j] for r in range(world)] for j in range(n)]
+
+
+def test_same_session_co_running_batches_share_one_session():
+    # The defining property: all W ranks at a micro-step run the SAME session,
+    # so their electrode count C is identical (zero straggler at the barrier).
+    keys = _keys({(1, 0): 16, (2, 0): 16, (3, 0): 16, (4, 0): 16})
+    for grp in _same_session_simultaneous(keys, 4, seed=4):
+        sessions = {keys[b[0]] for b in grp}
+        assert len(sessions) == 1, f"co-running ranks span sessions {sessions}"
+
+
+def test_same_session_co_running_batches_are_distinct_clips():
+    # A session with >= world batches: the W co-running batches are DIFFERENT
+    # clips of it (different work content, same C), not the same batch W times.
+    keys = _keys({(1, 0): 32})  # 8 batches, W=4 -> 2 full chunks, no padding
+    for grp in _same_session_simultaneous(keys, 4, seed=4):
+        flat = [i for b in grp for i in b]
+        assert len(flat) == len(set(flat)), "co-running ranks share clips"
+
+
+def test_same_session_covers_every_sample_and_homogeneous():
+    keys = _keys({(1, 0): 16, (2, 0): 12, (3, 0): 8})
+    world = 4
+    seen: set[int] = set()
+    for r in range(world):
+        s = _SessionGroupedBatchSampler(
+            keys, 4, shuffle=True, drop_last=False, seed=6,
+            num_replicas=world, rank=r, same_session=True)
+        for batch in s:
+            assert len({keys[i] for i in batch}) == 1
+            seen.update(batch)
+    assert seen == set(range(len(keys)))  # wrap-pad only repeats, adds no index
+
+
+def test_same_session_equal_per_rank_count_and_len():
+    # 4,3,2 batches per session -> ceil(/4) = 1+1+1 = 3 micro-steps per rank.
+    keys = _keys({(1, 0): 16, (2, 0): 12, (3, 0): 8})
+    world = 4
+    counts = [
+        len(list(_SessionGroupedBatchSampler(
+            keys, 4, shuffle=True, drop_last=False, seed=10,
+            num_replicas=world, rank=r, same_session=True)))
+        for r in range(world)
+    ]
+    assert len(set(counts)) == 1, f"unequal per-rank counts {counts}"
+    one = _SessionGroupedBatchSampler(
+        keys, 4, shuffle=True, drop_last=False, seed=10,
+        num_replicas=world, rank=0, same_session=True)
+    assert len(one) == counts[0] == 3 == sum(1 for _ in one)
+
+
+def test_same_session_takes_precedence_over_balance_ranks():
+    # Both flags + session_size given -> same_session wins (all ranks one session).
+    keys = _keys({(1, 0): 16, (2, 0): 16, (3, 0): 16, (4, 0): 16})
+    size = {(1, 0): 100, (2, 0): 80, (3, 0): 40, (4, 0): 10}
+    for grp in _same_session_simultaneous(
+            keys, 4, seed=4, session_size=size, balance=True):
+        assert len({keys[b[0]] for b in grp}) == 1
+
+
+def test_same_session_works_without_session_size():
+    # Needs no cost proxy (same session => same cost by construction).
+    keys = _keys({(1, 0): 16, (2, 0): 16})
+    for grp in _same_session_simultaneous(keys, 2, seed=4, session_size=None):
+        assert len({keys[b[0]] for b in grp}) == 1
+
+
+def test_same_session_grouping_is_rank_independent():
+    keys = _keys({(1, 0): 16, (2, 0): 16, (3, 0): 16})
+    groups = [
+        _SessionGroupedBatchSampler(
+            keys, 4, shuffle=True, drop_last=False, seed=12,
+            num_replicas=4, rank=r, same_session=True)._same_session_groups(4)
+        for r in range(4)
+    ]
+    assert all(g == groups[0] for g in groups)
+
+
+def test_same_session_world1_is_noop():
+    keys = _keys({(1, 0): 16, (2, 0): 12})
+    plain = list(_SessionGroupedBatchSampler(
+        keys, 4, shuffle=True, drop_last=False, seed=16))
+    same = list(_SessionGroupedBatchSampler(
+        keys, 4, shuffle=True, drop_last=False, seed=16,
+        num_replicas=1, rank=0, same_session=True))
+    assert plain == same
+
+
+def test_same_session_off_is_byte_identical_to_plain_stride():
+    keys = _keys({(1, 0): 16, (2, 0): 12, (3, 0): 9})
+    world = 3
+    for r in range(world):
+        plain = list(_SessionGroupedBatchSampler(
+            keys, 4, shuffle=True, drop_last=False, seed=14,
+            num_replicas=world, rank=r))
+        off = list(_SessionGroupedBatchSampler(
+            keys, 4, shuffle=True, drop_last=False, seed=14,
+            num_replicas=world, rank=r, same_session=False))
+        assert plain == off
+
+
+def test_same_session_deterministic_and_reshuffles_across_epochs():
+    keys = _keys({(1, 0): 16, (2, 0): 16, (3, 0): 16})
+    s = _SessionGroupedBatchSampler(
+        keys, 4, shuffle=True, drop_last=False, seed=19,
+        num_replicas=2, rank=1, same_session=True)
+    twin = _SessionGroupedBatchSampler(
+        keys, 4, shuffle=True, drop_last=False, seed=19,
+        num_replicas=2, rank=1, same_session=True)
+    e0 = list(s)
+    assert e0 == list(twin)  # deterministic under seed
+    s.set_epoch(1)
+    e1 = list(s)
+    assert e1 != e0  # reshuffled (different clips/order)
+    assert len(e1) == len(e0)  # per-rank count is epoch-invariant (no DDP hang)
