@@ -244,7 +244,8 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self._step_timing = os.environ.get("V14_STEP_TIMING") is not None
         self._last_batch_start_time: float | None = None
         # Optional component-split profiler (teacher / student frontend / latent /
-        # M2 / M4), gated by env `V14_PROFILE_STEPS="<wait>,<active>"` — unset ⇒ None
+        # M2 / M4), gated by env `V14_PROFILE_STEPS="<wait>,<active>"` (or
+        # "<wait>:<active>" — colon survives sbatch --export's comma split) — unset ⇒ None
         # ⇒ zero overhead. The forward stamps `record_function("v14/...")` ranges
         # (kept ON always, ~µs each); when this is set, `on_train_start` profiles an
         # `active`-step window AFTER `wait` steps (skip the ~12 static-shape compile
@@ -1082,7 +1083,12 @@ class V14ConvergedBrainModule(pl.LightningModule):
                 and torch.distributed.get_rank() != 0):
             return
         try:
-            wait_s, active_s = (int(x) for x in self._profile_spec.split(","))
+            # Accept ":" as well as "," so the spec survives SLURM `sbatch
+            # --export=VAR=a,b` (the CLI splits the export LIST on commas, which
+            # silently truncates a comma-valued env to its first field). A colon
+            # ("1450:20") passes through --export intact.
+            spec = self._profile_spec.replace(":", ",")
+            wait_s, active_s = (int(x) for x in spec.split(","))
         except ValueError:
             return
         self._profiler = torch.profiler.profile(

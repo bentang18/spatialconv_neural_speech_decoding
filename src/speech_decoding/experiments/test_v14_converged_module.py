@@ -982,3 +982,32 @@ def test_apply_sdpa_backend_math_only(monkeypatch) -> None:
     assert seen == {
         "math": True, "cudnn": False, "flash": False, "mem_efficient": False,
     }
+
+
+# ----------------------------------------------- profiler spec separator parsing
+@pytest.mark.parametrize(
+    "spec, builds",
+    [
+        ("1450:20", True),   # colon survives sbatch --export's comma list-split
+        ("1450,20", True),   # legacy comma form still parses
+        ("1450", False),     # mangled remnant of a comma-split => fail-soft, no profiler
+        ("a:b", False),      # non-int => fail-soft
+    ],
+)
+def test_profile_spec_accepts_colon_and_comma(monkeypatch, spec, builds) -> None:
+    """V14_PROFILE_STEPS parses both "wait,active" and "wait:active". The colon
+    form is what survives `sbatch --export=VAR=1450,20` (the CLI splits the export
+    LIST on commas, truncating the env to "1450"); a single/garbage value must
+    fail-soft to no profiler rather than raise. Stubs torch.profiler.profile so the
+    test exercises only the parse, not a real profiling session."""
+    import torch.profiler as tp_prof
+
+    class _StubProf:
+        def start(self) -> None: ...
+        def stop(self) -> None: ...
+
+    monkeypatch.setenv("V14_PROFILE_STEPS", spec)
+    m = _module()
+    monkeypatch.setattr(tp_prof, "profile", lambda *a, **k: _StubProf())
+    m.on_train_start()
+    assert (m._profiler is not None) is builds
