@@ -677,6 +677,72 @@ def test_forward_populates_rank_taps() -> None:
     assert bool((~taps["student_latent_valid"]).any()), "M2/M4 masking leaves hidden rows"
 
 
+def _effective_rank(z: torch.Tensor) -> float:
+    """RankMe = exp(Shannon entropy of normalised singular values)."""
+    sv = torch.linalg.svdvals(z.float())
+    p = sv / (sv.sum() + 1e-12)
+    p = p[p > 0]
+    return float(torch.exp(-(p * p.log()).sum()))
+
+
+def _strided_subsample(flat: torch.Tensor, n_max: int) -> torch.Tensor:
+    """The OLD (buggy) `_rankme_subsample` — kept here only as the artifact
+    reference the regression must out-perform."""
+    if flat.shape[0] > n_max:
+        stride = flat.shape[0] // n_max
+        flat = flat[::stride][:n_max]
+    return flat
+
+
+def test_rankme_subsample_is_batchsize_stable_unlike_stride() -> None:
+    """Regression for the frontend-RankMe 'needles' (bs32 collapse, bs8 clean).
+
+    The flat tap is ordered (B, C, S, d) with time innermost. A FIXED stride
+    ``n_rows // N_MAX`` phase-locks onto a single time-bin whenever it lands on a
+    multiple of the per-electrode token period S — i.e. when ``B·C/N_MAX`` hits an
+    integer — annihilating temporal rank. That resonance moves with batch size, so
+    bs32 needles where bs8 stays clean. The shipped random subsample has no phase
+    to lock onto, so its rank readout is batch-size-independent."""
+    m = _module()
+    torch.manual_seed(0)
+    d, S, C, n_max = 64, 8, 128, m._RANKME_N_MAX  # n_max=4096
+    time_basis = torch.eye(S, d)  # S orthogonal directions ⇒ full matrix rank = S
+
+    def build(B: int) -> torch.Tensor:
+        s_idx = torch.arange(S).repeat(B * C)  # innermost axis = time, period 1
+        return time_basis[s_idx] + 1e-4 * torch.randn(B * C * S, d)
+
+    Z32 = build(32)  # N=32768, stride=8 == S  → resonant (locks to one bin)
+    Z8 = build(8)    # N=8192,  stride=2       → non-resonant (keeps 4 bins)
+    assert Z32.shape[0] // n_max == S, "test must hit the exact phase-lock resonance"
+
+    # The artifact: strided subsample collapses to ~rank-1 at bs32, far less at bs8.
+    er_stride_32 = _effective_rank(_strided_subsample(Z32, n_max))
+    er_stride_8 = _effective_rank(_strided_subsample(Z8, n_max))
+    assert er_stride_32 < 2.0, "strided bs32 should phase-lock to one time-bin"
+    assert er_stride_8 > er_stride_32 + 1.0, "needle must vanish at bs8 (the symptom)"
+
+    # The fix: random subsample retains the full temporal rank, batch-size-stable.
+    er_rand_32 = _effective_rank(m._rankme_subsample(Z32))
+    er_rand_8 = _effective_rank(m._rankme_subsample(Z8))
+    assert er_rand_32 > S - 1, "random subsample keeps all time-bins at bs32"
+    assert abs(er_rand_32 - er_rand_8) < 1.0, "random subsample is batch-size-stable"
+
+
+def test_rankme_subsample_is_deterministic_and_count_capped() -> None:
+    """Fixed-seed generator ⇒ same input tensor returns the same subset (resume-
+    stable), and the cap is honoured exactly while a small input passes through."""
+    m = _module()
+    torch.manual_seed(1)
+    big = torch.randn(5000, 32)
+    a = m._rankme_subsample(big)
+    b = m._rankme_subsample(big)
+    assert a.shape[0] == m._RANKME_N_MAX
+    assert torch.equal(a, b), "subsample must be deterministic across calls"
+    small = torch.randn(100, 32)
+    assert m._rankme_subsample(small) is small, "no-op below the cap"
+
+
 def _spy(obj, name: str, calls: list[str]):
     """Wrap a bound method/attr so each call records and still delegates."""
     real = getattr(obj, name)

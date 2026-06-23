@@ -725,13 +725,31 @@ class V14ConvergedBrainModule(pl.LightningModule):
 
     # ----------------------------------------------------- forward-tap monitors
     _RANKME_N_MAX: tp.ClassVar[int] = 4096
+    _RANKME_SUBSAMPLE_SEED: tp.ClassVar[int] = 0x9E3779B1
 
     def _rankme_subsample(self, flat: Tensor) -> Tensor:
-        """Evenly-strided subsample to ≤``_RANKME_N_MAX`` rows for a cheap SVD —
-        deterministic (resume-stable) and spanning all batches/electrodes."""
-        if flat.shape[0] > self._RANKME_N_MAX:
-            stride = flat.shape[0] // self._RANKME_N_MAX
-            flat = flat[::stride][: self._RANKME_N_MAX]
+        """Uniform-random subsample to ≤``_RANKME_N_MAX`` rows for a cheap SVD.
+
+        RankMe's singular spectrum is permutation-invariant over rows, so any
+        subset is valid IN EXPECTATION — but it must be unbiased w.r.t. row
+        STRUCTURE. ``flat`` is ordered (batch, electrode, time) with time
+        innermost, so a fixed STRIDE (the old impl) phase-locks onto a single
+        time-bin whenever the stride lands near a multiple of the per-electrode
+        token period S — i.e. whenever ``B·C / _RANKME_N_MAX`` is near an
+        integer — annihilating temporal diversity and crashing the rank
+        estimate ("needle"). That resonance moves with batch size
+        (``stride = n_rows // N_MAX`` ∝ B), so bs32 needles where bs8 does not —
+        a sampling artifact, not a real rank gap. A uniform-random draw has no
+        phase to lock onto: stride-free and count-stable. Fixed-seed generator →
+        same input tensor ⇒ same subset (resume-stable, reproducible). Mirrors
+        the v14_joint_module fix (0d6692e), which never reached this module.
+        """
+        n = flat.shape[0]
+        if n > self._RANKME_N_MAX:
+            g = torch.Generator(device=flat.device)
+            g.manual_seed(self._RANKME_SUBSAMPLE_SEED)
+            idx = torch.randperm(n, generator=g, device=flat.device)
+            flat = flat[idx[: self._RANKME_N_MAX]]
         return flat
 
     def _log_rankme(self, verdict, *, step_name: str, key: str = "") -> None:
