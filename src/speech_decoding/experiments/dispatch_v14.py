@@ -3200,7 +3200,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--sdpa-backend", dest="sdpa_backend",
-        choices=["default", "cudnn", "cudnn_latent", "flash", "efficient", "math"],
+        choices=["default", "cudnn", "cudnn_latent", "cudnn_m4", "flash", "efficient", "math"],
         default="default",
         help="Science-neutral SDPA kernel preference (sets V14_SDPA_BACKEND, read "
              "in V14ConvergedBrainModule). The masked latent/cross attention falls "
@@ -3208,7 +3208,9 @@ def _parser() -> argparse.ArgumentParser:
              "GPU time); 'cudnn' forces the Hopper-native mask-capable sm90 cuDNN "
              "kernel around the WHOLE forward; 'cudnn_latent' scopes that force to "
              "just the large-L cross-electrode latent blocks (where the 2.7x GPU win "
-             "is, sparing small-L calls cuDNN's ~19ms/call host plan-building). "
+             "is, sparing small-L calls cuDNN's ~19ms/call host plan-building); "
+             "'cudnn_m4' scopes it to just the M4 predictor block-loop (the A/B/C "
+             "isolation control vs 'cudnn_latent'). "
              "Identical math (±5%% tripwire is the backstop); 'default' ⇒ stock "
              "selection, byte-identical, no cache blast (env, not a uid field).",
     )
