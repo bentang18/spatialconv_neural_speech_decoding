@@ -236,6 +236,16 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self._update_snapshot: dict[int, Tensor] | None = None
         self._last_micro_bsz: int | None = None
         self._last_batch_end_time: float | None = None
+        # Optional component-split profiler (teacher / student frontend / latent /
+        # M2 / M4), gated by env `V14_PROFILE_STEPS="<wait>,<active>"` — unset ⇒ None
+        # ⇒ zero overhead. The forward stamps `record_function("v14/...")` ranges
+        # (kept ON always, ~µs each); when this is set, `on_train_start` profiles an
+        # `active`-step window AFTER `wait` steps (skip the ~12 static-shape compile
+        # graphs) on rank 0 only, and `_dump_profile` prints a CUDA-time table keyed
+        # by those ranges + a chrome trace. Compile-safe: Dynamo traces through
+        # `record_function`, so the labels survive `--compile --sdpa-backend cudnn`.
+        self._profile_spec = os.environ.get("V14_PROFILE_STEPS")
+        self._profiler: tp.Any = None
         # RankMe normalised warn/alarm thresholds (the teacher_rank_monitor
         # defaults; surfaced as attrs so a future run can override per-arch).
         self._rankme_warn_threshold = float(RANKME_NORMALISED_WARN)
@@ -1012,6 +1022,58 @@ class V14ConvergedBrainModule(pl.LightningModule):
                 torch.cuda.max_memory_allocated() / 1e9, on_step=True,
             )
             torch.cuda.reset_peak_memory_stats()
+        if self._profiler is not None:
+            self._profiler.step()
+
+    # ---------------------------------------------- component-split profiler arm
+    def on_train_start(self) -> None:
+        """Build + start the component-split profiler when `V14_PROFILE_STEPS` is
+        set (rank 0 only). `wait` skips the static-shape compile graphs; after a
+        2-step warmup it records `active` steps, then `_dump_profile` fires with a
+        CUDA-time table keyed by the forward's `record_function("v14/...")` ranges.
+        Run the profiling probe at accumulate_grad_batches=1 so one batch == one
+        opt-step (the schedule counts batches)."""
+        if self._profile_spec is None:
+            return
+        if (torch.distributed.is_available() and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() != 0):
+            return
+        try:
+            wait_s, active_s = (int(x) for x in self._profile_spec.split(","))
+        except ValueError:
+            return
+        self._profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=wait_s, warmup=2, active=active_s, repeat=1),
+            on_trace_ready=self._dump_profile,
+            record_shapes=False, with_stack=False,
+        )
+        self._profiler.start()
+
+    def _dump_profile(self, prof: tp.Any) -> None:
+        table = prof.key_averages().table(
+            sort_by="self_cuda_time_total", row_limit=30)
+        print("=== V14 component profile (self CUDA time) ===\n" + table,
+              flush=True)
+        out_dir = os.environ.get("EXCA_CACHE_FOLDER", ".")
+        path = os.path.join(out_dir, f"v14_profile_trace_{os.getpid()}.json")
+        try:
+            prof.export_chrome_trace(path)
+            print(f"=== V14 profile chrome trace -> {path} ===", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"=== V14 profile trace export failed: {exc} ===", flush=True)
+
+    def on_train_end(self) -> None:
+        if self._profiler is not None:
+            try:
+                self._profiler.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._profiler = None
 
     def on_before_zero_grad(self, optimizer: tp.Any) -> None:  # noqa: ARG002
         """EMA tick once per optimiser step (after the step, before zero_grad).

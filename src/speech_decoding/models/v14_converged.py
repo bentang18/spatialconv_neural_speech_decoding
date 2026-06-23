@@ -36,6 +36,7 @@ from math import comb
 import torch
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.profiler import record_function
 
 from speech_decoding.models.v14_encoder import (
     _JointTokenBlock,
@@ -1315,7 +1316,7 @@ class V14ConvergedSSL(nn.Module):
         masked key adds 0 to the softmax and masked tokens are never read."""
         # ---- teacher: full REAL electrode set, RAGGED (drop padding), post-FE ---
         teacher_vis = electrode_mask.new_ones(m2_mask.shape)       # (B,C,38) all True
-        with torch.no_grad():
+        with record_function("v14/teacher_frontend"), torch.no_grad():
             t_f = self.teacher_frontend.forward_ragged(
                 slow, beta, hg, electrode_mask, teacher_vis,       # (B,C,38,d)
                 fixed_r=None if static is None else static.teacher_elec_k,
@@ -1325,17 +1326,19 @@ class V14ConvergedSSL(nn.Module):
         # ---- student: only un-tubed real electrodes, only visible tokens --------
         student_vis = ~m2_mask                                     # (B,C,38) visible
         student_keep = electrode_mask & ~tube_mask                 # drop tubed+padded
-        s_f = self.student_frontend.forward_ragged(
-            slow, beta, hg, student_keep, student_vis,
-            fixed_r=None if static is None else static.student_elec_k,
-            fixed_lk=None if static is None else static.s_vis)
+        with record_function("v14/student_frontend"):
+            s_f = self.student_frontend.forward_ragged(
+                slow, beta, hg, student_keep, student_vis,
+                fixed_r=None if static is None else static.student_elec_k,
+                fixed_lk=None if static is None else static.s_vis)
         latent_vis = (
             electrode_mask[:, :, None] & (~tube_mask)[:, :, None] & student_vis
         )                                                          # (B,C,38)
-        s_l = self.latent.forward_ragged(
-            s_f, parcel_per_electrode, latent_vis,
-            fixed_nv=None if static is None else static.latent_nv,
-        )
+        with record_function("v14/latent"):
+            s_l = self.latent.forward_ragged(
+                s_f, parcel_per_electrode, latent_vis,
+                fixed_nv=None if static is None else static.latent_nv,
+            )
         # Stash the taps the RankMe monitor needs — t_f is already detached; s_l
         # carries grad so detach. `latent_vis` (B,C,38) marks the rows the latent
         # actually wrote (zeros elsewhere) so the monitor ranks only real tokens.
@@ -1345,13 +1348,15 @@ class V14ConvergedSSL(nn.Module):
             "student_latent_valid": latent_vis,
         }
 
-        l_m2, m2_bands = self._m2_loss_ragged(
-            s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask,
-            static=static)
-        l_m4, m4_bands = self._m4_loss_ragged(
-            s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
-            tubed_parcels, tubed_parcel_mask, static=static,
-        )
+        with record_function("v14/m2"):
+            l_m2, m2_bands = self._m2_loss_ragged(
+                s_f, t_f, m2_mask, student_vis, electrode_mask, tube_mask,
+                static=static)
+        with record_function("v14/m4"):
+            l_m4, m4_bands = self._m4_loss_ragged(
+                s_l, t_f, parcel_per_electrode, electrode_mask, latent_vis,
+                tubed_parcels, tubed_parcel_mask, static=static,
+            )
         loss = self.lambda_m2 * l_m2 + self.lambda_m4 * l_m4
         out = _assemble_losses(loss, l_m2, l_m4, m2_bands, m4_bands)
         out.update(self._stem_norm_diag())
