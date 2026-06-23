@@ -628,6 +628,32 @@ def test_on_train_batch_end_emits_throughput() -> None:
     assert logged["train_mon_samples_per_sec"] > 0.0
 
 
+def test_step_timing_splits_into_data_wait_and_compute(monkeypatch) -> None:
+    """V14_STEP_TIMING ⇒ on_train_batch_end emits data_wait_s + compute_s that sum
+    to step_time_s — the host-gap split used to attribute the all-GPU-idle bubble.
+    OFF (default) ⇒ neither key is logged."""
+    monkeypatch.setenv("V14_STEP_TIMING", "1")
+    m = _module()
+    logged = _capture_logs(m)
+    batch = _batch()
+    m.on_train_batch_end(None, batch, 0)          # seeds prev-end timestamp
+    m.on_train_batch_start(batch, 1)              # marks compute start (after a wait)
+    m.on_train_batch_end(None, batch, 1)
+    assert "train_mon_data_wait_s" in logged and "train_mon_compute_s" in logged
+    split = logged["train_mon_data_wait_s"] + logged["train_mon_compute_s"]
+    assert abs(split - logged["train_mon_step_time_s"]) < 1e-6
+
+    m2 = _module()                                # flag unset ⇒ no split logged
+    monkeypatch.delenv("V14_STEP_TIMING", raising=False)
+    m2._step_timing = False
+    logged2 = _capture_logs(m2)
+    m2.on_train_batch_end(None, batch, 0)
+    m2.on_train_batch_start(batch, 1)
+    m2.on_train_batch_end(None, batch, 1)
+    assert "train_mon_data_wait_s" not in logged2
+    assert "train_mon_step_time_s" in logged2   # base throughput still emitted
+
+
 def test_monitor_from_step_emits_rankme_coverage_inputstats() -> None:
     m = _module()
     logged = _capture_logs(m)

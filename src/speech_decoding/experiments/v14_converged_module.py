@@ -236,6 +236,13 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self._update_snapshot: dict[int, Tensor] | None = None
         self._last_micro_bsz: int | None = None
         self._last_batch_end_time: float | None = None
+        # Diagnostic per-step host-gap split (env `V14_STEP_TIMING=1`, OFF in
+        # production ⇒ zero added logs). Splits the existing end-to-end
+        # ``step_time_s`` into ``data_wait_s`` (gap before the step = dataloader
+        # wait + between-step host work) and ``compute_s`` (in-step fwd/bwd/opt),
+        # to attribute the all-GPU-idle bubble seen at 100ms nvidia-smi.
+        self._step_timing = os.environ.get("V14_STEP_TIMING") is not None
+        self._last_batch_start_time: float | None = None
         # Optional component-split profiler (teacher / student frontend / latent /
         # M2 / M4), gated by env `V14_PROFILE_STEPS="<wait>,<active>"` — unset ⇒ None
         # ⇒ zero overhead. The forward stamps `record_function("v14/...")` ranges
@@ -1017,6 +1024,15 @@ class V14ConvergedBrainModule(pl.LightningModule):
             )
         self._maybe_log_true_update_ratio()
 
+    def on_train_batch_start(
+        self, batch: tp.Any, batch_idx: int,  # noqa: ARG002
+    ) -> None:
+        """Stamp the step-compute start so ``on_train_batch_end`` can split the
+        end-to-end ``step_time_s`` into host-wait vs in-step compute. Diagnostic
+        only (``V14_STEP_TIMING``); a single ``perf_counter`` read otherwise."""
+        if self._step_timing:
+            self._last_batch_start_time = time.perf_counter()
+
     def on_train_batch_end(
         self, outputs: tp.Any, batch: tp.Any, batch_idx: int,  # noqa: ARG002
     ) -> None:
@@ -1034,6 +1050,15 @@ class V14ConvergedBrainModule(pl.LightningModule):
                 bsz = _infer_batch_size(getattr(batch, "data", batch))
                 if bsz is not None:
                     self.log("train_mon_samples_per_sec", bsz / dt, on_step=True)
+                # Host-gap split (V14_STEP_TIMING): data_wait = gap before this
+                # step's compute (dataloader + between-step host work); compute =
+                # fwd/bwd/opt inside the step. data_wait + compute == step_time_s.
+                start = self._last_batch_start_time
+                if self._step_timing and start is not None:
+                    data_wait = max(0.0, start - prev)
+                    compute = max(0.0, now - start)
+                    self.log("train_mon_data_wait_s", data_wait, on_step=True)
+                    self.log("train_mon_compute_s", compute, on_step=True)
         if torch.cuda.is_available():
             self.log(
                 "train_mon_gpu_mem_gb",
