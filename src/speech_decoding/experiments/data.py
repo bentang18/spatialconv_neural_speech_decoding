@@ -376,9 +376,17 @@ class Data(pydantic.BaseModel):
                 worker_init_fn=worker_init_fn,
                 pin_memory=self.pin_memory,
             )
-            if self.group_by_session and split == "train":
-                # Session-homogeneous TRAIN batches (zero electrode padding). Eval
-                # splits keep the parity-locked plain loader untouched.
+            if self.group_by_session:
+                # Session-homogeneous batches (zero electrode padding) for EVERY
+                # split. The converged static-forward path requires a uniform
+                # per-batch electrode count (compute_static_shapes raises on a
+                # session-mixed batch), so val/test must be grouped too — not just
+                # train. group_by_session is SSL-phase-only, so the P4 Neuroprobe-
+                # parity eval (ssl_phase=False) still keeps the plain loader.
+                # Eval splits iterate deterministically (shuffle=False); the sampler
+                # self-shards equally across DDP ranks (no uneven-input hang), so
+                # val/test become rank-sharded rather than full-pass-per-rank —
+                # metrics all-reduce to the same global mean.
                 triggers = selected.triggers
                 if len(triggers) != len(selected):
                     raise ValueError(
@@ -402,7 +410,7 @@ class Data(pydantic.BaseModel):
                 loader_kwargs["batch_sampler"] = _SessionGroupedBatchSampler(
                     session_key,
                     self.batch_size,
-                    shuffle=True,
+                    shuffle=(split == "train"),
                     drop_last=False,
                     # rank-INDEPENDENT seed so every DDP rank builds the same
                     # full batch list before self-sharding (see class docstring).

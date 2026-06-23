@@ -61,6 +61,86 @@ def test_data_builds_split_loaders() -> None:
     assert batch.data["target"].shape == (2, 1)
 
 
+class TinySessionStudy(ns.Step):
+    """Two sessions (subject_id, trial_id), each spanning all three splits, so a
+    naive split loader would mix sessions in a batch."""
+
+    def _run(self):
+        rows = []
+        splits = ["train", "train", "val", "test"]
+        idx = 0
+        for subj, trial in ((1, 0), (2, 0)):
+            for split in splits:
+                rows.append(
+                    {
+                        "type": "Stimulus",
+                        "start": float(idx * 2),
+                        "duration": 0.2,
+                        "timeline": "run0",
+                        "code": idx % 2,
+                        "split": split,
+                        "subject_id": subj,
+                        "trial_id": trial,
+                    }
+                )
+                idx += 1
+        return ns.events.standardize_events(pd.DataFrame(rows))
+
+
+def _session_data(*, group_by_session: bool) -> Data:
+    return Data(
+        study=TinySessionStudy(),
+        segmenter={
+            "extractors": {
+                "input": {
+                    "name": "Pulse",
+                    "event_types": "Stimulus",
+                    "frequency": 16.0,
+                    "aggregation": "single",
+                },
+                "target": {
+                    "name": "EventField",
+                    "event_types": "Stimulus",
+                    "event_field": "code",
+                },
+            },
+            "trigger_query": "type == 'Stimulus'",
+            "start": 0.0,
+            "duration": 1.0,
+        },
+        batch_size=2,
+        group_by_session=group_by_session,
+    )
+
+
+def test_group_by_session_groups_eval_splits_too() -> None:
+    # The static-forward path needs session-homogeneous batches on EVERY split, so
+    # val/test must use the grouped sampler — not just train (the bug that crashed
+    # the converged run at the first in-training validation pass).
+    from speech_decoding.experiments.data import _SessionGroupedBatchSampler
+
+    loaders = _session_data(group_by_session=True).build()
+    for split in ("train", "val", "test"):
+        assert isinstance(
+            loaders[split].batch_sampler, _SessionGroupedBatchSampler
+        ), f"{split} loader is not session-grouped under group_by_session"
+        # Every batch is one session: the input is a fixed shape, but the guard is
+        # the sampler type above; here just confirm batches are drawable.
+        assert next(iter(loaders[split])) is not None
+
+
+def test_group_by_session_off_leaves_plain_loaders() -> None:
+    # SSL-phase-only safety: with group_by_session OFF (the P4 parity path) NO split
+    # gets the grouped sampler.
+    from speech_decoding.experiments.data import _SessionGroupedBatchSampler
+
+    loaders = _session_data(group_by_session=False).build()
+    for split in ("train", "val", "test"):
+        assert not isinstance(
+            loaders[split].batch_sampler, _SessionGroupedBatchSampler
+        )
+
+
 def test_experiment_dry_run(tmp_path) -> None:
     run_root = tmp_path / "runs"
     xp = Experiment(

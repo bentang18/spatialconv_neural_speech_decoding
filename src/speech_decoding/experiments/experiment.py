@@ -397,10 +397,11 @@ class Experiment(BaseExperiment):
             # (see _SessionGroupedBatchSampler). Tell Lightning NOT to also inject
             # a DistributedSampler: it CAN'T wrap a custom batch_sampler (raises
             # "doesn't subclass PyTorch's BatchSampler"), and the sampler already
-            # partitions batches disjointly per rank. Val/test then run unsharded
-            # (each rank computes the full val pass, capped by limit_val_batches) —
-            # correct (all ranks all-reduce to identical metrics), negligible at
-            # ~20 val batches.
+            # partitions batches disjointly per rank. Train AND val/test now all use
+            # the grouped sampler (session-homogeneous batches are required by the
+            # static-forward path on every split), so each rank draws a disjoint,
+            # equal-size shard of every split — correct (all ranks all-reduce to
+            # identical metrics), and no DDP uneven-input hang (equal batch count).
             kwargs["use_distributed_sampler"] = False
         if self.max_steps is not None:
             # Step budget overrides the epoch cap; max_epochs=-1 lets the run go
