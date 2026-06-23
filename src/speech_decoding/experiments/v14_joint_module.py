@@ -1473,6 +1473,10 @@ class V14JointBrainModule(pl.LightningModule):
     # ~30 ms on H100 while staying well above the d=256 ceiling for
     # the rank estimate to converge.
     _RANKME_N_MAX: tp.ClassVar[int] = 4096
+    # Fixed salt for the RankMe random subsample (below). Any constant works;
+    # it only needs to be deterministic so a resumed run on the same input
+    # tensor reproduces the same subset (and the same logged rank).
+    _RANKME_SUBSAMPLE_SEED: tp.ClassVar[int] = 0x9E3779B1
 
     def _run_parcel_coverage_monitor(
         self, *, latent_valid: Tensor, step_name: str,
@@ -1574,17 +1578,29 @@ class V14JointBrainModule(pl.LightningModule):
         _band(batch_data.get("electrode_tokens_high"), "_high")
 
     def _rankme_subsample(self, flat: Tensor) -> Tensor:
-        """Evenly-strided subsample to <=``_RANKME_N_MAX`` rows for a cheap SVD.
+        """Uniform-random subsample to <=``_RANKME_N_MAX`` rows for a cheap SVD.
 
-        Strided (NOT a head slice) so the sample spans all batches/electrodes
-        rather than biasing to the first rows of batch 0 — RankMe's spectrum is
-        permutation-invariant over ALL rows, but a head slice of rows sorted by
-        (batch, position) is a biased subsample. Deterministic → resume-stable.
+        RankMe's singular spectrum is permutation-invariant over rows, so any
+        subset is valid IN EXPECTATION — but the subset must be unbiased w.r.t.
+        row STRUCTURE. ``flat`` is ordered (batch, parcel/electrode, freq, time),
+        so a fixed STRIDE (the old impl) locks onto one (freq, time) phase
+        whenever the stride shares a factor with the per-parcel period — e.g. a
+        stride that lands only on time-bin 0 — collapsing temporal/spectral
+        diversity and making the rank estimate jitter ("needle") with the exact
+        valid-row count. That count moves with batch size, so two otherwise
+        equivalent runs (bs32 vs bs8) read different troughs purely from the
+        stride×period interaction — a sampling artifact, not a real rank gap. A
+        uniform-random draw has no phase to lock onto, so the estimate is
+        stride-free and count-stable. Fixed-seed generator → given the same
+        input tensor the same subset is drawn (resume-stable, reproducible).
         Shared by the M4 and M2 front-end probes so they subsample identically.
         """
-        if flat.shape[0] > self._RANKME_N_MAX:
-            stride = flat.shape[0] // self._RANKME_N_MAX
-            flat = flat[::stride][: self._RANKME_N_MAX]
+        n = flat.shape[0]
+        if n > self._RANKME_N_MAX:
+            g = torch.Generator(device=flat.device)
+            g.manual_seed(self._RANKME_SUBSAMPLE_SEED)
+            idx = torch.randperm(n, generator=g, device=flat.device)
+            flat = flat[idx[: self._RANKME_N_MAX]]
         return flat
 
     def _log_rankme(self, verdict, *, step_name: str, key: str = "") -> None:
