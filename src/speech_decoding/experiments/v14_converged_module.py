@@ -658,29 +658,40 @@ class V14ConvergedBrainModule(pl.LightningModule):
         # to host ONCE and reuse for both mask sampling and the static-shape
         # reduction below — same tensor + same CPU generator ⇒ bit-identical masks,
         # one fewer D2H copy than the old per-call ``.cpu()`` form.
-        ppe_cpu = ppe.cpu()
-        emask_cpu = emask.cpu()
-        if self.tube_cfg is None:
-            masks = sample_ssl_masks(
-                ppe_cpu, emask_cpu, self._mask_gen,
-                m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
-            )
-        else:
-            masks = sample_ssl_masks_static(
-                ppe_cpu, emask_cpu, self._mask_gen,
-                m2_cfg=self.m2_cfg, tube_cfg=self.tube_cfg, bands=self.model.bands,
-            )
+        #
+        # The four ``v14/mask_*`` ranges below name the host-side mask build for the
+        # bubble probe: ``mask_d2h`` self-CPU absorbs the GPU-DRAIN sync (``.cpu()``
+        # blocks until the prior step's queued GPU work finishes — "good" idle, the
+        # GPU was busy); ``mask_sample`` + ``mask_static_shapes`` are PURE CPU work
+        # with NOTHING queued on the GPU (= the all-GPU-idle bubble); ``mask_h2d`` is
+        # the upload. Annotations only — inert when no profiler is active (~ns).
+        with torch.profiler.record_function("v14/mask_d2h"):
+            ppe_cpu = ppe.cpu()
+            emask_cpu = emask.cpu()
+        with torch.profiler.record_function("v14/mask_sample"):
+            if self.tube_cfg is None:
+                masks = sample_ssl_masks(
+                    ppe_cpu, emask_cpu, self._mask_gen,
+                    m2_cfg=self.m2_cfg, m4_cfg=self.m4_cfg, bands=self.model.bands,
+                )
+            else:
+                masks = sample_ssl_masks_static(
+                    ppe_cpu, emask_cpu, self._mask_gen,
+                    m2_cfg=self.m2_cfg, tube_cfg=self.tube_cfg, bands=self.model.bands,
+                )
         # Static-shape forward: derive the CPU-known gather lengths from the CPU
         # masks (cheap CPU reductions, no GPU sync) BEFORE the device move, then pass
         # them through so every gather slices to a fixed length. Only when the static
         # mask regime is active (tube_cfg set) and the flag is on.
         static = None
         if self.static_forward and self.tube_cfg is not None:
-            static = compute_static_shapes(
-                emask_cpu.to(torch.bool), masks["m2_mask"], masks["tube_mask"],
-                self.tube_cfg.p_fixed,
-            )
-        masks = {k: v.to(slow.device) for k, v in masks.items()}
+            with torch.profiler.record_function("v14/mask_static_shapes"):
+                static = compute_static_shapes(
+                    emask_cpu.to(torch.bool), masks["m2_mask"], masks["tube_mask"],
+                    self.tube_cfg.p_fixed,
+                )
+        with torch.profiler.record_function("v14/mask_h2d"):
+            masks = {k: v.to(slow.device) for k, v in masks.items()}
         return self._call_model(slow, beta, hg, ppe, emask, **masks, static=static)
 
     # ------------------------------------------------------------------- loops
@@ -1091,11 +1102,16 @@ class V14ConvergedBrainModule(pl.LightningModule):
             wait_s, active_s = (int(x) for x in spec.split(","))
         except ValueError:
             return
+        # CPU-only by default: the per-step bubble is HOST-SIDE (GPU idle while the
+        # CPU builds masks), so CPU self-time + the v14/mask_* ranges name it, and we
+        # AVOID kineto's CUDA-activity (CUPTI) post-processing, which OOMs (large
+        # `active`) or HANGS (chrome export) at cycle-end on aarch64 GH200 + torch
+        # 2.10. Opt back into CUDA kernel timing with V14_PROFILE_CUDA=1 (at risk).
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if os.environ.get("V14_PROFILE_CUDA"):
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
         self._profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             schedule=torch.profiler.schedule(
                 wait=wait_s, warmup=2, active=active_s, repeat=1),
             on_trace_ready=self._dump_profile,
@@ -1104,10 +1120,18 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self._profiler.start()
 
     def _dump_profile(self, prof: tp.Any) -> None:
-        table = prof.key_averages().table(
-            sort_by="self_cuda_time_total", row_limit=30)
-        print("=== V14 component profile (self CUDA time) ===\n" + table,
-              flush=True)
+        # Default CPU-only: sort by self-CPU time so the host-side bubble (the
+        # v14/mask_* ranges + their aten ops) sits at the top. Only sort by CUDA
+        # time when V14_PROFILE_CUDA opted CUDA activity in.
+        have_cuda = bool(os.environ.get("V14_PROFILE_CUDA"))
+        sort_key = "self_cuda_time_total" if have_cuda else "self_cpu_time_total"
+        label = "self CUDA time" if have_cuda else "self CPU time"
+        table = prof.key_averages().table(sort_by=sort_key, row_limit=40)
+        print(f"=== V14 component profile ({label}) ===\n" + table, flush=True)
+        # Chrome trace export is the kineto step that HANGS on aarch64 GH200 +
+        # torch 2.10 — opt-in only (V14_PROFILE_TRACE=1), never on the default path.
+        if not os.environ.get("V14_PROFILE_TRACE"):
+            return
         out_dir = os.environ.get("EXCA_CACHE_FOLDER", ".")
         path = os.path.join(out_dir, f"v14_profile_trace_{os.getpid()}.json")
         try:
