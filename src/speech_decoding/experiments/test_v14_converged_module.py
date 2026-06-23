@@ -732,6 +732,49 @@ def test_step_timing_splits_into_data_wait_and_compute(monkeypatch) -> None:
     assert "train_mon_step_time_s" in logged2   # base throughput still emitted
 
 
+def test_mask_timing_is_inert_on_loss_and_flushes(monkeypatch, capsys) -> None:
+    """V14_MASK_TIMING ⇒ `_step` records per-section perf_counter walls and flushes a
+    median/p10/p90 table every N steps — the kineto-free bubble probe (v4). It is pure
+    instrumentation: the loss path is BIT-IDENTICAL with timing on vs off. Flush clears
+    the buffer; the table names the host-side bubble (mask_sample + mask_static)."""
+    monkeypatch.setenv("V14_MASK_TIMING", "2")
+    m = _module(tube_cfg=TightPackConfig(ratio=0.25), static_forward=True, mask_seed=7)
+    assert m._mask_timing_every == 2
+    data = _batch(B=3, C=6).data
+    # reference loss with timing forced off (compute path untouched)
+    m._mask_timing_every = 0
+    m._mask_gen.manual_seed(7)
+    with torch.no_grad():
+        ref = m._step(data)
+    # timing on: must be bit-identical, records one step, no flush yet (need 2)
+    m._mask_timing_every = 2
+    m._mask_gen.manual_seed(7)
+    with torch.no_grad():
+        out1 = m._step(data)
+    for k in ("loss", "l_m2", "l_m4"):
+        assert torch.equal(out1[k], ref[k]), k
+    assert all(len(v) == 1 for v in m._mask_timing_buf.values())
+    assert "V14 mask timing" not in capsys.readouterr().out
+    # second step → flush: prints the table and clears the buffer
+    m._mask_gen.manual_seed(7)
+    with torch.no_grad():
+        m._step(data)
+    out = capsys.readouterr().out
+    assert "V14 mask timing (kineto-free)" in out
+    assert "BUBBLE samp+stat" in out and "forward" in out
+    assert all(len(v) == 0 for v in m._mask_timing_buf.values())
+
+
+def test_mask_timing_off_records_nothing() -> None:
+    """Default (env unset) ⇒ `_mask_timing_every == 0` ⇒ `_step` takes not a single
+    perf_counter read and the buffer never grows."""
+    m = _module()
+    assert m._mask_timing_every == 0
+    with torch.no_grad():
+        m._step(_batch().data)
+    assert all(len(v) == 0 for v in m._mask_timing_buf.values())
+
+
 def test_monitor_from_step_emits_rankme_coverage_inputstats() -> None:
     m = _module()
     logged = _capture_logs(m)

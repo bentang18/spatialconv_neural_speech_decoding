@@ -254,6 +254,27 @@ class V14ConvergedBrainModule(pl.LightningModule):
         # `record_function`, so the labels survive `--compile --sdpa-backend cudnn`.
         self._profile_spec = os.environ.get("V14_PROFILE_STEPS")
         self._profiler: tp.Any = None
+        # Kineto-free per-section mask timing (env `V14_MASK_TIMING=<N>` ⇒ print a
+        # median/p10/p90 table over every N train steps; unset ⇒ zero overhead).
+        # Pure `perf_counter` + ONE `cuda.synchronize` after the forward — names the
+        # all-GPU-idle bubble (mask_sample + mask_static_shapes are pure CPU with
+        # NOTHING queued on the GPU) WITHOUT torch.profiler/kineto, which OOMs (CUDA
+        # activity) or HANGS (chrome export) at cycle-end on aarch64 GH200 + torch
+        # 2.10. mask_d2h absorbs the prior step's GPU-drain; mask_h2d is the upload;
+        # fwd is the forward GPU time (the post-forward sync makes it real, at the
+        # cost of one sync this probe-only path adds — production leaves it OFF).
+        # Rank-0 + training only.
+        _mt = os.environ.get("V14_MASK_TIMING")
+        self._mask_timing_every = 0
+        if _mt is not None:
+            try:
+                _mt_n = int(_mt)
+            except ValueError:
+                _mt_n = 50
+            self._mask_timing_every = _mt_n if _mt_n > 0 else 50
+        self._mask_timing_buf: dict[str, list[float]] = {
+            "d2h": [], "sample": [], "static": [], "h2d": [], "fwd": [],
+        }
         # RankMe normalised warn/alarm thresholds (the teacher_rank_monitor
         # defaults; surfaced as attrs so a future run can override per-arch).
         self._rankme_warn_threshold = float(RANKME_NORMALISED_WARN)
@@ -653,6 +674,11 @@ class V14ConvergedBrainModule(pl.LightningModule):
         → `model.forward`. Returns `{loss, l_m2, l_m4}` plus the per-band
         diagnostics `l_m2_{beta,hg}` / `l_m4_{slow,beta,hg}`."""
         slow, beta, hg, ppe, emask = self._converged_inputs(data)
+        # Kineto-free per-section wall timing (V14_MASK_TIMING). Only when armed +
+        # in training mode; reads `perf_counter` between the four mask ranges and
+        # syncs once after the forward. Off ⇒ `mt` False ⇒ not a single extra call.
+        mt = bool(self._mask_timing_every) and self.training
+        _t: list[float] = [time.perf_counter()] if mt else []
         # Mask sampling runs on CPU (a CPU generator can't drive CUDA randperm);
         # move the masks back to the feature device for the forward. Copy ppe/emask
         # to host ONCE and reuse for both mask sampling and the static-shape
@@ -668,6 +694,8 @@ class V14ConvergedBrainModule(pl.LightningModule):
         with torch.profiler.record_function("v14/mask_d2h"):
             ppe_cpu = ppe.cpu()
             emask_cpu = emask.cpu()
+        if mt:
+            _t.append(time.perf_counter())
         with torch.profiler.record_function("v14/mask_sample"):
             if self.tube_cfg is None:
                 masks = sample_ssl_masks(
@@ -679,6 +707,8 @@ class V14ConvergedBrainModule(pl.LightningModule):
                     ppe_cpu, emask_cpu, self._mask_gen,
                     m2_cfg=self.m2_cfg, tube_cfg=self.tube_cfg, bands=self.model.bands,
                 )
+        if mt:
+            _t.append(time.perf_counter())
         # Static-shape forward: derive the CPU-known gather lengths from the CPU
         # masks (cheap CPU reductions, no GPU sync) BEFORE the device move, then pass
         # them through so every gather slices to a fixed length. Only when the static
@@ -690,9 +720,71 @@ class V14ConvergedBrainModule(pl.LightningModule):
                     emask_cpu.to(torch.bool), masks["m2_mask"], masks["tube_mask"],
                     self.tube_cfg.p_fixed,
                 )
+        if mt:
+            _t.append(time.perf_counter())
         with torch.profiler.record_function("v14/mask_h2d"):
             masks = {k: v.to(slow.device) for k, v in masks.items()}
-        return self._call_model(slow, beta, hg, ppe, emask, **masks, static=static)
+        if mt:
+            _t.append(time.perf_counter())
+        out = self._call_model(slow, beta, hg, ppe, emask, **masks, static=static)
+        if mt:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t.append(time.perf_counter())
+            self._mask_timing_record(_t)
+        return out
+
+    def _mask_timing_record(self, t: list[float]) -> None:
+        """Accumulate one step's per-section walls (perf_counter stamps in `t`,
+        6 entries: start, +d2h, +sample, +static, +h2d, +forward); flush a
+        median/p10/p90 table every `_mask_timing_every` steps. Prints on rank 0;
+        clears on every rank so non-zero ranks stay bounded."""
+        if len(t) < 6:
+            return
+        buf = self._mask_timing_buf
+        buf["d2h"].append((t[1] - t[0]) * 1e3)
+        buf["sample"].append((t[2] - t[1]) * 1e3)
+        buf["static"].append((t[3] - t[2]) * 1e3)
+        buf["h2d"].append((t[4] - t[3]) * 1e3)
+        buf["fwd"].append((t[5] - t[4]) * 1e3)
+        if len(buf["d2h"]) < self._mask_timing_every:
+            return
+        is_rank0 = not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        )
+        if is_rank0:
+            def _sm(xs: list[float]) -> tuple[float, float, float, float]:
+                s = sorted(xs)
+                n = len(s)
+                med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+                p10 = s[max(0, int(0.1 * (n - 1)))]
+                p90 = s[min(n - 1, int(0.9 * (n - 1)))]
+                return med, p10, p90, sum(s) / n
+            n = len(buf["d2h"])
+            bubble = [a + b for a, b in zip(buf["sample"], buf["static"])]
+            total = [d + s + st + h + f for d, s, st, h, f in zip(
+                buf["d2h"], buf["sample"], buf["static"], buf["h2d"], buf["fwd"])]
+            rows = [
+                ("mask_d2h(drain)", buf["d2h"]),
+                ("mask_sample", buf["sample"]),
+                ("mask_static", buf["static"]),
+                ("mask_h2d", buf["h2d"]),
+                ("forward", buf["fwd"]),
+                ("BUBBLE samp+stat", bubble),
+                ("step sum(5)", total),
+            ]
+            lines = [
+                f"=== V14 mask timing (kineto-free) — {n} steps, ms ===",
+                f"  {'section':<18}{'median':>9}{'p10':>9}{'p90':>9}{'mean':>9}",
+            ]
+            for name, xs in rows:
+                med, p10, p90, mean = _sm(xs)
+                lines.append(
+                    f"  {name:<18}{med:>9.2f}{p10:>9.2f}{p90:>9.2f}{mean:>9.2f}")
+            print("\n".join(lines), flush=True)
+        for k in buf:
+            buf[k].clear()
 
     # ------------------------------------------------------------------- loops
     def training_step(self, batch: tp.Any, batch_idx: int) -> Tensor:
