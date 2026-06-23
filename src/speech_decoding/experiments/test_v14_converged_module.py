@@ -716,20 +716,20 @@ def test_monitor_falls_back_to_encode_when_taps_absent() -> None:
     assert "train_mon_rankme" in logged
 
 
-def test_heavy_monitor_due_none_falls_back_to_log_cadence() -> None:
+def test_monitor_tap_due_none_falls_back_to_log_cadence() -> None:
     # Default (None) ⇒ gate on the log cadence; with no trainer attached the log
-    # cadence is 1, so the heavy monitor is due every step (pre-decouple behavior).
+    # cadence is 1, so the monitor tap is due every step.
     m = _module()
     assert m._monitor_every_n_steps is None
-    assert all(m._heavy_monitor_due(i) for i in (0, 1, 2, 5, 49, 50))
+    assert all(m._monitor_tap_due(i) for i in (0, 1, 2, 5, 49, 50))
 
 
-def test_heavy_monitor_due_decoupled_cadence() -> None:
-    # An explicit cadence fires the expensive extra forward sparsely, independent
+def test_monitor_tap_due_decoupled_cadence() -> None:
+    # An explicit cadence thins the (cheap, activation-reusing) tap independently
     # of log_every_n_steps (which keeps loss curves per-step).
     m = _module(monitor_every_n_steps=50)
     assert m._monitor_every_n_steps == 50
-    assert [i for i in range(101) if m._heavy_monitor_due(i)] == [0, 50, 100]
+    assert [i for i in range(101) if m._monitor_tap_due(i)] == [0, 50, 100]
 
 
 def test_training_step_gates_monitor_on_heavy_cadence() -> None:

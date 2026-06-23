@@ -75,12 +75,11 @@ class V14ConvergedExperiment(V14Experiment):
     # Per-step mask RNG seed (own CPU generator in the module).
     mask_seed: int = 0
 
-    # Heavy forward-tap monitor cadence (RankMe / coverage / input-stats — each
-    # re-runs a no_grad extra forward; the post-latent RankMe tap is a DENSE
-    # full-input latent pass over ~C·190 tokens). None ⇒ gate on log_every_n_steps
-    # (pre-decouple behavior). Set it to fire the step-doubling extra forward
-    # sparsely while loss curves stay per-step — measured ~2.1× step at cadence 1
-    # (reports/converged_3stft_throughput_profile_2026_06_19.md). Diagnostic knob.
+    # Forward-tap monitor cadence (RankMe / coverage / input-stats). CHEAP — the
+    # taps reuse the training forward's stashed activations (model.last_rank_taps),
+    # no extra forward (the #245 double-forward was removed 2026-06-19), so this is
+    # safe to leave at every-step and IS on for the 48 h run. The knob only thins
+    # the wandb log; None ⇒ gate on log_every_n_steps.
     monitor_every_n_steps: int | None = pydantic.Field(default=None, ge=1)
 
     # --- static-shape SSL (V-JEPA-2 throughput regime; step A/B/C) ---------------

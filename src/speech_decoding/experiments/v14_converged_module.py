@@ -207,13 +207,12 @@ class V14ConvergedBrainModule(pl.LightningModule):
         # step-D validates the compiled step-time.
         self.static_forward = bool(static_forward)
         self._wd_exclude_norms = wd_exclude_norms
-        # Heavy forward-tap monitor cadence (RankMe / coverage / input-stats — each
-        # re-runs a no_grad extra forward, the post-latent RankMe tap being a DENSE
-        # full-input latent pass over ~C·190 tokens). Decoupled from
-        # log_every_n_steps: per-step loss logging stays cheap, but the extra
-        # forward roughly DOUBLES the step at cadence 1 (measured 2.1× on 5000 Ada,
-        # reports/converged_3stft_throughput_profile_2026_06_19.md). None ⇒ fall
-        # back to log_every_n_steps (byte-identical to the pre-decouple behavior).
+        # Forward-tap monitor cadence (RankMe / coverage / input-stats). These are
+        # CHEAP: _monitor_from_step REUSES the activations the training forward
+        # already stashed in model.last_rank_taps — NO extra forward (the #245
+        # double-forward regression was removed 2026-06-19). Safe to run every step;
+        # kept as a knob only to thin the wandb log, not for throughput. None ⇒ fall
+        # back to log_every_n_steps.
         self._monitor_every_n_steps = (
             int(monitor_every_n_steps) if monitor_every_n_steps is not None else None
         )
@@ -540,13 +539,11 @@ class V14ConvergedBrainModule(pl.LightningModule):
             cadence = 1
         return batch_idx % max(cadence, 1) == 0
 
-    def _heavy_monitor_due(self, batch_idx: int) -> bool:
-        """Cadence for the EXPENSIVE forward-tap monitors (RankMe / coverage /
-        input-stats — each re-runs a no_grad extra forward). When
-        ``monitor_every_n_steps`` is set it gates these on that cadence
-        independently of ``log_every_n_steps`` (so loss curves stay per-step while
-        the step-doubling extra forward fires sparsely); ``None`` falls back to the
-        log cadence — byte-identical to the pre-decouple behavior."""
+    def _monitor_tap_due(self, batch_idx: int) -> bool:
+        """Cadence for the forward-tap monitors (RankMe / coverage / input-stats).
+        These are CHEAP — they reuse the training forward's stashed activations, no
+        extra forward (see _monitor_from_step). ``monitor_every_n_steps`` only thins
+        the wandb log; ``None`` falls back to ``log_every_n_steps``."""
         if self._monitor_every_n_steps is None:
             return self._train_monitor_due(batch_idx)
         return batch_idx % max(self._monitor_every_n_steps, 1) == 0
@@ -674,11 +671,10 @@ class V14ConvergedBrainModule(pl.LightningModule):
         self._last_micro_bsz = _infer_batch_size(batch.data)
         out = self._step(batch.data)
         self._log_losses(out, "train", on_step=True, on_epoch=False)
-        # Forward-tap diagnostics (RankMe / coverage / input stats) re-run an
-        # extra no_grad forward (the post-latent RankMe tap is a DENSE full-input
-        # latent pass), so fire them on the heavy-monitor cadence — decoupled from
-        # the per-step loss logging above.
-        if self._heavy_monitor_due(batch_idx):
+        # Forward-tap diagnostics (RankMe / coverage / input stats) reuse the
+        # forward's stashed activations — cheap, no extra forward. The cadence only
+        # thins the wandb log; decoupled from the per-step loss logging above.
+        if self._monitor_tap_due(batch_idx):
             self._monitor_from_step(batch.data, step_name="train")
         return out["loss"]
 

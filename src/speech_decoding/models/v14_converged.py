@@ -654,7 +654,7 @@ class LatentEncoder(nn.Module):
             [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
         )
         self.ln_out = nn.LayerNorm(d_model)
-        self.tokens_per_electrode = int(time_slot.numel())  # 38
+        self.tokens_per_electrode = int(time_slot.numel())  # 30 at 1 s (slow 6 + beta 8 + HG 16)
 
         # Kernel selection only (output-identical). This cross-electrode latent
         # is the large-L all-pairs elephant where cuDNN's masked sm90 kernel is
@@ -821,7 +821,7 @@ class M4Predictor(nn.Module):
             [_JointTokenBlock(pred_dim, n_heads) for _ in range(n_layers)]
         )
         self.head = nn.Linear(pred_dim, d_model, bias=False)      # raw pred, NO LN
-        self.tokens_per_electrode = int(time_slot.numel())        # 38
+        self.tokens_per_electrode = int(time_slot.numel())        # 30 at 1 s (slow 6 + beta 8 + HG 16)
         # M4 joint self-attn is the SECOND large-L elephant (~8k context tokens,
         # ≈ the latent's cost), the other case where cuDNN's masked sm90 kernel
         # beats the sm80 mem-efficient fallback (~2.6× bakeoff). Scope the cuDNN
@@ -1045,7 +1045,7 @@ class ParcelReadout(nn.Module):
     ) -> None:
         super().__init__()
         self.n_parcels = n_parcels
-        self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 38
+        self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 30 at 1 s (slow 6 + beta 8 + HG 16)
         # k=1 learned seed query per parcel group.
         self.seed = nn.Parameter(torch.empty(n_parcels, d_model))
         nn.init.trunc_normal_(self.seed, std=0.02)
@@ -1182,7 +1182,7 @@ class V14ConvergedSSL(nn.Module):
         self.m4_precision_weight = bool(m4_precision_weight)
         self.m4_precision_alpha = float(m4_precision_alpha)
         self.m4_precision_n_ref = float(m4_precision_n_ref)
-        self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 38
+        self.tokens_per_electrode = sum(b.n_tokens for b in bands)  # 30 at 1 s (slow 6 + beta 8 + HG 16)
 
         self.student_frontend = FrontendEncoder(
             d_model, n_heads, frontend_layers, freq_pos=freq_pos, bands=bands
