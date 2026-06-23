@@ -510,6 +510,84 @@ def test_overfits_one_batch_fixed_masks() -> None:
     )
 
 
+# ----------------------------------------------------- resume-correctness check
+def test_resume_round_trip_is_bit_identical() -> None:
+    """Multi-slot training depends on a checkpoint resume restoring EVERYTHING:
+    the model (incl. the EMA teacher's OWN accumulated weights — NOT a re-sync to
+    the student, which is the separate phase-handoff path), the AdamW moments, the
+    warmup-cosine LR position, and the step counter. Train 2 steps → snapshot the
+    exact tensors a Lightning checkpoint persists → reload into a FRESH module →
+    take 2 more steps; the result must reproduce a straight 4-step run bit-for-bit.
+    Frozen masks make the trajectory deterministic, so any restore gap (teacher
+    reset, dropped optimizer moment, warmup restart) surfaces as a mismatch."""
+    from speech_decoding.experiments.lr_schedule import _WarmupCosineLR
+
+    batch = _batch()
+
+    def build():
+        torch.manual_seed(0)
+        m = _module()  # ema_tau=0.99 → the teacher visibly LAGS the student
+        opt = torch.optim.AdamW(
+            [p for p in m.model.parameters() if p.requires_grad], lr=3e-3,
+        )
+        # warmup_steps=2 ⇒ the resume boundary (step 2) lands just past warmup, so a
+        # restored run that wrongly restarted the ramp would diverge immediately.
+        sched = _WarmupCosineLR(opt, warmup_steps=2, total_steps=8, min_lr_ratio=0.1)
+        return m, opt, sched
+
+    def do_step(m, opt, sched) -> float:
+        m._mask_gen.manual_seed(0)  # freeze masks → stationary, deterministic target
+        opt.zero_grad()
+        out = m._step(batch.data)
+        out["loss"].backward()
+        opt.step()
+        sched.step()
+        m.model.update_teacher(m.ema_tau)  # the EMA tick (on_before_zero_grad in prod)
+        return float(out["loss"])
+
+    # --- reference: 4 steps straight through ---
+    m_ref, opt_ref, sched_ref = build()
+    ref_losses = [do_step(m_ref, opt_ref, sched_ref) for _ in range(4)]
+
+    # --- 2 steps → snapshot exactly what Lightning persists → fresh reload ---
+    m_a, opt_a, sched_a = build()
+    for _ in range(2):
+        do_step(m_a, opt_a, sched_a)
+    ckpt = {
+        "model": {k: v.clone() for k, v in m_a.model.state_dict().items()},
+        "opt": opt_a.state_dict(),
+        "sched": sched_a.state_dict(),
+    }
+
+    m_b, opt_b, sched_b = build()
+    m_b.model.load_state_dict(ckpt["model"])
+    opt_b.load_state_dict(ckpt["opt"])
+    sched_b.load_state_dict(ckpt["sched"])
+
+    # (a) the teacher must come back LAGGING the student — proof it was restored from
+    #     its own EMA history, not re-synced to the loaded student weights.
+    s_w = m_b.model.student_frontend.state_dict()
+    t_w = m_b.model.teacher_frontend.state_dict()
+    assert any(not torch.allclose(s_w[k], t_w[k]) for k in s_w), (
+        "teacher_frontend == student_frontend after reload → EMA lag lost (re-synced)"
+    )
+    # (b) the scheduler resumes PAST warmup at the right step, not restarting it.
+    assert sched_b.last_epoch == 2
+
+    # --- 2 more steps; must match the straight run BIT-FOR-BIT ---
+    resume_losses = [do_step(m_b, opt_b, sched_b) for _ in range(2)]
+    assert resume_losses == pytest.approx(ref_losses[2:], rel=1e-6, abs=1e-7), (
+        f"post-resume losses {resume_losses} != straight-run {ref_losses[2:]} "
+        "→ a piece of state did not restore (moments / LR / teacher)"
+    )
+    ref_state, b_state = m_ref.model.state_dict(), m_b.model.state_dict()
+    mism = [
+        k for k in ref_state
+        if not torch.allclose(ref_state[k], b_state[k], rtol=1e-5, atol=1e-7)
+    ]
+    assert not mism, f"resumed model tensors diverged from the straight run: {mism[:8]}"
+
+
 # ====================================================================
 # Monitor instrumentation — the full joint-module suite ported in. Each test
 # drives a hook with `self.log` captured and asserts the COMPLETE metric set is
