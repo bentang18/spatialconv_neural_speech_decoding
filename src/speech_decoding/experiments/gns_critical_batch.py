@@ -117,9 +117,11 @@ def run_gns_probe(  # pragma: no cover - DCC/DeltaAI-only driver
     """Build the real converged module + train loader, optionally warm-start from
     ``ckpt_path`` (full Lightning state → student AND EMA teacher restored), then
     estimate ``B_crit`` from ``rounds`` accumulations of ``n_accum`` single-session
-    micro-batches. Writes ``out_path`` (json) incrementally. fp32 (autocast off)
-    so the measured noise is the data/model/masking GNS, not bf16 kernel jitter
-    (which only ADDS to it). Returns the result dict."""
+    micro-batches. Writes ``out_path`` (json) incrementally. bf16 autocast on the
+    forward — MATCHES the production run (which trains bf16), so the measured noise
+    is the B_crit that actually governs the run (bf16 quantization noise included),
+    and it halves activation memory vs fp32. Grads stay fp32 (params fp32 →
+    flatten_grads is numerics-clean). Returns the result dict."""
     import json
     import time
 
@@ -172,7 +174,12 @@ def run_gns_probe(  # pragma: no cover - DCC/DeltaAI-only driver
                 for key, v in batch.data.items()
             }
             module.zero_grad(set_to_none=True)
-            out = module._step(data)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=(device.type == "cuda"),
+            ):
+                out = module._step(data)
             out["loss"].backward()
             g = flatten_grads(module.parameters())
             running = g.clone() if running is None else running + g
