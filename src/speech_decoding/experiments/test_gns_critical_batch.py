@@ -9,6 +9,7 @@ import torch
 from speech_decoding.experiments.gns_critical_batch import (
     fit_gns_curve,
     flatten_grads,
+    gns_param_groups,
     gradient_noise_scale,
 )
 
@@ -84,3 +85,46 @@ def test_flatten_grads_raises_when_empty():
     except RuntimeError:
         return
     raise AssertionError("expected RuntimeError when no grads populated")
+
+
+class _FakeConverged(torch.nn.Module):
+    # mirrors the V14ConvergedSSL top-level submodule names the grouping keys on
+    def __init__(self):
+        super().__init__()
+        self.student_frontend = torch.nn.Linear(2, 2)
+        self.teacher_frontend = torch.nn.Linear(2, 2)  # frozen EMA shadow
+        self.teacher_frontend.requires_grad_(False)
+        self.latent = torch.nn.Linear(2, 2)
+        self.m2_predictor = torch.nn.Linear(2, 2)
+        self.m4_predictor = torch.nn.Linear(2, 2)
+        self.lambda_m2 = torch.nn.Parameter(torch.ones(()))  # stray top-level → "other"
+
+
+def test_param_groups_partition_components_and_exclude_frozen_teacher():
+    groups = gns_param_groups(_FakeConverged())
+    assert set(groups) == {"frontend", "latent", "m2_pred", "m4_pred", "other", "whole"}
+    # frozen teacher contributes nothing to any group
+    teacher_ids = {id(p) for p in _FakeConverged().teacher_frontend.parameters()}
+    assert all(id(p) not in teacher_ids for p in groups["whole"])
+    # components partition `whole` exactly (each param in exactly one component)
+    comp_ids = [
+        id(p) for g in ("frontend", "latent", "m2_pred", "m4_pred", "other")
+        for p in groups[g]
+    ]
+    assert sorted(comp_ids) == sorted(id(p) for p in groups["whole"])
+    assert len(comp_ids) == len(set(comp_ids))  # no param double-counted
+    # frontend = weight+bias of student_frontend (2), stray scalar lands in other
+    assert len(groups["frontend"]) == 2
+    assert len(groups["other"]) == 1
+
+
+def test_param_groups_strips_lightning_model_prefix():
+    # the Lightning wrapper exposes params as "model.student_frontend.weight" etc.
+    class _Wrapped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _FakeConverged()
+
+    groups = gns_param_groups(_Wrapped())
+    assert len(groups["frontend"]) == 2  # still keyed correctly after stripping
+    assert len(groups["latent"]) == 2

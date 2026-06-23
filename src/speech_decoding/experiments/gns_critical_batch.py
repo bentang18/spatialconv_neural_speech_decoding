@@ -40,8 +40,47 @@ __all__ = [
     "gradient_noise_scale",
     "fit_gns_curve",
     "flatten_grads",
+    "gns_param_groups",
     "run_gns_probe",
 ]
+
+# Top-level submodule → component name. Lets us compute a SEPARATE B_crit per
+# part of the model (Ben 2026-06-22 frontend-easy/latent-hard hypothesis: the
+# low-entropy frontend gradient may dominate ‖G‖² and drag the whole-model
+# B_crit down, while the genuinely-hard latent task carries a higher B_crit).
+# ``teacher_frontend`` is the frozen EMA shadow (no grad) → never appears.
+_GNS_GROUP_OF_SUBMODULE = {
+    "student_frontend": "frontend",
+    "latent": "latent",
+    "m2_predictor": "m2_pred",
+    "m4_predictor": "m4_pred",
+}
+
+
+def gns_param_groups(
+    module: torch.nn.Module,
+) -> dict[str, list[torch.nn.Parameter]]:
+    """Partition ``module``'s trainable params into model-component groups plus a
+    ``whole`` group (all of them, = the prior whole-model B_crit). Groups by the
+    top-level submodule name (stripping a leading ``model.`` from the Lightning
+    wrapper); anything unrecognised lands in ``other`` so the components always
+    sum to ``whole``. Empty groups are dropped."""
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "frontend": [], "latent": [], "m2_pred": [], "m4_pred": [], "other": []
+    }
+    for name, p in module.named_parameters():
+        if not p.requires_grad:
+            continue
+        seg = name.split(".")
+        if seg and seg[0] == "model":
+            seg = seg[1:]
+        top = seg[0] if seg else ""
+        groups[_GNS_GROUP_OF_SUBMODULE.get(top, "other")].append(p)
+    groups["whole"] = [
+        p for g in ("frontend", "latent", "m2_pred", "m4_pred", "other")
+        for p in groups[g]
+    ]
+    return {k: v for k, v in groups.items() if v}
 
 
 def gradient_noise_scale(
@@ -150,8 +189,18 @@ def run_gns_probe(  # pragma: no cover - DCC/DeltaAI-only driver
 
     b = micro_batch if micro_batch is not None else int(xp.data.batch_size)
     sizes = [k * b for k in range(1, n_accum + 1)]
-    # running E‖g_B‖² accumulators, one per k=1..n_accum (B=k*b)
-    sum_e = [0.0] * n_accum
+
+    # Per-component B_crit: a SEPARATE E‖g_B‖² curve for the whole model and for
+    # each model component (frontend / latent / m2_pred / m4_pred). Same accumulated
+    # grads, just sliced per param-group, so it is a free add to the same forwards.
+    groups = gns_param_groups(module)
+    gnames = list(groups.keys())
+    print(
+        "[gns] param groups: "
+        + ", ".join(f"{k}={sum(p.numel() for p in v)}" for k, v in groups.items())
+    )
+    # sum_e[name][k] accumulates E‖g_B‖² at B=(k+1)*b for that group, over rounds.
+    sum_e = {name: [0.0] * n_accum for name in gnames}
     n_done = 0
 
     it = iter(train_loader)
@@ -166,7 +215,7 @@ def run_gns_probe(  # pragma: no cover - DCC/DeltaAI-only driver
 
     t0 = time.perf_counter()
     for r in range(rounds):
-        running: Tensor | None = None  # Σ of per-micro grad vectors
+        running: dict[str, Tensor | None] = {name: None for name in gnames}
         for k in range(n_accum):
             batch = _next_batch()
             data = {
@@ -181,46 +230,57 @@ def run_gns_probe(  # pragma: no cover - DCC/DeltaAI-only driver
             ):
                 out = module._step(data)
             out["loss"].backward()
-            g = flatten_grads(module.parameters())
-            running = g.clone() if running is None else running + g
-            mean_g = running / (k + 1)  # grad of the size-(k+1)*b big batch
-            sum_e[k] += float(mean_g.dot(mean_g))  # one sample of E‖g_{(k+1)b}‖²
+            for name, params in groups.items():
+                g = flatten_grads(params)
+                running[name] = g.clone() if running[name] is None else running[name] + g
+                mean_g = running[name] / (k + 1)  # grad of the size-(k+1)*b big batch
+                sum_e[name][k] += float(mean_g.dot(mean_g))  # one sample of E‖g_{(k+1)b}‖²
         n_done += 1
         if (r + 1) % max(1, rounds // 8) == 0:
-            e_now = [s / n_done for s in sum_e]
-            two = gradient_noise_scale(e_now[0], sizes[0], e_now[-1], sizes[-1])
-            fit = fit_gns_curve(sizes, e_now)
+            msgs = []
+            for name in gnames:
+                e_now = [s / n_done for s in sum_e[name]]
+                fit = fit_gns_curve(sizes, e_now)
+                msgs.append(f"{name}={fit['b_crit']:.0f}")
             print(
-                f"[gns] round {r + 1}/{rounds}  B_crit(2pt)={two['b_crit']:.0f} "
-                f"B_crit(fit)={fit['b_crit']:.0f} r2={fit['r2']:.3f} "
-                f"({time.perf_counter() - t0:.0f}s)"
+                f"[gns] round {r + 1}/{rounds}  B_crit(fit): "
+                + " ".join(msgs)
+                + f"  ({time.perf_counter() - t0:.0f}s)"
             )
 
-    e_final = [s / n_done for s in sum_e]
-    two = gradient_noise_scale(e_final[0], sizes[0], e_final[-1], sizes[-1])
-    fit = fit_gns_curve(sizes, e_final)
     eff_batch = b * 4  # 4-GPU eff-128 at micro-batch b (world_size 4)
+    components: dict[str, tp.Any] = {}
+    for name in gnames:
+        e_final = [s / n_done for s in sum_e[name]]
+        two = gradient_noise_scale(e_final[0], sizes[0], e_final[-1], sizes[-1])
+        fit = fit_gns_curve(sizes, e_final)
+        components[name] = {"e_of_b": e_final, "two_point": two, "curve_fit": fit}
+
+    whole = components["whole"]
     result: dict[str, tp.Any] = {
         "ckpt": ckpt_path,
         "micro_batch": b,
         "n_accum": n_accum,
         "rounds": n_done,
         "batch_sizes": sizes,
-        "e_of_b": e_final,
-        "two_point": two,
-        "curve_fit": fit,
         "eff_batch_4gpu": eff_batch,
-        "b_crit_vs_eff": fit["b_crit"] / eff_batch if eff_batch else None,
+        "components": components,
+        # whole-model keys hoisted to top level for backward-compat with prior runs
+        "e_of_b": whole["e_of_b"],
+        "two_point": whole["two_point"],
+        "curve_fit": whole["curve_fit"],
+        "b_crit_vs_eff": whole["curve_fit"]["b_crit"] / eff_batch if eff_batch else None,
         "verdict": (
             "eff-batch ABOVE B_crit (diminishing returns — bigger batch wastes FLOPs)"
-            if fit["b_crit"] < eff_batch
+            if whole["curve_fit"]["b_crit"] < eff_batch
             else "eff-batch BELOW B_crit (more batch still buys near-linear speedup)"
         ),
     }
     with open(out_path, "w") as fh:
         json.dump(result, fh, indent=2, default=float)
     print(
-        f"[gns] DONE  B_crit(fit)={fit['b_crit']:.0f} vs eff-{eff_batch}  "
-        f"→ {result['verdict']}  (wrote {out_path})"
+        "[gns] DONE  B_crit(fit): "
+        + " ".join(f"{n}={components[n]['curve_fit']['b_crit']:.0f}" for n in gnames)
+        + f"  vs eff-{eff_batch}  → {result['verdict']}  (wrote {out_path})"
     )
     return result
