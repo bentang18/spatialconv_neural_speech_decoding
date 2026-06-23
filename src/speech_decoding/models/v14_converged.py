@@ -1920,6 +1920,61 @@ def sample_m2_mask_fixed(
     return torch.cat(parts)
 
 
+def _sample_m2_masks_batched(
+    n: int,
+    bands: tuple[BandSpec, ...],
+    cfg: M2MaskConfig,
+    targets: dict[str, int],
+    generator: torch.Generator,
+) -> Tensor:
+    """Vectorized rand_unmask M2 for ``n`` independent electrodes at once — the
+    batched form of :func:`sample_m2_mask_fixed` (one call replaces the per-electrode
+    loop in :func:`sample_ssl_masks_static`, i.e. the ~455 ms/step host bubble).
+    Returns ``(n, S)`` bool in tokenizer order; each row is DISTRIBUTIONALLY identical
+    to ``sample_m2_mask_fixed`` (per band: exactly ``targets[band]`` time-columns
+    covered, every freq patch co-masked; slow exempt) because it runs the SAME
+    generative process — ``n_starts`` distinct uniform span starts → union of spans →
+    exact-``target`` trim with uniform random identity — just batched over rows.
+
+    The exact-target step is the argsort identity of :func:`_rand_unmask_columns`:
+    score every column ``covered + U(0,1)`` so covered columns (key ≥ 1) always
+    outrank uncovered (key < 1), then keep the top ``target``. Overflow ⇒ a uniform
+    random ``target``-subset of the covered set (tiebreak); underflow ⇒ all covered +
+    a uniform random fill from the uncovered — identical to the drop/add there.
+
+    The RNG draw ORDER differs from the per-electrode loop, so the masks are NOT
+    stream-identical to the old path; only the per-electrode marginal is. Fine for a
+    fresh run (the realization changes every seed regardless)."""
+    blocks: list[Tensor] = []
+    for b in bands:
+        F, T = b.n_freq_patches, b.n_time_patches
+        target = targets[b.name]
+        if b.name == "slow" or target <= 0:
+            blocks.append(torch.zeros(n, F * T, dtype=torch.bool))
+            continue
+        span = cfg.beta_span if b.name == "beta" else cfg.hg_span
+        rate = cfg.beta_start_rate if b.name == "beta" else cfg.hg_start_rate
+        allowed = T - span + 1
+        n_starts = min(round(rate * T), allowed)
+        # covered = union of `n_starts` DISTINCT uniform span starts per row. Batched
+        # randperm via argsort of a uniform draw → distinct starts in [0, allowed);
+        # s + [0, span) is always < T, so no clamp. Overlapping spans scatter True
+        # idempotently.
+        covered = torch.zeros(n, T, dtype=torch.bool)
+        if n_starts > 0:
+            starts = torch.rand(n, allowed, generator=generator).argsort(dim=1)[:, :n_starts]
+            idx = (starts[:, :, None] + torch.arange(span)[None, None, :]).reshape(n, -1)
+            covered.scatter_(1, idx, torch.ones_like(idx, dtype=torch.bool))
+        # exact-target: covered outranks uncovered; uniform tiebreak ⇒ random identity.
+        key = covered.to(torch.float32) + torch.rand(n, T, generator=generator)
+        sel = key.argsort(dim=1, descending=True)[:, :target]
+        cols = torch.zeros(n, T, dtype=torch.bool)
+        cols.scatter_(1, sel, torch.ones_like(sel, dtype=torch.bool))
+        # freq-tube: every freq patch shares the column pattern (freq-major reshape).
+        blocks.append(cols[:, None, :].expand(n, F, T).reshape(n, F * T).contiguous())
+    return torch.cat(blocks, dim=1)
+
+
 @dataclass(frozen=True)
 class TightPackConfig:
     """Static-shape M4 tube (Ben 2026-06-22). ``ratio`` of the real electrodes are
@@ -2020,10 +2075,10 @@ def sample_ssl_masks_static(
     S = sum(b.n_tokens for b in bands)
     targets = m2_fixed_col_targets(bands, m2_cfg)
     P = tube_cfg.p_fixed
-    m2 = torch.zeros(B, C, S, dtype=torch.bool)
     tube = torch.zeros(B, C, dtype=torch.bool)
     tubed_parcels = torch.zeros(B, P, dtype=torch.long)
     tubed_parcel_mask = torch.zeros(B, P, dtype=torch.bool)
+    # Tube tight-pack stays per-clip — data-dependent greedy first-fit + water-fill.
     for b in range(B):
         real = electrode_mask[b]
         tb, tparc = tight_pack_tube(parcel_per_electrode[b], real, generator, tube_cfg)
@@ -2035,10 +2090,11 @@ def sample_ssl_masks_static(
         tube[b] = tb
         tubed_parcels[b, :n_t] = tparc
         tubed_parcel_mask[b, :n_t] = True
-        keep = real & ~tb
-        for e in range(C):
-            if bool(keep[e]):
-                m2[b, e] = sample_m2_mask_fixed(generator, bands, m2_cfg, targets)
+    # M2 is per-electrode i.i.d. → one batched draw over all B·C kept electrodes
+    # replaces the ~B·C Python-loop calls to sample_m2_mask_fixed (the host bubble).
+    keep = electrode_mask & ~tube
+    m2 = _sample_m2_masks_batched(B * C, bands, m2_cfg, targets, generator)
+    m2 = m2.reshape(B, C, S) & keep[:, :, None]
     return {
         "m2_mask": m2,
         "tube_mask": tube,

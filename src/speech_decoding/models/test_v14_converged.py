@@ -299,6 +299,41 @@ def test_m2_fixed_determinism_and_no_positional_bias() -> None:
     assert (interior.max() - interior.min()) / interior.mean() < 0.25
 
 
+def test_m2_batched_exact_count_freq_tube_and_determinism() -> None:
+    targets = vc.m2_fixed_col_targets()
+    n_mask = targets["beta"] * 2 + targets["hg"]                     # 12 tokens / electrode
+    m = vc._sample_m2_masks_batched(500, vc.BANDS, vc.M2MaskConfig(), targets, _gen(0))
+    assert m.shape == (500, 30)
+    rows = m.sum(dim=1)
+    assert torch.equal(rows, torch.full((500,), n_mask)), "every row hits EXACT N_mask"
+    assert not m[:, :6].any(), "slow exempt"
+    beta = m[:, 6:14].reshape(500, 2, 4)
+    assert torch.equal(beta[:, 0], beta[:, 1]), "freq-tube: beta sub-bands co-masked"
+    assert torch.equal(beta.sum(dim=(1, 2)), torch.full((500,), 4))  # 2 cols × 2 subbands
+    assert torch.equal(m[:, 14:30].sum(dim=1), torch.full((500,), 8))  # hg target = 8 cols
+    # determinism: same seed → identical, different seed → not.
+    assert torch.equal(
+        vc._sample_m2_masks_batched(64, vc.BANDS, vc.M2MaskConfig(), targets, _gen(7)),
+        vc._sample_m2_masks_batched(64, vc.BANDS, vc.M2MaskConfig(), targets, _gen(7)))
+    assert not torch.equal(
+        vc._sample_m2_masks_batched(64, vc.BANDS, vc.M2MaskConfig(), targets, _gen(7)),
+        vc._sample_m2_masks_batched(64, vc.BANDS, vc.M2MaskConfig(), targets, _gen(8)))
+
+
+def test_m2_batched_distribution_matches_loop() -> None:
+    # batched HG per-column coverage frequency ≈ the per-electrode loop's (same
+    # generative process, different RNG order → DISTRIBUTIONALLY identical).
+    targets = vc.m2_fixed_col_targets()
+    N = 6000
+    loop = torch.zeros(16)
+    for s in range(N):
+        loop += vc.sample_m2_mask_fixed(_gen(s))[14:30].float()
+    loop /= N
+    batched = vc._sample_m2_masks_batched(
+        N, vc.BANDS, vc.M2MaskConfig(), targets, _gen(0))[:, 14:30].float().mean(dim=0)
+    assert torch.allclose(loop, batched, atol=0.03), (loop, batched)
+
+
 def test_tight_pack_constant_nvis_and_whole_targets() -> None:
     pe = _synthetic_montage(100)
     real = torch.ones(100, dtype=torch.bool)
@@ -1215,7 +1250,7 @@ def test_forward_ragged_equals_dense_static_masks() -> None:
     torch.manual_seed(0)
     model = _ssl_model().eval()
     slow, beta, hg, pe, emask, _ = _ssl_batch(B=3, C=10, seed=4)
-    g = torch.Generator().manual_seed(7)
+    g = torch.Generator().manual_seed(21)   # seed gives a non-degenerate M4 tube
     m = vc.sample_ssl_masks_static(
         pe, emask, g, tube_cfg=vc.TightPackConfig(ratio=0.25))
     args = (slow, beta, hg, pe, emask, m["m2_mask"], m["tube_mask"],
@@ -1238,7 +1273,7 @@ def test_forward_static_equals_dense() -> None:
     model = _ssl_model().eval()
     slow, beta, hg, pe, emask, _ = _ssl_batch(B=3, C=10, seed=4)
     assert bool(emask.all()), "static path needs a session-homogeneous batch"
-    g = torch.Generator().manual_seed(7)
+    g = torch.Generator().manual_seed(21)   # seed gives a non-degenerate M4 tube
     cfg = vc.TightPackConfig(ratio=0.25)
     m = vc.sample_ssl_masks_static(pe, emask, g, tube_cfg=cfg)
     shapes = vc.compute_static_shapes(
