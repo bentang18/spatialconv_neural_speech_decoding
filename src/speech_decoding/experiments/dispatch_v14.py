@@ -2913,6 +2913,27 @@ def _parser() -> argparse.ArgumentParser:
                         "the head-to-head (piece 3). Default all three. 'raw,frontend' "
                         "skips the expensive latent forward; 'raw' never touches the "
                         "model.")
+    # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
+    # run_gns_probe). Builds the real converged module + group_by_session loader,
+    # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
+    p.add_argument("--gns-probe", action="store_true",
+                   help="Measure the gradient noise scale / critical batch size of "
+                        "the converged SSL step instead of training, then exit. Build "
+                        "the experiment exactly as a real run (same arch/cache/sampler); "
+                        "optionally warm-start with --gns-ckpt. Pair with --frontend 3stft "
+                        "+ the converged_* shape flags + --group-by-session.")
+    p.add_argument("--gns-ckpt", type=str, default=None,
+                   help="Optional Lightning ckpt to warm-start the GNS probe (restores "
+                        "student AND EMA teacher). None = measure from init.")
+    p.add_argument("--gns-out", type=str, default=None,
+                   help="JSON output path for --gns-probe (default: ./gns_critical_batch.json).")
+    p.add_argument("--gns-rounds", type=int, default=64,
+                   help="Number of accumulation rounds to average E‖g_B‖² over "
+                        "(more = tighter B_crit; the intercept is noise-sensitive).")
+    p.add_argument("--gns-accum", type=int, default=8,
+                   help="Micro-batches accumulated per round; the batch-size axis is "
+                        "b, 2b, ..., gns_accum*b (each a DIFFERENT session under "
+                        "group_by_session, so it spans the cross-session variance).")
     p.add_argument("--lite-baseline-out", type=str, default=None,
                    help="JSON path for the raw |STFT| logistic baseline on the "
                         "Neuroprobe-Lite EVAL cells (piece 4). When set, build the "
@@ -4782,6 +4803,20 @@ def main(argv: list[str] | None = None) -> int:
             clip_len_s=1.0, max_iter=args.probe_bench_max_iter,
             do_ridge="ridge" in _pieces, do_headtohead="headtohead" in _pieces,
             taps=_taps,
+        )
+        return 0
+    if args.gns_probe:
+        # Gradient-noise-scale / critical-batch diagnostic. xp is built exactly as
+        # a real run (same arch/cache/group_by_session sampler), so the measured
+        # B_crit governs the production step. No trainer; 1 GPU.
+        import os as _os
+
+        from speech_decoding.experiments.gns_critical_batch import run_gns_probe
+
+        out = args.gns_out or _os.path.join(_os.getcwd(), "gns_critical_batch.json")
+        run_gns_probe(
+            xp, out_path=out, ckpt_path=args.gns_ckpt,
+            n_accum=args.gns_accum, rounds=args.gns_rounds,
         )
         return 0
     if args.lite_baseline_out is not None:
