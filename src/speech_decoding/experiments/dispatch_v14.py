@@ -2921,11 +2921,11 @@ def _parser() -> argparse.ArgumentParser:
                         "(bounds the p>>n per-electrode d=256 fits; same cap per "
                         "tap so raw<->encoder stay comparable). Default 2000.")
     p.add_argument("--probe-bench-pieces", type=str, default="ridge,headtohead",
-                   choices=["ridge,headtohead", "ridge", "headtohead"],
-                   help="Which probe-bench pieces to run. 'ridge' = piece 1 only; "
-                        "'headtohead' = piece 3 only; both (default) runs piece 1 then "
-                        "piece 3. Use 'headtohead' to re-run only the logistic when "
-                        "piece 1's ridge timing already landed.")
+                   help="Comma-separated probe-bench pieces. 'ridge' = piece 1 "
+                        "(timing); 'headtohead' = piece 3 (raw/frontend/latent "
+                        "logistic); 'bandablation' = piece 4 (Zac's raw-|STFT| band "
+                        "localizer: hg/slow/beta + drop-beta + slow granularity). "
+                        "Default runs ridge+headtohead.")
     p.add_argument("--probe-bench-taps", type=str, default="raw,frontend,latent",
                    help="Comma-separated subset of raw/frontend/latent to score in "
                         "the head-to-head (piece 3). Default all three. 'raw,frontend' "
@@ -4826,6 +4826,7 @@ def main(argv: list[str] | None = None) -> int:
             xp, ckpt_path=args.probe_bench_ckpt, out_path=out,
             clip_len_s=1.0, max_iter=args.probe_bench_max_iter,
             do_ridge="ridge" in _pieces, do_headtohead="headtohead" in _pieces,
+            do_band_ablation="bandablation" in _pieces,
             taps=_taps,
         )
         return 0

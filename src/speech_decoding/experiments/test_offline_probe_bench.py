@@ -17,9 +17,13 @@ import torch
 import pytest
 
 from speech_decoding.experiments.offline_probe_bench import (
+    BAND_ABLATION_SLICES,
+    _band_token_meta,
+    bench_band_ablation,
     bench_logistic_head_to_head,
     logistic_ws_cs_from_tokens,
     logistic_ws_cs_streaming,
+    select_band_slice,
 )
 from speech_decoding.experiments.online_probe import SubjectProbeData
 from speech_decoding.experiments.online_probe_raw_baseline import raw_tokens_from_bands
@@ -153,3 +157,72 @@ def test_head_to_head_rejects_unknown_tap():
         bench_logistic_head_to_head(
             None, ds, device=torch.device("cpu"), taps=("raw", "bogus")
         )
+
+
+# ----------------------------------------------------- piece 4: band ablation
+
+
+def test_band_slice_token_counts():
+    # 1 s geometry: slow 3fp×2tp=6, beta 2fp×4tp=8, HG 1fp×16tp=16 (N=30). Each
+    # slice's surviving-token count is fixed by the band geometry. slow has 2
+    # distinct time_slots ⇒ slow_mean collapses 6→2.
+    band_id, freq_gid, time_slot = _band_token_meta(1.0)
+    g = torch.Generator().manual_seed(0)
+    slow = torch.randn(3, 2, 2, BANDS[0].n_freq_bins, BANDS[0].n_time_frames, generator=g)
+    beta = torch.randn(3, 2, BANDS[1].n_freq_bins, BANDS[1].n_time_frames, generator=g).abs()
+    hg = torch.randn(3, 2, BANDS[2].n_freq_bins, BANDS[2].n_time_frames, generator=g).abs()
+    full = raw_tokens_from_bands(slow, beta, hg, clip_len_s=1.0)
+    expect = {
+        "all": 30, "hg": 16, "slow": 6, "beta": 8, "hg_slow": 22, "hg_beta": 24,
+        "slow_lower": 2, "slow_upper": 2, "slow_mean": 2, "hg_slow_mean": 18,
+    }
+    for name, (keep, collapse) in BAND_ABLATION_SLICES.items():
+        sl = select_band_slice(full, band_id, freq_gid, time_slot, keep, collapse)
+        assert sl.shape[:2] == full.shape[:2] and sl.shape[3] == 1
+        assert sl.shape[2] == expect[name], f"{name}: {sl.shape[2]} != {expect[name]}"
+
+
+def test_band_slice_all_reproduces_raw_and_hg_is_tail():
+    band_id, freq_gid, time_slot = _band_token_meta(1.0)
+    g = torch.Generator().manual_seed(1)
+    slow = torch.randn(2, 3, 2, BANDS[0].n_freq_bins, BANDS[0].n_time_frames, generator=g)
+    beta = torch.randn(2, 3, BANDS[1].n_freq_bins, BANDS[1].n_time_frames, generator=g).abs()
+    hg = torch.randn(2, 3, BANDS[2].n_freq_bins, BANDS[2].n_time_frames, generator=g).abs()
+    full = raw_tokens_from_bands(slow, beta, hg, clip_len_s=1.0)
+    keep_all, coll_all = BAND_ABLATION_SLICES["all"]
+    assert torch.equal(
+        select_band_slice(full, band_id, freq_gid, time_slot, keep_all, coll_all), full
+    )
+    keep_hg, coll_hg = BAND_ABLATION_SLICES["hg"]
+    # HG = freq_gid 5 = the last 16 tokens, kept in tokenizer order.
+    assert torch.equal(
+        select_band_slice(full, band_id, freq_gid, time_slot, keep_hg, coll_hg),
+        full[:, :, 14:30, :],
+    )
+
+
+def test_slow_mean_collapse_is_freq_average_per_time_slot():
+    # slow_mean averages slow's 3 freq-patches at each time_slot. In tokenizer order
+    # (freq-major, time-minor) slow tokens are fp0(t0,t1) fp1(t0,t1) fp2(t0,t1) =
+    # indices 0..5; time_slot 0 = {0,2,4}, slot 8 = {1,3,5}.
+    band_id, freq_gid, time_slot = _band_token_meta(1.0)
+    g = torch.Generator().manual_seed(2)
+    slow = torch.randn(2, 3, 2, BANDS[0].n_freq_bins, BANDS[0].n_time_frames, generator=g)
+    beta = torch.randn(2, 3, BANDS[1].n_freq_bins, BANDS[1].n_time_frames, generator=g).abs()
+    hg = torch.randn(2, 3, BANDS[2].n_freq_bins, BANDS[2].n_time_frames, generator=g).abs()
+    full = raw_tokens_from_bands(slow, beta, hg, clip_len_s=1.0)
+    keep, collapse = BAND_ABLATION_SLICES["slow_mean"]
+    out = select_band_slice(full, band_id, freq_gid, time_slot, keep, collapse)
+    assert out.shape[2] == 2
+    assert torch.allclose(out[:, :, 0, :], full[:, :, [0, 2, 4], :].mean(dim=2))
+    assert torch.allclose(out[:, :, 1, :], full[:, :, [1, 3, 5], :].mean(dim=2))
+
+
+def test_bench_band_ablation_metric_keys():
+    ds, _ = _fake()
+    out = bench_band_ablation(ds, max_iter=200)
+    for name in BAND_ABLATION_SLICES:
+        for kind in ("ws", "cs", "gap"):
+            assert f"val_probe/{name}/{kind}/delta_volume" in out["metrics"]
+    assert set(out["timings"]) == set(BAND_ABLATION_SLICES)
+    assert all(t["n_tok"] > 0 for t in out["timings"].values())

@@ -66,6 +66,9 @@ __all__ = [
     "logistic_ws_cs_from_tokens",
     "logistic_ws_cs_streaming",
     "bench_logistic_head_to_head",
+    "bench_band_ablation",
+    "select_band_slice",
+    "BAND_ABLATION_SLICES",
     "bench_ridge_timing",
     "encode_tap_tokens",
     "load_converged_model",
@@ -286,6 +289,113 @@ def bench_logistic_head_to_head(
             )
         )
         timings[tap] = {"total_s": time.perf_counter() - t0}
+    return {"metrics": metrics, "timings": timings}
+
+
+# ------------------------------------------------ piece 4: raw band-ablation probe
+# Zac 2026-06-24: probe SELECTED parts of the raw |STFT| frontend to localize where
+# decoding comes from (HGA vs low band) and whether low-band freq granularity helps.
+# Each slice keeps a subset of freq-global-ids and/or mean-collapses a band's freq
+# axis (grouping on time_slot), then runs the same WS/CS logistic as the raw tap.
+# Raw is d=1 + N<=30 tokens so the non-streaming path never OOMs. Bands (5 s/1 s):
+# slow freq-patches {0,1,2}, beta {3,4}, HG {5} (HG is one broadband patch — the
+# 70-150 magnitude, not freq-resolvable, by design). band_id slow=0 beta=1 hg=2.
+
+# name -> (keep_freq_global_ids, mean_collapse_band_ids). Disjoint by construction.
+BAND_ABLATION_SLICES: dict[str, tuple[frozenset[int], frozenset[int]]] = {
+    "all":          (frozenset({0, 1, 2, 3, 4, 5}), frozenset()),       # = raw tap (sanity)
+    "hg":           (frozenset({5}),                frozenset()),       # HGA only
+    "slow":         (frozenset({0, 1, 2}),          frozenset()),       # low band only
+    "beta":         (frozenset({3, 4}),             frozenset()),       # mid band only
+    "hg_slow":      (frozenset({0, 1, 2, 5}),       frozenset()),       # drop beta (2STFT)
+    "hg_beta":      (frozenset({3, 4, 5}),          frozenset()),       # drop slow
+    "slow_lower":   (frozenset({0}),                frozenset()),       # lowest slow patch
+    "slow_upper":   (frozenset({2}),                frozenset()),       # highest slow patch
+    "slow_mean":    (frozenset(),                   frozenset({0})),    # collapse slow freq
+    "hg_slow_mean": (frozenset({5}),                frozenset({0})),    # minimal 2STFT (Chang-like)
+}
+
+
+def _band_token_meta(clip_len_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    """``(band_id, freq_global_id, time_slot)`` per raw token, clip-len aware —
+    the same geometry ``raw_tokens_from_bands`` lays out, so column j of the raw
+    tensor is described by index j of these."""
+    from speech_decoding.models.v14_converged import bands_for_clip_len, token_metadata
+    return token_metadata(bands_for_clip_len(clip_len_s))
+
+
+def select_band_slice(
+    raw: Tensor,
+    band_id: Tensor,
+    freq_gid: Tensor,
+    time_slot: Tensor,
+    keep_freq: frozenset[int],
+    collapse_bands: frozenset[int],
+) -> Tensor:
+    """Slice raw ``|STFT|`` tokens ``(N,C,N_tok,1)`` → ``(N,C,N_sel,1)``.
+
+    Kept tokens (``freq_gid in keep_freq`` and band NOT collapsed) survive in
+    tokenizer order; each collapsed band contributes one mean-over-freq token per
+    distinct ``time_slot`` (= average the band's freq-patches at each time). The two
+    sets are disjoint so no token is double-counted."""
+    n_tok = raw.shape[2]
+    bid = band_id.tolist()
+    fid = freq_gid.tolist()
+    tsl = time_slot.tolist()
+    cols: list[Tensor] = []
+    for j in range(n_tok):
+        if fid[j] in keep_freq and bid[j] not in collapse_bands:
+            cols.append(raw[:, :, j : j + 1, :])
+    for b in sorted(collapse_bands):
+        slots = sorted({tsl[j] for j in range(n_tok) if bid[j] == b})
+        for sl in slots:
+            idx = [j for j in range(n_tok) if bid[j] == b and tsl[j] == sl]
+            cols.append(raw[:, :, idx, :].mean(dim=2, keepdim=True))
+    if not cols:
+        raise ValueError("empty band slice — keep_freq and collapse_bands both empty?")
+    return torch.cat(cols, dim=2)
+
+
+def bench_band_ablation(
+    dataset: tp.Any,
+    *,
+    clip_len_s: float = 1.0,
+    max_iter: int = 2000,
+    slices: dict[str, tuple[frozenset[int], frozenset[int]]] | None = None,
+) -> dict[str, tp.Any]:  # pragma: no cover - needs the real probe dataset
+    """Piece 4: WS/CS logistic AUROC for each raw-|STFT| band slice (Zac's localizer).
+
+    Builds each subject's full raw tokens once, then runs every slice through the
+    same :func:`logistic_ws_cs_from_tokens` protocol (tap = slice name) so the slice
+    numbers drop straight onto the ``raw`` head-to-head row. Returns
+    ``{metrics: {val_probe/<slice>/{ws,cs,gap}/<task>}, timings: {<slice>: {...}}}``."""
+    sl = slices or BAND_ABLATION_SLICES
+    band_id, freq_gid, time_slot = _band_token_meta(clip_len_s)
+    needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
+    sd = {s: dataset.subject_data(s) for s in needed}
+    raw = {
+        s: raw_tokens_from_bands(sd[s].slow, sd[s].beta, sd[s].hg, clip_len_s=clip_len_s)
+        for s in needed
+    }
+    metrics: dict[str, float] = {}
+    timings: dict[str, dict[str, float]] = {}
+    for name, (keep_freq, collapse_bands) in sl.items():
+        t0 = time.perf_counter()
+        toks = {
+            s: select_band_slice(
+                raw[s], band_id, freq_gid, time_slot, keep_freq, collapse_bands
+            )
+            for s in needed
+        }
+        metrics.update(
+            logistic_ws_cs_from_tokens(
+                dataset, toks, sd, n_parcels=dataset.n_parcels, tap=name, max_iter=max_iter
+            )
+        )
+        timings[name] = {
+            "total_s": time.perf_counter() - t0,
+            "n_tok": int(next(iter(toks.values())).shape[2]),
+        }
     return {"metrics": metrics, "timings": timings}
 
 
@@ -516,6 +626,7 @@ def run_probe_bench(
     max_iter: int = 2000,
     do_ridge: bool = True,
     do_headtohead: bool = True,
+    do_band_ablation: bool = False,
     taps: tp.Sequence[str] = ("raw", "frontend", "latent"),
 ) -> dict[str, tp.Any]:  # pragma: no cover - DCC-only driver
     """Top-level: build the probe dataset from the run, load the model at 1 s, run
@@ -571,6 +682,15 @@ def run_probe_bench(
         )
         print(f"[probe-bench] piece 3 done in {time.perf_counter()-t:.1f}s: "
               f"{result['piece3_head_to_head']['timings']}")
+        _flush()
+    if do_band_ablation:
+        print("[probe-bench] piece 4: raw band-ablation ...")
+        t = time.perf_counter()
+        result["piece4_band_ablation"] = bench_band_ablation(
+            dataset, clip_len_s=clip_len_s, max_iter=max_iter,
+        )
+        print(f"[probe-bench] piece 4 done in {time.perf_counter()-t:.1f}s: "
+              f"{result['piece4_band_ablation']['timings']}")
         _flush()
     print(f"[probe-bench] wrote {out_path}")
     return result
