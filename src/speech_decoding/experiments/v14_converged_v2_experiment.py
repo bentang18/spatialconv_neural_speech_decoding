@@ -74,7 +74,9 @@ class V14ConvergedV2Experiment(V14Experiment):
     # SSL-health monitor cadence (steps). The module forwards with detached health
     # taps on `global_step % N == 0` and the SSLHealthMonitor callback logs the LEAN
     # diagnostic set on that cadence; off-cadence steps carry zero added cost.
-    monitor_every_n_steps: int = 50
+    # Default 1: every-step intuition (rankme/feat_std/explained_var/GNS) is worth
+    # the ~5-6% tap-forward + SVD overhead — the long-standing v14 convention.
+    monitor_every_n_steps: int = 1
 
     def _build_brain_module(self, train_loader) -> BrainModule:  # type: ignore[override]
         """Build the converged-v2 Lightning module: resolve the model from the

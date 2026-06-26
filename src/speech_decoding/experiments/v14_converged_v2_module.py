@@ -50,7 +50,7 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         clip_len_s: float,
         mask_seed: int = 0,
         wd_exclude_norms: bool = True,
-        monitor_every_n_steps: int = 50,
+        monitor_every_n_steps: int = 1,
     ) -> None:
         super().__init__()
         self.model = model

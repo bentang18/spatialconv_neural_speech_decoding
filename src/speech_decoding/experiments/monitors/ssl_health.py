@@ -202,13 +202,19 @@ class SSLHealthMonitor(pl.Callback):
         self, trainer: pl.Trainer, pl_module: pl.LightningModule,
         outputs, batch, batch_idx: int,  # noqa: ARG002
     ) -> None:
-        step = int(pl_module.global_step)
-        if not self._due(step):
+        # The module stashes ``_last_taps`` inside ``training_step`` (pre-optimiser
+        # ``global_step`` = k) on EXACTLY its monitor-cadence batches — the same
+        # cadence Family A uses in ``on_before_optimizer_step`` (also pre-step). By
+        # the time THIS hook runs the optimiser has stepped and ``global_step`` is
+        # k+1, so re-deriving the cadence here is off-by-one and silently dropped
+        # every tap monitor. Presence of ``_last_taps`` IS the cadence signal — the
+        # module already decided. Run input-stats on the same gate so Family B +
+        # input-stats fire together with Family A.
+        taps = getattr(pl_module, "_last_taps", None)
+        if not taps:
             return
         self._run_input_stats(pl_module, batch)
-        taps = getattr(pl_module, "_last_taps", None)
-        if taps:
-            self._run_tap_monitors(pl_module, taps)
+        self._run_tap_monitors(pl_module, taps)
 
     # -- input stats (tap-free; reads the batch) --------------------------------
     def _run_input_stats(self, pl_module: pl.LightningModule, batch) -> None:

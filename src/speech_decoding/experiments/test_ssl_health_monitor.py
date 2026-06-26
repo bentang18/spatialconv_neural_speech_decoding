@@ -166,6 +166,42 @@ def test_tap_monitors_and_input_stats_finite():
     _ = out
 
 
+def test_tap_monitors_survive_global_step_advance():
+    """Regression: the module stashes taps in training_step at global_step=k (its
+    cadence), but on_train_batch_end runs AFTER the optimiser step at k+1. The
+    callback must consume the stashed taps by PRESENCE, not re-derive the cadence
+    from the advanced global_step — the off-by-one that silently dropped every tap
+    monitor (Family A + input-stats logged on DeltaAI, rankme/feat_std/explained_var
+    did NOT). Cadence 50 so the +1 step is genuinely off-cadence."""
+    m = _module(monitor_every_n_steps=50)
+    cb = SSLHealthMonitor(every_n_steps=50)
+    m.train()
+
+    class _FakeTrainer:
+        def __init__(self, step):
+            self.global_step = step
+
+    # Stash taps at the cadence step (global_step=50 ⇒ due).
+    m._trainer = _FakeTrainer(50)  # type: ignore[assignment]
+    out = m._step(_batch(B=3).data)
+    assert m._last_taps is not None
+    # Optimiser has since stepped ⇒ global_step is now 51 (NOT a cadence step).
+    m._trainer = _FakeTrainer(51)  # type: ignore[assignment]
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb.on_train_batch_end(trainer=m._trainer, pl_module=m, outputs=out,
+                          batch=_batch(B=3), batch_idx=0)
+    # The whole representation-health family fires despite the advanced step.
+    for k in ("train_mon_rankme", "train_mon_frontend_rankme",
+              "train_mon_feat_std_mean", "train_mon_frontend_feat_std_mean",
+              "train_mon_m2_explained_var", "train_mon_m4_explained_var",
+              "train_mon_m2_pred_target_var_ratio",
+              "train_mon_m4_pred_target_var_ratio",
+              "train_mon_input_electrode_tokens_lfs_absmax",
+              "train_mon_input_electrode_tokens_hga_std"):
+        assert k in logged and logged[k] == logged[k], k  # present + finite
+
+
 def test_input_stats_absmax_catches_outlier():
     m = _module()
     cb = SSLHealthMonitor()
