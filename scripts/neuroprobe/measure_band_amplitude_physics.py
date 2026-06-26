@@ -68,7 +68,7 @@ def _bandpass_env(x: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
     return np.abs(hilbert(xb, axis=-1)).astype(np.float32)
 
 
-def measure(subject_id: int, trial_id: int, frontend: str) -> dict:
+def measure(subject_id: int, trial_id: int, frontend: str, max_minutes: float = 0.0) -> dict:
     band_specs = pbw._make_band_specs(pbw._FRONTEND_BANDS[frontend])
 
     from neuroprobe.braintreebank_subject import BrainTreebankSubject
@@ -95,6 +95,12 @@ def measure(subject_id: int, trial_id: int, frontend: str) -> dict:
         rows = np.array([i for i, s in enumerate(shafts) if s == sh])
         if rows.size:
             filt[rows] -= filt[rows].mean(axis=0, keepdims=True)
+
+    if max_minutes and filt.shape[1] > int(max_minutes * 60 * sfreq):
+        win = int(max_minutes * 60 * sfreq)
+        start = (filt.shape[1] - win) // 2  # central window — skip lead-in/run-out
+        filt = np.ascontiguousarray(filt[:, start : start + win])
+        gc.collect()
 
     n_elec, n_samples = filt.shape
     broadband_mad = float(np.median(np.abs(filt - np.median(filt))) * 1.4826)
@@ -187,9 +193,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--session", nargs=2, type=int, metavar=("SUBJECT", "TRIAL"), required=True)
     ap.add_argument("--frontend", choices=("3stft", "2band"), default="2band")
+    ap.add_argument("--max-minutes", type=float, default=0.0,
+                    help="If >0, measure only the central N-min window (fast, well-conditioned FFT).")
     ap.add_argument("--out", default=None, help="optional JSON dump path")
     args = ap.parse_args()
-    r = measure(args.session[0], args.session[1], args.frontend)
+    r = measure(args.session[0], args.session[1], args.frontend, max_minutes=args.max_minutes)
     _print_report(r)
     if args.out:
         with open(args.out, "w") as f:
