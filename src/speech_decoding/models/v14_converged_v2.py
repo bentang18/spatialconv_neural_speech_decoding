@@ -25,12 +25,15 @@ groups have DIFFERENT bin counts (4/8/16) → a single ``fk`` cannot express the
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from speech_decoding.models.v14_encoder import (
+    NEG_INF_MASK_VALUE,
     _JointTokenBlock,
     _PatchStem,
     _rope_freqs,
@@ -319,3 +322,143 @@ class FrontendEncoderV2(nn.Module):
         for blk in self.blocks:
             x = blk(x, rope, km)
         return self.ln_out(x).reshape(B, C, S, d)
+
+
+def cell_operator_index(
+    bands: tuple[BandSpecV2, ...] = BANDS_V2, *, tie_lfs: bool = True
+) -> Tensor:
+    """``(S,)`` long → which pool reading-operator (`W_K`/`W_V`) each cell uses.
+
+    TIED DEFAULT (`tie_lfs=True`, `n_op=2`): operator = ``band_id`` — the 3 LFS
+    log groups SHARE one operator (0), HGA its own (1). UNTIED ablation
+    (`tie_lfs=False`, `n_op=4`): operator = ``freq_patch_id`` (LFS 0/1/2, HGA 3).
+    The exact integer labels are immaterial; what matters is the grouping +
+    that ``W_K`` is sized to ``n_operators(tie_lfs)``."""
+    band_id, freq_patch_id, _ = token_metadata(bands)
+    return band_id.clone() if tie_lfs else freq_patch_id.clone()
+
+
+def n_operators(tie_lfs: bool = True) -> int:
+    return 2 if tie_lfs else 4
+
+
+def active_parcels(parcel_of_electrode: Tensor) -> tuple[Tensor, Tensor]:
+    """Active parcels for one subject from per-electrode parcel labels.
+
+    Returns ``(parcel_labels (P,), membership (P, C) bool)`` where ``P`` =
+    distinct labels present (the ``~16``, NOT the DKT total), ``parcel_labels``
+    are the DKT label ids (index into the universal ``embed_p^q`` table), and
+    ``membership[p, e]`` = electrode ``e`` ∈ parcel ``p``. Every active parcel has
+    ≥1 electrode by construction ⇒ no empty rows."""
+    parcel_labels = torch.unique(parcel_of_electrode)            # sorted, P
+    membership = parcel_of_electrode[None, :] == parcel_labels[:, None]
+    return parcel_labels, membership
+
+
+class SetPoolV2(nn.Module):
+    """Stage 2 set-pool (PMA) — a parcel's electrode SET → ``k`` seeds, per cell.
+
+    Block-diagonal masked cross-attention, ONE per-(f,t)-CELL aggregation:
+    seed ``(p, j)`` at cell ``s`` attends ONLY to parcel ``p``'s electrodes' tokens
+    at that SAME cell (membership mask; time/freq structural, not a key tag).
+
+    Query ``= base_j + embed_p^q`` is FREQ- and TIME-agnostic (shared ``W_Q``;
+    "who's asking" = parcel + seed). Keys/values are FREQUENCY-SPECIFIC via
+    distinct WEIGHTS (NOT embeddings — in a per-cell pool an additive freq embed
+    on keys cancels in softmax): ``k_e = W_K^{(op)} x_e``, gathered per cell from
+    a stacked ``(n_op, d, d)`` by ``cell_patch``. TIED DEFAULT ``n_op=2`` (HGA |
+    LFS); UNTIE → 4 is the first ablation. The whole cell axis is VECTORIZED —
+    operators gathered + projected by einsum, no python loop over cells/parcels/
+    electrodes.
+
+    Forward (student passes its ``s_vis`` visible cells, teacher the full ``S`` —
+    same module, ``S`` is just the cell count):
+      - ``x`` ``(B, C, S, d)`` per-electrode tokens
+      - ``membership`` ``(P, C)`` bool, ``parcel_labels`` ``(P,)`` long (DKT ids)
+      - ``cell_patch`` ``(S,)`` long ∈ [0, n_op)
+    Output ``(B, P, k, S, d)``. The pool computes ALL ``P`` parcels (incl. soon-
+    tubed; block-diag ⇒ leak-free) — the latent gathers the untubed ones.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        k: int = 2,
+        n_parcels: int,
+        n_op: int = 2,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.k = k
+        self.n_op = n_op
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Queries: base seed color (k) + per-parcel query embed (universal,
+        # DKT-sized) + shared W_Q. Freq/time-agnostic.
+        self.base_seed = nn.Parameter(torch.empty(k, d_model))
+        nn.init.trunc_normal_(self.base_seed, std=0.02)
+        self.embed_pq = nn.Parameter(torch.empty(n_parcels, d_model))
+        nn.init.trunc_normal_(self.embed_pq, std=0.02)
+        self.W_Q = nn.Linear(d_model, d_model, bias=False)
+
+        # Stacked frequency-specific reading operators (gathered per cell).
+        self.W_K = nn.Parameter(torch.empty(n_op, d_model, d_model))
+        self.W_V = nn.Parameter(torch.empty(n_op, d_model, d_model))
+        for o in range(n_op):  # one-time init (n_op≤4), not the hot path
+            nn.init.xavier_uniform_(self.W_K[o])
+            nn.init.xavier_uniform_(self.W_V[o])
+
+        self.out = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(
+        self,
+        x: Tensor,                # (B, C, S, d)
+        membership: Tensor,       # (P, C) bool
+        parcel_labels: Tensor,    # (P,) long  DKT ids
+        cell_patch: Tensor,       # (S,) long  ∈ [0, n_op)
+    ) -> Tensor:
+        B, C, S, d = x.shape
+        P = membership.shape[0]
+        H, hd, k = self.n_heads, self.head_dim, self.k
+        if cell_patch.shape != (S,):
+            raise ValueError(f"cell_patch must be (S={S},), got {tuple(cell_patch.shape)}")
+
+        # Queries (P, k, d) → W_Q → (P·k, H, hd). Cell-independent.
+        q_tok = self.embed_pq[parcel_labels][:, None, :] + self.base_seed[None, :, :]
+        q = self.W_Q(q_tok).reshape(P * k, H, hd)
+
+        # Per-cell freq-specific key/value projection — gather operator, einsum.
+        WK = self.W_K[cell_patch]                                # (S, d, d)
+        WV = self.W_V[cell_patch]                                # (S, d, d)
+        keys = torch.einsum("bcsd,sde->bcse", x, WK)             # (B, C, S, d)
+        vals = torch.einsum("bcsd,sde->bcse", x, WV)
+
+        # Batch the cell axis: (B, S, C, H, hd).
+        keys = keys.permute(0, 2, 1, 3).reshape(B * S, C, H, hd)
+        vals = vals.permute(0, 2, 1, 3).reshape(B * S, C, H, hd)
+        qh = q[None].expand(B * S, P * k, H, hd).permute(0, 2, 1, 3)  # (BS, H, Pk, hd)
+        kh = keys.permute(0, 2, 1, 3)                                 # (BS, H, C, hd)
+        vh = vals.permute(0, 2, 1, 3)
+
+        # Block-diagonal additive bias (Pk, C): 0 = attend, -1e4 = block. Finite
+        # sentinel (not -inf) keeps a fully-blocked row a uniform finite softmax,
+        # NaN-free in fwd+bwd on every backend (see _MultiHeadCrossAttention).
+        mem_pk = membership.repeat_interleave(k, dim=0)              # (Pk, C)
+        bias = torch.zeros(P * k, C, dtype=qh.dtype, device=x.device)
+        bias = bias.masked_fill(~mem_pk, NEG_INF_MASK_VALUE)[None, None]  # (1,1,Pk,C)
+        ctx = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=bias)  # (BS,H,Pk,hd)
+        ctx = ctx.permute(0, 2, 1, 3).reshape(B * S, P * k, d)
+
+        # No-coverage rows (none for active parcels, kept for safety) → 0.
+        no_cov = ~mem_pk.any(dim=-1)                                # (Pk,)
+        ctx = ctx.masked_fill(no_cov[None, :, None], 0.0)
+        out = self.out(ctx)                                         # (BS, Pk, d)
+        return out.reshape(B, S, P, k, d).permute(0, 2, 3, 1, 4)    # (B, P, k, S, d)
