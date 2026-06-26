@@ -429,6 +429,107 @@ def sample_parcel_tube_v2(
     return tube
 
 
+@dataclass(frozen=True)
+class StaticShapesV2:
+    """Per-rank static shape header for one converged-v2 step. All fields are
+    session-constant (fixed by ``--same-session-ranks``); per-clip variation is
+    ONLY *which* parcels tube + *which* cells mask — constant-count, pure gathers.
+    The derived gather lengths size every downstream flatten/scatter."""
+
+    b: int
+    c: int
+    P: int
+    n_p: tuple[int, ...]  # electrodes per parcel, len P, Σ = c
+    k: int
+    S: int
+    n_mask: int
+    s_vis: int
+    n_tube: int
+    P_vis: int
+
+    @property
+    def latent_student(self) -> int:
+        return self.P_vis * self.k * self.s_vis
+
+    @property
+    def latent_teacher(self) -> int:
+        return self.P * self.k * self.S
+
+    @property
+    def m2_q(self) -> int:
+        return self.b * self.c * self.n_mask
+
+    @property
+    def m4_q(self) -> int:
+        # {tubed parcels: all S cells} ∪ {untubed: the n_mask masked cells}, ×k seeds.
+        return self.b * (self.n_tube * self.k * self.S + self.P_vis * self.k * self.n_mask)
+
+
+def compute_static_shapes_v2(
+    m2_mask: Tensor,
+    tube_mask: Tensor,
+    membership: Tensor,
+    bands: tuple[BandSpecV2, ...],
+    *,
+    k: int,
+    cfg: M2MaskConfigV2 = M2MaskConfigV2(),
+) -> StaticShapesV2:
+    """Build + VALIDATE the static header. FAILS LOUD if the masks are not
+    count-uniform (parcel-uniform M2 + fill-not-trim must guarantee an EXACT
+    ``n_mask`` per parcel; the tube an exact ``n_tube`` per clip) or if membership
+    is not a clean electrode→parcel partition — any of these silently breaks the
+    static-shape assumption every downstream gather relies on."""
+    if m2_mask.dtype != torch.bool or tube_mask.dtype != torch.bool:
+        raise ValueError("m2_mask and tube_mask must be bool")
+    B, P, S = m2_mask.shape
+    Pm, C = membership.shape
+    lfs, hga = bands
+    if Pm != P:
+        raise ValueError(f"membership P {Pm} != m2_mask P {P}")
+    if tuple(tube_mask.shape) != (B, P):
+        raise ValueError(f"tube_mask {tuple(tube_mask.shape)} != (B,P)=({B},{P})")
+    S_expected = sum(b.n_tokens for b in bands)
+    if S != S_expected:
+        raise ValueError(f"m2_mask S {S} != bands S {S_expected}")
+
+    # membership must be an exact partition: each electrode in exactly one parcel.
+    col = membership.sum(0)
+    if not torch.equal(col, torch.ones_like(col)):
+        raise ValueError("membership is not a partition (some electrode in ≠1 parcel)")
+    n_p = membership.sum(1)
+    if (n_p < 1).any():
+        raise ValueError("membership has an empty parcel (n_p<1) — pass active parcels only")
+
+    expected_n_mask = n_mask_hga(hga, cfg) + lfs.n_time_patches
+    counts = m2_mask.sum(-1)  # (B,P)
+    if not (counts == expected_n_mask).all():
+        bad = counts[counts != expected_n_mask]
+        raise ValueError(
+            f"M2 count not uniform: expected {expected_n_mask}/parcel, "
+            f"saw {sorted(set(bad.tolist()))} — fill-not-trim or freq-tube broke"
+        )
+
+    tube_counts = tube_mask.sum(-1)  # (B,)
+    n_tube = int(tube_counts[0])
+    if not (tube_counts == n_tube).all():
+        raise ValueError(
+            f"tube count not uniform across clips: saw {sorted(set(tube_counts.tolist()))}"
+        )
+
+    return StaticShapesV2(
+        b=B,
+        c=C,
+        P=P,
+        n_p=tuple(int(x) for x in n_p.tolist()),
+        k=k,
+        S=S,
+        n_mask=expected_n_mask,
+        s_vis=S - expected_n_mask,
+        n_tube=n_tube,
+        P_vis=P - n_tube,
+    )
+
+
 def cell_operator_index(
     bands: tuple[BandSpecV2, ...] = BANDS_V2, *, tie_lfs: bool = True
 ) -> Tensor:
