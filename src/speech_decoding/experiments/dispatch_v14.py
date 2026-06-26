@@ -646,7 +646,8 @@ def build_v14_experiment(
     # meaning). REQUIRED-when-2band (no silent run defaults); inert otherwise.
     # k / tie_lfs are v2 set-pool science knobs (seeds-per-parcel, n_op tie).
     converged_v2_pred_dim: int | None = None,
-    converged_v2_pred_layers: int | None = None,
+    converged_v2_m2_pred_layers: int | None = None,
+    converged_v2_m4_pred_layers: int | None = None,
     converged_v2_k: int = 2,
     converged_v2_untie_lfs: bool = False,
     # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
@@ -2244,14 +2245,15 @@ def build_v14_experiment(
         # dual-depth M2/M4 + frozen EMA teacher), wrapped by
         # V14ConvergedV2Experiment. The V14ParcelPerceiver return below is NOT
         # reached. The shape is REQUIRED (no silent run defaults — Ben's to name);
-        # a missing converged-v2 param is a hard ValueError. The v2 model has ONE
-        # shared M2/M4 predictor, so only a single pred_dim/pred_layers is named;
+        # a missing converged-v2 param is a hard ValueError. The v2 M2/M4 predictors
+        # share a hidden dim (pred_dim) but take SEPARATE depths (m2/m4 pred-layers);
         # d_model/n_heads + frontend/latent layers are shared with the 3STFT flags.
         _v2_shape = {
             "frontend_layers": converged_frontend_layers,
             "latent_layers": converged_latent_layers,
             "pred_dim": converged_v2_pred_dim,
-            "pred_layers": converged_v2_pred_layers,
+            "m2_pred_layers": converged_v2_m2_pred_layers,
+            "m4_pred_layers": converged_v2_m4_pred_layers,
         }
         _v2_missing = [k for k, v in _v2_shape.items() if v is None]
         if _v2_missing:
@@ -2259,7 +2261,8 @@ def build_v14_experiment(
                 "--frontend 2band requires the converged-v2 shape params (no "
                 f"silent run defaults): missing {_v2_missing}. Pass "
                 "--converged-frontend-layers / --converged-latent-layers / "
-                "--converged-v2-pred-dim / --converged-v2-pred-layers."
+                "--converged-v2-pred-dim / --converged-v2-m2-pred-layers / "
+                "--converged-v2-m4-pred-layers."
             )
         from speech_decoding.experiments.v14_converged_v2_experiment import (
             V14ConvergedV2Experiment,
@@ -2782,16 +2785,19 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--converged-m4-pred-layers", dest="converged_m4_pred_layers",
                    type=int, default=None,
                    help="3stft: M4 predictor depth.")
-    # --frontend 2band converged-v2 shape. The v2 model has ONE shared M2/M4
-    # predictor, so a single pred dim/depth (vs 3stft's m2/m4 split). d_model /
-    # n_heads + --converged-frontend-layers / --converged-latent-layers /
+    # --frontend 2band converged-v2 shape. The v2 M2/M4 predictors share a hidden
+    # dim (pred_dim) but take SEPARATE depths (m2/m4 pred-layers, like 3stft).
+    # d_model / n_heads + --converged-frontend-layers / --converged-latent-layers /
     # --converged-tube-ratio are SHARED with 3stft. REQUIRED on the 2band path.
     p.add_argument("--converged-v2-pred-dim", dest="converged_v2_pred_dim",
                    type=int, default=None,
                    help="2band: shared M2/M4 predictor hidden dim.")
-    p.add_argument("--converged-v2-pred-layers", dest="converged_v2_pred_layers",
+    p.add_argument("--converged-v2-m2-pred-layers", dest="converged_v2_m2_pred_layers",
                    type=int, default=None,
-                   help="2band: shared M2/M4 predictor depth.")
+                   help="2band: M2 predictor depth (separate from M4).")
+    p.add_argument("--converged-v2-m4-pred-layers", dest="converged_v2_m4_pred_layers",
+                   type=int, default=None,
+                   help="2band: M4 predictor depth (separate from M2).")
     p.add_argument("--converged-v2-k", dest="converged_v2_k",
                    type=int, default=2,
                    help="2band: set-pool seeds per parcel (k). Default 2.")
@@ -4067,7 +4073,8 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_m4_pred_dim=args.converged_m4_pred_dim,
         converged_m4_pred_layers=args.converged_m4_pred_layers,
         converged_v2_pred_dim=args.converged_v2_pred_dim,
-        converged_v2_pred_layers=args.converged_v2_pred_layers,
+        converged_v2_m2_pred_layers=args.converged_v2_m2_pred_layers,
+        converged_v2_m4_pred_layers=args.converged_v2_m4_pred_layers,
         converged_v2_k=args.converged_v2_k,
         converged_v2_untie_lfs=args.converged_v2_untie_lfs,
         converged_lambda_m2=args.converged_lambda_m2,

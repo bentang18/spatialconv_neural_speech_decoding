@@ -27,7 +27,8 @@ def _v2(tmp_path, **kw):
         bt_root=str(tmp_path), mode="lite", frontend="2band",
         d_model=64, n_heads=4,
         converged_frontend_layers=2, converged_latent_layers=2,
-        converged_v2_pred_dim=32, converged_v2_pred_layers=2,
+        converged_v2_pred_dim=32,
+        converged_v2_m2_pred_layers=2, converged_v2_m4_pred_layers=3,
     )
     base.update(kw)
     return build_v14_experiment(**base)
@@ -45,7 +46,8 @@ def test_2band_config_carries_named_shape(tmp_path) -> None:
     assert cfg.n_heads == 4
     assert cfg.frontend_layers == 2
     assert cfg.latent_layers == 2
-    assert cfg.pred_dim == 32 and cfg.pred_layers == 2
+    assert cfg.pred_dim == 32
+    assert cfg.m2_pred_layers == 2 and cfg.m4_pred_layers == 3
     # n_parcels = DK K=80 (the atlas vocabulary length), derived not passed
     assert cfg.n_parcels == 80
 
@@ -97,7 +99,8 @@ def test_2band_x_name_is_lfs_peek_key(tmp_path) -> None:
 @pytest.mark.parametrize(
     "drop",
     ["converged_frontend_layers", "converged_latent_layers",
-     "converged_v2_pred_dim", "converged_v2_pred_layers"],
+     "converged_v2_pred_dim", "converged_v2_m2_pred_layers",
+     "converged_v2_m4_pred_layers"],
 )
 def test_2band_requires_v2_shape(tmp_path, drop: str) -> None:
     """No silent run defaults: omitting any v2 shape param is a hard dispatch
@@ -106,7 +109,8 @@ def test_2band_requires_v2_shape(tmp_path, drop: str) -> None:
         bt_root=str(tmp_path), mode="lite", frontend="2band",
         d_model=64, n_heads=4,
         converged_frontend_layers=2, converged_latent_layers=2,
-        converged_v2_pred_dim=32, converged_v2_pred_layers=2,
+        converged_v2_pred_dim=32,
+        converged_v2_m2_pred_layers=2, converged_v2_m4_pred_layers=3,
     )
     kw[drop] = None
     with pytest.raises(ValueError, match="2band"):
@@ -155,13 +159,15 @@ def test_parser_accepts_2band_and_v2_args() -> None:
     a = _parser().parse_args([
         "--frontend", "2band",
         "--converged-frontend-layers", "6", "--converged-latent-layers", "8",
-        "--converged-v2-pred-dim", "128", "--converged-v2-pred-layers", "4",
+        "--converged-v2-pred-dim", "128",
+        "--converged-v2-m2-pred-layers", "3", "--converged-v2-m4-pred-layers", "6",
         "--converged-v2-k", "2", "--converged-v2-untie-lfs",
         "--group-by-session",
     ])
     assert a.frontend == "2band"
     assert a.converged_v2_pred_dim == 128
-    assert a.converged_v2_pred_layers == 4
+    assert a.converged_v2_m2_pred_layers == 3
+    assert a.converged_v2_m4_pred_layers == 6
     assert a.converged_v2_k == 2
     assert a.converged_v2_untie_lfs is True
     # The `--frontend 2band requires --group-by-session` SystemExit guard lives

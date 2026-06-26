@@ -30,7 +30,8 @@ def _tiny_model() -> V14ConvergedV2:
         n_heads=4,
         frontend_layers=1,
         latent_layers=1,
-        pred_layers=1,
+        m2_pred_layers=1,
+        m4_pred_layers=1,
         pred_dim=16,
         n_parcels=N_PARCELS,
     ).build(0, 0)

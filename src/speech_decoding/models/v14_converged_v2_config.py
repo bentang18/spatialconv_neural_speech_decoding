@@ -43,7 +43,8 @@ class V14ConvergedV2Net(BaseModelConfig):
     n_heads: int
     frontend_layers: int
     latent_layers: int
-    pred_layers: int
+    m2_pred_layers: int
+    m4_pred_layers: int
     pred_dim: int
     n_parcels: int
 
@@ -60,7 +61,8 @@ class V14ConvergedV2Net(BaseModelConfig):
                 n_heads=self.n_heads,
                 frontend_layers=self.frontend_layers,
                 latent_layers=self.latent_layers,
-                pred_layers=self.pred_layers,
+                m2_pred_layers=self.m2_pred_layers,
+                m4_pred_layers=self.m4_pred_layers,
                 pred_dim=self.pred_dim,
                 n_parcels=self.n_parcels,
                 k=self.k,

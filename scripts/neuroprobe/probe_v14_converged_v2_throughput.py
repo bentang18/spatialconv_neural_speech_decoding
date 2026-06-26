@@ -56,7 +56,8 @@ def main() -> None:
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--frontend-layers", type=int, default=6)
     ap.add_argument("--latent-layers", type=int, default=8)
-    ap.add_argument("--pred-layers", type=int, default=4)
+    ap.add_argument("--m2-pred-layers", type=int, default=3)
+    ap.add_argument("--m4-pred-layers", type=int, default=6)
     ap.add_argument("--pred-dim", type=int, default=128)
     ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--n-parcels", type=int, default=62, help="DKT embedding table size")
@@ -87,7 +88,8 @@ def main() -> None:
         n_heads=args.n_heads,
         frontend_layers=args.frontend_layers,
         latent_layers=args.latent_layers,
-        pred_layers=args.pred_layers,
+        m2_pred_layers=args.m2_pred_layers,
+        m4_pred_layers=args.m4_pred_layers,
         pred_dim=args.pred_dim,
         n_parcels=args.n_parcels,
         k=args.k,

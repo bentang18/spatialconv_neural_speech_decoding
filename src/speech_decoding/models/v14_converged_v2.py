@@ -1029,7 +1029,8 @@ class V14ConvergedV2Config:
     n_heads: int
     frontend_layers: int
     latent_layers: int
-    pred_layers: int
+    m2_pred_layers: int
+    m4_pred_layers: int
     pred_dim: int
     n_parcels: int
     k: int = 2
@@ -1088,11 +1089,11 @@ class V14ConvergedV2(nn.Module):
             ssl_bands=self.ssl_bands,
         )
         self.m2_predictor = JepaPredictorV2(
-            cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.pred_layers,
+            cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m2_pred_layers,
             ssl_bands=self.ssl_bands,
         )
         self.m4_predictor = JepaPredictorV2(
-            cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.pred_layers,
+            cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m4_pred_layers,
             n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
         )
 

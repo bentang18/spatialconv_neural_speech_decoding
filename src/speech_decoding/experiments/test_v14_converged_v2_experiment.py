@@ -33,7 +33,7 @@ N_PARCELS = 8
 def _config(**kw) -> V14ConvergedV2Net:
     base = dict(
         d_model=16, n_heads=4, frontend_layers=1, latent_layers=1,
-        pred_layers=1, pred_dim=16, n_parcels=N_PARCELS,
+        m2_pred_layers=1, m4_pred_layers=1, pred_dim=16, n_parcels=N_PARCELS,
     )
     base.update(kw)
     return V14ConvergedV2Net(**base)
