@@ -462,3 +462,106 @@ class SetPoolV2(nn.Module):
         ctx = ctx.masked_fill(no_cov[None, :, None], 0.0)
         out = self.out(ctx)                                         # (BS, Pk, d)
         return out.reshape(B, S, P, k, d).permute(0, 2, 3, 1, 4)    # (B, P, k, S, d)
+
+
+def _max_time_slot(bands: tuple[BandSpecV2, ...]) -> int:
+    _, _, time_slot = token_metadata(bands)
+    return int(time_slot.max().item())
+
+
+class LatentEncoderV2(nn.Module):
+    """Stage 3 latent — global self-attention over the parcel SEEDS (cost center).
+
+    Input is the pooled seeds ``(B, P, k, S, d)`` (NOT electrodes — v2 pools first,
+    so the latent is SMALLER: ``P·k·S`` ≈ 12·2·60 vs the old ``C·S``). Bridge:
+    add ``embed_p^pos`` (the latent's learned parcel positional tag, broadcast
+    across ``k`` seeds + ``S`` cells) then flatten to one ``P·k·S`` token set and
+    run ``n_layers`` all-pairs joint self-attention blocks. RoPE keys off the
+    seed's TIME (``cell_time_slot`` on the shared HGA-stride clock); the seed's
+    frequency identity is carried in via the residual from the frontend embed
+    (NOT re-added here). Freq is already structural in the seed — the pool was
+    per-cell — so only parcel(+) and time(RoPE) positions are added at the latent.
+
+    The student passes its gathered ``P_vis`` untubed parcels × ``s_vis`` visible
+    cells; the teacher passes all ``P`` × ``S``. ``key_mask`` ``(B,P,k,S)`` bool
+    (``True`` = attendable) supports a dense/padded path; the static hot path
+    gathers instead and passes ``None``.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        n_parcels: int,
+        *,
+        ssl_bands: tuple[BandSpecV2, ...] | None = None,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        head_dim = d_model // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+
+        # embed_p^pos — the latent's own parcel tag (separate from the pool's
+        # embed_p^q), universal DKT-sized table.
+        self.parcel_embed = nn.Embedding(n_parcels, d_model)
+        nn.init.trunc_normal_(self.parcel_embed.weight, std=0.02)
+
+        # Size the RoPE table to the LONGEST clock the model sees (5 s SSL by
+        # default); the 1 s eval slots are a subset ⇒ safe to gather.
+        if ssl_bands is None:
+            ssl_bands = bands_for_clip_len(5.0)
+        n_slots = _max_time_slot(ssl_bands) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
+        )
+        self.ln_out = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        seeds: Tensor,            # (B, P, k, S, d)
+        parcel_labels: Tensor,    # (P,) long  DKT ids
+        cell_time_slot: Tensor,   # (S,) long  RoPE clock per cell
+        *,
+        key_mask: Tensor | None = None,  # (B, P, k, S) bool, True = attendable
+    ) -> Tensor:
+        B, P, k, S, d = seeds.shape
+        if cell_time_slot.shape != (S,):
+            raise ValueError(
+                f"cell_time_slot must be (S={S},), got {tuple(cell_time_slot.shape)}"
+            )
+        x = seeds + self.parcel_embed(parcel_labels)[None, :, None, None, :]
+        x = x.reshape(B, P * k * S, d)
+        # token order is (p, j, s) p-major s-minor ⇒ tile cell slots across P·k.
+        slot = cell_time_slot.repeat(P * k)                       # (P·k·S,)
+        rope = self.key_rope[:, slot, :]                          # (2, N, head_dim)
+        km = None if key_mask is None else key_mask.reshape(B, P * k * S)
+        for blk in self.blocks:
+            x = blk(x, rope, km)
+        return self.ln_out(x).reshape(B, P, k, S, d)
+
+
+@torch.no_grad()
+def ema_update(teacher: nn.Module, student: nn.Module, tau: float) -> None:
+    """In-place EMA: ``θ_t ← τ·θ_t + (1−τ)·θ_s`` on params; buffers copied.
+
+    The JEPA momentum target update (mirrors ``v14_converged.update_teacher``):
+    foreach mul/add over the param lists (one fused kernel, no python loop),
+    then a hard copy of every buffer (RoPE tables etc. — non-learned, must track
+    the student exactly). ``tau`` is the teacher's retention (e.g. 0.9992)."""
+    if not 0.0 <= tau <= 1.0:
+        raise ValueError(f"tau must be in [0, 1], got {tau}")
+    t_params = list(teacher.parameters())
+    s_params = list(student.parameters())
+    if len(t_params) != len(s_params):
+        raise ValueError(
+            f"teacher/student param count mismatch: {len(t_params)} vs {len(s_params)}"
+        )
+    torch._foreach_mul_(t_params, tau)
+    torch._foreach_add_(t_params, s_params, alpha=1.0 - tau)
+    for tb, sb in zip(teacher.buffers(), student.buffers()):
+        tb.copy_(sb)
