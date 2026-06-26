@@ -213,6 +213,15 @@ class SSLHealthMonitor(pl.Callback):
         taps = getattr(pl_module, "_last_taps", None)
         if not taps:
             return
+        # Under grad-accum the module stashes taps on EVERY micro-batch (all share
+        # the pre-step global_step), but one logical training step = one optimiser
+        # step = the LAST micro-batch of the accum window. Fire once there so an
+        # accum-K config doesn't recompute the rankme SVD K× per step (Family A in
+        # on_before_optimizer_step is already once-per-step). accum defaults to 1 ⇒
+        # every batch (unchanged).
+        accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
+        if (batch_idx + 1) % accum != 0:
+            return
         self._run_input_stats(pl_module, batch)
         self._run_tap_monitors(pl_module, taps)
 

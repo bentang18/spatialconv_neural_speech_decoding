@@ -202,6 +202,34 @@ def test_tap_monitors_survive_global_step_advance():
         assert k in logged and logged[k] == logged[k], k  # present + finite
 
 
+def test_tap_monitors_fire_once_per_accum_window():
+    """Under grad-accum the tap monitors fire only on the LAST micro-batch of the
+    window (one rankme SVD per optimiser step, not per micro-batch)."""
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    m.train()
+
+    class _FakeTrainer:
+        global_step = 0
+        accumulate_grad_batches = 4
+
+    m._trainer = _FakeTrainer()  # type: ignore[assignment]
+    out = m._step(_batch(B=3).data)
+    assert m._last_taps is not None
+    for bidx in (0, 1, 2):
+        logged: dict[str, float] = {}
+        m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+        cb.on_train_batch_end(trainer=m._trainer, pl_module=m, outputs=out,
+                              batch=_batch(B=3), batch_idx=bidx)
+        assert not any("rankme" in k for k in logged), f"fired on micro-batch {bidx}"
+    # Last micro-batch of the window (batch_idx 3, (3+1)%4==0) ⇒ fires.
+    logged = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb.on_train_batch_end(trainer=m._trainer, pl_module=m, outputs=out,
+                          batch=_batch(B=3), batch_idx=3)
+    assert "train_mon_rankme" in logged
+
+
 def test_input_stats_absmax_catches_outlier():
     m = _module()
     cb = SSLHealthMonitor()
