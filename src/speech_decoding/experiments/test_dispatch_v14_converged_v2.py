@@ -175,3 +175,28 @@ def test_parser_accepts_2band_and_v2_args() -> None:
     # dispatch test also does not unit-test); the AUTHORITATIVE enforcement is the
     # module's runtime fail-loud, covered by
     # test_v14_converged_v2_module::test_v2_inputs_reject_heterogeneous_batch.
+
+
+def test_v2_config_registered_via_models_package() -> None:
+    """Worker-context registration guard. On DeltaAI the experiment's
+    brain_model_config dict {"name": "V14ConvergedV2Net", ...} is RE-VALIDATED
+    against the BaseModelConfig discriminated union in a process that imports only
+    `speech_decoding.models` (not the v2 module directly). The discriminator is
+    registered as an import side-effect, so models/__init__ MUST import the v2
+    config — otherwise the run dies at config validation (observed on DeltaAI
+    2026-06-26). A subprocess gives the clean import the bug needs; an in-process
+    check would be masked by sibling test imports."""
+    import subprocess
+    import sys
+
+    code = (
+        "import speech_decoding.models\n"
+        "from neuraltrain.models.base import BaseModelConfig\n"
+        "o = BaseModelConfig.model_validate({'name': 'V14ConvergedV2Net',\n"
+        "  'd_model': 256, 'n_heads': 4, 'frontend_layers': 4, 'latent_layers': 8,\n"
+        "  'm2_pred_layers': 2, 'm4_pred_layers': 6, 'pred_dim': 128, 'n_parcels': 80})\n"
+        "assert type(o).__name__ == 'V14ConvergedV2Net', type(o).__name__\n"
+        "assert o.m2_pred_layers == 2 and o.m4_pred_layers == 6\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, f"v2 config not registered from bare models import:\n{r.stderr}"
