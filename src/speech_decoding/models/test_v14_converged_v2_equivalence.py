@@ -127,6 +127,39 @@ def test_latent_parcel_packing_equals_keymask():
     assert torch.allclose(dense[:, untubed], static, atol=1e-5)
 
 
+def test_latent_per_clip_parcel_gather_equals_keymask():
+    """PRODUCTION gather: tube selects DIFFERENT parcels per clip. Tagging all P
+    parcels with embed_p^pos (shared labels) then gathering the untubed parcels
+    per-clip == running all P with a per-clip key-mask hiding the tubed ones. This
+    is what lets the static latent see only P_vis·k·s_vis tokens with NO per-clip
+    label indexing (parcel-embed added pre-gather)."""
+    torch.manual_seed(0)
+    bands = v2.bands_for_clip_len(5.0)
+    _, _, slot = v2.token_metadata(bands)
+    S = sum(b.n_tokens for b in bands)
+    B, P, k = 4, 6, 2
+    labels = torch.tensor([3, 7, 12, 20, 41, 55])
+    seeds = torch.randn(B, P, k, S, D)
+    tube = v2.sample_parcel_tube_v2(B, P, 0.35, _gen(7))      # (B,P), n_tube=2/clip
+    n_tube = int(tube[0].sum())
+    assert (tube.sum(-1) == n_tube).all() and n_tube >= 1
+    P_vis = P - n_tube
+    untubed_idx = (
+        (~tube).int().argsort(dim=-1, descending=True, stable=True)[:, :P_vis].sort(-1).values
+    )                                                        # (B, P_vis)
+    gidx = untubed_idx[:, :, None, None, None].expand(-1, -1, k, S, D)
+
+    enc = LatentEncoderV2(D, 4, n_layers=3, n_parcels=N_PARCELS)
+    enc.eval()
+    with torch.no_grad():
+        tagged = seeds + enc.parcel_embed(labels)[None, :, None, None, :]
+        static = enc(torch.gather(tagged, 1, gidx), None, slot)   # pre-tagged, gathered
+        key_mask = (~tube)[:, :, None, None].expand(B, P, k, S)
+        dense = enc(seeds, labels, slot, key_mask=key_mask)       # all P, key-masked
+        dense_unt = torch.gather(dense, 1, gidx)
+    assert torch.allclose(static, dense_unt, atol=1e-5)
+
+
 def test_latent_tubed_leak_free_under_packing():
     """Sanity: the dropped tubed parcels do NOT influence untubed latents (their
     seed values are irrelevant) — the property that makes drop==mask hold."""

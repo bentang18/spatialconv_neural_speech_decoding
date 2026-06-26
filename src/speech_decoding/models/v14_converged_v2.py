@@ -754,17 +754,26 @@ class LatentEncoderV2(nn.Module):
     def forward(
         self,
         seeds: Tensor,            # (B, P, k, S, d)
-        parcel_labels: Tensor,    # (P,) long  DKT ids
+        parcel_labels: Tensor | None,    # (P,) long DKT ids, OR None if pre-tagged
         cell_time_slot: Tensor,   # (S,) long  RoPE clock per cell
         *,
         key_mask: Tensor | None = None,  # (B, P, k, S) bool, True = attendable
     ) -> Tensor:
+        """``parcel_labels=None`` means the seeds already carry ``embed_p^pos``
+        (added pre-gather). The static hot path tags ALL P parcels at the pool
+        output — shared ``(P,)`` labels — THEN gathers the untubed parcels per clip,
+        so the latent never needs per-clip labels: it runs pure self-attention on
+        the pre-tagged, parcel-gathered seeds (the parcel axis is gathered, the cell
+        axis + RoPE are untouched)."""
         B, P, k, S, d = seeds.shape
         if cell_time_slot.shape != (S,):
             raise ValueError(
                 f"cell_time_slot must be (S={S},), got {tuple(cell_time_slot.shape)}"
             )
-        x = seeds + self.parcel_embed(parcel_labels)[None, :, None, None, :]
+        if parcel_labels is None:
+            x = seeds
+        else:
+            x = seeds + self.parcel_embed(parcel_labels)[None, :, None, None, :]
         x = x.reshape(B, P * k * S, d)
         # token order is (p, j, s) p-major s-minor ⇒ tile cell slots across P·k.
         slot = cell_time_slot.repeat(P * k)                       # (P·k·S,)
