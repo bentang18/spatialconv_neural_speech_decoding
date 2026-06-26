@@ -104,6 +104,9 @@ def build_sbatch(log_dir: Path, args: argparse.Namespace) -> str:
     if args.sessions:
         cmd[-1] += " \\"
         cmd.append(f"    --sessions {shlex.quote(args.sessions)}")
+    if args.frontend:
+        cmd[-1] += " \\"
+        cmd.append(f"    --frontend {shlex.quote(args.frontend)}")
     lines.extend(cmd)
     lines.append("")
     return "\n".join(lines)
@@ -123,6 +126,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--sessions", default=None,
         help='Optional "S:T,S:T,..." override of the scanned corpus (array indexes into it).',
+    )
+    p.add_argument(
+        "--frontend", choices=("3stft", "2band"), default=None,
+        help="Band set for the scan: 3stft (default in the script) or 2band "
+             "(converged-v2 LFS/HGA). Passed through to precompute_bad_windows.",
     )
     p.add_argument(
         "--log-dir", type=Path, default=None,
