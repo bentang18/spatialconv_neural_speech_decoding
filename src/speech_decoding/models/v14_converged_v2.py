@@ -545,6 +545,126 @@ class LatentEncoderV2(nn.Module):
         return self.ln_out(x).reshape(B, P, k, S, d)
 
 
+class JepaPredictorV2(nn.Module):
+    """I-JEPA joint predictor for v2 — serves BOTH M2 (shallow) and M4 (deep).
+
+    Queries (held-out positions) are built from a shared learnable mask token +
+    a learned freq-patch tag, optionally + a parcel tag (M4) + a seed tag (M4),
+    RoPE-positioned in time. They are concatenated with the projected visible
+    CONTEXT and run through ``n_layers`` joint self-attention blocks (each query
+    attends to all context + the queries co-resolve); the query rows are read out
+    and projected (raw, NO LayerNorm before the L1 — the TARGET is LN'd instead,
+    loss memo Refinement 5) to the teacher feature dim ``d_model``.
+
+    ONE class, two configs:
+      - **M2** (per-electrode, electrodes ride the batch dim): ``n_parcels=None,
+        k=None`` ⇒ query = mask + freq + RoPE, NO parcel/seed (stage-1 isolated).
+        Context = the electrode's ``s_vis`` visible FRONTEND tokens.
+      - **M4** (over the latent): ``n_parcels`` + ``k`` set ⇒ query = mask + freq
+        + parcel + seed + RoPE. Context = the student LATENT seeds. ONE predictor,
+        extended query set {tubed: all S cells} ∪ {untubed: M2-masked cells}.
+
+    All query/context metadata is per-row ``(B, L)`` (B = whatever rides the
+    batch dim — real B·C electrodes for M2, B clips for M4). ``ctx_key_mask``
+    ``(B, Lc)`` drops padded/invalid context; the static hot path gathers ⇒ None.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        pred_dim: int,
+        n_heads: int,
+        n_layers: int,
+        *,
+        n_parcels: int | None = None,
+        k: int | None = None,
+        ssl_bands: tuple[BandSpecV2, ...] | None = None,
+    ) -> None:
+        super().__init__()
+        if pred_dim % n_heads != 0:
+            raise ValueError(f"pred_dim={pred_dim} not divisible by n_heads={n_heads}")
+        head_dim = pred_dim // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+
+        self.ctx_proj = nn.Linear(d_model, pred_dim, bias=False)
+        self.mask_token = nn.Parameter(torch.zeros(pred_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.freq_embed = nn.Parameter(torch.empty(N_FREQ_PATCHES_V2, pred_dim))
+        nn.init.trunc_normal_(self.freq_embed, std=0.02)
+
+        self.parcel_embed = (
+            nn.Embedding(n_parcels, pred_dim) if n_parcels is not None else None
+        )
+        if self.parcel_embed is not None:
+            nn.init.trunc_normal_(self.parcel_embed.weight, std=0.02)
+        if k is not None:
+            self.seed_embed = nn.Parameter(torch.empty(k, pred_dim))
+            nn.init.trunc_normal_(self.seed_embed, std=0.02)
+        else:
+            self.seed_embed = None
+
+        if ssl_bands is None:
+            ssl_bands = bands_for_clip_len(5.0)
+        n_slots = _max_time_slot(ssl_bands) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(pred_dim, n_heads) for _ in range(n_layers)]
+        )
+        self.head = nn.Linear(pred_dim, d_model, bias=False)  # raw pred, NO LN
+
+    def _build_queries(
+        self,
+        q_freq: Tensor,        # (B, Lq)  RoPE-time added in forward, not here
+        q_parcel: Tensor | None,
+        q_seed: Tensor | None,
+    ) -> Tensor:
+        q = self.mask_token + self.freq_embed[q_freq]            # (B, Lq, pred)
+        if self.parcel_embed is not None:
+            if q_parcel is None:
+                raise ValueError("this predictor has a parcel tag; pass q_parcel")
+            q = q + self.parcel_embed(q_parcel)
+        elif q_parcel is not None:
+            raise ValueError("this predictor has no parcel tag; q_parcel must be None")
+        if self.seed_embed is not None:
+            if q_seed is None:
+                raise ValueError("this predictor has a seed tag; pass q_seed")
+            q = q + self.seed_embed[q_seed]
+        elif q_seed is not None:
+            raise ValueError("this predictor has no seed tag; q_seed must be None")
+        return q
+
+    def forward(
+        self,
+        ctx: Tensor,             # (B, Lc, d_model)
+        ctx_slot: Tensor,        # (B, Lc) long
+        q_slot: Tensor,          # (B, Lq) long
+        q_freq: Tensor,          # (B, Lq) long
+        *,
+        q_parcel: Tensor | None = None,   # (B, Lq) long  (M4)
+        q_seed: Tensor | None = None,     # (B, Lq) long  (M4)
+        ctx_key_mask: Tensor | None = None,  # (B, Lc) bool, True = real
+    ) -> Tensor:
+        """Predict ``(B, Lq, d_model)`` at the query positions from the context."""
+        B, Lc, _ = ctx.shape
+        Lq = q_slot.shape[1]
+        q = self._build_queries(q_freq, q_parcel, q_seed)          # (B, Lq, pred)
+        c = self.ctx_proj(ctx)                                     # (B, Lc, pred)
+        tokens = torch.cat([c, q], dim=1)                          # (B, Lc+Lq, pred)
+
+        slots = torch.cat([ctx_slot, q_slot], dim=1)               # (B, Lc+Lq)
+        rope = self.key_rope[:, slots, :]                          # (2, B, L, head_dim)
+
+        key_mask: Tensor | None = None
+        if ctx_key_mask is not None:
+            q_keep = torch.ones(B, Lq, dtype=torch.bool, device=ctx.device)
+            key_mask = torch.cat([ctx_key_mask, q_keep], dim=1)    # (B, L)
+
+        for blk in self.blocks:
+            tokens = blk(tokens, rope, key_mask)
+        return self.head(tokens[:, Lc:])                           # (B, Lq, d_model)
+
+
 @torch.no_grad()
 def ema_update(teacher: nn.Module, student: nn.Module, tau: float) -> None:
     """In-place EMA: ``θ_t ← τ·θ_t + (1−τ)·θ_s`` on params; buffers copied.
