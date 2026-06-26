@@ -43,6 +43,39 @@ def test_dispatch_default_wires_multi_stft_view(tmp_path, monkeypatch) -> None:
     assert ext.scaler is None
 
 
+@pytest.mark.parametrize(
+    "band,bins,hop,f_lo,f_hi",
+    [("lfs", 28, 512, 2.0, 56.0), ("hga", 7, 64, 64.0, 160.0)],
+)
+def test_dispatch_cache_band_v2_builds_magnitude_band_view(
+    tmp_path, monkeypatch, band, bins, hop, f_lo, f_hi
+) -> None:
+    """v2 P1.2: ``--cache-band {lfs,hga}`` rides the single-grid electrode_tokens
+    slot as a MAGNITUDE MultiStftView with the locked 2-band geometry and the
+    v14 preprocessing chain (shaft-CAR, mains notch). Magnitude (no Re/Im) ⇒
+    _expected_raw_f_bins == n_bins. Normalization = standard mag robust-z (the
+    beta/hg path, no new wiring); STATIC bad-electrode drop is band-independent
+    (anatomy.extra_bad_electrodes, applied pre-CAR upstream of this view)."""
+    monkeypatch.setenv("ROOT_DIR_BRAINTREEBANK", str(tmp_path))
+    xp = dispatch_v14.build_v14_experiment(
+        mode="nano", cache_band=band,
+        spec_cache_dir=str(tmp_path / "spec"),
+    )
+    ext = xp.data.segmenter.extractors["electrode_tokens"]
+    assert isinstance(ext, MultiStftView)
+    assert ext.front_end == "band"
+    assert ext.band_channelization == "mag"
+    assert ext.car == "shaft"
+    assert ext.notch_filter == 60.0
+    assert ext.hop_length == hop
+    assert ext.session_robust_z is True  # standard mag robust-z, no new wiring
+    assert ext._band_bins() == ((1, 28) if band == "lfs" else (4, 10))
+    assert ext._expected_raw_f_bins() == bins
+    # band_<name> spec-cache subdir so a future v2 run HITs the same namespace
+    assert ext.spec_cache_dir is not None
+    assert ext.spec_cache_dir.endswith(f"band_{band}")
+
+
 def test_dispatch_lof_off_by_default_leaves_view_unperturbed(tmp_path, monkeypatch) -> None:
     """#17: with LOF off (the default) the Multi-STFT view carries NO lof config —
     ``lof_bad_channels``/``drop_bads`` False, no report path — so the multi-TB STFT

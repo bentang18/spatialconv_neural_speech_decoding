@@ -48,7 +48,9 @@ from speech_decoding.extractors.shaft_mask import BTShaftMaskExtractor
 from speech_decoding.extractors.subtype_meta import SubjectSubtypeExtractor
 from speech_decoding.extractors.valid_mask import ElectrodeValidMask
 from speech_decoding.extractors.view import (
+    STFT_2BAND_HGA,
     STFT_2BAND_HIGH,
+    STFT_2BAND_LFS,
     STFT_2BAND_LOW,
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
@@ -552,7 +554,7 @@ def build_v14_experiment(
     # future ``--frontend 3stft`` training run (shared ``STFT_3BAND_*`` constants
     # + ``common_fe_kwargs``), so the spec-cache namespace matches → the run HITs
     # this cache. Overrides ``frontend``. None = no 3STFT band build.
-    cache_band: tp.Literal["slow", "beta", "hg"] | None = None,
+    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga"] | None = None,
     # Cache-build parallelism (--cache-only): restrict the SSL/study corpus to a
     # single session by its index in ``_SESSIONS_BY_MODE[study_mode]`` so a SLURM
     # array builds one session's spec cache per task. None = full corpus. The
@@ -1395,6 +1397,12 @@ def build_v14_experiment(
                 "slow": STFT_3BAND_SLOW,
                 "beta": STFT_3BAND_BETA,
                 "hg": STFT_3BAND_HG,
+                # converged-arch-v2 2-band magnitude frontend (P1.2). lfs/hga
+                # build into <spec-cache-dir>/band_{lfs,hga}; a future v2 run
+                # constructs the same MultiStftView(**STFT_2BAND_{LFS,HGA}) under
+                # the same subdir ⇒ namespace matches ⇒ the run HITs this cache.
+                "lfs": STFT_2BAND_LFS,
+                "hga": STFT_2BAND_HGA,
             }[cache_band]
             band_spec_cache = (
                 str(Path(spec_cache_dir) / f"band_{cache_band}")
@@ -2689,12 +2697,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="3stft: M4 down-weight full-trust electrode count n_ref "
                         "(default 11; the w=1 saturation point).")
     p.add_argument("--cache-band", dest="cache_band",
-                   choices=("slow", "beta", "hg"), default=None,
-                   help="3STFT per-band cache build (--cache-only only). Build ONE "
-                        "named band of the locked 2/2/2 ladder (slow N=1024/hop512 "
-                        "2-12Hz Cartesian Re/Im; beta N=256/hop128 16-56Hz |STFT|; "
-                        "hg N=128/hop64 64-192Hz |STFT|) into <spec-cache-dir>/band_"
-                        "<name>. Rides the single-grid electrode_tokens slot, so no "
+                   choices=("slow", "beta", "hg", "lfs", "hga"), default=None,
+                   help="Per-band cache build (--cache-only only). Build ONE named "
+                        "band into <spec-cache-dir>/band_<name>. 3STFT 2/2/2 ladder: "
+                        "slow N=1024/hop512 2-12Hz Cartesian Re/Im; beta N=256/hop128 "
+                        "16-56Hz |STFT|; hg N=128/hop64 64-192Hz |STFT|. Converged-v2 "
+                        "2-band magnitude: lfs N=1024/hop512 2-56Hz |STFT| (28 bins); "
+                        "hga N=128/hop64 64-160Hz |STFT| (7 bins). Rides the "
+                        "single-grid electrode_tokens slot, so no "
                         "encoder change is needed; the band view matches a future "
                         "--frontend 3stft run → that run HITs this cache. Overrides "
                         "--frontend.")
