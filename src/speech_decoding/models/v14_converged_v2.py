@@ -305,6 +305,35 @@ class FrontendEncoderV2(nn.Module):
         )
         self.ln_out = nn.LayerNorm(d_model)
 
+    def encode_tokens(
+        self,
+        tok: Tensor,
+        freq_patch_id: Tensor,
+        time_slot: Tensor,
+        *,
+        key_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Run +freq-embed → blocks → LN over pre-tokenized cells ``(B,C,L,d)``.
+
+        ``freq_patch_id``/``time_slot`` index the freq-embed + RoPE tables and may
+        be the canonical ``(S,)`` (shared across electrodes — the dense path) OR
+        per-electrode ``(B,C,L)`` (the STATIC path, where parcel-uniform M2 leaves a
+        DIFFERENT visible-cell set per parcel ⇒ per-row gather + per-row RoPE). This
+        split is what lets the packed static forward reuse the exact dense block
+        stack — the basis of the dense==static equivalence."""
+        B, C, L, d = tok.shape
+        x = tok + self.freq_embed[freq_patch_id]                 # (B,C,L,d)
+        if time_slot.dim() == 1:
+            rope = self.key_rope[:, time_slot, :]                # (2, L, head_dim) shared
+        else:
+            rs = self.key_rope[:, time_slot, :]                  # (2, B, C, L, head_dim)
+            rope = rs.reshape(2, B * C, L, rs.shape[-1])         # per-row
+        x = x.reshape(B * C, L, d)
+        km = None if key_mask is None else key_mask.reshape(B * C, L)
+        for blk in self.blocks:
+            x = blk(x, rope, km)
+        return self.ln_out(x).reshape(B, C, L, d)
+
     def forward(
         self,
         lfs: Tensor,
@@ -314,14 +343,9 @@ class FrontendEncoderV2(nn.Module):
     ) -> Tensor:
         """``(B,C,28,T_lfs)/(B,C,7,T_hga)`` → per-electrode features ``(B, C, S, d)``."""
         tok = self.tokenizer(lfs, hga)                            # (B, C, S, d)
-        B, C, S, d = tok.shape
-        tok = tok + self.freq_embed[self.tokenizer.freq_patch_id]  # + (S, d)
-        rope = self.key_rope[:, self.tokenizer.time_slot, :]      # (2, S, head_dim)
-        x = tok.reshape(B * C, S, d)
-        km = None if key_mask is None else key_mask.reshape(B * C, S)
-        for blk in self.blocks:
-            x = blk(x, rope, km)
-        return self.ln_out(x).reshape(B, C, S, d)
+        return self.encode_tokens(
+            tok, self.tokenizer.freq_patch_id, self.tokenizer.time_slot, key_mask=key_mask
+        )
 
 
 @dataclass(frozen=True)
