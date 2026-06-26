@@ -58,6 +58,19 @@ def test_band_specs_are_the_three_3stft_bands() -> None:
     assert by_name["hg"][:2] == (128, 64) and by_name["hg"][3] - by_name["hg"][2] + 1 == 9
 
 
+def test_2band_frontend_specs() -> None:
+    """The --frontend 2band selector scans the converged-v2 LFS/HGA magnitude bands
+    (LFS k1..k28 = 28 bins, HGA k4..k10 = 7 bins), LFS first as the dropout sentinel
+    — geometry derived from STFT_2BAND_* via the bin selector, not hand-typed."""
+    m = _mod()
+    specs = m._make_band_specs(m._FRONTEND_BANDS["2band"])
+    names = [name for (name, *_) in specs]
+    assert names == ["lfs", "hga"]
+    by_name = {name: (npseg, hop, k0, k1) for (name, npseg, hop, k0, k1) in specs}
+    assert by_name["lfs"][:2] == (1024, 512) and by_name["lfs"][3] - by_name["lfs"][2] + 1 == 28
+    assert by_name["hga"][:2] == (128, 64) and by_name["hga"][3] - by_name["hga"][2] + 1 == 7
+
+
 # ------------------------------------------------- per-band q (the #231 crux)
 def _quiet_loud(ne: int = 100, nw: int = 10):
     """A quiet band (q≈1) carrying a real transient + a loud uniform band (q≈100)

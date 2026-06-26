@@ -86,6 +86,8 @@ mne.set_log_level("ERROR")
 from speech_decoding.extractors.normalize import robust_z
 from speech_decoding.extractors.reference import parse_shaft
 from speech_decoding.extractors.view import (
+    STFT_2BAND_HGA,
+    STFT_2BAND_LFS,
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
@@ -138,23 +140,43 @@ NOTCH_HZ: float = 60.0
 HPF_HZ: float = 0.5
 SIGMA_FLOOR: float = 1e-6  # == SessionRobustZNormalizer / view.session_z_sigma_floor
 
-# Production 3-band geometry (one source of truth = STFT_3BAND_* in view.py). The flat
-# (dropout) rule runs on the FIRST band, so SLOW is listed first to keep the lowest band
+# Production band geometry (one source of truth = STFT_*BAND_* in view.py). The flat
+# (dropout) rule runs on the FIRST band, so the LOWEST band is listed first to keep it
 # as the dropout sentinel (its low-frequency z-std collapses first on a recording freeze).
 # Each entry: (name, nperseg, hop, k0, k1) with [k0, k1] the INCLUSIVE rfft-bin slice the
 # production cache stores. Badness is detected on |STFT| for ALL bands (incl. the Cartesian
 # slow band): the magnitude transient is the artifact signal regardless of how the band is
 # stored for the model — so no cartesian special-case is needed in the scan.
-_BAND_ORDER: tuple[str, ...] = ("slow", "beta", "hg")
-_BAND_DICTS = {"slow": STFT_3BAND_SLOW, "beta": STFT_3BAND_BETA, "hg": STFT_3BAND_HG}
-_BAND_SPECS: list[tuple[str, int, int, int, int]] = []
-for _name in _BAND_ORDER:
-    _band = _BAND_DICTS[_name]
-    _nperseg, _hop = int(_band["band_nperseg"]), int(_band["band_hop"])
-    _k0, _k1 = _stft_band_k_range(
-        float(_band["band_f_lo_hz"]), float(_band["band_f_hi_hz"]), nperseg=_nperseg
-    )
-    _BAND_SPECS.append((_name, _nperseg, _hop, _k0, _k1))
+#
+# Two frontends share this scan (same self-calibrating per-band rule): the 3STFT
+# slow/beta/HG bands and the converged-v2 2-band LFS/HGA magnitude bands. The
+# ``--frontend`` flag selects which set; LFS is the 2-band dropout sentinel (lowest band).
+_BAND_DICTS = {
+    "slow": STFT_3BAND_SLOW, "beta": STFT_3BAND_BETA, "hg": STFT_3BAND_HG,
+    "lfs": STFT_2BAND_LFS, "hga": STFT_2BAND_HGA,
+}
+_FRONTEND_BANDS: dict[str, tuple[str, ...]] = {
+    "3stft": ("slow", "beta", "hg"),
+    "2band": ("lfs", "hga"),
+}
+
+
+def _make_band_specs(band_order: tuple[str, ...]) -> list[tuple[str, int, int, int, int]]:
+    """(name, nperseg, hop, k0, k1) per band, freq crop derived from STFT_*BAND_*
+    via the production bin selector (no hand-typed k that can drift)."""
+    specs: list[tuple[str, int, int, int, int]] = []
+    for name in band_order:
+        band = _BAND_DICTS[name]
+        nperseg, hop = int(band["band_nperseg"]), int(band["band_hop"])
+        k0, k1 = _stft_band_k_range(
+            float(band["band_f_lo_hz"]), float(band["band_f_hi_hz"]), nperseg=nperseg
+        )
+        specs.append((name, nperseg, hop, k0, k1))
+    return specs
+
+
+_BAND_ORDER: tuple[str, ...] = _FRONTEND_BANDS["3stft"]
+_BAND_SPECS: list[tuple[str, int, int, int, int]] = _make_band_specs(_BAND_ORDER)
 
 
 def _robust_z_perbin(mag: np.ndarray) -> np.ndarray:
@@ -260,6 +282,7 @@ def _decide_bad_windows(
 
 def compute_ewm_by_band(
     subject_id: int, trial_id: int,
+    band_specs: list[tuple[str, int, int, int, int]] | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, int, float, int]:
     """Streaming pass — the EXPENSIVE part of the scan, factored out so the
     aggressiveness sweep can pay it once per session and re-decide cheaply over a
@@ -267,9 +290,12 @@ def compute_ewm_by_band(
 
     BT load (static contacts already dropped pre-CAR, native→2048 Hz) → notch+HPF
     → shaft-CAR → per-band STFT robust-z, accumulating each electrode's per-window
-    |z|-max WITHIN each band plus the per-window slow-band flat-electrode count.
-    Returns ``(ewm_by_band, n_flat, n_elec, total_s, n_windows)`` — byte-identical
-    to what ``scan_session`` fed ``_decide_bad_windows`` before the extraction."""
+    |z|-max WITHIN each band plus the per-window lowest-band flat-electrode count.
+    ``band_specs`` defaults to the 3STFT bands (back-compat for the sweep); pass the
+    2-band specs for the converged-v2 frontend. Returns ``(ewm_by_band, n_flat,
+    n_elec, total_s, n_windows)`` — byte-identical to what ``scan_session`` fed
+    ``_decide_bad_windows`` before the extraction."""
+    band_specs = _BAND_SPECS if band_specs is None else band_specs
     from neuroprobe.braintreebank_subject import BrainTreebankSubject
 
     bt = BrainTreebankSubject(
@@ -306,13 +332,13 @@ def compute_ewm_by_band(
     # scale q_band (#231) — the slow/beta/HG |z| distributions differ, so one pooled q
     # would let a transient in a quieter band slip the fence.
     ewm_by_band = {
-        name: np.zeros((n_elec, n_windows), np.float32) for name, *_ in _BAND_SPECS
+        name: np.zeros((n_elec, n_windows), np.float32) for name, *_ in band_specs
     }
-    n_flat = np.zeros(n_windows, np.int32)  # electrodes flat (slow-band z-std < FLAT_STD)
-    flat_band = _BAND_SPECS[0][0]  # SLOW: lowest band is the dropout sentinel
+    n_flat = np.zeros(n_windows, np.int32)  # electrodes flat (low-band z-std < FLAT_STD)
+    flat_band = band_specs[0][0]  # lowest band is the dropout sentinel (slow / lfs)
 
     for i in range(n_elec):
-        for name, nperseg, hop, k0, k1 in _BAND_SPECS:
+        for name, nperseg, hop, k0, k1 in band_specs:
             _, _, z_stft = stft(
                 filt[i], fs=sfreq, nperseg=nperseg, noverlap=nperseg - hop,
                 boundary=None, padded=False,  # type: ignore[arg-type]  # scipy: None disables boundary ext
@@ -323,7 +349,7 @@ def compute_ewm_by_band(
             t_start = (np.arange(per_frame.shape[0]) * hop) / sfreq
             win = np.clip((t_start / CLIP_S).astype(np.int64), 0, n_windows - 1)
             np.maximum.at(ewm_by_band[name][i], win, per_frame)
-            if name == flat_band:  # slow band: per-window z-std -> flat/dropout detection
+            if name == flat_band:  # lowest band: per-window z-std -> flat/dropout detection
                 fsum = z.sum(axis=0, dtype=np.float64)
                 fsq = np.square(z, dtype=np.float64).sum(axis=0)
                 w_sum = np.zeros(n_windows, np.float64)
@@ -344,11 +370,15 @@ def compute_ewm_by_band(
     return ewm_by_band, n_flat, n_elec, total_s, n_windows
 
 
-def scan_session(subject_id: int, trial_id: int) -> dict:
-    """Scan one (subject, trial) session and return its sidecar payload."""
+def scan_session(
+    subject_id: int, trial_id: int,
+    band_specs: list[tuple[str, int, int, int, int]] | None = None,
+) -> dict:
+    """Scan one (subject, trial) session and return its sidecar payload.
+    ``band_specs`` defaults to 3STFT; pass the 2-band specs for converged-v2."""
     tag = f"btbank{subject_id}_t{trial_id}"
     ewm_by_band, n_flat, n_elec, total_s, n_windows = compute_ewm_by_band(
-        subject_id, trial_id,
+        subject_id, trial_id, band_specs,
     )
     bad_idx, decision = _decide_bad_windows(
         ewm_by_band, n_flat, n_elec,
@@ -396,8 +426,12 @@ def main() -> None:
                     help="scan exactly this one session (overrides array indexing)")
     ap.add_argument("--sessions", default=None,
                     help='comma list "S:T,S:T,..." to scan (array indexes into it)')
+    ap.add_argument("--frontend", choices=("3stft", "2band"), default="3stft",
+                    help="band set to scan: 3stft (slow/beta/hg, default) or 2band "
+                         "(converged-v2 LFS/HGA magnitude). Selects the sidecar's bands.")
     args = ap.parse_args()
 
+    band_specs = _make_band_specs(_FRONTEND_BANDS[args.frontend])
     os.makedirs(args.out_dir, exist_ok=True)
 
     if args.session is not None:
@@ -408,7 +442,7 @@ def main() -> None:
         todo = [sessions[int(task)]] if task is not None else sessions
 
     for subject_id, trial_id in todo:
-        result = scan_session(subject_id, trial_id)
+        result = scan_session(subject_id, trial_id, band_specs)
         out_path = os.path.join(args.out_dir, f"{result['session']}.json")
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
