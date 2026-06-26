@@ -25,6 +25,7 @@ groups have DIFFERENT bin counts (4/8/16) → a single ``fk`` cannot express the
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, replace
 
@@ -766,18 +767,28 @@ class LatentEncoderV2(nn.Module):
         the pre-tagged, parcel-gathered seeds (the parcel axis is gathered, the cell
         axis + RoPE are untouched)."""
         B, P, k, S, d = seeds.shape
-        if cell_time_slot.shape != (S,):
-            raise ValueError(
-                f"cell_time_slot must be (S={S},), got {tuple(cell_time_slot.shape)}"
-            )
         if parcel_labels is None:
             x = seeds
         else:
             x = seeds + self.parcel_embed(parcel_labels)[None, :, None, None, :]
         x = x.reshape(B, P * k * S, d)
-        # token order is (p, j, s) p-major s-minor ⇒ tile cell slots across P·k.
-        slot = cell_time_slot.repeat(P * k)                       # (P·k·S,)
-        rope = self.key_rope[:, slot, :]                          # (2, N, head_dim)
+        # RoPE slots: shared (S,) (teacher / uniform cells) tiled across P·k, OR
+        # per-row (B, P·k·S) when the static path's visible cells DIFFER per parcel.
+        if cell_time_slot.dim() == 1:
+            if cell_time_slot.shape != (S,):
+                raise ValueError(
+                    f"cell_time_slot must be (S={S},), got {tuple(cell_time_slot.shape)}"
+                )
+            slot = cell_time_slot.repeat(P * k)                  # (P·k·S,)
+            rope = self.key_rope[:, slot, :]                     # (2, N, head_dim) shared
+        else:
+            if cell_time_slot.shape != (B, P * k * S):
+                raise ValueError(
+                    f"per-row cell_time_slot must be (B, P·k·S)=({B},{P * k * S}), "
+                    f"got {tuple(cell_time_slot.shape)}"
+                )
+            rs = self.key_rope[:, cell_time_slot, :]             # (2, B, N, head_dim)
+            rope = rs                                            # per-row
         km = None if key_mask is None else key_mask.reshape(B, P * k * S)
         for blk in self.blocks:
             x = blk(x, rope, km)
@@ -990,3 +1001,310 @@ def converged_v2_loss(
         1e-12
     )
     return diag
+
+
+def _select_idx(mask: Tensor, count: int) -> Tensor:
+    """Positions of the first ``count`` True entries along the last axis, ascending.
+
+    The caller guarantees an EXACT ``count`` True per row (the static header's
+    parcel-uniform M2 / fixed tube / fill-not-trim invariants), so this is a pure
+    gather-index builder — used for visible cells, masked cells, and untubed
+    parcels alike. ``argsort(descending, stable)`` floats the True positions to the
+    front in their original order; the final ``sort`` re-ascends the kept prefix."""
+    order = mask.int().argsort(dim=-1, descending=True, stable=True)
+    return order[..., :count].sort(dim=-1).values
+
+
+@dataclass(frozen=True)
+class V14ConvergedV2Config:
+    """Architecture + science knobs for :class:`V14ConvergedV2`.
+
+    Architecture dims (``d_model`` … ``n_parcels``) have NO defaults — the caller
+    justifies them per the discuss-before-code rule. The science knobs carry the
+    locked first-run values (impl-plan + memos): ``k=2`` seeds/parcel,
+    ``tube_ratio=0.25``, ``tie_lfs=True`` (n_op=2, untie→4 is the first ablation),
+    ``ema_tau=0.9992``."""
+
+    d_model: int
+    n_heads: int
+    frontend_layers: int
+    latent_layers: int
+    pred_layers: int
+    pred_dim: int
+    n_parcels: int
+    k: int = 2
+    tube_ratio: float = 0.25
+    tie_lfs: bool = True
+    ema_tau: float = 0.9992
+
+
+@dataclass(frozen=True)
+class _SessionLayout:
+    """Session-constant geometry for one homogeneous batch (cache once/session)."""
+
+    labels: Tensor       # (P,)  DKT parcel ids
+    membership: Tensor   # (P, C) bool
+    parcel_idx: Tensor   # (C,)  each electrode's row in `labels`
+    freq_id: Tensor      # (S,)  freq-patch id ∈ [0, 4)
+    slot: Tensor         # (S,)  RoPE time slot (shared HGA clock)
+    cell_patch: Tensor   # (S,)  pool operator id ∈ [0, n_op)
+
+
+class V14ConvergedV2(nn.Module):
+    """Converged-v2 SSL model — the full student+teacher assembly (#276 / P3.1).
+
+    One step: 2-band magnitude frontend → set-pool (k seeds/parcel/cell) → latent
+    self-attention over seeds, with a dual-depth multi-level JEPA loss (M2 = shallow
+    frontend target, M4 = deep latent target). The student runs the DROP-NOT-PAD
+    static path (pack visible cells / gather untubed parcels) so every tensor is
+    session-constant; the teacher (EMA, frozen) runs full shapes. Masks are accepted
+    as args (sampled by the dataloader so the ~455 ms CPU mask bubble stays out of
+    ``_step``); :meth:`sample_masks` is the matching sampler.
+
+    The 7-stage flow + the pool-needs-canonical-S finding are in memory
+    ``project_converged_v2_assembly_forward_2026_06_26``. Built on the P2 primitives
+    whose dense==static equivalence is proven cell-by-cell + parcel-by-parcel.
+    """
+
+    def __init__(
+        self, cfg: V14ConvergedV2Config, *, bands: tuple[BandSpecV2, ...] = BANDS_V2
+    ) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.base_bands = bands
+        # Build every submodule against the LONGEST clock (5 s SSL) so the RoPE
+        # tables cover the 5 s slots; 1 s eval slots are a subset (safe to gather).
+        self.ssl_bands = bands_for_clip_len(5.0, base=bands)
+        n_op = n_operators(cfg.tie_lfs)
+
+        self.frontend = FrontendEncoderV2(
+            cfg.d_model, cfg.n_heads, cfg.frontend_layers, bands=self.ssl_bands
+        )
+        self.pool = SetPoolV2(
+            cfg.d_model, cfg.n_heads, k=cfg.k, n_parcels=cfg.n_parcels, n_op=n_op
+        )
+        self.latent = LatentEncoderV2(
+            cfg.d_model, cfg.n_heads, cfg.latent_layers, cfg.n_parcels,
+            ssl_bands=self.ssl_bands,
+        )
+        self.m2_predictor = JepaPredictorV2(
+            cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.pred_layers,
+            ssl_bands=self.ssl_bands,
+        )
+        self.m4_predictor = JepaPredictorV2(
+            cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.pred_layers,
+            n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
+        )
+
+        # EMA teacher — frozen deep copies of the three target-side towers.
+        self.teacher_frontend = copy.deepcopy(self.frontend)
+        self.teacher_pool = copy.deepcopy(self.pool)
+        self.teacher_latent = copy.deepcopy(self.latent)
+        for m in (self.teacher_frontend, self.teacher_pool, self.teacher_latent):
+            for p in m.parameters():
+                p.requires_grad_(False)
+
+        self.m2_mask_cfg = M2MaskConfigV2()
+
+    # -- mask sampling (dataloader-side; keeps the bubble out of _step) ---------
+    def sample_masks(
+        self,
+        B: int,
+        membership: Tensor,
+        bands: tuple[BandSpecV2, ...],
+        generator: torch.Generator,
+    ) -> tuple[Tensor, Tensor]:
+        """``(m2_mask (B,P,S), tube_mask (B,P))`` for one homogeneous batch."""
+        P = membership.shape[0]
+        m2 = sample_m2_masks_v2(B, P, bands, generator, self.m2_mask_cfg)
+        tube = sample_parcel_tube_v2(B, P, self.cfg.tube_ratio, generator)
+        return m2, tube
+
+    # -- session geometry -------------------------------------------------------
+    def session_layout(
+        self, parcel_of_electrode: Tensor, bands: tuple[BandSpecV2, ...]
+    ) -> _SessionLayout:
+        device = parcel_of_electrode.device
+        labels, membership = active_parcels(parcel_of_electrode)
+        parcel_idx = membership.int().argmax(0)                   # (C,)
+        _, freq_id, slot = token_metadata(bands)
+        cell_patch = cell_operator_index(bands, tie_lfs=self.cfg.tie_lfs)
+        return _SessionLayout(
+            labels=labels,
+            membership=membership,
+            parcel_idx=parcel_idx,
+            freq_id=freq_id.to(device),
+            slot=slot.to(device),
+            cell_patch=cell_patch.to(device),
+        )
+
+    # -- M4 extended query set --------------------------------------------------
+    def _m4_indices(
+        self, tube_mask: Tensor, m2_mask: Tensor, sh: StaticShapesV2
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Build the M4 held-out query index set ``(pos, cell, seed, tubed)``.
+
+        Query set = {tubed parcels: ALL S cells} ∪ {untubed parcels: their n_mask
+        M2-masked cells}, ×k seeds. Flatten order = block (tubed‖untubed) then
+        parcel-major / seed-mid / cell-minor. ``pos`` is the P-axis position (for
+        the teacher gather + n_p weight), ``cell`` the S-axis position, ``seed`` the
+        seed id; ``tubed`` (Lq,) flags the cross-parcel block. The matching target
+        gather (``(pos·k+seed)·S+cell`` into the flattened teacher latent) is built
+        in :meth:`forward` from these — the alignment is proven by the oracle test."""
+        B = tube_mask.shape[0]
+        S, k = sh.S, sh.k
+        n_tube, P_vis, n_mask = sh.n_tube, sh.P_vis, sh.n_mask
+        device = tube_mask.device
+        arS = torch.arange(S, device=device)
+        arK = torch.arange(k, device=device)
+
+        tube_idx = _select_idx(tube_mask, n_tube)                 # (B, n_tube)
+        untubed_idx = _select_idx(~tube_mask, P_vis)              # (B, P_vis)
+        pmask_idx = _select_idx(m2_mask, n_mask)                  # (B, P, n_mask)
+
+        # tubed block (B, n_tube, k, S): all S cells of each tubed parcel.
+        t_pos = tube_idx[:, :, None, None].expand(B, n_tube, k, S)
+        t_cell = arS[None, None, None, :].expand(B, n_tube, k, S)
+        t_seed = arK[None, None, :, None].expand(B, n_tube, k, S)
+
+        # untubed block (B, P_vis, k, n_mask): the parcel's own M2-masked cells.
+        u_pos = untubed_idx[:, :, None, None].expand(B, P_vis, k, n_mask)
+        u_cell_pp = torch.gather(
+            pmask_idx, 1, untubed_idx[:, :, None].expand(B, P_vis, n_mask)
+        )                                                         # (B, P_vis, n_mask)
+        u_cell = u_cell_pp[:, :, None, :].expand(B, P_vis, k, n_mask)
+        u_seed = arK[None, None, :, None].expand(B, P_vis, k, n_mask)
+
+        pos = torch.cat([t_pos.reshape(B, -1), u_pos.reshape(B, -1)], dim=1)
+        cell = torch.cat([t_cell.reshape(B, -1), u_cell.reshape(B, -1)], dim=1)
+        seed = torch.cat([t_seed.reshape(B, -1), u_seed.reshape(B, -1)], dim=1)
+        Lt, Lu = n_tube * k * S, P_vis * k * n_mask
+        tubed = torch.cat(
+            [
+                torch.ones(Lt, dtype=torch.bool, device=device),
+                torch.zeros(Lu, dtype=torch.bool, device=device),
+            ]
+        )
+        return pos, cell, seed, tubed
+
+    # -- the SSL step -----------------------------------------------------------
+    def forward(
+        self,
+        lfs: Tensor,                  # (B, C, 28, T_lfs)  |STFT|, robust-z'd
+        hga: Tensor,                  # (B, C, 7,  T_hga)
+        parcel_of_electrode: Tensor,  # (C,) long  DKT label per electrode
+        m2_mask: Tensor,              # (B, P, S) bool, True = M2 target
+        tube_mask: Tensor,            # (B, P) bool, True = tubed parcel
+        *,
+        clip_len_s: float,
+    ) -> dict[str, Tensor]:
+        bands = bands_for_clip_len(clip_len_s, base=self.base_bands)
+        lay = self.session_layout(parcel_of_electrode, bands)
+        labels, membership, parcel_idx = lay.labels, lay.membership, lay.parcel_idx
+        freq_id, slot, cell_patch = lay.freq_id, lay.slot, lay.cell_patch
+        sh = compute_static_shapes_v2(
+            m2_mask, tube_mask, membership, bands, k=self.cfg.k, cfg=self.m2_mask_cfg
+        )
+        B, C, P, S, d = sh.b, sh.c, sh.P, sh.S, self.cfg.d_model
+        k, s_vis, n_mask = sh.k, sh.s_vis, sh.n_mask
+        P_vis = sh.P_vis
+
+        # === TEACHER (EMA, full shapes, no mask, detached) =====================
+        # Route through encode_tokens with per-clip (S,) metadata so the teacher is
+        # clip-len-parameterized (frontend.forward would use build-time buffers).
+        with torch.no_grad():
+            t_tok = self.teacher_frontend.tokenizer(lfs, hga)         # (B,C,S,d)
+            t_front = self.teacher_frontend.encode_tokens(t_tok, freq_id, slot)
+            t_seeds = self.teacher_pool(t_front, membership, labels, cell_patch)
+            t_latent = self.teacher_latent(t_seeds, labels, slot)     # (B,P,k,S,d)
+
+        # === STUDENT stage 1: frontend PACKED over visible cells ===============
+        elec_mask = m2_mask[:, parcel_idx, :]                         # (B,C,S) True=masked
+        visible = ~elec_mask
+        vis_idx = _select_idx(visible, s_vis)                        # (B,C,s_vis)
+        mask_idx = _select_idx(elec_mask, n_mask)                    # (B,C,n_mask)
+        tok = self.frontend.tokenizer(lfs, hga)                       # (B,C,S,d)
+        gtok = torch.gather(tok, 2, vis_idx[..., None].expand(B, C, s_vis, d))
+        gfreq = freq_id[vis_idx]                                      # (B,C,s_vis)
+        gslot = slot[vis_idx]
+        s_front_vis = self.frontend.encode_tokens(gtok, gfreq, gslot)  # (B,C,s_vis,d)
+
+        # === stage 2: M2 predictor (per-electrode; B·C rows) ===================
+        ctx2 = s_front_vis.reshape(B * C, s_vis, d)
+        ctx2_slot = gslot.reshape(B * C, s_vis)
+        q2_slot = slot[mask_idx].reshape(B * C, n_mask)
+        q2_freq = freq_id[mask_idx].reshape(B * C, n_mask)
+        m2_pred = self.m2_predictor(ctx2, ctx2_slot, q2_slot, q2_freq).reshape(
+            B, C, n_mask, d
+        )
+        m2_target = torch.gather(
+            t_front, 2, mask_idx[..., None].expand(B, C, n_mask, d)
+        )                                                            # (B,C,n_mask,d)
+
+        # === stage 3: SCATTER visible features back to canonical S =============
+        s_front_full = t_front.new_zeros(B, C, S, d)
+        s_front_full.scatter_(2, vis_idx[..., None].expand(B, C, s_vis, d), s_front_vis)
+
+        # === stage 4: pool over S (cheap; masked-cell seeds garbage-but-unused) =
+        s_seeds = self.pool(s_front_full, membership, labels, cell_patch)  # (B,P,k,S,d)
+
+        # === stage 5: gather visible seeds/parcel, tag, gather untubed parcels ==
+        pvis_idx = _select_idx(~m2_mask, s_vis)                       # (B,P,s_vis)
+        gpv = pvis_idx[:, :, None, :, None].expand(B, P, k, s_vis, d)
+        s_seeds_vis = torch.gather(s_seeds, 3, gpv)                   # (B,P,k,s_vis,d)
+        s_tag = (
+            s_seeds_vis
+            + self.latent.parcel_embed(labels)[None, :, None, None, :]
+        )
+        untubed_idx = _select_idx(~tube_mask, P_vis)                  # (B,P_vis)
+        gu = untubed_idx[:, :, None, None, None].expand(B, P_vis, k, s_vis, d)
+        s_in = torch.gather(s_tag, 1, gu)                            # (B,P_vis,k,s_vis,d)
+
+        # per-row latent RoPE slots = the untubed parcels' visible-cell slots.
+        pvis_slot = slot[pvis_idx]                                   # (B,P,s_vis)
+        untubed_slot = torch.gather(
+            pvis_slot, 1, untubed_idx[:, :, None].expand(B, P_vis, s_vis)
+        )                                                            # (B,P_vis,s_vis)
+        lat_slot = (
+            untubed_slot[:, :, None, :].expand(B, P_vis, k, s_vis).reshape(
+                B, P_vis * k * s_vis
+            )
+        )
+
+        # === stage 6: latent self-attention over the gathered seeds ============
+        s_latent = self.latent(s_in, None, lat_slot)                 # (B,P_vis,k,s_vis,d)
+
+        # === stage 7: M4 predictor (extended held-out query set) ===============
+        ctx4 = s_latent.reshape(B, P_vis * k * s_vis, d)
+        ctx4_slot = lat_slot
+        pos, cell, seed, tubed = self._m4_indices(tube_mask, m2_mask, sh)
+        q_parcel = labels[pos]                                       # (B,Lq) DKT label
+        q_freq = freq_id[cell]
+        q_slot = slot[cell]
+        m4_pred = self.m4_predictor(
+            ctx4, ctx4_slot, q_slot, q_freq, q_parcel=q_parcel, q_seed=seed
+        )                                                            # (B,Lq,d)
+        flat = (pos * k + seed) * S + cell                          # (B,Lq) into P·k·S
+        t_latent_flat = t_latent.reshape(B, P * k * S, d)
+        Lq = flat.shape[1]
+        m4_target = torch.gather(
+            t_latent_flat, 1, flat[..., None].expand(B, Lq, d)
+        )                                                            # (B,Lq,d)
+        n_p = membership.sum(1)                                       # (P,) long
+        m4_weight = n_p[pos].float()                                 # (B,Lq)  w_p=1
+
+        return converged_v2_loss(
+            m2_pred.reshape(-1, d),
+            m2_target.reshape(-1, d),
+            m4_pred.reshape(-1, d),
+            m4_target.reshape(-1, d),
+            m4_weight.reshape(-1),
+            tubed[None, :].expand(B, Lq).reshape(-1),
+        )
+
+    @torch.no_grad()
+    def ema_step(self) -> None:
+        """Advance the EMA teacher one step (call AFTER the optimizer step)."""
+        ema_update(self.teacher_frontend, self.frontend, self.cfg.ema_tau)
+        ema_update(self.teacher_pool, self.pool, self.cfg.ema_tau)
+        ema_update(self.teacher_latent, self.latent, self.cfg.ema_tau)
