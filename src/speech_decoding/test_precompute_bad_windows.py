@@ -200,10 +200,14 @@ def test_production_defaults_are_locked() -> None:
     accidental drift back to the pre-sweep 5/12 fences or a dropped abs-floor."""
     m = _mod()
     assert m.HOT_MULT == 4.0
-    assert m.CAT_MULT == 8.0
+    assert m.CAT_MULT == 8.0           # 3STFT scalar fence
     assert m.ABS_FLOOR_MAD == 200.0
     assert m.FRAC_HOT == 0.05
     assert m.N_FLOOR == 3
+    # converged-v2 2-band finals (locked 2026-06-26, proposal §6): cat 8→6 on lfs/hga
+    # only, via the band-keyed override; hot/frac/abs held. 3STFT keeps scalar cat8.
+    assert m.CAT_MULT_BY_BAND == {"lfs": 6.0, "hga": 6.0}
+    assert m.HOT_MULT_BY_BAND == {}
 
 
 # --------------------------------------------------------------- absolute floor

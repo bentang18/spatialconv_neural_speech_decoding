@@ -130,11 +130,15 @@ FLAT_STD: float = 0.05  # an electrode is "flat" in a window if its slow-band z-
 # already subsumes it (q<25) — it's the portable backstop for any future high-q session.
 ABS_FLOOR_MAD: float = 200.0
 
-# Per-band multiplier OVERRIDES (PRELIMINARY: empty → every band uses the scalar
-# HOT_MULT/CAT_MULT above). Ben fills these from the per-band knee sweep on the rebuilt
-# cache, e.g. ``HOT_MULT_BY_BAND = {"slow": 6.0}``. Keys must be in {"slow","beta","hg"}.
+# Per-band multiplier OVERRIDES (empty → that band uses the scalar HOT_MULT/CAT_MULT
+# above). Keyed by band name; a key only binds when that band is scanned, so the 3STFT
+# {slow,beta,hg} scan ignores lfs/hga keys (and vice-versa). The 2-band converged-v2
+# finals (locked 2026-06-26 from the pretrain CLIP sweep + cache-read tail, canary
+# btbank3_t2 stays at 0 drops; reports/converged_v2/2band_winsor_clip_proposal §6):
+# cat_mult 8→6 is the safe win (cohort 0.96→1.43%), hot stays 4, frac stays 0.05,
+# abs stays 200. 3STFT bands keep the scalar cat8 via the fallback.
 HOT_MULT_BY_BAND: dict[str, float] = {}
-CAT_MULT_BY_BAND: dict[str, float] = {}
+CAT_MULT_BY_BAND: dict[str, float] = {"lfs": 6.0, "hga": 6.0}
 
 NOTCH_HZ: float = 60.0
 HPF_HZ: float = 0.5
