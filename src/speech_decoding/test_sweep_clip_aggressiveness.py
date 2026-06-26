@@ -99,6 +99,21 @@ def test_locked_combined_is_real_union_not_ofat_sum() -> None:
     assert res["locked_combined"] >= res["baseline"]
 
 
+def test_candidate_locks_strict_implies_more_drops() -> None:
+    """The #264 candidate stricter locks report the REAL union drop. The
+    'current(hot4/cat8)' candidate == locked_combined (same fences + abs200), and a
+    strictly tighter combo drops at least as many. On _events: cat6 pulls the beta
+    8.0 cells (win11/12) into cat → {10,11,12,20,21,22,30}=7 > current's 5."""
+    m = _mod()
+    ewm, n_flat, n_elec = _synth()
+    _events(ewm)
+    cl = m.sweep_decision(ewm, n_flat, n_elec)["candidate_locks"]
+    assert set(cl) == set(m.CANDIDATE_LOCKS)
+    assert cl["current(hot4/cat8)"] == 5
+    assert cl["cat6"] == 7
+    assert cl["hot3.5/cat6"] >= cl["cat6"]  # tighter hot can only add windows
+
+
 def test_clean_session_zero_everywhere() -> None:
     """No events → zero drops at every grid point, and the histogram is empty."""
     m = _mod()
@@ -120,19 +135,20 @@ def test_hot_mult_marginal_and_monotone() -> None:
     ewm, n_flat, n_elec = _synth()
     _events(ewm)
     hm = m.sweep_decision(ewm, n_flat, n_elec)["levers"]["hot_mult"]
-    assert hm == {"3.5": 3, "4": 3, "4.5": 2, "5": 2}
+    assert hm == {"3": 3, "3.5": 3, "4": 3, "4.5": 2, "5": 2}
     seq = [hm[m._key(v)] for v in m.GRID["hot_mult"]]
     assert seq == sorted(seq, reverse=True)
 
 
 def test_cat_mult_marginal_and_monotone() -> None:
     """Lowering cat_mult pulls in the single mid cells: 11 trips at ≤10×q, 9 at
-    ≤8×q. Non-increasing as the cat fence rises."""
+    ≤8×q. Below 8×q the beta 8.0 common-mode cells also trip cat (win11/12), so
+    {10,11,12,20,21,22}=6 at fences 5/6/7. Non-increasing as the cat fence rises."""
     m = _mod()
     ewm, n_flat, n_elec = _synth()
     _events(ewm)
     cm = m.sweep_decision(ewm, n_flat, n_elec)["levers"]["cat_mult"]
-    assert cm == {"8": 4, "10": 3, "12": 2}
+    assert cm == {"5": 6, "6": 6, "7": 6, "8": 4, "10": 3, "12": 2}
     seq = [cm[m._key(v)] for v in m.GRID["cat_mult"]]
     assert seq == sorted(seq, reverse=True)
 
@@ -217,6 +233,7 @@ def test_most_aggressive_safe_picks_smallest_at_canary_baseline() -> None:
     hold 0, 4.0/3.5 break it → answer is 4.5."""
     m = _mod()
     curve = {
+        "3": {"cohort": 12, "canary": 3},
         "3.5": {"cohort": 9, "canary": 2},
         "4": {"cohort": 5, "canary": 1},
         "4.5": {"cohort": 3, "canary": 0},
@@ -224,5 +241,5 @@ def test_most_aggressive_safe_picks_smallest_at_canary_baseline() -> None:
     }
     assert m._most_aggressive_safe(curve, m.GRID["hot_mult"], 0) == "4.5"
     # if even the gentlest breaks the canary → 'none'
-    curve_all_bad = {k: {"cohort": 1, "canary": 1} for k in ["3.5", "4", "4.5", "5"]}
+    curve_all_bad = {k: {"cohort": 1, "canary": 1} for k in ["3", "3.5", "4", "4.5", "5"]}
     assert m._most_aggressive_safe(curve_all_bad, m.GRID["hot_mult"], 0) == "none"

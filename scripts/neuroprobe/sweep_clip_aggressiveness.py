@@ -41,7 +41,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from precompute_bad_windows import (  # noqa: E402
     Q_PCT,
     V14_PRETRAIN_SESSIONS,
+    _FRONTEND_BANDS,
     _decide_bad_windows,
+    _make_band_specs,
     compute_ewm_by_band,
 )
 
@@ -64,12 +66,28 @@ LOCKED: dict[str, float] = {
 # One-factor-at-a-time grid. Each value is swept with the OTHER three held at
 # BASELINE, so the marginal effect of that single lever is isolated. Values reach
 # MORE aggressive than baseline (lower fence / lower count) — the question is how
-# far we can push before the canary starts dropping clean clips.
+# far we can push before the canary starts dropping clean clips. Extended BELOW the
+# current lock (cat 8 / hot 4) to test "can we be a little stricter" (#264).
 GRID: dict[str, list[float]] = {
-    "hot_mult": [3.5, 4.0, 4.5, 5.0],
-    "cat_mult": [8.0, 10.0, 12.0],
+    "hot_mult": [3.0, 3.5, 4.0, 4.5, 5.0],
+    "cat_mult": [5.0, 6.0, 7.0, 8.0, 10.0, 12.0],
     "frac_hot": [0.02, 0.03, 0.04, 0.05],
     "n_floor": [2, 3],
+}
+
+# Candidate STRICTER locks (#264): the OFAT marginals isolate one lever; these are
+# full multi-lever combos whose REAL union drop (hot ∧ cat ∧ flat ∧ abs200) +
+# canary count are reported, so the cost of tightening is honest (not the sum of
+# marginals). All keep abs_floor=200 (the prior sweep's clean-safe floor). The
+# decisive number is each candidate's canary count: it must stay at the canary
+# baseline (~0) to be safe.
+CANDIDATE_LOCKS: dict[str, dict[str, float]] = {
+    "current(hot4/cat8)": {"hot_mult": 4.0, "cat_mult": 8.0, "frac_hot": 0.05, "n_floor": 3},
+    "cat6": {"hot_mult": 4.0, "cat_mult": 6.0, "frac_hot": 0.05, "n_floor": 3},
+    "hot3.5/cat6": {"hot_mult": 3.5, "cat_mult": 6.0, "frac_hot": 0.05, "n_floor": 3},
+    "hot3.5/cat6/frac.03": {"hot_mult": 3.5, "cat_mult": 6.0, "frac_hot": 0.03, "n_floor": 3},
+    "hot3/cat5": {"hot_mult": 3.0, "cat_mult": 5.0, "frac_hot": 0.05, "n_floor": 3},
+    "hot3/cat5/frac.03": {"hot_mult": 3.0, "cat_mult": 5.0, "frac_hot": 0.03, "n_floor": 3},
 }
 # Absolute-floor K (in session-normalized MADs): drop a window if ANY band cell
 # exceeds K, regardless of the relative q. This is the session-INDEPENDENT
@@ -121,6 +139,14 @@ def sweep_decision(
     locked_idx, _ = _decide_bad_windows(ewm_by_band, n_flat, n_elec, **LOCKED)  # type: ignore[arg-type]
     locked_combined = len(locked_idx)
 
+    # Candidate STRICTER locks (#264): real union drop (abs floor 200 ON) per combo.
+    candidate_locks = {}
+    for name, fences in CANDIDATE_LOCKS.items():
+        idx, _ = _decide_bad_windows(
+            ewm_by_band, n_flat, n_elec, abs_floor_mad=200.0, **fences,  # type: ignore[arg-type]
+        )
+        candidate_locks[name] = len(idx)
+
     # Absolute floor = baseline-bad UNION (any band cell > K). Union (not replace)
     # because it's an ADDITIONAL backstop on top of the relative rules.
     base_idx, _ = _decide_bad_windows(
@@ -152,6 +178,7 @@ def sweep_decision(
     return {
         "baseline": int(baseline),
         "locked_combined": int(locked_combined),
+        "candidate_locks": {k: int(v) for k, v in candidate_locks.items()},
         "n_windows": int(n_windows),
         "n_elec": int(n_elec),
         "hot_count_thresh": int(
@@ -163,12 +190,15 @@ def sweep_decision(
     }
 
 
-def run_session(subject_id: int, trial_id: int, out_dir: Path) -> dict:
+def run_session(
+    subject_id: int, trial_id: int, out_dir: Path,
+    band_specs: list[tuple[str, int, int, int, int]] | None = None,
+) -> dict:
     """Scan one session (the expensive streaming pass) and sweep it. Writes
     ``{session}.json`` of bad-window counts at every grid point."""
     tag = f"btbank{subject_id}_t{trial_id}"
     ewm_by_band, n_flat, n_elec, total_s, n_windows = compute_ewm_by_band(
-        subject_id, trial_id,
+        subject_id, trial_id, band_specs,
     )
     res = sweep_decision(ewm_by_band, n_flat, n_elec)
     res.update(
@@ -220,6 +250,13 @@ def _aggregate(recs: list[dict]) -> dict:
         }
         for k in range(1, GE_K_MAX + 1)
     }
+    candidate_locks = {
+        name: {
+            "cohort": sum(r.get("candidate_locks", {}).get(name, 0) for r in recs),
+            "canary": (canary.get("candidate_locks", {}).get(name) if canary else None),
+        }
+        for name in CANDIDATE_LOCKS
+    }
     return {
         "n_sessions": len(recs),
         "cohort_windows": cohort_windows,
@@ -228,6 +265,7 @@ def _aggregate(recs: list[dict]) -> dict:
         "cohort_baseline": sum(r["baseline"] for r in recs),
         "cohort_locked_combined": sum(r.get("locked_combined", 0) for r in recs),
         "canary_locked_combined": (canary.get("locked_combined") if canary else None),
+        "candidate_locks": candidate_locks,
         "levers": levers,
         "abs_floor": abs_floor,
         "common_mode_ge_k": ge_k,
@@ -262,6 +300,16 @@ def summarize(out_dir: Path) -> dict:
           f"({cb / cw:.2%})  canary={base_can}")
     print(f"  LOCKED (hot4/cat8/abs200)       : {cl:>5}/{cw} "
           f"({cl / cw:.2%})  canary={agg['canary_locked_combined']}\n")
+
+    print("CANDIDATE STRICTER LOCKS (real union, abs200 ON)  "
+          "[canary must stay at baseline to be safe]:")
+    print(f"  {'lock':>22}  {'cohort':>8}  {'cohort%':>8}  {'canary':>8}")
+    for name in CANDIDATE_LOCKS:
+        c = agg["candidate_locks"][name]
+        frac = c["cohort"] / cw if cw else 0.0
+        flag = "" if c["canary"] == base_can else "  <-canary LEAVES baseline"
+        print(f"  {name:>22}  {c['cohort']:>8}  {frac:>7.2%}  {c['canary']:>8}{flag}")
+    print()
 
     print("per-session baseline drops:")
     for r in sorted(recs, key=lambda r: r["session"]):
@@ -312,12 +360,15 @@ def main() -> None:
                    help="Session index (defaults to SLURM_ARRAY_TASK_ID).")
     p.add_argument("--sessions", default=None,
                    help='"S:T,S:T,..." override (array indexes into it).')
+    p.add_argument("--frontend", choices=("3stft", "2band"), default="3stft",
+                   help="Band set for the scan (default 3stft). 2band = converged-v2 LFS/HGA.")
     args = p.parse_args()
 
     if args.summarize:
         summarize(args.out_dir)
         return
 
+    band_specs = _make_band_specs(_FRONTEND_BANDS[args.frontend])
     sessions = (
         [tuple(int(x) for x in tok.split(":")) for tok in args.sessions.split(",")]
         if args.sessions else list(V14_PRETRAIN_SESSIONS)
@@ -325,7 +376,7 @@ def main() -> None:
     task_id = (args.task_id if args.task_id is not None
                else int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     subject_id, trial_id = _resolve_session(task_id, sessions)  # type: ignore[arg-type]
-    run_session(subject_id, trial_id, args.out_dir)
+    run_session(subject_id, trial_id, args.out_dir, band_specs)
 
 
 if __name__ == "__main__":
