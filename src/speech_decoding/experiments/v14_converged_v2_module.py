@@ -65,15 +65,26 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         self._mask_gen.manual_seed(self._mask_seed)
         # Diagnostic step timing (env-gated, OFF in production ⇒ zero added logs,
         # uid-neutral — read from env, not a pydantic field). `V14_STEP_TIMING`
-        # logs per-step `step_time_s` (= `data_wait_s` host-gap + `compute_s`
-        # in-step) to wandb ⇒ median sec/step. `V14_MASK_TIMING=<N>` prints a
-        # median/p10/p90 ms table over every N train steps splitting the in-`_step`
-        # work into mask_sample(CPU) / mask_h2d / forward — names where the step
-        # goes WITHOUT torch.profiler/kineto (which OOMs/hangs on aarch64 GH200 +
-        # torch 2.10). v2 masks are vectorized, so mask_sample should be small
-        # (no 3STFT 455ms per-electrode-loop bubble). Rank-0 + training only.
+        # logs a NON-OVERLAPPING per-step split to wandb ⇒ median sec/step:
+        #   fetch_s    = host gap before the forward (pure dataloader wait +
+        #                between-step host overhead) — measured from the END of the
+        #                FULL prior step (`on_train_batch_end`), so it does NOT
+        #                absorb backward/opt the way an end-of-forward stamp would.
+        #   compute_s  = forward only (cuda.sync'd ⇒ real GPU wall).
+        #   post_fwd_s = backward + optimizer.step + EMA tick + grad-clip
+        #                (cuda.sync'd at `on_train_batch_end`).
+        #   step_time_s = fetch_s + compute_s + post_fwd_s (true per-step wall).
+        # `V14_MASK_TIMING=<N>` prints a median/p10/p90 ms table over every N train
+        # steps splitting the in-`_step` work into mask_sample(CPU) / mask_h2d /
+        # forward — names where the step goes WITHOUT torch.profiler/kineto (which
+        # OOMs/hangs on aarch64 GH200 + torch 2.10). v2 masks are vectorized, so
+        # mask_sample should be small (no 3STFT 455ms per-electrode-loop bubble).
+        # Rank-0 + training only.
         self._step_timing = os.environ.get("V14_STEP_TIMING") is not None
-        self._last_batch_end_time: float | None = None
+        self._last_batch_end_time: float | None = None   # END of prior FULL step
+        self._fwd_end_time: float | None = None           # end of this step's fwd
+        self._fetch_s = 0.0
+        self._compute_s = 0.0
         _mt = os.environ.get("V14_MASK_TIMING")
         self._mask_timing_every = 0
         if _mt is not None:
@@ -204,14 +215,15 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
             buf[k].clear()
 
     def training_step(self, batch: tp.Any, batch_idx: int) -> Tensor:  # noqa: ARG002
-        # Host-gap split (V14_STEP_TIMING): data_wait = gap since the prior step
-        # ended (dataloader wait + between-step host work); compute = in-step
-        # fwd/bwd-dispatch (a cuda.sync makes it real GPU wall). step_time_s =
-        # data_wait + compute ⇒ median sec/step on wandb. Armed only.
+        # Non-overlapping split (V14_STEP_TIMING): fetch_s = gap since the prior
+        # FULL step ended (`on_train_batch_end` stamp ⇒ pure dataloader + host
+        # wait, NOT backward); compute_s = forward only (cuda.sync ⇒ real GPU
+        # wall). post_fwd_s + step_time_s are logged in `on_train_batch_end` once
+        # backward+opt+EMA have run. Armed only.
         st = self._step_timing
         if st:
             now = time.perf_counter()
-            data_wait = (
+            self._fetch_s = (
                 now - self._last_batch_end_time
                 if self._last_batch_end_time is not None else 0.0
             )
@@ -222,12 +234,29 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             end = time.perf_counter()
-            compute = end - t0
-            self.log("step_time_s", data_wait + compute, on_step=True, on_epoch=False)
-            self.log("data_wait_s", data_wait, on_step=True, on_epoch=False)
-            self.log("compute_s", compute, on_step=True, on_epoch=False)
-            self._last_batch_end_time = end
+            self._compute_s = end - t0
+            self._fwd_end_time = end
         return out["loss"]
+
+    def on_train_batch_end(
+        self, outputs: tp.Any, batch: tp.Any, batch_idx: int  # noqa: ARG002
+    ) -> None:
+        # Close the step AFTER Lightning has run backward + optimizer.step + the
+        # EMA tick (on_before_zero_grad). A cuda.sync here makes post_fwd_s the
+        # real backward+opt GPU wall, and stamping `_last_batch_end_time` at the
+        # FULL-step end means the next step's fetch_s is pure dataloader/host wait.
+        if not self._step_timing or self._fwd_end_time is None:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        bend = time.perf_counter()
+        post_fwd = bend - self._fwd_end_time
+        step_time = self._fetch_s + self._compute_s + post_fwd
+        self.log("fetch_s", self._fetch_s, on_step=True, on_epoch=False)
+        self.log("compute_s", self._compute_s, on_step=True, on_epoch=False)
+        self.log("post_fwd_s", post_fwd, on_step=True, on_epoch=False)
+        self.log("step_time_s", step_time, on_step=True, on_epoch=False)
+        self._last_batch_end_time = bend
 
     def validation_step(self, batch: tp.Any, batch_idx: int) -> None:  # noqa: ARG002
         out = self._step(batch.data)
