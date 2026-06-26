@@ -28,7 +28,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+
+from speech_decoding.models.v14_encoder import (
+    _JointTokenBlock,
+    _PatchStem,
+    _rope_freqs,
+)
 
 FS_HZ: int = 2048
 
@@ -155,3 +161,161 @@ def token_metadata(
         torch.tensor(freq_patch_id, dtype=torch.long),
         torch.tensor(time_slot, dtype=torch.long),
     )
+
+
+def _freq_patch_slices(band: BandSpecV2) -> list[tuple[int, int]]:
+    """Per-freq-patch ``(lo, hi)`` bin slices over the band's freq axis.
+
+    HGA ``(7,)`` → ``[(0, 7)]`` (one 7→1 fold); LFS ``(4, 8, 16)`` →
+    ``[(0, 4), (4, 12), (12, 28)]`` (the 3 log groups). Each slice feeds its own
+    ``_PatchStem`` with ``kernel_freq = hi − lo`` ⇒ each folds to exactly 1 patch."""
+    slices: list[tuple[int, int]] = []
+    lo = 0
+    for g in band.freq_patch_bins:
+        slices.append((lo, lo + g))
+        lo += g
+    return slices
+
+
+class TwoBandTokenizerV2(nn.Module):
+    """v2 per-electrode frontend tokenizer (Stage 1) — 2-band magnitude.
+
+    One ``_PatchStem`` per freq-patch GROUP (NOT per band): HGA = 1 stem
+    (``kernel_freq=7`` fold), LFS = 3 stems (``kernel_freq=4/8/16`` over the log
+    groups). The uniform-fk :class:`v14_converged.ThreeBandTokenizer` can't
+    express LFS's non-uniform groups, so each group gets its own stem over its
+    bin slice; every stem folds its bins to 1 freq-patch and strides time by
+    ``kernel_time=2``. Electrodes ride the batch dim — isolated, no cross-electrode
+    mixing.
+
+    Forward (magnitude, ``in_channels=1``; whole-session robust-z applied at load):
+      - ``lfs``: ``(B, C, 28, T_lfs)`` ``|STFT|``
+      - ``hga``: ``(B, C, 7,  T_hga)`` ``|STFT|``
+    Output ``tokens`` ``(B, C, S, d)`` in band-then-(freq-patch-major, time) order
+    (LFS g0/g1/g2 then HGA). Geometry metadata exposed as buffers ``band_id``,
+    ``freq_patch_id`` ∈ [0, 4), ``time_slot`` (shared HGA-stride clock).
+    """
+
+    def __init__(self, d_model: int, bands: tuple[BandSpecV2, ...] = BANDS_V2) -> None:
+        super().__init__()
+        if d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {d_model}")
+        self.d_model = d_model
+        self.bands = bands
+        band_slot_mults(bands)  # assert the bands share one RoPE clock
+
+        # One stem per freq-patch group, flattened in token order (band-major,
+        # freq-patch-major). _stem_band / _stem_slice carry which band + bin slice
+        # each stem reads — plain python lists (geometry-fixed, not parameters).
+        self.stems = nn.ModuleList()
+        self._stem_band: list[int] = []
+        self._stem_slice: list[tuple[int, int]] = []
+        self._stem_name: list[str] = []
+        for bi, b in enumerate(bands):
+            for gi, (lo, hi) in enumerate(_freq_patch_slices(b)):
+                self.stems.append(
+                    _PatchStem(
+                        d_model,
+                        kernel_freq=hi - lo,
+                        kernel_time=b.kernel_time,
+                        in_channels=b.in_channels,
+                    )
+                )
+                self._stem_band.append(bi)
+                self._stem_slice.append((lo, hi))
+                self._stem_name.append(f"{b.name}_fp{gi}")
+
+        band_id, freq_patch_id, time_slot = token_metadata(bands)
+        self.register_buffer("band_id", band_id, persistent=False)
+        self.register_buffer("freq_patch_id", freq_patch_id, persistent=False)
+        self.register_buffer("time_slot", time_slot, persistent=False)
+
+        # Per-stem mean per-token L2 norm (detached monitor): with 4 separate
+        # stems, one running hot would silently dominate the additive latent.
+        self.last_band_token_norm: dict[str, Tensor] = {}
+
+    def forward(self, lfs: Tensor, hga: Tensor) -> Tensor:
+        """``(B,C,28,T_lfs) / (B,C,7,T_hga)`` → tokens ``(B, C, S, d)``."""
+        band_inputs = (lfs, hga)
+        for bi, b in enumerate(self.bands):
+            F = band_inputs[bi].shape[-2]
+            if F != b.n_freq_bins:
+                raise ValueError(
+                    f"band {b.name!r} input has {F} freq bins, expected "
+                    f"{b.n_freq_bins}"
+                )
+        per_patch: list[Tensor] = []
+        norms: dict[str, Tensor] = {}
+        for stem, bi, (lo, hi), name in zip(
+            self.stems, self._stem_band, self._stem_slice, self._stem_name
+        ):
+            x = band_inputs[bi][:, :, lo:hi, :]              # (B, C, g, T)
+            out = stem(x)                                    # (B, C, 1, T_p, d)
+            B, C, F_p, T_p, d = out.shape
+            if F_p != 1:
+                raise ValueError(
+                    f"stem {name!r} produced {F_p} freq-patches, expected 1 "
+                    f"(kernel_freq must fold its bin group to one patch)"
+                )
+            norms[name] = out.detach().norm(dim=-1).mean()
+            per_patch.append(out.reshape(B, C, T_p, d))      # (B, C, T_p, d)
+        self.last_band_token_norm = norms
+        return torch.cat(per_patch, dim=2)                   # (B, C, S, d)
+
+
+class FrontendEncoderV2(nn.Module):
+    """Stage 1 (converged-v2): per-electrode ISOLATED 2-band frontend transformer.
+
+    Tokenize → add the learned freq-patch tag (4 patches) → ``n_layers`` joint
+    freq×time self-attention blocks (RoPE on the shared HGA-stride physical-time
+    clock) → LayerNorm. Electrodes ride the batch dim throughout: no
+    cross-electrode pathway (Stage-1 isolation). ``key_mask`` ``(B, C, S)`` bool
+    (``True`` = attendable) gives the student a leak-free M2-visibility forward
+    identical to physically dropping the masked cells, but batchable.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        *,
+        bands: tuple[BandSpecV2, ...] = BANDS_V2,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        head_dim = d_model // n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
+        self.tokenizer = TwoBandTokenizerV2(d_model, bands)
+        n_fp = sum(b.n_freq_patches for b in bands)
+
+        self.freq_embed = nn.Parameter(torch.empty(n_fp, d_model))
+        nn.init.trunc_normal_(self.freq_embed, std=0.02)
+
+        n_slots = int(self.tokenizer.time_slot.max().item()) + 1
+        self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
+
+        self.blocks = nn.ModuleList(
+            [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
+        )
+        self.ln_out = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        lfs: Tensor,
+        hga: Tensor,
+        *,
+        key_mask: Tensor | None = None,
+    ) -> Tensor:
+        """``(B,C,28,T_lfs)/(B,C,7,T_hga)`` → per-electrode features ``(B, C, S, d)``."""
+        tok = self.tokenizer(lfs, hga)                            # (B, C, S, d)
+        B, C, S, d = tok.shape
+        tok = tok + self.freq_embed[self.tokenizer.freq_patch_id]  # + (S, d)
+        rope = self.key_rope[:, self.tokenizer.time_slot, :]      # (2, S, head_dim)
+        x = tok.reshape(B * C, S, d)
+        km = None if key_mask is None else key_mask.reshape(B * C, S)
+        for blk in self.blocks:
+            x = blk(x, rope, km)
+        return self.ln_out(x).reshape(B, C, S, d)
