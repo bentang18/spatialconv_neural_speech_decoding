@@ -324,6 +324,111 @@ class FrontendEncoderV2(nn.Module):
         return self.ln_out(x).reshape(B, C, S, d)
 
 
+@dataclass(frozen=True)
+class M2MaskConfigV2:
+    """Parcel-uniform M2 mask config (frontend memo, locked 2026-06-26).
+
+    HGA = wav2vec2 FILL-NOT-TRIM time-spans, exact ``n_mask_hga = round(frac_hga·
+    T_hga)`` cells (``frac_hga=0.50`` ⇒ 8 @1s / 40 @5s). LFS = freq-tube, fixed 1
+    of 3 log groups (uniform-random which) ⇒ exactly ``T_lfs`` cells. Total
+    ``n_mask = n_mask_hga + T_lfs`` constant per parcel (the static invariant).
+    ``hg_start_rate`` is vestigial under fill-not-trim (we fill to the exact
+    target from all candidate starts) — kept only as documentation of the span
+    regime; ``hg_span`` (the granularity) is load-bearing."""
+
+    frac_hga: float = 0.50
+    hg_span: int = 3
+    n_lfs_tube_groups: int = 1
+
+
+def n_mask_hga(band_hga: BandSpecV2, cfg: M2MaskConfigV2 = M2MaskConfigV2()) -> int:
+    return round(cfg.frac_hga * band_hga.n_time_patches)
+
+
+def _hga_fill_not_trim(
+    R: int, T: int, target: int, span: int, generator: torch.Generator
+) -> Tensor:
+    """Vectorized wav2vec2 fill-not-trim over ``R`` rows → ``(R, T)`` bool, exactly
+    ``target`` True per row, span-granular with the LAST span tail-trimmed.
+
+    NO sequential loop. Each cell's COVER-RANK = the min random rank among the
+    spans that cover it (a cell is covered by start ``s`` iff ``s ≤ t < s+span``).
+    Adding spans in random order until the union hits ``target`` and trimming the
+    last span's tail ≡ selecting the ``target`` cells with the smallest
+    ``(cover_rank, time)`` — cells of fully-added spans (small rank) first, then a
+    time-ordered prefix of the last span. One argsort, no scan over spans."""
+    if target > T:
+        raise ValueError(f"n_mask_hga target {target} exceeds T_hga {T}")
+    if target == 0:
+        return torch.zeros(R, T, dtype=torch.bool)
+    allowed = T - span + 1
+    if allowed < 1:
+        raise ValueError(f"hg_span {span} exceeds T_hga {T}")
+    # Random rank of each candidate start (double argsort → integer 0..allowed-1).
+    order_rank = torch.rand(R, allowed, generator=generator).argsort(dim=1).argsort(dim=1)
+    s = torch.arange(allowed)[:, None]
+    t = torch.arange(T)[None, :]
+    cover = (s <= t) & (t < s + span)                          # (allowed, T) bool
+    big = allowed + 1
+    ranks = torch.where(cover[None], order_rank[:, :, None], big)  # (R, allowed, T)
+    cover_rank = ranks.min(dim=1).values                       # (R, T) — every cell covered
+    composite = cover_rank * T + torch.arange(T)               # (cover_rank, time) lexicographic
+    sel = composite.argsort(dim=1)[:, :target]                 # (R, target) smallest
+    mask = torch.zeros(R, T, dtype=torch.bool)
+    mask.scatter_(1, sel, True)
+    return mask
+
+
+def sample_m2_masks_v2(
+    B: int,
+    P: int,
+    bands: tuple[BandSpecV2, ...],
+    generator: torch.Generator,
+    cfg: M2MaskConfigV2 = M2MaskConfigV2(),
+) -> Tensor:
+    """Parcel-uniform M2 masks ``(B, P, S)`` bool (True = held out / an M2 target).
+
+    Constant count ``n_mask = n_mask_hga + T_lfs`` per parcel. VECTORIZED over all
+    ``B·P`` parcels — no per-parcel/per-electrode python loop. Token order matches
+    :func:`token_metadata`: LFS groups 0/1/2 (each ``T_lfs``) then HGA (``T_hga``)."""
+    lfs, hga = bands
+    if (lfs.name, hga.name) != ("lfs", "hga"):
+        raise ValueError(f"expected (lfs, hga) bands, got {(lfs.name, hga.name)}")
+    R = B * P
+    T_lfs = lfs.n_time_patches
+    n_lfs_groups = lfs.n_freq_patches
+    target_hga = n_mask_hga(hga, cfg)
+
+    # LFS freq-tube: pick cfg.n_lfs_tube_groups of the 3 groups, mask all their time.
+    grp = torch.rand(R, n_lfs_groups, generator=generator).argsort(dim=1)[
+        :, : cfg.n_lfs_tube_groups
+    ]                                                          # (R, n_tube_groups)
+    lfs_mask = torch.zeros(R, n_lfs_groups, T_lfs, dtype=torch.bool)
+    lfs_mask.scatter_(1, grp[:, :, None].expand(-1, -1, T_lfs), True)
+    lfs_mask = lfs_mask.reshape(R, n_lfs_groups * T_lfs)       # (R, n_lfs cells)
+
+    hga_mask = _hga_fill_not_trim(R, hga.n_time_patches, target_hga, cfg.hg_span, generator)
+
+    m2 = torch.cat([lfs_mask, hga_mask], dim=1)               # (R, S)
+    return m2.reshape(B, P, -1)
+
+
+def sample_parcel_tube_v2(
+    B: int, P: int, tube_ratio: float, generator: torch.Generator
+) -> Tensor:
+    """Per-clip tubed-parcel mask ``(B, P)`` bool, constant count ``n_tube`` per
+    clip. ``n_tube = round(tube_ratio·P)`` clamped to ``[1, P−1]`` (≥1 tubed for an
+    M4 target, ≥1 untubed for context). VECTORIZED over B (argsort-of-rand =
+    per-row randperm). A 1-parcel session tubes nothing (M4 inert)."""
+    if P < 2:
+        return torch.zeros(B, P, dtype=torch.bool)
+    n_tube = max(1, min(round(tube_ratio * P), P - 1))
+    idx = torch.rand(B, P, generator=generator).argsort(dim=1)[:, :n_tube]  # (B, n_tube)
+    tube = torch.zeros(B, P, dtype=torch.bool)
+    tube.scatter_(1, idx, True)
+    return tube
+
+
 def cell_operator_index(
     bands: tuple[BandSpecV2, ...] = BANDS_V2, *, tie_lfs: bool = True
 ) -> Tensor:
