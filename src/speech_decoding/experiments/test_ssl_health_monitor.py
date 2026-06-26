@@ -177,6 +177,50 @@ def test_input_stats_absmax_catches_outlier():
     assert logged["train_mon_input_electrode_tokens_lfs_absmax"] >= 1e6
 
 
+# ------------------------------------------------ Family A: grad_noise_scale
+def test_grad_noise_scale_finite_and_scaled_by_b_eff():
+    """GNS reads AdamW's existing moment EMAs (no extra grads): after a real
+    opt.step() the four keys log finite, var/signal ≥ 0, and the reported
+    ``..._scale`` equals ``ratio · B_eff`` with B_eff = world·accum·per_rank_bs."""
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    opt = torch.optim.AdamW(
+        [p for p in m.model.parameters() if p.requires_grad], lr=1e-3
+    )
+    # One real step populates exp_avg / exp_avg_sq / step in optimizer.state.
+    m._step(_batch(B=3).data)["loss"].backward()  # sets m._last_batch_size = 3
+    opt.step()
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    trainer = SimpleNamespace(world_size=4, accumulate_grad_batches=2)
+    cb._grad_noise_scale(trainer, m, opt)
+    for k in ("train_mon_grad_noise_signal", "train_mon_grad_noise_var",
+              "train_mon_grad_noise_ratio", "train_mon_grad_noise_scale"):
+        assert k in logged and logged[k] == logged[k]  # finite/present
+    assert logged["train_mon_grad_noise_signal"] > 0.0
+    assert logged["train_mon_grad_noise_var"] >= 0.0
+    assert logged["train_mon_grad_noise_ratio"] >= 0.0
+    b_eff = 4 * 2 * m._last_batch_size  # world · accum · per_rank_bs (=3)
+    assert logged["train_mon_grad_noise_scale"] == (
+        logged["train_mon_grad_noise_ratio"] * b_eff
+    )
+
+
+def test_grad_noise_scale_noop_without_optimizer_state():
+    """Before any opt.step() the moment EMAs are absent ⇒ signal=0 ⇒ the method
+    logs nothing (no divide-by-zero), so the cadence path is safe on step 0."""
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    opt = torch.optim.AdamW(
+        [p for p in m.model.parameters() if p.requires_grad], lr=1e-3
+    )
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    trainer = SimpleNamespace(world_size=1, accumulate_grad_batches=1)
+    cb._grad_noise_scale(trainer, m, opt)
+    assert not any("grad_noise" in k for k in logged)
+
+
 # -------------------------------------------------------------- tap cadence
 def test_taps_only_requested_on_cadence_step():
     m = _module(monitor_every_n_steps=10)

@@ -94,6 +94,58 @@ class SSLHealthMonitor(pl.Callback):
         pl_module.log(
             "train_mon_ema_weight_gap", self._ema_weight_gap(pl_module), on_step=True
         )
+        # grad_noise_scale (critical-batch estimate) from AdamW's existing moments.
+        self._grad_noise_scale(trainer, pl_module, optimizer)
+
+    def _grad_noise_scale(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, optimizer
+    ) -> None:
+        """McCandlish 2018 gradient-noise-scale via AdamW's existing moment EMAs —
+        NO extra forward/backward, just two reductions over ``optimizer.state``.
+
+        AdamW keeps a bias-corrected first moment ``m̂ ≈ G`` (true gradient) and
+        second moment ``v̂ ≈ E[|g|²]`` of the global-batch gradient ``g``. The
+        gradient the optimiser sees is the DDP+accum mean over the effective batch
+        ``B_eff = world · accum · per_rank_bs``, so ``Σ(v̂ − m̂²) ≈ tr(Σ)/B_eff``
+        (variance of that mean). Then::
+
+            signal = Σ m̂²                       # |G|²
+            var    = max(0, Σ v̂ − Σ m̂²)        # tr(Σ)/B_eff
+            B_simple = B_eff · var / signal      # critical batch (examples)
+
+        Below ``B_simple`` a bigger batch ≈ proportionally fewer steps; above it the
+        gradient is already clean ⇒ wasted compute. ``var`` can dip slightly negative
+        from EMA noise ⇒ clamp the sum (not per-element)."""
+        if optimizer is None:
+            return
+        sig = 0.0   # Σ m̂²
+        v_sum = 0.0  # Σ v̂
+        for group in optimizer.param_groups:
+            beta1, beta2 = group.get("betas", (0.9, 0.999))
+            for p in group["params"]:
+                st = optimizer.state.get(p)
+                if not st or "exp_avg" not in st or "exp_avg_sq" not in st:
+                    continue
+                t = float(st["step"]) if "step" in st else 0.0
+                bc1 = 1.0 - beta1 ** t if t > 0 else 1.0
+                bc2 = 1.0 - beta2 ** t if t > 0 else 1.0
+                m = st["exp_avg"].detach().to(torch.float32) / bc1
+                v = st["exp_avg_sq"].detach().to(torch.float32) / bc2
+                sig += float(m.pow(2).sum().item())
+                v_sum += float(v.sum().item())
+        if sig <= 0.0:
+            return
+        var = max(0.0, v_sum - sig)
+        ratio = var / sig                       # = B_simple / B_eff
+        b_eff = (
+            max(1, int(getattr(trainer, "world_size", 1) or 1))
+            * max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
+            * max(1, int(getattr(pl_module, "_last_batch_size", 1) or 1))
+        )
+        pl_module.log("train_mon_grad_noise_signal", sig, on_step=True)
+        pl_module.log("train_mon_grad_noise_var", var, on_step=True)
+        pl_module.log("train_mon_grad_noise_ratio", ratio, on_step=True)
+        pl_module.log("train_mon_grad_noise_scale", ratio * b_eff, on_step=True)
 
     def _ema_weight_gap(self, pl_module: pl.LightningModule) -> float:
         """``‖θ_student − θ_teacher‖₂ / ‖θ_student‖₂`` over the frontend EMA pair."""

@@ -63,6 +63,7 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         # due step the forward is byte-identical to the no-tap path.
         self._monitor_every_n_steps = max(int(monitor_every_n_steps), 1)
         self._last_taps: dict[str, Tensor] | None = None
+        self._last_batch_size = 0  # per-rank micro-batch, read by the monitor's B_eff
         # Own CPU generator: the per-clip mask draws (CUDA randperm needs a CPU
         # generator) are reproducible + independent of the global RNG. A shared
         # seed across DDP ranks only lowers mask diversity, not correctness — the
@@ -175,6 +176,7 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         # internal session layout (unique-sorted labels, identical P + ordering).
         _, membership = active_parcels(poe.cpu())
         B = lfs.shape[0]
+        self._last_batch_size = B  # per-rank micro-batch, for the monitor's B_eff
         m2, tube = self.model.sample_masks(B, membership, bands, self._mask_gen)
         if mt:
             _t.append(time.perf_counter())
