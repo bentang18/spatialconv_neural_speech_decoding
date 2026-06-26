@@ -72,6 +72,9 @@ from speech_decoding.experiments.monitors.slot_redundancy import (
     SlotRedundancyVerdict,
     slot_redundancy_monitor,
 )
+from speech_decoding.experiments.monitors.ssl_health import (
+    SSLHealthMonitor,
+)
 from speech_decoding.experiments.monitors.subject_id_leakage import (
     CHANCE_F1_BT9,
     SUBJECT_ID_LEAKAGE_F1_THRESHOLD,
@@ -116,6 +119,7 @@ __all__ = [
     "RANKME_NORMALISED_WARN",
     "REF_TYPE_CANARY_F1_THRESHOLD",
     "RefTypeCanaryVerdict",
+    "SSLHealthMonitor",
     "SENSOR_TYPE_CANARY_F1_THRESHOLD",
     "SUBJECT_ID_LEAKAGE_F1_THRESHOLD",
     "SensorTypeCanaryVerdict",

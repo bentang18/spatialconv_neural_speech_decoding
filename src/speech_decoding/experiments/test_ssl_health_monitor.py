@@ -1,0 +1,198 @@
+"""TDD for the LEAN SSLHealthMonitor callback + the V14ConvergedV2 `return_taps`
+forward seam: the tap path must not perturb the loss, Family A math (grad spike /
+ema_weight_gap / true_update_ratio) is correct, Family B + input-stats run finite
+on a tiny batch (and input-stats catches an injected outlier), and the module only
+requests taps on a monitor-cadence step."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import torch
+
+from speech_decoding.experiments.monitors.ssl_health import SSLHealthMonitor
+from speech_decoding.experiments.v14_converged_v2_module import (
+    V14ConvergedV2BrainModule,
+)
+from speech_decoding.models.v14_converged_v2 import (
+    V14ConvergedV2,
+    bands_for_clip_len,
+)
+from speech_decoding.models.v14_converged_v2_config import V14ConvergedV2Net
+
+from neuraltrain.optimizers import LightningOptimizer
+
+N_PARCELS = 62
+
+_TAP_KEYS = (
+    "_tap_teacher_frontend", "_tap_student_latent",
+    "_tap_m2_pred", "_tap_m2_target", "_tap_m4_pred", "_tap_m4_target",
+)
+
+
+def _tiny_model() -> V14ConvergedV2:
+    return V14ConvergedV2Net(
+        d_model=16, n_heads=4, frontend_layers=1, latent_layers=1,
+        m2_pred_layers=1, m4_pred_layers=1, pred_dim=16, n_parcels=N_PARCELS,
+    ).build(0, 0)
+
+
+def _module(**kw) -> V14ConvergedV2BrainModule:
+    return V14ConvergedV2BrainModule(
+        model=_tiny_model(),
+        optim_config=LightningOptimizer(
+            optimizer={"name": "AdamW", "lr": 1e-3, "kwargs": {"weight_decay": 0.0}}
+        ),
+        clip_len_s=5.0, **kw,
+    )
+
+
+def _batch(B: int = 3, *, clip_len_s: float = 5.0):
+    torch.manual_seed(0)
+    lfs_b, hga_b = bands_for_clip_len(clip_len_s)
+    C, K = 6, N_PARCELS
+    lfs = torch.randn(B, C, lfs_b.n_freq_bins, lfs_b.n_time_frames)
+    hga = torch.randn(B, C, hga_b.n_freq_bins, hga_b.n_time_frames)
+    support = torch.zeros(B, C, K)
+    for e, lab in enumerate([5, 5, 9, 9, 20, 20]):
+        support[:, e, lab] = 1.0
+    return SimpleNamespace(data={
+        "electrode_tokens_lfs": lfs,
+        "electrode_tokens_hga": hga,
+        "support": support,
+    })
+
+
+# ---------------------------------------------------------- return_taps seam
+def test_return_taps_loss_identical_and_taps_finite():
+    """`return_taps=True` returns the right detached tap keys with finite values and
+    a loss IDENTICAL (same seed) to `return_taps=False` — proves taps don't perturb."""
+    m = _module()
+    data = _batch(B=3).data
+
+    def _forward(return_taps: bool):
+        torch.manual_seed(7)
+        m._mask_gen.manual_seed(0)
+        lfs, hga, poe = m._v2_inputs(data)
+        from speech_decoding.models.v14_converged_v2 import active_parcels
+        _, membership = active_parcels(poe.cpu())
+        bands = bands_for_clip_len(m.clip_len_s)
+        m2, tube = m.model.sample_masks(lfs.shape[0], membership, bands, m._mask_gen)
+        return m.model(lfs, hga, poe, m2, tube, clip_len_s=m.clip_len_s,
+                       return_taps=return_taps)
+
+    out_no = _forward(False)
+    out_yes = _forward(True)
+    assert torch.equal(out_no["loss"], out_yes["loss"])
+    for k in _TAP_KEYS:
+        t = out_yes[k]
+        assert isinstance(t, torch.Tensor)
+        assert not t.requires_grad
+        assert torch.isfinite(t).all()
+        assert t.shape[-1] == m.model.cfg.d_model
+    assert all(k not in out_no for k in _TAP_KEYS)
+
+
+# ------------------------------------------------------ Family A: grad spike
+def test_grad_spike_uses_shared_helper():
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    m._step(_batch(B=2).data)["loss"].backward()
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb.on_before_optimizer_step(trainer=None, pl_module=m, optimizer=None)
+    for k in ("train_mon_grad_l2", "train_mon_grad_ema_l2",
+              "train_mon_grad_spike_ratio", "train_mon_grad_spike"):
+        assert k in logged and logged[k] == logged[k]  # finite/present
+    # EMA buffer seeded to the first grad-L2 (shared helper's step-0 behaviour).
+    assert cb._grad_ema_l2 == logged["train_mon_grad_l2"]
+
+
+# -------------------------------------------------- Family A: ema_weight_gap
+def test_ema_weight_gap_zero_then_positive():
+    m = _module()
+    cb = SSLHealthMonitor()
+    # Fresh model: teacher is a deepcopy of the student ⇒ gap exactly 0.
+    assert cb._ema_weight_gap(m) == 0.0
+    with torch.no_grad():
+        next(m.model.frontend.parameters()).add_(1.0)
+    assert cb._ema_weight_gap(m) > 0.0
+
+
+# ----------------------------------------------- Family A: true_update_ratio
+def test_true_update_ratio_zero_without_step_positive_after():
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    # Step A: snapshot taken, nothing logged yet (no prior snapshot).
+    cb._maybe_log_true_update_ratio(m, step=0)
+    assert cb._update_snapshot is not None
+    assert not any("true_update_ratio" in k for k in logged)
+    # No optimizer step between snapshots ⇒ ratio ~0.
+    cb._maybe_log_true_update_ratio(m, step=1)
+    for g in ("frontend", "latent", "m2_predictor", "m4_predictor"):
+        assert logged[f"train_mon_true_update_ratio_{g}"] == 0.0
+    # Perturb the frontend, then measure across the next pair ⇒ >0 for frontend.
+    logged.clear()
+    cb._maybe_log_true_update_ratio(m, step=2)            # snapshot
+    with torch.no_grad():
+        next(m.model.frontend.parameters()).add_(0.5)
+    cb._maybe_log_true_update_ratio(m, step=3)            # measure
+    assert logged["train_mon_true_update_ratio_frontend"] > 0.0
+
+
+# ------------------------------------------ Family B + input-stats: run finite
+def test_tap_monitors_and_input_stats_finite():
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    out = m._step(_batch(B=3).data)
+    assert m._last_taps is not None
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb._run_input_stats(m, _batch(B=3))
+    cb._run_tap_monitors(m, m._last_taps)
+    for k in (
+        "train_mon_frontend_rankme", "train_mon_frontend_rankme_normalised",
+        "train_mon_frontend_feat_std_mean", "train_mon_frontend_feat_std_min",
+        "train_mon_rankme", "train_mon_feat_std_mean", "train_mon_feat_std_min",
+        "train_mon_m2_explained_var", "train_mon_m2_pred_target_var_ratio",
+        "train_mon_m4_explained_var", "train_mon_m4_pred_target_var_ratio",
+        "train_mon_input_electrode_tokens_lfs_mean",
+        "train_mon_input_electrode_tokens_hga_std",
+    ):
+        assert k in logged, k
+        assert logged[k] == logged[k]  # finite
+    _ = out
+
+
+def test_input_stats_absmax_catches_outlier():
+    m = _module()
+    cb = SSLHealthMonitor()
+    batch = _batch(B=2)
+    batch.data["electrode_tokens_lfs"][0, 0, 0, 0] = 1e6
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb._run_input_stats(m, batch)
+    assert logged["train_mon_input_electrode_tokens_lfs_absmax"] >= 1e6
+
+
+# -------------------------------------------------------------- tap cadence
+def test_taps_only_requested_on_cadence_step():
+    m = _module(monitor_every_n_steps=10)
+    m.train()
+
+    class _FakeTrainer:
+        def __init__(self, step):
+            self.global_step = step
+
+    # On a non-cadence step the module must NOT stash taps.
+    m._trainer = _FakeTrainer(3)
+    m._step(_batch(B=2).data)
+    assert m._last_taps is None
+    # On a cadence step it stashes the tap subdict and strips the keys from losses.
+    m._trainer = _FakeTrainer(10)
+    out = m._step(_batch(B=2).data)
+    assert m._last_taps is not None
+    assert set(m._last_taps) == set(_TAP_KEYS)
+    assert not any(k.startswith("_tap_") for k in out)

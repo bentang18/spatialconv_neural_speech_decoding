@@ -50,12 +50,19 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         clip_len_s: float,
         mask_seed: int = 0,
         wd_exclude_norms: bool = True,
+        monitor_every_n_steps: int = 50,
     ) -> None:
         super().__init__()
         self.model = model
         self.optim_config = optim_config
         self.clip_len_s = float(clip_len_s)
         self._wd_exclude_norms = wd_exclude_norms
+        # SSL-health monitor cadence (steps). On a due step the forward runs with
+        # ``return_taps=True`` and the detached tap subdict is stashed on
+        # ``self._last_taps`` for the SSLHealthMonitor callback (Family B); off a
+        # due step the forward is byte-identical to the no-tap path.
+        self._monitor_every_n_steps = max(int(monitor_every_n_steps), 1)
+        self._last_taps: dict[str, Tensor] | None = None
         # Own CPU generator: the per-clip mask draws (CUDA randperm needs a CPU
         # generator) are reproducible + independent of the global RNG. A shared
         # seed across DDP ranks only lowers mask diversity, not correctness — the
@@ -140,6 +147,16 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         poe = ppe[0]                                              # (C',)
         return lfs, hga, poe
 
+    def _monitor_due(self) -> bool:
+        """Monitor cadence: ``global_step % N == 0``. ``global_step`` is 0 (and may
+        raise) when no trainer is attached (unit tests calling ``_step`` directly),
+        so guard it — a no-trainer call lands on step 0 ⇒ due."""
+        try:
+            step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            step = 0
+        return step % self._monitor_every_n_steps == 0
+
     # ------------------------------------------------------------- loss path
     def _step(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
         """Pure loss path (testable without a trainer): ingest → sample masks →
@@ -164,7 +181,21 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         m2, tube = m2.to(lfs.device), tube.to(lfs.device)
         if mt:
             _t.append(time.perf_counter())
-        out = self.model(lfs, hga, poe, m2, tube, clip_len_s=self.clip_len_s)
+        # On a monitor-cadence training step request detached health taps; stash
+        # them for the callback and STRIP the ``_tap_*`` keys before the dict flows
+        # into `_log_losses` (so they aren't logged as losses). Off-cadence ⇒ no
+        # taps requested ⇒ the forward is byte-identical to the no-tap path.
+        want_taps = self.training and self._monitor_due()
+        out = self.model(
+            lfs, hga, poe, m2, tube,
+            clip_len_s=self.clip_len_s, return_taps=want_taps,
+        )
+        if want_taps:
+            self._last_taps = {
+                k: out.pop(k) for k in list(out) if k.startswith("_tap_")
+            }
+        else:
+            self._last_taps = None
         if mt:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -273,6 +304,13 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
                 self.log(f"{name}_{key}", val, on_step=on_step, on_epoch=on_epoch)
 
     # ------------------------------------------------------------- lifecycle
+    def configure_callbacks(self) -> list[pl.Callback]:  # type: ignore[override]
+        """Attach the LEAN SSL-health monitor. Lightning MERGES these with any
+        Trainer-level callbacks (module callbacks take precedence on conflict)."""
+        from speech_decoding.experiments.monitors.ssl_health import SSLHealthMonitor
+
+        return [SSLHealthMonitor(every_n_steps=self._monitor_every_n_steps)]
+
     def on_before_zero_grad(self, optimizer: tp.Any) -> None:  # noqa: ARG002
         """EMA tick once per optimiser step (after step, before zero_grad)."""
         self.model.ema_step()

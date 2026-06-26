@@ -71,6 +71,11 @@ class V14ConvergedV2Experiment(V14Experiment):
     # never correctness).
     mask_seed: int = 0
 
+    # SSL-health monitor cadence (steps). The module forwards with detached health
+    # taps on `global_step % N == 0` and the SSLHealthMonitor callback logs the LEAN
+    # diagnostic set on that cadence; off-cadence steps carry zero added cost.
+    monitor_every_n_steps: int = 50
+
     def _build_brain_module(self, train_loader) -> BrainModule:  # type: ignore[override]
         """Build the converged-v2 Lightning module: resolve the model from the
         config (the C-peek is ignored by ``V14ConvergedV2Net.build``), fail loud if
@@ -99,6 +104,7 @@ class V14ConvergedV2Experiment(V14Experiment):
             clip_len_s=self.clip_len_s,
             mask_seed=self.mask_seed,
             wd_exclude_norms=self.wd_exclude_norms,
+            monitor_every_n_steps=self.monitor_every_n_steps,
         )
 
 

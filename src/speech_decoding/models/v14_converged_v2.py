@@ -1198,6 +1198,7 @@ class V14ConvergedV2(nn.Module):
         tube_mask: Tensor,            # (B, P) bool, True = tubed parcel
         *,
         clip_len_s: float,
+        return_taps: bool = False,
     ) -> dict[str, Tensor]:
         bands = bands_for_clip_len(clip_len_s, base=self.base_bands)
         lay = self.session_layout(parcel_of_electrode, bands)
@@ -1294,7 +1295,7 @@ class V14ConvergedV2(nn.Module):
         n_p = membership.sum(1)                                       # (P,) long
         m4_weight = n_p[pos].float()                                 # (B,Lq)  w_p=1
 
-        return converged_v2_loss(
+        out = converged_v2_loss(
             m2_pred.reshape(-1, d),
             m2_target.reshape(-1, d),
             m4_pred.reshape(-1, d),
@@ -1302,6 +1303,20 @@ class V14ConvergedV2(nn.Module):
             m4_weight.reshape(-1),
             tubed[None, :].expand(B, Lq).reshape(-1),
         )
+        if return_taps:
+            # Near-free detached SSL-health taps for the monitor callback. The loss
+            # path above is unchanged — these are additive + `.detach()`'d, so a
+            # tap-on step is bit-identical to a tap-off step (verified in tests).
+            # Frontend/latent taps keep their native per-cell shapes (the callback
+            # flattens to (N, d)); pred/target taps are the SAME flattened (Q, d)
+            # rows the loss scores, so their stats match what the model predicts.
+            out["_tap_teacher_frontend"] = t_front.detach()       # (B,C,S,d)
+            out["_tap_student_latent"] = s_latent.detach()        # (B,P_vis,k,s_vis,d)
+            out["_tap_m2_pred"] = m2_pred.reshape(-1, d).detach()  # (Q2,d)
+            out["_tap_m2_target"] = m2_target.reshape(-1, d).detach()
+            out["_tap_m4_pred"] = m4_pred.reshape(-1, d).detach()  # (Q4,d)
+            out["_tap_m4_target"] = m4_target.reshape(-1, d).detach()
+        return out
 
     @torch.no_grad()
     def ema_step(self) -> None:
