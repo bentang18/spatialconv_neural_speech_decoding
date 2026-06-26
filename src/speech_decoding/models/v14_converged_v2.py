@@ -891,3 +891,69 @@ def ema_update(teacher: nn.Module, student: nn.Module, tau: float) -> None:
     torch._foreach_add_(t_params, s_params, alpha=1.0 - tau)
     for tb, sb in zip(teacher.buffers(), student.buffers()):
         tb.copy_(sb)
+
+
+def _ln_target(t: Tensor) -> Tensor:
+    """LayerNorm-noaffine over the feature dim + stop-grad — the V-JEPA-2.1 target
+    transform that puts the shallow (frontend) and deep (latent) teacher targets on
+    one O(1) per-scalar scale so the shared denominator balances COUNT not magnitude
+    (no depth λ). ``eps`` matches ``F.layer_norm`` default."""
+    return F.layer_norm(t.detach(), (t.shape[-1],))
+
+
+def converged_v2_loss(
+    m2_pred: Tensor,
+    m2_target: Tensor,
+    m4_pred: Tensor,
+    m4_target: Tensor,
+    m4_weight: Tensor,
+    m4_tubed: Tensor,
+) -> dict[str, Tensor]:
+    """Shared-denominator dual-depth JEPA loss (locked Ben 2026-06-25).
+
+    ``L = [ Σ_{M2} Σ_d|p̂−t| + Σ_{M4} (w_p·n_p) Σ_d|p̂−t̄| ] / [ (|M2| + Σ_{M4} w_p·n_p)·d ]``
+
+    A weighted MEAN over every predicted scalar: each M2 frontend cell weight 1,
+    each M4 latent query weight ``w_p·n_p`` (= ``m4_weight``), the weight in BOTH
+    numerator and denominator. That keeps ``L`` magnitude-interpretable — a constant
+    per-scalar error ``e`` yields exactly ``e`` regardless of the weights (the
+    legibility property the old weighted-num / unweighted-denom scheme broke). Both
+    teacher targets are LN-noaffine'd + detached (no depth λ).
+
+    All query tensors are pre-flattened ``(Q, d)``; the forward owns the gather and
+    fills ``m4_weight`` (per-query ``w_p·n_p``) and ``m4_tubed`` (cross-parcel vs
+    within-parcel-inpaint, for the scale diagnostic). Returns ``loss`` plus per-term
+    means + ratios for the Refinement-5 scale assertions."""
+    d = m2_pred.shape[-1]
+    if m4_pred.shape[-1] != d:
+        raise ValueError(f"m2/m4 feature dim mismatch: {d} vs {m4_pred.shape[-1]}")
+    for name, w in (("m4_weight", m4_weight), ("m4_tubed", m4_tubed)):
+        if w.shape[0] != m4_pred.shape[0]:
+            raise ValueError(f"{name} length {w.shape[0]} != m4 queries {m4_pred.shape[0]}")
+
+    err_m2 = (m2_pred - _ln_target(m2_target)).abs().sum(-1)  # (Q2,)
+    err_m4 = (m4_pred - _ln_target(m4_target)).abs().sum(-1)  # (Q4,)
+
+    num = err_m2.sum() + (m4_weight * err_m4).sum()
+    den = (err_m2.new_tensor(float(err_m2.numel())) + m4_weight.sum()) * d
+    loss = num / den
+
+    def _wmean(e: Tensor, w: Tensor) -> Tensor:
+        wsum = w.sum()
+        if wsum == 0:
+            return e.new_zeros(())
+        return (w * e).sum() / (wsum * d)
+
+    tubed = m4_tubed.bool()
+    diag = {
+        "loss": loss,
+        "loss_m2": err_m2.mean() / d if err_m2.numel() else loss.new_zeros(()),
+        "loss_m4": _wmean(err_m4, m4_weight),
+        "loss_m4_tubed": _wmean(err_m4[tubed], m4_weight[tubed]),
+        "loss_m4_untubed": _wmean(err_m4[~tubed], m4_weight[~tubed]),
+    }
+    diag["ratio_m2_m4"] = diag["loss_m2"] / diag["loss_m4"].clamp_min(1e-12)
+    diag["ratio_tubed_untubed"] = diag["loss_m4_tubed"] / diag["loss_m4_untubed"].clamp_min(
+        1e-12
+    )
+    return diag
