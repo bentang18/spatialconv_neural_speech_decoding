@@ -64,28 +64,43 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
     def _v2_inputs(self, data: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         """Map a batch dict to ``(lfs, hga, parcel_of_electrode (C,))``.
 
-        ``parcel_of_electrode = support.argmax(-1)`` (DK support is one-hot, so
+        ``parcel_of_electrode = support.argmax(-1)`` (DKT support is one-hot, so
         argmax is the exact hard parcel id). The v2 model is session-homogeneous —
         one ``(C,)`` parcel vector for the whole batch — so the per-clip support
-        must be CONSTANT across clips; fail loud otherwise. v2 has no
-        electrode-padding path, so a ``valid_mask`` with padded electrodes is also
-        a fail-loud contract violation (the same-session sampler is zero-padding)."""
+        must be CONSTANT across clips; fail loud otherwise.
+
+        Unmapped electrodes (no DKT parcel ⇒ all-zero ``support`` row ⇒ a spurious
+        ``argmax``-0 parcel id) are marked False by ``ElectrodeValidMask``. v2 has
+        no masked-electrode path (unlike the 3STFT converged forward, which carries
+        an ``electrode_mask`` and biases those rows to ``-inf``), so it DROPS them
+        at ingest. Because the batch is session-homogeneous the same rows are
+        invalid for every clip — assert that, then drop one ``(C,)`` row set,
+        preserving the uniform-C contract. shaft-CAR is untouched: it ran in the
+        loader over the post-STATIC montage (which still includes these contacts)
+        before the cache; this drop is model-side, after the cache."""
         lfs = data["electrode_tokens_lfs"]
         hga = data["electrode_tokens_hga"]
         support = data["support"]
-        ppe = support.argmax(dim=-1)                              # (B, C)
+        valid = data.get("valid_mask")
+        if valid is not None:
+            valid = valid.to(torch.bool)
+            if not torch.equal(valid, valid[:1].expand_as(valid)):
+                raise ValueError(
+                    "v2 requires a session-homogeneous batch: valid_mask must be "
+                    "constant across clips (use the same-session sampler)"
+                )
+            keep = valid[0]                                       # (C,)
+            if not bool(keep.all()):
+                lfs = lfs[:, keep]
+                hga = hga[:, keep]
+                support = support[:, keep]
+        ppe = support.argmax(dim=-1)                              # (B, C')
         if not torch.equal(ppe, ppe[:1].expand_as(ppe)):
             raise ValueError(
                 "v2 requires a session-homogeneous batch: parcel_of_electrode must "
                 "be constant across clips (use the same-session sampler)"
             )
-        poe = ppe[0]                                             # (C,)
-        valid = data.get("valid_mask")
-        if valid is not None and not bool(valid.all()):
-            raise ValueError(
-                "v2 has no electrode-padding path: valid_mask has padded electrodes "
-                "(use the zero-padding-free same-session sampler)"
-            )
+        poe = ppe[0]                                              # (C',)
         return lfs, hga, poe
 
     # ------------------------------------------------------------- loss path

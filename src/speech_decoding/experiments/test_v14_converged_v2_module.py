@@ -105,11 +105,25 @@ def test_v2_inputs_reject_heterogeneous_batch():
         m._v2_inputs(_batch(B=3, heterogeneous=True).data)
 
 
-def test_v2_inputs_reject_padded_valid_mask():
+def test_v2_inputs_drops_unmapped_electrode():
+    """An unmapped electrode (valid_mask False across ALL clips) is DROPPED at
+    ingest, not rejected — v2 has no masked-electrode path, and the
+    session-homogeneous batch drops the same row for every clip (uniform C kept)."""
     m = _module()
     valid = torch.ones(3, 6, dtype=torch.bool)
-    valid[0, 5] = False                                       # a padded electrode
-    with pytest.raises(ValueError, match="electrode-padding"):
+    valid[:, 5] = False                                       # electrode 5 unmapped
+    lfs, hga, poe = m._v2_inputs(_batch(B=3, valid=valid).data)
+    assert lfs.shape[1] == 5 and hga.shape[1] == 5
+    assert poe.tolist() == [5, 5, 9, 9, 20]                   # electrode 5 (parcel 20) gone
+
+
+def test_v2_inputs_reject_nonconstant_valid_mask():
+    """valid_mask varying across clips violates session-homogeneity → fail loud
+    (a single (C,) drop set would otherwise be ambiguous)."""
+    m = _module()
+    valid = torch.ones(3, 6, dtype=torch.bool)
+    valid[0, 5] = False                                       # only clip 0 differs
+    with pytest.raises(ValueError, match="constant across clips"):
         m._v2_inputs(_batch(B=3, valid=valid).data)
 
 
