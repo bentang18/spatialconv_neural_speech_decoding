@@ -13,12 +13,16 @@ so a stock static DDP graph is correct.
 Batch contract (the v2 cache, session-homogeneous via the same-session sampler):
   electrode_tokens_lfs : (B, C, 28, T_lfs)   |STFT| magnitude, robust-z'd
   electrode_tokens_hga : (B, C,  7, T_hga)   |STFT| magnitude
-  support              : (B, C, K) DK one-hot → parcel_of_electrode = argmax → (C,)
-  valid_mask           : (B, C) bool, optional → MUST be all-real (no padding path)
+  support              : (B, C, K) DKT one-hot → parcel_of_electrode = argmax → (C,)
+  valid_mask           : (B, C) bool, optional → unmapped electrodes (False) are
+                         DROPPED at ingest (v2 has no masked-electrode path); the
+                         session-homogeneous batch drops the same rows for every clip
 """
 
 from __future__ import annotations
 
+import os
+import time
 import typing as tp
 
 import torch
@@ -59,6 +63,28 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         self._mask_seed = int(mask_seed)
         self._mask_gen = torch.Generator()
         self._mask_gen.manual_seed(self._mask_seed)
+        # Diagnostic step timing (env-gated, OFF in production ⇒ zero added logs,
+        # uid-neutral — read from env, not a pydantic field). `V14_STEP_TIMING`
+        # logs per-step `step_time_s` (= `data_wait_s` host-gap + `compute_s`
+        # in-step) to wandb ⇒ median sec/step. `V14_MASK_TIMING=<N>` prints a
+        # median/p10/p90 ms table over every N train steps splitting the in-`_step`
+        # work into mask_sample(CPU) / mask_h2d / forward — names where the step
+        # goes WITHOUT torch.profiler/kineto (which OOMs/hangs on aarch64 GH200 +
+        # torch 2.10). v2 masks are vectorized, so mask_sample should be small
+        # (no 3STFT 455ms per-electrode-loop bubble). Rank-0 + training only.
+        self._step_timing = os.environ.get("V14_STEP_TIMING") is not None
+        self._last_batch_end_time: float | None = None
+        _mt = os.environ.get("V14_MASK_TIMING")
+        self._mask_timing_every = 0
+        if _mt is not None:
+            try:
+                _mt_n = int(_mt)
+            except ValueError:
+                _mt_n = 50
+            self._mask_timing_every = _mt_n if _mt_n > 0 else 50
+        self._mask_timing_buf: dict[str, list[float]] = {
+            "sample": [], "h2d": [], "fwd": [],
+        }
 
     # ----------------------------------------------------------- batch ingest
     def _v2_inputs(self, data: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
@@ -110,18 +136,97 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         diagnostics)."""
         lfs, hga, poe = self._v2_inputs(data)
         bands = bands_for_clip_len(self.clip_len_s)
+        # Kineto-free per-section wall timing (V14_MASK_TIMING). Armed + training
+        # only ⇒ off ⇒ not a single extra call. 4 perf_counter stamps split the
+        # in-`_step` work into mask_sample(CPU) / mask_h2d / forward, with ONE
+        # post-forward cuda.sync so `forward` is real GPU time, not async-dispatch.
+        mt = bool(self._mask_timing_every) and self.training
+        _t: list[float] = [time.perf_counter()] if mt else []
         # Masks sampled on CPU (CUDA randperm needs a CPU generator), membership
         # derived from the SAME deterministic active_parcels ⇒ matches the model's
         # internal session layout (unique-sorted labels, identical P + ordering).
         _, membership = active_parcels(poe.cpu())
         B = lfs.shape[0]
         m2, tube = self.model.sample_masks(B, membership, bands, self._mask_gen)
+        if mt:
+            _t.append(time.perf_counter())
         m2, tube = m2.to(lfs.device), tube.to(lfs.device)
-        return self.model(lfs, hga, poe, m2, tube, clip_len_s=self.clip_len_s)
+        if mt:
+            _t.append(time.perf_counter())
+        out = self.model(lfs, hga, poe, m2, tube, clip_len_s=self.clip_len_s)
+        if mt:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t.append(time.perf_counter())
+            self._mask_timing_record(_t)
+        return out
+
+    def _mask_timing_record(self, t: list[float]) -> None:
+        """Accumulate one step's per-section walls (4 perf_counter stamps: start,
+        +sample, +h2d, +forward); flush a median/p10/p90 ms table every
+        ``_mask_timing_every`` steps. Prints on rank 0; clears on every rank so
+        non-zero ranks stay bounded."""
+        if len(t) < 4:
+            return
+        buf = self._mask_timing_buf
+        buf["sample"].append((t[1] - t[0]) * 1e3)
+        buf["h2d"].append((t[2] - t[1]) * 1e3)
+        buf["fwd"].append((t[3] - t[2]) * 1e3)
+        if len(buf["sample"]) < self._mask_timing_every:
+            return
+        is_rank0 = not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        )
+        if is_rank0:
+            def _sm(xs: list[float]) -> tuple[float, float, float, float]:
+                s = sorted(xs)
+                n = len(s)
+                med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+                p10 = s[max(0, int(0.1 * (n - 1)))]
+                p90 = s[min(n - 1, int(0.9 * (n - 1)))]
+                return med, p10, p90, sum(s) / n
+            n = len(buf["sample"])
+            total = [a + b + c for a, b, c in
+                     zip(buf["sample"], buf["h2d"], buf["fwd"])]
+            rows = [
+                ("mask_sample(CPU)", buf["sample"]),
+                ("mask_h2d", buf["h2d"]),
+                ("forward", buf["fwd"]),
+                ("step sum(3)", total),
+            ]
+            print(f"\n[V14_MASK_TIMING v2] median/p10/p90/mean ms over {n} steps:")
+            for name, xs in rows:
+                med, p10, p90, mean = _sm(xs)
+                print(f"  {name:18s} med={med:8.2f} p10={p10:8.2f} "
+                      f"p90={p90:8.2f} mean={mean:8.2f}")
+        for k in buf:
+            buf[k].clear()
 
     def training_step(self, batch: tp.Any, batch_idx: int) -> Tensor:  # noqa: ARG002
+        # Host-gap split (V14_STEP_TIMING): data_wait = gap since the prior step
+        # ended (dataloader wait + between-step host work); compute = in-step
+        # fwd/bwd-dispatch (a cuda.sync makes it real GPU wall). step_time_s =
+        # data_wait + compute ⇒ median sec/step on wandb. Armed only.
+        st = self._step_timing
+        if st:
+            now = time.perf_counter()
+            data_wait = (
+                now - self._last_batch_end_time
+                if self._last_batch_end_time is not None else 0.0
+            )
+            t0 = now
         out = self._step(batch.data)
         self._log_losses(out, "train", on_step=True, on_epoch=False)
+        if st:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end = time.perf_counter()
+            compute = end - t0
+            self.log("step_time_s", data_wait + compute, on_step=True, on_epoch=False)
+            self.log("data_wait_s", data_wait, on_step=True, on_epoch=False)
+            self.log("compute_s", compute, on_step=True, on_epoch=False)
+            self._last_batch_end_time = end
         return out["loss"]
 
     def validation_step(self, batch: tp.Any, batch_idx: int) -> None:  # noqa: ARG002

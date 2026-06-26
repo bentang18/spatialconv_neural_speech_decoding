@@ -142,6 +142,29 @@ def test_step_1s_clip():
     assert torch.isfinite(out["loss"])
 
 
+def test_mask_timing_probe_finite_and_flushes(monkeypatch):
+    """V14_MASK_TIMING arms the kineto-free per-section probe without breaking the
+    loss path: finite loss every step, and the buffer flushes (clears) once the
+    step count hits the cadence."""
+    monkeypatch.setenv("V14_MASK_TIMING", "2")
+    m = _module()
+    m.train()
+    assert m._mask_timing_every == 2
+    for _ in range(2):
+        out = m._step(_batch(B=2).data)
+        assert torch.isfinite(out["loss"])
+    assert all(len(v) == 0 for v in m._mask_timing_buf.values())  # flushed at cadence
+
+
+def test_mask_timing_off_by_default():
+    """No env ⇒ zero overhead: the probe never arms and the buffer stays empty."""
+    m = _module()
+    m.train()
+    assert m._mask_timing_every == 0 and m._step_timing is False
+    m._step(_batch(B=2).data)
+    assert all(len(v) == 0 for v in m._mask_timing_buf.values())
+
+
 def test_grad_flows_to_student_not_teacher():
     m = _module()
     m._step(_batch(B=2).data)["loss"].backward()
