@@ -188,6 +188,28 @@ STFT_3BAND_HG: dict[str, float] = {
     "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 192.0,
 }
 
+# ---------------------------------------------------------------------------
+# 2-band Chang-grounded MAGNITUDE front end (converged-arch-v2, 2026-06-26;
+# memory project_frontend_chang_2band_hga_lfs_2026_06_25). HGA + LFS, magnitude
+# only — NO phase, NO separate beta. Bins DERIVED via _stft_band_k_range at
+# fs=2048 (no hand-typed k that can drift):
+#   LFS  N=1024 hop=512  Δf=2 Hz   2–56 Hz  → k1..k28 = 28 bins
+#   HGA  N=128  hop=64   Δf=16 Hz  64–160 Hz → k4..k10 = 7  bins
+# HGA capped at 160 (sheds the 180 Hz harmonic; 60/120/180 already notched in
+# the feature path via _notch_filter). Both default band_channelization="mag"
+# (in_ch=1). DISTINCT from the provisional STFT_2BAND_LOW/HIGH (those are
+# 512/14-bin LOW + 128/64-192 HIGH; this is a finer 1024/28-bin LFS + a
+# 160-capped HGA, both magnitude). Per-electrode token geometry (post-stem,
+# tk=2): HGA 16/1s 80/5s (1 freq-patch); LFS 6/1s 30/5s (3 log freq-patches ×
+# 2/10 time-tokens) ⇒ 22/1s, 110/5s total — asserted at the stem (P2.1).
+# ---------------------------------------------------------------------------
+STFT_2BAND_LFS: dict[str, float] = {
+    "band_nperseg": 1024, "band_hop": 512, "band_f_lo_hz": 2.0, "band_f_hi_hz": 56.0,
+}
+STFT_2BAND_HGA: dict[str, float] = {
+    "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
+}
+
 # Canonical winsor-band tag, keyed by the band's defining ``band_nperseg``. Used
 # ONLY to select a per-band ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (the
 # three bands' |z| distributions differ, so one scalar cap mis-clamps two of them).

@@ -582,6 +582,50 @@ def test_multi_stft_view_n_time_bins_for_duration_maps_to_t_p_40_and_8() -> None
     assert stem.n_time_patches(16) == 8
 
 
+def test_2band_v2_magnitude_config_bin_and_frame_contract() -> None:
+    """Converged-arch-v2 frontend CONTRACT GATE (P1.1, premortem landmine #2).
+
+    The Chang-grounded 2-band magnitude config must derive EXACTLY:
+      LFS  2–56 Hz @ N=1024 → k1..k28 = 28 bins,  hop=512 → 5/21 frames (1/5 s)
+      HGA 64–160 Hz @ N=128 → k4..k10 =  7 bins,  hop=64  → 33/161 frames
+    via the real MultiStftView band path the cache bakes from. Magnitude
+    (in_ch=1) ⇒ _expected_raw_f_bins == n_bins (no Re/Im doubling). Pins this
+    BEFORE any cache build so an off-by-one in bins/edges/frames can't bake the
+    whole cache wrong. Token totals (22/1s, 110/5s) are stem-dependent → P2.1."""
+    from speech_decoding.extractors.view import (
+        STFT_2BAND_FS_HZ,
+        STFT_2BAND_HGA,
+        STFT_2BAND_LFS,
+        MultiStftView,
+        _stft_band_k_range,
+    )
+
+    # (1) bin selector = single source of truth (no hand-typed k)
+    assert _stft_band_k_range(2.0, 56.0, nperseg=1024) == (1, 28)
+    assert _stft_band_k_range(64.0, 160.0, nperseg=128) == (4, 10)
+
+    # (2) real band-view path used by the cache
+    lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
+    assert lfs._band_bins() == (1, 28)
+    assert lfs._expected_raw_f_bins() == 28  # magnitude — NOT 2×28
+    assert lfs.band_channelization == "mag"
+    assert lfs.n_time_bins_for_duration(1.0) == 5
+    assert lfs.n_time_bins_for_duration(5.0) == 21
+
+    hga = MultiStftView(front_end="band", hop_length=64, **STFT_2BAND_HGA)
+    assert hga._band_bins() == (4, 10)
+    assert hga._expected_raw_f_bins() == 7
+    assert hga.band_channelization == "mag"
+    assert hga.n_time_bins_for_duration(1.0) == 33
+    assert hga.n_time_bins_for_duration(5.0) == 161
+
+    # (3) edge center freqs land exactly on the physical band edges
+    df_lfs = STFT_2BAND_FS_HZ / 1024
+    df_hga = STFT_2BAND_FS_HZ / 128
+    assert (1 * df_lfs, 28 * df_lfs) == (2.0, 56.0)
+    assert (4 * df_hga, 10 * df_hga) == (64.0, 160.0)
+
+
 def test_log_stft_view_n_time_bins_for_duration_matches_17_at_1s() -> None:
     """The sister single-STFT view (hop = nperseg·(1−poverlap) = 128 @ 2048 Hz)
     emits 17 frames for a 1-s window — the historical ``DEFAULT_N_TIME_BINS``."""
