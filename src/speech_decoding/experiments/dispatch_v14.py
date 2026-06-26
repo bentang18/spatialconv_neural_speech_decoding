@@ -3072,9 +3072,9 @@ def _parser() -> argparse.ArgumentParser:
     # scalar for that band only — same cache-neutral env mechanism. Preliminary
     # caps are tuned per-band on the rebuilt 3STFT cache (Ben locks finals);
     # default None = fall back to --session-z-winsor for that band.
-    for _b in ("slow", "beta", "hg"):
+    for _b in ("slow", "beta", "hg", "lfs", "hga"):
         p.add_argument(f"--session-z-winsor-{_b}", type=float, default=None,
-                       help=f"Per-band winsor cap for the {_b} 3STFT band "
+                       help=f"Per-band winsor cap for the {_b} band "
                             f"(sets V14_SESSION_Z_WINSOR_{_b.upper()}); overrides "
                             f"--session-z-winsor for {_b} only. Default None.")
     p.add_argument("--dry-run", action="store_true",
@@ -4457,7 +4457,7 @@ def main(argv: list[str] | None = None) -> int:
     # Per-band winsor caps (#230): same front-door pattern, one env knob per band.
     # A band-specific cap wins over the global scalar for that band only; set/pop
     # explicitly so a warm worker never inherits a prior run's per-band value.
-    for _b in ("slow", "beta", "hg"):
+    for _b in ("slow", "beta", "hg", "lfs", "hga"):
         _cap = getattr(args, f"session_z_winsor_{_b}")
         _env = f"V14_SESSION_Z_WINSOR_{_b.upper()}"
         if _cap is not None:

@@ -210,17 +210,37 @@ STFT_2BAND_HGA: dict[str, float] = {
     "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
 }
 
-# Canonical winsor-band tag, keyed by the band's defining ``band_nperseg``. Used
-# ONLY to select a per-band ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (the
-# three bands' |z| distributions differ, so one scalar cap mis-clamps two of them).
-# Derived from ``band_nperseg`` — already a cache-key field — so it adds NO pydantic
-# field and never perturbs ``infra.uid()``; the per-band winsor stays cache-neutral.
-# 2STFT-HIGH shares HG's 128-sample window, so it also reads the HG cap when set;
-# 2STFT-LOW (512) has no per-band tag and falls back to the global scalar.
-_WINSOR_BAND_TAG: dict[int, str] = {
-    int(STFT_3BAND_SLOW["band_nperseg"]): "slow",
-    int(STFT_3BAND_BETA["band_nperseg"]): "beta",
-    int(STFT_3BAND_HG["band_nperseg"]): "hg",
+# Canonical winsor-band tag. Used ONLY to select a per-band
+# ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (each band's |z| distribution
+# differs, so one scalar cap mis-clamps the others).
+#
+# Keyed by ``(band_nperseg, band_channelization, round(band_f_hi_hz))`` — three
+# EXISTING cache-key fields, so the tag adds NO pydantic field and never perturbs
+# ``infra.uid()``; the per-band winsor stays cache-neutral. ``band_nperseg`` ALONE
+# collides across frontends: 2-band LFS (1024) aliases 3STFT SLOW, and 2-band HGA
+# (128) aliases 3STFT HG. Channelization separates LFS(mag) from SLOW(cartesian);
+# ``f_hi`` separates HGA(160) from HG(192). All five bands are then distinct.
+_DEFAULT_BAND_CHANNELIZATION = "mag"  # == MultiStftView.band_channelization default
+
+
+def _winsor_tag_key(nperseg, channelization, f_hi_hz) -> tuple[int, str, int]:
+    return (int(nperseg), str(channelization), int(round(float(f_hi_hz))))
+
+
+def _band_tag_key(band: dict) -> tuple[int, str, int]:
+    return _winsor_tag_key(
+        band["band_nperseg"],
+        band.get("band_channelization", _DEFAULT_BAND_CHANNELIZATION),
+        band["band_f_hi_hz"],
+    )
+
+
+_WINSOR_BAND_TAG: dict[tuple[int, str, int], str] = {
+    _band_tag_key(STFT_3BAND_SLOW): "slow",
+    _band_tag_key(STFT_3BAND_BETA): "beta",
+    _band_tag_key(STFT_3BAND_HG): "hg",
+    _band_tag_key(STFT_2BAND_LFS): "lfs",
+    _band_tag_key(STFT_2BAND_HGA): "hga",
 }
 
 
@@ -1218,12 +1238,17 @@ class MultiStftView(CARIeegExtractor):
         return self.band_nperseg if self.front_end == "band" else self.nperseg_low
 
     def _winsor_band_name(self) -> tp.Optional[str]:
-        """Canonical band tag (``"slow"``/``"beta"``/``"hg"``) for the per-band
-        winsor cap, or ``None`` (→ global scalar cap) for non-3STFT bands. Keyed
-        off ``band_nperseg`` so it is cache-neutral (no new cache-key field)."""
+        """Canonical band tag (``slow``/``beta``/``hg``/``lfs``/``hga``) for the
+        per-band winsor cap, or ``None`` (→ global scalar cap) for non-band views.
+        Keyed off ``(band_nperseg, band_channelization, f_hi)`` — all existing
+        cache-key fields — so it is cache-neutral (no new cache-key field)."""
         if self.front_end != "band":
             return None
-        return _WINSOR_BAND_TAG.get(int(self.band_nperseg))
+        return _WINSOR_BAND_TAG.get(
+            _winsor_tag_key(
+                self.band_nperseg, self.band_channelization, self.band_f_hi_hz
+            )
+        )
 
     def _band_bins(self) -> tuple[int, int]:
         """Inclusive rfft-bin slice ``(k0, k1)`` for this view's band, derived

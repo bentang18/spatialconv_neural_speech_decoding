@@ -23,9 +23,12 @@ import torch
 
 from speech_decoding.extractors.normalize import SCALE_TO_SIGMA
 from speech_decoding.extractors.view import (
+    STFT_2BAND_HGA,
+    STFT_2BAND_LFS,
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
+    _WINSOR_BAND_TAG,
     MultiStftView,
     _single_stft_raw_view,
     _single_stft_raw_view_chunked,
@@ -224,15 +227,40 @@ def test_cartesian_validators() -> None:
 
 # ------------------------------------------------------- per-band winsor tag
 def test_winsor_band_name_per_band() -> None:
-    """Each 3STFT view reports its canonical winsor-band tag (keyed off
-    band_nperseg); a non-band (raw) view has no tag → global scalar cap."""
+    """Each band view reports its canonical winsor-band tag, keyed off
+    ``(band_nperseg, band_channelization, f_hi)``; a non-band (raw) view has no
+    tag → global scalar cap."""
     slow = MultiStftView(front_end="band", hop_length=512, **STFT_3BAND_SLOW)
     beta = MultiStftView(front_end="band", hop_length=128, **STFT_3BAND_BETA)
     hg = MultiStftView(front_end="band", hop_length=64, **STFT_3BAND_HG)
+    lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
+    hga = MultiStftView(front_end="band", hop_length=64, **STFT_2BAND_HGA)
     assert slow._winsor_band_name() == "slow"
     assert beta._winsor_band_name() == "beta"
     assert hg._winsor_band_name() == "hg"
+    assert lfs._winsor_band_name() == "lfs"
+    assert hga._winsor_band_name() == "hga"
     assert MultiStftView(front_end="raw")._winsor_band_name() is None
+
+
+def test_winsor_band_tags_do_not_collide() -> None:
+    """The five physical bands must map to five DISTINCT tags. ``band_nperseg``
+    alone collides (2-band LFS 1024 == 3STFT SLOW; HGA 128 == HG); the
+    ``(nperseg, channelization, f_hi)`` key separates them. Guard against a future
+    band whose tuple aliases an existing band — that would silently clamp the
+    wrong band's training signal."""
+    tags = list(_WINSOR_BAND_TAG.values())
+    assert sorted(tags) == ["beta", "hg", "hga", "lfs", "slow"]
+    assert len(_WINSOR_BAND_TAG) == len(set(_WINSOR_BAND_TAG)) == 5
+    # The two real-world nperseg aliases resolve to different tags via the tuple.
+    lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
+    slow = MultiStftView(front_end="band", hop_length=512, **STFT_3BAND_SLOW)
+    assert lfs.band_nperseg == slow.band_nperseg == 1024
+    assert lfs._winsor_band_name() != slow._winsor_band_name()
+    hga = MultiStftView(front_end="band", hop_length=64, **STFT_2BAND_HGA)
+    hg = MultiStftView(front_end="band", hop_length=64, **STFT_3BAND_HG)
+    assert hga.band_nperseg == hg.band_nperseg == 128
+    assert hga._winsor_band_name() != hg._winsor_band_name()
 
 
 def test_winsor_band_tag_is_cache_neutral() -> None:
