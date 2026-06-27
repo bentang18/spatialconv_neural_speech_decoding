@@ -1319,6 +1319,43 @@ class V14ConvergedV2(nn.Module):
         return out
 
     @torch.no_grad()
+    def encode_clip_taps(
+        self,
+        lfs: Tensor,                  # (B, C, 28, T_lfs)  |STFT|, robust-z'd
+        hga: Tensor,                  # (B, C, 7,  T_hga)
+        parcel_of_electrode: Tensor,  # (C,) long  DKT label per electrode
+        *,
+        clip_len_s: float,
+        use_teacher: bool = False,
+    ) -> dict[str, Tensor]:
+        """Clean, mask-free clip encoding for the offline dev linear probe.
+
+        The student (or EMA-teacher) towers run over the FULL token grid with NO M2/M4
+        mask — i.e. exactly the teacher path of :meth:`forward` (the lines that build
+        ``t_front`` / ``t_seeds`` / ``t_latent``), which is the only mask-free encode in
+        the module. Returns the per-electrode frontend tap ``(B,C,S,d)`` and the
+        per-parcel latent tap ``(B,P,k,S,d)``, plus the session layout
+        (``labels`` ``(P,)`` / ``membership`` ``(P,C)`` / ``parcel_idx`` ``(C,)``) the
+        probe needs to pool electrodes→parcels and pick present parcels. No loss, no
+        grad — purely for probing a trained checkpoint."""
+        bands = bands_for_clip_len(clip_len_s, base=self.base_bands)
+        lay = self.session_layout(parcel_of_electrode, bands)
+        fe = self.teacher_frontend if use_teacher else self.frontend
+        pool = self.teacher_pool if use_teacher else self.pool
+        lat = self.teacher_latent if use_teacher else self.latent
+        tok = fe.tokenizer(lfs, hga)                              # (B,C,S,d)
+        front = fe.encode_tokens(tok, lay.freq_id, lay.slot)     # (B,C,S,d)
+        seeds = pool(front, lay.membership, lay.labels, lay.cell_patch)  # (B,P,k,S,d)
+        latent = lat(seeds, lay.labels, lay.slot)                # (B,P,k,S,d)
+        return {
+            "frontend": front,
+            "latent": latent,
+            "labels": lay.labels,
+            "membership": lay.membership,
+            "parcel_idx": lay.parcel_idx,
+        }
+
+    @torch.no_grad()
     def ema_step(self) -> None:
         """Advance the EMA teacher one step (call AFTER the optimizer step)."""
         ema_update(self.teacher_frontend, self.frontend, self.cfg.ema_tau)

@@ -127,13 +127,16 @@ def raw_ws_cs_auroc(
     tasks: Sequence[str],
     n_parcels: int,
     max_iter: int = 10000,
+    tap: str = "raw",
 ) -> dict[str, float]:
     """WS (per-electrode) + CS (parcel-pool) logistic AUROC over all tasks.
 
-    ``raw[s]`` is subject ``s``'s ``(N,C,D_raw,1)`` raw bins; ``sd[s]`` carries
-    ``parcel_per_electrode`` / ``electrode_mask`` / ``labels``. Emits the same
-    ``val_probe/raw/{ws,cs,gap}/{task}`` names the trained taps use, so the floor
-    drops straight onto a run's ``val_probe/latent/...`` lines."""
+    ``raw[s]`` is subject ``s``'s ``(N,C,D,1)`` per-electrode feature bins; ``sd[s]``
+    carries ``parcel_per_electrode`` / ``electrode_mask`` / ``labels``. ``tap`` names
+    the metric family (``raw`` for the input floor; reused by the bench with
+    ``tap="frontend"`` on the frontend tap reshaped to ``(N,C,S·d,1)``). Emits
+    ``val_probe/{tap}/{ws,cs,gap}/{task}`` so the floor and the trained taps share the
+    metric namespace and drop straight onto a run's ``val_probe/...`` lines."""
     a = cs_anchor
     pooled_cs: dict[int, tuple[Tensor, Tensor]] = {
         s: pool_electrodes_to_parcels(
@@ -170,9 +173,9 @@ def raw_ws_cs_auroc(
             cs_vals.append(cs_auroc_logistic(za, ya, zt, yt, max_iter=max_iter))
         cs_mean = float(np.nanmean(cs_vals)) if cs_vals else float("nan")
 
-        metrics[f"val_probe/raw/ws/{task}"] = ws_mean
-        metrics[f"val_probe/raw/cs/{task}"] = cs_mean
-        metrics[f"val_probe/raw/gap/{task}"] = ws_mean - cs_mean
+        metrics[f"val_probe/{tap}/ws/{task}"] = ws_mean
+        metrics[f"val_probe/{tap}/cs/{task}"] = cs_mean
+        metrics[f"val_probe/{tap}/gap/{task}"] = ws_mean - cs_mean
     return metrics
 
 

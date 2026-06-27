@@ -3111,6 +3111,21 @@ def _parser() -> argparse.ArgumentParser:
                         "the head-to-head (piece 3). Default all three. 'raw,frontend' "
                         "skips the expensive latent forward; 'raw' never touches the "
                         "model.")
+    # v2 dev probe-bench (v2_probe_bench.run_v2_probe_bench). Raw |STFT| floor always;
+    # frontend/latent encoder taps only when --v2-probe-bench-ckpt is given. Reuses the
+    # run's xp (same data chain / model config). No trainer; 1 GPU (CPU if no ckpt).
+    p.add_argument("--v2-probe-bench-out", type=str, default=None,
+                   help="Run the converged-v2 dev probe bench (raw floor + encoder "
+                        "taps when --v2-probe-bench-ckpt is set), write metrics JSON "
+                        "here, then exit. Pair with --frontend 2band + the v2 shape "
+                        "flags so the probe dataset/model match the run.")
+    p.add_argument("--v2-probe-bench-ckpt", type=str, default=None,
+                   help="Optional v2 Lightning ckpt; when set, the frontend/latent "
+                        "taps are scored head-to-head against raw. Omit to run the "
+                        "model-free raw floor only (testable before any ckpt exists).")
+    p.add_argument("--v2-probe-bench-max-iter", type=int, default=2000,
+                   help="lbfgs max_iter for the v2 probe logistic fits (same cap per "
+                        "tap so raw<->encoder stay comparable). Default 2000.")
     # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
     # run_gns_probe). Builds the real converged module + group_by_session loader,
     # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
@@ -5022,6 +5037,17 @@ def main(argv: list[str] | None = None) -> int:
             do_ridge="ridge" in _pieces, do_headtohead="headtohead" in _pieces,
             do_band_ablation="bandablation" in _pieces,
             taps=_taps,
+        )
+        return 0
+    if args.v2_probe_bench_out is not None:
+        # Converged-v2 dev probe bench: raw |STFT| floor (model-free) + frontend/latent
+        # encoder taps when a ckpt is given. xp is built exactly as the run, so the 1 s
+        # probe dataset + 5s->1s model load are byte-faithful. No trainer.
+        from speech_decoding.experiments.v2_probe_bench import run_v2_probe_bench
+
+        run_v2_probe_bench(
+            xp, out_path=args.v2_probe_bench_out, ckpt_path=args.v2_probe_bench_ckpt,
+            clip_len_s=1.0, max_iter=args.v2_probe_bench_max_iter,
         )
         return 0
     if args.gns_probe:
