@@ -3126,6 +3126,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--v2-probe-bench-max-iter", type=int, default=2000,
                    help="lbfgs max_iter for the v2 probe logistic fits (same cap per "
                         "tap so raw<->encoder stay comparable). Default 2000.")
+    p.add_argument("--v2-probe-bench-n-cap", type=int, default=None,
+                   help="Windows/subject for the v2 probe dataset (default N_CAP=3500). "
+                        "Lower it for a light smoke (e.g. 200) on a shared/login node.")
     # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
     # run_gns_probe). Builds the real converged module + group_by_session loader,
     # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
@@ -5043,11 +5046,13 @@ def main(argv: list[str] | None = None) -> int:
         # Converged-v2 dev probe bench: raw |STFT| floor (model-free) + frontend/latent
         # encoder taps when a ckpt is given. xp is built exactly as the run, so the 1 s
         # probe dataset + 5s->1s model load are byte-faithful. No trainer.
+        from speech_decoding.experiments.online_probe_dataset import N_CAP
         from speech_decoding.experiments.v2_probe_bench import run_v2_probe_bench
 
         run_v2_probe_bench(
             xp, out_path=args.v2_probe_bench_out, ckpt_path=args.v2_probe_bench_ckpt,
             clip_len_s=1.0, max_iter=args.v2_probe_bench_max_iter,
+            n_cap=args.v2_probe_bench_n_cap or N_CAP,
         )
         return 0
     if args.gns_probe:
