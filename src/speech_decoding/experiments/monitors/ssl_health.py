@@ -40,8 +40,10 @@ from speech_decoding.experiments.monitors.teacher_rank import teacher_rank_monit
 from speech_decoding.models.v14_converged_v2 import _ln_target
 
 # Routing groups for the true_update_ratio readback (v2 sub-modules).
+# ``m3_predictor`` is None in legacy mode — both consumers below skip absent
+# modules so the group is a no-op there and live only under Run-A.
 _ROUTING_GROUPS: tuple[str, ...] = (
-    "frontend", "latent", "m2_predictor", "m4_predictor",
+    "frontend", "latent", "m2_predictor", "m3_predictor", "m4_predictor",
 )
 
 # EMA student/teacher towers for ema_weight_gap. v2 has THREE EMA towers; the
@@ -187,9 +189,10 @@ class SSLHealthMonitor(pl.Callback):
         if snap is not None:
             for group in _ROUTING_GROUPS:
                 prev = snap.get(group)
-                if prev is None:
+                mod = getattr(pl_module.model, group, None)
+                if prev is None or mod is None:
                     continue
-                now = list(getattr(pl_module.model, group).parameters())
+                now = list(mod.parameters())
                 delta_sq = torch.zeros((), dtype=torch.float32)
                 base_sq = torch.zeros((), dtype=torch.float32)
                 for p_now, p_prev in zip(now, prev):
@@ -212,6 +215,7 @@ class SSLHealthMonitor(pl.Callback):
                     for p in getattr(pl_module.model, group).parameters()
                 ]
                 for group in _ROUTING_GROUPS
+                if getattr(pl_module.model, group, None) is not None
             }
 
     # ------------------------------------------------- Family B + input-stats
