@@ -54,6 +54,16 @@ class V14ConvergedV2Net(BaseModelConfig):
     tie_lfs: bool = True
     ema_tau: float = 0.9992
 
+    # --- Run-A bundle (default LEGACY for checkpoint resume) ----------------
+    # ``m3_pred_layers`` is the master switch: set it (e.g. 6) ⇒ the Run-A
+    # architecture (M3 pool-inpaint head + pool LayerNorm + tubed-only M4 +
+    # per-head loss). None ⇒ legacy assembly resumes byte-identical.
+    m3_pred_layers: int | None = None
+    qk_norm: bool = False
+    w_m2: float = 1.0
+    w_m3: float = 1.0
+    w_m4: float = 1.0
+
     def build(self, n_in_channels: int, n_outputs: int) -> nn.Module:  # noqa: ARG002
         return V14ConvergedV2(
             V14ConvergedV2Config(
@@ -69,6 +79,11 @@ class V14ConvergedV2Net(BaseModelConfig):
                 tube_ratio=self.tube_ratio,
                 tie_lfs=self.tie_lfs,
                 ema_tau=self.ema_tau,
+                m3_pred_layers=self.m3_pred_layers,
+                qk_norm=self.qk_norm,
+                w_m2=self.w_m2,
+                w_m3=self.w_m3,
+                w_m4=self.w_m4,
             )
         )
 

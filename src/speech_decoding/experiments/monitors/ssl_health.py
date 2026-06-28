@@ -44,6 +44,11 @@ _ROUTING_GROUPS: tuple[str, ...] = (
     "frontend", "latent", "m2_predictor", "m4_predictor",
 )
 
+# EMA student/teacher towers for ema_weight_gap. v2 has THREE EMA towers; the
+# pool/latent pair is the one whose target path can collapse (the frontend gap
+# alone — the legacy single metric — can't see it).
+_EMA_TOWERS: tuple[str, ...] = ("frontend", "pool", "latent")
+
 _STATS_EPS: float = 1e-8
 
 
@@ -90,10 +95,18 @@ class SSLHealthMonitor(pl.Callback):
         pl_module.log(
             "train_mon_grad_spike", 1.0 if verdict.is_spike else 0.0, on_step=True
         )
-        # ema_weight_gap over the frontend EMA pair.
-        pl_module.log(
-            "train_mon_ema_weight_gap", self._ema_weight_gap(pl_module), on_step=True
-        )
+        # ema_weight_gap per EMA tower. The frontend keeps the legacy key for chart
+        # continuity; pool/latent expose the towers whose target path collapses.
+        for tower in _EMA_TOWERS:
+            gap = self._ema_weight_gap(pl_module, tower)
+            if gap is None:
+                continue
+            key = (
+                "train_mon_ema_weight_gap"
+                if tower == "frontend"
+                else f"train_mon_ema_weight_gap_{tower}"
+            )
+            pl_module.log(key, gap, on_step=True)
         # grad_noise_scale (critical-batch estimate) from AdamW's existing moments.
         self._grad_noise_scale(trainer, pl_module, optimizer)
 
@@ -147,14 +160,19 @@ class SSLHealthMonitor(pl.Callback):
         pl_module.log("train_mon_grad_noise_ratio", ratio, on_step=True)
         pl_module.log("train_mon_grad_noise_scale", ratio * b_eff, on_step=True)
 
-    def _ema_weight_gap(self, pl_module: pl.LightningModule) -> float:
-        """``‖θ_student − θ_teacher‖₂ / ‖θ_student‖₂`` over the frontend EMA pair."""
+    def _ema_weight_gap(
+        self, pl_module: pl.LightningModule, tower: str = "frontend"
+    ) -> float | None:
+        """``‖θ_student − θ_teacher‖₂ / ‖θ_student‖₂`` over the named EMA tower's
+        student/teacher pair (``<tower>`` vs ``teacher_<tower>``). Returns ``None``
+        when the model lacks that tower (e.g. a model with no ``teacher_pool``)."""
+        student = getattr(pl_module.model, tower, None)
+        teacher = getattr(pl_module.model, f"teacher_{tower}", None)
+        if student is None or teacher is None:
+            return None
         num = torch.zeros((), dtype=torch.float32)
         den = torch.zeros((), dtype=torch.float32)
-        for ps, pt in zip(
-            pl_module.model.frontend.parameters(),
-            pl_module.model.teacher_frontend.parameters(),
-        ):
+        for ps, pt in zip(student.parameters(), teacher.parameters()):
             s = ps.detach().to(torch.float32)
             num = num + (s - pt.detach().to(torch.float32)).pow(2).sum()
             den = den + s.pow(2).sum()
@@ -265,9 +283,19 @@ class SSLHealthMonitor(pl.Callback):
         latent = taps.get("_tap_student_latent")
         if isinstance(latent, Tensor):
             self._rank_and_std(pl_module, latent, key="")
-        # explained_var + pred_target_var_ratio for M2 / M4 (LN-normalised target).
-        self._jepa_stats(pl_module, taps, "_tap_m2_pred", "_tap_m2_target", "m2")
-        self._jepa_stats(pl_module, taps, "_tap_m4_pred", "_tap_m4_target", "m4")
+        # Run-A only: rankme + feat_std on the teacher-pool tap (the M3 target).
+        pool = taps.get("_tap_teacher_pool")
+        if isinstance(pool, Tensor):
+            self._rank_and_std(pl_module, pool, key="pool_")
+        # explained_var + pred_target_var_ratio per head. Run-A regresses RAW
+        # targets (no _ln_target) — the model flags this via ``_tap_raw_targets``
+        # so the metric matches the loss. The M3 tap is absent in legacy mode ⇒
+        # _jepa_stats returns early (no-op).
+        rt = taps.get("_tap_raw_targets")
+        raw = bool(rt.item()) if isinstance(rt, Tensor) else False
+        self._jepa_stats(pl_module, taps, "_tap_m2_pred", "_tap_m2_target", "m2", raw)
+        self._jepa_stats(pl_module, taps, "_tap_m3_pred", "_tap_m3_target", "m3", raw)
+        self._jepa_stats(pl_module, taps, "_tap_m4_pred", "_tap_m4_target", "m4", raw)
 
     def _rank_and_std(
         self, pl_module: pl.LightningModule, tap: Tensor, *, key: str
@@ -286,18 +314,21 @@ class SSLHealthMonitor(pl.Callback):
 
     def _jepa_stats(
         self, pl_module: pl.LightningModule, taps: dict[str, Tensor],
-        pred_key: str, target_key: str, head: str,
+        pred_key: str, target_key: str, head: str, raw_targets: bool = False,
     ) -> None:
-        """``explained_var = 1 − Var(target_ln − pred) / Var(target_ln)`` and
-        ``pred_target_var_ratio = Var(pred) / Var(target_ln)`` on the LN-normalised
-        target (matching the loss's ``_ln_target``). Variance is the mean of the
-        per-dim variances over the flattened (Q, d) rows (3STFT convention)."""
+        """``explained_var = 1 − Var(target − pred) / Var(target)`` and
+        ``pred_target_var_ratio = Var(pred) / Var(target)``. The target is
+        LN-normalised (legacy shared-denom loss uses ``_ln_target``) UNLESS
+        ``raw_targets`` (Run-A per-head loss regresses raw post-``ln_out``
+        targets) — keeping the metric consistent with the loss either way.
+        Variance is the mean of the per-dim variances over the (Q, d) rows."""
         pred = taps.get(pred_key)
         target = taps.get(target_key)
         if not isinstance(pred, Tensor) or not isinstance(target, Tensor):
             return
         p = pred.detach().to(torch.float32)
-        t = _ln_target(target.detach().to(torch.float32))
+        td = target.detach().to(torch.float32)
+        t = td if raw_targets else _ln_target(td)
         if p.shape[0] < 2:
             return
         target_var = t.var(dim=0, unbiased=False).mean()

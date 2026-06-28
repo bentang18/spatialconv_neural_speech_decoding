@@ -365,7 +365,7 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
     no-RoPE variant — categorical freq embedding carries identity there.
     """
 
-    def __init__(self, d_model: int, n_heads: int) -> None:
+    def __init__(self, d_model: int, n_heads: int, *, qk_norm: bool = False) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
@@ -374,6 +374,24 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
+        # QK-norm (Wortsman 2023 / Gemma 2-3 / Qwen3): per-head RMSNorm over
+        # head_dim on Q,K BEFORE RoPE, bounding attention logits so bf16 matmuls
+        # can't run away (the gstep-1199 M2 spike). Default OFF → the pre-existing
+        # v14_converged model is byte-identical; v2 towers pass qk_norm=True.
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm_gain = nn.Parameter(torch.ones(self.head_dim))
+            self.k_norm_gain = nn.Parameter(torch.ones(self.head_dim))
+            self.qk_norm_eps = 1e-6
+
+    def _rms_qk(self, x: Tensor, gain: Tensor) -> Tensor:
+        # Per-head RMSNorm over head_dim, computed in fp32 then cast back (the
+        # canonical norm dtype; the downstream SDPA still runs bf16). x is
+        # (B, H, T, head_dim); gain is (head_dim,).
+        dtype = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.qk_norm_eps)
+        return (xf * gain.float()).to(dtype)
 
     def forward(
         self, x: Tensor, rope: Tensor, *, key_mask: Optional[Tensor] = None,
@@ -398,6 +416,16 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
         # up (it operates on the second-to-last axis). After RoPE, leave the
         # tensors in (B, H, T, head_dim) — the shape SDPA expects.
         q_t = q.transpose(1, 2)                          # (B, H, T, head_dim)
+        k_t = k.transpose(1, 2)                          # (B, H, T, head_dim)
+        # QK-norm BEFORE RoPE (Wortsman 2023 / Gemma 2-3 / Qwen3 convention):
+        # per-head RMSNorm bounds the pre-softmax logit magnitude, fixing the
+        # bf16 attention-logit blow-up (gstep-1199 M2 spike). Per-head RMSNorm
+        # is rotation-invariant only up to its learned gain, so it must precede
+        # the RoPE rotation. Slicing the query rows commutes with the per-row
+        # norm, so the n_query path normalizes then slices.
+        if self.qk_norm:
+            q_t = self._rms_qk(q_t, self.q_norm_gain)
+            k_t = self._rms_qk(k_t, self.k_norm_gain)
         if n_query is None:
             q = _apply_rope(q_t, rope)
         else:
@@ -408,7 +436,7 @@ class _PlainMultiHeadSelfAttentionRoPE(nn.Module):
                 else rope[:, :, T - n_query :, :]         # per-row (2, B, T, hd)
             )
             q = _apply_rope(q_t, rope_q)                 # (B, H, n_query, head_dim)
-        k = _apply_rope(k.transpose(1, 2), rope)        # (B, H, T, head_dim)
+        k = _apply_rope(k_t, rope)                       # (B, H, T, head_dim)
         v = v.transpose(1, 2)                           # (B, H, T, head_dim)
         attn_mask = None
         if key_mask is not None:
@@ -648,10 +676,10 @@ class _JointTokenBlock(nn.Module):
     this scope.
     """
 
-    def __init__(self, d_model: int, n_heads: int) -> None:
+    def __init__(self, d_model: int, n_heads: int, *, qk_norm: bool = False) -> None:
         super().__init__()
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = _PlainMultiHeadSelfAttentionRoPE(d_model, n_heads)
+        self.attn = _PlainMultiHeadSelfAttentionRoPE(d_model, n_heads, qk_norm=qk_norm)
         self.ln_ffn = nn.LayerNorm(d_model)
         self.ffn = _ffn(d_model)
 

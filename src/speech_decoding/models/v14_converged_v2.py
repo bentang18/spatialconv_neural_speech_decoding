@@ -285,6 +285,7 @@ class FrontendEncoderV2(nn.Module):
         n_layers: int,
         *,
         bands: tuple[BandSpecV2, ...] = BANDS_V2,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -302,7 +303,7 @@ class FrontendEncoderV2(nn.Module):
         self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
 
         self.blocks = nn.ModuleList(
-            [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
+            [_JointTokenBlock(d_model, n_heads, qk_norm=qk_norm) for _ in range(n_layers)]
         )
         self.ln_out = nn.LayerNorm(d_model)
 
@@ -486,8 +487,19 @@ class StaticShapesV2:
 
     @property
     def m4_q(self) -> int:
-        # {tubed parcels: all S cells} ∪ {untubed: the n_mask masked cells}, ×k seeds.
+        # LEGACY M4 query count: {tubed parcels: all S cells} ∪ {untubed: the
+        # n_mask masked cells}, ×k seeds. (Run-A M4 is tubed-only ⇒ ``m4_q_tubed``.)
         return self.b * (self.n_tube * self.k * self.S + self.P_vis * self.k * self.n_mask)
+
+    @property
+    def m4_q_tubed(self) -> int:
+        # Run-A M4 query count: tubed parcels only, all S cells, ×k seeds.
+        return self.b * self.n_tube * self.k * self.S
+
+    @property
+    def m3_q(self) -> int:
+        # Run-A M3 query count: untubed parcels' n_mask M2-masked cells, ×k seeds.
+        return self.b * self.P_vis * self.k * self.n_mask
 
 
 def compute_static_shapes_v2(
@@ -619,6 +631,7 @@ class SetPoolV2(nn.Module):
         k: int = 2,
         n_parcels: int,
         n_op: int = 2,
+        ln_out: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -648,6 +661,10 @@ class SetPoolV2(nn.Module):
             nn.init.xavier_uniform_(self.W_V[o])
 
         self.out = nn.Linear(d_model, d_model, bias=False)
+        # Run-A: terminal LayerNorm so the pool output (the M3 target) is unit-
+        # scale, matching frontend/latent ``ln_out``. Default OFF ⇒ legacy pool
+        # (no LN) resumes byte-identical.
+        self.ln_out = nn.LayerNorm(d_model) if ln_out else None
 
     def forward(
         self,
@@ -692,6 +709,8 @@ class SetPoolV2(nn.Module):
         no_cov = ~mem_pk.any(dim=-1)                                # (Pk,)
         ctx = ctx.masked_fill(no_cov[None, :, None], 0.0)
         out = self.out(ctx)                                         # (BS, Pk, d)
+        if self.ln_out is not None:
+            out = self.ln_out(out)
         return out.reshape(B, S, P, k, d).permute(0, 2, 3, 1, 4)    # (B, P, k, S, d)
 
 
@@ -727,6 +746,7 @@ class LatentEncoderV2(nn.Module):
         n_parcels: int,
         *,
         ssl_bands: tuple[BandSpecV2, ...] | None = None,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -748,7 +768,7 @@ class LatentEncoderV2(nn.Module):
         self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
 
         self.blocks = nn.ModuleList(
-            [_JointTokenBlock(d_model, n_heads) for _ in range(n_layers)]
+            [_JointTokenBlock(d_model, n_heads, qk_norm=qk_norm) for _ in range(n_layers)]
         )
         self.ln_out = nn.LayerNorm(d_model)
 
@@ -829,6 +849,7 @@ class JepaPredictorV2(nn.Module):
         n_parcels: int | None = None,
         k: int | None = None,
         ssl_bands: tuple[BandSpecV2, ...] | None = None,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         if pred_dim % n_heads != 0:
@@ -859,7 +880,7 @@ class JepaPredictorV2(nn.Module):
         n_slots = _max_time_slot(ssl_bands) + 1
         self.register_buffer("key_rope", _rope_freqs(head_dim, n_slots), persistent=False)
         self.blocks = nn.ModuleList(
-            [_JointTokenBlock(pred_dim, n_heads) for _ in range(n_layers)]
+            [_JointTokenBlock(pred_dim, n_heads, qk_norm=qk_norm) for _ in range(n_layers)]
         )
         self.head = nn.Linear(pred_dim, d_model, bias=False)  # raw pred, NO LN
 
@@ -1003,6 +1024,57 @@ def converged_v2_loss(
     return diag
 
 
+def converged_v2_loss_per_head(
+    m2_pred: Tensor,
+    m2_target: Tensor,
+    m3_pred: Tensor,
+    m3_target: Tensor,
+    m4_pred: Tensor,
+    m4_target: Tensor,
+    *,
+    w_m2: float = 1.0,
+    w_m3: float = 1.0,
+    w_m4: float = 1.0,
+) -> dict[str, Tensor]:
+    """Run-A per-head JEPA loss (Ben 2026-06-27): three INDEPENDENT
+    self-normalized L1 means on RAW (detached) EMA targets, combined with
+    explicit weights (V-JEPA convention: equal). NO target LayerNorm (the pool/
+    frontend/latent already end in ``ln_out``), NO shared denominator, NO
+    count-weighting::
+
+        L_m2 = |m2_pred − sg(t_front [masked])|.mean()   # mean over its OWN (Q×d)
+        L_m3 = |m3_pred − sg(t_seeds [masked])|.mean()   # pool output, masked cells
+        L_m4 = |m4_pred − sg(t_latent[tubed ])|.mean()   # tubed parcels
+        loss = w_m2·L_m2 + w_m3·L_m3 + w_m4·L_m4
+
+    Each ``.mean()`` divides by that head's own scalar count, so a head with few
+    queries isn't drowned by one with many — the per-head balance the shared
+    denominator lacked. All pred/target tensors are pre-flattened ``(Q, d)``."""
+    d = m2_pred.shape[-1]
+    for name, t in (("m3_pred", m3_pred), ("m4_pred", m4_pred)):
+        if t.shape[-1] != d:
+            raise ValueError(f"{name} feature dim {t.shape[-1]} != m2 dim {d}")
+
+    def _head(pred: Tensor, target: Tensor) -> Tensor:
+        if pred.numel() == 0:
+            return pred.new_zeros(())
+        return (pred - target.detach()).abs().mean()
+
+    l_m2 = _head(m2_pred, m2_target)
+    l_m3 = _head(m3_pred, m3_target)
+    l_m4 = _head(m4_pred, m4_target)
+    loss = w_m2 * l_m2 + w_m3 * l_m3 + w_m4 * l_m4
+    diag = {
+        "loss": loss,
+        "loss_m2": l_m2,
+        "loss_m3": l_m3,
+        "loss_m4": l_m4,
+    }
+    diag["ratio_m2_m4"] = l_m2 / l_m4.clamp_min(1e-12)
+    diag["ratio_m3_m4"] = l_m3 / l_m4.clamp_min(1e-12)
+    return diag
+
+
 def _select_idx(mask: Tensor, count: int) -> Tensor:
     """Positions of the first ``count`` True entries along the last axis, ascending.
 
@@ -1037,6 +1109,23 @@ class V14ConvergedV2Config:
     tube_ratio: float = 0.25
     tie_lfs: bool = True
     ema_tau: float = 0.9992
+    # --- Run-A bundle (all default to LEGACY behavior for checkpoint resume) ---
+    # ``m3_pred_layers`` is the master switch: set it (e.g. 6) to enable the Run-A
+    # architecture — the M3 pool-inpaint head, a terminal LayerNorm on the pool,
+    # M4 restricted to TUBED parcels only, and the per-head self-normalized loss
+    # (raw EMA targets). Left None ⇒ the legacy assembly resumes byte-identical
+    # (M4 = tubed∪untubed, shared-denominator ``_ln_target`` loss, no pool LN).
+    m3_pred_layers: int | None = None
+    qk_norm: bool = False
+    w_m2: float = 1.0
+    w_m3: float = 1.0
+    w_m4: float = 1.0
+
+    @property
+    def run_a(self) -> bool:
+        """True ⇒ the Run-A bundle is active (M3 + pool LN + tubed-only M4 +
+        per-head loss). Gated on the M3 head's presence."""
+        return self.m3_pred_layers is not None
 
 
 @dataclass(frozen=True)
@@ -1079,23 +1168,35 @@ class V14ConvergedV2(nn.Module):
         n_op = n_operators(cfg.tie_lfs)
 
         self.frontend = FrontendEncoderV2(
-            cfg.d_model, cfg.n_heads, cfg.frontend_layers, bands=self.ssl_bands
+            cfg.d_model, cfg.n_heads, cfg.frontend_layers, bands=self.ssl_bands,
+            qk_norm=cfg.qk_norm,
         )
         self.pool = SetPoolV2(
-            cfg.d_model, cfg.n_heads, k=cfg.k, n_parcels=cfg.n_parcels, n_op=n_op
+            cfg.d_model, cfg.n_heads, k=cfg.k, n_parcels=cfg.n_parcels, n_op=n_op,
+            ln_out=cfg.run_a,
         )
         self.latent = LatentEncoderV2(
             cfg.d_model, cfg.n_heads, cfg.latent_layers, cfg.n_parcels,
-            ssl_bands=self.ssl_bands,
+            ssl_bands=self.ssl_bands, qk_norm=cfg.qk_norm,
         )
         self.m2_predictor = JepaPredictorV2(
             cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m2_pred_layers,
-            ssl_bands=self.ssl_bands,
+            ssl_bands=self.ssl_bands, qk_norm=cfg.qk_norm,
         )
         self.m4_predictor = JepaPredictorV2(
             cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m4_pred_layers,
             n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
+            qk_norm=cfg.qk_norm,
         )
+        # Run-A: M3 pool-inpaint head (untubed parcels, M2-masked cells, pool
+        # target). Parcel- + seed-tagged like M4. None in legacy mode.
+        self.m3_predictor: JepaPredictorV2 | None = None
+        if cfg.m3_pred_layers is not None:
+            self.m3_predictor = JepaPredictorV2(
+                cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m3_pred_layers,
+                n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
+                qk_norm=cfg.qk_norm,
+            )
 
         # EMA teacher — frozen deep copies of the three target-side towers.
         self.teacher_frontend = copy.deepcopy(self.frontend)
@@ -1141,17 +1242,24 @@ class V14ConvergedV2(nn.Module):
 
     # -- M4 extended query set --------------------------------------------------
     def _m4_indices(
-        self, tube_mask: Tensor, m2_mask: Tensor, sh: StaticShapesV2
+        self,
+        tube_mask: Tensor,
+        m2_mask: Tensor,
+        sh: StaticShapesV2,
+        *,
+        tubed_only: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Build the M4 held-out query index set ``(pos, cell, seed, tubed)``.
 
-        Query set = {tubed parcels: ALL S cells} ∪ {untubed parcels: their n_mask
-        M2-masked cells}, ×k seeds. Flatten order = block (tubed‖untubed) then
-        parcel-major / seed-mid / cell-minor. ``pos`` is the P-axis position (for
-        the teacher gather + n_p weight), ``cell`` the S-axis position, ``seed`` the
-        seed id; ``tubed`` (Lq,) flags the cross-parcel block. The matching target
-        gather (``(pos·k+seed)·S+cell`` into the flattened teacher latent) is built
-        in :meth:`forward` from these — the alignment is proven by the oracle test."""
+        Legacy query set = {tubed parcels: ALL S cells} ∪ {untubed parcels: their
+        n_mask M2-masked cells}, ×k seeds. ``tubed_only=True`` (Run-A) drops the
+        untubed block — M4 then predicts ONLY the tubed parcels (the untubed
+        masked-cell inpaint moves to the M3 head). Flatten order = block
+        (tubed‖untubed) then parcel-major / seed-mid / cell-minor. ``pos`` is the
+        P-axis position, ``cell`` the S-axis position, ``seed`` the seed id;
+        ``tubed`` (Lq,) flags the cross-parcel block. The matching target gather
+        (``(pos·k+seed)·S+cell`` into the flattened teacher latent) is built in
+        :meth:`forward` — the alignment is proven by the oracle test."""
         B = tube_mask.shape[0]
         S, k = sh.S, sh.k
         n_tube, P_vis, n_mask = sh.n_tube, sh.P_vis, sh.n_mask
@@ -1160,15 +1268,24 @@ class V14ConvergedV2(nn.Module):
         arK = torch.arange(k, device=device)
 
         tube_idx = _select_idx(tube_mask, n_tube)                 # (B, n_tube)
-        untubed_idx = _select_idx(~tube_mask, P_vis)              # (B, P_vis)
-        pmask_idx = _select_idx(m2_mask, n_mask)                  # (B, P, n_mask)
 
         # tubed block (B, n_tube, k, S): all S cells of each tubed parcel.
         t_pos = tube_idx[:, :, None, None].expand(B, n_tube, k, S)
         t_cell = arS[None, None, None, :].expand(B, n_tube, k, S)
         t_seed = arK[None, None, :, None].expand(B, n_tube, k, S)
 
+        if tubed_only:
+            pos, cell, seed = (
+                t_pos.reshape(B, -1),
+                t_cell.reshape(B, -1),
+                t_seed.reshape(B, -1),
+            )
+            tubed = torch.ones(pos.shape[1], dtype=torch.bool, device=device)
+            return pos, cell, seed, tubed
+
         # untubed block (B, P_vis, k, n_mask): the parcel's own M2-masked cells.
+        untubed_idx = _select_idx(~tube_mask, P_vis)              # (B, P_vis)
+        pmask_idx = _select_idx(m2_mask, n_mask)                  # (B, P, n_mask)
         u_pos = untubed_idx[:, :, None, None].expand(B, P_vis, k, n_mask)
         u_cell_pp = torch.gather(
             pmask_idx, 1, untubed_idx[:, :, None].expand(B, P_vis, n_mask)
@@ -1187,6 +1304,33 @@ class V14ConvergedV2(nn.Module):
             ]
         )
         return pos, cell, seed, tubed
+
+    def _m3_indices(
+        self, tube_mask: Tensor, m2_mask: Tensor, sh: StaticShapesV2
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build the M3 held-out query index set ``(pos, cell, seed)`` — each
+        UNTUBED parcel's n_mask M2-masked cells, ×k seeds.
+
+        Identical structure to the legacy M4 untubed block, but M3 targets the
+        teacher POOL output ``t_seeds`` (not the latent). The untubed-parcel order
+        matches ``_select_idx(~tube_mask, P_vis)`` used to gather the M3 context
+        (``s_in``) in :meth:`forward`, so context parcel p ↔ query parcel p. The
+        target gather is ``(pos·k+seed)·S+cell`` into the flattened ``t_seeds``."""
+        B = tube_mask.shape[0]
+        S, k = sh.S, sh.k
+        P_vis, n_mask = sh.P_vis, sh.n_mask
+        device = tube_mask.device
+        arK = torch.arange(k, device=device)
+
+        untubed_idx = _select_idx(~tube_mask, P_vis)             # (B, P_vis)
+        pmask_idx = _select_idx(m2_mask, n_mask)                 # (B, P, n_mask)
+        u_pos = untubed_idx[:, :, None, None].expand(B, P_vis, k, n_mask)
+        u_cell_pp = torch.gather(
+            pmask_idx, 1, untubed_idx[:, :, None].expand(B, P_vis, n_mask)
+        )                                                        # (B, P_vis, n_mask)
+        u_cell = u_cell_pp[:, :, None, :].expand(B, P_vis, k, n_mask)
+        u_seed = arK[None, None, :, None].expand(B, P_vis, k, n_mask)
+        return u_pos.reshape(B, -1), u_cell.reshape(B, -1), u_seed.reshape(B, -1)
 
     # -- the SSL step -----------------------------------------------------------
     def forward(
@@ -1276,33 +1420,80 @@ class V14ConvergedV2(nn.Module):
         # === stage 6: latent self-attention over the gathered seeds ============
         s_latent = self.latent(s_in, None, lat_slot)                 # (B,P_vis,k,s_vis,d)
 
-        # === stage 7: M4 predictor (extended held-out query set) ===============
+        # === stage 7: M4 (+ Run-A M3) predictor(s) ============================
         ctx4 = s_latent.reshape(B, P_vis * k * s_vis, d)
         ctx4_slot = lat_slot
-        pos, cell, seed, tubed = self._m4_indices(tube_mask, m2_mask, sh)
-        q_parcel = labels[pos]                                       # (B,Lq) DKT label
-        q_freq = freq_id[cell]
-        q_slot = slot[cell]
-        m4_pred = self.m4_predictor(
-            ctx4, ctx4_slot, q_slot, q_freq, q_parcel=q_parcel, q_seed=seed
-        )                                                            # (B,Lq,d)
-        flat = (pos * k + seed) * S + cell                          # (B,Lq) into P·k·S
         t_latent_flat = t_latent.reshape(B, P * k * S, d)
-        Lq = flat.shape[1]
-        m4_target = torch.gather(
-            t_latent_flat, 1, flat[..., None].expand(B, Lq, d)
-        )                                                            # (B,Lq,d)
-        n_p = membership.sum(1)                                       # (P,) long
-        m4_weight = n_p[pos].float()                                 # (B,Lq)  w_p=1
+        m3_pred: Tensor | None = None
+        m3_target: Tensor | None = None
 
-        out = converged_v2_loss(
-            m2_pred.reshape(-1, d),
-            m2_target.reshape(-1, d),
-            m4_pred.reshape(-1, d),
-            m4_target.reshape(-1, d),
-            m4_weight.reshape(-1),
-            tubed[None, :].expand(B, Lq).reshape(-1),
-        )
+        if self.cfg.run_a:
+            # M4 predicts the TUBED parcels only (all S cells); the untubed
+            # masked-cell inpaint is the separate M3 head (pool target).
+            pos, cell, seed, _tubed = self._m4_indices(
+                tube_mask, m2_mask, sh, tubed_only=True
+            )
+            m4_pred = self.m4_predictor(
+                ctx4, ctx4_slot, slot[cell], freq_id[cell],
+                q_parcel=labels[pos], q_seed=seed,
+            )                                                        # (B,Lq4,d)
+            flat4 = (pos * k + seed) * S + cell
+            Lq4 = flat4.shape[1]
+            m4_target = torch.gather(
+                t_latent_flat, 1, flat4[..., None].expand(B, Lq4, d)
+            )
+
+            # M3: each UNTUBED parcel's M2-masked cells, predicting the teacher
+            # POOL output ``t_seeds``. Context = ``s_in`` (the latent's input =
+            # the untubed parcels' tagged visible-cell pool seeds) — same parcel
+            # order ⇒ context parcel p ↔ query parcel p. ``lat_slot`` is its
+            # per-row RoPE clock (the untubed parcels' visible-cell slots).
+            assert self.m3_predictor is not None  # guaranteed by cfg.run_a
+            ctx3 = s_in.reshape(B, P_vis * k * s_vis, d)
+            m3_pos, m3_cell, m3_seed = self._m3_indices(tube_mask, m2_mask, sh)
+            m3_pred = self.m3_predictor(
+                ctx3, lat_slot, slot[m3_cell], freq_id[m3_cell],
+                q_parcel=labels[m3_pos], q_seed=m3_seed,
+            )                                                        # (B,Lq3,d)
+            flat3 = (m3_pos * k + m3_seed) * S + m3_cell
+            Lq3 = flat3.shape[1]
+            t_seeds_flat = t_seeds.reshape(B, P * k * S, d)
+            m3_target = torch.gather(
+                t_seeds_flat, 1, flat3[..., None].expand(B, Lq3, d)
+            )
+
+            out = converged_v2_loss_per_head(
+                m2_pred.reshape(-1, d), m2_target.reshape(-1, d),
+                m3_pred.reshape(-1, d), m3_target.reshape(-1, d),
+                m4_pred.reshape(-1, d), m4_target.reshape(-1, d),
+                w_m2=self.cfg.w_m2, w_m3=self.cfg.w_m3, w_m4=self.cfg.w_m4,
+            )
+        else:
+            # LEGACY: M4 over {tubed: all S} ∪ {untubed: masked cells}; shared-
+            # denominator loss with ``_ln_target``. Resumes byte-identical.
+            pos, cell, seed, tubed = self._m4_indices(tube_mask, m2_mask, sh)
+            q_parcel = labels[pos]                                   # (B,Lq) DKT label
+            q_freq = freq_id[cell]
+            q_slot = slot[cell]
+            m4_pred = self.m4_predictor(
+                ctx4, ctx4_slot, q_slot, q_freq, q_parcel=q_parcel, q_seed=seed
+            )                                                        # (B,Lq,d)
+            flat = (pos * k + seed) * S + cell                       # (B,Lq) into P·k·S
+            Lq = flat.shape[1]
+            m4_target = torch.gather(
+                t_latent_flat, 1, flat[..., None].expand(B, Lq, d)
+            )                                                        # (B,Lq,d)
+            n_p = membership.sum(1)                                   # (P,) long
+            m4_weight = n_p[pos].float()                             # (B,Lq)  w_p=1
+            out = converged_v2_loss(
+                m2_pred.reshape(-1, d),
+                m2_target.reshape(-1, d),
+                m4_pred.reshape(-1, d),
+                m4_target.reshape(-1, d),
+                m4_weight.reshape(-1),
+                tubed[None, :].expand(B, Lq).reshape(-1),
+            )
+
         if return_taps:
             # Near-free detached SSL-health taps for the monitor callback. The loss
             # path above is unchanged — these are additive + `.detach()`'d, so a
@@ -1316,6 +1507,16 @@ class V14ConvergedV2(nn.Module):
             out["_tap_m2_target"] = m2_target.reshape(-1, d).detach()
             out["_tap_m4_pred"] = m4_pred.reshape(-1, d).detach()  # (Q4,d)
             out["_tap_m4_target"] = m4_target.reshape(-1, d).detach()
+            if m3_pred is not None and m3_target is not None:
+                out["_tap_m3_pred"] = m3_pred.reshape(-1, d).detach()   # (Q3,d)
+                out["_tap_m3_target"] = m3_target.reshape(-1, d).detach()
+                out["_tap_teacher_pool"] = t_seeds.detach()       # (B,P,k,S,d)
+            # Flag for the monitor: Run-A regresses RAW targets (no _ln_target),
+            # so explained-variance must be measured against raw targets. Emitted
+            # only in Run-A; legacy omits it and the monitor's `.get()` defaults
+            # to the legacy `_ln_target` behavior (keeps the legacy tap-key set).
+            if self.cfg.run_a:
+                out["_tap_raw_targets"] = t_front.new_tensor(1.0)
         return out
 
     @torch.no_grad()

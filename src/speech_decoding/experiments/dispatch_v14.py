@@ -650,6 +650,17 @@ def build_v14_experiment(
     converged_v2_m4_pred_layers: int | None = None,
     converged_v2_k: int = 2,
     converged_v2_untie_lfs: bool = False,
+    # Converged-v2 Run-A bundle (default LEGACY for checkpoint resume). Setting
+    # --converged-v2-m3-pred-layers is the master switch ⇒ M3 pool-inpaint head +
+    # pool LayerNorm + tubed-only M4 + per-head loss. --converged-v2-qk-norm is an
+    # independent stability lever (per-head RMSNorm on Q,K). The w-m{2,3,4}
+    # weights combine the per-head losses (V-JEPA convention: equal 1.0). Inert
+    # on raw/2stft and when m3-pred-layers is unset.
+    converged_v2_m3_pred_layers: int | None = None,
+    converged_v2_qk_norm: bool = False,
+    converged_v2_w_m2: float = 1.0,
+    converged_v2_w_m3: float = 1.0,
+    converged_v2_w_m4: float = 1.0,
     # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
     # λ sister sweeps override). Inert on raw/2stft.
     converged_lambda_m2: float = 1.0,
@@ -2279,6 +2290,16 @@ def build_v14_experiment(
             **({"tube_ratio": converged_tube_ratio}
                if converged_tube_ratio is not None else {}),
         }
+        # Run-A bundle knobs (default LEGACY: m3 None ⇒ legacy assembly resumes
+        # byte-identical; qk_norm False; equal head weights). Always carried so
+        # the V14ConvergedV2Net config records them.
+        _v2_run_a = {
+            "m3_pred_layers": converged_v2_m3_pred_layers,
+            "qk_norm": converged_v2_qk_norm,
+            "w_m2": converged_v2_w_m2,
+            "w_m3": converged_v2_w_m3,
+            "w_m4": converged_v2_w_m4,
+        }
         return V14ConvergedV2Experiment(
             data=data,
             infra=infra_cfg,
@@ -2294,6 +2315,7 @@ def build_v14_experiment(
                 "k": converged_v2_k,
                 "tie_lfs": not converged_v2_untie_lfs,
                 **_v2_model_knobs,
+                **_v2_run_a,
             },
             # SSL clip-length clock (sized the cached STFT; the v2 model derives its
             # bands from this float via bands_for_clip_len).
@@ -2805,6 +2827,24 @@ def _parser() -> argparse.ArgumentParser:
                    action="store_true",
                    help="2band: UNTIE the LFS/HGA pool operators (n_op=4 instead of "
                         "the tied n_op=2 default — the first set-pool ablation).")
+    p.add_argument("--converged-v2-m3-pred-layers", dest="converged_v2_m3_pred_layers",
+                   type=int, default=None,
+                   help="2band Run-A MASTER SWITCH: set ⇒ M3 pool-inpaint head "
+                        "(this depth) + pool LayerNorm + tubed-only M4 + per-head "
+                        "loss. Unset ⇒ legacy assembly (resumes byte-identical).")
+    p.add_argument("--converged-v2-qk-norm", dest="converged_v2_qk_norm",
+                   action="store_true",
+                   help="2band: per-head RMSNorm on Q,K before RoPE in every v2 "
+                        "tower (bounds attention logits; the bf16 spike fix).")
+    p.add_argument("--converged-v2-w-m2", dest="converged_v2_w_m2",
+                   type=float, default=1.0,
+                   help="2band Run-A: M2 per-head loss weight (default 1.0).")
+    p.add_argument("--converged-v2-w-m3", dest="converged_v2_w_m3",
+                   type=float, default=1.0,
+                   help="2band Run-A: M3 per-head loss weight (default 1.0).")
+    p.add_argument("--converged-v2-w-m4", dest="converged_v2_w_m4",
+                   type=float, default=1.0,
+                   help="2band Run-A: M4 per-head loss weight (default 1.0).")
     p.add_argument("--converged-lambda-m2", dest="converged_lambda_m2",
                    type=float, default=1.0,
                    help="3stft: M2 loss-term weight (neutral 1.0).")
@@ -4095,6 +4135,11 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_v2_m4_pred_layers=args.converged_v2_m4_pred_layers,
         converged_v2_k=args.converged_v2_k,
         converged_v2_untie_lfs=args.converged_v2_untie_lfs,
+        converged_v2_m3_pred_layers=args.converged_v2_m3_pred_layers,
+        converged_v2_qk_norm=args.converged_v2_qk_norm,
+        converged_v2_w_m2=args.converged_v2_w_m2,
+        converged_v2_w_m3=args.converged_v2_w_m3,
+        converged_v2_w_m4=args.converged_v2_w_m4,
         converged_lambda_m2=args.converged_lambda_m2,
         converged_lambda_m4=args.converged_lambda_m4,
         converged_m2_hg_start_rate=args.converged_m2_hg_start_rate,
