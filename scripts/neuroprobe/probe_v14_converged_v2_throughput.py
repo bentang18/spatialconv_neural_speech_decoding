@@ -67,6 +67,11 @@ def main() -> None:
     ap.add_argument("--clip-len-s", type=float, default=5.0)
     ap.add_argument("--tube-ratio", type=float, default=0.25)
     ap.add_argument("--untie-lfs", action="store_true", help="n_op=4 ablation")
+    ap.add_argument("--m3-pred-layers", type=int, default=None,
+                    help="Run-A master switch: M3 pool-inpaint head depth "
+                         "(None => legacy 2-head assembly)")
+    ap.add_argument("--qk-norm", action="store_true",
+                    help="per-head QK-norm on all towers (Run-A)")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--no-backward", action="store_true", help="forward-only timing")
@@ -95,6 +100,8 @@ def main() -> None:
         k=args.k,
         tube_ratio=args.tube_ratio,
         tie_lfs=not args.untie_lfs,
+        m3_pred_layers=args.m3_pred_layers,
+        qk_norm=args.qk_norm,
     )
     model = V14ConvergedV2(cfg).to(device)
     model.train(not args.no_backward)
@@ -143,9 +150,13 @@ def main() -> None:
         f"static header: B={sh.b} C={sh.c} P={sh.P} k={sh.k} S={sh.S} "
         f"n_mask={sh.n_mask} s_vis={sh.s_vis} n_tube={sh.n_tube} P_vis={sh.P_vis}"
     )
+    if cfg.run_a:
+        q_line = f"m2_q={sh.m2_q} m3_q={sh.m3_q} m4_q_tubed={sh.m4_q_tubed}"
+    else:
+        q_line = f"m2_q={sh.m2_q} m4_q={sh.m4_q}"
     print(
         f"  latent_student={sh.latent_student} latent_teacher={sh.latent_teacher} "
-        f"m2_q={sh.m2_q} m4_q={sh.m4_q}"
+        f"{q_line}"
     )
 
     for _ in range(args.warmup):
