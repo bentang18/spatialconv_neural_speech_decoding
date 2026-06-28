@@ -661,6 +661,7 @@ def build_v14_experiment(
     converged_v2_w_m2: float = 1.0,
     converged_v2_w_m3: float = 1.0,
     converged_v2_w_m4: float = 1.0,
+    converged_v2_support_weight: bool = False,
     # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
     # λ sister sweeps override). Inert on raw/2stft.
     converged_lambda_m2: float = 1.0,
@@ -2299,6 +2300,7 @@ def build_v14_experiment(
             "w_m2": converged_v2_w_m2,
             "w_m3": converged_v2_w_m3,
             "w_m4": converged_v2_w_m4,
+            "support_weight": converged_v2_support_weight,
         }
         return V14ConvergedV2Experiment(
             data=data,
@@ -2845,6 +2847,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--converged-v2-w-m4", dest="converged_v2_w_m4",
                    type=float, default=1.0,
                    help="2band Run-A: M4 per-head loss weight (default 1.0).")
+    p.add_argument("--converged-v2-support-weight",
+                   dest="converged_v2_support_weight", action="store_true",
+                   help="2band Run-A: weight each M3/M4 parcel's loss by its "
+                        "electrode count n_elec (convex weighted mean ÷ Σ n_elec) "
+                        "— a precision prior; scale-preserving. M2 unweighted.")
     p.add_argument("--converged-lambda-m2", dest="converged_lambda_m2",
                    type=float, default=1.0,
                    help="3stft: M2 loss-term weight (neutral 1.0).")
@@ -4140,6 +4147,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_v2_w_m2=args.converged_v2_w_m2,
         converged_v2_w_m3=args.converged_v2_w_m3,
         converged_v2_w_m4=args.converged_v2_w_m4,
+        converged_v2_support_weight=args.converged_v2_support_weight,
         converged_lambda_m2=args.converged_lambda_m2,
         converged_lambda_m4=args.converged_lambda_m4,
         converged_m2_hg_start_rate=args.converged_m2_hg_start_rate,

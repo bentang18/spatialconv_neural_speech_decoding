@@ -41,7 +41,7 @@ from speech_decoding.models.v14_converged_v2 import (
 N_PARCELS = 62
 
 
-def _cfg(run_a: bool, d=32, n_heads=4, qk_norm=None):
+def _cfg(run_a: bool, d=32, n_heads=4, qk_norm=None, support_weight=False):
     kw = dict(
         d_model=d, n_heads=n_heads, frontend_layers=2, latent_layers=2,
         m2_pred_layers=2, m4_pred_layers=2, pred_dim=d, n_parcels=N_PARCELS,
@@ -49,7 +49,8 @@ def _cfg(run_a: bool, d=32, n_heads=4, qk_norm=None):
         qk_norm=run_a if qk_norm is None else qk_norm,
     )
     if run_a:
-        kw.update(m3_pred_layers=2, w_m2=1.0, w_m3=1.0, w_m4=1.0)
+        kw.update(m3_pred_layers=2, w_m2=1.0, w_m3=1.0, w_m4=1.0,
+                  support_weight=support_weight)
     return V14ConvergedV2Config(**kw)
 
 
@@ -278,11 +279,17 @@ def _dense_loss_run_a(model, lfs, hga, poe, m2, tube, clip_len_s):
         t_seeds.reshape(B, P * k * S, d), 1, flat3[..., None].expand(B, Lq3, d)
     )
 
+    m3_w = m4_w = None
+    if model.cfg.support_weight:
+        n_elec = membership.sum(-1).to(m3_pred.dtype)
+        m3_w = n_elec[m3_pos].reshape(-1)
+        m4_w = n_elec[pos].reshape(-1)
     return converged_v2_loss_per_head(
         m2_pred.reshape(-1, d), m2_target.reshape(-1, d),
         m3_pred.reshape(-1, d), m3_target.reshape(-1, d),
         m4_pred.reshape(-1, d), m4_target.reshape(-1, d),
         w_m2=model.cfg.w_m2, w_m3=model.cfg.w_m3, w_m4=model.cfg.w_m4,
+        m3_weight=m3_w, m4_weight=m4_w,
     )
 
 
@@ -314,3 +321,65 @@ def test_run_a_e2e_grads_reach_m3_pool_ln_and_qk_gains():
           if "norm_gain" in n and p.requires_grad]
     assert qk and any(p.grad is not None for p in qk)
     assert all(p.grad is None for p in model.teacher_frontend.parameters())
+
+
+# ----------------------------------------------------- electrode-support weight
+def test_support_weight_is_convex_weighted_mean():
+    """A weighted head = Σ w·rowloss / Σ w (rowloss = mean over d). Convex, so
+    it stays within the per-row min/max and reduces to the flat mean when the
+    weights are uniform."""
+    torch.manual_seed(0)
+    d = 6
+    pred = torch.zeros(4, d)
+    target = torch.tensor([0.0, 1.0, 2.0, 3.0])[:, None].expand(4, d).contiguous()
+    w = torch.tensor([1.0, 3.0, 0.0, 4.0])              # row 2 ignored
+    out = converged_v2_loss_per_head(
+        pred, target, pred, target, pred, target, m3_weight=w, m4_weight=w
+    )
+    rowloss = target.abs().mean(-1)                     # [0,1,2,3]
+    expect = (rowloss * w).sum() / w.sum()              # (0+3+0+12)/8 = 1.875
+    assert torch.allclose(out["loss_m3"], expect)
+    assert torch.allclose(out["loss_m4"], expect)
+    assert torch.allclose(out["loss_m2"], rowloss.mean())   # M2 stays flat
+    # uniform weights == flat mean
+    flat = converged_v2_loss_per_head(pred, target, pred, target, pred, target)
+    uni = converged_v2_loss_per_head(
+        pred, target, pred, target, pred, target,
+        m3_weight=torch.ones(4), m4_weight=torch.ones(4),
+    )
+    assert torch.allclose(flat["loss_m3"], uni["loss_m3"])
+
+
+def test_support_weight_dense_equals_static():
+    """The electrode-weighted static path == the dense reference (same weights),
+    on the loss and every per-head diagnostic."""
+    _, poe, _, lfs, hga, m2, tube = _session(B=3, seed=7)
+    model = V14ConvergedV2(_cfg(run_a=True, support_weight=True)).eval()
+    assert model.cfg.support_weight
+    with torch.no_grad():
+        static = model(lfs, hga, poe, m2, tube, clip_len_s=5.0)
+        dense = _dense_loss_run_a(model, lfs, hga, poe, m2, tube, 5.0)
+    for key in ("loss", "loss_m2", "loss_m3", "loss_m4"):
+        assert torch.allclose(static[key], dense[key], atol=1e-5), key
+
+
+def test_support_weight_preserves_scale_and_changes_value():
+    """All three heads stay ~same scale at init (every target is LayerNorm-
+    terminated ⇒ |err|~0.8), and weighting actually moves loss_m3/loss_m4 vs the
+    flat mean (parcels here have unequal electrode counts: 3,1,2)."""
+    _, poe, _, lfs, hga, m2, tube = _session(B=3, seed=8)
+    flat = V14ConvergedV2(_cfg(run_a=True, support_weight=False)).eval()
+    wtd = V14ConvergedV2(_cfg(run_a=True, support_weight=True)).eval()
+    wtd.load_state_dict(flat.state_dict())              # identical weights
+    with torch.no_grad():
+        of = flat(lfs, hga, poe, m2, tube, clip_len_s=5.0)
+        ow = wtd(lfs, hga, poe, m2, tube, clip_len_s=5.0)
+    for o in (of, ow):
+        for kk in ("loss_m2", "loss_m3", "loss_m4"):
+            assert 0.3 < o[kk].item() < 1.6, (kk, o[kk].item())
+        assert 0.5 < (o["loss_m3"] / o["loss_m2"]).item() < 2.0
+        assert 0.5 < (o["loss_m4"] / o["loss_m2"]).item() < 2.0
+    # weighting redistributes ⇒ m3/m4 differ from flat; m2 (unweighted) identical.
+    assert torch.allclose(of["loss_m2"], ow["loss_m2"])
+    assert not torch.allclose(of["loss_m3"], ow["loss_m3"])
+    assert not torch.allclose(of["loss_m4"], ow["loss_m4"])

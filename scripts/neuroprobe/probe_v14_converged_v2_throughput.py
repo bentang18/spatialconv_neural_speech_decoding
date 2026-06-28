@@ -72,6 +72,8 @@ def main() -> None:
                          "(None => legacy 2-head assembly)")
     ap.add_argument("--qk-norm", action="store_true",
                     help="per-head QK-norm on all towers (Run-A)")
+    ap.add_argument("--support-weight", action="store_true",
+                    help="Run-A: electrode-count weighted M3/M4 per-head loss")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--no-backward", action="store_true", help="forward-only timing")
@@ -102,6 +104,7 @@ def main() -> None:
         tie_lfs=not args.untie_lfs,
         m3_pred_layers=args.m3_pred_layers,
         qk_norm=args.qk_norm,
+        support_weight=args.support_weight,
     )
     model = V14ConvergedV2(cfg).to(device)
     model.train(not args.no_backward)

@@ -1035,6 +1035,8 @@ def converged_v2_loss_per_head(
     w_m2: float = 1.0,
     w_m3: float = 1.0,
     w_m4: float = 1.0,
+    m3_weight: Tensor | None = None,
+    m4_weight: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """Run-A per-head JEPA loss (Ben 2026-06-27): three INDEPENDENT
     self-normalized L1 means on RAW (detached) EMA targets, combined with
@@ -1049,20 +1051,29 @@ def converged_v2_loss_per_head(
 
     Each ``.mean()`` divides by that head's own scalar count, so a head with few
     queries isn't drowned by one with many — the per-head balance the shared
-    denominator lacked. All pred/target tensors are pre-flattened ``(Q, d)``."""
+    denominator lacked. All pred/target tensors are pre-flattened ``(Q, d)``.
+
+    ``m3_weight``/``m4_weight`` (optional, shape ``(Q,)``) turn that head's flat
+    mean into a CONVEX electrode-support-weighted mean ``Σ w·rowloss / Σ w``
+    (rowloss = mean over ``d``). Convex ⇒ same scale as the flat mean, so the
+    weighted heads stay comparable to the unweighted M2. None ⇒ flat mean."""
     d = m2_pred.shape[-1]
     for name, t in (("m3_pred", m3_pred), ("m4_pred", m4_pred)):
         if t.shape[-1] != d:
             raise ValueError(f"{name} feature dim {t.shape[-1]} != m2 dim {d}")
 
-    def _head(pred: Tensor, target: Tensor) -> Tensor:
+    def _head(pred: Tensor, target: Tensor, weight: Tensor | None = None) -> Tensor:
         if pred.numel() == 0:
             return pred.new_zeros(())
-        return (pred - target.detach()).abs().mean()
+        err = (pred - target.detach()).abs()
+        if weight is None:
+            return err.mean()
+        rowloss = err.mean(-1)                          # (Q,) mean over d
+        return (rowloss * weight).sum() / weight.sum().clamp_min(1e-12)
 
     l_m2 = _head(m2_pred, m2_target)
-    l_m3 = _head(m3_pred, m3_target)
-    l_m4 = _head(m4_pred, m4_target)
+    l_m3 = _head(m3_pred, m3_target, m3_weight)
+    l_m4 = _head(m4_pred, m4_target, m4_weight)
     loss = w_m2 * l_m2 + w_m3 * l_m3 + w_m4 * l_m4
     diag = {
         "loss": loss,
@@ -1120,6 +1131,14 @@ class V14ConvergedV2Config:
     w_m2: float = 1.0
     w_m3: float = 1.0
     w_m4: float = 1.0
+    # Electrode-count weighting for M3/M4 (Run-A only): each parcel's per-head
+    # loss is weighted by its electrode-support count n_elec(p)=membership[p].sum,
+    # combined as a CONVEX weighted mean (÷ Σ n_elec) — a precision / inverse-
+    # variance prior (a parcel pooled from more electrodes is a lower-variance
+    # target) that also matches M2's implicit electrode-density weighting. Convex
+    # ⇒ scale-preserving: M2≈M3≈M4 stay comparable. M2 stays unweighted (already
+    # per-electrode-cell). Default False = flat per-head means.
+    support_weight: bool = False
 
     @property
     def run_a(self) -> bool:
@@ -1462,11 +1481,21 @@ class V14ConvergedV2(nn.Module):
                 t_seeds_flat, 1, flat3[..., None].expand(B, Lq3, d)
             )
 
+            # Electrode-support weights: each query row weighted by its parcel's
+            # electrode count n_elec(p) = membership[p].sum(). Convex weighted
+            # mean in the loss (÷ Σ n_elec) ⇒ scale-preserving precision prior.
+            m3_w: Tensor | None = None
+            m4_w: Tensor | None = None
+            if self.cfg.support_weight:
+                n_elec = membership.sum(-1).to(m3_pred.dtype)        # (P,)
+                m3_w = n_elec[m3_pos].reshape(-1)                    # (Q3,)
+                m4_w = n_elec[pos].reshape(-1)                       # (Q4,)
             out = converged_v2_loss_per_head(
                 m2_pred.reshape(-1, d), m2_target.reshape(-1, d),
                 m3_pred.reshape(-1, d), m3_target.reshape(-1, d),
                 m4_pred.reshape(-1, d), m4_target.reshape(-1, d),
                 w_m2=self.cfg.w_m2, w_m3=self.cfg.w_m3, w_m4=self.cfg.w_m4,
+                m3_weight=m3_w, m4_weight=m4_w,
             )
         else:
             # LEGACY: M4 over {tubed: all S} ∪ {untubed: masked cells}; shared-

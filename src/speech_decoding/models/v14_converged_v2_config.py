@@ -63,6 +63,7 @@ class V14ConvergedV2Net(BaseModelConfig):
     w_m2: float = 1.0
     w_m3: float = 1.0
     w_m4: float = 1.0
+    support_weight: bool = False
 
     def build(self, n_in_channels: int, n_outputs: int) -> nn.Module:  # noqa: ARG002
         return V14ConvergedV2(
@@ -84,6 +85,7 @@ class V14ConvergedV2Net(BaseModelConfig):
                 w_m2=self.w_m2,
                 w_m3=self.w_m3,
                 w_m4=self.w_m4,
+                support_weight=self.support_weight,
             )
         )
 
