@@ -42,7 +42,9 @@ class HeadTrainConfig:
     attn_dropout: float = 0.1
     mlp_dropout: float = 0.1
     residual_dropout: float = 0.1
-    token_dropout: float = 0.1
+    parcel_dropout: float = 0.0       # PRIMARY structured knob (drop whole parcels)
+    token_dropout: float = 0.0        # optional i.i.d.-token ablation (off by default)
+    tokens_per_parcel: int = 0        # k·S; set by the bench so parcel dropout knows blocks
     lr: float = 1e-3
     weight_decay: float = 0.1
     label_smoothing: float = 0.0
@@ -59,7 +61,8 @@ def _build_head(cfg: HeadTrainConfig) -> AttentiveProbeHead:
         cfg.d_model, n_heads=cfg.n_heads, n_queries=cfg.n_queries,
         mlp_ratio=cfg.mlp_ratio, attn_dropout=cfg.attn_dropout,
         mlp_dropout=cfg.mlp_dropout, residual_dropout=cfg.residual_dropout,
-        token_dropout=cfg.token_dropout, n_out=1,
+        parcel_dropout=cfg.parcel_dropout, token_dropout=cfg.token_dropout,
+        tokens_per_parcel=cfg.tokens_per_parcel, n_out=1,
     )
 
 

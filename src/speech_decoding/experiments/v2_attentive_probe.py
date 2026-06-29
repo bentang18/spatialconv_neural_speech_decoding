@@ -44,7 +44,9 @@ class AttentiveProbeHead(nn.Module):
         attn_dropout: float = 0.1,
         mlp_dropout: float = 0.1,
         residual_dropout: float = 0.1,
+        parcel_dropout: float = 0.0,
         token_dropout: float = 0.0,
+        tokens_per_parcel: int = 0,
         n_out: int = 1,
     ) -> None:
         super().__init__()
@@ -54,7 +56,9 @@ class AttentiveProbeHead(nn.Module):
         self.n_heads = n_heads
         self.n_queries = n_queries
         self.head_dim = d_model // n_heads
+        self.parcel_dropout = float(parcel_dropout)
         self.token_dropout = float(token_dropout)
+        self.tokens_per_parcel = int(tokens_per_parcel)
 
         # phi[q,h,:] — the folded scoring query (W_q∘W_k), scores the FULL token.
         self.phi = nn.Parameter(torch.empty(n_queries, n_heads, d_model))
@@ -81,16 +85,32 @@ class AttentiveProbeHead(nn.Module):
         self.head = nn.Linear(d_model, n_out)
 
     def _token_mask(self, x: Tensor, key_padding_mask: Tensor | None) -> Tensor | None:
-        """Combine the (B,T) valid mask with train-time token dropout; never empty."""
+        """Combine the (B,T) valid mask with train-time dropout; never leaves a row empty.
+
+        PARCEL dropout (primary) drops every token of a randomly chosen parcel together —
+        the augmentation that mimics the real cross-subject shift (a parcel absent because
+        a new subject lacks coverage there). Tokens are laid out as ``P`` contiguous
+        ``tokens_per_parcel``-blocks, so a per-parcel keep mask repeat-interleaves to
+        ``(B,T)``. TOKEN dropout (optional, off by default) drops i.i.d. single tokens —
+        a frame-level absence that never happens at test time, kept only as an ablation."""
         mask = key_padding_mask
-        if self.training and self.token_dropout > 0.0:
-            B, T, _ = x.shape
-            keep = torch.rand(B, T, device=x.device) >= self.token_dropout
-            m = keep if mask is None else (mask & keep)
-            empty = m.sum(dim=-1, keepdim=True) == 0       # dropped everything in a row
-            fallback = torch.ones_like(m) if mask is None else mask
-            mask = torch.where(empty, fallback, m)
-        return mask
+        if not self.training:
+            return mask
+        B, T, _ = x.shape
+        drop: Tensor | None = None
+        tpp = self.tokens_per_parcel
+        if self.parcel_dropout > 0.0 and tpp > 0 and T % tpp == 0:
+            keep_p = torch.rand(B, T // tpp, device=x.device) >= self.parcel_dropout
+            drop = keep_p.repeat_interleave(tpp, dim=1)            # (B,T) block mask
+        if self.token_dropout > 0.0:
+            keep_t = torch.rand(B, T, device=x.device) >= self.token_dropout
+            drop = keep_t if drop is None else (drop & keep_t)
+        if drop is None:
+            return mask
+        m = drop if mask is None else (mask & drop)
+        empty = m.sum(dim=-1, keepdim=True) == 0                   # dropped a whole row
+        fallback = torch.ones_like(m) if mask is None else mask
+        return torch.where(empty, fallback, m)
 
     def forward(self, x: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
         """``x`` ``(B,T,d)`` token set; ``key_padding_mask`` ``(B,T)`` bool, True = valid.

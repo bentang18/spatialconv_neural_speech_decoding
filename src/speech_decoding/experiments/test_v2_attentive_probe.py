@@ -84,6 +84,44 @@ def test_padding_mask_no_nan_when_dropout_would_empty_a_row():
     assert torch.isfinite(out).all()
 
 
+def test_parcel_dropout_drops_whole_parcels():
+    """Parcel dropout keep/drop is decided per parcel and broadcast to all its tokens."""
+    tpp = 4
+    head = AttentiveProbeHead(16, n_heads=4, parcel_dropout=0.5,
+                              tokens_per_parcel=tpp).train()
+    x = torch.randn(8, 5 * tpp, 16)                          # 5 parcels × 4 tokens
+    torch.manual_seed(0)
+    mask = head._token_mask(x, None)
+    assert mask is not None
+    blocks = mask.view(mask.shape[0], -1, tpp)
+    # every token in a parcel shares one decision (all kept or all dropped)
+    assert (blocks.all(dim=-1) | (~blocks.any(dim=-1))).all()
+    assert (mask.sum(dim=-1) > 0).all()                      # never-empty guard
+    assert not mask.all()                                    # some parcel actually dropped
+
+
+def test_parcel_dropout_noop_without_block_size():
+    """Unknown block size (tokens_per_parcel=0) disables parcel dropout (no guess)."""
+    head = AttentiveProbeHead(16, n_heads=4, parcel_dropout=0.9,
+                              tokens_per_parcel=0).train()
+    assert head._token_mask(torch.randn(4, 12, 16), None) is None
+
+
+def test_parcel_dropout_forward_finite_and_train_eval_differ():
+    head = AttentiveProbeHead(16, n_heads=4, parcel_dropout=0.5, tokens_per_parcel=3,
+                              attn_dropout=0.0, mlp_dropout=0.0, residual_dropout=0.0)
+    x = torch.randn(8, 12, 16)
+    head.train()
+    torch.manual_seed(0)
+    o1 = head(x)
+    torch.manual_seed(1)
+    o2 = head(x)
+    assert torch.isfinite(o1).all() and torch.isfinite(o2).all()
+    assert not torch.allclose(o1, o2)
+    head.eval()
+    assert torch.allclose(head(x), head(x))
+
+
 def test_learnability_separable_set():
     """A set whose token-mean encodes the label is learnable → train AUROC ≈ 1."""
     torch.manual_seed(0)

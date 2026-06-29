@@ -392,8 +392,9 @@ def run_v2_attentive_bench(
     towers: tp.Sequence[str] = ("student",),
     wd_grid: tp.Sequence[float] = (0.1, 1.0, 3.0),
     dropout_grid: tp.Sequence[float] = (0.1, 0.5),
+    parcel_dropout_grid: tp.Sequence[float] = (0.0, 0.2),
     ls_grid: tp.Sequence[float] = (0.0, 0.1),
-    token_dropout: float = 0.1,
+    token_dropout: float = 0.0,
     n_diwa_seeds: int = 3,
     n_heads: int = 6,
     n_queries: int = 1,
@@ -415,8 +416,10 @@ def run_v2_attentive_bench(
     :func:`loso_pooled_cs` — leave-one-SUBJECT-out test with INNER-LOSO model selection
     (HP chosen by mean inner-val AUROC over all train subjects, not one), SWAD per run,
     DiWA across ``n_diwa_seeds``. The HP grid is the cartesian
-    product of ``wd_grid`` (up to 3.0) × ``dropout_grid`` (very-large range, tied across
-    attn/MLP/residual) × ``ls_grid`` (label smoothing, 0 in the grid as the safety net).
+    product of ``wd_grid`` (up to 3.0) × ``dropout_grid`` (activation dropout, tied across
+    attn/MLP/residual) × ``parcel_dropout_grid`` (PRIMARY structured knob — drops whole
+    parcels, mimicking the cross-subject coverage shift) × ``ls_grid`` (label smoothing,
+    0 in the grid as the safety net). ``token_dropout`` (i.i.d. single-token) defaults off.
     Emits ``val_probe/attn_{surface}_{tower}/{cs,cs_std}/{task}``; the bar is the raw_tok
     ridge floor (CS ``delta_volume`` 0.666)."""
     from speech_decoding.experiments.v2_attentive_train import (
@@ -429,8 +432,9 @@ def run_v2_attentive_bench(
     tasks = list(tasks) if tasks is not None else list(dataset.tasks)
     hp_grid = [
         {"weight_decay": w, "attn_dropout": p, "mlp_dropout": p,
-         "residual_dropout": p, "label_smoothing": a}
-        for w in wd_grid for p in dropout_grid for a in ls_grid
+         "residual_dropout": p, "parcel_dropout": pd, "label_smoothing": a}
+        for w in wd_grid for p in dropout_grid for pd in parcel_dropout_grid
+        for a in ls_grid
     ]
 
     metrics: dict[str, float] = {}
@@ -439,12 +443,14 @@ def run_v2_attentive_bench(
         # Only materialize the requested surfaces — each is ~k·S·d/parcel × N × ΣP wide
         # (≈110GB at d384/n_cap3500), so holding both M3 and M4 doubles peak host RAM.
         toks: dict[str, dict[int, Tensor]] = {sf: {} for sf in surfaces}
+        tokens_per_parcel = 0
         for s in subs:
             m3, m4, _ = encode_subject_tokens(
                 model, sd[s].bands, sd[s].parcel_per_electrode,
                 clip_len_s=clip_len_s, device=device, use_teacher=use_teacher,
                 batch_size=batch_size_fwd,
             )
+            tokens_per_parcel = m4.shape[2] * m4.shape[3]   # k·S — the parcel block size
             if "m3" in toks:
                 toks["m3"][s] = m3.reshape(m3.shape[0], -1, m3.shape[-1])
             if "m4" in toks:
@@ -453,7 +459,8 @@ def run_v2_attentive_bench(
         d_model = next(iter(toks[surfaces[0]].values())).shape[-1]
         base = HeadTrainConfig(
             d_model=d_model, n_heads=n_heads, n_queries=n_queries, mlp_ratio=mlp_ratio,
-            token_dropout=token_dropout, lr=lr, max_steps=max_steps,
+            token_dropout=token_dropout, tokens_per_parcel=tokens_per_parcel,
+            lr=lr, max_steps=max_steps,
             batch_size=batch_size, eval_every=eval_every, patience=patience,
             swad_warmup=swad_warmup,
         )

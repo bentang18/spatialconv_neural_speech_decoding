@@ -203,9 +203,9 @@ def test_run_v2_attentive_bench_smoke():
     )
     out = run_v2_attentive_bench(
         dataset, model, clip_len_s=1.0, device=torch.device("cpu"),
-        wd_grid=(0.1,), dropout_grid=(0.1,), ls_grid=(0.0,), n_diwa_seeds=1,
-        n_heads=4, max_steps=120, eval_every=30, swad_warmup=30, patience=3,
-        batch_size=16,
+        wd_grid=(0.1,), dropout_grid=(0.1,), parcel_dropout_grid=(0.0,), ls_grid=(0.0,),
+        n_diwa_seeds=1, n_heads=4, max_steps=120, eval_every=30, swad_warmup=30,
+        patience=3, batch_size=16,
     )
     for surface in ("m3", "m4"):
         assert f"val_probe/attn_{surface}_student/cs/delta_volume" in out
@@ -234,7 +234,8 @@ def test_run_v2_attentive_bench_single_surface():
     )
     out = run_v2_attentive_bench(
         dataset, model, clip_len_s=1.0, device=torch.device("cpu"),
-        surfaces=("m4",), wd_grid=(0.1,), dropout_grid=(0.1,), ls_grid=(0.0,),
+        surfaces=("m4",), wd_grid=(0.1,), dropout_grid=(0.1,),
+        parcel_dropout_grid=(0.2,), ls_grid=(0.0,),  # exercise the parcel-drop path
         n_diwa_seeds=1, n_heads=4, max_steps=120, eval_every=30, swad_warmup=30,
         patience=3, batch_size=16,
     )

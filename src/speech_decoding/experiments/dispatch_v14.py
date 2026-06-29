@@ -3202,6 +3202,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="Comma-list of towers: student,teacher (default student).")
     p.add_argument("--v2-attentive-wd-grid", type=str, default="0.1,1.0,3.0",
                    help="Comma-list AdamW weight-decay grid (up to 3.0). Default 0.1,1.0,3.0.")
+    p.add_argument("--v2-attentive-parcel-dropout-grid", type=str, default="0.0,0.2",
+                   help="PRIMARY structured-dropout sweep: fraction of whole parcels "
+                        "dropped per step (mimics cross-subject coverage shift).")
     p.add_argument("--v2-attentive-dropout-grid", type=str, default="0.1,0.5",
                    help="Comma-list dropout grid (tied attn/MLP/residual, very-large "
                         "range). Default 0.1,0.5.")
@@ -5160,6 +5163,7 @@ def main(argv: list[str] | None = None) -> int:
                 towers=tuple(t.strip() for t in args.v2_attentive_towers.split(",") if t.strip()),
                 wd_grid=_floats(args.v2_attentive_wd_grid),
                 dropout_grid=_floats(args.v2_attentive_dropout_grid),
+                parcel_dropout_grid=_floats(args.v2_attentive_parcel_dropout_grid),
                 ls_grid=_floats(args.v2_attentive_ls_grid),
                 n_diwa_seeds=args.v2_attentive_diwa_seeds,
                 max_steps=args.v2_attentive_max_steps,
