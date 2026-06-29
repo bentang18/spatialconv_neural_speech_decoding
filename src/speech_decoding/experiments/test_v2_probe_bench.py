@@ -88,11 +88,14 @@ def test_encode_subject_taps_shapes():
     model = _tiny_model()
     n, c = 20, 4
     poe = torch.tensor([5, 5, 9, 20])  # parcels {5,9,20}
-    front, latent, labels = encode_subject_taps(
+    front, latent, latent_keepS, labels = encode_subject_taps(
         model, _bands(n, c), poe, clip_len_s=1.0, device=torch.device("cpu"), batch_size=8,
     )
     assert front.shape == (n, c, 16)          # token-pooled per-electrode (N,C,d)
     assert latent.shape == (n, 3, 16)         # token-pooled per-parcel (N,P,d)
+    assert latent_keepS.shape[:2] == (n, 3)   # keep-S per-parcel (N,P,k·S·d)
+    assert latent_keepS.shape[2] % 16 == 0    # multiple of d
+    assert latent_keepS.shape[2] > 16         # cells kept → wider than pooled d
     assert labels.tolist() == [5, 9, 20]
 
 
@@ -117,7 +120,7 @@ def test_run_v2_encoder_taps_emits_all_metrics():
     out = run_v2_encoder_taps(
         dataset, model, clip_len_s=1.0, device=torch.device("cpu"), max_iter=300,
     )
-    for tap in ("frontend", "latent"):
+    for tap in ("frontend", "latent", "latent_keepS"):
         for split in ("ws", "cs", "gap"):
             assert f"val_probe/{tap}/{split}/delta_volume" in out
     assert all(np.isfinite(v) for v in out.values())

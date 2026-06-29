@@ -33,17 +33,17 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from speech_decoding.experiments.linear_probe_logistic import (
-    cs_auroc_logistic,
-    ws_auroc_2fold_logistic,
-)
 from speech_decoding.experiments.online_probe import (
     _finite_rows,
     feature_matrix,
     parcel_intersection,
 )
 from speech_decoding.experiments.online_probe_dataset import N_CAP
-from speech_decoding.experiments.v2_raw_probe import raw_ws_cs_auroc, run_v2_raw_baseline
+from speech_decoding.experiments.v2_raw_probe import (
+    auroc_estimators,
+    raw_ws_cs_auroc,
+    run_v2_raw_baseline,
+)
 
 __all__ = [
     "load_v2_converged_model",
@@ -98,19 +98,25 @@ def encode_subject_taps(
     clip_len_s: float,
     device: torch.device,
     batch_size: int = 64,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Forward one subject's clips → token-pooled frontend + latent taps.
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Forward one subject's clips → frontend + two latent reductions.
 
-    Pools the token grid INSIDE the batch loop (frontend mean over ``S``; latent mean
-    over ``k`` and ``S``) so only ``(N,C,d)`` / ``(N,P,d)`` ever land on the host.
-    ``labels`` ``(P,)`` are the active-parcel DKT ids (constant across the subject's
-    windows; read off the first batch). Returns ``(front (N,C,d), latent (N,P,d),
-    labels (P,))`` on CPU."""
+    Reduces the token grid INSIDE the batch loop so only parcel/electrode-level
+    tensors land on the host:
+      ``front``        frontend, mean over ``S``               → ``(N,C,d)``
+      ``latent``       latent, mean over ``k`` and ``S``       → ``(N,P,d)``
+      ``latent_keepS`` latent, flatten ``k·S·d`` (cells kept)  → ``(N,P,k·S·d)``
+    Frontend keep-S is intentionally NOT produced: per-electrode it is ``C·S·d``
+    (~1.4M dims → OOM) and the cross-subject unit is the parcel anyway, so keep-S is
+    a latent-tap eval. ``labels`` ``(P,)`` are the active-parcel DKT ids (constant
+    across windows; read off the first batch). Returns
+    ``(front, latent, latent_keepS, labels)`` on CPU."""
     lfs, hga = bands[0], bands[1]
     n = lfs.shape[0]
     ppe = parcel_per_electrode.to(device)
     fronts: list[Tensor] = []
     latents: list[Tensor] = []
+    latents_keep: list[Tensor] = []
     labels: Tensor | None = None
     for i in range(0, n, batch_size):
         taps = model.encode_clip_taps(
@@ -119,13 +125,16 @@ def encode_subject_taps(
             ppe,
             clip_len_s=clip_len_s,
         )
+        lat = taps["latent"]                                       # (b,P,k,S,d)
+        b, P = lat.shape[0], lat.shape[1]
         fronts.append(taps["frontend"].mean(dim=2).cpu())          # (b,C,d)
-        latents.append(taps["latent"].mean(dim=(2, 3)).cpu())      # (b,P,d)
+        latents.append(lat.mean(dim=(2, 3)).cpu())                 # (b,P,d)
+        latents_keep.append(lat.reshape(b, P, -1).cpu())           # (b,P,k·S·d)
         if labels is None:
             labels = taps["labels"].cpu().long()
     if labels is None:
         raise RuntimeError("subject had no clips to encode")
-    return torch.cat(fronts, 0), torch.cat(latents, 0), labels
+    return torch.cat(fronts, 0), torch.cat(latents, 0), torch.cat(latents_keep, 0), labels
 
 
 def latent_ws_cs_auroc(
@@ -139,15 +148,19 @@ def latent_ws_cs_auroc(
     tasks: tp.Sequence[str],
     n_parcels: int,
     max_iter: int = 10000,
+    estimator: str = "logistic",
+    tap: str = "latent",
 ) -> dict[str, float]:
-    """Logistic AUROC on the per-parcel latent tap.
+    """AUROC on the per-parcel latent tap.
 
-    ``latent[s]`` is ``(N, P_s, d)`` (token-pooled), ``labels[s]`` the ``(P_s,)``
-    active-parcel DKT ids. **WS** flattens the subject's own active parcels →
-    ``(N, P_s·d)``. **CS** scatters each subject's parcels into the global
-    ``n_parcels`` table by DKT id, then fits the anchor / scores each test subject
-    over the shared (present-in-both) parcels — the same global-id intersection the raw
-    CS pool uses. Emits ``val_probe/latent/{ws,cs,gap}/{task}``."""
+    ``latent[s]`` is ``(N, P_s, D)`` (``D=d`` token-pooled, or ``D=k·S·d`` keep-S),
+    ``labels[s]`` the ``(P_s,)`` active-parcel DKT ids. **WS** flattens the subject's
+    own active parcels → ``(N, P_s·D)``. **CS** scatters each subject's parcels into
+    the global ``n_parcels`` table by DKT id, then fits the anchor / scores each test
+    subject over the shared (present-in-both) parcels — the same global-id intersection
+    the raw CS pool uses. ``estimator`` is ``"logistic"`` or ``"ridge"``; ``tap`` names
+    the metric family. Emits ``val_probe/{tap}/{ws,cs,gap}/{task}``."""
+    ws_fn, cs_fn = auroc_estimators(estimator, max_iter)
     def _to_global(s: int) -> tuple[Tensor, Tensor]:
         lat, lab = latent[s], labels[s]
         n, _, d = lat.shape
@@ -165,10 +178,7 @@ def latent_ws_cs_auroc(
         for s in ws_subjects:
             z = latent[s].reshape(latent[s].shape[0], -1).numpy()
             zf, yf = _finite_rows(z, sd[s].labels[task])
-            ws_vals.append(
-                ws_auroc_2fold_logistic(zf, yf, max_iter=max_iter)
-                if len(yf) >= 4 else float("nan")
-            )
+            ws_vals.append(ws_fn(zf, yf) if len(yf) >= 4 else float("nan"))
         ws_mean = float(np.nanmean(ws_vals)) if ws_vals else float("nan")
 
         ga, pres_a = glob_cs[cs_anchor]
@@ -184,12 +194,12 @@ def latent_ws_cs_auroc(
             if len(ya) < 2 or len(yt) < 1:
                 cs_vals.append(float("nan"))
                 continue
-            cs_vals.append(cs_auroc_logistic(za, ya, zt, yt, max_iter=max_iter))
+            cs_vals.append(cs_fn(za, ya, zt, yt))
         cs_mean = float(np.nanmean(cs_vals)) if cs_vals else float("nan")
 
-        metrics[f"val_probe/latent/ws/{task}"] = ws_mean
-        metrics[f"val_probe/latent/cs/{task}"] = cs_mean
-        metrics[f"val_probe/latent/gap/{task}"] = ws_mean - cs_mean
+        metrics[f"val_probe/{tap}/ws/{task}"] = ws_mean
+        metrics[f"val_probe/{tap}/cs/{task}"] = cs_mean
+        metrics[f"val_probe/{tap}/gap/{task}"] = ws_mean - cs_mean
     return metrics
 
 
@@ -201,36 +211,44 @@ def run_v2_encoder_taps(
     device: torch.device,
     max_iter: int = 10000,
     batch_size: int = 64,
+    estimator: str = "ridge",
 ) -> dict[str, float]:
-    """Frontend + latent tap AUROC over the dev probe dataset.
+    """Frontend + latent tap AUROC over the dev probe dataset, scored with ``estimator``.
 
-    Frontend (per-electrode, token-pooled to ``(N,C,d)``) reuses the raw WS/CS
-    machinery under ``tap="frontend"``; latent (per-parcel) uses
-    :func:`latent_ws_cs_auroc`."""
+    Three families, all under ``estimator`` (``"ridge"`` = the trustworthy meter at
+    p≫n):
+      ``frontend``      per-electrode pooled tap, reuses the raw WS/CS machinery;
+      ``latent``        per-parcel pooled tap (mean over ``k,S``);
+      ``latent_keepS``  per-parcel tap with the ``k·S·d`` freq×time cells kept —
+                        apples-to-apples with the raw floor (which keeps freq/time).
+    Frontend keep-S is not evaluated (per-electrode ``C·S·d`` ≈ 1.4M dims → OOM; the
+    cross-subject unit is the parcel, so keep-S is a latent eval)."""
     needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
     sd = {s: dataset.subject_data(s) for s in needed}
     front: dict[int, Tensor] = {}
     latent: dict[int, Tensor] = {}
+    latent_keep: dict[int, Tensor] = {}
     labels: dict[int, Tensor] = {}
     for s in needed:
-        f, lat, lab = encode_subject_taps(
+        f, lat, lat_keep, lab = encode_subject_taps(
             model, sd[s].bands, sd[s].parcel_per_electrode,
             clip_len_s=clip_len_s, device=device, batch_size=batch_size,
         )
         front[s] = f.unsqueeze(-1)        # (N,C,d,1) for the raw machinery
         latent[s] = lat
+        latent_keep[s] = lat_keep
         labels[s] = lab
 
-    metrics = raw_ws_cs_auroc(
-        front, sd, ws_subjects=dataset.ws_subjects, cs_anchor=dataset.cs_anchor,
-        cs_test_subjects=dataset.cs_test_subjects, tasks=dataset.tasks,
-        n_parcels=dataset.n_parcels, max_iter=max_iter, tap="frontend",
-    )
-    metrics.update(latent_ws_cs_auroc(
-        latent, labels, sd, ws_subjects=dataset.ws_subjects, cs_anchor=dataset.cs_anchor,
+    common = dict(
+        ws_subjects=dataset.ws_subjects, cs_anchor=dataset.cs_anchor,
         cs_test_subjects=dataset.cs_test_subjects, tasks=dataset.tasks,
         n_parcels=dataset.n_parcels, max_iter=max_iter,
-    ))
+    )
+    metrics = raw_ws_cs_auroc(front, sd, tap="frontend", estimator=estimator, **common)
+    metrics.update(latent_ws_cs_auroc(
+        latent, labels, sd, tap="latent", estimator=estimator, **common))
+    metrics.update(latent_ws_cs_auroc(
+        latent_keep, labels, sd, tap="latent_keepS", estimator=estimator, **common))
     return metrics
 
 

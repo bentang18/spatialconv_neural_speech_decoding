@@ -43,9 +43,27 @@ from speech_decoding.experiments.linear_probe_logistic import (
 )
 from speech_decoding.experiments.online_probe import (
     _finite_rows,
+    cs_auroc as _cs_auroc_ridge,
     feature_matrix,
     parcel_intersection,
+    ws_auroc_2fold as _ws_auroc_ridge,
 )
+
+
+def auroc_estimators(estimator: str, max_iter: int):
+    """Return ``(ws_fn(z,y), cs_fn(za,ya,zt,yt))`` for ``"logistic"`` or ``"ridge"``.
+
+    Shared by the raw floor and the encoder-tap bench so both score with one meter.
+    ``"ridge"`` = the dimension-robust dual ridge (``online_probe`` primitives; the
+    trustworthy meter at p≫n); ``"logistic"`` = fixed-C L2 logistic (the original
+    floor). The ridge primitives take no ``max_iter``."""
+    if estimator == "ridge":
+        return (lambda z, y: _ws_auroc_ridge(z, y),
+                lambda za, ya, zt, yt: _cs_auroc_ridge(za, ya, zt, yt))
+    if estimator == "logistic":
+        return (lambda z, y: ws_auroc_2fold_logistic(z, y, max_iter=max_iter),
+                lambda za, ya, zt, yt: cs_auroc_logistic(za, ya, zt, yt, max_iter=max_iter))
+    raise ValueError(f"estimator must be 'logistic' or 'ridge', got {estimator!r}")
 
 __all__ = [
     "raw_bins_from_bands",
@@ -128,8 +146,9 @@ def raw_ws_cs_auroc(
     n_parcels: int,
     max_iter: int = 10000,
     tap: str = "raw",
+    estimator: str = "logistic",
 ) -> dict[str, float]:
-    """WS (per-electrode) + CS (parcel-pool) logistic AUROC over all tasks.
+    """WS (per-electrode) + CS (parcel-pool) AUROC over all tasks.
 
     ``raw[s]`` is subject ``s``'s ``(N,C,D,1)`` per-electrode feature bins; ``sd[s]``
     carries ``parcel_per_electrode`` / ``electrode_mask`` / ``labels``. ``tap`` names
@@ -138,6 +157,7 @@ def raw_ws_cs_auroc(
     ``val_probe/{tap}/{ws,cs,gap}/{task}`` so the floor and the trained taps share the
     metric namespace and drop straight onto a run's ``val_probe/...`` lines."""
     a = cs_anchor
+    ws_fn, cs_fn = auroc_estimators(estimator, max_iter)
     pooled_cs: dict[int, tuple[Tensor, Tensor]] = {
         s: pool_electrodes_to_parcels(
             raw[s], sd[s].parcel_per_electrode, sd[s].electrode_mask, n_parcels
@@ -151,10 +171,7 @@ def raw_ws_cs_auroc(
         for s in ws_subjects:
             z = per_electrode_features(raw[s], sd[s].electrode_mask).numpy()
             zf, yf = _finite_rows(z, sd[s].labels[task])
-            ws_vals.append(
-                ws_auroc_2fold_logistic(zf, yf, max_iter=max_iter)
-                if len(yf) >= 4 else float("nan")
-            )
+            ws_vals.append(ws_fn(zf, yf) if len(yf) >= 4 else float("nan"))
         ws_mean = float(np.nanmean(ws_vals)) if ws_vals else float("nan")
 
         pa, pres_a = pooled_cs[a]
@@ -170,7 +187,7 @@ def raw_ws_cs_auroc(
             if len(ya) < 2 or len(yt) < 1:
                 cs_vals.append(float("nan"))
                 continue
-            cs_vals.append(cs_auroc_logistic(za, ya, zt, yt, max_iter=max_iter))
+            cs_vals.append(cs_fn(za, ya, zt, yt))
         cs_mean = float(np.nanmean(cs_vals)) if cs_vals else float("nan")
 
         metrics[f"val_probe/{tap}/ws/{task}"] = ws_mean
