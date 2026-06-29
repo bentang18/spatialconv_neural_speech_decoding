@@ -477,6 +477,7 @@ def run_v2_probe_bench(
     dataset_cache_path: str | None = None,
     skip_raw: bool = False,
     taps: tp.Sequence[str] | None = None,
+    attentive_kwargs: dict | None = None,
 ) -> dict[str, float]:  # pragma: no cover - needs BT voltage (+ ckpt for taps)
     """Build the dev probe dataset from ``xp.data`` and bench it.
 
@@ -487,7 +488,10 @@ def run_v2_probe_bench(
     of rebuilding from BT voltage (the probe dataset is build-once / clip-len-fixed);
     a missing path builds then saves it there. ``taps`` (None = all) restricts the
     encoder-tap families — pass only the surfaces under test to bound host RAM at
-    ``d384``. Writes ``{metrics, ckpt, n_cap}`` to ``out_path`` and returns the dict."""
+    ``d384``. ``attentive_kwargs`` (when set, with a ckpt) additionally runs the
+    attentive-head bench (:func:`run_v2_attentive_bench`) on the same loaded model and
+    merges its ``val_probe/attn_*`` metrics; ``taps=()`` skips the ridge taps for an
+    attentive-only run. Writes ``{metrics, ckpt, n_cap}`` to ``out_path``."""
     from speech_decoding.experiments.v2_probe_dataset import build_v2_probe_dataset
 
     if dataset_cache_path is not None and os.path.exists(dataset_cache_path):
@@ -526,6 +530,14 @@ def run_v2_probe_bench(
         print("[v2-probe-bench] encoder taps:")
         for k in sorted(tap_metrics):
             print(f"    {k} = {tap_metrics[k]:.4f}")
+        if attentive_kwargs is not None:
+            print("[v2-probe-bench] running attentive-head bench ...")
+            attn_metrics = run_v2_attentive_bench(
+                dataset, model, clip_len_s=clip_len_s, device=dev, **attentive_kwargs,
+            )
+            metrics.update(attn_metrics)
+            for k in sorted(attn_metrics):
+                print(f"    {k} = {attn_metrics[k]:.4f}")
     else:
         print("[v2-probe-bench] no checkpoint — raw floor only (taps skipped).")
 

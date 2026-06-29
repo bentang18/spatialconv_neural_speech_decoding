@@ -3187,7 +3187,35 @@ def _parser() -> argparse.ArgumentParser:
                    help="Comma-list of encoder-tap families to score (default all five: "
                         "frontend,frontend_keepS,latent,latent_keepS,pool_keepS). Restrict "
                         "to the surfaces under test (e.g. latent_keepS,pool_keepS) to bound "
-                        "host RAM at d384 n_cap>=3500.")
+                        "host RAM at d384 n_cap>=3500. Pass an empty value to skip the "
+                        "ridge taps entirely (attentive-only run).")
+    # Attentive-head bench (v2_probe_bench.run_v2_attentive_bench) — the NONLINEAR rung.
+    # Adds onto the probe-bench when --v2-attentive-bench is set (needs a ckpt). 7-fold
+    # leave-one-SUBJECT-out CS on M3/M4 with nested-val WD/LS/dropout sweep + SWAD + DiWA.
+    p.add_argument("--v2-attentive-bench", action="store_true",
+                   help="Also run the attentive-head bench on the loaded ckpt (M3/M4 "
+                        "single-query cross-attention readout). Pair with "
+                        "--v2-probe-bench-out/--v2-probe-bench-ckpt.")
+    p.add_argument("--v2-attentive-surfaces", type=str, default="m3,m4",
+                   help="Comma-list of surfaces for the attentive bench (default m3,m4).")
+    p.add_argument("--v2-attentive-towers", type=str, default="student",
+                   help="Comma-list of towers: student,teacher (default student).")
+    p.add_argument("--v2-attentive-wd-grid", type=str, default="0.1,1.0,3.0",
+                   help="Comma-list AdamW weight-decay grid (up to 3.0). Default 0.1,1.0,3.0.")
+    p.add_argument("--v2-attentive-dropout-grid", type=str, default="0.1,0.5",
+                   help="Comma-list dropout grid (tied attn/MLP/residual, very-large "
+                        "range). Default 0.1,0.5.")
+    p.add_argument("--v2-attentive-ls-grid", type=str, default="0.0,0.1",
+                   help="Comma-list label-smoothing grid (keep 0.0 in it as the safety "
+                        "net). Default 0.0,0.1.")
+    p.add_argument("--v2-attentive-diwa-seeds", type=int, default=3,
+                   help="DiWA: heads averaged per HP (different seeds). Default 3.")
+    p.add_argument("--v2-attentive-max-steps", type=int, default=2000,
+                   help="Max optimizer steps per head (early-stop usually fires first).")
+    p.add_argument("--v2-attentive-n-heads", type=int, default=6,
+                   help="Attention heads in the readout (match the encoder; default 6).")
+    p.add_argument("--v2-attentive-n-queries", type=int, default=1,
+                   help="Learnable queries (1 = V-JEPA-2 classification; >1 = ablation).")
     # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
     # run_gns_probe). Builds the real converged module + group_by_session loader,
     # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
@@ -5115,9 +5143,26 @@ def main(argv: list[str] | None = None) -> int:
         from speech_decoding.experiments.v2_probe_bench import run_v2_probe_bench
 
         _v2_taps = (
-            tuple(t.strip() for t in args.v2_probe_bench_taps.split(",") if t.strip())
-            if args.v2_probe_bench_taps else None
+            None if args.v2_probe_bench_taps is None
+            else tuple(t.strip() for t in args.v2_probe_bench_taps.split(",") if t.strip())
         )
+
+        def _floats(s: str) -> tuple[float, ...]:
+            return tuple(float(x) for x in s.split(",") if x.strip())
+
+        _attn_kwargs = None
+        if args.v2_attentive_bench:
+            _attn_kwargs = dict(
+                surfaces=tuple(s.strip() for s in args.v2_attentive_surfaces.split(",") if s.strip()),
+                towers=tuple(t.strip() for t in args.v2_attentive_towers.split(",") if t.strip()),
+                wd_grid=_floats(args.v2_attentive_wd_grid),
+                dropout_grid=_floats(args.v2_attentive_dropout_grid),
+                ls_grid=_floats(args.v2_attentive_ls_grid),
+                n_diwa_seeds=args.v2_attentive_diwa_seeds,
+                max_steps=args.v2_attentive_max_steps,
+                n_heads=args.v2_attentive_n_heads,
+                n_queries=args.v2_attentive_n_queries,
+            )
         run_v2_probe_bench(
             xp, out_path=args.v2_probe_bench_out, ckpt_path=args.v2_probe_bench_ckpt,
             clip_len_s=1.0, max_iter=args.v2_probe_bench_max_iter,
@@ -5125,6 +5170,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset_cache_path=args.v2_probe_bench_dataset_cache,
             skip_raw=args.v2_probe_bench_skip_raw,
             taps=_v2_taps,
+            attentive_kwargs=_attn_kwargs,
         )
         return 0
     if args.gns_probe:
