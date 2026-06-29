@@ -131,9 +131,10 @@ def test_loso_pooled_cs_separable_beats_chance():
     out = loso_pooled_cs(tokens, labels, subs, base, hp_grid=grid, n_diwa_seeds=1)
     assert len(out["folds"]) == 5
     assert out["cs_mean"] > 0.8
-    # firewall: each fold's val_s and test_s are distinct and both in the cohort
+    # firewall: the test subject is never in the fit pool (selection or final refit)
     for f in out["folds"]:
-        assert f["val_s"] != f["test_s"]
+        assert f["test_s"] not in f["fit_subjects"]
+        assert set(f["fit_subjects"]) == set(subs) - {f["test_s"]}
 
 
 def test_loso_pooled_cs_random_near_chance():

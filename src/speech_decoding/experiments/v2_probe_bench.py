@@ -412,8 +412,9 @@ def run_v2_attentive_bench(
     For each tower (student / EMA-teacher), forward every cohort subject through
     :func:`encode_subject_tokens` → the ``(N,P,k,S,d)`` M3-tagged / M4 token grids,
     flatten each to a ``(N, P·k·S, d)`` set, and for each surface×task run
-    :func:`loso_pooled_cs` — 7-fold leave-one-SUBJECT-out with a nested-val WD/LS/dropout
-    sweep, SWAD per run, DiWA across ``n_diwa_seeds``. The HP grid is the cartesian
+    :func:`loso_pooled_cs` — leave-one-SUBJECT-out test with INNER-LOSO model selection
+    (HP chosen by mean inner-val AUROC over all train subjects, not one), SWAD per run,
+    DiWA across ``n_diwa_seeds``. The HP grid is the cartesian
     product of ``wd_grid`` (up to 3.0) × ``dropout_grid`` (very-large range, tied across
     attn/MLP/residual) × ``ls_grid`` (label smoothing, 0 in the grid as the safety net).
     Emits ``val_probe/attn_{surface}_{tower}/{cs,cs_std}/{task}``; the bar is the raw_tok
