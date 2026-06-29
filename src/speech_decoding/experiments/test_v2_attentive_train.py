@@ -15,6 +15,8 @@ from speech_decoding.experiments.v2_attentive_probe import AttentiveProbeHead
 from speech_decoding.experiments.v2_attentive_train import (
     HeadTrainConfig,
     diwa_average,
+    loso_pooled_cs,
+    pad_concat,
     train_head,
 )
 
@@ -90,6 +92,71 @@ def test_diwa_average_fuses_heads():
     with torch.no_grad():
         s = head(xv).squeeze(-1).numpy()
     assert roc_auc_score(yv.numpy(), s) > 0.85
+
+
+def test_pad_concat_shapes_and_mask():
+    a = torch.randn(3, 4, 8)
+    b = torch.randn(2, 7, 8)
+    x, m = pad_concat([a, b])
+    assert x.shape == (5, 7, 8)
+    assert m.shape == (5, 7)
+    assert m[:3, :4].all() and not m[:3, 4:].any()   # subject A: 4 valid, 3 pad
+    assert m[3:].all()                                # subject B: all 7 valid
+    assert torch.allclose(x[:3, :4], a)              # real tokens preserved
+    assert torch.allclose(x[:3, 4:], torch.zeros(3, 3, 8))  # pad is zero
+
+
+def _multi_subject(seed, *, separable, n_sub=5, d=12):
+    """Subjects with DIFFERENT token counts; token-mean encodes a SHARED label rule."""
+    rng = np.random.default_rng(seed)
+    tokens, labels = {}, {}
+    for s in range(n_sub):
+        n = 120
+        t = 5 + s * 2                                # 5,7,9,11,13 tokens → padding path
+        y = rng.choice([0.0, 1.0], size=n).astype(np.float32)
+        x = rng.standard_normal((n, t, d)).astype(np.float32)
+        if separable:
+            x[:, :, 0] += (2.0 * y - 1.0)[:, None] * 1.6   # shared discriminative dim
+        tokens[s] = torch.from_numpy(x)
+        labels[s] = y
+    return tokens, labels, list(range(n_sub))
+
+
+def test_loso_pooled_cs_separable_beats_chance():
+    tokens, labels, subs = _multi_subject(0, separable=True)
+    base = HeadTrainConfig(d_model=12, n_heads=4, attn_dropout=0.0, mlp_dropout=0.0,
+                           residual_dropout=0.0, token_dropout=0.0, lr=3e-3,
+                           max_steps=600, eval_every=50, swad_warmup=100, patience=6)
+    grid = [{"weight_decay": 0.05, "label_smoothing": 0.0}]
+    out = loso_pooled_cs(tokens, labels, subs, base, hp_grid=grid, n_diwa_seeds=1)
+    assert len(out["folds"]) == 5
+    assert out["cs_mean"] > 0.8
+    # firewall: each fold's val_s and test_s are distinct and both in the cohort
+    for f in out["folds"]:
+        assert f["val_s"] != f["test_s"]
+
+
+def test_loso_pooled_cs_random_near_chance():
+    tokens, labels, subs = _multi_subject(1, separable=False)
+    base = HeadTrainConfig(d_model=12, n_heads=4, max_steps=400, eval_every=40,
+                           swad_warmup=80, patience=4)
+    grid = [{"weight_decay": 0.1, "label_smoothing": 0.0}]
+    out = loso_pooled_cs(tokens, labels, subs, base, hp_grid=grid, n_diwa_seeds=1)
+    assert 0.3 < out["cs_mean"] < 0.7
+
+
+def test_loso_pooled_cs_hp_selection_picks_by_val():
+    """Two-HP grid runs end-to-end and records the selected hp per fold."""
+    tokens, labels, subs = _multi_subject(2, separable=True, n_sub=4)
+    base = HeadTrainConfig(d_model=12, n_heads=4, attn_dropout=0.0, mlp_dropout=0.0,
+                           residual_dropout=0.0, token_dropout=0.0, lr=3e-3,
+                           max_steps=400, eval_every=50, swad_warmup=80, patience=5)
+    grid = [{"weight_decay": 0.01, "label_smoothing": 0.0},
+            {"weight_decay": 1.0, "label_smoothing": 0.1}]
+    out = loso_pooled_cs(tokens, labels, subs, base, hp_grid=grid, n_diwa_seeds=1)
+    assert len(out["folds"]) == 4
+    for f in out["folds"]:
+        assert f["hp"] in grid
 
 
 def test_diwa_average_is_parameter_mean():

@@ -18,7 +18,7 @@ subject's AUROC is what selects for cross-subject transfer (the load-bearing reg
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -27,7 +27,10 @@ from torch import Tensor
 
 from speech_decoding.experiments.v2_attentive_probe import AttentiveProbeHead
 
-__all__ = ["HeadTrainConfig", "train_head", "diwa_average"]
+__all__ = [
+    "HeadTrainConfig", "train_head", "diwa_average",
+    "pad_concat", "loso_pooled_cs",
+]
 
 
 @dataclass
@@ -149,6 +152,109 @@ def train_head(
     return {
         "best_state": best_state, "swad_state": swad_state,
         "best_val": float(best_val), "swad_val": swad_val, "steps": step,
+    }
+
+
+def pad_concat(tokens_list: list[Tensor]) -> tuple[Tensor, Tensor]:
+    """List of ``(N_s, T_s, d)`` → ``(ΣN, T_max, d)`` zero-padded + ``(ΣN, T_max)`` mask.
+
+    Subjects have different token counts ``T_s = P_s·k·S`` (different parcel counts);
+    the attentive head is set-valued so we pad to the batch max and mask the pad."""
+    d = tokens_list[0].shape[-1]
+    t_max = max(t.shape[1] for t in tokens_list)
+    xs: list[Tensor] = []
+    ms: list[Tensor] = []
+    for t in tokens_list:
+        n, ts, _ = t.shape
+        x = t if ts == t_max else torch.cat([t, t.new_zeros(n, t_max - ts, d)], dim=1)
+        m = torch.zeros(n, t_max, dtype=torch.bool)
+        m[:, :ts] = True
+        xs.append(x)
+        ms.append(m)
+    return torch.cat(xs, 0), torch.cat(ms, 0)
+
+
+def _stack(
+    tokens: dict[int, Tensor], labels: dict[int, np.ndarray], subs: list[int],
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Concat finite-label clips across ``subs`` → padded ``(x, mask, y)``."""
+    xs: list[Tensor] = []
+    ys: list[np.ndarray] = []
+    for s in subs:
+        y = np.asarray(labels[s], dtype=float)
+        fin = np.isfinite(y)
+        xs.append(tokens[s][torch.from_numpy(fin)])
+        ys.append(y[fin])
+    x, m = pad_concat(xs)
+    return x, m, torch.from_numpy(np.concatenate(ys)).float()
+
+
+def loso_pooled_cs(
+    tokens: dict[int, Tensor],
+    labels: dict[int, np.ndarray],
+    subjects: list[int],
+    base_cfg: HeadTrainConfig,
+    *,
+    hp_grid: list[dict],
+    n_diwa_seeds: int = 3,
+    device: torch.device | None = None,
+) -> dict:
+    """7-fold leave-one-SUBJECT-out cross-subject AUROC for the attentive head.
+
+    Per fold (test = each subject in turn): train on the remaining subjects MINUS one
+    nested-val subject (rotating), pooling their clips with :func:`pad_concat`. For each
+    HP in ``hp_grid`` train ``n_diwa_seeds`` heads (SWAD per run), DiWA-average them, and
+    score the fused head on the nested-val subject; SELECT the HP with the best val AUROC
+    (the firewall — test never enters selection), then report that fused head's AUROC on
+    the held-out test subject. Returns ``{cs_mean, cs_std, folds}`` where each fold logs
+    its ``test_s/val_s/hp/val/test``. ``tokens[s]`` ``(N_s,T_s,d)``, ``labels[s]``
+    ``(N_s,)`` in {0,1}/NaN for ONE task."""
+    if not hp_grid:
+        raise ValueError("hp_grid must be non-empty")
+    device = device or torch.device("cpu")
+    subs = list(subjects)
+    folds: list[dict] = []
+    for i, test_s in enumerate(subs):
+        train_s = [s for s in subs if s != test_s]
+        val_s = train_s[i % len(train_s)]                  # rotating nested-val subject
+        fit_s = [s for s in train_s if s != val_s]
+        x_tr, m_tr, y_tr = _stack(tokens, labels, fit_s)
+        x_val, m_val, y_val = _stack(tokens, labels, [val_s])
+        x_te, m_te, y_te = _stack(tokens, labels, [test_s])
+        y_val_np = y_val.numpy()
+        y_te_np = y_te.numpy()
+
+        best: dict | None = None
+        for hp in hp_grid:
+            cfg = replace(base_cfg, **hp)
+            states = []
+            for sd in range(n_diwa_seeds):
+                r = train_head(
+                    x_tr, y_tr, x_val, y_val, replace(cfg, seed=sd),
+                    mask_tr=m_tr, mask_val=m_val, device=device,
+                )
+                states.append(r["swad_state"])
+            fused = diwa_average(states)
+            vhead = _build_head(cfg).to(device)
+            vhead.load_state_dict(fused)
+            v = _auroc(vhead, x_val, y_val_np, m_val, device)
+            if best is None or (np.isfinite(v) and v > best["val"]):
+                best = {"val": v, "state": fused, "hp": hp}
+
+        assert best is not None                            # hp_grid non-empty ⇒ set
+        thead = _build_head(replace(base_cfg, **best["hp"])).to(device)
+        thead.load_state_dict(best["state"])
+        te = _auroc(thead, x_te, y_te_np, m_te, device)
+        folds.append({
+            "test_s": test_s, "val_s": val_s, "hp": best["hp"],
+            "val": best["val"], "test": te,
+        })
+
+    cs = [f["test"] for f in folds if np.isfinite(f["test"])]
+    return {
+        "cs_mean": float(np.mean(cs)) if cs else float("nan"),
+        "cs_std": float(np.std(cs)) if cs else float("nan"),
+        "folds": folds,
     }
 
 
