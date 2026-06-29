@@ -435,15 +435,19 @@ def run_v2_attentive_bench(
     metrics: dict[str, float] = {}
     for tower in towers:
         use_teacher = tower == "teacher"
-        toks: dict[str, dict[int, Tensor]] = {"m3": {}, "m4": {}}
+        # Only materialize the requested surfaces — each is ~k·S·d/parcel × N × ΣP wide
+        # (≈110GB at d384/n_cap3500), so holding both M3 and M4 doubles peak host RAM.
+        toks: dict[str, dict[int, Tensor]] = {sf: {} for sf in surfaces}
         for s in subs:
             m3, m4, _ = encode_subject_tokens(
                 model, sd[s].bands, sd[s].parcel_per_electrode,
                 clip_len_s=clip_len_s, device=device, use_teacher=use_teacher,
                 batch_size=batch_size_fwd,
             )
-            toks["m3"][s] = m3.reshape(m3.shape[0], -1, m3.shape[-1])
-            toks["m4"][s] = m4.reshape(m4.shape[0], -1, m4.shape[-1])
+            if "m3" in toks:
+                toks["m3"][s] = m3.reshape(m3.shape[0], -1, m3.shape[-1])
+            if "m4" in toks:
+                toks["m4"][s] = m4.reshape(m4.shape[0], -1, m4.shape[-1])
             del m3, m4
         d_model = next(iter(toks["m3"].values())).shape[-1]
         base = HeadTrainConfig(
