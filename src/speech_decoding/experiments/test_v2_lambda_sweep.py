@@ -9,6 +9,8 @@ CS sweep + LOSO honest-selection plumbing over synthetic per-subject parcel tabl
 
 from __future__ import annotations
 
+import types
+
 import numpy as np
 import torch
 
@@ -18,9 +20,15 @@ from speech_decoding.experiments.v2_lambda_sweep import (
     loso_cs_auroc,
     ridge_lambda_curve,
     ridge_lambda_scores,
+    run_latent_keepS_lambda_sweep,
     select_lam_mult,
     sweep_cs_task,
     ws_lambda_curve,
+)
+from speech_decoding.models.v14_converged_v2 import (
+    V14ConvergedV2,
+    V14ConvergedV2Config,
+    bands_for_clip_len,
 )
 
 
@@ -153,3 +161,55 @@ def test_loso_cs_auroc_holds_out_each_subject():
 def test_loso_needs_two_usable_subjects():
     val, picks = loso_cs_auroc({1: np.zeros(len(DEFAULT_LAM_MULTS)), 2: None}, DEFAULT_LAM_MULTS)
     assert np.isnan(val) and picks == {}
+
+
+# --- driver smoke test: the one model-side (pragma:no-cover) path runs unattended
+# when Run A lands, so exercise it end-to-end now against a tiny real model. -------
+
+
+def _tiny_model():
+    cfg = V14ConvergedV2Config(
+        d_model=16, n_heads=4, frontend_layers=2, latent_layers=2,
+        m2_pred_layers=2, m4_pred_layers=2, pred_dim=16, n_parcels=62, k=2,
+        tube_ratio=0.35,
+    )
+    torch.manual_seed(0)
+    return V14ConvergedV2(cfg).eval()
+
+
+def _bands(n, c, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    b = bands_for_clip_len(1.0)
+    lfs = torch.randn(n, c, b[0].n_freq_bins, b[0].n_time_frames, generator=g)
+    hga = torch.randn(n, c, b[1].n_freq_bins, b[1].n_time_frames, generator=g)
+    return [lfs, hga]
+
+
+def test_run_latent_keepS_lambda_sweep_end_to_end():
+    model = _tiny_model()
+    n, c = 30, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    rng = np.random.default_rng(3)
+
+    def subject(sid):
+        y = rng.choice([-1.0, 1.0], size=n)
+        return types.SimpleNamespace(
+            bands=_bands(n, c, seed=sid), parcel_per_electrode=poe,
+            electrode_mask=torch.ones(c), labels={"delta_volume": y},
+        )
+
+    subjects = {s: subject(s) for s in (0, 1, 2)}
+    dataset = types.SimpleNamespace(
+        ws_subjects=[0, 1, 2], cs_anchor=0, cs_test_subjects=[1, 2],
+        tasks=["delta_volume"], n_parcels=62, subject_data=lambda s: subjects[s],
+    )
+    out = run_latent_keepS_lambda_sweep(
+        dataset, model, clip_len_s=1.0, device=torch.device("cpu"),
+        batch_size=8, lam_mults=[0.1, 1.0, 10.0],
+    )
+    assert out["lam_mults"] == [0.1, 1.0, 10.0]
+    t = out["tasks"]["delta_volume"]
+    assert len(t["cs_curve"]) == 3 and len(t["ws_curve"]) == 3
+    assert set(t["cs_per_subject"]) == {1, 2}
+    assert t["selected_lam_mult"] in (0.1, 1.0, 10.0)
+    assert np.isfinite(t["selected_cs_auroc"])
