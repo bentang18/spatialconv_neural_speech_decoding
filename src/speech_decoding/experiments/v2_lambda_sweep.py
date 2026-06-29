@@ -210,7 +210,7 @@ def run_latent_keepS_lambda_sweep(
     latent_keep: dict[int, Tensor] = {}
     labels: dict[int, Tensor] = {}
     for s in needed:
-        _, _, _, lat_keep, lab = encode_subject_taps(
+        _, _, _, lat_keep, _, lab = encode_subject_taps(
             model, sd[s].bands, sd[s].parcel_per_electrode,
             sd[s].electrode_mask, dataset.n_parcels,
             clip_len_s=clip_len_s, device=device, batch_size=batch_size,

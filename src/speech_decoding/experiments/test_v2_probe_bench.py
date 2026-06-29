@@ -89,7 +89,7 @@ def test_encode_subject_taps_shapes():
     n, c = 20, 4
     poe = torch.tensor([5, 5, 9, 20])  # parcels {5,9,20}
     mask = torch.ones(c)
-    front, front_keepS, latent, latent_keepS, labels = encode_subject_taps(
+    front, front_keepS, latent, latent_keepS, pool_keepS, labels = encode_subject_taps(
         model, _bands(n, c), poe, mask, 62,
         clip_len_s=1.0, device=torch.device("cpu"), batch_size=8,
     )
@@ -101,6 +101,8 @@ def test_encode_subject_taps_shapes():
     assert front_keepS.shape[:2] == (n, 3)    # keep-S frontend, parcel-pooled (N,P,S·d)
     assert front_keepS.shape[2] % 16 == 0     # multiple of d
     assert front_keepS.shape[2] == latent_keepS.shape[2] // 2  # S·d == (k·S·d)/k, k=2
+    # pool tap (M3 surface) shares the latent's (P,k,S,d) layout → same keep-S width
+    assert pool_keepS.shape == latent_keepS.shape
     assert labels.tolist() == [5, 9, 20]
 
 
@@ -125,7 +127,7 @@ def test_run_v2_encoder_taps_emits_all_metrics():
     out = run_v2_encoder_taps(
         dataset, model, clip_len_s=1.0, device=torch.device("cpu"), max_iter=300,
     )
-    for tap in ("frontend", "frontend_keepS", "latent", "latent_keepS"):
+    for tap in ("frontend", "frontend_keepS", "latent", "latent_keepS", "pool_keepS"):
         for split in ("ws", "cs", "gap"):
             assert f"val_probe/{tap}/{split}/delta_volume" in out
     assert all(np.isfinite(v) for v in out.values())

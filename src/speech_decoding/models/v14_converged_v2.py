@@ -1563,8 +1563,10 @@ class V14ConvergedV2(nn.Module):
         The student (or EMA-teacher) towers run over the FULL token grid with NO M2/M4
         mask — i.e. exactly the teacher path of :meth:`forward` (the lines that build
         ``t_front`` / ``t_seeds`` / ``t_latent``), which is the only mask-free encode in
-        the module. Returns the per-electrode frontend tap ``(B,C,S,d)`` and the
-        per-parcel latent tap ``(B,P,k,S,d)``, plus the session layout
+        the module. Returns the per-electrode frontend tap ``(B,C,S,d)``, the per-parcel
+        POOL output ``seeds`` ``(B,P,k,S,d)`` (the M3 head's target surface, post-pool /
+        pre-latent, terminal-LayerNorm'd) and the per-parcel latent tap ``(B,P,k,S,d)``
+        (the M4 head's target surface), plus the session layout
         (``labels`` ``(P,)`` / ``membership`` ``(P,C)`` / ``parcel_idx`` ``(C,)``) the
         probe needs to pool electrodes→parcels and pick present parcels. No loss, no
         grad — purely for probing a trained checkpoint."""
@@ -1579,6 +1581,7 @@ class V14ConvergedV2(nn.Module):
         latent = lat(seeds, lay.labels, lay.slot)                # (B,P,k,S,d)
         return {
             "frontend": front,
+            "pool": seeds,
             "latent": latent,
             "labels": lay.labels,
             "membership": lay.membership,
