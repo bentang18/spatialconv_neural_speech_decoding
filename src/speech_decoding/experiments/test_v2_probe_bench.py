@@ -211,3 +211,33 @@ def test_run_v2_attentive_bench_smoke():
         assert f"val_probe/attn_{surface}_student/cs/delta_volume" in out
         assert f"val_probe/attn_{surface}_student/cs_std/delta_volume" in out
     assert all(np.isfinite(v) for v in out.values())
+
+
+def test_run_v2_attentive_bench_single_surface():
+    """surfaces=('m4',) must not reach for a non-materialized 'm3' key (regression)."""
+    model = _tiny_model()
+    n, c = 24, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    rng = np.random.default_rng(11)
+
+    def subject(sid):
+        y = rng.choice([-1.0, 1.0], size=n)
+        return types.SimpleNamespace(
+            bands=_bands(n, c, seed=sid), parcel_per_electrode=poe,
+            electrode_mask=torch.ones(c), labels={"delta_volume": y},
+        )
+
+    subjects = {s: subject(s) for s in (0, 1, 2)}
+    dataset = types.SimpleNamespace(
+        ws_subjects=[0, 1, 2], cs_anchor=0, cs_test_subjects=[1, 2],
+        tasks=["delta_volume"], n_parcels=62, subject_data=lambda s: subjects[s],
+    )
+    out = run_v2_attentive_bench(
+        dataset, model, clip_len_s=1.0, device=torch.device("cpu"),
+        surfaces=("m4",), wd_grid=(0.1,), dropout_grid=(0.1,), ls_grid=(0.0,),
+        n_diwa_seeds=1, n_heads=4, max_steps=120, eval_every=30, swad_warmup=30,
+        patience=3, batch_size=16,
+    )
+    assert f"val_probe/attn_m4_student/cs/delta_volume" in out
+    assert not any("m3" in k for k in out)
+    assert all(np.isfinite(v) for v in out.values())

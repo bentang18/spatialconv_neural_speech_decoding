@@ -3216,6 +3216,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="Attention heads in the readout (match the encoder; default 6).")
     p.add_argument("--v2-attentive-n-queries", type=int, default=1,
                    help="Learnable queries (1 = V-JEPA-2 classification; >1 = ablation).")
+    p.add_argument("--v2-attentive-tasks", type=str, default="",
+                   help="Comma-list restricting attentive tasks (default '' = all "
+                        "dataset tasks). Use 'delta_volume' for the fast bar-only sweep.")
     # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
     # run_gns_probe). Builds the real converged module + group_by_session loader,
     # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
@@ -5162,6 +5165,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_steps=args.v2_attentive_max_steps,
                 n_heads=args.v2_attentive_n_heads,
                 n_queries=args.v2_attentive_n_queries,
+                tasks=tuple(t.strip() for t in args.v2_attentive_tasks.split(",") if t.strip())
+                or None,
             )
         run_v2_probe_bench(
             xp, out_path=args.v2_probe_bench_out, ckpt_path=args.v2_probe_bench_ckpt,

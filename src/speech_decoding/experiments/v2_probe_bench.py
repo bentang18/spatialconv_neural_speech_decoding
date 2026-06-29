@@ -449,7 +449,7 @@ def run_v2_attentive_bench(
             if "m4" in toks:
                 toks["m4"][s] = m4.reshape(m4.shape[0], -1, m4.shape[-1])
             del m3, m4
-        d_model = next(iter(toks["m3"].values())).shape[-1]
+        d_model = next(iter(toks[surfaces[0]].values())).shape[-1]
         base = HeadTrainConfig(
             d_model=d_model, n_heads=n_heads, n_queries=n_queries, mlp_ratio=mlp_ratio,
             token_dropout=token_dropout, lr=lr, max_steps=max_steps,
