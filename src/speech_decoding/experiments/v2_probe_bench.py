@@ -228,6 +228,11 @@ def latent_ws_cs_auroc(
     return metrics
 
 
+ALL_ENCODER_TAPS = (
+    "frontend", "frontend_keepS", "latent", "latent_keepS", "pool_keepS",
+)
+
+
 def run_v2_encoder_taps(
     dataset: tp.Any,
     model: tp.Any,
@@ -238,6 +243,7 @@ def run_v2_encoder_taps(
     batch_size: int = 64,
     estimator: str = "ridge",
     lam_mult: float = 1.0,
+    taps: tp.Sequence[str] | None = None,
 ) -> dict[str, float]:
     """Frontend + latent tap AUROC over the dev probe dataset, scored with ``estimator``.
 
@@ -252,7 +258,23 @@ def run_v2_encoder_taps(
                           the two keep-S encoder taps are apples-to-apples with the raw
                           ``raw_tok`` / keep-S floors.
     The keep-S taps mirror the raw floor's bin-keeping, so the encoder↔raw head-to-head
-    is matched at both reductions."""
+    is matched at both reductions.
+
+    ``taps`` (None = all five) restricts which families are accumulated AND scored — a
+    family not in ``taps`` is dropped right after each subject's forward, so its keep-S
+    tensors never accumulate across subjects. At ``d384`` n_cap≥3500 the four keep-S
+    families together overrun host RAM; passing e.g. ``("latent_keepS","pool_keepS")``
+    keeps only the two surfaces under test (M3/M4) and halves the footprint."""
+    want = ALL_ENCODER_TAPS if taps is None else tuple(taps)
+    unknown = [t for t in want if t not in ALL_ENCODER_TAPS]
+    if unknown:
+        raise ValueError(f"unknown encoder taps {unknown}; valid: {ALL_ENCODER_TAPS}")
+    need_front = "frontend" in want
+    need_front_keep = "frontend_keepS" in want
+    need_latent = "latent" in want
+    need_latent_keep = "latent_keepS" in want
+    need_pool_keep = "pool_keepS" in want
+
     needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
     sd = {s: dataset.subject_data(s) for s in needed}
     front: dict[int, Tensor] = {}
@@ -267,27 +289,40 @@ def run_v2_encoder_taps(
             sd[s].electrode_mask, dataset.n_parcels,
             clip_len_s=clip_len_s, device=device, batch_size=batch_size,
         )
-        front[s] = f.unsqueeze(-1)        # (N,C,d,1) for the raw machinery
-        front_keep[s] = f_keep
-        latent[s] = lat
-        latent_keep[s] = lat_keep
-        pool_keep[s] = p_keep
+        if need_front:
+            front[s] = f.unsqueeze(-1)    # (N,C,d,1) for the raw machinery
+        if need_front_keep:
+            front_keep[s] = f_keep
+        if need_latent:
+            latent[s] = lat
+        if need_latent_keep:
+            latent_keep[s] = lat_keep
+        if need_pool_keep:
+            pool_keep[s] = p_keep
         labels[s] = lab
+        del f, f_keep, lat, lat_keep, p_keep
 
     common = dict(
         ws_subjects=dataset.ws_subjects, cs_anchor=dataset.cs_anchor,
         cs_test_subjects=dataset.cs_test_subjects, tasks=dataset.tasks,
         n_parcels=dataset.n_parcels, max_iter=max_iter, lam_mult=lam_mult,
     )
-    metrics = raw_ws_cs_auroc(front, sd, tap="frontend", estimator=estimator, **common)
-    metrics.update(latent_ws_cs_auroc(
-        front_keep, labels, sd, tap="frontend_keepS", estimator=estimator, **common))
-    metrics.update(latent_ws_cs_auroc(
-        latent, labels, sd, tap="latent", estimator=estimator, **common))
-    metrics.update(latent_ws_cs_auroc(
-        latent_keep, labels, sd, tap="latent_keepS", estimator=estimator, **common))
-    metrics.update(latent_ws_cs_auroc(
-        pool_keep, labels, sd, tap="pool_keepS", estimator=estimator, **common))
+    metrics: dict[str, float] = {}
+    if need_front:
+        metrics.update(raw_ws_cs_auroc(
+            front, sd, tap="frontend", estimator=estimator, **common))
+    if need_front_keep:
+        metrics.update(latent_ws_cs_auroc(
+            front_keep, labels, sd, tap="frontend_keepS", estimator=estimator, **common))
+    if need_latent:
+        metrics.update(latent_ws_cs_auroc(
+            latent, labels, sd, tap="latent", estimator=estimator, **common))
+    if need_latent_keep:
+        metrics.update(latent_ws_cs_auroc(
+            latent_keep, labels, sd, tap="latent_keepS", estimator=estimator, **common))
+    if need_pool_keep:
+        metrics.update(latent_ws_cs_auroc(
+            pool_keep, labels, sd, tap="pool_keepS", estimator=estimator, **common))
     return metrics
 
 
@@ -300,31 +335,53 @@ def run_v2_probe_bench(
     n_cap: int = N_CAP,
     max_iter: int = 10000,
     device: torch.device | None = None,
+    dataset_cache_path: str | None = None,
+    skip_raw: bool = False,
+    taps: tp.Sequence[str] | None = None,
 ) -> dict[str, float]:  # pragma: no cover - needs BT voltage (+ ckpt for taps)
     """Build the dev probe dataset from ``xp.data`` and bench it.
 
-    Always runs the raw floor. If ``ckpt_path`` is given, also loads the v2 model and
-    runs the frontend/latent taps head-to-head. Writes ``{metrics, ckpt, n_cap}`` to
-    ``out_path`` and returns the metric dict."""
+    Always runs the raw floor unless ``skip_raw`` (the floor is a fixed model-free
+    quantity — once reproduced there is no reason to recompute it for a new ckpt). If
+    ``ckpt_path`` is given, also loads the v2 model and runs the encoder taps
+    head-to-head. ``dataset_cache_path``, when it exists, is ``torch.load``-ed instead
+    of rebuilding from BT voltage (the probe dataset is build-once / clip-len-fixed);
+    a missing path builds then saves it there. ``taps`` (None = all) restricts the
+    encoder-tap families — pass only the surfaces under test to bound host RAM at
+    ``d384``. Writes ``{metrics, ckpt, n_cap}`` to ``out_path`` and returns the dict."""
     from speech_decoding.experiments.v2_probe_dataset import build_v2_probe_dataset
 
-    print(f"[v2-probe-bench] building dev probe dataset (n_cap={n_cap}, clip={clip_len_s}s) ...")
-    dataset = build_v2_probe_dataset(xp.data, n_cap=n_cap)
+    if dataset_cache_path is not None and os.path.exists(dataset_cache_path):
+        print(f"[v2-probe-bench] loading cached dev probe dataset {dataset_cache_path} ...")
+        dataset = torch.load(dataset_cache_path, weights_only=False)
+    else:
+        print(f"[v2-probe-bench] building dev probe dataset "
+              f"(n_cap={n_cap}, clip={clip_len_s}s) ...")
+        dataset = build_v2_probe_dataset(xp.data, n_cap=n_cap)
+        if dataset_cache_path is not None:
+            os.makedirs(os.path.dirname(dataset_cache_path) or ".", exist_ok=True)
+            torch.save(dataset, dataset_cache_path)
+            print(f"[v2-probe-bench] cached dataset → {dataset_cache_path}")
     print(f"[v2-probe-bench] cohort ws={dataset.ws_subjects} "
           f"cs_anchor={dataset.cs_anchor} cs_test={dataset.cs_test_subjects} "
           f"n_parcels={dataset.n_parcels}")
 
-    metrics = run_v2_raw_baseline(dataset, max_iter=max_iter)
-    print("[v2-probe-bench] raw floor:")
-    for k in sorted(metrics):
-        print(f"    {k} = {metrics[k]:.4f}")
+    metrics: dict[str, float] = {}
+    if skip_raw:
+        print("[v2-probe-bench] skip_raw=True — raw floor not recomputed.")
+    else:
+        metrics = run_v2_raw_baseline(dataset, max_iter=max_iter)
+        print("[v2-probe-bench] raw floor:")
+        for k in sorted(metrics):
+            print(f"    {k} = {metrics[k]:.4f}")
 
     if ckpt_path is not None:
         dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[v2-probe-bench] loading checkpoint {ckpt_path} on {dev} ...")
         model = load_v2_converged_model(xp, ckpt_path, device=dev)
         tap_metrics = run_v2_encoder_taps(
-            dataset, model, clip_len_s=clip_len_s, device=dev, max_iter=max_iter
+            dataset, model, clip_len_s=clip_len_s, device=dev, max_iter=max_iter,
+            taps=taps,
         )
         metrics.update(tap_metrics)
         print("[v2-probe-bench] encoder taps:")

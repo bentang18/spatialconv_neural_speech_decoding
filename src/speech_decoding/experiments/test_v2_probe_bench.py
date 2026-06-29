@@ -131,3 +131,14 @@ def test_run_v2_encoder_taps_emits_all_metrics():
         for split in ("ws", "cs", "gap"):
             assert f"val_probe/{tap}/{split}/delta_volume" in out
     assert all(np.isfinite(v) for v in out.values())
+
+    # taps subset → only the requested families are scored (memory-bounded path).
+    sub = run_v2_encoder_taps(
+        dataset, model, clip_len_s=1.0, device=torch.device("cpu"), max_iter=300,
+        taps=("latent_keepS", "pool_keepS"),
+    )
+    assert {k.split("/")[1] for k in sub} == {"latent_keepS", "pool_keepS"}
+    for tap in ("latent_keepS", "pool_keepS"):
+        for split in ("ws", "cs", "gap"):
+            assert f"val_probe/{tap}/{split}/delta_volume" in sub
+    assert all(np.isfinite(v) for v in sub.values())

@@ -3176,6 +3176,18 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--v2-probe-bench-n-cap", type=int, default=None,
                    help="Windows/subject for the v2 probe dataset (default N_CAP=3500). "
                         "Lower it for a light smoke (e.g. 200) on a shared/login node.")
+    p.add_argument("--v2-probe-bench-dataset-cache", type=str, default=None,
+                   help="torch.load the probe dataset from here if it exists (build-once "
+                        "/ clip-len-fixed), else build + save it there. Skips the slow BT "
+                        "voltage rebuild on reruns; must match --v2-probe-bench-n-cap.")
+    p.add_argument("--v2-probe-bench-skip-raw", action="store_true",
+                   help="Skip the model-free raw |STFT| floor (a fixed quantity — once "
+                        "reproduced there is no reason to recompute it per ckpt).")
+    p.add_argument("--v2-probe-bench-taps", type=str, default=None,
+                   help="Comma-list of encoder-tap families to score (default all five: "
+                        "frontend,frontend_keepS,latent,latent_keepS,pool_keepS). Restrict "
+                        "to the surfaces under test (e.g. latent_keepS,pool_keepS) to bound "
+                        "host RAM at d384 n_cap>=3500.")
     # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
     # run_gns_probe). Builds the real converged module + group_by_session loader,
     # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
@@ -5102,10 +5114,17 @@ def main(argv: list[str] | None = None) -> int:
         from speech_decoding.experiments.online_probe_dataset import N_CAP
         from speech_decoding.experiments.v2_probe_bench import run_v2_probe_bench
 
+        _v2_taps = (
+            tuple(t.strip() for t in args.v2_probe_bench_taps.split(",") if t.strip())
+            if args.v2_probe_bench_taps else None
+        )
         run_v2_probe_bench(
             xp, out_path=args.v2_probe_bench_out, ckpt_path=args.v2_probe_bench_ckpt,
             clip_len_s=1.0, max_iter=args.v2_probe_bench_max_iter,
             n_cap=args.v2_probe_bench_n_cap or N_CAP,
+            dataset_cache_path=args.v2_probe_bench_dataset_cache,
+            skip_raw=args.v2_probe_bench_skip_raw,
+            taps=_v2_taps,
         )
         return 0
     if args.gns_probe:
