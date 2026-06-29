@@ -1579,9 +1579,19 @@ class V14ConvergedV2(nn.Module):
         front = fe.encode_tokens(tok, lay.freq_id, lay.slot)     # (B,C,S,d)
         seeds = pool(front, lay.membership, lay.labels, lay.cell_patch)  # (B,P,k,S,d)
         latent = lat(seeds, lay.labels, lay.slot)                # (B,P,k,S,d)
+        # M3 attentive surface: the bare pool output carries NO parcel tag (the pool
+        # is per-cell), so a single-query attentive readout that pools ACROSS parcels
+        # would be parcel-blind. Re-add the latent's OWN parcel embed (`embed_p^pos`,
+        # the same table the latent tags its input with at line 793) so the M3 token
+        # carries the model's parcel id — no new readout embedding. The bare `pool`
+        # is kept untagged for the keep-S ridge rung (per-parcel weight blocks make
+        # the tag structural there; tagging would only shift the floor's numbers).
+        # M4 (`latent`) already rode through that embed internally ⇒ no re-add.
+        pool_tagged = seeds + lat.parcel_embed(lay.labels)[None, :, None, None, :]
         return {
             "frontend": front,
             "pool": seeds,
+            "pool_tagged": pool_tagged,
             "latent": latent,
             "labels": lay.labels,
             "membership": lay.membership,

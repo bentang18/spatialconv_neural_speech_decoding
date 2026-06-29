@@ -19,6 +19,7 @@ import torch
 
 from speech_decoding.experiments.v2_probe_bench import (
     encode_subject_taps,
+    encode_subject_tokens,
     latent_ws_cs_auroc,
     run_v2_encoder_taps,
 )
@@ -104,6 +105,42 @@ def test_encode_subject_taps_shapes():
     # pool tap (M3 surface) shares the latent's (P,k,S,d) layout → same keep-S width
     assert pool_keepS.shape == latent_keepS.shape
     assert labels.tolist() == [5, 9, 20]
+
+
+def test_pool_tagged_is_pool_plus_latent_parcel_embed():
+    """M3 attentive surface = bare pool + the latent's OWN parcel embed (no new table)."""
+    model = _tiny_model()
+    n, c = 6, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    lfs, hga = _bands(n, c)
+    taps = model.encode_clip_taps(lfs, hga, poe, clip_len_s=1.0)
+    labels = taps["labels"]                                        # (P,)
+    tag = model.latent.parcel_embed(labels)[None, :, None, None, :]
+    assert torch.allclose(taps["pool_tagged"], taps["pool"] + tag, atol=1e-6)
+    # bare pool is left UNtagged (the ridge rung depends on it)
+    assert not torch.allclose(taps["pool_tagged"], taps["pool"])
+
+
+def test_encode_subject_tokens_shapes_and_teacher():
+    model = _tiny_model()
+    n, c = 12, 4
+    poe = torch.tensor([5, 5, 9, 20])  # parcels {5,9,20}
+    bands = _bands(n, c)
+    m3, m4, labels = encode_subject_tokens(
+        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"), batch_size=8,
+    )
+    # full per-token grid kept (N,P,k,S,d): P=3 active parcels, k=2, d=16
+    assert m3.shape[0] == n and m3.shape[1] == 3 and m3.shape[2] == 2 and m3.shape[-1] == 16
+    assert m4.shape == m3.shape
+    assert labels.tolist() == [5, 9, 20]
+    # teacher towers are deepcopies at init ⇒ teacher tap == student tap (path works)
+    m3_t, m4_t, lab_t = encode_subject_tokens(
+        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"),
+        use_teacher=True, batch_size=8,
+    )
+    assert torch.allclose(m3_t, m3, atol=1e-6)
+    assert torch.allclose(m4_t, m4, atol=1e-6)
+    assert lab_t.tolist() == labels.tolist()
 
 
 def test_run_v2_encoder_taps_emits_all_metrics():

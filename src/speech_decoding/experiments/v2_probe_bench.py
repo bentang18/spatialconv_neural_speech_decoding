@@ -49,6 +49,7 @@ from speech_decoding.experiments.v2_raw_probe import (
 __all__ = [
     "load_v2_converged_model",
     "encode_subject_taps",
+    "encode_subject_tokens",
     "latent_ws_cs_auroc",
     "run_v2_encoder_taps",
     "run_v2_probe_bench",
@@ -158,6 +159,52 @@ def encode_subject_taps(
         torch.cat(latents, 0), torch.cat(latents_keep, 0),
         torch.cat(pools_keep, 0), labels,
     )
+
+
+@torch.no_grad()
+def encode_subject_tokens(
+    model: tp.Any,
+    bands: list[Tensor],
+    parcel_per_electrode: Tensor,
+    *,
+    clip_len_s: float,
+    device: torch.device,
+    use_teacher: bool = False,
+    batch_size: int = 64,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Forward one subject → M3-tagged + M4 PER-TOKEN taps for the attentive head.
+
+    Unlike :func:`encode_subject_taps` (which mean-pools / flattens for the ridge
+    rungs), this keeps the full ``(N, P, k, S, d)`` token grid the single-query
+    attentive pool consumes — it pools the ``P·k·S`` set itself, so nothing is
+    reduced here. Returns ``(m3, m4, labels)``:
+      ``m3``   POOL output + the latent's parcel embed (``taps["pool_tagged"]``) —
+               parcel id rides in the token so the across-parcel pool isn't blind;
+      ``m4``   latent output (``taps["latent"]``) — already parcel-tagged internally;
+      ``labels`` ``(P,)`` active-parcel DKT ids.
+    ``use_teacher`` selects the EMA-teacher towers (both surfaces from one tower).
+    All on CPU; the attentive head reshapes ``(N,P,k,S,d)`` → set per clip."""
+    lfs, hga = bands[0], bands[1]
+    n = lfs.shape[0]
+    ppe = parcel_per_electrode.to(device)
+    m3s: list[Tensor] = []
+    m4s: list[Tensor] = []
+    labels: Tensor | None = None
+    for i in range(0, n, batch_size):
+        taps = model.encode_clip_taps(
+            lfs[i : i + batch_size].to(device),
+            hga[i : i + batch_size].to(device),
+            ppe,
+            clip_len_s=clip_len_s,
+            use_teacher=use_teacher,
+        )
+        m3s.append(taps["pool_tagged"].cpu())                      # (b,P,k,S,d)
+        m4s.append(taps["latent"].cpu())                           # (b,P,k,S,d)
+        if labels is None:
+            labels = taps["labels"].cpu().long()
+    if labels is None:
+        raise RuntimeError("subject had no clips to encode")
+    return torch.cat(m3s, 0), torch.cat(m4s, 0), labels
 
 
 def latent_ws_cs_auroc(
