@@ -67,6 +67,7 @@ def auroc_estimators(estimator: str, max_iter: int):
 
 __all__ = [
     "raw_bins_from_bands",
+    "raw_pooled_tokens_from_bands",
     "per_electrode_features",
     "pool_electrodes_to_parcels",
     "raw_ws_cs_auroc",
@@ -96,6 +97,51 @@ def raw_bins_from_bands(bands: Sequence[Tensor]) -> Tensor:
         n, c, f, t = b.shape
         cols.append(b.reshape(n, c, f * t))          # freq-major, time-minor
     return torch.cat(cols, dim=2).unsqueeze(-1)      # (N, C, D_raw, 1)
+
+
+def raw_pooled_tokens_from_bands(
+    bands: Sequence[Tensor], specs: Sequence[tp.Any]
+) -> Tensor:
+    """Mean-pool every ``|STFT|`` bin into the frontend's 22-token patch grid →
+    ``(N, C, N_TOK, 1)``.
+
+    The *linear* analogue of the learned :class:`TwoBandTokenizerV2` ``_PatchStem``
+    pooling: per band, for each freq-patch group (cumulative ``freq_patch_bins``) ×
+    each non-overlapping ``kernel_time`` time window, take the **mean** over that
+    patch's ``freq×time`` bins → one scalar token. Token order is band-major,
+    freq-group-major, time-minor — identical to the tokenizer's concat order — so
+    ``N_TOK = Σ_b n_freq_patches_b · n_tp_b`` (= 22 @1 s). Each ``spec`` supplies the
+    clip-independent ``freq_patch_bins`` + ``kernel_time``; the time count is read
+    from the delivered band's own ``T``. Trailing ``d=1`` matches
+    :func:`raw_bins_from_bands` so the WS/CS path is shared."""
+    if not bands:
+        raise ValueError("need at least one band")
+    if len(bands) != len(specs):
+        raise ValueError(f"need one spec per band; got {len(bands)} bands, {len(specs)} specs")
+    n0, c0 = bands[0].shape[0], bands[0].shape[1]
+    cols: list[Tensor] = []
+    for b, spec in zip(bands, specs):
+        if b.ndim != 4:
+            raise ValueError(f"each band must be (N,C,F,T) magnitude; got {tuple(b.shape)}")
+        n, c, f, t = b.shape
+        if n != n0 or c != c0:
+            raise ValueError(f"bands must share (N,C); got {(n, c)} vs {(n0, c0)}")
+        kt = int(spec.kernel_time)
+        if sum(spec.freq_patch_bins) != f:
+            raise ValueError(
+                f"band freq bins {f} != sum(freq_patch_bins) {sum(spec.freq_patch_bins)}"
+            )
+        n_tp = (t - kt) // kt + 1
+        if n_tp < 1:
+            raise ValueError(f"time frames {t} < kernel_time {kt}; clip too short")
+        lo = 0
+        for g in spec.freq_patch_bins:
+            fg = b[:, :, lo:lo + g, :]                       # (N, C, g, T)
+            lo += g
+            for j in range(n_tp):
+                w = fg[:, :, :, j * kt:(j + 1) * kt]         # (N, C, g, kt)
+                cols.append(w.reshape(n, c, -1).mean(dim=2))  # (N, C)
+    return torch.stack(cols, dim=2).unsqueeze(-1)            # (N, C, N_TOK, 1)
 
 
 def per_electrode_features(raw: Tensor, electrode_mask: Tensor) -> Tensor:
@@ -196,23 +242,44 @@ def raw_ws_cs_auroc(
     return metrics
 
 
-def run_v2_raw_baseline(dataset: tp.Any, *, max_iter: int = 10000) -> dict[str, float]:
-    """Raw-feature floor over the dev probe dataset.
+def run_v2_raw_baseline(
+    dataset: tp.Any, *, max_iter: int = 10000, estimator: str = "ridge"
+) -> dict[str, float]:
+    """Raw-feature floor over the dev probe dataset — two representations.
 
     ``dataset`` is the v2 probe dataset: ``ws_subjects`` / ``cs_anchor`` /
     ``cs_test_subjects`` / ``tasks`` / ``n_parcels`` and ``subject_data(s)`` whose
     result carries ``.bands`` (the list of magnitude band tensors the encoder is
     fed) plus ``.parcel_per_electrode`` / ``.electrode_mask`` / ``.labels``. Pure
-    CPU tensor work — no model, no forward."""
+    CPU tensor work — no model, no forward.
+
+    Emits **two** floors with the same protocol/estimator (default ``"ridge"`` — the
+    dimension-robust dual ridge that the encoder-tap bench scores with, so floor and
+    taps share one meter):
+      - ``val_probe/raw/...``     — every ``|STFT|`` bin (full ``D_raw``, no pooling).
+      - ``val_probe/raw_tok/...`` — the frontend's 22-token mean-pool grid (the
+        apples-to-apples floor for the *pooled* encoder taps).
+
+    Band patch specs (``freq_patch_bins`` + ``kernel_time``) default to ``BANDS_V2``
+    (clip-independent); a ``dataset.band_specs`` attribute overrides them (used by the
+    laptop test, whose synthetic bands don't match the real ladder)."""
     needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
     sd = {s: dataset.subject_data(s) for s in needed}
+    specs = getattr(dataset, "band_specs", None)
+    if specs is None:
+        from speech_decoding.models.v14_converged_v2 import BANDS_V2
+        specs = BANDS_V2
     raw = {s: raw_bins_from_bands(sd[s].bands) for s in needed}
-    return raw_ws_cs_auroc(
-        raw, sd,
+    tok = {s: raw_pooled_tokens_from_bands(sd[s].bands, specs) for s in needed}
+    common = dict(
         ws_subjects=dataset.ws_subjects,
         cs_anchor=dataset.cs_anchor,
         cs_test_subjects=dataset.cs_test_subjects,
         tasks=dataset.tasks,
         n_parcels=dataset.n_parcels,
         max_iter=max_iter,
+        estimator=estimator,
     )
+    metrics = raw_ws_cs_auroc(raw, sd, tap="raw", **common)
+    metrics.update(raw_ws_cs_auroc(tok, sd, tap="raw_tok", **common))
+    return metrics

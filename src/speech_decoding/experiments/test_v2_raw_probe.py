@@ -1,8 +1,9 @@
 """Laptop TDD for the v2 raw-feature probe floor (:mod:`v2_raw_probe`).
 
 Pure torch/numpy/sklearn — no model, no DCC. Pins the RAW RAW contract: every
-``|STFT|`` bin exposed (no patch pooling), bands concatenated, electrode→parcel
-mean taken at every bin, and the WS/CS logistic protocol end-to-end.
+``|STFT|`` bin exposed (no patch pooling), the 22-token frontend mean-pool grid,
+bands concatenated, electrode→parcel mean taken at every bin, and the WS/CS
+ridge protocol end-to-end.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from speech_decoding.experiments.v2_raw_probe import (
     pool_electrodes_to_parcels,
     per_electrode_features,
     raw_bins_from_bands,
+    raw_pooled_tokens_from_bands,
     raw_ws_cs_auroc,
     run_v2_raw_baseline,
 )
@@ -89,10 +91,18 @@ def test_pool_respects_electrode_mask():
 def _fake_dataset(seed: int, *, separable: bool):
     """A tiny pure-tensor v2 probe dataset: 3 subjects (anchor 0, test 1, ws {0,1,2}),
     one task. When ``separable`` the +1/-1 classes carry a constant feature offset so
-    a linear probe scores AUROC≈1; otherwise labels are random → AUROC≈0.5."""
+    a linear probe scores AUROC≈1; otherwise labels are random → AUROC≈0.5.
+
+    Carries ``band_specs`` matching the synthetic ``(3,2)``/``(2,4)`` band grids (not
+    the real ``BANDS_V2`` ladder), so :func:`run_v2_raw_baseline`'s pooled-token path
+    folds them into 2+2 = 4 tokens."""
     rng = np.random.default_rng(seed)
     n, c, n_parcels = 60, 4, 3
     bands_shapes = [(3, 2), (2, 4)]  # two magnitude bands, different F×T
+    band_specs = [                    # freq_patch_bins sum to F; kernel_time folds T
+        types.SimpleNamespace(freq_patch_bins=(1, 2), kernel_time=2),  # 3 bins → 2 fp; T=2 → 1 tp → 2 tok
+        types.SimpleNamespace(freq_patch_bins=(2,), kernel_time=2),    # 2 bins → 1 fp; T=4 → 2 tp → 2 tok
+    ]
     ppe = torch.tensor([0, 0, 1, 2])  # parcels 0,1,2 all present (shared across subjects)
     mask = torch.ones(c)
 
@@ -113,25 +123,51 @@ def _fake_dataset(seed: int, *, separable: bool):
 
     return types.SimpleNamespace(
         ws_subjects=[0, 1, 2], cs_anchor=0, cs_test_subjects=[1],
-        tasks=["delta_volume"], n_parcels=n_parcels,
+        tasks=["delta_volume"], n_parcels=n_parcels, band_specs=band_specs,
         subject_data=lambda s: subjects[s],
     )
 
 
+def test_raw_pooled_tokens_geometry_and_mean():
+    # band 0: (n,c,3,2), specs fp=(1,2) kt=2 -> 2 freq-patches x 1 time-patch = 2 tokens
+    # band 1: (n,c,2,4), specs fp=(2,)  kt=2 -> 1 freq-patch x 2 time-patches = 2 tokens
+    n, c = 2, 3
+    b0 = torch.arange(n * c * 3 * 2, dtype=torch.float32).reshape(n, c, 3, 2)
+    b1 = torch.arange(n * c * 2 * 4, dtype=torch.float32).reshape(n, c, 2, 4) + 100.0
+    specs = [
+        types.SimpleNamespace(freq_patch_bins=(1, 2), kernel_time=2),
+        types.SimpleNamespace(freq_patch_bins=(2,), kernel_time=2),
+    ]
+    tok = raw_pooled_tokens_from_bands([b0, b1], specs)
+    assert tok.shape == (n, c, 4, 1)
+    # band 0, fp0 = bin row 0 (whole T window 0:2) mean; fp1 = bin rows 1:3 mean.
+    assert torch.allclose(tok[:, :, 0, 0], b0[:, :, 0:1, 0:2].reshape(n, c, -1).mean(2))
+    assert torch.allclose(tok[:, :, 1, 0], b0[:, :, 1:3, 0:2].reshape(n, c, -1).mean(2))
+    # band 1, single fp, two time windows 0:2 and 2:4.
+    assert torch.allclose(tok[:, :, 2, 0], b1[:, :, 0:2, 0:2].reshape(n, c, -1).mean(2))
+    assert torch.allclose(tok[:, :, 3, 0], b1[:, :, 0:2, 2:4].reshape(n, c, -1).mean(2))
+
+
 def test_end_to_end_separable_scores_high():
     out = run_v2_raw_baseline(_fake_dataset(0, separable=True), max_iter=2000)
+    # both representations emitted, both under ridge.
     assert set(out) == {
         "val_probe/raw/ws/delta_volume",
         "val_probe/raw/cs/delta_volume",
         "val_probe/raw/gap/delta_volume",
+        "val_probe/raw_tok/ws/delta_volume",
+        "val_probe/raw_tok/cs/delta_volume",
+        "val_probe/raw_tok/gap/delta_volume",
     }
-    assert out["val_probe/raw/ws/delta_volume"] > 0.9
-    assert out["val_probe/raw/cs/delta_volume"] > 0.9
+    for tap in ("raw", "raw_tok"):
+        assert out[f"val_probe/{tap}/ws/delta_volume"] > 0.9
+        assert out[f"val_probe/{tap}/cs/delta_volume"] > 0.9
 
 
 def test_end_to_end_random_scores_near_chance():
     out = run_v2_raw_baseline(_fake_dataset(1, separable=False), max_iter=2000)
     assert 0.3 < out["val_probe/raw/ws/delta_volume"] < 0.7
+    assert 0.3 < out["val_probe/raw_tok/ws/delta_volume"] < 0.7
 
 
 def test_raw_ws_cs_auroc_matches_driver():
@@ -142,7 +178,8 @@ def test_raw_ws_cs_auroc_matches_driver():
     direct = raw_ws_cs_auroc(
         raw, sd, ws_subjects=ds.ws_subjects, cs_anchor=ds.cs_anchor,
         cs_test_subjects=ds.cs_test_subjects, tasks=ds.tasks,
-        n_parcels=ds.n_parcels, max_iter=2000,
+        n_parcels=ds.n_parcels, max_iter=2000, tap="raw", estimator="ridge",
     )
     via_driver = run_v2_raw_baseline(ds, max_iter=2000)
-    assert direct == via_driver
+    # the driver's raw/* family must equal the direct full-bin ridge call.
+    assert direct == {k: v for k, v in via_driver.items() if k.startswith("val_probe/raw/")}

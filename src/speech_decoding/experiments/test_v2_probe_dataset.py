@@ -9,6 +9,8 @@ plugs straight into :func:`v2_raw_probe.run_v2_raw_baseline`.
 
 from __future__ import annotations
 
+import types
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -86,9 +88,16 @@ def test_built_dataset_runs_raw_baseline():
     ds = InMemoryV2ProbeDataset(
         per, n_parcels=3, ws_subjects=[1, 2, 3], cs_anchor=2, cs_test_subjects=[1, 3]
     )
+    # synthetic (3,2)/(2,4) bands don't match the real BANDS_V2 ladder → inject specs
+    # for the pooled-token floor (real runs use the BANDS_V2 default).
+    ds.band_specs = [
+        types.SimpleNamespace(freq_patch_bins=(1, 2), kernel_time=2),
+        types.SimpleNamespace(freq_patch_bins=(2,), kernel_time=2),
+    ]
     out = run_v2_raw_baseline(ds, max_iter=500)
-    for task in ("delta_volume", "word_length", "word_position"):
-        assert f"val_probe/raw/ws/{task}" in out
+    for tap in ("raw", "raw_tok"):
+        for task in ("delta_volume", "word_length", "word_position"):
+            assert f"val_probe/{tap}/ws/{task}" in out
         assert f"val_probe/raw/cs/{task}" in out
     # random features → AUROC near chance (sanity, not a perf claim).
     assert 0.2 < out["val_probe/raw/ws/delta_volume"] < 0.8

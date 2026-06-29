@@ -41,6 +41,7 @@ from speech_decoding.experiments.online_probe import (
 from speech_decoding.experiments.online_probe_dataset import N_CAP
 from speech_decoding.experiments.v2_raw_probe import (
     auroc_estimators,
+    pool_electrodes_to_parcels,
     raw_ws_cs_auroc,
     run_v2_raw_baseline,
 )
@@ -94,27 +95,35 @@ def encode_subject_taps(
     model: tp.Any,
     bands: list[Tensor],
     parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    n_parcels: int,
     *,
     clip_len_s: float,
     device: torch.device,
     batch_size: int = 64,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Forward one subject's clips → frontend + two latent reductions.
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Forward one subject's clips → frontend + latent taps, pooled/kept-S.
 
     Reduces the token grid INSIDE the batch loop so only parcel/electrode-level
     tensors land on the host:
-      ``front``        frontend, mean over ``S``               → ``(N,C,d)``
-      ``latent``       latent, mean over ``k`` and ``S``       → ``(N,P,d)``
-      ``latent_keepS`` latent, flatten ``k·S·d`` (cells kept)  → ``(N,P,k·S·d)``
-    Frontend keep-S is intentionally NOT produced: per-electrode it is ``C·S·d``
-    (~1.4M dims → OOM) and the cross-subject unit is the parcel anyway, so keep-S is
-    a latent-tap eval. ``labels`` ``(P,)`` are the active-parcel DKT ids (constant
-    across windows; read off the first batch). Returns
-    ``(front, latent, latent_keepS, labels)`` on CPU."""
+      ``front``         frontend, mean over ``S``, per-electrode → ``(N,C,d)``
+      ``front_keepS``   frontend, flatten ``S·d`` then electrode→parcel mean
+                        → ``(N,P,S·d)`` (cells kept; parcel-pooled to stay tractable —
+                        per-electrode ``C·S·d`` ≈ 1.4M dims would OOM)
+      ``latent``        latent, mean over ``k`` and ``S``        → ``(N,P,d)``
+      ``latent_keepS``  latent, flatten ``k·S·d`` (cells kept)   → ``(N,P,k·S·d)``
+    ``labels`` ``(P,)`` are the active-parcel DKT ids (constant across windows). The
+    two keep-S taps + ``latent`` share this parcel ordering, so all three score via
+    :func:`latent_ws_cs_auroc`. Frontend keep-S is pooled to parcels per batch so the
+    ``(b,C,S·d)`` per-electrode tensor is never held across the subject. Returns
+    ``(front, front_keepS, latent, latent_keepS, labels)`` on CPU."""
     lfs, hga = bands[0], bands[1]
     n = lfs.shape[0]
     ppe = parcel_per_electrode.to(device)
+    ppe_cpu = parcel_per_electrode.cpu()
+    mask_cpu = electrode_mask.cpu()
     fronts: list[Tensor] = []
+    fronts_keep: list[Tensor] = []
     latents: list[Tensor] = []
     latents_keep: list[Tensor] = []
     labels: Tensor | None = None
@@ -125,16 +134,25 @@ def encode_subject_taps(
             ppe,
             clip_len_s=clip_len_s,
         )
+        fr = taps["frontend"]                                      # (b,C,S,d)
         lat = taps["latent"]                                       # (b,P,k,S,d)
-        b, P = lat.shape[0], lat.shape[1]
-        fronts.append(taps["frontend"].mean(dim=2).cpu())          # (b,C,d)
+        b, C, S, d = fr.shape
+        P = lat.shape[1]
+        lab_b = taps["labels"].cpu().long()                        # (P,)
+        fronts.append(fr.mean(dim=2).cpu())                        # (b,C,d)
+        fke = fr.reshape(b, C, S * d).cpu().unsqueeze(-1)          # (b,C,S·d,1) transient
+        dense, _ = pool_electrodes_to_parcels(fke, ppe_cpu, mask_cpu, n_parcels)
+        fronts_keep.append(dense[:, lab_b].squeeze(-1))           # (b,P,S·d) active parcels
         latents.append(lat.mean(dim=(2, 3)).cpu())                 # (b,P,d)
         latents_keep.append(lat.reshape(b, P, -1).cpu())           # (b,P,k·S·d)
         if labels is None:
-            labels = taps["labels"].cpu().long()
+            labels = lab_b
     if labels is None:
         raise RuntimeError("subject had no clips to encode")
-    return torch.cat(fronts, 0), torch.cat(latents, 0), torch.cat(latents_keep, 0), labels
+    return (
+        torch.cat(fronts, 0), torch.cat(fronts_keep, 0),
+        torch.cat(latents, 0), torch.cat(latents_keep, 0), labels,
+    )
 
 
 def latent_ws_cs_auroc(
@@ -215,26 +233,31 @@ def run_v2_encoder_taps(
 ) -> dict[str, float]:
     """Frontend + latent tap AUROC over the dev probe dataset, scored with ``estimator``.
 
-    Three families, all under ``estimator`` (``"ridge"`` = the trustworthy meter at
+    Four families, all under ``estimator`` (``"ridge"`` = the trustworthy meter at
     p≫n):
-      ``frontend``      per-electrode pooled tap, reuses the raw WS/CS machinery;
-      ``latent``        per-parcel pooled tap (mean over ``k,S``);
-      ``latent_keepS``  per-parcel tap with the ``k·S·d`` freq×time cells kept —
-                        apples-to-apples with the raw floor (which keeps freq/time).
-    Frontend keep-S is not evaluated (per-electrode ``C·S·d`` ≈ 1.4M dims → OOM; the
-    cross-subject unit is the parcel, so keep-S is a latent eval)."""
+      ``frontend``        per-electrode pooled tap, reuses the raw WS/CS machinery;
+      ``frontend_keepS``  per-parcel frontend tap with the ``S·d`` freq×time cells kept
+                          (parcel-pooled — per-electrode would OOM);
+      ``latent``          per-parcel pooled tap (mean over ``k,S``);
+      ``latent_keepS``    per-parcel tap with the ``k·S·d`` freq×time cells kept —
+                          apples-to-apples with the raw ``raw_tok`` / keep-S floors.
+    The keep-S taps mirror the raw floor's bin-keeping, so the encoder↔raw head-to-head
+    is matched at both reductions."""
     needed = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
     sd = {s: dataset.subject_data(s) for s in needed}
     front: dict[int, Tensor] = {}
+    front_keep: dict[int, Tensor] = {}
     latent: dict[int, Tensor] = {}
     latent_keep: dict[int, Tensor] = {}
     labels: dict[int, Tensor] = {}
     for s in needed:
-        f, lat, lat_keep, lab = encode_subject_taps(
+        f, f_keep, lat, lat_keep, lab = encode_subject_taps(
             model, sd[s].bands, sd[s].parcel_per_electrode,
+            sd[s].electrode_mask, dataset.n_parcels,
             clip_len_s=clip_len_s, device=device, batch_size=batch_size,
         )
         front[s] = f.unsqueeze(-1)        # (N,C,d,1) for the raw machinery
+        front_keep[s] = f_keep
         latent[s] = lat
         latent_keep[s] = lat_keep
         labels[s] = lab
@@ -245,6 +268,8 @@ def run_v2_encoder_taps(
         n_parcels=dataset.n_parcels, max_iter=max_iter,
     )
     metrics = raw_ws_cs_auroc(front, sd, tap="frontend", estimator=estimator, **common)
+    metrics.update(latent_ws_cs_auroc(
+        front_keep, labels, sd, tap="frontend_keepS", estimator=estimator, **common))
     metrics.update(latent_ws_cs_auroc(
         latent, labels, sd, tap="latent", estimator=estimator, **common))
     metrics.update(latent_ws_cs_auroc(
