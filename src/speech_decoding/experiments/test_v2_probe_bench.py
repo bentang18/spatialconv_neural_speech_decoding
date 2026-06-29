@@ -21,6 +21,7 @@ from speech_decoding.experiments.v2_probe_bench import (
     encode_subject_taps,
     encode_subject_tokens,
     latent_ws_cs_auroc,
+    run_v2_attentive_bench,
     run_v2_encoder_taps,
 )
 from speech_decoding.models.v14_converged_v2 import (
@@ -179,3 +180,34 @@ def test_run_v2_encoder_taps_emits_all_metrics():
         for split in ("ws", "cs", "gap"):
             assert f"val_probe/{tap}/{split}/delta_volume" in sub
     assert all(np.isfinite(v) for v in sub.values())
+
+
+def test_run_v2_attentive_bench_smoke():
+    """Tiny model + 3 subjects → attentive M3/M4 CS metrics emitted and finite."""
+    model = _tiny_model()
+    n, c = 24, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    rng = np.random.default_rng(7)
+
+    def subject(sid):
+        y = rng.choice([-1.0, 1.0], size=n)
+        return types.SimpleNamespace(
+            bands=_bands(n, c, seed=sid), parcel_per_electrode=poe,
+            electrode_mask=torch.ones(c), labels={"delta_volume": y},
+        )
+
+    subjects = {s: subject(s) for s in (0, 1, 2)}
+    dataset = types.SimpleNamespace(
+        ws_subjects=[0, 1, 2], cs_anchor=0, cs_test_subjects=[1, 2],
+        tasks=["delta_volume"], n_parcels=62, subject_data=lambda s: subjects[s],
+    )
+    out = run_v2_attentive_bench(
+        dataset, model, clip_len_s=1.0, device=torch.device("cpu"),
+        wd_grid=(0.1,), dropout_grid=(0.1,), ls_grid=(0.0,), n_diwa_seeds=1,
+        n_heads=4, max_steps=120, eval_every=30, swad_warmup=30, patience=3,
+        batch_size=16,
+    )
+    for surface in ("m3", "m4"):
+        assert f"val_probe/attn_{surface}_student/cs/delta_volume" in out
+        assert f"val_probe/attn_{surface}_student/cs_std/delta_volume" in out
+    assert all(np.isfinite(v) for v in out.values())

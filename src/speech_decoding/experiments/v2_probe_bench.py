@@ -52,8 +52,17 @@ __all__ = [
     "encode_subject_tokens",
     "latent_ws_cs_auroc",
     "run_v2_encoder_taps",
+    "run_v2_attentive_bench",
     "run_v2_probe_bench",
 ]
+
+
+def _labels_to01(y: tp.Any) -> np.ndarray:
+    """±1/NaN dense labels → {0,1}/NaN for BCE (NaN clips stay dropped downstream)."""
+    arr = np.asarray(y, dtype=float)
+    out = np.where(arr > 0, 1.0, 0.0)
+    out[~np.isfinite(arr)] = np.nan
+    return out
 
 
 def load_v2_converged_model(
@@ -370,6 +379,89 @@ def run_v2_encoder_taps(
     if need_pool_keep:
         metrics.update(latent_ws_cs_auroc(
             pool_keep, labels, sd, tap="pool_keepS", estimator=estimator, **common))
+    return metrics
+
+
+def run_v2_attentive_bench(
+    dataset: tp.Any,
+    model: tp.Any,
+    *,
+    clip_len_s: float,
+    device: torch.device,
+    surfaces: tp.Sequence[str] = ("m3", "m4"),
+    towers: tp.Sequence[str] = ("student",),
+    wd_grid: tp.Sequence[float] = (0.1, 1.0, 3.0),
+    dropout_grid: tp.Sequence[float] = (0.1, 0.5),
+    ls_grid: tp.Sequence[float] = (0.0, 0.1),
+    token_dropout: float = 0.1,
+    n_diwa_seeds: int = 3,
+    n_heads: int = 6,
+    n_queries: int = 1,
+    mlp_ratio: float = 2.0,
+    lr: float = 1e-3,
+    max_steps: int = 2000,
+    batch_size: int = 256,
+    eval_every: int = 50,
+    patience: int = 8,
+    swad_warmup: int = 200,
+    tasks: tp.Sequence[str] | None = None,
+    batch_size_fwd: int = 64,
+) -> dict[str, float]:
+    """Attentive-head cross-subject bench over the M3/M4 taps (the nonlinear rung).
+
+    For each tower (student / EMA-teacher), forward every cohort subject through
+    :func:`encode_subject_tokens` → the ``(N,P,k,S,d)`` M3-tagged / M4 token grids,
+    flatten each to a ``(N, P·k·S, d)`` set, and for each surface×task run
+    :func:`loso_pooled_cs` — 7-fold leave-one-SUBJECT-out with a nested-val WD/LS/dropout
+    sweep, SWAD per run, DiWA across ``n_diwa_seeds``. The HP grid is the cartesian
+    product of ``wd_grid`` (up to 3.0) × ``dropout_grid`` (very-large range, tied across
+    attn/MLP/residual) × ``ls_grid`` (label smoothing, 0 in the grid as the safety net).
+    Emits ``val_probe/attn_{surface}_{tower}/{cs,cs_std}/{task}``; the bar is the raw_tok
+    ridge floor (CS ``delta_volume`` 0.666)."""
+    from speech_decoding.experiments.v2_attentive_train import (
+        HeadTrainConfig,
+        loso_pooled_cs,
+    )
+
+    subs = sorted({dataset.cs_anchor, *dataset.ws_subjects, *dataset.cs_test_subjects})
+    sd = {s: dataset.subject_data(s) for s in subs}
+    tasks = list(tasks) if tasks is not None else list(dataset.tasks)
+    hp_grid = [
+        {"weight_decay": w, "attn_dropout": p, "mlp_dropout": p,
+         "residual_dropout": p, "label_smoothing": a}
+        for w in wd_grid for p in dropout_grid for a in ls_grid
+    ]
+
+    metrics: dict[str, float] = {}
+    for tower in towers:
+        use_teacher = tower == "teacher"
+        toks: dict[str, dict[int, Tensor]] = {"m3": {}, "m4": {}}
+        for s in subs:
+            m3, m4, _ = encode_subject_tokens(
+                model, sd[s].bands, sd[s].parcel_per_electrode,
+                clip_len_s=clip_len_s, device=device, use_teacher=use_teacher,
+                batch_size=batch_size_fwd,
+            )
+            toks["m3"][s] = m3.reshape(m3.shape[0], -1, m3.shape[-1])
+            toks["m4"][s] = m4.reshape(m4.shape[0], -1, m4.shape[-1])
+            del m3, m4
+        d_model = next(iter(toks["m3"].values())).shape[-1]
+        base = HeadTrainConfig(
+            d_model=d_model, n_heads=n_heads, n_queries=n_queries, mlp_ratio=mlp_ratio,
+            token_dropout=token_dropout, lr=lr, max_steps=max_steps,
+            batch_size=batch_size, eval_every=eval_every, patience=patience,
+            swad_warmup=swad_warmup,
+        )
+        for surface in surfaces:
+            for task in tasks:
+                labels_task = {s: _labels_to01(sd[s].labels[task]) for s in subs}
+                out = loso_pooled_cs(
+                    toks[surface], labels_task, subs, base,
+                    hp_grid=hp_grid, n_diwa_seeds=n_diwa_seeds, device=device,
+                )
+                pre = f"val_probe/attn_{surface}_{tower}"
+                metrics[f"{pre}/cs/{task}"] = out["cs_mean"]
+                metrics[f"{pre}/cs_std/{task}"] = out["cs_std"]
     return metrics
 
 
