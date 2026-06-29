@@ -50,16 +50,19 @@ from speech_decoding.experiments.online_probe import (
 )
 
 
-def auroc_estimators(estimator: str, max_iter: int):
+def auroc_estimators(estimator: str, max_iter: int, lam_mult: float = 1.0):
     """Return ``(ws_fn(z,y), cs_fn(za,ya,zt,yt))`` for ``"logistic"`` or ``"ridge"``.
 
     Shared by the raw floor and the encoder-tap bench so both score with one meter.
     ``"ridge"`` = the dimension-robust dual ridge (``online_probe`` primitives; the
     trustworthy meter at p≫n); ``"logistic"`` = fixed-C L2 logistic (the original
-    floor). The ridge primitives take no ``max_iter``."""
+    floor). The ridge primitives take no ``max_iter``. ``lam_mult`` scales the ridge λ
+    rule (``lam_mult·trace(G)/N``) — default 1; set it to the λ picked by the
+    pretrain-eval sweep (:mod:`v2_lambda_sweep`) to apply that λ to the benchmark
+    eval. ``lam_mult`` is ridge-only (logistic ignores it)."""
     if estimator == "ridge":
-        return (lambda z, y: _ws_auroc_ridge(z, y),
-                lambda za, ya, zt, yt: _cs_auroc_ridge(za, ya, zt, yt))
+        return (lambda z, y: _ws_auroc_ridge(z, y, lam_mult=lam_mult),
+                lambda za, ya, zt, yt: _cs_auroc_ridge(za, ya, zt, yt, lam_mult=lam_mult))
     if estimator == "logistic":
         return (lambda z, y: ws_auroc_2fold_logistic(z, y, max_iter=max_iter),
                 lambda za, ya, zt, yt: cs_auroc_logistic(za, ya, zt, yt, max_iter=max_iter))
@@ -193,17 +196,19 @@ def raw_ws_cs_auroc(
     max_iter: int = 10000,
     tap: str = "raw",
     estimator: str = "logistic",
+    lam_mult: float = 1.0,
 ) -> dict[str, float]:
     """WS (per-electrode) + CS (parcel-pool) AUROC over all tasks.
 
     ``raw[s]`` is subject ``s``'s ``(N,C,D,1)`` per-electrode feature bins; ``sd[s]``
     carries ``parcel_per_electrode`` / ``electrode_mask`` / ``labels``. ``tap`` names
     the metric family (``raw`` for the input floor; reused by the bench with
-    ``tap="frontend"`` on the frontend tap reshaped to ``(N,C,S·d,1)``). Emits
+    ``tap="frontend"`` on the frontend tap reshaped to ``(N,C,S·d,1)``). ``lam_mult``
+    scales the ridge λ (for applying a swept λ; ridge-only). Emits
     ``val_probe/{tap}/{ws,cs,gap}/{task}`` so the floor and the trained taps share the
     metric namespace and drop straight onto a run's ``val_probe/...`` lines."""
     a = cs_anchor
-    ws_fn, cs_fn = auroc_estimators(estimator, max_iter)
+    ws_fn, cs_fn = auroc_estimators(estimator, max_iter, lam_mult)
     pooled_cs: dict[int, tuple[Tensor, Tensor]] = {
         s: pool_electrodes_to_parcels(
             raw[s], sd[s].parcel_per_electrode, sd[s].electrode_mask, n_parcels
@@ -243,7 +248,8 @@ def raw_ws_cs_auroc(
 
 
 def run_v2_raw_baseline(
-    dataset: tp.Any, *, max_iter: int = 10000, estimator: str = "ridge"
+    dataset: tp.Any, *, max_iter: int = 10000, estimator: str = "ridge",
+    lam_mult: float = 1.0,
 ) -> dict[str, float]:
     """Raw-feature floor over the dev probe dataset — two representations.
 
@@ -279,6 +285,7 @@ def run_v2_raw_baseline(
         n_parcels=dataset.n_parcels,
         max_iter=max_iter,
         estimator=estimator,
+        lam_mult=lam_mult,
     )
     metrics = raw_ws_cs_auroc(raw, sd, tap="raw", **common)
     metrics.update(raw_ws_cs_auroc(tok, sd, tap="raw_tok", **common))

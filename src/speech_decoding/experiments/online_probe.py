@@ -117,19 +117,26 @@ def parcel_intersection(present_a: Tensor, present_b: Tensor) -> Tensor:
 
 
 def dual_ridge_scores(
-    z_train: np.ndarray, y_train: np.ndarray, z_test: np.ndarray, lam: float | None = None
+    z_train: np.ndarray,
+    y_train: np.ndarray,
+    z_test: np.ndarray,
+    lam: float | None = None,
+    lam_mult: float = 1.0,
 ) -> np.ndarray:
     """Dual (kernel) ridge (spec §5). ``G = ZZᵀ`` (N×N), ``α = (G+λI)⁻¹y``,
-    ``scores = G_test,train α``. ``lam`` defaults to ``trace(G)/N`` (fixed, no
-    per-step tuning). ``d`` enters only through ``G`` so the cost is N²·d — the
-    feature dim is free, which is why dual form was chosen."""
+    ``scores = G_test,train α``. ``lam`` defaults to ``lam_mult · trace(G)/N`` — the
+    scale-aware default rule (``lam_mult=1`` = the original fixed rule); ``lam_mult``
+    scales it for the λ sweep (:mod:`v2_lambda_sweep`) without breaking the
+    dimension-robust trace normalization. An explicit ``lam`` overrides both. ``d``
+    enters only through ``G`` so the cost is N²·d — the feature dim is free, which is
+    why dual form was chosen."""
     z_train = np.asarray(z_train, dtype=np.float64)
     y_train = np.asarray(y_train, dtype=np.float64)
     z_test = np.asarray(z_test, dtype=np.float64)
     g = z_train @ z_train.T                             # (n, n)
     n = g.shape[0]
     if lam is None:
-        lam = float(np.trace(g) / max(n, 1))
+        lam = lam_mult * float(np.trace(g) / max(n, 1))
     alpha = np.linalg.solve(g + lam * np.eye(n), y_train)
     return (z_test @ z_train.T) @ alpha
 
@@ -164,26 +171,29 @@ def contiguous_folds(n: int, k: int = 2) -> list[tuple[np.ndarray, np.ndarray]]:
     return out
 
 
-def ws_auroc_2fold(z: np.ndarray, y: np.ndarray, k_folds: int = 2) -> float:
+def ws_auroc_2fold(
+    z: np.ndarray, y: np.ndarray, k_folds: int = 2, lam_mult: float = 1.0
+) -> float:
     """Within-session AUROC: mean over contiguous folds (spec §5). Fit dual ridge
     on each fold's train half, score the held-out half, nan-mean the per-fold
-    AUROCs."""
+    AUROCs. ``lam_mult`` scales the λ rule for the sweep (default 1 = unchanged)."""
     scores: list[float] = []
     for train, test in contiguous_folds(len(y), k_folds):
         if len(train) == 0 or len(test) == 0:
             continue
-        pred = dual_ridge_scores(z[train], y[train], z[test])
+        pred = dual_ridge_scores(z[train], y[train], z[test], lam_mult=lam_mult)
         scores.append(auroc(pred, y[test]))
     return float(np.nanmean(scores)) if scores else float("nan")
 
 
 def cs_auroc(
-    z_anchor: np.ndarray, y_anchor: np.ndarray, z_test: np.ndarray, y_test: np.ndarray
+    z_anchor: np.ndarray, y_anchor: np.ndarray, z_test: np.ndarray, y_test: np.ndarray,
+    lam_mult: float = 1.0,
 ) -> float:
     """Cross-subject AUROC: fit dual ridge on the anchor (sub2), score the test
     subject's windows (spec §5). Caller restricts ``z_*`` to the pair's parcel
-    intersection beforehand."""
-    pred = dual_ridge_scores(z_anchor, y_anchor, z_test)
+    intersection beforehand. ``lam_mult`` scales the λ rule for the sweep."""
+    pred = dual_ridge_scores(z_anchor, y_anchor, z_test, lam_mult=lam_mult)
     return auroc(pred, y_test)
 
 

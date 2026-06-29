@@ -168,6 +168,7 @@ def latent_ws_cs_auroc(
     max_iter: int = 10000,
     estimator: str = "logistic",
     tap: str = "latent",
+    lam_mult: float = 1.0,
 ) -> dict[str, float]:
     """AUROC on the per-parcel latent tap.
 
@@ -177,8 +178,9 @@ def latent_ws_cs_auroc(
     the global ``n_parcels`` table by DKT id, then fits the anchor / scores each test
     subject over the shared (present-in-both) parcels — the same global-id intersection
     the raw CS pool uses. ``estimator`` is ``"logistic"`` or ``"ridge"``; ``tap`` names
-    the metric family. Emits ``val_probe/{tap}/{ws,cs,gap}/{task}``."""
-    ws_fn, cs_fn = auroc_estimators(estimator, max_iter)
+    the metric family. ``lam_mult`` scales the ridge λ (for applying a swept λ;
+    ridge-only). Emits ``val_probe/{tap}/{ws,cs,gap}/{task}``."""
+    ws_fn, cs_fn = auroc_estimators(estimator, max_iter, lam_mult)
     def _to_global(s: int) -> tuple[Tensor, Tensor]:
         lat, lab = latent[s], labels[s]
         n, _, d = lat.shape
@@ -230,6 +232,7 @@ def run_v2_encoder_taps(
     max_iter: int = 10000,
     batch_size: int = 64,
     estimator: str = "ridge",
+    lam_mult: float = 1.0,
 ) -> dict[str, float]:
     """Frontend + latent tap AUROC over the dev probe dataset, scored with ``estimator``.
 
@@ -265,7 +268,7 @@ def run_v2_encoder_taps(
     common = dict(
         ws_subjects=dataset.ws_subjects, cs_anchor=dataset.cs_anchor,
         cs_test_subjects=dataset.cs_test_subjects, tasks=dataset.tasks,
-        n_parcels=dataset.n_parcels, max_iter=max_iter,
+        n_parcels=dataset.n_parcels, max_iter=max_iter, lam_mult=lam_mult,
     )
     metrics = raw_ws_cs_auroc(front, sd, tap="frontend", estimator=estimator, **common)
     metrics.update(latent_ws_cs_auroc(
