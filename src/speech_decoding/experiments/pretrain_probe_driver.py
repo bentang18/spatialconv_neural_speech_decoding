@@ -52,20 +52,25 @@ class SessionTapCache:
     """One cohort session's forwarded tap grids + labels + splits + electrode metadata.
 
     ``grids["M2"]`` is ``(N, C, S, d)`` (electrode-space); ``grids["M3"]``/``["M4"]`` are
-    ``(N, P, k, S, d)`` (parcel-space). ``labels[task]`` is ``(N,)`` in {0,1,NaN}.
-    ``ws_split[fold]`` is ``{"train","val","test"}`` row-index arrays (KFold2 held-out
-    fold halved); ``cs_split`` is ``{"val","test"}`` for when this session is a CS test
-    session (its 50/50 val/test halves)."""
+    ``(N, P, k, S, d)`` (parcel-space). ``labels[task]`` is ``(N,)`` in {0,1,NaN} over the
+    session's union clip axis (NaN where the clip is outside the task's balanced set).
+
+    Splits are PER TASK — the leaderboard cut runs over each task's interleaved item order
+    (class balance depends on it), so a clip's split membership differs by task.
+    ``ws_split[task][fold]`` is ``{"train","val","test"}`` union-index arrays (KFold2 held-out
+    fold halved); ``cs_split[task]`` is ``{"val","test"}`` for when this session is a CS test
+    session (its per-task 50/50 chronological halves). CS train comes from the anchor
+    cache's finite ``labels[task]`` rows (the whole anchor session is train)."""
 
     subject_id: int
     trial_id: int
     grids: dict[str, Tensor]
-    labels: dict[str, object]                 # task -> np.ndarray (N,)
-    parcel_per_electrode: Tensor              # (C,)
-    electrode_mask: Tensor                    # (C,)
+    labels: dict[str, object]                            # task -> np.ndarray (N,)
+    parcel_per_electrode: Tensor                         # (C,)
+    electrode_mask: Tensor                               # (C,)
     n_parcels: int
-    ws_split: dict[int, dict[str, object]]    # fold -> {train,val,test} -> np.ndarray
-    cs_split: dict[str, object]               # {val,test} -> np.ndarray
+    ws_split: dict[str, dict[int, dict[str, object]]]    # task -> fold -> {train,val,test}
+    cs_split: dict[str, dict[str, object]]               # task -> {val,test}
 
 
 def save_cache(cache: SessionTapCache, path: str) -> None:
@@ -88,7 +93,7 @@ def run_linear_cell(
     anchor (train) cache + the test session cache (λ on the test val half)."""
     space = TAP_SPACE[tap]
     if cell.eval_mode == "WithinSession":
-        sp = test_cache.ws_split[cell.fold_index]
+        sp = test_cache.ws_split[cell.task][cell.fold_index]
         return linear_ws_cell_auroc(
             test_cache.grids[tap], test_cache.labels[cell.task],
             train_rows=sp["train"], val_rows=sp["val"], test_rows=sp["test"],
@@ -100,7 +105,7 @@ def run_linear_cell(
     if cell.eval_mode == "CrossSubject":
         if anchor_cache is None:
             raise ValueError("CrossSubject linear cell needs an anchor_cache")
-        sp = test_cache.cs_split
+        sp = test_cache.cs_split[cell.task]
         return linear_cs_cell_auroc(
             anchor_cache.grids[tap], anchor_cache.labels[cell.task],
             test_cache.grids[tap], test_cache.labels[cell.task],
@@ -125,7 +130,7 @@ def run_attentive_cell_result(
     intersect. ``val`` drives the sweep-once HP pick; ``test`` is the held-out report."""
     space = TAP_SPACE[tap]
     if cell.eval_mode == "WithinSession":
-        sp = test_cache.ws_split[cell.fold_index]
+        sp = test_cache.ws_split[cell.task][cell.fold_index]
         return attentive_ws_cell_result(
             test_cache.grids[tap], test_cache.labels[cell.task],
             train_rows=sp["train"], val_rows=sp["val"], test_rows=sp["test"],
@@ -137,7 +142,7 @@ def run_attentive_cell_result(
     if cell.eval_mode == "CrossSubject":
         if anchor_cache is None:
             raise ValueError("CrossSubject attentive cell needs an anchor_cache")
-        sp = test_cache.cs_split
+        sp = test_cache.cs_split[cell.task]
         return attentive_cs_cell_result(
             anchor_cache.grids[tap], anchor_cache.labels[cell.task],
             test_cache.grids[tap], test_cache.labels[cell.task],

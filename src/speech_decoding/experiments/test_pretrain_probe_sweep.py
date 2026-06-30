@@ -50,14 +50,16 @@ def _cache(seed: int, subject_id: int, trial_id: int, *, signal: bool) -> Sessio
         m3[:, 1, 0, 0, 0] = sgn * 4 + 0.2 * rng.normal(size=N)
         m4[:, 1, 0, 0, 0] = sgn * 4 + 0.2 * rng.normal(size=N)
     rows = _split_rows(N)
+    ws = {0: rows, 1: _split_rows(N)}
+    cs = {"val": rows["val"], "test": rows["test"]}
     return SessionTapCache(
         subject_id=subject_id, trial_id=trial_id,
         grids={"M2": torch.from_numpy(m2), "M3": torch.from_numpy(m3),
                "M4": torch.from_numpy(m4)},
         labels={"onset": y, "volume": y},
         parcel_per_electrode=PE, electrode_mask=EM, n_parcels=P,
-        ws_split={0: rows, 1: _split_rows(N)},
-        cs_split={"val": rows["val"], "test": rows["test"]},
+        ws_split={"onset": ws, "volume": ws},
+        cs_split={"onset": cs, "volume": cs},
     )
 
 

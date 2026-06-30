@@ -44,14 +44,16 @@ def _make_cache(seed: int, subject_id: int, trial_id: int) -> SessionTapCache:
     m4 = rng.normal(size=(N, P, K, S, D)).astype(np.float32)
     m4[:, 1, 0, 0, 0] = sgn * 4 + 0.2 * rng.normal(size=N)
     rows = _split_rows(N)
+    ws = {0: rows, 1: _split_rows(N)}
+    cs = {"val": rows["val"], "test": rows["test"]}
     return SessionTapCache(
         subject_id=subject_id, trial_id=trial_id,
         grids={"M2": torch.from_numpy(m2), "M3": torch.from_numpy(m3),
                "M4": torch.from_numpy(m4)},
         labels={"onset": y, "speech": y},
         parcel_per_electrode=PE, electrode_mask=EM, n_parcels=P,
-        ws_split={0: rows, 1: _split_rows(N)},
-        cs_split={"val": rows["val"], "test": rows["test"]},
+        ws_split={"onset": ws, "speech": ws},
+        cs_split={"onset": cs, "speech": cs},
     )
 
 
