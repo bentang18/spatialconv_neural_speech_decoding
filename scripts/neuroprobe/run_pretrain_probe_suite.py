@@ -318,6 +318,60 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
     return all_rows
 
 
+def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, batch_size=64):
+    """Stage 1: forward the trained encoder over each session's union clips → tap caches.
+
+    One GPU forward per session over EXACTLY the union word windows (est_idx-aligned,
+    fail-loud), keeping the full token grids the Stage-2 readouts consume:
+      ``M2`` frontend ``(N,C,S,d)`` electrode-space; ``M3`` pool_tagged ``(N,P,k,S,d)``;
+      ``M4`` latent ``(N,P,k,S,d)``; ``M3_untagged`` bare pool (the ridge A/B surface,
+    skipped if ``cache_untagged_m3`` is False). Each session's :class:`SessionTapCache`
+    (grids + per-task labels + WS/CS split rows + electrode anatomy) is ``torch.save``-d
+    to ``out_dir`` so the CPU Stage-2 sweep reruns without re-forwarding. Pure reuse of
+    ``encode_subject_tokens`` (the unreduced full-grid encode) — no new model logic."""
+    import torch
+
+    from speech_decoding.experiments.pretrain_probe_driver import save_cache
+    from speech_decoding.experiments.pretrain_probe_labels import build_session_targets
+    from speech_decoding.experiments.pretrain_probe_stage1 import (
+        SessionMeta,
+        cache_from_targets,
+    )
+    from speech_decoding.experiments.v2_probe_bench import (
+        encode_subject_tokens,
+        load_v2_converged_model,
+    )
+
+    bt_root = os.environ.get("ROOT_DIR_BRAINTREEBANK")
+    xp = _build_xp()
+    ieeg = _ieeg_index(xp)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_v2_converged_model(xp, ckpt_path, device=device)
+    os.makedirs(out_dir, exist_ok=True)
+
+    surfaces = ["frontend", "m3", "m4"] + (["m3_untagged"] if cache_untagged_m3 else [])
+    tap_of = {"frontend": "M2", "m3": "M3", "m4": "M4", "m3_untagged": "M3_untagged"}
+
+    for session in sessions:
+        subject_id, trial_id = session
+        row = ieeg[session]
+        events = _label_events(subject_id, trial_id, str(row["timeline"]), tasks, bt_root)
+        targets = build_session_targets(events, subject_id=subject_id, trial_id=trial_id)
+        bands, ppe, em, n_parcels = _materialize_bands(xp, row, targets.clip_starts)
+        grids_sf, _ = encode_subject_tokens(
+            model, bands, ppe, clip_len_s=PROBE_CLIP_DUR_S, device=device,
+            surfaces=tuple(surfaces), batch_size=batch_size,
+        )
+        grids = {tap_of[sf]: g for sf, g in grids_sf.items()}
+        meta = SessionMeta(parcel_per_electrode=ppe, electrode_mask=em, n_parcels=n_parcels)
+        cache = cache_from_targets(targets, grids, meta)
+        path = os.path.join(out_dir, f"taps_s{subject_id}_t{trial_id}.pt")
+        save_cache(cache, path)
+        shp = {k: tuple(v.shape) for k, v in grids.items()}
+        print(f"[encode] {session}: {shp} -> {path}", flush=True)
+        del bands, grids_sf, grids, cache
+
+
 def _print_summary(rows) -> None:
     by = {}
     for r in rows:
@@ -339,6 +393,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="one session, a few tasks: print shapes + WS AUROC, no CSV write")
     p.add_argument("--full", action="store_true",
                    help="all firewall-legal sessions, all 15 tasks, WS+CS → CSV")
+    p.add_argument("--encode", action="store_true",
+                   help="Stage 1: GPU forward a checkpoint → per-session tap caches")
+    p.add_argument("--ckpt", default=None, help="checkpoint to forward (required for --encode)")
+    p.add_argument("--cache-dir", default=None,
+                   help="output dir for --encode tap caches (required for --encode)")
+    p.add_argument("--no-untagged-m3", action="store_true",
+                   help="skip the untagged-pool M3 A/B surface (cache M2/M3/M4 only)")
     p.add_argument("--out", default="reports/neuroprobe_probe_results.csv")
     p.add_argument("--anchor", default=None,
                    help="CS train anchor 'subj,trial' (default the contract anchor)")
@@ -375,6 +436,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.full:
         run_raw_floor(tuple(PRETRAIN_UNIVERSE), tuple(NEUROPROBE_TASKS),
                       anchor=anchor, out_path=args.out)
+        return 0
+
+    if args.encode:
+        if not args.ckpt or not args.cache_dir:
+            p.error("--encode requires --ckpt and --cache-dir")
+        run_encode(tuple(PRETRAIN_UNIVERSE), tuple(NEUROPROBE_TASKS),
+                   ckpt_path=args.ckpt, out_dir=args.cache_dir,
+                   cache_untagged_m3=not args.no_untagged_m3)
         return 0
 
     p.print_help()

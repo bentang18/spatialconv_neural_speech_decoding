@@ -152,6 +152,24 @@ def test_encode_subject_tokens_shapes_and_teacher():
     assert lab_t.tolist() == labels.tolist()
 
 
+def test_encode_subject_tokens_m3_untagged_is_bare_pool():
+    """m3_untagged surface = the bare (untagged) pool — the ridge's documented M3 surface,
+    distinct from m3 (pool_tagged), same (N,P,k,S,d) layout. Cached for the ridge A/B."""
+    model = _tiny_model()
+    n, c = 10, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    bands = _bands(n, c)
+    grids, _ = encode_subject_tokens(
+        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"),
+        surfaces=("m3", "m3_untagged"), batch_size=8,
+    )
+    assert grids["m3_untagged"].shape == grids["m3"].shape
+    # untagged == m3 with the latent parcel embed removed
+    assert not torch.allclose(grids["m3_untagged"], grids["m3"])
+    taps = model.encode_clip_taps(bands[0], bands[1], poe, clip_len_s=1.0)
+    assert torch.allclose(grids["m3_untagged"], taps["pool"], atol=1e-6)
+
+
 def test_encode_subject_tokens_rejects_unknown_surface():
     model = _tiny_model()
     poe = torch.tensor([5, 5, 9, 20])

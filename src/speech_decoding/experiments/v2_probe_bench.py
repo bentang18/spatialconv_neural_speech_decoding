@@ -170,11 +170,14 @@ def encode_subject_taps(
     )
 
 
-# Attentive surface → the `encode_clip_taps` key it reads.
+# Surface → the `encode_clip_taps` key it reads.
 _ATTENTIVE_SURFACE_TAP: dict[str, str] = {
     "frontend": "frontend",     # (B,C,S,d) RAW per-electrode (M2 = electrode-independent)
     "m3": "pool_tagged",        # (B,P,k,S,d) pool + the latent's trained parcel embed
     "m4": "latent",             # (B,P,k,S,d) latent output, parcel-tagged internally
+    "m3_untagged": "pool",      # (B,P,k,S,d) bare pool, NO tag — the ridge's documented
+                                # M3 surface (per-parcel weight blocks make the tag
+                                # structural); cached alongside m3 for the ridge A/B.
 }
 
 
