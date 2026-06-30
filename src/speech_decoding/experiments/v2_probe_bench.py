@@ -170,6 +170,14 @@ def encode_subject_taps(
     )
 
 
+# Attentive surface → the `encode_clip_taps` key it reads.
+_ATTENTIVE_SURFACE_TAP: dict[str, str] = {
+    "frontend": "frontend",     # (B,C,S,d) RAW per-electrode (M2 = electrode-independent)
+    "m3": "pool_tagged",        # (B,P,k,S,d) pool + the latent's trained parcel embed
+    "m4": "latent",             # (B,P,k,S,d) latent output, parcel-tagged internally
+}
+
+
 @torch.no_grad()
 def encode_subject_tokens(
     model: tp.Any,
@@ -178,26 +186,33 @@ def encode_subject_tokens(
     *,
     clip_len_s: float,
     device: torch.device,
+    surfaces: tp.Sequence[str] = ("m3", "m4"),
     use_teacher: bool = False,
     batch_size: int = 64,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Forward one subject → M3-tagged + M4 PER-TOKEN taps for the attentive head.
+) -> tuple[dict[str, Tensor], Tensor]:
+    """Forward one subject → the requested PER-TOKEN tap grids for the attentive head.
 
     Unlike :func:`encode_subject_taps` (which mean-pools / flattens for the ridge
-    rungs), this keeps the full ``(N, P, k, S, d)`` token grid the single-query
-    attentive pool consumes — it pools the ``P·k·S`` set itself, so nothing is
-    reduced here. Returns ``(m3, m4, labels)``:
-      ``m3``   POOL output + the latent's parcel embed (``taps["pool_tagged"]``) —
-               parcel id rides in the token so the across-parcel pool isn't blind;
-      ``m4``   latent output (``taps["latent"]``) — already parcel-tagged internally;
-      ``labels`` ``(P,)`` active-parcel DKT ids.
-    ``use_teacher`` selects the EMA-teacher towers (both surfaces from one tower).
-    All on CPU; the attentive head reshapes ``(N,P,k,S,d)`` → set per clip."""
+    rungs), this keeps the full token grid the single-query attentive pool consumes —
+    nothing is reduced here. Returns ``({surface: grid}, labels)`` over ``surfaces``:
+      ``frontend``  per-electrode frontend tap ``(N, C, S, d)`` — RAW, NO parcel tag
+                    (M2 is electrode-independent; the pool's set axis is electrodes);
+      ``m3``        POOL output + the latent's parcel embed (``pool_tagged``),
+                    ``(N, P, k, S, d)`` — parcel id rides in the token;
+      ``m4``        latent output (``latent``), ``(N, P, k, S, d)`` — parcel-tagged
+                    internally.
+    ``labels`` ``(P,)`` active-parcel DKT ids. ``use_teacher`` selects the EMA-teacher
+    towers. All on CPU; the bench reshapes each grid to a ``(N, set, d)`` token set."""
+    for sf in surfaces:
+        if sf not in _ATTENTIVE_SURFACE_TAP:
+            raise ValueError(
+                f"unknown attentive surface {sf!r}; expected "
+                f"{sorted(_ATTENTIVE_SURFACE_TAP)}"
+            )
     lfs, hga = bands[0], bands[1]
     n = lfs.shape[0]
     ppe = parcel_per_electrode.to(device)
-    m3s: list[Tensor] = []
-    m4s: list[Tensor] = []
+    acc: dict[str, list[Tensor]] = {sf: [] for sf in surfaces}
     labels: Tensor | None = None
     for i in range(0, n, batch_size):
         taps = model.encode_clip_taps(
@@ -207,13 +222,13 @@ def encode_subject_tokens(
             clip_len_s=clip_len_s,
             use_teacher=use_teacher,
         )
-        m3s.append(taps["pool_tagged"].cpu())                      # (b,P,k,S,d)
-        m4s.append(taps["latent"].cpu())                           # (b,P,k,S,d)
+        for sf in surfaces:
+            acc[sf].append(taps[_ATTENTIVE_SURFACE_TAP[sf]].cpu())
         if labels is None:
             labels = taps["labels"].cpu().long()
     if labels is None:
         raise RuntimeError("subject had no clips to encode")
-    return torch.cat(m3s, 0), torch.cat(m4s, 0), labels
+    return {sf: torch.cat(v, 0) for sf, v in acc.items()}, labels
 
 
 def latent_ws_cs_auroc(
@@ -409,11 +424,15 @@ def run_v2_attentive_bench(
     tasks: tp.Sequence[str] | None = None,
     batch_size_fwd: int = 64,
 ) -> dict[str, float]:
-    """Attentive-head cross-subject bench over the M3/M4 taps (the nonlinear rung).
+    """Attentive-head cross-subject bench over the frontend / M3 / M4 taps (nonlinear rung).
 
     For each tower (student / EMA-teacher), forward every cohort subject through
-    :func:`encode_subject_tokens` → the ``(N,P,k,S,d)`` M3-tagged / M4 token grids,
-    flatten each to a ``(N, P·k·S, d)`` set, and for each surface×task run
+    :func:`encode_subject_tokens` → the per-token grids, flatten each to a ``(N, set, d)``
+    set: ``frontend`` ``(N,C,S,d)`` → ``(N, C·S, d)`` RAW electrode set (M2 is
+    electrode-independent, NO parcel tag, so the pool's set axis is electrodes); ``m3`` /
+    ``m4`` ``(N,P,k,S,d)`` → ``(N, P·k·S, d)`` parcel set. The structured-dropout block is
+    per surface (frontend = S = one electrode; M3/M4 = k·S = one parcel). For each
+    surface×task run
     :func:`loso_pooled_cs` — leave-one-SUBJECT-out test with INNER-LOSO model selection
     (HP chosen by mean inner-val AUROC over all train subjects, not one), SWAD per run,
     DiWA across ``n_diwa_seeds``. The HP grid is the cartesian
@@ -444,35 +463,43 @@ def run_v2_attentive_bench(
         # Only materialize the requested surfaces — each is ~k·S·d/parcel × N × ΣP wide
         # (≈110GB at d384/n_cap3500), so holding both M3 and M4 doubles peak host RAM.
         toks: dict[str, dict[int, Tensor]] = {sf: {} for sf in surfaces}
-        tokens_per_parcel = 0
+        block: dict[str, int] = {}              # per-surface structured-dropout block
         n_time_frames = 0
         for s in subs:
-            m3, m4, _ = encode_subject_tokens(
+            grids, _ = encode_subject_tokens(
                 model, sd[s].bands, sd[s].parcel_per_electrode,
-                clip_len_s=clip_len_s, device=device, use_teacher=use_teacher,
-                batch_size=batch_size_fwd,
+                clip_len_s=clip_len_s, device=device, surfaces=surfaces,
+                use_teacher=use_teacher, batch_size=batch_size_fwd,
             )
-            tokens_per_parcel = m4.shape[2] * m4.shape[3]   # k·S — the parcel block size
-            n_time_frames = m4.shape[3]                     # S — the time positional axis
-            if "m3" in toks:
-                toks["m3"][s] = m3.reshape(m3.shape[0], -1, m3.shape[-1])
-            if "m4" in toks:
-                toks["m4"][s] = m4.reshape(m4.shape[0], -1, m4.shape[-1])
-            del m3, m4
+            for sf in surfaces:
+                g = grids[sf]
+                if sf == "frontend":                        # (N,C,S,d) raw electrode set
+                    nN, C, S, d = g.shape
+                    toks[sf][s] = g.reshape(nN, C * S, d)    # set axis = electrodes×time
+                    block[sf] = S                           # one electrode = S frames
+                else:                                       # (N,P,k,S,d) parcel set
+                    nN, P, k, S, d = g.shape
+                    toks[sf][s] = g.reshape(nN, P * k * S, d)
+                    block[sf] = k * S                       # one parcel = k·S
+                n_time_frames = S                           # S is shared across surfaces
+            del grids
         d_model = next(iter(toks[surfaces[0]].values())).shape[-1]
-        base = HeadTrainConfig(
-            d_model=d_model, n_heads=n_heads, n_queries=n_queries, mlp_ratio=mlp_ratio,
-            token_dropout=token_dropout, tokens_per_parcel=tokens_per_parcel,
-            n_time_frames=(n_time_frames if time_tag else 0),
-            lr=lr, max_steps=max_steps,
-            batch_size=batch_size, eval_every=eval_every, patience=patience,
-            swad_warmup=swad_warmup,
-        )
         for surface in surfaces:
+            # tokens_per_parcel = the contiguous block the structured (parcel/electrode)
+            # dropout drops as a unit: k·S for parcel surfaces, S for the frontend (so
+            # the same mechanism drops whole electrodes there).
+            cfg = HeadTrainConfig(
+                d_model=d_model, n_heads=n_heads, n_queries=n_queries, mlp_ratio=mlp_ratio,
+                token_dropout=token_dropout, tokens_per_parcel=block[surface],
+                n_time_frames=(n_time_frames if time_tag else 0),
+                lr=lr, max_steps=max_steps,
+                batch_size=batch_size, eval_every=eval_every, patience=patience,
+                swad_warmup=swad_warmup,
+            )
             for task in tasks:
                 labels_task = {s: _labels_to01(sd[s].labels[task]) for s in subs}
                 out = loso_pooled_cs(
-                    toks[surface], labels_task, subs, base,
+                    toks[surface], labels_task, subs, cfg,
                     hp_grid=hp_grid, n_diwa_seeds=n_diwa_seeds, device=device,
                 )
                 pre = f"val_probe/attn_{surface}_{tower}"

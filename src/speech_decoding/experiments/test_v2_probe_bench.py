@@ -15,6 +15,7 @@ from __future__ import annotations
 import types
 
 import numpy as np
+import pytest
 import torch
 
 from speech_decoding.experiments.v2_probe_bench import (
@@ -127,21 +128,38 @@ def test_encode_subject_tokens_shapes_and_teacher():
     n, c = 12, 4
     poe = torch.tensor([5, 5, 9, 20])  # parcels {5,9,20}
     bands = _bands(n, c)
-    m3, m4, labels = encode_subject_tokens(
-        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"), batch_size=8,
+    grids, labels = encode_subject_tokens(
+        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"),
+        surfaces=("frontend", "m3", "m4"), batch_size=8,
     )
+    m3, m4 = grids["m3"], grids["m4"]
     # full per-token grid kept (N,P,k,S,d): P=3 active parcels, k=2, d=16
     assert m3.shape[0] == n and m3.shape[1] == 3 and m3.shape[2] == 2 and m3.shape[-1] == 16
     assert m4.shape == m3.shape
+    # frontend is RAW per-electrode (N,C,S,d): C=4 electrodes, NO parcel pooling, d=16
+    front = grids["frontend"]
+    assert front.shape[0] == n and front.shape[1] == c and front.shape[-1] == 16
+    assert front.shape[2] == m3.shape[3]               # shared time axis S
     assert labels.tolist() == [5, 9, 20]
     # teacher towers are deepcopies at init ⇒ teacher tap == student tap (path works)
-    m3_t, m4_t, lab_t = encode_subject_tokens(
+    grids_t, lab_t = encode_subject_tokens(
         model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"),
-        use_teacher=True, batch_size=8,
+        surfaces=("frontend", "m3", "m4"), use_teacher=True, batch_size=8,
     )
-    assert torch.allclose(m3_t, m3, atol=1e-6)
-    assert torch.allclose(m4_t, m4, atol=1e-6)
+    assert torch.allclose(grids_t["m3"], m3, atol=1e-6)
+    assert torch.allclose(grids_t["m4"], m4, atol=1e-6)
+    assert torch.allclose(grids_t["frontend"], front, atol=1e-6)
     assert lab_t.tolist() == labels.tolist()
+
+
+def test_encode_subject_tokens_rejects_unknown_surface():
+    model = _tiny_model()
+    poe = torch.tensor([5, 5, 9, 20])
+    with pytest.raises(ValueError, match="unknown attentive surface"):
+        encode_subject_tokens(
+            model, _bands(6, 4), poe, clip_len_s=1.0,
+            device=torch.device("cpu"), surfaces=("latent",), batch_size=8,
+        )
 
 
 def test_run_v2_encoder_taps_emits_all_metrics():
@@ -240,5 +258,36 @@ def test_run_v2_attentive_bench_single_surface():
         patience=3, batch_size=16,
     )
     assert f"val_probe/attn_m4_student/cs/delta_volume" in out
+
+
+def test_run_v2_attentive_bench_frontend_rung():
+    """Frontend Option-2 rung: raw electrode set (N,C·S,d), electrode-block dropout."""
+    model = _tiny_model()
+    n, c = 24, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    rng = np.random.default_rng(13)
+
+    def subject(sid):
+        y = rng.choice([-1.0, 1.0], size=n)
+        return types.SimpleNamespace(
+            bands=_bands(n, c, seed=sid), parcel_per_electrode=poe,
+            electrode_mask=torch.ones(c), labels={"delta_volume": y},
+        )
+
+    subjects = {s: subject(s) for s in (0, 1, 2)}
+    dataset = types.SimpleNamespace(
+        ws_subjects=[0, 1, 2], cs_anchor=0, cs_test_subjects=[1, 2],
+        tasks=["delta_volume"], n_parcels=62, subject_data=lambda s: subjects[s],
+    )
+    out = run_v2_attentive_bench(
+        dataset, model, clip_len_s=1.0, device=torch.device("cpu"),
+        surfaces=("frontend",), wd_grid=(0.1,), dropout_grid=(0.1,),
+        parcel_dropout_grid=(0.2,), ls_grid=(0.0,),  # parcel_dropout drops whole electrodes
+        n_diwa_seeds=1, n_heads=4, max_steps=120, eval_every=30, swad_warmup=30,
+        patience=3, batch_size=16,
+    )
+    assert "val_probe/attn_frontend_student/cs/delta_volume" in out
+    assert "val_probe/attn_frontend_student/cs_std/delta_volume" in out
+    assert all(np.isfinite(v) for v in out.values())
     assert not any("m3" in k for k in out)
     assert all(np.isfinite(v) for v in out.values())
