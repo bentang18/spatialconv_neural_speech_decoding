@@ -45,6 +45,7 @@ class HeadTrainConfig:
     parcel_dropout: float = 0.0       # PRIMARY structured knob (drop whole parcels)
     token_dropout: float = 0.0        # optional i.i.d.-token ablation (off by default)
     tokens_per_parcel: int = 0        # k·S; set by the bench so parcel dropout knows blocks
+    n_time_frames: int = 0            # S; >0 turns on the learnable time positional tag
     lr: float = 1e-3
     weight_decay: float = 0.1
     label_smoothing: float = 0.0
@@ -62,7 +63,8 @@ def _build_head(cfg: HeadTrainConfig) -> AttentiveProbeHead:
         mlp_ratio=cfg.mlp_ratio, attn_dropout=cfg.attn_dropout,
         mlp_dropout=cfg.mlp_dropout, residual_dropout=cfg.residual_dropout,
         parcel_dropout=cfg.parcel_dropout, token_dropout=cfg.token_dropout,
-        tokens_per_parcel=cfg.tokens_per_parcel, n_out=1,
+        tokens_per_parcel=cfg.tokens_per_parcel, n_time_frames=cfg.n_time_frames,
+        n_out=1,
     )
 
 

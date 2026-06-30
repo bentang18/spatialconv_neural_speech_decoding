@@ -395,6 +395,7 @@ def run_v2_attentive_bench(
     parcel_dropout_grid: tp.Sequence[float] = (0.0, 0.2),
     ls_grid: tp.Sequence[float] = (0.0, 0.1),
     token_dropout: float = 0.0,
+    time_tag: bool = True,
     n_diwa_seeds: int = 3,
     n_heads: int = 6,
     n_queries: int = 1,
@@ -444,6 +445,7 @@ def run_v2_attentive_bench(
         # (≈110GB at d384/n_cap3500), so holding both M3 and M4 doubles peak host RAM.
         toks: dict[str, dict[int, Tensor]] = {sf: {} for sf in surfaces}
         tokens_per_parcel = 0
+        n_time_frames = 0
         for s in subs:
             m3, m4, _ = encode_subject_tokens(
                 model, sd[s].bands, sd[s].parcel_per_electrode,
@@ -451,6 +453,7 @@ def run_v2_attentive_bench(
                 batch_size=batch_size_fwd,
             )
             tokens_per_parcel = m4.shape[2] * m4.shape[3]   # k·S — the parcel block size
+            n_time_frames = m4.shape[3]                     # S — the time positional axis
             if "m3" in toks:
                 toks["m3"][s] = m3.reshape(m3.shape[0], -1, m3.shape[-1])
             if "m4" in toks:
@@ -460,6 +463,7 @@ def run_v2_attentive_bench(
         base = HeadTrainConfig(
             d_model=d_model, n_heads=n_heads, n_queries=n_queries, mlp_ratio=mlp_ratio,
             token_dropout=token_dropout, tokens_per_parcel=tokens_per_parcel,
+            n_time_frames=(n_time_frames if time_tag else 0),
             lr=lr, max_steps=max_steps,
             batch_size=batch_size, eval_every=eval_every, patience=patience,
             swad_warmup=swad_warmup,

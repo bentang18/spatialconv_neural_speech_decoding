@@ -122,6 +122,29 @@ def test_parcel_dropout_forward_finite_and_train_eval_differ():
     assert torch.allclose(head(x), head(x))
 
 
+def test_time_tag_off_by_default_no_embed():
+    head = AttentiveProbeHead(16, n_heads=4)
+    assert not hasattr(head, "time_embed")
+
+
+def test_time_tag_breaks_permutation_invariance_over_frames():
+    """With a time tag, reordering frames within a parcel changes the output (the point)."""
+    S = 5
+    head = AttentiveProbeHead(16, n_heads=4, n_time_frames=S, attn_dropout=0.0).eval()
+    x = torch.randn(4, S, 16)                                # one parcel, k=1, S frames
+    perm = torch.randperm(S)
+    assert not torch.allclose(head(x), head(x[:, perm]), atol=1e-5)
+
+
+def test_time_tag_shapes_and_frame_indexing():
+    """frame = token_idx % S, so the tag table has exactly S rows and forward is finite."""
+    S = 6
+    head = AttentiveProbeHead(16, n_heads=4, n_time_frames=S).eval()
+    assert head.time_embed.weight.shape == (S, 16)
+    out = head(torch.randn(3, 2 * S, 16))                    # k=2 → 2·S tokens, frame wraps
+    assert out.shape == (3, 1) and torch.isfinite(out).all()
+
+
 def test_learnability_separable_set():
     """A set whose token-mean encodes the label is learnable → train AUROC ≈ 1."""
     torch.manual_seed(0)

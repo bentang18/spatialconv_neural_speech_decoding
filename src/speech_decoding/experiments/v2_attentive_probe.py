@@ -47,6 +47,7 @@ class AttentiveProbeHead(nn.Module):
         parcel_dropout: float = 0.0,
         token_dropout: float = 0.0,
         tokens_per_parcel: int = 0,
+        n_time_frames: int = 0,
         n_out: int = 1,
     ) -> None:
         super().__init__()
@@ -59,6 +60,14 @@ class AttentiveProbeHead(nn.Module):
         self.parcel_dropout = float(parcel_dropout)
         self.token_dropout = float(token_dropout)
         self.tokens_per_parcel = int(tokens_per_parcel)
+        # Learnable TIME positional tag over the S axis (frame = token_idx % S; the k seeds
+        # share a frame's tag, parcels repeat it). The one positional axis not in content
+        # (freq folds into d, parcel is tagged, the k seeds differ in content). Off (=0)
+        # keeps the pool permutation-invariant; on makes it position-aware like keep-S.
+        self.n_time_frames = int(n_time_frames)
+        if self.n_time_frames > 0:
+            self.time_embed = nn.Embedding(self.n_time_frames, d_model)
+            nn.init.trunc_normal_(self.time_embed.weight, std=0.02)
 
         # phi[q,h,:] — the folded scoring query (W_q∘W_k), scores the FULL token.
         self.phi = nn.Parameter(torch.empty(n_queries, n_heads, d_model))
@@ -117,6 +126,9 @@ class AttentiveProbeHead(nn.Module):
 
         Returns ``(B, n_out)`` logits."""
         B, T, d = x.shape
+        if self.n_time_frames > 0:                                    # time positional tag
+            pos = torch.arange(T, device=x.device) % self.n_time_frames
+            x = x + self.time_embed(pos)[None]                        # (B,T,d), frame=t%S
         scale = self.d_model ** -0.5
         scores = torch.einsum("qhd,btd->bqht", self.phi, x) * scale   # (B,Q,H,T)
         mask = self._token_mask(x, key_padding_mask)

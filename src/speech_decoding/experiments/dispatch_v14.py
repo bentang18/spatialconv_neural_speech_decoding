@@ -3222,6 +3222,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--v2-attentive-tasks", type=str, default="",
                    help="Comma-list restricting attentive tasks (default '' = all "
                         "dataset tasks). Use 'delta_volume' for the fast bar-only sweep.")
+    p.add_argument("--v2-attentive-no-time-tag", action="store_true",
+                   help="Disable the learnable time positional tag on the readout (default "
+                        "ON: makes the set-pool position-aware over the S time axis, the "
+                        "one positional axis not already in token content).")
     # Gradient-noise-scale → critical-batch diagnostic (gns_critical_batch.
     # run_gns_probe). Builds the real converged module + group_by_session loader,
     # runs accum'd single-session micro-batch grads, fits B_crit. No trainer, 1 GPU.
@@ -5169,6 +5173,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_steps=args.v2_attentive_max_steps,
                 n_heads=args.v2_attentive_n_heads,
                 n_queries=args.v2_attentive_n_queries,
+                time_tag=not args.v2_attentive_no_time_tag,
                 tasks=tuple(t.strip() for t in args.v2_attentive_tasks.split(",") if t.strip())
                 or None,
             )
