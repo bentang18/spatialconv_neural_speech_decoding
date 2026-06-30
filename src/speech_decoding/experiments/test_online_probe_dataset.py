@@ -85,6 +85,59 @@ def test_pm1_raises_on_nan_feature() -> None:
         opd.pm1_labels(wdf, "delta_volume")
 
 
+def test_pm1_word_part_speech_parity_with_upstream() -> None:
+    """High-level depth-test categorical: +1 VERB / −1 NOUN, other POS → NaN."""
+    pos = np.array(["VERB", "NOUN", "ADJ", "VERB", "DET", "NOUN", "PRON", "VERB"])
+    wdf = pd.DataFrame({"pos": pos})
+    mine = opd.pm1_labels(wdf, "word_part_speech")
+    assert np.where(mine == 1.0)[0].tolist() == [0, 3, 7]
+    assert np.where(mine == -1.0)[0].tolist() == [1, 5]
+    assert np.isnan(mine[[2, 4, 6]]).all()
+    ref = derive_label_indices(
+        words_df=wdf, nonverbal_df=pd.DataFrame(), task="word_part_speech",
+        binary_tasks=True, balance=False, lite=False,
+    )
+    assert np.array_equal(np.where(mine == 1.0)[0], np.sort(ref[1]))
+    assert np.array_equal(np.where(mine == -1.0)[0], np.sort(ref[0]))
+
+
+def test_pm1_word_head_pos_parity_with_upstream() -> None:
+    """+1 bin_head==0 / −1 bin_head==1, other values → NaN."""
+    wdf = pd.DataFrame({"bin_head": np.array([0, 1, 2, 0, 1, 0], dtype=float)})
+    mine = opd.pm1_labels(wdf, "word_head_pos")
+    assert np.where(mine == 1.0)[0].tolist() == [0, 3, 5]
+    assert np.where(mine == -1.0)[0].tolist() == [1, 4]
+    assert np.isnan(mine[2])
+    ref = derive_label_indices(
+        words_df=wdf, nonverbal_df=pd.DataFrame(), task="word_head_pos",
+        binary_tasks=True, balance=False, lite=False,
+    )
+    assert np.array_equal(np.where(mine == 1.0)[0], np.sort(ref[1]))
+    assert np.array_equal(np.where(mine == -1.0)[0], np.sort(ref[0]))
+
+
+def test_pm1_face_num_parity_with_upstream() -> None:
+    """Visual control: +1 any face (>0) / −1 none (==0)."""
+    wdf = pd.DataFrame({"face_num": np.array([0, 1, 3, 0, 2, 0], dtype=float)})
+    mine = opd.pm1_labels(wdf, "face_num")
+    assert np.where(mine == 1.0)[0].tolist() == [1, 2, 4]
+    assert np.where(mine == -1.0)[0].tolist() == [0, 3, 5]
+    assert not np.isnan(mine).any()                       # binary face_num labels every row
+    ref = derive_label_indices(
+        words_df=wdf, nonverbal_df=pd.DataFrame(), task="face_num",
+        binary_tasks=True, balance=False, lite=False,
+    )
+    assert np.array_equal(np.where(mine == 1.0)[0], np.sort(ref[1]))
+    assert np.array_equal(np.where(mine == -1.0)[0], np.sort(ref[0]))
+
+
+def test_pm1_categorical_int_raises_on_nan() -> None:
+    """The integer-categorical NaN-guard (LG14) fires on a join-miss for face_num."""
+    wdf = pd.DataFrame({"face_num": [0.0, np.nan, 2.0]})
+    with pytest.raises(ValueError, match="non-finite"):
+        opd.pm1_labels(wdf, "face_num")
+
+
 # ------------------------------------------------------------------- selection
 def test_select_window_indices_all_when_under_cap() -> None:
     assert np.array_equal(opd.select_window_indices(100, 3500, seed=0), np.arange(100))

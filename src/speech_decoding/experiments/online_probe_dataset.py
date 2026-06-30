@@ -37,6 +37,7 @@ from speech_decoding.experiments.online_probe import SubjectProbeData, assert_fi
 from speech_decoding.studies.braintreebank.labels import (
     SINGLE_FLOAT_TASK_COLUMNS,
     _assert_finite_labels,
+    _finite_int_column,
     remap_task_column,
 )
 from speech_decoding.studies.braintreebank.manifest import (
@@ -91,8 +92,10 @@ def pm1_labels(words_df: pd.DataFrame, task: str) -> np.ndarray:
     ``mean(values < v)`` and assign **+1** above the 75th pct, **−1** below the 25th,
     **NaN** (excluded from the fit) in the middle 50%; ``word_index`` assigns +1 to
     the first word in a sentence (``idx_in_sentence == 0``), −1 to the second
-    (``== 1``), NaN otherwise. Class 1↔+1 / class 0↔−1 mirrors the upstream dict
-    keys (verified by :mod:`test_online_probe_dataset` against the real function)."""
+    (``== 1``), NaN otherwise. The high-level depth-test categoricals: ``word_part_speech``
+    +1 VERB / −1 NOUN; ``word_head_pos`` +1 ``bin_head==0`` / −1 ``==1``; ``face_num``
+    +1 any face (``>0``) / −1 none (``==0``). Class 1↔+1 / class 0↔−1 mirrors the upstream
+    dict keys (verified by :mod:`test_online_probe_dataset` against the real function)."""
     ut = _upstream_task(task)
     out = np.full(len(words_df), np.nan, dtype=np.float64)
     if ut in SINGLE_FLOAT_TASK_COLUMNS:
@@ -107,6 +110,23 @@ def pm1_labels(words_df: pd.DataFrame, task: str) -> np.ndarray:
         idx = np.asarray(words_df["idx_in_sentence"].to_numpy(), dtype=float)
         out[idx == 0.0] = 1.0
         out[idx == 1.0] = -1.0
+    elif ut == "word_part_speech":
+        # Categorical: binary is VERB(+1) vs NOUN(−1), all other POS excluded (NaN).
+        # Mirrors derive_label_indices {1: pos=="VERB", 0: pos=="NOUN"}.
+        pos = words_df[remap_task_column(ut)].to_numpy()
+        out[pos == "VERB"] = 1.0
+        out[pos == "NOUN"] = -1.0
+    elif ut == "word_head_pos":
+        # Integer-categorical bin_head: binary is 0(+1) vs 1(−1). NaN-guarded
+        # (LG14 integer-categorical analogue) so a join-miss fails loud.
+        head = _finite_int_column(words_df, remap_task_column(ut), ut)
+        out[head == 0] = 1.0
+        out[head == 1] = -1.0
+    elif ut == "face_num":
+        # Visual control: any face present (>0 → +1) vs none (==0 → −1). NaN-guarded.
+        faces = _finite_int_column(words_df, remap_task_column(ut), ut)
+        out[faces > 0] = 1.0
+        out[faces == 0] = -1.0
     else:
         raise KeyError(f"probe task {task!r} -> upstream {ut!r} is not supported")
     return out
@@ -114,15 +134,17 @@ def pm1_labels(words_df: pd.DataFrame, task: str) -> np.ndarray:
 
 def probe_feature_columns(tasks: tp.Sequence[str] = PROBE_TASKS) -> tuple[str, ...]:
     """The transcript-feature columns :func:`pm1_labels` reads, derived from the
-    probe tasks (deduped, order-preserving). Continuous tasks map through
-    ``remap_task_column`` (``delta_volume`` → ``delta_rms``, ``word_length`` →
-    ``word_length``); ``word_position`` → upstream ``word_index`` → ``idx_in_sentence``.
-    This is the exact set :func:`attach_probe_features` must re-join onto the
-    forwarded windows before labelling."""
+    probe tasks (deduped, order-preserving). Most tasks map through
+    ``remap_task_column`` (continuous ``delta_volume`` → ``delta_rms``; categorical
+    ``word_part_speech`` → ``pos``, ``word_head_pos`` → ``bin_head``, ``face_num`` →
+    ``face_num``); ``word_position`` → upstream ``word_index`` → ``idx_in_sentence`` is
+    the one column ``remap_task_column`` doesn't carry. This is the exact set
+    :func:`attach_probe_features` must re-join onto the forwarded windows before
+    labelling."""
     cols: list[str] = []
     for task in tasks:
         ut = _upstream_task(task)
-        col = remap_task_column(ut) if ut in SINGLE_FLOAT_TASK_COLUMNS else "idx_in_sentence"
+        col = "idx_in_sentence" if ut == "word_index" else remap_task_column(ut)
         if col not in cols:
             cols.append(col)
     return tuple(cols)
