@@ -318,7 +318,36 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
     return all_rows
 
 
-def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, batch_size=64):
+def _apply_lite_montage(bands, ppe, em, *, bt_root, subject_id, trial_id):
+    """Subset the electrode axis of (bands, parcel_per_electrode, electrode_mask) to the
+    Neuroprobe-Lite montage — the SAME ~93–120 electrodes the real Lite leaderboard evals
+    on (parity), and the lever that takes M2's all-electrode keep-S grid from ~256 → Lite
+    width (the host-RAM ceiling that was OOM-ing the encode).
+
+    Uses the vendored ``lite_voltage_mask`` (a boolean mask over ``voltage_electrode_order``,
+    the canonical voltage row order the front-end and the support/valid_mask extractors all
+    key off). Applying the one mask in lockstep to bands AND ppe/em keeps ``support[c]`` ↔
+    ``electrode_tokens[c]`` aligned. Fails loud if the mask length != the electrode axis —
+    a voltage-order desync that would silently mis-route electrodes into parcels."""
+    import torch
+
+    from speech_decoding.studies.braintreebank.anatomy import lite_voltage_mask
+
+    if bt_root is None:
+        raise ValueError("electrode_set='lite' needs ROOT_DIR_BRAINTREEBANK (lite montage)")
+    mask = lite_voltage_mask(bt_root, subject_id, trial_id)        # (C,) bool over voltage order
+    c_axis = int(ppe.shape[0])
+    if mask.shape[0] != c_axis:
+        raise ValueError(
+            f"({subject_id},{trial_id}) Lite mask length {mask.shape[0]} != electrode axis "
+            f"{c_axis}: voltage-order desync. Refusing to silently mis-route electrodes."
+        )
+    m = torch.from_numpy(mask)
+    return [b[:, m] for b in bands], ppe[m], em[m]
+
+
+def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
+               electrode_set="lite", batch_size=64):
     """Stage 1: forward the trained encoder over each session's union clips → tap caches.
 
     One GPU forward per session over EXACTLY the union word windows (est_idx-aligned,
@@ -328,7 +357,12 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
     skipped if ``cache_untagged_m3`` is False). Each session's :class:`SessionTapCache`
     (grids + per-task labels + WS/CS split rows + electrode anatomy) is ``torch.save``-d
     to ``out_dir`` so the CPU Stage-2 sweep reruns without re-forwarding. Pure reuse of
-    ``encode_subject_tokens`` (the unreduced full-grid encode) — no new model logic."""
+    ``encode_subject_tokens`` (the unreduced full-grid encode) — no new model logic.
+
+    ``electrode_set='lite'`` (default) subsets each session to its Neuroprobe-Lite montage
+    BEFORE the forward (leaderboard parity + the M2 host-RAM lever); ``'all'`` keeps every
+    electrode. Sessions are processed one at a time and freed, so peak host RAM is one
+    session's grids, not the whole cohort's."""
     import torch
 
     from speech_decoding.experiments.pretrain_probe_driver import save_cache
@@ -364,6 +398,10 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
         events = _label_events(subject_id, trial_id, str(row["timeline"]), tasks, bt_root)
         targets = build_session_targets(events, subject_id=subject_id, trial_id=trial_id)
         bands, ppe, em, _ = _materialize_bands(xp, row, targets.clip_starts)
+        if electrode_set == "lite":
+            bands, ppe, em = _apply_lite_montage(
+                bands, ppe, em, bt_root=bt_root, subject_id=subject_id, trial_id=trial_id
+            )
         grids_sf, labels = encode_subject_tokens(
             model, bands, ppe, clip_len_s=PROBE_CLIP_DUR_S, device=device,
             surfaces=tuple(surfaces), batch_size=batch_size,
@@ -381,24 +419,28 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
         del bands, grids_sf, grids, cache
 
 
-def _load_tap_caches(cache_dir):
-    """Load the per-session `--encode` tap caches → ``{(subj,trial): SessionTapCache}``."""
+def _load_tap_caches(cache_dir, *, maxsize=2):
+    """Index the per-session `--encode` tap caches → a :class:`LazyCacheMap` that loads each
+    session on access and keeps at most ``maxsize`` resident.
+
+    The keep-S grids are large (Lite-120 M2 ≈ 50 GB/session); eager-loading all 7 cohort
+    sessions would OOM the readout node. The lazy map holds only what the current cell needs
+    (test + anchor = 2), so peak readout RAM is ~2 sessions, not the whole cohort."""
     import glob
     import re
 
-    from speech_decoding.experiments.pretrain_probe_driver import load_cache
+    from speech_decoding.experiments.pretrain_probe_driver import LazyCacheMap
 
-    caches = {}
+    paths = {}
     pat = re.compile(r"taps_s(\d+)_t(\d+)\.pt$")
     for path in sorted(glob.glob(os.path.join(cache_dir, "taps_s*_t*.pt"))):
         m = pat.search(os.path.basename(path))
         if not m:
             continue
-        key = (int(m.group(1)), int(m.group(2)))
-        caches[key] = load_cache(path)
-    if not caches:
+        paths[(int(m.group(1)), int(m.group(2)))] = path
+    if not paths:
         raise FileNotFoundError(f"no taps_s*_t*.pt caches under {cache_dir}")
-    return caches
+    return LazyCacheMap(paths, maxsize=maxsize)
 
 
 def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=None,
@@ -419,14 +461,18 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
 
     caches = _load_tap_caches(cache_dir)
-    d_model = int(next(iter(caches.values())).grids["M2"].shape[-1])
+    # Read d_model off ONE session (loads + LRU-caches it) — never materialize all caches.
+    d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
     caches_by_ckpt = {ckpt_tag: caches}
+    # Enumerate cells over EXACTLY the cached sessions — a cell can never request a cache
+    # the --encode step didn't write (e.g. the 13→7 cohort cut, or a partial encode).
+    cohort = tuple(sorted(caches.keys()))
     sel = select_best_checkpoint(
         caches_by_ckpt, cfg, representative_ckpt=ckpt_tag,
         modes=tuple(modes), tasks=tuple(tasks) if tasks else NEUROPROBE_TASKS,
         taps=tuple(taps) if taps else TAPS,
-        cs_train_anchor=anchor, hp_grid=hp_grid, device=device,
+        cs_train_anchor=anchor, cohort=cohort, hp_grid=hp_grid, device=device,
     )
     stamp = _stamp()
     hp = sel.sweep.best_hp
@@ -483,7 +529,7 @@ def _print_summary(rows) -> None:
 def main(argv: list[str] | None = None) -> int:
     from speech_decoding.experiments.pretrain_probe_suite import (
         DEFAULT_CS_TRAIN_ANCHOR,
-        PRETRAIN_UNIVERSE,
+        PROBE_COHORT_7,
         NEUROPROBE_TASKS,
     )
 
@@ -499,6 +545,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="output dir for --encode tap caches (required for --encode)")
     p.add_argument("--no-untagged-m3", action="store_true",
                    help="skip the untagged-pool M3 A/B surface (cache M2/M3/M4 only)")
+    p.add_argument("--electrode-set", choices=("lite", "all"), default="lite",
+                   help="--encode montage: 'lite' (Neuroprobe-Lite ~120, leaderboard parity, "
+                        "default) or 'all' electrodes")
     p.add_argument("--score", action="store_true",
                    help="Stage 2 (CPU): load --cache-dir tap caches → sweep + eval → CSV")
     p.add_argument("--ckpt-tag", default="ladder-60000",
@@ -537,16 +586,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.full:
-        run_raw_floor(tuple(PRETRAIN_UNIVERSE), tuple(NEUROPROBE_TASKS),
+        run_raw_floor(tuple(PROBE_COHORT_7), tuple(NEUROPROBE_TASKS),
                       anchor=anchor, out_path=args.out)
         return 0
 
     if args.encode:
         if not args.ckpt or not args.cache_dir:
             p.error("--encode requires --ckpt and --cache-dir")
-        run_encode(tuple(PRETRAIN_UNIVERSE), tuple(NEUROPROBE_TASKS),
+        run_encode(tuple(PROBE_COHORT_7), tuple(NEUROPROBE_TASKS),
                    ckpt_path=args.ckpt, out_dir=args.cache_dir,
-                   cache_untagged_m3=not args.no_untagged_m3)
+                   cache_untagged_m3=not args.no_untagged_m3,
+                   electrode_set=args.electrode_set)
         return 0
 
     if args.score:

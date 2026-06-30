@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from speech_decoding.experiments.pretrain_probe_driver import (
+    LazyCacheMap,
     SessionTapCache,
     load_cache,
     run_attentive_cell,
@@ -108,6 +109,53 @@ def test_save_load_roundtrip(tmp_path):
     a_load = run_linear_cell(cell, "M3", test_cache=loaded)
     assert a_orig == pytest.approx(a_load)
     assert loaded.subject_id == 1 and loaded.n_parcels == P
+
+
+def _write_caches(tmp_path, keys):
+    paths = {}
+    for i, (s, t) in enumerate(keys):
+        p = str(tmp_path / f"taps_s{s}_t{t}.pt")
+        save_cache(_make_cache(i, s, t), p)
+        paths[(s, t)] = p
+    return paths
+
+
+def test_lazy_cache_map_dispatches_like_eager_dict(tmp_path):
+    """A CS cell driven off a LazyCacheMap yields the same AUROC as off an eager dict —
+    the lazy map is a transparent drop-in for the readout dispatch."""
+    keys = [(2, 1), (3, 2)]
+    paths = _write_caches(tmp_path, keys)
+    lazy = LazyCacheMap(paths, maxsize=2)
+    eager = {k: load_cache(p) for k, p in paths.items()}
+    cell = ProbeCell("CrossSubject", "onset", 3, 2, train_subject_id=2, train_trial_id=1)
+    a_lazy = run_linear_cell(cell, "M3", test_cache=lazy[(3, 2)], anchor_cache=lazy[(2, 1)])
+    a_eager = run_linear_cell(
+        cell, "M3", test_cache=eager[(3, 2)], anchor_cache=eager[(2, 1)]
+    )
+    assert a_lazy == pytest.approx(a_eager)
+
+
+def test_lazy_cache_map_evicts_to_maxsize_and_supports_get(tmp_path):
+    """LRU caps residency at maxsize (so the readout never holds the whole cohort), while
+    keeping the anchor warm under the test→anchor access pattern; .get/contains/iter work."""
+    keys = [(2, 1), (1, 0), (3, 2), (4, 2)]
+    paths = _write_caches(tmp_path, keys)
+    lazy = LazyCacheMap(paths, maxsize=2)
+    assert set(lazy) == set(keys) and len(lazy) == 4         # iter/keys/len: no loading
+    assert (2, 1) in lazy and (9, 9) not in lazy
+    assert lazy.get((9, 9)) is None
+    # CS-like pattern: each cell touches a test then the constant anchor (2,1).
+    for test_key in [(1, 0), (3, 2), (4, 2)]:
+        _ = lazy[test_key]
+        _ = lazy[(2, 1)]
+        assert len(lazy._lru) <= 2                           # never more than maxsize resident
+        assert (2, 1) in lazy._lru                            # anchor stays warm across cells
+
+
+def test_lazy_cache_map_rejects_maxsize_below_two(tmp_path):
+    paths = _write_caches(tmp_path, [(2, 1)])
+    with pytest.raises(ValueError, match="maxsize"):
+        LazyCacheMap(paths, maxsize=1)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,40 @@ def test_load_tap_caches_empty_dir_raises(tmp_path):
         _runner()._load_tap_caches(str(tmp_path))
 
 
+def test_apply_lite_montage_subsets_electrode_axis(monkeypatch):
+    """The Lite mask subsets the electrode axis of bands + parcel_per_electrode +
+    electrode_mask in lockstep (so support[c] ↔ token[c] stays aligned)."""
+    import speech_decoding.studies.braintreebank.anatomy as anat
+
+    Cfull = 5
+    mask = np.array([True, False, True, False, True])           # keep electrodes 0,2,4
+    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: mask)
+    bands = [torch.randn(4, Cfull, 2, 3), torch.randn(4, Cfull, 2, 3)]
+    ppe = torch.arange(Cfull)
+    em = torch.ones(Cfull, dtype=torch.bool)
+    b2, ppe2, em2 = _runner()._apply_lite_montage(
+        bands, ppe, em, bt_root="x", subject_id=2, trial_id=1
+    )
+    assert [b.shape[1] for b in b2] == [3, 3]
+    assert torch.equal(ppe2, torch.tensor([0, 2, 4]))
+    assert em2.shape == (3,)
+    assert torch.equal(b2[0], bands[0][:, torch.from_numpy(mask)])
+
+
+def test_apply_lite_montage_fails_loud_on_axis_desync(monkeypatch):
+    """A mask whose length != the electrode axis is a voltage-order desync — raise, never
+    silently mis-route electrodes into parcels."""
+    import speech_decoding.studies.braintreebank.anatomy as anat
+
+    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: np.ones(99, bool))
+    bands = [torch.randn(4, 5, 2, 3)]
+    with pytest.raises(ValueError, match="desync"):
+        _runner()._apply_lite_montage(
+            bands, torch.arange(5), torch.ones(5, dtype=torch.bool),
+            bt_root="x", subject_id=2, trial_id=1,
+        )
+
+
 def test_run_score_writes_cross_subject_mean_rows(tmp_path):
     _write_caches(tmp_path)
     out = tmp_path / "scores.csv"

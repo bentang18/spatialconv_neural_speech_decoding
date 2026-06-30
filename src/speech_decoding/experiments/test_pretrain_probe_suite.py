@@ -12,6 +12,7 @@ from speech_decoding.experiments.pretrain_probe_suite import (
     DEFAULT_CS_TRAIN_ANCHOR,
     NEUROPROBE_TASKS,
     PRETRAIN_UNIVERSE,
+    PROBE_COHORT_7,
     WS_N_FOLDS,
     assert_cells_firewall_legal,
     enumerate_cells,
@@ -58,6 +59,28 @@ def test_cross_subject_drops_train_subject_and_uses_anchor():
         assert (c.train_subject_id, c.train_trial_id) == DEFAULT_CS_TRAIN_ANCHOR
     n_test_sessions = sum(1 for (s, _) in PRETRAIN_UNIVERSE if s != 2)
     assert len(cells) == n_test_sessions * len(NEUROPROBE_TASKS)
+
+
+def test_probe_cohort_7_is_one_firewall_legal_trial_per_subject():
+    """The 13→7 cut: one trial per subject, the CS anchor included, all firewall-legal."""
+    assert len(PROBE_COHORT_7) == 7
+    assert {s for (s, _) in PROBE_COHORT_7} == {1, 2, 3, 4, 6, 8, 9}
+    assert len({s for (s, _) in PROBE_COHORT_7}) == 7          # one trial per subject
+    assert set(PROBE_COHORT_7).issubset(set(PRETRAIN_UNIVERSE))
+    assert DEFAULT_CS_TRAIN_ANCHOR in PROBE_COHORT_7
+    assert set(PROBE_COHORT_7).isdisjoint(_LITE)
+
+
+def test_enumerate_cells_restricts_to_cohort():
+    """Passing the 7-cohort enumerates cells only over those sessions (no missing-cache
+    cells): WS test sessions ⊆ cohort, CS test subjects = cohort minus the anchor subject."""
+    ws = enumerate_cells(("WithinSession",), NEUROPROBE_TASKS, cohort=PROBE_COHORT_7)
+    assert {(c.test_subject_id, c.test_trial_id) for c in ws} == set(PROBE_COHORT_7)
+    assert len(ws) == len(PROBE_COHORT_7) * len(NEUROPROBE_TASKS) * WS_N_FOLDS
+    cs = enumerate_cells(("CrossSubject",), NEUROPROBE_TASKS, cohort=PROBE_COHORT_7)
+    assert {c.test_subject_id for c in cs} == {1, 3, 4, 6, 8, 9}
+    assert len(cs) == 6 * len(NEUROPROBE_TASKS)
+    assert_cells_firewall_legal(cs)
 
 
 def test_enumerate_rejects_crosssession():

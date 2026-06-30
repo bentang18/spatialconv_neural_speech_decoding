@@ -31,6 +31,7 @@ from speech_decoding.studies.braintreebank.manifest import (
 __all__ = [
     "NEUROPROBE_TASKS",
     "PRETRAIN_UNIVERSE",
+    "PROBE_COHORT_7",
     "CS_TRAIN_SUBJECT",
     "CS_TRAIN_ANCHOR_CANDIDATES",
     "DEFAULT_CS_TRAIN_ANCHOR",
@@ -54,6 +55,26 @@ if _LEAK:
     raise AssertionError(
         f"WALL OF FIRE breach: pretrain probe cohort intersects the Neuroprobe eval "
         f"set (BT_LITE_SESSIONS) at {sorted(_LEAK)}. The probe must NEVER touch eval data."
+    )
+
+# 7-session probe cohort (Ben 2026-06-30): ONE trial per subject — the CS train anchor
+# (subject 2) plus one trial for each of the 6 cross-subject test subjects. This halves
+# encode + readout cost vs the full 13-session universe (subjects 2 and 6 each have
+# multiple trials there) while keeping the FULL CrossSubject structure (1 anchor + 6 test
+# subjects) and full per-cell statistical power (clips are NOT cut). Every member is drawn
+# from PRETRAIN_UNIVERSE, so it is firewall-legal by construction; the length guard fails
+# loud if a chosen trial is ever dropped from the universe.
+PROBE_COHORT_TRIALS: dict[int, int] = {1: 0, 2: 1, 3: 2, 4: 2, 6: 0, 8: 0, 9: 0}
+PROBE_COHORT_7: tuple[tuple[int, int], ...] = tuple(
+    (subject_id, trial_id)
+    for (subject_id, trial_id) in PRETRAIN_UNIVERSE
+    if PROBE_COHORT_TRIALS.get(subject_id) == trial_id
+)
+if len(PROBE_COHORT_7) != len(PROBE_COHORT_TRIALS):
+    raise AssertionError(
+        f"PROBE_COHORT_7 has {len(PROBE_COHORT_7)} sessions, expected "
+        f"{len(PROBE_COHORT_TRIALS)} (one per subject {sorted(PROBE_COHORT_TRIALS)}); a "
+        f"chosen trial is missing from PRETRAIN_UNIVERSE. Got {sorted(PROBE_COHORT_7)}."
     )
 
 # CrossSubject trains on subject 2 (same person as the leaderboard DS-DM train
@@ -95,9 +116,11 @@ class ProbeCell:
         return base
 
 
-def _within_session_cells(tasks: tuple[str, ...]) -> list[ProbeCell]:
+def _within_session_cells(
+    tasks: tuple[str, ...], cohort: tuple[tuple[int, int], ...]
+) -> list[ProbeCell]:
     cells: list[ProbeCell] = []
-    for (subject_id, trial_id) in PRETRAIN_UNIVERSE:
+    for (subject_id, trial_id) in cohort:
         for task in tasks:
             for fold in range(WS_N_FOLDS):
                 cells.append(
@@ -107,7 +130,8 @@ def _within_session_cells(tasks: tuple[str, ...]) -> list[ProbeCell]:
 
 
 def _cross_subject_cells(
-    tasks: tuple[str, ...], anchor: tuple[int, int]
+    tasks: tuple[str, ...], anchor: tuple[int, int],
+    cohort: tuple[tuple[int, int], ...],
 ) -> list[ProbeCell]:
     anchor_subject, anchor_trial = anchor
     if anchor not in PRETRAIN_UNIVERSE:
@@ -117,7 +141,7 @@ def _cross_subject_cells(
             f"{CS_TRAIN_ANCHOR_CANDIDATES}."
         )
     cells: list[ProbeCell] = []
-    for (subject_id, trial_id) in PRETRAIN_UNIVERSE:
+    for (subject_id, trial_id) in cohort:
         if subject_id == anchor_subject:
             # Drop the entire train SUBJECT from test (upstream CrossSubject contract).
             continue
@@ -136,14 +160,20 @@ def enumerate_cells(
     tasks: tuple[str, ...] = NEUROPROBE_TASKS,
     *,
     cs_train_anchor: tuple[int, int] = DEFAULT_CS_TRAIN_ANCHOR,
+    cohort: tuple[tuple[int, int], ...] = PRETRAIN_UNIVERSE,
 ) -> list[ProbeCell]:
-    """All probe cells for the requested modes. Modes ⊆ {WithinSession, CrossSubject}."""
+    """All probe cells for the requested modes. Modes ⊆ {WithinSession, CrossSubject}.
+
+    ``cohort`` is the set of sessions to enumerate over (WS test = each session; CS test =
+    each non-anchor-subject session). Defaults to the full firewall-legal
+    :data:`PRETRAIN_UNIVERSE`; pass :data:`PROBE_COHORT_7` (or the sessions actually cached)
+    to restrict cells to the encoded sessions so no cell requests a missing cache."""
     cells: list[ProbeCell] = []
     for mode in modes:
         if mode == "WithinSession":
-            cells.extend(_within_session_cells(tasks))
+            cells.extend(_within_session_cells(tasks, cohort))
         elif mode == "CrossSubject":
-            cells.extend(_cross_subject_cells(tasks, cs_train_anchor))
+            cells.extend(_cross_subject_cells(tasks, cs_train_anchor, cohort))
         else:
             raise ValueError(
                 f"unsupported eval mode {mode!r}; the pretrain probe suite runs only "

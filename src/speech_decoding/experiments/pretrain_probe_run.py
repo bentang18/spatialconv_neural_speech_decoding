@@ -76,6 +76,7 @@ def select_best_checkpoint(
     hp_grid: list[HPCombo] | None = None,
     sweep_cells: list[ProbeCell] | None = None,
     taps: tuple[str, ...] = TAPS,
+    cohort: tuple[tuple[int, int], ...] | None = None,
     device: torch.device | None = None,
 ) -> CheckpointSelection:
     """Run the full suite and pick the best checkpoint by cross-subject AUROC.
@@ -83,13 +84,16 @@ def select_best_checkpoint(
     1. enumerate firewall-legal cells (+ self-test); 2. sweep the attentive HP ONCE on
     ``representative_ckpt`` by mean val AUROC; 3. eval every checkpoint at the fixed HP;
     4. aggregate; 5. rank by ``best_cross_subject``. ``sweep_cells`` defaults to all cells
-    (pass a representative subset to cut sweep cost)."""
+    (pass a representative subset to cut sweep cost). ``cohort`` restricts the enumerated
+    cells to a session set (default: all of PRETRAIN_UNIVERSE); pass the sessions actually
+    cached so no cell requests a missing cache."""
     if representative_ckpt not in caches_by_ckpt:
         raise ValueError(
             f"representative_ckpt {representative_ckpt!r} not in caches_by_ckpt "
             f"{sorted(caches_by_ckpt)}"
         )
-    cells = enumerate_cells(modes, tasks, cs_train_anchor=cs_train_anchor)
+    enum_kw = {} if cohort is None else {"cohort": cohort}
+    cells = enumerate_cells(modes, tasks, cs_train_anchor=cs_train_anchor, **enum_kw)
     firewall_self_test(cells)
 
     grid = hp_grid if hp_grid is not None else default_hp_grid()

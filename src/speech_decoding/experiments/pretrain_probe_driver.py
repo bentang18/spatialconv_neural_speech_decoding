@@ -15,6 +15,7 @@ cache.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -36,6 +37,7 @@ from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
 __all__ = [
     "TAP_SPACE",
     "SessionTapCache",
+    "LazyCacheMap",
     "save_cache",
     "load_cache",
     "run_linear_cell",
@@ -83,6 +85,56 @@ def save_cache(cache: SessionTapCache, path: str) -> None:
 
 def load_cache(path: str) -> SessionTapCache:
     return torch.load(path, weights_only=False)
+
+
+class LazyCacheMap:
+    """Disk-backed ``{(subject,trial) -> SessionTapCache}`` that loads on access and keeps
+    at most ``maxsize`` caches resident (LRU).
+
+    The Stage-2 keep-S grids are large (one Lite-120 session's M2 ≈ 50 GB), so loading all
+    cohort sessions eagerly would OOM the readout node. A single cell touches at most two
+    caches — a CrossSubject cell reads the test session then the subject-2 anchor — so
+    ``maxsize=2`` holds both at once and keeps the (constant) anchor warm across cells while
+    only ever 2 grids sit in RAM. Drop-in for the eager dict the sweep/eval code expects:
+    it uses only ``cache[key]``, ``.get(key)``, ``key in cache``, iteration, and ``keys()``.
+    """
+
+    def __init__(self, paths: dict[tuple[int, int], str], *, maxsize: int = 2):
+        if maxsize < 2:
+            raise ValueError("maxsize must be >= 2 (a CrossSubject cell needs test+anchor)")
+        self._paths = dict(paths)
+        self._maxsize = maxsize
+        self._lru: OrderedDict[tuple[int, int], SessionTapCache] = OrderedDict()
+
+    def __contains__(self, key) -> bool:
+        return key in self._paths
+
+    def __iter__(self):
+        return iter(self._paths)
+
+    def keys(self):
+        return self._paths.keys()
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def __getitem__(self, key) -> SessionTapCache:
+        if key not in self._paths:
+            raise KeyError(key)
+        if key in self._lru:
+            self._lru.move_to_end(key)
+            return self._lru[key]
+        cache = load_cache(self._paths[key])
+        self._lru[key] = cache
+        while len(self._lru) > self._maxsize:
+            self._lru.popitem(last=False)
+        return cache
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
 
 def run_linear_cell(
