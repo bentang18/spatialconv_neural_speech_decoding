@@ -241,12 +241,15 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
     ieeg = _ieeg_index(xp)
     stamp = _stamp()
 
-    caches = {s: _session_cache(xp, ieeg, s, tasks, bt_root) for s in sessions}
-    n_parcels = max(c.n_parcels for c in caches.values())
-    anchor_cache = caches[anchor]
-    rows: list[ResultRow] = []
+    # Stream one session at a time: hold only the anchor cache + the current
+    # session (<=2 caches), and append rows to the CSV per session. Building all
+    # caches up front OOM-killed the login-node cgroup; an end-only write also
+    # lost everything on a mid-run death. Same numbers, bounded RAM.
+    anchor_cache = _session_cache(xp, ieeg, anchor, tasks, bt_root)
+    all_rows: list[ResultRow] = []
 
-    for s, cache in caches.items():
+    def _eval_session(s, cache) -> list[ResultRow]:
+        rows: list[ResultRow] = []
         for task in tasks:
             y = cache.labels.get(task)
             if y is None or np.sum(np.isfinite(y)) < 4:
@@ -274,6 +277,9 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
             ya = anchor_cache.labels.get(task)
             if ya is None or np.sum(np.isfinite(ya)) < 4:
                 continue
+            # Globally-fixed DK parcel grid; per-pair max is identical to a global
+            # max here (extra parcels are unsupported in both -> dropped on intersect).
+            n_parcels = max(anchor_cache.n_parcels, cache.n_parcels)
             auc_cs = linear_cs_cell_auroc(
                 anchor_cache.grids["raw"], ya, cache.grids["raw"], y,
                 val_rows=cs["val"], test_rows=cs["test"], tap_space="electrode",
@@ -288,11 +294,20 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
                     auroc=round(float(auc_cs), 4), n=int(len(cs["test"])),
                     notes=f"anchor={anchor} test={s}",
                 ))
+        return rows
 
-    append_results(rows, out_path)
-    _print_summary(rows)
-    print(f"[pretrain-probe] wrote {len(rows)} rows -> {out_path}")
-    return rows
+    for s in sessions:
+        cache = anchor_cache if s == anchor else _session_cache(xp, ieeg, s, tasks, bt_root)
+        rows = _eval_session(s, cache)
+        append_results(rows, out_path)  # incremental: survives a later death
+        all_rows.extend(rows)
+        print(f"[pretrain-probe] session {s}: +{len(rows)} rows -> {out_path}", flush=True)
+        if cache is not anchor_cache:
+            del cache
+
+    _print_summary(all_rows)
+    print(f"[pretrain-probe] wrote {len(all_rows)} rows -> {out_path}")
+    return all_rows
 
 
 def _print_summary(rows) -> None:
