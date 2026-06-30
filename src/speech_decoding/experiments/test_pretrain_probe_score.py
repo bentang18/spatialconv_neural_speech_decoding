@@ -109,43 +109,65 @@ def test_apply_lite_montage_subsets_electrode_axis(monkeypatch):
     assert torch.equal(b2[0], bands[0][:, torch.from_numpy(mask)])
 
 
-def test_apply_lite_montage_expands_over_padded_valid_positions(monkeypatch):
-    """The v14 segmenter pads the electrode axis (256) and marks the real electrodes via
-    valid_mask; ``lite_voltage_mask`` is ``n_valid`` long (voltage order), so it must be
-    placed at the VALID positions of the padded axis — never indexed against the raw axis."""
+def test_apply_lite_montage_lays_over_voltage_block_with_unmapped_contact(monkeypatch):
+    """The segmenter lays the voltage block contiguous-front; an UNMAPPED voltage electrode
+    is valid=False IN PLACE, so ``valid.sum() < n_voltage`` (the subject-4 case). The lite
+    mask is ``n_voltage`` long (one row per voltage electrode), so it must lay over the
+    contiguous-front block — NOT over ``where(em)``, which would mis-place it by the unmapped
+    count. A kept-but-unmapped lite electrode rides along with em=False (dropped downstream)."""
     import speech_decoding.studies.braintreebank.anatomy as anat
 
     Cfull = 5
-    em = torch.tensor([True, True, True, False, False])         # 3 real electrodes, 2 padding
-    lite = np.array([True, False, True])                        # keep voltage electrodes 0,2
+    # voltage block = positions 0..2 (n_voltage=3); electrode 1 is UNMAPPED (valid False in
+    # place); positions 3,4 are padding. valid.sum()=2 < n_voltage=3.
+    em = torch.tensor([True, False, True, False, False])
+    lite = np.array([True, True, False])                        # keep voltage electrodes 0,1
     monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: lite)
     bands = [torch.randn(4, Cfull, 2, 3)]
     ppe = torch.arange(Cfull)
     b2, ppe2, em2 = _runner()._apply_lite_montage(
-        bands, ppe, em, bt_root="x", subject_id=1, trial_id=0
+        bands, ppe, em, bt_root="x", subject_id=4, trial_id=2
     )
-    assert [b.shape[1] for b in b2] == [2]                      # lite ∩ valid = {0,2}
-    assert torch.equal(ppe2, torch.tensor([0, 2]))
-    assert torch.equal(em2, torch.tensor([True, True]))         # padding never selected
-    assert torch.equal(b2[0], bands[0][:, torch.tensor([0, 2])])
+    assert [b.shape[1] for b in b2] == [2]                      # lite over block = {0,1}
+    assert torch.equal(ppe2, torch.tensor([0, 1]))
+    assert torch.equal(em2, torch.tensor([True, False]))        # unmapped lite contact rides w/ em=False
+    assert torch.equal(b2[0], bands[0][:, torch.tensor([0, 1])])
 
 
-def test_apply_lite_montage_fails_loud_on_valid_count_desync(monkeypatch):
-    """A lite mask whose length != the valid-electrode count is a voltage-order desync —
-    raise, never expand a mis-sized selection onto the padded axis."""
+def test_apply_lite_montage_all_mapped_block(monkeypatch):
+    """When every voltage electrode maps (valid.sum() == n_voltage, the subj-1/2 case), the
+    lite mask lays over the same front block and padding is never selected."""
     import speech_decoding.studies.braintreebank.anatomy as anat
 
-    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: np.ones(99, bool))
-    em = torch.tensor([True, True, True, False, False])         # 3 valid, mask says 99
-    with pytest.raises(ValueError, match="desync"):
+    em = torch.tensor([True, True, True, False, False])         # 3 mapped, 2 padding
+    lite = np.array([True, False, True])                        # keep voltage electrodes 0,2
+    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: lite)
+    bands = [torch.randn(4, 5, 2, 3)]
+    b2, ppe2, em2 = _runner()._apply_lite_montage(
+        bands, torch.arange(5), em, bt_root="x", subject_id=1, trial_id=0
+    )
+    assert [b.shape[1] for b in b2] == [2]
+    assert torch.equal(ppe2, torch.tensor([0, 2]))
+    assert torch.equal(em2, torch.tensor([True, True]))         # padding never selected
+
+
+def test_apply_lite_montage_fails_loud_on_valid_beyond_block(monkeypatch):
+    """A valid slot BEYOND the voltage block breaks the contiguous-front layout the alignment
+    relies on — raise, never lay the lite mask over a non-contiguous block."""
+    import speech_decoding.studies.braintreebank.anatomy as anat
+
+    lite = np.array([True, False, True])                        # n_voltage=3
+    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: lite)
+    em = torch.tensor([True, True, False, False, True])         # valid at 4, beyond block [:3]
+    with pytest.raises(ValueError, match="contiguous-front desync"):
         _runner()._apply_lite_montage(
             [torch.randn(4, 5, 2, 3)], torch.arange(5), em,
             bt_root="x", subject_id=1, trial_id=0,
         )
 
 
-def test_apply_lite_montage_fails_loud_on_axis_desync(monkeypatch):
-    """A mask whose length != the electrode axis is a voltage-order desync — raise, never
+def test_apply_lite_montage_fails_loud_on_axis_overrun(monkeypatch):
+    """A voltage order longer than the padded electrode axis is a desync — raise, never
     silently mis-route electrodes into parcels."""
     import speech_decoding.studies.braintreebank.anatomy as anat
 

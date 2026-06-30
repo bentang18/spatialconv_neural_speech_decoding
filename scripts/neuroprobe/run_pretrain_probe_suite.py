@@ -355,31 +355,44 @@ def _apply_lite_montage(bands, ppe, em, *, bt_root, subject_id, trial_id):
     on (parity), and the lever that takes M2's all-electrode keep-S grid from the padded
     width down to Lite width (the host-RAM ceiling that was OOM-ing the encode).
 
-    The v14 segmenter PADS the electrode axis to a fixed width (256 here) and marks the
-    real electrodes with ``valid_mask`` (``em``): the valid positions are contiguous and
-    sit in ``voltage_electrode_order`` (verified byte-exact against ``aligned_voltage_support``
-    — support[valid] == the voltage-order DKT support). ``lite_voltage_mask`` is a boolean
-    over that voltage order, so it is ``n_valid`` long, NOT the padded axis. We expand it
-    onto the padded axis at the valid positions, then subset bands AND ppe/em in lockstep so
-    ``support[c]`` ↔ ``electrode_tokens[c]`` stays aligned. Fails loud if the mask length !=
-    the valid-electrode count — a voltage-order desync that would silently mis-route
-    electrodes into parcels."""
+    The v14 segmenter PADS the electrode axis to a fixed width (256 here) and lays the
+    VOLTAGE BLOCK contiguous-front: ``valid_mask`` (``em``) is ``mask[:n_voltage] = valid``,
+    where ``valid[c]`` is True iff voltage electrode ``c`` was assigned a DK parcel (an
+    UNMAPPED voltage electrode is False **in place**, NOT dropped) and the trailing
+    ``c_max - n_voltage`` padding slots are False. ``lite_voltage_mask`` is a boolean over
+    the SAME ``voltage_electrode_order``, so it is ``n_voltage`` long — one row per voltage
+    electrode regardless of parcel mapping — NOT ``valid.sum()`` long. (For subjects whose
+    every voltage electrode maps, ``valid.sum() == n_voltage``; subjects with an unmapped
+    contact have ``valid.sum() < n_voltage``, so aligning the lite mask to ``where(em)``
+    would mis-place it by the unmapped count.) We lay the lite mask over the contiguous-front
+    voltage block, then subset bands AND ppe/em in lockstep so ``support[c]`` ↔
+    ``electrode_tokens[c]`` stays aligned; em rides along, so any kept-but-unmapped lite
+    electrode is marked False and dropped downstream at the pool, exactly as on the
+    all-electrode path. Fails loud if the voltage order overruns the padded axis, or if any
+    valid slot sits BEYOND the voltage block — either breaks the contiguous-front layout the
+    alignment relies on and would silently mis-route electrodes into parcels."""
     import torch
 
     from speech_decoding.studies.braintreebank.anatomy import lite_voltage_mask
 
     if bt_root is None:
         raise ValueError("electrode_set='lite' needs ROOT_DIR_BRAINTREEBANK (lite montage)")
-    mask = lite_voltage_mask(bt_root, subject_id, trial_id)        # (n_valid,) bool, voltage order
-    valid_idx = np.where(em.numpy())[0]                            # real electrodes in padded axis
-    if mask.shape[0] != valid_idx.shape[0]:
+    mask = lite_voltage_mask(bt_root, subject_id, trial_id)        # (n_voltage,) bool, voltage order
+    n_voltage = int(mask.shape[0])
+    axis = int(em.shape[0])
+    if n_voltage > axis:
         raise ValueError(
-            f"({subject_id},{trial_id}) Lite mask length {mask.shape[0]} != valid-electrode "
-            f"count {valid_idx.shape[0]} (padded axis {int(em.shape[0])}): voltage-order "
-            f"desync. Refusing to silently mis-route electrodes."
+            f"({subject_id},{trial_id}) Lite mask length {n_voltage} exceeds padded electrode "
+            f"axis {axis}: voltage-order desync. Refusing to silently mis-route electrodes."
         )
-    full = np.zeros(int(em.shape[0]), dtype=bool)                  # place lite selection at the
-    full[valid_idx] = mask                                         # valid (voltage-order) positions
+    if bool(em[n_voltage:].any()):
+        raise ValueError(
+            f"({subject_id},{trial_id}) valid electrode beyond the voltage block "
+            f"[:{n_voltage}] of padded axis {axis}: contiguous-front desync. Refusing to "
+            f"silently mis-route electrodes."
+        )
+    full = np.zeros(axis, dtype=bool)                             # lay lite over the contiguous-
+    full[:n_voltage] = mask                                       # front voltage block (em rides along)
     m = torch.from_numpy(full)
     return [b[:, m] for b in bands], ppe[m], em[m]
 
