@@ -460,6 +460,13 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     from speech_decoding.experiments.pretrain_probe_sweep import TAPS
     from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
 
+    # Train the attentive heads on the GPU when one is present (the score job runs on a
+    # GH200): minibatches move to device while the large keep-S grids stay in host RAM, so
+    # the ~2000-step heads finish fast without inflating GPU memory. Ridge stays on CPU.
+    if device is None:
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     caches = _load_tap_caches(cache_dir)
     # Read d_model off ONE session (loads + LRU-caches it) — never materialize all caches.
     d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
