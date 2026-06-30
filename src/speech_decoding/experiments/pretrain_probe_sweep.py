@@ -146,21 +146,33 @@ def fixed_hp_eval(
     *,
     taps: tuple[str, ...] = TAPS,
     lam_grid: tuple[float, ...] = DEFAULT_LAM_GRID,
+    readouts: tuple[str, ...] = ("ridge", "attentive"),
     device: torch.device | None = None,
 ) -> list[CellScore]:
     """Eval every (cell, tap) at the FIXED swept HP — linear ridge + attentive test AUROC.
-    Run per checkpoint; no per-checkpoint sweep."""
+    Run per checkpoint; no per-checkpoint sweep.
+
+    ``readouts`` selects which heads to actually fit: a ridge-only shard skips the (much
+    costlier) attentive training and leaves ``attentive=nan``; an attentive-only shard
+    skips the ridge solve and leaves ``linear=nan``. The fan-out uses this to put ridge
+    shards on cheap CPU/1-GPU holes and attentive shards on the RAM-heavy 2-GPU holes."""
+    if not set(readouts) <= {"ridge", "attentive"}:
+        raise ValueError(f"readouts must be a subset of {{ridge,attentive}}, got {readouts}")
     cfg = cfg_for_hp(base_cfg, hp)
     scores: list[CellScore] = []
     for cell in cells:
         tc = caches[(cell.test_subject_id, cell.test_trial_id)]
         anchor = _anchor_for(cell, caches)
         for tap in taps:
-            lin = run_linear_cell(
-                cell, tap, test_cache=tc, anchor_cache=anchor, lam_grid=lam_grid
+            lin = (
+                run_linear_cell(cell, tap, test_cache=tc, anchor_cache=anchor,
+                                lam_grid=lam_grid)
+                if "ridge" in readouts else float("nan")
             )
-            att = run_attentive_cell(
-                cell, tap, cfg, test_cache=tc, anchor_cache=anchor, device=device
+            att = (
+                run_attentive_cell(cell, tap, cfg, test_cache=tc, anchor_cache=anchor,
+                                   device=device)
+                if "attentive" in readouts else float("nan")
             )
             scores.append(
                 CellScore(cell.label(), cell.eval_mode, cell.task, tap, lin, att)

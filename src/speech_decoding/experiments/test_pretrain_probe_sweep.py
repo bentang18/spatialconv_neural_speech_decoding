@@ -108,6 +108,35 @@ def test_fixed_hp_eval_emits_both_readouts_per_cell_tap():
         assert s.linear > 0.8 and s.attentive > 0.7  # signal recovered by both
 
 
+def test_fixed_hp_eval_ridge_only_skips_attentive_training():
+    """A ridge-only shard fits the ridge and leaves attentive=nan (no head training)."""
+    caches = {(1, 0): _cache(0, 1, 0, signal=True)}
+    cells = [ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)]
+    hp = default_hp_grid()[0]
+    scores = fixed_hp_eval(cells, caches, _base_cfg(), hp, taps=("M3",),
+                           readouts=("ridge",))
+    assert len(scores) == 1
+    assert scores[0].linear > 0.8 and np.isnan(scores[0].attentive)
+
+
+def test_fixed_hp_eval_attentive_only_skips_ridge():
+    caches = {(1, 0): _cache(0, 1, 0, signal=True)}
+    cells = [ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)]
+    hp = default_hp_grid()[0]
+    scores = fixed_hp_eval(cells, caches, _base_cfg(), hp, taps=("M3",),
+                           readouts=("attentive",))
+    assert len(scores) == 1
+    assert np.isnan(scores[0].linear) and scores[0].attentive > 0.7
+
+
+def test_fixed_hp_eval_rejects_unknown_readout():
+    caches = {(1, 0): _cache(0, 1, 0, signal=True)}
+    cells = [ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)]
+    with pytest.raises(ValueError, match="readouts must be a subset"):
+        fixed_hp_eval(caches=caches, cells=cells, base_cfg=_base_cfg(),
+                      hp=default_hp_grid()[0], taps=("M3",), readouts=("bogus",))
+
+
 def test_aggregate_scores_rolls_up_and_finds_best_cross_subject():
     scores = [
         CellScore("c1", "CrossSubject", "volume", "M4", linear=0.70, attentive=0.72),

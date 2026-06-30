@@ -321,28 +321,35 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
 def _apply_lite_montage(bands, ppe, em, *, bt_root, subject_id, trial_id):
     """Subset the electrode axis of (bands, parcel_per_electrode, electrode_mask) to the
     Neuroprobe-Lite montage — the SAME ~93–120 electrodes the real Lite leaderboard evals
-    on (parity), and the lever that takes M2's all-electrode keep-S grid from ~256 → Lite
-    width (the host-RAM ceiling that was OOM-ing the encode).
+    on (parity), and the lever that takes M2's all-electrode keep-S grid from the padded
+    width down to Lite width (the host-RAM ceiling that was OOM-ing the encode).
 
-    Uses the vendored ``lite_voltage_mask`` (a boolean mask over ``voltage_electrode_order``,
-    the canonical voltage row order the front-end and the support/valid_mask extractors all
-    key off). Applying the one mask in lockstep to bands AND ppe/em keeps ``support[c]`` ↔
-    ``electrode_tokens[c]`` aligned. Fails loud if the mask length != the electrode axis —
-    a voltage-order desync that would silently mis-route electrodes into parcels."""
+    The v14 segmenter PADS the electrode axis to a fixed width (256 here) and marks the
+    real electrodes with ``valid_mask`` (``em``): the valid positions are contiguous and
+    sit in ``voltage_electrode_order`` (verified byte-exact against ``aligned_voltage_support``
+    — support[valid] == the voltage-order DKT support). ``lite_voltage_mask`` is a boolean
+    over that voltage order, so it is ``n_valid`` long, NOT the padded axis. We expand it
+    onto the padded axis at the valid positions, then subset bands AND ppe/em in lockstep so
+    ``support[c]`` ↔ ``electrode_tokens[c]`` stays aligned. Fails loud if the mask length !=
+    the valid-electrode count — a voltage-order desync that would silently mis-route
+    electrodes into parcels."""
     import torch
 
     from speech_decoding.studies.braintreebank.anatomy import lite_voltage_mask
 
     if bt_root is None:
         raise ValueError("electrode_set='lite' needs ROOT_DIR_BRAINTREEBANK (lite montage)")
-    mask = lite_voltage_mask(bt_root, subject_id, trial_id)        # (C,) bool over voltage order
-    c_axis = int(ppe.shape[0])
-    if mask.shape[0] != c_axis:
+    mask = lite_voltage_mask(bt_root, subject_id, trial_id)        # (n_valid,) bool, voltage order
+    valid_idx = np.where(em.numpy())[0]                            # real electrodes in padded axis
+    if mask.shape[0] != valid_idx.shape[0]:
         raise ValueError(
-            f"({subject_id},{trial_id}) Lite mask length {mask.shape[0]} != electrode axis "
-            f"{c_axis}: voltage-order desync. Refusing to silently mis-route electrodes."
+            f"({subject_id},{trial_id}) Lite mask length {mask.shape[0]} != valid-electrode "
+            f"count {valid_idx.shape[0]} (padded axis {int(em.shape[0])}): voltage-order "
+            f"desync. Refusing to silently mis-route electrodes."
         )
-    m = torch.from_numpy(mask)
+    full = np.zeros(int(em.shape[0]), dtype=bool)                  # place lite selection at the
+    full[valid_idx] = mask                                         # valid (voltage-order) positions
+    m = torch.from_numpy(full)
     return [b[:, m] for b in bands], ppe[m], em[m]
 
 
@@ -443,6 +450,49 @@ def _load_tap_caches(cache_dir, *, maxsize=2):
     return LazyCacheMap(paths, maxsize=maxsize)
 
 
+def _hp_note(hp) -> str:
+    return f"wd={hp.weight_decay},pd={hp.parcel_dropout},dr={hp.dropout}"
+
+
+def _percell_rows(scores, *, ckpt_tag, stamp, hp_note):
+    """CellScore list → per-cell ResultRows (ridge + attentive, finite only). The single
+    schema both the monolithic --score and the fan-out shards write, so shard CSVs merge
+    back cleanly."""
+    from speech_decoding.experiments.pretrain_probe_csv import ResultRow
+
+    rows = []
+    for s in scores:
+        for readout, auc in (("ridge", s.linear), ("attentive", s.attentive)):
+            if not np.isfinite(auc):
+                continue
+            rows.append(ResultRow(
+                stamp=stamp, ckpt=ckpt_tag, readout=readout, tap=s.tap,
+                eval_mode=s.eval_mode, task=s.task, split="test",
+                auroc=round(float(auc), 4), n=0,
+                lam="" if readout == "attentive" else "val",
+                notes=f"{s.label};{hp_note}" if readout == "attentive" else s.label,
+            ))
+    return rows
+
+
+def _mean_rows(mean_by_mode_tap, n_cells, *, ckpt_tag, stamp, note):
+    """Per (mode, tap, readout) MEAN aggregate rows. aggregate_scores labels the linear
+    readout 'linear'; the ledger schema uses 'ridge' — normalize here."""
+    from speech_decoding.experiments.pretrain_probe_csv import ResultRow
+
+    rows = []
+    for (mode, tap, readout), m in sorted(mean_by_mode_tap.items()):
+        if not np.isfinite(m):
+            continue
+        rows.append(ResultRow(
+            stamp=stamp, ckpt=ckpt_tag,
+            readout="ridge" if readout == "linear" else readout,
+            tap=tap, eval_mode=mode, task="MEAN", split="test",
+            auroc=round(float(m), 4), n=n_cells, lam="", notes=note,
+        ))
+    return rows
+
+
 def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=None,
               modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
               device=None):
@@ -483,32 +533,16 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     )
     stamp = _stamp()
     hp = sel.sweep.best_hp
-    hp_note = f"wd={hp.weight_decay},pd={hp.parcel_dropout},dr={hp.dropout}"
+    hp_note = _hp_note(hp)
     summary = sel.summary_by_ckpt[ckpt_tag]
 
-    rows: list[ResultRow] = []
-    for s in sel.scores_by_ckpt[ckpt_tag]:
-        for readout, auc in (("ridge", s.linear), ("attentive", s.attentive)):
-            if not np.isfinite(auc):
-                continue
-            rows.append(ResultRow(
-                stamp=stamp, ckpt=ckpt_tag, readout=readout, tap=s.tap,
-                eval_mode=s.eval_mode, task=s.task, split="test",
-                auroc=round(float(auc), 4), n=0,
-                lam="" if readout == "attentive" else "val",
-                notes=f"{s.label};{hp_note}" if readout == "attentive" else s.label,
-            ))
-    # Aggregate MEAN rows (the selection signal): per (mode, tap, readout). aggregate_scores
-    # labels the linear readout 'linear'; the ledger schema uses 'ridge' — normalize.
-    for (mode, tap, readout), m in sorted(summary.mean_by_mode_tap.items()):
-        if not np.isfinite(m):
-            continue
-        rows.append(ResultRow(
-            stamp=stamp, ckpt=ckpt_tag, readout="ridge" if readout == "linear" else readout,
-            tap=tap, eval_mode=mode, task="MEAN", split="test",
-            auroc=round(float(m), 4), n=summary.n_cells,
-            lam="", notes=f"agg;{hp_note}",
-        ))
+    rows: list[ResultRow] = _percell_rows(
+        sel.scores_by_ckpt[ckpt_tag], ckpt_tag=ckpt_tag, stamp=stamp, hp_note=hp_note,
+    )
+    rows += _mean_rows(
+        summary.mean_by_mode_tap, summary.n_cells,
+        ckpt_tag=ckpt_tag, stamp=stamp, note=f"agg;{hp_note}",
+    )
     append_results(rows, out_path)
 
     best_tap, best_readout, best_m = summary.best_cross_subject

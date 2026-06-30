@@ -109,6 +109,41 @@ def test_apply_lite_montage_subsets_electrode_axis(monkeypatch):
     assert torch.equal(b2[0], bands[0][:, torch.from_numpy(mask)])
 
 
+def test_apply_lite_montage_expands_over_padded_valid_positions(monkeypatch):
+    """The v14 segmenter pads the electrode axis (256) and marks the real electrodes via
+    valid_mask; ``lite_voltage_mask`` is ``n_valid`` long (voltage order), so it must be
+    placed at the VALID positions of the padded axis — never indexed against the raw axis."""
+    import speech_decoding.studies.braintreebank.anatomy as anat
+
+    Cfull = 5
+    em = torch.tensor([True, True, True, False, False])         # 3 real electrodes, 2 padding
+    lite = np.array([True, False, True])                        # keep voltage electrodes 0,2
+    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: lite)
+    bands = [torch.randn(4, Cfull, 2, 3)]
+    ppe = torch.arange(Cfull)
+    b2, ppe2, em2 = _runner()._apply_lite_montage(
+        bands, ppe, em, bt_root="x", subject_id=1, trial_id=0
+    )
+    assert [b.shape[1] for b in b2] == [2]                      # lite ∩ valid = {0,2}
+    assert torch.equal(ppe2, torch.tensor([0, 2]))
+    assert torch.equal(em2, torch.tensor([True, True]))         # padding never selected
+    assert torch.equal(b2[0], bands[0][:, torch.tensor([0, 2])])
+
+
+def test_apply_lite_montage_fails_loud_on_valid_count_desync(monkeypatch):
+    """A lite mask whose length != the valid-electrode count is a voltage-order desync —
+    raise, never expand a mis-sized selection onto the padded axis."""
+    import speech_decoding.studies.braintreebank.anatomy as anat
+
+    monkeypatch.setattr(anat, "lite_voltage_mask", lambda root, s, t: np.ones(99, bool))
+    em = torch.tensor([True, True, True, False, False])         # 3 valid, mask says 99
+    with pytest.raises(ValueError, match="desync"):
+        _runner()._apply_lite_montage(
+            [torch.randn(4, 5, 2, 3)], torch.arange(5), em,
+            bt_root="x", subject_id=1, trial_id=0,
+        )
+
+
 def test_apply_lite_montage_fails_loud_on_axis_desync(monkeypatch):
     """A mask whose length != the electrode axis is a voltage-order desync — raise, never
     silently mis-route electrodes into parcels."""
