@@ -175,5 +175,78 @@ def test_run_score_writes_cross_subject_mean_rows(tmp_path):
     assert all(0.0 <= float(r["auroc"]) <= 1.0 for r in mean_cs)
 
 
+def test_parse_pairs_and_csv():
+    r = _runner()
+    assert r._parse_pairs("1,0 3,2;4,2") == ((1, 0), (3, 2), (4, 2))
+    assert r._parse_csv("M3, M4 ") == ("M3", "M4")
+    assert r._parse_csv("") is None and r._parse_csv(None) is None
+
+
+def test_hp_from_spec_string_and_file(tmp_path):
+    r = _runner()
+    hp = r._hp_from_spec("3.0,0.2,0.5")
+    assert (hp.weight_decay, hp.parcel_dropout, hp.dropout) == (3.0, 0.2, 0.5)
+    f = tmp_path / "hp.json"
+    f.write_text('{"weight_decay": 1.0, "parcel_dropout": 0.0, "dropout": 0.1}')
+    hp2 = r._hp_from_spec(file=str(f))
+    assert (hp2.weight_decay, hp2.parcel_dropout, hp2.dropout) == (1.0, 0.0, 0.1)
+
+
+def _cfg():
+    return HeadTrainConfig(d_model=D, n_heads=6, lr=3e-3, batch_size=64, max_steps=60,
+                           eval_every=20, patience=4, swad_warmup=20, seed=0)
+
+
+def test_run_score_shard_writes_percell_only_ridge(tmp_path):
+    """A ridge-only shard writes per-cell rows (NO MEAN aggregate), and fits ridge only."""
+    _write_caches(tmp_path)
+    out = tmp_path / "shard.csv"
+    _runner().run_score_shard(
+        str(tmp_path), ckpt_tag="60k", anchor=DEFAULT_CS_TRAIN_ANCHOR, out_path=str(out),
+        hp=HPCombo(0.1, 0.0, 0.1), readouts=("ridge",), base_cfg=_cfg(),
+        modes=("CrossSubject",), tasks=("onset",), taps=("M3",),
+    )
+    rows = read_results(str(out))
+    assert rows and all(r["task"] != "MEAN" for r in rows)     # shard = per-cell only
+    assert {r["readout"] for r in rows} == {"ridge"}           # attentive skipped
+
+
+def test_run_merge_recomputes_global_means(tmp_path):
+    """Merge concatenates shard per-cell rows and recomputes the per-(mode,tap,readout)
+    MEAN as the plain mean of the cells — across shards."""
+    from speech_decoding.experiments.pretrain_probe_csv import ResultRow, append_results
+
+    def cell(tap, auc, task):
+        return ResultRow(stamp="s", ckpt="60k", readout="ridge", tap=tap,
+                         eval_mode="CrossSubject", task=task, split="test",
+                         auroc=auc, n=10, lam="val", notes="x")
+    append_results([cell("M3", 0.60, "onset"), cell("M3", 0.70, "volume")],
+                   str(tmp_path / "a.csv"))
+    append_results([cell("M4", 0.80, "onset")], str(tmp_path / "b.csv"))
+    out = tmp_path / "merged.csv"
+    _runner().run_merge([str(tmp_path / "a.csv"), str(tmp_path / "b.csv")], str(out))
+    rows = read_results(str(out))
+    means = {(r["tap"], r["readout"]): float(r["auroc"])
+             for r in rows if r["task"] == "MEAN"}
+    assert means[("M3", "ridge")] == pytest.approx(0.65)       # mean(0.60, 0.70)
+    assert means[("M4", "ridge")] == pytest.approx(0.80)
+    # per-cell rows survive the merge (3 cells in, 3 cells out + 2 MEANs)
+    assert sum(1 for r in rows if r["task"] != "MEAN") == 3
+
+
+def test_run_sweep_hp_writes_json(tmp_path):
+    _write_caches(tmp_path)
+    out = tmp_path / "best_hp.json"
+    payload = _runner().run_sweep_hp(
+        str(tmp_path), anchor=DEFAULT_CS_TRAIN_ANCHOR, out_path=str(out),
+        base_cfg=_cfg(), hp_grid=[HPCombo(0.1, 0.0, 0.1)],
+        modes=("CrossSubject",), tasks=("onset",), taps=("M3",),
+    )
+    assert set(payload) >= {"weight_decay", "parcel_dropout", "dropout"}
+    import json
+    saved = json.loads(out.read_text())
+    assert saved["weight_decay"] == 0.1 and saved["dropout"] == 0.1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

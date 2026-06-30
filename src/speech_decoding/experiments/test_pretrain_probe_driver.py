@@ -111,6 +111,17 @@ def test_save_load_roundtrip(tmp_path):
     assert loaded.subject_id == 1 and loaded.n_parcels == P
 
 
+def test_save_cache_is_atomic_no_tmp_left(tmp_path):
+    """Atomic write: the final path exists, the .tmp sibling is gone (so the encode's
+    resume-skip can trust any present taps_*.pt as complete)."""
+    import os
+
+    path = str(tmp_path / "cache.pt")
+    save_cache(_make_cache(0, 1, 0), path)
+    assert os.path.exists(path)
+    assert not os.path.exists(path + ".tmp")
+
+
 def _write_caches(tmp_path, keys):
     paths = {}
     for i, (s, t) in enumerate(keys):

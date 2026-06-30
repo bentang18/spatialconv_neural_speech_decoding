@@ -80,7 +80,14 @@ class SessionTapCache:
 
 
 def save_cache(cache: SessionTapCache, path: str) -> None:
-    torch.save(cache, path)
+    """Atomic write: torch.save to a sibling .tmp, then os.replace. A wall-kill mid-save
+    leaves only the .tmp, never a truncated cache — so the encode's resume-skip (existence
+    means complete) can trust any present taps_*.pt."""
+    import os
+
+    tmp = f"{path}.tmp"
+    torch.save(cache, tmp)
+    os.replace(tmp, path)
 
 
 def load_cache(path: str) -> SessionTapCache:

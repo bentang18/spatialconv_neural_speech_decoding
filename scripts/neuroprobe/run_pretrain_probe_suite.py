@@ -234,6 +234,37 @@ def _stamp() -> str:
     return _dt.datetime.now().isoformat(timespec="seconds")
 
 
+def _parse_pairs(spec):
+    """'1,0 3,2' or '1,0;3,2' -> ((1,0),(3,2)) — session subset for per-session shards."""
+    out = []
+    for tok in spec.replace(";", " ").split():
+        a, b = tok.split(",")
+        out.append((int(a), int(b)))
+    return tuple(out)
+
+
+def _parse_csv(spec):
+    """'M3,M4' -> ('M3','M4'); None/'' -> None (caller's default)."""
+    if not spec:
+        return None
+    return tuple(x.strip() for x in spec.split(",") if x.strip())
+
+
+def _hp_from_spec(spec=None, file=None):
+    """Build an HPCombo from a 'wd,pd,dr' string or a --sweep-hp JSON file (one or the other)."""
+    from speech_decoding.experiments.pretrain_probe_sweep import HPCombo
+
+    if file:
+        import json
+
+        with open(file) as f:
+            d = json.load(f)
+        return HPCombo(float(d["weight_decay"]), float(d["parcel_dropout"]),
+                       float(d["dropout"]))
+    wd, pd_, dr = (float(x) for x in spec.split(","))
+    return HPCombo(wd, pd_, dr)
+
+
 def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
     """Phase 0: raw-371 linear-ridge floor, all tasks, WS + CS, → ledger CSV."""
     from speech_decoding.experiments.pretrain_probe_csv import ResultRow, append_results
@@ -401,6 +432,12 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
 
     for session in sessions:
         subject_id, trial_id = session
+        path = os.path.join(out_dir, f"taps_s{subject_id}_t{trial_id}.pt")
+        # Resume-skip: save_cache is atomic, so a present cache is a COMPLETE cache. Lets a
+        # wall-killed encode (or a per-session shard fan-out) re-run without re-forwarding.
+        if os.path.exists(path):
+            print(f"[encode] {session}: cache exists, skip -> {path}", flush=True)
+            continue
         row = ieeg[session]
         events = _label_events(subject_id, trial_id, str(row["timeline"]), tasks, bt_root)
         targets = build_session_targets(events, subject_id=subject_id, trial_id=trial_id)
@@ -419,7 +456,6 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
             parcel_labels=labels,
         )
         cache = cache_from_targets(targets, grids, meta)
-        path = os.path.join(out_dir, f"taps_s{subject_id}_t{trial_id}.pt")
         save_cache(cache, path)
         shp = {k: tuple(v.shape) for k, v in grids.items()}
         print(f"[encode] {session}: {shp} -> {path}", flush=True)
@@ -558,6 +594,132 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     return rows
 
 
+def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None,
+                 modes=("CrossSubject",), tasks=None, taps=None, sweep_cap=None,
+                 device=None):
+    """Fan-out Stage 2, step 1 (sweep ONCE): pick the attentive HP on a representative cell
+    subset (CrossSubject by default — the selection signal) and write the winning
+    {weight_decay, parcel_dropout, dropout} to a JSON. Every score shard then reads it via
+    ``--hp-file`` and skips the (expensive) re-sweep, so the sweep cost is paid once."""
+    import json
+
+    from speech_decoding.experiments.pretrain_probe_collect import firewall_self_test
+    from speech_decoding.experiments.pretrain_probe_suite import (
+        NEUROPROBE_TASKS,
+        enumerate_cells,
+    )
+    from speech_decoding.experiments.pretrain_probe_sweep import (
+        TAPS,
+        default_hp_grid,
+        sweep_hp,
+    )
+    from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    caches = _load_tap_caches(cache_dir)
+    d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
+    cohort = tuple(sorted(caches.keys()))
+    cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
+                            cs_train_anchor=anchor, cohort=cohort)
+    firewall_self_test(cells)
+    if sweep_cap is not None and sweep_cap < len(cells):
+        cells = cells[:sweep_cap]                  # deterministic representative cap on cost
+    grid = hp_grid if hp_grid is not None else default_hp_grid()
+    res = sweep_hp(cells, caches, cfg, grid, taps=tuple(taps) if taps else TAPS, device=device)
+    hp = res.best_hp
+    payload = {"weight_decay": hp.weight_decay, "parcel_dropout": hp.parcel_dropout,
+               "dropout": hp.dropout, "n_cells_scored": res.n_cells_scored}
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"[sweep] best_hp wd={hp.weight_decay} pd={hp.parcel_dropout} dr={hp.dropout} "
+          f"over {res.n_cells_scored} cells -> {out_path}", flush=True)
+    return payload
+
+
+def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp,
+                    readouts=("ridge", "attentive"), base_cfg=None,
+                    modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
+                    device=None):
+    """Fan-out Stage 2, step 2 (a SHARD): eval this shard's cells (modes×tasks×taps subset)
+    at the FIXED ``hp`` → per-cell CSV rows only. No sweep (HP is given), no global MEAN
+    (``run_merge`` recomputes that across shards). ``readouts`` puts ridge-only shards on
+    cheap 1-GPU/CPU holes and the RAM-heavy attentive shards on 2-GPU holes."""
+    from speech_decoding.experiments.pretrain_probe_collect import firewall_self_test
+    from speech_decoding.experiments.pretrain_probe_csv import append_results
+    from speech_decoding.experiments.pretrain_probe_suite import (
+        NEUROPROBE_TASKS,
+        enumerate_cells,
+    )
+    from speech_decoding.experiments.pretrain_probe_sweep import TAPS, fixed_hp_eval
+    from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    caches = _load_tap_caches(cache_dir)
+    d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
+    cohort = tuple(sorted(caches.keys()))
+    cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
+                            cs_train_anchor=anchor, cohort=cohort)
+    firewall_self_test(cells)
+    scores = fixed_hp_eval(cells, caches, cfg, hp, taps=tuple(taps) if taps else TAPS,
+                           readouts=tuple(readouts), device=device)
+    rows = _percell_rows(scores, ckpt_tag=ckpt_tag, stamp=_stamp(), hp_note=_hp_note(hp))
+    append_results(rows, out_path)
+    print(f"[shard] ckpt={ckpt_tag} cells={len(cells)} taps={taps or 'all'} "
+          f"readouts={readouts} -> {len(rows)} per-cell rows -> {out_path}", flush=True)
+    return rows
+
+
+def run_merge(shard_csvs, out_path):
+    """Fan-out Stage 2, step 3 (merge): concat the shards' per-cell rows and recompute the
+    global per-(mode,tap,readout) MEAN aggregate → final ledger (per-cell + MEAN). Shards
+    are assumed disjoint (the fan-out partitions by tap/mode/readout); overlapping cells
+    would double-count, so each cell must be scored by exactly one shard."""
+    from speech_decoding.experiments.pretrain_probe_collect import RIDGE_FLOOR_DELTA_VOLUME
+    from speech_decoding.experiments.pretrain_probe_csv import (
+        ResultRow,
+        append_results,
+        read_results,
+    )
+
+    percell = [r for p in shard_csvs for r in read_results(p) if r["task"] != "MEAN"]
+    if not percell:
+        raise ValueError(f"no per-cell rows across {len(shard_csvs)} shard CSVs")
+    groups: dict[tuple[str, str, str], list[float]] = {}
+    for r in percell:
+        groups.setdefault((r["eval_mode"], r["tap"], r["readout"]), []).append(
+            float(r["auroc"])
+        )
+    rows = [ResultRow(
+        stamp=r["stamp"], ckpt=r["ckpt"], readout=r["readout"], tap=r["tap"],
+        eval_mode=r["eval_mode"], task=r["task"], split=r["split"],
+        auroc=float(r["auroc"]), n=int(r["n"]) if r["n"] else 0,
+        lam=r["lam"], notes=r["notes"],
+    ) for r in percell]
+    stamp = _stamp()
+    ckpt = percell[0]["ckpt"]
+    for (mode, tap, readout), vals in sorted(groups.items()):
+        rows.append(ResultRow(
+            stamp=stamp, ckpt=ckpt, readout=readout, tap=tap, eval_mode=mode,
+            task="MEAN", split="test", auroc=round(float(np.mean(vals)), 4),
+            n=len(vals), lam="", notes="merged",
+        ))
+    append_results(rows, out_path)
+    cs = {(tap, ro): float(np.mean(v)) for (m, tap, ro), v in groups.items()
+          if m == "CrossSubject"}
+    print(f"[merge] {len(percell)} per-cell rows from {len(shard_csvs)} shards -> {out_path}",
+          flush=True)
+    if cs:
+        (bt, bro), bm = max(cs.items(), key=lambda kv: kv[1])
+        print(f"[merge] best CrossSubject = {bt}/{bro} {bm:.4f} (floor "
+              f"{RIDGE_FLOOR_DELTA_VOLUME:.3f}, delta {bm - RIDGE_FLOOR_DELTA_VOLUME:+.4f})",
+              flush=True)
+    return rows
+
+
 def _print_summary(rows) -> None:
     by = {}
     for r in rows:
@@ -589,8 +751,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--electrode-set", choices=("lite", "all"), default="lite",
                    help="--encode montage: 'lite' (Neuroprobe-Lite ~120, leaderboard parity, "
                         "default) or 'all' electrodes")
+    p.add_argument("--sessions", default=None,
+                   help="--encode: session subset 'S,T S,T' for per-session shards "
+                        "(default the full cohort)")
     p.add_argument("--score", action="store_true",
-                   help="Stage 2 (CPU): load --cache-dir tap caches → sweep + eval → CSV")
+                   help="Stage 2 (CPU/GPU): load --cache-dir tap caches → sweep + eval → CSV. "
+                        "With --hp/--hp-file becomes a fixed-HP SHARD (no sweep).")
+    p.add_argument("--sweep-hp", action="store_true",
+                   help="Stage 2 sweep-once: pick the attentive HP on representative cells "
+                        "→ write JSON to --out (read by shards via --hp-file)")
+    p.add_argument("--merge", nargs="+", default=None, metavar="SHARD_CSV",
+                   help="merge fan-out shard CSVs → recompute global MEANs → --out ledger")
+    p.add_argument("--taps", default=None, help="--score/--sweep-hp: comma subset of M2,M3,M4")
+    p.add_argument("--tasks", default=None, help="--score/--sweep-hp: comma subset of the 15 tasks")
+    p.add_argument("--modes", default=None,
+                   help="--score/--sweep-hp: comma subset of WithinSession,CrossSubject")
+    p.add_argument("--readout", choices=("ridge", "attentive", "both"), default="both",
+                   help="--score shard: which readout(s) to fit (ridge-only skips attentive)")
+    p.add_argument("--hp", default=None,
+                   help="--score shard: fixed attentive HP 'wd,pd,dr' (skips the sweep)")
+    p.add_argument("--hp-file", default=None,
+                   help="--score shard: read the fixed HP from a --sweep-hp JSON")
+    p.add_argument("--sweep-cap", type=int, default=None,
+                   help="--sweep-hp: cap representative cells (deterministic) to bound cost")
     p.add_argument("--ckpt-tag", default="ladder-60000",
                    help="checkpoint label for the --score ledger rows")
     p.add_argument("--out", default="reports/neuroprobe_probe_results.csv")
@@ -634,16 +817,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.encode:
         if not args.ckpt or not args.cache_dir:
             p.error("--encode requires --ckpt and --cache-dir")
-        run_encode(tuple(PROBE_COHORT_7), tuple(NEUROPROBE_TASKS),
+        sessions = _parse_pairs(args.sessions) if args.sessions else tuple(PROBE_COHORT_7)
+        run_encode(sessions, tuple(NEUROPROBE_TASKS),
                    ckpt_path=args.ckpt, out_dir=args.cache_dir,
                    cache_untagged_m3=not args.no_untagged_m3,
                    electrode_set=args.electrode_set)
         return 0
 
+    if args.merge:
+        run_merge(args.merge, args.out)
+        return 0
+
+    if args.sweep_hp:
+        if not args.cache_dir:
+            p.error("--sweep-hp requires --cache-dir (the --encode tap caches)")
+        modes = _parse_csv(args.modes) or ("CrossSubject",)
+        run_sweep_hp(args.cache_dir, anchor=anchor, out_path=args.out,
+                     modes=modes, tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
+                     sweep_cap=args.sweep_cap)
+        return 0
+
     if args.score:
         if not args.cache_dir:
             p.error("--score requires --cache-dir (the --encode tap caches)")
-        run_score(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor, out_path=args.out)
+        modes = _parse_csv(args.modes) or ("WithinSession", "CrossSubject")
+        if args.hp or args.hp_file:        # fixed-HP SHARD: no sweep, per-cell rows only
+            hp = _hp_from_spec(args.hp, args.hp_file)
+            readouts = ("ridge", "attentive") if args.readout == "both" else (args.readout,)
+            run_score_shard(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
+                            out_path=args.out, hp=hp, readouts=readouts, modes=modes,
+                            tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps))
+        else:                              # monolithic: sweep-once + eval + aggregate
+            run_score(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
+                      out_path=args.out, modes=modes, tasks=_parse_csv(args.tasks),
+                      taps=_parse_csv(args.taps))
         return 0
 
     p.print_help()
