@@ -100,8 +100,16 @@ def _ieeg_index(xp) -> dict[tuple[int, int], pd.Series]:
     return out
 
 
-def _label_events(subject_id: int, trial_id: int, timeline: str, tasks, bt_root) -> pd.DataFrame:
-    """Balanced, all-task word-event rows for ONE pretrain session (full electrodes)."""
+def _label_events(subject_id: int, trial_id: int, timeline: str, tasks, bt_root,
+                  *, lite_cap: bool = True) -> pd.DataFrame:
+    """Balanced, all-task word-event rows for ONE pretrain session (full electrodes).
+
+    ``lite_cap`` (default True) matches the Neuroprobe-Lite leaderboard's per-task sample
+    budget: ``derive_label_indices(lite=True)`` caps each class at ``LITE_MAX_SAMPLES//n_classes``
+    (3500 total/task) via the seeded ``rng.choice`` upstream uses — the SAME subsample the real
+    Lite eval scores, so the proxy isn't optimistic from extra samples. The ``lite`` flag is
+    label-only here (it never selects lite electrodes/sessions — those stay full/pretrain).
+    Set False for the uncapped Neuroprobe-Full reference."""
     from speech_decoding.studies.braintreebank.word_events import (
         _load_neural_to_movie_map,
         _load_pitch_volume_features,
@@ -121,7 +129,7 @@ def _label_events(subject_id: int, trial_id: int, timeline: str, tasks, bt_root)
     return _word_event_rows(
         subject_id=subject_id, trial_id=trial_id, timeline=timeline,
         words_df=words_df, nonverbal_df=nonverbal_df, tasks=tuple(tasks),
-        binary_tasks=True, lite=False, nano=False, random_seed=42,
+        binary_tasks=True, lite=lite_cap, nano=False, random_seed=42,
         duration=PROBE_CLIP_DUR_S, balance=True,
         pitch_volume_features=pvf, neural_to_movie=neural_to_movie,
     )
