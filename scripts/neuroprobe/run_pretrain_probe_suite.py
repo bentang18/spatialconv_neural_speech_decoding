@@ -475,7 +475,23 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
         del bands, grids_sf, grids, cache
 
 
-def _load_tap_caches(cache_dir, *, maxsize=2):
+def _keep_grids_for(taps):
+    """Grid-prune set for the score load: exactly the requested taps (default M2/M3/M4). The
+    cache bundles M2 + M3 + M4 + M3_untagged, but a readout reads only ``grids[tap]``, so a
+    per-tap shard can drop the rest on load and stay under the RAM cap. M3_untagged is never
+    read by the score path (it's a cached future A/B surface) → always dropped here."""
+    from speech_decoding.experiments.pretrain_probe_sweep import TAPS
+
+    return set(taps) if taps else set(TAPS)
+
+
+def _d_model_of(cache):
+    """d_model = last axis, shared by every grid ((N,C,S,d) and (N,P,k,S,d)) — read it off
+    ANY kept grid so a grid-pruned (e.g. M2-dropped) cache still resolves it."""
+    return int(next(iter(cache.grids.values())).shape[-1])
+
+
+def _load_tap_caches(cache_dir, *, maxsize=2, keep_grids=None):
     """Index the per-session `--encode` tap caches → a :class:`LazyCacheMap` that loads each
     session on access and keeps at most ``maxsize`` resident.
 
@@ -496,7 +512,7 @@ def _load_tap_caches(cache_dir, *, maxsize=2):
         paths[(int(m.group(1)), int(m.group(2)))] = path
     if not paths:
         raise FileNotFoundError(f"no taps_s*_t*.pt caches under {cache_dir}")
-    return LazyCacheMap(paths, maxsize=maxsize)
+    return LazyCacheMap(paths, maxsize=maxsize, keep_grids=keep_grids)
 
 
 def _hp_note(hp) -> str:
@@ -566,9 +582,9 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
         import torch
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    caches = _load_tap_caches(cache_dir)
+    caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     # Read d_model off ONE session (loads + LRU-caches it) — never materialize all caches.
-    d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
+    d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
     caches_by_ckpt = {ckpt_tag: caches}
     # Enumerate cells over EXACTLY the cached sessions — a cell can never request a cache
@@ -630,8 +646,8 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None,
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    caches = _load_tap_caches(cache_dir)
-    d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
+    caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
+    d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
     cohort = tuple(sorted(caches.keys()))
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
@@ -670,8 +686,8 @@ def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp,
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    caches = _load_tap_caches(cache_dir)
-    d_model = int(caches[next(iter(caches.keys()))].grids["M2"].shape[-1])
+    caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
+    d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
     cohort = tuple(sorted(caches.keys()))
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,

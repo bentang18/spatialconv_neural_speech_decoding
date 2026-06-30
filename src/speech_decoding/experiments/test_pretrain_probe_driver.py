@@ -169,5 +169,25 @@ def test_lazy_cache_map_rejects_maxsize_below_two(tmp_path):
         LazyCacheMap(paths, maxsize=1)
 
 
+def test_lazy_cache_map_keep_grids_prunes_on_load(tmp_path):
+    """keep_grids drops the grids a shard's taps don't read right after load (the cache
+    bundles all taps; a CS pair would otherwise hold ~200 GB). A parcel-tap shard keeps only
+    M3/M4; the readout it feeds still recovers signal, and d_model reads off a kept grid."""
+    paths = _write_caches(tmp_path, [(2, 1), (3, 2)])
+    lazy = LazyCacheMap(paths, maxsize=2, keep_grids={"M3", "M4"})
+    cache = lazy[(3, 2)]
+    assert set(cache.grids) == {"M3", "M4"}                  # M2 pruned
+    assert int(next(iter(cache.grids.values())).shape[-1]) == D   # d_model still resolvable
+    cell = ProbeCell("CrossSubject", "onset", 3, 2, train_subject_id=2, train_trial_id=1)
+    a = run_linear_cell(cell, "M3", test_cache=lazy[(3, 2)], anchor_cache=lazy[(2, 1)])
+    assert a > 0.8                                            # kept tap still scores
+
+
+def test_lazy_cache_map_keep_grids_none_keeps_all(tmp_path):
+    paths = _write_caches(tmp_path, [(2, 1)])
+    cache = LazyCacheMap(paths, maxsize=2)[(2, 1)]
+    assert set(cache.grids) == {"M2", "M3", "M4"}            # back-compat: no pruning
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

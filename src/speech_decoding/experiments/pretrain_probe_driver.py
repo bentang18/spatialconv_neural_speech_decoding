@@ -106,11 +106,24 @@ class LazyCacheMap:
     it uses only ``cache[key]``, ``.get(key)``, ``key in cache``, iteration, and ``keys()``.
     """
 
-    def __init__(self, paths: dict[tuple[int, int], str], *, maxsize: int = 2):
+    def __init__(
+        self,
+        paths: dict[tuple[int, int], str],
+        *,
+        maxsize: int = 2,
+        keep_grids: set[str] | None = None,
+    ):
         if maxsize < 2:
             raise ValueError("maxsize must be >= 2 (a CrossSubject cell needs test+anchor)")
         self._paths = dict(paths)
         self._maxsize = maxsize
+        # Prune grids the shard's taps don't read RIGHT AFTER load (the cache file bundles all
+        # four — M2 ~55 GB + M3/M4/M3_untagged ~15 GB each — so a CrossSubject pair would hold
+        # ~200 GB resident and OOM the 227 GB slot). With keep_grids={"M3","M4"} a parcel-tap
+        # shard holds ~30 GB/cache; {"M2"} isolates the electrode-tap RAM hog onto its own job.
+        # ``None`` keeps every grid (back-compat). Peak is bounded by ONE full cache (the
+        # transient torch.load) + (maxsize-1) pruned, not maxsize full caches.
+        self._keep_grids = set(keep_grids) if keep_grids is not None else None
         self._lru: OrderedDict[tuple[int, int], SessionTapCache] = OrderedDict()
 
     def __contains__(self, key) -> bool:
@@ -132,6 +145,9 @@ class LazyCacheMap:
             self._lru.move_to_end(key)
             return self._lru[key]
         cache = load_cache(self._paths[key])
+        if self._keep_grids is not None:
+            for g in [g for g in cache.grids if g not in self._keep_grids]:
+                del cache.grids[g]
         self._lru[key] = cache
         while len(self._lru) > self._maxsize:
             self._lru.popitem(last=False)
