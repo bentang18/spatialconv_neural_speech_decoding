@@ -336,7 +336,6 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
     from speech_decoding.experiments.pretrain_probe_stage1 import (
         SessionMeta,
         cache_from_targets,
-        scatter_parcels_to_atlas,
     )
     from speech_decoding.experiments.v2_probe_bench import (
         encode_subject_tokens,
@@ -350,14 +349,14 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
     model = load_v2_converged_model(xp, ckpt_path, device=device)
     # Global DK parcel atlas — the model's own parcel-embed table: constant across every
     # session and ≥ each subject's max DKT id (the model was trained on this cohort). The
-    # parcel-space M3/M4 grids are scattered onto THIS shared axis so CS intersects align.
+    # parcel-space M3/M4 grids stay COMPACTED (~16 present parcels); CS intersection aligns
+    # via the per-session ``parcel_labels`` (DKT ids of the compacted P axis), mapped to
+    # grid positions lazily in the readouts. ``n_parcels`` is the shared atlas-id space.
     n_parcels_atlas = int(model.latent.parcel_embed.num_embeddings)
     os.makedirs(out_dir, exist_ok=True)
 
     surfaces = ["frontend", "m3", "m4"] + (["m3_untagged"] if cache_untagged_m3 else [])
     tap_of = {"frontend": "M2", "m3": "M3", "m4": "M4", "m3_untagged": "M3_untagged"}
-    # parcel-space surfaces need the compacted-P -> atlas scatter; frontend stays electrode-space
-    parcel_surfaces = {"m3", "m4", "m3_untagged"}
 
     for session in sessions:
         subject_id, trial_id = session
@@ -369,15 +368,10 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
             model, bands, ppe, clip_len_s=PROBE_CLIP_DUR_S, device=device,
             surfaces=tuple(surfaces), batch_size=batch_size,
         )
-        grids = {
-            tap_of[sf]: (
-                scatter_parcels_to_atlas(g, labels, n_parcels_atlas)
-                if sf in parcel_surfaces else g
-            )
-            for sf, g in grids_sf.items()
-        }
+        grids = {tap_of[sf]: g for sf, g in grids_sf.items()}
         meta = SessionMeta(
-            parcel_per_electrode=ppe, electrode_mask=em, n_parcels=n_parcels_atlas
+            parcel_per_electrode=ppe, electrode_mask=em, n_parcels=n_parcels_atlas,
+            parcel_labels=labels,
         )
         cache = cache_from_targets(targets, grids, meta)
         path = os.path.join(out_dir, f"taps_s{subject_id}_t{trial_id}.pt")

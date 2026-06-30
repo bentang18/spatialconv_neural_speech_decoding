@@ -58,6 +58,7 @@ def _cache(seed: int, subject_id: int, trial_id: int, *, signal: bool) -> Sessio
                "M4": torch.from_numpy(m4)},
         labels={"onset": y, "volume": y},
         parcel_per_electrode=PE, electrode_mask=EM, n_parcels=P,
+        parcel_labels=torch.arange(P),
         ws_split={"onset": ws, "volume": ws},
         cs_split={"onset": cs, "volume": cs},
     )

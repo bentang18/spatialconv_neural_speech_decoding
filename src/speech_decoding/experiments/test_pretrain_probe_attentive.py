@@ -93,7 +93,8 @@ def test_ws_parcel_recovers_signal():
     em = torch.ones(6, dtype=torch.bool)
     a = attentive_ws_cell_auroc(
         grid, y, train_rows=tr, val_rows=va, test_rows=te, tap_space="parcel",
-        parcel_per_electrode=pe, electrode_mask=em, n_parcels=N_PARCELS, cfg=_cfg(),
+        parcel_per_electrode=pe, electrode_mask=em, n_parcels=N_PARCELS,
+        parcel_labels=torch.arange(N_PARCELS), cfg=_cfg(),
     )
     assert a > 0.8
 
@@ -130,7 +131,8 @@ def test_cs_parcel_full_grid_no_intersect_recovers_signal():
     a = attentive_cs_cell_auroc(
         ga, ya, gt, yt, val_rows=va, test_rows=te, tap_space="parcel",
         pe_anchor=pe, em_anchor=em, pe_test=pe, em_test=em,
-        n_parcels=N_PARCELS, cfg=_cfg(),
+        n_parcels=N_PARCELS, parcel_labels_anchor=torch.arange(N_PARCELS),
+        parcel_labels_test=torch.arange(N_PARCELS), cfg=_cfg(),
     )
     assert a > 0.75
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import numpy as np
+import torch
 from torch import Tensor
 
 from speech_decoding.experiments.online_probe import (
@@ -42,6 +43,7 @@ from speech_decoding.experiments.v2_raw_probe import (
 __all__ = [
     "DEFAULT_LAM_GRID",
     "parcel_support",
+    "compacted_positions",
     "linear_ws_cell_auroc",
     "linear_cs_cell_auroc",
 ]
@@ -61,9 +63,33 @@ def parcel_support(
     for p, valid in zip(pe, em):
         if valid:
             present[int(p)] = True
-    import torch
-
     return torch.from_numpy(present)
+
+
+def compacted_positions(parcel_labels: Tensor, atlas_ids: Tensor) -> Tensor:
+    """Map DKT atlas ids → positions in a COMPACTED parcel grid whose axis-1 is
+    ``parcel_labels`` (the sorted unique present parcels ``encode_clip_taps`` emits).
+
+    The parcel-space M3/M4 grids are stored compacted (P ≈ 16 present parcels, not the
+    full ~80-parcel atlas) to avoid a 5× memory/disk blow-up. ``parcel_support`` /
+    ``parcel_intersection`` reason in atlas-id space (length ``n_parcels``); this bridges
+    those atlas ids to the grid's own positions via ``searchsorted`` (``parcel_labels`` is
+    sorted). Every requested id MUST be present — by construction the CS intersection and
+    WS support are subsets of ``parcel_labels`` — so a miss is a fail-loud contract bug."""
+    lab = parcel_labels.long().cpu()
+    ids = torch.as_tensor(atlas_ids, dtype=torch.long).cpu()
+    pos = torch.searchsorted(lab, ids)
+    if ids.numel() and (pos.max() >= lab.numel() or not torch.equal(lab[pos], ids)):
+        raise ValueError(
+            "atlas id absent from parcel_labels — compacted grid axis and support disagree"
+        )
+    return pos
+
+
+def _parcel_features(grid: Tensor, atlas_ids: Tensor, parcel_labels: Tensor) -> np.ndarray:
+    """Select the atlas parcels ``atlas_ids`` from a COMPACTED parcel grid and flatten."""
+    pos = compacted_positions(parcel_labels, atlas_ids)
+    return feature_matrix(grid, pos).cpu().numpy()
 
 
 def _electrode_features(grid: Tensor, electrode_mask: Tensor) -> np.ndarray:
@@ -72,15 +98,20 @@ def _electrode_features(grid: Tensor, electrode_mask: Tensor) -> np.ndarray:
 
 
 def _all_parcel_features(
-    grid: Tensor, parcel_per_electrode: Tensor, electrode_mask: Tensor, n_parcels: int
+    grid: Tensor,
+    parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    n_parcels: int,
+    parcel_labels: Tensor,
 ) -> np.ndarray:
     """WS parcel-space features ``(N, P_present·F)`` — all supported parcels, flatten.
 
-    M2 (electrode-space) pools electrode→parcel; M3/M4 (parcel-native) select the
-    supported parcels directly. Both go through ``parcel_support`` so an unsupported
-    parcel never contributes a zero column."""
+    The M3/M4 grid is COMPACTED (axis-1 = ``parcel_labels``). ``parcel_support`` gives the
+    supported atlas ids; :func:`compacted_positions` maps them to the grid's own positions
+    so an unsupported parcel never contributes a zero column."""
     present = parcel_support(parcel_per_electrode, electrode_mask, n_parcels)
-    return feature_matrix(grid, parcel_intersection(present, present)).cpu().numpy()
+    atlas_ids = parcel_intersection(present, present)
+    return _parcel_features(grid, atlas_ids, parcel_labels)
 
 
 def _select_lambda(
@@ -113,6 +144,7 @@ def linear_ws_cell_auroc(
     parcel_per_electrode: Tensor,
     electrode_mask: Tensor,
     n_parcels: int,
+    parcel_labels: Tensor | None = None,
     lam_grid: Sequence[float] = DEFAULT_LAM_GRID,
 ) -> float:
     """WithinSession cell: fit on ``train_rows``, select λ on ``val_rows``, report
@@ -120,7 +152,11 @@ def linear_ws_cell_auroc(
     if tap_space == "electrode":
         z = _electrode_features(grid, electrode_mask)
     elif tap_space == "parcel":
-        z = _all_parcel_features(grid, parcel_per_electrode, electrode_mask, n_parcels)
+        if parcel_labels is None:
+            raise ValueError("parcel tap_space needs parcel_labels (compacted grid ids)")
+        z = _all_parcel_features(
+            grid, parcel_per_electrode, electrode_mask, n_parcels, parcel_labels
+        )
     else:
         raise ValueError(f"tap_space must be 'electrode'|'parcel'; got {tap_space!r}")
 
@@ -147,6 +183,8 @@ def linear_cs_cell_auroc(
     pe_test: Tensor,
     em_test: Tensor,
     n_parcels: int,
+    parcel_labels_anchor: Tensor | None = None,
+    parcel_labels_test: Tensor | None = None,
     lam_grid: Sequence[float] = DEFAULT_LAM_GRID,
 ) -> float:
     """CrossSubject cell: fit on the anchor (train), select λ on the test session's
@@ -160,17 +198,23 @@ def linear_cs_cell_auroc(
         pooled_t, present_t = pool_electrodes_to_parcels(
             grid_test, pe_test, em_test, n_parcels
         )
+        inter = parcel_intersection(present_a, present_t)
+        if inter.numel() == 0:
+            return float("nan")
+        za_all = feature_matrix(pooled_a, inter).cpu().numpy()
+        zt_all = feature_matrix(pooled_t, inter).cpu().numpy()
     elif tap_space == "parcel":
-        pooled_a, present_a = grid_anchor, parcel_support(pe_anchor, em_anchor, n_parcels)
-        pooled_t, present_t = grid_test, parcel_support(pe_test, em_test, n_parcels)
+        if parcel_labels_anchor is None or parcel_labels_test is None:
+            raise ValueError("parcel tap_space needs anchor + test parcel_labels")
+        present_a = parcel_support(pe_anchor, em_anchor, n_parcels)
+        present_t = parcel_support(pe_test, em_test, n_parcels)
+        inter = parcel_intersection(present_a, present_t)
+        if inter.numel() == 0:
+            return float("nan")
+        za_all = _parcel_features(grid_anchor, inter, parcel_labels_anchor)
+        zt_all = _parcel_features(grid_test, inter, parcel_labels_test)
     else:
         raise ValueError(f"tap_space must be 'electrode'|'parcel'; got {tap_space!r}")
-
-    inter = parcel_intersection(present_a, present_t)
-    if inter.numel() == 0:
-        return float("nan")
-    za_all = feature_matrix(pooled_a, inter).cpu().numpy()
-    zt_all = feature_matrix(pooled_t, inter).cpu().numpy()
 
     za, ya = _finite(za_all, y_anchor)
     zv, yv = _finite(zt_all[val_rows], y_test[val_rows])

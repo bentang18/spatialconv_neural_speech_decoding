@@ -52,6 +52,7 @@ def _make_cache(seed: int, subject_id: int, trial_id: int) -> SessionTapCache:
                "M4": torch.from_numpy(m4)},
         labels={"onset": y, "speech": y},
         parcel_per_electrode=PE, electrode_mask=EM, n_parcels=P,
+        parcel_labels=torch.arange(P),
         ws_split={"onset": ws, "speech": ws},
         cs_split={"onset": cs, "speech": cs},
     )

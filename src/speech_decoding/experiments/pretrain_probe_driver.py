@@ -52,7 +52,10 @@ class SessionTapCache:
     """One cohort session's forwarded tap grids + labels + splits + electrode metadata.
 
     ``grids["M2"]`` is ``(N, C, S, d)`` (electrode-space); ``grids["M3"]``/``["M4"]`` are
-    ``(N, P, k, S, d)`` (parcel-space). ``labels[task]`` is ``(N,)`` in {0,1,NaN} over the
+    ``(N, P, k, S, d)`` (parcel-space, COMPACTED — P = the ~16 parcels actually present, NOT
+    the full atlas). ``parcel_labels`` are those P parcels' DKT atlas ids; the parcel-space
+    readouts map compacted↔atlas off them (a ``searchsorted``, no dense atlas grid). ``None``
+    when no parcel-space tap is cached. ``labels[task]`` is ``(N,)`` in {0,1,NaN} over the
     session's union clip axis (NaN where the clip is outside the task's balanced set).
 
     Splits are PER TASK — the leaderboard cut runs over each task's interleaved item order
@@ -71,6 +74,7 @@ class SessionTapCache:
     n_parcels: int
     ws_split: dict[str, dict[int, dict[str, object]]]    # task -> fold -> {train,val,test}
     cs_split: dict[str, dict[str, object]]               # task -> {val,test}
+    parcel_labels: Tensor | None = None                  # (P,) DKT ids of compacted parcel grids
 
 
 def save_cache(cache: SessionTapCache, path: str) -> None:
@@ -100,7 +104,8 @@ def run_linear_cell(
             tap_space=space,
             parcel_per_electrode=test_cache.parcel_per_electrode,
             electrode_mask=test_cache.electrode_mask,
-            n_parcels=test_cache.n_parcels, lam_grid=lam_grid,
+            n_parcels=test_cache.n_parcels, parcel_labels=test_cache.parcel_labels,
+            lam_grid=lam_grid,
         )
     if cell.eval_mode == "CrossSubject":
         if anchor_cache is None:
@@ -112,7 +117,9 @@ def run_linear_cell(
             val_rows=sp["val"], test_rows=sp["test"], tap_space=space,
             pe_anchor=anchor_cache.parcel_per_electrode, em_anchor=anchor_cache.electrode_mask,
             pe_test=test_cache.parcel_per_electrode, em_test=test_cache.electrode_mask,
-            n_parcels=test_cache.n_parcels, lam_grid=lam_grid,
+            n_parcels=test_cache.n_parcels,
+            parcel_labels_anchor=anchor_cache.parcel_labels,
+            parcel_labels_test=test_cache.parcel_labels, lam_grid=lam_grid,
         )
     raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
 
@@ -137,7 +144,8 @@ def run_attentive_cell_result(
             tap_space=space,
             parcel_per_electrode=test_cache.parcel_per_electrode,
             electrode_mask=test_cache.electrode_mask,
-            n_parcels=test_cache.n_parcels, cfg=cfg, device=device,
+            n_parcels=test_cache.n_parcels, parcel_labels=test_cache.parcel_labels,
+            cfg=cfg, device=device,
         )
     if cell.eval_mode == "CrossSubject":
         if anchor_cache is None:
@@ -149,7 +157,9 @@ def run_attentive_cell_result(
             val_rows=sp["val"], test_rows=sp["test"], tap_space=space,
             pe_anchor=anchor_cache.parcel_per_electrode, em_anchor=anchor_cache.electrode_mask,
             pe_test=test_cache.parcel_per_electrode, em_test=test_cache.electrode_mask,
-            n_parcels=test_cache.n_parcels, cfg=cfg, device=device,
+            n_parcels=test_cache.n_parcels,
+            parcel_labels_anchor=anchor_cache.parcel_labels,
+            parcel_labels_test=test_cache.parcel_labels, cfg=cfg, device=device,
         )
     raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
 

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from speech_decoding.experiments.pretrain_probe_readout import (
+    compacted_positions,
     linear_cs_cell_auroc,
     linear_ws_cell_auroc,
     parcel_support,
@@ -69,6 +70,7 @@ def test_ws_parcel_recovers_signal():
     a = linear_ws_cell_auroc(
         grid, y, train_rows=tr, val_rows=va, test_rows=te, tap_space="parcel",
         parcel_per_electrode=pe, electrode_mask=em, n_parcels=N_PARCELS,
+        parcel_labels=torch.arange(N_PARCELS),
     )
     assert a > 0.9
 
@@ -116,6 +118,8 @@ def test_cs_parcel_supported_intersection_recovers_signal():
     a = linear_cs_cell_auroc(
         ga, ya, gt, yt, val_rows=va, test_rows=te, tap_space="parcel",
         pe_anchor=pe, em_anchor=em, pe_test=pe, em_test=em, n_parcels=N_PARCELS,
+        parcel_labels_anchor=torch.arange(N_PARCELS),
+        parcel_labels_test=torch.arange(N_PARCELS),
     )
     assert a > 0.85
 
@@ -133,8 +137,42 @@ def test_cs_empty_intersection_returns_nan():
     a = linear_cs_cell_auroc(
         ga, ya, gt, yt, val_rows=va, test_rows=te, tap_space="parcel",
         pe_anchor=pe_a, em_anchor=em, pe_test=pe_t, em_test=em, n_parcels=N_PARCELS,
+        parcel_labels_anchor=torch.arange(N_PARCELS),
+        parcel_labels_test=torch.arange(N_PARCELS),
     )
     assert np.isnan(a)
+
+
+def test_compacted_positions_maps_atlas_to_grid_axis():
+    """``searchsorted`` over the sorted compacted ids; absent id is fail-loud."""
+    lab = torch.tensor([0, 2, 5, 7])               # compacted parcel grid axis
+    pos = compacted_positions(lab, torch.tensor([2, 7]))
+    assert pos.tolist() == [1, 3]
+    with pytest.raises(ValueError, match="absent"):
+        compacted_positions(lab, torch.tensor([3]))  # 3 not in the compacted set
+
+
+def test_cs_parcel_compacted_grids_align_by_dkt_id():
+    """The CS lazy-map the refactor relies on: two subjects with DIFFERENT compacted
+    parcel sets share DKT parcel 2; its block must align even though it sits at a
+    different compacted position in each grid (here both pos 1, but selected by id)."""
+    rng = np.random.default_rng(7)
+    n_parcels = 5
+    na, nt = 60, 60
+    ya, yt = _labels(rng, na), _labels(rng, nt)
+    # Subject A: parcels {0,2}; B: {1,2}. Signal rides the SHARED parcel 2.
+    ga = _grid_with_signal(rng, ya, 2, signal_unit=1)   # compacted pos1 = parcel 2
+    gt = _grid_with_signal(rng, yt, 2, signal_unit=1)
+    lab_a, lab_t = torch.tensor([0, 2]), torch.tensor([1, 2])
+    pe_a, pe_t = torch.tensor([0, 2]), torch.tensor([1, 2])
+    em = torch.ones(2, dtype=torch.bool)
+    _, va, te = _rows(nt)
+    a = linear_cs_cell_auroc(
+        ga, ya, gt, yt, val_rows=va, test_rows=te, tap_space="parcel",
+        pe_anchor=pe_a, em_anchor=em, pe_test=pe_t, em_test=em, n_parcels=n_parcels,
+        parcel_labels_anchor=lab_a, parcel_labels_test=lab_t,
+    )
+    assert a > 0.85
 
 
 def test_nan_labels_dropped():

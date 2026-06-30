@@ -76,16 +76,21 @@ def _electrode_tokens(
 
 
 def _parcel_tokens(
-    grid: Tensor, support: Tensor
+    grid: Tensor, support: Tensor, parcel_labels: Tensor
 ) -> tuple[Tensor, Tensor, Tensor, int]:
-    """``(N,P,k,S,d)`` → ``(N, P·k·S, d)`` tokens over the full global parcel grid.
+    """``(N,P,k,S,d)`` → ``(N, P·k·S, d)`` tokens over a COMPACTED parcel grid.
 
-    Unsupported parcels are masked (``key_padding_mask`` False), not dropped — full
-    grid, no intersect. Returns ``(tokens, mask (N,P·k·S), token_parcel_ids, S)``."""
+    The grid's P axis is ``parcel_labels`` (the ~16 present parcels, NOT the full atlas).
+    ``token_parcel_ids`` carry the real DKT atlas ids — so parcel-group dropout and the CS
+    anchor/test alignment reason in anatomy, not compacted position. Unsupported parcels
+    (in the compacted set but with no valid electrode this subject) are masked
+    (``key_padding_mask`` False), not dropped. Returns ``(tokens, mask (N,P·k·S),
+    token_parcel_ids, S)``."""
     n, p, k, s, d = grid.shape
+    lab = parcel_labels.long()
     tokens = grid.reshape(n, p * k * s, d)
-    pids = torch.arange(p).repeat_interleave(k * s)
-    tok_valid = support.bool().repeat_interleave(k * s)   # (P·k·S,)
+    pids = lab.repeat_interleave(k * s)
+    tok_valid = support.bool()[lab].repeat_interleave(k * s)   # (P·k·S,)
     mask = tok_valid[None].expand(n, -1).contiguous()
     return tokens, mask, pids, s
 
@@ -96,12 +101,15 @@ def _build_tokens(
     parcel_per_electrode: Tensor,
     electrode_mask: Tensor,
     n_parcels: int,
+    parcel_labels: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor, int]:
     if tap_space == "electrode":
         return _electrode_tokens(grid, electrode_mask, parcel_per_electrode)
     if tap_space == "parcel":
+        if parcel_labels is None:
+            raise ValueError("parcel tap_space needs parcel_labels (compacted grid ids)")
         support = parcel_support(parcel_per_electrode, electrode_mask, n_parcels)
-        return _parcel_tokens(grid, support)
+        return _parcel_tokens(grid, support, parcel_labels)
     raise ValueError(f"tap_space must be 'electrode'|'parcel'; got {tap_space!r}")
 
 
@@ -179,6 +187,7 @@ def attentive_ws_cell_result(
     parcel_per_electrode: Tensor,
     electrode_mask: Tensor,
     n_parcels: int,
+    parcel_labels: Tensor | None = None,
     cfg: HeadTrainConfig,
     device: torch.device | None = None,
 ) -> CellResult:
@@ -186,7 +195,7 @@ def attentive_ws_cell_result(
     report AUROC on ``test_rows`` (all one session's full-grid token set)."""
     device = device or torch.device("cpu")
     tokens, mask, pids, s = _build_tokens(
-        grid, tap_space, parcel_per_electrode, electrode_mask, n_parcels
+        grid, tap_space, parcel_per_electrode, electrode_mask, n_parcels, parcel_labels
     )
     x_tr, m_tr, y_tr = _take(tokens, mask, y, train_rows)
     x_val, m_val, y_val = _take(tokens, mask, y, val_rows)
@@ -211,6 +220,8 @@ def attentive_cs_cell_result(
     pe_test: Tensor,
     em_test: Tensor,
     n_parcels: int,
+    parcel_labels_anchor: Tensor | None = None,
+    parcel_labels_test: Tensor | None = None,
     cfg: HeadTrainConfig,
     device: torch.device | None = None,
 ) -> CellResult:
@@ -220,10 +231,10 @@ def attentive_cs_cell_result(
     intersected); ``parcel_dropout`` augments the train side for the cross-subject shift."""
     device = device or torch.device("cpu")
     tok_a, mask_a, pids_a, s = _build_tokens(
-        grid_anchor, tap_space, pe_anchor, em_anchor, n_parcels
+        grid_anchor, tap_space, pe_anchor, em_anchor, n_parcels, parcel_labels_anchor
     )
     tok_t, mask_t, _, _ = _build_tokens(
-        grid_test, tap_space, pe_test, em_test, n_parcels
+        grid_test, tap_space, pe_test, em_test, n_parcels, parcel_labels_test
     )
     anchor_rows = np.arange(len(y_anchor))
     x_tr, m_tr, y_tr = _take(tok_a, mask_a, y_anchor, anchor_rows)
