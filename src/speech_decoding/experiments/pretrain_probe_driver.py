@@ -21,8 +21,9 @@ import torch
 from torch import Tensor
 
 from speech_decoding.experiments.pretrain_probe_attentive import (
-    attentive_cs_cell_auroc,
-    attentive_ws_cell_auroc,
+    CellResult,
+    attentive_cs_cell_result,
+    attentive_ws_cell_result,
 )
 from speech_decoding.experiments.pretrain_probe_readout import (
     DEFAULT_LAM_GRID,
@@ -39,6 +40,7 @@ __all__ = [
     "load_cache",
     "run_linear_cell",
     "run_attentive_cell",
+    "run_attentive_cell_result",
 ]
 
 # Tap → feature space. M2 is electrode-space (pre-pool); M3/M4 are parcel-space (post-PMA).
@@ -110,7 +112,7 @@ def run_linear_cell(
     raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
 
 
-def run_attentive_cell(
+def run_attentive_cell_result(
     cell: ProbeCell,
     tap: str,
     cfg: HeadTrainConfig,
@@ -118,12 +120,13 @@ def run_attentive_cell(
     test_cache: SessionTapCache,
     anchor_cache: SessionTapCache | None = None,
     device: torch.device | None = None,
-) -> float:
-    """Attentive (set-attention) AUROC for one (cell, tap). Full grid, no intersect."""
+) -> CellResult:
+    """Attentive (set-attention) val+test AUROC for one (cell, tap). Full grid, no
+    intersect. ``val`` drives the sweep-once HP pick; ``test`` is the held-out report."""
     space = TAP_SPACE[tap]
     if cell.eval_mode == "WithinSession":
         sp = test_cache.ws_split[cell.fold_index]
-        return attentive_ws_cell_auroc(
+        return attentive_ws_cell_result(
             test_cache.grids[tap], test_cache.labels[cell.task],
             train_rows=sp["train"], val_rows=sp["val"], test_rows=sp["test"],
             tap_space=space,
@@ -135,7 +138,7 @@ def run_attentive_cell(
         if anchor_cache is None:
             raise ValueError("CrossSubject attentive cell needs an anchor_cache")
         sp = test_cache.cs_split
-        return attentive_cs_cell_auroc(
+        return attentive_cs_cell_result(
             anchor_cache.grids[tap], anchor_cache.labels[cell.task],
             test_cache.grids[tap], test_cache.labels[cell.task],
             val_rows=sp["val"], test_rows=sp["test"], tap_space=space,
@@ -144,3 +147,18 @@ def run_attentive_cell(
             n_parcels=test_cache.n_parcels, cfg=cfg, device=device,
         )
     raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
+
+
+def run_attentive_cell(
+    cell: ProbeCell,
+    tap: str,
+    cfg: HeadTrainConfig,
+    *,
+    test_cache: SessionTapCache,
+    anchor_cache: SessionTapCache | None = None,
+    device: torch.device | None = None,
+) -> float:
+    """Held-out test AUROC for one attentive (cell, tap)."""
+    return run_attentive_cell_result(
+        cell, tap, cfg, test_cache=test_cache, anchor_cache=anchor_cache, device=device
+    ).test

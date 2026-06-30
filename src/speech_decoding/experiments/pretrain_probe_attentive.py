@@ -28,7 +28,7 @@ HP selection (weight_decay / parcel_dropout / dropout) is swept ONCE upstream, n
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -43,9 +43,22 @@ from speech_decoding.experiments.v2_attentive_train import (
 )
 
 __all__ = [
+    "CellResult",
     "attentive_ws_cell_auroc",
     "attentive_cs_cell_auroc",
+    "attentive_ws_cell_result",
+    "attentive_cs_cell_result",
 ]
+
+
+@dataclass(frozen=True)
+class CellResult:
+    """One attentive cell's held-out AUROCs. ``val`` selects HP (sweep-once); ``test``
+    reports. ``val`` is the chosen snapshot's val AUROC (the same set used for early-stop
+    + best-vs-SWAD); ``test`` is the never-touched test half."""
+
+    val: float
+    test: float
 
 
 def _electrode_tokens(
@@ -106,12 +119,12 @@ def _take(
     return x, m, yy
 
 
-def _pick_state(res: dict) -> dict:
-    """The better of the best-val / SWAD snapshot by val AUROC (SWAD on by default)."""
+def _pick(res: dict) -> tuple[dict, float]:
+    """The better of the best-val / SWAD snapshot, with its val AUROC (SWAD on)."""
     swad_val = res["swad_val"]
     if not np.isfinite(swad_val) or res["best_val"] >= swad_val:
-        return res["best_state"]
-    return res["swad_state"]
+        return res["best_state"], res["best_val"]
+    return res["swad_state"], swad_val
 
 
 @torch.no_grad()
@@ -139,7 +152,23 @@ def _cfg_for(cfg: HeadTrainConfig, s_frames: int) -> HeadTrainConfig:
     return replace(cfg, n_time_frames=s_frames, tokens_per_parcel=0)
 
 
-def attentive_ws_cell_auroc(
+def _fit_and_score(
+    x_tr: Tensor, m_tr: Tensor | None, y_tr: Tensor,
+    x_val: Tensor, m_val: Tensor | None, y_val: Tensor,
+    x_te: Tensor, m_te: Tensor | None, y_te: Tensor,
+    pids_tr: Tensor, cfg2: HeadTrainConfig, device: torch.device,
+) -> CellResult:
+    if x_tr.shape[1] == 0 or x_tr.shape[0] < 2 or x_te.shape[0] < 2:
+        return CellResult(float("nan"), float("nan"))
+    res = train_head(
+        x_tr, y_tr, x_val, y_val, cfg2,
+        mask_tr=m_tr, mask_val=m_val, token_parcel_ids_tr=pids_tr, device=device,
+    )
+    state, val = _pick(res)
+    return CellResult(val, _score(cfg2, state, x_te, y_te, m_te, device))
+
+
+def attentive_ws_cell_result(
     grid: Tensor,
     y: np.ndarray,
     *,
@@ -152,7 +181,7 @@ def attentive_ws_cell_auroc(
     n_parcels: int,
     cfg: HeadTrainConfig,
     device: torch.device | None = None,
-) -> float:
+) -> CellResult:
     """WithinSession attentive cell: fit on ``train_rows``, early-stop on ``val_rows``,
     report AUROC on ``test_rows`` (all one session's full-grid token set)."""
     device = device or torch.device("cpu")
@@ -162,17 +191,13 @@ def attentive_ws_cell_auroc(
     x_tr, m_tr, y_tr = _take(tokens, mask, y, train_rows)
     x_val, m_val, y_val = _take(tokens, mask, y, val_rows)
     x_te, m_te, y_te = _take(tokens, mask, y, test_rows)
-    if x_tr.shape[1] == 0 or x_tr.shape[0] < 2 or x_te.shape[0] < 2:
-        return float("nan")
-    cfg2 = _cfg_for(cfg, s)
-    res = train_head(
-        x_tr, y_tr, x_val, y_val, cfg2,
-        mask_tr=m_tr, mask_val=m_val, token_parcel_ids_tr=pids, device=device,
+    return _fit_and_score(
+        x_tr, m_tr, y_tr, x_val, m_val, y_val, x_te, m_te, y_te,
+        pids, _cfg_for(cfg, s), device,
     )
-    return _score(cfg2, _pick_state(res), x_te, y_te, m_te, device)
 
 
-def attentive_cs_cell_auroc(
+def attentive_cs_cell_result(
     grid_anchor: Tensor,
     y_anchor: np.ndarray,
     grid_test: Tensor,
@@ -188,7 +213,7 @@ def attentive_cs_cell_auroc(
     n_parcels: int,
     cfg: HeadTrainConfig,
     device: torch.device | None = None,
-) -> float:
+) -> CellResult:
     """CrossSubject attentive cell: fit on ALL the anchor tokens, early-stop on the test
     session's val half, report AUROC on its test half. Full grid, no pool, no intersect
     — the anchor and test token sets keep their own per-subject coverage (masked, not
@@ -204,11 +229,17 @@ def attentive_cs_cell_auroc(
     x_tr, m_tr, y_tr = _take(tok_a, mask_a, y_anchor, anchor_rows)
     x_val, m_val, y_val = _take(tok_t, mask_t, y_test, val_rows)
     x_te, m_te, y_te = _take(tok_t, mask_t, y_test, test_rows)
-    if x_tr.shape[1] == 0 or x_tr.shape[0] < 2 or x_te.shape[0] < 2:
-        return float("nan")
-    cfg2 = _cfg_for(cfg, s)
-    res = train_head(
-        x_tr, y_tr, x_val, y_val, cfg2,
-        mask_tr=m_tr, mask_val=m_val, token_parcel_ids_tr=pids_a, device=device,
+    return _fit_and_score(
+        x_tr, m_tr, y_tr, x_val, m_val, y_val, x_te, m_te, y_te,
+        pids_a, _cfg_for(cfg, s), device,
     )
-    return _score(cfg2, _pick_state(res), x_te, y_te, m_te, device)
+
+
+def attentive_ws_cell_auroc(*args, **kwargs) -> float:
+    """Test AUROC for a WithinSession attentive cell (see :func:`attentive_ws_cell_result`)."""
+    return attentive_ws_cell_result(*args, **kwargs).test
+
+
+def attentive_cs_cell_auroc(*args, **kwargs) -> float:
+    """Test AUROC for a CrossSubject attentive cell (see :func:`attentive_cs_cell_result`)."""
+    return attentive_cs_cell_result(*args, **kwargs).test
