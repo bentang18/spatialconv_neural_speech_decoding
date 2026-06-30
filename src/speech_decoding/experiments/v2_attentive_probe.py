@@ -93,22 +93,35 @@ class AttentiveProbeHead(nn.Module):
         )
         self.head = nn.Linear(d_model, n_out)
 
-    def _token_mask(self, x: Tensor, key_padding_mask: Tensor | None) -> Tensor | None:
+    def _token_mask(
+        self,
+        x: Tensor,
+        key_padding_mask: Tensor | None,
+        token_parcel_ids: Tensor | None = None,
+    ) -> Tensor | None:
         """Combine the (B,T) valid mask with train-time dropout; never leaves a row empty.
 
         PARCEL dropout (primary) drops every token of a randomly chosen parcel together —
         the augmentation that mimics the real cross-subject shift (a parcel absent because
-        a new subject lacks coverage there). Tokens are laid out as ``P`` contiguous
-        ``tokens_per_parcel``-blocks, so a per-parcel keep mask repeat-interleaves to
-        ``(B,T)``. TOKEN dropout (optional, off by default) drops i.i.d. single tokens —
-        a frame-level absence that never happens at test time, kept only as an ablation."""
+        a new subject lacks coverage there). Two layouts:
+          - regular blocks (M3/M4 parcel taps): ``P`` contiguous ``tokens_per_parcel``-blocks,
+            so a per-parcel keep mask repeat-interleaves to ``(B,T)``.
+          - irregular groups (``token_parcel_ids`` ``(T,)``, M2 electrode tap): electrodes of
+            one anatomical parcel form an arbitrary-size group, so the keep mask is gathered
+            by each token's group id. Takes precedence over the block path when supplied.
+        TOKEN dropout (optional, off by default) drops i.i.d. single tokens — a frame-level
+        absence that never happens at test time, kept only as an ablation."""
         mask = key_padding_mask
         if not self.training:
             return mask
         B, T, _ = x.shape
         drop: Tensor | None = None
         tpp = self.tokens_per_parcel
-        if self.parcel_dropout > 0.0 and tpp > 0 and T % tpp == 0:
+        if self.parcel_dropout > 0.0 and token_parcel_ids is not None:
+            uniq, inv = torch.unique(token_parcel_ids.to(x.device), return_inverse=True)
+            keep_g = torch.rand(B, uniq.numel(), device=x.device) >= self.parcel_dropout
+            drop = keep_g[:, inv]                                  # (B,T) gathered by group id
+        elif self.parcel_dropout > 0.0 and tpp > 0 and T % tpp == 0:
             keep_p = torch.rand(B, T // tpp, device=x.device) >= self.parcel_dropout
             drop = keep_p.repeat_interleave(tpp, dim=1)            # (B,T) block mask
         if self.token_dropout > 0.0:
@@ -121,8 +134,18 @@ class AttentiveProbeHead(nn.Module):
         fallback = torch.ones_like(m) if mask is None else mask
         return torch.where(empty, fallback, m)
 
-    def forward(self, x: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        key_padding_mask: Tensor | None = None,
+        *,
+        token_parcel_ids: Tensor | None = None,
+    ) -> Tensor:
         """``x`` ``(B,T,d)`` token set; ``key_padding_mask`` ``(B,T)`` bool, True = valid.
+
+        ``token_parcel_ids`` ``(T,)`` long maps each token to its anatomical parcel for
+        irregular-group parcel dropout (M2 electrode tap, where electrodes-per-parcel
+        varies); omit for the regular ``tokens_per_parcel``-block path (M3/M4).
 
         Returns ``(B, n_out)`` logits."""
         B, T, d = x.shape
@@ -131,7 +154,7 @@ class AttentiveProbeHead(nn.Module):
             x = x + self.time_embed(pos)[None]                        # (B,T,d), frame=t%S
         scale = self.d_model ** -0.5
         scores = torch.einsum("qhd,btd->bqht", self.phi, x) * scale   # (B,Q,H,T)
-        mask = self._token_mask(x, key_padding_mask)
+        mask = self._token_mask(x, key_padding_mask, token_parcel_ids)
         if mask is not None:
             scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
         a = self.attn_drop(scores.softmax(dim=-1))                    # (B,Q,H,T)

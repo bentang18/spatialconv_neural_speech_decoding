@@ -89,14 +89,17 @@ def train_head(
     *,
     mask_tr: Tensor | None = None,
     mask_val: Tensor | None = None,
+    token_parcel_ids_tr: Tensor | None = None,
     device: torch.device | None = None,
 ) -> dict:
     """Train one head; return ``{best_state, swad_state, best_val, swad_val, steps}``.
 
     ``x_*`` are ``(N, T, d)`` token sets, ``y_*`` ``(N,)`` in {0,1}, masks ``(N,T)``
-    bool (True=valid) or None (constant T). Label smoothing is applied to the binary
-    targets (``y(1-α)+α/2``). Early-stops on ``x_val`` AUROC; SWAD-averages post-warmup
-    snapshots up to the stop."""
+    bool (True=valid) or None (constant T). ``token_parcel_ids_tr`` ``(T,)`` long drives
+    irregular-group parcel dropout on the TRAIN tokens (M2 electrode tap); eval is
+    dropout-free so val/test need none. Label smoothing is applied to the binary targets
+    (``y(1-α)+α/2``). Early-stops on ``x_val`` AUROC; SWAD-averages post-warmup snapshots
+    up to the stop."""
     device = device or torch.device("cpu")
     y_val_np = y_val.cpu().numpy().astype(float)
     head = _build_head(cfg).to(device)
@@ -120,7 +123,8 @@ def train_head(
         ys = yb_tr[idx].to(device)
         ys = ys * (1.0 - cfg.label_smoothing) + 0.5 * cfg.label_smoothing
         mb = None if mask_tr is None else mask_tr[idx].to(device)
-        loss = lossf(head(xb, mb), ys)
+        tpi = None if token_parcel_ids_tr is None else token_parcel_ids_tr.to(device)
+        loss = lossf(head(xb, mb, token_parcel_ids=tpi), ys)
         opt.zero_grad()
         loss.backward()
         opt.step()
