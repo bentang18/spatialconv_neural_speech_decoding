@@ -31,9 +31,37 @@ from speech_decoding.experiments.pretrain_probe_labels import SessionTargets
 
 __all__ = [
     "SessionMeta",
+    "scatter_parcels_to_atlas",
     "cache_from_targets",
     "build_caches",
 ]
+
+
+def scatter_parcels_to_atlas(grid: Tensor, labels: Tensor, n_parcels: int) -> Tensor:
+    """Scatter a compacted parcel-space grid into the global DK atlas by DKT id.
+
+    ``encode_clip_taps`` emits the M3/M4 grids over a subject's COMPACTED active parcels
+    (``(N, P, k, S, d)``, ``P`` = the ~16 present parcels), with ``labels (P,)`` their DKT
+    ids. The parcel-space readout (:func:`pretrain_probe_readout.linear_cs_cell_auroc`,
+    ``tap_space='parcel'``) does NO electrode pooling — it ``index_select``s the grid by
+    atlas id and intersects subjects on a SHARED ``n_parcels`` axis. So the grid must be
+    pre-scattered here to ``(N, n_parcels, k, S, d)``, zero-filling unsupported parcels, with
+    a GLOBAL ``n_parcels`` constant across every session (else CS compares mismatched axes).
+    Mirrors ``v2_probe_bench._to_global``; zero rows are never selected (CS keeps only
+    present-in-both parcels)."""
+    if grid.ndim != 5:
+        raise ValueError(f"parcel grid must be (N,P,k,S,d); got {tuple(grid.shape)}")
+    n, p, k, s, d = grid.shape
+    if labels.shape[0] != p:
+        raise ValueError(f"labels {tuple(labels.shape)} != grid P axis {p}")
+    if int(labels.max()) >= n_parcels:
+        raise ValueError(
+            f"label id {int(labels.max())} >= n_parcels {n_parcels}; the atlas must cover "
+            "every active parcel (use the model's parcel-embed table size)."
+        )
+    glob = grid.new_zeros(n, n_parcels, k, s, d)
+    glob[:, labels.long()] = grid
+    return glob
 
 
 @dataclass(frozen=True)
