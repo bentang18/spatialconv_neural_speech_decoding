@@ -79,6 +79,8 @@ def _build_xp():
 
     args = _parser().parse_args(RUN_A_ARGV)
     _resolve_static_forward_cohesion(args)
+    if getattr(args, "exca_mode", None) is None:
+        args.exca_mode = "cached"          # main() resolves this default; we skip main()
     common = _common_build_kwargs(args)
     # The eval probe forwards 1 s clips; the SSL phase-1 data chain carries the 2-band
     # segmenter + pretrain corpus we need (we only ever read xp.data, never train).
