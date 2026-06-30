@@ -381,6 +381,96 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True, b
         del bands, grids_sf, grids, cache
 
 
+def _load_tap_caches(cache_dir):
+    """Load the per-session `--encode` tap caches → ``{(subj,trial): SessionTapCache}``."""
+    import glob
+    import re
+
+    from speech_decoding.experiments.pretrain_probe_driver import load_cache
+
+    caches = {}
+    pat = re.compile(r"taps_s(\d+)_t(\d+)\.pt$")
+    for path in sorted(glob.glob(os.path.join(cache_dir, "taps_s*_t*.pt"))):
+        m = pat.search(os.path.basename(path))
+        if not m:
+            continue
+        key = (int(m.group(1)), int(m.group(2)))
+        caches[key] = load_cache(path)
+    if not caches:
+        raise FileNotFoundError(f"no taps_s*_t*.pt caches under {cache_dir}")
+    return caches
+
+
+def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=None,
+              modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
+              device=None):
+    """Stage 2 (CPU): load the encoder-tap caches → sweep attentive HP once → eval every
+    cell × tap (ridge + attentive) at the fixed HP → aggregate → ledger CSV + summary.
+
+    Consumes ONLY the `--encode` caches (no GPU, no BT reads); the cross-subject mean is
+    the headline number the pooled encoder taps must push above the 0.666 raw_tok floor.
+    ``base_cfg``/``hp_grid`` default to the contract config + Ben's 3×2×2 grid; overrides
+    exist only so the wiring is unit-testable on a tiny config."""
+    from speech_decoding.experiments.pretrain_probe_collect import RIDGE_FLOOR_DELTA_VOLUME
+    from speech_decoding.experiments.pretrain_probe_csv import ResultRow, append_results
+    from speech_decoding.experiments.pretrain_probe_run import select_best_checkpoint
+    from speech_decoding.experiments.pretrain_probe_suite import NEUROPROBE_TASKS
+    from speech_decoding.experiments.pretrain_probe_sweep import TAPS
+    from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
+
+    caches = _load_tap_caches(cache_dir)
+    d_model = int(next(iter(caches.values())).grids["M2"].shape[-1])
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
+    caches_by_ckpt = {ckpt_tag: caches}
+    sel = select_best_checkpoint(
+        caches_by_ckpt, cfg, representative_ckpt=ckpt_tag,
+        modes=tuple(modes), tasks=tuple(tasks) if tasks else NEUROPROBE_TASKS,
+        taps=tuple(taps) if taps else TAPS,
+        cs_train_anchor=anchor, hp_grid=hp_grid, device=device,
+    )
+    stamp = _stamp()
+    hp = sel.sweep.best_hp
+    hp_note = f"wd={hp.weight_decay},pd={hp.parcel_dropout},dr={hp.dropout}"
+    summary = sel.summary_by_ckpt[ckpt_tag]
+
+    rows: list[ResultRow] = []
+    for s in sel.scores_by_ckpt[ckpt_tag]:
+        for readout, auc in (("ridge", s.linear), ("attentive", s.attentive)):
+            if not np.isfinite(auc):
+                continue
+            rows.append(ResultRow(
+                stamp=stamp, ckpt=ckpt_tag, readout=readout, tap=s.tap,
+                eval_mode=s.eval_mode, task=s.task, split="test",
+                auroc=round(float(auc), 4), n=0,
+                lam="" if readout == "attentive" else "val",
+                notes=f"{s.label};{hp_note}" if readout == "attentive" else s.label,
+            ))
+    # Aggregate MEAN rows (the selection signal): per (mode, tap, readout). aggregate_scores
+    # labels the linear readout 'linear'; the ledger schema uses 'ridge' — normalize.
+    for (mode, tap, readout), m in sorted(summary.mean_by_mode_tap.items()):
+        if not np.isfinite(m):
+            continue
+        rows.append(ResultRow(
+            stamp=stamp, ckpt=ckpt_tag, readout="ridge" if readout == "linear" else readout,
+            tap=tap, eval_mode=mode, task="MEAN", split="test",
+            auroc=round(float(m), 4), n=summary.n_cells,
+            lam="", notes=f"agg;{hp_note}",
+        ))
+    append_results(rows, out_path)
+
+    best_tap, best_readout, best_m = summary.best_cross_subject
+    print(f"\n[score] ckpt={ckpt_tag} d_model={d_model} cells={summary.n_cells} "
+          f"sweep_best_hp=({hp_note})")
+    print(f"{'mode':<14}{'tap':<6}{'readout':<11}{'mean_auroc':>11}")
+    for (mode, tap, readout), m in sorted(summary.mean_by_mode_tap.items()):
+        if np.isfinite(m):
+            print(f"{mode:<14}{tap:<6}{readout:<11}{m:>11.4f}")
+    delta = best_m - RIDGE_FLOOR_DELTA_VOLUME
+    print(f"\n[score] best CrossSubject = {best_tap}/{best_readout} {best_m:.4f} "
+          f"(floor {RIDGE_FLOOR_DELTA_VOLUME:.3f}, delta {delta:+.4f}) -> {out_path}")
+    return rows
+
+
 def _print_summary(rows) -> None:
     by = {}
     for r in rows:
@@ -409,6 +499,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="output dir for --encode tap caches (required for --encode)")
     p.add_argument("--no-untagged-m3", action="store_true",
                    help="skip the untagged-pool M3 A/B surface (cache M2/M3/M4 only)")
+    p.add_argument("--score", action="store_true",
+                   help="Stage 2 (CPU): load --cache-dir tap caches → sweep + eval → CSV")
+    p.add_argument("--ckpt-tag", default="ladder-60000",
+                   help="checkpoint label for the --score ledger rows")
     p.add_argument("--out", default="reports/neuroprobe_probe_results.csv")
     p.add_argument("--anchor", default=None,
                    help="CS train anchor 'subj,trial' (default the contract anchor)")
@@ -453,6 +547,12 @@ def main(argv: list[str] | None = None) -> int:
         run_encode(tuple(PRETRAIN_UNIVERSE), tuple(NEUROPROBE_TASKS),
                    ckpt_path=args.ckpt, out_dir=args.cache_dir,
                    cache_untagged_m3=not args.no_untagged_m3)
+        return 0
+
+    if args.score:
+        if not args.cache_dir:
+            p.error("--score requires --cache-dir (the --encode tap caches)")
+        run_score(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor, out_path=args.out)
         return 0
 
     p.print_help()
