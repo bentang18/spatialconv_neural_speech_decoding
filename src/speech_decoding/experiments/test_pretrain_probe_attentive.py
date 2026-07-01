@@ -89,6 +89,26 @@ def test_ws_electrode_recovers_signal():
     assert a > 0.8
 
 
+def test_ws_strict_subset_rows_remap_is_correct():
+    """The cell rows are a NON-CONTIGUOUS strict subset of the grid N (only even indices),
+    the way one task's ≤3500 clips subset the 15-task union grid. The readout subsets the
+    grid to `keep = train∪val∪test` and searchsorts the rows into that subset; if the remap
+    misaligned tokens vs labels the AUROC would collapse to chance. Even-row signal only."""
+    rng = np.random.default_rng(7)
+    n, c = 200, 6
+    y = _labels(rng, n)
+    grid = _electrode_grid(rng, y, c, signal_elec=2)
+    sel = np.arange(0, n, 2)                      # 100 even rows; odd rows never in `keep`
+    tr, va, te = sel[:70], sel[70:85], sel[85:]   # scattered, union {0,2,…} ⊊ range(n)
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    em = torch.ones(c, dtype=torch.bool)
+    a = attentive_ws_cell_auroc(
+        grid, y, train_rows=tr, val_rows=va, test_rows=te, tap_space="electrode",
+        parcel_per_electrode=pe, electrode_mask=em, n_parcels=N_PARCELS, cfg=_cfg(),
+    )
+    assert a > 0.8
+
+
 def test_ws_parcel_recovers_signal():
     rng = np.random.default_rng(1)
     n = 120

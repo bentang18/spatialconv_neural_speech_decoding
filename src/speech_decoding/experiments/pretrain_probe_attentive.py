@@ -192,8 +192,20 @@ def attentive_ws_cell_result(
     device: torch.device | None = None,
 ) -> CellResult:
     """WithinSession attentive cell: fit on ``train_rows``, early-stop on ``val_rows``,
-    report AUROC on ``test_rows`` (all one session's full-grid token set)."""
+    report AUROC on ``test_rows``.
+
+    Subset the grid to THIS task's rows (``train ∪ val ∪ test`` ≤ the lite balanced cap,
+    ~3500) BEFORE tokenizing — the cache ``N`` axis is the union over all 15 tasks (~13.8k),
+    so tokenizing the whole grid first would materialize a ~55 GB electrode copy only to drop
+    75% of it. Row-subset-first cuts each fit ~4× in RAM (M2 fits 1 GPU) and is numerically
+    identical (same clips, same tokens; rows are just remapped into the kept subset)."""
     device = device or torch.device("cpu")
+    keep = np.unique(np.concatenate([train_rows, val_rows, test_rows]))
+    grid = grid[torch.from_numpy(keep).long()]
+    y = np.asarray(y, dtype=float)[keep]
+    train_rows = np.searchsorted(keep, train_rows)
+    val_rows = np.searchsorted(keep, val_rows)
+    test_rows = np.searchsorted(keep, test_rows)
     tokens, mask, pids, s = _build_tokens(
         grid, tap_space, parcel_per_electrode, electrode_mask, n_parcels, parcel_labels
     )
@@ -230,6 +242,19 @@ def attentive_cs_cell_result(
     — the anchor and test token sets keep their own per-subject coverage (masked, not
     intersected); ``parcel_dropout`` augments the train side for the cross-subject shift."""
     device = device or torch.device("cpu")
+    # Subset each grid to THIS task's rows before tokenizing (see the WS docstring): the anchor
+    # to its finite-label rows (the whole balanced anchor set is train), the test session to
+    # val ∪ test. The cache N axis is the 15-task union, so this avoids a ~55 GB electrode copy
+    # per side and keeps CS on 1 GPU; numerically identical (same clips, rows remapped).
+    ya = np.asarray(y_anchor, dtype=float)
+    keep_a = np.where(np.isfinite(ya))[0]
+    grid_anchor = grid_anchor[torch.from_numpy(keep_a).long()]
+    y_anchor = ya[keep_a]
+    keep_t = np.unique(np.concatenate([val_rows, test_rows]))
+    grid_test = grid_test[torch.from_numpy(keep_t).long()]
+    y_test = np.asarray(y_test, dtype=float)[keep_t]
+    val_rows = np.searchsorted(keep_t, val_rows)
+    test_rows = np.searchsorted(keep_t, test_rows)
     tok_a, mask_a, pids_a, s = _build_tokens(
         grid_anchor, tap_space, pe_anchor, em_anchor, n_parcels, parcel_labels_anchor
     )
