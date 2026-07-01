@@ -91,7 +91,11 @@ def save_cache(cache: SessionTapCache, path: str) -> None:
 
 
 def load_cache(path: str) -> SessionTapCache:
-    return torch.load(path, weights_only=False)
+    """mmap the cache so only the grids a shard actually reads page into RAM. The per-session
+    file bundles every tap (~57-94 GB); a plain load would deserialize all of them before
+    LazyCacheMap prunes to keep_grids, forcing a 2-GPU host-RAM slot. With mmap the unused
+    taps are never touched → pruned grids cost nothing and a single-tap shard fits 1 GPU."""
+    return torch.load(path, weights_only=False, mmap=True)
 
 
 class LazyCacheMap:

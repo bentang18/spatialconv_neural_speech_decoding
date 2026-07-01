@@ -189,5 +189,17 @@ def test_lazy_cache_map_keep_grids_none_keeps_all(tmp_path):
     assert set(cache.grids) == {"M2", "M3", "M4"}            # back-compat: no pruning
 
 
+def test_mmap_load_prune_attentive_shard_path(tmp_path):
+    """The exact shard path: save → mmap load via keep_grids-pruned LazyCacheMap → attentive
+    readout. Guards that an mmap'd tensor trains a head (grad/backprop over a mmap view) and
+    that the single-tap prune leaves the attentive dispatch intact."""
+    paths = _write_caches(tmp_path, [(2, 1), (3, 2)])
+    lazy = LazyCacheMap(paths, maxsize=2, keep_grids={"M3"})
+    cell = ProbeCell("CrossSubject", "onset", 3, 2, train_subject_id=2, train_trial_id=1)
+    a = run_attentive_cell(cell, "M3", _cfg(), test_cache=lazy[(3, 2)],
+                           anchor_cache=lazy[(2, 1)])
+    assert np.isfinite(a)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -520,27 +520,24 @@ def _hp_note(hp) -> str:
 
 
 def _percell_rows(scores, *, ckpt_tag, stamp, hp_note, attn_label="attentive"):
-    """CellScore list → per-cell ResultRows (ridge + attentive, finite only). The single
-    schema both the monolithic --score and the fan-out shards write, so shard CSVs merge
-    back cleanly. ``attn_label`` names the attentive readout column — 'attentive' for the
-    nonlinear head (attn-pool→MLP→linear), 'attn_lin' for the matched linear baseline
-    (attn-pool→linear) — so the two heads stay distinct rows through the merge's
-    (mode,tap,readout) grouping."""
+    """CellScore list → per-cell attentive ResultRows (finite only). The single schema both
+    the monolithic --score and the fan-out shards write, so shard CSVs merge back cleanly.
+    ``attn_label`` names the attentive readout column — 'attentive' for the nonlinear head
+    (attn-pool→MLP→linear), 'attn_lin' for the matched linear baseline (attn-pool→linear) —
+    so the two heads stay distinct rows through the merge's (mode,tap,readout) grouping. The
+    keep-S encoder-tap ridge (``s.linear``) is retired and no longer emitted."""
     from speech_decoding.experiments.pretrain_probe_csv import ResultRow
 
     rows = []
     for s in scores:
-        for readout, auc in (("ridge", s.linear), (attn_label, s.attentive)):
-            if not np.isfinite(auc):
-                continue
-            is_attn = readout == attn_label
-            rows.append(ResultRow(
-                stamp=stamp, ckpt=ckpt_tag, readout=readout, tap=s.tap,
-                eval_mode=s.eval_mode, task=s.task, split="test",
-                auroc=round(float(auc), 4), n=0,
-                lam="" if is_attn else "val",
-                notes=f"{s.label};{hp_note}" if is_attn else s.label,
-            ))
+        if not np.isfinite(s.attentive):
+            continue
+        rows.append(ResultRow(
+            stamp=stamp, ckpt=ckpt_tag, readout=attn_label, tap=s.tap,
+            eval_mode=s.eval_mode, task=s.task, split="test",
+            auroc=round(float(s.attentive), 4), n=0, lam="",
+            notes=f"{s.label};{hp_note}",
+        ))
     return rows
 
 
@@ -673,17 +670,15 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, us
     return payload
 
 
-def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp,
-                    readouts=("ridge", "attentive"), base_cfg=None, use_mlp=True,
+def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp, base_cfg=None, use_mlp=True,
                     modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
                     device=None):
     """Fan-out Stage 2, step 2 (a SHARD): eval this shard's cells (modes×tasks×taps subset)
-    at the FIXED ``hp`` → per-cell CSV rows only. No sweep (HP is given), no global MEAN
-    (``run_merge`` recomputes that across shards). ``readouts`` puts ridge-only shards on
-    cheap 1-GPU/CPU holes and the RAM-heavy attentive shards on 2-GPU holes. ``use_mlp``
-    picks the attentive head — nonlinear (attn-pool→MLP→linear, labeled 'attentive') vs the
-    matched linear baseline (attn-pool→linear, labeled 'attn_lin') — so the two land as
-    distinct readout rows that ``run_merge`` keeps separate."""
+    at the FIXED ``hp`` → per-cell attentive CSV rows only. No sweep (HP is given), no ridge
+    (retired), no global MEAN (``run_merge`` recomputes that across shards). ``use_mlp`` picks
+    the attentive head — nonlinear (attn-pool→MLP→linear, labeled 'attentive') vs the matched
+    linear baseline (attn-pool→linear, labeled 'attn_lin') — so the two land as distinct
+    readout rows that ``run_merge`` keeps separate."""
     from speech_decoding.experiments.pretrain_probe_collect import firewall_self_test
     from speech_decoding.experiments.pretrain_probe_csv import append_results
     from speech_decoding.experiments.pretrain_probe_suite import (
@@ -703,13 +698,13 @@ def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp,
                             cs_train_anchor=anchor, cohort=cohort)
     firewall_self_test(cells)
     scores = fixed_hp_eval(cells, caches, cfg, hp, taps=tuple(taps) if taps else TAPS,
-                           readouts=tuple(readouts), device=device)
+                           device=device)
     attn_label = "attentive" if cfg.use_mlp else "attn_lin"
     rows = _percell_rows(scores, ckpt_tag=ckpt_tag, stamp=_stamp(), hp_note=_hp_note(hp),
                          attn_label=attn_label)
     append_results(rows, out_path)
     print(f"[shard] ckpt={ckpt_tag} cells={len(cells)} taps={taps or 'all'} "
-          f"readouts={readouts} head={attn_label} -> {len(rows)} per-cell rows -> {out_path}",
+          f"head={attn_label} -> {len(rows)} per-cell rows -> {out_path}",
           flush=True)
     return rows
 
@@ -807,8 +802,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tasks", default=None, help="--score/--sweep-hp: comma subset of the 15 tasks")
     p.add_argument("--modes", default=None,
                    help="--score/--sweep-hp: comma subset of WithinSession,CrossSubject")
-    p.add_argument("--readout", choices=("ridge", "attentive", "both"), default="both",
-                   help="--score shard: which readout(s) to fit (ridge-only skips attentive)")
     p.add_argument("--linear-head", action="store_true",
                    help="--score/--sweep-hp: use the matched LINEAR attentive head "
                         "(attn-pool→linear, labeled 'attn_lin') instead of the nonlinear "
@@ -888,9 +881,8 @@ def main(argv: list[str] | None = None) -> int:
         modes = _parse_csv(args.modes) or ("WithinSession", "CrossSubject")
         if args.hp or args.hp_file:        # fixed-HP SHARD: no sweep, per-cell rows only
             hp = _hp_from_spec(args.hp, args.hp_file)
-            readouts = ("ridge", "attentive") if args.readout == "both" else (args.readout,)
             run_score_shard(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
-                            out_path=args.out, hp=hp, readouts=readouts, modes=modes,
+                            out_path=args.out, hp=hp, modes=modes,
                             tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
                             use_mlp=not args.linear_head)
         else:                              # monolithic: sweep-once + eval + aggregate

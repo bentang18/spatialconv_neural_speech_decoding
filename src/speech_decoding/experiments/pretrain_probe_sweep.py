@@ -146,16 +146,17 @@ def fixed_hp_eval(
     *,
     taps: tuple[str, ...] = TAPS,
     lam_grid: tuple[float, ...] = DEFAULT_LAM_GRID,
-    readouts: tuple[str, ...] = ("ridge", "attentive"),
+    readouts: tuple[str, ...] = ("attentive",),
     device: torch.device | None = None,
 ) -> list[CellScore]:
-    """Eval every (cell, tap) at the FIXED swept HP — linear ridge + attentive test AUROC.
+    """Eval every (cell, tap) at the FIXED swept HP — attentive test AUROC.
     Run per checkpoint; no per-checkpoint sweep.
 
-    ``readouts`` selects which heads to actually fit: a ridge-only shard skips the (much
-    costlier) attentive training and leaves ``attentive=nan``; an attentive-only shard
-    skips the ridge solve and leaves ``linear=nan``. The fan-out uses this to put ridge
-    shards on cheap CPU/1-GPU holes and attentive shards on the RAM-heavy 2-GPU holes."""
+    ``readouts`` DEFAULTS to attentive-only — the keep-S encoder-tap ridge is retired from
+    the per-checkpoint path (capacity-confounded and below the raw floor; the matched probe
+    is linear-vs-nonlinear ATTENTIVE now). The ridge branch survives only for explicit
+    ``readouts=("ridge",...)`` callers/tests; nothing in the suite requests it. (The raw-371
+    FLOOR is a separate ``run_raw_floor`` on raw bins — the bar, not this path.)"""
     if not set(readouts) <= {"ridge", "attentive"}:
         raise ValueError(f"readouts must be a subset of {{ridge,attentive}}, got {readouts}")
     cfg = cfg_for_hp(base_cfg, hp)

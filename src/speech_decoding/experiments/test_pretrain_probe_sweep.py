@@ -102,14 +102,24 @@ def test_sweep_picks_a_finite_hp_on_val_only():
     assert res.n_cells_scored >= 1
 
 
-def test_fixed_hp_eval_emits_both_readouts_per_cell_tap():
+def test_fixed_hp_eval_both_readouts_when_requested():
     caches = {(1, 0): _cache(0, 1, 0, signal=True)}
     cells = [ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)]
     hp = default_hp_grid()[0]
-    scores = fixed_hp_eval(cells, caches, _base_cfg(), hp, taps=("M2", "M3"))
+    scores = fixed_hp_eval(cells, caches, _base_cfg(), hp, taps=("M2", "M3"),
+                           readouts=("ridge", "attentive"))
     assert len(scores) == 2  # one cell × two taps
     for s in scores:
         assert s.linear > 0.8 and s.attentive > 0.7  # signal recovered by both
+
+
+def test_fixed_hp_eval_defaults_to_attentive_only():
+    """The default retires the ridge — attentive scored, linear left nan."""
+    caches = {(1, 0): _cache(0, 1, 0, signal=True)}
+    cells = [ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)]
+    scores = fixed_hp_eval(cells, caches, _base_cfg(), default_hp_grid()[0], taps=("M3",))
+    assert len(scores) == 1
+    assert np.isnan(scores[0].linear) and scores[0].attentive > 0.7
 
 
 def test_fixed_hp_eval_ridge_only_skips_attentive_training():

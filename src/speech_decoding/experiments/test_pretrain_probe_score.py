@@ -193,7 +193,7 @@ def test_run_score_writes_cross_subject_mean_rows(tmp_path):
     rows = read_results(str(out))
     mean_cs = [r for r in rows if r["task"] == "MEAN" and r["eval_mode"] == "CrossSubject"]
     assert mean_cs, "expected a CrossSubject MEAN aggregate row"
-    assert {r["readout"] for r in mean_cs} == {"ridge", "attentive"}
+    assert {r["readout"] for r in mean_cs} == {"attentive"}  # ridge retired from the score path
     assert all(0.0 <= float(r["auroc"]) <= 1.0 for r in mean_cs)
 
 
@@ -219,18 +219,32 @@ def _cfg():
                            eval_every=20, patience=4, swad_warmup=20, seed=0)
 
 
-def test_run_score_shard_writes_percell_only_ridge(tmp_path):
-    """A ridge-only shard writes per-cell rows (NO MEAN aggregate), and fits ridge only."""
+def test_run_score_shard_writes_percell_attentive_only(tmp_path):
+    """A shard writes per-cell attentive rows (NO MEAN aggregate, NO ridge — retired)."""
     _write_caches(tmp_path)
     out = tmp_path / "shard.csv"
     _runner().run_score_shard(
         str(tmp_path), ckpt_tag="60k", anchor=DEFAULT_CS_TRAIN_ANCHOR, out_path=str(out),
-        hp=HPCombo(0.1, 0.0, 0.1), readouts=("ridge",), base_cfg=_cfg(),
+        hp=HPCombo(0.1, 0.0, 0.1), base_cfg=_cfg(),
         modes=("CrossSubject",), tasks=("onset",), taps=("M3",),
     )
     rows = read_results(str(out))
     assert rows and all(r["task"] != "MEAN" for r in rows)     # shard = per-cell only
-    assert {r["readout"] for r in rows} == {"ridge"}           # attentive skipped
+    assert {r["readout"] for r in rows} == {"attentive"}       # ridge retired
+
+
+def test_run_score_shard_linear_head_labels_attn_lin(tmp_path):
+    """The linear attentive head (use_mlp=False) tags the matched baseline 'attn_lin'."""
+    import dataclasses
+    _write_caches(tmp_path)
+    out = tmp_path / "shard.csv"
+    _runner().run_score_shard(
+        str(tmp_path), ckpt_tag="60k", anchor=DEFAULT_CS_TRAIN_ANCHOR, out_path=str(out),
+        hp=HPCombo(0.1, 0.0, 0.1), base_cfg=dataclasses.replace(_cfg(), use_mlp=False),
+        modes=("CrossSubject",), tasks=("onset",), taps=("M3",),
+    )
+    rows = read_results(str(out))
+    assert {r["readout"] for r in rows} == {"attn_lin"}
 
 
 def test_run_merge_recomputes_global_means(tmp_path):
