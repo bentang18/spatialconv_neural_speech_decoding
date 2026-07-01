@@ -152,6 +152,27 @@ def test_encode_subject_tokens_shapes_and_teacher():
     assert lab_t.tolist() == labels.tolist()
 
 
+def test_encode_subject_tokens_out_dtype_bf16_is_bit_identical():
+    """out_dtype=bf16 yields bf16 grids that EQUAL the fp32 grids cast to bf16 — casting each
+    batch on-device before CPU accumulation is the same rounding save_cache applies, just
+    earlier, so the stored cache is bit-identical while the fp32 grid never materialises."""
+    model = _tiny_model()
+    n, c = 12, 4
+    poe = torch.tensor([5, 5, 9, 20])
+    bands = _bands(n, c)
+    fp32, _ = encode_subject_tokens(
+        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"),
+        surfaces=("frontend", "m3", "m4"), batch_size=8,
+    )
+    bf16, _ = encode_subject_tokens(
+        model, bands, poe, clip_len_s=1.0, device=torch.device("cpu"),
+        surfaces=("frontend", "m3", "m4"), batch_size=8, out_dtype=torch.bfloat16,
+    )
+    for k in ("frontend", "m3", "m4"):
+        assert bf16[k].dtype == torch.bfloat16
+        assert torch.equal(bf16[k], fp32[k].to(torch.bfloat16))   # exact, not approx
+
+
 def test_encode_subject_tokens_m3_untagged_is_bare_pool():
     """m3_untagged surface = the bare (untagged) pool — the ridge's documented M3 surface,
     distinct from m3 (pool_tagged), same (N,P,k,S,d) layout. Cached for the ridge A/B."""

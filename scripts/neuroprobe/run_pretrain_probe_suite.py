@@ -489,7 +489,7 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
             )
         grids_sf, labels = encode_subject_tokens(
             model, bands, ppe, clip_len_s=PROBE_CLIP_DUR_S, device=device,
-            surfaces=tuple(surfaces), batch_size=batch_size,
+            surfaces=tuple(surfaces), batch_size=batch_size, out_dtype=torch.bfloat16,
         )
         grids = {tap_of[sf]: g for sf, g in grids_sf.items()}
         meta = SessionMeta(

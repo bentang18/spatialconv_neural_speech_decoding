@@ -192,6 +192,7 @@ def encode_subject_tokens(
     surfaces: tp.Sequence[str] = ("m3", "m4"),
     use_teacher: bool = False,
     batch_size: int = 64,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[dict[str, Tensor], Tensor]:
     """Forward one subject → the requested PER-TOKEN tap grids for the attentive head.
 
@@ -205,7 +206,12 @@ def encode_subject_tokens(
       ``m4``        latent output (``latent``), ``(N, P, k, S, d)`` — parcel-tagged
                     internally.
     ``labels`` ``(P,)`` active-parcel DKT ids. ``use_teacher`` selects the EMA-teacher
-    towers. All on CPU; the bench reshapes each grid to a ``(N, set, d)`` token set."""
+    towers. All on CPU; the bench reshapes each grid to a ``(N, set, d)`` token set.
+
+    ``out_dtype`` (default None = keep the model's dtype) casts each tap batch BEFORE it
+    accumulates on CPU — pass ``torch.bfloat16`` so the full fp32 grid never materialises
+    (halves the encode's host-RAM peak → M2 fits 1 GPU). This is the SAME rounding the
+    bf16 cache store applies, just earlier, so the saved cache is bit-identical."""
     for sf in surfaces:
         if sf not in _ATTENTIVE_SURFACE_TAP:
             raise ValueError(
@@ -226,7 +232,10 @@ def encode_subject_tokens(
             use_teacher=use_teacher,
         )
         for sf in surfaces:
-            acc[sf].append(taps[_ATTENTIVE_SURFACE_TAP[sf]].cpu())
+            t = taps[_ATTENTIVE_SURFACE_TAP[sf]]
+            if out_dtype is not None:
+                t = t.to(out_dtype)          # cast on device → half-size host copy, no fp32 grid
+            acc[sf].append(t.cpu())
         if labels is None:
             labels = taps["labels"].cpu().long()
     if labels is None:
