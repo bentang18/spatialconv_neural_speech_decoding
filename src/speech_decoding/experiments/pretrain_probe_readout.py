@@ -9,8 +9,14 @@ Tap-space contract (project_pretrain_probe_suite_contract_2026_06_30) for the LI
 ridge (fixed feature vector → cross-subject must intersect to consistent dims):
 
   - frontend / M2  (electrode-space, ``tap_space="electrode"``):
-      WS → all electrodes, keep-S, flatten.
-      CS → pool electrode→parcel, keep-S, intersect supported parcels P∩, flatten.
+      WS → pool electrode→parcel (mean), keep-S, all supported parcels, flatten.
+      CS → pool electrode→parcel (mean), keep-S, intersect supported parcels P∩, flatten.
+
+  WS-M2 pools to parcels (not the all-electrode ``C·S·d`` flatten) so its feature width
+  is the ~16 present parcels — the all-electrode matrix is 46 GB on the largest session
+  and OOMs the readout. Parcel-mean collapses only the electrode axis (keep-S survives)
+  at parcel resolution, matching M3/M4 so the M2→M3→M4 ladder isolates encoder depth at
+  fixed spatial resolution, and reuses the CS electrode→parcel reduction (one code path).
   - M3 / M4        (parcel-space, ``tap_space="parcel"``):
       WS → all parcels, keep-S, flatten.
       CS → parcels keep-S, intersect supported parcels P∩, flatten.
@@ -36,7 +42,6 @@ from speech_decoding.experiments.online_probe import (
     parcel_intersection,
 )
 from speech_decoding.experiments.v2_raw_probe import (
-    per_electrode_features,
     pool_electrodes_to_parcels,
 )
 
@@ -92,9 +97,24 @@ def _parcel_features(grid: Tensor, atlas_ids: Tensor, parcel_labels: Tensor) -> 
     return feature_matrix(grid, pos).cpu().numpy()
 
 
-def _electrode_features(grid: Tensor, electrode_mask: Tensor) -> np.ndarray:
-    """WS electrode-space features ``(N, C_valid·F)``."""
-    return per_electrode_features(grid, electrode_mask).cpu().numpy()
+def _pooled_parcel_features_ws(
+    grid: Tensor,
+    parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    n_parcels: int,
+) -> np.ndarray:
+    """WS electrode-space features, parcel-MEAN pooled → ``(N, P_present·F)``.
+
+    Mirrors the CS electrode reduction (electrode→parcel mean via
+    :func:`pool_electrodes_to_parcels`, then this session's own supported parcels — a
+    self-intersection, since WS is one montage). Keeps WS-M2's width at the ~16 present
+    parcels instead of the all-electrode ``C·S·d`` flatten (46 GB on the largest session
+    → OOM). Only the electrode axis reduces; keep-S survives."""
+    pooled, present = pool_electrodes_to_parcels(
+        grid, parcel_per_electrode, electrode_mask, n_parcels
+    )
+    atlas_ids = parcel_intersection(present, present)
+    return feature_matrix(pooled, atlas_ids).cpu().numpy()
 
 
 def _all_parcel_features(
@@ -150,7 +170,9 @@ def linear_ws_cell_auroc(
     """WithinSession cell: fit on ``train_rows``, select λ on ``val_rows``, report
     AUROC on ``test_rows`` — all from one session's grid (fixed montage)."""
     if tap_space == "electrode":
-        z = _electrode_features(grid, electrode_mask)
+        z = _pooled_parcel_features_ws(
+            grid, parcel_per_electrode, electrode_mask, n_parcels
+        )
     elif tap_space == "parcel":
         if parcel_labels is None:
             raise ValueError("parcel tap_space needs parcel_labels (compacted grid ids)")

@@ -46,17 +46,39 @@ def test_parcel_support_marks_only_covered_parcels():
 
 
 def test_ws_electrode_recovers_signal():
+    """WS-M2 now pools electrode→parcel (mean). Signal in an electrode of parcel 1
+    survives the 2-electrode average and is recovered at parcel resolution."""
     rng = np.random.default_rng(0)
     n, c = 80, 6
     y = _labels(rng, n)
-    grid = _grid_with_signal(rng, y, c, signal_unit=2)
+    grid = _grid_with_signal(rng, y, c, signal_unit=2)      # electrode 2 → parcel 1
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
     tr, va, te = _rows(n)
     a = linear_ws_cell_auroc(
         grid, y, train_rows=tr, val_rows=va, test_rows=te, tap_space="electrode",
-        parcel_per_electrode=torch.zeros(c, dtype=torch.long),
+        parcel_per_electrode=pe,
         electrode_mask=torch.ones(c, dtype=torch.bool), n_parcels=N_PARCELS,
     )
     assert a > 0.9
+
+
+def test_ws_electrode_pools_to_parcel_width_not_electrode_width():
+    """The reduction is parcel-mean: feature width is P_present·F (here 3 parcels × F),
+    NOT C·F — this is what keeps WS-M2 off the 46 GB all-electrode flatten. Two
+    electrodes sharing a parcel are averaged into one block."""
+    import speech_decoding.experiments.pretrain_probe_readout as ro
+
+    rng = np.random.default_rng(10)
+    n, c = 40, 6
+    grid = torch.from_numpy(rng.normal(size=(n, c, F, 1)).astype(np.float32))
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])                   # 3 parcels, 2 electrodes each
+    z = ro._pooled_parcel_features_ws(
+        grid, pe, torch.ones(c, dtype=torch.bool), N_PARCELS
+    )
+    assert z.shape == (n, 3 * F)                            # parcel width, not 6·F
+    # parcel-0 block is the mean of electrodes 0 and 1.
+    expect = ((grid[:, 0] + grid[:, 1]) / 2).reshape(n, F).numpy()
+    np.testing.assert_allclose(z[:, :F], expect, rtol=1e-5, atol=1e-5)
 
 
 def test_ws_parcel_recovers_signal():
