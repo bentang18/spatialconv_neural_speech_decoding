@@ -165,22 +165,32 @@ class AttentiveProbeHead(nn.Module):
 
         Returns ``(B, n_out)`` logits."""
         B, T, d = x.shape
-        x = x.float()   # caches store bf16 (half the host-RAM/IO); compute stays fp32
-        if self.n_time_frames > 0:                                    # time positional tag
-            pos = torch.arange(T, device=x.device) % self.n_time_frames
-            x = x + self.time_embed(pos)[None]                        # (B,T,d), frame=t%S
-        xn = self.ln_in(x)                                            # pre-norm K/V: xattn(q,LN(X))
-        scale = self.d_model ** -0.5
-        scores = torch.einsum("qhd,btd->bqht", self.phi, xn) * scale  # (B,Q,H,T)
-        mask = self._token_mask(x, key_padding_mask, token_parcel_ids)
-        if mask is not None:
-            scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
-        a = self.attn_drop(scores.softmax(dim=-1))                    # (B,Q,H,T)
-        v = self.W_v(xn).reshape(B, T, self.n_heads, self.head_dim)   # (B,T,H,c)
-        o = torch.einsum("bqht,bthc->bqhc", a, v).reshape(B, self.n_queries, d)
-        attn_out = self.W_o(o)                                        # (B,Q,d)
-        z = self.query[None] + self.resid_drop(attn_out)             # +query residual
-        if self.use_mlp:
-            z = z + self.mlp(self.ln1(z))                            # FFN residual (nonlinear)
-        z = self.ln2(z).mean(dim=1)                                  # pool queries → (B,d)
-        return self.head(z)
+        # bf16 autocast on GPU: matmuls (W_v, einsums, MLP) run on the tensor cores (~10x vs
+        # plain fp32) while LN/softmax stay fp32 for stability, and the big (B,T,d) pre-norm
+        # ops run bf16 instead of the old fp32 upcast. Caches are bf16, so x arrives bf16 and
+        # never materialises an fp32 copy. CPU path keeps the fp32 upcast (deterministic
+        # tests). Logits are cast back to fp32 so the downstream BCE/AUROC is unchanged.
+        dev_type = x.device.type
+        use_ac = dev_type == "cuda"
+        if not use_ac:
+            x = x.float()
+        with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_ac):
+            if self.n_time_frames > 0:                                # time positional tag
+                pos = torch.arange(T, device=x.device) % self.n_time_frames
+                x = x + self.time_embed(pos)[None]                    # (B,T,d), frame=t%S
+            xn = self.ln_in(x)                                        # pre-norm K/V: xattn(q,LN(X))
+            scale = self.d_model ** -0.5
+            scores = torch.einsum("qhd,btd->bqht", self.phi, xn) * scale  # (B,Q,H,T)
+            mask = self._token_mask(x, key_padding_mask, token_parcel_ids)
+            if mask is not None:
+                scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
+            a = self.attn_drop(scores.softmax(dim=-1))                # (B,Q,H,T)
+            v = self.W_v(xn).reshape(B, T, self.n_heads, self.head_dim)   # (B,T,H,c)
+            o = torch.einsum("bqht,bthc->bqhc", a, v).reshape(B, self.n_queries, d)
+            attn_out = self.W_o(o)                                    # (B,Q,d)
+            z = self.query[None] + self.resid_drop(attn_out)         # +query residual
+            if self.use_mlp:
+                z = z + self.mlp(self.ln1(z))                        # FFN residual (nonlinear)
+            z = self.ln2(z).mean(dim=1)                              # pool queries → (B,d)
+            out = self.head(z)
+        return out.float()
