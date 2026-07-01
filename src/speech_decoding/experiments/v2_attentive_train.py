@@ -104,6 +104,15 @@ def train_head(
     device = device or torch.device("cpu")
     y_val_np = y_val.cpu().numpy().astype(float)
     head = _build_head(cfg).to(device)
+    # torch.compile the TRAIN forward (GPU only). The single-query head is tiny, so the hot
+    # loop is launch-bound — profiling one M2 cell showed ~143 kernel launches/step and 57%
+    # of wall in cudaStreamSynchronize, with the GEMMs a small minority. Fusing the ~143
+    # kernels into a handful ~halves the per-cell wall (31s→16s pdrop-off, 20s with the
+    # parcel-dropout torch.unique graph break). Compiled artifacts cache by input shape, so
+    # each distinct T recompiles once and is reused across that subject's 15 tasks. Eval,
+    # SWAD state cloning, and the optimizer all keep the eager ``head`` (same params — the
+    # compiled wrapper shares them), so state_dict keys stay clean and the numbers match.
+    train_fwd = torch.compile(head) if device.type == "cuda" else head
     opt = torch.optim.AdamW(head.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     lossf = torch.nn.BCEWithLogitsLoss()
     g = torch.Generator().manual_seed(cfg.seed)
@@ -138,7 +147,7 @@ def train_head(
         ys = yb_tr[idx]
         ys = ys * (1.0 - cfg.label_smoothing) + 0.5 * cfg.label_smoothing
         mb = None if mask_tr is None else mask_tr[idx]
-        loss = lossf(head(xb, mb, token_parcel_ids=tpi), ys)
+        loss = lossf(train_fwd(xb, mb, token_parcel_ids=tpi), ys)
         opt.zero_grad()
         loss.backward()
         opt.step()
