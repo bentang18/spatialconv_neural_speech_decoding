@@ -677,6 +677,12 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, us
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # The head upcasts to fp32 for compute (v2_attentive_probe.forward: x.float()); its W_v
+    # GEMM over all T tokens dominates wall and ran at plain-fp32 rate (~67 TFLOP/s, tensor
+    # cores off) -- that, NOT host transfer, was why 98% GPU util still took ~57 s/cell on
+    # M2. TF32 runs those matmuls on the tensor cores (~7x) with fp32-drop-in numerics
+    # (10-bit mantissa) -- AUROC-invariant for a probe. Kept fp32 storage; nothing else.
+    torch.set_float32_matmul_precision("high")
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
@@ -718,6 +724,12 @@ def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp, base_cfg=None,
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # The head upcasts to fp32 for compute (v2_attentive_probe.forward: x.float()); its W_v
+    # GEMM over all T tokens dominates wall and ran at plain-fp32 rate (~67 TFLOP/s, tensor
+    # cores off) -- that, NOT host transfer, was why 98% GPU util still took ~57 s/cell on
+    # M2. TF32 runs those matmuls on the tensor cores (~7x) with fp32-drop-in numerics
+    # (10-bit mantissa) -- AUROC-invariant for a probe. Kept fp32 storage; nothing else.
+    torch.set_float32_matmul_precision("high")
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
