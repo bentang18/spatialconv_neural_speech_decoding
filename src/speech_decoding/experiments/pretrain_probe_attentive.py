@@ -255,16 +255,26 @@ def attentive_cs_cell_result(
     y_test = np.asarray(y_test, dtype=float)[keep_t]
     val_rows = np.searchsorted(keep_t, val_rows)
     test_rows = np.searchsorted(keep_t, test_rows)
+    # Stream like the encoder: build + take the anchor side, FREE it, THEN the test side.
+    # CS is the only mode holding two subjects at once; M2 (unpooled electrode tokens, ~4×
+    # the parcel taps) on a dense task overflows the 1-GPU host cap if both sides stay live.
+    # ``grid[:, valid]`` and ``tokens[sel]`` are advanced-index COPIES (tok_a doesn't alias
+    # grid_anchor, x_tr doesn't alias tok_a), so each frees as soon as it's consumed —
+    # peak drops from ~4 M2 tensors to ~2. Numerically identical (same tokens, released
+    # earlier). Test half stays small (val∪test rows), so eval fits.
     tok_a, mask_a, pids_a, s = _build_tokens(
         grid_anchor, tap_space, pe_anchor, em_anchor, n_parcels, parcel_labels_anchor
     )
+    del grid_anchor
+    x_tr, m_tr, y_tr = _take(tok_a, mask_a, y_anchor, np.arange(len(y_anchor)))
+    del tok_a, mask_a
     tok_t, mask_t, _, _ = _build_tokens(
         grid_test, tap_space, pe_test, em_test, n_parcels, parcel_labels_test
     )
-    anchor_rows = np.arange(len(y_anchor))
-    x_tr, m_tr, y_tr = _take(tok_a, mask_a, y_anchor, anchor_rows)
+    del grid_test
     x_val, m_val, y_val = _take(tok_t, mask_t, y_test, val_rows)
     x_te, m_te, y_te = _take(tok_t, mask_t, y_test, test_rows)
+    del tok_t, mask_t
     return _fit_and_score(
         x_tr, m_tr, y_tr, x_val, m_val, y_val, x_te, m_te, y_te,
         pids_a, _cfg_for(cfg, s), device,
