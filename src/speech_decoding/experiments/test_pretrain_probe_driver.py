@@ -102,13 +102,26 @@ def test_cs_without_anchor_raises():
 def test_save_load_roundtrip(tmp_path):
     cache = _make_cache(0, 1, 0)
     path = str(tmp_path / "cache.pt")
+    cell = ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)
+    a_orig = run_linear_cell(cell, "M3", test_cache=cache)  # before save consumes grids
     save_cache(cache, path)
     loaded = load_cache(path)
-    cell = ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)
-    a_orig = run_linear_cell(cell, "M3", test_cache=cache)
     a_load = run_linear_cell(cell, "M3", test_cache=loaded)
-    assert a_orig == pytest.approx(a_load)
+    assert a_orig == pytest.approx(a_load, abs=0.02)  # bf16 store rounds features slightly
+    assert loaded.grids["M3"].dtype == torch.bfloat16  # stored bf16 (half host-RAM/IO)
     assert loaded.subject_id == 1 and loaded.n_parcels == P
+
+
+def test_bf16_storage_attentive_recovers_signal(tmp_path):
+    """The deployed path: save (grids → bf16) → mmap load → attentive readout. Guards that a
+    bf16-stored grid still trains the head (which upcasts each minibatch to fp32) and recovers
+    the planted signal — bf16 storage halves M2's host-RAM so it fits 1 GPU, AUROC unchanged."""
+    path = str(tmp_path / "cache.pt")
+    save_cache(_make_cache(0, 1, 0), path)
+    loaded = load_cache(path)
+    assert loaded.grids["M2"].dtype == torch.bfloat16
+    cell = ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)
+    assert run_attentive_cell(cell, "M2", _cfg(), test_cache=loaded) > 0.75
 
 
 def test_save_cache_is_atomic_no_tmp_left(tmp_path):

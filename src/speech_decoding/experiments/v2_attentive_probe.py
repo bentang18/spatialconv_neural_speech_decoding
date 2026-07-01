@@ -165,6 +165,7 @@ class AttentiveProbeHead(nn.Module):
 
         Returns ``(B, n_out)`` logits."""
         B, T, d = x.shape
+        x = x.float()   # caches store bf16 (half the host-RAM/IO); compute stays fp32
         if self.n_time_frames > 0:                                    # time positional tag
             pos = torch.arange(T, device=x.device) % self.n_time_frames
             x = x + self.time_embed(pos)[None]                        # (B,T,d), frame=t%S

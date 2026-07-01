@@ -104,7 +104,7 @@ def feature_matrix(pooled: Tensor, parcels: Tensor | tp.Sequence[int]) -> Tensor
     """Select ``parcels`` from ``(B, n_parcels, F, k, d)`` and flatten → ``(B, P·F·k·d)``."""
     idx = torch.as_tensor(list(parcels), dtype=torch.long, device=pooled.device)
     sel = pooled.index_select(1, idx)
-    return sel.reshape(sel.shape[0], -1)
+    return sel.reshape(sel.shape[0], -1).float()   # bf16 caches -> fp32 for the numpy ridge
 
 
 def parcel_intersection(present_a: Tensor, present_b: Tensor) -> Tensor:

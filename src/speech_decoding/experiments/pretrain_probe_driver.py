@@ -79,12 +79,31 @@ class SessionTapCache:
     parcel_labels: Tensor | None = None                  # (P,) DKT ids of compacted parcel grids
 
 
-def save_cache(cache: SessionTapCache, path: str) -> None:
+def save_cache(cache: SessionTapCache, path: str, *, store_dtype=torch.bfloat16) -> None:
     """Atomic write: torch.save to a sibling .tmp, then os.replace. A wall-kill mid-save
     leaves only the .tmp, never a truncated cache — so the encode's resume-skip (existence
-    means complete) can trust any present taps_*.pt."""
+    means complete) can trust any present taps_*.pt.
+
+    Float grids are cast to ``store_dtype`` (bf16 default) — HALVING host-RAM + IO so the M2
+    electrode grid (55 GB fp32 → 27 GB) and its row-subset copy fit a 1-GPU slot. The head
+    upcasts each minibatch back to fp32, so compute (and AUROC) is unchanged. Pass
+    ``store_dtype=None`` to keep fp32. Re-casting an existing cache is just
+    ``save_cache(load_cache(p), p)``.
+
+    Casting CONSUMES ``cache.grids`` (pops each source grid as it casts + frees it) so peak
+    RAM is ~one fp32 grid + the accumulating bf16 set, not both full sets at once — a whole-
+    cohort cast then fits the same 1-GPU slot the scoring runs on. Callers discard the cache
+    after saving."""
+    import dataclasses
     import os
 
+    if store_dtype is not None:
+        grids: dict = {}
+        for k in list(cache.grids):
+            v = cache.grids.pop(k)                                    # drop source ref
+            grids[k] = v.to(store_dtype) if v.is_floating_point() else v
+            del v                                                     # free fp32 grid now
+        cache = dataclasses.replace(cache, grids=grids)
     tmp = f"{path}.tmp"
     torch.save(cache, tmp)
     os.replace(tmp, path)
