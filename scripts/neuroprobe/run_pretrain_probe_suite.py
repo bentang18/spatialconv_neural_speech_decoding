@@ -519,23 +519,27 @@ def _hp_note(hp) -> str:
     return f"wd={hp.weight_decay},pd={hp.parcel_dropout},dr={hp.dropout}"
 
 
-def _percell_rows(scores, *, ckpt_tag, stamp, hp_note):
+def _percell_rows(scores, *, ckpt_tag, stamp, hp_note, attn_label="attentive"):
     """CellScore list → per-cell ResultRows (ridge + attentive, finite only). The single
     schema both the monolithic --score and the fan-out shards write, so shard CSVs merge
-    back cleanly."""
+    back cleanly. ``attn_label`` names the attentive readout column — 'attentive' for the
+    nonlinear head (attn-pool→MLP→linear), 'attn_lin' for the matched linear baseline
+    (attn-pool→linear) — so the two heads stay distinct rows through the merge's
+    (mode,tap,readout) grouping."""
     from speech_decoding.experiments.pretrain_probe_csv import ResultRow
 
     rows = []
     for s in scores:
-        for readout, auc in (("ridge", s.linear), ("attentive", s.attentive)):
+        for readout, auc in (("ridge", s.linear), (attn_label, s.attentive)):
             if not np.isfinite(auc):
                 continue
+            is_attn = readout == attn_label
             rows.append(ResultRow(
                 stamp=stamp, ckpt=ckpt_tag, readout=readout, tap=s.tap,
                 eval_mode=s.eval_mode, task=s.task, split="test",
                 auroc=round(float(auc), 4), n=0,
-                lam="" if readout == "attentive" else "val",
-                notes=f"{s.label};{hp_note}" if readout == "attentive" else s.label,
+                lam="" if is_attn else "val",
+                notes=f"{s.label};{hp_note}" if is_attn else s.label,
             ))
     return rows
 
@@ -559,7 +563,7 @@ def _mean_rows(mean_by_mode_tap, n_cells, *, ckpt_tag, stamp, note):
 
 
 def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=None,
-              modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
+              use_mlp=True, modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
               device=None):
     """Stage 2 (CPU): load the encoder-tap caches → sweep attentive HP once → eval every
     cell × tap (ridge + attentive) at the fixed HP → aggregate → ledger CSV + summary.
@@ -585,7 +589,7 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     # Read d_model off ONE session (loads + LRU-caches it) — never materialize all caches.
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
-    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
     caches_by_ckpt = {ckpt_tag: caches}
     # Enumerate cells over EXACTLY the cached sessions — a cell can never request a cache
     # the --encode step didn't write (e.g. the 13→7 cohort cut, or a partial encode).
@@ -603,6 +607,7 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
 
     rows: list[ResultRow] = _percell_rows(
         sel.scores_by_ckpt[ckpt_tag], ckpt_tag=ckpt_tag, stamp=stamp, hp_note=hp_note,
+        attn_label="attentive" if cfg.use_mlp else "attn_lin",
     )
     rows += _mean_rows(
         summary.mean_by_mode_tap, summary.n_cells,
@@ -623,13 +628,14 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     return rows
 
 
-def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None,
+def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, use_mlp=True,
                  modes=("CrossSubject",), tasks=None, taps=None, sweep_cap=None,
                  device=None):
     """Fan-out Stage 2, step 1 (sweep ONCE): pick the attentive HP on a representative cell
     subset (CrossSubject by default — the selection signal) and write the winning
     {weight_decay, parcel_dropout, dropout} to a JSON. Every score shard then reads it via
-    ``--hp-file`` and skips the (expensive) re-sweep, so the sweep cost is paid once."""
+    ``--hp-file`` and skips the (expensive) re-sweep, so the sweep cost is paid once.
+    ``use_mlp`` sweeps the head the shards will run (nonlinear by default)."""
     import json
 
     from speech_decoding.experiments.pretrain_probe_collect import firewall_self_test
@@ -648,7 +654,7 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None,
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
-    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
     cohort = tuple(sorted(caches.keys()))
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
                             cs_train_anchor=anchor, cohort=cohort)
@@ -668,13 +674,16 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None,
 
 
 def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp,
-                    readouts=("ridge", "attentive"), base_cfg=None,
+                    readouts=("ridge", "attentive"), base_cfg=None, use_mlp=True,
                     modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
                     device=None):
     """Fan-out Stage 2, step 2 (a SHARD): eval this shard's cells (modes×tasks×taps subset)
     at the FIXED ``hp`` → per-cell CSV rows only. No sweep (HP is given), no global MEAN
     (``run_merge`` recomputes that across shards). ``readouts`` puts ridge-only shards on
-    cheap 1-GPU/CPU holes and the RAM-heavy attentive shards on 2-GPU holes."""
+    cheap 1-GPU/CPU holes and the RAM-heavy attentive shards on 2-GPU holes. ``use_mlp``
+    picks the attentive head — nonlinear (attn-pool→MLP→linear, labeled 'attentive') vs the
+    matched linear baseline (attn-pool→linear, labeled 'attn_lin') — so the two land as
+    distinct readout rows that ``run_merge`` keeps separate."""
     from speech_decoding.experiments.pretrain_probe_collect import firewall_self_test
     from speech_decoding.experiments.pretrain_probe_csv import append_results
     from speech_decoding.experiments.pretrain_probe_suite import (
@@ -688,17 +697,20 @@ def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp,
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
-    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model)
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
     cohort = tuple(sorted(caches.keys()))
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
                             cs_train_anchor=anchor, cohort=cohort)
     firewall_self_test(cells)
     scores = fixed_hp_eval(cells, caches, cfg, hp, taps=tuple(taps) if taps else TAPS,
                            readouts=tuple(readouts), device=device)
-    rows = _percell_rows(scores, ckpt_tag=ckpt_tag, stamp=_stamp(), hp_note=_hp_note(hp))
+    attn_label = "attentive" if cfg.use_mlp else "attn_lin"
+    rows = _percell_rows(scores, ckpt_tag=ckpt_tag, stamp=_stamp(), hp_note=_hp_note(hp),
+                         attn_label=attn_label)
     append_results(rows, out_path)
     print(f"[shard] ckpt={ckpt_tag} cells={len(cells)} taps={taps or 'all'} "
-          f"readouts={readouts} -> {len(rows)} per-cell rows -> {out_path}", flush=True)
+          f"readouts={readouts} head={attn_label} -> {len(rows)} per-cell rows -> {out_path}",
+          flush=True)
     return rows
 
 
@@ -797,6 +809,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="--score/--sweep-hp: comma subset of WithinSession,CrossSubject")
     p.add_argument("--readout", choices=("ridge", "attentive", "both"), default="both",
                    help="--score shard: which readout(s) to fit (ridge-only skips attentive)")
+    p.add_argument("--linear-head", action="store_true",
+                   help="--score/--sweep-hp: use the matched LINEAR attentive head "
+                        "(attn-pool→linear, labeled 'attn_lin') instead of the nonlinear "
+                        "attn-pool→MLP→linear head ('attentive'). The matched-comparison knob.")
     p.add_argument("--hp", default=None,
                    help="--score shard: fixed attentive HP 'wd,pd,dr' (skips the sweep)")
     p.add_argument("--hp-file", default=None,
@@ -863,7 +879,7 @@ def main(argv: list[str] | None = None) -> int:
         modes = _parse_csv(args.modes) or ("CrossSubject",)
         run_sweep_hp(args.cache_dir, anchor=anchor, out_path=args.out,
                      modes=modes, tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
-                     sweep_cap=args.sweep_cap)
+                     sweep_cap=args.sweep_cap, use_mlp=not args.linear_head)
         return 0
 
     if args.score:
@@ -875,11 +891,12 @@ def main(argv: list[str] | None = None) -> int:
             readouts = ("ridge", "attentive") if args.readout == "both" else (args.readout,)
             run_score_shard(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
                             out_path=args.out, hp=hp, readouts=readouts, modes=modes,
-                            tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps))
+                            tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
+                            use_mlp=not args.linear_head)
         else:                              # monolithic: sweep-once + eval + aggregate
             run_score(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
                       out_path=args.out, modes=modes, tasks=_parse_csv(args.tasks),
-                      taps=_parse_csv(args.taps))
+                      taps=_parse_csv(args.taps), use_mlp=not args.linear_head)
         return 0
 
     p.print_help()

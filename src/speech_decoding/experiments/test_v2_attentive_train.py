@@ -26,7 +26,10 @@ def _separable(seed: int, *, n=240, t=8, d=16, separable=True):
     y = rng.choice([0.0, 1.0], size=n).astype(np.float32)
     x = rng.standard_normal((n, t, d)).astype(np.float32)
     if separable:
-        x += (2.0 * y[:, None, None] - 1.0) * 1.3
+        # Shift HALF the dims by the label — a direction (first-half vs second-half
+        # contrast) that survives the head's pre-norm LN(X). A uniform all-dim shift is a
+        # pure per-token mean offset LN would remove exactly, collapsing the task to chance.
+        x[..., : d // 2] += (2.0 * y[:, None, None] - 1.0) * 1.3
     return torch.from_numpy(x), torch.from_numpy(y)
 
 

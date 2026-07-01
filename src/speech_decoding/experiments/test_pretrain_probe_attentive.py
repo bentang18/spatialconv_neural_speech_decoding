@@ -41,18 +41,24 @@ def _labels(rng, n: int) -> np.ndarray:
 
 
 def _electrode_grid(rng, y, c, signal_elec, *, snr=4.0):
-    """(N,C,S,d) grid; the signal electrode's frame-0 channel-0 encodes the label."""
+    """(N,C,S,d) grid; the signal electrode's frame-0 encodes the label as a 3-dim DIRECTION.
+
+    A single d-channel is a per-token mean component the head's pre-norm LN(X) removes;
+    spreading over a few dims makes it a direction that survives LN (as real tap signal does)."""
     n = len(y)
     g = rng.normal(size=(n, c, S, D)).astype(np.float32)
-    g[:, signal_elec, 0, 0] = ((y * 2 - 1) * snr + 0.2 * rng.normal(size=n)).astype(np.float32)
+    sig = ((y * 2 - 1) * snr + 0.2 * rng.normal(size=n)).astype(np.float32)
+    g[:, signal_elec, 0, :6] = sig[:, None]
     return torch.from_numpy(g)
 
 
 def _parcel_grid(rng, y, p, signal_parcel, *, snr=4.0):
-    """(N,P,k,S,d) grid; the signal parcel's seed-0 frame-0 channel-0 encodes the label."""
+    """(N,P,k,S,d) grid; the signal parcel's seed-0 frame-0 encodes the label as a 3-dim
+    DIRECTION (single-dim signal is removed by the head's pre-norm LN; a direction survives)."""
     n = len(y)
     g = rng.normal(size=(n, p, K, S, D)).astype(np.float32)
-    g[:, signal_parcel, 0, 0, 0] = ((y * 2 - 1) * snr + 0.2 * rng.normal(size=n)).astype(np.float32)
+    sig = ((y * 2 - 1) * snr + 0.2 * rng.normal(size=n)).astype(np.float32)
+    g[:, signal_parcel, 0, 0, :6] = sig[:, None]
     return torch.from_numpy(g)
 
 

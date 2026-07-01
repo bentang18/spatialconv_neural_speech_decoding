@@ -46,9 +46,13 @@ def _cache(seed: int, subject_id: int, trial_id: int, *, signal: bool) -> Sessio
     m3 = rng.normal(size=(N, P, K, S, D)).astype(np.float32)
     m4 = rng.normal(size=(N, P, K, S, D)).astype(np.float32)
     if signal:
-        m2[:, 0, 0, 0] = sgn * 4 + 0.2 * rng.normal(size=N)
-        m3[:, 1, 0, 0, 0] = sgn * 4 + 0.2 * rng.normal(size=N)
-        m4[:, 1, 0, 0, 0] = sgn * 4 + 0.2 * rng.normal(size=N)
+        # Signal as a 6-dim DIRECTION spanning the carrier's tokens (all frames/seeds): a
+        # lone d-channel is a per-token mean component the head's pre-norm LN(X) removes, so
+        # the label rides a multi-dim direction; and a real parcel/electrode carries its
+        # signal across its frames, not one seed — which the set-pool can attend to.
+        m2[:, 0, :, :6] = (sgn * 4 + 0.2 * rng.normal(size=N))[:, None, None]
+        m3[:, 1, :, :, :6] = (sgn * 4 + 0.2 * rng.normal(size=N))[:, None, None, None]
+        m4[:, 1, :, :, :6] = (sgn * 4 + 0.2 * rng.normal(size=N))[:, None, None, None]
     rows = _split_rows(N)
     ws = {0: rows, 1: _split_rows(N)}
     cs = {"val": rows["val"], "test": rows["test"]}

@@ -169,3 +169,46 @@ def test_learnability_separable_set():
     with torch.no_grad():
         scores = head(xt).squeeze(-1).numpy()
     assert roc_auc_score(y, scores) > 0.95
+
+
+def test_use_mlp_false_drops_the_ffn_modules():
+    """The matched linear baseline: use_mlp=False builds no MLP/ln1 (the only nonlinearity
+    on the pooled summary), while attn-pool + W_v/W_o + head + ln2 remain."""
+    full = AttentiveProbeHead(16, n_heads=4, use_mlp=True)
+    lin = AttentiveProbeHead(16, n_heads=4, use_mlp=False)
+    full_mods = {n for n, _ in full.named_modules()}
+    lin_mods = {n for n, _ in lin.named_modules()}
+    assert "mlp" in full_mods and "ln1" in full_mods
+    assert "mlp" not in lin_mods and "ln1" not in lin_mods
+    assert "ln2" in lin_mods and "head" in lin_mods       # pool + classifier stay
+    assert sum(p.numel() for p in lin.parameters()) < sum(p.numel() for p in full.parameters())
+
+
+def test_use_mlp_false_shapes_and_forward_finite():
+    head = AttentiveProbeHead(24, n_heads=6, n_queries=2, use_mlp=False).eval()
+    out = head(torch.randn(3, 11, 24))
+    assert out.shape == (3, 1) and torch.isfinite(out).all()
+
+
+def test_use_mlp_false_linear_baseline_learns_separable_set():
+    """attn-pool → linear (no FFN) still recovers a set whose mean encodes the label."""
+    torch.manual_seed(0)
+    rng = np.random.default_rng(1)
+    n, t, d = 200, 8, 16
+    y = rng.choice([0.0, 1.0], size=n).astype(np.float32)
+    x = rng.standard_normal((n, t, d)).astype(np.float32)
+    x += (2.0 * y[:, None, None] - 1.0) * 1.5
+    xt, yt = torch.from_numpy(x), torch.from_numpy(y)[:, None]
+    head = AttentiveProbeHead(d, n_heads=4, attn_dropout=0.0, residual_dropout=0.0,
+                              use_mlp=False)
+    opt = torch.optim.AdamW(head.parameters(), lr=3e-3, weight_decay=0.01)
+    lossf = torch.nn.BCEWithLogitsLoss()
+    head.train()
+    for _ in range(300):
+        opt.zero_grad()
+        lossf(head(xt), yt).backward()
+        opt.step()
+    head.eval()
+    with torch.no_grad():
+        scores = head(xt).squeeze(-1).numpy()
+    assert roc_auc_score(y, scores) > 0.95

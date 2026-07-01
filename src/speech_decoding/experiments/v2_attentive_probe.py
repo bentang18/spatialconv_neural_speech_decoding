@@ -18,8 +18,12 @@ Folded single-query attention (exact, fewer params — the locked contract):
 The residual base is a SEPARATE learned query vector ``query ∈ R^d`` — the V-JEPA query
 token's residual role; its scoring role is what got absorbed into ``phi``.
 
-Block: ``z = query + attn(x)`` → ``z = z + MLP(LN(z))`` → ``LN`` → mean over queries →
-linear. Regularizers (all config, swept offline): attention-weight / MLP / residual
+Block (V-JEPA CrossAttentionBlock, one layer): keys/values are PRE-NORMED —
+``attn(query, LN_in(x))`` — then ``z = query + attn`` → ``z = z + MLP(LN(z))`` →
+``LN`` (final norm, pre-head) → mean over queries → linear. Two scale notes vs textbook
+MHA, both consequences of the fold: the score ``⟨phi^h, x_t⟩`` is a FULL-d dot (each head
+a free ``R^d`` functional, not a ``d/H`` slice), so the temperature is ``1/√d_model`` (the
+variance-matching scale for a d-dim dot), NOT ``1/√d_head``. Values ARE per-head standard. Regularizers (all config, swept offline): attention-weight / MLP / residual
 dropout, and token-dropout augmentation (drop a fraction of the input token set per clip
 — the set-pool analogue of the SSL mask). The head is permutation-invariant over the
 token axis by construction, so the parcel id must ride IN each token (it does: M3 tap is
@@ -40,7 +44,7 @@ class AttentiveProbeHead(nn.Module):
         *,
         n_heads: int = 6,
         n_queries: int = 1,
-        mlp_ratio: float = 2.0,
+        mlp_ratio: float = 4.0,
         attn_dropout: float = 0.1,
         mlp_dropout: float = 0.1,
         residual_dropout: float = 0.1,
@@ -48,6 +52,7 @@ class AttentiveProbeHead(nn.Module):
         token_dropout: float = 0.0,
         tokens_per_parcel: int = 0,
         n_time_frames: int = 0,
+        use_mlp: bool = True,
         n_out: int = 1,
     ) -> None:
         super().__init__()
@@ -60,6 +65,11 @@ class AttentiveProbeHead(nn.Module):
         self.parcel_dropout = float(parcel_dropout)
         self.token_dropout = float(token_dropout)
         self.tokens_per_parcel = int(tokens_per_parcel)
+        # use_mlp gates the FFN residual block — the ONLY nonlinearity on the pooled
+        # summary. Off ⇒ attn-pool → linear head (the matched linear baseline); on ⇒
+        # attn-pool → MLP → linear (full nonlinear). Same attn-pool + time-tag either way,
+        # so the pair isolates the value of nonlinear readout depth.
+        self.use_mlp = bool(use_mlp)
         # Learnable TIME positional tag over the S axis (frame = token_idx % S; the k seeds
         # share a frame's tag, parcels repeat it). The one positional axis not in content
         # (freq folds into d, parcel is tagged, the k seeds differ in content). Off (=0)
@@ -76,21 +86,27 @@ class AttentiveProbeHead(nn.Module):
         self.query = nn.Parameter(torch.zeros(n_queries, d_model))
         nn.init.trunc_normal_(self.query, std=0.02)
 
+        # Pre-norm on keys/values (V-JEPA ``xattn(q, LN(X))``): the frozen encoder taps
+        # arrive unnormalized (no terminal LN on the tap), so normalize the token set once
+        # and score/value off it. Shared by both heads (linear + nonlinear), so it does not
+        # perturb the matched comparison.
+        self.ln_in = nn.LayerNorm(d_model)
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(attn_dropout)
         self.resid_drop = nn.Dropout(residual_dropout)
 
-        self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
-        hidden = int(round(d_model * mlp_ratio))
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Dropout(mlp_dropout),
-            nn.Linear(hidden, d_model),
-            nn.Dropout(mlp_dropout),
-        )
+        if self.use_mlp:
+            self.ln1 = nn.LayerNorm(d_model)
+            hidden = int(round(d_model * mlp_ratio))
+            self.mlp = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Dropout(mlp_dropout),
+                nn.Linear(hidden, d_model),
+                nn.Dropout(mlp_dropout),
+            )
         self.head = nn.Linear(d_model, n_out)
 
     def _token_mask(
@@ -152,16 +168,18 @@ class AttentiveProbeHead(nn.Module):
         if self.n_time_frames > 0:                                    # time positional tag
             pos = torch.arange(T, device=x.device) % self.n_time_frames
             x = x + self.time_embed(pos)[None]                        # (B,T,d), frame=t%S
+        xn = self.ln_in(x)                                            # pre-norm K/V: xattn(q,LN(X))
         scale = self.d_model ** -0.5
-        scores = torch.einsum("qhd,btd->bqht", self.phi, x) * scale   # (B,Q,H,T)
+        scores = torch.einsum("qhd,btd->bqht", self.phi, xn) * scale  # (B,Q,H,T)
         mask = self._token_mask(x, key_padding_mask, token_parcel_ids)
         if mask is not None:
             scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
         a = self.attn_drop(scores.softmax(dim=-1))                    # (B,Q,H,T)
-        v = self.W_v(x).reshape(B, T, self.n_heads, self.head_dim)    # (B,T,H,c)
+        v = self.W_v(xn).reshape(B, T, self.n_heads, self.head_dim)   # (B,T,H,c)
         o = torch.einsum("bqht,bthc->bqhc", a, v).reshape(B, self.n_queries, d)
         attn_out = self.W_o(o)                                        # (B,Q,d)
         z = self.query[None] + self.resid_drop(attn_out)             # +query residual
-        z = z + self.mlp(self.ln1(z))                                # FFN residual
+        if self.use_mlp:
+            z = z + self.mlp(self.ln1(z))                            # FFN residual (nonlinear)
         z = self.ln2(z).mean(dim=1)                                  # pool queries → (B,d)
         return self.head(z)
