@@ -211,8 +211,26 @@ def _raw_grid(bands) -> torch.Tensor:
     return raw.reshape(n, c, d_raw).unsqueeze(2)      # (N,C,1,D_raw)
 
 
-def _session_cache(xp, ieeg, session, tasks, bt_root):
-    """Materialize one session into a SessionTapCache holding the raw-371 grid."""
+def _pooled_grid(bands) -> torch.Tensor:
+    """Pooled floor grid: the |STFT| bins mean-pooled into the frontend's 22-token patch
+    grid (band/freq-patch/time), as an electrode-space tap (N,C,1,N_TOK). The linear analogue
+    of the learned patch-pool — the apples-to-apples floor the pooled encoder taps must beat,
+    and the '371->22' merge Ben measured as stronger before."""
+    from speech_decoding.experiments.v2_raw_probe import raw_pooled_tokens_from_bands
+    from speech_decoding.models.v14_converged_v2 import BANDS_V2
+
+    # BANDS_V2 = (LFS, HGA) — the freq_patch_bins/kernel_time specs for the 2 materialized
+    # bands (the pooled fn reads the time count from each band's own T).
+    tok = raw_pooled_tokens_from_bands(bands, BANDS_V2)   # (N,C,N_TOK,1)
+    n, c, n_tok, _ = tok.shape
+    return tok.reshape(n, c, n_tok).unsqueeze(2)      # (N,C,1,N_TOK)
+
+
+def _session_cache(xp, ieeg, session, tasks, bt_root, *, electrode_set="lite"):
+    """Materialize one session into a SessionTapCache holding BOTH floor grids: raw-371 and
+    the 22-token pooled band-merge. ``electrode_set='lite'`` subsets to the Neuroprobe-Lite
+    montage (matching the attentive probe's electrode set — the floor must be measured on the
+    same electrodes it bounds); ``'all'`` keeps every electrode (the legacy all-electrode floor)."""
     from speech_decoding.experiments.pretrain_probe_labels import build_session_targets
     from speech_decoding.experiments.pretrain_probe_stage1 import (
         SessionMeta,
@@ -224,9 +242,13 @@ def _session_cache(xp, ieeg, session, tasks, bt_root):
     events = _label_events(subject_id, trial_id, str(row["timeline"]), tasks, bt_root)
     targets = build_session_targets(events, subject_id=subject_id, trial_id=trial_id)
     bands, ppe, em, n_parcels = _materialize_bands(xp, row, targets.clip_starts)
-    grid = _raw_grid(bands)
+    if electrode_set == "lite":
+        bands, ppe, em = _apply_lite_montage(
+            bands, ppe, em, bt_root=bt_root, subject_id=subject_id, trial_id=trial_id
+        )
+    grids = {"raw": _raw_grid(bands), "raw_pooled": _pooled_grid(bands)}
     meta = SessionMeta(parcel_per_electrode=ppe, electrode_mask=em, n_parcels=n_parcels)
-    cache = cache_from_targets(targets, {"raw": grid}, meta)
+    cache = cache_from_targets(targets, grids, meta)
     return cache
 
 
@@ -265,8 +287,13 @@ def _hp_from_spec(spec=None, file=None):
     return HPCombo(wd, pd_, dr)
 
 
-def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
-    """Phase 0: raw-371 linear-ridge floor, all tasks, WS + CS, → ledger CSV."""
+def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None, electrode_set="lite"):
+    """Phase 0: model-free linear-ridge floor, all tasks, WS + CS, → ledger CSV.
+
+    Scores BOTH feature sets — ``raw_371`` (every |STFT| bin) and ``raw_pooled`` (the 22-token
+    band-merge) — on the Lite montage (``electrode_set``), so the floor is measured on the same
+    electrodes and the same split the attentive probe uses. The honest floor is the MAX over the
+    two features per (mode,task); the merge/max happens at read time off the ``tap`` column."""
     from speech_decoding.experiments.pretrain_probe_csv import ResultRow, append_results
     from speech_decoding.experiments.pretrain_probe_readout import (
         DEFAULT_LAM_GRID,
@@ -279,12 +306,13 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
     xp = _build_xp()
     ieeg = _ieeg_index(xp)
     stamp = _stamp()
+    features = (("raw", "raw_371"), ("raw_pooled", "raw_pooled"))
 
     # Stream one session at a time: hold only the anchor cache + the current
     # session (<=2 caches), and append rows to the CSV per session. Building all
     # caches up front OOM-killed the login-node cgroup; an end-only write also
     # lost everything on a mid-run death. Same numbers, bounded RAM.
-    anchor_cache = _session_cache(xp, ieeg, anchor, tasks, bt_root)
+    anchor_cache = _session_cache(xp, ieeg, anchor, tasks, bt_root, electrode_set=electrode_set)
     all_rows: list[ResultRow] = []
 
     def _eval_session(s, cache) -> list[ResultRow]:
@@ -293,50 +321,50 @@ def run_raw_floor(sessions, tasks, *, anchor, out_path, lam_grid=None):
             y = cache.labels.get(task)
             if y is None or np.sum(np.isfinite(y)) < 4:
                 continue
-            # WithinSession (fold 0; the held-out half is val+test).
-            ws = cache.ws_split[task][0]
-            auc = linear_ws_cell_auroc(
-                cache.grids["raw"], y,
-                train_rows=ws["train"], val_rows=ws["val"], test_rows=ws["test"],
-                tap_space="electrode", parcel_per_electrode=cache.parcel_per_electrode,
-                electrode_mask=cache.electrode_mask, n_parcels=cache.n_parcels,
-                lam_grid=lam_grid,
-            )
-            if np.isfinite(auc):
-                rows.append(ResultRow(
-                    stamp=stamp, ckpt="raw_371", readout="ridge", tap="raw_371",
-                    eval_mode="WithinSession", task=task, split="test",
-                    auroc=round(float(auc), 4), n=int(len(ws["test"])),
-                    notes=f"sess={s}",
-                ))
-            # CrossSubject: anchor=train, this session=test (skip the anchor as test).
-            if s == anchor:
-                continue
+            ws = cache.ws_split[task][0]      # fold 0; held-out half is val+test
             cs = cache.cs_split[task]
             ya = anchor_cache.labels.get(task)
-            if ya is None or np.sum(np.isfinite(ya)) < 4:
-                continue
-            # Globally-fixed DK parcel grid; per-pair max is identical to a global
-            # max here (extra parcels are unsupported in both -> dropped on intersect).
-            n_parcels = max(anchor_cache.n_parcels, cache.n_parcels)
-            auc_cs = linear_cs_cell_auroc(
-                anchor_cache.grids["raw"], ya, cache.grids["raw"], y,
-                val_rows=cs["val"], test_rows=cs["test"], tap_space="electrode",
-                pe_anchor=anchor_cache.parcel_per_electrode, em_anchor=anchor_cache.electrode_mask,
-                pe_test=cache.parcel_per_electrode, em_test=cache.electrode_mask,
-                n_parcels=n_parcels, lam_grid=lam_grid,
-            )
-            if np.isfinite(auc_cs):
-                rows.append(ResultRow(
-                    stamp=stamp, ckpt="raw_371", readout="ridge", tap="raw_371",
-                    eval_mode="CrossSubject", task=task, split="test",
-                    auroc=round(float(auc_cs), 4), n=int(len(cs["test"])),
-                    notes=f"anchor={anchor} test={s}",
-                ))
+            for gkey, tap in features:
+                # WithinSession (fold 0).
+                auc = linear_ws_cell_auroc(
+                    cache.grids[gkey], y,
+                    train_rows=ws["train"], val_rows=ws["val"], test_rows=ws["test"],
+                    tap_space="electrode", parcel_per_electrode=cache.parcel_per_electrode,
+                    electrode_mask=cache.electrode_mask, n_parcels=cache.n_parcels,
+                    lam_grid=lam_grid,
+                )
+                if np.isfinite(auc):
+                    rows.append(ResultRow(
+                        stamp=stamp, ckpt="raw_floor", readout="ridge", tap=tap,
+                        eval_mode="WithinSession", task=task, split="test",
+                        auroc=round(float(auc), 4), n=int(len(ws["test"])),
+                        notes=f"sess={s};elec={electrode_set}",
+                    ))
+                # CrossSubject: anchor=train, this session=test (skip the anchor as test).
+                if s == anchor or ya is None or np.sum(np.isfinite(ya)) < 4:
+                    continue
+                # Globally-fixed DK parcel grid; per-pair max is identical to a global
+                # max here (extra parcels are unsupported in both -> dropped on intersect).
+                n_parcels = max(anchor_cache.n_parcels, cache.n_parcels)
+                auc_cs = linear_cs_cell_auroc(
+                    anchor_cache.grids[gkey], ya, cache.grids[gkey], y,
+                    val_rows=cs["val"], test_rows=cs["test"], tap_space="electrode",
+                    pe_anchor=anchor_cache.parcel_per_electrode, em_anchor=anchor_cache.electrode_mask,
+                    pe_test=cache.parcel_per_electrode, em_test=cache.electrode_mask,
+                    n_parcels=n_parcels, lam_grid=lam_grid,
+                )
+                if np.isfinite(auc_cs):
+                    rows.append(ResultRow(
+                        stamp=stamp, ckpt="raw_floor", readout="ridge", tap=tap,
+                        eval_mode="CrossSubject", task=task, split="test",
+                        auroc=round(float(auc_cs), 4), n=int(len(cs["test"])),
+                        notes=f"anchor={anchor} test={s};elec={electrode_set}",
+                    ))
         return rows
 
     for s in sessions:
-        cache = anchor_cache if s == anchor else _session_cache(xp, ieeg, s, tasks, bt_root)
+        cache = (anchor_cache if s == anchor
+                 else _session_cache(xp, ieeg, s, tasks, bt_root, electrode_set=electrode_set))
         rows = _eval_session(s, cache)
         append_results(rows, out_path)  # incremental: survives a later death
         all_rows.extend(rows)
@@ -849,7 +877,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.full:
         run_raw_floor(tuple(PROBE_COHORT_7), tuple(NEUROPROBE_TASKS),
-                      anchor=anchor, out_path=args.out)
+                      anchor=anchor, out_path=args.out, electrode_set=args.electrode_set)
         return 0
 
     if args.encode:
