@@ -24,7 +24,9 @@ from torch import Tensor
 from speech_decoding.experiments.pretrain_probe_attentive import (
     CellResult,
     attentive_cs_cell_result,
+    attentive_cs_concat_cell_result,
     attentive_ws_cell_result,
+    attentive_ws_concat_cell_result,
 )
 from speech_decoding.experiments.pretrain_probe_readout import (
     DEFAULT_LAM_GRID,
@@ -36,6 +38,8 @@ from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
 
 __all__ = [
     "TAP_SPACE",
+    "CONCAT_TAP",
+    "CONCAT_SUBTAPS",
     "SessionTapCache",
     "LazyCacheMap",
     "save_cache",
@@ -47,6 +51,12 @@ __all__ = [
 
 # Tap → feature space. M2 is electrode-space (pre-pool); M3/M4 are parcel-space (post-PMA).
 TAP_SPACE: dict[str, str] = {"M2": "electrode", "M3": "parcel", "M4": "parcel"}
+
+# Synthetic multi-tap: concat the sub-taps' token sets → one single-query attentive read
+# over the union (V-JEPA-2 multi-source probe). Attentive-only (the ridge needs a fixed
+# feature vector, which heterogeneous electrode+parcel token sets don't share).
+CONCAT_TAP = "M234"
+CONCAT_SUBTAPS: tuple[str, ...] = ("M2", "M3", "M4")
 
 
 @dataclass
@@ -222,6 +232,45 @@ def run_linear_cell(
     raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
 
 
+def _run_concat_cell_result(
+    cell: ProbeCell,
+    cfg: HeadTrainConfig,
+    *,
+    test_cache: SessionTapCache,
+    anchor_cache: SessionTapCache | None = None,
+    device: torch.device | None = None,
+) -> CellResult:
+    """Concat-tap attentive cell: one single-query head over the CONCATENATION of the
+    sub-taps' token sets (``CONCAT_SUBTAPS`` = M2⊕M3⊕M4). Same split contract as the
+    single-tap path; the sub-taps share this session's electrode/parcel metadata."""
+    spaces = [TAP_SPACE[t] for t in CONCAT_SUBTAPS]
+    if cell.eval_mode == "WithinSession":
+        sp = test_cache.ws_split[cell.task][cell.fold_index]
+        return attentive_ws_concat_cell_result(
+            [test_cache.grids[t] for t in CONCAT_SUBTAPS], test_cache.labels[cell.task],
+            train_rows=sp["train"], val_rows=sp["val"], test_rows=sp["test"], spaces=spaces,
+            parcel_per_electrode=test_cache.parcel_per_electrode,
+            electrode_mask=test_cache.electrode_mask,
+            n_parcels=test_cache.n_parcels, parcel_labels=test_cache.parcel_labels,
+            cfg=cfg, device=device,
+        )
+    if cell.eval_mode == "CrossSubject":
+        if anchor_cache is None:
+            raise ValueError("CrossSubject concat cell needs an anchor_cache")
+        sp = test_cache.cs_split[cell.task]
+        return attentive_cs_concat_cell_result(
+            [anchor_cache.grids[t] for t in CONCAT_SUBTAPS], anchor_cache.labels[cell.task],
+            [test_cache.grids[t] for t in CONCAT_SUBTAPS], test_cache.labels[cell.task],
+            val_rows=sp["val"], test_rows=sp["test"], spaces=spaces,
+            pe_anchor=anchor_cache.parcel_per_electrode, em_anchor=anchor_cache.electrode_mask,
+            pe_test=test_cache.parcel_per_electrode, em_test=test_cache.electrode_mask,
+            n_parcels=test_cache.n_parcels,
+            parcel_labels_anchor=anchor_cache.parcel_labels,
+            parcel_labels_test=test_cache.parcel_labels, cfg=cfg, device=device,
+        )
+    raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
+
+
 def run_attentive_cell_result(
     cell: ProbeCell,
     tap: str,
@@ -233,6 +282,10 @@ def run_attentive_cell_result(
 ) -> CellResult:
     """Attentive (set-attention) val+test AUROC for one (cell, tap). Full grid, no
     intersect. ``val`` drives the sweep-once HP pick; ``test`` is the held-out report."""
+    if tap == CONCAT_TAP:
+        return _run_concat_cell_result(
+            cell, cfg, test_cache=test_cache, anchor_cache=anchor_cache, device=device
+        )
     space = TAP_SPACE[tap]
     if cell.eval_mode == "WithinSession":
         sp = test_cache.ws_split[cell.task][cell.fold_index]

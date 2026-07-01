@@ -507,10 +507,20 @@ def _keep_grids_for(taps):
     """Grid-prune set for the score load: exactly the requested taps (default M2/M3/M4). The
     cache bundles M2 + M3 + M4 + M3_untagged, but a readout reads only ``grids[tap]``, so a
     per-tap shard can drop the rest on load and stay under the RAM cap. M3_untagged is never
-    read by the score path (it's a cached future A/B surface) → always dropped here."""
+    read by the score path (it's a cached future A/B surface) → always dropped here. The
+    concat tap (``CONCAT_TAP``) expands to its sub-taps — it reads all of them."""
+    from speech_decoding.experiments.pretrain_probe_driver import (
+        CONCAT_SUBTAPS,
+        CONCAT_TAP,
+    )
     from speech_decoding.experiments.pretrain_probe_sweep import TAPS
 
-    return set(taps) if taps else set(TAPS)
+    if not taps:
+        return set(TAPS)
+    keep: set[str] = set()
+    for t in taps:
+        keep.update(CONCAT_SUBTAPS if t == CONCAT_TAP else (t,))
+    return keep
 
 
 def _d_model_of(cache):
@@ -588,8 +598,8 @@ def _mean_rows(mean_by_mode_tap, n_cells, *, ckpt_tag, stamp, note):
 
 
 def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=None,
-              use_mlp=True, modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
-              device=None):
+              use_mlp=True, time_tag=True, modes=("WithinSession", "CrossSubject"),
+              tasks=None, taps=None, device=None):
     """Stage 2 (CPU): load the encoder-tap caches → sweep attentive HP once → eval every
     cell × tap (ridge + attentive) at the fixed HP → aggregate → ledger CSV + summary.
 
@@ -614,7 +624,8 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     # Read d_model off ONE session (loads + LRU-caches it) — never materialize all caches.
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
-    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(
+        d_model=d_model, use_mlp=use_mlp, time_tag=time_tag)
     caches_by_ckpt = {ckpt_tag: caches}
     # Enumerate cells over EXACTLY the cached sessions — a cell can never request a cache
     # the --encode step didn't write (e.g. the 13→7 cohort cut, or a partial encode).
@@ -705,8 +716,8 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, us
 
 
 def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp, base_cfg=None, use_mlp=True,
-                    modes=("WithinSession", "CrossSubject"), tasks=None, taps=None,
-                    device=None):
+                    time_tag=True, modes=("WithinSession", "CrossSubject"), tasks=None,
+                    taps=None, device=None):
     """Fan-out Stage 2, step 2 (a SHARD): eval this shard's cells (modes×tasks×taps subset)
     at the FIXED ``hp`` → per-cell attentive CSV rows only. No sweep (HP is given), no ridge
     (retired), no global MEAN (``run_merge`` recomputes that across shards). ``use_mlp`` picks
@@ -732,7 +743,8 @@ def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp, base_cfg=None,
     torch.set_float32_matmul_precision("high")
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
-    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
+    cfg = base_cfg if base_cfg is not None else HeadTrainConfig(
+        d_model=d_model, use_mlp=use_mlp, time_tag=time_tag)
     cohort = tuple(sorted(caches.keys()))
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
                             cs_train_anchor=anchor, cohort=cohort)
@@ -842,6 +854,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tasks", default=None, help="--score/--sweep-hp: comma subset of the 15 tasks")
     p.add_argument("--modes", default=None,
                    help="--score/--sweep-hp: comma subset of WithinSession,CrossSubject")
+    p.add_argument("--no-time-tag", action="store_true",
+                   help="--score: ablate the learnable time positional tag (n_time_frames=0)")
     p.add_argument("--linear-head", action="store_true",
                    help="--score/--sweep-hp: use the matched LINEAR attentive head "
                         "(attn-pool→linear, labeled 'attn_lin') instead of the nonlinear "
@@ -924,11 +938,12 @@ def main(argv: list[str] | None = None) -> int:
             run_score_shard(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
                             out_path=args.out, hp=hp, modes=modes,
                             tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
-                            use_mlp=not args.linear_head)
+                            use_mlp=not args.linear_head, time_tag=not args.no_time_tag)
         else:                              # monolithic: sweep-once + eval + aggregate
             run_score(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
                       out_path=args.out, modes=modes, tasks=_parse_csv(args.tasks),
-                      taps=_parse_csv(args.taps), use_mlp=not args.linear_head)
+                      taps=_parse_csv(args.taps), use_mlp=not args.linear_head,
+                      time_tag=not args.no_time_tag)
         return 0
 
     p.print_help()

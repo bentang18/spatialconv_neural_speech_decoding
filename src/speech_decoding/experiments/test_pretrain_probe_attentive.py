@@ -6,9 +6,14 @@ import numpy as np
 import pytest
 import torch
 
+from dataclasses import replace
+
 from speech_decoding.experiments.pretrain_probe_attentive import (
+    _build_concat_tokens,
     attentive_cs_cell_auroc,
+    attentive_cs_concat_cell_result,
     attentive_ws_cell_auroc,
+    attentive_ws_concat_cell_result,
 )
 from speech_decoding.experiments.v2_attentive_probe import AttentiveProbeHead
 from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
@@ -177,6 +182,125 @@ def test_nan_labels_dropped():
         n_parcels=N_PARCELS, cfg=_cfg(),
     )
     assert np.isfinite(a)
+
+
+_SPACES = ["electrode", "parcel", "parcel"]
+
+
+def test_build_concat_tokens_shape_and_block_alignment():
+    """Concat token count = C·S + 2·(P·k·S), and every sub-tap block is a multiple of S
+    (so the head's ``arange(T) % S`` time tag stays the true frame index across the join)."""
+    rng = np.random.default_rng(12)
+    n, c = 5, 6
+    y = _labels(rng, n)
+    grids = [
+        _electrode_grid(rng, y, c, signal_elec=2),
+        _parcel_grid(rng, y, N_PARCELS, signal_parcel=1),
+        _parcel_grid(rng, y, N_PARCELS, signal_parcel=1),
+    ]
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    em = torch.ones(c, dtype=torch.bool)
+    tokens, mask, pids, s = _build_concat_tokens(
+        grids, _SPACES, pe, em, N_PARCELS, torch.arange(N_PARCELS)
+    )
+    expected = c * S + 2 * (N_PARCELS * K * S)
+    assert tokens.shape == (n, expected, D)
+    assert mask.shape == (n, expected)
+    assert pids.shape == (expected,)
+    assert s == S
+    assert (c * S) % S == 0 and (N_PARCELS * K * S) % S == 0   # block starts ≡ 0 (mod S)
+
+
+def test_ws_concat_recovers_signal_in_electrode_subtap():
+    """Signal ONLY in the M2 (electrode) sub-tap, M3/M4 pure noise: the concat head must
+    still find it — the union readout reads from whichever depth carries the signal."""
+    rng = np.random.default_rng(10)
+    n, c = 160, 6
+    y = _labels(rng, n)
+    grids = [
+        _electrode_grid(rng, y, c, signal_elec=2, snr=8.0),
+        _parcel_grid(rng, y, N_PARCELS, signal_parcel=1, snr=0.0),
+        _parcel_grid(rng, y, N_PARCELS, signal_parcel=1, snr=0.0),
+    ]
+    tr, va, te = _rows(n)
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    a = attentive_ws_concat_cell_result(
+        grids, y, train_rows=tr, val_rows=va, test_rows=te, spaces=_SPACES,
+        parcel_per_electrode=pe, electrode_mask=torch.ones(c, dtype=torch.bool),
+        n_parcels=N_PARCELS, parcel_labels=torch.arange(N_PARCELS), cfg=_cfg(),
+    ).test
+    # Concat dilutes 1 signal token among ~44 (+2 pure-noise sub-taps); the mechanism
+    # lands ~0.73-0.77 across seeds — the bar checks recovery ≫ chance, not the exact value.
+    assert a > 0.68
+
+
+def test_ws_concat_recovers_signal_in_parcel_subtap():
+    """Signal ONLY in the M3 (parcel) sub-tap, M2/M4 pure noise."""
+    rng = np.random.default_rng(14)
+    n, c = 160, 6
+    y = _labels(rng, n)
+    grids = [
+        _electrode_grid(rng, y, c, signal_elec=2, snr=0.0),
+        _parcel_grid(rng, y, N_PARCELS, signal_parcel=1, snr=8.0),
+        _parcel_grid(rng, y, N_PARCELS, signal_parcel=1, snr=0.0),
+    ]
+    tr, va, te = _rows(n)
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    a = attentive_ws_concat_cell_result(
+        grids, y, train_rows=tr, val_rows=va, test_rows=te, spaces=_SPACES,
+        parcel_per_electrode=pe, electrode_mask=torch.ones(c, dtype=torch.bool),
+        n_parcels=N_PARCELS, parcel_labels=torch.arange(N_PARCELS), cfg=_cfg(),
+    ).test
+    # Concat dilutes 1 signal token among ~44 (+2 pure-noise sub-taps); the mechanism
+    # lands ~0.73-0.77 across seeds — the bar checks recovery ≫ chance, not the exact value.
+    assert a > 0.68
+
+
+def test_cs_concat_no_intersect_recovers_signal():
+    """CrossSubject concat: signal shared in the M2 electrode sub-tap transfers anchor→test
+    over the union of all three taps (no intersect, DKT-id + time-tag alignment)."""
+    rng = np.random.default_rng(11)
+    na, nt = 100, 100
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    em = torch.ones(6, dtype=torch.bool)
+    ya, yt = _labels(rng, na), _labels(rng, nt)
+    grids_a = [
+        _electrode_grid(rng, ya, 6, signal_elec=0, snr=8.0),
+        _parcel_grid(rng, ya, N_PARCELS, signal_parcel=1, snr=0.0),
+        _parcel_grid(rng, ya, N_PARCELS, signal_parcel=1, snr=0.0),
+    ]
+    grids_t = [
+        _electrode_grid(rng, yt, 6, signal_elec=0, snr=8.0),
+        _parcel_grid(rng, yt, N_PARCELS, signal_parcel=1, snr=0.0),
+        _parcel_grid(rng, yt, N_PARCELS, signal_parcel=1, snr=0.0),
+    ]
+    _, va, te = _rows(nt)
+    a = attentive_cs_concat_cell_result(
+        grids_a, ya, grids_t, yt, val_rows=va, test_rows=te, spaces=_SPACES,
+        pe_anchor=pe, em_anchor=em, pe_test=pe, em_test=em, n_parcels=N_PARCELS,
+        parcel_labels_anchor=torch.arange(N_PARCELS),
+        parcel_labels_test=torch.arange(N_PARCELS), cfg=_cfg(),
+    ).test
+    # Cross-subject transfer of a diluted, single-token signal (+ parcel_dropout over the
+    # concatenated DKT ids) — bar checks above-chance recovery, not the exact value.
+    assert a > 0.63
+
+
+def test_time_tag_off_still_recovers_signal():
+    """The time-tag ablation (``cfg.time_tag=False`` → ``n_time_frames=0``) runs and still
+    recovers a content-encoded signal (the head scores tokens by content, not just frame)."""
+    rng = np.random.default_rng(13)
+    n, c = 120, 6
+    y = _labels(rng, n)
+    grid = _electrode_grid(rng, y, c, signal_elec=2)
+    tr, va, te = _rows(n)
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    a = attentive_ws_cell_auroc(
+        grid, y, train_rows=tr, val_rows=va, test_rows=te, tap_space="electrode",
+        parcel_per_electrode=pe, electrode_mask=torch.ones(c, dtype=torch.bool),
+        n_parcels=N_PARCELS, cfg=replace(_cfg(), time_tag=False),
+    )
+    assert np.isfinite(a) and a > 0.8
 
 
 if __name__ == "__main__":

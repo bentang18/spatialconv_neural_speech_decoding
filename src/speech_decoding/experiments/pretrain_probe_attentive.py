@@ -155,9 +155,10 @@ def _score(
 
 
 def _cfg_for(cfg: HeadTrainConfig, s_frames: int) -> HeadTrainConfig:
-    """Force the time tag on (``n_time_frames=S``) and the group-dropout path
-    (``tokens_per_parcel=0`` — dropout is driven by ``token_parcel_ids``)."""
-    return replace(cfg, n_time_frames=s_frames, tokens_per_parcel=0)
+    """Force the group-dropout path (``tokens_per_parcel=0`` — dropout is driven by
+    ``token_parcel_ids``) and turn the learnable time tag on at ``n_time_frames=S`` —
+    unless ``cfg.time_tag`` is False (the ablation), which leaves it off (0)."""
+    return replace(cfg, n_time_frames=s_frames if cfg.time_tag else 0, tokens_per_parcel=0)
 
 
 def _fit_and_score(
@@ -272,6 +273,139 @@ def attentive_cs_cell_result(
         grid_test, tap_space, pe_test, em_test, n_parcels, parcel_labels_test
     )
     del grid_test
+    x_val, m_val, y_val = _take(tok_t, mask_t, y_test, val_rows)
+    x_te, m_te, y_te = _take(tok_t, mask_t, y_test, test_rows)
+    del tok_t, mask_t
+    return _fit_and_score(
+        x_tr, m_tr, y_tr, x_val, m_val, y_val, x_te, m_te, y_te,
+        pids_a, _cfg_for(cfg, s), device,
+    )
+
+
+def _build_concat_tokens(
+    grids: list[Tensor],
+    spaces: list[str],
+    parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    n_parcels: int,
+    parcel_labels: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor, int]:
+    """Tokenize each sub-tap and concat along the token axis into ONE set (the V-JEPA-2
+    multi-source attentive-probe move: concat token sets, one query attends the union).
+
+    Each sub-tap's token count is a multiple of ``S`` (electrode: ``C·S``; parcel:
+    ``P·k·S``), so every block starts at a multiple of ``S`` and the head's
+    ``arange(T) % S`` time tag stays the true frame index across the concatenation.
+    ``token_parcel_ids`` carry DKT atlas ids for all sub-taps, so a parcel's electrode
+    (M2) and pooled (M3/M4) tokens share an id and ``parcel_dropout`` drops them
+    together (anatomically coherent). M2's all-valid tokens (mask ``None``) ride as an
+    all-True block so the concatenated ``key_padding_mask`` lines up."""
+    toks: list[Tensor] = []
+    masks: list[Tensor] = []
+    pids: list[Tensor] = []
+    s_ref: int | None = None
+    for grid, space in zip(grids, spaces):
+        t, m, p, s = _build_tokens(
+            grid, space, parcel_per_electrode, electrode_mask, n_parcels, parcel_labels
+        )
+        if s_ref is None:
+            s_ref = s
+        elif s != s_ref:
+            raise ValueError(f"concat sub-taps disagree on S ({s} vs {s_ref})")
+        if m is None:                                  # electrode tap: every token valid
+            m = torch.ones(t.shape[0], t.shape[1], dtype=torch.bool)
+        toks.append(t)
+        masks.append(m)
+        pids.append(p)
+    if s_ref is None:
+        raise ValueError("concat needs at least one sub-tap grid")
+    return (torch.cat(toks, dim=1), torch.cat(masks, dim=1),
+            torch.cat(pids, dim=0), s_ref)
+
+
+def attentive_ws_concat_cell_result(
+    grids: list[Tensor],
+    y: np.ndarray,
+    *,
+    train_rows: np.ndarray,
+    val_rows: np.ndarray,
+    test_rows: np.ndarray,
+    spaces: list[str],
+    parcel_per_electrode: Tensor,
+    electrode_mask: Tensor,
+    n_parcels: int,
+    parcel_labels: Tensor | None = None,
+    cfg: HeadTrainConfig,
+    device: torch.device | None = None,
+) -> CellResult:
+    """WithinSession attentive cell over the CONCATENATION of several taps' token sets
+    (M2⊕M3⊕M4): one single-query head attends the union, so each task reads from
+    whichever depth serves it. Row-subset each grid BEFORE tokenizing (as the single-tap
+    path does) so the full-N electrode copy is never materialized."""
+    device = device or torch.device("cpu")
+    keep = np.unique(np.concatenate([train_rows, val_rows, test_rows]))
+    ksel = torch.from_numpy(keep).long()
+    y = np.asarray(y, dtype=float)[keep]
+    train_rows = np.searchsorted(keep, train_rows)
+    val_rows = np.searchsorted(keep, val_rows)
+    test_rows = np.searchsorted(keep, test_rows)
+    tokens, mask, pids, s = _build_concat_tokens(
+        [g[ksel] for g in grids], spaces, parcel_per_electrode,
+        electrode_mask, n_parcels, parcel_labels,
+    )
+    x_tr, m_tr, y_tr = _take(tokens, mask, y, train_rows)
+    x_val, m_val, y_val = _take(tokens, mask, y, val_rows)
+    x_te, m_te, y_te = _take(tokens, mask, y, test_rows)
+    return _fit_and_score(
+        x_tr, m_tr, y_tr, x_val, m_val, y_val, x_te, m_te, y_te,
+        pids, _cfg_for(cfg, s), device,
+    )
+
+
+def attentive_cs_concat_cell_result(
+    grids_anchor: list[Tensor],
+    y_anchor: np.ndarray,
+    grids_test: list[Tensor],
+    y_test: np.ndarray,
+    *,
+    val_rows: np.ndarray,
+    test_rows: np.ndarray,
+    spaces: list[str],
+    pe_anchor: Tensor,
+    em_anchor: Tensor,
+    pe_test: Tensor,
+    em_test: Tensor,
+    n_parcels: int,
+    parcel_labels_anchor: Tensor | None = None,
+    parcel_labels_test: Tensor | None = None,
+    cfg: HeadTrainConfig,
+    device: torch.device | None = None,
+) -> CellResult:
+    """CrossSubject attentive cell over the CONCATENATED taps: fit on the anchor's union
+    tokens, early-stop on the test session's val half, report on its test half. No
+    intersect (the single-query head reasons over DKT ids + time tag, not aligned dims).
+    Build+free the anchor side before the test side (see the single-tap CS docstring) —
+    concat is the largest token set, so streaming keeps CS on ≤2 GPU."""
+    device = device or torch.device("cpu")
+    ya = np.asarray(y_anchor, dtype=float)
+    keep_a = np.where(np.isfinite(ya))[0]
+    a_sel = torch.from_numpy(keep_a).long()
+    y_anchor = ya[keep_a]
+    keep_t = np.unique(np.concatenate([val_rows, test_rows]))
+    t_sel = torch.from_numpy(keep_t).long()
+    y_test = np.asarray(y_test, dtype=float)[keep_t]
+    val_rows = np.searchsorted(keep_t, val_rows)
+    test_rows = np.searchsorted(keep_t, test_rows)
+    tok_a, mask_a, pids_a, s = _build_concat_tokens(
+        [g[a_sel] for g in grids_anchor], spaces, pe_anchor, em_anchor,
+        n_parcels, parcel_labels_anchor,
+    )
+    x_tr, m_tr, y_tr = _take(tok_a, mask_a, y_anchor, np.arange(len(y_anchor)))
+    del tok_a, mask_a
+    tok_t, mask_t, _, _ = _build_concat_tokens(
+        [g[t_sel] for g in grids_test], spaces, pe_test, em_test,
+        n_parcels, parcel_labels_test,
+    )
     x_val, m_val, y_val = _take(tok_t, mask_t, y_test, val_rows)
     x_te, m_te, y_te = _take(tok_t, mask_t, y_test, test_rows)
     del tok_t, mask_t

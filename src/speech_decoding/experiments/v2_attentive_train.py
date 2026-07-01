@@ -46,6 +46,7 @@ class HeadTrainConfig:
     token_dropout: float = 0.0        # optional i.i.d.-token ablation (off by default)
     tokens_per_parcel: int = 0        # k·S; set by the bench so parcel dropout knows blocks
     n_time_frames: int = 0            # S; >0 turns on the learnable time positional tag
+    time_tag: bool = True             # readout ablation: False ⇒ _cfg_for leaves the tag off
     use_mlp: bool = True              # False ⇒ attn-pool→linear (matched linear baseline)
     lr: float = 1e-3
     weight_decay: float = 0.1
