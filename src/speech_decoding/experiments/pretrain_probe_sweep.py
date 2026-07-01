@@ -17,6 +17,7 @@ from the same dict by the cell's ``train_*`` ids.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -161,10 +162,13 @@ def fixed_hp_eval(
         raise ValueError(f"readouts must be a subset of {{ridge,attentive}}, got {readouts}")
     cfg = cfg_for_hp(base_cfg, hp)
     scores: list[CellScore] = []
+    n_units = len(cells) * len(taps)
+    done = 0
     for cell in cells:
         tc = caches[(cell.test_subject_id, cell.test_trial_id)]
         anchor = _anchor_for(cell, caches)
         for tap in taps:
+            t0 = time.perf_counter()
             lin = (
                 run_linear_cell(cell, tap, test_cache=tc, anchor_cache=anchor,
                                 lam_grid=lam_grid)
@@ -175,6 +179,11 @@ def fixed_hp_eval(
                                    device=device)
                 if "attentive" in readouts else float("nan")
             )
+            done += 1
+            # Per-cell wall so a running shard isn't a black box (it writes the CSV only at
+            # the end) and the resident-features speedup is measurable.
+            print(f"[fixed_hp_eval] {done}/{n_units} {cell.eval_mode}/{cell.task}/{tap} "
+                  f"att={att:.3f} {time.perf_counter() - t0:.1f}s", flush=True)
             scores.append(
                 CellScore(cell.label(), cell.eval_mode, cell.task, tap, lin, att)
             )

@@ -110,7 +110,21 @@ def train_head(
     torch.manual_seed(cfg.seed)
 
     n = x_tr.shape[0]
-    yb_tr = y_tr.float().view(n, 1)
+    # Move the whole cell's tokens to the GPU ONCE. The old per-step ``x_tr[idx].to(device)``
+    # gathered + copied a minibatch host→device every step; for the M2 electrode tap that's
+    # ~0.5 GB/step × up to 2000 steps × 105 cells, and it dominated wall (transfer-bound, not
+    # compute-bound — the single-query head's GEMMs are ~1-2 min of real work). Resident on
+    # device, minibatch indexing is a free on-GPU gather. The CPU-seeded generator still
+    # draws ``idx`` (moved to device is a 2 KB copy), so the sampled rows are bit-identical
+    # to before — same numbers, ~10-25× faster. One cell fits easily (≤~40 GB vs 97 GB).
+    x_tr = x_tr.to(device)
+    yb_tr = y_tr.float().view(n, 1).to(device)
+    if mask_tr is not None:
+        mask_tr = mask_tr.to(device)
+    tpi = None if token_parcel_ids_tr is None else token_parcel_ids_tr.to(device)
+    x_val = x_val.to(device)
+    if mask_val is not None:
+        mask_val = mask_val.to(device)
     swad_sum: dict[str, Tensor] | None = None
     swad_count = 0
     best_val = -float("inf")
@@ -119,12 +133,11 @@ def train_head(
     step = 0
     while step < cfg.max_steps:
         head.train()
-        idx = torch.randint(0, n, (min(cfg.batch_size, n),), generator=g)
-        xb = x_tr[idx].to(device)
-        ys = yb_tr[idx].to(device)
+        idx = torch.randint(0, n, (min(cfg.batch_size, n),), generator=g).to(device)
+        xb = x_tr[idx]
+        ys = yb_tr[idx]
         ys = ys * (1.0 - cfg.label_smoothing) + 0.5 * cfg.label_smoothing
-        mb = None if mask_tr is None else mask_tr[idx].to(device)
-        tpi = None if token_parcel_ids_tr is None else token_parcel_ids_tr.to(device)
+        mb = None if mask_tr is None else mask_tr[idx]
         loss = lossf(head(xb, mb, token_parcel_ids=tpi), ys)
         opt.zero_grad()
         loss.backward()
