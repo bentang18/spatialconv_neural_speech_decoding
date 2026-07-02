@@ -4,11 +4,17 @@ The v2 model OWNS the EMA teacher, the dual-depth shared-denominator loss, the
 static drop-not-pad forward, and mask sampling — so this shell is THIN: ingest
 the 2-band batch → sample masks (CPU) → ``model.forward`` → log → return loss,
 with the EMA tick in ``on_before_zero_grad`` (one update per optimiser step, so
-``accumulate_grad_batches=K`` gives τ not τ^K — the #46 lesson). It does NOT need
-the 3STFT ``V14ConvergedBrainModule``'s compile / DDP-find-unused / static-shape
-threading: v2's forward is static-shape BY CONSTRUCTION (drop-not-pad) and every
+``accumulate_grad_batches=K`` gives τ not τ^K — the #46 lesson).
+
+Speedups (env-gated by ``dispatch_v14``, byte-identical when unset ⇒ unit tests /
+eager runs unaffected): ``V14_COMPILE`` ``torch.compile``s the whole forward
+(OptimizedModule in a plain dict, never a submodule, rebuilt lazily after an
+un-pickle) and ``V14_SDPA_BACKEND=cudnn`` forces the cuDNN-first SDPA priority for
+the forward. v2's forward is static-shape BY CONSTRUCTION (drop-not-pad) and every
 parameter is used every step (M2+M4 predictors always fire, teacher always runs),
-so a stock static DDP graph is correct.
+so the compile is simpler than the 3STFT one — but ``dynamic=False``
+(``--no-compile-dynamic``) is still REQUIRED: the data-dependent drop-not-pad
+gathers storm dynamo's symbolic solver under ``dynamic=True``/``None``.
 
 Batch contract (the v2 cache, session-homogeneous via the same-session sampler):
   electrode_tokens_lfs : (B, C, 28, T_lfs)   |STFT| magnitude, robust-z'd
@@ -21,6 +27,7 @@ Batch contract (the v2 cache, session-homogeneous via the same-session sampler):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import typing as tp
@@ -28,6 +35,7 @@ import typing as tp
 import torch
 from lightning import pytorch as pl
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from neuraltrain.optimizers import BaseOptimizer
 
@@ -37,6 +45,28 @@ from speech_decoding.models.v14_converged_v2 import (
     active_parcels,
     bands_for_clip_len,
 )
+
+# cuDNN-first SDPA priority (cuDNN → mem-efficient → math fallback), forced only
+# when V14_SDPA_BACKEND=cudnn; otherwise the default dispatcher governs.
+_CUDNN_SDPA_PRIORITY = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+def _sdpa_forward_context(name: str | None) -> tp.ContextManager[None]:
+    """Select the SDPA kernel for the wrapped v2 forward. ``"cudnn"`` forces the
+    cuDNN-first priority (Hopper sm90 kernel; backward inherits the forward's
+    kernel, so wrapping the forward suffices) around the WHOLE forward — v2 has no
+    internal latent scoping, so a whole-forward force is the v2 analogue of the
+    3STFT ``"cudnn"``. All other names / unset ⇒ ``nullcontext`` (the auto-resolved
+    ``"cudnn_latent"`` too — v2 has nowhere to scope it). The recon head uses an
+    explicit softmax, NOT SDPA, so it is unaffected either way. Identical math."""
+    key = (name or "").strip().lower()
+    if key == "cudnn" and torch.cuda.is_available():
+        return sdpa_kernel(_CUDNN_SDPA_PRIORITY, set_priority=True)
+    return contextlib.nullcontext()
 
 
 class V14ConvergedV2BrainModule(pl.LightningModule):
@@ -54,6 +84,35 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
     ) -> None:
         super().__init__()
         self.model = model
+        # ── Science-neutral speedups (env-gated by dispatch_v14; byte-identical
+        # when unset ⇒ unit tests / eager 1-GPU runs unaffected) ──
+        # SDPA preference read once; applied per-forward via the context in
+        # _call_model. Only frontend/latent/predictor attentions are affected
+        # (the recon head uses an explicit softmax, not SDPA).
+        self._sdpa_backend_name = os.environ.get("V14_SDPA_BACKEND")
+        # torch.compile override: the OptimizedModule lives in a PLAIN dict (never a
+        # submodule ⇒ no `_orig_mod.` ckpt prefix, no double param/EMA registration)
+        # and is rebuilt lazily after an un-pickle (the exca/submitit job-pickle
+        # drops it in __getstate__ — its dynamo guards carry unpicklable weakrefs).
+        self._compiled_fwd: dict[str, tp.Callable[..., tp.Any]] = {}
+        self._compile_spec: tuple[str, bool | None] | None = None
+        _compile_flag = os.environ.get("V14_COMPILE", "").strip().lower()
+        if _compile_flag not in ("", "0", "false", "no", "off"):
+            _mode = os.environ.get("V14_COMPILE_MODE") or "default"
+            # Three states: True = symbolic (compile once), False = fully static
+            # (recompile per concrete shape, no symbolic reasoning), unset = torch's
+            # automatic-dynamic. v2's data-dependent gathers storm the symbolic
+            # solver under True/None, so --no-compile-dynamic ("0") ⇒ False is the
+            # working setting; keep the three-state map so it is selectable.
+            _dyn = os.environ.get("V14_COMPILE_DYNAMIC", "").strip().lower()
+            if _dyn in ("1", "true", "yes", "on"):
+                _dynamic: bool | None = True
+            elif _dyn in ("0", "false", "no", "off"):
+                _dynamic = False
+            else:
+                _dynamic = None
+            self._compile_spec = (_mode, _dynamic)
+            self._build_compiled_model()
         self.optim_config = optim_config
         self.clip_len_s = float(clip_len_s)
         self._wd_exclude_norms = wd_exclude_norms
@@ -162,6 +221,56 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
             coords1 = coords[0]                                   # (C',3)
         return lfs, hga, poe, coords1
 
+    def _build_compiled_model(self) -> None:
+        """Compile ``self.model`` per ``_compile_spec`` into the plain
+        ``_compiled_fwd`` dict. Re-applies the global dynamo switches because
+        un-pickling bypasses ``__init__`` — the in-allocation-ddp / submitit
+        job-pickle drops the OptimizedModule (``__getstate__``) and ``_call_model``
+        rebuilds it on the first forward after the un-pickle."""
+        if self._compile_spec is None:
+            return
+        _mode, _dynamic = self._compile_spec
+        import torch._dynamo as _dynamo_mod
+
+        # DDPOptimizer OFF (default): the bucket-split optimizer reorders the graph
+        # and can desync a find_unused DDP run — compiling ONE graph avoids it (cost:
+        # lost allreduce/compute overlap, negligible for this small model on
+        # single-node 4-GPU DDP). Env-tunable, mirrors the 3STFT module.
+        _ddp_opt = os.environ.get("V14_COMPILE_DDP_OPTIMIZER", "").strip().lower()
+        _dynamo_mod.config.optimize_ddp = _ddp_opt in ("1", "true", "yes", "on")
+        # Recompile cap: dynamic=False compiles one concrete graph per distinct
+        # session geometry (~one per BT session); the default cap (8) is below the
+        # corpus session count, so dynamo would silently fall back to eager past the
+        # 8th shape without a raise. torch 2.10 renamed cache_size_limit →
+        # recompile_limit (alias); set both.
+        _cap = int(os.environ.get("V14_COMPILE_CACHE_LIMIT", "64"))
+        for _attr in ("cache_size_limit", "recompile_limit"):
+            if hasattr(_dynamo_mod.config, _attr):
+                setattr(_dynamo_mod.config, _attr, _cap)
+        self._compiled_fwd["model"] = torch.compile(
+            self.model, mode=_mode, dynamic=_dynamic,
+        )
+
+    def __getstate__(self) -> dict[str, tp.Any]:
+        """cloudpickle-safe when compiled: the OptimizedModule carries
+        ``torch._dynamo`` guard weakrefs cloudpickle cannot serialize. Drop it (a
+        copy — the in-process original keeps its compiled forward, so 1-GPU / cluster
+        runs that never round-trip are unaffected); ``_compile_spec`` survives, so
+        ``_call_model`` rebuilds it lazily on the first forward after the un-pickle."""
+        state = self.__dict__.copy()
+        state["_compiled_fwd"] = {}
+        return state
+
+    def _call_model(self, *args: tp.Any, **kwargs: tp.Any) -> dict[str, Tensor]:
+        """Forward through the compiled override when present (rebuilding lazily
+        after an un-pickle), else eager — byte-identical when ``V14_COMPILE`` is
+        unset. Wraps the call in the SDPA context so ``--sdpa-backend cudnn`` forces
+        the cuDNN-first priority for this forward (backward inherits the kernel)."""
+        if self._compile_spec is not None and "model" not in self._compiled_fwd:
+            self._build_compiled_model()
+        with _sdpa_forward_context(self._sdpa_backend_name):
+            return self._compiled_fwd.get("model", self.model)(*args, **kwargs)
+
     def _monitor_due(self) -> bool:
         """Monitor cadence: ``global_step % N == 0``. ``global_step`` is 0 (and may
         raise) when no trainer is attached (unit tests calling ``_step`` directly),
@@ -223,7 +332,7 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         # into `_log_losses` (so they aren't logged as losses). Off-cadence ⇒ no
         # taps requested ⇒ the forward is byte-identical to the no-tap path.
         want_taps = self.training and self._monitor_due()
-        out = self.model(
+        out = self._call_model(
             lfs, hga, poe, m2, tube,
             clip_len_s=self.clip_len_s, coords=coords, drop_mask=drop,
             m2_elec_mask=m2_elec, return_taps=want_taps,

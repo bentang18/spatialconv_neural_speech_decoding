@@ -255,3 +255,75 @@ def test_overfit_one_batch():
         opt.step()
         m.model.ema_step()
     assert m._step(batch.data)["loss"].item() < first
+
+
+# ----------------------------------------------- science-neutral speedup wiring
+def test_speedups_off_by_default_eager_bytewise():
+    """No env ⇒ no compile spec, empty _compiled_fwd, _call_model IS self.model."""
+    m = _module()
+    assert m._compile_spec is None
+    assert m._compiled_fwd == {}
+    assert m._sdpa_backend_name is None
+    # _call_model with no compile spec routes straight to self.model.
+    out = m._step(_batch(B=2).data)
+    assert torch.isfinite(out["loss"])
+
+
+def test_sdpa_backend_read_from_env(monkeypatch):
+    """V14_SDPA_BACKEND is read once at construction; the forward still runs (on
+    CPU the cuDNN context degrades to nullcontext — identical math)."""
+    monkeypatch.setenv("V14_SDPA_BACKEND", "cudnn")
+    m = _module()
+    assert m._sdpa_backend_name == "cudnn"
+    out = m._step(_batch(B=2).data)
+    assert torch.isfinite(out["loss"])
+
+
+def test_compile_spec_resolves_from_env(monkeypatch):
+    """--compile --no-compile-dynamic ⇒ V14_COMPILE=1, V14_COMPILE_DYNAMIC=0 ⇒
+    _compile_spec = ("default", False) (fully static, the required v2 setting)."""
+    monkeypatch.setenv("V14_COMPILE", "1")
+    monkeypatch.setenv("V14_COMPILE_DYNAMIC", "0")
+    m = _module()
+    assert m._compile_spec == ("default", False)
+    # the OptimizedModule is a plain-dict entry, NOT a registered submodule ⇒ no
+    # `_orig_mod.` prefix leaks into the checkpoint / param set.
+    assert "model" in m._compiled_fwd
+    assert not any("_orig_mod" in k for k in m.state_dict())
+
+
+def test_getstate_drops_optimized_module(monkeypatch):
+    """__getstate__ returns a pickle-safe copy with _compiled_fwd cleared (dynamo
+    guard weakrefs are unpicklable); _compile_spec survives for the lazy rebuild."""
+    monkeypatch.setenv("V14_COMPILE", "1")
+    monkeypatch.setenv("V14_COMPILE_DYNAMIC", "0")
+    m = _module()
+    state = m.__getstate__()
+    assert state["_compiled_fwd"] == {}
+    assert state["_compile_spec"] == ("default", False)
+    assert m._compiled_fwd != {}                          # original untouched (a copy)
+
+
+def test_compiled_forward_runs_and_matches_eager():
+    """End-to-end: the compiled forward traces + runs on CPU and its loss matches
+    the SAME model's eager forward (compile is math-neutral). dynamic=False keeps
+    dims concrete so the data-dependent gathers don't storm the symbolic solver.
+    Compares one instance (identical weights) with the mask generator reset before
+    each call so both draw the same masks; eval() silences dropout."""
+    m = _module()
+    m.eval()
+
+    def _loss() -> float:
+        m._mask_gen.manual_seed(m._mask_seed)
+        with torch.no_grad():
+            return m._step(_batch(B=2).data)["loss"].item()
+
+    eager = _loss()
+    m._compile_spec = ("default", False)
+    m._build_compiled_model()
+    try:
+        compiled = _loss()
+    finally:
+        torch._dynamo.reset()
+    assert m._compiled_fwd != {}                          # the OptimizedModule built
+    assert abs(compiled - eager) < 1e-4
