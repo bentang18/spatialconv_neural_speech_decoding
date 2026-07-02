@@ -804,7 +804,14 @@ class ElectrodeReconHead(nn.Module):
         qh = self.W_q(qn).reshape(N, 1, H, hd).transpose(1, 2)  # (N, H, 1, hd)
         kh = self.W_k(sn).reshape(N, k, H, hd).transpose(1, 2)  # (N, H, k, hd)
         vh = self.W_v(sn).reshape(N, k, H, hd).transpose(1, 2)
-        ctx = F.scaled_dot_product_attention(qh, kh, vh)       # (N, H, 1, hd)
+        # Explicit (unmasked, no-dropout) attention — mathematically identical to
+        # F.scaled_dot_product_attention but NOT routed through the fused dispatcher.
+        # The recon query is degenerate (q_len=1, kv_len=k=2); the flash/cuDNN fused
+        # kernels the dispatcher picks for it mis-launch on GPU (cudaErrorInvalid-
+        # Configuration). At k=2 the small matmul + softmax is trivially cheap and
+        # backend-independent (CPU/GPU/compile identical).
+        attn = torch.softmax(qh @ kh.transpose(-2, -1) / (hd ** 0.5), dim=-1)  # (N,H,1,k)
+        ctx = attn @ vh                                        # (N, H, 1, hd)
         # Perceiver-IO BasicDecoder: query residual OFF (the query is a positional
         # ADDRESS, not content to preserve), MLP residual ON, then linear readout.
         h = self.W_o(ctx.transpose(1, 2).reshape(N, d))        # no query residual
