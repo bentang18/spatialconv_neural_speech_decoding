@@ -10,7 +10,7 @@ from __future__ import annotations
 import functools
 import json
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +40,19 @@ class HardLabelSupport:
     support: np.ndarray
     valid: np.ndarray
     label_column: str
+    coords: np.ndarray | None = None
+    """Optional ``(n_electrodes, 3)`` float32 NATIVE subject-space ``depth-wm.csv``
+    ``(L, I, P)`` coordinates (~1 mm-isotropic voxels), row-aligned to
+    ``electrode_labels`` (= the voltage order). Populated only when the support is
+    built with ``with_coords=True``; None otherwise. Native subject space is used
+    (NOT the fsaverage ``elec_coords_full.csv``): fsaverage pial registration
+    projects depth contacts onto the surface and scrambles along-shaft geometry,
+    whereas the relational PE needs the most accurate INTER-electrode distances.
+    Coords ride the identical ``voltage_electrode_order`` row identity and the same
+    in-place ``valid`` zeroing as ``support`` — so ``coords[c]``, ``support[c]``,
+    ``valid[c]`` and ``electrode_labels[c]`` always name the same physical
+    electrode (coords are independent of parcel validity: an unmapped electrode
+    still keeps its coordinate)."""
 
 
 def load_public_bt_anatomy(
@@ -691,6 +704,61 @@ def _drop_single_electrode_parcels(result: HardLabelSupport) -> HardLabelSupport
     )
 
 
+_BT_COORD_COLUMNS: tuple[str, str, str] = ("L", "I", "P")
+"""``depth-wm.csv`` native subject-space coordinate columns (Left/Inferior/
+Posterior voxel indices, ~1 mm isotropic). Used relationally, never as absolute
+position. See :class:`HardLabelSupport` for why native (not fsaverage) space."""
+
+
+@functools.lru_cache(maxsize=256)
+def aligned_voltage_coords(
+    bt_root: str | Path,
+    subject_id: int,
+    *,
+    trial_id: int | None = None,
+    electrode_set: tp.Literal["all", "lite"] = "all",
+) -> np.ndarray:
+    """Native ``depth-wm.csv`` ``(L, I, P)`` coords aligned to the VOLTAGE order.
+
+    Returns ``(n_electrodes, 3)`` float32, where row ``c`` is the coordinate of
+    the SAME physical electrode as ``voltage_electrode_order(...)[c]`` (or the Lite
+    order under ``electrode_set="lite"``). Fails loud (``ValueError``) if any
+    electrode in that order has no ``depth-wm.csv`` row — the missing-coordinate
+    contacts are already dropped upstream by :data:`_BT_MISSING_COORDINATE_ELECTRODES`
+    inside :func:`voltage_electrode_order`, so a survivor with no coord row is a
+    real desync, not an expected gap.
+    """
+    order = (
+        lite_voltage_order(bt_root, subject_id, trial_id)
+        if electrode_set == "lite"
+        else voltage_electrode_order(bt_root, subject_id, trial_id)
+    )
+    anatomy = load_public_bt_anatomy(bt_root, int(subject_id))
+    missing_cols = [c for c in _BT_COORD_COLUMNS if c not in anatomy.columns]
+    if missing_cols:
+        raise KeyError(
+            f"depth-wm.csv for subject {int(subject_id)} missing coordinate "
+            f"columns {missing_cols}; native-RAS relational PE needs (L, I, P)."
+        )
+    coord_by_electrode = {
+        clean_bt_electrode_label(str(getattr(row, "Electrode"))): (
+            float(getattr(row, "L")),
+            float(getattr(row, "I")),
+            float(getattr(row, "P")),
+        )
+        for row in anatomy.itertuples(index=False)
+    }
+    missing = [e for e in order if e not in coord_by_electrode]
+    if missing:
+        raise ValueError(
+            f"subject {int(subject_id)}: {len(missing)} voltage-order electrodes "
+            f"have no depth-wm.csv coordinate row {missing[:10]}"
+            + (f" (+{len(missing) - 10} more)" if len(missing) > 10 else "")
+            + " — coordinate/voltage row desync."
+        )
+    return np.asarray([coord_by_electrode[e] for e in order], dtype=np.float32)
+
+
 @functools.lru_cache(maxsize=256)
 def aligned_voltage_support(
     bt_root: str | Path,
@@ -702,6 +770,7 @@ def aligned_voltage_support(
     label_column: str = DEFAULT_BT_LABEL_COLUMN,
     exclude_single_electrode_parcels: bool = False,
     electrode_set: tp.Literal["all", "lite"] = "all",
+    with_coords: bool = False,
 ) -> HardLabelSupport:
     """DK/DKT support aligned to the VOLTAGE electrode order.
 
@@ -755,4 +824,17 @@ def aligned_voltage_support(
     _assert_parcel_support_coverage(result, int(subject_id))
     if exclude_single_electrode_parcels:
         result = _drop_single_electrode_parcels(result)
+    if with_coords:
+        # Attach AFTER the single-electrode drop: that drop only zeros support/
+        # valid in place (row order is untouched), so ``order`` — and coords keyed
+        # off it — stays aligned to ``result.electrode_labels``.
+        coords = aligned_voltage_coords(
+            bt_root, subject_id, trial_id=trial_id, electrode_set=electrode_set
+        )
+        if coords.shape[0] != len(result.electrode_labels):
+            raise ValueError(
+                f"subject {int(subject_id)}: coords rows {coords.shape[0]} != "
+                f"support rows {len(result.electrode_labels)} — alignment broken."
+            )
+        result = replace(result, coords=coords)
     return result

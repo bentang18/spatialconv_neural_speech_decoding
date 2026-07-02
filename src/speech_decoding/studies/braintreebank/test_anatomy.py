@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ from speech_decoding.studies.braintreebank.anatomy import (
     DEFAULT_SUPPORT_BIAS_EPS,
     V14_DK_PARCEL_LABELS,
     _MIN_PARCEL_VALID_FRACTION,
+    aligned_voltage_coords,
     aligned_voltage_support,
     build_hard_public_bt_label_support,
     bt_label_vocabulary,
@@ -28,6 +30,92 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _BT_CACHE = _REPO_ROOT / ".cache" / "braintreebank"
 _NEUROPROBE_UPSTREAM = _REPO_ROOT / ".cache" / "neuroprobe_upstream"
 _VENDORED_SUBJECTS = tuple(range(1, 11))
+_HAS_BT = _BT_CACHE.exists() and (_BT_CACHE / "electrode_labels" / "sub_1").exists()
+
+
+def _depth_wm_coord_map(subject_id: int) -> dict[str, tuple[float, float, float]]:
+    """Ground-truth native (L, I, P) per cleaned electrode label, read raw."""
+    dw = pd.read_csv(_BT_CACHE / "localization" / f"sub_{subject_id}" / "depth-wm.csv")
+    return {
+        clean_bt_electrode_label(str(e)): (float(l), float(i), float(p))
+        for e, l, i, p in zip(dw["Electrode"], dw["L"], dw["I"], dw["P"])
+    }
+
+
+def _write_synthetic_bt(tmp_path: Path, labels, coord_rows, *, corrupted=()) -> None:
+    """Minimal BT root: electrode_labels.json + optional corrupted + depth-wm.csv."""
+    lab_dir = tmp_path / "electrode_labels" / "sub_99"
+    lab_dir.mkdir(parents=True)
+    (lab_dir / "electrode_labels.json").write_text(json.dumps(list(labels)))
+    if corrupted:
+        (tmp_path / "corrupted_elec.json").write_text(json.dumps({"sub_99": list(corrupted)}))
+    loc = tmp_path / "localization" / "sub_99"
+    loc.mkdir(parents=True)
+    header = "Electrode,L,I,P,DesikanKilliany\n"
+    body = "".join(f"{e},{l},{i},{p},insula\n" for (e, l, i, p) in coord_rows)
+    (loc / "depth-wm.csv").write_text(header + body)
+
+
+@pytest.mark.skipif(not _HAS_BT, reason="BrainTreebank cache absent")
+@pytest.mark.parametrize("subject_id", (1, 2, 3, 4))
+def test_aligned_voltage_coords_row_identity(subject_id: int) -> None:
+    """coords[c] is the native (L,I,P) of voltage_electrode_order[c] — the invariant."""
+    order = voltage_electrode_order(_BT_CACHE, subject_id)
+    coords = aligned_voltage_coords(_BT_CACHE, subject_id)
+    assert coords.shape == (len(order), 3)
+    assert coords.dtype == np.float32
+    assert np.isfinite(coords).all()  # full coverage: every survivor has a coord row
+    truth = _depth_wm_coord_map(subject_id)
+    for c in {0, len(order) // 2, len(order) - 1}:
+        assert tuple(coords[c]) == truth[order[c]], f"row {c} desync"
+
+
+@pytest.mark.skipif(not _HAS_BT, reason="BrainTreebank cache absent")
+def test_aligned_voltage_support_with_coords_row_aligned() -> None:
+    """with_coords=True attaches coords aligned to support rows, present even where
+    valid=False (subject 4 has unmapped ventricle contacts)."""
+    supp = aligned_voltage_support(
+        _BT_CACHE, 4, trial_id=2, unmapped_policy="zero", with_coords=True
+    )
+    assert supp.coords is not None
+    assert supp.coords.shape == (len(supp.electrode_labels), 3)
+    assert np.isfinite(supp.coords).all()
+    # coords are independent of parcel validity — an unmapped (valid=False) row
+    # still carries its physical coordinate.
+    if (~supp.valid).any():
+        inv = int(np.flatnonzero(~supp.valid)[0])
+        assert np.isfinite(supp.coords[inv]).all()
+    truth = _depth_wm_coord_map(4)
+    step = max(1, len(supp.electrode_labels) // 5)
+    for c in range(0, len(supp.electrode_labels), step):
+        assert tuple(supp.coords[c]) == truth[supp.electrode_labels[c]]
+
+
+def test_aligned_voltage_coords_fails_loud_on_missing(tmp_path: Path) -> None:
+    """A voltage-order survivor with no depth-wm.csv row is a desync → ValueError."""
+    _write_synthetic_bt(
+        tmp_path,
+        labels=["E1", "E2", "E3"],
+        coord_rows=[("E1", 10, 20, 30), ("E2", 11, 21, 31)],  # E3 has no coord row
+    )
+    with pytest.raises(ValueError, match="desync"):
+        aligned_voltage_coords(tmp_path, 99)
+
+
+def test_aligned_voltage_coords_drops_corrupted_consistently(tmp_path: Path) -> None:
+    """A corrupted electrode drops from BOTH the voltage order and coords, in order."""
+    _write_synthetic_bt(
+        tmp_path,
+        labels=["E1", "E2", "E3"],
+        coord_rows=[("E1", 10, 20, 30), ("E2", 11, 21, 31), ("E3", 12, 22, 32)],
+        corrupted=["E2"],
+    )
+    order = voltage_electrode_order(tmp_path, 99)
+    coords = aligned_voltage_coords(tmp_path, 99)
+    assert order == ("E1", "E3")
+    assert coords.shape == (2, 3)
+    assert tuple(coords[0]) == (10.0, 20.0, 30.0)  # E1
+    assert tuple(coords[1]) == (12.0, 22.0, 32.0)  # E3 (E2 skipped, no shift)
 
 
 def test_load_public_bt_anatomy_cleans_electrode_labels(tmp_path: Path) -> None:
