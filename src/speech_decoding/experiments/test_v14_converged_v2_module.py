@@ -12,6 +12,10 @@ import torch
 
 from neuraltrain.optimizers import LightningOptimizer
 
+# Import registers WarmupCosine with the BaseLRScheduler discriminated union so
+# LightningOptimizer(scheduler={"name": "WarmupCosine", ...}) validates (same
+# registration path dispatch_v14 relies on).
+from speech_decoding.experiments.lr_schedule import WarmupCosine  # noqa: F401
 from speech_decoding.experiments.v14_converged_v2_module import (
     V14ConvergedV2BrainModule,
 )
@@ -237,6 +241,62 @@ def test_configure_optimizers_excludes_teacher():
     n_opt = sum(p.numel() for g in opt_obj.param_groups for p in g["params"])
     n_student = sum(p.numel() for p in m.model.parameters() if p.requires_grad)
     assert n_opt == n_student                                # teacher excluded
+
+
+def _find_warmup_scheduler(opt):
+    """Dig the _WarmupCosineLR out of whatever configure_optimizers returned."""
+    if isinstance(opt, dict):
+        sc = opt.get("lr_scheduler")
+        if isinstance(sc, dict):
+            sc = sc.get("scheduler")
+        return sc
+    return None
+
+
+def test_configure_optimizers_threads_warmup_horizon():
+    """Regression for the dropped-total_steps bug: WarmupCosine must receive the
+    training horizon from the trainer, else warmup_steps clamps to 0 and the LR is
+    a flat constant (the --warmup-steps no-op that caused the Run-B smoke storm)."""
+    warmup, total = 50, 200
+    m = _module()
+    m.optim_config = LightningOptimizer(
+        optimizer={"name": "AdamW", "lr": 1e-3, "kwargs": {"weight_decay": 0.0}},
+        scheduler={"name": "WarmupCosine", "warmup_steps": warmup,
+                   "min_lr_ratio": 1.0},
+        interval="step",
+    )
+    m._trainer = SimpleNamespace(estimated_stepping_batches=total)  # noqa: SLF001
+
+    opt = m.configure_optimizers()
+    sched = _find_warmup_scheduler(opt)
+    assert sched is not None, "scheduler missing from configure_optimizers"
+    # The bug: total_steps=None -> warmup_steps clamped to 0. The fix threads the
+    # horizon so the warmup window is preserved.
+    assert sched.warmup_steps == warmup, sched.warmup_steps
+    assert sched.total_steps == total
+
+    opt_obj = opt["optimizer"] if isinstance(opt, dict) else opt
+    peak = 1e-3
+    lr0 = opt_obj.param_groups[0]["lr"]
+    assert lr0 < peak, f"LR should ramp from ~0, got {lr0}"     # not flat at peak
+    for _ in range(warmup):
+        opt_obj.step()
+        sched.step()
+    lr_after = opt_obj.param_groups[0]["lr"]
+    assert abs(lr_after - peak) < 1e-9, lr_after                # reached peak
+
+
+def test_configure_optimizers_no_trainer_is_safe():
+    """No attached trainer (unit path) must not crash: horizon resolves to None
+    and the build degrades gracefully rather than raising."""
+    m = _module()
+    m.optim_config = LightningOptimizer(
+        optimizer={"name": "AdamW", "lr": 1e-3, "kwargs": {"weight_decay": 0.0}},
+        scheduler={"name": "WarmupCosine", "warmup_steps": 50, "min_lr_ratio": 1.0},
+        interval="step",
+    )
+    opt = m.configure_optimizers()      # no _trainer set
+    assert opt is not None
 
 
 def test_overfit_one_batch():

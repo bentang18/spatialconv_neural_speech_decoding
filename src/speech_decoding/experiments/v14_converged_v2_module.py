@@ -462,6 +462,12 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         """EMA tick once per optimiser step (after step, before zero_grad)."""
         self.model.ema_step()
 
+    def _estimated_total_steps(self) -> int | None:
+        try:
+            return int(self.trainer.estimated_stepping_batches)
+        except (RuntimeError, AttributeError):
+            return None
+
     def configure_optimizers(self):  # type: ignore[override]
         # Only the trainable params (the EMA teacher is requires_grad False, so it
         # is excluded by construction).
@@ -471,7 +477,18 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
             params, modules=(self.model,),
             optim_config=self.optim_config, exclude=self._wd_exclude_norms,
         )
-        return self.optim_config.build(params)
+        # Thread the training horizon into the scheduler build. Without it,
+        # WarmupCosine.build() gets total_steps=None and silently degrades to a
+        # CONSTANT LR (warmup_steps clamped to 0) — i.e. --warmup-steps becomes a
+        # no-op. This dropped-total_steps was the cause of the flat-1e-2 Run-B
+        # smoke (grad storm at the pre-decollapse window with zero warmup cushion).
+        total_steps = self._estimated_total_steps()
+        if total_steps is None:
+            return self.optim_config.build(params)
+        try:
+            return self.optim_config.build(params, total_steps=total_steps)
+        except TypeError:
+            return self.optim_config.build(params)
 
 
 __all__ = ["V14ConvergedV2BrainModule"]
