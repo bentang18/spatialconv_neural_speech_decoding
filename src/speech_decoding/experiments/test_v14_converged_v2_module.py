@@ -51,8 +51,16 @@ def _module(clip_len_s: float = 5.0, **kw) -> V14ConvergedV2BrainModule:
     )
 
 
+def _tiny_run_b_model() -> V14ConvergedV2:
+    return V14ConvergedV2Net(
+        d_model=16, n_heads=4, frontend_layers=1, latent_layers=1,
+        m2_pred_layers=1, m4_pred_layers=1, pred_dim=16, n_parcels=N_PARCELS,
+        m3_drop_frac=0.4, m3_min_keep=1,
+    ).build(0, 0)
+
+
 def _batch(B: int = 3, *, clip_len_s: float = 5.0, valid: torch.Tensor | None = None,
-           heterogeneous: bool = False):
+           heterogeneous: bool = False, coords: bool = False):
     """Synthetic session-homogeneous 2-band batch on the locked geometry. 6
     electrodes → 3 parcels (2 each) via a one-hot support CONSTANT across clips."""
     torch.manual_seed(0)
@@ -75,6 +83,9 @@ def _batch(B: int = 3, *, clip_len_s: float = 5.0, valid: torch.Tensor | None = 
     }
     if valid is not None:
         data["valid_mask"] = valid
+    if coords:
+        c = torch.randn(C, 3) * 10.0                 # session-static native-RAS mm
+        data["electrode_coords"] = c[None].expand(B, C, 3).contiguous()
     return SimpleNamespace(data=data)
 
 
@@ -93,7 +104,7 @@ def test_config_shape_fields_required():
 # ------------------------------------------------------------------ batch ingest
 def test_v2_inputs_derive_homogeneous_parcel():
     m = _module()
-    lfs, hga, poe = m._v2_inputs(_batch(B=3).data)
+    lfs, hga, poe, _coords = m._v2_inputs(_batch(B=3).data)
     assert lfs.shape[1] == 6 and hga.shape[1] == 6
     assert poe.shape == (6,)
     assert poe.tolist() == [5, 5, 9, 9, 20, 20]
@@ -112,7 +123,7 @@ def test_v2_inputs_drops_unmapped_electrode():
     m = _module()
     valid = torch.ones(3, 6, dtype=torch.bool)
     valid[:, 5] = False                                       # electrode 5 unmapped
-    lfs, hga, poe = m._v2_inputs(_batch(B=3, valid=valid).data)
+    lfs, hga, poe, _coords = m._v2_inputs(_batch(B=3, valid=valid).data)
     assert lfs.shape[1] == 5 and hga.shape[1] == 5
     assert poe.tolist() == [5, 5, 9, 9, 20]                   # electrode 5 (parcel 20) gone
 
@@ -140,6 +151,40 @@ def test_step_1s_clip():
     m = _module(clip_len_s=1.0)
     out = m._step(_batch(B=2, clip_len_s=1.0).data)
     assert torch.isfinite(out["loss"])
+
+
+# --------------------------------------------------------------- Run-B wiring
+def test_v2_inputs_returns_coords_when_present():
+    m = V14ConvergedV2BrainModule(
+        model=_tiny_run_b_model(), optim_config=_optim(), clip_len_s=5.0,
+    )
+    lfs, hga, poe, coords = m._v2_inputs(_batch(B=3, coords=True).data)
+    assert coords is not None and coords.shape == (6, 3)
+
+
+def test_v2_inputs_rejects_misaligned_coords():
+    m = _module()
+    data = _batch(B=2, coords=True).data
+    data["electrode_coords"] = data["electrode_coords"][:, :5]   # C mismatch
+    with pytest.raises(ValueError, match="align with support"):
+        m._v2_inputs(data)
+
+
+def test_run_b_step_produces_melec_loss():
+    m = V14ConvergedV2BrainModule(
+        model=_tiny_run_b_model(), optim_config=_optim(), clip_len_s=5.0,
+    )
+    out = m._step(_batch(B=3, coords=True).data)
+    assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
+    assert "loss_melec" in out and torch.isfinite(out["loss_melec"])
+
+
+def test_run_b_step_requires_coords():
+    m = V14ConvergedV2BrainModule(
+        model=_tiny_run_b_model(), optim_config=_optim(), clip_len_s=5.0,
+    )
+    with pytest.raises(ValueError, match="requires electrode_coords"):
+        m._step(_batch(B=2, coords=False).data)
 
 
 def test_mask_timing_probe_finite_and_flushes(monkeypatch):

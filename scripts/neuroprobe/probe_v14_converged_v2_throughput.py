@@ -66,7 +66,11 @@ def main() -> None:
     ap.add_argument("--active-parcels", type=int, default=16)
     ap.add_argument("--clip-len-s", type=float, default=5.0)
     ap.add_argument("--tube-ratio", type=float, default=0.25)
-    ap.add_argument("--untie-lfs", action="store_true", help="n_op=4 ablation")
+    ap.add_argument("--pool-op", choices=["shared", "band", "patch"], default=None,
+                    help="pool K/V typing: shared(1)/band(2)/patch(4); "
+                         "None => auto (Run-B=shared, else band)")
+    ap.add_argument("--untie-lfs", action="store_true",
+                    help="back-compat alias for --pool-op patch (n_op=4)")
     ap.add_argument("--m3-pred-layers", type=int, default=None,
                     help="Run-A master switch: M3 pool-inpaint head depth "
                          "(None => legacy 2-head assembly)")
@@ -74,6 +78,18 @@ def main() -> None:
                     help="per-head QK-norm on all towers (Run-A)")
     ap.add_argument("--support-weight", action="store_true",
                     help="Run-A: electrode-count weighted M3/M4 per-head loss")
+    ap.add_argument("--m3-drop-frac", type=float, default=None,
+                    help="Run-B master switch: whole-electrode drop fraction "
+                         "(None => Run-A/legacy; replaces M3 with the recon head)")
+    ap.add_argument("--m3-min-keep", type=int, default=3,
+                    help="Run-B: per-parcel survivor floor")
+    ap.add_argument("--w-melec", type=float, default=1.0, help="Run-B: recon loss weight")
+    ap.add_argument("--sigma-mm", type=float, default=12.0,
+                    help="Run-B: centroid-offset normalizer (mm)")
+    ap.add_argument("--geom-n-freqs", type=int, default=5,
+                    help="Run-B: relational Fourier bands")
+    ap.add_argument("--m2-hetero", action="store_true",
+                    help="Run-B: per-electrode (not parcel-uniform) M2 masking")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--no-backward", action="store_true", help="forward-only timing")
@@ -101,10 +117,16 @@ def main() -> None:
         n_parcels=args.n_parcels,
         k=args.k,
         tube_ratio=args.tube_ratio,
-        tie_lfs=not args.untie_lfs,
+        pool_op=args.pool_op or ("patch" if args.untie_lfs else None),
         m3_pred_layers=args.m3_pred_layers,
         qk_norm=args.qk_norm,
         support_weight=args.support_weight,
+        m3_drop_frac=args.m3_drop_frac,
+        m3_min_keep=args.m3_min_keep,
+        w_melec=args.w_melec,
+        sigma_mm=args.sigma_mm,
+        geom_n_freqs=args.geom_n_freqs,
+        m2_hetero=args.m2_hetero,
     )
     model = V14ConvergedV2(cfg).to(device)
     model.train(not args.no_backward)
@@ -123,6 +145,14 @@ def main() -> None:
     m2_mask, tube_mask = m2_mask.to(device), tube_mask.to(device)
     sh = compute_static_shapes_v2(m2_mask, tube_mask, membership, bands, k=cfg.k)
 
+    # Run-B extra inputs (native-RAS coords, whole-electrode drop, optional het M2).
+    coords = drop_mask = m2_elec = None
+    if cfg.run_b:
+        coords = (torch.randn(C, 3, generator=gen) * 10.0).to(device)   # native-RAS mm
+        drop_mask = model.sample_drop(B, membership.cpu(), gen).to(device)
+        if cfg.m2_hetero:
+            m2_elec = model.sample_m2_hetero(B, C, bands, gen).to(device)
+
     fwd = model
     if args.compile:
         fwd = torch.compile(model)
@@ -136,7 +166,8 @@ def main() -> None:
             else torch.autocast(device_type=device.type, enabled=False)
         )
         with ctx:
-            out = fwd(lfs, hga, poe, m2_mask, tube_mask, clip_len_s=args.clip_len_s)
+            out = fwd(lfs, hga, poe, m2_mask, tube_mask, clip_len_s=args.clip_len_s,
+                      coords=coords, drop_mask=drop_mask, m2_elec_mask=m2_elec)
             loss = out["loss"]
         if not args.no_backward:
             opt.zero_grad(set_to_none=True)

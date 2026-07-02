@@ -39,6 +39,7 @@ import speech_decoding.models  # noqa: F401  # registers V14ParcelPerceiver with
 from speech_decoding.experiments import Data, Experiment
 from speech_decoding.experiments.lr_schedule import WarmupCosine  # noqa: F401  # registers WarmupCosine BaseLRScheduler for the optim discriminator
 from speech_decoding.extractors.dk_support import V14DKHardSupportExtractor
+from speech_decoding.extractors.electrode_coords import V14ElectrodeCoordsExtractor
 from speech_decoding.extractors.ref_aug import (
     REF_MODES,
     RefAugMultiStftView,
@@ -623,6 +624,11 @@ def build_v14_experiment(
     # degenerate within-parcel std (=0) that poisons the heteroscedastic M4
     # precision weight. Applied identically to the support + valid_mask extractors.
     exclude_single_electrode_parcels: bool = False,
+    # Run-B: emit native-RAS electrode coords (voltage order, c_max-padded) so the
+    # converged-v2 masked-electrode-reconstruction head can query dropped electrodes
+    # by their centroid-relative offset. Gated (default off) to keep Run-A/legacy
+    # exca cache uids unchanged (a new batch key would perturb the segmenter hash).
+    emit_electrode_coords: bool = False,
     d_model: int = DEFAULT_D_MODEL,
     depth: int = DEFAULT_DEPTH,
     n_heads: int = DEFAULT_N_HEADS,
@@ -644,11 +650,12 @@ def build_v14_experiment(
     # (converged_frontend_layers/converged_latent_layers above) + tube_ratio
     # (converged_tube_ratio below) are SHARED with the 3STFT path (identical
     # meaning). REQUIRED-when-2band (no silent run defaults); inert otherwise.
-    # k / tie_lfs are v2 set-pool science knobs (seeds-per-parcel, n_op tie).
+    # k / pool_op are v2 set-pool science knobs (seeds-per-parcel, K/V typing).
     converged_v2_pred_dim: int | None = None,
     converged_v2_m2_pred_layers: int | None = None,
     converged_v2_m4_pred_layers: int | None = None,
     converged_v2_k: int = 2,
+    converged_v2_pool_op: str | None = None,
     converged_v2_untie_lfs: bool = False,
     # Converged-v2 Run-A bundle (default LEGACY for checkpoint resume). Setting
     # --converged-v2-m3-pred-layers is the master switch ⇒ M3 pool-inpaint head +
@@ -662,6 +669,15 @@ def build_v14_experiment(
     converged_v2_w_m3: float = 1.0,
     converged_v2_w_m4: float = 1.0,
     converged_v2_support_weight: bool = False,
+    # Run-B masked-electrode-prediction knobs (default off ⇒ Run-A/legacy). Setting
+    # ``m3_drop_frac`` (ρ) REPLACES the M3 pool-inpaint head with the native-RAS
+    # reconstruction head and auto-enables the coords extractor.
+    converged_v2_m3_drop_frac: float | None = None,
+    converged_v2_m3_min_keep: int = 3,
+    converged_v2_w_melec: float = 1.0,
+    converged_v2_sigma_mm: float = 12.0,
+    converged_v2_geom_n_freqs: int = 4,
+    converged_v2_m2_hetero: bool = False,
     # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
     # λ sister sweeps override). Inert on raw/2stft.
     converged_lambda_m2: float = 1.0,
@@ -1804,6 +1820,17 @@ def build_v14_experiment(
             "support": dk_extractor,
             "valid_mask": valid_mask_extractor,
         }
+        if emit_electrode_coords or converged_v2_m3_drop_frac is not None:
+            # Run-B: native-RAS coords in voltage order (aligns row-for-row with
+            # support/valid_mask ⇒ coords[c] ↔ support[c] ↔ token[c]).
+            coords_extractor = V14ElectrodeCoordsExtractor(
+                event_types="Ieeg", bt_root=bt_root, c_max=c_max,
+                electrode_set=electrode_set,
+            )
+            _apply_extractor_cache(
+                coords_extractor, "electrode_coords", extractor_cache_folder
+            )
+            segmenter_extractors["electrode_coords"] = coords_extractor
     else:
         segmenter_extractors = {
             "electrode_tokens": electrode_tokens_extractor,
@@ -2302,6 +2329,15 @@ def build_v14_experiment(
             "w_m4": converged_v2_w_m4,
             "support_weight": converged_v2_support_weight,
         }
+        # Run-B bundle (default off ⇒ m3_drop_frac None ⇒ Run-A/legacy assembly).
+        _v2_run_b = {
+            "m3_drop_frac": converged_v2_m3_drop_frac,
+            "m3_min_keep": converged_v2_m3_min_keep,
+            "w_melec": converged_v2_w_melec,
+            "sigma_mm": converged_v2_sigma_mm,
+            "geom_n_freqs": converged_v2_geom_n_freqs,
+            "m2_hetero": converged_v2_m2_hetero,
+        }
         return V14ConvergedV2Experiment(
             data=data,
             infra=infra_cfg,
@@ -2315,9 +2351,17 @@ def build_v14_experiment(
                 "n_parcels": k_parcels,
                 **_v2_shape,
                 "k": converged_v2_k,
-                "tie_lfs": not converged_v2_untie_lfs,
+                # Pool K/V typing: explicit --pool-op wins; --untie-lfs is the
+                # back-compat alias for "patch"; else None ⇒ model auto-resolves
+                # (Run-B ⇒ shared/n_op=1, Run-A/legacy ⇒ band/n_op=2).
+                "pool_op": (
+                    converged_v2_pool_op
+                    if converged_v2_pool_op is not None
+                    else ("patch" if converged_v2_untie_lfs else None)
+                ),
                 **_v2_model_knobs,
                 **_v2_run_a,
+                **_v2_run_b,
             },
             # SSL clip-length clock (sized the cached STFT; the v2 model derives its
             # bands from this float via bands_for_clip_len).
@@ -2825,10 +2869,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--converged-v2-k", dest="converged_v2_k",
                    type=int, default=2,
                    help="2band: set-pool seeds per parcel (k). Default 2.")
+    p.add_argument("--converged-v2-pool-op", dest="converged_v2_pool_op",
+                   choices=["shared", "band", "patch"], default=None,
+                   help="2band: pool K/V read-operator typing — shared (n_op=1, "
+                        "plain PMA), band (n_op=2, LFS-tied), patch (n_op=4, "
+                        "per-freq-patch). Default None ⇒ auto (Run-B=shared, "
+                        "Run-A/legacy=band). band/patch are the ablations.")
     p.add_argument("--converged-v2-untie-lfs", dest="converged_v2_untie_lfs",
                    action="store_true",
-                   help="2band: UNTIE the LFS/HGA pool operators (n_op=4 instead of "
-                        "the tied n_op=2 default — the first set-pool ablation).")
+                   help="2band: back-compat alias for --converged-v2-pool-op patch "
+                        "(n_op=4). Ignored if --converged-v2-pool-op is given.")
     p.add_argument("--converged-v2-m3-pred-layers", dest="converged_v2_m3_pred_layers",
                    type=int, default=None,
                    help="2band Run-A MASTER SWITCH: set ⇒ M3 pool-inpaint head "
@@ -2852,6 +2902,34 @@ def _parser() -> argparse.ArgumentParser:
                    help="2band Run-A: weight each M3/M4 parcel's loss by its "
                         "electrode count n_elec (convex weighted mean ÷ Σ n_elec) "
                         "— a precision prior; scale-preserving. M2 unweighted.")
+    p.add_argument("--converged-v2-m3-drop-frac", dest="converged_v2_m3_drop_frac",
+                   type=float, default=None,
+                   help="2band Run-B MASTER SWITCH (ρ): set ⇒ REPLACE the M3 pool-"
+                        "inpaint head with the masked-electrode reconstruction head "
+                        "(whole-electrode drop + native-RAS relational recon off the "
+                        "k pool seeds). Auto-enables the coords extractor. Unset ⇒ "
+                        "Run-A/legacy.")
+    p.add_argument("--converged-v2-m3-min-keep", dest="converged_v2_m3_min_keep",
+                   type=int, default=3,
+                   help="2band Run-B: survivor floor — each parcel keeps ≥ this many "
+                        "electrodes after the drop (default 3).")
+    p.add_argument("--converged-v2-w-melec", dest="converged_v2_w_melec",
+                   type=float, default=1.0,
+                   help="2band Run-B: masked-electrode recon loss weight (default 1.0).")
+    p.add_argument("--converged-v2-sigma-mm", dest="converged_v2_sigma_mm",
+                   type=float, default=12.0,
+                   help="2band Run-B: native-RAS offset scale-normalizer in mm "
+                        "(measured RMS centroid offset ≈ 12).")
+    p.add_argument("--converged-v2-geom-n-freqs", dest="converged_v2_geom_n_freqs",
+                   type=int, default=4,
+                   help="2band Run-B: number of Fourier frequencies in the relative-"
+                        "geometry features (default 4, ~6–30 mm band = [0.5σ, 2.5σ]).")
+    p.add_argument("--converged-v2-m2-hetero", dest="converged_v2_m2_hetero",
+                   action="store_true",
+                   help="2band Run-B: per-electrode HETEROGENEOUS M2 masking (each "
+                        "electrode holds out its OWN cells; pool blocks them). Off ⇒ "
+                        "parcel-uniform (all electrodes in a parcel mask the same "
+                        "cells). Swept flag — keep both arms for the A/B.")
     p.add_argument("--converged-lambda-m2", dest="converged_lambda_m2",
                    type=float, default=1.0,
                    help="3stft: M2 loss-term weight (neutral 1.0).")
@@ -4191,6 +4269,7 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_v2_m2_pred_layers=args.converged_v2_m2_pred_layers,
         converged_v2_m4_pred_layers=args.converged_v2_m4_pred_layers,
         converged_v2_k=args.converged_v2_k,
+        converged_v2_pool_op=args.converged_v2_pool_op,
         converged_v2_untie_lfs=args.converged_v2_untie_lfs,
         converged_v2_m3_pred_layers=args.converged_v2_m3_pred_layers,
         converged_v2_qk_norm=args.converged_v2_qk_norm,
@@ -4198,6 +4277,12 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_v2_w_m3=args.converged_v2_w_m3,
         converged_v2_w_m4=args.converged_v2_w_m4,
         converged_v2_support_weight=args.converged_v2_support_weight,
+        converged_v2_m3_drop_frac=args.converged_v2_m3_drop_frac,
+        converged_v2_m3_min_keep=args.converged_v2_m3_min_keep,
+        converged_v2_w_melec=args.converged_v2_w_melec,
+        converged_v2_sigma_mm=args.converged_v2_sigma_mm,
+        converged_v2_geom_n_freqs=args.converged_v2_geom_n_freqs,
+        converged_v2_m2_hetero=args.converged_v2_m2_hetero,
         converged_lambda_m2=args.converged_lambda_m2,
         converged_lambda_m4=args.converged_lambda_m4,
         converged_m2_hg_start_rate=args.converged_m2_hg_start_rate,

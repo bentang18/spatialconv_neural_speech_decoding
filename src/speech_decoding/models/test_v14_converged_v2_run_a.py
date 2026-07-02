@@ -168,6 +168,34 @@ def test_per_head_loss_self_normalized_and_weighted():
     assert torch.allclose(out["loss"], torch.tensor(0.5 + 2.0 * 2.0 + 3.0 * 1.0))
 
 
+def test_per_head_loss_melec_term_added():
+    """Run-B: melec head adds w_melec·L_melec (self-normalized L1); omitting it
+    leaves the loss byte-identical (Run-A back-compat)."""
+    d = 8
+    m2p, m2t = torch.zeros(10, d), torch.full((10, d), 0.5)
+    m3p, m3t = torch.zeros(7, d), torch.full((7, d), 2.0)
+    m4p, m4t = torch.zeros(5, d), torch.full((5, d), 1.0)
+    mep, met = torch.zeros(6, d), torch.full((6, d), 3.0)     # err 3.0
+    base = converged_v2_loss_per_head(m2p, m2t, m3p, m3t, m4p, m4t)
+    out = converged_v2_loss_per_head(
+        m2p, m2t, m3p, m3t, m4p, m4t, melec_pred=mep, melec_target=met, w_melec=0.5
+    )
+    assert "loss_melec" not in base                          # off by default
+    assert torch.allclose(out["loss_melec"], torch.tensor(3.0))
+    assert torch.allclose(out["loss"], base["loss"] + 0.5 * 3.0)
+    assert torch.allclose(out["ratio_melec_m4"], torch.tensor(3.0))  # l_melec/l_m4
+
+
+def test_per_head_loss_melec_detaches_target():
+    p = torch.zeros(4, 6, requires_grad=True)
+    t = torch.ones(4, 6, requires_grad=True)
+    mp = torch.zeros(4, 6, requires_grad=True)
+    mt = torch.ones(4, 6, requires_grad=True)
+    out = converged_v2_loss_per_head(p, t, p, t, p, t, melec_pred=mp, melec_target=mt)
+    out["loss"].backward()
+    assert mp.grad is not None and mt.grad is None
+
+
 def test_per_head_loss_detaches_target():
     """The target is stop-grad'd: grad flows to preds only."""
     p = torch.zeros(4, 6, requires_grad=True)

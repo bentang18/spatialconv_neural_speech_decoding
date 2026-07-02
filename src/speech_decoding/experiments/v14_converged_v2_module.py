@@ -106,8 +106,10 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         }
 
     # ----------------------------------------------------------- batch ingest
-    def _v2_inputs(self, data: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
-        """Map a batch dict to ``(lfs, hga, parcel_of_electrode (C,))``.
+    def _v2_inputs(
+        self, data: dict[str, Tensor]
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Map a batch dict to ``(lfs, hga, parcel_of_electrode (C,), coords (C,3)|None)``.
 
         ``parcel_of_electrode = support.argmax(-1)`` (DKT support is one-hot, so
         argmax is the exact hard parcel id). The v2 model is session-homogeneous —
@@ -126,6 +128,12 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         lfs = data["electrode_tokens_lfs"]
         hga = data["electrode_tokens_hga"]
         support = data["support"]
+        coords = data.get("electrode_coords")                    # (B,C,3) native-RAS
+        if coords is not None and coords.shape[1] != support.shape[1]:
+            raise ValueError(
+                f"electrode_coords C={coords.shape[1]} must align with support "
+                f"C={support.shape[1]} (same voltage order) — alignment invariant"
+            )
         valid = data.get("valid_mask")
         if valid is not None:
             valid = valid.to(torch.bool)
@@ -139,6 +147,8 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
                 lfs = lfs[:, keep]
                 hga = hga[:, keep]
                 support = support[:, keep]
+                if coords is not None:
+                    coords = coords[:, keep]
         ppe = support.argmax(dim=-1)                              # (B, C')
         if not torch.equal(ppe, ppe[:1].expand_as(ppe)):
             raise ValueError(
@@ -146,7 +156,11 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
                 "be constant across clips (use the same-session sampler)"
             )
         poe = ppe[0]                                              # (C',)
-        return lfs, hga, poe
+        # Coords are session-static ⇒ constant across clips; take one row set.
+        coords1: Tensor | None = None
+        if coords is not None:
+            coords1 = coords[0]                                   # (C',3)
+        return lfs, hga, poe, coords1
 
     def _monitor_due(self) -> bool:
         """Monitor cadence: ``global_step % N == 0``. ``global_step`` is 0 (and may
@@ -163,7 +177,7 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         """Pure loss path (testable without a trainer): ingest → sample masks →
         ``model.forward``. Returns the converged-v2 loss dict (loss + per-term
         diagnostics)."""
-        lfs, hga, poe = self._v2_inputs(data)
+        lfs, hga, poe, coords = self._v2_inputs(data)
         bands = bands_for_clip_len(self.clip_len_s)
         # Kineto-free per-section wall timing (V14_MASK_TIMING). Armed + training
         # only ⇒ off ⇒ not a single extra call. 4 perf_counter stamps split the
@@ -178,9 +192,30 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         B = lfs.shape[0]
         self._last_batch_size = B  # per-rank micro-batch, for the monitor's B_eff
         m2, tube = self.model.sample_masks(B, membership, bands, self._mask_gen)
+        # Run-B: whole-electrode drop (dataloader-side, count-uniform per parcel) +
+        # native-RAS coords required for the masked-electrode reconstruction head.
+        drop: Tensor | None = None
+        m2_elec: Tensor | None = None
+        if self.model.cfg.run_b:
+            if coords is None:
+                raise ValueError(
+                    "Run-B requires electrode_coords in the batch (register "
+                    "V14ElectrodeCoordsExtractor); none present"
+                )
+            drop = self.model.sample_drop(B, membership, self._mask_gen)
+            if self.model.cfg.m2_hetero:
+                m2_elec = self.model.sample_m2_hetero(
+                    B, poe.shape[0], bands, self._mask_gen
+                )
         if mt:
             _t.append(time.perf_counter())
         m2, tube = m2.to(lfs.device), tube.to(lfs.device)
+        if coords is not None:
+            coords = coords.to(lfs.device)
+        if drop is not None:
+            drop = drop.to(lfs.device)
+        if m2_elec is not None:
+            m2_elec = m2_elec.to(lfs.device)
         if mt:
             _t.append(time.perf_counter())
         # On a monitor-cadence training step request detached health taps; stash
@@ -190,7 +225,8 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         want_taps = self.training and self._monitor_due()
         out = self.model(
             lfs, hga, poe, m2, tube,
-            clip_len_s=self.clip_len_s, return_taps=want_taps,
+            clip_len_s=self.clip_len_s, coords=coords, drop_mask=drop,
+            m2_elec_mask=m2_elec, return_taps=want_taps,
         )
         if want_taps:
             self._last_taps = {

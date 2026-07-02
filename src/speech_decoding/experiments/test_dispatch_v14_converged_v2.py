@@ -5,7 +5,7 @@ Verifies (without BT data — a tmp bt_root constructs the Experiment object but
 never builds loaders): the 2band path returns a V14ConvergedV2Experiment with a
 V14ConvergedV2Net config of the named shape, emits the two band keys + support +
 valid_mask into the segmenter, requires the v2 shape (no silent run defaults),
-threads the science knobs (k / tie_lfs / tube_ratio / ema_tau) onto the MODEL
+threads the science knobs (k / pool_op / tube_ratio / ema_tau) onto the MODEL
 config, and — the regression guard — leaves the raw / 2stft / 3stft paths
 byte-identical."""
 
@@ -55,7 +55,7 @@ def test_2band_config_carries_named_shape(tmp_path) -> None:
 def test_2band_science_knob_defaults(tmp_path) -> None:
     cfg = _v2(tmp_path).brain_model_config
     assert cfg.k == 2                       # locked first-run seeds/parcel
-    assert cfg.tie_lfs is True              # tied n_op=2 default
+    assert cfg.pool_op is None              # auto (Run-A/legacy ⇒ band n_op=2)
     assert cfg.tube_ratio == 0.25           # config locked default (none passed)
     # ema_tau is the RUN momentum: the dispatch resolves it to DEFAULT_EMA_TAU
     # (the single source of truth for all converged frontends), which overrides the
@@ -69,9 +69,25 @@ def test_2band_science_knobs_thread(tmp_path) -> None:
         converged_tube_ratio=0.30, ema_tau=0.97,
     ).brain_model_config
     assert cfg.k == 3
-    assert cfg.tie_lfs is False             # --converged-v2-untie-lfs ⇒ n_op=4
+    assert cfg.pool_op == "patch"           # --untie-lfs alias ⇒ patch (n_op=4)
     assert cfg.tube_ratio == 0.30
     assert cfg.ema_tau == pytest.approx(0.97)
+
+
+def test_2band_pool_op_explicit_beats_untie_alias(tmp_path) -> None:
+    # explicit --converged-v2-pool-op wins over the --untie-lfs back-compat alias
+    cfg = _v2(
+        tmp_path, converged_v2_pool_op="band", converged_v2_untie_lfs=True,
+    ).brain_model_config
+    assert cfg.pool_op == "band"
+
+
+def test_2band_run_b_default_pool_op_resolves_shared(tmp_path) -> None:
+    # Run-B (m3_drop_frac set), no pool_op ⇒ Net carries None, model resolves shared
+    cfg = _v2(tmp_path, converged_v2_m3_drop_frac=0.5).brain_model_config
+    assert cfg.pool_op is None
+    model = cfg.build(n_in_channels=1, n_outputs=1)
+    assert model.pool.W_K.shape[0] == 1     # n_op=1 (shared / plain PMA)
 
 
 def test_2band_clip_len_threads(tmp_path) -> None:
@@ -94,6 +110,49 @@ def test_2band_segmenter_emits_two_band_keys(tmp_path) -> None:
 def test_2band_x_name_is_lfs_peek_key(tmp_path) -> None:
     xp = _v2(tmp_path)
     assert xp.x_name == "electrode_tokens_lfs"
+
+
+# --------------------------------------------------------------- Run-B wiring
+def test_2band_run_b_config_carries_knobs(tmp_path) -> None:
+    """Setting the Run-B master switch (m3_drop_frac) threads the recon knobs into
+    the V14ConvergedV2Net config."""
+    cfg = _v2(
+        tmp_path, converged_v2_m3_drop_frac=0.4, converged_v2_m3_min_keep=3,
+        converged_v2_w_melec=0.5, converged_v2_sigma_mm=12.0,
+        converged_v2_geom_n_freqs=6,
+    ).brain_model_config
+    assert cfg.m3_drop_frac == 0.4
+    assert cfg.m3_min_keep == 3
+    assert cfg.w_melec == 0.5
+    assert cfg.sigma_mm == 12.0
+    assert cfg.geom_n_freqs == 6
+
+
+def test_2band_default_is_run_a_no_run_b_knobs(tmp_path) -> None:
+    cfg = _v2(tmp_path).brain_model_config
+    assert cfg.m3_drop_frac is None                     # default ⇒ Run-A/legacy
+    assert cfg.m2_hetero is False                       # parcel-uniform by default
+
+
+def test_2band_run_b_m2_hetero_threads(tmp_path) -> None:
+    cfg = _v2(
+        tmp_path, converged_v2_m3_drop_frac=0.4, converged_v2_m2_hetero=True,
+    ).brain_model_config
+    assert cfg.m2_hetero is True
+
+
+def test_2band_run_b_emits_coords_extractor(tmp_path) -> None:
+    """Run-B (m3_drop_frac set) auto-registers the native-RAS coords extractor."""
+    xp = _v2(tmp_path, converged_v2_m3_drop_frac=0.4)
+    keys = set(xp.data.segmenter.extractors)
+    assert "electrode_coords" in keys
+
+
+def test_2band_run_a_omits_coords_extractor(tmp_path) -> None:
+    """No coords key on the default (Run-A) path — keeps the segmenter hash / exca
+    cache uid unchanged for existing runs."""
+    xp = _v2(tmp_path)
+    assert "electrode_coords" not in set(xp.data.segmenter.extractors)
 
 
 @pytest.mark.parametrize(
@@ -161,7 +220,7 @@ def test_parser_accepts_2band_and_v2_args() -> None:
         "--converged-frontend-layers", "6", "--converged-latent-layers", "8",
         "--converged-v2-pred-dim", "128",
         "--converged-v2-m2-pred-layers", "3", "--converged-v2-m4-pred-layers", "6",
-        "--converged-v2-k", "2", "--converged-v2-untie-lfs",
+        "--converged-v2-k", "2", "--converged-v2-pool-op", "shared",
         "--group-by-session",
     ])
     assert a.frontend == "2band"
@@ -169,7 +228,8 @@ def test_parser_accepts_2band_and_v2_args() -> None:
     assert a.converged_v2_m2_pred_layers == 3
     assert a.converged_v2_m4_pred_layers == 6
     assert a.converged_v2_k == 2
-    assert a.converged_v2_untie_lfs is True
+    assert a.converged_v2_pool_op == "shared"
+    assert a.converged_v2_untie_lfs is False
     # The `--frontend 2band requires --group-by-session` SystemExit guard lives
     # inline in main() (alongside the static-forward guards, which the existing
     # dispatch test also does not unit-test); the AUTHORITATIVE enforcement is the

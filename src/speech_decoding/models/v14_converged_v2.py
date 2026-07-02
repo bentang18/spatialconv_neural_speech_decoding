@@ -15,8 +15,8 @@ Frontend (memory project_frontend_chang_2band_hga_lfs_2026_06_25, fs=2048):
 Totals 22 tok/1s, 110/5s (per electrode). Both MAGNITUDE (in_channels=1; no
 phase, no beta). RoPE shares one physical-time clock; LFS:HGA stride = 1024:128
 = 8:1 (500 ms : 62.5 ms). 4 freq-patches total (1 HGA + 3 LFS) carry the freq
-identity (4 freq-embeds at the frontend; the pool's freq-specific weights map
-these → 2 reading operators tied-default / 4 untied-ablation).
+identity (4 freq-embeds at the frontend; the pool's K/V read-operator typing is
+``pool_op``: 1 shared / 2 band-tied / 4 per-patch — see ``cell_operator_index``).
 
 Unlike :class:`v14_converged.BandSpec` (uniform ``kernel_freq``), LFS's 3 log
 groups have DIFFERENT bin counts (4/8/16) → a single ``fk`` cannot express them.
@@ -405,22 +405,19 @@ def _hga_fill_not_trim(
     return mask
 
 
-def sample_m2_masks_v2(
-    B: int,
-    P: int,
+def _sample_m2_rows(
+    R: int,
     bands: tuple[BandSpecV2, ...],
     generator: torch.Generator,
-    cfg: M2MaskConfigV2 = M2MaskConfigV2(),
+    cfg: M2MaskConfigV2,
 ) -> Tensor:
-    """Parcel-uniform M2 masks ``(B, P, S)`` bool (True = held out / an M2 target).
-
-    Constant count ``n_mask = n_mask_hga + T_lfs`` per parcel. VECTORIZED over all
-    ``B·P`` parcels — no per-parcel/per-electrode python loop. Token order matches
+    """Core M2 sampler over ``R`` independent rows → ``(R, S)`` bool, constant count
+    ``n_mask = n_mask_hga + T_lfs`` per row. Row = one parcel (uniform) or one
+    electrode (heterogeneous) — the caller reshapes. Token order matches
     :func:`token_metadata`: LFS groups 0/1/2 (each ``T_lfs``) then HGA (``T_hga``)."""
     lfs, hga = bands
     if (lfs.name, hga.name) != ("lfs", "hga"):
         raise ValueError(f"expected (lfs, hga) bands, got {(lfs.name, hga.name)}")
-    R = B * P
     T_lfs = lfs.n_time_patches
     n_lfs_groups = lfs.n_freq_patches
     target_hga = n_mask_hga(hga, cfg)
@@ -434,9 +431,38 @@ def sample_m2_masks_v2(
     lfs_mask = lfs_mask.reshape(R, n_lfs_groups * T_lfs)       # (R, n_lfs cells)
 
     hga_mask = _hga_fill_not_trim(R, hga.n_time_patches, target_hga, cfg.hg_span, generator)
+    return torch.cat([lfs_mask, hga_mask], dim=1)             # (R, S)
 
-    m2 = torch.cat([lfs_mask, hga_mask], dim=1)               # (R, S)
-    return m2.reshape(B, P, -1)
+
+def sample_m2_masks_v2(
+    B: int,
+    P: int,
+    bands: tuple[BandSpecV2, ...],
+    generator: torch.Generator,
+    cfg: M2MaskConfigV2 = M2MaskConfigV2(),
+) -> Tensor:
+    """Parcel-uniform M2 masks ``(B, P, S)`` bool (True = held out / an M2 target).
+
+    Constant count ``n_mask = n_mask_hga + T_lfs`` per parcel. VECTORIZED over all
+    ``B·P`` parcels — no per-parcel/per-electrode python loop."""
+    return _sample_m2_rows(B * P, bands, generator, cfg).reshape(B, P, -1)
+
+
+def sample_m2_masks_hetero_v2(
+    B: int,
+    C: int,
+    bands: tuple[BandSpecV2, ...],
+    generator: torch.Generator,
+    cfg: M2MaskConfigV2 = M2MaskConfigV2(),
+) -> Tensor:
+    """Run-B heterogeneous per-ELECTRODE M2 masks ``(B, C, S)`` bool — same constant
+    count per row as the parcel-uniform sampler, but each electrode masks its OWN
+    cells independently. Within a parcel, electrodes now disagree on which cells are
+    held out, so the pool must be told to skip masked electrode-cells (its ``block``
+    arg) or the zero-filled held-out token leaks into the seeds. VECTORIZED over
+    ``B·C``. Membership is NOT consulted — padded electrodes get masks too; the
+    caller intersects with the voltage/support mask when it applies the block."""
+    return _sample_m2_rows(B * C, bands, generator, cfg).reshape(B, C, -1)
 
 
 def sample_parcel_tube_v2(
@@ -453,6 +479,48 @@ def sample_parcel_tube_v2(
     tube = torch.zeros(B, P, dtype=torch.bool)
     tube.scatter_(1, idx, True)
     return tube
+
+
+def electrode_drop_count(membership: Tensor, drop_frac: float, min_keep: int) -> Tensor:
+    """Per-parcel whole-electrode drop count ``n_drop(p)`` ``(P,)`` long (Run-B).
+
+    ``n_drop = clamp(round(drop_frac·n_elec), 0, max(n_elec − min_keep, 0))`` per
+    parcel — a survivor FLOOR: at least ``min_keep`` electrodes always stay visible,
+    so a parcel with ``n_elec ≤ min_keep`` is EXEMPT (drops nothing, serves as pure
+    visible context). Deterministic in ``n_elec`` ⇒ constant per parcel across clips
+    (only WHICH electrodes drop varies) ⇒ the static-shape contract holds: the total
+    dropped-per-clip ``Σ_p n_drop(p)`` is clip-invariant."""
+    if not 0.0 <= drop_frac <= 1.0:
+        raise ValueError(f"drop_frac must be in [0,1], got {drop_frac}")
+    if min_keep < 1:
+        raise ValueError(f"min_keep must be ≥1, got {min_keep}")
+    n_elec = membership.sum(1)                                    # (P,) long
+    upper = (n_elec - min_keep).clamp(min=0)                      # survivor floor
+    raw = torch.round(drop_frac * n_elec.to(torch.float32)).long()
+    return raw.clamp(min=0).minimum(upper)                        # (P,)
+
+
+def sample_electrode_drop_v2(
+    B: int, membership: Tensor, drop_frac: float, min_keep: int, generator: torch.Generator
+) -> Tensor:
+    """Per-clip whole-electrode drop mask ``(B, C)`` bool (True = dropped = an
+    M-elec reconstruction target for the Run-B pool head).
+
+    Each parcel drops EXACTLY ``electrode_drop_count(p)`` of its own electrodes,
+    chosen uniformly at random per clip (constant count ⇒ static shapes). Dropped
+    electrodes are always parcel members; membership is a partition so the per-parcel
+    selections are disjoint. VECTORIZED over ``B`` and ``P`` (argsort-of-rand =
+    per-(clip,parcel) randperm), no python loop over parcels/electrodes."""
+    P, C = membership.shape
+    ndrop = electrode_drop_count(membership, drop_frac, min_keep)  # (P,)
+    # Rank each parcel's members by a per-(clip,parcel) random key; non-members sort
+    # last (+inf) so they are never among the first ``ndrop`` picks.
+    scores = torch.rand(B, P, C, generator=generator).masked_fill(
+        ~membership[None], float("inf")
+    )
+    rank = scores.argsort(dim=2).argsort(dim=2)                    # (B,P,C) 0-based rank
+    drop_pp = rank < ndrop[None, :, None]                          # (B,P,C) first ndrop members
+    return (drop_pp & membership[None]).any(dim=1)                 # (B,C) partition ⇒ exact
 
 
 @dataclass(frozen=True)
@@ -568,21 +636,33 @@ def compute_static_shapes_v2(
 
 
 def cell_operator_index(
-    bands: tuple[BandSpecV2, ...] = BANDS_V2, *, tie_lfs: bool = True
+    bands: tuple[BandSpecV2, ...] = BANDS_V2, *, op_mode: str = "band"
 ) -> Tensor:
     """``(S,)`` long → which pool reading-operator (`W_K`/`W_V`) each cell uses.
 
-    TIED DEFAULT (`tie_lfs=True`, `n_op=2`): operator = ``band_id`` — the 3 LFS
-    log groups SHARE one operator (0), HGA its own (1). UNTIED ablation
-    (`tie_lfs=False`, `n_op=4`): operator = ``freq_patch_id`` (LFS 0/1/2, HGA 3).
+    ``op_mode`` selects the band-typing granularity of the pool's K/V read:
+      - ``"shared"`` (``n_op=1``): every cell uses ONE operator (all zeros). The
+        pool is a plain PMA / Perceiver pooler — band identity already rides in
+        via separate cells + the frontend's band-colored tokens, so a shared
+        read is the simplest grounded default (Run-B first arm).
+      - ``"band"`` (``n_op=2``): operator = ``band_id`` — the 3 LFS log groups
+        SHARE operator 0, HGA gets operator 1. (Run-A/legacy default.)
+      - ``"patch"`` (``n_op=4``): operator = ``freq_patch_id`` (LFS 0/1/2, HGA 3)
+        — the untied ablation, each freq-patch its own K/V.
     The exact integer labels are immaterial; what matters is the grouping +
-    that ``W_K`` is sized to ``n_operators(tie_lfs)``."""
+    that ``W_K`` is sized to ``n_operators(op_mode)``."""
     band_id, freq_patch_id, _ = token_metadata(bands)
-    return band_id.clone() if tie_lfs else freq_patch_id.clone()
+    if op_mode == "shared":
+        return torch.zeros_like(band_id)
+    if op_mode == "band":
+        return band_id.clone()
+    if op_mode == "patch":
+        return freq_patch_id.clone()
+    raise ValueError(f"op_mode must be shared|band|patch, got {op_mode!r}")
 
 
-def n_operators(tie_lfs: bool = True) -> int:
-    return 2 if tie_lfs else 4
+def n_operators(op_mode: str = "band") -> int:
+    return {"shared": 1, "band": 2, "patch": 4}[op_mode]
 
 
 def active_parcels(parcel_of_electrode: Tensor) -> tuple[Tensor, Tensor]:
@@ -596,6 +676,140 @@ def active_parcels(parcel_of_electrode: Tensor) -> tuple[Tensor, Tensor]:
     parcel_labels = torch.unique(parcel_of_electrode)            # sorted, P
     membership = parcel_of_electrode[None, :] == parcel_labels[:, None]
     return parcel_labels, membership
+
+
+class RelativeGeometry(nn.Module):
+    """Native-RAS relative positional bias for the Run-B spatial pool (2026-07-01).
+
+    Maps a centroid-relative offset Δ (mm, native subject space) to a per-head
+    additive attention-logit bias. Δ is normalized by ``sigma_mm`` (the MEASURED
+    ~12 mm RMS within-parcel centroid offset — cohort of 7, 116 parcels), Fourier-
+    featurized at ``n_freqs`` geometric wavelengths spanning ``wl_min_sigma``·σ
+    (~6 mm — resolves adjacent electrodes for the reconstruction query; measured NN
+    spacing ~3.2 mm) to ``wl_max_sigma``·σ (~30 mm ≈ the 95th-pct 24.7 mm parcel
+    extent — the coarsest STRUCTURED scale), PLUS the raw linear offset. The band
+    stops at the parcel extent because longer-range monotonic decay + direction are
+    already carried by the raw linear term, so wider Fourier octaves just duplicate
+    it. A tiny MLP → ``n_heads`` scalars.
+
+    ISOTROPIC (one σ, all axes): the P-axis anisotropy (std ~2× L/I) is a shaft-
+    sampling artifact, NOT coupling physics, so the mm-metric stays axis-symmetric
+    for cross-subject transfer. Δ is relative ⇒ translation-invariant by
+    construction; per-axis Fourier preserves DIRECTION (sin is odd), which the
+    reconstruction query needs to disambiguate opposite equidistant electrodes.
+    Last layer zero-init ⇒ the bias starts at exactly 0 (pool = pure content
+    attention at init; geometry is learned in).
+    """
+
+    def __init__(
+        self,
+        n_heads: int,
+        *,
+        sigma_mm: float = 12.0,
+        n_freqs: int = 4,
+        wl_min_sigma: float = 0.5,
+        wl_max_sigma: float = 2.5,
+        hidden: int = 64,
+    ) -> None:
+        super().__init__()
+        if n_freqs < 1:
+            raise ValueError(f"n_freqs must be ≥1, got {n_freqs}")
+        if not 0.0 < wl_min_sigma < wl_max_sigma:
+            raise ValueError(f"need 0<wl_min_sigma<wl_max_sigma, got {wl_min_sigma},{wl_max_sigma}")
+        self.n_heads = n_heads
+        self.sigma_mm = float(sigma_mm)
+        # geometric wavelengths (in σ units) → angular frequencies ω=2π/λ.
+        wl = torch.logspace(math.log10(wl_min_sigma), math.log10(wl_max_sigma), n_freqs)
+        self.register_buffer("omega", 2.0 * math.pi / wl)            # (n_freqs,)
+        feat_dim = 3 * (2 * n_freqs + 1)                            # per axis: raw + sin,cos×nf
+        self.mlp = nn.Sequential(
+            nn.Linear(feat_dim, hidden), nn.GELU(), nn.Linear(hidden, n_heads)
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def features(self, delta: Tensor) -> Tensor:
+        """``(..., 3)`` mm offset → ``(..., 3·(2·n_freqs+1))`` Fourier+linear features."""
+        u = delta / self.sigma_mm                                   # (...,3) normalized
+        ang = u[..., None] * self.omega                             # (...,3,n_freqs)
+        feats = torch.cat([u[..., None], ang.sin(), ang.cos()], dim=-1)  # (...,3,2nf+1)
+        return feats.flatten(-2)                                    # (...,3·(2nf+1))
+
+    def forward(self, delta: Tensor) -> Tensor:
+        """``(..., 3)`` mm offset → ``(..., n_heads)`` per-head additive logit bias."""
+        return self.mlp(self.features(delta))
+
+    @property
+    def feat_dim(self) -> int:
+        return 3 * (self.omega.numel() * 2 + 1)
+
+
+class ElectrodeReconHead(nn.Module):
+    """Run-B reconstruction-decode head (2026-07-01) — the MNI-free identity.
+
+    Perceiver-IO-style positional decode: reconstruct a DROPPED electrode's teacher
+    frontend feature from its parcel's ``k`` pool seeds, addressed by the electrode's
+    native-RAS centroid-relative offset (the query carries WHICH electrode; the k
+    seeds carry the pooled field). One masked-free cross-attention block — a single
+    positional query attends to the k seeds. Because the query is a continuous
+    relational offset (not a discrete slot), the pool is FORCED to encode a spatial
+    field rich enough to interpolate held-out electrodes ⇒ retain the detail it
+    currently averages away. Per (dropped-electrode, cell) row is independent; the
+    cell identity rides in WHICH seeds (``seeds`` are already the pool at that cell).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, geom_feat_dim: int) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        # Positional query = learned base + a projection of the offset's Fourier
+        # features (the SAME featurization the pool bias uses, so both geometry
+        # readers share one frequency basis).
+        self.q_base = nn.Parameter(torch.zeros(d_model))
+        self.q_pos = nn.Linear(geom_feat_dim, d_model, bias=False)
+        # One pre-norm decode block: cross-attention (query → k seeds) + FFN. The
+        # single cross-attention keeps the pool pressure honest (no multi-hop over
+        # seeds), while the FFN gives the readout the nonlinearity a bare linear
+        # seed-interpolation lacks — so a well-encoded pool is actually recoverable
+        # (else the loss floors out and stops pressuring the pool). Not stacked:
+        # a deeper decoder would reconstruct FROM a lossy pool and relieve the tax.
+        self.ln_q = nn.LayerNorm(d_model)
+        self.ln_kv = nn.LayerNorm(d_model)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+        self.ln_ff = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(                              # standard 4x FFN
+            nn.Linear(d_model, 4 * d_model), nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+        )
+        # Final clean projection to the target space — mirrors JepaPredictorV2's
+        # ``self.head`` (raw pred, NO LN): reads the residual stream and projects,
+        # so the raw positional query doesn't leak into the output. Matches the
+        # M2/M4 predictor's output contract exactly.
+        self.out_head = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, seeds: Tensor, offset_feats: Tensor) -> Tensor:
+        """``seeds`` ``(N, k, d)`` the query electrode's parcel seeds at its cell;
+        ``offset_feats`` ``(N, F)`` = ``RelativeGeometry.features(centroid-relative
+        offset)``. Returns ``(N, d)`` the reconstructed feature."""
+        N, k, d = seeds.shape
+        H, hd = self.n_heads, self.head_dim
+        q = self.q_base + self.q_pos(offset_feats)              # (N, d)
+        qn, sn = self.ln_q(q), self.ln_kv(seeds)               # pre-norm
+        qh = self.W_q(qn).reshape(N, 1, H, hd).transpose(1, 2)  # (N, H, 1, hd)
+        kh = self.W_k(sn).reshape(N, k, H, hd).transpose(1, 2)  # (N, H, k, hd)
+        vh = self.W_v(sn).reshape(N, k, H, hd).transpose(1, 2)
+        ctx = F.scaled_dot_product_attention(qh, kh, vh)       # (N, H, 1, hd)
+        # Perceiver-IO BasicDecoder: query residual OFF (the query is a positional
+        # ADDRESS, not content to preserve), MLP residual ON, then linear readout.
+        h = self.W_o(ctx.transpose(1, 2).reshape(N, d))        # no query residual
+        h = h + self.ffn(self.ln_ff(h))                        # MLP + residual
+        return self.out_head(h)                                # linear readout
 
 
 class SetPoolV2(nn.Module):
@@ -632,6 +846,7 @@ class SetPoolV2(nn.Module):
         n_parcels: int,
         n_op: int = 2,
         ln_out: bool = False,
+        mab: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -665,6 +880,19 @@ class SetPoolV2(nn.Module):
         # scale, matching frontend/latent ``ln_out``. Default OFF ⇒ legacy pool
         # (no LN) resumes byte-identical.
         self.ln_out = nn.LayerNorm(d_model) if ln_out else None
+        # Run-B: complete the bare PMA into a proper pre-norm MAB — seed/query
+        # residual + FFN — matching Set-Transformer PMA (1810.00825) and the
+        # Perceiver encoder cross-attention (2103.03206), which both carry an FFN
+        # and a query residual. Gated so Run-A's bare pool resumes byte-identical.
+        self.mab = mab
+        if mab:
+            self.ln_q = nn.LayerNorm(d_model)
+            self.ln_kv = nn.LayerNorm(d_model)
+            self.ln_ff = nn.LayerNorm(d_model)
+            self.ffn = nn.Sequential(
+                nn.Linear(d_model, 4 * d_model), nn.GELU(),
+                nn.Linear(4 * d_model, d_model),
+            )
 
     def forward(
         self,
@@ -672,6 +900,9 @@ class SetPoolV2(nn.Module):
         membership: Tensor,       # (P, C) bool
         parcel_labels: Tensor,    # (P,) long  DKT ids
         cell_patch: Tensor,       # (S,) long  ∈ [0, n_op)
+        *,
+        block: Tensor | None = None,      # (B, S, C) bool — Run-B: electrode blocked at cell
+        geom_bias: Tensor | None = None,  # (H, Pk, C) float — Run-B: per-head relational bias
     ) -> Tensor:
         B, C, S, d = x.shape
         P = membership.shape[0]
@@ -679,15 +910,19 @@ class SetPoolV2(nn.Module):
         if cell_patch.shape != (S,):
             raise ValueError(f"cell_patch must be (S={S},), got {tuple(cell_patch.shape)}")
 
-        # Queries (P, k, d) → W_Q → (P·k, H, hd). Cell-independent.
+        # Queries (P, k, d) → W_Q → (P·k, H, hd). Cell-independent. MAB pre-norms
+        # the query (raw q_tok kept for the seed residual below).
         q_tok = self.embed_pq[parcel_labels][:, None, :] + self.base_seed[None, :, :]
-        q = self.W_Q(q_tok).reshape(P * k, H, hd)
+        q_in = self.ln_q(q_tok) if self.mab else q_tok
+        q = self.W_Q(q_in).reshape(P * k, H, hd)
 
         # Per-cell freq-specific key/value projection — gather operator, einsum.
+        # MAB pre-norms the electrode tokens before the K/V projection.
+        xk = self.ln_kv(x) if self.mab else x
         WK = self.W_K[cell_patch]                                # (S, d, d)
         WV = self.W_V[cell_patch]                                # (S, d, d)
-        keys = torch.einsum("bcsd,sde->bcse", x, WK)             # (B, C, S, d)
-        vals = torch.einsum("bcsd,sde->bcse", x, WV)
+        keys = torch.einsum("bcsd,sde->bcse", xk, WK)           # (B, C, S, d)
+        vals = torch.einsum("bcsd,sde->bcse", xk, WV)
 
         # Batch the cell axis: (B, S, C, H, hd).
         keys = keys.permute(0, 2, 1, 3).reshape(B * S, C, H, hd)
@@ -702,6 +937,20 @@ class SetPoolV2(nn.Module):
         mem_pk = membership.repeat_interleave(k, dim=0)              # (Pk, C)
         bias = torch.zeros(P * k, C, dtype=qh.dtype, device=x.device)
         bias = bias.masked_fill(~mem_pk, NEG_INF_MASK_VALUE)[None, None]  # (1,1,Pk,C)
+        # Run-B additive contributions (both None ⇒ byte-identical to the base pool):
+        #  * geom_bias (H,Pk,C): per-head relational seed→electrode bias. Non-member
+        #    logits are already -1e4 ⇒ geom there is inert. Broadcast over (B·S).
+        #  * block (B,S,C): whole-electrode drop + heterogeneous M2 mask — the pool
+        #    must not read a dropped/masked electrode-cell (else its zero-filled or
+        #    held-out feature leaks in). Additive -1e4 per (B·S). Broadcast over Pk.
+        if geom_bias is not None:
+            bias = bias + geom_bias[None].to(qh.dtype)               # (1,H,Pk,C)
+        if block is not None:
+            if tuple(block.shape) != (B, S, C):
+                raise ValueError(f"block must be (B,S,C)=({B},{S},{C}), got {tuple(block.shape)}")
+            blk = torch.zeros(B, S, C, dtype=qh.dtype, device=x.device)
+            blk = blk.masked_fill(block, NEG_INF_MASK_VALUE)
+            bias = bias + blk.reshape(B * S, 1, 1, C)                # (B·S,1,1,C) broadcast
         ctx = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=bias)  # (BS,H,Pk,hd)
         ctx = ctx.permute(0, 2, 1, 3).reshape(B * S, P * k, d)
 
@@ -709,6 +958,9 @@ class SetPoolV2(nn.Module):
         no_cov = ~mem_pk.any(dim=-1)                                # (Pk,)
         ctx = ctx.masked_fill(no_cov[None, :, None], 0.0)
         out = self.out(ctx)                                         # (BS, Pk, d)
+        if self.mab:
+            out = q_tok.reshape(P * k, d)[None] + out               # seed/query residual
+            out = out + self.ffn(self.ln_ff(out))                  # FFN residual
         if self.ln_out is not None:
             out = self.ln_out(out)
         return out.reshape(B, S, P, k, d).permute(0, 2, 3, 1, 4)    # (B, P, k, S, d)
@@ -1037,6 +1289,9 @@ def converged_v2_loss_per_head(
     w_m4: float = 1.0,
     m3_weight: Tensor | None = None,
     m4_weight: Tensor | None = None,
+    melec_pred: Tensor | None = None,
+    melec_target: Tensor | None = None,
+    w_melec: float = 1.0,
 ) -> dict[str, Tensor]:
     """Run-A per-head JEPA loss (Ben 2026-06-27): three INDEPENDENT
     self-normalized L1 means on RAW (detached) EMA targets, combined with
@@ -1081,6 +1336,18 @@ def converged_v2_loss_per_head(
         "loss_m3": l_m3,
         "loss_m4": l_m4,
     }
+    # Run-B: masked-electrode reconstruction head (replaces M3; another
+    # self-normalized L1 mean on the RAW detached teacher frontend feature).
+    if melec_pred is not None:
+        if melec_target is None:
+            raise ValueError("melec_pred given but melec_target is None")
+        if melec_pred.shape[-1] != d:
+            raise ValueError(f"melec_pred feature dim {melec_pred.shape[-1]} != m2 dim {d}")
+        l_melec = _head(melec_pred, melec_target)
+        loss = loss + w_melec * l_melec
+        diag["loss"] = loss
+        diag["loss_melec"] = l_melec
+        diag["ratio_melec_m4"] = l_melec / l_m4.clamp_min(1e-12)
     diag["ratio_m2_m4"] = l_m2 / l_m4.clamp_min(1e-12)
     diag["ratio_m3_m4"] = l_m3 / l_m4.clamp_min(1e-12)
     return diag
@@ -1105,8 +1372,8 @@ class V14ConvergedV2Config:
     Architecture dims (``d_model`` … ``n_parcels``) have NO defaults — the caller
     justifies them per the discuss-before-code rule. The science knobs carry the
     locked first-run values (impl-plan + memos): ``k=2`` seeds/parcel,
-    ``tube_ratio=0.25``, ``tie_lfs=True`` (n_op=2, untie→4 is the first ablation),
-    ``ema_tau=0.9992``."""
+    ``tube_ratio=0.25``, ``ema_tau=0.9992``. ``pool_op`` (the pool's K/V
+    band-typing) auto-resolves by run mode — see :attr:`pool_op_resolved`."""
 
     d_model: int
     n_heads: int
@@ -1118,7 +1385,12 @@ class V14ConvergedV2Config:
     n_parcels: int
     k: int = 2
     tube_ratio: float = 0.25
-    tie_lfs: bool = True
+    # Pool K/V read-operator typing. ``None`` ⇒ auto (see ``pool_op_resolved``):
+    # Run-B first arm = ``"shared"`` (n_op=1, plain PMA — band already rides in via
+    # separate cells + band-colored frontend tokens); Run-A/legacy = ``"band"``
+    # (n_op=2, byte-identical resume). Explicit ``"shared"|"band"|"patch"`` (1/2/4)
+    # overrides — ``"band"``/``"patch"`` are the tie/untie ablations.
+    pool_op: str | None = None
     ema_tau: float = 0.9992
     # --- Run-A bundle (all default to LEGACY behavior for checkpoint resume) ---
     # ``m3_pred_layers`` is the master switch: set it (e.g. 6) to enable the Run-A
@@ -1139,12 +1411,51 @@ class V14ConvergedV2Config:
     # ⇒ scale-preserving: M2≈M3≈M4 stay comparable. M2 stays unweighted (already
     # per-electrode-cell). Default False = flat per-head means.
     support_weight: bool = False
+    # --- Run-B bundle (masked-electrode-prediction pool head) ---------------
+    # ``m3_drop_frac`` (ρ) is the Run-B master switch: set it (e.g. 0.3) ⇒ the M3
+    # pool-inpaint head is REPLACED by the per-parcel masked-electrode-prediction
+    # head — whole electrodes are dropped from each parcel (survivor floor
+    # ``m3_min_keep``) and their teacher FRONTEND feature is reconstructed from the
+    # parcel's k pool seeds, queried by the electrode's native-RAS centroid-relative
+    # offset via a relative attention bias. Fixes the pooling tax (the pool must
+    # encode a spatial field rich enough to interpolate held-out electrodes). None ⇒
+    # Run-B off (Run-A/legacy assembly unchanged). ``w_melec`` weights the head's
+    # self-normalized L1 term. ``sigma_mm`` (12.0, measured RMS centroid offset) +
+    # ``geom_n_freqs`` size the Fourier relative-geometry features. Requires Run-A
+    # (``m3_pred_layers`` set) — Run-B reshapes that head, it is not standalone.
+    m3_drop_frac: float | None = None
+    m3_min_keep: int = 3
+    w_melec: float = 1.0
+    sigma_mm: float = 12.0
+    geom_n_freqs: int = 5
+    # Run-B M2 masking granularity. False ⇒ parcel-uniform (all electrodes in a
+    # parcel hold out the SAME cells — the Run-A default, broadcast to electrodes).
+    # True ⇒ per-electrode HETEROGENEOUS (each electrode holds out its OWN cells;
+    # the pool then blocks each electrode's masked cells so its zero-filled token
+    # never leaks into the seeds). Only consulted in Run-B. Swept flag — the
+    # parcel-uniform arm is kept so the prototype A/B can attribute the delta.
+    m2_hetero: bool = False
 
     @property
     def run_a(self) -> bool:
         """True ⇒ the Run-A bundle is active (M3 + pool LN + tubed-only M4 +
         per-head loss). Gated on the M3 head's presence."""
         return self.m3_pred_layers is not None
+
+    @property
+    def run_b(self) -> bool:
+        """True ⇒ the Run-B masked-electrode-prediction head replaces M3. Gated on
+        ``m3_drop_frac``; requires Run-A (it reshapes the M3 head)."""
+        return self.m3_drop_frac is not None
+
+    @property
+    def pool_op_resolved(self) -> str:
+        """Pool K/V operator mode, defaulting by run mode when ``pool_op`` is None:
+        Run-B ⇒ ``"shared"`` (n_op=1, first arm); Run-A/legacy ⇒ ``"band"`` (n_op=2,
+        byte-identical resume). An explicit ``pool_op`` always wins."""
+        if self.pool_op is not None:
+            return self.pool_op
+        return "shared" if self.run_b else "band"
 
 
 @dataclass(frozen=True)
@@ -1184,7 +1495,7 @@ class V14ConvergedV2(nn.Module):
         # Build every submodule against the LONGEST clock (5 s SSL) so the RoPE
         # tables cover the 5 s slots; 1 s eval slots are a subset (safe to gather).
         self.ssl_bands = bands_for_clip_len(5.0, base=bands)
-        n_op = n_operators(cfg.tie_lfs)
+        n_op = n_operators(cfg.pool_op_resolved)
 
         self.frontend = FrontendEncoderV2(
             cfg.d_model, cfg.n_heads, cfg.frontend_layers, bands=self.ssl_bands,
@@ -1192,7 +1503,7 @@ class V14ConvergedV2(nn.Module):
         )
         self.pool = SetPoolV2(
             cfg.d_model, cfg.n_heads, k=cfg.k, n_parcels=cfg.n_parcels, n_op=n_op,
-            ln_out=cfg.run_a,
+            ln_out=cfg.run_a or cfg.run_b, mab=cfg.run_b,
         )
         self.latent = LatentEncoderV2(
             cfg.d_model, cfg.n_heads, cfg.latent_layers, cfg.n_parcels,
@@ -1210,12 +1521,27 @@ class V14ConvergedV2(nn.Module):
         # Run-A: M3 pool-inpaint head (untubed parcels, M2-masked cells, pool
         # target). Parcel- + seed-tagged like M4. None in legacy mode.
         self.m3_predictor: JepaPredictorV2 | None = None
-        if cfg.m3_pred_layers is not None:
+        if cfg.m3_pred_layers is not None and not cfg.run_b:
             self.m3_predictor = JepaPredictorV2(
                 cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m3_pred_layers,
                 n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
                 qk_norm=cfg.qk_norm,
             )
+
+        # Run-B: native-RAS relative geometry (shared by the pool seed→electrode
+        # bias and the recon query), learned per-seed spatial offsets, and the
+        # masked-electrode reconstruction head. Replaces the M3 pool-inpaint head.
+        self.geom: RelativeGeometry | None = None
+        self.recon: ElectrodeReconHead | None = None
+        self.pool_seed_offset: nn.Parameter | None = None
+        if cfg.run_b:
+            self.geom = RelativeGeometry(
+                cfg.n_heads, sigma_mm=cfg.sigma_mm, n_freqs=cfg.geom_n_freqs
+            )
+            self.recon = ElectrodeReconHead(cfg.d_model, cfg.n_heads, self.geom.feat_dim)
+            # k seed probes, centroid-relative mm frame; zero-init ⇒ all seeds start
+            # at the parcel centroid (pure content pool at step 0).
+            self.pool_seed_offset = nn.Parameter(torch.zeros(cfg.k, 3))
 
         # EMA teacher — frozen deep copies of the three target-side towers.
         self.teacher_frontend = copy.deepcopy(self.frontend)
@@ -1241,6 +1567,35 @@ class V14ConvergedV2(nn.Module):
         tube = sample_parcel_tube_v2(B, P, self.cfg.tube_ratio, generator)
         return m2, tube
 
+    def sample_drop(
+        self, B: int, membership: Tensor, generator: torch.Generator
+    ) -> Tensor:
+        """Run-B whole-electrode drop ``(B, C)`` bool (True = dropped). Count-uniform
+        per parcel (survivor floor ``m3_min_keep``) so shapes stay static. Sampled
+        dataloader-side, passed to :meth:`forward` as ``drop_mask``."""
+        if not self.cfg.run_b:
+            raise ValueError("sample_drop is Run-B only (set m3_drop_frac)")
+        assert self.cfg.m3_drop_frac is not None
+        return sample_electrode_drop_v2(
+            B, membership, self.cfg.m3_drop_frac, self.cfg.m3_min_keep, generator
+        )
+
+    def sample_m2_hetero(
+        self,
+        B: int,
+        C: int,
+        bands: tuple[BandSpecV2, ...],
+        generator: torch.Generator,
+    ) -> Tensor:
+        """Run-B per-electrode HETEROGENEOUS M2 mask ``(B, C, S)`` bool. Same
+        constant per-row hold-out count as the parcel-uniform sampler (SAME
+        ``m2_mask_cfg``) ⇒ ``s_vis``/``n_mask`` static shapes are unchanged; only
+        WHICH cells each electrode holds out differs. Sampled dataloader-side,
+        passed to :meth:`forward` as ``m2_elec_mask``."""
+        if not (self.cfg.run_b and self.cfg.m2_hetero):
+            raise ValueError("sample_m2_hetero is Run-B + m2_hetero only")
+        return sample_m2_masks_hetero_v2(B, C, bands, generator, self.m2_mask_cfg)
+
     # -- session geometry -------------------------------------------------------
     def session_layout(
         self, parcel_of_electrode: Tensor, bands: tuple[BandSpecV2, ...]
@@ -1249,7 +1604,7 @@ class V14ConvergedV2(nn.Module):
         labels, membership = active_parcels(parcel_of_electrode)
         parcel_idx = membership.int().argmax(0)                   # (C,)
         _, freq_id, slot = token_metadata(bands)
-        cell_patch = cell_operator_index(bands, tie_lfs=self.cfg.tie_lfs)
+        cell_patch = cell_operator_index(bands, op_mode=self.cfg.pool_op_resolved)
         return _SessionLayout(
             labels=labels,
             membership=membership,
@@ -1351,6 +1706,83 @@ class V14ConvergedV2(nn.Module):
         u_seed = arK[None, None, :, None].expand(B, P_vis, k, n_mask)
         return u_pos.reshape(B, -1), u_cell.reshape(B, -1), u_seed.reshape(B, -1)
 
+    # -- Run-B native-RAS geometry ---------------------------------------------
+    def _centroid_relative(self, coords: Tensor, membership: Tensor, parcel_idx: Tensor):
+        """``(centroid (P,3), u_e (C,3))`` — per-parcel centroid + each electrode's
+        centroid-relative native-RAS offset (the translation-free frame the bias +
+        recon query both read)."""
+        memf = membership.to(coords.dtype)                        # (P,C)
+        centroid = (memf @ coords) / memf.sum(1, keepdim=True).clamp_min(1.0)  # (P,3)
+        u_e = coords - centroid[parcel_idx]                       # (C,3)
+        return centroid, u_e
+
+    def _pool_geom_bias(self, u_e: Tensor, membership: Tensor) -> Tensor:
+        """Per-head seed→electrode relative bias ``(H, P·k, C)`` for the pool. Seed
+        ``j``'s probe sits at ``seed_offset_j`` (centroid frame); its bias vs
+        electrode ``e`` is ``geom(seed_offset_j − u_e)``. Independent of parcel (each
+        seed reuses the same k offsets), so compute ``(k,C,H)`` and tile over P;
+        cross-parcel pairs are membership-masked in the pool anyway."""
+        assert self.geom is not None and self.pool_seed_offset is not None
+        P, C = membership.shape
+        k = self.cfg.k
+        delta = self.pool_seed_offset[:, None, :] - u_e[None, :, :]  # (k,C,3)
+        geom_k = self.geom(delta)                                 # (k,C,H)
+        H = geom_k.shape[-1]
+        geom_pk = geom_k[None].expand(P, k, C, H).reshape(P * k, C, H)
+        return geom_pk.permute(2, 0, 1).contiguous()             # (H, P·k, C)
+
+    def _melec_recon(
+        self,
+        s_seeds: Tensor,      # (B,P,k,S,d) student seeds (dropped electrodes blocked)
+        t_front: Tensor,      # (B,C,S,d) teacher frontend (the recon target source)
+        drop_mask: Tensor,    # (B,C) bool, True = dropped
+        pvis_idx: Tensor,     # (B,P,s_vis) each parcel's visible-cell indices
+        parcel_idx: Tensor,   # (C,) each electrode's parcel row
+        u_e: Tensor,          # (C,3) centroid-relative offsets
+        membership: Tensor,   # (P,C) bool
+        sh: StaticShapesV2,
+    ) -> tuple[Tensor, Tensor]:
+        """Reconstruct each DROPPED electrode's teacher frontend feature at its
+        parcel's VISIBLE cells (seeds are real there) from the survivor-only seeds,
+        addressed by the electrode's native-RAS offset. Returns flat
+        ``(pred (N,d), target (N,d))`` with ``N = B·D·s_vis``, ``D`` = the static
+        per-clip drop count. All gathers are static (``D`` fixed by membership)."""
+        assert self.recon is not None and self.geom is not None
+        assert self.cfg.m3_drop_frac is not None
+        B, C, S, d = t_front.shape
+        k, s_vis = sh.k, sh.s_vis
+        nd = electrode_drop_count(membership, self.cfg.m3_drop_frac, self.cfg.m3_min_keep)
+        D = int(nd.sum().item())
+        if D == 0:                                               # nothing droppable
+            z = t_front.new_zeros(0, d)
+            return z, z
+        drop_idx = _select_idx(drop_mask, D)                    # (B,D) electrode ids
+        pd = parcel_idx[drop_idx]                               # (B,D) their parcels
+        dvis = torch.gather(pvis_idx, 1, pd[:, :, None].expand(B, D, s_vis))  # (B,D,s_vis)
+
+        # context seeds: gather parcel pd, then that parcel's visible cells.
+        seeds_p = torch.gather(
+            s_seeds, 1, pd[:, :, None, None, None].expand(B, D, k, S, d)
+        )                                                       # (B,D,k,S,d)
+        seeds_ctx = torch.gather(
+            seeds_p, 3, dvis[:, :, None, :, None].expand(B, D, k, s_vis, d)
+        )                                                       # (B,D,k,s_vis,d)
+        seeds_ctx = seeds_ctx.permute(0, 1, 3, 2, 4).reshape(B * D * s_vis, k, d)
+
+        # target: teacher frontend of the dropped electrode at those visible cells.
+        tgt_e = torch.gather(t_front, 1, drop_idx[:, :, None, None].expand(B, D, S, d))
+        tgt = torch.gather(
+            tgt_e, 2, dvis[:, :, :, None].expand(B, D, s_vis, d)
+        ).reshape(B * D * s_vis, d)
+
+        # positional query features (per dropped electrode, broadcast over cells).
+        feats_e = self.geom.features(u_e)                       # (C,F)
+        feats = feats_e[drop_idx]                               # (B,D,F)
+        Fdim = feats.shape[-1]
+        feats = feats[:, :, None, :].expand(B, D, s_vis, Fdim).reshape(B * D * s_vis, Fdim)
+        pred = self.recon(seeds_ctx, feats)                     # (B·D·s_vis, d)
+        return pred, tgt
+
     # -- the SSL step -----------------------------------------------------------
     def forward(
         self,
@@ -1361,8 +1793,15 @@ class V14ConvergedV2(nn.Module):
         tube_mask: Tensor,            # (B, P) bool, True = tubed parcel
         *,
         clip_len_s: float,
+        coords: Tensor | None = None,      # (C,3) native-RAS mm — Run-B only
+        drop_mask: Tensor | None = None,   # (B,C) bool, True = dropped — Run-B only
+        m2_elec_mask: Tensor | None = None,  # (B,C,S) per-electrode M2 mask — Run-B hetero
         return_taps: bool = False,
     ) -> dict[str, Tensor]:
+        if self.cfg.run_b and (coords is None or drop_mask is None):
+            raise ValueError("Run-B forward requires coords (C,3) and drop_mask (B,C)")
+        if self.cfg.run_b and self.cfg.m2_hetero and m2_elec_mask is None:
+            raise ValueError("Run-B m2_hetero forward requires m2_elec_mask (B,C,S)")
         bands = bands_for_clip_len(clip_len_s, base=self.base_bands)
         lay = self.session_layout(parcel_of_electrode, bands)
         labels, membership, parcel_idx = lay.labels, lay.membership, lay.parcel_idx
@@ -1384,7 +1823,18 @@ class V14ConvergedV2(nn.Module):
             t_latent = self.teacher_latent(t_seeds, labels, slot)     # (B,P,k,S,d)
 
         # === STUDENT stage 1: frontend PACKED over visible cells ===============
-        elec_mask = m2_mask[:, parcel_idx, :]                         # (B,C,S) True=masked
+        # Parcel-uniform (Run-A default): broadcast the parcel mask to its electrodes.
+        # Heterogeneous (Run-B m2_hetero): each electrode holds out its OWN cells —
+        # same per-row count ⇒ s_vis/n_mask unchanged. The pool then blocks each
+        # electrode's masked cell (stage 4) so its zero-filled token can't leak.
+        if m2_elec_mask is not None:
+            if tuple(m2_elec_mask.shape) != (B, C, S):
+                raise ValueError(
+                    f"m2_elec_mask must be (B,C,S)=({B},{C},{S}), got {tuple(m2_elec_mask.shape)}"
+                )
+            elec_mask = m2_elec_mask                                  # (B,C,S) heterogeneous
+        else:
+            elec_mask = m2_mask[:, parcel_idx, :]                     # (B,C,S) parcel-broadcast
         visible = ~elec_mask
         vis_idx = _select_idx(visible, s_vis)                        # (B,C,s_vis)
         mask_idx = _select_idx(elec_mask, n_mask)                    # (B,C,n_mask)
@@ -1411,7 +1861,29 @@ class V14ConvergedV2(nn.Module):
         s_front_full.scatter_(2, vis_idx[..., None].expand(B, C, s_vis, d), s_front_vis)
 
         # === stage 4: pool over S (cheap; masked-cell seeds garbage-but-unused) =
-        s_seeds = self.pool(s_front_full, membership, labels, cell_patch)  # (B,P,k,S,d)
+        pool_block: Tensor | None = None
+        pool_geom: Tensor | None = None
+        u_e: Tensor | None = None
+        if self.cfg.run_b:
+            assert coords is not None and drop_mask is not None
+            if tuple(coords.shape) != (C, 3):
+                raise ValueError(f"coords must be (C={C},3), got {tuple(coords.shape)}")
+            if tuple(drop_mask.shape) != (B, C):
+                raise ValueError(f"drop_mask must be (B={B},C={C}), got {tuple(drop_mask.shape)}")
+            _, u_e = self._centroid_relative(coords, membership, parcel_idx)
+            pool_geom = self._pool_geom_bias(u_e, membership)         # (H,P·k,C)
+            # Dropped electrodes are invisible to the STUDENT pool at every cell ⇒
+            # its seeds pool the survivors only (the recon must interpolate them).
+            pool_block = drop_mask[:, None, :].expand(B, S, C)        # (B,S,C)
+            # Heterogeneous M2: also skip each electrode's OWN masked cells — its
+            # token is zero-filled there (scattered visible-only), so pooling it
+            # would leak a zero into a parcel-visible seed. Union with the drop.
+            if m2_elec_mask is not None:
+                pool_block = pool_block | m2_elec_mask.permute(0, 2, 1)  # (B,S,C)
+        s_seeds = self.pool(
+            s_front_full, membership, labels, cell_patch,
+            block=pool_block, geom_bias=pool_geom,
+        )                                                            # (B,P,k,S,d)
 
         # === stage 5: gather visible seeds/parcel, tag, gather untubed parcels ==
         pvis_idx = _select_idx(~m2_mask, s_vis)                       # (B,P,s_vis)
@@ -1445,8 +1917,42 @@ class V14ConvergedV2(nn.Module):
         t_latent_flat = t_latent.reshape(B, P * k * S, d)
         m3_pred: Tensor | None = None
         m3_target: Tensor | None = None
+        melec_pred: Tensor | None = None
+        melec_target: Tensor | None = None
 
-        if self.cfg.run_a:
+        if self.cfg.run_b:
+            # Run-B: Run-A's tubed-only M4, but the M3 pool-inpaint head is REPLACED
+            # by the masked-electrode reconstruction (M-elec). M2 + M4 unchanged.
+            pos, cell, seed, _tubed = self._m4_indices(
+                tube_mask, m2_mask, sh, tubed_only=True
+            )
+            m4_pred = self.m4_predictor(
+                ctx4, ctx4_slot, slot[cell], freq_id[cell],
+                q_parcel=labels[pos], q_seed=seed,
+            )
+            flat4 = (pos * k + seed) * S + cell
+            Lq4 = flat4.shape[1]
+            m4_target = torch.gather(
+                t_latent_flat, 1, flat4[..., None].expand(B, Lq4, d)
+            )
+            assert u_e is not None and drop_mask is not None
+            melec_pred, melec_target = self._melec_recon(
+                s_seeds, t_front, drop_mask, pvis_idx, parcel_idx, u_e, membership, sh
+            )
+            m4_w = None
+            if self.cfg.support_weight:
+                n_elec = membership.sum(-1).to(m4_pred.dtype)
+                m4_w = n_elec[pos].reshape(-1)
+            empty = m2_pred.new_zeros(0, d)
+            out = converged_v2_loss_per_head(
+                m2_pred.reshape(-1, d), m2_target.reshape(-1, d),
+                empty, empty,                                    # M3 replaced by M-elec
+                m4_pred.reshape(-1, d), m4_target.reshape(-1, d),
+                w_m2=self.cfg.w_m2, w_m3=0.0, w_m4=self.cfg.w_m4, m4_weight=m4_w,
+                melec_pred=melec_pred, melec_target=melec_target,
+                w_melec=self.cfg.w_melec,
+            )
+        elif self.cfg.run_a:
             # M4 predicts the TUBED parcels only (all S cells); the untubed
             # masked-cell inpaint is the separate M3 head (pool target).
             pos, cell, seed, _tubed = self._m4_indices(
@@ -1540,11 +2046,14 @@ class V14ConvergedV2(nn.Module):
                 out["_tap_m3_pred"] = m3_pred.reshape(-1, d).detach()   # (Q3,d)
                 out["_tap_m3_target"] = m3_target.reshape(-1, d).detach()
                 out["_tap_teacher_pool"] = t_seeds.detach()       # (B,P,k,S,d)
-            # Flag for the monitor: Run-A regresses RAW targets (no _ln_target),
+            if melec_pred is not None and melec_target is not None:
+                out["_tap_melec_pred"] = melec_pred.detach()      # (N,d)
+                out["_tap_melec_target"] = melec_target.detach()
+            # Flag for the monitor: Run-A/Run-B regress RAW targets (no _ln_target),
             # so explained-variance must be measured against raw targets. Emitted
-            # only in Run-A; legacy omits it and the monitor's `.get()` defaults
+            # only in Run-A/Run-B; legacy omits it and the monitor's `.get()` defaults
             # to the legacy `_ln_target` behavior (keeps the legacy tap-key set).
-            if self.cfg.run_a:
+            if self.cfg.run_a or self.cfg.run_b:
                 out["_tap_raw_targets"] = t_front.new_tensor(1.0)
         return out
 

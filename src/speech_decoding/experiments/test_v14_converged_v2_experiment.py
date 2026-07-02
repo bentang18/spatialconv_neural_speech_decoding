@@ -95,7 +95,7 @@ def test_build_brain_module_threads_optim_clip_and_seed() -> None:
 
 
 def test_build_brain_module_threads_science_knobs_via_config() -> None:
-    """The science knobs (k / tube_ratio / tie_lfs / ema_tau) live on the MODEL
+    """The science knobs (k / tube_ratio / pool_op / ema_tau) live on the MODEL
     config, not the experiment — confirm they reach the built model so the
     experiment never needs to (or can) re-thread them."""
     xp = V14ConvergedV2Experiment.model_construct(
