@@ -148,6 +148,9 @@ def test_run_b_dropped_electrodes_blocked_from_student_pool():
     # melec pred is driven by student seeds; a dropped-elec corruption must not move
     # the student-side prediction (only the teacher target moved).
     assert torch.allclose(t_base["_tap_melec_pred"], t_drop["_tap_melec_pred"], atol=1e-5)
+    # Run-B must emit the teacher-pool tap too (pool_rankme/feat_std source) so the
+    # monitor's pool-rank diagnostic logs and overlays Run-A (M3 head is off here).
+    assert "_tap_teacher_pool" in t_base
 
 
 # ----------------------------------------------------- heterogeneous M2 masking

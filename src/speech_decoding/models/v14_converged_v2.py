@@ -2062,6 +2062,12 @@ class V14ConvergedV2(nn.Module):
             if melec_pred is not None and melec_target is not None:
                 out["_tap_melec_pred"] = melec_pred.detach()      # (N,d)
                 out["_tap_melec_target"] = melec_target.detach()
+                # Run-B pool tap: the SAME pool_rankme/pool_feat_std source Run-A emits
+                # from its M3 block (the teacher-pool "M3 target" = the pooling-tax rank
+                # diagnostic). t_seeds is computed unconditionally in the teacher block,
+                # so emit it here too — else pool_rankme/feat_std never log for Run-B and
+                # can't overlay Run-A. Detached ⇒ training bit-identical.
+                out["_tap_teacher_pool"] = t_seeds.detach()       # (B,P,k,S,d)
             # Flag for the monitor: Run-A/Run-B regress RAW targets (no _ln_target),
             # so explained-variance must be measured against raw targets. Emitted
             # only in Run-A/Run-B; legacy omits it and the monitor's `.get()` defaults
