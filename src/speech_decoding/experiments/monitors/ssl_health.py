@@ -299,6 +299,11 @@ class SSLHealthMonitor(pl.Callback):
         raw = bool(rt.item()) if isinstance(rt, Tensor) else False
         self._jepa_stats(pl_module, taps, "_tap_m2_pred", "_tap_m2_target", "m2", raw)
         self._jepa_stats(pl_module, taps, "_tap_m3_pred", "_tap_m3_target", "m3", raw)
+        # Run-B's recon head IS the third SSL head (M3 is off): log its stats under
+        # the SAME "m3" keys so the wandb dashboards overlay Run-A. Run-A emits
+        # _tap_m3_*, Run-B _tap_melec_* ⇒ _jepa_stats no-ops on the absent one, so
+        # exactly one of these two calls fires per run.
+        self._jepa_stats(pl_module, taps, "_tap_melec_pred", "_tap_melec_target", "m3", raw)
         self._jepa_stats(pl_module, taps, "_tap_m4_pred", "_tap_m4_target", "m4", raw)
 
     def _rank_and_std(

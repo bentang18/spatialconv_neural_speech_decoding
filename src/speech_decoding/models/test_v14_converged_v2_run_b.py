@@ -86,7 +86,11 @@ def test_run_b_forward_loss_finite_with_melec():
     assert torch.isfinite(out["loss"]) and out["loss"] > 0
     assert "loss_melec" in out
     assert torch.isfinite(out["loss_melec"])
-    assert "loss_m3" in out and out["loss_m3"] == 0.0       # M3 head is off
+    # M3 head is OFF, but its diagnostic slot is re-labelled to the recon (third)
+    # head so the wandb dashboards overlay Run-A's m3 curve (the training loss is
+    # built from loss_melec, unchanged).
+    assert "loss_m3" in out and out["loss_m3"] == out["loss_melec"]
+    assert out["ratio_m3_m4"] == out["ratio_melec_m4"]
 
 
 def test_run_b_requires_coords_and_drop():

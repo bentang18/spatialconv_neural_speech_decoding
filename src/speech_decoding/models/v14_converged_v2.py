@@ -1355,8 +1355,14 @@ def converged_v2_loss_per_head(
         diag["loss"] = loss
         diag["loss_melec"] = l_melec
         diag["ratio_melec_m4"] = l_melec / l_m4.clamp_min(1e-12)
+        # Overlay the recon (third-head) loss onto Run-A's "m3" slot so the wandb
+        # dashboards compare the third SSL term across runs. The M3 head is OFF in
+        # Run-B (its l_m3=0), so without this loss_m3/ratio_m3_m4 would plot a flat
+        # zero over Run-A's m3 curve. The training loss is UNCHANGED (built from
+        # l_melec above); this only re-labels the diagnostic.
+        diag["loss_m3"] = l_melec
     diag["ratio_m2_m4"] = l_m2 / l_m4.clamp_min(1e-12)
-    diag["ratio_m3_m4"] = l_m3 / l_m4.clamp_min(1e-12)
+    diag["ratio_m3_m4"] = diag["loss_m3"] / l_m4.clamp_min(1e-12)
     return diag
 
 
