@@ -2352,8 +2352,8 @@ def build_v14_experiment(
                 **_v2_shape,
                 "k": converged_v2_k,
                 # Pool K/V typing: explicit --pool-op wins; --untie-lfs is the
-                # back-compat alias for "patch"; else None ⇒ model auto-resolves
-                # (Run-B ⇒ shared/n_op=1, Run-A/legacy ⇒ band/n_op=2).
+                # back-compat alias for "patch" (n_op=4); else None ⇒ model auto-
+                # resolves to "band" (n_op=2, LFS | HGA — the physiology default).
                 "pool_op": (
                     converged_v2_pool_op
                     if converged_v2_pool_op is not None

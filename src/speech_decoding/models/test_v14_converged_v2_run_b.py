@@ -62,26 +62,27 @@ def test_run_b_builds_expected_params():
     assert any("pool_seed_offset" in k for k in keys)
     assert any("pool.ln_out" in k for k in keys)           # Run-A structure inherited
     assert not any("m3_predictor" in k for k in keys)      # M3 head replaced
-    # Run-B canonical: pool K/V typing auto-resolves to "patch" (n_op=4 — HGA + 3 LFS
-    # log-groups get distinct multiplicative W_K/W_V), NOT the Run-A band-tied 2.
-    assert m.cfg.pool_op_resolved == "patch"
-    assert m.pool.W_K.shape[0] == 4
-    assert m.teacher_pool.W_K.shape[0] == 4
+    # Run-B canonical: pool K/V typing auto-resolves to "band" (n_op=2, LFS | HGA —
+    # the one physiology-backed spatial-regime boundary), NOT the n_op=4 LFS split.
+    assert m.cfg.pool_op_resolved == "band"
+    assert m.pool.W_K.shape[0] == 2
+    assert m.teacher_pool.W_K.shape[0] == 2
     # No per-parcel pool query embed (universal geometric operator); recon K/V + output
     # are band-typed to the same n_op as the pool (symmetric inverse).
     assert m.pool.embed_pq is None
     assert m.teacher_pool.embed_pq is None
-    assert m.recon.n_op == 4
-    assert m.recon.W_k.shape[0] == 4 and m.recon.out_head.shape[0] == 4
+    assert m.recon.n_op == 2
+    assert m.recon.W_k.shape[0] == 2 and m.recon.out_head.shape[0] == 2
 
 
-def test_run_b_pool_op_override_restores_band_typed():
-    # explicit pool_op="band" opts a Run-B run back into the n_op=2 tie ablation.
+def test_run_b_pool_op_override_untie_lfs_patch():
+    # explicit pool_op="patch" opts a Run-B run into the n_op=4 LFS-untie ablation.
     import dataclasses
 
-    m = V14ConvergedV2(dataclasses.replace(_cfg(), pool_op="band"))
-    assert m.cfg.pool_op_resolved == "band"
-    assert m.pool.W_K.shape[0] == 2
+    m = V14ConvergedV2(dataclasses.replace(_cfg(), pool_op="patch"))
+    assert m.cfg.pool_op_resolved == "patch"
+    assert m.pool.W_K.shape[0] == 4
+    assert m.recon.n_op == 4 and m.recon.W_k.shape[0] == 4
 
 
 def test_run_b_forward_loss_finite_with_melec():
@@ -313,8 +314,8 @@ def test_recon_head_band_typed_output_depends_on_band():
 
 
 def test_run_b_hetero_no_parcel_embed_grads_flow():
-    """Canonical Run-B (hetero, n_op=4, no embed_pq): forward+backward finite, and
-    gradients reach the shared base_seed + the band-typed recon K/V + output."""
+    """Canonical Run-B (hetero, band-typed n_op=2, no embed_pq): forward+backward
+    finite, and grads reach the shared base_seed + the band-typed recon K/V + output."""
     bands, poe, membership, lfs, hga, m2, tube, coords, g = _session(seed=7)
     m = V14ConvergedV2(_cfg(m2_hetero=True))
     assert m.pool.embed_pq is None                             # universal geometric pool

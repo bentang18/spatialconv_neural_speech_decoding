@@ -82,12 +82,13 @@ def test_2band_pool_op_explicit_beats_untie_alias(tmp_path) -> None:
     assert cfg.pool_op == "band"
 
 
-def test_2band_run_b_default_pool_op_resolves_shared(tmp_path) -> None:
-    # Run-B (m3_drop_frac set), no pool_op ⇒ Net carries None, model resolves shared
+def test_2band_run_b_default_pool_op_resolves_band(tmp_path) -> None:
+    # Run-B (m3_drop_frac set), no pool_op ⇒ Net carries None, model resolves "band"
+    # (n_op=2, LFS | HGA — the physiology-backed default).
     cfg = _v2(tmp_path, converged_v2_m3_drop_frac=0.5).brain_model_config
     assert cfg.pool_op is None
     model = cfg.build(n_in_channels=1, n_outputs=1)
-    assert model.pool.W_K.shape[0] == 1     # n_op=1 (shared / plain PMA)
+    assert model.pool.W_K.shape[0] == 2     # n_op=2 (band-tied LFS | HGA)
 
 
 def test_2band_clip_len_threads(tmp_path) -> None:

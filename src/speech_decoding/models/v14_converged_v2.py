@@ -1454,10 +1454,10 @@ class V14ConvergedV2Config:
     k: int = 2
     tube_ratio: float = 0.25
     # Pool K/V read-operator typing. ``None`` ⇒ auto (see ``pool_op_resolved``):
-    # Run-B first arm = ``"shared"`` (n_op=1, plain PMA — band already rides in via
-    # separate cells + band-colored frontend tokens); Run-A/legacy = ``"band"``
-    # (n_op=2, byte-identical resume). Explicit ``"shared"|"band"|"patch"`` (1/2/4)
-    # overrides — ``"band"``/``"patch"`` are the tie/untie ablations.
+    # ``"band"`` (n_op=2, LFS | HGA) for every run mode — the physiology-backed
+    # default (LFS↔HGA is the one real spatial-regime boundary; n_op=1 is pool-band-
+    # blind, n_op=4 over-splits LFS). Explicit ``"shared"|"band"|"patch"`` (1/2/4)
+    # overrides — ``"shared"``/``"patch"`` are the tie/untie ablations.
     pool_op: str | None = None
     ema_tau: float = 0.9992
     # --- Run-A bundle (all default to LEGACY behavior for checkpoint resume) ---
@@ -1518,14 +1518,20 @@ class V14ConvergedV2Config:
 
     @property
     def pool_op_resolved(self) -> str:
-        """Pool K/V operator mode, defaulting by run mode when ``pool_op`` is None:
-        Run-B ⇒ ``"patch"`` (n_op=4 — HGA + the 3 LFS log-groups get distinct K/V,
-        the multiplicative band-typing HGA/LFS genuinely need; an additive freq-embed
-        on keys cancels in the per-cell softmax); Run-A/legacy ⇒ ``"band"`` (n_op=2,
-        byte-identical resume). An explicit ``pool_op`` always wins."""
+        """Pool K/V operator mode, defaulting to ``"band"`` (n_op=2, LFS | HGA) for
+        every run mode when ``pool_op`` is None. The pool needs SOME multiplicative
+        band-typing — an additive freq-embed is cell-common-mode and cancels in the
+        per-cell pooling softmax, so n_op=1 (``"shared"``) leaves the pool band-blind.
+        But the only spatial-regime boundary the physiology supports at mm–cm ECoG
+        spacing is LFS↔HGA (focal broadband high-gamma tracks local firing vs
+        distributed low-freq: Muller 2016 J Neural Eng; Ray & Maunsell 2011 PLoS
+        Biol); the 3-way LFS split (``"patch"``, n_op=4) rides a smooth, modest,
+        partly non-monotonic coherence gradient (Bullock 1995) and starves its ops
+        (~2 tokens each vs HGA's 16) — an opt-in ablation, not the default. Run-A/
+        legacy already used ``"band"`` (byte-identical). Explicit ``pool_op`` wins."""
         if self.pool_op is not None:
             return self.pool_op
-        return "patch" if self.run_b else "band"
+        return "band"
 
 
 @dataclass(frozen=True)
@@ -1616,6 +1622,19 @@ class V14ConvergedV2(nn.Module):
             # at the parcel centroid (pure content pool at step 0).
             self.pool_seed_offset = nn.Parameter(torch.zeros(cfg.k, 3))
 
+        # Canonical weight init: unify every tower Linear/Embedding under one
+        # scheme (trunc_normal 0.02 — GPT-2/ViT/MAE), replacing PyTorch's default
+        # kaiming_uniform(a=√5). ``apply`` only visits child MODULES, so the raw-
+        # Parameter inits (xavier K/V, base_seed, q_base, pool_seed_offset,
+        # mask/seed/freq embeds) are untouched; the one casualty is the geom
+        # adaLN-zero gate (a Linear), re-asserted below. Runs before the teacher
+        # deep-copy so the frozen towers inherit the corrected init.
+        self.apply(self._init_weights)
+        for mod in self.modules():
+            if isinstance(mod, RelativeGeometry):
+                nn.init.zeros_(mod.mlp[-1].weight)
+                nn.init.zeros_(mod.mlp[-1].bias)
+
         # EMA teacher — frozen deep copies of the three target-side towers.
         self.teacher_frontend = copy.deepcopy(self.frontend)
         self.teacher_pool = copy.deepcopy(self.pool)
@@ -1625,6 +1644,19 @@ class V14ConvergedV2(nn.Module):
                 p.requires_grad_(False)
 
         self.m2_mask_cfg = M2MaskConfigV2()
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        """Canonical trunc_normal(0.02) for every Linear/Embedding (GPT-2/ViT/MAE).
+        Deliberate raw-Parameter inits are not child modules ⇒ untouched by
+        ``apply``; the geom adaLN-zero gate is a Linear and is re-asserted by the
+        caller after ``apply``."""
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.trunc_normal_(m.weight, std=0.02)
 
     # -- mask sampling (dataloader-side; keeps the bubble out of _step) ---------
     def sample_masks(

@@ -51,9 +51,9 @@ class V14ConvergedV2Net(BaseModelConfig):
     # --- locked first-run science knobs (impl-plan + memos) -----------------
     k: int = 2
     tube_ratio: float = 0.25
-    # Pool K/V read-operator typing; None ⇒ auto by run mode (Run-B ⇒ "shared"
-    # n_op=1 plain PMA; Run-A/legacy ⇒ "band" n_op=2). "shared"|"band"|"patch"
-    # (1/2/4) override — band/patch are the tie/untie ablations.
+    # Pool K/V read-operator typing; None ⇒ auto → "band" (n_op=2, LFS | HGA — the
+    # physiology-backed default; see V14ConvergedV2Config.pool_op_resolved).
+    # "shared"|"band"|"patch" (1/2/4) override — shared/patch are the tie/untie ablations.
     pool_op: str | None = None
     ema_tau: float = 0.9992
 
