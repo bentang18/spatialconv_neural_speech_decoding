@@ -677,7 +677,7 @@ def build_v14_experiment(
     converged_v2_w_melec: float = 1.0,
     converged_v2_sigma_mm: float = 12.0,
     converged_v2_geom_n_freqs: int = 4,
-    converged_v2_m2_hetero: bool = False,
+    converged_v2_m2_hetero: bool = True,
     # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
     # λ sister sweeps override). Inert on raw/2stft.
     converged_lambda_m2: float = 1.0,
@@ -2925,11 +2925,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="2band Run-B: number of Fourier frequencies in the relative-"
                         "geometry features (default 4, ~6–30 mm band = [0.5σ, 2.5σ]).")
     p.add_argument("--converged-v2-m2-hetero", dest="converged_v2_m2_hetero",
-                   action="store_true",
+                   action=argparse.BooleanOptionalAction, default=True,
                    help="2band Run-B: per-electrode HETEROGENEOUS M2 masking (each "
-                        "electrode holds out its OWN cells; pool blocks them). Off ⇒ "
-                        "parcel-uniform (all electrodes in a parcel mask the same "
-                        "cells). Swept flag — keep both arms for the A/B.")
+                        "electrode holds out its OWN cells; pool blocks them) — the "
+                        "CANONICAL Run-B default (electrodes are the masking unit). "
+                        "Pass --no-converged-v2-m2-hetero for the parcel-uniform "
+                        "ablation (all electrodes in a parcel mask the same cells).")
     p.add_argument("--converged-lambda-m2", dest="converged_lambda_m2",
                    type=float, default=1.0,
                    help="3stft: M2 loss-term weight (neutral 1.0).")

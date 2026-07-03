@@ -79,7 +79,7 @@ class V14ConvergedV2Net(BaseModelConfig):
     w_melec: float = 1.0
     sigma_mm: float = 12.0
     geom_n_freqs: int = 4
-    m2_hetero: bool = False
+    m2_hetero: bool = True  # canonical Run-B: electrodes are the masking unit
 
     def build(self, n_in_channels: int, n_outputs: int) -> nn.Module:  # noqa: ARG002
         return V14ConvergedV2(

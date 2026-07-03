@@ -500,6 +500,18 @@ def electrode_drop_count(membership: Tensor, drop_frac: float, min_keep: int) ->
     return raw.clamp(min=0).minimum(upper)                        # (P,)
 
 
+def _empty_cell_mask(pool_block: Tensor, membership: Tensor) -> Tensor:
+    """``(B,P,S)`` bool — a parcel-cell is EMPTY when EVERY member electrode is
+    blocked there (Run-B hetero: dropped or M2-masked), so the pool produces only
+    the finite-sentinel null. Threaded as a key-block up the stack (latent + M4 —
+    a null no live token attends is a JEPA *drop*, not a mask token) and as a 0/1
+    melec loss weight. ``pool_block`` ``(B,S,C)`` True = electrode blocked at cell;
+    ``membership`` ``(P,C)`` bool."""
+    vis = (~pool_block).to(torch.float32)                        # (B,S,C) visible
+    cnt = torch.einsum("bsc,pc->bsp", vis, membership.to(torch.float32))
+    return (cnt < 0.5).permute(0, 2, 1).contiguous()             # (B,P,S)
+
+
 def sample_electrode_drop_v2(
     B: int, membership: Tensor, drop_frac: float, min_keep: int, generator: torch.Generator
 ) -> Tensor:
@@ -758,13 +770,16 @@ class ElectrodeReconHead(nn.Module):
     cell identity rides in WHICH seeds (``seeds`` are already the pool at that cell).
     """
 
-    def __init__(self, d_model: int, n_heads: int, geom_feat_dim: int) -> None:
+    def __init__(
+        self, d_model: int, n_heads: int, geom_feat_dim: int, *, n_op: int = 1
+    ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.n_op = n_op
         # Positional query = learned base + a projection of the offset's Fourier
         # features (the SAME featurization the pool bias uses, so both geometry
         # readers share one frequency basis).
@@ -778,32 +793,56 @@ class ElectrodeReconHead(nn.Module):
         # a deeper decoder would reconstruct FROM a lossy pool and relieve the tax.
         self.ln_q = nn.LayerNorm(d_model)
         self.ln_kv = nn.LayerNorm(d_model)
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
-        self.W_o = nn.Linear(d_model, d_model, bias=False)
+        self.W_q = nn.Linear(d_model, d_model, bias=False)      # query = band-agnostic
+        # BAND-TYPED K/V + output projections (``n_op`` distinct weights, gathered per
+        # cell by ``cell_patch``) — the multiplicative inverse of the pool's band-typed
+        # W_K/W_V: the seeds are band-specific (the pool typed them), the target is
+        # band-specific, so a band-BLIND readout would have to undo n_op encodings with
+        # one map. Bands are abundant (every cell is one of n_op groups) ⇒ no rare-
+        # bucket staleness (unlike a per-parcel typing). Applied as ``x @ W[op]``.
+        self.W_k = nn.Parameter(torch.empty(n_op, d_model, d_model))
+        self.W_v = nn.Parameter(torch.empty(n_op, d_model, d_model))
+        self.out_head = nn.Parameter(torch.empty(n_op, d_model, d_model))
+        for o in range(n_op):
+            nn.init.xavier_uniform_(self.W_k[o])
+            nn.init.xavier_uniform_(self.W_v[o])
+            nn.init.xavier_uniform_(self.out_head[o])
+        self.W_o = nn.Linear(d_model, d_model, bias=False)     # head-merge, band-agnostic
         self.ln_ff = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(                              # standard 4x FFN
             nn.Linear(d_model, 4 * d_model), nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
-        # Final clean projection to the target space — mirrors JepaPredictorV2's
-        # ``self.head`` (raw pred, NO LN): reads the residual stream and projects,
-        # so the raw positional query doesn't leak into the output. Matches the
-        # M2/M4 predictor's output contract exactly.
-        self.out_head = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, seeds: Tensor, offset_feats: Tensor) -> Tensor:
+    def _band_proj(self, x: Tensor, weight: Tensor, band: Tensor | None) -> Tensor:
+        """``x @ weight[band]`` — per-row band-typed linear. ``weight`` ``(n_op,d,d)``,
+        ``band`` ``(N,)`` the cell's operator id. Masked-SUM over the ≤4 ops (grad-safe,
+        no in-place, no ``(N,d,d)`` gather); ``n_op=1`` is the plain single op (band
+        ignored ⇒ may be None)."""
+        if self.n_op == 1:
+            return x @ weight[0]
+        if band is None:
+            raise ValueError(f"band-typed recon (n_op={self.n_op}) needs a band index")
+        out = x @ weight[0] * (band == 0).view(band.shape[0], *([1] * (x.dim() - 1)))
+        for op in range(1, self.n_op):
+            m = (band == op).view(band.shape[0], *([1] * (x.dim() - 1)))
+            out = out + (x @ weight[op]) * m
+        return out
+
+    def forward(
+        self, seeds: Tensor, offset_feats: Tensor, band: Tensor | None = None
+    ) -> Tensor:
         """``seeds`` ``(N, k, d)`` the query electrode's parcel seeds at its cell;
         ``offset_feats`` ``(N, F)`` = ``RelativeGeometry.features(centroid-relative
-        offset)``. Returns ``(N, d)`` the reconstructed feature."""
+        offset)``; ``band`` ``(N,)`` long = the cell's K/V operator id (``cell_patch``),
+        required iff ``n_op>1``. Returns ``(N, d)`` the reconstructed feature."""
         N, k, d = seeds.shape
         H, hd = self.n_heads, self.head_dim
         q = self.q_base + self.q_pos(offset_feats)              # (N, d)
         qn, sn = self.ln_q(q), self.ln_kv(seeds)               # pre-norm
         qh = self.W_q(qn).reshape(N, 1, H, hd).transpose(1, 2)  # (N, H, 1, hd)
-        kh = self.W_k(sn).reshape(N, k, H, hd).transpose(1, 2)  # (N, H, k, hd)
-        vh = self.W_v(sn).reshape(N, k, H, hd).transpose(1, 2)
+        kh = self._band_proj(sn, self.W_k, band).reshape(N, k, H, hd).transpose(1, 2)
+        vh = self._band_proj(sn, self.W_v, band).reshape(N, k, H, hd).transpose(1, 2)
         # Explicit (unmasked, no-dropout) attention — mathematically identical to
         # F.scaled_dot_product_attention but NOT routed through the fused dispatcher.
         # The recon query is degenerate (q_len=1, kv_len=k=2); the flash/cuDNN fused
@@ -813,10 +852,10 @@ class ElectrodeReconHead(nn.Module):
         attn = torch.softmax(qh @ kh.transpose(-2, -1) / (hd ** 0.5), dim=-1)  # (N,H,1,k)
         ctx = attn @ vh                                        # (N, H, 1, hd)
         # Perceiver-IO BasicDecoder: query residual OFF (the query is a positional
-        # ADDRESS, not content to preserve), MLP residual ON, then linear readout.
+        # ADDRESS, not content to preserve), MLP residual ON, then band-typed readout.
         h = self.W_o(ctx.transpose(1, 2).reshape(N, d))        # no query residual
         h = h + self.ffn(self.ln_ff(h))                        # MLP + residual
-        return self.out_head(h)                                # linear readout
+        return self._band_proj(h, self.out_head, band)         # band-typed readout
 
 
 class SetPoolV2(nn.Module):
@@ -854,6 +893,7 @@ class SetPoolV2(nn.Module):
         n_op: int = 2,
         ln_out: bool = False,
         mab: bool = False,
+        parcel_embed: bool = True,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -867,12 +907,19 @@ class SetPoolV2(nn.Module):
         self.n_op = n_op
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
-        # Queries: base seed color (k) + per-parcel query embed (universal,
-        # DKT-sized) + shared W_Q. Freq/time-agnostic.
+        # Queries: base seed color (k), SHARED across parcels (the k probes are
+        # universal — same learned seeds everywhere, the cross-subject-transfer
+        # property). Run-A/legacy adds a per-parcel query embed (coarse anatomical
+        # anchor); Run-B DROPS it (``parcel_embed=False``) so the pool is a UNIVERSAL
+        # geometric operator — parcels differ only by electrode geometry (membership +
+        # relational bias + band), not a learned per-region prior that goes stale on a
+        # held-out subject; anatomical identity is re-injected downstream at M4.
         self.base_seed = nn.Parameter(torch.empty(k, d_model))
         nn.init.trunc_normal_(self.base_seed, std=0.02)
-        self.embed_pq = nn.Parameter(torch.empty(n_parcels, d_model))
-        nn.init.trunc_normal_(self.embed_pq, std=0.02)
+        self.embed_pq: nn.Parameter | None = None
+        if parcel_embed:
+            self.embed_pq = nn.Parameter(torch.empty(n_parcels, d_model))
+            nn.init.trunc_normal_(self.embed_pq, std=0.02)
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
 
         # Stacked frequency-specific reading operators (gathered per cell).
@@ -918,8 +965,11 @@ class SetPoolV2(nn.Module):
             raise ValueError(f"cell_patch must be (S={S},), got {tuple(cell_patch.shape)}")
 
         # Queries (P, k, d) → W_Q → (P·k, H, hd). Cell-independent. MAB pre-norms
-        # the query (raw q_tok kept for the seed residual below).
-        q_tok = self.embed_pq[parcel_labels][:, None, :] + self.base_seed[None, :, :]
+        # the query (raw q_tok kept for the seed residual below). Run-B: no per-parcel
+        # embed ⇒ the shared base_seed broadcast over all parcels.
+        q_tok = self.base_seed[None, :, :].expand(P, k, d)
+        if self.embed_pq is not None:
+            q_tok = self.embed_pq[parcel_labels][:, None, :] + q_tok
         q_in = self.ln_q(q_tok) if self.mab else q_tok
         q = self.W_Q(q_in).reshape(P * k, H, hd)
 
@@ -1299,6 +1349,7 @@ def converged_v2_loss_per_head(
     melec_pred: Tensor | None = None,
     melec_target: Tensor | None = None,
     w_melec: float = 1.0,
+    melec_weight: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """Run-A per-head JEPA loss (Ben 2026-06-27): three INDEPENDENT
     self-normalized L1 means on RAW (detached) EMA targets, combined with
@@ -1350,7 +1401,11 @@ def converged_v2_loss_per_head(
             raise ValueError("melec_pred given but melec_target is None")
         if melec_pred.shape[-1] != d:
             raise ValueError(f"melec_pred feature dim {melec_pred.shape[-1]} != m2 dim {d}")
-        l_melec = _head(melec_pred, melec_target)
+        # ``melec_weight`` (Run-B complete-grid): 0/1 per query cell — 0 at cells
+        # whose survivor-seed is fully empty (no signal to reconstruct from), so the
+        # self-normalized mean divides by LIVE cells only (don't supervise the
+        # information-theoretically impossible).
+        l_melec = _head(melec_pred, melec_target, melec_weight)
         loss = loss + w_melec * l_melec
         diag["loss"] = loss
         diag["loss_melec"] = l_melec
@@ -1464,11 +1519,13 @@ class V14ConvergedV2Config:
     @property
     def pool_op_resolved(self) -> str:
         """Pool K/V operator mode, defaulting by run mode when ``pool_op`` is None:
-        Run-B ⇒ ``"shared"`` (n_op=1, first arm); Run-A/legacy ⇒ ``"band"`` (n_op=2,
+        Run-B ⇒ ``"patch"`` (n_op=4 — HGA + the 3 LFS log-groups get distinct K/V,
+        the multiplicative band-typing HGA/LFS genuinely need; an additive freq-embed
+        on keys cancels in the per-cell softmax); Run-A/legacy ⇒ ``"band"`` (n_op=2,
         byte-identical resume). An explicit ``pool_op`` always wins."""
         if self.pool_op is not None:
             return self.pool_op
-        return "shared" if self.run_b else "band"
+        return "patch" if self.run_b else "band"
 
 
 @dataclass(frozen=True)
@@ -1517,6 +1574,7 @@ class V14ConvergedV2(nn.Module):
         self.pool = SetPoolV2(
             cfg.d_model, cfg.n_heads, k=cfg.k, n_parcels=cfg.n_parcels, n_op=n_op,
             ln_out=cfg.run_a or cfg.run_b, mab=cfg.run_b,
+            parcel_embed=not cfg.run_b,
         )
         self.latent = LatentEncoderV2(
             cfg.d_model, cfg.n_heads, cfg.latent_layers, cfg.n_parcels,
@@ -1551,7 +1609,9 @@ class V14ConvergedV2(nn.Module):
             self.geom = RelativeGeometry(
                 cfg.n_heads, sigma_mm=cfg.sigma_mm, n_freqs=cfg.geom_n_freqs
             )
-            self.recon = ElectrodeReconHead(cfg.d_model, cfg.n_heads, self.geom.feat_dim)
+            self.recon = ElectrodeReconHead(
+                cfg.d_model, cfg.n_heads, self.geom.feat_dim, n_op=n_op
+            )
             # k seed probes, centroid-relative mm frame; zero-init ⇒ all seeds start
             # at the parcel centroid (pure content pool at step 0).
             self.pool_seed_offset = nn.Parameter(torch.zeros(cfg.k, 3))
@@ -1753,6 +1813,7 @@ class V14ConvergedV2(nn.Module):
         parcel_idx: Tensor,   # (C,) each electrode's parcel row
         u_e: Tensor,          # (C,3) centroid-relative offsets
         membership: Tensor,   # (P,C) bool
+        cell_patch: Tensor,   # (S,) long — each cell's band op id (recon K/V typing)
         sh: StaticShapesV2,
     ) -> tuple[Tensor, Tensor]:
         """Reconstruct each DROPPED electrode's teacher frontend feature at its
@@ -1793,8 +1854,66 @@ class V14ConvergedV2(nn.Module):
         feats = feats_e[drop_idx]                               # (B,D,F)
         Fdim = feats.shape[-1]
         feats = feats[:, :, None, :].expand(B, D, s_vis, Fdim).reshape(B * D * s_vis, Fdim)
-        pred = self.recon(seeds_ctx, feats)                     # (B·D·s_vis, d)
+        band = cell_patch[dvis].reshape(B * D * s_vis)          # (B·D·s_vis,) band per cell
+        pred = self.recon(seeds_ctx, feats, band)              # (B·D·s_vis, d)
         return pred, tgt
+
+    def _melec_recon_full(
+        self,
+        s_seeds: Tensor,      # (B,P,k,S,d) student seeds (dropped electrodes blocked)
+        t_front: Tensor,      # (B,C,S,d) teacher frontend (the recon target source)
+        drop_mask: Tensor,    # (B,C) bool, True = dropped
+        empty_ps: Tensor,     # (B,P,S) bool, True = parcel-cell has no visible seed
+        parcel_idx: Tensor,   # (C,) each electrode's parcel row
+        u_e: Tensor,          # (C,3) centroid-relative offsets
+        membership: Tensor,   # (P,C) bool
+        cell_patch: Tensor,   # (S,) long — each cell's band op id (recon K/V typing)
+        sh: StaticShapesV2,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Complete-grid (Run-B hetero) recon: reconstruct each DROPPED electrode's
+        teacher frontend at ALL ``S`` cells from the survivor seeds at that cell,
+        addressed by its native-RAS offset. Under hetero the pool exposes the full
+        grid (the union of the survivors' per-electrode masks covers it), so there is
+        no parcel-visible subset to gather — we predict every cell and mask the LOSS
+        at the rare empty cell (all survivors masked there ⇒ nothing to interpolate).
+        Returns ``(pred (N,d), target (N,d), weight (N,))`` with ``N = B·D·S`` and
+        ``weight`` 0/1 (0 at empty cells)."""
+        assert self.recon is not None and self.geom is not None
+        assert self.cfg.m3_drop_frac is not None
+        B, C, S, d = t_front.shape
+        k = sh.k
+        nd = electrode_drop_count(membership, self.cfg.m3_drop_frac, self.cfg.m3_min_keep)
+        D = int(nd.sum().item())
+        if D == 0:                                               # nothing droppable
+            z = t_front.new_zeros(0, d)
+            return z, z, t_front.new_zeros(0)
+        drop_idx = _select_idx(drop_mask, D)                    # (B,D) electrode ids
+        pd = parcel_idx[drop_idx]                               # (B,D) their parcels
+
+        # context seeds: the dropped electrode's parcel, ALL S cells (complete grid).
+        seeds_ctx = torch.gather(
+            s_seeds, 1, pd[:, :, None, None, None].expand(B, D, k, S, d)
+        )                                                       # (B,D,k,S,d)
+        seeds_ctx = seeds_ctx.permute(0, 1, 3, 2, 4).reshape(B * D * S, k, d)
+
+        # target: teacher frontend of the dropped electrode at all S cells.
+        tgt = torch.gather(
+            t_front, 1, drop_idx[:, :, None, None].expand(B, D, S, d)
+        ).reshape(B * D * S, d)
+
+        # positional query features (per dropped electrode, broadcast over cells).
+        feats_e = self.geom.features(u_e)                       # (C,F)
+        feats = feats_e[drop_idx]                               # (B,D,F)
+        Fdim = feats.shape[-1]
+        feats = feats[:, :, None, :].expand(B, D, S, Fdim).reshape(B * D * S, Fdim)
+        band = cell_patch[None, None, :].expand(B, D, S).reshape(B * D * S)  # band per cell
+        pred = self.recon(seeds_ctx, feats, band)              # (B·D·S, d)
+
+        # loss weight: 0 where the dropped electrode's parcel-cell has no survivor
+        # (empty seed) — don't supervise an impossible reconstruction.
+        empty_d = torch.gather(empty_ps, 1, pd[:, :, None].expand(B, D, S))  # (B,D,S)
+        weight = (~empty_d).to(pred.dtype).reshape(B * D * S)
+        return pred, tgt, weight
 
     # -- the SSL step -----------------------------------------------------------
     def forward(
@@ -1898,35 +2017,72 @@ class V14ConvergedV2(nn.Module):
             block=pool_block, geom_bias=pool_geom,
         )                                                            # (B,P,k,S,d)
 
-        # === stage 5: gather visible seeds/parcel, tag, gather untubed parcels ==
-        pvis_idx = _select_idx(~m2_mask, s_vis)                       # (B,P,s_vis)
-        gpv = pvis_idx[:, :, None, :, None].expand(B, P, k, s_vis, d)
-        s_seeds_vis = torch.gather(s_seeds, 3, gpv)                   # (B,P,k,s_vis,d)
-        s_tag = (
-            s_seeds_vis
-            + self.latent.parcel_embed(labels)[None, :, None, None, :]
-        )
-        untubed_idx = _select_idx(~tube_mask, P_vis)                  # (B,P_vis)
-        gu = untubed_idx[:, :, None, None, None].expand(B, P_vis, k, s_vis, d)
-        s_in = torch.gather(s_tag, 1, gu)                            # (B,P_vis,k,s_vis,d)
+        # Complete-grid (Run-B hetero): different electrodes hold out DIFFERENT cells,
+        # so their union covers the grid — the pool exposes the full S field and NO
+        # parcel cell is dropped (unlike Run-A / uniform, which pvis-drop the masked
+        # cells). A parcel-cell with no visible member (all survivors masked there) is
+        # EMPTY = the finite-sentinel null; key-block it up the stack (latent + M4 —
+        # a null no live token attends is a JEPA drop, not a mask token) and drop it
+        # from the melec loss.
+        hetero = self.cfg.run_b and m2_elec_mask is not None
+        empty_ps: Tensor | None = None
+        lat_key_mask: Tensor | None = None
+        ctx4_key_mask: Tensor | None = None
+        melec_weight: Tensor | None = None
+        if hetero:
+            assert pool_block is not None
+            empty_ps = _empty_cell_mask(pool_block, membership)      # (B,P,S)
 
-        # per-row latent RoPE slots = the untubed parcels' visible-cell slots.
-        pvis_slot = slot[pvis_idx]                                   # (B,P,s_vis)
-        untubed_slot = torch.gather(
-            pvis_slot, 1, untubed_idx[:, :, None].expand(B, P_vis, s_vis)
-        )                                                            # (B,P_vis,s_vis)
-        lat_slot = (
-            untubed_slot[:, :, None, :].expand(B, P_vis, k, s_vis).reshape(
-                B, P_vis * k * s_vis
+        # === stage 5: tag seeds, gather untubed parcels ========================
+        if hetero:
+            # Complete grid: keep ALL S cells (no pvis drop); the empty cells are
+            # key-blocked in the latent/M4 instead. RoPE slots are the shared (S,)
+            # clock — every parcel exposes the same full cell set.
+            assert empty_ps is not None
+            s_tag = s_seeds + self.latent.parcel_embed(labels)[None, :, None, None, :]
+            untubed_idx = _select_idx(~tube_mask, P_vis)             # (B,P_vis)
+            gu = untubed_idx[:, :, None, None, None].expand(B, P_vis, k, S, d)
+            s_in = torch.gather(s_tag, 1, gu)                        # (B,P_vis,k,S,d)
+            s_lat = S
+            lat_slot: Tensor = slot                                 # (S,) shared clock
+            ctx4_slot = slot.repeat(P_vis * k)[None].expand(B, P_vis * k * S)
+            attend_unt = torch.gather(
+                ~empty_ps, 1, untubed_idx[:, :, None].expand(B, P_vis, S)
+            )                                                       # (B,P_vis,S)
+            lat_key_mask = attend_unt[:, :, None, :].expand(B, P_vis, k, S)
+            ctx4_key_mask = lat_key_mask.reshape(B, P_vis * k * S)
+        else:
+            # pvis path (Run-A + Run-B-uniform): drop each parcel's M2-masked cells
+            # (Run-A's M3 predicts them; uniform masks every electrode identically so
+            # the masked cell has no visible seed anyway).
+            pvis_idx = _select_idx(~m2_mask, s_vis)                  # (B,P,s_vis)
+            gpv = pvis_idx[:, :, None, :, None].expand(B, P, k, s_vis, d)
+            s_seeds_vis = torch.gather(s_seeds, 3, gpv)              # (B,P,k,s_vis,d)
+            s_tag = (
+                s_seeds_vis
+                + self.latent.parcel_embed(labels)[None, :, None, None, :]
             )
-        )
+            untubed_idx = _select_idx(~tube_mask, P_vis)            # (B,P_vis)
+            gu = untubed_idx[:, :, None, None, None].expand(B, P_vis, k, s_vis, d)
+            s_in = torch.gather(s_tag, 1, gu)                       # (B,P_vis,k,s_vis,d)
+            # per-row latent RoPE slots = the untubed parcels' visible-cell slots.
+            pvis_slot = slot[pvis_idx]                              # (B,P,s_vis)
+            untubed_slot = torch.gather(
+                pvis_slot, 1, untubed_idx[:, :, None].expand(B, P_vis, s_vis)
+            )                                                       # (B,P_vis,s_vis)
+            lat_slot = (
+                untubed_slot[:, :, None, :].expand(B, P_vis, k, s_vis).reshape(
+                    B, P_vis * k * s_vis
+                )
+            )
+            s_lat = s_vis
+            ctx4_slot = lat_slot
 
-        # === stage 6: latent self-attention over the gathered seeds ============
-        s_latent = self.latent(s_in, None, lat_slot)                 # (B,P_vis,k,s_vis,d)
+        # === stage 6: latent self-attention over the seeds =====================
+        s_latent = self.latent(s_in, None, lat_slot, key_mask=lat_key_mask)  # (B,P_vis,k,s_lat,d)
 
         # === stage 7: M4 (+ Run-A M3) predictor(s) ============================
-        ctx4 = s_latent.reshape(B, P_vis * k * s_vis, d)
-        ctx4_slot = lat_slot
+        ctx4 = s_latent.reshape(B, P_vis * k * s_lat, d)
         t_latent_flat = t_latent.reshape(B, P * k * S, d)
         m3_pred: Tensor | None = None
         m3_target: Tensor | None = None
@@ -1942,6 +2098,7 @@ class V14ConvergedV2(nn.Module):
             m4_pred = self.m4_predictor(
                 ctx4, ctx4_slot, slot[cell], freq_id[cell],
                 q_parcel=labels[pos], q_seed=seed,
+                ctx_key_mask=ctx4_key_mask,          # hetero: drop empty context cells
             )
             flat4 = (pos * k + seed) * S + cell
             Lq4 = flat4.shape[1]
@@ -1949,9 +2106,17 @@ class V14ConvergedV2(nn.Module):
                 t_latent_flat, 1, flat4[..., None].expand(B, Lq4, d)
             )
             assert u_e is not None and drop_mask is not None
-            melec_pred, melec_target = self._melec_recon(
-                s_seeds, t_front, drop_mask, pvis_idx, parcel_idx, u_e, membership, sh
-            )
+            if hetero:
+                assert empty_ps is not None
+                melec_pred, melec_target, melec_weight = self._melec_recon_full(
+                    s_seeds, t_front, drop_mask, empty_ps, parcel_idx, u_e,
+                    membership, cell_patch, sh
+                )
+            else:
+                melec_pred, melec_target = self._melec_recon(
+                    s_seeds, t_front, drop_mask, pvis_idx, parcel_idx, u_e,
+                    membership, cell_patch, sh
+                )
             m4_w = None
             if self.cfg.support_weight:
                 n_elec = membership.sum(-1).to(m4_pred.dtype)
@@ -1963,7 +2128,7 @@ class V14ConvergedV2(nn.Module):
                 m4_pred.reshape(-1, d), m4_target.reshape(-1, d),
                 w_m2=self.cfg.w_m2, w_m3=0.0, w_m4=self.cfg.w_m4, m4_weight=m4_w,
                 melec_pred=melec_pred, melec_target=melec_target,
-                w_melec=self.cfg.w_melec,
+                w_melec=self.cfg.w_melec, melec_weight=melec_weight,
             )
         elif self.cfg.run_a:
             # M4 predicts the TUBED parcels only (all S cells); the untubed
@@ -2062,6 +2227,10 @@ class V14ConvergedV2(nn.Module):
             if melec_pred is not None and melec_target is not None:
                 out["_tap_melec_pred"] = melec_pred.detach()      # (N,d)
                 out["_tap_melec_target"] = melec_target.detach()
+                if hetero:
+                    assert empty_ps is not None and melec_weight is not None
+                    out["_tap_empty_cell"] = empty_ps.detach()    # (B,P,S) True=empty
+                    out["_tap_melec_weight"] = melec_weight.detach()  # (N,) 0/1
                 # Run-B pool tap: the SAME pool_rankme/pool_feat_std source Run-A emits
                 # from its M3 block (the teacher-pool "M3 target" = the pooling-tax rank
                 # diagnostic). t_seeds is computed unconditionally in the teacher block,

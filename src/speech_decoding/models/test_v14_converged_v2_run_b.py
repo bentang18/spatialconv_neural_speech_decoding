@@ -62,11 +62,17 @@ def test_run_b_builds_expected_params():
     assert any("pool_seed_offset" in k for k in keys)
     assert any("pool.ln_out" in k for k in keys)           # Run-A structure inherited
     assert not any("m3_predictor" in k for k in keys)      # M3 head replaced
-    # Run-B first-arm default: pool K/V typing auto-resolves to "shared" (n_op=1,
-    # plain PMA) — one shared W_K/W_V read operator, NOT the Run-A band-tied 2.
-    assert m.cfg.pool_op_resolved == "shared"
-    assert m.pool.W_K.shape[0] == 1
-    assert m.teacher_pool.W_K.shape[0] == 1
+    # Run-B canonical: pool K/V typing auto-resolves to "patch" (n_op=4 — HGA + 3 LFS
+    # log-groups get distinct multiplicative W_K/W_V), NOT the Run-A band-tied 2.
+    assert m.cfg.pool_op_resolved == "patch"
+    assert m.pool.W_K.shape[0] == 4
+    assert m.teacher_pool.W_K.shape[0] == 4
+    # No per-parcel pool query embed (universal geometric operator); recon K/V + output
+    # are band-typed to the same n_op as the pool (symmetric inverse).
+    assert m.pool.embed_pq is None
+    assert m.teacher_pool.embed_pq is None
+    assert m.recon.n_op == 4
+    assert m.recon.W_k.shape[0] == 4 and m.recon.out_head.shape[0] == 4
 
 
 def test_run_b_pool_op_override_restores_band_typed():
@@ -200,3 +206,126 @@ def test_run_b_m2_hetero_off_ignores_elec_mask():
     drop = m.sample_drop(lfs.shape[0], membership, g)
     out = m(lfs, hga, poe, m2, tube, clip_len_s=5.0, coords=coords, drop_mask=drop)
     assert torch.isfinite(out["loss"])                     # no m2_elec_mask needed
+
+
+# ---------------------------------- complete-grid (hetero) + empty-cell key-block
+def test_empty_cell_mask_helper():
+    """A parcel-cell is EMPTY iff every member electrode is blocked there."""
+    membership = torch.tensor([[True, True, False], [False, False, True]])
+    block = torch.zeros(1, 3, 3, dtype=torch.bool)          # (B,S,C)
+    block[0, 0, 0] = True; block[0, 0, 1] = True            # parcel0 empty @ cell0
+    block[0, 1, 0] = True                                   # parcel0 keeps elec1 @ cell1
+    block[0, 2, 2] = True                                   # parcel1 empty @ cell2
+    empty = v2._empty_cell_mask(block, membership)          # (B,P,S)
+    assert empty.shape == (1, 2, 3)
+    assert bool(empty[0, 0, 0]) and not bool(empty[0, 0, 1])
+    assert not bool(empty[0, 0, 2])                         # both visible @ cell2
+    assert bool(empty[0, 1, 2]) and not bool(empty[0, 1, 0])
+
+
+def test_run_b_hetero_latent_runs_over_full_S_grid():
+    """Hetero drops NO parcel cells (union of per-electrode masks covers the
+    grid) ⇒ the latent runs the full S cells, not the pvis-shrunk s_vis."""
+    bands, poe, membership, lfs, hga, m2, tube, coords, g = _session(seed=7)
+    m = V14ConvergedV2(_cfg(m2_hetero=True))
+    B, C = lfs.shape[0], poe.shape[0]
+    drop = m.sample_drop(B, membership, g)
+    m2e = m.sample_m2_hetero(B, C, bands, g)
+    out = m(lfs, hga, poe, m2, tube, clip_len_s=5.0, coords=coords,
+            drop_mask=drop, m2_elec_mask=m2e, return_taps=True)
+    S = out["_tap_teacher_pool"].shape[3]                   # teacher = full grid
+    assert out["_tap_student_latent"].shape[3] == S        # complete grid, no pvis
+
+
+def test_run_b_uniform_latent_shrinks_to_s_vis():
+    """Contrast: the parcel-uniform (non-hetero) arm still drops the masked cells
+    via pvis, so its latent is strictly smaller than the full S grid."""
+    bands, poe, membership, lfs, hga, m2, tube, coords, g = _session(seed=7)
+    m = V14ConvergedV2(_cfg(m2_hetero=False))
+    drop = m.sample_drop(lfs.shape[0], membership, g)
+    out = m(lfs, hga, poe, m2, tube, clip_len_s=5.0, coords=coords,
+            drop_mask=drop, return_taps=True)
+    S = out["_tap_teacher_pool"].shape[3]
+    assert out["_tap_student_latent"].shape[3] < S         # pvis shrinks the grid
+
+
+def test_run_b_hetero_melec_weight_is_binary_and_marks_empties():
+    """melec loss weight ∈ {0,1}, length == B·D·S, and its zeros count EXACTLY the
+    empty cells at the dropped electrodes' parcels (no supervision on empty seeds)."""
+    bands, poe, membership, lfs, hga, m2, tube, coords, g = _session(seed=4)
+    m = V14ConvergedV2(_cfg(m2_hetero=True))
+    B, C = lfs.shape[0], poe.shape[0]
+    drop = m.sample_drop(B, membership, g)
+    m2e = m.sample_m2_hetero(B, C, bands, g)
+    out = m(lfs, hga, poe, m2, tube, clip_len_s=5.0, coords=coords,
+            drop_mask=drop, m2_elec_mask=m2e, return_taps=True)
+    w = out["_tap_melec_weight"]                            # (B·D·S,)
+    empty = out["_tap_empty_cell"]                          # (B,P,S)
+    assert ((w == 0) | (w == 1)).all()
+    D = int(v2.electrode_drop_count(membership, 0.4, 3).sum())
+    S = empty.shape[-1]
+    assert w.numel() == B * D * S
+    drop_idx = v2._select_idx(drop, D)                     # (B,D) same as forward
+    parcel_idx = membership.float().argmax(0)              # electrode -> parcel row
+    pd = parcel_idx[drop_idx]                              # (B,D)
+    empty_d = torch.gather(empty, 1, pd[:, :, None].expand(B, D, S))
+    assert int((w == 0).sum()) == int(empty_d.sum())       # zeros ⟺ empty cells
+
+
+def test_melec_loss_weight_masks_zero_weighted_cells():
+    """melec_weight all-ones == unweighted; zeroing cells drops them from the mean."""
+    torch.manual_seed(0)
+    d = 8
+    m2p, m2t = torch.randn(4, d), torch.randn(4, d)
+    m4p, m4t = torch.randn(4, d), torch.randn(4, d)
+    mp, mt = torch.randn(6, d), torch.randn(6, d)
+    e = torch.zeros(0, d)
+    base = v2.converged_v2_loss_per_head(
+        m2p, m2t, e, e, m4p, m4t, melec_pred=mp, melec_target=mt)
+    ones = v2.converged_v2_loss_per_head(
+        m2p, m2t, e, e, m4p, m4t, melec_pred=mp, melec_target=mt,
+        melec_weight=torch.ones(6))
+    assert torch.allclose(base["loss_melec"], ones["loss_melec"])
+    w = torch.tensor([1., 1., 1., 0., 0., 0.])
+    masked = v2.converged_v2_loss_per_head(
+        m2p, m2t, e, e, m4p, m4t, melec_pred=mp, melec_target=mt, melec_weight=w)
+    expected = (mp[:3] - mt[:3]).abs().mean()
+    assert torch.allclose(masked["loss_melec"], expected)
+
+
+def test_recon_head_band_typed_output_depends_on_band():
+    """Band-typed K/V + output ⇒ the SAME seeds+offset reconstruct differently under
+    a different cell band (proves the typing is live); n_op=1 ignores band."""
+    torch.manual_seed(0)
+    d, H, F, n_op = 32, 4, 7, 4
+    head = v2.ElectrodeReconHead(d, H, F, n_op=n_op)
+    seeds = torch.randn(5, 2, d)
+    feats = torch.randn(5, F)
+    o0 = head(seeds, feats, torch.zeros(5, dtype=torch.long))
+    o1 = head(seeds, feats, torch.ones(5, dtype=torch.long))
+    assert o0.shape == (5, d)
+    assert not torch.allclose(o0, o1)                          # band changes the readout
+    # a single-op head is band-invariant (no typing).
+    shared = v2.ElectrodeReconHead(d, H, F, n_op=1)
+    s0 = shared(seeds, feats, torch.zeros(5, dtype=torch.long))
+    s1 = shared(seeds, feats, torch.ones(5, dtype=torch.long))
+    assert torch.allclose(s0, s1)
+
+
+def test_run_b_hetero_no_parcel_embed_grads_flow():
+    """Canonical Run-B (hetero, n_op=4, no embed_pq): forward+backward finite, and
+    gradients reach the shared base_seed + the band-typed recon K/V + output."""
+    bands, poe, membership, lfs, hga, m2, tube, coords, g = _session(seed=7)
+    m = V14ConvergedV2(_cfg(m2_hetero=True))
+    assert m.pool.embed_pq is None                             # universal geometric pool
+    B, C = lfs.shape[0], poe.shape[0]
+    drop = m.sample_drop(B, membership, g)
+    m2e = m.sample_m2_hetero(B, C, bands, g)
+    out = m(lfs, hga, poe, m2, tube, clip_len_s=5.0, coords=coords,
+            drop_mask=drop, m2_elec_mask=m2e)
+    assert torch.isfinite(out["loss"]).all()
+    out["loss"].backward()
+    assert m.pool.base_seed.grad is not None and torch.isfinite(m.pool.base_seed.grad).all()
+    assert m.recon.W_k.grad is not None and m.recon.W_k.grad.abs().sum() > 0
+    assert m.recon.out_head.grad is not None and m.recon.out_head.grad.abs().sum() > 0
+    assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
