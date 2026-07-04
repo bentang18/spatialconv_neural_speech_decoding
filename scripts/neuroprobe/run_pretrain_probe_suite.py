@@ -65,11 +65,45 @@ RUN_A_ARGV: list[str] = [
     "--trial-durations", "/projects/bhqk/htang13/v14_trial_durations.json",
 ]
 
+# Run-B (recon) arch — matches the live `runb_recon_e512` run (job 2599052, DeltaAI HEAD
+# b01ad1f): d256/4-heads, latent 6 (not Run-A's 12), pred_dim 128, m4-pred 6, + the melec
+# reconstruction head (m3-drop-frac/w-melec, which overlays the m3 loss slot ⇒ no w-m3, no
+# m3-pred-layers). ``--converged-v2-pool-op patch`` PINS n_op=4 explicitly so the built
+# pool matches the ckpt regardless of the src ``pool_op_resolved`` default (b01ad1f resolves
+# Run-B→patch; origin/main 85cd592 flips the default to band — pinning is load-safe on both).
+# Data flags (winsor / bad-window / spec / durations) are identical to Run-A, so reused.
+RUN_B_ARGV: list[str] = [
+    "--phase", "1", "--mode", "full", "--frontend", "2band", "--atlas", "dkt",
+    "--d-model", "256", "--n-heads", "4",
+    "--converged-frontend-layers", "6", "--converged-latent-layers", "6",
+    "--converged-v2-pred-dim", "128",
+    "--converged-v2-m2-pred-layers", "6", "--converged-v2-m4-pred-layers", "6",
+    "--converged-v2-qk-norm",
+    "--converged-v2-m3-drop-frac", "0.5", "--converged-v2-m3-min-keep", "3",
+    "--converged-v2-w-m2", "1.0", "--converged-v2-w-m4", "1.0",
+    "--converged-v2-w-melec", "1.0",
+    "--converged-v2-pool-op", "patch",
+    "--converged-v2-support-weight", "--converged-v2-k", "2",
+    "--converged-tube-ratio", "0.25", "--clip-len", "4.0",
+    "--lr", "6e-3", "--weight-decay", "0.04", "--grad-clip", "3.0",
+    "--lr-schedule", "warmup_cosine", "--min-lr-ratio", "1.0", "--warmup-steps", "5000",
+    "--ema-tau", "0.99925", "--adam-beta2", "0.95", "--seed", "33",
+    "--batch-size", "32", "--accumulate-grad-batches", "4",
+    "--session-z-winsor-lfs", "15", "--session-z-winsor-hga", "20",
+    "--bad-window-dir", "/projects/bhqk/htang13/v14_bad_windows_2band",
+    "--spec-only", "--spec-cache-dir", "/work/nvme/bhqk/htang13/v14_2band_v2_spec_pretrain",
+    "--trial-durations", "/projects/bhqk/htang13/v14_trial_durations.json",
+]
+
 PROBE_CLIP_DUR_S = 1.0
 
 
-def _build_xp():
-    """Build the run's experiment so ``xp.data`` carries Run A's exact 2-band segmenter."""
+def _build_xp(argv: list[str] = RUN_A_ARGV):
+    """Build the run's experiment so ``xp.data`` carries the run's exact 2-band segmenter.
+
+    ``argv`` selects the arch: ``RUN_A_ARGV`` (default) or ``RUN_B_ARGV`` (the recon run).
+    The Run-B argv sets ``m3_drop_frac`` ⇒ the segmenter auto-registers the native-RAS
+    ``electrode_coords`` extractor the melec head consumes at forward."""
     from speech_decoding.experiments.dispatch_v14 import (
         _common_build_kwargs,
         _parser,
@@ -77,7 +111,7 @@ def _build_xp():
         build_v14_experiment,
     )
 
-    args = _parser().parse_args(RUN_A_ARGV)
+    args = _parser().parse_args(argv)
     _resolve_static_forward_cohesion(args)
     if getattr(args, "exca_mode", None) is None:
         args.exca_mode = "cached"          # main() resolves this default; we skip main()
@@ -426,7 +460,7 @@ def _apply_lite_montage(bands, ppe, em, *, bt_root, subject_id, trial_id):
 
 
 def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
-               electrode_set="lite", batch_size=64):
+               electrode_set="lite", batch_size=64, argv=RUN_A_ARGV):
     """Stage 1: forward the trained encoder over each session's union clips → tap caches.
 
     One GPU forward per session over EXACTLY the union word windows (est_idx-aligned,
@@ -456,7 +490,7 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
     )
 
     bt_root = os.environ.get("ROOT_DIR_BRAINTREEBANK")
-    xp = _build_xp()
+    xp = _build_xp(argv)
     ieeg = _ieeg_index(xp)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_v2_converged_model(xp, ckpt_path, device=device)
@@ -832,6 +866,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--encode", action="store_true",
                    help="Stage 1: GPU forward a checkpoint → per-session tap caches")
     p.add_argument("--ckpt", default=None, help="checkpoint to forward (required for --encode)")
+    p.add_argument("--run-b", action="store_true",
+                   help="--encode: build the Run-B recon arch (RUN_B_ARGV) instead of Run-A")
     p.add_argument("--cache-dir", default=None,
                    help="output dir for --encode tap caches (required for --encode)")
     p.add_argument("--no-untagged-m3", action="store_true",
@@ -913,7 +949,8 @@ def main(argv: list[str] | None = None) -> int:
         run_encode(sessions, tuple(NEUROPROBE_TASKS),
                    ckpt_path=args.ckpt, out_dir=args.cache_dir,
                    cache_untagged_m3=not args.no_untagged_m3,
-                   electrode_set=args.electrode_set)
+                   electrode_set=args.electrode_set,
+                   argv=RUN_B_ARGV if args.run_b else RUN_A_ARGV)
         return 0
 
     if args.merge:
