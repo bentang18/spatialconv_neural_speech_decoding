@@ -587,6 +587,21 @@ def _load_tap_caches(cache_dir, *, maxsize=2, keep_grids=None):
     return LazyCacheMap(paths, maxsize=maxsize, keep_grids=keep_grids)
 
 
+def _cohort_subset(cohort, score_sessions):
+    """Restrict the enumerated cohort to ``score_sessions`` (a set of (subj,trial)); the
+    unrequested caches are then never accessed, so a CrossSubject shard scoped to
+    {anchor, one test subject} holds only 2 grids resident — the lever that fits the M2
+    electrode-tap CS shard on a 1-GPU host slot instead of the 2-GPU (2×~30 GB) one. The
+    anchor MUST be in ``score_sessions`` or its CS cells vanish; the caller includes it."""
+    if not score_sessions:
+        return cohort
+    keep = set(score_sessions)
+    sub = tuple(s for s in cohort if s in keep)
+    if not sub:
+        raise ValueError(f"--sessions {sorted(keep)} matched none of the cached {cohort}")
+    return sub
+
+
 def _hp_note(hp) -> str:
     return f"wd={hp.weight_decay},pd={hp.parcel_dropout},dr={hp.dropout}"
 
@@ -633,7 +648,7 @@ def _mean_rows(mean_by_mode_tap, n_cells, *, ckpt_tag, stamp, note):
 
 def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=None,
               use_mlp=True, time_tag=True, modes=("WithinSession", "CrossSubject"),
-              tasks=None, taps=None, device=None):
+              tasks=None, taps=None, device=None, score_sessions=None):
     """Stage 2 (CPU): load the encoder-tap caches → sweep attentive HP once → eval every
     cell × tap (ridge + attentive) at the fixed HP → aggregate → ledger CSV + summary.
 
@@ -663,7 +678,7 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
     caches_by_ckpt = {ckpt_tag: caches}
     # Enumerate cells over EXACTLY the cached sessions — a cell can never request a cache
     # the --encode step didn't write (e.g. the 13→7 cohort cut, or a partial encode).
-    cohort = tuple(sorted(caches.keys()))
+    cohort = _cohort_subset(tuple(sorted(caches.keys())), score_sessions)
     sel = select_best_checkpoint(
         caches_by_ckpt, cfg, representative_ckpt=ckpt_tag,
         modes=tuple(modes), tasks=tuple(tasks) if tasks else NEUROPROBE_TASKS,
@@ -700,7 +715,7 @@ def run_score(cache_dir, *, ckpt_tag, anchor, out_path, base_cfg=None, hp_grid=N
 
 def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, use_mlp=True,
                  modes=("CrossSubject",), tasks=None, taps=None, sweep_cap=None,
-                 device=None):
+                 device=None, score_sessions=None):
     """Fan-out Stage 2, step 1 (sweep ONCE): pick the attentive HP on a representative cell
     subset (CrossSubject by default — the selection signal) and write the winning
     {weight_decay, parcel_dropout, dropout} to a JSON. Every score shard then reads it via
@@ -731,7 +746,7 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, us
     caches = _load_tap_caches(cache_dir, keep_grids=_keep_grids_for(taps))
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(d_model=d_model, use_mlp=use_mlp)
-    cohort = tuple(sorted(caches.keys()))
+    cohort = _cohort_subset(tuple(sorted(caches.keys())), score_sessions)
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
                             cs_train_anchor=anchor, cohort=cohort)
     firewall_self_test(cells)
@@ -751,7 +766,7 @@ def run_sweep_hp(cache_dir, *, anchor, out_path, base_cfg=None, hp_grid=None, us
 
 def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp, base_cfg=None, use_mlp=True,
                     time_tag=True, modes=("WithinSession", "CrossSubject"), tasks=None,
-                    taps=None, device=None):
+                    taps=None, device=None, score_sessions=None):
     """Fan-out Stage 2, step 2 (a SHARD): eval this shard's cells (modes×tasks×taps subset)
     at the FIXED ``hp`` → per-cell attentive CSV rows only. No sweep (HP is given), no ridge
     (retired), no global MEAN (``run_merge`` recomputes that across shards). ``use_mlp`` picks
@@ -779,7 +794,7 @@ def run_score_shard(cache_dir, *, ckpt_tag, anchor, out_path, hp, base_cfg=None,
     d_model = _d_model_of(caches[next(iter(caches.keys()))])
     cfg = base_cfg if base_cfg is not None else HeadTrainConfig(
         d_model=d_model, use_mlp=use_mlp, time_tag=time_tag)
-    cohort = tuple(sorted(caches.keys()))
+    cohort = _cohort_subset(tuple(sorted(caches.keys())), score_sessions)
     cells = enumerate_cells(tuple(modes), tuple(tasks) if tasks else NEUROPROBE_TASKS,
                             cs_train_anchor=anchor, cohort=cohort)
     firewall_self_test(cells)
@@ -876,8 +891,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="--encode montage: 'lite' (Neuroprobe-Lite ~120, leaderboard parity, "
                         "default) or 'all' electrodes")
     p.add_argument("--sessions", default=None,
-                   help="--encode: session subset 'S,T S,T' for per-session shards "
-                        "(default the full cohort)")
+                   help="session subset 'S,T S,T'. --encode: which sessions to forward "
+                        "(default full cohort). --score/--sweep-hp: restrict the scored "
+                        "cohort — a CS shard scoped to {anchor, one test subj} holds 2 "
+                        "grids resident, fitting M2-CS on 1 GPU (must include the anchor)")
     p.add_argument("--score", action="store_true",
                    help="Stage 2 (CPU/GPU): load --cache-dir tap caches → sweep + eval → CSV. "
                         "With --hp/--hp-file becomes a fixed-HP SHARD (no sweep).")
@@ -961,26 +978,30 @@ def main(argv: list[str] | None = None) -> int:
         if not args.cache_dir:
             p.error("--sweep-hp requires --cache-dir (the --encode tap caches)")
         modes = _parse_csv(args.modes) or ("CrossSubject",)
+        score_sessions = _parse_pairs(args.sessions) if args.sessions else None
         run_sweep_hp(args.cache_dir, anchor=anchor, out_path=args.out,
                      modes=modes, tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
-                     sweep_cap=args.sweep_cap, use_mlp=not args.linear_head)
+                     sweep_cap=args.sweep_cap, use_mlp=not args.linear_head,
+                     score_sessions=score_sessions)
         return 0
 
     if args.score:
         if not args.cache_dir:
             p.error("--score requires --cache-dir (the --encode tap caches)")
         modes = _parse_csv(args.modes) or ("WithinSession", "CrossSubject")
+        score_sessions = _parse_pairs(args.sessions) if args.sessions else None
         if args.hp or args.hp_file:        # fixed-HP SHARD: no sweep, per-cell rows only
             hp = _hp_from_spec(args.hp, args.hp_file)
             run_score_shard(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
                             out_path=args.out, hp=hp, modes=modes,
                             tasks=_parse_csv(args.tasks), taps=_parse_csv(args.taps),
-                            use_mlp=not args.linear_head, time_tag=not args.no_time_tag)
+                            use_mlp=not args.linear_head, time_tag=not args.no_time_tag,
+                            score_sessions=score_sessions)
         else:                              # monolithic: sweep-once + eval + aggregate
             run_score(args.cache_dir, ckpt_tag=args.ckpt_tag, anchor=anchor,
                       out_path=args.out, modes=modes, tasks=_parse_csv(args.tasks),
                       taps=_parse_csv(args.taps), use_mlp=not args.linear_head,
-                      time_tag=not args.no_time_tag)
+                      time_tag=not args.no_time_tag, score_sessions=score_sessions)
         return 0
 
     p.print_help()

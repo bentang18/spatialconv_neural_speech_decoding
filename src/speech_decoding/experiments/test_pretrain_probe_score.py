@@ -89,6 +89,19 @@ def test_load_tap_caches_empty_dir_raises(tmp_path):
         _runner()._load_tap_caches(str(tmp_path))
 
 
+def test_cohort_subset_scopes_score_to_requested_sessions():
+    """The --sessions score filter restricts the enumerated cohort so a CS shard scoped to
+    {anchor, one test subj} holds only 2 grids resident (the M2-CS 1-GPU lever). None is a
+    passthrough; a request matching nothing cached is a hard typo guard."""
+    r = _runner()
+    cohort = ((1, 0), (2, 1), (3, 2), (4, 2))
+    assert r._cohort_subset(cohort, None) == cohort                 # full cohort
+    assert r._cohort_subset(cohort, [(2, 1), (3, 2)]) == ((2, 1), (3, 2))  # anchor+1 test
+    assert r._cohort_subset(cohort, [(3, 2), (2, 1)]) == ((2, 1), (3, 2))  # cohort order, not request
+    with pytest.raises(ValueError, match="matched none"):
+        r._cohort_subset(cohort, [(9, 9)])
+
+
 def test_apply_lite_montage_subsets_electrode_axis(monkeypatch):
     """The Lite mask subsets the electrode axis of bands + parcel_per_electrode +
     electrode_mask in lockstep (so support[c] ↔ token[c] stays aligned)."""
