@@ -2250,6 +2250,14 @@ class V14ConvergedV2(nn.Module):
             out["_tap_student_latent"] = s_latent.detach()        # (B,P_vis,k,s_vis,d)
             out["_tap_m2_pred"] = m2_pred.reshape(-1, d).detach()  # (Q2,d)
             out["_tap_m2_target"] = m2_target.reshape(-1, d).detach()
+            # Per-query band tag (0=LFS, 1=HGA) in the SAME (B,C,n_mask) flatten
+            # order as _tap_m2_pred, so the monitor can split the M2 explained-var /
+            # L1 by band. ``freq_id`` is the freq-patch id ∈[0,4); LFS owns the first
+            # ``len(bands[0].freq_patch_bins)`` patches (=3), HGA the rest.
+            n_lfs_patches = len(bands[0].freq_patch_bins)
+            out["_tap_m2_band"] = (
+                (freq_id >= n_lfs_patches).long()[mask_idx].reshape(-1).detach()
+            )  # (Q2,)
             out["_tap_m4_pred"] = m4_pred.reshape(-1, d).detach()  # (Q4,d)
             out["_tap_m4_target"] = m4_target.reshape(-1, d).detach()
             if m3_pred is not None and m3_target is not None:

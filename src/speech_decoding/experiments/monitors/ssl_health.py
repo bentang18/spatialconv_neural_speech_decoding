@@ -297,7 +297,10 @@ class SSLHealthMonitor(pl.Callback):
         # _jepa_stats returns early (no-op).
         rt = taps.get("_tap_raw_targets")
         raw = bool(rt.item()) if isinstance(rt, Tensor) else False
-        self._jepa_stats(pl_module, taps, "_tap_m2_pred", "_tap_m2_target", "m2", raw)
+        self._jepa_stats(
+            pl_module, taps, "_tap_m2_pred", "_tap_m2_target", "m2", raw,
+            band_key="_tap_m2_band",
+        )
         self._jepa_stats(pl_module, taps, "_tap_m3_pred", "_tap_m3_target", "m3", raw)
         # Run-B's recon head IS the third SSL head (M3 is off): log its stats under
         # the SAME "m3" keys so the wandb dashboards overlay Run-A. Run-A emits
@@ -324,13 +327,20 @@ class SSLHealthMonitor(pl.Callback):
     def _jepa_stats(
         self, pl_module: pl.LightningModule, taps: dict[str, Tensor],
         pred_key: str, target_key: str, head: str, raw_targets: bool = False,
+        band_key: str | None = None,
     ) -> None:
         """``explained_var = 1 − Var(target − pred) / Var(target)`` and
         ``pred_target_var_ratio = Var(pred) / Var(target)``. The target is
         LN-normalised (legacy shared-denom loss uses ``_ln_target``) UNLESS
         ``raw_targets`` (Run-A per-head loss regresses raw post-``ln_out``
         targets) — keeping the metric consistent with the loss either way.
-        Variance is the mean of the per-dim variances over the (Q, d) rows."""
+        Variance is the mean of the per-dim variances over the (Q, d) rows.
+
+        ``band_key`` (optional): a per-query 0/1 band tag (0=LFS, 1=HGA) in the
+        SAME row order as the pred/target taps. When present, ALSO log the
+        explained-var and the raw-target L1 (the quantity ``loss_{head}`` minimises)
+        split by band — the LFS-vs-HGA loss instrument. Aggregate metrics are
+        unchanged; this is purely additive."""
         pred = taps.get(pred_key)
         target = taps.get(target_key)
         if not isinstance(pred, Tensor) or not isinstance(target, Tensor):
@@ -347,6 +357,23 @@ class SSLHealthMonitor(pl.Callback):
         ratio = pred_var / (target_var + _STATS_EPS)
         pl_module.log(f"train_mon_{head}_explained_var", explained_var, on_step=True)
         pl_module.log(f"train_mon_{head}_pred_target_var_ratio", ratio, on_step=True)
+        if band_key is None:
+            return
+        band = taps.get(band_key)
+        if not isinstance(band, Tensor) or band.shape[0] != p.shape[0]:
+            return
+        b = band.detach().reshape(-1)
+        for bid, name in ((0, "lfs"), (1, "hga")):
+            m = b == bid
+            if int(m.sum()) < 2:
+                continue
+            pb, tb, tdb = p[m], t[m], td[m]
+            tvar = tb.var(dim=0, unbiased=False).mean()
+            rvar = (tb - pb).var(dim=0, unbiased=False).mean()
+            ev = 1.0 - rvar / (tvar + _STATS_EPS)
+            l1 = (tdb - pb).abs().mean()  # raw-target L1 ≡ loss_{head} on band rows
+            pl_module.log(f"train_mon_{head}_explained_var_{name}", ev, on_step=True)
+            pl_module.log(f"train_mon_{head}_l1_{name}", l1, on_step=True)
 
 
 __all__ = ["SSLHealthMonitor"]

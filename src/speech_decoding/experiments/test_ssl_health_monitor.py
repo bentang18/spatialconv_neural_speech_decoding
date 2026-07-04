@@ -73,7 +73,7 @@ def test_return_taps_loss_identical_and_taps_finite():
     def _forward(return_taps: bool):
         torch.manual_seed(7)
         m._mask_gen.manual_seed(0)
-        lfs, hga, poe = m._v2_inputs(data)
+        lfs, hga, poe, _coords = m._v2_inputs(data)
         from speech_decoding.models.v14_converged_v2 import active_parcels
         _, membership = active_parcels(poe.cpu())
         bands = bands_for_clip_len(m.clip_len_s)
@@ -164,6 +164,51 @@ def test_tap_monitors_and_input_stats_finite():
         assert k in logged, k
         assert logged[k] == logged[k]  # finite
     _ = out
+
+
+def test_m2_band_tap_shape_and_composition():
+    """The model emits a per-query M2 band tag (0=LFS, 1=HGA) matching the
+    `_tap_m2_pred` row count, values in {0,1}, both bands present, and — the
+    order-integrity check — a CONSTANT per-electrode HGA count (the M2 mask holds
+    out a fixed 1-of-3 LFS group + a fixed HGA time-fraction per electrode)."""
+    m = _module()
+    data = _batch(B=3).data
+    torch.manual_seed(7)
+    m._mask_gen.manual_seed(0)
+    lfs, hga, poe, _coords = m._v2_inputs(data)
+    from speech_decoding.models.v14_converged_v2 import active_parcels
+    _, membership = active_parcels(poe.cpu())
+    bands = bands_for_clip_len(m.clip_len_s)
+    m2, tube = m.model.sample_masks(lfs.shape[0], membership, bands, m._mask_gen)
+    out = m.model(lfs, hga, poe, m2, tube, clip_len_s=m.clip_len_s, return_taps=True)
+
+    band = out["_tap_m2_band"]
+    assert band.shape == (out["_tap_m2_pred"].shape[0],)
+    assert set(band.unique().tolist()) <= {0, 1}
+    assert (band == 0).any() and (band == 1).any()          # both bands masked
+    # (B,C,n_mask): HGA count per electrode is the static-invariant n_mask_hga.
+    B, C = lfs.shape[0], lfs.shape[1]
+    per_elec_hga = band.reshape(B, C, -1).sum(-1)           # (B,C)
+    assert per_elec_hga.min() == per_elec_hga.max()         # constant ⇒ order intact
+
+
+def test_m2_per_band_explained_var_and_l1_logged():
+    """The monitor splits the M2 explained-var + raw-target L1 by band from the tap.
+    Both per-band keys log finite for each band, alongside the aggregate."""
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    m._step(_batch(B=3).data)
+    assert m._last_taps is not None and "_tap_m2_band" in m._last_taps
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb._run_tap_monitors(m, m._last_taps)
+    for k in (
+        "train_mon_m2_explained_var",                        # aggregate unchanged
+        "train_mon_m2_explained_var_lfs", "train_mon_m2_explained_var_hga",
+        "train_mon_m2_l1_lfs", "train_mon_m2_l1_hga",
+    ):
+        assert k in logged, k
+        assert logged[k] == logged[k]                        # finite
 
 
 def test_tap_monitors_survive_global_step_advance():
@@ -302,5 +347,6 @@ def test_taps_only_requested_on_cadence_step():
     m._trainer = _FakeTrainer(10)
     out = m._step(_batch(B=2).data)
     assert m._last_taps is not None
-    assert set(m._last_taps) == set(_TAP_KEYS)
+    # feature taps (N,d) + the 1-D per-query M2 band tag for the per-band split.
+    assert set(m._last_taps) == set(_TAP_KEYS) | {"_tap_m2_band"}
     assert not any(k.startswith("_tap_") for k in out)
