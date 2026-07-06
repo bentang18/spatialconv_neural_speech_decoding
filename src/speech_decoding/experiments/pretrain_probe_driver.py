@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -31,7 +32,10 @@ from speech_decoding.experiments.pretrain_probe_attentive import (
 from speech_decoding.experiments.pretrain_probe_readout import (
     DEFAULT_LAM_GRID,
     linear_cs_cell_auroc,
+    linear_cs_cell_scores,
     linear_ws_cell_auroc,
+    linear_ws_cell_scores,
+    linear_ws_cell_scores_all_electrode,
 )
 from speech_decoding.experiments.pretrain_probe_suite import ProbeCell
 from speech_decoding.experiments.v2_attentive_train import HeadTrainConfig
@@ -200,13 +204,75 @@ def run_linear_cell(
     test_cache: SessionTapCache,
     anchor_cache: SessionTapCache | None = None,
     lam_grid: tuple[float, ...] = DEFAULT_LAM_GRID,
+    full_test: bool = False,
 ) -> float:
     """Linear ridge AUROC for one (cell, tap). WS reads ``test_cache`` only; CS reads the
-    anchor (train) cache + the test session cache (λ on the test val half)."""
+    anchor (train) cache + the test session cache (λ on the test val half).
+
+    ``full_test`` (WS + CS): score on ALL held-out data — the val + test halves merged —
+    with no held-out val. Valid only at a fixed λ (``len(lam_grid)==1``), where there is
+    nothing to select on val, so folding val into test just lowers the score's sampling
+    noise. Train is unchanged (WS: the fold's train half; CS: the anchor subject), so no
+    train/test leak — val was always held-out data, never train."""
+    space = TAP_SPACE[tap]
+    if cell.eval_mode == "WithinSession":
+        if full_test and len(lam_grid) != 1:
+            raise ValueError("full_test needs a single fixed λ (nothing to select on val)")
+        sp = test_cache.ws_split[cell.task][cell.fold_index]
+        if full_test:
+            test_rows = np.concatenate([sp["val"], sp["test"]])
+            val_rows = np.empty(0, dtype=test_rows.dtype)
+        else:
+            val_rows, test_rows = sp["val"], sp["test"]
+        return linear_ws_cell_auroc(
+            test_cache.grids[tap], test_cache.labels[cell.task],
+            train_rows=sp["train"], val_rows=val_rows, test_rows=test_rows,
+            tap_space=space,
+            parcel_per_electrode=test_cache.parcel_per_electrode,
+            electrode_mask=test_cache.electrode_mask,
+            n_parcels=test_cache.n_parcels, parcel_labels=test_cache.parcel_labels,
+            lam_grid=lam_grid,
+        )
+    if cell.eval_mode == "CrossSubject":
+        if anchor_cache is None:
+            raise ValueError("CrossSubject linear cell needs an anchor_cache")
+        if full_test and len(lam_grid) != 1:
+            raise ValueError("full_test needs a single fixed λ (nothing to select on val)")
+        sp = test_cache.cs_split[cell.task]
+        if full_test:
+            test_rows = np.concatenate([sp["val"], sp["test"]])
+            val_rows = np.empty(0, dtype=test_rows.dtype)
+        else:
+            val_rows, test_rows = sp["val"], sp["test"]
+        return linear_cs_cell_auroc(
+            anchor_cache.grids[tap], anchor_cache.labels[cell.task],
+            test_cache.grids[tap], test_cache.labels[cell.task],
+            val_rows=val_rows, test_rows=test_rows, tap_space=space,
+            pe_anchor=anchor_cache.parcel_per_electrode, em_anchor=anchor_cache.electrode_mask,
+            pe_test=test_cache.parcel_per_electrode, em_test=test_cache.electrode_mask,
+            n_parcels=test_cache.n_parcels,
+            parcel_labels_anchor=anchor_cache.parcel_labels,
+            parcel_labels_test=test_cache.parcel_labels, lam_grid=lam_grid,
+        )
+    raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
+
+
+def run_linear_cell_scores(
+    cell: ProbeCell,
+    tap: str,
+    *,
+    test_cache: SessionTapCache,
+    anchor_cache: SessionTapCache | None = None,
+    lam_grid: tuple[float, ...] = DEFAULT_LAM_GRID,
+) -> list[tuple[float, float, float]]:
+    """Per-λ ``(lam, val_auroc, test_auroc)`` for one (cell, tap) — the fixed-per-tap-λ
+    input. Same features/splits as :func:`run_linear_cell`; the caller aggregates val
+    across cells to freeze ONE λ per tap, then reads that λ's test (vs the old per-cell
+    val-argmax)."""
     space = TAP_SPACE[tap]
     if cell.eval_mode == "WithinSession":
         sp = test_cache.ws_split[cell.task][cell.fold_index]
-        return linear_ws_cell_auroc(
+        return linear_ws_cell_scores(
             test_cache.grids[tap], test_cache.labels[cell.task],
             train_rows=sp["train"], val_rows=sp["val"], test_rows=sp["test"],
             tap_space=space,
@@ -219,7 +285,7 @@ def run_linear_cell(
         if anchor_cache is None:
             raise ValueError("CrossSubject linear cell needs an anchor_cache")
         sp = test_cache.cs_split[cell.task]
-        return linear_cs_cell_auroc(
+        return linear_cs_cell_scores(
             anchor_cache.grids[tap], anchor_cache.labels[cell.task],
             test_cache.grids[tap], test_cache.labels[cell.task],
             val_rows=sp["val"], test_rows=sp["test"], tap_space=space,
@@ -230,6 +296,30 @@ def run_linear_cell(
             parcel_labels_test=test_cache.parcel_labels, lam_grid=lam_grid,
         )
     raise ValueError(f"unsupported eval mode {cell.eval_mode!r}")
+
+
+def run_linear_ws_all_electrode_scores(
+    cell: ProbeCell,
+    tap: str,
+    *,
+    test_cache: SessionTapCache,
+    lam_grid: tuple[float, ...] = DEFAULT_LAM_GRID,
+) -> list[tuple[float, float, float]]:
+    """Per-λ scores for a WS cell read at FULL electrode resolution (streamed Gram) — the
+    un-crippled M2 read the pooled path can't do (parcel pool discards electrode detail).
+    WithinSession + electrode-space taps only; the CS grids have no cross-subject electrode
+    correspondence (that is why they pool)."""
+    if cell.eval_mode != "WithinSession":
+        raise ValueError("all-electrode read is WithinSession-only")
+    if TAP_SPACE[tap] != "electrode":
+        raise ValueError(f"all-electrode read needs an electrode-space tap; {tap} is "
+                         f"{TAP_SPACE[tap]!r}")
+    sp = test_cache.ws_split[cell.task][cell.fold_index]
+    return linear_ws_cell_scores_all_electrode(
+        test_cache.grids[tap], test_cache.labels[cell.task],
+        train_rows=sp["train"], val_rows=sp["val"], test_rows=sp["test"],
+        electrode_mask=test_cache.electrode_mask, lam_grid=lam_grid,
+    )
 
 
 def _run_concat_cell_result(

@@ -110,20 +110,73 @@ def reduce_meantime_keepfreq(m4, fpi, f_p):
 
 
 @torch.no_grad()
-def extract_split(encoder, loader, reduction):
+def extract_split(encoder, loader, reduction, tap="M4"):
     """Forward every batch. mean* → pooled (N,K,*,d); attentive → raw (N,K,S,d) fp16.
+    ``tap`` picks the encoder representation: "M4" (end / full encoder output) or
+    "M2" (frontend / post-2STFT-stem, pre-backbone). Both are (B,K,S,d) dual-band.
     Returns (feats, labels (N,), latent_valid (N,K) bool)."""
     feats, labels, lvs = [], [], []
     fpi = f_p = None
+    m2_only = tap == "M2"                      # frontend: early-stop before backbone
     for batch in loader:
         data = batch.data
         et_low = data["electrode_tokens"].float()
         et_high = data["electrode_tokens_high"].float()
         support = data["support"].float()
         valid_mask = data["valid_mask"].bool() if "valid_mask" in data else None
+        if tap == "praw":
+            # electrode->parcel mean|std pool (the model's EXACT spatial pool,
+            # no encoder weights), then pool time->mean+std/keep freq like
+            # `raw`. Isolates electrode->parcel pooling: same reduction as raw,
+            # only the spatial unit changes (parcel vs electrode).
+            prl, lvp, _, _ = encoder._mean_pool_electrodes(et_low, support, valid_mask)
+            prh, _, _, _ = encoder._mean_pool_electrodes(et_high, support, valid_mask)
+            if prl.dim() == 4:                 # mean_pool_std OFF: (B,K,F,T)
+                prl, prh = prl.unsqueeze(2), prh.unsqueeze(2)   # ->(B,K,1,F,T)
+            def _pt(x):                        # (B,K,sp,F,T) -> (B,K,sp,F,2)
+                return torch.stack([x.mean(-1), x.std(-1)], dim=-1)
+            red = torch.cat([_pt(prl), _pt(prh)], dim=3)        # (B,K,sp,Fcat,2)
+            B_, K_, sp, Fc, tp = red.shape
+            red = red.reshape(B_, K_, sp * Fc, tp).cpu().numpy()  # (B,K,sp*Fcat,2)
+            lv = lvp.bool()
+            feats.append(red)
+            lvs.append(lv.cpu().numpy())
+            y = data["target"]; y = y.reshape(y.shape[0], -1)
+            labels.append((y.argmax(1) if y.shape[1] > 1 else y[:, 0]).cpu().numpy())
+            continue
+        if tap.startswith("raw"):
+            # Input baselines on the normalized 2STFT the model ingests, per
+            # electrode (no parcel pool, no encoder), both bands. (B,C,F,T)
+            # freq-major. Variants differ only in how the F×T grid is reduced;
+            # all return 4D (B,C,*,*) so the flatten reshape works. Keep valid
+            # (Lite) electrodes.
+            if tap == "raw":            # pool TIME → keep freq: (B,C,Fcat,2)
+                m = torch.cat([et_low.mean(-1), et_high.mean(-1)], dim=2)
+                s = torch.cat([et_low.std(-1), et_high.std(-1)], dim=2)
+                red = torch.stack([m, s], dim=-1)
+            elif tap == "raw_freq":     # pool FREQ → keep time: (B,C,Tcat,2)
+                lo = torch.stack([et_low.mean(2), et_low.std(2)], dim=-1)
+                hi = torch.stack([et_high.mean(2), et_high.std(2)], dim=-1)
+                red = torch.cat([lo, hi], dim=2)
+            elif tap == "raw_ft":       # pool FREQ+TIME → (B,C,4,1)
+                lo = torch.stack([et_low.mean((2, 3)), et_low.std((2, 3))], dim=-1)
+                hi = torch.stack([et_high.mean((2, 3)), et_high.std((2, 3))], dim=-1)
+                red = torch.cat([lo, hi], dim=2).unsqueeze(-1)
+            else:                       # raw_flat: NO pool, flatten F×T: (B,C,G,1)
+                red = torch.cat([et_low.flatten(2), et_high.flatten(2)],
+                                dim=2).unsqueeze(-1)
+            red = red.cpu().numpy()
+            lv = (valid_mask if valid_mask is not None
+                  else torch.ones(red.shape[:2], dtype=torch.bool))
+            feats.append(red)
+            lvs.append(lv.cpu().numpy())
+            y = data["target"]; y = y.reshape(y.shape[0], -1)
+            labels.append((y.argmax(1) if y.shape[1] > 1 else y[:, 0]).cpu().numpy())
+            continue
         taps = encoder(et_low, support, valid_mask,
-                       electrode_tokens_high=et_high, return_taps=True)
-        m4 = taps["M4"]                       # (B, K, S, d)
+                       electrode_tokens_high=et_high, return_taps=True,
+                       m2_only=m2_only)
+        m4 = taps[tap]                        # (B, K, S, d) — frontend(M2) or end(M4)
         lv = taps["latent_valid"].bool()      # (B, K)
         if reduction == "meantime_keepfreq":
             if fpi is None:
@@ -151,21 +204,34 @@ def _auroc(y_true, proba, classes):
                                average="macro", labels=classes))
 
 
-def fit_sklearn(X_tr, y_tr, X_te, y_te, c, seed):
-    """StandardScaler + L2 LogisticRegression (upstream-parity); AUROC + bal-acc."""
-    from sklearn.linear_model import LogisticRegression
+def fit_sklearn(X_tr, y_tr, X_te, y_te, c, seed, c_grid=None, cv=3):
+    """StandardScaler + L2 LogisticRegression (upstream-parity); AUROC + bal-acc.
+    If ``c_grid`` (list of C values), pick C by ``cv``-fold CV on TRAIN
+    (LogisticRegressionCV) and eval test at that C — no test-set leakage."""
+    from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
     from sklearn.metrics import balanced_accuracy_score
     from sklearn.preprocessing import StandardScaler
 
     scaler = StandardScaler().fit(X_tr)
     Xtr, Xte = scaler.transform(X_tr), scaler.transform(X_te)
-    clf = LogisticRegression(C=c, random_state=seed, max_iter=10000, tol=1e-3)
-    clf.fit(Xtr, y_tr)
+    n_cls = len(np.unique(y_tr))
+    if c_grid:
+        scoring = "roc_auc" if n_cls == 2 else "accuracy"
+        clf = LogisticRegressionCV(Cs=c_grid, cv=cv, scoring=scoring,
+                                   random_state=seed, max_iter=10000, tol=1e-3,
+                                   refit=True)
+        clf.fit(Xtr, y_tr)
+        c_chosen = float(np.atleast_1d(clf.C_)[0])
+    else:
+        clf = LogisticRegression(C=c, random_state=seed, max_iter=10000, tol=1e-3)
+        clf.fit(Xtr, y_tr)
+        c_chosen = float(c)
     proba = clf.predict_proba(Xte)
     return {
         "auroc": _auroc(y_te, proba, clf.classes_),
         "bal_acc": float(balanced_accuracy_score(y_te, clf.predict(Xte))),
         "n_classes": int(len(clf.classes_)),
+        "C_chosen": c_chosen,
     }
 
 
@@ -271,10 +337,23 @@ def main() -> int:
     ap.add_argument("--trial", type=int, default=1)
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--C", type=float, default=1.0, help="L2 inverse-reg (sklearn).")
+    ap.add_argument("--c-grid", default=None,
+                    help="comma-sep C values; pick by CV on TRAIN (LogisticRegressionCV), "
+                         "overrides --C. e.g. 0.001,0.01,0.1,1,10")
     ap.add_argument("--n-seed", type=int, default=1, help="attentive: #PMA seed queries.")
     ap.add_argument("--seed", type=int, default=33)
     ap.add_argument("--out", default=None, help="JSON sidecar path.")
     ap.add_argument("--spec-cache-dir", default=SPEC_CACHE_DIR)
+    ap.add_argument("--tap", default="M4",
+                    choices=("M2", "M4", "raw", "raw_freq", "raw_ft", "raw_flat",
+                             "praw"),
+                    help="representation: M4=end (full encoder), "
+                         "M2=frontend (post-2STFT-stem, pre-backbone), "
+                         "raw*=per-electrode model input, no encoder (ckpt-indep): "
+                         "raw=pool time/keep freq, raw_freq=pool freq/keep time, "
+                         "raw_ft=pool freq+time, raw_flat=no pool (full F×T); "
+                         "praw=electrode->parcel pool (model's spatial pool), no "
+                         "encoder, pool time/keep freq (isolates pooling).")
     args = ap.parse_args()
 
     eval_mode = _MODE_ALIASES[args.eval_mode]
@@ -301,12 +380,12 @@ def main() -> int:
     encoder = build_frozen_encoder(experiment, args.ckpt)
     loaders = experiment.data.build(worker_seed=experiment.seed)
 
-    Xtr, ytr, lv_tr = extract_split(encoder, loaders["train"], args.reduction)
-    Xte, yte, lv_te = extract_split(encoder, loaders["test"], args.reduction)
+    Xtr, ytr, lv_tr = extract_split(encoder, loaders["train"], args.reduction, args.tap)
+    Xte, yte, lv_te = extract_split(encoder, loaders["test"], args.reduction, args.tap)
     has_val = "val" in loaders
     Xva = yva = None
     if has_val and args.reduction == "attentive":
-        Xva, yva, _ = extract_split(encoder, loaders["val"], args.reduction)
+        Xva, yva, _ = extract_split(encoder, loaders["val"], args.reduction, args.tap)
 
     # Valid (covered) parcels are session-constant; require valid across the split.
     valid_tr = lv_tr.all(axis=0)
@@ -330,7 +409,8 @@ def main() -> int:
         Xtr_f = Xtr[:, sel, :, :].reshape(Xtr.shape[0], -1)
         Xte_f = Xte[:, sel, :, :].reshape(Xte.shape[0], -1)
         n_tokens = 0
-        scores = fit_sklearn(Xtr_f, ytr, Xte_f, yte, args.C, args.seed)
+        c_grid = [float(x) for x in args.c_grid.split(",")] if args.c_grid else None
+        scores = fit_sklearn(Xtr_f, ytr, Xte_f, yte, args.C, args.seed, c_grid=c_grid)
         feature_dim = int(Xtr_f.shape[1])
 
     rec = {
@@ -339,7 +419,8 @@ def main() -> int:
         "n_train": int(Xtr.shape[0]), "n_test": int(Xte.shape[0]),
         "k_valid_train": int(valid_tr.sum()), "k_valid_test": int(valid_te.sum()),
         "k_sel": k_sel, "n_tokens": int(n_tokens), "feature_dim": feature_dim,
-        "C": args.C, "n_seed": args.n_seed, "ckpt": args.ckpt,
+        "C": args.C, "c_grid": args.c_grid, "n_seed": args.n_seed,
+        "tap": args.tap, "ckpt": args.ckpt,
         "elapsed_s": round(time.time() - t0, 1), **scores,
     }
     print(json.dumps(rec, indent=2))

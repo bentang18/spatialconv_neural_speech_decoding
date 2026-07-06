@@ -74,6 +74,22 @@ def test_linear_ws_dispatch_recovers_signal(tap):
 
 
 @pytest.mark.parametrize("tap", ["M2", "M3", "M4"])
+def test_linear_ws_full_test_recovers_signal(tap):
+    # full_test folds val into test at fixed λ (no held-out val), symmetric with CS.
+    cache = _make_cache(0, subject_id=1, trial_id=0)
+    cell = ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)
+    a = run_linear_cell(cell, tap, test_cache=cache, lam_grid=(1.0,), full_test=True)
+    assert a > 0.85
+
+
+def test_linear_ws_full_test_requires_single_lambda():
+    cache = _make_cache(0, subject_id=1, trial_id=0)
+    cell = ProbeCell("WithinSession", "onset", 1, 0, fold_index=0)
+    with pytest.raises(ValueError, match="single fixed"):
+        run_linear_cell(cell, "M3", test_cache=cache, lam_grid=(0.1, 1.0), full_test=True)
+
+
+@pytest.mark.parametrize("tap", ["M2", "M3", "M4"])
 def test_linear_cs_dispatch_recovers_signal(tap):
     anchor = _make_cache(1, subject_id=2, trial_id=1)
     test = _make_cache(2, subject_id=3, trial_id=2)

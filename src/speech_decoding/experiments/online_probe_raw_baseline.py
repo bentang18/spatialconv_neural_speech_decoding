@@ -26,6 +26,8 @@ un-pooled WS path.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+
 import numpy as np
 import torch
 from torch import Tensor
@@ -41,7 +43,66 @@ from speech_decoding.experiments.online_probe import (
     feature_matrix,
     parcel_intersection,
 )
-from speech_decoding.models.v14_converged import BandSpec, bands_for_clip_len
+# Locked 3STFT 2/2/2 ladder — relocated verbatim from the retired v1
+# ``v14_converged`` module (the current 2-band pretrain is ``v14_converged_v2``
+# with ``BANDS_V2``; this raw-feature floor keeps the original 3-band grid it was
+# TDD'd against — slow 6 + beta 8 + HG 16 = 30 tokens at 1 s). FE spec §2.
+FS_HZ: int = 2048
+
+
+@dataclass(frozen=True)
+class BandSpec:
+    """One band of the locked 3STFT 2/2/2 ladder (FE spec §2)."""
+
+    name: str
+    nperseg: int          # N
+    hop: int              # N // 2
+    n_freq_bins: int      # in-band bins (slow 6, beta 6, HG 9)
+    n_time_frames: int    # stft frames over a 2048-sample clip (5 / 17 / 33)
+    kernel_freq: int      # fk
+    kernel_time: int      # tk (== 2 for all locked bands)
+    in_channels: int      # 2 (slow Re,Im) | 1 (mag)
+
+    @property
+    def n_freq_patches(self) -> int:
+        return (self.n_freq_bins - self.kernel_freq) // self.kernel_freq + 1
+
+    @property
+    def n_time_patches(self) -> int:
+        return (self.n_time_frames - self.kernel_time) // self.kernel_time + 1
+
+    @property
+    def n_tokens(self) -> int:
+        return self.n_freq_patches * self.n_time_patches
+
+
+SLOW = BandSpec("slow", 1024, 512, 6, 5, kernel_freq=2, kernel_time=2, in_channels=2)
+BETA = BandSpec("beta", 256, 128, 6, 17, kernel_freq=3, kernel_time=4, in_channels=1)
+HG = BandSpec("hg", 128, 64, 9, 33, kernel_freq=9, kernel_time=2, in_channels=1)
+BANDS: tuple[BandSpec, ...] = (SLOW, BETA, HG)
+
+
+def bands_for_clip_len(
+    clip_len_s: float, fs: int = FS_HZ, base: tuple[BandSpec, ...] = BANDS,
+) -> tuple[BandSpec, ...]:
+    """The locked 2/2/2 ladder retimed for a ``clip_len_s``-second clip.
+
+    Every BandSpec field is clip-length-INVARIANT except ``n_time_frames`` — the
+    per-band ``torch.stft`` frame count, exactly ``1 + n_samples // hop`` for
+    ``center=True``. Only the TIME axis grows; freq grid, kernels, channels are
+    untouched, so token order and the RoPE clock multipliers are preserved."""
+    n_samples = int(round(clip_len_s * fs))
+    out: list[BandSpec] = []
+    for b in base:
+        n_frames = 1 + n_samples // b.hop
+        if n_frames < b.kernel_time:
+            raise ValueError(
+                f"clip_len_s={clip_len_s}s gives band {b.name!r} only {n_frames} "
+                f"stft frames (< kernel_time {b.kernel_time}); clip too short"
+            )
+        out.append(replace(b, n_time_frames=n_frames))
+    return tuple(out)
+
 
 __all__ = [
     "raw_tokens_from_bands",
@@ -142,9 +203,16 @@ def pool_electrodes_to_parcels(
         raise ValueError("parcel_per_electrode / electrode_mask must be length C")
     valid = electrode_mask.to(raw_tokens.dtype)
     pe = parcel_per_electrode.long()
-    contrib = raw_tokens * valid[None, :, None, None]
     psum = raw_tokens.new_zeros(B, n_parcels, N, d)
-    psum.index_add_(1, pe, contrib)
+    # Scatter-accumulate in sample-axis chunks. The old ``raw_tokens * valid`` made a full
+    # copy of the electrode grid (~55 GB for a Lite-120 M2 tap) on top of ``psum``, blowing a
+    # 111 GB host node's cap. Chunking bounds the transient to one slice (~128 MB), so the
+    # peak is ``psum`` (the pooled output) plus a small copy — M2 pools on the login node.
+    chunk = max(1, 33_554_432 // max(1, C * N * d))  # ~32 M elems (~128 MB fp32) per step
+    scale = valid[None, :, None, None]
+    for i in range(0, B, chunk):
+        contrib = raw_tokens[i:i + chunk] * scale
+        psum[i:i + chunk].index_add_(1, pe, contrib)
     pcount = raw_tokens.new_zeros(n_parcels)
     pcount.index_add_(0, pe, valid)
     present = pcount > 0

@@ -6,10 +6,21 @@ import numpy as np
 import pytest
 import torch
 
+from speech_decoding.experiments.online_probe_raw_baseline import (
+    feature_matrix_per_electrode,
+)
 from speech_decoding.experiments.pretrain_probe_readout import (
+    DEFAULT_LAM,
+    DEFAULT_LAM_GRID,
+    SWEEP_LAM_GRID,
+    _finite,
+    _lam_scores,
+    _lam_scores_from_kernels,
+    _ws_all_electrode_kernels,
     compacted_positions,
     linear_cs_cell_auroc,
     linear_ws_cell_auroc,
+    linear_ws_cell_scores_all_electrode,
     parcel_support,
 )
 
@@ -128,6 +139,53 @@ def test_cs_electrode_pool_intersect_recovers_shared_parcel_signal():
     assert a > 0.85
 
 
+def test_anchor_pool_is_memoized_across_cells():
+    """The subj-2 anchor grid pools to parcels once and is reused; test grids pool per
+    cell. Same anchor + two different test grids → anchor pooled 1×, test 2×, and the
+    memoized AUROCs equal a cold (memo-cleared) recompute."""
+    import speech_decoding.experiments.pretrain_probe_readout as ro
+
+    rng = np.random.default_rng(11)
+    na, nt, c = 60, 60, 6
+    pe = torch.tensor([0, 0, 1, 1, 2, 2])
+    em = torch.ones(c, dtype=torch.bool)
+    ya = _labels(rng, na)
+    ga = _grid_with_signal(rng, ya, c, signal_unit=0)
+    cells = []
+    for _ in range(2):
+        yt = _labels(rng, nt)
+        cells.append((yt, _grid_with_signal(rng, yt, c, signal_unit=0)))
+
+    calls = {"anchor": 0, "test": 0}
+    real = ro.pool_electrodes_to_parcels
+
+    def counting(grid, *a, **k):
+        calls["anchor" if grid is ga else "test"] += 1
+        return real(grid, *a, **k)
+
+    def score(gt, yt):
+        _, va, te = _rows(nt)
+        return linear_cs_cell_auroc(
+            ga, ya, gt, yt, val_rows=va, test_rows=te, tap_space="electrode",
+            pe_anchor=pe, em_anchor=em, pe_test=pe, em_test=em, n_parcels=N_PARCELS,
+        )
+
+    ro.pool_electrodes_to_parcels = counting
+    try:
+        ro._ANCHOR_POOL.clear()
+        memoed = [score(gt, yt) for yt, gt in cells]
+        assert calls["anchor"] == 1  # pooled once, memo hit on the 2nd cell
+        assert calls["test"] == 2    # test grid pooled every cell
+        cold = []
+        for yt, gt in cells:
+            ro._ANCHOR_POOL.clear()  # force a cold recompute each call
+            cold.append(score(gt, yt))
+        assert np.allclose(memoed, cold, equal_nan=True)
+    finally:
+        ro.pool_electrodes_to_parcels = real
+        ro._ANCHOR_POOL.clear()
+
+
 def test_cs_parcel_supported_intersection_recovers_signal():
     rng = np.random.default_rng(4)
     na, nt = 60, 60
@@ -210,6 +268,97 @@ def test_nan_labels_dropped():
         electrode_mask=torch.ones(c, dtype=torch.bool), n_parcels=N_PARCELS,
     )
     assert np.isfinite(a)
+
+
+def _alt(n: int) -> np.ndarray:
+    """Alternating ±1 so every contiguous split holds both classes (AUROC defined)."""
+    return np.tile([1.0, -1.0], n // 2)
+
+
+def test_lam_scores_from_kernels_matches_lam_scores():
+    """The kernel-form λ sweep reproduces the materialized ``_lam_scores`` exactly."""
+    rng = np.random.default_rng(11)
+    d, ntr, nv, nte = 12, 24, 10, 10
+    ztr, ytr = rng.normal(size=(ntr, d)), _alt(ntr)
+    zv, yv = rng.normal(size=(nv, d)), _alt(nv)
+    zte, yte = rng.normal(size=(nte, d)), _alt(nte)
+    mat = _lam_scores(ztr, ytr, zv, yv, zte, yte, SWEEP_LAM_GRID)
+    ker = _lam_scores_from_kernels(
+        ztr @ ztr.T, ytr, zv @ ztr.T, yv, zte @ ztr.T, yte, SWEEP_LAM_GRID
+    )
+    assert [s[0] for s in mat] == [s[0] for s in ker]
+    assert np.allclose([s[1:] for s in mat], [s[1:] for s in ker], atol=1e-9, equal_nan=True)
+
+
+def test_default_lam_is_single_fixed_no_sweep():
+    """Scoring defaults to ONE fixed λ (=1.0), no per-cell sweep. The multi-λ grid lives in
+    SWEEP_LAM_GRID and is opt-in (run_keepS_ridge diagnostic, equivalence tests above).
+    Guards the 2026-07-02 decision that per-cell λ selection is a ~0.004 test-peek optimism
+    on a flat-in-λ landscape — so the default readout is a single ridge solve per cell."""
+    assert DEFAULT_LAM == 1.0
+    assert DEFAULT_LAM_GRID == (DEFAULT_LAM,) and len(DEFAULT_LAM_GRID) == 1
+    assert 1.0 in SWEEP_LAM_GRID and len(SWEEP_LAM_GRID) > 1
+
+
+def test_ws_all_electrode_streamed_matches_materialized():
+    """Streamed-Gram all-electrode read == materializing the full (N, C·F) flatten and
+    running the normal ridge — including when a masked electrode is dropped and when the
+    stream is forced to many single-electrode blocks (target_bytes=1)."""
+    rng = np.random.default_rng(12)
+    n, c = 64, 5
+    y = _alt(n)
+    grid = _grid_with_signal(rng, y, c, signal_unit=2)
+    em = torch.ones(c, dtype=torch.bool)
+    em[4] = False  # dropped electrode must not enter either path
+    tr, va, te = _rows(n)
+
+    z = feature_matrix_per_electrode(grid, em).cpu().numpy()
+    ztr, ytr = _finite(z[tr], y[tr])
+    zv, yv = _finite(z[va], y[va])
+    zte, yte = _finite(z[te], y[te])
+    mat = _lam_scores(ztr, ytr, zv, yv, zte, yte, SWEEP_LAM_GRID)
+
+    st = linear_ws_cell_scores_all_electrode(
+        grid, y, train_rows=tr, val_rows=va, test_rows=te, electrode_mask=em,
+        lam_grid=SWEEP_LAM_GRID,
+    )
+    assert np.allclose([s[1:] for s in mat], [s[1:] for s in st], atol=1e-9, equal_nan=True)
+
+    ker = _ws_all_electrode_kernels(
+        grid, y, train_rows=tr, val_rows=va, test_rows=te, electrode_mask=em,
+        target_bytes=1,  # force one electrode per block
+    )
+    assert ker is not None
+    blocked = _lam_scores_from_kernels(*ker, SWEEP_LAM_GRID)
+    assert np.allclose([s[1:] for s in st], [s[1:] for s in blocked], atol=1e-9, equal_nan=True)
+
+
+def test_ws_all_electrode_recovers_signal():
+    """A signal planted in one electrode is decoded at full electrode resolution."""
+    rng = np.random.default_rng(13)
+    n, c = 96, 6
+    y = _alt(n)
+    grid = _grid_with_signal(rng, y, c, signal_unit=3)
+    tr, va, te = _rows(n)
+    scores = linear_ws_cell_scores_all_electrode(
+        grid, y, train_rows=tr, val_rows=va, test_rows=te,
+        electrode_mask=torch.ones(c, dtype=torch.bool),
+    )
+    assert max(s[2] for s in scores) > 0.85
+
+
+def test_ws_all_electrode_degenerate_returns_empty():
+    """<2 finite test labels → no scores (mirrors the pooled degeneracy contract)."""
+    rng = np.random.default_rng(14)
+    n, c = 40, 4
+    y = _alt(n)
+    grid = _grid_with_signal(rng, y, c, signal_unit=1)
+    tr, va, te = _rows(n)
+    y[te] = np.nan  # wipe the test half → degenerate
+    assert linear_ws_cell_scores_all_electrode(
+        grid, y, train_rows=tr, val_rows=va, test_rows=te,
+        electrode_mask=torch.ones(c, dtype=torch.bool),
+    ) == []
 
 
 if __name__ == "__main__":
