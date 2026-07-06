@@ -308,6 +308,22 @@ class SSLHealthMonitor(pl.Callback):
         # exactly one of these two calls fires per run.
         self._jepa_stats(pl_module, taps, "_tap_melec_pred", "_tap_melec_target", "m3", raw)
         self._jepa_stats(pl_module, taps, "_tap_m4_pred", "_tap_m4_target", "m4", raw)
+        # Context-position EV (m4_recon_m3 only; absent ⇒ no-op). Compare against the
+        # masked m2/m4 EV: ctx EV ≫ masked EV flags V-JEPA's trivial-copy solution.
+        self._jepa_stats(
+            pl_module, taps, "_tap_m2_ctx_pred", "_tap_m2_ctx_target", "m2_ctx", raw
+        )
+        self._jepa_stats(
+            pl_module, taps, "_tap_m4_ctx_pred", "_tap_m4_ctx_target", "m4_ctx", raw
+        )
+        # MELEC context EV — the kept-electrode context term aimed at the POOL (the
+        # pooling-tax locus). Absent ⇒ no-op. Compare against the masked melec ("m3")
+        # EV: this is the one context surface with no Run-A analogue, so it had no
+        # curve until now.
+        self._jepa_stats(
+            pl_module, taps, "_tap_melec_ctx_pred", "_tap_melec_ctx_target",
+            "melec_ctx", raw,
+        )
 
     def _rank_and_std(
         self, pl_module: pl.LightningModule, tap: Tensor, *, key: str

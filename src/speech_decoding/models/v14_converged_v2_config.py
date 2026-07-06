@@ -55,7 +55,7 @@ class V14ConvergedV2Net(BaseModelConfig):
     # physiology-backed default; see V14ConvergedV2Config.pool_op_resolved).
     # "shared"|"band"|"patch" (1/2/4) override — shared/patch are the tie/untie ablations.
     pool_op: str | None = None
-    ema_tau: float = 0.9992
+    ema_tau: float = 0.99925   # V-JEPA 2 §2.4 lock; matches dispatch DEFAULT_EMA_TAU
 
     # --- Run-A bundle (default LEGACY for checkpoint resume) ----------------
     # ``m3_pred_layers`` is the master switch: set it (e.g. 6) ⇒ the Run-A
@@ -79,7 +79,26 @@ class V14ConvergedV2Net(BaseModelConfig):
     w_melec: float = 1.0
     sigma_mm: float = 12.0
     geom_n_freqs: int = 4
+    seed_offset_sigma_mm: float = 0.0  # isotropic k-seed offset init σ (mm); 0=zero-init
     m2_hetero: bool = True  # canonical Run-B: electrodes are the masking unit
+
+    # --- Run-B variant: M4→teacher-M3 + V-JEPA 2.1 context loss -------------
+    # ``m4_recon_m3`` retargets the M4 head to the teacher's M3 (pool + parcel-
+    # embed; teacher latent NOT run) and reads the predictor's context-position
+    # outputs as a second (context) loss, weighted by λ warmed 0→``context_lambda``
+    # over ``context_warmup_steps``. M-elec kept. Off ⇒ byte-identical Run-B.
+    m4_recon_m3: bool = False
+    context_lambda: float = 0.2
+    context_warmup_steps: int = 15000
+    context_warmup_start_step: int = 0
+    # V-JEPA 2.1 context-loss master switch, DECOUPLED from ``m4_recon_m3`` so both
+    # A/B arms carry identical context. ``context_taps`` ⊆ {M2, M4, MELEC}.
+    context_loss: bool = False
+    context_taps: tuple[str, ...] = ("M2", "M4")
+
+    # --- V-JEPA parity knobs (default OFF = byte-identical resume) -----------
+    target_ln: bool = False   # affine-free F.layer_norm on loss targets (forward_target)
+    pred_ln: bool = False     # affine predictor_norm before head (models/predictor.py)
 
     def build(self, n_in_channels: int, n_outputs: int) -> nn.Module:  # noqa: ARG002
         return V14ConvergedV2(
@@ -107,7 +126,16 @@ class V14ConvergedV2Net(BaseModelConfig):
                 w_melec=self.w_melec,
                 sigma_mm=self.sigma_mm,
                 geom_n_freqs=self.geom_n_freqs,
+                seed_offset_sigma_mm=self.seed_offset_sigma_mm,
                 m2_hetero=self.m2_hetero,
+                m4_recon_m3=self.m4_recon_m3,
+                context_lambda=self.context_lambda,
+                context_warmup_steps=self.context_warmup_steps,
+                context_warmup_start_step=self.context_warmup_start_step,
+                context_loss=self.context_loss,
+                context_taps=self.context_taps,
+                target_ln=self.target_ln,
+                pred_ln=self.pred_ln,
             )
         )
 

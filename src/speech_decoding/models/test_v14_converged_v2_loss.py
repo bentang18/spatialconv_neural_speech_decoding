@@ -6,7 +6,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from speech_decoding.models.v14_converged_v2 import converged_v2_loss
+from speech_decoding.models.v14_converged_v2 import (
+    converged_v2_loss,
+    converged_v2_loss_per_head,
+)
+
+
+def _eh(d):
+    return torch.zeros(0, d)
 
 
 def _batch(Q2=20, Q4=12, d=16, seed=0):
@@ -122,3 +129,85 @@ def test_m4_weight_length_mismatch_rejected():
             torch.randn(5, 16), torch.randn(5, 16),
             torch.ones(4), torch.zeros(5, dtype=torch.bool),
         )
+
+
+# --- per-head loss: V-JEPA parameter-free target-norm flag (target_ln) ---------
+
+
+def test_target_ln_off_is_raw_l1_default():
+    """Default (off) ⇒ raw detached target, byte-identical to the pre-fix loss."""
+    torch.manual_seed(0)
+    d = 16
+    m2p, m2t = torch.randn(8, d), torch.randn(8, d) * 5.0
+    m4p, m4t = torch.randn(6, d), torch.randn(6, d) * 0.1
+    out = converged_v2_loss_per_head(m2p, m2t, _eh(d), _eh(d), m4p, m4t)
+    assert torch.allclose(out["loss_m2"], (m2p - m2t).abs().mean())
+    assert torch.allclose(out["loss_m4"], (m4p - m4t).abs().mean())
+
+
+def test_target_ln_on_matches_layernorm_target():
+    """On ⇒ every head's target passes through affine-free F.layer_norm(t,(d,))."""
+    torch.manual_seed(1)
+    d = 16
+    m2p, m2t = torch.randn(8, d), torch.randn(8, d) * 5.0
+    m4p, m4t = torch.randn(6, d), torch.randn(6, d) * 0.1
+    out = converged_v2_loss_per_head(
+        m2p, m2t, _eh(d), _eh(d), m4p, m4t, target_ln=True
+    )
+    assert torch.allclose(out["loss_m2"], (m2p - F.layer_norm(m2t, (d,))).abs().mean())
+    assert torch.allclose(out["loss_m4"], (m4p - F.layer_norm(m4t, (d,))).abs().mean())
+
+
+def test_target_ln_scale_invariant_to_target_magnitude():
+    """THE fix property: with target_ln on, scaling a target by any positive factor
+    leaves the loss ~UNCHANGED (affine-free LN strips magnitude) ⇒ no upstream module
+    (the pool ln_out γ) can lower loss by inflating output scale — the γ-runaway root
+    cause. Invariance is eps-limited (LN's sqrt(var+eps) doesn't cancel the 1e-5 eps
+    under scaling), so a 13× scale moves the loss <0.1%; the RAW loss moves ~10×."""
+    torch.manual_seed(2)
+    d = 16
+    m2p, m2t = torch.randn(8, d), torch.randn(8, d)
+    m4p, m4t = torch.randn(6, d), torch.randn(6, d)
+    on = lambda a, b: converged_v2_loss_per_head(
+        m2p, a, _eh(d), _eh(d), m4p, b, target_ln=True
+    )["loss"]
+    off = lambda a, b: converged_v2_loss_per_head(
+        m2p, a, _eh(d), _eh(d), m4p, b, target_ln=False
+    )["loss"]
+    base_on, scaled_on = on(m2t, m4t), on(m2t * 13.0, m4t * 0.07)
+    assert ((base_on - scaled_on).abs() / base_on) < 1e-3   # invariant up to eps
+    base_off, scaled_off = off(m2t, m4t), off(m2t * 13.0, m4t * 0.07)
+    assert ((base_off - scaled_off).abs() / base_off) > 0.5  # raw loss tracks scale
+
+
+def test_target_ln_applies_to_melec_and_ctx_heads():
+    """The norm is uniform — melec (Run-B's active third head) and the context
+    variants go through the same _head, so target_ln covers them too."""
+    torch.manual_seed(3)
+    d = 16
+    m2p, m2t = torch.randn(4, d), torch.randn(4, d)
+    m4p, m4t = torch.randn(4, d), torch.randn(4, d)
+    mep, met = torch.randn(5, d), torch.randn(5, d)
+    m2cp, m2ct = torch.randn(3, d), torch.randn(3, d)
+    out = converged_v2_loss_per_head(
+        m2p, m2t, _eh(d), _eh(d), m4p, m4t, w_m3=0.0,
+        melec_pred=mep, melec_target=met,
+        m2_ctx_pred=m2cp, m2_ctx_target=m2ct, target_ln=True,
+    )
+    assert torch.allclose(out["loss_melec"], (mep - F.layer_norm(met, (d,))).abs().mean())
+    assert torch.allclose(
+        out["loss_m2_ctx"], (m2cp - F.layer_norm(m2ct, (d,))).abs().mean()
+    )
+
+
+def test_target_ln_still_stops_grad_to_target():
+    torch.manual_seed(4)
+    d = 16
+    m2p = torch.randn(6, d, requires_grad=True)
+    m2t = torch.randn(6, d, requires_grad=True)
+    m4p, m4t = torch.randn(4, d), torch.randn(4, d)
+    converged_v2_loss_per_head(
+        m2p, m2t, _eh(d), _eh(d), m4p, m4t, target_ln=True
+    )["loss"].backward()
+    assert m2p.grad is not None and torch.isfinite(m2p.grad).all()
+    assert m2t.grad is None        # _ln_target detaches ⇒ no grad to target

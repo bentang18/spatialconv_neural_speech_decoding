@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from speech_decoding.models.v14_encoder import (
+    LN_EPS,
     NEG_INF_MASK_VALUE,
     _JointTokenBlock,
     _PatchStem,
@@ -305,7 +306,7 @@ class FrontendEncoderV2(nn.Module):
         self.blocks = nn.ModuleList(
             [_JointTokenBlock(d_model, n_heads, qk_norm=qk_norm) for _ in range(n_layers)]
         )
-        self.ln_out = nn.LayerNorm(d_model)
+        self.ln_out = nn.LayerNorm(d_model, eps=LN_EPS)
 
     def encode_tokens(
         self,
@@ -791,8 +792,8 @@ class ElectrodeReconHead(nn.Module):
         # seed-interpolation lacks — so a well-encoded pool is actually recoverable
         # (else the loss floors out and stops pressuring the pool). Not stacked:
         # a deeper decoder would reconstruct FROM a lossy pool and relieve the tax.
-        self.ln_q = nn.LayerNorm(d_model)
-        self.ln_kv = nn.LayerNorm(d_model)
+        self.ln_q = nn.LayerNorm(d_model, eps=LN_EPS)
+        self.ln_kv = nn.LayerNorm(d_model, eps=LN_EPS)
         self.W_q = nn.Linear(d_model, d_model, bias=False)      # query = band-agnostic
         # BAND-TYPED K/V + output projections (``n_op`` distinct weights, gathered per
         # cell by ``cell_patch``) — the multiplicative inverse of the pool's band-typed
@@ -808,7 +809,7 @@ class ElectrodeReconHead(nn.Module):
             nn.init.xavier_uniform_(self.W_v[o])
             nn.init.xavier_uniform_(self.out_head[o])
         self.W_o = nn.Linear(d_model, d_model, bias=False)     # head-merge, band-agnostic
-        self.ln_ff = nn.LayerNorm(d_model)
+        self.ln_ff = nn.LayerNorm(d_model, eps=LN_EPS)
         self.ffn = nn.Sequential(                              # standard 4x FFN
             nn.Linear(d_model, 4 * d_model), nn.GELU(),
             nn.Linear(4 * d_model, d_model),
@@ -933,16 +934,16 @@ class SetPoolV2(nn.Module):
         # Run-A: terminal LayerNorm so the pool output (the M3 target) is unit-
         # scale, matching frontend/latent ``ln_out``. Default OFF ⇒ legacy pool
         # (no LN) resumes byte-identical.
-        self.ln_out = nn.LayerNorm(d_model) if ln_out else None
+        self.ln_out = nn.LayerNorm(d_model, eps=LN_EPS) if ln_out else None
         # Run-B: complete the bare PMA into a proper pre-norm MAB — seed/query
         # residual + FFN — matching Set-Transformer PMA (1810.00825) and the
         # Perceiver encoder cross-attention (2103.03206), which both carry an FFN
         # and a query residual. Gated so Run-A's bare pool resumes byte-identical.
         self.mab = mab
         if mab:
-            self.ln_q = nn.LayerNorm(d_model)
-            self.ln_kv = nn.LayerNorm(d_model)
-            self.ln_ff = nn.LayerNorm(d_model)
+            self.ln_q = nn.LayerNorm(d_model, eps=LN_EPS)
+            self.ln_kv = nn.LayerNorm(d_model, eps=LN_EPS)
+            self.ln_ff = nn.LayerNorm(d_model, eps=LN_EPS)
             self.ffn = nn.Sequential(
                 nn.Linear(d_model, 4 * d_model), nn.GELU(),
                 nn.Linear(4 * d_model, d_model),
@@ -1079,7 +1080,7 @@ class LatentEncoderV2(nn.Module):
         self.blocks = nn.ModuleList(
             [_JointTokenBlock(d_model, n_heads, qk_norm=qk_norm) for _ in range(n_layers)]
         )
-        self.ln_out = nn.LayerNorm(d_model)
+        self.ln_out = nn.LayerNorm(d_model, eps=LN_EPS)
 
     def forward(
         self,
@@ -1159,6 +1160,7 @@ class JepaPredictorV2(nn.Module):
         k: int | None = None,
         ssl_bands: tuple[BandSpecV2, ...] | None = None,
         qk_norm: bool = False,
+        pred_ln: bool = False,
     ) -> None:
         super().__init__()
         if pred_dim % n_heads != 0:
@@ -1167,9 +1169,14 @@ class JepaPredictorV2(nn.Module):
         if head_dim % 2 != 0:
             raise ValueError(f"RoPE needs an even head_dim, got {head_dim}")
 
-        self.ctx_proj = nn.Linear(d_model, pred_dim, bias=False)
+        # ``pred_ln`` = the full V-JEPA predictor-tail bundle: terminal norm (below)
+        # AND bias-True on both projections (V-JEPA `predictor_embed` / `predictor_proj`
+        # are bias-True, ``models/predictor.py``:83,177). Off ⇒ bias-False, byte-identical.
+        self.ctx_proj = nn.Linear(d_model, pred_dim, bias=pred_ln)
+        # Zero-init the mask token (V-JEPA `zero_init_mask_tokens=True`,
+        # predictor.py:64,139): the query starts as PURE additive freq/parcel/seed
+        # identity tags with no arbitrary constant direction injected at step 0.
         self.mask_token = nn.Parameter(torch.zeros(pred_dim))
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.freq_embed = nn.Parameter(torch.empty(N_FREQ_PATCHES_V2, pred_dim))
         nn.init.trunc_normal_(self.freq_embed, std=0.02)
 
@@ -1191,7 +1198,12 @@ class JepaPredictorV2(nn.Module):
         self.blocks = nn.ModuleList(
             [_JointTokenBlock(pred_dim, n_heads, qk_norm=qk_norm) for _ in range(n_layers)]
         )
-        self.head = nn.Linear(pred_dim, d_model, bias=False)  # raw pred, NO LN
+        # V-JEPA terminal ``predictor_norm`` (affine LN before the projection):
+        # the pre-norm blocks leave an unnormalized residual stream, so without
+        # this the head reads raw residuals. Gated (``pred_ln``); default off keeps
+        # every pre-fix checkpoint byte-identical.
+        self.pred_norm = nn.LayerNorm(pred_dim, eps=LN_EPS) if pred_ln else None
+        self.head = nn.Linear(pred_dim, d_model, bias=pred_ln)
 
     def _build_queries(
         self,
@@ -1224,8 +1236,16 @@ class JepaPredictorV2(nn.Module):
         q_parcel: Tensor | None = None,   # (B, Lq) long  (M4)
         q_seed: Tensor | None = None,     # (B, Lq) long  (M4)
         ctx_key_mask: Tensor | None = None,  # (B, Lc) bool, True = real
-    ) -> Tensor:
-        """Predict ``(B, Lq, d_model)`` at the query positions from the context."""
+        return_ctx: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Predict ``(B, Lq, d_model)`` at the query positions from the context.
+
+        The predictor concatenates the context tokens with learnable mask-token
+        queries and runs JOINT self-attention, so it computes an output for BOTH
+        context and query positions (V-JEPA 2.1, methods.tex:116). By default only
+        the query outputs are returned. ``return_ctx=True`` ALSO returns the
+        context-position outputs ``head(tokens[:, :Lc])`` — the surface V-JEPA 2.1's
+        context loss supervises — as ``(q_pred (B,Lq,d), ctx_pred (B,Lc,d))``."""
         B, Lc, _ = ctx.shape
         Lq = q_slot.shape[1]
         q = self._build_queries(q_freq, q_parcel, q_seed)          # (B, Lq, pred)
@@ -1242,7 +1262,12 @@ class JepaPredictorV2(nn.Module):
 
         for blk in self.blocks:
             tokens = blk(tokens, rope, key_mask)
-        return self.head(tokens[:, Lc:])                           # (B, Lq, d_model)
+        if self.pred_norm is not None:
+            tokens = self.pred_norm(tokens)                        # V-JEPA predictor_norm
+        q_pred = self.head(tokens[:, Lc:])                         # (B, Lq, d_model)
+        if return_ctx:
+            return q_pred, self.head(tokens[:, :Lc])               # (B, Lc, d_model)
+        return q_pred
 
 
 @torch.no_grad()
@@ -1350,12 +1375,21 @@ def converged_v2_loss_per_head(
     melec_target: Tensor | None = None,
     w_melec: float = 1.0,
     melec_weight: Tensor | None = None,
+    m2_ctx_pred: Tensor | None = None,
+    m2_ctx_target: Tensor | None = None,
+    m4_ctx_pred: Tensor | None = None,
+    m4_ctx_target: Tensor | None = None,
+    m4_ctx_weight: Tensor | None = None,
+    melec_ctx_pred: Tensor | None = None,
+    melec_ctx_target: Tensor | None = None,
+    melec_ctx_weight: Tensor | None = None,
+    target_ln: bool = False,
 ) -> dict[str, Tensor]:
     """Run-A per-head JEPA loss (Ben 2026-06-27): three INDEPENDENT
-    self-normalized L1 means on RAW (detached) EMA targets, combined with
-    explicit weights (V-JEPA convention: equal). NO target LayerNorm (the pool/
-    frontend/latent already end in ``ln_out``), NO shared denominator, NO
-    count-weighting::
+    self-normalized L1 means on detached EMA targets, combined with explicit
+    weights (V-JEPA convention: equal). Targets are RAW by default; with
+    ``target_ln`` they get V-JEPA's affine-free ``F.layer_norm`` (see below). NO
+    shared denominator, NO count-weighting::
 
         L_m2 = |m2_pred − sg(t_front [masked])|.mean()   # mean over its OWN (Q×d)
         L_m3 = |m3_pred − sg(t_seeds [masked])|.mean()   # pool output, masked cells
@@ -1369,7 +1403,14 @@ def converged_v2_loss_per_head(
     ``m3_weight``/``m4_weight`` (optional, shape ``(Q,)``) turn that head's flat
     mean into a CONVEX electrode-support-weighted mean ``Σ w·rowloss / Σ w``
     (rowloss = mean over ``d``). Convex ⇒ same scale as the flat mean, so the
-    weighted heads stay comparable to the unweighted M2. None ⇒ flat mean."""
+    weighted heads stay comparable to the unweighted M2. None ⇒ flat mean.
+
+    ``target_ln`` (V-JEPA parameter-free target norm): on ⇒ every target is passed
+    through ``_ln_target`` = affine-free ``F.layer_norm(target, (d,))`` before the
+    L1, exactly as ``facebookresearch/vjepa2`` ``forward_target``. The norm can't
+    drift, so the predictors chase a unit-scale target and no upstream module (the
+    pool's terminal ``ln_out`` affine γ) can reduce its loss by inflating output
+    scale — the fix for the pool_feat_std / γ runaway. Off ⇒ raw detached target."""
     d = m2_pred.shape[-1]
     for name, t in (("m3_pred", m3_pred), ("m4_pred", m4_pred)):
         if t.shape[-1] != d:
@@ -1378,7 +1419,8 @@ def converged_v2_loss_per_head(
     def _head(pred: Tensor, target: Tensor, weight: Tensor | None = None) -> Tensor:
         if pred.numel() == 0:
             return pred.new_zeros(())
-        err = (pred - target.detach()).abs()
+        tgt = _ln_target(target) if target_ln else target.detach()
+        err = (pred - tgt).abs()
         if weight is None:
             return err.mean()
         rowloss = err.mean(-1)                          # (Q,) mean over d
@@ -1416,6 +1458,23 @@ def converged_v2_loss_per_head(
         # zero over Run-A's m3 curve. The training loss is UNCHANGED (built from
         # l_melec above); this only re-labels the diagnostic.
         diag["loss_m3"] = l_melec
+    # Context loss (V-JEPA 2.1): the predictor's context-position outputs are
+    # supervised toward the SAME per-head targets as the masked queries — a second
+    # self-normalized L1 mean, kept SEPARATE from ``loss`` here. The module applies
+    # the ramped coefficient λ(t) and folds these into the training loss, so λ never
+    # enters the (compiled) forward graph. Absent ⇒ no term (byte-identical).
+    if m2_ctx_pred is not None:
+        if m2_ctx_target is None:
+            raise ValueError("m2_ctx_pred given but m2_ctx_target is None")
+        diag["loss_m2_ctx"] = _head(m2_ctx_pred, m2_ctx_target)
+    if m4_ctx_pred is not None:
+        if m4_ctx_target is None:
+            raise ValueError("m4_ctx_pred given but m4_ctx_target is None")
+        diag["loss_m4_ctx"] = _head(m4_ctx_pred, m4_ctx_target, m4_ctx_weight)
+    if melec_ctx_pred is not None:
+        if melec_ctx_target is None:
+            raise ValueError("melec_ctx_pred given but melec_ctx_target is None")
+        diag["loss_melec_ctx"] = _head(melec_ctx_pred, melec_ctx_target, melec_ctx_weight)
     diag["ratio_m2_m4"] = l_m2 / l_m4.clamp_min(1e-12)
     diag["ratio_m3_m4"] = diag["loss_m3"] / l_m4.clamp_min(1e-12)
     return diag
@@ -1459,7 +1518,7 @@ class V14ConvergedV2Config:
     # blind, n_op=4 over-splits LFS). Explicit ``"shared"|"band"|"patch"`` (1/2/4)
     # overrides — ``"shared"``/``"patch"`` are the tie/untie ablations.
     pool_op: str | None = None
-    ema_tau: float = 0.9992
+    ema_tau: float = 0.99925   # V-JEPA 2 §2.4 lock; matches dispatch DEFAULT_EMA_TAU
     # --- Run-A bundle (all default to LEGACY behavior for checkpoint resume) ---
     # ``m3_pred_layers`` is the master switch: set it (e.g. 6) to enable the Run-A
     # architecture — the M3 pool-inpaint head, a terminal LayerNorm on the pool,
@@ -1496,6 +1555,12 @@ class V14ConvergedV2Config:
     w_melec: float = 1.0
     sigma_mm: float = 12.0
     geom_n_freqs: int = 5
+    # k pool-seed spatial-offset init: ``pool_seed_offset`` starts at
+    # ``N(0, seed_offset_sigma_mm² · I₃)`` (isotropic 3D Gaussian, native-RAS mm,
+    # LEARNABLE). 0.0 ⇒ zero-init (all seeds coincident at the parcel centroid —
+    # the k=2 collapse cause). Run-C: 5.0 (data-derived — radial-RMS median 8.6 mm
+    # /√3, DKT 10-subj). SEPARATE from ``sigma_mm`` (the geom featurizer normalizer).
+    seed_offset_sigma_mm: float = 0.0
     # Run-B M2 masking granularity. False ⇒ parcel-uniform (all electrodes in a
     # parcel hold out the SAME cells — the Run-A default, broadcast to electrodes).
     # True ⇒ per-electrode HETEROGENEOUS (each electrode holds out its OWN cells;
@@ -1503,6 +1568,52 @@ class V14ConvergedV2Config:
     # never leaks into the seeds). Only consulted in Run-B. Swept flag — the
     # parcel-uniform arm is kept so the prototype A/B can attribute the delta.
     m2_hetero: bool = False
+    # --- M4→teacher-M3 dense context-loss bundle (2026-07-04) -----------------
+    # ``m4_recon_m3`` retargets the M4 head: instead of predicting the teacher
+    # LATENT at tubed parcels, the M4 predictor predicts the teacher POOL output +
+    # parcel-embed (``pool_tagged`` = "M3") for ALL parcels — the TUBED parcels via
+    # its learnable mask-token queries (``L_predict``, weight 1.0), the UNTUBED
+    # parcels via the predictor's context-position outputs (``L_ctx``, weight λ, the
+    # V-JEPA 2.1 context loss). The EMA teacher is truncated at M3 (no teacher latent
+    # forward). A symmetric context loss is added to M2 (visible cells → teacher
+    # frontend). Each head is TWO self-normalized L1 means (masked + λ·context), so
+    # the masked task is undiluted and count-invariant. λ holds 0 through
+    # ``context_warmup_start_step``, then warms 0→``context_lambda`` linearly over the
+    # next ``context_warmup_steps`` steps (delayed ramp — lets the masked pretext
+    # establish before context is introduced, avoiding the trivial-copy basin).
+    # ``context_taps`` selects which heads get the context term. Requires Run-A (reuses
+    # the M4 head + terminal pool LN); off ⇒ every existing assembly byte-identical.
+    m4_recon_m3: bool = False
+    context_lambda: float = 0.2
+    context_warmup_steps: int = 15000
+    context_warmup_start_step: int = 0
+    context_taps: tuple[str, ...] = ("M2", "M4")
+    # V-JEPA 2.1 context-loss master switch, DECOUPLED from ``m4_recon_m3`` so the
+    # M4 pool-vs-latent A/B carries identical M2/M4/MELEC context supervision on both
+    # arms. Off ⇒ no context terms emitted or folded (byte-identical for every
+    # non-context config, regardless of ``context_taps``). ``m4_recon_m3`` now controls
+    # ONLY the M4 masked target (teacher pool vs teacher latent) + the teacher-latent run.
+    context_loss: bool = False
+    # V-JEPA parameter-free TARGET normalization at loss time. On ⇒ every per-head
+    # target (M2/M3/M4/MELEC + their context variants) is passed through
+    # ``F.layer_norm(target, (d,))`` (affine-free) before the L1, exactly as
+    # ``facebookresearch/vjepa2`` ``forward_target`` does. The affine-free norm can't
+    # drift, so the predictors chase a UNIT-scale target and no intermediate module
+    # (notably the pool's terminal ``ln_out`` affine γ) has an incentive to inflate
+    # its output scale — the fix for the measured pool_feat_std / γ runaway. Keep the
+    # model's own ``ln_out`` affine ON (V-JEPA keeps ``predictor_norm`` affine). Off ⇒
+    # raw detached targets (byte-identical to every pre-fix config).
+    target_ln: bool = False
+
+    # V-JEPA affine predictor-output LayerNorm. On ⇒ each JepaPredictorV2 applies a
+    # terminal ``nn.LayerNorm(pred_dim)`` (affine) to the full joint token sequence
+    # AFTER the pre-norm blocks and BEFORE ``head``, exactly as V-JEPA's predictor
+    # ends ``blocks → predictor_norm → predictor_proj`` (``models/predictor.py``:132).
+    # This is the INPUT norm to the projection, NOT V-JEPA's ``normalize_predictor``
+    # OUTPUT norm (that gates ``normalize_nested`` on ``z_pred`` and is OFF in their
+    # pretrain config). Pairs with ``target_ln``: both L1 sides then live in a
+    # LayerNorm'd space. Off ⇒ raw residual-stream → head (byte-identical pre-fix).
+    pred_ln: bool = False
 
     @property
     def run_a(self) -> bool:
@@ -1588,12 +1699,12 @@ class V14ConvergedV2(nn.Module):
         )
         self.m2_predictor = JepaPredictorV2(
             cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m2_pred_layers,
-            ssl_bands=self.ssl_bands, qk_norm=cfg.qk_norm,
+            ssl_bands=self.ssl_bands, qk_norm=cfg.qk_norm, pred_ln=cfg.pred_ln,
         )
         self.m4_predictor = JepaPredictorV2(
             cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m4_pred_layers,
             n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
-            qk_norm=cfg.qk_norm,
+            qk_norm=cfg.qk_norm, pred_ln=cfg.pred_ln,
         )
         # Run-A: M3 pool-inpaint head (untubed parcels, M2-masked cells, pool
         # target). Parcel- + seed-tagged like M4. None in legacy mode.
@@ -1602,7 +1713,12 @@ class V14ConvergedV2(nn.Module):
             self.m3_predictor = JepaPredictorV2(
                 cfg.d_model, cfg.pred_dim, cfg.n_heads, cfg.m3_pred_layers,
                 n_parcels=cfg.n_parcels, k=cfg.k, ssl_bands=self.ssl_bands,
-                qk_norm=cfg.qk_norm,
+                qk_norm=cfg.qk_norm, pred_ln=cfg.pred_ln,
+            )
+        if cfg.m4_recon_m3 and not cfg.run_b:
+            raise ValueError(
+                "m4_recon_m3 requires Run-B (set m3_drop_frac); it retargets the "
+                "Run-B M4 head to the teacher-M3 (pool + parcel-embed) target."
             )
 
         # Run-B: native-RAS relative geometry (shared by the pool seed→electrode
@@ -1618,9 +1734,18 @@ class V14ConvergedV2(nn.Module):
             self.recon = ElectrodeReconHead(
                 cfg.d_model, cfg.n_heads, self.geom.feat_dim, n_op=n_op
             )
-            # k seed probes, centroid-relative mm frame; zero-init ⇒ all seeds start
-            # at the parcel centroid (pure content pool at step 0).
-            self.pool_seed_offset = nn.Parameter(torch.zeros(cfg.k, 3))
+            # k seed probes, centroid-relative mm frame. ONE model-level learnable
+            # parameter (shared by student + teacher pooling via the seed→electrode
+            # geom bias below). Isotropic 3D Gaussian init N(0, σ²·I₃) so the k seeds
+            # start SPREAD through the parcel volume (each specializes; breaks the
+            # zero-init coincidence that collapsed k=2). σ=0 ⇒ zero-init (all at
+            # centroid), byte-identical to pre-fix. Seeded by the global RNG (``--seed``).
+            if cfg.seed_offset_sigma_mm > 0.0:
+                self.pool_seed_offset = nn.Parameter(
+                    torch.randn(cfg.k, 3) * cfg.seed_offset_sigma_mm
+                )
+            else:
+                self.pool_seed_offset = nn.Parameter(torch.zeros(cfg.k, 3))
 
         # Canonical weight init: unify every tower Linear/Embedding under one
         # scheme (trunc_normal 0.02 — GPT-2/ViT/MAE), replacing PyTorch's default
@@ -1634,6 +1759,20 @@ class V14ConvergedV2(nn.Module):
             if isinstance(mod, RelativeGeometry):
                 nn.init.zeros_(mod.mlp[-1].weight)
                 nn.init.zeros_(mod.mlp[-1].bias)
+
+        # Depth-rescaled block init (BEiT `fix_init_weight` / V-JEPA `_rescale_blocks`):
+        # shrink each self-attention block's OUTPUT projections (attn-out + MLP-fc2) by
+        # 1/√(2·layer_id) so residual-stream variance doesn't grow with depth — the
+        # param-free, zero-cost JEPA-native alternative to LayerScale (which JEPAs omit).
+        # Per-stack layer_id (each tower's residual stream is renormalized by its terminal
+        # ``ln_out`` ⇒ independent depth counts, matching V-JEPA's per-ViT rescale). Applied
+        # to the trunc_normal'd weights, before the teacher deep-copy so frozen towers inherit
+        # it. Init-only ⇒ a resumed run overwrites it from ckpt (live-run requeue-safe).
+        stacks = [self.frontend, self.latent, self.m2_predictor, self.m4_predictor]
+        if self.m3_predictor is not None:
+            stacks.append(self.m3_predictor)
+        for stack in stacks:
+            self._rescale_blocks(stack.blocks)
 
         # EMA teacher — frozen deep copies of the three target-side towers.
         self.teacher_frontend = copy.deepcopy(self.frontend)
@@ -1657,6 +1796,18 @@ class V14ConvergedV2(nn.Module):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
             nn.init.trunc_normal_(m.weight, std=0.02)
+
+    @staticmethod
+    def _rescale_blocks(blocks: nn.ModuleList) -> None:
+        """BEiT/V-JEPA depth-rescaled init: divide each ``_JointTokenBlock``'s
+        attention output-proj (``attn.out``) and MLP fc2 (``ffn[-1]``) weights by
+        √(2·layer_id) (layer_id from 1). Weights only (biases stay zero-init), once
+        at construction. Zero added params, zero inference cost."""
+        with torch.no_grad():
+            for layer_id, blk in enumerate(blocks, start=1):
+                scale = math.sqrt(2.0 * layer_id)
+                blk.attn.out.weight.div_(scale)
+                blk.ffn[-1].weight.div_(scale)
 
     # -- mask sampling (dataloader-side; keeps the bubble out of _step) ---------
     def sample_masks(
@@ -1947,6 +2098,58 @@ class V14ConvergedV2(nn.Module):
         weight = (~empty_d).to(pred.dtype).reshape(B * D * S)
         return pred, tgt, weight
 
+    def _melec_context_full(
+        self,
+        s_seeds: Tensor,      # (B,P,k,S,d) student seeds (dropped electrodes blocked)
+        t_front: Tensor,      # (B,C,S,d) teacher frontend (the recon target source)
+        drop_mask: Tensor,    # (B,C) bool, True = dropped
+        empty_ps: Tensor,     # (B,P,S) bool, True = parcel-cell has no visible seed
+        parcel_idx: Tensor,   # (C,) each electrode's parcel row
+        u_e: Tensor,          # (C,3) centroid-relative offsets
+        membership: Tensor,   # (P,C) bool
+        cell_patch: Tensor,   # (S,) long — each cell's band op id (recon K/V typing)
+        sh: StaticShapesV2,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Melec CONTEXT loss (V-JEPA 2.1 visible-position supervision): the KEPT
+        (un-dropped) analogue of :meth:`_melec_recon_full`. Reconstruct each KEPT
+        electrode's teacher frontend at all ``S`` cells from the SAME survivor seeds
+        (which include that electrode), so the pool is pressured to keep per-electrode
+        detail for what it pooled — the anti-aggregator term at the pool. Identical
+        machinery, ``drop_idx``→kept, same ``empty_ps`` loss mask. Returns
+        ``(pred (N,d), target (N,d), weight (N,))`` with ``N = B·K·S``, ``K = C − D``."""
+        assert self.recon is not None and self.geom is not None
+        assert self.cfg.m3_drop_frac is not None
+        B, C, S, d = t_front.shape
+        k = sh.k
+        nd = electrode_drop_count(membership, self.cfg.m3_drop_frac, self.cfg.m3_min_keep)
+        D = int(nd.sum().item())
+        K = C - D
+        if K == 0:                                               # everything dropped
+            z = t_front.new_zeros(0, d)
+            return z, z, t_front.new_zeros(0)
+        kept_idx = _select_idx(~drop_mask, K)                    # (B,K) electrode ids
+        pk = parcel_idx[kept_idx]                                # (B,K) their parcels
+
+        seeds_ctx = torch.gather(
+            s_seeds, 1, pk[:, :, None, None, None].expand(B, K, k, S, d)
+        )                                                        # (B,K,k,S,d)
+        seeds_ctx = seeds_ctx.permute(0, 1, 3, 2, 4).reshape(B * K * S, k, d)
+
+        tgt = torch.gather(
+            t_front, 1, kept_idx[:, :, None, None].expand(B, K, S, d)
+        ).reshape(B * K * S, d)
+
+        feats_e = self.geom.features(u_e)                        # (C,F)
+        feats = feats_e[kept_idx]                                # (B,K,F)
+        Fdim = feats.shape[-1]
+        feats = feats[:, :, None, :].expand(B, K, S, Fdim).reshape(B * K * S, Fdim)
+        band = cell_patch[None, None, :].expand(B, K, S).reshape(B * K * S)
+        pred = self.recon(seeds_ctx, feats, band)                # (B·K·S, d)
+
+        empty_k = torch.gather(empty_ps, 1, pk[:, :, None].expand(B, K, S))  # (B,K,S)
+        weight = (~empty_k).to(pred.dtype).reshape(B * K * S)
+        return pred, tgt, weight
+
     # -- the SSL step -----------------------------------------------------------
     def forward(
         self,
@@ -1984,7 +2187,12 @@ class V14ConvergedV2(nn.Module):
             t_tok = self.teacher_frontend.tokenizer(lfs, hga)         # (B,C,S,d)
             t_front = self.teacher_frontend.encode_tokens(t_tok, freq_id, slot)
             t_seeds = self.teacher_pool(t_front, membership, labels, cell_patch)
-            t_latent = self.teacher_latent(t_seeds, labels, slot)     # (B,P,k,S,d)
+            # M4→teacher-M3: the teacher STOPS at M3 (pool + parcel-embed); its
+            # latent stack is not run (only ``teacher_latent.parcel_embed`` is used,
+            # as the M3 tag). Otherwise run the latent for the M4-latent target.
+            t_latent: Tensor | None = None
+            if not self.cfg.m4_recon_m3:
+                t_latent = self.teacher_latent(t_seeds, labels, slot)  # (B,P,k,S,d)
 
         # === STUDENT stage 1: frontend PACKED over visible cells ===============
         # Parcel-uniform (Run-A default): broadcast the parcel mask to its electrodes.
@@ -2013,9 +2221,20 @@ class V14ConvergedV2(nn.Module):
         ctx2_slot = gslot.reshape(B * C, s_vis)
         q2_slot = slot[mask_idx].reshape(B * C, n_mask)
         q2_freq = freq_id[mask_idx].reshape(B * C, n_mask)
-        m2_pred = self.m2_predictor(ctx2, ctx2_slot, q2_slot, q2_freq).reshape(
-            B, C, n_mask, d
-        )
+        # M4→teacher-M3 with an M2 context tap: read the predictor's context-position
+        # outputs (visible cells) and supervise them toward the teacher frontend at
+        # those SAME cells (the symmetric M2 context loss). Else the plain query path.
+        m2_ctx_pred_raw: Tensor | None = None
+        if self.cfg.context_loss and "M2" in self.cfg.context_taps:
+            m2_pred, m2_ctx_pred_raw = self.m2_predictor(
+                ctx2, ctx2_slot, q2_slot, q2_freq, return_ctx=True
+            )
+            m2_pred = m2_pred.reshape(B, C, n_mask, d)
+            m2_ctx_pred_raw = m2_ctx_pred_raw.reshape(B, C, s_vis, d)
+        else:
+            m2_pred = self.m2_predictor(ctx2, ctx2_slot, q2_slot, q2_freq).reshape(
+                B, C, n_mask, d
+            )
         m2_target = torch.gather(
             t_front, 2, mask_idx[..., None].expand(B, C, n_mask, d)
         )                                                            # (B,C,n_mask,d)
@@ -2115,27 +2334,101 @@ class V14ConvergedV2(nn.Module):
 
         # === stage 7: M4 (+ Run-A M3) predictor(s) ============================
         ctx4 = s_latent.reshape(B, P_vis * k * s_lat, d)
-        t_latent_flat = t_latent.reshape(B, P * k * S, d)
+        t_latent_flat = (
+            t_latent.reshape(B, P * k * S, d) if t_latent is not None else None
+        )
         m3_pred: Tensor | None = None
         m3_target: Tensor | None = None
         melec_pred: Tensor | None = None
         melec_target: Tensor | None = None
+        # Context (V-JEPA 2.1) predictions/targets, m4_recon_m3 only — declared at
+        # function scope so the return_taps block can emit their EV on every path.
+        m2_ctx_pred: Tensor | None = None
+        m2_ctx_target: Tensor | None = None
+        m4_ctx_pred: Tensor | None = None
+        m4_ctx_target: Tensor | None = None
+        melec_ctx_pred: Tensor | None = None
+        melec_ctx_target: Tensor | None = None
+        melec_ctx_weight: Tensor | None = None
 
         if self.cfg.run_b:
-            # Run-B: Run-A's tubed-only M4, but the M3 pool-inpaint head is REPLACED
-            # by the masked-electrode reconstruction (M-elec). M2 + M4 unchanged.
+            # Run-B: Run-A's tubed-only M4 + the masked-electrode reconstruction
+            # (M-elec) pool head. M2 + M4 unchanged. When ``m4_recon_m3`` is set the
+            # M4 head is retargeted to the teacher's M3 (pool + parcel-embed) for the
+            # TUBED parcels, and its context-position outputs (the untubed parcels)
+            # are read out and supervised toward the same target = the context loss.
+            # M-elec is KEPT in both modes.
             pos, cell, seed, _tubed = self._m4_indices(
                 tube_mask, m2_mask, sh, tubed_only=True
             )
-            m4_pred = self.m4_predictor(
-                ctx4, ctx4_slot, slot[cell], freq_id[cell],
-                q_parcel=labels[pos], q_seed=seed,
-                ctx_key_mask=ctx4_key_mask,          # hetero: drop empty context cells
-            )
             flat4 = (pos * k + seed) * S + cell
             Lq4 = flat4.shape[1]
+            m4_ctx_weight: Tensor | None = None
+            # M4 masked target source — the ONLY thing ``m4_recon_m3`` controls: the
+            # teacher POOL (M3, tagged; teacher latent not run) vs the teacher LATENT
+            # (M4). Context supervision below is identical on both arms.
+            if self.cfg.m4_recon_m3:
+                target_src = (
+                    t_seeds
+                    + self.teacher_latent.parcel_embed(labels)[None, :, None, None, :]
+                ).reshape(B, P * k * S, d)
+            else:
+                assert t_latent_flat is not None
+                target_src = t_latent_flat
+            if self.cfg.context_loss and "M4" in self.cfg.context_taps:
+                m4_pred, m4_ctx_pred = self.m4_predictor(
+                    ctx4, ctx4_slot, slot[cell], freq_id[cell],
+                    q_parcel=labels[pos], q_seed=seed,
+                    ctx_key_mask=ctx4_key_mask, return_ctx=True,
+                )
+                # Context positions: the untubed parcels' latent cells in canonical
+                # (P,k,S) flat order == ctx4's (P_vis,k,s_lat) reshape order. hetero
+                # keeps all S cells (empty ones weighted out below); pvis keeps the
+                # parcel's visible cells.
+                arK = torch.arange(k, device=labels.device)
+                if hetero:
+                    ctx_cells = (
+                        torch.arange(S, device=labels.device)[None, None, :]
+                        .expand(B, P_vis, S)
+                    )                                            # (B,P_vis,S)
+                else:
+                    ctx_cells = torch.gather(
+                        pvis_idx, 1,
+                        untubed_idx[:, :, None].expand(B, P_vis, s_vis),
+                    )                                            # (B,P_vis,s_vis)
+                ctx_flat = (
+                    (untubed_idx[:, :, None, None] * k + arK[None, None, :, None]) * S
+                    + ctx_cells[:, :, None, :]
+                ).reshape(B, P_vis * k * s_lat)
+                m4_ctx_target = torch.gather(
+                    target_src, 1,
+                    ctx_flat[..., None].expand(B, P_vis * k * s_lat, d),
+                )
+                # Weight: convex electrode-support (matched to the masked M4) ×,
+                # in hetero, a 0/1 empty-cell mask (``attend_unt`` = ~empty at the
+                # untubed parcels) so empty context cells aren't supervised.
+                w: Tensor | None = None
+                if self.cfg.support_weight:
+                    n_elec_c = membership.sum(-1).to(m4_pred.dtype)
+                    w = (
+                        n_elec_c[untubed_idx][:, :, None, None]
+                        .expand(B, P_vis, k, s_lat).reshape(-1)
+                    )
+                if hetero:
+                    valid = (
+                        attend_unt[:, :, None, :].expand(B, P_vis, k, S)
+                        .reshape(-1).to(m4_pred.dtype)
+                    )
+                    w = valid if w is None else w * valid
+                m4_ctx_weight = w
+            else:
+                m4_pred = self.m4_predictor(
+                    ctx4, ctx4_slot, slot[cell], freq_id[cell],
+                    q_parcel=labels[pos], q_seed=seed,
+                    ctx_key_mask=ctx4_key_mask,      # hetero: drop empty context cells
+                )
             m4_target = torch.gather(
-                t_latent_flat, 1, flat4[..., None].expand(B, Lq4, d)
+                target_src, 1, flat4[..., None].expand(B, Lq4, d)
             )
             assert u_e is not None and drop_mask is not None
             if hetero:
@@ -2144,6 +2437,16 @@ class V14ConvergedV2(nn.Module):
                     s_seeds, t_front, drop_mask, empty_ps, parcel_idx, u_e,
                     membership, cell_patch, sh
                 )
+                if self.cfg.context_loss and "MELEC" in self.cfg.context_taps:
+                    # Context = read the KEPT electrodes back out of the survivor seeds
+                    # (V-JEPA 2.1 visible-position supervision) so the pool keeps
+                    # per-electrode detail for what it pooled. Same empty-cell mask.
+                    melec_ctx_pred, melec_ctx_target, melec_ctx_weight = (
+                        self._melec_context_full(
+                            s_seeds, t_front, drop_mask, empty_ps, parcel_idx, u_e,
+                            membership, cell_patch, sh
+                        )
+                    )
             else:
                 melec_pred, melec_target = self._melec_recon(
                     s_seeds, t_front, drop_mask, pvis_idx, parcel_idx, u_e,
@@ -2153,6 +2456,13 @@ class V14ConvergedV2(nn.Module):
             if self.cfg.support_weight:
                 n_elec = membership.sum(-1).to(m4_pred.dtype)
                 m4_w = n_elec[pos].reshape(-1)
+            # M2 context target: teacher frontend at the visible cells (predictor's
+            # context positions == ``vis_idx`` order).
+            if m2_ctx_pred_raw is not None:
+                m2_ctx_pred = m2_ctx_pred_raw
+                m2_ctx_target = torch.gather(
+                    t_front, 2, vis_idx[..., None].expand(B, C, s_vis, d)
+                )
             empty = m2_pred.new_zeros(0, d)
             out = converged_v2_loss_per_head(
                 m2_pred.reshape(-1, d), m2_target.reshape(-1, d),
@@ -2161,6 +2471,28 @@ class V14ConvergedV2(nn.Module):
                 w_m2=self.cfg.w_m2, w_m3=0.0, w_m4=self.cfg.w_m4, m4_weight=m4_w,
                 melec_pred=melec_pred, melec_target=melec_target,
                 w_melec=self.cfg.w_melec, melec_weight=melec_weight,
+                m2_ctx_pred=(
+                    m2_ctx_pred.reshape(-1, d) if m2_ctx_pred is not None else None
+                ),
+                m2_ctx_target=(
+                    m2_ctx_target.reshape(-1, d) if m2_ctx_target is not None else None
+                ),
+                m4_ctx_pred=(
+                    m4_ctx_pred.reshape(-1, d) if m4_ctx_pred is not None else None
+                ),
+                m4_ctx_target=(
+                    m4_ctx_target.reshape(-1, d) if m4_ctx_target is not None else None
+                ),
+                m4_ctx_weight=m4_ctx_weight,
+                melec_ctx_pred=(
+                    melec_ctx_pred.reshape(-1, d) if melec_ctx_pred is not None else None
+                ),
+                melec_ctx_target=(
+                    melec_ctx_target.reshape(-1, d)
+                    if melec_ctx_target is not None else None
+                ),
+                melec_ctx_weight=melec_ctx_weight,
+                target_ln=self.cfg.target_ln,
             )
         elif self.cfg.run_a:
             # M4 predicts the TUBED parcels only (all S cells); the untubed
@@ -2212,6 +2544,7 @@ class V14ConvergedV2(nn.Module):
                 m4_pred.reshape(-1, d), m4_target.reshape(-1, d),
                 w_m2=self.cfg.w_m2, w_m3=self.cfg.w_m3, w_m4=self.cfg.w_m4,
                 m3_weight=m3_w, m4_weight=m4_w,
+                target_ln=self.cfg.target_ln,
             )
         else:
             # LEGACY: M4 over {tubed: all S} ∪ {untubed: masked cells}; shared-
@@ -2260,6 +2593,19 @@ class V14ConvergedV2(nn.Module):
             )  # (Q2,)
             out["_tap_m4_pred"] = m4_pred.reshape(-1, d).detach()  # (Q4,d)
             out["_tap_m4_target"] = m4_target.reshape(-1, d).detach()
+            # Context-position EV (m4_recon_m3 only): the V-JEPA 2.1 context loss can
+            # trivially copy context features — EV≈1 on the ctx tap while the masked
+            # tap lags is exactly that failure. Emit ctx pred/target so the monitor
+            # scores them alongside the masked heads.
+            if m2_ctx_pred is not None and m2_ctx_target is not None:
+                out["_tap_m2_ctx_pred"] = m2_ctx_pred.reshape(-1, d).detach()
+                out["_tap_m2_ctx_target"] = m2_ctx_target.reshape(-1, d).detach()
+            if m4_ctx_pred is not None and m4_ctx_target is not None:
+                out["_tap_m4_ctx_pred"] = m4_ctx_pred.reshape(-1, d).detach()
+                out["_tap_m4_ctx_target"] = m4_ctx_target.reshape(-1, d).detach()
+            if melec_ctx_pred is not None and melec_ctx_target is not None:
+                out["_tap_melec_ctx_pred"] = melec_ctx_pred.reshape(-1, d).detach()
+                out["_tap_melec_ctx_target"] = melec_ctx_target.reshape(-1, d).detach()
             if m3_pred is not None and m3_target is not None:
                 out["_tap_m3_pred"] = m3_pred.reshape(-1, d).detach()   # (Q3,d)
                 out["_tap_m3_target"] = m3_target.reshape(-1, d).detach()

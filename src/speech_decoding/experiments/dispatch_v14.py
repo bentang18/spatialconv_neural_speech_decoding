@@ -677,7 +677,20 @@ def build_v14_experiment(
     converged_v2_w_melec: float = 1.0,
     converged_v2_sigma_mm: float = 12.0,
     converged_v2_geom_n_freqs: int = 4,
+    converged_v2_seed_offset_sigma_mm: float = 0.0,
     converged_v2_m2_hetero: bool = True,
+    # M4→teacher-M3 + V-JEPA 2.1 context loss (Run-B variant). ``m4_recon_m3``
+    # retargets M4 to the teacher's M3 (pool + parcel-embed) and reads the
+    # predictor's context-position outputs as a second (context) loss, weighted by
+    # λ warmed 0→``context_lambda`` over ``context_warmup_steps``. M-elec is kept.
+    converged_v2_m4_recon_m3: bool = False,
+    converged_v2_context_lambda: float = 0.2,
+    converged_v2_context_warmup_steps: int = 15000,
+    converged_v2_context_warmup_start_step: int = 0,
+    converged_v2_context_loss: bool = True,
+    converged_v2_context_taps: tuple[str, ...] = ("M2", "M4", "MELEC"),
+    converged_v2_target_ln: bool = False,
+    converged_v2_pred_ln: bool = False,
     # Converged M2/M4 loss-term weights (neutral 1.0 default; FE-spec §8.7
     # λ sister sweeps override). Inert on raw/2stft.
     converged_lambda_m2: float = 1.0,
@@ -2336,7 +2349,16 @@ def build_v14_experiment(
             "w_melec": converged_v2_w_melec,
             "sigma_mm": converged_v2_sigma_mm,
             "geom_n_freqs": converged_v2_geom_n_freqs,
+            "seed_offset_sigma_mm": converged_v2_seed_offset_sigma_mm,
             "m2_hetero": converged_v2_m2_hetero,
+            "m4_recon_m3": converged_v2_m4_recon_m3,
+            "context_lambda": converged_v2_context_lambda,
+            "context_warmup_steps": converged_v2_context_warmup_steps,
+            "context_warmup_start_step": converged_v2_context_warmup_start_step,
+            "context_loss": converged_v2_context_loss,
+            "context_taps": converged_v2_context_taps,
+            "target_ln": converged_v2_target_ln,
+            "pred_ln": converged_v2_pred_ln,
         }
         return V14ConvergedV2Experiment(
             data=data,
@@ -2353,7 +2375,8 @@ def build_v14_experiment(
                 "k": converged_v2_k,
                 # Pool K/V typing: explicit --pool-op wins; --untie-lfs is the
                 # back-compat alias for "patch" (n_op=4); else None ⇒ model auto-
-                # resolves to "band" (n_op=2, LFS | HGA — the physiology default).
+                # resolves by run mode (Run-B ⇒ "patch" n_op=4; Run-A/legacy ⇒
+                # "band" n_op=2 — see pool_op_resolved).
                 "pool_op": (
                     converged_v2_pool_op
                     if converged_v2_pool_op is not None
@@ -2924,6 +2947,12 @@ def _parser() -> argparse.ArgumentParser:
                    type=int, default=4,
                    help="2band Run-B: number of Fourier frequencies in the relative-"
                         "geometry features (default 4, ~6–30 mm band = [0.5σ, 2.5σ]).")
+    p.add_argument("--converged-v2-seed-offset-sigma-mm",
+                   dest="converged_v2_seed_offset_sigma_mm", type=float, default=0.0,
+                   help="2band Run-B: isotropic 3D-Gaussian init σ (mm/axis) for the k "
+                        "pool-seed spatial offsets, N(0, σ²·I₃), learnable. 0.0=zero-init "
+                        "(coincident at centroid, the k=2 collapse cause). Run-C: 5.0 "
+                        "(data-derived, radial-RMS median 8.6 mm /√3, DKT 10-subj).")
     p.add_argument("--converged-v2-m2-hetero", dest="converged_v2_m2_hetero",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="2band Run-B: per-electrode HETEROGENEOUS M2 masking (each "
@@ -2931,6 +2960,56 @@ def _parser() -> argparse.ArgumentParser:
                         "CANONICAL Run-B default (electrodes are the masking unit). "
                         "Pass --no-converged-v2-m2-hetero for the parcel-uniform "
                         "ablation (all electrodes in a parcel mask the same cells).")
+    p.add_argument("--converged-v2-m4-recon-m3", dest="converged_v2_m4_recon_m3",
+                   action="store_true", default=False,
+                   help="2band Run-B variant: retarget the M4 masked target to the "
+                        "teacher's M3 (pool + parcel-embed; teacher latent NOT run) "
+                        "instead of the teacher latent. M-elec is KEPT. Context loss is "
+                        "now separate (--converged-v2-context-loss). Requires Run-B.")
+    p.add_argument("--converged-v2-context-lambda", dest="converged_v2_context_lambda",
+                   type=float, default=0.2,
+                   help="M4-recon-M3: context-loss coefficient λ (default 0.2, the "
+                        "V-JEPA 2.1 dense sweet spot).")
+    p.add_argument("--converged-v2-context-warmup-steps",
+                   dest="converged_v2_context_warmup_steps",
+                   type=int, default=15000,
+                   help="M4-recon-M3: linear ramp length for λ (0→context_lambda over "
+                        "this many steps, starting at context_warmup_start_step; "
+                        "default 15000).")
+    p.add_argument("--converged-v2-context-warmup-start-step",
+                   dest="converged_v2_context_warmup_start_step",
+                   type=int, default=0,
+                   help="M4-recon-M3: hold λ=0 through this step, THEN ramp over "
+                        "context_warmup_steps (delayed warmup; default 0 = ramp from "
+                        "step 0).")
+    p.add_argument("--converged-v2-context-loss", dest="converged_v2_context_loss",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="V-JEPA 2.1 context loss (visible-position supervision), "
+                        "DECOUPLED from --converged-v2-m4-recon-m3 so the M4 pool-vs-"
+                        "latent A/B carries identical context on both arms. ON by "
+                        "default; pass --no-converged-v2-context-loss to ablate. Taps "
+                        "chosen by --converged-v2-context-taps.")
+    p.add_argument("--converged-v2-context-taps", dest="converged_v2_context_taps",
+                   type=lambda s: tuple(x for x in s.split(",") if x),
+                   default=("M2", "M4", "MELEC"),
+                   help="Comma list of heads that get context loss (subset of "
+                        "M2,M4,MELEC; default all three). Inert with "
+                        "--no-converged-v2-context-loss.")
+    p.add_argument("--converged-v2-target-ln", dest="converged_v2_target_ln",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="V-JEPA parameter-free TARGET LayerNorm: pass every per-head "
+                        "target through affine-free F.layer_norm(t,(d,)) before the L1, "
+                        "exactly as vjepa2 forward_target. Fixes the pool_feat_std / "
+                        "ln_out-gamma runaway (predictors chase a unit-scale target, no "
+                        "module can shrink loss by inflating output scale). OFF by "
+                        "default (raw targets, byte-identical); ON for Run-C.")
+    p.add_argument("--converged-v2-pred-ln", dest="converged_v2_pred_ln",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="V-JEPA affine predictor-output LayerNorm: each predictor ends "
+                        "blocks -> pred_norm (affine LN) -> head, matching vjepa2 "
+                        "predictor_norm (the pre-norm blocks leave a raw residual stream "
+                        "otherwise). Pairs with --converged-v2-target-ln. OFF by default "
+                        "(byte-identical); ON for Run-C.")
     p.add_argument("--converged-lambda-m2", dest="converged_lambda_m2",
                    type=float, default=1.0,
                    help="3stft: M2 loss-term weight (neutral 1.0).")
@@ -4283,7 +4362,16 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_v2_w_melec=args.converged_v2_w_melec,
         converged_v2_sigma_mm=args.converged_v2_sigma_mm,
         converged_v2_geom_n_freqs=args.converged_v2_geom_n_freqs,
+        converged_v2_seed_offset_sigma_mm=args.converged_v2_seed_offset_sigma_mm,
         converged_v2_m2_hetero=args.converged_v2_m2_hetero,
+        converged_v2_m4_recon_m3=args.converged_v2_m4_recon_m3,
+        converged_v2_context_lambda=args.converged_v2_context_lambda,
+        converged_v2_context_warmup_steps=args.converged_v2_context_warmup_steps,
+        converged_v2_context_warmup_start_step=args.converged_v2_context_warmup_start_step,
+        converged_v2_context_loss=args.converged_v2_context_loss,
+        converged_v2_context_taps=args.converged_v2_context_taps,
+        converged_v2_target_ln=args.converged_v2_target_ln,
+        converged_v2_pred_ln=args.converged_v2_pred_ln,
         converged_lambda_m2=args.converged_lambda_m2,
         converged_lambda_m4=args.converged_lambda_m4,
         converged_m2_hg_start_rate=args.converged_m2_hg_start_rate,

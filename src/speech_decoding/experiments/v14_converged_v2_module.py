@@ -281,6 +281,25 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
             step = 0
         return step % self._monitor_every_n_steps == 0
 
+    def _context_lambda(self) -> float:
+        """Delayed-ramp context-loss coefficient: λ(t) = 0 for t < ``S``, then linear
+        0→``context_lambda`` over the next ``W`` = ``context_warmup_steps`` steps (S =
+        ``context_warmup_start_step``). The 0-hold lets the masked pretext establish
+        before context is introduced (avoids the trivial-copy basin). Read from
+        ``global_step`` in eager code so λ never enters the compiled forward (a
+        per-step scalar would thrash dynamo guards). No trainer / step 0 ⇒ 0.0."""
+        try:
+            step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            step = 0
+        s = self.model.cfg.context_warmup_start_step
+        w = self.model.cfg.context_warmup_steps
+        if w > 0:
+            frac = min(max(step - s, 0) / w, 1.0)
+        else:
+            frac = 1.0 if step >= s else 0.0
+        return self.model.cfg.context_lambda * frac
+
     # ------------------------------------------------------------- loss path
     def _step(self, data: dict[str, Tensor]) -> dict[str, Tensor]:
         """Pure loss path (testable without a trainer): ingest → sample masks →
@@ -348,6 +367,17 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
                 torch.cuda.synchronize()
             _t.append(time.perf_counter())
             self._mask_timing_record(_t)
+        # Context loss (m4_recon_m3): the forward returns the per-head context terms
+        # as diagnostics; fold them into the training loss here with the ramped λ(t),
+        # so λ stays out of the compiled graph. Grad flows through the compiled
+        # context outputs. Absent terms ⇒ no-op.
+        if self.model.cfg.context_loss:
+            lam = self._context_lambda()
+            ctx = out["loss"].new_zeros(())
+            for key in ("loss_m2_ctx", "loss_m4_ctx", "loss_melec_ctx"):
+                if key in out:
+                    ctx = ctx + out[key]
+            out["loss"] = out["loss"] + lam * ctx
         return out
 
     def _mask_timing_record(self, t: list[float]) -> None:

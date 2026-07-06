@@ -180,6 +180,14 @@ def _sincos_1d(n_pos: int, dim: int, *, base: float = 10_000.0) -> Tensor:
 # IE12 in docs/neuroprobe/v14_blockers.md.
 NEG_INF_MASK_VALUE: float = -1e4
 
+# LayerNorm eps for the converged-v2 / Run-C path (this file's ``_JointTokenBlock``
+# plus every ``nn.LayerNorm`` in ``v14_converged_v2.py``). V-JEPA 2.1 builds all
+# module norms with ``partial(nn.LayerNorm, eps=1e-6)`` (vision_transformer.py:283);
+# PyTorch's default is 1e-5. Numerically negligible in fp32, flipped only to erase
+# the silent divergence. Legacy 3STFT/joint blocks below keep the PyTorch default
+# (on-hold families, not brought to V-JEPA parity).
+LN_EPS: float = 1e-6
+
 # Renormalisation floor for the hand-rolled ``pool_weights`` path. After the
 # post-softmax ``masked_fill(0)`` zeroes off-parcel weights, the on-parcel row
 # is divided by its own sum so it totals exactly 1.0. This corrects the
@@ -678,9 +686,9 @@ class _JointTokenBlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, *, qk_norm: bool = False) -> None:
         super().__init__()
-        self.ln_attn = nn.LayerNorm(d_model)
+        self.ln_attn = nn.LayerNorm(d_model, eps=LN_EPS)
         self.attn = _PlainMultiHeadSelfAttentionRoPE(d_model, n_heads, qk_norm=qk_norm)
-        self.ln_ffn = nn.LayerNorm(d_model)
+        self.ln_ffn = nn.LayerNorm(d_model, eps=LN_EPS)
         self.ffn = _ffn(d_model)
 
     def forward(

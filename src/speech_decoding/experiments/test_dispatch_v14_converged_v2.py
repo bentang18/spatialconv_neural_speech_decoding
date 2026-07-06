@@ -131,8 +131,10 @@ def test_2band_run_b_config_carries_knobs(tmp_path) -> None:
 
 def test_2band_default_is_run_a_no_run_b_knobs(tmp_path) -> None:
     cfg = _v2(tmp_path).brain_model_config
-    assert cfg.m3_drop_frac is None                     # default ⇒ Run-A/legacy
-    assert cfg.m2_hetero is False                       # parcel-uniform by default
+    assert cfg.m3_drop_frac is None                     # Run-B gate off ⇒ Run-A/legacy
+    # m2_hetero defaults True (canonical Run-B masking unit = electrodes) but is
+    # INERT while m3_drop_frac is None, so a default 2band run is still pure Run-A.
+    assert cfg.m2_hetero is True
 
 
 def test_2band_run_b_m2_hetero_threads(tmp_path) -> None:

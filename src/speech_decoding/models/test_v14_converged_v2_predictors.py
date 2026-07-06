@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
 
 from speech_decoding.models.v14_converged_v2 import JepaPredictorV2
 
@@ -102,3 +103,61 @@ def test_rope_table_sized_for_5s():
     pred = _m4()
     # 5 s HGA reaches slot 79 ⇒ table ≥ 80.
     assert pred.key_rope.shape[1] >= 80
+
+
+# --- pred_ln: V-JEPA terminal predictor_norm before the head ----------------
+
+def test_pred_ln_off_by_default():
+    """Default = raw residual stream → head (byte-identical to pre-fix)."""
+    assert _m2().pred_norm is None
+    assert _m4().pred_norm is None
+
+
+def test_pred_ln_builds_affine_layernorm_over_pred_dim():
+    pred = JepaPredictorV2(32, 24, 4, 2, pred_ln=True)
+    assert isinstance(pred.pred_norm, nn.LayerNorm)
+    assert tuple(pred.pred_norm.normalized_shape) == (24,)   # normalizes pred_dim
+    assert pred.pred_norm.elementwise_affine is True         # affine, like V-JEPA
+
+
+def test_pred_ln_output_shape_unchanged():
+    pred = JepaPredictorV2(32, 24, 4, 2, n_parcels=N_PARCELS, k=K, pred_ln=True)
+    ctx, ctx_slot, q_slot, q_freq, extra = _meta(B=2, Lc=40, Lq=20, with_pc_seed=True)
+    out = pred(ctx, ctx_slot, q_slot, q_freq, **extra)
+    assert out.shape == (2, 20, 32)
+
+
+def test_pred_ln_is_applied_in_forward():
+    """The terminal norm actually sits before the head: injecting one changes
+    the output (proves the forward branch is wired, not just constructed)."""
+    pred = _m2()                                   # pred_ln off ⇒ pred_norm None
+    pred.eval()
+    ctx, ctx_slot, q_slot, q_freq, _ = _meta(B=3, Lc=12, Lq=6)
+    with torch.no_grad():
+        out_off = pred(ctx, ctx_slot, q_slot, q_freq)
+        pred.pred_norm = nn.LayerNorm(24)          # γ=1, β=0 still normalizes variance
+        out_on = pred(ctx, ctx_slot, q_slot, q_freq)
+    assert not torch.allclose(out_off, out_on)
+
+
+def test_pred_ln_grad_flows_to_norm_affine():
+    pred = JepaPredictorV2(32, 24, 4, 2, pred_ln=True)
+    ctx, ctx_slot, q_slot, q_freq, _ = _meta(B=2, Lc=14, Lq=8)
+    pred(ctx, ctx_slot, q_slot, q_freq).sum().backward()
+    assert pred.pred_norm.weight.grad is not None
+    assert pred.pred_norm.bias.grad is not None
+
+
+def test_pred_ln_bundles_projection_biases():
+    """``pred_ln`` = the full V-JEPA predictor tail: terminal norm AND bias-True on
+    both projections (predictor_embed / predictor_proj). Off ⇒ bias-free (byte-id)."""
+    off = JepaPredictorV2(32, 24, 4, 2)
+    assert off.ctx_proj.bias is None and off.head.bias is None
+    on = JepaPredictorV2(32, 24, 4, 2, pred_ln=True)
+    assert on.ctx_proj.bias is not None and on.head.bias is not None
+
+
+def test_pred_norm_uses_vjepa_eps():
+    """Terminal predictor_norm eps matches V-JEPA (1e-6), not the PyTorch default."""
+    pred = JepaPredictorV2(32, 24, 4, 2, pred_ln=True)
+    assert pred.pred_norm.eps == 1e-6

@@ -1,22 +1,23 @@
-"""No-weight-decay optimizer param-group SPLIT (§7/B01 locked CONVENTION, task #40).
+"""No-weight-decay optimizer param-group SPLIT (§7/B01 CONVENTION, task #40).
 
 This is a convention for *which kinds of parameters* receive weight decay when it
 is applied — NOT a lock on the weight_decay VALUE. The §7/B01 recipe UNLOCKED the
 wd value (it is an M0 sweep center, not a fixed universal; the dispatch guard that
 refused ``weight_decay > 0`` was removed in #40). What is locked is only the
-standard exemption: the following ride in a ``weight_decay: 0.0`` group while only
-matmul/conv weights get the swept wd —
+standard exemption: biases + LayerNorm/RMSNorm gains (any param with ``ndim <= 1``)
+ride in a ``weight_decay: 0.0`` group; every ≥2-D param — matmul/conv weights AND
+learned embedding / identity / query tables — gets the swept wd.
 
-  * biases + LayerNorm/RMSNorm gains (any param with ``ndim <= 1``) — the nanoGPT
-    convention; and
-  * learned embedding / identity / query tokens (≥2-D tables that are not matmul
-    weights) — the timm / ViT / V-JEPA-2 ``no_weight_decay`` convention. (nanoGPT
-    itself DECAYS 2-D embeddings — it exempts only ``ndim <= 1``; we follow timm
-    for the table/token part, not nanoGPT.)
+This exactly matches V-JEPA 2/2.1 ``init_opt`` (``app/vjepa_2_1/utils.py``:305-331),
+which exempts only ``("bias" in n) or (len(p.shape) == 1)`` and DECAYS all 2-D+
+params including every embedding and (3-D) mask token — same rule nanoGPT uses.
+(An earlier revision here additionally exempted 2-D embedding tables by name, citing
+timm/ViT ``no_weight_decay``; the actual V-JEPA source decays them, so that
+name-allowlist was removed to eliminate the silent divergence — 2026-07-06.)
 
 The exemption itself is falsifiable: ``--no-wd-exclude-norms`` decays every param
-uniformly (the uniform-decay falsifier), so the M0 sweep can measure whether the
-exemption helps.
+uniformly (the uniform-decay falsifier — V-JEPA's ``zero_init_bias_wd=False``), so
+the M0 sweep can measure whether the bias/norm exemption helps.
 
 Mechanism — the top-level ``LightningOptimizer`` ``weight_decay`` is the DEFAULT
 applied to every param group; per-group ``weight_decay: 0.0`` dicts override it
@@ -40,32 +41,13 @@ import typing as tp
 import torch
 import torch.nn as nn
 
-# Embedding / identity / query tables the §7 convention exempts from weight decay
-# even though they are >1-D (the ``ndim <= 1`` rule below misses them). Matched as
-# whole dot-separated COMPONENTS of the parameter name (not raw substrings), so
-# ``student.encoder.freq_embed`` and ``predictor.id_embed.weight`` qualify while a
-# hypothetical ``grid_embedder.weight`` does NOT falsely match ``id_embed`` — the
-# component split keeps the exemption from creeping onto matmul weights by name
-# accident.
-_NO_DECAY_NAME_COMPONENTS: frozenset[str] = frozenset({
-    "freq_embed",               # encoder per-freq-patch additive table
-    "learnable_parcel_embed",   # encoder parcel-id latent table
-    "learnable_subslot_embed",  # encoder sub-slot table (M>1)
-    "subtype_embed",            # encoder sensor-subtype nn.Embedding (.weight)
-    "ref_embed",                # encoder reference-operator nn.Embedding (.weight)
-    "id_embed",                 # JepaPredictor learned identity/tag table (6/04)
-    "query",                    # PMA / attentive-pooler learned query token (3-D)
-})
-
-
-def is_no_decay(name: str, param: torch.Tensor) -> bool:
-    """True if ``param`` is weight-decay-exempt: a bias / LayerNorm γβ / any
-    other ``ndim <= 1`` param (mask tokens included), or a named embedding /
-    identity / query table whose dotted name contains a component in
-    :data:`_NO_DECAY_NAME_COMPONENTS`."""
-    if param.ndim <= 1:
-        return True
-    return any(c in _NO_DECAY_NAME_COMPONENTS for c in name.split("."))
+def is_no_decay(name: str, param: torch.Tensor) -> bool:  # noqa: ARG001
+    """True if ``param`` is weight-decay-exempt: a bias / LayerNorm γβ / any other
+    ``ndim <= 1`` param (1-D mask/identity tokens included). Every ≥2-D param —
+    matmul/conv weights AND embedding / identity / query tables — is decayed, exactly
+    as V-JEPA 2.1 ``init_opt`` (``utils.py``:305-331). ``name`` is unused (retained so
+    :func:`no_decay_param_ids` can pass it straight from ``named_parameters``)."""
+    return param.ndim <= 1
 
 
 def no_decay_param_ids(*modules: nn.Module) -> set[int]:
