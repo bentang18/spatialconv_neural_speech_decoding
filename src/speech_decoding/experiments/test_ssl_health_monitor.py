@@ -142,6 +142,51 @@ def test_true_update_ratio_zero_without_step_positive_after():
     assert logged["train_mon_true_update_ratio_frontend"] > 0.0
 
 
+# ------------------------------------------------- Family A: update_cosine
+def _run_cos_window(cb, m, logged, step0_perturb, step1_perturb):
+    """Drive one 3-step cosine window on the frontend's first param. Returns after
+    the window closes at step 2 (cosine logged). `step0_perturb`/`step1_perturb`
+    are the signed magnitudes added to the whole param before steps 1 and 2 — i.e.
+    Δθ₁ and Δθ₂ directions."""
+    p = next(m.model.frontend.parameters())
+    cb._maybe_log_update_cosine(m, step=0)               # snapshot θ0
+    assert cb._cos_snap is not None and cb._cos_delta_a is None
+    with torch.no_grad():
+        p.add_(step0_perturb)                            # Δθ₁
+    cb._maybe_log_update_cosine(m, step=1)               # store Δθ₁, re-snapshot
+    assert cb._cos_delta_a is not None
+    assert not any("update_cos" in k for k in logged)    # nothing until window closes
+    with torch.no_grad():
+        p.add_(step1_perturb)                            # Δθ₂
+    cb._maybe_log_update_cosine(m, step=2)               # cosine + reset
+    assert cb._cos_snap is None and cb._cos_delta_a is None
+
+
+def test_update_cosine_aligned_updates_positive():
+    """Two same-direction consecutive updates ⇒ cos(Δθ₁, Δθ₂) ≈ +1 (smooth descent).
+    Only the perturbed group logs; untouched groups (zero update) are skipped."""
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    _run_cos_window(cb, m, logged, step0_perturb=0.1, step1_perturb=0.1)
+    assert logged["train_mon_update_cos_frontend"] > 0.99
+    # Untouched groups have Δθ = 0 both steps ⇒ undefined cosine ⇒ not logged.
+    for g in ("latent", "m2_predictor", "m4_predictor"):
+        assert f"train_mon_update_cos_{g}" not in logged
+
+
+def test_update_cosine_antialigned_updates_negative():
+    """Opposite-direction consecutive updates (the edge-of-stability signature:
+    iterate bouncing across a sharp valley) ⇒ cos(Δθ₁, Δθ₂) ≈ −1 = too-hot."""
+    m = _module(monitor_every_n_steps=1)
+    cb = SSLHealthMonitor(every_n_steps=1)
+    logged: dict[str, float] = {}
+    m.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    _run_cos_window(cb, m, logged, step0_perturb=0.1, step1_perturb=-0.1)
+    assert logged["train_mon_update_cos_frontend"] < -0.99
+
+
 # ------------------------------------------ Family B + input-stats: run finite
 def test_tap_monitors_and_input_stats_finite():
     m = _module(monitor_every_n_steps=1)

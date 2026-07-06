@@ -10,6 +10,10 @@ Family A — MODEL-AGNOSTIC (grads/params, no forward taps), in
   * ema_weight_gap   — ``‖θ_s − θ_t‖₂ / ‖θ_s‖₂`` over the frontend EMA pair.
   * true_update_ratio — per routing group ``‖Δθ‖₂/‖θ_prev‖₂`` across two
     consecutive optimiser steps, measured only at the monitor cadence.
+  * update_cos       — per routing group ``cos(Δθ₁, Δθ₂)`` over two CONSECUTIVE
+    optimiser updates. HVP-free / tap-free edge-of-stability probe: at the stable
+    edge the Adam iterate oscillates ACROSS the sharp valley so consecutive updates
+    anti-align (cos → −1 ⇒ too-hot); smooth descent keeps them aligned (cos → +1).
 
 Family B — TAP-DEPENDENT (detached forward taps), in ``on_train_batch_end`` at
 the monitor cadence, reading ``pl_module._last_taps``:
@@ -67,6 +71,10 @@ class SSLHealthMonitor(pl.Callback):
         self._grad_ema_l2: float = 0.0
         # Per-group param snapshot for the 2-step true_update_ratio measurement.
         self._update_snapshot: dict[str, list[Tensor]] | None = None
+        # 3-step window for the consecutive-update cosine: a param snapshot plus
+        # the first update vector Δθ₁. Both cleared at window close.
+        self._cos_snap: dict[str, list[Tensor]] | None = None
+        self._cos_delta_a: dict[str, list[Tensor]] | None = None
 
     # ----------------------------------------------------------------- cadence
     def _due(self, step: int) -> bool:
@@ -81,6 +89,9 @@ class SSLHealthMonitor(pl.Callback):
         # then take a fresh one only at the cadence. Run every step so the snapshot
         # taken at step N is consumed at step N+1.
         self._maybe_log_true_update_ratio(pl_module, step)
+        # update_cos runs every step too — its 3-step window spans consecutive
+        # steps and is opened at the cadence, so it must see every step to close.
+        self._maybe_log_update_cosine(pl_module, step)
         if not self._due(step):
             return
         # grad spike: total grad-L2 over trainable params.
@@ -217,6 +228,77 @@ class SSLHealthMonitor(pl.Callback):
                 for group in _ROUTING_GROUPS
                 if getattr(pl_module.model, group, None) is not None
             }
+
+    def _maybe_log_update_cosine(
+        self, pl_module: pl.LightningModule, step: int
+    ) -> None:
+        """Per-group ``cos(Δθ₁, Δθ₂)`` over two CONSECUTIVE optimiser updates,
+        where ``Δθ₁ = θ_{N+1} − θ_N`` and ``Δθ₂ = θ_{N+2} − θ_{N+1}``.
+
+        HVP-free / tap-free edge-of-stability probe (pure parameter arithmetic — no
+        forward, no backward, no ``.grad``, no taps). At the stable edge the Adam
+        iterate oscillates across the sharp valley ⇒ consecutive updates anti-align
+        (cos → −1 = too-hot); smooth descent keeps them aligned (cos → +1). A window
+        spans 3 consecutive steps and opens only at the monitor cadence, so it is the
+        same cost class as ``true_update_ratio``. A group with no net update in a
+        window (either ‖Δθ‖ = 0) is skipped — undefined cosine, not logged."""
+        groups = [
+            g for g in _ROUTING_GROUPS
+            if getattr(pl_module.model, g, None) is not None
+        ]
+        snap = self._cos_snap
+        if snap is None:
+            # Idle → open a window at the cadence by snapshotting θ_N.
+            if self._due(step):
+                self._cos_snap = {
+                    g: [p.detach().clone()
+                        for p in getattr(pl_module.model, g).parameters()]
+                    for g in groups
+                }
+            return
+        # Hold θ_prev ⇒ form the current update Δθ = θ_now − θ_prev per group.
+        cur_delta: dict[str, list[Tensor]] = {}
+        for g in groups:
+            prev = snap.get(g)
+            mod = getattr(pl_module.model, g, None)
+            if prev is None or mod is None:
+                continue
+            cur_delta[g] = [
+                p.detach().to(torch.float32) - b.to(torch.float32)
+                for p, b in zip(mod.parameters(), prev)
+            ]
+        if self._cos_delta_a is None:
+            # Phase 1 → 2: store Δθ₁, re-snapshot θ_{N+1} for the second update.
+            self._cos_delta_a = cur_delta
+            self._cos_snap = {
+                g: [p.detach().clone()
+                    for p in getattr(pl_module.model, g).parameters()]
+                for g in groups
+            }
+            return
+        # Phase 2: cur_delta = Δθ₂ ⇒ cosine with the stored Δθ₁, then close window.
+        for g in groups:
+            da = self._cos_delta_a.get(g)
+            db = cur_delta.get(g)
+            if da is None or db is None:
+                continue
+            dot = torch.zeros((), dtype=torch.float32)
+            na = torch.zeros((), dtype=torch.float32)
+            nb = torch.zeros((), dtype=torch.float32)
+            for a, b in zip(da, db):
+                dot = dot + (a * b).sum()
+                na = na + a.pow(2).sum()
+                nb = nb + b.pow(2).sum()
+            na_v = float(na.sqrt().item())
+            nb_v = float(nb.sqrt().item())
+            if na_v > 0.0 and nb_v > 0.0:
+                pl_module.log(
+                    f"train_mon_update_cos_{g}",
+                    float(dot.item()) / (na_v * nb_v),
+                    on_step=True,
+                )
+        self._cos_snap = None
+        self._cos_delta_a = None
 
     # ------------------------------------------------- Family B + input-stats
     @torch.no_grad()
