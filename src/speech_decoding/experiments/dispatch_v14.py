@@ -687,6 +687,8 @@ def build_v14_experiment(
     converged_v2_context_lambda: float = 0.2,
     converged_v2_context_warmup_steps: int = 15000,
     converged_v2_context_warmup_start_step: int = 0,
+    converged_v2_m4_context_warmup_start_step: int = -1,
+    converged_v2_m4_context_warmup_steps: int = -1,
     converged_v2_context_loss: bool = True,
     converged_v2_context_taps: tuple[str, ...] = ("M2", "M4", "MELEC"),
     converged_v2_target_ln: bool = False,
@@ -2355,6 +2357,8 @@ def build_v14_experiment(
             "context_lambda": converged_v2_context_lambda,
             "context_warmup_steps": converged_v2_context_warmup_steps,
             "context_warmup_start_step": converged_v2_context_warmup_start_step,
+            "m4_context_warmup_start_step": converged_v2_m4_context_warmup_start_step,
+            "m4_context_warmup_steps": converged_v2_m4_context_warmup_steps,
             "context_loss": converged_v2_context_loss,
             "context_taps": converged_v2_context_taps,
             "target_ln": converged_v2_target_ln,
@@ -2982,6 +2986,17 @@ def _parser() -> argparse.ArgumentParser:
                    help="M4-recon-M3: hold λ=0 through this step, THEN ramp over "
                         "context_warmup_steps (delayed warmup; default 0 = ramp from "
                         "step 0).")
+    p.add_argument("--converged-v2-m4-context-warmup-start-step",
+                   dest="converged_v2_m4_context_warmup_start_step",
+                   type=int, default=-1,
+                   help="m4_recon_m3: SEPARATE start step for the M4 context ramp, "
+                        "decoupled from the M2/MELEC ramp. -1 (default) => inherit "
+                        "context_warmup_start_step (single shared ramp).")
+    p.add_argument("--converged-v2-m4-context-warmup-steps",
+                   dest="converged_v2_m4_context_warmup_steps",
+                   type=int, default=-1,
+                   help="m4_recon_m3: SEPARATE ramp width for the M4 context term. "
+                        "-1 (default) => inherit context_warmup_steps.")
     p.add_argument("--converged-v2-context-loss", dest="converged_v2_context_loss",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="V-JEPA 2.1 context loss (visible-position supervision), "
@@ -4368,6 +4383,8 @@ def _common_build_kwargs(args) -> dict[str, tp.Any]:
         converged_v2_context_lambda=args.converged_v2_context_lambda,
         converged_v2_context_warmup_steps=args.converged_v2_context_warmup_steps,
         converged_v2_context_warmup_start_step=args.converged_v2_context_warmup_start_step,
+        converged_v2_m4_context_warmup_start_step=args.converged_v2_m4_context_warmup_start_step,
+        converged_v2_m4_context_warmup_steps=args.converged_v2_m4_context_warmup_steps,
         converged_v2_context_loss=args.converged_v2_context_loss,
         converged_v2_context_taps=args.converged_v2_context_taps,
         converged_v2_target_ln=args.converged_v2_target_ln,

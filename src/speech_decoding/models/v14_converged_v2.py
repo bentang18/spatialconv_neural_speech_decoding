@@ -1587,6 +1587,11 @@ class V14ConvergedV2Config:
     context_lambda: float = 0.2
     context_warmup_steps: int = 15000
     context_warmup_start_step: int = 0
+    # Optional SEPARATE ramp for the M4 context term, decoupled from the M2/MELEC
+    # ramp above (own delayed start + width). Sentinel -1 ⇒ inherit the shared
+    # context_warmup_* schedule (byte-identical to the single-ramp path).
+    m4_context_warmup_start_step: int = -1
+    m4_context_warmup_steps: int = -1
     context_taps: tuple[str, ...] = ("M2", "M4")
     # V-JEPA 2.1 context-loss master switch, DECOUPLED from ``m4_recon_m3`` so the
     # M4 pool-vs-latent A/B carries identical M2/M4/MELEC context supervision on both
@@ -2624,10 +2629,12 @@ class V14ConvergedV2(nn.Module):
                 # can't overlay Run-A. Detached ⇒ training bit-identical.
                 out["_tap_teacher_pool"] = t_seeds.detach()       # (B,P,k,S,d)
             # Flag for the monitor: Run-A/Run-B regress RAW targets (no _ln_target),
-            # so explained-variance must be measured against raw targets. Emitted
-            # only in Run-A/Run-B; legacy omits it and the monitor's `.get()` defaults
-            # to the legacy `_ln_target` behavior (keeps the legacy tap-key set).
-            if self.cfg.run_a or self.cfg.run_b:
+            # so explained-variance must be measured against raw targets — UNLESS
+            # ``target_ln`` is on, in which case the per-head loss regresses
+            # ``_ln_target(target)`` (see the loss builder) and the monitor must too.
+            # Omitting the flag ⇒ the monitor's `.get()` defaults to `_ln_target`,
+            # keeping EV/VR consistent with the loss. Legacy also omits it.
+            if (self.cfg.run_a or self.cfg.run_b) and not self.cfg.target_ln:
                 out["_tap_raw_targets"] = t_front.new_tensor(1.0)
         return out
 

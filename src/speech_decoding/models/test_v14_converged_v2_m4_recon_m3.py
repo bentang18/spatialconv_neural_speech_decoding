@@ -400,6 +400,47 @@ def test_context_lambda_no_trainer_is_zero():
     assert lam == 0.0
 
 
+@pytest.mark.parametrize(
+    "step,expected",
+    [(0, 0.0), (29999, 0.0), (30000, 0.0), (35000, 0.25), (40000, 0.5), (60000, 0.5)],
+)
+def test_context_lambda_decoupled_m4_ramp(step, expected):
+    """Decoupled M4 context ramp: explicit start/steps override the shared schedule
+    (M2/MELEC ramp 10k→20k) so M4 rides its own 30k→40k ramp — λ=0 through 30k, then
+    linear 0→context_lambda over the next 10k. Shared cfg is the M2/MELEC schedule;
+    the override args are what `_step` passes for M4."""
+    fake = types.SimpleNamespace(
+        global_step=step,
+        model=types.SimpleNamespace(
+            cfg=types.SimpleNamespace(
+                context_lambda=0.5, context_warmup_steps=10000,
+                context_warmup_start_step=10000,
+            )
+        ),
+    )
+    lam_m4 = V14ConvergedV2BrainModule._context_lambda(fake, start=30000, steps=10000)
+    assert lam_m4 == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("step", [0, 5000, 15000, 20000, 40000])
+def test_context_lambda_sentinel_inherits_shared_schedule(step):
+    """start=None/steps=None (the -1 sentinel path in `_step`) ⇒ the M4 ramp is
+    byte-identical to the shared M2/MELEC ramp. Guarantees the single-ramp default
+    (no m4_context_warmup_* set) folds the context loss exactly as before."""
+    fake = types.SimpleNamespace(
+        global_step=step,
+        model=types.SimpleNamespace(
+            cfg=types.SimpleNamespace(
+                context_lambda=0.5, context_warmup_steps=10000,
+                context_warmup_start_step=10000,
+            )
+        ),
+    )
+    shared = V14ConvergedV2BrainModule._context_lambda(fake)
+    inherited = V14ConvergedV2BrainModule._context_lambda(fake, start=None, steps=None)
+    assert inherited == pytest.approx(shared)
+
+
 # --- predictor return_ctx ------------------------------------------------
 
 

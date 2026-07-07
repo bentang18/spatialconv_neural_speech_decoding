@@ -281,19 +281,22 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
             step = 0
         return step % self._monitor_every_n_steps == 0
 
-    def _context_lambda(self) -> float:
+    def _context_lambda(
+        self, start: int | None = None, steps: int | None = None
+    ) -> float:
         """Delayed-ramp context-loss coefficient: λ(t) = 0 for t < ``S``, then linear
         0→``context_lambda`` over the next ``W`` = ``context_warmup_steps`` steps (S =
         ``context_warmup_start_step``). The 0-hold lets the masked pretext establish
-        before context is introduced (avoids the trivial-copy basin). Read from
-        ``global_step`` in eager code so λ never enters the compiled forward (a
-        per-step scalar would thrash dynamo guards). No trainer / step 0 ⇒ 0.0."""
+        before context is introduced (avoids the trivial-copy basin). ``start``/``steps``
+        override the shared schedule (used for the decoupled M4 ramp); None ⇒ shared.
+        Read from ``global_step`` in eager code so λ never enters the compiled forward
+        (a per-step scalar would thrash dynamo guards). No trainer / step 0 ⇒ 0.0."""
         try:
             step = int(self.global_step)
         except (RuntimeError, AttributeError):
             step = 0
-        s = self.model.cfg.context_warmup_start_step
-        w = self.model.cfg.context_warmup_steps
+        s = self.model.cfg.context_warmup_start_step if start is None else start
+        w = self.model.cfg.context_warmup_steps if steps is None else steps
         if w > 0:
             frac = min(max(step - s, 0) / w, 1.0)
         else:
@@ -372,12 +375,22 @@ class V14ConvergedV2BrainModule(pl.LightningModule):
         # so λ stays out of the compiled graph. Grad flows through the compiled
         # context outputs. Absent terms ⇒ no-op.
         if self.model.cfg.context_loss:
+            # M2 + MELEC context ride the shared ramp; M4 context can ride a SEPARATE,
+            # later ramp (sentinel -1 ⇒ inherit the shared schedule, byte-identical).
             lam = self._context_lambda()
+            m4_s = self.model.cfg.m4_context_warmup_start_step
+            m4_w = self.model.cfg.m4_context_warmup_steps
+            lam_m4 = self._context_lambda(
+                start=None if m4_s < 0 else m4_s,
+                steps=None if m4_w < 0 else m4_w,
+            )
             ctx = out["loss"].new_zeros(())
-            for key in ("loss_m2_ctx", "loss_m4_ctx", "loss_melec_ctx"):
+            for key in ("loss_m2_ctx", "loss_melec_ctx"):
                 if key in out:
                     ctx = ctx + out[key]
             out["loss"] = out["loss"] + lam * ctx
+            if "loss_m4_ctx" in out:
+                out["loss"] = out["loss"] + lam_m4 * out["loss_m4_ctx"]
         return out
 
     def _mask_timing_record(self, t: list[float]) -> None:

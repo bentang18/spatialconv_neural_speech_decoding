@@ -91,6 +91,10 @@ class V14ConvergedV2Net(BaseModelConfig):
     context_lambda: float = 0.2
     context_warmup_steps: int = 15000
     context_warmup_start_step: int = 0
+    # Optional SEPARATE M4-context ramp (own delayed start + width); -1 ⇒ inherit
+    # the shared context_warmup_* schedule (byte-identical single-ramp default).
+    m4_context_warmup_start_step: int = -1
+    m4_context_warmup_steps: int = -1
     # V-JEPA 2.1 context-loss master switch, DECOUPLED from ``m4_recon_m3`` so both
     # A/B arms carry identical context. ``context_taps`` ⊆ {M2, M4, MELEC}.
     context_loss: bool = False
@@ -132,6 +136,8 @@ class V14ConvergedV2Net(BaseModelConfig):
                 context_lambda=self.context_lambda,
                 context_warmup_steps=self.context_warmup_steps,
                 context_warmup_start_step=self.context_warmup_start_step,
+                m4_context_warmup_start_step=self.m4_context_warmup_start_step,
+                m4_context_warmup_steps=self.m4_context_warmup_steps,
                 context_loss=self.context_loss,
                 context_taps=self.context_taps,
                 target_ln=self.target_ln,
