@@ -31,7 +31,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from collections.abc import Sequence
+
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.stem import SpectralStem
 from speech_decoding.models.v14_converged_v3.towers import (
     PRED_D_MODEL,
     build_encoder,
@@ -55,6 +58,32 @@ class JepaOutput:
     n_masked: int
 
 
+class _TargetTower(nn.Module):
+    """The full target-producing path: stem (patch-embed) + encoder.
+
+    This is the unit the EMA teacher mirrors. V-JEPA's target encoder is an EMA of
+    the ENTIRE context encoder INCLUDING the patch-embed — so the stem must live
+    inside the EMA'd tower, not be shared. The predictor is NOT part of this tower:
+    it is the online-only module that maps context latents into target space (it has
+    no teacher counterpart in JEPA).
+    """
+
+    def __init__(self, *, n_parcels: int) -> None:
+        super().__init__()
+        self.stem = SpectralStem(D_MODEL)
+        self.encoder = build_encoder(n_parcels=n_parcels)
+
+    def forward(
+        self,
+        bands: Sequence[Tensor],
+        geom: L1Geometry,
+        parcel_id: Tensor,
+        visible: Tensor | None,
+    ) -> Tensor:
+        tokens = self.stem(bands)  # (B, N, T, 256)
+        return self.encoder(tokens, geom, parcel_id, visible=visible)
+
+
 class V3JepaObjective(nn.Module):
     def __init__(
         self,
@@ -64,9 +93,10 @@ class V3JepaObjective(nn.Module):
         ema_tau: float = EMA_TAU,
     ) -> None:
         super().__init__()
-        self.encoder = build_encoder(n_parcels=n_parcels)
+        # online target path (stem + encoder) — every param here is EMA-mirrored.
+        self.online = _TargetTower(n_parcels=n_parcels)
         self.teacher = EmaTeacher(
-            self.encoder, coeff_schedule=fixed_ema_schedule(tau=ema_tau)
+            self.online, coeff_schedule=fixed_ema_schedule(tau=ema_tau)
         )
         self.predictor = build_predictor(n_parcels=n_parcels)
         self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
@@ -76,17 +106,21 @@ class V3JepaObjective(nn.Module):
         self.target_ln = target_ln
 
     def forward(
-        self, x: Tensor, geom: L1Geometry, parcel_id: Tensor, mask: Tensor
+        self,
+        bands: Sequence[Tensor],
+        geom: L1Geometry,
+        parcel_id: Tensor,
+        mask: Tensor,
     ) -> JepaOutput:
-        """x: (B, N, T, 256) stemmed tokens; mask: (B, N) bool (True = target)."""
+        """bands: 3-band |STFT| inputs; mask: (B, N) bool (True = target)."""
         visible = ~mask  # (B, N)
 
-        # online encoder over visible electrodes only
-        z = self.encoder(x, geom, parcel_id, visible=visible)  # (B, N, T, 256)
+        # online tower (stem + encoder) over visible electrodes only
+        z = self.online(bands, geom, parcel_id, visible)  # (B, N, T, 256)
 
-        # EMA teacher over the full grid → targets
+        # EMA teacher (own stem + encoder) over the full grid → targets
         with torch.no_grad():
-            tgt = self.teacher(x, geom, parcel_id, visible=None)  # (B, N, T, 256)
+            tgt = self.teacher(bands, geom, parcel_id, None)  # (B, N, T, 256)
         tgt = _ln_target(tgt) if self.target_ln else stop_grad(tgt)
 
         # predictor: mask-query at masked slots, full attention
@@ -105,4 +139,4 @@ class V3JepaObjective(nn.Module):
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:
-        return self.teacher.update_from(self.encoder, step=step)
+        return self.teacher.update_from(self.online, step=step)

@@ -4,17 +4,18 @@ Memo project-v14-converged-v3-sensor-architecture (v1 = PLAIN JEPA, KISS):
 EMA teacher + 1 predictor + masked-position L1 loss ONLY. KEEP target_ln
 (affine-free F.layer_norm on teacher targets). Collapse guard = EMA-teacher
 asymmetry + predictor bottleneck (NOT dense loss). I-JEPA mechanics: the online
-encoder sees VISIBLE electrodes only (masked excluded as keys so targets can't
-leak); the EMA teacher sees the FULL grid → targets at masked positions; the
-predictor re-inserts a learnable mask-query at each masked (electrode,slot),
-its PE supplied by the predictor's own L1 (index-RoPE) + L2 (parcel identity).
+tower (stem + encoder) sees VISIBLE electrodes only (masked excluded as keys so
+targets can't leak); the EMA teacher sees the FULL grid → targets at masked
+positions; the predictor re-inserts a learnable mask-query at each masked
+(electrode,slot), its PE supplied by the predictor's own L1/L2.
 
-Asserted contracts: scalar finite loss; gradient flows to online (encoder /
-predictor / projections) but NEVER the EMA teacher; the teacher lags then moves
-toward the online net on update; target_ln is applied; no NaN when a whole shaft
-is masked (all-excluded attention rows go uniform, not NaN); the loss reads only
-masked positions; and the loss is reducible by optimization (the predictor can
-fit fixed teacher targets from visible context).
+The EMA teacher mirrors the ENTIRE target-producing path — stem (patch-embed) AND
+encoder — matching V-JEPA (whose target encoder EMAs the patch-embed too). The
+predictor is online-only (no teacher counterpart). Asserted contracts: scalar
+finite loss; gradient flows to the online tower (stem + encoder) and the predictor
+but NEVER the EMA teacher; the teacher (incl. its stem) lags then moves toward the
+online net; target_ln is applied; no NaN when a whole shaft is masked; the loss
+reads only masked positions; and the loss is reducible by optimization.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from speech_decoding.models.v14_converged_v3.objective import V3JepaObjective
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 N_PARCELS = 8
-T = 6
+T = 16  # slow ×8→2, mid ×2→8, hga ×1→16
 
 
 def _session(shaft_sizes=(4, 3, 3)):
@@ -44,19 +45,26 @@ def _obj():
     return V3JepaObjective(n_parcels=N_PARCELS)
 
 
+def _bands(n, B=1):
+    slow = torch.randn(B, n, 7, T // 8)
+    mid = torch.randn(B, n, 6, T // 2)
+    hga = torch.randn(B, n, 7, T)
+    return [slow, mid, hga]
+
+
 def _batch(sc, n_masked_contacts=4, B=1):
     n = len(sc.labels)
-    x = torch.randn(B, n, T, 256)
+    bands = _bands(n, B)
     mask = torch.zeros(B, n, dtype=torch.bool)
     mask[:, :n_masked_contacts] = True  # mask the first few contacts
-    return x, mask
+    return bands, mask
 
 
 def test_forward_returns_scalar_finite_loss() -> None:
     sc, geom = _session()
     obj = _obj()
-    x, mask = _batch(sc)
-    out = obj(x, geom, sc.parcel_id, mask)
+    bands, mask = _batch(sc)
+    out = obj(bands, geom, sc.parcel_id, mask)
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.loss.requires_grad
@@ -65,45 +73,62 @@ def test_forward_returns_scalar_finite_loss() -> None:
 def test_gradient_flows_to_online_not_teacher() -> None:
     sc, geom = _session()
     obj = _obj()
-    x, mask = _batch(sc)
-    obj(x, geom, sc.parcel_id, mask).loss.backward()
-    # online modules receive grad
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.encoder.parameters())
+    bands, mask = _batch(sc)
+    obj(bands, geom, sc.parcel_id, mask).loss.backward()
+    # online tower (stem + encoder) and predictor receive grad
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.stem.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.encoder.parameters())
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.predictor.parameters())
-    # the EMA teacher is frozen: no grad ever
+    # the EMA teacher is frozen: no grad ever, on stem OR encoder
     assert all(p.grad is None for p in obj.teacher.parameters())
     assert all(not p.requires_grad for p in obj.teacher.parameters())
+
+
+def test_teacher_emas_the_stem_too() -> None:
+    # V-JEPA contract: the teacher mirrors the patch-embed (our stem), not just the
+    # transformer. The teacher must own a stem that lags then moves on update.
+    sc, geom = _session()
+    obj = _obj()
+    tea = dict(obj.teacher.model.named_parameters())
+    stem_names = [n for n in tea if n.startswith("stem.")]
+    assert stem_names, "teacher has no stem params — stem is not EMA'd"
+    online = dict(obj.online.named_parameters())
+    name = stem_names[0]
+    assert torch.allclose(online[name], tea[name])  # starts equal (deepcopy)
+    with torch.no_grad():
+        online[name] += 1.0
+    before = tea[name].clone()
+    obj.update_teacher()
+    after = dict(obj.teacher.model.named_parameters())[name]
+    assert not torch.allclose(after, before)  # teacher stem moved
+    assert not torch.allclose(after, online[name])  # but LAGS
 
 
 def test_teacher_lags_then_moves_toward_online() -> None:
     sc, geom = _session()
     obj = _obj()
-    x, mask = _batch(sc)
-    # teacher starts == encoder (deepcopy)
-    enc_p = dict(obj.encoder.named_parameters())
-    tea_p = dict(obj.teacher.model.named_parameters())
-    name = next(iter(enc_p))
-    assert torch.allclose(enc_p[name], tea_p[name])
-    # perturb the online encoder, then EMA-update → teacher moves partway
+    online = dict(obj.online.named_parameters())
+    tea = dict(obj.teacher.model.named_parameters())
+    name = next(n for n in online if n.startswith("encoder."))
+    assert torch.allclose(online[name], tea[name])
     with torch.no_grad():
-        enc_p[name] += 1.0
-    before = tea_p[name].clone()
+        online[name] += 1.0
+    before = tea[name].clone()
     obj.update_teacher()
     after = dict(obj.teacher.model.named_parameters())[name]
     assert not torch.allclose(after, before)  # moved
-    assert not torch.allclose(after, enc_p[name])  # but LAGS (not fully caught up)
+    assert not torch.allclose(after, online[name])  # but LAGS
 
 
 def test_target_ln_is_applied() -> None:
     sc, geom = _session()
-    x, mask = _batch(sc)
+    bands, mask = _batch(sc)
     torch.manual_seed(0)
     on = V3JepaObjective(n_parcels=N_PARCELS, target_ln=True)
     torch.manual_seed(0)
     off = V3JepaObjective(n_parcels=N_PARCELS, target_ln=False)
-    # same init (same seed) ⇒ the only difference is the target normalisation.
-    lo = on(x, geom, sc.parcel_id, mask).loss
-    lf = off(x, geom, sc.parcel_id, mask).loss
+    lo = on(bands, geom, sc.parcel_id, mask).loss
+    lf = off(bands, geom, sc.parcel_id, mask).loss
     assert not torch.allclose(lo, lf)
 
 
@@ -111,46 +136,37 @@ def test_no_nan_when_a_whole_shaft_is_masked() -> None:
     sc, geom = _session()
     obj = _obj()
     n = len(sc.labels)
-    x = torch.randn(1, n, T, 256)
+    bands = _bands(n)
     mask = torch.zeros(1, n, dtype=torch.bool)
     mask[0, sc.shaft_id == 0] = True  # whole shaft A masked (absent from encoder)
-    out = obj(x, geom, sc.parcel_id, mask)
+    out = obj(bands, geom, sc.parcel_id, mask)
     assert torch.isfinite(out.loss)
     out.loss.backward()
     assert all(
-        p.grad is None or torch.isfinite(p.grad).all()
-        for p in obj.parameters()
+        p.grad is None or torch.isfinite(p.grad).all() for p in obj.parameters()
     )
 
 
 def test_loss_reads_only_masked_positions() -> None:
-    # Perturbing the predictor's target at a VISIBLE contact must not change the
-    # loss; perturbing a MASKED contact's teacher target must.
     sc, geom = _session()
     obj = _obj()
     n = len(sc.labels)
-    x = torch.randn(1, n, T, 256)
+    bands = _bands(n)
     mask = torch.zeros(1, n, dtype=torch.bool)
     mask[0, :4] = True
-    base = obj(x, geom, sc.parcel_id, mask).loss.item()
-    # change a VISIBLE contact's input (contact 6, visible) → teacher target there
-    # is not in the loss; but it CAN change visible context → allow it to affect.
-    # Instead: masked-count invariance — loss over exactly the masked tube.
-    out = obj(x, geom, sc.parcel_id, mask)
+    out = obj(bands, geom, sc.parcel_id, mask)
     assert out.n_masked == int(mask.sum()) * T
 
 
 def test_loss_is_reducible_by_optimization() -> None:
     sc, geom = _session()
     obj = _obj()
-    x, mask = _batch(sc)
-    opt = torch.optim.Adam(
-        [p for p in obj.parameters() if p.requires_grad], lr=1e-3
-    )
+    bands, mask = _batch(sc)
+    opt = torch.optim.Adam([p for p in obj.parameters() if p.requires_grad], lr=1e-3)
     first = None
     for i in range(40):
         opt.zero_grad()
-        loss = obj(x, geom, sc.parcel_id, mask).loss
+        loss = obj(bands, geom, sc.parcel_id, mask).loss
         loss.backward()
         opt.step()
         if i == 0:

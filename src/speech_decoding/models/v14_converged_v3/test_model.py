@@ -65,7 +65,9 @@ def test_backward_reaches_stem_and_online_towers() -> None:
     n = len(sc.labels)
     model = V3ConvergedModel(n_parcels=N_PARCELS)
     model(_bands(n), geom, sc.parcel_id, generator=_gen()).loss.backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.stem.parameters())
+    # the stem now lives inside the EMA-mirrored online tower
+    online = model.objective.online
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in online.stem.parameters())
     assert all(p.grad is None for p in model.objective.teacher.parameters())
 
 

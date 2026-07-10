@@ -39,11 +39,9 @@ from speech_decoding.models.v14_converged_v3.masking import (
     sample_contact_mask,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
-    D_MODEL,
     JepaOutput,
     V3JepaObjective,
 )
-from speech_decoding.models.v14_converged_v3.stem import SpectralStem
 
 
 class V3ConvergedModel(nn.Module):
@@ -55,7 +53,8 @@ class V3ConvergedModel(nn.Module):
         target_ln: bool = True,
     ) -> None:
         super().__init__()
-        self.stem = SpectralStem(D_MODEL)
+        # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
+        # EMAs the patch-embed too), so the model owns only the objective + mask cfg.
         self.objective = V3JepaObjective(n_parcels=n_parcels, target_ln=target_ln)
         self.mask_cfg = mask_cfg
 
@@ -67,12 +66,11 @@ class V3ConvergedModel(nn.Module):
         *,
         generator: torch.Generator,
     ) -> JepaOutput:
-        tokens = self.stem(band_inputs)  # (B, N, T, 256)
-        B, N = tokens.shape[0], tokens.shape[1]
+        B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
         mask = sample_contact_mask(
             geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg
         )  # (B, N) — masking is the sole augmentation
-        return self.objective(tokens, geom, parcel_id, mask)
+        return self.objective(band_inputs, geom, parcel_id, mask)
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:
