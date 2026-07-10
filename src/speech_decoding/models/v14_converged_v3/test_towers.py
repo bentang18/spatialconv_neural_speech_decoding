@@ -3,7 +3,8 @@
 Memo project-v14-converged-v3-sensor-architecture (ENCODER/PREDICTOR OFFLOAD):
 
   Encoder  12 WIDE blocks, d_model 256, 4 heads (head_dim 64). Layout
-           ``L1×6 · L2L1L1 · L2L1L1`` = 10 L1 : 2 L2 (5:1, L1-heavy — the local,
+           ``L1×6 · (L2 L1)×3`` = 9 L1 : 3 L2 (6-block local front-load, then a
+           1:1 local/global interleave — Ben 2026-07-10, KISS; the local,
            overfit-safe capacity the encoder RETAINS). SINGLE tap = the final
            block output.
   Predictor 12 NARROW blocks, d_model 128 (0.5×), 4 heads (head_dim 32). Layout
@@ -47,15 +48,18 @@ def _kinds(tower):
     ]
 
 
-def test_encoder_layout_is_l1x6_then_two_l2l1l1() -> None:
+def test_encoder_layout_is_l1x6_then_1to1_interleave() -> None:
+    # 6-block local front-load, then a 1:1 local/global interleave (Ben 2026-07-10,
+    # KISS): L2-first in the mixed region, replacing the old 2:1 L2L1L1 tail.
     assert ENC_LAYOUT == (
         "L1", "L1", "L1", "L1", "L1", "L1",
-        "L2", "L1", "L1", "L2", "L1", "L1",
+        "L2", "L1", "L2", "L1", "L2", "L1",
     )
     enc = build_encoder(n_parcels=8)
     kinds = _kinds(enc)
     assert len(kinds) == 12
-    assert kinds.count("L1") == 10 and kinds.count("L2") == 2
+    assert kinds.count("L1") == 9 and kinds.count("L2") == 3
+    assert kinds[:6] == ["L1"] * 6  # front-load intact
     assert kinds == list(ENC_LAYOUT)
 
 
