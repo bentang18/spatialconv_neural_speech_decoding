@@ -110,7 +110,11 @@ class V3JepaObjective(nn.Module):
         init_transformer_weights(self.enc_to_pred)  # V-JEPA 2 trunc_normal(0.02)
         init_transformer_weights(self.pred_to_target)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit: mask_token zero-init).
-        self.mask_token = nn.Parameter(torch.zeros(PRED_D_MODEL))
+        # Stored 3-D (1, 1, D) to match upstream predictor.py:64-65: the shared
+        # ndim<=1 no-decay rule (optim_param_groups.is_no_decay) then DECAYS it, as
+        # upstream does — a 1-D (D,) store would silently exempt it (audit L36). It
+        # broadcasts identically in the torch.where below (numerically a no-op).
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, PRED_D_MODEL))
         self.target_ln = target_ln
 
     def forward(

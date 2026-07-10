@@ -166,6 +166,21 @@ def test_loss_reads_only_masked_positions() -> None:
     assert out.n_masked == int(mask.sum()) * T
 
 
+def test_mask_token_is_weight_decayed_like_upstream() -> None:
+    # Audit L36 (Ben-confirmed match-upstream): upstream stores the predictor mask
+    # token 3-D (1,1,D) so the shared ndim<=1 no-decay rule DECAYS it; a 1-D (D,)
+    # store would silently exempt it. v3 must keep it >=2-D → in the decay group.
+    from speech_decoding.experiments.optim_param_groups import is_no_decay
+
+    obj = _obj()
+    assert obj.mask_token.ndim >= 2
+    assert not is_no_decay("mask_token", obj.mask_token)  # decayed, upstream parity
+    # still numerically a no-op in the forward (broadcasts to every masked slot)
+    sc, geom = _session()
+    bands, mask = _batch(sc)
+    assert torch.isfinite(obj(bands, geom, sc.parcel_id, mask).loss)
+
+
 def test_loss_is_reducible_by_optimization() -> None:
     sc, geom = _session()
     obj = _obj()
