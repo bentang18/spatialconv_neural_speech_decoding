@@ -75,9 +75,12 @@ class V3Tower(nn.Module):
         # already unit, so the affine gamma has nothing to inflate toward), and makes
         # the teacher target `affinefree_LN(affine_LN(h))` — the exact upstream form.
         self.norm_out = nn.LayerNorm(d_model, eps=LN_EPS)
-        # V-JEPA 2 init (vision_transformer.py:115-116): trunc_normal(0.02)+zero-bias
-        # on Linears / LN 1,0, then depth-scaled residual rescale. The parcel embed
-        # self-inits (0.02) and is skipped by init_transformer_weights.
+        # V-JEPA 2 init (vision_transformer.py:130-159 @204698b4): Linear
+        # trunc_normal(0.02)+zero-bias / LN weight 1 bias 0, then depth-scaled
+        # residual rescale div_(sqrt(2·layer_id)), 1-indexed, on attn out-proj +
+        # mlp.fc2 — verified byte-for-byte against 2.0 AND 2.1. The parcel embed is
+        # an nn.Embedding: init_transformer_weights matches only Linear/LayerNorm, so
+        # it KEEPS its own near-zero init (1e-6 default; 0.02 is the A/B arm).
         self.apply(init_transformer_weights)
         self._rescale_blocks()
 
