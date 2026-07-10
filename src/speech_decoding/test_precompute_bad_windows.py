@@ -71,6 +71,40 @@ def test_2band_frontend_specs() -> None:
     assert by_name["hga"][:2] == (128, 64) and by_name["hga"][3] - by_name["hga"][2] + 1 == 7
 
 
+def test_v3_frontend_specs() -> None:
+    """The --frontend v3 selector scans the sensor frontend's 3 bands in
+    v3slow→v3mid→hga order at the native hop=64 (32Hz), matching the verified v3
+    cache shape (91,{7,6,7},T): v3slow 7 bins (2-14Hz), v3mid 6 (16-56Hz), hga 7
+    (= STFT_2BAND_HGA 64-160Hz). v3slow is first = the dropout sentinel."""
+    m = _mod()
+    specs = m._make_band_specs(m._FRONTEND_BANDS["v3"])
+    names = [name for (name, *_) in specs]
+    assert names == ["v3slow", "v3mid", "hga"]
+    by_name = {name: (npseg, hop, k0, k1) for (name, npseg, hop, k0, k1) in specs}
+    assert by_name["v3slow"][:2] == (1024, 64) and by_name["v3slow"][3] - by_name["v3slow"][2] + 1 == 7
+    assert by_name["v3mid"][:2] == (256, 64) and by_name["v3mid"][3] - by_name["v3mid"][2] + 1 == 6
+    assert by_name["hga"][:2] == (128, 64) and by_name["hga"][3] - by_name["hga"][2] + 1 == 7
+
+
+def test_v3_hga_band_inherits_cat_mult_6() -> None:
+    """The v3 hga band is KEYED "hga", so the locked CAT_MULT_BY_BAND override (6.0,
+    inherited from the 2-band lock) binds — its single-cell fence is 6·q, not the
+    scalar 8·q that v3slow/v3mid use. A 7·q cell fires cat under hga but not under a
+    scalar-8 band, pinning the per-band routing for the v3 frontend."""
+    m = _mod()
+    ne, nw = 100, 6
+    band = np.ones((ne, nw), np.float32)
+    band[0, 2] = 7.0                       # ratio 7 vs q=1: > 6 (hga) but < 8 (scalar)
+    n_flat = np.zeros(nw, np.int32)
+    bad, diag = m._decide_bad_windows(
+        {"hga": band}, n_flat, ne, cat_mult_by_band=m.CAT_MULT_BY_BAND,
+    )
+    assert bad == [2] and diag["per_band"]["hga"]["cat_mult"] == 6.0
+    # same cell under the scalar cat_mult=8 (v3slow/v3mid path) does NOT fire
+    clean, _ = m._decide_bad_windows({"v3mid": band}, n_flat, ne)
+    assert clean == []
+
+
 # ------------------------------------------------- per-band q (the #231 crux)
 def _quiet_loud(ne: int = 100, nw: int = 10):
     """A quiet band (q≈1) carrying a real transient + a loud uniform band (q≈100)
@@ -240,3 +274,13 @@ def test_merge_contiguous_windows_into_spans() -> None:
     # so its tail is capped to the session duration → [35,38).
     spans = m._merge_bad_windows([1, 2, 3, 7], clip_s=5.0, total_s=38.0)
     assert spans == [(5.0, 20.0), (35.0, 38.0)]
+
+
+def test_detect_window_1s_gives_tighter_spans() -> None:
+    """v3 scans at --detect-window 1.0: the SAME merge logic at clip_s=1.0 yields
+    1-second-resolution spans (≈5× tighter than the 5s default), so strict
+    any-overlap clip rejection sacrifices far less clean data. Windows 3-4 fuse into
+    [3,5); window 7 is a separate [7,8)."""
+    m = _mod()
+    spans = m._merge_bad_windows([3, 4, 7], clip_s=1.0, total_s=10.0)
+    assert spans == [(3.0, 5.0), (7.0, 8.0)]

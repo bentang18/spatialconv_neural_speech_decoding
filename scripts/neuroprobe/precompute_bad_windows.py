@@ -91,6 +91,8 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
+    STFT_V3_MID,
+    STFT_V3_SLOW,
     _stft_band_k_range,
 )
 from speech_decoding.studies.braintreebank.loader import bt_load_raw
@@ -158,10 +160,15 @@ SIGMA_FLOOR: float = 1e-6  # == SessionRobustZNormalizer / view.session_z_sigma_
 _BAND_DICTS = {
     "slow": STFT_3BAND_SLOW, "beta": STFT_3BAND_BETA, "hg": STFT_3BAND_HG,
     "lfs": STFT_2BAND_LFS, "hga": STFT_2BAND_HGA,
+    "v3slow": STFT_V3_SLOW, "v3mid": STFT_V3_MID,
 }
 _FRONTEND_BANDS: dict[str, tuple[str, ...]] = {
     "3stft": ("slow", "beta", "hg"),
     "2band": ("lfs", "hga"),
+    # v3 sensor frontend: v3slow (2-14Hz) dropout sentinel, v3mid (16-56Hz), hga
+    # (= STFT_2BAND_HGA 64-160Hz, inherits its cat_mult=6 override). Scanned at a
+    # 1s detection window (--detect-window 1.0) for ~5x tighter spans vs 3stft/2band.
+    "v3": ("v3slow", "v3mid", "hga"),
 }
 
 
@@ -287,6 +294,7 @@ def _decide_bad_windows(
 def compute_ewm_by_band(
     subject_id: int, trial_id: int,
     band_specs: list[tuple[str, int, int, int, int]] | None = None,
+    clip_s: float = CLIP_S,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, int, float, int]:
     """Streaming pass — the EXPENSIVE part of the scan, factored out so the
     aggressiveness sweep can pay it once per session and re-decide cheaply over a
@@ -330,7 +338,7 @@ def compute_ewm_by_band(
 
     n_samples = filt.shape[-1]
     total_s = n_samples / sfreq
-    n_windows = int(np.ceil(total_s / CLIP_S))
+    n_windows = int(np.ceil(total_s / clip_s))
     n_elec = int(filt.shape[0])
     # per-(electrode, window) |z|-max kept PER BAND so each band self-calibrates its own
     # scale q_band (#231) — the slow/beta/HG |z| distributions differ, so one pooled q
@@ -351,7 +359,7 @@ def compute_ewm_by_band(
             z = _robust_z_perbin(mag)  # signed (F_band, T_frames)
             per_frame = np.abs(z).max(axis=0)
             t_start = (np.arange(per_frame.shape[0]) * hop) / sfreq
-            win = np.clip((t_start / CLIP_S).astype(np.int64), 0, n_windows - 1)
+            win = np.clip((t_start / clip_s).astype(np.int64), 0, n_windows - 1)
             np.maximum.at(ewm_by_band[name][i], win, per_frame)
             if name == flat_band:  # lowest band: per-window z-std -> flat/dropout detection
                 fsum = z.sum(axis=0, dtype=np.float64)
@@ -377,18 +385,21 @@ def compute_ewm_by_band(
 def scan_session(
     subject_id: int, trial_id: int,
     band_specs: list[tuple[str, int, int, int, int]] | None = None,
+    clip_s: float = CLIP_S,
 ) -> dict:
     """Scan one (subject, trial) session and return its sidecar payload.
-    ``band_specs`` defaults to 3STFT; pass the 2-band specs for converged-v2."""
+    ``band_specs`` defaults to 3STFT; pass the 2-band specs for converged-v2.
+    ``clip_s`` is the detection-window stride (5s default; v3 uses 1s for tighter
+    spans) — it sets the window grid AND the merged-span resolution."""
     tag = f"btbank{subject_id}_t{trial_id}"
     ewm_by_band, n_flat, n_elec, total_s, n_windows = compute_ewm_by_band(
-        subject_id, trial_id, band_specs,
+        subject_id, trial_id, band_specs, clip_s,
     )
     bad_idx, decision = _decide_bad_windows(
         ewm_by_band, n_flat, n_elec,
         hot_mult_by_band=HOT_MULT_BY_BAND, cat_mult_by_band=CAT_MULT_BY_BAND,
     )
-    bad_windows_s = _merge_bad_windows(bad_idx, CLIP_S, total_s)
+    bad_windows_s = _merge_bad_windows(bad_idx, clip_s, total_s)
 
     return {
         "session": tag,
@@ -397,7 +408,7 @@ def scan_session(
         "bad_windows_s": [[float(lo), float(hi)] for lo, hi in bad_windows_s],
         # diagnostics (ignored by load_bad_windows) — now PER BAND (#231): every
         # band's self-calibrated q + fences live under rule["per_band"][name].
-        "rule": {"clip_s": CLIP_S, **decision},
+        "rule": {"clip_s": clip_s, **decision},
         "n_elec": n_elec,
         "duration_s": float(total_s),
         "n_windows": int(n_windows),
@@ -430,9 +441,14 @@ def main() -> None:
                     help="scan exactly this one session (overrides array indexing)")
     ap.add_argument("--sessions", default=None,
                     help='comma list "S:T,S:T,..." to scan (array indexes into it)')
-    ap.add_argument("--frontend", choices=("3stft", "2band"), default="3stft",
-                    help="band set to scan: 3stft (slow/beta/hg, default) or 2band "
-                         "(converged-v2 LFS/HGA magnitude). Selects the sidecar's bands.")
+    ap.add_argument("--frontend", choices=("3stft", "2band", "v3"), default="3stft",
+                    help="band set to scan: 3stft (slow/beta/hg, default), 2band "
+                         "(converged-v2 LFS/HGA magnitude), or v3 (v3slow/v3mid/hga, "
+                         "the sensor frontend). Selects the sidecar's bands.")
+    ap.add_argument("--detect-window", type=float, default=CLIP_S,
+                    help="detection-window seconds = tiling stride AND merged-span "
+                         f"resolution (default {CLIP_S}; v3 uses 1.0 for ~5x tighter "
+                         "spans → less clean data lost under strict any-overlap drop).")
     args = ap.parse_args()
 
     band_specs = _make_band_specs(_FRONTEND_BANDS[args.frontend])
@@ -446,7 +462,7 @@ def main() -> None:
         todo = [sessions[int(task)]] if task is not None else sessions
 
     for subject_id, trial_id in todo:
-        result = scan_session(subject_id, trial_id, band_specs)
+        result = scan_session(subject_id, trial_id, band_specs, clip_s=args.detect_window)
         out_path = os.path.join(args.out_dir, f"{result['session']}.json")
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
