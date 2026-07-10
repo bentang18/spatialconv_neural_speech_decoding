@@ -34,6 +34,12 @@ from torch import Tensor, nn
 from collections.abc import Sequence
 
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.packing import (
+    PackPlan,
+    build_pack_plan,
+    gather_tokens,
+    scatter_tokens,
+)
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import SpectralStem
 from speech_decoding.models.v14_converged_v3.towers import (
@@ -78,12 +84,32 @@ class _TargetTower(nn.Module):
     def forward(
         self,
         bands: Sequence[Tensor],
+        plan: PackPlan,
+        parcel_packed: Tensor,
+        *,
+        backend: str = "auto",
+        tap_blocks: tuple[int, ...] = (),
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        # PACKED production path (#24): stem over all N, gather the plan's selected
+        # contacts (M_vis online / N teacher), run the encoder packed. This is the
+        # forward the EMA teacher (a deepcopy) also routes through.
+        tokens = self.stem(bands)  # (B, N, T, 256)
+        x = gather_tokens(tokens, plan.order)  # (B, P, T, 256)
+        return self.encoder.forward_packed(
+            x, plan, parcel_packed, backend=backend, tap_blocks=tap_blocks
+        )
+
+    def forward_padded(
+        self,
+        bands: Sequence[Tensor],
         geom: L1Geometry,
         parcel_id: Tensor,
         visible: Tensor | None,
         *,
         tap_blocks: tuple[int, ...] = (),
     ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        # Padded ORACLE (test only): the pre-#24 dense path, kept to pin the packed
+        # forward numerically on CPU.
         tokens = self.stem(bands)  # (B, N, T, 256)
         return self.encoder(
             tokens, geom, parcel_id, visible=visible, tap_blocks=tap_blocks
@@ -124,79 +150,151 @@ class V3JepaObjective(nn.Module):
         parcel_id: Tensor,
         mask: Tensor,
         *,
+        m_masked: int,
+        backend: str = "auto",
         collect_taps: bool = False,
         whole_contact: Tensor | None = None,
     ) -> JepaOutput:
         """bands: 3-band |STFT| inputs; mask: (B, N) bool (True = target).
 
-        ``collect_taps`` (monitor cadence only): also return detached taps —
-        encoder block-6/12 visible-token rows (rankme/feat_std depth probe) and the
-        predictor/target rows split by whole-sensor vs intra-sensor tier (EV +
-        var-ratio + L1). ``whole_contact`` (B, N) bool marks the whole-sensor tier;
-        required when ``collect_taps`` for the tier split.
+        PACKED production path (#24 FULL varlen): the online encoder runs over the
+        ``M_vis = N − m_masked`` visible contacts, the EMA teacher + predictor over
+        all N, all shaft-grouped and ragged (no ``max_c`` pad). ``m_masked`` = the
+        per-row held-out count ``M = round(mask_frac·N)`` (a per-session CONSTANT the
+        model supplies) — it fixes ``M_vis`` without a host-sync on ``mask.sum()`` and
+        gives ``n_masked = B·M·T`` for free (B6).
+
+        ``collect_taps`` (monitor cadence only): also return detached taps — encoder
+        block-3/12 visible rows (rankme/feat_std) + predictor/target rows split by
+        whole-sensor vs intra-sensor tier. ``whole_contact`` (B, N) bool required then.
         """
         visible = ~mask  # (B, N)
+        B, N = mask.shape
+        T = bands[0].shape[-1]  # 32 Hz clock length (all bands native 32 Hz, factor 1)
+        m_vis = N - m_masked
 
-        # online tower (stem + encoder) over visible electrodes only
+        # per-clip visible pack plan (online) + static all-N plan (teacher/predictor)
+        online_plan = build_pack_plan(
+            geom, n_time=T, batch=B, n_selected=m_vis, visible=visible
+        )
+        full_plan = build_pack_plan(geom, n_time=T, batch=B, n_selected=N, visible=None)
+        online_parcel = parcel_id[online_plan.order]  # (B, M_vis)
+        full_parcel = parcel_id[full_plan.order]  # (B, N)
+
+        # online encoder over the visible contacts (packed)
         if collect_taps:
             z, enc_taps = self.online(
-                bands, geom, parcel_id, visible, tap_blocks=(3, 12)
-            )  # (B, N, T, 256), {3,12: (B,N,T,256)}
+                bands, online_plan, online_parcel, backend=backend, tap_blocks=(3, 12)
+            )  # (B, M_vis, T, 256)
         else:
-            z = self.online(bands, geom, parcel_id, visible)  # (B, N, T, 256)
+            z = self.online(bands, online_plan, online_parcel, backend=backend)
 
-        # EMA teacher (own stem + encoder) over the full grid → targets
+        # EMA teacher over all N (packed, full_plan order) → targets
         with torch.no_grad():
-            tgt = self.teacher(bands, geom, parcel_id, None)  # (B, N, T, 256)
-        tgt = _ln_target(tgt) if self.target_ln else stop_grad(tgt)
+            tgt = self.teacher(bands, full_plan, full_parcel, backend=backend)
+        tgt = _ln_target(tgt) if self.target_ln else stop_grad(tgt)  # (B,N,T,256) full order
 
-        # predictor: mask-query at masked slots, full attention
-        zp = self.enc_to_pred(z)  # (B, N, T, 128)
+        # predictor input assembly: enc_to_pred(z) at visible, mask-query at masked
+        # (built in CONTACT order, then gathered into the predictor's all-N order).
+        zp_full = scatter_tokens(self.enc_to_pred(z), online_plan.order, N)  # (B,N,T,128)
         m = mask[:, :, None, None]  # (B, N, 1, 1)
-        pred_in = torch.where(m, self.mask_token, zp)  # masked → learnable query
-        h = self.predictor(pred_in, geom, parcel_id, visible=None)  # (B, N, T, 128)
-        pred = self.pred_to_target(h)  # (B, N, T, 256)
+        pred_in_full = torch.where(m, self.mask_token, zp_full)  # masked → query, contact order
+        pred_in = gather_tokens(pred_in_full, full_plan.order)  # (B, N, T, 128) full order
+        h = self.predictor.forward_packed(pred_in, full_plan, full_parcel, backend=backend)
+        pred = self.pred_to_target(h)  # (B, N, T, 256) full order
 
-        # L1 over masked positions only (time-tubed)
-        tube = mask[:, :, None].expand(pred.shape[:-1])  # (B, N, T) bool
-        pred_m = pred[tube]  # (n_masked, 256)
-        tgt_m = tgt[tube]
-        loss = _l1_or_zero(pred_m, tgt_m, "l1")
+        # L1 at masked positions; pred & tgt BOTH in full_plan order → reorder mask
+        mask_packed = mask.gather(1, full_plan.order)  # (B, N) bool, full order
+        tube = mask_packed[:, :, None].expand(B, N, T)  # (B, N, T)
+        loss = _l1_or_zero(pred[tube], tgt[tube], "l1")
 
         taps = None
         if collect_taps:
-            taps = self._build_taps(enc_taps, pred, tgt, mask, visible, whole_contact)
-        return JepaOutput(loss=loss, n_masked=int(tube.sum()), taps=taps)
+            taps = self._build_taps_packed(
+                enc_taps, pred, tgt, mask, whole_contact, full_plan.order
+            )
+        return JepaOutput(loss=loss, n_masked=B * m_masked * T, taps=taps)
 
     @staticmethod
-    def _build_taps(
+    def _build_taps_packed(
         enc_taps: dict[int, Tensor],
         pred: Tensor,
         tgt: Tensor,
         mask: Tensor,
-        visible: Tensor,
         whole_contact: Tensor | None,
+        full_order: Tensor,
     ) -> dict[str, Tensor]:
-        """Detached monitor taps. Encoder rows are VISIBLE tokens only (the learned
-        representation); pred/target rows are the time-tubed masked positions split
-        into whole-sensor and intra-sensor tiers. Target rows are already
-        ``target_ln``'d (computed after the norm), matching the loss."""
-        B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
-        vis_t = visible[:, :, None].expand(B, N, T)  # (B, N, T)
+        """Detached monitor taps (packed path). Encoder taps are already the packed
+        VISIBLE tokens (B, M_vis, T, d) ⇒ every row is a visible token, so flatten
+        directly. pred/tgt are in ``full_order``; the whole/intra tiers are reordered
+        to match before extracting. Targets are already ``target_ln``'d (post-norm)."""
+        d_enc = enc_taps[3].shape[-1]
+        d_out = pred.shape[-1]
         out: dict[str, Tensor] = {
-            "enc3": enc_taps[3].detach()[vis_t],  # (n_vis·T, 256); pre-first-L2
-            "enc12": enc_taps[12].detach()[vis_t],
+            "enc3": enc_taps[3].detach().reshape(-1, d_enc),  # (n_vis·T, 256); pre-first-L2
+            "enc12": enc_taps[12].detach().reshape(-1, d_enc),
         }
         if whole_contact is None:
             return out
-        whole_t = whole_contact[:, :, None].expand(B, N, T)
-        intra_t = (mask & ~whole_contact)[:, :, None].expand(B, N, T)
+        B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
+        whole_packed = whole_contact.gather(1, full_order)  # (B, N) full order
+        intra_packed = (mask & ~whole_contact).gather(1, full_order)
+        whole_t = whole_packed[:, :, None].expand(B, N, T)
+        intra_t = intra_packed[:, :, None].expand(B, N, T)
         p, t = pred.detach(), tgt.detach()
         out.update(
-            pred_whole=p[whole_t], tgt_whole=t[whole_t],
-            pred_intra=p[intra_t], tgt_intra=t[intra_t],
+            pred_whole=p[whole_t].reshape(-1, d_out), tgt_whole=t[whole_t].reshape(-1, d_out),
+            pred_intra=p[intra_t].reshape(-1, d_out), tgt_intra=t[intra_t].reshape(-1, d_out),
         )
         return out
+
+    def _forward_padded(
+        self,
+        bands: Sequence[Tensor],
+        geom: L1Geometry,
+        parcel_id: Tensor,
+        mask: Tensor,
+        *,
+        collect_taps: bool = False,
+        whole_contact: Tensor | None = None,
+    ) -> JepaOutput:
+        """Padded ORACLE (test only): the pre-#24 dense JEPA assembly, kept to pin the
+        packed ``forward`` numerically on CPU. The teacher is routed through the
+        deepcopy's ``forward_padded``."""
+        visible = ~mask
+        if collect_taps:
+            z, enc_taps = self.online.forward_padded(
+                bands, geom, parcel_id, visible, tap_blocks=(3, 12)
+            )
+        else:
+            z = self.online.forward_padded(bands, geom, parcel_id, visible)
+        with torch.no_grad():
+            tgt = self.teacher.model.forward_padded(bands, geom, parcel_id, None)
+        tgt = _ln_target(tgt) if self.target_ln else stop_grad(tgt)
+        zp = self.enc_to_pred(z)
+        m = mask[:, :, None, None]
+        pred_in = torch.where(m, self.mask_token, zp)
+        h = self.predictor(pred_in, geom, parcel_id, visible=None)
+        pred = self.pred_to_target(h)
+        tube = mask[:, :, None].expand(pred.shape[:-1])
+        loss = _l1_or_zero(pred[tube], tgt[tube], "l1")
+        taps = None
+        if collect_taps:
+            B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
+            vis_t = visible[:, :, None].expand(B, N, T)
+            taps = {
+                "enc3": enc_taps[3].detach()[vis_t],
+                "enc12": enc_taps[12].detach()[vis_t],
+            }
+            if whole_contact is not None:
+                whole_t = whole_contact[:, :, None].expand(B, N, T)
+                intra_t = (mask & ~whole_contact)[:, :, None].expand(B, N, T)
+                p, t = pred.detach(), tgt.detach()
+                taps.update(
+                    pred_whole=p[whole_t], tgt_whole=t[whole_t],
+                    pred_intra=p[intra_t], tgt_intra=t[intra_t],
+                )
+        return JepaOutput(loss=loss, n_masked=int(tube.sum()), taps=taps)
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:

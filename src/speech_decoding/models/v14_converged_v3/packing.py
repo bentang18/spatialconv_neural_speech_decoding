@@ -118,3 +118,21 @@ def build_pack_plan(
         n_selected=P,
         n_tokens=B * P * T,
     )
+
+
+def gather_tokens(x_full: Tensor, order: Tensor) -> Tensor:
+    """(B, N, T, d) full grid → (B, P, T, d) packed, selecting ``order`` per clip."""
+    _, _, t, d = x_full.shape
+    return x_full.gather(1, order[:, :, None, None].expand(-1, -1, t, d))
+
+
+def scatter_tokens(x_packed: Tensor, order: Tensor, n_full: int) -> Tensor:
+    """(B, P, T, d) packed → (B, n_full, T, d) full grid; unselected rows stay 0.
+
+    Inverse of :func:`gather_tokens` — writes each packed slot back to its true
+    contact row (``order``). The predictor uses this to lift encoder-visible latents
+    into the all-N buffer before overwriting masked rows with the mask query.
+    """
+    b, _, t, d = x_packed.shape
+    out = x_packed.new_zeros(b, n_full, t, d)
+    return out.scatter_(1, order[:, :, None, None].expand(-1, -1, t, d), x_packed)

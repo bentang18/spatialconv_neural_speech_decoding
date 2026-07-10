@@ -66,6 +66,7 @@ class V3ConvergedModel(nn.Module):
         *,
         generator: torch.Generator,
         collect_taps: bool = False,
+        backend: str = "auto",
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
         # masking is the sole augmentation; the whole-sensor tier tag is only needed
@@ -80,8 +81,12 @@ class V3ConvergedModel(nn.Module):
                 geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg
             )
             whole_contact = None
+        # M = round(mask_frac·N) — the EXACT per-row held-out count the masking
+        # guarantees (masking.py). Passing it (not mask.sum()) keeps the packed
+        # objective host-sync-free and fixes M_vis for the online pack plan.
+        m_masked = round(self.mask_cfg.mask_frac * N)
         return self.objective(
-            band_inputs, geom, parcel_id, mask,
+            band_inputs, geom, parcel_id, mask, m_masked=m_masked, backend=backend,
             collect_taps=collect_taps, whole_contact=whole_contact,
         )
 

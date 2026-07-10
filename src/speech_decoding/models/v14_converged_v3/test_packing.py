@@ -19,7 +19,11 @@ from __future__ import annotations
 import torch
 
 from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
-from speech_decoding.models.v14_converged_v3.packing import build_pack_plan
+from speech_decoding.models.v14_converged_v3.packing import (
+    build_pack_plan,
+    gather_tokens,
+    scatter_tokens,
+)
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 
@@ -131,6 +135,26 @@ def test_masked_depth_still_raw_after_selection() -> None:
     plan = build_pack_plan(geom, n_time=4, batch=1, n_selected=4, visible=visible)
     assert plan.order[0].tolist() == [0, 2, 3, 4]
     assert plan.depth[0].tolist() == [1, 5, 2, 3]  # LA1=1, LA5=5, LB2=2, LB3=3
+
+
+def test_gather_scatter_round_trip_unmasked() -> None:
+    # gather_tokens ∘ scatter_tokens = identity when all contacts are selected.
+    geom = _geom(["LA1", "LA2", "LA3", "LB1", "LB2"], [0, 0, 0, 1, 1])
+    plan = build_pack_plan(geom, n_time=4, batch=2, n_selected=5, visible=None)
+    x = torch.randn(2, 5, 4, 8)
+    packed = gather_tokens(x, plan.order)
+    full = scatter_tokens(packed, plan.order, n_full=5)
+    assert torch.equal(full, x)
+
+
+def test_gather_scatter_masked_leaves_masked_rows_zero() -> None:
+    geom = _geom(["LA1", "LA2", "LA3", "LB1", "LB2"], [0, 0, 0, 1, 1])
+    visible = torch.tensor([[True, False, True, False, True]])
+    plan = build_pack_plan(geom, n_time=4, batch=1, n_selected=3, visible=visible)
+    x = torch.randn(1, 5, 4, 8)
+    full = scatter_tokens(gather_tokens(x, plan.order), plan.order, n_full=5)
+    assert torch.equal(full[0, [0, 2, 4]], x[0, [0, 2, 4]])  # visible preserved
+    assert torch.count_nonzero(full[0, 1]) == 0 and torch.count_nonzero(full[0, 3]) == 0
 
 
 def test_order_scatters_back_to_full_n_buffer() -> None:

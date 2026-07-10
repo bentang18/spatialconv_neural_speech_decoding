@@ -64,7 +64,7 @@ def test_forward_returns_scalar_finite_loss() -> None:
     sc, geom = _session()
     obj = _obj()
     bands, mask = _batch(sc)
-    out = obj(bands, geom, sc.parcel_id, mask)
+    out = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum()))
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.loss.requires_grad
@@ -74,7 +74,7 @@ def test_gradient_flows_to_online_not_teacher() -> None:
     sc, geom = _session()
     obj = _obj()
     bands, mask = _batch(sc)
-    obj(bands, geom, sc.parcel_id, mask).loss.backward()
+    obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss.backward()
     # online tower (stem + encoder) and predictor receive grad
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.stem.parameters())
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.encoder.parameters())
@@ -134,9 +134,9 @@ def test_target_ln_is_applied() -> None:
         obj.teacher.model.encoder.norm_out.weight.mul_(3.0)
         obj.teacher.model.encoder.norm_out.bias.add_(2.0)
     obj.target_ln = True
-    lo = obj(bands, geom, sc.parcel_id, mask).loss
+    lo = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss
     obj.target_ln = False
-    lf = obj(bands, geom, sc.parcel_id, mask).loss
+    lf = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss
     assert not torch.allclose(lo, lf)
 
 
@@ -147,7 +147,7 @@ def test_no_nan_when_a_whole_shaft_is_masked() -> None:
     bands = _bands(n)
     mask = torch.zeros(1, n, dtype=torch.bool)
     mask[0, sc.shaft_id == 0] = True  # whole shaft A masked (absent from encoder)
-    out = obj(bands, geom, sc.parcel_id, mask)
+    out = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum()))
     assert torch.isfinite(out.loss)
     out.loss.backward()
     assert all(
@@ -162,7 +162,7 @@ def test_loss_reads_only_masked_positions() -> None:
     bands = _bands(n)
     mask = torch.zeros(1, n, dtype=torch.bool)
     mask[0, :4] = True
-    out = obj(bands, geom, sc.parcel_id, mask)
+    out = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum()))
     assert out.n_masked == int(mask.sum()) * T
 
 
@@ -178,7 +178,35 @@ def test_mask_token_is_weight_decayed_like_upstream() -> None:
     # still numerically a no-op in the forward (broadcasts to every masked slot)
     sc, geom = _session()
     bands, mask = _batch(sc)
-    assert torch.isfinite(obj(bands, geom, sc.parcel_id, mask).loss)
+    assert torch.isfinite(obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss)
+
+
+def test_packed_forward_matches_padded_oracle() -> None:
+    # THE #24 correctness proof: the packed (varlen) production forward reproduces
+    # the padded oracle loss exactly (L1 is a mean over masked positions ⇒ the row
+    # reorder between contact-order and full_plan-order is invariant).
+    sc, geom = _session()
+    obj = _obj().eval()
+    bands, mask = _batch(sc, n_masked_contacts=5)  # shaft A whole + shaft B partial
+    m = int(mask[0].sum())
+    packed = obj(bands, geom, sc.parcel_id, mask, m_masked=m, backend="reference")
+    padded = obj._forward_padded(bands, geom, sc.parcel_id, mask)
+    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
+    assert packed.n_masked == padded.n_masked
+
+
+def test_packed_matches_padded_multi_clip_and_partial() -> None:
+    # B>1 with a per-clip-uniform partial mask across all shafts.
+    sc, geom = _session()
+    obj = _obj().eval()
+    n = len(sc.labels)
+    bands = _bands(n, B=3)
+    mask = torch.zeros(3, n, dtype=torch.bool)
+    mask[:, [1, 5, 8]] = True  # one interior contact per shaft, same per clip
+    packed = obj(bands, geom, sc.parcel_id, mask, m_masked=3, backend="reference")
+    padded = obj._forward_padded(bands, geom, sc.parcel_id, mask)
+    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
+    assert packed.n_masked == padded.n_masked == 3 * 3 * T
 
 
 def test_loss_is_reducible_by_optimization() -> None:
@@ -189,7 +217,7 @@ def test_loss_is_reducible_by_optimization() -> None:
     first = None
     for i in range(40):
         opt.zero_grad()
-        loss = obj(bands, geom, sc.parcel_id, mask).loss
+        loss = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss
         loss.backward()
         opt.step()
         if i == 0:
