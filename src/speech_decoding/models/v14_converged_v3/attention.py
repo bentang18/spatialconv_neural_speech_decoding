@@ -33,7 +33,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.packing import PackPlan
 from speech_decoding.models.v14_converged_v3.pe import L1RoPE
+from speech_decoding.models.v14_converged_v3.varlen import varlen_block_diag_attention
 
 LN_EPS = 1e-6  # v14 convention (v14_encoder.LN_EPS)
 NEG_INF_MASK = -1e4  # v14 convention: finite (not -inf) → all-masked rows go uniform
@@ -139,6 +141,45 @@ class L1Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
+    # ── packed (varlen) path (#24) — the PRODUCTION path (towers run packed) ──
+    # ``_attn`` above is the padded ORACLE: it stays the CPU-testable reference the
+    # packed path is pinned against (test_attention). The packed path avoids the
+    # ``max_c`` zero-pad entirely — it attends over the flat, shaft-grouped tokens
+    # the pack plan lays out, block-diagonal via ``cu_seqlens`` (flash on GPU, the
+    # block-diagonal SDPA reference on CPU). Same weights, same RoPE, same key set
+    # per shaft ⇒ per-contact-identical output at every present contact.
+    def _attn_packed(self, x: Tensor, plan: PackPlan, *, backend: str) -> Tensor:
+        # x: (B, P, T, d) packed, shaft-grouped. Token order = (clip, slot, time),
+        # matching plan.cu_seqlens (B*S segments, token units, b-major).
+        B, P, T, d = x.shape
+        total = B * P * T
+        qkv = self.qkv(x.reshape(total, d)).reshape(total, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=1)  # (total, H, hd)
+
+        # RoPE coord per packed token: index = clinical depth (per slot, over T),
+        # time = arange(T) (per slot). Flat (clip, slot, time) order.
+        idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)  # (total,)
+        tt = torch.arange(T, device=x.device)[None, None, :].expand(B, P, T).reshape(total)
+        qh, kh = q.transpose(0, 1), k.transpose(0, 1)  # (H, total, hd) — seq=total
+        qh, kh = self.rope(qh, kh, idx, tt)
+        q, k = qh.transpose(0, 1), kh.transpose(0, 1)  # (total, H, hd)
+        # RoPE promotes q,k to fp32 (cos/sin fp32 buffers); align to v for flash
+        # (strict/flash needs q,k,v same dtype). No-op under fp32.
+        q, k = q.to(v.dtype), k.to(v.dtype)
+
+        ctx = varlen_block_diag_attention(
+            q, k, v, plan.cu_seqlens, plan.max_seqlen, backend=backend
+        )  # (total, H, hd)
+        ctx = self.out(ctx.reshape(total, d)).reshape(B, P, T, d)
+        return ctx
+
+    def forward_packed(
+        self, x: Tensor, plan: PackPlan, *, backend: str = "auto"
+    ) -> Tensor:
+        x = x + self._attn_packed(self.norm1(x), plan, backend=backend)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
 
 class L2Block(nn.Module):
     """Cross-sensor factorized (same-t) attention block.
@@ -195,5 +236,25 @@ class L2Block(nn.Module):
 
     def forward(self, x: Tensor, visible: Tensor | None = None) -> Tensor:
         x = x + self._attn(self.norm1(x), visible)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+    # ── packed path (#24) ── x carries only the SELECTED contacts (M_vis online,
+    # all-N teacher/predictor), so the masked electrodes are physically absent —
+    # no key-mask needed (``_attn`` above is the padded oracle). Cross-sensor
+    # attention is permutation-invariant over keys, so per-contact output matches
+    # the padded path regardless of the shaft-grouped packing order.
+    def _attn_packed(self, x: Tensor) -> Tensor:
+        B, P, T, d = x.shape
+        xt = x.permute(0, 2, 1, 3).reshape(B * T, P, d)  # (B*T, P, d)
+        qkv = self.qkv(xt).reshape(B * T, P, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B*T,H,P,hd)
+        ctx = F.scaled_dot_product_attention(q, k, v)
+        ctx = ctx.transpose(1, 2).reshape(B * T, P, d)
+        return self.out(ctx).reshape(B, T, P, d).permute(0, 2, 1, 3)
+
+    def forward_packed(self, x: Tensor) -> Tensor:
+        x = x + self._attn_packed(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
