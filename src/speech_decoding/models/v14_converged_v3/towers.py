@@ -5,12 +5,11 @@ block to its geometry (L1 ← shaft gather; L2 ← parcel identity). Memo
 project-v14-converged-v3-sensor-architecture (ENCODER/PREDICTOR OFFLOAD, the
 MAE/V-JEPA local-heavy-encoder asymmetry):
 
-  Encoder  12 WIDE, d_model 256, 4 heads (head_dim 64). ``L1×6 · (L2 L1)×3``
-           = 9 L1 : 3 L2. Keeps the 6-block local front-load (build within-shaft
-           structure first), then a 1:1 local/global interleave (Ben 2026-07-10,
-           KISS first pass: uniform 1:1 in the mixed region replaces the 2:1
-           ``L2L1L1`` tail — a plain, defensible schedule, no magic digest ratio).
-           The encoder RETAINS the local, overfit-safe capacity; its final block
+  Encoder  12 WIDE, d_model 256, 4 heads (head_dim 64). ``L1×3 · [L2 L1 L1]×3``
+           = 9 L1 : 3 L2. A short 3-block local front-load, then three ``L2 L1 L1``
+           digests — each cross-sensor L2 mix is followed by 2 local blocks that
+           fold it in. Global mixing starts at block 4 (Ben 2026-07-10). The
+           encoder RETAINS the local, overfit-safe capacity; its final block
            output is the SINGLE tap.
   Predictor 12 NARROW, d_model 128 (0.5×), 4 heads (head_dim 32). ``[L2L1L1]×4``
            = 8 L1 : 4 L2, L2-first. Carries the cross-sensor capacity that is
@@ -35,7 +34,7 @@ from speech_decoding.models.v14_converged_v3.pe import (
     init_transformer_weights,
 )
 
-ENC_LAYOUT: tuple[str, ...] = ("L1",) * 6 + ("L2", "L1") * 3
+ENC_LAYOUT: tuple[str, ...] = ("L1",) * 3 + ("L2", "L1", "L1") * 3
 PRED_LAYOUT: tuple[str, ...] = ("L2", "L1", "L1") * 4
 
 ENC_D_MODEL, ENC_N_HEADS = 256, 4  # head_dim 64
@@ -101,7 +100,7 @@ class V3Tower(nn.Module):
         tap_blocks: tuple[int, ...] = (),
     ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
         # ``tap_blocks`` (monitor only): 1-based block indices whose RAW output to
-        # capture (e.g. (6, 12) for the rankme/feat_std depth comparison). Empty ⇒
+        # capture (e.g. (3, 12) for the rankme/feat_std depth comparison). Empty ⇒
         # the default single-return path (no tuple), so non-monitor callers and the
         # compiled hot path are unchanged.
         x = x + self.parcel_embed(parcel_id)[None, :, None, :]  # (B,N,T,d) + (1,N,1,d)

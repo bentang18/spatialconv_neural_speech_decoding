@@ -140,8 +140,8 @@ class V3JepaObjective(nn.Module):
         # online tower (stem + encoder) over visible electrodes only
         if collect_taps:
             z, enc_taps = self.online(
-                bands, geom, parcel_id, visible, tap_blocks=(6, 12)
-            )  # (B, N, T, 256), {6,12: (B,N,T,256)}
+                bands, geom, parcel_id, visible, tap_blocks=(3, 12)
+            )  # (B, N, T, 256), {3,12: (B,N,T,256)}
         else:
             z = self.online(bands, geom, parcel_id, visible)  # (B, N, T, 256)
 
@@ -184,7 +184,7 @@ class V3JepaObjective(nn.Module):
         B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
         vis_t = visible[:, :, None].expand(B, N, T)  # (B, N, T)
         out: dict[str, Tensor] = {
-            "enc6": enc_taps[6].detach()[vis_t],  # (n_vis·T, 256)
+            "enc3": enc_taps[3].detach()[vis_t],  # (n_vis·T, 256); pre-first-L2
             "enc12": enc_taps[12].detach()[vis_t],
         }
         if whole_contact is None:

@@ -3,10 +3,10 @@
 Memo project-v14-converged-v3-sensor-architecture (ENCODER/PREDICTOR OFFLOAD):
 
   Encoder  12 WIDE blocks, d_model 256, 4 heads (head_dim 64). Layout
-           ``L1×6 · (L2 L1)×3`` = 9 L1 : 3 L2 (6-block local front-load, then a
-           1:1 local/global interleave — Ben 2026-07-10, KISS; the local,
-           overfit-safe capacity the encoder RETAINS). SINGLE tap = the final
-           block output.
+           ``L1×3 · [L2 L1 L1]×3`` = 9 L1 : 3 L2 (3-block local front-load, then
+           three L2 L1 L1 digests; global mixing from block 4 — Ben 2026-07-10;
+           the local, overfit-safe capacity the encoder RETAINS). SINGLE tap =
+           the final block output.
   Predictor 12 NARROW blocks, d_model 128 (0.5×), 4 heads (head_dim 32). Layout
            ``[L2L1L1]×4`` = 8 L1 : 4 L2, L2-FIRST (the cross-sensor capacity the
            predictor carries, discarded at inference — MAE/V-JEPA asymmetry).
@@ -48,18 +48,19 @@ def _kinds(tower):
     ]
 
 
-def test_encoder_layout_is_l1x6_then_1to1_interleave() -> None:
-    # 6-block local front-load, then a 1:1 local/global interleave (Ben 2026-07-10,
-    # KISS): L2-first in the mixed region, replacing the old 2:1 L2L1L1 tail.
+def test_encoder_layout_is_l1x3_then_three_l2l1l1() -> None:
+    # 3-block local front-load, then three L2 L1 L1 digests (Ben 2026-07-10):
+    # global mixing starts at block 4, each L2 mix folded in by 2 local blocks.
     assert ENC_LAYOUT == (
-        "L1", "L1", "L1", "L1", "L1", "L1",
-        "L2", "L1", "L2", "L1", "L2", "L1",
+        "L1", "L1", "L1",
+        "L2", "L1", "L1", "L2", "L1", "L1", "L2", "L1", "L1",
     )
     enc = build_encoder(n_parcels=8)
     kinds = _kinds(enc)
     assert len(kinds) == 12
     assert kinds.count("L1") == 9 and kinds.count("L2") == 3
-    assert kinds[:6] == ["L1"] * 6  # front-load intact
+    assert kinds[:3] == ["L1"] * 3  # front-load
+    assert kinds[3] == "L2"  # first global mix at block 4
     assert kinds == list(ENC_LAYOUT)
 
 
@@ -168,9 +169,10 @@ def test_tower_init_matches_vjepa2() -> None:
 
 def test_tower_dispatches_l1_to_geom_and_l2_to_parcel() -> None:
     # A whole-session forward must be block-diagonal-then-mixed: after the first
-    # 6 L1 blocks (encoder), shaft A still cannot have seen shaft B; only once an
-    # L2 block runs does cross-shaft information flow. Verify the encoder as a
-    # whole DOES mix across shafts (an L2 fired) but a 6-L1 prefix does NOT.
+    # 3 L1 blocks (the encoder front-load), shaft A still cannot have seen shaft B;
+    # only once an L2 block runs (block 4) does cross-shaft information flow. Verify
+    # the encoder as a whole DOES mix across shafts (an L2 fired) but a 3-L1 prefix
+    # does NOT.
     sc, geom = _session()
     enc = build_encoder(n_parcels=8).eval()
     x = torch.randn(1, 5, T, 256)
@@ -184,9 +186,9 @@ def test_tower_dispatches_l1_to_geom_and_l2_to_parcel() -> None:
 
     # the L1-only prefix does not
     h = x
-    for b in enc.blocks[:6]:
+    for b in enc.blocks[:3]:
         h = b(h, geom)
     h2 = x2
-    for b in enc.blocks[:6]:
+    for b in enc.blocks[:3]:
         h2 = b(h2, geom)
     assert torch.allclose(h[0, :3], h2[0, :3], atol=1e-5)  # shaft A untouched

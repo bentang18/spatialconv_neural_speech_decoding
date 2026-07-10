@@ -21,8 +21,8 @@ consecutive-step windows):
 Family B — tap-dependent (detached forward taps), in ``on_train_batch_end``, reading
 ``pl_module._last_taps`` (present ⇒ this is a cadence step; the module already
 decided, so no off-by-one re-derivation):
-  * rankme + feat_std at encoder block 6 vs block 12 — does cross-sensor L2 mixing
-    raise effective rank (healthy) or collapse it?
+  * rankme + feat_std at encoder block 3 (pre-first-L2) vs block 12 — does cross-
+    sensor L2 mixing raise effective rank (healthy) or collapse it?
   * explained_var + pred_target_var_ratio + L1, split whole-sensor vs intra-sensor —
     is L2 actually learning the cross-sensor task, or is the encoder cheating locally?
 
@@ -232,8 +232,8 @@ class SSLHealthMonitorV3(pl.Callback):
         accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
         if (batch_idx + 1) % accum != 0:
             return
-        # rankme + feat_std at encoder block 6 vs block 12.
-        for key, tap_name in (("enc6", "enc6"), ("enc12", "enc12")):
+        # rankme + feat_std at encoder block 3 (pre-first-L2) vs block 12.
+        for key, tap_name in (("enc3", "enc3"), ("enc12", "enc12")):
             tap = taps.get(tap_name)
             if isinstance(tap, Tensor):
                 self._rank_and_std(pl_module, tap, key=f"{key}_")
