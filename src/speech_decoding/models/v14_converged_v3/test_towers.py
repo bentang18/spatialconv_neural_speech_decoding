@@ -139,6 +139,26 @@ def test_tower_has_terminal_layernorm() -> None:
     assert (out.var(dim=-1, unbiased=False) - 1.0).abs().max() < 1e-2
 
 
+def test_tower_init_matches_vjepa2() -> None:
+    # V-JEPA 2 init: Linear weights trunc_normal(0.02) + zero bias (qkv_bias ON),
+    # then depth-scaled residual rescale of attn out-proj + mlp.fc2 by sqrt(2·id).
+    import math
+
+    enc = build_encoder(n_parcels=8)
+    # qkv/out biases restored (upstream qkv_bias=True, proj bias)
+    b0 = enc.blocks[0]
+    assert b0.qkv.bias is not None and b0.out.bias is not None
+    assert b0.qkv.bias.abs().max().item() == 0.0  # zero-init
+    # trunc_normal(0.02) on an un-rescaled Linear (mlp.fc1)
+    assert abs(b0.mlp.fc1.weight.std().item() - 0.02) < 0.004
+    assert b0.mlp.fc1.bias.abs().max().item() == 0.0
+    # depth rescale: out-proj std shrinks as 1/sqrt(2·(id+1)) ⇒ block0/block5 ~ sqrt(6)
+    s0 = enc.blocks[0].out.weight.std().item()
+    s5 = enc.blocks[5].out.weight.std().item()
+    assert s0 > s5
+    assert abs(s0 / s5 - math.sqrt(6.0)) < 0.4
+
+
 def test_tower_dispatches_l1_to_geom_and_l2_to_parcel() -> None:
     # A whole-session forward must be block-diagonal-then-mixed: after the first
     # 6 L1 blocks (encoder), shaft A still cannot have seen shaft B; only once an

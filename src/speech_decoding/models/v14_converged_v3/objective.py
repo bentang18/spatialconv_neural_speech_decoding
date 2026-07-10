@@ -17,10 +17,10 @@ Forward (I-JEPA mechanics):
            attention (queries gather visible context), project up (128→256).
   loss     L1 over the masked positions only.
 
-The EMA copy wraps the ENCODER; the stem (a linear patch-embed applied upstream)
-is shared, not EMA-blended — a KISS simplification of the V-JEPA target encoder,
-negligible for a linear embed. Whole-sensor masks reappear in the predictor as
-all-query shafts, reconstructed cross-shaft via L2 (the offloaded task).
+The EMA teacher wraps the WHOLE target path — stem (linear patch-embed) AND encoder
+— matching V-JEPA 2, whose target encoder is a deepcopy that EMA-blends the
+patch-embed too (`app/vjepa_2_1/train.py:361`). Whole-sensor masks reappear in the
+predictor as all-query shafts, reconstructed cross-shaft via L2 (the offloaded task).
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from torch import Tensor, nn
 from collections.abc import Sequence
 
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import SpectralStem
 from speech_decoding.models.v14_converged_v3.towers import (
     PRED_D_MODEL,
@@ -101,6 +102,8 @@ class V3JepaObjective(nn.Module):
         self.predictor = build_predictor(n_parcels=n_parcels)
         self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
         self.pred_to_target = nn.Linear(PRED_D_MODEL, D_MODEL)
+        init_transformer_weights(self.enc_to_pred)  # V-JEPA 2 trunc_normal(0.02)
+        init_transformer_weights(self.pred_to_target)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit: mask_token zero-init).
         self.mask_token = nn.Parameter(torch.zeros(PRED_D_MODEL))
         self.target_ln = target_ln

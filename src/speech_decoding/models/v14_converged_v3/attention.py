@@ -79,8 +79,10 @@ class L1Block(nn.Module):
             raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
+        # qkv/out biases ON to match upstream V-JEPA 2 (qkv_bias=True, proj bias;
+        # vision_transformer.py factories). QK-norm is our only intentional add.
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out = nn.Linear(d_model, d_model, bias=True)
         self.rope = L1RoPE(self.head_dim)
         self.qk_norm = qk_norm
         if qk_norm:
@@ -166,8 +168,9 @@ class L2Block(nn.Module):
             raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
+        # qkv/out biases ON to match upstream V-JEPA 2 (qkv_bias=True, proj bias).
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out = nn.Linear(d_model, d_model, bias=True)
         self.qk_norm = qk_norm
         if qk_norm:
             self.q_norm = _QKNorm(self.head_dim)

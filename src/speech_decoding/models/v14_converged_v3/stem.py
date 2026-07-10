@@ -26,6 +26,8 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
+from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
+
 # (n_bins, hold_factor) per band, in concat order. 7·1 + 6·... note factors are
 # T32/T_band = 32Hz / band-frame-rate: SLOW 4Hz→8, MID 16Hz→2, HGA 32Hz→1.
 V3_BANDS: tuple[tuple[int, int], ...] = ((7, 8), (6, 2), (7, 1))
@@ -42,6 +44,7 @@ class SpectralStem(nn.Module):
         self.bands = tuple((int(nb), int(f)) for nb, f in bands)
         self.total_bins = sum(nb for nb, _ in self.bands)
         self.proj = nn.Linear(self.total_bins, d_model)
+        self.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)+zero-bias
 
     def broadcast_concat(self, band_inputs: Sequence[Tensor]) -> Tensor:
         """Bands ``[(...,F_b,T_b)]`` → ``(..., total_bins, T32)`` on the 32 Hz clock."""

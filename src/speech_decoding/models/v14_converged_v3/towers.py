@@ -19,13 +19,17 @@ encoder tap to the predictor input belong to the JEPA objective assembly
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.attention import LN_EPS, L1Block, L2Block
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
-from speech_decoding.models.v14_converged_v3.pe import ParcelIdentityEmbed
+from speech_decoding.models.v14_converged_v3.pe import (
+    ParcelIdentityEmbed,
+    init_transformer_weights,
+)
 
 ENC_LAYOUT: tuple[str, ...] = ("L1",) * 6 + ("L2", "L1", "L1") * 2
 PRED_LAYOUT: tuple[str, ...] = ("L2", "L1", "L1") * 4
@@ -68,6 +72,20 @@ class V3Tower(nn.Module):
         # already unit, so the affine gamma has nothing to inflate toward), and makes
         # the teacher target `affinefree_LN(affine_LN(h))` — the exact upstream form.
         self.norm_out = nn.LayerNorm(d_model, eps=LN_EPS)
+        # V-JEPA 2 init (vision_transformer.py:115-116): trunc_normal(0.02)+zero-bias
+        # on Linears / LN 1,0, then depth-scaled residual rescale. The parcel embed
+        # self-inits (0.02) and is skipped by init_transformer_weights.
+        self.apply(init_transformer_weights)
+        self._rescale_blocks()
+
+    def _rescale_blocks(self) -> None:
+        # V-JEPA 2 vision_transformer.py:231-237 / predictor.py:206-212 — divide the
+        # attn out-proj and mlp.fc2 by sqrt(2·layer_id) (1-indexed) so residual-branch
+        # variance stays flat with depth.
+        for layer_id, block in enumerate(self.blocks):
+            scale = math.sqrt(2.0 * (layer_id + 1))
+            block.out.weight.data.div_(scale)
+            block.mlp.fc2.weight.data.div_(scale)
 
     def forward(
         self,

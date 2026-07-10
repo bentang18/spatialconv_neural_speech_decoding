@@ -26,6 +26,19 @@ import torch
 from torch import Tensor, nn
 
 
+def init_transformer_weights(m: nn.Module, init_std: float = 0.02) -> None:
+    """V-JEPA 2 module init (``vision_transformer.py:130-141``): Linear weights
+    ``trunc_normal_(std)`` + zero bias; LayerNorm weight 1 / bias 0. Applied via
+    ``module.apply(...)``; Embeddings are skipped (they self-init in ``__init__``)."""
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=init_std)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.constant_(m.bias, 0.0)
+        nn.init.constant_(m.weight, 1.0)
+
+
 def _rotate_half(x: Tensor) -> Tensor:
     x_paired = x.unflatten(-1, (-1, 2))  # (..., hd/2, 2)
     return torch.stack([-x_paired[..., 1], x_paired[..., 0]], dim=-1).flatten(-2)
