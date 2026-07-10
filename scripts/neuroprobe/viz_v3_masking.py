@@ -43,6 +43,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--block-lo", type=int, default=None)  # override cfg block_w_lo
     ap.add_argument("--block-hi", type=int, default=None)  # override cfg block_w_hi
+    ap.add_argument("--whole-frac", type=float, default=None)  # override whole_shaft_frac
+    ap.add_argument("--r-lo", type=float, default=None)  # override per-shaft r_lo
+    ap.add_argument("--r-hi", type=float, default=None)  # override per-shaft r_hi
     ap.add_argument("--out", default="/work/ht203/v3_mask_viz.png")
     args = ap.parse_args()
 
@@ -60,7 +63,9 @@ def main() -> None:
         mask_frac=base.mask_frac,
         block_w_lo=args.block_lo if args.block_lo is not None else base.block_w_lo,
         block_w_hi=args.block_hi if args.block_hi is not None else base.block_w_hi,
-        whole_shaft_frac=base.whole_shaft_frac,
+        whole_shaft_frac=args.whole_frac if args.whole_frac is not None else base.whole_shaft_frac,
+        r_lo=args.r_lo if args.r_lo is not None else base.r_lo,
+        r_hi=args.r_hi if args.r_hi is not None else base.r_hi,
     )
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -122,9 +127,9 @@ def main() -> None:
     ax.set_title(
         f"v3 mask — subject {args.subject} trial {args.trial}, seed {args.seed}\n"
         f"N={n} contacts, {sc.n_shafts} shafts  |  masked {n_masked}/{n} "
-        f"= {frac:.0%}  |  whole-shaft {n_whole}  |  melec {melec}  |  "
-        f"cfg frac={cfg.mask_frac:.0%} block[{cfg.block_w_lo}-{cfg.block_w_hi}] "
-        f"ws={cfg.whole_shaft_frac:.0%}",
+        f"= {frac:.0%}  |  whole-shaft {n_whole} (100%)  |  melec {melec}  |  "
+        f"cfg frac={cfg.mask_frac:.0%} whole={cfg.whole_shaft_frac:.0%} "
+        f"r~[{cfg.r_lo:.2f},{cfg.r_hi:.2f}] block≥{cfg.block_w_lo}",
         fontsize=10,
     )
     ax.legend(

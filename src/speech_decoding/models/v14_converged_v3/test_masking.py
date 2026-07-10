@@ -1,18 +1,16 @@
 """v14_converged_v3 Phase 5 — electrode-unit time-tube masking (TDD).
 
-Memo project-v14-converged-v3-sensor-architecture (MASK UNIT = THE ELECTRODE,
-time-tubed): the mask is a per-ELECTRODE boolean; a masked electrode is hidden
-across ALL time slots (a full time tube). Distribution, small→large spatial
-extent: melec(1) ⊂ within-shaft contiguous contact-blocks (w~Uniform{4..8}, the
-MAJORITY mass — shaft-mates run out ⇒ cross-sensor L2 must fill) ⊂ whole-shaft
-(the THIN TAIL — trains the offloaded predictor L2). Blocks are contiguous ALONG
-the shaft (adjacency in surviving contacts, drop-gaps already removed).
+Memo project-v14-converged-v3-sensor-architecture, two-tier per-SHAFT scheme
+(Ben 2026-07-09): (1) WHOLE-SENSOR tier — ``whole_shaft_frac`` of shafts masked
+100% (the patient-invariant / L2 augmentation); (2) WITHIN-SENSOR tier — every
+surviving shaft masked at its OWN ratio ``r ~ Uniform[r_lo, r_hi]`` via contiguous
+depth-blocks, width ``Uniform{block_w_lo..hi}``, floor 4 = along-shaft HGA autocorr.
 
-Locked contract (this session): mask_frac 0.60 ⇒ M = round(0.60·N) held out,
-CONSTANT count (⇒ static shapes / compile-once-per-session); whole-shaft tier
-~15% of shafts; block width Uniform{4..8} (floor 4 = along-shaft HGA autocorr);
-overlap allowed; FULLY VECTORIZED (cover-rank argsort, no python loop over
-shafts/blocks). Vectorized over R independent rows (one per clip in the batch).
+Locked contract: ``mask_frac 0.60 ⇒ M = round(0.60·N)`` held out, CONSTANT count
+(⇒ static shapes / compile-once-per-session); per-shaft ratios average ~M and one
+reconciliation argsort holds the count EXACTLY while never trimming whole shafts.
+FULLY VECTORIZED (cover-rank + per-shaft top-k, no python loop). Vectorized over R
+independent rows (one per clip in the batch).
 """
 
 from __future__ import annotations
@@ -57,6 +55,16 @@ def _runs(mask_row: torch.Tensor) -> list[int]:
     return out
 
 
+def _per_shaft_rate(sc, mask: torch.Tensor) -> torch.Tensor:
+    """(R, S) fraction of each shaft's contacts masked."""
+    R, S = mask.shape[0], int(sc.n_shafts)
+    out = torch.zeros(R, S)
+    for s in range(S):
+        idx = (sc.shaft_id == s).nonzero(as_tuple=True)[0]
+        out[:, s] = mask[:, idx].float().mean(dim=1)
+    return out
+
+
 def test_exact_constant_masked_count() -> None:
     sc, geom = _session([12, 10, 8, 6])  # N = 36
     n = 36
@@ -76,23 +84,27 @@ def test_mask_frac_config_controls_count() -> None:
 
 
 def test_masking_is_blocky_not_iid_scatter() -> None:
-    # Contiguous blocks ⇒ the masked set clusters into FAR fewer runs than an iid
-    # coin flip at the same rate would (p=0.6 over 30 ≈ 7 runs). Overlap-allowed
-    # fragments (incl. melec singletons) are fine — the clustering still dominates.
+    # Contiguous blocks ⇒ FAR fewer runs than an iid coin flip at the same rate.
+    # Fixed per-shaft ratio at the target (r=mask_frac, no whole tier) isolates the
+    # block mechanism: natural total = M, no reconciliation padding.
     sc, geom = _session([30])
-    cfg = V3MaskConfig(mask_frac=0.6, block_w_lo=4, block_w_hi=8, whole_shaft_frac=0.0)
+    cfg = V3MaskConfig(
+        mask_frac=0.6, block_w_lo=4, block_w_hi=8, whole_shaft_frac=0.0, r_lo=0.6, r_hi=0.6
+    )
     mask = sample_contact_mask(geom, 30, n_rows=8, generator=_gen(1), cfg=cfg)
     mean_runs = sum(len(_runs(mask[r])) for r in range(8)) / 8
     assert mean_runs <= 4.0, f"mean runs/row {mean_runs} — not blocky enough"
-    # and a full block actually forms: some row reaches a run ≥ block_w_lo.
     assert max(max(_runs(mask[r]), default=0) for r in range(8)) >= 4
 
 
 def test_wider_blocks_give_longer_runs() -> None:
-    # The Uniform{lo..hi} width knob is real: wider spans ⇒ longer masked runs.
     sc, geom = _session([40])
-    narrow = V3MaskConfig(mask_frac=0.5, block_w_lo=4, block_w_hi=4, whole_shaft_frac=0.0)
-    wide = V3MaskConfig(mask_frac=0.5, block_w_lo=10, block_w_hi=10, whole_shaft_frac=0.0)
+    narrow = V3MaskConfig(
+        mask_frac=0.5, block_w_lo=4, block_w_hi=4, whole_shaft_frac=0.0, r_lo=0.5, r_hi=0.5
+    )
+    wide = V3MaskConfig(
+        mask_frac=0.5, block_w_lo=10, block_w_hi=10, whole_shaft_frac=0.0, r_lo=0.5, r_hi=0.5
+    )
     mn = sample_contact_mask(geom, 40, n_rows=8, generator=_gen(2), cfg=narrow)
     mw = sample_contact_mask(geom, 40, n_rows=8, generator=_gen(2), cfg=wide)
     max_narrow = sum(max(_runs(mn[r]), default=0) for r in range(8)) / 8
@@ -100,25 +112,59 @@ def test_wider_blocks_give_longer_runs() -> None:
     assert max_wide > max_narrow, f"wide {max_wide} !> narrow {max_narrow}"
 
 
-def test_whole_shaft_tier_masks_entire_shafts_first() -> None:
-    # whole_shaft_frac=0.5 over 4 shafts ⇒ 2 shafts wholly masked before any block.
+def test_whole_shaft_tier_masks_entire_shafts() -> None:
+    # whole_shaft_frac=0.5 over 4 shafts ⇒ exactly 2 shafts masked 100% (never
+    # trimmed), and those shafts are FULLY masked.
     sc, geom = _session([5, 5, 5, 5])  # N=20, M=12
     cfg = V3MaskConfig(mask_frac=0.6, whole_shaft_frac=0.5)
     mask = sample_contact_mask(geom, 20, n_rows=16, generator=_gen(3), cfg=cfg)
-    # count fully-masked shafts per row; expect ≥2 (the whole-shaft tier).
-    shaft_of = sc.shaft_id  # (20,)
-    for r in range(16):
-        full = sum(
-            bool(mask[r][shaft_of == s].all()) for s in range(4)
-        )
-        assert full >= 2, f"row {r}: only {full} whole shafts"
+    rate = _per_shaft_rate(sc, mask)  # (16, 4)
+    n_full = (rate >= 0.999).sum(dim=1)  # fully-masked shafts per row
+    assert (n_full >= 2).all(), f"expected ≥2 whole shafts, got {n_full.tolist()}"
+
+
+def test_whole_shaft_count_matches_frac() -> None:
+    # round(whole_shaft_frac·S) shafts are masked 100%; the rest are NOT full.
+    sc, geom = _session([8, 8, 8, 8, 8, 8])  # S=6, N=48
+    cfg = V3MaskConfig(mask_frac=0.6, whole_shaft_frac=0.34)  # round(0.34·6)=2
+    mask = sample_contact_mask(geom, 48, n_rows=200, generator=_gen(4), cfg=cfg)
+    rate = _per_shaft_rate(sc, mask)  # (200, 6)
+    n_full = (rate >= 0.999).float().mean(dim=0).sum()  # avg fully-masked shafts/row
+    assert abs(n_full.item() - 2.0) < 0.25, f"avg whole shafts {n_full:.2f} != ~2"
+
+
+def test_within_shaft_ratio_spreads_over_range() -> None:
+    # The per-shaft ratio r~Uniform[r_lo,r_hi] gives a BOUNDED spread — no shaft
+    # masked "too much" (the pooled-budget clumping is gone). r_mean = mask_frac and
+    # no whole tier ⇒ minimal reconciliation, so realised rates track the draw.
+    sc, geom = _session([16] * 8)  # 8 equal shafts, N=128
+    cfg = V3MaskConfig(
+        mask_frac=0.5, whole_shaft_frac=0.0, block_w_lo=4, block_w_hi=8, r_lo=0.3, r_hi=0.7
+    )
+    mask = sample_contact_mask(geom, 128, n_rows=2000, generator=_gen(6), cfg=cfg)
+    rate = _per_shaft_rate(sc, mask).reshape(-1)  # all (row, shaft) rates
+    assert abs(rate.mean().item() - 0.5) < 0.03
+    # bounded: essentially nothing above r_hi (no more pathological ~100% shafts)
+    assert (rate > 0.85).float().mean().item() < 0.02
+    # genuinely varying (not collapsed to a single per-shaft rate)
+    assert rate.std().item() > 0.06
+
+
+def test_fixed_within_ratio_masks_every_shaft_at_that_rate() -> None:
+    # r_lo=r_hi=0.5, no whole tier ⇒ every shaft masked ~50%, uniformly.
+    sc, geom = _session([12] * 5)  # N=60
+    cfg = V3MaskConfig(
+        mask_frac=0.5, whole_shaft_frac=0.0, block_w_lo=4, block_w_hi=8, r_lo=0.5, r_hi=0.5
+    )
+    mask = sample_contact_mask(geom, 60, n_rows=1000, generator=_gen(7), cfg=cfg)
+    rate = _per_shaft_rate(sc, mask)  # (1000, 5)
+    assert (rate.mean(dim=0) - 0.5).abs().max().item() < 0.03
 
 
 def test_only_valid_contacts_masked_and_time_tube_expand() -> None:
     sc, geom = _session([7, 5])  # N=12
     mask = sample_contact_mask(geom, 12, n_rows=4, generator=_gen())
     assert mask.shape == (4, 12)
-    # time-tube expansion is a trivial broadcast the objective consumes:
     T = 128
     tube = mask[:, :, None].expand(4, 12, T)
     assert tube.shape == (4, 12, T)
@@ -137,19 +183,19 @@ def test_deterministic_in_generator_seed() -> None:
 def test_rows_are_independent() -> None:
     sc, geom = _session([20])
     mask = sample_contact_mask(geom, 20, n_rows=8, generator=_gen(5))
-    # not all rows identical (independent sampling).
     assert not all(torch.equal(mask[0], mask[r]) for r in range(1, 8))
 
 
 def test_shallow_edge_coverage_is_uniform() -> None:
     # Contiguous-block masking under-covers shaft boundaries: contact 0 is coverable
-    # ONLY by a block starting exactly at 0. The negative-start extension fixes this
-    # so the shallowest contact's marginal mask rate ≈ interior ≈ mask_frac.
+    # ONLY by a block starting at 0. Negative starts + random tiebreak fix it so the
+    # shallowest contact's marginal mask rate ≈ interior ≈ the per-shaft ratio.
     sc, geom = _session([12, 12, 12, 12, 12])  # 5 equal shafts, len 12
     n = 60
-    cfg = V3MaskConfig(mask_frac=0.6, block_w_lo=4, block_w_hi=8, whole_shaft_frac=0.0)
+    cfg = V3MaskConfig(
+        mask_frac=0.6, block_w_lo=4, block_w_hi=8, whole_shaft_frac=0.0, r_lo=0.6, r_hi=0.6
+    )
     mask = sample_contact_mask(geom, n, n_rows=3000, generator=_gen(0), cfg=cfg).float()
-    # per-shaft, rate at depth-rank 0 (shallowest) vs the interior mean.
     shallow_rates, interior_rates = [], []
     for s in range(5):
         idx = (sc.shaft_id == s).nonzero(as_tuple=True)[0]

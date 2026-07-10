@@ -1,24 +1,32 @@
 """v14_converged_v3 — electrode-unit time-tube masking (Phase 5).
 
-Memo project-v14-converged-v3-sensor-architecture. The mask is a per-ELECTRODE
-boolean (a masked electrode is time-tubed = hidden across ALL slots — the
-objective broadcasts it over the clock). Distribution, small→large spatial
-extent: within-shaft contiguous contact-blocks (w~Uniform{block_w_lo..hi}, the
-MAJORITY mass) ⊂ whole-shaft masks (the THIN TAIL that trains the offloaded
-predictor L2). Constant held-out count ``M = round(mask_frac·N)`` per row ⇒ static
-shapes (compile once per session).
+Memo project-v14-converged-v3-sensor-architecture, two-tier per-SHAFT scheme
+(Ben 2026-07-09, supersedes the earlier global-budget cover-rank):
 
-Vectorized end-to-end (the memo's "ALWAYS VECTORIZE" rule): one COVER-RANK
-argsort, generalising v2's ``_hga_fill_not_trim`` to (a) variable block width and
-(b) a whole-shaft priority tier. No python loop over shafts / blocks / rows.
+  • WHOLE-SENSOR tier (the patient-invariant augmentation): ``whole_shaft_frac`` of
+    the shafts are masked 100% — pulled entirely out of the L1 encoder so the only
+    way to reconstruct them is cross-sensor (the L2 / predictor-offload task). Kept
+    a PURE removal (not I-JEPA's [0.85,1.0]): the ~0.30 along-shaft common mode
+    never decorrelates, so one visible contact would leak it to the whole shaft and
+    turn a cross-sensor target back into a trivial within-shaft copy.
+  • WITHIN-SENSOR tier: every surviving shaft is masked at its OWN ratio
+    ``r ~ Uniform[r_lo, r_hi]`` (each shaft is its own 1-D image, V-JEPA-per-image),
+    realised as contiguous depth-blocks of width ``Uniform{block_w_lo..hi}``. The
+    floor ``block_w_lo=4`` is the measured along-shaft HGA autocorrelation length:
+    the local excess above the common mode lives at lag 1 (+0.177) and is gone by
+    lag 2 (+0.047), so ≥4-wide keeps the trivially-copyable lag-1 edge fraction
+    (2/W) ≤ 50%. Per-shaft ratios kill the global clumping (some shafts ending up
+    ~100% masked) that a single pooled budget produced.
 
-Cover-rank recipe: a contact's block priority = the min random start-rank among
-the spans covering it (span ``s`` covers contact ``c`` iff ``s ≤ c < s+w_s``);
-selecting the smallest-``M`` by (tier, cover_rank, position) ≡ adding whole spans
-in random order until the budget is hit and trimming the last — contiguous blocks,
-exact count, no scan. The whole-shaft tier sits strictly below every block
-priority, so designated shafts fill first (large-extent tail), blocks fill the
-remainder.
+Constant held-out count ``M = round(mask_frac·N)`` per row ⇒ static shapes (compile
+once per session). The per-shaft ratios are drawn to AVERAGE ~M, then a single
+priority argsort reconciles to EXACTLY M — whole shafts are held (never trimmed),
+the marginal within-shaft block contacts absorb any over/undershoot.
+
+Vectorized end-to-end (the memo's "ALWAYS VECTORIZE" rule): argsort-of-rand for the
+whole-shaft pick, a COVER-RANK argsort for the contiguous blocks, a per-shaft
+top-``k`` select, and one reconciliation argsort. No python loop over shafts /
+blocks / rows.
 """
 
 from __future__ import annotations
@@ -33,10 +41,12 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 
 @dataclass(frozen=True)
 class V3MaskConfig:
-    mask_frac: float = 0.60  # ⇒ M = round(mask_frac·N) held out
-    block_w_lo: int = 4  # Uniform{lo..hi} inclusive; floor 4 = along-shaft HGA autocorr
+    mask_frac: float = 0.60  # ⇒ M = round(mask_frac·N) held out, constant per row
+    whole_shaft_frac: float = 0.20  # fraction of shafts masked 100% (patient-invariant)
+    block_w_lo: int = 4  # Uniform{lo..hi}; floor 4 = along-shaft HGA autocorr length
     block_w_hi: int = 8
-    whole_shaft_frac: float = 0.15  # fraction of shafts wholly masked (thin tail)
+    r_lo: float = 0.30  # per-shaft within-sensor ratio ~ Uniform[r_lo, r_hi]
+    r_hi: float = 0.70
 
 
 def sample_contact_mask(
@@ -58,56 +68,66 @@ def sample_contact_mask(
     valid = geom.valid  # (S, C) bool
     gidx_flat = geom.gather_idx.reshape(-1)  # (S*C,) long
     dev = valid.device
+    Cs = valid.sum(1)  # (S,) contacts per shaft
 
-    # --- whole-shaft tier: round(frac·S) shafts per row, argsort-of-rand top-k ---
+    def rand(*shape: int) -> Tensor:
+        return torch.rand(*shape, generator=generator, device=dev)
+
+    # --- whole-sensor tier: round(frac·S) shafts, each masked 100% ---
     n_ws = round(cfg.whole_shaft_frac * S)
-    ws_rank = (
-        torch.rand(R, S, generator=generator, device=dev).argsort(1).argsort(1)
-    )  # (R, S) 0-based
+    ws_rank = rand(R, S).argsort(1).argsort(1)  # (R, S) 0-based random rank
     whole = ws_rank < n_ws  # (R, S) bool
 
-    # --- within-shaft block cover-rank (variable width) ---
-    # Start positions run from -(w_hi-1) to C-1. The negative starts let contact 0
-    # be covered by a block starting "before" it (clamped to the shaft), so every
-    # contact — boundary or interior — is reachable by the same w candidate spans.
-    # Without them, contact 0 is coverable ONLY by a start at 0 (span s covers c iff
-    # s ≤ c < s+w ⇒ shallow-end deficit), masking it at ~0.36 vs ~0.67 interior.
-    P = cfg.block_w_hi - 1  # max left-extension
+    # --- per-shaft within-sensor target count: r ~ Uniform[r_lo, r_hi] ---
+    r = cfg.r_lo + (cfg.r_hi - cfg.r_lo) * rand(R, S)  # (R, S)
+    k_s = torch.round(r * Cs[None].float()).long()  # (R, S) target masked count
+    k_s = torch.where(whole, Cs[None].expand(R, S), k_s)  # whole shafts → full
+    k_s = k_s.clamp(max=Cs[None].expand(R, S))
+
+    # --- contiguous block cover-rank (variable width, negative starts) ---
+    # Starts run from -(w_hi-1)..C-1 so contact 0 is reachable by a block starting
+    # "before" it (span s covers c iff s ≤ c < s+w) — else the shallow edge is
+    # under-masked. cover_rank[c] = min random start-rank among spans covering c.
+    P = cfg.block_w_hi - 1
     n_start = C + P
-    starts = torch.arange(-P, C, device=dev)  # (n_start,) actual start positions
+    starts = torch.arange(-P, C, device=dev)  # (n_start,)
     w = torch.randint(
         cfg.block_w_lo, cfg.block_w_hi + 1, (R, S, n_start), generator=generator, device=dev
-    )  # per candidate start
-    start_rank = (
-        torch.rand(R, S, n_start, generator=generator, device=dev).argsort(2).argsort(2)
-    )  # (R, S, n_start) random rank of each candidate start
-    s_idx = starts[None, None, :, None]  # start axis
-    c_idx = torch.arange(C, device=dev)[None, None, None, :]  # covered axis
-    cover = (
-        (s_idx <= c_idx)
-        & (c_idx < s_idx + w[:, :, :, None])
-        & valid[None, :, None, :]
-    )  # (R, S, n_start, C_c)
+    )
+    start_rank = rand(R, S, n_start).argsort(2).argsort(2)  # (R, S, n_start)
+    s_idx = starts[None, None, :, None]
+    c_idx = torch.arange(C, device=dev)[None, None, None, :]
+    cover = (s_idx <= c_idx) & (c_idx < s_idx + w[:, :, :, None]) & valid[None, :, None, :]
     BIG = n_start + 1
-    ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,n_start,C_c)
-    cover_rank = ranks.min(dim=2).values  # (R, S, C) min over starts; finite for valid
+    ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,n_start,C)
+    cover_rank = ranks.min(dim=2).values.float()  # (R, S, C); finite for valid contacts
 
-    # --- composite priority: tier ⊳ (whole < block); ties broken at RANDOM ---
-    # A deterministic position tiebreak (+pos) would systematically pick the shallow
-    # end of the marginal block, re-introducing a mild depth gradient. A uniform
-    # [0,1) tiebreak (< the tier gap of C) leaves marginal selection depth-unbiased.
-    pos = torch.arange(C, device=dev)[None, None, :].expand(R, S, C).float()
-    rand_tie = torch.rand(R, S, C, generator=generator, device=dev)  # [0, 1)
-    ws_rank_f = ws_rank[:, :, None].float().expand(R, S, C)
-    whole_pri = ws_rank_f * C + pos  # in [0, S*C); whole shafts fully selected anyway
-    block_pri = float(S * C) + cover_rank.float() * C + rand_tie  # ≥ S*C, tiers disjoint
-    priority = torch.where(whole[:, :, None].expand(R, S, C), whole_pri, block_pri)
-    priority = priority.masked_fill(~valid[None].expand(R, S, C), float("inf"))
-    priority = priority.reshape(R, S * C)
+    # --- per-shaft select the k_s lowest-cover-rank contacts (ties broken at random,
+    # invalid pushed past every valid rank) ---
+    cr = torch.where(
+        valid[None].expand(R, S, C),
+        cover_rank + rand(R, S, C),  # random within-tier tiebreak → depth-flat
+        torch.full((R, S, C), float(2 * BIG), device=dev),
+    )
+    wsrank = cr.argsort(2).argsort(2)  # (R, S, C) 0 = lowest cover_rank on the shaft
+    sel = (wsrank < k_s[:, :, None]) & valid[None].expand(R, S, C)  # selected within-shaft
 
-    # --- pick the M smallest-priority contacts, scatter onto the contact axis ---
-    sel = priority.argsort(dim=1)[:, :M]  # (R, M) grid-cell indices, all valid
-    target = gidx_flat[sel]  # (R, M) contact indices (distinct per row)
+    # --- reconcile to EXACTLY M via one priority argsort ---
+    # tiers: whole (always in) < within-selected (trim highest wsrank first) <
+    # within-unselected (pad pool) < invalid. Taking the M smallest holds the count
+    # constant while whole shafts are never trimmed.
+    whole_c = whole[:, :, None].expand(R, S, C) & valid[None].expand(R, S, C)
+    within_sel = sel & ~whole_c
+    within_unsel = valid[None].expand(R, S, C) & ~sel & ~whole_c
+    r0 = rand(R, S, C)
+    pri = torch.full((R, S, C), float("inf"), device=dev)
+    pri = torch.where(whole_c, 0.5 * r0, pri)  # [0, 0.5)
+    pri = torch.where(within_sel, 1.0 + wsrank.float() / (C + 1), pri)  # [1, 2)
+    pri = torch.where(within_unsel, 2.0 + r0, pri)  # [2, 3)
+    pri = pri.reshape(R, S * C)
+
+    sel_idx = pri.argsort(dim=1)[:, :M]  # (R, M) grid-cell indices, all finite/valid
+    target = gidx_flat[sel_idx]  # (R, M) contact indices (distinct per row)
     mask = torch.zeros(R, N, dtype=torch.bool, device=dev)
     mask.scatter_(1, target, True)
     return mask
