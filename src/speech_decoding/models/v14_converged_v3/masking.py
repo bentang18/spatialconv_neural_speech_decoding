@@ -92,11 +92,15 @@ def sample_contact_mask(
     ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,n_start,C_c)
     cover_rank = ranks.min(dim=2).values  # (R, S, C) min over starts; finite for valid
 
-    # --- composite priority: tier ⊳ (whole < block); ties by (rank, position) ---
+    # --- composite priority: tier ⊳ (whole < block); ties broken at RANDOM ---
+    # A deterministic position tiebreak (+pos) would systematically pick the shallow
+    # end of the marginal block, re-introducing a mild depth gradient. A uniform
+    # [0,1) tiebreak (< the tier gap of C) leaves marginal selection depth-unbiased.
     pos = torch.arange(C, device=dev)[None, None, :].expand(R, S, C).float()
+    rand_tie = torch.rand(R, S, C, generator=generator, device=dev)  # [0, 1)
     ws_rank_f = ws_rank[:, :, None].float().expand(R, S, C)
-    whole_pri = ws_rank_f * C + pos  # in [0, S*C)
-    block_pri = float(S * C) + cover_rank.float() * C + pos  # ≥ S*C
+    whole_pri = ws_rank_f * C + pos  # in [0, S*C); whole shafts fully selected anyway
+    block_pri = float(S * C) + cover_rank.float() * C + rand_tie  # ≥ S*C, tiers disjoint
     priority = torch.where(whole[:, :, None].expand(R, S, C), whole_pri, block_pri)
     priority = priority.masked_fill(~valid[None].expand(R, S, C), float("inf"))
     priority = priority.reshape(R, S * C)
