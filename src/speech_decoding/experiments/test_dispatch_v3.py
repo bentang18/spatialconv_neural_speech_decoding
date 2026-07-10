@@ -129,6 +129,29 @@ def test_local_cpu_smoke_fit_runs(tmp_path) -> None:
     assert torch.isfinite(torch.tensor(trainer.callback_metrics["train_loss"].item()))
 
 
+def test_main_argv_path_runs(tmp_path, monkeypatch) -> None:
+    # exercise main()'s full argv → load_v3_sessions → build_v3_training → fit glue,
+    # with the one real seam (BT parcel lookup) stubbed so no anatomy/GPU is needed.
+    import speech_decoding.experiments.dispatch_v3 as d3
+
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    monkeypatch.setattr(d3, "make_bt_parcel_fn", lambda bt_root: _stub_parcel_fn)
+    argv = [
+        "--bt-root", "unused",
+        "--band-cache-dir", band_dirs[0],
+        "--band-cache-dir", band_dirs[1],
+        "--band-cache-dir", band_dirs[2],
+        "--span-dir", span_dir,
+        "--session", "1:0",
+        "--clips-per-session", "4", "--batch-size", "2",
+        "--ssl-max-steps", "1", "--accumulate-grad-batches", "2",
+        "--accelerator", "cpu", "--devices", "1", "--precision", "32-true",
+        "--num-workers", "0",
+    ]
+    d3.main(argv)  # must not raise
+
+
 def test_smoke_advances_teacher_and_params(tmp_path) -> None:
     sess = [(1, 0, _shaft_labels((8, 8, 8)))]
     band_dirs, span_dir = _write_caches(tmp_path, sess)
