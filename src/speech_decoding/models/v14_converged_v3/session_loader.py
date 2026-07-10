@@ -22,7 +22,6 @@ everything else is exercised locally with synthetic caches + a stub parcel_fn.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -33,6 +32,7 @@ from speech_decoding.models.v14_converged_v3.cache_index import (
     BandCacheEntry,
     index_band_cache,
     index_bad_windows,
+    parse_key_session,
     parse_lof_report,
 )
 from speech_decoding.models.v14_converged_v3.dataset import (
@@ -46,14 +46,13 @@ ParcelFn = Callable[[int, int, Sequence[str]], Tensor]
 
 
 def _entry_for(index: dict[str, BandCacheEntry], subject_id: int, trial_id: int) -> BandCacheEntry:
-    """The unique cache entry for a session, matched on the sidecar ``key`` string.
+    """The unique cache entry for a session, matched on the sidecar ``key``.
 
-    Word-boundary match on ``subject_id=S`` / ``trial_id=T`` so S=1 never matches
-    ``subject_id=12``.
-    """
-    s_pat = re.compile(rf"subject_id={subject_id}(?![0-9])")
-    t_pat = re.compile(rf"trial_id={trial_id}(?![0-9])")
-    hits = [e for k, e in index.items() if s_pat.search(k) and t_pat.search(k)]
+    ``key`` is the real producer uid (nested JSON with ``"subject_id":S`` /
+    ``"trial_id":T`` inside ``timeline``); ``parse_key_session`` extracts the two
+    ids (full-integer, so S=1 never aliases 12). Exactly one entry per session per
+    band leaf (one continuous whole-movie cache), so >1 or 0 is a fail-loud."""
+    hits = [e for k, e in index.items() if parse_key_session(k) == (subject_id, trial_id)]
     if len(hits) != 1:
         raise ValueError(
             f"expected exactly one cache entry for subject {subject_id} trial "

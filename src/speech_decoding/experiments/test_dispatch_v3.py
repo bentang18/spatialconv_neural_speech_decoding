@@ -54,7 +54,11 @@ def _write_caches(tmp_path, sessions, *, n_frames=400):
         F = _BAND_F[b]
         for subject_id, trial_id, labels in sessions:
             stem = f"btbank{subject_id}_t{trial_id}"
-            key = f"Wang2024Treebank:subject_id={subject_id},trial_id={trial_id}"
+            key = (
+                '{"cls":"Wang2024Treebank","method":"_load_raw","timeline":'
+                f'{{"extra_bad":[],"subject":"btbank{subject_id}",'
+                f'"subject_id":{subject_id},"trial_id":{trial_id}}}}}_0.000_6867.860'
+            )
             C = len(labels)
             (d / f"{stem}.json").write_text(json.dumps({
                 "key": key, "ch_names": labels, "total_frames": n_frames,

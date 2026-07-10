@@ -49,6 +49,48 @@ def parse_session_name(name: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+def parse_key_session(key: str) -> tuple[int, int]:
+    """``(subject_id, trial_id)`` from a real spec-cache ``key`` string.
+
+    The producer writes the session uid VERBATIM, e.g.
+    ``{"cls":"Wang2024Treebank","method":"_load_raw","timeline":{"extra_bad":[...],
+    "subject":"btbank1","subject_id":1,"trial_id":0}}_0.000_6867.860`` — a nested
+    JSON blob (subject_id/trial_id inside ``timeline``) plus a time-range suffix.
+    Parse the two ids directly (full-integer capture, so 1 never aliases 12)."""
+    ms = re.search(r'"subject_id"\s*:\s*(\d+)', key)
+    mt = re.search(r'"trial_id"\s*:\s*(\d+)', key)
+    if not ms or not mt:
+        raise ValueError(f"key missing subject_id/trial_id: {key[:120]!r}")
+    return int(ms.group(1)), int(mt.group(1))
+
+
+def resolve_band_leaf(band_dir: str, *, band_hop: int = 64) -> str:
+    """The leaf dir holding a band's ``{hash}.json/.npy/.stats.npz`` triples.
+
+    The real cache nests the triples under exca's method-cache tree
+    (``{band_root}/…MultiStftView._get_data,1/{config-hash-dir}/``), and a band root
+    can carry STALE leaves from earlier regens (e.g. ``band_v3slow`` keeps a
+    ``band_hop=512`` leaf beside the current ``band_hop=64`` one). Descend to the
+    unique leaf whose exca config dirname carries the locked ``band_hop`` — fail loud
+    on 0 or >1 so a stale cache can never be silently trained on. A dir that already
+    holds ``*.json`` directly (a leaf, or a synthetic test dir) is returned as-is."""
+    if glob.glob(os.path.join(band_dir, "*.json")):
+        return band_dir
+    leaves = sorted(
+        {os.path.dirname(p) for p in glob.glob(os.path.join(band_dir, "**", "*.json"), recursive=True)}
+    )
+    if not leaves:
+        raise ValueError(f"no spec-cache sidecars under {band_dir}")
+    hop_re = re.compile(rf"band_hop={band_hop}(?![0-9])")
+    pick = [d for d in leaves if hop_re.search(d)] or leaves
+    if len(pick) != 1:
+        raise ValueError(
+            f"{band_dir}: expected exactly one band_hop={band_hop} leaf, found "
+            f"{len(pick)}: {[os.path.basename(d) for d in pick]}"
+        )
+    return pick[0]
+
+
 @dataclass(frozen=True)
 class BandCacheEntry:
     npy_path: str
@@ -66,6 +108,7 @@ def index_band_cache(band_dir: str) -> dict[str, BandCacheEntry]:
     channel (voltage) order, which the sidecar/geometry build treats as the FULL
     session order.
     """
+    band_dir = resolve_band_leaf(band_dir)
     out: dict[str, BandCacheEntry] = {}
     for meta_path in sorted(glob.glob(os.path.join(band_dir, "*.json"))):
         if meta_path.endswith(".stats.npz"):  # defensive; .npz never matches *.json

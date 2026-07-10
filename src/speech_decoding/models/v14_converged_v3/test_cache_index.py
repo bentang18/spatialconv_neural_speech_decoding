@@ -23,9 +23,20 @@ from speech_decoding.models.v14_converged_v3.cache_index import (
     index_band_cache,
     index_bad_windows,
     load_bad_window_spans,
+    parse_key_session,
     parse_lof_report,
     parse_session_name,
+    resolve_band_leaf,
 )
+
+
+def _real_key(subject_id: int, trial_id: int) -> str:
+    """A key in the REAL producer format (nested JSON + time-range suffix)."""
+    return (
+        '{"cls":"Wang2024Treebank","method":"_load_raw","timeline":'
+        f'{{"extra_bad":[],"subject":"btbank{subject_id}",'
+        f'"subject_id":{subject_id},"trial_id":{trial_id}}}}}_0.000_6867.860'
+    )
 
 
 def _write(path, obj):
@@ -64,26 +75,56 @@ def test_parse_session_name() -> None:
     assert parse_session_name("btbank1_t0") == (1, 0)
 
 
+def test_parse_key_session_reads_nested_json_key() -> None:
+    k = _real_key(1, 0)
+    assert parse_key_session(k) == (1, 0)
+    # full-integer capture: 12 never aliases 1
+    assert parse_key_session(_real_key(12, 3)) == (12, 3)
+
+
+def test_parse_key_session_fails_loud_on_bad_key() -> None:
+    import pytest
+    with pytest.raises(ValueError, match="missing subject_id"):
+        parse_key_session("not-a-real-key")
+
+
 def test_index_band_cache_scans_sidecars(tmp_path) -> None:
     # two sessions in one band dir; each has {stem}.json + {stem}.npy + {stem}.stats.npz
     for stem, key, ch, tf in (
-        ("aaa", "Wang2024Treebank:subject_id=1,trial_id=0", ["LA1", "LA2"], 5000),
-        ("bbb", "Wang2024Treebank:subject_id=2,trial_id=1", ["LB1"], 4000),
+        ("aaa", _real_key(1, 0), ["LA1", "LA2"], 5000),
+        ("bbb", _real_key(2, 1), ["LB1"], 4000),
     ):
         _write(tmp_path / f"{stem}.json", {
-            "key": key, "ch_names": ch, "total_frames": tf, "sample_rate": 32,
+            "key": key, "ch_names": ch, "total_frames": tf, "sample_rate": 2048,
         })
         np.save(str(tmp_path / f"{stem}.npy"), np.zeros((len(ch), 7, tf), np.float32))
         np.savez(str(tmp_path / f"{stem}.stats.npz"),
                  median=np.zeros((len(ch), 7, 1)), sigma=np.ones((len(ch), 7, 1)))
     idx = index_band_cache(str(tmp_path))
-    keys = set(idx)
-    assert "Wang2024Treebank:subject_id=1,trial_id=0" in keys
-    e = idx["Wang2024Treebank:subject_id=1,trial_id=0"]
+    e = idx[_real_key(1, 0)]
     assert e.ch_names == ("LA1", "LA2")
     assert e.total_frames == 5000
     assert e.npy_path.endswith("aaa.npy")
     assert e.stats_path.endswith("aaa.stats.npz")
+
+
+def test_resolve_band_leaf_descends_and_disambiguates_stale_hop(tmp_path) -> None:
+    # emulate the real exca nesting: a stale band_hop=512 leaf beside the hop=64 one
+    method = tmp_path / "speech_decoding.extractors.view.MultiStftView._get_data,1"
+    stale = method / "c_max=256,car=shaft,band_hop=512,x-aaa-111"
+    live = method / "c_max=256,car=shaft,band_hop=64,hop_length=64,x-bbb-222"
+    for d, tf in ((stale, 111), (live, 222)):
+        d.mkdir(parents=True)
+        _write(d / "h.json", {"key": _real_key(1, 0), "ch_names": ["LA1"],
+                              "total_frames": tf, "sample_rate": 2048})
+        np.save(str(d / "h.npy"), np.zeros((1, 7, tf), np.float32))
+        np.savez(str(d / "h.stats.npz"),
+                 median=np.zeros((1, 7, 1)), sigma=np.ones((1, 7, 1)))
+    leaf = resolve_band_leaf(str(tmp_path))  # band ROOT → descend, pick hop=64
+    assert leaf == str(live)
+    # index_band_cache auto-resolves the same leaf (reads the live total_frames)
+    idx = index_band_cache(str(tmp_path))
+    assert idx[_real_key(1, 0)].total_frames == 222
 
 
 def test_index_band_cache_ignores_sidecar_without_npy(tmp_path) -> None:

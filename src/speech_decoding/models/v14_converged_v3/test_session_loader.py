@@ -55,7 +55,11 @@ def _write_band_cache(band_dir, band_idx, sessions, n_frames):
     F = _BAND_F[band_idx]
     for subject_id, trial_id, labels in sessions:
         stem = f"btbank{subject_id}_t{trial_id}"
-        key = f"Wang2024Treebank:subject_id={subject_id},trial_id={trial_id}"
+        key = (
+            '{"cls":"Wang2024Treebank","method":"_load_raw","timeline":'
+            f'{{"extra_bad":[],"subject":"btbank{subject_id}",'
+            f'"subject_id":{subject_id},"trial_id":{trial_id}}}}}_0.000_6867.860'
+        )
         C = len(labels)
         (band_dir / f"{stem}.json").write_text(json.dumps({
             "key": key, "ch_names": labels, "total_frames": n_frames,
@@ -219,12 +223,18 @@ def test_wrong_band_dir_count_fails_loud(tmp_path) -> None:
         )
 
 
-def test_entry_for_ambiguous_raises(tmp_path) -> None:
-    # two entries both matching the same (S,T) → refuse rather than pick one
+def test_entry_for_ambiguous_raises() -> None:
+    # two entries both parsing to the same (S,T) → refuse rather than pick one
     from speech_decoding.models.v14_converged_v3.cache_index import BandCacheEntry
+
+    def _k(suffix):
+        return (
+            '{"cls":"Wang2024Treebank","method":"_load_raw","timeline":'
+            f'{{"subject_id":1,"trial_id":0}}}}_{suffix}'
+        )
     idx = {
-        "subject_id=1,trial_id=0,a": BandCacheEntry("a.npy", "a.npz", ("X",), 1, 32),
-        "subject_id=1,trial_id=0,b": BandCacheEntry("b.npy", "b.npz", ("X",), 1, 32),
+        _k("0.000_10.0"): BandCacheEntry("a.npy", "a.npz", ("X",), 1, 2048),
+        _k("0.000_20.0"): BandCacheEntry("b.npy", "b.npz", ("X",), 1, 2048),
     }
     with pytest.raises(ValueError, match="found 2"):
         _entry_for(idx, 1, 0)
