@@ -133,7 +133,13 @@ class L1Block(nn.Module):
         ctx = ctx.transpose(1, 2).reshape(B * S, seq, d)
         ctx = self.out(ctx).reshape(B, S, C, T, d)
 
-        out = x.new_zeros(B, N, T, d)
+        # Allocate the scatter target in ctx's dtype, NOT x's. Under bf16-mixed
+        # autocast x = norm1(x) is fp32 (LayerNorm autocasts to fp32) while
+        # ctx = self.out(ctx) is bf16; the advanced-index assignment below does NOT
+        # promote dtypes (unlike `+`) and would raise "Index put requires source and
+        # destination dtypes match". The residual add in forward() promotes back to
+        # the fp32 stream. (fp32 tests never hit this — both were fp32.)
+        out = ctx.new_zeros(B, N, T, d)
         out[:, geom.gather_idx[geom.valid]] = ctx[:, geom.valid]
         return out
 

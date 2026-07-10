@@ -130,3 +130,20 @@ def test_l2_is_time_factorized() -> None:
     x2[0, 3, 2] += _BUMP_D  # contact 3, time 2
     out2 = blk(x2)
     assert torch.allclose(out[0, :, 0], out2[0, :, 0], atol=1e-5)
+
+
+def test_both_blocks_run_under_bf16_autocast() -> None:
+    # Regression: v3 is documented to train bf16-mixed (params fp32). L1Block's
+    # visible-gather scatter (out[...] = ctx[...]) must allocate `out` in ctx's
+    # dtype — under autocast x=norm1(x) is fp32 but ctx=out(ctx) is bf16, and the
+    # advanced-index assignment does NOT promote (unlike `+`). Every other test runs
+    # fp32, so nothing else catches this. The residual add must stay fp32.
+    sc, geom = _two_shaft()
+    x = torch.randn(2, 5, T, D)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        l1_out = L1Block(D, H)(x, geom)
+        l2_out = L2Block(D, H)(x)
+    assert l1_out.shape == x.shape and l2_out.shape == x.shape
+    # forward() adds these to the fp32 residual stream → promotes back to fp32.
+    assert (x + l1_out).dtype == torch.float32
+    assert (x + l2_out).dtype == torch.float32

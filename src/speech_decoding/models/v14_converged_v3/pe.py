@@ -91,10 +91,20 @@ class L1RoPE(nn.Module):
 class ParcelIdentityEmbed(nn.Module):
     """Learned per-parcel identity embedding indexed by the DKT/DK hard tag."""
 
-    def __init__(self, n_parcels: int, d_model: int, *, init_std: float = 0.02) -> None:
+    def __init__(self, n_parcels: int, d_model: int, *, init_std: float = 1e-6) -> None:
         super().__init__()
         self.embed = nn.Embedding(n_parcels, d_model)
         nn.init.trunc_normal_(self.embed.weight, std=init_std)
+        # NEAR-ZERO init = upstream parity (audit finding #1, memo's strongest
+        # change-candidate). Every additive-to-residual embed in V-JEPA 2.1 inits
+        # ~0 so the model GROWS into it (modality embed std 1e-6 at
+        # `app/vjepa_2_1/models/vision_transformer.py:187-188`; mask_token zero).
+        # This table is added to BOTH encoder+predictor input and rides every block
+        # (towers.py:97) — at the old 0.02 it was ~20% of the token signal at init,
+        # a strong per-parcel prior from step 0 that biases toward memorizing parcel
+        # identity early, exactly the failure mode in the high-repeat 30h regime.
+        # 0.02 is retained as the A/B arm (pass init_std=0.02).
+        #
         # NO weight-decay exemption: this 2-D table IS decayed, matching upstream
         # V-JEPA 2 exactly (`app/vjepa_2_1/utils.py` shape-only rule decays every
         # ≥2-D param, including its own 3-D modality embed) and our established

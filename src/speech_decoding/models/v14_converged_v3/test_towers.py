@@ -110,7 +110,10 @@ def test_parcel_embed_added_once_at_tower_input() -> None:
     pid_b[0] = 5  # contact 0 → different parcel
     out_a = enc(x, geom, sc.parcel_id)
     out_b = enc(x, geom, pid_b)
-    assert not torch.allclose(out_a, out_b, atol=1e-4)
+    # Wiring check (init-magnitude-agnostic): relabelling a parcel must change the
+    # output at all. atol=0 catches the near-zero-init (1e-6) parcel signal, which a
+    # fixed 1e-4 tolerance would mask.
+    assert not torch.allclose(out_a, out_b, atol=0.0, rtol=0.0)
 
 
 def test_tower_has_terminal_layernorm() -> None:
