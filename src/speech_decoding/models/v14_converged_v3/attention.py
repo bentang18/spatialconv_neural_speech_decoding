@@ -109,6 +109,15 @@ class L1Block(nn.Module):
         # query) softmaxes to uniform → finite garbage we discard, never NaN.
         attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * S, 1, 1, seq)
 
+        # Unify dtypes right before SDPA (audit L11). RoPE ran in fp32 (cos/sin are
+        # fp32 buffers ⇒ q,k promote) while v stays bf16 under autocast, and the bias
+        # is fp32. A strict/flash SDPA build requires q,k,v AND attn_mask to share the
+        # query dtype; the math backend tolerates the split but production flash won't.
+        # Down-cast to v's dtype (keeps rope precise, matches flash semantics; a no-op
+        # under fp32 where every tensor is already fp32).
+        q, k = q.to(v.dtype), k.to(v.dtype)
+        attn_bias = attn_bias.to(v.dtype)
+
         ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         ctx = ctx.transpose(1, 2).reshape(B * S, seq, d)
         ctx = self.out(ctx).reshape(B, S, C, T, d)
@@ -176,7 +185,8 @@ class L2Block(nn.Module):
         if visible is not None:
             # (B, N) → keys at every time slice: (B*T, 1, 1, N).
             key_ok = visible[:, None, :].expand(B, T, N).reshape(B * T, N)
-            attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * T, 1, 1, N)
+            # match query dtype for strict/flash SDPA (audit L11; no-op under fp32).
+            attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * T, 1, 1, N).to(q.dtype)
 
         ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         ctx = ctx.transpose(1, 2).reshape(B * T, N, d)
