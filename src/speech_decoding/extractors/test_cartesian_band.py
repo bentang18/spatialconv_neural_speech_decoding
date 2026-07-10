@@ -244,14 +244,15 @@ def test_winsor_band_name_per_band() -> None:
 
 
 def test_winsor_band_tags_do_not_collide() -> None:
-    """The five physical bands must map to five DISTINCT tags. ``band_nperseg``
-    alone collides (2-band LFS 1024 == 3STFT SLOW; HGA 128 == HG); the
-    ``(nperseg, channelization, f_hi)`` key separates them. Guard against a future
-    band whose tuple aliases an existing band — that would silently clamp the
-    wrong band's training signal."""
+    """The physical bands must map to DISTINCT tags. ``band_nperseg`` alone
+    collides (2-band LFS 1024 == 3STFT SLOW == v3 SLOW; HGA 128 == HG); the
+    ``(nperseg, channelization, f_hi)`` key separates them (v3 SLOW is 1024/mag/14,
+    distinct from LFS 1024/mag/56 and cartesian SLOW 1024/cart/12). Guard against a
+    future band whose tuple aliases an existing band — that would silently clamp
+    the wrong band's training signal."""
     tags = list(_WINSOR_BAND_TAG.values())
-    assert sorted(tags) == ["beta", "hg", "hga", "lfs", "slow"]
-    assert len(_WINSOR_BAND_TAG) == len(set(_WINSOR_BAND_TAG)) == 5
+    assert sorted(tags) == ["beta", "hg", "hga", "lfs", "slow", "vslow"]
+    assert len(_WINSOR_BAND_TAG) == len(set(_WINSOR_BAND_TAG)) == 6
     # The two real-world nperseg aliases resolve to different tags via the tuple.
     lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
     slow = MultiStftView(front_end="band", hop_length=512, **STFT_3BAND_SLOW)

@@ -210,6 +210,22 @@ STFT_2BAND_HGA: dict[str, float] = {
     "band_nperseg": 128, "band_hop": 64, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
 }
 
+# ---------------------------------------------------------------------------
+# v14_converged_v3 3-band frontend (memo project-v14-converged-v3-sensor-
+# architecture-2026-07-08). Three multi-resolution MAGNITUDE bands broadcast to
+# a common 32 Hz token clock, concat → 20 ch → Linear(20→256). Bins DERIVED via
+# _stft_band_k_range at fs=2048:
+#   SLOW N=1024 hop=512  Δf=2 Hz   2–14 Hz  → k1..k7  = 7 bins  (this dict; NEW)
+#   MID  = STFT_3BAND_BETA (256/128, 16–56, k2..k7 = 6 bins)    reused verbatim
+#   HGA  = STFT_2BAND_HGA  (128/64,  64–160, k4..k10 = 7 bins)  reused verbatim
+# Only SLOW is new: it is the MAGNITUDE 2–14 band (the legacy STFT_3BAND_SLOW is
+# cartesian Re/Im 2–12 — a different band). MID/HGA are NOT re-declared here: a
+# second dict with identical params would collide in _WINSOR_BAND_TAG.
+# ---------------------------------------------------------------------------
+STFT_V3_SLOW: dict[str, float] = {
+    "band_nperseg": 1024, "band_hop": 512, "band_f_lo_hz": 2.0, "band_f_hi_hz": 14.0,
+}
+
 # Canonical winsor-band tag. Used ONLY to select a per-band
 # ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (each band's |z| distribution
 # differs, so one scalar cap mis-clamps the others).
@@ -241,6 +257,9 @@ _WINSOR_BAND_TAG: dict[tuple[int, str, int], str] = {
     _band_tag_key(STFT_3BAND_HG): "hg",
     _band_tag_key(STFT_2BAND_LFS): "lfs",
     _band_tag_key(STFT_2BAND_HGA): "hga",
+    # v3 SLOW is (1024, "mag", 14): distinct from legacy SLOW (cartesian, 12)
+    # and LFS (mag, 56), so it earns its own per-band winsor cap.
+    _band_tag_key(STFT_V3_SLOW): "vslow",
 }
 
 
