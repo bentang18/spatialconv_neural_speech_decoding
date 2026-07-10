@@ -6,8 +6,8 @@ sensor-architecture):
   L1Block  within-sensor JOINT spatiotemporal SA. Tokens are gathered into the
            padded (n_shafts, max_c) grid; each shaft attends jointly over its
            (contact, time) pairs, block-diagonal across shafts. Q/K carry the
-           L1 rotary (index depth + time), QK-norm before RoPE. Pad slots are
-           excluded by a key mask ⇒ the varlen block-diagonal is exact.
+           L1 rotary (index depth + time). Pad slots are excluded by a key
+           mask ⇒ the varlen block-diagonal is exact.
 
   L2Block  cross-sensor FACTORIZED SA at same-t. At each time slice the N
            contacts attend across shafts. No RoPE (no shared metric across
@@ -39,26 +39,6 @@ LN_EPS = 1e-6  # v14 convention (v14_encoder.LN_EPS)
 NEG_INF_MASK = -1e4  # v14 convention: finite (not -inf) → all-masked rows go uniform
 
 
-class _QKNorm(nn.Module):
-    """Per-head RMSNorm over head_dim on Q or K (Wortsman 2023 / Gemma / Qwen3).
-
-    Bounds pre-softmax logits so bf16 matmuls can't run away. Computed in fp32,
-    cast back. Applied BEFORE RoPE (per-head norm is rotation-covariant only up
-    to its learned gain).
-    """
-
-    def __init__(self, head_dim: int) -> None:
-        super().__init__()
-        self.gain = nn.Parameter(torch.ones(head_dim))
-        self.eps = LN_EPS
-
-    def forward(self, x: Tensor) -> Tensor:  # x: (..., head_dim)
-        dtype = x.dtype
-        xf = x.float()
-        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (xf * self.gain.float()).to(dtype)
-
-
 class _MLP(nn.Module):
     def __init__(self, d_model: int, mlp_ratio: int) -> None:
         super().__init__()
@@ -75,7 +55,7 @@ class L1Block(nn.Module):
     """Within-shaft joint spatiotemporal attention block (block-diagonal, RoPE)."""
 
     def __init__(
-        self, d_model: int, n_heads: int, *, mlp_ratio: int = 4, qk_norm: bool = True
+        self, d_model: int, n_heads: int, *, mlp_ratio: int = 4
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -83,14 +63,14 @@ class L1Block(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         # qkv/out biases ON to match upstream V-JEPA 2 (qkv_bias=True, proj bias;
-        # vision_transformer.py factories). QK-norm is our only intentional add.
+        # vision_transformer.py factories). No QK-norm: upstream ViT-B omits it,
+        # and a per-element head_dim gain rotates inconsistently across each RoPE
+        # pair (breaks relative-covariance) while being WD-exempt (1-D) — worse
+        # than none. Logit runaway is unlikely at d256/ViT-B scale; if it appears
+        # at the 10x LR the fix is a pair-shared (not per-element) RMSNorm.
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
         self.rope = L1RoPE(self.head_dim)
-        self.qk_norm = qk_norm
-        if qk_norm:
-            self.q_norm = _QKNorm(self.head_dim)
-            self.k_norm = _QKNorm(self.head_dim)
         self.norm1 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.norm2 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.mlp = _MLP(d_model, mlp_ratio)
@@ -110,9 +90,6 @@ class L1Block(nn.Module):
         q = q.transpose(1, 2)  # (B*S, H, seq, hd)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
 
         # index-RoPE coordinate = depth (broadcast over T); time coord = arange(T)
         # (broadcast over C). Token order is contact-major: token = c*T + t.
@@ -170,7 +147,6 @@ class L2Block(nn.Module):
         n_heads: int,
         *,
         mlp_ratio: int = 4,
-        qk_norm: bool = True,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -178,12 +154,9 @@ class L2Block(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         # qkv/out biases ON to match upstream V-JEPA 2 (qkv_bias=True, proj bias).
+        # No QK-norm (see L1Block).
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
-        self.qk_norm = qk_norm
-        if qk_norm:
-            self.q_norm = _QKNorm(self.head_dim)
-            self.k_norm = _QKNorm(self.head_dim)
         self.norm1 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.norm2 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.mlp = _MLP(d_model, mlp_ratio)
@@ -198,9 +171,6 @@ class L2Block(nn.Module):
         q = q.transpose(1, 2)  # (B*T, H, N, hd)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
 
         attn_bias = None
         if visible is not None:
