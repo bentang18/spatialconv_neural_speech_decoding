@@ -67,21 +67,29 @@ def sample_contact_mask(
     whole = ws_rank < n_ws  # (R, S) bool
 
     # --- within-shaft block cover-rank (variable width) ---
+    # Start positions run from -(w_hi-1) to C-1. The negative starts let contact 0
+    # be covered by a block starting "before" it (clamped to the shaft), so every
+    # contact — boundary or interior — is reachable by the same w candidate spans.
+    # Without them, contact 0 is coverable ONLY by a start at 0 (span s covers c iff
+    # s ≤ c < s+w ⇒ shallow-end deficit), masking it at ~0.36 vs ~0.67 interior.
+    P = cfg.block_w_hi - 1  # max left-extension
+    n_start = C + P
+    starts = torch.arange(-P, C, device=dev)  # (n_start,) actual start positions
     w = torch.randint(
-        cfg.block_w_lo, cfg.block_w_hi + 1, (R, S, C), generator=generator, device=dev
-    )  # (R, S) per start
+        cfg.block_w_lo, cfg.block_w_hi + 1, (R, S, n_start), generator=generator, device=dev
+    )  # per candidate start
     start_rank = (
-        torch.rand(R, S, C, generator=generator, device=dev).argsort(2).argsort(2)
-    )  # (R, S, C_start) random rank of each candidate start
-    s_idx = torch.arange(C, device=dev)[None, None, :, None]  # start axis
+        torch.rand(R, S, n_start, generator=generator, device=dev).argsort(2).argsort(2)
+    )  # (R, S, n_start) random rank of each candidate start
+    s_idx = starts[None, None, :, None]  # start axis
     c_idx = torch.arange(C, device=dev)[None, None, None, :]  # covered axis
     cover = (
         (s_idx <= c_idx)
         & (c_idx < s_idx + w[:, :, :, None])
         & valid[None, :, None, :]
-    )  # (R, S, C_start, C_c)
-    BIG = C + 1
-    ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,C_start,C_c)
+    )  # (R, S, n_start, C_c)
+    BIG = n_start + 1
+    ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,n_start,C_c)
     cover_rank = ranks.min(dim=2).values  # (R, S, C) min over starts; finite for valid
 
     # --- composite priority: tier ⊳ (whole < block); ties by (rank, position) ---

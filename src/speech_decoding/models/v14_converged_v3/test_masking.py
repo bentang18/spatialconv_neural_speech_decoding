@@ -139,3 +139,25 @@ def test_rows_are_independent() -> None:
     mask = sample_contact_mask(geom, 20, n_rows=8, generator=_gen(5))
     # not all rows identical (independent sampling).
     assert not all(torch.equal(mask[0], mask[r]) for r in range(1, 8))
+
+
+def test_shallow_edge_coverage_is_uniform() -> None:
+    # Contiguous-block masking under-covers shaft boundaries: contact 0 is coverable
+    # ONLY by a block starting exactly at 0. The negative-start extension fixes this
+    # so the shallowest contact's marginal mask rate ≈ interior ≈ mask_frac.
+    sc, geom = _session([12, 12, 12, 12, 12])  # 5 equal shafts, len 12
+    n = 60
+    cfg = V3MaskConfig(mask_frac=0.6, block_w_lo=4, block_w_hi=8, whole_shaft_frac=0.0)
+    mask = sample_contact_mask(geom, n, n_rows=3000, generator=_gen(0), cfg=cfg).float()
+    # per-shaft, rate at depth-rank 0 (shallowest) vs the interior mean.
+    shallow_rates, interior_rates = [], []
+    for s in range(5):
+        idx = (sc.shaft_id == s).nonzero(as_tuple=True)[0]
+        idx = idx[torch.argsort(sc.depth[idx])]
+        rate = mask[:, idx].mean(dim=0)  # (12,) per depth-rank
+        shallow_rates.append(rate[0].item())
+        interior_rates.append(rate[3:9].mean().item())
+    shallow = sum(shallow_rates) / 5
+    interior = sum(interior_rates) / 5
+    assert abs(shallow - 0.60) < 0.08, f"shallow rate {shallow:.3f} far from 0.60"
+    assert abs(shallow - interior) < 0.08, f"shallow {shallow:.3f} vs interior {interior:.3f}"
