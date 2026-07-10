@@ -96,6 +96,23 @@ def test_predictor_forward_preserves_shape() -> None:
     assert out.shape == (1, 5, T, 128)
 
 
+def test_parcel_embed_added_once_at_tower_input() -> None:
+    # V-JEPA 2.1 modality-embed style: one shared parcel table per tower, added to
+    # the token stream at the tower input (not per-L2-block). Relabelling a contact's
+    # parcel changes the tower output; and the tower owns exactly one parcel table.
+    sc, geom = _session()
+    enc = build_encoder(n_parcels=8).eval()
+    # exactly one parcel embedding table on the tower (not one per L2 block)
+    n_embeds = sum(1 for _ in enc.parcel_embed.parameters())
+    assert n_embeds == 1
+    x = torch.randn(1, 5, T, 256)
+    pid_b = sc.parcel_id.clone()
+    pid_b[0] = 5  # contact 0 → different parcel
+    out_a = enc(x, geom, sc.parcel_id)
+    out_b = enc(x, geom, pid_b)
+    assert not torch.allclose(out_a, out_b, atol=1e-4)
+
+
 def test_tower_dispatches_l1_to_geom_and_l2_to_parcel() -> None:
     # A whole-session forward must be block-diagonal-then-mixed: after the first
     # 6 L1 blocks (encoder), shaft A still cannot have seen shaft B; only once an

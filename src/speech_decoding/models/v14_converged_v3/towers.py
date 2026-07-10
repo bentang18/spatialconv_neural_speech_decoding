@@ -25,6 +25,7 @@ from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.attention import L1Block, L2Block
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.pe import ParcelIdentityEmbed
 
 ENC_LAYOUT: tuple[str, ...] = ("L1",) * 6 + ("L2", "L1", "L1") * 2
 PRED_LAYOUT: tuple[str, ...] = ("L2", "L1", "L1") * 4
@@ -45,12 +46,17 @@ class V3Tower(nn.Module):
         n_parcels: int,
     ) -> None:
         super().__init__()
+        # Parcel/DKT identity is added ONCE here at the tower input (V-JEPA 2.1
+        # modality-embedding style: the learned categorical embed is added to the
+        # encoder AND predictor inputs alongside RoPE) — it then rides the residual
+        # into every block, so L2 needs no per-block identity injection.
+        self.parcel_embed = ParcelIdentityEmbed(n_parcels, d_model)
         blocks: list[nn.Module] = []
         for kind in layout:
             if kind == "L1":
                 blocks.append(L1Block(d_model, n_heads))
             elif kind == "L2":
-                blocks.append(L2Block(d_model, n_heads, n_parcels=n_parcels))
+                blocks.append(L2Block(d_model, n_heads))
             else:
                 raise ValueError(f"unknown block kind {kind!r}")
         self.blocks = nn.ModuleList(blocks)
@@ -62,12 +68,9 @@ class V3Tower(nn.Module):
         parcel_id: Tensor,
         visible: Tensor | None = None,
     ) -> Tensor:
+        x = x + self.parcel_embed(parcel_id)[None, :, None, :]  # (B,N,T,d) + (1,N,1,d)
         for b in self.blocks:
-            x = (
-                b(x, geom, visible)
-                if isinstance(b, L1Block)
-                else b(x, parcel_id, visible)
-            )
+            x = b(x, geom, visible) if isinstance(b, L1Block) else b(x, visible)
         return x
 
 

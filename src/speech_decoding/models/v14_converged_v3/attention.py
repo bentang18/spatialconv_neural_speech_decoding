@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
-from speech_decoding.models.v14_converged_v3.pe import L1RoPE, ParcelIdentityEmbed
+from speech_decoding.models.v14_converged_v3.pe import L1RoPE
 
 LN_EPS = 1e-6  # v14 convention (v14_encoder.LN_EPS)
 NEG_INF_MASK = -1e4  # v14 convention: finite (not -inf) → all-masked rows go uniform
@@ -144,14 +144,20 @@ class L1Block(nn.Module):
 
 
 class L2Block(nn.Module):
-    """Cross-sensor factorized (same-t) attention block, DKT-identity in score space."""
+    """Cross-sensor factorized (same-t) attention block.
+
+    Plain same-t cross-shaft self-attention (no RoPE — no shared metric across
+    sensors). The parcel/DKT identity is NOT injected here: it is added ONCE to the
+    token stream at the tower input (V-JEPA 2.1 modality-embedding style — the
+    learned modality embed is added to encoder AND predictor inputs alongside RoPE,
+    `methods.tex:141,308`), so it rides the residual into every block's content.
+    """
 
     def __init__(
         self,
         d_model: int,
         n_heads: int,
         *,
-        n_parcels: int,
         mlp_ratio: int = 4,
         qk_norm: bool = True,
     ) -> None:
@@ -160,13 +166,8 @@ class L2Block(nn.Module):
             raise ValueError(f"d_model={d_model} not divisible by n_heads={n_heads}")
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        # Separate Q/K/V so identity feeds Q/K only (V, hence the residual, is
-        # identity-free — see module docstring).
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
-        self.identity = ParcelIdentityEmbed(n_parcels, d_model)
         self.qk_norm = qk_norm
         if qk_norm:
             self.q_norm = _QKNorm(self.head_dim)
@@ -175,20 +176,16 @@ class L2Block(nn.Module):
         self.norm2 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.mlp = _MLP(d_model, mlp_ratio)
 
-    def _heads(self, t: Tensor, bt: int, n: int) -> Tensor:
-        return t.reshape(bt, n, self.n_heads, self.head_dim).transpose(1, 2)
-
-    def _attn(self, x: Tensor, parcel_id: Tensor, visible: Tensor | None) -> Tensor:
+    def _attn(self, x: Tensor, visible: Tensor | None) -> Tensor:
         # x: (B, N, T, d). Attend over N at each time slice (T folded into batch).
         # visible: (B, N) bool — masked electrodes excluded as keys (same t).
         B, N, T, d = x.shape
         xt = x.permute(0, 2, 1, 3).reshape(B * T, N, d)  # (B*T, N, d)
-        ident = self.identity(parcel_id)  # (N, d)
-        qk_in = xt + ident[None]  # identity into score path only
-
-        q = self._heads(self.q_proj(qk_in), B * T, N)  # (B*T, H, N, hd)
-        k = self._heads(self.k_proj(qk_in), B * T, N)
-        v = self._heads(self.v_proj(xt), B * T, N)
+        qkv = self.qkv(xt).reshape(B * T, N, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)  # (B*T, N, H, hd)
+        q = q.transpose(1, 2)  # (B*T, H, N, hd)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         if self.qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -204,9 +201,7 @@ class L2Block(nn.Module):
         ctx = self.out(ctx).reshape(B, T, N, d).permute(0, 2, 1, 3)
         return ctx
 
-    def forward(
-        self, x: Tensor, parcel_id: Tensor, visible: Tensor | None = None
-    ) -> Tensor:
-        x = x + self._attn(self.norm1(x), parcel_id, visible)
+    def forward(self, x: Tensor, visible: Tensor | None = None) -> Tensor:
+        x = x + self._attn(self.norm1(x), visible)
         x = x + self.mlp(self.norm2(x))
         return x

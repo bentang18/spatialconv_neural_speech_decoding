@@ -7,7 +7,9 @@ Memo project-v14-converged-v3-sensor-architecture, the two disjoint mixers:
       contact mix together (not factorized). RoPE (index+time), relative.
   L2  cross-sensor FACTORIZED at same-t. Mixes contacts ACROSS shafts, but only
       within a single time slice (temporal lag is left to a 2-hop L1∘L2 compose).
-      Identity = learned DKT-parcel tag injected in the SCORE space; no RoPE.
+      Plain same-t cross-shaft attention; no RoPE. Parcel/DKT identity is added at
+      the TOWER input (V-JEPA 2.1 modality-embed style), not injected in L2 — so
+      that behaviour is tested in test_towers, not here.
 
 The load-bearing behavioural contrasts, asserted below:
   - L1 is block-diagonal (perturbing shaft B leaves shaft A untouched); L2 is NOT
@@ -100,22 +102,20 @@ def test_l1_padded_varlen_matches_lone_shaft() -> None:
 
 
 def test_l2_preserves_shape() -> None:
-    sc, _ = _two_shaft()
-    blk = L2Block(D, H, n_parcels=8).eval()
+    blk = L2Block(D, H).eval()
     x = torch.randn(2, 5, T, D)
-    assert blk(x, sc.parcel_id).shape == x.shape
+    assert blk(x).shape == x.shape
 
 
 def test_l2_mixes_across_sensors() -> None:
     # Opposite of L1: perturbing one contact changes OTHER contacts' outputs
     # (cross-shaft mixing) at the same time.
-    sc, _ = _two_shaft()
-    blk = L2Block(D, H, n_parcels=8).eval()
+    blk = L2Block(D, H).eval()
     x = torch.randn(1, 5, T, D)
-    out = blk(x, sc.parcel_id)
+    out = blk(x)
     x2 = x.clone()
     x2[0, 3, 0] += _BUMP_D  # contact 3 (shaft B), time 0
-    out2 = blk(x2, sc.parcel_id)
+    out2 = blk(x2)
     # a DIFFERENT-shaft contact (0, shaft A) at the SAME time is affected.
     assert not torch.allclose(out[0, 0, 0], out2[0, 0, 0], atol=1e-4)
 
@@ -123,25 +123,10 @@ def test_l2_mixes_across_sensors() -> None:
 def test_l2_is_time_factorized() -> None:
     # Perturbing any contact at time t=2 must leave EVERY output at t=0 unchanged
     # (L2 mixes space only within a time slice).
-    sc, _ = _two_shaft()
-    blk = L2Block(D, H, n_parcels=8).eval()
+    blk = L2Block(D, H).eval()
     x = torch.randn(1, 5, T, D)
-    out = blk(x, sc.parcel_id)
+    out = blk(x)
     x2 = x.clone()
     x2[0, 3, 2] += _BUMP_D  # contact 3, time 2
-    out2 = blk(x2, sc.parcel_id)
+    out2 = blk(x2)
     assert torch.allclose(out[0, :, 0], out2[0, :, 0], atol=1e-5)
-
-
-def test_l2_parcel_identity_changes_the_score() -> None:
-    # The DKT tag lives in the score space: relabelling a contact's parcel changes
-    # its attention output even with identical content.
-    sc, _ = _two_shaft()
-    blk = L2Block(D, H, n_parcels=8).eval()
-    x = torch.randn(1, 5, T, D)
-    pid_a = sc.parcel_id.clone()
-    pid_b = sc.parcel_id.clone()
-    pid_b[0] = 5  # contact 0 gets a different parcel tag
-    out_a = blk(x, pid_a)
-    out_b = blk(x, pid_b)
-    assert not torch.allclose(out_a, out_b, atol=1e-4)
