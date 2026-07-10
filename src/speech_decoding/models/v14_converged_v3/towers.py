@@ -55,9 +55,19 @@ class V3Tower(nn.Module):
                 raise ValueError(f"unknown block kind {kind!r}")
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x: Tensor, geom: L1Geometry, parcel_id: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        geom: L1Geometry,
+        parcel_id: Tensor,
+        visible: Tensor | None = None,
+    ) -> Tensor:
         for b in self.blocks:
-            x = b(x, geom) if isinstance(b, L1Block) else b(x, parcel_id)
+            x = (
+                b(x, geom, visible)
+                if isinstance(b, L1Block)
+                else b(x, parcel_id, visible)
+            )
         return x
 
 

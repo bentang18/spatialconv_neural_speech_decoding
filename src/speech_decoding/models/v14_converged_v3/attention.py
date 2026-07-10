@@ -25,8 +25,6 @@ block's RoPE score stays a pure function of relative (index, time).
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -35,6 +33,7 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.pe import L1RoPE, ParcelIdentityEmbed
 
 LN_EPS = 1e-6  # v14 convention (v14_encoder.LN_EPS)
+NEG_INF_MASK = -1e4  # v14 convention: finite (not -inf) → all-masked rows go uniform
 
 
 class _QKNorm(nn.Module):
@@ -91,8 +90,10 @@ class L1Block(nn.Module):
         self.norm2 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.mlp = _MLP(d_model, mlp_ratio)
 
-    def _attn(self, x: Tensor, geom: L1Geometry) -> Tensor:
+    def _attn(self, x: Tensor, geom: L1Geometry, visible: Tensor | None) -> Tensor:
         # x: (B, N, T, d) → gather to (B, S, C, T, d), attend within each shaft.
+        # visible: (B, N) bool, True = keepable key (masked electrodes excluded so
+        # they never leak into the visible latents). None → all keepable.
         B, N, T, d = x.shape
         S, C = geom.n_shafts, geom.max_c
         gathered = x[:, geom.gather_idx]  # (B, S, C, T, d)
@@ -116,12 +117,17 @@ class L1Block(nn.Module):
         tt = tt[None].expand(B, S, seq).reshape(B * S, seq)
         q, k = self.rope(q, k, idx, tt)
 
-        # key mask: pad slots (invalid contacts) excluded. (S, C) → (S, seq).
-        key_ok = geom.valid[:, :, None].expand(S, C, T).reshape(S, seq)  # bool
-        key_ok = key_ok[None].expand(B, S, seq).reshape(B * S, seq)
-        attn_mask = key_ok[:, None, None, :]  # (B*S, 1, 1, seq) bool, True=keep
+        # key mask: pad slots (invalid contacts) always excluded; masked
+        # electrodes excluded when `visible` given. (B, S, C) → (B*S, seq).
+        key_ok = geom.valid[None].expand(B, S, C)  # (B, S, C) bool
+        if visible is not None:
+            key_ok = key_ok & visible[:, geom.gather_idx]  # gather vis into grid
+        key_ok = key_ok[:, :, :, None].expand(B, S, C, T).reshape(B * S, seq)
+        # Additive mask (NEG, not -inf): a fully-excluded row (a whole-shaft-masked
+        # query) softmaxes to uniform → finite garbage we discard, never NaN.
+        attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * S, 1, 1, seq)
 
-        ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         ctx = ctx.transpose(1, 2).reshape(B * S, seq, d)
         ctx = self.out(ctx).reshape(B, S, C, T, d)
 
@@ -129,8 +135,10 @@ class L1Block(nn.Module):
         out[:, geom.gather_idx[geom.valid]] = ctx[:, geom.valid]
         return out
 
-    def forward(self, x: Tensor, geom: L1Geometry) -> Tensor:
-        x = x + self._attn(self.norm1(x), geom)
+    def forward(
+        self, x: Tensor, geom: L1Geometry, visible: Tensor | None = None
+    ) -> Tensor:
+        x = x + self._attn(self.norm1(x), geom, visible)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -170,8 +178,9 @@ class L2Block(nn.Module):
     def _heads(self, t: Tensor, bt: int, n: int) -> Tensor:
         return t.reshape(bt, n, self.n_heads, self.head_dim).transpose(1, 2)
 
-    def _attn(self, x: Tensor, parcel_id: Tensor) -> Tensor:
+    def _attn(self, x: Tensor, parcel_id: Tensor, visible: Tensor | None) -> Tensor:
         # x: (B, N, T, d). Attend over N at each time slice (T folded into batch).
+        # visible: (B, N) bool — masked electrodes excluded as keys (same t).
         B, N, T, d = x.shape
         xt = x.permute(0, 2, 1, 3).reshape(B * T, N, d)  # (B*T, N, d)
         ident = self.identity(parcel_id)  # (N, d)
@@ -184,12 +193,20 @@ class L2Block(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        ctx = F.scaled_dot_product_attention(q, k, v)  # (B*T, H, N, hd)
+        attn_bias = None
+        if visible is not None:
+            # (B, N) → keys at every time slice: (B*T, 1, 1, N).
+            key_ok = visible[:, None, :].expand(B, T, N).reshape(B * T, N)
+            attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * T, 1, 1, N)
+
+        ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         ctx = ctx.transpose(1, 2).reshape(B * T, N, d)
         ctx = self.out(ctx).reshape(B, T, N, d).permute(0, 2, 1, 3)
         return ctx
 
-    def forward(self, x: Tensor, parcel_id: Tensor) -> Tensor:
-        x = x + self._attn(self.norm1(x), parcel_id)
+    def forward(
+        self, x: Tensor, parcel_id: Tensor, visible: Tensor | None = None
+    ) -> Tensor:
+        x = x + self._attn(self.norm1(x), parcel_id, visible)
         x = x + self.mlp(self.norm2(x))
         return x
