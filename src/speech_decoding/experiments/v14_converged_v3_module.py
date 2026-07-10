@@ -29,37 +29,22 @@ exposes (``model``, ``_last_batch_size``, ``_last_taps``).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-
 import torch
 from lightning import pytorch as pl
 from torch import Tensor
 
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
-from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.batch import V3Batch
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
 
 # Base offset so the per-step mask seed decorrelates across seeds/steps without
 # ever aliasing step N of seed A onto step M of seed B for small N.
 _MASK_SEED_STRIDE = 1_000_003
 
-
-@dataclass
-class V3Batch:
-    """One session's worth of clips — the contract the Phase-0 cache dataloader
-    must produce (batch = ONE session; ``n_rows`` = clips in this micro-batch).
-
-      * ``bands``     — the 3 multi-res |STFT| bands, each ``(n_rows, N, F_b, T_b)``
-        in v3 concat order (SLOW, MID, HGA); ``F_b`` = (7, 6, 7).
-      * ``geom``      — the per-session ``L1Geometry`` (shaft gather + depths),
-        built once upstream and shared across every clip of the session.
-      * ``parcel_id`` — ``(N,)`` long DKT hard tag, per contact.
-    """
-
-    bands: Sequence[Tensor]
-    geom: L1Geometry
-    parcel_id: Tensor
+# V3Batch (bands / geom / parcel_id, shared per session) is the data contract the
+# datamodule's ``v3_collate`` produces; re-exported here so callers that imported it
+# from this module keep working after the definition moved to the models package.
+__all__ = ["V3Batch", "V14ConvergedV3Module"]
 
 
 class V14ConvergedV3Module(pl.LightningModule):

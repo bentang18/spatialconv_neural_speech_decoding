@@ -31,12 +31,16 @@ class V3ClipSample:
 
 @dataclass(frozen=True)
 class V3Batch:
-    """A session-homogeneous batch ready for ``V3ConvergedModel.forward``."""
+    """A session-homogeneous batch ready for ``V3ConvergedModel.forward``.
+
+    ``session_key`` (logging / compile-cache identity) is optional so a batch can be
+    built directly in tests without a session tag; ``v3_collate`` always sets it.
+    """
 
     bands: list[Tensor]  # 3 × (B, N, F_band, T)
     geom: L1Geometry
     parcel_id: Tensor  # (N,) long — session-shared
-    session_key: tuple
+    session_key: tuple | None = None
 
 
 def v3_collate(samples: Sequence[V3ClipSample]) -> V3Batch:
