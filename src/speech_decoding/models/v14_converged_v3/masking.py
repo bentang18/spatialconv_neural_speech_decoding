@@ -41,8 +41,8 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 
 @dataclass(frozen=True)
 class V3MaskConfig:
-    mask_frac: float = 0.60  # ⇒ M = round(mask_frac·N) held out, constant per row
-    whole_shaft_frac: float = 0.20  # fraction of shafts masked 100% (patient-invariant)
+    mask_frac: float = 0.575  # M = round(mask_frac·N); = whole(0.15)+(1−whole)·mean r(0.5), lets overall dip <0.60
+    whole_shaft_frac: float = 0.15  # fraction of shafts masked 100% (patient-invariant)
     block_w_lo: int = 4  # Uniform{lo..hi}; floor 4 = along-shaft HGA autocorr length
     block_w_hi: int = 8
     r_lo: float = 0.30  # per-shaft within-sensor ratio ~ Uniform[r_lo, r_hi]
@@ -102,11 +102,16 @@ def sample_contact_mask(
     ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,n_start,C)
     cover_rank = ranks.min(dim=2).values.float()  # (R, S, C); finite for valid contacts
 
-    # --- per-shaft select the k_s lowest-cover-rank contacts (ties broken at random,
-    # invalid pushed past every valid rank) ---
+    # --- per-shaft select the k_s lowest-cover-rank contacts. Tie-break by DEPTH
+    # (not random): contacts sharing a cover_rank are the same block, so a depth
+    # tiebreak takes them as a contiguous shallow-prefix — a random tiebreak would
+    # scramble which of them get picked and punch length-1 holes (orphans, the
+    # trivially lag-1-interpolatable case floor-4 exists to prevent). The negative-
+    # start blocks already flatten the shallow edge, so no random jitter is needed. ---
+    c_pos = torch.arange(C, device=dev).float()
     cr = torch.where(
         valid[None].expand(R, S, C),
-        cover_rank + rand(R, S, C),  # random within-tier tiebreak → depth-flat
+        cover_rank + c_pos[None, None, :] / (C + 1),  # depth tiebreak → contiguous partial block
         torch.full((R, S, C), float(2 * BIG), device=dev),
     )
     wsrank = cr.argsort(2).argsort(2)  # (R, S, C) 0 = lowest cover_rank on the shaft
@@ -123,7 +128,7 @@ def sample_contact_mask(
     pri = torch.full((R, S, C), float("inf"), device=dev)
     pri = torch.where(whole_c, 0.5 * r0, pri)  # [0, 0.5)
     pri = torch.where(within_sel, 1.0 + wsrank.float() / (C + 1), pri)  # [1, 2)
-    pri = torch.where(within_unsel, 2.0 + r0, pri)  # [2, 3)
+    pri = torch.where(within_unsel, 2.0 + wsrank.float() / (C + 1), pri)  # [2, 3) extend blocks, not scatter
     pri = pri.reshape(R, S * C)
 
     sel_idx = pri.argsort(dim=1)[:, :M]  # (R, M) grid-cell indices, all finite/valid

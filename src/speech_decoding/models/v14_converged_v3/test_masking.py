@@ -68,7 +68,7 @@ def _per_shaft_rate(sc, mask: torch.Tensor) -> torch.Tensor:
 def test_exact_constant_masked_count() -> None:
     sc, geom = _session([12, 10, 8, 6])  # N = 36
     n = 36
-    m = round(0.60 * n)  # 22
+    m = round(V3MaskConfig().mask_frac * n)  # default frac ⇒ constant M
     mask = sample_contact_mask(geom, n, n_rows=5, generator=_gen())
     assert mask.shape == (5, n)
     assert mask.dtype == torch.bool
@@ -95,6 +95,29 @@ def test_masking_is_blocky_not_iid_scatter() -> None:
     mean_runs = sum(len(_runs(mask[r])) for r in range(8)) / 8
     assert mean_runs <= 4.0, f"mean runs/row {mean_runs} — not blocky enough"
     assert max(max(_runs(mask[r]), default=0) for r in range(8)) >= 4
+
+
+def test_isolated_orphan_contacts_are_rare() -> None:
+    # An orphan = a masked contact whose BOTH same-shaft depth-neighbors are visible:
+    # the lag-1-interpolatable case (corr 0.477 each side) that floor-4 blocks exist
+    # to prevent. The depth (not random) tiebreak keeps partial blocks contiguous, so
+    # orphans stay a small fraction of masked contacts.
+    sc, geom = _session([16, 12, 10, 9, 8, 6])  # N=61, varied lengths
+    n = 61
+    cfg = V3MaskConfig(mask_frac=0.575, whole_shaft_frac=0.15, r_lo=0.3, r_hi=0.7)
+    mask = sample_contact_mask(geom, n, n_rows=1000, generator=_gen(0), cfg=cfg)
+    orph = 0
+    for r in range(1000):
+        for s in range(int(sc.n_shafts)):
+            idx = (sc.shaft_id == s).nonzero(as_tuple=True)[0]
+            idx = idx[torch.argsort(sc.depth[idx])]
+            m = mask[r, idx].tolist()
+            for j in range(len(m)):
+                lv = j == 0 or not m[j - 1]
+                rv = j == len(m) - 1 or not m[j + 1]
+                orph += m[j] and lv and rv
+    frac_orphan = orph / (1000 * mask.sum(1).float().mean().item())
+    assert frac_orphan < 0.08, f"orphan fraction {frac_orphan:.3f} too high — blocks leaking"
 
 
 def test_wider_blocks_give_longer_runs() -> None:

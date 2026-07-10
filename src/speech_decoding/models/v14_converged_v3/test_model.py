@@ -97,4 +97,4 @@ def test_batched_clips_get_independent_masks() -> None:
     model = V3ConvergedModel(n_parcels=N_PARCELS)
     out = model(_bands(n, B=4), geom, sc.parcel_id, generator=_gen())
     assert torch.isfinite(out.loss)
-    assert out.n_masked == round(0.6 * n) * T32 * 4
+    assert out.n_masked == round(V3MaskConfig().mask_frac * n) * T32 * 4
