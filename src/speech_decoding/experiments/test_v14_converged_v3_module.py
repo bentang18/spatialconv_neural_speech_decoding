@@ -44,10 +44,11 @@ def _session_batch(*, n_rows: int = 2):
     sc = build_sidecar(labels, parcel_id=parcel_id)
     geom = build_l1_geometry(sc)
     n = len(labels)
-    # 3 bands: SLOW 7 bins / T=1, MID 6 bins / T=4, HGA 7 bins / T=8 → 32 Hz clock T=8.
+    # 3 bands on the shared 32 Hz clock (uniform hop=64, no hold): SLOW 7 bins,
+    # MID 6 bins, HGA 7 bins — all T=8 frames.
     bands = [
-        torch.randn(n_rows, n, 7, 1),
-        torch.randn(n_rows, n, 6, 4),
+        torch.randn(n_rows, n, 7, 8),
+        torch.randn(n_rows, n, 6, 8),
         torch.randn(n_rows, n, 7, 8),
     ]
     return V3Batch(bands=bands, geom=geom, parcel_id=sc.parcel_id)
