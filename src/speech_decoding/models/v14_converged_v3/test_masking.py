@@ -156,6 +156,19 @@ def test_whole_shaft_count_matches_frac() -> None:
     assert abs(n_full.item() - 2.0) < 0.25, f"avg whole shafts {n_full:.2f} != ~2"
 
 
+def test_no_accidental_whole_shafts() -> None:
+    # EXACTLY round(whole_shaft_frac·S) shafts are fully masked — never more. A partial
+    # shaft must keep ≥1 visible contact so it can't saturate to 100% via a high r-draw
+    # or reconciliation padding and inflate the whole-sensor (patient-invariant) tier.
+    sc, geom = _session([6, 16, 9, 9, 4, 10, 8, 3])  # S=8, varied incl. tiny shafts
+    n = sum([6, 16, 9, 9, 4, 10, 8, 3])
+    cfg = V3MaskConfig(mask_frac=0.575, whole_shaft_frac=0.25)  # round(0.25·8)=2
+    mask = sample_contact_mask(geom, n, n_rows=1000, generator=_gen(0), cfg=cfg)
+    rate = _per_shaft_rate(sc, mask)  # (1000, 8)
+    n_full = (rate >= 0.999).sum(dim=1)
+    assert (n_full == 2).all(), f"whole-shaft count drifted: {n_full.unique().tolist()}"
+
+
 def test_within_shaft_ratio_spreads_over_range() -> None:
     # The per-shaft ratio r~Uniform[r_lo,r_hi] gives a BOUNDED spread — no shaft
     # masked "too much" (the pooled-budget clumping is gone). r_mean = mask_frac and

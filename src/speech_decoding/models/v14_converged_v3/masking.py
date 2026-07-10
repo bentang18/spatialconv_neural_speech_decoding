@@ -81,8 +81,12 @@ def sample_contact_mask(
     # --- per-shaft within-sensor target count: r ~ Uniform[r_lo, r_hi] ---
     r = cfg.r_lo + (cfg.r_hi - cfg.r_lo) * rand(R, S)  # (R, S)
     k_s = torch.round(r * Cs[None].float()).long()  # (R, S) target masked count
-    k_s = torch.where(whole, Cs[None].expand(R, S), k_s)  # whole shafts → full
-    k_s = k_s.clamp(max=Cs[None].expand(R, S))
+    Cs_e = Cs[None].expand(R, S)
+    # non-whole shafts keep ≥1 visible contact (cap at Cs−1): whole-sensor masking is
+    # the SPECIAL patient-invariant tier, so a partial shaft must not accidentally
+    # saturate to 100% (via a high r-draw or reconciliation padding) and inflate the
+    # whole-shaft count above round(whole_shaft_frac·S).
+    k_s = torch.where(whole, Cs_e, torch.minimum(k_s, (Cs_e - 1).clamp(min=0)))
 
     # --- contiguous block cover-rank (variable width, negative starts) ---
     # Starts run from -(w_hi-1)..C-1 so contact 0 is reachable by a block starting
@@ -122,10 +126,13 @@ def sample_contact_mask(
     # within-unselected (pad pool) < invalid. Taking the M smallest holds the count
     # constant while whole shafts are never trimmed.
     whole_c = whole[:, :, None].expand(R, S, C) & valid[None].expand(R, S, C)
-    within_sel = sel & ~whole_c
-    within_unsel = valid[None].expand(R, S, C) & ~sel & ~whole_c
+    # the single deepest-cover-rank contact of each non-whole shaft stays visible
+    # (never eligible) → guarantees ≥1 live contact so no partial shaft saturates.
+    keep_alive = (wsrank == (Cs[None, :, None] - 1)) & ~whole[:, :, None] & valid[None].expand(R, S, C)
+    within_sel = sel & ~whole_c & ~keep_alive
+    within_unsel = valid[None].expand(R, S, C) & ~sel & ~whole_c & ~keep_alive
     r0 = rand(R, S, C)
-    pri = torch.full((R, S, C), float("inf"), device=dev)
+    pri = torch.full((R, S, C), float("inf"), device=dev)  # keep_alive + invalid stay inf
     pri = torch.where(whole_c, 0.5 * r0, pri)  # [0, 0.5)
     pri = torch.where(within_sel, 1.0 + wsrank.float() / (C + 1), pri)  # [1, 2)
     pri = torch.where(within_unsel, 2.0 + wsrank.float() / (C + 1), pri)  # [2, 3) extend blocks, not scatter
