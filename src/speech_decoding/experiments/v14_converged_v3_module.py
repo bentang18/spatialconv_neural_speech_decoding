@@ -101,6 +101,22 @@ class V14ConvergedV3Module(pl.LightningModule):
         except TypeError:
             return self.optim_config.build(params)
 
+    # -------------------------------------------------------------- device move
+    def transfer_batch_to_device(  # type: ignore[override]
+        self, batch: V3Batch, device: torch.device, dataloader_idx: int
+    ) -> V3Batch:
+        """Move the ``V3Batch`` to ``device`` field-by-field. Lightning's default
+        ``apply_to_collection`` refuses a FROZEN dataclass (can't reconstruct it in
+        place), so the custom batch type moves itself: the band tensors + the
+        per-session geometry (``L1Geometry.to``) + ``parcel_id``; ``session_key`` is
+        metadata and stays put."""
+        return V3Batch(
+            bands=[b.to(device) for b in batch.bands],
+            geom=batch.geom.to(device),
+            parcel_id=batch.parcel_id.to(device),
+            session_key=batch.session_key,
+        )
+
     # ------------------------------------------------------------------- train
     def _step_generator(self, device: torch.device) -> torch.Generator:
         """Per-step mask generator seeded ``f(seed, global_step)`` — resume-stable

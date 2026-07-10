@@ -32,6 +32,19 @@ class L1Geometry:
     n_shafts: int
     max_c: int
 
+    def to(self, device) -> "L1Geometry":
+        """Move the gather-plan tensors to ``device`` (for Lightning's per-batch
+        device transfer — a frozen dataclass can't be moved by ``apply_to_collection``)."""
+        import dataclasses
+
+        return dataclasses.replace(
+            self,
+            gather_idx=self.gather_idx.to(device),
+            valid=self.valid.to(device),
+            depth=self.depth.to(device),
+            shaft_of_contact=self.shaft_of_contact.to(device),
+        )
+
 
 def build_l1_geometry(sidecar: SensorSidecar) -> L1Geometry:
     """Group the sidecar's contacts into a padded ``(n_shafts, max_c)`` gather plan.
