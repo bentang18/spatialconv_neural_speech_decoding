@@ -49,6 +49,48 @@ class V3MaskConfig:
     r_hi: float = 0.70
 
 
+def assert_mask_feasible(geom: L1Geometry, cfg: V3MaskConfig = V3MaskConfig()) -> None:
+    """Fail LOUD if a montage + mask config can silently corrupt the fixed-M mask
+    (audit M6). Call ONCE per session at setup — NOT inside the compiled forward
+    (it reads scalar counts, which would graph-break compile). Both conditions are
+    static properties of (montage, cfg).
+
+    Two failure regimes the ``argsort[:M]`` reconciliation does not guard:
+      (1) FEW HUGE SHAFTS — if the ``n_ws`` chosen whole shafts can hold more than
+          M contacts total, ``argsort[:M]`` admits only M and the overflow
+          whole-shaft contacts stay VISIBLE, breaking the 100%-removal invariant
+          and leaking the ~0.30 along-shaft common mode. Worst case = the n_ws
+          LARGEST shafts, so bound their contact sum by M.
+      (2) DENSE GRID — if eligible cells ``N − (S − n_ws)`` (every non-whole shaft
+          reserves ≥1 keep_alive) fall below M, ``argsort`` reaches into inf-priority
+          pad/keep_alive slots (→ contact 0 via gather_idx) → duplicate / < M masks.
+
+    Harmless for uniform sEEG (largest shaft ≈ 10% ≪ 57.5%); a live hazard for the
+    eventual uECoG grid ("shaft" = a large contiguous block).
+    """
+    valid = geom.valid  # (S, C) bool
+    N = int(valid.sum().item())
+    S = int(geom.n_shafts)
+    Cs = valid.sum(1)  # (S,) contacts per shaft
+    M = round(cfg.mask_frac * N)
+    n_ws = round(cfg.whole_shaft_frac * S)
+    largest_ws_sum = int(torch.sort(Cs, descending=True).values[:n_ws].sum().item()) if n_ws else 0
+    if largest_ws_sum > M:
+        raise ValueError(
+            f"mask over-subscription: {n_ws} whole shafts can hold up to "
+            f"{largest_ws_sum} contacts > M={M} (mask_frac={cfg.mask_frac}); the "
+            f"argsort[:M] would leave whole-shaft contacts visible. Lower "
+            f"whole_shaft_frac or raise mask_frac for this montage."
+        )
+    eligible = N - (S - n_ws)
+    if eligible < M:
+        raise ValueError(
+            f"mask under-subscription: only {eligible} eligible cells "
+            f"(N={N} − {S - n_ws} keep-alive) < M={M}; argsort would pull "
+            f"pad/keep-alive slots. Lower mask_frac for this montage."
+        )
+
+
 def sample_contact_mask(
     geom: L1Geometry,
     n_contacts: int,

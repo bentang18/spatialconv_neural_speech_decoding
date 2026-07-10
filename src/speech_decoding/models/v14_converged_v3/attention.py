@@ -10,17 +10,20 @@ sensor-architecture):
            excluded by a key mask ⇒ the varlen block-diagonal is exact.
 
   L2Block  cross-sensor FACTORIZED SA at same-t. At each time slice the N
-           contacts attend across shafts; the learned DKT-parcel identity is
-           injected into the SCORE space only (added to the Q/K inputs, NOT to V
-           or the residual) so it stays disjoint from L1's RoPE score-space and
-           never accumulates in the residual stream. No RoPE (no shared metric
-           across sensors).
+           contacts attend across shafts. No RoPE (no shared metric across
+           sensors); the sole cross-sensor coordinate is the learned DKT-parcel
+           identity, which is added ONCE at the TOWER INPUT (``towers.py`` builds
+           ``x + parcel_embed(parcel_id)``) and rides the residual into every
+           block — so identity IS present in the residual and in L2's V, not a
+           score-space-only term. L2Block itself injects nothing.
 
-Score-space disjointness (memo "non-redundant BY CONSTRUCTION"): L1 scores are
-RoPE-relative on content; L2 scores add the parcel identity. Because identity
-feeds only L2's Q/K (V is identity-free), the residual carries content mixed by
-identity-aware weights but never the raw identity vectors — so a downstream L1
-block's RoPE score stays a pure function of relative (index, time).
+Non-redundancy (memo "non-redundant BY CONSTRUCTION") therefore rests on the
+DISJOINT PAIR-SETS, not on a V-is-identity-free property: L1 mixes only
+within-shaft (block-diagonal) same-shaft (contact,time) pairs; L2 mixes only
+cross-shaft same-t pairs. L1's per-pair score stays RoPE-relative on content;
+L2's score sees the identity-laden residual. (Audit note L2: same-shaft same-t
+pairs are touched by both mixers with independent weights — a bounded overlap,
+not strict disjointness; see M2 on identity being absolute + injected-once.)
 """
 
 from __future__ import annotations

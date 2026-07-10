@@ -15,11 +15,13 @@ independent rows (one per clip in the batch).
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
 from speech_decoding.models.v14_converged_v3.masking import (
     V3MaskConfig,
+    assert_mask_feasible,
     sample_contact_mask,
 )
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
@@ -220,6 +222,31 @@ def test_rows_are_independent() -> None:
     sc, geom = _session([20])
     mask = sample_contact_mask(geom, 20, n_rows=8, generator=_gen(5))
     assert not all(torch.equal(mask[0], mask[r]) for r in range(1, 8))
+
+
+def test_mask_feasible_passes_for_realistic_seeg() -> None:
+    # A representative sEEG montage under the frozen default cfg must be feasible —
+    # no shaft is remotely close to M, and eligible cells far exceed M.
+    sc, geom = _session([16, 12, 10, 9, 8, 6])  # N=61, mixed shaft lengths
+    assert_mask_feasible(geom)  # default V3MaskConfig ⇒ no raise
+
+
+def test_mask_feasible_flags_over_subscription() -> None:
+    # One dominant "shaft" (a uECoG grid block) can hold more contacts than M, so
+    # the argsort[:M] reconciliation would leave whole-shaft contacts VISIBLE.
+    sc, geom = _session([40, 4, 4])  # N=48, S=3
+    cfg = V3MaskConfig(mask_frac=0.5, whole_shaft_frac=0.4)  # n_ws=1, M=24, largest=40>24
+    with pytest.raises(ValueError, match="over-subscription"):
+        assert_mask_feasible(geom, cfg)
+
+
+def test_mask_feasible_flags_under_subscription() -> None:
+    # A dense grid of tiny shafts: eligible cells (N − keep-alive) fall below M, so
+    # the argsort would reach into inf-priority pad/keep-alive slots.
+    sc, geom = _session([2] * 10)  # N=20, S=10, eligible = 20−10 = 10
+    cfg = V3MaskConfig(mask_frac=0.7, whole_shaft_frac=0.0)  # M=14 > 10
+    with pytest.raises(ValueError, match="under-subscription"):
+        assert_mask_feasible(geom, cfg)
 
 
 def test_shallow_edge_coverage_is_uniform() -> None:
