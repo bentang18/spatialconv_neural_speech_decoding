@@ -23,7 +23,7 @@ from collections.abc import Sequence
 
 from torch import Tensor, nn
 
-from speech_decoding.models.v14_converged_v3.attention import L1Block, L2Block
+from speech_decoding.models.v14_converged_v3.attention import LN_EPS, L1Block, L2Block
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.pe import ParcelIdentityEmbed
 
@@ -60,6 +60,14 @@ class V3Tower(nn.Module):
             else:
                 raise ValueError(f"unknown block kind {kind!r}")
         self.blocks = nn.ModuleList(blocks)
+        # Terminal affine LayerNorm, applied to BOTH towers before the downstream
+        # projection — V-JEPA 2 encoder `self.norm` (vision_transformer.py:210) and
+        # predictor `predictor_norm` (predictor.py:241), also present in v2
+        # (pred_norm / ln_out). Keeps the predictor output unit-scale against the
+        # affine-free-LN'd target (kills the scale-runaway incentive: the target is
+        # already unit, so the affine gamma has nothing to inflate toward), and makes
+        # the teacher target `affinefree_LN(affine_LN(h))` — the exact upstream form.
+        self.norm_out = nn.LayerNorm(d_model, eps=LN_EPS)
 
     def forward(
         self,
@@ -71,7 +79,7 @@ class V3Tower(nn.Module):
         x = x + self.parcel_embed(parcel_id)[None, :, None, :]  # (B,N,T,d) + (1,N,1,d)
         for b in self.blocks:
             x = b(x, geom, visible) if isinstance(b, L1Block) else b(x, visible)
-        return x
+        return self.norm_out(x)
 
 
 def build_encoder(*, n_parcels: int) -> V3Tower:

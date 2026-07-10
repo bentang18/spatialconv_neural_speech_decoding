@@ -113,6 +113,32 @@ def test_parcel_embed_added_once_at_tower_input() -> None:
     assert not torch.allclose(out_a, out_b, atol=1e-4)
 
 
+def test_tower_has_terminal_layernorm() -> None:
+    # V-JEPA 2 applies an affine terminal LayerNorm to BOTH towers before the
+    # downstream projection: encoder `self.norm` (vision_transformer.py:210) and
+    # predictor `predictor_norm` (predictor.py:241). v2 carried the same
+    # (pred_norm / ln_out); the v3 rewrite dropped it — restore it here so the
+    # predictor output is unit-scale against the LN'd target (no scale runaway),
+    # and the encoder tap / teacher target match upstream `affinefree(affine(h))`.
+    import torch.nn as nn
+
+    from speech_decoding.models.v14_converged_v3.towers import (
+        build_encoder,
+        build_predictor,
+    )
+
+    for build in (build_encoder, build_predictor):
+        tower = build(n_parcels=8).eval()
+        assert isinstance(tower.norm_out, nn.LayerNorm)
+    sc, geom = _session()
+    enc = build_encoder(n_parcels=8).eval()
+    x = torch.randn(1, 5, T, 256) * 7.0  # deliberately off-scale input
+    out = enc(x, geom, sc.parcel_id)
+    # fresh affine LN (gamma=1, beta=0) ⇒ each token unit-scaled over the feature dim
+    assert out.mean(dim=-1).abs().max() < 1e-4
+    assert (out.var(dim=-1, unbiased=False) - 1.0).abs().max() < 1e-2
+
+
 def test_tower_dispatches_l1_to_geom_and_l2_to_parcel() -> None:
     # A whole-session forward must be block-diagonal-then-mixed: after the first
     # 6 L1 blocks (encoder), shaft A still cannot have seen shaft B; only once an

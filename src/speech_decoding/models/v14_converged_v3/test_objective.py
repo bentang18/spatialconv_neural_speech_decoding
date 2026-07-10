@@ -121,14 +121,22 @@ def test_teacher_lags_then_moves_toward_online() -> None:
 
 
 def test_target_ln_is_applied() -> None:
+    # With the terminal affine LayerNorm on the tower, target_ln is ~a no-op at init
+    # (both give unit-scale targets). Its real job is to RE-normalize when the
+    # terminal affine gamma/beta drift off identity during training — upstream stacks
+    # both (affine `self.norm` THEN affine-free target LN). Force the drift on the
+    # teacher's terminal norm and confirm target_ln then changes the loss.
     sc, geom = _session()
     bands, mask = _batch(sc)
     torch.manual_seed(0)
-    on = V3JepaObjective(n_parcels=N_PARCELS, target_ln=True)
-    torch.manual_seed(0)
-    off = V3JepaObjective(n_parcels=N_PARCELS, target_ln=False)
-    lo = on(bands, geom, sc.parcel_id, mask).loss
-    lf = off(bands, geom, sc.parcel_id, mask).loss
+    obj = V3JepaObjective(n_parcels=N_PARCELS, target_ln=True)
+    with torch.no_grad():
+        obj.teacher.model.encoder.norm_out.weight.mul_(3.0)
+        obj.teacher.model.encoder.norm_out.bias.add_(2.0)
+    obj.target_ln = True
+    lo = obj(bands, geom, sc.parcel_id, mask).loss
+    obj.target_ln = False
+    lf = obj(bands, geom, sc.parcel_id, mask).loss
     assert not torch.allclose(lo, lf)
 
 
