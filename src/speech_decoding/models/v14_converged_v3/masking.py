@@ -1,0 +1,101 @@
+"""v14_converged_v3 — electrode-unit time-tube masking (Phase 5).
+
+Memo project-v14-converged-v3-sensor-architecture. The mask is a per-ELECTRODE
+boolean (a masked electrode is time-tubed = hidden across ALL slots — the
+objective broadcasts it over the clock). Distribution, small→large spatial
+extent: within-shaft contiguous contact-blocks (w~Uniform{block_w_lo..hi}, the
+MAJORITY mass) ⊂ whole-shaft masks (the THIN TAIL that trains the offloaded
+predictor L2). Constant held-out count ``M = round(mask_frac·N)`` per row ⇒ static
+shapes (compile once per session).
+
+Vectorized end-to-end (the memo's "ALWAYS VECTORIZE" rule): one COVER-RANK
+argsort, generalising v2's ``_hga_fill_not_trim`` to (a) variable block width and
+(b) a whole-shaft priority tier. No python loop over shafts / blocks / rows.
+
+Cover-rank recipe: a contact's block priority = the min random start-rank among
+the spans covering it (span ``s`` covers contact ``c`` iff ``s ≤ c < s+w_s``);
+selecting the smallest-``M`` by (tier, cover_rank, position) ≡ adding whole spans
+in random order until the budget is hit and trimming the last — contiguous blocks,
+exact count, no scan. The whole-shaft tier sits strictly below every block
+priority, so designated shafts fill first (large-extent tail), blocks fill the
+remainder.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from torch import Tensor
+
+from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+
+
+@dataclass(frozen=True)
+class V3MaskConfig:
+    mask_frac: float = 0.60  # ⇒ M = round(mask_frac·N) held out
+    block_w_lo: int = 4  # Uniform{lo..hi} inclusive; floor 4 = along-shaft HGA autocorr
+    block_w_hi: int = 8
+    whole_shaft_frac: float = 0.15  # fraction of shafts wholly masked (thin tail)
+
+
+def sample_contact_mask(
+    geom: L1Geometry,
+    n_contacts: int,
+    *,
+    n_rows: int,
+    generator: torch.Generator,
+    cfg: V3MaskConfig = V3MaskConfig(),
+) -> Tensor:
+    """Sample ``n_rows`` independent per-contact masks → ``(R, N)`` bool.
+
+    True = held out (an SSL target, time-tubed). Exactly ``M = round(mask_frac·N)``
+    True per row.
+    """
+    R, S, C = n_rows, geom.n_shafts, geom.max_c
+    N = n_contacts
+    M = round(cfg.mask_frac * N)
+    valid = geom.valid  # (S, C) bool
+    gidx_flat = geom.gather_idx.reshape(-1)  # (S*C,) long
+    dev = valid.device
+
+    # --- whole-shaft tier: round(frac·S) shafts per row, argsort-of-rand top-k ---
+    n_ws = round(cfg.whole_shaft_frac * S)
+    ws_rank = (
+        torch.rand(R, S, generator=generator, device=dev).argsort(1).argsort(1)
+    )  # (R, S) 0-based
+    whole = ws_rank < n_ws  # (R, S) bool
+
+    # --- within-shaft block cover-rank (variable width) ---
+    w = torch.randint(
+        cfg.block_w_lo, cfg.block_w_hi + 1, (R, S, C), generator=generator, device=dev
+    )  # (R, S) per start
+    start_rank = (
+        torch.rand(R, S, C, generator=generator, device=dev).argsort(2).argsort(2)
+    )  # (R, S, C_start) random rank of each candidate start
+    s_idx = torch.arange(C, device=dev)[None, None, :, None]  # start axis
+    c_idx = torch.arange(C, device=dev)[None, None, None, :]  # covered axis
+    cover = (
+        (s_idx <= c_idx)
+        & (c_idx < s_idx + w[:, :, :, None])
+        & valid[None, :, None, :]
+    )  # (R, S, C_start, C_c)
+    BIG = C + 1
+    ranks = torch.where(cover, start_rank[:, :, :, None], BIG)  # (R,S,C_start,C_c)
+    cover_rank = ranks.min(dim=2).values  # (R, S, C) min over starts; finite for valid
+
+    # --- composite priority: tier ⊳ (whole < block); ties by (rank, position) ---
+    pos = torch.arange(C, device=dev)[None, None, :].expand(R, S, C).float()
+    ws_rank_f = ws_rank[:, :, None].float().expand(R, S, C)
+    whole_pri = ws_rank_f * C + pos  # in [0, S*C)
+    block_pri = float(S * C) + cover_rank.float() * C + pos  # ≥ S*C
+    priority = torch.where(whole[:, :, None].expand(R, S, C), whole_pri, block_pri)
+    priority = priority.masked_fill(~valid[None].expand(R, S, C), float("inf"))
+    priority = priority.reshape(R, S * C)
+
+    # --- pick the M smallest-priority contacts, scatter onto the contact axis ---
+    sel = priority.argsort(dim=1)[:, :M]  # (R, M) grid-cell indices, all valid
+    target = gidx_flat[sel]  # (R, M) contact indices (distinct per row)
+    mask = torch.zeros(R, N, dtype=torch.bool, device=dev)
+    mask.scatter_(1, target, True)
+    return mask
