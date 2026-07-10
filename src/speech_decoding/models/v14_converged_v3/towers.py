@@ -93,11 +93,23 @@ class V3Tower(nn.Module):
         geom: L1Geometry,
         parcel_id: Tensor,
         visible: Tensor | None = None,
-    ) -> Tensor:
+        *,
+        tap_blocks: tuple[int, ...] = (),
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        # ``tap_blocks`` (monitor only): 1-based block indices whose RAW output to
+        # capture (e.g. (6, 12) for the rankme/feat_std depth comparison). Empty ⇒
+        # the default single-return path (no tuple), so non-monitor callers and the
+        # compiled hot path are unchanged.
         x = x + self.parcel_embed(parcel_id)[None, :, None, :]  # (B,N,T,d) + (1,N,1,d)
-        for b in self.blocks:
+        taps: dict[int, Tensor] = {}
+        for i, b in enumerate(self.blocks):
             x = b(x, geom, visible) if isinstance(b, L1Block) else b(x, visible)
-        return self.norm_out(x)
+            if (i + 1) in tap_blocks:
+                taps[i + 1] = x
+        out = self.norm_out(x)
+        if tap_blocks:
+            return out, taps
+        return out
 
 
 def build_encoder(*, n_parcels: int) -> V3Tower:

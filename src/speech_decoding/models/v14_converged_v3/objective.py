@@ -57,6 +57,7 @@ def _ln_target(t: Tensor) -> Tensor:
 class JepaOutput:
     loss: Tensor
     n_masked: int
+    taps: dict[str, Tensor] | None = None
 
 
 class _TargetTower(nn.Module):
@@ -80,9 +81,13 @@ class _TargetTower(nn.Module):
         geom: L1Geometry,
         parcel_id: Tensor,
         visible: Tensor | None,
-    ) -> Tensor:
+        *,
+        tap_blocks: tuple[int, ...] = (),
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
         tokens = self.stem(bands)  # (B, N, T, 256)
-        return self.encoder(tokens, geom, parcel_id, visible=visible)
+        return self.encoder(
+            tokens, geom, parcel_id, visible=visible, tap_blocks=tap_blocks
+        )
 
 
 class V3JepaObjective(nn.Module):
@@ -114,12 +119,27 @@ class V3JepaObjective(nn.Module):
         geom: L1Geometry,
         parcel_id: Tensor,
         mask: Tensor,
+        *,
+        collect_taps: bool = False,
+        whole_contact: Tensor | None = None,
     ) -> JepaOutput:
-        """bands: 3-band |STFT| inputs; mask: (B, N) bool (True = target)."""
+        """bands: 3-band |STFT| inputs; mask: (B, N) bool (True = target).
+
+        ``collect_taps`` (monitor cadence only): also return detached taps —
+        encoder block-6/12 visible-token rows (rankme/feat_std depth probe) and the
+        predictor/target rows split by whole-sensor vs intra-sensor tier (EV +
+        var-ratio + L1). ``whole_contact`` (B, N) bool marks the whole-sensor tier;
+        required when ``collect_taps`` for the tier split.
+        """
         visible = ~mask  # (B, N)
 
         # online tower (stem + encoder) over visible electrodes only
-        z = self.online(bands, geom, parcel_id, visible)  # (B, N, T, 256)
+        if collect_taps:
+            z, enc_taps = self.online(
+                bands, geom, parcel_id, visible, tap_blocks=(6, 12)
+            )  # (B, N, T, 256), {6,12: (B,N,T,256)}
+        else:
+            z = self.online(bands, geom, parcel_id, visible)  # (B, N, T, 256)
 
         # EMA teacher (own stem + encoder) over the full grid → targets
         with torch.no_grad():
@@ -138,7 +158,41 @@ class V3JepaObjective(nn.Module):
         pred_m = pred[tube]  # (n_masked, 256)
         tgt_m = tgt[tube]
         loss = _l1_or_zero(pred_m, tgt_m, "l1")
-        return JepaOutput(loss=loss, n_masked=int(tube.sum()))
+
+        taps = None
+        if collect_taps:
+            taps = self._build_taps(enc_taps, pred, tgt, mask, visible, whole_contact)
+        return JepaOutput(loss=loss, n_masked=int(tube.sum()), taps=taps)
+
+    @staticmethod
+    def _build_taps(
+        enc_taps: dict[int, Tensor],
+        pred: Tensor,
+        tgt: Tensor,
+        mask: Tensor,
+        visible: Tensor,
+        whole_contact: Tensor | None,
+    ) -> dict[str, Tensor]:
+        """Detached monitor taps. Encoder rows are VISIBLE tokens only (the learned
+        representation); pred/target rows are the time-tubed masked positions split
+        into whole-sensor and intra-sensor tiers. Target rows are already
+        ``target_ln``'d (computed after the norm), matching the loss."""
+        B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
+        vis_t = visible[:, :, None].expand(B, N, T)  # (B, N, T)
+        out: dict[str, Tensor] = {
+            "enc6": enc_taps[6].detach()[vis_t],  # (n_vis·T, 256)
+            "enc12": enc_taps[12].detach()[vis_t],
+        }
+        if whole_contact is None:
+            return out
+        whole_t = whole_contact[:, :, None].expand(B, N, T)
+        intra_t = (mask & ~whole_contact)[:, :, None].expand(B, N, T)
+        p, t = pred.detach(), tgt.detach()
+        out.update(
+            pred_whole=p[whole_t], tgt_whole=t[whole_t],
+            pred_intra=p[intra_t], tgt_intra=t[intra_t],
+        )
+        return out
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:

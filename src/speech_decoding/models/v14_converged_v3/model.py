@@ -65,12 +65,25 @@ class V3ConvergedModel(nn.Module):
         parcel_id: Tensor,
         *,
         generator: torch.Generator,
+        collect_taps: bool = False,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
-        mask = sample_contact_mask(
-            geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg
-        )  # (B, N) — masking is the sole augmentation
-        return self.objective(band_inputs, geom, parcel_id, mask)
+        # masking is the sole augmentation; the whole-sensor tier tag is only needed
+        # for the monitor tap split (collect_taps).
+        if collect_taps:
+            mask, whole_contact = sample_contact_mask(
+                geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg,
+                return_tier=True,
+            )
+        else:
+            mask = sample_contact_mask(
+                geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg
+            )
+            whole_contact = None
+        return self.objective(
+            band_inputs, geom, parcel_id, mask,
+            collect_taps=collect_taps, whole_contact=whole_contact,
+        )
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:

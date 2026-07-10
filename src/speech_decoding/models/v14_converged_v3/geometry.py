@@ -28,6 +28,7 @@ class L1Geometry:
     gather_idx: Tensor  # (n_shafts, max_c) long — contact index into N; pad → 0
     valid: Tensor  # (n_shafts, max_c) bool — False on pad slots
     depth: Tensor  # (n_shafts, max_c) long — clinical contact index per slot
+    shaft_of_contact: Tensor  # (N,) long — shaft id per contact (tier-split monitor)
     n_shafts: int
     max_c: int
 
@@ -63,6 +64,7 @@ def build_l1_geometry(sidecar: SensorSidecar) -> L1Geometry:
         gather_idx=gather_idx,
         valid=valid,
         depth=depth_pad,
+        shaft_of_contact=shaft_id.clone(),
         n_shafts=n_shafts,
         max_c=max_c,
     )

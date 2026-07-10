@@ -56,11 +56,17 @@ def sample_contact_mask(
     n_rows: int,
     generator: torch.Generator,
     cfg: V3MaskConfig = V3MaskConfig(),
-) -> Tensor:
+    return_tier: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Sample ``n_rows`` independent per-contact masks → ``(R, N)`` bool.
 
     True = held out (an SSL target, time-tubed). Exactly ``M = round(mask_frac·N)``
     True per row.
+
+    ``return_tier`` (monitor only): also return ``whole_contact`` ``(R, N)`` bool —
+    True where a masked contact belongs to a WHOLLY-masked shaft (the cross-sensor
+    tier) vs a within-shaft block (the local tier). Derived statically from the
+    per-shaft ``whole`` pick via ``geom.shaft_of_contact`` (no dynamic scatter).
     """
     R, S, C = n_rows, geom.n_shafts, geom.max_c
     N = n_contacts
@@ -142,4 +148,10 @@ def sample_contact_mask(
     target = gidx_flat[sel_idx]  # (R, M) contact indices (distinct per row)
     mask = torch.zeros(R, N, dtype=torch.bool, device=dev)
     mask.scatter_(1, target, True)
-    return mask
+    if not return_tier:
+        return mask
+    # whole_contact: a contact is whole-tier iff its shaft was wholly masked. Map
+    # per-shaft `whole` (R, S) to per-contact via shaft_of_contact (R, N), then AND
+    # with the mask so only actually-masked contacts carry a tier tag.
+    whole_contact = whole[:, geom.shaft_of_contact] & mask  # (R, N)
+    return mask, whole_contact

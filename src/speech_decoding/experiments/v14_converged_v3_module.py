@@ -128,11 +128,27 @@ class V14ConvergedV3Module(pl.LightningModule):
         g.manual_seed((self.seed * _MASK_SEED_STRIDE + step) & 0x7FFF_FFFF_FFFF_FFFF)
         return g
 
+    def _monitor_due(self, step: int) -> bool:
+        return step % self.monitor_every_n_steps == 0
+
     def training_step(self, batch: V3Batch, batch_idx: int) -> Tensor:  # noqa: ARG002
         device = batch.bands[0].device
         gen = self._step_generator(device)
-        out = self.model(batch.bands, batch.geom, batch.parcel_id, generator=gen)
+        # Taps (the SVD/rankme + tier-EV monitor inputs) are computed only on the
+        # monitor cadence — off-cost otherwise (the <5% budget). Presence of
+        # ``_last_taps`` IS the cadence signal the callback's on_train_batch_end
+        # reads (its own global_step is post-step / off-by-one).
+        try:
+            step = int(self.global_step)
+        except (RuntimeError, AttributeError):
+            step = 0
+        collect = self._monitor_due(step)
+        out = self.model(
+            batch.bands, batch.geom, batch.parcel_id,
+            generator=gen, collect_taps=collect,
+        )
         self._last_batch_size = int(batch.bands[0].shape[0])
+        self._last_taps = out.taps if collect else None
         self.log("train_loss", out.loss, on_step=True, prog_bar=True)
         self.log("train_n_masked", float(out.n_masked), on_step=True)
         return out.loss
