@@ -29,6 +29,7 @@ from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.attention import LN_EPS, L1Block, L2Block
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
+from speech_decoding.models.v14_converged_v3.packing import PackPlan
 from speech_decoding.models.v14_converged_v3.pe import (
     ParcelIdentityEmbed,
     init_transformer_weights,
@@ -113,6 +114,37 @@ class V3Tower(nn.Module):
         taps: dict[int, Tensor] = {}
         for i, b in enumerate(self.blocks):
             x = b(x, geom, visible) if isinstance(b, L1Block) else b(x, visible)
+            if (i + 1) in tap_blocks:
+                taps[i + 1] = x
+        out = self.norm_out(x)
+        if tap_blocks:
+            return out, taps
+        return out
+
+    # ── packed (varlen) path (#24) — the PRODUCTION forward ──────────────────
+    # ``forward`` above is the padded ORACLE (test_towers). The packed forward runs
+    # the tower over the SELECTED contacts only (M_vis for the online encoder, all-N
+    # for teacher/predictor), shaft-grouped per ``plan.order``. L1 dispatches to the
+    # varlen block-diagonal attention; L2 to the dense-over-P mixer. Parcel identity
+    # is added ONCE here (packed slots ← ``parcel_id[plan.order]``, supplied as
+    # ``parcel_packed``), exactly as the padded path adds it once over N.
+    def forward_packed(
+        self,
+        x: Tensor,
+        plan: PackPlan,
+        parcel_packed: Tensor,
+        *,
+        backend: str = "auto",
+        tap_blocks: tuple[int, ...] = (),
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        # x: (B, P, T, d); parcel_packed: (B, P) long — parcel id per packed slot.
+        x = x + self.parcel_embed(parcel_packed).to(x.dtype)[:, :, None, :]
+        taps: dict[int, Tensor] = {}
+        for i, b in enumerate(self.blocks):
+            if isinstance(b, L1Block):
+                x = b.forward_packed(x, plan, backend=backend)
+            else:
+                x = b.forward_packed(x)
             if (i + 1) in tap_blocks:
                 taps[i + 1] = x
         out = self.norm_out(x)
