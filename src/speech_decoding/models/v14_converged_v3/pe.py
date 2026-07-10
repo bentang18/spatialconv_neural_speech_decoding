@@ -95,9 +95,11 @@ class ParcelIdentityEmbed(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(n_parcels, d_model)
         nn.init.trunc_normal_(self.embed.weight, std=init_std)
-        # Identity embeddings are weight-decay-exempt (memo / VJEPA-2.1 audit); the
-        # optimizer's no-decay filter keys on this attribute at param-group build.
-        self.embed.weight._no_weight_decay = True  # type: ignore[attr-defined]
+        # NO weight-decay exemption: this 2-D table IS decayed, matching upstream
+        # V-JEPA 2 exactly (`app/vjepa_2_1/utils.py` shape-only rule decays every
+        # ≥2-D param, including its own 3-D modality embed) and our established
+        # `optim_param_groups.is_no_decay` (ndim<=1). Tagging `_no_weight_decay`
+        # here would be a silent divergence — and the splitter ignores it anyway.
 
     def forward(self, parcel_id: Tensor) -> Tensor:
         """parcel_id: (..., seq) long → (..., seq, d_model)."""
