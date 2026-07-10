@@ -212,18 +212,32 @@ STFT_2BAND_HGA: dict[str, float] = {
 
 # ---------------------------------------------------------------------------
 # v14_converged_v3 3-band frontend (memo project-v14-converged-v3-sensor-
-# architecture-2026-07-08). Three multi-resolution MAGNITUDE bands broadcast to
-# a common 32 Hz token clock, concat → 20 ch → Linear(20→256). Bins DERIVED via
+# architecture-2026-07-08). Three multi-resolution MAGNITUDE bands on a COMMON
+# 32 Hz token clock, concat → 20 ch → Linear(20→256). Bins DERIVED via
 # _stft_band_k_range at fs=2048:
-#   SLOW N=1024 hop=512  Δf=2 Hz   2–14 Hz  → k1..k7  = 7 bins  (this dict; NEW)
-#   MID  = STFT_3BAND_BETA (256/128, 16–56, k2..k7 = 6 bins)    reused verbatim
-#   HGA  = STFT_2BAND_HGA  (128/64,  64–160, k4..k10 = 7 bins)  reused verbatim
-# Only SLOW is new: it is the MAGNITUDE 2–14 band (the legacy STFT_3BAND_SLOW is
-# cartesian Re/Im 2–12 — a different band). MID/HGA are NOT re-declared here: a
-# second dict with identical params would collide in _WINSOR_BAND_TAG.
+#   SLOW N=1024 hop=64  Δf=2 Hz   2–14 Hz  → k1..k7  = 7 bins
+#   MID  N=256  hop=64  Δf=8 Hz   16–56 Hz → k2..k7  = 6 bins
+#   HGA  = STFT_2BAND_HGA (128/64, 64–160, k4..k10 = 7 bins)  reused verbatim
+#
+# UNIFORM hop=64 (fixed 2026-07-10, Ben): every band emits one frame per 31.25 ms
+# slot NATIVELY (2048/64 = 32 Hz). nperseg still sets frequency resolution
+# independently — long window = fine freq, short hop = full time-rate (decoupled).
+# This REPLACES the earlier slow-hop=512/mid-hop=128 extraction, where slow rode a
+# 4 Hz frame rate and mid a 16 Hz rate and the stem repeat_interleave-HELD them up
+# to 32 Hz (8×/2×). The held stairsteps carried no real sub-250 ms / 62.5 ms
+# timing; uniform 64-hop gives slow/mid genuine 32 Hz temporal detail (heavily
+# overlapped windows). SLOW+MID are v3-EXCLUSIVE dicts (hop 64) — the shared
+# STFT_3BAND_BETA (hop 128) is left untouched for the cartesian 3STFT ladder.
+# Winsor tags are hop-independent (nperseg,chan,f_hi): SLOW keeps "vslow"; MID's
+# (256,"mag",56) resolves to the existing "beta" cap (identical freq content →
+# same |z| distribution → correct), so NO new _WINSOR_BAND_TAG entry. The
+# spec-cache uid DOES include band_hop, so the new hop forces a FRESH extraction.
 # ---------------------------------------------------------------------------
 STFT_V3_SLOW: dict[str, float] = {
-    "band_nperseg": 1024, "band_hop": 512, "band_f_lo_hz": 2.0, "band_f_hi_hz": 14.0,
+    "band_nperseg": 1024, "band_hop": 64, "band_f_lo_hz": 2.0, "band_f_hi_hz": 14.0,
+}
+STFT_V3_MID: dict[str, float] = {
+    "band_nperseg": 256, "band_hop": 64, "band_f_lo_hz": 16.0, "band_f_hi_hz": 56.0,
 }
 
 # Canonical winsor-band tag. Used ONLY to select a per-band

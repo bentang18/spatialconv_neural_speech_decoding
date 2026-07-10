@@ -6,11 +6,16 @@ Fold the 3 multi-resolution |STFT| bands into one content token per (contact,
 Each band arrives as ``(..., F_bins, T_band)`` (v2 cache convention: freq axis −2,
 time axis −1), already per-(elec,bin) robust-z'd at load. The stem:
 
-  1. broadcasts each band's time axis onto the shared 32 Hz clock by a per-band
-     integer HOLD factor (SLOW ×8 @4Hz, MID ×2 @16Hz, HGA ×1 @32Hz) —
-     repeat_interleave, because a slow frame is constant across its longer window;
+  1. aligns each band's time axis onto the shared 32 Hz clock. As of the
+     uniform-hop fix (2026-07-10) every band is EXTRACTED at hop=64 → 32 Hz
+     natively, so the per-band factors are all 1 (no hold). The repeat_interleave
+     is retained as a no-op that also GUARDS every band's frame count == the clock;
   2. concatenates the bands along freq → 20 channels;
   3. applies ONE weight-shared ``Linear(20 → d_model)`` per (contact, slot).
+
+  Historical note: before the fix, slow/mid were extracted at hop=512/128 (4/16 Hz)
+  and HELD up (×8/×2) to the 32 Hz clock — held stairsteps with no real sub-250 ms
+  / 62.5 ms timing. Uniform hop=64 gives all bands genuine 32 Hz temporal detail.
 
 Deliberately bare: NO freq embedding, NO band embedding, NO per-band norm (the
 projection's weight columns self-identify each band; per-band norm would
@@ -28,9 +33,11 @@ from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 
-# (n_bins, hold_factor) per band, in concat order. 7·1 + 6·... note factors are
-# T32/T_band = 32Hz / band-frame-rate: SLOW 4Hz→8, MID 16Hz→2, HGA 32Hz→1.
-V3_BANDS: tuple[tuple[int, int], ...] = ((7, 8), (6, 2), (7, 1))
+# (n_bins, hold_factor) per band, in concat order: SLOW 7, MID 6, HGA 7 = 20 ch.
+# hold_factor = T32 / T_band = 32Hz / band-frame-rate. With the uniform-hop=64 fix
+# (2026-07-10) every band is extracted at 32 Hz ⇒ all factors are 1 (no hold). The
+# factor is retained (=1) so broadcast_concat still asserts each band == the clock.
+V3_BANDS: tuple[tuple[int, int], ...] = ((7, 1), (6, 1), (7, 1))
 
 
 class SpectralStem(nn.Module):

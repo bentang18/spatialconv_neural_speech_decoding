@@ -16,7 +16,7 @@ from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 N_PARCELS = 8
-T32 = 16  # small clock for tests; SLOW ×8→2, MID ×2→8, HGA ×1→16
+T32 = 16  # small clock for tests; uniform hop=64 → all bands at 32 Hz (T32 each)
 
 
 def _session(shaft_sizes=(5, 4, 4)):
@@ -30,9 +30,9 @@ def _session(shaft_sizes=(5, 4, 4)):
 
 
 def _bands(n, B=1):
-    slow = torch.randn(B, n, 7, T32 // 8)
-    mid = torch.randn(B, n, 6, T32 // 2)
-    hga = torch.randn(B, n, 7, T32 // 1)
+    slow = torch.randn(B, n, 7, T32)
+    mid = torch.randn(B, n, 6, T32)
+    hga = torch.randn(B, n, 7, T32)
     return [slow, mid, hga]
 
 

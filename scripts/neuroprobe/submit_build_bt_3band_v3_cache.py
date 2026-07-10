@@ -4,14 +4,21 @@ DCC, MASSIVELY PARALLEL across common+scavenger (cache-only, CPU).
 
 Mechanism (identical to the 2band builder, new band set): each of the 3 v3 bands
 rides the single-grid ``electrode_tokens`` slot via ``dispatch_v14 --cache-band
-{v3slow,beta,hga}`` (--cache-only exits before the trainer, so no v3 model is
+{v3slow,v3mid,hga}`` (--cache-only exits before the trainer, so no v3 model is
 needed). Each band view is constructed exactly as the future v3 frontend run will
-build it (shared STFT_{V3_SLOW / 3BAND_BETA / 2BAND_HGA} + common_fe_kwargs +
+build it (STFT_{V3_SLOW / V3_MID / 2BAND_HGA} + common_fe_kwargs +
 band_<name> spec-cache subdir), so the run HITs this cache.
 
-  SLOW  N=1024 hop=512  2-14 Hz  |STFT| → 7 bins (k1..k7)   [cache-band v3slow, NEW]
-  MID   N=256  hop=128  16-56 Hz |STFT| → 6 bins (k2..k7)   [cache-band beta, reused]
-  HGA   N=128  hop=64   64-160Hz |STFT| → 7 bins (k4..k10)  [cache-band hga,  reused]
+UNIFORM hop=64 (fixed 2026-07-10, Ben): every band hops at 64 samples → 32 Hz
+frame rate natively, so slow/mid carry REAL 31.25 ms timing (window still sets
+frequency resolution) instead of being extracted at 4/16 Hz and stem-held. This
+is why SLOW+MID are v3-EXCLUSIVE cache-bands (v3slow/v3mid at hop 64): the shared
+"beta" (hop 128) stays put for the 3stft ladder. Slow/mid caches are now 8×/2×
+larger (more frames) — build memory ~192G (see --mem).
+
+  SLOW  N=1024 hop=64  2-14 Hz  |STFT| → 7 bins (k1..k7)   [cache-band v3slow]
+  MID   N=256  hop=64  16-56 Hz |STFT| → 6 bins (k2..k7)   [cache-band v3mid, NEW]
+  HGA   N=128  hop=64  64-160Hz |STFT| → 7 bins (k4..k10)  [cache-band hga, reused]
 
 20 bins total. All magnitude (NO phase — the legacy cartesian SLOW is a different
 band). Voltage→feature preprocessing is BYTE-IDENTICAL to v2 (shaft-CAR → notch
@@ -69,9 +76,10 @@ _LITE_SESSIONS: tuple[tuple[int, int], ...] = (
     (1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
     (4, 0), (4, 1), (7, 0), (7, 1), (10, 0), (10, 1),
 )
-# v3 3-band set: SLOW is the NEW mag 2-14 band (cache-band v3slow); MID/HGA reuse
-# the existing "beta"/"hga" cache-band names (identical STFT params).
-_BANDS = ("v3slow", "beta", "hga")
+# v3 3-band set (uniform hop=64): SLOW and MID are v3-exclusive cache-bands at
+# hop 64 (v3slow/v3mid); HGA reuses "hga" (already hop 64). The shared "beta"
+# (hop 128) is NOT used by v3 anymore — forking v3mid keeps the 3stft ladder safe.
+_BANDS = ("v3slow", "v3mid", "hga")
 
 
 def _verify_lite_sessions() -> None:
@@ -204,7 +212,7 @@ def parse_args() -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--spec-cache-dir", type=Path, required=True,
                    help="Spec-cache root. Each band lands in <root>/band_<name> "
-                        "(band_v3slow, band_beta, band_hga). The v3 run MUST pass the "
+                        "(band_v3slow, band_v3mid, band_hga). The v3 run MUST pass the "
                         "SAME --spec-cache-dir to read these. Use a FRESH, corpus-specific dir.")
     p.add_argument("--extractor-cache-folder", type=Path, required=True,
                    help="EXCA_EXTRACTOR_CACHE_FOLDER (electrode_tokens raw-waveform "
@@ -214,7 +222,7 @@ def parse_args() -> argparse.Namespace:
                    help="pretrain (13 full-montage SSL sessions) OR eval (12 lite "
                         "leaderboard sessions). Run ONCE PER CORPUS with distinct "
                         "dirs (default pretrain). 'both' shares dirs — see warning.")
-    p.add_argument("--bands", default="v3slow,beta,hga",
+    p.add_argument("--bands", default="v3slow,v3mid,hga",
                    help="Comma list of v3 bands to build (default all three).")
     p.add_argument("--array-range", default=None,
                    help="Override the SLURM array range (default 0-12 pretrain / "
@@ -235,9 +243,10 @@ def parse_args() -> argparse.Namespace:
                    help="Comma list → SLURM lands each task wherever a node is free "
                         "(massively parallel). Default common,scavenger.")
     p.add_argument("--cpus", type=int, default=8)
-    p.add_argument("--mem", default="160G",
-                   help="Per-task memory. 160G clears the 3 largest sessions that "
-                        "OOM'd the 3STFT build at 64G (rerun-failed @192G if any die).")
+    p.add_argument("--mem", default="192G",
+                   help="Per-task memory. Bumped 160G→192G: uniform hop=64 makes the "
+                        "slow/mid spec memmaps 8×/2× larger (more frames) than the old "
+                        "hop 512/128 build, so the largest sessions need more headroom.")
     p.add_argument("--time", default="04:00:00")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()

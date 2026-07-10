@@ -56,6 +56,7 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
+    STFT_V3_MID,
     STFT_V3_SLOW,
     MultiStftView,
 )
@@ -556,7 +557,7 @@ def build_v14_experiment(
     # future ``--frontend 3stft`` training run (shared ``STFT_3BAND_*`` constants
     # + ``common_fe_kwargs``), so the spec-cache namespace matches → the run HITs
     # this cache. Overrides ``frontend``. None = no 3STFT band build.
-    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga", "v3slow"] | None = None,
+    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid"] | None = None,
     # Cache-build parallelism (--cache-only): restrict the SSL/study corpus to a
     # single session by its index in ``_SESSIONS_BY_MODE[study_mode]`` so a SLURM
     # array builds one session's spec cache per task. None = full corpus. The
@@ -1462,10 +1463,14 @@ def build_v14_experiment(
                 # the same subdir ⇒ namespace matches ⇒ the run HITs this cache.
                 "lfs": STFT_2BAND_LFS,
                 "hga": STFT_2BAND_HGA,
-                # v14_converged_v3 3-band frontend: SLOW is the NEW mag 2–14 band;
-                # v3 MID/HGA reuse "beta"/"hga" above (identical params). All three
-                # build into <v3-spec-cache-dir>/band_{v3slow,beta,hga}.
+                # v14_converged_v3 3-band frontend (UNIFORM hop=64 → 32 Hz native,
+                # fixed 2026-07-10): SLOW is the mag 2–14 band, MID the mag 16–56
+                # band — BOTH v3-exclusive at hop 64 (the shared "beta" above stays
+                # hop 128 for the 3stft ladder; v3 MID must NOT alias it). HGA reuses
+                # "hga" (already hop 64). Build into
+                # <v3-spec-cache-dir>/band_{v3slow,v3mid,hga}.
                 "v3slow": STFT_V3_SLOW,
+                "v3mid": STFT_V3_MID,
             }[cache_band]
             band_spec_cache = (
                 str(Path(spec_cache_dir) / f"band_{cache_band}")
@@ -3092,7 +3097,7 @@ def _parser() -> argparse.ArgumentParser:
                    help="3stft: M4 down-weight full-trust electrode count n_ref "
                         "(default 11; the w=1 saturation point).")
     p.add_argument("--cache-band", dest="cache_band",
-                   choices=("slow", "beta", "hg", "lfs", "hga", "v3slow"), default=None,
+                   choices=("slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid"), default=None,
                    help="Per-band cache build (--cache-only only). Build ONE named "
                         "band into <spec-cache-dir>/band_<name>. 3STFT 2/2/2 ladder: "
                         "slow N=1024/hop512 2-12Hz Cartesian Re/Im; beta N=256/hop128 "

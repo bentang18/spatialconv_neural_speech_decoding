@@ -1,16 +1,18 @@
 """v14_converged_v3 3-band frontend geometry (Phase 0).
 
-The v3 front-end is 3 multi-resolution |STFT| magnitude bands broadcast to a
-common 32 Hz token clock (memo project-v14-converged-v3-sensor-architecture):
+The v3 front-end is 3 multi-resolution |STFT| magnitude bands on a common 32 Hz
+token clock (memo project-v14-converged-v3-sensor-architecture). UNIFORM hop=64
+(fixed 2026-07-10): every band is extracted at 32 Hz natively — window sets
+frequency resolution, hop sets frame rate (decoupled). No stem hold/duplication.
 
-    SLOW  N=1024 hop=512  2–14 Hz   → k1..k7  = 7 bins   (NEW: mag, was cartesian 2–12)
-    MID   N=256  hop=128  16–56 Hz  → k2..k7  = 6 bins   (= STFT_3BAND_BETA, reused)
-    HGA   N=128  hop=64   64–160 Hz → k4..k10 = 7 bins   (= STFT_2BAND_HGA, reused)
+    SLOW  N=1024 hop=64  2–14 Hz   → k1..k7  = 7 bins   (v3-only mag)
+    MID   N=256  hop=64  16–56 Hz  → k2..k7  = 6 bins   (v3-only; forked from beta)
+    HGA   N=128  hop=64  64–160 Hz → k4..k10 = 7 bins   (= STFT_2BAND_HGA, already 32 Hz)
 
-Total 20 bins → Linear(20→256). Only SLOW is a new dict; MID/HGA are reused
-verbatim (defining new same-param dicts would collide in _WINSOR_BAND_TAG). All
-three are magnitude (band_channelization default "mag"); cutoffs land on clean
-integer bin centers.
+Total 20 bins → Linear(20→256). SLOW+MID are v3-exclusive dicts at hop 64; the
+SHARED STFT_3BAND_BETA (hop 128) is left untouched for the 3stft ladder. MID's
+winsor key (256,"mag",56) equals beta's, so it correctly reuses beta's cap with no
+new registration. All three magnitude; cutoffs land on clean integer bin centers.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 from speech_decoding.extractors.view import (
     STFT_2BAND_HGA,
     STFT_3BAND_BETA,
+    STFT_V3_MID,
     STFT_V3_SLOW,
     _DEFAULT_BAND_CHANNELIZATION,
     _WINSOR_BAND_TAG,
@@ -47,12 +50,27 @@ def test_slow_band_is_new_mag_2_14_seven_bins() -> None:
     assert STFT_V3_SLOW.get("band_channelization", _DEFAULT_BAND_CHANNELIZATION) == "mag"
 
 
-def test_mid_reuses_beta_six_bins() -> None:
-    _check(STFT_3BAND_BETA, V3_MID_EXPECT)
+def test_mid_is_v3_mag_16_56_six_bins() -> None:
+    _check(STFT_V3_MID, V3_MID_EXPECT)
+    assert STFT_V3_MID.get("band_channelization", _DEFAULT_BAND_CHANNELIZATION) == "mag"
 
 
 def test_hga_reuses_2band_hga_seven_bins() -> None:
     _check(STFT_2BAND_HGA, V3_HGA_EXPECT)
+
+
+def test_all_three_v3_bands_hop_at_64_for_a_32hz_clock() -> None:
+    # THE fix: every v3 band hops at 64 samples (2048/64 = 32 Hz) so each emits one
+    # frame per 31.25 ms slot natively — no 4/16 Hz extraction + stem hold.
+    for band in (STFT_V3_SLOW, STFT_V3_MID, STFT_2BAND_HGA):
+        assert int(band["band_hop"]) == 64
+
+
+def test_shared_beta_is_untouched_at_hop_128() -> None:
+    # v3 MID must be a SEPARATE dict — the shared 3stft beta keeps its hop 128 so
+    # forking v3 MID to hop 64 never re-hops the cartesian 3stft ladder.
+    assert int(STFT_3BAND_BETA["band_hop"]) == 128
+    assert int(STFT_V3_MID["band_hop"]) == 64
 
 
 def test_total_is_twenty_bins() -> None:
@@ -60,15 +78,17 @@ def test_total_is_twenty_bins() -> None:
     assert total == 20
 
 
-def test_slow_winsor_tag_registered_and_no_collision() -> None:
-    # The new SLOW key (1024, "mag", 14) must be a distinct winsor tag — it must
-    # NOT alias the legacy cartesian SLOW (1024,"cartesian",12) or LFS (1024,"mag",56).
-    key = _band_tag_key(STFT_V3_SLOW)
-    assert key == (1024, "mag", 14)
-    assert key in _WINSOR_BAND_TAG
-    # every registered band key is unique (the reuse discipline holds).
+def test_v3_winsor_tags_registered_and_mid_reuses_beta_cap() -> None:
+    # SLOW key (1024,"mag",14) is a distinct registered tag (not legacy cartesian
+    # SLOW (1024,"cartesian",12) nor LFS (1024,"mag",56)).
+    slow_key = _band_tag_key(STFT_V3_SLOW)
+    assert slow_key == (1024, "mag", 14)
+    assert _WINSOR_BAND_TAG[slow_key] == "vslow"
+    # v3 MID is hop-forked from beta but shares beta's winsor key (hop-independent),
+    # so it correctly resolves to the "beta" cap WITHOUT a second registration.
+    assert _band_tag_key(STFT_V3_MID) == _band_tag_key(STFT_3BAND_BETA) == (256, "mag", 56)
+    assert _WINSOR_BAND_TAG[_band_tag_key(STFT_V3_MID)] == "beta"
+    # every registered key is still unique (no collision introduced).
     keys = list(_WINSOR_BAND_TAG.keys())
     assert len(keys) == len(set(keys))
-    # MID/HGA reuse keeps the existing tags.
-    assert _WINSOR_BAND_TAG[_band_tag_key(STFT_3BAND_BETA)] == "beta"
     assert _WINSOR_BAND_TAG[_band_tag_key(STFT_2BAND_HGA)] == "hga"

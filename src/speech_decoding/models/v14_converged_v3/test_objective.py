@@ -27,7 +27,7 @@ from speech_decoding.models.v14_converged_v3.objective import V3JepaObjective
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 N_PARCELS = 8
-T = 16  # slow ×8→2, mid ×2→8, hga ×1→16
+T = 16  # 32 Hz clock; uniform hop=64 → all bands at 32 Hz (T frames each)
 
 
 def _session(shaft_sizes=(4, 3, 3)):
@@ -46,8 +46,8 @@ def _obj():
 
 
 def _bands(n, B=1):
-    slow = torch.randn(B, n, 7, T // 8)
-    mid = torch.randn(B, n, 6, T // 2)
+    slow = torch.randn(B, n, 7, T)
+    mid = torch.randn(B, n, 6, T)
     hga = torch.randn(B, n, 7, T)
     return [slow, mid, hga]
 

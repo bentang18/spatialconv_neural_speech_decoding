@@ -1,11 +1,11 @@
 """v14_converged_v3 Phase 2 — spectral stem fold (TDD).
 
 Memo (project-v14-converged-v3-sensor-architecture, FRONTEND bullet): the 3 multi-
-res |STFT| bands, each already per-(elec,bin) robust-z'd at load, are broadcast
-onto the shared 32 Hz token clock (SLOW ×8, MID ×2, HGA ×1 — a hold/repeat, since
-a slow frame is constant over its longer window), concatenated to 20 channels, and
-folded by ONE weight-shared Linear(20 → d_model) → 1 token per (contact, 31.25 ms).
-NO freq embed, NO band embed, NO per-band norm.
+res |STFT| bands, each already per-(elec,bin) robust-z'd at load, sit on the shared
+32 Hz token clock. As of the uniform-hop=64 fix (2026-07-10) every band is extracted
+at 32 Hz natively (SLOW/MID/HGA all one frame per 31.25 ms slot — NO hold/repeat),
+concatenated to 20 channels, and folded by ONE weight-shared Linear(20 → d_model)
+→ 1 token per (contact, 31.25 ms). NO freq embed, NO band embed, NO per-band norm.
 
 Input band layout matches v2's cache convention: (..., F_bins, T_band), freq axis
 −2, time axis −1 (v2 forward: lfs (B,C,28,T), hga (B,C,7,T)).
@@ -18,9 +18,10 @@ import torch
 
 from speech_decoding.models.v14_converged_v3.stem import SpectralStem
 
-# 4 s clip on the 32 Hz clock = 128 slots; band frame counts at 4/16/32 Hz.
+# 4 s clip on the 32 Hz clock = 128 slots. Uniform hop=64 → every band at 32 Hz,
+# so all three arrive with 128 frames (no hold).
 T32 = 128
-T_SLOW, T_MID, T_HGA = 16, 64, 128
+T_SLOW, T_MID, T_HGA = 128, 128, 128
 B, C = 2, 5
 
 
@@ -56,17 +57,17 @@ def test_total_channels_is_twenty() -> None:
     assert folded.shape == (B, C, 20, T32)
 
 
-def test_broadcast_is_a_hold_repeat_along_time() -> None:
-    # SLOW frame k must occupy the 8 consecutive 32 Hz slots [8k, 8k+8).
+def test_no_hold_each_band_frame_maps_one_to_one_to_a_slot() -> None:
+    # Uniform hop=64: SLOW frame k occupies EXACTLY slot k (no ×8 hold). Adjacent
+    # slots carry independent slow content — the whole point of the hop fix.
     slow = torch.arange(T_SLOW, dtype=torch.float32).reshape(1, 1, 1, T_SLOW).expand(1, 1, 7, T_SLOW)
     mid = torch.zeros(1, 1, 6, T_MID)
     hga = torch.zeros(1, 1, 7, T_HGA)
     stem = SpectralStem(d_model=256)
     folded = stem.broadcast_concat((slow, mid, hga))  # (1,1,20,128)
     slow_rows = folded[0, 0, :7, :]  # (7, 128)
-    for k in range(T_SLOW):
-        block = slow_rows[:, 8 * k : 8 * k + 8]
-        assert torch.allclose(block, torch.full_like(block, float(k)))
+    expected = torch.arange(T32, dtype=torch.float32).expand(7, T32)
+    assert torch.allclose(slow_rows, expected)
 
 
 def test_concat_order_is_slow_mid_hga() -> None:
@@ -88,9 +89,10 @@ def test_wrong_bin_count_raises() -> None:
         stem((bad_slow, mid, hga))
 
 
-def test_non_multiple_time_length_raises() -> None:
+def test_mismatched_band_length_raises() -> None:
+    # Uniform hop=64 (factor 1): a band whose frame count != the clock must raise.
     stem = SpectralStem(d_model=256)
-    bad_slow = torch.randn(B, C, 7, 15)  # 15 * 8 = 120 ≠ 128
+    bad_slow = torch.randn(B, C, 7, 127)  # 127 ≠ 128
     _, mid, hga = _bands()
     with pytest.raises(ValueError):
         stem((bad_slow, mid, hga))
