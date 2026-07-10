@@ -90,6 +90,26 @@ def test_spatial_and_temporal_axes_are_independent() -> None:
     assert torch.allclose(s_a, s_b, atol=1e-4)
 
 
+def test_default_base_makes_every_pair_position_live() -> None:
+    # Audit L12/#8: base must fit OUR ranges, not the LLM-inherited 10000. A pair
+    # with frequency f turns R·f radians across a range R; a pair turning <<1 rad
+    # end-to-end is position-DEAD. The default base_index/base_time must leave EVERY
+    # rotary pair turning a meaningful angle across index (~20 contacts) and time
+    # (128 slots) — and the old 10000 must NOT (regression witness).
+    R_index, R_time = 20.0, 128.0
+    rope = L1RoPE(head_dim=64)  # encoder width; pairs = 16 per axis
+    idx_turn = R_index * rope.idx_freq  # (pairs,) radians across the index range
+    t_turn = R_time * rope.t_freq
+    assert (idx_turn >= 1.0).all(), f"dead index pairs: {idx_turn.tolist()}"
+    assert (t_turn >= 1.0).all(), f"dead time pairs: {t_turn.tolist()}"
+    # lowest-freq pair stays under a full turn (≤2π) ⇒ no wrap-around ambiguity
+    assert idx_turn.min() <= 2 * torch.pi and t_turn.min() <= 2 * torch.pi
+
+    dead = L1RoPE(head_dim=64, base_index=10_000.0, base_time=10_000.0)
+    assert (R_index * dead.idx_freq < 1.0).sum() >= 10  # most index pairs were dead
+    assert (R_time * dead.t_freq < 1.0).sum() >= 6
+
+
 def test_parcel_identity_shape_and_indexing() -> None:
     emb = ParcelIdentityEmbed(n_parcels=74, d_model=256)
     parcel_id = torch.tensor([[3, 3, 7, 0]])

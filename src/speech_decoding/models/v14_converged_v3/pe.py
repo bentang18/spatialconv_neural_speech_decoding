@@ -3,13 +3,27 @@
 Memo: project-v14-converged-v3-sensor-architecture.
 
 L1RoPE — within-sensor JOINT spatiotemporal rotary. head_dim is split EQUALLY
-across two axes (contact-index, time), each with the standard RoPE freq schedule
-(base 10000; VideoRoPE low-freq-on-time is an ablation, not the default). RoPE
-rotates Q/K by ABSOLUTE position but the q·k score depends only on the RELATIVE
-offset (Δindex, Δtime) — so a global per-shaft depth flip/offset is a no-op
-(depth-flip is retired to a QC flag). Applied within a shaft (the block-diagonal
-L1 attention supplies per-shaft grouping); the raw clinical contact index (with
-drop-gaps) is the spatial coordinate.
+across two axes (contact-index, time), each with the standard RoPE freq schedule.
+RoPE rotates Q/K by ABSOLUTE position but the q·k score depends only on the
+RELATIVE offset (Δindex, Δtime) — so a global per-shaft depth flip/offset is a
+no-op (depth-flip is retired to a QC flag). Applied within a shaft (the
+block-diagonal L1 attention supplies per-shaft grouping); the raw clinical contact
+index (with drop-gaps) is the spatial coordinate.
+
+BASE (audit L12/#8, 2026-07-10): base is NOT the LLM/video-inherited 10000 — that
+is calibrated for context ~1e3-1e5, and against our ranges (index ~20 contacts,
+time 128 slots) it leaves most rotary pairs turning <<1 radian end-to-end, i.e.
+position-DEAD. A pair j turns R/base^(j/pairs) radians across a range R. Choosing
+base so the LOWEST-frequency pair (j=pairs-1) turns ~half a cycle across R (≈R rad,
+so ~π-3 rad — full ladder utilized, no wrap-around ambiguity) gives base ≈ R/(2π)
+scaled up by the ladder: base_index=8 (R≈20 ⇒ every pair 2.9–20 rad, vs ~3/16 live
+at 10000) and base_time=64 (R=128 ⇒ every pair 2.6–128 rad, vs ~9/16 live). Clean
+powers of two near the derived optima; the sweep arms are {4,32}=λ_max≈R and
+{16,128}=λ_max≈2R. NOTE we deliberately do NOT normalize index to a reference span
+(upstream ``interpolate_rope``): our contact index maps to PHYSICAL depth at fixed
+inter-contact spacing, so a shorter shaft SHOULD span less phase, and drop-gaps are
+real physical gaps — normalizing would erase geometry that raw index encodes, and
+because index is already physical, cross-subject phase is consistent WITHOUT it.
 
 ParcelIdentityEmbed — L2 cross-sensor identity: a LEARNED embedding indexed by
 the DKT/DK hard parcel tag (the only cross-subject-meaningful "who am I"), added
@@ -51,8 +65,8 @@ class L1RoPE(nn.Module):
         self,
         head_dim: int,
         *,
-        base_index: float = 10_000.0,
-        base_time: float = 10_000.0,
+        base_index: float = 8.0,
+        base_time: float = 64.0,
     ) -> None:
         super().__init__()
         if head_dim % 4 != 0:
