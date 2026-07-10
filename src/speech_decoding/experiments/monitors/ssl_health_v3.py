@@ -110,8 +110,13 @@ class SSLHealthMonitorV3(pl.Callback):
         ``optimizer.state``, no extra forward/backward."""
         if optimizer is None:
             return
-        sig = 0.0
-        v_sum = 0.0
+        # Accumulate on-GPU in a running float64 scalar and sync ONCE at the end,
+        # instead of two blocking .item() per parameter tensor (hundreds of
+        # device→host stalls/step). Bit-identical: both paths are a double-precision
+        # SEQUENTIAL sum (same iteration order) of the same float32 per-tensor
+        # reductions — float32→float64 promotion is exact, IEEE add is deterministic.
+        sig_t: torch.Tensor | None = None
+        v_t: torch.Tensor | None = None
         for group in optimizer.param_groups:
             beta1, beta2 = group.get("betas", (0.9, 0.999))
             for p in group["params"]:
@@ -123,8 +128,12 @@ class SSLHealthMonitorV3(pl.Callback):
                 bc2 = 1.0 - beta2 ** t if t > 0 else 1.0
                 m = st["exp_avg"].detach().to(torch.float32) / bc1
                 v = st["exp_avg_sq"].detach().to(torch.float32) / bc2
-                sig += float(m.pow(2).sum().item())
-                v_sum += float(v.sum().item())
+                s = m.pow(2).sum().double()
+                vv = v.sum().double()
+                sig_t = s if sig_t is None else sig_t + s
+                v_t = vv if v_t is None else v_t + vv
+        sig = float(sig_t.item()) if sig_t is not None else 0.0
+        v_sum = float(v_t.item()) if v_t is not None else 0.0
         if sig <= 0.0:
             return
         var = max(0.0, v_sum - sig)

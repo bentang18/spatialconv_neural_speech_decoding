@@ -106,7 +106,10 @@ class V3Tower(nn.Module):
         # capture (e.g. (3, 12) for the rankme/feat_std depth comparison). Empty ⇒
         # the default single-return path (no tuple), so non-monitor callers and the
         # compiled hot path are unchanged.
-        x = x + self.parcel_embed(parcel_id)[None, :, None, :]  # (B,N,T,d) + (1,N,1,d)
+        # (B,N,T,d) + (1,N,1,d). ``.to(x.dtype)``: nn.Embedding output is not autocast-
+        # downcast (stays fp32), so under bf16-mixed the bare add would promote the whole
+        # residual stream back to fp32; cast keeps it bf16. No-op under fp32.
+        x = x + self.parcel_embed(parcel_id).to(x.dtype)[None, :, None, :]
         taps: dict[int, Tensor] = {}
         for i, b in enumerate(self.blocks):
             x = b(x, geom, visible) if isinstance(b, L1Block) else b(x, visible)
