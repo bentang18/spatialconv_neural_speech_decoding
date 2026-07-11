@@ -221,6 +221,40 @@ def sdpa_block_diag_packed(
     return ctx.gather(1, idx).reshape(total, H, hd)  # back to packed (total, H, hd)
 
 
+@torch._dynamo.disable
+def njt_block_diag(q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor) -> Tensor:
+    """Block-diagonal L1 attention via jagged NestedTensor — the GPU PRODUCTION path.
+
+    Same block-diagonal attention as ``sdpa_block_diag_packed`` (the CPU/test oracle)
+    but with NO pad and NO mask: ``nested_tensor_from_jagged`` VIEWS the flat packed
+    ``(total, H, hd)`` values as a jagged ``(n_block, jᵢ, H, hd)`` delimited by
+    ``cu_seqlens``, so SDPA dispatches to the ragged flash-varlen kernel (fast fwd AND
+    bwd) instead of the mask-forced mem-efficient kernel. ~3× on attention fwd+bwd at
+    real shapes. Grad-preserving: ``_from_jagged`` views (unlike the ``nested_tensor``
+    constructor, which detaches).
+
+    Whole-masked shafts are DROPPED, not padded: they arrive as zero-length segments
+    (``cu_seqlens`` keeps the constant ``B*S`` block count for the padded oracle/grid),
+    and an empty jagged row corrupts the varlen backward (NaN grad). Empty blocks carry
+    no tokens, so removing their boundary leaves the packed values + order unchanged —
+    the varlen-native "drop" of an absent shaft.
+
+    Runs EAGER (``torch._dynamo.disable``): the NestedTensor subclass tangent breaks
+    torch-2.10 compiled autograd (AOTAutograd ``process_runtime_tangent`` asserts), so
+    the SDPA is a graph break — projections/RoPE around it stay compiled, and the
+    per-step-varying offsets never touch the compiled graph (no recompile). Default
+    SDPA scale ``1/sqrt(hd)`` matches the oracle. Returns packed ``(total, H, hd)``."""
+    off = cu_seqlens.to(torch.int64)
+    keep = off[1:] != off[:-1]  # drop zero-length (whole-masked) shafts
+    off = torch.cat([off[:1], off[1:][keep]])
+
+    def _nt(x: Tensor) -> Tensor:
+        return torch.nested.nested_tensor_from_jagged(x, offsets=off).transpose(1, 2)
+
+    ctx = F.scaled_dot_product_attention(_nt(q), _nt(k), _nt(v))
+    return ctx.transpose(1, 2).values()
+
+
 def _flash_varlen(
     q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor, max_seqlen: int
 ) -> Tensor:

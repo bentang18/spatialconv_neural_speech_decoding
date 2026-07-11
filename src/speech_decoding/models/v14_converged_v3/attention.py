@@ -35,7 +35,10 @@ from torch import Tensor, nn
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.packing import PackPlan
 from speech_decoding.models.v14_converged_v3.pe import L1RoPE
-from speech_decoding.models.v14_converged_v3.varlen import sdpa_block_diag_packed
+from speech_decoding.models.v14_converged_v3.varlen import (
+    njt_block_diag,
+    sdpa_block_diag_packed,
+)
 
 LN_EPS = 1e-6  # v14 convention (v14_encoder.LN_EPS)
 NEG_INF_MASK = -1e4  # v14 convention: finite (not -inf) → all-masked rows go uniform
@@ -180,14 +183,20 @@ class L1Block(nn.Module):
         # (strict/cuDNN needs q,k,v same dtype). No-op under fp32.
         q, k = q.to(v.dtype), k.to(v.dtype)
 
-        # SDPA-per-block (dense cuDNN on GPU, math on CPU): scatter packed → padded
-        # (B, S*max_c, T) grid, one dense attention per (clip, shaft) block, gather back.
-        # Same grid + key set as the padded oracle ⇒ per-contact-identical, but the
-        # linears above stayed on the packed P (keeps #24's visible-gather saving).
-        max_c = plan.max_seqlen // T
-        ctx = sdpa_block_diag_packed(
-            q, k, v, plan.grid_pos, plan.n_shafts, max_c, T
-        )  # (total, H, hd)
+        # GPU: ragged flash-varlen over cu_seqlens — no pad, no mask (~3× on attention
+        # fwd+bwd; the mask-forced mem-efficient kernel was ~76% of the step). Whole-
+        # masked shafts are DROPPED (zero-length segments), not padded. Runs eager
+        # (dynamo.disable) — the NestedTensor subclass tangent breaks torch-2.10
+        # compiled autograd; SDPA is a graph break, projections/RoPE stay compiled.
+        # CPU keeps the scatter-to-padded oracle (the test reference the GPU path is
+        # pinned against; njt is numerically identical to bf16, grad-matched).
+        if q.is_cuda:
+            ctx = njt_block_diag(q, k, v, plan.cu_seqlens)  # (total, H, hd)
+        else:
+            max_c = plan.max_seqlen // T
+            ctx = sdpa_block_diag_packed(
+                q, k, v, plan.grid_pos, plan.n_shafts, max_c, T
+            )  # (total, H, hd)
         ctx = self.out(ctx.reshape(total, d)).reshape(B, P, T, d)
         return ctx
 

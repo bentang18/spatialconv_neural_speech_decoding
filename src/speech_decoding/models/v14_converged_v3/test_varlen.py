@@ -117,3 +117,54 @@ def test_flex_matches_reference() -> None:
     got = _flex_block_diag(q, k, v, cu, compiled=False)
     want = _per_segment_truth(q, k, v, cu)
     assert torch.allclose(got, want, atol=1e-5)
+
+
+def _grid_pos_cu(contacts, max_c, T, vis):
+    """(grid_pos (1,P), cu (S+1,)) for one clip, given per-shaft contact counts and
+    the visible-shaft set. Masked shafts contribute a zero-length cu segment."""
+    S = len(contacts)
+    slots = [s * max_c + c for s in vis for c in range(contacts[s])]
+    grid_pos = torch.tensor(slots, dtype=torch.int64)[None]
+    blens = [contacts[s] * T if s in vis else 0 for s in range(S)]
+    cu = torch.tensor([0] + list(_accum(blens)), dtype=torch.int32)
+    return grid_pos, cu
+
+
+def _accum(xs):
+    t = 0
+    for x in xs:
+        t += x
+        yield t
+
+
+def test_njt_matches_padded_oracle_gpu() -> None:
+    # njt_block_diag (the GPU production path) is numerically identical to the padded
+    # sdpa_block_diag_packed oracle (the CPU/test path), all-visible AND with dropped
+    # (whole-masked) shafts, and its backward is finite. GPU-gated: the ragged
+    # flash-varlen kernel is CUDA-only. This is the #24-style equivalence re-proof.
+    import pytest
+
+    if not torch.cuda.is_available():
+        pytest.skip("njt varlen path is GPU-only")
+    from speech_decoding.models.v14_converged_v3.varlen import (
+        njt_block_diag,
+        sdpa_block_diag_packed,
+    )
+
+    dev = torch.device("cuda")
+    contacts = [4, 3, 5, 2]  # 4 shafts, ragged
+    S, max_c, T = len(contacts), max(contacts), 6
+    for vis in ([0, 1, 2, 3], [0, 2, 3]):  # all-visible, then drop shaft 1
+        grid_pos = _grid_pos_cu(contacts, max_c, T, vis)[0].to(dev)
+        cu = _grid_pos_cu(contacts, max_c, T, vis)[1].to(dev)
+        P = grid_pos.shape[1]
+        torch.manual_seed(7)
+        q, k, v = (
+            torch.randn(P * T, 4, 32, device=dev, dtype=torch.float32, requires_grad=True)
+            for _ in range(3)
+        )
+        o_pad = sdpa_block_diag_packed(q, k, v, grid_pos, S, max_c, T)
+        o_njt = njt_block_diag(q, k, v, cu)
+        assert torch.allclose(o_pad, o_njt, atol=1e-4), (vis, (o_pad - o_njt).abs().max())
+        o_njt.sum().backward()
+        assert all(torch.isfinite(t.grad).all() for t in (q, k, v)), vis
