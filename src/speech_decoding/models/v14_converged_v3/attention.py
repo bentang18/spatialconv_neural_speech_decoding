@@ -148,7 +148,14 @@ class L1Block(nn.Module):
     # the pack plan lays out, block-diagonal via ``cu_seqlens`` (flash on GPU, the
     # block-diagonal SDPA reference on CPU). Same weights, same RoPE, same key set
     # per shaft ⇒ per-contact-identical output at every present contact.
-    def _attn_packed(self, x: Tensor, plan: PackPlan, *, backend: str) -> Tensor:
+    def _attn_packed(
+        self,
+        x: Tensor,
+        plan: PackPlan,
+        *,
+        backend: str,
+        rope_cs: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
         # x: (B, P, T, d) packed, shaft-grouped. Token order = (clip, slot, time),
         # matching plan.cu_seqlens (B*S segments, token units, b-major).
         B, P, T, d = x.shape
@@ -157,11 +164,17 @@ class L1Block(nn.Module):
         q, k, v = qkv.unbind(dim=1)  # (total, H, hd)
 
         # RoPE coord per packed token: index = clinical depth (per slot, over T),
-        # time = arange(T) (per slot). Flat (clip, slot, time) order.
-        idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)  # (total,)
-        tt = torch.arange(T, device=x.device)[None, None, :].expand(B, P, T).reshape(total)
+        # time = arange(T) (per slot). Flat (clip, slot, time) order. ``rope_cs`` (the
+        # B5 hoist) is the tower-precomputed (cos, sin) table shared across all L1
+        # blocks — identical to recomputing here (same idx/t, same fp32 table), so
+        # when supplied we skip both the idx/t build and the cos/sin math.
         qh, kh = q.transpose(0, 1), k.transpose(0, 1)  # (H, total, hd) — seq=total
-        qh, kh = self.rope(qh, kh, idx, tt)
+        if rope_cs is None:
+            idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)  # (total,)
+            tt = torch.arange(T, device=x.device)[None, None, :].expand(B, P, T).reshape(total)
+            qh, kh = self.rope(qh, kh, idx, tt)
+        else:
+            qh, kh = self.rope.rotate(qh, kh, rope_cs[0], rope_cs[1])
         q, k = qh.transpose(0, 1), kh.transpose(0, 1)  # (total, H, hd)
         # RoPE promotes q,k to fp32 (cos/sin fp32 buffers); align to v for flash
         # (strict/flash needs q,k,v same dtype). No-op under fp32.
@@ -174,9 +187,14 @@ class L1Block(nn.Module):
         return ctx
 
     def forward_packed(
-        self, x: Tensor, plan: PackPlan, *, backend: str = "auto"
+        self,
+        x: Tensor,
+        plan: PackPlan,
+        *,
+        backend: str = "auto",
+        rope_cs: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
-        x = x + self._attn_packed(self.norm1(x), plan, backend=backend)
+        x = x + self._attn_packed(self.norm1(x), plan, backend=backend, rope_cs=rope_cs)
         x = x + self.mlp(self.norm2(x))
         return x
 

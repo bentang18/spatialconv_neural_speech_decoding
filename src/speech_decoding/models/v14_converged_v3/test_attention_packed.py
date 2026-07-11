@@ -93,6 +93,27 @@ def test_l1_packed_whole_shaft_masked_matches_visible_shaft() -> None:
     _assert_visible_match(full, padded, visible)
 
 
+def test_l1_packed_precomputed_rope_cs_matches_recompute() -> None:
+    # B5 hoist: feeding forward_packed a precomputed cos/sin table must be
+    # BIT-IDENTICAL to letting the block recompute it (rope_cs=None). Proves the
+    # tower can build the table once and share it across every L1 block.
+    sc, geom = _two_shaft()
+    N = 5
+    blk = L1Block(D, H).eval()
+    x = torch.randn(2, N, T, D)
+    plan = build_pack_plan(geom, n_time=T, batch=2, n_selected=N, visible=None)
+    xg = _gather(x, plan)
+    B, P = xg.shape[0], xg.shape[1]
+    total = B * P * T
+    idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)
+    tt = torch.arange(T)[None, None, :].expand(B, P, T).reshape(total)
+    cos, sin = blk.rope.cos_sin(idx, tt)
+
+    recompute = blk.forward_packed(xg, plan, backend="reference")
+    hoisted = blk.forward_packed(xg, plan, backend="reference", rope_cs=(cos, sin))
+    assert torch.equal(recompute, hoisted)
+
+
 # ── L2 ───────────────────────────────────────────────────────────────────────
 
 

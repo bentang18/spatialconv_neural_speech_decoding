@@ -81,8 +81,17 @@ class L1RoPE(nn.Module):
         self.register_buffer("idx_freq", idx_freq, persistent=False)
         self.register_buffer("t_freq", t_freq, persistent=False)
 
-    def _cos_sin(self, idx: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
-        # idx, t: (..., seq) → cos/sin: (..., seq, head_dim)
+    def cos_sin(self, idx: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
+        """The (..., seq, head_dim) fp32 cos/sin rotary table for coords (idx, t).
+
+        B5 hoist (#46): every L1RoPE instance is identical (same head_dim, same
+        bases), so within one tower forward the table is IDENTICAL across all L1
+        blocks and across every head. Building it once here and feeding
+        :meth:`rotate` in each block — instead of each block recomputing the
+        ``pow``/``cos``/``sin``/``repeat_interleave`` over ~B·P·T tokens — is
+        bit-identical (same fp32 math) and drops (n_L1−1) redundant table builds
+        per tower. Kept fp32: the rope math runs in fp32 and the result is
+        down-cast AFTER (attention.py); a bf16 table would change the rounding."""
         ang_idx = idx[..., None].float() * self.idx_freq  # (..., seq, pairs)
         ang_t = t[..., None].float() * self.t_freq
         ang = torch.cat([ang_idx, ang_t], dim=-1)  # (..., seq, head_dim/2)
@@ -90,16 +99,24 @@ class L1RoPE(nn.Module):
         sin = ang.sin().repeat_interleave(2, dim=-1)
         return cos, sin
 
-    def forward(
-        self, q: Tensor, k: Tensor, idx: Tensor, t: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """q, k: (..., H, seq, head_dim); idx, t: (..., seq) (no head axis)."""
-        cos, sin = self._cos_sin(idx, t)  # (..., seq, head_dim)
+    @staticmethod
+    def rotate(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply a precomputed (from :meth:`cos_sin`) rotary table to q, k.
+
+        q, k: (..., H, seq, head_dim); cos, sin: (..., seq, head_dim) — the head
+        axis is broadcast in via ``unsqueeze(-3)``."""
         cos = cos.unsqueeze(-3)  # (..., 1, seq, head_dim) → broadcast over heads
         sin = sin.unsqueeze(-3)
         q_out = q * cos + _rotate_half(q) * sin
         k_out = k * cos + _rotate_half(k) * sin
         return q_out, k_out
+
+    def forward(
+        self, q: Tensor, k: Tensor, idx: Tensor, t: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """q, k: (..., H, seq, head_dim); idx, t: (..., seq) (no head axis)."""
+        cos, sin = self.cos_sin(idx, t)  # (..., seq, head_dim)
+        return self.rotate(q, k, cos, sin)
 
 
 class ParcelIdentityEmbed(nn.Module):

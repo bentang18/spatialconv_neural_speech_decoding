@@ -110,6 +110,46 @@ def test_default_base_makes_every_pair_position_live() -> None:
     assert (R_time * dead.t_freq < 1.0).sum() >= 6
 
 
+def test_cos_sin_and_rotate_reconstruct_forward_exactly() -> None:
+    # B5 hoist mechanism: forward(q,k,idx,t) must be BIT-IDENTICAL to
+    # rotate(q,k,*cos_sin(idx,t)). This is what lets the tower build the table ONCE
+    # and feed every L1 block instead of each block recomputing it.
+    rope = L1RoPE(head_dim=64)
+    q, k = _qk(4, 6, 64)
+    idx = torch.tensor([[0, 1, 2, 4, 5, 6]])
+    t = torch.tensor([[0, 1, 2, 3, 4, 5]])
+    q_ref, k_ref = rope(q, k, idx, t)
+    cos, sin = rope.cos_sin(idx, t)
+    q_hoist, k_hoist = rope.rotate(q, k, cos, sin)
+    assert torch.equal(q_ref, q_hoist)  # exact, not allclose
+    assert torch.equal(k_ref, k_hoist)
+
+
+def test_cos_sin_is_fp32_regardless_of_input_dtype() -> None:
+    # The table must stay fp32 (the rope math runs in fp32, result down-cast AFTER)
+    # — a bf16 table would change the rounding and break equivalence.
+    rope = L1RoPE(head_dim=64)
+    idx = torch.tensor([[0, 1, 2]])
+    t = torch.tensor([[0, 1, 2]])
+    cos, sin = rope.cos_sin(idx, t)
+    assert cos.dtype == torch.float32 and sin.dtype == torch.float32
+
+
+def test_shared_table_matches_per_instance_recompute() -> None:
+    # Two L1RoPE instances with the same head_dim/bases produce the SAME table, so a
+    # table built by block[0].rope applied via block[1].rope.rotate is exact — the
+    # invariant the tower relies on to share one table across all L1 blocks.
+    a, b = L1RoPE(head_dim=64), L1RoPE(head_dim=64)
+    q, k = _qk(2, 5, 64)
+    idx = torch.tensor([[0, 1, 2, 3, 4]])
+    t = torch.tensor([[0, 1, 2, 3, 4]])
+    cos, sin = a.cos_sin(idx, t)  # built by instance a
+    q_shared, k_shared = b.rotate(q, k, cos, sin)  # applied via instance b
+    q_ref, k_ref = b(q, k, idx, t)  # b recomputes its own
+    assert torch.equal(q_ref, q_shared)
+    assert torch.equal(k_ref, k_shared)
+
+
 def test_parcel_identity_shape_and_indexing() -> None:
     emb = ParcelIdentityEmbed(n_parcels=74, d_model=256)
     parcel_id = torch.tensor([[3, 3, 7, 0]])

@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+import torch
 from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.attention import LN_EPS, L1Block, L2Block
@@ -85,6 +86,21 @@ class V3Tower(nn.Module):
         self.apply(init_transformer_weights)
         self._rescale_blocks()
 
+    def _rope_cos_sin(
+        self, x: Tensor, plan: PackPlan
+    ) -> tuple[Tensor, Tensor] | None:
+        # Build the shared L1 rotary table once for this tower forward (B5 #46).
+        # Uses the first L1 block's rope; every L1RoPE here is identical so the table
+        # serves all L1 blocks. None when the tower has no L1 block.
+        first_l1 = next((b for b in self.blocks if isinstance(b, L1Block)), None)
+        if first_l1 is None:
+            return None
+        B, P, T, _ = x.shape
+        total = B * P * T
+        idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)  # (total,)
+        tt = torch.arange(T, device=x.device)[None, None, :].expand(B, P, T).reshape(total)
+        return first_l1.rope.cos_sin(idx, tt)
+
     def _rescale_blocks(self) -> None:
         # V-JEPA 2 vision_transformer.py:231-237 / predictor.py:206-212 — divide the
         # attn out-proj and mlp.fc2 by sqrt(2·layer_id) (1-indexed) so residual-branch
@@ -139,10 +155,15 @@ class V3Tower(nn.Module):
     ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
         # x: (B, P, T, d); parcel_packed: (B, P) long — parcel id per packed slot.
         x = x + self.parcel_embed(parcel_packed).to(x.dtype)[:, :, None, :]
+        # B5 hoist (#46): the L1 rotary cos/sin table is identical across every L1
+        # block in this tower (same head_dim/bases, same plan coords) — build it ONCE
+        # from the plan and share, instead of recomputing it in each of the n_L1
+        # blocks. Bit-identical (same fp32 table, same rotate math).
+        rope_cs = self._rope_cos_sin(x, plan)
         taps: dict[int, Tensor] = {}
         for i, b in enumerate(self.blocks):
             if isinstance(b, L1Block):
-                x = b.forward_packed(x, plan, backend=backend)
+                x = b.forward_packed(x, plan, backend=backend, rope_cs=rope_cs)
             else:
                 x = b.forward_packed(x)
             if (i + 1) in tap_blocks:
