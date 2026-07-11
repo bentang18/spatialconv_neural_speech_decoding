@@ -51,11 +51,16 @@ class V3ConvergedModel(nn.Module):
         n_parcels: int,
         mask_cfg: V3MaskConfig = V3MaskConfig(),
         target_ln: bool = True,
+        deep_sup: bool = True,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
         # EMAs the patch-embed too), so the model owns only the objective + mask cfg.
-        self.objective = V3JepaObjective(n_parcels=n_parcels, target_ln=target_ln)
+        # deep_sup default ON (#61, Ben-greenlit copy-exactly); deep_sup=False = the
+        # single-tap ablation arm.
+        self.objective = V3JepaObjective(
+            n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup
+        )
         self.mask_cfg = mask_cfg
 
     def forward(

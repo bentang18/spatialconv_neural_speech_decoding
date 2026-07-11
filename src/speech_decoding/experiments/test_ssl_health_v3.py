@@ -47,9 +47,12 @@ def test_collect_taps_loss_identical_and_taps_finite() -> None:
         assert isinstance(t, torch.Tensor) and not t.requires_grad
         assert t.shape[-1] == 256 and torch.isfinite(t).all()
     # intra tier is always populated (whole shafts round to 0 on a 2-shaft synth);
-    # pred/target rows must be paired and same-shape.
+    # pred/target rows must be paired and same-shape. Under deep-sup (#61) the
+    # prediction/target space is the n_levels-concatenated vector (4·256=1024), not
+    # the single-tap 256 — the monitor's EV/VR read that full target vector.
+    tgt_dim = mod.model.objective.n_levels * 256
     assert taps["pred_intra"].shape == taps["tgt_intra"].shape
-    assert taps["pred_intra"].shape[-1] == 256
+    assert taps["pred_intra"].shape[-1] == tgt_dim
     assert not taps["pred_intra"].requires_grad
     # whole/intra rows partition the masked (contact,slot) positions exactly.
     total = taps["pred_whole"].shape[0] + taps["pred_intra"].shape[0]

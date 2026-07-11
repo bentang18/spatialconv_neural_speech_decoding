@@ -178,7 +178,10 @@ def build_v3_training(
     sessions + a stub parcel_fn (no caches, no wandb, CPU).
     """
     mask_cfg = V3MaskConfig()  # locked two-tier config (its own defaults)
-    model = V3ConvergedModel(n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg)
+    model = V3ConvergedModel(
+        n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
+        deep_sup=getattr(args, "deep_sup", True),
+    )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps, min_lr_ratio=args.min_lr_ratio,
@@ -300,6 +303,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=50)
+    p.add_argument("--deep-sup", dest="deep_sup",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="deep self-supervision (#61, V-JEPA 2.1 copy-exactly): tap "
+                        "encoder blocks {3,6,9,12}, per-level affine LN, concat → "
+                        "fusion-MLP → predictor → wide proj → per-level double-normed "
+                        "targets. --no-deep-sup = the single-tap ablation arm")
     p.add_argument("--compile", dest="compile", action="store_true",
                    help="torch.compile the model, dynamic=False (audit lever; apply "
                         "LAST). v2 measured >1.5x; validate the flex-nesting on G4")

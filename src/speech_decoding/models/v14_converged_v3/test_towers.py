@@ -86,11 +86,12 @@ def test_predictor_is_narrow_128_four_heads() -> None:
 
 
 def test_encoder_forward_preserves_shape() -> None:
+    # Deep-sup default (#61): the encoder concatenates 4 tapped levels → 4·256.
     sc, geom = _session()
     enc = build_encoder(n_parcels=8).eval()
     x = torch.randn(1, 5, T, 256)
     out = enc(x, geom, sc.parcel_id)
-    assert out.shape == (1, 5, T, 256)
+    assert out.shape == (1, 5, T, 4 * 256)
 
 
 def test_predictor_forward_preserves_shape() -> None:
@@ -122,12 +123,11 @@ def test_parcel_embed_added_once_at_tower_input() -> None:
 
 
 def test_tower_has_terminal_layernorm() -> None:
-    # V-JEPA 2 applies an affine terminal LayerNorm to BOTH towers before the
-    # downstream projection: encoder `self.norm` (vision_transformer.py:210) and
-    # predictor `predictor_norm` (predictor.py:241). v2 carried the same
-    # (pred_norm / ln_out); the v3 rewrite dropped it — restore it here so the
-    # predictor output is unit-scale against the LN'd target (no scale runaway),
-    # and the encoder tap / teacher target match upstream `affinefree(affine(h))`.
+    # Terminal affine LayerNorm before the downstream projection. Deep-sup encoder:
+    # per-level `norms_block` (the deepest doubles as terminal, upstream `norms_block`
+    # `vision_transformer.py:176`). Predictor (never deep-sup): `norm_out` = upstream
+    # `predictor_norm` (predictor.py:176). Both keep outputs unit-scale against the
+    # affine-free-LN'd target (no scale runaway), matching `affinefree(affine(h))`.
     import torch.nn as nn
 
     from speech_decoding.models.v14_converged_v3.towers import (
@@ -135,16 +135,20 @@ def test_tower_has_terminal_layernorm() -> None:
         build_predictor,
     )
 
-    for build in (build_encoder, build_predictor):
-        tower = build(n_parcels=8).eval()
-        assert isinstance(tower.norm_out, nn.LayerNorm)
-    sc, geom = _session()
     enc = build_encoder(n_parcels=8).eval()
+    assert enc.norm_out is None
+    assert all(isinstance(n, nn.LayerNorm) for n in enc.norms_block)
+    pred = build_predictor(n_parcels=8).eval()
+    assert isinstance(pred.norm_out, nn.LayerNorm)
+
+    sc, geom = _session()
     x = torch.randn(1, 5, T, 256) * 7.0  # deliberately off-scale input
-    out = enc(x, geom, sc.parcel_id)
-    # fresh affine LN (gamma=1, beta=0) ⇒ each token unit-scaled over the feature dim
-    assert out.mean(dim=-1).abs().max() < 1e-4
-    assert (out.var(dim=-1, unbiased=False) - 1.0).abs().max() < 1e-2
+    out = enc(x, geom, sc.parcel_id)  # (1, 5, T, 4·256)
+    # each 256-level is a fresh affine LN (gamma=1, beta=0) ⇒ unit-scaled per token
+    for lvl in range(4):
+        chunk = out[..., lvl * 256 : (lvl + 1) * 256]
+        assert chunk.mean(dim=-1).abs().max() < 1e-4
+        assert (chunk.var(dim=-1, unbiased=False) - 1.0).abs().max() < 1e-2
 
 
 def test_tower_init_matches_vjepa2() -> None:

@@ -121,23 +121,99 @@ def test_teacher_lags_then_moves_toward_online() -> None:
 
 
 def test_target_ln_is_applied() -> None:
-    # With the terminal affine LayerNorm on the tower, target_ln is ~a no-op at init
-    # (both give unit-scale targets). Its real job is to RE-normalize when the
-    # terminal affine gamma/beta drift off identity during training — upstream stacks
-    # both (affine `self.norm` THEN affine-free target LN). Force the drift on the
-    # teacher's terminal norm and confirm target_ln then changes the loss.
+    # With the per-level affine LayerNorm on the tower, target_ln is ~a no-op at init
+    # (both give unit-scale targets). Its real job is to RE-normalize when the affine
+    # gamma/beta drift off identity during training — upstream stacks both (affine
+    # `norms_block` THEN affine-free per-level target LN). Force the drift on the
+    # teacher's deepest-level norm (deep-sup default: no `norm_out`) and confirm
+    # target_ln then changes the loss.
     sc, geom = _session()
     bands, mask = _batch(sc)
     torch.manual_seed(0)
     obj = V3JepaObjective(n_parcels=N_PARCELS, target_ln=True)
     with torch.no_grad():
-        obj.teacher.model.encoder.norm_out.weight.mul_(3.0)
-        obj.teacher.model.encoder.norm_out.bias.add_(2.0)
+        obj.teacher.model.encoder.norms_block[-1].weight.mul_(3.0)
+        obj.teacher.model.encoder.norms_block[-1].bias.add_(2.0)
     obj.target_ln = True
     lo = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss
     obj.target_ln = False
     lf = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss
     assert not torch.allclose(lo, lf)
+
+
+def test_deep_sup_default_wiring() -> None:
+    # #61 deep-sup default: the encoder→predictor map is upstream's 2-layer
+    # `predictor_embed` fusion MLP Linear(4·256→256)·GELU·Linear(256→128), and
+    # `pred_to_target` is the ONE wide Linear(128→4·256) emitting all levels. The
+    # teacher/online encoders are deep-sup (4 per-level norms, no norm_out).
+    import torch.nn as nn
+
+    from speech_decoding.models.v14_converged_v3.towers import N_LEVELS
+
+    obj = _obj()
+    assert obj.deep_sup and obj.n_levels == N_LEVELS == 4
+    assert isinstance(obj.enc_to_pred, nn.Sequential)
+    lins = [m for m in obj.enc_to_pred if isinstance(m, nn.Linear)]
+    assert len(lins) == 2
+    assert lins[0].in_features == 4 * 256 and lins[0].out_features == 256
+    assert lins[1].in_features == 256 and lins[1].out_features == 128
+    assert any(isinstance(m, nn.GELU) for m in obj.enc_to_pred)
+    assert isinstance(obj.pred_to_target, nn.Linear)
+    assert obj.pred_to_target.in_features == 128
+    assert obj.pred_to_target.out_features == 4 * 256
+    assert obj.online.encoder.norm_out is None
+    assert len(obj.online.encoder.norms_block) == 4
+
+
+def test_deep_sup_target_is_per_level_double_normed() -> None:
+    # The teacher emits 4 concatenated levels (each already affine-`norms_block`'d);
+    # `_ln_target` with n_levels=4 applies a SECOND parameter-free LN to EACH 256-chunk
+    # independently ⇒ every chunk is zero-mean/unit-var, not the whole 1024 vector.
+    from speech_decoding.models.v14_converged_v3.objective import _ln_target
+
+    torch.manual_seed(1)
+    t = torch.randn(2, 5, 3, 4 * 256) * 7.0 + 3.0
+    out = _ln_target(t, n_levels=4)
+    assert out.shape == t.shape
+    for lvl in range(4):
+        chunk = out[..., lvl * 256 : (lvl + 1) * 256]
+        assert chunk.mean(-1).abs().max() < 1e-5
+        assert (chunk.var(-1, unbiased=False) - 1.0).abs().max() < 1e-3
+    # a single whole-vector LN would NOT leave each chunk unit-var → the two differ
+    whole = _ln_target(t, n_levels=1)
+    assert not torch.allclose(out, whole, atol=1e-3)
+
+
+def test_single_tap_arm_wiring() -> None:
+    # deep_sup=False = the single-tap ablation arm: plain Linear maps, encoder norm_out.
+    import torch.nn as nn
+
+    obj = V3JepaObjective(n_parcels=N_PARCELS, deep_sup=False)
+    assert not obj.deep_sup and obj.n_levels == 1
+    assert isinstance(obj.enc_to_pred, nn.Linear)
+    assert obj.enc_to_pred.in_features == 256 and obj.enc_to_pred.out_features == 128
+    assert isinstance(obj.pred_to_target, nn.Linear)
+    assert obj.pred_to_target.in_features == 128 and obj.pred_to_target.out_features == 256
+    assert obj.online.encoder.norm_out is not None
+    assert obj.online.encoder.norms_block is None
+    # still trains end-to-end
+    sc, geom = _session()
+    bands, mask = _batch(sc)
+    out = obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum()))
+    assert torch.isfinite(out.loss) and out.loss.requires_grad
+
+
+def test_single_tap_packed_matches_padded() -> None:
+    # #24 equivalence must also hold in the single-tap arm (the ablation must be a
+    # faithful control, not a differently-wired path).
+    sc, geom = _session()
+    torch.manual_seed(0)
+    obj = V3JepaObjective(n_parcels=N_PARCELS, deep_sup=False).eval()
+    bands, mask = _batch(sc, n_masked_contacts=5)
+    m = int(mask[0].sum())
+    packed = obj(bands, geom, sc.parcel_id, mask, m_masked=m, backend="reference")
+    padded = obj._forward_padded(bands, geom, sc.parcel_id, mask)
+    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
 
 
 def test_no_nan_when_a_whole_shaft_is_masked() -> None:

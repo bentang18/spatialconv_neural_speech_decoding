@@ -42,6 +42,13 @@ PRED_LAYOUT: tuple[str, ...] = ("L2", "L1", "L1") * 4
 ENC_D_MODEL, ENC_N_HEADS = 256, 4  # head_dim 64
 PRED_D_MODEL, PRED_N_HEADS = 128, 4  # head_dim 32
 
+# Deep-supervision taps (V-JEPA 2.1, #61): the depth-12 encoder is tapped at the
+# equally-spaced quartiles — upstream `hierarchical_layers=[2,5,8,11]` 0-indexed =
+# {3,6,9,12} 1-indexed (`app/vjepa_2_1/models/vision_transformer.py:149`). Each tap
+# gets its own affine `norms_block` LN; the outputs are concatenated → [.,4·d].
+ENC_SUP_TAPS: tuple[int, ...] = (3, 6, 9, 12)
+N_LEVELS = len(ENC_SUP_TAPS)
+
 
 class V3Tower(nn.Module):
     """Pre-norm L1/L2 block stack; forward dispatches per block kind."""
@@ -53,6 +60,8 @@ class V3Tower(nn.Module):
         d_model: int,
         n_heads: int,
         n_parcels: int,
+        deep_sup: bool = False,
+        sup_taps: Sequence[int] = (),
     ) -> None:
         super().__init__()
         # Parcel/DKT identity is added ONCE here at the tower input (V-JEPA 2.1
@@ -69,14 +78,30 @@ class V3Tower(nn.Module):
             else:
                 raise ValueError(f"unknown block kind {kind!r}")
         self.blocks = nn.ModuleList(blocks)
-        # Terminal affine LayerNorm, applied to BOTH towers before the downstream
-        # projection — V-JEPA 2 encoder `self.norm` (vision_transformer.py:210) and
-        # predictor `predictor_norm` (predictor.py:241), also present in v2
-        # (pred_norm / ln_out). Keeps the predictor output unit-scale against the
-        # affine-free-LN'd target (kills the scale-runaway incentive: the target is
-        # already unit, so the affine gamma has nothing to inflate toward), and makes
-        # the teacher target `affinefree_LN(affine_LN(h))` — the exact upstream form.
-        self.norm_out = nn.LayerNorm(d_model, eps=LN_EPS)
+        self.deep_sup = bool(deep_sup)
+        self.sup_taps = tuple(int(b) for b in sup_taps) if self.deep_sup else ()
+        if self.deep_sup:
+            # DEEP SUPERVISION (#61, V-JEPA 2.1): tap ``sup_taps`` blocks, each through
+            # its OWN affine LayerNorm (`norms_block`, one per level), and CONCATENATE
+            # → [.,n_levels·d]. There is NO separate terminal ``norm_out``: upstream
+            # reuses the deepest level's norm as the terminal norm
+            # (`vision_transformer.py:176-178, 328-340` — training path returns
+            # `cat(hier)` with no extra `self.norm`).
+            if not self.sup_taps:
+                raise ValueError("deep_sup=True requires a non-empty sup_taps")
+            self.norms_block = nn.ModuleList(
+                [nn.LayerNorm(d_model, eps=LN_EPS) for _ in self.sup_taps]
+            )
+            self.norm_out = None
+        else:
+            # Terminal affine LayerNorm (single-tap path) — V-JEPA 2 encoder
+            # `self.norm` / predictor `predictor_norm`, also v2 (pred_norm / ln_out).
+            # Keeps the predictor output unit-scale against the affine-free-LN'd target
+            # (kills the scale-runaway incentive) and makes the target the exact
+            # upstream `affinefree_LN(affine_LN(h))` form. The predictor ALWAYS uses
+            # this (deep_sup=False) — it emits from one wide proj on its final block.
+            self.norms_block = None
+            self.norm_out = nn.LayerNorm(d_model, eps=LN_EPS)
         # V-JEPA 2 init (vision_transformer.py:130-159 @204698b4): Linear
         # trunc_normal(0.02)+zero-bias / LN weight 1 bias 0, then depth-scaled
         # residual rescale div_(sqrt(2·layer_id)), 1-indexed, on attn out-proj +
@@ -128,11 +153,14 @@ class V3Tower(nn.Module):
         # residual stream back to fp32; cast keeps it bf16. No-op under fp32.
         x = x + self.parcel_embed(parcel_id).to(x.dtype)[None, :, None, :]
         taps: dict[int, Tensor] = {}
+        levels: list[Tensor] = []
         for i, b in enumerate(self.blocks):
             x = b(x, geom, visible) if isinstance(b, L1Block) else b(x, visible)
             if (i + 1) in tap_blocks:
                 taps[i + 1] = x
-        out = self.norm_out(x)
+            if self.deep_sup and (i + 1) in self.sup_taps:
+                levels.append(self.norms_block[self.sup_taps.index(i + 1)](x))
+        out = torch.cat(levels, dim=-1) if self.deep_sup else self.norm_out(x)
         if tap_blocks:
             return out, taps
         return out
@@ -161,6 +189,7 @@ class V3Tower(nn.Module):
         # blocks. Bit-identical (same fp32 table, same rotate math).
         rope_cs = self._rope_cos_sin(x, plan)
         taps: dict[int, Tensor] = {}
+        levels: list[Tensor] = []
         for i, b in enumerate(self.blocks):
             if isinstance(b, L1Block):
                 x = b.forward_packed(x, plan, backend=backend, rope_cs=rope_cs)
@@ -168,19 +197,27 @@ class V3Tower(nn.Module):
                 x = b.forward_packed(x)
             if (i + 1) in tap_blocks:
                 taps[i + 1] = x
-        out = self.norm_out(x)
+            if self.deep_sup and (i + 1) in self.sup_taps:
+                levels.append(self.norms_block[self.sup_taps.index(i + 1)](x))
+        out = torch.cat(levels, dim=-1) if self.deep_sup else self.norm_out(x)
         if tap_blocks:
             return out, taps
         return out
 
 
-def build_encoder(*, n_parcels: int) -> V3Tower:
+def build_encoder(*, n_parcels: int, deep_sup: bool = True) -> V3Tower:
+    # deep_sup default ON (#61, Ben-greenlit "copy exactly"): tap {3,6,9,12} → 4
+    # affine-normed levels concatenated. deep_sup=False = the single-tap ablation arm.
     return V3Tower(
-        ENC_LAYOUT, d_model=ENC_D_MODEL, n_heads=ENC_N_HEADS, n_parcels=n_parcels
+        ENC_LAYOUT, d_model=ENC_D_MODEL, n_heads=ENC_N_HEADS, n_parcels=n_parcels,
+        deep_sup=deep_sup, sup_taps=ENC_SUP_TAPS if deep_sup else (),
     )
 
 
 def build_predictor(*, n_parcels: int) -> V3Tower:
+    # The predictor is NEVER deep-supervised: it emits all levels from one wide proj
+    # on its final block (objective.pred_to_target), with the terminal norm_out =
+    # upstream `predictor_norm`. It does not tap its own intermediate blocks.
     return V3Tower(
         PRED_LAYOUT, d_model=PRED_D_MODEL, n_heads=PRED_N_HEADS, n_parcels=n_parcels
     )

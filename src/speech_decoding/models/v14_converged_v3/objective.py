@@ -43,6 +43,7 @@ from speech_decoding.models.v14_converged_v3.packing import (
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import SpectralStem
 from speech_decoding.models.v14_converged_v3.towers import (
+    N_LEVELS,
     PRED_D_MODEL,
     build_encoder,
     build_predictor,
@@ -54,9 +55,21 @@ D_MODEL = 256
 EMA_TAU = 0.99925  # V-JEPA 2 / 2.1 default (B26 lock)
 
 
-def _ln_target(t: Tensor) -> Tensor:
-    """Affine-free V-JEPA target norm (matches v14_converged_v2._ln_target)."""
-    return F.layer_norm(t.detach(), (t.shape[-1],))
+def _ln_target(t: Tensor, n_levels: int = 1) -> Tensor:
+    """Affine-free V-JEPA target norm (matches v14_converged_v2._ln_target).
+
+    Deep-sup (#61, ``n_levels>1``): the teacher emits ``n_levels`` concatenated
+    per-level chunks (each already through the encoder's affine ``norms_block``), and
+    upstream applies a SECOND parameter-free ``F.layer_norm`` to EACH chunk
+    independently (`train.py:591-611`) — the DOUBLE norm. Split, LN each, re-cat.
+    ``n_levels==1`` is exactly the single-tap affine-free LN over the whole vector."""
+    t = t.detach()
+    if n_levels == 1:
+        return F.layer_norm(t, (t.shape[-1],))
+    d = t.shape[-1] // n_levels
+    return torch.cat(
+        [F.layer_norm(c, (d,)) for c in t.split(d, dim=-1)], dim=-1
+    )
 
 
 @dataclass
@@ -76,10 +89,10 @@ class _TargetTower(nn.Module):
     no teacher counterpart in JEPA).
     """
 
-    def __init__(self, *, n_parcels: int) -> None:
+    def __init__(self, *, n_parcels: int, deep_sup: bool = True) -> None:
         super().__init__()
         self.stem = SpectralStem(D_MODEL)
-        self.encoder = build_encoder(n_parcels=n_parcels)
+        self.encoder = build_encoder(n_parcels=n_parcels, deep_sup=deep_sup)
 
     def forward(
         self,
@@ -123,17 +136,34 @@ class V3JepaObjective(nn.Module):
         n_parcels: int,
         target_ln: bool = True,
         ema_tau: float = EMA_TAU,
+        deep_sup: bool = True,
     ) -> None:
         super().__init__()
+        self.deep_sup = bool(deep_sup)
+        self.n_levels = N_LEVELS if self.deep_sup else 1
         # online target path (stem + encoder) — every param here is EMA-mirrored.
-        self.online = _TargetTower(n_parcels=n_parcels)
+        self.online = _TargetTower(n_parcels=n_parcels, deep_sup=self.deep_sup)
         self.teacher = EmaTeacher(
             self.online, coeff_schedule=fixed_ema_schedule(tau=ema_tau)
         )
         self.predictor = build_predictor(n_parcels=n_parcels)
-        self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
-        self.pred_to_target = nn.Linear(PRED_D_MODEL, D_MODEL)
-        init_transformer_weights(self.enc_to_pred)  # V-JEPA 2 trunc_normal(0.02)
+        # Encoder→predictor input map. Deep-sup (#61): the encoder emits n_levels
+        # concatenated levels, so this is upstream's ``predictor_embed`` 2-layer fusion
+        # MLP (`predictor.py:84-89`) — Linear(n_levels·d → d) · GELU · Linear(d →
+        # d_pred), NO LayerNorm before/after. Single-tap: a plain Linear(d → d_pred).
+        # ``pred_to_target`` is upstream ``predictor_proj`` — ONE wide Linear emitting
+        # all n_levels·d target dims from the predictor's final (norm_out'd) block.
+        if self.deep_sup:
+            self.enc_to_pred = nn.Sequential(
+                nn.Linear(N_LEVELS * D_MODEL, D_MODEL),
+                nn.GELU(),
+                nn.Linear(D_MODEL, PRED_D_MODEL),
+            )
+            self.pred_to_target = nn.Linear(PRED_D_MODEL, N_LEVELS * D_MODEL)
+        else:
+            self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
+            self.pred_to_target = nn.Linear(PRED_D_MODEL, D_MODEL)
+        self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
         init_transformer_weights(self.pred_to_target)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit: mask_token zero-init).
         # Stored 3-D (1, 1, D) to match upstream predictor.py:64-65: the shared
@@ -192,7 +222,8 @@ class V3JepaObjective(nn.Module):
         # EMA teacher over all N (packed, full_plan order) → targets
         with torch.no_grad():
             tgt = self.teacher(bands, full_plan, full_parcel, backend=backend)
-        tgt = _ln_target(tgt) if self.target_ln else stop_grad(tgt)  # (B,N,T,256) full order
+        # (B,N,T,n_levels·256) full order; deep-sup per-level double-norm (see _ln_target)
+        tgt = _ln_target(tgt, self.n_levels) if self.target_ln else stop_grad(tgt)
 
         # predictor input assembly: enc_to_pred(z) at visible, mask-query at masked
         # (built in CONTACT order, then gathered into the predictor's all-N order).
@@ -270,7 +301,7 @@ class V3JepaObjective(nn.Module):
             z = self.online.forward_padded(bands, geom, parcel_id, visible)
         with torch.no_grad():
             tgt = self.teacher.model.forward_padded(bands, geom, parcel_id, None)
-        tgt = _ln_target(tgt) if self.target_ln else stop_grad(tgt)
+        tgt = _ln_target(tgt, self.n_levels) if self.target_ln else stop_grad(tgt)
         zp = self.enc_to_pred(z)
         m = mask[:, :, None, None]
         pred_in = torch.where(m, self.mask_token, zp)
