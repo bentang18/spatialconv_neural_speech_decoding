@@ -301,10 +301,13 @@ class V3JepaObjective(nn.Module):
         whole_t = whole_packed[:, :, None].expand(B, N, T)
         intra_t = intra_packed[:, :, None].expand(B, N, T)
         p, t = pred.detach(), tgt.detach()
-        out.update(
-            pred_whole=p[whole_t].reshape(-1, d_out), tgt_whole=t[whole_t].reshape(-1, d_out),
-            pred_intra=p[intra_t].reshape(-1, d_out), tgt_intra=t[intra_t].reshape(-1, d_out),
-        )
+        # NB: item-assign, NOT dict.update() — Dynamo can't trace dict.update, so
+        # .update() here graph-breaks and the resume frame's guard churns to the
+        # recompile_limit (64) → eager fallback on this per-step monitor path.
+        out["pred_whole"] = p[whole_t].reshape(-1, d_out)
+        out["tgt_whole"] = t[whole_t].reshape(-1, d_out)
+        out["pred_intra"] = p[intra_t].reshape(-1, d_out)
+        out["tgt_intra"] = t[intra_t].reshape(-1, d_out)
         return out
 
     def _forward_padded(
