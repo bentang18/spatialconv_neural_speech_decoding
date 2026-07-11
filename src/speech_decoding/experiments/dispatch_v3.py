@@ -251,9 +251,16 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
 
         # v3 has NO dormant requires_grad params (single predictor, one loss ⇒ every
         # trainable param gets a gradient each step), so find_unused=False is safe.
-        # static_graph stays False: the ragged per-session electrode count varies the
-        # autograd graph structure batch-to-batch.
-        kwargs["strategy"] = DDPStrategy(find_unused_parameters=False)
+        # static_graph (v2 `--ddp-static-graph`, default True): the per-session
+        # electrode count varies TENSOR SHAPES, but the autograd graph STRUCTURE is
+        # identical every step (same blocks, same params all participate) — which is
+        # what static_graph requires, not fixed shapes. v2 ran static_graph=True with
+        # the same session-grouped ragged batching, and it composes with torch.compile
+        # (fewer DDP reducer re-analyses). Only active on multi-GPU (single-GPU launch
+        # never builds a DDPStrategy).
+        kwargs["strategy"] = DDPStrategy(
+            find_unused_parameters=False, static_graph=args.ddp_static_graph
+        )
     return pl.Trainer(**kwargs)
 
 
@@ -294,7 +301,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    type=int, default=1)
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=50)
     p.add_argument("--compile", dest="compile", action="store_true",
-                   help="torch.compile the model (audit lever; apply LAST)")
+                   help="torch.compile the model, dynamic=False (audit lever; apply "
+                        "LAST). v2 measured >1.5x; validate the flex-nesting on G4")
+    p.add_argument("--ddp-static-graph", dest="ddp_static_graph",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="DDP static_graph (multi-GPU only; v2 --ddp-static-graph)")
     # --- io ---
     p.add_argument("--ckpt-dir", default=None, help="checkpoint + wandb save dir")
     p.add_argument("--ckpt-ladder-every", dest="ckpt_ladder_every", type=int,
@@ -332,7 +343,26 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:
-        module.model = torch.compile(module.model)  # type: ignore[assignment]
+        # dynamic=False (v2 `--no-compile-dynamic`): every shape v3 sees is STATIC
+        # per session — session-homogeneous batching + the varlen constant-masked-count
+        # invariant fix M_vis (online) and N (teacher/predictor) per session. Letting
+        # Dynamo specialize each shape gives the fast static graphs v2 measured >1.5×
+        # from; the dynamic path would trace slower symbolic-shape graphs and can
+        # graph-break. Cost: one recompile per distinct session shape ⇒ raise the
+        # recompile cap above the cohort's shape count (online + full-N per session,
+        # ×headroom) so we specialize instead of falling back to eager.
+        #
+        # OPEN (G4 measures): v3's L1 uses FlexAttention which SELF-compiles
+        # (varlen.py `_flex_fn`), so torch.compile(model) wraps an already-compiled
+        # inner HOP — v2 used SDPA-cudnn, no nesting. FlexAttention is designed to be
+        # called inside a compiled region so this should lower natively, but whether
+        # the varlen backend-dispatch / create_block_mask graph-breaks is exactly what
+        # the G4 probe pins ("steps/sec AFTER compile"). If it under-delivers, the fix
+        # is to drop the inner _flex_fn compile and let the outer compile own flex.
+        import torch._dynamo as _dynamo
+
+        _dynamo.config.cache_size_limit = max(64, len(sessions) * 4)
+        module.model = torch.compile(module.model, dynamic=False)  # type: ignore[assignment]
     trainer.fit(module, datamodule=dm)
 
 
