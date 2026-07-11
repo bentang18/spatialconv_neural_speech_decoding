@@ -99,3 +99,21 @@ def test_auto_backend_is_reference_on_cpu() -> None:
     # backend="auto" on CPU must not attempt to import/use flash.
     out = varlen_block_diag_attention(q, q, q, cu, max_seqlen=4, backend="auto")
     assert out.shape == (4, 1, 4)
+
+
+def test_flex_matches_reference() -> None:
+    # FlexAttention (eager, no compile) realises the SAME block-diagonal softmax as
+    # the reference — the numerical pin for the GPU-without-flash backend (F2b). Run
+    # eager (compiled=False) so no torch.compile in CI; identical numerics either way.
+    import pytest
+
+    pytest.importorskip("torch.nn.attention.flex_attention")
+    from speech_decoding.models.v14_converged_v3.varlen import _flex_block_diag
+
+    torch.manual_seed(4)
+    total, h, hd = 9, 2, 16
+    q, k, v = (torch.randn(total, h, hd, dtype=torch.float32) for _ in range(3))
+    cu = torch.tensor([0, 4, 4, 9], dtype=torch.int32)  # incl a 0-length shaft
+    got = _flex_block_diag(q, k, v, cu, compiled=False)
+    want = _per_segment_truth(q, k, v, cu)
+    assert torch.allclose(got, want, atol=1e-5)
