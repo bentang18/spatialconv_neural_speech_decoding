@@ -85,6 +85,14 @@ class V14ConvergedV3Module(pl.LightningModule):
         self._context_lambda_hold = float(context_lambda_hold)
         self._context_warmup_start = int(context_warmup_start)
         self._context_warmup_end = int(context_warmup_end)
+        # Context OFF (hold==0, the locked plain-JEPA arm) ⇒ the predictor's context
+        # head never receives gradient. Freeze it so DDP's reducer and the optimizer
+        # both skip it — the same requires_grad=False mechanism that excludes the EMA
+        # teacher. Without this, DDP with find_unused_parameters=False aborts on the
+        # unused head (LightningModule "parameters that were not used" error).
+        if self._context_lambda_hold == 0.0:
+            for p in self.model.objective.pred_to_target_context.parameters():
+                p.requires_grad_(False)
         # Read by SSLHealthMonitorV3 (grad_noise_scale B_eff) and the tap monitors.
         self._last_batch_size: int = 0
         self._last_taps: dict[str, Tensor] | None = None

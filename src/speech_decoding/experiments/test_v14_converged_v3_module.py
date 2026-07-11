@@ -147,10 +147,14 @@ def test_context_lambda_schedule() -> None:
 
 def test_training_step_context_off_by_default() -> None:
     # Library default hold=0.0 ⇒ the context head gets no gradient (static-off).
+    # It must ALSO be frozen (requires_grad=False) so DDP's reducer skips it under
+    # find_unused_parameters=False — otherwise the multi-GPU run aborts on it.
     mod = _module()
     assert mod._context_lambda_hold == 0.0
-    mod.training_step(_session_batch(n_rows=2), 0).backward()
     ctx_head = mod.model.objective.pred_to_target_context
+    assert all(not p.requires_grad for p in ctx_head.parameters())
+    assert ctx_head.weight not in set(mod._trainable_parameters())
+    mod.training_step(_session_batch(n_rows=2), 0).backward()
     assert all(p.grad is None for p in ctx_head.parameters())
 
 
