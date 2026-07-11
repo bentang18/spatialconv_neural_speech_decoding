@@ -164,7 +164,11 @@ def test_njt_matches_padded_oracle_gpu() -> None:
             for _ in range(3)
         )
         o_pad = sdpa_block_diag_packed(q, k, v, grid_pos, S, max_c, T)
-        o_njt = njt_block_diag(q, k, v, cu)
+        # njt now consumes the PRECOMPUTED compacted offsets + explicit max_seqlen
+        # (the build_pack_plan contract) — drop the zero-length shafts here.
+        off = cu.to(torch.int64)
+        cu_drop = torch.cat([off[:1], off[1:][off[1:] != off[:-1]]])
+        o_njt = njt_block_diag(q, k, v, cu_drop, max_c * T)
         assert torch.allclose(o_pad, o_njt, atol=1e-4), (vis, (o_pad - o_njt).abs().max())
         o_njt.sum().backward()
         assert all(torch.isfinite(t.grad).all() for t in (q, k, v)), vis

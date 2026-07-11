@@ -47,6 +47,11 @@ class PackPlan:
     order: Tensor  # (B, P) long — selected contacts per clip, shaft-grouped, into N
     depth: Tensor  # (B, P) long — clinical depth per selected contact (gaps kept)
     cu_seqlens: Tensor  # (B*S+1,) int32 — per (clip, shaft) block bound, TOKEN units
+    cu_seqlens_drop: Tensor  # (n_real+1,) int64 — cu_seqlens with the zero-length (whole-
+    # masked) shafts removed, for the GPU njt path. Compacting the offsets is a data-
+    # dependent masked_select (the surviving-block count varies per step) ⇒ ONE CPU sync;
+    # done HERE, once per plan, so the ~9-block encoder / ~8-block predictor towers reuse
+    # it sync-free instead of each L1 block re-dropping (≈12 hidden syncs/call otherwise).
     max_seqlen: int  # max block length in tokens (static upper bound = max_c * T)
     n_selected: int  # P — selected contacts per clip (constant per session)
     n_tokens: int  # B * P * T — total packed tokens (constant per session)
@@ -126,10 +131,19 @@ def build_pack_plan(
     cu = torch.zeros(B * S + 1, dtype=torch.int32, device=device)
     cu[1:] = seg_tok.cumsum(0).to(torch.int32)
 
+    # Precompute the compacted offsets ONCE (drop zero-length whole-masked shafts): the
+    # njt path can't feed empty jagged rows to the varlen backward (NaN grad), and the
+    # boolean compaction is a single data-dependent CPU sync — paid here per plan, not
+    # per L1 block. int64 for nested_tensor_from_jagged.
+    off = cu.to(torch.int64)
+    keep = off[1:] != off[:-1]
+    cu_drop = torch.cat([off[:1], off[1:][keep]])
+
     return PackPlan(
         order=order,
         depth=depth,
         cu_seqlens=cu,
+        cu_seqlens_drop=cu_drop,
         max_seqlen=geom.max_c * T,
         n_selected=P,
         n_tokens=B * P * T,

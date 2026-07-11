@@ -191,7 +191,9 @@ class L1Block(nn.Module):
         # CPU keeps the scatter-to-padded oracle (the test reference the GPU path is
         # pinned against; njt is numerically identical to bf16, grad-matched).
         if q.is_cuda:
-            ctx = njt_block_diag(q, k, v, plan.cu_seqlens)  # (total, H, hd)
+            ctx = njt_block_diag(
+                q, k, v, plan.cu_seqlens_drop, plan.max_seqlen
+            )  # (total, H, hd)
         else:
             max_c = plan.max_seqlen // T
             ctx = sdpa_block_diag_packed(

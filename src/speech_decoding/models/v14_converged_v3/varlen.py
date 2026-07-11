@@ -222,34 +222,40 @@ def sdpa_block_diag_packed(
 
 
 @torch._dynamo.disable
-def njt_block_diag(q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor) -> Tensor:
+def njt_block_diag(
+    q: Tensor, k: Tensor, v: Tensor, cu_seqlens_drop: Tensor, max_seqlen: int
+) -> Tensor:
     """Block-diagonal L1 attention via jagged NestedTensor — the GPU PRODUCTION path.
 
     Same block-diagonal attention as ``sdpa_block_diag_packed`` (the CPU/test oracle)
     but with NO pad and NO mask: ``nested_tensor_from_jagged`` VIEWS the flat packed
-    ``(total, H, hd)`` values as a jagged ``(n_block, jᵢ, H, hd)`` delimited by
-    ``cu_seqlens``, so SDPA dispatches to the ragged flash-varlen kernel (fast fwd AND
-    bwd) instead of the mask-forced mem-efficient kernel. ~3× on attention fwd+bwd at
-    real shapes. Grad-preserving: ``_from_jagged`` views (unlike the ``nested_tensor``
+    ``(total, H, hd)`` values as a jagged ``(n_block, jᵢ, H, hd)`` delimited by the
+    offsets, so SDPA dispatches to the ragged flash-varlen kernel (fast fwd AND bwd)
+    instead of the mask-forced mem-efficient kernel. ~3× on attention fwd+bwd at real
+    shapes. Grad-preserving: ``_from_jagged`` views (unlike the ``nested_tensor``
     constructor, which detaches).
 
-    Whole-masked shafts are DROPPED, not padded: they arrive as zero-length segments
-    (``cu_seqlens`` keeps the constant ``B*S`` block count for the padded oracle/grid),
-    and an empty jagged row corrupts the varlen backward (NaN grad). Empty blocks carry
-    no tokens, so removing their boundary leaves the packed values + order unchanged —
-    the varlen-native "drop" of an absent shaft.
+    ``cu_seqlens_drop`` (``PackPlan.cu_seqlens_drop``, int64) is the COMPACTED offset
+    table — whole-masked shafts already dropped (an empty jagged row corrupts the varlen
+    backward: NaN grad). The drop is a data-dependent ``masked_select`` that CPU-syncs;
+    it is done ONCE per plan in ``build_pack_plan`` and reused across every L1 block, so
+    a ~9-block encoder / ~8-block predictor tower pays 1 sync, not ~12 per block. Passing
+    ``max_seqlen`` (the static ``max_c*T`` bound) explicitly likewise skips the ragged
+    SDPA's own offset-diff reduction (a second per-call sync). Net: ≈206→4 DtoH syncs on
+    a 17-call step, measured. Empty blocks carry no tokens, so dropping their boundary
+    leaves the packed values + order unchanged — the varlen-native "drop" of an absent
+    shaft.
 
     Runs EAGER (``torch._dynamo.disable``): the NestedTensor subclass tangent breaks
     torch-2.10 compiled autograd (AOTAutograd ``process_runtime_tangent`` asserts), so
     the SDPA is a graph break — projections/RoPE around it stay compiled, and the
     per-step-varying offsets never touch the compiled graph (no recompile). Default
     SDPA scale ``1/sqrt(hd)`` matches the oracle. Returns packed ``(total, H, hd)``."""
-    off = cu_seqlens.to(torch.int64)
-    keep = off[1:] != off[:-1]  # drop zero-length (whole-masked) shafts
-    off = torch.cat([off[:1], off[1:][keep]])
 
     def _nt(x: Tensor) -> Tensor:
-        return torch.nested.nested_tensor_from_jagged(x, offsets=off).transpose(1, 2)
+        return torch.nested.nested_tensor_from_jagged(
+            x, offsets=cu_seqlens_drop, min_seqlen=1, max_seqlen=max_seqlen
+        ).transpose(1, 2)
 
     ctx = F.scaled_dot_product_attention(_nt(q), _nt(k), _nt(v))
     return ctx.transpose(1, 2).values()
