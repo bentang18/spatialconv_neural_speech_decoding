@@ -106,28 +106,27 @@ def build_v3_optim_cfg(
 def make_bt_parcel_fn(
     bt_root: str,
     *,
-    parcel_labels: tuple[str, ...] | None = None,
-    label_column: str | None = None,
+    atlas: str = "dkt",
 ) -> ParcelFn:
     """Default ``parcel_fn``: DKT hard tag per electrode from BT anatomy (F2 seam).
 
-    Maps each cache channel label to its one-hot parcel via
-    ``aligned_voltage_support`` (row-aligned to the voltage order). Unmapped
-    electrodes (zero support row) fall to parcel id 0; whether id 0 should instead
-    be a RESERVED "unknown" identity distinct from ``parcel_labels[0]`` is the one
-    open parcel-vocabulary decision flagged for F2 — it does not affect the launcher
-    mechanics (``n_parcels`` is derived from the realized max id, so the identity
-    table is always large enough). Lazily imported so the launcher is importable
-    (and unit-testable with a stub parcel_fn) without the BT anatomy stack.
+    Maps each cache channel label to its one-hot DKT parcel via
+    ``aligned_voltage_support`` (row-aligned to the voltage order). Electrodes with
+    NO parcel support (all-zero row — outside every DKT parcel) get the RESERVED
+    "unknown" id = ``len(parcel_labels)`` (=74), an identity distinct from every real
+    parcel 0..73 that never collides with ``parcel_labels[0]``. ``_n_parcels``
+    reserves the matching +1 identity-table row. Atlas name threads
+    ``anatomy.atlas_spec`` so the DKT CSV column and the K=74 vocabulary can never
+    desync. Lazily imported so the launcher is importable (and unit-testable with a
+    stub parcel_fn) without the BT anatomy stack.
     """
     from speech_decoding.studies.braintreebank.anatomy import (
-        DEFAULT_BT_LABEL_COLUMN,
-        V14_DK_PARCEL_LABELS,
         aligned_voltage_support,
+        atlas_spec,
     )
 
-    plabels = parcel_labels if parcel_labels is not None else V14_DK_PARCEL_LABELS
-    lcol = label_column if label_column is not None else DEFAULT_BT_LABEL_COLUMN
+    lcol, plabels = atlas_spec(atlas)  # "dkt" → ("DKT", V14_DKT_PARCEL_LABELS/K=74)
+    unknown_id = len(plabels)  # reserved id, distinct from every real parcel 0..K-1
 
     def parcel_fn(subject_id: int, trial_id: int, labels: tp.Sequence[str]) -> torch.Tensor:
         hs = aligned_voltage_support(
@@ -135,7 +134,8 @@ def make_bt_parcel_fn(
             parcel_labels=plabels, unmapped_policy="zero", label_column=lcol,
         )
         by_label = {
-            lab: int(hs.support[c].argmax()) for c, lab in enumerate(hs.electrode_labels)
+            lab: (int(hs.support[c].argmax()) if bool(hs.support[c].any()) else unknown_id)
+            for c, lab in enumerate(hs.electrode_labels)
         }
         missing = [lab for lab in labels if lab not in by_label]
         if missing:
@@ -150,8 +150,22 @@ def make_bt_parcel_fn(
 
 # ------------------------------------------------------------------- assembly
 def _n_parcels(sessions: tp.Sequence[V3SessionSpec]) -> int:
-    """Identity-table size = global max realized parcel id + 1 (policy-agnostic)."""
-    return 1 + max(int(s.setup.parcel_id.max()) for s in sessions)
+    """Identity-table size = DKT vocab (74) + 1 reserved 'unknown' row (id 74) = 75, FIXED.
+
+    Not data-derived: the reserved unknown identity (id 74) must exist even when no
+    electrode in the current cohort is unmapped, and the table must be identical
+    across cohorts so a checkpoint's parcel-embedding rows mean the same thing
+    everywhere. Asserts no realized id escapes the table.
+    """
+    from speech_decoding.studies.braintreebank.anatomy import V14_DKT_PARCEL_LABELS
+
+    n = len(V14_DKT_PARCEL_LABELS) + 1  # 74 real (0..73) + 1 reserved unknown (74)
+    realized = max(int(s.setup.parcel_id.max()) for s in sessions)
+    if realized >= n:
+        raise ValueError(
+            f"realized parcel id {realized} exceeds DKT identity table size {n}"
+        )
+    return n
 
 
 def build_v3_training(

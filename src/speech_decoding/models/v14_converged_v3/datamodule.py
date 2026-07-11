@@ -10,9 +10,14 @@ is passed so the optional straggler-balancing path is available.
 
 ``set_epoch`` fans out to BOTH the dataset (re-seed the random-continuous window
 draw) and the sampler (reshuffle) so they stay phase-locked. The training loop
-(E1) calls it from ``on_train_epoch_start``. NOTE: with ``persistent_workers`` the
-forked workers hold a stale ``dataset._epoch``; the launch trainer refreshes windows
-via ``reload_dataloaders_every_n_epochs=1`` (an E2 knob) — moot at ``num_workers=0``.
+(E1) calls it from ``on_train_epoch_start``. ``persistent_workers`` DEFAULTS OFF:
+``reload_dataloaders_every_n_epochs=1`` (the launch E2 knob) recreates the loader each
+epoch anyway, so persistence buys nothing here AND the smoke warned that
+``pin_memory=True`` + ``persistent_workers=True`` + ``reload>0`` hits a documented
+PyTorch instability (pytorch/pytorch#91252). Off removes the risk at no throughput cost
+(``pin_memory`` stays on). With persistence on, the forked workers would also hold a
+stale ``dataset._epoch`` — reload=1 is what refreshes windows regardless. Moot at
+``num_workers=0``.
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ class V3DataModule(pl.LightningDataModule):
         seed: int = 0,
         drop_last: bool = False,
         pin_memory: bool = True,
-        persistent_workers: bool = True,
+        persistent_workers: bool = False,
         prefetch_factor: int = 4,
         balance_ranks: bool = False,
     ) -> None:
