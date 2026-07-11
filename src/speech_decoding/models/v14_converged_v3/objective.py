@@ -251,10 +251,17 @@ class V3JepaObjective(nn.Module):
         h = self.predictor.forward_packed(pred_in, full_plan, full_parcel, backend=backend)
         pred = self.pred_to_target(h)  # (B, N, T, 256) full order
 
-        # L1 at masked positions; pred & tgt BOTH in full_plan order → reorder mask
+        # L1 at masked positions; pred & tgt BOTH in full_plan order → reorder mask.
+        # STATIC masked-MEAN, not boolean-index: ``x[bool_mask]`` has a data-dependent
+        # output shape, which graph-breaks (and specializes) under
+        # ``torch.compile(dynamic=False)``. The weighted mean over the fixed (B,N,T)
+        # grid is the IDENTICAL value — every masked cell shares the same feature width
+        # ``d`` — with a shape-static graph. B6: ``m_masked`` is the exact per-row
+        # held-out count, so the denominator needs no host-sync on ``mask.sum()``.
         mask_packed = mask.gather(1, full_plan.order)  # (B, N) bool, full order
-        tube = mask_packed[:, :, None].expand(B, N, T)  # (B, N, T)
-        loss = _l1_or_zero(pred[tube], tgt[tube], "l1")
+        w = mask_packed[:, :, None].to(pred.dtype)  # (B, N, 1) → broadcasts over T
+        ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
+        loss = (ae * w).sum() / w.expand_as(ae).sum().clamp(min=1.0)
 
         # CONTEXT loss (#66, upstream predict_all): a SECOND L1 predicting the teacher
         # target at the VISIBLE/context positions via ``pred_to_target_context``, added
@@ -276,6 +283,7 @@ class V3JepaObjective(nn.Module):
         return JepaOutput(loss=loss, n_masked=B * m_masked * T, taps=taps)
 
     @staticmethod
+    @torch.compiler.disable
     def _build_taps_packed(
         enc_taps: dict[int, Tensor],
         pred: Tensor,
@@ -287,7 +295,15 @@ class V3JepaObjective(nn.Module):
         """Detached monitor taps (packed path). Encoder taps are already the packed
         VISIBLE tokens (B, M_vis, T, d) ⇒ every row is a visible token, so flatten
         directly. pred/tgt are in ``full_order``; the whole/intra tiers are reordered
-        to match before extracting. Targets are already ``target_ln``'d (post-norm)."""
+        to match before extracting. Targets are already ``target_ln``'d (post-norm).
+
+        ``@torch.compiler.disable``: the whole/intra tiers are boolean-indexed
+        (``p[whole_t]``) with a per-step-VARIABLE row count (which shafts get whole-
+        masked is random and shafts differ in size). Under ``torch.compile(dynamic=
+        False)`` that resume frame respecialises on every new count and blows past
+        ``recompile_limit`` (64) → the G4 probe's storm. This path is a DETACHED,
+        monitor-cadence read that never touches the loss, so running it in eager (one
+        clean graph break, no guards) is correct and eliminates the storm outright."""
         d_enc = enc_taps[12].shape[-1]
         d_out = pred.shape[-1]
         out: dict[str, Tensor] = {
@@ -301,9 +317,6 @@ class V3JepaObjective(nn.Module):
         whole_t = whole_packed[:, :, None].expand(B, N, T)
         intra_t = intra_packed[:, :, None].expand(B, N, T)
         p, t = pred.detach(), tgt.detach()
-        # NB: item-assign, NOT dict.update() — Dynamo can't trace dict.update, so
-        # .update() here graph-breaks and the resume frame's guard churns to the
-        # recompile_limit (64) → eager fallback on this per-step monitor path.
         out["pred_whole"] = p[whole_t].reshape(-1, d_out)
         out["tgt_whole"] = t[whole_t].reshape(-1, d_out)
         out["pred_intra"] = p[intra_t].reshape(-1, d_out)
@@ -339,8 +352,11 @@ class V3JepaObjective(nn.Module):
         pred_in = torch.where(m, self.mask_token, zp)
         h = self.predictor(pred_in, geom, parcel_id, visible=None)
         pred = self.pred_to_target(h)
-        tube = mask[:, :, None].expand(pred.shape[:-1])
-        loss = _l1_or_zero(pred[tube], tgt[tube], "l1")
+        # Same static masked-mean as the packed ``forward`` (identical value) so the
+        # oracle stays a faithful numeric pin of the production loss.
+        w = mask[:, :, None].to(pred.dtype)  # (B, N, 1)
+        ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
+        loss = (ae * w).sum() / w.expand_as(ae).sum().clamp(min=1.0)
         if not _static_off(lambda_context):
             pred_ctx = self.pred_to_target_context(h)
             ctx_tube = (~mask)[:, :, None].expand(pred.shape[:-1])
@@ -361,7 +377,9 @@ class V3JepaObjective(nn.Module):
                     pred_whole=p[whole_t], tgt_whole=t[whole_t],
                     pred_intra=p[intra_t], tgt_intra=t[intra_t],
                 )
-        return JepaOutput(loss=loss, n_masked=int(tube.sum()), taps=taps)
+        return JepaOutput(
+            loss=loss, n_masked=int(w.expand_as(ae).sum().item()), taps=taps
+        )
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:
