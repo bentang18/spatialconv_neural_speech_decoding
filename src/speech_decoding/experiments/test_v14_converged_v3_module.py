@@ -130,3 +130,42 @@ def test_ema_teacher_advances_once_per_step() -> None:
     mod.on_before_zero_grad(optimizer=None)
     after = int(mod.model.objective.teacher._step.item())
     assert after == before + 1
+
+
+def test_context_lambda_schedule() -> None:
+    # #66 upstream Lambda_LinearWarmupHold: off before start, linear ramp, hold after.
+    from speech_decoding.experiments.v14_converged_v3_module import context_lambda
+
+    assert context_lambda(0, 0.5, 15_000, 30_000) == 0.0  # before start
+    assert context_lambda(14_999, 0.5, 15_000, 30_000) == 0.0
+    assert context_lambda(15_000, 0.5, 15_000, 30_000) == 0.0  # ramp start = 0
+    assert abs(context_lambda(22_500, 0.5, 15_000, 30_000) - 0.25) < 1e-9  # midpoint
+    assert context_lambda(30_000, 0.5, 15_000, 30_000) == 0.5  # hold
+    assert context_lambda(100_000, 0.5, 15_000, 30_000) == 0.5
+    assert context_lambda(50_000, 0.0, 15_000, 30_000) == 0.0  # hold<=0 ⇒ always off
+
+
+def test_training_step_context_off_by_default() -> None:
+    # Library default hold=0.0 ⇒ the context head gets no gradient (static-off).
+    mod = _module()
+    assert mod._context_lambda_hold == 0.0
+    mod.training_step(_session_batch(n_rows=2), 0).backward()
+    ctx_head = mod.model.objective.pred_to_target_context
+    assert all(p.grad is None for p in ctx_head.parameters())
+
+
+def test_training_step_with_context_loss_trains_head() -> None:
+    # hold>0 with the ramp already complete at step 0 (start=end=0 ⇒ λ=hold at step 0);
+    # the module passes a 0-d tensor and the context head is trained.
+    model = V3ConvergedModel(n_parcels=N_PARCELS)
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        context_lambda_hold=0.5, context_warmup_start=0, context_warmup_end=0,
+    )
+    loss = mod.training_step(_session_batch(n_rows=2), 0)
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    loss.backward()
+    ctx_head = mod.model.objective.pred_to_target_context
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0 for p in ctx_head.parameters()
+    )

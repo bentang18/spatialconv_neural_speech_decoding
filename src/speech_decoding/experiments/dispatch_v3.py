@@ -190,6 +190,9 @@ def build_v3_training(
     module = V14ConvergedV3Module(
         model=model, optim_config=optim, seed=args.seed,
         monitor_every_n_steps=args.monitor_every_n_steps,
+        context_lambda_hold=getattr(args, "context_lambda", 0.5),
+        context_warmup_start=getattr(args, "context_warmup_start", 15_000),
+        context_warmup_end=getattr(args, "context_warmup_end", 30_000),
     )
     dm = V3DataModule(
         sessions,
@@ -303,6 +306,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=50)
+    p.add_argument("--context-lambda", dest="context_lambda", type=float, default=0.5,
+                   help="context-loss hold value (#66, V-JEPA 2.1 predict_all): off "
+                        "before --context-warmup-start, linear ramp to this, then hold. "
+                        "Ben 2026-07-10: 0.5. Set 0.0 for the pure plain-JEPA arm")
+    p.add_argument("--context-warmup-start", dest="context_warmup_start", type=int,
+                   default=15_000, help="context-loss λ ramp start step (default 15000)")
+    p.add_argument("--context-warmup-end", dest="context_warmup_end", type=int,
+                   default=30_000, help="context-loss λ ramp end / hold step (default 30000)")
     p.add_argument("--deep-sup", dest="deep_sup",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="deep self-supervision (#61, V-JEPA 2.1 copy-exactly): tap "

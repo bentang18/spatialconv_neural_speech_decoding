@@ -42,10 +42,11 @@ def test_collect_taps_loss_identical_and_taps_finite() -> None:
     assert torch.equal(out_no.loss, out_yes.loss)
     assert out_no.taps is None and out_yes.taps is not None
     taps = out_yes.taps
-    for key in ("enc3", "enc12"):
-        t = taps[key]
-        assert isinstance(t, torch.Tensor) and not t.requires_grad
-        assert t.shape[-1] == 256 and torch.isfinite(t).all()
+    # block-3 tap removed (2026-07-10) — only the terminal encoder tap remains.
+    assert "enc3" not in taps
+    t = taps["enc12"]
+    assert isinstance(t, torch.Tensor) and not t.requires_grad
+    assert t.shape[-1] == 256 and torch.isfinite(t).all()
     # intra tier is always populated (whole shafts round to 0 on a 2-shaft synth);
     # pred/target rows must be paired and same-shape. Under deep-sup (#61) the
     # prediction/target space is the n_levels-concatenated vector (4·256=1024), not
@@ -149,12 +150,14 @@ def test_family_b_tap_keys_finite() -> None:
         outputs=None, batch=None, batch_idx=0,
     )
     for k in (
-        "train_mon_enc3_rankme", "train_mon_enc3_feat_std_mean",
-        "train_mon_enc12_rankme", "train_mon_enc12_feat_std_min",
+        "train_mon_enc12_rankme", "train_mon_enc12_feat_std_mean",
+        "train_mon_enc12_feat_std_min",
         "train_mon_intra_explained_var", "train_mon_intra_pred_target_var_ratio",
         "train_mon_intra_l1",
     ):
         assert k in logged and logged[k] == logged[k], k
+    # block-3 tap keys are gone (2026-07-10).
+    assert not any(key.startswith("train_mon_enc3_") for key in logged)
 
 
 def test_family_b_noop_without_taps() -> None:

@@ -72,6 +72,15 @@ def _ln_target(t: Tensor, n_levels: int = 1) -> Tensor:
     )
 
 
+def _static_off(lambda_context: float | Tensor) -> bool:
+    """True ⇒ context loss is statically off (the pure plain-JEPA arm). Only a python
+    ``0.0`` counts: it is known at ``torch.compile`` trace time so the branch is
+    constant-folded and the context head is never touched. A 0-d tensor (the module's
+    on-schedule λ, even value 0 during the 0–15k hold) is NOT static-off — the head
+    always runs, keeping the compiled graph invariant across the λ ramp."""
+    return isinstance(lambda_context, (int, float)) and lambda_context == 0.0
+
+
 @dataclass
 class JepaOutput:
     loss: Tensor
@@ -153,18 +162,25 @@ class V3JepaObjective(nn.Module):
         # d_pred), NO LayerNorm before/after. Single-tap: a plain Linear(d → d_pred).
         # ``pred_to_target`` is upstream ``predictor_proj`` — ONE wide Linear emitting
         # all n_levels·d target dims from the predictor's final (norm_out'd) block.
+        target_dim = N_LEVELS * D_MODEL if self.deep_sup else D_MODEL
         if self.deep_sup:
             self.enc_to_pred = nn.Sequential(
                 nn.Linear(N_LEVELS * D_MODEL, D_MODEL),
                 nn.GELU(),
                 nn.Linear(D_MODEL, PRED_D_MODEL),
             )
-            self.pred_to_target = nn.Linear(PRED_D_MODEL, N_LEVELS * D_MODEL)
         else:
             self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
-            self.pred_to_target = nn.Linear(PRED_D_MODEL, D_MODEL)
+        self.pred_to_target = nn.Linear(PRED_D_MODEL, target_dim)
+        # CONTEXT-loss head (#66, upstream ``predictor_proj_context``, predictor.py:183):
+        # a SEPARATE wide Linear that predicts the teacher target at the VISIBLE/context
+        # positions (not the masked ones). Same target space as ``pred_to_target``. Only
+        # trained when the λ schedule is active (off before 15k). Always constructed so
+        # the module + optimizer see a static param set regardless of the λ ramp.
+        self.pred_to_target_context = nn.Linear(PRED_D_MODEL, target_dim)
         self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
         init_transformer_weights(self.pred_to_target)
+        init_transformer_weights(self.pred_to_target_context)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit: mask_token zero-init).
         # Stored 3-D (1, 1, D) to match upstream predictor.py:64-65: the shared
         # ndim<=1 no-decay rule (optim_param_groups.is_no_decay) then DECAYS it, as
@@ -184,6 +200,7 @@ class V3JepaObjective(nn.Module):
         backend: str = "auto",
         collect_taps: bool = False,
         whole_contact: Tensor | None = None,
+        lambda_context: float | Tensor = 0.0,
     ) -> JepaOutput:
         """bands: 3-band |STFT| inputs; mask: (B, N) bool (True = target).
 
@@ -214,7 +231,7 @@ class V3JepaObjective(nn.Module):
         # online encoder over the visible contacts (packed)
         if collect_taps:
             z, enc_taps = self.online(
-                bands, online_plan, online_parcel, backend=backend, tap_blocks=(3, 12)
+                bands, online_plan, online_parcel, backend=backend, tap_blocks=(12,)
             )  # (B, M_vis, T, 256)
         else:
             z = self.online(bands, online_plan, online_parcel, backend=backend)
@@ -239,6 +256,18 @@ class V3JepaObjective(nn.Module):
         tube = mask_packed[:, :, None].expand(B, N, T)  # (B, N, T)
         loss = _l1_or_zero(pred[tube], tgt[tube], "l1")
 
+        # CONTEXT loss (#66, upstream predict_all): a SECOND L1 predicting the teacher
+        # target at the VISIBLE/context positions via ``pred_to_target_context``, added
+        # as ``λ(step)·loss_context``. ``_static_off`` (a python 0.0 known at trace time
+        # ⇒ compile constant-folds the branch) skips the head entirely for the pure
+        # plain-JEPA arm; when the schedule is active the module ALWAYS passes a 0-d
+        # tensor (even value 0 pre-15k) so the graph is static across the λ ramp.
+        if not _static_off(lambda_context):
+            pred_ctx = self.pred_to_target_context(h)  # (B, N, T, target_dim) full order
+            ctx_tube = (~mask_packed)[:, :, None].expand(B, N, T)
+            loss_context = _l1_or_zero(pred_ctx[ctx_tube], tgt[ctx_tube], "l1")
+            loss = loss + lambda_context * loss_context
+
         taps = None
         if collect_taps:
             taps = self._build_taps_packed(
@@ -259,11 +288,10 @@ class V3JepaObjective(nn.Module):
         VISIBLE tokens (B, M_vis, T, d) ⇒ every row is a visible token, so flatten
         directly. pred/tgt are in ``full_order``; the whole/intra tiers are reordered
         to match before extracting. Targets are already ``target_ln``'d (post-norm)."""
-        d_enc = enc_taps[3].shape[-1]
+        d_enc = enc_taps[12].shape[-1]
         d_out = pred.shape[-1]
         out: dict[str, Tensor] = {
-            "enc3": enc_taps[3].detach().reshape(-1, d_enc),  # (n_vis·T, 256); pre-first-L2
-            "enc12": enc_taps[12].detach().reshape(-1, d_enc),
+            "enc12": enc_taps[12].detach().reshape(-1, d_enc),  # (n_vis·T, 256)
         }
         if whole_contact is None:
             return out
@@ -288,6 +316,7 @@ class V3JepaObjective(nn.Module):
         *,
         collect_taps: bool = False,
         whole_contact: Tensor | None = None,
+        lambda_context: float | Tensor = 0.0,
     ) -> JepaOutput:
         """Padded ORACLE (test only): the pre-#24 dense JEPA assembly, kept to pin the
         packed ``forward`` numerically on CPU. The teacher is routed through the
@@ -295,7 +324,7 @@ class V3JepaObjective(nn.Module):
         visible = ~mask
         if collect_taps:
             z, enc_taps = self.online.forward_padded(
-                bands, geom, parcel_id, visible, tap_blocks=(3, 12)
+                bands, geom, parcel_id, visible, tap_blocks=(12,)
             )
         else:
             z = self.online.forward_padded(bands, geom, parcel_id, visible)
@@ -309,12 +338,16 @@ class V3JepaObjective(nn.Module):
         pred = self.pred_to_target(h)
         tube = mask[:, :, None].expand(pred.shape[:-1])
         loss = _l1_or_zero(pred[tube], tgt[tube], "l1")
+        if not _static_off(lambda_context):
+            pred_ctx = self.pred_to_target_context(h)
+            ctx_tube = (~mask)[:, :, None].expand(pred.shape[:-1])
+            loss_context = _l1_or_zero(pred_ctx[ctx_tube], tgt[ctx_tube], "l1")
+            loss = loss + lambda_context * loss_context
         taps = None
         if collect_taps:
             B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
             vis_t = visible[:, :, None].expand(B, N, T)
             taps = {
-                "enc3": enc_taps[3].detach()[vis_t],
                 "enc12": enc_taps[12].detach()[vis_t],
             }
             if whole_contact is not None:

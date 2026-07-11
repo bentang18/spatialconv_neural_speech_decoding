@@ -42,6 +42,17 @@ from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
 # ever aliasing step N of seed A onto step M of seed B for small N.
 _MASK_SEED_STRIDE = 1_000_003
 
+
+def context_lambda(step: int, hold: float, start: int, end: int) -> float:
+    """Upstream ``Lambda_LinearWarmupHold`` (modules.py:523): 0 before ``start``,
+    linear ramp to ``hold`` across ``[start, end]``, constant ``hold`` after. v3
+    context-loss schedule (#66) — Ben: off 15k → ramp 15k–30k → hold 0.5."""
+    if hold <= 0.0 or step < start:
+        return 0.0
+    if step >= end:
+        return hold
+    return hold * (step - start) / (end - start)
+
 # V3Batch (bands / geom / parcel_id, shared per session) is the data contract the
 # datamodule's ``v3_collate`` produces; re-exported here so callers that imported it
 # from this module keep working after the definition moved to the models package.
@@ -57,6 +68,9 @@ class V14ConvergedV3Module(pl.LightningModule):
         seed: int = 33,
         monitor_every_n_steps: int = 1,
         wd_exclude_norms: bool = True,
+        context_lambda_hold: float = 0.0,
+        context_warmup_start: int = 15_000,
+        context_warmup_end: int = 30_000,
     ) -> None:
         super().__init__()
         self.model = model
@@ -64,6 +78,13 @@ class V14ConvergedV3Module(pl.LightningModule):
         self.seed = int(seed)
         self.monitor_every_n_steps = max(int(monitor_every_n_steps), 1)
         self._wd_exclude_norms = wd_exclude_norms
+        # Context-loss schedule (#66). hold<=0 ⇒ feature OFF (the pure plain-JEPA arm):
+        # forward gets a python 0.0 (compile-static skip). hold>0 ⇒ every step passes a
+        # 0-d λ tensor (value 0 pre-start) so the compiled graph stays invariant across
+        # the ramp. Library default OFF; the dispatch flag sets Ben's 0.5 for the run.
+        self._context_lambda_hold = float(context_lambda_hold)
+        self._context_warmup_start = int(context_warmup_start)
+        self._context_warmup_end = int(context_warmup_end)
         # Read by SSLHealthMonitorV3 (grad_noise_scale B_eff) and the tap monitors.
         self._last_batch_size: int = 0
         self._last_taps: dict[str, Tensor] | None = None
@@ -148,9 +169,21 @@ class V14ConvergedV3Module(pl.LightningModule):
         except (RuntimeError, AttributeError):
             step = 0
         collect = self._monitor_due(step)
+        # Context-loss λ (#66): a 0-d tensor when the schedule is active (compile-static
+        # graph across the ramp), else a python 0.0 (compile-static skip of the head).
+        if self._context_lambda_hold > 0.0:
+            lam = context_lambda(
+                step, self._context_lambda_hold,
+                self._context_warmup_start, self._context_warmup_end,
+            )
+            lambda_context: float | Tensor = torch.tensor(
+                lam, device=device, dtype=torch.float32
+            )
+        else:
+            lambda_context = 0.0
         out = self.model(
             batch.bands, batch.geom, batch.parcel_id,
-            generator=gen, collect_taps=collect,
+            generator=gen, collect_taps=collect, lambda_context=lambda_context,
         )
         self._last_batch_size = int(batch.bands[0].shape[0])
         self._last_taps = out.taps if collect else None

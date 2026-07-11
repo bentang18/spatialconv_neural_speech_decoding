@@ -216,6 +216,74 @@ def test_single_tap_packed_matches_padded() -> None:
     assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
 
 
+def test_context_head_shape_both_arms() -> None:
+    # #66: pred_to_target_context mirrors pred_to_target's target space (deep-sup
+    # 128→4·256; single-tap 128→256).
+    import torch.nn as nn
+
+    obj = _obj()  # deep-sup default
+    assert isinstance(obj.pred_to_target_context, nn.Linear)
+    assert obj.pred_to_target_context.in_features == 128
+    assert obj.pred_to_target_context.out_features == 4 * 256
+    obj1 = V3JepaObjective(n_parcels=N_PARCELS, deep_sup=False)
+    assert obj1.pred_to_target_context.out_features == 256
+
+
+def test_context_lambda_zero_is_exactly_plain_jepa() -> None:
+    # A python 0.0 (default / feature-off) is the static-skip: loss must be BYTE-equal
+    # to not passing lambda_context at all — the context head never perturbs the loss.
+    sc, geom = _session()
+    obj = _obj().eval()
+    bands, mask = _batch(sc)
+    m = int(mask[0].sum())
+    plain = obj(bands, geom, sc.parcel_id, mask, m_masked=m)
+    off = obj(bands, geom, sc.parcel_id, mask, m_masked=m, lambda_context=0.0)
+    assert torch.equal(plain.loss, off.loss)
+
+
+def test_context_lambda_positive_changes_loss_and_trains_head() -> None:
+    # A 0-d λ tensor > 0 adds the visible-position context L1 ⇒ loss changes, and the
+    # context head receives gradient (it is trained only when the schedule is active).
+    sc, geom = _session()
+    obj = _obj()
+    bands, mask = _batch(sc)
+    m = int(mask[0].sum())
+    base = obj(bands, geom, sc.parcel_id, mask, m_masked=m).loss
+    lam = torch.tensor(0.5)
+    withc = obj(bands, geom, sc.parcel_id, mask, m_masked=m, lambda_context=lam)
+    assert not torch.allclose(base, withc.loss)
+    withc.loss.backward()
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in obj.pred_to_target_context.parameters()
+    )
+    # teacher still frozen under the context loss
+    assert all(p.grad is None for p in obj.teacher.parameters())
+
+
+def test_context_head_untouched_when_lambda_zero() -> None:
+    # With the static-off path, the context head gets NO gradient (it is skipped).
+    sc, geom = _session()
+    obj = _obj()
+    bands, mask = _batch(sc)
+    obj(bands, geom, sc.parcel_id, mask, m_masked=int(mask[0].sum())).loss.backward()
+    assert all(p.grad is None for p in obj.pred_to_target_context.parameters())
+
+
+def test_packed_matches_padded_with_context_loss() -> None:
+    # #24 equivalence must survive the context loss: both paths add λ·(visible-position
+    # L1), a mean over context positions ⇒ order-invariant like the masked loss.
+    sc, geom = _session()
+    obj = _obj().eval()
+    bands, mask = _batch(sc, n_masked_contacts=5)
+    m = int(mask[0].sum())
+    lam = torch.tensor(0.5)
+    packed = obj(bands, geom, sc.parcel_id, mask, m_masked=m,
+                 backend="reference", lambda_context=lam)
+    padded = obj._forward_padded(bands, geom, sc.parcel_id, mask, lambda_context=lam)
+    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
+
+
 def test_no_nan_when_a_whole_shaft_is_masked() -> None:
     sc, geom = _session()
     obj = _obj()

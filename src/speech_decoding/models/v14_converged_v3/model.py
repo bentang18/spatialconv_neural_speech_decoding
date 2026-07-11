@@ -72,6 +72,7 @@ class V3ConvergedModel(nn.Module):
         generator: torch.Generator,
         collect_taps: bool = False,
         backend: str = "auto",
+        lambda_context: float | Tensor = 0.0,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
         # masking is the sole augmentation; the whole-sensor tier tag is only needed
@@ -93,6 +94,7 @@ class V3ConvergedModel(nn.Module):
         return self.objective(
             band_inputs, geom, parcel_id, mask, m_masked=m_masked, backend=backend,
             collect_taps=collect_taps, whole_contact=whole_contact,
+            lambda_context=lambda_context,
         )
 
     @torch.no_grad()

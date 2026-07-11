@@ -21,8 +21,8 @@ consecutive-step windows):
 Family B — tap-dependent (detached forward taps), in ``on_train_batch_end``, reading
 ``pl_module._last_taps`` (present ⇒ this is a cadence step; the module already
 decided, so no off-by-one re-derivation):
-  * rankme + feat_std at encoder block 3 (pre-first-L2) vs block 12 — does cross-
-    sensor L2 mixing raise effective rank (healthy) or collapse it?
+  * rankme + feat_std at encoder block 12 (terminal representation) — effective-rank
+    / feature-std collapse guard. (The block-3 pre-L2 tap was removed 2026-07-10.)
   * explained_var + pred_target_var_ratio + L1, split whole-sensor vs intra-sensor —
     is L2 actually learning the cross-sensor task, or is the encoder cheating locally?
 
@@ -241,11 +241,12 @@ class SSLHealthMonitorV3(pl.Callback):
         accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
         if (batch_idx + 1) % accum != 0:
             return
-        # rankme + feat_std at encoder block 3 (pre-first-L2) vs block 12.
-        for key, tap_name in (("enc3", "enc3"), ("enc12", "enc12")):
-            tap = taps.get(tap_name)
-            if isinstance(tap, Tensor):
-                self._rank_and_std(pl_module, tap, key=f"{key}_")
+        # rankme + feat_std at the encoder's final block (12). The block-3 tap was
+        # removed (Ben 2026-07-10): the pre-first-L2 rank/std comparison is no longer
+        # tracked — only the terminal encoder representation.
+        tap = taps.get("enc12")
+        if isinstance(tap, Tensor):
+            self._rank_and_std(pl_module, tap, key="enc12_")
         # tier-split explained-var / var-ratio / L1.
         self._tier_stats(pl_module, taps, "whole")
         self._tier_stats(pl_module, taps, "intra")
