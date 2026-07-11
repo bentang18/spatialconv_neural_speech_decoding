@@ -373,26 +373,21 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:
-        # dynamic=False (v2 `--no-compile-dynamic`): every shape v3 sees is STATIC
-        # per session — session-homogeneous batching + the varlen constant-masked-count
-        # invariant fix M_vis (online) and N (teacher/predictor) per session. Letting
-        # Dynamo specialize each shape gives the fast static graphs v2 measured >1.5×
-        # from; the dynamic path would trace slower symbolic-shape graphs and can
-        # graph-break. Cost: one recompile per distinct session shape ⇒ raise the
-        # recompile cap above the cohort's shape count (online + full-N per session,
-        # ×headroom) so we specialize instead of falling back to eager.
-        #
-        # OPEN (G4 measures): v3's L1 uses FlexAttention which SELF-compiles
-        # (varlen.py `_flex_fn`), so torch.compile(model) wraps an already-compiled
-        # inner HOP — v2 used SDPA-cudnn, no nesting. FlexAttention is designed to be
-        # called inside a compiled region so this should lower natively, but whether
-        # the varlen backend-dispatch / create_block_mask graph-breaks is exactly what
-        # the G4 probe pins ("steps/sec AFTER compile"). If it under-delivers, the fix
-        # is to drop the inner _flex_fn compile and let the outer compile own flex.
+        # dynamic=None (AUTO), NOT False — measured by the G4 probe (2026-07-11).
+        # dynamic=False forces a STATIC graph per distinct sequence length. v3 cycles
+        # 13 sessions whose ONLINE M_vis and TEACHER/predictor N differ ⇒ ~26 distinct
+        # lengths, and each is further split by grad_mode (online grad vs the EMA
+        # teacher's no_grad block) and bf16/fp32 autocast dtype ⇒ ~100+ specialisations,
+        # far above the cache. The cache thrashes (evict→recompile every step): the
+        # probe saw 3001 grad_mode + ~2900 size recompiles and a flat ~15 s/step (eager
+        # FlexAttention, no fused kernel, was ~30 s/step — so compile is mandatory).
+        # dynamic=None marks the sequence dim symbolic after the 2nd length, collapsing
+        # the ~26 lengths to ONE graph ⇒ ~4 variants (grad×dtype) that all cache ⇒ the
+        # churn stops. FlexAttention supports dynamic seq-len when it owns the compile.
         import torch._dynamo as _dynamo
 
         _dynamo.config.cache_size_limit = max(64, len(sessions) * 4)
-        module.model = torch.compile(module.model, dynamic=False)  # type: ignore[assignment]
+        module.model = torch.compile(module.model, dynamic=None)  # type: ignore[assignment]
     trainer.fit(module, datamodule=dm)
 
 
