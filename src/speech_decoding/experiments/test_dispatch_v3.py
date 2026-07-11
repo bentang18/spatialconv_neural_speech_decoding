@@ -88,6 +88,8 @@ def _smoke_args(**over):
         ssl_max_steps=2, precision="32-true", accelerator="cpu", devices=1,
         grad_clip=3.0, accumulate_grad_batches=2, log_every_n_steps=1,
         ckpt_dir=None, ckpt_ladder_every=0, wandb_project=None, run_name=None,
+        compile=False, same_session_ranks=False, sdpa_backend="auto",
+        ddp_static_graph=False,
     )
     a.update(over)
     return argparse.Namespace(**a)

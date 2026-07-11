@@ -426,6 +426,15 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         # is longer than v2 (13 session shapes vs 1 padded) but one-time and bounded.
         import torch._dynamo as _dynamo
 
+        # DDPOptimizer OFF (v2 parity, v14_converged_v2_module.py:240): with it ON
+        # (torch default) Dynamo splits the compiled graph at DDP bucket boundaries and
+        # inserts its own allreduce, which (a) bypasses DDP's per-param autograd hooks —
+        # the mechanism behind the static_graph `expect_autograd_hooks_` assert — and
+        # (b) adds a graph break per bucket, worsening our already-heavy compile warmup.
+        # For 11.95M params on a single NVLink node with accum4 (allreduce every 4th
+        # step) the overlap it buys is negligible; one clean graph + DDP's native hook
+        # overlap is the better trade. FLOP/numerics-neutral.
+        _dynamo.config.optimize_ddp = False
         _dynamo.config.cache_size_limit = max(256, len(sessions) * 16)
         _dynamo.config.accumulated_cache_size_limit = max(512, len(sessions) * 32)
         module.model = torch.compile(module.model, dynamic=False)  # type: ignore[assignment]
