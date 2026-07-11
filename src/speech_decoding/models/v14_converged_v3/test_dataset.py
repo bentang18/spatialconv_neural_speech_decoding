@@ -162,3 +162,46 @@ def test_build_session_spec_slices_stats_to_survivors(tmp_path) -> None:
     n = len(spec.setup.sidecar.labels)
     for med, sig in spec.band_stats:
         assert med.shape[0] == n and sig.shape[0] == n
+
+
+def test_per_band_winsor_caps_each_normalizer(tmp_path) -> None:
+    # v3 winsor is per-band (SLOW/MID 15, HGA 20): each band's frozen normalizer must
+    # carry its own |z| cap so the looser HGA clamp doesn't leak onto SLOW/MID.
+    spec = _spec_winsor(tmp_path, winsor=(15.0, 15.0, 20.0))
+    caps = [nrm.winsor for nrm in spec.band_norms]
+    assert caps == [15.0, 15.0, 20.0]
+    # a scalar broadcasts to all bands (back-compat with the single-cap contract)
+    spec_scalar = _spec_winsor(tmp_path, winsor=12.0)
+    assert [nrm.winsor for nrm in spec_scalar.band_norms] == [12.0, 12.0, 12.0]
+    # and the clamp actually bites: a +100σ outlier is capped at the band's cap
+    z = spec.band_norms[2].transform(
+        spec.band_stats[2][0] + 100.0 * spec.band_stats[2][1]
+    )
+    assert float(z.max()) <= 20.0 + 1e-5 and float(z.max()) >= 20.0 - 1e-5
+
+
+def _spec_winsor(tmp, *, winsor):
+    labels, parcels = [], []
+    for s, n in enumerate((4, 3, 3)):
+        for c in range(1, n + 1):
+            labels.append(f"L{chr(65 + s)}{c}")
+            parcels.append(s)
+    c_full = len(labels)
+    setup = build_session_setup(labels, torch.tensor(parcels), drop_labels=frozenset())
+    band_paths, band_fbins = [], (F_SLOW, F_MID, F_HGA)
+    for bname, fb in zip(("v3slow", "v3mid", "hga"), band_fbins):
+        p, _ = _write_band(tmp, f"w_{bname}", c_full, fb, 4000)
+        band_paths.append(p)
+    band_stats = [
+        (torch.randn(c_full, fb, 1), torch.rand(c_full, fb, 1) + 0.5)
+        for fb in band_fbins
+    ]
+    return build_session_spec(
+        session_key=(1, 0),
+        band_paths=tuple(band_paths),
+        band_stats=tuple(band_stats),
+        setup=setup,
+        n_frames=4000,
+        bad_spans_s=[],
+        winsor=winsor,
+    )

@@ -286,6 +286,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="per-epoch clip budget/session (operational; epoch length + "
                         "window re-draw cadence, NOT a model hyperparameter)")
     p.add_argument("--clip-len", type=float, default=3.0, help="clip seconds (locked 3.0)")
+    # Per-band robust-z winsor |z| cap (v2 --session-z-winsor-{lfs,hga} port). SLOW+MID
+    # = the old sub-HGA content → 15; HGA's heavier tails get the looser 20 (Ben
+    # 2026-07-10). Applied at transform inside SessionRobustZNormalizer.
+    p.add_argument("--session-z-winsor-slow", dest="winsor_slow", type=float, default=15.0)
+    p.add_argument("--session-z-winsor-mid", dest="winsor_mid", type=float, default=15.0)
+    p.add_argument("--session-z-winsor-hga", dest="winsor_hga", type=float, default=20.0)
     p.add_argument("--num-workers", type=int, default=4)
     # --- locked optimizer/schedule ---
     p.add_argument("--lr", type=float, default=6e-3)
@@ -329,7 +335,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- io ---
     p.add_argument("--ckpt-dir", default=None, help="checkpoint + wandb save dir")
     p.add_argument("--ckpt-ladder-every", dest="ckpt_ladder_every", type=int,
-                   default=5000, help="save a ladder ckpt every N steps (0=off)")
+                   default=1000, help="save a ladder ckpt every N steps (0=off); "
+                                      "1000 = v2 probe-ladder cadence (Ben 2026-07-10)")
     p.add_argument("--wandb-project", dest="wandb_project", default=None,
                    help="wandb project (live); omit to disable logging")
     p.add_argument("--run-name", dest="run_name", default=None)
@@ -360,6 +367,7 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         span_dir=args.span_dir,
         parcel_fn=make_bt_parcel_fn(args.bt_root),
         lof_report_path=args.lof_report_path,
+        winsor=(args.winsor_slow, args.winsor_mid, args.winsor_hga),
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:

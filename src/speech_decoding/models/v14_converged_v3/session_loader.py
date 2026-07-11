@@ -74,7 +74,7 @@ def load_v3_sessions(
     parcel_fn: ParcelFn,
     lof_report_path: str | None = None,
     sigma_floor: float = 1e-6,
-    winsor: float | None = None,
+    winsor: float | Sequence[float] | None = None,
     mask_cfg: V3MaskConfig = V3MaskConfig(),
 ) -> list[V3SessionSpec]:
     """Assemble the per-session ``V3SessionSpec`` list for the datamodule."""

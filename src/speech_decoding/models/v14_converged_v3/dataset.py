@@ -61,22 +61,32 @@ def build_session_spec(
     n_frames: int,
     bad_spans_s: Sequence[tuple[float, float]],
     sigma_floor: float = 1e-6,
-    winsor: float | None = None,
+    winsor: float | Sequence[float] | None = None,
 ) -> V3SessionSpec:
     """Slice the full-C robust-z stats to survivors and freeze a normalizer per band.
 
     ``band_stats`` arrive at the caches' full ``C`` rows (as stored in ``.stats.npz``);
     ``keep_idx`` selects the survivor rows so median/σ align to the clip rows the
     mmap read returns. ``winsor``/``sigma_floor`` are applied at transform (reused
-    ``SessionRobustZNormalizer`` contract), not baked into σ.
+    ``SessionRobustZNormalizer`` contract), not baked into σ. ``winsor`` may be a
+    single |z| cap broadcast to all bands, or a per-band sequence (v3 default
+    SLOW/MID 15, HGA 20 — HGA's heavier tails get the looser clamp).
     """
     keep = setup.keep_idx
     sliced = tuple((med[keep], sig[keep]) for med, sig in band_stats)
+    if winsor is None or isinstance(winsor, (int, float)):
+        winsor_bands: tuple[float | None, ...] = (winsor,) * len(sliced)
+    else:
+        winsor_bands = tuple(winsor)
+        if len(winsor_bands) != len(sliced):
+            raise ValueError(
+                f"winsor sequence length {len(winsor_bands)} != n_bands {len(sliced)}"
+            )
     norms = tuple(
         SessionRobustZNormalizer.from_stats(
-            median=med, sigma=sig, sigma_floor=sigma_floor, winsor=winsor
+            median=med, sigma=sig, sigma_floor=sigma_floor, winsor=w
         )
-        for med, sig in sliced
+        for (med, sig), w in zip(sliced, winsor_bands)
     )
     return V3SessionSpec(
         session_key=session_key,
