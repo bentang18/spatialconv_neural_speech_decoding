@@ -17,8 +17,9 @@ model-agnostic substrate v2 relies on:
 
 Hyperparameters are the frozen v2 set (Ben 2026-07-10): lr 6e-3, wd 0.04,
 grad-clip 3.0, warmup_cosine with min_lr_ratio 1.0 (flat peak after 5k warmup),
-ema-tau 0.99925, β₂ 0.95, seed 33, bs 32 × accum 4. target_ln / predictor
-terminal-LN / QK-norm are ON by construction in :class:`V3ConvergedModel`.
+ema-tau 0.99925, β₂ 0.95, seed 33, bs 32 × accum 4. target_ln and the predictor
+terminal-LN are ON by construction in :class:`V3ConvergedModel`; QK-norm is OFF
+(intentional — see attention.py rationale, not on the locked-divergences list).
 
 Masking is the sole augmentation and is sampled INSIDE ``model.forward`` from a
 per-step generator seeded ``f(seed, global_step)`` — resume-stable (same step ⇒
@@ -110,10 +111,13 @@ class V14ConvergedV3Module(pl.LightningModule):
         place), so the custom batch type moves itself: the band tensors + the
         per-session geometry (``L1Geometry.to``) + ``parcel_id``; ``session_key`` is
         metadata and stays put."""
+        # non_blocking H2D: pin_memory is on (datamodule), so async copies overlap
+        # transfer with compute. geom is a per-session static that Lightning may move
+        # before the pinned batch tensors exist; keep it blocking (its own .to).
         return V3Batch(
-            bands=[b.to(device) for b in batch.bands],
+            bands=[b.to(device, non_blocking=True) for b in batch.bands],
             geom=batch.geom.to(device),
-            parcel_id=batch.parcel_id.to(device),
+            parcel_id=batch.parcel_id.to(device, non_blocking=True),
             session_key=batch.session_key,
         )
 
