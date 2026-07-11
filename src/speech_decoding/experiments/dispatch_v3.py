@@ -311,7 +311,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
-    p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=50)
+    p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=1,
+                   help="wandb flush cadence; 1 = per-step resolution (Ben 2026-07-11) "
+                        "so update_cos/grad-spike/feat_std are not window-averaged away")
     p.add_argument("--context-lambda", dest="context_lambda", type=float, default=0.0,
                    help="context-loss hold value (#66, V-JEPA 2.1 predict_all): off "
                         "before --context-warmup-start, linear ramp to this, then hold. "
