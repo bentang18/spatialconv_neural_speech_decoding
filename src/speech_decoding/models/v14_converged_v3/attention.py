@@ -35,7 +35,7 @@ from torch import Tensor, nn
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.packing import PackPlan
 from speech_decoding.models.v14_converged_v3.pe import L1RoPE
-from speech_decoding.models.v14_converged_v3.varlen import varlen_block_diag_attention
+from speech_decoding.models.v14_converged_v3.varlen import sdpa_block_diag_packed
 
 LN_EPS = 1e-6  # v14 convention (v14_encoder.LN_EPS)
 NEG_INF_MASK = -1e4  # v14 convention: finite (not -inf) → all-masked rows go uniform
@@ -176,12 +176,17 @@ class L1Block(nn.Module):
         else:
             qh, kh = self.rope.rotate(qh, kh, rope_cs[0], rope_cs[1])
         q, k = qh.transpose(0, 1), kh.transpose(0, 1)  # (total, H, hd)
-        # RoPE promotes q,k to fp32 (cos/sin fp32 buffers); align to v for flash
-        # (strict/flash needs q,k,v same dtype). No-op under fp32.
+        # RoPE promotes q,k to fp32 (cos/sin fp32 buffers); align to v for the SDPA
+        # (strict/cuDNN needs q,k,v same dtype). No-op under fp32.
         q, k = q.to(v.dtype), k.to(v.dtype)
 
-        ctx = varlen_block_diag_attention(
-            q, k, v, plan.cu_seqlens, plan.max_seqlen, backend=backend
+        # SDPA-per-block (dense cuDNN on GPU, math on CPU): scatter packed → padded
+        # (B, S*max_c, T) grid, one dense attention per (clip, shaft) block, gather back.
+        # Same grid + key set as the padded oracle ⇒ per-contact-identical, but the
+        # linears above stayed on the packed P (keeps #24's visible-gather saving).
+        max_c = plan.max_seqlen // T
+        ctx = sdpa_block_diag_packed(
+            q, k, v, plan.grid_pos, plan.n_shafts, max_c, T
         )  # (total, H, hd)
         ctx = self.out(ctx.reshape(total, d)).reshape(B, P, T, d)
         return ctx

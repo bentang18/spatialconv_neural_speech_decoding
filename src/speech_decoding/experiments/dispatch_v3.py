@@ -69,6 +69,29 @@ class _EpochSeedCallback(pl.Callback):
             dm.set_epoch(int(trainer.current_epoch))
 
 
+class _StepTimeCallback(pl.Callback):
+    """Log wall-clock ``train_sec_per_step`` every step — FREE (a CPU perf_counter
+    diff between consecutive batch-ends + one scalar log; no CUDA sync, no extra
+    kernel, and loss already logs each step). Measures true step-to-step throughput
+    incl. dataloader, so compile spikes show as tall bars and the steady floor is
+    obvious. First step is skipped (no prior mark); ``sync_dist=False`` ⇒ no
+    cross-rank barrier."""
+
+    def __init__(self) -> None:
+        self._t: float | None = None
+
+    def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, *_: object) -> None:  # noqa: ARG002
+        import time
+
+        now = time.perf_counter()
+        if self._t is not None:
+            pl_module.log(
+                "train_sec_per_step", now - self._t,
+                on_step=True, on_epoch=False, prog_bar=True, sync_dist=False,
+            )
+        self._t = now
+
+
 # --------------------------------------------------------------------- optimizer
 def build_v3_optim_cfg(
     *,
@@ -202,6 +225,7 @@ def build_v3_training(
         fps=_FPS,
         num_workers=args.num_workers,
         seed=args.seed,
+        same_session=args.same_session_ranks,
     )
     trainer = _build_trainer(args)
     return module, dm, trainer
@@ -213,6 +237,7 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
 
     callbacks: list[pl.Callback] = [
         _EpochSeedCallback(),
+        _StepTimeCallback(),
         SSLHealthMonitorV3(every_n_steps=args.monitor_every_n_steps),
     ]
     if args.ckpt_ladder_every > 0 and args.ckpt_dir:
@@ -334,6 +359,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ddp-static-graph", dest="ddp_static_graph",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="DDP static_graph (multi-GPU only; v2 --ddp-static-graph)")
+    p.add_argument("--same-session-ranks", dest="same_session_ranks",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="All DDP ranks step the SAME session each step (v2 "
+                        "--same-session-ranks): identical shape across ranks ⇒ no "
+                        "recompile-desync stall under --compile + no straggler. "
+                        "DEFAULT ON (max-throughput); --no-same-session-ranks to disable. "
+                        "Multi-GPU only; no-op at devices=1.")
+    p.add_argument("--sdpa-backend", dest="sdpa_backend", default="auto",
+                   choices=["auto", "cudnn", "flash", "efficient", "math"],
+                   help="Preferred SDPA backend (v2 --sdpa-backend cudnn). Sets a "
+                        "PRIORITY list (chosen first, then flash/efficient/math) so "
+                        "an unusable kernel gracefully falls back — never hard-errors. "
+                        "'auto' (default) leaves torch's dispatcher untouched.")
     # --- io ---
     p.add_argument("--ckpt-dir", default=None, help="checkpoint + wandb save dir")
     p.add_argument("--ckpt-ladder-every", dest="ckpt_ladder_every", type=int,
@@ -373,22 +411,49 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:
-        # dynamic=None (AUTO), NOT False — measured by the G4 probe (2026-07-11).
-        # dynamic=False forces a STATIC graph per distinct sequence length. v3 cycles
-        # 13 sessions whose ONLINE M_vis and TEACHER/predictor N differ ⇒ ~26 distinct
-        # lengths, and each is further split by grad_mode (online grad vs the EMA
-        # teacher's no_grad block) and bf16/fp32 autocast dtype ⇒ ~100+ specialisations,
-        # far above the cache. The cache thrashes (evict→recompile every step): the
-        # probe saw 3001 grad_mode + ~2900 size recompiles and a flat ~15 s/step (eager
-        # FlexAttention, no fused kernel, was ~30 s/step — so compile is mandatory).
-        # dynamic=None marks the sequence dim symbolic after the 2nd length, collapsing
-        # the ~26 lengths to ONE graph ⇒ ~4 variants (grad×dtype) that all cache ⇒ the
-        # churn stops. FlexAttention supports dynamic seq-len when it owns the compile.
+        # dynamic=False (STATIC graph per shape) = v2's --no-compile-dynamic, the config
+        # that hit 1-2 s/step. Static shapes give the best-fused kernels; the EARLIER
+        # G4 probe's thrash (3001 grad_mode + 2900 size recompiles, flat ~15 s/step) was
+        # NOT dynamic=False's fault — it was cache EVICTION: v3 cycles 13 sessions whose
+        # ONLINE M_vis and TEACHER/predictor N differ, ×grad_mode (online grad vs EMA
+        # teacher no_grad) ×bf16/fp32 autocast ⇒ ~150 specialisations across the towers,
+        # far above cache_size_limit=64. Once the working set exceeds the cache, Dynamo
+        # evicts a variant and recompiles it next step ⇒ perpetual ping-pong, warmup
+        # never ends. dynamic=None "fixed" the shape axis but broke build_pack_plan with
+        # symbolic-value guards (packing.py:84 recompiled every step). The real fix:
+        # keep dynamic=False and size the cache ABOVE the working set so the ~500-step
+        # warmup COMPLETES and every step thereafter hits a cached static kernel. Warmup
+        # is longer than v2 (13 session shapes vs 1 padded) but one-time and bounded.
         import torch._dynamo as _dynamo
 
-        _dynamo.config.cache_size_limit = max(64, len(sessions) * 4)
-        module.model = torch.compile(module.model, dynamic=None)  # type: ignore[assignment]
-    trainer.fit(module, datamodule=dm)
+        _dynamo.config.cache_size_limit = max(256, len(sessions) * 16)
+        _dynamo.config.accumulated_cache_size_limit = max(512, len(sessions) * 32)
+        module.model = torch.compile(module.model, dynamic=False)  # type: ignore[assignment]
+    with _sdpa_ctx(args.sdpa_backend):
+        trainer.fit(module, datamodule=dm)
+
+
+def _sdpa_ctx(name: str):
+    """Prefer one SDPA backend, keep the rest as fallback so an unusable kernel
+    (e.g. cuDNN rejecting our additive pad-key bias) degrades instead of raising.
+    Under ``--compile`` the context is active when inductor lowers SDPA on the first
+    step, so the preference is baked into the compiled kernel. ``auto`` = no-op."""
+    import contextlib
+
+    if name == "auto":
+        return contextlib.nullcontext()
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    order = {
+        "cudnn": SDPBackend.CUDNN_ATTENTION,
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+        "math": SDPBackend.MATH,
+    }
+    rest = [b for b in (SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH)
+            if b is not order[name]]
+    return sdpa_kernel([order[name], *rest], set_priority=True)
 
 
 if __name__ == "__main__":

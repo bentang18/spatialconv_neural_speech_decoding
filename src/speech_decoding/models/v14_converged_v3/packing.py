@@ -50,6 +50,13 @@ class PackPlan:
     max_seqlen: int  # max block length in tokens (static upper bound = max_c * T)
     n_selected: int  # P — selected contacts per clip (constant per session)
     n_tokens: int  # B * P * T — total packed tokens (constant per session)
+    grid_pos: Tensor  # (B, P) long — flat (shaft*max_c + slot_in_shaft) grid cell per
+    # packed slot. The SDPA-per-block attention (varlen.sdpa_block_diag_packed) scatters
+    # the packed q/k/v into the padded (B, S*max_c, T) grid at these cells, runs one dense
+    # cuDNN SDPA per (clip, shaft) block (masked pad keys), and gathers back — same grid
+    # + key set as the padded L1Block._attn oracle, so per-contact-identical, but with the
+    # linears still on the packed P (keeps #24's visible-gather saving).
+    n_shafts: int  # S — shaft count (grid row count); grid width = max_c = max_seqlen // T
 
 
 def build_pack_plan(
@@ -101,6 +108,15 @@ def build_pack_plan(
     order = canon[pos]  # (B, P) long — selected contacts in N, shaft-grouped
     depth = depth_canon[pos]  # (B, P) long — clinical depth per selected slot
 
+    # flat padded-grid cell (shaft*max_c + slot_in_shaft) per selected slot, for the
+    # SDPA-per-block scatter. canon iterates ``geom.valid`` in row-major (shaft, slot)
+    # order, so the j-th valid cell's flat grid index = grid_flat[valid][j]; index that
+    # by ``pos`` to get the cell of each packed slot. Visible-but-holey shafts keep their
+    # ORIGINAL slot positions (holes stay empty, masked out) — matching the padded oracle.
+    grid_flat = torch.arange(S * geom.max_c, device=device)  # (S*max_c,)
+    canon_grid = grid_flat[geom.valid.reshape(-1)]  # (N,) grid cell per canon position
+    grid_pos = canon_grid[pos]  # (B, P) long — grid cell per packed slot
+
     # per-(clip, shaft) visible count → segment lengths in TOKEN units (Vs * T). Kept
     # for ALL S shafts (a whole-masked shaft ⇒ Vs=0 ⇒ zero-length block, not filtered)
     # so cu_seqlens has the per-session-constant length B*S+1.
@@ -117,6 +133,8 @@ def build_pack_plan(
         max_seqlen=geom.max_c * T,
         n_selected=P,
         n_tokens=B * P * T,
+        grid_pos=grid_pos,
+        n_shafts=S,
     )
 
 

@@ -96,20 +96,60 @@ def _reference_block_diag(
 
 
 def _flex_block_diag(
-    q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor, *, compiled: bool = True
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: Tensor,
+    *,
+    n_clips: int | None = None,
+    compiled: bool = True,
 ) -> Tensor:
     """Block-diagonal attention via FlexAttention (GPU, no external wheel).
 
     Same contract as the other backends: q,k,v ``(total, H, hd)``, blocks delimited
     by ``cu_seqlens``. A token attends iff it shares a block. Softmax scale
     ``1/sqrt(hd)`` (flex default). ``compiled=False`` runs eager ``flex_attention``
-    (tiny-N numerical test only — eager materialises the score grid)."""
+    (tiny-N numerical test only — eager materialises the score grid).
+
+    ``n_clips`` (the packed batch B) switches to the BATCHED-per-clip layout: the
+    flat ``total = B·P·T`` tokens are reshaped to ``(B, P·T)`` and flex is given a
+    per-clip block-diagonal mask over the ``S`` shafts. This is IDENTICAL to the flat
+    global mask — a token attends iff it shares (clip, shaft): same-clip is enforced
+    by the batch dim, same-shaft by the mask — but it drops flex's tile-walk from
+    ``(B·P·T/128)²`` to ``B·(P·T/128)²`` (~B× less), the G4 320k-token O(seq²) cost.
+    ``None`` keeps the flat single-sequence layout (CPU test / tiny-N)."""
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
     total = q.shape[0]
+    H, hd = q.shape[1], q.shape[2]
+    fn = _flex_fn() if compiled else flex_attention
+
+    if n_clips is not None:
+        # BATCHED per-clip: local shaft id (0..S-1) within each clip. The flat block
+        # id (0..B·S-1) minus clip·S; clip = token // (P·T). Blocks are clip-major so
+        # the reshape (total,)→(B, P·T) lands each clip's tokens contiguously.
+        seg_flat = _segment_ids(cu_seqlens, total)  # (total,) 0..B*S-1
+        s_per_clip = (cu_seqlens.shape[0] - 1) // n_clips  # S
+        length = total // n_clips  # P*T
+        clip_of = torch.arange(total, device=q.device) // length
+        seg_bl = (seg_flat - clip_of * s_per_clip).reshape(n_clips, length)  # (B, P*T)
+
+        def _mask_mod(b, h, q_idx, kv_idx):
+            return seg_bl[b, q_idx] == seg_bl[b, kv_idx]
+
+        block_mask = create_block_mask(
+            _mask_mod, B=n_clips, H=None, Q_LEN=length, KV_LEN=length,
+            device=q.device, _compile=compiled,
+        )
+        qb = q.reshape(n_clips, length, H, hd).transpose(1, 2)  # (B, H, P*T, hd)
+        kb = k.reshape(n_clips, length, H, hd).transpose(1, 2)
+        vb = v.reshape(n_clips, length, H, hd).transpose(1, 2)
+        ctx = fn(qb, kb, vb, block_mask=block_mask)  # (B, H, P*T, hd)
+        return ctx.transpose(1, 2).reshape(total, H, hd).contiguous()
+
     seg = _segment_ids(cu_seqlens, total)  # (total,) block id per token
 
-    def _mask_mod(b, h, q_idx, kv_idx):
+    def _mask_mod_flat(b, h, q_idx, kv_idx):
         return seg[q_idx] == seg[kv_idx]
 
     # ``_compile`` builds the BlockMask per 128-tile (mask_mod evaluated block-wise);
@@ -117,15 +157,68 @@ def _flex_block_diag(
     # OOMs at real token counts (the F2b GH200 failure). ``total`` is constant per
     # session (constant masked-count invariant) ⇒ compiles once per session, reused.
     block_mask = create_block_mask(
-        _mask_mod, B=None, H=None, Q_LEN=total, KV_LEN=total, device=q.device,
+        _mask_mod_flat, B=None, H=None, Q_LEN=total, KV_LEN=total, device=q.device,
         _compile=compiled,
     )
     qh = q.transpose(0, 1)[None]  # (1, H, total, hd)
     kh = k.transpose(0, 1)[None]
     vh = v.transpose(0, 1)[None]
-    fn = _flex_fn() if compiled else flex_attention
     ctx = fn(qh, kh, vh, block_mask=block_mask)  # scale=None ⇒ 1/sqrt(hd)
     return ctx[0].transpose(0, 1).contiguous()  # (total, H, hd)
+
+
+def sdpa_block_diag_packed(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    grid_pos: Tensor,
+    n_shafts: int,
+    max_c: int,
+    n_time: int,
+) -> Tensor:
+    """Block-diagonal L1 attention via dense SDPA-per-block — the PRODUCTION path.
+
+    q,k,v: ``(total = B*P*T, H, hd)`` — the packed tokens (linears already run on the
+    packed P, keeping #24's visible-gather saving). ``grid_pos`` ``(B, P)`` is each
+    packed slot's flat cell in the padded ``(S, max_c)`` grid (``PackPlan.grid_pos``).
+
+    The packed q/k/v are SCATTERED into the padded ``(B, S*max_c, T)`` grid, reshaped
+    to ``(B*S, max_c*T)`` so each ``(clip, shaft)`` block is one batch row, and a SINGLE
+    dense ``scaled_dot_product_attention`` runs per block with the pad cells masked out
+    (finite ``NEG_INF_MASK`` so a whole-masked row softmaxes to uniform, never NaN — the
+    v14 convention). The context is gathered back to the packed layout. This is EXACTLY
+    the padded ``L1Block._attn`` oracle's SDPA (same grid, same key set, same RoPE'd
+    q/k) — per-contact-identical — and runs on every device (SDPA picks the math kernel
+    on CPU, cuDNN/flash on GPU). No FlexAttention, no external flash wheel."""
+    total, H, hd = q.shape
+    B, P = grid_pos.shape
+    T = n_time
+    S = n_shafts
+    G = S * max_c  # grid rows (padded contacts per clip)
+
+    idx = grid_pos[:, :, None, None, None].expand(B, P, T, H, hd)  # scatter/gather index
+    qg = q.new_zeros(B, G, T, H, hd).scatter_(1, idx, q.reshape(B, P, T, H, hd))
+    kg = k.new_zeros(B, G, T, H, hd).scatter_(1, idx, k.reshape(B, P, T, H, hd))
+    vg = v.new_zeros(B, G, T, H, hd).scatter_(1, idx, v.reshape(B, P, T, H, hd))
+
+    # key mask: a grid cell is a valid key iff a packed slot scattered into it. (B, G) →
+    # (B*S, 1, 1, max_c*T), additive NEG (not -inf) so all-pad query rows go uniform.
+    filled = q.new_zeros(B, G, dtype=torch.bool).scatter_(
+        1, grid_pos, torch.ones_like(grid_pos, dtype=torch.bool)
+    )
+    key_ok = filled.reshape(B * S, max_c)[:, :, None].expand(B * S, max_c, T).reshape(B * S, 1, 1, max_c * T)
+    attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).to(v.dtype)
+
+    # (B, S, max_c, T, H, hd) → (B*S, H, max_c*T, hd). Token = slot*T + t (contact-major),
+    # matching the oracle's c*T + t ordering.
+    def _to_blocks(g: Tensor) -> Tensor:
+        return g.reshape(B * S, max_c * T, H, hd).transpose(1, 2)
+
+    ctx = F.scaled_dot_product_attention(
+        _to_blocks(qg), _to_blocks(kg), _to_blocks(vg), attn_mask=attn_bias
+    )  # (B*S, H, max_c*T, hd)
+    ctx = ctx.transpose(1, 2).reshape(B, G, T, H, hd)
+    return ctx.gather(1, idx).reshape(total, H, hd)  # back to packed (total, H, hd)
 
 
 def _flash_varlen(

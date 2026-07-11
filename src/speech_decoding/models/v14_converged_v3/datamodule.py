@@ -51,6 +51,7 @@ class V3DataModule(pl.LightningDataModule):
         persistent_workers: bool = False,
         prefetch_factor: int = 4,
         balance_ranks: bool = False,
+        same_session: bool = False,
     ) -> None:
         super().__init__()
         self.dataset = V3SessionDataset(
@@ -71,6 +72,11 @@ class V3DataModule(pl.LightningDataModule):
         self.persistent_workers = bool(persistent_workers)
         self.prefetch_factor = int(prefetch_factor)
         self.balance_ranks = bool(balance_ranks)
+        # same_session (v2 `--same-session-ranks`): all DDP ranks step the SAME session
+        # each step ⇒ identical N/shape across ranks. Under `--compile` this keeps every
+        # rank on the SAME compiled variant at the same step (no recompile-desync stall
+        # at the all-reduce barrier) AND removes the straggler. Multi-GPU only (world>1).
+        self.same_session = bool(same_session)
         self._sampler: _SessionGroupedBatchSampler | None = None
 
     def set_epoch(self, epoch: int) -> None:
@@ -87,6 +93,7 @@ class V3DataModule(pl.LightningDataModule):
             seed=self.seed,
             session_size=self._session_size,
             balance_ranks=self.balance_ranks,
+            same_session=self.same_session,
         )
         kwargs: dict = dict(
             batch_sampler=self._sampler,
