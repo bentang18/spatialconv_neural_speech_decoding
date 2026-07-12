@@ -208,8 +208,9 @@ def test_outer_product_visible_fraction_matches_product() -> None:
 def test_static_counts_are_constant_across_seeds() -> None:
     sc, geom = _session([14, 12, 10, 8, 6])  # N=50
     n, t = 50, 96
-    d = round(0.5 * n)
-    tmask = round(0.5 * t)
+    cfg = V3MaskConfig()  # no cfg passed to sample_masks below ⇒ assert the DEFAULT's invariant
+    d = round(cfg.space_frac * n)
+    tmask = round(cfg.time_frac * t)
     for seed in range(20):
         m = sample_masks(geom, n, n_time=t, n_rows=8, generator=_gen(seed))
         assert (m.contact_mask.sum(1) == d).all()
@@ -239,7 +240,7 @@ def test_only_valid_contacts_masked() -> None:
     sc, geom = _session([7, 5])  # N=12
     m = sample_masks(geom, 12, n_time=96, n_rows=4, generator=_gen())
     assert m.contact_mask.shape == (4, 12)
-    assert m.contact_mask.sum(1).unique().tolist() == [6]  # D = round(0.5·12)
+    assert m.contact_mask.sum(1).unique().tolist() == [round(V3MaskConfig().space_frac * 12)]
 
 
 def test_feasible_passes_for_realistic_seeg() -> None:

@@ -30,8 +30,10 @@ Masking-axis inversion (Ben 2026-07-12): the old scheme masked whole CONTACTS
       live shaft would leave a masked cell (c,t) with no same-t visible neighbour for
       the predictor to reconstruct from. Guarantee ≥1 live sensor per t WITHOUT
       breaking the exact-``T_mask`` (static) invariant: assign each t a single
-      "guardian" shaft — the live shaft whose local live-index equals ``t mod V``
-      (``V`` = live shafts this row) — and FORBID that shaft from masking t. Guardian
+      "guardian" shaft (``V`` = live shafts this row) via a random per-row permutation
+      (``perm_rank % V`` — balanced so each live-index guards ``⌊T/V⌋..⌈T/V⌉`` frames,
+      but RANDOMLY scattered, NOT the ``t mod V`` diagonal, which was a phase-locked,
+      memorizable positional crutch) — and FORBID that shaft from masking t. Guardian
       frames are held visible, the remaining ``T_mask`` masked frames are block-sampled
       as usual. Exactly one guardian per t ⇒ coverage ≥1 everywhere, by construction.
       Feasible for ``V ≥ 2`` (guardian frames ``≈T/V ≤ T_kept``); ``V=1`` (a single
@@ -64,9 +66,9 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 
 @dataclass(frozen=True)
 class V3MaskConfig:
-    space_frac: float = 0.5  # D = round(space_frac·N) contacts masked (whole + intra)
+    space_frac: float = 0.60  # D = round(space_frac·N) contacts masked (whole + intra)
     time_frac: float = 0.5  # T_mask = round(time_frac·T) frames masked per shaft
-    whole_shaft_frac: float = 0.15  # E[K]; K ~ Binomial(S, frac) clamped to K_max
+    whole_shaft_frac: float = 0.10  # E[K]; K ~ Binomial(S, frac) clamped to K_max
     block_w_space: int = 4  # depth-block width (contacts); floor 4 = HGA along-shaft autocorr
     block_w_time: int = 7  # time-block width (frames); floor 7 = HGA |STFT| support
 
@@ -191,8 +193,18 @@ def sample_masks(
     v_live = live_shaft.sum(1).clamp(min=1)  # (R,) live-shaft count (≥1 by construction)
     # local live-index of each shaft = # live shafts strictly before it in the row.
     lidx = (live_shaft.cumsum(1) - 1).clamp(min=0)  # (R, S) only meaningful where live
-    t_ar = torch.arange(t, device=dev)  # (T,)
-    guardian = (t_ar[None, None, :] % v_live[:, None, None]) == lidx[:, :, None]  # (R,S,T)
+    # Balanced-RANDOM guardian (Ben 2026-07-12): a deterministic ``t % V == lidx``
+    # forces a rigid diagonal of always-visible cells (phase-locked to t=0) — a
+    # memorizable positional scaffold that systematically exempts a (t, shaft = t mod V)
+    # sublattice from the temporal task. Instead assign each frame its guardian via a
+    # random per-row permutation. ``perm_rank`` is a bijection 0..T-1, so ``% v_live`` is
+    # still perfectly balanced (live-index j guards ⌊T/V⌋ or ⌈T/V⌉ frames — the SAME
+    # per-shaft counts as the deterministic version ⇒ exact-T_mask static invariant and
+    # ≥1-coverage preserved identically) but the guarded frames are randomly scattered,
+    # not a diagonal, killing the positional crutch.
+    perm_rank = rand(r, t).argsort(1).argsort(1)  # (R, T) random bijection 0..T-1 per row
+    guardian_local = perm_rank % v_live[:, None]  # (R, T) balanced live-index labels, scattered
+    guardian = guardian_local[:, None, :] == lidx[:, :, None]  # (R, S, T)
     forbid = guardian & live_shaft[:, :, None]  # (R, S, T) held-visible frames
 
     valid_time = torch.ones(s, t, dtype=torch.bool, device=dev)  # every frame valid
