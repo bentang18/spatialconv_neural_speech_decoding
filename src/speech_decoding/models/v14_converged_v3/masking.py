@@ -66,7 +66,7 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 
 @dataclass(frozen=True)
 class V3MaskConfig:
-    space_frac: float = 0.50  # D = round(space_frac·N) contacts masked (whole + intra)
+    space_frac: float = 0.60  # D = round(space_frac·N) contacts masked (whole + intra)
     time_frac: float = 0.5  # T_mask = round(time_frac·T) frames masked per shaft
     whole_shaft_frac: float = 0.10  # E[K]; K ~ Binomial(S, frac) clamped to K_max
     block_w_space: int = 4  # depth-block width (contacts); floor 4 = HGA along-shaft autocorr
