@@ -37,8 +37,9 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.packing import (
     PackPlan,
     build_pack_plan,
+    gather_cells,
     gather_tokens,
-    scatter_tokens,
+    scatter_cells,
 )
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import SpectralStem
@@ -112,11 +113,12 @@ class _TargetTower(nn.Module):
         backend: str = "auto",
         tap_blocks: tuple[int, ...] = (),
     ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
-        # PACKED production path (#24): stem over all N, gather the plan's selected
-        # contacts (M_vis online / N teacher), run the encoder packed. This is the
+        # PACKED production path (#24, dual-axis): stem over all N×T, gather the plan's
+        # selected VISIBLE CELLS (M_vis×T_kept online / N×T teacher — full-grid time_idx
+        # is arange(T) ⇒ a no-op on the time axis), run the encoder packed. This is the
         # forward the EMA teacher (a deepcopy) also routes through.
         tokens = self.stem(bands)  # (B, N, T, 256)
-        x = gather_tokens(tokens, plan.order)  # (B, P, T, 256)
+        x = gather_cells(tokens, plan.order, plan.time_idx)  # (B, P, T_kept, 256)
         return self.encoder.forward_packed(
             x, plan, parcel_packed, backend=backend, tap_blocks=tap_blocks
         )
@@ -194,93 +196,110 @@ class V3JepaObjective(nn.Module):
         bands: Sequence[Tensor],
         geom: L1Geometry,
         parcel_id: Tensor,
-        mask: Tensor,
+        contact_mask: Tensor,
+        frame_mask: Tensor,
         *,
-        m_masked: int,
+        m_vis: int,
+        t_kept: int,
         backend: str = "auto",
         collect_taps: bool = False,
         whole_contact: Tensor | None = None,
         lambda_context: float | Tensor = 0.0,
     ) -> JepaOutput:
-        """bands: 3-band |STFT| inputs; mask: (B, N) bool (True = target).
+        """bands: 3-band |STFT| inputs. Dual-axis masks (Ben 2026-07-12):
+        ``contact_mask`` (B, N) bool = spatially masked contacts; ``frame_mask``
+        (B, S, T) bool = temporally masked frames per shaft. A CELL (contact c, frame t)
+        is a target iff c is spatially masked OR t is masked for c's shaft.
 
-        PACKED production path (#24 FULL varlen): the online encoder runs over the
-        ``M_vis = N − m_masked`` visible contacts, the EMA teacher + predictor over
-        all N, all shaft-grouped and ragged (no ``max_c`` pad). ``m_masked`` = the
-        per-row held-out count ``M = round(mask_frac·N)`` (a per-session CONSTANT the
-        model supplies) — it fixes ``M_vis`` without a host-sync on ``mask.sum()`` and
-        gives ``n_masked = B·M·T`` for free (B6).
+        PACKED production path (#24 FULL varlen, dual-axis): the online encoder runs over
+        the ``m_vis·t_kept`` VISIBLE CELLS (space-kept ∧ frame-kept), compacted and ragged
+        on BOTH axes; the EMA teacher + predictor over the FULL grid (all N contacts × all
+        T frames, same-t exact). ``m_vis = N − D`` and ``t_kept = T − T_mask`` are
+        per-session CONSTANTS the model supplies — they fix the compacted shapes without a
+        host-sync and give ``n_masked = B·(N·T − m_vis·t_kept)`` for free (B6).
 
         ``collect_taps`` (monitor cadence only): also return detached taps — encoder
-        block-3/12 visible rows (rankme/feat_std) + predictor/target rows split by
-        whole-sensor vs intra-sensor tier. ``whole_contact`` (B, N) bool required then.
+        block-12 visible cells (rankme/feat_std) + predictor/target cells split by
+        whole-sensor vs intra tier. ``whole_contact`` (B, N) bool required then.
         """
-        visible = ~mask  # (B, N)
-        B, N = mask.shape
+        B, N = contact_mask.shape
         T = bands[0].shape[-1]  # 32 Hz clock length (all bands native 32 Hz, factor 1)
-        m_vis = N - m_masked
+        shaft_of = geom.shaft_of_contact  # (N,) long — shaft id per contact
+        # dual-axis CELL mask: masked iff contact spatially masked OR frame masked for its
+        # shaft (per-sensor outer product; homogeneous within shaft). (B, N, T) True=target.
+        cell_masked = contact_mask[:, :, None] | frame_mask[:, shaft_of, :]  # (B, N, T)
+        cell_visible = ~cell_masked
 
-        # per-clip visible pack plan (online) + static all-N plan (teacher/predictor)
+        # per-clip visible-CELL pack plan (online, compacted on both axes + L2 real-frame
+        # regroup) + static full-grid plan (teacher/predictor, no time compaction/regroup).
         online_plan = build_pack_plan(
-            geom, n_time=T, batch=B, n_selected=m_vis, visible=visible
+            geom, n_time=T, batch=B, n_selected=m_vis,
+            visible=~contact_mask, frame_keep=~frame_mask,
         )
         full_plan = build_pack_plan(geom, n_time=T, batch=B, n_selected=N, visible=None)
-        online_parcel = parcel_id[online_plan.order]  # (B, M_vis)
+        online_parcel = parcel_id[online_plan.order]  # (B, m_vis)
         full_parcel = parcel_id[full_plan.order]  # (B, N)
 
-        # online encoder over the visible contacts (packed)
+        # online encoder over the visible cells (packed) → (B, m_vis, T_kept, d)
         if collect_taps:
             z, enc_taps = self.online(
                 bands, online_plan, online_parcel, backend=backend, tap_blocks=(12,)
-            )  # (B, M_vis, T, 256)
+            )
         else:
             z = self.online(bands, online_plan, online_parcel, backend=backend)
 
-        # EMA teacher over all N (packed, full_plan order) → targets
+        # EMA teacher over the full grid (packed, full_plan order) → targets
         with torch.no_grad():
             tgt = self.teacher(bands, full_plan, full_parcel, backend=backend)
         # (B,N,T,n_levels·256) full order; deep-sup per-level double-norm (see _ln_target)
         tgt = _ln_target(tgt, self.n_levels) if self.target_ln else stop_grad(tgt)
 
-        # predictor input assembly: enc_to_pred(z) at visible, mask-query at masked
-        # (built in CONTACT order, then gathered into the predictor's all-N order).
-        zp_full = scatter_tokens(self.enc_to_pred(z), online_plan.order, N)  # (B,N,T,128)
-        m = mask[:, :, None, None]  # (B, N, 1, 1)
-        pred_in_full = torch.where(m, self.mask_token, zp_full)  # masked → query, contact order
+        # predictor input assembly: enc_to_pred(z) at visible CELLS, mask-query at masked
+        # cells (built in CONTACT order, then gathered into the predictor's all-N order).
+        # scatter_cells places the compacted encoder outputs back at their (order, real
+        # frame) cells; masked cells stay 0 then get the mask-query below.
+        zp_full = scatter_cells(
+            self.enc_to_pred(z), online_plan.order, online_plan.time_idx, N, T
+        )  # (B, N, T, 128) contact order
+        pred_in_full = torch.where(
+            cell_masked[:, :, :, None], self.mask_token, zp_full
+        )  # masked cell → query, contact order
         pred_in = gather_tokens(pred_in_full, full_plan.order)  # (B, N, T, 128) full order
         h = self.predictor.forward_packed(pred_in, full_plan, full_parcel, backend=backend)
-        pred = self.pred_to_target(h)  # (B, N, T, 256) full order
+        pred = self.pred_to_target(h)  # (B, N, T, n_levels·256) full order
 
-        # L1 at masked positions; pred & tgt BOTH in full_plan order → reorder mask.
+        # L1 at masked CELLS; pred & tgt BOTH in full_plan order → reorder the cell mask.
         # STATIC masked-MEAN, not boolean-index: ``x[bool_mask]`` has a data-dependent
         # output shape, which graph-breaks (and specializes) under
-        # ``torch.compile(dynamic=False)``. The weighted mean over the fixed (B,N,T)
-        # grid is the IDENTICAL value — every masked cell shares the same feature width
-        # ``d`` — with a shape-static graph. B6: ``m_masked`` is the exact per-row
-        # held-out count, so the denominator needs no host-sync on ``mask.sum()``.
-        mask_packed = mask.gather(1, full_plan.order)  # (B, N) bool, full order
-        w = mask_packed[:, :, None].to(pred.dtype)  # (B, N, 1) → broadcasts over T
+        # ``torch.compile(dynamic=False)``. The weighted mean over the fixed (B,N,T) grid
+        # is the IDENTICAL value — every masked cell shares the same feature width ``d`` —
+        # with a shape-static graph. The masked-cell count is a per-session constant so the
+        # denominator needs no host-sync.
+        cm_packed = cell_masked.gather(
+            1, full_plan.order[:, :, None].expand(B, N, T)
+        )  # (B, N, T) bool, full order
+        w = cm_packed.to(pred.dtype)  # (B, N, T)
         ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
-        loss = (ae * w).sum() / w.expand_as(ae).sum().clamp(min=1.0)
+        loss = (ae * w).sum() / w.sum().clamp(min=1.0)
 
         # CONTEXT loss (#66, upstream predict_all): a SECOND L1 predicting the teacher
-        # target at the VISIBLE/context positions via ``pred_to_target_context``, added
-        # as ``λ(step)·loss_context``. ``_static_off`` (a python 0.0 known at trace time
-        # ⇒ compile constant-folds the branch) skips the head entirely for the pure
-        # plain-JEPA arm; when the schedule is active the module ALWAYS passes a 0-d
-        # tensor (even value 0 pre-15k) so the graph is static across the λ ramp.
+        # target at the VISIBLE/context cells via ``pred_to_target_context``, added as
+        # ``λ(step)·loss_context``. ``_static_off`` (a python 0.0 known at trace time ⇒
+        # compile constant-folds the branch) skips the head entirely for the pure plain-
+        # JEPA arm; when the schedule is active the module ALWAYS passes a 0-d tensor
+        # (even value 0 pre-15k) so the graph is static across the λ ramp.
         if not _static_off(lambda_context):
             pred_ctx = self.pred_to_target_context(h)  # (B, N, T, target_dim) full order
-            ctx_tube = (~mask_packed)[:, :, None].expand(B, N, T)
+            ctx_tube = ~cm_packed  # (B, N, T) visible cells
             loss_context = _l1_or_zero(pred_ctx[ctx_tube], tgt[ctx_tube], "l1")
             loss = loss + lambda_context * loss_context
 
         taps = None
         if collect_taps:
             taps = self._build_taps_packed(
-                enc_taps, pred, tgt, mask, whole_contact, full_plan.order
+                enc_taps, pred, tgt, cell_masked, whole_contact, full_plan.order
             )
-        return JepaOutput(loss=loss, n_masked=B * m_masked * T, taps=taps)
+        return JepaOutput(loss=loss, n_masked=B * (N * T - m_vis * t_kept), taps=taps)
 
     @staticmethod
     @torch.compiler.disable
@@ -288,39 +307,44 @@ class V3JepaObjective(nn.Module):
         enc_taps: dict[int, Tensor],
         pred: Tensor,
         tgt: Tensor,
-        mask: Tensor,
+        cell_masked: Tensor,
         whole_contact: Tensor | None,
         full_order: Tensor,
     ) -> dict[str, Tensor]:
         """Detached monitor taps (packed path). Encoder taps are already the packed
-        VISIBLE tokens (B, M_vis, T, d) ⇒ every row is a visible token, so flatten
+        VISIBLE CELLS (B, m_vis, T_kept, d) ⇒ every row is a visible cell, so flatten
         directly. pred/tgt are in ``full_order``; the whole/intra tiers are reordered
         to match before extracting. Targets are already ``target_ln``'d (post-norm).
 
-        ``@torch.compiler.disable``: the whole/intra tiers are boolean-indexed
-        (``p[whole_t]``) with a per-step-VARIABLE row count (which shafts get whole-
-        masked is random and shafts differ in size). Under ``torch.compile(dynamic=
-        False)`` that resume frame respecialises on every new count and blows past
-        ``recompile_limit`` (64) → the G4 probe's storm. This path is a DETACHED,
-        monitor-cadence read that never touches the loss, so running it in eager (one
-        clean graph break, no guards) is correct and eliminates the storm outright."""
+        The tiers are CELL-level: ``whole`` = every cell of a wholly-dropped shaft (all T
+        frames of its contacts); ``intra`` = the remaining masked cells (space depth-blocks
+        + per-shaft time-blocks). ``whole_cell ⊆ cell_masked`` since a wholly-masked
+        contact masks all T of its frames.
+
+        ``@torch.compiler.disable``: the tiers are boolean-indexed (``p[whole_t]``) with a
+        per-step-VARIABLE cell count (which shafts get whole-masked is random and shafts
+        differ in size). Under ``torch.compile(dynamic=False)`` that resume frame
+        respecialises on every new count and blows past ``recompile_limit`` (64) → the G4
+        probe's storm. This path is a DETACHED, monitor-cadence read that never touches the
+        loss, so running it in eager (one clean graph break, no guards) is correct."""
         d_enc = enc_taps[12].shape[-1]
         d_out = pred.shape[-1]
         out: dict[str, Tensor] = {
-            "enc12": enc_taps[12].detach().reshape(-1, d_enc),  # (n_vis·T, 256)
+            "enc12": enc_taps[12].detach().reshape(-1, d_enc),  # (n_vis_cells, 256)
         }
         if whole_contact is None:
             return out
-        B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
-        whole_packed = whole_contact.gather(1, full_order)  # (B, N) full order
-        intra_packed = (mask & ~whole_contact).gather(1, full_order)
-        whole_t = whole_packed[:, :, None].expand(B, N, T)
-        intra_t = intra_packed[:, :, None].expand(B, N, T)
+        B, N, T = cell_masked.shape
+        whole_cell = whole_contact[:, :, None].expand(B, N, T)  # (B, N, T) contact order
+        intra_cell = cell_masked & ~whole_cell  # (B, N, T) contact order
+        exp = full_order[:, :, None].expand(B, N, T)
+        whole_packed = whole_cell.gather(1, exp)  # (B, N, T) full order
+        intra_packed = intra_cell.gather(1, exp)
         p, t = pred.detach(), tgt.detach()
-        out["pred_whole"] = p[whole_t].reshape(-1, d_out)
-        out["tgt_whole"] = t[whole_t].reshape(-1, d_out)
-        out["pred_intra"] = p[intra_t].reshape(-1, d_out)
-        out["tgt_intra"] = t[intra_t].reshape(-1, d_out)
+        out["pred_whole"] = p[whole_packed].reshape(-1, d_out)
+        out["tgt_whole"] = t[whole_packed].reshape(-1, d_out)
+        out["pred_intra"] = p[intra_packed].reshape(-1, d_out)
+        out["tgt_intra"] = t[intra_packed].reshape(-1, d_out)
         return out
 
     def _forward_padded(
@@ -328,7 +352,8 @@ class V3JepaObjective(nn.Module):
         bands: Sequence[Tensor],
         geom: L1Geometry,
         parcel_id: Tensor,
-        mask: Tensor,
+        contact_mask: Tensor,
+        frame_mask: Tensor,
         *,
         collect_taps: bool = False,
         whole_contact: Tensor | None = None,
@@ -336,49 +361,52 @@ class V3JepaObjective(nn.Module):
     ) -> JepaOutput:
         """Padded ORACLE (test only): the pre-#24 dense JEPA assembly, kept to pin the
         packed ``forward`` numerically on CPU. The teacher is routed through the
-        deepcopy's ``forward_padded``."""
-        visible = ~mask
+        deepcopy's ``forward_padded``. Dual-axis: the encoder gets the CELL visibility
+        mask ``cell_visible`` (B, N, T); masked cells are excluded as attention keys (so
+        they never leak into a visible latent) and overwritten by the mask-query."""
+        B, N = contact_mask.shape
+        T = bands[0].shape[-1]
+        shaft_of = geom.shaft_of_contact
+        cell_masked = contact_mask[:, :, None] | frame_mask[:, shaft_of, :]  # (B, N, T)
+        cell_visible = ~cell_masked
         if collect_taps:
             z, enc_taps = self.online.forward_padded(
-                bands, geom, parcel_id, visible, tap_blocks=(12,)
+                bands, geom, parcel_id, cell_visible, tap_blocks=(12,)
             )
         else:
-            z = self.online.forward_padded(bands, geom, parcel_id, visible)
+            z = self.online.forward_padded(bands, geom, parcel_id, cell_visible)
         with torch.no_grad():
             tgt = self.teacher.model.forward_padded(bands, geom, parcel_id, None)
         tgt = _ln_target(tgt, self.n_levels) if self.target_ln else stop_grad(tgt)
-        zp = self.enc_to_pred(z)
-        m = mask[:, :, None, None]
-        pred_in = torch.where(m, self.mask_token, zp)
+        zp = self.enc_to_pred(z)  # (B, N, T, 128); masked-cell rows discarded below
+        pred_in = torch.where(cell_masked[:, :, :, None], self.mask_token, zp)
         h = self.predictor(pred_in, geom, parcel_id, visible=None)
         pred = self.pred_to_target(h)
         # Same static masked-mean as the packed ``forward`` (identical value) so the
         # oracle stays a faithful numeric pin of the production loss.
-        w = mask[:, :, None].to(pred.dtype)  # (B, N, 1)
+        w = cell_masked.to(pred.dtype)  # (B, N, T)
         ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
-        loss = (ae * w).sum() / w.expand_as(ae).sum().clamp(min=1.0)
+        loss = (ae * w).sum() / w.sum().clamp(min=1.0)
         if not _static_off(lambda_context):
             pred_ctx = self.pred_to_target_context(h)
-            ctx_tube = (~mask)[:, :, None].expand(pred.shape[:-1])
+            ctx_tube = cell_visible  # (B, N, T)
             loss_context = _l1_or_zero(pred_ctx[ctx_tube], tgt[ctx_tube], "l1")
             loss = loss + lambda_context * loss_context
         taps = None
         if collect_taps:
-            B, N, T = mask.shape[0], mask.shape[1], pred.shape[2]
-            vis_t = visible[:, :, None].expand(B, N, T)
             taps = {
-                "enc12": enc_taps[12].detach()[vis_t],
+                "enc12": enc_taps[12].detach()[cell_visible],
             }
             if whole_contact is not None:
                 whole_t = whole_contact[:, :, None].expand(B, N, T)
-                intra_t = (mask & ~whole_contact)[:, :, None].expand(B, N, T)
+                intra_t = cell_masked & ~whole_t
                 p, t = pred.detach(), tgt.detach()
                 taps.update(
                     pred_whole=p[whole_t], tgt_whole=t[whole_t],
                     pred_intra=p[intra_t], tgt_intra=t[intra_t],
                 )
         return JepaOutput(
-            loss=loss, n_masked=int(w.expand_as(ae).sum().item()), taps=taps
+            loss=loss, n_masked=int(w.sum().item()), taps=taps
         )
 
     @torch.no_grad()

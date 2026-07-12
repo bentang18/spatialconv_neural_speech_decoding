@@ -36,7 +36,7 @@ from torch import Tensor, nn
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.masking import (
     V3MaskConfig,
-    sample_contact_mask,
+    sample_masks,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
     JepaOutput,
@@ -75,24 +75,22 @@ class V3ConvergedModel(nn.Module):
         lambda_context: float | Tensor = 0.0,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
-        # masking is the sole augmentation; the whole-sensor tier tag is only needed
-        # for the monitor tap split (collect_taps).
-        if collect_taps:
-            mask, whole_contact = sample_contact_mask(
-                geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg,
-                return_tier=True,
-            )
-        else:
-            mask = sample_contact_mask(
-                geom, N, n_rows=B, generator=generator, cfg=self.mask_cfg
-            )
-            whole_contact = None
-        # M = round(mask_frac·N) — the EXACT per-row held-out count the masking
-        # guarantees (masking.py). Passing it (not mask.sum()) keeps the packed
-        # objective host-sync-free and fixes M_vis for the online pack plan.
-        m_masked = round(self.mask_cfg.mask_frac * N)
+        T = band_inputs[0].shape[-1]
+        # masking is the sole augmentation (dual-axis space×time). The whole-sensor tier
+        # tag is only needed for the monitor tap split (collect_taps).
+        masks = sample_masks(
+            geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
+        )
+        whole_contact = masks.whole_contact if collect_taps else None
+        # D = round(space_frac·N) contacts and T_mask = round(time_frac·T) frames/shaft
+        # are the EXACT per-row held-out counts the masking snaps to (masking.py). Passing
+        # the derived visible constants (not mask.sum()) keeps the packed objective
+        # host-sync-free and fixes the compacted (m_vis, t_kept) shapes for the pack plan.
+        m_vis = N - round(self.mask_cfg.space_frac * N)
+        t_kept = T - round(self.mask_cfg.time_frac * T)
         return self.objective(
-            band_inputs, geom, parcel_id, mask, m_masked=m_masked, backend=backend,
+            band_inputs, geom, parcel_id, masks.contact_mask, masks.frame_mask,
+            m_vis=m_vis, t_kept=t_kept, backend=backend,
             collect_taps=collect_taps, whole_contact=whole_contact,
             lambda_context=lambda_context,
         )

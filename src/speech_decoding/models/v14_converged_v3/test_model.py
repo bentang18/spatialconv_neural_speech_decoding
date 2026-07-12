@@ -53,11 +53,17 @@ def test_end_to_end_bands_to_loss() -> None:
 
 
 def test_masked_count_is_constant_and_matches_frac() -> None:
+    # Dual-axis: n_masked = total masked CELLS = N·T − m_vis·t_kept, a per-session
+    # CONSTANT (independent of WHICH cells are masked) — verify it holds across seeds.
     sc, geom = _session()
     n = len(sc.labels)  # 13
-    model = V3ConvergedModel(n_parcels=N_PARCELS, mask_cfg=V3MaskConfig(mask_frac=0.6))
-    out = model(_bands(n), geom, sc.parcel_id, generator=_gen())
-    assert out.n_masked == round(0.6 * n) * T32
+    cfg = V3MaskConfig(space_frac=0.5, time_frac=0.5)
+    model = V3ConvergedModel(n_parcels=N_PARCELS, mask_cfg=cfg)
+    a = model(_bands(n), geom, sc.parcel_id, generator=_gen(1))
+    b = model(_bands(n), geom, sc.parcel_id, generator=_gen(2))  # different mask
+    m_vis = n - round(0.5 * n)
+    t_kept = T32 - round(0.5 * T32)
+    assert a.n_masked == b.n_masked == n * T32 - m_vis * t_kept
 
 
 def test_backward_reaches_stem_and_online_towers() -> None:
@@ -97,4 +103,6 @@ def test_batched_clips_get_independent_masks() -> None:
     model = V3ConvergedModel(n_parcels=N_PARCELS)
     out = model(_bands(n, B=4), geom, sc.parcel_id, generator=_gen())
     assert torch.isfinite(out.loss)
-    assert out.n_masked == round(V3MaskConfig().mask_frac * n) * T32 * 4
+    m_vis = n - round(V3MaskConfig().space_frac * n)
+    t_kept = T32 - round(V3MaskConfig().time_frac * T32)
+    assert out.n_masked == 4 * (n * T32 - m_vis * t_kept)

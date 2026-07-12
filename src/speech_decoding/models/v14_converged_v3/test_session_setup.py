@@ -64,11 +64,18 @@ def test_drop_removes_named_electrodes_order_preserved() -> None:
     assert setup.keep_idx.tolist() == [0, 2, 3, 5, 6, 7, 8, 9]
 
 
+# These four exercise electrode BOOKKEEPING (keep_idx / depth gaps / parcel realign),
+# not masking. On these toy 2-shaft montages the dominant shaft exceeds D=round(0.5·N),
+# which trips the whole-shaft feasibility assert — irrelevant here, so they opt out with
+# ``whole_shaft_frac=0`` (intra-only masking; real montages keep the default).
+_NO_WHOLE = V3MaskConfig(whole_shaft_frac=0.0)
+
+
 def test_depth_gap_preserved_after_mid_shaft_drop() -> None:
     # LA1..LA5 → drop LA3 → survivors keep clinical depths [1,2,4,5], NOT re-densified.
     labels = ["LA1", "LA2", "LA3", "LA4", "LA5", "LB1", "LB2"]
     parcel = _parcels(labels)
-    setup = build_session_setup(labels, parcel, drop_labels={"LA3"})
+    setup = build_session_setup(labels, parcel, drop_labels={"LA3"}, mask_cfg=_NO_WHOLE)
     la = setup.sidecar.shaft_id == 0
     assert setup.sidecar.depth[la].tolist() == [1, 2, 4, 5]
 
@@ -76,7 +83,7 @@ def test_depth_gap_preserved_after_mid_shaft_drop() -> None:
 def test_parcel_id_realigns_to_survivors() -> None:
     labels = _labels((3, 3))
     parcel = torch.tensor([10, 11, 12, 20, 21, 22], dtype=torch.long)
-    setup = build_session_setup(labels, parcel, drop_labels={"LA2"})
+    setup = build_session_setup(labels, parcel, drop_labels={"LA2"}, mask_cfg=_NO_WHOLE)
     # LA2 (parcel 11) removed; survivors carry [10,12,20,21,22]
     assert setup.parcel_id.tolist() == [10, 12, 20, 21, 22]
 
@@ -84,7 +91,9 @@ def test_parcel_id_realigns_to_survivors() -> None:
 def test_keep_idx_indexes_full_order_for_memmap_read() -> None:
     labels = _labels((4, 3))
     parcel = _parcels(labels)
-    setup = build_session_setup(labels, parcel, drop_labels={"LA1", "LB3"})
+    setup = build_session_setup(
+        labels, parcel, drop_labels={"LA1", "LB3"}, mask_cfg=_NO_WHOLE
+    )
     # keep_idx must be a strictly-ascending gather into the full voltage order
     ki = setup.keep_idx
     assert ki.dtype == torch.long
@@ -96,23 +105,26 @@ def test_drop_label_not_in_montage_is_a_noop() -> None:
     # extra_bad may name a channel already excluded upstream; intersect, don't fail.
     labels = _labels((3, 3))
     parcel = _parcels(labels)
-    setup = build_session_setup(labels, parcel, drop_labels={"LZ9", "LA2"})
+    setup = build_session_setup(
+        labels, parcel, drop_labels={"LZ9", "LA2"}, mask_cfg=_NO_WHOLE
+    )
     assert "LA2" not in setup.sidecar.labels
     assert len(setup.sidecar.labels) == 5
 
 
 def test_feasibility_assert_fires_on_oversubscribed_montage() -> None:
-    # One huge shaft + tiny others: n_ws=round(0.15*S) whole shafts can hold > M
-    # contacts → assert_mask_feasible must raise at setup (wires #36).
-    # S=4 shafts, sizes 40,3,3,3 (N=49). n_ws=round(0.15*4)=1 → largest shaft 40 > M=round(0.575*49)=28.
+    # Dual-axis (Ben 2026-07-12): whole-shaft dropping is feasible only if SOME shaft
+    # fits under D=round(space_frac·N). One dominant shaft > D ⇒ no whole shaft fits ⇒
+    # assert_mask_feasible must raise at setup (fail loud, wires #36).
+    # S=4, sizes 40,3,3,3 (N=49). D=round(0.5·49)=24; largest shaft 40 > 24.
     labels = _labels((40, 3, 3, 3))
     parcel = _parcels(labels)
-    with pytest.raises(ValueError, match="over-subscription"):
+    with pytest.raises(ValueError, match="whole-shaft infeasible"):
         build_session_setup(labels, parcel, drop_labels=set())
 
 
 def test_feasibility_passes_for_uniform_seeg() -> None:
-    # Uniform sEEG (largest shaft ≪ 57.5%) is always feasible — no raise.
+    # Uniform sEEG (largest shaft ≪ D) is always feasible — no raise.
     labels = _labels((8, 8, 8, 8, 8, 8))
     parcel = _parcels(labels)
     setup = build_session_setup(labels, parcel, drop_labels=set())  # must not raise
@@ -120,12 +132,15 @@ def test_feasibility_passes_for_uniform_seeg() -> None:
 
 
 def test_custom_mask_cfg_threads_to_feasibility() -> None:
-    # A montage feasible at default frac can be made infeasible by a higher whole frac.
-    labels = _labels((20, 5, 5, 5, 5))  # N=40
+    # The dominant-shaft montage (25,5,5,5): D=round(0.5·40)=20, largest 25 > 20 ⇒ the
+    # DEFAULT whole tier is infeasible and setup must raise. Setting whole_shaft_frac=0
+    # opts OUT of the whole tier (intra-only) ⇒ same montage now passes. Proves mask_cfg
+    # threads through to the feasibility gate.
+    labels = _labels((25, 5, 5, 5))  # N=40
     parcel = _parcels(labels)
-    build_session_setup(labels, parcel, drop_labels=set())  # default 0.15 whole → ok
-    with pytest.raises(ValueError):
-        build_session_setup(
-            labels, parcel, drop_labels=set(),
-            mask_cfg=V3MaskConfig(whole_shaft_frac=0.4),  # forces the 20-shaft whole
-        )
+    with pytest.raises(ValueError, match="whole-shaft infeasible"):
+        build_session_setup(labels, parcel, drop_labels=set())  # default 0.15 whole
+    build_session_setup(
+        labels, parcel, drop_labels=set(),
+        mask_cfg=V3MaskConfig(whole_shaft_frac=0.0),  # opt out → feasible
+    )

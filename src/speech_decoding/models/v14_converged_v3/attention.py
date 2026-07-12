@@ -36,6 +36,7 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.packing import PackPlan
 from speech_decoding.models.v14_converged_v3.pe import L1RoPE
 from speech_decoding.models.v14_converged_v3.varlen import (
+    _reference_block_diag,
     njt_block_diag,
     sdpa_block_diag_packed,
 )
@@ -82,8 +83,9 @@ class L1Block(nn.Module):
 
     def _attn(self, x: Tensor, geom: L1Geometry, visible: Tensor | None) -> Tensor:
         # x: (B, N, T, d) → gather to (B, S, C, T, d), attend within each shaft.
-        # visible: (B, N) bool, True = keepable key (masked electrodes excluded so
-        # they never leak into the visible latents). None → all keepable.
+        # visible: (B, N, T) bool CELL mask, True = keepable key (masked cells excluded
+        # so they never leak into the visible latents). None → all keepable. Dual-axis
+        # (Ben 2026-07-12): the key mask is per (contact, frame), not per contact.
         B, N, T, d = x.shape
         S, C = geom.n_shafts, geom.max_c
         gathered = x[:, geom.gather_idx]  # (B, S, C, T, d)
@@ -104,12 +106,13 @@ class L1Block(nn.Module):
         tt = tt[None].expand(B, S, seq).reshape(B * S, seq)
         q, k = self.rope(q, k, idx, tt)
 
-        # key mask: pad slots (invalid contacts) always excluded; masked
-        # electrodes excluded when `visible` given. (B, S, C) → (B*S, seq).
-        key_ok = geom.valid[None].expand(B, S, C)  # (B, S, C) bool
+        # key mask: pad slots (invalid contacts) always excluded; masked CELLS excluded
+        # when `visible` given. valid (B,S,C) broadcasts over T; the cell mask is gathered
+        # into the (S,C,T) grid and ANDed. → (B*S, seq), token order c*T + t.
+        key_ok = geom.valid[None, :, :, None].expand(B, S, C, T)  # (B, S, C, T) bool
         if visible is not None:
-            key_ok = key_ok & visible[:, geom.gather_idx]  # gather vis into grid
-        key_ok = key_ok[:, :, :, None].expand(B, S, C, T).reshape(B * S, seq)
+            key_ok = key_ok & visible[:, geom.gather_idx, :]  # (B,S,C,T) cell vis in grid
+        key_ok = key_ok.reshape(B * S, seq)
         # Additive mask (NEG, not -inf): a fully-excluded row (a whole-shaft-masked
         # query) softmaxes to uniform → finite garbage we discard, never NaN.
         attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * S, 1, 1, seq)
@@ -174,7 +177,10 @@ class L1Block(nn.Module):
         qh, kh = q.transpose(0, 1), k.transpose(0, 1)  # (H, total, hd) — seq=total
         if rope_cs is None:
             idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)  # (total,)
-            tt = torch.arange(T, device=x.device)[None, None, :].expand(B, P, T).reshape(total)
+            # time coord = the REAL kept-frame index per token (plan.time_idx), NOT
+            # arange — dual-axis drops frames, so slot k of a shaft is its k-th kept
+            # real frame; RoPE must see the true frame separations (Ben's catch).
+            tt = plan.time_idx.reshape(total)
             qh, kh = self.rope(qh, kh, idx, tt)
         else:
             qh, kh = self.rope.rotate(qh, kh, rope_cs[0], rope_cs[1])
@@ -247,7 +253,7 @@ class L2Block(nn.Module):
 
     def _attn(self, x: Tensor, visible: Tensor | None) -> Tensor:
         # x: (B, N, T, d). Attend over N at each time slice (T folded into batch).
-        # visible: (B, N) bool — masked electrodes excluded as keys (same t).
+        # visible: (B, N, T) bool CELL mask — masked cells excluded as keys, per real t.
         B, N, T, d = x.shape
         xt = x.permute(0, 2, 1, 3).reshape(B * T, N, d)  # (B*T, N, d)
         qkv = self.qkv(xt).reshape(B * T, N, 3, self.n_heads, self.head_dim)
@@ -258,8 +264,8 @@ class L2Block(nn.Module):
 
         attn_bias = None
         if visible is not None:
-            # (B, N) → keys at every time slice: (B*T, 1, 1, N).
-            key_ok = visible[:, None, :].expand(B, T, N).reshape(B * T, N)
+            # (B, N, T) → keys per real frame t: (B*T, 1, 1, N).
+            key_ok = visible.permute(0, 2, 1).reshape(B * T, N)  # (B*T, N) cell vis at t
             # match query dtype for strict/flash SDPA (audit L11; no-op under fp32).
             attn_bias = torch.where(key_ok, 0.0, NEG_INF_MASK).view(B * T, 1, 1, N).to(q.dtype)
 
@@ -273,22 +279,51 @@ class L2Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-    # ── packed path (#24) ── x carries only the SELECTED contacts (M_vis online,
-    # all-N teacher/predictor), so the masked electrodes are physically absent —
-    # no key-mask needed (``_attn`` above is the padded oracle). Cross-sensor
-    # attention is permutation-invariant over keys, so per-contact output matches
-    # the padded path regardless of the shaft-grouped packing order.
-    def _attn_packed(self, x: Tensor) -> Tensor:
+    # ── packed path (#24) ── x carries the selected contacts × kept frames. Two
+    # regimes, chosen by whether the plan carries the L2 real-frame regroup:
+    #
+    #   FULL GRID (teacher/predictor, ``plan.perm_l2 is None``): no time masking ⇒
+    #     the kept-frame slot k IS real frame k for every shaft, so cross-sensor
+    #     same-t attention = one dense SDPA over the P contacts at each slot t. Masked
+    #     contacts are physically absent (permutation-invariant over keys ⇒ matches the
+    #     padded oracle).
+    #
+    #   ONLINE (dual-axis encoder, ``plan.perm_l2`` set): heterogeneous time masking ⇒
+    #     slot k is a DIFFERENT real frame per shaft, so "same-t" needs a genuine
+    #     regroup. ``perm_l2`` reorders the flat visible-cell tokens into time-major
+    #     order; ``cu_l2`` marks each (clip, real-frame) block; the SAME block-diagonal
+    #     primitive (njt on GPU / reference on CPU) runs one attention per real frame,
+    #     no RoPE. The ≥1-live-sensor guarantee keeps every frame block non-empty. The
+    #     result is scattered back to (slot, kept-frame) order. Exact same-t, njt-fast.
+    def _attn_packed(self, x: Tensor, plan: PackPlan, *, backend: str) -> Tensor:
         B, P, T, d = x.shape
-        xt = x.permute(0, 2, 1, 3).reshape(B * T, P, d)  # (B*T, P, d)
-        qkv = self.qkv(xt).reshape(B * T, P, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B*T,H,P,hd)
-        ctx = F.scaled_dot_product_attention(q, k, v)
-        ctx = ctx.transpose(1, 2).reshape(B * T, P, d)
-        return self.out(ctx).reshape(B, T, P, d).permute(0, 2, 1, 3)
+        if plan.perm_l2 is None:
+            xt = x.permute(0, 2, 1, 3).reshape(B * T, P, d)  # (B*T, P, d)
+            qkv = self.qkv(xt).reshape(B * T, P, 3, self.n_heads, self.head_dim)
+            q, k, v = qkv.unbind(dim=2)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B*T,H,P,hd)
+            ctx = F.scaled_dot_product_attention(q, k, v)
+            ctx = ctx.transpose(1, 2).reshape(B * T, P, d)
+            return self.out(ctx).reshape(B, T, P, d).permute(0, 2, 1, 3)
 
-    def forward_packed(self, x: Tensor) -> Tensor:
-        x = x + self._attn_packed(self.norm1(x))
+        # ── real-frame regroup (online) ──────────────────────────────────────
+        tot = B * P * T
+        perm = plan.perm_l2  # (B, P*T) flat visible-cell → time-major position
+        xf = x.reshape(B, P * T, d)
+        xtm = xf.gather(1, perm[:, :, None].expand(B, P * T, d))  # (B, P*T, d) time-major
+        qkv = self.qkv(xtm.reshape(tot, d)).reshape(tot, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=1)  # (tot, H, hd) — no RoPE on L2
+        if q.is_cuda:
+            ctx = njt_block_diag(q, k, v, plan.cu_l2_drop, plan.max_seqlen_l2)
+        else:
+            ctx = _reference_block_diag(q, k, v, plan.cu_l2)  # (tot, H, hd)
+        ctx = self.out(ctx.reshape(tot, d)).reshape(B, P * T, d)  # time-major
+        back = ctx.new_zeros(B, P * T, d).scatter_(
+            1, perm[:, :, None].expand(B, P * T, d), ctx
+        )  # → (slot, kept-frame) order
+        return back.reshape(B, P, T, d)
+
+    def forward_packed(self, x: Tensor, plan: PackPlan, *, backend: str = "auto") -> Tensor:
+        x = x + self._attn_packed(self.norm1(x), plan, backend=backend)
         x = x + self.mlp(self.norm2(x))
         return x

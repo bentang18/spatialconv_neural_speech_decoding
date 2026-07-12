@@ -123,7 +123,8 @@ class V3Tower(nn.Module):
         B, P, T, _ = x.shape
         total = B * P * T
         idx = plan.depth[:, :, None].expand(B, P, T).reshape(total)  # (total,)
-        tt = torch.arange(T, device=x.device)[None, None, :].expand(B, P, T).reshape(total)
+        # time coord = REAL kept-frame index (plan.time_idx), NOT arange — see L1Block.
+        tt = plan.time_idx.reshape(total)
         return first_l1.rope.cos_sin(idx, tt)
 
     def _rescale_blocks(self) -> None:
@@ -194,7 +195,7 @@ class V3Tower(nn.Module):
             if isinstance(b, L1Block):
                 x = b.forward_packed(x, plan, backend=backend, rope_cs=rope_cs)
             else:
-                x = b.forward_packed(x)
+                x = b.forward_packed(x, plan, backend=backend)
             if (i + 1) in tap_blocks:
                 taps[i + 1] = x
             if self.deep_sup and (i + 1) in self.sup_taps:
