@@ -165,7 +165,7 @@ class V14ConvergedV3Module(pl.LightningModule):
     def _monitor_due(self, step: int) -> bool:
         return step % self.monitor_every_n_steps == 0
 
-    def training_step(self, batch: V3Batch, batch_idx: int) -> Tensor:  # noqa: ARG002
+    def training_step(self, batch: V3Batch, batch_idx: int) -> Tensor:
         device = batch.bands[0].device
         gen = self._step_generator(device)
         # Taps (the SVD/rankme + tier-EV monitor inputs) are computed only on the
@@ -176,7 +176,19 @@ class V14ConvergedV3Module(pl.LightningModule):
             step = int(self.global_step)
         except (RuntimeError, AttributeError):
             step = 0
-        collect = self._monitor_due(step)
+        # Collect taps ONLY on the last accumulation micro-batch. ``global_step`` is
+        # constant across an accum window, so ``_monitor_due`` alone would set
+        # collect=True on every micro-batch — but the callback's on_train_batch_end
+        # acts once per opt-step (guards ``(batch_idx+1) % accum == 0``) and discards
+        # taps from the other accum-1 micro-batches. Materialising them there is pure
+        # waste (measured +0.47s/opt-step at accum=4, monitor_every=1). Collecting only
+        # on the used micro-batch keeps per-opt-step monitoring at monitor_every=1.
+        try:
+            accum = max(1, int(self.trainer.accumulate_grad_batches or 1))
+        except (RuntimeError, AttributeError):
+            accum = 1  # no trainer attached (unit tests) ⇒ every call is "last"
+        is_last_microbatch = (batch_idx + 1) % accum == 0
+        collect = self._monitor_due(step) and is_last_microbatch
         # Context-loss λ (#66): a 0-d tensor when the schedule is active (compile-static
         # graph across the ramp), else a python 0.0 (compile-static skip of the head).
         if self._context_lambda_hold > 0.0:
