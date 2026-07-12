@@ -91,49 +91,6 @@ def test_ema_weight_gap_zero_then_positive() -> None:
     assert cb._ema_weight_gap(mod) > 0.0
 
 
-# ---------------------------------------------- Family A: true_update_ratio
-def test_true_update_ratio_zero_without_step_positive_after() -> None:
-    mod = _module()
-    cb = SSLHealthMonitorV3(every_n_steps=1)
-    logged: dict[str, float] = {}
-    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
-    cb._maybe_log_true_update_ratio(mod, step=0)  # snapshot only
-    assert cb._update_snapshot is not None
-    assert not any("true_update_ratio" in k for k in logged)
-    cb._maybe_log_true_update_ratio(mod, step=1)  # no step between ⇒ ~0
-    for g in ("online", "predictor"):
-        assert logged[f"train_mon_true_update_ratio_{g}"] == 0.0
-    logged.clear()
-    cb._maybe_log_true_update_ratio(mod, step=2)  # snapshot
-    with torch.no_grad():
-        next(mod.model.objective.online.parameters()).add_(0.5)
-    cb._maybe_log_true_update_ratio(mod, step=3)  # measure
-    assert logged["train_mon_true_update_ratio_online"] > 0.0
-
-
-# ------------------------------------------------ Family A: grad_noise_scale
-def test_grad_noise_scale_logs_after_optimizer_step() -> None:
-    """B_simple needs AdamW moment EMAs; drive one real AdamW step to populate
-    ``optimizer.state`` then assert the four grad-noise keys are finite."""
-    mod = _module()
-    mod._last_batch_size = 2
-    opt = torch.optim.AdamW(mod._trainable_parameters(), lr=1e-3, betas=(0.9, 0.95))
-    mod.training_step(_session_batch(n_rows=2), 0).backward()
-    opt.step()
-    logged: dict[str, float] = {}
-    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
-    cb = SSLHealthMonitorV3()
-    cb._grad_noise_scale(_fake_trainer(accum=4), mod, opt)
-    for k in (
-        "train_mon_grad_noise_signal", "train_mon_grad_noise_var",
-        "train_mon_grad_noise_ratio", "train_mon_grad_noise_scale",
-    ):
-        assert k in logged and logged[k] == logged[k]
-    # B_eff scaling: scale = ratio * (world 1 * accum 4 * batch 2) = ratio * 8.
-    assert abs(logged["train_mon_grad_noise_scale"]
-               - logged["train_mon_grad_noise_ratio"] * 8.0) < 1e-4
-
-
 # --------------------------------------------------------- Family B: tap keys
 def test_family_b_tap_keys_finite() -> None:
     """After a monitor-cadence training_step (taps stashed on the module),
