@@ -91,6 +91,7 @@ def build_pack_plan(
     n_selected: int,
     visible: Tensor | None = None,
     frame_keep: Tensor | None = None,
+    t_kept_hint: int | None = None,
 ) -> PackPlan:
     """Build the varlen pack plan for ``batch`` clips.
 
@@ -137,8 +138,14 @@ def build_pack_plan(
         time_idx = torch.arange(T, device=device)[None, None, :].expand(B, P, T)
     else:
         # T_kept is a per-session constant (= T − T_mask); every shaft keeps the same
-        # count by construction (masking snaps each shaft to exactly T_mask masked).
-        t_kept = int(frame_keep[0].sum(-1).max().item())
+        # count by construction (masking snaps each shaft to exactly T_mask masked). The
+        # caller supplies it (t_kept_hint) so the plan stays host-sync-free; the .item()
+        # fallback keeps standalone/test callers working.
+        t_kept = (
+            t_kept_hint
+            if t_kept_hint is not None
+            else int(frame_keep[0].sum(-1).max().item())
+        )
         ar_t = torch.arange(T, device=device)
         keyt = torch.where(frame_keep, ar_t[None, None, :].expand(B, S, T), T)
         tidx_shaft = keyt.sort(dim=2).values[:, :, :t_kept]  # (B, S, T_kept) real kept frames
@@ -171,7 +178,11 @@ def build_pack_plan(
         cu_l2 = torch.zeros(B * T + 1, dtype=torch.int32, device=device)
         cu_l2[1:] = seg_l2.cumsum(0).to(torch.int32)
         cu_l2_drop = _drop_offsets(cu_l2)
-        max_seqlen_l2 = int(cnt.max().item()) if cnt.numel() else N
+        # static session-constant upper bound: at most P spatially-visible contacts can
+        # share one real frame, so P bounds every L2 block. njt/flash use max_seqlen only
+        # as a tiling/alloc bound (not a numeric input), so the loose-but-constant P
+        # removes the host sync with no change to the attention result.
+        max_seqlen_l2 = P
 
     return PackPlan(
         order=order,

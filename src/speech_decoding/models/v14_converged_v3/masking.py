@@ -82,14 +82,18 @@ class V3Masks:
     whole_contact: Tensor  # (R, N) bool — True where the contact's shaft was wholly dropped (⊆ contact_mask).
 
 
-def _k_max(cs: Tensor, d: int) -> int:
+def _k_max(cs: Tensor, d: int) -> Tensor:
     """Largest number of shafts whose total contacts ≤ D (whole-shaft feasibility
     ceiling). Any K ≤ K_max RANDOM shafts sum ≤ the K largest ≤ K_max largest ≤ D, so
     clamping the stochastic whole count to K_max keeps whole-contacts ≤ D for EVERY
-    draw ⇒ the snap never has to trim a whole shaft (which would leak the common mode)."""
+    draw ⇒ the snap never has to trim a whole shaft (which would leak the common mode).
+
+    Returns a 0-dim tensor (NO host sync) so ``sample_masks`` can call it inside the
+    compiled forward and feed it straight to ``.clamp(max=…)``; the setup-time
+    feasibility check wraps it in ``int()`` where a Python scalar is wanted."""
     sizes = torch.sort(cs, descending=True).values
     csum = torch.cumsum(sizes, 0)
-    return int((csum <= d).sum().item())
+    return (csum <= d).sum()
 
 
 def assert_mask_feasible(geom: L1Geometry, cfg: V3MaskConfig = V3MaskConfig()) -> None:
@@ -101,7 +105,7 @@ def assert_mask_feasible(geom: L1Geometry, cfg: V3MaskConfig = V3MaskConfig()) -
     if not (0 < d < n):
         raise ValueError(f"space_frac={cfg.space_frac} ⇒ D={d} not in (0, N={n})")
     cs = valid.sum(1)  # (S,) contacts per shaft
-    if _k_max(cs, d) < 1 and cfg.whole_shaft_frac > 0:
+    if int(_k_max(cs, d)) < 1 and cfg.whole_shaft_frac > 0:
         raise ValueError(
             f"whole-shaft infeasible: no shaft fits under D={d} (largest shaft "
             f"{int(cs.max())} > D). Lower whole_shaft_frac to 0 or raise space_frac."

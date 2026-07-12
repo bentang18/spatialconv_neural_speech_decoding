@@ -234,7 +234,7 @@ class V3JepaObjective(nn.Module):
         # regroup) + static full-grid plan (teacher/predictor, no time compaction/regroup).
         online_plan = build_pack_plan(
             geom, n_time=T, batch=B, n_selected=m_vis,
-            visible=~contact_mask, frame_keep=~frame_mask,
+            visible=~contact_mask, frame_keep=~frame_mask, t_kept_hint=t_kept,
         )
         full_plan = build_pack_plan(geom, n_time=T, batch=B, n_selected=N, visible=None)
         online_parcel = parcel_id[online_plan.order]  # (B, m_vis)
