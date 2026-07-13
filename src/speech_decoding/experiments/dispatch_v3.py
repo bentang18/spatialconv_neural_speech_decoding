@@ -261,8 +261,17 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
             project=args.wandb_project, name=args.run_name, save_dir=args.ckpt_dir or ".",
         )
 
+    # Ben 2026-07-13: constant LR (min_lr_ratio=1.0, V-JEPA-2 style) ⇒ max_steps is a pure
+    # STOP-POINT, not a schedule parameter, so raising it is science-neutral. 100k is our
+    # standard SSL horizon; floored here so the already-queued r2/r3 (submitted with
+    # --ssl-max-steps 60000) run the full horizon WITHOUT a resubmit — the batch script
+    # re-reads this module at launch, so redeploying reaches a still-pending job with no
+    # forfeited queue age. Early stopping = kill + ladder-pick; nothing schedule-wise wants
+    # a stop below 100k. (At ~2 s/opt-step the 48h wall bites first, ~86k; that's fine.)
+    SSL_MAX_STEPS_STD = 100_000
+    ssl_max_steps = max(args.ssl_max_steps, SSL_MAX_STEPS_STD)
     kwargs: dict[str, tp.Any] = dict(
-        max_steps=args.ssl_max_steps,
+        max_steps=ssl_max_steps,
         max_epochs=-1,
         accelerator=args.accelerator,
         devices=args.devices,

@@ -330,6 +330,33 @@ def test_no_nan_when_a_whole_shaft_is_masked() -> None:
     )
 
 
+def test_intra_inter_split_partitions_the_masked_loss() -> None:
+    # inter (whole-shaft) + intra (partial-shaft) cells partition the masked set, so the
+    # count-weighted mean of the two tier losses must reconstruct the total masked loss.
+    sc, geom = _session()
+    obj = _obj()
+    mm = _whole_shaft_masks(sc, geom, shaft=0)
+    m = mm[0]
+    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, mm, whole_contact=m.whole_contact)
+    assert out.loss_intra is not None and out.loss_inter is not None
+    assert torch.isfinite(out.loss_intra) and torch.isfinite(out.loss_inter)
+    cm = _cell_masked(m, geom)  # (B,N,T) all masked cells
+    whole = m.whole_contact[:, :, None]  # (B,N,1) whole-shaft contacts
+    n_inter = (cm & whole).sum().float()
+    n_intra = (cm & ~whole).sum().float()
+    assert n_inter > 0 and n_intra > 0  # fixture drives both tiers
+    recon = (n_inter * out.loss_inter + n_intra * out.loss_intra) / (n_inter + n_intra)
+    assert torch.allclose(recon, out.loss, atol=1e-5)
+
+
+def test_intra_inter_none_off_monitor() -> None:
+    # whole_contact defaults None (off-monitor steps) ⇒ the split is not computed.
+    sc, geom = _session()
+    obj = _obj()
+    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom))
+    assert out.loss_intra is None and out.loss_inter is None
+
+
 def test_loss_reads_only_masked_cells() -> None:
     sc, geom = _session()
     obj = _obj()

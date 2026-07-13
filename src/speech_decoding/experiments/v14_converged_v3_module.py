@@ -214,6 +214,11 @@ class V14ConvergedV3Module(pl.LightningModule):
         # Trivial-copy tell = this dropping toward 0 while masked EV stays low.
         if out.loss_context is not None:
             self.log("train_loss_context", out.loss_context, on_step=True)
+        # intra/inter masked-loss split (monitor cadence; total train_loss unchanged).
+        # inter = whole-shaft (cross-sensor) cells, intra = partial-shaft cells.
+        if out.loss_intra is not None:
+            self.log("train_loss_intra", out.loss_intra, on_step=True)
+            self.log("train_loss_inter", out.loss_inter, on_step=True)
         return out.loss
 
     def on_before_zero_grad(self, optimizer) -> None:  # noqa: ARG002

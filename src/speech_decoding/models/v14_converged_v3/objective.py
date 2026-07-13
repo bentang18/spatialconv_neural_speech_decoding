@@ -88,6 +88,8 @@ class JepaOutput:
     n_masked: int
     taps: dict[str, Tensor] | None = None
     loss_context: Tensor | None = None  # #66 monitor: the raw (unweighted) context L1
+    loss_intra: Tensor | None = None  # monitor: masked L1 over partial-shaft (intra) cells
+    loss_inter: Tensor | None = None  # monitor: masked L1 over whole-shaft (inter) cells
 
 
 class _TargetTower(nn.Module):
@@ -283,6 +285,19 @@ class V3JepaObjective(nn.Module):
         ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
         loss = (ae * w).sum() / w.sum().clamp(min=1.0)
 
+        # intra/inter monitor: split the same masked L1 by whole-shaft (INTER — predict a
+        # fully-hidden sensor from OTHER shafts, the cross-sensor task) vs partial-shaft
+        # (INTRA — same-shaft context available). Reuses ``ae``; static masked-means, no
+        # boolean index. whole_contact is (B, N) contact order ⇒ gather into full order to
+        # align with cm_packed. None off-monitor (model passes whole_contact only then).
+        loss_intra = loss_inter = None
+        if whole_contact is not None:
+            whole_packed = whole_contact.gather(1, full_plan.order)[:, :, None]  # (B,N,1)
+            wi = (cm_packed & whole_packed).to(pred.dtype)
+            wa = (cm_packed & ~whole_packed).to(pred.dtype)
+            loss_inter = (ae * wi).sum() / wi.sum().clamp(min=1.0)
+            loss_intra = (ae * wa).sum() / wa.sum().clamp(min=1.0)
+
         # CONTEXT loss (#66, upstream predict_all): a SECOND L1 predicting the teacher
         # target at the VISIBLE/context cells via ``pred_to_target_context``, added as
         # ``λ(step)·loss_context``. ``_static_off`` (a python 0.0 known at trace time ⇒
@@ -303,7 +318,7 @@ class V3JepaObjective(nn.Module):
             )
         return JepaOutput(
             loss=loss, n_masked=B * (N * T - m_vis * t_kept), taps=taps,
-            loss_context=loss_context,
+            loss_context=loss_context, loss_intra=loss_intra, loss_inter=loss_inter,
         )
 
     @staticmethod
@@ -392,6 +407,14 @@ class V3JepaObjective(nn.Module):
         w = cell_masked.to(pred.dtype)  # (B, N, T)
         ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
         loss = (ae * w).sum() / w.sum().clamp(min=1.0)
+        # intra/inter monitor (oracle, contact order ⇒ no gather). See packed forward.
+        loss_intra = loss_inter = None
+        if whole_contact is not None:
+            whole_c = whole_contact[:, :, None]  # (B, N, 1)
+            wi = (cell_masked & whole_c).to(pred.dtype)
+            wa = (cell_masked & ~whole_c).to(pred.dtype)
+            loss_inter = (ae * wi).sum() / wi.sum().clamp(min=1.0)
+            loss_intra = (ae * wa).sum() / wa.sum().clamp(min=1.0)
         loss_context = None
         if not _static_off(lambda_context):
             pred_ctx = self.pred_to_target_context(h)
@@ -413,7 +436,7 @@ class V3JepaObjective(nn.Module):
                 )
         return JepaOutput(
             loss=loss, n_masked=int(w.sum().item()), taps=taps,
-            loss_context=loss_context,
+            loss_context=loss_context, loss_intra=loss_intra, loss_inter=loss_inter,
         )
 
     @torch.no_grad()
