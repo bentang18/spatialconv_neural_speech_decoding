@@ -209,6 +209,11 @@ class V14ConvergedV3Module(pl.LightningModule):
         self._last_taps = out.taps if collect else None
         self.log("train_loss", out.loss, on_step=True, prog_bar=True)
         self.log("train_n_masked", float(out.n_masked), on_step=True)
+        # #66 context-loss observable: the raw (unweighted) context L1, logged whenever
+        # the schedule is active (r3). None for the plain-JEPA arm (r2) ⇒ not logged.
+        # Trivial-copy tell = this dropping toward 0 while masked EV stays low.
+        if out.loss_context is not None:
+            self.log("train_loss_context", out.loss_context, on_step=True)
         return out.loss
 
     def on_before_zero_grad(self, optimizer) -> None:  # noqa: ARG002

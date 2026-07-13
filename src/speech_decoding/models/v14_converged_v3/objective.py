@@ -87,6 +87,7 @@ class JepaOutput:
     loss: Tensor
     n_masked: int
     taps: dict[str, Tensor] | None = None
+    loss_context: Tensor | None = None  # #66 monitor: the raw (unweighted) context L1
 
 
 class _TargetTower(nn.Module):
@@ -288,6 +289,7 @@ class V3JepaObjective(nn.Module):
         # compile constant-folds the branch) skips the head entirely for the pure plain-
         # JEPA arm; when the schedule is active the module ALWAYS passes a 0-d tensor
         # (even value 0 pre-15k) so the graph is static across the λ ramp.
+        loss_context = None
         if not _static_off(lambda_context):
             pred_ctx = self.pred_to_target_context(h)  # (B, N, T, target_dim) full order
             ctx_tube = ~cm_packed  # (B, N, T) visible cells
@@ -299,7 +301,10 @@ class V3JepaObjective(nn.Module):
             taps = self._build_taps_packed(
                 enc_taps, pred, tgt, cell_masked, whole_contact, full_plan.order
             )
-        return JepaOutput(loss=loss, n_masked=B * (N * T - m_vis * t_kept), taps=taps)
+        return JepaOutput(
+            loss=loss, n_masked=B * (N * T - m_vis * t_kept), taps=taps,
+            loss_context=loss_context,
+        )
 
     @staticmethod
     @torch.compiler.disable
@@ -387,6 +392,7 @@ class V3JepaObjective(nn.Module):
         w = cell_masked.to(pred.dtype)  # (B, N, T)
         ae = (pred - tgt).abs().mean(-1)  # (B, N, T) per-cell mean over d
         loss = (ae * w).sum() / w.sum().clamp(min=1.0)
+        loss_context = None
         if not _static_off(lambda_context):
             pred_ctx = self.pred_to_target_context(h)
             ctx_tube = cell_visible  # (B, N, T)
@@ -406,7 +412,8 @@ class V3JepaObjective(nn.Module):
                     pred_intra=p[intra_t], tgt_intra=t[intra_t],
                 )
         return JepaOutput(
-            loss=loss, n_masked=int(w.sum().item()), taps=taps
+            loss=loss, n_masked=int(w.sum().item()), taps=taps,
+            loss_context=loss_context,
         )
 
     @torch.no_grad()
