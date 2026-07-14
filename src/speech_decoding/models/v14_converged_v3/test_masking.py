@@ -152,27 +152,49 @@ def test_time_is_blocky() -> None:
     assert max(max(_runs(m.frame_mask[r, 0]), default=0) for r in range(8)) >= 7
 
 
-def test_at_least_one_live_sensor_per_frame() -> None:
-    # Guarantee (Ben 2026-07-12): at every real frame t, ≥1 LIVE shaft (a shaft with
-    # ≥1 spatially-visible contact) keeps t visible ⇒ no masked cell is left without a
-    # same-t visible neighbour. Checked jointly across space AND time over many rows.
+def test_blank_frames_are_rare_and_match_the_arithmetic() -> None:
+    # THE GUARDIAN IS GONE (M14, 2026-07-15). It used to force ≥1 live shaft to keep
+    # every t; M14 measured that this SATURATED the realized block run at ~6 no matter
+    # how wide a block was requested, which defeats the whole purpose of the width (it
+    # must bury a cell deeper than the STFT window overlap). See masking.py's docstring.
+    #
+    # The new contract, and this test IS the contract:
+    #   1. blank frames (no live shaft keeps t) are ALLOWED — proving the guardian is
+    #      really gone, so this is a REGRESSION GUARD: re-adding one fails here.
+    #   2. they are RARE, and rare at the rate the arithmetic predicts: a shaft masks t
+    #      with prob time_frac, blocks correlate frames WITHIN a shaft but the shafts are
+    #      drawn INDEPENDENTLY, so P(blank) ≈ time_frac^V over V live shafts.
+    #   3. the STATIC invariant is untouched: still EXACTLY T_mask masked frames per
+    #      (row, shaft). This is the one that would break the compiled buffer, and it is
+    #      why deleting the guardian is safe — it only ever reordered the cover-rank sort,
+    #      which happens BEFORE the `time_rank < t_mask` snap.
     sc, geom = _session([12, 10, 10, 8, 8, 6, 6, 4])  # N=64, S=8
-    n = 64
-    m = sample_masks(geom, n, n_time=96, n_rows=800, generator=_gen(9))
+    n, rows, t = 64, 800, 96
+    m = sample_masks(geom, n, n_time=t, n_rows=rows, generator=_gen(9))
+
+    # (3) the static invariant — the only one that can break the compiled shapes
+    assert (m.frame_mask.sum(-1) == 48).all()
+
     shaft_of = geom.shaft_of_contact
-    # live shaft per (row, shaft): has ≥1 visible contact
     vis = ~m.contact_mask  # (R, N)
-    live = torch.zeros(800, int(sc.n_shafts), dtype=torch.bool)
+    live = torch.zeros(rows, int(sc.n_shafts), dtype=torch.bool)
     for si in range(int(sc.n_shafts)):
         idx = (shaft_of == si).nonzero(as_tuple=True)[0]
         live[:, si] = vis[:, idx].any(1)
-    # a shaft "covers" t iff it is live AND keeps frame t (~frame_mask)
-    keeps = ~m.frame_mask  # (R, S, T)
-    covers = keeps & live[:, :, None]  # (R, S, T)
-    coverage = covers.sum(1)  # (R, T) live shafts keeping each frame
-    assert (coverage >= 1).all(), f"blank frame exists: min coverage {int(coverage.min())}"
-    # and the exact-T_mask invariant SURVIVES the guardian constraint
-    assert (m.frame_mask.sum(-1) == 48).all()
+    covers = (~m.frame_mask) & live[:, :, None]  # (R, S, T) live AND keeping t
+    blank = covers.sum(1) == 0  # (R, T)
+    blank_frac = blank.float().mean().item()
+
+    # (1) the guardian is gone
+    assert blank_frac > 0.0, "no blank frame in 76800 draws — is the guardian back?"
+    # (2) rare, and at the predicted rate. V varies per row, so predict per row and pool.
+    v_live = live.sum(1).clamp(min=1).float()  # (R,)
+    predicted = (V3MaskConfig().time_frac ** v_live).mean().item()
+    assert blank_frac < 0.02, f"blank frames not rare: {blank_frac:.4f}"
+    assert 0.5 * predicted < blank_frac < 2.0 * predicted, (
+        f"blank rate {blank_frac:.5f} does not match time_frac^V = {predicted:.5f} — "
+        "the sampler and the arithmetic disagree, so one of them is wrong"
+    )
 
 
 def test_time_is_heterogeneous_across_shafts() -> None:
@@ -228,8 +250,9 @@ def test_deterministic_in_generator_seed() -> None:
 
 
 def test_rows_are_independent() -> None:
-    # multi-shaft (realistic): single-shaft V=1 degenerates the time guardian, which
-    # never occurs on a real montage (S≫1); the model's L2 needs ≥2 shafts anyway.
+    # multi-shaft (realistic); a real montage always has S≫1 anyway. (The old V=1
+    # degeneracy note belonged to the time guardian, deleted 2026-07-15 — the sampler
+    # no longer has any V-dependent constraint.)
     sc, geom = _session([8, 6, 6])
     m = sample_masks(geom, 20, n_time=96, n_rows=8, generator=_gen(5))
     assert not all(torch.equal(m.contact_mask[0], m.contact_mask[r]) for r in range(1, 8))

@@ -28,19 +28,29 @@ Masking-axis inversion (Ben 2026-07-12): the old scheme masked whole CONTACTS
       (row, shaft) ⇒ HETEROGENEOUS inter-sensor timing (at any t some sensors visible,
       some masked) — the L2 / montage pressure the homogeneous-intra outer product
       otherwise loses.
-    • AT-LEAST-ONE-SENSOR-LIVES (Ben 2026-07-12): a real frame t masked across EVERY
-      live shaft would leave a masked cell (c,t) with no same-t visible neighbour for
-      the predictor to reconstruct from. Guarantee ≥1 live sensor per t WITHOUT
-      breaking the exact-``T_mask`` (static) invariant: assign each t a single
-      "guardian" shaft (``V`` = live shafts this row) via a random per-row permutation
-      (``perm_rank % V`` — balanced so each live-index guards ``⌊T/V⌋..⌈T/V⌉`` frames,
-      but RANDOMLY scattered, NOT the ``t mod V`` diagonal, which was a phase-locked,
-      memorizable positional crutch) — and FORBID that shaft from masking t. Guardian
-      frames are held visible, the remaining ``T_mask`` masked frames are block-sampled
-      as usual. Exactly one guardian per t ⇒ coverage ≥1 everywhere, by construction.
-      Feasible for ``V ≥ 2`` (guardian frames ``≈T/V ≤ T_kept``); ``V=1`` (a single
-      live shaft — combinatorially impossible at ``space_frac 0.5`` on a real montage)
-      would over-constrain and is asserted against, not special-cased.
+    • NO GUARDIAN (M14, 2026-07-15 — the "at-least-one-sensor-lives" rule is DELETED).
+      It forbade one randomly-chosen live shaft per t from masking that frame, so that
+      every t kept ≥1 visible sensor. M14 measured what it actually did, and it was
+      WORSE THAN DEAD WEIGHT: because the forbidden frames are scattered through every
+      shaft's candidate set, they SHRED the time blocks. Realized run length, target vs
+      realized: w=4 → 4.32, w=8 → 5.83, w=12 → 6.63. It SATURATES the realized run at
+      ~6 no matter how wide a block you ask for — i.e. it would have silently prevented
+      any wide block from ever burying a cell deep enough to beat the STFT window
+      overlap, which is the ENTIRE POINT of the block width. It re-creates the very leak
+      the width exists to kill. Guardian OFF: w=12 → 11.65, as designed.
+      What it bought: a same-t spatial path for 0.03% of masked cells (dead-frame rate
+      0.000488 over 13 montages ≈ 0.5^V at V≈11 live shafts — the sampler and the
+      arithmetic agree to 3 figures). Those cells are not "unpredictable": a masked cell
+      at a dead frame still has its OWN shaft's other frames and every other shaft's
+      other frames. It has no SAME-t neighbour, which is a much weaker deprivation than
+      the rule's name suggests.
+      STATIC-SAFE, and that is provable rather than hoped: the guardian only pushed
+      frames to the back of the cover-rank sort, BEFORE the snap
+      ``frame_mask = time_rank < t_mask``. Exactly ``T_mask`` frames are masked per
+      (row, shaft) with it or without it, so ``T_kept``, ``D``, the online token count
+      ``(N-D)·T_kept`` and the loss denominator are all unchanged. Deleting it also
+      deletes the ``V ≥ 2`` feasibility constraint, so the sampler gets strictly more
+      robust on degenerate montages.
 
 Compose (in the objective) as a per-sensor OUTER PRODUCT: cell (contact c of shaft s,
 frame t) is VISIBLE iff contact c is spatially kept AND frame t is kept for shaft s.
@@ -205,36 +215,17 @@ def sample_masks(
     contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
     contact_mask.scatter_(1, target, True)
 
-    # ── TIME (per shaft, snap to exactly T_mask, ≥1 live sensor per t) ─────────
-    # A shaft is LIVE this row iff it keeps ≥1 contact (whole drops AND intra
-    # saturation both kill it — no keep-alive floor). Guardianship is shared across
-    # live shafts only; dead shafts have no visible cells so their frame mask is moot.
-    # per-shaft visible-contact count via one-hot matmul (vectorized, no python loop).
-    sc_onehot = torch.zeros(n, s, device=dev)
-    sc_onehot[torch.arange(n, device=dev), geom.shaft_of_contact] = 1.0
-    vis_per_shaft = (~contact_mask).to(torch.float32) @ sc_onehot  # (R, S)
-    live_shaft = vis_per_shaft > 0.5  # (R, S) bool
-    v_live = live_shaft.sum(1).clamp(min=1)  # (R,) live-shaft count (≥1 by construction)
-    # local live-index of each shaft = # live shafts strictly before it in the row.
-    lidx = (live_shaft.cumsum(1) - 1).clamp(min=0)  # (R, S) only meaningful where live
-    # Balanced-RANDOM guardian (Ben 2026-07-12): a deterministic ``t % V == lidx``
-    # forces a rigid diagonal of always-visible cells (phase-locked to t=0) — a
-    # memorizable positional scaffold that systematically exempts a (t, shaft = t mod V)
-    # sublattice from the temporal task. Instead assign each frame its guardian via a
-    # random per-row permutation. ``perm_rank`` is a bijection 0..T-1, so ``% v_live`` is
-    # still perfectly balanced (live-index j guards ⌊T/V⌋ or ⌈T/V⌉ frames — the SAME
-    # per-shaft counts as the deterministic version ⇒ exact-T_mask static invariant and
-    # ≥1-coverage preserved identically) but the guarded frames are randomly scattered,
-    # not a diagonal, killing the positional crutch.
-    perm_rank = rand(r, t).argsort(1).argsort(1)  # (R, T) random bijection 0..T-1 per row
-    guardian_local = perm_rank % v_live[:, None]  # (R, T) balanced live-index labels, scattered
-    guardian = guardian_local[:, None, :] == lidx[:, :, None]  # (R, S, T)
-    forbid = guardian & live_shaft[:, :, None]  # (R, S, T) held-visible frames
-
+    # ── TIME (per shaft, snap to exactly T_mask) ──────────────────────────────
+    # NO GUARDIAN (M14, 2026-07-15). Every frame is a candidate on every shaft; blocks
+    # are placed by cover-rank and the lowest-ranked T_mask frames win. The deleted
+    # guardian used to force one live shaft per t to the back of this sort, which capped
+    # the realized run at ~6 however wide the block — see the module docstring. Blank
+    # frames (no shaft visible at t) are now possible at ~0.05% of frames and that is
+    # ACCEPTED: such a cell still has its own shaft's other frames and every other
+    # shaft's other frames; it lacks only a SAME-t neighbour.
     valid_time = torch.ones(s, t, dtype=torch.bool, device=dev)  # every frame valid
     cover_time = _cover_rank(valid_time, cfg.block_w_time, r, generator)  # (R, S, T)
-    cover_time = torch.where(forbid, torch.full_like(cover_time, float("inf")), cover_time)
-    time_rank = cover_time.argsort(-1).argsort(-1)  # (R, S, T) 0-based; forbid → last
+    time_rank = cover_time.argsort(-1).argsort(-1)  # (R, S, T) 0-based
     frame_mask = time_rank < t_mask  # (R, S, T) exactly T_mask True per (row, shaft)
 
     whole_contact = whole[:, geom.shaft_of_contact] & contact_mask  # (R, N)
