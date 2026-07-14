@@ -1,57 +1,75 @@
-"""D-cohort (Cogan sEEG) NeuralFetch-style Study (T3.5 scaffold).
+"""Cogan D-cohort (Duke sEEG) NeuralSet ``Study`` — v3 SSL corpus producer.
 
-Per ``docs/neuroprobe/v14_blockers.md`` DP03 the decision-*candidate* is to
-implement ``studies/cogan_dcohort/`` as a Study subclass mirroring
-``Wang2024Treebank`` and anatomy-bearing via native FS recons (DK
-``aparc+aseg`` is present directly in the recon CSVs). The D-cohort is the Cogan-lab Duke sEEG cohort
-referenced in ``CLAUDE.md §Key Files`` (``D<num>`` = Stage-3 scope sEEG
-patients, distinct from ``S<num>`` PS uECoG).
+Mirrors ``braintreebank.Wang2024Treebank`` under the CODE-VERIFIED v3 contract
+(memory: project-cogan-seeg-ingestion-contract): the training path never touches
+a Study — ``iter_timelines()`` IS the session registry that ``dispatch_v14``
+enumerates when it bakes the per-session spec caches, and ``dispatch_v3`` then
+reads those caches by ``--session``. So this class only has to yield one timeline
+per run and hand back clean 2048 Hz voltage; the front-end (``MultiStftView`` via
+``CARIeegExtractor``) owns notch / HPF / shaft-CAR / STFT.
 
-DP03 itself is not yet ratified, so this module is a structural scaffold:
-class declaration + ClassVars. Every method that would commit to a
-contract decision raises :class:`NotImplementedError` citing the gating
-blocker IDs.
+``manifest_path`` is the run MANIFEST CSV emitted by
+``scripts/neuroprobe/build_cogan_manifest.py`` — one row per (subject, task, run),
+each carrying the globally-disjoint ``global_subject_id`` (``corpus_ids``), the
+per-subject ``trial_id``, the EDF + channels.tsv paths, and ``duration_s`` (from
+``ieeg.json``, so timeline building opens ZERO EDFs). The cache key embeds the
+row's ``subject_id`` + ``trial_id`` as bare ints (``parse_key_session`` parses
+them back). Voltage comes from ``cogan_load_raw`` (EDF → neural-type select +
+contact-index filter → polyphase resample to 2048), returned as an
+``mne.io.RawArray`` whose ``ch_names`` are clean ``<shaft><contact>`` so the
+extractor's name-based ``parse_shaft`` groups the CAR correctly.
 
-Cited blockers (text below):
-
-  - DP03 — subpackage path + contract mirror not yet ratified.
-  - DP05 — per-subject DK-index-map serialization + load-once cache.
-  - DP06 — session-stratified clip extraction with respected boundaries.
-  - M07  — Phase-1/Phase-2 train/val split policy.
-  - M18  — clip extraction strategy.
+Guard-1 static-bad contacts (per run) are not yet scanned; when they are, fold the
+per-session bad list into the yielded timeline (as BT does with ``extra_bad``) so
+it enters the cache key and any edit auto-invalidates the stale raw cache.
 """
 
 from __future__ import annotations
 
+import csv
 import typing as tp
 
 import mne
 import pandas as pd
 from neuralset.events import study
 
+from speech_decoding.studies.cogan_dcohort.loader import (
+    TARGET_RATE_HZ,
+    cogan_load_raw,
+)
 
-_BLOCKER_MSG = (
-    "DCohortStudy is a T3.5 scaffold gated on docs/neuroprobe/v14_blockers.md "
-    "DP03 (studies/cogan_dcohort/ contract not yet ratified). Cited blockers: "
-    "DP03, DP05 (DK-index map), DP06 (clip extraction), "
-    "M07 (SSL split), M18 (clip strategy)."
+# Manifest columns this Study consumes (a subset of build_cogan_manifest's
+# ManifestRow). Kept as an explicit contract so the CSV format and the reader
+# can't silently drift apart.
+_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "subject_bids",
+    "global_subject_id",
+    "trial_id",
+    "edf_path",
+    "channels_tsv_path",
+    "duration_s",
 )
 
 
 class DCohortStudy(study.Study):
-    """Cogan-lab Duke sEEG D-cohort (D<num> patients).
+    """Cogan-lab Duke sEEG D-cohort (D<num> patients) — v3 SSL producer.
 
-    Anatomy-bearing under v14: per-subject DK parcel routing via native
-    FreeSurfer recons (DK ``aparc+aseg`` is present directly in the recon
-    CSVs — no Pipeline C derivation needed). The class declaration exists
-    so dispatch can reference it; all data-loading methods raise until DP03
-    (subpackage contract) lands.
-
-    NOTE: D-cohort native rate is MIXED (mostly 2048 Hz; also 2000 / 1024 /
-    1000 Hz across runs) — NOT a flat 2000 Hz. Loader reads the per-run rate
-    and resamples to the v14 canonical 2048 Hz; after resample all 30
-    Multi-STFT bins are valid. Inventory: ``memory/project_d_cohort_data_inventory_2026_06_03.md``.
+    Anatomy-bearing via native FreeSurfer recons (per-electrode DKT parcels are
+    produced by the #97 localization pipeline into ``depth-wm.csv``, consumed
+    downstream by the v3 ``parcel_fn`` — not here). This class is purely the
+    voltage + timeline boundary.
     """
+
+    # Run manifest CSV (build_cogan_manifest.py). The base ``path`` field is a
+    # study DATA DIRECTORY (a validator mkdir's it), so the manifest — a file —
+    # gets its own field. Enumeration-only ⇒ dropped in ``_cls_kwargs``.
+    manifest_path: str = ""
+
+    # SLURM-array cache build: restrict emitted timelines to this exact set of
+    # ``(subject_id, trial_id)`` pairs (a subset of the manifest). Like BT's, it
+    # lives in the timeline list, not the class uid — dropped in ``_cls_kwargs``
+    # so it never perturbs a per-session cache key.
+    session_subset: tp.Optional[tp.Tuple[tp.Tuple[int, int], ...]] = None
 
     aliases: tp.ClassVar[tuple[str, ...]] = (
         "DCohort", "Cogan_DCohort", "Cogan-Duke-sEEG",
@@ -60,35 +78,126 @@ class DCohortStudy(study.Study):
     url: tp.ClassVar[str] = ""
     licence: tp.ClassVar[str] = "Internal Cogan-lab data; IRB-restricted."
     description: tp.ClassVar[str] = (
-        "Cogan-lab Duke sEEG D-cohort (D<num> patients). Anatomy-bearing via "
-        "native FS recons (DK aparc+aseg present in recon CSVs). Distinct from "
+        "Cogan-lab Duke sEEG D-cohort (D<num> patients), 7-task speech+cognitive "
+        "SSL corpus. Anatomy-bearing via native FS recons (DKT). Distinct from "
         "the PS S<num> uECoG cohort."
     )
     requirements: tp.ClassVar[tuple[str, ...]] = ()
     _info: tp.ClassVar[study.StudyInfo | None] = None
 
-    # v14 canonical RESAMPLE TARGET. Native rate is mixed (mostly 2048; also
-    # 2000 / 1024 / 1000 across runs); loader resamples per-run to this.
-    SAMPLE_RATE_HZ: tp.ClassVar[float] = 2048.0
-    # US site (Duke); v14 dispatch's 60 Hz notch already correct.
-    MAINS_NOTCH_HZ: tp.ClassVar[float] = 60.0
-    # Half-open ``(start, stop)`` of the trainable v14 30-bin filterbank.
-    # After resample to 2048 Hz → all 30 bins valid → ``(0, 30)``.
-    VALID_BIN_RANGE: tp.ClassVar[tuple[int, int]] = (0, 30)
-    # Speech-subset FS gate (project_d_cohort_data_inventory_2026_06_03):
-    # 87 / 87 D-pts pass — D107/D139 earlier mis-flagged (recons live under
-    # suffix variants D107A/B, D139A/B). Full inventory has 113 task subjects,
-    # 134 recon-localized.
-    N_UNIQUE_PATIENTS: tp.ClassVar[int] = 87
+    # v3 canonical rate. Native rate is mixed across runs (2048/2000/1024/1000);
+    # cogan_load_raw resamples every run to this before it leaves the loader.
+    SAMPLE_RATE_HZ: tp.ClassVar[float] = TARGET_RATE_HZ
+
+    def _cls_kwargs(self) -> dict[str, tp.Any]:
+        """Drop enumeration-only fields from the class uid.
+
+        The base ``_cls_kwargs`` rejects any non-default pydantic field as an
+        unsupported class parameter, which would block dispatch whenever
+        ``session_subset`` (or the manifest ``path``) is set. Neither changes the
+        CONTENT of a per-session timeline, so both are excluded — the per-session
+        cache key is the SpecialLoader uid over the timeline, not the class uid.
+        """
+        kwargs: dict[str, tp.Any] = self.model_dump(
+            serialize_as_any=True, exclude_defaults=True,
+        )
+        for p in ("infra", "infra_timelines", "path", "name", "query",
+                  "manifest_path", "session_subset"):
+            kwargs.pop(p, None)
+        if kwargs:
+            raise RuntimeError(
+                f"DCohortStudy: unexpected non-default fields {sorted(kwargs)}"
+            )
+        return kwargs
 
     def _download(self) -> None:
-        raise NotImplementedError(_BLOCKER_MSG)
+        raise NotImplementedError(
+            "Cogan D-cohort is IRB-restricted lab data already on DCC at "
+            "/hpc/group/coganlab/Data; there is no download step. Set "
+            "DCohortStudy.manifest_path to a build_cogan_manifest.py CSV."
+        )
+
+    def _manifest_rows(self) -> list[dict[str, str]]:
+        """Read the manifest CSV at ``self.manifest_path`` → list of row dicts.
+
+        Validates the required columns are present (fail loud on a stale CSV
+        schema) but does no type coercion beyond what the callers do inline.
+        """
+        if not self.manifest_path:
+            raise ValueError("DCohortStudy.manifest_path is unset")
+        with open(self.manifest_path, newline="") as fh:
+            reader = csv.DictReader(fh)
+            missing = [c for c in _REQUIRED_COLUMNS if c not in (reader.fieldnames or [])]
+            if missing:
+                raise ValueError(
+                    f"manifest {self.manifest_path} missing columns {missing}; "
+                    f"regenerate with build_cogan_manifest.py"
+                )
+            return list(reader)
+
+    def _row_for(self, timeline: dict[str, tp.Any]) -> dict[str, str]:
+        sid, tid = int(timeline["subject_id"]), int(timeline["trial_id"])
+        for row in self._manifest_rows():
+            if int(row["global_subject_id"]) == sid and int(row["trial_id"]) == tid:
+                return row
+        raise KeyError(
+            f"session (subject_id={sid}, trial_id={tid}) not in manifest {self.manifest_path}"
+        )
 
     def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
-        raise NotImplementedError(_BLOCKER_MSG)
+        subset = (
+            {tuple(p) for p in self.session_subset}
+            if self.session_subset is not None
+            else None
+        )
+        seen: set[tuple[int, int]] = set()
+        for row in self._manifest_rows():
+            sid, tid = int(row["global_subject_id"]), int(row["trial_id"])
+            if subset is not None and (sid, tid) not in subset:
+                continue
+            seen.add((sid, tid))
+            # Guard-1 per-run static-bad list folds in here once #98 item-4 lands.
+            yield {
+                "subject": row["subject_bids"],
+                "subject_id": sid,
+                "trial_id": tid,
+            }
+        if subset is not None:
+            unknown = subset - seen
+            if unknown:
+                raise ValueError(
+                    f"session_subset {sorted(unknown)} not in manifest {self.manifest_path}"
+                )
 
     def _load_timeline_events(self, timeline: dict[str, tp.Any]) -> pd.DataFrame:
-        raise NotImplementedError(_BLOCKER_MSG)
+        row = self._row_for(timeline)
+        filepath = study.SpecialLoader(method=self._load_raw, timeline=timeline).to_json()
+        return pd.DataFrame(
+            [
+                {
+                    "type": "Ieeg",
+                    "start": 0.0,
+                    # Wall-clock seconds from ieeg.json — resample preserves it, so
+                    # it is consistent with frequency = post-resample 2048.
+                    "duration": float(row["duration_s"]),
+                    "frequency": float(TARGET_RATE_HZ),
+                    "filepath": filepath,
+                }
+            ]
+        )
 
     def _load_raw(self, timeline: dict[str, tp.Any]) -> mne.io.RawArray:
-        raise NotImplementedError(_BLOCKER_MSG)
+        row = self._row_for(timeline)
+        channels_tsv = row["channels_tsv_path"]
+        if not channels_tsv:
+            raise ValueError(
+                f"run {row['edf_path']} has no channels.tsv; cannot select neural "
+                "channels by type (this run should have been skipped at manifest build)"
+            )
+        extra_bad = tuple(timeline.get("extra_bad", ()))
+        data, ch_names, sfreq = cogan_load_raw(
+            row["edf_path"], channels_tsv, extra_bad=extra_bad,
+            target_rate=TARGET_RATE_HZ,
+        )
+        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="seeg")
+        return mne.io.RawArray(data, info, verbose=False)
