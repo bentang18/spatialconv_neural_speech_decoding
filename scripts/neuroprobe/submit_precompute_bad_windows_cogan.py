@@ -61,6 +61,8 @@ def build_sbatch(log_dir: Path, args: argparse.Namespace) -> str:
     ]
     if args.account:
         lines.append(f"#SBATCH --account={args.account}")
+    if args.dependency:
+        lines.append(f"#SBATCH --dependency={args.dependency}")
     lines.extend([
         "#SBATCH --requeue",  # scavenger is preemptible -> requeue on preemption
         f"#SBATCH --cpus-per-task={args.cpus}",
@@ -133,6 +135,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
     p.add_argument("--python", default="/work/ht203/probe_bench/.venv/bin/python",
                    help="Interpreter (absolute — the repo/speech clone has no .venv).")
+    p.add_argument("--dependency", default=None,
+                   help="SLURM --dependency string (e.g. afterok:<band1>:<band2>:<band3>) "
+                        "for the overnight chain — run guard-2 only after the cache bake.")
     p.add_argument("--account", default="coganlab")
     p.add_argument("--cpu-partition", default="common,scavenger",
                    help="CPU partitions for the array (SLURM picks whichever has room).")

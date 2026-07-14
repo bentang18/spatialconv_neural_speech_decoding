@@ -70,6 +70,7 @@ from speech_decoding.studies.braintreebank.study import (
     _SESSIONS_BY_MODE,
     Wang2024Treebank,
 )
+from speech_decoding.studies.cogan_dcohort.study import DCohortStudy
 from speech_decoding.studies.braintreebank.word_events import (
     BTWordEvents,
     DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
@@ -3250,6 +3251,21 @@ def _parser() -> argparse.ArgumentParser:
                         "timeline building — so --spec-only runs h5-free (DeltaAI). "
                         "Duration is uid-invariant ⇒ byte-identical caches/clips to the "
                         "h5 path. Default None = read duration from h5.")
+    # Corpus/study selector. 'bt' (default) is the ENTIRE existing dispatch,
+    # unchanged. 'cogan' routes a DCohortStudy through build_cogan_cache_experiment
+    # for the spec-cache bake ONLY (cache-only path); no Cogan training is wired.
+    p.add_argument("--study", dest="study", choices=("bt", "cogan"), default="bt",
+                   help="Corpus to dispatch. 'bt' (default) = Wang2024Treebank "
+                        "(unchanged). 'cogan' = DCohortStudy 3-band spec-cache bake; "
+                        "requires --cache-only --cache-band --cache-session-index "
+                        "--cogan-manifest --spec-cache-dir. No Cogan training path.")
+    p.add_argument("--cogan-manifest", dest="cogan_manifest", default=None,
+                   help="Cogan run manifest CSV (build_cogan_manifest.py). Required "
+                        "with --study cogan; row order = --cache-session-index order "
+                        "(same order the guard-1/guard-2 arrays enumerate).")
+    p.add_argument("--cogan-notch-hz", dest="cogan_notch_hz", type=float, default=60.0,
+                   help="Mains notch for the Cogan bake. All Duke D-cohort runs are "
+                        "60 Hz (verified in the manifest power_line_hz). Default 60.0.")
     # Layer-2 bad-electrode clip filter (#180). SSL-only: clips overlapping a
     # precomputed glitch span are dropped before sampling. P4 eval untouched
     # (build gates this to the SSL phases). Default None = no filtering.
@@ -4694,6 +4710,133 @@ def _build_v14_chain(args) -> list[Experiment]:
     return [p1, p2, p3a, p3b, p4]
 
 
+# --- Cogan D-cohort spec-cache bake (cache-only; NO training path) -------------
+# The v3 band lookup mirrors build_v14_experiment's --cache-band map (v3slow/v3mid
+# ride hop-64 STFT_V3_*; hga reuses STFT_2BAND_HGA). Kept in sync with that literal
+# by test_dispatch_cogan_cache_seam.test_cogan_band_view_matches_bt.
+_COGAN_CACHE_BANDS: dict[str, tp.Any] = {
+    "v3slow": STFT_V3_SLOW,
+    "v3mid": STFT_V3_MID,
+    "hga": STFT_2BAND_HGA,
+}
+
+
+def _cogan_common_fe_kwargs(
+    *, notch_hz: float, c_max: int, session_robust_z: bool, spec_only: bool,
+) -> dict[str, tp.Any]:
+    """RAW-|STFT| front-end config for the Cogan bake — a VERBATIM mirror of
+    build_v14_experiment's ``common_fe_kwargs`` (car='shaft' name-based, 0.5 Hz HPF,
+    no scaler/log, per-(elec,bin,session) robust-z). Mirrored here rather than
+    threaded through build_v14_experiment so a Cogan run never traverses BT-specific
+    pre-setup (which reads bt_root anatomy). The drift guard is
+    test_dispatch_cogan_cache_seam."""
+    return dict(
+        event_types="Ieeg",
+        car="shaft",
+        notch_filter=notch_hz,
+        filter=(0.5, None),
+        scaler=None,
+        apply_log=False,
+        channel_order="original",
+        c_max=c_max,
+        session_robust_z=session_robust_z,
+        spec_only=spec_only,
+    )
+
+
+def build_cogan_cache_experiment(
+    *,
+    cache_band: str | None,
+    cache_session_index: int | None,
+    spec_cache_dir: str | None,
+    cogan_manifest: str | None,
+    notch_hz: float,
+    c_max: int,
+    session_robust_z: bool,
+    spec_only: bool,
+    clip_len: float,
+) -> tp.Any:
+    """Cogan D-cohort 3-band spec-cache bake experiment (cache-only; NO training).
+
+    Routes a :class:`DCohortStudy` through the SAME :class:`MultiStftView` band view
+    the BT v3 ``--cache-band`` build uses, so the produced |STFT| robust-z memmaps
+    are byte-identical in format + front-end to a BT v3 cache — the v3 consumer
+    (``dispatch_v3 --session``) reads them unchanged. Skips ALL BT-specific machinery
+    (Wang2024Treebank, BTWordEvents, DK support / valid_mask / ref_idx). DCohortStudy
+    yields ONE whole-movie ``Ieeg`` row per session, so the segmenter triggers on
+    ``type == 'Ieeg'`` (no Word events).
+
+    Returns a shim carrying ``.data``; the caller's ``--cache-only`` block drives
+    ``data.study.run() -> segmenter.apply() -> dataset.prepare()``."""
+    import types as _types
+
+    if cache_band not in _COGAN_CACHE_BANDS:
+        raise SystemExit(
+            f"--study cogan: --cache-band {cache_band!r} not a v3 band; choose from "
+            f"{tuple(_COGAN_CACHE_BANDS)}"
+        )
+    if not cogan_manifest:
+        raise SystemExit("--study cogan requires --cogan-manifest CSV")
+    if spec_cache_dir is None:
+        raise SystemExit("--study cogan cache bake requires --spec-cache-dir")
+    if cache_session_index is None:
+        raise SystemExit("--study cogan cache bake requires --cache-session-index")
+
+    # Session enumeration from the Cogan MANIFEST (not _SESSIONS_BY_MODE): the array
+    # task index picks (subject_id, trial_id). iter_timelines() yields rows in
+    # manifest order, so index i is deterministic and matches the guard-1/guard-2
+    # arrays (all three drive off the same manifest row order).
+    sessions = [
+        (int(tl["subject_id"]), int(tl["trial_id"]))
+        for tl in DCohortStudy(manifest_path=cogan_manifest).iter_timelines()
+    ]
+    if not 0 <= cache_session_index < len(sessions):
+        raise SystemExit(
+            f"--cache-session-index {cache_session_index} out of range "
+            f"(manifest has {len(sessions)} sessions: 0..{len(sessions) - 1})"
+        )
+    s_id, t_id = sessions[cache_session_index]
+    print(
+        f"[cache-only cogan] session-index {cache_session_index} -> "
+        f"(subject_id={s_id}, trial_id={t_id}) of {len(sessions)} manifest sessions"
+    )
+
+    study_obj = DCohortStudy(
+        manifest_path=cogan_manifest,
+        session_subset=((s_id, t_id),),
+        infra_timelines={"cluster": None},
+    )
+    chain = ns.Chain(steps=[study_obj])
+
+    common_fe_kwargs = _cogan_common_fe_kwargs(
+        notch_hz=notch_hz, c_max=c_max,
+        session_robust_z=session_robust_z, spec_only=spec_only,
+    )
+    band_const = _COGAN_CACHE_BANDS[cache_band]
+    band_spec_cache = str(Path(spec_cache_dir) / f"band_{cache_band}")
+    view = MultiStftView(
+        **common_fe_kwargs, front_end="band", **band_const,
+        hop_length=int(band_const["band_hop"]),
+        spec_cache_dir=band_spec_cache,
+    )
+
+    data = Data(
+        study=chain,
+        segmenter={
+            "extractors": {"electrode_tokens": view},
+            # DCohortStudy emits the whole-movie Ieeg span; MultiStftView.prepare
+            # bakes off Ieeg rows, so trigger on Ieeg (Cogan SSL has no Word events).
+            "trigger_query": "type == 'Ieeg'",
+            "start": 0.0,
+            # Cache-irrelevant: the whole-movie |STFT| memmap is clip-independent.
+            "duration": clip_len,
+        },
+        batch_size=1,
+        num_workers=0,
+    )
+    return _types.SimpleNamespace(data=data)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     # --cache-band is a cache-build-only lever (it swaps the electrode_tokens
@@ -4706,6 +4849,17 @@ def main(argv: list[str] | None = None) -> int:
             "--cache-only (it builds one 3STFT band's spec cache, then exits before "
             "the trainer). Add --cache-only, or drop --cache-band for a real run."
         )
+    # --study cogan is a spec-cache-bake-only path (no Cogan trainer is wired). Fail
+    # loud here so a mis-invocation never falls through to the BT training builder.
+    if args.study == "cogan":
+        if not args.cache_only:
+            raise SystemExit(
+                "--study cogan is spec-cache-bake-only; pass --cache-only "
+                "--cache-band {v3slow,v3mid,hga} --cache-session-index N. No Cogan "
+                "training path is wired."
+            )
+        if not args.cogan_manifest:
+            raise SystemExit("--study cogan requires --cogan-manifest CSV")
     # Predictor depth half-rule (Ben 2026-06-12). Each JEPA predictor defaults to
     # HALF the depth of the encoder stack it predicts from: M2 (front-end) tracks
     # --depth, M4 (parcel/latent) tracks --latent-depth. At the canonical B37
@@ -5278,34 +5432,52 @@ def main(argv: list[str] | None = None) -> int:
         else args.electrode_set
     )
     print(f"  electrode_set={single_electrode_set} (--electrode-set {args.electrode_set})")
-    xp = build_v14_experiment(
-        **_common_build_kwargs(args),
-        clip_len=args.clip_len,
-        electrode_set=single_electrode_set,
-        neural_lag_s=args.neural_lag_s,
-        max_steps=single_max_steps,
-        val_check_interval=single_val_check,
-        limit_val_batches=single_limit_val,
-        limit_test_batches=single_limit_test,
-        early_stopping_patience=single_p4_patience,
-        # #54 audit M1: guard is SSL/distill-only; a single --phase 4 probe run
-        # disables it (EarlyStopping + real metric already cover it). #68:
-        # --no-collapse-guard further disarms it for a diagnostic SSL run.
-        collapse_guard=(args.phase != 4) and args.collapse_guard,
-        joint_phase=(args.phase == 1),
-        p3_distill=(args.phase == 3),
-        p3_stage=args.p3_stage,
-        whisper_target_cache_dir=args.whisper_target_cache_dir,
-        whisper_layer_merge=args.whisper_layer_merge,
-        channel_stats_path=args.channel_stats_path,
-        target_standardize=args.target_standardize,
-        phase4_frozen_probe=phase4_frozen_probe,
-        fold_index=args.fold_index,
-        pretrained_ckpt=args.resume_from,
-        snapshot_ckpt_to=args.snapshot_ckpt_to,
-        jepa_phase=args.jepa_phase,
-        parcel_lr_scale=args.parcel_lr_scale,
-    )
+    if args.study == "cogan":
+        # Cogan D-cohort spec-cache bake (cache-only, no trainer). Self-contained
+        # builder that mirrors the BT common_fe_kwargs + band view byte-for-byte
+        # (drift-guarded by test_dispatch_cogan_cache_seam) but sources the corpus
+        # from DCohortStudy, so ZERO BT dispatch lines change. Falls through to the
+        # shared `if args.cache_only:` block below → identical bake sequence.
+        xp = build_cogan_cache_experiment(
+            cache_band=args.cache_band,
+            cache_session_index=args.cache_session_index,
+            spec_cache_dir=args.spec_cache_dir,
+            cogan_manifest=args.cogan_manifest,
+            notch_hz=args.cogan_notch_hz,
+            c_max=args.c_max,
+            session_robust_z=args.session_robust_z,
+            spec_only=args.spec_only,
+            clip_len=args.clip_len,
+        )
+    else:
+        xp = build_v14_experiment(
+            **_common_build_kwargs(args),
+            clip_len=args.clip_len,
+            electrode_set=single_electrode_set,
+            neural_lag_s=args.neural_lag_s,
+            max_steps=single_max_steps,
+            val_check_interval=single_val_check,
+            limit_val_batches=single_limit_val,
+            limit_test_batches=single_limit_test,
+            early_stopping_patience=single_p4_patience,
+            # #54 audit M1: guard is SSL/distill-only; a single --phase 4 probe run
+            # disables it (EarlyStopping + real metric already cover it). #68:
+            # --no-collapse-guard further disarms it for a diagnostic SSL run.
+            collapse_guard=(args.phase != 4) and args.collapse_guard,
+            joint_phase=(args.phase == 1),
+            p3_distill=(args.phase == 3),
+            p3_stage=args.p3_stage,
+            whisper_target_cache_dir=args.whisper_target_cache_dir,
+            whisper_layer_merge=args.whisper_layer_merge,
+            channel_stats_path=args.channel_stats_path,
+            target_standardize=args.target_standardize,
+            phase4_frozen_probe=phase4_frozen_probe,
+            fold_index=args.fold_index,
+            pretrained_ckpt=args.resume_from,
+            snapshot_ckpt_to=args.snapshot_ckpt_to,
+            jepa_phase=args.jepa_phase,
+            parcel_lr_scale=args.parcel_lr_scale,
+        )
     if args.cache_only:
         # Build the front-end spec cache then EXIT before the trainer (no GPU).
         # Drives the exact study.run() -> segmenter.apply() -> dataset.prepare()
