@@ -37,7 +37,13 @@ PIN_SUBJECTS = ("D23", "D24")
 
 
 def _recon_dir(recon_root: str, subj: str) -> str:
+    # electrodeNames / LEPTOVOX / the shipped DK CSV live here.
     return os.path.join(recon_root, subj, "elec_recon")
+
+
+def _mri_dir(recon_root: str, subj: str) -> str:
+    # FreeSurfer atlas volumes (aparc+aseg / aparc.DKTatlas+aseg) live here.
+    return os.path.join(recon_root, subj, "mri")
 
 
 def _load_mgz(path: str) -> np.ndarray:
@@ -75,7 +81,7 @@ def pin_convention(
         )
         gt = dict(cl.read_dk_csv_origins(_dk_csv_path(recon_root, subj, radius_mm)))
         expected = [gt[n[0]] for n in names]
-        vol = _load_mgz(os.path.join(rd, "aparc+aseg.mgz"))
+        vol = _load_mgz(os.path.join(_mri_dir(recon_root, subj), "aparc+aseg.mgz"))
         perm, flips, frac = cl.find_axis_convention(
             vol, coords, expected, lut, radius_mm
         )
@@ -144,8 +150,11 @@ def main() -> None:
     ap.add_argument("--radius-mm", type=float, default=3.0)
     ap.add_argument("--pin-threshold", type=float, default=0.95)
     ap.add_argument(
-        "--label-choice", choices=("origin", "majority"), required=True,
-        help="which candidate fills the DKT column (Ben-gated; no default)",
+        "--label-choice", choices=("origin", "majority"), default="majority",
+        help="which candidate fills the DKT column. Default 'majority' (3mm-sphere "
+        "plurality): matches BT's gray-matter-favoring near-zero-WM convention and "
+        "the iEEG-parcellation literature (Behncke 2019 / Stolk 2018 / Anderson "
+        "2021); 'origin' (center voxel) drops WM-adjacent depth contacts to sentinel.",
     )
     args = ap.parse_args()
 
