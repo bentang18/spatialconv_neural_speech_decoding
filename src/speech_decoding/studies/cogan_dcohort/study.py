@@ -29,6 +29,7 @@ then the fold-in is a no-op (see ``guard1_static``).
 from __future__ import annotations
 
 import csv
+import os
 import typing as tp
 
 import mne
@@ -120,20 +121,38 @@ class DCohortStudy(study.Study):
             "DCohortStudy.manifest_path to a build_cogan_manifest.py CSV."
         )
 
+    def _resolved_manifest_path(self) -> str:
+        """The manifest CSV path, resolving the SpecialLoader round-trip.
+
+        ``manifest_path`` is dropped from ``_cls_kwargs`` (it's not cache-content —
+        the SpecialLoader uid is over the timeline), so a study reconstructed by
+        ``SpecialLoader.from_json`` at bake time has it empty. Mirror the BT study,
+        whose ``_load_raw`` reads its data root from an env var (ROOT_DIR_BRAINTREEBANK):
+        fall back to ``COGAN_MANIFEST``, which ``build_cogan_cache_experiment`` sets
+        from the same ``--cogan-manifest`` CLI arg (single source of truth).
+        """
+        mp = self.manifest_path or os.environ.get("COGAN_MANIFEST", "")
+        if not mp:
+            raise ValueError(
+                "DCohortStudy.manifest_path is unset and COGAN_MANIFEST env is empty; "
+                "a reconstructed study restores the manifest path from COGAN_MANIFEST "
+                "(set by build_cogan_cache_experiment from --cogan-manifest)."
+            )
+        return mp
+
     def _manifest_rows(self) -> list[dict[str, str]]:
-        """Read the manifest CSV at ``self.manifest_path`` → list of row dicts.
+        """Read the manifest CSV → list of row dicts.
 
         Validates the required columns are present (fail loud on a stale CSV
         schema) but does no type coercion beyond what the callers do inline.
         """
-        if not self.manifest_path:
-            raise ValueError("DCohortStudy.manifest_path is unset")
-        with open(self.manifest_path, newline="") as fh:
+        manifest_path = self._resolved_manifest_path()
+        with open(manifest_path, newline="") as fh:
             reader = csv.DictReader(fh)
             missing = [c for c in _REQUIRED_COLUMNS if c not in (reader.fieldnames or [])]
             if missing:
                 raise ValueError(
-                    f"manifest {self.manifest_path} missing columns {missing}; "
+                    f"manifest {manifest_path} missing columns {missing}; "
                     f"regenerate with build_cogan_manifest.py"
                 )
             return list(reader)
@@ -144,7 +163,8 @@ class DCohortStudy(study.Study):
             if int(row["global_subject_id"]) == sid and int(row["trial_id"]) == tid:
                 return row
         raise KeyError(
-            f"session (subject_id={sid}, trial_id={tid}) not in manifest {self.manifest_path}"
+            f"session (subject_id={sid}, trial_id={tid}) not in manifest "
+            f"{self._resolved_manifest_path()}"
         )
 
     def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:

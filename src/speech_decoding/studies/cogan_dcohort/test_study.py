@@ -97,6 +97,25 @@ def test_cls_kwargs_drops_enumeration_fields(tmp_path, manifest):
     assert s._cls_kwargs() == {}  # path + session_subset dropped, no raise
 
 
+def test_manifest_path_resolves_from_env_after_roundtrip(tmp_path, manifest, monkeypatch):
+    """A study reconstructed by SpecialLoader.from_json has manifest_path=='' (dropped
+    from the uid); _load_raw must still find the CSV via the COGAN_MANIFEST env that
+    build_cogan_cache_experiment publishes — otherwise the bake dies at load time."""
+    reconstructed = DCohortStudy(path=str(tmp_path), manifest_path="")
+    monkeypatch.setenv("COGAN_MANIFEST", manifest)
+    assert reconstructed._resolved_manifest_path() == manifest
+    # and enumeration off the resolved CSV yields the same rows the field-set study does
+    assert [t["subject_id"] for t in reconstructed.iter_timelines()] == [
+        t["subject_id"] for t in _study(tmp_path, manifest).iter_timelines()
+    ]
+
+
+def test_manifest_path_unset_and_no_env_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("COGAN_MANIFEST", raising=False)
+    with pytest.raises(ValueError, match="COGAN_MANIFEST env is empty"):
+        DCohortStudy(path=str(tmp_path), manifest_path="")._resolved_manifest_path()
+
+
 def test_row_for_missing_session_raises(tmp_path, manifest):
     s = _study(tmp_path, manifest)
     with pytest.raises(KeyError, match="not in manifest"):

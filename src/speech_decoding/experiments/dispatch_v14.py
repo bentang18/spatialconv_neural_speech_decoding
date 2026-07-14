@@ -4777,6 +4777,12 @@ def build_cogan_cache_experiment(
         )
     if not cogan_manifest:
         raise SystemExit("--study cogan requires --cogan-manifest CSV")
+    # DCohortStudy drops manifest_path from its cache uid, so a study reconstructed
+    # by SpecialLoader.from_json at bake time has it empty. Publish it to the env the
+    # study's _resolved_manifest_path() falls back to (mirrors BT's ROOT_DIR env), so
+    # in-process + forked-worker _load_raw calls resolve the same CSV. Single source:
+    # the --cogan-manifest arg drives both the study field and this env.
+    os.environ["COGAN_MANIFEST"] = cogan_manifest
     if spec_cache_dir is None:
         raise SystemExit("--study cogan cache bake requires --spec-cache-dir")
     if cache_session_index is None:
