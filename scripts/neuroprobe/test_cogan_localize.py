@@ -324,6 +324,128 @@ def test_find_axis_convention_length_mismatch_raises():
         cl.find_axis_convention(vol, np.zeros((3, 3)), ["a", "b"], {}, 0.0)
 
 
+# --------------------- nearest-GM volumetric labeling ----------------------
+
+
+def test_gm_ids_from_lut_picks_in_vocab_only():
+    lut = {
+        0: "Unknown", 2: "Left-Cerebral-White-Matter", 17: "Left-Hippocampus",
+        1024: "ctx-lh-precentral", 1030: "ctx-lh-superiortemporal",
+        1004: "ctx-lh-corpuscallosum",  # real FS id, NOT in the parcel vocab
+    }
+    ids = cl.gm_ids_from_lut(lut, vocab=("ctx-lh-precentral", "Left-Hippocampus"))
+    assert ids == {1024, 17}
+    # default vocab (K=74) picks up superiortemporal but never WM/unknown/callosum
+    d = cl.gm_ids_from_lut(lut)
+    assert 1030 in d and 1024 in d and 17 in d
+    assert 0 not in d and 2 not in d and 1004 not in d
+
+
+def test_vendored_dkt_vocab_matches_anatomy():
+    anatomy = pytest.importorskip(
+        "speech_decoding.studies.braintreebank.anatomy",
+        reason="package not importable (DCC-standalone run)",
+    )
+    # Order-sensitive parity: the vendored copy must be the SAME tuple the v3
+    # parcel embedding uses, or a location maps to a different parcel across
+    # BT and Cogan and breaks parcel identity.
+    assert cl.V14_DKT_PARCEL_LABELS == anatomy.V14_DKT_PARCEL_LABELS
+    assert len(cl.V14_DKT_PARCEL_LABELS) == 74
+
+
+def test_nearest_gm_center_in_gm_reach_zero():
+    vol = np.full((12, 12, 12), 2, dtype=np.int64)  # all white matter
+    vol[6, 6, 6] = 1024  # a single cortical voxel at the center
+    gm_id, reach, nbase = cl.nearest_gm_label(vol, (6, 6, 6), {1024}, 3.0, 10.0)
+    assert gm_id == 1024
+    assert reach == 0.0
+    assert nbase == 1
+
+
+def test_nearest_gm_plurality_ignores_white_matter():
+    # A 3x3x3 cortical cube at the center inside a WM sea: WM is the numerical
+    # majority of the recording sphere, but the rule labels the contact cortex.
+    vol = np.full((14, 14, 14), 2, dtype=np.int64)  # WM everywhere
+    vol[6:9, 6:9, 6:9] = 1030  # 27 cortical voxels straddling the center (7,7,7)
+    gm_id, reach, nbase = cl.nearest_gm_label(vol, (7, 7, 7), {1024, 1030}, 3.0, 10.0)
+    assert gm_id == 1030  # not 2 (WM), which naive sphere-majority would pick
+    assert reach == 0.0
+    assert nbase == 27
+
+
+def test_nearest_gm_grows_past_base_to_reach_gm():
+    vol = np.full((14, 14, 14), 2, dtype=np.int64)  # WM
+    vol[6, 6, 11] = 1024  # only gray voxel, 5mm from the contact
+    gm_id, reach, nbase = cl.nearest_gm_label(vol, (6, 6, 6), {1024}, 3.0, 10.0)
+    assert gm_id == 1024
+    assert abs(reach - 5.0) < 1e-9
+    assert nbase == 0  # nothing gray inside the 3mm base sphere
+
+
+def test_nearest_gm_deep_wm_beyond_cap_returns_sentinel():
+    vol = np.full((26, 26, 26), 2, dtype=np.int64)  # WM
+    vol[6, 6, 17] = 1024  # gray 11mm away — beyond the 10mm cap
+    gm_id, reach, nbase = cl.nearest_gm_label(vol, (6, 6, 6), {1024}, 3.0, 10.0)
+    assert gm_id == 0  # unknown sentinel → maps out of vocab downstream
+    assert reach == float("inf")
+    assert nbase == 0
+
+
+def test_nearest_gm_tie_breaks_to_nearer_parcel():
+    vol = np.full((14, 14, 14), 2, dtype=np.int64)  # WM; center (6,6,6) is WM
+    vol[6, 6, 7] = 1024  # dist 1
+    vol[6, 6, 8] = 1024  # dist 2  → two 1024 voxels, nearest at 1
+    vol[6, 4, 6] = 1030  # dist 2
+    vol[6, 3, 6] = 1030  # dist 3  → two 1030 voxels, nearest at 2
+    gm_id, _, _ = cl.nearest_gm_label(vol, (6, 6, 6), {1024, 1030}, 3.0, 10.0)
+    assert gm_id == 1024  # equal counts (2 vs 2) → nearer parcel wins
+
+
+def test_nearest_gm_invalid_radii_raise():
+    vol = np.zeros((6, 6, 6), dtype=np.int64)
+    with pytest.raises(ValueError, match="r_base_vox"):
+        cl.nearest_gm_label(vol, (3, 3, 3), {1}, -1.0, 10.0)
+    with pytest.raises(ValueError, match="r_base_vox"):
+        cl.nearest_gm_label(vol, (3, 3, 3), {1}, 5.0, 3.0)  # cap < base
+
+
+def test_write_depth_wm_csv_nearest_gm_choice_and_counterfactual_columns(tmp_path):
+    out = tmp_path / "depth-wm.csv"
+    rows = [("A1", "D", "L"), ("A2", "D", "L")]
+    coords = np.array([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]])
+    cl.write_depth_wm_csv(
+        str(out), rows, coords,
+        origin_names=["Left-Cerebral-White-Matter", "Left-Cerebral-White-Matter"],
+        majority_names=["Left-Cerebral-White-Matter", "ctx-lh-superiortemporal"],
+        majority_props=[0.7, 0.55],
+        label_choice="nearest_gm", radius_mm=3.0,
+        nearest_gm_names=["ctx-lh-precentral", "unknown"],
+        gm_reach_mm=[1.4142, float("inf")], n_gm_base=[8, 0], cap_mm=10.0,
+    )
+    with open(out) as fh:
+        got = list(csv.DictReader(fh))
+    # DKT follows the nearest-GM candidate...
+    assert got[0]["DKT"] == "ctx-lh-precentral"
+    assert got[1]["DKT"] == "unknown"
+    # ...and all three labelings survive for the blind-vs-rule counterfactual.
+    assert got[0]["DKT_origin"] == "Left-Cerebral-White-Matter"
+    assert got[0]["DKT_majority"] == "Left-Cerebral-White-Matter"
+    assert got[0]["DKT_nearest_gm"] == "ctx-lh-precentral"
+    assert got[0]["gm_reach_mm"] == "1.4142"
+    assert got[1]["gm_reach_mm"] == "inf"  # deep-WM reach written as inf
+    assert got[0]["n_gm_base"] == "8"
+    assert got[0]["cap_mm"] == "10.000"
+
+
+def test_write_depth_wm_csv_nearest_requires_columns(tmp_path):
+    with pytest.raises(ValueError, match="requires nearest_gm_names"):
+        cl.write_depth_wm_csv(
+            str(tmp_path / "x.csv"), [("A", "D", "L")], np.zeros((1, 3)),
+            origin_names=["x"], majority_names=["y"], majority_props=[1.0],
+            label_choice="nearest_gm", radius_mm=3.0,
+        )
+
+
 @pytest.mark.skipif(
     not os.path.isdir(_D24_DIR), reason="D24 DK CSV not staged locally"
 )

@@ -248,49 +248,91 @@ def write_depth_wm_csv(
     *,
     label_choice: str,
     radius_mm: float,
+    nearest_gm_names: Sequence[str] | None = None,
+    gm_reach_mm: Sequence[float] | None = None,
+    n_gm_base: Sequence[int] | None = None,
+    cap_mm: float | None = None,
 ) -> None:
     """Write the per-subject ``depth-wm.csv`` the v3 parcel_fn consumes.
 
-    Columns: ``Electrode,DKT,DKT_origin,DKT_majority,majority_prop,R,A,S,radius_mm``.
-    ``load_public_bt_anatomy`` reads only ``Electrode`` + the label column
-    (``DKT``); the rest are provenance/audit and the two candidate labels.
+    Columns: ``Electrode,DKT,DKT_nearest_gm,DKT_majority,DKT_origin,majority_prop,
+    gm_reach_mm,n_gm_base,R,A,S,radius_mm,cap_mm``. ``load_public_bt_anatomy`` reads
+    only ``Electrode`` + the label column (``DKT``); the rest are provenance/audit
+    and the three candidate labelings, so the origin/majority/nearest-GM choice is
+    fully re-derivable from one file (the counterfactual lives in the columns).
 
-    ``label_choice`` (``"origin"`` | ``"majority"``) selects which candidate fills
-    the ``DKT`` column — REQUIRED, no default, because origin (center voxel) vs
-    majority (top sphere proportion) is a Ben-gated decision that must not be made
-    silently. Both candidates are always written, so the choice is auditable and
-    re-derivable without re-sampling.
+    ``label_choice`` (``"nearest_gm"`` | ``"majority"`` | ``"origin"``) selects which
+    candidate fills ``DKT`` — REQUIRED, no default. ``"nearest_gm"`` is the
+    physically-correct volumetric rule (:func:`nearest_gm_label`) and requires the
+    ``nearest_gm_names``/``gm_reach_mm``/``n_gm_base`` columns; ``"origin"`` (center
+    voxel) and ``"majority"`` (top sphere proportion incl. WM) are the naive
+    volume labelings kept for the blind-vs-rule counterfactual. When the nearest-GM
+    columns are absent they are written empty and ``"nearest_gm"`` is rejected.
     """
-    if label_choice not in ("origin", "majority"):
+    if label_choice not in ("origin", "majority", "nearest_gm"):
         raise ValueError(
-            f"label_choice must be 'origin' or 'majority', got {label_choice!r}"
+            "label_choice must be 'nearest_gm', 'majority', or 'origin', got "
+            f"{label_choice!r}"
         )
+    has_ng = nearest_gm_names is not None
+    if has_ng and (gm_reach_mm is None or n_gm_base is None):
+        raise ValueError(
+            "nearest_gm_names/gm_reach_mm/n_gm_base must be provided together"
+        )
+    if label_choice == "nearest_gm" and not has_ng:
+        raise ValueError(
+            "label_choice='nearest_gm' requires nearest_gm_names/gm_reach_mm/"
+            "n_gm_base"
+        )
+    # Narrowed non-optional views (all-or-none, guarded above).
+    ng_names: Sequence[str] = nearest_gm_names if has_ng else ()
+    ng_reach: Sequence[float] = gm_reach_mm if gm_reach_mm is not None else ()
+    ng_nbase: Sequence[int] = n_gm_base if n_gm_base is not None else ()
+
     n = len(electrode_rows)
-    if not (
-        coords_ras.shape[0] == n == len(origin_names)
-        == len(majority_names) == len(majority_props)
-    ):
+    lengths = [coords_ras.shape[0], n, len(origin_names),
+               len(majority_names), len(majority_props)]
+    if has_ng:
+        lengths += [len(ng_names), len(ng_reach), len(ng_nbase)]
+    if len(set(lengths)) != 1:
         raise ValueError(
             "write_depth_wm_csv: ragged inputs "
             f"(electrodes={n}, coords={coords_ras.shape[0]}, "
             f"origin={len(origin_names)}, majority={len(majority_names)}, "
-            f"props={len(majority_props)})"
+            f"props={len(majority_props)}, "
+            f"nearest={len(ng_names) if has_ng else '-'})"
         )
+
+    def _reach(k: int) -> str:
+        if not has_ng:
+            return ""
+        v = float(ng_reach[k])
+        return "inf" if not np.isfinite(v) else f"{v:.4f}"
+
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(
-            ["Electrode", "DKT", "DKT_origin", "DKT_majority",
-             "majority_prop", "R", "A", "S", "radius_mm"]
+            ["Electrode", "DKT", "DKT_nearest_gm", "DKT_majority", "DKT_origin",
+             "majority_prop", "gm_reach_mm", "n_gm_base",
+             "R", "A", "S", "radius_mm", "cap_mm"]
         )
         for k in range(n):
             name = electrode_rows[k][0]
-            chosen = origin_names[k] if label_choice == "origin" else majority_names[k]
+            ng = ng_names[k] if has_ng else ""
+            chosen = {
+                "origin": origin_names[k],
+                "majority": majority_names[k],
+                "nearest_gm": ng,
+            }[label_choice]
             r, a, s = (float(coords_ras[k, 0]), float(coords_ras[k, 1]),
                        float(coords_ras[k, 2]))
             w.writerow(
-                [name, chosen, origin_names[k], majority_names[k],
-                 f"{float(majority_props[k]):.4f}", f"{r:.4f}", f"{a:.4f}",
-                 f"{s:.4f}", f"{float(radius_mm):.3f}"]
+                [name, chosen, ng, majority_names[k], origin_names[k],
+                 f"{float(majority_props[k]):.4f}", _reach(k),
+                 str(int(ng_nbase[k])) if has_ng else "",
+                 f"{r:.4f}", f"{a:.4f}", f"{s:.4f}",
+                 f"{float(radius_mm):.3f}",
+                 "" if cap_mm is None else f"{float(cap_mm):.3f}"]
             )
 
 
@@ -356,3 +398,146 @@ def sphere_label_proportions(
     else:
         origin = 0
     return origin, props
+
+
+# ---------------------------------------------------------------------------
+# Volumetric nearest-GM parcel labeling (the physically-correct depth rule).
+#
+# An sEEG contact records LFP/HGA over a small volume (a few mm). The parcel it
+# "belongs to" is the gray matter that dominates the tissue it actually records —
+# the plurality of IN-VOCAB gray voxels inside the recording sphere, ignoring
+# white matter / unknown / CSF / ventricle (all out of the parcel vocabulary). If
+# no gray sits inside the base sphere, the contact is at the gray/white fringe:
+# grow the sphere just far enough to reach the nearest gray voxel and vote there
+# (nearest-GM), up to a physical reach cap. Beyond the cap the contact is in
+# genuine deep white matter with no cortex in reach → WM sentinel (drops out of
+# vocab downstream). This is strictly MORE faithful than a 2-D pial-surface
+# projection (iELVis yangWang, BT's method): it respects the 3-D recording volume
+# and reaches subcortical sEEG targets (hippocampus/amygdala/thalamus) a surface
+# projection cannot represent — while reducing to the same nearest-GM answer in
+# the near-cortical regime where BT's projection lives (BT max ShiftDist 7.5mm).
+#
+# The GM vocabulary MUST be the exact set the v3 parcel embedding uses, or the
+# same physical location would map to a different parcel across BT and Cogan and
+# break parcel identity. It is vendored here (this file runs standalone on DCC
+# where the package is not importable) and pinned to the package's canonical
+# tuple by ``test_vendored_dkt_vocab_matches_anatomy`` locally. Any drift fails
+# that test. Mirrors ``anatomy.V14_DKT_PARCEL_LABELS`` (K=74).
+# ---------------------------------------------------------------------------
+
+_DKT_CORTICAL_BASES: tuple[str, ...] = (
+    "caudalanteriorcingulate", "caudalmiddlefrontal", "cuneus", "entorhinal",
+    "fusiform", "inferiorparietal", "inferiortemporal", "insula",
+    "isthmuscingulate", "lateraloccipital", "lateralorbitofrontal", "lingual",
+    "medialorbitofrontal", "middletemporal", "paracentral", "parahippocampal",
+    "parsopercularis", "parsorbitalis", "parstriangularis", "pericalcarine",
+    "postcentral", "posteriorcingulate", "precentral", "precuneus",
+    "rostralanteriorcingulate", "rostralmiddlefrontal", "superiorfrontal",
+    "superiorparietal", "superiortemporal", "supramarginal", "transversetemporal",
+)
+"""31 DKT cortical bases = the 34 DK aparc gyri minus DKT's 3 drops
+(bankssts, frontalpole, temporalpole). Order matches ``anatomy._DK_APARC_BASE_LABELS``
+with those three removed; the vocab tuple is order-sensitive downstream, so the
+local parity test compares against the package, not just as a set."""
+
+_ASEG_SUBCORTICAL_BASES: tuple[str, ...] = (
+    "Hippocampus", "Amygdala", "Caudate", "Putamen", "Pallidum", "Thalamus-Proper",
+)
+
+V14_DKT_PARCEL_LABELS: tuple[str, ...] = (
+    tuple(f"ctx-{h}-{b}" for h in ("lh", "rh") for b in _DKT_CORTICAL_BASES)
+    + tuple(f"{p}-{b}" for p in ("Left", "Right") for b in _ASEG_SUBCORTICAL_BASES)
+)
+"""Vendored copy of the canonical K=74 DKT parcel vocabulary (62 cortical + 12
+subcortical). Pinned to ``anatomy.V14_DKT_PARCEL_LABELS`` by a local test."""
+
+
+def gm_ids_from_lut(
+    lut: dict[int, str], vocab: Sequence[str] = V14_DKT_PARCEL_LABELS
+) -> set[int]:
+    """FS LUT ids whose names are in the parcel vocabulary (the in-vocab GM set).
+
+    This is the ONLY place the raw atlas integers meet the parcel vocabulary:
+    every id not in this set (white matter, unknown, CSF, ventricle, choroid, the
+    3 DKT-dropped gyri) is treated as non-GM by ``nearest_gm_label`` and never
+    fills a parcel. Passing the vocab in keeps the rule vocab-agnostic + testable.
+    """
+    names = set(vocab)
+    return {i for i, n in lut.items() if n in names}
+
+
+def nearest_gm_label(
+    atlas_vol: np.ndarray,
+    center_ijk: Sequence[float],
+    gm_ids: set[int],
+    r_base_vox: float,
+    r_cap_vox: float,
+) -> tuple[int, float, int]:
+    """One depth contact → ``(gm_label_id, reach_vox, n_gm_base)`` by nearest-GM.
+
+    ``atlas_vol`` is a 3-D integer label volume; ``center_ijk`` is the contact in
+    this array's index order (caller resolves the LEPTOVOX→array convention).
+    ``gm_ids`` is the in-vocab gray set from :func:`gm_ids_from_lut`. For a 1 mm
+    conformed volume ``r_base_vox``/``r_cap_vox`` are radii in mm.
+
+    Rule: take the plurality in-vocab gray label within the smallest sphere that
+    (a) is at least ``r_base_vox`` and (b) contains ≥1 gray voxel, ignoring all
+    non-gray voxels in the vote. If the nearest gray voxel is beyond ``r_cap_vox``
+    (or the sphere is entirely out of bounds), the contact is deep white matter →
+    return the ``0`` (``unknown``) sentinel, which maps out of vocab downstream.
+
+    Returns:
+      * ``gm_label_id`` — plurality in-vocab gray id, or ``0`` if none within cap.
+      * ``reach_vox``   — distance (vox==mm) to the nearest in-vocab voxel; ``0``
+        when the center voxel itself is gray (BT ``ShiftDist`` analogue). ``inf``
+        if no gray within cap.
+      * ``n_gm_base``   — count of in-vocab voxels inside the base sphere (``0`` if
+        the contact only reached gray by growing past ``r_base_vox``).
+    """
+    if r_base_vox < 0 or r_cap_vox < r_base_vox:
+        raise ValueError(
+            f"require 0 <= r_base_vox ({r_base_vox}) <= r_cap_vox ({r_cap_vox})"
+        )
+    vol = atlas_vol
+    if vol.ndim != 3:
+        raise ValueError(f"atlas_vol must be 3-D, got shape {vol.shape}")
+    center = np.asarray(center_ijk, dtype=float)
+    if center.shape != (3,):
+        raise ValueError(f"center_ijk must be length-3, got {center.shape}")
+
+    ctr = np.rint(center).astype(np.int64)
+    offs = sphere_offsets(r_cap_vox)
+    dists = np.sqrt((offs.astype(float) ** 2).sum(axis=1))
+    coords = ctr[None, :] + offs
+    in_bounds = np.all((coords >= 0) & (coords < np.array(vol.shape)), axis=1)
+    coords = coords[in_bounds]
+    dists = dists[in_bounds]
+    if coords.shape[0] == 0:
+        return 0, float("inf"), 0
+
+    labels = vol[coords[:, 0], coords[:, 1], coords[:, 2]]
+    gm = (
+        np.isin(labels, np.fromiter(gm_ids, dtype=np.int64))
+        if gm_ids
+        else np.zeros(labels.shape[0], dtype=bool)
+    )
+    if not gm.any():
+        return 0, float("inf"), 0
+
+    nearest = float(dists[gm].min())
+    r_star = max(float(r_base_vox), nearest)
+    vote = gm & (dists <= r_star + 1e-9)
+    vlabels = labels[vote]
+    vdists = dists[vote]
+    # Plurality among in-vocab gray voxels; ties broken toward the nearer parcel,
+    # then the smaller id, for determinism.
+    best_id: int | None = None
+    best_key: tuple[int, float, int] | None = None
+    for u in np.unique(vlabels):
+        m = vlabels == u
+        key = (-int(m.sum()), float(vdists[m].min()), int(u))
+        if best_key is None or key < best_key:
+            best_key, best_id = key, int(u)
+    assert best_id is not None
+    n_gm_base = int((gm & (dists <= float(r_base_vox) + 1e-9)).sum())
+    return best_id, nearest, n_gm_base

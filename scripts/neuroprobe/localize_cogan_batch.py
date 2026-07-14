@@ -148,6 +148,7 @@ def localize_subject(
     perm: tuple[int, ...],
     flips: tuple[bool, ...],
     radius_mm: float,
+    cap_mm: float,
     label_choice: str,
     out_path: str,
     depth_only: bool = True,
@@ -174,10 +175,14 @@ def localize_subject(
         os.path.join(_mri_dir(recon_root, subj), "aparc.DKTatlas+aseg.mgz")
     )
     ijk = cl.apply_axis_convention(coords, perm, flips, vol.shape)
+    gm_ids = cl.gm_ids_from_lut(lut)
 
     origin_names: list[str] = []
     majority_names: list[str] = []
     majority_props: list[float] = []
+    nearest_gm_names: list[str] = []
+    gm_reach_mm: list[float] = []
+    n_gm_base: list[int] = []
     for k in range(ijk.shape[0]):
         origin_id, props = cl.sphere_label_proportions(vol, ijk[k], radius_mm)
         origin_name, named = cl.label_ids_to_names(origin_id, props, lut)
@@ -188,10 +193,17 @@ def localize_subject(
         else:
             majority_names.append("unknown")
             majority_props.append(0.0)
+        # Physically-correct volumetric nearest-GM label (the DKT column default).
+        gm_id, reach, nbase = cl.nearest_gm_label(vol, ijk[k], gm_ids, radius_mm, cap_mm)
+        nearest_gm_names.append(lut.get(gm_id, "unknown") if gm_id else "unknown")
+        gm_reach_mm.append(reach)
+        n_gm_base.append(nbase)
 
     cl.write_depth_wm_csv(
         out_path, names, coords, origin_names, majority_names, majority_props,
         label_choice=label_choice, radius_mm=radius_mm,
+        nearest_gm_names=nearest_gm_names, gm_reach_mm=gm_reach_mm,
+        n_gm_base=n_gm_base, cap_mm=cap_mm,
     )
     return len(names)
 
@@ -202,7 +214,19 @@ def main() -> None:
     ap.add_argument("--lut", required=True, help="FreeSurferColorLUT.txt")
     ap.add_argument("--subjects", nargs="+", required=True, help="e.g. D23 D24 D19 …")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--radius-mm", type=float, default=3.0)
+    ap.add_argument(
+        "--radius-mm", type=float, default=3.0,
+        help="recording-sphere radius (mm=vox on the 1mm conformed volume). 3.0 = "
+        "the lab's own ECoG_Recon neighborhood (shipped DK CSV is radius_3mm), so "
+        "the nearest-GM vote runs over the same sphere the lab sampled.",
+    )
+    ap.add_argument(
+        "--cap-mm", type=float, default=10.0,
+        help="max reach for nearest-GM growth (mm). Beyond it a contact is deep "
+        "white matter with no cortex in reach → dropped to 'unknown'. 10.0 clears "
+        "BT's empirical max ShiftDist (7.5mm) with margin; Cogan reaches GM by 10mm "
+        "for ~100%% of contacts, so >cap is genuine deep-WM (~0.1%%).",
+    )
     ap.add_argument(
         "--pin-threshold", type=float, default=0.90,
         help="min origin-match on each depth pin subject to trust the convention. "
@@ -216,11 +240,14 @@ def main() -> None:
         "auditing surface reproduction only — the v3 feed drops surface contacts.",
     )
     ap.add_argument(
-        "--label-choice", choices=("origin", "majority"), default="majority",
-        help="which candidate fills the DKT column. Default 'majority' (3mm-sphere "
-        "plurality): matches BT's gray-matter-favoring near-zero-WM convention and "
-        "the iEEG-parcellation literature (Behncke 2019 / Stolk 2018 / Anderson "
-        "2021); 'origin' (center voxel) drops WM-adjacent depth contacts to sentinel.",
+        "--label-choice", choices=("nearest_gm", "majority", "origin"),
+        default="nearest_gm",
+        help="which candidate fills the DKT column. Default 'nearest_gm': the "
+        "physically-correct volumetric rule — plurality of IN-VOCAB gray voxels in "
+        "the recording sphere, grown to the nearest gray up to --cap-mm, WM/unknown "
+        "ignored (so no contact is labeled white matter, matching BT's 0%%-WM DKT). "
+        "'majority' (top sphere proportion incl. WM) and 'origin' (center voxel) are "
+        "the naive labelings kept in audit columns for the blind-vs-rule counterfactual.",
     )
     args = ap.parse_args()
 
@@ -236,7 +263,8 @@ def main() -> None:
         try:
             n = localize_subject(
                 args.recon_root, subj, lut, perm, flips, args.radius_mm,
-                args.label_choice, out, depth_only=not args.keep_surface,
+                args.cap_mm, args.label_choice, out,
+                depth_only=not args.keep_surface,
             )
             tag = "ok" if n else "EMPTY(surface-only)"
             print(f"[{tag}] {subj}: {n} depth electrodes → {out}")
