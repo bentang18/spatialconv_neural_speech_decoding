@@ -71,18 +71,26 @@ class V3MaskConfig:
     space_frac: float = 0.60  # D = round(space_frac·N) contacts masked (whole + intra)
     time_frac: float = 0.5  # T_mask = round(time_frac·T) frames masked per shaft
     whole_shaft_frac: float = 0.10  # E[K]; K ~ Binomial(S, frac) clamped to K_max
-    block_w_space: int = 4  # depth-block width (contacts); floor 4 = HGA along-shaft autocorr
+    # ⚠️ NOT JUSTIFIED BY ANY MEASUREMENT. The comment this replaces claimed "floor 4 = HGA
+    # along-shaft autocorr", which is FALSE: M2 measured HGA depth-lag ACF at 0.34 / 0.21 /
+    # 0.18 for lags 1/2/3 — gone by lag 2, not 4. M14 then measured the lever directly and it
+    # is WEAK: own-shaft copy-ability of a masked contact is 0.237 / 0.192 / 0.134 at
+    # w_s = 1 / 4 / 8 (HGA, 13 montages). So 4 is neither right nor wrong; it is INERTIA.
+    # It is also the wrong QUESTION: a temporal leak is a TRANSFORM ARTIFACT (the visible
+    # STFT window literally contains the masked samples — copying it teaches nothing, and it
+    # must be defeated), whereas a spatial correlation is PHYSICS (a neighbouring contact
+    # genuinely sees a correlated population — predicting it IS the cross-sensor task). Do
+    # not "widen w_s to kill the leak"; there is no spatial leak to kill.
+    block_w_space: int = 4  # depth-block width (contacts). See above: inertia, not evidence.
     # B6 (Ben, 2026-07-15): 7 -> 4. The old comment claimed "floor 7 = HGA |STFT| support",
-    # which is simply wrong: HGA is nperseg=128 @ hop 64, so its support is 2 slots (62.5 ms),
-    # not 7 (219 ms). Two independent numbers set the real scale — our measured HGA envelope
-    # ACF half-life (18 ms) and Greg's (20 ms) — so 7 was ~11x the correlation length of the
-    # thing it masks. Cells buried >2 slots deep are unpredictable in principle (ACF at lag 4
-    # ~ 0.01), and the optimal answer to an unpredictable target is the conditional mean —
-    # i.e. the smear. 4 is the width whose deepest cell sits at margin 2, exactly HGA's
-    # support radius: nothing is buried past HGA's own predictability horizon. Measured
-    # realized geometry (probe_v3_mask_geometry, 13 montages): floor 4 -> run 4.10, 59.1% of
-    # masked cells fully hidden; floor 7 -> run 5.16 (the guardian shreds it), 66-69% hidden.
-    block_w_time: int = 4  # time-block width (frames); 4 slots = 125 ms @ 32 Hz
+    # which is wrong: at the SHARED hop=64 grid HGA (nperseg 128) has support 2 slots, not 7.
+    # M14 (2026-07-15) then found the real mechanism: the leak is STFT WINDOW OVERLAP, and the
+    # overlap factor is nperseg/hop = 16 (SLOW) / 4 (MID) / 2 (HGA) on the shared 32 Hz grid.
+    # Under the PER-BAND token rates (HGA 32 Hz, MID 16 Hz, SLOW 4 Hz) every band's token hop
+    # is nperseg/2, so the overlap factor is EXACTLY 2 for all three, and a width-4 block puts
+    # its deepest cells at margin 2 = zero sample overlap. That is why 4 is right, in every
+    # band's OWN grid. Realized geometry (M14, guardian OFF): w=4 -> run 5.57.
+    block_w_time: int = 4  # time-block width, in each band's OWN grid; deepest cell at margin 2
 
 
 @dataclass(frozen=True)
