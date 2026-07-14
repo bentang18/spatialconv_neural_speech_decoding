@@ -4782,13 +4782,22 @@ def build_cogan_cache_experiment(
     if cache_session_index is None:
         raise SystemExit("--study cogan cache bake requires --cache-session-index")
 
+    # The base study.Study requires ``path`` — a DATA DIRECTORY it mkdir's (the real
+    # voltage comes from the manifest's edf_path, so this is just an anchor). It is
+    # dropped from the class uid (_cls_kwargs), so it never perturbs a cache key; we
+    # only need a writable /work dir. Make it per-(session) unique so the 2814 array
+    # tasks never race on the same mkdir. Sits beside the spec cache on /work.
+    study_root = Path(spec_cache_dir).parent / "cogan_study_root" / f"idx{cache_session_index}"
+    study_root.mkdir(parents=True, exist_ok=True)
+    study_path = str(study_root)
+
     # Session enumeration from the Cogan MANIFEST (not _SESSIONS_BY_MODE): the array
     # task index picks (subject_id, trial_id). iter_timelines() yields rows in
     # manifest order, so index i is deterministic and matches the guard-1/guard-2
     # arrays (all three drive off the same manifest row order).
     sessions = [
         (int(tl["subject_id"]), int(tl["trial_id"]))
-        for tl in DCohortStudy(manifest_path=cogan_manifest).iter_timelines()
+        for tl in DCohortStudy(path=study_path, manifest_path=cogan_manifest).iter_timelines()
     ]
     if not 0 <= cache_session_index < len(sessions):
         raise SystemExit(
@@ -4802,6 +4811,7 @@ def build_cogan_cache_experiment(
     )
 
     study_obj = DCohortStudy(
+        path=study_path,
         manifest_path=cogan_manifest,
         session_subset=((s_id, t_id),),
         infra_timelines={"cluster": None},

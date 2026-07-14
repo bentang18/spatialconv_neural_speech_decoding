@@ -206,8 +206,12 @@ def parse_args() -> argparse.Namespace:
                         "for the overnight chain. Applied to every band array.")
     p.add_argument("--log-dir", type=Path, default=None)
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
-    p.add_argument("--python", default="/work/ht203/probe_bench/.venv/bin/python",
-                   help="Interpreter (absolute -- the repo/speech clone has no .venv).")
+    p.add_argument("--python", default=".venv/bin/python",
+                   help="Interpreter for the bake. MUST have the full training stack "
+                        "(neuraltrain + neuralset) -- dispatch_v14 imports neuraltrain, "
+                        "which the probe_bench venv LACKS. Default .venv/bin/python is the "
+                        "clone's own venv (sbatch cd's to --repo-root first), matching the "
+                        "BT v3 bake.")
     p.add_argument("--pythonpath", default=None)
     p.add_argument("--notch-hz", type=float, default=60.0,
                    help="Mains notch (Duke = 60 Hz, same as BT). Passed as --cogan-notch-hz.")

@@ -133,8 +133,10 @@ def parse_args() -> argparse.Namespace:
                    help="Where the .sbatch + slurm logs land "
                         "(default reports/guard2_badwin_cogan_<date>).")
     p.add_argument("--repo-root", type=Path, default=Path("/work/ht203/repo/speech"))
-    p.add_argument("--python", default="/work/ht203/probe_bench/.venv/bin/python",
-                   help="Interpreter (absolute — the repo/speech clone has no .venv).")
+    p.add_argument("--python", default="/work/ht203/repo/speech/.venv/bin/python",
+                   help="Interpreter. Imports cache_index, which pulls in "
+                        "speech_decoding.models.__init__ -> neuraltrain (the probe_bench "
+                        "venv LACKS it). The clone's own .venv has the full stack.")
     p.add_argument("--dependency", default=None,
                    help="SLURM --dependency string (e.g. afterok:<band1>:<band2>:<band3>) "
                         "for the overnight chain — run guard-2 only after the cache bake.")
