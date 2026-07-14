@@ -298,6 +298,39 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
         # the same session-grouped ragged batching, and it composes with torch.compile
         # (fewer DDP reducer re-analyses). Only active on multi-GPU (single-GPU launch
         # never builds a DDPStrategy).
+        if (
+            getattr(args, "context_lambda", 0.0) > 0.0
+            and args.ddp_static_graph
+            and not getattr(args, "ack_r3_static_graph", False)
+        ):
+            raise SystemExit(
+                "REFUSING TO LAUNCH: --context-lambda > 0 with multi-GPU DDP static_graph.\n"
+                "\n"
+                "This exact combination killed r3 (DeltaAI 2653154, 2026-07-14): all 4 ranks\n"
+                "died at the FIRST backward with\n"
+                "    expect_autograd_hooks_ INTERNAL ASSERT FAILED (c10d/reducer.cpp:1703)\n"
+                "after ~5 min of compile warmup — 0 usable steps, GPU hours burned.\n"
+                "\n"
+                "ROOT CAUSE IS NOT ESTABLISHED. Two plausible stories were tested and REFUTED:\n"
+                "  - 'context head is unused during the lambda warmup'  -> refuted: _static_off\n"
+                "    is a TYPE test, so the 0-d tensor lambda keeps the head graph-connected;\n"
+                "    it gets zero-valued grads, not no grads.\n"
+                "  - 'the head joining DDP's buckets is the trigger'    -> refuted: a CPU/gloo\n"
+                "    repro asserts identically with the head frozen (r2) and live (r3).\n"
+                "What IS established (CPU/gloo, zero GPU): static_graph=False survives every\n"
+                "configuration tested.\n"
+                "\n"
+                "DO NOT 'fix' this with find_unused_parameters=True — the head is not unused.\n"
+                "DO NOT freeze/unfreeze the head at warmup_start — that mutates graph structure\n"
+                "mid-run, which static_graph forbids; it trades a step-0 crash for a step-15k one.\n"
+                "\n"
+                "Relaunch with --no-ddp-static-graph (DDP bookkeeping only: it does not touch\n"
+                "gradients, the loss, or any locked hyperparameter, so it is NOT a contract\n"
+                "change). Costs some throughput.\n"
+                "\n"
+                "To override deliberately, pass --ack-r3-static-graph.\n"
+                "See memory: project-v3-r3-ddp-static-graph-crash-2026-07-14"
+            )
         kwargs["strategy"] = DDPStrategy(
             find_unused_parameters=False, static_graph=args.ddp_static_graph
         )
@@ -368,6 +401,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ddp-static-graph", dest="ddp_static_graph",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="DDP static_graph (multi-GPU only; v2 --ddp-static-graph)")
+    p.add_argument("--ack-r3-static-graph", dest="ack_r3_static_graph",
+                   action="store_true",
+                   help="override the r3 crash gate and launch --context-lambda>0 with "
+                        "multi-GPU static_graph anyway (this killed r3 at the first backward)")
     p.add_argument("--same-session-ranks", dest="same_session_ranks",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="All DDP ranks step the SAME session each step (v2 "
