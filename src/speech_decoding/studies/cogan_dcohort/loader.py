@@ -75,9 +75,16 @@ def parse_contact(name: str) -> tuple[str, int] | None:
 
 
 def read_channel_types(channels_tsv_path: str) -> dict[str, str]:
-    """BIDS ``channels.tsv`` → ``{channel_name: TYPE}`` (upper-cased type)."""
+    """BIDS ``channels.tsv`` → ``{channel_name: TYPE}`` (upper-cased type).
+
+    ``utf-8-sig`` strips a leading UTF-8 BOM if present (13 Cogan subjects — e.g.
+    sub-D0057 — carry a ``EF BB BF`` BOM + CRLF from a Windows export, which under a
+    plain-utf-8 DictReader mangles the first header into ``\\ufeffname`` and KeyErrors
+    on ``row['name']``); it behaves as utf-8 for the BOM-free majority. csv handles
+    the CRLF itself under ``newline=''``.
+    """
     types: dict[str, str] = {}
-    with open(channels_tsv_path, newline="") as fh:
+    with open(channels_tsv_path, newline="", encoding="utf-8-sig") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
             types[row["name"]] = (row.get("type") or "").strip().upper()
     return types

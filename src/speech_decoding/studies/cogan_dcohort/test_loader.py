@@ -8,9 +8,29 @@ import pytest
 from speech_decoding.studies.cogan_dcohort.loader import (
     TARGET_RATE_HZ,
     parse_contact,
+    read_channel_types,
     resample_to,
     select_neural,
 )
+
+
+def test_read_channel_types_strips_bom_and_crlf(tmp_path):
+    """13 Cogan subjects (e.g. sub-D0057) ship channels.tsv with a UTF-8 BOM + CRLF
+    from a Windows export; utf-8-sig must strip the BOM so row['name'] resolves."""
+    p = tmp_path / "sub-D0057_channels.tsv"
+    p.write_bytes(
+        b"\xef\xbb\xbfname\ttype\tunits\r\n"
+        b"RAI1\tSEEG\tuV\r\n"
+        b"RAI2\tECOG\tuV\r\n"
+    )
+    types = read_channel_types(str(p))
+    assert types == {"RAI1": "SEEG", "RAI2": "ECOG"}
+
+
+def test_read_channel_types_plain_utf8_no_bom(tmp_path):
+    p = tmp_path / "plain_channels.tsv"
+    p.write_text("name\ttype\tunits\nLA1\tSEEG\tuV\n")
+    assert read_channel_types(str(p)) == {"LA1": "SEEG"}
 
 
 def _synth(n_ch: int, n_samp: int) -> np.ndarray:
