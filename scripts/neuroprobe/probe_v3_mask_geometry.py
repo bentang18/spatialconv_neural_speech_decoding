@@ -41,6 +41,7 @@ Real 13-session geometry (Delta CPU; reads only cache ch_names + stats, not the 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 from collections import Counter
@@ -50,7 +51,11 @@ import numpy as np
 import torch
 
 from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
-from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig, sample_masks
+from speech_decoding.models.v14_converged_v3.masking import (
+    V3MaskConfig,
+    _cover_rank,
+    sample_masks,
+)
 from speech_decoding.models.v14_converged_v3.sidecar import SensorSidecar
 
 # SLOW nperseg=1024 -> +-8 slots; MID 256 -> +-2; HGA 128 -> +-1. (view.py:236-241, hop 64.)
@@ -207,9 +212,17 @@ def main() -> None:
     p.add_argument("--n-rows", type=int, default=256)
     p.add_argument("--clip-frames", type=int, default=96)  # --clip-len 3.0 @ 32 Hz
     p.add_argument("--seed", type=int, default=33)
+    # B6 sweep: the shipped floor 7 is justified in masking.py's docstring as "the HGA
+    # |STFT| support", but HGA is nperseg=128 @ hop 64 => its support is 2 slots, not 7.
+    # The realized geometry at a candidate width is what decides it, so make it sweepable
+    # instead of re-deriving from the same wrong premise.
+    p.add_argument("--block-w-time", type=int, default=None,
+                   help="override V3MaskConfig.block_w_time (B6 sweep). None = shipped.")
     args = p.parse_args()
 
     cfg = V3MaskConfig()  # r2's config, unchanged — this measures what we ALREADY run
+    if args.block_w_time is not None:
+        cfg = dataclasses.replace(cfg, block_w_time=args.block_w_time)
     print(f"cfg: space_frac={cfg.space_frac} time_frac={cfg.time_frac} "
           f"whole_shaft_frac={cfg.whole_shaft_frac} "
           f"block_w_space={cfg.block_w_space} block_w_time={cfg.block_w_time}\n")
@@ -220,19 +233,15 @@ def main() -> None:
         results.append({"session": "synthetic", **simulate(
             geom, n, args.clip_frames, args.n_rows, cfg, args.seed)})
     else:
+        from speech_decoding.experiments.dispatch_v3 import make_bt_parcel_fn
         from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
-        from speech_decoding.studies.braintreebank.anatomy import aligned_voltage_support
         from scripts.neuroprobe.probe_v3_field_stats import BAND_DIRS, V3_SESSIONS, WINSOR
-
-        def parcel_fn(subject_id, trial_id, labels):
-            sup = aligned_voltage_support(args.bt_root, subject_id, trial_id)
-            return torch.as_tensor(np.asarray(sup).argmax(1))
 
         specs = load_v3_sessions(
             sessions=V3_SESSIONS,
             band_cache_dirs=[os.path.join(args.band_root, b) for b in BAND_DIRS],
             span_dir=args.span_dir,
-            parcel_fn=parcel_fn,
+            parcel_fn=make_bt_parcel_fn(args.bt_root),
             lof_report_path=None,
             winsor=WINSOR,
         )

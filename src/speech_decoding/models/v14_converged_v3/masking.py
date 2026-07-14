@@ -19,8 +19,10 @@ Masking-axis inversion (Ben 2026-07-12): the old scheme masked whole CONTACTS
       outcome — the ≥1-visible rule only existed to protect a PINNED whole count.
 
   TIME (which frames, per surviving shaft) — the temporal-prediction task:
-    • Contiguous width-``w_t`` time-blocks (floor 7 = HGA |STFT| support: a masked
-      frame is fully hidden only ≥ support frames from any visible frame), random
+    • Contiguous width-``w_t`` time-blocks (floor 4 = 125 ms @ 32 Hz; a masked frame is
+      fully hidden only ≥ support frames from any visible frame, and HGA's support is
+      2 slots — nperseg 128 @ hop 64. The old floor of 7 cited "HGA |STFT| support" but
+      that is 2, not 7; see V3MaskConfig.block_w_time), random
       starts, overlaps allowed. Snap PER SHAFT to EXACTLY ``T_mask = round(time_frac·T)``
       masked frames (constant ``T_kept`` ⇒ the buffer stays static). Independent per
       (row, shaft) ⇒ HETEROGENEOUS inter-sensor timing (at any t some sensors visible,
@@ -70,7 +72,17 @@ class V3MaskConfig:
     time_frac: float = 0.5  # T_mask = round(time_frac·T) frames masked per shaft
     whole_shaft_frac: float = 0.10  # E[K]; K ~ Binomial(S, frac) clamped to K_max
     block_w_space: int = 4  # depth-block width (contacts); floor 4 = HGA along-shaft autocorr
-    block_w_time: int = 7  # time-block width (frames); floor 7 = HGA |STFT| support
+    # B6 (Ben, 2026-07-15): 7 -> 4. The old comment claimed "floor 7 = HGA |STFT| support",
+    # which is simply wrong: HGA is nperseg=128 @ hop 64, so its support is 2 slots (62.5 ms),
+    # not 7 (219 ms). Two independent numbers set the real scale — our measured HGA envelope
+    # ACF half-life (18 ms) and Greg's (20 ms) — so 7 was ~11x the correlation length of the
+    # thing it masks. Cells buried >2 slots deep are unpredictable in principle (ACF at lag 4
+    # ~ 0.01), and the optimal answer to an unpredictable target is the conditional mean —
+    # i.e. the smear. 4 is the width whose deepest cell sits at margin 2, exactly HGA's
+    # support radius: nothing is buried past HGA's own predictability horizon. Measured
+    # realized geometry (probe_v3_mask_geometry, 13 montages): floor 4 -> run 4.10, 59.1% of
+    # masked cells fully hidden; floor 7 -> run 5.16 (the guardian shreds it), 66-69% hidden.
+    block_w_time: int = 4  # time-block width (frames); 4 slots = 125 ms @ 32 Hz
 
 
 @dataclass(frozen=True)
