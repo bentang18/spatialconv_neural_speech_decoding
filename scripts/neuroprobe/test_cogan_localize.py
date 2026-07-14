@@ -155,6 +155,62 @@ def test_read_recon_electrodes_length_mismatch_raises(tmp_path):
         cl.read_recon_electrodes(str(en), str(lv))
 
 
+# ----------------------- PostimpLoc recovery (D59-style) -------------------
+
+_POSTIMPLOC = """LAT 14 182.000000 122.000000 112.000000 L D
+LAT 13 178.250000 122.000000 113.000000 L D
+LPT 16 50.000000 60.000000 70.000000 L D
+LPT 15 51.000000 61.000000 71.000000 L D
+"""
+
+
+def test_read_postimploc_names_concatenates_shaft_and_num(tmp_path):
+    p = tmp_path / "D59PostimpLoc.txt"
+    p.write_text(_POSTIMPLOC)
+    assert cl.read_postimploc_names(str(p)) == ["LAT14", "LAT13", "LPT16", "LPT15"]
+
+
+def test_recon_postimploc_recovers_by_name_and_drops_extras(tmp_path):
+    # electrodeNames lists only the 2 recorded contacts (LAT14, LAT13); LEPTOVOX
+    # + PostimpLoc carry 4 localized coords (LPT16/15 dropped from the EDF).
+    en = tmp_path / "D59.electrodeNames"
+    en.write_text("hdr1\nhdr2\nLAT14 D L\nLAT13 D L\n")
+    lv = tmp_path / "D59.LEPTOVOX"
+    lv.write_text(
+        "hdr1\nhdr2\n"
+        "182.0 122.0 112.0\n178.25 122.0 113.0\n50.0 60.0 70.0\n51.0 61.0 71.0\n"
+    )
+    pl = tmp_path / "D59PostimpLoc.txt"
+    pl.write_text(_POSTIMPLOC)
+    names, coords = cl.read_recon_electrodes_postimploc(str(en), str(lv), str(pl))
+    assert [n[0] for n in names] == ["LAT14", "LAT13"]  # extras dropped
+    # coord for LAT14 comes from LEPTOVOX row 0 (PostimpLoc name index 0)
+    np.testing.assert_allclose(coords[0], [182.0, 122.0, 112.0])
+    np.testing.assert_allclose(coords[1], [178.25, 122.0, 113.0])
+
+
+def test_recon_postimploc_missing_electrode_raises(tmp_path):
+    en = tmp_path / "D59.electrodeNames"
+    en.write_text("h1\nh2\nGHOST9 D L\n")  # name not present in PostimpLoc
+    lv = tmp_path / "D59.LEPTOVOX"
+    lv.write_text("h1\nh2\n1 2 3\n")
+    pl = tmp_path / "D59PostimpLoc.txt"
+    pl.write_text("LAT 14 1 2 3 L D\n")
+    with pytest.raises(ValueError, match="absent from PostimpLoc"):
+        cl.read_recon_electrodes_postimploc(str(en), str(lv), str(pl))
+
+
+def test_recon_postimploc_leptovox_length_mismatch_raises(tmp_path):
+    en = tmp_path / "D59.electrodeNames"
+    en.write_text("h1\nh2\nLAT14 D L\n")
+    lv = tmp_path / "D59.LEPTOVOX"
+    lv.write_text("h1\nh2\n1 2 3\n4 5 6\n")  # 2 coords
+    pl = tmp_path / "D59PostimpLoc.txt"
+    pl.write_text("LAT 14 1 2 3 L D\n")  # 1 name → not row-aligned to LEPTOVOX
+    with pytest.raises(ValueError, match="not row-aligned"):
+        cl.read_recon_electrodes_postimploc(str(en), str(lv), str(pl))
+
+
 # ------------------------------ FS color LUT -------------------------------
 
 _LUT = """#No. Label Name:  R G B A

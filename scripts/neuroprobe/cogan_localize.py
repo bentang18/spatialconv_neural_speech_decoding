@@ -107,6 +107,70 @@ def read_recon_electrodes(
     return names, coords
 
 
+def read_postimploc_names(path: str) -> list[str]:
+    """``D<id>PostimpLoc.txt`` → ``[electrode_name, …]`` in file order.
+
+    Each row is ``<shaft> <num> <R> <A> <S> <hem> <kind>``; the electrode name is
+    ``shaft+num`` (e.g. ``LAT 14`` → ``LAT14``). PostimpLoc is ROW-ALIGNED to
+    ``LEPTOVOX`` (same order, identical coordinates) and names EVERY localized
+    contact — including ones later dropped from the clinical ``electrodeNames``
+    channel list. Used only to recover a subject whose two primary recon files
+    disagree in length (see ``read_recon_electrodes_postimploc``).
+    """
+    names: list[str] = []
+    for ln in open(path).read().splitlines():
+        if not ln.strip():
+            continue
+        parts = ln.split()
+        if len(parts) < 5:
+            raise ValueError(f"{path}: PostimpLoc row not <shaft num R A S ...>: {ln!r}")
+        names.append(f"{parts[0]}{parts[1]}")
+    return names
+
+
+def read_recon_electrodes_postimploc(
+    electrode_names_path: str, leptovox_path: str, postimploc_path: str
+) -> tuple[list[tuple[str, str, str]], np.ndarray]:
+    """Recover a subject whose ``electrodeNames``/``LEPTOVOX`` counts disagree.
+
+    Some subjects (e.g. D59: 182 clinical names vs 184 localized coords) drop a
+    couple of localized contacts from the EDF channel list, leaving ``LEPTOVOX``
+    longer than ``electrodeNames`` so a naive row-align misassigns every coord.
+    ``PostimpLoc`` is row-aligned to ``LEPTOVOX`` and names all coords, so we map
+    each ``electrodeNames`` contact to its ``LEPTOVOX`` coord BY NAME and drop the
+    localized-but-unrecorded extras. ``LEPTOVOX`` stays the coordinate authority
+    (matching the row-aligned path used for every other subject); PostimpLoc only
+    supplies the name→row index. Returns ``(electrode_rows, coords)`` like
+    ``read_recon_electrodes``.
+    """
+    names = read_electrode_names(electrode_names_path)
+    coords = read_leptovox(leptovox_path)
+    pl_names = read_postimploc_names(postimploc_path)
+    if len(pl_names) != coords.shape[0]:
+        raise ValueError(
+            f"PostimpLoc rows ({len(pl_names)}) != LEPTOVOX coords "
+            f"({coords.shape[0]}) — not row-aligned, recovery unsafe."
+        )
+    index = {n: i for i, n in enumerate(pl_names)}
+    if len(index) != len(pl_names):
+        raise ValueError(f"{postimploc_path}: PostimpLoc names are not unique.")
+    out_rows: list[tuple[str, str, str]] = []
+    out_coords: list[np.ndarray] = []
+    missing: list[str] = []
+    for name, kind, hem in names:
+        i = index.get(name)
+        if i is None:
+            missing.append(name)
+            continue
+        out_rows.append((name, kind, hem))
+        out_coords.append(coords[i])
+    if missing:
+        raise ValueError(
+            f"electrodeNames contacts absent from PostimpLoc: {missing[:10]}"
+        )
+    return out_rows, np.array(out_coords, dtype=float).reshape(-1, 3)
+
+
 def read_fs_color_lut(path: str) -> dict[int, str]:
     """``FreeSurferColorLUT.txt`` → ``{label_id: label_name}``.
 

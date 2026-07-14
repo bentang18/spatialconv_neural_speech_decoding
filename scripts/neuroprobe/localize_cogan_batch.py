@@ -163,10 +163,19 @@ def localize_subject(
     out of the feed naturally; a mixed subject (e.g. D67) keeps only its depths.
     """
     rd = _recon_dir(recon_root, subj)
-    names, coords = cl.read_recon_electrodes(
-        os.path.join(rd, f"{subj}.electrodeNames"),
-        os.path.join(rd, f"{subj}.LEPTOVOX"),
-    )
+    en_path = os.path.join(rd, f"{subj}.electrodeNames")
+    lv_path = os.path.join(rd, f"{subj}.LEPTOVOX")
+    try:
+        names, coords = cl.read_recon_electrodes(en_path, lv_path)
+    except ValueError:
+        # electrodeNames/LEPTOVOX row-counts disagree (e.g. D59: 182 vs 184).
+        # Recover by name via PostimpLoc, which is row-aligned to LEPTOVOX and
+        # names every localized contact; if it's absent, re-raise the mismatch.
+        pl_path = os.path.join(rd, f"{subj}PostimpLoc.txt")
+        if not os.path.isfile(pl_path):
+            raise
+        names, coords = cl.read_recon_electrodes_postimploc(en_path, lv_path, pl_path)
+        print(f"[recover] {subj}: name-aligned {len(names)} contacts via PostimpLoc")
     if depth_only:
         keep = [k for k, n in enumerate(names) if n[1] == "D"]
         names = [names[k] for k in keep]
