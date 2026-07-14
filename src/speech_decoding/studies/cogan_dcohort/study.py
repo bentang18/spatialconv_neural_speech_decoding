@@ -19,9 +19,11 @@ contact-index filter → polyphase resample to 2048), returned as an
 ``mne.io.RawArray`` whose ``ch_names`` are clean ``<shaft><contact>`` so the
 extractor's name-based ``parse_shaft`` groups the CAR correctly.
 
-Guard-1 static-bad contacts (per run) are not yet scanned; when they are, fold the
-per-session bad list into the yielded timeline (as BT does with ``extra_bad``) so
-it enters the cache key and any edit auto-invalidates the stale raw cache.
+Guard-1 static-bad contacts (per run) fold into the yielded timeline via
+``cogan_extra_bad`` (as BT does with ``extra_bad``) so they enter the cache key
+(any edit auto-invalidates the stale raw cache) and ``_load_raw`` drops them
+pre-CAR. The drop map is absent until the guard-1 scan+collector runs, so until
+then the fold-in is a no-op (see ``guard1_static``).
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import mne
 import pandas as pd
 from neuralset.events import study
 
+from speech_decoding.studies.cogan_dcohort.guard1_static import cogan_extra_bad
 from speech_decoding.studies.cogan_dcohort.loader import (
     TARGET_RATE_HZ,
     cogan_load_raw,
@@ -156,12 +159,19 @@ class DCohortStudy(study.Study):
             if subset is not None and (sid, tid) not in subset:
                 continue
             seen.add((sid, tid))
-            # Guard-1 per-run static-bad list folds in here once #98 item-4 lands.
-            yield {
+            timeline: dict[str, tp.Any] = {
                 "subject": row["subject_bids"],
                 "subject_id": sid,
                 "trial_id": tid,
             }
+            # Fold the guard-1 STATIC drop into the timeline so the raw exca cache
+            # uid depends on it (edit → auto-invalidate) and _load_raw drops it
+            # pre-CAR. CONDITIONAL (absence ⟺ empty) so a clean run's cache stays
+            # valid — read back symmetrically by _load_raw's .get("extra_bad", ()).
+            extra_bad = sorted(cogan_extra_bad(sid, tid))
+            if extra_bad:
+                timeline["extra_bad"] = extra_bad
+            yield timeline
         if subset is not None:
             unknown = subset - seen
             if unknown:
