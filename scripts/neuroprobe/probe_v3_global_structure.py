@@ -107,7 +107,6 @@ from scripts.neuroprobe.probe_v3_field_stats import (
     FPS,
     V3_SESSIONS,
     WINSOR,
-    _shaft_car,
 )
 
 K_SWEEP = (1, 2, 4, 8, 16, 32)      # global-latent budget for M10a — this sweep SETS M
@@ -241,10 +240,24 @@ def _circshift_clipwise(X: np.ndarray, n_clips: int, T: int, rng) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# M10a — many-to-one cross-shaft predictability (contact level, post-shaft-CAR)
+# M10a — many-to-one cross-shaft predictability (contact level)
+#
+# LEAK/DEGENERACY NOTE — the first cut of this probe was WRONG and it is worth stating
+# why, because the same trap sank the M7 interpretation.
+#   * v1 ran on SHAFT-CAR'd features. Shaft-CAR subtracts the per-shaft mean, so the
+#     residuals of a shaft SUM TO ZERO: contact c is then an EXACT linear function of its
+#     own shaft-mates. The within-shaft baseline hit R2 = 1.000 and dR2 was identically 0.
+#     The probe measured nothing at all.
+#   * The fix is NOT "demean globally instead": the grand mean contains c, so a
+#     global-demeaned other-shaft block linearly encodes -(c + own_others), and combined
+#     with the baseline it reconstructs c EXACTLY. That is a direct target leak.
+# So: run on RAW features, and give the baseline the free global signal EXPLICITLY as the
+# mean of contacts NOT on c's shaft (leak-free by construction — c is nowhere in it).
+# dR2 then answers the actual question: does cross-shaft structure BEYOND the common mode
+# add anything, given the shaft's own context and the common mode?
 # ---------------------------------------------------------------------------
-def m10a(env_car, shaft_id, tr, va, te, T, targets, rng) -> dict:
-    hga = env_car[2]
+def m10a(env_raw, shaft_id, tr, va, te, T, targets, rng) -> dict:
+    hga = env_raw[2]
     out = {f"K{k}": [] for k in K_SWEEP}
     out_null = {f"K{k}": [] for k in K_SWEEP}
     base_r2, full_train_r2 = [], []
@@ -257,14 +270,25 @@ def m10a(env_car, shaft_id, tr, va, te, T, targets, rng) -> dict:
             continue
 
         ytr, yva, yte = (_target(hga, ix, c) for ix in (tr, va, te))
-        Btr, Bva, Bte = (_design(env_car, ix, own) for ix in (tr, va, te))
-        Otr, Ova, Ote = (_design(env_car, ix, oth) for ix in (tr, va, te))
+        Wtr, Wva, Wte = (_design(env_raw, ix, own) for ix in (tr, va, te))   # own shaft
+        Otr, Ova, Ote = (_design(env_raw, ix, oth) for ix in (tr, va, te))   # other shafts
+
+        # The FREE global signal: the common mode, computed from OTHER shafts only, so c
+        # cannot leak into it. This goes in the BASELINE — we are asking what a global
+        # summary adds ON TOP of the common mode, not whether the common mode exists.
+        cm_tr, cm_va, cm_te = (O.mean(1, keepdims=True) for O in (Otr, Ova, Ote))
+        Btr = np.column_stack([Wtr, cm_tr])
+        Bva = np.column_stack([Wva, cm_va])
+        Bte = np.column_stack([Wte, cm_te])
 
         r2_base, _ = _fit_eval(Btr, ytr, Bva, yva, Bte, yte)
         base_r2.append(r2_base)
 
-        mu, comp = _pca_fit(Otr, K_SWEEP[-1])            # PCA on TRAIN clips only
-        Ptr, Pva, Pte = ((O - mu) @ comp.T for O in (Otr, Ova, Ote))
+        # Residual cross-shaft structure: project the other-shaft common mode OUT, then
+        # take the top-K PCs of what remains. Fit on TRAIN clips only.
+        Rtr, Rva, Rte = (O - O.mean(1, keepdims=True) for O in (Otr, Ova, Ote))
+        mu, comp = _pca_fit(Rtr, K_SWEEP[-1])
+        Ptr, Pva, Pte = ((R - mu) @ comp.T for R in (Rtr, Rva, Rte))
 
         for k in K_SWEEP:
             r2_full, r2_tr = _fit_eval(
@@ -276,9 +300,8 @@ def m10a(env_car, shaft_id, tr, va, te, T, targets, rng) -> dict:
             if k == K_SWEEP[-1]:
                 full_train_r2.append(r2_tr)
 
-        # NULL: circular-shift ONLY the cross-shaft block. The within-shaft baseline and
-        # the target stay aligned, so this isolates "how much dR2 does adding K USELESS
-        # global predictors buy by chance/overfit" — which is exactly the question.
+        # NULL: circular-shift ONLY the cross-shaft PC block. Baseline and target stay
+        # aligned, so this isolates how much dR2 K USELESS predictors buy by chance.
         for _ in range(N_PERM):
             Ptr_n = _circshift_clipwise(Ptr, len(tr), T, rng)
             Pva_n = _circshift_clipwise(Pva, len(va), T, rng)
@@ -293,7 +316,8 @@ def m10a(env_car, shaft_id, tr, va, te, T, targets, rng) -> dict:
 
     return {
         "n_targets": len(base_r2),
-        "R2_within_shaft_baseline": round(float(np.mean(base_r2)), 5) if base_r2 else None,
+        "R2_baseline_ownshaft_plus_commonmode": (
+            round(float(np.mean(base_r2)), 5) if base_r2 else None),
         "R2_train_at_Kmax": round(float(np.mean(full_train_r2)), 5) if full_train_r2 else None,
         "dR2_by_K": {k: round(float(np.mean(v)), 5) for k, v in out.items() if v},
         "dR2_null_by_K": {k: round(float(np.mean(v)), 5) for k, v in out_null.items() if v},
@@ -305,23 +329,33 @@ def m10a(env_car, shaft_id, tr, va, te, T, targets, rng) -> dict:
 
 # ---------------------------------------------------------------------------
 # M10b — multiplicative gating: does the global state predict local HGA MAGNITUDE?
+#
+# LEAK NOTE: v1 built the global state from ALL contacts, INCLUDING the target c. The
+# "global state" therefore literally contained the thing it was predicting, which is why
+# its level-R2 came back 0.06-0.25 instead of the ~0 the physics predicts. Here g is built
+# from contacts NOT on c's shaft — c is nowhere in the predictors.
 # ---------------------------------------------------------------------------
-def m10b(env_raw, env_car, tr, va, te, T, targets, rng, k_global=8) -> dict:
-    hga_car = env_car[2]
-    Gtr, Gva, Gte = (_design(env_raw, ix) for ix in (tr, va, te))   # ALL contacts, raw
-    mu, comp = _pca_fit(Gtr, k_global)
-    gtr, gva, gte = ((G - mu) @ comp.T for G in (Gtr, Gva, Gte))    # the global state g_t
-
+def m10b(env_raw, shaft_id, tr, va, te, T, targets, rng, k_global=8) -> dict:
+    hga = env_raw[2]
     lin, gain, gain_null = [], [], []
-    for c in targets:
-        ytr, yva, yte = (_target(hga_car, ix, c) for ix in (tr, va, te))
 
-        # 1. LEVEL: does g predict r linearly?  (M7 says no — this confirms in-sample.)
+    for c in targets:
+        s = shaft_id[c]
+        oth = np.where(shaft_id != s)[0]
+        if len(oth) < k_global:
+            continue
+
+        ytr, yva, yte = (_target(hga, ix, c) for ix in (tr, va, te))
+        Otr, Ova, Ote = (_design(env_raw, ix, oth) for ix in (tr, va, te))
+        mu, comp = _pca_fit(Otr, k_global)                    # TRAIN-only PCA
+        gtr, gva, gte = ((O - mu) @ comp.T for O in (Otr, Ova, Ote))
+
+        # 1. LEVEL: does the global state predict local HGA linearly?
         r2_lin, _ = _fit_eval(gtr, ytr, gva, yva, gte, yte)
         lin.append(r2_lin)
 
-        # 2. Kill the linear part FIRST. Without this, any residual linear g->r would
-        #    leak into |r| and we would report gating that is really just level.
+        # 2. Kill the linear part FIRST. Without this, any linear g->y relationship would
+        #    induce a spurious g->|y| one and we would report gating that is really level.
         gs_tr, gs_va, gs_te = _standardize(gtr, gva, gte)
         A = np.column_stack([gs_tr, np.ones(len(gs_tr))])
         w = _ridge_fit(A, ytr, 1.0)
@@ -356,73 +390,103 @@ def m10b(env_raw, env_car, tr, va, te, T, targets, rng, k_global=8) -> dict:
 # ---------------------------------------------------------------------------
 # M10c / M10d — parcel summaries: is Ben's WRITE target reliable, and what rank is it?
 # ---------------------------------------------------------------------------
-def _global_demean(env: list[np.ndarray]) -> list[np.ndarray]:
-    """Remove the GRAND mean across ALL contacts at each t, per band. This is the GLOBAL
-    common mode. Deliberately NOT shaft-CAR: a parcel often ~ a shaft segment, so
-    shaft-CAR would zero its parcel mean BY CONSTRUCTION and fake a null."""
-    return [e - e.mean(axis=1, keepdims=True) for e in env]
-
-
 def m10cd(env_raw, parcel_id, tr, va, te, T, rng, n_splits=20) -> dict:
-    env_g = _global_demean(env_raw)
+    """M10c/M10d — is a PARCEL-STATE summary a well-posed WRITE target, and what rank is it?
+
+    LEAK NOTE on the v1 of this: it built parcel summaries from GLOBAL-DEMEANED features.
+    Demeaning by the grand mean makes the size-weighted parcel summaries sum to ~zero, so
+    "predict parcel j from the other parcels" is partly solved by that constraint alone —
+    the 0.66-0.90 R2 v1 reported was inflated by an identity, not earned. Here every
+    regression runs on RAW summaries and the COMMON MODE (the other-parcel mean, which
+    never contains parcel j) is given to the BASELINE. dR2 over that baseline is the real
+    question: does the MULTIDIMENSIONAL parcel state carry anything the common mode does
+    not? Only that increment justifies M > 1 latents.
+
+    Split-half reliability stays on raw features and is reported both with and without the
+    common mode projected out — it is the CEILING on any head predicting this target, and
+    it is what tells us whether the parcel mean is signal or averaged-down noise.
+    """
     parcels = [p for p in np.unique(parcel_id)
                if int((parcel_id == p).sum()) >= MIN_PARCEL_CONTACTS]
     if len(parcels) < 3:
         return {"n_parcels": len(parcels), "skipped": "fewer than 3 usable parcels"}
 
-    hga_g, hga_raw = env_g[2], env_raw[2]
+    hga = env_raw[2]
     all_clips = np.concatenate([tr, va, te])
 
-    # --- M10c(i) split-half reliability = the CEILING on any parcel-summary head -------
-    rel_g, rel_raw = [], []
+    # --- M10c(i) split-half reliability = the CEILING ---------------------------------
+    # For each parcel: split its contacts in half, correlate the two half-means over time.
+    # "cm-removed" projects out the mean of contacts OUTSIDE this parcel (leak-free), so
+    # it measures reliable parcel structure that is NOT just the common mode.
+    rel_raw, rel_cm = [], []
     for p in parcels:
         idx = np.where(parcel_id == p)[0]
-        rg, rr = [], []
+        out_idx = np.where(parcel_id != p)[0]
+        cm = hga[all_clips][:, out_idx].mean(1).reshape(-1)       # (n*T,) — excludes parcel p
+        rr, rc = [], []
         for _ in range(n_splits):
             perm = rng.permutation(idx)
             a, b = perm[: len(perm) // 2], perm[len(perm) // 2 :]
-            for src, acc in ((hga_g, rg), (hga_raw, rr)):
-                h1 = src[all_clips][:, a].mean(1).reshape(-1)
-                h2 = src[all_clips][:, b].mean(1).reshape(-1)
-                if h1.std() > 1e-8 and h2.std() > 1e-8:
-                    acc.append(float(np.corrcoef(h1, h2)[0, 1]))
-        for acc, out in ((rg, rel_g), (rr, rel_raw)):
+            h1 = hga[all_clips][:, a].mean(1).reshape(-1)
+            h2 = hga[all_clips][:, b].mean(1).reshape(-1)
+            if h1.std() < 1e-8 or h2.std() < 1e-8:
+                continue
+            rr.append(float(np.corrcoef(h1, h2)[0, 1]))
+            # regress the common mode out of BOTH halves, then correlate the residuals
+            A = np.column_stack([cm, np.ones(len(cm))])
+            q1 = h1 - A @ np.linalg.lstsq(A, h1, rcond=None)[0]
+            q2 = h2 - A @ np.linalg.lstsq(A, h2, rcond=None)[0]
+            if q1.std() > 1e-8 and q2.std() > 1e-8:
+                rc.append(float(np.corrcoef(q1, q2)[0, 1]))
+        for acc, out in ((rr, rel_raw), (rc, rel_cm)):
             if acc:
                 r = float(np.mean(acc))
-                out.append(2 * r / (1 + r) if r > -1 else 0.0)   # Spearman-Brown -> full
+                out.append(2 * r / (1 + r) if r > -1 else 0.0)    # Spearman-Brown -> full
 
-    # --- M10c(ii) inter-parcel predictability, vs that ceiling ------------------------
-    def _psum(env_list, clips):
+    # --- M10c(ii) does the MULTIDIM parcel state beat the COMMON MODE alone? ----------
+    def _psum(clips):
         cols = [np.stack([e[clips][:, parcel_id == p].mean(1) for p in parcels], 1)
-                for e in env_list]                                # per band (n,P,T)
+                for e in env_raw]                                  # per band (n,P,T)
         return np.stack(cols, 2).transpose(0, 3, 1, 2).reshape(len(clips) * T, len(parcels) * 3)
 
-    Str, Sva, Ste = (_psum(env_g, ix) for ix in (tr, va, te))
-    ytr_all, yva_all, yte_all = (
-        np.stack([hga_g[ix][:, parcel_id == p].mean(1).reshape(-1) for p in parcels], 1)
+    Str, Sva, Ste = (_psum(ix) for ix in (tr, va, te))
+    Ytr, Yva, Yte = (
+        np.stack([hga[ix][:, parcel_id == p].mean(1).reshape(-1) for p in parcels], 1)
         for ix in (tr, va, te)
     )
-    inter, inter_null = [], []
+    d_inter, d_null, base_inter = [], [], []
     for j in range(len(parcels)):
-        keep = [c for c in range(Str.shape[1]) if c // 3 != j]    # drop parcel j's OWN 3 bands
-        r2, _ = _fit_eval(Str[:, keep], ytr_all[:, j], Sva[:, keep], yva_all[:, j],
-                          Ste[:, keep], yte_all[:, j])
-        inter.append(r2)
+        keep = [c for c in range(Str.shape[1]) if c // 3 != j]     # drop parcel j's OWN bands
+        Otr, Ova, Ote = Str[:, keep], Sva[:, keep], Ste[:, keep]
+        # BASELINE = the common mode only (mean of the other parcels — never contains j)
+        r2_b, _ = _fit_eval(Otr.mean(1, keepdims=True), Ytr[:, j],
+                            Ova.mean(1, keepdims=True), Yva[:, j],
+                            Ote.mean(1, keepdims=True), Yte[:, j])
+        # FULL = the whole multidimensional other-parcel state
+        r2_f, _ = _fit_eval(Otr, Ytr[:, j], Ova, Yva[:, j], Ote, Yte[:, j])
+        base_inter.append(r2_b)
+        d_inter.append(r2_f - r2_b)
         for _ in range(max(N_PERM // 4, 3)):
-            r2n, _ = _fit_eval(
-                _circshift_clipwise(Str[:, keep], len(tr), T, rng), ytr_all[:, j],
-                _circshift_clipwise(Sva[:, keep], len(va), T, rng), yva_all[:, j],
-                _circshift_clipwise(Ste[:, keep], len(te), T, rng), yte_all[:, j],
+            r2_n, _ = _fit_eval(
+                _circshift_clipwise(Otr, len(tr), T, rng), Ytr[:, j],
+                _circshift_clipwise(Ova, len(va), T, rng), Yva[:, j],
+                _circshift_clipwise(Ote, len(te), T, rng), Yte[:, j],
             )
-            inter_null.append(r2n)
+            d_null.append(r2_n - r2_b)
 
-    # --- M10d eigenspectrum of the parcel-summary matrix (P x T) ----------------------
-    def _spec(src):
-        M = np.stack([src[all_clips][:, parcel_id == p].mean(1).reshape(-1) for p in parcels], 0)
+    # --- M10d eigenspectrum of the parcel-state matrix (P x T) ------------------------
+    # Reported RAW and after removing PC1. PC1 IS the common mode — the cleanest possible
+    # definition of it — so "rank after PC1 removal" is exactly "is there a global state
+    # richer than the common mode, and how many dimensions does it have?" That number
+    # SETS M. Grand-mean subtraction is deliberately NOT used (it is the leaky version).
+    def _spec(deflate_pc1: bool):
+        M = np.stack([hga[all_clips][:, parcel_id == p].mean(1).reshape(-1) for p in parcels], 0)
         M = M - M.mean(1, keepdims=True)
-        sd = np.maximum(M.std(1, keepdims=True), 1e-8)
-        sv = np.linalg.svd(M / sd, compute_uv=False)
-        e = sv**2
+        M = M / np.maximum(M.std(1, keepdims=True), 1e-8)
+        if deflate_pc1:
+            U, S, Vt = np.linalg.svd(M, full_matrices=False)
+            M = M - np.outer(U[:, 0] * S[0], Vt[0])                # strip the common mode
+        e = np.linalg.svd(M, compute_uv=False) ** 2
         frac = e / max(e.sum(), 1e-12)
         return {
             "var_top1": round(float(frac[0]), 4),
@@ -434,14 +498,17 @@ def m10cd(env_raw, parcel_id, tr, va, te, T, rng, n_splits=20) -> dict:
 
     return {
         "n_parcels": len(parcels),
-        "M10c_reliability_hga_global_demeaned": round(float(np.mean(rel_g)), 4) if rel_g else None,
-        "M10c_reliability_hga_raw": round(float(np.mean(rel_raw)), 4) if rel_raw else None,
-        "M10c_interparcel_R2": round(float(np.mean(inter)), 5) if inter else None,
-        "M10c_interparcel_R2_null_p95": (
-            round(float(np.percentile(inter_null, 95)), 5) if inter_null else None
-        ),
-        "M10d_spectrum_global_demeaned": _spec(hga_g),
-        "M10d_spectrum_raw": _spec(hga_raw),
+        "M10c_reliability_raw": round(float(np.mean(rel_raw)), 4) if rel_raw else None,
+        "M10c_reliability_commonmode_removed": (
+            round(float(np.mean(rel_cm)), 4) if rel_cm else None),
+        "M10c_interparcel_R2_commonmode_baseline": (
+            round(float(np.mean(base_inter)), 5) if base_inter else None),
+        "M10c_interparcel_dR2_over_commonmode": (
+            round(float(np.mean(d_inter)), 5) if d_inter else None),
+        "M10c_interparcel_dR2_null_p95": (
+            round(float(np.percentile(d_null, 95)), 5) if d_null else None),
+        "M10d_spectrum_raw": _spec(False),
+        "M10d_spectrum_pc1_removed": _spec(True),
     }
 
 
@@ -479,8 +546,6 @@ def main() -> None:
         bands, starts = _read_clips(spec, a.n_clips, a.clip_frames, a.seed)
         env_raw = [b.mean(2) for b in bands]                 # per band (n_clips, N, T)
         T = env_raw[0].shape[-1]
-        env_car = [np.stack([_shaft_car(e[i], shaft_id) for i in range(e.shape[0])], 0)
-                   for e in env_raw]
 
         tr, va, te = _split_clips(starts, a.clip_frames)
         if len(va) < 4 or len(te) < 4:
@@ -496,24 +561,27 @@ def main() -> None:
             "subject_id": sid, "trial_id": tid, "n_contacts": n_c,
             "n_shafts": int(sc.n_shafts),
             "clips_train_val_test": [len(tr), len(va), len(te)],
-            "M10a": m10a(env_car, shaft_id, tr, va, te, T, targets, rng),
-            "M10b": m10b(env_raw, env_car, tr, va, te, T, targets, rng),
+            "M10a": m10a(env_raw, shaft_id, tr, va, te, T, targets, rng),
+            "M10b": m10b(env_raw, shaft_id, tr, va, te, T, targets, rng),
             "M10cd": m10cd(env_raw, parcel_id, tr, va, te, T, rng),
         }
         rows.append(rec)
 
         A, B, C = rec["M10a"], rec["M10b"], rec["M10cd"]
         print(f"[s{sid}t{tid}] N={n_c} clips {len(tr)}/{len(va)}/{len(te)}", flush=True)
-        print(f"    M10a  within-shaft R2 {A['R2_within_shaft_baseline']}  |  "
-              f"dR2 {A['dR2_by_K']}", flush=True)
-        print(f"          null           {A['dR2_null_by_K']}", flush=True)
+        print(f"    M10a  base(own-shaft+common-mode) R2 "
+              f"{A['R2_baseline_ownshaft_plus_commonmode']}  |  dR2 {A['dR2_by_K']}", flush=True)
+        print(f"          null p95                       {A['dR2_null_p95_by_K']}", flush=True)
         print(f"    M10b  level R2 {B['R2_level_linear']}  gain R2 {B['R2_gain']}  "
               f"(gain null p95 {B['R2_gain_null_p95']})", flush=True)
         print(f"    M10cd parcels {C.get('n_parcels')}  "
-              f"reliability {C.get('M10c_reliability_hga_global_demeaned')} "
-              f"(raw {C.get('M10c_reliability_hga_raw')})  "
-              f"inter-parcel R2 {C.get('M10c_interparcel_R2')}  "
-              f"spectrum {C.get('M10d_spectrum_global_demeaned')}", flush=True)
+              f"reliability {C.get('M10c_reliability_commonmode_removed')} "
+              f"(raw {C.get('M10c_reliability_raw')})  "
+              f"inter-parcel dR2-over-common-mode "
+              f"{C.get('M10c_interparcel_dR2_over_commonmode')} "
+              f"(null p95 {C.get('M10c_interparcel_dR2_null_p95')})", flush=True)
+        print(f"          parcel-state spectrum, PC1(common mode) REMOVED: "
+              f"{C.get('M10d_spectrum_pc1_removed')}", flush=True)
 
     # ---- pooled ----
     print("\n" + "=" * 78)
@@ -531,51 +599,60 @@ def main() -> None:
                                           if f"K{k}" in r["M10a"]["dR2_null_p95_by_K"]])), 5)
             for k in K_SWEEP
         }
-        pooled["M10a_within_shaft_R2"] = round(
-            float(np.mean([r["M10a"]["R2_within_shaft_baseline"] for r in rows])), 5)
+        pooled["M10a_baseline_R2"] = round(
+            float(np.mean([r["M10a"]["R2_baseline_ownshaft_plus_commonmode"] for r in rows])), 5)
         for key, src in (("M10b_level_R2", "R2_level_linear"), ("M10b_gain_R2", "R2_gain"),
                          ("M10b_gain_null_p95", "R2_gain_null_p95")):
             pooled[key] = round(float(np.mean([r["M10b"][src] for r in rows])), 5)
         cd = [r["M10cd"] for r in rows if r["M10cd"].get("n_parcels", 0) >= 3]
         if cd:
-            pooled["M10c_parcel_reliability"] = round(
-                float(np.mean([c["M10c_reliability_hga_global_demeaned"] for c in cd])), 4)
-            pooled["M10c_parcel_reliability_raw"] = round(
-                float(np.mean([c["M10c_reliability_hga_raw"] for c in cd])), 4)
-            pooled["M10c_interparcel_R2"] = round(
-                float(np.mean([c["M10c_interparcel_R2"] for c in cd])), 5)
-            pooled["M10d_var_top1"] = round(
-                float(np.mean([c["M10d_spectrum_global_demeaned"]["var_top1"] for c in cd])), 4)
-            pooled["M10d_var_top8"] = round(
-                float(np.mean([c["M10d_spectrum_global_demeaned"]["var_top8"] for c in cd])), 4)
-            pooled["M10d_participation_ratio"] = round(
-                float(np.mean([c["M10d_spectrum_global_demeaned"]["participation_ratio"]
-                               for c in cd])), 2)
+            for key, src in (
+                ("M10c_reliability_cm_removed", "M10c_reliability_commonmode_removed"),
+                ("M10c_reliability_raw", "M10c_reliability_raw"),
+                ("M10c_interparcel_commonmode_R2", "M10c_interparcel_R2_commonmode_baseline"),
+                ("M10c_interparcel_dR2", "M10c_interparcel_dR2_over_commonmode"),
+                ("M10c_interparcel_dR2_null_p95", "M10c_interparcel_dR2_null_p95"),
+            ):
+                pooled[key] = round(float(np.mean([c[src] for c in cd])), 5)
+            for tag, sk in (("raw", "M10d_spectrum_raw"), ("pc1rm", "M10d_spectrum_pc1_removed")):
+                for f in ("var_top1", "var_top8", "participation_ratio", "n_for_90pct"):
+                    pooled[f"M10d_{tag}_{f}"] = round(
+                        float(np.mean([c[sk][f] for c in cd])), 3)
 
-        print("\nM10a — does a K-dim GLOBAL summary add anything to the within-shaft "
-              "prediction of local HGA?")
-        print(f"  within-shaft baseline R2 : {pooled['M10a_within_shaft_R2']}")
+        print("\nM10a — does a K-dim GLOBAL summary add to local-HGA prediction, ON TOP OF")
+        print("       the contact's own shaft AND the common mode?")
+        print(f"  baseline R2 (own shaft + common mode): {pooled['M10a_baseline_R2']}")
         for k in K_SWEEP:
             d = pooled["M10a_dR2_by_K"][f"K{k}"]
             n = pooled["M10a_dR2_null_p95_by_K"][f"K{k}"]
-            verdict = "REAL" if d > n else "null"
-            print(f"  K={k:>2}: dR2 {d:+.5f}   (null p95 {n:+.5f})   -> {verdict}")
+            print(f"  K={k:>2}: dR2 {d:+.5f}   (null p95 {n:+.5f})   -> "
+                  f"{'REAL' if d > n else 'null'}")
 
-        print(f"\nM10b — LEVEL vs GAIN (decides additive-vs-FiLM read)")
+        print("\nM10b — LEVEL vs GAIN (decides additive cross-attn vs GAIN-ONLY FiLM read)")
         print(f"  R2(global -> local HGA level) : {pooled['M10b_level_R2']:+.5f}")
         print(f"  R2(global -> local HGA |gain|): {pooled['M10b_gain_R2']:+.5f}  "
               f"(null p95 {pooled['M10b_gain_null_p95']:+.5f})")
 
         if cd:
-            print(f"\nM10c/d — is a PARCEL summary a well-posed WRITE target?")
-            print(f"  split-half reliability (global-demeaned): "
-                  f"{pooled['M10c_parcel_reliability']}   <-- CEILING on any such head")
-            print(f"  split-half reliability (raw, w/ common mode): "
-                  f"{pooled['M10c_parcel_reliability_raw']}")
-            print(f"  inter-parcel held-out R2                 : {pooled['M10c_interparcel_R2']}")
-            print(f"  parcel-state spectrum: top1 {pooled['M10d_var_top1']}  "
-                  f"top8 {pooled['M10d_var_top8']}  "
-                  f"participation ratio {pooled['M10d_participation_ratio']}")
+            print("\nM10c — is a PARCEL-STATE summary a well-posed WRITE target?")
+            print(f"  split-half reliability, common mode REMOVED: "
+                  f"{pooled['M10c_reliability_cm_removed']}   <-- CEILING on any such head")
+            print(f"  split-half reliability, raw                : "
+                  f"{pooled['M10c_reliability_raw']}")
+            print(f"  inter-parcel R2 from the COMMON MODE alone : "
+                  f"{pooled['M10c_interparcel_commonmode_R2']}")
+            print(f"  ...dR2 from the MULTIDIM parcel state      : "
+                  f"{pooled['M10c_interparcel_dR2']:+.5f}  "
+                  f"(null p95 {pooled['M10c_interparcel_dR2_null_p95']:+.5f})")
+            print("\nM10d — parcel-state RANK. PC1 == the common mode; the rank of what is")
+            print("       LEFT after stripping it is the dimension of the real global state,")
+            print("       and that number SETS M.")
+            print(f"  raw        : top1 {pooled['M10d_raw_var_top1']}  "
+                  f"PR {pooled['M10d_raw_participation_ratio']}  "
+                  f"n@90% {pooled['M10d_raw_n_for_90pct']}")
+            print(f"  PC1 removed: top1 {pooled['M10d_pc1rm_var_top1']}  "
+                  f"PR {pooled['M10d_pc1rm_participation_ratio']}  "
+                  f"n@90% {pooled['M10d_pc1rm_n_for_90pct']}   <-- M")
 
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)

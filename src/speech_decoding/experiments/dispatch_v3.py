@@ -231,6 +231,24 @@ def build_v3_training(
     return module, dm, trainer
 
 
+def _enabled_optional_modules(args: argparse.Namespace) -> list[str]:
+    """Optional modules that join the TRAINABLE set beyond the r1/r2 plain-JEPA
+    baseline (encoder + EMA teacher + predictor + ``pred_to_target``).
+
+    Each entry is ``"<module> (<flag that enabled it>)"``. The r3 gate below fires on a
+    NON-EMPTY list under multi-GPU static_graph — the crash surface is "the trainable
+    parameter set grew", not the context head specifically, so a new optional module
+    must be ADDED HERE THE MOMENT IT LANDS or it walks into the same crash:
+
+      * r4 secondary prediction head — add when it lands.
+      * r4 Perceiver latents + FiLM parameters — add when they land.
+    """
+    enabled: list[str] = []
+    if getattr(args, "context_lambda", 0.0) > 0.0:
+        enabled.append("pred_to_target_context (--context-lambda > 0)")
+    return enabled
+
+
 def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
     """The locked v3 Trainer (E2 knobs). Single-device unless ``--devices>1``."""
     torch.set_float32_matmul_precision("high")  # audit lever, numerics-safe
@@ -298,16 +316,19 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
         # the same session-grouped ragged batching, and it composes with torch.compile
         # (fewer DDP reducer re-analyses). Only active on multi-GPU (single-GPU launch
         # never builds a DDPStrategy).
+        optional = _enabled_optional_modules(args)
         if (
-            getattr(args, "context_lambda", 0.0) > 0.0
+            optional
             and args.ddp_static_graph
             and not getattr(args, "ack_r3_static_graph", False)
         ):
             raise SystemExit(
-                "REFUSING TO LAUNCH: --context-lambda > 0 with multi-GPU DDP static_graph.\n"
-                "\n"
-                "This exact combination killed r3 (DeltaAI 2653154, 2026-07-14): all 4 ranks\n"
-                "died at the FIRST backward with\n"
+                "REFUSING TO LAUNCH: optional module(s) join the trainable set under\n"
+                "multi-GPU DDP static_graph:\n"
+                + "".join(f"    {m}\n" for m in optional)
+                + "\n"
+                "This is the r3 shape. r3 (DeltaAI 2653154, 2026-07-14) enabled exactly one\n"
+                "such module (the context head) and all 4 ranks died at the FIRST backward with\n"
                 "    expect_autograd_hooks_ INTERNAL ASSERT FAILED (c10d/reducer.cpp:1703)\n"
                 "after ~5 min of compile warmup — 0 usable steps, GPU hours burned.\n"
                 "\n"
@@ -317,11 +338,16 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
                 "    it gets zero-valued grads, not no grads.\n"
                 "  - 'the head joining DDP's buckets is the trigger'    -> refuted: a CPU/gloo\n"
                 "    repro asserts identically with the head frozen (r2) and live (r3).\n"
-                "What IS established (CPU/gloo, zero GPU): static_graph=False survives every\n"
+                "What IS established (CPU/gloo, zero GPU, committed as\n"
+                "experiments/test_ddp_static_graph_repro.py): static_graph=False survives every\n"
                 "configuration tested.\n"
                 "\n"
-                "DO NOT 'fix' this with find_unused_parameters=True — the head is not unused.\n"
-                "DO NOT freeze/unfreeze the head at warmup_start — that mutates graph structure\n"
+                "The gate is therefore NOT about which module it is — it fires on ANY growth of\n"
+                "the trainable set beyond the r1/r2 baseline (r1 ran ~43k steps on that baseline\n"
+                "with static_graph=True; nothing else about static_graph has been cleared).\n"
+                "\n"
+                "DO NOT 'fix' this with find_unused_parameters=True — the module is not unused.\n"
+                "DO NOT freeze/unfreeze it at warmup_start — that mutates graph structure\n"
                 "mid-run, which static_graph forbids; it trades a step-0 crash for a step-15k one.\n"
                 "\n"
                 "Relaunch with --no-ddp-static-graph (DDP bookkeeping only: it does not touch\n"
@@ -403,8 +429,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="DDP static_graph (multi-GPU only; v2 --ddp-static-graph)")
     p.add_argument("--ack-r3-static-graph", dest="ack_r3_static_graph",
                    action="store_true",
-                   help="override the r3 crash gate and launch --context-lambda>0 with "
-                        "multi-GPU static_graph anyway (this killed r3 at the first backward)")
+                   help="override the r3 crash gate and launch an optional-module run "
+                        "(e.g. --context-lambda>0) with multi-GPU static_graph anyway "
+                        "(this killed r3 at the first backward)")
     p.add_argument("--same-session-ranks", dest="same_session_ranks",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="All DDP ranks step the SAME session each step (v2 "

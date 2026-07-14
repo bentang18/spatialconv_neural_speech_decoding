@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from speech_decoding.experiments.dispatch_v3 import (
+    _build_trainer,
     _parse_sessions,
     build_v3_optim_cfg,
     build_v3_training,
@@ -174,3 +175,60 @@ def test_smoke_advances_teacher_and_params(tmp_path) -> None:
                        if p.requires_grad])
     # one optimizer step moved the trainable params (optimizer + EMA both ran)
     assert not torch.allclose(before, after)
+
+
+# --- r3 static_graph launch gate --------------------------------------------
+# The gate fires on ANY optional module joining the trainable set under multi-GPU
+# static_graph, not on --context-lambda specifically: r4 adds a secondary head +
+# Perceiver latents/FiLM at context_lambda == 0 and must be caught by the SAME gate.
+# The crash it guards is reproduced on CPU in test_ddp_static_graph_repro.py.
+
+
+def _ddp_args(**over):
+    base = dict(
+        devices=4, ddp_static_graph=True, ack_r3_static_graph=False,
+        context_lambda=0.0, context_warmup_start=15_000, context_warmup_end=30_000,
+    )
+    base.update(over)
+    return _smoke_args(**base)
+
+
+def test_r3_gate_fires_on_context_lambda_multi_gpu_static_graph() -> None:
+    with pytest.raises(SystemExit, match="pred_to_target_context"):
+        _build_trainer(_ddp_args(context_lambda=0.5))
+
+
+def test_r3_gate_is_generic_over_the_optional_module(monkeypatch) -> None:
+    """r4's modules do not exist yet, so pin the SHAPE: any non-empty optional-module
+    list trips the gate at context_lambda == 0 (r4's condition)."""
+    import speech_decoding.experiments.dispatch_v3 as d3
+
+    monkeypatch.setattr(
+        d3, "_enabled_optional_modules", lambda args: ["perceiver_latents (--r4)"]
+    )
+    with pytest.raises(SystemExit, match="perceiver_latents"):
+        _build_trainer(_ddp_args())
+
+
+def test_r3_gate_silent_on_the_r1_r2_baseline() -> None:
+    """r1 ran ~43k steps multi-GPU with static_graph=True and no optional module —
+    the gate must not break that launch."""
+    assert _build_trainer(_ddp_args()) is not None
+
+
+def test_r3_gate_ack_flag_overrides() -> None:
+    assert _build_trainer(
+        _ddp_args(context_lambda=0.5, ack_r3_static_graph=True)
+    ) is not None
+
+
+def test_r3_gate_ignores_single_device() -> None:
+    """No DDPStrategy at devices=1 ⇒ no static_graph ⇒ nothing to gate."""
+    assert _build_trainer(_ddp_args(devices=1, context_lambda=0.5)) is not None
+
+
+def test_r3_gate_silent_with_no_static_graph() -> None:
+    """--no-ddp-static-graph IS the fix; it must launch."""
+    assert _build_trainer(
+        _ddp_args(context_lambda=0.5, ddp_static_graph=False)
+    ) is not None
