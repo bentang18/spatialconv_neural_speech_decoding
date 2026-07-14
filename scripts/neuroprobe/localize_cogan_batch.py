@@ -170,7 +170,9 @@ def localize_subject(
         keep = [k for k, n in enumerate(names) if n[1] == "D"]
         names = [names[k] for k in keep]
         coords = coords[keep]
-    vol = _load_mgz(os.path.join(rd, "aparc.DKTatlas+aseg.mgz"))
+    vol = _load_mgz(
+        os.path.join(_mri_dir(recon_root, subj), "aparc.DKTatlas+aseg.mgz")
+    )
     ijk = cl.apply_axis_convention(coords, perm, flips, vol.shape)
 
     origin_names: list[str] = []
