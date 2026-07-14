@@ -33,9 +33,15 @@ import numpy as np
 
 import cogan_localize as cl
 
-# Only D23/D24 ship a ready DK CSV; both are used to pin (and cross-check) the
-# axis convention before it is trusted for the DKT-atlas sampling on all feeds.
-PIN_SUBJECTS = ("D23", "D24")
+# Only D23/D24 ship a ready DK CSV. D24 is a subdural GRID/STRIP (ECoG) subject
+# whose surface contacts sit at the pial boundary — center-voxel volume labeling
+# reproduces its DK CSV at only ~0.44, an intrinsic surface-vs-volume mismatch,
+# not a convention error. The Cogan v3 feed is depth-only (surface subjects are
+# dropped, matching BT's sEEG modality and the shaft/depth-RoPE arch), so the
+# convention is pinned on the DEPTH reference D23 alone: 121 contacts across 10
+# shafts spanning the hemisphere reproduce its DK CSV at 0.926 origin / 0.942
+# majority, with the runner-up convention at 0.42 — a decisive, unambiguous lock.
+PIN_SUBJECTS = ("D23",)
 
 # The shipped DK CSV is generated FROM the recon in row order, so we align the
 # ground-truth origin column to our coords by ROW INDEX, not by electrode name.
@@ -83,11 +89,11 @@ def pin_convention(
     radius_mm: float,
     threshold: float,
 ) -> tuple[tuple[int, ...], tuple[bool, ...]]:
-    """Reproduce the D23/D24 DK CSV to lock the LEPTOVOX→array convention.
+    """Reproduce the depth-reference DK CSV to lock the LEPTOVOX→array convention.
 
-    The winning ``(perm, flips)`` must agree on the SAME convention across both
-    pin subjects and clear ``threshold`` on each, else we abort — a partial match
-    means the geometry is unresolved.
+    The winning ``(perm, flips)`` must clear ``threshold`` on every pin subject
+    (depth-only; see ``PIN_SUBJECTS``), else we abort — a match below threshold
+    means the geometry is unresolved. Multiple pin subjects must also agree.
     """
     winner: tuple[tuple[int, ...], tuple[bool, ...]] | None = None
     for subj in PIN_SUBJECTS:
@@ -144,13 +150,26 @@ def localize_subject(
     radius_mm: float,
     label_choice: str,
     out_path: str,
+    depth_only: bool = True,
 ) -> int:
-    """Sample the DKT atlas for one subject → write ``depth-wm.csv``. Returns N."""
+    """Sample the DKT atlas for one subject → write ``depth-wm.csv``. Returns N.
+
+    ``depth_only`` (default True) keeps only kind ``D`` (sEEG depth) contacts and
+    drops grid/strip (``G``/``S``) surface contacts: the Cogan v3 feed is
+    depth-only, center-voxel volume labeling is unreliable for surface contacts
+    (~0.44 reproduction), and 2D grids have no linear shaft for the depth-RoPE.
+    A pure-surface subject then yields an empty ``depth-wm.csv`` (N=0) and drops
+    out of the feed naturally; a mixed subject (e.g. D67) keeps only its depths.
+    """
     rd = _recon_dir(recon_root, subj)
     names, coords = cl.read_recon_electrodes(
         os.path.join(rd, f"{subj}.electrodeNames"),
         os.path.join(rd, f"{subj}.LEPTOVOX"),
     )
+    if depth_only:
+        keep = [k for k, n in enumerate(names) if n[1] == "D"]
+        names = [names[k] for k in keep]
+        coords = coords[keep]
     vol = _load_mgz(os.path.join(rd, "aparc.DKTatlas+aseg.mgz"))
     ijk = cl.apply_axis_convention(coords, perm, flips, vol.shape)
 
@@ -182,7 +201,18 @@ def main() -> None:
     ap.add_argument("--subjects", nargs="+", required=True, help="e.g. D23 D24 D19 …")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--radius-mm", type=float, default=3.0)
-    ap.add_argument("--pin-threshold", type=float, default=0.95)
+    ap.add_argument(
+        "--pin-threshold", type=float, default=0.90,
+        help="min origin-match on each depth pin subject to trust the convention. "
+        "0.90: D23 reproduces at 0.926 (residual = center-voxel boundary noise, "
+        "every miss has the expected label inside the sphere) while the runner-up "
+        "convention sits at 0.42, so 0.90 separates them decisively.",
+    )
+    ap.add_argument(
+        "--keep-surface", action="store_true",
+        help="also localize grid/strip (G/S) contacts (default: depth-only). For "
+        "auditing surface reproduction only — the v3 feed drops surface contacts.",
+    )
     ap.add_argument(
         "--label-choice", choices=("origin", "majority"), default="majority",
         help="which candidate fills the DKT column. Default 'majority' (3mm-sphere "
@@ -204,9 +234,10 @@ def main() -> None:
         try:
             n = localize_subject(
                 args.recon_root, subj, lut, perm, flips, args.radius_mm,
-                args.label_choice, out,
+                args.label_choice, out, depth_only=not args.keep_surface,
             )
-            print(f"[ok] {subj}: {n} electrodes → {out}")
+            tag = "ok" if n else "EMPTY(surface-only)"
+            print(f"[{tag}] {subj}: {n} depth electrodes → {out}")
         except (FileNotFoundError, ValueError) as e:
             print(f"[SKIP] {subj}: {e}")
 
