@@ -425,8 +425,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="torch.compile the model, dynamic=False (audit lever; apply "
                         "LAST). v2 measured >1.5x; validate the flex-nesting on G4")
     p.add_argument("--ddp-static-graph", dest="ddp_static_graph",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="DDP static_graph (multi-GPU only; v2 --ddp-static-graph)")
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="DDP static_graph (multi-GPU only). DEFAULT FLIPPED TO FALSE "
+                        "2026-07-15: static_graph killed r3 at the first backward, and it "
+                        "is the ONLY thing established across every sighting (a gloo CPU "
+                        "repro asserts under grad-accum even with the optional module "
+                        "FROZEN -- see test_ddp_static_graph_repro.py). r4 runs optional "
+                        "modules, so it needs static_graph=False regardless; defaulting it "
+                        "on was a landmine with nothing to gain. Pass --ddp-static-graph "
+                        "explicitly to opt back in on a plain-JEPA baseline.")
     p.add_argument("--ack-r3-static-graph", dest="ack_r3_static_graph",
                    action="store_true",
                    help="override the r3 crash gate and launch an optional-module run "
