@@ -18,14 +18,16 @@ Two stages:
 
 Run-gated + output-gated: the produced CSVs feed v3 SSL only once the 0.578
 Neuroprobe gate is cleared, and any launch that samples the volumes is Ben-gated.
-The ``origin`` vs ``majority`` label pick is a required ``--label-choice`` flag —
-no silent default (see ``write_depth_wm_csv``).
+The DKT ``DKT`` column defaults to ``majority`` (3mm-sphere plurality); both
+``origin`` and ``majority`` candidates are always written for audit (see
+``write_depth_wm_csv`` and ``--label-choice``).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 
 import numpy as np
 
@@ -34,6 +36,21 @@ import cogan_localize as cl
 # Only D23/D24 ship a ready DK CSV; both are used to pin (and cross-check) the
 # axis convention before it is trusted for the DKT-atlas sampling on all feeds.
 PIN_SUBJECTS = ("D23", "D24")
+
+# The shipped DK CSV is generated FROM the recon in row order, so we align the
+# ground-truth origin column to our coords by ROW INDEX, not by electrode name.
+# Some subjects (e.g. D23) renumber contacts within a shaft between the
+# electrodeNames file (clinical, what the EDF channels use) and the DK CSV
+# (e.g. RAMF 1..7 vs 8..14) — a pure relabel, not a reorder. Name-matching then
+# spuriously KeyErrors; row alignment is correct and more faithful. We still
+# guard it by asserting the shaft PREFIX agrees row-by-row, which catches a real
+# reorder while tolerating the benign within-shaft renumber.
+_SHAFT_RE = re.compile(r"^(?P<shaft>.*?)(?P<depth>\d+)$")
+
+
+def _shaft_prefix(name: str) -> str:
+    m = _SHAFT_RE.match(name)
+    return m.group("shaft") if m else name
 
 
 def _recon_dir(recon_root: str, subj: str) -> str:
@@ -79,8 +96,25 @@ def pin_convention(
             os.path.join(rd, f"{subj}.electrodeNames"),
             os.path.join(rd, f"{subj}.LEPTOVOX"),
         )
-        gt = dict(cl.read_dk_csv_origins(_dk_csv_path(recon_root, subj, radius_mm)))
-        expected = [gt[n[0]] for n in names]
+        gt = cl.read_dk_csv_origins(_dk_csv_path(recon_root, subj, radius_mm))
+        if len(gt) != len(names):
+            raise SystemExit(
+                f"{subj}: DK CSV rows ({len(gt)}) != recon electrodes "
+                f"({len(names)}) — cannot row-align the pin ground truth."
+            )
+        # Row alignment is only valid if the two files list contacts in the same
+        # order; assert the shaft prefix matches row-by-row (tolerates renumber).
+        mismatched = [
+            (i, n[0], gt[i][0])
+            for i, n in enumerate(names)
+            if _shaft_prefix(n[0]) != _shaft_prefix(gt[i][0])
+        ]
+        if mismatched:
+            raise SystemExit(
+                f"{subj}: DK CSV is NOT row-aligned to the recon — shaft prefix "
+                f"differs at rows {mismatched[:5]}; row-index pin is unsafe."
+            )
+        expected = [origin for _, origin in gt]
         vol = _load_mgz(os.path.join(_mri_dir(recon_root, subj), "aparc+aseg.mgz"))
         perm, flips, frac = cl.find_axis_convention(
             vol, coords, expected, lut, radius_mm
