@@ -193,7 +193,7 @@ class PerceiverHead(nn.Module):
         self,
         z_tokens: Tensor,
         token_time: Tensor,
-        token_mask: Tensor,
+        token_mask: Tensor | None,
         query_parcel: Tensor,
         query_slot: Tensor,
         *,
@@ -201,7 +201,9 @@ class PerceiverHead(nn.Module):
         noise: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """z_tokens (B,K,d_tap) padded visible-token deep-sup features; token_time (B,K)
-        long 32 Hz-lattice frame index; token_mask (B,K) bool (True=real). Decode queries
+        long 32 Hz-lattice frame index; token_mask (B,K) bool (True=real) or None when
+        every token is real (exact masking ⇒ no padding, so the objective passes None and
+        the encode cross-attention skips the identically-zero key-bias). Decode queries
         query_parcel (B,Q) long, query_slot (B,Q) long (0..n_slots-1). ``noise`` (B,Q,6)
         optional per-query PD floor (the count-dependent floor keyed on each query's parcel
         electrode count — the objective owns the n_elec map and passes it through to the

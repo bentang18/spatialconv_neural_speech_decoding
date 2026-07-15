@@ -309,18 +309,24 @@ class V3JepaObjective(nn.Module):
         B, P, S, _ = target.shape
         dev = target.device
         # per-parcel electrode count → per-query count-dependent 6-D noise floor.
-        counts = torch.bincount(parcel_id, minlength=int(parcels.max().item()) + 1)
+        # ``parcels = unique(parcel_id)`` ⇒ ``parcels.max() == parcel_id.max()``, so a bare
+        # ``bincount`` already returns length ``parcel_id.max()+1`` — the old ``minlength=
+        # int(parcels.max().item())+1`` was a no-op that cost a per-step host sync (the
+        # secondary-path twin of the syncs e3baef6 killed on the primary path).
+        counts = torch.bincount(parcel_id)
         n_elec = counts[parcels]  # (P,)
         noise = count_dependent_noise_var(n_elec.repeat_interleave(S))  # (Q, 6)
         # queries parcel-major to match target.reshape(B, P·S, 6): [p0s0,p0s1,…,p1s0,…].
         Q = P * S
         q_parcel = parcels.repeat_interleave(S)  # (Q,) actual parcel ids (index ParcelIdentityEmbed)
         q_slot = torch.arange(S, device=dev).repeat(P)  # (Q,) 0..S-1
-        token_mask = torch.ones(B, pack.m_vis, dtype=torch.bool, device=dev)
+        # exact masking ⇒ every packed visible token is real, so the encode key-mask would be
+        # all-True and its additive bias identically zero. Pass None to skip the bool alloc +
+        # the zero bias-add in the perceiver's encode cross-attention (agent finding #5).
         mu, cov = self.perceiver(
             z,
             pack.time_pos,
-            token_mask,
+            None,
             q_parcel[None].expand(B, Q),
             q_slot[None].expand(B, Q),
             n_slots=S,
