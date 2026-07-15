@@ -391,7 +391,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--clips-per-session", type=int, default=2000,
                    help="per-epoch clip budget/session (operational; epoch length + "
                         "window re-draw cadence, NOT a model hyperparameter)")
-    p.add_argument("--clip-len", type=float, default=3.0, help="clip seconds (locked 3.0)")
+    p.add_argument("--clip-len", type=float, default=3.0,
+                   help="clip seconds (adjustable HP; r4 uses 2.0 — shorter clips give "
+                        "more opt-steps + mask diversity per GPU-hour at a ~7% raw "
+                        "contact-frame throughput cost, worth it in our step-bound regime)")
     # Per-band robust-z winsor |z| cap (v2 --session-z-winsor-{lfs,hga} port). SLOW+MID
     # = the old sub-HGA content → 15; HGA's heavier tails get the looser 20 (Ben
     # 2026-07-10). Applied at transform inside SessionRobustZNormalizer.
