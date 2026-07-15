@@ -54,25 +54,28 @@ def raw_state_vectors(
         S = T // slot_stride
         if S * slot_stride != T:
             raise ValueError(f"T={T} not divisible by slot_stride={slot_stride}")
-        parcels = torch.unique(parcel_id)  # sorted ascending
+        parcels, inv = torch.unique(parcel_id, return_inverse=True)  # sorted; inv (N,) parcel row/elec
         P = int(parcels.shape[0])
         # per-band per-electrode 4 Hz envelope: mean over freq bins → window-average.
-        slots = []
+        envs = []
         for b in band_inputs:
             env = b.mean(dim=2)  # (B, N, T)  mean over freq bins
             env = env.reshape(B, N, S, slot_stride).mean(dim=-1)  # (B, N, S) 4 Hz
-            slots.append(env)
-        n_elec = torch.empty(P, dtype=torch.long, device=parcel_id.device)
-        raw = band_inputs[0].new_zeros(B, P, S, STATE_DIM)
-        for pi in range(P):
-            idx = torch.nonzero(parcel_id == parcels[pi], as_tuple=False).squeeze(1)
-            n_elec[pi] = idx.shape[0]
-            for bi in range(N_BANDS):
-                e = slots[bi][:, idx]  # (B, n_p, S)
-                raw[:, pi, :, bi] = e.mean(dim=1)  # parcel MEAN
-                # population SD (ddof=0) — matches the M11/M17 reliability measurement;
-                # =0 at n=1 (masked out downstream). std over the electrode axis.
-                raw[:, pi, :, N_BANDS + bi] = e.std(dim=1, unbiased=False)
+            envs.append(env)
+        env = torch.stack(envs, dim=-1)  # (B, N, S, N_BANDS) band-major last dim
+        # Parcel pooling by scatter-add over the electrode axis (replaces the per-parcel
+        # nonzero loop): ``inv`` groups electrodes by parcel row. Two-pass population moments
+        # — parcel MEAN, then the mean-centred squares — which equals std(unbiased=False)
+        # exactly and is stabler than sum-of-squares minus square-of-sum. std=0 at n=1
+        # (masked out downstream), matching the M11/M17 reliability measurement.
+        n_elec = torch.bincount(inv, minlength=P)  # (P,) electrodes per parcel
+        cnt = n_elec.clamp_min(1).to(env.dtype)[None, :, None, None]  # (1, P, 1, 1)
+        sum_e = env.new_zeros(B, P, S, N_BANDS).index_add_(1, inv, env)
+        mean = sum_e / cnt  # (B, P, S, N_BANDS) parcel MEAN
+        dev = env - mean[:, inv]  # (B, N, S, N_BANDS) centre each electrode on its parcel
+        sq = env.new_zeros(B, P, S, N_BANDS).index_add_(1, inv, dev * dev)
+        std = (sq / cnt).clamp_min(0.0).sqrt()  # population SD over the parcel's electrodes
+        raw = torch.cat([mean, std], dim=-1)  # (B, P, S, 6) band-major mean then std
         return raw.detach(), parcels, n_elec
 
 

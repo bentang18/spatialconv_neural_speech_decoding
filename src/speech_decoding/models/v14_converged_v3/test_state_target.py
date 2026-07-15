@@ -48,6 +48,46 @@ def test_raw_parcel_mean_and_std_match_hand_computation() -> None:
     assert ok_mu and ok_sd
 
 
+def _raw_state_vectors_loop(bands, parcel_id, *, slot_stride=8):
+    """Reference per-parcel loop (the pre-vectorization implementation) — the fixture the
+    vectorized ``raw_state_vectors`` must reproduce bit-for-bit on arbitrary geometry."""
+    B, N, _, T = bands[0].shape
+    S = T // slot_stride
+    parcels = torch.unique(parcel_id)
+    P = int(parcels.shape[0])
+    slots = [b.mean(dim=2).reshape(B, N, S, slot_stride).mean(dim=-1) for b in bands]
+    n_elec = torch.empty(P, dtype=torch.long)
+    raw = bands[0].new_zeros(B, P, S, STATE_DIM)
+    for pi in range(P):
+        idx = torch.nonzero(parcel_id == parcels[pi], as_tuple=False).squeeze(1)
+        n_elec[pi] = idx.shape[0]
+        for bi in range(N_BANDS):
+            e = slots[bi][:, idx]
+            raw[:, pi, :, bi] = e.mean(dim=1)
+            raw[:, pi, :, N_BANDS + bi] = e.std(dim=1, unbiased=False)
+    return raw, parcels, n_elec
+
+
+def test_vectorized_matches_reference_loop() -> None:
+    # The scatter/index_add vectorization must equal the per-parcel loop it replaces, on a
+    # ragged parcel layout (singleton, pair, and larger parcels; parcel ids non-contiguous).
+    g = torch.Generator().manual_seed(17)
+    Bv, Nv, Fv, Tv = 5, 9, 4, 24
+    parcel_id = torch.tensor([7, 7, 7, 7, 2, 2, 5, 5, 9])  # counts {7:4, 2:2, 5:2, 9:1}
+    bands = [torch.rand(Bv, Nv, Fv, Tv, generator=g) * 3.0 for _ in range(N_BANDS)]
+    raw, parcels, n_elec = raw_state_vectors(bands, parcel_id)
+    ref_raw, ref_parcels, ref_n = _raw_state_vectors_loop(bands, parcel_id)
+    ok = (
+        torch.equal(parcels, ref_parcels)
+        and torch.equal(n_elec, ref_n)
+        and torch.allclose(raw, ref_raw, atol=1e-5)
+    )
+    print(f"[check] vectorized raw_state_vectors == reference loop "
+          f"(parcels {parcels.tolist()}, n_elec {n_elec.tolist()}) "
+          f"max|Δ|={ (raw - ref_raw).abs().max().item():.2e} {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_singleton_parcel_std_is_undefined_and_masked() -> None:
     target, present, parcels = build_state_target(
         _const_bands(), PARCEL_ID,
