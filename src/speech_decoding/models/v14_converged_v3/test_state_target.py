@@ -14,10 +14,12 @@ import math
 import torch
 
 from speech_decoding.models.v14_converged_v3.state_target import (
+    MIN_STD_ELEC,
     N_BANDS,
     STATE_DIM,
     StateStatsAccumulator,
     build_state_target,
+    dim_presence,
     raw_state_stats,
     raw_state_vectors,
 )
@@ -25,6 +27,24 @@ from speech_decoding.models.v14_converged_v3.state_target import (
 B, N, F, T = 4, 6, 5, 16
 PARCEL_ID = torch.tensor([0, 0, 0, 1, 1, 2])  # n_elec = [3, 2, 1] — parcel 2 is a singleton
 S = T // 8  # 2 slots
+
+
+def test_dim_presence_layout_wellformed() -> None:
+    """The invariant present_masked_nll TRUSTS instead of re-checking per step (the two host
+    syncs removed from the compiled forward): dim_presence CONSTRUCTS a well-formed layout for
+    every electrode count — mean dims [0:3] always present, std dims [3:6] all-or-none per
+    position, std on iff n_elec >= MIN_STD_ELEC. Pinned here at the constructor so removing the
+    consumer-side guard is safe (feedback-build-the-invariant-into-the-probe)."""
+    n_elec = torch.arange(0, 40)  # 0,1 (std off) .. large (std on); covers both patterns
+    present = dim_presence(n_elec)  # (P, 6)
+    mean_always = bool(present[:, :N_BANDS].all())
+    std_block = present[:, N_BANDS:]
+    std_all_or_none = bool((std_block.all(-1) | (~std_block).all(-1)).all())
+    std_matches_count = bool((std_block.all(-1) == (n_elec >= MIN_STD_ELEC)).all())
+    ok = mean_always and std_all_or_none and std_matches_count
+    print(f"[check] dim_presence: mean-always-on={mean_always} std-all-or-none={std_all_or_none} "
+          f"std⇔(n≥{MIN_STD_ELEC})={std_matches_count} {'OK' if ok else 'VIOLATED'}")
+    assert ok
 
 
 def _const_bands() -> list[torch.Tensor]:

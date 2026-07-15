@@ -355,13 +355,7 @@ def test_present_masked_marginal_ignores_absent_and_crosscov() -> None:
     assert ok
 
 
-def test_present_masked_rejects_noncprefix_present() -> None:
-    # Fail loud: the std dims must be present all-or-none (dim_presence guarantees this);
-    # a partial std mask is a wiring bug, not a data condition.
-    import pytest
-
-    mu, cov, x = _rand_gaussians(4, 5)
-    bad = torch.ones(4, D, dtype=torch.bool)
-    bad[:, 4] = False  # only ONE std dim off → not all-or-none
-    with pytest.raises(ValueError, match="all-or-none"):
-        present_masked_nll(mu, cov, x, bad)
+# NOTE: the former test_present_masked_rejects_noncprefix_present is gone — present_masked_nll
+# no longer validates the present layout per step (those two bool(...all()) checks were host
+# syncs inside the compiled forward). The layout is guaranteed by dim_presence's construction
+# and pinned in test_state_target.test_dim_presence_layout_wellformed instead.

@@ -216,16 +216,13 @@ def present_masked_nll(
     with the mean/std split at 3 (the locked r4 state layout)."""
     D = x.shape[-1]
     n_mean = D // 2
-    # fail loud on a non-conforming present mask (a wiring bug, not a data condition):
-    # mean dims [0:n_mean] always on; std dims [n_mean:] all-or-none.
-    mean_on = present[..., :n_mean].all(-1)
-    std_block = present[..., n_mean:]
-    std_all = std_block.all(-1)
-    std_none = (~std_block).all(-1)
-    if not bool(mean_on.all()):
-        raise ValueError("present: the mean dims must always be present")
-    if not bool((std_all | std_none).all()):
-        raise ValueError("present: the std dims must be present all-or-none per position")
+    # ``present`` comes from state_target.dim_presence, which CONSTRUCTS exactly the two legal
+    # patterns — mean dims always on, std dims all-or-none per position — so the layout is
+    # well-formed BY CONSTRUCTION (pinned by test_dim_presence_layout_wellformed). We trust it
+    # here and do NOT re-validate per step: the old ``bool(mean_on.all())`` /
+    # ``bool((std_all|std_none).all())`` guards were two host syncs (graph breaks) inside the
+    # compiled forward over a session-invariant structure.
+    std_all = present[..., n_mean:].all(-1)  # (...,) select 6-D vs 3-D-mean marginal per pos
     full = _nll_terms(mu, cov, x)  # (...,) 6-D
     mean_marg = _nll_terms(mu[..., :n_mean], cov[..., :n_mean, :n_mean], x[..., :n_mean])
     per_pos = torch.where(std_all, full, mean_marg)  # (...,)
