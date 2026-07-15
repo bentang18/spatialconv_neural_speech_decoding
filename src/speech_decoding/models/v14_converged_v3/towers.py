@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
+
+if TYPE_CHECKING:
+    from speech_decoding.models.v14_converged_v3.pack_r4 import R4Grid, VisiblePack
 
 from speech_decoding.models.v14_converged_v3.attention import LN_EPS, L1Block, L2Block
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
@@ -36,8 +40,14 @@ from speech_decoding.models.v14_converged_v3.pe import (
     init_transformer_weights,
 )
 
-ENC_LAYOUT: tuple[str, ...] = ("L1",) * 3 + ("L2", "L1", "L1") * 3
-PRED_LAYOUT: tuple[str, ...] = ("L2", "L1", "L1") * 4
+# Design B (Ben-locked 2026-07-15, contract project-r4-contract-2026-07-15 §3): the encoder
+# is 12 IDENTICAL L1 blocks, NO L2 — montage-invariant by construction (M9 "depth/L2 earns
+# nothing" on the leaky task; r=−0.763 electrode-count leak ⇒ L1-only kills the cross-shaft
+# nuisance). Deep-sup taps {3,6,9,12} unchanged. The old 9-L1:3-L2 layout is retired (its
+# cross-sensor mixing moves to the write-only perceiver, M10). L2Block stays a valid unit
+# (tested in isolation) but is no longer wired into either tower.
+ENC_LAYOUT: tuple[str, ...] = ("L1",) * 12
+PRED_LAYOUT: tuple[str, ...] = ("L1",) * 6  # Design B (Ben 2026-07-15): L1-only, 6 layers; class W dropped ⇒ no cross-shaft predictor
 
 ENC_D_MODEL, ENC_N_HEADS = 256, 4  # head_dim 64
 PRED_D_MODEL, PRED_N_HEADS = 128, 4  # head_dim 32
@@ -201,6 +211,109 @@ class V3Tower(nn.Module):
             if self.deep_sup and (i + 1) in self.sup_taps:
                 levels.append(self.norms_block[self.sup_taps.index(i + 1)](x))
         out = torch.cat(levels, dim=-1) if self.deep_sup else self.norm_out(x)
+        if tap_blocks:
+            return out, taps
+        return out
+
+
+    # ── flat per-band (r4) path — the Design-B PRODUCTION forward ────────────
+    # Consumes a FLAT, shaft-contiguous token set (pack_r4.R4Grid) — the full teacher
+    # grid OR a visible-subset grid — with NO (B,P,T) rectangle: r4 tokens are ragged
+    # per (contact, band). Adds parcel identity ONCE (per token via grid.contact →
+    # parcel_packed), runs the L1-only stack through L1Block.forward_flat sharing ONE
+    # rope table (built from grid.depth/time_pos), and emits the deep-sup concat (enc)
+    # or norm_out (pred). The single-clip grid is lifted to the batch here: clip b's
+    # shaft blocks are the grid's cu_seqlens offset by b·total, and the rope table is
+    # tiled B× (same per-token coords every clip) — clip-major throughout, so the flat
+    # kernel's block-diagonal is per (clip, shaft) by construction.
+    def forward_flat(
+        self,
+        x_flat: Tensor,
+        grid: "R4Grid",
+        parcel_packed: Tensor,
+        *,
+        tap_blocks: tuple[int, ...] = (),
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        """FULL-grid flat forward (teacher / predictor). ``grid`` coords are clip-INDEPENDENT
+        (``(total,)``), tiled to every clip; ``parcel_packed`` (total,). See :meth:`_run_flat`."""
+        B, M, _ = x_flat.shape
+        if M != grid.total:
+            raise ValueError(f"x_flat has {M} tokens, grid.total={grid.total}")
+        depth_bm = grid.depth[None, :].expand(B, M)
+        time_bm = grid.time_pos[None, :].expand(B, M)
+        parcel_bm = parcel_packed[None, :].expand(B, M)
+        return self._run_flat(
+            x_flat, depth_bm, time_bm, parcel_bm, grid.cu_seqlens, grid.max_seqlen, tap_blocks
+        )
+
+    def forward_flat_pack(
+        self, x_flat: Tensor, pack: "VisiblePack", *, tap_blocks: tuple[int, ...] = ()
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        """VISIBLE-subset flat forward (online encoder). ``pack`` coords are PER-CLIP
+        (``(B, M_vis)`` — different tokens survive per clip) but ``cu_seqlens`` is
+        clip-shared (per-shaft visible count is a per-session constant). See :meth:`_run_flat`."""
+        B, M, _ = x_flat.shape
+        if M != pack.m_vis:
+            raise ValueError(f"x_flat has {M} tokens, pack.m_vis={pack.m_vis}")
+        return self._run_flat(
+            x_flat, pack.depth, pack.time_pos, pack.parcel, pack.cu_seqlens, pack.max_seqlen, tap_blocks
+        )
+
+    # Shared flat driver for both entry points. Consumes PER-CLIP coords (B, M) so the
+    # online encoder (per-clip visible pack) and teacher/predictor (tiled full grid) run the
+    # SAME code. Lifts the single clip to the batch: clip b's shaft blocks are cu_static
+    # offset by b·M, and the L1 rope table is built over the flattened (B·M) coords — so the
+    # flat kernel's block-diagonal is per (clip, shaft) by construction.
+    def _run_flat(
+        self,
+        x_flat: Tensor,
+        depth_bm: Tensor,
+        time_bm: Tensor,
+        parcel_bm: Tensor,
+        cu_static: Tensor,
+        max_seqlen: int,
+        tap_blocks: tuple[int, ...],
+    ) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+        B, M, d = x_flat.shape
+        device = x_flat.device
+        x_flat = x_flat + self.parcel_embed(parcel_bm).to(x_flat.dtype)  # (B, M, d)
+
+        # batch the single-clip block bounds: clip b offset by b·M; drop zero-length shafts.
+        offsets = torch.arange(B, device=device, dtype=torch.int64) * M  # (B,)
+        cu_b = torch.cat([
+            (cu_static[:-1].to(torch.int64)[None, :] + offsets[:, None]).reshape(-1),
+            torch.tensor([B * M], dtype=torch.int64, device=device),
+        ])  # (B·S + 1,)
+        keep = torch.ones_like(cu_b, dtype=torch.bool)
+        keep[1:] = cu_b[1:] != cu_b[:-1]
+        cu_drop_b = cu_b[keep]  # zero-length shafts removed (njt), incl any boundary coincidence
+        cu_b = cu_b.to(cu_static.dtype)
+
+        depth_b = depth_bm.reshape(B * M)
+        time_b = time_bm.reshape(B * M)
+        # shared L1 rope table: build once over the flattened per-clip coords, reused by every block.
+        first_l1 = next((blk for blk in self.blocks if isinstance(blk, L1Block)), None)
+        rope_cs = None
+        if first_l1 is not None:
+            cos, sin = first_l1.rope.cos_sin(depth_b, time_b)  # (B·M, head_dim)
+            rope_cs = (cos, sin)
+
+        xf = x_flat.reshape(B * M, d)
+        taps: dict[int, Tensor] = {}
+        levels: list[Tensor] = []
+        for i, blk in enumerate(self.blocks):
+            # r4 is L1-only (Design B); an L2 in the layout has no flat path (guard).
+            if not isinstance(blk, L1Block):
+                raise TypeError("forward_flat is L1-only (Design B); found a non-L1 block")
+            xf = blk.forward_flat(
+                xf, depth_b, time_b, cu_b, cu_drop_b, max_seqlen, rope_cs=rope_cs,
+            )
+            if (i + 1) in tap_blocks:
+                taps[i + 1] = xf.reshape(B, M, d)
+            if self.deep_sup and (i + 1) in self.sup_taps:
+                levels.append(self.norms_block[self.sup_taps.index(i + 1)](xf))
+        out = torch.cat(levels, dim=-1) if self.deep_sup else self.norm_out(xf)
+        out = out.reshape(B, M, out.shape[-1])
         if tap_blocks:
             return out, taps
         return out

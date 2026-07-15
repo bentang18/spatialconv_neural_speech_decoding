@@ -1,69 +1,50 @@
-"""v14_converged_v3 — dual-axis (space × time) block masking (Phase 5, rewritten).
+"""v14_converged_v3 — unified space × time block masking (Phase 5, r4 global rewrite).
 
-Masking-axis inversion (Ben 2026-07-12): the old scheme masked whole CONTACTS
-(tube along TIME). The new scheme masks on BOTH axes independently, per sensor:
+ONE primitive, per-band budgets (Ben-locked 2026-07-15, contract project-r4-contract §2).
+Everything is "union of contiguous ``_cover_rank`` blocks on a lattice, snapped to an exact
+per-unit count" — the same call serves both axes; only the lattice and snap-policy differ.
 
-  SPACE (which contacts, across all time) — the montage / cross-sensor task:
-    • WHOLE-SHAFT tier: a STOCHASTIC number of shafts (``K ~ Binomial(S,
-      whole_shaft_frac)`` clamped to the montage feasibility ceiling ``K_max``)
-      masked 100% — reconstructable only cross-sensor. Kept a PURE removal (the
-      ~0.30 along-shaft common mode would leak through one survivor).
-    • INTRA tier: every other shaft masked with contiguous width-``w_s`` depth-blocks
-      (floor 4 = along-shaft HGA autocorr length), random starts, OVERLAPS ALLOWED
-      (union of blocks → varied run/gap structure = regularization, data2vec-2.0
-      philosophy). Snap to EXACTLY ``D = round(space_frac·N)`` masked contacts via
-      one global priority argsort — whole-shaft contacts held (never trimmed, stay a
-      true 100% montage target), intra contacts filled/trimmed by cover-rank.
-      NO keep-alive floor: because the whole-shaft count is now stochastic, a shaft
-      that saturates to 100% via the intra tier is simply another whole drop, a legal
-      outcome — the ≥1-visible rule only existed to protect a PINNED whole count.
+  SPACE (which contacts, all bands, all time) — the within-shaft prediction task.
+    PER-SHAFT BALANCED (Ben 2026-07-15: a global top-D let one shaft starve another —
+    measured std 0.18, min 0.00, occasional 0/N shafts). Each shaft masks EXACTLY
+    ``d_s = round(space_frac·n_s)`` of its OWN contacts via contiguous width-``block_w_space``
+    depth-blocks (``_cover_rank`` within shaft, random starts, overlaps allowed). Balanced by
+    construction; keep-alive is automatic (``d_s ≤ n_s−1`` leaves ≥1 visible/shaft — no argmax
+    hack). WHOLE-SHAFT tier (class W): a stochastic K ~ Binomial(S, whole_shaft_frac) clamped to
+    K_max sets d_s=n_s (full). DROPPED in Design B (frac=0); machinery kept (dead at 0). Static
+    count (Σ d_s) holds for Design B (whole=0); with whole>0 the per-row total varies (legacy).
 
-  TIME (which frames, per surviving shaft) — the temporal-prediction task:
-    • Contiguous width-``w_t`` time-blocks (floor 4 = 125 ms @ 32 Hz; a masked frame is
-      fully hidden only ≥ support frames from any visible frame, and HGA's support is
-      2 slots — nperseg 128 @ hop 64. The old floor of 7 cited "HGA |STFT| support" but
-      that is 2, not 7; see V3MaskConfig.block_w_time), random
-      starts, overlaps allowed. Snap PER SHAFT to EXACTLY ``T_mask = round(time_frac·T)``
-      masked frames (constant ``T_kept`` ⇒ the buffer stays static). Independent per
-      (row, shaft) ⇒ HETEROGENEOUS inter-sensor timing (at any t some sensors visible,
-      some masked) — the L2 / montage pressure the homogeneous-intra outer product
-      otherwise loses.
-    • NO GUARDIAN (M14, 2026-07-15 — the "at-least-one-sensor-lives" rule is DELETED).
-      It forbade one randomly-chosen live shaft per t from masking that frame, so that
-      every t kept ≥1 visible sensor. M14 measured what it actually did, and it was
-      WORSE THAN DEAD WEIGHT: because the forbidden frames are scattered through every
-      shaft's candidate set, they SHRED the time blocks. Realized run length, target vs
-      realized: w=4 → 4.32, w=8 → 5.83, w=12 → 6.63. It SATURATES the realized run at
-      ~6 no matter how wide a block you ask for — i.e. it would have silently prevented
-      any wide block from ever burying a cell deep enough to beat the STFT window
-      overlap, which is the ENTIRE POINT of the block width. It re-creates the very leak
-      the width exists to kill. Guardian OFF: w=12 → 11.65, as designed.
-      What it bought: a same-t spatial path for 0.03% of masked cells (dead-frame rate
-      0.000488 over 13 montages ≈ 0.5^V at V≈11 live shafts — the sampler and the
-      arithmetic agree to 3 figures). Those cells are not "unpredictable": a masked cell
-      at a dead frame still has its OWN shaft's other frames and every other shaft's
-      other frames. It has no SAME-t neighbour, which is a much weaker deprivation than
-      the rule's name suggests.
-      STATIC-SAFE, and that is provable rather than hoped: the guardian only pushed
-      frames to the back of the cover-rank sort, BEFORE the snap
-      ``frame_mask = time_rank < t_mask``. Exactly ``T_mask`` frames are masked per
-      (row, shaft) with it or without it, so ``T_kept``, ``D``, the online token count
-      ``(N-D)·T_kept`` and the loss denominator are all unchanged. Deleting it also
-      deletes the ``V ≥ 2`` feasibility constraint, so the sampler gets strictly more
-      robust on degenerate montages.
+  TIME (which frames, GLOBAL across shafts) — the temporal-prediction task.
+    The old per-shaft-INDEPENDENT time mask existed only to pressure the deleted encoder L2, so the
+    time mask is GLOBAL (same band-b frames hidden for every shaft). ONE unified rule (Ben-locked
+    2026-07-15, replacing the blackout mechanism): **each band is masked INDEPENDENTLY, in contiguous
+    blocks of ``block_w_band`` (=4) of its OWN tokens, snapped to ~``*_mask_frac``.** Same rule, three
+    grids — HGA 4×31 ms, MID 4×62 ms, SLOW 4×250 ms blocks. 4 own-tokens is the leak-safe minimum
+    (M14 overlap-factor-2 on each band's decimated grid ⇒ the 2 interior tokens of a width-4 block
+    have no visible same-band neighbor sharing samples; the objective's margin-gate scores those).
 
-Compose (in the objective) as a per-sensor OUTER PRODUCT: cell (contact c of shaft s,
-frame t) is VISIBLE iff contact c is spatially kept AND frame t is kept for shaft s.
-Visible cells per surviving shaft form a clean ``C_kept × T_kept`` rectangle ⇒ the
-online encoder's varlen blocks stay rectangular, njt-fast, and STATIC:
+      • HGA (32 Hz, T tokens): blocks ≈125 ms, snapped to ``hga_mask_frac``.
+      • MID (16 Hz, T/2 tokens): blocks ≈250 ms, snapped to ``mid_mask_frac``.
+      • SLOW (4 Hz, T/8 tokens): blocks ≈1 s, snapped to ``slow_mask_frac``. SLOW is NOW a first-class
+        masked band (symmetric with the others), no longer a mere blackout input-drop.
 
-  • space snapped to exactly D  ⇒ N−D visible contacts (constant P for the encoder).
-  • time snapped to exactly T_mask per shaft ⇒ T_kept visible frames per shaft (constant).
-  • ⇒ online tokens = (N−D)·T_kept and loss denominator = N·T − (N−D)·T_kept are
-    per-session CONSTANTS (compile once). Only WHICH cells are masked varies per step.
+    WHY no blackout: (a) SLOW is on the loss now (uniform margin-gated rule), so it needs no special
+    input-drop; (b) independent ~50% masking of all three bands makes a slot land all-three-masked
+    ~12% of the time — those emergent empty windows ARE the perceiver's temporal-prediction pressure,
+    handled by the soft-global (RoPE-localized, NOT hard-windowed) Stage-1 cross-attention, no
+    special-casing. Per-band decode already gives per-band temporal masking its weight.
 
-FULLY VECTORIZED (cover-rank + argsort, no python loop over shafts/blocks/rows),
-over R independent rows (one per clip in the batch).
+    Per-band masked counts are per-session CONSTANTS ⇒ compiled shapes fixed:
+      HGA = round(hga_mask_frac·T),  MID = round(mid_mask_frac·T/2),  SLOW = round(slow_mask_frac·T/8).
+      Bands are masked INDEPENDENTLY; empty-window slots emerge stochastically (shapes stay static
+      because each band's own count is fixed).
+
+Compose (in the objective) as an OUTER PRODUCT: a (contact c, band b, token t_b) is VISIBLE iff
+contact c is spatially kept AND band-b token t_b is not temporally masked. Global time mask ⇒
+every surviving shaft sees the SAME visible rectangle per band ⇒ online varlen blocks stay
+rectangular and STATIC. time_pos = RoPE (contract §2, LOCKED).
+
+FULLY VECTORIZED (cover-rank + argsort, no python loop over shafts/blocks/rows).
 """
 
 from __future__ import annotations
@@ -75,66 +56,62 @@ from torch import Tensor
 
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 
+# Band lattice strides on the shared 32 Hz clock — MUST match stem.PER_BAND_SPECS
+# ((7,8),(6,2),(7,1)) = SLOW 8, MID 2, HGA 1. The latent-slot grid == the SLOW grid.
+SLOW_STRIDE = 8
+MID_STRIDE = 2
+
 
 @dataclass(frozen=True)
 class V3MaskConfig:
-    space_frac: float = 0.60  # D = round(space_frac·N) contacts masked (whole + intra)
-    time_frac: float = 0.5  # T_mask = round(time_frac·T) frames masked per shaft
-    whole_shaft_frac: float = 0.10  # E[K]; K ~ Binomial(S, frac) clamped to K_max
-    # ⚠️ NOT JUSTIFIED BY ANY MEASUREMENT. The comment this replaces claimed "floor 4 = HGA
-    # along-shaft autocorr", which is FALSE: M2 measured HGA depth-lag ACF at 0.34 / 0.21 /
-    # 0.18 for lags 1/2/3 — gone by lag 2, not 4. M14 then measured the lever directly and it
-    # is WEAK: own-shaft copy-ability of a masked contact is 0.237 / 0.192 / 0.134 at
-    # w_s = 1 / 4 / 8 (HGA, 13 montages). So 4 is neither right nor wrong; it is INERTIA.
-    # It is also the wrong QUESTION: a temporal leak is a TRANSFORM ARTIFACT (the visible
-    # STFT window literally contains the masked samples — copying it teaches nothing, and it
-    # must be defeated), whereas a spatial correlation is PHYSICS (a neighbouring contact
-    # genuinely sees a correlated population — predicting it IS the cross-sensor task). Do
-    # not "widen w_s to kill the leak"; there is no spatial leak to kill.
-    block_w_space: int = 4  # depth-block width (contacts). See above: inertia, not evidence.
-    # B6 (Ben, 2026-07-15): 7 -> 4. The old comment claimed "floor 7 = HGA |STFT| support",
-    # which is wrong: at the SHARED hop=64 grid HGA (nperseg 128) has support 2 slots, not 7.
-    # M14 (2026-07-15) then found the real mechanism: the leak is STFT WINDOW OVERLAP, and the
-    # overlap factor is nperseg/hop = 16 (SLOW) / 4 (MID) / 2 (HGA) on the shared 32 Hz grid.
-    # Under the PER-BAND token rates (HGA 32 Hz, MID 16 Hz, SLOW 4 Hz) every band's token hop
-    # is nperseg/2, so the overlap factor is EXACTLY 2 for all three, and a width-4 block puts
-    # its deepest cells at margin 2 = zero sample overlap. That is why 4 is right, in every
-    # band's OWN grid. Realized geometry (M14, guardian OFF): w=4 -> run 5.57.
-    block_w_time: int = 4  # time-block width, in each band's OWN grid; deepest cell at margin 2
+    space_frac: float = 0.50  # each shaft masks d_s = round(space_frac·n_s) of its OWN contacts.
+    whole_shaft_frac: float = 0.0  # E[K]; K ~ Binomial(S, frac) clamped to K_max. Design B: 0.
+    keep_alive: bool = True  # Design B: reserve ≥1 visible contact per non-whole shaft (d_s≤n_s−1).
+    block_w_space: int = 4  # depth-block width (contacts).
+    # ── TIME (global; each band masked INDEPENDENTLY on its OWN grid, ONE unified rule) ──
+    hga_mask_frac: float = 0.50  # HGA masked on its 32 Hz grid (Ben: 50%).
+    mid_mask_frac: float = 0.50  # MID masked on its 16 Hz grid (Ben: 50% for symmetry).
+    slow_mask_frac: float = 0.50  # SLOW masked on its 4 Hz grid (Ben 2026-07-15: 50%, first-class band).
+    block_w_band: int = 4  # leak-safe block width in a band's OWN tokens (M14 margin 2); same all 3.
 
 
 @dataclass(frozen=True)
 class V3Masks:
-    """One batch of sampled masks (R rows). All counts are per-row/per-shaft EXACT."""
+    """One batch of sampled masks (R rows). Per-band counts are per-row EXACT constants.
 
-    contact_mask: Tensor  # (R, N) bool — True = spatially masked contact. Exactly D/row.
-    frame_mask: Tensor  # (R, S, T) bool — True = temporally masked frame. Exactly T_mask/(row,shaft).
-    whole_contact: Tensor  # (R, N) bool — True where the contact's shaft was wholly dropped (⊆ contact_mask).
+    Time masks are GLOBAL across shafts (no S axis): the same band-b frames are hidden for every
+    surviving contact. All three band masks are INDEPENDENT and symmetric — ``slow_mask`` is SLOW's
+    own 4 Hz temporal mask (SLOW token k == latent slot k), NOT a blackout indicator. A latent slot
+    is empty exactly where all three band masks cover it — an emergent (not engineered) event."""
+
+    contact_mask: Tensor  # (R, N) bool — spatially masked contact.
+    whole_contact: Tensor  # (R, N) bool — contact whose shaft was wholly dropped (⊆ contact_mask).
+    hga_mask: Tensor  # (R, T_hga) bool — HGA masked on its 32 Hz grid. Exactly round(hga_frac·T).
+    mid_mask: Tensor  # (R, T_mid) bool — MID masked on its 16 Hz grid. Exactly round(mid_frac·T/2).
+    slow_mask: Tensor  # (R, T_slow) bool — SLOW masked on its 4 Hz grid. Exactly round(slow_frac·T/8).
 
 
 def _k_max(cs: Tensor, d: int) -> Tensor:
-    """Largest number of shafts whose total contacts ≤ D (whole-shaft feasibility
-    ceiling). Any K ≤ K_max RANDOM shafts sum ≤ the K largest ≤ K_max largest ≤ D, so
-    clamping the stochastic whole count to K_max keeps whole-contacts ≤ D for EVERY
-    draw ⇒ the snap never has to trim a whole shaft (which would leak the common mode).
-
-    Returns a 0-dim tensor (NO host sync) so ``sample_masks`` can call it inside the
-    compiled forward and feed it straight to ``.clamp(max=…)``; the setup-time
-    feasibility check wraps it in ``int()`` where a Python scalar is wanted."""
+    """Largest number of shafts whose total contacts ≤ D (whole-shaft feasibility ceiling)."""
     sizes = torch.sort(cs, descending=True).values
     csum = torch.cumsum(sizes, 0)
     return (csum <= d).sum()
 
 
 def assert_mask_feasible(geom: L1Geometry, cfg: V3MaskConfig = V3MaskConfig()) -> None:
-    """Fail LOUD at session setup on a degenerate (montage, cfg). Reads scalar counts,
-    so call ONCE at setup — never inside the compiled forward (graph-break)."""
+    """Fail LOUD at session setup on a degenerate (montage, cfg). Setup-time only (host sync)."""
     valid = geom.valid  # (S, C) bool
     n = int(valid.sum().item())
-    d = round(cfg.space_frac * n)
-    if not (0 < d < n):
-        raise ValueError(f"space_frac={cfg.space_frac} ⇒ D={d} not in (0, N={n})")
     cs = valid.sum(1)  # (S,) contacts per shaft
+    d_s = torch.round(cfg.space_frac * cs.float()).long()
+    if cfg.keep_alive:
+        d_s = torch.minimum(d_s, (cs - 1).clamp(min=0))
+    if int(d_s.sum()) == 0 or int(d_s.sum()) >= n:
+        raise ValueError(
+            f"space_frac={cfg.space_frac} keep_alive={cfg.keep_alive} ⇒ Σd_s={int(d_s.sum())} "
+            f"not in (0, N={n}); every shaft size ≤1 leaves nothing to mask under keep-alive?"
+        )
+    d = int(d_s.sum())
     if int(_k_max(cs, d)) < 1 and cfg.whole_shaft_frac > 0:
         raise ValueError(
             f"whole-shaft infeasible: no shaft fits under D={d} (largest shaft "
@@ -142,16 +119,35 @@ def assert_mask_feasible(geom: L1Geometry, cfg: V3MaskConfig = V3MaskConfig()) -
         )
 
 
+def assert_time_feasible(n_time: int, cfg: V3MaskConfig = V3MaskConfig()) -> None:
+    """Fail LOUD if the time config is degenerate for this clip length. Setup-time only."""
+    if n_time % SLOW_STRIDE != 0:
+        raise ValueError(f"n_time={n_time} not a multiple of SLOW_STRIDE={SLOW_STRIDE}")
+    if n_time % MID_STRIDE != 0:
+        raise ValueError(f"n_time={n_time} not a multiple of MID_STRIDE={MID_STRIDE}")
+    grids = {
+        "HGA": (n_time, cfg.hga_mask_frac),
+        "MID": (n_time // MID_STRIDE, cfg.mid_mask_frac),
+        "SLOW": (n_time // SLOW_STRIDE, cfg.slow_mask_frac),
+    }
+    for name, (length, frac) in grids.items():
+        cnt = round(frac * length)
+        if not (0 <= cnt <= length):
+            raise ValueError(f"{name}: round({frac}·{length})={cnt} not in [0,{length}]")
+        if cnt > 0 and cfg.block_w_band > length:
+            raise ValueError(
+                f"{name} grid length {length} < block_w_band={cfg.block_w_band}: clip too short "
+                f"for a leak-safe {name} block (need n_time ≥ {cfg.block_w_band}·stride)"
+            )
+
+
 def _cover_rank(valid: Tensor, width: int, n_rows: int, generator: torch.Generator) -> Tensor:
-    """Contiguous-block cover-rank over ``(U, L)`` units (shafts) of length L.
+    """Contiguous-block cover-rank over ``(U, L)`` units of length L.
 
     Per (row, unit): scatter width-``width`` blocks at random start ranks (starts from
-    ``-(width-1)`` so the shallow/early edge is coverable — else it under-masks),
-    OVERLAPS ALLOWED. ``cover_rank[i]`` = the min block start-rank among all spans
-    covering position i (lower ⇒ covered by an earlier-placed block). Returns
-    ``(R, U, L)`` float, ``inf`` on invalid positions. The caller takes the lowest-rank
-    positions per unit (space: globally to D; time: per shaft to T_mask) — the union of
-    the lowest-ranked overlapping blocks, contiguous by construction."""
+    ``-(width-1)`` so the early edge is coverable), OVERLAPS ALLOWED. ``cover_rank[i]`` = the min
+    block start-rank among all spans covering position i. Returns ``(R, U, L)`` float, ``inf`` on
+    invalid positions. Callers take the lowest-rank positions per unit (contiguous by construction)."""
     dev = valid.device
     u, length = valid.shape
     p = width - 1
@@ -178,55 +174,65 @@ def sample_masks(
     generator: torch.Generator,
     cfg: V3MaskConfig = V3MaskConfig(),
 ) -> V3Masks:
-    """Sample ``n_rows`` independent dual-axis masks (see module docstring)."""
+    """Sample ``n_rows`` independent unified space × time masks (see module docstring)."""
     r, s, c = n_rows, geom.n_shafts, geom.max_c
     n, t = n_contacts, n_time
     valid = geom.valid  # (S, C)
     dev = valid.device
     cs = valid.sum(1)  # (S,)
-    d = round(cfg.space_frac * n)
-    t_mask = round(cfg.time_frac * t)
-    k_max = _k_max(cs, d)
 
     def rand(*shape: int) -> Tensor:
         return torch.rand(*shape, generator=generator, device=dev)
 
-    # ── SPACE ────────────────────────────────────────────────────────────────
-    # whole-shaft tier: stochastic count K ~ Binomial(S, frac) clamped to K_max, then
-    # K random shafts. clamp keeps whole-contacts ≤ D for every draw (see _k_max).
+    # ── SPACE (per-shaft balanced) ─────────────────────────────────────────────
+    d_s_base = torch.round(cfg.space_frac * cs.float()).long()  # (S,) per-shaft target
+    if cfg.keep_alive:
+        d_s_base = torch.minimum(d_s_base, (cs - 1).clamp(min=0))  # reserve ≥1 visible/shaft
+    d = int(d_s_base.sum())
+    k_max = _k_max(cs, d)
+    # whole-shaft tier (legacy; frac=0 in Design B): whole shafts mask ALL n_s.
     k = (rand(r, s) < cfg.whole_shaft_frac).sum(1).clamp(max=k_max)  # (R,)
     ws_rank = rand(r, s).argsort(1).argsort(1)  # (R, S) random 0-based shaft rank
     whole = ws_rank < k[:, None]  # (R, S) bool
+    d_s = torch.where(whole, cs[None].expand(r, s), d_s_base[None].expand(r, s))  # (R, S)
 
-    cover_space = _cover_rank(valid, cfg.block_w_space, r, generator)  # (R, S, C)
-    valid_g = valid[None].expand(r, s, c)
-    whole_g = whole[:, :, None].expand(r, s, c) & valid_g
-    nonwhole_g = valid_g & ~whole_g
-    # priority: whole [0,1) (always taken) < non-whole [1, 2+n_start) by cover-rank
-    # (lowest-rank = block cells first) with a random tiebreak that round-robins across
-    # shafts, so no single shaft is exhausted before the others contribute a block.
-    r0 = rand(r, s, c)
-    pri = torch.full((r, s, c), float("inf"), device=dev)
-    pri = torch.where(whole_g, r0, pri)  # [0, 1)
-    pri = torch.where(nonwhole_g, 1.0 + cover_space + r0, pri)  # [1, 2+n_start)
-    sel_idx = pri.reshape(r, s * c).argsort(1)[:, :d]  # (R, D) grid cells, all finite/valid
-    gidx_flat = geom.gather_idx.reshape(-1)  # (S*C,) → contact index in N
-    target = gidx_flat[sel_idx]  # (R, D) distinct contact indices per row
+    cover_space = _cover_rank(valid, cfg.block_w_space, r, generator)  # (R, S, C) inf on invalid
+    key = cover_space + rand(r, s, c)  # block-rank + random tiebreak; inf on invalid → sorts last
+    within_rank = key.argsort(-1).argsort(-1)  # (R, S, C) 0-based rank within shaft
+    grid_mask = within_rank < d_s[:, :, None]  # (R, S, C) exactly d_s per (row, shaft); valid-only
+
+    # map (S,C) grid → (N,) contacts. valid cells carry a distinct contact index in gather_idx.
+    vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,) valid grid positions
+    vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,) permutation of 0..N−1
     contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
-    contact_mask.scatter_(1, target, True)
+    contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
+    whole_contact = torch.zeros(r, n, dtype=torch.bool, device=dev)
+    whole_g = whole[:, :, None].expand(r, s, c) & valid[None].expand(r, s, c)
+    whole_contact[:, vcontact] = whole_g.reshape(r, -1)[:, vpos]
 
-    # ── TIME (per shaft, snap to exactly T_mask) ──────────────────────────────
-    # NO GUARDIAN (M14, 2026-07-15). Every frame is a candidate on every shaft; blocks
-    # are placed by cover-rank and the lowest-ranked T_mask frames win. The deleted
-    # guardian used to force one live shaft per t to the back of this sort, which capped
-    # the realized run at ~6 however wide the block — see the module docstring. Blank
-    # frames (no shaft visible at t) are now possible at ~0.05% of frames and that is
-    # ACCEPTED: such a cell still has its own shaft's other frames and every other
-    # shaft's other frames; it lacks only a SAME-t neighbour.
-    valid_time = torch.ones(s, t, dtype=torch.bool, device=dev)  # every frame valid
-    cover_time = _cover_rank(valid_time, cfg.block_w_time, r, generator)  # (R, S, T)
-    time_rank = cover_time.argsort(-1).argsort(-1)  # (R, S, T) 0-based
-    frame_mask = time_rank < t_mask  # (R, S, T) exactly T_mask True per (row, shaft)
+    # ── TIME (global; each band masked INDEPENDENTLY on its own leak-safe grid) ─
+    if t % SLOW_STRIDE != 0:
+        raise ValueError(f"n_time={t} not a multiple of SLOW_STRIDE={SLOW_STRIDE}")
+    if t % MID_STRIDE != 0:
+        raise ValueError(f"n_time={t} not a multiple of MID_STRIDE={MID_STRIDE}")
+    t_mid = t // MID_STRIDE
+    n_slots = t // SLOW_STRIDE
 
-    whole_contact = whole[:, geom.shaft_of_contact] & contact_mask  # (R, N)
-    return V3Masks(contact_mask=contact_mask, frame_mask=frame_mask, whole_contact=whole_contact)
+    def _band_mask(length: int, frac: float) -> Tensor:
+        """~frac of a band's own grid, in contiguous width-block_w_band blocks (leak-safe)."""
+        ones = torch.ones(1, length, dtype=torch.bool, device=dev)
+        cover = _cover_rank(ones, cfg.block_w_band, r, generator).squeeze(1)  # (R, length)
+        cnt = round(frac * length)
+        return cover.argsort(-1).argsort(-1) < cnt  # (R, length) exactly cnt masked
+
+    hga_mask = _band_mask(t, cfg.hga_mask_frac)  # (R, T)   exactly round(hga_frac·T)
+    mid_mask = _band_mask(t_mid, cfg.mid_mask_frac)  # (R, T/2) exactly round(mid_frac·T/2)
+    slow_mask = _band_mask(n_slots, cfg.slow_mask_frac)  # (R, T/8) exactly round(slow_frac·T/8)
+
+    return V3Masks(
+        contact_mask=contact_mask,
+        whole_contact=whole_contact,
+        hga_mask=hga_mask,
+        mid_mask=mid_mask,
+        slow_mask=slow_mask,
+    )

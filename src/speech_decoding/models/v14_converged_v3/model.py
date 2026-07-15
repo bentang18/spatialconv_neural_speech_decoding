@@ -71,28 +71,27 @@ class V3ConvergedModel(nn.Module):
         *,
         generator: torch.Generator,
         collect_taps: bool = False,
-        backend: str = "auto",
-        lambda_context: float | Tensor = 0.0,
+        stat_mean: Tensor | None = None,
+        stat_std: Tensor | None = None,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
         T = band_inputs[0].shape[-1]
-        # masking is the sole augmentation (dual-axis space×time). The whole-sensor tier
-        # tag is only needed for the monitor tap split (collect_taps).
+        # masking is the sole augmentation: per-shaft-balanced spatial contact drop + per-band
+        # (SLOW/MID/HGA) independent temporal blocks (masking.V3Masks). The flat r4 objective
+        # derives the visible/scored token sets from these directly (pack_r4.token_flags).
         masks = sample_masks(
             geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
         )
-        whole_contact = masks.whole_contact if collect_taps else None
-        # D = round(space_frac·N) contacts and T_mask = round(time_frac·T) frames/shaft
-        # are the EXACT per-row held-out counts the masking snaps to (masking.py). Passing
-        # the derived visible constants (not mask.sum()) keeps the packed objective
-        # host-sync-free and fixes the compacted (m_vis, t_kept) shapes for the pack plan.
-        m_vis = N - round(self.mask_cfg.space_frac * N)
-        t_kept = T - round(self.mask_cfg.time_frac * T)
+        # stat_mean/stat_std (per-session frozen state-norm stats) turn ON the secondary
+        # Gaussian-NLL; absent ⇒ JEPA-only. They flow in per-session like geom/parcel_id.
         return self.objective(
-            band_inputs, geom, parcel_id, masks.contact_mask, masks.frame_mask,
-            m_vis=m_vis, t_kept=t_kept, backend=backend,
-            collect_taps=collect_taps, whole_contact=whole_contact,
-            lambda_context=lambda_context,
+            band_inputs,
+            geom,
+            parcel_id,
+            masks,
+            collect_taps=collect_taps,
+            stat_mean=stat_mean,
+            stat_std=stat_std,
         )
 
     @torch.no_grad()

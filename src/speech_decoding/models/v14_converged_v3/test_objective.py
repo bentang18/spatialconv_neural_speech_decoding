@@ -1,22 +1,20 @@
-"""v14_converged_v3 Phase 6 — plain-JEPA objective (TDD, dual-axis).
+"""v14_converged_v3 r4 — plain-JEPA objective STRUCTURAL invariants (TDD).
 
-Memo project-v14-converged-v3-sensor-architecture (v1 = PLAIN JEPA, KISS):
-EMA teacher + 1 predictor + masked-CELL L1 loss ONLY. KEEP target_ln (affine-free
-F.layer_norm on teacher targets). Collapse guard = EMA-teacher asymmetry + predictor
-bottleneck (NOT dense loss). I-JEPA mechanics: the online tower (stem + encoder) sees
-VISIBLE CELLS only (masked cells excluded as keys so targets can't leak); the EMA
-teacher sees the FULL grid → targets at masked cells; the predictor re-inserts a
-learnable mask-query at each masked (contact, frame).
+This file holds the wiring / EMA / target-norm invariants of ``V3JepaObjective`` that
+are INDEPENDENT of the flat-path forward behaviour (which lives in test_objective_r4.py:
+finite loss + grads, teacher stop-grad, leak-safety, margin gate). Kept here:
 
-Dual-axis masking (Ben 2026-07-12): ``contact_mask`` (B,N) drops whole contacts;
-``frame_mask`` (B,S,T) drops frames per shaft. A CELL (c,t) is a target iff its contact
-is masked OR its shaft's frame t is masked. ``m_vis = N−D`` and ``t_kept = T−T_mask``
-are per-session constants the model supplies (the compacted online shapes).
+  • target_ln re-normalizes teacher targets when the affine norms drift;
+  • deep-sup vs single-tap MAP wiring (enc_to_pred / pred_to_target / encoder norms);
+  • ``_ln_target`` per-level DOUBLE norm;
+  • the EMA teacher mirrors the STEM too, and lags-then-moves toward the online tower;
+  • the predictor mask-token stays ≥2-D (upstream weight-decay parity);
+  • the loss is reducible by optimization against a fixed teacher target.
 
-Asserted contracts: scalar finite loss; gradient flows to the online tower + predictor
-but NEVER the EMA teacher; the teacher lags then moves; target_ln applied; no NaN when a
-whole shaft is masked; loss reads only masked cells; loss reducible by optimization; and
-the packed production path reproduces the padded oracle exactly.
+The retired dual-axis PACKED machinery (``_forward_padded`` / ``backend="reference"`` /
+``m_vis``/``t_kept`` / context loss / intra-inter split / whole-shaft ``frame_mask``) is
+GONE (r4 contract project-r4-contract-2026-07-15), so the packed↔padded oracle,
+context-head, and intra/inter tests were deleted with it.
 """
 
 from __future__ import annotations
@@ -24,17 +22,12 @@ from __future__ import annotations
 import torch
 
 from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
-from speech_decoding.models.v14_converged_v3.masking import (
-    V3MaskConfig,
-    V3Masks,
-    sample_masks,
-)
+from speech_decoding.models.v14_converged_v3.masking import sample_masks
 from speech_decoding.models.v14_converged_v3.objective import V3JepaObjective
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 N_PARCELS = 8
-T = 16  # 32 Hz clock; uniform hop=64 → all bands at 32 Hz (T frames each)
-SPACE, TIME = 0.4, 0.4  # feasible on the (4,3,3) montage (largest shaft 4 = D)
+T = 16  # 32 Hz clock; SLOW 2 / MID 8 / HGA 16 tokens per contact.
 
 
 def _session(shaft_sizes=(4, 3, 3)):
@@ -59,73 +52,19 @@ def _bands(n, B=1):
     return [slow, mid, hga]
 
 
-def _masks(sc, geom, *, B=1, seed=0, space=SPACE, time=TIME):
-    """Sample a fixed dual-axis mask + the derived (m_vis, t_kept) constants."""
+def _masks(sc, geom, *, B=1, seed=0):
     n = len(sc.labels)
     g = torch.Generator().manual_seed(seed)
-    cfg = V3MaskConfig(space_frac=space, time_frac=time)
-    m = sample_masks(geom, n, n_time=T, n_rows=B, generator=g, cfg=cfg)
-    return m, n - round(space * n), T - round(time * T)
+    return sample_masks(geom, n, n_time=T, n_rows=B, generator=g)
 
 
-def _whole_shaft_masks(sc, geom, *, shaft=0, time=TIME):
-    """Deterministic masks with one shaft wholly dropped (space) + contiguous per-shaft
-    time blocks (exact T_mask each), for the whole-shaft no-NaN test."""
-    n = len(sc.labels)
-    contact_mask = torch.zeros(1, n, dtype=torch.bool)
-    contact_mask[0, sc.shaft_id == shaft] = True  # whole shaft absent from the encoder
-    d = int(contact_mask[0].sum())
-    t_mask = round(time * T)
-    frame_mask = torch.zeros(1, geom.n_shafts, T, dtype=torch.bool)
-    frame_mask[0, :, :t_mask] = True  # exact T_mask/shaft (homogeneous within shaft)
-    masks = V3Masks(contact_mask=contact_mask, frame_mask=frame_mask,
-                    whole_contact=contact_mask.clone())
-    return masks, n - d, T - t_mask
-
-
-def _fwd(obj, bands, geom, sc, mm, **kw):
-    m, m_vis, t_kept = mm
-    return obj(bands, geom, sc.parcel_id, m.contact_mask, m.frame_mask,
-               m_vis=m_vis, t_kept=t_kept, **kw)
-
-
-def _fwd_padded(obj, bands, geom, sc, mm, **kw):
-    m, _, _ = mm
-    return obj._forward_padded(
-        bands, geom, sc.parcel_id, m.contact_mask, m.frame_mask, **kw
-    )
-
-
-def _cell_masked(m, geom):
-    return m.contact_mask[:, :, None] | m.frame_mask[:, geom.shaft_of_contact, :]
-
-
-def test_forward_returns_scalar_finite_loss() -> None:
-    sc, geom = _session()
-    obj = _obj()
-    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom))
-    assert out.loss.ndim == 0
-    assert torch.isfinite(out.loss)
-    assert out.loss.requires_grad
-
-
-def test_gradient_flows_to_online_not_teacher() -> None:
-    sc, geom = _session()
-    obj = _obj()
-    _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom)).loss.backward()
-    # online tower (stem + encoder) and predictor receive grad
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.stem.parameters())
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.encoder.parameters())
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in obj.predictor.parameters())
-    # the EMA teacher is frozen: no grad ever, on stem OR encoder
-    assert all(p.grad is None for p in obj.teacher.parameters())
-    assert all(not p.requires_grad for p in obj.teacher.parameters())
+def _fwd(obj, bands, geom, sc, masks, **kw):
+    return obj(bands, geom, sc.parcel_id, masks, **kw)
 
 
 def test_teacher_emas_the_stem_too() -> None:
-    # V-JEPA contract: the teacher mirrors the patch-embed (our stem), not just the
+    # V-JEPA contract: the teacher mirrors the patch-embed (our PerBandStem), not just the
     # transformer. The teacher must own a stem that lags then moves on update.
-    sc, geom = _session()
     obj = _obj()
     tea = dict(obj.teacher.model.named_parameters())
     stem_names = [n for n in tea if n.startswith("stem.")]
@@ -143,7 +82,6 @@ def test_teacher_emas_the_stem_too() -> None:
 
 
 def test_teacher_lags_then_moves_toward_online() -> None:
-    sc, geom = _session()
     obj = _obj()
     online = dict(obj.online.named_parameters())
     tea = dict(obj.teacher.model.named_parameters())
@@ -165,16 +103,16 @@ def test_target_ln_is_applied() -> None:
     # deepest-level norm and confirm target_ln then changes the loss.
     sc, geom = _session()
     bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom)
+    masks = _masks(sc, geom)
     torch.manual_seed(0)
     obj = V3JepaObjective(n_parcels=N_PARCELS, target_ln=True)
     with torch.no_grad():
         obj.teacher.model.encoder.norms_block[-1].weight.mul_(3.0)
         obj.teacher.model.encoder.norms_block[-1].bias.add_(2.0)
     obj.target_ln = True
-    lo = _fwd(obj, bands, geom, sc, mm).loss
+    lo = _fwd(obj, bands, geom, sc, masks).loss
     obj.target_ln = False
-    lf = _fwd(obj, bands, geom, sc, mm).loss
+    lf = _fwd(obj, bands, geom, sc, masks).loss
     assert not torch.allclose(lo, lf)
 
 
@@ -233,137 +171,10 @@ def test_single_tap_arm_wiring() -> None:
     assert obj.pred_to_target.in_features == 128 and obj.pred_to_target.out_features == 256
     assert obj.online.encoder.norm_out is not None
     assert obj.online.encoder.norms_block is None
-    # still trains end-to-end
+    # still trains end-to-end on the flat r4 path
     sc, geom = _session()
     out = _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom))
     assert torch.isfinite(out.loss) and out.loss.requires_grad
-
-
-def test_single_tap_packed_matches_padded() -> None:
-    # #24 equivalence must also hold in the single-tap arm (the ablation must be a
-    # faithful control, not a differently-wired path).
-    sc, geom = _session()
-    torch.manual_seed(0)
-    obj = V3JepaObjective(n_parcels=N_PARCELS, deep_sup=False).eval()
-    bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom, seed=3)
-    packed = _fwd(obj, bands, geom, sc, mm, backend="reference")
-    padded = _fwd_padded(obj, bands, geom, sc, mm)
-    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
-
-
-def test_context_head_shape_both_arms() -> None:
-    # #66: pred_to_target_context mirrors pred_to_target's target space (deep-sup
-    # 128→4·256; single-tap 128→256).
-    import torch.nn as nn
-
-    obj = _obj()  # deep-sup default
-    assert isinstance(obj.pred_to_target_context, nn.Linear)
-    assert obj.pred_to_target_context.in_features == 128
-    assert obj.pred_to_target_context.out_features == 4 * 256
-    obj1 = V3JepaObjective(n_parcels=N_PARCELS, deep_sup=False)
-    assert obj1.pred_to_target_context.out_features == 256
-
-
-def test_context_lambda_zero_is_exactly_plain_jepa() -> None:
-    # A python 0.0 (default / feature-off) is the static-skip: loss must be BYTE-equal
-    # to not passing lambda_context at all — the context head never perturbs the loss.
-    sc, geom = _session()
-    obj = _obj().eval()
-    bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom)
-    plain = _fwd(obj, bands, geom, sc, mm)
-    off = _fwd(obj, bands, geom, sc, mm, lambda_context=0.0)
-    assert torch.equal(plain.loss, off.loss)
-
-
-def test_context_lambda_positive_changes_loss_and_trains_head() -> None:
-    # A 0-d λ tensor > 0 adds the visible-CELL context L1 ⇒ loss changes, and the
-    # context head receives gradient (it is trained only when the schedule is active).
-    sc, geom = _session()
-    obj = _obj()
-    bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom)
-    base = _fwd(obj, bands, geom, sc, mm).loss
-    lam = torch.tensor(0.5)
-    withc = _fwd(obj, bands, geom, sc, mm, lambda_context=lam)
-    assert not torch.allclose(base, withc.loss)
-    withc.loss.backward()
-    assert any(
-        p.grad is not None and p.grad.abs().sum() > 0
-        for p in obj.pred_to_target_context.parameters()
-    )
-    # teacher still frozen under the context loss
-    assert all(p.grad is None for p in obj.teacher.parameters())
-
-
-def test_context_head_untouched_when_lambda_zero() -> None:
-    # With the static-off path, the context head gets NO gradient (it is skipped).
-    sc, geom = _session()
-    obj = _obj()
-    _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom)).loss.backward()
-    assert all(p.grad is None for p in obj.pred_to_target_context.parameters())
-
-
-def test_packed_matches_padded_with_context_loss() -> None:
-    # #24 equivalence must survive the context loss: both paths add λ·(visible-CELL
-    # L1), a mean over context cells ⇒ order-invariant like the masked loss.
-    sc, geom = _session()
-    obj = _obj().eval()
-    bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom, seed=5)
-    lam = torch.tensor(0.5)
-    packed = _fwd(obj, bands, geom, sc, mm, backend="reference", lambda_context=lam)
-    padded = _fwd_padded(obj, bands, geom, sc, mm, lambda_context=lam)
-    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
-
-
-def test_no_nan_when_a_whole_shaft_is_masked() -> None:
-    sc, geom = _session()
-    obj = _obj()
-    mm = _whole_shaft_masks(sc, geom, shaft=0)  # whole shaft A absent from the encoder
-    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, mm)
-    assert torch.isfinite(out.loss)
-    out.loss.backward()
-    assert all(
-        p.grad is None or torch.isfinite(p.grad).all() for p in obj.parameters()
-    )
-
-
-def test_intra_inter_split_partitions_the_masked_loss() -> None:
-    # inter (whole-shaft) + intra (partial-shaft) cells partition the masked set, so the
-    # count-weighted mean of the two tier losses must reconstruct the total masked loss.
-    sc, geom = _session()
-    obj = _obj()
-    mm = _whole_shaft_masks(sc, geom, shaft=0)
-    m = mm[0]
-    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, mm, whole_contact=m.whole_contact)
-    assert out.loss_intra is not None and out.loss_inter is not None
-    assert torch.isfinite(out.loss_intra) and torch.isfinite(out.loss_inter)
-    cm = _cell_masked(m, geom)  # (B,N,T) all masked cells
-    whole = m.whole_contact[:, :, None]  # (B,N,1) whole-shaft contacts
-    n_inter = (cm & whole).sum().float()
-    n_intra = (cm & ~whole).sum().float()
-    assert n_inter > 0 and n_intra > 0  # fixture drives both tiers
-    recon = (n_inter * out.loss_inter + n_intra * out.loss_intra) / (n_inter + n_intra)
-    assert torch.allclose(recon, out.loss, atol=1e-5)
-
-
-def test_intra_inter_none_off_monitor() -> None:
-    # whole_contact defaults None (off-monitor steps) ⇒ the split is not computed.
-    sc, geom = _session()
-    obj = _obj()
-    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom))
-    assert out.loss_intra is None and out.loss_inter is None
-
-
-def test_loss_reads_only_masked_cells() -> None:
-    sc, geom = _session()
-    obj = _obj()
-    mm = _masks(sc, geom)
-    out = _fwd(obj, _bands(len(sc.labels)), geom, sc, mm)
-    # n_masked = total masked CELLS = N·T − m_vis·t_kept (the dual-axis count).
-    assert out.n_masked == int(_cell_masked(mm[0], geom).sum())
 
 
 def test_mask_token_is_weight_decayed_like_upstream() -> None:
@@ -375,51 +186,21 @@ def test_mask_token_is_weight_decayed_like_upstream() -> None:
     obj = _obj()
     assert obj.mask_token.ndim >= 2
     assert not is_no_decay("mask_token", obj.mask_token)  # decayed, upstream parity
-    # still numerically a no-op in the forward (broadcasts to every masked cell)
+    # still numerically a no-op in the forward (broadcasts to every masked token)
     sc, geom = _session()
-    assert torch.isfinite(
-        _fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom)).loss
-    )
-
-
-def test_packed_forward_matches_padded_oracle() -> None:
-    # THE #24 correctness proof: the packed (varlen) production forward reproduces the
-    # padded oracle loss exactly (L1 is a mean over masked cells ⇒ the reorder between
-    # contact-order and full_plan-order is invariant).
-    sc, geom = _session()
-    obj = _obj().eval()
-    bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom, seed=7)  # sampled dual-axis: whole + intra + per-shaft time
-    packed = _fwd(obj, bands, geom, sc, mm, backend="reference")
-    padded = _fwd_padded(obj, bands, geom, sc, mm)
-    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
-    assert packed.n_masked == padded.n_masked
-
-
-def test_packed_matches_padded_multi_clip_and_partial() -> None:
-    # B>1 with independent per-clip dual-axis masks.
-    sc, geom = _session()
-    obj = _obj().eval()
-    n = len(sc.labels)
-    bands = _bands(n, B=3)
-    mm = _masks(sc, geom, B=3, seed=11)
-    packed = _fwd(obj, bands, geom, sc, mm, backend="reference")
-    padded = _fwd_padded(obj, bands, geom, sc, mm)
-    m, m_vis, t_kept = mm
-    assert torch.allclose(packed.loss, padded.loss, atol=1e-5)
-    assert packed.n_masked == padded.n_masked == 3 * (n * T - m_vis * t_kept)
+    assert torch.isfinite(_fwd(obj, _bands(len(sc.labels)), geom, sc, _masks(sc, geom)).loss)
 
 
 def test_loss_is_reducible_by_optimization() -> None:
     sc, geom = _session()
     obj = _obj()
     bands = _bands(len(sc.labels))
-    mm = _masks(sc, geom)  # FIXED mask (fit the frozen teacher targets)
+    masks = _masks(sc, geom)  # FIXED mask (fit the frozen teacher targets)
     opt = torch.optim.Adam([p for p in obj.parameters() if p.requires_grad], lr=1e-3)
     first = None
     for i in range(40):
         opt.zero_grad()
-        loss = _fwd(obj, bands, geom, sc, mm).loss
+        loss = _fwd(obj, bands, geom, sc, masks).loss
         loss.backward()
         opt.step()
         if i == 0:

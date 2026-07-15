@@ -119,6 +119,48 @@ class L1RoPE(nn.Module):
         return self.rotate(q, k, cos, sin)
 
 
+class TimeRoPE(nn.Module):
+    """Single-axis rotary over the FULL head_dim on the shared 32 Hz lattice.
+
+    The perceiver latents and the fused encoder tokens share ONE time lattice (a
+    latent slot s sits at lattice pos 8·s; a token sits at its band-lattice frame
+    index) and carry NO contact-index / band axis, so — unlike :class:`L1RoPE`,
+    which splits head_dim across (index, time) — the single time axis uses the whole
+    head_dim. base_time=64 is L1's time base (range R≈128 lattice), the locked choice
+    for this same 32 Hz lattice. For CROSS-attention q and k live at DIFFERENT
+    positions, so :meth:`forward` rotates each by its own table (self-attention passes
+    the same positions). Pair convention matches L1RoPE (dims 2j,2j+1 rotate together).
+    """
+
+    def __init__(self, head_dim: int, *, base: float = 64.0) -> None:
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError(f"TimeRoPE needs head_dim % 2 == 0, got {head_dim}")
+        self.head_dim = head_dim
+        pairs = head_dim // 2
+        freq = 1.0 / (base ** (torch.arange(pairs).float() / pairs))
+        self.register_buffer("freq", freq, persistent=False)
+
+    def cos_sin(self, pos: Tensor) -> tuple[Tensor, Tensor]:
+        """(..., seq) positions → (..., seq, head_dim) fp32 cos/sin table."""
+        ang = pos[..., None].float() * self.freq  # (..., seq, pairs)
+        cos = ang.cos().repeat_interleave(2, dim=-1)  # (..., seq, head_dim)
+        sin = ang.sin().repeat_interleave(2, dim=-1)
+        return cos, sin
+
+    def forward(
+        self, q: Tensor, k: Tensor, pos_q: Tensor, pos_k: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """q, k: (..., H, seq, head_dim); pos_q, pos_k: (..., seq) (no head axis).
+        q and k are rotated by their OWN positions (q·k score depends only on the
+        RELATIVE offset pos_q − pos_k)."""
+        cos_q, sin_q = self.cos_sin(pos_q)
+        cos_k, sin_k = self.cos_sin(pos_k)
+        q_out = q * cos_q.unsqueeze(-3) + _rotate_half(q) * sin_q.unsqueeze(-3)
+        k_out = k * cos_k.unsqueeze(-3) + _rotate_half(k) * sin_k.unsqueeze(-3)
+        return q_out, k_out
+
+
 class ParcelIdentityEmbed(nn.Module):
     """Learned per-parcel identity embedding indexed by the DKT/DK hard tag."""
 

@@ -220,6 +220,61 @@ class L1Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
+    # ── flat per-band (r4) path — the SAME varlen kernels over a FULLY flat token
+    # set (no (B,P,T) rectangle). r4 tokens are ragged per (contact, band) so there
+    # is no max_c×T grid to reshape through; the pack plan (pack_r4.R4Grid) already
+    # lays them out flat + shaft-contiguous with per-token RoPE coords. This is the
+    # rectangular ``_attn_packed`` with the rectangle removed: qkv → RoPE(depth,
+    # time_pos) → block-diagonal SDPA over ``cu_seqlens`` → out. ``depth`` is the L1
+    # index coord (clinical contact index), ``time_pos`` the shared-32Hz lattice
+    # position; both are per-token (M,), not per-slot.
+    def _attn_flat(
+        self,
+        x_flat: Tensor,
+        depth: Tensor,
+        time_pos: Tensor,
+        cu_seqlens: Tensor,
+        cu_seqlens_drop: Tensor,
+        max_seqlen: int,
+        *,
+        rope_cs: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        # x_flat: (M, d). depth, time_pos: (M,) long. Token order = shaft-contiguous
+        # (cu_seqlens delimits each shaft block).
+        m, d = x_flat.shape
+        qkv = self.qkv(x_flat).reshape(m, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=1)  # (M, H, hd)
+        qh, kh = q.transpose(0, 1), k.transpose(0, 1)  # (H, M, hd)
+        if rope_cs is None:
+            qh, kh = self.rope(qh, kh, depth, time_pos)
+        else:
+            qh, kh = self.rope.rotate(qh, kh, rope_cs[0], rope_cs[1])
+        q, k = qh.transpose(0, 1), kh.transpose(0, 1)  # (M, H, hd)
+        q, k = q.to(v.dtype), k.to(v.dtype)  # align to v for SDPA (no-op under fp32)
+        if q.is_cuda:
+            ctx = njt_block_diag(q, k, v, cu_seqlens_drop, max_seqlen)  # (M, H, hd)
+        else:
+            ctx = _reference_block_diag(q, k, v, cu_seqlens)  # (M, H, hd)
+        return self.out(ctx.reshape(m, d))
+
+    def forward_flat(
+        self,
+        x_flat: Tensor,
+        depth: Tensor,
+        time_pos: Tensor,
+        cu_seqlens: Tensor,
+        cu_seqlens_drop: Tensor,
+        max_seqlen: int,
+        *,
+        rope_cs: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        x_flat = x_flat + self._attn_flat(
+            self.norm1(x_flat), depth, time_pos, cu_seqlens, cu_seqlens_drop,
+            max_seqlen, rope_cs=rope_cs,
+        )
+        x_flat = x_flat + self.mlp(self.norm2(x_flat))
+        return x_flat
+
 
 class L2Block(nn.Module):
     """Cross-sensor factorized (same-t) attention block.

@@ -113,14 +113,17 @@ def test_drop_label_not_in_montage_is_a_noop() -> None:
 
 
 def test_feasibility_assert_fires_on_oversubscribed_montage() -> None:
-    # Dual-axis (Ben 2026-07-12): whole-shaft dropping is feasible only if SOME shaft
-    # fits under D=round(space_frac·N). One dominant shaft > D ⇒ no whole shaft fits ⇒
-    # assert_mask_feasible must raise at setup (fail loud, wires #36).
-    # S=4, sizes 40,3,3,3 (N=49). D=round(0.5·49)=24; largest shaft 40 > 24.
+    # Whole-shaft dropping (whole_shaft_frac>0) is feasible only if SOME shaft fits under
+    # D=round(space_frac·N). One dominant shaft > D ⇒ no shaft fits ⇒ assert_mask_feasible
+    # raises. r4's DEFAULT whole_shaft_frac=0.0 leaves the tier OFF, so the gate fires only
+    # when the tier is explicitly enabled. S=4, sizes 40,3,3,3 (N=49); D=round(0.5·49)=24 < 40.
     labels = _labels((40, 3, 3, 3))
     parcel = _parcels(labels)
     with pytest.raises(ValueError, match="whole-shaft infeasible"):
-        build_session_setup(labels, parcel, drop_labels=set())
+        build_session_setup(
+            labels, parcel, drop_labels=set(),
+            mask_cfg=V3MaskConfig(whole_shaft_frac=0.15),
+        )
 
 
 def test_feasibility_passes_for_uniform_seeg() -> None:
@@ -132,15 +135,14 @@ def test_feasibility_passes_for_uniform_seeg() -> None:
 
 
 def test_custom_mask_cfg_threads_to_feasibility() -> None:
-    # The dominant-shaft montage (25,5,5,5): D=round(0.5·40)=20, largest 25 > 20 ⇒ the
-    # DEFAULT whole tier is infeasible and setup must raise. Setting whole_shaft_frac=0
-    # opts OUT of the whole tier (intra-only) ⇒ same montage now passes. Proves mask_cfg
-    # threads through to the feasibility gate.
+    # The dominant-shaft montage (25,5,5,5): D=round(0.5·40)=20, largest 25 > 20 ⇒ enabling
+    # the whole tier is infeasible. r4's DEFAULT whole_shaft_frac=0.0 opts OUT (intra-only)
+    # ⇒ this montage passes; setting whole_shaft_frac>0 threads through and makes it raise.
     labels = _labels((25, 5, 5, 5))  # N=40
     parcel = _parcels(labels)
+    build_session_setup(labels, parcel, drop_labels=set())  # default 0.0 whole → feasible
     with pytest.raises(ValueError, match="whole-shaft infeasible"):
-        build_session_setup(labels, parcel, drop_labels=set())  # default 0.15 whole
-    build_session_setup(
-        labels, parcel, drop_labels=set(),
-        mask_cfg=V3MaskConfig(whole_shaft_frac=0.0),  # opt out → feasible
-    )
+        build_session_setup(
+            labels, parcel, drop_labels=set(),
+            mask_cfg=V3MaskConfig(whole_shaft_frac=0.15),  # enable whole tier → infeasible
+        )

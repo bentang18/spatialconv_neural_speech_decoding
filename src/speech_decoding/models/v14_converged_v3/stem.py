@@ -86,3 +86,86 @@ class SpectralStem(nn.Module):
         folded = self.broadcast_concat(band_inputs)  # (..., total_bins, T32)
         folded = folded.transpose(-1, -2)  # (..., T32, total_bins)
         return self.proj(folded)  # (..., T32, d_model)
+
+
+# ── r4 / Design B per-band decimated stem ──────────────────────────────────────
+# (n_bins, lattice_stride) per band in SLOW, MID, HGA order. lattice_stride = the
+# 32 Hz-frame decimation step = the shared-lattice position increment per token:
+# HGA 1 (32 Hz), MID 2 (16 Hz), SLOW 8 (4 Hz). Bins 7/6/7 = the v2 cache band widths.
+PER_BAND_SPECS: tuple[tuple[int, int], ...] = ((7, 8), (6, 2), (7, 1))
+
+
+class PerBandStem(nn.Module):
+    """Per-band DECIMATED token stem (r4 / Design B, contract project-r4-contract-2026-07-15).
+
+    Each band arrives on the shared 32 Hz clock as ``(..., F_b, T32)`` (v2 cache
+    convention: freq axis −2, time −1, per-(elec,bin) robust-z'd at load). This stem:
+
+      1. DECIMATES each band to its own token rate by a strided time slice — HGA stride 1
+         (32 Hz), MID stride 2 (16 Hz), SLOW stride 8 (4 Hz). The dropped frames are the
+         ~75%/94% window-overlap-redundant frames that ARE the M14 leak; the surviving
+         token hop = nperseg/2 makes the overlap factor EXACTLY 2 in every band, so a
+         width-4 mask block buries the deepest cell at margin 2 = zero raw-sample overlap.
+      2. projects each band with its OWN ``Linear(F_b → d)`` (separate weights self-identify
+         the band) and ADDS a learnable per-band ``band_type_emb`` (Ben: "100% add a band
+         embed" — REVERSES the old single-concat-token / no-band-embed frontend).
+      3. emits, per band, each token's SHARED-32Hz-LATTICE position ``token_index · stride``
+         — the L1 time-RoPE coordinate. HGA stride 1 keeps the tuned base regime; MID/SLOW
+         inherit the same per-unit frequency at wider strides, so a SLOW token at lattice
+         8k and an HGA token at 8k share phase ⇒ band mixing aligns them in physical time.
+
+    Ragged BY DESIGN: bands carry different token counts (T32 / stride). Deliberately NO
+    freq embed and NO per-band norm (per-band norm reintroduces within-band 1/f dominance);
+    band identity rides the separate projections + the additive band embed.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        *,
+        bands: Sequence[tuple[int, int]] = PER_BAND_SPECS,
+        band_emb_std: float = 0.02,
+    ) -> None:
+        super().__init__()
+        self.specs = tuple((int(nb), int(st)) for nb, st in bands)
+        self.projs = nn.ModuleList(nn.Linear(nb, d_model) for nb, _ in self.specs)
+        # additive per-band identity, one d-vector per band; standard 0.02 init (the band
+        # is deliberate structure we WANT the model to use, unlike the near-zero parcel
+        # nuisance embed). band_emb_std is the A/B knob.
+        self.band_type_emb = nn.Parameter(torch.empty(len(self.specs), d_model))
+        self.projs.apply(init_transformer_weights)  # V-JEPA trunc_normal(0.02)+zero-bias
+        nn.init.trunc_normal_(self.band_type_emb, std=band_emb_std)
+
+    @staticmethod
+    def decimate(x: Tensor, stride: int) -> Tensor:
+        """Strided time slice ``x[..., ::stride]`` — the band's own-rate frames. Requires
+        the 32 Hz length to be an exact multiple of ``stride`` (128 % {1,2,8} == 0)."""
+        t32 = x.shape[-1]
+        if t32 % stride != 0:
+            raise ValueError(f"32 Hz length {t32} not a multiple of stride {stride}")
+        return x[..., ::stride]
+
+    def forward(
+        self, band_inputs: Sequence[Tensor]
+    ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+        """Bands ``[(...,F_b,T32)]`` → (per-band tokens ``(..., T_b, d)``, per-band lattice
+        positions ``(T_b,)`` long). Order is SLOW, MID, HGA (the spec order)."""
+        if len(band_inputs) != len(self.specs):
+            raise ValueError(f"expected {len(self.specs)} bands, got {len(band_inputs)}")
+        tokens: list[Tensor] = []
+        positions: list[Tensor] = []
+        for b, (x, (n_bins, stride), proj) in enumerate(
+            zip(band_inputs, self.specs, self.projs)
+        ):
+            if x.shape[-2] != n_bins:
+                raise ValueError(
+                    f"band {b} has {x.shape[-2]} freq bins, expected {n_bins}"
+                )
+            xd = self.decimate(x, stride)  # (..., F_b, T_b)
+            xd = xd.transpose(-1, -2)  # (..., T_b, F_b)
+            tok = proj(xd) + self.band_type_emb[b]  # (..., T_b, d)
+            t_b = xd.shape[-2]
+            pos = torch.arange(t_b, device=x.device, dtype=torch.long) * stride  # (T_b,)
+            tokens.append(tok)
+            positions.append(pos)
+        return tuple(tokens), tuple(positions)

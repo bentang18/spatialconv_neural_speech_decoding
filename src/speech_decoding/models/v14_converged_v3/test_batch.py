@@ -103,7 +103,5 @@ def test_batch_bands_feed_model_forward() -> None:
     torch.manual_seed(0)
     model = V3ConvergedModel(n_parcels=8).eval()
     g = torch.Generator().manual_seed(0)
-    out = model(
-        batch.bands, batch.geom, batch.parcel_id, generator=g, backend="reference"
-    )
+    out = model(batch.bands, batch.geom, batch.parcel_id, generator=g)
     assert torch.isfinite(out.loss)

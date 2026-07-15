@@ -7,9 +7,10 @@ Memo project-v14-converged-v3-sensor-architecture (ENCODER/PREDICTOR OFFLOAD):
            three L2 L1 L1 digests; global mixing from block 4 — Ben 2026-07-10;
            the local, overfit-safe capacity the encoder RETAINS). SINGLE tap =
            the final block output.
-  Predictor 12 NARROW blocks, d_model 128 (0.5×), 4 heads (head_dim 32). Layout
-           ``[L2L1L1]×4`` = 8 L1 : 4 L2, L2-FIRST (the cross-sensor capacity the
-           predictor carries, discarded at inference — MAE/V-JEPA asymmetry).
+  Predictor 6 NARROW blocks, d_model 128 (0.5×), 4 heads (head_dim 32). Layout
+           ``L1×6`` (Design B, Ben 2026-07-15) — L1-only: class W is dropped so the
+           predictor never crosses shafts, and a JEPA predictor is conventionally
+           shallower than its encoder (discarded at inference — MAE/V-JEPA asymmetry).
 
 The tower is a plain pre-norm block stack that dispatches each block to its
 geometry (L1 ← shaft gather; L2 ← parcel identity). These tests pin the exact
@@ -48,29 +49,27 @@ def _kinds(tower):
     ]
 
 
-def test_encoder_layout_is_l1x3_then_three_l2l1l1() -> None:
-    # 3-block local front-load, then three L2 L1 L1 digests (Ben 2026-07-10):
-    # global mixing starts at block 4, each L2 mix folded in by 2 local blocks.
-    assert ENC_LAYOUT == (
-        "L1", "L1", "L1",
-        "L2", "L1", "L1", "L2", "L1", "L1", "L2", "L1", "L1",
-    )
+def test_encoder_layout_is_twelve_l1_design_b() -> None:
+    # Design B (contract §3): 12 IDENTICAL L1 blocks, NO L2 — montage-invariant by
+    # construction (the old 9-L1:3-L2 layout is retired; cross-sensor mixing moved to
+    # the write-only perceiver, M10). Deep-sup taps {3,6,9,12} unchanged.
+    assert ENC_LAYOUT == ("L1",) * 12
     enc = build_encoder(n_parcels=8)
     kinds = _kinds(enc)
     assert len(kinds) == 12
-    assert kinds.count("L1") == 9 and kinds.count("L2") == 3
-    assert kinds[:3] == ["L1"] * 3  # front-load
-    assert kinds[3] == "L2"  # first global mix at block 4
+    assert kinds.count("L1") == 12 and kinds.count("L2") == 0
     assert kinds == list(ENC_LAYOUT)
 
 
-def test_predictor_layout_is_four_l2l1l1_l2_first() -> None:
-    assert PRED_LAYOUT == ("L2", "L1", "L1") * 4
+def test_predictor_layout_is_six_l1_design_b() -> None:
+    # Design B (Ben 2026-07-15): L1-only 6-layer predictor. Class W dropped ⇒ no
+    # cross-shaft prediction ⇒ no L2 in the predictor. JEPA predictors are also
+    # conventionally shallower than the encoder (V-JEPA), and our task is easier.
+    assert PRED_LAYOUT == ("L1",) * 6
     pred = build_predictor(n_parcels=8)
     kinds = _kinds(pred)
-    assert len(kinds) == 12
-    assert kinds.count("L1") == 8 and kinds.count("L2") == 4
-    assert kinds[0] == "L2"  # L2-first
+    assert len(kinds) == 6
+    assert kinds.count("L1") == 6 and kinds.count("L2") == 0
 
 
 def test_encoder_is_wide_256_four_heads() -> None:
@@ -171,28 +170,19 @@ def test_tower_init_matches_vjepa2() -> None:
     assert abs(s0 / s5 - math.sqrt(6.0)) < 0.4
 
 
-def test_tower_dispatches_l1_to_geom_and_l2_to_parcel() -> None:
-    # A whole-session forward must be block-diagonal-then-mixed: after the first
-    # 3 L1 blocks (the encoder front-load), shaft A still cannot have seen shaft B;
-    # only once an L2 block runs (block 4) does cross-shaft information flow. Verify
-    # the encoder as a whole DOES mix across shafts (an L2 fired) but a 3-L1 prefix
-    # does NOT.
+def test_l1_only_encoder_is_montage_invariant_across_shafts() -> None:
+    # Design B (contract §3): the encoder is L1-only, so it NEVER mixes across shafts —
+    # perturbing shaft B leaves shaft A's output bit-stable through the WHOLE 12-block
+    # encoder. This is the montage-invariance property that replaces the old L2-mixing
+    # dispatch test (the r=−0.763 electrode-count leak motive for dropping L2).
     sc, geom = _session()
     enc = build_encoder(n_parcels=8).eval()
     x = torch.randn(1, 5, T, 256)
 
-    # full encoder mixes across shafts
     out = enc(x, geom, sc.parcel_id)
     x2 = x.clone()
-    x2[0, 3] += torch.randn(T, 256) * 3.0  # perturb shaft B
+    x2[0, 3] += torch.randn(T, 256) * 3.0  # perturb shaft B (contacts 3,4)
     out2 = enc(x2, geom, sc.parcel_id)
-    assert not torch.allclose(out[0, 0], out2[0, 0], atol=1e-4)  # shaft A moved
-
-    # the L1-only prefix does not
-    h = x
-    for b in enc.blocks[:3]:
-        h = b(h, geom)
-    h2 = x2
-    for b in enc.blocks[:3]:
-        h2 = b(h2, geom)
-    assert torch.allclose(h[0, :3], h2[0, :3], atol=1e-5)  # shaft A untouched
+    # shaft A (contacts 0,1,2) untouched at every deep-sup level; shaft B moved.
+    assert torch.allclose(out[0, :3], out2[0, :3], atol=1e-5)
+    assert not torch.allclose(out[0, 3:], out2[0, 3:], atol=1e-4)

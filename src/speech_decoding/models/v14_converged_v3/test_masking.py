@@ -1,10 +1,10 @@
-"""v14_converged_v3 Phase 5 — dual-axis (space × time) block masking (TDD).
+"""v14_converged_v3 Phase 5 — unified space × time block masking (TDD).
 
-Masking-axis inversion (Ben 2026-07-12): mask on BOTH axes independently per sensor
-— SPACE (whole-shaft stochastic tier + intra width-4 depth-blocks, snap to exactly
-D=round(space_frac·N)) and TIME (width-7 time-blocks per shaft, snap to exactly
-T_mask=round(time_frac·T) per shaft). Compose as a per-sensor outer product ⇒ static
-shapes (constant N−D visible contacts, constant T_kept visible frames per shaft).
+SPACE is PER-SHAFT balanced (each shaft masks round(space_frac·n_s) of its own contacts via
+depth-blocks; keep-alive automatic). TIME is GLOBAL across shafts, ONE unified rule: each band is
+masked INDEPENDENTLY, in contiguous width-block_w_band (=4) blocks of its OWN tokens, snapped to
+~*_mask_frac. HGA 32 Hz / MID 16 Hz / SLOW 4 Hz — symmetric, no blackout (empty latent windows
+emerge where all three masks overlap).
 """
 
 from __future__ import annotations
@@ -14,8 +14,11 @@ import torch
 
 from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
 from speech_decoding.models.v14_converged_v3.masking import (
+    MID_STRIDE,
+    SLOW_STRIDE,
     V3MaskConfig,
     assert_mask_feasible,
+    assert_time_feasible,
     sample_masks,
 )
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
@@ -59,51 +62,84 @@ def _per_shaft_rate(sc, contact_mask: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# ── SPACE axis: exact count, whole tier, blockiness ──────────────────────────
+def _expected_space(cfg: V3MaskConfig, sizes: list[int]) -> int:
+    cs = torch.tensor(sizes)
+    d_s = torch.round(cfg.space_frac * cs.float()).long()
+    if cfg.keep_alive:
+        d_s = torch.minimum(d_s, (cs - 1).clamp(min=0))
+    return int(d_s.sum())
+
+
+def _expected_counts(cfg: V3MaskConfig, t: int) -> dict[str, int]:
+    t_mid = t // MID_STRIDE
+    n_slots = t // SLOW_STRIDE
+    return {
+        "hga": round(cfg.hga_mask_frac * t),
+        "mid": round(cfg.mid_mask_frac * t_mid),
+        "slow": round(cfg.slow_mask_frac * n_slots),
+        "n_slots": n_slots,
+    }
+
+
+# ── SPACE axis: per-shaft balanced count, blockiness ─────────────────────────
 def test_space_exact_constant_count() -> None:
-    sc, geom = _session([12, 10, 8, 6])  # N=36
+    sizes = [12, 10, 8, 6]
+    sc, geom = _session(sizes)  # N=36
     n = 36
-    d = round(V3MaskConfig().space_frac * n)  # 18
-    m = sample_masks(geom, n, n_time=96, n_rows=5, generator=_gen())
+    d = _expected_space(V3MaskConfig(), sizes)  # Σ round(0.5·n_s) = 18
+    m = sample_masks(geom, n, n_time=128, n_rows=5, generator=_gen())
     assert m.contact_mask.shape == (5, n) and m.contact_mask.dtype == torch.bool
     assert (m.contact_mask.sum(1) == d).all()
 
 
 def test_space_frac_controls_count() -> None:
-    sc, geom = _session([20])
-    m = sample_masks(geom, 20, n_time=96, n_rows=3, generator=_gen(), cfg=V3MaskConfig(space_frac=0.4))
-    assert (m.contact_mask.sum(1) == 8).all()
+    sizes = [20]
+    sc, geom = _session(sizes)
+    cfg = V3MaskConfig(space_frac=0.4)
+    m = sample_masks(geom, 20, n_time=128, n_rows=3, generator=_gen(), cfg=cfg)
+    assert (m.contact_mask.sum(1) == _expected_space(cfg, sizes)).all()  # 8
+
+
+def test_space_is_per_shaft_balanced() -> None:
+    # THE FIX (Ben 2026-07-15): every shaft masks ~space_frac of its OWN contacts. No shaft is
+    # left fully unmasked while another is hammered — the old global top-D had std 0.18, min 0.00.
+    sizes = [12, 10, 14, 8, 10, 12, 6, 9, 7, 11]
+    sc, geom = _session(sizes)
+    n = sum(sizes)
+    m = sample_masks(geom, n, n_time=128, n_rows=200, generator=_gen(1))
+    rate = _per_shaft_rate(sc, m.contact_mask)  # (R, S)
+    # each shaft is deterministically round(0.5·n_s)/n_s masked — exact, zero variance across rows.
+    for si, sz in enumerate(sizes):
+        exp = min(round(0.5 * sz), sz - 1) / sz
+        assert torch.allclose(rate[:, si], torch.full((200,), exp), atol=1e-6), (
+            f"shaft {si} (size {sz}) rate {rate[:, si].unique().tolist()} != {exp}"
+        )
+    assert rate.min() > 0.0, "some shaft fully unmasked — imbalance not fixed"
 
 
 def test_space_is_blocky_not_iid() -> None:
-    # contiguous depth-blocks ⇒ far fewer runs than an iid coin-flip at the same rate.
     sc, geom = _session([30])
     cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.0, block_w_space=4)
-    m = sample_masks(geom, 30, n_time=96, n_rows=8, generator=_gen(1), cfg=cfg)
+    m = sample_masks(geom, 30, n_time=128, n_rows=8, generator=_gen(1), cfg=cfg)
     mean_runs = sum(len(_runs(m.contact_mask[r])) for r in range(8)) / 8
     assert mean_runs <= 4.5, f"mean runs/row {mean_runs} — not blocky"
     assert max(max(_runs(m.contact_mask[r]), default=0) for r in range(8)) >= 4
 
 
 def test_whole_shaft_tier_fully_masks_shafts() -> None:
-    # whole_shaft_frac high over few shafts ⇒ some shafts masked 100%.
-    sc, geom = _session([5, 5, 5, 5])  # N=20, D=10
-    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.5)
-    m = sample_masks(geom, 20, n_time=96, n_rows=64, generator=_gen(3), cfg=cfg)
+    sc, geom = _session([5, 5, 5, 5])  # N=20
+    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.5, keep_alive=False)
+    m = sample_masks(geom, 20, n_time=128, n_rows=64, generator=_gen(3), cfg=cfg)
     rate = _per_shaft_rate(sc, m.contact_mask)
-    n_full = (rate >= 0.999).sum(1)
-    assert n_full.float().mean() >= 1.0, f"expected some whole shafts, got {n_full.tolist()}"
-    # whole_contact ⊆ contact_mask
+    n_full = (rate >= 0.999).sum(1)  # k_max caps whole count at 1 for this montage (D=8)
+    assert (n_full >= 1).float().mean() > 0.5, f"expected whole shafts in most rows, got {n_full.tolist()}"
     assert (m.whole_contact & ~m.contact_mask).sum() == 0
 
 
 def test_whole_shaft_count_is_stochastic() -> None:
-    # The number of fully-masked shafts VARIES across rows (not pinned) and averages
-    # near whole_shaft_frac·S (plus intra saturation).
-    sc, geom = _session([8, 8, 8, 8, 8, 8])  # S=6, N=48, D=24
-    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.25)  # E[K]=1.5
-    m = sample_masks(geom, 48, n_time=96, n_rows=400, generator=_gen(4), cfg=cfg)
-    # whole_contact tells us the whole tier directly (not intra saturation)
+    sc, geom = _session([8, 8, 8, 8, 8, 8])  # S=6, N=48
+    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.25, keep_alive=False)  # E[K]=1.5
+    m = sample_masks(geom, 48, n_time=128, n_rows=400, generator=_gen(4), cfg=cfg)
     whole_shafts = torch.zeros(400, 6)
     for si in range(6):
         idx = (sc.shaft_id == si).nonzero(as_tuple=True)[0]
@@ -113,167 +149,206 @@ def test_whole_shaft_count_is_stochastic() -> None:
     assert 0.5 < k_per_row.mean().item() < 2.5, f"E[K] off: {k_per_row.mean().item():.2f}"
 
 
-def test_no_keep_alive_shafts_may_saturate() -> None:
-    # With the ≥1-visible rule REMOVED, a non-whole shaft is ALLOWED to reach 100%
-    # via the intra tier — it just becomes another full drop. So we do NOT assert a
-    # pinned whole-shaft count; we only require the global count stays exactly D.
-    sc, geom = _session([6, 16, 9, 9, 4, 10, 8, 3])  # varied incl. tiny shafts
-    n = sum([6, 16, 9, 9, 4, 10, 8, 3])
-    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.15)
-    m = sample_masks(geom, n, n_time=96, n_rows=500, generator=_gen(0), cfg=cfg)
-    assert (m.contact_mask.sum(1) == round(0.5 * n)).all()
-    # at least one row somewhere saturates a shaft beyond the whole tier (legal now)
-    rate = _per_shaft_rate(sc, m.contact_mask)
-    assert (rate >= 0.999).any(), "expected some fully-masked shafts across 500 rows"
-
-
-# ── TIME axis: exact per-shaft count, blockiness, heterogeneity ──────────────
-def test_time_exact_per_shaft_count() -> None:
-    sc, geom = _session([12, 10, 8])  # S=3
-    t = 96
-    tmask = round(V3MaskConfig().time_frac * t)  # 48
+# ── TIME axis: GLOBAL across shafts, per-band budgets ────────────────────────
+def test_time_masks_are_global_no_shaft_axis() -> None:
+    sc, geom = _session([12, 10, 8])
+    t = 128
     m = sample_masks(geom, 30, n_time=t, n_rows=5, generator=_gen(2))
-    assert m.frame_mask.shape == (5, 3, t) and m.frame_mask.dtype == torch.bool
-    assert (m.frame_mask.sum(-1) == tmask).all(), "every (row, shaft) must mask exactly T_mask frames"
+    assert m.hga_mask.shape == (5, t)
+    assert m.mid_mask.shape == (5, t // MID_STRIDE)
+    assert m.slow_mask.shape == (5, t // SLOW_STRIDE)
+    assert all(x.dtype == torch.bool for x in (m.hga_mask, m.mid_mask, m.slow_mask))
 
 
-def test_time_frac_controls_count() -> None:
+def test_time_exact_per_band_counts() -> None:
+    sc, geom = _session([12, 10, 8])
+    t = 128
+    cfg = V3MaskConfig()
+    exp = _expected_counts(cfg, t)
+    m = sample_masks(geom, 30, n_time=t, n_rows=16, generator=_gen(2), cfg=cfg)
+    assert (m.hga_mask.sum(-1) == exp["hga"]).all(), "HGA count not constant"
+    assert (m.mid_mask.sum(-1) == exp["mid"]).all(), "MID count = round(mid_frac·T/2) not constant"
+    assert (m.slow_mask.sum(-1) == exp["slow"]).all(), "SLOW count = round(slow_frac·T/8) not constant"
+
+
+def test_all_three_bands_near_50pct() -> None:
+    # ONE rule, three grids: HGA/MID/SLOW each masked ~50% of their OWN tokens (Ben 2026-07-15:
+    # "each band its own independent temporal masking ... slow can be masked well ... 50% symmetry").
+    sc, geom = _session([12, 10])
+    t = 128
+    m = sample_masks(geom, 22, n_time=t, n_rows=32, generator=_gen(3))
+    assert (m.hga_mask.float().mean() - 0.50).abs() < 1e-6
+    assert (m.mid_mask.float().mean() - 0.50).abs() < 1e-6
+    assert (m.slow_mask.float().mean() - 0.50).abs() < 1e-6
+
+
+def test_each_band_is_blocky_width4() -> None:
+    # Leak-safe: each band masked in contiguous blocks of ≥block_w_band (=4) of its OWN tokens.
     sc, geom = _session([12])
-    m = sample_masks(geom, 12, n_time=100, n_rows=4, generator=_gen(), cfg=V3MaskConfig(time_frac=0.3))
-    assert (m.frame_mask.sum(-1) == 30).all()
+    t = 128
+    m = sample_masks(geom, 12, n_time=t, n_rows=16, generator=_gen(7))
+    for name, band in (("hga", m.hga_mask), ("mid", m.mid_mask), ("slow", m.slow_mask)):
+        longest = max(max(_runs(band[r]), default=0) for r in range(16))
+        assert longest >= 4, f"{name}: longest run {longest} < 4 ⇒ not leak-safe width-4 blocky"
 
 
-def test_time_is_blocky() -> None:
+def test_bands_are_masked_independently() -> None:
+    # No coupling: a SLOW-masked slot does NOT force its HGA/MID tokens masked (that was blackout).
+    # Across many rows there exist slots where SLOW is masked but some HGA in that slot is visible.
+    sc, geom = _session([10])
+    t = 128
+    m = sample_masks(geom, 10, n_time=t, n_rows=64, generator=_gen(6))
+    hpp = SLOW_STRIDE
+    found_slow_masked_hga_visible = False
+    for r in range(64):
+        for k in m.slow_mask[r].nonzero(as_tuple=True)[0].tolist():
+            if not m.hga_mask[r, k * hpp:(k + 1) * hpp].all():
+                found_slow_masked_hga_visible = True
+    assert found_slow_masked_hga_visible, "bands appear coupled — SLOW-masked slots always empty HGA"
+
+
+def test_slow_frac_controls_slow_count() -> None:
     sc, geom = _session([12])
-    m = sample_masks(geom, 12, n_time=96, n_rows=8, generator=_gen(5), cfg=V3MaskConfig(block_w_time=7))
-    # 48 masked frames of 96 in width-7 blocks ⇒ few runs (≲ ~8), longest run ≥ 7
-    mean_runs = sum(len(_runs(m.frame_mask[r, 0])) for r in range(8)) / 8
-    assert mean_runs <= 9.0, f"time mean runs {mean_runs} — not blocky"
-    assert max(max(_runs(m.frame_mask[r, 0]), default=0) for r in range(8)) >= 7
-
-
-def test_blank_frames_are_rare_and_match_the_arithmetic() -> None:
-    # THE GUARDIAN IS GONE (M14, 2026-07-15). It used to force ≥1 live shaft to keep
-    # every t; M14 measured that this SATURATED the realized block run at ~6 no matter
-    # how wide a block was requested, which defeats the whole purpose of the width (it
-    # must bury a cell deeper than the STFT window overlap). See masking.py's docstring.
-    #
-    # The new contract, and this test IS the contract:
-    #   1. blank frames (no live shaft keeps t) are ALLOWED — proving the guardian is
-    #      really gone, so this is a REGRESSION GUARD: re-adding one fails here.
-    #   2. they are RARE, and rare at the rate the arithmetic predicts: a shaft masks t
-    #      with prob time_frac, blocks correlate frames WITHIN a shaft but the shafts are
-    #      drawn INDEPENDENTLY, so P(blank) ≈ time_frac^V over V live shafts.
-    #   3. the STATIC invariant is untouched: still EXACTLY T_mask masked frames per
-    #      (row, shaft). This is the one that would break the compiled buffer, and it is
-    #      why deleting the guardian is safe — it only ever reordered the cover-rank sort,
-    #      which happens BEFORE the `time_rank < t_mask` snap.
-    sc, geom = _session([12, 10, 10, 8, 8, 6, 6, 4])  # N=64, S=8
-    n, rows, t = 64, 800, 96
-    m = sample_masks(geom, n, n_time=t, n_rows=rows, generator=_gen(9))
-
-    # (3) the static invariant — the only one that can break the compiled shapes
-    assert (m.frame_mask.sum(-1) == 48).all()
-
-    shaft_of = geom.shaft_of_contact
-    vis = ~m.contact_mask  # (R, N)
-    live = torch.zeros(rows, int(sc.n_shafts), dtype=torch.bool)
-    for si in range(int(sc.n_shafts)):
-        idx = (shaft_of == si).nonzero(as_tuple=True)[0]
-        live[:, si] = vis[:, idx].any(1)
-    covers = (~m.frame_mask) & live[:, :, None]  # (R, S, T) live AND keeping t
-    blank = covers.sum(1) == 0  # (R, T)
-    blank_frac = blank.float().mean().item()
-
-    # (1) the guardian is gone
-    assert blank_frac > 0.0, "no blank frame in 76800 draws — is the guardian back?"
-    # (2) rare, and at the predicted rate. V varies per row, so predict per row and pool.
-    v_live = live.sum(1).clamp(min=1).float()  # (R,)
-    predicted = (V3MaskConfig().time_frac ** v_live).mean().item()
-    assert blank_frac < 0.02, f"blank frames not rare: {blank_frac:.4f}"
-    assert 0.5 * predicted < blank_frac < 2.0 * predicted, (
-        f"blank rate {blank_frac:.5f} does not match time_frac^V = {predicted:.5f} — "
-        "the sampler and the arithmetic disagree, so one of them is wrong"
-    )
-
-
-def test_time_is_heterogeneous_across_shafts() -> None:
-    # Different shafts mask different frames (independent draws) ⇒ at most t slices are
-    # NOT uniformly all-masked/all-visible across shafts. This is what keeps L2 pressured.
-    sc, geom = _session([10, 10, 10, 10])  # S=4
-    m = sample_masks(geom, 40, n_time=96, n_rows=1, generator=_gen(11))
-    fm = m.frame_mask[0]  # (S, T)
-    frac_masked_per_t = fm.float().mean(0)  # (T,)
-    # some time slices are partially masked across shafts (not all 0 or all 1)
-    mixed = ((frac_masked_per_t > 0.1) & (frac_masked_per_t < 0.9)).float().mean()
-    assert mixed > 0.5, f"time masking too homogeneous across shafts: {mixed:.2f}"
+    t = 128
+    cfg = V3MaskConfig(slow_mask_frac=0.25)  # 0.25·16 = 4 SLOW slots
+    m = sample_masks(geom, 12, n_time=t, n_rows=8, generator=_gen(), cfg=cfg)
+    assert (m.slow_mask.sum(-1) == 4).all()
+    exp = _expected_counts(cfg, t)
+    assert (m.hga_mask.sum(-1) == exp["hga"]).all()  # HGA unaffected by SLOW frac (independent)
 
 
 # ── OUTER-PRODUCT composition / static invariants ────────────────────────────
-def test_outer_product_visible_fraction_matches_product() -> None:
-    # total visible cells = (N−D)·T_kept ; total masked = 1 − space_keep·time_keep.
-    sc, geom = _session([16, 12, 10, 8])  # N=46
-    n, t = 46, 96
-    cfg = V3MaskConfig(space_frac=0.5, time_frac=0.5)
+def test_outer_product_visible_hga_cells_matches_product() -> None:
+    sizes = [16, 12, 10, 8]
+    sc, geom = _session(sizes)  # N=46
+    n, t = 46, 128
+    cfg = V3MaskConfig()
     m = sample_masks(geom, n, n_time=t, n_rows=32, generator=_gen(7), cfg=cfg)
-    d = round(0.5 * n)
-    tmask = round(0.5 * t)
-    tkept = t - tmask
-    # build the cell mask: cell masked iff contact masked OR frame masked for its shaft
-    shaft_of = geom.shaft_of_contact  # (N,)
-    cell_masked = m.contact_mask[:, :, None] | m.frame_mask[:, shaft_of, :]  # (R, N, T)
-    vis = (~cell_masked).sum(dim=(1, 2))  # (R,) visible cells per row
-    expected_vis = (n - d) * tkept
-    assert (vis == expected_vis).all(), f"visible cells {vis.unique().tolist()} != {expected_vis}"
+    d = _expected_space(cfg, sizes)
+    exp = _expected_counts(cfg, t)
+    t_kept = t - exp["hga"]
+    cell_masked = m.contact_mask[:, :, None] | m.hga_mask[:, None, :]  # (R, N, T_hga)
+    vis = (~cell_masked).sum(dim=(1, 2))
+    assert (vis == (n - d) * t_kept).all(), f"HGA visible {vis.unique().tolist()} != {(n-d)*t_kept}"
 
 
 def test_static_counts_are_constant_across_seeds() -> None:
-    sc, geom = _session([14, 12, 10, 8, 6])  # N=50
-    n, t = 50, 96
-    cfg = V3MaskConfig()  # no cfg passed to sample_masks below ⇒ assert the DEFAULT's invariant
-    d = round(cfg.space_frac * n)
-    tmask = round(cfg.time_frac * t)
+    sizes = [14, 12, 10, 8, 6]
+    sc, geom = _session(sizes)  # N=50
+    n, t = 50, 128
+    cfg = V3MaskConfig()
+    d = _expected_space(cfg, sizes)
+    exp = _expected_counts(cfg, t)
     for seed in range(20):
         m = sample_masks(geom, n, n_time=t, n_rows=8, generator=_gen(seed))
         assert (m.contact_mask.sum(1) == d).all()
-        assert (m.frame_mask.sum(-1) == tmask).all()
+        assert (m.hga_mask.sum(-1) == exp["hga"]).all()
+        assert (m.mid_mask.sum(-1) == exp["mid"]).all()
+        assert (m.slow_mask.sum(-1) == exp["slow"]).all()
 
 
 # ── determinism / independence / feasibility ─────────────────────────────────
 def test_deterministic_in_generator_seed() -> None:
     sc, geom = _session([12, 8])
-    a = sample_masks(geom, 20, n_time=96, n_rows=4, generator=_gen(7))
-    b = sample_masks(geom, 20, n_time=96, n_rows=4, generator=_gen(7))
-    c = sample_masks(geom, 20, n_time=96, n_rows=4, generator=_gen(8))
-    assert torch.equal(a.contact_mask, b.contact_mask) and torch.equal(a.frame_mask, b.frame_mask)
-    assert not torch.equal(a.contact_mask, c.contact_mask)
+    a = sample_masks(geom, 20, n_time=128, n_rows=4, generator=_gen(7))
+    b = sample_masks(geom, 20, n_time=128, n_rows=4, generator=_gen(7))
+    c = sample_masks(geom, 20, n_time=128, n_rows=4, generator=_gen(8))
+    assert torch.equal(a.contact_mask, b.contact_mask) and torch.equal(a.hga_mask, b.hga_mask)
+    assert torch.equal(a.mid_mask, b.mid_mask) and torch.equal(a.slow_mask, b.slow_mask)
+    assert not (torch.equal(a.contact_mask, c.contact_mask) and torch.equal(a.hga_mask, c.hga_mask))
 
 
 def test_rows_are_independent() -> None:
-    # multi-shaft (realistic); a real montage always has S≫1 anyway. (The old V=1
-    # degeneracy note belonged to the time guardian, deleted 2026-07-15 — the sampler
-    # no longer has any V-dependent constraint.)
     sc, geom = _session([8, 6, 6])
-    m = sample_masks(geom, 20, n_time=96, n_rows=8, generator=_gen(5))
+    m = sample_masks(geom, 20, n_time=128, n_rows=8, generator=_gen(5))
     assert not all(torch.equal(m.contact_mask[0], m.contact_mask[r]) for r in range(1, 8))
-    assert not all(torch.equal(m.frame_mask[0], m.frame_mask[r]) for r in range(1, 8))
+    assert not all(torch.equal(m.hga_mask[0], m.hga_mask[r]) for r in range(1, 8))
+    assert not all(torch.equal(m.mid_mask[0], m.mid_mask[r]) for r in range(1, 8))
 
 
 def test_only_valid_contacts_masked() -> None:
-    sc, geom = _session([7, 5])  # N=12
-    m = sample_masks(geom, 12, n_time=96, n_rows=4, generator=_gen())
+    sizes = [7, 5]
+    sc, geom = _session(sizes)  # N=12
+    m = sample_masks(geom, 12, n_time=128, n_rows=4, generator=_gen())
     assert m.contact_mask.shape == (4, 12)
-    assert m.contact_mask.sum(1).unique().tolist() == [round(V3MaskConfig().space_frac * 12)]
+    assert m.contact_mask.sum(1).unique().tolist() == [_expected_space(V3MaskConfig(), sizes)]
 
 
 def test_feasible_passes_for_realistic_seeg() -> None:
     sc, geom = _session([16, 12, 10, 9, 8, 6])  # N=61
     assert_mask_feasible(geom)
+    assert_time_feasible(128)
 
 
 def test_feasible_flags_whole_infeasible() -> None:
-    # one dominant grid block larger than D ⇒ no shaft fits under D ⇒ whole tier infeasible.
-    sc, geom = _session([40, 4, 4])  # N=48, D=24, largest=40>24
-    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.15)
+    sc, geom = _session([40, 4, 4])  # N=48, D≈24, largest=40>24
+    cfg = V3MaskConfig(space_frac=0.5, whole_shaft_frac=0.15, keep_alive=False)
     with pytest.raises(ValueError, match="whole-shaft infeasible"):
         assert_mask_feasible(geom, cfg)
+
+
+def test_time_feasible_flags_bad_clip_and_short_grid() -> None:
+    with pytest.raises(ValueError, match="multiple of SLOW_STRIDE"):
+        assert_time_feasible(100)
+    with pytest.raises(ValueError, match="clip too short"):
+        # n_time=16 ⇒ SLOW grid only 2 slots < block_w_band=4 ⇒ no leak-safe SLOW block fits.
+        assert_time_feasible(16)
+
+
+def test_time_feasible_passes_3s_clip() -> None:
+    assert_time_feasible(96)  # 3 s @ 32 Hz: n_slots=12, t_mid=48, all bands leak-safe
+
+
+# ── KEEP-ALIVE floor (Design B, L1-only predictor: no shaft may be fully masked) ──
+def _dead_shaft_rows(sc, geom, contact_mask: torch.Tensor) -> torch.Tensor:
+    r, n = contact_mask.shape
+    s = int(sc.n_shafts)
+    soc = geom.shaft_of_contact
+    vps = geom.valid.sum(1)
+    masked_per = torch.zeros(r, s, dtype=torch.long)
+    masked_per.scatter_add_(1, soc[None].expand(r, n), contact_mask.long())
+    return (masked_per == vps[None]).sum(1)
+
+
+def test_keepalive_no_dead_shaft_default() -> None:
+    sc, geom = _session([16, 12, 8, 6, 4, 4, 3, 2])  # N=55, has size-2/3/4
+    n = 55
+    for seed in range(6):
+        m = sample_masks(geom, n, n_time=128, n_rows=500, generator=_gen(seed))
+        dead = _dead_shaft_rows(sc, geom, m.contact_mask)
+        assert dead.sum().item() == 0, f"seed {seed}: {int(dead.sum())} dead-shaft events"
+
+
+def test_keepalive_off_allows_whole_drops() -> None:
+    # keep_alive=False + whole tier ⇒ whole shafts fully masked (dead by design).
+    sc, geom = _session([4, 4, 3, 3, 2, 4, 3, 2])  # tiny-stress, N=25
+    n = 25
+    cfg = V3MaskConfig(keep_alive=False, whole_shaft_frac=0.4)
+    m = sample_masks(geom, n, n_time=128, n_rows=500, generator=_gen(0), cfg=cfg)
+    assert _dead_shaft_rows(sc, geom, m.contact_mask).sum().item() > 0
+
+
+def test_keepalive_protects_every_shaft() -> None:
+    sc, geom = _session([8, 6, 5, 4])  # N=23
+    n = 23
+    m = sample_masks(geom, n, n_time=128, n_rows=200, generator=_gen(1))
+    vis = ~m.contact_mask
+    soc = geom.shaft_of_contact
+    for si in range(int(sc.n_shafts)):
+        idx = (soc == si).nonzero(as_tuple=True)[0]
+        assert vis[:, idx].any(1).all(), f"shaft {si} fully masked in some row"
+
+
+def test_keepalive_clamps_per_shaft_to_n_minus_one() -> None:
+    # size-2 shafts at space_frac 0.5 ⇒ round(1)=1 ≤ n_s−1=1 (already fits); size-2 keeps 1 visible.
+    sc, geom = _session([2, 2, 2, 2, 2])  # N=10, S=5
+    n = 10
+    m = sample_masks(geom, n, n_time=128, n_rows=50, generator=_gen(0))
+    assert (m.contact_mask.sum(1) == 5).all(), "each size-2 shaft masks exactly 1 ⇒ Σ=5"
+    assert _dead_shaft_rows(sc, geom, m.contact_mask).sum().item() == 0
+
+
+def test_keepalive_feasible_flags_all_size1() -> None:
+    sc, geom = _session([1, 1, 1, 1])  # N=4, every shaft size 1 ⇒ nothing maskable under keep-alive
+    with pytest.raises(ValueError, match="not in"):
+        assert_mask_feasible(geom)

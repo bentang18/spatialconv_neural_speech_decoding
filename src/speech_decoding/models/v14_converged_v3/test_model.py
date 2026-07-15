@@ -11,8 +11,13 @@ from __future__ import annotations
 import torch
 
 from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
-from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
+from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig, sample_masks
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+from speech_decoding.models.v14_converged_v3.pack_r4 import (
+    build_r4_grid,
+    build_visible_pack,
+    token_flags,
+)
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 N_PARCELS = 8
@@ -52,18 +57,28 @@ def test_end_to_end_bands_to_loss() -> None:
     assert out.loss.requires_grad
 
 
-def test_masked_count_is_constant_and_matches_frac() -> None:
-    # Dual-axis: n_masked = total masked CELLS = N·T − m_vis·t_kept, a per-session
-    # CONSTANT (independent of WHICH cells are masked) — verify it holds across seeds.
+def test_masked_query_count_is_constant_across_seeds() -> None:
+    # The compile-once-per-session contract: mask REALIZATION must not change any compiled
+    # shape. The predictor-query set (token_flags `masked`) has a per-session-CONSTANT size —
+    # masking.py fixes the per-shaft spatial d_s and per-band temporal counts and the time mask
+    # is global, so masked.sum() = (#masked contacts)·ΣT_b + (#visible contacts)·Σ(masked
+    # band-tokens) is independent of WHICH tokens are hidden ⇒ the visible-pack m_vis (the
+    # online encoder's compiled length) is seed-invariant. The margin-gated SCORED count
+    # (`n_masked`/in_loss) IS realization-dependent — it is the loss denominator, not a shape.
     sc, geom = _session()
     n = len(sc.labels)  # 13
-    cfg = V3MaskConfig(space_frac=0.5, time_frac=0.5)
-    model = V3ConvergedModel(n_parcels=N_PARCELS, mask_cfg=cfg)
-    a = model(_bands(n), geom, sc.parcel_id, generator=_gen(1))
-    b = model(_bands(n), geom, sc.parcel_id, generator=_gen(2))  # different mask
-    m_vis = n - round(0.5 * n)
-    t_kept = T32 - round(0.5 * T32)
-    assert a.n_masked == b.n_masked == n * T32 - m_vis * t_kept
+    grid = build_r4_grid(geom, n_time=T32)
+    cfg = V3MaskConfig(space_frac=0.5)
+
+    def shapes(seed):
+        m = sample_masks(geom, n, n_time=T32, n_rows=1, generator=_gen(seed), cfg=cfg)
+        masked, _ = token_flags(grid, m)
+        pack = build_visible_pack(grid, masked, sc.parcel_id[grid.contact])
+        return int(masked.sum()), pack.m_vis
+
+    (ma, va), (mb, vb) = shapes(1), shapes(2)  # two different mask realizations
+    assert ma == mb > 0  # session-constant query count
+    assert va == vb  # ⇒ seed-invariant compiled online length
 
 
 def test_backward_reaches_stem_and_online_towers() -> None:
@@ -100,9 +115,18 @@ def test_deterministic_given_generator() -> None:
 def test_batched_clips_get_independent_masks() -> None:
     sc, geom = _session()
     n = len(sc.labels)
-    model = V3ConvergedModel(n_parcels=N_PARCELS)
-    out = model(_bands(n, B=4), geom, sc.parcel_id, generator=_gen())
+    grid = build_r4_grid(geom, n_time=T32)
+    m = sample_masks(
+        geom, n, n_time=T32, n_rows=4, generator=_gen(), cfg=V3MaskConfig(space_frac=0.5)
+    )
+    masked, _ = token_flags(grid, m)  # (4, total)
+    per_row = masked.sum(1)
+    # per-clip query count is a session constant ⇒ every row hides the SAME number of tokens…
+    assert (per_row == per_row[0]).all() and int(per_row[0]) > 0
+    # …but the masks are INDEPENDENT: not every row hides the identical token set.
+    assert not bool((masked == masked[0]).all(1).all())
+    # and the model forward runs finite on the B=4 batch.
+    out = V3ConvergedModel(n_parcels=N_PARCELS)(
+        _bands(n, B=4), geom, sc.parcel_id, generator=_gen()
+    )
     assert torch.isfinite(out.loss)
-    m_vis = n - round(V3MaskConfig().space_frac * n)
-    t_kept = T32 - round(V3MaskConfig().time_frac * T32)
-    assert out.n_masked == 4 * (n * T32 - m_vis * t_kept)
