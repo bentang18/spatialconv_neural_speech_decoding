@@ -279,6 +279,30 @@ def test_nll_handles_bf16_cov_vs_fp32_target() -> None:
     assert ok
 
 
+def test_head_assembles_cov_in_fp32_under_bf16_autocast() -> None:
+    # REGRESSION (bf16 launch landmine #3, caught by the λ-drift probe): if the head assembles
+    # the covariance UNDER autocast, ``L @ Lᵀ`` runs in bf16 and a 6×6 covariance is not
+    # reliably PD once training drifts L — cholesky crashes mid-run (a stochastic ~hour-N kill
+    # the .float() in _nll_terms can't undo, since precision is lost in the bf16 matmul). The
+    # head must build the factor→cov in fp32 REGARDLESS of the autocast dtype. Lock the
+    # invariant that was violated: cov.dtype is fp32 and cov is PD under bf16 autocast, both
+    # for the fixed buffer floor and the per-position count-dependent floor.
+    torch.manual_seed(0)
+    head = GaussianStateHead(d_in=16)
+    feat = torch.randn(128, 16)
+    noise = count_dependent_noise_var(torch.randint(1, 40, (128,)))  # per-position floor
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        _, cov_fix = head(feat)                 # fixed buffer floor
+        _, cov_cnt = head(feat, noise=noise)    # count-dependent floor
+    for tag, cov in [("fixed", cov_fix), ("count-dep", cov_cnt)]:
+        is_fp32 = cov.dtype == torch.float32
+        torch.linalg.cholesky(cov)  # raises if the bf16-assembly regression returns
+        min_eig = float(torch.linalg.eigvalsh(cov).min())
+        print(f"[check] autocast cov {tag}: dtype={cov.dtype} min_eig={min_eig:.4f} "
+              f"{'OK' if is_fp32 and min_eig > 0 else 'VIOLATED'}")
+        assert is_fp32 and min_eig > 0
+
+
 def test_present_masked_marginal_matches_analytic_subblock() -> None:
     # A 1-electrode parcel scores the 3-D MEAN marginal = the exact (μ[:3], Σ[:3,:3]) NLL.
     mu, cov, x = _rand_gaussians(15, 2)

@@ -141,21 +141,27 @@ class GaussianStateHead(nn.Module):
         Either way ``cov = L Lᵀ + diag(floor)`` stays strictly PD, so the head remains the
         SOLE owner of positive-definiteness (the objective never sees a singular cov)."""
         mu = self.mu_head(feat)
-        raw = self.chol_head(feat)  # (..., n_tril)
+        # Assemble the covariance in fp32. Under bf16 autocast the chol_head Linear emits
+        # bf16, and a bf16 ``L @ Lᵀ`` (+ floor) is NOT reliably PD for a 6×6 covariance once
+        # training drifts L ill-conditioned — cholesky then fails mid-run (a STOCHASTIC crash
+        # the .float() in _nll_terms cannot undo, because the precision is already lost in the
+        # bf16 matmul). Do the factor→cov build in fp32; mu keeps the autocast dtype (the NLL
+        # upcasts it). [bf16 autocast landmine #3, caught by the λ-drift probe 2026-07-15]
+        raw = self.chol_head(feat).float()  # (..., n_tril) fp32
         # softplus the diagonal entries (strictly positive) — a valid Cholesky factor.
         diag_soft = torch.nn.functional.softplus(raw)
         vals = torch.where(self._diag_sel, diag_soft, raw)
-        L = feat.new_zeros(*feat.shape[:-1], self.dim, self.dim)
+        L = raw.new_zeros(*raw.shape[:-1], self.dim, self.dim)  # fp32
         L[..., self._tril_i, self._tril_j] = vals
-        cov = L @ L.transpose(-1, -2)
+        cov = L @ L.transpose(-1, -2)  # fp32 — PD-stable
         if noise is None:
-            cov = cov + torch.diag(self.noise_var.to(cov.dtype))
+            cov = cov + torch.diag(self.noise_var.float())
         else:
             if noise.shape[-1] != self.dim:
                 raise ValueError(
                     f"noise last dim {noise.shape[-1]} != head dim {self.dim}"
                 )
-            cov = cov + torch.diag_embed(noise.to(cov.dtype))  # (..., dim, dim)
+            cov = cov + torch.diag_embed(noise.float())  # (..., dim, dim)
         return mu, cov
 
 
