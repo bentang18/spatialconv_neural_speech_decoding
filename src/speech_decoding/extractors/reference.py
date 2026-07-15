@@ -47,7 +47,7 @@ class CARIeegExtractor(IeegExtractor):
     -> filter/notch/hilbert/scaler/clamp.
     """
 
-    car: tp.Literal["global", "shaft"] | None = None
+    car: tp.Literal["global", "shaft", "group"] | None = None
 
     def model_post_init(self, log__):
         super().model_post_init(log__)
@@ -84,5 +84,24 @@ class CARIeegExtractor(IeegExtractor):
                 if idx.size == 0:
                     continue
                 data[idx] -= data[idx].mean(axis=0, keepdims=True)
+            return raw
+        if self.car == "group":
+            temp = raw.info.get("temp") or {}
+            cmap = temp.get("car_groups")
+            if cmap is None:
+                raise ValueError(
+                    "car='group' requires an authoritative per-run map at "
+                    "raw.info['temp']['car_groups'] (set by the Study's _load_raw)."
+                )
+            groups = [cmap[name] for name in raw.ch_names]
+            drop = []
+            for g in set(groups):
+                idx = np.array([i for i, s in enumerate(groups) if s == g])
+                if idx.size <= 1:               # singleton: no valid CAR ref -> DROP
+                    drop.extend(idx.tolist())   #   (orphaned tail / guard-1 remnant; dynamic)
+                    continue
+                data[idx] -= data[idx].mean(axis=0, keepdims=True)
+            if drop:
+                raw.drop_channels([raw.ch_names[i] for i in sorted(set(drop))])
             return raw
         raise ValueError(f"Unknown car mode: {self.car!r}")

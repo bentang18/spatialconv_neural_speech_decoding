@@ -32,7 +32,12 @@ import pandas as pd
 from neuralset.events import study
 
 from speech_decoding.studies.ram_cohort.guard1_static import ram_extra_bad
-from speech_decoding.studies.ram_cohort.loader import TARGET_RATE_HZ, ram_load_raw
+from speech_decoding.studies.ram_cohort.loader import (
+    TARGET_RATE_HZ,
+    ram_car_groups,
+    ram_load_raw,
+    read_channels_tsv,
+)
 
 _REQUIRED_COLUMNS: tuple[str, ...] = (
     "subject_bids",
@@ -180,4 +185,15 @@ class RamCohortStudy(study.Study):
             target_rate=TARGET_RATE_HZ,
         )
         info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="seeg")
-        return mne.io.RawArray(data, info, verbose=False)
+        raw = mne.io.RawArray(data, info, verbose=False)
+        # #94 group-CAR: stash the authoritative per-run {name: group} map (from the
+        # channels.tsv ``group`` column) so ``_apply_car`` (car="group") can reference
+        # each contact against its own shaft/group. Must cover every surviving name.
+        meta = read_channels_tsv(channels_tsv)
+        groups = ram_car_groups(ch_names, meta)
+        car_groups = {nm: g for nm, g in zip(ch_names, groups)}
+        assert set(car_groups) == set(ch_names), (
+            "car_groups map does not cover all surviving ch_names"
+        )
+        raw.info["temp"] = {"car_groups": car_groups}
+        return raw

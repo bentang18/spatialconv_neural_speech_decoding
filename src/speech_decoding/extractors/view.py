@@ -1089,6 +1089,10 @@ class MultiStftView(CARIeegExtractor):
     # apply_log=False, and no waveform-domain transforms (baseline/scale/clamp),
     # which ``_validate_spec_cache_config`` enforces at construction.
     spec_cache_dir: str | None = None
+    # Per-run group-CAR digest (#94): folded into the spec-cache namespace
+    # ONLY when car=='group' so group-referenced RAM caches are separated from
+    # shaft/global caches; default '' + car!='group' -> byte-identical namespace.
+    car_groups_digest: str = ""
     # Lightweight-redeploy path (Option B / DeltaAI): serve clips from the on-disk
     # spec cache ALONE — no extractor cache, no raw h5 on the target. ``prepare``
     # then builds the index/channels/robust-z stats from the .npy/.json/.stats.npz
@@ -1249,6 +1253,7 @@ class MultiStftView(CARIeegExtractor):
         # empty subdir. Exclude it for both uid stability and cache reuse.
         return super()._exclude_from_cache_uid() + [
             "lof_report_path", "spec_cache_dir", "spec_only",
+            "car_groups_digest",
         ]
 
     def n_time_bins_for_duration(self, duration_s: float) -> int:
@@ -1920,7 +1925,13 @@ class MultiStftView(CARIeegExtractor):
             # cartesian (slow phase band) vs mag must NOT share a cache dir: same
             # band geometry but a doubled freq axis + different stored values (§4).
             self.band_channelization if self.front_end == "band" else None,
-        )).encode()
+        ))
+        # #94: fold the per-run group-CAR digest into the namespace ONLY for
+        # car=='group'. For any other car the tuple is byte-identical to before,
+        # so existing Cogan/BT/shaft/global caches keep their namespace.
+        if self.car == "group":
+            sig = repr((sig, self.car_groups_digest))
+        sig = sig.encode()
         digest = hashlib.sha1(sig).hexdigest()[:12]
         return f"{self.infra.uid()}-fe{digest}"  # type: ignore[attr-defined]
 

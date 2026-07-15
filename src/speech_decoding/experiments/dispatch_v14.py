@@ -71,6 +71,7 @@ from speech_decoding.studies.braintreebank.study import (
     Wang2024Treebank,
 )
 from speech_decoding.studies.cogan_dcohort.study import DCohortStudy
+from speech_decoding.studies.ram_cohort.study import RamCohortStudy
 from speech_decoding.studies.braintreebank.word_events import (
     BTWordEvents,
     DEFAULT_PRETRAIN_HOLDOUT_FRACTION,
@@ -3254,7 +3255,7 @@ def _parser() -> argparse.ArgumentParser:
     # Corpus/study selector. 'bt' (default) is the ENTIRE existing dispatch,
     # unchanged. 'cogan' routes a DCohortStudy through build_cogan_cache_experiment
     # for the spec-cache bake ONLY (cache-only path); no Cogan training is wired.
-    p.add_argument("--study", dest="study", choices=("bt", "cogan"), default="bt",
+    p.add_argument("--study", dest="study", choices=("bt", "cogan", "ram"), default="bt",
                    help="Corpus to dispatch. 'bt' (default) = Wang2024Treebank "
                         "(unchanged). 'cogan' = DCohortStudy 3-band spec-cache bake; "
                         "requires --cache-only --cache-band --cache-session-index "
@@ -3266,6 +3267,13 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--cogan-notch-hz", dest="cogan_notch_hz", type=float, default=60.0,
                    help="Mains notch for the Cogan bake. All Duke D-cohort runs are "
                         "60 Hz (verified in the manifest power_line_hz). Default 60.0.")
+    p.add_argument("--ram-manifest", dest="ram_manifest", default=None,
+                   help="RAM cohort run manifest CSV (build_ram_manifest.py). Required "
+                        "with --study ram; row order = --cache-session-index order "
+                        "(same order the RAM guard-1 array enumerates).")
+    p.add_argument("--ram-notch-hz", dest="ram_notch_hz", type=float, default=60.0,
+                   help="Mains notch for the RAM bake. RAM runs are uniformly 60 Hz "
+                        "(verified in the manifest power_line_hz). Default 60.0.")
     # Layer-2 bad-electrode clip filter (#180). SSL-only: clips overlapping a
     # precomputed glitch span are dropped before sampling. P4 eval untouched
     # (build gates this to the SSL phases). Default None = no filtering.
@@ -4744,19 +4752,23 @@ def _cogan_common_fe_kwargs(
     )
 
 
-def build_cogan_cache_experiment(
+def build_cohort_cache_experiment(
     *,
+    study_cls: tp.Any,
+    manifest: str | None,
+    manifest_env: str,
+    cohort_label: str,
+    car: str | None,
     cache_band: str | None,
     cache_session_index: int | None,
     spec_cache_dir: str | None,
-    cogan_manifest: str | None,
     notch_hz: float,
     c_max: int,
     session_robust_z: bool,
     spec_only: bool,
     clip_len: float,
 ) -> tp.Any:
-    """Cogan D-cohort 3-band spec-cache bake experiment (cache-only; NO training).
+    """Generic cohort 3-band spec-cache bake experiment (cache-only; NO training).
 
     Routes a :class:`DCohortStudy` through the SAME :class:`MultiStftView` band view
     the BT v3 ``--cache-band`` build uses, so the produced |STFT| robust-z memmaps
@@ -4772,28 +4784,28 @@ def build_cogan_cache_experiment(
 
     if cache_band not in _COGAN_CACHE_BANDS:
         raise SystemExit(
-            f"--study cogan: --cache-band {cache_band!r} not a v3 band; choose from "
+            f"--study {cohort_label}: --cache-band {cache_band!r} not a v3 band; choose from "
             f"{tuple(_COGAN_CACHE_BANDS)}"
         )
-    if not cogan_manifest:
-        raise SystemExit("--study cogan requires --cogan-manifest CSV")
+    if not manifest:
+        raise SystemExit(f"--study {cohort_label} requires --{cohort_label}-manifest CSV")
     # DCohortStudy drops manifest_path from its cache uid, so a study reconstructed
     # by SpecialLoader.from_json at bake time has it empty. Publish it to the env the
     # study's _resolved_manifest_path() falls back to (mirrors BT's ROOT_DIR env), so
     # in-process + forked-worker _load_raw calls resolve the same CSV. Single source:
     # the --cogan-manifest arg drives both the study field and this env.
-    os.environ["COGAN_MANIFEST"] = cogan_manifest
+    os.environ[manifest_env] = manifest
     if spec_cache_dir is None:
-        raise SystemExit("--study cogan cache bake requires --spec-cache-dir")
+        raise SystemExit(f"--study {cohort_label} cache bake requires --spec-cache-dir")
     if cache_session_index is None:
-        raise SystemExit("--study cogan cache bake requires --cache-session-index")
+        raise SystemExit(f"--study {cohort_label} cache bake requires --cache-session-index")
 
     # The base study.Study requires ``path`` — a DATA DIRECTORY it mkdir's (the real
     # voltage comes from the manifest's edf_path, so this is just an anchor). It is
     # dropped from the class uid (_cls_kwargs), so it never perturbs a cache key; we
     # only need a writable /work dir. Make it per-(session) unique so the 2814 array
     # tasks never race on the same mkdir. Sits beside the spec cache on /work.
-    study_root = Path(spec_cache_dir).parent / "cogan_study_root" / f"idx{cache_session_index}"
+    study_root = Path(spec_cache_dir).parent / f"{cohort_label}_study_root" / f"idx{cache_session_index}"
     study_root.mkdir(parents=True, exist_ok=True)
     study_path = str(study_root)
 
@@ -4803,7 +4815,7 @@ def build_cogan_cache_experiment(
     # arrays (all three drive off the same manifest row order).
     sessions = [
         (int(tl["subject_id"]), int(tl["trial_id"]))
-        for tl in DCohortStudy(path=study_path, manifest_path=cogan_manifest).iter_timelines()
+        for tl in study_cls(path=study_path, manifest_path=manifest).iter_timelines()
     ]
     if not 0 <= cache_session_index < len(sessions):
         raise SystemExit(
@@ -4812,17 +4824,35 @@ def build_cogan_cache_experiment(
         )
     s_id, t_id = sessions[cache_session_index]
     print(
-        f"[cache-only cogan] session-index {cache_session_index} -> "
+        f"[cache-only {cohort_label}] session-index {cache_session_index} -> "
         f"(subject_id={s_id}, trial_id={t_id}) of {len(sessions)} manifest sessions"
     )
 
-    study_obj = DCohortStudy(
+    study_obj = study_cls(
         path=study_path,
-        manifest_path=cogan_manifest,
+        manifest_path=manifest,
         session_subset=((s_id, t_id),),
         infra_timelines={"cluster": None},
     )
     chain = ns.Chain(steps=[study_obj])
+
+    # #94 group-CAR namespacing (car=="group" ONLY): bind this run's spec cache to
+    # the EXACT per-run group map + guard-1 drops it is built with, so any later
+    # change to either (channels.tsv edit / guard-1 refresh) lands in a DIFFERENT
+    # cache dir instead of silently reusing a stale spec. car != "group" (BT/Cogan)
+    # leaves the digest "" so the namespace is byte-identical to before.
+    car_groups_digest = ""
+    if car == "group":
+        import hashlib as _hashlib
+        from speech_decoding.studies.ram_cohort.guard1_static import ram_extra_bad
+        from speech_decoding.studies.ram_cohort.loader import read_channels_tsv
+        _row = study_obj._row_for({"subject_id": s_id, "trial_id": t_id})
+        _meta = read_channels_tsv(_row["channels_tsv_path"])
+        sorted_group_rows = sorted((nm, m.get("group", "")) for nm, m in _meta.items())
+        sorted_guard1_dropped_names = sorted(ram_extra_bad(s_id, t_id))
+        car_groups_digest = _hashlib.sha1(
+            repr((sorted_group_rows, sorted_guard1_dropped_names)).encode()
+        ).hexdigest()[:16]
 
     common_fe_kwargs = _cogan_common_fe_kwargs(
         notch_hz=notch_hz, c_max=c_max,
@@ -4830,10 +4860,18 @@ def build_cogan_cache_experiment(
     )
     band_const = _COGAN_CACHE_BANDS[cache_band]
     band_spec_cache = str(Path(spec_cache_dir) / f"band_{cache_band}")
+    # ``car`` override: None keeps the common-FE default (car="shaft" — the BT/Cogan
+    # name-based CAR that _cogan_common_fe_kwargs already sets), "group" selects the
+    # RAM explicit-group CAR. Applied on common_fe_kwargs (which already carries
+    # car="shaft") rather than as a SECOND kwarg, so MultiStftView never gets a
+    # duplicate `car` argument. cogan (car=None) is therefore byte-identical.
+    if car is not None:
+        common_fe_kwargs["car"] = car
     view = MultiStftView(
         **common_fe_kwargs, front_end="band", **band_const,
         hop_length=int(band_const["band_hop"]),
         spec_cache_dir=band_spec_cache,
+        car_groups_digest=car_groups_digest,
     )
 
     data = Data(
@@ -4851,6 +4889,26 @@ def build_cogan_cache_experiment(
         num_workers=0,
     )
     return _types.SimpleNamespace(data=data)
+
+
+def build_cogan_cache_experiment(**kw: tp.Any) -> tp.Any:
+    """Thin Cogan wrapper over :func:`build_cohort_cache_experiment` (car=None ⇒ the
+    front-end + spec-cache namespace are byte-identical to the pre-#94 Cogan bake)."""
+    return build_cohort_cache_experiment(
+        study_cls=DCohortStudy,
+        manifest=kw["cogan_manifest"],
+        manifest_env="COGAN_MANIFEST",
+        cohort_label="cogan",
+        car=None,
+        cache_band=kw["cache_band"],
+        cache_session_index=kw["cache_session_index"],
+        spec_cache_dir=kw["spec_cache_dir"],
+        notch_hz=kw["notch_hz"],
+        c_max=kw["c_max"],
+        session_robust_z=kw["session_robust_z"],
+        spec_only=kw["spec_only"],
+        clip_len=kw["clip_len"],
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4876,6 +4934,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         if not args.cogan_manifest:
             raise SystemExit("--study cogan requires --cogan-manifest CSV")
+    if args.study == "ram":
+        if not args.cache_only:
+            raise SystemExit(
+                "--study ram is spec-cache-bake-only; pass --cache-only "
+                "--cache-band {v3slow,v3mid,hga} --cache-session-index N. No RAM "
+                "training path is wired."
+            )
+        if not args.ram_manifest:
+            raise SystemExit("--study ram requires --ram-manifest CSV")
     # Predictor depth half-rule (Ben 2026-06-12). Each JEPA predictor defaults to
     # HALF the depth of the encoder stack it predicts from: M2 (front-end) tracks
     # --depth, M4 (parcel/latent) tracks --latent-depth. At the canonical B37
@@ -5460,6 +5527,22 @@ def main(argv: list[str] | None = None) -> int:
             spec_cache_dir=args.spec_cache_dir,
             cogan_manifest=args.cogan_manifest,
             notch_hz=args.cogan_notch_hz,
+            c_max=args.c_max,
+            session_robust_z=args.session_robust_z,
+            spec_only=args.spec_only,
+            clip_len=args.clip_len,
+        )
+    elif args.study == "ram":
+        xp = build_cohort_cache_experiment(
+            study_cls=RamCohortStudy,
+            manifest=args.ram_manifest,
+            manifest_env="RAM_MANIFEST",
+            cohort_label="ram",
+            car="group",
+            cache_band=args.cache_band,
+            cache_session_index=args.cache_session_index,
+            spec_cache_dir=args.spec_cache_dir,
+            notch_hz=args.ram_notch_hz,
             c_max=args.c_max,
             session_robust_z=args.session_robust_z,
             spec_only=args.spec_only,
