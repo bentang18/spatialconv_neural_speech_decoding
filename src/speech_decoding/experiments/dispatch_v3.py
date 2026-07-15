@@ -266,6 +266,10 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
         _StepTimeCallback(),
         SSLHealthMonitorV3(every_n_steps=args.monitor_every_n_steps),
     ]
+    if args.wandb_project:  # LearningRateMonitor needs a logger; verifies the 5k warmup ramp
+        from lightning.pytorch.callbacks import LearningRateMonitor
+
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
     if args.ckpt_ladder_every > 0 and args.ckpt_dir:
         from lightning.pytorch.callbacks import ModelCheckpoint
 

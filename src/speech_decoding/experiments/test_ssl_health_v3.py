@@ -117,6 +117,39 @@ def test_family_b_tap_keys_finite() -> None:
     assert not any(key.startswith("train_mon_enc3_") for key in logged)
 
 
+def test_input_tripwire_flags_nonfinite_band() -> None:
+    """The per-band input tripwire emits nonfinite_frac/absmax/mean/std for every band
+    and catches a NaN injected into one band (frac>0 there, 0 for the clean bands)."""
+    mod = _module()
+    batch = _session_batch(n_rows=3)
+    batch.bands[2][0, 0, 0, 0] = float("nan")  # corrupt one HGA token
+    logged: dict[str, float] = {}
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb = SSLHealthMonitorV3(every_n_steps=1)
+    cb.on_train_batch_end(
+        trainer=_fake_trainer(), pl_module=mod,
+        outputs=None, batch=batch, batch_idx=0,
+    )
+    for band in ("slow", "mid", "hga"):
+        for suffix in ("nonfinite_frac", "absmax", "mean", "std"):
+            assert f"train_mon_input_{band}_{suffix}" in logged, f"{band}_{suffix}"
+    assert logged["train_mon_input_hga_nonfinite_frac"] > 0.0
+    assert logged["train_mon_input_slow_nonfinite_frac"] == 0.0
+
+
+def test_input_tripwire_noop_without_batch() -> None:
+    """batch=None (the Family-B no-tap tests pass it) ⇒ the tripwire logs nothing."""
+    mod = _module()
+    mod._last_taps = None
+    logged: dict[str, float] = {}
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    SSLHealthMonitorV3().on_train_batch_end(
+        trainer=_fake_trainer(), pl_module=mod,
+        outputs=None, batch=None, batch_idx=0,
+    )
+    assert not logged
+
+
 def test_family_b_noop_without_taps() -> None:
     """No stashed taps (off-cadence step) ⇒ ``on_train_batch_end`` logs nothing —
     the <5% budget guarantee: Family B is pure off-cost when not due."""

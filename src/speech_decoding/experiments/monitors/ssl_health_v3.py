@@ -96,11 +96,15 @@ class SSLHealthMonitorV3(pl.Callback):
         self, trainer: pl.Trainer, pl_module: pl.LightningModule,
         outputs, batch, batch_idx: int,  # noqa: ARG002
     ) -> None:
-        taps = getattr(pl_module, "_last_taps", None)
-        if not taps:
-            return
         accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
         if (batch_idx + 1) % accum != 0:
+            return
+        # input tripwire: per-band raw-token health BEFORE any tap read — catches a
+        # corrupt/NaN band cache or a robust-z blow-up at the door, independent of taps.
+        if self._due(int(getattr(pl_module, "global_step", 0))):
+            self._input_tripwire(pl_module, batch)
+        taps = getattr(pl_module, "_last_taps", None)
+        if not taps:
             return
         # rankme + feat_std at the encoder's final block (12). The block-3 tap was
         # removed (Ben 2026-07-10): the pre-first-L2 rank/std comparison is no longer
@@ -111,6 +115,30 @@ class SSLHealthMonitorV3(pl.Callback):
         # tier-split explained-var / var-ratio / L1.
         self._tier_stats(pl_module, taps, "whole")
         self._tier_stats(pl_module, taps, "intra")
+
+    _BAND_NAMES: tuple[str, ...] = ("slow", "mid", "hga")
+
+    def _input_tripwire(self, pl_module: pl.LightningModule, batch) -> None:
+        """Per-band raw-input |STFT| token health (the v3 3-band analog of r2's
+        ``input_electrode_tokens_lfs/hga`` tripwire): fraction non-finite, |max|, mean,
+        std over the batch's band tensors. A NaN/inf cache or a normalization blow-up
+        shows here before it silently poisons the loss. No-op if the batch is absent."""
+        bands = getattr(batch, "bands", None)
+        if not bands:
+            return
+        for x, name in zip(bands, self._BAND_NAMES):
+            x = x.detach().to(torch.float32)
+            prefix = f"train_mon_input_{name}_"
+            # Single-pass reductions only — NO boolean-mask allocation (the costly part).
+            # A NaN makes mean/std/absmax NaN, which nonfinite_frac already flags; both
+            # are visible in the log, so masking buys nothing but a full-tensor copy.
+            pl_module.log(
+                f"{prefix}nonfinite_frac",
+                (~torch.isfinite(x)).to(torch.float32).mean(), on_step=True,
+            )
+            pl_module.log(f"{prefix}absmax", x.abs().amax(), on_step=True)
+            pl_module.log(f"{prefix}mean", x.mean(), on_step=True)
+            pl_module.log(f"{prefix}std", x.std(unbiased=False), on_step=True)
 
     def _rank_and_std(
         self, pl_module: pl.LightningModule, tap: Tensor, *, key: str
