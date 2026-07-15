@@ -132,44 +132,50 @@ def test_ema_teacher_advances_once_per_step() -> None:
     assert after == before + 1
 
 
-def test_context_lambda_schedule() -> None:
-    # #66 upstream Lambda_LinearWarmupHold: off before start, linear ramp, hold after.
-    from speech_decoding.experiments.v14_converged_v3_module import context_lambda
+def _session_batch_with_stats(*, n_rows: int = 2):
+    # Same synthetic session as _session_batch, plus per-parcel frozen z-score stats
+    # ALREADY gathered to (P, 6) for the two present parcels (as build_session_setup
+    # would produce). std=1 ⇒ z-score is identity, so the target stays finite.
+    batch = _session_batch(n_rows=n_rows)
+    n_parcels_present = int(batch.parcel_id.unique().numel())
+    return V3Batch(
+        bands=batch.bands,
+        geom=batch.geom,
+        parcel_id=batch.parcel_id,
+        stat_mean=torch.zeros(n_parcels_present, 6),
+        stat_std=torch.ones(n_parcels_present, 6),
+    )
 
-    assert context_lambda(0, 0.5, 15_000, 30_000) == 0.0  # before start
-    assert context_lambda(14_999, 0.5, 15_000, 30_000) == 0.0
-    assert context_lambda(15_000, 0.5, 15_000, 30_000) == 0.0  # ramp start = 0
-    assert abs(context_lambda(22_500, 0.5, 15_000, 30_000) - 0.25) < 1e-9  # midpoint
-    assert context_lambda(30_000, 0.5, 15_000, 30_000) == 0.5  # hold
-    assert context_lambda(100_000, 0.5, 15_000, 30_000) == 0.5
-    assert context_lambda(50_000, 0.0, 15_000, 30_000) == 0.0  # hold<=0 ⇒ always off
 
-
-def test_training_step_context_off_by_default() -> None:
-    # Library default hold=0.0 ⇒ the context head gets no gradient (static-off).
-    # It must ALSO be frozen (requires_grad=False) so DDP's reducer skips it under
-    # find_unused_parameters=False — otherwise the multi-GPU run aborts on it.
+def test_secondary_off_by_default_freezes_perceiver() -> None:
+    # Default secondary_active=False ⇒ no stats ever reach forward, so the write-only
+    # Perceiver head gets no gradient. It must be FROZEN (requires_grad=False) so DDP's
+    # reducer skips it under find_unused_parameters=False — else the multi-GPU run aborts.
     mod = _module()
-    assert mod._context_lambda_hold == 0.0
-    ctx_head = mod.model.objective.pred_to_target_context
-    assert all(not p.requires_grad for p in ctx_head.parameters())
-    assert ctx_head.weight not in set(mod._trainable_parameters())
-    mod.training_step(_session_batch(n_rows=2), 0).backward()
-    assert all(p.grad is None for p in ctx_head.parameters())
+    assert mod._secondary_active is False
+    perceiver = mod.model.objective.perceiver
+    assert perceiver is not None  # deep_sup default ON ⇒ the head exists
+    assert all(not p.requires_grad for p in perceiver.parameters())
+    trainable = set(mod._trainable_parameters())
+    assert all(p not in trainable for p in perceiver.parameters())
+    out_loss = mod.training_step(_session_batch(n_rows=2), 0)  # JEPA-only, no stats
+    out_loss.backward()
+    assert all(p.grad is None for p in perceiver.parameters())
 
 
-def test_training_step_with_context_loss_trains_head() -> None:
-    # hold>0 with the ramp already complete at step 0 (start=end=0 ⇒ λ=hold at step 0);
-    # the module passes a 0-d tensor and the context head is trained.
-    model = V3ConvergedModel(n_parcels=N_PARCELS)
+def test_secondary_active_trains_perceiver_on_stats() -> None:
+    # secondary_active=True + per-session stats in the batch ⇒ the Gaussian-NLL fires and
+    # the write-only Perceiver receives gradient. The total is finite and graph-connected.
+    model = V3ConvergedModel(n_parcels=N_PARCELS)  # deep_sup default ON
     mod = V14ConvergedV3Module(
         model=model, optim_config=_optim_config(weight_decay=0.04),
-        context_lambda_hold=0.5, context_warmup_start=0, context_warmup_end=0,
+        secondary_active=True,
     )
-    loss = mod.training_step(_session_batch(n_rows=2), 0)
+    perceiver = mod.model.objective.perceiver
+    assert all(p.requires_grad for p in perceiver.parameters())  # NOT frozen
+    loss = mod.training_step(_session_batch_with_stats(n_rows=2), 0)
     assert loss.ndim == 0 and torch.isfinite(loss)
     loss.backward()
-    ctx_head = mod.model.objective.pred_to_target_context
     assert any(
-        p.grad is not None and p.grad.abs().sum() > 0 for p in ctx_head.parameters()
+        p.grad is not None and p.grad.abs().sum() > 0 for p in perceiver.parameters()
     )

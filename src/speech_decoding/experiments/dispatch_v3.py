@@ -48,6 +48,7 @@ from speech_decoding.models.v14_converged_v3.datamodule import V3DataModule
 from speech_decoding.models.v14_converged_v3.dataset import V3SessionSpec
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+from speech_decoding.models.v14_converged_v3.objective import LAMBDA_NLL
 from speech_decoding.models.v14_converged_v3.session_loader import (
     ParcelFn,
     load_v3_sessions,
@@ -204,6 +205,7 @@ def build_v3_training(
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
+        lambda_nll=getattr(args, "lambda_nll", LAMBDA_NLL),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -213,9 +215,7 @@ def build_v3_training(
     module = V14ConvergedV3Module(
         model=model, optim_config=optim, seed=args.seed,
         monitor_every_n_steps=args.monitor_every_n_steps,
-        context_lambda_hold=getattr(args, "context_lambda", 0.0),
-        context_warmup_start=getattr(args, "context_warmup_start", 15_000),
-        context_warmup_end=getattr(args, "context_warmup_end", 30_000),
+        secondary_active=_secondary_active(args),
     )
     dm = V3DataModule(
         sessions,
@@ -231,21 +231,29 @@ def build_v3_training(
     return module, dm, trainer
 
 
+def _secondary_active(args: argparse.Namespace) -> bool:
+    """The secondary Gaussian-NLL is ON iff a state-stats dir is configured (the
+    datamodule then supplies per-session stats and the write-only Perceiver receives
+    gradient). deep_sup is required for the Perceiver to exist at all."""
+    return bool(getattr(args, "state_stats_dir", None)) and bool(
+        getattr(args, "deep_sup", True)
+    )
+
+
 def _enabled_optional_modules(args: argparse.Namespace) -> list[str]:
     """Optional modules that join the TRAINABLE set beyond the r1/r2 plain-JEPA
     baseline (encoder + EMA teacher + predictor + ``pred_to_target``).
 
     Each entry is ``"<module> (<flag that enabled it>)"``. The r3 gate below fires on a
     NON-EMPTY list under multi-GPU static_graph — the crash surface is "the trainable
-    parameter set grew", not the context head specifically, so a new optional module
-    must be ADDED HERE THE MOMENT IT LANDS or it walks into the same crash:
-
-      * r4 secondary prediction head — add when it lands.
-      * r4 Perceiver latents + FiLM parameters — add when they land.
-    """
+    parameter set grew", not any one head, so a new optional module must be listed HERE
+    or it walks into the same crash. r4's secondary write-only Perceiver Gaussian-NLL is
+    exactly such a module: when --state-stats-dir is set the Perceiver receives gradient
+    every step (same shape as r3's always-connected context head). r3 died on this under
+    static_graph, so the launch must run --no-ddp-static-graph (the default) or ack it."""
     enabled: list[str] = []
-    if getattr(args, "context_lambda", 0.0) > 0.0:
-        enabled.append("pred_to_target_context (--context-lambda > 0)")
+    if _secondary_active(args):
+        enabled.append("secondary Perceiver Gaussian-NLL (--state-stats-dir)")
     return enabled
 
 
@@ -407,14 +415,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=1,
                    help="wandb flush cadence; 1 = per-step resolution (Ben 2026-07-11) "
                         "so update_cos/grad-spike/feat_std are not window-averaged away")
-    p.add_argument("--context-lambda", dest="context_lambda", type=float, default=0.0,
-                   help="context-loss hold value (#66, V-JEPA 2.1 predict_all): off "
-                        "before --context-warmup-start, linear ramp to this, then hold. "
-                        "Default 0.0 = OFF (Ben 2026-07-10); set 0.5 to enable the ramp")
-    p.add_argument("--context-warmup-start", dest="context_warmup_start", type=int,
-                   default=15_000, help="context-loss λ ramp start step (default 15000)")
-    p.add_argument("--context-warmup-end", dest="context_warmup_end", type=int,
-                   default=30_000, help="context-loss λ ramp end / hold step (default 30000)")
+    p.add_argument("--state-stats-dir", dest="state_stats_dir", default=None,
+                   help="dir of per-subject frozen state-norm tables (sub-<id>.npz with "
+                        "stat_mean/stat_std, each (n_parcels, 6) indexed by parcel id "
+                        "VALUE). Present ⇒ the secondary write-only Perceiver Gaussian-NLL "
+                        "is ON (total = JEPA_L1 + λ·NLL); omit ⇒ JEPA-only. Requires "
+                        "--deep-sup (the Perceiver reads the deep-sup taps).")
+    p.add_argument("--lambda-nll", dest="lambda_nll", type=float, default=LAMBDA_NLL,
+                   help="secondary Gaussian-NLL weight λ in total = JEPA_L1 + λ·NLL "
+                        f"(contract §5 open knob; default {LAMBDA_NLL}). No effect without "
+                        "--state-stats-dir.")
     p.add_argument("--deep-sup", dest="deep_sup",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="deep self-supervision (#61, V-JEPA 2.1 copy-exactly): tap "
@@ -437,7 +447,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ack-r3-static-graph", dest="ack_r3_static_graph",
                    action="store_true",
                    help="override the r3 crash gate and launch an optional-module run "
-                        "(e.g. --context-lambda>0) with multi-GPU static_graph anyway "
+                        "(e.g. --state-stats-dir set) with multi-GPU static_graph anyway "
                         "(this killed r3 at the first backward)")
     p.add_argument("--same-session-ranks", dest="same_session_ranks",
                    action=argparse.BooleanOptionalAction, default=True,
@@ -488,6 +498,7 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         parcel_fn=make_bt_parcel_fn(args.bt_root),
         lof_report_path=args.lof_report_path,
         winsor=(args.winsor_slow, args.winsor_mid, args.winsor_hga),
+        state_stats_dir=args.state_stats_dir,
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:

@@ -39,6 +39,7 @@ from speech_decoding.models.v14_converged_v3.masking import (
     sample_masks,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
+    LAMBDA_NLL,
     JepaOutput,
     V3JepaObjective,
 )
@@ -52,14 +53,18 @@ class V3ConvergedModel(nn.Module):
         mask_cfg: V3MaskConfig = V3MaskConfig(),
         target_ln: bool = True,
         deep_sup: bool = True,
+        lambda_nll: float = LAMBDA_NLL,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
         # EMAs the patch-embed too), so the model owns only the objective + mask cfg.
         # deep_sup default ON (#61, Ben-greenlit copy-exactly); deep_sup=False = the
-        # single-tap ablation arm.
+        # single-tap ablation arm. lambda_nll (§5 open knob) is the secondary
+        # Gaussian-NLL weight in total = JEPA_L1 + λ·NLL; it only matters when the
+        # per-session frozen state-stats are supplied (secondary opt-in).
         self.objective = V3JepaObjective(
-            n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup
+            n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
+            lambda_nll=lambda_nll,
         )
         self.mask_cfg = mask_cfg
 

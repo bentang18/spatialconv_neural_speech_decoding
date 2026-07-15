@@ -43,16 +43,6 @@ from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
 _MASK_SEED_STRIDE = 1_000_003
 
 
-def context_lambda(step: int, hold: float, start: int, end: int) -> float:
-    """Upstream ``Lambda_LinearWarmupHold`` (modules.py:523): 0 before ``start``,
-    linear ramp to ``hold`` across ``[start, end]``, constant ``hold`` after. v3
-    context-loss schedule (#66) — Ben: off 15k → ramp 15k–30k → hold 0.5."""
-    if hold <= 0.0 or step < start:
-        return 0.0
-    if step >= end:
-        return hold
-    return hold * (step - start) / (end - start)
-
 # V3Batch (bands / geom / parcel_id, shared per session) is the data contract the
 # datamodule's ``v3_collate`` produces; re-exported here so callers that imported it
 # from this module keep working after the definition moved to the models package.
@@ -68,9 +58,7 @@ class V14ConvergedV3Module(pl.LightningModule):
         seed: int = 33,
         monitor_every_n_steps: int = 1,
         wd_exclude_norms: bool = True,
-        context_lambda_hold: float = 0.0,
-        context_warmup_start: int = 15_000,
-        context_warmup_end: int = 30_000,
+        secondary_active: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -78,20 +66,19 @@ class V14ConvergedV3Module(pl.LightningModule):
         self.seed = int(seed)
         self.monitor_every_n_steps = max(int(monitor_every_n_steps), 1)
         self._wd_exclude_norms = wd_exclude_norms
-        # Context-loss schedule (#66). hold<=0 ⇒ feature OFF (the pure plain-JEPA arm):
-        # forward gets a python 0.0 (compile-static skip). hold>0 ⇒ every step passes a
-        # 0-d λ tensor (value 0 pre-start) so the compiled graph stays invariant across
-        # the ramp. Library default OFF; the dispatch flag sets Ben's 0.5 for the run.
-        self._context_lambda_hold = float(context_lambda_hold)
-        self._context_warmup_start = int(context_warmup_start)
-        self._context_warmup_end = int(context_warmup_end)
-        # Context OFF (hold==0, the locked plain-JEPA arm) ⇒ the predictor's context
-        # head never receives gradient. Freeze it so DDP's reducer and the optimizer
-        # both skip it — the same requires_grad=False mechanism that excludes the EMA
-        # teacher. Without this, DDP with find_unused_parameters=False aborts on the
-        # unused head (LightningModule "parameters that were not used" error).
-        if self._context_lambda_hold == 0.0:
-            for p in self.model.objective.pred_to_target_context.parameters():
+        # Secondary Gaussian-NLL (contract §5–7) is OPT-IN: it fires only when the batch
+        # carries per-session frozen state-stats, which the datamodule supplies iff a
+        # stats dir was configured. ``secondary_active`` mirrors that config so the module
+        # knows at construction whether the write-only Perceiver head will receive gradient.
+        self._secondary_active = bool(secondary_active)
+        # Secondary OFF ⇒ the Perceiver head never receives gradient (no stats ever reach
+        # forward). Freeze it so DDP's reducer and the optimizer both skip it — the same
+        # requires_grad=False mechanism that excludes the EMA teacher. Without this, DDP
+        # with find_unused_parameters=False aborts on the unused head. deep_sup=False has
+        # no Perceiver at all (objective.perceiver is None) ⇒ nothing to freeze.
+        perceiver = self.model.objective.perceiver
+        if perceiver is not None and not self._secondary_active:
+            for p in perceiver.parameters():
                 p.requires_grad_(False)
         # Read by SSLHealthMonitorV3 (grad_noise_scale B_eff) and the tap monitors.
         self._last_batch_size: int = 0
@@ -143,11 +130,17 @@ class V14ConvergedV3Module(pl.LightningModule):
         # non_blocking H2D: pin_memory is on (datamodule), so async copies overlap
         # transfer with compute. geom is a per-session static that Lightning may move
         # before the pinned batch tensors exist; keep it blocking (its own .to).
+        # stat_mean/stat_std (per-session frozen state-stats, (P,6)) ride along like the
+        # other per-session statics when present; None ⇒ secondary OFF (JEPA-only).
+        sm = batch.stat_mean
+        ss = batch.stat_std
         return V3Batch(
             bands=[b.to(device, non_blocking=True) for b in batch.bands],
             geom=batch.geom.to(device),
             parcel_id=batch.parcel_id.to(device, non_blocking=True),
             session_key=batch.session_key,
+            stat_mean=None if sm is None else sm.to(device, non_blocking=True),
+            stat_std=None if ss is None else ss.to(device, non_blocking=True),
         )
 
     # ------------------------------------------------------------------- train
@@ -189,36 +182,32 @@ class V14ConvergedV3Module(pl.LightningModule):
             accum = 1  # no trainer attached (unit tests) ⇒ every call is "last"
         is_last_microbatch = (batch_idx + 1) % accum == 0
         collect = self._monitor_due(step) and is_last_microbatch
-        # Context-loss λ (#66): a 0-d tensor when the schedule is active (compile-static
-        # graph across the ramp), else a python 0.0 (compile-static skip of the head).
-        if self._context_lambda_hold > 0.0:
-            lam = context_lambda(
-                step, self._context_lambda_hold,
-                self._context_warmup_start, self._context_warmup_end,
-            )
-            lambda_context: float | Tensor = torch.tensor(
-                lam, device=device, dtype=torch.float32
-            )
-        else:
-            lambda_context = 0.0
+        # stat_mean/stat_std turn ON the secondary Gaussian-NLL when present (secondary
+        # opt-in); absent ⇒ JEPA-only. They flow per-session like geom/parcel_id.
         out = self.model(
             batch.bands, batch.geom, batch.parcel_id,
-            generator=gen, collect_taps=collect, lambda_context=lambda_context,
+            generator=gen, collect_taps=collect,
+            stat_mean=batch.stat_mean, stat_std=batch.stat_std,
         )
         self._last_batch_size = int(batch.bands[0].shape[0])
         self._last_taps = out.taps if collect else None
         self.log("train_loss", out.loss, on_step=True, prog_bar=True)
         self.log("train_n_masked", float(out.n_masked), on_step=True)
-        # #66 context-loss observable: the raw (unweighted) context L1, logged whenever
-        # the schedule is active (r3). None for the plain-JEPA arm (r2) ⇒ not logged.
-        # Trivial-copy tell = this dropping toward 0 while masked EV stays low.
-        if out.loss_context is not None:
-            self.log("train_loss_context", out.loss_context, on_step=True)
-        # intra/inter masked-loss split (monitor cadence; total train_loss unchanged).
-        # inter = whole-shaft (cross-sensor) cells, intra = partial-shaft cells.
-        if out.loss_intra is not None:
-            self.log("train_loss_intra", out.loss_intra, on_step=True)
-            self.log("train_loss_inter", out.loss_inter, on_step=True)
+        # Two-loss monitors (Ben 2026-07-15): when the secondary is active, log the primary
+        # JEPA L1 and the secondary Gaussian-NLL SEPARATELY so the two objectives are
+        # tracked independently (λ-balance readout). Both None on the JEPA-only arm ⇒ only
+        # train_loss (== jepa_loss) is logged. LOG-ONLY — nothing here kills the run.
+        if out.jepa_loss is not None:
+            self.log("train_jepa_loss", out.jepa_loss, on_step=True, prog_bar=True)
+        if out.nll_loss is not None:
+            self.log("train_nll_loss", out.nll_loss, on_step=True, prog_bar=True)
+            # The weighted contribution the total actually carries (λ·NLL) — reads the
+            # objective's live λ, so a change to --lambda-nll shows up here directly.
+            self.log(
+                "train_nll_weighted",
+                float(self.model.objective.lambda_nll) * out.nll_loss.detach(),
+                on_step=True,
+            )
         return out.loss
 
     def on_before_zero_grad(self, optimizer) -> None:  # noqa: ARG002

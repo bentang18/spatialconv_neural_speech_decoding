@@ -22,6 +22,7 @@ everything else is exercised locally with synthetic caches + a stub parcel_fn.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -66,6 +67,27 @@ def _load_stats(stats_path: str) -> tuple[Tensor, Tensor]:
     return torch.from_numpy(z["median"]).float(), torch.from_numpy(z["sigma"]).float()
 
 
+def _load_state_stats(
+    state_stats_dir: str | None, subject_id: int
+) -> tuple[Tensor | None, Tensor | None]:
+    """Per-SUBJECT frozen state-norm table for the secondary Gaussian-NLL.
+
+    ``<state_stats_dir>/sub-<subject_id>.npz`` holds ``stat_mean``/``stat_std``, each
+    (n_parcels, 6) indexed by parcel id VALUE — the same index space as the perceiver's
+    parcel embedding and ``raw_state_vectors``. ``build_session_setup`` gathers the rows
+    for this session's survivor parcels and fails loud on shape/coverage. Stats are frozen
+    per SUBJECT (over the subject's train clips), so all of a subject's sessions share one
+    table. ``None`` dir ⇒ secondary OFF (JEPA-only)."""
+    if state_stats_dir is None:
+        return None, None
+    path = os.path.join(state_stats_dir, f"sub-{subject_id}.npz")
+    z = np.load(path)
+    return (
+        torch.from_numpy(z["stat_mean"]).float(),
+        torch.from_numpy(z["stat_std"]).float(),
+    )
+
+
 def load_v3_sessions(
     *,
     sessions: Sequence[tuple[int, int]],
@@ -76,8 +98,12 @@ def load_v3_sessions(
     sigma_floor: float = 1e-6,
     winsor: float | Sequence[float] | None = None,
     mask_cfg: V3MaskConfig = V3MaskConfig(),
+    state_stats_dir: str | None = None,
 ) -> list[V3SessionSpec]:
-    """Assemble the per-session ``V3SessionSpec`` list for the datamodule."""
+    """Assemble the per-session ``V3SessionSpec`` list for the datamodule.
+
+    ``state_stats_dir`` (opt): dir of per-subject frozen state-norm tables that turn ON
+    the secondary Gaussian-NLL; omit ⇒ JEPA-only."""
     if len(band_cache_dirs) != 3:
         raise ValueError(f"expected 3 band cache dirs, got {len(band_cache_dirs)}")
     band_indexes = [index_band_cache(d) for d in band_cache_dirs]
@@ -97,8 +123,10 @@ def load_v3_sessions(
         labels = list(ch0)
         parcel_id = parcel_fn(subject_id, trial_id, labels).long()
         drop = lof.get((subject_id, trial_id), set())
+        stat_mean, stat_std = _load_state_stats(state_stats_dir, subject_id)
         setup = build_session_setup(
-            labels, parcel_id, drop_labels=drop, mask_cfg=mask_cfg
+            labels, parcel_id, drop_labels=drop, mask_cfg=mask_cfg,
+            stat_mean=stat_mean, stat_std=stat_std,
         )
         band_stats = [_load_stats(e.stats_path) for e in entries]
         specs.append(
