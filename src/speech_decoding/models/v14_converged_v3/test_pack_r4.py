@@ -219,6 +219,30 @@ def test_scatter_visible_round_trips_and_fills_masked() -> None:
     assert ok
 
 
+def test_scatter_visible_casts_fp32_fill_to_visible_dtype() -> None:
+    # REGRESSION (bf16 launch): the mask-query ``fill`` is an fp32 parameter (params are not
+    # autocast-downcast), while ``h_vis`` is the encoder's autocast-bf16 output. scatter_
+    # requires self.dtype == src.dtype, so scatter_visible must emit the SCATTER-SOURCE dtype
+    # (bf16), not fill's. The compiled bf16 forward hard-errored here before the .to(h_vis.dtype)
+    # fix; fp32 tests never caught it. Assert dtype follows h_vis and the values still land.
+    sc, geom = _session()
+    grid = build_r4_grid(geom, n_time=T)
+    pid = sc.parcel_id[grid.contact]
+    g = torch.Generator().manual_seed(4)
+    masks = sample_masks(geom, int(geom.valid.sum()), n_time=T, n_rows=6, generator=g)
+    masked, _ = token_flags(grid, masks)
+    d = 5
+    pack = build_visible_pack(grid, masked, pid)
+    h_vis = pack.idx[:, :, None].expand(-1, -1, d).to(torch.bfloat16).clone()  # bf16 latents
+    fill = torch.full((1, 1, d), -1.0, dtype=torch.float32)                    # fp32 mask query
+    full = scatter_visible(h_vis, pack.idx, grid.total, fill)  # must NOT raise on dtype
+    dtype_ok = full.dtype == torch.bfloat16
+    filled_ok = bool(torch.all(full[masked] == -1.0))  # fill still placed (cast is exact for -1)
+    print(f"[check] scatter_visible bf16: out dtype==bf16={dtype_ok}; masked==fill={filled_ok} "
+          f"{'OK' if dtype_ok and filled_ok else 'VIOLATED'}")
+    assert dtype_ok and filled_ok
+
+
 def test_dist_to_visible_is_correct_on_a_known_mask() -> None:
     # [v m m m m v] → distances to nearest visible: 0,1,2,2,1,0. margin≥2 hits the 2 interior.
     mask = torch.tensor([[False, True, True, True, True, False]])

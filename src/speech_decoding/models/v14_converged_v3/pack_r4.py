@@ -215,7 +215,12 @@ def scatter_visible(h_vis: Tensor, idx: Tensor, total: int, fill: Tensor) -> Ten
     at ``idx``. The predictor then runs the FULL grid so the mask query gets its target's
     RoPE/parcel position (JEPA mask-token + positional-embed)."""
     B, m_vis, d = h_vis.shape
-    out = fill.expand(B, total, d).clone()
+    # ``fill`` is the mask-query PARAMETER — it stays fp32 under bf16 autocast (params are not
+    # autocast-downcast, like nn.Embedding), whereas ``h_vis`` is the encoder's autocast-bf16
+    # output. scatter_ requires self.dtype == src.dtype, so cast the grid to the scatter
+    # source's dtype (bf16 under autocast; no-op under fp32) — same pattern as towers' parcel
+    # embed .to(x.dtype). Without this the compiled bf16 forward hard-errors on the scatter.
+    out = fill.to(h_vis.dtype).expand(B, total, d).clone()
     out.scatter_(1, idx[:, :, None].expand(B, m_vis, d), h_vis)
     return out
 
