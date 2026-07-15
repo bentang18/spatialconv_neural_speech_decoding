@@ -179,3 +179,54 @@ def test_secondary_active_trains_perceiver_on_stats() -> None:
     assert any(
         p.grad is not None and p.grad.abs().sum() > 0 for p in perceiver.parameters()
     )
+
+
+def test_grad_ratio_off_by_default_logs_nothing() -> None:
+    # grad_ratio_every_n_steps default 0 ⇒ the live loss-balance readout never fires,
+    # even with the secondary active. The launch config relies on this default.
+    model = V3ConvergedModel(n_parcels=N_PARCELS)
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        secondary_active=True,
+    )
+    assert mod.grad_ratio_every_n_steps == 0
+    logged: dict[str, object] = {}
+    mod.log = lambda name, value, **_: logged.__setitem__(name, value)  # type: ignore[method-assign]
+    loss = mod.training_step(_session_batch_with_stats(n_rows=2), 0)
+    loss.backward()  # graph still intact (nothing consumed it)
+    assert not any(k.startswith("train_mon_grad") or k == "train_mon_g_jepa" for k in logged)
+
+
+def test_grad_ratio_logs_balance_and_retains_graph_single_process() -> None:
+    # grad_ratio_every_n_steps=1 + secondary active + no trainer (world_size==1) ⇒ the
+    # readout fires: ‖g_nll‖/‖g_jepa‖ and λ·ratio are logged, both grad norms > 0, and the
+    # graph SURVIVES for Lightning's own backward (retain_graph in the helper). Invariant
+    # printed (feedback-build-the-invariant-into-the-probe).
+    model = V3ConvergedModel(n_parcels=N_PARCELS)
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        secondary_active=True, grad_ratio_every_n_steps=1,
+    )
+    logged: dict[str, float] = {}
+    mod.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
+    loss = mod.training_step(_session_batch_with_stats(n_rows=2), 0)
+    loss.backward()  # must not raise — the probe retained the graph
+    online = list(mod.model.objective.online.parameters())
+    grads_flow = any(p.grad is not None and p.grad.abs().sum() > 0 for p in online)
+
+    r = logged["train_mon_grad_ratio"]
+    rw = logged["train_mon_grad_ratio_weighted"]
+    lam = float(mod.model.objective.lambda_nll)
+    ok = (
+        logged["train_mon_g_jepa"] > 0.0
+        and logged["train_mon_g_nll"] > 0.0
+        and r > 0.0
+        and abs(rw - lam * r) < 1e-5
+        and grads_flow
+    )
+    print(
+        f"[check] wired grad-ratio: ‖g_jepa‖={logged['train_mon_g_jepa']:.4e} "
+        f"‖g_nll‖={logged['train_mon_g_nll']:.4e} ratio={r:.3f} λ·ratio={rw:.3f} "
+        f"(λ={lam}) backward-after-probe={grads_flow} → {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok

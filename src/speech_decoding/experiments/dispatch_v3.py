@@ -216,6 +216,7 @@ def build_v3_training(
         model=model, optim_config=optim, seed=args.seed,
         monitor_every_n_steps=args.monitor_every_n_steps,
         secondary_active=_secondary_active(args),
+        grad_ratio_every_n_steps=args.grad_ratio_every_n_steps,
     )
     dm = V3DataModule(
         sessions,
@@ -416,6 +417,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
+    p.add_argument("--grad-ratio-every-n-steps", dest="grad_ratio_every_n_steps",
+                   type=int, default=0,
+                   help="live loss-balance readout (#43): every N opt-steps log "
+                        "‖g_nll‖/‖g_jepa‖ on the shared online tower. 0 = OFF (the launch "
+                        "default). SINGLE-PROCESS ONLY (--devices 1): the extra autograd.grad "
+                        "passes re-enter the DDP reducer (the r3 static_graph×grad-accum crash "
+                        "surface), so the module hard-refuses world_size>1. 1-GPU diagnostic only.")
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=1,
                    help="wandb flush cadence; 1 = per-step resolution (Ben 2026-07-11) "
                         "so update_cos/grad-spike/feat_std are not window-averaged away")
@@ -492,6 +500,13 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
     if len(args.band_cache_dirs) != 3:
         raise ValueError(
             f"need 3 --band-cache-dir (slow, mid, hga), got {len(args.band_cache_dirs)}"
+        )
+    if args.grad_ratio_every_n_steps > 0 and args.devices and args.devices != 1:
+        raise SystemExit(
+            "REFUSING TO LAUNCH: --grad-ratio-every-n-steps > 0 requires --devices 1.\n"
+            "The live grad-ratio does two extra autograd.grad passes over the shared online\n"
+            "tower; under multi-GPU DDP those re-enter the reducer over the shared graph — the\n"
+            "r3 static_graph×grad-accum crash surface. It is a 1-GPU diagnostic lever only."
         )
     pl.seed_everything(args.seed, workers=True)
 

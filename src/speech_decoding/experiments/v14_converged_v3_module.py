@@ -34,6 +34,7 @@ import torch
 from lightning import pytorch as pl
 from torch import Tensor
 
+from speech_decoding.experiments.monitors.grad_ratio import loss_grad_ratio
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.models.v14_converged_v3.batch import V3Batch
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
@@ -59,6 +60,7 @@ class V14ConvergedV3Module(pl.LightningModule):
         monitor_every_n_steps: int = 1,
         wd_exclude_norms: bool = True,
         secondary_active: bool = False,
+        grad_ratio_every_n_steps: int = 0,
     ) -> None:
         super().__init__()
         self.model = model
@@ -66,6 +68,12 @@ class V14ConvergedV3Module(pl.LightningModule):
         self.seed = int(seed)
         self.monitor_every_n_steps = max(int(monitor_every_n_steps), 1)
         self._wd_exclude_norms = wd_exclude_norms
+        # Live loss-balance readout (#43): ‖g_nll‖/‖g_jepa‖ on the shared online tower,
+        # measured every ``grad_ratio_every_n_steps`` opt-steps (0 ⇒ OFF, the launch default).
+        # SINGLE-PROCESS ONLY — the two extra autograd.grad passes re-enter the DDP reducer
+        # over the shared graph (the r3 static_graph×grad-accum crash surface), so this is
+        # gated to world_size==1 in ``training_step`` and is a 1-GPU diagnostic lever only.
+        self.grad_ratio_every_n_steps = max(int(grad_ratio_every_n_steps), 0)
         # Secondary Gaussian-NLL (contract §5–7) is OPT-IN: it fires only when the batch
         # carries per-session frozen state-stats, which the datamodule supplies iff a
         # stats dir was configured. ``secondary_active`` mirrors that config so the module
@@ -163,6 +171,9 @@ class V14ConvergedV3Module(pl.LightningModule):
     def _monitor_due(self, step: int) -> bool:
         return step % self.monitor_every_n_steps == 0
 
+    def _grad_ratio_due(self, step: int) -> bool:
+        return self.grad_ratio_every_n_steps > 0 and step % self.grad_ratio_every_n_steps == 0
+
     def _plan_for(self, batch: V3Batch) -> tuple[int | None, int | None, int | None]:
         """The cached ``(grid_max_seqlen, m_vis, pack_max_seqlen)`` for this batch's session,
         computed once per ``session_key`` via ``model.session_plan``. A batch with no
@@ -235,6 +246,37 @@ class V14ConvergedV3Module(pl.LightningModule):
                 float(self.model.objective.lambda_nll) * out.nll_loss.detach(),
                 on_step=True,
             )
+        # #43 live grad-balance: on cadence, on the last micro-batch, ONLY single-process.
+        # Both losses must be graph-connected (jepa_loss/nll_loss are; the weighted log above
+        # detached its own copy). retain_graph inside the helper keeps Lightning's subsequent
+        # backward(out.loss) intact. Under DDP this would re-enter the reducer → r3 crash, so
+        # hard-refuse world_size>1 rather than silently mis-measure.
+        if (
+            self._grad_ratio_due(step)
+            and is_last_microbatch
+            and out.jepa_loss is not None
+            and out.nll_loss is not None
+        ):
+            try:
+                world_size = int(self.trainer.world_size)
+            except (RuntimeError, AttributeError):
+                world_size = 1  # no trainer attached (unit tests) ⇒ single-process
+            if world_size > 1:
+                raise RuntimeError(
+                    "grad_ratio_every_n_steps>0 requires single-process (world_size==1): "
+                    "the extra autograd.grad passes re-enter the DDP reducer (r3 crash surface). "
+                    "Use it only on the 1-GPU diagnostic."
+                )
+            gr = loss_grad_ratio(
+                out.jepa_loss,
+                out.nll_loss,
+                list(self.model.objective.online.parameters()),
+                lambda_nll=float(self.model.objective.lambda_nll),
+            )
+            self.log("train_mon_grad_ratio", gr["grad_ratio"], on_step=True)
+            self.log("train_mon_grad_ratio_weighted", gr["grad_ratio_weighted"], on_step=True)
+            self.log("train_mon_g_jepa", gr["loss_g_jepa"], on_step=True)
+            self.log("train_mon_g_nll", gr["loss_g_nll"], on_step=True)
         return out.loss
 
     def on_before_zero_grad(self, optimizer) -> None:  # noqa: ARG002
