@@ -192,9 +192,15 @@ def scan_session_cache(
                 f"{subject_id}/{trial_id}: {e.total_frames} vs {total_frames}"
             )
     for e in entries:
-        if e.sample_rate != int(round(fps)):
+        sr = int(e.sample_rate)
+        fps_i = int(round(fps))
+        # BT caches store the frame rate (== fps); Cogan caches store the voltage
+        # sample rate (fps x band_hop). Accept either exact fps or a positive
+        # integer multiple of fps; neither => a genuinely misclocked cache.
+        if sr != fps_i and (sr <= 0 or sr % fps_i != 0):
             raise ValueError(
-                f"cache sample_rate {e.sample_rate} != expected fps {fps} for "
+                f"cache sample_rate {sr} is not on the {fps_i} Hz frame clock "
+                f"(expected {fps_i} or an integer multiple) for "
                 f"session {subject_id}/{trial_id}"
             )
 
