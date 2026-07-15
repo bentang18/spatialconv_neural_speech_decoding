@@ -35,6 +35,11 @@ from torch import Tensor, nn
 
 from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.masking import V3Masks
+from speech_decoding.models.v14_converged_v3.monitor_taps import (
+    cov_entropy_vs_floor,
+    per_band_jepa_stats,
+    per_band_nll,
+)
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
     R4Grid,
     VisiblePack,
@@ -255,6 +260,7 @@ class V3JepaObjective(nn.Module):
 
         # ── secondary write-only Perceiver Gaussian-NLL (opt-in on the frozen stats) ──
         nll_loss = None
+        sec_taps = None
         total = jepa_loss
         if stat_mean is not None or stat_std is not None:
             if self.perceiver is None:
@@ -263,8 +269,8 @@ class V3JepaObjective(nn.Module):
                 )
             if stat_mean is None or stat_std is None:
                 raise ValueError("stat_mean and stat_std must BOTH be given to enable the NLL")
-            nll_loss = self._secondary_nll(
-                bands, parcel_id, z, pack, stat_mean, stat_std
+            nll_loss, sec_taps = self._secondary_nll(
+                bands, parcel_id, z, pack, stat_mean, stat_std, collect_taps=collect_taps
             )
             total = jepa_loss + self.lambda_nll * nll_loss
 
@@ -272,6 +278,13 @@ class V3JepaObjective(nn.Module):
         if collect_taps:
             d_enc = enc_taps[12].shape[-1]
             taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
+            # per-band JEPA health (#40) — reduce the GB-scale pred/tgt to scalars HERE
+            # (they never leave the objective as raw taps). no_grad: monitor-only, must not
+            # extend the backward graph the loss above already built.
+            with torch.no_grad():
+                taps.update(per_band_jepa_stats(pred, tgt, w, grid.band))
+            if sec_taps is not None:  # per-band NLL (#41) + cov-entropy vs floor (#42)
+                taps.update(sec_taps)
         return JepaOutput(
             loss=total,
             # 0-dim tensor, NOT an int: the scored-token count is realization-dependent
@@ -293,7 +306,9 @@ class V3JepaObjective(nn.Module):
         pack: VisiblePack,
         stat_mean: Tensor,
         stat_std: Tensor,
-    ) -> Tensor:
+        *,
+        collect_taps: bool = False,
+    ) -> tuple[Tensor, dict[str, Tensor] | None]:
         """Write-only Perceiver → per-(parcel, 4 Hz slot) Gaussian, scored by the present-
         masked marginal NLL against the model-free 6-D state target.
 
@@ -334,9 +349,16 @@ class V3JepaObjective(nn.Module):
         )
         present_q = present.repeat_interleave(S, dim=0)  # (Q, 6)
         target_q = target.reshape(B, Q, target.shape[-1])
-        return present_masked_nll(
-            mu, cov, target_q, present_q[None].expand(B, Q, present_q.shape[-1])
-        )
+        present_q_full = present_q[None].expand(B, Q, present_q.shape[-1])  # (B, Q, 6)
+        nll = present_masked_nll(mu, cov, target_q, present_q_full)
+        aux = None
+        if collect_taps:  # per-band NLL (#41) + predicted-cov entropy vs floor (#42)
+            with torch.no_grad():
+                aux = {
+                    **per_band_nll(mu, cov, target_q, present_q_full),
+                    **cov_entropy_vs_floor(cov, noise[None].expand(B, Q, noise.shape[-1])),
+                }
+        return nll, aux
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:

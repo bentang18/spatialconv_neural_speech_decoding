@@ -24,8 +24,11 @@ Family B — tap-dependent (detached forward taps), in ``on_train_batch_end``, r
 decided, so no off-by-one re-derivation):
   * rankme + feat_std at encoder block 12 (terminal representation) — effective-rank
     / feature-std collapse guard. (The block-3 pre-L2 tap was removed 2026-07-10.)
-  * explained_var + pred_target_var_ratio + L1, split whole-sensor vs intra-sensor —
-    is L2 actually learning the cross-sensor task, or is the encoder cheating locally?
+  * per-band scalar taps reduced INSIDE the objective (r4): JEPA explained_var /
+    pred_target_var_ratio / L1 per band (#40), per-band Gaussian-NLL (#41), and
+    predicted-cov entropy vs the noise-floor ceiling (#42). The r4 flat path has no
+    whole/intra sensor tiers — the split that carried signal is now per-BAND (SLOW /
+    MID / HGA), each reduced weighted over the margin-gated scored tokens.
 
 Keys follow the ``train_mon_<name>`` convention. Off-cost when not due: the module
 only produces taps on cadence steps, so Family B is skipped entirely off-cadence.
@@ -39,8 +42,6 @@ from torch import Tensor
 
 from speech_decoding.experiments.monitors.grad_spike import grad_spike_monitor
 from speech_decoding.experiments.monitors.teacher_rank import teacher_rank_monitor
-
-_STATS_EPS: float = 1e-8
 
 
 class SSLHealthMonitorV3(pl.Callback):
@@ -112,9 +113,10 @@ class SSLHealthMonitorV3(pl.Callback):
         tap = taps.get("enc12")
         if isinstance(tap, Tensor):
             self._rank_and_std(pl_module, tap, key="enc12_")
-        # tier-split explained-var / var-ratio / L1.
-        self._tier_stats(pl_module, taps, "whole")
-        self._tier_stats(pl_module, taps, "intra")
+        # scalar monitor taps reduced INSIDE the objective (r4): per-band JEPA
+        # explained-var / var-ratio / L1 (#40), per-band NLL (#41), predicted-cov
+        # entropy vs floor (#42). Each is a 0-dim tensor keyed by its own name.
+        self._log_scalar_taps(pl_module, taps)
 
     _BAND_NAMES: tuple[str, ...] = ("slow", "mid", "hga")
 
@@ -156,32 +158,16 @@ class SSLHealthMonitorV3(pl.Callback):
         pl_module.log(f"{prefix}feat_std_mean", std.mean(), on_step=True)
         pl_module.log(f"{prefix}feat_std_min", std.min(), on_step=True)
 
-    def _tier_stats(
-        self, pl_module: pl.LightningModule, taps: dict[str, Tensor], tier: str
+    def _log_scalar_taps(
+        self, pl_module: pl.LightningModule, taps: dict[str, Tensor]
     ) -> None:
-        """explained_var / pred_target_var_ratio / L1 on one mask tier. The target
-        rows are already ``target_ln``'d in the objective (matching the loss), so
-        the L1 here equals the loss contribution of this tier."""
-        pred = taps.get(f"pred_{tier}")
-        target = taps.get(f"tgt_{tier}")
-        if not isinstance(pred, Tensor) or not isinstance(target, Tensor):
-            return
-        p = pred.detach().to(torch.float32)
-        t = target.detach().to(torch.float32)
-        if p.shape[0] < 2:
-            return
-        target_var = t.var(dim=0, unbiased=False).mean()
-        resid_var = (t - p).var(dim=0, unbiased=False).mean()
-        pred_var = p.var(dim=0, unbiased=False).mean()
-        pl_module.log(
-            f"train_mon_{tier}_explained_var",
-            1.0 - resid_var / (target_var + _STATS_EPS), on_step=True,
-        )
-        pl_module.log(
-            f"train_mon_{tier}_pred_target_var_ratio",
-            pred_var / (target_var + _STATS_EPS), on_step=True,
-        )
-        pl_module.log(f"train_mon_{tier}_l1", (t - p).abs().mean(), on_step=True)
+        """Log every 0-dim scalar tap the objective reduced on this cadence step
+        (``jepa_*`` #40, ``nll_*`` #41, ``cov_entropy*`` #42). ``enc12`` — the only
+        non-scalar tap — is consumed by ``_rank_and_std`` and skipped here."""
+        for key, val in taps.items():
+            if key == "enc12" or not isinstance(val, Tensor) or val.ndim != 0:
+                continue
+            pl_module.log(f"train_mon_{key}", val.detach().to(torch.float32), on_step=True)
 
 
 __all__ = ["SSLHealthMonitorV3"]

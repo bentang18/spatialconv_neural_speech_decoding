@@ -280,6 +280,56 @@ def test_secondary_is_write_only_no_readback_into_primary() -> None:
     assert no_readback
 
 
+def test_collect_taps_emits_per_band_monitor_scalars() -> None:
+    # Monitor wiring (#40/#41/#42): with collect_taps=True AND the secondary active, the
+    # objective returns the enc12 tap PLUS finite per-band JEPA scalars, per-band NLL, and
+    # the cov-entropy-vs-floor triple — all 0-dim — and the backward still runs (the taps
+    # are detached / no_grad, so they do not consume or extend the loss graph).
+    sc, geom = _session()
+    obj = V3JepaObjective(n_parcels=8, lambda_nll=0.2)
+    sm, ss = _stats(sc)
+    out = obj(
+        _bands(), geom, sc.parcel_id, _masks(geom),
+        stat_mean=sm, stat_std=ss, collect_taps=True,
+    )
+    taps = out.taps
+    bands = ("slow", "mid", "hga")
+    expect = (
+        [f"jepa_{b}_{m}" for b in bands for m in ("explained_var", "pred_target_var_ratio", "l1")]
+        + [f"nll_{b}" for b in bands]
+        + ["cov_entropy", "cov_entropy_floor", "cov_entropy_gap"]
+    )
+    present = taps is not None and all(k in taps for k in expect)
+    scalars = present and all(taps[k].ndim == 0 and torch.isfinite(taps[k]) for k in expect)
+    gap_nonneg = present and float(taps["cov_entropy_gap"]) >= -1e-4  # #42 invariant
+    out.loss.backward()  # graph intact despite the monitor reductions
+    enc_flows = any(
+        p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.encoder.parameters()
+    )
+    ok = scalars and gap_nonneg and enc_flows
+    print(
+        f"[check] collect_taps monitor scalars present+finite={scalars}, cov gap≥0 "
+        f"({float(taps['cov_entropy_gap']):.3f})={gap_nonneg}, backward-after-taps={enc_flows} "
+        f"→ {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
+def test_collect_taps_jepa_only_has_no_secondary_scalars() -> None:
+    # collect_taps=True but secondary OFF (no stats): enc12 + per-band JEPA scalars present,
+    # but NO nll_*/cov_entropy* (the secondary never ran). Guards against logging stale keys.
+    sc, geom = _session()
+    obj = V3JepaObjective(n_parcels=8)
+    out = obj(_bands(), geom, sc.parcel_id, _masks(geom), collect_taps=True)
+    taps = out.taps or {}
+    has_jepa = all(f"jepa_{b}_l1" in taps for b in ("slow", "mid", "hga"))
+    no_sec = not any(k.startswith("nll_") or k.startswith("cov_entropy") for k in taps)
+    ok = has_jepa and no_sec and "enc12" in taps
+    print(f"[check] JEPA-only collect_taps: per-band JEPA={has_jepa}, no secondary keys={no_sec} "
+          f"→ {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_secondary_requires_deep_sup() -> None:
     # The perceiver reads the deep-sup 1024 taps; the single-tap arm has none ⇒ fail loud.
     import pytest
