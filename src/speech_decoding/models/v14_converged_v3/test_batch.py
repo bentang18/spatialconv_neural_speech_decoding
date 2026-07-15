@@ -105,3 +105,52 @@ def test_batch_bands_feed_model_forward() -> None:
     g = torch.Generator().manual_seed(0)
     out = model(batch.bands, batch.geom, batch.parcel_id, generator=g)
     assert torch.isfinite(out.loss)
+
+
+def _setup_with_stats(shaft_sizes=(4, 3, 3), key=(1, 0)):
+    labels, parcels = [], []
+    for s, n in enumerate(shaft_sizes):
+        for c in range(1, n + 1):
+            labels.append(f"L{chr(65 + s)}{c}")
+            parcels.append(s)
+    sm = torch.zeros(len(shaft_sizes), 6)
+    ss = torch.ones(len(shaft_sizes), 6)  # frozen std 1 → z-score is identity
+    setup = build_session_setup(
+        labels, torch.tensor(parcels), drop_labels=set(), stat_mean=sm, stat_std=ss
+    )
+    return setup, key
+
+
+def test_collate_stats_none_when_absent() -> None:
+    setup, key = _setup()
+    batch = v3_collate([_clip(setup, key) for _ in range(3)])
+    assert batch.stat_mean is None
+    assert batch.stat_std is None
+
+
+def test_collate_carries_shared_stats_once() -> None:
+    setup, key = _setup_with_stats()
+    batch = v3_collate([_clip(setup, key) for _ in range(3)])
+    assert batch.stat_mean is setup.stat_mean
+    assert batch.stat_std is setup.stat_std
+    assert batch.stat_mean.shape == (3, 6)  # three parcels present
+
+
+def test_batch_stats_activate_secondary_in_forward() -> None:
+    # With per-session frozen stats present, forward runs the secondary Gaussian-NLL:
+    # out.nll_loss is set and total decomposes; absent → JEPA-only (nll_loss None).
+    from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+
+    setup, key = _setup_with_stats()
+    batch = v3_collate([_clip(setup, key) for _ in range(2)])
+    torch.manual_seed(0)
+    model = V3ConvergedModel(n_parcels=8, deep_sup=True).eval()
+    g = torch.Generator().manual_seed(0)
+    out = model(
+        batch.bands, batch.geom, batch.parcel_id,
+        generator=g, stat_mean=batch.stat_mean, stat_std=batch.stat_std,
+    )
+    assert out.nll_loss is not None
+    assert out.jepa_loss is not None
+    assert torch.isfinite(out.loss)
+    assert torch.isfinite(out.nll_loss)

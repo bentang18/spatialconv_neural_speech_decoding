@@ -41,6 +41,10 @@ class V3Batch:
     geom: L1Geometry
     parcel_id: Tensor  # (N,) long — session-shared
     session_key: tuple | None = None
+    # frozen per-(parcel,dim) z-score stats (P, 6), session-shared like geom/parcel_id;
+    # None ⇒ secondary Gaussian-NLL OFF (JEPA-only). Set from the session setup.
+    stat_mean: Tensor | None = None
+    stat_std: Tensor | None = None
 
 
 def v3_collate(samples: Sequence[V3ClipSample]) -> V3Batch:
@@ -68,4 +72,6 @@ def v3_collate(samples: Sequence[V3ClipSample]) -> V3Batch:
         geom=setup.geom,
         parcel_id=setup.parcel_id,
         session_key=key,
+        stat_mean=setup.stat_mean,
+        stat_std=setup.stat_std,
     )
