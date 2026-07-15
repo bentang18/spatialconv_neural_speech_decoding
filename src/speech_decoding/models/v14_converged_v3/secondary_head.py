@@ -160,7 +160,17 @@ class GaussianStateHead(nn.Module):
 
 def _nll_terms(mu: Tensor, cov: Tensor, x: Tensor) -> Tensor:
     """Per-position full-covariance Gaussian NLL (NO reduction). ``mu``/``x`` (..., D),
-    ``cov`` (..., D, D) PD → (...,). Cholesky solve (cov is PD by the noise floor)."""
+    ``cov`` (..., D, D) PD → (...,). Cholesky solve (cov is PD by the noise floor).
+
+    The covariance solve is forced to fp32: cholesky / cholesky_solve are numerically unsafe
+    in bf16 (a near-singular cov loses all precision), and under bf16 autocast the head emits
+    bf16 mu/cov while the model-free target x stays fp32 (elementwise reductions are not
+    autocast-downcast) — cholesky_solve then hard-errors on the A/b dtype mismatch. Casting all
+    three to fp32 fixes both the correctness and the crash; the scalar loss rejoins the bf16
+    graph on return."""
+    mu = mu.float()
+    cov = cov.float()
+    x = x.float()
     d = x.shape[-1]
     r = (x - mu).unsqueeze(-1)  # (..., D, 1)
     chol = torch.linalg.cholesky(cov)  # (..., D, D) lower
@@ -219,6 +229,7 @@ def gaussian_entropy(cov: Tensor) -> Tensor:
     """Differential entropy ½·log((2πe)^D · det cov) of a Gaussian — the analytic floor
     machinery for the M12-style collapse tripwire (ceiling / common-mode / marginal).
     ``cov`` (..., D, D) → (...,)."""
+    cov = cov.float()  # fp32 cholesky (bf16-autocast safe; see _nll_terms)
     d = cov.shape[-1]
     chol = torch.linalg.cholesky(cov)
     logdet = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum(-1)

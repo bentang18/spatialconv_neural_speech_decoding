@@ -262,6 +262,23 @@ def test_present_masked_all_present_equals_full_nll() -> None:
     assert ok
 
 
+def test_nll_handles_bf16_cov_vs_fp32_target() -> None:
+    # REGRESSION (bf16 launch): under autocast the head emits bf16 mu/cov while the model-free
+    # target x stays fp32 (reductions are not autocast-downcast). cholesky_solve then errors
+    # "Expected b and A to have the same dtype". The NLL must force fp32 internally (also the
+    # numerically-correct choice for a covariance solve) and return a finite fp32 scalar.
+    mu, cov, x = _rand_gaussians(20, 7)
+    mu_bf, cov_bf, x_fp = mu.bfloat16(), cov.bfloat16(), x.float()
+    present = torch.ones(20, D, dtype=torch.bool)
+    full = gaussian_nll(mu_bf, cov_bf, x_fp)         # must NOT raise on dtype mismatch
+    marg = present_masked_nll(mu_bf, cov_bf, x_fp, present)
+    ok = (full.dtype == torch.float32 and torch.isfinite(full)
+          and marg.dtype == torch.float32 and torch.isfinite(marg))
+    print(f"[check] bf16 cov / fp32 target NLL finite fp32: full {float(full):.3f} "
+          f"marg {float(marg):.3f} {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_present_masked_marginal_matches_analytic_subblock() -> None:
     # A 1-electrode parcel scores the 3-D MEAN marginal = the exact (μ[:3], Σ[:3,:3]) NLL.
     mu, cov, x = _rand_gaussians(15, 2)
