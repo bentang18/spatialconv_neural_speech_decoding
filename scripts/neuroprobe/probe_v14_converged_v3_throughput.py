@@ -78,6 +78,11 @@ def main() -> None:
     ap.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
     ap.add_argument("--compile", action="store_true", help="torch.compile(dynamic=False)")
     ap.add_argument("--seed", type=int, default=33)
+    ap.add_argument("--plan-cache", action=argparse.BooleanOptionalAction, default=True,
+                    help="thread the per-session shape-const plan (grid/m_vis/pack max_seqlen) "
+                         "into forward, exactly as the LightningModule does — the real launch "
+                         "path that skips the per-step .item() host syncs. --no-plan-cache "
+                         "measures the eager self-syncing path for comparison.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -116,6 +121,15 @@ def main() -> None:
     sm_dev = None if setup.stat_mean is None else setup.stat_mean.to(device)
     ss_dev = None if setup.stat_std is None else setup.stat_std.to(device)
 
+    # Per-session shape-const plan, computed ONCE (uncompiled — the OptimizedModule delegates
+    # session_plan to the underlying V3ConvergedModel via __getattr__), then threaded into every
+    # forward. This is the LightningModule's real launch path; without it forward derives the
+    # constants with a per-step .item() host sync (the eager path, --no-plan-cache).
+    if args.plan_cache:
+        gms, mvis, pms = model.session_plan(geom, pid_dev, T)
+    else:
+        gms = mvis = pms = None
+
     def _bands():
         return [
             torch.randn(args.batch_size, N, _BAND_F[b], T, device=device)
@@ -137,6 +151,7 @@ def main() -> None:
                 out = model(
                     _bands(), geom, pid_dev, generator=g,
                     stat_mean=sm_dev, stat_std=ss_dev,
+                    grid_max_seqlen=gms, m_vis=mvis, pack_max_seqlen=pms,
                 )
                 (out.loss / args.accum).backward()
         torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 3.0)
@@ -147,7 +162,7 @@ def main() -> None:
         f"[cfg] device={device} N={N} parcels_present={int(pid_dev.unique().numel())} "
         f"B={args.batch_size} accum={args.accum} T={T} secondary={args.secondary} "
         f"deep_sup={args.deep_sup} lambda_nll={args.lambda_nll} precision={args.precision} "
-        f"compile={args.compile}"
+        f"compile={args.compile} plan_cache={args.plan_cache}"
     )
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[cfg] trainable params = {n_trainable/1e6:.2f}M")
