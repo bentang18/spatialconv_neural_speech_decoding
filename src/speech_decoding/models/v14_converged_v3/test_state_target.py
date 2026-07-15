@@ -16,6 +16,7 @@ import torch
 from speech_decoding.models.v14_converged_v3.state_target import (
     N_BANDS,
     STATE_DIM,
+    StateStatsAccumulator,
     build_state_target,
     raw_state_stats,
     raw_state_vectors,
@@ -110,5 +111,57 @@ def test_raw_state_stats_recovers_per_parcel_dim_moments() -> None:
           and torch.allclose(std[0, 0], ref.std(unbiased=False), atol=1e-6)
           and mean.shape == (3, STATE_DIM))
     print(f"[check] raw_state_stats moments match brute force "
+          f"{'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_accumulator_single_session_matches_raw_state_stats() -> None:
+    # The producer's cross-session accumulator, run on ONE session, must reproduce
+    # raw_state_stats exactly (population moments over the clip·slot samples), placed at
+    # the parcel-id VALUE (not position). Absent values stay 0.
+    g = torch.Generator().manual_seed(11)
+    bands = [torch.rand(9, N, F, T, generator=g) for _ in range(N_BANDS)]
+    raw, parcels, _ = raw_state_vectors(bands, PARCEL_ID)  # (9, P, S, 6), values {0,1,2}
+    ref_mean, ref_std = raw_state_stats(raw)
+    acc = StateStatsAccumulator()
+    acc.add(raw, parcels)
+    mean, std = acc.finalize(n_parcels=5)
+    per_value = all(
+        torch.allclose(mean[int(v)], ref_mean[pi], atol=1e-5)
+        and torch.allclose(std[int(v)], ref_std[pi], atol=1e-5)
+        for pi, v in enumerate(parcels.tolist())
+    )
+    absent_zero = bool(
+        torch.all(mean[3] == 0) and torch.all(mean[4] == 0)
+        and torch.all(std[3] == 0)
+    )
+    ok = per_value and absent_zero and mean.shape == (5, STATE_DIM)
+    print(f"[check] accumulator single-session == raw_state_stats by value, "
+          f"absent→0 {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_accumulator_pools_across_sessions_by_value() -> None:
+    # A parcel value present in TWO sessions (with different data + different parcel
+    # sets) must pool to the moments of the CONCATENATED sample set — the defining
+    # property of value-keyed cross-session accumulation.
+    g = torch.Generator().manual_seed(13)
+    raw_a = torch.rand(3, 2, S, STATE_DIM, generator=g)
+    raw_b = torch.rand(2, 2, S, STATE_DIM, generator=g)
+    par_a = torch.tensor([5, 8])  # value 5 at position 0
+    par_b = torch.tensor([1, 5])  # value 5 at position 1
+    acc = StateStatsAccumulator()
+    acc.add(raw_a, par_a)
+    acc.add(raw_b, par_b)
+    mean, std = acc.finalize(n_parcels=9)
+    pooled = torch.cat(
+        [raw_a[:, 0].reshape(-1, STATE_DIM), raw_b[:, 1].reshape(-1, STATE_DIM)], dim=0
+    )
+    ok = (
+        torch.allclose(mean[5], pooled.mean(0), atol=1e-5)
+        and torch.allclose(std[5], pooled.std(0, unbiased=False), atol=1e-5)
+        and torch.allclose(mean[8], raw_a[:, 1].reshape(-1, STATE_DIM).mean(0), atol=1e-5)
+    )
+    print(f"[check] value 5 pooled over 2 sessions == concat moments "
           f"{'OK' if ok else 'VIOLATED'}")
     assert ok

@@ -141,3 +141,65 @@ def raw_state_stats(raw: Tensor) -> tuple[Tensor, Tensor]:
     floored downstream and masked out anyway."""
     flat = raw.movedim(1, 0).reshape(raw.shape[1], -1, STATE_DIM)  # (P, M*S, 6)
     return flat.mean(dim=1), flat.std(dim=1, unbiased=False)
+
+
+class StateStatsAccumulator:
+    """Pooled per-(parcel VALUE, dim) mean/std for the frozen state-norm table.
+
+    The offline producer of the per-subject ``sub-<id>.npz`` (``stat_mean``/``stat_std``,
+    each (n_parcels, 6) indexed by parcel-id VALUE) the secondary head z-scores against
+    (see :func:`normalize_target`, ``session_loader._load_state_stats``). Generalizes
+    :func:`raw_state_stats` across sessions: a subject's sessions have DIFFERENT parcel
+    sets, so we key running sufficient statistics by parcel-id value, not position, and
+    pool a value that recurs across sessions. Population std (ddof=0), matching
+    :func:`raw_state_stats` and the M11 reliability measurement. Sums are fp64 (many
+    thousands of clip·slot samples pooled); common-mode removal is NOT applied here — it
+    happens at consumption, in z-scored coords (see the module docstring)."""
+
+    def __init__(self, state_dim: int = STATE_DIM) -> None:
+        self.dim = int(state_dim)
+        self._sum: dict[int, Tensor] = {}
+        self._sumsq: dict[int, Tensor] = {}
+        self._count: dict[int, int] = {}
+
+    def add(self, raw: Tensor, parcels: Tensor) -> None:
+        """Accumulate one ``raw`` block. ``raw`` (B, P, S, 6) from
+        :func:`raw_state_vectors`; ``parcels`` (P,) its sorted unique parcel-id VALUES.
+        Adds B·S samples per parcel value."""
+        if raw.shape[-1] != self.dim:
+            raise ValueError(f"raw last dim {raw.shape[-1]} != state_dim {self.dim}")
+        if raw.shape[1] != parcels.shape[0]:
+            raise ValueError(
+                f"raw P={raw.shape[1]} != parcels {parcels.shape[0]}"
+            )
+        r = raw.detach().to(torch.float64)
+        s = r.sum(dim=(0, 2))  # (P, 6)
+        sq = (r * r).sum(dim=(0, 2))  # (P, 6)
+        cnt = int(raw.shape[0] * raw.shape[2])  # B·S samples/parcel
+        for pi in range(int(parcels.shape[0])):
+            v = int(parcels[pi])
+            if v not in self._sum:
+                self._sum[v] = s[pi].clone()
+                self._sumsq[v] = sq[pi].clone()
+                self._count[v] = cnt
+            else:
+                self._sum[v] += s[pi]
+                self._sumsq[v] += sq[pi]
+                self._count[v] += cnt
+
+    def finalize(self, n_parcels: int | None = None) -> tuple[Tensor, Tensor]:
+        """``(stat_mean (V, 6), stat_std (V, 6))`` value-indexed, float32. ``V`` =
+        ``n_parcels`` (must cover ``max value + 1``) or the observed ``max value + 1``.
+        Absent values → 0 (masked/floored downstream). Population std."""
+        max_v = max(self._sum) if self._sum else -1
+        v_out = int(n_parcels) if n_parcels is not None else max_v + 1
+        if v_out <= max_v:
+            raise ValueError(f"n_parcels={v_out} <= max parcel value {max_v}")
+        mean = torch.zeros(v_out, self.dim, dtype=torch.float64)
+        std = torch.zeros(v_out, self.dim, dtype=torch.float64)
+        for v, c in self._count.items():
+            m = self._sum[v] / c
+            var = (self._sumsq[v] / c) - m * m
+            mean[v] = m
+            std[v] = var.clamp_min(0.0).sqrt()
+        return mean.float(), std.float()
