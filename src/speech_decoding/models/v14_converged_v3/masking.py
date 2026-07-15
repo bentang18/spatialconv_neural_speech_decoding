@@ -91,8 +91,9 @@ class V3Masks:
     slow_mask: Tensor  # (R, T_slow) bool — SLOW masked on its 4 Hz grid. Exactly round(slow_frac·T/8).
 
 
-def _k_max(cs: Tensor, d: int) -> Tensor:
-    """Largest number of shafts whose total contacts ≤ D (whole-shaft feasibility ceiling)."""
+def _k_max(cs: Tensor, d: int | Tensor) -> Tensor:
+    """Largest number of shafts whose total contacts ≤ D (whole-shaft feasibility ceiling).
+    ``d`` may be a Python int or a 0-dim tensor (``csum <= d`` broadcasts either)."""
     sizes = torch.sort(cs, descending=True).values
     csum = torch.cumsum(sizes, 0)
     return (csum <= d).sum()
@@ -188,7 +189,7 @@ def sample_masks(
     d_s_base = torch.round(cfg.space_frac * cs.float()).long()  # (S,) per-shaft target
     if cfg.keep_alive:
         d_s_base = torch.minimum(d_s_base, (cs - 1).clamp(min=0))  # reserve ≥1 visible/shaft
-    d = int(d_s_base.sum())
+    d = d_s_base.sum()  # 0-dim tensor — kept on-device (no host sync); _k_max broadcasts it
     k_max = _k_max(cs, d)
     # whole-shaft tier (legacy; frac=0 in Design B): whole shafts mask ALL n_s.
     k = (rand(r, s) < cfg.whole_shaft_frac).sum(1).clamp(max=k_max)  # (R,)

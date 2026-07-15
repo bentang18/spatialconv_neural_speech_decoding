@@ -98,8 +98,14 @@ def _drop_offsets(cu: Tensor) -> Tensor:
     return torch.cat([off[:1], off[1:][keep]])
 
 
-def build_r4_grid(geom: L1Geometry, *, n_time: int) -> R4Grid:
-    """Build the clip-independent flat full-grid layout for one session."""
+def build_r4_grid(
+    geom: L1Geometry, *, n_time: int, max_seqlen: int | None = None
+) -> R4Grid:
+    """Build the clip-independent flat full-grid layout for one session.
+
+    ``max_seqlen`` (longest shaft block, tokens) is a per-session CONSTANT; pass the cached
+    value to skip its ``.item()`` host sync (the compiled per-step path). ``None`` ⇒ derive
+    it here (one sync — the standalone/first-call fallback)."""
     device = geom.gather_idx.device
     S, max_c = geom.n_shafts, geom.max_c
     lengths = band_token_counts(n_time)  # (T_slow, T_mid, T_hga)
@@ -135,7 +141,8 @@ def build_r4_grid(geom: L1Geometry, *, n_time: int) -> R4Grid:
     seg = (n_per_shaft * k_full).to(torch.int32)  # (S,)
     cu = torch.zeros(S + 1, dtype=torch.int32, device=device)
     cu[1:] = seg.cumsum(0).to(torch.int32)
-    max_seqlen = int((n_per_shaft.max() * k_full).item())
+    if max_seqlen is None:
+        max_seqlen = int((n_per_shaft.max() * k_full).item())
 
     return R4Grid(
         depth=depth, time_pos=time_pos, contact=contact, band=band, bandpos=bandpos,
@@ -172,15 +179,18 @@ def pack_band_tokens(band_tokens: Sequence[Tensor], grid: R4Grid) -> Tensor:
 
 
 def build_visible_pack(
-    grid: R4Grid, masked: Tensor, parcel_packed: Tensor, *, m_vis: int | None = None
+    grid: R4Grid, masked: Tensor, parcel_packed: Tensor, *,
+    m_vis: int | None = None, max_seqlen: int | None = None,
 ) -> VisiblePack:
     """Compact each clip's VISIBLE (~masked) tokens into a flat, shaft-contiguous layout.
 
     Fixed-shape selection (packing.py:124 technique, compile-safe — no ``.nonzero()``):
     visible columns keep their grid index, masked columns get sentinel ``total``; an
     ascending sort floats the ``M_vis`` visible columns to the front in grid order (so the
-    packed set stays shaft-contiguous). ``M_vis`` is a per-session constant; the ``.item()``
-    fallback (one host sync, once per plan) keeps standalone/test callers working.
+    packed set stays shaft-contiguous). ``M_vis`` and the longest visible shaft block
+    (``max_seqlen``) are per-session constants; pass the cached values to skip their
+    ``.item()`` host syncs (the compiled per-step path). ``None`` ⇒ derive here (one sync
+    each — the standalone/first-call fallback).
     """
     B, total = masked.shape
     device = masked.device
@@ -196,13 +206,15 @@ def build_visible_pack(
     seg = per_shaft[0].to(torch.int32)  # static across clips (per-session constant)
     cu = torch.zeros(S + 1, dtype=torch.int32, device=device)
     cu[1:] = seg.cumsum(0).to(torch.int32)
+    if max_seqlen is None:
+        max_seqlen = int(seg.max().item())
     return VisiblePack(
         idx=idx,
         depth=grid.depth[idx],
         time_pos=grid.time_pos[idx],
         parcel=parcel_packed[idx],
         cu_seqlens=cu,
-        max_seqlen=int(seg.max().item()),
+        max_seqlen=max_seqlen,
         m_vis=m_vis,
     )
 

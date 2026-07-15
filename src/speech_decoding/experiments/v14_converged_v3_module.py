@@ -83,6 +83,11 @@ class V14ConvergedV3Module(pl.LightningModule):
         # Read by SSLHealthMonitorV3 (grad_noise_scale B_eff) and the tap monitors.
         self._last_batch_size: int = 0
         self._last_taps: dict[str, Tensor] | None = None
+        # Per-session cache of the (grid_max_seqlen, m_vis, pack_max_seqlen) Python-int shape
+        # constants (``model.session_plan``): computed once per session_key here (uncompiled),
+        # then passed into the compiled forward so it skips the per-step ``.item()`` host syncs.
+        # Batches are session-homogeneous (v3_collate), so a batch's session_key keys the plan.
+        self._session_plan_cache: dict[tuple, tuple[int, int, int]] = {}
 
     # --------------------------------------------------------------- optimizer
     def _trainable_parameters(self) -> list[Tensor]:
@@ -158,6 +163,21 @@ class V14ConvergedV3Module(pl.LightningModule):
     def _monitor_due(self, step: int) -> bool:
         return step % self.monitor_every_n_steps == 0
 
+    def _plan_for(self, batch: V3Batch) -> tuple[int | None, int | None, int | None]:
+        """The cached ``(grid_max_seqlen, m_vis, pack_max_seqlen)`` for this batch's session,
+        computed once per ``session_key`` via ``model.session_plan``. A batch with no
+        session_key (unit tests build V3Batch directly) returns all-None ⇒ the eager forward
+        derives the constants itself (one host sync/step) — behaviour unchanged there."""
+        key = batch.session_key
+        if key is None:
+            return (None, None, None)
+        plan = self._session_plan_cache.get(key)
+        if plan is None:
+            n_time = int(batch.bands[0].shape[-1])
+            plan = self.model.session_plan(batch.geom, batch.parcel_id, n_time)
+            self._session_plan_cache[key] = plan
+        return plan
+
     def training_step(self, batch: V3Batch, batch_idx: int) -> Tensor:
         device = batch.bands[0].device
         gen = self._step_generator(device)
@@ -184,15 +204,22 @@ class V14ConvergedV3Module(pl.LightningModule):
         collect = self._monitor_due(step) and is_last_microbatch
         # stat_mean/stat_std turn ON the secondary Gaussian-NLL when present (secondary
         # opt-in); absent ⇒ JEPA-only. They flow per-session like geom/parcel_id.
+        # grid_max_seqlen/m_vis/pack_max_seqlen: per-session Python-int shape constants,
+        # computed once per session_key here (uncompiled) and passed in so the compiled
+        # forward skips their per-step .item() host syncs (None ⇒ eager self-syncing path).
+        gms, mvis, pms = self._plan_for(batch)
         out = self.model(
             batch.bands, batch.geom, batch.parcel_id,
             generator=gen, collect_taps=collect,
             stat_mean=batch.stat_mean, stat_std=batch.stat_std,
+            grid_max_seqlen=gms, m_vis=mvis, pack_max_seqlen=pms,
         )
         self._last_batch_size = int(batch.bands[0].shape[0])
         self._last_taps = out.taps if collect else None
         self.log("train_loss", out.loss, on_step=True, prog_bar=True)
-        self.log("train_n_masked", float(out.n_masked), on_step=True)
+        # n_masked is a 0-dim tensor (sync deferred to the logger cadence, not the compiled
+        # forward); Lightning reduces/syncs it at its own log interval.
+        self.log("train_n_masked", out.n_masked, on_step=True)
         # Two-loss monitors (Ben 2026-07-15): when the secondary is active, log the primary
         # JEPA L1 and the secondary Gaussian-NLL SEPARATELY so the two objectives are
         # tracked independently (λ-balance readout). Both None on the JEPA-only arm ⇒ only

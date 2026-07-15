@@ -140,11 +140,68 @@ def test_scored_set_is_the_margin_gate() -> None:
     masks = _masks(geom)
     masked, in_loss = token_flags(grid, masks)
     out = obj(_bands(), geom, sc.parcel_id, masks)
+    nm = int(out.n_masked)  # n_masked is now a 0-dim tensor (sync deferred)
     subset = bool(torch.all(in_loss <= masked))
-    n_ok = out.n_masked == int(in_loss.sum())
-    ok = subset and n_ok and out.n_masked > 0
-    print(f"[check] in_loss ⊆ masked={subset}; n_masked={out.n_masked} == Σin_loss="
+    n_ok = nm == int(in_loss.sum())
+    ok = subset and n_ok and nm > 0
+    print(f"[check] in_loss ⊆ masked={subset}; n_masked={nm} == Σin_loss="
           f"{int(in_loss.sum())} ({n_ok}) {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_session_plan_consts_are_session_invariant_and_exact() -> None:
+    """The (grid_max_seqlen, m_vis, pack_max_seqlen) the module caches must be (a) IDENTICAL
+    across mask realizations — the property that makes caching them sound — and (b) exactly
+    what ``model.session_plan`` returns. Exact per-shaft spatial + GLOBAL per-band temporal
+    masking makes the per-shaft visible count clip-invariant, so one representative mask
+    fixes the shapes for every clip in the session."""
+    from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+
+    sc, geom = _session()
+    grid = build_r4_grid(geom, n_time=T)
+    parcel_packed = sc.parcel_id[grid.contact]
+    seen = set()
+    for seed in range(6):
+        g = torch.Generator().manual_seed(100 + seed)
+        masks = sample_masks(geom, N, n_time=T, n_rows=B, generator=g)
+        masked, _ = token_flags(grid, masks)
+        pack = build_visible_pack(grid, masked, parcel_packed)
+        seen.add((pack.m_vis, pack.max_seqlen))
+    invariant = len(seen) == 1
+    m_vis, pack_max = next(iter(seen))
+    plan = V3ConvergedModel(n_parcels=8).session_plan(geom, sc.parcel_id, T)
+    exact = plan == (grid.max_seqlen, m_vis, pack_max)
+    ok = invariant and exact
+    print(f"[check] shape-consts invariant across 6 mask seeds={invariant} (seen "
+          f"{sorted(seen)}); session_plan={plan} == derived "
+          f"{(grid.max_seqlen, m_vis, pack_max)} ({exact}) {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_passed_shape_consts_give_identical_forward() -> None:
+    """Passing the cached shape-consts must NOT change the forward — it only removes the
+    per-step ``.item()`` host syncs. Same masks + same weights ⇒ identical loss and n_masked
+    whether the objective derives the consts (None) or receives them."""
+    sc, geom = _session()
+    obj = V3JepaObjective(n_parcels=8)
+    grid = build_r4_grid(geom, n_time=T)
+    parcel_packed = sc.parcel_id[grid.contact]
+    masks = _masks(geom)
+    bands = _bands()
+    masked, _ = token_flags(grid, masks)
+    pack = build_visible_pack(grid, masked, parcel_packed)
+    out_eager = obj(bands, geom, sc.parcel_id, masks)
+    out_cached = obj(
+        bands, geom, sc.parcel_id, masks,
+        grid_max_seqlen=grid.max_seqlen, m_vis=pack.m_vis, pack_max_seqlen=pack.max_seqlen,
+    )
+    same_loss = torch.allclose(out_eager.loss, out_cached.loss, atol=1e-6)
+    same_nm = int(out_eager.n_masked) == int(out_cached.n_masked)
+    ok = same_loss and same_nm
+    print(f"[check] cached-const forward == eager: loss Δ="
+          f"{(out_eager.loss - out_cached.loss).abs().item():.2e} ({same_loss}), "
+          f"n_masked {int(out_eager.n_masked)}=={int(out_cached.n_masked)} ({same_nm}) "
+          f"{'OK' if ok else 'VIOLATED'}")
     assert ok
 
 

@@ -43,6 +43,11 @@ from speech_decoding.models.v14_converged_v3.objective import (
     JepaOutput,
     V3JepaObjective,
 )
+from speech_decoding.models.v14_converged_v3.pack_r4 import (
+    build_r4_grid,
+    build_visible_pack,
+    token_flags,
+)
 
 
 class V3ConvergedModel(nn.Module):
@@ -78,6 +83,9 @@ class V3ConvergedModel(nn.Module):
         collect_taps: bool = False,
         stat_mean: Tensor | None = None,
         stat_std: Tensor | None = None,
+        grid_max_seqlen: int | None = None,
+        m_vis: int | None = None,
+        pack_max_seqlen: int | None = None,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
         T = band_inputs[0].shape[-1]
@@ -87,6 +95,9 @@ class V3ConvergedModel(nn.Module):
         masks = sample_masks(
             geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
         )
+        # grid_max_seqlen / m_vis / pack_max_seqlen are the per-session Python-int shape
+        # constants ``session_plan`` precomputes (the module caches + passes them each step);
+        # they let the objective skip the per-step ``.item()`` host syncs. None ⇒ eager path.
         # stat_mean/stat_std (per-session frozen state-norm stats) turn ON the secondary
         # Gaussian-NLL; absent ⇒ JEPA-only. They flow in per-session like geom/parcel_id.
         return self.objective(
@@ -97,7 +108,33 @@ class V3ConvergedModel(nn.Module):
             collect_taps=collect_taps,
             stat_mean=stat_mean,
             stat_std=stat_std,
+            grid_max_seqlen=grid_max_seqlen,
+            m_vis=m_vis,
+            pack_max_seqlen=pack_max_seqlen,
         )
+
+    @torch.no_grad()
+    def session_plan(
+        self, geom: L1Geometry, parcel_id: Tensor, n_time: int
+    ) -> tuple[int, int, int]:
+        """``(grid_max_seqlen, m_vis, pack_max_seqlen)`` — the per-session Python-int shape
+        constants the compiled ``forward`` would otherwise recover with a per-step host sync.
+
+        Computed ONCE per session (the module caches the result by ``session_key``): all the
+        ``.item()`` syncs fire here, not every step. The counts are session-INVARIANT — exact
+        per-shaft spatial masking (``d_s`` fixed) + GLOBAL per-band temporal masking ⇒ every
+        clip masks ``d_s·k_full + (n_s−d_s)·T_masked`` tokens per shaft — so a single
+        representative mask (fixed seed) yields the values every clip shares."""
+        N = int(geom.valid.sum())
+        grid = build_r4_grid(geom, n_time=n_time)
+        parcel_packed = parcel_id[grid.contact]
+        gen = torch.Generator(device=grid.contact.device).manual_seed(0)
+        masks = sample_masks(
+            geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
+        )
+        masked, _ = token_flags(grid, masks)
+        pack = build_visible_pack(grid, masked, parcel_packed)
+        return grid.max_seqlen, pack.m_vis, pack.max_seqlen
 
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:

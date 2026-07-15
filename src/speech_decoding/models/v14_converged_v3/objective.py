@@ -87,7 +87,7 @@ def _ln_target(t: Tensor, n_levels: int = 1) -> Tensor:
 @dataclass
 class JepaOutput:
     loss: Tensor  # the TOTAL the trainer backprops: jepa_loss + λ·nll_loss (jepa only if secondary off)
-    n_masked: int  # margin-gated scored-token count (per-session constant × B)
+    n_masked: Tensor  # 0-dim: margin-gated scored-token count (realization-dependent; sync deferred)
     taps: dict[str, Tensor] | None = None
     jepa_loss: Tensor | None = None  # primary L1 term (set only when the secondary is active)
     nll_loss: Tensor | None = None  # secondary Gaussian-NLL term (None when secondary off)
@@ -189,6 +189,9 @@ class V3JepaObjective(nn.Module):
         collect_taps: bool = False,
         stat_mean: Tensor | None = None,
         stat_std: Tensor | None = None,
+        grid_max_seqlen: int | None = None,
+        m_vis: int | None = None,
+        pack_max_seqlen: int | None = None,
     ) -> JepaOutput:
         """``bands``: 3-band |STFT| inputs, ``bands[b]`` (B, N, F_b, T) on the shared 32 Hz
         clock (SLOW, MID, HGA). ``masks`` (``V3Masks``): per-band temporal masks
@@ -210,10 +213,16 @@ class V3JepaObjective(nn.Module):
         VISIBLE-cell tap (rankme / feat_std).
         """
         T = bands[0].shape[-1]  # 32 Hz clock length
-        grid = build_r4_grid(geom, n_time=T)
+        # grid_max_seqlen / m_vis / pack_max_seqlen are per-session Python-int shape constants
+        # (the module caches them via ``V3ConvergedModel.session_plan`` and passes them in);
+        # supplying them skips the per-step ``.item()`` host syncs that otherwise break the
+        # compiled graph. None ⇒ derive them here (one sync each — the eager/standalone path).
+        grid = build_r4_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
         parcel_packed = parcel_id[grid.contact]  # (total,) long
         masked, in_loss = token_flags(grid, masks)  # (B, total) bool each
-        pack = build_visible_pack(grid, masked, parcel_packed)
+        pack = build_visible_pack(
+            grid, masked, parcel_packed, m_vis=m_vis, max_seqlen=pack_max_seqlen
+        )
 
         # online encoder over the VISIBLE tokens (masked physically dropped) → (B, M_vis, 1024)
         if collect_taps:
@@ -265,7 +274,12 @@ class V3JepaObjective(nn.Module):
             taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
         return JepaOutput(
             loss=total,
-            n_masked=int(w.sum().item()),
+            # 0-dim tensor, NOT an int: the scored-token count is realization-dependent
+            # (the margin gate varies per clip — NOT a session constant, so it cannot be
+            # cached/passed like m_vis). Returning the tensor defers the host sync to the
+            # logger's own cadence instead of forcing one inside the compiled forward each
+            # step; consumers ``.item()``/log it lazily.
+            n_masked=w.sum().detach(),
             taps=taps,
             jepa_loss=jepa_loss if nll_loss is not None else None,
             nll_loss=nll_loss,
