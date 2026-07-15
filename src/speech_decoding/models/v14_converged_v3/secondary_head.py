@@ -37,9 +37,12 @@ from torch import Tensor, nn
 # Per-dim measurement-noise variance = 1 − split-half reliability, in the z-scored units
 # the target lives in (unit marginal variance per dim). Order:
 #   [slow_mu, mid_mu, hga_mu, slow_sd, mid_sd, hga_sd].
-# Means: M11 common-mode-removed parcel-mean reliability slow .7916 / mid .6389 / hga .5612.
-# Stds:  M17 common-mode-removed parcel-std  reliability slow .601 / mid .464 / hga .478.
-NOISE_VAR: tuple[float, ...] = (0.208, 0.361, 0.439, 0.399, 0.536, 0.522)
+# Refreshed to the ACTUAL target rate + processing (#28 cm-removed 4 Hz sweep, 2026-07-15):
+# means  reliability slow .881 / mid .796 / hga .828  (HGA-mean RISES vs .561 native — the 4 Hz
+#   temporal window-average denoises HGA rather than losing it; the 8 Hz arm was worse on every
+#   dim, headroom 3.53 < 3.82 nats, so 4 Hz is the evidence-based grid).
+# stds   reliability slow .652 / mid .496 / hga .546.
+NOISE_VAR: tuple[float, ...] = (0.119, 0.204, 0.172, 0.348, 0.504, 0.454)
 STATE_DIM: int = len(NOISE_VAR)
 
 # --- count-dependent noise floor (Ben 2026-07-15: "weight dependent") --------------------
@@ -52,13 +55,11 @@ STATE_DIM: int = len(NOISE_VAR)
 # r(n→∞)→1 idealization (ignoring shared biological noise) is shakier than the std sampling
 # law — mean-count-dependence is a clean HELD option, not built for v1.
 #
-# ⚠️ PLACEHOLDER anchors — REFRESH before launch (non-gating, flagged in contract §7):
-#   STD_REF_RELIABILITY = 1 − NOISE_VAR[3:] (M17 native-rate); refresh to cm-removed 4 Hz.
-#   N_REF = the mean electrode count the reliability was averaged over (#28 used parcels
-#   n_elec ≥ 6). The refresh probe reports the exact effective n_ref; 10 is a documented
-#   rough placeholder (mean of the n≥6 tail from the parcel-count probe).
-STD_REF_RELIABILITY: tuple[float, ...] = (0.601, 0.464, 0.478)  # slow/mid/hga std reliab @ n_ref
-N_REF: float = 10.0
+# REFRESHED anchors (#28 cm-removed 4 Hz sweep, 2026-07-15): std reliability at the sweep's
+# effective reference electron count. STD_REF_RELIABILITY = 1 − NOISE_VAR[3:] (consistent by
+# construction); N_REF is the mean n_elec the reliability was averaged over in that sweep.
+STD_REF_RELIABILITY: tuple[float, ...] = (0.652, 0.496, 0.546)  # slow/mid/hga std reliab @ n_ref
+N_REF: float = 13.35
 
 
 def count_dependent_noise_var(
