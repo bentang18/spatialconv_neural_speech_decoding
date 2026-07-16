@@ -90,7 +90,9 @@ def _smoke_args(**over):
         grad_clip=3.0, accumulate_grad_batches=2, log_every_n_steps=1,
         ckpt_dir=None, ckpt_ladder_every=0, wandb_project=None, run_name=None,
         compile=False, same_session_ranks=False, sdpa_backend="auto",
-        ddp_static_graph=False,
+        ddp_static_graph=False, grad_ratio_every_n_steps=0,
+        state_stats_dir=None, deep_sup=True,
+        nll_warmup_start_step=0, nll_warmup_steps=0, resume_ckpt=None,
     )
     a.update(over)
     return argparse.Namespace(**a)
@@ -175,6 +177,83 @@ def test_smoke_advances_teacher_and_params(tmp_path) -> None:
                        if p.requires_grad])
     # one optimizer step moved the trainable params (optimizer + EMA both ran)
     assert not torch.allclose(before, after)
+
+
+# --- resume / fork wiring ----------------------------------------------------
+# r4b forks r4 at step 10000 (--lambda-nll 0) by restoring r4's ladder ckpt. That
+# needs dispatch to thread a ckpt_path into trainer.fit — v3 runs dispatch directly
+# (no exca), so the resume is plain Lightning ckpt_path, and it was never plumbed.
+
+
+def test_resume_ckpt_arg_defaults_none_and_parses() -> None:
+    from speech_decoding.experiments.dispatch_v3 import build_arg_parser
+
+    base = [
+        "--bt-root", "x", "--band-cache-dir", "a", "--band-cache-dir", "b",
+        "--band-cache-dir", "c", "--span-dir", "s", "--session", "1:0",
+        "--ssl-max-steps", "1",
+    ]
+    assert build_arg_parser().parse_args(base).resume_ckpt is None
+    got = build_arg_parser().parse_args(base + ["--resume-ckpt", "/p/ladder-step=10000.ckpt"])
+    assert got.resume_ckpt == "/p/ladder-step=10000.ckpt"
+
+
+def _cpu_trainer(max_steps, ckpt_dir=None):
+    """A tiny CPU trainer that honors a small max_steps — build_v3_training's own
+    trainer floors max_steps to 100k (a real-run stop-point), so resume tests build
+    their own."""
+    import lightning.pytorch as pl
+
+    cbs = []
+    if ckpt_dir is not None:
+        from lightning.pytorch.callbacks import ModelCheckpoint
+
+        cbs.append(ModelCheckpoint(
+            dirpath=str(ckpt_dir), filename="ladder-{step}",
+            every_n_train_steps=1, save_last=True, save_top_k=-1,
+        ))
+    return pl.Trainer(
+        max_steps=max_steps, max_epochs=-1, accelerator="cpu", devices=1,
+        precision="32-true", accumulate_grad_batches=2, log_every_n_steps=1,
+        callbacks=cbs, logger=False, num_sanity_val_steps=0,
+        reload_dataloaders_every_n_epochs=1, enable_checkpointing=ckpt_dir is not None,
+        gradient_clip_val=3.0, use_distributed_sampler=False,
+    )
+
+
+def test_module_resumes_model_and_step_from_checkpoint(tmp_path) -> None:
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+
+    def _build():
+        specs = load_v3_sessions(
+            sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+            parcel_fn=_stub_parcel_fn,
+        )
+        module, dm, _ = build_v3_training(specs, _smoke_args(clips_per_session=4))
+        return module, dm
+
+    ckpt_dir = tmp_path / "ck"
+    m1, dm1 = _build()
+    _cpu_trainer(2, ckpt_dir=ckpt_dir).fit(m1, datamodule=dm1)
+    last = ckpt_dir / "last.ckpt"
+    assert last.exists()
+    trained = torch.cat([p.detach().flatten() for p in m1.model.parameters()
+                         if p.requires_grad])
+
+    # a FRESH module (independent init) restored from the ckpt at its own stop-step
+    # must end holding the ckpt's exact weights after ZERO further opt-steps — the
+    # unambiguous proof that ckpt_path restored model + global_step (not a fresh run).
+    m2, dm2 = _build()
+    fresh = torch.cat([p.detach().flatten() for p in m2.model.parameters()
+                       if p.requires_grad])
+    assert not torch.allclose(trained, fresh)  # genuinely different before restore
+    t2 = _cpu_trainer(2)  # max_steps == restore step ⇒ resume then stop immediately
+    t2.fit(m2, datamodule=dm2, ckpt_path=str(last))
+    assert t2.global_step == 2
+    restored = torch.cat([p.detach().flatten() for p in m2.model.parameters()
+                          if p.requires_grad])
+    assert torch.allclose(trained, restored, atol=1e-5)
 
 
 # --- r3 static_graph launch gate --------------------------------------------

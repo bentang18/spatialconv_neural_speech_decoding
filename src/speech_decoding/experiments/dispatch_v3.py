@@ -494,6 +494,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-ladder-every", dest="ckpt_ladder_every", type=int,
                    default=1000, help="save a ladder ckpt every N steps (0=off); "
                                       "1000 = v2 probe-ladder cadence (Ben 2026-07-10)")
+    p.add_argument("--resume-ckpt", dest="resume_ckpt", default=None,
+                   help="Lightning ckpt_path to restore before fit (model + optimizer + "
+                        "EMA + global_step + loop state). Use to FORK a run: point at a "
+                        "prior ladder-<step>.ckpt to branch from that step with a changed "
+                        "config (e.g. r4b = r4's step-10000 ckpt with --lambda-nll 0). The "
+                        "resumed trainable-param set must match the ckpt's, so keep "
+                        "--state-stats-dir when the ckpt was trained with it. Default None "
+                        "= fresh run from step 0.")
     p.add_argument("--wandb-project", dest="wandb_project", default=None,
                    help="wandb project (live); omit to disable logging")
     p.add_argument("--run-name", dest="run_name", default=None)
@@ -564,7 +572,10 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         _dynamo.config.accumulated_cache_size_limit = max(512, len(sessions) * 32)
         module.model = torch.compile(module.model, dynamic=False)  # type: ignore[assignment]
     with _sdpa_ctx(args.sdpa_backend):
-        trainer.fit(module, datamodule=dm)
+        trainer.fit(
+            module, datamodule=dm,
+            ckpt_path=getattr(args, "resume_ckpt", None) or None,
+        )
 
 
 def _sdpa_ctx(name: str):
