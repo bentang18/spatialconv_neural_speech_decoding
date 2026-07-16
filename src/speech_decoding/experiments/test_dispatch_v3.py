@@ -341,3 +341,31 @@ def test_step_time_scalar_still_skips_first_step_then_logs() -> None:
     assert len(logged) == 1
     key, value, sync = logged[0]
     assert key == "train_sec_per_step" and value >= 0.0 and sync is False
+
+
+# --- r5 Arm 2 wiring: --no-nll-floor -----------------------------------------
+
+
+def test_nll_floor_flag_defaults_on_and_parses_no_variant() -> None:
+    """Default MUST stay ON: r1-r4 and the r4 resume all assume the measured floor, so a
+    flipped default would silently change a live run's objective mid-matrix."""
+    from speech_decoding.experiments.dispatch_v3 import build_arg_parser
+
+    base = [
+        "--bt-root", "x", "--band-cache-dir", "a", "--band-cache-dir", "b",
+        "--band-cache-dir", "c", "--span-dir", "s", "--session", "1:0",
+        "--ssl-max-steps", "1",
+    ]
+    assert build_arg_parser().parse_args(base).nll_floor is True
+    assert build_arg_parser().parse_args(base + ["--no-nll-floor"]).nll_floor is False
+    assert build_arg_parser().parse_args(base + ["--nll-floor"]).nll_floor is True
+
+
+def test_nll_floor_threads_from_args_through_model_to_objective() -> None:
+    """'Is X wired?' -> assert it end-to-end, don't trust the kwarg chain by eye. The flag
+    crosses dispatch -> V3ConvergedModel -> V3JepaObjective; a drop anywhere is silent
+    (the run trains happily WITH the floor and Arm 2 measures nothing)."""
+    from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+
+    assert V3ConvergedModel(n_parcels=4).objective.nll_floor is True  # default = r4
+    assert V3ConvergedModel(n_parcels=4, nll_floor=False).objective.nll_floor is False

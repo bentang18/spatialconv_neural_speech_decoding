@@ -49,6 +49,7 @@ from speech_decoding.models.v14_converged_v3.dataset import V3SessionSpec
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
 from speech_decoding.models.v14_converged_v3.objective import LAMBDA_NLL
+from speech_decoding.models.v14_converged_v3.secondary_head import NLL_FLOOR_JITTER
 from speech_decoding.models.v14_converged_v3.session_loader import (
     ParcelFn,
     load_v3_sessions,
@@ -239,6 +240,7 @@ def build_v3_training(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
         lambda_nll=getattr(args, "lambda_nll", LAMBDA_NLL),
+        nll_floor=getattr(args, "nll_floor", True),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -475,6 +477,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="secondary Gaussian-NLL weight λ in total = JEPA_L1 + λ·NLL "
                         f"(contract §5 open knob; default {LAMBDA_NLL}). This is the HOLD value "
                         "the ramp climbs to. No effect without --state-stats-dir.")
+    p.add_argument("--nll-floor", dest="nll_floor",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="ON (default, r1–r4): Sigma = L Lᵀ + the measured count-dependent "
+                        "noise floor. --no-nll-floor is r5 Arm 2 (floor-off): the head learns "
+                        f"Sigma with only a {NLL_FLOOR_JITTER:g} conditioning jitter, no "
+                        "measured floor. No effect without --state-stats-dir.")
     p.add_argument("--nll-warmup-start-step", dest="nll_warmup_start_step",
                    type=int, default=0,
                    help="opt-step at which the secondary-NLL λ ramp OPENS. Before it, λ=0 "

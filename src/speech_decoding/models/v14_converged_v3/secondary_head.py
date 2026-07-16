@@ -45,6 +45,15 @@ from torch import Tensor, nn
 NOISE_VAR: tuple[float, ...] = (0.119, 0.204, 0.172, 0.348, 0.504, 0.454)
 STATE_DIM: int = len(NOISE_VAR)
 
+# r5 Arm 2 (floor-off) ONLY — the floor the head gets when --no-nll-floor replaces the
+# measured NOISE_VAR. Not a floor: L already carries a softplus diagonal, so ``L Lᵀ`` is
+# strictly PD on its own and this is bf16 conditioning insurance for the case where that
+# softplus underflows toward 0. Ben-set 1e-6 (2026-07-16), ~5 orders below the smallest
+# measured entry (0.119), so it cannot act as a floor in disguise and contaminate the
+# Arm1-vs-Arm2 contrast — that separation is the arm's whole point and
+# test_arm2_jitter_cannot_masquerade_as_a_floor pins it.
+NLL_FLOOR_JITTER: float = 1e-6
+
 # --- count-dependent noise floor (Ben 2026-07-15: "weight dependent"; means added same day) --
 # A parcel summary is a sample statistic over its n electrodes: measurement is WORSE for small
 # parcels, and the distribution probe found 28% of the loss terms come from 2-4 electrode

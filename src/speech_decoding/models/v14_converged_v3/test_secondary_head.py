@@ -27,6 +27,7 @@ import torch
 from speech_decoding.models.v14_converged_v3.secondary_head import (
     MEAN_REF_RELIABILITY,
     N_REF,
+    NLL_FLOOR_JITTER,
     NOISE_VAR,
     STD_REF_RELIABILITY,
     GaussianStateHead,
@@ -368,3 +369,54 @@ def test_present_masked_marginal_ignores_absent_and_crosscov() -> None:
 # no longer validates the present layout per step (those two bool(...all()) checks were host
 # syncs inside the compiled forward). The layout is guaranteed by dim_presence's construction
 # and pinned in test_state_target.test_dim_presence_layout_wellformed instead.
+
+
+# --- r5 Arm 2: floor-off -----------------------------------------------------
+# Arm 2 removes the measured floor so the head must learn Sigma itself. It exists because
+# r4 (wandb y365e10t) showed the entropy gap at only ~0.36 nats over a 5.46 floor -- N is
+# most of Sigma -- and the raw NLL flatlined from 16k (slope -0.0016/1000 steps over
+# 20k-26k with lambda pinned at 0.02) while JEPA kept falling. The head may be echoing the
+# floor we handed it. These two tests pin the properties that make the arm interpretable.
+
+
+def test_arm2_jitter_cannot_masquerade_as_a_floor() -> None:
+    """THE invariant protecting the Arm1-vs-Arm2 contrast. The jitter exists only so a
+    bf16-underflowed softplus diagonal cannot make Sigma singular; if it were anywhere near
+    the measured floor it would BE a floor, and Arm 2 would silently test 'smaller floor'
+    instead of 'no floor' -- the contrast would be uninterpretable and we would not see it
+    in the CS number. Ben set 1e-6 (2026-07-16) against a measured floor of 0.119..0.504."""
+    smallest_measured = min(NOISE_VAR)
+    orders = math.log10(smallest_measured / NLL_FLOOR_JITTER)
+    ok = orders >= 4.0
+    print(f"[check] jitter {NLL_FLOOR_JITTER:g} vs smallest measured floor "
+          f"{smallest_measured:g} -> {orders:.1f} orders below (need >=4) "
+          f"{'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_arm2_floor_off_keeps_sigma_pd_when_L_underflows() -> None:
+    """The one real risk of floor-off: L's softplus diagonal underflows toward 0 in bf16,
+    and with no measured floor Sigma leans entirely on the jitter. Drive the head's chol
+    params hard negative (softplus -> ~0) and assert Sigma is STILL PD and the NLL finite.
+    Without the jitter this is a singular Sigma and a NaN loss ~40 h into a queued run."""
+    torch.manual_seed(0)
+    head = GaussianStateHead(d_in=16)
+    with torch.no_grad():  # force softplus(diag) -> ~0: the underflow regime
+        head.chol_head.weight.zero_()
+        head.chol_head.bias.fill_(-30.0)
+    feat = torch.randn(8, 16)
+    jitter = torch.full((8, len(NOISE_VAR)), NLL_FLOOR_JITTER)
+    mu, cov = head(feat, noise=jitter)
+    eig = torch.linalg.eigvalsh(cov.float())
+    pd = bool((eig > 0).all())
+    chol_ok = True
+    try:
+        torch.linalg.cholesky(cov.float())
+    except RuntimeError:
+        chol_ok = False
+    nll = gaussian_nll(mu, cov, torch.randn_like(mu))
+    finite = bool(torch.isfinite(nll).all())
+    ok = pd and chol_ok and finite
+    print(f"[check] floor-off under softplus underflow: min eig={eig.min():.3e} PD={pd} "
+          f"cholesky={chol_ok} finite NLL={finite} {'OK' if ok else 'VIOLATED'}")
+    assert ok

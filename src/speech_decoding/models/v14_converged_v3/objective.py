@@ -52,6 +52,8 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.perceiver import PerceiverHead
 from speech_decoding.models.v14_converged_v3.secondary_head import (
+    NLL_FLOOR_JITTER,
+    STATE_DIM,
     count_dependent_noise_var,
     present_masked_nll,
 )
@@ -145,11 +147,19 @@ class V3JepaObjective(nn.Module):
         ema_tau: float = EMA_TAU,
         deep_sup: bool = True,
         lambda_nll: float = LAMBDA_NLL,
+        nll_floor: bool = True,
     ) -> None:
         super().__init__()
         self.deep_sup = bool(deep_sup)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         self.lambda_nll = float(lambda_nll)
+        # r5 Arm 2. True (r1–r4, the default) = the measured count-dependent floor. False =
+        # floor-off: Sigma is L Lᵀ + NLL_FLOOR_JITTER·I, i.e. the head learns its own
+        # covariance instead of being handed one. r4 evidence motivating the arm (wandb
+        # y365e10t): the entropy gap sits at only ~0.36 nats over a 5.46 floor, so the fixed
+        # N is most of Sigma and the head plateaued at 16k — it may be echoing our floor
+        # rather than modelling anything.
+        self.nll_floor = bool(nll_floor)
         # online target path (stem + encoder) — every param here is EMA-mirrored.
         self.online = _TargetTower(n_parcels=n_parcels, deep_sup=self.deep_sup)
         self.teacher = EmaTeacher(
@@ -330,7 +340,12 @@ class V3JepaObjective(nn.Module):
         # secondary-path twin of the syncs e3baef6 killed on the primary path).
         counts = torch.bincount(parcel_id)
         n_elec = counts[parcels]  # (P,)
-        noise = count_dependent_noise_var(n_elec.repeat_interleave(S))  # (Q, 6)
+        if self.nll_floor:
+            noise = count_dependent_noise_var(n_elec.repeat_interleave(S))  # (Q, 6)
+        else:  # r5 Arm 2 — no measured floor; jitter only, for bf16 conditioning.
+            noise = torch.full(
+                (P * S, STATE_DIM), NLL_FLOOR_JITTER, device=dev, dtype=target.dtype
+            )
         # queries parcel-major to match target.reshape(B, P·S, 6): [p0s0,p0s1,…,p1s0,…].
         Q = P * S
         q_parcel = parcels.repeat_interleave(S)  # (Q,) actual parcel ids (index ParcelIdentityEmbed)

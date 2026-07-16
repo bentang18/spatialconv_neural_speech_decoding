@@ -59,6 +59,7 @@ class V3ConvergedModel(nn.Module):
         target_ln: bool = True,
         deep_sup: bool = True,
         lambda_nll: float = LAMBDA_NLL,
+        nll_floor: bool = True,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -67,9 +68,11 @@ class V3ConvergedModel(nn.Module):
         # single-tap ablation arm. lambda_nll (§5 open knob) is the secondary
         # Gaussian-NLL weight in total = JEPA_L1 + λ·NLL; it only matters when the
         # per-session frozen state-stats are supplied (secondary opt-in).
+        # nll_floor=False is r5 Arm 2 (floor-off): the head learns Sigma with no measured
+        # noise floor. Like lambda_nll it only bites when the secondary is opted in.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
-            lambda_nll=lambda_nll,
+            lambda_nll=lambda_nll, nll_floor=nll_floor,
         )
         self.mask_cfg = mask_cfg
 
