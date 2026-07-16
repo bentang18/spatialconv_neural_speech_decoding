@@ -199,7 +199,8 @@ class PerceiverHead(nn.Module):
         *,
         n_slots: int,
         noise: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        return_latents: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """z_tokens (B,K,d_tap) padded visible-token deep-sup features; token_time (B,K)
         long 32 Hz-lattice frame index; token_mask (B,K) bool (True=real) or None when
         every token is real (exact masking ⇒ no padding, so the objective passes None and
@@ -209,7 +210,9 @@ class PerceiverHead(nn.Module):
         electrode count — the objective owns the n_elec map and passes it through to the
         head). Returns (mu (B,Q,6), cov (B,Q,6,6)) — the joint Gaussian per (parcel, slot).
         Presence masking + NLL are the objective's job (B3); this returns a Gaussian at
-        every query.
+        every query. ``return_latents`` (monitor cadence only) additionally returns the
+        processed latent bank ``lat`` (B, n_slots·M, d_perc) — post-``process``, pre-decode —
+        for the representation-health monitor; it is a read-only view, the caller detaches.
         """
         B = z_tokens.shape[0]
         dev = z_tokens.device
@@ -232,4 +235,6 @@ class PerceiverHead(nn.Module):
         q_pos = query_slot * SLOT_STRIDE  # (B, Q)
         dec = self.decode(q, lat, q_pos, lat_pos, key_mask=None)  # (B, Q, d_perc)
         mu, cov = self.head(dec, noise=noise)
+        if return_latents:
+            return mu, cov, lat
         return mu, cov

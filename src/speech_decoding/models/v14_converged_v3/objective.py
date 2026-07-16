@@ -338,15 +338,28 @@ class V3JepaObjective(nn.Module):
         # exact masking ⇒ every packed visible token is real, so the encode key-mask would be
         # all-True and its additive bias identically zero. Pass None to skip the bool alloc +
         # the zero bias-add in the perceiver's encode cross-attention (agent finding #5).
-        mu, cov = self.perceiver(
-            z,
-            pack.time_pos,
-            None,
-            q_parcel[None].expand(B, Q),
-            q_slot[None].expand(B, Q),
-            n_slots=S,
-            noise=noise[None].expand(B, Q, noise.shape[-1]),
-        )
+        lat = None
+        if collect_taps:  # also pull the processed latent bank for the health monitor
+            mu, cov, lat = self.perceiver(
+                z,
+                pack.time_pos,
+                None,
+                q_parcel[None].expand(B, Q),
+                q_slot[None].expand(B, Q),
+                n_slots=S,
+                noise=noise[None].expand(B, Q, noise.shape[-1]),
+                return_latents=True,
+            )
+        else:
+            mu, cov = self.perceiver(
+                z,
+                pack.time_pos,
+                None,
+                q_parcel[None].expand(B, Q),
+                q_slot[None].expand(B, Q),
+                n_slots=S,
+                noise=noise[None].expand(B, Q, noise.shape[-1]),
+            )
         present_q = present.repeat_interleave(S, dim=0)  # (Q, 6)
         target_q = target.reshape(B, Q, target.shape[-1])
         present_q_full = present_q[None].expand(B, Q, present_q.shape[-1])  # (B, Q, 6)
@@ -358,6 +371,11 @@ class V3JepaObjective(nn.Module):
                     **per_band_nll(mu, cov, target_q, present_q_full),
                     **cov_entropy_vs_floor(cov, noise[None].expand(B, Q, noise.shape[-1])),
                 }
+            # processed-latent bank (B, S·M, d_perc), raw — reduced by the callback's
+            # perceiver-health monitor (RankMe/feat_std via the shared _rank_and_std path,
+            # dead-frac + latent-latent cosine). Detached: monitor-only, never in backward.
+            if lat is not None:
+                aux["perc_lat"] = lat.detach()
         return nll, aux
 
     @torch.no_grad()

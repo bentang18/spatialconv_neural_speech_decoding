@@ -315,6 +315,36 @@ def test_collect_taps_emits_per_band_monitor_scalars() -> None:
     assert ok
 
 
+def test_collect_taps_ships_raw_perceiver_latent_bank() -> None:
+    # Perceiver-health monitor wiring: with collect_taps + secondary active, the objective
+    # ships the processed latent bank as a RAW 3-d tap ``perc_lat`` (B, S·M, d_perc), detached
+    # (no grad) so the callback can reduce RankMe / dead-frac / cosine off the loss graph.
+    # Absent when the secondary is off (perceiver never ran).
+    from speech_decoding.models.v14_converged_v3.perceiver import D_PERC, M_LATENTS
+
+    sc, geom = _session()
+    obj = V3JepaObjective(n_parcels=8, lambda_nll=0.2)
+    sm, ss = _stats(sc)
+    out = obj(
+        _bands(), geom, sc.parcel_id, _masks(geom),
+        stat_mean=sm, stat_std=ss, collect_taps=True,
+    )
+    lat = (out.taps or {}).get("perc_lat")
+    present = isinstance(lat, torch.Tensor) and lat.ndim == 3
+    shape_ok = present and lat.shape[-1] == D_PERC and lat.shape[1] % M_LATENTS == 0
+    detached = present and not lat.requires_grad
+    # secondary OFF ⇒ no perc_lat tap at all
+    off = obj(_bands(), geom, sc.parcel_id, _masks(geom), collect_taps=True)
+    absent = "perc_lat" not in (off.taps or {})
+    ok = present and shape_ok and detached and absent
+    print(
+        f"[check] perc_lat raw 3-d tap present={present}, shape={tuple(lat.shape) if present else None} "
+        f"(d_perc={D_PERC}, ×M={M_LATENTS}) ok={shape_ok}, detached={detached}, "
+        f"absent-when-off={absent} → {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
 def test_collect_taps_jepa_only_has_no_secondary_scalars() -> None:
     # collect_taps=True but secondary OFF (no stats): enc12 + per-band JEPA scalars present,
     # but NO nll_*/cov_entropy* (the secondary never ran). Guards against logging stale keys.

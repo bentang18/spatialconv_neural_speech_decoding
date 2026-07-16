@@ -41,6 +41,7 @@ from lightning import pytorch as pl
 from torch import Tensor
 
 from speech_decoding.experiments.monitors.grad_spike import grad_spike_monitor
+from speech_decoding.experiments.monitors.perceiver_health import perceiver_latent_health
 from speech_decoding.experiments.monitors.teacher_rank import teacher_rank_monitor
 
 
@@ -113,6 +114,13 @@ class SSLHealthMonitorV3(pl.Callback):
         tap = taps.get("enc12")
         if isinstance(tap, Tensor):
             self._rank_and_std(pl_module, tap, key="enc12_")
+        # perceiver processed-latent health (r4 secondary head). RankMe + feat_std via the
+        # SAME shared _rank_and_std path as enc12 (no duplication); dead-feature fraction +
+        # latent-latent cosine redundancy on top. Present only when the secondary is active.
+        perc = taps.get("perc_lat")
+        if isinstance(perc, Tensor):
+            self._rank_and_std(pl_module, perc, key="perc_lat_")
+            self._perceiver_health(pl_module, perc)
         # scalar monitor taps reduced INSIDE the objective (r4): per-band JEPA
         # explained-var / var-ratio / L1 (#40), per-band NLL (#41), predicted-cov
         # entropy vs floor (#42). Each is a 0-dim tensor keyed by its own name.
@@ -157,6 +165,16 @@ class SSLHealthMonitorV3(pl.Callback):
         std = flat.std(dim=0, unbiased=False)
         pl_module.log(f"{prefix}feat_std_mean", std.mean(), on_step=True)
         pl_module.log(f"{prefix}feat_std_min", std.min(), on_step=True)
+
+    def _perceiver_health(self, pl_module: pl.LightningModule, lat: Tensor) -> None:
+        """Dead-feature fraction + latent-latent cosine redundancy on the perceiver's
+        processed latent bank ``lat`` (B, L, d). RankMe / feat_std_mean / feat_std_min are
+        already logged by ``_rank_and_std`` on the same tap; this adds the two residual
+        (non-RankMe) collapse reads. All log-only, detached, per-rank (DDP-safe)."""
+        stats = perceiver_latent_health(lat.detach().to(torch.float32))
+        pl_module.log("train_mon_perc_lat_dead_frac", stats["dead_frac"], on_step=True)
+        pl_module.log("train_mon_perc_lat_cos_mean", stats["cos_mean"], on_step=True)
+        pl_module.log("train_mon_perc_lat_cos_pct95", stats["cos_pct95"], on_step=True)
 
     def _log_scalar_taps(
         self, pl_module: pl.LightningModule, taps: dict[str, Tensor]
