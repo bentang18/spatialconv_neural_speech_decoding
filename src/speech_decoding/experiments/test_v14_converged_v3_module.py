@@ -181,24 +181,25 @@ def test_secondary_active_trains_perceiver_on_stats() -> None:
     )
 
 
-def test_nll_lambda_schedule_ramps_10k_to_25k() -> None:
-    # The eager λ ramp (Ben 2026-07-15): λ=0 before the start step, linear 0→hold over
-    # [start, start+steps], hold after. hold is the objective's lambda_nll. Invariant
+def test_nll_lambda_schedule_ramps_10k_to_20k() -> None:
+    # The eager λ ramp (Ben 2026-07-15, 10k→20k): λ=0 before the start step, linear 0→hold
+    # over [start, start+steps], hold after. hold is the objective's lambda_nll. Invariant
     # PRINTED (feedback-build-the-invariant-into-the-probe): the schedule must be 0 below
-    # start, exactly hold/2 at the midpoint, hold at the end, and clamp above.
+    # start, exactly hold/2 at the midpoint, hold at the end, and clamp above. These are the
+    # real launch numbers (--nll-warmup-start-step 10000 --nll-warmup-steps 10000).
     model = V3ConvergedModel(n_parcels=N_PARCELS)
     mod = V14ConvergedV3Module(
         model=model, optim_config=_optim_config(weight_decay=0.04),
         secondary_active=True,
-        nll_warmup_start_step=10_000, nll_warmup_steps=15_000,
+        nll_warmup_start_step=10_000, nll_warmup_steps=10_000,
     )
     hold = float(mod.model.objective.lambda_nll)
     cases = {
         0: 0.0,
         9_999: 0.0,
         10_000: 0.0,          # ramp opens AT start ⇒ frac 0 here
-        17_500: 0.5 * hold,   # midpoint of [10k, 25k]
-        25_000: hold,         # ramp closes
+        15_000: 0.5 * hold,   # midpoint of [10k, 20k]
+        20_000: hold,         # ramp closes
         40_000: hold,         # clamp above
     }
     worst = 0.0
@@ -207,9 +208,9 @@ def test_nll_lambda_schedule_ramps_10k_to_25k() -> None:
         worst = max(worst, abs(got - want))
     ok = worst < 1e-9 and mod._nll_lambda(-5) == 0.0
     print(
-        f"[check] λ_nll schedule (hold={hold}, 10k→25k): "
-        f"λ(0)={mod._nll_lambda(0):.4f} λ(17.5k)={mod._nll_lambda(17_500):.4f} "
-        f"λ(25k)={mod._nll_lambda(25_000):.4f} max|Δ|={worst:.2e} → {'OK' if ok else 'VIOLATED'}"
+        f"[check] λ_nll schedule (hold={hold}, 10k→20k): "
+        f"λ(0)={mod._nll_lambda(0):.4f} λ(15k)={mod._nll_lambda(15_000):.4f} "
+        f"λ(20k)={mod._nll_lambda(20_000):.4f} max|Δ|={worst:.2e} → {'OK' if ok else 'VIOLATED'}"
     )
     assert ok
 
