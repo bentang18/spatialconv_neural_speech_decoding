@@ -12,6 +12,12 @@ pooled to parcels (MEAN over electrodes per band-slot) at encode. So both direct
     test subject's cs_split test half, over the anchor∩test PARCEL intersection (same v2
     direction as r1). Parcel columns aligned by atlas id.
 
+Perceiver taps (Ben 2026-07-16) ride the same caches: ``dec``/``lat`` (+ ``_rand`` fresh-init
+twins). ``dec`` has the enc taps' parcel axis and takes the normal CS intersection; ``lat`` is
+PARCEL-FREE (see PARCEL_FREE_TAPS) and is CS-scored WHOLE — no intersection, 6144 dims in every
+subject. Read the perceiver block against the _rand twin, not against enc12: tap-vs-twin is a
+matched contrast, tap-vs-enc12 crosses the teacher-vs-context stream caveat.
+
 Ridge/metric primitives INLINED from the r1 readout — zero speech_decoding dep, runs on the
 stock NCSA Delta pytorch module. λ held CONSTANT (lam_mult=1.0) across every cell. Sole
 divergence from r1: the ridge GEMMs run fp32 (r1 was fp64 at a much narrower, electrode-
@@ -41,6 +47,16 @@ PROBE_TASKS = ("onset", "delta_volume", "word_index", "gpt2_surprisal")
 CS_TRAIN_ANCHOR = (2, 1)
 CS_TEST_SUBJECTS = (1, 3, 4, 6, 8, 9)
 ENCODERS = ("enc0", "enc3", "enc6", "enc12")
+# Write-only Perceiver taps (Ben 2026-07-16), each with its fresh-init control twin.
+#   dec  (n,|P|,S·128)  — the per-(parcel,slot) query read, PRE-head. Parcel axis == the enc
+#                         taps' `present_parcels`, so the CS intersection needs no special case.
+#   lat  (n,1,S·M·128)  — the processed latent bank. PARCEL-FREE by construction (the 12 latents
+#                         are shared learned params), so it is natively subject-independent and
+#                         CS takes it WHOLE: no intersection, identical 6144 dims every session.
+#                         It is also dec's information CEILING (dec = f(lat, parcel, slot)).
+PERC_TAPS = ("dec", "lat", "dec_rand", "lat_rand")
+PARCEL_FREE_TAPS = ("lat", "lat_rand")
+ALL_TAPS = ENCODERS + PERC_TAPS
 # Readout conditioning of the raw parcel-mean feature. std = per-feature z-score on TRAIN stats
 # (the FM linear-probe convention; also removes the enc0-is-already-normalized asymmetry — enc0
 # is robust-z'd pre-pool while taps are at network scale). raw = as-cached (r1/M9-comparable).
@@ -135,6 +151,14 @@ def _cs_cell(anchor_rec, test_rec, enc, task, norm) -> float:
     if len(tr) < 2 or len(te) < 2:
         return float("nan")
 
+    if enc in PARCEL_FREE_TAPS:
+        # No parcel axis to intersect — the latent bank is the SAME 12 shared learned slots in
+        # every subject, so slot m at time s already means the same thing on both sides and the
+        # feature is dimension-matched by construction. This is the cleanest CS transfer in the
+        # suite: no intersection, no montage bridge, full 6144 dims.
+        return _ridge_test(_feat(anchor_rec, enc, tr), y_anchor[tr],
+                           _feat(test_rec, enc, te), y_test[te], norm)
+
     a_p = np.asarray(anchor_rec["present_parcels"], dtype=np.int64)
     t_p = np.asarray(test_rec["present_parcels"], dtype=np.int64)
     common = np.intersect1d(a_p, t_p)
@@ -154,27 +178,27 @@ def _load(cache_dir, session, tag):
 
 
 # ── sharded units (one SLURM array task each; all cells are independent) ────────────
-def _ws_shard(cache_dir, tag, session) -> dict:
+def _ws_shard(cache_dir, tag, session, taps=ALL_TAPS) -> dict:
     """All WS cells for ONE session → {key: auroc}. Loads that session's cache only."""
     rec = _load(cache_dir, session, tag)
     cells = {f"{tag}|{enc}|{v}|{task}": _ws_session(rec, enc, task, v)
-             for enc in ENCODERS for v in NORMS for task in PROBE_TASKS}
+             for enc in taps for v in NORMS for task in PROBE_TASKS}
     return {"kind": "ws", "name": f"S{session[0]}T{session[1]}", "cells": cells}
 
 
-def _cs_shard(cache_dir, tag, test_subject) -> dict:
+def _cs_shard(cache_dir, tag, test_subject, taps=ALL_TAPS) -> dict:
     """All CS cells for ONE held-out test subject → {key: auroc}. Loads anchor + that test."""
     anchor_rec = _load(cache_dir, CS_TRAIN_ANCHOR, tag)
     ts = (test_subject, next(t for (ss, t) in PROBE_COHORT_7 if ss == test_subject))
     test_rec = _load(cache_dir, ts, tag)
     cells = {f"{tag}|{enc}|{v}|{task}": _cs_cell(anchor_rec, test_rec, enc, task, v)
-             for enc in ENCODERS for v in NORMS for task in PROBE_TASKS}
+             for enc in taps for v in NORMS for task in PROBE_TASKS}
     return {"kind": "cs", "test": f"S{test_subject}", "cells": cells}
 
 
-def _empty_cells(tags) -> dict:
+def _empty_cells(tags, taps=ALL_TAPS) -> dict:
     return {f"{tag}|{enc}|{v}|{t}": {"ws_per_session": {}, "cs_per_test": {}}
-            for tag in tags for enc in ENCODERS for v in NORMS for t in PROBE_TASKS}
+            for tag in tags for enc in taps for v in NORMS for t in PROBE_TASKS}
 
 
 def _finalize(cells: dict) -> dict:
@@ -185,8 +209,8 @@ def _finalize(cells: dict) -> dict:
     return cells
 
 
-def _merge_shards(tags, shard_dir) -> dict:
-    cells = _empty_cells(tags)
+def _merge_shards(tags, shard_dir, taps=ALL_TAPS) -> dict:
+    cells = _empty_cells(tags, taps)
     for path in sorted(glob.glob(f"{shard_dir}/ws_*.json")):
         with open(path) as f:
             sh = json.load(f)
@@ -200,36 +224,59 @@ def _merge_shards(tags, shard_dir) -> dict:
     return _finalize(cells)
 
 
-def _compute_all(cache_dir, tags) -> dict:
+def _compute_all(cache_dir, tags, taps=ALL_TAPS) -> dict:
     """Serial path (mode=all): every session + every test in one process."""
-    cells = _empty_cells(tags)
+    cells = _empty_cells(tags, taps)
     for tag in tags:
         for session in PROBE_COHORT_7:
-            sh = _ws_shard(cache_dir, tag, session)
+            sh = _ws_shard(cache_dir, tag, session, taps)
             for key, val in sh["cells"].items():
                 cells[key]["ws_per_session"][sh["name"]] = val
             print(f"[{tag}] WS done {sh['name']}", flush=True)
         for s in CS_TEST_SUBJECTS:
-            sh = _cs_shard(cache_dir, tag, s)
+            sh = _cs_shard(cache_dir, tag, s, taps)
             for key, val in sh["cells"].items():
                 cells[key]["cs_per_test"][sh["test"]] = val
             print(f"[{tag}] CS done {sh['test']}", flush=True)
     return _finalize(cells)
 
 
-def _print_ladder(tags, results) -> None:
-    print("\n=== r4 depth ladder — CS mean over test subjects (per encoder tap) ===", flush=True)
+def _print_ladder(tags, results, taps=ALL_TAPS) -> None:
+    encs = [e for e in ENCODERS if e in taps]
+    if encs:
+        for direction, key in (("CS mean over test subjects", "cs_mean"),
+                               ("WS cohort mean", "ws_cohort")):
+            print(f"\n=== r4 depth ladder — {direction} (per encoder tap) ===", flush=True)
+            for tag in tags:
+                for v in NORMS:
+                    for task in PROBE_TASKS:
+                        row = [f"{e}:{results[f'{tag}|{e}|{v}|{task}'][key]:.4f}" for e in encs]
+                        print(f"  {direction[:2]} {tag} {v:3s} {task:16s} " + "  ".join(row),
+                              flush=True)
+    _print_perceiver(tags, results, taps)
+
+
+def _print_perceiver(tags, results, taps=ALL_TAPS) -> None:
+    """Perceiver taps against their fresh-init twins — the contrast that survives the stream
+    caveat (both sides carry it identically). lat is CS-scored WHOLE (no parcel intersection);
+    dec is a deterministic function of lat, so lat is dec's ceiling and dec>lat means only that
+    the parcel query made the same information more linearly accessible."""
+    bases = [b for b in ("dec", "lat") if b in taps and f"{b}_rand" in taps]
+    if not bases:
+        return
+    print("\n=== r4 perceiver taps — trained vs fresh-init control (Δ = trained − rand) ===",
+          flush=True)
     for tag in tags:
         for v in NORMS:
-            for task in PROBE_TASKS:
-                row = [f"{enc}:{results[f'{tag}|{enc}|{v}|{task}']['cs_mean']:.4f}" for enc in ENCODERS]
-                print(f"  CS {tag} {v:3s} {task:16s} " + "  ".join(row), flush=True)
-    print("\n=== r4 depth ladder — WS cohort mean (per encoder tap) ===", flush=True)
-    for tag in tags:
-        for v in NORMS:
-            for task in PROBE_TASKS:
-                row = [f"{enc}:{results[f'{tag}|{enc}|{v}|{task}']['ws_cohort']:.4f}" for enc in ENCODERS]
-                print(f"  WS {tag} {v:3s} {task:16s} " + "  ".join(row), flush=True)
+            for base in bases:
+                for task in PROBE_TASKS:
+                    def val(suffix, key):
+                        return results[f"{tag}|{base}{suffix}|{v}|{task}"][key]
+                    cs, cs_r = val("", "cs_mean"), val("_rand", "cs_mean")
+                    ws, ws_r = val("", "ws_cohort"), val("_rand", "ws_cohort")
+                    print(f"  {tag} {v:3s} {base:3s} {task:16s} "
+                          f"CS {cs:.4f} (rand {cs_r:.4f}, Δ{cs - cs_r:+.4f})   "
+                          f"WS {ws:.4f} (rand {ws_r:.4f}, Δ{ws - ws_r:+.4f})", flush=True)
 
 
 # array-index layout: 0..len(cohort)-1 → WS per session; then one per CS test subject
@@ -245,8 +292,17 @@ def main() -> None:
     p.add_argument("--mode", choices=("all", "array", "merge"), default="all")
     p.add_argument("--array-index", type=int, help="mode=array: 0..%d" % (N_ARRAY - 1))
     p.add_argument("--shard-dir", default=None, help="mode=array writes here, mode=merge reads here")
+    p.add_argument("--taps", default=",".join(ALL_TAPS),
+                   help="comma-separated subset of ALL_TAPS. COMPUTE ONLY THE DELTA: the enc "
+                        "ladder is a re-encode-invariant function of the ckpt, so when a tag is "
+                        "re-encoded purely to add Perceiver taps, pass --taps dec,lat,dec_rand,"
+                        "lat_rand and read enc0/3/6/12 off the existing results JSON.")
     args = p.parse_args()
     tags = tuple(t.strip() for t in args.tags.split(","))
+    taps = tuple(t.strip() for t in args.taps.split(","))
+    bad = [t for t in taps if t not in ALL_TAPS]
+    if bad:
+        raise SystemExit(f"unknown --taps {bad}; known: {list(ALL_TAPS)}")
 
     if args.mode == "array":
         if args.shard_dir is None or args.array_index is None:
@@ -255,10 +311,10 @@ def main() -> None:
         os.makedirs(args.shard_dir, exist_ok=True)
         n = args.array_index
         if n < N_WS:
-            sh = _ws_shard(args.cache_dir, tag, PROBE_COHORT_7[n])
+            sh = _ws_shard(args.cache_dir, tag, PROBE_COHORT_7[n], taps)
             path = f"{args.shard_dir}/ws_{sh['name']}_{tag}.json"
         elif n < N_ARRAY:
-            sh = _cs_shard(args.cache_dir, tag, CS_TEST_SUBJECTS[n - N_WS])
+            sh = _cs_shard(args.cache_dir, tag, CS_TEST_SUBJECTS[n - N_WS], taps)
             path = f"{args.shard_dir}/cs_{sh['test']}_{tag}.json"
         else:
             raise SystemExit(f"--array-index {n} out of range 0..{N_ARRAY - 1}")
@@ -270,15 +326,15 @@ def main() -> None:
     if args.mode == "merge":
         if args.shard_dir is None or args.out is None:
             raise SystemExit("mode=merge needs --shard-dir and --out")
-        results = _merge_shards(tags, args.shard_dir)
+        results = _merge_shards(tags, args.shard_dir, taps)
     else:  # all
         if args.out is None:
             raise SystemExit("mode=all needs --out")
-        results = _compute_all(args.cache_dir, tags)
+        results = _compute_all(args.cache_dir, tags, taps)
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
-    _print_ladder(tags, results)
+    _print_ladder(tags, results, taps)
     print(f"\nwrote {args.out}", flush=True)
 
 

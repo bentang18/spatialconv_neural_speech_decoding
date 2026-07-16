@@ -6,12 +6,37 @@ SLOW 4 tokens per 1 s clip) and a flat-L1 encoder attends over the RAGGED per-(c
 tokens packed varlen per shaft (``pack_r4.build_r4_grid``). There is no ``forward_padded``;
 the teacher runs ``encoder.forward_flat`` over the packed grid.
 
-Taps (Ben 2026-07-15): enc0, enc3, enc6, enc12.
+Taps (Ben 2026-07-15): enc0, enc3, enc6, enc12. Perceiver taps (Ben 2026-07-16): dec, lat.
   - enc0 = the pre-projection DECIMATED raw band bins (``x[..., ::stride]`` per band, the exact
     tensor ``PerBandStem``'s per-band Linear consumes) — the M9 input-linear floor, decimated to
     what the model actually sees. No model, CPU-side (computed here so bands aren't re-read).
   - enc3/6/12 = raw block outputs of the EMA teacher (``_TargetTower``, the shipped
     representation), read in ONE forward via ``tap_blocks=(3,6,12)``.
+  - dec/lat = the write-only secondary Perceiver, run on the SAME teacher ``z`` (the deep-sup
+    1024-concat the tap forward already computes and the depth ladder discards).
+      * ``dec`` (n,|P|,S·128) = the DECODE cross-attn per-(parcel,slot) query read, PRE-head.
+        Already per-parcel — the model's own read, so NO electrode pooling is applied.
+      * ``lat`` (n,1,S·M·128) = the processed latent bank. PARCEL-FREE by construction (the
+        12 latents are shared learned params), hence natively subject-independent: CS needs
+        NO parcel intersection. This is the bottleneck's information CEILING — ``dec`` is a
+        deterministic function of ``(lat, parcel, slot)``, so no query set can exceed it.
+        (That is also why a fixed-75-parcel query was dropped: provably redundant with lat.)
+  Each Perceiver tap has a ``_rand`` twin from a FRESH-INIT Perceiver on the same teacher z —
+  the control isolating what the Perceiver learned with the encoder held fixed by construction.
+  Verified 2026-07-16: at the 10k ckpt every Perceiver tensor sits at std ~0.0033, a uniform
+  decay from the 0.02 init ⇒ zero loss gradient ever (λ=0 until 10000), so "trained" means the
+  10k→20k λ ramp alone.
+
+Expect WEAK absolutes from dec/lat: the Perceiver's only loss was Gaussian NLL on a 6-D
+band-power state target, so word-level information there is incidental, not optimized-for. The
+informative contrasts are lat CS vs lat WS (does the code transfer?) and tap vs its _rand twin
+(did the bottleneck learn to compress?) — both matched, hence immune to the teacher-vs-context
+stream caveat below.
+
+Stream caveat: the Perceiver trained reading the CONTEXT encoder over VISIBLE tokens; here it
+reads the EMA TEACHER over the FULL grid, to stay on the same axis as enc0/3/6/12. τ=0.99925
+makes the teacher a ~1333-step EMA (small); the full-vs-masked gap is the real one. Both sides
+of every reported contrast carry it identically.
 
 Feature = keep-time, NATIVE ragged (no hold-up: linear ridge, frame alignment irrelevant),
 ELECTRODES POOLED TO PARCELS at encode (Ben 2026-07-15, OOM guard): per (band-slot, parcel)
@@ -44,9 +69,34 @@ FPS = 32.0
 CLIP_DUR_S = 1.0
 N_PARCELS = 75
 GPU_TAPS: tuple[int, ...] = (3, 6, 12)   # raw block outputs read in one teacher forward
+PERC_RAND_SEED = 33                      # the launch seed — the fresh-init control's twin
 
 
-def _load_teacher(ckpt_path: str, *, device: torch.device):
+def _load_ckpt(ckpt_path: str) -> dict:
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return raw["state_dict"] if "state_dict" in raw else raw
+
+
+def _subtree(sd: dict, pref: str) -> dict:
+    """The ``pref``-rooted subtree of a LightningModule state_dict, de-compiled + de-``model.``d."""
+    out = {}
+    for k, v in sd.items():
+        kk = k.replace("_orig_mod.", "")
+        if kk.startswith("model."):
+            kk = kk[len("model."):]
+        if kk.startswith(pref):
+            out[kk[len(pref):]] = v
+    return out
+
+
+def _freeze(m, *, device):
+    m.eval().to(device)
+    for p in m.parameters():
+        p.requires_grad_(False)
+    return m
+
+
+def _load_teacher(sd: dict, *, device: torch.device):
     """Load ONLY the EMA teacher tower (`_TargetTower` = PerBandStem + encoder) from the ckpt.
 
     Filter the LightningModule state_dict to the ``objective.teacher.model.*`` subtree and
@@ -54,18 +104,10 @@ def _load_teacher(ckpt_path: str, *, device: torch.device):
     head, so the load is independent of the objective's post-launch changes (#46 mean floor)."""
     from speech_decoding.models.v14_converged_v3.objective import _TargetTower
 
-    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = raw["state_dict"] if "state_dict" in raw else raw
     pref = "objective.teacher.model."
-    tsd = {}
-    for k, v in sd.items():
-        kk = k.replace("_orig_mod.", "")
-        if kk.startswith("model."):
-            kk = kk[len("model."):]
-        if kk.startswith(pref):
-            tsd[kk[len(pref):]] = v
+    tsd = _subtree(sd, pref)
     if not tsd:
-        raise RuntimeError(f"no '{pref}*' keys in {ckpt_path}; wrong ckpt layout")
+        raise RuntimeError(f"no '{pref}*' keys in ckpt; wrong ckpt layout")
     peek = [v.shape[0] for kk, v in tsd.items() if kk.endswith("parcel_embed.embed.weight")]
     if peek and int(peek[0]) != N_PARCELS:
         raise ValueError(f"ckpt parcel table {peek[0]} != expected {N_PARCELS}")
@@ -74,10 +116,30 @@ def _load_teacher(ckpt_path: str, *, device: torch.device):
     bad = [m for m in missing if "num_batches_tracked" not in m]
     if bad or unexpected:
         raise RuntimeError(f"teacher state_dict mismatch: missing={bad[:8]} unexpected={unexpected[:8]}")
-    tower.eval().to(device)
-    for p in tower.parameters():
-        p.requires_grad_(False)
-    return tower
+    return _freeze(tower, device=device)
+
+
+def _load_perceivers(sd: dict, *, device: torch.device):
+    """The ckpt's TRAINED Perceiver + a FRESH-INIT twin → ``{"": trained, "_rand": control}``.
+
+    Both consume the SAME teacher z, so the pair holds the encoder fixed by construction and
+    the only moving part is what the Perceiver learned. The twin re-inits at the launch seed,
+    NOT the 10k ckpt's weights: 10k would confound Perceiver state with encoder state (10k vs
+    20k encoder) and its 6× weight-decay shrink puts it off its own init distribution."""
+    from speech_decoding.models.v14_converged_v3.perceiver import PerceiverHead
+
+    pref = "objective.perceiver."
+    psd = _subtree(sd, pref)
+    if not psd:
+        raise RuntimeError(f"no '{pref}*' keys in ckpt; a deep_sup=False run has no Perceiver")
+    trained = PerceiverHead(n_parcels=N_PARCELS)
+    missing, unexpected = trained.load_state_dict(psd, strict=False)
+    bad = [m for m in missing if "num_batches_tracked" not in m]
+    if bad or unexpected:
+        raise RuntimeError(f"perceiver state_dict mismatch: missing={bad[:8]} unexpected={unexpected[:8]}")
+    torch.manual_seed(PERC_RAND_SEED)
+    rand = PerceiverHead(n_parcels=N_PARCELS)
+    return {"": _freeze(trained, device=device), "_rand": _freeze(rand, device=device)}
 
 
 def _load_targets(session, bt_root):
@@ -160,29 +222,130 @@ def _enc0_pooled(bands, canon, parcel_canon, present):
     return torch.cat(per_band, dim=-1)                            # (n, |P|, F0)
 
 
+def _perc_queries(present, n_slots, *, device):
+    """Parcel-major (q_parcel, q_slot), mirroring objective._secondary_nll's query build.
+
+    Order [p0s0,p0s1,…,p1s0,…] so a (B, P·S, d) read reshapes to (B, P, S, d) — and the parcel
+    axis then matches ``present``, i.e. the SAME order the enc taps are pooled into, so the
+    readout's atlas-id intersection needs no special case for dec."""
+    p = torch.as_tensor(present, dtype=torch.long, device=device)
+    q_parcel = p.repeat_interleave(n_slots)                       # (Q,) atlas ids
+    q_slot = torch.arange(n_slots, device=device).repeat(len(p))  # (Q,) 0..S-1
+    return q_parcel, q_slot
+
+
+def _perc_forward(perc, z, grid, q_parcel, q_slot, *, n_slots):
+    """One Perceiver forward → (dec (B,Q,d_perc), lat (B,n_slots·M,d_perc)).
+
+    BOTH taps come from forward HOOKS, and deliberately so — ``forward`` returns only the head's
+    mu/cov, and hooks keep the training path untouched while r4b is queued.
+      * ``dec`` = the DECODE cross-attn output: the per-(parcel,slot) query read, PRE-head.
+      * ``lat`` = the output of the LAST ``process`` block, which is exactly the bank the
+        forward's own ``return_latents`` hands back (it returns ``lat`` after ``for blk in
+        self.process: lat = blk(...)``, pre-decode).
+    We hook ``process[-1]`` rather than pass ``return_latents=True`` because that kwarg does NOT
+    exist on the deployed r4 tree (2d3f52d) — only in a later local commit — and scp'ing src/ to
+    add it would touch the queued r4b run for no gain. Hooks work on BOTH trees, and the weights
+    are identical across them (the commit is a pure API addition, no structural change).
+
+    ``noise=None`` is safe BY CONSTRUCTION, not by luck: the count-dependent floor enters only
+    at ``head(dec, noise=...)``, strictly AFTER both taps, so it cannot reach dec or lat (and
+    secondary_head.GaussianStateHead.forward falls back to its fixed buffer regardless).
+
+    ``token_time`` on the full grid is ``grid.time_pos`` expanded — literally what the packed
+    path gathers from (``pack.time_pos = grid.time_pos[idx]``, pack_r4.py:214), and what the
+    teacher's own full-grid forward already builds (towers.py:243). No mask machinery needed;
+    ``key_mask=None`` stays correct because every full-grid token is real."""
+    B = z.shape[0]
+    grab: dict = {}
+    handles = [
+        perc.decode.register_forward_hook(lambda _m, _i, out: grab.__setitem__("dec", out)),
+        perc.process[-1].register_forward_hook(lambda _m, _i, out: grab.__setitem__("lat", out)),
+    ]
+    try:
+        perc(
+            z,
+            grid.time_pos[None].expand(B, grid.total),
+            None,
+            q_parcel[None].expand(B, q_parcel.shape[0]),
+            q_slot[None].expand(B, q_slot.shape[0]),
+            n_slots=n_slots,
+            noise=None,
+        )
+    finally:
+        for h in handles:
+            h.remove()
+    return grab["dec"], grab["lat"]
+
+
+def _perc_checks(percs, z, grid, q_parcel, q_slot, *, n_slots) -> bool:
+    """[check] the Perceiver is a BOTTLENECK and its weights actually loaded.
+
+    Rolling the parcel ids under a FIXED slot order must leave ``lat`` bit-identical — lat is
+    computed before any query touches the model — while MOVING ``dec``, whose query is a parcel
+    embedding. A lat that moves ⇒ we hooked the wrong module; a dec that doesn't ⇒ the parcel
+    embedding is dead. Separately the trained tap must differ from its fresh-init twin, else the
+    ckpt load silently no-op'd and every contrast below would be a random-vs-random null."""
+    P = q_parcel.shape[0] // n_slots
+    if P < 2:
+        print("[check] perceiver bottleneck: SKIPPED (|P|<2, the parcel roll is a no-op)", flush=True)
+        return True
+    rolled = q_parcel.reshape(P, n_slots).roll(1, 0).reshape(-1)
+    dec_a, lat_a = _perc_forward(percs[""], z, grid, q_parcel, q_slot, n_slots=n_slots)
+    dec_b, lat_b = _perc_forward(percs[""], z, grid, rolled, q_slot, n_slots=n_slots)
+    dec_r, _ = _perc_forward(percs["_rand"], z, grid, q_parcel, q_slot, n_slots=n_slots)
+    lat_free = torch.equal(lat_a, lat_b)
+    dec_sens = not torch.equal(dec_a, dec_b)
+    loaded = not torch.equal(dec_a, dec_r)
+    ok = lat_free and dec_sens and loaded
+    print(f"[check] perceiver: lat parcel-free={lat_free} dec parcel-sensitive={dec_sens} "
+          f"trained!=rand={loaded} -> {'OK' if ok else 'VIOLATED'}", flush=True)
+    return ok
+
+
 @torch.no_grad()
-def _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon, present,
-                 *, device, batch_size):
+def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, present,
+                 *, device, batch_size, n_slots, run_checks):
     """One forward of the teacher over all windows → per-tap parcel-pooled keep-time features.
 
     Cache stores the raw parcel-mean feature (n,|P|,k_full·d) — the most flexible storage: a
     readout can standardize columns on train stats (the FM linear-probe convention) or feed it
     raw (r1/M9-comparable), but neither is recoverable from a baked per-token LN. So we keep raw
-    only. Returns {tap: {'raw': (n,|P|,k_full·d)}} for tap in GPU_TAPS."""
+    only. Returns {tap: {'raw': ...}} for the enc taps plus the Perceiver's dec/lat (+ _rand
+    twins), which ride the SAME forward: ``z`` is the deep-sup 1024-concat the teacher already
+    computes and the depth ladder throws away, so the control costs no extra job and no extra
+    encoder pass. dec/lat are NOT electrode-pooled — dec is already per-parcel (that IS the
+    model's read) and lat has no parcel axis at all, so it is stored under one pseudo-parcel."""
     n = bands[0].shape[0]
     k = grid.k_full
-    acc = {t: [] for t in GPU_TAPS}
+    acc: dict = {t: [] for t in GPU_TAPS}
+    for name in percs:
+        acc[f"dec{name}"], acc[f"lat{name}"] = [], []
+    checked = not run_checks
     for s in range(0, n, batch_size):
         e = min(s + batch_size, n)
         bb = [b[s:e].to(device) for b in bands]
+        Bb = e - s
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=(device.type == "cuda")):
-            _, taps = teacher.forward(bb, grid, parcel_packed, tap_blocks=GPU_TAPS)
-        Bb = e - s
+            z, taps = teacher.forward(bb, grid, parcel_packed, tap_blocks=GPU_TAPS)
+            q_parcel, q_slot = _perc_queries(present, n_slots, device=device)
+            if not checked:
+                if not _perc_checks(percs, z, grid, q_parcel, q_slot, n_slots=n_slots):
+                    raise RuntimeError("perceiver invariant VIOLATED — refusing to write a cache")
+                checked = True
+            perc_out = {name: _perc_forward(p, z, grid, q_parcel, q_slot, n_slots=n_slots)
+                        for name, p in percs.items()}
         for t in GPU_TAPS:
             enc = taps[t].float().reshape(Bb, -1, k, taps[t].shape[-1]).cpu()  # (Bb, n, k, d)
             acc[t].append(_pool_parcels(enc, parcel_canon, present))
-    return {t: {"raw": torch.cat(acc[t], 0)} for t in GPU_TAPS}
+        for name, (dec, lat) in perc_out.items():
+            # dec (Bb, P·S, d) → (Bb, P, S·d): per-parcel already, no pooling.
+            acc[f"dec{name}"].append(
+                dec.float().reshape(Bb, len(present), -1).cpu().to(torch.float16))
+            # lat (Bb, S·M, d) → (Bb, 1, S·M·d): parcel-FREE, one pseudo-parcel.
+            acc[f"lat{name}"].append(lat.float().reshape(Bb, 1, -1).cpu().to(torch.float16))
+    return {t: {"raw": torch.cat(v, 0)} for t, v in acc.items()}
 
 
 def main() -> None:
@@ -200,6 +363,7 @@ def main() -> None:
     from speech_decoding.experiments.pretrain_probe_suite import PROBE_COHORT_7
     from speech_decoding.experiments.dispatch_v3 import make_bt_parcel_fn
     from speech_decoding.models.v14_converged_v3.pack_r4 import build_r4_grid
+    from speech_decoding.models.v14_converged_v3.perceiver import SLOT_STRIDE
     from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
 
     if len(args.band_cache_dirs) != 3:
@@ -207,10 +371,19 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_frames = round(CLIP_DUR_S * FPS)
+    # S = T // slot_stride, exactly as state_target.raw_state_vectors derives it (32//8 = 4).
+    n_slots, rem = divmod(clip_frames, SLOT_STRIDE)
+    if rem:
+        raise SystemExit(f"clip_frames={clip_frames} not divisible by SLOT_STRIDE={SLOT_STRIDE}")
     parcel_fn = make_bt_parcel_fn(args.bt_root)
-    teacher = _load_teacher(args.ckpt, device=device)
-    print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0", flush=True)
+    sd = _load_ckpt(args.ckpt)
+    teacher = _load_teacher(sd, device=device)
+    percs = _load_perceivers(sd, device=device)
+    del sd
+    print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0 "
+          f"+ perceiver dec/lat (+_rand control), n_slots={n_slots}", flush=True)
 
+    first = True
     for session in PROBE_COHORT_7:
         subject_id, trial_id = session
         path = os.path.join(args.out_dir, f"enc_s{subject_id}_t{trial_id}_{args.tag}.pt")
@@ -231,10 +404,15 @@ def main() -> None:
         canon, parcel_canon, present = _canon_parcels(grid, parcel_id)
 
         feats = {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present)}}
-        tap_pooled = _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon,
-                                  present, device=device, batch_size=args.batch_size)
+        tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
+                                  present, device=device, batch_size=args.batch_size,
+                                  n_slots=n_slots, run_checks=first)
+        first = False
         for t in GPU_TAPS:
             feats[f"enc{t}"] = tap_pooled[t]
+        for name in percs:
+            feats[f"dec{name}"] = tap_pooled[f"dec{name}"]
+            feats[f"lat{name}"] = tap_pooled[f"lat{name}"]
 
         payload = {
             "subject_id": subject_id, "trial_id": trial_id, "ckpt_tag": args.tag,
