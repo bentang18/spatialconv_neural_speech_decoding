@@ -425,9 +425,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lof-report-path", default=None, help="guard-1 LOF report (opt)")
     p.add_argument("--session", dest="sessions", action="append", required=True,
                    metavar="S:T", help="subject:trial, repeatable (e.g. 6:4)")
-    p.add_argument("--clips-per-session", type=int, default=2000,
+    p.add_argument("--clips-per-session", type=int, default=40_000,
                    help="per-epoch clip budget/session (operational; epoch length + "
                         "window re-draw cadence, NOT a model hyperparameter)")
+    # Ben 2026-07-16: raised 2000 -> 40000. Science-neutral BY CONSTRUCTION — the dataset is
+    # virtual (``V3SessionDataset.__getitem__`` draws a uniform-random t0 seeded by
+    # (seed, epoch, index)), so a step consumes the same iid random windows at any epoch
+    # length; only the epoch BOUNDARY moves. What it buys: at 2000 an epoch is ~52 opt-steps
+    # (13 sessions x 2000 / (bs32 x accum4 x 4 ranks)) and ``reload_dataloaders_every_n_epochs
+    # =1`` rebuilds the loader + respawns workers EVERY 52 steps — r4 did that 507 times before
+    # dying at 26414 on an undiagnosed stall whose leading read is Lustre/IO. 40000 makes it
+    # ~1016 steps/epoch, 20x less mmap/worker churn. Landed as the DEFAULT (not a floor: the
+    # tests and the smoke launch pass small explicit values) so the already-queued r4b — which
+    # passes no --clips-per-session and would otherwise inherit r4's exact IO exposure while
+    # arms 1/2/4 pass 40000 explicitly — picks it up at RUN time, no resubmit, no forfeited
+    # queue age. Same lever as SSL_MAX_STEPS_STD above; slurm stores the sbatch at SUBMIT, but
+    # ``.venv/bin/python -m`` reads this module when the job starts.
     p.add_argument("--clip-len", type=float, default=3.0,
                    help="clip seconds (adjustable HP; r4 uses 2.0 — shorter clips give "
                         "more opt-steps + mask diversity per GPU-hour at a ~7% raw "

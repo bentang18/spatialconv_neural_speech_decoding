@@ -198,6 +198,61 @@ def test_module_resumes_model_and_step_from_checkpoint(tmp_path) -> None:
     assert torch.allclose(trained, restored, atol=1e-5)
 
 
+def test_clips_per_session_default_is_the_long_epoch() -> None:
+    """r4b passes NO --clips-per-session, so this default IS Arm 0's epoch length. It must
+    match the 40000 arms 1/2/4 pass explicitly, or the control arm silently inherits r4's
+    every-52-step loader-rebuild churn (r4 died at 26414 on a suspected IO stall)."""
+    from speech_decoding.experiments.dispatch_v3 import build_arg_parser
+
+    base = ["--bt-root", "x", "--band-cache-dir", "a", "--band-cache-dir", "b",
+            "--band-cache-dir", "c", "--span-dir", "s", "--session", "1:0",
+            "--ssl-max-steps", "1"]
+    assert build_arg_parser().parse_args(base).clips_per_session == 40_000
+    # still overridable — the smoke launch and probes pass small values
+    assert build_arg_parser().parse_args(
+        base + ["--clips-per-session", "32"]).clips_per_session == 32
+
+
+def test_resume_survives_a_changed_clips_per_session(tmp_path) -> None:
+    """The r4 resume + arms raise --clips-per-session 40000 while r4 (and r4b) ran the
+    default 2000, so the ckpt is restored into a datamodule whose EPOCH LENGTH differs
+    20x. clips_per_session is documented operational (epoch length only), but "is X
+    wired?" gets asserted, not assumed: the restored global_step must be the ckpt's,
+    NOT 0 (a silent cold start is exactly the failure Ben hit with the v2 exca recipe)
+    and NOT rescaled by the new epoch geometry."""
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+
+    def _build(clips):
+        specs = load_v3_sessions(
+            sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+            parcel_fn=_stub_parcel_fn,
+        )
+        module, dm, _ = build_v3_training(specs, _smoke_args(clips_per_session=clips))
+        return module, dm
+
+    ckpt_dir = tmp_path / "ck_epoch"
+    m1, dm1 = _build(4)  # short epochs: 4 clips/session -> epoch flips fast
+    _cpu_trainer(4, ckpt_dir=ckpt_dir).fit(m1, datamodule=dm1)
+    last = ckpt_dir / "last.ckpt"
+    saved_epoch = torch.load(last, weights_only=False)["epoch"]
+    trained = torch.cat([p.detach().flatten() for p in m1.model.parameters()
+                         if p.requires_grad])
+
+    m2, dm2 = _build(64)  # 16x longer epoch, same ckpt
+    t2 = _cpu_trainer(4)  # max_steps == restore step => resume then stop immediately
+    t2.fit(m2, datamodule=dm2, ckpt_path=str(last))
+    restored = torch.cat([p.detach().flatten() for p in m2.model.parameters()
+                          if p.requires_grad])
+    ok_step = t2.global_step == 4
+    ok_w = torch.allclose(trained, restored, atol=1e-5)
+    print(f"[check] saved epoch={saved_epoch} (clips=4) -> resumed into clips=64 "
+          f"epoch={t2.current_epoch}; global_step={t2.global_step} (want 4, cold=0) "
+          f"{'OK' if ok_step and ok_w else 'VIOLATED'}")
+    assert ok_step, f"changed epoch length broke step restore: {t2.global_step}"
+    assert ok_w  # weights are the ckpt's, not a fresh init
+
+
 # --- r3 static_graph launch gate --------------------------------------------
 # The gate fires on ANY optional module joining the trainable set under multi-GPU
 # static_graph, not on one specific head: r4's secondary write-only Perceiver
