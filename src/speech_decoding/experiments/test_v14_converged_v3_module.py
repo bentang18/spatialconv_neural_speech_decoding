@@ -181,6 +181,132 @@ def test_secondary_active_trains_perceiver_on_stats() -> None:
     )
 
 
+def test_nll_lambda_schedule_ramps_10k_to_25k() -> None:
+    # The eager λ ramp (Ben 2026-07-15): λ=0 before the start step, linear 0→hold over
+    # [start, start+steps], hold after. hold is the objective's lambda_nll. Invariant
+    # PRINTED (feedback-build-the-invariant-into-the-probe): the schedule must be 0 below
+    # start, exactly hold/2 at the midpoint, hold at the end, and clamp above.
+    model = V3ConvergedModel(n_parcels=N_PARCELS)
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        secondary_active=True,
+        nll_warmup_start_step=10_000, nll_warmup_steps=15_000,
+    )
+    hold = float(mod.model.objective.lambda_nll)
+    cases = {
+        0: 0.0,
+        9_999: 0.0,
+        10_000: 0.0,          # ramp opens AT start ⇒ frac 0 here
+        17_500: 0.5 * hold,   # midpoint of [10k, 25k]
+        25_000: hold,         # ramp closes
+        40_000: hold,         # clamp above
+    }
+    worst = 0.0
+    for step, want in cases.items():
+        got = mod._nll_lambda(step)
+        worst = max(worst, abs(got - want))
+    ok = worst < 1e-9 and mod._nll_lambda(-5) == 0.0
+    print(
+        f"[check] λ_nll schedule (hold={hold}, 10k→25k): "
+        f"λ(0)={mod._nll_lambda(0):.4f} λ(17.5k)={mod._nll_lambda(17_500):.4f} "
+        f"λ(25k)={mod._nll_lambda(25_000):.4f} max|Δ|={worst:.2e} → {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
+def test_nll_lambda_default_is_constant_hold() -> None:
+    # Default warmup params (start=0, steps=0) ⇒ constant λ==hold at every step. This is
+    # the backward-compatible path: a run that doesn't pass --nll-warmup-* trains at the
+    # fixed λ the objective was built with, from step 0.
+    model = V3ConvergedModel(n_parcels=N_PARCELS)
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        secondary_active=True,
+    )
+    hold = float(mod.model.objective.lambda_nll)
+    steps = [0, 1, 5_000, 50_000]
+    ok = all(abs(mod._nll_lambda(s) - hold) < 1e-9 for s in steps)
+    print(
+        f"[check] default λ_nll constant: hold={hold} "
+        f"λ@{steps}={[round(mod._nll_lambda(s), 4) for s in steps]} → {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
+def test_nll_lambda_zero_keeps_perceiver_in_graph_with_zero_grad() -> None:
+    # DDP graph-stability invariant: while λ==0 (below the ramp start) the total is
+    # jepa + 0.0*nll, NOT a branch that drops the nll term. So the write-only Perceiver
+    # stays IN the autograd graph and receives a ZERO gradient (not None) — DDP's reducer
+    # sees it "used", so no find_unused_parameters abort and no graph-structure mutation
+    # when the ramp opens. Contrast: at full λ the SAME param set gets a nonzero grad.
+    def _mod(start, steps):
+        m = V3ConvergedModel(n_parcels=N_PARCELS)
+        return V14ConvergedV3Module(
+            model=m, optim_config=_optim_config(weight_decay=0.04),
+            secondary_active=True,
+            nll_warmup_start_step=start, nll_warmup_steps=steps,
+        )
+
+    # step 0 < start=100 ⇒ λ=0
+    mod0 = _mod(start=100, steps=50)
+    assert mod0._nll_lambda(0) == 0.0
+    loss0 = mod0.training_step(_session_batch_with_stats(n_rows=2), 0)
+    loss0.backward()
+    perc0 = list(mod0.model.objective.perceiver.parameters())
+    all_present0 = all(p.grad is not None for p in perc0)
+    zero_grad0 = all(float(p.grad.abs().sum()) == 0.0 for p in perc0)
+
+    # constant hold ⇒ λ>0, SAME param set, nonzero grad
+    mod1 = _mod(start=0, steps=0)
+    assert mod1._nll_lambda(0) > 0.0
+    loss1 = mod1.training_step(_session_batch_with_stats(n_rows=2), 0)
+    loss1.backward()
+    perc1 = list(mod1.model.objective.perceiver.parameters())
+    all_present1 = all(p.grad is not None for p in perc1)
+    nonzero_grad1 = any(float(p.grad.abs().sum()) > 0.0 for p in perc1)
+
+    ok = all_present0 and zero_grad0 and all_present1 and nonzero_grad1
+    print(
+        f"[check] λ=0 graph-stable: perceiver grads present@λ0={all_present0} "
+        f"zero@λ0={zero_grad0} present@hold={all_present1} nonzero@hold={nonzero_grad1} "
+        f"→ {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
+def test_training_step_logs_ramped_total_and_lambda() -> None:
+    # training_step must combine the loss in EAGER code (compile-safe): total =
+    # jepa + λ·nll with the RAMPED λ, and log train_nll_lambda (the live λ),
+    # train_nll_weighted (== λ·nll), and train_loss (== the returned total). Invariant:
+    # the three logged pieces are self-consistent with the returned scalar.
+    model = V3ConvergedModel(n_parcels=N_PARCELS)
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        secondary_active=True,  # default warmup ⇒ constant hold at step 0
+    )
+    logged: dict[str, float] = {}
+    mod.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
+    total = mod.training_step(_session_batch_with_stats(n_rows=2), 0)
+    hold = float(mod.model.objective.lambda_nll)
+    lam = logged["train_nll_lambda"]
+    jepa = logged["train_jepa_loss"]
+    nll = logged["train_nll_loss"]
+    weighted = logged["train_nll_weighted"]
+    recomposed = jepa + lam * nll
+    ok = (
+        abs(lam - hold) < 1e-9
+        and abs(weighted - lam * nll) < 1e-5
+        and abs(logged["train_loss"] - float(total)) < 1e-5
+        and abs(float(total) - recomposed) < 1e-4
+    )
+    print(
+        f"[check] ramped total: λ={lam:.4f} jepa={jepa:.4f} nll={nll:.4f} "
+        f"λ·nll={weighted:.4f} total={float(total):.4f} (jepa+λ·nll={recomposed:.4f}) "
+        f"→ {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
 def test_grad_ratio_off_by_default_logs_nothing() -> None:
     # grad_ratio_every_n_steps default 0 ⇒ the live loss-balance readout never fires,
     # even with the secondary active. The launch config relies on this default.

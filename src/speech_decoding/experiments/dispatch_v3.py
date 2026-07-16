@@ -217,6 +217,8 @@ def build_v3_training(
         monitor_every_n_steps=args.monitor_every_n_steps,
         secondary_active=_secondary_active(args),
         grad_ratio_every_n_steps=args.grad_ratio_every_n_steps,
+        nll_warmup_start_step=getattr(args, "nll_warmup_start_step", 0),
+        nll_warmup_steps=getattr(args, "nll_warmup_steps", 0),
     )
     dm = V3DataModule(
         sessions,
@@ -438,8 +440,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "--deep-sup (the Perceiver reads the deep-sup taps).")
     p.add_argument("--lambda-nll", dest="lambda_nll", type=float, default=LAMBDA_NLL,
                    help="secondary Gaussian-NLL weight λ in total = JEPA_L1 + λ·NLL "
-                        f"(contract §5 open knob; default {LAMBDA_NLL}). No effect without "
-                        "--state-stats-dir.")
+                        f"(contract §5 open knob; default {LAMBDA_NLL}). This is the HOLD value "
+                        "the ramp climbs to. No effect without --state-stats-dir.")
+    p.add_argument("--nll-warmup-start-step", dest="nll_warmup_start_step",
+                   type=int, default=0,
+                   help="opt-step at which the secondary-NLL λ ramp OPENS. Before it, λ=0 "
+                        "(the Perceiver head stays in-graph with zero grad — DDP-safe). "
+                        "Default 0 ⇒ ramp opens immediately.")
+    p.add_argument("--nll-warmup-steps", dest="nll_warmup_steps",
+                   type=int, default=0,
+                   help="length (opt-steps) of the linear 0→--lambda-nll ramp starting at "
+                        "--nll-warmup-start-step; λ holds at --lambda-nll after. Default 0 ⇒ "
+                        "no ramp (constant λ==--lambda-nll from --nll-warmup-start-step).")
     p.add_argument("--deep-sup", dest="deep_sup",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="deep self-supervision (#61, V-JEPA 2.1 copy-exactly): tap "
