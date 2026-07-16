@@ -45,52 +45,66 @@ from torch import Tensor, nn
 NOISE_VAR: tuple[float, ...] = (0.119, 0.204, 0.172, 0.348, 0.504, 0.454)
 STATE_DIM: int = len(NOISE_VAR)
 
-# --- count-dependent noise floor (Ben 2026-07-15: "weight dependent") --------------------
-# A parcel's within-parcel STD is a sample statistic over its n electrodes: measurement is
-# WORSE for small parcels. The distribution probe found 28% of std-loss terms come from
-# 2-4 electrode parcels, so a FIXED floor over-trusts a quarter of the std targets. Make the
-# 3 STD floors depend on n via the SAMPLING VARIANCE of the sample std (Var(s) ∝ 1/(n−1) —
-# the "1/√(n−1)" law), anchored on the reliability MEASURED at the reference electrode count.
-# The 3 MEAN dims keep a FIXED floor for v1: the parcel mean is robust, and Spearman-Brown's
-# r(n→∞)→1 idealization (ignoring shared biological noise) is shakier than the std sampling
-# law — mean-count-dependence is a clean HELD option, not built for v1.
+# --- count-dependent noise floor (Ben 2026-07-15: "weight dependent"; means added same day) --
+# A parcel summary is a sample statistic over its n electrodes: measurement is WORSE for small
+# parcels, and the distribution probe found 28% of the loss terms come from 2-4 electrode
+# parcels — a FIXED floor over-trusts a quarter of the targets. BOTH summaries get a
+# count-dependent floor, each on its OWN sampling law in RELIABILITY space (unit-invariant, so
+# the z-scoring doesn't touch it):
+#   MEAN — a mean of n electrodes has sampling variance ∝ 1/n (the SEM), so the noise fraction
+#     of the unit-variance mean target ∝ 1/n:   r_μ(n) = 1/(1 + (1−r_ref)/r_ref · n_ref/n).
+#     Defined at n=1 (a mean IS defined for a singleton). DIRECTLY MEASURED at small n by
+#     probe_v3_mean_floor_vs_count (disjoint size-n subsets, cm-removed, 4 Hz): the anchored law
+#     predicts r_μ(1)=0.357 (meas 0.370), r_μ(2)=0.526 (meas 0.510) — tight where unconfounded.
+#     [The measured curve plateaus BELOW the #28 SB full-parcel number (~0.72 vs 0.881 slow);
+#     that gap is Spearman-Brown-extrapolation vs direct + a big-parcel confound at large n, so
+#     we anchor at #28 (frozen ref, recovered exactly at n_ref) and add count-dependence BELOW
+#     it rather than lower the large-n floor. See project-r4-mean-floor-count-dependent-*.]
+#   STD — a sample std has sampling variance ∝ 1/(n−1), so its noise fraction ∝ 1/(n−1):
+#     r_σ(n) = 1/(1 + (1−r_ref)/r_ref · (n_ref−1)/(n−1)). At n=1 the std is UNDEFINED
+#     (present-masked upstream); the denominator is clamped so it stays finite (never scored).
+# Both recover the measured anchor exactly at n_ref: N(n_ref) = 1 − r_ref.
 #
-# REFRESHED anchors (#28 cm-removed 4 Hz sweep, 2026-07-15): std reliability at the sweep's
-# effective reference electron count. STD_REF_RELIABILITY = 1 − NOISE_VAR[3:] (consistent by
-# construction); N_REF is the mean n_elec the reliability was averaged over in that sweep.
-STD_REF_RELIABILITY: tuple[float, ...] = (0.652, 0.496, 0.546)  # slow/mid/hga std reliab @ n_ref
+# Anchors (#28 cm-removed 4 Hz sweep, 2026-07-15). *_REF_RELIABILITY = 1 − NOISE_VAR[...]
+# (consistent by construction); N_REF = mean n_elec the reliabilities were averaged over.
+MEAN_REF_RELIABILITY: tuple[float, ...] = (0.881, 0.796, 0.828)  # slow/mid/hga mean reliab @ n_ref
+STD_REF_RELIABILITY: tuple[float, ...] = (0.652, 0.496, 0.546)   # slow/mid/hga std  reliab @ n_ref
 N_REF: float = 13.35
 
 
 def count_dependent_noise_var(
     n_elec: Tensor,
     *,
-    mean_var: tuple[float, ...] = NOISE_VAR[:3],
+    mean_r_ref: tuple[float, ...] = MEAN_REF_RELIABILITY,
     std_r_ref: tuple[float, ...] = STD_REF_RELIABILITY,
     n_ref: float = N_REF,
 ) -> Tensor:
     """Per-(parcel) 6-vector noise floor N, keyed on the parcel's electrode count.
 
-    ``n_elec`` (...,) long ≥ 1. Returns (..., 6) = [3 FIXED mean floors, 3 count-dependent
-    std floors]. The std floor uses the sample-std sampling-variance law in RELIABILITY
-    space (unit-invariant, so the z-scoring doesn't touch it): with the noise fraction of
-    the unit-variance std target scaling as 1/(n−1),
+    ``n_elec`` (...,) long ≥ 1. Returns (..., 6) = [3 count-dependent mean floors, 3
+    count-dependent std floors]. Each summary uses its own sampling law in RELIABILITY space:
 
-        r_σ(n) = 1 / (1 + (1−r_ref)/r_ref · (n_ref−1)/(n−1)),   N_σ(n) = 1 − r_σ(n)
+        r_μ(n) = 1 / (1 + (1−r_ref)/r_ref · n_ref/n),         N_μ(n) = 1 − r_μ(n)   (mean, ∝1/n)
+        r_σ(n) = 1 / (1 + (1−r_ref)/r_ref · (n_ref−1)/(n−1)), N_σ(n) = 1 − r_σ(n)   (std, ∝1/(n−1))
 
-    so N_σ(n_ref) = 1 − r_ref (recovers the anchor) and N_σ decreases with n. At n=1 the std
-    is UNDEFINED (present-masked out upstream); the denominator is clamped so the value stays
-    finite (→ the max floor, but never scored). Mean floors are broadcast unchanged."""
-    if len(mean_var) != 3 or len(std_r_ref) != 3:
-        raise ValueError("mean_var and std_r_ref must each have 3 entries (slow/mid/hga)")
+    Both recover the anchor exactly at n_ref (N(n_ref) = 1 − r_ref) and decrease with n. The
+    mean is defined at n=1; the std is present-masked upstream at n=1 but the denominator is
+    clamped so it stays finite (→ the max floor, never scored)."""
+    if len(mean_r_ref) != 3 or len(std_r_ref) != 3:
+        raise ValueError("mean_r_ref and std_r_ref must each have 3 entries (slow/mid/hga)")
     n = n_elec.to(torch.float32)
+    # MEAN floor — SEM sampling law ∝ 1/n; a mean is defined at n=1 so the denominator is n.
+    denom_mean = n.clamp_min(1.0)
+    r_ref_m = n_elec.new_tensor(mean_r_ref, dtype=torch.float32)  # (3,)
+    ratio_m = (1.0 - r_ref_m) / r_ref_m * n_ref  # (3,) noise/signal at n_ref, ×n_ref
+    r_mu = 1.0 / (1.0 + ratio_m / denom_mean.unsqueeze(-1))  # (..., 3)
+    n_mean = 1.0 - r_mu  # (..., 3) mean floor
+    # STD floor — sample-std sampling law ∝ 1/(n−1).
     denom = (n - 1.0).clamp_min(1.0)  # n=1 → 1 (std masked out anyway; keeps it finite)
     r_ref = n_elec.new_tensor(std_r_ref, dtype=torch.float32)  # (3,)
     ratio = (1.0 - r_ref) / r_ref * (n_ref - 1.0)  # (3,) the noise/signal at n_ref, ×(n_ref−1)
-    # broadcast over leading dims: (..., 1) with (3,) → (..., 3)
     r_sigma = 1.0 / (1.0 + ratio / denom.unsqueeze(-1))  # (..., 3)
     n_sigma = 1.0 - r_sigma  # (..., 3) std floor
-    n_mean = n_elec.new_tensor(mean_var, dtype=torch.float32).expand(*n.shape, 3)  # (..., 3)
     return torch.cat([n_mean, n_sigma], dim=-1)  # (..., 6)
 
 

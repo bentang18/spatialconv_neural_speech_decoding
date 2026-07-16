@@ -25,6 +25,7 @@ import math
 import torch
 
 from speech_decoding.models.v14_converged_v3.secondary_head import (
+    MEAN_REF_RELIABILITY,
     N_REF,
     NOISE_VAR,
     STD_REF_RELIABILITY,
@@ -147,47 +148,55 @@ def test_gaussian_entropy_matches_closed_form_identity() -> None:
     print(f"[check] H(I_{D}) = {ent:.4f} == {expect:.4f} OK")
 
 
-# --- count-dependent noise floor (Ben "weight dependent" 2026-07-15) ----------------------
+# --- count-dependent noise floor (Ben "weight dependent" 2026-07-15; means added same day) --
 def test_count_floor_recovers_anchor_at_reference_n() -> None:
-    # By construction N_σ(n_ref) = 1 − r_ref: the count-dep std floor must EQUAL the measured
-    # anchor exactly at the reference electrode count.
+    # By construction N(n_ref) = 1 − r_ref for BOTH summaries: the count-dep floor must EQUAL
+    # the measured anchor exactly at the reference electrode count (mean AND std).
     n = torch.tensor([round(N_REF)])
     N = count_dependent_noise_var(n, n_ref=float(round(N_REF)))
-    std_floor = N[0, 3:]
-    expect = 1.0 - torch.tensor(STD_REF_RELIABILITY)
-    ok = torch.allclose(std_floor, expect, atol=1e-6)
-    print(f"[check] std floor at n_ref={round(N_REF)} = {std_floor.tolist()} "
-          f"== 1−r_ref {expect.tolist()} {'OK' if ok else 'VIOLATED'}")
-    assert ok
+    mean_floor, std_floor = N[0, :3], N[0, 3:]
+    exp_mean = 1.0 - torch.tensor(MEAN_REF_RELIABILITY)
+    exp_std = 1.0 - torch.tensor(STD_REF_RELIABILITY)
+    ok = torch.allclose(mean_floor, exp_mean, atol=1e-6) and torch.allclose(std_floor, exp_std, atol=1e-6)
+    # the mean anchor is exactly the fixed NOISE_VAR[:3] the head buffer uses (consistency).
+    consistent = torch.allclose(mean_floor, torch.tensor(NOISE_VAR[:3]), atol=1e-6)
+    print(f"[check] floor at n_ref={round(N_REF)}: mean {mean_floor.tolist()}==1−r_ref, "
+          f"std {std_floor.tolist()}==1−r_ref, mean==NOISE_VAR[:3]={consistent} "
+          f"{'OK' if ok and consistent else 'VIOLATED'}")
+    assert ok and consistent
 
 
-def test_count_floor_std_decreases_with_n_mean_fixed() -> None:
-    # More electrodes ⇒ a less-noisy std estimate ⇒ STRICTLY lower std floor; mean floor is
-    # FIXED regardless of n; every floor stays in (0,1).
-    n = torch.tensor([2, 3, 4, 6, 10, 20, 30])
-    N = count_dependent_noise_var(n)  # (7, 6)
-    std = N[:, 3:]
-    mean = N[:, :3]
-    mono = bool((std[1:] < std[:-1] - 1e-7).all())  # strictly decreasing per std dim
-    mean_fixed = torch.allclose(mean, torch.tensor(NOISE_VAR[:3]).expand(len(n), 3), atol=1e-7)
+def test_count_floor_both_decrease_with_n() -> None:
+    # More electrodes ⇒ less-noisy mean AND std estimates ⇒ STRICTLY lower floor on every dim;
+    # every floor stays in (0,1). (Mean is now count-dependent too — was fixed pre-2026-07-15.)
+    n = torch.tensor([1, 2, 3, 4, 6, 10, 20, 30])
+    N = count_dependent_noise_var(n)  # (8, 6)
+    mean, std = N[:, :3], N[:, 3:]
+    mean_mono = bool((mean[1:] < mean[:-1] - 1e-7).all())  # mean defined at n=1, strictly ↓
+    # std is undefined at n=1 (clamped/masked); check strict decrease from n=2 onward.
+    std_mono = bool((std[2:] < std[1:-1] - 1e-7).all())
     in_unit = bool((N > 0).all() and (N < 1.0 + 1e-6).all())
-    ok = mono and mean_fixed and in_unit
-    print(f"[check] std floor ↓ with n (n=2 {std[0].tolist()} → n=30 {std[-1].tolist()}), "
-          f"mean fixed={mean_fixed}, in (0,1)={in_unit} {'OK' if ok else 'VIOLATED'}")
+    ok = mean_mono and std_mono and in_unit
+    print(f"[check] mean floor ↓ with n (n=1 {mean[0].tolist()} → n=30 {mean[-1].tolist()}); "
+          f"std floor ↓ with n; in (0,1)={in_unit} {'OK' if ok else 'VIOLATED'}")
     assert ok
 
 
 def test_count_floor_obeys_sampling_variance_law() -> None:
-    # The noise/signal ratio of the std floor must scale as 1/(n−1): ratio(n) = N_σ/(1−N_σ)
-    # ∝ 1/(n−1). So ratio(a)/ratio(b) == (b−1)/(a−1), independent of the anchor.
+    # Each floor's noise/signal ratio follows its OWN sampling law: mean ∝ 1/n, std ∝ 1/(n−1).
+    # So mean ratio(a)/ratio(b) == b/a, std ratio(a)/ratio(b) == (b−1)/(a−1) — anchor-free.
     a, b = 3, 9
     N = count_dependent_noise_var(torch.tensor([a, b]))
-    ratio = N[:, 3:] / (1.0 - N[:, 3:])  # (2, 3) noise/signal per std dim
-    got = (ratio[0] / ratio[1])
-    expect = (b - 1) / (a - 1)  # 8/2 = 4
-    ok = torch.allclose(got, torch.full((3,), float(expect)), rtol=1e-5)
-    print(f"[check] std noise/signal ∝ 1/(n−1): ratio(3)/ratio(9) {got.tolist()} "
-          f"== (9−1)/(3−1)={expect} {'OK' if ok else 'VIOLATED'}")
+    mean_ratio = N[:, :3] / (1.0 - N[:, :3])
+    std_ratio = N[:, 3:] / (1.0 - N[:, 3:])
+    got_mean = mean_ratio[0] / mean_ratio[1]
+    got_std = std_ratio[0] / std_ratio[1]
+    exp_mean = b / a               # 9/3 = 3   (mean ∝ 1/n)
+    exp_std = (b - 1) / (a - 1)    # 8/2 = 4   (std  ∝ 1/(n−1))
+    ok = (torch.allclose(got_mean, torch.full((3,), float(exp_mean)), rtol=1e-5)
+          and torch.allclose(got_std, torch.full((3,), float(exp_std)), rtol=1e-5))
+    print(f"[check] mean noise/signal ∝ 1/n: ratio(3)/ratio(9) {got_mean.tolist()}=={exp_mean}; "
+          f"std ∝ 1/(n−1): {got_std.tolist()}=={exp_std} {'OK' if ok else 'VIOLATED'}")
     assert ok
 
 
