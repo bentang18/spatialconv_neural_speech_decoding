@@ -84,6 +84,9 @@ while :; do
   sleep 20
 done
 
-echo "== [3/3] DEPTH LADDER (tag=$TAG) =="
-ssh delta "sed -n '/=== r4 depth ladder/,\$p' $MOUT"
+echo "== [3/3] RESULTS (tag=$TAG) =="
+# Anchor on the first result header of EITHER block: a --taps subset that omits the enc
+# ladder prints only the perceiver block, and anchoring on the ladder header alone made
+# the driver exit 0 with an empty report.
+ssh delta "sed -n '/^=== r4 \(depth ladder\|perceiver\)/,\$p' $MOUT"
 echo "   full json: $RESULT (on delta/dtai shared Lustre)"
