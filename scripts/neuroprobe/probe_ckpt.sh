@@ -30,7 +30,12 @@ NSESS=7    # PROBE_COHORT_7
 NARR=13    # 7 WS sessions + 6 CS test subjects
 
 echo "== [1/3] ENCODE on dtai (ckpt=$CKPT tag=$TAG) =="
-AID=$(ssh dtai "sbatch --parsable $BASE/v3_probe_encode_r4.sbatch '$CKPT' '$TAG' '$CACHE'")
+# --time override: the sbatch defaults to 3 h, which is ~6x the real job and too fat to
+# backfill — ghx4 sits at 40 nodes drain$ and a 3 h ask queued ~2 h behind Priority. The
+# r4_10k encode wrote all 7 caches in a 4-min window (03:00:39→03:04:36); 30 min is 6x
+# that with room for model load + spec-cache reads. Safe to run tight: the encode SKIPS
+# sessions whose cache exists, so a walltime kill costs one requeue, not the work.
+AID=$(ssh dtai "sbatch --parsable --time=00:30:00 $BASE/v3_probe_encode_r4.sbatch '$CKPT' '$TAG' '$CACHE'")
 echo "   encode job $AID  ->  $CACHE"
 while :; do
   n=$(ssh dtai "ls $CACHE/*.pt 2>/dev/null | wc -l" | tr -d ' ')
