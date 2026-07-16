@@ -1,12 +1,15 @@
-"""v14_converged_v3 launcher — E1/E2 assembly + F1 local CPU smoke (TDD).
+"""v14_converged_v3 launcher — E1/E2 assembly + resume/gate/forensics wiring (TDD).
 
-Drives the WHOLE v3 stack end-to-end on CPU with synthetic caches + a stub
-parcel_fn (no BT anatomy, no wandb, no GPU): synthetic band caches ─▶
-load_v3_sessions ─▶ build_v3_training ─▶ trainer.fit for a couple of optimizer
-steps. This is the first thing that constructs a real V3Batch and runs it through
-the model + objective + optimizer + EMA + monitors, so it is the launch-readiness
-gate (F1) as well as the unit test for the launcher assembly (E1) and the trainer
-knobs (E2).
+Mostly cheap, pure-Python contract tests over the launcher assembly (E1), the
+trainer knobs (E2), the r3 static_graph launch gate, and the r4 heartbeat.
+
+The three standalone CPU smoke tests that ran ``trainer.fit`` on the real ~12M-param
+model (F1) were removed 2026-07-16 (Ben): they pinned the whole laptop for minutes on
+a bare ``pytest``. End-to-end coverage did NOT go with them —
+``test_module_resumes_model_and_step_from_checkpoint`` still drives synthetic band
+caches ─▶ load_v3_sessions ─▶ build_v3_training ─▶ fit, so a real V3Batch still goes
+through model + objective + optimizer + EMA here. What IS gone: the only test of
+``main()``'s argv glue.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import torch
 from speech_decoding.experiments.dispatch_v3 import (
     _build_trainer,
     _parse_sessions,
+    _StepTimeCallback,
     build_v3_optim_cfg,
     build_v3_training,
 )
@@ -115,68 +119,6 @@ def test_build_optim_cfg_is_non_fused_adamw_warmupcosine() -> None:
     assert list(o.optimizer.kwargs["betas"]) == [0.9, 0.95]
     assert o.optimizer.kwargs["weight_decay"] == 0.04
     assert type(o.scheduler).__name__ == "WarmupCosine"
-
-
-def test_local_cpu_smoke_fit_runs(tmp_path) -> None:
-    sess = [
-        (1, 0, _shaft_labels((8, 8, 8))),
-        (2, 1, _shaft_labels((8, 8))),
-    ]
-    band_dirs, span_dir = _write_caches(tmp_path, sess)
-    specs = load_v3_sessions(
-        sessions=[(1, 0), (2, 1)],
-        band_cache_dirs=band_dirs, span_dir=span_dir, parcel_fn=_stub_parcel_fn,
-    )
-    args = _smoke_args()
-    module, dm, trainer = build_v3_training(specs, args)
-
-    # teacher starts as an exact copy of the online tower (EMA not yet advanced)
-    trainer.fit(module, datamodule=dm)
-
-    assert trainer.global_step == 2  # max_steps honored
-    # the training_step logged a finite loss and a fixed masked count
-    assert torch.isfinite(torch.tensor(trainer.callback_metrics["train_loss"].item()))
-
-
-def test_main_argv_path_runs(tmp_path, monkeypatch) -> None:
-    # exercise main()'s full argv → load_v3_sessions → build_v3_training → fit glue,
-    # with the one real seam (BT parcel lookup) stubbed so no anatomy/GPU is needed.
-    import speech_decoding.experiments.dispatch_v3 as d3
-
-    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
-    band_dirs, span_dir = _write_caches(tmp_path, sess)
-    monkeypatch.setattr(d3, "make_bt_parcel_fn", lambda bt_root: _stub_parcel_fn)
-    argv = [
-        "--bt-root", "unused",
-        "--band-cache-dir", band_dirs[0],
-        "--band-cache-dir", band_dirs[1],
-        "--band-cache-dir", band_dirs[2],
-        "--span-dir", span_dir,
-        "--session", "1:0",
-        "--clips-per-session", "4", "--batch-size", "2",
-        "--ssl-max-steps", "1", "--accumulate-grad-batches", "2",
-        "--accelerator", "cpu", "--devices", "1", "--precision", "32-true",
-        "--num-workers", "0",
-    ]
-    d3.main(argv)  # must not raise
-
-
-def test_smoke_advances_teacher_and_params(tmp_path) -> None:
-    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
-    band_dirs, span_dir = _write_caches(tmp_path, sess)
-    specs = load_v3_sessions(
-        sessions=[(1, 0)],
-        band_cache_dirs=band_dirs, span_dir=span_dir, parcel_fn=_stub_parcel_fn,
-    )
-    args = _smoke_args(clips_per_session=4, ssl_max_steps=1, accumulate_grad_batches=2)
-    module, dm, trainer = build_v3_training(specs, args)
-    before = torch.cat([p.detach().flatten() for p in module.model.parameters()
-                        if p.requires_grad])
-    trainer.fit(module, datamodule=dm)
-    after = torch.cat([p.detach().flatten() for p in module.model.parameters()
-                       if p.requires_grad])
-    # one optimizer step moved the trainable params (optimizer + EMA both ran)
-    assert not torch.allclose(before, after)
 
 
 # --- resume / fork wiring ----------------------------------------------------
@@ -311,3 +253,91 @@ def test_r3_gate_silent_with_no_static_graph() -> None:
     assert _build_trainer(
         _ddp_args(state_stats_dir="/some/stats", ddp_static_graph=False)
     ) is not None
+
+
+# ------------------------------------------------------- heartbeat (r4 forensics)
+class _HbTrainer:
+    """Minimal trainer stand-in: the heartbeat reads only host ints."""
+
+    def __init__(self, *, global_step: int, global_rank: int = 0, current_epoch: int = 7) -> None:
+        self.global_step = global_step
+        self.global_rank = global_rank
+        self.current_epoch = current_epoch
+
+
+class _HbModule:
+    def log(self, *_: object, **__: object) -> None:  # the wandb scalar; not under test
+        return None
+
+
+def _hb_lines(capsys) -> list[str]:
+    return [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[hb]")]
+
+
+def test_heartbeat_prints_on_cadence_and_is_silent_off_cadence(capsys) -> None:
+    """The r4 post-mortem gap: the .log held ZERO step lines across 14 h, so the crash
+    step was unknowable. Heartbeat must emit exactly on the N-step cadence."""
+    cb = _StepTimeCallback(heartbeat_every=100)
+    for step in (100, 137, 200):
+        cb.on_train_batch_end(_HbTrainer(global_step=step), _HbModule())
+    lines = _hb_lines(capsys)
+    assert len(lines) == 2, lines  # 137 is off-cadence
+    assert "step=100" in lines[0] and "step=200" in lines[1]
+
+
+def test_heartbeat_dedupes_under_grad_accum(capsys) -> None:
+    """``on_train_batch_end`` fires once per MICRO-batch, so r4's accumulate=4 hands the
+    SAME global_step 4×. Without dedup the log would carry 4 identical lines per step."""
+    cb = _StepTimeCallback(heartbeat_every=100)
+    for _ in range(4):  # accumulate_grad_batches=4 micro-batches, one optimizer step
+        cb.on_train_batch_end(_HbTrainer(global_step=100), _HbModule())
+    assert len(_hb_lines(capsys)) == 1
+
+
+def test_heartbeat_is_per_rank_and_names_the_rank(capsys) -> None:
+    """Rank identity is the WHOLE point: r4 died with ranks 0/2/3 stalled at collective
+    266865 while rank 1 ran ahead into a broadcast. Per-rank lines make a divergence
+    readable directly, instead of inferred from NCCL sequence numbers."""
+    for rank in range(4):
+        _StepTimeCallback(heartbeat_every=100).on_train_batch_end(
+            _HbTrainer(global_step=100, global_rank=rank), _HbModule()
+        )
+    lines = _hb_lines(capsys)
+    assert len(lines) == 4
+    assert {f"rank={r}" for r in range(4)} == {ln.split()[1] for ln in lines}
+
+
+def test_heartbeat_reports_step_epoch_elapsed_and_never_syncs(capsys) -> None:
+    """Fields needed to bracket a stall; and the values it reads are host ints — a
+    GPU ``.item()`` here would undo the #37 per-step sync kill."""
+    cb = _StepTimeCallback(heartbeat_every=100)
+    cb.on_train_batch_end(_HbTrainer(global_step=100, current_epoch=520), _HbModule())
+    (line,) = _hb_lines(capsys)
+    for field in ("rank=0", "step=100", "epoch=520", "sec_per_step=", "elapsed="):
+        assert field in line, line
+    assert "sec_per_step=nan" in line  # first mark: no prior perf_counter
+
+
+def test_heartbeat_disabled_when_zero(capsys) -> None:
+    cb = _StepTimeCallback(heartbeat_every=0)
+    cb.on_train_batch_end(_HbTrainer(global_step=100), _HbModule())
+    assert _hb_lines(capsys) == []
+
+
+def test_step_time_scalar_still_skips_first_step_then_logs() -> None:
+    """The PRE-EXISTING _StepTimeCallback contract, pinned cheaply (no 12M-param CPU
+    fit): first batch-end has no prior perf_counter mark ⇒ no scalar; every later one
+    logs a finite train_sec_per_step with sync_dist=False (no cross-rank barrier)."""
+    logged: list[tuple[str, float, bool]] = []
+
+    class _Rec(_HbModule):
+        def log(self, key, value, **kw):  # type: ignore[override]
+            logged.append((key, float(value), bool(kw.get("sync_dist", False))))
+
+    cb, mod = _StepTimeCallback(heartbeat_every=0), _Rec()
+    cb.on_train_batch_end(_HbTrainer(global_step=1), mod)
+    assert logged == []  # first step: no prior mark
+    cb.on_train_batch_end(_HbTrainer(global_step=2), mod)
+    assert len(logged) == 1
+    key, value, sync = logged[0]
+    assert key == "train_sec_per_step" and value >= 0.0 and sync is False

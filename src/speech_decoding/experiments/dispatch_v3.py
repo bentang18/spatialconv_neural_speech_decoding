@@ -76,21 +76,54 @@ class _StepTimeCallback(pl.Callback):
     kernel, and loss already logs each step). Measures true step-to-step throughput
     incl. dataloader, so compile spikes show as tall bars and the steady floor is
     obvious. First step is skipped (no prior mark); ``sync_dist=False`` ⇒ no
-    cross-rank barrier."""
+    cross-rank barrier.
 
-    def __init__(self) -> None:
+    ALSO prints a per-rank HEARTBEAT to stdout every ``heartbeat_every`` optimizer
+    steps (2026-07-16). The wandb scalar above is invisible in the .log file, which
+    is why r4's NCCL-abort post-mortem could not name the step it died at, nor which
+    rank ran ahead: the whole 14 h log held zero step lines. EVERY rank prints (not
+    just rank 0) because the failure mode this exists to catch is rank DIVERGENCE —
+    ranks 0/2/3 stalled in python at 266865 while rank 1 sat alone in a broadcast.
+    Per-rank lines make that read straight off the log instead of being inferred from
+    NCCL sequence numbers. Cost: one f-string + one write per rank per N steps, no
+    CUDA sync (``global_step``/``current_epoch`` are host ints) ⇒ throughput-neutral.
+    Deduped on global_step: ``on_train_batch_end`` fires once per MICRO-batch, so
+    under grad-accum the same optimizer step arrives ``accumulate_grad_batches`` times.
+    """
+
+    def __init__(self, heartbeat_every: int = 100) -> None:
         self._t: float | None = None
+        self._heartbeat_every = int(heartbeat_every)
+        self._t0: float | None = None
+        self._last_hb: int | None = None
 
     def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, *_: object) -> None:  # noqa: ARG002
         import time
 
         now = time.perf_counter()
-        if self._t is not None:
+        if self._t0 is None:
+            self._t0 = now
+        sec = None if self._t is None else now - self._t
+        if sec is not None:
             pl_module.log(
-                "train_sec_per_step", now - self._t,
+                "train_sec_per_step", sec,
                 on_step=True, on_epoch=False, prog_bar=True, sync_dist=False,
             )
         self._t = now
+        step = int(trainer.global_step)
+        if (
+            self._heartbeat_every > 0
+            and step % self._heartbeat_every == 0
+            and step != self._last_hb
+        ):
+            self._last_hb = step
+            print(
+                f"[hb] rank={trainer.global_rank} step={step} "
+                f"epoch={int(trainer.current_epoch)} "
+                f"sec_per_step={'nan' if sec is None else format(sec, '.3f')} "
+                f"elapsed={now - self._t0:.0f}s",
+                flush=True,
+            )
 
 
 # --------------------------------------------------------------------- optimizer
