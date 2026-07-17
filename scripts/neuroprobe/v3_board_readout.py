@@ -340,25 +340,30 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
     return {"cells": _grid_cells(grid), "n_parcels": int(common.size)}
 
 
-def _load(cache_dir, session, tag, mmap=True):
-    """Load a session cache. ``mmap=True`` makes the read LAZY and therefore SELECTIVE.
+# mmap default is PER MODE, and the reason is measured, not aesthetic (07-17, on enc_s2_t4
+# under a Lustre carrying 734 jobs):
+#     cold scattered gather, 1750 elec rows : 231.55 s for 5.5 GB  =  24 MB/s
+#     warm gather, same rows (page cache)   :   2.31 s             = 100x faster
+#     eager sequential load (shard 0, live) : ~660 s for 56.7 GB   = ~86 MB/s
+# So mmap does NOT make loading free — it DEFERS it into the gathers, at ~1/4 the bandwidth of
+# one sequential stream. ("mmap loads in 0.5 s at 0.5 GB" is an artifact of measuring an open()
+# that reads nothing; the bytes are still owed.) The trade therefore splits by mode:
+#   CS  -> mmap WINS: it touches only the ~12 GB of parcel taps out of 43 GB, so it reads ~3.6x
+#          less data (a wash on time at the worse bandwidth) and resides ~12 GB instead of 43.
+#          The win is MEMORY, which is what buys the --mem cut and the concurrency.
+#   WS  -> mmap LOSES: across 15 tasks x 2 folds the union of gathered rows covers most of the
+#          34 GB enc12_elec tensor anyway, so it re-reads nearly all of it scattered (~24 min)
+#          instead of streaming it once (~10 min). Eager is right for WS.
+MMAP_DEFAULT = {"ws": False, "cs": True}
 
-    Measured on enc_s2_t4 (43 GB file): eager torch.load takes minutes and resides the whole
-    file; mmap=True returns in 0.5 s at 0.5 GB RSS, and pages arrive only where a tensor is
-    actually indexed. Two consequences, both of which the 20263259 array paid for:
 
-      1. A CS shard uses ONLY the parcel-mean taps but eagerly pulled the 34 GB enc12_elec
-         tensor it never touches — that waste, not the fits, set the 160 G floor and throttled
-         the array to 4 concurrent shards. Under mmap the tap is never gathered, so it is
-         never read. The selection needs no tap-filter argument: not touching IS not loading.
-      2. A WS shard gathers ~1750 of 10768 rows per fit, so it reads a fraction of the file
-         instead of all of it.
+def _load(cache_dir, session, tag, mmap=False):
+    """Load a session cache. ``mmap=True`` defers the read into the gathers (see MMAP_DEFAULT).
 
-    The risk mmap trades for: reads become scattered rather than one sequential 43 GB stream,
-    and pages evicted under cgroup pressure are re-read. Each row is a contiguous 3.2 MB and
-    upstream hands us SORTED indices, so the access is ascending and semi-sequential — but
-    that is an argument, not a measurement, which is why this is a flag and why every shard
-    prints its phase budget. A/B it (--no-mmap) on one WS shard before trusting it.
+    Pages arrive only where a tensor is actually indexed, so selectivity is free: a CS shard
+    never gathers enc12_elec and therefore never reads those 34 GB. No tap-filter argument is
+    needed — not touching IS not loading. But laziness is not a speedup, and for WS it is a
+    slowdown; pick with MMAP_DEFAULT and A/B with --mmap/--no-mmap before trusting a change.
     """
     s, t = session
     return torch.load(f"{cache_dir}/enc_s{s}_t{t}_{tag}.pt", map_location="cpu",
@@ -396,14 +401,16 @@ def _map_tasks(fn, taps, workers) -> dict:
         return dict(pool.map(_task_worker, BOARD_TASKS))
 
 
-def _ws_shard(cache_dir, tag, session, taps=WS_TAPS, workers=1, mmap=True) -> dict:
+def _ws_shard(cache_dir, tag, session, taps=WS_TAPS, workers=1,
+              mmap=MMAP_DEFAULT["ws"]) -> dict:
     rec = _load(cache_dir, session, tag, mmap=mmap)
     out = _map_tasks(lambda task, tp: _ws_cell(rec, task, tp), taps, workers)
     return {"kind": "ws", "name": f"S{session[0]}T{session[1]}",
             "cells": {f"{tag}|{k}": v for k, v in out.items()}}
 
 
-def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS, workers=1, mmap=True) -> dict:
+def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS, workers=1,
+              mmap=MMAP_DEFAULT["cs"]) -> dict:
     taps = tuple(t for t in taps if t not in ELEC_TAPS)   # CS is parcel-bridged by necessity
     anchor_rec = _load(cache_dir, CS_TRAIN_ANCHOR, tag, mmap=mmap)
     test_rec = _load(cache_dir, cell, tag, mmap=mmap)
@@ -552,9 +559,12 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=1,
                    help="fork this many task-workers per shard (memory-bound: WS ~3, CS ~8). "
                         "Set OMP_NUM_THREADS = cpus-per-task / workers.")
-    p.add_argument("--no-mmap", action="store_true",
-                   help="eagerly load the whole cache (the pre-2026-07-17 behaviour). Use to "
-                        "A/B the mmap path on one shard before trusting it.")
+    p.add_argument("--mmap", dest="mmap", default=None, action="store_true",
+                   help=f"force lazy paging (default per mode: {MMAP_DEFAULT}). Measured: it "
+                        f"DEFERS the read into the gathers at ~1/4 sequential bandwidth — a "
+                        f"win for CS (skips the 34 GB elec tap) and a loss for WS.")
+    p.add_argument("--no-mmap", dest="mmap", action="store_false",
+                   help="force one eager sequential read of the whole cache.")
     p.add_argument("--taps", default="",
                    help=f"comma-separated subset of {WS_TAPS} (default: all; CS drops "
                         f"{ELEC_TAPS} automatically)")
@@ -571,8 +581,8 @@ def main() -> None:
         cell = cells[args.index]
         fn = _ws_shard if args.mode == "ws" else _cs_shard
         t0 = time.perf_counter()
-        sh = fn(args.cache_dir, tags[0], cell, taps, workers=args.workers,
-                mmap=not args.no_mmap)
+        use_mmap = MMAP_DEFAULT[args.mode] if args.mmap is None else args.mmap
+        sh = fn(args.cache_dir, tags[0], cell, taps, workers=args.workers, mmap=use_mmap)
         os.makedirs(args.shard_dir, exist_ok=True)
         out = f"{args.shard_dir}/{args.mode}_{sh['name']}.json"
         with open(out, "w") as f:
@@ -581,7 +591,7 @@ def main() -> None:
         # Phase totals are per-PROCESS: with --workers>1 the children's timers die with them,
         # so this table is the parent's view (load + merge) only. Profile with --workers 1.
         _phase_report(f"{args.mode} {sh['name']} workers={args.workers} "
-                      f"mmap={not args.no_mmap} wall={(time.perf_counter() - t0) / 60:.1f} min")
+                      f"mmap={use_mmap} wall={(time.perf_counter() - t0) / 60:.1f} min")
         return
 
     res = _merge(tags, args.shard_dir) if args.mode == "merge" else _compute_all(

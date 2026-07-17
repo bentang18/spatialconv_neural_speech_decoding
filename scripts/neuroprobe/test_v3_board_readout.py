@@ -258,17 +258,26 @@ def test_map_tasks_forked_gives_identical_results_to_serial() -> None:
 
 
 def test_load_mmap_flag_reaches_torch_load() -> None:
-    """mmap is the fix for the 34 GB a CS shard read and never used. Pin that the flag is
-    actually threaded through to torch.load rather than silently defaulting."""
+    """Pin that the flag is threaded through to torch.load rather than silently defaulting."""
     import scripts.neuroprobe.v3_board_readout as B
 
     seen = {}
     orig = B.torch.load
     B.torch.load = lambda path, **kw: seen.update(kw) or {"ok": True}
     try:
-        B._load("/cache", (2, 4), "tg")
+        B._load("/cache", (2, 4), "tg", mmap=True)
         assert seen["mmap"] is True
-        B._load("/cache", (2, 4), "tg", mmap=False)
-        assert seen["mmap"] is False
+        B._load("/cache", (2, 4), "tg")
+        assert seen["mmap"] is False          # eager is the safe default; modes opt in
     finally:
         B.torch.load = orig
+
+
+def test_mmap_default_is_per_mode_cs_only() -> None:
+    """Measured 07-17: mmap DEFERS the read into the gathers at ~1/4 sequential bandwidth
+    (cold 24 MB/s vs eager ~86 MB/s). CS touches only ~12 of 43 GB so it wins on memory; WS
+    gathers most of the 34 GB elec tap anyway, so lazy paging makes it SLOWER. A default of
+    mmap-everywhere would have silently regressed the 12 WS shards."""
+    from scripts.neuroprobe.v3_board_readout import MMAP_DEFAULT
+
+    assert MMAP_DEFAULT == {"ws": False, "cs": True}
