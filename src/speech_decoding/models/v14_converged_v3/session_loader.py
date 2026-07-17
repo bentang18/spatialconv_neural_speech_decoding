@@ -44,6 +44,7 @@ from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
 
 ParcelFn = Callable[[int, int, Sequence[str]], Tensor]
+KeepLabelsFn = Callable[[int, int, Sequence[str]], set[str]]
 
 
 def _entry_for(index: dict[str, BandCacheEntry], subject_id: int, trial_id: int) -> BandCacheEntry:
@@ -99,11 +100,22 @@ def load_v3_sessions(
     winsor: float | Sequence[float] | None = None,
     mask_cfg: V3MaskConfig = V3MaskConfig(),
     state_stats_dir: str | None = None,
+    keep_labels_fn: KeepLabelsFn | None = None,
 ) -> list[V3SessionSpec]:
     """Assemble the per-session ``V3SessionSpec`` list for the datamodule.
 
     ``state_stats_dir`` (opt): dir of per-subject frozen state-norm tables that turn ON
-    the secondary Gaussian-NLL; omit ⇒ JEPA-only."""
+    the secondary Gaussian-NLL; omit ⇒ JEPA-only.
+
+    ``keep_labels_fn`` (opt): ``(subject_id, trial_id, labels) -> set[str]`` naming the
+    electrodes to KEEP; everything else joins the LOF drop set. Injected like ``parcel_fn``
+    so study-specific montages (e.g. the Neuroprobe-Lite electrode list) stay out of this
+    loader. Restricting here rather than subsetting the built spec is what makes it safe:
+    ``keep_idx``/``parcel_id``/``sidecar``/``geom``/``band_stats`` are then all constructed
+    on the restricted axis by the same code path as a normal run, so none of them can
+    desync. (``geom`` in particular CANNOT be masked post-hoc — ``gather_idx`` stores
+    indices INTO the survivor axis, so dropping survivors invalidates every stored index.)
+    ``None`` ⇒ keep everything (the training path; byte-identical to no argument)."""
     if len(band_cache_dirs) != 3:
         raise ValueError(f"expected 3 band cache dirs, got {len(band_cache_dirs)}")
     band_indexes = [index_band_cache(d) for d in band_cache_dirs]
@@ -122,7 +134,16 @@ def load_v3_sessions(
                 )
         labels = list(ch0)
         parcel_id = parcel_fn(subject_id, trial_id, labels).long()
-        drop = lof.get((subject_id, trial_id), set())
+        drop = set(lof.get((subject_id, trial_id), set()))
+        if keep_labels_fn is not None:
+            keep = keep_labels_fn(subject_id, trial_id, labels)
+            restricted = {lab for lab in labels if lab not in keep}
+            if len(labels) - len(restricted | drop) == 0:
+                raise ValueError(
+                    f"session {subject_id}/{trial_id}: keep_labels_fn kept 0 of "
+                    f"{len(labels)} electrodes — montage does not match this cache"
+                )
+            drop |= restricted
         stat_mean, stat_std = _load_state_stats(state_stats_dir, subject_id)
         setup = build_session_setup(
             labels, parcel_id, drop_labels=drop, mask_cfg=mask_cfg,

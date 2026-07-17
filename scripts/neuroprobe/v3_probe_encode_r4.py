@@ -55,6 +55,25 @@ Usage (one 1-GPU allocation):
       --out-dir /projects/bhqk/htang13/v3_probe_cache_r4_10k \
       --band-cache-dir <slow> --band-cache-dir <mid> --band-cache-dir <hga> \
       --span-dir <spans> --bt-root <bt_root>
+
+BOARD MODE (Ben 2026-07-16) — the Neuroprobe-Lite leaderboard-parity encode, consumed by
+``v3_board_readout.py``. Three flags move the eval universe to the board's; the FEATURES and
+the teacher forward are untouched, so the diagnostic and the board number are the same probe:
+  --sessions board        the 12 Lite sessions (upstream NEUROPROBE_LITE_SUBJECT_TRIALS),
+                          not the 7-session diagnostic cohort
+  --tasks board15         the 15 leaderboard tasks — a RE-LABEL of the same task-agnostic
+                          features (build_session_targets reads events["task"].unique())
+  --electrode-set lite    the Lite montage, injected as load_v3_sessions(keep_labels_fn=...)
+                          so keep_idx/parcel_id/sidecar/geom/band_stats are all BUILT on the
+                          Lite axis — geom cannot be masked after the fact
+  --no-perceiver          the board number is enc12; skip dec/lat
+
+  .venv/bin/python -m scripts.neuroprobe.v3_probe_encode_r4 \
+      --ckpt /projects/bhqk/htang13/v3_ckpt_r4/ladder-step=20000.ckpt --tag board_r4_20k \
+      --out-dir /projects/bhqk/htang13/v3_board_cache \
+      --band-cache-dir <slow_lite> --band-cache-dir <mid_lite> --band-cache-dir <hga_lite> \
+      --span-dir <spans> --bt-root <bt_root> \
+      --sessions board --tasks board15 --electrode-set lite --no-perceiver
 """
 from __future__ import annotations
 
@@ -65,6 +84,20 @@ import numpy as np
 import torch
 
 PROBE_TASKS: tuple[str, ...] = ("onset", "delta_volume", "word_index", "gpt2_surprisal")
+# The 15 Neuroprobe leaderboard tasks (upstream ``neuroprobe.config.NEUROPROBE_TASKS``).
+# --tasks board re-labels the SAME task-agnostic features, so the only extra encode cost is
+# materializing 15 label vectors instead of 4.
+BOARD_TASKS: tuple[str, ...] = (
+    "onset", "speech", "volume", "delta_volume", "pitch", "word_index",
+    "word_gap", "gpt2_surprisal", "word_head_pos", "word_part_speech",
+    "word_length", "global_flow", "local_flow", "frame_brightness", "face_num",
+)
+# The 12 Neuroprobe-Lite sessions (upstream ``NEUROPROBE_LITE_SUBJECT_TRIALS``): the board's
+# CS anchor (2,4) + the 10 CS test cells + (2,0). --sessions board evaluates these.
+BOARD_SESSIONS: tuple[tuple[int, int], ...] = (
+    (1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
+    (4, 0), (4, 1), (7, 0), (7, 1), (10, 0), (10, 1),
+)
 FPS = 32.0
 CLIP_DUR_S = 1.0
 N_PARCELS = 75
@@ -142,14 +175,34 @@ def _load_perceivers(sd: dict, *, device: torch.device):
     return {"": _freeze(trained, device=device), "_rand": _freeze(rand, device=device)}
 
 
-def _load_targets(session, bt_root):
+def _load_targets(session, bt_root, tasks=PROBE_TASKS):
     from scripts.neuroprobe.run_pretrain_probe_suite import _label_events
     from speech_decoding.experiments.pretrain_probe_labels import build_session_targets
 
     subject_id, trial_id = session
     events = _label_events(subject_id, trial_id, f"btbank{subject_id}_trial{trial_id}",
-                           PROBE_TASKS, bt_root, lite_cap=True)
+                           tasks, bt_root, lite_cap=True)
+    # build_session_targets derives its task list from events["task"].unique(), so passing
+    # `tasks` to _label_events is what widens 4 -> 15.
     return build_session_targets(events, subject_id=subject_id, trial_id=trial_id)
+
+
+def _lite_keep_labels_fn(bt_root):
+    """``keep_labels_fn`` restricting a session to its Neuroprobe-Lite montage.
+
+    Injected into ``load_v3_sessions`` (NOT applied to the built spec) so keep_idx / parcel_id
+    / sidecar / geom / band_stats are all constructed on the Lite axis by the normal code path
+    — ``geom`` cannot be masked post-hoc, its gather_idx stores indices into the survivor axis.
+    The realized montage is a SET intersection (``voltage_order ∩ lite_labels``), matching
+    upstream ``datasets.py`` ``[full.index(e) for e in lite if e in full]``; we keep OUR voltage
+    order, which is free for the encoder (the per-parcel pool is permutation-invariant within a
+    parcel) and is what index-RoPE expects."""
+    from speech_decoding.studies.braintreebank.anatomy import lite_electrode_set
+
+    def fn(subject_id, trial_id, labels):
+        return set(lite_electrode_set(subject_id))
+
+    return fn
 
 
 def _window_bands(spec, starts, clip_frames):
@@ -305,7 +358,7 @@ def _perc_checks(percs, z, grid, q_parcel, q_slot, *, n_slots) -> bool:
 
 @torch.no_grad()
 def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, present,
-                 *, device, batch_size, n_slots, run_checks):
+                 *, device, batch_size, n_slots, run_checks, elec_taps=()):
     """One forward of the teacher over all windows → per-tap parcel-pooled keep-time features.
 
     Cache stores the raw parcel-mean feature (n,|P|,k_full·d) — the most flexible storage: a
@@ -319,6 +372,11 @@ def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, prese
     n = bands[0].shape[0]
     k = grid.k_full
     acc: dict = {t: [] for t in GPU_TAPS}
+    # Per-electrode keep-time (Ben 2026-07-16): WS keeps ALL electrodes; the parcel-mean is the
+    # comparison. Stored UNPOOLED on the canonical-contact axis (same order as parcel_canon), so
+    # it is the pooled tap's exact pre-mean input — the diff is the pooling and nothing else.
+    for t in elec_taps:
+        acc[f"elec{t}"] = []
     for name in percs:
         acc[f"dec{name}"], acc[f"lat{name}"] = [], []
     checked = not run_checks
@@ -330,7 +388,7 @@ def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, prese
                             enabled=(device.type == "cuda")):
             z, taps = teacher.forward(bb, grid, parcel_packed, tap_blocks=GPU_TAPS)
             q_parcel, q_slot = _perc_queries(present, n_slots, device=device)
-            if not checked:
+            if not checked and percs:
                 if not _perc_checks(percs, z, grid, q_parcel, q_slot, n_slots=n_slots):
                     raise RuntimeError("perceiver invariant VIOLATED — refusing to write a cache")
                 checked = True
@@ -339,6 +397,9 @@ def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, prese
         for t in GPU_TAPS:
             enc = taps[t].float().reshape(Bb, -1, k, taps[t].shape[-1]).cpu()  # (Bb, n, k, d)
             acc[t].append(_pool_parcels(enc, parcel_canon, present))
+            if t in elec_taps:
+                # (Bb, n_contacts, k·d) fp16 — the SAME tensor, just unpooled.
+                acc[f"elec{t}"].append(enc.reshape(Bb, enc.shape[1], -1).to(torch.float16))
         for name, (dec, lat) in perc_out.items():
             # dec (Bb, P·S, d) → (Bb, P, S·d): per-parcel already, no pooling.
             acc[f"dec{name}"].append(
@@ -358,6 +419,19 @@ def main() -> None:
     p.add_argument("--span-dir", required=True)
     p.add_argument("--bt-root", required=True)
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--sessions", choices=("cohort7", "board"), default="cohort7",
+                   help="cohort7 = the 7-session diagnostic cohort; board = the 12 Neuroprobe-Lite sessions")
+    p.add_argument("--tasks", choices=("probe4", "board15"), default="probe4",
+                   help="board15 = the 15 leaderboard tasks (re-labels the same features)")
+    p.add_argument("--electrode-set", choices=("all", "lite"), default="all",
+                   help="lite = the Neuroprobe-Lite montage (leaderboard parity)")
+    p.add_argument("--no-perceiver", action="store_true",
+                   help="skip the dec/lat taps — the board number is enc12, and the Perceiver "
+                        "taps need the secondary head's ckpt subtree")
+    p.add_argument("--elec-taps", default="",
+                   help="comma-separated GPU taps to ALSO write per-electrode (unpooled), e.g. "
+                        "'12' -> feats['enc12_elec']. WS keeps all electrodes by default (Ben "
+                        "2026-07-16); each costs ~N/|P| (~5x) the pooled tap on disk.")
     args = p.parse_args()
 
     from speech_decoding.experiments.pretrain_probe_suite import PROBE_COHORT_7
@@ -376,15 +450,24 @@ def main() -> None:
     if rem:
         raise SystemExit(f"clip_frames={clip_frames} not divisible by SLOT_STRIDE={SLOT_STRIDE}")
     parcel_fn = make_bt_parcel_fn(args.bt_root)
+    cohort = BOARD_SESSIONS if args.sessions == "board" else tuple(PROBE_COHORT_7)
+    tasks = BOARD_TASKS if args.tasks == "board15" else PROBE_TASKS
+    keep_labels_fn = _lite_keep_labels_fn(args.bt_root) if args.electrode_set == "lite" else None
+    elec_taps = tuple(int(t) for t in args.elec_taps.split(",") if t.strip())
+    bad = [t for t in elec_taps if t not in GPU_TAPS]
+    if bad:
+        raise SystemExit(f"--elec-taps {bad} not in GPU_TAPS {GPU_TAPS}")
     sd = _load_ckpt(args.ckpt)
     teacher = _load_teacher(sd, device=device)
-    percs = _load_perceivers(sd, device=device)
+    percs = {} if args.no_perceiver else _load_perceivers(sd, device=device)
     del sd
+    perc_note = "no perceiver" if args.no_perceiver else "+ perceiver dec/lat (+_rand control)"
     print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0 "
-          f"+ perceiver dec/lat (+_rand control), n_slots={n_slots}", flush=True)
+          f"{perc_note}, n_slots={n_slots} sessions={args.sessions}({len(cohort)}) "
+          f"tasks={args.tasks}({len(tasks)}) electrodes={args.electrode_set}", flush=True)
 
     first = True
-    for session in PROBE_COHORT_7:
+    for session in cohort:
         subject_id, trial_id = session
         path = os.path.join(args.out_dir, f"enc_s{subject_id}_t{trial_id}_{args.tag}.pt")
         if os.path.exists(path):
@@ -393,8 +476,20 @@ def main() -> None:
         spec = load_v3_sessions(
             sessions=[session], band_cache_dirs=args.band_cache_dirs, span_dir=args.span_dir,
             parcel_fn=parcel_fn, lof_report_path=None, winsor=(15.0, 15.0, 20.0),
+            keep_labels_fn=keep_labels_fn,
         )[0]
-        targets = _load_targets(session, args.bt_root)
+        if keep_labels_fn is not None:
+            # The montage is the WHOLE parity claim — print what was realized, per session.
+            from speech_decoding.studies.braintreebank.anatomy import lite_electrode_set
+            lite = lite_electrode_set(subject_id)
+            kept = spec.setup.sidecar.labels
+            ok = set(kept) <= set(lite)
+            print(f"[check] lite montage s{subject_id}_t{trial_id}: kept={len(kept)} "
+                  f"of lite-list {len(lite)} subset-of-lite={ok} -> {'OK' if ok else 'VIOLATED'}",
+                  flush=True)
+            if not ok:
+                raise RuntimeError("lite montage kept a non-Lite electrode — refusing to write")
+        targets = _load_targets(session, args.bt_root, tasks)
         bands = _window_bands(spec, targets.clip_starts, clip_frames)
 
         geom = spec.setup.geom.to(device)
@@ -406,10 +501,12 @@ def main() -> None:
         feats = {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present)}}
         tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
                                   present, device=device, batch_size=args.batch_size,
-                                  n_slots=n_slots, run_checks=first)
+                                  n_slots=n_slots, run_checks=first, elec_taps=elec_taps)
         first = False
         for t in GPU_TAPS:
             feats[f"enc{t}"] = tap_pooled[t]
+        for t in elec_taps:
+            feats[f"enc{t}_elec"] = tap_pooled[f"elec{t}"]
         for name in percs:
             feats[f"dec{name}"] = tap_pooled[f"dec{name}"]
             feats[f"lat{name}"] = tap_pooled[f"lat{name}"]

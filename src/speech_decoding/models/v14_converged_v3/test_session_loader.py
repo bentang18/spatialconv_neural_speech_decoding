@@ -157,6 +157,72 @@ def test_lof_drops_named_electrodes(tmp_path) -> None:
     assert 8 not in s0.keep_idx.tolist()
 
 
+def test_keep_labels_fn_none_is_a_no_op(tmp_path) -> None:
+    """The training path passes no keep_labels_fn — it must stay byte-identical."""
+    sess = _mk_sessions()
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    base = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )[0]
+    same = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, keep_labels_fn=None,
+    )[0]
+    assert base.keep_idx.tolist() == same.keep_idx.tolist()
+    assert base.setup.sidecar.labels == same.setup.sidecar.labels
+
+
+def test_keep_labels_fn_restricts_to_the_montage(tmp_path) -> None:
+    """Montage restriction lands on keep_idx (the .npy read plan) and the sidecar in
+    lockstep — the alignment that silently mis-routes electrodes into parcels if wrong."""
+    sess = _mk_sessions()
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    montage = {"LA1", "LA3", "LC8"}  # full-order rows 0, 2, 23
+    specs = load_v3_sessions(
+        sessions=[(1, 0)],
+        band_cache_dirs=band_dirs, span_dir=span_dir, parcel_fn=_stub_parcel_fn,
+        keep_labels_fn=lambda s, t, labels: montage,
+    )
+    s0 = specs[0]
+    assert s0.keep_idx.tolist() == [0, 2, 23]
+    assert s0.setup.sidecar.labels == ("LA1", "LA3", "LC8")
+    # parcel_id rides the SAME restricted axis: LA1/LA3 are shaft LA, LC8 is shaft LC.
+    pid = s0.setup.parcel_id.tolist()
+    assert pid[0] == pid[1] != pid[2]
+    # band stats slice to the survivors: full-order median was arange(C).
+    med, _ = s0.band_stats[0]
+    assert [float(med[i, 0, 0]) for i in range(3)] == [0.0, 2.0, 23.0]
+
+
+def test_keep_labels_fn_unions_with_lof(tmp_path) -> None:
+    """A montage electrode that LOF condemned stays dropped — LOF is not overridden."""
+    sess = _mk_sessions()
+    band_dirs, span_dir, lof_path = _setup_caches(
+        tmp_path, sess, lof={(1, 0): {"LA3"}},
+    )
+    specs = load_v3_sessions(
+        sessions=[(1, 0)],
+        band_cache_dirs=band_dirs, span_dir=span_dir, parcel_fn=_stub_parcel_fn,
+        lof_report_path=lof_path,
+        keep_labels_fn=lambda s, t, labels: {"LA1", "LA2", "LA3", "LC8"},
+    )
+    # LA3 (row 2) kept by the montage, killed by LOF; LA1/LA2/LC8 survive.
+    assert specs[0].keep_idx.tolist() == [0, 1, 23]
+
+
+def test_keep_labels_fn_empty_montage_fails_loud(tmp_path) -> None:
+    """A montage that matches nothing means the wrong cache, not an empty session."""
+    sess = _mk_sessions()
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    with pytest.raises(ValueError, match="kept 0 of"):
+        load_v3_sessions(
+            sessions=[(1, 0)],
+            band_cache_dirs=band_dirs, span_dir=span_dir, parcel_fn=_stub_parcel_fn,
+            keep_labels_fn=lambda s, t, labels: {"NOT_AN_ELECTRODE"},
+        )
+
+
 def test_stats_sliced_to_survivors(tmp_path) -> None:
     sess = _mk_sessions()
     band_dirs, span_dir, lof_path = _setup_caches(
