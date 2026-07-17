@@ -28,6 +28,10 @@ from speech_decoding.experiments.dispatch_v3 import (
     build_v3_optim_cfg,
     build_v3_training,
 )
+from speech_decoding.experiments.fork_point_ckpt import (
+    fork_to_point_ckpt,
+    optimizer_param_names,
+)
 from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
 
 _BAND_F = (7, 6, 7)
@@ -424,3 +428,111 @@ def test_nll_floor_threads_from_args_through_model_to_objective() -> None:
 
     assert V3ConvergedModel(n_parcels=4).objective.nll_floor is True  # default = r4
     assert V3ConvergedModel(n_parcels=4, nll_floor=False).objective.nll_floor is False
+
+
+def _write_state_stats(tmp_path, subject_id: int, n_parcels: int = 64):
+    """Frozen per-(parcel-value, dim) state-norm table — identity normalization. Presence
+    of the dir is what opts the secondary IN (session_loader._load_state_stats)."""
+    import numpy as np
+
+    d = tmp_path / "stats"
+    d.mkdir(parents=True, exist_ok=True)
+    np.savez(d / f"sub-{subject_id}.npz",
+             stat_mean=np.zeros((n_parcels, 6), dtype=np.float32),
+             stat_std=np.ones((n_parcels, 6), dtype=np.float32))
+    return str(d)
+
+
+def test_arm3_forks_an_nll_checkpoint_despite_owning_no_covariance_head(tmp_path) -> None:
+    """r5 Arm 3 forks r4's step-10000 ckpt — written by a model that HAD a chol_head that
+    Arm 3's point head does not own. Two ways that can go wrong, both silent-to-reason-about
+    and neither allowed to be assumed:
+
+      1. STATE_DICT: a strict load must reject the 2 unexpected chol_head keys. If it does,
+         the fork needs those keys stripped, and this test is what proves the stripping is
+         necessary AND sufficient.
+      2. OPTIMIZER: AdamW state is restored BY POSITION within each param group, so 2 fewer
+         trainable params can shift every later index. The restored ``global_step`` must be
+         the ckpt's (10000 in the real run, 4 here) and NOT 0 — a silent cold start is the
+         exact failure Ben hit with the v2 exca recipe.
+
+    The perceiver is at INIT in the real fork (λ=0 for the whole 0→10k prefix, so it took
+    no gradient), which is WHY dropping its covariance weights costs nothing scientifically.
+    """
+    import torch
+
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    stats_dir = _write_state_stats(tmp_path, subject_id=1)
+
+    def _build(secondary_loss):
+        specs = load_v3_sessions(
+            sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+            parcel_fn=_stub_parcel_fn, state_stats_dir=stats_dir,
+        )
+        module, dm, _ = build_v3_training(
+            specs, _smoke_args(state_stats_dir=stats_dir, secondary_loss=secondary_loss)
+        )
+        return module, dm
+
+    ckpt_dir = tmp_path / "ck_nll"
+    m_nll, dm_nll = _build("nll")
+    _cpu_trainer(4, ckpt_dir=ckpt_dir).fit(m_nll, datamodule=dm_nll)
+    last = ckpt_dir / "last.ckpt"
+    sd = torch.load(last, weights_only=False)["state_dict"]
+    chol_keys = [k for k in sd if "chol_head" in k]
+
+    # (1) does a strict load of the NLL ckpt into the POINT model actually reject?
+    m_l1, dm_l1 = _build("l1")
+    strict_rejected = False
+    try:
+        m_l1.load_state_dict(sd, strict=True)
+    except RuntimeError as e:
+        strict_rejected = "chol_head" in str(e)
+
+    # (2) a NAIVE strip (state_dict only) must NOT be enough — it leaves the optimizer
+    #     param groups the wrong size. Pinning this is the point: it is why
+    #     fork_point_ckpt exists rather than a one-line dict comprehension.
+    naive = ckpt_dir / "fork-naive.ckpt"
+    ck = torch.load(last, weights_only=False)
+    ck["state_dict"] = {k: v for k, v in ck["state_dict"].items() if "chol_head" not in k}
+    torch.save(ck, naive)
+    naive_err = ""
+    try:
+        m_n, dm_n = _build("l1")
+        _cpu_trainer(4).fit(m_n, datamodule=dm_n, ckpt_path=str(naive))
+    except Exception as e:
+        naive_err = type(e).__name__
+    naive_rejected = naive_err != ""
+
+    # (3) the REAL fork: strip + remap the optimizer state BY NAME.
+    m_old, _ = _build("nll")
+    m_new, _ = _build("l1")
+    old_names = optimizer_param_names(m_old)
+    new_names = optimizer_param_names(m_new)
+    forked_ck, rep = fork_to_point_ckpt(
+        torch.load(last, weights_only=False), old_names, new_names
+    )
+    good = ckpt_dir / "fork-point.ckpt"
+    torch.save(forked_ck, good)
+
+    m_l1b, dm_l1b = _build("l1")
+    t = _cpu_trainer(4)  # max_steps == restore step => resume then stop immediately
+    forked, err = True, ""
+    try:
+        t.fit(m_l1b, datamodule=dm_l1b, ckpt_path=str(good))
+    except Exception as e:
+        forked, err = False, f"{type(e).__name__}: {e}"
+
+    ok_step = forked and t.global_step == 4
+    only_chol = all("chol_head" in n for n in rep["optimizer_params_dropped"])
+    ok = bool(chol_keys) and strict_rejected and naive_rejected and forked and ok_step \
+        and only_chol
+    print(f"[check] fork: ckpt chol keys={len(chol_keys)}; strict load into the point model "
+          f"REJECTED={strict_rejected}; NAIVE state_dict-only strip also rejected="
+          f"{naive_rejected} ({naive_err or 'no error!'}) => the optimizer remap is REQUIRED")
+    print(f"[check] remapped fork: dropped optimizer params={rep['optimizer_params_dropped']} "
+          f"(only chol_head={only_chol}); {rep['n_params_in']}->{rep['n_params_out']} params; "
+          f"loaded={forked}{(' err=' + err) if err else ''}; restored global_step="
+          f"{t.global_step if forked else 'n/a'} (want 4, cold=0) {'OK' if ok else 'VIOLATED'}")
+    assert ok
