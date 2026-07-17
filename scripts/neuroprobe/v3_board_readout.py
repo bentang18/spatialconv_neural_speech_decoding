@@ -49,12 +49,40 @@ Usage (CPU, NCSA Delta; --mem>=64G):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
+import multiprocessing as mp
 import os
+import time
 
 import numpy as np
 import torch
+
+# ── phase timing ───────────────────────────────────────────────────────────────────
+# The 20263259 array ran shards at 98-581% of 8 cores: some were single-threaded for
+# 20 min while others sat in threaded BLAS. I diagnosed that serial phase twice from
+# the armchair (torch.load; then the fp16->fp32 gather) and was WRONG BOTH TIMES —
+# read_bytes showed the file fully read while state=R, and the gather measured 4.8
+# min/shard. So the code now MEASURES instead of me guessing: every shard prints its
+# own phase budget, and the next optimization argues from this table or not at all.
+_PH: dict = {}
+
+
+@contextlib.contextmanager
+def _timed(name):
+    t = time.perf_counter()
+    try:
+        yield
+    finally:
+        _PH[name] = _PH.get(name, 0.0) + (time.perf_counter() - t)
+
+
+def _phase_report(label) -> None:
+    tot = sum(_PH.values()) or 1.0
+    print(f"[phase] {label} — wall budget by phase (total {tot / 60:.1f} min):", flush=True)
+    for k, v in sorted(_PH.items(), key=lambda kv: -kv[1]):
+        print(f"[phase]   {k:22s} {v / 60:7.2f} min  {100 * v / tot:5.1f}%", flush=True)
 
 # The 15 Neuroprobe leaderboard tasks — verified == upstream neuroprobe.config.NEUROPROBE_TASKS.
 BOARD_TASKS = (
@@ -114,10 +142,11 @@ def _standardize(z_tr, others):
     BatchNorm WITHOUT affine before the linear head, and BN at eval uses statistics
     accumulated over probe TRAINING — i.e. train-set stats, which in CS means the ANCHOR's.
     """
-    mu = z_tr.mean(axis=0)
-    sd = z_tr.std(axis=0)
-    sd[sd == 0] = 1.0
-    return (z_tr - mu) / sd, [(z - mu) / sd for z in others]
+    with _timed("standardize"):
+        mu = z_tr.mean(axis=0)
+        sd = z_tr.std(axis=0)
+        sd[sd == 0] = 1.0
+        return (z_tr - mu) / sd, [(z - mu) / sd for z in others]
 
 
 def _standardize_per_domain(z_tr, z_va, z_te):
@@ -150,12 +179,18 @@ def _standardize_per_domain(z_tr, z_va, z_te):
 
 
 def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
-    """(n,|P|,F) fp16 cache → rows (and optionally parcel columns) → flat fp32 (r, ·)."""
-    x = rec["feats"][enc]["raw"][np.asarray(rows, dtype=np.int64)]
-    if col_idx is not None:
-        x = x[:, np.asarray(col_idx, dtype=np.int64)]
-    x = x.to(torch.float32).numpy()
-    return x.reshape(x.shape[0], -1)
+    """(n,|P|,F) fp16 cache → rows (and optionally parcel columns) → flat fp32 (r, ·).
+
+    Under --mmap this is where the cache is actually READ: the gather touches only the
+    requested rows' pages, so a tap never gathered is never paged in at all.
+    """
+    with _timed("gather_fp16"):
+        x = rec["feats"][enc]["raw"][np.asarray(rows, dtype=np.int64)]
+        if col_idx is not None:
+            x = x[:, np.asarray(col_idx, dtype=np.int64)]
+    with _timed("to_fp32"):
+        x = x.to(torch.float32).numpy()
+        return x.reshape(x.shape[0], -1)
 
 
 def _lam_grid(z_tr, y_tr, evals):
@@ -168,17 +203,22 @@ def _lam_grid(z_tr, y_tr, evals):
     """
     if len(y_tr) < 2:
         return {name: {m: float("nan") for m in LAM_MULTS} for name in evals}
-    g = np.asarray(z_tr @ z_tr.T, dtype=np.float64)             # fp32 GEMM → fp64 Gram
+    with _timed("gram_gemm"):
+        g = np.asarray(z_tr @ z_tr.T, dtype=np.float64)         # fp32 GEMM → fp64 Gram
     n = g.shape[0]
-    w, V = np.linalg.eigh(g)                                    # G symmetric PSD ⇒ w >= 0
+    with _timed("eigh"):
+        w, V = np.linalg.eigh(g)                                # G symmetric PSD ⇒ w >= 0
     c = V.T @ np.asarray(y_tr, dtype=np.float64)
     base = float(np.sum(w) / max(n, 1))                         # trace(G)/n — the λ scale
-    kern = {name: np.asarray(z @ z_tr.T, dtype=np.float64) for name, (z, _) in evals.items()}
+    with _timed("eval_kernels"):
+        kern = {name: np.asarray(z @ z_tr.T, dtype=np.float64)
+                for name, (z, _) in evals.items()}
     out: dict = {name: {} for name in evals}
-    for m in LAM_MULTS:
-        alpha = V @ (c / (w + m * base))
-        for name, (_, y) in evals.items():
-            out[name][m] = (auroc(kern[name] @ alpha, y) if len(y) >= 2 else float("nan"))
+    with _timed("lam_sweep"):
+        for m in LAM_MULTS:
+            alpha = V @ (c / (w + m * base))
+            for name, (_, y) in evals.items():
+                out[name][m] = (auroc(kern[name] @ alpha, y) if len(y) >= 2 else float("nan"))
     return out
 
 
@@ -300,25 +340,76 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
     return {"cells": _grid_cells(grid), "n_parcels": int(common.size)}
 
 
-def _load(cache_dir, session, tag):
+def _load(cache_dir, session, tag, mmap=True):
+    """Load a session cache. ``mmap=True`` makes the read LAZY and therefore SELECTIVE.
+
+    Measured on enc_s2_t4 (43 GB file): eager torch.load takes minutes and resides the whole
+    file; mmap=True returns in 0.5 s at 0.5 GB RSS, and pages arrive only where a tensor is
+    actually indexed. Two consequences, both of which the 20263259 array paid for:
+
+      1. A CS shard uses ONLY the parcel-mean taps but eagerly pulled the 34 GB enc12_elec
+         tensor it never touches — that waste, not the fits, set the 160 G floor and throttled
+         the array to 4 concurrent shards. Under mmap the tap is never gathered, so it is
+         never read. The selection needs no tap-filter argument: not touching IS not loading.
+      2. A WS shard gathers ~1750 of 10768 rows per fit, so it reads a fraction of the file
+         instead of all of it.
+
+    The risk mmap trades for: reads become scattered rather than one sequential 43 GB stream,
+    and pages evicted under cgroup pressure are re-read. Each row is a contiguous 3.2 MB and
+    upstream hands us SORTED indices, so the access is ascending and semi-sequential — but
+    that is an argument, not a measurement, which is why this is a flag and why every shard
+    prints its phase budget. A/B it (--no-mmap) on one WS shard before trusting it.
+    """
     s, t = session
     return torch.load(f"{cache_dir}/enc_s{s}_t{t}_{tag}.pt", map_location="cpu",
-                      weights_only=False)
+                      weights_only=False, mmap=mmap)
 
 
 # ── sharded units (one SLURM array task each; all cells are independent) ────────────
-def _ws_shard(cache_dir, tag, session, taps=WS_TAPS) -> dict:
-    rec = _load(cache_dir, session, tag)
-    cells = {f"{tag}|{task}": _ws_cell(rec, task, taps) for task in BOARD_TASKS}
-    return {"kind": "ws", "name": f"S{session[0]}T{session[1]}", "cells": cells}
+# The 15 board tasks within a shard are independent and share the loaded cache, so a shard is
+# itself embarrassingly parallel — but the 20263259 array ran them SERIALLY on 8 cores, which
+# is why shards sat at ~100% CPU (1 core of 8) for long stretches. _map_tasks forks AFTER the
+# cache is opened: children inherit it copy-on-write (and under mmap share the page cache
+# outright), so the per-task serial work (gather / fp32 / standardize) of one task overlaps
+# the threaded BLAS of another instead of stalling behind it.
+#
+# Memory is the ceiling, not cores: a WS worker's private fp32 slices are ~22 GB for the
+# enc12_elec tap and ~44 GB while a norm's standardized copy coexists with the raw one, so
+# --workers must be set against --mem (WS ~3, CS ~8 — CS's parcel taps are ~40x smaller).
+# Give each worker its own BLAS threads via OMP_NUM_THREADS = cpus-per-task / workers.
+_SHARED: dict = {}
 
 
-def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS) -> dict:
+def _task_worker(task):
+    """Runs in a forked child. Reads the cache from _SHARED — NEVER take it as an argument:
+    Pool pickles arguments, which would serialize a multi-GB cache per task."""
+    fn, taps = _SHARED["fn"], _SHARED["taps"]
+    return task, fn(task, taps)
+
+
+def _map_tasks(fn, taps, workers) -> dict:
+    """{task: cell} over BOARD_TASKS, optionally across forked workers."""
+    if workers <= 1:
+        return {task: fn(task, taps) for task in BOARD_TASKS}
+    _SHARED["fn"], _SHARED["taps"] = fn, taps          # set BEFORE fork ⇒ inherited, not pickled
+    with mp.get_context("fork").Pool(workers) as pool:
+        return dict(pool.map(_task_worker, BOARD_TASKS))
+
+
+def _ws_shard(cache_dir, tag, session, taps=WS_TAPS, workers=1, mmap=True) -> dict:
+    rec = _load(cache_dir, session, tag, mmap=mmap)
+    out = _map_tasks(lambda task, tp: _ws_cell(rec, task, tp), taps, workers)
+    return {"kind": "ws", "name": f"S{session[0]}T{session[1]}",
+            "cells": {f"{tag}|{k}": v for k, v in out.items()}}
+
+
+def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS, workers=1, mmap=True) -> dict:
     taps = tuple(t for t in taps if t not in ELEC_TAPS)   # CS is parcel-bridged by necessity
-    anchor_rec = _load(cache_dir, CS_TRAIN_ANCHOR, tag)
-    test_rec = _load(cache_dir, cell, tag)
-    cells = {f"{tag}|{task}": _cs_cell(anchor_rec, test_rec, task, taps) for task in BOARD_TASKS}
-    return {"kind": "cs", "name": f"S{cell[0]}T{cell[1]}", "cells": cells}
+    anchor_rec = _load(cache_dir, CS_TRAIN_ANCHOR, tag, mmap=mmap)
+    test_rec = _load(cache_dir, cell, tag, mmap=mmap)
+    out = _map_tasks(lambda task, tp: _cs_cell(anchor_rec, test_rec, task, tp), taps, workers)
+    return {"kind": "cs", "name": f"S{cell[0]}T{cell[1]}",
+            "cells": {f"{tag}|{k}": v for k, v in out.items()}}
 
 
 def _blank(tags) -> dict:
@@ -458,6 +549,12 @@ def main() -> None:
     p.add_argument("--mode", choices=("all", "ws", "cs", "merge"), default="all")
     p.add_argument("--index", type=int, help="shard index (mode=ws|cs)")
     p.add_argument("--shard-dir")
+    p.add_argument("--workers", type=int, default=1,
+                   help="fork this many task-workers per shard (memory-bound: WS ~3, CS ~8). "
+                        "Set OMP_NUM_THREADS = cpus-per-task / workers.")
+    p.add_argument("--no-mmap", action="store_true",
+                   help="eagerly load the whole cache (the pre-2026-07-17 behaviour). Use to "
+                        "A/B the mmap path on one shard before trusting it.")
     p.add_argument("--taps", default="",
                    help=f"comma-separated subset of {WS_TAPS} (default: all; CS drops "
                         f"{ELEC_TAPS} automatically)")
@@ -473,12 +570,18 @@ def main() -> None:
         cells = LITE_SESSIONS if args.mode == "ws" else CS_TEST_CELLS
         cell = cells[args.index]
         fn = _ws_shard if args.mode == "ws" else _cs_shard
-        sh = fn(args.cache_dir, tags[0], cell, taps)
+        t0 = time.perf_counter()
+        sh = fn(args.cache_dir, tags[0], cell, taps, workers=args.workers,
+                mmap=not args.no_mmap)
         os.makedirs(args.shard_dir, exist_ok=True)
         out = f"{args.shard_dir}/{args.mode}_{sh['name']}.json"
         with open(out, "w") as f:
             json.dump(sh, f, indent=2)
         print(f"wrote {out}", flush=True)
+        # Phase totals are per-PROCESS: with --workers>1 the children's timers die with them,
+        # so this table is the parent's view (load + merge) only. Profile with --workers 1.
+        _phase_report(f"{args.mode} {sh['name']} workers={args.workers} "
+                      f"mmap={not args.no_mmap} wall={(time.perf_counter() - t0) / 60:.1f} min")
         return
 
     res = _merge(tags, args.shard_dir) if args.mode == "merge" else _compute_all(

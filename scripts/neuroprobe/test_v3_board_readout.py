@@ -238,3 +238,37 @@ def test_merge_carries_the_lambda_pin_flag_to_the_report() -> None:
         "tg|onset": {"cells": {"enc12|std": {"test": 0.9, "lam_pinned": True},
                                "enc12|raw": {"test": 0.9, "lam_pinned": False}}}}})
     assert res["tg|onset"]["pinned"] == {"ws:enc12|std": ["S2T0"]}
+
+
+def test_map_tasks_forked_gives_identical_results_to_serial() -> None:
+    """Ben 2026-07-17: fork-over-tasks is a THROUGHPUT change and must be a NUMERICAL no-op.
+    The failure it guards against is silent — a forked worker that mis-shares state returns
+    plausible numbers, not an error. So: same input, both paths, byte-identical output."""
+    from scripts.neuroprobe.v3_board_readout import _map_tasks
+
+    rec = _rec(seed=3)
+    fn = lambda task, tp: _ws_cell(rec, task, tp)      # a lambda: fork inherits, never pickles
+    serial = _map_tasks(fn, ("enc12",), workers=1)
+    forked = _map_tasks(fn, ("enc12",), workers=2)
+    assert set(serial) == set(forked) == set(BOARD_TASKS)
+    for t in BOARD_TASKS:
+        for gk in serial[t]["cells"]:
+            a, b = serial[t]["cells"][gk]["test"], forked[t]["cells"][gk]["test"]
+            assert a == b or (np.isnan(a) and np.isnan(b)), f"{t}|{gk}: {a} != {b}"
+
+
+def test_load_mmap_flag_reaches_torch_load() -> None:
+    """mmap is the fix for the 34 GB a CS shard read and never used. Pin that the flag is
+    actually threaded through to torch.load rather than silently defaulting."""
+    import scripts.neuroprobe.v3_board_readout as B
+
+    seen = {}
+    orig = B.torch.load
+    B.torch.load = lambda path, **kw: seen.update(kw) or {"ok": True}
+    try:
+        B._load("/cache", (2, 4), "tg")
+        assert seen["mmap"] is True
+        B._load("/cache", (2, 4), "tg", mmap=False)
+        assert seen["mmap"] is False
+    finally:
+        B.torch.load = orig
