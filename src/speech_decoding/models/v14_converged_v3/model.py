@@ -60,6 +60,7 @@ class V3ConvergedModel(nn.Module):
         deep_sup: bool = True,
         lambda_nll: float = LAMBDA_NLL,
         nll_floor: bool = True,
+        secondary_loss: str = "nll",
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -70,9 +71,12 @@ class V3ConvergedModel(nn.Module):
         # per-session frozen state-stats are supplied (secondary opt-in).
         # nll_floor=False is r5 Arm 2 (floor-off): the head learns Sigma with no measured
         # noise floor. Like lambda_nll it only bites when the secondary is opted in.
+        # secondary_loss="l1" is r5 Arm 3 (point loss): mu-only head, no covariance
+        # parameters at all. L1 (not L2) is measured — see V3JepaObjective.__init__.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
             lambda_nll=lambda_nll, nll_floor=nll_floor,
+            secondary_loss=secondary_loss,
         )
         self.mask_cfg = mask_cfg
 

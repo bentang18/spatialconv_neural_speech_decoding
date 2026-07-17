@@ -164,6 +164,7 @@ class PerceiverHead(nn.Module):
         n_heads: int = N_PERC_HEADS,
         m_latents: int = M_LATENTS,
         l_sa: int = L_SA,
+        point_only: bool = False,
     ) -> None:
         super().__init__()
         self.d_perc = d_perc
@@ -185,7 +186,8 @@ class PerceiverHead(nn.Module):
         # decode-query CONTENT = parcel identity (NOT a near-zero additive prior — it IS
         # the query seed, so init at the normal 0.02 so queries are distinguishable).
         self.parcel_emb = ParcelIdentityEmbed(n_parcels, d_perc, init_std=0.02)
-        self.head = GaussianStateHead(d_perc)
+        # point_only (r5 Arm 3): mu-only head, no covariance parameters at all.
+        self.head = GaussianStateHead(d_perc, point_only=point_only)
         self.apply(init_transformer_weights)  # V-JEPA trunc_normal(0.02); skips Embedding
         nn.init.trunc_normal_(self.latents, std=0.02)
 

@@ -38,6 +38,7 @@ from speech_decoding.models.v14_converged_v3.masking import V3Masks
 from speech_decoding.models.v14_converged_v3.monitor_taps import (
     cov_entropy_vs_floor,
     per_band_jepa_stats,
+    per_band_l1,
     per_band_nll,
 )
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
@@ -55,6 +56,7 @@ from speech_decoding.models.v14_converged_v3.secondary_head import (
     NLL_FLOOR_JITTER,
     STATE_DIM,
     count_dependent_noise_var,
+    present_masked_l1,
     present_masked_nll,
 )
 from speech_decoding.models.v14_converged_v3.state_target import (
@@ -148,11 +150,25 @@ class V3JepaObjective(nn.Module):
         deep_sup: bool = True,
         lambda_nll: float = LAMBDA_NLL,
         nll_floor: bool = True,
+        secondary_loss: str = "nll",
     ) -> None:
         super().__init__()
         self.deep_sup = bool(deep_sup)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         self.lambda_nll = float(lambda_nll)
+        # r5 Arm 3. "nll" (r1–r4, the default) = the full-covariance Gaussian NLL. "l1" =
+        # POINT loss: the head emits mu only and is scored by present_masked_l1, so the arm
+        # asks whether the second moment earns its keep at all.
+        # L1 and not L2 is MEASURED, not assumed: at Sigma=I the Gaussian NLL collapses to
+        # 0.5·‖r‖²+const, i.e. L2 IS "Gaussian residuals" and L1 IS "Laplace residuals".
+        # M18 (probe_v3_residual_tailweight, 2026-07-16) split each parcel's electrodes in
+        # half and measured the excess kurtosis of the half-state difference — 5/6 dims sit
+        # ABOVE the Laplace pole by >=3 SEM (hga_mu +10.4 vs a +0.41 laplace control), so
+        # the residual is heavier-tailed than Laplace and L1 is strictly the closer of the
+        # two. See present_masked_l1's docstring for the table.
+        if secondary_loss not in ("nll", "l1"):
+            raise ValueError(f"secondary_loss must be 'nll' or 'l1', got {secondary_loss!r}")
+        self.secondary_loss = secondary_loss
         # r5 Arm 2. True (r1–r4, the default) = the measured count-dependent floor. False =
         # floor-off: Sigma is L Lᵀ + NLL_FLOOR_JITTER·I, i.e. the head learns its own
         # covariance instead of being handed one. r4 evidence motivating the arm (wandb
@@ -192,7 +208,11 @@ class V3JepaObjective(nn.Module):
         # concat (1024) the CONTEXT encoder emits, so it exists ONLY under deep_sup; the
         # single-tap ablation arm has no secondary. Its own fusion (1024→d_perc) is SEPARATE
         # from enc_to_pred — the shared trunk is the ENCODER, not the fusion.
-        self.perceiver = PerceiverHead(n_parcels=n_parcels) if self.deep_sup else None
+        self.perceiver = (
+            PerceiverHead(n_parcels=n_parcels, point_only=self.secondary_loss == "l1")
+            if self.deep_sup
+            else None
+        )
 
     def forward(
         self,
@@ -378,14 +398,26 @@ class V3JepaObjective(nn.Module):
         present_q = present.repeat_interleave(S, dim=0)  # (Q, 6)
         target_q = target.reshape(B, Q, target.shape[-1])
         present_q_full = present_q[None].expand(B, Q, present_q.shape[-1])  # (B, Q, 6)
-        nll = present_masked_nll(mu, cov, target_q, present_q_full)
+        if self.secondary_loss == "l1":  # r5 Arm 3 — point head, cov is None
+            nll = present_masked_l1(mu, target_q, present_q_full)
+        else:
+            nll = present_masked_nll(mu, cov, target_q, present_q_full)
         aux = None
         if collect_taps:  # per-band NLL (#41) + predicted-cov entropy vs floor (#42)
             with torch.no_grad():
-                aux = {
-                    **per_band_nll(mu, cov, target_q, present_q_full),
-                    **cov_entropy_vs_floor(cov, noise[None].expand(B, Q, noise.shape[-1])),
-                }
+                if self.secondary_loss == "l1":
+                    # cov does not exist on this arm, so #42 (entropy vs floor) has no
+                    # referent. The per-band split still does — it is the diagnostic that
+                    # shows WHICH band the secondary is actually learning, and dropping it
+                    # would leave Arm 3 blind exactly where r4's flatline was found.
+                    aux = per_band_l1(mu, target_q, present_q_full)
+                else:
+                    aux = {
+                        **per_band_nll(mu, cov, target_q, present_q_full),
+                        **cov_entropy_vs_floor(
+                            cov, noise[None].expand(B, Q, noise.shape[-1])
+                        ),
+                    }
             # processed-latent bank (B, S·M, d_perc), raw — reduced by the callback's
             # perceiver-health monitor (RankMe/feat_std via the shared _rank_and_std path,
             # dead-frac + latent-latent cosine). Detached: monitor-only, never in backward.

@@ -133,6 +133,7 @@ class GaussianStateHead(nn.Module):
         *,
         dim: int = STATE_DIM,
         noise_var: tuple[float, ...] = NOISE_VAR,
+        point_only: bool = False,
     ) -> None:
         super().__init__()
         if len(noise_var) != dim:
@@ -141,8 +142,16 @@ class GaussianStateHead(nn.Module):
             raise ValueError("noise_var must be strictly positive (it is the PD floor)")
         self.dim = dim
         self.n_tril = dim * (dim + 1) // 2
+        # r5 Arm 3 (point loss): the head emits mu ONLY and forward returns cov=None.
+        # chol_head is NOT CONSTRUCTED rather than merely unused — a point loss touches no
+        # covariance parameter, so leaving the Linear in place would hand DDP a parameter
+        # that never receives a gradient, which is the X1 failure class that killed r3
+        # (find_unused_parameters=False asserts every param contributes to the loss). Not
+        # constructing it also makes the arm's claim structural: Arm 3 IS "the second
+        # moment does not exist", not "the second moment exists and is ignored".
+        self.point_only = bool(point_only)
         self.mu_head = nn.Linear(d_in, dim)
-        self.chol_head = nn.Linear(d_in, self.n_tril)
+        self.chol_head = None if self.point_only else nn.Linear(d_in, self.n_tril)
         # fixed measurement-noise floor; buffer => saved, moved with .to(), no grad/decay.
         self.register_buffer("noise_var", torch.tensor(noise_var, dtype=torch.float32))
         # lower-tri scatter indices, computed once.
@@ -154,8 +163,10 @@ class GaussianStateHead(nn.Module):
 
     def forward(
         self, feat: Tensor, noise: Tensor | None = None
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None]:
         """``feat`` (..., d_in) → (``mu`` (..., dim), ``cov`` (..., dim, dim)).
+
+        Under ``point_only`` (r5 Arm 3) ``cov`` is None — there is no covariance head.
 
         ``noise`` (..., dim) optional PER-POSITION PD floor — the count-dependent floor
         keyed on each query's parcel electrode count (:func:`count_dependent_noise_var`,
@@ -164,6 +175,8 @@ class GaussianStateHead(nn.Module):
         Either way ``cov = L Lᵀ + diag(floor)`` stays strictly PD, so the head remains the
         SOLE owner of positive-definiteness (the objective never sees a singular cov)."""
         mu = self.mu_head(feat)
+        if self.chol_head is None:  # r5 Arm 3 — point head, there is no second moment
+            return mu, None
         # Assemble the covariance in fp32. Under bf16 autocast the chol_head Linear emits
         # bf16, and a bf16 ``L @ Lᵀ`` (+ floor) is NOT reliably PD for a 6×6 covariance once
         # training drifts L ill-conditioned — cholesky then fails mid-run (a STOCHASTIC crash
@@ -250,6 +263,43 @@ def present_masked_nll(
     mean_marg = _nll_terms(mu[..., :n_mean], cov[..., :n_mean, :n_mean], x[..., :n_mean])
     per_pos = torch.where(std_all, full, mean_marg)  # (...,)
     return per_pos.mean()
+
+
+def present_masked_l1(mu: Tensor, x: Tensor, present: Tensor) -> Tensor:
+    """Mean per-position SUM of |x − mu| over PRESENT dims — r5 Arm 3's POINT loss.
+
+    The reduction is the exact twin of :func:`present_masked_nll`: that scores each
+    position on its present dims (summing over them inside ``_nll_terms``) and then means
+    over positions, so this sums |r| over the present dims and means over positions. Same
+    denominator, same masking ⇒ the ONLY difference between Arm 3 and Arm 1 is the loss
+    form, which is what makes it an ablation rather than two unrelated runs.
+
+    WHY L1 AND NOT L2 (M18, measured 2026-07-16 — probe_v3_residual_tailweight).
+    L2 is not a neutral default: at Σ=I the Gaussian NLL IS ``0.5·‖r‖² + const`` (see
+    ``_nll_terms``), so L2 asserts GAUSSIAN residuals and L1 asserts LAPLACE ones. M18
+    measured the assertion instead of arguing it — split each parcel's electrodes in half,
+    take the difference of the two half-states (the parcel's true state cancels, leaving
+    pure sampling noise with the model removed) and read its excess kurtosis against
+    synthetic gauss/laplace controls pushed through the identical pipeline:
+
+        dim      gauss ctl      REAL      laplace ctl
+        slow_mu     -0.005    + 3.646        +0.440
+        mid_mu      -0.008    + 2.476        +0.404
+        hga_mu      +0.000    +10.364        +0.411
+
+    5/6 dims sit ABOVE the laplace pole by ≥3 SEM. So the residual is heavier-tailed than
+    Laplace, L1 is strictly the closer of the two, and L2 is the worse choice. (Neither is
+    the TRUE noise model — a Huber/Student-t would fit better, but that adds a second axis
+    to an ablation whose whole point is isolating one. Logged as a follow-up, not smuggled
+    in here.) The controls are load-bearing: the state is a MEAN over electrodes, so the
+    CLT drags a Laplace electrode's kurtosis 3.0 down to +0.4 by the time it reaches the
+    parcel state — reading the real data against a hard-coded 3.0 would have been wrong.
+
+    ``mu``/``x`` (..., D), ``present`` (..., D) bool. Absent dims contribute 0 — the target
+    is SET to 0 there by ``state_target.normalize_target`` while ``mu`` is free, so the
+    mask is what keeps the head from being scored on a value that carries no information."""
+    r = (x - mu).abs() * present.to(x.dtype)
+    return r.sum(-1).mean()
 
 
 def gaussian_entropy(cov: Tensor) -> Tensor:

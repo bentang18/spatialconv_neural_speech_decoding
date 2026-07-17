@@ -241,6 +241,7 @@ def build_v3_training(
         deep_sup=getattr(args, "deep_sup", True),
         lambda_nll=getattr(args, "lambda_nll", LAMBDA_NLL),
         nll_floor=getattr(args, "nll_floor", True),
+        secondary_loss=getattr(args, "secondary_loss", "nll"),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -496,6 +497,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "noise floor. --no-nll-floor is r5 Arm 2 (floor-off): the head learns "
                         f"Sigma with only a {NLL_FLOOR_JITTER:g} conditioning jitter, no "
                         "measured floor. No effect without --state-stats-dir.")
+    p.add_argument("--secondary-loss", dest="secondary_loss",
+                   choices=("nll", "l1"), default="nll",
+                   help="'nll' (default, r1–r4): full-covariance Gaussian NLL. 'l1' is r5 "
+                        "Arm 3 (POINT loss): the head emits mu only — the covariance Linear "
+                        "is NOT constructed — and is scored by mean per-position sum|x-mu| "
+                        "over present dims. L1 rather than L2 is MEASURED (M18, "
+                        "probe_v3_residual_tailweight 2026-07-16): at Sigma=I the Gaussian "
+                        "NLL IS 0.5*||r||^2, so L2 asserts Gaussian residuals; the split-half "
+                        "electrode difference reads 5/6 dims ABOVE the Laplace pole by >=3 "
+                        "SEM, so L1 is strictly the closer of the two. No effect without "
+                        "--state-stats-dir.")
     p.add_argument("--nll-warmup-start-step", dest="nll_warmup_start_step",
                    type=int, default=0,
                    help="opt-step at which the secondary-NLL λ ramp OPENS. Before it, λ=0 "

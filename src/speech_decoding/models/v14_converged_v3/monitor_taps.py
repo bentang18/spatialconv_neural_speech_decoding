@@ -97,6 +97,26 @@ def per_band_nll(
     return out
 
 
+def per_band_l1(mu: Tensor, target_q: Tensor, present_q: Tensor) -> dict[str, Tensor]:
+    """Per-band POINT-loss split (r5 Arm 3) — the cov-free twin of :func:`per_band_nll`.
+
+    Band ``b`` owns dims ``[b, b+3]`` (its mean + its std). Keys are ``nll_{band}`` — NOT
+    a mislabel: the trainer logs the secondary term under one name across arms, so Arm 3's
+    per-band curve lands on the same wandb panel as r4's and the two are readable side by
+    side. The VALUES are not comparable across arms (nats vs |r|); the arm is."""
+    n_mean = target_q.shape[-1] // 2  # 3
+    pres = present_q.to(mu.dtype)
+    out: dict[str, Tensor] = {}
+    for b, name in enumerate(BAND_NAMES):
+        idx = [b, b + n_mean]
+        # sum |r| over the band's 2 dims, weighted-mean over positions where its std is
+        # present — the same weighting per_band_nll uses, so the panels align.
+        l1_pos = (target_q[..., idx] - mu[..., idx]).abs().sum(-1)  # (B, Q)
+        wpos = pres[..., b + n_mean]
+        out[f"nll_{name}"] = (l1_pos * wpos).sum() / wpos.sum().clamp_min(1.0)
+    return out
+
+
 def cov_entropy_vs_floor(cov: Tensor, noise: Tensor) -> dict[str, Tensor]:
     """Predicted-cov differential entropy vs the noise-floor ceiling, meaned over positions.
 
