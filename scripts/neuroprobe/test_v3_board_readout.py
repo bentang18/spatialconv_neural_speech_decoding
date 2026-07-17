@@ -19,6 +19,7 @@ from scripts.neuroprobe.v3_board_readout import (
     LITE_SESSIONS,
     _absorb,
     _blank,
+    auroc,
     _cs_cell,
     _finalize,
     _lam_grid,
@@ -113,13 +114,41 @@ def test_select_lam_all_nan_val_is_nan_not_a_default_lambda() -> None:
     assert np.isnan(got["test"]) and np.isnan(got["lam_mult"])
 
 
-def test_select_lam_flags_lambda_pinned_to_a_grid_boundary() -> None:
-    """A boundary argmax means the optimum is OUTSIDE the grid: the AUROC is a truncation
-    artifact that looks exactly like a fit. It must reach the report."""
-    assert _select_lam({"val": {LAM_MULTS[-1]: 0.9},
-                        "test": {LAM_MULTS[-1]: 0.8}})["lam_pinned"] is True
+def test_select_lam_flags_only_the_LO_boundary_as_truncation() -> None:
+    """The two boundaries are different failures, and only LO invalidates a fit.
+
+    HI is benign: AUROC saturates as λ→∞ (the smoother w/(w+λ)→0 uniformly, so the ranking — and
+    hence the AUROC — converges; see test_auroc_saturates_at_high_lambda). "Maximal shrinkage
+    won" is a faithful answer, not an artifact, and widening the grid cannot change it.
+    LO has no such limit: λ→0 keeps moving, so a LO argmax really is truncated.
+    """
+    hi = _select_lam({"val": {LAM_MULTS[-1]: 0.9}, "test": {LAM_MULTS[-1]: 0.8}})
+    assert hi["lam_pin"] == "hi" and hi["lam_pinned"] is False
+
+    lo = _select_lam({"val": {LAM_MULTS[0]: 0.9}, "test": {LAM_MULTS[0]: 0.8}})
+    assert lo["lam_pin"] == "lo" and lo["lam_pinned"] is True
+
     mid = LAM_MULTS[len(LAM_MULTS) // 2]
-    assert _select_lam({"val": {mid: 0.9}, "test": {mid: 0.8}})["lam_pinned"] is False
+    got = _select_lam({"val": {mid: 0.9}, "test": {mid: 0.8}})
+    assert got["lam_pin"] == "" and got["lam_pinned"] is False
+
+
+def test_auroc_saturates_at_high_lambda() -> None:
+    """The measurement the LO/HI split rests on: past some λ the AUROC stops moving entirely, so
+    a HI pin cannot be hiding a better score further out.
+
+    As λ→∞, α = V diag(1/(w+λ)) Vᵀ y → (1/λ)·y, so the scores → (1/λ)·K@y — a POSITIVE rescale of
+    K@y, which AUROC is invariant to. So the top of the grid already IS the limit.
+    """
+    rng = np.random.default_rng(0)
+    z_tr = rng.normal(size=(60, 8))
+    y_tr = (z_tr[:, 0] + 0.3 * rng.normal(size=60) > 0).astype(float)
+    z_te = rng.normal(size=(40, 8))
+    y_te = (z_te[:, 0] > 0).astype(float)
+
+    g = _lam_grid(z_tr, y_tr, {"test": (z_te, y_te)})
+    limit = auroc(np.asarray(z_te @ z_tr.T) @ y_tr, y_te)
+    assert g["test"][LAM_MULTS[-1]] == limit
 
 
 def test_lambda_grid_brackets_the_diagnostics_pinned_lam_mult() -> None:
@@ -273,11 +302,14 @@ def test_load_mmap_flag_reaches_torch_load() -> None:
         B.torch.load = orig
 
 
-def test_mmap_default_is_per_mode_cs_only() -> None:
-    """Measured 07-17: mmap DEFERS the read into the gathers at ~1/4 sequential bandwidth
-    (cold 24 MB/s vs eager ~86 MB/s). CS touches only ~12 of 43 GB so it wins on memory; WS
-    gathers most of the 34 GB elec tap anyway, so lazy paging makes it SLOWER. A default of
-    mmap-everywhere would have silently regressed the 12 WS shards."""
+def test_mmap_is_never_the_default() -> None:
+    """mmap DEFERS the read into the gathers at ~1/4 sequential bandwidth (cold 24 MB/s vs eager
+    ~86 MB/s), so it is only ever worth it to save MEMORY.
+
+    Memory is not scarce here, and believing it was is what made this default wrong: the shards
+    that stalled were starved by NUMA node-0 pinning, not by size, and `numactl --interleave=all`
+    is the fix. Under mmap a shard measured 15 MB/s with 3.7M major faults and produced nothing in
+    43 minutes. Eager for both modes; the --mmap/--no-mmap knob stays for A/B only."""
     from scripts.neuroprobe.v3_board_readout import MMAP_DEFAULT
 
-    assert MMAP_DEFAULT == {"ws": False, "cs": True}
+    assert MMAP_DEFAULT == {"ws": False, "cs": False}

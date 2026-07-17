@@ -235,20 +235,30 @@ def _select_lam(d) -> dict:
     All-NaN val (single-class val half) → NaN, reported as such rather than silently defaulting
     to a λ, so a degenerate cell cannot masquerade as a scored one.
 
-    ``lam_pinned`` flags a selected λ sitting on a grid boundary: the optimum is then outside
-    the grid and the reported AUROC is a truncation artifact, not a fit. It is plausible and
-    wrong — exactly the failure that cannot be caught by eye — so it is carried to the report.
+    ``lam_pin`` records which grid boundary the selected λ sits on, and the two sides are NOT
+    the same failure (measured 07-17):
+
+      "hi" → BENIGN. AUROC saturates as λ→∞: the smoother w/(w+λ) → 0 uniformly, so the scores
+             converge to a fixed ranking (AUROC(1e4) == AUROC(1e16) exactly, and both equal the
+             AUROC of K@y_tr). A HI pin means "maximal shrinkage is best", which the grid already
+             reports faithfully. Widening the grid cannot change the number.
+      "lo"  → REAL truncation. There is no such limit at the bottom; λ→0 keeps moving, so the
+             optimum really is outside the grid and the AUROC is an artifact.
+
+    ``lam_pinned`` is therefore LO-only — it is the one that invalidates a fit. Conflating the two
+    costs a full re-run of a 22-shard board for nothing.
     """
     best = None
     for m, va in d["val"].items():
         if np.isnan(va):
             continue
         if best is None or va > best["val"]:
+            pin = "lo" if m == LAM_MULTS[0] else ("hi" if m == LAM_MULTS[-1] else "")
             best = {"val": va, "test": d["test"][m], "lam_mult": float(m),
-                    "lam_pinned": bool(m in (LAM_MULTS[0], LAM_MULTS[-1]))}
+                    "lam_pin": pin, "lam_pinned": pin == "lo"}
     if best is None:
         return {"val": float("nan"), "test": float("nan"), "lam_mult": float("nan"),
-                "lam_pinned": False}
+                "lam_pin": "", "lam_pinned": False}
     return best
 
 
@@ -302,6 +312,7 @@ def _ws_cell(rec, task, taps) -> dict:
         vals = [f[k]["test"] for f in folds if k in f]
         out[k] = {"test": float(np.nanmean(vals)) if vals else float("nan"),
                   "lam_pinned": bool(any(f[k]["lam_pinned"] for f in folds if k in f)),
+                  "lam_sat": bool(any(f[k].get("lam_pin") == "hi" for f in folds if k in f)),
                   "lam_mult": [f[k]["lam_mult"] for f in folds if k in f]}
     return {"cells": out}
 
@@ -347,14 +358,18 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
 #     eager sequential load (shard 0, live) : ~660 s for 56.7 GB   = ~86 MB/s
 # So mmap does NOT make loading free — it DEFERS it into the gathers, at ~1/4 the bandwidth of
 # one sequential stream. ("mmap loads in 0.5 s at 0.5 GB" is an artifact of measuring an open()
-# that reads nothing; the bytes are still owed.) The trade therefore splits by mode:
-#   CS  -> mmap WINS: it touches only the ~12 GB of parcel taps out of 43 GB, so it reads ~3.6x
-#          less data (a wash on time at the worse bandwidth) and resides ~12 GB instead of 43.
-#          The win is MEMORY, which is what buys the --mem cut and the concurrency.
-#   WS  -> mmap LOSES: across 15 tasks x 2 folds the union of gathered rows covers most of the
-#          34 GB enc12_elec tensor anyway, so it re-reads nearly all of it scattered (~24 min)
-#          instead of streaming it once (~10 min). Eager is right for WS.
-MMAP_DEFAULT = {"ws": False, "cs": True}
+# that reads nothing; the bytes are still owed.)
+#
+# mmap was originally ON for CS, to cut RESIDENT memory (~12 GB of parcel taps instead of 43 GB)
+# and buy concurrency. That whole premise was WRONG, and the correction is the lesson worth
+# keeping: the shards were not stalling because they were too big. They were stalling because
+# --cpus-per-task=8 pins to NUMA node 0 (31.9 GB of 251 GB) and AutoNUMA then thrashes forever
+# trying to migrate spilled pages home. The fix is `numactl --interleave=all` in the sbatch — see
+# reference-delta-numa-node0-starvation-interleave-2026-07-17. Once memory is no longer scarce,
+# mmap buys nothing and costs plenty: measured 15 MB/s with 3.7M major faults and RSS collapsed
+# to 1 GB, vs ~86 MB/s eager. A 43-min shard produced zero output under it.
+# Eager is right for BOTH modes. Keep the knob for A/B, but neither default is mmap.
+MMAP_DEFAULT = {"ws": False, "cs": False}
 
 
 def _load(cache_dir, session, tag, mmap=False):
@@ -420,7 +435,7 @@ def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS, workers=1,
 
 
 def _blank(tags) -> dict:
-    return {f"{tag}|{t}": {"ws": {}, "cs": {}, "pinned": {}, "n_parcels": {}}
+    return {f"{tag}|{t}": {"ws": {}, "cs": {}, "pinned": {}, "sat": {}, "n_parcels": {}}
             for tag in tags for t in BOARD_TASKS}
 
 
@@ -433,6 +448,8 @@ def _absorb(res, sh) -> None:
             res[k][kind].setdefault(gk, {})[sh["name"]] = s["test"]
             if s.get("lam_pinned"):
                 res[k]["pinned"].setdefault(f"{kind}:{gk}", []).append(sh["name"])
+            if s.get("lam_sat"):
+                res[k]["sat"].setdefault(f"{kind}:{gk}", []).append(sh["name"])
         if val.get("n_parcels") is not None:
             res[k]["n_parcels"][sh["name"]] = val["n_parcels"]
 
@@ -528,21 +545,32 @@ def _report(tags, res) -> None:
                         print(f"  [diff] enc12 per-electrode − parcel-mean ({nm}) = {e - q:+.4f}"
                               f"  ({e:.4f} vs {q:.4f})", flush=True)
 
-    # λ pin check: a boundary argmax means the optimum lies OUTSIDE the grid, so the AUROC is a
-    # truncation artifact indistinguishable by eye from a fit. Name it, count it, print it.
+    # λ pin check. The two boundaries are NOT the same failure and must not be counted together:
+    #   HI (λ=LAM_MULTS[-1]) → BENIGN. AUROC saturates as λ→∞ (α→(1/λ)·y ⇒ scores→(1/λ)·K@y, a
+    #      positive rescale AUROC ignores; asserted in test_auroc_saturates_at_high_lambda).
+    #      "Maximal shrinkage won" is the true answer; widening the grid cannot change the number.
+    #   LO (λ=LAM_MULTS[0])  → REAL truncation. No limit at the bottom, so the optimum is genuinely
+    #      off-grid and the AUROC is an artifact.
+    # Conflating them once cost a near-re-run of the whole 22-shard board for nothing.
     pinned = {f"{k}  {gk}": cells for k, c in res.items()
               for gk, cells in c.get("pinned", {}).items() if cells}
+    sat = {f"{k}  {gk}": cells for k, c in res.items()
+           for gk, cells in c.get("sat", {}).items() if cells}
     n_fits = sum(len(d) for c in res.values() for kind in ("ws", "cs")
                  for d in c.get(kind, {}).values())
     n_pin = sum(len(v) for v in pinned.values())
+    n_sat = sum(len(v) for v in sat.values())
     if pinned:
-        print(f"\n[check] λ grid: VIOLATED — {n_pin}/{n_fits} fits selected a λ on a grid "
-              f"boundary ({LAM_MULTS[0]:.1e} or {LAM_MULTS[-1]:.1e}); their optimum is OUTSIDE "
-              f"the grid and those AUROCs are truncation artifacts. Widen LAM_MULTS and re-run."
+        print(f"\n[check] λ grid: VIOLATED — {n_pin}/{n_fits} fits selected the LO boundary "
+              f"({LAM_MULTS[0]:.1e}); their optimum is BELOW the grid and those AUROCs are "
+              f"truncation artifacts. Lower LAM_MULTS[0] and re-run those cells."
               f" First 10: {list(pinned)[:10]}", flush=True)
     else:
-        print(f"\n[check] λ grid: OK — 0/{n_fits} fits pinned to a boundary; every selected λ "
-              f"is interior to [{LAM_MULTS[0]:.1e}, {LAM_MULTS[-1]:.1e}].", flush=True)
+        print(f"\n[check] λ grid: OK — 0/{n_fits} fits pinned to the LO boundary "
+              f"({LAM_MULTS[0]:.1e}); no fit is truncated from below.", flush=True)
+    print(f"[check] λ saturated (HI, benign): {n_sat}/{n_fits} fits chose λ={LAM_MULTS[-1]:.1e}, "
+          f"i.e. maximal shrinkage. AUROC is constant past that point, so these are faithful "
+          f"reports, NOT artifacts — do not widen the grid for them.", flush=True)
     print("[check] selection: every number above is a TEST-half AUROC. λ is the ONLY axis "
           "chosen on the val half (upstream train_test_splits.py:65); tap and norm are "
           "reported in full, never selected.", flush=True)
