@@ -221,6 +221,35 @@ def test_cs_cell_aligns_parcel_columns_by_atlas_id_not_position() -> None:
     assert got["test"] == pytest.approx(1.0)
 
 
+def test_cs_per_domain_ablation_is_reported_but_never_selected() -> None:
+    """Ben 2026-07-17: per-domain std (AdaBN-style) is CS-only and an ABLATION. If it could win
+    the val selection the headline would be target-adapted on some cells and not others,
+    silently changing the claim per cell. It must be reported and unable to move "test"."""
+    anchor, test = _rec(seed=1), _rec(seed=2)
+    got = _cs_cell(anchor, test, "onset", ("enc12",))
+    assert set(got["diag_tgt"]) == {"enc12"}          # computed and reported
+    assert got["norm"] in ("std", "raw")              # headline never selects the ablation
+    assert got["sel"]["norm"] in ("std", "raw")
+
+
+def test_per_domain_standardize_uses_val_stats_only_never_test() -> None:
+    """The legality condition: the target scaler is fit on the VAL half only. If test rows
+    could move mu/sd, the ablation would be transductive on the reported half."""
+    from scripts.neuroprobe.v3_board_readout import _standardize_per_domain
+
+    rng = np.random.default_rng(0)
+    z_tr = rng.normal(size=(20, 4))
+    z_va = rng.normal(loc=5.0, scale=2.0, size=(20, 4))
+    z_te = rng.normal(loc=5.0, scale=2.0, size=(20, 4))
+    _, (b1, c1) = _standardize_per_domain(z_tr, z_va, z_te)
+    # Perturbing TEST must not change how VAL was scaled, nor the scaler applied to test.
+    _, (b2, c2) = _standardize_per_domain(z_tr, z_va, z_te * 100.0 + 7.0)
+    assert np.allclose(b1, b2)
+    assert np.allclose(c2, (z_te * 100.0 + 7.0 - z_va.mean(0)) / z_va.std(0))
+    # The val half IS centred by its own stats — that is the point of the ablation.
+    assert np.allclose(b1.mean(axis=0), 0.0, atol=1e-9)
+
+
 def test_cs_cell_no_shared_parcels_is_nan() -> None:
     anchor = _rec(parcels=[0, 1], n_parcels=2, seed=1)
     test = _rec(parcels=[8, 9], n_parcels=2, seed=2)

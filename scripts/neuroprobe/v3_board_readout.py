@@ -106,11 +106,43 @@ def _finite(y: np.ndarray, rows: np.ndarray) -> np.ndarray:
 
 
 def _standardize(z_tr, others):
-    """Per-feature z-score on TRAIN stats only (never fit on val/test). σ=0 → 1."""
+    """Per-feature z-score on TRAIN stats only (never fit on val/test). σ=0 → 1.
+
+    This is the canonical frozen-FM linear probe: the MAE/MoCo-v3/DINO lineage puts a
+    BatchNorm WITHOUT affine before the linear head, and BN at eval uses statistics
+    accumulated over probe TRAINING — i.e. train-set stats, which in CS means the ANCHOR's.
+    """
     mu = z_tr.mean(axis=0)
     sd = z_tr.std(axis=0)
     sd[sd == 0] = 1.0
     return (z_tr - mu) / sd, [(z - mu) / sd for z in others]
+
+
+def _standardize_per_domain(z_tr, z_va, z_te):
+    """CS ablation: each SUBJECT z-scored in its OWN frame (AdaBN-style target adaptation).
+
+    Anchor uses anchor stats (identical to _standardize's train side, so G/eigh/α are unchanged);
+    the target subject uses the target's OWN stats — fit on its VAL half ONLY and applied to both
+    val and test, so no test-half statistic is ever touched. Motivation: plain std maps the target
+    into the ANCHOR's coordinate frame ((z_t − μ_a)/σ_a), which is wrong exactly when subjects'
+    feature scales differ — i.e. in the CS regime the probe is measuring. Per-subject target
+    normalization is standard in cross-subject EEG/BCI transfer (AdaBN; the Euclidean-Alignment
+    family), though NOT part of the canonical vision linear probe.
+
+    ABLATION ONLY (Ben 2026-07-17): it never enters the val selection. Letting it would make the
+    headline target-adapted on some cells and not others, silently changing the claim per cell
+    from "frozen features transfer" to "transfer GIVEN target statistics".
+
+    Rules check: SUBMIT.md constrains only (1) splits from train_test_splits.py and (2) no
+    pretraining on eval data — nothing about normalization. Fitting an UNSUPERVISED scaler on the
+    val half uses strictly less information than the λ/tap selection upstream already sanctions
+    on the same half.
+    """
+    mu_a, sd_a = z_tr.mean(axis=0), z_tr.std(axis=0)
+    sd_a[sd_a == 0] = 1.0
+    mu_t, sd_t = z_va.mean(axis=0), z_va.std(axis=0)   # target stats: VAL half only
+    sd_t[sd_t == 0] = 1.0
+    return (z_tr - mu_a) / sd_a, [(z_va - mu_t) / sd_t, (z_te - mu_t) / sd_t]
 
 
 def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
@@ -264,7 +296,8 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
     a_idx, t_idx, common = _parcel_cols(anchor_rec, test_rec)
     if common.size == 0:
         return {"test": float("nan")}
-    grid = {}
+    grid: dict = {}
+    abl: dict = {}
     for enc in taps:
         if enc not in anchor_rec["feats"] or enc not in test_rec["feats"]:
             continue
@@ -274,6 +307,9 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
             a, (b, c) = ((z_tr, [z_va, z_te]) if norm == "raw"
                          else _standardize(z_tr, [z_va, z_te]))
             grid[(enc, norm)] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
+        # CS-only ablation, computed OUTSIDE `grid` so it cannot reach the headline selection.
+        a, (b, c) = _standardize_per_domain(z_tr, z_va, z_te)
+        abl[enc] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
     if not grid:
         return {"test": float("nan")}
     both = _per_tap_and_joint(grid, taps)
@@ -281,6 +317,8 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
     out["per_tap"] = {t: {"test": s["test"]} for t, s in both["per_tap"].items()}
     out["diag_std"] = {t: {"test": s["test"]} for t, s in both["diag_std"].items()}
     out["diag_raw"] = {t: {"test": s["test"]} for t, s in both["diag_raw"].items()}
+    out["diag_tgt"] = {t: {"test": _select({(t, "std_target"): g})["test"]}
+                       for t, g in abl.items()}
     out["sel"] = both["joint"]
     out["n_parcels"] = int(common.size)
     return out
@@ -310,7 +348,7 @@ def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS) -> dict:
 def _blank(tags) -> dict:
     return {f"{tag}|{t}": {"ws_per_session": {}, "cs_per_cell": {}, "sel": {},
                            "ws_tap": {}, "cs_tap": {}, "ws_std": {}, "cs_std": {},
-                           "ws_raw": {}, "cs_raw": {}, "pinned": {}}
+                           "ws_raw": {}, "cs_raw": {}, "cs_tgt": {}, "pinned": {}}
             for tag in tags for t in BOARD_TASKS}
 
 
@@ -332,6 +370,8 @@ def _absorb(res, sh) -> None:
             res[k][stdkey].setdefault(tap, {})[sh["name"]] = s["test"]
         for tap, s in (val.get("diag_raw") or {}).items():
             res[k][rawkey].setdefault(tap, {})[sh["name"]] = s["test"]
+        for tap, s in (val.get("diag_tgt") or {}).items():          # CS-only ablation
+            res[k]["cs_tgt"].setdefault(tap, {})[sh["name"]] = s["test"]
 
 
 def _merge(tags, shard_dir) -> dict:
@@ -350,7 +390,8 @@ def _finalize(res: dict) -> dict:
         c["cs_mean"] = float(np.nanmean(cs)) if cs else float("nan")
         for src, dst in (("ws_tap", "ws_tap_mean"), ("cs_tap", "cs_tap_mean"),
                          ("ws_std", "ws_std_mean"), ("cs_std", "cs_std_mean"),
-                         ("ws_raw", "ws_raw_mean"), ("cs_raw", "cs_raw_mean")):
+                         ("ws_raw", "ws_raw_mean"), ("cs_raw", "cs_raw_mean"),
+                         ("cs_tgt", "cs_tgt_mean")):
             c[dst] = {tap: float(np.nanmean(list(d.values()))) for tap, d in c[src].items() if d}
     return res
 
@@ -416,6 +457,21 @@ def _report(tags, res) -> None:
                 r = float(np.nanmean([res[f"{tag}|{t}"][rk].get(tp, np.nan)
                                       for t in BOARD_TASKS]))
                 print(f"  {tp:12s} std {s:.4f}  raw {r:.4f}  Δ(std−raw) {s - r:+.4f}",
+                      flush=True)
+
+        # CS per-domain-standardization ablation (AdaBN-style target adaptation). ABLATION —
+        # never the headline: it answers "does the anchor's scaler mis-fit the target subject?",
+        # a different claim from "frozen features transfer".
+        tgt_taps = sorted({tp for t in BOARD_TASKS for tp in res[f"{tag}|{t}"]["cs_tgt_mean"]})
+        if tgt_taps:
+            print(f"\n=== CS per-domain std ABLATION (macro over 15 tasks), tag={tag} "
+                  f"[NOT the headline — target-adapted claim] ===", flush=True)
+            for tp in tgt_taps:
+                def _m(key, tp=tp):
+                    return float(np.nanmean([res[f"{tag}|{t}"][key].get(tp, np.nan)
+                                             for t in BOARD_TASKS]))
+                g, s = _m("cs_tgt_mean"), _m("cs_std_mean")
+                print(f"  {tp:12s} per-domain {g:.4f}  anchor-std {s:.4f}  Δ {g - s:+.4f}",
                       flush=True)
 
     # λ pin check: a boundary argmax means the optimum lies OUTSIDE the grid, so the AUROC is a
