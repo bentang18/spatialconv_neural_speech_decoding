@@ -15,6 +15,7 @@ from scripts.neuroprobe.v3_board_readout import (
     BOARD_TASKS,
     CS_TEST_CELLS,
     CS_TRAIN_ANCHOR,
+    LAM_MULTS,
     LITE_SESSIONS,
     _cs_cell,
     _lam_grid,
@@ -116,6 +117,51 @@ def test_select_all_nan_val_is_nan_not_a_default_lambda() -> None:
     grid = {("enc0", "raw"): {"val": {1.0: float("nan")}, "test": {1.0: 0.99}}}
     got = _select(grid)
     assert np.isnan(got["test"]) and got["enc"] is None
+
+
+def test_select_spans_both_norms_and_can_pick_raw() -> None:
+    """Ben 2026-07-17: norm is val-selected like tap and λ. Measured, not assumed — our r4 20k
+    probe has std 16/16 WS but 9/16 CS, and every real encoder tap mildly prefers raw in CS.
+    A selector that silently pinned std would impose a WS convention on the CS headline."""
+    grid = {
+        ("enc12", "std"): {"val": {1.0: 0.60}, "test": {1.0: 0.61}},
+        ("enc12", "raw"): {"val": {1.0: 0.90}, "test": {1.0: 0.88}},
+    }
+    got = _select(grid)
+    assert got["norm"] == "raw" and got["test"] == 0.88
+
+
+def test_select_norm_filter_isolates_one_norm_for_the_diagnostic() -> None:
+    grid = {
+        ("enc12", "std"): {"val": {1.0: 0.60}, "test": {1.0: 0.61}},
+        ("enc12", "raw"): {"val": {1.0: 0.90}, "test": {1.0: 0.88}},
+    }
+    assert _select(grid, norm="std")["test"] == 0.61
+    assert _select(grid, norm="raw")["test"] == 0.88
+
+
+def test_select_flags_lambda_pinned_to_a_grid_boundary() -> None:
+    """A boundary argmax means the optimum is OUTSIDE the grid: the AUROC is a truncation
+    artifact that looks exactly like a fit. It must reach the report."""
+    edge = {("enc0", "std"): {"val": {LAM_MULTS[-1]: 0.9}, "test": {LAM_MULTS[-1]: 0.8}}}
+    assert _select(edge)["lam_pinned"] is True
+    mid = LAM_MULTS[len(LAM_MULTS) // 2]
+    interior = {("enc0", "std"): {"val": {mid: 0.9}, "test": {mid: 0.8}}}
+    assert _select(interior)["lam_pinned"] is False
+
+
+def test_lambda_grid_brackets_the_diagnostics_pinned_lam_mult() -> None:
+    """lam_mult=1.0 (the r4 diagnostic's fixed value) must be an interior grid point, so the
+    board number is never worse than the diagnostic's for want of a λ."""
+    assert min(LAM_MULTS) < 1.0 < max(LAM_MULTS)
+    assert any(abs(m - 1.0) < 1e-9 for m in LAM_MULTS)
+
+
+def test_ws_cell_diagnostic_norms_do_not_move_the_headline() -> None:
+    """diag_std/diag_raw are reported beside the number, never fused into it."""
+    got = _ws_cell(_rec(), "onset", ("enc12",))
+    assert set(got["diag_std"]) == {"enc12"} and set(got["diag_raw"]) == {"enc12"}
+    assert got["test"] == pytest.approx(1.0)
 
 
 def test_ws_cell_recovers_signal_on_the_test_half() -> None:

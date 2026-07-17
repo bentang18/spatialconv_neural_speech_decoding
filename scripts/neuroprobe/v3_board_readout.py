@@ -73,8 +73,21 @@ ELEC_TAPS = ("enc12_elec",)
 WS_TAPS = ELEC_TAPS + ENCODERS
 CS_TAPS = ENCODERS
 NORMS = ("std", "raw")
-# λ grid as multipliers of trace(G)/n (the diagnostic's pinned lam_mult=1.0 sits at the centre).
-LAM_MULTS = tuple(np.logspace(-3.0, 3.0, 13))
+# norm is val-SELECTED, like tap and λ (Ben 2026-07-17). Measured, not assumed: on our own r4
+# 20k probe (results_v3_probe_r4_20k.json, 16 paired tap×task cells) std beats raw 16/16 WS
+# (meanΔ +0.0277) but only 9/16 CS (meanΔ +0.0026, median +0.0007 — a coin flip), and the whole
+# CS edge is carried by enc0 (the already-normalized input floor, +0.0281): every real encoder
+# tap mildly PREFERS raw in CS (enc3 −0.0046, enc6 −0.0091 @ 25% std-wins, enc12 −0.0041).
+# Mechanism for the regime split: WS fits μ/σ on the same session it scores, so the scaler is
+# valid; CS fits μ/σ on the ANCHOR and applies it to a DIFFERENT subject, where a scale mismatch
+# makes z-scoring actively harmful. Fixing std would impose a WS-derived convention on the CS
+# headline against our own numbers. Selecting on val costs 2× eigh and pre-commits to nothing.
+# (Upstream's pip package ships no baseline readout, so nothing external forces the choice.)
+# λ grid as multipliers of trace(G)/n (lam_mult=1.0 — the diagnostic's pinned value — is a grid
+# point). One eigh serves the whole grid, so extra λ cost O(n²) each: there is no reason to be
+# stingy with the RANGE, and a truncated range is the real failure (a boundary argmax means the
+# optimum is outside the grid). Wide + a printed pin check beats narrow + hope.
+LAM_MULTS = tuple(np.logspace(-4.0, 4.0, 25))
 
 
 def auroc(scores, labels) -> float:
@@ -133,24 +146,33 @@ def _lam_grid(z_tr, y_tr, evals):
     return out
 
 
-def _select(grid) -> dict:
+def _select(grid, norm=None) -> dict:
     """grid = {(enc,norm): {"val": {m: auroc}, "test": {m: auroc}}} → pick argmax VAL.
 
-    Selection is over (tap, norm, λ) jointly, per cell, on that cell's own val half. Ties and
-    all-NaN val (single-class val half) → NaN, reported as such rather than silently defaulting
-    to a λ, so a degenerate cell cannot masquerade as a scored one.
+    Selection is over (tap, norm, λ) jointly, per cell, on that cell's own val half. ``norm``
+    restricts the search to one norm — used ONLY to build the std/raw diagnostic contrast,
+    never for the headline. Ties and all-NaN val (single-class val half) → NaN, reported as
+    such rather than silently defaulting to a λ, so a degenerate cell cannot masquerade as a
+    scored one.
+
+    ``lam_pinned`` flags a selected λ sitting on a grid boundary: the optimum is then outside
+    the grid and the reported AUROC is a truncation artifact, not a fit. It is plausible and
+    wrong — exactly the failure that cannot be caught by eye — so it is carried to the report.
     """
     best = None
-    for (enc, norm), d in grid.items():
+    for (enc, nm), d in grid.items():
+        if norm is not None and nm != norm:
+            continue
         for m, va in d["val"].items():
             if np.isnan(va):
                 continue
             if best is None or va > best["val"]:
-                best = {"val": va, "test": d["test"][m], "enc": enc, "norm": norm,
-                        "lam_mult": float(m)}
+                best = {"val": va, "test": d["test"][m], "enc": enc, "norm": nm,
+                        "lam_mult": float(m),
+                        "lam_pinned": bool(m in (LAM_MULTS[0], LAM_MULTS[-1]))}
     if best is None:
         return {"val": float("nan"), "test": float("nan"), "enc": None, "norm": None,
-                "lam_mult": float("nan")}
+                "lam_mult": float("nan"), "lam_pinned": False}
     return best
 
 
@@ -173,11 +195,19 @@ def _per_tap_and_joint(grid, taps) -> dict:
     parcel-mean contrast (Ben 2026-07-16) stay readable — selecting the tap jointly would fuse
     the two feature units into one number and hide exactly that diff. joint additionally
     selects the tap on val, which is the board-headline rule. Same grid, so per_tap is free.
+
+    diag_std / diag_raw pin each norm and report it alone. They are DIAGNOSTIC only and never
+    feed "test": they exist to measure the std-vs-raw split the r4 20k probe found (std 16/16
+    WS but a coin flip CS) on the BOARD data, where n is larger and the montage is Lite.
     """
+    def _tap_grid(t):
+        return {k: v for k, v in grid.items() if k[0] == t}
+    present = [t for t in taps if any(k[0] == t for k in grid)]
     return {
-        "per_tap": {t: _select({k: v for k, v in grid.items() if k[0] == t})
-                    for t in taps if any(k[0] == t for k in grid)},
+        "per_tap": {t: _select(_tap_grid(t)) for t in present},
         "joint": _select(grid),
+        "diag_std": {t: _select(_tap_grid(t), norm="std") for t in present},
+        "diag_raw": {t: _select(_tap_grid(t), norm="raw") for t in present},
     }
 
 
@@ -212,6 +242,11 @@ def _ws_cell(rec, task, taps) -> dict:
         "test": _avg(lambda f: f["joint"]["test"]),
         "per_tap": {t: {"test": _avg(lambda f, t=t: f["per_tap"].get(t, {}).get("test"))}
                     for t in taps if any(t in f["per_tap"] for f in folds)},
+        "diag_std": {t: {"test": _avg(lambda f, t=t: f["diag_std"].get(t, {}).get("test"))}
+                     for t in taps if any(t in f["diag_std"] for f in folds)},
+        "diag_raw": {t: {"test": _avg(lambda f, t=t: f["diag_raw"].get(t, {}).get("test"))}
+                     for t in taps if any(t in f["diag_raw"] for f in folds)},
+        "lam_pinned": bool(any(f["joint"].get("lam_pinned") for f in folds)),
         "sel": folds[0]["joint"],
     }
 
@@ -244,6 +279,8 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
     both = _per_tap_and_joint(grid, taps)
     out = dict(both["joint"])
     out["per_tap"] = {t: {"test": s["test"]} for t, s in both["per_tap"].items()}
+    out["diag_std"] = {t: {"test": s["test"]} for t, s in both["diag_std"].items()}
+    out["diag_raw"] = {t: {"test": s["test"]} for t, s in both["diag_raw"].items()}
     out["sel"] = both["joint"]
     out["n_parcels"] = int(common.size)
     return out
@@ -272,7 +309,8 @@ def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS) -> dict:
 
 def _blank(tags) -> dict:
     return {f"{tag}|{t}": {"ws_per_session": {}, "cs_per_cell": {}, "sel": {},
-                           "ws_tap": {}, "cs_tap": {}}
+                           "ws_tap": {}, "cs_tap": {}, "ws_std": {}, "cs_std": {},
+                           "ws_raw": {}, "cs_raw": {}, "pinned": {}}
             for tag in tags for t in BOARD_TASKS}
 
 
@@ -280,13 +318,20 @@ def _absorb(res, sh) -> None:
     kind = sh["kind"]
     key = "ws_per_session" if kind == "ws" else "cs_per_cell"
     tapkey = "ws_tap" if kind == "ws" else "cs_tap"
+    stdkey = "ws_std" if kind == "ws" else "cs_std"
+    rawkey = "ws_raw" if kind == "ws" else "cs_raw"
     for k, val in sh["cells"].items():
         res[k][key][sh["name"]] = val["test"]
         res[k]["sel"][f"{kind}:{sh['name']}"] = {
             x: (val.get("sel") or {}).get(x) for x in ("enc", "norm", "lam_mult")
         } | {"n_parcels": val.get("n_parcels")}
+        res[k]["pinned"][f"{kind}:{sh['name']}"] = bool(val.get("lam_pinned", False))
         for tap, s in (val.get("per_tap") or {}).items():
             res[k][tapkey].setdefault(tap, {})[sh["name"]] = s["test"]
+        for tap, s in (val.get("diag_std") or {}).items():
+            res[k][stdkey].setdefault(tap, {})[sh["name"]] = s["test"]
+        for tap, s in (val.get("diag_raw") or {}).items():
+            res[k][rawkey].setdefault(tap, {})[sh["name"]] = s["test"]
 
 
 def _merge(tags, shard_dir) -> dict:
@@ -303,7 +348,9 @@ def _finalize(res: dict) -> dict:
         ws, cs = list(c["ws_per_session"].values()), list(c["cs_per_cell"].values())
         c["ws_cohort"] = float(np.nanmean(ws)) if ws else float("nan")
         c["cs_mean"] = float(np.nanmean(cs)) if cs else float("nan")
-        for src, dst in (("ws_tap", "ws_tap_mean"), ("cs_tap", "cs_tap_mean")):
+        for src, dst in (("ws_tap", "ws_tap_mean"), ("cs_tap", "cs_tap_mean"),
+                         ("ws_std", "ws_std_mean"), ("cs_std", "cs_std_mean"),
+                         ("ws_raw", "ws_raw_mean"), ("cs_raw", "cs_raw_mean")):
             c[dst] = {tap: float(np.nanmean(list(d.values()))) for tap, d in c[src].items() if d}
     return res
 
@@ -352,9 +399,41 @@ def _report(tags, res) -> None:
                                       for t in BOARD_TASKS]))
                 print(f"  [diff] enc12 per-electrode − parcel-mean = {e - p:+.4f} "
                       f"({e:.4f} vs {p:.4f})", flush=True)
+        # std vs raw ON THE BOARD. The r4 20k probe found std 16/16 WS (meanΔ +0.0277) but a
+        # coin flip CS (9/16, +0.0026) with every real encoder tap mildly preferring raw. That
+        # is n=16 on the pretrain cohort; this is the same contrast at board n. Diagnostic
+        # only — neither column is the headline, which selects norm per cell on val.
+        for direction, sk, rk in (("CS", "cs_std_mean", "cs_raw_mean"),
+                                  ("WS", "ws_std_mean", "ws_raw_mean")):
+            taps = sorted({tp for t in BOARD_TASKS for tp in res[f"{tag}|{t}"][sk]})
+            if not taps:
+                continue
+            print(f"\n=== {direction} std vs raw per tap (macro over 15 tasks), tag={tag} "
+                  f"[DIAGNOSTIC — not the headline] ===", flush=True)
+            for tp in taps:
+                s = float(np.nanmean([res[f"{tag}|{t}"][sk].get(tp, np.nan)
+                                      for t in BOARD_TASKS]))
+                r = float(np.nanmean([res[f"{tag}|{t}"][rk].get(tp, np.nan)
+                                      for t in BOARD_TASKS]))
+                print(f"  {tp:12s} std {s:.4f}  raw {r:.4f}  Δ(std−raw) {s - r:+.4f}",
+                      flush=True)
+
+    # λ pin check: a boundary argmax means the optimum lies OUTSIDE the grid, so the AUROC is a
+    # truncation artifact indistinguishable by eye from a fit. Name it, count it, print it.
+    pinned = [f"{tag.split('|')[0]}:{cell}" for tag, c in res.items()
+              for cell, hit in c.get("pinned", {}).items() if hit]
+    n_cells = sum(len(c.get("pinned", {})) for c in res.values())
+    if pinned:
+        print(f"\n[check] λ grid: VIOLATED — {len(pinned)}/{n_cells} cells selected a λ on a "
+              f"grid boundary ({LAM_MULTS[0]:.1e} or {LAM_MULTS[-1]:.1e}); their optimum is "
+              f"OUTSIDE the grid and those AUROCs are truncation artifacts. Widen LAM_MULTS "
+              f"and re-run. First 10: {pinned[:10]}", flush=True)
+    else:
+        print(f"\n[check] λ grid: OK — 0/{n_cells} cells pinned to a boundary; every selected "
+              f"λ is interior to [{LAM_MULTS[0]:.1e}, {LAM_MULTS[-1]:.1e}].", flush=True)
     # The board's headline is the CS macro over the 15 tasks; the leaderboard reference point
     # is CS #1 CNN 0.578 > PopT 0.575 (reference-neuroprobe-cs-leaderboard-2026-05).
-    print("\n[check] selection: every reported number is a TEST-half AUROC; λ/tap/norm were "
+    print("[check] selection: every reported number is a TEST-half AUROC; λ/tap/norm were "
           "chosen on the VAL half only (upstream train_test_splits.py:65).", flush=True)
 
 
