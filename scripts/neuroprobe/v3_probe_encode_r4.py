@@ -165,13 +165,18 @@ def _load_perceivers(sd: dict, *, device: torch.device):
     psd = _subtree(sd, pref)
     if not psd:
         raise RuntimeError(f"no '{pref}*' keys in ckpt; a deep_sup=False run has no Perceiver")
-    trained = PerceiverHead(n_parcels=N_PARCELS)
+    # A diag_nll / point-head run (r5 Arm 3, r5mod, ctx-loss) writes a mu-only head with NO
+    # covariance params; a full-cov run writes head.chol_head.*. Match the head to the ckpt so
+    # both load strict-clean. (The enc-only readout never reads the Perceiver taps, but the
+    # encode loads it unconditionally, so a shape skew here is a hard crash.)
+    point_only = not any("chol_head" in k for k in psd)
+    trained = PerceiverHead(n_parcels=N_PARCELS, point_only=point_only)
     missing, unexpected = trained.load_state_dict(psd, strict=False)
     bad = [m for m in missing if "num_batches_tracked" not in m]
     if bad or unexpected:
         raise RuntimeError(f"perceiver state_dict mismatch: missing={bad[:8]} unexpected={unexpected[:8]}")
     torch.manual_seed(PERC_RAND_SEED)
-    rand = PerceiverHead(n_parcels=N_PARCELS)
+    rand = PerceiverHead(n_parcels=N_PARCELS, point_only=point_only)
     return {"": _freeze(trained, device=device), "_rand": _freeze(rand, device=device)}
 
 

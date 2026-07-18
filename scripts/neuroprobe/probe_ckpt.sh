@@ -47,7 +47,8 @@ echo "== [1/3] ENCODE on dtai (ckpt=$CKPT tag=$TAG) =="
 # r4_10k encode wrote all 7 caches in a 4-min window (03:00:39→03:04:36); 30 min is 6x
 # that with room for model load + spec-cache reads. Safe to run tight: the encode SKIPS
 # sessions whose cache exists, so a walltime kill costs one requeue, not the work.
-AID=$(ssh dtai "sbatch --parsable --time=00:30:00 $BASE/v3_probe_encode_r4.sbatch '$CKPT' '$TAG' '$CACHE'")
+ENCODE_SBATCH="${ENCODE_SBATCH:-$BASE/v3_probe_encode_r4.sbatch}"   # override for 5-dim/point-head ckpts
+AID=$(ssh dtai "sbatch --parsable --time=00:30:00 $ENCODE_SBATCH '$CKPT' '$TAG' '$CACHE'")
 echo "   encode job $AID  ->  $CACHE"
 while :; do
   n=$(ssh dtai "ls $CACHE/*.pt 2>/dev/null | wc -l" | tr -d ' ')
