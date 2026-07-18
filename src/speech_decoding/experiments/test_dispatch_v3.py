@@ -29,10 +29,12 @@ from speech_decoding.experiments.dispatch_v3 import (
     build_v3_training,
 )
 from speech_decoding.experiments.fork_point_ckpt import (
+    fork_ckpt_general,
     fork_to_point_ckpt,
     optimizer_param_names,
 )
 from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
+from speech_decoding.models.v14_converged_v3.state_target import STATE_DIM
 
 _BAND_F = (7, 6, 7)
 
@@ -438,8 +440,8 @@ def _write_state_stats(tmp_path, subject_id: int, n_parcels: int = 64):
     d = tmp_path / "stats"
     d.mkdir(parents=True, exist_ok=True)
     np.savez(d / f"sub-{subject_id}.npz",
-             stat_mean=np.zeros((n_parcels, 6), dtype=np.float32),
-             stat_std=np.ones((n_parcels, 6), dtype=np.float32))
+             stat_mean=np.zeros((n_parcels, STATE_DIM), dtype=np.float32),
+             stat_std=np.ones((n_parcels, STATE_DIM), dtype=np.float32))
     return str(d)
 
 
@@ -536,3 +538,251 @@ def test_arm3_forks_an_nll_checkpoint_despite_owning_no_covariance_head(tmp_path
           f"loaded={forked}{(' err=' + err) if err else ''}; restored global_step="
           f"{t.global_step if forked else 'n/a'} (want 4, cold=0) {'OK' if ok else 'VIOLATED'}")
     assert ok
+
+
+def test_fork_reinits_shape_changed_mu_head_for_diag_nll() -> None:
+    """r5-mod (diag_nll) forks the SAME r4@10k ckpt as Arm 3, but its state is 5-dim
+    ([slow_mu, mid_mu, hga_mu, relmod48, relmod816]) where the ckpt's NLL head is 6-dim
+    (3 mean + 3 std). So mu_head is a SHAPE CHANGE (6,d)->(5,d), not a drop: carrying its
+    tensor would fail the strict load and carrying its Adam moment would fail the optimizer
+    load. The fork must (a) drop chol_head, (b) reseed mu_head from the fresh 5-dim module,
+    (c) drop mu_head's carried optimizer state (lazy re-init), (d) carry the backbone BY
+    NAME and preserve global_step. Reseeding costs nothing at the fork point: the whole
+    0->10k prefix ran lambda=0, so the head took zero gradient (moments are zero, weights
+    are decayed init).
+
+    Unit-tested on a SYNTHETIC 6-dim ckpt because current code (STATE_DIM=5) can no longer
+    write one; the same-dim (l1) path stays covered by the Arm-3 end-to-end test above."""
+    import torch
+
+    d = 4
+    sd = {
+        "model.enc.weight": torch.arange(9.0).reshape(3, 3),
+        "model.head.mu_head.weight": torch.full((6, d), 7.0),  # the OLD 6-dim head
+        "model.head.mu_head.bias": torch.full((6,), 7.0),
+        "model.head.chol_head.weight": torch.zeros(21, d),  # 6-dim tril = 21
+        "model.head.chol_head.bias": torch.zeros(21),
+    }
+    # optimizer index order (as maybe_split_no_decay lays it out): wd group = the >=2-D
+    # weights [enc, mu_head.w, chol_head.w]; no-wd group = the 1-D biases [mu_head.b, chol_head.b].
+    old_names = [
+        "model.enc.weight", "model.head.mu_head.weight", "model.head.chol_head.weight",
+        "model.head.mu_head.bias", "model.head.chol_head.bias",
+    ]
+    # a distinguishable Adam moment per old param, so carry-vs-drop is checkable by value.
+    old_state = {i: {"step": torch.tensor(10000.0), "tag": torch.tensor(float(i))}
+                 for i in range(5)}
+    ckpt = {
+        "global_step": 10000, "epoch": 5, "state_dict": dict(sd),
+        "optimizer_states": [{
+            "state": old_state,
+            "param_groups": [
+                {"params": [0, 1, 2], "lr": 1e-3, "weight_decay": 0.04},  # wd (weights)
+                {"params": [3, 4], "lr": 1e-3, "weight_decay": 0.0},       # no-wd (biases)
+            ],
+        }],
+    }
+    # the fresh 5-dim diag_nll module: mu_head (5,d), no chol.
+    new_names = ["model.enc.weight", "model.head.mu_head.weight", "model.head.mu_head.bias"]
+    seed = {
+        "model.enc.weight": torch.zeros(3, 3),  # backbone in seed is IGNORED (only reinit keys used)
+        "model.head.mu_head.weight": torch.ones(5, d),
+        "model.head.mu_head.bias": torch.ones(5),
+    }
+    out, rep = fork_to_point_ckpt(
+        ckpt, old_names, new_names, seed_state_dict=seed, reinit_substrings=("mu_head",)
+    )
+
+    # (a) chol fully gone; (b) mu_head reseeded to 5-dim from the fresh module.
+    assert not any("chol_head" in k for k in out["state_dict"])
+    assert out["state_dict"]["model.head.mu_head.weight"].shape == (5, d)
+    assert torch.equal(out["state_dict"]["model.head.mu_head.weight"], torch.ones(5, d))
+    assert torch.equal(out["state_dict"]["model.head.mu_head.bias"], torch.ones(5))
+    # (c) backbone carried VERBATIM (value untouched, NOT taken from seed's zeros).
+    assert torch.equal(out["state_dict"]["model.enc.weight"], sd["model.enc.weight"])
+    assert out["global_step"] == 10000
+
+    st = out["optimizer_states"][0]
+    # new order [enc(0), mu_head.w(1), mu_head.b(2)]: only the backbone carries a moment;
+    # both mu_head params are fresh (no state entry) so AdamW lazily re-inits them at (5,d).
+    assert 0 in st["state"] and st["state"][0]["tag"].item() == 0.0  # enc carried from old idx 0
+    assert 1 not in st["state"] and 2 not in st["state"]
+    # group sizes: wd [enc, mu_head.w]=2, no-wd [mu_head.b]=1 (chol removed from each).
+    assert [len(g["params"]) for g in st["param_groups"]] == [2, 1]
+    assert set(rep["state_dict_keys_reseeded"]) == {
+        "model.head.mu_head.weight", "model.head.mu_head.bias"
+    }
+    assert all("chol_head" in n for n in rep["optimizer_params_dropped"])
+    print(f"[check] diag_nll fork: chol dropped={rep['state_dict_keys_dropped']}; "
+          f"mu_head reseeded 6->5={rep['state_dict_keys_reseeded']}; backbone moment carried "
+          f"(tag=0), mu_head moments dropped (fresh); global_step={out['global_step']} OK")
+
+
+def test_fork_reseeds_shape_changed_buffer_not_optimizer() -> None:
+    """The 5-dim head resizes a frozen BUFFER as well as a Linear: ``noise_var`` is
+    register_buffer'd at STATE_DIM, so it went (6,)->(5,) alongside mu_head. A buffer is in
+    the state_dict but NOT in the optimizer's param groups, so the fork must reseed it from
+    the fresh module (else the carried 6-dim buffer fails the strict load — the exact reject
+    the CPU resume smoke hit) WITHOUT ever trying to touch it as an optimizer param. This
+    pins that a reinit substring naming a buffer reseeds the tensor and leaves the optimizer
+    remap untouched."""
+    import torch
+
+    d = 4
+    sd = {
+        "model.enc.weight": torch.arange(9.0).reshape(3, 3),
+        "model.head.mu_head.weight": torch.full((6, d), 7.0),
+        "model.head.mu_head.bias": torch.full((6,), 7.0),
+        "model.head.chol_head.weight": torch.zeros(21, d),
+        "model.head.chol_head.bias": torch.zeros(21),
+        "model.head.noise_var": torch.full((6,), 9.0),  # frozen buffer, OLD 6-dim
+    }
+    old_names = [
+        "model.enc.weight", "model.head.mu_head.weight", "model.head.chol_head.weight",
+        "model.head.mu_head.bias", "model.head.chol_head.bias",
+    ]
+    old_state = {i: {"step": torch.tensor(10000.0), "tag": torch.tensor(float(i))}
+                 for i in range(5)}
+    ckpt = {
+        "global_step": 10000, "epoch": 5, "state_dict": dict(sd),
+        "optimizer_states": [{
+            "state": old_state,
+            "param_groups": [
+                {"params": [0, 1, 2], "lr": 1e-3, "weight_decay": 0.04},
+                {"params": [3, 4], "lr": 1e-3, "weight_decay": 0.0},
+            ],
+        }],
+    }
+    new_names = ["model.enc.weight", "model.head.mu_head.weight", "model.head.mu_head.bias"]
+    seed = {
+        "model.enc.weight": torch.zeros(3, 3),
+        "model.head.mu_head.weight": torch.ones(5, d),
+        "model.head.mu_head.bias": torch.ones(5),
+        "model.head.noise_var": torch.full((5,), 0.5),  # fresh 5-dim floor
+    }
+    out, rep = fork_to_point_ckpt(
+        ckpt, old_names, new_names, seed_state_dict=seed,
+        reinit_substrings=("mu_head", "noise_var"),
+    )
+
+    # buffer reseeded to the fresh 5-dim floor, not the carried 6-dim one.
+    assert out["state_dict"]["model.head.noise_var"].shape == (5,)
+    assert torch.equal(out["state_dict"]["model.head.noise_var"], torch.full((5,), 0.5))
+    assert "model.head.noise_var" in rep["state_dict_keys_reseeded"]
+    # buffer is NOT an optimizer param: it never appears in the (dropped) optimizer names,
+    # and the remap still only drops the two chol params.
+    assert all("chol_head" in n for n in rep["optimizer_params_dropped"])
+    st = out["optimizer_states"][0]
+    assert [len(g["params"]) for g in st["param_groups"]] == [2, 1]
+    assert 0 in st["state"] and 1 not in st["state"] and 2 not in st["state"]
+    print(f"[check] buffer fork: noise_var reseeded 6->5 (state_dict only, not optimizer)="
+          f"{out['state_dict']['model.head.noise_var'].tolist()}; opt drops still chol-only OK")
+
+
+def test_fork_ckpt_general_carries_reshapes_drops_and_adds() -> None:
+    """The context arm needs the fully general fork: it forks the SAME r4@10k (6-dim NLL)
+    ckpt but the new module BOTH reshapes the diag head 6->5 (like r5-mod) AND INJECTS a
+    ``pred_to_target_context`` head the ckpt never had. ``fork_to_point_ckpt`` can't add a
+    param (it refuses names the ckpt lacks), so ``fork_ckpt_general`` classifies every new
+    param CARRY / RESHAPE / ADD / (implicit DROP) against the ckpt.
+
+    Pins, on a synthetic COMPILED-prefix ckpt (``model._orig_mod.``) so the cross-prefix
+    match + inject-under-ckpt-front both get exercised:
+      * enc + pred_to_target CARRY verbatim (value + Adam moment BY NAME),
+      * mu_head (Linear) and noise_var (buffer) RESHAPE 6->5 from the fresh module (moment
+        dropped for the Linear; buffer never touches the optimizer),
+      * chol_head DROP (absent from out state_dict AND optimizer),
+      * pred_to_target_context ADD from the fresh module under the ckpt's ``_orig_mod`` front,
+        with NO carried moment (fresh at the lambda=0 fork point)."""
+    import torch
+
+    d, t = 4, 3
+    F = "model._orig_mod."  # compiled-run front the ckpt carries
+    ck_sd = {
+        F + "enc.weight": torch.arange(9.0).reshape(3, 3),
+        F + "head.mu_head.weight": torch.full((6, d), 7.0),
+        F + "head.mu_head.bias": torch.full((6,), 7.0),
+        F + "head.chol_head.weight": torch.zeros(21, d),
+        F + "head.chol_head.bias": torch.zeros(21),
+        F + "head.noise_var": torch.full((6,), 9.0),  # frozen buffer, OLD 6-dim
+        F + "pred_to_target.weight": torch.full((t, d), 5.0),
+        F + "pred_to_target.bias": torch.full((t,), 5.0),
+    }
+    # ckpt optimizer index order: wd group (>=2-D weights) then no-wd (1-D biases). noise_var
+    # is a buffer, so it is NOT here.
+    old_names = [
+        F + "enc.weight", F + "head.mu_head.weight", F + "head.chol_head.weight",
+        F + "pred_to_target.weight",
+        F + "head.mu_head.bias", F + "head.chol_head.bias", F + "pred_to_target.bias",
+    ]
+    old_state = {i: {"step": torch.tensor(10000.0), "tag": torch.tensor(float(i))}
+                 for i in range(7)}
+    ckpt = {
+        "global_step": 10000, "epoch": 5, "state_dict": dict(ck_sd),
+        "optimizer_states": [{
+            "state": old_state,
+            "param_groups": [
+                {"params": [0, 1, 2, 3], "lr": 1e-3, "weight_decay": 0.04},  # wd weights
+                {"params": [4, 5, 6], "lr": 1e-3, "weight_decay": 0.0},       # no-wd biases
+            ],
+        }],
+    }
+    # the fresh module: 5-dim diag head, NO chol, PLUS a context head. Uncompiled "model."
+    # keys (different front from the ckpt) to prove the stripped match works cross-prefix.
+    new_group_names = [
+        ["model.enc.weight", "model.head.mu_head.weight",
+         "model.pred_to_target.weight", "model.pred_to_target_context.weight"],
+        ["model.head.mu_head.bias", "model.pred_to_target.bias",
+         "model.pred_to_target_context.bias"],
+    ]
+    new_sd = {
+        "model.enc.weight": torch.zeros(3, 3),                 # CARRY target IGNORED
+        "model.head.mu_head.weight": torch.ones(5, d),         # RESHAPE seed
+        "model.head.mu_head.bias": torch.ones(5),              # RESHAPE seed
+        "model.head.noise_var": torch.full((5,), 0.5),         # RESHAPE seed (buffer)
+        "model.pred_to_target.weight": torch.zeros(t, d),      # CARRY target IGNORED
+        "model.pred_to_target.bias": torch.zeros(t),           # CARRY target IGNORED
+        "model.pred_to_target_context.weight": torch.full((t, d), 2.0),  # ADD
+        "model.pred_to_target_context.bias": torch.full((t,), 2.0),      # ADD
+    }
+    out, rep = fork_ckpt_general(
+        ckpt, old_names=old_names, new_group_names=new_group_names, new_state_dict=new_sd
+    )
+    osd = out["state_dict"]
+
+    # CARRY: verbatim ckpt value, under the ckpt's own compiled front (NOT the seed's zeros).
+    assert torch.equal(osd[F + "enc.weight"], ck_sd[F + "enc.weight"])
+    assert torch.equal(osd[F + "pred_to_target.weight"], ck_sd[F + "pred_to_target.weight"])
+    # RESHAPE: reseeded to the fresh 5-dim tensors, keyed under the ckpt front.
+    assert osd[F + "head.mu_head.weight"].shape == (5, d)
+    assert torch.equal(osd[F + "head.mu_head.weight"], torch.ones(5, d))
+    assert osd[F + "head.noise_var"].shape == (5,)
+    assert torch.equal(osd[F + "head.noise_var"], torch.full((5,), 0.5))
+    # ADD: injected under the ckpt's compiled front, taken from the fresh module.
+    assert torch.equal(osd[F + "pred_to_target_context.weight"], torch.full((t, d), 2.0))
+    assert torch.equal(osd[F + "pred_to_target_context.bias"], torch.full((t,), 2.0))
+    # DROP: chol gone entirely.
+    assert not any("chol_head" in k for k in osd)
+    assert out["global_step"] == 10000
+
+    st = out["optimizer_states"][0]
+    # new order [enc(0), mu.w(1), ptt.w(2), pttc.w(3), mu.b(4), ptt.b(5), pttc.b(6)].
+    # carried moments: enc<-old0, pred_to_target.w<-old3, pred_to_target.b<-old6.
+    assert st["state"][0]["tag"].item() == 0.0
+    assert st["state"][2]["tag"].item() == 3.0
+    assert st["state"][5]["tag"].item() == 6.0
+    # reshaped (mu.w=1, mu.b=4) and added (pttc.w=3, pttc.b=6) carry NO moment.
+    assert all(j not in st["state"] for j in (1, 3, 4, 6))
+    assert [len(g["params"]) for g in st["param_groups"]] == [4, 3]
+
+    assert sorted(rep["state_dict_keys_reshaped"]) == [
+        "head.mu_head.bias", "head.mu_head.weight", "head.noise_var"
+    ]
+    assert sorted(rep["state_dict_keys_added"]) == [
+        "pred_to_target_context.bias", "pred_to_target_context.weight"
+    ]
+    assert all("chol_head" in k for k in rep["state_dict_keys_dropped"])
+    print(f"[check] general fork: carry={{enc,pred_to_target}} moments tag 0/3/6; "
+          f"reshape={rep['state_dict_keys_reshaped']}; add={rep['state_dict_keys_added']}; "
+          f"drop={rep['state_dict_keys_dropped']}; groups {[len(g['params']) for g in st['param_groups']]} "
+          f"global_step={out['global_step']} OK")

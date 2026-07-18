@@ -48,7 +48,7 @@ from speech_decoding.models.v14_converged_v3.datamodule import V3DataModule
 from speech_decoding.models.v14_converged_v3.dataset import V3SessionSpec
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
-from speech_decoding.models.v14_converged_v3.objective import LAMBDA_NLL
+from speech_decoding.models.v14_converged_v3.objective import LAMBDA_CTX, LAMBDA_NLL
 from speech_decoding.models.v14_converged_v3.secondary_head import NLL_FLOOR_JITTER
 from speech_decoding.models.v14_converged_v3.session_loader import (
     ParcelFn,
@@ -242,6 +242,8 @@ def build_v3_training(
         lambda_nll=getattr(args, "lambda_nll", LAMBDA_NLL),
         nll_floor=getattr(args, "nll_floor", True),
         secondary_loss=getattr(args, "secondary_loss", "nll"),
+        context_loss=getattr(args, "context_loss", False),
+        lambda_ctx=getattr(args, "lambda_ctx", LAMBDA_CTX),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -255,6 +257,8 @@ def build_v3_training(
         grad_ratio_every_n_steps=args.grad_ratio_every_n_steps,
         nll_warmup_start_step=getattr(args, "nll_warmup_start_step", 0),
         nll_warmup_steps=getattr(args, "nll_warmup_steps", 0),
+        ctx_warmup_start_step=getattr(args, "ctx_warmup_start_step", 0),
+        ctx_warmup_steps=getattr(args, "ctx_warmup_steps", 0),
     )
     dm = V3DataModule(
         sessions,
@@ -293,6 +297,8 @@ def _enabled_optional_modules(args: argparse.Namespace) -> list[str]:
     enabled: list[str] = []
     if _secondary_active(args):
         enabled.append("secondary Perceiver Gaussian-NLL (--state-stats-dir)")
+    if getattr(args, "context_loss", False):
+        enabled.append("V-JEPA 2.1 context head (--context-loss)")
     return enabled
 
 
@@ -498,15 +504,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         f"Sigma with only a {NLL_FLOOR_JITTER:g} conditioning jitter, no "
                         "measured floor. No effect without --state-stats-dir.")
     p.add_argument("--secondary-loss", dest="secondary_loss",
-                   choices=("nll", "l1"), default="nll",
-                   help="'nll' (default, r1–r4): full-covariance Gaussian NLL. 'l1' is r5 "
-                        "Arm 3 (POINT loss): the head emits mu only — the covariance Linear "
-                        "is NOT constructed — and is scored by mean per-position sum|x-mu| "
-                        "over present dims. L1 rather than L2 is MEASURED (M18, "
-                        "probe_v3_residual_tailweight 2026-07-16): at Sigma=I the Gaussian "
-                        "NLL IS 0.5*||r||^2, so L2 asserts Gaussian residuals; the split-half "
-                        "electrode difference reads 5/6 dims ABOVE the Laplace pole by >=3 "
-                        "SEM, so L1 is strictly the closer of the two. No effect without "
+                   choices=("nll", "l1", "diag_nll"), default="nll",
+                   help="'diag_nll' (r5-mod, the CURRENT 5-dim objective): point (mu-only) "
+                        "head scored by frozen-diagonal Gaussian NLL over the 5-dim state "
+                        "[slow_mu, mid_mu, hga_mu, relmod48, relmod816] — sigma^2 is the "
+                        "measured count-dependent noise floor, FROZEN, so the loss drops only "
+                        "via a better mu (closes the r4 free-sigma flatline hatch). Requires "
+                        "--nll-floor. 'nll' (r1–r4, RETIRED for the 5-dim layout — its D//2 "
+                        "mean/std split mis-scores the 3/2 state): full-covariance Gaussian "
+                        "NLL. 'l1' is r5 Arm 3 (POINT loss): mu-only head scored by mean "
+                        "per-position sum|x-mu| over present dims. No effect without "
                         "--state-stats-dir.")
     p.add_argument("--nll-warmup-start-step", dest="nll_warmup_start_step",
                    type=int, default=0,
@@ -518,6 +525,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="length (opt-steps) of the linear 0→--lambda-nll ramp starting at "
                         "--nll-warmup-start-step; λ holds at --lambda-nll after. Default 0 ⇒ "
                         "no ramp (constant λ==--lambda-nll from --nll-warmup-start-step).")
+    p.add_argument("--context-loss", dest="context_loss", action="store_true",
+                   help="V-JEPA 2.1 §2.3.1 context loss: the predictor also predicts the "
+                        "per-level-normed teacher target at the VISIBLE (context) tokens via a "
+                        "SEPARATE projection head, scored by the same L1 at ~masked positions, "
+                        "λ_ctx-weighted (total += λ_ctx·L_ctx). Off ⇒ zero new params. Requires "
+                        "--deep-sup.")
+    p.add_argument("--lambda-ctx", dest="lambda_ctx", type=float, default=LAMBDA_CTX,
+                   help=f"context-loss weight λ_ctx — the HOLD the ramp climbs to (default "
+                        f"{LAMBDA_CTX}, V-JEPA 2.1 Eq 2 peak). No effect without --context-loss.")
+    p.add_argument("--ctx-warmup-start-step", dest="ctx_warmup_start_step",
+                   type=int, default=0,
+                   help="opt-step at which the context-loss λ_ctx ramp OPENS. Before it, λ_ctx=0 "
+                        "(the context head stays in-graph with zero grad — DDP-safe). Default 0 "
+                        "⇒ ramp opens immediately.")
+    p.add_argument("--ctx-warmup-steps", dest="ctx_warmup_steps",
+                   type=int, default=0,
+                   help="length (opt-steps) of the linear 0→--lambda-ctx ramp starting at "
+                        "--ctx-warmup-start-step; λ_ctx holds at --lambda-ctx after. Default 0 ⇒ "
+                        "no ramp (constant λ_ctx==--lambda-ctx from --ctx-warmup-start-step).")
     p.add_argument("--deep-sup", dest="deep_sup",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="deep self-supervision (#61, V-JEPA 2.1 copy-exactly): tap "

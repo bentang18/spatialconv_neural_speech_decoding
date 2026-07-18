@@ -308,6 +308,117 @@ def test_training_step_logs_ramped_total_and_lambda() -> None:
     assert ok
 
 
+def _ctx_module(*, start: int, steps: int, secondary_active: bool = False):
+    model = V3ConvergedModel(n_parcels=N_PARCELS, context_loss=True)
+    return V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04),
+        secondary_active=secondary_active,
+        ctx_warmup_start_step=start, ctx_warmup_steps=steps,
+    )
+
+
+def test_ctx_lambda_schedule_ramps_10k_to_20k() -> None:
+    # The context-loss λ_ctx ramp — the λ_nll ramp's twin at the SAME launch numbers
+    # (--ctx-warmup-start-step 10000 --ctx-warmup-steps 10000): 0 below start, hold/2 at the
+    # midpoint, hold at the end, clamp above. hold = the objective's lambda_ctx.
+    mod = _ctx_module(start=10_000, steps=10_000)
+    hold = float(mod.model.objective.lambda_ctx)
+    cases = {0: 0.0, 9_999: 0.0, 10_000: 0.0, 15_000: 0.5 * hold, 20_000: hold, 40_000: hold}
+    worst = max(abs(mod._ctx_lambda(s) - w) for s, w in cases.items())
+    ok = worst < 1e-9 and mod._ctx_lambda(-5) == 0.0
+    print(
+        f"[check] λ_ctx schedule (hold={hold}, 10k→20k): λ(0)={mod._ctx_lambda(0):.4f} "
+        f"λ(15k)={mod._ctx_lambda(15_000):.4f} λ(20k)={mod._ctx_lambda(20_000):.4f} "
+        f"max|Δ|={worst:.2e} → {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
+def test_ctx_lambda_default_hold_and_context_off_never_applies() -> None:
+    # Default warmup (0,0) ⇒ constant λ_ctx==hold for a context module. And a NON-context module
+    # never applies the context term at all: its objective builds no context head, so a forward
+    # returns ctx_loss=None and training_step logs no train_ctx_loss (the ramp value is moot).
+    ctx = _ctx_module(start=0, steps=0)
+    hold = float(ctx.model.objective.lambda_ctx)
+    const = all(abs(ctx._ctx_lambda(s) - hold) < 1e-9 for s in [0, 1, 5_000, 50_000])
+    plain = V14ConvergedV3Module(
+        model=V3ConvergedModel(n_parcels=N_PARCELS),
+        optim_config=_optim_config(weight_decay=0.04),
+    )
+    logged: dict[str, float] = {}
+    plain.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
+    plain.training_step(_session_batch(n_rows=2), 0)
+    off = plain.model.objective.pred_to_target_context is None and "train_ctx_loss" not in logged
+    ok = const and off
+    print(f"[check] λ_ctx default const=hold({hold})={const}; non-context arm: head=None + no "
+          f"train_ctx_loss logged={off} → {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_ctx_lambda_zero_keeps_context_head_in_graph_with_zero_grad() -> None:
+    # DDP graph-stability: while λ_ctx==0 (below the ramp start) the total is jepa + 0·ctx, so
+    # the context head stays IN the autograd graph with a ZERO (not None) grad — DDP sees it
+    # "used", no find_unused abort, no graph mutation when the ramp opens. At full λ the SAME
+    # head gets a nonzero grad.
+    mod0 = _ctx_module(start=100, steps=50)  # step 0 < 100 ⇒ λ_ctx=0
+    assert mod0._ctx_lambda(0) == 0.0
+    mod0.training_step(_session_batch(n_rows=2), 0).backward()
+    head0 = list(mod0.model.objective.pred_to_target_context.parameters())
+    present0 = all(p.grad is not None for p in head0)
+    zero0 = all(float(p.grad.abs().sum()) == 0.0 for p in head0)
+
+    mod1 = _ctx_module(start=0, steps=0)  # constant hold ⇒ λ_ctx>0
+    assert mod1._ctx_lambda(0) > 0.0
+    mod1.training_step(_session_batch(n_rows=2), 0).backward()
+    head1 = list(mod1.model.objective.pred_to_target_context.parameters())
+    present1 = all(p.grad is not None for p in head1)
+    nonzero1 = any(float(p.grad.abs().sum()) > 0.0 for p in head1)
+    ok = present0 and zero0 and present1 and nonzero1
+    print(
+        f"[check] λ_ctx=0 graph-stable: ctx-head grads present@λ0={present0} zero@λ0={zero0} "
+        f"present@hold={present1} nonzero@hold={nonzero1} → {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
+def test_training_step_folds_context_with_nll_and_jepa() -> None:
+    # The full three-term arm: secondary active (frozen 5-dim diag stats) AND context on.
+    # training_step must combine ALL THREE in eager code: total = jepa + λ_nll·nll + λ_ctx·ctx,
+    # with the ramped λ's, and log the context pieces. diag_nll is the ONLY secondary the 5-dim
+    # state_target supports (the retired full-cov 'nll' mis-shapes it), so build it explicitly.
+    from speech_decoding.models.v14_converged_v3.secondary_head import STATE_DIM
+
+    model = V3ConvergedModel(n_parcels=N_PARCELS, context_loss=True, secondary_loss="diag_nll")
+    mod = V14ConvergedV3Module(
+        model=model, optim_config=_optim_config(weight_decay=0.04), secondary_active=True,
+    )
+    batch = _session_batch(n_rows=2)
+    P = int(batch.parcel_id.unique().numel())
+    stats_batch = V3Batch(
+        bands=batch.bands, geom=batch.geom, parcel_id=batch.parcel_id,
+        stat_mean=torch.zeros(P, STATE_DIM), stat_std=torch.ones(P, STATE_DIM),
+    )
+    logged: dict[str, float] = {}
+    mod.log = lambda name, value, **_: logged.__setitem__(name, float(value))  # type: ignore[method-assign]
+    total = mod.training_step(stats_batch, 0)
+    lam_nll = float(mod.model.objective.lambda_nll)
+    lam_ctx = float(mod.model.objective.lambda_ctx)
+    jepa, nll, ctx = logged["train_jepa_loss"], logged["train_nll_loss"], logged["train_ctx_loss"]
+    recomposed = jepa + lam_nll * nll + lam_ctx * ctx
+    ok = (
+        abs(logged["train_ctx_lambda"] - lam_ctx) < 1e-9
+        and abs(logged["train_ctx_weighted"] - lam_ctx * ctx) < 1e-5
+        and abs(logged["train_loss"] - float(total)) < 1e-5
+        and abs(float(total) - recomposed) < 1e-4
+    )
+    print(
+        f"[check] 3-term total: jepa={jepa:.4f} + λ_nll({lam_nll})·nll={nll:.4f} + "
+        f"λ_ctx({lam_ctx})·ctx={ctx:.4f} = {recomposed:.4f} == total {float(total):.4f} "
+        f"→ {'OK' if ok else 'VIOLATED'}"
+    )
+    assert ok
+
+
 def test_grad_ratio_off_by_default_logs_nothing() -> None:
     # grad_ratio_every_n_steps default 0 ⇒ the live loss-balance readout never fires,
     # even with the secondary active. The launch config relies on this default.

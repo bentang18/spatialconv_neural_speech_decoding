@@ -39,6 +39,7 @@ from speech_decoding.models.v14_converged_v3.masking import (
     sample_masks,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
+    LAMBDA_CTX,
     LAMBDA_NLL,
     JepaOutput,
     V3JepaObjective,
@@ -61,6 +62,8 @@ class V3ConvergedModel(nn.Module):
         lambda_nll: float = LAMBDA_NLL,
         nll_floor: bool = True,
         secondary_loss: str = "nll",
+        context_loss: bool = False,
+        lambda_ctx: float = LAMBDA_CTX,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -77,6 +80,7 @@ class V3ConvergedModel(nn.Module):
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
             lambda_nll=lambda_nll, nll_floor=nll_floor,
             secondary_loss=secondary_loss,
+            context_loss=context_loss, lambda_ctx=lambda_ctx,
         )
         self.mask_cfg = mask_cfg
 

@@ -40,6 +40,7 @@ from speech_decoding.models.v14_converged_v3.monitor_taps import (
     per_band_jepa_stats,
     per_band_l1,
     per_band_nll,
+    per_dim_diag_nll,
 )
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
     R4Grid,
@@ -56,6 +57,7 @@ from speech_decoding.models.v14_converged_v3.secondary_head import (
     NLL_FLOOR_JITTER,
     STATE_DIM,
     count_dependent_noise_var,
+    present_masked_diag_nll,
     present_masked_l1,
     present_masked_nll,
 )
@@ -73,9 +75,20 @@ from speech_decoding.models.v14_converged_v3.towers import (
 from speech_decoding.ssl.ema import EmaTeacher, fixed_ema_schedule, stop_grad
 
 LAMBDA_NLL: float = 0.2  # secondary Gaussian-NLL weight (contract §5, ⚙️ open knob λ≈0.2)
+LAMBDA_CTX: float = 0.5  # context-loss weight λ_ctx (V-JEPA 2.1 §2.3.1 Eq 2 best-config peak)
 
 D_MODEL = 256
 EMA_TAU = 0.99925  # V-JEPA 2 / 2.1 default (B26 lock)
+
+
+def _masked_mean_l1(pred: Tensor, tgt: Tensor, weight: Tensor) -> Tensor:
+    """Weighted-mean per-token L1 over the (B, total) grid: the |pred-tgt| feature-mean at
+    each token, averaged over the tokens ``weight`` selects. ``weight`` is a (B, total) 0/1
+    float mask; the denominator is its sum (clamped ≥1 so an all-zero mask is a safe 0). Both
+    the primary (masked-token) JEPA term and the V-JEPA-2.1 context term (visible tokens)
+    share this exact arithmetic — only the token set (the ``weight``) differs."""
+    ae = (pred - tgt).abs().mean(-1)  # (B, total) per-token mean over the feature stack
+    return (ae * weight).sum() / weight.sum().clamp(min=1.0)
 
 
 def _ln_target(t: Tensor, n_levels: int = 1) -> Tensor:
@@ -98,8 +111,9 @@ class JepaOutput:
     loss: Tensor  # the TOTAL the trainer backprops: jepa_loss + λ·nll_loss (jepa only if secondary off)
     n_masked: Tensor  # 0-dim: margin-gated scored-token count (realization-dependent; sync deferred)
     taps: dict[str, Tensor] | None = None
-    jepa_loss: Tensor | None = None  # primary L1 term (set only when the secondary is active)
+    jepa_loss: Tensor | None = None  # primary L1 term (set when ANY ramped secondary is active)
     nll_loss: Tensor | None = None  # secondary Gaussian-NLL term (None when secondary off)
+    ctx_loss: Tensor | None = None  # V-JEPA-2.1 context L1 at visible tokens (None when off)
 
 
 class _TargetTower(nn.Module):
@@ -150,25 +164,39 @@ class V3JepaObjective(nn.Module):
         deep_sup: bool = True,
         lambda_nll: float = LAMBDA_NLL,
         nll_floor: bool = True,
-        secondary_loss: str = "nll",
+        secondary_loss: str = "diag_nll",
+        context_loss: bool = False,
+        lambda_ctx: float = LAMBDA_CTX,
     ) -> None:
         super().__init__()
         self.deep_sup = bool(deep_sup)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         self.lambda_nll = float(lambda_nll)
-        # r5 Arm 3. "nll" (r1–r4, the default) = the full-covariance Gaussian NLL. "l1" =
-        # POINT loss: the head emits mu only and is scored by present_masked_l1, so the arm
-        # asks whether the second moment earns its keep at all.
-        # L1 and not L2 is MEASURED, not assumed: at Sigma=I the Gaussian NLL collapses to
-        # 0.5·‖r‖²+const, i.e. L2 IS "Gaussian residuals" and L1 IS "Laplace residuals".
-        # M18 (probe_v3_residual_tailweight, 2026-07-16) split each parcel's electrodes in
-        # half and measured the excess kurtosis of the half-state difference — 5/6 dims sit
-        # ABOVE the Laplace pole by >=3 SEM (hga_mu +10.4 vs a +0.41 laplace control), so
-        # the residual is heavier-tailed than Laplace and L1 is strictly the closer of the
-        # two. See present_masked_l1's docstring for the table.
-        if secondary_loss not in ("nll", "l1"):
-            raise ValueError(f"secondary_loss must be 'nll' or 'l1', got {secondary_loss!r}")
+        # V-JEPA 2.1 §2.3.1 context loss (OPT-IN, default OFF ⇒ no new params, no behavior
+        # change): the predictor also predicts the teacher target at the VISIBLE (context)
+        # tokens via a SEPARATE projection head, scored by the same per-level-normed L1 as the
+        # masked term but at ``~masked`` positions, λ_ctx-weighted. λ_ctx is the fixed HOLD the
+        # module's eager ramp climbs to (0→λ_ctx over the warmup window), mirroring λ_nll.
+        self.context_loss = bool(context_loss)
+        self.lambda_ctx = float(lambda_ctx)
+        # "diag_nll" (r5-mod, THIS build) = frozen-DIAGONAL Gaussian NLL over the 5-dim state
+        #   [slow_mu, mid_mu, hga_mu, relmod48, relmod816]: the head emits mu ONLY (point head)
+        #   and σ² is FROZEN to the count-dependent floor, so the loss drops only via a better
+        #   mu — the r4 "inflate σ to raise the NLL floor" flatline hatch is closed. This is the
+        #   OFAT arm (fork arm1 @10k, swap the target/form, compare CS transfer @20k).
+        # "nll" / "l1" (retired r5 full-cov arms) = the r4 full-covariance Gaussian NLL / its
+        #   POINT (present_masked_l1) twin over the OLD 6-dim mean+std target. Kept for
+        #   provenance; NOT compatible with the 5-dim (3-mean/2-mod) dim_presence layout this
+        #   build produces — do not select them with the r5-mod target.
+        if secondary_loss not in ("nll", "l1", "diag_nll"):
+            raise ValueError(
+                f"secondary_loss must be 'nll', 'l1', or 'diag_nll', got {secondary_loss!r}"
+            )
         self.secondary_loss = secondary_loss
+        # diag_nll's σ² IS the count-dependent floor (frozen); it cannot run floor-off.
+        if secondary_loss == "diag_nll" and not nll_floor:
+            raise ValueError("diag_nll uses the count-dependent floor as its frozen σ²; "
+                             "nll_floor must be True")
         # r5 Arm 2. True (r1–r4, the default) = the measured count-dependent floor. False =
         # floor-off: Sigma is L Lᵀ + NLL_FLOOR_JITTER·I, i.e. the head learns its own
         # covariance instead of being handed one. r4 evidence motivating the arm (wandb
@@ -197,8 +225,17 @@ class V3JepaObjective(nn.Module):
         else:
             self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
         self.pred_to_target = nn.Linear(PRED_D_MODEL, target_dim)
+        # Context head (upstream ``predictor_proj_context``): a SEPARATE wide Linear so the
+        # context task (predict teacher at VISIBLE tokens) does not share weights with the
+        # masked task. Built only when context_loss is on ⇒ off = zero new params, so an
+        # existing ckpt / the default arms load unchanged.
+        self.pred_to_target_context = (
+            nn.Linear(PRED_D_MODEL, target_dim) if self.context_loss else None
+        )
         self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
         init_transformer_weights(self.pred_to_target)
+        if self.pred_to_target_context is not None:
+            init_transformer_weights(self.pred_to_target_context)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit). Stored 3-D (1, 1, D) to match
         # upstream: the shared ndim<=1 no-decay rule then DECAYS it (a 1-D store would
         # silently exempt it). Broadcasts identically in scatter_visible (a no-op there).
@@ -209,7 +246,10 @@ class V3JepaObjective(nn.Module):
         # single-tap ablation arm has no secondary. Its own fusion (1024→d_perc) is SEPARATE
         # from enc_to_pred — the shared trunk is the ENCODER, not the fusion.
         self.perceiver = (
-            PerceiverHead(n_parcels=n_parcels, point_only=self.secondary_loss == "l1")
+            PerceiverHead(
+                n_parcels=n_parcels,
+                point_only=self.secondary_loss in ("l1", "diag_nll"),
+            )
             if self.deep_sup
             else None
         )
@@ -285,8 +325,18 @@ class V3JepaObjective(nn.Module):
         # per-session constant ⇒ the denominator needs no host sync). §5: reuse the tested
         # deep-sup L1 unchanged (pure |·|, NOT smooth-L1 — the DATA-FLOW one-liner's wording).
         w = in_loss.to(pred.dtype)  # (B, total)
-        ae = (pred - tgt).abs().mean(-1)  # (B, total) per-token mean over the 1024-d stack
-        jepa_loss = (ae * w).sum() / w.sum().clamp(min=1.0)
+        jepa_loss = _masked_mean_l1(pred, tgt, w)
+
+        # ── V-JEPA 2.1 context loss (opt-in): predict the SAME per-level-normed teacher target
+        # at the VISIBLE (context) tokens through the separate context head. Scored at ``~masked``
+        # — the complement of the JEPA ``in_loss ⊆ masked`` set, so the two are disjoint. λ_ctx is
+        # applied EAGERLY in the module's ramp (not folded here), mirroring λ_nll; the fixed-hold
+        # fold below only drives a standalone forward (no trainer). ──
+        ctx_loss = None
+        if self.pred_to_target_context is not None:
+            pred_ctx = self.pred_to_target_context(h)  # (B, total, n_levels·256)
+            w_ctx = (~masked).to(pred_ctx.dtype)  # (B, total) visible tokens
+            ctx_loss = _masked_mean_l1(pred_ctx, tgt, w_ctx)
 
         # ── secondary write-only Perceiver Gaussian-NLL (opt-in on the frozen stats) ──
         nll_loss = None
@@ -303,6 +353,8 @@ class V3JepaObjective(nn.Module):
                 bands, parcel_id, z, pack, stat_mean, stat_std, collect_taps=collect_taps
             )
             total = jepa_loss + self.lambda_nll * nll_loss
+        if ctx_loss is not None:  # fixed-hold fold — the module overrides with the ramped λ_ctx.
+            total = total + self.lambda_ctx * ctx_loss
 
         taps = None
         if collect_taps:
@@ -324,8 +376,11 @@ class V3JepaObjective(nn.Module):
             # step; consumers ``.item()``/log it lazily.
             n_masked=w.sum().detach(),
             taps=taps,
-            jepa_loss=jepa_loss if nll_loss is not None else None,
+            # Expose the primary term separately whenever ANY ramped secondary is active (nll
+            # OR context), so the module can recompose the total with the live ramped λ's.
+            jepa_loss=jepa_loss if (nll_loss is not None or ctx_loss is not None) else None,
             nll_loss=nll_loss,
+            ctx_loss=ctx_loss,
         )
 
     def _secondary_nll(
@@ -340,7 +395,8 @@ class V3JepaObjective(nn.Module):
         collect_taps: bool = False,
     ) -> tuple[Tensor, dict[str, Tensor] | None]:
         """Write-only Perceiver → per-(parcel, 4 Hz slot) Gaussian, scored by the present-
-        masked marginal NLL against the model-free 6-D state target.
+        masked NLL against the model-free 5-D state target (diag_nll: frozen-diagonal; the
+        retired nll/l1 arms: full-cov marginal / point).
 
         ``z`` (B, M_vis, 1024) = the CONTEXT (visible) encoder deep-sup output (WITH grad —
         write-only means no read-BACK into the primary stream, not stop-grad; the NLL DOES
@@ -349,8 +405,8 @@ class V3JepaObjective(nn.Module):
         adds the floor). Exact masking ⇒ every packed visible token is real (no key mask)."""
         assert self.perceiver is not None  # guarded by the caller
         target, present, parcels = build_state_target(
-            bands, parcel_id, stat_mean, stat_std, slot_stride=SLOT_STRIDE
-        )  # target (B, P, S, 6), present (P, 6), parcels (P,)
+            list(bands), parcel_id, stat_mean, stat_std, slot_stride=SLOT_STRIDE
+        )  # target (B, P, S, 5), present (P, 5), parcels (P,)
         B, P, S, _ = target.shape
         dev = target.device
         # per-parcel electrode count → per-query count-dependent 6-D noise floor.
@@ -361,7 +417,7 @@ class V3JepaObjective(nn.Module):
         counts = torch.bincount(parcel_id)
         n_elec = counts[parcels]  # (P,)
         if self.nll_floor:
-            noise = count_dependent_noise_var(n_elec.repeat_interleave(S))  # (Q, 6)
+            noise = count_dependent_noise_var(n_elec.repeat_interleave(S))  # (Q, 5)
         else:  # r5 Arm 2 — no measured floor; jitter only, for bf16 conditioning.
             noise = torch.full(
                 (P * S, STATE_DIM), NLL_FLOOR_JITTER, device=dev, dtype=target.dtype
@@ -395,17 +451,26 @@ class V3JepaObjective(nn.Module):
                 n_slots=S,
                 noise=noise[None].expand(B, Q, noise.shape[-1]),
             )
-        present_q = present.repeat_interleave(S, dim=0)  # (Q, 6)
+        present_q = present.repeat_interleave(S, dim=0)  # (Q, 5)
         target_q = target.reshape(B, Q, target.shape[-1])
-        present_q_full = present_q[None].expand(B, Q, present_q.shape[-1])  # (B, Q, 6)
-        if self.secondary_loss == "l1":  # r5 Arm 3 — point head, cov is None
+        present_q_full = present_q[None].expand(B, Q, present_q.shape[-1])  # (B, Q, 5)
+        noise_q = noise[None].expand(B, Q, noise.shape[-1])  # (B, Q, D) frozen σ²
+        if self.secondary_loss == "diag_nll":  # r5-mod — point head + frozen diagonal σ²
+            nll = present_masked_diag_nll(mu, target_q, present_q_full, noise_q)
+        elif self.secondary_loss == "l1":  # r5 Arm 3 — point head, cov is None
             nll = present_masked_l1(mu, target_q, present_q_full)
         else:
             nll = present_masked_nll(mu, cov, target_q, present_q_full)
         aux = None
         if collect_taps:  # per-band NLL (#41) + predicted-cov entropy vs floor (#42)
             with torch.no_grad():
-                if self.secondary_loss == "l1":
+                if self.secondary_loss == "diag_nll":
+                    # cov does not exist (point head), so #42 (entropy vs floor) has no
+                    # referent. The per-DIM diag NLL is the diagnostic that shows whether the
+                    # secondary is moving the 2 MODULATION dims (the above-MAE work) or only the
+                    # 3 already-reachable means — exactly where r4's flatline was found.
+                    aux = per_dim_diag_nll(mu, target_q, present_q_full, noise_q)
+                elif self.secondary_loss == "l1":
                     # cov does not exist on this arm, so #42 (entropy vs floor) has no
                     # referent. The per-band split still does — it is the diagnostic that
                     # shows WHICH band the secondary is actually learning, and dropping it
