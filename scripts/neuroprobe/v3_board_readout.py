@@ -108,9 +108,11 @@ CS_TAPS = ENCODERS
 # DEFAULT std-only for speed (Ben 2026-07-18): std / raw / std_target are three SEPARATE ridge
 # solves per tap (each a fresh gram + λ-sweep over the same gathered features), so reporting only
 # std cuts the readout ~3x. raw and std_target are OPT-IN via the PROBE_NORMS env var — "std,raw",
-# "std,raw,std_target", or "all". Keep this in mind for CS arch comparisons: every real encoder tap
-# mildly PREFERS raw cross-subject (measured below), so set PROBE_NORMS=std,raw when a CS delta is
-# the deciding number, or the std-only headline will understate it.
+# "std,raw,std_target", or "all". std is the BETTER metric: on this 15-subject board std beats raw
+# at every tap, CS and WS (CS enc12 +0.0146, larger at shallower taps; WS enc12_elec +0.0012, 07-18).
+# raw is only a SENSITIVITY cross-check — a model-vs-model delta can surface larger in raw because it
+# preserves scale (r5mod-vs-Arm1 was +0.0092 raw / +0.0034 std), which is visibility, not a better
+# readout. Opt raw in only when checking whether a specific model delta is real.
 def _norm_config():
     req = os.environ.get("PROBE_NORMS", "std").strip().lower()
     req = ["std", "raw", "std_target"] if req == "all" else [n.strip() for n in req.split(",") if n.strip()]
@@ -123,7 +125,10 @@ NORMS, WANT_STD_TARGET = _norm_config()
 # 16 paired tap×task cells): std beats raw 16/16 WS (meanΔ +0.0277) but only 9/16 CS (meanΔ
 # +0.0026, median +0.0007 — a coin flip), and the whole CS edge is carried by enc0 (the already-
 # normalized input floor, +0.0281): every real encoder tap mildly PREFERS raw in CS (enc3 −0.0046,
-# enc6 −0.0091 @ 25% std-wins, enc12 −0.0041). Mechanism for the regime split: WS fits μ/σ on the
+# enc6 −0.0091 @ 25% std-wins, enc12 −0.0041). ⚠️ CORRECTION (07-18): that raw-preference is the
+# 7-subject PRETRAIN cohort and a sub-0.01 coin flip; it does NOT replicate on the 15-subject board,
+# where std beats raw at every tap in CS (enc12 +0.0146) and WS. Do not read it as a real effect.
+# Mechanism for the regime split: WS fits μ/σ on the
 # same session it scores, so the scaler is valid; CS fits μ/σ on the ANCHOR and applies it to a
 # DIFFERENT subject, where a scale mismatch makes z-scoring actively harmful. That is a RESULT,
 # and val-selecting over it would bury it — and would make the headline a per-cell mixture of two

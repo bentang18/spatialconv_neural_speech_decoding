@@ -63,9 +63,11 @@ ALL_TAPS = ENCODERS + PERC_TAPS
 # std PRIMARY, raw the cross-check: they can disagree if signal is variance-concentrated (raw)
 # vs spread across many dims (std) — that disagreement is itself diagnostic of collapse.
 # DEFAULT std-only for speed (Ben 2026-07-18): std and raw are separate ridge solves per tap, so
-# std-only is ~2x here. raw is OPT-IN via PROBE_NORMS ("std,raw" or "all"). Opt raw back in for CS
-# arch comparisons — a variance-concentrated CS delta shows up larger in raw (cf. r5mod +0.0092 raw
-# vs +0.0034 std) and the std-only headline would understate it.
+# std-only is ~2x here. raw is OPT-IN via PROBE_NORMS ("std,raw" or "all"). std is the BETTER metric
+# (on the 15-subject board std beats raw at every tap, CS and WS, 07-18); raw is only a SENSITIVITY
+# cross-check — a model-vs-model delta can surface larger in raw because it preserves scale (cf.
+# r5mod-vs-Arm1 +0.0092 raw / +0.0034 std), which is visibility, not superiority. Opt it in only
+# when checking whether such a delta is real, never as a better number.
 def _norm_config():
     req = os.environ.get("PROBE_NORMS", "std").strip().lower()
     req = ["std", "raw"] if req == "all" else [n.strip() for n in req.split(",") if n.strip()]
