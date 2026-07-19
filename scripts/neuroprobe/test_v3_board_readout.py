@@ -158,12 +158,15 @@ def test_lambda_grid_brackets_the_diagnostics_pinned_lam_mult() -> None:
     assert any(abs(m - 1.0) < 1e-9 for m in LAM_MULTS)
 
 
-def test_ws_cell_reports_every_tap_x_norm_and_selects_only_lambda() -> None:
+def test_ws_cell_reports_every_tap_x_norm_and_selects_only_lambda(monkeypatch) -> None:
     """Ben 2026-07-17: λ is the ONLY val-selected axis. Every (tap, norm) must come back with
-    its own complete number — no argmax over taps, no argmax over norms, nothing dropped."""
+    its own complete number — no argmax over taps, no argmax over norms, nothing dropped. (Opt in
+    both norm columns via PROBE_NORMS; that norm coverage is exactly what this test guards.)"""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "NORMS", ("std", "raw"))
     rec = _rec()
     rec["feats"]["enc12_elec"] = rec["feats"]["enc12"]
-    got = _ws_cell(rec, "onset", ("enc12_elec", "enc12", "enc0"))
+    got = mod._ws_cell(rec, "onset", ("enc12_elec", "enc12", "enc0"))
     assert set(got["cells"]) == {f"{t}|{n}" for t in ("enc12_elec", "enc12", "enc0")
                                  for n in ("std", "raw")}
     assert got["cells"]["enc12|std"]["test"] == pytest.approx(1.0)
@@ -171,9 +174,10 @@ def test_ws_cell_reports_every_tap_x_norm_and_selects_only_lambda() -> None:
 
 
 def test_ws_cell_skips_taps_absent_from_the_cache() -> None:
-    """A cache encoded without --elec-taps must not NaN the whole session."""
+    """A cache encoded without --elec-taps must not NaN the whole session. (Default norm set is
+    std-only as of 2026-07-18; the point here is the absent tap is skipped, not the norm axis.)"""
     got = _ws_cell(_rec(), "onset", ("enc12_elec", "enc12"))
-    assert set(got["cells"]) == {"enc12|std", "enc12|raw"}
+    assert set(got["cells"]) == {"enc12|std"}
     assert got["cells"]["enc12|std"]["test"] == pytest.approx(1.0)
 
 
@@ -210,13 +214,44 @@ def test_cs_cell_aligns_parcel_columns_by_atlas_id_not_position() -> None:
     assert got["cells"]["enc12|std"]["test"] == pytest.approx(1.0)
 
 
-def test_cs_reports_std_raw_and_std_target_as_three_separate_columns() -> None:
+def test_cs_reports_all_three_norm_columns_when_opted_in(monkeypatch) -> None:
     """Ben 2026-07-17: per-domain std (AdaBN-style) is CS-only and a THIRD reported norm, on the
     same footing as std/raw. It is a different claim ("transfer GIVEN target statistics"), which
-    is exactly why it must be a column of its own and never fused into the others by an argmax."""
+    is exactly why it must be a column of its own and never fused into the others by an argmax.
+    OPT-IN as of 2026-07-18 (PROBE_NORMS) — when opted in, all three columns are still separate."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "NORMS", ("std", "raw"))
+    monkeypatch.setattr(mod, "WANT_STD_TARGET", True)
     anchor, test = _rec(seed=1), _rec(seed=2)
-    got = _cs_cell(anchor, test, "onset", ("enc12",))
+    got = mod._cs_cell(anchor, test, "onset", ("enc12",))
     assert set(got["cells"]) == {"enc12|std", "enc12|raw", "enc12|std_target"}
+
+
+def test_cs_defaults_to_std_only_column(monkeypatch) -> None:
+    """Default as of 2026-07-18 (Ben): std-only, so the readout is ~3x faster (std/raw/std_target
+    are three separate ridge solves per tap). raw and std_target are opt-in via PROBE_NORMS."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "NORMS", ("std",))
+    monkeypatch.setattr(mod, "WANT_STD_TARGET", False)
+    anchor, test = _rec(seed=1), _rec(seed=2)
+    got = mod._cs_cell(anchor, test, "onset", ("enc12",))
+    assert set(got["cells"]) == {"enc12|std"}
+
+
+def test_norm_config_parses_probe_norms_env(monkeypatch) -> None:
+    """PROBE_NORMS parsing: default std-only; comma list selects columns; 'all' = std,raw,std_target;
+    std_target is the CS-only extra flag, never a column-standardization mode."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.delenv("PROBE_NORMS", raising=False)
+    assert mod._norm_config() == (("std",), False)
+    monkeypatch.setenv("PROBE_NORMS", "std,raw")
+    assert mod._norm_config() == (("std", "raw"), False)
+    monkeypatch.setenv("PROBE_NORMS", "std,raw,std_target")
+    assert mod._norm_config() == (("std", "raw"), True)
+    monkeypatch.setenv("PROBE_NORMS", "all")
+    assert mod._norm_config() == (("std", "raw"), True)
+    monkeypatch.setenv("PROBE_NORMS", "")  # empty -> fall back to std-only, never zero columns
+    assert mod._norm_config() == (("std",), False)
 
 
 def test_per_domain_standardize_uses_val_stats_only_never_test() -> None:

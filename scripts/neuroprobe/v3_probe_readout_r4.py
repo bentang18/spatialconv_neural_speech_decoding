@@ -62,7 +62,17 @@ ALL_TAPS = ENCODERS + PERC_TAPS
 # is robust-z'd pre-pool while taps are at network scale). raw = as-cached (r1/M9-comparable).
 # std PRIMARY, raw the cross-check: they can disagree if signal is variance-concentrated (raw)
 # vs spread across many dims (std) — that disagreement is itself diagnostic of collapse.
-NORMS = ("std", "raw")
+# DEFAULT std-only for speed (Ben 2026-07-18): std and raw are separate ridge solves per tap, so
+# std-only is ~2x here. raw is OPT-IN via PROBE_NORMS ("std,raw" or "all"). Opt raw back in for CS
+# arch comparisons — a variance-concentrated CS delta shows up larger in raw (cf. r5mod +0.0092 raw
+# vs +0.0034 std) and the std-only headline would understate it.
+def _norm_config():
+    req = os.environ.get("PROBE_NORMS", "std").strip().lower()
+    req = ["std", "raw"] if req == "all" else [n.strip() for n in req.split(",") if n.strip()]
+    return tuple(n for n in req if n in ("std", "raw")) or ("std",)
+
+
+NORMS = _norm_config()
 CONST_LAM_MULT = 1.0
 PROBE_COHORT_7 = ((1, 0), (2, 1), (3, 2), (4, 2), (6, 0), (8, 0), (9, 0))
 
@@ -292,11 +302,13 @@ def main() -> None:
     p.add_argument("--mode", choices=("all", "array", "merge"), default="all")
     p.add_argument("--array-index", type=int, help="mode=array: 0..%d" % (N_ARRAY - 1))
     p.add_argument("--shard-dir", default=None, help="mode=array writes here, mode=merge reads here")
-    p.add_argument("--taps", default=",".join(ALL_TAPS),
-                   help="comma-separated subset of ALL_TAPS. COMPUTE ONLY THE DELTA: the enc "
-                        "ladder is a re-encode-invariant function of the ckpt, so when a tag is "
-                        "re-encoded purely to add Perceiver taps, pass --taps dec,lat,dec_rand,"
-                        "lat_rand and read enc0/3/6/12 off the existing results JSON.")
+    p.add_argument("--taps", default=",".join(ENCODERS),
+                   help="comma-separated subset of ALL_TAPS. DEFAULT = enc-only "
+                        "(enc0,enc3,enc6,enc12); the Perceiver taps (dec,lat,dec_rand,lat_rand) are "
+                        "OPT-IN because for a write-only/untrained head they are rank-degenerate and "
+                        "make the ridge gram singular. COMPUTE ONLY THE DELTA: the enc ladder is a "
+                        "re-encode-invariant function of the ckpt, so to add Perceiver taps pass "
+                        "--taps dec,lat,dec_rand,lat_rand and read enc0/3/6/12 off the existing JSON.")
     args = p.parse_args()
     tags = tuple(t.strip() for t in args.tags.split(","))
     taps = tuple(t.strip() for t in args.taps.split(","))

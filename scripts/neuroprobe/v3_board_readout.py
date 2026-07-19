@@ -105,9 +105,21 @@ ENCODERS = ("enc0", "enc3", "enc6", "enc12")          # parcel-mean (electrodes 
 ELEC_TAPS = ("enc12_elec",)
 WS_TAPS = ELEC_TAPS + ENCODERS
 CS_TAPS = ENCODERS
-NORMS = ("std", "raw")
-# norm is a REPORTED axis, not a selected one (Ben 2026-07-17): both columns are computed over
-# every cell and both are printed. Measured on our own r4 20k probe (results_v3_probe_r4_20k.json,
+# DEFAULT std-only for speed (Ben 2026-07-18): std / raw / std_target are three SEPARATE ridge
+# solves per tap (each a fresh gram + λ-sweep over the same gathered features), so reporting only
+# std cuts the readout ~3x. raw and std_target are OPT-IN via the PROBE_NORMS env var — "std,raw",
+# "std,raw,std_target", or "all". Keep this in mind for CS arch comparisons: every real encoder tap
+# mildly PREFERS raw cross-subject (measured below), so set PROBE_NORMS=std,raw when a CS delta is
+# the deciding number, or the std-only headline will understate it.
+def _norm_config():
+    req = os.environ.get("PROBE_NORMS", "std").strip().lower()
+    req = ["std", "raw", "std_target"] if req == "all" else [n.strip() for n in req.split(",") if n.strip()]
+    return (tuple(n for n in req if n in ("std", "raw")) or ("std",)), ("std_target" in req)
+
+
+NORMS, WANT_STD_TARGET = _norm_config()
+# norm is a REPORTED axis, not a selected one (Ben 2026-07-17): when opted in, all columns are
+# computed over every cell and all are printed. Measured on our own r4 20k probe (results_v3_probe_r4_20k.json,
 # 16 paired tap×task cells): std beats raw 16/16 WS (meanΔ +0.0277) but only 9/16 CS (meanΔ
 # +0.0026, median +0.0007 — a coin flip), and the whole CS edge is carried by enc0 (the already-
 # normalized input floor, +0.0281): every real encoder tap mildly PREFERS raw in CS (enc3 −0.0046,
@@ -342,10 +354,12 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
             grid[(enc, norm)] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
         # CS-only per-domain (AdaBN-style) normalization — a third REPORTED norm column, on the
         # same footing as std/raw. It is not a headline and not selected against them; it is the
-        # protocol "target subject z-scored in its own frame", reported over every cell.
-        a, (b, c) = _standardize_per_domain(z_tr, z_va, z_te)
-        grid[(enc, "std_target")] = _lam_grid(
-            a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
+        # protocol "target subject z-scored in its own frame", reported over every cell. OPT-IN
+        # (PROBE_NORMS contains std_target) — off by default so the readout is ~3x faster.
+        if WANT_STD_TARGET:
+            a, (b, c) = _standardize_per_domain(z_tr, z_va, z_te)
+            grid[(enc, "std_target")] = _lam_grid(
+                a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
     if not grid:
         return {"cells": {}}
     return {"cells": _grid_cells(grid), "n_parcels": int(common.size)}
