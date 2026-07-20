@@ -218,40 +218,34 @@ def test_cs_reports_all_three_norm_columns_when_opted_in(monkeypatch) -> None:
     """Ben 2026-07-17: per-domain std (AdaBN-style) is CS-only and a THIRD reported norm, on the
     same footing as std/raw. It is a different claim ("transfer GIVEN target statistics"), which
     is exactly why it must be a column of its own and never fused into the others by an argmax.
-    OPT-IN as of 2026-07-18 (PROBE_NORMS) — when opted in, all three columns are still separate."""
+    Monkeypatch the module norm globals on — when opted in, all three columns are still separate."""
     import scripts.neuroprobe.v3_board_readout as mod
     monkeypatch.setattr(mod, "NORMS", ("std", "raw"))
-    monkeypatch.setattr(mod, "WANT_STD_TARGET", True)
+    monkeypatch.setattr(mod, "REPORT_STD_TARGET", True)
     anchor, test = _rec(seed=1), _rec(seed=2)
     got = mod._cs_cell(anchor, test, "onset", ("enc12",))
     assert set(got["cells"]) == {"enc12|std", "enc12|raw", "enc12|std_target"}
 
 
 def test_cs_defaults_to_std_only_column(monkeypatch) -> None:
-    """Default as of 2026-07-18 (Ben): std-only, so the readout is ~3x faster (std/raw/std_target
-    are three separate ridge solves per tap). raw and std_target are opt-in via PROBE_NORMS."""
+    """Default as of 2026-07-20 (Ben): std-only, so the readout is ~2x faster (std and raw are
+    separate ridge solves per tap and raw is retired). std_target is gated by REPORT_STD_TARGET."""
     import scripts.neuroprobe.v3_board_readout as mod
     monkeypatch.setattr(mod, "NORMS", ("std",))
-    monkeypatch.setattr(mod, "WANT_STD_TARGET", False)
+    monkeypatch.setattr(mod, "REPORT_STD_TARGET", False)
     anchor, test = _rec(seed=1), _rec(seed=2)
     got = mod._cs_cell(anchor, test, "onset", ("enc12",))
     assert set(got["cells"]) == {"enc12|std"}
 
 
-def test_norm_config_parses_probe_norms_env(monkeypatch) -> None:
-    """PROBE_NORMS parsing: default std-only; comma list selects columns; 'all' = std,raw,std_target;
-    std_target is the CS-only extra flag, never a column-standardization mode."""
+def test_norms_default_is_std_only() -> None:
+    """Ben 2026-07-20: raw is retired, so the module norm default is std-only — the single column
+    the leaderboard reports. std_target stays available as a CS-only extra, gated by
+    REPORT_STD_TARGET / --no-std-target, and is never fused into std by an argmax."""
     import scripts.neuroprobe.v3_board_readout as mod
-    monkeypatch.delenv("PROBE_NORMS", raising=False)
-    assert mod._norm_config() == (("std",), False)
-    monkeypatch.setenv("PROBE_NORMS", "std,raw")
-    assert mod._norm_config() == (("std", "raw"), False)
-    monkeypatch.setenv("PROBE_NORMS", "std,raw,std_target")
-    assert mod._norm_config() == (("std", "raw"), True)
-    monkeypatch.setenv("PROBE_NORMS", "all")
-    assert mod._norm_config() == (("std", "raw"), True)
-    monkeypatch.setenv("PROBE_NORMS", "")  # empty -> fall back to std-only, never zero columns
-    assert mod._norm_config() == (("std",), False)
+    assert mod.NORMS == ("std",)
+    assert "raw" not in mod.NORMS
+    assert not hasattr(mod, "_norm_config")  # env-var opt-in mechanism removed
 
 
 def test_per_domain_standardize_uses_val_stats_only_never_test() -> None:
@@ -347,4 +341,4 @@ def test_mmap_is_never_the_default() -> None:
     43 minutes. Eager for both modes; the --mmap/--no-mmap knob stays for A/B only."""
     from scripts.neuroprobe.v3_board_readout import MMAP_DEFAULT
 
-    assert MMAP_DEFAULT == {"ws": False, "cs": False}
+    assert MMAP_DEFAULT == {"ws": False, "cs": False, "csession": False}

@@ -99,36 +99,38 @@ CS_TEST_CELLS = ((1, 1), (1, 2), (3, 0), (3, 1), (4, 0), (4, 1),
 LITE_SESSIONS = ((1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
                  (4, 0), (4, 1), (7, 0), (7, 1), (10, 0), (10, 1))
 ENCODERS = ("enc0", "enc3", "enc6", "enc12")          # parcel-mean (electrodes pooled at encode)
-# Per-electrode taps (Ben 2026-07-16): WS keeps ALL electrodes by DEFAULT; the parcel-mean is
-# the opt-in comparison, reported beside it so the diff is visible. CS cannot use these —
-# electrode identity is not shared across subjects, which is what the parcel bridge exists for.
-ELEC_TAPS = ("enc12_elec",)
-WS_TAPS = ELEC_TAPS + ENCODERS
+ELEC_TAPS = ("enc0_elec", "enc12_elec")   # per-electrode: enc0_elec = depth-0 parity FLOOR for enc12_elec
+ALL_TAPS = ELEC_TAPS + ENCODERS           # universe for --taps validation
+# Per-regime feature UNIT (Ben 2026-07-19): compute only the unit that is defensible for each
+# regime, so no column is a distraction on the leaderboard grid.
+#   WS / CSession → ELECTRODE-level only. The same electrodes are available (WS trivially;
+#     CSession via elec_labels identity-intersect within subject), so the per-electrode ladder
+#     is the meaningful unit — parcel-mean would only discard spatial resolution here.
+#   CSubject      → PARCEL-mean only. Electrode identity is NOT shared across subjects, so the
+#     anatomical parcel bridge is the only cross-subject-valid unit.
+WS_TAPS = ELEC_TAPS
 CS_TAPS = ENCODERS
-# DEFAULT std-only for speed (Ben 2026-07-18): std / raw / std_target are three SEPARATE ridge
-# solves per tap (each a fresh gram + λ-sweep over the same gathered features), so reporting only
-# std cuts the readout ~3x. raw and std_target are OPT-IN via the PROBE_NORMS env var — "std,raw",
-# "std,raw,std_target", or "all". std is the BETTER metric: on this 15-subject board std beats raw
-# at every tap, CS and WS (CS enc12 +0.0146, larger at shallower taps; WS enc12_elec +0.0012, 07-18).
-# raw is only a SENSITIVITY cross-check — a model-vs-model delta can surface larger in raw because it
-# preserves scale (r5mod-vs-Arm1 was +0.0092 raw / +0.0034 std), which is visibility, not a better
-# readout. Opt raw in only when checking whether a specific model delta is real.
-def _norm_config():
-    req = os.environ.get("PROBE_NORMS", "std").strip().lower()
-    req = ["std", "raw", "std_target"] if req == "all" else [n.strip() for n in req.split(",") if n.strip()]
-    return (tuple(n for n in req if n in ("std", "raw")) or ("std",)), ("std_target" in req)
+CSESSION_TAPS = ELEC_TAPS
+CSESSION_CELLS = LITE_SESSIONS            # every Lite session is a cross-session test cell, sibling-trained
 
 
-NORMS, WANT_STD_TARGET = _norm_config()
-# norm is a REPORTED axis, not a selected one (Ben 2026-07-17): when opted in, all columns are
-# computed over every cell and all are printed. Measured on our own r4 20k probe (results_v3_probe_r4_20k.json,
+def _sibling(cell):
+    """The other Lite trial of the SAME subject — upstream cross_session's train trial
+    (train_test_splits.py:146: the one other NEUROPROBE_LITE_SUBJECT_TRIALS entry for the subject)."""
+    s, _ = cell
+    sibs = [c for c in LITE_SESSIONS if c[0] == s and c != cell]
+    assert len(sibs) == 1, f"subject {s} must have exactly one sibling Lite trial, got {sibs}"
+    return sibs[0]
+# std_target (per-domain/AdaBN CS column) is REPORTED by default (preserves the r4 board), but
+# Ben's r5mod board is raw+std ONLY — toggle off with --no-std-target.
+REPORT_STD_TARGET = True
+NORMS = ("std",)   # std-only default (Ben 2026-07-20); raw retired
+# norm is a REPORTED axis, not a selected one (Ben 2026-07-17): both columns are computed over
+# every cell and both are printed. Measured on our own r4 20k probe (results_v3_probe_r4_20k.json,
 # 16 paired tap×task cells): std beats raw 16/16 WS (meanΔ +0.0277) but only 9/16 CS (meanΔ
 # +0.0026, median +0.0007 — a coin flip), and the whole CS edge is carried by enc0 (the already-
 # normalized input floor, +0.0281): every real encoder tap mildly PREFERS raw in CS (enc3 −0.0046,
-# enc6 −0.0091 @ 25% std-wins, enc12 −0.0041). ⚠️ CORRECTION (07-18): that raw-preference is the
-# 7-subject PRETRAIN cohort and a sub-0.01 coin flip; it does NOT replicate on the 15-subject board,
-# where std beats raw at every tap in CS (enc12 +0.0146) and WS. Do not read it as a real effect.
-# Mechanism for the regime split: WS fits μ/σ on the
+# enc6 −0.0091 @ 25% std-wins, enc12 −0.0041). Mechanism for the regime split: WS fits μ/σ on the
 # same session it scores, so the scaler is valid; CS fits μ/σ on the ANCHOR and applies it to a
 # DIFFERENT subject, where a scale mismatch makes z-scoring actively harmful. That is a RESULT,
 # and val-selecting over it would bury it — and would make the headline a per-cell mixture of two
@@ -359,15 +361,80 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
             grid[(enc, norm)] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
         # CS-only per-domain (AdaBN-style) normalization — a third REPORTED norm column, on the
         # same footing as std/raw. It is not a headline and not selected against them; it is the
-        # protocol "target subject z-scored in its own frame", reported over every cell. OPT-IN
-        # (PROBE_NORMS contains std_target) — off by default so the readout is ~3x faster.
-        if WANT_STD_TARGET:
+        # protocol "target subject z-scored in its own frame", reported over every cell.
+        # Gated by REPORT_STD_TARGET (Ben's r5mod board is raw+std only).
+        if REPORT_STD_TARGET:
             a, (b, c) = _standardize_per_domain(z_tr, z_va, z_te)
             grid[(enc, "std_target")] = _lam_grid(
                 a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
     if not grid:
         return {"cells": {}}
     return {"cells": _grid_cells(grid), "n_parcels": int(common.size)}
+
+
+def _elec_cols(train_rec, test_rec):
+    """Shared electrodes between two SAME-SUBJECT sessions, aligned BY LABEL (elec_labels).
+
+    Sibling Lite trials drop DIFFERENT bad channels (measured: 4/6 subjects differ, e.g. subj-3
+    100 vs 102), so the per-electrode axis is NOT positionally aligned across sessions —
+    intersecting by identity is the only correct alignment. Returns (train_idx, test_idx,
+    n_shared); (None, None, 0) if either cache lacks elec_labels (pre-edit cache) or no overlap."""
+    a = train_rec.get("elec_labels")
+    t = test_rec.get("elec_labels")
+    if a is None or t is None:
+        return None, None, 0
+    a = np.asarray(a)
+    t = np.asarray(t)
+    common = np.intersect1d(a, t)
+    if common.size == 0:
+        return None, None, 0
+    a_idx = [int(np.where(a == c)[0][0]) for c in common]
+    t_idx = [int(np.where(t == c)[0][0]) for c in common]
+    return a_idx, t_idx, int(common.size)
+
+
+def _csession_cell(train_rec, test_rec, task, taps) -> dict:
+    """Cross-session: train on the SIBLING trial of the SAME subject, λ-select on this cell's val
+    half, report its test half.
+
+    Upstream ``generate_splits_cross_session`` halves the test session IDENTICALLY to
+    ``generate_splits_cross_subject`` (train_test_splits.py:153-156 == 66-69: val=range(size//2),
+    test=range(size//2,size)), so ``cs_split``'s val/test are reused VERBATIM — only the train
+    anchor differs (the sibling trial, not S2T4). Parcel taps align by atlas id (``_parcel_cols``);
+    per-electrode taps align by electrode IDENTITY (``_elec_cols``), on the shared-electrode subset.
+    """
+    y_a = np.asarray(train_rec["labels"][task], dtype=np.float64)
+    y_t = np.asarray(test_rec["labels"][task], dtype=np.float64)
+    tr = _finite(y_a, np.arange(len(y_a)))
+    va = _finite(y_t, test_rec["cs_split"][task]["val"])
+    te = _finite(y_t, test_rec["cs_split"][task]["test"])
+    if len(tr) < 2 or len(te) < 2:
+        return {"cells": {}}
+    p_a, p_t, p_common = _parcel_cols(train_rec, test_rec)
+    e_a, e_t, n_elec = _elec_cols(train_rec, test_rec)
+    grid: dict = {}
+    for enc in taps:
+        if enc not in train_rec["feats"] or enc not in test_rec["feats"]:
+            continue
+        if enc in ELEC_TAPS:
+            if e_a is None:
+                continue
+            col_a, col_t = e_a, e_t
+        else:
+            if p_a is None:
+                continue
+            col_a, col_t = p_a, p_t
+        z_tr = _feat(train_rec, enc, tr, col_a)
+        z_va, z_te = _feat(test_rec, enc, va, col_t), _feat(test_rec, enc, te, col_t)
+        for norm in NORMS:
+            a, (b, c) = ((z_tr, [z_va, z_te]) if norm == "raw"
+                         else _standardize(z_tr, [z_va, z_te]))
+            grid[(enc, norm)] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
+    if not grid:
+        return {"cells": {}}
+    return {"cells": _grid_cells(grid),
+            "n_parcels": int(p_common.size) if p_a is not None else 0,
+            "n_elec": n_elec}
 
 
 # mmap default is PER MODE, and the reason is measured, not aesthetic (07-17, on enc_s2_t4
@@ -388,7 +455,7 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
 # mmap buys nothing and costs plenty: measured 15 MB/s with 3.7M major faults and RSS collapsed
 # to 1 GB, vs ~86 MB/s eager. A 43-min shard produced zero output under it.
 # Eager is right for BOTH modes. Keep the knob for A/B, but neither default is mmap.
-MMAP_DEFAULT = {"ws": False, "cs": False}
+MMAP_DEFAULT = {"ws": False, "cs": False, "csession": False}
 
 
 def _load(cache_dir, session, tag, mmap=False):
@@ -453,8 +520,20 @@ def _cs_shard(cache_dir, tag, cell, taps=CS_TAPS, workers=1,
             "cells": {f"{tag}|{k}": v for k, v in out.items()}}
 
 
+def _csession_shard(cache_dir, tag, cell, taps=CSESSION_TAPS, workers=1,
+                    mmap=MMAP_DEFAULT["csession"]) -> dict:
+    """Cross-session cell: train on the sibling trial (same subject), test on this session's
+    held-out half. Keeps the per-electrode taps (electrode identity IS shared within subject)."""
+    train_rec = _load(cache_dir, _sibling(cell), tag, mmap=mmap)
+    test_rec = _load(cache_dir, cell, tag, mmap=mmap)
+    out = _map_tasks(lambda task, tp: _csession_cell(train_rec, test_rec, task, tp), taps, workers)
+    return {"kind": "csession", "name": f"S{cell[0]}T{cell[1]}",
+            "cells": {f"{tag}|{k}": v for k, v in out.items()}}
+
+
 def _blank(tags) -> dict:
-    return {f"{tag}|{t}": {"ws": {}, "cs": {}, "pinned": {}, "sat": {}, "n_parcels": {}}
+    return {f"{tag}|{t}": {"ws": {}, "cs": {}, "csession": {}, "pinned": {}, "sat": {},
+                           "n_parcels": {}, "n_elec": {}}
             for tag in tags for t in BOARD_TASKS}
 
 
@@ -471,11 +550,13 @@ def _absorb(res, sh) -> None:
                 res[k]["sat"].setdefault(f"{kind}:{gk}", []).append(sh["name"])
         if val.get("n_parcels") is not None:
             res[k]["n_parcels"][sh["name"]] = val["n_parcels"]
+        if val.get("n_elec") is not None:
+            res[k]["n_elec"][sh["name"]] = val["n_elec"]
 
 
 def _merge(tags, shard_dir) -> dict:
     res = _blank(tags)
-    for kind in ("ws", "cs"):
+    for kind in ("ws", "cs", "csession"):
         for path in sorted(glob.glob(f"{shard_dir}/{kind}_*.json")):
             with open(path) as f:
                 _absorb(res, json.load(f))
@@ -483,9 +564,9 @@ def _merge(tags, shard_dir) -> dict:
 
 
 def _finalize(res: dict) -> dict:
-    """Cohort-mean each grid entry over its cells (12 WS sessions / 10 CS cells)."""
+    """Cohort-mean each grid entry over its cells (12 WS sessions / 10 CS cells / 12 cross-session)."""
     for c in res.values():
-        for kind in ("ws", "cs"):
+        for kind in ("ws", "cs", "csession"):
             c[f"{kind}_mean"] = {gk: float(np.nanmean(list(d.values())))
                                  for gk, d in c[kind].items() if d}
     return res
@@ -502,6 +583,10 @@ def _compute_all(cache_dir, tags, ws_taps=WS_TAPS, cs_taps=CS_TAPS) -> dict:
             sh = _cs_shard(cache_dir, tag, cell, cs_taps)
             _absorb(res, sh)
             print(f"[{tag}] CS done {sh['name']}", flush=True)
+        for cell in CSESSION_CELLS:
+            sh = _csession_shard(cache_dir, tag, cell, CSESSION_TAPS)
+            _absorb(res, sh)
+            print(f"[{tag}] CSession done {sh['name']}", flush=True)
     return _finalize(res)
 
 
@@ -523,7 +608,9 @@ def _report(tags, res) -> None:
     job is to put every number on the table honestly.
     """
     for tag in tags:
-        for kind, label in (("cs", "CS (anchor S2T4 → 10 cells)"), ("ws", "WS (12 sessions)")):
+        for kind, label in (("cs", "CS (anchor S2T4 → 10 cells)"),
+                            ("csession", "CSession (12 cells, sibling-trained)"),
+                            ("ws", "WS (12 sessions)")):
             gks = sorted({g for t in BOARD_TASKS for g in res[f"{tag}|{t}"].get(kind, {})},
                          key=lambda g: (g.split("|")[1], g.split("|")[0]))
             if not gks:
@@ -539,7 +626,7 @@ def _report(tags, res) -> None:
 
         # Contrasts the grid above already contains, stated as differences so the ordering is
         # not left to the reader's eye. These are READS of the table, never separate fits.
-        for kind, taps in (("cs", ENCODERS), ("ws", WS_TAPS)):
+        for kind, taps in (("cs", ENCODERS), ("csession", CSESSION_TAPS), ("ws", WS_TAPS)):
             norms = sorted({g.split("|")[1] for t in BOARD_TASKS
                             for g in res[f"{tag}|{t}"].get(kind, {})})
             if not norms:
@@ -556,13 +643,22 @@ def _report(tags, res) -> None:
                         continue
                     print(f"  {tp:12s} {nm:11s} {x:.4f}  vs std {y:.4f}  Δ {x - y:+.4f}",
                           flush=True)
-            if kind == "ws":
+            # per-electrode vs parcel-mean at enc12 — meaningful where electrodes are shared
+            # (WS trivially; CSession via identity intersection). CS has no shared electrodes.
+            if kind in ("ws", "csession"):
                 for nm in norms:
                     e, q = (_macro(res, tag, kind, f"enc12_elec|{nm}"),
                             _macro(res, tag, kind, f"enc12|{nm}"))
                     if not (np.isnan(e) or np.isnan(q)):
                         print(f"  [diff] enc12 per-electrode − parcel-mean ({nm}) = {e - q:+.4f}"
                               f"  ({e:.4f} vs {q:.4f})", flush=True)
+                # depth-0 parity floor: enc0_elec vs enc12_elec, both per-electrode
+                for nm in norms:
+                    f0, f12 = (_macro(res, tag, kind, f"enc0_elec|{nm}"),
+                               _macro(res, tag, kind, f"enc12_elec|{nm}"))
+                    if not (np.isnan(f0) or np.isnan(f12)):
+                        print(f"  [diff] enc12_elec − enc0_elec ({nm}) = {f12 - f0:+.4f}"
+                              f"  ({f12:.4f} vs {f0:.4f})  [per-electrode depth gain]", flush=True)
 
     # λ pin check. The two boundaries are NOT the same failure and must not be counted together:
     #   HI (λ=LAM_MULTS[-1]) → BENIGN. AUROC saturates as λ→∞ (α→(1/λ)·y ⇒ scores→(1/λ)·K@y, a
@@ -600,8 +696,10 @@ def main() -> None:
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--tags", default="board_r4_20k")
     p.add_argument("--out", required=True)
-    p.add_argument("--mode", choices=("all", "ws", "cs", "merge"), default="all")
-    p.add_argument("--index", type=int, help="shard index (mode=ws|cs)")
+    p.add_argument("--mode", choices=("all", "ws", "cs", "csession", "merge"), default="all")
+    p.add_argument("--index", type=int, help="shard index (mode=ws|cs|csession)")
+    p.add_argument("--no-std-target", dest="std_target", action="store_false",
+                   help="drop the CS std_target (AdaBN) column — Ben's r5mod board is raw+std only.")
     p.add_argument("--shard-dir")
     p.add_argument("--workers", type=int, default=1,
                    help="fork this many task-workers per shard (memory-bound: WS ~3, CS ~8). "
@@ -613,20 +711,26 @@ def main() -> None:
     p.add_argument("--no-mmap", dest="mmap", action="store_false",
                    help="force one eager sequential read of the whole cache.")
     p.add_argument("--taps", default="",
-                   help=f"comma-separated subset of {WS_TAPS} (default: all; CS drops "
+                   help=f"comma-separated subset of {ALL_TAPS} (default: per-regime; CS drops "
                         f"{ELEC_TAPS} automatically)")
     args = p.parse_args()
 
-    tags = tuple(t.strip() for t in args.tags.split(","))
-    taps = tuple(t.strip() for t in args.taps.split(",") if t.strip()) or WS_TAPS
-    bad = [t for t in taps if t not in WS_TAPS]
-    if bad:
-        raise SystemExit(f"unknown taps {bad}; choose from {WS_TAPS}")
+    global REPORT_STD_TARGET
+    REPORT_STD_TARGET = args.std_target
 
-    if args.mode in ("ws", "cs"):
-        cells = LITE_SESSIONS if args.mode == "ws" else CS_TEST_CELLS
+    tags = tuple(t.strip() for t in args.tags.split(","))
+    # Default taps are per-REGIME (WS/CSession electrode-only, CS parcel-only); --taps overrides.
+    _mode_taps = {"ws": WS_TAPS, "cs": CS_TAPS, "csession": CSESSION_TAPS}
+    taps = (tuple(t.strip() for t in args.taps.split(",") if t.strip())
+            or _mode_taps.get(args.mode, ALL_TAPS))
+    bad = [t for t in taps if t not in ALL_TAPS]
+    if bad:
+        raise SystemExit(f"unknown taps {bad}; choose from {ALL_TAPS}")
+
+    if args.mode in ("ws", "cs", "csession"):
+        cells = {"ws": LITE_SESSIONS, "cs": CS_TEST_CELLS, "csession": CSESSION_CELLS}[args.mode]
         cell = cells[args.index]
-        fn = _ws_shard if args.mode == "ws" else _cs_shard
+        fn = {"ws": _ws_shard, "cs": _cs_shard, "csession": _csession_shard}[args.mode]
         t0 = time.perf_counter()
         use_mmap = MMAP_DEFAULT[args.mode] if args.mmap is None else args.mmap
         sh = fn(args.cache_dir, tags[0], cell, taps, workers=args.workers, mmap=use_mmap)
