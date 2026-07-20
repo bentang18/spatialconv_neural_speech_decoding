@@ -168,6 +168,28 @@ def _standardize(z_tr, others):
         return (z_tr - mu) / sd, [(z - mu) / sd for z in others]
 
 
+def _standardize_inplace(z_tr, others):
+    """Bit-identical to _standardize but MUTATES its inputs — no second copy of the design
+    matrix ever exists. `z -= mu; z /= sd` is the same two fp32 ufuncs in the same order as
+    `(z - mu) / sd`, so every downstream number is unchanged; the only difference is that the
+    ~tens-of-GB std copy is never allocated. That copy is what pushed heavy CSession cells (two
+    sessions' design matrices resident at once) past the node memory cap into thrash.
+
+    CONSUMES z_tr and every array in `others` — the caller must run any norm that needs the RAW
+    features (raw, std_target) BEFORE this one. `_run_norms` enforces that ordering.
+    """
+    with _timed("standardize"):
+        mu = z_tr.mean(axis=0)
+        sd = z_tr.std(axis=0)
+        sd[sd == 0] = 1.0
+        z_tr -= mu
+        z_tr /= sd
+        for z in others:
+            z -= mu
+            z /= sd
+        return z_tr, others
+
+
 def _standardize_per_domain(z_tr, z_va, z_te):
     """CS ablation: each SUBJECT z-scored in its OWN frame (AdaBN-style target adaptation).
 
@@ -302,6 +324,28 @@ def _parcel_cols(anchor_rec, test_rec):
     return a_idx, t_idx, common
 
 
+def _run_norms(grid, enc, z_tr, z_va, z_te, y_tr, y_va, y_te, cs=False):
+    """Score one tap's λ-grid under every REPORTED norm, holding only ONE copy of each design
+    matrix in memory.
+
+    ORDER IS LOAD-BEARING: raw and std_target both read the RAW
+    features, so they run BEFORE the in-place std that consumes (mutates) z_tr/z_va/z_te. With
+    this ordering every norm's numbers are bit-identical to the old copy-based path; the only
+    change is that the std copy — the ~tens-of-GB duplicate that thrashed heavy CSession cells —
+    is never allocated. std_target (_standardize_per_domain) makes its own copies and never
+    mutates its inputs, so it is safe to run before the in-place std."""
+    def evals(b, c):
+        return {"val": (b, y_va), "test": (c, y_te)}
+    if "raw" in NORMS:
+        grid[(enc, "raw")] = _lam_grid(z_tr, y_tr, evals(z_va, z_te))
+    if cs and REPORT_STD_TARGET:
+        a, (b, c) = _standardize_per_domain(z_tr, z_va, z_te)
+        grid[(enc, "std_target")] = _lam_grid(a, y_tr, evals(b, c))
+    if "std" in NORMS:
+        a, (b, c) = _standardize_inplace(z_tr, [z_va, z_te])
+        grid[(enc, "std")] = _lam_grid(a, y_tr, evals(b, c))
+
+
 def _ws_cell(rec, task, taps) -> dict:
     """Within-session: board KFold(2). Per fold fit train, λ-select on the val half, report the
     test half; average the two folds' test AUROCs, per (tap, norm)."""
@@ -317,10 +361,7 @@ def _ws_cell(rec, task, taps) -> dict:
                 continue
             z_tr = _feat(rec, enc, tr)
             z_va, z_te = _feat(rec, enc, va), _feat(rec, enc, te)
-            for norm in NORMS:
-                a, (b, c) = ((z_tr, [z_va, z_te]) if norm == "raw"
-                             else _standardize(z_tr, [z_va, z_te]))
-                grid[(enc, norm)] = _lam_grid(a, y[tr], {"val": (b, y[va]), "test": (c, y[te])})
+            _run_norms(grid, enc, z_tr, z_va, z_te, y[tr], y[va], y[te])
         if grid:
             folds.append(_grid_cells(grid))
     if not folds:
@@ -355,18 +396,10 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
             continue
         z_tr = _feat(anchor_rec, enc, tr, a_idx)
         z_va, z_te = _feat(test_rec, enc, va, t_idx), _feat(test_rec, enc, te, t_idx)
-        for norm in NORMS:
-            a, (b, c) = ((z_tr, [z_va, z_te]) if norm == "raw"
-                         else _standardize(z_tr, [z_va, z_te]))
-            grid[(enc, norm)] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
-        # CS-only per-domain (AdaBN-style) normalization — a third REPORTED norm column, on the
-        # same footing as std/raw. It is not a headline and not selected against them; it is the
-        # protocol "target subject z-scored in its own frame", reported over every cell.
-        # Gated by REPORT_STD_TARGET (Ben's r5mod board is raw+std only).
-        if REPORT_STD_TARGET:
-            a, (b, c) = _standardize_per_domain(z_tr, z_va, z_te)
-            grid[(enc, "std_target")] = _lam_grid(
-                a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
+        # cs=True reports the AdaBN-style per-domain norm (std_target) as a third column; it makes
+        # its own copies and reads the RAW features, so _run_norms runs it before the in-place std.
+        # Gated by REPORT_STD_TARGET (Ben's r5mod board is std-only via --no-std-target).
+        _run_norms(grid, enc, z_tr, z_va, z_te, y_a[tr], y_t[va], y_t[te], cs=True)
     if not grid:
         return {"cells": {}}
     return {"cells": _grid_cells(grid), "n_parcels": int(common.size)}
@@ -426,10 +459,7 @@ def _csession_cell(train_rec, test_rec, task, taps) -> dict:
             col_a, col_t = p_a, p_t
         z_tr = _feat(train_rec, enc, tr, col_a)
         z_va, z_te = _feat(test_rec, enc, va, col_t), _feat(test_rec, enc, te, col_t)
-        for norm in NORMS:
-            a, (b, c) = ((z_tr, [z_va, z_te]) if norm == "raw"
-                         else _standardize(z_tr, [z_va, z_te]))
-            grid[(enc, norm)] = _lam_grid(a, y_a[tr], {"val": (b, y_t[va]), "test": (c, y_t[te])})
+        _run_norms(grid, enc, z_tr, z_va, z_te, y_a[tr], y_t[va], y_t[te])
     if not grid:
         return {"cells": {}}
     return {"cells": _grid_cells(grid),
