@@ -52,8 +52,6 @@ from speech_decoding.models.v14_converged_v3.dataset import (
 )
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
-from speech_decoding.models.v14_converged_v3.objective import LAMBDA_CTX, LAMBDA_NLL
-from speech_decoding.models.v14_converged_v3.secondary_head import NLL_FLOOR_JITTER
 from speech_decoding.models.v14_converged_v3.session_loader import (
     ParcelFn,
     load_v3_sessions,
@@ -260,11 +258,6 @@ def build_v3_training(
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
-        lambda_nll=getattr(args, "lambda_nll", LAMBDA_NLL),
-        nll_floor=getattr(args, "nll_floor", True),
-        secondary_loss=getattr(args, "secondary_loss", "nll"),
-        context_loss=getattr(args, "context_loss", False),
-        lambda_ctx=getattr(args, "lambda_ctx", LAMBDA_CTX),
         mae=mae, native_fine_hga=native_fine_hga,
     )
     optim = build_v3_optim_cfg(
@@ -275,12 +268,6 @@ def build_v3_training(
     module = V14ConvergedV3Module(
         model=model, optim_config=optim, seed=args.seed,
         monitor_every_n_steps=args.monitor_every_n_steps,
-        secondary_active=_secondary_active(args),
-        grad_ratio_every_n_steps=args.grad_ratio_every_n_steps,
-        nll_warmup_start_step=getattr(args, "nll_warmup_start_step", 0),
-        nll_warmup_steps=getattr(args, "nll_warmup_steps", 0),
-        ctx_warmup_start_step=getattr(args, "ctx_warmup_start_step", 0),
-        ctx_warmup_steps=getattr(args, "ctx_warmup_steps", 0),
     )
     dm = V3DataModule(
         sessions,
@@ -295,34 +282,6 @@ def build_v3_training(
     )
     trainer = _build_trainer(args)
     return module, dm, trainer
-
-
-def _secondary_active(args: argparse.Namespace) -> bool:
-    """The secondary Gaussian-NLL is ON iff a state-stats dir is configured (the
-    datamodule then supplies per-session stats and the write-only Perceiver receives
-    gradient). deep_sup is required for the Perceiver to exist at all."""
-    return bool(getattr(args, "state_stats_dir", None)) and bool(
-        getattr(args, "deep_sup", True)
-    )
-
-
-def _enabled_optional_modules(args: argparse.Namespace) -> list[str]:
-    """Optional modules that join the TRAINABLE set beyond the r1/r2 plain-JEPA
-    baseline (encoder + EMA teacher + predictor + ``pred_to_target``).
-
-    Each entry is ``"<module> (<flag that enabled it>)"``. The r3 gate below fires on a
-    NON-EMPTY list under multi-GPU static_graph — the crash surface is "the trainable
-    parameter set grew", not any one head, so a new optional module must be listed HERE
-    or it walks into the same crash. r4's secondary write-only Perceiver Gaussian-NLL is
-    exactly such a module: when --state-stats-dir is set the Perceiver receives gradient
-    every step (same shape as r3's always-connected context head). r3 died on this under
-    static_graph, so the launch must run --no-ddp-static-graph (the default) or ack it."""
-    enabled: list[str] = []
-    if _secondary_active(args):
-        enabled.append("secondary Perceiver Gaussian-NLL (--state-stats-dir)")
-    if getattr(args, "context_loss", False):
-        enabled.append("V-JEPA 2.1 context head (--context-loss)")
-    return enabled
 
 
 def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
@@ -394,48 +353,9 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
         # what static_graph requires, not fixed shapes. v2 ran static_graph=True with
         # the same session-grouped ragged batching, and it composes with torch.compile
         # (fewer DDP reducer re-analyses). Only active on multi-GPU (single-GPU launch
-        # never builds a DDPStrategy).
-        optional = _enabled_optional_modules(args)
-        if (
-            optional
-            and args.ddp_static_graph
-            and not getattr(args, "ack_r3_static_graph", False)
-        ):
-            raise SystemExit(
-                "REFUSING TO LAUNCH: optional module(s) join the trainable set under\n"
-                "multi-GPU DDP static_graph:\n"
-                + "".join(f"    {m}\n" for m in optional)
-                + "\n"
-                "This is the r3 shape. r3 (DeltaAI 2653154, 2026-07-14) enabled exactly one\n"
-                "such module (the context head) and all 4 ranks died at the FIRST backward with\n"
-                "    expect_autograd_hooks_ INTERNAL ASSERT FAILED (c10d/reducer.cpp:1703)\n"
-                "after ~5 min of compile warmup — 0 usable steps, GPU hours burned.\n"
-                "\n"
-                "ROOT CAUSE IS NOT ESTABLISHED. Two plausible stories were tested and REFUTED:\n"
-                "  - 'context head is unused during the lambda warmup'  -> refuted: _static_off\n"
-                "    is a TYPE test, so the 0-d tensor lambda keeps the head graph-connected;\n"
-                "    it gets zero-valued grads, not no grads.\n"
-                "  - 'the head joining DDP's buckets is the trigger'    -> refuted: a CPU/gloo\n"
-                "    repro asserts identically with the head frozen (r2) and live (r3).\n"
-                "What IS established (CPU/gloo, zero GPU, committed as\n"
-                "experiments/test_ddp_static_graph_repro.py): static_graph=False survives every\n"
-                "configuration tested.\n"
-                "\n"
-                "The gate is therefore NOT about which module it is — it fires on ANY growth of\n"
-                "the trainable set beyond the r1/r2 baseline (r1 ran ~43k steps on that baseline\n"
-                "with static_graph=True; nothing else about static_graph has been cleared).\n"
-                "\n"
-                "DO NOT 'fix' this with find_unused_parameters=True — the module is not unused.\n"
-                "DO NOT freeze/unfreeze it at warmup_start — that mutates graph structure\n"
-                "mid-run, which static_graph forbids; it trades a step-0 crash for a step-15k one.\n"
-                "\n"
-                "Relaunch with --no-ddp-static-graph (DDP bookkeeping only: it does not touch\n"
-                "gradients, the loss, or any locked hyperparameter, so it is NOT a contract\n"
-                "change). Costs some throughput.\n"
-                "\n"
-                "To override deliberately, pass --ack-r3-static-graph.\n"
-                "See memory: project-v3-r3-ddp-static-graph-crash-2026-07-14"
-            )
+        # never builds a DDPStrategy). Default OFF: static_graph killed r3 at the first
+        # backward (project-v3-r3-ddp-static-graph-crash-2026-07-14); opt back in only on
+        # a plain-JEPA baseline with --ddp-static-graph.
         kwargs["strategy"] = DDPStrategy(
             find_unused_parameters=False, static_graph=args.ddp_static_graph
         )
@@ -500,7 +420,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "reconstruct each masked token's OWN norm_pix'd input |STFT| bins, "
                         "no EMA teacher). ONLY the target changes; the visible-only encoder, "
                         "predictor, mask query, margin-gated in_loss, and all locked HPs are "
-                        "identical. 'mae' forbids --state-stats-dir / --context-loss.")
+                        "identical.")
     p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine"),
                    default="v3",
                    help="temporal front-end: 'v3' (default, uniform-32Hz PerBandStem — the "
@@ -515,73 +435,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
-    p.add_argument("--grad-ratio-every-n-steps", dest="grad_ratio_every_n_steps",
-                   type=int, default=0,
-                   help="live loss-balance readout (#43): every N opt-steps log "
-                        "‖g_nll‖/‖g_jepa‖ on the shared online tower. 0 = OFF (the launch "
-                        "default). SINGLE-PROCESS ONLY (--devices 1): the extra autograd.grad "
-                        "passes re-enter the DDP reducer (the r3 static_graph×grad-accum crash "
-                        "surface), so the module hard-refuses world_size>1. 1-GPU diagnostic only.")
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=1,
                    help="wandb flush cadence; 1 = per-step resolution (Ben 2026-07-11) "
                         "so update_cos/grad-spike/feat_std are not window-averaged away")
-    p.add_argument("--state-stats-dir", dest="state_stats_dir", default=None,
-                   help="dir of per-subject frozen state-norm tables (sub-<id>.npz with "
-                        "stat_mean/stat_std, each (n_parcels, 6) indexed by parcel id "
-                        "VALUE). Present ⇒ the secondary write-only Perceiver Gaussian-NLL "
-                        "is ON (total = JEPA_L1 + λ·NLL); omit ⇒ JEPA-only. Requires "
-                        "--deep-sup (the Perceiver reads the deep-sup taps).")
-    p.add_argument("--lambda-nll", dest="lambda_nll", type=float, default=LAMBDA_NLL,
-                   help="secondary Gaussian-NLL weight λ in total = JEPA_L1 + λ·NLL "
-                        f"(contract §5 open knob; default {LAMBDA_NLL}). This is the HOLD value "
-                        "the ramp climbs to. No effect without --state-stats-dir.")
-    p.add_argument("--nll-floor", dest="nll_floor",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="ON (default, r1–r4): Sigma = L Lᵀ + the measured count-dependent "
-                        "noise floor. --no-nll-floor is r5 Arm 2 (floor-off): the head learns "
-                        f"Sigma with only a {NLL_FLOOR_JITTER:g} conditioning jitter, no "
-                        "measured floor. No effect without --state-stats-dir.")
-    p.add_argument("--secondary-loss", dest="secondary_loss",
-                   choices=("nll", "l1", "diag_nll"), default="nll",
-                   help="'diag_nll' (r5-mod, the CURRENT 5-dim objective): point (mu-only) "
-                        "head scored by frozen-diagonal Gaussian NLL over the 5-dim state "
-                        "[slow_mu, mid_mu, hga_mu, relmod48, relmod816] — sigma^2 is the "
-                        "measured count-dependent noise floor, FROZEN, so the loss drops only "
-                        "via a better mu (closes the r4 free-sigma flatline hatch). Requires "
-                        "--nll-floor. 'nll' (r1–r4, RETIRED for the 5-dim layout — its D//2 "
-                        "mean/std split mis-scores the 3/2 state): full-covariance Gaussian "
-                        "NLL. 'l1' is r5 Arm 3 (POINT loss): mu-only head scored by mean "
-                        "per-position sum|x-mu| over present dims. No effect without "
-                        "--state-stats-dir.")
-    p.add_argument("--nll-warmup-start-step", dest="nll_warmup_start_step",
-                   type=int, default=0,
-                   help="opt-step at which the secondary-NLL λ ramp OPENS. Before it, λ=0 "
-                        "(the Perceiver head stays in-graph with zero grad — DDP-safe). "
-                        "Default 0 ⇒ ramp opens immediately.")
-    p.add_argument("--nll-warmup-steps", dest="nll_warmup_steps",
-                   type=int, default=0,
-                   help="length (opt-steps) of the linear 0→--lambda-nll ramp starting at "
-                        "--nll-warmup-start-step; λ holds at --lambda-nll after. Default 0 ⇒ "
-                        "no ramp (constant λ==--lambda-nll from --nll-warmup-start-step).")
-    p.add_argument("--context-loss", dest="context_loss", action="store_true",
-                   help="V-JEPA 2.1 §2.3.1 context loss: the predictor also predicts the "
-                        "per-level-normed teacher target at the VISIBLE (context) tokens via a "
-                        "SEPARATE projection head, scored by the same L1 at ~masked positions, "
-                        "λ_ctx-weighted (total += λ_ctx·L_ctx). Off ⇒ zero new params. Requires "
-                        "--deep-sup.")
-    p.add_argument("--lambda-ctx", dest="lambda_ctx", type=float, default=LAMBDA_CTX,
-                   help=f"context-loss weight λ_ctx — the HOLD the ramp climbs to (default "
-                        f"{LAMBDA_CTX}, V-JEPA 2.1 Eq 2 peak). No effect without --context-loss.")
-    p.add_argument("--ctx-warmup-start-step", dest="ctx_warmup_start_step",
-                   type=int, default=0,
-                   help="opt-step at which the context-loss λ_ctx ramp OPENS. Before it, λ_ctx=0 "
-                        "(the context head stays in-graph with zero grad — DDP-safe). Default 0 "
-                        "⇒ ramp opens immediately.")
-    p.add_argument("--ctx-warmup-steps", dest="ctx_warmup_steps",
-                   type=int, default=0,
-                   help="length (opt-steps) of the linear 0→--lambda-ctx ramp starting at "
-                        "--ctx-warmup-start-step; λ_ctx holds at --lambda-ctx after. Default 0 ⇒ "
-                        "no ramp (constant λ_ctx==--lambda-ctx from --ctx-warmup-start-step).")
     p.add_argument("--deep-sup", dest="deep_sup",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="deep self-supervision (#61, V-JEPA 2.1 copy-exactly): tap "
@@ -601,11 +457,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "modules, so it needs static_graph=False regardless; defaulting it "
                         "on was a landmine with nothing to gain. Pass --ddp-static-graph "
                         "explicitly to opt back in on a plain-JEPA baseline.")
-    p.add_argument("--ack-r3-static-graph", dest="ack_r3_static_graph",
-                   action="store_true",
-                   help="override the r3 crash gate and launch an optional-module run "
-                        "(e.g. --state-stats-dir set) with multi-GPU static_graph anyway "
-                        "(this killed r3 at the first backward)")
     p.add_argument("--same-session-ranks", dest="same_session_ranks",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="All DDP ranks step the SAME session each step (v2 "
@@ -628,10 +479,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Lightning ckpt_path to restore before fit (model + optimizer + "
                         "EMA + global_step + loop state). Use to FORK a run: point at a "
                         "prior ladder-<step>.ckpt to branch from that step with a changed "
-                        "config (e.g. r4b = r4's step-10000 ckpt with --lambda-nll 0). The "
-                        "resumed trainable-param set must match the ckpt's, so keep "
-                        "--state-stats-dir when the ckpt was trained with it. Default None "
-                        "= fresh run from step 0.")
+                        "config. The resumed trainable-param set must match the ckpt's. "
+                        "Default None = fresh run from step 0.")
     p.add_argument("--wandb-project", dest="wandb_project", default=None,
                    help="wandb project (live); omit to disable logging")
     p.add_argument("--run-name", dest="run_name", default=None)
@@ -654,18 +503,6 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         raise ValueError(
             f"need 3 --band-cache-dir (slow, mid, hga), got {len(args.band_cache_dirs)}"
         )
-    if args.grad_ratio_every_n_steps > 0 and args.devices and args.devices != 1:
-        raise SystemExit(
-            "REFUSING TO LAUNCH: --grad-ratio-every-n-steps > 0 requires --devices 1.\n"
-            "The live grad-ratio does two extra autograd.grad passes over the shared online\n"
-            "tower; under multi-GPU DDP those re-enter the reducer over the shared graph — the\n"
-            "r3 static_graph×grad-accum crash surface. It is a 1-GPU diagnostic lever only."
-        )
-    if args.objective == "mae" and (args.state_stats_dir or args.context_loss):
-        raise SystemExit(
-            "REFUSING TO LAUNCH: --objective mae has no secondary NLL or context loss.\n"
-            "Drop --state-stats-dir / --context-loss (MAE reconstructs the raw input target)."
-        )
     pl.seed_everything(args.seed, workers=True)
 
     _, band_rates = _frontend_config(args)
@@ -676,7 +513,6 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         parcel_fn=make_bt_parcel_fn(args.bt_root),
         lof_report_path=args.lof_report_path,
         winsor=(args.winsor_slow, args.winsor_mid, args.winsor_hga),
-        state_stats_dir=args.state_stats_dir,
         band_rates=band_rates,
     )
     module, dm, trainer = build_v3_training(sessions, args)

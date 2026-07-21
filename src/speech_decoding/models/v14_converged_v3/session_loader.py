@@ -22,7 +22,6 @@ everything else is exercised locally with synthetic caches + a stub parcel_fn.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -70,27 +69,6 @@ def _load_stats(stats_path: str) -> tuple[Tensor, Tensor]:
     return torch.from_numpy(z["median"]).float(), torch.from_numpy(z["sigma"]).float()
 
 
-def _load_state_stats(
-    state_stats_dir: str | None, subject_id: int
-) -> tuple[Tensor | None, Tensor | None]:
-    """Per-SUBJECT frozen state-norm table for the secondary Gaussian-NLL.
-
-    ``<state_stats_dir>/sub-<subject_id>.npz`` holds ``stat_mean``/``stat_std``, each
-    (n_parcels, 6) indexed by parcel id VALUE — the same index space as the perceiver's
-    parcel embedding and ``raw_state_vectors``. ``build_session_setup`` gathers the rows
-    for this session's survivor parcels and fails loud on shape/coverage. Stats are frozen
-    per SUBJECT (over the subject's train clips), so all of a subject's sessions share one
-    table. ``None`` dir ⇒ secondary OFF (JEPA-only)."""
-    if state_stats_dir is None:
-        return None, None
-    path = os.path.join(state_stats_dir, f"sub-{subject_id}.npz")
-    z = np.load(path)
-    return (
-        torch.from_numpy(z["stat_mean"]).float(),
-        torch.from_numpy(z["stat_std"]).float(),
-    )
-
-
 def load_v3_sessions(
     *,
     sessions: Sequence[tuple[int, int]],
@@ -101,7 +79,6 @@ def load_v3_sessions(
     sigma_floor: float = 1e-6,
     winsor: float | Sequence[float] | None = None,
     mask_cfg: V3MaskConfig = V3MaskConfig(),
-    state_stats_dir: str | None = None,
     keep_labels_fn: KeepLabelsFn | None = None,
     band_rates: Sequence[tuple[int, int]] = UNIFORM_BAND_RATES,
 ) -> list[V3SessionSpec]:
@@ -113,9 +90,6 @@ def load_v3_sessions(
     native frame count and the spec's ``n_frames`` is the derived 32 Hz reference. The
     dataset MUST be built with the same ``band_rates`` (memo
     project-fine-hga-bt-rebake-tasklist-2026-07-21).
-
-    ``state_stats_dir`` (opt): dir of per-subject frozen state-norm tables that turn ON
-    the secondary Gaussian-NLL; omit ⇒ JEPA-only.
 
     ``keep_labels_fn`` (opt): ``(subject_id, trial_id, labels) -> set[str]`` naming the
     electrodes to KEEP; everything else joins the LOF drop set. Injected like ``parcel_fn``
@@ -156,10 +130,8 @@ def load_v3_sessions(
                     f"{len(labels)} electrodes — montage does not match this cache"
                 )
             drop |= restricted
-        stat_mean, stat_std = _load_state_stats(state_stats_dir, subject_id)
         setup = build_session_setup(
             labels, parcel_id, drop_labels=drop, mask_cfg=mask_cfg,
-            stat_mean=stat_mean, stat_std=stat_std,
         )
         band_stats = [_load_stats(e.stats_path) for e in entries]
         n_frames_32 = reference_n_frames(

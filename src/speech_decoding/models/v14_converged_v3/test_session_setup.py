@@ -24,7 +24,6 @@ import torch
 
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
-from speech_decoding.models.v14_converged_v3.state_target import STATE_DIM
 
 
 def _labels(shaft_sizes):
@@ -133,77 +132,6 @@ def test_feasibility_passes_for_uniform_seeg() -> None:
     parcel = _parcels(labels)
     setup = build_session_setup(labels, parcel, drop_labels=set())  # must not raise
     assert setup.geom.n_shafts == 6
-
-
-def _stat_table(n_parcels):
-    # by-parcel-VALUE frozen stats; row p = [p*10 + d for d in 0..4] so a gather is checkable.
-    base = torch.arange(n_parcels, dtype=torch.float32)[:, None] * 10.0
-    return base + torch.arange(STATE_DIM, dtype=torch.float32)[None, :]
-
-
-def test_stats_none_by_default_secondary_off() -> None:
-    labels = _labels((4, 3, 3))
-    parcel = _parcels(labels)
-    setup = build_session_setup(labels, parcel, drop_labels=set())
-    assert setup.stat_mean is None
-    assert setup.stat_std is None
-
-
-def test_stats_gathered_and_aligned_to_survivor_parcels() -> None:
-    # by-value table indexed by parcel id; setup gathers rows for unique(survivor parcels),
-    # aligned to raw_state_vectors' torch.unique(parcel_id) order.
-    labels = _labels((4, 3, 3))  # parcels 0,0,0,0,1,1,1,2,2,2
-    parcel = _parcels(labels)
-    sm, ss = _stat_table(3), _stat_table(3) + 0.5
-    setup = build_session_setup(
-        labels, parcel, drop_labels={"LA2"}, mask_cfg=_NO_WHOLE, stat_mean=sm, stat_std=ss
-    )
-    # LA2 dropped but parcel 0 survives (LA1/3/4) → all three parcels present.
-    assert setup.stat_mean.shape == (3, STATE_DIM)
-    assert torch.equal(setup.stat_mean, sm[torch.tensor([0, 1, 2])])
-    assert torch.equal(setup.stat_std, ss[torch.tensor([0, 1, 2])])
-
-
-def test_stats_drop_of_whole_parcel_shrinks_aligned_rows() -> None:
-    # Drop every electrode of shaft B → parcel 1 vanishes → aligned stats gather rows [0,2].
-    labels = _labels((4, 3, 3))
-    parcel = _parcels(labels)
-    sm = _stat_table(3)
-    setup = build_session_setup(
-        labels, parcel, drop_labels={"LB1", "LB2", "LB3"},
-        mask_cfg=_NO_WHOLE, stat_mean=sm, stat_std=sm,
-    )
-    assert setup.parcel_id.unique().tolist() == [0, 2]
-    assert setup.stat_mean.shape == (2, STATE_DIM)
-    assert torch.equal(setup.stat_mean, sm[torch.tensor([0, 2])])
-
-
-def test_stats_both_or_neither() -> None:
-    labels = _labels((4, 3, 3))
-    parcel = _parcels(labels)
-    with pytest.raises(ValueError, match="both be given"):
-        build_session_setup(labels, parcel, drop_labels=set(), stat_mean=_stat_table(3))
-
-
-def test_stats_wrong_dim_raises() -> None:
-    labels = _labels((4, 3, 3))
-    parcel = _parcels(labels)
-    bad = torch.zeros(3, STATE_DIM + 1)  # wrong last dim
-    with pytest.raises(ValueError, match="stat_mean must be"):
-        build_session_setup(
-            labels, parcel, drop_labels=set(), stat_mean=bad,
-            stat_std=torch.zeros(3, STATE_DIM),
-        )
-
-
-def test_stats_table_too_small_to_cover_parcels_raises() -> None:
-    labels = _labels((4, 3, 3))  # max parcel id 2
-    parcel = _parcels(labels)
-    small = _stat_table(2)  # only covers parcels 0,1 — id 2 out of range
-    with pytest.raises(ValueError, match="do not cover parcel id"):
-        build_session_setup(
-            labels, parcel, drop_labels=set(), stat_mean=small, stat_std=small
-        )
 
 
 def test_custom_mask_cfg_threads_to_feasibility() -> None:

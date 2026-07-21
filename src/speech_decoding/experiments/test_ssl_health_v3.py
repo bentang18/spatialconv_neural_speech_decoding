@@ -12,13 +12,8 @@ import torch
 
 from speech_decoding.experiments.monitors.ssl_health_v3 import SSLHealthMonitorV3
 from speech_decoding.experiments.test_v14_converged_v3_module import (
-    N_PARCELS,
-    V14ConvergedV3Module,
-    V3ConvergedModel,
     _module,
-    _optim_config,
     _session_batch,
-    _session_batch_with_stats,
 )
 
 
@@ -52,17 +47,14 @@ def test_collect_taps_loss_identical_and_taps_finite() -> None:
     t = taps["enc12"]
     assert isinstance(t, torch.Tensor) and not t.requires_grad
     assert t.shape[-1] == 256 and torch.isfinite(t).all()
-    # intra tier is always populated (whole shafts round to 0 on a 2-shaft synth);
-    # pred/target rows must be paired and same-shape. Under deep-sup (#61) the
-    # prediction/target space is the n_levels-concatenated vector (4·256=1024), not
-    # the single-tap 256 — the monitor's EV/VR read that full target vector.
-    tgt_dim = mod.model.objective.n_levels * 256
-    assert taps["pred_intra"].shape == taps["tgt_intra"].shape
-    assert taps["pred_intra"].shape[-1] == tgt_dim
-    assert not taps["pred_intra"].requires_grad
-    # whole/intra rows partition the masked (contact,slot) positions exactly.
-    total = taps["pred_whole"].shape[0] + taps["pred_intra"].shape[0]
-    assert total == out_yes.n_masked
+    # r4 per-band JEPA scalar taps (the whole/intra tier split was retired 2026-07-15):
+    # explained-var / pred-target var-ratio / L1 reduced INSIDE the objective, one 0-dim
+    # scalar per (band, metric) over the margin-gated scored tokens.
+    for band in ("slow", "mid", "hga"):
+        for metric in ("explained_var", "pred_target_var_ratio", "l1"):
+            v = taps[f"jepa_{band}_{metric}"]
+            assert isinstance(v, torch.Tensor) and v.ndim == 0 and not v.requires_grad
+            assert torch.isfinite(v).all()
     assert N >= 2
 
 
@@ -99,8 +91,8 @@ def test_ema_weight_gap_zero_then_positive() -> None:
 # --------------------------------------------------------- Family B: tap keys
 def test_family_b_tap_keys_finite() -> None:
     """After a monitor-cadence training_step (taps stashed on the module),
-    ``on_train_batch_end`` emits the rankme/feat_std depth keys and the intra-tier
-    EV/var-ratio/L1 keys, all finite."""
+    ``on_train_batch_end`` emits the rankme/feat_std depth keys and the per-band
+    JEPA EV/var-ratio/L1 keys, all finite."""
     mod = _module()
     mod.training_step(_session_batch(n_rows=3), 0)
     assert mod._last_taps is not None  # step 0 is a cadence step
@@ -111,48 +103,20 @@ def test_family_b_tap_keys_finite() -> None:
         trainer=_fake_trainer(), pl_module=mod,
         outputs=None, batch=None, batch_idx=0,
     )
-    for k in (
+    keys = [
         "train_mon_enc12_rankme", "train_mon_enc12_feat_std_mean",
         "train_mon_enc12_feat_std_min",
-        "train_mon_intra_explained_var", "train_mon_intra_pred_target_var_ratio",
-        "train_mon_intra_l1",
-    ):
+    ]
+    for band in ("slow", "mid", "hga"):
+        keys += [
+            f"train_mon_jepa_{band}_explained_var",
+            f"train_mon_jepa_{band}_pred_target_var_ratio",
+            f"train_mon_jepa_{band}_l1",
+        ]
+    for k in keys:
         assert k in logged and logged[k] == logged[k], k
     # block-3 tap keys are gone (2026-07-10).
     assert not any(key.startswith("train_mon_enc3_") for key in logged)
-
-
-def test_family_b_perceiver_latent_health_keys_finite() -> None:
-    """Secondary active + monitor-cadence step ⇒ the perceiver processed-latent bank is
-    shipped as the ``perc_lat`` tap and the callback logs RankMe / feat_std (shared
-    ``_rank_and_std`` path) PLUS dead-frac and latent-latent cosine, all finite and in range.
-    Absent from the JEPA-only ``_module()`` run (perceiver frozen, never forwarded)."""
-    model = V3ConvergedModel(n_parcels=N_PARCELS)
-    mod = V14ConvergedV3Module(
-        model=model, optim_config=_optim_config(weight_decay=0.04),
-        secondary_active=True,
-    )
-    mod.training_step(_session_batch_with_stats(n_rows=3), 0)  # step 0 = cadence
-    assert "perc_lat" in (mod._last_taps or {})
-    logged: dict[str, float] = {}
-    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
-    SSLHealthMonitorV3().on_train_batch_end(
-        trainer=_fake_trainer(), pl_module=mod, outputs=None, batch=None, batch_idx=0,
-    )
-    for k in (
-        "train_mon_perc_lat_rankme", "train_mon_perc_lat_rankme_normalised",
-        "train_mon_perc_lat_feat_std_mean", "train_mon_perc_lat_feat_std_min",
-        "train_mon_perc_lat_dead_frac",
-        "train_mon_perc_lat_cos_mean", "train_mon_perc_lat_cos_pct95",
-    ):
-        assert k in logged and logged[k] == logged[k], k  # present + finite
-    assert 0.0 <= logged["train_mon_perc_lat_dead_frac"] <= 1.0
-    assert -1.0 <= logged["train_mon_perc_lat_cos_mean"] <= 1.0
-
-    # JEPA-only module never forwards the perceiver ⇒ no perc_lat tap, no perc keys.
-    jepa = _module()
-    jepa.training_step(_session_batch(n_rows=3), 0)
-    assert "perc_lat" not in (jepa._last_taps or {})
 
 
 def test_input_tripwire_flags_nonfinite_band() -> None:

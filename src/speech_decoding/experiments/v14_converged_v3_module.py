@@ -34,7 +34,6 @@ import torch
 from lightning import pytorch as pl
 from torch import Tensor
 
-from speech_decoding.experiments.monitors.grad_ratio import loss_grad_ratio
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.models.v14_converged_v3.batch import V3Batch
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
@@ -59,12 +58,6 @@ class V14ConvergedV3Module(pl.LightningModule):
         seed: int = 33,
         monitor_every_n_steps: int = 1,
         wd_exclude_norms: bool = True,
-        secondary_active: bool = False,
-        grad_ratio_every_n_steps: int = 0,
-        nll_warmup_start_step: int = 0,
-        nll_warmup_steps: int = 0,
-        ctx_warmup_start_step: int = 0,
-        ctx_warmup_steps: int = 0,
     ) -> None:
         super().__init__()
         self.model = model
@@ -72,40 +65,6 @@ class V14ConvergedV3Module(pl.LightningModule):
         self.seed = int(seed)
         self.monitor_every_n_steps = max(int(monitor_every_n_steps), 1)
         self._wd_exclude_norms = wd_exclude_norms
-        # Live loss-balance readout (#43): ‖g_nll‖/‖g_jepa‖ on the shared online tower,
-        # measured every ``grad_ratio_every_n_steps`` opt-steps (0 ⇒ OFF, the launch default).
-        # SINGLE-PROCESS ONLY — the two extra autograd.grad passes re-enter the DDP reducer
-        # over the shared graph (the r3 static_graph×grad-accum crash surface), so this is
-        # gated to world_size==1 in ``training_step`` and is a 1-GPU diagnostic lever only.
-        self.grad_ratio_every_n_steps = max(int(grad_ratio_every_n_steps), 0)
-        # Secondary-NLL λ RAMP (Ben 2026-07-15): λ_nll is applied in EAGER training_step,
-        # never inside the compiled objective forward — a per-step python-float scalar in
-        # a compiled graph thrashes dynamo guards (mirrors v2's _context_lambda). λ=0 below
-        # ``nll_warmup_start_step``, linear 0→hold over the next ``nll_warmup_steps`` opt-steps,
-        # then hold (the objective's fixed lambda_nll). Defaults (0, 0) ⇒ constant λ==hold from
-        # step 0 — backward-compatible with a run that passes no --nll-warmup-* flags.
-        self._nll_warmup_start_step = max(int(nll_warmup_start_step), 0)
-        self._nll_warmup_steps = max(int(nll_warmup_steps), 0)
-        # Context-loss λ RAMP (same eager pattern as λ_nll): λ_ctx=0 below
-        # ``ctx_warmup_start_step``, linear 0→hold over the next ``ctx_warmup_steps`` opt-steps,
-        # then hold (the objective's fixed lambda_ctx). Only bites when the objective was built
-        # with context_loss=True; defaults (0, 0) ⇒ constant λ==hold from step 0.
-        self._ctx_warmup_start_step = max(int(ctx_warmup_start_step), 0)
-        self._ctx_warmup_steps = max(int(ctx_warmup_steps), 0)
-        # Secondary Gaussian-NLL (contract §5–7) is OPT-IN: it fires only when the batch
-        # carries per-session frozen state-stats, which the datamodule supplies iff a
-        # stats dir was configured. ``secondary_active`` mirrors that config so the module
-        # knows at construction whether the write-only Perceiver head will receive gradient.
-        self._secondary_active = bool(secondary_active)
-        # Secondary OFF ⇒ the Perceiver head never receives gradient (no stats ever reach
-        # forward). Freeze it so DDP's reducer and the optimizer both skip it — the same
-        # requires_grad=False mechanism that excludes the EMA teacher. Without this, DDP
-        # with find_unused_parameters=False aborts on the unused head. deep_sup=False has
-        # no Perceiver at all (objective.perceiver is None) ⇒ nothing to freeze.
-        perceiver = self.model.objective.perceiver
-        if perceiver is not None and not self._secondary_active:
-            for p in perceiver.parameters():
-                p.requires_grad_(False)
         # Read by SSLHealthMonitorV3 (grad_noise_scale B_eff) and the tap monitors.
         self._last_batch_size: int = 0
         self._last_taps: dict[str, Tensor] | None = None
@@ -161,17 +120,11 @@ class V14ConvergedV3Module(pl.LightningModule):
         # non_blocking H2D: pin_memory is on (datamodule), so async copies overlap
         # transfer with compute. geom is a per-session static that Lightning may move
         # before the pinned batch tensors exist; keep it blocking (its own .to).
-        # stat_mean/stat_std (per-session frozen state-stats, (P,6)) ride along like the
-        # other per-session statics when present; None ⇒ secondary OFF (JEPA-only).
-        sm = batch.stat_mean
-        ss = batch.stat_std
         return V3Batch(
             bands=[b.to(device, non_blocking=True) for b in batch.bands],
             geom=batch.geom.to(device),
             parcel_id=batch.parcel_id.to(device, non_blocking=True),
             session_key=batch.session_key,
-            stat_mean=None if sm is None else sm.to(device, non_blocking=True),
-            stat_std=None if ss is None else ss.to(device, non_blocking=True),
         )
 
     # ------------------------------------------------------------------- train
@@ -188,48 +141,6 @@ class V14ConvergedV3Module(pl.LightningModule):
 
     def _monitor_due(self, step: int) -> bool:
         return step % self.monitor_every_n_steps == 0
-
-    def _grad_ratio_due(self, step: int) -> bool:
-        return self.grad_ratio_every_n_steps > 0 and step % self.grad_ratio_every_n_steps == 0
-
-    def _nll_lambda(self, step: int | None = None) -> float:
-        """The secondary-NLL weight at ``step``: 0 below ``_nll_warmup_start_step``,
-        linear 0→hold over the next ``_nll_warmup_steps`` opt-steps, then hold. ``hold``
-        is the objective's fixed ``lambda_nll``. Read in EAGER code so λ never enters the
-        compiled forward (v2's ``_context_lambda`` pattern). ``step=None`` reads
-        ``global_step`` (0 when no trainer is attached)."""
-        if step is None:
-            try:
-                step = int(self.global_step)
-            except (RuntimeError, AttributeError):
-                step = 0
-        hold = float(self.model.objective.lambda_nll)
-        s = self._nll_warmup_start_step
-        w = self._nll_warmup_steps
-        if w > 0:
-            frac = min(max(step - s, 0) / w, 1.0)
-        else:
-            frac = 1.0 if step >= s else 0.0
-        return hold * frac
-
-    def _ctx_lambda(self, step: int | None = None) -> float:
-        """The context-loss weight at ``step``: the λ_nll ramp's twin over the objective's fixed
-        ``lambda_ctx`` hold (0 below ``_ctx_warmup_start_step``, linear over the next
-        ``_ctx_warmup_steps``, then hold). Read in EAGER code so λ_ctx never enters the compiled
-        forward. hold is 0 when the objective was built without context_loss (no ``lambda_ctx``)."""
-        if step is None:
-            try:
-                step = int(self.global_step)
-            except (RuntimeError, AttributeError):
-                step = 0
-        hold = float(getattr(self.model.objective, "lambda_ctx", 0.0))
-        s = self._ctx_warmup_start_step
-        w = self._ctx_warmup_steps
-        if w > 0:
-            frac = min(max(step - s, 0) / w, 1.0)
-        else:
-            frac = 1.0 if step >= s else 0.0
-        return hold * frac
 
     def _plan_for(self, batch: V3Batch) -> tuple[int | None, int | None, int | None]:
         """The cached ``(grid_max_seqlen, m_vis, pack_max_seqlen)`` for this batch's session,
@@ -270,8 +181,6 @@ class V14ConvergedV3Module(pl.LightningModule):
             accum = 1  # no trainer attached (unit tests) ⇒ every call is "last"
         is_last_microbatch = (batch_idx + 1) % accum == 0
         collect = self._monitor_due(step) and is_last_microbatch
-        # stat_mean/stat_std turn ON the secondary Gaussian-NLL when present (secondary
-        # opt-in); absent ⇒ JEPA-only. They flow per-session like geom/parcel_id.
         # grid_max_seqlen/m_vis/pack_max_seqlen: per-session Python-int shape constants,
         # computed once per session_key here (uncompiled) and passed in so the compiled
         # forward skips their per-step .item() host syncs (None ⇒ eager self-syncing path).
@@ -279,84 +188,15 @@ class V14ConvergedV3Module(pl.LightningModule):
         out = self.model(
             batch.bands, batch.geom, batch.parcel_id,
             generator=gen, collect_taps=collect,
-            stat_mean=batch.stat_mean, stat_std=batch.stat_std,
             grid_max_seqlen=gms, m_vis=mvis, pack_max_seqlen=pms,
         )
         self._last_batch_size = int(batch.bands[0].shape[0])
         self._last_taps = out.taps if collect else None
-        # Combine the two losses in EAGER code with the RAMPED λ (compile-safe: the compiled
-        # objective already produced jepa_loss/nll_loss separately; the λ multiply happens
-        # here, outside the graph). When the secondary is off (nll_loss None) the objective's
-        # own total (== jepa_loss) is used unchanged. Crucially, when the secondary is ON we
-        # ALWAYS write jepa + λ·nll — even at λ=0, the ``0·nll`` term keeps the Perceiver head
-        # in the autograd graph (zero grad, not None) so DDP's reducer sees it "used" and the
-        # graph structure never mutates when the ramp opens.
-        lam = 0.0
-        lam_ctx = 0.0
-        if out.jepa_loss is not None:  # a ramped secondary (nll and/or context) is active
-            total = out.jepa_loss
-            if out.nll_loss is not None:
-                lam = self._nll_lambda(step)
-                total = total + lam * out.nll_loss
-            if out.ctx_loss is not None:
-                lam_ctx = self._ctx_lambda(step)
-                total = total + lam_ctx * out.ctx_loss
-        else:
-            total = out.loss
+        total = out.loss
         self.log("train_loss", total, on_step=True, prog_bar=True)
         # n_masked is a 0-dim tensor (sync deferred to the logger cadence, not the compiled
         # forward); Lightning reduces/syncs it at its own log interval.
         self.log("train_n_masked", out.n_masked, on_step=True)
-        # Two-loss monitors (Ben 2026-07-15): when the secondary is active, log the primary
-        # JEPA L1 and the secondary Gaussian-NLL SEPARATELY so the two objectives are
-        # tracked independently (λ-balance readout). Both None on the JEPA-only arm ⇒ only
-        # train_loss (== jepa_loss) is logged. LOG-ONLY — nothing here kills the run.
-        if out.jepa_loss is not None:
-            self.log("train_jepa_loss", out.jepa_loss, on_step=True, prog_bar=True)
-        if out.nll_loss is not None:
-            self.log("train_nll_loss", out.nll_loss, on_step=True, prog_bar=True)
-            # The live ramped λ and the weighted contribution the total actually carries
-            # (λ·NLL) — both track the eager ramp directly, so the schedule is visible in wandb.
-            self.log("train_nll_lambda", lam, on_step=True)
-            self.log("train_nll_weighted", lam * out.nll_loss.detach(), on_step=True)
-        # Context-loss monitors: the raw context L1, the live ramped λ_ctx, and the weighted
-        # contribution (λ_ctx·ctx) the total carries — all track the eager ramp so the schedule
-        # is visible in wandb. LOG-ONLY. Absent on every arm that did not opt into context_loss.
-        if out.ctx_loss is not None:
-            self.log("train_ctx_loss", out.ctx_loss, on_step=True, prog_bar=True)
-            self.log("train_ctx_lambda", lam_ctx, on_step=True)
-            self.log("train_ctx_weighted", lam_ctx * out.ctx_loss.detach(), on_step=True)
-        # #43 live grad-balance: on cadence, on the last micro-batch, ONLY single-process.
-        # Both losses must be graph-connected (jepa_loss/nll_loss are; the weighted log above
-        # detached its own copy). retain_graph inside the helper keeps Lightning's subsequent
-        # backward(out.loss) intact. Under DDP this would re-enter the reducer → r3 crash, so
-        # hard-refuse world_size>1 rather than silently mis-measure.
-        if (
-            self._grad_ratio_due(step)
-            and is_last_microbatch
-            and out.jepa_loss is not None
-            and out.nll_loss is not None
-        ):
-            try:
-                world_size = int(self.trainer.world_size)
-            except (RuntimeError, AttributeError):
-                world_size = 1  # no trainer attached (unit tests) ⇒ single-process
-            if world_size > 1:
-                raise RuntimeError(
-                    "grad_ratio_every_n_steps>0 requires single-process (world_size==1): "
-                    "the extra autograd.grad passes re-enter the DDP reducer (r3 crash surface). "
-                    "Use it only on the 1-GPU diagnostic."
-                )
-            gr = loss_grad_ratio(
-                out.jepa_loss,
-                out.nll_loss,
-                list(self.model.objective.online.parameters()),
-                lambda_nll=lam,
-            )
-            self.log("train_mon_grad_ratio", gr["grad_ratio"], on_step=True)
-            self.log("train_mon_grad_ratio_weighted", gr["grad_ratio_weighted"], on_step=True)
-            self.log("train_mon_g_jepa", gr["loss_g_jepa"], on_step=True)
-            self.log("train_mon_g_nll", gr["loss_g_nll"], on_step=True)
         return total
 
     def on_before_zero_grad(self, optimizer) -> None:  # noqa: ARG002

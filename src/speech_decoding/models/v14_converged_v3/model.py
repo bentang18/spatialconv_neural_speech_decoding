@@ -39,8 +39,6 @@ from speech_decoding.models.v14_converged_v3.masking import (
     sample_masks,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
-    LAMBDA_CTX,
-    LAMBDA_NLL,
     JepaOutput,
     V3JepaObjective,
 )
@@ -60,11 +58,6 @@ class V3ConvergedModel(nn.Module):
         mask_cfg: V3MaskConfig = V3MaskConfig(),
         target_ln: bool = True,
         deep_sup: bool = True,
-        lambda_nll: float = LAMBDA_NLL,
-        nll_floor: bool = True,
-        secondary_loss: str = "nll",
-        context_loss: bool = False,
-        lambda_ctx: float = LAMBDA_CTX,
         mae: bool = False,
         native_fine_hga: bool = False,
     ) -> None:
@@ -72,18 +65,9 @@ class V3ConvergedModel(nn.Module):
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
         # EMAs the patch-embed too), so the model owns only the objective + mask cfg.
         # deep_sup default ON (#61, Ben-greenlit copy-exactly); deep_sup=False = the
-        # single-tap ablation arm. lambda_nll (§5 open knob) is the secondary
-        # Gaussian-NLL weight in total = JEPA_L1 + λ·NLL; it only matters when the
-        # per-session frozen state-stats are supplied (secondary opt-in).
-        # nll_floor=False is r5 Arm 2 (floor-off): the head learns Sigma with no measured
-        # noise floor. Like lambda_nll it only bites when the secondary is opted in.
-        # secondary_loss="l1" is r5 Arm 3 (point loss): mu-only head, no covariance
-        # parameters at all. L1 (not L2) is measured — see V3JepaObjective.__init__.
+        # single-tap ablation arm.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
-            lambda_nll=lambda_nll, nll_floor=nll_floor,
-            secondary_loss=secondary_loss,
-            context_loss=context_loss, lambda_ctx=lambda_ctx,
             mae=mae, native_fine_hga=native_fine_hga,
         )
         self.native_fine_hga = bool(native_fine_hga)
@@ -97,8 +81,6 @@ class V3ConvergedModel(nn.Module):
         *,
         generator: torch.Generator,
         collect_taps: bool = False,
-        stat_mean: Tensor | None = None,
-        stat_std: Tensor | None = None,
         grid_max_seqlen: int | None = None,
         m_vis: int | None = None,
         pack_max_seqlen: int | None = None,
@@ -114,16 +96,12 @@ class V3ConvergedModel(nn.Module):
         # grid_max_seqlen / m_vis / pack_max_seqlen are the per-session Python-int shape
         # constants ``session_plan`` precomputes (the module caches + passes them each step);
         # they let the objective skip the per-step ``.item()`` host syncs. None ⇒ eager path.
-        # stat_mean/stat_std (per-session frozen state-norm stats) turn ON the secondary
-        # Gaussian-NLL; absent ⇒ JEPA-only. They flow in per-session like geom/parcel_id.
         return self.objective(
             band_inputs,
             geom,
             parcel_id,
             masks,
             collect_taps=collect_taps,
-            stat_mean=stat_mean,
-            stat_std=stat_std,
             grid_max_seqlen=grid_max_seqlen,
             m_vis=m_vis,
             pack_max_seqlen=pack_max_seqlen,
