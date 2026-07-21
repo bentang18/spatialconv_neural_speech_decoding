@@ -215,29 +215,28 @@ STFT_2BAND_HGA: dict[str, float] = {
 # architecture-2026-07-08). Three multi-resolution MAGNITUDE bands on a COMMON
 # 32 Hz token clock, concat → 20 ch → Linear(20→256). Bins DERIVED via
 # _stft_band_k_range at fs=2048:
-#   SLOW N=1024 hop=64  Δf=2 Hz   2–14 Hz  → k1..k7  = 7 bins
-#   MID  N=256  hop=64  Δf=8 Hz   16–56 Hz → k2..k7  = 6 bins
-#   HGA  = STFT_2BAND_HGA (128/64, 64–160, k4..k10 = 7 bins)  reused verbatim
+#   SLOW N=1024 hop=512 Δf=2 Hz   2–14 Hz  → k1..k7  = 7 bins  (4 Hz native)
+#   MID  N=256  hop=128 Δf=8 Hz   16–56 Hz → k2..k7  = 6 bins  (16 Hz native)
+#   HGA  = STFT_2BAND_HGA (128/64, 64–160, k4..k10 = 7 bins)  reused verbatim (coarse ctrl)
 #
-# UNIFORM hop=64 (fixed 2026-07-10, Ben): every band emits one frame per 31.25 ms
-# slot NATIVELY (2048/64 = 32 Hz). nperseg still sets frequency resolution
-# independently — long window = fine freq, short hop = full time-rate (decoupled).
-# This REPLACES the earlier slow-hop=512/mid-hop=128 extraction, where slow rode a
-# 4 Hz frame rate and mid a 16 Hz rate and the stem repeat_interleave-HELD them up
-# to 32 Hz (8×/2×). The held stairsteps carried no real sub-250 ms / 62.5 ms
-# timing; uniform 64-hop gives slow/mid genuine 32 Hz temporal detail (heavily
-# overlapped windows). SLOW+MID are v3-EXCLUSIVE dicts (hop 64) — the shared
-# STFT_3BAND_BETA (hop 128) is left untouched for the cartesian 3STFT ladder.
-# Winsor tags are hop-independent (nperseg,chan,f_hi): SLOW keeps "vslow"; MID's
-# (256,"mag",56) resolves to the existing "beta" cap (identical freq content →
-# same |z| distribution → correct), so NO new _WINSOR_BAND_TAG entry. The
-# spec-cache uid DOES include band_hop, so the new hop forces a FRESH extraction.
+# NATIVE-RATE SLOW/MID (2026-07-21, Ben — supersedes the uniform-hop=64 fix of
+# 2026-07-10). The live PerBandStem (stem.py:95) DECIMATES the 32 Hz cache ::8 (SLOW)
+# / ::2 (MID) before the model ever sees it, so arm0 already feeds SLOW@4 Hz / MID@16 Hz
+# — the intermediate 32 Hz frames were extracted only to be thrown away. Extracting
+# natively at hop=512 (SLOW) / hop=128 (MID) hits the IDENTICAL window centers (k·512,
+# k·128) with the same nperseg window ⇒ bit-identical |STFT| at the frames the stem
+# keeps (test_native_rate_{slow,mid}_equals_decimated_32hz), and saves 8×/2× storage.
+# The fine-HGA stem consumes these native rates directly (no ::8/::2 decimate). SLOW+MID
+# stay v3-EXCLUSIVE — the shared STFT_3BAND_BETA (hop 128) is a different (nperseg,f_hi)
+# key, untouched. Winsor tags are hop-independent (nperseg,chan,f_hi): SLOW keeps "vslow";
+# MID's (256,"mag",56) resolves to the existing "beta" cap. The spec-cache uid DOES
+# include band_hop, so the new hop forces a FRESH extraction (the intended rebake).
 # ---------------------------------------------------------------------------
 STFT_V3_SLOW: dict[str, float] = {
-    "band_nperseg": 1024, "band_hop": 64, "band_f_lo_hz": 2.0, "band_f_hi_hz": 14.0,
+    "band_nperseg": 1024, "band_hop": 512, "band_f_lo_hz": 2.0, "band_f_hi_hz": 14.0,
 }
 STFT_V3_MID: dict[str, float] = {
-    "band_nperseg": 256, "band_hop": 64, "band_f_lo_hz": 16.0, "band_f_hi_hz": 56.0,
+    "band_nperseg": 256, "band_hop": 128, "band_f_lo_hz": 16.0, "band_f_hi_hz": 56.0,
 }
 
 # ---------------------------------------------------------------------------

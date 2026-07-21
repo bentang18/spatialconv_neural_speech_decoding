@@ -1,15 +1,16 @@
 """v14_converged_v3 3-band frontend geometry (Phase 0).
 
-The v3 front-end is 3 multi-resolution |STFT| magnitude bands on a common 32 Hz
-token clock (memo project-v14-converged-v3-sensor-architecture). UNIFORM hop=64
-(fixed 2026-07-10): every band is extracted at 32 Hz natively — window sets
-frequency resolution, hop sets frame rate (decoupled). No stem hold/duplication.
+The v3 front-end is 3 multi-resolution |STFT| magnitude bands (memo
+project-v14-converged-v3-sensor-architecture). NATIVE-RATE extraction (2026-07-21,
+supersedes the 2026-07-10 uniform-hop=64): each band is extracted at its OWN frame
+rate — the rate the live PerBandStem decimates the model down to anyway (SLOW ::8,
+MID ::2). Window sets frequency resolution, hop sets frame rate (decoupled).
 
-    SLOW  N=1024 hop=64  2–14 Hz   → k1..k7  = 7 bins   (v3-only mag)
-    MID   N=256  hop=64  16–56 Hz  → k2..k7  = 6 bins   (v3-only; forked from beta)
-    HGA   N=128  hop=64  64–160 Hz → k4..k10 = 7 bins   (= STFT_2BAND_HGA, already 32 Hz)
+    SLOW  N=1024 hop=512 2–14 Hz   → k1..k7  = 7 bins   (v3-only mag, 4 Hz native)
+    MID   N=256  hop=128 16–56 Hz  → k2..k7  = 6 bins   (v3-only fork of beta, 16 Hz native)
+    HGA   N=128  hop=64  64–160 Hz → k4..k10 = 7 bins   (= STFT_2BAND_HGA, 32 Hz, coarse ctrl)
 
-Total 20 bins → Linear(20→256). SLOW+MID are v3-exclusive dicts at hop 64; the
+Total 20 bins → Linear(20→256). SLOW+MID are v3-exclusive dicts; the
 SHARED STFT_3BAND_BETA (hop 128) is left untouched for the 3stft ladder. MID's
 winsor key (256,"mag",56) equals beta's, so it correctly reuses beta's cap with no
 new registration. All three magnitude; cutoffs land on clean integer bin centers.
@@ -59,18 +60,22 @@ def test_hga_reuses_2band_hga_seven_bins() -> None:
     _check(STFT_2BAND_HGA, V3_HGA_EXPECT)
 
 
-def test_all_three_v3_bands_hop_at_64_for_a_32hz_clock() -> None:
-    # THE fix: every v3 band hops at 64 samples (2048/64 = 32 Hz) so each emits one
-    # frame per 31.25 ms slot natively — no 4/16 Hz extraction + stem hold.
-    for band in (STFT_V3_SLOW, STFT_V3_MID, STFT_2BAND_HGA):
-        assert int(band["band_hop"]) == 64
+def test_v3_bands_extract_at_native_rate() -> None:
+    # NATIVE-RATE (2026-07-21): SLOW hop=512 (4 Hz), MID hop=128 (16 Hz), coarse HGA
+    # (STFT_2BAND_HGA) hop=64 (32 Hz) — the frame rates the PerBandStem decimates the
+    # model down to (::8/::2/::1). Native extraction hits identical window centers +
+    # saves 8×/2× storage (test_native_rate_*_equals_decimated_32hz in test_cartesian_band).
+    assert int(STFT_V3_SLOW["band_hop"]) == 512
+    assert int(STFT_V3_MID["band_hop"]) == 128
+    assert int(STFT_2BAND_HGA["band_hop"]) == 64
 
 
 def test_shared_beta_is_untouched_at_hop_128() -> None:
-    # v3 MID must be a SEPARATE dict — the shared 3stft beta keeps its hop 128 so
-    # forking v3 MID to hop 64 never re-hops the cartesian 3stft ladder.
+    # v3 MID must be a SEPARATE dict — the shared 3stft beta keeps its hop 128 for the
+    # cartesian 3stft ladder. MID at N=256/hop=128 (16 Hz) coincidentally shares beta's
+    # hop but is a distinct dict (mag vs cartesian channelization, v3-exclusive).
     assert int(STFT_3BAND_BETA["band_hop"]) == 128
-    assert int(STFT_V3_MID["band_hop"]) == 64
+    assert int(STFT_V3_MID["band_hop"]) == 128
 
 
 def test_total_is_twenty_bins() -> None:

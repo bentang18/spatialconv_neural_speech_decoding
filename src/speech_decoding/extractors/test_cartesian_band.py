@@ -121,6 +121,48 @@ def test_mag_view_unchanged_by_cartesian_flag() -> None:
     assert torch.allclose(mag, spec[..., k0:k1 + 1, :].abs())
 
 
+def test_native_rate_slow_equals_decimated_32hz() -> None:
+    """Native SLOW (hop=512 → 4 Hz) == 32 Hz cache (hop=64) then ::8.
+
+    The load-bearing invariant of the native-rate rebake: PerBandStem decimates
+    arm0's 32 Hz SLOW cache ::8 (stem.py:95,164), so the model sees SLOW@4 Hz.
+    Extracting natively at hop=512 hits the SAME window centers (k·512) with the
+    SAME N=1024 window ⇒ bit-identical |STFT| at the retained frames. Skips the
+    decimate + saves 8× storage. Same for MID ::2 below."""
+    torch.manual_seed(0)
+    x = torch.randn(4, 8192)  # 4 s @ 2048 Hz — many SLOW frames
+    k0, k1 = _stft_band_k_range(2.0, 14.0, nperseg=1024, sample_rate=FS)
+    dense = _single_stft_raw_view(
+        x, sample_rate=FS, nperseg=1024, hop_length=64, k0=k0, k1=k1,
+        log_eps=1e-6, cartesian=False,
+    )
+    native = _single_stft_raw_view(
+        x, sample_rate=FS, nperseg=1024, hop_length=512, k0=k0, k1=k1,
+        log_eps=1e-6, cartesian=False,
+    )
+    dec = dense[..., ::8]
+    assert dec.shape == native.shape, f"[check] SLOW frames {dec.shape} != {native.shape}"
+    assert torch.allclose(dec, native, atol=1e-5), "[check] native SLOW != decimated 32 Hz"
+
+
+def test_native_rate_mid_equals_decimated_32hz() -> None:
+    """Native MID (hop=128 → 16 Hz) == 32 Hz cache (hop=64) then ::2 (PerBandStem MID stride 2)."""
+    torch.manual_seed(1)
+    x = torch.randn(4, 8192)
+    k0, k1 = _stft_band_k_range(16.0, 56.0, nperseg=256, sample_rate=FS)
+    dense = _single_stft_raw_view(
+        x, sample_rate=FS, nperseg=256, hop_length=64, k0=k0, k1=k1,
+        log_eps=1e-6, cartesian=False,
+    )
+    native = _single_stft_raw_view(
+        x, sample_rate=FS, nperseg=256, hop_length=128, k0=k0, k1=k1,
+        log_eps=1e-6, cartesian=False,
+    )
+    dec = dense[..., ::2]
+    assert dec.shape == native.shape, f"[check] MID frames {dec.shape} != {native.shape}"
+    assert torch.allclose(dec, native, atol=1e-5), "[check] native MID != decimated 32 Hz"
+
+
 def test_chunked_cartesian_equals_unchunked() -> None:
     """The streaming (chunked) cartesian view matches the whole-clip view."""
     torch.manual_seed(0)

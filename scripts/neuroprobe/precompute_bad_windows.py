@@ -91,6 +91,7 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
+    STFT_V3_HGA,
     STFT_V3_MID,
     STFT_V3_SLOW,
     _stft_band_k_range,
@@ -140,7 +141,7 @@ ABS_FLOOR_MAD: float = 200.0
 # cat_mult 8→6 is the safe win (cohort 0.96→1.43%), hot stays 4, frac stays 0.05,
 # abs stays 200. 3STFT bands keep the scalar cat8 via the fallback.
 HOT_MULT_BY_BAND: dict[str, float] = {}
-CAT_MULT_BY_BAND: dict[str, float] = {"lfs": 6.0, "hga": 6.0}
+CAT_MULT_BY_BAND: dict[str, float] = {"lfs": 6.0, "hga": 6.0, "v3hga": 6.0}
 
 NOTCH_HZ: float = 60.0
 HPF_HZ: float = 0.5
@@ -160,7 +161,7 @@ SIGMA_FLOOR: float = 1e-6  # == SessionRobustZNormalizer / view.session_z_sigma_
 _BAND_DICTS = {
     "slow": STFT_3BAND_SLOW, "beta": STFT_3BAND_BETA, "hg": STFT_3BAND_HG,
     "lfs": STFT_2BAND_LFS, "hga": STFT_2BAND_HGA,
-    "v3slow": STFT_V3_SLOW, "v3mid": STFT_V3_MID,
+    "v3slow": STFT_V3_SLOW, "v3mid": STFT_V3_MID, "v3hga": STFT_V3_HGA,
 }
 _FRONTEND_BANDS: dict[str, tuple[str, ...]] = {
     "3stft": ("slow", "beta", "hg"),
@@ -169,6 +170,10 @@ _FRONTEND_BANDS: dict[str, tuple[str, ...]] = {
     # (= STFT_2BAND_HGA 64-160Hz, inherits its cat_mult=6 override). Scanned at a
     # 1s detection window (--detect-window 1.0) for ~5x tighter spans vs 3stft/2band.
     "v3": ("v3slow", "v3mid", "hga"),
+    # v3 fine-HGA (2026-07-21): native-rate SLOW@4Hz/MID@16Hz + fine HGA (N=64/hop=16
+    # → 128Hz, 4 bins, 64-160Hz). v3slow dropout sentinel; v3hga inherits hga's
+    # cat_mult=6 (same 64-160 HGA |z| family). Spans in NEURAL SECONDS ⇒ rate-robust.
+    "v3fine": ("v3slow", "v3mid", "v3hga"),
 }
 
 
@@ -441,7 +446,7 @@ def main() -> None:
                     help="scan exactly this one session (overrides array indexing)")
     ap.add_argument("--sessions", default=None,
                     help='comma list "S:T,S:T,..." to scan (array indexes into it)')
-    ap.add_argument("--frontend", choices=("3stft", "2band", "v3"), default="3stft",
+    ap.add_argument("--frontend", choices=("3stft", "2band", "v3", "v3fine"), default="3stft",
                     help="band set to scan: 3stft (slow/beta/hg, default), 2band "
                          "(converged-v2 LFS/HGA magnitude), or v3 (v3slow/v3mid/hga, "
                          "the sensor frontend). Selects the sidecar's bands.")
