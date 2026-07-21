@@ -3120,7 +3120,7 @@ def _parser() -> argparse.ArgumentParser:
                    help="3stft: M4 down-weight full-trust electrode count n_ref "
                         "(default 11; the w=1 saturation point).")
     p.add_argument("--cache-band", dest="cache_band",
-                   choices=("slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid", "v3hga"), default=None,
+                   choices=("slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid", "v3hga", "v3lfs"), default=None,
                    help="Per-band cache build (--cache-only only). Build ONE named "
                         "band into <spec-cache-dir>/band_<name>. 3STFT 2/2/2 ladder: "
                         "slow N=1024/hop512 2-12Hz Cartesian Re/Im; beta N=256/hop128 "
