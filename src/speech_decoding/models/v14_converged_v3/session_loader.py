@@ -37,8 +37,10 @@ from speech_decoding.models.v14_converged_v3.cache_index import (
     parse_lof_report,
 )
 from speech_decoding.models.v14_converged_v3.dataset import (
+    UNIFORM_BAND_RATES,
     V3SessionSpec,
     build_session_spec,
+    reference_n_frames,
 )
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
@@ -101,8 +103,16 @@ def load_v3_sessions(
     mask_cfg: V3MaskConfig = V3MaskConfig(),
     state_stats_dir: str | None = None,
     keep_labels_fn: KeepLabelsFn | None = None,
+    band_rates: Sequence[tuple[int, int]] = UNIFORM_BAND_RATES,
 ) -> list[V3SessionSpec]:
     """Assemble the per-session ``V3SessionSpec`` list for the datamodule.
+
+    ``band_rates`` (opt): per-band read rate (num, den) vs the 32 Hz clip clock, in the
+    (slow, mid, hga) cache order. Default uniform ((1,1)×3) = arm0 (all bands cached at
+    32 Hz). Native fine-HGA passes ((1,8),(1,2),(4,1)); each band cache then carries its
+    native frame count and the spec's ``n_frames`` is the derived 32 Hz reference. The
+    dataset MUST be built with the same ``band_rates`` (memo
+    project-fine-hga-bt-rebake-tasklist-2026-07-21).
 
     ``state_stats_dir`` (opt): dir of per-subject frozen state-norm tables that turn ON
     the secondary Gaussian-NLL; omit ⇒ JEPA-only.
@@ -118,6 +128,8 @@ def load_v3_sessions(
     ``None`` ⇒ keep everything (the training path; byte-identical to no argument)."""
     if len(band_cache_dirs) != 3:
         raise ValueError(f"expected 3 band cache dirs, got {len(band_cache_dirs)}")
+    if len(band_rates) != 3:
+        raise ValueError(f"expected 3 band_rates, got {len(band_rates)}")
     band_indexes = [index_band_cache(d) for d in band_cache_dirs]
     bad_idx = index_bad_windows(span_dir)
     lof = parse_lof_report(lof_report_path)
@@ -150,13 +162,16 @@ def load_v3_sessions(
             stat_mean=stat_mean, stat_std=stat_std,
         )
         band_stats = [_load_stats(e.stats_path) for e in entries]
+        n_frames_32 = reference_n_frames(
+            [e.total_frames for e in entries], band_rates
+        )
         specs.append(
             build_session_spec(
                 session_key=(subject_id, trial_id),
                 band_paths=tuple(e.npy_path for e in entries),
                 band_stats=tuple(band_stats),
                 setup=setup,
-                n_frames=entries[0].total_frames,
+                n_frames=n_frames_32,
                 bad_spans_s=bad_idx.get((subject_id, trial_id), []),
                 sigma_floor=sigma_floor,
                 winsor=winsor,

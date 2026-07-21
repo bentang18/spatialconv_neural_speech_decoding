@@ -180,6 +180,99 @@ def test_per_band_winsor_caps_each_normalizer(tmp_path) -> None:
     assert float(z.max()) <= 20.0 + 1e-5 and float(z.max()) >= 20.0 - 1e-5
 
 
+# ── native-rate multi-rate read (fine-HGA, 2026-07-21) ─────────────────────────
+# Under native rates the 3 band npys have DIFFERENT frame counts: SLOW T/8 (4 Hz),
+# MID T/2 (16 Hz), HGA T·4 (128 Hz). A clip of clip_frames (32 Hz) reads each band at
+# its own offset t0·num//den for len clip_frames·num//den. band_rates default (1,1)×3
+# = uniform = byte-identical to arm0. Binding align = lcm(dens); clip_frames must be
+# divisible so every per-band clip length is an integer.
+FINE_RATES = ((1, 8), (1, 2), (4, 1))  # (slow, mid, hga) relative to 32 Hz
+
+
+def _spec_multirate(tmp, *, key=(1, 0), t32=8000, band_rates=FINE_RATES, bad_spans=()):
+    """Synthetic spec whose per-band npys carry NATIVE frame counts (t32·num//den)."""
+    labels, parcels = [], []
+    for s, n in enumerate((4, 3, 3)):
+        for c in range(1, n + 1):
+            labels.append(f"L{chr(65 + s)}{c}")
+            parcels.append(s)
+    c_full = len(labels)
+    setup = build_session_setup(labels, torch.tensor(parcels), drop_labels=frozenset())
+    band_paths, arrays, band_fbins = [], [], (F_SLOW, F_MID, 4)  # HGA fine = 4 bins
+    for bname, fb, (num, den) in zip(("v3slow", "v3mid", "v3hga"), band_fbins, band_rates):
+        t_band = t32 * num // den
+        p, arr = _write_band(tmp, f"mr_{key[0]}_{key[1]}_{bname}", c_full, fb, t_band)
+        band_paths.append(p)
+        arrays.append(arr)
+    band_stats = [
+        (torch.zeros(c_full, fb, 1), torch.ones(c_full, fb, 1)) for fb in band_fbins
+    ]
+    # n_frames is the 32 Hz REFERENCE (what session_loader derives); here == t32.
+    spec = build_session_spec(
+        session_key=key, band_paths=tuple(band_paths), band_stats=tuple(band_stats),
+        setup=setup, n_frames=t32, bad_spans_s=list(bad_spans),
+    )
+    return spec, arrays
+
+
+def test_native_rates_read_per_band_at_own_offset(tmp_path) -> None:
+    # SLOW [t0/8:+12], MID [t0/2:+48], HGA [t0·4:+384] for clip_frames=96, and the
+    # returned clip must equal the raw native-slice (stats are 0/1 ⇒ identity norm).
+    spec, arrays = _spec_multirate(tmp_path, t32=8000)
+    n = len(spec.setup.sidecar.labels)
+    keep = spec.keep_idx.numpy()
+    ds = V3SessionDataset([spec], clips_per_session=1, clip_frames=T_CLIP, fps=FPS,
+                          band_rates=FINE_RATES)
+    sample = ds[0]
+    t0 = ds._last_t0
+    assert t0 % 8 == 0, f"t0={t0} not 8-aligned"
+    assert sample.bands[0].shape == (n, F_SLOW, T_CLIP // 8)   # 12
+    assert sample.bands[1].shape == (n, F_MID, T_CLIP // 2)    # 48
+    assert sample.bands[2].shape == (n, 4, T_CLIP * 4)         # 384
+    for bi, (num, den) in enumerate(FINE_RATES):
+        lo, hi = t0 * num // den, (t0 + T_CLIP) * num // den
+        expect = torch.from_numpy(arrays[bi][keep, :, lo:hi].astype(np.float32))
+        assert torch.allclose(sample.bands[bi], expect), f"band {bi} native slice mismatch"
+
+
+def test_uniform_rates_default_is_byte_identical(tmp_path) -> None:
+    # Omitting band_rates (default uniform) must reproduce the single-rate read exactly.
+    spec = _spec(tmp_path, t_total=4000)
+    ds_default = V3SessionDataset([spec], clips_per_session=1, clip_frames=T_CLIP, fps=FPS)
+    ds_explicit = V3SessionDataset([spec], clips_per_session=1, clip_frames=T_CLIP, fps=FPS,
+                                   band_rates=((1, 1), (1, 1), (1, 1)))
+    ds_default.set_epoch(3); ds_explicit.set_epoch(3)
+    a, b = ds_default[0], ds_explicit[0]
+    assert ds_default._last_t0 == ds_explicit._last_t0
+    for x, y in zip(a.bands, b.bands):
+        assert torch.equal(x, y)
+
+
+def test_native_clip_len_indivisible_raises(tmp_path) -> None:
+    # clip_frames=100 with SLOW den=8 ⇒ 100·1/8 not integer ⇒ band clip length undefined.
+    spec, _ = _spec_multirate(tmp_path)
+    import pytest
+    with pytest.raises(ValueError, match="not integer|divisible"):
+        V3SessionDataset([spec], clips_per_session=1, clip_frames=100, fps=FPS,
+                         band_rates=FINE_RATES)
+
+
+def test_native_guard2_span_still_excluded_in_32hz(tmp_path) -> None:
+    # guard-2 stays on the 32 Hz clock (t0, clip_frames) — a bad span excludes t0 the
+    # same way regardless of per-band rates.
+    a, b = 50.0, 60.0  # → 32 Hz frames [1600,1920)
+    spec, _ = _spec_multirate(tmp_path, t32=8000, bad_spans=[(a, b)])
+    ds = V3SessionDataset([spec], clips_per_session=1, clip_frames=T_CLIP, fps=FPS,
+                          band_rates=FINE_RATES)
+    fa, fb = round(a * FPS), round(b * FPS)
+    for ep in range(60):
+        ds.set_epoch(ep)
+        ds[0]
+        t0 = ds._last_t0
+        assert t0 % 8 == 0
+        assert not (t0 < fb and t0 + T_CLIP > fa)
+
+
 def _spec_winsor(tmp, *, winsor):
     labels, parcels = [], []
     for s, n in enumerate((4, 3, 3)):

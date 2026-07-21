@@ -26,11 +26,43 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import gcd
 
 import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
+
+# Default per-band read rate relative to the 32 Hz clip clock: (num, den) s.t. a band
+# frame index = 32Hz_index · num // den. Uniform (1,1) = arm0 (all bands cached @32 Hz,
+# stem decimates). Native fine-HGA = ((1,8),(1,2),(4,1)) (SLOW 4 Hz / MID 16 Hz / HGA
+# 128 Hz), extracted at native rate — the stem consumes them directly (memo
+# project-fine-hga-bt-rebake-tasklist-2026-07-21).
+UNIFORM_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 1), (1, 1), (1, 1))
+
+
+def _start_align(band_rates: Sequence[tuple[int, int]]) -> int:
+    """Binding clip-start alignment = lcm of band denominators (t0 must be ≡0 mod it
+    so every t0·num//den is an integer landing on a shared window lattice)."""
+    align = 1
+    for _num, den in band_rates:
+        align = align * den // gcd(align, den)
+    return align
+
+
+def reference_n_frames(
+    total_frames: Sequence[int], band_rates: Sequence[tuple[int, int]]
+) -> int:
+    """The 32 Hz clip-clock length from per-band NATIVE frame counts.
+
+    Each band supports ``total_frames_b · den // num`` 32 Hz frames; the common clock
+    is the min (so no band read goes out of bounds), floored to the clip-start
+    alignment so the last window start stays aligned. Uniform rates ((1,1)) reduce to
+    ``min(total_frames)`` — identical to taking any single band's count when equal.
+    """
+    caps = [tf * den // num for tf, (num, den) in zip(total_frames, band_rates)]
+    align = _start_align(band_rates)
+    return (min(caps) // align) * align
 
 from speech_decoding.extractors.normalize import SessionRobustZNormalizer
 from speech_decoding.models.v14_converged_v3.batch import V3ClipSample
@@ -111,12 +143,25 @@ class V3SessionDataset(Dataset):
         clip_frames: int,
         fps: float,
         seed: int = 0,
+        band_rates: Sequence[tuple[int, int]] = UNIFORM_BAND_RATES,
     ) -> None:
         self.sessions = list(sessions)
         self.clips_per_session = int(clips_per_session)
         self.clip_frames = int(clip_frames)
         self.fps = float(fps)
         self._seed = int(seed)
+        self.band_rates = tuple((int(n), int(d)) for n, d in band_rates)
+        if len(self.band_rates) != 3:
+            raise ValueError(f"expected 3 band_rates, got {len(self.band_rates)}")
+        self.start_align = _start_align(self.band_rates)
+        # invariant: every per-band clip length clip_frames·num//den must be integer,
+        # else the band clip has an undefined boundary. Fail loud at construction.
+        for num, den in self.band_rates:
+            if (self.clip_frames * num) % den != 0:
+                raise ValueError(
+                    f"clip_frames {self.clip_frames} × {num}/{den} not integer — band "
+                    f"clip length undefined; clip_frames must be divisible by {den}"
+                )
         self._epoch = 0
         self._index: list[tuple[int, int]] = [
             (si, k)
@@ -154,14 +199,16 @@ class V3SessionDataset(Dataset):
             bad_spans_s=s.bad_spans_s,
             fps=self.fps,
             generator=g,
+            start_align=self.start_align,
         )
         self._last_t0 = t0
         keep = s.keep_idx.numpy()
         end = t0 + self.clip_frames
         bands = []
-        for path, norm in zip(s.band_paths, s.band_norms):
-            mm = np.load(path, mmap_mode="r")  # (C_full, F_band, T_total)
-            clip = np.asarray(mm[keep, :, t0:end], dtype=np.float32)  # (N, F, T)
+        for path, norm, (num, den) in zip(s.band_paths, s.band_norms, self.band_rates):
+            lo, hi = t0 * num // den, end * num // den  # native-rate band window
+            mm = np.load(path, mmap_mode="r")  # (C_full, F_band, T_band)
+            clip = np.asarray(mm[keep, :, lo:hi], dtype=np.float32)  # (N, F, T_band)
             del mm
             bands.append(norm.transform(torch.from_numpy(clip)))
         return V3ClipSample(

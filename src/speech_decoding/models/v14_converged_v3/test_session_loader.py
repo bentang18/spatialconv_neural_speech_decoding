@@ -253,6 +253,71 @@ def test_guard2_spans_carried_in_seconds(tmp_path) -> None:
     assert specs[0].bad_spans_s == [(10.0, 11.0), (20.0, 21.0)]
 
 
+# ── native-rate n_frames derivation (fine-HGA, 2026-07-21) ─────────────────────
+FINE_RATES = ((1, 8), (1, 2), (4, 1))
+
+
+def _write_native_caches(tmp_path, sessions, per_band_frames):
+    """3 band dirs whose caches carry DIFFERENT (native) total_frames per band."""
+    band_dirs = []
+    for b in range(3):
+        d = tmp_path / f"nband{b}"
+        _write_band_cache(d, b, sessions, per_band_frames[b])
+        band_dirs.append(str(d))
+    span_dir = tmp_path / "nspans"
+    span_dir.mkdir()
+    for subject_id, trial_id, _ in sessions:
+        (span_dir / f"btbank{subject_id}_t{trial_id}.json").write_text(json.dumps({
+            "session": f"btbank{subject_id}_t{trial_id}",
+            "subject_id": subject_id, "trial_id": trial_id, "bad_windows_s": [],
+        }))
+    return band_dirs, str(span_dir)
+
+
+def test_native_rates_derive_32hz_reference_n_frames(tmp_path) -> None:
+    # t32=2048 ⇒ slow 256 (4Hz), mid 1024 (16Hz), hga 8192 (128Hz). Native rates ⇒
+    # reference = min(256·8, 1024·2, 8192//4) = 2048 (all bands agree, 8-aligned).
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_native_caches(tmp_path, sess, (256, 1024, 8192))
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=FINE_RATES,
+    )
+    assert specs[0].n_frames == 2048
+
+
+def test_native_reference_takes_min_and_floors_to_align(tmp_path) -> None:
+    # Make HGA 2 frames short (8190//4=2047) ⇒ min=2047 ⇒ floored to lcm(8,2,1)=8 → 2040.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_native_caches(tmp_path, sess, (256, 1024, 8190))
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=FINE_RATES,
+    )
+    assert specs[0].n_frames == 2040
+
+
+def test_default_uniform_reference_is_unchanged(tmp_path) -> None:
+    # Omitting band_rates (uniform) must keep n_frames == the shared band count (2000).
+    sess = _mk_sessions()
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    assert specs[0].n_frames == 2000
+
+
+def test_wrong_band_rates_count_fails_loud(tmp_path) -> None:
+    sess = _mk_sessions()
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    with pytest.raises(ValueError, match="3 band_rates"):
+        load_v3_sessions(
+            sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+            parcel_fn=_stub_parcel_fn, band_rates=((1, 8), (1, 2)),
+        )
+
+
 def test_missing_session_fails_loud(tmp_path) -> None:
     sess = _mk_sessions()
     band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
