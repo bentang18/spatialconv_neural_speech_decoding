@@ -169,3 +169,94 @@ class PerBandStem(nn.Module):
             tokens.append(tok)
             positions.append(pos)
         return tuple(tokens), tuple(positions)
+
+
+# ── fine-HGA native-rate stem (2026-07-21, native-rate rebake) ──────────────────
+# (n_bins,) per band in SLOW, MID, HGA order. HGA is the FINE band (4 bins 64-160 Hz,
+# k2..k5) — down from the coarse 7 (STFT_2BAND_HGA). SLOW/MID keep the v2 widths.
+FINE_HGA_BINS: tuple[int, int, int] = (7, 6, 4)
+# lattice stride per band (32 Hz-frame position increment) — IDENTICAL to PER_BAND_SPECS
+# so the emitted RoPE positions match PerBandStem exactly and pack/mask/pe are unchanged.
+FINE_LATTICE_STRIDES: tuple[int, int, int] = (8, 2, 1)
+HGA_POOL_FACTOR: int = 4  # 128 Hz → 32 Hz via 2× stride-2 convs (2² = 4)
+
+
+class FineHgaStem(nn.Module):
+    """Native-rate per-band token stem — fine-HGA OFAT (2026-07-21).
+
+    The native-rate rebake extracts each band at ITS OWN rate (view.py: SLOW hop 512
+    → 4 Hz, MID hop 128 → 16 Hz, HGA hop 16 → 128 Hz), so this stem receives bands at
+    DIFFERENT frame counts on a clip: SLOW ``T/8``, MID ``T/2``, HGA ``4T`` (T = the
+    32 Hz clip length). It emits the SAME per-band token grid + lattice positions as
+    ``PerBandStem`` (T/8, T/2, T at strides 8, 2, 1) so packing/masking/pe/attention
+    are byte-identical downstream — the OFAT changes ONLY the HGA time front-end:
+
+      • SLOW/MID: already at their token rate ⇒ NO decimate, a plain per-band
+        ``Linear(F_b → d)`` + additive ``band_type_emb`` (matches PerBandStem's
+        SLOW/MID path; those tokens are bit-identical given the same weights + native
+        inputs, since native extraction == PerBandStem's ::8/::2 decimate — proven in
+        test_native_rate_*_equals_decimated_32hz).
+      • HGA: arrives at 128 Hz and is LEARN-pooled 128 → 32 Hz by 2×``Conv1d(k3, s2,
+        pad1)`` + GELU (4 → d → d), replacing the fixed strided decimate. RF = 7 frames
+        @128 Hz ≈ 54.7 ms reaches ±1 output token, so a width-4 mask block buries the
+        deepest cell at margin 2 (leak-clean; test_fine_hga_conv_pool_is_local).
+
+    Deliberately NO freq embed / NO per-band norm — band identity rides the separate
+    projections + the additive band embed, exactly as PerBandStem.
+    """
+
+    def __init__(self, d_model: int = 256, *, band_emb_std: float = 0.02) -> None:
+        super().__init__()
+        n_slow, n_mid, n_hga = FINE_HGA_BINS
+        self.slow_proj = nn.Linear(n_slow, d_model)
+        self.mid_proj = nn.Linear(n_mid, d_model)
+        # HGA conv-pool 128 → 32 Hz: 4 bins → d → d, two stride-2 k3 convs, GELU between.
+        self.hga_pool = nn.Sequential(
+            nn.Conv1d(n_hga, d_model, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1),
+        )
+        self.band_type_emb = nn.Parameter(torch.empty(3, d_model))
+        self.apply(init_transformer_weights)  # Linear trunc_normal(0.02)+zero-bias; convs default
+        nn.init.trunc_normal_(self.band_type_emb, std=band_emb_std)
+
+    def _pool_hga(self, hga: Tensor) -> Tensor:
+        """(..., F_hga, 4T) → (..., T, d) via the 2× stride-2 conv-pool."""
+        *lead, f, length = hga.shape
+        if length % HGA_POOL_FACTOR != 0:
+            raise ValueError(
+                f"HGA length {length} not a multiple of pool factor {HGA_POOL_FACTOR}"
+            )
+        x = hga.reshape(-1, f, length)  # (prod_lead, F_hga, 4T)
+        x = self.hga_pool(x)  # (prod_lead, d, T)
+        x = x.transpose(-1, -2)  # (prod_lead, T, d)
+        return x.reshape(*lead, x.shape[-2], x.shape[-1])  # (..., T, d)
+
+    def forward(
+        self, band_inputs: Sequence[Tensor]
+    ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+        """Bands ``[SLOW(...,7,T/8), MID(...,6,T/2), HGA(...,4,4T)]`` → (per-band tokens
+        ``(..., T_b, d)``, per-band lattice positions ``(T_b,)`` long), SLOW/MID/HGA order."""
+        if len(band_inputs) != 3:
+            raise ValueError(f"expected 3 bands, got {len(band_inputs)}")
+        slow, mid, hga = band_inputs
+        for name, x, nb in (
+            ("slow", slow, FINE_HGA_BINS[0]),
+            ("mid", mid, FINE_HGA_BINS[1]),
+            ("hga", hga, FINE_HGA_BINS[2]),
+        ):
+            if x.shape[-2] != nb:
+                raise ValueError(f"band {name} has {x.shape[-2]} freq bins, expected {nb}")
+
+        slow_tok = self.slow_proj(slow.transpose(-1, -2)) + self.band_type_emb[0]
+        mid_tok = self.mid_proj(mid.transpose(-1, -2)) + self.band_type_emb[1]
+        hga_tok = self._pool_hga(hga) + self.band_type_emb[2]
+        tokens = (slow_tok, mid_tok, hga_tok)
+
+        s_slow, s_mid, s_hga = FINE_LATTICE_STRIDES
+        positions = (
+            torch.arange(slow_tok.shape[-2], device=slow.device, dtype=torch.long) * s_slow,
+            torch.arange(mid_tok.shape[-2], device=mid.device, dtype=torch.long) * s_mid,
+            torch.arange(hga_tok.shape[-2], device=hga.device, dtype=torch.long) * s_hga,
+        )
+        return tokens, positions

@@ -16,7 +16,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from speech_decoding.models.v14_converged_v3.stem import PerBandStem, SpectralStem
+from speech_decoding.models.v14_converged_v3.stem import (
+    FineHgaStem,
+    PerBandStem,
+    SpectralStem,
+)
 
 # 4 s clip on the 32 Hz clock = 128 slots. Uniform hop=64 → every band at 32 Hz,
 # so all three arrive with 128 frames (no hold).
@@ -181,3 +185,106 @@ def test_perband_wrong_band_count_and_wrong_bins_raise() -> None:
     bad_mid = torch.randn(B, C, 7, T_MID)  # 7 bins, MID expects 6
     with pytest.raises(ValueError):
         stem((slow, bad_mid, hga))
+
+
+# ── FineHgaStem (native-rate SLOW/MID + HGA conv-pool 128→32 Hz; 2026-07-21) ─────
+# NATIVE rates on a 128-slot (T32) clip: SLOW @4 Hz = 16 frames, MID @16 Hz = 64,
+# HGA @128 Hz = 512 frames (4× the 32 Hz clock). Token counts MUST match PerBandStem
+# (16/64/128) + SAME lattice positions (idx·8/·2/·1) so pack/mask/pe are unchanged.
+FH_SLOW_IN, FH_MID_IN, FH_HGA_IN = 16, 64, 512  # native input frame counts
+FH_HGA_BINS = 4  # fine HGA 64-160 Hz, k2..k5
+
+
+def _fine_bands(bB: int = B, cC: int = C):
+    slow = torch.randn(bB, cC, 7, FH_SLOW_IN)   # @4 Hz, no decimate
+    mid = torch.randn(bB, cC, 6, FH_MID_IN)     # @16 Hz, no decimate
+    hga = torch.randn(bB, cC, FH_HGA_BINS, FH_HGA_IN)  # @128 Hz, conv-pooled /4
+    return slow, mid, hga
+
+
+def test_fine_output_token_counts_match_perband() -> None:
+    # native SLOW/MID feed straight through (no decimate); HGA conv-pools 512→128.
+    stem = FineHgaStem(d_model=D)
+    toks, pos = stem(_fine_bands())
+    assert [t.shape for t in toks] == [
+        (B, C, T_SLOW_TOK, D), (B, C, T_MID_TOK, D), (B, C, T_HGA_TOK, D),
+    ]
+    assert [p.shape[0] for p in pos] == [T_SLOW_TOK, T_MID_TOK, T_HGA_TOK]
+
+
+def test_fine_lattice_positions_identical_to_perband() -> None:
+    # THE interop invariant: same lattice positions ⇒ pack_r4/masking/pe are byte-identical.
+    stem = FineHgaStem(d_model=D)
+    _, pos = stem(_fine_bands())
+    assert torch.equal(pos[0], torch.arange(T_SLOW_TOK) * 8)
+    assert torch.equal(pos[1], torch.arange(T_MID_TOK) * 2)
+    assert torch.equal(pos[2], torch.arange(T_HGA_TOK) * 1)
+    for k in range(T_SLOW_TOK):
+        assert pos[0][k].item() == pos[2][8 * k].item()
+
+
+def test_fine_slow_mid_are_no_decimate_plain_projection() -> None:
+    # SLOW/MID arrive at native rate ⇒ token k == proj(band frame k) (NO strided pick).
+    stem = FineHgaStem(d_model=D)
+    slow, mid, hga = _fine_bands(1, 1)
+    with torch.no_grad():
+        stem.band_type_emb.zero_()
+    toks, _ = stem((slow, mid, hga))
+    assert torch.allclose(toks[0], stem.slow_proj(slow.transpose(-1, -2)), atol=1e-6)
+    assert torch.allclose(toks[1], stem.mid_proj(mid.transpose(-1, -2)), atol=1e-6)
+
+
+def test_fine_hga_pool_is_two_stride2_convs_kernel3() -> None:
+    stem = FineHgaStem(d_model=D)
+    convs = [m for m in stem.hga_pool.modules() if isinstance(m, torch.nn.Conv1d)]
+    assert len(convs) == 2
+    assert convs[0].in_channels == FH_HGA_BINS and convs[0].out_channels == D
+    assert convs[1].in_channels == D and convs[1].out_channels == D
+    for c in convs:
+        assert c.kernel_size == (3,) and c.stride == (2,) and c.padding == (1,)
+    assert any(isinstance(m, torch.nn.GELU) for m in stem.hga_pool.modules())
+
+
+def test_fine_hga_conv_pool_is_local_leak_clean() -> None:
+    # RF of 2×(k3,s2) = 7 input frames; output token o covers HGA frames [4o-3, 4o+3].
+    # An impulse at HGA frame 20 must perturb ONLY token 5 (4·5=20) — the leak-margin claim.
+    stem = FineHgaStem(d_model=D)
+    slow, mid, _ = _fine_bands(1, 1)
+    base = torch.zeros(1, 1, FH_HGA_BINS, FH_HGA_IN)
+    imp = base.clone()
+    imp[0, 0, :, 20] = 5.0
+    with torch.no_grad():
+        t_base, _ = stem((slow, mid, base))
+        t_imp, _ = stem((slow, mid, imp))
+    diff = (t_imp[2] - t_base[2]).abs().sum(dim=-1)[0, 0]  # (128,) per-token change
+    changed = torch.nonzero(diff > 1e-6).flatten().tolist()
+    assert changed == [5], f"impulse at HGA frame 20 leaked beyond token 5: {changed}"
+
+
+def test_fine_hga_input_not_divisible_by_pool_raises() -> None:
+    stem = FineHgaStem(d_model=D)
+    slow, mid, _ = _fine_bands()
+    bad_hga = torch.randn(B, C, FH_HGA_BINS, 510)  # 510 % 4 != 0
+    with pytest.raises(ValueError):
+        stem((slow, mid, bad_hga))
+
+
+def test_fine_wrong_bins_and_band_count_raise() -> None:
+    stem = FineHgaStem(d_model=D)
+    slow, mid, hga = _fine_bands()
+    with pytest.raises(ValueError):
+        stem((slow, mid))  # 2 bands
+    bad_hga = torch.randn(B, C, 7, FH_HGA_IN)  # 7 bins, fine HGA expects 4
+    with pytest.raises(ValueError):
+        stem((slow, mid, bad_hga))
+
+
+def test_fine_arbitrary_leading_dims() -> None:
+    stem = FineHgaStem(d_model=D)
+    slow = torch.randn(C, 7, FH_SLOW_IN)
+    mid = torch.randn(C, 6, FH_MID_IN)
+    hga = torch.randn(C, FH_HGA_BINS, FH_HGA_IN)
+    toks, pos = stem((slow, mid, hga))
+    assert [t.shape for t in toks] == [
+        (C, T_SLOW_TOK, D), (C, T_MID_TOK, D), (C, T_HGA_TOK, D),
+    ]
