@@ -54,6 +54,7 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import pickle
 import time
 
 import numpy as np
@@ -124,6 +125,13 @@ def _sibling(cell):
 # std_target (per-domain/AdaBN CS column) is REPORTED by default (preserves the r4 board), but
 # Ben's r5mod board is raw+std ONLY — toggle off with --no-std-target.
 REPORT_STD_TARGET = True
+
+# Back-fill electrode labels for caches encoded before ``elec_labels`` was stored (e.g. arm0/r4b).
+# Labels are a pure function of (channels, drop-set), independent of weights (session_setup.py:114/
+# 119), so a sibling cache's labels are valid for a same-set session — proven per session by
+# count + present_parcels equality in build_arm0_label_sidecar.py before the sidecar is written.
+# {"s{S}_t{T}": np.ndarray[str]}; attached in _load only when the record lacks its own.
+_ELEC_LABELS_SIDECAR: dict | None = None
 NORMS = ("std",)   # std-only default (Ben 2026-07-20); raw retired
 # norm is a REPORTED axis, not a selected one (Ben 2026-07-17): both columns are computed over
 # every cell and both are printed. Measured on our own r4 20k probe (results_v3_probe_r4_20k.json,
@@ -497,8 +505,17 @@ def _load(cache_dir, session, tag, mmap=False):
     slowdown; pick with MMAP_DEFAULT and A/B with --mmap/--no-mmap before trusting a change.
     """
     s, t = session
-    return torch.load(f"{cache_dir}/enc_s{s}_t{t}_{tag}.pt", map_location="cpu",
-                      weights_only=False, mmap=mmap)
+    rec = torch.load(f"{cache_dir}/enc_s{s}_t{t}_{tag}.pt", map_location="cpu",
+                     weights_only=False, mmap=mmap)
+    if _ELEC_LABELS_SIDECAR is not None and rec.get("elec_labels") is None:
+        lab = _ELEC_LABELS_SIDECAR.get(f"s{s}_t{t}")
+        if lab is not None:
+            if lab.shape[0] != rec["feats"]["enc12_elec"]["raw"].shape[1]:
+                raise ValueError(
+                    f"sidecar labels ({lab.shape[0]}) != enc12_elec electrodes "
+                    f"({rec['feats']['enc12_elec']['raw'].shape[1]}) for s{s}_t{t}")
+            rec["elec_labels"] = lab
+    return rec
 
 
 # ── sharded units (one SLURM array task each; all cells are independent) ────────────
@@ -743,10 +760,19 @@ def main() -> None:
     p.add_argument("--taps", default="",
                    help=f"comma-separated subset of {ALL_TAPS} (default: per-regime; CS drops "
                         f"{ELEC_TAPS} automatically)")
+    p.add_argument("--elec-labels-sidecar",
+                   help="pickle {'s{S}_t{T}': labels} to attach to records that lack elec_labels "
+                        "(caches encoded before the field was stored, e.g. arm0/r4b). Validated "
+                        "same-set upstream; _load re-asserts count-match before attaching.")
     args = p.parse_args()
 
-    global REPORT_STD_TARGET
+    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR
     REPORT_STD_TARGET = args.std_target
+    if args.elec_labels_sidecar:
+        with open(args.elec_labels_sidecar, "rb") as fh:
+            _ELEC_LABELS_SIDECAR = pickle.load(fh)
+        print(f"[sidecar] attaching elec_labels for {len(_ELEC_LABELS_SIDECAR)} sessions",
+              flush=True)
 
     tags = tuple(t.strip() for t in args.tags.split(","))
     # Default taps are per-REGIME (WS/CSession electrode-only, CS parcel-only); --taps overrides.

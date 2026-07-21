@@ -95,6 +95,43 @@ RUN_B_ARGV: list[str] = [
     "--trial-durations", "/projects/bhqk/htang13/v14_trial_durations.json",
 ]
 
+# Run-C recon encoder (runC_split_args.sh): k=4 / pool-op BAND / seed-offset 5mm /
+# target-ln + pred-ln / M2+M4 context ramps. k and pool-op change PARAMS ⇒ RUN_B_ARGV
+# (k2/patch) will NOT load a Run-C ckpt; the loss-side flags (m4-recon-m3, context,
+# target/pred-ln) carry zero encoder params but are kept for an exact-parity xp.
+RUN_C_ARGV: list[str] = [
+    "--phase", "1", "--mode", "full", "--frontend", "2band", "--atlas", "dkt",
+    "--d-model", "256", "--n-heads", "4",
+    "--converged-frontend-layers", "6", "--converged-latent-layers", "6",
+    "--converged-v2-pred-dim", "128",
+    "--converged-v2-m2-pred-layers", "6", "--converged-v2-m4-pred-layers", "6",
+    "--converged-v2-qk-norm",
+    "--converged-v2-m3-drop-frac", "0.5", "--converged-v2-m3-min-keep", "4",
+    "--converged-v2-m4-recon-m3",
+    "--converged-v2-pool-op", "band",
+    "--converged-v2-k", "4",
+    "--converged-v2-seed-offset-sigma-mm", "5.0",
+    "--converged-v2-context-lambda", "0.5",
+    "--converged-v2-context-warmup-start-step", "10000",
+    "--converged-v2-context-warmup-steps", "10000",
+    "--converged-v2-m4-context-warmup-start-step", "30000",
+    "--converged-v2-m4-context-warmup-steps", "10000",
+    "--converged-v2-w-m2", "1.0", "--converged-v2-w-m4", "1.0",
+    "--converged-v2-w-melec", "1.0",
+    "--converged-v2-support-weight",
+    "--converged-v2-target-ln", "--converged-v2-pred-ln",
+    "--converged-tube-ratio", "0.25", "--clip-len", "4.0",
+    "--lr", "6e-3", "--weight-decay", "0.04", "--grad-clip", "3.0",
+    "--lr-schedule", "warmup_cosine", "--min-lr-ratio", "1.0", "--warmup-steps", "5000",
+    "--ema-tau", "0.99925", "--adam-beta2", "0.95", "--seed", "33",
+    "--batch-size", "32", "--accumulate-grad-batches", "4",
+    "--group-by-session",
+    "--session-z-winsor-lfs", "15", "--session-z-winsor-hga", "20",
+    "--bad-window-dir", "/projects/bhqk/htang13/v14_bad_windows_2band",
+    "--spec-only", "--spec-cache-dir", "/work/nvme/bhqk/htang13/v14_2band_v2_spec_pretrain",
+    "--trial-durations", "/projects/bhqk/htang13/v14_trial_durations.json",
+]
+
 PROBE_CLIP_DUR_S = 1.0
 
 
@@ -460,7 +497,7 @@ def _apply_lite_montage(bands, ppe, em, *, bt_root, subject_id, trial_id):
 
 
 def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
-               electrode_set="lite", batch_size=64, argv=RUN_A_ARGV):
+               cache_frontend=True, electrode_set="lite", batch_size=64, argv=RUN_A_ARGV):
     """Stage 1: forward the trained encoder over each session's union clips → tap caches.
 
     One GPU forward per session over EXACTLY the union word windows (est_idx-aligned,
@@ -502,7 +539,10 @@ def run_encode(sessions, tasks, *, ckpt_path, out_dir, cache_untagged_m3=True,
     n_parcels_atlas = int(model.latent.parcel_embed.num_embeddings)
     os.makedirs(out_dir, exist_ok=True)
 
-    surfaces = ["frontend", "m3", "m4"] + (["m3_untagged"] if cache_untagged_m3 else [])
+    # M2 (frontend, ~55 GB/session) is only read by the M2 ridge; drop it when we probe
+    # M3/M4 only ⇒ no 55 GB write, no host-RAM/OOM pressure, much faster.
+    surfaces = (["frontend"] if cache_frontend else []) + ["m3", "m4"] \
+        + (["m3_untagged"] if cache_untagged_m3 else [])
     tap_of = {"frontend": "M2", "m3": "M3", "m4": "M4", "m3_untagged": "M3_untagged"}
 
     for session in sessions:
@@ -883,6 +923,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ckpt", default=None, help="checkpoint to forward (required for --encode)")
     p.add_argument("--run-b", action="store_true",
                    help="--encode: build the Run-B recon arch (RUN_B_ARGV) instead of Run-A")
+    p.add_argument("--run-c", action="store_true",
+                   help="--encode: build the Run-C recon arch (RUN_C_ARGV, k4/pool-op band)")
+    p.add_argument("--no-m2", action="store_true",
+                   help="--encode: skip the M2/frontend grid (55 GB/session) — M3/M4 probes only")
     p.add_argument("--cache-dir", default=None,
                    help="output dir for --encode tap caches (required for --encode)")
     p.add_argument("--no-untagged-m3", action="store_true",
@@ -963,11 +1007,13 @@ def main(argv: list[str] | None = None) -> int:
         if not args.ckpt or not args.cache_dir:
             p.error("--encode requires --ckpt and --cache-dir")
         sessions = _parse_pairs(args.sessions) if args.sessions else tuple(PROBE_COHORT_7)
+        arch_argv = RUN_C_ARGV if args.run_c else (RUN_B_ARGV if args.run_b else RUN_A_ARGV)
         run_encode(sessions, tuple(NEUROPROBE_TASKS),
                    ckpt_path=args.ckpt, out_dir=args.cache_dir,
                    cache_untagged_m3=not args.no_untagged_m3,
+                   cache_frontend=not args.no_m2,
                    electrode_set=args.electrode_set,
-                   argv=RUN_B_ARGV if args.run_b else RUN_A_ARGV)
+                   argv=arch_argv)
         return 0
 
     if args.merge:

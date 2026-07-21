@@ -2,7 +2,8 @@
 Gaussian-NLL head (contract project-r4-contract-2026-07-15 §7).
 
 Writes ``<out-dir>/sub-<subject_id>.npz`` (arrays ``stat_mean``/``stat_std``, each
-(n_parcels, 6) indexed by parcel-id VALUE) — the exact schema
+(n_parcels, 5) indexed by parcel-id VALUE — the 5-dim state
+[slow_mu, mid_mu, hga_mu, relmod48, relmod816]) — the exact schema
 ``session_loader._load_state_stats`` reads and the r4 launch turns on via
 ``--state-stats-dir``. Without these files the secondary NLL cannot run.
 
@@ -60,7 +61,7 @@ def _accumulate_subject(
     epochs: int,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Pool one subject's sessions → (stat_mean (V,6), stat_std (V,6), n_samples)."""
+    """Pool one subject's sessions → (stat_mean (V,5), stat_std (V,5), n_samples)."""
     acc = StateStatsAccumulator()
     max_parcel = 0
     n_clips = 0

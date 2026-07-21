@@ -49,12 +49,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from speech_decoding.experiments.dispatch_v3 import make_bt_parcel_fn
 from speech_decoding.models.v14_converged_v3.clip_sampler import sample_clip_start
 from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
-from speech_decoding.studies.braintreebank.anatomy import (
-    aligned_voltage_coords,
-    aligned_voltage_support,
-)
+from speech_decoding.studies.braintreebank.anatomy import aligned_voltage_coords
 
 # The 13 pretrain sessions r1/r2/r3 train on (v3_launch_r2.sbatch).
 V3_SESSIONS: list[tuple[int, int]] = [
@@ -68,13 +66,6 @@ FPS = 32  # hop 64 @ 2048 Hz -> 31.25 ms slots
 
 # Variogram distance bins (mm), matching the 2026-07-08 probe's reporting granularity.
 DIST_EDGES = np.array([0, 5, 10, 15, 20, 30, 40, 55, 70, 1e9], dtype=float)
-
-
-def _parcel_fn(bt_root: str):
-    def fn(subject_id: int, trial_id: int, labels):
-        sup = aligned_voltage_support(bt_root, subject_id, trial_id)  # (n_v, P) one-hot
-        return torch.as_tensor(np.asarray(sup).argmax(1))
-    return fn
 
 
 def _read_frames(spec, n_clips: int, clip_frames: int, seed: int) -> list[np.ndarray]:
@@ -239,7 +230,7 @@ def main() -> None:
         sessions=V3_SESSIONS,
         band_cache_dirs=[os.path.join(args.band_root, b) for b in BAND_DIRS],
         span_dir=args.span_dir,
-        parcel_fn=_parcel_fn(args.bt_root),
+        parcel_fn=make_bt_parcel_fn(args.bt_root),  # DKT — the SAME fn dispatch_v3 uses
         lof_report_path=None,  # r2 passes no LOF report -> no guard-1 drops on BT
         winsor=WINSOR,
     )
@@ -252,7 +243,9 @@ def main() -> None:
         shaft_id = sc.shaft_id.numpy()
         depth = sc.depth.numpy()
 
-        coords_full = np.asarray(aligned_voltage_coords(args.bt_root, sid, tid), dtype=float)
+        coords_full = np.asarray(
+            aligned_voltage_coords(args.bt_root, sid, trial_id=tid), dtype=float
+        )
         coords = coords_full[keep]
         if coords.shape[0] != len(sc.labels):
             sys.exit(f"{sid}/{tid}: coords {coords.shape} vs {len(sc.labels)} survivors")
@@ -274,9 +267,19 @@ def main() -> None:
             sig_z = _zscore_rows(flat)
             corr = _pair_corr(sig_z)
 
+            # M7 — the SAME variogram after shaft-CAR. The raw variogram still contains the
+            # common mode, so SLOW's long-range tail (0.11-0.14 past 70 mm) may be nothing but
+            # volume conduction + reference + global arousal. Removing the per-shaft mean at
+            # each t and re-measuring is the only thing that separates "real inter-shaft
+            # structure L2 could carry" from "the common mode input-linear already has".
+            corr_car = _pair_corr(_zscore_rows(_shaft_car(flat, shaft_id)))
+
             rec = {
                 "subject_id": sid, "trial_id": tid, "band": name,
                 "M1_eigenspectrum": {"raw": eig_raw, "shaft_car": eig_car},
+                "M7_variogram_car": _variogram(corr_car, coords),
+                "M7_depth_lag_car": _depth_lag(corr_car, shaft_id, depth, coords,
+                                               args.max_depth_lag),
                 "M2a_time_acf": {
                     "acf": [round(float(v), 4) for v in acf],
                     "lag_half_slots": round(_crossing(acf, 0.5), 2),
@@ -325,14 +328,23 @@ def main() -> None:
             vs = [d["corr_med"] for r in rs for d in r["M2b_depth_lag"] if d["lag"] == lag]
             if vs:
                 print(f"  M2b depth lag {lag}: corr {np.median(vs):.3f}")
-        print("  M3 variogram:")
+        print("  M3 variogram   RAW -> M7 POST-SHAFT-CAR   (the CAR column is the honest one:")
+        print("                 raw still contains the common mode, which input-linear gets free)")
         for k in range(len(DIST_EDGES) - 1):
             lo = float(DIST_EDGES[k])
             vs = [d["corr_med"] for r in rs for d in r["M3_variogram"] if d["lo_mm"] == lo]
+            vc = [d["corr_med"] for r in rs for d in r["M7_variogram_car"] if d["lo_mm"] == lo]
             if vs:
                 hi = DIST_EDGES[k + 1]
                 lbl = f">{lo:.0f}mm" if hi > 1e8 else f"{lo:.0f}-{hi:.0f}mm"
-                print(f"    {lbl:>10}: corr {np.median(vs):.3f}")
+                car = f"{np.median(vc):.3f}" if vc else "  -  "
+                print(f"    {lbl:>10}: raw {np.median(vs):.3f}   CAR {car}")
+        print("  M7 depth lag (post-CAR, within-shaft — CAR removes the shaft mean, so this")
+        print("     is the WITHIN-shaft residual field L1 sees):")
+        for lag in (1, 2, 3, 5):
+            vc = [d["corr_med"] for r in rs for d in r["M7_depth_lag_car"] if d["lag"] == lag]
+            if vc:
+                print(f"    lag {lag}: corr {np.median(vc):.3f}")
 
 
 if __name__ == "__main__":
