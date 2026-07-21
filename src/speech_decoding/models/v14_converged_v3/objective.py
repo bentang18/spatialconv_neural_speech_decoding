@@ -65,7 +65,13 @@ from speech_decoding.models.v14_converged_v3.state_target import (
     SLOT_STRIDE,
     build_state_target,
 )
-from speech_decoding.models.v14_converged_v3.stem import PER_BAND_SPECS, PerBandStem
+from speech_decoding.models.v14_converged_v3.stem import (
+    FINE_LATTICE_STRIDES,
+    HGA_POOL_FACTOR,
+    PER_BAND_SPECS,
+    FineHgaStem,
+    PerBandStem,
+)
 from speech_decoding.models.v14_converged_v3.towers import (
     N_LEVELS,
     PRED_D_MODEL,
@@ -129,9 +135,15 @@ class _TargetTower(nn.Module):
     flat entry point the encoder takes (``forward_flat`` vs ``forward_flat_pack``).
     """
 
-    def __init__(self, *, n_parcels: int, deep_sup: bool = True) -> None:
+    def __init__(
+        self, *, n_parcels: int, deep_sup: bool = True, native_fine_hga: bool = False
+    ) -> None:
         super().__init__()
-        self.stem = PerBandStem(D_MODEL)
+        # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
+        # HGA 4 bins conv-pooled 128→32Hz) instead of arm0's uniform-32Hz PerBandStem.
+        # Same (tokens, positions) contract + same 32Hz output lattice, so masking/pack/
+        # pe/encoder are byte-identical (memo project-fine-hga-bt-rebake-tasklist-2026-07-21).
+        self.stem = FineHgaStem(D_MODEL) if native_fine_hga else PerBandStem(D_MODEL)
         self.encoder = build_encoder(n_parcels=n_parcels, deep_sup=deep_sup)
 
     def forward(
@@ -168,8 +180,10 @@ class V3JepaObjective(nn.Module):
         context_loss: bool = False,
         lambda_ctx: float = LAMBDA_CTX,
         mae: bool = False,
+        native_fine_hga: bool = False,
     ) -> None:
         super().__init__()
+        self.native_fine_hga = bool(native_fine_hga)
         # MAE arm (Masked Autoencoder target, He 2021 / AudioMAE): the ONLY change vs the
         # JEPA arm is the prediction TARGET — reconstruct this token's OWN norm_pix'd input
         # |STFT| bins instead of the EMA-teacher latent. No EMA teacher, no secondary/context.
@@ -214,7 +228,10 @@ class V3JepaObjective(nn.Module):
         # rather than modelling anything.
         self.nll_floor = bool(nll_floor)
         # online target path (stem + encoder) — every param here is EMA-mirrored (JEPA arm).
-        self.online = _TargetTower(n_parcels=n_parcels, deep_sup=self.deep_sup)
+        self.online = _TargetTower(
+            n_parcels=n_parcels, deep_sup=self.deep_sup,
+            native_fine_hga=self.native_fine_hga,
+        )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
             None
@@ -311,7 +328,20 @@ class V3JepaObjective(nn.Module):
         ``collect_taps`` (monitor cadence): also return the detached encoder block-12
         VISIBLE-cell tap (rankme / feat_std).
         """
-        T = bands[0].shape[-1]  # 32 Hz clock length
+        if self.native_fine_hga:
+            # Native rates (SLOW T/8 @4Hz, MID T/2 @16Hz, HGA 4T @128Hz): the 32 Hz clock
+            # is derived from HGA (128 = 4·32, integer-exact). Assert all three bands agree
+            # so a mis-shaped native cache fails loud instead of silently mis-gridding.
+            s_slow, s_mid, _ = FINE_LATTICE_STRIDES  # (8, 2, 1) — SLOW/MID native = T/stride
+            T = bands[2].shape[-1] // HGA_POOL_FACTOR
+            if not (bands[0].shape[-1] * s_slow == T and bands[1].shape[-1] * s_mid == T):
+                raise ValueError(
+                    f"native band frame counts disagree on the 32 Hz clock: "
+                    f"slow={bands[0].shape[-1]} mid={bands[1].shape[-1]} "
+                    f"hga={bands[2].shape[-1]} → T={T}"
+                )
+        else:
+            T = bands[0].shape[-1]  # 32 Hz clock length (uniform arm0)
         # grid_max_seqlen / m_vis / pack_max_seqlen are per-session Python-int shape constants
         # (the module caches them via ``V3ConvergedModel.session_plan`` and passes them in);
         # supplying them skips the per-step ``.item()`` host syncs that otherwise break the
