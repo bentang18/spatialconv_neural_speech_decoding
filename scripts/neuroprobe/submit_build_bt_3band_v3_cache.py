@@ -79,7 +79,10 @@ _LITE_SESSIONS: tuple[tuple[int, int], ...] = (
 # v3 3-band set (uniform hop=64): SLOW and MID are v3-exclusive cache-bands at
 # hop 64 (v3slow/v3mid); HGA reuses "hga" (already hop 64). The shared "beta"
 # (hop 128) is NOT used by v3 anymore — forking v3mid keeps the 3stft ladder safe.
-_BANDS = ("v3slow", "v3mid", "hga")
+# v3hga = fine-HGA OFAT (2026-07-21): HGA re-baked at N=64/hop=16 → 128 Hz / 4 bins
+# into band_v3hga (NOT in the default set — pass --bands v3hga to build just it;
+# band_v3slow/band_v3mid are reused byte-identical from the arm0 cache).
+_BANDS = ("v3slow", "v3mid", "hga", "v3hga")
 
 
 def _verify_lite_sessions() -> None:

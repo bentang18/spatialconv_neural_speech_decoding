@@ -56,6 +56,7 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
+    STFT_V3_HGA,
     STFT_V3_MID,
     STFT_V3_SLOW,
     MultiStftView,
@@ -559,7 +560,7 @@ def build_v14_experiment(
     # future ``--frontend 3stft`` training run (shared ``STFT_3BAND_*`` constants
     # + ``common_fe_kwargs``), so the spec-cache namespace matches → the run HITs
     # this cache. Overrides ``frontend``. None = no 3STFT band build.
-    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid"] | None = None,
+    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid", "v3hga"] | None = None,
     # Cache-build parallelism (--cache-only): restrict the SSL/study corpus to a
     # single session by its index in ``_SESSIONS_BY_MODE[study_mode]`` so a SLURM
     # array builds one session's spec cache per task. None = full corpus. The
@@ -1473,6 +1474,11 @@ def build_v14_experiment(
                 # <v3-spec-cache-dir>/band_{v3slow,v3mid,hga}.
                 "v3slow": STFT_V3_SLOW,
                 "v3mid": STFT_V3_MID,
+                # fine-HGA OFAT (2026-07-21): HGA at N=64/hop=16 → 128 Hz, 4 bins.
+                # Builds into <v3-spec-cache-dir>/band_v3hga; the v3 fine-HGA run
+                # reads it + reuses band_v3slow/band_v3mid byte-identical (SLOW/MID
+                # unchanged). The stem conv-pools 128→32 Hz (learned decimate).
+                "v3hga": STFT_V3_HGA,
             }[cache_band]
             band_spec_cache = (
                 str(Path(spec_cache_dir) / f"band_{cache_band}")

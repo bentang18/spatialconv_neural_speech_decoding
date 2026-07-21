@@ -28,6 +28,7 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_BETA,
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
+    STFT_V3_HGA,
     _WINSOR_BAND_TAG,
     MultiStftView,
     _single_stft_raw_view,
@@ -235,11 +236,16 @@ def test_winsor_band_name_per_band() -> None:
     hg = MultiStftView(front_end="band", hop_length=64, **STFT_3BAND_HG)
     lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
     hga = MultiStftView(front_end="band", hop_length=64, **STFT_2BAND_HGA)
+    vhga = MultiStftView(front_end="band", hop_length=16, **STFT_V3_HGA)
     assert slow._winsor_band_name() == "slow"
     assert beta._winsor_band_name() == "beta"
     assert hg._winsor_band_name() == "hg"
     assert lfs._winsor_band_name() == "lfs"
     assert hga._winsor_band_name() == "hga"
+    # fine-HGA (N=64/hop=16) is the SAME physical 64-160 band as the 32 Hz HGA
+    # (N=128), so it REUSES the "hga" winsor cap by design (distinct tuple key,
+    # same value) — the |z| family is the same; parity spec keeps HGA winsor 20.
+    assert vhga._winsor_band_name() == "hga"
     assert MultiStftView(front_end="raw")._winsor_band_name() is None
 
 
@@ -251,8 +257,13 @@ def test_winsor_band_tags_do_not_collide() -> None:
     future band whose tuple aliases an existing band — that would silently clamp
     the wrong band's training signal."""
     tags = list(_WINSOR_BAND_TAG.values())
-    assert sorted(tags) == ["beta", "hg", "hga", "lfs", "slow", "vslow"]
-    assert len(_WINSOR_BAND_TAG) == len(set(_WINSOR_BAND_TAG)) == 6
+    # "hga" appears TWICE by design: the 32 Hz HGA (128,mag,160) and the fine-HGA
+    # (64,mag,160) are the SAME physical 64-160 band at two window/hop resolutions,
+    # so they share the "hga" cap. The guard that matters is KEY uniqueness (no two
+    # physical bands aliasing one tuple → silently clamping the wrong signal), which
+    # holds: 7 DISTINCT keys. Value-sharing across resolutions of one band is fine.
+    assert sorted(tags) == ["beta", "hg", "hga", "hga", "lfs", "slow", "vslow"]
+    assert len(_WINSOR_BAND_TAG) == len(set(_WINSOR_BAND_TAG)) == 7
     # The two real-world nperseg aliases resolve to different tags via the tuple.
     lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
     slow = MultiStftView(front_end="band", hop_length=512, **STFT_3BAND_SLOW)

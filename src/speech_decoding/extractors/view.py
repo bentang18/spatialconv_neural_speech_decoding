@@ -240,6 +240,21 @@ STFT_V3_MID: dict[str, float] = {
     "band_nperseg": 256, "band_hop": 64, "band_f_lo_hz": 16.0, "band_f_hi_hz": 56.0,
 }
 
+# ---------------------------------------------------------------------------
+# Fine-HGA (2026-07-21, memo project-fine-hga-frontend-ablation). HGA extracted at
+# N=64 / hop=16 → 128 Hz frames, 4 bins over 64-160 (Δf=fs/N=32 Hz → k2..k5 =
+# 64/96/128/160). REPLACES the 32 Hz STFT_V3 HGA (which reuses STFT_2BAND_HGA at
+# 128/64 → 32 Hz) for v3 fine-HGA OFAT runs: the stem LEARNS a conv-pool 128→32 Hz
+# instead of a fixed strided-slice decimate, recovering the ~20 ms transient timing
+# the 62.5 ms window blurs (poison screen 2026-07-21: N=64 FWHM 16 ms ≈ Chang 14 ms
+# vs the current N=128 31 ms). SLOW+MID unchanged. hop = N/4 (not N/2) — COLA is
+# irrelevant here (magnitude only, never inverted; scipy.stft forward-only). band_hop
+# is in the exca uid ⇒ FRESH extraction; builds into <spec-cache-dir>/band_v3hga.
+# ---------------------------------------------------------------------------
+STFT_V3_HGA: dict[str, float] = {
+    "band_nperseg": 64, "band_hop": 16, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
+}
+
 # Canonical winsor-band tag. Used ONLY to select a per-band
 # ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (each band's |z| distribution
 # differs, so one scalar cap mis-clamps the others).
@@ -274,6 +289,10 @@ _WINSOR_BAND_TAG: dict[tuple[int, str, int], str] = {
     # v3 SLOW is (1024, "mag", 14): distinct from legacy SLOW (cartesian, 12)
     # and LFS (mag, 56), so it earns its own per-band winsor cap.
     _band_tag_key(STFT_V3_SLOW): "vslow",
+    # fine-HGA (64, "mag", 160): same 64-160 band as STFT_2BAND_HGA, just a finer
+    # window/hop → the same |z| family, so it reuses the "hga" winsor cap. Distinct
+    # key from STFT_2BAND_HGA (128, "mag", 160), so no collision.
+    _band_tag_key(STFT_V3_HGA): "hga",
 }
 
 
