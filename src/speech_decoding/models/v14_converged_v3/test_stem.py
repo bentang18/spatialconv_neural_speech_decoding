@@ -20,6 +20,7 @@ from speech_decoding.models.v14_converged_v3.stem import (
     FineHgaStem,
     PerBandStem,
     SpectralStem,
+    clock_length_32hz,
 )
 
 # 4 s clip on the 32 Hz clock = 128 slots. Uniform hop=64 → every band at 32 Hz,
@@ -288,3 +289,25 @@ def test_fine_arbitrary_leading_dims() -> None:
     assert [t.shape for t in toks] == [
         (C, T_SLOW_TOK, D), (C, T_MID_TOK, D), (C, T_HGA_TOK, D),
     ]
+
+
+# ── clock_length_32hz (the single 32 Hz-clock derivation model+objective share) ──
+
+
+def test_clock_uniform_reads_slow_length() -> None:
+    # arm0: SLOW is already at 32 Hz ⇒ the clock is just its frame count (HGA ignored).
+    assert clock_length_32hz(_bands(), native_fine_hga=False) == T32
+
+
+def test_clock_native_derives_t32_from_agreeing_bands() -> None:
+    # native SLOW 16 / MID 64 / HGA 512 all encode T32=128 (16·8 = 64·2 = 512//4).
+    assert clock_length_32hz(_fine_bands(), native_fine_hga=True) == T32
+
+
+def test_clock_native_disagreeing_bands_raise() -> None:
+    # a mis-shaped SLOW (15 frames → 120 ≠ 128) must fail loud, not silently mis-grid.
+    slow = torch.randn(B, C, 7, 15)
+    mid = torch.randn(B, C, 6, FH_MID_IN)
+    hga = torch.randn(B, C, FH_HGA_BINS, FH_HGA_IN)
+    with pytest.raises(ValueError, match="disagree on the 32 Hz clock"):
+        clock_length_32hz((slow, mid, hga), native_fine_hga=True)

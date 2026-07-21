@@ -66,11 +66,10 @@ from speech_decoding.models.v14_converged_v3.state_target import (
     build_state_target,
 )
 from speech_decoding.models.v14_converged_v3.stem import (
-    FINE_LATTICE_STRIDES,
-    HGA_POOL_FACTOR,
     PER_BAND_SPECS,
     FineHgaStem,
     PerBandStem,
+    clock_length_32hz,
 )
 from speech_decoding.models.v14_converged_v3.towers import (
     N_LEVELS,
@@ -328,20 +327,7 @@ class V3JepaObjective(nn.Module):
         ``collect_taps`` (monitor cadence): also return the detached encoder block-12
         VISIBLE-cell tap (rankme / feat_std).
         """
-        if self.native_fine_hga:
-            # Native rates (SLOW T/8 @4Hz, MID T/2 @16Hz, HGA 4T @128Hz): the 32 Hz clock
-            # is derived from HGA (128 = 4·32, integer-exact). Assert all three bands agree
-            # so a mis-shaped native cache fails loud instead of silently mis-gridding.
-            s_slow, s_mid, _ = FINE_LATTICE_STRIDES  # (8, 2, 1) — SLOW/MID native = T/stride
-            T = bands[2].shape[-1] // HGA_POOL_FACTOR
-            if not (bands[0].shape[-1] * s_slow == T and bands[1].shape[-1] * s_mid == T):
-                raise ValueError(
-                    f"native band frame counts disagree on the 32 Hz clock: "
-                    f"slow={bands[0].shape[-1]} mid={bands[1].shape[-1]} "
-                    f"hga={bands[2].shape[-1]} → T={T}"
-                )
-        else:
-            T = bands[0].shape[-1]  # 32 Hz clock length (uniform arm0)
+        T = clock_length_32hz(bands, native_fine_hga=self.native_fine_hga)  # 32 Hz clock
         # grid_max_seqlen / m_vis / pack_max_seqlen are per-session Python-int shape constants
         # (the module caches them via ``V3ConvergedModel.session_plan`` and passes them in);
         # supplying them skips the per-step ``.item()`` host syncs that otherwise break the

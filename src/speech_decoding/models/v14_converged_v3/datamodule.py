@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from speech_decoding.experiments.data import _SessionGroupedBatchSampler
 from speech_decoding.models.v14_converged_v3.batch import v3_collate
 from speech_decoding.models.v14_converged_v3.dataset import (
+    UNIFORM_BAND_RATES,
     V3SessionDataset,
     V3SessionSpec,
 )
@@ -52,6 +53,7 @@ class V3DataModule(pl.LightningDataModule):
         prefetch_factor: int = 4,
         balance_ranks: bool = False,
         same_session: bool = False,
+        band_rates: Sequence[tuple[int, int]] = UNIFORM_BAND_RATES,
     ) -> None:
         super().__init__()
         self.dataset = V3SessionDataset(
@@ -60,6 +62,7 @@ class V3DataModule(pl.LightningDataModule):
             clip_frames=clip_frames,
             fps=fps,
             seed=seed,
+            band_rates=band_rates,
         )
         self._session_size = {
             s.session_key: len(s.setup.sidecar.labels) for s in sessions

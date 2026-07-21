@@ -181,6 +181,30 @@ FINE_LATTICE_STRIDES: tuple[int, int, int] = (8, 2, 1)
 HGA_POOL_FACTOR: int = 4  # 128 Hz → 32 Hz via 2× stride-2 convs (2² = 4)
 
 
+def clock_length_32hz(band_inputs: Sequence[Tensor], *, native_fine_hga: bool) -> int:
+    """The 32 Hz clip-clock length T from the input bands.
+
+    Uniform arm0: SLOW is already at 32 Hz ⇒ T = SLOW.shape[-1]. Native fine-HGA: bands
+    arrive at SLOW T/8, MID T/2, HGA 4T ⇒ derive from HGA (128 = 4·32, integer-exact) and
+    assert all three agree, so a mis-shaped native cache fails loud instead of silently
+    mis-gridding. Both the masking (model.py) and the grid (objective.py) call this so the
+    two never disagree on T."""
+    if not native_fine_hga:
+        return int(band_inputs[0].shape[-1])
+    s_slow, s_mid, _ = FINE_LATTICE_STRIDES  # (8, 2, 1) — SLOW/MID native = T/stride
+    T = int(band_inputs[2].shape[-1]) // HGA_POOL_FACTOR
+    if not (
+        int(band_inputs[0].shape[-1]) * s_slow == T
+        and int(band_inputs[1].shape[-1]) * s_mid == T
+    ):
+        raise ValueError(
+            f"native band frame counts disagree on the 32 Hz clock: "
+            f"slow={int(band_inputs[0].shape[-1])} mid={int(band_inputs[1].shape[-1])} "
+            f"hga={int(band_inputs[2].shape[-1])} → T={T}"
+        )
+    return T
+
+
 class FineHgaStem(nn.Module):
     """Native-rate per-band token stem — fine-HGA OFAT (2026-07-21).
 

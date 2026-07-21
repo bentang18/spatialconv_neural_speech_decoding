@@ -49,6 +49,7 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
     build_visible_pack,
     token_flags,
 )
+from speech_decoding.models.v14_converged_v3.stem import clock_length_32hz
 
 
 class V3ConvergedModel(nn.Module):
@@ -65,6 +66,7 @@ class V3ConvergedModel(nn.Module):
         context_loss: bool = False,
         lambda_ctx: float = LAMBDA_CTX,
         mae: bool = False,
+        native_fine_hga: bool = False,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -82,8 +84,9 @@ class V3ConvergedModel(nn.Module):
             lambda_nll=lambda_nll, nll_floor=nll_floor,
             secondary_loss=secondary_loss,
             context_loss=context_loss, lambda_ctx=lambda_ctx,
-            mae=mae,
+            mae=mae, native_fine_hga=native_fine_hga,
         )
+        self.native_fine_hga = bool(native_fine_hga)
         self.mask_cfg = mask_cfg
 
     def forward(
@@ -101,7 +104,7 @@ class V3ConvergedModel(nn.Module):
         pack_max_seqlen: int | None = None,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
-        T = band_inputs[0].shape[-1]
+        T = clock_length_32hz(band_inputs, native_fine_hga=self.native_fine_hga)
         # masking is the sole augmentation: per-shaft-balanced spatial contact drop + per-band
         # (SLOW/MID/HGA) independent temporal blocks (masking.V3Masks). The flat r4 objective
         # derives the visible/scored token sets from these directly (pack_r4.token_flags).
