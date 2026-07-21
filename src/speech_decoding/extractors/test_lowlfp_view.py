@@ -1,9 +1,9 @@
 """Tests for LowLfpView — the raw-waveform 1-30 Hz LFS band producer.
 
 TDD for the Chang 2-stream frontend redesign. The load-bearing test is
-``test_frame_grid_alignment``: it proves the LFS 64 Hz frame grid rides the SAME
+``test_frame_grid_alignment``: it proves the LFS 128 Hz frame grid rides the SAME
 window-center clock as an HGA STFT (N=64, hop=16), so the two streams are exactly
-alignable (one LFS frame per two HGA frames).
+alignable frame-for-frame (LFS frame i == HGA frame i).
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ def _make_view(tmp_path=None, **overrides):
     kwargs = dict(
         front_end="band",
         band_nperseg=64,
-        band_hop=32,
-        hop_length=32,
+        band_hop=16,
+        hop_length=16,
         band_f_lo_hz=1.0,
         band_f_hi_hz=30.0,
         session_robust_z=True,
@@ -53,13 +53,13 @@ def test_shape_and_f_bins() -> None:
     view = _make_view()
     wave = _sinusoid_mix()
     frames = view._lfs_frames(wave, FS)
-    assert frames.shape == (C, 1, 1 + T // 32)
+    assert frames.shape == (C, 1, 1 + T // 16)
     assert view._expected_raw_f_bins() == 1
     print(f"[check] OK shape={tuple(frames.shape)} f_bins={view._expected_raw_f_bins()}")
 
 
 def test_clock_matches_n_time_bins() -> None:
-    """LFS frame count == inherited n_time_bins_for_duration (same hop=32 clock)."""
+    """LFS frame count == inherited n_time_bins_for_duration (same hop=16 clock)."""
     view = _make_view()
     for dur in (0.5, 1.0, 2.0, 5.0, 6.0):
         n_samples = int(round(dur * FS))
@@ -81,15 +81,16 @@ def test_prepare_geometry_probe_short_input() -> None:
     for n_samples in (1, 2, 3, int(round(0.001 * FS)), 10, 27):
         wave = _sinusoid_mix(n_samples=n_samples)
         frames = view._lfs_frames(wave, FS)  # must NOT raise
-        assert frames.shape == (C, 1, 1 + n_samples // 32), (n_samples, frames.shape)
+        assert frames.shape == (C, 1, 1 + n_samples // 16), (n_samples, frames.shape)
     print("[check] OK short-input geometry probe survives (no padlen ValueError)")
 
 
 def test_frame_grid_alignment() -> None:
-    """CRITICAL: LFS frame i centered at raw-sample i*32 == HGA frame 2i center (2i*16).
+    """CRITICAL: LFS frame i centered at raw-sample i*16 == HGA frame i center (i*16).
 
-    Proves the LFS 64 Hz grid is exactly the even sub-grid of an HGA STFT
-    (N=64, hop=16, center=True), so the two streams are alignable frame-for-frame.
+    At 128 Hz (hop=16) the LFS grid IS the HGA STFT grid (N=64, hop=16, center=True)
+    exactly — frame-for-frame, not the even sub-grid — so the two streams stack into
+    one token per (elec, 128 Hz step) with no reconcile, and the stem conv-pools both.
     """
     view = _make_view()
     wave = _sinusoid_mix()
@@ -98,17 +99,17 @@ def test_frame_grid_alignment() -> None:
 
     # HGA STFT frame count (torch.stft(center=True), hop=16).
     n_hga = 1 + T // 16
-    # LFS count is the even sub-grid of the HGA grid.
-    assert n_lfs == 1 + T // 32
-    assert n_lfs == 1 + (n_hga - 1) // 2, (n_lfs, n_hga)
+    # LFS rides the SAME 128 Hz clock as HGA — identical frame count.
+    assert n_lfs == 1 + T // 16
+    assert n_lfs == n_hga, (n_lfs, n_hga)
 
-    lfs_hop, hga_hop = 32, 16
+    lfs_hop, hga_hop = 16, 16
     for i in range(n_lfs):
         lfs_center = i * lfs_hop
-        hga_center = (2 * i) * hga_hop
+        hga_center = i * hga_hop
         assert lfs_center == hga_center, (i, lfs_center, hga_center)
     print(f"[check] OK grid alignment n_lfs={n_lfs} n_hga={n_hga}; "
-          f"LFS[i] center == HGA[2i] center for all i")
+          f"LFS[i] center == HGA[i] center for all i")
 
 
 def test_sos_filter_removes_high_freq() -> None:
@@ -129,7 +130,7 @@ def test_sos_filter_removes_high_freq() -> None:
 
     for f in (2.0, 20.0, 100.0):
         wave = torch.sin(2 * np.pi * f * t).unsqueeze(0)  # (1, T), unit amplitude
-        frames = view._lfs_frames(wave, fs)  # (1, 1, n_frames) at 64 Hz
+        frames = view._lfs_frames(wave, fs)  # (1, 1, n_frames) at 128 Hz
         out = frames[0, 0].numpy()
         n_frames = out.shape[0]
         if f == 100.0:
@@ -141,7 +142,7 @@ def test_sos_filter_removes_high_freq() -> None:
             assert frac < 0.01, f"100 Hz not removed: central rms frac {frac}"
             print(f"[check] OK 100 Hz central rms/input = {frac:.4f} < 0.01")
         else:
-            out_amp = amp_at(out, f, 64.0, n_frames)
+            out_amp = amp_at(out, f, 128.0, n_frames)
             assert out_amp > 0.5, f"{f} Hz not preserved: amp {out_amp}"
             print(f"[check] OK {f:g} Hz amplitude {out_amp:.3f} > 0.5")
 
@@ -163,7 +164,7 @@ def test_filter_sanity_no_fake_sine() -> None:
     t = torch.arange(T).float() / FS
     wave20 = torch.sin(2 * np.pi * 20.0 * t).unsqueeze(0)
     out20 = view._lfs_frames(wave20, FS)[0, 0].numpy()
-    f, pxx = scipy.signal.welch(out20, fs=64.0, nperseg=min(256, out20.shape[0]))
+    f, pxx = scipy.signal.welch(out20, fs=128.0, nperseg=min(256, out20.shape[0]))
     total = pxx.sum()
     high_frac = pxx[f > 16.0].sum() / total
     delta_frac = pxx[(f >= 1.0) & (f <= 4.0)].sum() / total
@@ -176,7 +177,7 @@ def test_filter_sanity_no_fake_sine() -> None:
     torch.manual_seed(0)
     noise = torch.randn(1, T)
     out_n = view._lfs_frames(noise, FS)[0, 0].numpy()
-    fn, pxxn = scipy.signal.welch(out_n, fs=64.0, nperseg=min(256, out_n.shape[0]))
+    fn, pxxn = scipy.signal.welch(out_n, fs=128.0, nperseg=min(256, out_n.shape[0]))
     peak_idx = int(np.argmax(pxxn))
     peak_frac = pxxn[peak_idx] / pxxn.sum()
     assert peak_frac < 0.5, (
@@ -205,8 +206,8 @@ def test_construction_passes_validators(tmp_path) -> None:
     view = LowLfpView(
         front_end="band",
         band_nperseg=64,
-        band_hop=32,
-        hop_length=32,
+        band_hop=16,
+        hop_length=16,
         band_f_lo_hz=1.0,
         band_f_hi_hz=30.0,
         spec_cache_dir=str(tmp_path),
