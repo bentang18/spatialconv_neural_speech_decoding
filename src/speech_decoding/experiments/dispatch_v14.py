@@ -57,10 +57,12 @@ from speech_decoding.extractors.view import (
     STFT_3BAND_HG,
     STFT_3BAND_SLOW,
     STFT_V3_HGA,
+    STFT_V3_LFS,
     STFT_V3_MID,
     STFT_V3_SLOW,
     MultiStftView,
 )
+from speech_decoding.extractors.lowlfp_view import LowLfpView
 from speech_decoding.extractors.whisper_target import WhisperTargetExtractor
 from speech_decoding.studies.braintreebank.anatomy import (
     V14_DK_PARCEL_LABELS,
@@ -560,7 +562,7 @@ def build_v14_experiment(
     # future ``--frontend 3stft`` training run (shared ``STFT_3BAND_*`` constants
     # + ``common_fe_kwargs``), so the spec-cache namespace matches → the run HITs
     # this cache. Overrides ``frontend``. None = no 3STFT band build.
-    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid", "v3hga"] | None = None,
+    cache_band: tp.Literal["slow", "beta", "hg", "lfs", "hga", "v3slow", "v3mid", "v3hga", "v3lfs"] | None = None,
     # Cache-build parallelism (--cache-only): restrict the SSL/study corpus to a
     # single session by its index in ``_SESSIONS_BY_MODE[study_mode]`` so a SLURM
     # array builds one session's spec cache per task. None = full corpus. The
@@ -1481,12 +1483,23 @@ def build_v14_experiment(
                 # (64/96/128/160). The FineHgaStem conv-pools 128→32 Hz (learned decimate)
                 # instead of a fixed strided slice. Builds into band_v3hga.
                 "v3hga": STFT_V3_HGA,
+                # v3 raw-waveform LFS band (Chang 2-stream redesign, 2026-07-21): a
+                # 1-30 Hz SOS Butterworth bandpass on the RAW waveform, grid-sampled to
+                # 64 Hz (hop=32), F=1. NOT an |STFT| band — built by LowLfpView, which
+                # overrides the producer while reusing MultiStftView's cache/robust-z
+                # machinery. band_nperseg/band_hop are dummy-but-valid (pass the parent
+                # band validators); LowLfpView ignores them. Builds into band_v3lfs.
+                "v3lfs": STFT_V3_LFS,
             }[cache_band]
             band_spec_cache = (
                 str(Path(spec_cache_dir) / f"band_{cache_band}")
                 if spec_cache_dir is not None else None
             )
-            electrode_tokens_extractor = MultiStftView(
+            # v3lfs rides the raw-waveform LowLfpView; every other band is an |STFT|
+            # MultiStftView. The band view is constructed identically to the future
+            # training run so the spec-cache namespace matches → the run HITs this cache.
+            view_cls = LowLfpView if cache_band == "v3lfs" else MultiStftView
+            electrode_tokens_extractor = view_cls(
                 **common_fe_kwargs, front_end="band", **band_const,
                 hop_length=int(band_const["band_hop"]),
                 spec_cache_dir=band_spec_cache,

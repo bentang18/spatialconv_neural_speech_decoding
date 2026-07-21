@@ -82,7 +82,10 @@ _LITE_SESSIONS: tuple[tuple[int, int], ...] = (
 # v3hga = fine-HGA OFAT (2026-07-21): HGA re-baked at N=64/hop=16 → 128 Hz / 4 bins
 # into band_v3hga (NOT in the default set — pass --bands v3hga to build just it;
 # band_v3slow/band_v3mid are reused byte-identical from the arm0 cache).
-_BANDS = ("v3slow", "v3mid", "hga", "v3hga")
+# v3lfs = Chang 2-stream redesign (2026-07-21): raw-waveform LFS 1-30 Hz baked at
+# 64 Hz as a (C,F=1,T_64) leaf via LowLfpView (NOT |STFT|). Pass --bands v3lfs to
+# build just it; pairs with band_v3hga to form the 2-stream {hga_fine@128, lfs@64}.
+_BANDS = ("v3slow", "v3mid", "hga", "v3hga", "v3lfs")
 
 
 def _verify_lite_sessions() -> None:

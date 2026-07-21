@@ -254,6 +254,20 @@ STFT_V3_HGA: dict[str, float] = {
     "band_nperseg": 64, "band_hop": 16, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
 }
 
+# ---------------------------------------------------------------------------
+# v3 raw-waveform LFS band (2026-07-21, Chang 2-stream frontend redesign). NOT an
+# |STFT| band: a 1-30 Hz SOS Butterworth bandpass on the raw waveform, grid-sampled
+# onto the 64 Hz frame clock (hop=32 @ 2048 Hz), emitted as a (C, F=1, T_64) leaf by
+# LowLfpView (extractors/lowlfp_view.py), which OVERRIDES the |STFT| producer while
+# reusing all of MultiStftView's cache-build / robust-z / atomic-write machinery.
+# band_nperseg/band_hop below are DUMMY-BUT-VALID (64%32==0, half=32%32==0, hop==32)
+# purely to pass MultiStftView._validate_band_config — LowLfpView IGNORES them and
+# does bandpass + grid-sample instead. band_f_lo/hi_hz (1-30) are the REAL passband.
+# ---------------------------------------------------------------------------
+STFT_V3_LFS: dict[str, float] = {
+    "band_nperseg": 64, "band_hop": 32, "band_f_lo_hz": 1.0, "band_f_hi_hz": 30.0,
+}
+
 # Canonical winsor-band tag. Used ONLY to select a per-band
 # ``V14_SESSION_Z_WINSOR_<TAG>`` cap at read time (each band's |z| distribution
 # differs, so one scalar cap mis-clamps the others).
