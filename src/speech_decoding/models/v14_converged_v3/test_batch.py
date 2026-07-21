@@ -24,6 +24,7 @@ from speech_decoding.models.v14_converged_v3.batch import (
     v3_collate,
 )
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
+from speech_decoding.models.v14_converged_v3.state_target import STATE_DIM
 
 F_SLOW, F_MID, F_HGA = 7, 6, 7
 T = 96  # clip_len 3.0 s @ 32 Hz
@@ -113,8 +114,8 @@ def _setup_with_stats(shaft_sizes=(4, 3, 3), key=(1, 0)):
         for c in range(1, n + 1):
             labels.append(f"L{chr(65 + s)}{c}")
             parcels.append(s)
-    sm = torch.zeros(len(shaft_sizes), 6)
-    ss = torch.ones(len(shaft_sizes), 6)  # frozen std 1 → z-score is identity
+    sm = torch.zeros(len(shaft_sizes), STATE_DIM)
+    ss = torch.ones(len(shaft_sizes), STATE_DIM)  # frozen std 1 → z-score is identity
     setup = build_session_setup(
         labels, torch.tensor(parcels), drop_labels=set(), stat_mean=sm, stat_std=ss
     )
@@ -133,7 +134,7 @@ def test_collate_carries_shared_stats_once() -> None:
     batch = v3_collate([_clip(setup, key) for _ in range(3)])
     assert batch.stat_mean is setup.stat_mean
     assert batch.stat_std is setup.stat_std
-    assert batch.stat_mean.shape == (3, 6)  # three parcels present
+    assert batch.stat_mean.shape == (3, STATE_DIM)  # three parcels present
 
 
 def test_batch_stats_activate_secondary_in_forward() -> None:

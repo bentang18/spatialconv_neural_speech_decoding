@@ -117,6 +117,30 @@ def per_band_l1(mu: Tensor, target_q: Tensor, present_q: Tensor) -> dict[str, Te
     return out
 
 
+STATE_DIM_NAMES: tuple[str, ...] = ("slow_mu", "mid_mu", "hga_mu", "relmod48", "relmod816")
+
+
+def per_dim_diag_nll(
+    mu: Tensor, target_q: Tensor, present_q: Tensor, noise: Tensor
+) -> dict[str, Tensor]:
+    """Per-DIM frozen-diagonal NLL split (r5-mod diag_nll) — the 5-dim replacement for
+    :func:`per_band_nll`/:func:`per_band_l1`, whose [b, b+3] band pairing assumes the retired
+    6-dim mean/std layout. Here the state is [slow_mu, mid_mu, hga_mu, relmod48, relmod816]
+    with no std, so the informative split is per DIM: it shows whether the secondary is moving
+    the 2 MODULATION dims (the above-MAE work) at all, or only the 3 already-reachable means.
+
+    ``mu``/``target_q`` (B, Q, 5), ``present_q`` (B, Q, 5), ``noise`` (B, Q, 5) the frozen σ².
+    Each dim scored ½[(x−μ)²/σ² + log(2πσ²)], weighted-mean over its present positions (static
+    shape). Keys ``nll_{dim}`` so the trainer logs each on its own wandb series."""
+    pres = present_q.to(mu.dtype)
+    per_dim = 0.5 * ((target_q - mu) ** 2 / noise + torch.log(2.0 * torch.pi * noise))  # (B,Q,5)
+    out: dict[str, Tensor] = {}
+    for d, name in enumerate(STATE_DIM_NAMES):
+        w = pres[..., d]
+        out[f"nll_{name}"] = (per_dim[..., d] * w).sum() / w.sum().clamp_min(1.0)
+    return out
+
+
 def cov_entropy_vs_floor(cov: Tensor, noise: Tensor) -> dict[str, Tensor]:
     """Predicted-cov differential entropy vs the noise-floor ceiling, meaned over positions.
 

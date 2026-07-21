@@ -1,30 +1,36 @@
-"""v14_converged_v3 r4 — secondary-head STATE distribution + Gaussian NLL.
+"""v14_converged_v3 r5-mod — secondary-head STATE distribution + Gaussian NLL.
 
 The secondary (perceiver) objective predicts, per present (parcel, 4 Hz slot), the
-model-free parcel-state 6-vector
+model-free parcel-state 5-vector
 
-    x = [z_slow_mu, z_mid_mu, z_hga_mu, z_slow_sd, z_mid_sd, z_hga_sd]
+    x = [z_slow_mu, z_mid_mu, z_hga_mu, z_relmod48, z_relmod816]
 
-(the 3 per-band parcel MEANS + the 3 per-band within-parcel STDs; z-scored per
-(subject, parcel, dim), common-mode-removed — contract project-r4-contract-2026-07-15 §7).
+(the 3 per-band parcel MEANS + the 2 HGA MODULATION dims — phase-free relative modulation
+power in 4-8 Hz and 8-16 Hz; z-scored per (subject, parcel, dim), common-mode-removed —
+see state_target.py). The 3 within-parcel STDs of the r4 target are DROPPED: r4 flatlined
+on mean+std (the means are richly reachable from JEPA, the stds are noisy). Modulation is a
+normalized SECOND moment, quadratic-in-envelope and NOT linearly reachable from the latent,
+so the encoder must BUILD it (above-MAE work); validity probe
+(project-modulation-target-validity-2026-07-17) confirms it is a weak-but-real per-clip
+regional signal.
 
-HEAD FORM — single full-covariance Gaussian NLL, noise-floored (Ben-locked 2026-07-15,
-from first principles): the target is a smooth, low-dim, near-Gaussian vector with a
-KNOWN per-dim measurement-noise floor and dominantly-LINEAR cross-dim coupling (M17:
-hist-TC 0.166 <= gauss-TC 0.200 => no nonlinear structure a Gaussian would miss). So a
-single 6-D Gaussian (an MDN / "GMM" at ONE component) captures the joint EXACTLY through
-its covariance. Go to a mixture only on measured multimodality (none). NOT soft-bins:
-discretizing a smooth Gaussian is machinery to approximate what a Gaussian models natively.
+HEAD FORM for THIS OFAT — frozen-DIAGONAL Gaussian NLL (point head + fixed per-dim σ²).
+The r4 full-covariance head let the model LEARN σ; the r4 secondary then flatlined by
+inflating σ (raising its own NLL floor) instead of predicting better. Freezing σ² closes
+that hatch — the ONLY way the loss drops is a better μ — which is what makes the OFAT a fair
+test of whether the modulation target moves downstream CS transfer. σ² is the measured
+per-dim floor, so the weak modulation dims (σ²≈0.82/0.76) contribute ~¼ the gradient of a
+reliable mean dim (σ²≈0.12) — auto-downweighted, no tuned HP. Diagonal (not full-cov)
+because with σ frozen there is no learned cross-dim coupling to carry, and the point head
+emits no covariance parameter (DDP-safe: no unused params, the r3 X1 failure class).
 
-    Sigma = L Lᵀ + N        L = softplus-diagonal lower-tri Cholesky the head emits
-    N     = diag(sigma²_noise)  FIXED = 1 − reliability (means M11, stds M17)
+    x ~ N(μ, diag(σ²_noise))    μ = the point head's output; σ² FIXED (count-dependent floor)
 
-N is the S-JEPA "honest ambiguity" property expressed as an additive observation-noise
-covariance: the target is signal + noise, noise ~ N(0, N), so x ~ N(mu, L Lᵀ + N). The
-loss can never reward resolving below the measurement floor (Sigma's marginals >= N),
-and a perfect predictor's NLL floors at the target's own differential entropy (the
-ceiling). Because N is strictly positive Sigma is always PD => the NLL is numerically
-safe with no jitter.
+σ² is the S-JEPA "honest ambiguity" as additive observation noise: target = signal + noise,
+noise ~ N(0, σ²). The loss can never reward resolving below the measurement floor, and a
+perfect μ floors the NLL at the target's differential entropy. σ² strictly positive ⇒ always
+numerically safe. (The full-covariance :class:`GaussianStateHead` + :func:`present_masked_nll`
+below remain for the retired r5 full-cov arms; the diagonal path is what this build wires.)
 """
 
 from __future__ import annotations
@@ -35,14 +41,16 @@ import torch
 from torch import Tensor, nn
 
 # Per-dim measurement-noise variance = 1 − split-half reliability, in the z-scored units
-# the target lives in (unit marginal variance per dim). Order:
-#   [slow_mu, mid_mu, hga_mu, slow_sd, mid_sd, hga_sd].
-# Refreshed to the ACTUAL target rate + processing (#28 cm-removed 4 Hz sweep, 2026-07-15):
-# means  reliability slow .881 / mid .796 / hga .828  (HGA-mean RISES vs .561 native — the 4 Hz
-#   temporal window-average denoises HGA rather than losing it; the 8 Hz arm was worse on every
-#   dim, headroom 3.53 < 3.82 nats, so 4 Hz is the evidence-based grid).
-# stds   reliability slow .652 / mid .496 / hga .546.
-NOISE_VAR: tuple[float, ...] = (0.119, 0.204, 0.172, 0.348, 0.504, 0.454)
+# the target lives in (unit marginal variance per dim ⇒ σ² = 1 − r directly). Order:
+#   [slow_mu, mid_mu, hga_mu, relmod48, relmod816].
+# means   reliability slow .881 / mid .796 / hga .828  (#28 cm-removed 4 Hz sweep, 2026-07-15;
+#   HGA-mean RISES vs .561 native — the 4 Hz window-average denoises HGA rather than losing it).
+# modulation reliability relmod48 .179 / relmod816 .239  (parcel-spec per-clip, SB-corrected,
+#   mean over the 3 board subjects — project-modulation-target-validity-2026-07-17). WEAK but
+#   positive in all 3 subjects: σ²≈0.82/0.76 ⇒ NLL weight (1/σ²)≈1.2/1.3 vs ~5-8 for a mean dim
+#   ⇒ modulation contributes ~¼ the gradient, auto-ignored if it were noise, kept as an honest
+#   weak pin. No tuned HP.
+NOISE_VAR: tuple[float, ...] = (0.119, 0.204, 0.172, 0.821, 0.761)
 STATE_DIM: int = len(NOISE_VAR)
 
 # r5 Arm 2 (floor-off) ONLY — the floor the head gets when --no-nll-floor replaces the
@@ -54,67 +62,48 @@ STATE_DIM: int = len(NOISE_VAR)
 # test_arm2_jitter_cannot_masquerade_as_a_floor pins it.
 NLL_FLOOR_JITTER: float = 1e-6
 
-# --- count-dependent noise floor (Ben 2026-07-15: "weight dependent"; means added same day) --
-# A parcel summary is a sample statistic over its n electrodes: measurement is WORSE for small
-# parcels, and the distribution probe found 28% of the loss terms come from 2-4 electrode
-# parcels — a FIXED floor over-trusts a quarter of the targets. BOTH summaries get a
-# count-dependent floor, each on its OWN sampling law in RELIABILITY space (unit-invariant, so
-# the z-scoring doesn't touch it):
-#   MEAN — a mean of n electrodes has sampling variance ∝ 1/n (the SEM), so the noise fraction
-#     of the unit-variance mean target ∝ 1/n:   r_μ(n) = 1/(1 + (1−r_ref)/r_ref · n_ref/n).
-#     Defined at n=1 (a mean IS defined for a singleton). DIRECTLY MEASURED at small n by
-#     probe_v3_mean_floor_vs_count (disjoint size-n subsets, cm-removed, 4 Hz): the anchored law
-#     predicts r_μ(1)=0.357 (meas 0.370), r_μ(2)=0.526 (meas 0.510) — tight where unconfounded.
-#     [The measured curve plateaus BELOW the #28 SB full-parcel number (~0.72 vs 0.881 slow);
-#     that gap is Spearman-Brown-extrapolation vs direct + a big-parcel confound at large n, so
-#     we anchor at #28 (frozen ref, recovered exactly at n_ref) and add count-dependence BELOW
-#     it rather than lower the large-n floor. See project-r4-mean-floor-count-dependent-*.]
-#   STD — a sample std has sampling variance ∝ 1/(n−1), so its noise fraction ∝ 1/(n−1):
-#     r_σ(n) = 1/(1 + (1−r_ref)/r_ref · (n_ref−1)/(n−1)). At n=1 the std is UNDEFINED
-#     (present-masked upstream); the denominator is clamped so it stays finite (never scored).
-# Both recover the measured anchor exactly at n_ref: N(n_ref) = 1 − r_ref.
+# --- count-dependent noise floor (Ben 2026-07-15: "weight dependent") -------------------------
+# Every dim of the 5-vector is now a MEAN over the parcel's n electrodes — the 3 band means, and
+# the 2 modulation dims (per-electrode relmod, averaged over the parcel). A mean of n electrodes
+# has sampling variance ∝ 1/n (the SEM), so ALL five dims share ONE law in RELIABILITY space
+# (unit-invariant, so the z-scoring doesn't touch it):
+#     r(n) = 1 / (1 + (1−r_ref)/r_ref · n_ref/n),   N(n) = 1 − r(n).
+# Defined at n=1 (a mean IS defined for a singleton — modulation is present-masked upstream at
+# n=1 anyway). Recovers the anchor exactly at n_ref: N(n_ref) = 1 − r_ref. Measurement is WORSE
+# for small parcels (the distribution probe found 28% of the loss terms come from 2-4 electrode
+# parcels), so a FIXED floor over-trusts a quarter of the targets — hence the count law.
+# [The r4 STD dims used a separate ∝1/(n−1) law; with the stds dropped there is no second law.]
 #
-# Anchors (#28 cm-removed 4 Hz sweep, 2026-07-15). *_REF_RELIABILITY = 1 − NOISE_VAR[...]
-# (consistent by construction); N_REF = mean n_elec the reliabilities were averaged over.
-MEAN_REF_RELIABILITY: tuple[float, ...] = (0.881, 0.796, 0.828)  # slow/mid/hga mean reliab @ n_ref
-STD_REF_RELIABILITY: tuple[float, ...] = (0.652, 0.496, 0.546)   # slow/mid/hga std  reliab @ n_ref
+# Anchors: means #28 cm-removed 4 Hz sweep (2026-07-15); modulation the validity probe
+# (2026-07-17). REF_RELIABILITY = 1 − NOISE_VAR (consistent by construction); N_REF = mean
+# n_elec the reliabilities were averaged over (shared: both probes pooled full-parcel electrodes).
+REF_RELIABILITY: tuple[float, ...] = (0.881, 0.796, 0.828, 0.179, 0.239)  # = 1 − NOISE_VAR
 N_REF: float = 13.35
 
 
 def count_dependent_noise_var(
     n_elec: Tensor,
     *,
-    mean_r_ref: tuple[float, ...] = MEAN_REF_RELIABILITY,
-    std_r_ref: tuple[float, ...] = STD_REF_RELIABILITY,
+    r_ref: tuple[float, ...] = REF_RELIABILITY,
     n_ref: float = N_REF,
 ) -> Tensor:
-    """Per-(parcel) 6-vector noise floor N, keyed on the parcel's electrode count.
+    """Per-(parcel) 5-vector noise floor N, keyed on the parcel's electrode count.
 
-    ``n_elec`` (...,) long ≥ 1. Returns (..., 6) = [3 count-dependent mean floors, 3
-    count-dependent std floors]. Each summary uses its own sampling law in RELIABILITY space:
+    ``n_elec`` (...,) long ≥ 1. Returns (..., 5). Every dim is a mean over the parcel's
+    electrodes, so all share the SEM sampling law ∝ 1/n in reliability space:
 
-        r_μ(n) = 1 / (1 + (1−r_ref)/r_ref · n_ref/n),         N_μ(n) = 1 − r_μ(n)   (mean, ∝1/n)
-        r_σ(n) = 1 / (1 + (1−r_ref)/r_ref · (n_ref−1)/(n−1)), N_σ(n) = 1 − r_σ(n)   (std, ∝1/(n−1))
+        r(n) = 1 / (1 + (1−r_ref)/r_ref · n_ref/n),   N(n) = 1 − r(n).
 
-    Both recover the anchor exactly at n_ref (N(n_ref) = 1 − r_ref) and decrease with n. The
-    mean is defined at n=1; the std is present-masked upstream at n=1 but the denominator is
-    clamped so it stays finite (→ the max floor, never scored)."""
-    if len(mean_r_ref) != 3 or len(std_r_ref) != 3:
-        raise ValueError("mean_r_ref and std_r_ref must each have 3 entries (slow/mid/hga)")
+    Recovers the anchor exactly at n_ref (N(n_ref) = 1 − r_ref) and decreases with n. Defined
+    at n=1 (a mean is; modulation is present-masked upstream there)."""
+    if len(r_ref) != STATE_DIM:
+        raise ValueError(f"r_ref must have {STATE_DIM} entries, got {len(r_ref)}")
     n = n_elec.to(torch.float32)
-    # MEAN floor — SEM sampling law ∝ 1/n; a mean is defined at n=1 so the denominator is n.
-    denom_mean = n.clamp_min(1.0)
-    r_ref_m = n_elec.new_tensor(mean_r_ref, dtype=torch.float32)  # (3,)
-    ratio_m = (1.0 - r_ref_m) / r_ref_m * n_ref  # (3,) noise/signal at n_ref, ×n_ref
-    r_mu = 1.0 / (1.0 + ratio_m / denom_mean.unsqueeze(-1))  # (..., 3)
-    n_mean = 1.0 - r_mu  # (..., 3) mean floor
-    # STD floor — sample-std sampling law ∝ 1/(n−1).
-    denom = (n - 1.0).clamp_min(1.0)  # n=1 → 1 (std masked out anyway; keeps it finite)
-    r_ref = n_elec.new_tensor(std_r_ref, dtype=torch.float32)  # (3,)
-    ratio = (1.0 - r_ref) / r_ref * (n_ref - 1.0)  # (3,) the noise/signal at n_ref, ×(n_ref−1)
-    r_sigma = 1.0 / (1.0 + ratio / denom.unsqueeze(-1))  # (..., 3)
-    n_sigma = 1.0 - r_sigma  # (..., 3) std floor
-    return torch.cat([n_mean, n_sigma], dim=-1)  # (..., 6)
+    denom = n.clamp_min(1.0)  # a mean is defined at n=1
+    r_ref_t = n_elec.new_tensor(r_ref, dtype=torch.float32)  # (5,)
+    ratio = (1.0 - r_ref_t) / r_ref_t * n_ref  # (5,) noise/signal at n_ref, ×n_ref
+    r = 1.0 / (1.0 + ratio / denom.unsqueeze(-1))  # (..., 5)
+    return 1.0 - r  # (..., 5) floor
 
 
 class GaussianStateHead(nn.Module):
@@ -300,6 +289,33 @@ def present_masked_l1(mu: Tensor, x: Tensor, present: Tensor) -> Tensor:
     mask is what keeps the head from being scored on a value that carries no information."""
     r = (x - mu).abs() * present.to(x.dtype)
     return r.sum(-1).mean()
+
+
+def present_masked_diag_nll(
+    mu: Tensor, x: Tensor, present: Tensor, noise: Tensor
+) -> Tensor:
+    """Mean frozen-DIAGONAL Gaussian NLL over present (parcel, slot) dims — this build's loss.
+
+        L = mean_pos Σ_{d ∈ present}  ½[ (x_d − μ_d)² / σ²_d  +  log(2π σ²_d) ]
+
+    ``mu``/``x`` (..., D) (D=5), ``present`` (..., D) bool, ``noise`` (..., D) the FIXED per-dim
+    σ² (the count-dependent floor from :func:`count_dependent_noise_var`, keyed on each query's
+    parcel electrode count). σ² is FROZEN — the head emits only μ — so the ONLY way to lower L
+    is a better μ; the r4 hatch of inflating σ to raise the NLL floor is closed.
+
+    Reduction matches :func:`present_masked_nll`/:func:`present_masked_l1`: sum over the present
+    dims of a position, mean over positions. Diagonal ⇒ no cross-dim term and no Cholesky, so
+    the marginal over present dims is just the sum of the present per-dim terms — no sub-block
+    logic, no data-dependent grouping, static shape (compile-once, no host sync). Absent dims are
+    masked to 0 (``normalize_target`` also sets the target 0 there); μ is free at absent dims and
+    never scored. fp32 throughout (x is fp32; μ may be bf16 under autocast) — the log/reciprocal
+    of a strictly-positive σ² is numerically safe with no jitter."""
+    mu = mu.float()
+    x = x.float()
+    noise = noise.float()
+    per_dim = 0.5 * ((x - mu) ** 2 / noise + torch.log(2.0 * math.pi * noise))  # (..., D)
+    per_dim = per_dim * present.to(per_dim.dtype)
+    return per_dim.sum(-1).mean()
 
 
 def gaussian_entropy(cov: Tensor) -> Tensor:

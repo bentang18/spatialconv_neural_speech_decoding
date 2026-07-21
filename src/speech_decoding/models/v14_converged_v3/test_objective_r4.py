@@ -1,4 +1,4 @@
-"""v14_converged_v3 r4 — JEPA objective on the flat per-band path (TDD, #36 unit 3a).
+"""v14_converged_v3 r4/r5-mod — JEPA objective on the flat per-band path (TDD, #36 unit 3a).
 
 The objective composes the tested primitives (stem → pack_band_tokens → visible-pack
 encoder / full-grid teacher / full-grid predictor → margin-gated L1). The invariants that
@@ -12,6 +12,11 @@ a silent miscompute would violate, named + asserted + printed
      frames leaves the online latent BIT-IDENTICAL — a target cannot leak into a visible
      latent, because masked tokens are physically dropped from the encoder's sequence.
   4. The scored set is the margin gate: n_masked == in_loss.sum(), and in_loss ⊆ masked.
+
+The secondary section (unit 3b) covers the LIVE r5-mod secondary loss: frozen-DIAGONAL
+Gaussian NLL over the 5-D state [slow_mu, mid_mu, hga_mu, relmod48, relmod816], read by a
+point-only Perceiver head (no covariance parameter). The retired r4/r5 full-cov "nll" and
+point "l1" arms are covered by test_secondary_head.py.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
     build_visible_pack,
     token_flags,
 )
+from speech_decoding.models.v14_converged_v3.secondary_head import STATE_DIM
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 T = 16  # 32 Hz clock; multiple of SLOW stride 8 ⇒ SLOW 2 / MID 8 / HGA 16 tokens per contact.
@@ -205,18 +211,43 @@ def test_passed_shape_consts_give_identical_forward() -> None:
     assert ok
 
 
-# ── secondary write-only Perceiver Gaussian-NLL assembly (#36 unit 3b) ───────────────────
+# ── secondary write-only Perceiver frozen-DIAGONAL NLL (r5-mod, #36 unit 3b) ──────────────
+# The LIVE secondary loss: point-only Perceiver head → per-(parcel, 4 Hz slot) μ, scored by
+# present_masked_diag_nll against the model-free 5-D state with FROZEN σ² (count-dep floor).
 def _stats(sc):
-    """FROZEN per-(parcel,dim) state-norm stats for the test session (identity normalization:
-    mean 0, std 1 over the P present parcels). Real stats come from the offline pass."""
+    """FROZEN per-(parcel,dim) 5-D state-norm stats for the test session (identity
+    normalization: mean 0, std 1 over the P present parcels). Real stats come from the
+    offline pass."""
     parcels = torch.unique(sc.parcel_id)
     P = int(parcels.numel())
-    return torch.zeros(P, 6), torch.ones(P, 6)
+    return torch.zeros(P, STATE_DIM), torch.ones(P, STATE_DIM)
+
+
+def test_diag_nll_is_the_default_and_is_point_only() -> None:
+    # The r5-mod build's canonical secondary form: default diag_nll, point head (no covariance
+    # parameter — the DDP X1 precondition), 5-D state.
+    obj = V3JepaObjective(n_parcels=8)
+    default = obj.secondary_loss == "diag_nll"
+    point = obj.perceiver.head.chol_head is None
+    _, cov = obj.perceiver.head(torch.randn(4, obj.perceiver.d_perc))
+    no_cov = cov is None
+    ok = default and point and no_cov
+    print(f"[check] default='{obj.secondary_loss}' ({default}); point head chol=None ({point}); "
+          f"forward cov=None ({no_cov}) {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_diag_nll_requires_nll_floor() -> None:
+    # diag_nll's σ² IS the count-dependent floor (frozen); it cannot run floor-off.
+    import pytest
+
+    with pytest.raises(ValueError, match="nll_floor"):
+        V3JepaObjective(n_parcels=8, secondary_loss="diag_nll", nll_floor=False)
 
 
 def test_secondary_off_by_default_is_pure_jepa() -> None:
-    # No stats ⇒ JEPA-only: nll/jepa fields None, loss == the stats-absent loss, and the
-    # perceiver receives NO gradient (write path never engaged).
+    # No stats ⇒ JEPA-only: nll/jepa fields None, and the perceiver receives NO gradient
+    # (the write path never engaged).
     sc, geom = _session()
     obj = V3JepaObjective(n_parcels=8)
     out = obj(_bands(), geom, sc.parcel_id, _masks(geom))
@@ -229,7 +260,7 @@ def test_secondary_off_by_default_is_pure_jepa() -> None:
 
 
 def test_secondary_active_total_is_jepa_plus_lambda_nll() -> None:
-    # With stats: loss == jepa_loss + λ·nll_loss EXACTLY, both terms finite, nll ≥ 0-ish scalar.
+    # With stats: loss == jepa_loss + λ·nll_loss EXACTLY, both finite, nll a 0-dim scalar.
     sc, geom = _session()
     obj = V3JepaObjective(n_parcels=8, lambda_nll=0.2)
     sm, ss = _stats(sc)
@@ -242,9 +273,23 @@ def test_secondary_active_total_is_jepa_plus_lambda_nll() -> None:
     assert ok
 
 
-def test_secondary_nll_grad_reaches_perceiver_and_encoder_write() -> None:
-    # The secondary must (a) train the perceiver (its own params + the Gaussian head) and
-    # (b) WRITE into the shared online encoder (grad flows back through z). Both are the point.
+def test_secondary_nll_is_nonnegative_a_proper_scoring_floor() -> None:
+    # A frozen-diagonal NLL floors at the target's own diagonal entropy — with unit-variance
+    # (identity-normalized) targets and a σ²<1 floor, that entropy is > 0, so the scored term
+    # is a sensible finite scalar (this is the tell that separates a diagonal NLL from an L1).
+    sc, geom = _session()
+    obj = V3JepaObjective(n_parcels=8, lambda_nll=0.2)
+    sm, ss = _stats(sc)
+    out = obj(_bands(), geom, sc.parcel_id, _masks(geom), stat_mean=sm, stat_std=ss)
+    finite = bool(torch.isfinite(out.nll_loss))
+    print(f"[check] diag NLL secondary finite scalar ({float(out.nll_loss):.4f}) "
+          f"{'OK' if finite else 'VIOLATED'}")
+    assert finite
+
+
+def test_secondary_grad_reaches_perceiver_head_and_encoder_write() -> None:
+    # The secondary must (a) train the perceiver + its point head (mu_head) and (b) WRITE into
+    # the shared online encoder (grad flows back through z). Both are the point.
     sc, geom = _session()
     obj = V3JepaObjective(n_parcels=8)
     sm, ss = _stats(sc)
@@ -260,7 +305,7 @@ def test_secondary_nll_grad_reaches_perceiver_and_encoder_write() -> None:
         for p in obj.online.encoder.parameters()
     )
     ok = perc and head and enc
-    print(f"[check] grad → perceiver={perc}, gauss-head={head}, encoder(write)={enc} "
+    print(f"[check] grad → perceiver={perc}, μ-head={head}, encoder(write)={enc} "
           f"{'OK' if ok else 'VIOLATED'}")
     assert ok
 
@@ -280,11 +325,11 @@ def test_secondary_is_write_only_no_readback_into_primary() -> None:
     assert no_readback
 
 
-def test_collect_taps_emits_per_band_monitor_scalars() -> None:
-    # Monitor wiring (#40/#41/#42): with collect_taps=True AND the secondary active, the
-    # objective returns the enc12 tap PLUS finite per-band JEPA scalars, per-band NLL, and
-    # the cov-entropy-vs-floor triple — all 0-dim — and the backward still runs (the taps
-    # are detached / no_grad, so they do not consume or extend the loss graph).
+def test_collect_taps_emits_per_dim_monitor_scalars() -> None:
+    # Monitor wiring (#40 per-band JEPA + per-DIM diag NLL): with collect_taps=True AND the
+    # secondary active, the objective returns per-band JEPA scalars PLUS the 5 per-dim NLL
+    # scalars — all 0-dim finite — and NO cov_entropy* (a point head has no covariance to
+    # report). The backward still runs (taps are detached / no_grad).
     sc, geom = _session()
     obj = V3JepaObjective(n_parcels=8, lambda_nll=0.2)
     sm, ss = _stats(sc)
@@ -294,22 +339,22 @@ def test_collect_taps_emits_per_band_monitor_scalars() -> None:
     )
     taps = out.taps
     bands = ("slow", "mid", "hga")
+    dims = ("slow_mu", "mid_mu", "hga_mu", "relmod48", "relmod816")
     expect = (
         [f"jepa_{b}_{m}" for b in bands for m in ("explained_var", "pred_target_var_ratio", "l1")]
-        + [f"nll_{b}" for b in bands]
-        + ["cov_entropy", "cov_entropy_floor", "cov_entropy_gap"]
+        + [f"nll_{d}" for d in dims]
     )
     present = taps is not None and all(k in taps for k in expect)
     scalars = present and all(taps[k].ndim == 0 and torch.isfinite(taps[k]) for k in expect)
-    gap_nonneg = present and float(taps["cov_entropy_gap"]) >= -1e-4  # #42 invariant
+    no_cov = present and not any(k.startswith("cov_entropy") for k in taps)  # point head
     out.loss.backward()  # graph intact despite the monitor reductions
     enc_flows = any(
         p.grad is not None and p.grad.abs().sum() > 0 for p in obj.online.encoder.parameters()
     )
-    ok = scalars and gap_nonneg and enc_flows
+    ok = scalars and no_cov and enc_flows
     print(
-        f"[check] collect_taps monitor scalars present+finite={scalars}, cov gap≥0 "
-        f"({float(taps['cov_entropy_gap']):.3f})={gap_nonneg}, backward-after-taps={enc_flows} "
+        f"[check] collect_taps monitor scalars present+finite={scalars}, no cov_entropy "
+        f"tap (point head)={no_cov}, backward-after-taps={enc_flows} "
         f"→ {'OK' if ok else 'VIOLATED'}"
     )
     assert ok
@@ -372,11 +417,10 @@ def test_secondary_requires_deep_sup() -> None:
         obj(_bands(), geom, sc.parcel_id, _masks(geom), stat_mean=sm, stat_std=ss)
 
 
-def test_secondary_singleton_parcel_scores_mean_marginal_end_to_end() -> None:
-    # A 1-electrode parcel: its std is undefined ⇒ build_state_target masks the 3 std dims,
-    # the NLL scores the 3-D mean marginal there, and count_dependent_noise_var stays finite
-    # at n=1. End-to-end the forward must run finite and grads stay finite (no NaN from the
-    # degenerate parcel).
+def test_secondary_singleton_parcel_scores_mean_only_end_to_end() -> None:
+    # A 1-electrode parcel: its 2 modulation dims are undefined ⇒ build_state_target masks
+    # them, the diag NLL scores the 3 mean dims there, and count_dependent_noise_var stays
+    # finite at n=1. End-to-end the forward must run finite and grads stay finite.
     sc = build_sidecar(
         ["LA1", "LA2", "LB1", "LC1", "LC2"],
         parcel_id=torch.tensor([0, 0, 1, 2, 2]),  # parcel 1 is a singleton
@@ -384,7 +428,8 @@ def test_secondary_singleton_parcel_scores_mean_marginal_end_to_end() -> None:
     geom = build_l1_geometry(sc)
     obj = V3JepaObjective(n_parcels=8)
     parcels = torch.unique(sc.parcel_id)
-    sm, ss = torch.zeros(parcels.numel(), 6), torch.ones(parcels.numel(), 6)
+    sm = torch.zeros(parcels.numel(), STATE_DIM)
+    ss = torch.ones(parcels.numel(), STATE_DIM)
     out = obj(_bands(), geom, sc.parcel_id, _masks(geom), stat_mean=sm, stat_std=ss)
     out.loss.backward()
     grads_finite = all(
@@ -396,151 +441,9 @@ def test_secondary_singleton_parcel_scores_mean_marginal_end_to_end() -> None:
     assert ok
 
 
-# ---------------------------------------------------------------------------
-# r5 Arm 3 — POINT loss (secondary_loss="l1"). L1 not L2 is measured, not assumed:
-# M18 (probe_v3_residual_tailweight) reads 5/6 state dims ABOVE the Laplace pole.
-# ---------------------------------------------------------------------------
-
-
-def test_arm3_point_head_has_no_covariance_parameters() -> None:
-    """THE DDP INVARIANT — this is the r3 killer, so it is asserted, not assumed.
-
-    A point loss touches no covariance parameter. If ``chol_head`` still EXISTED it would
-    receive no gradient, and DDP with find_unused_parameters=False hard-asserts that every
-    parameter contributed to the loss (X1). So Arm 3 must not merely ignore the covariance
-    — the Linear must not be constructed at all. Equivalently: Arm 3's claim is "there is
-    no second moment", not "there is a second moment we declined to use"."""
-    sc, geom = _session()
-    sm, ss = _stats(sc)
-    obj = V3JepaObjective(n_parcels=8, secondary_loss="l1")
-    assert obj.perceiver is not None
-    head = obj.perceiver.head
-    no_chol = head.chol_head is None
-    # no parameter anywhere in the head may carry "chol" — catches a future re-add
-    chol_params = [n for n, _ in obj.perceiver.named_parameters() if "chol" in n]
-
-    out = obj(_bands(), geom, sc.parcel_id, _masks(geom), stat_mean=sm, stat_std=ss)
-    out.loss.backward()
-    # EVERY perceiver parameter must receive a gradient — the exact DDP precondition.
-    dead = [n for n, p in obj.perceiver.named_parameters()
-            if p.requires_grad and (p.grad is None or not torch.isfinite(p.grad).all()
-                                    or float(p.grad.abs().sum()) == 0.0)]
-    ok = no_chol and not chol_params and not dead
-    print(f"[check] arm3 point head: chol_head is None={no_chol}; params matching 'chol'="
-          f"{chol_params}; perceiver params with NO/zero grad={dead} "
-          f"(DDP find_unused_parameters=False requires none) {'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
-def test_arm3_l1_loss_is_the_present_masked_l1_of_mu() -> None:
-    """The secondary term must BE the point loss (not an NLL), and the head must return
-    cov=None so nothing downstream can silently read a covariance that does not exist."""
-    from speech_decoding.models.v14_converged_v3.secondary_head import present_masked_l1
-
-    sc, geom = _session()
-    sm, ss = _stats(sc)
-    obj = V3JepaObjective(n_parcels=8, secondary_loss="l1")
-    out = obj(_bands(), geom, sc.parcel_id, _masks(geom), stat_mean=sm, stat_std=ss)
-    # total = JEPA_L1 + λ·secondary, same composition as the NLL arms
-    recomposed = out.jepa_loss + obj.lambda_nll * out.nll_loss
-    ok_total = torch.allclose(out.loss, recomposed, atol=1e-6)
-    # the secondary is non-negative — |r| is, an NLL is NOT (that is the tell)
-    ok_sign = float(out.nll_loss) >= 0.0
-    mu, cov = obj.perceiver.head(torch.randn(4, obj.perceiver.d_perc))
-    ok_none = cov is None
-    print(f"[check] arm3 secondary={float(out.nll_loss):.4f} >= 0 ({ok_sign}); "
-          f"total==jepa+λ·secondary ({ok_total}); head returns cov=None ({ok_none}) "
-          f"{'OK' if ok_total and ok_sign and ok_none else 'VIOLATED'}")
-    assert ok_total and ok_sign and ok_none
-
-
-def test_present_masked_l1_ignores_absent_dims_and_matches_hand_sum() -> None:
-    """Absent dims must contribute NOTHING: state_target sets the target to 0 there while
-    mu stays free, so an unmasked L1 would score the head on a value carrying no
-    information (and the std dims are absent exactly at n_elec=1). Also pins the reduction
-    — per-position SUM over present dims, then MEAN over positions — which is what makes
-    Arm 3 comparable to Arm 1 rather than a differently-normalized run."""
-    from speech_decoding.models.v14_converged_v3.secondary_head import present_masked_l1
-
-    mu = torch.tensor([[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                        [0.0, 0.0, 0.0, 9.0, 9.0, 9.0]]])
-    x = torch.zeros(1, 2, 6)
-    present = torch.tensor([[[True] * 6, [True, True, True, False, False, False]]])
-    got = float(present_masked_l1(mu, x, present))
-    # pos0: all 6 present -> 1+2+3+4+5+6 = 21;  pos1: only the 3 mean dims -> 0
-    want = (21.0 + 0.0) / 2
-    # the absent std dims of pos1 hold 9.0 each: an unmasked L1 would add 27 -> 24.0
-    unmasked = float((x - mu).abs().sum(-1).mean())
-    ok = abs(got - want) < 1e-6 and abs(unmasked - 24.0) < 1e-6
-    print(f"[check] present_masked_l1={got:.4f} == hand {want:.4f}; the same tensors "
-          f"UNMASKED give {unmasked:.4f} (absent dims would leak 27/2 nats of gibberish) "
-          f"{'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
-def test_l2_would_be_the_gaussian_nll_at_identity_covariance() -> None:
-    """The identity that makes L2-vs-L1 a NOISE-MODEL question rather than a taste one:
-    at Sigma=I the full-cov Gaussian NLL IS 0.5*||r||^2 + const. Pinning it here is what
-    licenses the M18 framing (L2 <=> Gaussian residuals, L1 <=> Laplace residuals) — if
-    this identity ever breaks, the reasoning behind Arm 3's loss choice breaks with it."""
-    import math
-
-    from speech_decoding.models.v14_converged_v3.secondary_head import _nll_terms
-
-    torch.manual_seed(0)
-    mu = torch.randn(5, 6)
-    x = torch.randn(5, 6)
-    cov = torch.eye(6).expand(5, 6, 6)
-    got = _nll_terms(mu, cov, x)
-    want = 0.5 * ((x - mu) ** 2).sum(-1) + 0.5 * 6 * math.log(2 * math.pi)
-    ok = torch.allclose(got, want, atol=1e-5)
-    print(f"[check] gaussian NLL at Sigma=I == 0.5*||r||^2 + const (max diff "
-          f"{float((got - want).abs().max()):.2e}) -> L2 IS the gaussian likelihood "
-          f"{'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
-def test_arm3_per_band_taps_exist_without_a_covariance() -> None:
-    """Arm 3 must not go blind: the per-band split is how r4's flatline was found, so it
-    must survive the loss swap. The cov-dependent tap (#42 entropy-vs-floor) has no
-    referent on this arm and must be ABSENT rather than fabricated."""
-    sc, geom = _session()
-    sm, ss = _stats(sc)
-    obj = V3JepaObjective(n_parcels=8, secondary_loss="l1")
-    out = obj(_bands(), geom, sc.parcel_id, _masks(geom),
-              stat_mean=sm, stat_std=ss, collect_taps=True)
-    keys = set(out.taps or {})
-    has_bands = {"nll_slow", "nll_mid", "nll_hga"} <= keys
-    no_cov_tap = not any("entropy" in k or "cov" in k for k in keys)
-    ok = has_bands and no_cov_tap
-    print(f"[check] arm3 taps: per-band present={has_bands}; no cov/entropy tap "
-          f"fabricated={no_cov_tap} (keys={sorted(k for k in keys if k != 'perc_lat')}) "
-          f"{'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
-def test_nll_arm_is_untouched_by_the_arm3_plumbing() -> None:
-    """Adding Arm 3 must not perturb the arms ALREADY QUEUED. The default stays 'nll', the
-    covariance head still exists, and the secondary is still an NLL (sign-indefinite)."""
-    sc, geom = _session()
-    sm, ss = _stats(sc)
-    obj = V3JepaObjective(n_parcels=8)
-    default_nll = obj.secondary_loss == "nll"
-    has_chol = obj.perceiver.head.chol_head is not None
-    out = obj(_bands(), geom, sc.parcel_id, _masks(geom),
-              stat_mean=sm, stat_std=ss, collect_taps=True)
-    _, cov = obj.perceiver.head(torch.randn(4, obj.perceiver.d_perc))
-    ok_cov = cov is not None and cov.shape[-2:] == (6, 6)
-    ok = default_nll and has_chol and ok_cov
-    print(f"[check] default arm untouched: secondary_loss='{obj.secondary_loss}' "
-          f"({default_nll}); chol_head present ({has_chol}); cov {tuple(cov.shape)} "
-          f"({ok_cov}) {'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
 def test_secondary_loss_rejects_an_unknown_form() -> None:
-    """A typo'd arm name must fail LOUDLY at construction, not silently fall back to the
-    NLL and hand us a 48h run of the wrong experiment."""
+    """A typo'd arm name must fail LOUDLY at construction, not silently fall back and hand us
+    a run of the wrong experiment."""
     import pytest
 
     with pytest.raises(ValueError, match="secondary_loss"):

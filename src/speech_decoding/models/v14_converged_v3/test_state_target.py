@@ -1,23 +1,27 @@
-"""v14_converged_v3 r4 — model-free state TARGET invariants (B3).
+"""v14_converged_v3 r5-mod — model-free state TARGET invariants (B3).
 
-Load-bearing properties, each asserted with a printed ``[check]``: (1) raw parcel mean/std
-match hand computation; (2) a SINGLETON parcel has undefined std (raw std = 0) and its std
-dims are present=False; (3) cm-removal zeroes the cross-parcel mean of every PRESENT dim at
-every (clip, slot) — the defining property; (4) the target is stop-grad (model-free); (5)
-raw_state_stats recovers per-(parcel,dim) mean/std over the (clip, slot) sample axes.
+Load-bearing properties, each asserted with a printed ``[check]``: (1) ``_relmod`` puts a
+known-frequency envelope oscillation in the right band (the FFT bin math); (2) raw parcel
+means match hand computation and a constant envelope has ZERO relative modulation; (3) the
+scatter/index_add vectorization equals the per-parcel reference loop on ragged geometry;
+(4) a parcel with < MIN_MOD_ELEC electrodes has its modulation dims present=False; (5)
+cm-removal zeroes the cross-parcel mean of every PRESENT dim at every (clip, slot); (6) the
+target is stop-grad (model-free); (7) raw_state_stats / the cross-session accumulator recover
+per-(parcel,dim) population moments.
 """
 
 from __future__ import annotations
 
-import math
-
 import torch
 
 from speech_decoding.models.v14_converged_v3.state_target import (
-    MIN_STD_ELEC,
-    N_BANDS,
+    HGA_BAND,
+    MIN_MOD_ELEC,
+    N_MEAN,
+    N_MOD,
     STATE_DIM,
     StateStatsAccumulator,
+    _relmod,
     build_state_target,
     dim_presence,
     raw_state_stats,
@@ -29,43 +33,60 @@ PARCEL_ID = torch.tensor([0, 0, 0, 1, 1, 2])  # n_elec = [3, 2, 1] — parcel 2 
 S = T // 8  # 2 slots
 
 
+def test_relmod_localizes_known_frequency() -> None:
+    """The physics the target rests on: a pure envelope oscillation at f Hz must land in the
+    band containing f and (mostly) nowhere else. 64 frames @32 Hz → 0.5 Hz bins; a 6 Hz tone
+    → relmod48 (4-8 Hz) ≫ relmod816 (8-16 Hz); a 10 Hz tone → the reverse. Pins the rFFT bin
+    math so a fixed clip length can never silently mis-map the Hz bands."""
+    fs, Tc = 32.0, 64
+    t = torch.arange(Tc, dtype=torch.float64) / fs
+    env6 = (1.0 + 0.5 * torch.sin(2 * torch.pi * 6.0 * t))[None, None, :]   # (1,1,64)
+    env10 = (1.0 + 0.5 * torch.sin(2 * torch.pi * 10.0 * t))[None, None, :]
+    m6 = _relmod(env6, fs=fs).squeeze()   # (2,)
+    m10 = _relmod(env10, fs=fs).squeeze()
+    ok = (m6[0] > 0.5 and m6[0] > 5 * m6[1] and m10[1] > 0.5 and m10[1] > 5 * m10[0])
+    print(f"[check] _relmod localizes: 6Hz→[{m6[0]:.2f},{m6[1]:.2f}] (48 wins), "
+          f"10Hz→[{m10[0]:.2f},{m10[1]:.2f}] (816 wins) {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_dim_presence_layout_wellformed() -> None:
-    """The invariant present_masked_nll TRUSTS instead of re-checking per step (the two host
-    syncs removed from the compiled forward): dim_presence CONSTRUCTS a well-formed layout for
-    every electrode count — mean dims [0:3] always present, std dims [3:6] all-or-none per
-    position, std on iff n_elec >= MIN_STD_ELEC. Pinned here at the constructor so removing the
-    consumer-side guard is safe (feedback-build-the-invariant-into-the-probe)."""
-    n_elec = torch.arange(0, 40)  # 0,1 (std off) .. large (std on); covers both patterns
-    present = dim_presence(n_elec)  # (P, 6)
-    mean_always = bool(present[:, :N_BANDS].all())
-    std_block = present[:, N_BANDS:]
-    std_all_or_none = bool((std_block.all(-1) | (~std_block).all(-1)).all())
-    std_matches_count = bool((std_block.all(-1) == (n_elec >= MIN_STD_ELEC)).all())
-    ok = mean_always and std_all_or_none and std_matches_count
-    print(f"[check] dim_presence: mean-always-on={mean_always} std-all-or-none={std_all_or_none} "
-          f"std⇔(n≥{MIN_STD_ELEC})={std_matches_count} {'OK' if ok else 'VIOLATED'}")
+    """present_masked_diag_nll TRUSTS this layout instead of re-checking per step: mean dims
+    [0:3] always present; the 2 modulation dims [3:5] all-or-none per parcel, on iff
+    n_elec >= MIN_MOD_ELEC. Pinned at the constructor so the consumer-side guard can be
+    removed safely (feedback-build-the-invariant-into-the-probe)."""
+    n_elec = torch.arange(0, 40)  # 0,1 (mod off) .. large (mod on); covers both patterns
+    present = dim_presence(n_elec)  # (P, 5)
+    mean_always = bool(present[:, :N_MEAN].all())
+    mod_block = present[:, N_MEAN:]
+    mod_all_or_none = bool((mod_block.all(-1) | (~mod_block).all(-1)).all())
+    mod_matches_count = bool((mod_block.all(-1) == (n_elec >= MIN_MOD_ELEC)).all())
+    ok = mean_always and mod_all_or_none and mod_matches_count
+    print(f"[check] dim_presence: mean-always-on={mean_always} mod-all-or-none={mod_all_or_none} "
+          f"mod⇔(n≥{MIN_MOD_ELEC})={mod_matches_count} {'OK' if ok else 'VIOLATED'}")
     assert ok
 
 
 def _const_bands() -> list[torch.Tensor]:
     # each band = constant per electrode (value = electrode index), broadcast over (F, T);
-    # then env=const, 4 Hz slots=const, so parcel mean/std are just over the electrode set.
+    # env is constant in time, so parcel means = mean over the electrode set and relmod = 0.
     e = torch.arange(N, dtype=torch.float32)
-    return [e[None, :, None, None].expand(B, N, F, T).clone() for _ in range(N_BANDS)]
+    return [e[None, :, None, None].expand(B, N, F, T).clone() for _ in range(N_MEAN)]
 
 
-def test_raw_parcel_mean_and_std_match_hand_computation() -> None:
+def test_raw_parcel_mean_and_constant_has_zero_modulation() -> None:
     raw, parcels, n_elec = raw_state_vectors(_const_bands(), PARCEL_ID)
-    assert raw.shape == (B, S, STATE_DIM) or raw.shape == (B, 3, S, STATE_DIM)
-    # parcel 0 = electrodes {0,1,2}: mean 1, population std sqrt(2/3).
-    p0_mu = raw[:, 0, :, 0]
-    p0_sd = raw[:, 0, :, N_BANDS]
+    assert raw.shape == (B, 3, S, STATE_DIM)
+    # parcel 0 = electrodes {0,1,2}: mean 1 on every mean dim.
+    p0_mu = raw[:, 0, :, :N_MEAN]
     ok_mu = torch.allclose(p0_mu, torch.ones_like(p0_mu))
-    ok_sd = torch.allclose(p0_sd, torch.full_like(p0_sd, math.sqrt(2 / 3)), atol=1e-5)
-    assert torch.equal(n_elec, torch.tensor([3, 2, 1]))
-    print(f"[check] parcel0 mean=1 ({ok_mu}), pop-std=√(2/3) ({ok_sd}), "
-          f"n_elec={n_elec.tolist()} {'OK' if ok_mu and ok_sd else 'VIOLATED'}")
-    assert ok_mu and ok_sd
+    # a constant-in-time envelope has NO fluctuation ⇒ relative modulation power = 0.
+    mod = raw[:, :, :, N_MEAN:]
+    ok_mod = torch.allclose(mod, torch.zeros_like(mod), atol=1e-6)
+    ok = ok_mu and ok_mod and torch.equal(n_elec, torch.tensor([3, 2, 1]))
+    print(f"[check] parcel0 mean=1 ({ok_mu}), constant→relmod=0 ({ok_mod}), "
+          f"n_elec={n_elec.tolist()} {'OK' if ok else 'VIOLATED'}")
+    assert ok
 
 
 def _raw_state_vectors_loop(bands, parcel_id, *, slot_stride=8):
@@ -75,16 +96,17 @@ def _raw_state_vectors_loop(bands, parcel_id, *, slot_stride=8):
     S = T // slot_stride
     parcels = torch.unique(parcel_id)
     P = int(parcels.shape[0])
-    slots = [b.mean(dim=2).reshape(B, N, S, slot_stride).mean(dim=-1) for b in bands]
+    slots = [b.mean(dim=2).reshape(B, N, S, slot_stride).mean(dim=-1) for b in bands]  # (B,N,S)
+    mod_e = _relmod(bands[HGA_BAND].mean(dim=2))  # (B, N, N_MOD) per electrode
     n_elec = torch.empty(P, dtype=torch.long)
     raw = bands[0].new_zeros(B, P, S, STATE_DIM)
     for pi in range(P):
         idx = torch.nonzero(parcel_id == parcels[pi], as_tuple=False).squeeze(1)
         n_elec[pi] = idx.shape[0]
-        for bi in range(N_BANDS):
-            e = slots[bi][:, idx]
-            raw[:, pi, :, bi] = e.mean(dim=1)
-            raw[:, pi, :, N_BANDS + bi] = e.std(dim=1, unbiased=False)
+        for bi in range(N_MEAN):
+            raw[:, pi, :, bi] = slots[bi][:, idx].mean(dim=1)
+        m = mod_e[:, idx].mean(dim=1)                       # (B, N_MOD) parcel-pooled
+        raw[:, pi, :, N_MEAN:] = m[:, None, :].expand(B, S, N_MOD)  # broadcast across slots
     return raw, parcels, n_elec
 
 
@@ -94,7 +116,7 @@ def test_vectorized_matches_reference_loop() -> None:
     g = torch.Generator().manual_seed(17)
     Bv, Nv, Fv, Tv = 5, 9, 4, 24
     parcel_id = torch.tensor([7, 7, 7, 7, 2, 2, 5, 5, 9])  # counts {7:4, 2:2, 5:2, 9:1}
-    bands = [torch.rand(Bv, Nv, Fv, Tv, generator=g) * 3.0 for _ in range(N_BANDS)]
+    bands = [torch.rand(Bv, Nv, Fv, Tv, generator=g) * 3.0 for _ in range(N_MEAN)]
     raw, parcels, n_elec = raw_state_vectors(bands, parcel_id)
     ref_raw, ref_parcels, ref_n = _raw_state_vectors_loop(bands, parcel_id)
     ok = (
@@ -108,18 +130,18 @@ def test_vectorized_matches_reference_loop() -> None:
     assert ok
 
 
-def test_singleton_parcel_std_is_undefined_and_masked() -> None:
+def test_singleton_parcel_modulation_is_masked() -> None:
     target, present, parcels = build_state_target(
         _const_bands(), PARCEL_ID,
         stat_mean=torch.zeros(3, STATE_DIM), stat_std=torch.ones(3, STATE_DIM),
     )
-    # parcel index 2 is the singleton (id 2): std dims present=False, mean dims present.
+    # parcel index 2 is the singleton (id 2): modulation dims present=False, mean dims present.
     p_singleton = int((parcels == 2).nonzero().item())
-    std_absent = not present[p_singleton, N_BANDS:].any()
-    mean_present = present[p_singleton, :N_BANDS].all()
+    mod_absent = not present[p_singleton, N_MEAN:].any()
+    mean_present = present[p_singleton, :N_MEAN].all()
     others_full = present[[i for i in range(3) if i != p_singleton]].all()
-    ok = std_absent and mean_present and others_full
-    print(f"[check] singleton parcel std masked (present row "
+    ok = mod_absent and mean_present and others_full
+    print(f"[check] singleton parcel modulation masked (present row "
           f"{present[p_singleton].tolist()}) {'OK' if ok else 'VIOLATED'}")
     assert ok
 
@@ -128,28 +150,28 @@ def test_common_mode_removed_zeroes_cross_parcel_mean() -> None:
     # Identity z-score isolates the cm step: after removal the cross-parcel mean of each
     # PRESENT dim must be ~0 at every (clip, slot). Non-constant input so it's a real test.
     g = torch.Generator().manual_seed(3)
-    bands = [torch.rand(B, N, F, T, generator=g) + 0.1 for _ in range(N_BANDS)]
+    bands = [torch.rand(B, N, F, T, generator=g) + 0.1 for _ in range(N_MEAN)]
     target, present, parcels = build_state_target(
         bands, PARCEL_ID,
         stat_mean=torch.zeros(3, STATE_DIM), stat_std=torch.ones(3, STATE_DIM),
     )
     # mean dims: all 3 parcels present → straight cross-parcel mean is ~0.
-    mean_cm = target[:, :, :, :N_BANDS].mean(dim=1).abs().max().item()
-    # std dims: only present (n>=2) parcels contribute → masked cross-parcel mean ~0.
-    stdp = present[:, N_BANDS:]  # (P, 3) which parcels are present per std dim
-    max_std_cm = 0.0
-    for d in range(N_BANDS):
-        sel = stdp[:, d]  # (P,)
-        vals = target[:, sel, :, N_BANDS + d]  # (B, n_present, S)
-        max_std_cm = max(max_std_cm, vals.mean(dim=1).abs().max().item())
-    ok = mean_cm < 1e-5 and max_std_cm < 1e-5
-    print(f"[check] cm removed: cross-parcel mean-dim {mean_cm:.2e}, std-dim {max_std_cm:.2e} "
+    mean_cm = target[:, :, :, :N_MEAN].mean(dim=1).abs().max().item()
+    # modulation dims: only present (n>=2) parcels contribute → masked cross-parcel mean ~0.
+    modp = present[:, N_MEAN:]  # (P, N_MOD) which parcels are present per modulation dim
+    max_mod_cm = 0.0
+    for d in range(N_MOD):
+        sel = modp[:, d]  # (P,)
+        vals = target[:, sel, :, N_MEAN + d]  # (B, n_present, S)
+        max_mod_cm = max(max_mod_cm, vals.mean(dim=1).abs().max().item())
+    ok = mean_cm < 1e-5 and max_mod_cm < 1e-5
+    print(f"[check] cm removed: cross-parcel mean-dim {mean_cm:.2e}, mod-dim {max_mod_cm:.2e} "
           f"{'OK' if ok else 'VIOLATED'}")
     assert ok
 
 
 def test_target_is_stop_grad() -> None:
-    bands = [torch.rand(B, N, F, T, requires_grad=True) for _ in range(N_BANDS)]
+    bands = [torch.rand(B, N, F, T, requires_grad=True) for _ in range(N_MEAN)]
     target, _, _ = build_state_target(
         bands, PARCEL_ID,
         stat_mean=torch.zeros(3, STATE_DIM), stat_std=torch.ones(3, STATE_DIM),
@@ -162,8 +184,8 @@ def test_target_is_stop_grad() -> None:
 
 def test_raw_state_stats_recovers_per_parcel_dim_moments() -> None:
     g = torch.Generator().manual_seed(7)
-    bands = [torch.rand(9, N, F, T, generator=g) for _ in range(N_BANDS)]
-    raw, parcels, _ = raw_state_vectors(bands, PARCEL_ID)  # (9, P, S, 6)
+    bands = [torch.rand(9, N, F, T, generator=g) for _ in range(N_MEAN)]
+    raw, parcels, _ = raw_state_vectors(bands, PARCEL_ID)  # (9, P, S, 5)
     mean, std = raw_state_stats(raw)
     # brute-force reference for parcel 0, dim 0 over (clip, slot).
     ref = raw[:, 0, :, 0].reshape(-1)
@@ -180,8 +202,8 @@ def test_accumulator_single_session_matches_raw_state_stats() -> None:
     # raw_state_stats exactly (population moments over the clip·slot samples), placed at
     # the parcel-id VALUE (not position). Absent values stay 0.
     g = torch.Generator().manual_seed(11)
-    bands = [torch.rand(9, N, F, T, generator=g) for _ in range(N_BANDS)]
-    raw, parcels, _ = raw_state_vectors(bands, PARCEL_ID)  # (9, P, S, 6), values {0,1,2}
+    bands = [torch.rand(9, N, F, T, generator=g) for _ in range(N_MEAN)]
+    raw, parcels, _ = raw_state_vectors(bands, PARCEL_ID)  # (9, P, S, 5), values {0,1,2}
     ref_mean, ref_std = raw_state_stats(raw)
     acc = StateStatsAccumulator()
     acc.add(raw, parcels)

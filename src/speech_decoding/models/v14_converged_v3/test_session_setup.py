@@ -24,6 +24,7 @@ import torch
 
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
+from speech_decoding.models.v14_converged_v3.state_target import STATE_DIM
 
 
 def _labels(shaft_sizes):
@@ -135,9 +136,9 @@ def test_feasibility_passes_for_uniform_seeg() -> None:
 
 
 def _stat_table(n_parcels):
-    # by-parcel-VALUE frozen stats; row p = [p*10 + d for d in 0..5] so a gather is checkable.
+    # by-parcel-VALUE frozen stats; row p = [p*10 + d for d in 0..4] so a gather is checkable.
     base = torch.arange(n_parcels, dtype=torch.float32)[:, None] * 10.0
-    return base + torch.arange(6, dtype=torch.float32)[None, :]
+    return base + torch.arange(STATE_DIM, dtype=torch.float32)[None, :]
 
 
 def test_stats_none_by_default_secondary_off() -> None:
@@ -158,7 +159,7 @@ def test_stats_gathered_and_aligned_to_survivor_parcels() -> None:
         labels, parcel, drop_labels={"LA2"}, mask_cfg=_NO_WHOLE, stat_mean=sm, stat_std=ss
     )
     # LA2 dropped but parcel 0 survives (LA1/3/4) → all three parcels present.
-    assert setup.stat_mean.shape == (3, 6)
+    assert setup.stat_mean.shape == (3, STATE_DIM)
     assert torch.equal(setup.stat_mean, sm[torch.tensor([0, 1, 2])])
     assert torch.equal(setup.stat_std, ss[torch.tensor([0, 1, 2])])
 
@@ -173,7 +174,7 @@ def test_stats_drop_of_whole_parcel_shrinks_aligned_rows() -> None:
         mask_cfg=_NO_WHOLE, stat_mean=sm, stat_std=sm,
     )
     assert setup.parcel_id.unique().tolist() == [0, 2]
-    assert setup.stat_mean.shape == (2, 6)
+    assert setup.stat_mean.shape == (2, STATE_DIM)
     assert torch.equal(setup.stat_mean, sm[torch.tensor([0, 2])])
 
 
@@ -187,10 +188,11 @@ def test_stats_both_or_neither() -> None:
 def test_stats_wrong_dim_raises() -> None:
     labels = _labels((4, 3, 3))
     parcel = _parcels(labels)
-    bad = torch.zeros(3, 5)  # 5 != STATE_DIM(6)
+    bad = torch.zeros(3, STATE_DIM + 1)  # wrong last dim
     with pytest.raises(ValueError, match="stat_mean must be"):
         build_session_setup(
-            labels, parcel, drop_labels=set(), stat_mean=bad, stat_std=torch.zeros(3, 6)
+            labels, parcel, drop_labels=set(), stat_mean=bad,
+            stat_std=torch.zeros(3, STATE_DIM),
         )
 
 
