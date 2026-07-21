@@ -64,6 +64,7 @@ class V3ConvergedModel(nn.Module):
         secondary_loss: str = "nll",
         context_loss: bool = False,
         lambda_ctx: float = LAMBDA_CTX,
+        mae: bool = False,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -81,6 +82,7 @@ class V3ConvergedModel(nn.Module):
             lambda_nll=lambda_nll, nll_floor=nll_floor,
             secondary_loss=secondary_loss,
             context_loss=context_loss, lambda_ctx=lambda_ctx,
+            mae=mae,
         )
         self.mask_cfg = mask_cfg
 

@@ -65,7 +65,7 @@ from speech_decoding.models.v14_converged_v3.state_target import (
     SLOT_STRIDE,
     build_state_target,
 )
-from speech_decoding.models.v14_converged_v3.stem import PerBandStem
+from speech_decoding.models.v14_converged_v3.stem import PER_BAND_SPECS, PerBandStem
 from speech_decoding.models.v14_converged_v3.towers import (
     N_LEVELS,
     PRED_D_MODEL,
@@ -167,8 +167,17 @@ class V3JepaObjective(nn.Module):
         secondary_loss: str = "diag_nll",
         context_loss: bool = False,
         lambda_ctx: float = LAMBDA_CTX,
+        mae: bool = False,
     ) -> None:
         super().__init__()
+        # MAE arm (Masked Autoencoder target, He 2021 / AudioMAE): the ONLY change vs the
+        # JEPA arm is the prediction TARGET — reconstruct this token's OWN norm_pix'd input
+        # |STFT| bins instead of the EMA-teacher latent. No EMA teacher, no secondary/context.
+        # Everything upstream (visible-only encoder, predictor, mask query, margin-gated
+        # in_loss, all locked HPs) is byte-identical to the JEPA arm.
+        self.mae = bool(mae)
+        if self.mae and context_loss:
+            raise ValueError("MAE arm has no context loss (JEPA-target-only feature)")
         self.deep_sup = bool(deep_sup)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         self.lambda_nll = float(lambda_nll)
@@ -204,10 +213,13 @@ class V3JepaObjective(nn.Module):
         # N is most of Sigma and the head plateaued at 16k — it may be echoing our floor
         # rather than modelling anything.
         self.nll_floor = bool(nll_floor)
-        # online target path (stem + encoder) — every param here is EMA-mirrored.
+        # online target path (stem + encoder) — every param here is EMA-mirrored (JEPA arm).
         self.online = _TargetTower(n_parcels=n_parcels, deep_sup=self.deep_sup)
-        self.teacher = EmaTeacher(
-            self.online, coeff_schedule=fixed_ema_schedule(tau=ema_tau)
+        # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
+        self.teacher = (
+            None
+            if self.mae
+            else EmaTeacher(self.online, coeff_schedule=fixed_ema_schedule(tau=ema_tau))
         )
         self.predictor = build_predictor(n_parcels=n_parcels)
         # Encoder→predictor input map. Deep-sup: the encoder emits n_levels concatenated
@@ -224,18 +236,30 @@ class V3JepaObjective(nn.Module):
             )
         else:
             self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
-        self.pred_to_target = nn.Linear(PRED_D_MODEL, target_dim)
-        # Context head (upstream ``predictor_proj_context``): a SEPARATE wide Linear so the
-        # context task (predict teacher at VISIBLE tokens) does not share weights with the
-        # masked task. Built only when context_loss is on ⇒ off = zero new params, so an
-        # existing ckpt / the default arms load unchanged.
-        self.pred_to_target_context = (
-            nn.Linear(PRED_D_MODEL, target_dim) if self.context_loss else None
-        )
         self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
-        init_transformer_weights(self.pred_to_target)
-        if self.pred_to_target_context is not None:
-            init_transformer_weights(self.pred_to_target_context)
+        if self.mae:
+            # MAE decoder_pred = per-band reconstruction heads, one Linear(d_pred → F_b) per
+            # band (SLOW 7 / MID 6 / HGA 7) — the transpose-twin of PerBandStem's per-band
+            # INPUT projections. Fed by the predictor's terminal norm_out (= MAE decoder_norm),
+            # each emits its band's own |STFT| bins; no wide teacher-target projection.
+            self.pred_to_target = None
+            self.pred_to_target_context = None
+            self.mae_heads = nn.ModuleList(
+                nn.Linear(PRED_D_MODEL, nb) for nb, _ in PER_BAND_SPECS
+            )
+            self.mae_heads.apply(init_transformer_weights)
+        else:
+            self.pred_to_target = nn.Linear(PRED_D_MODEL, target_dim)
+            # Context head (upstream ``predictor_proj_context``): a SEPARATE wide Linear so the
+            # context task (predict teacher at VISIBLE tokens) does not share weights with the
+            # masked task. Built only when context_loss is on ⇒ off = zero new params, so an
+            # existing ckpt / the default arms load unchanged.
+            self.pred_to_target_context = (
+                nn.Linear(PRED_D_MODEL, target_dim) if self.context_loss else None
+            )
+            init_transformer_weights(self.pred_to_target)
+            if self.pred_to_target_context is not None:
+                init_transformer_weights(self.pred_to_target_context)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit). Stored 3-D (1, 1, D) to match
         # upstream: the shared ndim<=1 no-decay rule then DECAYS it (a 1-D store would
         # silently exempt it). Broadcasts identically in scatter_visible (a no-op there).
@@ -250,7 +274,7 @@ class V3JepaObjective(nn.Module):
                 n_parcels=n_parcels,
                 point_only=self.secondary_loss in ("l1", "diag_nll"),
             )
-            if self.deep_sup
+            if self.deep_sup and not self.mae
             else None
         )
 
@@ -308,15 +332,28 @@ class V3JepaObjective(nn.Module):
             z = self.online(bands, grid, parcel_packed, pack=pack)
 
         # EMA teacher over the FULL grid → deep-sup targets, per-level double-norm + stop-grad.
-        with torch.no_grad():
-            tgt = self.teacher(bands, grid, parcel_packed)  # (B, total, n_levels·256)
-        tgt = _ln_target(tgt, self.n_levels) if self.target_ln else stop_grad(tgt)
+        # MAE has no teacher (target = the token's OWN norm_pix'd input, built in _mae_output);
+        # skip the teacher forward entirely so ``tgt`` never touches the None teacher.
+        tgt = None
+        if not self.mae:
+            with torch.no_grad():
+                tgt = self.teacher(bands, grid, parcel_packed)  # (B, total, n_levels·256)
+            tgt = _ln_target(tgt, self.n_levels) if self.target_ln else stop_grad(tgt)
 
         # predictor input: enc_to_pred(z) at visible tokens, mask-query at masked tokens.
         pred_in = scatter_visible(
             self.enc_to_pred(z), pack.idx, grid.total, self.mask_token
         )  # (B, total, 128)
         h = self.predictor.forward_flat(pred_in, grid, parcel_packed)  # (B, total, 128)
+        if self.mae:
+            if stat_mean is not None or stat_std is not None:
+                raise ValueError("MAE arm has no secondary NLL; do not pass state-stats")
+            return self._mae_output(
+                bands, grid, h, in_loss,
+                enc_taps=enc_taps if collect_taps else None,
+                collect_taps=collect_taps,
+            )
+        assert self.pred_to_target is not None  # JEPA arm always builds it (mae returned above)
         pred = self.pred_to_target(h)  # (B, total, n_levels·256)
 
         # L1 at the MARGIN-GATED masked tokens (in_loss). STATIC weighted mean over the
@@ -490,6 +527,112 @@ class V3JepaObjective(nn.Module):
                 aux["perc_lat"] = lat.detach()
         return nll, aux
 
+    # ── MAE arm (Masked Autoencoder target) ──────────────────────────────────────
+    def _mae_output(
+        self,
+        bands: Sequence[Tensor],
+        grid: R4Grid,
+        h: Tensor,
+        in_loss: Tensor,
+        *,
+        enc_taps: dict[int, Tensor] | None,
+        collect_taps: bool,
+    ) -> JepaOutput:
+        """MAE loss: reconstruct each masked token's OWN norm_pix'd input |STFT| bins.
+
+        Exact He-2021 / AudioMAE recipe — per-token target normalization
+        ``(x-mean)/sqrt(var+1e-6)`` (unbiased var) over that token's F_b bins, MSE
+        ``(pred-target)^2`` meaned over the bins, then masked-mean over the SAME
+        margin-gated ``in_loss`` tokens the JEPA arm scores. ``h`` (B, total, d_pred) is the
+        predictor output AFTER its terminal ``norm_out`` (= MAE ``decoder_norm``)."""
+        target, feat_valid, feat_count = self._mae_gather_target(bands, grid)
+        target = self._norm_pix(target.float(), feat_valid, feat_count)  # fp32 norm_pix
+        pred = self._mae_pred(h, grid)  # (B, total, F_MAX); pad slot = 0
+        target = target.to(pred.dtype)
+        w = in_loss.to(pred.dtype)  # (B, total) margin-gated masked weight
+        fv = feat_valid[None].to(pred.dtype)  # (1, total, F_MAX)
+        # per-token MSE over that token's own valid bins (pad excluded), then masked-mean.
+        se_tok = (((pred - target) ** 2) * fv).sum(-1) / feat_count[None].to(pred.dtype)
+        mae_loss = (se_tok * w).sum() / w.sum().clamp(min=1.0)
+
+        taps = None
+        if collect_taps:
+            assert enc_taps is not None
+            d_enc = enc_taps[12].shape[-1]
+            taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
+            with torch.no_grad():  # per-band recon health; pad zeroed so it can't pollute
+                taps.update(per_band_jepa_stats(pred, target * fv, w, grid.band))
+        return JepaOutput(
+            loss=mae_loss,
+            n_masked=w.sum().detach(),
+            taps=taps,
+            jepa_loss=None,  # single loss (no ramped secondary) ⇒ trainer uses out.loss
+            nll_loss=None,
+            ctx_loss=None,
+        )
+
+    def _mae_gather_target(
+        self, bands: Sequence[Tensor], grid: R4Grid
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Gather each flat token's own band |STFT| bins into a padded (B, total, F_MAX)
+        tensor via ONE static index — no boolean/data-dependent gather (compile-safe).
+
+        ``bands[b]`` (B, N, F_b, T32), already per-(elec,bin) robust-z'd at load (the stem's
+        input). A token of (band, contact, time_pos) wants ``bands[band][:, contact, :,
+        time_pos]`` — ``time_pos`` IS the T32 clock index of that decimated frame
+        (bandpos·stride). Pad each band's freq to F_MAX, stack band-major, index with
+        ``lin = (band·N + contact)·T32 + time_pos``. Returns (target, feat_valid, feat_count):
+        ``feat_valid`` (total, F_MAX) bool marks each token's real bins (MID pad = the F_MAX-th
+        slot), ``feat_count`` (total,) = F_b per token."""
+        B, N = bands[0].shape[0], bands[0].shape[1]
+        T = bands[0].shape[-1]
+        f_max = max(nb for nb, _ in PER_BAND_SPECS)
+        padded: list[Tensor] = []
+        for b, (nb, _) in enumerate(PER_BAND_SPECS):
+            xb = bands[b].transpose(-1, -2)  # (B, N, T, F_b)
+            if nb < f_max:
+                xb = F.pad(xb, (0, f_max - nb))  # zero-pad freq to F_MAX
+            padded.append(xb)
+        stack = torch.stack(padded, dim=1)  # (B, N_BANDS, N, T, F_MAX)
+        flat = stack.reshape(B, len(PER_BAND_SPECS) * N * T, f_max)
+        lin = (grid.band * N + grid.contact) * T + grid.time_pos  # (total,)
+        target = flat[:, lin, :]  # (B, total, F_MAX)
+        device = grid.band.device
+        f_by_band = torch.tensor([nb for nb, _ in PER_BAND_SPECS], device=device)
+        feat_count = f_by_band[grid.band]  # (total,)
+        feat_valid = torch.arange(f_max, device=device)[None, :] < feat_count[:, None]
+        return target, feat_valid, feat_count
+
+    def _mae_pred(self, h: Tensor, grid: R4Grid) -> Tensor:
+        """Per-band reconstruction heads → (B, total, F_MAX), selected per token by band.
+
+        Runs all 3 heads over every token (static shape) and one-hot-selects by ``grid.band``
+        — the compile-safe analogue of a per-band boolean gather. MID's F_MAX-th slot is
+        zero-pad (masked out of the loss by ``feat_valid``)."""
+        f_max = max(nb for nb, _ in PER_BAND_SPECS)
+        outs: list[Tensor] = []
+        for head, (nb, _) in zip(self.mae_heads, PER_BAND_SPECS):
+            o = head(h)  # (B, total, F_b)
+            if nb < f_max:
+                o = F.pad(o, (0, f_max - nb))
+            outs.append(o)  # (B, total, F_MAX)
+        stack = torch.stack(outs, dim=-1)  # (B, total, F_MAX, N_BANDS)
+        onehot = F.one_hot(grid.band, len(PER_BAND_SPECS)).to(h.dtype)  # (total, N_BANDS)
+        return (stack * onehot[None, :, None, :]).sum(-1)  # (B, total, F_MAX)
+
+    @staticmethod
+    def _norm_pix(x: Tensor, feat_valid: Tensor, feat_count: Tensor) -> Tensor:
+        """He-2021 norm_pix over each token's VALID bins: ``(x-mean)/sqrt(var+1e-6)`` with
+        UNBIASED var (÷(n-1), matching ``torch.var``) and eps 1e-6. Pad bins are excluded
+        from mean/var; their post-norm value is masked out of the loss by ``feat_valid``."""
+        fv = feat_valid[None].to(x.dtype)  # (1, total, F_MAX)
+        fc = feat_count[None, :, None].to(x.dtype)  # (1, total, 1)
+        mean = (x * fv).sum(-1, keepdim=True) / fc
+        var = ((x - mean) ** 2 * fv).sum(-1, keepdim=True) / (fc - 1.0)
+        return (x - mean) / (var + 1e-6).sqrt()
+
     @torch.no_grad()
     def update_teacher(self, step: int | None = None) -> float:
+        if self.teacher is None:  # MAE arm has no EMA teacher — no-op every opt-step.
+            return 0.0
         return self.teacher.update_from(self.online, step=step)

@@ -236,6 +236,7 @@ def build_v3_training(
     sessions + a stub parcel_fn (no caches, no wandb, CPU).
     """
     mask_cfg = V3MaskConfig()  # locked two-tier config (its own defaults)
+    mae = getattr(args, "objective", "jepa") == "mae"
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
@@ -244,6 +245,7 @@ def build_v3_training(
         secondary_loss=getattr(args, "secondary_loss", "nll"),
         context_loss=getattr(args, "context_loss", False),
         lambda_ctx=getattr(args, "lambda_ctx", LAMBDA_CTX),
+        mae=mae,
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -337,14 +339,13 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
         )
 
     # Ben 2026-07-13: constant LR (min_lr_ratio=1.0, V-JEPA-2 style) ⇒ max_steps is a pure
-    # STOP-POINT, not a schedule parameter, so raising it is science-neutral. 100k is our
-    # standard SSL horizon; floored here so the already-queued r2/r3 (submitted with
-    # --ssl-max-steps 60000) run the full horizon WITHOUT a resubmit — the batch script
-    # re-reads this module at launch, so redeploying reaches a still-pending job with no
-    # forfeited queue age. Early stopping = kill + ladder-pick; nothing schedule-wise wants
-    # a stop below 100k. (At ~2 s/opt-step the 48h wall bites first, ~86k; that's fine.)
-    SSL_MAX_STEPS_STD = 100_000
-    ssl_max_steps = max(args.ssl_max_steps, SSL_MAX_STEPS_STD)
+    # STOP-POINT, not a schedule parameter, so it can be whatever horizon a run wants.
+    # --ssl-max-steps binds AS WRITTEN (it is required, so always explicit). The old
+    # max(_, 100_000) floor was a one-time hack so the long-finished r2/r3 queue ran the full
+    # 100k horizon without a resubmit; it has no live dependants and actively fought explicit
+    # short-horizon arms (e.g. the 20k MAE-vs-JEPA board runs), so it is removed. Early
+    # stopping = kill + ladder-pick, unchanged.
+    ssl_max_steps = args.ssl_max_steps
     kwargs: dict[str, tp.Any] = dict(
         max_steps=ssl_max_steps,
         max_epochs=-1,
@@ -470,6 +471,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--accumulate-grad-batches", dest="accumulate_grad_batches",
                    type=int, default=4)
     p.add_argument("--seed", type=int, default=33)
+    # --- objective ---
+    p.add_argument("--objective", dest="objective", choices=("jepa", "mae"),
+                   default="jepa",
+                   help="prediction TARGET: 'jepa' (default, EMA-teacher latent, the arm0 "
+                        "recipe) or 'mae' (Masked Autoencoder, He 2021 / AudioMAE — "
+                        "reconstruct each masked token's OWN norm_pix'd input |STFT| bins, "
+                        "no EMA teacher). ONLY the target changes; the visible-only encoder, "
+                        "predictor, mask query, margin-gated in_loss, and all locked HPs are "
+                        "identical. 'mae' forbids --state-stats-dir / --context-loss.")
     # --- trainer/precision (E2) ---
     p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, required=True)
     p.add_argument("--precision", default="bf16-mixed")
@@ -622,6 +632,11 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
             "The live grad-ratio does two extra autograd.grad passes over the shared online\n"
             "tower; under multi-GPU DDP those re-enter the reducer over the shared graph — the\n"
             "r3 static_graph×grad-accum crash surface. It is a 1-GPU diagnostic lever only."
+        )
+    if args.objective == "mae" and (args.state_stats_dir or args.context_loss):
+        raise SystemExit(
+            "REFUSING TO LAUNCH: --objective mae has no secondary NLL or context loss.\n"
+            "Drop --state-stats-dir / --context-loss (MAE reconstructs the raw input target)."
         )
     pl.seed_everything(args.seed, workers=True)
 
