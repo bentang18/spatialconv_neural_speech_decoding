@@ -1466,18 +1466,20 @@ def build_v14_experiment(
                 # the same subdir ⇒ namespace matches ⇒ the run HITs this cache.
                 "lfs": STFT_2BAND_LFS,
                 "hga": STFT_2BAND_HGA,
-                # v14_converged_v3 3-band frontend (UNIFORM hop=64 → 32 Hz native,
-                # fixed 2026-07-10): SLOW is the mag 2–14 band, MID the mag 16–56
-                # band — BOTH v3-exclusive at hop 64 (the shared "beta" above stays
-                # hop 128 for the 3stft ladder; v3 MID must NOT alias it). HGA reuses
-                # "hga" (already hop 64). Build into
-                # <v3-spec-cache-dir>/band_{v3slow,v3mid,hga}.
+                # v14_converged_v3 3-band frontend, NATIVE-RATE rebake (2026-07-21,
+                # supersedes the 2026-07-10 uniform hop=64 → 32 Hz caches): each band
+                # extracted at ITS OWN hop, no 32 Hz intermediate. SLOW = mag 2–14 at
+                # N=1024/hop=512 → 4 Hz; MID = mag 16–56 at N=256/hop=128 → 16 Hz. Both
+                # v3-EXCLUSIVE (the shared "beta"/"hga" bands stay their 3stft/2band hops;
+                # band_hop is in the exca uid so these force a FRESH extraction). Native
+                # hits the same window centers as the old ::8/::2 decimate ⇒ bit-identical
+                # at the frames the stem keeps, 8×/2× less storage. Build into
+                # <v3-spec-cache-dir>/band_{v3slow,v3mid,v3hga}.
                 "v3slow": STFT_V3_SLOW,
                 "v3mid": STFT_V3_MID,
-                # fine-HGA OFAT (2026-07-21): HGA at N=64/hop=16 → 128 Hz, 4 bins.
-                # Builds into <v3-spec-cache-dir>/band_v3hga; the v3 fine-HGA run
-                # reads it + reuses band_v3slow/band_v3mid byte-identical (SLOW/MID
-                # unchanged). The stem conv-pools 128→32 Hz (learned decimate).
+                # fine-HGA OFAT (2026-07-21): HGA at N=64/hop=16 → 128 Hz, 4 bins
+                # (64/96/128/160). The FineHgaStem conv-pools 128→32 Hz (learned decimate)
+                # instead of a fixed strided slice. Builds into band_v3hga.
                 "v3hga": STFT_V3_HGA,
             }[cache_band]
             band_spec_cache = (
