@@ -45,7 +45,11 @@ from neuraltrain import LightningOptimizer
 from speech_decoding.experiments.monitors.ssl_health_v3 import SSLHealthMonitorV3
 from speech_decoding.experiments.v14_converged_v3_module import V14ConvergedV3Module
 from speech_decoding.models.v14_converged_v3.datamodule import V3DataModule
-from speech_decoding.models.v14_converged_v3.dataset import V3SessionSpec
+from speech_decoding.models.v14_converged_v3.dataset import (
+    NATIVE_FINE_BAND_RATES,
+    UNIFORM_BAND_RATES,
+    V3SessionSpec,
+)
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
 from speech_decoding.models.v14_converged_v3.objective import LAMBDA_CTX, LAMBDA_NLL
@@ -226,6 +230,21 @@ def _n_parcels(sessions: tp.Sequence[V3SessionSpec]) -> int:
     return n
 
 
+def _frontend_config(
+    args: argparse.Namespace,
+) -> tuple[bool, tuple[tuple[int, int], ...]]:
+    """(native_fine_hga, band_rates) from ``--frontend``.
+
+    ``v3`` (default) = uniform-32Hz PerBandStem (arm0, byte-identical to every prior run).
+    ``v3fine`` = FineHgaStem on native-rate caches (SLOW 4Hz / MID 16Hz / HGA 128Hz). The
+    SAME band_rates must reach the dataset (per-band read offsets), the loader (32Hz
+    reference n_frames) AND the model (stem + T derivation), so all three read this one fn.
+    """
+    if getattr(args, "frontend", "v3") == "v3fine":
+        return True, NATIVE_FINE_BAND_RATES
+    return False, UNIFORM_BAND_RATES
+
+
 def build_v3_training(
     sessions: tp.Sequence[V3SessionSpec],
     args: argparse.Namespace,
@@ -237,6 +256,7 @@ def build_v3_training(
     """
     mask_cfg = V3MaskConfig()  # locked two-tier config (its own defaults)
     mae = getattr(args, "objective", "jepa") == "mae"
+    native_fine_hga, band_rates = _frontend_config(args)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
@@ -245,7 +265,7 @@ def build_v3_training(
         secondary_loss=getattr(args, "secondary_loss", "nll"),
         context_loss=getattr(args, "context_loss", False),
         lambda_ctx=getattr(args, "lambda_ctx", LAMBDA_CTX),
-        mae=mae,
+        mae=mae, native_fine_hga=native_fine_hga,
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -271,6 +291,7 @@ def build_v3_training(
         num_workers=args.num_workers,
         seed=args.seed,
         same_session=args.same_session_ranks,
+        band_rates=band_rates,
     )
     trainer = _build_trainer(args)
     return module, dm, trainer
@@ -480,6 +501,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "no EMA teacher). ONLY the target changes; the visible-only encoder, "
                         "predictor, mask query, margin-gated in_loss, and all locked HPs are "
                         "identical. 'mae' forbids --state-stats-dir / --context-loss.")
+    p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine"),
+                   default="v3",
+                   help="temporal front-end: 'v3' (default, uniform-32Hz PerBandStem — the "
+                        "arm0 recipe, byte-identical) or 'v3fine' (FineHgaStem on native-rate "
+                        "caches: SLOW 4Hz / MID 16Hz / HGA 128Hz conv-pooled 128→32Hz). "
+                        "'v3fine' REQUIRES native-rate band caches (--band-cache-dir must point "
+                        "at the fine bake, e.g. v3slow/v3mid/v3hga).")
     # --- trainer/precision (E2) ---
     p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, required=True)
     p.add_argument("--precision", default="bf16-mixed")
@@ -640,6 +668,7 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         )
     pl.seed_everything(args.seed, workers=True)
 
+    _, band_rates = _frontend_config(args)
     sessions = load_v3_sessions(
         sessions=_parse_sessions(args.sessions),
         band_cache_dirs=args.band_cache_dirs,
@@ -648,6 +677,7 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         lof_report_path=args.lof_report_path,
         winsor=(args.winsor_slow, args.winsor_mid, args.winsor_hga),
         state_stats_dir=args.state_stats_dir,
+        band_rates=band_rates,
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:

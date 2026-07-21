@@ -39,6 +39,9 @@ from torch.utils.data import Dataset
 # 128 Hz), extracted at native rate — the stem consumes them directly (memo
 # project-fine-hga-bt-rebake-tasklist-2026-07-21).
 UNIFORM_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 1), (1, 1), (1, 1))
+# Fine-HGA OFAT native rates vs the 32 Hz clip clock (SLOW 4 Hz = 1/8, MID 16 Hz = 1/2,
+# HGA 128 Hz = 4/1) — the SINGLE source of truth the dispatch --frontend flag reads.
+NATIVE_FINE_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 8), (1, 2), (4, 1))
 
 
 def _start_align(band_rates: Sequence[tuple[int, int]]) -> int:

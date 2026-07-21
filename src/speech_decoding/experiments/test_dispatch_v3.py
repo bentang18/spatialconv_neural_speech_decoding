@@ -23,10 +23,16 @@ import torch
 
 from speech_decoding.experiments.dispatch_v3 import (
     _build_trainer,
+    _frontend_config,
     _parse_sessions,
     _StepTimeCallback,
+    build_arg_parser,
     build_v3_optim_cfg,
     build_v3_training,
+)
+from speech_decoding.models.v14_converged_v3.dataset import (
+    NATIVE_FINE_BAND_RATES,
+    UNIFORM_BAND_RATES,
 )
 from speech_decoding.experiments.fork_point_ckpt import (
     fork_ckpt_general,
@@ -202,6 +208,41 @@ def test_module_resumes_model_and_step_from_checkpoint(tmp_path) -> None:
     restored = torch.cat([p.detach().flatten() for p in m2.model.parameters()
                           if p.requires_grad])
     assert torch.allclose(trained, restored, atol=1e-5)
+
+
+def test_frontend_flag_parses_and_defaults_to_v3() -> None:
+    base = ["--bt-root", "/b", "--band-cache-dir", "/s", "--band-cache-dir", "/m",
+            "--band-cache-dir", "/h", "--span-dir", "/sp", "--session", "1/0",
+            "--ssl-max-steps", "10"]
+    assert build_arg_parser().parse_args(base).frontend == "v3"
+    assert build_arg_parser().parse_args(base + ["--frontend", "v3fine"]).frontend == "v3fine"
+
+
+def test_frontend_config_maps_flag_to_native_flag_and_rates() -> None:
+    assert _frontend_config(_smoke_args()) == (False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3")) == (False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, NATIVE_FINE_BAND_RATES)
+
+
+def test_v3fine_threads_native_into_model_and_dataset(tmp_path) -> None:
+    # The flag must reach BOTH the stem (model.native_fine_hga) AND the loader's per-band
+    # read (dataset.band_rates); either alone silently mis-reads. Uniform default is proven
+    # in every other build_v3_training test.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_fine, dm_fine, _ = build_v3_training(specs, _smoke_args(frontend="v3fine"))
+    assert m_fine.model.native_fine_hga is True
+    assert m_fine.model.objective.native_fine_hga is True
+    assert dm_fine.dataset.band_rates == NATIVE_FINE_BAND_RATES
+    assert dm_fine.dataset.start_align == 8  # lcm(8,2,1)
+
+    m_uni, dm_uni, _ = build_v3_training(specs, _smoke_args())
+    assert m_uni.model.native_fine_hga is False
+    assert dm_uni.dataset.band_rates == UNIFORM_BAND_RATES
 
 
 def test_clips_per_session_default_is_the_long_epoch() -> None:
