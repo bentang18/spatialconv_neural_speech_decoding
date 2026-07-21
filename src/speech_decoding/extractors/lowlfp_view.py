@@ -74,7 +74,21 @@ class LowLfpView(MultiStftView):
             4, [1.0 / nyq, 30.0 / nyq], btype="band", output="sos"
         )
         arr = waveform.detach().cpu().numpy().astype(np.float64)
-        filtered = np.asarray(scipy.signal.sosfiltfilt(sos, arr, axis=-1))
+        try:
+            filtered = scipy.signal.sosfiltfilt(sos, arr, axis=-1)
+        except ValueError as exc:
+            # neuralset's ``prepare()`` probes the extractor geometry with a ~1 ms
+            # (duration=0.001, ~2-sample) clip that is SHORTER than the zero-phase
+            # filter's default padlen (~27 for order 4). That probe only needs the
+            # OUTPUT SHAPE, so filter it with a clamped pad. REAL clips (>=1 s =
+            # >=2048 samples) are >> padlen, so they never enter here and keep
+            # scipy's default padlen ⇒ byte-identical features.
+            if "padlen" not in str(exc):
+                raise
+            filtered = scipy.signal.sosfiltfilt(
+                sos, arr, axis=-1, padlen=max(0, arr.shape[-1] - 1)
+            )
+        filtered = np.asarray(filtered)
         L = filtered.shape[-1]
         n_frames = 1 + L // hop
         idx = [min(k * hop, L - 1) for k in range(n_frames)]

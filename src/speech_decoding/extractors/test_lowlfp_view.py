@@ -70,6 +70,21 @@ def test_clock_matches_n_time_bins() -> None:
     print("[check] OK LFS frame count == n_time_bins_for_duration for all durations")
 
 
+def test_prepare_geometry_probe_short_input() -> None:
+    """REGRESSION: neuralset's prepare() probes geometry with a ~1 ms (duration=0.001,
+    ~2-sample) clip that is shorter than the SOS filter's padlen (~27). _lfs_frames
+    must survive it (shape-only), not raise ValueError('greater than padlen'). Real
+    clips are >>padlen so this path never touches them."""
+    view = _make_view()
+    # 0.001 s at 2048 Hz ≈ 2 samples (the exact prepare() probe), plus other
+    # sub-padlen lengths down to 1 sample.
+    for n_samples in (1, 2, 3, int(round(0.001 * FS)), 10, 27):
+        wave = _sinusoid_mix(n_samples=n_samples)
+        frames = view._lfs_frames(wave, FS)  # must NOT raise
+        assert frames.shape == (C, 1, 1 + n_samples // 32), (n_samples, frames.shape)
+    print("[check] OK short-input geometry probe survives (no padlen ValueError)")
+
+
 def test_frame_grid_alignment() -> None:
     """CRITICAL: LFS frame i centered at raw-sample i*32 == HGA frame 2i center (2i*16).
 
