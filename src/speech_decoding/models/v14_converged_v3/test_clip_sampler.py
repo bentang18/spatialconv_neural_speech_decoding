@@ -118,3 +118,65 @@ def test_sample_raises_when_no_valid_window() -> None:
 def test_clip_longer_than_session_has_no_start() -> None:
     ivals = allowed_start_intervals(n_frames=64, clip_frames=96, bad_spans_s=[], fps=FPS)
     assert ivals == []
+
+
+# ── native-rate t0 alignment (2026-07-21) ──────────────────────────────────────
+# Native SLOW extraction (hop=512=8×64) reads frame t0//8, so t0 must be ≡0 mod 8
+# for the SLOW/MID/HGA clips to land on a shared window lattice. clip_frames=96 is
+# already 8-aligned so t0+96 stays aligned. start_align lives ONLY in the sampler;
+# allowed_start_intervals stays the raw 32 Hz complement primitive.
+
+
+def test_start_align_only_returns_multiples() -> None:
+    # Every drawn start must be a multiple of 8 AND still avoid the bad span.
+    spans = [(3.0, 4.0)]  # [96,128)
+    g = _gen(0)
+    for _ in range(300):
+        t0 = sample_clip_start(
+            n_frames=320, clip_frames=96, bad_spans_s=spans, fps=FPS,
+            generator=g, start_align=8,
+        )
+        assert t0 % 8 == 0, f"t0={t0} not 8-aligned"
+        assert 0 <= t0 <= 224
+        assert not (t0 < 128 and t0 + 96 > 96)
+
+
+def test_start_align_default_one_is_unchanged() -> None:
+    # start_align default (=1) reproduces the un-aligned behaviour bit-for-bit.
+    spans = [(3.0, 4.0)]
+    g0, g1 = _gen(7), _gen(7)
+    for _ in range(50):
+        a = sample_clip_start(
+            n_frames=320, clip_frames=96, bad_spans_s=spans, fps=FPS, generator=g0
+        )
+        b = sample_clip_start(
+            n_frames=320, clip_frames=96, bad_spans_s=spans, fps=FPS,
+            generator=g1, start_align=1,
+        )
+        assert a == b
+
+
+def test_start_align_weights_by_aligned_count() -> None:
+    # Allowed = {0} ∪ [128,224]. With align=8 the point-gap {0} contributes 1 start
+    # and [128,224] contributes 13 (128,136,...,224) → big gap dominates.
+    spans = [(3.0, 4.0)]
+    g = _gen(1)
+    counts = {"zero": 0, "big": 0}
+    for _ in range(2000):
+        t0 = sample_clip_start(
+            n_frames=320, clip_frames=96, bad_spans_s=spans, fps=FPS,
+            generator=g, start_align=8,
+        )
+        assert t0 % 8 == 0
+        counts["zero" if t0 == 0 else "big"] += 1
+    assert counts["big"] > counts["zero"] * 8
+
+
+def test_start_align_raises_when_no_aligned_start() -> None:
+    # Allowed=[(3,7)] (hi_start=7, t0=0..2 blocked) holds NO multiple of 8 → raise.
+    g = _gen(0)
+    with pytest.raises(ValueError, match="no valid clip"):
+        sample_clip_start(
+            n_frames=103, clip_frames=96, bad_spans_s=[(0.0, 0.1)], fps=FPS,
+            generator=g, start_align=8,
+        )

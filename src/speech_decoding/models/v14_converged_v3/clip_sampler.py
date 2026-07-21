@@ -79,18 +79,31 @@ def sample_clip_start(
     bad_spans_s: Sequence[tuple[float, float]],
     fps: float,
     generator: torch.Generator,
+    start_align: int = 1,
 ) -> int:
-    """Draw one guard-2-valid clip start (frames), length-weighted over allowed gaps."""
+    """Draw one guard-2-valid clip start (frames), length-weighted over allowed gaps.
+
+    ``start_align`` constrains starts to multiples of it (native-rate SLOW hop=512=8×64
+    reads frame ``t0 // 8``, so ``t0`` must be ≡0 mod 8 for the bands to share a window
+    lattice — 2026-07-21). Each allowed 32 Hz gap is narrowed to its aligned starts and
+    weighted by the COUNT of them; raises if no aligned start survives guard-2.
+    """
     allowed = allowed_start_intervals(
         n_frames=n_frames, clip_frames=clip_frames, bad_spans_s=bad_spans_s, fps=fps
     )
-    if not allowed:
+    aligned: list[tuple[int, int]] = []  # (first aligned start, count of aligned starts)
+    for lo, hi in allowed:
+        a_lo = -(-lo // start_align) * start_align  # ceil(lo/align)*align
+        a_hi = (hi // start_align) * start_align  # floor(hi/align)*align
+        if a_lo <= a_hi:
+            aligned.append((a_lo, (a_hi - a_lo) // start_align + 1))
+    if not aligned:
         raise ValueError(
             f"no valid clip start: session {n_frames} frames, clip {clip_frames}, "
-            f"{len(bad_spans_s)} bad spans block every window"
+            f"align {start_align}, {len(bad_spans_s)} bad spans block every window"
         )
-    widths = torch.tensor([hi - lo + 1 for lo, hi in allowed], dtype=torch.float64)
-    which = int(torch.multinomial(widths / widths.sum(), 1, generator=generator).item())
-    lo, hi = allowed[which]
-    offset = int(torch.randint(0, hi - lo + 1, (1,), generator=generator).item())
-    return lo + offset
+    counts = torch.tensor([c for _, c in aligned], dtype=torch.float64)
+    which = int(torch.multinomial(counts / counts.sum(), 1, generator=generator).item())
+    a_lo, count = aligned[which]
+    step = int(torch.randint(0, count, (1,), generator=generator).item())
+    return a_lo + step * start_align
