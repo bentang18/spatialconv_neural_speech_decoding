@@ -81,7 +81,9 @@ class SSLHealthMonitorV3(pl.Callback):
 
     def _ema_weight_gap(self, pl_module: pl.LightningModule) -> float | None:
         obj = getattr(pl_module.model, "objective", None)
-        if obj is None:
+        # MAE arm has no EMA teacher (obj.teacher is None) ⇒ no student-teacher weight gap
+        # to report; skip the metric rather than dereference a None teacher.
+        if obj is None or getattr(obj, "teacher", None) is None:
             return None
         student, teacher = obj.online, obj.teacher.model
         num = torch.zeros((), dtype=torch.float32)
