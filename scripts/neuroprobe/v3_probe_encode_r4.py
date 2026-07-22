@@ -129,15 +129,19 @@ def _freeze(m, *, device):
     return m
 
 
-def _load_teacher(sd: dict, *, device: torch.device):
-    """Load ONLY the EMA teacher tower (`_TargetTower` = PerBandStem + encoder) from the ckpt.
+def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teacher.model."):
+    """Load ONLY the shipped encoder tower (`_TargetTower` = PerBandStem + encoder) from the ckpt.
 
-    Filter the LightningModule state_dict to the ``objective.teacher.model.*`` subtree and
-    load it into a fresh ``_TargetTower`` (strict) — no need to build the full model / secondary
-    head, so the load is independent of the objective's post-launch changes (#46 mean floor)."""
+    Filter the LightningModule state_dict to the ``pref``-rooted subtree and load it into a fresh
+    ``_TargetTower`` (strict) — no need to build the full model / secondary head, so the load is
+    independent of the objective's post-launch changes (#46 mean floor).
+
+    ``pref`` selects which tower: the JEPA EMA teacher (default) or, for the MAE arm which has no
+    teacher, ``objective.online.`` — the online encoder is the MAE arm's deployed representation.
+    The online subtree is key- and shape-identical to the teacher subtree (verified on arm0, which
+    carries both), so it loads into the same ``_TargetTower`` shell unchanged."""
     from speech_decoding.models.v14_converged_v3.objective import _TargetTower
 
-    pref = "objective.teacher.model."
     tsd = _subtree(sd, pref)
     if not tsd:
         raise RuntimeError(f"no '{pref}*' keys in ckpt; wrong ckpt layout")
@@ -433,6 +437,10 @@ def main() -> None:
     p.add_argument("--no-perceiver", action="store_true",
                    help="skip the dec/lat taps — the board number is enc12, and the Perceiver "
                         "taps need the secondary head's ckpt subtree")
+    p.add_argument("--online", action="store_true",
+                   help="probe the ONLINE encoder (objective.online.*) instead of the EMA teacher. "
+                        "Required for the MAE arm (no teacher); implies --no-perceiver (MAE has no "
+                        "Perceiver). Use it on a JEPA ckpt too for an online-vs-online parity match.")
     p.add_argument("--elec-taps", default="",
                    help="comma-separated GPU taps to ALSO write per-electrode (unpooled), e.g. "
                         "'12' -> feats['enc12_elec']. WS keeps all electrodes by default (Ben "
@@ -463,10 +471,14 @@ def main() -> None:
     if bad:
         raise SystemExit(f"--elec-taps {bad} not in GPU_TAPS {GPU_TAPS}")
     sd = _load_ckpt(args.ckpt)
-    teacher = _load_teacher(sd, device=device)
-    percs = {} if args.no_perceiver else _load_perceivers(sd, device=device)
+    tower_pref = "objective.online." if args.online else "objective.teacher.model."
+    teacher = _load_teacher(sd, device=device, pref=tower_pref)
+    # --online (MAE arm, or a JEPA online-vs-online match) has no Perceiver subtree to load.
+    percs = {} if (args.no_perceiver or args.online) else _load_perceivers(sd, device=device)
     del sd
-    perc_note = "no perceiver" if args.no_perceiver else "+ perceiver dec/lat (+_rand control)"
+    perc_note = ("online encoder, no perceiver" if args.online
+                 else "no perceiver" if args.no_perceiver
+                 else "+ perceiver dec/lat (+_rand control)")
     print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0 "
           f"{perc_note}, n_slots={n_slots} sessions={args.sessions}({len(cohort)}) "
           f"tasks={args.tasks}({len(tasks)}) electrodes={args.electrode_set}", flush=True)
