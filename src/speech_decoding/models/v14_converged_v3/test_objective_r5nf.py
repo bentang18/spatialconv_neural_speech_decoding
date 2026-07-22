@@ -152,6 +152,29 @@ def _all_masked_loss(obj, hga_bias: float, lfs_bias: float):
     return float(out.loss.detach()), float(out.taps["mae_hga"]), float(out.taps["mae_lfs"])
 
 
+def test_taps_emit_per_stream_recon_stats() -> None:
+    # the nf tap block must emit per-stream explained-var + var-ratio (collapse detector), not
+    # just the mean-MSE split — the health signal that was missing on the nf arm.
+    import math
+
+    sc, geom = _session()
+    obj = _nf()
+    grid = build_r5nf_grid(geom, n_time=T)
+    bands = [torch.randn(B, N, NOFUSION_BINS[0], L), torch.randn(B, N, NOFUSION_BINS[1], L)]
+    h = torch.randn(B, grid.total, PRED_D_MODEL)
+    in_loss = torch.ones(B, grid.total, dtype=torch.bool)
+    out = obj._mae_output_r5nf(
+        bands, grid, h, in_loss, enc_taps={12: torch.zeros(1, 256)}, collect_taps=True
+    )
+    assert out.taps is not None
+    keys = ("jepa_hga_explained_var", "jepa_hga_pred_target_var_ratio",
+            "jepa_lfs_explained_var", "jepa_lfs_pred_target_var_ratio",
+            "mae_hga", "mae_lfs")
+    ok = all(k in out.taps and math.isfinite(float(out.taps[k])) for k in keys)
+    print(f"[check] nf taps carry per-stream EV+var-ratio+MSE, all finite → {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_default_stream_weight_is_equal() -> None:
     assert _nf().mae_stream_weight == "equal"
     with pytest.raises(ValueError, match="equal|pooled"):

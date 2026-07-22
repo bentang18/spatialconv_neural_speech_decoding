@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import torch
 
-from speech_decoding.models.v14_converged_v3.monitor_taps import per_band_jepa_stats
+from speech_decoding.models.v14_converged_v3.monitor_taps import (
+    nofusion_recon_stats,
+    per_band_jepa_stats,
+)
 
 
 def _ref_band_jepa(pred, tgt, w, band_ids, b, eps=1e-8):
@@ -65,3 +68,49 @@ def test_per_band_jepa_perfect_prediction_gives_unit_ev_zero_l1() -> None:
     )
     print(f"[check] perfect-pred ⇒ EV=1,L1=0,ratio=1 all bands → {'OK' if ok else 'VIOLATED'}")
     assert ok
+
+
+def test_nofusion_recon_perfect_prediction_gives_unit_ev() -> None:
+    # invariant: pred==tgt (on each stream's valid feats) ⇒ EV=1, var-ratio=1 for both streams.
+    torch.manual_seed(2)
+    B, total, F_MAX, n_hga, n_lfs = 2, 16, 8, 8, 2
+    band = torch.randint(0, 2, (total,))  # 0=HGA 1=LFS
+    w = torch.ones(B, total)
+    w_hga = w * (band == 0).float()[None]
+    w_lfs = w * (band == 1).float()[None]
+    tgt = torch.randn(B, total, F_MAX)
+    tgt[:, band == 1, n_lfs:] = 0.0  # LFS pad slots zero in the target (as the gather produces)
+    got = nofusion_recon_stats(tgt.clone(), tgt, w_hga, w_lfs, n_hga=n_hga, n_lfs=n_lfs)
+    ok = all(
+        abs(float(got[f"jepa_{n}_explained_var"]) - 1.0) < 1e-5
+        and abs(float(got[f"jepa_{n}_pred_target_var_ratio"]) - 1.0) < 1e-5
+        for n in ("hga", "lfs")
+    )
+    print(f"[check] nf perfect-pred ⇒ EV=1,ratio=1 both streams → {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_nofusion_recon_ignores_lfs_pad_slots() -> None:
+    # LFS uses only the first n_lfs feats; garbage in the pad slots must NOT change LFS stats
+    # (they'd deflate variance if included). HGA (all 8 valid) is untouched here.
+    torch.manual_seed(3)
+    B, total, F_MAX, n_hga, n_lfs = 2, 20, 8, 8, 2
+    band = torch.zeros(total, dtype=torch.long)
+    band[total // 2:] = 1  # half HGA, half LFS
+    w = torch.ones(B, total)
+    w_hga = w * (band == 0).float()[None]
+    w_lfs = w * (band == 1).float()[None]
+    tgt = torch.randn(B, total, F_MAX)
+    pred = tgt + 0.3 * torch.randn(B, total, F_MAX)  # imperfect ⇒ EV<1
+    base = nofusion_recon_stats(pred.clone(), tgt.clone(), w_hga, w_lfs, n_hga=n_hga, n_lfs=n_lfs)
+    pred2, tgt2 = pred.clone(), tgt.clone()
+    pred2[:, band == 1, n_lfs:] = 99.0  # poison LFS pad in pred
+    tgt2[:, band == 1, n_lfs:] = -99.0  # and in tgt
+    poisoned = nofusion_recon_stats(pred2, tgt2, w_hga, w_lfs, n_hga=n_hga, n_lfs=n_lfs)
+    same = all(
+        abs(float(base[k]) - float(poisoned[k])) < 1e-6
+        for k in ("jepa_lfs_explained_var", "jepa_lfs_pred_target_var_ratio",
+                  "jepa_hga_explained_var", "jepa_hga_pred_target_var_ratio")
+    )
+    print(f"[check] LFS pad slots ignored → {'OK' if same else 'VIOLATED'}")
+    assert same

@@ -100,4 +100,48 @@ def early_fusion_recon_stats(
     return out
 
 
-__all__ = ["per_band_jepa_stats", "early_fusion_recon_stats", "BAND_NAMES"]
+def nofusion_recon_stats(
+    pred: Tensor,
+    tgt: Tensor,
+    w_hga: Tensor,
+    w_lfs: Tensor,
+    *,
+    n_hga: int,
+    n_lfs: int,
+) -> dict[str, Tensor]:
+    """v3r5nf per-stream recon health: explained-var + pred-target var-ratio for the HGA and LFS
+    TOKEN streams (separate tokens, unlike r5's within-token channel split).
+
+    ``pred``/``tgt`` (B, total, F_MAX) are the padded per-token targets; HGA tokens use all
+    ``n_hga`` feats, LFS tokens only the first ``n_lfs`` (the rest pad-zero in BOTH pred and tgt).
+    Each stream is sliced to its OWN valid feats (``[:n_b]``) so LFS's variance isn't deflated by
+    the pad zeros, and weighted by that stream's masked weight (``w_hga``/``w_lfs``, already
+    stream-disjoint) so only its own tokens contribute. Same weighted per-feature-variance as
+    :func:`per_band_jepa_stats`, so {hga,lfs} land on the SAME wandb panel as r5-fused's split."""
+    B, total, _ = pred.shape
+    out: dict[str, Tensor] = {}
+    for name, wsel, nf in (("hga", w_hga, n_hga), ("lfs", w_lfs, n_lfs)):
+        x_t = tgt[..., :nf]  # (B, total, nf) this stream's valid feats
+        x_p = pred[..., :nf]
+        wf = wsel.reshape(1, B * total)
+        denom = wsel.sum().clamp_min(1.0)
+
+        def _mean_f_var(x: Tensor, _nf=nf, _wsel=wsel, _wf=wf, _denom=denom) -> Tensor:
+            e_sq = (x.pow(2).sum(-1) * _wsel).sum() / _denom  # E[‖x‖²]
+            mean_vec = (_wf @ x.reshape(B * total, _nf)).squeeze(0) / _denom  # (nf,)
+            return (e_sq - mean_vec.pow(2).sum()) / _nf
+
+        var_t = _mean_f_var(x_t)
+        var_p = _mean_f_var(x_p)
+        var_r = _mean_f_var(x_t - x_p)
+        out[f"jepa_{name}_explained_var"] = 1.0 - var_r / (var_t + _EPS)
+        out[f"jepa_{name}_pred_target_var_ratio"] = var_p / (var_t + _EPS)
+    return out
+
+
+__all__ = [
+    "per_band_jepa_stats",
+    "early_fusion_recon_stats",
+    "nofusion_recon_stats",
+    "BAND_NAMES",
+]

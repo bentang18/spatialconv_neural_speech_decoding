@@ -36,6 +36,7 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.masking import V3Masks
 from speech_decoding.models.v14_converged_v3.monitor_taps import (
     early_fusion_recon_stats,
+    nofusion_recon_stats,
     per_band_jepa_stats,
 )
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
@@ -658,6 +659,14 @@ class V3JepaObjective(nn.Module):
                 # mode): reports each stream's raw reconstruction quality for the health monitor.
                 taps["mae_hga"] = mae_hga.detach()
                 taps["mae_lfs"] = mae_lfs.detach()
+                # per-stream explained-var + pred-target var-ratio (collapse detector) — the nf
+                # analogue of r5-fused's early_fusion_recon_stats, split by TOKEN-band and sliced
+                # to each stream's own valid feats (LFS 2, HGA 8) so pad zeros don't deflate it.
+                taps.update(nofusion_recon_stats(
+                    pred, target, w_hga, w_lfs,
+                    n_hga=NOFUSION_DECIMATE * NOFUSION_BINS[0],
+                    n_lfs=NOFUSION_DECIMATE * NOFUSION_BINS[1],
+                ))
         return JepaOutput(
             loss=mae_loss,
             n_masked=w.sum().detach(),
