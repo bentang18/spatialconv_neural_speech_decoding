@@ -373,16 +373,15 @@ class V3JepaObjective(nn.Module):
             self.enc_to_pred(z), pack.idx, grid.total, self.mask_token
         )  # (B, total, 128)
         # v3r5nf: HGA and LFS tokens at the SAME (contact, 32Hz-pos) share IDENTICAL RoPE
-        # (same time_pos + depth), and independent masking can hide both at once — two
-        # co-located masked queries would be byte-identical predictor inputs forced to predict
-        # DIFFERENT targets, distinguishable only at the final head. Add a per-stream band
-        # identity to the mask QUERY (predictor space, d_pred) so the predictor separates them
-        # from block 1. Masked slots only (masked_f=0 leaves visible slots byte-unchanged); r4/r5
-        # arms never enter this branch.
+        # (same time_pos + depth), so two co-located masked queries would be byte-identical
+        # predictor inputs forced to predict DIFFERENT targets. A per-stream band identity
+        # (predictor space, d_pred) breaks that. Added to ALL tokens (visible + masked),
+        # symmetric with the parcel embed (towers.py:279) and matching the MAE-decoder /
+        # I-JEPA-predictor convention of adding position/identity embeds to context AND mask
+        # tokens alike. r4/r5 arms never enter this branch (no mask_band_emb).
         if self.no_fusion:
             band_q = self.mask_band_emb[grid.band]  # (total, PRED_D_MODEL)
-            masked_f = masked.unsqueeze(-1).to(pred_in.dtype)  # (B, total, 1)
-            pred_in = pred_in + masked_f * band_q[None]  # visible slots unchanged
+            pred_in = pred_in + band_q[None]  # all tokens (visible + masked)
         h = self.predictor.forward_flat(pred_in, grid, parcel_packed)  # (B, total, 128)
         if self.mae:
             if self.no_fusion:

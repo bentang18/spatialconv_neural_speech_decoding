@@ -278,8 +278,9 @@ def _capture_pred_in(obj, bands, geom, parcel_id, masks):
 
 
 def test_mask_band_emb_differentiates_colocated_masked_queries() -> None:
-    # Two co-located masked tokens (same contact + pos, band 0 vs 1) must get DIFFERENT pred_in
-    # rows; a VISIBLE token's pred_in must be UNCHANGED by mask_band_emb (masked_f=0).
+    # The band identity rides ALL predictor tokens (symmetric with parcel, MAE/I-JEPA convention).
+    # Two co-located tokens (same contact + pos, band 0 vs 1) must get DIFFERENT pred_in rows,
+    # AND toggling mask_band_emb must move BOTH visible and masked slots (it's on every token).
     from speech_decoding.models.v14_converged_v3.masking import V3MasksR5NF
 
     sc, geom = _session()
@@ -311,14 +312,13 @@ def test_mask_band_emb_differentiates_colocated_masked_queries() -> None:
     lfs_tok = ((grid.contact == 0) & (grid.band == 1) & (grid.bandpos == 0)).nonzero().item()
     assert bool(masked[0, hga_tok]) and bool(masked[0, lfs_tok])
     colocated_differ = not torch.allclose(pin1[:, hga_tok], pin1[:, lfs_tok])
-    # visible slots byte-unchanged whether or not mask_band_emb is present.
+    # band emb is on ALL tokens ⇒ toggling it moves BOTH visible and masked slots.
     vis = ~masked
-    visible_unchanged = torch.allclose(pin1[vis], pin2[vis], atol=1e-7)
-    # masked slots DO change when the band emb is added (pin1 has it, pin2 zeroed it).
+    visible_changed = not torch.allclose(pin1[vis], pin2[vis])
     masked_changed = not torch.allclose(pin1[masked], pin2[masked])
-    ok = colocated_differ and visible_unchanged and masked_changed
-    print(f"[check] mask-query band emb: co-located HGA/LFS differ ({colocated_differ}); "
-          f"visible unchanged ({visible_unchanged}); masked changed ({masked_changed}) "
+    ok = colocated_differ and visible_changed and masked_changed
+    print(f"[check] band emb rides all tokens: co-located HGA/LFS differ ({colocated_differ}); "
+          f"visible moved ({visible_changed}); masked moved ({masked_changed}) "
           f"{'OK' if ok else 'VIOLATED'}")
     assert ok
 
