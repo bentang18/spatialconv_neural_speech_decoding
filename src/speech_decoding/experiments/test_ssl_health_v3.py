@@ -204,6 +204,47 @@ def test_family_b_tap_keys_finite() -> None:
     assert not any(key.startswith("train_mon_enc3_") for key in logged)
 
 
+def test_enc12_stream_split_logs_per_stream_rankme_and_feat_std() -> None:
+    """v3r5nf: when the taps carry ``enc12_band`` (per-visible-token stream label), the monitor
+    splits the pooled enc12 by stream and logs each stream's OWN rankme + feat_std, in ADDITION
+    to the pooled keys. The boolean split + per-stream SVD run here in the eager callback."""
+    torch.manual_seed(0)
+    d = 16
+    enc12 = torch.cat([torch.randn(40, d), torch.randn(30, d)], 0)  # 40 HGA + 30 LFS rows
+    band = torch.cat([torch.zeros(40), torch.ones(30)]).long()      # aligned label
+    logged: dict[str, float] = {}
+    mod = SimpleNamespace(_last_taps={"enc12": enc12, "enc12_band": band}, global_step=0)
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[attr-defined]
+    cb = SSLHealthMonitorV3()
+    cb.on_train_batch_end(
+        trainer=_fake_trainer(), pl_module=mod, outputs=None, batch=None, batch_idx=0,
+    )
+    keys = [
+        "train_mon_enc12_rankme",                                          # pooled (existing)
+        "train_mon_enc12_hga_rankme", "train_mon_enc12_hga_feat_std_mean",
+        "train_mon_enc12_hga_feat_std_min",
+        "train_mon_enc12_lfs_rankme", "train_mon_enc12_lfs_feat_std_mean",
+        "train_mon_enc12_lfs_feat_std_min",
+    ]
+    for k in keys:
+        assert k in logged and logged[k] == logged[k], k  # present + finite
+    print(f"[check] enc12 stream split logs pooled+HGA+LFS rankme/feat_std ({len(keys)} keys) OK")
+
+
+def test_enc12_no_stream_split_without_band_tap() -> None:
+    """No ``enc12_band`` (r4 / r5-fused) ⇒ only the pooled enc12 keys, no per-stream keys."""
+    torch.manual_seed(0)
+    logged: dict[str, float] = {}
+    mod = SimpleNamespace(_last_taps={"enc12": torch.randn(50, 16)}, global_step=0)
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[attr-defined]
+    SSLHealthMonitorV3().on_train_batch_end(
+        trainer=_fake_trainer(), pl_module=mod, outputs=None, batch=None, batch_idx=0,
+    )
+    assert "train_mon_enc12_rankme" in logged
+    assert not any("_hga_" in k or "_lfs_" in k for k in logged)
+    print("[check] OK no enc12_band ⇒ pooled-only, no per-stream split")
+
+
 def test_input_tripwire_flags_nonfinite_band() -> None:
     """The per-band input tripwire emits nonfinite_frac/absmax/mean/std for every band
     and catches a NaN injected into one band (frac>0 there, 0 for the clean bands)."""

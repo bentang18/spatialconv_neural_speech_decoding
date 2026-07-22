@@ -175,6 +175,38 @@ def test_taps_emit_per_stream_recon_stats() -> None:
     assert ok
 
 
+def test_enc12_band_tap_splits_visible_tokens_by_stream() -> None:
+    # v3r5nf collect_taps must emit enc12_band: a per-VISIBLE-token stream label (0=HGA 1=LFS)
+    # aligned to the flattened enc12 rows, so the health monitor can split rankme/feat_std per
+    # stream. Static shape (NO boolean gather in-objective — the compiled collect-taps graph
+    # stays shape-stable); the boolean split + per-stream SVD run in the eager monitor.
+    sc, geom = _session()
+    out = _nf()(_streams(), geom, sc.parcel_id, _masks(geom), collect_taps=True)
+    assert out.taps is not None
+    enc12 = out.taps["enc12"]        # (B·M_vis, 256)
+    band = out.taps["enc12_band"]    # (B·M_vis,)
+    uniq = {int(x) for x in band.unique().tolist()}
+    n_hga = int((band == 0).sum())
+    n_lfs = int((band == 1).sum())
+    ok = (
+        band.ndim == 1
+        and band.shape[0] == enc12.shape[0]
+        and uniq == {0, 1}                       # both streams have visible tokens
+        and n_hga + n_lfs == enc12.shape[0]      # partition is exhaustive
+        and n_hga > 0 and n_lfs > 0
+    )
+    print(f"[check] enc12_band aligns to enc12 rows={enc12.shape[0]} "
+          f"(HGA {n_hga} + LFS {n_lfs}), values {uniq} {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_enc12_band_absent_without_collect_taps() -> None:
+    sc, geom = _session()
+    out = _nf()(_streams(), geom, sc.parcel_id, _masks(geom), collect_taps=False)
+    assert out.taps is None
+    print("[check] OK collect_taps=False ⇒ no taps at all (incl enc12_band)")
+
+
 def test_default_stream_weight_is_equal() -> None:
     assert _nf().mae_stream_weight == "equal"
     with pytest.raises(ValueError, match="equal|pooled"):

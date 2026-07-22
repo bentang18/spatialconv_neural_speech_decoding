@@ -193,6 +193,18 @@ class SSLHealthMonitorV3(pl.Callback):
         tap = taps.get("enc12")
         if isinstance(tap, Tensor):
             self._rank_and_std(pl_module, tap, key="enc12_")
+            # v3r5nf: split the pooled enc12 by token STREAM (0=HGA 1=LFS) and emit each
+            # stream's OWN rankme + feat_std. The boolean gather + per-stream SVD run here in
+            # the eager callback (off the compiled graph). Tests whether r5nf's low pooled
+            # rankme is the between-stream identity axis (per-stream rankme ≫ pooled) or a
+            # genuinely low per-stream spectrum. Absent for r4/r5-fused (no enc12_band tap).
+            band = taps.get("enc12_band")
+            if isinstance(band, Tensor):
+                flat = tap.detach().reshape(-1, tap.shape[-1])
+                b = band.detach().reshape(-1)
+                if b.shape[0] == flat.shape[0]:
+                    for bid, bkey in ((0, "enc12_hga_"), (1, "enc12_lfs_")):
+                        self._rank_and_std(pl_module, flat[b == bid], key=bkey)
         # scalar monitor taps reduced INSIDE the objective (r4): per-band JEPA
         # explained-var / var-ratio / L1 (#40), per-band NLL (#41), predicted-cov
         # entropy vs floor (#42). Each is a 0-dim tensor keyed by its own name.

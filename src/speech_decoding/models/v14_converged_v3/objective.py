@@ -403,6 +403,9 @@ class V3JepaObjective(nn.Module):
                     bands, grid, h, in_loss,
                     enc_taps=enc_taps if collect_taps else None,
                     collect_taps=collect_taps,
+                    # per-VISIBLE-token stream label (0=HGA 1=LFS), aligned to enc_taps[12]'s
+                    # (B, M_vis) axis, so the monitor can split enc12 rankme/feat_std by stream.
+                    band_vis=grid.band[pack.idx] if collect_taps else None,
                 )
             if self.early_fusion:
                 return self._mae_output_r5(
@@ -632,6 +635,7 @@ class V3JepaObjective(nn.Module):
         *,
         enc_taps: dict[int, Tensor] | None,
         collect_taps: bool,
+        band_vis: Tensor | None = None,
     ) -> JepaOutput:
         """v3r5nf MAE loss: reconstruct each masked token's OWN DEC(2) raw 64 Hz frames of its
         OWN stream (HGA 8 feats, LFS 2). Accept-the-bleed ``in_loss`` (== masked).
@@ -668,6 +672,13 @@ class V3JepaObjective(nn.Module):
             d_enc = enc_taps[12].shape[-1]
             taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
             with torch.no_grad():
+                # per-VISIBLE-token stream label aligned to the flattened enc12 rows (static
+                # shape — NO boolean gather here, so the compiled collect-taps graph stays
+                # shape-stable). The eager health monitor does the boolean split + per-stream
+                # SVD off-graph: is r5nf's low pooled rankme the between-stream ID axis, or does
+                # each stream's OWN spectrum also sit low? (0=HGA 1=LFS, matches grid.band.)
+                if band_vis is not None:
+                    taps["enc12_band"] = band_vis.detach().reshape(-1)  # (B·M_vis,)
                 # log-only per-stream mean-MSE (the SAME per-token means, independent of the loss
                 # mode): reports each stream's raw reconstruction quality for the health monitor.
                 taps["mae_hga"] = mae_hga.detach()
