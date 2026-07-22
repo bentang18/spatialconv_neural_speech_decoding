@@ -32,6 +32,7 @@ from speech_decoding.experiments.dispatch_v3 import (
 )
 from speech_decoding.models.v14_converged_v3.dataset import (
     NATIVE_FINE_BAND_RATES,
+    R5_BAND_RATES,
     UNIFORM_BAND_RATES,
 )
 from speech_decoding.experiments.fork_point_ckpt import (
@@ -216,12 +217,15 @@ def test_frontend_flag_parses_and_defaults_to_v3() -> None:
             "--ssl-max-steps", "10"]
     assert build_arg_parser().parse_args(base).frontend == "v3"
     assert build_arg_parser().parse_args(base + ["--frontend", "v3fine"]).frontend == "v3fine"
+    assert build_arg_parser().parse_args(base + ["--frontend", "v3r5"]).frontend == "v3r5"
 
 
 def test_frontend_config_maps_flag_to_native_flag_and_rates() -> None:
-    assert _frontend_config(_smoke_args()) == (False, UNIFORM_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3")) == (False, UNIFORM_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, NATIVE_FINE_BAND_RATES)
+    # (native_fine_hga, early_fusion, band_rates)
+    assert _frontend_config(_smoke_args()) == (False, False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3")) == (False, False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, False, NATIVE_FINE_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3r5")) == (False, True, R5_BAND_RATES)
 
 
 def test_v3fine_threads_native_into_model_and_dataset(tmp_path) -> None:
@@ -243,6 +247,60 @@ def test_v3fine_threads_native_into_model_and_dataset(tmp_path) -> None:
     m_uni, dm_uni, _ = build_v3_training(specs, _smoke_args())
     assert m_uni.model.native_fine_hga is False
     assert dm_uni.dataset.band_rates == UNIFORM_BAND_RATES
+
+
+def _write_r5_caches(tmp_path, sessions, *, n_frames_64=400):
+    """Two 64 Hz caches (v3hga F=4, v3lfs F=1) — the Chang 2-stream r5 input. total_frames
+    is the 64 Hz count (= 2× the 32 Hz clock); the loader/dataset apply R5_BAND_RATES."""
+    band_dirs = []
+    for b, F in enumerate((4, 1)):  # (v3hga, v3lfs) — HGA first
+        d = tmp_path / f"r5band{b}"
+        d.mkdir(parents=True, exist_ok=True)
+        for subject_id, trial_id, labels in sessions:
+            stem = f"btbank{subject_id}_t{trial_id}"
+            key = (
+                '{"cls":"Wang2024Treebank","method":"_load_raw","timeline":'
+                f'{{"extra_bad":[],"subject":"btbank{subject_id}",'
+                f'"subject_id":{subject_id},"trial_id":{trial_id}}}}}_0.000_6867.860'
+            )
+            C = len(labels)
+            (d / f"{stem}.json").write_text(json.dumps({
+                "key": key, "ch_names": labels, "total_frames": n_frames_64,
+                "sample_rate": 64,
+            }))
+            rng = np.random.default_rng(subject_id * 100 + trial_id + 17 + b)
+            np.save(str(d / f"{stem}.npy"),
+                    rng.standard_normal((C, F, n_frames_64)).astype(np.float32))
+            np.savez(str(d / f"{stem}.stats.npz"),
+                     median=np.zeros((C, F, 1), np.float32),
+                     sigma=np.ones((C, F, 1), np.float32))
+        band_dirs.append(str(d))
+    span_dir = tmp_path / "r5spans"
+    span_dir.mkdir()
+    for subject_id, trial_id, _ in sessions:
+        (span_dir / f"btbank{subject_id}_t{trial_id}.json").write_text(json.dumps({
+            "subject_id": subject_id, "trial_id": trial_id, "bad_windows_s": [],
+        }))
+    return band_dirs, str(span_dir)
+
+
+def test_v3r5_threads_early_fusion_into_model_and_dataset(tmp_path) -> None:
+    # v3r5 must reach the stem (model.early_fusion) AND the loader's per-band read
+    # (dataset.band_rates == R5_BAND_RATES). 2 caches (v3hga F=4, v3lfs F=1) @64 Hz;
+    # the 32 Hz clip clock is total_frames//2, so clip_len 3s (96 tok) needs 192 frames.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_r5_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=R5_BAND_RATES,
+    )
+    assert specs[0].n_frames == 200  # 400 // 2 (64 Hz cache → 32 Hz clock)
+    m_r5, dm_r5, _ = build_v3_training(specs, _smoke_args(frontend="v3r5"))
+    assert m_r5.model.early_fusion is True
+    assert m_r5.model.objective.early_fusion is True
+    assert m_r5.model.native_fine_hga is False
+    assert dm_r5.dataset.band_rates == R5_BAND_RATES
+    assert dm_r5.dataset.start_align == 1  # lcm(1,1) — single-rate lattice
 
 
 def test_clips_per_session_default_is_the_long_epoch() -> None:

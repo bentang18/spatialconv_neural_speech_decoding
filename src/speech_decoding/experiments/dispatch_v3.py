@@ -47,6 +47,7 @@ from speech_decoding.experiments.v14_converged_v3_module import V14ConvergedV3Mo
 from speech_decoding.models.v14_converged_v3.datamodule import V3DataModule
 from speech_decoding.models.v14_converged_v3.dataset import (
     NATIVE_FINE_BAND_RATES,
+    R5_BAND_RATES,
     UNIFORM_BAND_RATES,
     V3SessionSpec,
 )
@@ -232,17 +233,22 @@ def _n_parcels(sessions: tp.Sequence[V3SessionSpec]) -> int:
 
 def _frontend_config(
     args: argparse.Namespace,
-) -> tuple[bool, tuple[tuple[int, int], ...]]:
-    """(native_fine_hga, band_rates) from ``--frontend``.
+) -> tuple[bool, bool, tuple[tuple[int, int], ...]]:
+    """(native_fine_hga, early_fusion, band_rates) from ``--frontend``.
 
     ``v3`` (default) = uniform-32Hz PerBandStem (arm0, byte-identical to every prior run).
-    ``v3fine`` = FineHgaStem on native-rate caches (SLOW 4Hz / MID 16Hz / HGA 128Hz). The
-    SAME band_rates must reach the dataset (per-band read offsets), the loader (32Hz
-    reference n_frames) AND the model (stem + T derivation), so all three read this one fn.
+    ``v3fine`` = FineHgaStem on native-rate caches (SLOW 4Hz / MID 16Hz / HGA 128Hz).
+    ``v3r5`` = EarlyFusionStem (Chang 2-stream): 2 caches (v3hga, v3lfs) both @64 Hz, fused
+    5ch→256→stride-2 to 32 Hz tokens. The SAME band_rates must reach the dataset (per-band
+    read offsets), the loader (32Hz reference n_frames) AND the model (stem + T derivation),
+    so all three read this one fn. (native_fine_hga, early_fusion) are mutually exclusive.
     """
-    if getattr(args, "frontend", "v3") == "v3fine":
-        return True, NATIVE_FINE_BAND_RATES
-    return False, UNIFORM_BAND_RATES
+    frontend = getattr(args, "frontend", "v3")
+    if frontend == "v3fine":
+        return True, False, NATIVE_FINE_BAND_RATES
+    if frontend == "v3r5":
+        return False, True, R5_BAND_RATES
+    return False, False, UNIFORM_BAND_RATES
 
 
 def build_v3_training(
@@ -256,7 +262,7 @@ def build_v3_training(
     """
     mask_cfg = V3MaskConfig()  # locked two-tier config (its own defaults)
     mae = getattr(args, "objective", "jepa") == "mae"
-    native_fine_hga, band_rates = _frontend_config(args)
+    native_fine_hga, early_fusion, band_rates = _frontend_config(args)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
@@ -265,7 +271,7 @@ def build_v3_training(
         secondary_loss=getattr(args, "secondary_loss", "nll"),
         context_loss=getattr(args, "context_loss", False),
         lambda_ctx=getattr(args, "lambda_ctx", LAMBDA_CTX),
-        mae=mae, native_fine_hga=native_fine_hga,
+        mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -480,6 +486,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-z-winsor-slow", dest="winsor_slow", type=float, default=15.0)
     p.add_argument("--session-z-winsor-mid", dest="winsor_mid", type=float, default=15.0)
     p.add_argument("--session-z-winsor-hga", dest="winsor_hga", type=float, default=20.0)
+    # r5 (--frontend v3r5) has 2 bands (v3hga, v3lfs); winsor tuple is (hga, lfs). LFS is
+    # sub-HGA raw voltage (same content class as the old SLOW/MID) ⇒ the 15 cap; HGA keeps 20.
+    p.add_argument("--session-z-winsor-lfs", dest="winsor_lfs", type=float, default=15.0)
     p.add_argument("--num-workers", type=int, default=4)
     # --- locked optimizer/schedule ---
     p.add_argument("--lr", type=float, default=6e-3)
@@ -501,13 +510,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "no EMA teacher). ONLY the target changes; the visible-only encoder, "
                         "predictor, mask query, margin-gated in_loss, and all locked HPs are "
                         "identical. 'mae' forbids --state-stats-dir / --context-loss.")
-    p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine"),
+    p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine", "v3r5"),
                    default="v3",
                    help="temporal front-end: 'v3' (default, uniform-32Hz PerBandStem — the "
-                        "arm0 recipe, byte-identical) or 'v3fine' (FineHgaStem on native-rate "
-                        "caches: SLOW 4Hz / MID 16Hz / HGA 128Hz conv-pooled 128→32Hz). "
-                        "'v3fine' REQUIRES native-rate band caches (--band-cache-dir must point "
-                        "at the fine bake, e.g. v3slow/v3mid/v3hga).")
+                        "arm0 recipe, byte-identical), 'v3fine' (FineHgaStem on native-rate "
+                        "caches: SLOW 4Hz / MID 16Hz / HGA 128Hz conv-pooled 128→32Hz), or "
+                        "'v3r5' (EarlyFusionStem, Chang 2-stream: 2 caches v3hga|v3lfs both "
+                        "@64 Hz, fused 5ch→256→stride-2→32Hz tokens; single-rate, no band embed, "
+                        "accept-the-bleed in_loss=masked). 'v3fine' REQUIRES the 3 native-rate "
+                        "band caches; 'v3r5' REQUIRES exactly the 2 caches --band-cache-dir "
+                        "v3hga --band-cache-dir v3lfs (HGA first).")
     # --- trainer/precision (E2) ---
     p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, required=True)
     p.add_argument("--precision", default="bf16-mixed")
@@ -650,9 +662,13 @@ def _parse_sessions(raw: tp.Sequence[str]) -> list[tuple[int, int]]:
 
 def main(argv: tp.Sequence[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    if len(args.band_cache_dirs) != 3:
+    is_r5 = getattr(args, "frontend", "v3") == "v3r5"
+    n_want = 2 if is_r5 else 3
+    if len(args.band_cache_dirs) != n_want:
+        order = "v3hga, v3lfs" if is_r5 else "slow, mid, hga"
         raise ValueError(
-            f"need 3 --band-cache-dir (slow, mid, hga), got {len(args.band_cache_dirs)}"
+            f"--frontend {args.frontend} needs {n_want} --band-cache-dir ({order}), "
+            f"got {len(args.band_cache_dirs)}"
         )
     if args.grad_ratio_every_n_steps > 0 and args.devices and args.devices != 1:
         raise SystemExit(
@@ -668,14 +684,20 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         )
     pl.seed_everything(args.seed, workers=True)
 
-    _, band_rates = _frontend_config(args)
+    _, _, band_rates = _frontend_config(args)
+    # winsor is per-band in cache order: r5 = (hga, lfs); arm0/v3fine = (slow, mid, hga).
+    winsor = (
+        (args.winsor_hga, args.winsor_lfs)
+        if is_r5
+        else (args.winsor_slow, args.winsor_mid, args.winsor_hga)
+    )
     sessions = load_v3_sessions(
         sessions=_parse_sessions(args.sessions),
         band_cache_dirs=args.band_cache_dirs,
         span_dir=args.span_dir,
         parcel_fn=make_bt_parcel_fn(args.bt_root),
         lof_report_path=args.lof_report_path,
-        winsor=(args.winsor_slow, args.winsor_mid, args.winsor_hga),
+        winsor=winsor,
         state_stats_dir=args.state_stats_dir,
         band_rates=band_rates,
     )
