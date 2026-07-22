@@ -104,10 +104,11 @@ def test_temporal_is_blocky_via_temporal_block_w() -> None:
     print(f"[check] OK temporal_block_w drives blockiness: mean run w4={means[4]:.2f} < w6={means[6]:.2f}")
 
 
-def test_default_temporal_block_w_is_six() -> None:
-    # r5 default block width = 6 tokens = 187.5 ms @ 32 Hz (Ben 2026-07-22, 150-200 ms range).
-    assert V3MaskConfig().temporal_block_w == 6
-    print("[check] OK default temporal_block_w == 6 (187.5 ms @ 32 Hz)")
+def test_default_temporal_block_w_is_five() -> None:
+    # r5 default block width = 5 tokens = 156 ms floor @ 32 Hz (~190 ms mean run after overlap;
+    # Ben 2026-07-22, τ-anchored to LFS 83 ms first-zero, deliberately shorter than speech 200 ms).
+    assert V3MaskConfig().temporal_block_w == 5
+    print("[check] OK default temporal_block_w == 5 (156 ms floor, ~190 ms mean run @ 32 Hz)")
 
 
 def test_space_balanced_and_keep_alive() -> None:

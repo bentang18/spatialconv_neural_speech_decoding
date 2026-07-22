@@ -129,7 +129,8 @@ def _freeze(m, *, device):
     return m
 
 
-def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teacher.model."):
+def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teacher.model.",
+                  early_fusion: bool = False):
     """Load ONLY the shipped encoder tower (`_TargetTower` = PerBandStem + encoder) from the ckpt.
 
     Filter the LightningModule state_dict to the ``pref``-rooted subtree and load it into a fresh
@@ -148,7 +149,7 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     peek = [v.shape[0] for kk, v in tsd.items() if kk.endswith("parcel_embed.embed.weight")]
     if peek and int(peek[0]) != N_PARCELS:
         raise ValueError(f"ckpt parcel table {peek[0]} != expected {N_PARCELS}")
-    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=True)
+    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=True, early_fusion=early_fusion)
     missing, unexpected = tower.load_state_dict(tsd, strict=False)
     bad = [m for m in missing if "num_batches_tracked" not in m]
     if bad or unexpected:
@@ -214,9 +215,14 @@ def _lite_keep_labels_fn(bt_root):
     return fn
 
 
-def _window_bands(spec, starts, clip_frames):
-    """Slice + robust-z every union window from the continuous 32 Hz spec caches. Returns 3
-    tensors, each (n_windows, N, F_band, T32=clip_frames).
+def _window_bands(spec, starts, clip_frames, rate_mult: int = 1):
+    """Slice + robust-z every union window from the continuous spec caches. Returns one tensor
+    per band, each (n_windows, N, F_band, T=clip_frames·rate_mult).
+
+    ``rate_mult`` = cache frames per 32 Hz reference frame: 1 for the r4 uniform-32 Hz caches,
+    2 for the r5 native-64 Hz caches (R5_BAND_RATES=((2,1),(2,1))) whose EarlyFusionStem
+    conv-pools 64→32 Hz. Windows are sliced in the cache's own frame units (FPS·rate_mult), so
+    the returned length is clip_frames·rate_mult = L = 2·T for r5.
 
     Bulk-loads each band's survivor rows into RAM ONCE (``mm[keep]`` → ~1 GB/band), then slices
     windows from RAM and robust-z's the whole (n,N,F,T) batch in one vectorized call. The naive
@@ -224,13 +230,16 @@ def _window_bands(spec, starts, clip_frames):
     dominated wall-clock; this is numerically identical (mm[keep] then slice == mm[keep,:,a:b];
     the normalizer is elementwise broadcast)."""
     keep = spec.keep_idx.numpy()
-    t0 = np.rint(np.asarray(starts, dtype=float) * FPS).astype(np.int64)
-    end = t0 + clip_frames
-    oob = np.where((t0 < 0) | (end > spec.n_frames))[0]
+    # spec.n_frames is the 32 Hz reference count; the r5 caches carry rate_mult× that many
+    # native frames. Bound the native-unit windows against the native length.
+    n_frames_native = spec.n_frames * rate_mult
+    t0 = np.rint(np.asarray(starts, dtype=float) * FPS * rate_mult).astype(np.int64)
+    end = t0 + clip_frames * rate_mult
+    oob = np.where((t0 < 0) | (end > n_frames_native))[0]
     if len(oob):
         raise RuntimeError(
             f"{spec.session_key}: {len(oob)} union windows out of cache bounds "
-            f"(n_frames={spec.n_frames}, first bad start={float(starts[oob[0]]):.4f}s)"
+            f"(n_frames_native={n_frames_native}, first bad start={float(starts[oob[0]]):.4f}s)"
         )
     bands = []
     for path, norm in zip(spec.band_paths, spec.band_norms):
@@ -434,6 +443,11 @@ def main() -> None:
                    help="board15 = the 15 leaderboard tasks (re-labels the same features)")
     p.add_argument("--electrode-set", choices=("all", "lite"), default="all",
                    help="lite = the Neuroprobe-Lite montage (leaderboard parity)")
+    p.add_argument("--frontend", choices=("v3r4", "v3r5"), default="v3r4",
+                   help="v3r4 = 3-band PerBandStem @32Hz (r4/arm0, default). v3r5 = Chang "
+                        "2-stream EarlyFusionStem: 2 native-64Hz caches (hga, lfs) → ONE 32Hz "
+                        "token. Implies --online (r5 MAE has no teacher) + --no-perceiver + no "
+                        "enc0 (band strides are r4-only).")
     p.add_argument("--no-perceiver", action="store_true",
                    help="skip the dec/lat taps — the board number is enc12, and the Perceiver "
                         "taps need the secondary head's ckpt subtree")
@@ -449,19 +463,33 @@ def main() -> None:
 
     from speech_decoding.experiments.pretrain_probe_suite import PROBE_COHORT_7
     from speech_decoding.experiments.dispatch_v3 import make_bt_parcel_fn
-    from speech_decoding.models.v14_converged_v3.pack_r4 import build_r4_grid
-    from speech_decoding.models.v14_converged_v3.perceiver import SLOT_STRIDE
+    from speech_decoding.models.v14_converged_v3.pack_r4 import build_r4_grid, build_r5_grid
     from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
 
-    if len(args.band_cache_dirs) != 3:
-        raise SystemExit(f"need 3 --band-cache-dir (slow, mid, hga), got {len(args.band_cache_dirs)}")
+    is_r5 = args.frontend == "v3r5"
+    if is_r5:
+        # r5: EarlyFusionStem, single-band grid, no teacher/perceiver/enc0. Force the flags the
+        # frontend implies so a bare `--frontend v3r5` is sufficient.
+        args.online = True
+        args.no_perceiver = True
+    n_cache = 2 if is_r5 else 3
+    if len(args.band_cache_dirs) != n_cache:
+        want = "(hga, lfs)" if is_r5 else "(slow, mid, hga)"
+        raise SystemExit(
+            f"need {n_cache} --band-cache-dir {want}, got {len(args.band_cache_dirs)}")
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_frames = round(CLIP_DUR_S * FPS)
-    # S = T // slot_stride, exactly as state_target.raw_state_vectors derives it (32//8 = 4).
-    n_slots, rem = divmod(clip_frames, SLOT_STRIDE)
-    if rem:
-        raise SystemExit(f"clip_frames={clip_frames} not divisible by SLOT_STRIDE={SLOT_STRIDE}")
+    # n_slots is the Perceiver slot count; the r5 tree has the perceiver path ripped out, so
+    # import SLOT_STRIDE lazily only on the r4 perceiver path (n_slots is unused for r5).
+    if is_r5:
+        n_slots = 0
+    else:
+        from speech_decoding.models.v14_converged_v3.perceiver import SLOT_STRIDE
+        # S = T // slot_stride, exactly as state_target.raw_state_vectors derives it (32//8 = 4).
+        n_slots, rem = divmod(clip_frames, SLOT_STRIDE)
+        if rem:
+            raise SystemExit(f"clip_frames={clip_frames} not divisible by SLOT_STRIDE={SLOT_STRIDE}")
     parcel_fn = make_bt_parcel_fn(args.bt_root)
     cohort = BOARD_SESSIONS if args.sessions == "board" else tuple(PROBE_COHORT_7)
     tasks = BOARD_TASKS if args.tasks == "board15" else PROBE_TASKS
@@ -472,7 +500,7 @@ def main() -> None:
         raise SystemExit(f"--elec-taps {bad} not in GPU_TAPS {GPU_TAPS}")
     sd = _load_ckpt(args.ckpt)
     tower_pref = "objective.online." if args.online else "objective.teacher.model."
-    teacher = _load_teacher(sd, device=device, pref=tower_pref)
+    teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5)
     # --online (MAE arm, or a JEPA online-vs-online match) has no Perceiver subtree to load.
     percs = {} if (args.no_perceiver or args.online) else _load_perceivers(sd, device=device)
     del sd
@@ -490,10 +518,15 @@ def main() -> None:
         if os.path.exists(path):
             print(f"[encode-r4] {session}: exists, skip -> {path}", flush=True)
             continue
+        load_kw = {}
+        if is_r5:
+            from speech_decoding.models.v14_converged_v3.dataset import R5_BAND_RATES
+            load_kw["band_rates"] = R5_BAND_RATES
         spec = load_v3_sessions(
             sessions=[session], band_cache_dirs=args.band_cache_dirs, span_dir=args.span_dir,
-            parcel_fn=parcel_fn, lof_report_path=None, winsor=(15.0, 15.0, 20.0),
-            keep_labels_fn=keep_labels_fn,
+            parcel_fn=parcel_fn, lof_report_path=None,
+            winsor=(20.0, 15.0) if is_r5 else (15.0, 15.0, 20.0),
+            keep_labels_fn=keep_labels_fn, **load_kw,
         )[0]
         if keep_labels_fn is not None:
             # The montage is the WHOLE parity claim — print what was realized, per session.
@@ -507,15 +540,20 @@ def main() -> None:
             if not ok:
                 raise RuntimeError("lite montage kept a non-Lite electrode — refusing to write")
         targets = _load_targets(session, args.bt_root, tasks)
-        bands = _window_bands(spec, targets.clip_starts, clip_frames)
+        # r5 caches are native-64Hz (R5_BAND_RATES 2×); read 2·clip_frames frames per window.
+        bands = _window_bands(spec, targets.clip_starts, clip_frames, rate_mult=2 if is_r5 else 1)
 
         geom = spec.setup.geom.to(device)
         parcel_id = spec.setup.parcel_id.to(device)
-        grid = build_r4_grid(geom, n_time=clip_frames)
+        grid = (build_r5_grid(geom, n_time=clip_frames) if is_r5
+                else build_r4_grid(geom, n_time=clip_frames))
         parcel_packed = parcel_id[grid.contact]
         canon, parcel_canon, present = _canon_parcels(grid, parcel_id)
 
-        feats = {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present)}}
+        # enc0 = the r4 per-band decimated input floor (BAND_STRIDES is r4-only); r5's single
+        # early-fused stream has no analogous decimation, so skip it — enc3/6/12 are the arms.
+        feats = ({} if is_r5
+                 else {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present)}})
         tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
                                   present, device=device, batch_size=args.batch_size,
                                   n_slots=n_slots, run_checks=first, elec_taps=elec_taps)

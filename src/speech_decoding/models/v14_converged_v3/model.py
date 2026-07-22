@@ -38,6 +38,7 @@ from speech_decoding.models.v14_converged_v3.masking import (
     V3MaskConfig,
     sample_masks,
     sample_masks_r5,
+    sample_masks_r5nf,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
     JepaOutput,
@@ -46,9 +47,11 @@ from speech_decoding.models.v14_converged_v3.objective import (
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
     build_r4_grid,
     build_r5_grid,
+    build_r5nf_grid,
     build_visible_pack,
     token_flags,
     token_flags_r5,
+    token_flags_r5nf,
 )
 from speech_decoding.models.v14_converged_v3.stem import clock_length_32hz
 
@@ -64,6 +67,8 @@ class V3ConvergedModel(nn.Module):
         mae: bool = False,
         native_fine_hga: bool = False,
         early_fusion: bool = False,
+        no_fusion: bool = False,
+        mae_stream_weight: str = "equal",
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -73,12 +78,16 @@ class V3ConvergedModel(nn.Module):
         # early_fusion (r5, Chang 2-stream): EarlyFusionStem + single-band grid + single
         # temporal mask + accept-the-bleed scoring. The mask sampler / grid / flags switch
         # to their r5 variants below; the objective owns the frontend + scoring swap.
+        # no_fusion (v3r5nf): r5-fused's fully-separated sibling — NoFusionStem (2 stems) +
+        # two-band grid + INDEPENDENT per-stream masks + accept-the-bleed scoring, MAE-only.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
             mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
+            no_fusion=no_fusion, mae_stream_weight=mae_stream_weight,
         )
         self.native_fine_hga = bool(native_fine_hga)
         self.early_fusion = bool(early_fusion)
+        self.no_fusion = bool(no_fusion)
         self.mask_cfg = mask_cfg
 
     def forward(
@@ -98,6 +107,7 @@ class V3ConvergedModel(nn.Module):
             band_inputs,
             native_fine_hga=self.native_fine_hga,
             early_fusion=self.early_fusion,
+            no_fusion=self.no_fusion,
         )
         # masking is the sole augmentation: per-shaft-balanced spatial contact drop + per-band
         # (SLOW/MID/HGA) independent temporal blocks (masking.V3Masks). The flat r4 objective
@@ -105,6 +115,10 @@ class V3ConvergedModel(nn.Module):
         # r5 (early_fusion): ONE temporal mask over the single 32 Hz band (sample_masks_r5).
         if self.early_fusion:
             masks = sample_masks_r5(
+                geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
+            )
+        elif self.no_fusion:
+            masks = sample_masks_r5nf(
                 geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
             )
         else:
@@ -146,6 +160,13 @@ class V3ConvergedModel(nn.Module):
                 geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
             )
             masked, _ = token_flags_r5(grid, masks)
+        elif self.no_fusion:  # v3r5nf two-band grid + independent per-stream mask flags
+            grid = build_r5nf_grid(geom, n_time=n_time)
+            parcel_packed = parcel_id[grid.contact]
+            masks = sample_masks_r5nf(
+                geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
+            )
+            masked, _ = token_flags_r5nf(grid, masks)
         else:
             grid = build_r4_grid(geom, n_time=n_time)
             parcel_packed = parcel_id[grid.contact]

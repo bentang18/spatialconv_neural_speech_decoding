@@ -159,15 +159,13 @@ def test_mae_taps_split_recon_into_hga_and_lfs() -> None:
     assert not any(k.startswith("jepa_slow") or k.startswith("jepa_mid") for k in out.taps)
     hga, lfs = float(out.taps["mae_hga"]), float(out.taps["mae_lfs"])
     loss = float(out.loss.detach())
-    n_hga, n_lfs = EARLY_FUSION_BINS  # (4, 1)
-    recombined = (n_hga * EARLY_FUSION_DECIMATE * hga + n_lfs * EARLY_FUSION_DECIMATE * lfs) / DEC_C
+    # each tap is the stream's CONTRIBUTION to the training loss ⇒ they add up to it directly.
     ok = (
         hga >= 0.0 and lfs >= 0.0
-        and abs(recombined - loss) < 1e-5  # split recomposes the training loss
+        and abs((hga + lfs) - loss) < 1e-5  # displayed split IS the optimized loss
     )
-    print(f"[check] recon split: mae_hga={hga:.4f} mae_lfs={lfs:.4f}; "
-          f"(8·hga+2·lfs)/10={recombined:.4f} == loss={loss:.4f} "
-          f"{'OK' if ok else 'VIOLATED'}")
+    print(f"[check] recon split: mae_hga={hga:.4f} + mae_lfs={lfs:.4f} = {hga + lfs:.4f} "
+          f"== loss={loss:.4f} {'OK' if ok else 'VIOLATED'}")
     assert ok
 
 

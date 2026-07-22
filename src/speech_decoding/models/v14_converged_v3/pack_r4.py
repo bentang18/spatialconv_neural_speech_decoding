@@ -353,3 +353,78 @@ def token_flags_r5(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
     temporal_masked = masks.temporal_mask[:, grid.shaft, grid.bandpos]  # (B, total)
     masked = contact_masked | temporal_masked
     return masked, masked
+
+
+# ── v3r5nf (no-fusion) two stride-1 bands + per-stream accept-the-bleed flags ─────
+def build_r5nf_grid(
+    geom: L1Geometry, *, n_time: int, max_seqlen: int | None = None
+) -> R4Grid:
+    """v3r5nf flat full-grid — TWO bands (0=HGA, 1=LFS), BOTH stride-1 @32 Hz.
+
+    The v3r5nf stem (``NoFusionStem``) emits TWO token streams at 32 Hz (T tokens each per
+    contact), so the grid is the two-band case with BOTH bands at stride 1: ``band_lengths ==
+    (T, T)``, ``k_full == 2T``, ``bandpos == time_pos == token index within band`` (stride 1),
+    both HGA and LFS at a given (contact, frame) sharing the SAME lattice position (band embed
+    the only distinguisher). Token order per contact is band-major HGA then LFS: ``[HGA 0..T-1,
+    LFS 0..T-1]`` — the same shaft-major / canonical-contact / band-major layout as
+    ``build_r4_grid``. The R4Grid contract is unchanged so pack/pe/encoder are byte-identical.
+
+    ``max_seqlen`` is a per-session CONSTANT; pass the cached value to skip its ``.item()``
+    host sync (compiled path). ``None`` ⇒ derive here (one sync — standalone fallback)."""
+    device = geom.gather_idx.device
+    S, max_c = geom.n_shafts, geom.max_c
+    T = int(n_time)
+    lengths = (T, T)  # (HGA, LFS) both stride-1 @32 Hz
+    k_full = 2 * T
+
+    # canonical (shaft-major, slot) contact order — same as build_r4_grid.
+    rows = torch.arange(S, device=device)[:, None].expand(S, max_c)[geom.valid]  # (N,)
+    canon = geom.gather_idx[geom.valid]  # (N,) contact index into N
+    depth_canon = geom.depth[geom.valid]  # (N,) clinical depth
+    n = int(canon.shape[0])
+
+    # per-contact block: band-major [HGA 0..T-1, LFS 0..T-1], both stride 1.
+    band_blk = torch.cat(
+        [torch.full((T,), b, dtype=torch.long, device=device) for b in range(2)]
+    )  # (2T,)
+    pos_blk = torch.cat([torch.arange(T, device=device) for _ in range(2)])  # (2T,)
+
+    depth = depth_canon.repeat_interleave(k_full)
+    contact = canon.repeat_interleave(k_full)
+    shaft = rows.repeat_interleave(k_full)
+    band = band_blk.repeat(n)
+    bandpos = pos_blk.repeat(n)
+    time_pos = pos_blk.repeat(n)  # stride 1 ⇒ lattice position == token index
+
+    n_per_shaft = geom.valid.sum(dim=1).to(torch.long)  # (S,)
+    seg = (n_per_shaft * k_full).to(torch.int32)  # (S,)
+    cu = torch.zeros(S + 1, dtype=torch.int32, device=device)
+    cu[1:] = seg.cumsum(0).to(torch.int32)
+    if max_seqlen is None:
+        max_seqlen = int((n_per_shaft.max() * k_full).item())
+
+    return R4Grid(
+        depth=depth, time_pos=time_pos, contact=contact, band=band, bandpos=bandpos,
+        shaft=shaft, cu_seqlens=cu, cu_seqlens_drop=_drop_offsets(cu),
+        max_seqlen=max_seqlen, total=n * k_full, k_full=k_full, band_lengths=lengths,
+    )
+
+
+def token_flags_r5nf(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
+    """(masked, in_loss) each (B, total) bool for the v3r5nf two-band grid.
+
+    ACCEPT THE BLEED (``in_loss == masked``, no margin gate — the M14 gate is r4-only). Each
+    stream masked INDEPENDENTLY: a token is masked iff its CONTACT is spatially masked OR its
+    OWN SHAFT's temporal mask covers its ``bandpos``, using that token's stream's fields.
+    ``masks`` (``masking.V3MasksR5NF``): {hga,lfs}_contact_mask (B, N), {hga,lfs}_temporal_mask
+    (B, S, T). Compile-safe per-stream select over the flat grid (no data-dependent gather):
+    compute BOTH streams then ``where`` by band. Returns the same tensor for both flags."""
+    hga_c = masks.hga_contact_mask[:, grid.contact]  # (B, total)
+    lfs_c = masks.lfs_contact_mask[:, grid.contact]  # (B, total)
+    hga_t = masks.hga_temporal_mask[:, grid.shaft, grid.bandpos]  # (B, total)
+    lfs_t = masks.lfs_temporal_mask[:, grid.shaft, grid.bandpos]  # (B, total)
+    is_hga = (grid.band == 0)[None]  # (1, total)
+    contact_masked = torch.where(is_hga, hga_c, lfs_c)
+    temporal_masked = torch.where(is_hga, hga_t, lfs_t)
+    masked = contact_masked | temporal_masked
+    return masked, masked

@@ -74,12 +74,15 @@ class V3MaskConfig:
     slow_mask_frac: float = 0.50  # SLOW masked on its 4 Hz grid (Ben 2026-07-15: 50%, first-class band).
     block_w_band: int = 4  # leak-safe block width in a band's OWN tokens (M14 margin 2); same all 3.
     temporal_mask_frac: float = 0.50  # r5 ONLY: single early-fused 32 Hz grid masked (T7-tunable).
-    # r5 temporal block width (tokens) on the 32 Hz grid. 6 tokens = 187.5 ms (Ben 2026-07-22,
-    # "150-200 ms range"). Accept-the-bleed ⇒ NO leak floor (unlike block_w_band's M14 margin);
-    # width is a task-difficulty knob. Frontend RF = 5 frames = ±1 token, so a width-W block
-    # leaks only at its 2 edges (interior W-2 tokens fully clean) — edge share 2/W = 33% at W=6.
+    # r5 temporal block width (tokens) on the 32 Hz grid. 5 tokens = 156 ms FLOOR; overlap
+    # (_cover_rank) lifts the mean masked run to ~190 ms (Ben 2026-07-22, τ-anchored not speech-
+    # matched: our LFS first-zero is 83 ms, so a 5-wide block's ~95 ms half-width clears the
+    # predictability horizon with margin — deliberately SHORTER than speech's 200 ms base span
+    # because our signal decorrelates faster than phonemes). Accept-the-bleed ⇒ NO leak floor
+    # (unlike block_w_band's M14 margin); width is a task-difficulty knob. Frontend RF = 5 frames
+    # = ±1 token, so a width-W block leaks only at its 2 edges (interior W-2 clean; 40% at W=5).
     # T7 τ-autocorr may retune. Separate from block_w_band so r4 stays byte-identical.
-    temporal_block_w: int = 6
+    temporal_block_w: int = 5
 
 
 @dataclass(frozen=True)
@@ -311,11 +314,111 @@ def sample_masks_r5(
     # L1-only shaft-local ⇒ each shaft is its own axiom: give every (row, shaft) its OWN
     # contiguous-block temporal mask, not one shared across the pack's shafts. Shape-neutral —
     # cnt is identical per shaft, so m_vis = (T−cnt)·Σ(visible contacts) is unchanged; only
-    # WHICH timepoints a shaft hides differs. width = temporal_block_w (6 = 187.5 ms @ 32 Hz);
-    # accept-the-bleed ⇒ no margin gate downstream.
+    # WHICH timepoints a shaft hides differs. width = temporal_block_w (5 = 156 ms floor @ 32 Hz,
+    # ~190 ms mean run after overlap); accept-the-bleed ⇒ no margin gate downstream.
     ones = torch.ones(s, t, dtype=torch.bool, device=dev)
     cover = _cover_rank(ones, cfg.temporal_block_w, r, generator)  # (R, S, T)
     cnt = round(cfg.temporal_mask_frac * t)
     temporal_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, S, T) exactly cnt per (row, shaft)
 
     return V3MasksR5(contact_mask=contact_mask, temporal_mask=temporal_mask)
+
+
+# ── v3r5nf (no-fusion): two INDEPENDENT r5-style masks, one per stream ────────────
+@dataclass(frozen=True)
+class V3MasksR5NF:
+    """v3r5nf masks — TWO independent r5-style masks, one per separated stream.
+
+    v3r5nf splits the r5 early-fused token into TWO token streams (HGA, LFS), each masked
+    INDEPENDENTLY: 4 fields, the SAME per-shaft balanced SPACE + per-shaft temporal TIME tier
+    as ``V3MasksR5`` but drawn SEPARATELY for HGA and LFS (sequential draws from the same
+    generator ⇒ independent realizations, identical fractions). Consequence (intended): HGA(e,
+    t) can be masked while LFS(e, t) is visible. Per-shaft-balanced space ⇒ each stream's
+    masked count is a per-session constant, so static shapes hold exactly as in r5."""
+
+    hga_contact_mask: Tensor  # (R, N) bool — spatially masked contact, HGA stream.
+    hga_temporal_mask: Tensor  # (R, S, T) bool — per-shaft HGA temporal mask.
+    lfs_contact_mask: Tensor  # (R, N) bool — spatially masked contact, LFS stream.
+    lfs_temporal_mask: Tensor  # (R, S, T) bool — per-shaft LFS temporal mask.
+
+
+def _sample_r5_space_time(
+    geom: L1Geometry,
+    n_contacts: int,
+    *,
+    n_time: int,
+    n_rows: int,
+    generator: torch.Generator,
+    cfg: V3MaskConfig,
+) -> tuple[Tensor, Tensor]:
+    """One r5-style (contact_mask (R,N), temporal_mask (R,S,T)) draw — a faithful copy of
+    :func:`sample_masks_r5`'s body, kept SEPARATE so the locked r5 sampler is untouched.
+
+    ``sample_masks_r5nf`` calls this TWICE (HGA then LFS): consecutive draws from the SAME
+    generator give independent realizations at identical fractions."""
+    r, s, c = n_rows, geom.n_shafts, geom.max_c
+    n, t = n_contacts, n_time
+    valid = geom.valid  # (S, C)
+    dev = valid.device
+    cs = valid.sum(1)  # (S,)
+
+    def rand(*shape: int) -> Tensor:
+        return torch.rand(*shape, generator=generator, device=dev)
+
+    # ── SPACE (per-shaft balanced) — same tier as sample_masks / sample_masks_r5 ──
+    d_s_base = torch.round(cfg.space_frac * cs.float()).long()
+    if cfg.keep_alive:
+        d_s_base = torch.minimum(d_s_base, (cs - 1).clamp(min=0))
+    d = d_s_base.sum()
+    k_max = _k_max(cs, d)
+    k = (rand(r, s) < cfg.whole_shaft_frac).sum(1).clamp(max=k_max)  # (R,)
+    ws_rank = rand(r, s).argsort(1).argsort(1)  # (R, S)
+    whole = ws_rank < k[:, None]  # (R, S)
+    d_s = torch.where(whole, cs[None].expand(r, s), d_s_base[None].expand(r, s))
+
+    cover_space = _cover_rank(valid, cfg.block_w_space, r, generator)  # (R, S, C)
+    key = cover_space + rand(r, s, c)
+    within_rank = key.argsort(-1).argsort(-1)  # (R, S, C)
+    grid_mask = within_rank < d_s[:, :, None]  # (R, S, C) exactly d_s per (row, shaft)
+
+    vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,)
+    vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,)
+    contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
+    contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
+
+    # ── TIME (per-shaft INDEPENDENT 32 Hz masks) — same tier as sample_masks_r5 ──
+    ones = torch.ones(s, t, dtype=torch.bool, device=dev)
+    cover = _cover_rank(ones, cfg.temporal_block_w, r, generator)  # (R, S, T)
+    cnt = round(cfg.temporal_mask_frac * t)
+    temporal_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, S, T) exactly cnt per (row, shaft)
+
+    return contact_mask, temporal_mask
+
+
+def sample_masks_r5nf(
+    geom: L1Geometry,
+    n_contacts: int,
+    *,
+    n_time: int,
+    n_rows: int,
+    generator: torch.Generator,
+    cfg: V3MaskConfig = V3MaskConfig(),
+) -> V3MasksR5NF:
+    """Sample ``n_rows`` v3r5nf masks: TWO independent r5-style masks (HGA then LFS).
+
+    Each stream gets the SAME per-shaft balanced SPACE + per-shaft temporal TIME tier as
+    ``sample_masks_r5``, drawn SEPARATELY (sequential draws from the one generator ⇒
+    independent realizations, identical fractions ⇒ HGA(e,t) can be masked while LFS(e,t) is
+    visible). Both streams' masked counts stay per-session constants (per-shaft balanced)."""
+    hga_contact, hga_temporal = _sample_r5_space_time(
+        geom, n_contacts, n_time=n_time, n_rows=n_rows, generator=generator, cfg=cfg
+    )
+    lfs_contact, lfs_temporal = _sample_r5_space_time(
+        geom, n_contacts, n_time=n_time, n_rows=n_rows, generator=generator, cfg=cfg
+    )
+    return V3MasksR5NF(
+        hga_contact_mask=hga_contact,
+        hga_temporal_mask=hga_temporal,
+        lfs_contact_mask=lfs_contact,
+        lfs_temporal_mask=lfs_temporal,
+    )

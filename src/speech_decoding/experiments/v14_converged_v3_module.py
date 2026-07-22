@@ -165,10 +165,13 @@ class V14ConvergedV3Module(pl.LightningModule):
             # bands[0].shape[-1] != T for those frontends. Derive T the same way the model's
             # forward does (clock_length_32hz) or session_plan grids a mis-sized T and m_vis
             # overflows the visible pack (arm0 works only because SLOW is already at 32 Hz).
+            # v3r5nf rides the SAME 2×64 Hz caches as r5 ⇒ MUST thread no_fusion too, else T
+            # comes back 2T (the arm0 branch) and m_vis overflows exactly like the 07-22 bug.
             n_time = clock_length_32hz(
                 batch.bands,
                 native_fine_hga=self.model.native_fine_hga,
                 early_fusion=self.model.early_fusion,
+                no_fusion=self.model.no_fusion,
             )
             plan = self.model.session_plan(batch.geom, batch.parcel_id, n_time)
             if not is_pack:

@@ -43,12 +43,32 @@ from torch import Tensor
 from speech_decoding.experiments.monitors.grad_spike import grad_spike_monitor
 from speech_decoding.experiments.monitors.teacher_rank import teacher_rank_monitor
 
+# The named trainable towers whose per-group update-to-weight ratio we track. ``online`` =
+# stem+encoder, ``predictor`` = predictor tower, ``mae_head`` = the r5 MAE linear recon decoder
+# (None on non-r5 arms ⇒ skipped). Under AdamW raw grad-L2 is scale-free w.r.t. the effective
+# step, so ``‖Δθ‖/‖θ‖`` (target ≈1e-3) is the genuinely-informative LR-health readout — per
+# group so a frozen (→0) or runaway (≫1e-2) tower shows even when the global looks fine.
+_ROUTING_GROUPS: tuple[str, ...] = ("online", "predictor", "mae_head")
+
+
+def _group(pl_module: pl.LightningModule, name: str):
+    obj = getattr(pl_module.model, "objective", None)
+    if obj is None:
+        return None
+    return {
+        "online": getattr(obj, "online", None),
+        "predictor": getattr(obj, "predictor", None),
+        "mae_head": getattr(obj, "mae_head_r5", None),
+    }.get(name)
+
 
 class SSLHealthMonitorV3(pl.Callback):
     def __init__(self, *, every_n_steps: int = 1) -> None:
         super().__init__()
         self.every_n_steps = max(int(every_n_steps), 1)
         self._grad_ema_l2: float = 0.0
+        # θ snapshot taken at a cadence step, read one step later to form the single-step Δθ.
+        self._update_snapshot: dict[str, list[Tensor]] | None = None
 
     def _due(self, step: int) -> bool:
         return step % self.every_n_steps == 0
@@ -58,6 +78,9 @@ class SSLHealthMonitorV3(pl.Callback):
         self, trainer: pl.Trainer, pl_module: pl.LightningModule, optimizer
     ) -> None:
         step = int(pl_module.global_step)
+        # update-to-weight ratio spans ONE optimizer step: snapshot θ at a cadence step, read
+        # Δθ on the next call. Runs every step (the read is a no-op until a snapshot exists).
+        self._maybe_log_true_update_ratio(pl_module, step)
         if not self._due(step):
             return
         grad_sq = torch.zeros((), dtype=torch.float32)
@@ -74,6 +97,19 @@ class SSLHealthMonitorV3(pl.Callback):
         pl_module.log(
             "train_mon_grad_spike", 1.0 if verdict.is_spike else 0.0, on_step=True
         )
+        # clip-hit tracker: does the pre-clip norm exceed the ``gradient_clip_val`` rail (3.0)?
+        # ``clip_hit`` is 0/1 on the cadence step (its wandb mean = the sampled clip-hit RATE — an
+        # unbiased estimate, each cadence step a fair Bernoulli draw); ``clip_ratio`` = grad_l2 /
+        # clip_val is the continuous headroom (≥1 ⇒ clip fired). Skipped when clipping is off.
+        clip_val = float(getattr(trainer, "gradient_clip_val", 0.0) or 0.0)
+        if clip_val > 0.0:
+            pl_module.log(
+                "train_mon_grad_clip_hit",
+                1.0 if verdict.grad_l2 > clip_val else 0.0, on_step=True,
+            )
+            pl_module.log(
+                "train_mon_grad_clip_ratio", verdict.grad_l2 / clip_val, on_step=True
+            )
         gap = self._ema_weight_gap(pl_module)
         if gap is not None:
             pl_module.log("train_mon_ema_weight_gap", gap, on_step=True)
@@ -92,6 +128,41 @@ class SSLHealthMonitorV3(pl.Callback):
             num = num + (s - pt.detach().to(torch.float32)).pow(2).sum()
             den = den + s.pow(2).sum()
         return float((num.sqrt() / (den.sqrt() + 1e-12)).item())
+
+    def _maybe_log_true_update_ratio(
+        self, pl_module: pl.LightningModule, step: int
+    ) -> None:
+        """Per-group ``‖Δθ‖₂/‖θ_prev‖₂`` over ONE optimizer step — the AdamW effective-step
+        readout (target ≈1e-3). Snapshot θ at a cadence step; on the next call the params have
+        moved by exactly one ``optimizer.step()``, so the diff is the true single-step update."""
+        snap = self._update_snapshot
+        if snap is not None:
+            for name in _ROUTING_GROUPS:
+                prev = snap.get(name)
+                mod = _group(pl_module, name)
+                if prev is None or mod is None:
+                    continue
+                delta_sq = torch.zeros((), dtype=torch.float32)
+                base_sq = torch.zeros((), dtype=torch.float32)
+                for p_now, p_prev in zip(mod.parameters(), prev):
+                    a = p_now.detach().to(torch.float32)
+                    b = p_prev.to(torch.float32)
+                    delta_sq = delta_sq + (a - b).pow(2).sum()
+                    base_sq = base_sq + b.pow(2).sum()
+                bn = float(base_sq.sqrt().item())
+                if bn > 0.0:
+                    pl_module.log(
+                        f"train_mon_true_update_ratio_{name}",
+                        float(delta_sq.sqrt().item()) / (bn + 1e-12),
+                        on_step=True,
+                    )
+            self._update_snapshot = None
+        if self._due(step):
+            self._update_snapshot = {
+                name: [p.detach().clone() for p in mod.parameters()]
+                for name in _ROUTING_GROUPS
+                if (mod := _group(pl_module, name)) is not None
+            }
 
     # ------------------------------------------------------------- Family B (taps)
     @torch.no_grad()
@@ -121,6 +192,13 @@ class SSLHealthMonitorV3(pl.Callback):
         self._log_scalar_taps(pl_module, taps)
 
     _BAND_NAMES: tuple[str, ...] = ("slow", "mid", "hga")
+    _BAND_NAMES_R5: tuple[str, ...] = ("hga", "lfs")  # r5 early-fusion input caches, in arg order
+
+    def _band_names(self, pl_module: pl.LightningModule) -> tuple[str, ...]:
+        obj = getattr(pl_module.model, "objective", None)
+        if obj is not None and getattr(obj, "early_fusion", False):
+            return self._BAND_NAMES_R5
+        return self._BAND_NAMES
 
     def _input_tripwire(self, pl_module: pl.LightningModule, batch) -> None:
         """Per-band raw-input |STFT| token health (the v3 3-band analog of r2's
@@ -130,7 +208,7 @@ class SSLHealthMonitorV3(pl.Callback):
         bands = getattr(batch, "bands", None)
         if not bands:
             return
-        for x, name in zip(bands, self._BAND_NAMES):
+        for x, name in zip(bands, self._band_names(pl_module)):
             x = x.detach().to(torch.float32)
             prefix = f"train_mon_input_{name}_"
             # Single-pass reductions only — NO boolean-mask allocation (the costly part).

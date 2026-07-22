@@ -43,20 +43,25 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
     VisiblePack,
     build_r4_grid,
     build_r5_grid,
+    build_r5nf_grid,
     build_visible_pack,
     pack_band_tokens,
     scatter_visible,
     token_flags,
     token_flags_r5,
+    token_flags_r5nf,
 )
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import (
     EARLY_FUSION_BINS,
     EARLY_FUSION_CHANNELS,
     EARLY_FUSION_DECIMATE,
+    NOFUSION_BINS,
+    NOFUSION_DECIMATE,
     PER_BAND_SPECS,
     EarlyFusionStem,
     FineHgaStem,
+    NoFusionStem,
     PerBandStem,
     clock_length_32hz,
 )
@@ -124,6 +129,7 @@ class _TargetTower(nn.Module):
         deep_sup: bool = True,
         native_fine_hga: bool = False,
         early_fusion: bool = False,
+        no_fusion: bool = False,
     ) -> None:
         super().__init__()
         # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
@@ -131,11 +137,17 @@ class _TargetTower(nn.Module):
         # Same (tokens, positions) contract + same 32Hz output lattice, so masking/pack/
         # pe/encoder are byte-identical (memo project-fine-hga-bt-rebake-tasklist-2026-07-21).
         # early_fusion (r5): the Chang 2-stream EarlyFusionStem — HGA⊕LFS → ONE 32Hz token
-        # stream (a degenerate single-band grid). Mutually exclusive with native_fine_hga.
-        if early_fusion and native_fine_hga:
-            raise ValueError("early_fusion and native_fine_hga are mutually exclusive")
+        # stream (a degenerate single-band grid). no_fusion (v3r5nf): the same 2 streams but
+        # NOT fused — NoFusionStem emits TWO 32Hz token streams (a two-band grid). At most one
+        # of the three is set (mutually exclusive).
+        if int(early_fusion) + int(native_fine_hga) + int(no_fusion) > 1:
+            raise ValueError(
+                "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
+            )
         if early_fusion:
             self.stem = EarlyFusionStem(D_MODEL)
+        elif no_fusion:
+            self.stem = NoFusionStem(D_MODEL)
         elif native_fine_hga:
             self.stem = FineHgaStem(D_MODEL)
         else:
@@ -173,22 +185,40 @@ class V3JepaObjective(nn.Module):
         mae: bool = False,
         native_fine_hga: bool = False,
         early_fusion: bool = False,
+        no_fusion: bool = False,
+        mae_stream_weight: str = "equal",
     ) -> None:
         super().__init__()
         self.native_fine_hga = bool(native_fine_hga)
         # early_fusion (r5, Chang 2-stream): EarlyFusionStem + single-band stride-1 grid
         # (build_r5_grid) + single temporal mask + accept-the-bleed scoring (token_flags_r5,
-        # in_loss == masked). Objective stays swappable (JEPA-latent OR MAE-recon). Mutually
-        # exclusive with native_fine_hga. Memo: project-r5-config-canonical-2026-07-21.
+        # in_loss == masked). Objective stays swappable (JEPA-latent OR MAE-recon).
         self.early_fusion = bool(early_fusion)
-        if self.early_fusion and self.native_fine_hga:
-            raise ValueError("early_fusion and native_fine_hga are mutually exclusive")
+        # no_fusion (v3r5nf): r5-fused's fully-separated sibling — NoFusionStem (2 stems) +
+        # two-band stride-1 grid (build_r5nf_grid) + INDEPENDENT per-stream masks
+        # (sample_masks_r5nf) + accept-the-bleed scoring (token_flags_r5nf). MAE-ONLY (raw-frame
+        # per-stream recon, pooled ⇒ 4:1 HGA:LFS); JEPA-nf is deferred.
+        self.no_fusion = bool(no_fusion)
+        if int(self.early_fusion) + int(self.native_fine_hga) + int(self.no_fusion) > 1:
+            raise ValueError(
+                "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
+            )
+        # v3r5nf loss weighting (Ben 07-22): "equal" (1:1, NEW DEFAULT) averages the two
+        # per-stream MEAN-MSEs ⇒ each stream 50% of the gradient regardless of feat count,
+        # invariant to HGA's arbitrary bin granularity; "pooled" (4:1) sums per-channel SE over
+        # both streams ⇒ HGA:LFS = 4:1 (matches r5-fused). Only bites the no_fusion MAE path.
+        if mae_stream_weight not in ("equal", "pooled"):
+            raise ValueError(f"mae_stream_weight must be equal|pooled, got {mae_stream_weight!r}")
+        self.mae_stream_weight = mae_stream_weight
         # MAE arm (Masked Autoencoder target, He 2021 / AudioMAE): the ONLY change vs the
         # JEPA arm is the prediction TARGET — reconstruct this token's OWN norm_pix'd input
         # |STFT| bins instead of the EMA-teacher latent. No EMA teacher. Everything upstream
         # (visible-only encoder, predictor, mask query, margin-gated in_loss, all locked HPs)
         # is byte-identical to the JEPA arm.
         self.mae = bool(mae)
+        # v3r5nf is MAE-only (per-stream raw-frame reconstruction); JEPA-nf is deferred.
+        if self.no_fusion and not self.mae:
+            raise ValueError("v3r5nf is MAE-only")
         self.deep_sup = bool(deep_sup)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         # online target path (stem + encoder) — every param here is EMA-mirrored (JEPA arm).
@@ -196,6 +226,7 @@ class V3JepaObjective(nn.Module):
             n_parcels=n_parcels, deep_sup=self.deep_sup,
             native_fine_hga=self.native_fine_hga,
             early_fusion=self.early_fusion,
+            no_fusion=self.no_fusion,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
@@ -221,7 +252,24 @@ class V3JepaObjective(nn.Module):
         self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
         if self.mae:
             self.pred_to_target = None
-            if self.early_fusion:
+            if self.no_fusion:
+                # v3r5nf MAE decoder = TWO independent Linear heads, one per SEPARATED stream:
+                # HGA reconstructs its own DEC(2)·4 raw 64 Hz values, LFS its own DEC(2)·1. No
+                # per-token norm_pix; the loss POOLS per-channel MSE over all masked tokens both
+                # streams ⇒ HGA:LFS = 4:1 in expectation (equal masked counts × 8 vs 2 feats).
+                self.mae_head_hga = nn.Linear(PRED_D_MODEL, NOFUSION_DECIMATE * NOFUSION_BINS[0])
+                self.mae_head_lfs = nn.Linear(PRED_D_MODEL, NOFUSION_DECIMATE * NOFUSION_BINS[1])
+                init_transformer_weights(self.mae_head_hga)
+                init_transformer_weights(self.mae_head_lfs)
+                self.mae_head_r5 = None
+                self.mae_heads = None
+                # per-stream band identity ADDED to the mask QUERY (predictor space, d_pred =
+                # PRED_D_MODEL) — a SEPARATE param from the stem's 256-dim band_type_emb. Lets
+                # the predictor tell apart two co-located masked queries (HGA vs LFS at the same
+                # RoPE position) that must predict different targets.
+                self.mask_band_emb = nn.Parameter(torch.empty(2, PRED_D_MODEL))
+                nn.init.trunc_normal_(self.mask_band_emb, std=0.02)
+            elif self.early_fusion:
                 # r5 MAE decoder_pred = ONE Linear(d_pred → DEC·C) reconstructing this token's
                 # OWN 2 raw 64 Hz frames × 5 fused channels (10 values). Plain per-channel MSE
                 # on the load-time z-scored channels ⇒ 4:1 HGA:LFS by construction, NO per-token
@@ -278,7 +326,8 @@ class V3JepaObjective(nn.Module):
         VISIBLE-cell tap (rankme / feat_std).
         """
         T = clock_length_32hz(
-            bands, native_fine_hga=self.native_fine_hga, early_fusion=self.early_fusion
+            bands, native_fine_hga=self.native_fine_hga, early_fusion=self.early_fusion,
+            no_fusion=self.no_fusion,
         )  # 32 Hz clock
         # grid_max_seqlen / m_vis / pack_max_seqlen are per-session Python-int shape constants
         # (the module caches them via ``V3ConvergedModel.session_plan`` and passes them in);
@@ -289,6 +338,10 @@ class V3JepaObjective(nn.Module):
             grid = build_r5_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
             parcel_packed = parcel_id[grid.contact]
             masked, in_loss = token_flags_r5(grid, masks)  # (B, total) bool; in_loss == masked
+        elif self.no_fusion:
+            grid = build_r5nf_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
+            parcel_packed = parcel_id[grid.contact]
+            masked, in_loss = token_flags_r5nf(grid, masks)  # (B, total); in_loss == masked
         else:
             grid = build_r4_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
             parcel_packed = parcel_id[grid.contact]  # (total,) long
@@ -318,8 +371,25 @@ class V3JepaObjective(nn.Module):
         pred_in = scatter_visible(
             self.enc_to_pred(z), pack.idx, grid.total, self.mask_token
         )  # (B, total, 128)
+        # v3r5nf: HGA and LFS tokens at the SAME (contact, 32Hz-pos) share IDENTICAL RoPE
+        # (same time_pos + depth), and independent masking can hide both at once — two
+        # co-located masked queries would be byte-identical predictor inputs forced to predict
+        # DIFFERENT targets, distinguishable only at the final head. Add a per-stream band
+        # identity to the mask QUERY (predictor space, d_pred) so the predictor separates them
+        # from block 1. Masked slots only (masked_f=0 leaves visible slots byte-unchanged); r4/r5
+        # arms never enter this branch.
+        if self.no_fusion:
+            band_q = self.mask_band_emb[grid.band]  # (total, PRED_D_MODEL)
+            masked_f = masked.unsqueeze(-1).to(pred_in.dtype)  # (B, total, 1)
+            pred_in = pred_in + masked_f * band_q[None]  # visible slots unchanged
         h = self.predictor.forward_flat(pred_in, grid, parcel_packed)  # (B, total, 128)
         if self.mae:
+            if self.no_fusion:
+                return self._mae_output_r5nf(
+                    bands, grid, h, in_loss,
+                    enc_taps=enc_taps if collect_taps else None,
+                    collect_taps=collect_taps,
+                )
             if self.early_fusion:
                 return self._mae_output_r5(
                     bands, grid, h, in_loss,
@@ -445,18 +515,21 @@ class V3JepaObjective(nn.Module):
                 ))
                 # HGA-vs-LFS recon split (LOG-ONLY monitor). The DEC·C target lays out each of
                 # the DEC frames as [HGA₀..₃, LFS] (EARLY_FUSION_BINS = (4, 1)), so channels
-                # [:4] are the 4 HGA |STFT| bins (combined) and [4:] the LFS raw. Report each as
-                # its own masked-mean MSE; the TRAINING loss stays mean-over-10 (4:1 HGA:LFS by
-                # channel count) UNCHANGED. Invariant: mae_loss == (4·2·mae_hga + 1·2·mae_lfs)/10.
+                # [:4] are the 4 HGA |STFT| bins (combined) and [4:] the LFS raw. Each stream's
+                # tap is its CONTRIBUTION to the training loss — the group's squared errors summed
+                # and divided by the FULL DEC·C (not the group count), so the displayed split adds
+                # up to the optimized loss. Invariant: mae_hga + mae_lfs == mae_loss (the 4:1
+                # HGA:LFS dominance is visible directly in the two summands, not a hidden reweight).
                 n_hga = EARLY_FUSION_BINS[0]
                 se_f = se.reshape(
                     se.shape[0], se.shape[1], EARLY_FUSION_DECIMATE, EARLY_FUSION_CHANNELS
                 )
                 denom = w.sum().clamp(min=1.0)
-                hga_se = se_f[..., :n_hga].mean((-2, -1))  # (B, total) over DEC frames × 4 HGA
-                lfs_se = se_f[..., n_hga:].mean((-2, -1))  # (B, total) over DEC frames × 1 LFS
-                taps["mae_hga"] = (hga_se * w).sum() / denom
-                taps["mae_lfs"] = (lfs_se * w).sum() / denom
+                dc = EARLY_FUSION_DECIMATE * EARLY_FUSION_CHANNELS  # 10 = training-loss denominator
+                hga_c = se_f[..., :n_hga].sum((-2, -1)) / dc  # HGA share of the 10-value token mean
+                lfs_c = se_f[..., n_hga:].sum((-2, -1)) / dc  # LFS share
+                taps["mae_hga"] = (hga_c * w).sum() / denom
+                taps["mae_lfs"] = (lfs_c * w).sum() / denom
         return JepaOutput(
             loss=mae_loss,
             n_masked=w.sum().detach(),
@@ -480,6 +553,116 @@ class V3JepaObjective(nn.Module):
         lin0 = grid.contact * L + EARLY_FUSION_DECIMATE * grid.time_pos  # (total,) frame DEC·p
         frames = [ft[:, lin0 + f, :] for f in range(EARLY_FUSION_DECIMATE)]  # DEC × (B, total, 5)
         return torch.stack(frames, dim=2).reshape(B, grid.total, EARLY_FUSION_DECIMATE * C)
+
+    # ── v3r5nf MAE arm (no-fusion per-stream raw-frame reconstruction) ────────────
+    def _mae_gather_target_r5nf(
+        self, bands: Sequence[Tensor], grid: R4Grid
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Gather each token's OWN DEC(2) raw 64 Hz frames of its OWN stream → padded
+        (B, total, F_MAX=8) + (feat_valid, feat_count).
+
+        ``bands`` = (HGA (B,N,4,L), LFS (B,N,1,L)) at 64 Hz frames (L = 2T), robust-z'd at
+        load. Both streams computed over ALL tokens then selected by band (compile-safe, no
+        data-dependent gather), mirroring ``_mae_gather_target_r5``'s linear-index gather. A
+        token of (contact c, bandpos p) pooled 64→32 Hz from frames {DEC·p, DEC·p+1}. Value
+        layout per token = [frame0 ch0..C-1, frame1 ch0..C-1] (matches the head output). LFS is
+        zero-padded from DEC·1=2 to F_MAX=8; ``feat_valid`` marks each token's real feats,
+        ``feat_count`` = 8 (HGA) or 2 (LFS)."""
+        DEC = NOFUSION_DECIMATE
+        hga = bands[0]
+        B, N, Ch_h, L = hga.shape  # Ch_h = 4
+        hga_ft = hga.permute(0, 1, 3, 2).reshape(B, N * L, Ch_h)  # (B, N·L, 4)
+        lin_h = grid.contact * L + DEC * grid.bandpos  # (total,) frame DEC·p
+        hga_tgt = torch.stack(
+            [hga_ft[:, lin_h + f, :] for f in range(DEC)], dim=2
+        ).reshape(B, grid.total, DEC * Ch_h)  # (B, total, 8)
+
+        lfs = bands[1]
+        Ch_l = lfs.shape[2]  # 1
+        lfs_ft = lfs.permute(0, 1, 3, 2).reshape(B, N * L, Ch_l)  # (B, N·L, 1)
+        lfs_tgt = torch.stack(
+            [lfs_ft[:, lin_h + f, :] for f in range(DEC)], dim=2
+        ).reshape(B, grid.total, DEC * Ch_l)  # (B, total, 2)
+        lfs_tgt = F.pad(lfs_tgt, (0, DEC * Ch_h - DEC * Ch_l))  # → (B, total, 8)
+
+        is_hga = (grid.band == 0)[None, :, None]  # (1, total, 1)
+        target = torch.where(is_hga, hga_tgt, lfs_tgt)  # (B, total, 8)
+        f_max = DEC * Ch_h  # 8
+        feat_count = torch.where(
+            grid.band == 0,
+            torch.full_like(grid.band, DEC * Ch_h),
+            torch.full_like(grid.band, DEC * Ch_l),
+        )  # (total,) 8 or 2
+        feat_valid = (
+            torch.arange(f_max, device=grid.band.device)[None, :] < feat_count[:, None]
+        )  # (total, 8)
+        return target, feat_valid, feat_count
+
+    def _mae_pred_r5nf(self, h: Tensor, grid: R4Grid) -> Tensor:
+        """Per-stream reconstruction heads → (B, total, 8), selected per token by band.
+
+        Runs BOTH heads over every token (static shape) and selects by ``grid.band`` — the
+        compile-safe analogue of a per-stream boolean gather. LFS output (DEC·1=2) is zero-
+        padded to F_MAX=8 (the pad slots masked out of the loss by ``feat_valid``)."""
+        o_hga = self.mae_head_hga(h)  # (B, total, 8)
+        o_lfs = F.pad(self.mae_head_lfs(h), (0, NOFUSION_DECIMATE * NOFUSION_BINS[0]
+                                             - NOFUSION_DECIMATE * NOFUSION_BINS[1]))  # → 8
+        return torch.where((grid.band == 0)[None, :, None], o_hga, o_lfs)  # (B, total, 8)
+
+    def _mae_output_r5nf(
+        self,
+        bands: Sequence[Tensor],
+        grid: R4Grid,
+        h: Tensor,
+        in_loss: Tensor,
+        *,
+        enc_taps: dict[int, Tensor] | None,
+        collect_taps: bool,
+    ) -> JepaOutput:
+        """v3r5nf MAE loss: reconstruct each masked token's OWN DEC(2) raw 64 Hz frames of its
+        OWN stream (HGA 8 feats, LFS 2). Accept-the-bleed ``in_loss`` (== masked).
+
+        ``mae_stream_weight`` (Ben 07-22):
+        - ``equal`` (1:1, DEFAULT): average the two per-stream MEAN-MSEs (HGA = mean over its 8
+          feats then mean over masked HGA tokens; LFS likewise over its 2) ⇒ each stream is 50%
+          of the loss, invariant to HGA's arbitrary bin granularity, lifting LFS 20%→50%.
+        - ``pooled`` (4:1): SUM per-channel SE over all masked tokens both streams / total valid
+          channel count ⇒ HGA:LFS = 4:1 (matches r5-fused, 8 vs 2 valid feats at equal counts)."""
+        target, feat_valid, feat_count = self._mae_gather_target_r5nf(bands, grid)
+        pred = self._mae_pred_r5nf(h, grid)  # (B, total, 8); LFS pad slots = 0
+        target = target.to(pred.dtype)
+        w = in_loss.to(pred.dtype)  # (B, total) accept-the-bleed
+        fv = feat_valid[None].to(pred.dtype)  # (1, total, 8)
+        se_valid = (((pred - target) ** 2) * fv).sum(-1)  # (B, total) SUM over each token's feats
+        is_hga = (grid.band == 0).to(pred.dtype)[None]  # (1, total)
+        is_lfs = (grid.band == 1).to(pred.dtype)[None]  # (1, total)
+        w_hga, w_lfs = w * is_hga, w * is_lfs  # (B, total) per-stream masked weights
+        # per-stream mean-MSE: each token's SE ÷ its own feat_count (mean over its valid feats),
+        # then weighted-mean over that stream's masked tokens. Static shapes (no boolean gather).
+        tok_mean = se_valid / feat_count[None].to(pred.dtype)  # (B, total) mean over valid feats
+        mae_hga = (tok_mean * w_hga).sum() / w_hga.sum().clamp(min=1.0)
+        mae_lfs = (tok_mean * w_lfs).sum() / w_lfs.sum().clamp(min=1.0)
+        if self.mae_stream_weight == "equal":
+            mae_loss = 0.5 * (mae_hga + mae_lfs)  # 1:1, each stream 50%
+        else:  # pooled ⇒ 4:1 HGA:LFS by construction
+            denom = (feat_count[None].to(pred.dtype) * w).sum().clamp(min=1.0)
+            mae_loss = (se_valid * w).sum() / denom
+
+        taps = None
+        if collect_taps:
+            assert enc_taps is not None
+            d_enc = enc_taps[12].shape[-1]
+            taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
+            with torch.no_grad():
+                # log-only per-stream mean-MSE (the SAME per-token means, independent of the loss
+                # mode): reports each stream's raw reconstruction quality for the health monitor.
+                taps["mae_hga"] = mae_hga.detach()
+                taps["mae_lfs"] = mae_lfs.detach()
+        return JepaOutput(
+            loss=mae_loss,
+            n_masked=w.sum().detach(),
+            taps=taps,
+        )
 
     def _mae_gather_target(
         self, bands: Sequence[Tensor], grid: R4Grid

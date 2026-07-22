@@ -17,8 +17,13 @@ from speech_decoding.experiments.test_v14_converged_v3_module import (
 )
 
 
-def _fake_trainer(*, world_size: int = 1, accum: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(world_size=world_size, accumulate_grad_batches=accum)
+def _fake_trainer(
+    *, world_size: int = 1, accum: int = 1, grad_clip: float = 0.0
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        world_size=world_size, accumulate_grad_batches=accum,
+        gradient_clip_val=grad_clip,
+    )
 
 
 # ----------------------------------------------------------- collect_taps seam
@@ -76,6 +81,63 @@ def test_family_a_grad_and_ema_gap_keys() -> None:
     ):
         assert k in logged and logged[k] == logged[k]  # present + finite
     assert cb._grad_ema_l2 == logged["train_mon_grad_l2"]  # step-0 EMA seed
+
+
+def test_grad_clip_hit_tracker() -> None:
+    """With ``gradient_clip_val`` set, the monitor logs clip_hit (0/1) + clip_ratio
+    (grad_l2/clip); a huge clip is never hit, a tiny clip always is. Off when clip=0."""
+    mod = _module()
+    cb = SSLHealthMonitorV3(every_n_steps=1)
+    mod.training_step(_session_batch(n_rows=2), 0).backward()
+    logged: dict[str, float] = {}
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb.on_before_optimizer_step(
+        trainer=_fake_trainer(grad_clip=1e9), pl_module=mod, optimizer=None
+    )
+    assert logged["train_mon_grad_clip_hit"] == 0.0  # norm ≪ 1e9
+    assert logged["train_mon_grad_clip_ratio"] > 0.0
+    logged.clear()
+    cb.on_before_optimizer_step(
+        trainer=_fake_trainer(grad_clip=1e-9), pl_module=mod, optimizer=None
+    )
+    assert logged["train_mon_grad_clip_hit"] == 1.0  # norm ≫ 1e-9
+    # clipping off ⇒ no clip keys
+    logged.clear()
+    cb.on_before_optimizer_step(
+        trainer=_fake_trainer(grad_clip=0.0), pl_module=mod, optimizer=None
+    )
+    assert not any("grad_clip" in k for k in logged)
+
+
+def test_true_update_ratio_logged_after_one_step() -> None:
+    """Snapshot θ at a cadence step, take a real optimizer step, then the next
+    ``on_before_optimizer_step`` logs ``‖Δθ‖/‖θ‖`` per group (>0). First call logs
+    nothing (no prior snapshot); r5-only ``mae_head`` group is absent on this arm."""
+    mod = _module()
+    cb = SSLHealthMonitorV3(every_n_steps=1)
+    opt = torch.optim.SGD(mod.model.parameters(), lr=0.1)
+    mod.training_step(_session_batch(n_rows=2), 0).backward()
+    logged: dict[str, float] = {}
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb.on_before_optimizer_step(trainer=_fake_trainer(), pl_module=mod, optimizer=opt)
+    assert not any("true_update_ratio" in k for k in logged)  # nothing to diff yet
+    opt.step()  # move θ by exactly one update
+    logged.clear()
+    cb.on_before_optimizer_step(trainer=_fake_trainer(), pl_module=mod, optimizer=opt)
+    for name in ("online", "predictor"):
+        k = f"train_mon_true_update_ratio_{name}"
+        assert k in logged and logged[k] > 0.0, k
+
+
+def test_band_names_frontend_aware() -> None:
+    """r5 (early_fusion) input tripwire labels its two streams hga/lfs; r4 keeps
+    slow/mid/hga. A regression guard for the mislabel that read HGA as ``slow``."""
+    cb = SSLHealthMonitorV3()
+    def _mod(early: bool) -> SimpleNamespace:
+        return SimpleNamespace(model=SimpleNamespace(
+            objective=SimpleNamespace(early_fusion=early)))
+    assert cb._band_names(_mod(False)) == ("slow", "mid", "hga")
+    assert cb._band_names(_mod(True)) == ("hga", "lfs")
 
 
 def test_ema_weight_gap_zero_then_positive() -> None:

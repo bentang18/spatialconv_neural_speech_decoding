@@ -186,18 +186,23 @@ def clock_length_32hz(
     *,
     native_fine_hga: bool = False,
     early_fusion: bool = False,
+    no_fusion: bool = False,
 ) -> int:
     """The 32 Hz clip-clock length T from the input bands.
 
     Uniform arm0: SLOW is already at 32 Hz ⇒ T = SLOW.shape[-1]. Native fine-HGA: bands
     arrive at SLOW T/8, MID T/2, HGA 4T ⇒ derive from HGA (128 = 4·32, integer-exact) and
     assert all three agree, so a mis-shaped native cache fails loud instead of silently
-    mis-gridding. r5 early-fusion (EarlyFusionStem): 2 streams HGA/LFS both at 64 Hz = 2T
-    frames ⇒ T = HGA/2 (stem stride-2 decimate 64→32), assert LFS agrees. Both the masking
-    (model.py) and the grid (objective.py) call this so the two never disagree on T."""
-    if early_fusion and native_fine_hga:
-        raise ValueError("early_fusion and native_fine_hga are mutually exclusive")
-    if early_fusion:
+    mis-gridding. r5 early-fusion (EarlyFusionStem) AND v3r5nf no-fusion (NoFusionStem): 2
+    streams HGA/LFS both at 64 Hz = 2T frames ⇒ T = HGA/2 (stem stride-2 decimate 64→32),
+    assert LFS agrees (the derivation is IDENTICAL — both consume the same 2×64 Hz caches).
+    Both the masking (model.py) and the grid (objective.py) call this so the two never
+    disagree on T."""
+    if int(early_fusion) + int(native_fine_hga) + int(no_fusion) > 1:
+        raise ValueError(
+            "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
+        )
+    if early_fusion or no_fusion:
         L = int(band_inputs[0].shape[-1])  # HGA @ 64 Hz = 2T frames
         if L % 2 != 0:
             raise ValueError(f"early-fusion 64 Hz frame count {L} must be even (= 2T)")
@@ -315,6 +320,14 @@ EARLY_FUSION_BINS: tuple[int, int] = (4, 1)  # (HGA bins, LFS channels), concat 
 EARLY_FUSION_CHANNELS: int = sum(EARLY_FUSION_BINS)  # 5 fused channels per 64 Hz frame
 EARLY_FUSION_DECIMATE: int = 2  # stem stride-2 (64→32 Hz) ⇒ 2 raw 64 Hz frames per token
 
+# ── v3r5nf NoFusionStem (r5-fused's fully-separated sibling; 2026-07-22) ──────────
+# The r5 contract WITHOUT the fusion: the SAME two 64 Hz streams (HGA 4-bin |STFT|, LFS
+# 1-ch raw voltage), IDENTICAL cache content — but each conv-pooled by its OWN stem into
+# its OWN 32 Hz token stream (no 5-channel concat), tagged by a 2-way band embed. Two token
+# streams per (contact, 32 Hz slot). Memo: project-r5-config-canonical-2026-07-21.
+NOFUSION_BINS: tuple[int, int] = (4, 1)  # (HGA bins, LFS channels), SEPARATE streams
+NOFUSION_DECIMATE: int = 2  # each stem stride-2 (64→32 Hz) ⇒ 2 raw 64 Hz frames per token
+
 
 class EarlyFusionStem(nn.Module):
     """Chang 2-stream early-fusion stem (r5) — HGA ⊕ LFS → 32 Hz tokens.
@@ -387,3 +400,90 @@ class EarlyFusionStem(nn.Module):
         t = tok.shape[-2]
         pos = torch.arange(t, device=hga.device, dtype=torch.long)  # single-rate, stride 1
         return (tok,), (pos,)
+
+
+class NoFusionStem(nn.Module):
+    """v3r5nf no-fusion stem — EarlyFusionStem's fully-separated sibling (2026-07-22).
+
+    Consumes the SAME two 64 Hz streams as ``EarlyFusionStem`` (byte-identical caches, zero
+    re-bake) but does NOT concat them: each stream gets its OWN conv-pool stem into its OWN
+    32 Hz token stream, and a 2-way ``band_type_emb`` (like ``PerBandStem``/``FineHgaStem``)
+    tags which stream a token came from. The ONLY change vs r5-fused is fusion → full
+    separation:
+
+      • HGA: ``(..., 4, L)`` — |STFT| magnitude, 4 bins 64–160 Hz, per-(elec,bin) robust-z.
+      • LFS: ``(..., 1, L)`` — raw 1–30 Hz voltage, per-elec robust-z.
+    with ``L = 2·T``. Each stem is ``Conv1d(c_in→d, k3, s1, pad1) → GELU → Conv1d(d→d, k3, s2,
+    pad1) → GELU`` (mirrors ``EarlyFusionStem.fuse`` exactly, per-stream ``c_in`` = 4 / 1); the
+    single stride-2 decimates 64 → 32 Hz. Emits TWO token streams (HGA d, LFS d) + stride-1
+    lattice positions ``arange(T)`` shared by both (the two streams sit at the same (elec,
+    frame) RoPE position; ``band_type_emb`` is the only distinguisher, exactly like the r4
+    multi-band path with both bands at stride 1).
+
+    Deliberately NO per-band norm — stream identity rides the separate stems + the additive
+    band embed. band_type_emb init order matches FineHgaStem: ``apply(init_transformer_weights)``
+    first (no-op on the convs), then ``trunc_normal_`` the band embed.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        *,
+        bins: tuple[int, int] = NOFUSION_BINS,
+        band_emb_std: float = 0.02,
+    ) -> None:
+        super().__init__()
+        self.n_hga, self.n_lfs = int(bins[0]), int(bins[1])
+
+        def _stem(c_in: int) -> nn.Sequential:
+            # identical shape to EarlyFusionStem.fuse, per-stream in_channels.
+            return nn.Sequential(
+                nn.Conv1d(c_in, d_model, kernel_size=3, stride=1, padding=1),
+                nn.GELU(),
+                nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+            )
+
+        self.hga_stem = _stem(self.n_hga)
+        self.lfs_stem = _stem(self.n_lfs)
+        self.band_type_emb = nn.Parameter(torch.empty(2, d_model))
+        self.apply(init_transformer_weights)  # no Linear here ⇒ no-op on convs (default init)
+        nn.init.trunc_normal_(self.band_type_emb, std=band_emb_std)
+
+    def _pool(self, x: Tensor, stem: nn.Sequential) -> Tensor:
+        """(..., C, L) → (..., T, d) via a stream's stride-2 conv-pool (64→32 Hz)."""
+        *lead, c, L = x.shape
+        x = x.reshape(-1, c, L)  # (prod_lead, C, L)
+        x = stem(x)  # (prod_lead, d, T)
+        x = x.transpose(-1, -2)  # (prod_lead, T, d)
+        return x.reshape(*lead, x.shape[-2], x.shape[-1])  # (..., T, d)
+
+    def forward(
+        self, band_inputs: Sequence[Tensor]
+    ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+        """Streams ``[HGA(...,4,L), LFS(...,1,L)]`` (L = 2T, 64 Hz) → ((hga_tok ``(...,T,d)``,
+        lfs_tok ``(...,T,d)``), (pos ``(T,)``, pos ``(T,)``)). Both streams stride-1, SAME
+        lattice positions; band_type_emb[0]/[1] the only stream distinguisher."""
+        if len(band_inputs) != 2:
+            raise ValueError(
+                f"NoFusionStem expects 2 streams (HGA, LFS), got {len(band_inputs)}"
+            )
+        hga, lfs = band_inputs
+        if hga.shape[-2] != self.n_hga:
+            raise ValueError(f"HGA has {hga.shape[-2]} bins, expected {self.n_hga}")
+        if lfs.shape[-2] != self.n_lfs:
+            raise ValueError(f"LFS has {lfs.shape[-2]} channels, expected {self.n_lfs}")
+        if hga.shape[-1] != lfs.shape[-1]:
+            raise ValueError(
+                f"HGA/LFS 64 Hz frame counts disagree: {hga.shape[-1]} vs {lfs.shape[-1]}"
+            )
+        length = hga.shape[-1]
+        if length % 2 != 0:
+            raise ValueError(
+                f"64 Hz frame count {length} must be even (= 2× the 32 Hz token count)"
+            )
+        hga_tok = self._pool(hga, self.hga_stem) + self.band_type_emb[0]  # (..., T, d)
+        lfs_tok = self._pool(lfs, self.lfs_stem) + self.band_type_emb[1]  # (..., T, d)
+        t = hga_tok.shape[-2]
+        pos = torch.arange(t, device=hga.device, dtype=torch.long)  # stride 1, shared
+        return (hga_tok, lfs_tok), (pos, pos)

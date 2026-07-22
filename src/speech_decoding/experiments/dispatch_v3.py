@@ -60,6 +60,10 @@ from speech_decoding.models.v14_converged_v3.session_loader import (
 
 _FPS = 32.0  # the v3 uniform 32 Hz frame clock (hop=64 @ native rate)
 
+# v3r5nf (no-fusion) reads the SAME two 64 Hz caches as r5-fused (v3hga, v3lfs) — the ONLY
+# change is fusion → full separation in the stem, not the per-band read offsets.
+R5NF_BAND_RATES = R5_BAND_RATES
+
 
 class _EpochSeedCallback(pl.Callback):
     """Fan the epoch out to the datamodule so windows re-draw + the sampler
@@ -231,22 +235,27 @@ def _n_parcels(sessions: tp.Sequence[V3SessionSpec]) -> int:
 
 def _frontend_config(
     args: argparse.Namespace,
-) -> tuple[bool, bool, tuple[tuple[int, int], ...]]:
-    """(native_fine_hga, early_fusion, band_rates) from ``--frontend``.
+) -> tuple[bool, bool, bool, tuple[tuple[int, int], ...]]:
+    """(native_fine_hga, early_fusion, no_fusion, band_rates) from ``--frontend``.
 
     ``v3`` (default) = uniform-32Hz PerBandStem (arm0, byte-identical to every prior run).
     ``v3fine`` = FineHgaStem on native-rate caches (SLOW 4Hz / MID 16Hz / HGA 128Hz).
     ``v3r5`` = EarlyFusionStem (Chang 2-stream): 2 caches (v3hga, v3lfs) both @64 Hz, fused
-    5ch→256→stride-2 to 32 Hz tokens. The SAME band_rates must reach the dataset (per-band
-    read offsets), the loader (32Hz reference n_frames) AND the model (stem + T derivation),
-    so all three read this one fn. (native_fine_hga, early_fusion) are mutually exclusive.
+    5ch→256→stride-2 to 32 Hz tokens.
+    ``v3r5nf`` = NoFusionStem: the SAME 2 caches, but each conv-pooled by its OWN stem into its
+    OWN 32 Hz token stream (2 streams, 2-way band embed, independent masks/heads, MAE-only).
+    The SAME band_rates must reach the dataset (per-band read offsets), the loader (32Hz
+    reference n_frames) AND the model (stem + T derivation), so all three read this one fn.
+    (native_fine_hga, early_fusion, no_fusion) are mutually exclusive.
     """
     frontend = getattr(args, "frontend", "v3")
     if frontend == "v3fine":
-        return True, False, NATIVE_FINE_BAND_RATES
+        return True, False, False, NATIVE_FINE_BAND_RATES
     if frontend == "v3r5":
-        return False, True, R5_BAND_RATES
-    return False, False, UNIFORM_BAND_RATES
+        return False, True, False, R5_BAND_RATES
+    if frontend == "v3r5nf":
+        return False, False, True, R5NF_BAND_RATES
+    return False, False, False, UNIFORM_BAND_RATES
 
 
 def build_v3_training(
@@ -260,11 +269,13 @@ def build_v3_training(
     """
     mask_cfg = V3MaskConfig()  # locked two-tier config (its own defaults)
     mae = getattr(args, "objective", "jepa") == "mae"
-    native_fine_hga, early_fusion, band_rates = _frontend_config(args)
+    native_fine_hga, early_fusion, no_fusion, band_rates = _frontend_config(args)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
         mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
+        no_fusion=no_fusion,
+        mae_stream_weight=getattr(args, "mae_stream_weight", "equal"),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -275,9 +286,10 @@ def build_v3_training(
         model=model, optim_config=optim, seed=args.seed,
         monitor_every_n_steps=args.monitor_every_n_steps,
     )
-    # batch_unit default: r5 (early_fusion) ⇒ shaft-level (cross-patient) batching; the older
-    # session-homogeneous path stays the default for arm0/v3/v3fine. --batch-unit overrides.
-    batch_unit = args.batch_unit or ("shaft" if early_fusion else "session")
+    # batch_unit default: the two-stream arms (r5 early_fusion, v3r5nf no_fusion) ⇒ shaft-level
+    # (cross-patient) batching; the older session-homogeneous path stays the default for
+    # arm0/v3/v3fine. --batch-unit overrides.
+    batch_unit = args.batch_unit or ("shaft" if (early_fusion or no_fusion) else "session")
     dm = V3DataModule(
         sessions,
         batch_size=args.batch_size,
@@ -436,16 +448,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "no EMA teacher). ONLY the target changes; the visible-only encoder, "
                         "predictor, mask query, margin-gated in_loss, and all locked HPs are "
                         "identical.")
-    p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine", "v3r5"),
+    p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine", "v3r5", "v3r5nf"),
                    default="v3",
                    help="temporal front-end: 'v3' (default, uniform-32Hz PerBandStem — the "
                         "arm0 recipe, byte-identical), 'v3fine' (FineHgaStem on native-rate "
-                        "caches: SLOW 4Hz / MID 16Hz / HGA 128Hz conv-pooled 128→32Hz), or "
+                        "caches: SLOW 4Hz / MID 16Hz / HGA 128Hz conv-pooled 128→32Hz), "
                         "'v3r5' (EarlyFusionStem, Chang 2-stream: 2 caches v3hga|v3lfs both "
                         "@64 Hz, fused 5ch→256→stride-2→32Hz tokens; single-rate, no band embed, "
-                        "accept-the-bleed in_loss=masked). 'v3fine' REQUIRES the 3 native-rate "
-                        "band caches; 'v3r5' REQUIRES exactly the 2 caches --band-cache-dir "
+                        "accept-the-bleed in_loss=masked), or 'v3r5nf' (NoFusionStem: the "
+                        "EarlyFusionStem separated into 2 stems + 2 token streams + independent "
+                        "masks/heads, MAE-only). 'v3fine' REQUIRES the 3 native-rate band "
+                        "caches; 'v3r5'/'v3r5nf' REQUIRE exactly the 2 caches --band-cache-dir "
                         "v3hga --band-cache-dir v3lfs (HGA first).")
+    p.add_argument("--mae-stream-weight", dest="mae_stream_weight",
+                   choices=("equal", "pooled"), default="equal",
+                   help="v3r5nf MAE loss weighting (Ben 07-22): 'equal' (1:1, DEFAULT) averages "
+                        "the two per-stream mean-MSEs so each stream is 50%% of the gradient, "
+                        "invariant to HGA's bin granularity (lifts LFS 20%%→50%%); 'pooled' (4:1) "
+                        "sums per-channel SE over both streams ⇒ HGA:LFS = 4:1 (matches r5-fused). "
+                        "No-op outside the v3r5nf (no-fusion) MAE path.")
     # --- batching unit (shaft-level cross-patient vs session-homogeneous) ---
     p.add_argument("--batch-unit", dest="batch_unit", choices=("session", "shaft"),
                    default=None,
@@ -532,21 +553,23 @@ def _parse_sessions(raw: tp.Sequence[str]) -> list[tuple[int, int]]:
 
 def main(argv: tp.Sequence[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    is_r5 = getattr(args, "frontend", "v3") == "v3r5"
-    n_want = 2 if is_r5 else 3
+    # v3r5 (fused) AND v3r5nf (no-fusion) both read exactly the 2 caches (v3hga, v3lfs).
+    is_two_stream = getattr(args, "frontend", "v3") in ("v3r5", "v3r5nf")
+    n_want = 2 if is_two_stream else 3
     if len(args.band_cache_dirs) != n_want:
-        order = "v3hga, v3lfs" if is_r5 else "slow, mid, hga"
+        order = "v3hga, v3lfs" if is_two_stream else "slow, mid, hga"
         raise ValueError(
             f"--frontend {args.frontend} needs {n_want} --band-cache-dir ({order}), "
             f"got {len(args.band_cache_dirs)}"
         )
     pl.seed_everything(args.seed, workers=True)
 
-    _, _, band_rates = _frontend_config(args)
-    # winsor is per-band in cache order: r5 = (hga, lfs); arm0/v3fine = (slow, mid, hga).
+    _, _, _, band_rates = _frontend_config(args)
+    # winsor is per-band in cache order: two-stream (r5/r5nf) = (hga, lfs); arm0/v3fine =
+    # (slow, mid, hga).
     winsor = (
         (args.winsor_hga, args.winsor_lfs)
-        if is_r5
+        if is_two_stream
         else (args.winsor_slow, args.winsor_mid, args.winsor_hga)
     )
     sessions = load_v3_sessions(
@@ -560,19 +583,25 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:
-        # dynamic=False (STATIC graph per shape) = v2's --no-compile-dynamic, the config
-        # that hit 1-2 s/step. Static shapes give the best-fused kernels; the EARLIER
-        # G4 probe's thrash (3001 grad_mode + 2900 size recompiles, flat ~15 s/step) was
-        # NOT dynamic=False's fault — it was cache EVICTION: v3 cycles 13 sessions whose
-        # ONLINE M_vis and TEACHER/predictor N differ, ×grad_mode (online grad vs EMA
-        # teacher no_grad) ×bf16/fp32 autocast ⇒ ~150 specialisations across the towers,
-        # far above cache_size_limit=64. Once the working set exceeds the cache, Dynamo
-        # evicts a variant and recompiles it next step ⇒ perpetual ping-pong, warmup
-        # never ends. dynamic=None "fixed" the shape axis but broke build_pack_plan with
-        # symbolic-value guards (packing.py:84 recompiled every step). The real fix:
-        # keep dynamic=False and size the cache ABOVE the working set so the ~500-step
-        # warmup COMPLETES and every step thereafter hits a cached static kernel. Warmup
-        # is longer than v2 (13 session shapes vs 1 padded) but one-time and bounded.
+        # dynamic=True (SHAPE-GENERIC graphs), NOT dynamic=False. Measured on GH200 @15k
+        # contacts (2026-07-22): dynamic=False STORMS on the shaft-pack workload — S (shaft
+        # count) and max_c vary near-continuously pack-to-pack (far beyond the 13 session
+        # shapes the old cache-sizing theory assumed), so every step is a fresh shape ⇒
+        # perpetual recompile, ~100 s/step, warmup never ends (the "size the cache bigger"
+        # fix does NOT work here; the working set is unbounded). dynamic=None broke
+        # build_pack_plan (symbolic-value guards, packing.py:84 recompiled every step).
+        # dynamic=True traces 39 shape-generic graphs ONCE during warmup and reuses them
+        # across novel shapes (+0 new graphs on 5 unseen shapes) ⇒ 1.65× (472→278 ms/step),
+        # no storm. The njt attention (dynamo.disable) and mask sampling (.item() graph-
+        # break, masking.py:115) stay eager, so RNG + attention are byte-identical to eager.
+        # CAVEAT — NOT bitwise-neutral: compiled-vs-eager loss diverges ~1% (18-23× the
+        # 4.4e-4 eager run-to-run nondeterminism floor), a systematic bf16 fusion-reorder
+        # shift. The speedup is INSEPARABLE from it: encoder-block-only compile is floor-
+        # neutral (1×) but 0× faster; the 1.65× lives in the head/loss/glue fusion that
+        # causes the shift. So --compile is an opt-in throughput/precision tradeoff — keep
+        # it OFF for runs that must be numerically comparable to an eager lineage (e.g. a
+        # board-decisive arm); flip it ON for fully-compiled lineages or when wall-clock
+        # gates. Full scope: memory project-r5-eager-compile-speedup-scope-2026-07-22.
         import torch._dynamo as _dynamo
 
         # DDPOptimizer OFF (v2 parity, v14_converged_v2_module.py:240): with it ON
@@ -586,7 +615,7 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         _dynamo.config.optimize_ddp = False
         _dynamo.config.cache_size_limit = max(256, len(sessions) * 16)
         _dynamo.config.accumulated_cache_size_limit = max(512, len(sessions) * 32)
-        module.model = torch.compile(module.model, dynamic=False)  # type: ignore[assignment]
+        module.model = torch.compile(module.model, dynamic=True)  # type: ignore[assignment]
     with _sdpa_ctx(args.sdpa_backend):
         trainer.fit(
             module, datamodule=dm,

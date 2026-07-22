@@ -25,6 +25,7 @@ from speech_decoding.experiments.dispatch_v3 import (
     _frontend_config,
     _parse_sessions,
     _StepTimeCallback,
+    R5NF_BAND_RATES,
     build_arg_parser,
     build_v3_optim_cfg,
     build_v3_training,
@@ -213,11 +214,12 @@ def test_frontend_flag_parses_and_defaults_to_v3() -> None:
 
 
 def test_frontend_config_maps_flag_to_native_flag_and_rates() -> None:
-    # (native_fine_hga, early_fusion, band_rates)
-    assert _frontend_config(_smoke_args()) == (False, False, UNIFORM_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3")) == (False, False, UNIFORM_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, False, NATIVE_FINE_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3r5")) == (False, True, R5_BAND_RATES)
+    # (native_fine_hga, early_fusion, no_fusion, band_rates)
+    assert _frontend_config(_smoke_args()) == (False, False, False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3")) == (False, False, False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, False, False, NATIVE_FINE_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3r5")) == (False, True, False, R5_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3r5nf")) == (False, False, True, R5NF_BAND_RATES)
 
 
 def test_v3fine_threads_native_into_model_and_dataset(tmp_path) -> None:
@@ -303,6 +305,38 @@ def test_v3r5_threads_early_fusion_into_model_and_dataset(tmp_path) -> None:
     assert dm_r5.dataset.contact_budget == 16
     assert dm_r5.dataset.band_rates == R5_BAND_RATES
     assert dm_r5.dataset.start_align == 1  # lcm(1,1) — single-rate lattice
+
+
+def test_v3r5nf_threads_no_fusion_and_stream_weight_then_fits(tmp_path) -> None:
+    # v3r5nf reads the SAME 2 caches as v3r5 (v3hga F=4, v3lfs F=1) but must reach the
+    # NoFusionStem (model.no_fusion) and default to shaft batching. --mae-stream-weight
+    # threads to the objective (default 'equal'); a couple of real CPU fit steps prove the
+    # full trainer path — shaft-pack dataset + session_plan static shapes + backward — the
+    # layer where the 07-22 plan-cache clock bug lived.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_r5_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=R5NF_BAND_RATES,
+    )
+    m, dm, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae")
+    )
+    assert m.model.no_fusion is True
+    assert m.model.objective.no_fusion is True
+    assert m.model.early_fusion is False and m.model.native_fine_hga is False
+    assert m.model.objective.mae_stream_weight == "equal"  # NEW DEFAULT
+    assert dm.batch_unit == "shaft"  # two-stream ⇒ shaft is the default batch unit
+    assert dm.dataset.band_rates == R5NF_BAND_RATES
+
+    # --mae-stream-weight pooled threads through too.
+    m_pooled, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae",
+                           mae_stream_weight="pooled")
+    )
+    assert m_pooled.model.objective.mae_stream_weight == "pooled"
+
+    _cpu_trainer(2).fit(m, datamodule=dm)  # runs; no shape/plan-cache error
 
 
 def test_clips_per_session_default_is_the_long_epoch() -> None:
