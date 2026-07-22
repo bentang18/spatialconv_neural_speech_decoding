@@ -53,7 +53,11 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
     token_flags_r5,
     token_flags_r5nf,
 )
-from speech_decoding.models.v14_converged_v3.stem import clock_length_32hz
+from speech_decoding.models.v14_converged_v3.stem import (
+    NOFUSION_DECIMATE,
+    clock_length_32hz,
+    nf_token_geometry,
+)
 
 
 class V3ConvergedModel(nn.Module):
@@ -68,6 +72,7 @@ class V3ConvergedModel(nn.Module):
         native_fine_hga: bool = False,
         early_fusion: bool = False,
         no_fusion: bool = False,
+        nf_decimate: int = NOFUSION_DECIMATE,
         mae_stream_weight: str = "equal",
     ) -> None:
         super().__init__()
@@ -83,11 +88,12 @@ class V3ConvergedModel(nn.Module):
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
             mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
-            no_fusion=no_fusion, mae_stream_weight=mae_stream_weight,
+            no_fusion=no_fusion, nf_decimate=nf_decimate, mae_stream_weight=mae_stream_weight,
         )
         self.native_fine_hga = bool(native_fine_hga)
         self.early_fusion = bool(early_fusion)
         self.no_fusion = bool(no_fusion)
+        self.nf_decimate = int(nf_decimate)
         self.mask_cfg = mask_cfg
 
     def forward(
@@ -118,8 +124,11 @@ class V3ConvergedModel(nn.Module):
                 geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
             )
         elif self.no_fusion:
+            # mask on the TOKEN grid (T tokens @32 Hz for decimate 2; T/2 @16 Hz for fast). The
+            # objective derives the SAME n_tok from T (nf_token_geometry), so mask + grid agree.
+            n_tok, _ = nf_token_geometry(T, decimate=self.nf_decimate)
             masks = sample_masks_r5nf(
-                geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
+                geom, N, n_time=n_tok, n_rows=B, generator=generator, cfg=self.mask_cfg
             )
         else:
             masks = sample_masks(
@@ -161,7 +170,10 @@ class V3ConvergedModel(nn.Module):
             )
             masked, _ = token_flags_r5(grid, masks)
         elif self.no_fusion:  # v3r5nf two-band grid + independent per-stream mask flags
-            grid = build_r5nf_grid(geom, n_time=n_time)
+            # n_time arrives as the TOKEN count (the module converts via nf_token_geometry); the
+            # grid still needs the RoPE stride (1 for decimate 2, 2 for fast) — but max_seqlen/
+            # m_vis are stride-invariant (they count tokens), so this plan is decimate-correct.
+            grid = build_r5nf_grid(geom, n_time=n_time, time_stride=self.nf_decimate // 2)
             parcel_packed = parcel_id[grid.contact]
             masks = sample_masks_r5nf(
                 geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg

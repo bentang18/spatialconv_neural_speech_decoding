@@ -65,6 +65,7 @@ from speech_decoding.models.v14_converged_v3.stem import (
     NoFusionStem,
     PerBandStem,
     clock_length_32hz,
+    nf_token_geometry,
 )
 from speech_decoding.models.v14_converged_v3.towers import (
     N_LEVELS,
@@ -131,6 +132,7 @@ class _TargetTower(nn.Module):
         native_fine_hga: bool = False,
         early_fusion: bool = False,
         no_fusion: bool = False,
+        nf_decimate: int = NOFUSION_DECIMATE,
     ) -> None:
         super().__init__()
         # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
@@ -148,7 +150,7 @@ class _TargetTower(nn.Module):
         if early_fusion:
             self.stem = EarlyFusionStem(D_MODEL)
         elif no_fusion:
-            self.stem = NoFusionStem(D_MODEL)
+            self.stem = NoFusionStem(D_MODEL, decimate=nf_decimate)
         elif native_fine_hga:
             self.stem = FineHgaStem(D_MODEL)
         else:
@@ -187,6 +189,7 @@ class V3JepaObjective(nn.Module):
         native_fine_hga: bool = False,
         early_fusion: bool = False,
         no_fusion: bool = False,
+        nf_decimate: int = NOFUSION_DECIMATE,
         mae_stream_weight: str = "equal",
     ) -> None:
         super().__init__()
@@ -200,6 +203,10 @@ class V3JepaObjective(nn.Module):
         # (sample_masks_r5nf) + accept-the-bleed scoring (token_flags_r5nf). MAE-ONLY (raw-frame
         # per-stream recon, pooled ⇒ 4:1 HGA:LFS); JEPA-nf is deferred.
         self.no_fusion = bool(no_fusion)
+        # nf_decimate (v3r5nffast OFAT): NoFusionStem net decimation. 2 = v3r5nf (32 Hz tokens,
+        # byte-identical); 4 = fast (16 Hz tokens). Sets the stem stride, the per-stream MAE head
+        # widths (DEC·bins) and the target-gather frame count — all keyed off self.nf_decimate.
+        self.nf_decimate = int(nf_decimate)
         if int(self.early_fusion) + int(self.native_fine_hga) + int(self.no_fusion) > 1:
             raise ValueError(
                 "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
@@ -228,6 +235,7 @@ class V3JepaObjective(nn.Module):
             native_fine_hga=self.native_fine_hga,
             early_fusion=self.early_fusion,
             no_fusion=self.no_fusion,
+            nf_decimate=self.nf_decimate,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
@@ -258,8 +266,8 @@ class V3JepaObjective(nn.Module):
                 # HGA reconstructs its own DEC(2)·4 raw 64 Hz values, LFS its own DEC(2)·1. No
                 # per-token norm_pix; the loss POOLS per-channel MSE over all masked tokens both
                 # streams ⇒ HGA:LFS = 4:1 in expectation (equal masked counts × 8 vs 2 feats).
-                self.mae_head_hga = nn.Linear(PRED_D_MODEL, NOFUSION_DECIMATE * NOFUSION_BINS[0])
-                self.mae_head_lfs = nn.Linear(PRED_D_MODEL, NOFUSION_DECIMATE * NOFUSION_BINS[1])
+                self.mae_head_hga = nn.Linear(PRED_D_MODEL, self.nf_decimate * NOFUSION_BINS[0])
+                self.mae_head_lfs = nn.Linear(PRED_D_MODEL, self.nf_decimate * NOFUSION_BINS[1])
                 init_transformer_weights(self.mae_head_hga)
                 init_transformer_weights(self.mae_head_lfs)
                 self.mae_head_r5 = None
@@ -340,7 +348,13 @@ class V3JepaObjective(nn.Module):
             parcel_packed = parcel_id[grid.contact]
             masked, in_loss = token_flags_r5(grid, masks)  # (B, total) bool; in_loss == masked
         elif self.no_fusion:
-            grid = build_r5nf_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
+            # nf token count = T (decimate 2) or T/2 (decimate 4, fast); time_stride places 16 Hz
+            # tokens on the 32 Hz lattice (RoPE physical). Masks were sampled with the SAME n_tok
+            # (model.forward derives it identically), so the grid/mask never disagree.
+            n_tok, time_stride = nf_token_geometry(T, decimate=self.nf_decimate)
+            grid = build_r5nf_grid(
+                geom, n_time=n_tok, time_stride=time_stride, max_seqlen=grid_max_seqlen
+            )
             parcel_packed = parcel_id[grid.contact]
             masked, in_loss = token_flags_r5nf(grid, masks)  # (B, total); in_loss == masked
         else:
@@ -568,7 +582,7 @@ class V3JepaObjective(nn.Module):
         layout per token = [frame0 ch0..C-1, frame1 ch0..C-1] (matches the head output). LFS is
         zero-padded from DEC·1=2 to F_MAX=8; ``feat_valid`` marks each token's real feats,
         ``feat_count`` = 8 (HGA) or 2 (LFS)."""
-        DEC = NOFUSION_DECIMATE
+        DEC = self.nf_decimate  # 2 (v3r5nf) or 4 (fast); L = DEC·n_tok, so DEC·bandpos covers all L
         hga = bands[0]
         B, N, Ch_h, L = hga.shape  # Ch_h = 4
         hga_ft = hga.permute(0, 1, 3, 2).reshape(B, N * L, Ch_h)  # (B, N·L, 4)
@@ -604,10 +618,10 @@ class V3JepaObjective(nn.Module):
         Runs BOTH heads over every token (static shape) and selects by ``grid.band`` — the
         compile-safe analogue of a per-stream boolean gather. LFS output (DEC·1=2) is zero-
         padded to F_MAX=8 (the pad slots masked out of the loss by ``feat_valid``)."""
-        o_hga = self.mae_head_hga(h)  # (B, total, 8)
-        o_lfs = F.pad(self.mae_head_lfs(h), (0, NOFUSION_DECIMATE * NOFUSION_BINS[0]
-                                             - NOFUSION_DECIMATE * NOFUSION_BINS[1]))  # → 8
-        return torch.where((grid.band == 0)[None, :, None], o_hga, o_lfs)  # (B, total, 8)
+        o_hga = self.mae_head_hga(h)  # (B, total, DEC·4)
+        o_lfs = F.pad(self.mae_head_lfs(h), (0, self.nf_decimate * NOFUSION_BINS[0]
+                                             - self.nf_decimate * NOFUSION_BINS[1]))  # → DEC·4
+        return torch.where((grid.band == 0)[None, :, None], o_hga, o_lfs)  # (B, total, DEC·4)
 
     def _mae_output_r5nf(
         self,
@@ -663,8 +677,8 @@ class V3JepaObjective(nn.Module):
                 # to each stream's own valid feats (LFS 2, HGA 8) so pad zeros don't deflate it.
                 taps.update(nofusion_recon_stats(
                     pred, target, w_hga, w_lfs,
-                    n_hga=NOFUSION_DECIMATE * NOFUSION_BINS[0],
-                    n_lfs=NOFUSION_DECIMATE * NOFUSION_BINS[1],
+                    n_hga=self.nf_decimate * NOFUSION_BINS[0],
+                    n_lfs=self.nf_decimate * NOFUSION_BINS[1],
                 ))
         return JepaOutput(
             loss=mae_loss,

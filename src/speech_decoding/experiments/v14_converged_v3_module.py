@@ -37,7 +37,10 @@ from torch import Tensor
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.models.v14_converged_v3.batch import V3Batch
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
-from speech_decoding.models.v14_converged_v3.stem import clock_length_32hz
+from speech_decoding.models.v14_converged_v3.stem import (
+    clock_length_32hz,
+    nf_token_geometry,
+)
 
 # Base offset so the per-step mask seed decorrelates across seeds/steps without
 # ever aliasing step N of seed A onto step M of seed B for small N.
@@ -173,6 +176,11 @@ class V14ConvergedV3Module(pl.LightningModule):
                 early_fusion=self.model.early_fusion,
                 no_fusion=self.model.no_fusion,
             )
+            # v3r5nf(fast): session_plan grids/masks on the TOKEN count, not the 32 Hz clock —
+            # decimate 4 halves it (16 Hz tokens). Convert here so the cached plan's m_vis/
+            # max_seqlen match the token grid the forward builds (byte-identical at decimate 2).
+            if self.model.no_fusion:
+                n_time, _ = nf_token_geometry(n_time, decimate=self.model.nf_decimate)
             plan = self.model.session_plan(batch.geom, batch.parcel_id, n_time)
             if not is_pack:
                 self._session_plan_cache[key] = plan

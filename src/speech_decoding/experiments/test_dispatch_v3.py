@@ -23,6 +23,7 @@ import torch
 
 from speech_decoding.experiments.dispatch_v3 import (
     _frontend_config,
+    _nf_decimate,
     _parse_sessions,
     _StepTimeCallback,
     R5NF_BAND_RATES,
@@ -337,6 +338,58 @@ def test_v3r5nf_threads_no_fusion_and_stream_weight_then_fits(tmp_path) -> None:
     assert m_pooled.model.objective.mae_stream_weight == "pooled"
 
     _cpu_trainer(2).fit(m, datamodule=dm)  # runs; no shape/plan-cache error
+
+
+def test_v3r5nffast_threads_decimate_4_and_block_w_3_then_fits(tmp_path) -> None:
+    # v3r5nffast = v3r5nf with the first stem conv at stride 2 (net 4× → 16 Hz tokens). It maps to
+    # the SAME (no_fusion, R5NF_BAND_RATES) config as v3r5nf but with nf_decimate=4, and the
+    # temporal block shrinks 5→3 (physics: hold the masked-run half-width above the 83 ms horizon).
+    # --temporal-block-w overrides for any arm; v3r5nf stays at 5 (the queued run is unaffected).
+    assert _frontend_config(_smoke_args(frontend="v3r5nffast")) == (
+        False, False, True, R5NF_BAND_RATES
+    )  # same tuple as v3r5nf — the decimate is the only difference
+    assert _nf_decimate(_smoke_args(frontend="v3r5nffast")) == 4
+    assert _nf_decimate(_smoke_args(frontend="v3r5nf")) == 2
+    assert _nf_decimate(_smoke_args(frontend="v3")) == 2
+
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_r5_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=R5NF_BAND_RATES,
+    )
+    m, dm, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nffast", contact_budget=16, objective="mae")
+    )
+    assert m.model.no_fusion is True
+    assert m.model.nf_decimate == 4
+    assert m.model.objective.nf_decimate == 4
+    assert m.model.objective.online.stem.decimate == 4
+    assert m.model.objective.mae_head_hga.out_features == 16  # DEC·4
+    assert m.model.objective.mae_head_lfs.out_features == 4  # DEC·1
+    assert m.model.mask_cfg.temporal_block_w == 3  # fast physics default
+    assert dm.batch_unit == "shaft"
+
+    # v3r5nf keeps the locked default (5) — the queued run's config is byte-identical.
+    m_nf, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae")
+    )
+    assert m_nf.model.nf_decimate == 2
+    assert m_nf.model.mask_cfg.temporal_block_w == 5
+
+    # --temporal-block-w wins for any arm (fast override, and a non-default on v3r5nf).
+    m_ov, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nffast", contact_budget=16, objective="mae",
+                           temporal_block_w=4)
+    )
+    assert m_ov.model.mask_cfg.temporal_block_w == 4
+    m_nf7, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae",
+                           temporal_block_w=7)
+    )
+    assert m_nf7.model.mask_cfg.temporal_block_w == 7
+
+    _cpu_trainer(2).fit(m, datamodule=dm)  # 16 Hz token grid fits end-to-end (plan cache + backward)
 
 
 def test_clips_per_session_default_is_the_long_epoch() -> None:

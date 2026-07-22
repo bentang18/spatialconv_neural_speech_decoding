@@ -53,6 +53,7 @@ from speech_decoding.models.v14_converged_v3.dataset import (
 )
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+from speech_decoding.models.v14_converged_v3.stem import NOFUSION_DECIMATE
 from speech_decoding.models.v14_converged_v3.session_loader import (
     ParcelFn,
     load_v3_sessions,
@@ -253,9 +254,18 @@ def _frontend_config(
         return True, False, False, NATIVE_FINE_BAND_RATES
     if frontend == "v3r5":
         return False, True, False, R5_BAND_RATES
-    if frontend == "v3r5nf":
+    if frontend in ("v3r5nf", "v3r5nffast"):
+        # v3r5nffast: the no-fusion path with the first stem conv at stride 2 (net 4× → 16 Hz
+        # tokens). SAME 2×64 Hz caches ⇒ SAME band_rates; the decimate differs (see _nf_decimate).
         return False, False, True, R5NF_BAND_RATES
     return False, False, False, UNIFORM_BAND_RATES
+
+
+def _nf_decimate(args: argparse.Namespace) -> int:
+    """NoFusionStem net decimation from ``--frontend``: 4 for v3r5nffast (16 Hz tokens), else 2
+    (v3r5nf, 32 Hz — byte-identical). Separate from ``_frontend_config`` so that fn's return
+    arity + the r5nf/fast shared (no_fusion, band_rates) tuple stay unchanged."""
+    return 4 if getattr(args, "frontend", "v3") == "v3r5nffast" else NOFUSION_DECIMATE
 
 
 def build_v3_training(
@@ -267,14 +277,26 @@ def build_v3_training(
     Split out from ``main`` so F1 can drive the whole stack locally with synthetic
     sessions + a stub parcel_fn (no caches, no wandb, CPU).
     """
-    mask_cfg = V3MaskConfig()  # locked two-tier config (its own defaults)
     mae = getattr(args, "objective", "jepa") == "mae"
     native_fine_hga, early_fusion, no_fusion, band_rates = _frontend_config(args)
+    nf_decimate = _nf_decimate(args)
+    # temporal_block_w is a tunable HP (--temporal-block-w). Unset ⇒ the arm's physics default:
+    # 5 tokens (=156 ms @32 Hz) for every arm EXCEPT v3r5nffast, where the 16 Hz tokens halve the
+    # rate so the block shrinks to 3 (holds the ~95 ms masked-run half-width that clears the 83 ms
+    # LFS decorrelation horizon, the block's τ-anchor — masking.py:77). Any explicit value wins;
+    # unset + non-fast ⇒ V3MaskConfig() default (byte-identical to the locked config).
+    block_w = getattr(args, "temporal_block_w", None)
+    if block_w is None:
+        block_w = 3 if nf_decimate == 4 else V3MaskConfig().temporal_block_w
+    mask_cfg = (
+        V3MaskConfig() if block_w == V3MaskConfig().temporal_block_w
+        else V3MaskConfig(temporal_block_w=block_w)
+    )
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
         mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
-        no_fusion=no_fusion,
+        no_fusion=no_fusion, nf_decimate=nf_decimate,
         mae_stream_weight=getattr(args, "mae_stream_weight", "equal"),
     )
     optim = build_v3_optim_cfg(
@@ -448,17 +470,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "no EMA teacher). ONLY the target changes; the visible-only encoder, "
                         "predictor, mask query, margin-gated in_loss, and all locked HPs are "
                         "identical.")
-    p.add_argument("--frontend", dest="frontend", choices=("v3", "v3fine", "v3r5", "v3r5nf"),
+    p.add_argument("--frontend", dest="frontend",
+                   choices=("v3", "v3fine", "v3r5", "v3r5nf", "v3r5nffast"),
                    default="v3",
                    help="temporal front-end: 'v3' (default, uniform-32Hz PerBandStem — the "
                         "arm0 recipe, byte-identical), 'v3fine' (FineHgaStem on native-rate "
                         "caches: SLOW 4Hz / MID 16Hz / HGA 128Hz conv-pooled 128→32Hz), "
                         "'v3r5' (EarlyFusionStem, Chang 2-stream: 2 caches v3hga|v3lfs both "
                         "@64 Hz, fused 5ch→256→stride-2→32Hz tokens; single-rate, no band embed, "
-                        "accept-the-bleed in_loss=masked), or 'v3r5nf' (NoFusionStem: the "
+                        "accept-the-bleed in_loss=masked), 'v3r5nf' (NoFusionStem: the "
                         "EarlyFusionStem separated into 2 stems + 2 token streams + independent "
-                        "masks/heads, MAE-only). 'v3fine' REQUIRES the 3 native-rate band "
-                        "caches; 'v3r5'/'v3r5nf' REQUIRE exactly the 2 caches --band-cache-dir "
+                        "masks/heads, MAE-only), or 'v3r5nffast' (v3r5nf with the first stem conv "
+                        "at stride 2 → net 4× → 16 Hz tokens; physical stride-2 RoPE + block_w=3, "
+                        "SAME caches). 'v3fine' REQUIRES the 3 native-rate band "
+                        "caches; 'v3r5'/'v3r5nf'/'v3r5nffast' REQUIRE exactly the 2 caches --band-cache-dir "
                         "v3hga --band-cache-dir v3lfs (HGA first).")
     p.add_argument("--mae-stream-weight", dest="mae_stream_weight",
                    choices=("equal", "pooled"), default="equal",
@@ -467,6 +492,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "invariant to HGA's bin granularity (lifts LFS 20%%→50%%); 'pooled' (4:1) "
                         "sums per-channel SE over both streams ⇒ HGA:LFS = 4:1 (matches r5-fused). "
                         "No-op outside the v3r5nf (no-fusion) MAE path.")
+    p.add_argument("--temporal-block-w", dest="temporal_block_w", type=int, default=None,
+                   help="temporal mask block width in TOKENS (masking.py: the τ-anchored SSL "
+                        "difficulty knob; block half-width must clear the ~83 ms LFS decorrelation "
+                        "horizon). Unset ⇒ arm default: 5 (156 ms @32 Hz) everywhere except "
+                        "v3r5nffast where 16 Hz tokens ⇒ 3 (holds the ~95 ms half-width). An "
+                        "explicit value overrides for any arm.")
     # --- batching unit (shaft-level cross-patient vs session-homogeneous) ---
     p.add_argument("--batch-unit", dest="batch_unit", choices=("session", "shaft"),
                    default=None,
@@ -554,7 +585,7 @@ def _parse_sessions(raw: tp.Sequence[str]) -> list[tuple[int, int]]:
 def main(argv: tp.Sequence[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
     # v3r5 (fused) AND v3r5nf (no-fusion) both read exactly the 2 caches (v3hga, v3lfs).
-    is_two_stream = getattr(args, "frontend", "v3") in ("v3r5", "v3r5nf")
+    is_two_stream = getattr(args, "frontend", "v3") in ("v3r5", "v3r5nf", "v3r5nffast")
     n_want = 2 if is_two_stream else 3
     if len(args.band_cache_dirs) != n_want:
         order = "v3hga, v3lfs" if is_two_stream else "slow, mid, hga"

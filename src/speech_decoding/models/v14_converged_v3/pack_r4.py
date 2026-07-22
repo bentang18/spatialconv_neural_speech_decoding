@@ -357,17 +357,21 @@ def token_flags_r5(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
 
 # ── v3r5nf (no-fusion) two stride-1 bands + per-stream accept-the-bleed flags ─────
 def build_r5nf_grid(
-    geom: L1Geometry, *, n_time: int, max_seqlen: int | None = None
+    geom: L1Geometry, *, n_time: int, time_stride: int = 1, max_seqlen: int | None = None
 ) -> R4Grid:
-    """v3r5nf flat full-grid — TWO bands (0=HGA, 1=LFS), BOTH stride-1 @32 Hz.
+    """v3r5nf flat full-grid — TWO bands (0=HGA, 1=LFS), BOTH stride-``time_stride``.
 
-    The v3r5nf stem (``NoFusionStem``) emits TWO token streams at 32 Hz (T tokens each per
-    contact), so the grid is the two-band case with BOTH bands at stride 1: ``band_lengths ==
-    (T, T)``, ``k_full == 2T``, ``bandpos == time_pos == token index within band`` (stride 1),
-    both HGA and LFS at a given (contact, frame) sharing the SAME lattice position (band embed
-    the only distinguisher). Token order per contact is band-major HGA then LFS: ``[HGA 0..T-1,
-    LFS 0..T-1]`` — the same shaft-major / canonical-contact / band-major layout as
-    ``build_r4_grid``. The R4Grid contract is unchanged so pack/pe/encoder are byte-identical.
+    The v3r5nf stem (``NoFusionStem``) emits TWO token streams (T tokens each per contact), so
+    the grid is the two-band case with BOTH bands sharing one lattice: ``band_lengths == (T,
+    T)``, ``k_full == 2T``, both HGA and LFS at a given (contact, token) sharing the SAME
+    position (band embed the only distinguisher). ``bandpos`` is the token index within band
+    (0..T−1) — the temporal-MASK index; ``time_pos = bandpos·time_stride`` is the RoPE lattice
+    position. ``time_stride=1`` (v3r5nf, 32 Hz tokens): time_pos == bandpos, byte-identical.
+    ``time_stride=2`` (v3r5nffast, 16 Hz tokens): each token sits at its true 32 Hz-lattice
+    position (bandpos p → lattice 2p), so RoPE geometry matches the 32 Hz arm (nf_token_geometry).
+    Token order per contact is band-major HGA then LFS: ``[HGA 0..T−1, LFS 0..T−1]`` — the same
+    shaft-major / canonical-contact / band-major layout as ``build_r4_grid``. The R4Grid contract
+    is unchanged so pack/pe/encoder are byte-identical.
 
     ``max_seqlen`` is a per-session CONSTANT; pass the cached value to skip its ``.item()``
     host sync (compiled path). ``None`` ⇒ derive here (one sync — standalone fallback)."""
@@ -393,8 +397,8 @@ def build_r5nf_grid(
     contact = canon.repeat_interleave(k_full)
     shaft = rows.repeat_interleave(k_full)
     band = band_blk.repeat(n)
-    bandpos = pos_blk.repeat(n)
-    time_pos = pos_blk.repeat(n)  # stride 1 ⇒ lattice position == token index
+    bandpos = pos_blk.repeat(n)  # token index within band (0..T-1) — the temporal-MASK index
+    time_pos = pos_blk.repeat(n) * time_stride  # RoPE lattice position (bandpos·stride)
 
     n_per_shaft = geom.valid.sum(dim=1).to(torch.long)  # (S,)
     seg = (n_per_shaft * k_full).to(torch.int32)  # (S,)

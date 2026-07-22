@@ -229,6 +229,26 @@ def clock_length_32hz(
     return T
 
 
+def nf_token_geometry(t_32hz: int, *, decimate: int) -> tuple[int, int]:
+    """(n_tokens_per_stream, time_stride) for a ``NoFusionStem`` of net decimation ``decimate``.
+
+    The stem consumes 2×64 Hz caches (L = 2·T_32 frames) and emits L//decimate tokens/stream:
+      • ``decimate=2`` (v3r5nf): n_tok = T_32, stride 1 — 32 Hz tokens, byte-identical to before.
+      • ``decimate=4`` (v3r5nffast OFAT): n_tok = T_32//2, stride 2 — 16 Hz tokens. The stride
+        places each 16 Hz token at its TRUE 32 Hz-lattice position (token p → lattice 2p), so the
+        L1 RoPE geometry is physically identical to the 32 Hz arm (``base_time=64`` stays matched)
+        — only the temporal sampling coarsens. Masks/grid index tokens by ``bandpos`` (0..n_tok−1);
+        RoPE uses ``time_pos = bandpos·stride`` (build_r5nf_grid). Both the model's mask sampling
+        and the objective's grid derive n_tok from HERE so they never disagree on the token count
+        (the 07-22 plan-cache clock bug invariant)."""
+    L = 2 * int(t_32hz)  # 64 Hz frame count
+    if decimate not in (2, 4):
+        raise ValueError(f"nf decimate must be 2 or 4, got {decimate}")
+    if L % decimate != 0:
+        raise ValueError(f"64 Hz frame count {L} (2·T_32) not divisible by decimate {decimate}")
+    return L // decimate, decimate // 2
+
+
 class FineHgaStem(nn.Module):
     """Native-rate per-band token stem — fine-HGA OFAT (2026-07-21).
 
@@ -430,15 +450,22 @@ class NoFusionStem(nn.Module):
         d_model: int = 256,
         *,
         bins: tuple[int, int] = NOFUSION_BINS,
+        decimate: int = NOFUSION_DECIMATE,
         band_emb_std: float = 0.02,
     ) -> None:
         super().__init__()
         self.n_hga, self.n_lfs = int(bins[0]), int(bins[1])
+        if decimate not in (2, 4):
+            raise ValueError(f"NoFusionStem decimate must be 2 or 4, got {decimate}")
+        self.decimate = int(decimate)
+        s1 = self.decimate // 2  # net stem stride = s1·2 = decimate (64 Hz → 64/decimate Hz)
 
-        def _stem(c_in: int) -> nn.Sequential:
-            # identical shape to EarlyFusionStem.fuse, per-stream in_channels.
+        def _stem(c_in: int, _s1: int = s1) -> nn.Sequential:
+            # identical shape to EarlyFusionStem.fuse, per-stream in_channels. The FIRST conv's
+            # stride carries the fast-frontend decimation (v3r5nffast OFAT): s1=1 → net 2 = 32 Hz
+            # tokens (v3r5nf, byte-identical); s1=2 → net 4 = 16 Hz tokens. Second conv stays s2.
             return nn.Sequential(
-                nn.Conv1d(c_in, d_model, kernel_size=3, stride=1, padding=1),
+                nn.Conv1d(c_in, d_model, kernel_size=3, stride=_s1, padding=1),
                 nn.GELU(),
                 nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1),
                 nn.GELU(),
@@ -478,9 +505,10 @@ class NoFusionStem(nn.Module):
                 f"HGA/LFS 64 Hz frame counts disagree: {hga.shape[-1]} vs {lfs.shape[-1]}"
             )
         length = hga.shape[-1]
-        if length % 2 != 0:
+        if length % self.decimate != 0:
             raise ValueError(
-                f"64 Hz frame count {length} must be even (= 2× the 32 Hz token count)"
+                f"64 Hz frame count {length} must be divisible by decimate {self.decimate} "
+                f"(= the tokens/stream count)"
             )
         hga_tok = self._pool(hga, self.hga_stem) + self.band_type_emb[0]  # (..., T, d)
         lfs_tok = self._pool(lfs, self.lfs_stem) + self.band_type_emb[1]  # (..., T, d)

@@ -132,7 +132,7 @@ def test_mismatched_or_odd_frame_count_raises() -> None:
         stem((hga, lfs_short))
     hga_odd = torch.randn(B, C, NF_HGA_BINS, L - 1)  # 255, odd
     lfs_odd = torch.randn(B, C, NF_LFS_CH, L - 1)
-    with pytest.raises(ValueError, match="must be even"):
+    with pytest.raises(ValueError, match="divisible by decimate"):  # default decimate=2 ⇒ odd rejected
         stem((hga_odd, lfs_odd))
 
 
