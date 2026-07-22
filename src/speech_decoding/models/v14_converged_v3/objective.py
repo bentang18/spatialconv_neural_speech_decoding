@@ -37,6 +37,7 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.masking import V3Masks
 from speech_decoding.models.v14_converged_v3.monitor_taps import (
     cov_entropy_vs_floor,
+    early_fusion_recon_stats,
     per_band_jepa_stats,
     per_band_l1,
     per_band_nll,
@@ -68,6 +69,7 @@ from speech_decoding.models.v14_converged_v3.state_target import (
     build_state_target,
 )
 from speech_decoding.models.v14_converged_v3.stem import (
+    EARLY_FUSION_BINS,
     EARLY_FUSION_CHANNELS,
     EARLY_FUSION_DECIMATE,
     PER_BAND_SPECS,
@@ -668,7 +670,8 @@ class V3JepaObjective(nn.Module):
         pred = self.mae_head_r5(h)  # (B, total, DEC·C)
         target = target.to(pred.dtype)
         w = in_loss.to(pred.dtype)  # (B, total) accept-the-bleed masked weight
-        se_tok = ((pred - target) ** 2).mean(-1)  # (B, total) per-token MSE over the 10 values
+        se = (pred - target) ** 2  # (B, total, DEC·C)
+        se_tok = se.mean(-1)  # (B, total) per-token MSE over the 10 values
         mae_loss = (se_tok * w).sum() / w.sum().clamp(min=1.0)
 
         taps = None
@@ -676,8 +679,27 @@ class V3JepaObjective(nn.Module):
             assert enc_taps is not None
             d_enc = enc_taps[12].shape[-1]
             taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
-            with torch.no_grad():  # single-band recon health (all tokens band 0)
-                taps.update(per_band_jepa_stats(pred, target, w, grid.band))
+            with torch.no_grad():
+                # r5 recon health split by the early-fused CHANNEL groups: explained-var +
+                # pred-target var-ratio for HGA (4 |STFT| bins combined) vs LFS (1 raw) — the r5
+                # replacement for r4's per-band {slow,mid,hga} (single band ⇒ that split is here).
+                taps.update(early_fusion_recon_stats(
+                    pred, target, w, n_hga=EARLY_FUSION_BINS[0], decimate=EARLY_FUSION_DECIMATE
+                ))
+                # HGA-vs-LFS recon split (LOG-ONLY monitor). The DEC·C target lays out each of
+                # the DEC frames as [HGA₀..₃, LFS] (EARLY_FUSION_BINS = (4, 1)), so channels
+                # [:4] are the 4 HGA |STFT| bins (combined) and [4:] the LFS raw. Report each as
+                # its own masked-mean MSE; the TRAINING loss stays mean-over-10 (4:1 HGA:LFS by
+                # channel count) UNCHANGED. Invariant: mae_loss == (4·2·mae_hga + 1·2·mae_lfs)/10.
+                n_hga = EARLY_FUSION_BINS[0]
+                se_f = se.reshape(
+                    se.shape[0], se.shape[1], EARLY_FUSION_DECIMATE, EARLY_FUSION_CHANNELS
+                )
+                denom = w.sum().clamp(min=1.0)
+                hga_se = se_f[..., :n_hga].mean((-2, -1))  # (B, total) over DEC frames × 4 HGA
+                lfs_se = se_f[..., n_hga:].mean((-2, -1))  # (B, total) over DEC frames × 1 LFS
+                taps["mae_hga"] = (hga_se * w).sum() / denom
+                taps["mae_lfs"] = (lfs_se * w).sum() / denom
         return JepaOutput(
             loss=mae_loss,
             n_masked=w.sum().detach(),

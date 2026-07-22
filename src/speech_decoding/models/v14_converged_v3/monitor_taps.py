@@ -72,6 +72,41 @@ def per_band_jepa_stats(
     return out
 
 
+def early_fusion_recon_stats(
+    pred: Tensor, tgt: Tensor, w: Tensor, *, n_hga: int, decimate: int
+) -> dict[str, Tensor]:
+    """r5 HGA-vs-LFS recon health: explained-var + pred-target var-ratio split by the early-fused
+    CHANNEL groups (not token-band — r5 is a single band, the split lives in the reconstruction
+    feature dim). ``pred``/``tgt`` (B, total, DEC·C) reshape to (B, total, DEC, C); channels
+    ``[:n_hga]`` are the HGA |STFT| bins (combined), ``[n_hga:]`` the LFS raw. Same weighted
+    per-feature-variance definition as :func:`per_band_jepa_stats` (variance over the scored-token
+    axis, per feature, mean over features) so the {hga,lfs} curves land on the SAME wandb panel as
+    r4's {slow,mid,hga}. ``w`` (B, total) = ``in_loss`` (accept-the-bleed ⇒ every masked token)."""
+    B, total, dc = pred.shape
+    c = dc // decimate
+    pr = pred.reshape(B, total, decimate, c)
+    tg = tgt.reshape(B, total, decimate, c)
+    wf = w.reshape(1, B * total)
+    denom = w.sum().clamp_min(1.0)
+    out: dict[str, Tensor] = {}
+    for name, lo, hi in (("hga", 0, n_hga), ("lfs", n_hga, c)):
+        x_t = tg[..., lo:hi].reshape(B, total, -1)  # (B, total, g) group features (DEC·group_ch)
+        x_p = pr[..., lo:hi].reshape(B, total, -1)
+        n_feat = x_t.shape[-1]
+
+        def _mean_f_var(x: Tensor, _nf=n_feat) -> Tensor:
+            e_sq = (x.pow(2).sum(-1) * w).sum() / denom  # E[‖x‖²]
+            mean_vec = (wf @ x.reshape(B * total, _nf)).squeeze(0) / denom  # (F,)
+            return (e_sq - mean_vec.pow(2).sum()) / _nf
+
+        var_t = _mean_f_var(x_t)
+        var_p = _mean_f_var(x_p)
+        var_r = _mean_f_var(x_t - x_p)
+        out[f"jepa_{name}_explained_var"] = 1.0 - var_r / (var_t + _EPS)
+        out[f"jepa_{name}_pred_target_var_ratio"] = var_p / (var_t + _EPS)
+    return out
+
+
 def per_band_nll(
     mu: Tensor, cov: Tensor, target_q: Tensor, present_q: Tensor
 ) -> dict[str, Tensor]:
@@ -158,4 +193,7 @@ def cov_entropy_vs_floor(cov: Tensor, noise: Tensor) -> dict[str, Tensor]:
     }
 
 
-__all__ = ["per_band_jepa_stats", "per_band_nll", "cov_entropy_vs_floor", "BAND_NAMES"]
+__all__ = [
+    "per_band_jepa_stats", "early_fusion_recon_stats", "per_band_nll",
+    "cov_entropy_vs_floor", "BAND_NAMES",
+]

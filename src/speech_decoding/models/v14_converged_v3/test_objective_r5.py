@@ -139,6 +139,37 @@ def test_mae_arm_head_shape_no_teacher_single_loss() -> None:
     assert ok
 
 
+def test_mae_taps_split_recon_into_hga_and_lfs() -> None:
+    # collect_taps emits a LOG-ONLY HGA-vs-LFS recon split: mae_hga = MSE over the 4 |STFT|
+    # bins (combined), mae_lfs = MSE over the 1 raw LFS channel. The training loss is UNCHANGED
+    # (mean over all DEC·C=10). Invariant: mae_loss == (n_hga·DEC·mae_hga + n_lfs·DEC·mae_lfs)/
+    # (DEC·C) = (8·mae_hga + 2·mae_lfs)/10 — the channel-count weighting, not per-channel.
+    from speech_decoding.models.v14_converged_v3.stem import EARLY_FUSION_BINS
+
+    sc, geom = _session()
+    obj = _mae().eval()
+    out = obj(_streams(), geom, sc.parcel_id, _masks(geom), collect_taps=True)
+    assert out.taps is not None and "mae_hga" in out.taps and "mae_lfs" in out.taps
+    # health split (Ben): explained-var + pred-target var-ratio for {HGA, LFS}, NOT one band.
+    for k in ("jepa_hga_explained_var", "jepa_lfs_explained_var",
+              "jepa_hga_pred_target_var_ratio", "jepa_lfs_pred_target_var_ratio"):
+        assert k in out.taps and torch.isfinite(out.taps[k]), k
+    # the r4 leftover keys (degenerate zero-weight mid/slow) must be GONE.
+    assert not any(k.startswith("jepa_slow") or k.startswith("jepa_mid") for k in out.taps)
+    hga, lfs = float(out.taps["mae_hga"]), float(out.taps["mae_lfs"])
+    loss = float(out.loss.detach())
+    n_hga, n_lfs = EARLY_FUSION_BINS  # (4, 1)
+    recombined = (n_hga * EARLY_FUSION_DECIMATE * hga + n_lfs * EARLY_FUSION_DECIMATE * lfs) / DEC_C
+    ok = (
+        hga >= 0.0 and lfs >= 0.0
+        and abs(recombined - loss) < 1e-5  # split recomposes the training loss
+    )
+    print(f"[check] recon split: mae_hga={hga:.4f} mae_lfs={lfs:.4f}; "
+          f"(8·hga+2·lfs)/10={recombined:.4f} == loss={loss:.4f} "
+          f"{'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_mae_target_is_own_contacts_two_frames_five_channels() -> None:
     # THE r5 alignment invariant: token t (contact c, time_pos p) → the DEC·C fused input
     # values from frames {DEC·p, DEC·p+1}, channel order [f0 ch0..4, f1 ch0..4].
