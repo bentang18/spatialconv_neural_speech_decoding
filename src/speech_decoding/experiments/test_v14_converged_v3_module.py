@@ -115,6 +115,48 @@ def test_training_step_finite_scalar_loss() -> None:
     assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
+def _r5_session_batch(*, n_rows: int = 2, t_tokens: int = 8):
+    """An early-fusion (r5) batch: 2 streams (HGA F=4, LFS F=1) at 64 Hz = 2·T frames.
+    session_key SET so ``_plan_for`` exercises the cached-plan path (the crash surface)."""
+    labels = ["LA1", "LA2", "LA3", "LB1", "LB2"]
+    parcel_id = torch.tensor([0, 0, 0, 1, 1])
+    sc = build_sidecar(labels, parcel_id=parcel_id)
+    geom = build_l1_geometry(sc)
+    n, l64 = len(labels), 2 * t_tokens
+    bands = [torch.randn(n_rows, n, 4, l64), torch.randn(n_rows, n, 1, l64)]
+    return V3Batch(bands=bands, geom=geom, parcel_id=sc.parcel_id, session_key=(1, 0))
+
+
+def test_r5_plan_uses_32hz_clock_not_raw_64hz_frame_count() -> None:
+    """Regression: the plan cache derived n_time from batch.bands[0].shape[-1], which for r5
+    is the 64 Hz frame count (2·T), so session_plan grided a 2·T clock and m_vis (visible per
+    clip) came out 2× the real 576, overflowing build_visible_pack's fixed-shape sort with the
+    sentinel index `total`. It must use the 32 Hz clock T (clock_length_32hz). Arm0 hid this
+    because SLOW is already at 32 Hz."""
+    model = V3ConvergedModel(n_parcels=N_PARCELS, early_fusion=True)
+    mod = V14ConvergedV3Module(model=model, optim_config=_optim_config(weight_decay=0.04))
+    batch = _r5_session_batch(n_rows=2, t_tokens=8)
+    gms, m_vis, pms = mod._plan_for(batch)
+    # plan must be for T=8 (=16//2), so m_vis matches a T=8 grid — NOT the T=16 count.
+    exp = model.session_plan(batch.geom, batch.parcel_id, 8)
+    assert (gms, m_vis, pms) == exp, f"plan {(gms, m_vis, pms)} != T=8 plan {exp}"
+    wrong = model.session_plan(batch.geom, batch.parcel_id, 16)
+    assert m_vis != wrong[1], "m_vis still matches the raw-64Hz (T=16) grid — bug not fixed"
+
+
+def test_r5_training_step_finite_scalar_loss() -> None:
+    """End-to-end r5 fwd+bwd through EarlyFusionStem with a KEYED batch (plan cache active) —
+    the path that raised IndexError before the clock fix."""
+    model = V3ConvergedModel(n_parcels=N_PARCELS, early_fusion=True)
+    mod = V14ConvergedV3Module(model=model, optim_config=_optim_config(weight_decay=0.04))
+    loss = mod.training_step(_r5_session_batch(n_rows=2), 0)
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    loss.backward()
+    grads = [p.grad for p in mod.model.parameters()
+             if p.requires_grad and p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
 def test_mask_seed_is_step_deterministic_but_varies() -> None:
     mod = _module()
     g0a = mod._step_generator(torch.device("cpu")).initial_seed()

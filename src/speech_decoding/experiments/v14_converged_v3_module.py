@@ -38,6 +38,7 @@ from speech_decoding.experiments.monitors.grad_ratio import loss_grad_ratio
 from speech_decoding.experiments.optim_param_groups import maybe_split_no_decay
 from speech_decoding.models.v14_converged_v3.batch import V3Batch
 from speech_decoding.models.v14_converged_v3.model import V3ConvergedModel
+from speech_decoding.models.v14_converged_v3.stem import clock_length_32hz
 
 # Base offset so the per-step mask seed decorrelates across seeds/steps without
 # ever aliasing step N of seed A onto step M of seed B for small N.
@@ -241,7 +242,16 @@ class V14ConvergedV3Module(pl.LightningModule):
             return (None, None, None)
         plan = self._session_plan_cache.get(key)
         if plan is None:
-            n_time = int(batch.bands[0].shape[-1])
+            # n_time is the 32 Hz CLOCK length T, not the raw band frame count: r5's bands
+            # arrive at 64 Hz (2T) and native-fine SLOW/MID/HGA at T/8 / T/2 / 4T, so
+            # bands[0].shape[-1] != T for those frontends. Derive T the same way the model's
+            # forward does (clock_length_32hz) or session_plan grids a mis-sized T and m_vis
+            # overflows the visible pack (arm0 works only because SLOW is already at 32 Hz).
+            n_time = clock_length_32hz(
+                batch.bands,
+                native_fine_hga=self.model.native_fine_hga,
+                early_fusion=self.model.early_fusion,
+            )
             plan = self.model.session_plan(batch.geom, batch.parcel_id, n_time)
             self._session_plan_cache[key] = plan
         return plan
