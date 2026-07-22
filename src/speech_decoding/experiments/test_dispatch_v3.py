@@ -110,6 +110,7 @@ def _smoke_args(**over):
         ddp_static_graph=False, grad_ratio_every_n_steps=0,
         state_stats_dir=None, deep_sup=True,
         nll_warmup_start_step=0, nll_warmup_steps=0, resume_ckpt=None,
+        batch_unit=None, contact_budget=None, shaft_alpha=0.5,
     )
     a.update(over)
     return argparse.Namespace(**a)
@@ -295,10 +296,20 @@ def test_v3r5_threads_early_fusion_into_model_and_dataset(tmp_path) -> None:
         parcel_fn=_stub_parcel_fn, band_rates=R5_BAND_RATES,
     )
     assert specs[0].n_frames == 200  # 400 // 2 (64 Hz cache → 32 Hz clock)
-    m_r5, dm_r5, _ = build_v3_training(specs, _smoke_args(frontend="v3r5"))
+    # r5 (early_fusion) DEFAULTS to shaft-level cross-patient batching; shaft mode requires an
+    # explicit --contact-budget (the per-pack contact count that pins grid.total — no invented
+    # numeric default). The ShaftPackDataset still threads the same per-band read contract.
+    from speech_decoding.models.v14_converged_v3.shaft_dataset import ShaftPackDataset
+
+    m_r5, dm_r5, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5", contact_budget=16)
+    )
     assert m_r5.model.early_fusion is True
     assert m_r5.model.objective.early_fusion is True
     assert m_r5.model.native_fine_hga is False
+    assert dm_r5.batch_unit == "shaft"  # early_fusion ⇒ shaft is the default batch unit
+    assert isinstance(dm_r5.dataset, ShaftPackDataset)
+    assert dm_r5.dataset.contact_budget == 16
     assert dm_r5.dataset.band_rates == R5_BAND_RATES
     assert dm_r5.dataset.start_align == 1  # lcm(1,1) — single-rate lattice
 

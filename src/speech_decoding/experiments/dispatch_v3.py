@@ -288,6 +288,9 @@ def build_v3_training(
         ctx_warmup_start_step=getattr(args, "ctx_warmup_start_step", 0),
         ctx_warmup_steps=getattr(args, "ctx_warmup_steps", 0),
     )
+    # batch_unit default: r5 (early_fusion) ⇒ shaft-level (cross-patient) batching; the older
+    # session-homogeneous path stays the default for arm0/v3/v3fine. --batch-unit overrides.
+    batch_unit = args.batch_unit or ("shaft" if early_fusion else "session")
     dm = V3DataModule(
         sessions,
         batch_size=args.batch_size,
@@ -298,6 +301,9 @@ def build_v3_training(
         seed=args.seed,
         same_session=args.same_session_ranks,
         band_rates=band_rates,
+        batch_unit=batch_unit,
+        contact_budget=args.contact_budget,
+        shaft_alpha=args.shaft_alpha,
     )
     trainer = _build_trainer(args)
     return module, dm, trainer
@@ -520,6 +526,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "accept-the-bleed in_loss=masked). 'v3fine' REQUIRES the 3 native-rate "
                         "band caches; 'v3r5' REQUIRES exactly the 2 caches --band-cache-dir "
                         "v3hga --band-cache-dir v3lfs (HGA first).")
+    # --- batching unit (shaft-level cross-patient vs session-homogeneous) ---
+    p.add_argument("--batch-unit", dest="batch_unit", choices=("session", "shaft"),
+                   default=None,
+                   help="batch granularity. 'session' = v3 session-homogeneous (one patient/"
+                        "step). 'shaft' = cross-patient shaft-level: each step packs shafts from "
+                        "the GLOBAL pool (K distinct patients/step, constant compile footprint at "
+                        "scale). Default: 'shaft' for --frontend v3r5, else 'session'. Requires "
+                        "--contact-budget when shaft.")
+    p.add_argument("--contact-budget", dest="contact_budget", type=int, default=None,
+                   help="shaft mode: contacts per pack. Pins grid.total to ONE compiled shape "
+                        "(overfill-and-trim closes it exactly, no pad). Set to ~match session "
+                        "tokens/step (batch_size x mean-session-N).")
+    p.add_argument("--shaft-alpha", dest="shaft_alpha", type=float, default=0.5,
+                   help="shaft mode: temperature for P(subject) ~ n_shafts^alpha (0 = subject-"
+                        "uniform, 1 = shaft-uniform, 0.5 = sqrt-tempered default).")
     # --- trainer/precision (E2) ---
     p.add_argument("--ssl-max-steps", dest="ssl_max_steps", type=int, required=True)
     p.add_argument("--precision", default="bf16-mixed")

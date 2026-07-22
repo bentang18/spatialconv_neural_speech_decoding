@@ -34,6 +34,8 @@ from speech_decoding.models.v14_converged_v3.dataset import (
     V3SessionDataset,
     V3SessionSpec,
 )
+from speech_decoding.models.v14_converged_v3.shaft_batch import collate_shaft_pack
+from speech_decoding.models.v14_converged_v3.shaft_dataset import ShaftPackDataset
 
 
 class V3DataModule(pl.LightningDataModule):
@@ -54,16 +56,43 @@ class V3DataModule(pl.LightningDataModule):
         balance_ranks: bool = False,
         same_session: bool = False,
         band_rates: Sequence[tuple[int, int]] = UNIFORM_BAND_RATES,
+        batch_unit: str = "session",
+        contact_budget: int | None = None,
+        shaft_alpha: float = 0.5,
     ) -> None:
         super().__init__()
-        self.dataset = V3SessionDataset(
-            sessions,
-            clips_per_session=clips_per_session,
-            clip_frames=clip_frames,
-            fps=fps,
-            seed=seed,
-            band_rates=band_rates,
-        )
+        # batch_unit: "session" (v3 session-homogeneous batching) or "shaft" (cross-patient
+        # shaft-level batching — the r5 default; K distinct patients/step from the global
+        # shaft pool). The shaft path streams B=1 super-montage packs; the session path keeps
+        # the reused _SessionGroupedBatchSampler. Everything else (module, model) is shared.
+        self.batch_unit = str(batch_unit)
+        if self.batch_unit not in ("session", "shaft"):
+            raise ValueError(f"batch_unit must be 'session' or 'shaft', got {batch_unit!r}")
+        if self.batch_unit == "shaft":
+            if contact_budget is None:
+                raise ValueError("batch_unit='shaft' requires contact_budget (the per-pack "
+                                 "contact count that pins grid.total to one compiled shape)")
+            # packs/epoch: reuse the session clip budget × n_sessions as the per-epoch step
+            # count (max_steps bounds training anyway; the stream draws fresh packs each step).
+            self.dataset = ShaftPackDataset(
+                sessions,
+                contact_budget=int(contact_budget),
+                clip_frames=clip_frames,
+                fps=fps,
+                band_rates=band_rates,
+                packs_per_epoch=int(clips_per_session) * max(1, len(sessions)),
+                alpha=float(shaft_alpha),
+                seed=seed,
+            )
+        else:
+            self.dataset = V3SessionDataset(
+                sessions,
+                clips_per_session=clips_per_session,
+                clip_frames=clip_frames,
+                fps=fps,
+                seed=seed,
+                band_rates=band_rates,
+            )
         self._session_size = {
             s.session_key: len(s.setup.sidecar.labels) for s in sessions
         }
@@ -88,6 +117,22 @@ class V3DataModule(pl.LightningDataModule):
             self._sampler.set_epoch(epoch)
 
     def train_dataloader(self) -> DataLoader:
+        if self.batch_unit == "shaft":
+            # One pack → one V3Batch super-montage: the IterableDataset yields a
+            # list[ShaftClipSample] per step; batch_size=None disables auto-batching so
+            # collate_shaft_pack runs on that list directly. The dataset self-shards across
+            # DDP ranks/workers (disjoint seeds), so no DistributedSampler is needed.
+            kwargs: dict = dict(
+                batch_size=None,
+                collate_fn=collate_shaft_pack,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+            )
+            if self.num_workers > 0:
+                kwargs["persistent_workers"] = self.persistent_workers
+                kwargs["prefetch_factor"] = self.prefetch_factor
+            return DataLoader(self.dataset, **kwargs)
+
         self._sampler = _SessionGroupedBatchSampler(
             self.dataset.session_key_list(),
             self.batch_size,

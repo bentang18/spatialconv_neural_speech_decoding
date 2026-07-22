@@ -240,7 +240,14 @@ class V14ConvergedV3Module(pl.LightningModule):
         key = batch.session_key
         if key is None:
             return (None, None, None)
-        plan = self._session_plan_cache.get(key)
+        # Shaft packs (session_key = ("shaft_pack", ΣN)): the geometry CHANGES every step even
+        # at constant ΣN — different shafts ⇒ different max_seqlen and m_vis — so the
+        # per-session_key cache would hand every step the FIRST pack's STALE plan. Compute
+        # fresh each step (uncompiled; m_vis/max_seqlen are deterministic from THIS pack's
+        # shaft sizes). grid.total is pinned by the budget, so the compiled shape count stays
+        # bounded to the handful of distinct m_vis values.
+        is_pack = isinstance(key, tuple) and len(key) >= 1 and key[0] == "shaft_pack"
+        plan = None if is_pack else self._session_plan_cache.get(key)
         if plan is None:
             # n_time is the 32 Hz CLOCK length T, not the raw band frame count: r5's bands
             # arrive at 64 Hz (2T) and native-fine SLOW/MID/HGA at T/8 / T/2 / 4T, so
@@ -253,7 +260,8 @@ class V14ConvergedV3Module(pl.LightningModule):
                 early_fusion=self.model.early_fusion,
             )
             plan = self.model.session_plan(batch.geom, batch.parcel_id, n_time)
-            self._session_plan_cache[key] = plan
+            if not is_pack:
+                self._session_plan_cache[key] = plan
         return plan
 
     def training_step(self, batch: V3Batch, batch_idx: int) -> Tensor:
