@@ -126,10 +126,13 @@ def load_v3_sessions(
     desync. (``geom`` in particular CANNOT be masked post-hoc — ``gather_idx`` stores
     indices INTO the survivor axis, so dropping survivors invalidates every stored index.)
     ``None`` ⇒ keep everything (the training path; byte-identical to no argument)."""
-    if len(band_cache_dirs) != 3:
-        raise ValueError(f"expected 3 band cache dirs, got {len(band_cache_dirs)}")
-    if len(band_rates) != 3:
-        raise ValueError(f"expected 3 band_rates, got {len(band_rates)}")
+    # band-count agnostic: r4/arm0 pass 3 (slow, mid, hga); r5 passes 2 (v3hga, v3lfs).
+    # dirs must align to rates; everything below zips over band_indexes.
+    if len(band_cache_dirs) != len(band_rates):
+        raise ValueError(
+            f"band_cache_dirs ({len(band_cache_dirs)}) must align with band_rates "
+            f"({len(band_rates)}); pass 3 for r4/arm0, 2 for r5"
+        )
     band_indexes = [index_band_cache(d) for d in band_cache_dirs]
     bad_idx = index_bad_windows(span_dir)
     lof = parse_lof_report(lof_report_path)

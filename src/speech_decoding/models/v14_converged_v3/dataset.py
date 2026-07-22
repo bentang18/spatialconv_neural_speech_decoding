@@ -39,6 +39,10 @@ from torch.utils.data import Dataset
 # 128 Hz), extracted at native rate — the stem consumes them directly (memo
 # project-fine-hga-bt-rebake-tasklist-2026-07-21).
 UNIFORM_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 1), (1, 1), (1, 1))
+
+# r5 Chang 2-stream: both bands (v3hga, v3lfs) cached @64 Hz = 2× the 32 Hz clip clock;
+# the EarlyFusionStem pools 2 frames → 1 token (stride-2). So each band reads 2× frames.
+R5_BAND_RATES: tuple[tuple[int, int], ...] = ((2, 1), (2, 1))
 # Fine-HGA OFAT native rates vs the 32 Hz clip clock (SLOW 4 Hz = 1/8, MID 16 Hz = 1/2,
 # HGA 128 Hz = 4/1) — the SINGLE source of truth the dispatch --frontend flag reads.
 NATIVE_FINE_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 8), (1, 2), (4, 1))
@@ -154,8 +158,14 @@ class V3SessionDataset(Dataset):
         self.fps = float(fps)
         self._seed = int(seed)
         self.band_rates = tuple((int(n), int(d)) for n, d in band_rates)
-        if len(self.band_rates) != 3:
-            raise ValueError(f"expected 3 band_rates, got {len(self.band_rates)}")
+        # band-count agnostic: rates must align to each session's bands (3 for r4/arm0
+        # slow/mid/hga, 2 for r5 v3hga/v3lfs). __getitem__ zips over band_paths.
+        for s in self.sessions:
+            if len(s.band_paths) != len(self.band_rates):
+                raise ValueError(
+                    f"session {s.session_key}: {len(s.band_paths)} bands != "
+                    f"{len(self.band_rates)} band_rates"
+                )
         self.start_align = _start_align(self.band_rates)
         # invariant: every per-band clip length clip_frames·num//den must be integer,
         # else the band clip has an undefined boundary. Fail loud at construction.

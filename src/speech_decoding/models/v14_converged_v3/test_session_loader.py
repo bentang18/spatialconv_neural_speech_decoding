@@ -311,7 +311,8 @@ def test_default_uniform_reference_is_unchanged(tmp_path) -> None:
 def test_wrong_band_rates_count_fails_loud(tmp_path) -> None:
     sess = _mk_sessions()
     band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
-    with pytest.raises(ValueError, match="3 band_rates"):
+    # 3 dirs + 2 rates = misalignment ⇒ fail loud (band-count agnostic invariant).
+    with pytest.raises(ValueError, match="must align"):
         load_v3_sessions(
             sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
             parcel_fn=_stub_parcel_fn, band_rates=((1, 8), (1, 2)),
@@ -346,12 +347,28 @@ def test_disagreeing_band_channel_order_fails_loud(tmp_path) -> None:
 def test_wrong_band_dir_count_fails_loud(tmp_path) -> None:
     sess = _mk_sessions()
     band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
-    with pytest.raises(ValueError, match="3 band cache dirs"):
+    # 2 dirs + default 3 rates = misalignment ⇒ fail loud.
+    with pytest.raises(ValueError, match="must align"):
         load_v3_sessions(
             sessions=[(1, 0)],
             band_cache_dirs=band_dirs[:2], span_dir=span_dir,
             parcel_fn=_stub_parcel_fn,
         )
+
+
+def test_r5_two_band_load_succeeds(tmp_path) -> None:
+    # r5 (Chang 2-stream) passes 2 aligned dirs (v3hga, v3lfs) + R5_BAND_RATES; the loader
+    # is band-count agnostic now (was hard-locked to 3 for r4 slow/mid/hga).
+    from speech_decoding.models.v14_converged_v3.dataset import R5_BAND_RATES
+
+    sess = _mk_sessions()
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs[:2], span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=R5_BAND_RATES,
+    )
+    assert len(specs) == 1
+    assert len(specs[0].band_paths) == 2 and len(specs[0].band_norms) == 2
 
 
 def test_entry_for_ambiguous_raises() -> None:
