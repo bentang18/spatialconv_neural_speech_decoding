@@ -72,9 +72,9 @@ def test_accept_the_bleed_in_loss_equals_masked() -> None:
     masked, in_loss = token_flags_r5(grid, masks)
     # ACCEPT THE BLEED: no margin gate ⇒ every masked token scored.
     assert torch.equal(masked, in_loss)
-    # masked == contact OR temporal, reconstructed independently.
+    # masked == contact OR per-shaft temporal, reconstructed independently.
     contact_masked = masks.contact_mask[:, grid.contact]
-    temporal_masked = masks.temporal_mask[:, grid.bandpos]
+    temporal_masked = masks.temporal_mask[:, grid.shaft, grid.bandpos]  # per-shaft time axis
     assert torch.equal(masked, contact_masked | temporal_masked)
     assert masked.any() and not masked.all()  # non-degenerate
     print(f"[check] OK in_loss == masked (no gate); masked frac {masked.float().mean():.0%}")

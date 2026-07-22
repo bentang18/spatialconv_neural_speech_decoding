@@ -251,13 +251,16 @@ def sample_masks(
 class V3MasksR5:
     """r5 masks — ONE early-fused 32 Hz band (no SLOW/MID/HGA split).
 
-    SPACE (``contact_mask``) is the SAME per-shaft balanced tier as ``V3Masks``. TIME is a
-    SINGLE global temporal mask on the one 32 Hz grid — exactly ``round(temporal_mask_frac·T)``
-    tokens, contiguous width-``block_w_band`` blocks. Downstream (``pack_r4.token_flags_r5``)
-    scores EVERY masked token (``in_loss == masked``, accept-the-bleed) — no margin gate."""
+    SPACE (``contact_mask``) is the SAME per-shaft balanced tier as ``V3Masks``. TIME is
+    PER-SHAFT INDEPENDENT on the one 32 Hz grid — each ``(row, shaft)`` masks its OWN
+    ``round(temporal_mask_frac·T)`` timepoints in contiguous width-``temporal_block_w`` blocks
+    (L1-only shaft-local ⇒ each shaft is its own axiom). Shape-neutral: the count is identical
+    per shaft, so ``m_vis`` is unchanged — only WHICH timepoints a shaft hides differs.
+    Downstream (``pack_r4.token_flags_r5``) scores EVERY masked token (``in_loss == masked``,
+    accept-the-bleed) — no margin gate."""
 
     contact_mask: Tensor  # (R, N) bool — spatially masked contact.
-    temporal_mask: Tensor  # (R, T) bool — masked on the 32 Hz grid. Exactly round(frac·T).
+    temporal_mask: Tensor  # (R, S, T) bool — per-shaft. Exactly round(frac·T) per (row, shaft).
 
 
 def sample_masks_r5(
@@ -304,11 +307,15 @@ def sample_masks_r5(
     contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
     contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
 
-    # ── TIME (single 32 Hz grid; one contiguous-block temporal mask) ────────────
-    # width = temporal_block_w (6 = 187.5 ms); accept-the-bleed ⇒ no margin gate downstream.
-    ones = torch.ones(1, t, dtype=torch.bool, device=dev)
-    cover = _cover_rank(ones, cfg.temporal_block_w, r, generator).squeeze(1)  # (R, T)
+    # ── TIME (per-shaft INDEPENDENT 32 Hz masks) ────────────────────────────────
+    # L1-only shaft-local ⇒ each shaft is its own axiom: give every (row, shaft) its OWN
+    # contiguous-block temporal mask, not one shared across the pack's shafts. Shape-neutral —
+    # cnt is identical per shaft, so m_vis = (T−cnt)·Σ(visible contacts) is unchanged; only
+    # WHICH timepoints a shaft hides differs. width = temporal_block_w (6 = 187.5 ms @ 32 Hz);
+    # accept-the-bleed ⇒ no margin gate downstream.
+    ones = torch.ones(s, t, dtype=torch.bool, device=dev)
+    cover = _cover_rank(ones, cfg.temporal_block_w, r, generator)  # (R, S, T)
     cnt = round(cfg.temporal_mask_frac * t)
-    temporal_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, T) exactly cnt masked
+    temporal_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, S, T) exactly cnt per (row, shaft)
 
     return V3MasksR5(contact_mask=contact_mask, temporal_mask=temporal_mask)

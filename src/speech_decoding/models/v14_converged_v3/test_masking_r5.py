@@ -1,8 +1,9 @@
 """r5 (Chang 2-stream) single-band masking — ``sample_masks_r5``.
 
 r5 has ONE early-fused 32 Hz band, so masking is: the SAME per-shaft balanced SPACE tier as
-``sample_masks`` + ONE global temporal mask (``temporal_mask_frac``) on the single grid (no
-SLOW/MID/HGA trio). Invariants named + asserted + printed.
+``sample_masks`` + a PER-SHAFT temporal mask (``temporal_mask_frac``) on the single grid (no
+SLOW/MID/HGA trio) — each shaft hides its own timepoints (shaft = independent axiom).
+Invariants named + asserted + printed.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def test_shape_and_type() -> None:
     m = sample_masks_r5(geom, n, n_time=16, n_rows=5, generator=_gen())
     assert isinstance(m, V3MasksR5)
     assert m.contact_mask.shape == (5, n)
-    assert m.temporal_mask.shape == (5, 16)
+    assert m.temporal_mask.shape == (5, geom.n_shafts, 16)  # (R, S, T) — per-shaft time axis
     print(f"[check] OK V3MasksR5 contact {tuple(m.contact_mask.shape)} temporal {tuple(m.temporal_mask.shape)}")
 
 
@@ -65,18 +66,27 @@ def test_temporal_exact_count_and_frac_controls_it() -> None:
         cfg = V3MaskConfig(temporal_mask_frac=frac)
         m = sample_masks_r5(geom, n, n_time=t, n_rows=16, generator=_gen(1), cfg=cfg)
         want = round(frac * t)
-        counts = m.temporal_mask.sum(1)
+        counts = m.temporal_mask.sum(-1)  # (R, S) — count over the T axis, per shaft
         assert torch.all(counts == want), (frac, counts.unique().tolist())
-    print(f"[check] OK temporal count == round(frac·T) exactly for frac in {{0.25,0.5,0.75}}")
+    print(f"[check] OK temporal count == round(frac·T) exactly per (row, shaft) for frac in {{0.25,0.5,0.75}}")
 
 
-def test_temporal_is_global_no_shaft_axis() -> None:
-    # ONE temporal mask per row over the T grid — no per-shaft/per-contact axis.
-    sc, geom = _session([3, 5])
+def test_temporal_is_per_shaft_independent() -> None:
+    # (R, S, T): each shaft has its OWN temporal mask — shafts within a row hide DIFFERENT
+    # timepoints (the independence axiom). Count per shaft is identical (shape-neutral), but
+    # the masked SET differs across shafts, else this collapses back to a shared mask.
+    sc, geom = _session([3, 5, 4])
     n = int(geom.valid.sum())
     m = sample_masks_r5(geom, n, n_time=24, n_rows=4, generator=_gen(2))
-    assert m.temporal_mask.dim() == 2 and m.temporal_mask.shape == (4, 24)
-    print("[check] OK temporal mask is (R, T) global — no shaft axis")
+    assert m.temporal_mask.dim() == 3 and m.temporal_mask.shape == (4, geom.n_shafts, 24)
+    # some pair of shafts in some row must differ — a shared mask would make all rows equal.
+    tm = m.temporal_mask
+    any_differ = any(
+        not torch.equal(tm[r, i], tm[r, j])
+        for r in range(tm.shape[0]) for i in range(tm.shape[1]) for j in range(i + 1, tm.shape[1])
+    )
+    assert any_differ, "shafts share a temporal mask — not independent"
+    print("[check] OK temporal mask is (R, S, T) per-shaft — shafts hide different timepoints")
 
 
 def test_temporal_is_blocky_via_temporal_block_w() -> None:
@@ -88,7 +98,7 @@ def test_temporal_is_blocky_via_temporal_block_w() -> None:
     for w in (4, 6):
         cfg = V3MaskConfig(temporal_mask_frac=0.5, temporal_block_w=w)
         m = sample_masks_r5(geom, n, n_time=64, n_rows=16, generator=_gen(7), cfg=cfg)
-        runs = [r for row in m.temporal_mask for r in _runs(row)]
+        runs = [r for row in m.temporal_mask.reshape(-1, 64) for r in _runs(row)]  # per (row,shaft)
         means[w] = sum(runs) / len(runs)
     assert means[6] > means[4] > 1.5, means  # wider blocks ⇒ longer runs
     print(f"[check] OK temporal_block_w drives blockiness: mean run w4={means[4]:.2f} < w6={means[6]:.2f}")

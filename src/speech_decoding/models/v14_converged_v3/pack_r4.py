@@ -345,10 +345,11 @@ def token_flags_r5(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
 
     ACCEPT THE BLEED (memo project-r5-config-canonical-2026-07-21): ``in_loss == masked`` —
     EVERY masked token is scored, NO margin gate (the M14 margin gate is r4-only and stays
-    there). A token is masked iff its CONTACT is spatially masked OR the single global
-    temporal mask covers its ``time_pos``. ``masks`` (``masking.V3MasksR5``): ``contact_mask``
-    (B, N), ``temporal_mask`` (B, T). Returns the same tensor for both flags."""
+    there). A token is masked iff its CONTACT is spatially masked OR its OWN SHAFT's temporal
+    mask covers its ``time_pos``. ``masks`` (``masking.V3MasksR5``): ``contact_mask`` (B, N),
+    ``temporal_mask`` (B, S, T) — per-shaft. Returns the same tensor for both flags."""
     contact_masked = masks.contact_mask[:, grid.contact]  # (B, total)
-    temporal_masked = masks.temporal_mask[:, grid.bandpos]  # (B, total); bandpos == 32 Hz index
+    # per-shaft temporal: pick each token's OWN shaft mask at its 32 Hz index (bandpos).
+    temporal_masked = masks.temporal_mask[:, grid.shaft, grid.bandpos]  # (B, total)
     masked = contact_masked | temporal_masked
     return masked, masked
