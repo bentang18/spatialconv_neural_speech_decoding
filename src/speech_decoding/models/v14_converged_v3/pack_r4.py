@@ -152,7 +152,7 @@ def build_r4_grid(
 
 
 def pack_band_tokens(band_tokens: Sequence[Tensor], grid: R4Grid) -> Tensor:
-    """Flatten PerBandStem's per-band token tuples into the flat grid token order.
+    """Flatten per-band token tuples into the flat grid token order.
 
     ``band_tokens`` = (SLOW, MID, HGA) each ``(B, N, T_b, d)`` over the FULL N contacts
     (``stem.PerBandStem.forward`` output). Returns ``(B, total, d)`` in EXACTLY the order
@@ -160,9 +160,15 @@ def pack_band_tokens(band_tokens: Sequence[Tensor], grid: R4Grid) -> Tensor:
     then band-token index — so ``x_flat[:, t]`` is the token whose (contact, band, bandpos)
     is (``grid.contact[t]``, ``grid.band[t]``, ``grid.bandpos[t]``). No copy of the layout
     logic: the canonical contact order is read back off ``grid.contact`` (constant within
-    each k_full block), and bands are concatenated in spec order (== ``grid.band_lengths``)."""
-    if len(band_tokens) != N_BANDS:
-        raise ValueError(f"expected {N_BANDS} bands (SLOW, MID, HGA), got {len(band_tokens)}")
+    each k_full block), and bands are concatenated in spec order (== ``grid.band_lengths``).
+
+    Band-count agnostic: the expected stream count is ``len(grid.band_lengths)`` — 3 for the
+    r4/fine-HGA grids (SLOW, MID, HGA), 1 for the r5 single early-fused band (``build_r5_grid``).
+    r4 behaviour is byte-identical (its grids always carry 3 band_lengths)."""
+    if len(band_tokens) != len(grid.band_lengths):
+        raise ValueError(
+            f"expected {len(grid.band_lengths)} band token streams, got {len(band_tokens)}"
+        )
     b0 = band_tokens[0]
     B, d = b0.shape[0], b0.shape[-1]
     n = grid.total // grid.k_full
@@ -282,3 +288,67 @@ def token_flags(
     # temporal margin gate decides.
     in_loss = contact_masked | (temporal_masked & temporal_in_loss)
     return masked, in_loss
+
+
+# ── r5 (Chang 2-stream) single-band grid + accept-the-bleed flags ────────────────
+R5_STRIDE = 1  # one early-fused band, stride-1 lattice: token index == 32 Hz frame index.
+
+
+def build_r5_grid(
+    geom: L1Geometry, *, n_time: int, max_seqlen: int | None = None
+) -> R4Grid:
+    """r5 flat full-grid — ONE early-fused band at 32 Hz, stride-1 lattice.
+
+    The r5 stem (``EarlyFusionStem``) emits a SINGLE token stream at 32 Hz (T tokens per
+    contact), so the grid is the degenerate one-band case of :func:`build_r4_grid`: band 0
+    for every token, ``bandpos == time_pos == token index`` in [0, T), ``k_full == T``. The
+    R4Grid contract is unchanged (RoPE coords ``depth``/``time_pos``, ``cu_seqlens``,
+    shaft-contiguous order) so pack/pe/encoder are byte-identical to the multi-band path.
+
+    ``max_seqlen`` is a per-session CONSTANT; pass the cached value to skip its ``.item()``
+    host sync (compiled path). ``None`` ⇒ derive here (one sync — standalone fallback)."""
+    device = geom.gather_idx.device
+    S, max_c = geom.n_shafts, geom.max_c
+    k_full = int(n_time)
+
+    # canonical (shaft-major, slot) contact order — same as build_r4_grid.
+    rows = torch.arange(S, device=device)[:, None].expand(S, max_c)[geom.valid]  # (N,)
+    canon = geom.gather_idx[geom.valid]  # (N,) contact index into N
+    depth_canon = geom.depth[geom.valid]  # (N,) clinical depth
+    n = int(canon.shape[0])
+
+    pos_blk = torch.arange(k_full, device=device)  # (T,) token index == lattice (stride 1)
+
+    depth = depth_canon.repeat_interleave(k_full)
+    contact = canon.repeat_interleave(k_full)
+    shaft = rows.repeat_interleave(k_full)
+    band = torch.zeros(n * k_full, dtype=torch.long, device=device)  # single band 0
+    bandpos = pos_blk.repeat(n)
+    time_pos = pos_blk.repeat(n)  # stride 1 ⇒ lattice position == token index
+
+    n_per_shaft = geom.valid.sum(dim=1).to(torch.long)  # (S,)
+    seg = (n_per_shaft * k_full).to(torch.int32)  # (S,)
+    cu = torch.zeros(S + 1, dtype=torch.int32, device=device)
+    cu[1:] = seg.cumsum(0).to(torch.int32)
+    if max_seqlen is None:
+        max_seqlen = int((n_per_shaft.max() * k_full).item())
+
+    return R4Grid(
+        depth=depth, time_pos=time_pos, contact=contact, band=band, bandpos=bandpos,
+        shaft=shaft, cu_seqlens=cu, cu_seqlens_drop=_drop_offsets(cu),
+        max_seqlen=max_seqlen, total=n * k_full, k_full=k_full, band_lengths=(k_full,),
+    )
+
+
+def token_flags_r5(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
+    """(masked, in_loss) each (B, total) bool for the r5 single-band grid.
+
+    ACCEPT THE BLEED (memo project-r5-config-canonical-2026-07-21): ``in_loss == masked`` —
+    EVERY masked token is scored, NO margin gate (the M14 margin gate is r4-only and stays
+    there). A token is masked iff its CONTACT is spatially masked OR the single global
+    temporal mask covers its ``time_pos``. ``masks`` (``masking.V3MasksR5``): ``contact_mask``
+    (B, N), ``temporal_mask`` (B, T). Returns the same tensor for both flags."""
+    contact_masked = masks.contact_mask[:, grid.contact]  # (B, total)
+    temporal_masked = masks.temporal_mask[:, grid.bandpos]  # (B, total); bandpos == 32 Hz index
+    masked = contact_masked | temporal_masked
+    return masked, masked

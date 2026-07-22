@@ -130,3 +130,39 @@ def test_batched_clips_get_independent_masks() -> None:
         _bands(n, B=4), geom, sc.parcel_id, generator=_gen()
     )
     assert torch.isfinite(out.loss)
+
+
+# ── r5 (Chang 2-stream early-fusion) model wiring ───────────────────────────────
+def _streams_r5(n, B=1):
+    """(HGA (B,n,4,2T), LFS (B,n,1,2T)) — 64 Hz frames for the r5 EarlyFusionStem."""
+    return [torch.randn(B, n, 4, 2 * T32), torch.randn(B, n, 1, 2 * T32)]
+
+
+def test_r5_end_to_end_jepa_and_mae() -> None:
+    sc, geom = _session()
+    n = len(sc.labels)
+    for mae in (False, True):
+        model = V3ConvergedModel(n_parcels=N_PARCELS, early_fusion=True, mae=mae)
+        out = model(_streams_r5(n, B=2), geom, sc.parcel_id, generator=_gen())
+        assert out.loss.ndim == 0 and torch.isfinite(out.loss) and out.loss.requires_grad
+        out.loss.backward()  # grads flow through the EarlyFusionStem
+        online = model.objective.online
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in online.stem.parameters()
+        )
+
+
+def test_r5_session_plan_matches_forward_shapes() -> None:
+    # session_plan must precompute the SAME per-session shape constants the r5 forward derives,
+    # so the compiled path (passing them in) equals the eager path (deriving them).
+    sc, geom = _session()
+    n = len(sc.labels)
+    model = V3ConvergedModel(n_parcels=N_PARCELS, early_fusion=True)
+    gms, m_vis, pms = model.session_plan(geom, sc.parcel_id, T32)
+    # feed the cached constants back in — forward must run finite and consistent.
+    out = model(
+        _streams_r5(n, B=2), geom, sc.parcel_id, generator=_gen(),
+        grid_max_seqlen=gms, m_vis=m_vis, pack_max_seqlen=pms,
+    )
+    assert torch.isfinite(out.loss)
+    assert gms > 0 and m_vis > 0 and pms > 0

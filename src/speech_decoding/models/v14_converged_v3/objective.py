@@ -46,10 +46,12 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
     R4Grid,
     VisiblePack,
     build_r4_grid,
+    build_r5_grid,
     build_visible_pack,
     pack_band_tokens,
     scatter_visible,
     token_flags,
+    token_flags_r5,
 )
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.perceiver import PerceiverHead
@@ -66,7 +68,10 @@ from speech_decoding.models.v14_converged_v3.state_target import (
     build_state_target,
 )
 from speech_decoding.models.v14_converged_v3.stem import (
+    EARLY_FUSION_CHANNELS,
+    EARLY_FUSION_DECIMATE,
     PER_BAND_SPECS,
+    EarlyFusionStem,
     FineHgaStem,
     PerBandStem,
     clock_length_32hz,
@@ -135,14 +140,28 @@ class _TargetTower(nn.Module):
     """
 
     def __init__(
-        self, *, n_parcels: int, deep_sup: bool = True, native_fine_hga: bool = False
+        self,
+        *,
+        n_parcels: int,
+        deep_sup: bool = True,
+        native_fine_hga: bool = False,
+        early_fusion: bool = False,
     ) -> None:
         super().__init__()
         # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
         # HGA 4 bins conv-pooled 128→32Hz) instead of arm0's uniform-32Hz PerBandStem.
         # Same (tokens, positions) contract + same 32Hz output lattice, so masking/pack/
         # pe/encoder are byte-identical (memo project-fine-hga-bt-rebake-tasklist-2026-07-21).
-        self.stem = FineHgaStem(D_MODEL) if native_fine_hga else PerBandStem(D_MODEL)
+        # early_fusion (r5): the Chang 2-stream EarlyFusionStem — HGA⊕LFS → ONE 32Hz token
+        # stream (a degenerate single-band grid). Mutually exclusive with native_fine_hga.
+        if early_fusion and native_fine_hga:
+            raise ValueError("early_fusion and native_fine_hga are mutually exclusive")
+        if early_fusion:
+            self.stem = EarlyFusionStem(D_MODEL)
+        elif native_fine_hga:
+            self.stem = FineHgaStem(D_MODEL)
+        else:
+            self.stem = PerBandStem(D_MODEL)
         self.encoder = build_encoder(n_parcels=n_parcels, deep_sup=deep_sup)
 
     def forward(
@@ -180,9 +199,17 @@ class V3JepaObjective(nn.Module):
         lambda_ctx: float = LAMBDA_CTX,
         mae: bool = False,
         native_fine_hga: bool = False,
+        early_fusion: bool = False,
     ) -> None:
         super().__init__()
         self.native_fine_hga = bool(native_fine_hga)
+        # early_fusion (r5, Chang 2-stream): EarlyFusionStem + single-band stride-1 grid
+        # (build_r5_grid) + single temporal mask + accept-the-bleed scoring (token_flags_r5,
+        # in_loss == masked). Objective stays swappable (JEPA-latent OR MAE-recon). Mutually
+        # exclusive with native_fine_hga. Memo: project-r5-config-canonical-2026-07-21.
+        self.early_fusion = bool(early_fusion)
+        if self.early_fusion and self.native_fine_hga:
+            raise ValueError("early_fusion and native_fine_hga are mutually exclusive")
         # MAE arm (Masked Autoencoder target, He 2021 / AudioMAE): the ONLY change vs the
         # JEPA arm is the prediction TARGET — reconstruct this token's OWN norm_pix'd input
         # |STFT| bins instead of the EMA-teacher latent. No EMA teacher, no secondary/context.
@@ -230,6 +257,7 @@ class V3JepaObjective(nn.Module):
         self.online = _TargetTower(
             n_parcels=n_parcels, deep_sup=self.deep_sup,
             native_fine_hga=self.native_fine_hga,
+            early_fusion=self.early_fusion,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
@@ -254,16 +282,30 @@ class V3JepaObjective(nn.Module):
             self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
         self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
         if self.mae:
-            # MAE decoder_pred = per-band reconstruction heads, one Linear(d_pred → F_b) per
-            # band (SLOW 7 / MID 6 / HGA 7) — the transpose-twin of PerBandStem's per-band
-            # INPUT projections. Fed by the predictor's terminal norm_out (= MAE decoder_norm),
-            # each emits its band's own |STFT| bins; no wide teacher-target projection.
             self.pred_to_target = None
             self.pred_to_target_context = None
-            self.mae_heads = nn.ModuleList(
-                nn.Linear(PRED_D_MODEL, nb) for nb, _ in PER_BAND_SPECS
-            )
-            self.mae_heads.apply(init_transformer_weights)
+            if self.early_fusion:
+                # r5 MAE decoder_pred = ONE Linear(d_pred → DEC·C) reconstructing this token's
+                # OWN 2 raw 64 Hz frames × 5 fused channels (10 values). Plain per-channel MSE
+                # on the load-time z-scored channels ⇒ 4:1 HGA:LFS by construction, NO per-token
+                # norm_pix (norm_pix would re-normalise per token and destroy the count=ratio).
+                # Linear (He-2022: the predictor transformer IS the nonlinear decoder, the head a
+                # linear readout); an MLP head is a flagged OFAT if linear underperforms.
+                self.mae_head_r5 = nn.Linear(
+                    PRED_D_MODEL, EARLY_FUSION_DECIMATE * EARLY_FUSION_CHANNELS
+                )
+                self.mae_heads = None
+                init_transformer_weights(self.mae_head_r5)
+            else:
+                # MAE decoder_pred = per-band reconstruction heads, one Linear(d_pred → F_b) per
+                # band (SLOW 7 / MID 6 / HGA 7) — the transpose-twin of PerBandStem's per-band
+                # INPUT projections. Fed by the predictor's terminal norm_out (= MAE
+                # decoder_norm), each emits its band's own |STFT| bins; no wide teacher target.
+                self.mae_head_r5 = None
+                self.mae_heads = nn.ModuleList(
+                    nn.Linear(PRED_D_MODEL, nb) for nb, _ in PER_BAND_SPECS
+                )
+                self.mae_heads.apply(init_transformer_weights)
         else:
             self.pred_to_target = nn.Linear(PRED_D_MODEL, target_dim)
             # Context head (upstream ``predictor_proj_context``): a SEPARATE wide Linear so the
@@ -285,12 +327,13 @@ class V3JepaObjective(nn.Module):
         # concat (1024) the CONTEXT encoder emits, so it exists ONLY under deep_sup; the
         # single-tap ablation arm has no secondary. Its own fusion (1024→d_perc) is SEPARATE
         # from enc_to_pred — the shared trunk is the ENCODER, not the fusion.
+        # r5 (early_fusion) CUTS the secondary (WASH per board @20k) ⇒ no perceiver params.
         self.perceiver = (
             PerceiverHead(
                 n_parcels=n_parcels,
                 point_only=self.secondary_loss in ("l1", "diag_nll"),
             )
-            if self.deep_sup and not self.mae
+            if self.deep_sup and not self.mae and not self.early_fusion
             else None
         )
 
@@ -327,14 +370,22 @@ class V3JepaObjective(nn.Module):
         ``collect_taps`` (monitor cadence): also return the detached encoder block-12
         VISIBLE-cell tap (rankme / feat_std).
         """
-        T = clock_length_32hz(bands, native_fine_hga=self.native_fine_hga)  # 32 Hz clock
+        T = clock_length_32hz(
+            bands, native_fine_hga=self.native_fine_hga, early_fusion=self.early_fusion
+        )  # 32 Hz clock
         # grid_max_seqlen / m_vis / pack_max_seqlen are per-session Python-int shape constants
         # (the module caches them via ``V3ConvergedModel.session_plan`` and passes them in);
         # supplying them skips the per-step ``.item()`` host syncs that otherwise break the
         # compiled graph. None ⇒ derive them here (one sync each — the eager/standalone path).
-        grid = build_r4_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
-        parcel_packed = parcel_id[grid.contact]  # (total,) long
-        masked, in_loss = token_flags(grid, masks)  # (B, total) bool each
+        # r5 (early_fusion): single-band stride-1 grid + accept-the-bleed flags (in_loss==masked).
+        if self.early_fusion:
+            grid = build_r5_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
+            parcel_packed = parcel_id[grid.contact]
+            masked, in_loss = token_flags_r5(grid, masks)  # (B, total) bool; in_loss == masked
+        else:
+            grid = build_r4_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
+            parcel_packed = parcel_id[grid.contact]  # (total,) long
+            masked, in_loss = token_flags(grid, masks)  # (B, total) bool each
         pack = build_visible_pack(
             grid, masked, parcel_packed, m_vis=m_vis, max_seqlen=pack_max_seqlen
         )
@@ -364,6 +415,12 @@ class V3JepaObjective(nn.Module):
         if self.mae:
             if stat_mean is not None or stat_std is not None:
                 raise ValueError("MAE arm has no secondary NLL; do not pass state-stats")
+            if self.early_fusion:
+                return self._mae_output_r5(
+                    bands, grid, h, in_loss,
+                    enc_taps=enc_taps if collect_taps else None,
+                    collect_taps=collect_taps,
+                )
             return self._mae_output(
                 bands, grid, h, in_loss,
                 enc_taps=enc_taps if collect_taps else None,
@@ -586,6 +643,67 @@ class V3JepaObjective(nn.Module):
             nll_loss=None,
             ctx_loss=None,
         )
+
+    # ── r5 MAE arm (Chang 2-stream raw-frame reconstruction) ─────────────────────
+    def _mae_output_r5(
+        self,
+        bands: Sequence[Tensor],
+        grid: R4Grid,
+        h: Tensor,
+        in_loss: Tensor,
+        *,
+        enc_taps: dict[int, Tensor] | None,
+        collect_taps: bool,
+    ) -> JepaOutput:
+        """r5 MAE loss: reconstruct each masked token's OWN 2 raw 64 Hz frames × 5 channels.
+
+        Target = the DEC(2)·C(5)=10 fused input values that stride-2 the stem pooled into this
+        32 Hz token (already load-time per-(elec,bin)/(elec) robust-z'd). Plain per-channel MSE
+        over the 10 values — NO per-token norm_pix, so the 4 HGA bins vs 1 LFS channel keep
+        their amplitude ratio ⇒ 4:1 HGA:LFS by construction (memo). Masked-mean over the
+        accept-the-bleed ``in_loss`` set (== masked). ``h`` (B, total, d_pred) is the predictor
+        output AFTER its terminal ``norm_out`` (= MAE decoder_norm)."""
+        assert self.mae_head_r5 is not None  # r5 MAE always builds it
+        target = self._mae_gather_target_r5(bands, grid)  # (B, total, DEC·C)
+        pred = self.mae_head_r5(h)  # (B, total, DEC·C)
+        target = target.to(pred.dtype)
+        w = in_loss.to(pred.dtype)  # (B, total) accept-the-bleed masked weight
+        se_tok = ((pred - target) ** 2).mean(-1)  # (B, total) per-token MSE over the 10 values
+        mae_loss = (se_tok * w).sum() / w.sum().clamp(min=1.0)
+
+        taps = None
+        if collect_taps:
+            assert enc_taps is not None
+            d_enc = enc_taps[12].shape[-1]
+            taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
+            with torch.no_grad():  # single-band recon health (all tokens band 0)
+                taps.update(per_band_jepa_stats(pred, target, w, grid.band))
+        return JepaOutput(
+            loss=mae_loss,
+            n_masked=w.sum().detach(),
+            taps=taps,
+            jepa_loss=None,  # single loss (no ramped secondary) ⇒ trainer uses out.loss
+            nll_loss=None,
+            ctx_loss=None,
+        )
+
+    def _mae_gather_target_r5(
+        self, bands: Sequence[Tensor], grid: R4Grid
+    ) -> Tensor:
+        """Gather each flat token's OWN 2 raw 64 Hz frames × 5 fused channels → (B, total, DEC·C).
+
+        ``bands`` = (HGA (B,N,4,L), LFS (B,N,1,L)) at 64 Hz frames (L = 2T), already robust-z'd
+        at load. A token of (contact c, time_pos p) pooled 64→32 Hz from frames {DEC·p, DEC·p+1}
+        (stem stride-2, ``time_pos == 32 Hz index`` on the r5 grid). Stack the 2 streams to 5
+        channels, flatten (contact, frame) into one axis, and index with ONE static linear index
+        per frame offset — no boolean/data-dependent gather (compile-safe). Value order per token:
+        [frame0 ch0..4, frame1 ch0..4] (== the head's DEC·C output layout)."""
+        fused = torch.cat([bands[0], bands[1]], dim=2)  # (B, N, C=5, L)
+        B, N, C, L = fused.shape
+        ft = fused.permute(0, 1, 3, 2).reshape(B, N * L, C)  # (B, N·L, 5)
+        lin0 = grid.contact * L + EARLY_FUSION_DECIMATE * grid.time_pos  # (total,) frame DEC·p
+        frames = [ft[:, lin0 + f, :] for f in range(EARLY_FUSION_DECIMATE)]  # DEC × (B, total, 5)
+        return torch.stack(frames, dim=2).reshape(B, grid.total, EARLY_FUSION_DECIMATE * C)
 
     def _mae_gather_target(
         self, bands: Sequence[Tensor], grid: R4Grid

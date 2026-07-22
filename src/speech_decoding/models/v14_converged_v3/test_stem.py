@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from speech_decoding.models.v14_converged_v3.stem import (
+    EarlyFusionStem,
     FineHgaStem,
     PerBandStem,
     SpectralStem,
@@ -304,6 +305,28 @@ def test_clock_native_derives_t32_from_agreeing_bands() -> None:
     assert clock_length_32hz(_fine_bands(), native_fine_hga=True) == T32
 
 
+def test_clock_early_fusion_halves_64hz_to_32hz() -> None:
+    # r5: HGA/LFS both at 64 Hz (2·T32 = 256 frames) ⇒ stem stride-2 → T32 = 128.
+    hga, lfs = _ef_streams()
+    assert clock_length_32hz((hga, lfs), early_fusion=True) == T32
+
+
+def test_clock_early_fusion_stream_disagreement_raises() -> None:
+    hga = torch.randn(B, C, EF_HGA_BINS, EF_L)
+    lfs = torch.randn(B, C, EF_LFS_CH, EF_L - 2)  # LFS off the 64 Hz clock
+    with pytest.raises(ValueError, match="disagree on the 32 Hz clock"):
+        clock_length_32hz((hga, lfs), early_fusion=True)
+    odd = torch.randn(B, C, EF_HGA_BINS, EF_L - 1)  # 255, odd → not 2T
+    with pytest.raises(ValueError, match="must be even"):
+        clock_length_32hz((odd, odd), early_fusion=True)
+
+
+def test_clock_early_fusion_and_native_mutually_exclusive() -> None:
+    hga, lfs = _ef_streams()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        clock_length_32hz((hga, lfs), native_fine_hga=True, early_fusion=True)
+
+
 def test_clock_native_disagreeing_bands_raise() -> None:
     # a mis-shaped SLOW (15 frames → 120 ≠ 128) must fail loud, not silently mis-grid.
     slow = torch.randn(B, C, 7, 15)
@@ -311,3 +334,127 @@ def test_clock_native_disagreeing_bands_raise() -> None:
     hga = torch.randn(B, C, FH_HGA_BINS, FH_HGA_IN)
     with pytest.raises(ValueError, match="disagree on the 32 Hz clock"):
         clock_length_32hz((slow, mid, hga), native_fine_hga=True)
+
+
+# ── EarlyFusionStem (r5 Chang 2-stream single-rate; 2026-07-21) ──────────────────
+# HGA 4-bin ⊕ LFS 1-ch, BOTH at 64 Hz frames = 2·T32 = 256 on a 4 s clip; the stem's
+# single stride-2 conv decimates 64 → 32 Hz ⇒ T32 = 128 tokens, stride-1 lattice.
+EF_L = 2 * T32  # 256 frames @64 Hz
+EF_HGA_BINS, EF_LFS_CH = 4, 1
+
+
+def _ef_streams(bB: int = B, cC: int = C):
+    hga = torch.randn(bB, cC, EF_HGA_BINS, EF_L)
+    lfs = torch.randn(bB, cC, EF_LFS_CH, EF_L)
+    return hga, lfs
+
+
+def test_ef_single_rate_tokens_on_32hz_clock() -> None:
+    stem = EarlyFusionStem(d_model=D)
+    toks, pos = stem(_ef_streams())
+    assert len(toks) == 1 and len(pos) == 1  # single-rate: ONE token stream
+    assert toks[0].shape == (B, C, T32, D)
+    assert pos[0].shape[0] == T32
+
+
+def test_ef_lattice_is_stride_one() -> None:
+    # single-rate ⇒ lattice position == token index (stride 1), unlike the 8/2/1 of the
+    # multi-rate stems. This is the L1 time-RoPE coordinate.
+    stem = EarlyFusionStem(d_model=D)
+    _, pos = stem(_ef_streams())
+    assert torch.equal(pos[0], torch.arange(T32))
+
+
+def test_ef_five_channels_two_convs_no_linear_no_embed_no_norm() -> None:
+    stem = EarlyFusionStem(d_model=D)
+    convs = [m for m in stem.modules() if isinstance(m, torch.nn.Conv1d)]
+    assert len(convs) == 2
+    # layer 1: 5→d, k3, s1, pad1 (band-mix + short temporal filter).
+    assert (convs[0].in_channels, convs[0].out_channels) == (5, D)
+    assert convs[0].kernel_size == (3,) and convs[0].stride == (1,) and convs[0].padding == (1,)
+    # layer 2: d→d, k3, s2, pad1 (decimate 64→32).
+    assert (convs[1].in_channels, convs[1].out_channels) == (D, D)
+    assert convs[1].kernel_size == (3,) and convs[1].stride == (2,) and convs[1].padding == (1,)
+    assert any(isinstance(m, torch.nn.GELU) for m in stem.modules())
+    # memo: single early-fused conv token — NO Linear proj, NO band embed, NO per-band norm.
+    assert not any(isinstance(m, torch.nn.Linear) for m in stem.modules())
+    assert not any(isinstance(m, torch.nn.Embedding) for m in stem.modules())
+    assert not any(
+        isinstance(m, (torch.nn.LayerNorm, torch.nn.BatchNorm1d, torch.nn.GroupNorm))
+        for m in stem.modules()
+    )
+
+
+def test_ef_receptive_field_is_five_frames_accepted_bleed() -> None:
+    # 2×(k3,s1 then k3,s2): 32 Hz token o covers 64 Hz frames [2o-2, 2o+2] (5-frame RF).
+    # An impulse at frame 20 perturbs tokens {9,10,11} — adjacent tokens share 3 of 5
+    # frames = the ACCEPTED conv-RF bleed (r5 scores all masked tokens, no margin gate).
+    stem = EarlyFusionStem(d_model=D)
+    base_h = torch.zeros(1, 1, EF_HGA_BINS, EF_L)
+    base_l = torch.zeros(1, 1, EF_LFS_CH, EF_L)
+    imp_h = base_h.clone()
+    imp_h[0, 0, :, 20] = 5.0
+    with torch.no_grad():
+        t_base, _ = stem((base_h, base_l))
+        t_imp, _ = stem((imp_h, base_l))
+    diff = (t_imp[0] - t_base[0]).abs().sum(dim=-1)[0, 0]  # (T32,) per-token change
+    changed = torch.nonzero(diff > 1e-6).flatten().tolist()
+    assert changed == [9, 10, 11], f"RF not the expected 3-token bleed: {changed}"
+
+
+def test_ef_lfs_channel_reaches_tokens() -> None:
+    # the LFS stream (concat channel 4) must actually drive the output, not be dropped:
+    # an impulse in LFS alone perturbs the same local token window as an HGA impulse.
+    stem = EarlyFusionStem(d_model=D)
+    base_h = torch.zeros(1, 1, EF_HGA_BINS, EF_L)
+    base_l = torch.zeros(1, 1, EF_LFS_CH, EF_L)
+    imp_l = base_l.clone()
+    imp_l[0, 0, :, 20] = 5.0
+    with torch.no_grad():
+        t_base, _ = stem((base_h, base_l))
+        t_imp, _ = stem((base_h, imp_l))
+    diff = (t_imp[0] - t_base[0]).abs().sum(dim=-1)[0, 0]
+    changed = torch.nonzero(diff > 1e-6).flatten().tolist()
+    assert changed == [9, 10, 11], f"LFS impulse did not reach tokens: {changed}"
+
+
+def test_ef_arbitrary_leading_dims() -> None:
+    stem = EarlyFusionStem(d_model=D)
+    hga = torch.randn(C, EF_HGA_BINS, EF_L)  # no batch axis
+    lfs = torch.randn(C, EF_LFS_CH, EF_L)
+    toks, pos = stem((hga, lfs))
+    assert toks[0].shape == (C, T32, D)
+    assert pos[0].shape[0] == T32
+
+
+def test_ef_wrong_stream_count_raises() -> None:
+    stem = EarlyFusionStem(d_model=D)
+    hga, lfs = _ef_streams()
+    with pytest.raises(ValueError, match="2 streams"):
+        stem((hga,))
+    with pytest.raises(ValueError, match="2 streams"):
+        stem((hga, lfs, hga))
+
+
+def test_ef_wrong_bins_raise() -> None:
+    stem = EarlyFusionStem(d_model=D)
+    _, lfs = _ef_streams()
+    bad_hga = torch.randn(B, C, 7, EF_L)  # 7 bins, expected 4
+    with pytest.raises(ValueError, match="HGA has"):
+        stem((bad_hga, lfs))
+    hga, _ = _ef_streams()
+    bad_lfs = torch.randn(B, C, 2, EF_L)  # 2 channels, expected 1
+    with pytest.raises(ValueError, match="LFS has"):
+        stem((hga, bad_lfs))
+
+
+def test_ef_mismatched_or_odd_frame_count_raises() -> None:
+    stem = EarlyFusionStem(d_model=D)
+    hga = torch.randn(B, C, EF_HGA_BINS, EF_L)
+    lfs_short = torch.randn(B, C, EF_LFS_CH, EF_L - 2)  # disagree with HGA
+    with pytest.raises(ValueError, match="frame counts disagree"):
+        stem((hga, lfs_short))
+    hga_odd = torch.randn(B, C, EF_HGA_BINS, EF_L - 1)  # 255, odd
+    lfs_odd = torch.randn(B, C, EF_LFS_CH, EF_L - 1)
+    with pytest.raises(ValueError, match="must be even"):
+        stem((hga_odd, lfs_odd))

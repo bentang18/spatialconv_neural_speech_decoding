@@ -73,6 +73,7 @@ class V3MaskConfig:
     mid_mask_frac: float = 0.50  # MID masked on its 16 Hz grid (Ben: 50% for symmetry).
     slow_mask_frac: float = 0.50  # SLOW masked on its 4 Hz grid (Ben 2026-07-15: 50%, first-class band).
     block_w_band: int = 4  # leak-safe block width in a band's OWN tokens (M14 margin 2); same all 3.
+    temporal_mask_frac: float = 0.50  # r5 ONLY: single early-fused 32 Hz grid masked (T7-tunable).
 
 
 @dataclass(frozen=True)
@@ -237,3 +238,70 @@ def sample_masks(
         mid_mask=mid_mask,
         slow_mask=slow_mask,
     )
+
+
+# ── r5 (Chang 2-stream) single early-fused band masking ─────────────────────────
+@dataclass(frozen=True)
+class V3MasksR5:
+    """r5 masks — ONE early-fused 32 Hz band (no SLOW/MID/HGA split).
+
+    SPACE (``contact_mask``) is the SAME per-shaft balanced tier as ``V3Masks``. TIME is a
+    SINGLE global temporal mask on the one 32 Hz grid — exactly ``round(temporal_mask_frac·T)``
+    tokens, contiguous width-``block_w_band`` blocks. Downstream (``pack_r4.token_flags_r5``)
+    scores EVERY masked token (``in_loss == masked``, accept-the-bleed) — no margin gate."""
+
+    contact_mask: Tensor  # (R, N) bool — spatially masked contact.
+    temporal_mask: Tensor  # (R, T) bool — masked on the 32 Hz grid. Exactly round(frac·T).
+
+
+def sample_masks_r5(
+    geom: L1Geometry,
+    n_contacts: int,
+    *,
+    n_time: int,
+    n_rows: int,
+    generator: torch.Generator,
+    cfg: V3MaskConfig = V3MaskConfig(),
+) -> V3MasksR5:
+    """Sample ``n_rows`` r5 masks: per-shaft balanced SPACE + ONE 32 Hz temporal mask.
+
+    The SPACE tier is a faithful copy of :func:`sample_masks` (kept SEPARATE so the
+    seed-sensitive locked r4 sampler is untouched). r5 has a SINGLE band, so there is one
+    temporal mask (``temporal_mask_frac``) instead of the SLOW/MID/HGA trio."""
+    r, s, c = n_rows, geom.n_shafts, geom.max_c
+    n, t = n_contacts, n_time
+    valid = geom.valid  # (S, C)
+    dev = valid.device
+    cs = valid.sum(1)  # (S,)
+
+    def rand(*shape: int) -> Tensor:
+        return torch.rand(*shape, generator=generator, device=dev)
+
+    # ── SPACE (per-shaft balanced) — faithful copy of sample_masks ──────────────
+    d_s_base = torch.round(cfg.space_frac * cs.float()).long()
+    if cfg.keep_alive:
+        d_s_base = torch.minimum(d_s_base, (cs - 1).clamp(min=0))
+    d = d_s_base.sum()
+    k_max = _k_max(cs, d)
+    k = (rand(r, s) < cfg.whole_shaft_frac).sum(1).clamp(max=k_max)  # (R,)
+    ws_rank = rand(r, s).argsort(1).argsort(1)  # (R, S)
+    whole = ws_rank < k[:, None]  # (R, S)
+    d_s = torch.where(whole, cs[None].expand(r, s), d_s_base[None].expand(r, s))
+
+    cover_space = _cover_rank(valid, cfg.block_w_space, r, generator)  # (R, S, C)
+    key = cover_space + rand(r, s, c)
+    within_rank = key.argsort(-1).argsort(-1)  # (R, S, C)
+    grid_mask = within_rank < d_s[:, :, None]  # (R, S, C) exactly d_s per (row, shaft)
+
+    vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,)
+    vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,)
+    contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
+    contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
+
+    # ── TIME (single 32 Hz grid; one contiguous-block temporal mask) ────────────
+    ones = torch.ones(1, t, dtype=torch.bool, device=dev)
+    cover = _cover_rank(ones, cfg.block_w_band, r, generator).squeeze(1)  # (R, T)
+    cnt = round(cfg.temporal_mask_frac * t)
+    temporal_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, T) exactly cnt masked
+
+    return V3MasksR5(contact_mask=contact_mask, temporal_mask=temporal_mask)

@@ -181,14 +181,33 @@ FINE_LATTICE_STRIDES: tuple[int, int, int] = (8, 2, 1)
 HGA_POOL_FACTOR: int = 4  # 128 Hz → 32 Hz via 2× stride-2 convs (2² = 4)
 
 
-def clock_length_32hz(band_inputs: Sequence[Tensor], *, native_fine_hga: bool) -> int:
+def clock_length_32hz(
+    band_inputs: Sequence[Tensor],
+    *,
+    native_fine_hga: bool = False,
+    early_fusion: bool = False,
+) -> int:
     """The 32 Hz clip-clock length T from the input bands.
 
     Uniform arm0: SLOW is already at 32 Hz ⇒ T = SLOW.shape[-1]. Native fine-HGA: bands
     arrive at SLOW T/8, MID T/2, HGA 4T ⇒ derive from HGA (128 = 4·32, integer-exact) and
     assert all three agree, so a mis-shaped native cache fails loud instead of silently
-    mis-gridding. Both the masking (model.py) and the grid (objective.py) call this so the
-    two never disagree on T."""
+    mis-gridding. r5 early-fusion (EarlyFusionStem): 2 streams HGA/LFS both at 64 Hz = 2T
+    frames ⇒ T = HGA/2 (stem stride-2 decimate 64→32), assert LFS agrees. Both the masking
+    (model.py) and the grid (objective.py) call this so the two never disagree on T."""
+    if early_fusion and native_fine_hga:
+        raise ValueError("early_fusion and native_fine_hga are mutually exclusive")
+    if early_fusion:
+        L = int(band_inputs[0].shape[-1])  # HGA @ 64 Hz = 2T frames
+        if L % 2 != 0:
+            raise ValueError(f"early-fusion 64 Hz frame count {L} must be even (= 2T)")
+        T = L // 2
+        if int(band_inputs[1].shape[-1]) // 2 != T:  # LFS must ride the same 64 Hz clock
+            raise ValueError(
+                f"early-fusion streams disagree on the 32 Hz clock: "
+                f"hga={L} lfs={int(band_inputs[1].shape[-1])} → T={T}"
+            )
+        return T
     if not native_fine_hga:
         return int(band_inputs[0].shape[-1])
     s_slow, s_mid, _ = FINE_LATTICE_STRIDES  # (8, 2, 1) — SLOW/MID native = T/stride
@@ -284,3 +303,87 @@ class FineHgaStem(nn.Module):
             torch.arange(hga_tok.shape[-2], device=hga.device, dtype=torch.long) * s_hga,
         )
         return tokens, positions
+
+
+# ── r5 EarlyFusionStem (Chang 2-stream single-rate; 2026-07-21) ──────────────────
+# TWO streams early-fused to one token per (contact, 32 Hz slot): HGA 4-bin |STFT|
+# magnitude (64–160 Hz) ⊕ LFS 1-ch raw 1–30 Hz voltage, BOTH at 64 Hz frames (hop=32,
+# frame-for-frame aligned). Concat → 5 channels → Conv1d(5→d, k3, s1) → GELU →
+# Conv1d(d→d, k3, s2) → GELU decimates 64 → 32 Hz. Single-rate (stride-1 lattice), NO
+# band embed, NO SLOW/MID, NO multi-rate. Memo: project-r5-config-canonical-2026-07-21.
+EARLY_FUSION_BINS: tuple[int, int] = (4, 1)  # (HGA bins, LFS channels), concat HGA⊕LFS = 5
+EARLY_FUSION_CHANNELS: int = sum(EARLY_FUSION_BINS)  # 5 fused channels per 64 Hz frame
+EARLY_FUSION_DECIMATE: int = 2  # stem stride-2 (64→32 Hz) ⇒ 2 raw 64 Hz frames per token
+
+
+class EarlyFusionStem(nn.Module):
+    """Chang 2-stream early-fusion stem (r5) — HGA ⊕ LFS → 32 Hz tokens.
+
+    Receives TWO streams, both at 64 Hz frames (hop=32) on the same clip clock:
+      • HGA: ``(..., 4, L)`` — |STFT| magnitude, 4 bins 64–160 Hz, per-(elec,bin) robust-z.
+      • LFS: ``(..., 1, L)`` — raw 1–30 Hz voltage, per-elec robust-z.
+    with ``L = 2·T`` (T = the 32 Hz token count). Stacks them to 5 channels per (elec,
+    64 Hz frame) and conv-pools 64 → 32 Hz:
+
+      ``Conv1d(5 → d, k3, s1, pad1) → GELU → Conv1d(d → d, k3, s2, pad1) → GELU``
+
+    one stride-2 decimate (64 → 32). Emits a SINGLE-rate token stream + stride-1 lattice
+    positions ``arange(T)``, returned as 1-element tuples so the r5 path reuses the same
+    pack/mask/pe machinery as the multi-rate stems (a degenerate one-band case).
+
+    k=3 BOTH layers (Ben 2026-07-21, LOCKED — NOT k=5, NOT blurpool; Whisper ``Conv1d(k3,
+    s2)`` precedent, accepts the small 1/f residual β alias). ACCEPT THE BLEED: each 32 Hz
+    token's receptive field is 5 input frames (~78 ms @64 Hz), so adjacent tokens share 3
+    of 5 frames — that overlap is scored anyway (``in_loss = masked``, no margin gate).
+    Deliberately NO band embed, NO per-band norm: single early-fused token, single axial
+    time-RoPE.
+    """
+
+    def __init__(
+        self, d_model: int = 256, *, bins: tuple[int, int] = EARLY_FUSION_BINS
+    ) -> None:
+        super().__init__()
+        self.n_hga, self.n_lfs = int(bins[0]), int(bins[1])
+        c_in = self.n_hga + self.n_lfs
+        # 5→d band-mix + short temporal filter (k3,s1); d→d decimate 64→32 (k3,s2). GELU
+        # after each. No Linear ⇒ convs keep PyTorch default init (matches FineHgaStem pool).
+        self.fuse = nn.Sequential(
+            nn.Conv1d(c_in, d_model, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.apply(init_transformer_weights)  # no Linear here ⇒ no-op on convs (default init)
+
+    def forward(
+        self, band_inputs: Sequence[Tensor]
+    ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+        """Streams ``[HGA(...,4,L), LFS(...,1,L)]`` (L = 2T, 64 Hz) → ((tokens ``(...,T,d)``,),
+        (positions ``(T,)`` long,)). Single-rate: one token stream, lattice stride 1."""
+        if len(band_inputs) != 2:
+            raise ValueError(
+                f"EarlyFusionStem expects 2 streams (HGA, LFS), got {len(band_inputs)}"
+            )
+        hga, lfs = band_inputs
+        if hga.shape[-2] != self.n_hga:
+            raise ValueError(f"HGA has {hga.shape[-2]} bins, expected {self.n_hga}")
+        if lfs.shape[-2] != self.n_lfs:
+            raise ValueError(f"LFS has {lfs.shape[-2]} channels, expected {self.n_lfs}")
+        if hga.shape[-1] != lfs.shape[-1]:
+            raise ValueError(
+                f"HGA/LFS 64 Hz frame counts disagree: {hga.shape[-1]} vs {lfs.shape[-1]}"
+            )
+        length = hga.shape[-1]
+        if length % 2 != 0:
+            raise ValueError(
+                f"64 Hz frame count {length} must be even (= 2× the 32 Hz token count)"
+            )
+        x = torch.cat((hga, lfs), dim=-2)  # (..., 5, L) — HGA bins 0..3, LFS ch 4
+        *lead, c, L = x.shape
+        x = x.reshape(-1, c, L)  # (prod_lead, 5, L)
+        x = self.fuse(x)  # (prod_lead, d, T)
+        x = x.transpose(-1, -2)  # (prod_lead, T, d)
+        tok = x.reshape(*lead, x.shape[-2], x.shape[-1])  # (..., T, d)
+        t = tok.shape[-2]
+        pos = torch.arange(t, device=hga.device, dtype=torch.long)  # single-rate, stride 1
+        return (tok,), (pos,)

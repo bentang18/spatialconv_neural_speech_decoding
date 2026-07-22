@@ -37,6 +37,7 @@ from speech_decoding.models.v14_converged_v3.geometry import L1Geometry
 from speech_decoding.models.v14_converged_v3.masking import (
     V3MaskConfig,
     sample_masks,
+    sample_masks_r5,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
     LAMBDA_CTX,
@@ -46,8 +47,10 @@ from speech_decoding.models.v14_converged_v3.objective import (
 )
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
     build_r4_grid,
+    build_r5_grid,
     build_visible_pack,
     token_flags,
+    token_flags_r5,
 )
 from speech_decoding.models.v14_converged_v3.stem import clock_length_32hz
 
@@ -67,6 +70,7 @@ class V3ConvergedModel(nn.Module):
         lambda_ctx: float = LAMBDA_CTX,
         mae: bool = False,
         native_fine_hga: bool = False,
+        early_fusion: bool = False,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -79,14 +83,18 @@ class V3ConvergedModel(nn.Module):
         # noise floor. Like lambda_nll it only bites when the secondary is opted in.
         # secondary_loss="l1" is r5 Arm 3 (point loss): mu-only head, no covariance
         # parameters at all. L1 (not L2) is measured — see V3JepaObjective.__init__.
+        # early_fusion (r5, Chang 2-stream): EarlyFusionStem + single-band grid + single
+        # temporal mask + accept-the-bleed scoring. The mask sampler / grid / flags switch
+        # to their r5 variants below; the objective owns the frontend + scoring swap.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
             lambda_nll=lambda_nll, nll_floor=nll_floor,
             secondary_loss=secondary_loss,
             context_loss=context_loss, lambda_ctx=lambda_ctx,
-            mae=mae, native_fine_hga=native_fine_hga,
+            mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
         )
         self.native_fine_hga = bool(native_fine_hga)
+        self.early_fusion = bool(early_fusion)
         self.mask_cfg = mask_cfg
 
     def forward(
@@ -104,13 +112,23 @@ class V3ConvergedModel(nn.Module):
         pack_max_seqlen: int | None = None,
     ) -> JepaOutput:
         B, N = band_inputs[0].shape[0], band_inputs[0].shape[1]
-        T = clock_length_32hz(band_inputs, native_fine_hga=self.native_fine_hga)
+        T = clock_length_32hz(
+            band_inputs,
+            native_fine_hga=self.native_fine_hga,
+            early_fusion=self.early_fusion,
+        )
         # masking is the sole augmentation: per-shaft-balanced spatial contact drop + per-band
         # (SLOW/MID/HGA) independent temporal blocks (masking.V3Masks). The flat r4 objective
         # derives the visible/scored token sets from these directly (pack_r4.token_flags).
-        masks = sample_masks(
-            geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
-        )
+        # r5 (early_fusion): ONE temporal mask over the single 32 Hz band (sample_masks_r5).
+        if self.early_fusion:
+            masks = sample_masks_r5(
+                geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
+            )
+        else:
+            masks = sample_masks(
+                geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
+            )
         # grid_max_seqlen / m_vis / pack_max_seqlen are the per-session Python-int shape
         # constants ``session_plan`` precomputes (the module caches + passes them each step);
         # they let the objective skip the per-step ``.item()`` host syncs. None ⇒ eager path.
@@ -142,13 +160,21 @@ class V3ConvergedModel(nn.Module):
         clip masks ``d_s·k_full + (n_s−d_s)·T_masked`` tokens per shaft — so a single
         representative mask (fixed seed) yields the values every clip shares."""
         N = int(geom.valid.sum())
-        grid = build_r4_grid(geom, n_time=n_time)
-        parcel_packed = parcel_id[grid.contact]
-        gen = torch.Generator(device=grid.contact.device).manual_seed(0)
-        masks = sample_masks(
-            geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
-        )
-        masked, _ = token_flags(grid, masks)
+        gen = torch.Generator(device=geom.gather_idx.device).manual_seed(0)
+        if self.early_fusion:  # r5 single-band grid + single-temporal-mask flags
+            grid = build_r5_grid(geom, n_time=n_time)
+            parcel_packed = parcel_id[grid.contact]
+            masks = sample_masks_r5(
+                geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
+            )
+            masked, _ = token_flags_r5(grid, masks)
+        else:
+            grid = build_r4_grid(geom, n_time=n_time)
+            parcel_packed = parcel_id[grid.contact]
+            masks = sample_masks(
+                geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
+            )
+            masked, _ = token_flags(grid, masks)
         pack = build_visible_pack(grid, masked, parcel_packed)
         return grid.max_seqlen, pack.m_vis, pack.max_seqlen
 
