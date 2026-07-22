@@ -44,11 +44,16 @@ from speech_decoding.experiments.monitors.grad_spike import grad_spike_monitor
 from speech_decoding.experiments.monitors.teacher_rank import teacher_rank_monitor
 
 # The named trainable towers whose per-group update-to-weight ratio we track. ``online`` =
-# stem+encoder, ``predictor`` = predictor tower, ``mae_head`` = the r5 MAE linear recon decoder
-# (None on non-r5 arms ⇒ skipped). Under AdamW raw grad-L2 is scale-free w.r.t. the effective
-# step, so ``‖Δθ‖/‖θ‖`` (target ≈1e-3) is the genuinely-informative LR-health readout — per
-# group so a frozen (→0) or runaway (≫1e-2) tower shows even when the global looks fine.
-_ROUTING_GROUPS: tuple[str, ...] = ("online", "predictor", "mae_head")
+# stem+encoder, ``predictor`` = predictor tower, ``mae_head`` = the r5 MAE linear recon decoder,
+# ``mae_head_hga``/``mae_head_lfs`` = the v3r5nf per-stream recon decoders. Each is None on the
+# arms that lack it ⇒ skipped (r5 has only mae_head; v3r5nf has only the two per-stream heads).
+# Under AdamW raw grad-L2 is scale-free w.r.t. the effective step, so ``‖Δθ‖/‖θ‖`` (target ≈1e-3)
+# is the genuinely-informative LR-health readout — per group so a frozen (→0) or runaway (≫1e-2)
+# tower shows even when the global looks fine (and the two nf heads show independently, catching a
+# stream the co-located mask-query fails to separate).
+_ROUTING_GROUPS: tuple[str, ...] = (
+    "online", "predictor", "mae_head", "mae_head_hga", "mae_head_lfs",
+)
 
 
 def _group(pl_module: pl.LightningModule, name: str):
@@ -59,6 +64,8 @@ def _group(pl_module: pl.LightningModule, name: str):
         "online": getattr(obj, "online", None),
         "predictor": getattr(obj, "predictor", None),
         "mae_head": getattr(obj, "mae_head_r5", None),
+        "mae_head_hga": getattr(obj, "mae_head_hga", None),
+        "mae_head_lfs": getattr(obj, "mae_head_lfs", None),
     }.get(name)
 
 

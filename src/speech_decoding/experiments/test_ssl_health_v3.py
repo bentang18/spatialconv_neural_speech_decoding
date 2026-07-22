@@ -10,7 +10,11 @@ from types import SimpleNamespace
 
 import torch
 
-from speech_decoding.experiments.monitors.ssl_health_v3 import SSLHealthMonitorV3
+from speech_decoding.experiments.monitors.ssl_health_v3 import (
+    _ROUTING_GROUPS,
+    _group,
+    SSLHealthMonitorV3,
+)
 from speech_decoding.experiments.test_v14_converged_v3_module import (
     _module,
     _session_batch,
@@ -138,6 +142,25 @@ def test_band_names_frontend_aware() -> None:
             objective=SimpleNamespace(early_fusion=early)))
     assert cb._band_names(_mod(False)) == ("slow", "mid", "hga")
     assert cb._band_names(_mod(True)) == ("hga", "lfs")
+
+
+def test_update_ratio_routes_nofusion_per_stream_heads() -> None:
+    """v3r5nf exposes ``mae_head_hga``/``mae_head_lfs`` (r5's ``mae_head_r5`` is None on this
+    arm), so the update-ratio monitor must route to the two per-stream heads — otherwise the
+    MAE-head update ratio silently vanishes on the no-fusion arm."""
+    assert "mae_head_hga" in _ROUTING_GROUPS and "mae_head_lfs" in _ROUTING_GROUPS
+    hga, lfs = torch.nn.Linear(4, 8), torch.nn.Linear(4, 2)
+    nf = SimpleNamespace(model=SimpleNamespace(objective=SimpleNamespace(
+        mae_head_hga=hga, mae_head_lfs=lfs, mae_head_r5=None)))
+    assert _group(nf, "mae_head_hga") is hga
+    assert _group(nf, "mae_head_lfs") is lfs
+    assert _group(nf, "mae_head") is None  # nf has no fused r5 head
+    # r5-fused / r4 arms lack the per-stream heads ⇒ those groups resolve to None (skipped).
+    fused = SimpleNamespace(model=SimpleNamespace(objective=SimpleNamespace(
+        mae_head_r5=torch.nn.Linear(4, 10))))
+    assert _group(fused, "mae_head_hga") is None
+    assert _group(fused, "mae_head_lfs") is None
+    assert _group(fused, "mae_head") is fused.model.objective.mae_head_r5
 
 
 def test_ema_weight_gap_zero_then_positive() -> None:
