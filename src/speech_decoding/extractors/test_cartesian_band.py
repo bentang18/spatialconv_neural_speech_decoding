@@ -278,13 +278,13 @@ def test_winsor_band_name_per_band() -> None:
     hg = MultiStftView(front_end="band", hop_length=64, **STFT_3BAND_HG)
     lfs = MultiStftView(front_end="band", hop_length=512, **STFT_2BAND_LFS)
     hga = MultiStftView(front_end="band", hop_length=64, **STFT_2BAND_HGA)
-    vhga = MultiStftView(front_end="band", hop_length=16, **STFT_V3_HGA)
+    vhga = MultiStftView(front_end="band", hop_length=32, **STFT_V3_HGA)
     assert slow._winsor_band_name() == "slow"
     assert beta._winsor_band_name() == "beta"
     assert hg._winsor_band_name() == "hg"
     assert lfs._winsor_band_name() == "lfs"
     assert hga._winsor_band_name() == "hga"
-    # fine-HGA (N=64/hop=16) is the SAME physical 64-160 band as the 32 Hz HGA
+    # fine-HGA (N=64/hop=32) is the SAME physical 64-160 band as the 32 Hz HGA
     # (N=128), so it REUSES the "hga" winsor cap by design (distinct tuple key,
     # same value) — the |z| family is the same; parity spec keeps HGA winsor 20.
     assert vhga._winsor_band_name() == "hga"

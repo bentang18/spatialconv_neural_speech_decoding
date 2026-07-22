@@ -240,34 +240,40 @@ STFT_V3_MID: dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
-# Fine-HGA (2026-07-21, memo project-fine-hga-frontend-ablation). HGA extracted at
-# N=64 / hop=16 → 128 Hz frames, 4 bins over 64-160 (Δf=fs/N=32 Hz → k2..k5 =
-# 64/96/128/160). REPLACES the 32 Hz STFT_V3 HGA (which reuses STFT_2BAND_HGA at
-# 128/64 → 32 Hz) for v3 fine-HGA OFAT runs: the stem LEARNS a conv-pool 128→32 Hz
-# instead of a fixed strided-slice decimate, recovering the ~20 ms transient timing
-# the 62.5 ms window blurs (poison screen 2026-07-21: N=64 FWHM 16 ms ≈ Chang 14 ms
-# vs the current N=128 31 ms). SLOW+MID unchanged. hop = N/4 (not N/2) — COLA is
-# irrelevant here (magnitude only, never inverted; scipy.stft forward-only). band_hop
-# is in the exca uid ⇒ FRESH extraction; builds into <spec-cache-dir>/band_v3hga.
+# Fine-HGA (2026-07-21, memo project-fine-hga-frontend-ablation; hop=32 amendment
+# 2026-07-21 for the Chang 2-stream frontend). HGA extracted at N=64 / hop=32 → 64 Hz
+# frames, 4 bins over 64-160 (Δf=fs/N=32 Hz → k2..k5 = 64/96/128/160). REPLACES the
+# 32 Hz STFT_V3 HGA (STFT_2BAND_HGA 128/64 → 32 Hz): the stem LEARNS a conv-pool
+# 64→32 Hz (single stride-2 decimate) instead of a fixed strided-slice decimate,
+# recovering the ~20 ms transient timing the 62.5 ms window blurs (poison screen
+# 2026-07-21: N=64 FWHM 16 ms ≈ Chang 14 ms vs the current N=128 31 ms). The N=64
+# window band-limits the gamma envelope to ~32 Hz, so hop=32 (64 Hz, Nyquist 32) is
+# Nyquist-matched — hop=16 (128 Hz) was 2× oversampling that the 32 Hz token pool
+# discards, so 64 Hz halves the cache with no usable loss and matches the LFS clock
+# frame-for-frame at 64 Hz. hop = N/2 → 50% overlap (M14 margin gate shrinks vs the
+# 75%-overlap hop=16). SLOW+MID unchanged. band_hop is in the exca uid ⇒ FRESH
+# extraction; builds into <spec-cache-dir>/band_v3hga.
 # ---------------------------------------------------------------------------
 STFT_V3_HGA: dict[str, float] = {
-    "band_nperseg": 64, "band_hop": 16, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
+    "band_nperseg": 64, "band_hop": 32, "band_f_lo_hz": 64.0, "band_f_hi_hz": 160.0,
 }
 
 # ---------------------------------------------------------------------------
 # v3 raw-waveform LFS band (2026-07-21, Chang 2-stream frontend redesign). NOT an
 # |STFT| band: a 1-30 Hz SOS Butterworth bandpass on the raw waveform, grid-sampled
-# onto the 128 Hz frame clock (hop=16 @ 2048 Hz) so it matches the HGA |STFT| rate
-# (N=64/hop=16 -> 128 Hz) EXACTLY (LFS frame i == HGA frame i), emitted as a
-# (C, F=1, T_128) leaf by LowLfpView (extractors/lowlfp_view.py), which OVERRIDES the
+# onto the 64 Hz frame clock (hop=32 @ 2048 Hz) so it matches the HGA |STFT| rate
+# (N=64/hop=32 -> 64 Hz) EXACTLY (LFS frame i == HGA frame i), emitted as a
+# (C, F=1, T_64) leaf by LowLfpView (extractors/lowlfp_view.py), which OVERRIDES the
 # |STFT| producer while reusing all of MultiStftView's cache-build / robust-z /
-# atomic-write machinery. band_nperseg/band_hop below are DUMMY-BUT-VALID
-# (64%16==0, half=32%16==0, hop==16) purely to pass MultiStftView._validate_band_config
+# atomic-write machinery. LFS is bandlimited to 30 Hz so 64 Hz (Nyquist 32) is
+# information-complete; the earlier 128 Hz bake was pure oversampling, dropped
+# 2026-07-21. band_nperseg/band_hop below are DUMMY-BUT-VALID
+# (64%32==0, half=32%32==0, hop==32) purely to pass MultiStftView._validate_band_config
 # — LowLfpView IGNORES them and does bandpass + grid-sample instead. band_f_lo/hi_hz
 # (1-30) are the REAL passband.
 # ---------------------------------------------------------------------------
 STFT_V3_LFS: dict[str, float] = {
-    "band_nperseg": 64, "band_hop": 16, "band_f_lo_hz": 1.0, "band_f_hi_hz": 30.0,
+    "band_nperseg": 64, "band_hop": 32, "band_f_lo_hz": 1.0, "band_f_hi_hz": 30.0,
 }
 
 # Canonical winsor-band tag. Used ONLY to select a per-band
