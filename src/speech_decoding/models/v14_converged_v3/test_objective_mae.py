@@ -8,7 +8,7 @@ silent miscompute would violate, named + asserted + printed
 (feedback-build-the-invariant-into-the-probe):
 
   1. NO EMA teacher (``obj.teacher is None``); ``update_teacher()`` is a no-op. The arm has
-     per-band reconstruction heads instead of ``pred_to_target``/the Perceiver.
+     per-band reconstruction heads instead of ``pred_to_target``.
   2. Forward runs finite; loss is a non-negative scalar; grads reach every TRAINABLE module
      (stem projs, encoder, predictor, enc_to_pred, the 3 mae_heads, mask_token).
   3. TARGET ALIGNMENT: the gathered target at flat token t is EXACTLY norm_pix of that
@@ -19,7 +19,6 @@ silent miscompute would violate, named + asserted + printed
      with MID's pad bin excluded.
   6. LEAK-SAFETY still holds (masked tokens dropped from the encoder) — inherited from the
      shared visible path, re-asserted here because the arm reuses it.
-  7. The arm forbids the secondary NLL / context loss (target-only feature).
 """
 
 from __future__ import annotations
@@ -74,14 +73,13 @@ def _mae(**kw) -> V3JepaObjective:
 def test_mae_arm_has_no_teacher_and_update_is_noop() -> None:
     obj = _mae()
     no_teacher = obj.teacher is None
-    no_perceiver = obj.perceiver is None
     no_ptt = obj.pred_to_target is None
     has_heads = len(obj.mae_heads) == len(PER_BAND_SPECS) and all(
         h.out_features == nb for h, (nb, _) in zip(obj.mae_heads, PER_BAND_SPECS)
     )
     noop = obj.update_teacher() == 0.0  # must not raise / touch a None teacher
-    ok = no_teacher and no_perceiver and no_ptt and has_heads and noop
-    print(f"[check] teacher=None ({no_teacher}), perceiver=None ({no_perceiver}), "
+    ok = no_teacher and no_ptt and has_heads and noop
+    print(f"[check] teacher=None ({no_teacher}), "
           f"pred_to_target=None ({no_ptt}), 3 per-band heads {[h.out_features for h in obj.mae_heads]} "
           f"({has_heads}), update_teacher()=0 no-op ({noop}) {'OK' if ok else 'VIOLATED'}")
     assert ok
@@ -96,7 +94,6 @@ def test_forward_runs_and_grads_reach_every_trainable_module() -> None:
     out.loss.backward()
 
     finite = bool(torch.isfinite(loss_val)) and loss_val.ndim == 0 and float(loss_val) >= 0.0
-    single = out.jepa_loss is None and out.nll_loss is None and out.ctx_loss is None
     checks = {
         "stem.projs": obj.online.stem.projs,
         "encoder": obj.online.encoder,
@@ -109,8 +106,8 @@ def test_forward_runs_and_grads_reach_every_trainable_module() -> None:
         for name, m in checks.items()
     }
     mask_grad = obj.mask_token.grad is not None and torch.isfinite(obj.mask_token.grad).all()
-    ok = finite and single and all(grad_ok.values()) and mask_grad
-    print(f"[check] loss={float(out.loss):.4f} finite={finite}; single-loss={single}; "
+    ok = finite and all(grad_ok.values()) and mask_grad
+    print(f"[check] loss={float(out.loss):.4f} finite={finite}; "
           f"grads {grad_ok}; mask_token grad={mask_grad} {'OK' if ok else 'VIOLATED'}")
     assert ok
 
@@ -243,20 +240,6 @@ def test_loss_only_depends_on_masked_target_frames() -> None:
     print(f"[check] corrupting scored target frames moves loss {base:.4f}→{moved:.4f} "
           f"(Δ={abs(moved - base):.2e})={changed} {'OK' if changed else 'VIOLATED'}")
     assert changed
-
-
-def test_mae_forbids_secondary_and_context() -> None:
-    import pytest
-
-    with pytest.raises(ValueError, match="context"):
-        V3JepaObjective(n_parcels=8, mae=True, context_loss=True)
-    sc, geom = _session()
-    obj = _mae()
-    parcels = torch.unique(sc.parcel_id)
-    sm = torch.zeros(parcels.numel(), 5)
-    ss = torch.ones(parcels.numel(), 5)
-    with pytest.raises(ValueError, match="secondary"):
-        obj(_bands(), geom, sc.parcel_id, _masks(geom), stat_mean=sm, stat_std=ss)
 
 
 def test_collect_taps_emits_enc12_and_per_band_recon_scalars() -> None:

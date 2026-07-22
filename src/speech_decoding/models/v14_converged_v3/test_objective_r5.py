@@ -79,10 +79,10 @@ def _mae(**kw) -> V3JepaObjective:
 def test_stem_is_early_fusion_grid_single_band_secondary_cut() -> None:
     obj = _jepa()
     is_ef = isinstance(obj.online.stem, EarlyFusionStem)
-    no_perc = obj.perceiver is None  # r5 CUTS the secondary
+    no_perc = not hasattr(obj, "perceiver")  # secondary Perceiver PURGED (no attr at all)
     has_teacher = obj.teacher is not None  # JEPA arm keeps the EMA teacher
     ok = is_ef and no_perc and has_teacher
-    print(f"[check] EarlyFusionStem ({is_ef}), perceiver=None ({no_perc}), "
+    print(f"[check] EarlyFusionStem ({is_ef}), perceiver purged ({no_perc}), "
           f"teacher present ({has_teacher}) {'OK' if ok else 'VIOLATED'}")
     assert ok
 
@@ -124,7 +124,8 @@ def test_mae_arm_head_shape_no_teacher_single_loss() -> None:
     out = obj(_streams(), geom, sc.parcel_id, _masks(geom))
     loss_val = out.loss.detach()
     out.loss.backward()
-    single = out.jepa_loss is None and out.nll_loss is None and out.ctx_loss is None
+    # single loss: the secondary ramped-loss fields are PURGED — JepaOutput carries only `loss`.
+    single = not hasattr(out, "nll_loss") and not hasattr(out, "ctx_loss")
     finite = bool(torch.isfinite(loss_val)) and float(loss_val) >= 0.0
     grad = all(
         p.grad is not None and torch.isfinite(p.grad).all()

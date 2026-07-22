@@ -3,9 +3,8 @@
 The ONLY change vs arm0 is the frontend: FineHgaStem consumes native-rate bands (SLOW
 4Hz T/8, MID 16Hz T/2, HGA 128Hz T·4, HGA 4 bins conv-pooled 128→32Hz) instead of the
 uniform-32Hz PerBandStem. Same (tokens, positions) contract + same 32Hz output lattice,
-so masking / pack / pe / encoder / predictor are untouched. Secondary is OFF for the
-OFAT (state_stats_dir=None ⇒ build_state_target, which assumes a 32Hz 7-bin HGA, is
-never called). Invariants named + asserted + printed (feedback-build-the-invariant).
+so masking / pack / pe / encoder / predictor are untouched. Invariants named + asserted
++ printed (feedback-build-the-invariant).
 """
 
 from __future__ import annotations
@@ -82,12 +81,10 @@ def test_finehga_forward_runs_and_grads_reach_the_stem() -> None:
     assert ok
 
 
-def test_finehga_secondary_off_is_pure_jepa() -> None:
-    # No state stats ⇒ the (32Hz-7bin-assuming) build_state_target is never reached; the
-    # loss is the single JEPA term (jepa_loss None ⇒ trainer uses out.loss directly).
+def test_finehga_is_pure_jepa() -> None:
+    # The fine stem swaps only the frontend; the loss is the single JEPA term.
     sc, geom = _session()
     obj = V3JepaObjective(n_parcels=8, native_fine_hga=True)
     obj.train()
     out = obj(_native_bands(), geom, sc.parcel_id, _masks(geom))
-    assert out.nll_loss is None and out.jepa_loss is None
     assert bool(torch.isfinite(out.loss)) and float(out.loss) >= 0.0

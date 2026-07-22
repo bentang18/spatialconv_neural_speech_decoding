@@ -42,7 +42,6 @@ from speech_decoding.models.v14_converged_v3.sidecar import (
     SensorSidecar,
     build_sidecar,
 )
-from speech_decoding.models.v14_converged_v3.state_target import STATE_DIM
 
 
 @dataclass(frozen=True)
@@ -53,38 +52,6 @@ class V3SessionSetup:
     sidecar: SensorSidecar  # shaft_id / depth / parcel_id over survivors
     geom: L1Geometry  # padded per-shaft L1 gather plan
     parcel_id: Tensor  # (N,) long — survivor parcel tags (== sidecar.parcel_id)
-    # frozen per-(parcel,dim) z-score stats for the secondary Gaussian-NLL, gathered to
-    # (P, 6) aligned to the survivor unique(parcel_id) — None ⇒ secondary OFF (JEPA-only).
-    stat_mean: Tensor | None = None
-    stat_std: Tensor | None = None
-
-
-def _align_state_stats(
-    parcel_id: Tensor, stat_mean: Tensor | None, stat_std: Tensor | None
-) -> tuple[Tensor | None, Tensor | None]:
-    """Gather by-parcel-VALUE frozen state stats into (P, 6) aligned to unique(parcel_id).
-
-    ``stat_mean``/``stat_std`` are indexed by parcel id VALUE (the same index space as the
-    perceiver's parcel embedding and ``raw_state_vectors``' ``torch.unique(parcel_id)``), so
-    the survivor set after guard-1 selects the rows. The secondary Gaussian-NLL is OPT-IN:
-    both omitted ⇒ (None, None) ⇒ JEPA-only. Fails loud on shape / coverage (cold path)."""
-    if stat_mean is None and stat_std is None:
-        return None, None
-    if stat_mean is None or stat_std is None:
-        raise ValueError("stat_mean and stat_std must both be given, or both omitted")
-    parcels = torch.unique(parcel_id)  # sorted survivor ids == raw_state_vectors order
-    hi = int(parcels.max().item())
-    for name, t in (("stat_mean", stat_mean), ("stat_std", stat_std)):
-        if t.ndim != 2 or t.shape[1] != STATE_DIM:
-            raise ValueError(
-                f"{name} must be (n_parcels, {STATE_DIM}) indexed by parcel id; "
-                f"got {tuple(t.shape)}"
-            )
-        if hi >= t.shape[0]:
-            raise ValueError(
-                f"{name} rows {t.shape[0]} do not cover parcel id {hi}"
-            )
-    return stat_mean[parcels], stat_std[parcels]
 
 
 def build_session_setup(
@@ -93,8 +60,6 @@ def build_session_setup(
     *,
     drop_labels: Iterable[str],
     mask_cfg: V3MaskConfig = V3MaskConfig(),
-    stat_mean: Tensor | None = None,
-    stat_std: Tensor | None = None,
 ) -> V3SessionSetup:
     """Guard-1 filter → sidecar → geometry → feasibility assert.
 
@@ -122,13 +87,10 @@ def build_session_setup(
     sidecar = build_sidecar(keep_labels, parcel_id=keep_parcel)
     geom = build_l1_geometry(sidecar)
     assert_mask_feasible(geom, mask_cfg)
-    sm, ss = _align_state_stats(sidecar.parcel_id, stat_mean, stat_std)
 
     return V3SessionSetup(
         keep_idx=keep_idx,
         sidecar=sidecar,
         geom=geom,
         parcel_id=sidecar.parcel_id,
-        stat_mean=sm,
-        stat_std=ss,
     )

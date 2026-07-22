@@ -121,7 +121,7 @@ def test_collate_unions_cross_patient_shafts_into_b1_super_montage() -> None:
     k_full = sum(band_token_counts(T))
     grid = build_r4_grid(batch.geom, n_time=T)
     assert grid.total == 8 * k_full
-    assert batch.stat_mean is None and batch.stat_std is None          # secondary CUT
+    assert not hasattr(batch, "stat_mean") and not hasattr(batch, "stat_std")  # secondary PURGED
     print(f"[check] collate: 2 cross-patient shafts → B=1 super-montage, "
           f"grid.total={grid.total}=8×{k_full}, blocks distinct OK")
 

@@ -123,7 +123,7 @@ def test_datamodule_shaft_loader_yields_pinned_super_montages(tmp_path) -> None:
     seen = 0
     for batch in dm.train_dataloader():
         assert build_r4_grid(batch.geom, n_time=T_CLIP).total == 8 * k_full
-        assert batch.stat_mean is None and batch.stat_std is None   # secondary CUT
+        assert not hasattr(batch, "stat_mean") and not hasattr(batch, "stat_std")  # secondary PURGED
         seen += 1
         if seen >= 3:
             break

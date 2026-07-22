@@ -1,10 +1,9 @@
-"""Compact in-objective monitor reductions for r4 (#40 per-band JEPA, #41 per-band NLL,
-#42 predicted-cov entropy vs floor).
+"""Compact in-objective monitor reductions (#40 per-band JEPA).
 
 The JEPA ``pred``/``tgt`` are ``(B, total, 1024)`` — GB-scale, too big to ship to the
-Lightning callback as raw taps. These pure functions reduce them (and the small secondary
-``mu``/``cov``) to per-band SCALARS INSIDE the objective's forward, on the monitor cadence
-only; the callback then just logs the scalars.
+Lightning callback as raw taps. This pure function reduces them to per-band SCALARS
+INSIDE the objective's forward, on the monitor cadence only; the callback then just logs
+the scalars.
 
 Every split uses WEIGHTED reductions over the STATIC ``(B, total)`` grid (never a boolean
 index), matching how the JEPA loss itself is computed — so the compiled forward's shapes
@@ -13,13 +12,7 @@ stay static and no data-dependent branch is introduced on the monitor path.
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor
-
-from speech_decoding.models.v14_converged_v3.secondary_head import (
-    _nll_terms,
-    gaussian_entropy,
-)
 
 _EPS: float = 1e-8
 BAND_NAMES: tuple[str, ...] = ("slow", "mid", "hga")
@@ -107,93 +100,4 @@ def early_fusion_recon_stats(
     return out
 
 
-def per_band_nll(
-    mu: Tensor, cov: Tensor, target_q: Tensor, present_q: Tensor
-) -> dict[str, Tensor]:
-    """Per-band marginal Gaussian NLL, scored on that band's present positions.
-
-    ``mu``/``target_q`` (B, Q, 6), ``cov`` (B, Q, 6, 6), ``present_q`` (B, Q, 6). A joint
-    Gaussian's MARGINAL over a dim subset IS the sub-block ``(μ_S, Σ_SS)``; band ``b``'s
-    marginal is dims ``[b, b+3]`` (its mean + its std). Scored where the band's std dim is
-    present (n_elec ≥ 2 ⇒ the std target is defined), weighted-mean over positions (static
-    shape). n=1 positions carry an undefined std and are weighted out — matching the way
-    ``present_masked_nll`` drops them from the training loss."""
-    n_mean = target_q.shape[-1] // 2  # 3
-    pres = present_q.to(mu.dtype)
-    out: dict[str, Tensor] = {}
-    for b, name in enumerate(BAND_NAMES):
-        idx = [b, b + n_mean]
-        sub_mu = mu[..., idx]
-        sub_x = target_q[..., idx]
-        sub_cov = cov[..., idx, :][..., :, idx]  # (B, Q, 2, 2) marginal cov block
-        nll_pos = _nll_terms(sub_mu, sub_cov, sub_x)  # (B, Q)
-        wpos = pres[..., b + n_mean]  # present iff the band's std dim is on
-        out[f"nll_{name}"] = (nll_pos * wpos).sum() / wpos.sum().clamp_min(1.0)
-    return out
-
-
-def per_band_l1(mu: Tensor, target_q: Tensor, present_q: Tensor) -> dict[str, Tensor]:
-    """Per-band POINT-loss split (r5 Arm 3) — the cov-free twin of :func:`per_band_nll`.
-
-    Band ``b`` owns dims ``[b, b+3]`` (its mean + its std). Keys are ``nll_{band}`` — NOT
-    a mislabel: the trainer logs the secondary term under one name across arms, so Arm 3's
-    per-band curve lands on the same wandb panel as r4's and the two are readable side by
-    side. The VALUES are not comparable across arms (nats vs |r|); the arm is."""
-    n_mean = target_q.shape[-1] // 2  # 3
-    pres = present_q.to(mu.dtype)
-    out: dict[str, Tensor] = {}
-    for b, name in enumerate(BAND_NAMES):
-        idx = [b, b + n_mean]
-        # sum |r| over the band's 2 dims, weighted-mean over positions where its std is
-        # present — the same weighting per_band_nll uses, so the panels align.
-        l1_pos = (target_q[..., idx] - mu[..., idx]).abs().sum(-1)  # (B, Q)
-        wpos = pres[..., b + n_mean]
-        out[f"nll_{name}"] = (l1_pos * wpos).sum() / wpos.sum().clamp_min(1.0)
-    return out
-
-
-STATE_DIM_NAMES: tuple[str, ...] = ("slow_mu", "mid_mu", "hga_mu", "relmod48", "relmod816")
-
-
-def per_dim_diag_nll(
-    mu: Tensor, target_q: Tensor, present_q: Tensor, noise: Tensor
-) -> dict[str, Tensor]:
-    """Per-DIM frozen-diagonal NLL split (r5-mod diag_nll) — the 5-dim replacement for
-    :func:`per_band_nll`/:func:`per_band_l1`, whose [b, b+3] band pairing assumes the retired
-    6-dim mean/std layout. Here the state is [slow_mu, mid_mu, hga_mu, relmod48, relmod816]
-    with no std, so the informative split is per DIM: it shows whether the secondary is moving
-    the 2 MODULATION dims (the above-MAE work) at all, or only the 3 already-reachable means.
-
-    ``mu``/``target_q`` (B, Q, 5), ``present_q`` (B, Q, 5), ``noise`` (B, Q, 5) the frozen σ².
-    Each dim scored ½[(x−μ)²/σ² + log(2πσ²)], weighted-mean over its present positions (static
-    shape). Keys ``nll_{dim}`` so the trainer logs each on its own wandb series."""
-    pres = present_q.to(mu.dtype)
-    per_dim = 0.5 * ((target_q - mu) ** 2 / noise + torch.log(2.0 * torch.pi * noise))  # (B,Q,5)
-    out: dict[str, Tensor] = {}
-    for d, name in enumerate(STATE_DIM_NAMES):
-        w = pres[..., d]
-        out[f"nll_{name}"] = (per_dim[..., d] * w).sum() / w.sum().clamp_min(1.0)
-    return out
-
-
-def cov_entropy_vs_floor(cov: Tensor, noise: Tensor) -> dict[str, Tensor]:
-    """Predicted-cov differential entropy vs the noise-floor ceiling, meaned over positions.
-
-    ``cov`` (B, Q, 6, 6) = ``L Lᵀ + diag(noise)``; ``noise`` (B, Q, 6) the per-position PD
-    floor. The floor ceiling is ``entropy(diag(noise))`` (the head's L=0 limit — pure
-    irreducible measurement noise, the NLL ceiling). ``gap = entropy(cov) − entropy(floor)``
-    is ≥ 0 BY CONSTRUCTION (``cov ⪰ diag(noise)`` ⇒ larger log-det), so a healthy head sits
-    ABOVE the floor and the gap tracks how much predictive covariance it is still carrying."""
-    ent = gaussian_entropy(cov)  # (B, Q)
-    ent_floor = gaussian_entropy(torch.diag_embed(noise))  # (B, Q)
-    return {
-        "cov_entropy": ent.mean(),
-        "cov_entropy_floor": ent_floor.mean(),
-        "cov_entropy_gap": (ent - ent_floor).mean(),
-    }
-
-
-__all__ = [
-    "per_band_jepa_stats", "early_fusion_recon_stats", "per_band_nll",
-    "cov_entropy_vs_floor", "BAND_NAMES",
-]
+__all__ = ["per_band_jepa_stats", "early_fusion_recon_stats", "BAND_NAMES"]

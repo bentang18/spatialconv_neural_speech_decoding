@@ -236,8 +236,6 @@ def collate_shaft_pack(
         geom=geom,
         parcel_id=sidecar.parcel_id,
         session_key=("shaft_pack", int(parcel_id.shape[0])),  # shape key ⇒ plan-cache by shape
-        stat_mean=None,  # secondary NLL is CUT on the r5 go-forward — JEPA/MAE only
-        stat_std=None,
     )
 
 

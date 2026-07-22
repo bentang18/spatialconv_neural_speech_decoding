@@ -8,12 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from speech_decoding.models.v14_converged_v3.monitor_taps import (
-    cov_entropy_vs_floor,
-    per_band_jepa_stats,
-    per_band_nll,
-)
-from speech_decoding.models.v14_converged_v3.secondary_head import _nll_terms
+from speech_decoding.models.v14_converged_v3.monitor_taps import per_band_jepa_stats
 
 
 def _ref_band_jepa(pred, tgt, w, band_ids, b, eps=1e-8):
@@ -69,52 +64,4 @@ def test_per_band_jepa_perfect_prediction_gives_unit_ev_zero_l1() -> None:
         for n in ("slow", "mid", "hga")
     )
     print(f"[check] perfect-pred ⇒ EV=1,L1=0,ratio=1 all bands → {'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
-def test_per_band_nll_matches_marginal_subblock_reference() -> None:
-    # invariant: the per-band scalar equals _nll_terms on the boolean-selected present
-    # positions of that band's 2-D marginal (dims [b, b+3]).
-    torch.manual_seed(2)
-    B, Q, D = 2, 12, 6
-    mu = torch.randn(B, Q, D)
-    L = torch.randn(B, Q, D, D) * 0.2
-    cov = L @ L.transpose(-1, -2) + torch.eye(D) * 0.5  # PD
-    target_q = torch.randn(B, Q, D)
-    present_q = (torch.rand(B, Q, D) < 0.7).float()
-    got = per_band_nll(mu, cov, target_q, present_q)
-
-    worst = 0.0
-    for b, name in enumerate(("slow", "mid", "hga")):
-        idx = [b, b + 3]
-        sub_cov = cov[..., idx, :][..., :, idx]
-        nll_pos = _nll_terms(mu[..., idx], sub_cov, target_q[..., idx])  # (B,Q)
-        wpos = present_q[..., b + 3]
-        ref = float((nll_pos * wpos).sum() / wpos.sum().clamp_min(1.0))
-        worst = max(worst, abs(float(got[f"nll_{name}"]) - ref))
-    ok = worst < 1e-5
-    print(f"[check] per-band NLL == marginal-subblock ref: max|Δ|={worst:.2e} → {'OK' if ok else 'VIOLATED'}")
-    assert ok
-
-
-def test_cov_entropy_gap_nonnegative_and_floor_exact() -> None:
-    # invariant 1: gap = H(cov) - H(diag(noise)) >= 0 (cov ⪰ diag(noise) by construction).
-    # invariant 2: with L=0 the head IS the floor ⇒ gap == 0 exactly.
-    torch.manual_seed(3)
-    B, Q, D = 2, 10, 6
-    noise = torch.rand(B, Q, D) * 0.3 + 0.1  # PD floor
-    L = torch.randn(B, Q, D, D) * 0.4
-    cov = L @ L.transpose(-1, -2) + torch.diag_embed(noise)
-    out = cov_entropy_vs_floor(cov, noise)
-    gap = float(out["cov_entropy_gap"])
-    floor_only = cov_entropy_vs_floor(torch.diag_embed(noise), noise)
-    gap0 = float(floor_only["cov_entropy_gap"])
-    # cross-check the floor entropy against a closed-form diagonal Gaussian entropy.
-    cf_floor = float((0.5 * (D * (1.0 + torch.log(torch.tensor(2 * torch.pi))) + torch.log(noise).sum(-1))).mean())
-    floor_match = abs(float(out["cov_entropy_floor"]) - cf_floor) < 1e-4
-    ok = gap >= -1e-5 and abs(gap0) < 1e-5 and floor_match
-    print(
-        f"[check] cov-entropy gap≥0 ({gap:.4f}), L=0⇒gap==0 ({gap0:.2e}), "
-        f"floor==closed-form ({floor_match}) → {'OK' if ok else 'VIOLATED'}"
-    )
     assert ok
