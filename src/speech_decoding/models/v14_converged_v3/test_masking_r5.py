@@ -79,16 +79,25 @@ def test_temporal_is_global_no_shaft_axis() -> None:
     print("[check] OK temporal mask is (R, T) global — no shaft axis")
 
 
-def test_temporal_is_blocky_not_iid() -> None:
-    # Contiguous width-4 blocks ⇒ mean run length > 1 (an iid Bernoulli mask would be ~1).
-    cfg = V3MaskConfig(temporal_mask_frac=0.5, block_w_band=4)
+def test_temporal_is_blocky_via_temporal_block_w() -> None:
+    # Contiguous width-``temporal_block_w`` blocks (r5's OWN knob, not block_w_band) ⇒ mean
+    # masked-run length grows with the width; an iid Bernoulli mask would be ~1-2.
     sc, geom = _session([6, 6])
     n = int(geom.valid.sum())
-    m = sample_masks_r5(geom, n, n_time=64, n_rows=16, generator=_gen(7), cfg=cfg)
-    runs = [r for row in m.temporal_mask for r in _runs(row)]
-    mean_run = sum(runs) / len(runs)
-    assert mean_run > 1.5, mean_run
-    print(f"[check] OK temporal blocky: mean run length {mean_run:.2f} > 1.5")
+    means = {}
+    for w in (4, 6):
+        cfg = V3MaskConfig(temporal_mask_frac=0.5, temporal_block_w=w)
+        m = sample_masks_r5(geom, n, n_time=64, n_rows=16, generator=_gen(7), cfg=cfg)
+        runs = [r for row in m.temporal_mask for r in _runs(row)]
+        means[w] = sum(runs) / len(runs)
+    assert means[6] > means[4] > 1.5, means  # wider blocks ⇒ longer runs
+    print(f"[check] OK temporal_block_w drives blockiness: mean run w4={means[4]:.2f} < w6={means[6]:.2f}")
+
+
+def test_default_temporal_block_w_is_six() -> None:
+    # r5 default block width = 6 tokens = 187.5 ms @ 32 Hz (Ben 2026-07-22, 150-200 ms range).
+    assert V3MaskConfig().temporal_block_w == 6
+    print("[check] OK default temporal_block_w == 6 (187.5 ms @ 32 Hz)")
 
 
 def test_space_balanced_and_keep_alive() -> None:

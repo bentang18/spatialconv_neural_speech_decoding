@@ -74,6 +74,12 @@ class V3MaskConfig:
     slow_mask_frac: float = 0.50  # SLOW masked on its 4 Hz grid (Ben 2026-07-15: 50%, first-class band).
     block_w_band: int = 4  # leak-safe block width in a band's OWN tokens (M14 margin 2); same all 3.
     temporal_mask_frac: float = 0.50  # r5 ONLY: single early-fused 32 Hz grid masked (T7-tunable).
+    # r5 temporal block width (tokens) on the 32 Hz grid. 6 tokens = 187.5 ms (Ben 2026-07-22,
+    # "150-200 ms range"). Accept-the-bleed ⇒ NO leak floor (unlike block_w_band's M14 margin);
+    # width is a task-difficulty knob. Frontend RF = 5 frames = ±1 token, so a width-W block
+    # leaks only at its 2 edges (interior W-2 tokens fully clean) — edge share 2/W = 33% at W=6.
+    # T7 τ-autocorr may retune. Separate from block_w_band so r4 stays byte-identical.
+    temporal_block_w: int = 6
 
 
 @dataclass(frozen=True)
@@ -299,8 +305,9 @@ def sample_masks_r5(
     contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
 
     # ── TIME (single 32 Hz grid; one contiguous-block temporal mask) ────────────
+    # width = temporal_block_w (6 = 187.5 ms); accept-the-bleed ⇒ no margin gate downstream.
     ones = torch.ones(1, t, dtype=torch.bool, device=dev)
-    cover = _cover_rank(ones, cfg.block_w_band, r, generator).squeeze(1)  # (R, T)
+    cover = _cover_rank(ones, cfg.temporal_block_w, r, generator).squeeze(1)  # (R, T)
     cnt = round(cfg.temporal_mask_frac * t)
     temporal_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, T) exactly cnt masked
 
