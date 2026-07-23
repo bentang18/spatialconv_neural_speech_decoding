@@ -19,6 +19,7 @@ import torch
 from speech_decoding.models.v14_converged_v3.stem import (
     EarlyFusionStem,
     FineHgaStem,
+    NativePerBandStem,
     PerBandStem,
     SpectralStem,
     clock_length_32hz,
@@ -286,6 +287,96 @@ def test_fine_arbitrary_leading_dims() -> None:
     slow = torch.randn(C, 7, FH_SLOW_IN)
     mid = torch.randn(C, 6, FH_MID_IN)
     hga = torch.randn(C, FH_HGA_BINS, FH_HGA_IN)
+    toks, pos = stem((slow, mid, hga))
+    assert [t.shape for t in toks] == [
+        (C, T_SLOW_TOK, D), (C, T_MID_TOK, D), (C, T_HGA_TOK, D),
+    ]
+
+
+# ── NativePerBandStem (r6: native-rate 3-band, plain linear, NO decimate) ────────
+# r6 bakes each band at its OWN native rate on a T32=128 clip: SLOW @4 Hz = 16 frames,
+# MID @16 Hz = 64, HGA @32 Hz = 128 (COARSE 7-bin STFT_2BAND_HGA — NOT fine 4-bin). The
+# stem is PerBandStem WITHOUT the decimate (inputs already at token rate), so its tokens +
+# lattice positions are byte-identical to PerBandStem fed the equivalent 32 Hz-clock bands.
+NP_SLOW_IN, NP_MID_IN, NP_HGA_IN = 16, 64, 128  # native input frame counts (7,6,7 bins)
+
+
+def _native_bands(bB: int = B, cC: int = C):
+    slow = torch.randn(bB, cC, 7, NP_SLOW_IN)   # @4 Hz, no decimate
+    mid = torch.randn(bB, cC, 6, NP_MID_IN)     # @16 Hz, no decimate
+    hga = torch.randn(bB, cC, 7, NP_HGA_IN)     # @32 Hz coarse 7-bin, no decimate/conv
+    return slow, mid, hga
+
+
+def test_native_perband_shapes_and_positions() -> None:
+    stem = NativePerBandStem(d_model=D)
+    toks, pos = stem(_native_bands())
+    assert [t.shape for t in toks] == [
+        (B, C, T_SLOW_TOK, D), (B, C, T_MID_TOK, D), (B, C, T_HGA_TOK, D),
+    ]
+    assert torch.equal(pos[0], torch.arange(T_SLOW_TOK) * 8)  # SLOW stride 8
+    assert torch.equal(pos[1], torch.arange(T_MID_TOK) * 2)   # MID stride 2
+    assert torch.equal(pos[2], torch.arange(T_HGA_TOK) * 1)   # HGA stride 1
+    for k in range(T_SLOW_TOK):  # SLOW token k shares phase with HGA token 8k
+        assert pos[0][k].item() == pos[2][8 * k].item()
+
+
+def test_native_perband_all_bands_no_decimate_plain_projection() -> None:
+    # EVERY band arrives at native rate ⇒ token k == proj(band frame k) + band_emb (no strided pick).
+    stem = NativePerBandStem(d_model=D)
+    slow, mid, hga = _native_bands(1, 1)
+    toks, _ = stem((slow, mid, hga))
+    for b, x in enumerate((slow, mid, hga)):
+        expect = stem.projs[b](x.transpose(-1, -2)) + stem.band_type_emb[b]
+        assert torch.allclose(toks[b], expect, atol=1e-6)
+
+
+def test_native_perband_equals_perband_decimated() -> None:
+    # THE correctness invariant: native extraction == PerBandStem's ::8/::2/::1 decimate of the
+    # 32 Hz clock. Same weights, native input == decimated(32 Hz input) ⇒ byte-identical tokens.
+    perband = PerBandStem(d_model=D).eval()
+    native = NativePerBandStem(d_model=D).eval()
+    native.load_state_dict(perband.state_dict())  # identical param structure ⇒ direct load
+    slow32 = torch.randn(B, C, 7, T32)
+    mid32 = torch.randn(B, C, 6, T32)
+    hga32 = torch.randn(B, C, 7, T32)
+    with torch.no_grad():
+        t_pb, p_pb = perband((slow32, mid32, hga32))  # decimates internally
+        t_np, p_np = native((slow32[..., ::8], mid32[..., ::2], hga32[..., ::1]))  # pre-decimated
+    for a, b in zip(t_pb, t_np):
+        assert torch.allclose(a, b, atol=1e-6)
+    for a, b in zip(p_pb, p_np):
+        assert torch.equal(a, b)
+
+
+def test_native_perband_band_emb_additive_and_distinct() -> None:
+    stem = NativePerBandStem(d_model=D)
+    slow, mid, hga = _native_bands(1, 1)
+    with torch.no_grad():
+        t_on, _ = stem((slow, mid, hga))
+        stem.band_type_emb.zero_()
+        t_off, _ = stem((slow, mid, hga))
+    for b in range(3):  # zeroing the embed shifts every band's tokens by exactly band_type_emb[b]
+        assert not torch.allclose(t_on[b], t_off[b])
+    # per-band distinct: MID's projection differs from feeding MID frames through SLOW's proj.
+    assert not torch.allclose(stem.projs[0].weight, stem.projs[2].weight)
+
+
+def test_native_perband_wrong_bins_and_band_count_raise() -> None:
+    stem = NativePerBandStem(d_model=D)
+    slow, mid, hga = _native_bands()
+    with pytest.raises(ValueError):
+        stem((slow, mid))  # 2 bands
+    bad_hga = torch.randn(B, C, 4, NP_HGA_IN)  # 4 bins, r6 HGA expects coarse 7
+    with pytest.raises(ValueError):
+        stem((slow, mid, bad_hga))
+
+
+def test_native_perband_arbitrary_leading_dims() -> None:
+    stem = NativePerBandStem(d_model=D)
+    slow = torch.randn(C, 7, NP_SLOW_IN)
+    mid = torch.randn(C, 6, NP_MID_IN)
+    hga = torch.randn(C, 7, NP_HGA_IN)
     toks, pos = stem((slow, mid, hga))
     assert [t.shape for t in toks] == [
         (C, T_SLOW_TOK, D), (C, T_MID_TOK, D), (C, T_HGA_TOK, D),

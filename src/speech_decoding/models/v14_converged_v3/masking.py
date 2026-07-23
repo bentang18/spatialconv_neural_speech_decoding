@@ -406,6 +406,118 @@ def _sample_r5_space_time(
     return contact_mask, temporal_mask
 
 
+# ── r6: r4's 3-band leak-safe structure with r5's per-shaft independence ──────────
+@dataclass(frozen=True)
+class V3MasksR6:
+    """r6 masks — r4's 3-band leak-safe STRUCTURE × r5's PER-SHAFT INDEPENDENCE.
+
+    ONE per-shaft-balanced SPACE mask (``contact_mask``, shared across bands — the r4
+    outer-product structure: a (contact c, band b, token t_b) is visible iff c is spatially
+    kept AND band-b token t_b is not time-masked) + THREE band TIME masks on the SLOW/MID/HGA
+    native grids. Unlike r4's GLOBAL ``(R,T_b)`` band masks, each r6 band mask is PER-SHAFT
+    ``(R,S,T_b)`` (r5 independence): each ``(row, shaft)`` hides its OWN contiguous width-
+    ``block_w_band`` blocks, exactly ``round(frac·length)`` per band — a per-session constant ⇒
+    static compiled shapes hold (r5nf-style), only the per-shaft LAYOUT differs. The M14
+    margin-2 in_loss gate is RETAINED downstream (objective) — this sampler lays width-4 blocks
+    and does NOT gate (contrast r5's accept-the-bleed)."""
+
+    contact_mask: Tensor  # (R, N) bool — per-shaft balanced SPACE, shared across bands.
+    hga_mask: Tensor  # (R, S, T)   bool — per-shaft HGA (32 Hz). round(hga_frac·T) per (row, shaft).
+    mid_mask: Tensor  # (R, S, T/2) bool — per-shaft MID (16 Hz). round(mid_frac·T/2).
+    slow_mask: Tensor  # (R, S, T/8) bool — per-shaft SLOW (4 Hz). round(slow_frac·T/8).
+
+
+def _sample_pershaft_band_time(
+    n_shafts: int,
+    length: int,
+    *,
+    frac: float,
+    block_w: int,
+    n_rows: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """One per-shaft band time mask on a ``(S, length)`` grid: contiguous width-``block_w`` blocks,
+    exactly ``round(frac·length)`` masked per ``(row, shaft)``. This is r4's leak-safe per-band
+    ``_band_mask`` (module docstring §TIME) made PER-SHAFT (r5 independence) — the ``s`` axis of the
+    ``_cover_rank`` grid is the shaft, so each shaft draws its own blocks at identical count."""
+    ones = torch.ones(n_shafts, length, dtype=torch.bool, device=device)
+    cover = _cover_rank(ones, block_w, n_rows, generator)  # (R, S, length)
+    cnt = round(frac * length)
+    return cover.argsort(-1).argsort(-1) < cnt  # (R, S, length) exactly cnt per (row, shaft)
+
+
+def sample_masks_r6(
+    geom: L1Geometry,
+    n_contacts: int,
+    *,
+    n_time: int,
+    n_rows: int,
+    generator: torch.Generator,
+    cfg: V3MaskConfig = V3MaskConfig(),
+) -> V3MasksR6:
+    """Sample ``n_rows`` r6 masks: shared per-shaft-balanced SPACE + THREE per-shaft band TIME masks.
+
+    SPACE is a faithful copy of :func:`sample_masks`'s per-shaft balanced tier (drawn ONCE, shared
+    across bands). TIME draws SLOW/MID/HGA INDEPENDENTLY on their own native grids (sequential draws
+    from the one generator ⇒ independent realizations), each PER-SHAFT ``(R,S,T_b)`` in contiguous
+    width-``block_w_band`` blocks. Per-shaft counts are per-session constants ⇒ static shapes."""
+    r, s, c = n_rows, geom.n_shafts, geom.max_c
+    n, t = n_contacts, n_time
+    valid = geom.valid  # (S, C)
+    dev = valid.device
+    cs = valid.sum(1)  # (S,)
+
+    def rand(*shape: int) -> Tensor:
+        return torch.rand(*shape, generator=generator, device=dev)
+
+    # ── SPACE (per-shaft balanced) — faithful copy of sample_masks (shared across bands) ──
+    d_s_base = torch.round(cfg.space_frac * cs.float()).long()
+    if cfg.keep_alive:
+        d_s_base = torch.minimum(d_s_base, (cs - 1).clamp(min=0))
+    d = d_s_base.sum()
+    k_max = _k_max(cs, d)
+    k = (rand(r, s) < cfg.whole_shaft_frac).sum(1).clamp(max=k_max)  # (R,)
+    ws_rank = rand(r, s).argsort(1).argsort(1)  # (R, S)
+    whole = ws_rank < k[:, None]  # (R, S)
+    d_s = torch.where(whole, cs[None].expand(r, s), d_s_base[None].expand(r, s))
+
+    cover_space = _cover_rank(valid, cfg.block_w_space, r, generator)  # (R, S, C)
+    key = cover_space + rand(r, s, c)
+    within_rank = key.argsort(-1).argsort(-1)  # (R, S, C)
+    grid_mask = within_rank < d_s[:, :, None]  # (R, S, C) exactly d_s per (row, shaft)
+
+    vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,)
+    vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,)
+    contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
+    contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
+
+    # ── TIME (per-shaft INDEPENDENT, 3 bands each on its own native grid, width-4 blocks) ──
+    if t % SLOW_STRIDE != 0:
+        raise ValueError(f"n_time={t} not a multiple of SLOW_STRIDE={SLOW_STRIDE}")
+    if t % MID_STRIDE != 0:
+        raise ValueError(f"n_time={t} not a multiple of MID_STRIDE={MID_STRIDE}")
+    t_mid = t // MID_STRIDE
+    n_slots = t // SLOW_STRIDE
+
+    def band(length: int, frac: float) -> Tensor:
+        return _sample_pershaft_band_time(
+            s, length, frac=frac, block_w=cfg.block_w_band,
+            n_rows=r, generator=generator, device=dev,
+        )
+
+    hga_mask = band(t, cfg.hga_mask_frac)  # (R, S, T)   32 Hz
+    mid_mask = band(t_mid, cfg.mid_mask_frac)  # (R, S, T/2) 16 Hz
+    slow_mask = band(n_slots, cfg.slow_mask_frac)  # (R, S, T/8) 4 Hz
+
+    return V3MasksR6(
+        contact_mask=contact_mask,
+        hga_mask=hga_mask,
+        mid_mask=mid_mask,
+        slow_mask=slow_mask,
+    )
+
+
 def sample_masks_r5nf(
     geom: L1Geometry,
     n_contacts: int,

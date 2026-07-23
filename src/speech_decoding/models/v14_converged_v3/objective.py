@@ -51,6 +51,7 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
     token_flags,
     token_flags_r5,
     token_flags_r5nf,
+    token_flags_r6,
 )
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import (
@@ -62,6 +63,7 @@ from speech_decoding.models.v14_converged_v3.stem import (
     PER_BAND_SPECS,
     EarlyFusionStem,
     FineHgaStem,
+    NativePerBandStem,
     NoFusionStem,
     PerBandStem,
     clock_length_32hz,
@@ -132,6 +134,7 @@ class _TargetTower(nn.Module):
         native_fine_hga: bool = False,
         early_fusion: bool = False,
         no_fusion: bool = False,
+        native_perband: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
     ) -> None:
         super().__init__()
@@ -139,13 +142,15 @@ class _TargetTower(nn.Module):
         # HGA 4 bins conv-pooled 128→32Hz) instead of arm0's uniform-32Hz PerBandStem.
         # Same (tokens, positions) contract + same 32Hz output lattice, so masking/pack/
         # pe/encoder are byte-identical (memo project-fine-hga-bt-rebake-tasklist-2026-07-21).
-        # early_fusion (r5): the Chang 2-stream EarlyFusionStem — HGA⊕LFS → ONE 32Hz token
-        # stream (a degenerate single-band grid). no_fusion (v3r5nf): the same 2 streams but
-        # NOT fused — NoFusionStem emits TWO 32Hz token streams (a two-band grid). At most one
-        # of the three is set (mutually exclusive).
-        if int(early_fusion) + int(native_fine_hga) + int(no_fusion) > 1:
+        # native_perband (r6): consume native-rate 3-band |STFT| (SLOW 4Hz / MID 16Hz / HGA 32Hz
+        # coarse-7bin) via NativePerBandStem = PerBandStem with the decimate removed (bands arrive
+        # at token rate). NO conv (linear stem), same 32Hz output lattice as arm0. early_fusion
+        # (r5): the Chang 2-stream EarlyFusionStem — HGA⊕LFS → ONE 32Hz token stream (a degenerate
+        # single-band grid). no_fusion (v3r5nf): the same 2 streams but NOT fused — NoFusionStem
+        # emits TWO 32Hz token streams. At most one of the four is set (mutually exclusive).
+        if int(early_fusion) + int(native_fine_hga) + int(no_fusion) + int(native_perband) > 1:
             raise ValueError(
-                "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
+                "early_fusion, native_fine_hga, no_fusion and native_perband are mutually exclusive"
             )
         if early_fusion:
             self.stem = EarlyFusionStem(D_MODEL)
@@ -153,6 +158,8 @@ class _TargetTower(nn.Module):
             self.stem = NoFusionStem(D_MODEL, decimate=nf_decimate)
         elif native_fine_hga:
             self.stem = FineHgaStem(D_MODEL)
+        elif native_perband:
+            self.stem = NativePerBandStem(D_MODEL)
         else:
             self.stem = PerBandStem(D_MODEL)
         self.encoder = build_encoder(n_parcels=n_parcels, deep_sup=deep_sup)
@@ -189,11 +196,18 @@ class V3JepaObjective(nn.Module):
         native_fine_hga: bool = False,
         early_fusion: bool = False,
         no_fusion: bool = False,
+        native_perband: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
         mae_stream_weight: str = "equal",
     ) -> None:
         super().__init__()
         self.native_fine_hga = bool(native_fine_hga)
+        # native_perband (r6): 3-band native-rate |STFT| (SLOW 4Hz / MID 16Hz / HGA 32Hz-coarse-7bin)
+        # via NativePerBandStem (linear, no conv, no decimate) + r6 per-shaft 3-band margin-gated
+        # masks (token_flags_r6) + SPECTRAL |STFT|-bin MAE with RAW target (NO norm_pix — the r5
+        # no-norm_pix decision applied to r4's per-band bins). The winning r4-MAE frontend moved
+        # onto r5's shaft-batched data regime (project-r6-contract-2026-07-22). MAE-only.
+        self.native_perband = bool(native_perband)
         # early_fusion (r5, Chang 2-stream): EarlyFusionStem + single-band stride-1 grid
         # (build_r5_grid) + single temporal mask + accept-the-bleed scoring (token_flags_r5,
         # in_loss == masked). Objective stays swappable (JEPA-latent OR MAE-recon).
@@ -207,9 +221,12 @@ class V3JepaObjective(nn.Module):
         # byte-identical); 4 = fast (16 Hz tokens). Sets the stem stride, the per-stream MAE head
         # widths (DEC·bins) and the target-gather frame count — all keyed off self.nf_decimate.
         self.nf_decimate = int(nf_decimate)
-        if int(self.early_fusion) + int(self.native_fine_hga) + int(self.no_fusion) > 1:
+        if (
+            int(self.early_fusion) + int(self.native_fine_hga)
+            + int(self.no_fusion) + int(self.native_perband) > 1
+        ):
             raise ValueError(
-                "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
+                "early_fusion, native_fine_hga, no_fusion and native_perband are mutually exclusive"
             )
         # v3r5nf loss weighting (Ben 07-22): "equal" (1:1, NEW DEFAULT) averages the two
         # per-stream MEAN-MSEs ⇒ each stream 50% of the gradient regardless of feat count,
@@ -227,6 +244,9 @@ class V3JepaObjective(nn.Module):
         # v3r5nf is MAE-only (per-stream raw-frame reconstruction); JEPA-nf is deferred.
         if self.no_fusion and not self.mae:
             raise ValueError("v3r5nf is MAE-only")
+        # r6 is MAE-only (spectral |STFT|-bin reconstruction, no norm_pix); JEPA-r6 not in scope.
+        if self.native_perband and not self.mae:
+            raise ValueError("r6 (native_perband) is MAE-only")
         self.deep_sup = bool(deep_sup)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         # online target path (stem + encoder) — every param here is EMA-mirrored (JEPA arm).
@@ -235,6 +255,7 @@ class V3JepaObjective(nn.Module):
             native_fine_hga=self.native_fine_hga,
             early_fusion=self.early_fusion,
             no_fusion=self.no_fusion,
+            native_perband=self.native_perband,
             nf_decimate=self.nf_decimate,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
@@ -336,7 +357,7 @@ class V3JepaObjective(nn.Module):
         """
         T = clock_length_32hz(
             bands, native_fine_hga=self.native_fine_hga, early_fusion=self.early_fusion,
-            no_fusion=self.no_fusion,
+            no_fusion=self.no_fusion, native_perband=self.native_perband,
         )  # 32 Hz clock
         # grid_max_seqlen / m_vis / pack_max_seqlen are per-session Python-int shape constants
         # (the module caches them via ``V3ConvergedModel.session_plan`` and passes them in);
@@ -357,6 +378,13 @@ class V3JepaObjective(nn.Module):
             )
             parcel_packed = parcel_id[grid.contact]
             masked, in_loss = token_flags_r5nf(grid, masks)  # (B, total); in_loss == masked
+        elif self.native_perband:
+            # r6: r4's 3-band 32Hz-lattice grid (build_r4_grid — identical, native bake changes only
+            # WHERE bins come from) + PER-SHAFT band masks with the M14 margin gate (token_flags_r6,
+            # in_loss ⊊ masked — margin KEPT, unlike r5's accept-the-bleed).
+            grid = build_r4_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
+            parcel_packed = parcel_id[grid.contact]
+            masked, in_loss = token_flags_r6(grid, masks)  # (B, total); in_loss ⊆ masked
         else:
             grid = build_r4_grid(geom, n_time=T, max_seqlen=grid_max_seqlen)
             parcel_packed = parcel_id[grid.contact]  # (total,) long
@@ -409,6 +437,12 @@ class V3JepaObjective(nn.Module):
                 )
             if self.early_fusion:
                 return self._mae_output_r5(
+                    bands, grid, h, in_loss,
+                    enc_taps=enc_taps if collect_taps else None,
+                    collect_taps=collect_taps,
+                )
+            if self.native_perband:
+                return self._mae_output_r6(
                     bands, grid, h, in_loss,
                     enc_taps=enc_taps if collect_taps else None,
                     collect_taps=collect_taps,
@@ -474,6 +508,78 @@ class V3JepaObjective(nn.Module):
         w = in_loss.to(pred.dtype)  # (B, total) margin-gated masked weight
         fv = feat_valid[None].to(pred.dtype)  # (1, total, F_MAX)
         # per-token MSE over that token's own valid bins (pad excluded), then masked-mean.
+        se_tok = (((pred - target) ** 2) * fv).sum(-1) / feat_count[None].to(pred.dtype)
+        mae_loss = (se_tok * w).sum() / w.sum().clamp(min=1.0)
+
+        taps = None
+        if collect_taps:
+            assert enc_taps is not None
+            d_enc = enc_taps[12].shape[-1]
+            taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
+            with torch.no_grad():  # per-band recon health; pad zeroed so it can't pollute
+                taps.update(per_band_jepa_stats(pred, target * fv, w, grid.band))
+        return JepaOutput(
+            loss=mae_loss,
+            n_masked=w.sum().detach(),
+            taps=taps,
+        )
+
+    # ── r6 MAE arm (3-band native-rate |STFT|-bin reconstruction, RAW target) ────
+    def _mae_gather_target_r6(
+        self, bands: Sequence[Tensor], grid: R4Grid
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Gather each flat token's own band |STFT| bins from RAGGED native-rate bands → padded
+        (B, total, F_MAX) + (feat_valid, feat_count). r4's SPECTRAL per-band target, but each band
+        is indexed by its OWN native ``T_b`` (SLOW 16 / MID 64 / HGA 128 on a T=128 clip), NOT r4's
+        shared-T stack. The native frame ``bandpos`` == r4's decimated frame ``bandpos·stride``
+        (piece-1 equivalence: the native bake IS the r4 decimate). Compile-safe: each band gathered
+        over ALL tokens (``bandpos`` clamped to that band's ``T_b-1`` so the wrong-band reads never
+        go OOB — they are discarded by the one-hot band select), mirroring ``_mae_pred``."""
+        B, N = bands[0].shape[0], bands[0].shape[1]
+        f_max = max(nb for nb, _ in PER_BAND_SPECS)
+        outs: list[Tensor] = []
+        for b, (nb, _) in enumerate(PER_BAND_SPECS):
+            t_b = bands[b].shape[-1]  # native length (16 / 64 / 128 on a T=128 clip)
+            xb = bands[b].transpose(-1, -2)  # (B, N, T_b, F_b)
+            if nb < f_max:
+                xb = F.pad(xb, (0, f_max - nb))  # zero-pad freq to F_MAX
+            flat_b = xb.reshape(B, N * t_b, f_max)  # (B, N·T_b, F_MAX)
+            pos = grid.bandpos.clamp(max=t_b - 1)  # OOB for non-b tokens; one-hot select discards
+            lin_b = grid.contact * t_b + pos  # (total,) native flat index into (contact, T_b)
+            outs.append(flat_b[:, lin_b, :])  # (B, total, F_MAX)
+        stack = torch.stack(outs, dim=-1)  # (B, total, F_MAX, N_BANDS)
+        onehot = F.one_hot(grid.band, len(PER_BAND_SPECS)).to(stack.dtype)  # (total, N_BANDS)
+        target = (stack * onehot[None, :, None, :]).sum(-1)  # (B, total, F_MAX)
+        device = grid.band.device
+        f_by_band = torch.tensor([nb for nb, _ in PER_BAND_SPECS], device=device)
+        feat_count = f_by_band[grid.band]  # (total,)
+        feat_valid = torch.arange(f_max, device=device)[None, :] < feat_count[:, None]
+        return target, feat_valid, feat_count
+
+    def _mae_output_r6(
+        self,
+        bands: Sequence[Tensor],
+        grid: R4Grid,
+        h: Tensor,
+        in_loss: Tensor,
+        *,
+        enc_taps: dict[int, Tensor] | None,
+        collect_taps: bool,
+    ) -> JepaOutput:
+        """r6 MAE loss: reconstruct each masked token's OWN |STFT| bins — RAW target, NO norm_pix.
+
+        Identical to :meth:`_mae_output` (r4's spectral per-band MAE — same ``_mae_pred`` heads,
+        same per-token MSE over the token's valid bins, same masked-mean over the margin-gated
+        ``in_loss``) MINUS the ``_norm_pix`` renormalization (Ben 07-22: "that was dumb"; the r5
+        arms already reconstruct a raw target). Count-proportional band weighting is AUTOMATIC —
+        the flat masked-mean over all scored tokens gives HGA (T tokens) ~8:1 dominance over SLOW
+        (T/8) by token count, exactly as r4 (no per-band reweight). ``h`` (B, total, d_pred) is the
+        predictor output AFTER its terminal ``norm_out`` (= MAE decoder_norm)."""
+        target, feat_valid, feat_count = self._mae_gather_target_r6(bands, grid)
+        pred = self._mae_pred(h, grid)  # (B, total, F_MAX) — r4 per-band heads, VERBATIM
+        target = target.to(pred.dtype)  # RAW bins — NO _norm_pix (the only change vs _mae_output)
+        w = in_loss.to(pred.dtype)  # (B, total) margin-gated masked weight
+        fv = feat_valid[None].to(pred.dtype)  # (1, total, F_MAX)
         se_tok = (((pred - target) ** 2) * fv).sum(-1) / feat_count[None].to(pred.dtype)
         mae_loss = (se_tok * w).sum() / w.sum().clamp(min=1.0)
 

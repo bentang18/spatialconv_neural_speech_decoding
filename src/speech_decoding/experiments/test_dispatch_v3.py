@@ -34,6 +34,7 @@ from speech_decoding.experiments.dispatch_v3 import (
 from speech_decoding.models.v14_converged_v3.dataset import (
     NATIVE_FINE_BAND_RATES,
     R5_BAND_RATES,
+    R6_BAND_RATES,
     UNIFORM_BAND_RATES,
 )
 from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
@@ -215,12 +216,13 @@ def test_frontend_flag_parses_and_defaults_to_v3() -> None:
 
 
 def test_frontend_config_maps_flag_to_native_flag_and_rates() -> None:
-    # (native_fine_hga, early_fusion, no_fusion, band_rates)
-    assert _frontend_config(_smoke_args()) == (False, False, False, UNIFORM_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3")) == (False, False, False, UNIFORM_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, False, False, NATIVE_FINE_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3r5")) == (False, True, False, R5_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3r5nf")) == (False, False, True, R5NF_BAND_RATES)
+    # (native_fine_hga, early_fusion, no_fusion, native_perband, band_rates)
+    assert _frontend_config(_smoke_args()) == (False, False, False, False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3")) == (False, False, False, False, UNIFORM_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, False, False, False, NATIVE_FINE_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3r5")) == (False, True, False, False, R5_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3r5nf")) == (False, False, True, False, R5NF_BAND_RATES)
+    assert _frontend_config(_smoke_args(frontend="v3r6")) == (False, False, False, True, R6_BAND_RATES)
 
 
 def test_v3fine_threads_native_into_model_and_dataset(tmp_path) -> None:
@@ -337,6 +339,40 @@ def test_v3r5nf_threads_no_fusion_and_stream_weight_then_fits(tmp_path) -> None:
     )
     assert m_pooled.model.objective.mae_stream_weight == "pooled"
 
+
+def test_v3r6_threads_native_perband_and_shaft_batching(tmp_path) -> None:
+    # v3r6 = the winning r4-MAE 3-band |STFT| frontend on r5's shaft-batched regime. It reads the
+    # SAME 3 native-rate band caches (SLOW 4Hz / MID 16Hz / HGA 32Hz, F=7/6/7) as arm0/v3fine but
+    # must reach the NativePerBandStem (model.native_perband), the per-shaft 3-band masks, and
+    # default to shaft (cross-patient) batching. R6_BAND_RATES = ((1,8),(1,2),(1,1)).
+    from speech_decoding.models.v14_converged_v3.shaft_dataset import ShaftPackDataset
+    from speech_decoding.models.v14_converged_v3.stem import NativePerBandStem
+
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn, band_rates=R6_BAND_RATES,
+    )
+    m, dm, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
+    )
+    assert m.model.native_perband is True
+    assert m.model.objective.native_perband is True
+    assert isinstance(m.model.objective.online.stem, NativePerBandStem)
+    assert m.model.no_fusion is False and m.model.early_fusion is False
+    assert m.model.native_fine_hga is False
+    assert dm.batch_unit == "shaft"  # native_perband ⇒ shaft is the default batch unit
+    assert isinstance(dm.dataset, ShaftPackDataset)
+    assert dm.dataset.band_rates == R6_BAND_RATES
+    assert dm.dataset.start_align == 8  # lcm(8,2,1)
+
+    # r6 is MAE-only — the JEPA objective must be rejected before any run starts.
+    with pytest.raises(ValueError, match="MAE-only"):
+        build_v3_training(
+            specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="jepa")
+        )
+
     _cpu_trainer(2).fit(m, datamodule=dm)  # runs; no shape/plan-cache error
 
 
@@ -346,7 +382,7 @@ def test_v3r5nffast_threads_decimate_4_and_per_stream_block_w_then_fits(tmp_path
     # widths are now PER-STREAM (Ben 2026-07-22): HGA 3 / LFS 5 by default on BOTH no-fusion arms —
     # LFS wider so the slow stream can't trivially in-fill the masked run.
     assert _frontend_config(_smoke_args(frontend="v3r5nffast")) == (
-        False, False, True, R5NF_BAND_RATES
+        False, False, True, False, R5NF_BAND_RATES
     )  # same tuple as v3r5nf — the decimate is the only difference
     assert _nf_decimate(_smoke_args(frontend="v3r5nffast")) == 4
     assert _nf_decimate(_smoke_args(frontend="v3r5nf")) == 2

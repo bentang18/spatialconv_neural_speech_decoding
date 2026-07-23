@@ -171,6 +171,44 @@ class PerBandStem(nn.Module):
         return tuple(tokens), tuple(positions)
 
 
+class NativePerBandStem(PerBandStem):
+    """r6 stem: PerBandStem on NATIVE-RATE bands — plain per-band Linear, ZERO decimate/conv.
+
+    r6 bakes each band at its own native rate (SLOW @4 Hz, MID @16 Hz, HGA @32 Hz coarse
+    7-bin ``STFT_2BAND_HGA``), so the bands arrive ALREADY at token rate — the r4/PerBandStem
+    strided decimate has nothing to drop. This is the ONLY difference from PerBandStem: same
+    ``specs``/``projs``/``band_type_emb`` (⇒ ``load_state_dict`` across the two is direct), same
+    additive band-embed, same emitted lattice positions ``token_index · stride`` (8/2/1 on the
+    shared 32 Hz reference lattice). Feeding this stem ``band[..., ::stride]`` reproduces
+    PerBandStem's tokens byte-for-byte — the native bake IS the r4 decimate, precomputed
+    (test_native_perband_equals_perband_decimated). Conv stem OUT (OFAT #1); no per-band norm.
+    """
+
+    def forward(
+        self, band_inputs: Sequence[Tensor]
+    ) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+        """Native bands ``[(...,F_b,T_b)]`` (T_b already the token count) → (per-band tokens
+        ``(...,T_b,d)``, per-band lattice positions ``token_index·stride``). SLOW, MID, HGA order."""
+        if len(band_inputs) != len(self.specs):
+            raise ValueError(f"expected {len(self.specs)} bands, got {len(band_inputs)}")
+        tokens: list[Tensor] = []
+        positions: list[Tensor] = []
+        for b, (x, (n_bins, stride), proj) in enumerate(
+            zip(band_inputs, self.specs, self.projs)
+        ):
+            if x.shape[-2] != n_bins:
+                raise ValueError(
+                    f"band {b} has {x.shape[-2]} freq bins, expected {n_bins}"
+                )
+            xt = x.transpose(-1, -2)  # (..., T_b, F_b) — NO decimate, native rate in
+            tok = proj(xt) + self.band_type_emb[b]  # (..., T_b, d)
+            t_b = xt.shape[-2]
+            pos = torch.arange(t_b, device=x.device, dtype=torch.long) * stride  # (T_b,)
+            tokens.append(tok)
+            positions.append(pos)
+        return tuple(tokens), tuple(positions)
+
+
 # ── fine-HGA native-rate stem (2026-07-21, native-rate rebake) ──────────────────
 # (n_bins,) per band in SLOW, MID, HGA order. HGA is the FINE band (4 bins 64-160 Hz,
 # k2..k5) — down from the coarse 7 (STFT_2BAND_HGA). SLOW/MID keep the v2 widths.
@@ -187,21 +225,39 @@ def clock_length_32hz(
     native_fine_hga: bool = False,
     early_fusion: bool = False,
     no_fusion: bool = False,
+    native_perband: bool = False,
 ) -> int:
     """The 32 Hz clip-clock length T from the input bands.
 
     Uniform arm0: SLOW is already at 32 Hz ⇒ T = SLOW.shape[-1]. Native fine-HGA: bands
     arrive at SLOW T/8, MID T/2, HGA 4T ⇒ derive from HGA (128 = 4·32, integer-exact) and
     assert all three agree, so a mis-shaped native cache fails loud instead of silently
-    mis-gridding. r5 early-fusion (EarlyFusionStem) AND v3r5nf no-fusion (NoFusionStem): 2
-    streams HGA/LFS both at 64 Hz = 2T frames ⇒ T = HGA/2 (stem stride-2 decimate 64→32),
-    assert LFS agrees (the derivation is IDENTICAL — both consume the same 2×64 Hz caches).
+    mis-gridding. r6 native-per-band (``native_perband``): SLOW T/8, MID T/2, HGA T (HGA at 32 Hz,
+    7-bin coarse — NO conv-pool, factor 1, unlike fine-HGA's 128 Hz/4T) ⇒ T = HGA.shape[-1], same
+    SLOW·8 / MID·2 agreement asserts. r5 early-fusion (EarlyFusionStem) AND v3r5nf no-fusion
+    (NoFusionStem): 2 streams HGA/LFS both at 64 Hz = 2T frames ⇒ T = HGA/2 (stem stride-2 decimate
+    64→32), assert LFS agrees (the derivation is IDENTICAL — both consume the same 2×64 Hz caches).
     Both the masking (model.py) and the grid (objective.py) call this so the two never
     disagree on T."""
-    if int(early_fusion) + int(native_fine_hga) + int(no_fusion) > 1:
+    if (
+        int(early_fusion) + int(native_fine_hga) + int(no_fusion) + int(native_perband) > 1
+    ):
         raise ValueError(
-            "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
+            "early_fusion, native_fine_hga, no_fusion and native_perband are mutually exclusive"
         )
+    if native_perband:
+        s_slow, s_mid, _ = FINE_LATTICE_STRIDES  # (8, 2, 1) — SLOW/MID native = T/stride
+        T = int(band_inputs[2].shape[-1])  # HGA native = T (32 Hz, stride 1, NO pool)
+        if not (
+            int(band_inputs[0].shape[-1]) * s_slow == T
+            and int(band_inputs[1].shape[-1]) * s_mid == T
+        ):
+            raise ValueError(
+                f"r6 native band frame counts disagree on the 32 Hz clock: "
+                f"slow={int(band_inputs[0].shape[-1])} mid={int(band_inputs[1].shape[-1])} "
+                f"hga={int(band_inputs[2].shape[-1])} → T={T}"
+            )
+        return T
     if early_fusion or no_fusion:
         L = int(band_inputs[0].shape[-1])  # HGA @ 64 Hz = 2T frames
         if L % 2 != 0:

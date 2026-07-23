@@ -290,6 +290,42 @@ def token_flags(
     return masked, in_loss
 
 
+# ── r6 (3-band native-rate) PER-SHAFT band masks + MARGIN gate ───────────────────
+def token_flags_r6(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
+    """(masked, in_loss) each (B, total) bool for r6's 3-band grid with PER-SHAFT band masks.
+
+    r6 = r4's margin-gated leak-safety (``in_loss`` ⊆ ``masked``, M14 margin 2 — KEPT, unlike
+    r5's accept-the-bleed) on r5-style PER-SHAFT band masks. Reuses ``build_r4_grid`` (the grid
+    is identical — native bake changes only WHERE bins come from, not token positions). The only
+    change from :func:`token_flags`: each band mask is ``(B, S, T_b)`` (per-shaft) not ``(B, T_b)``
+    (global), so a token reads its OWN shaft's row (``bm[:, grid.shaft, grid.bandpos]``) and the
+    margin gate runs per-shaft (``_dist_to_visible`` over each ``(B·S, T_b)`` row independently).
+    Reduces EXACTLY to :func:`token_flags` when every shaft shares one mask (test_pack_r6).
+    ``masks`` (``masking.V3MasksR6``): ``contact_mask`` (B, N) + {slow,mid,hga}_mask (B, S, T_b)."""
+    band_masks = (masks.slow_mask, masks.mid_mask, masks.hga_mask)  # each (B, S, T_b)
+    B = masks.contact_mask.shape[0]
+    device = grid.contact.device
+
+    contact_masked = masks.contact_mask[:, grid.contact]  # (B, total)
+
+    temporal_masked = torch.zeros(B, grid.total, dtype=torch.bool, device=device)
+    temporal_in_loss = torch.zeros(B, grid.total, dtype=torch.bool, device=device)
+    for b, bm in enumerate(band_masks):  # bm (B, S, T_b)
+        sel = grid.band == b  # (total,) tokens of band b
+        sh = grid.shaft[sel]  # (n_b,) each token's shaft
+        pos = grid.bandpos[sel]  # (n_b,) band-token index
+        temporal_masked[:, sel] = bm[:, sh, pos]  # (B, n_b) per-shaft mask at token's (shaft,pos)
+        s_dim, t_b = bm.shape[1], bm.shape[2]
+        flat = bm.reshape(B * s_dim, t_b)  # margin gate PER (row, shaft), each its own grid
+        margin_ok = (flat & (_dist_to_visible(flat) >= MARGIN)).reshape(B, s_dim, t_b)
+        temporal_in_loss[:, sel] = margin_ok[:, sh, pos]  # (B, n_b)
+
+    masked = contact_masked | temporal_masked
+    # spatially-masked contact ⇒ leak-proof (no own visible same-band frame); else margin gate.
+    in_loss = contact_masked | (temporal_masked & temporal_in_loss)
+    return masked, in_loss
+
+
 # ── r5 (Chang 2-stream) single-band grid + accept-the-bleed flags ────────────────
 R5_STRIDE = 1  # one early-fused band, stride-1 lattice: token index == 32 Hz frame index.
 

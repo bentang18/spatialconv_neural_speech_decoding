@@ -46,6 +46,10 @@ R5_BAND_RATES: tuple[tuple[int, int], ...] = ((2, 1), (2, 1))
 # Fine-HGA OFAT native rates vs the 32 Hz clip clock (SLOW 4 Hz = 1/8, MID 16 Hz = 1/2,
 # HGA 128 Hz = 4/1) — the SINGLE source of truth the dispatch --frontend flag reads.
 NATIVE_FINE_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 8), (1, 2), (4, 1))
+# r6 native-rate 3-band |STFT| (SLOW 4 Hz = 1/8, MID 16 Hz = 1/2, HGA 32 Hz = 1/1). Same SLOW/MID
+# as fine, but HGA at the r4 STFT_2BAND_HGA rate (32 Hz, 7-bin coarse) NOT fine's 128 Hz/4-bin —
+# so HGA lands on the 32 Hz reference clock directly (rate 1/1, NativePerBandStem consumes native).
+R6_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 8), (1, 2), (1, 1))
 
 
 def _start_align(band_rates: Sequence[tuple[int, int]]) -> int:
