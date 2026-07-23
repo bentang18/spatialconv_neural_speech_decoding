@@ -130,7 +130,7 @@ def _freeze(m, *, device):
 
 
 def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teacher.model.",
-                  early_fusion: bool = False):
+                  early_fusion: bool = False, no_fusion: bool = False, nf_decimate: int = 2):
     """Load ONLY the shipped encoder tower (`_TargetTower` = PerBandStem + encoder) from the ckpt.
 
     Filter the LightningModule state_dict to the ``pref``-rooted subtree and load it into a fresh
@@ -149,7 +149,8 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     peek = [v.shape[0] for kk, v in tsd.items() if kk.endswith("parcel_embed.embed.weight")]
     if peek and int(peek[0]) != N_PARCELS:
         raise ValueError(f"ckpt parcel table {peek[0]} != expected {N_PARCELS}")
-    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=True, early_fusion=early_fusion)
+    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=True, early_fusion=early_fusion,
+                         no_fusion=no_fusion, nf_decimate=nf_decimate)
     missing, unexpected = tower.load_state_dict(tsd, strict=False)
     bad = [m for m in missing if "num_batches_tracked" not in m]
     if bad or unexpected:
@@ -443,11 +444,14 @@ def main() -> None:
                    help="board15 = the 15 leaderboard tasks (re-labels the same features)")
     p.add_argument("--electrode-set", choices=("all", "lite"), default="all",
                    help="lite = the Neuroprobe-Lite montage (leaderboard parity)")
-    p.add_argument("--frontend", choices=("v3r4", "v3r5"), default="v3r4",
+    p.add_argument("--frontend", choices=("v3r4", "v3r5", "v3r5nf", "v3r5nffast"), default="v3r4",
                    help="v3r4 = 3-band PerBandStem @32Hz (r4/arm0, default). v3r5 = Chang "
                         "2-stream EarlyFusionStem: 2 native-64Hz caches (hga, lfs) → ONE 32Hz "
-                        "token. Implies --online (r5 MAE has no teacher) + --no-perceiver + no "
-                        "enc0 (band strides are r4-only).")
+                        "token. v3r5nf = NoFusionStem: the SAME 2 caches, each stem-pooled into "
+                        "its OWN 32Hz token stream (two-band grid, decimate 2). v3r5nffast = "
+                        "v3r5nf with the first stem conv at stride 2 → 16Hz tokens (decimate 4). "
+                        "All three 2-stream frontends imply --online (MAE has no teacher) + "
+                        "--no-perceiver + no enc0 (band strides are r4-only).")
     p.add_argument("--no-perceiver", action="store_true",
                    help="skip the dec/lat taps — the board number is enc12, and the Perceiver "
                         "taps need the secondary head's ckpt subtree")
@@ -463,18 +467,25 @@ def main() -> None:
 
     from speech_decoding.experiments.pretrain_probe_suite import PROBE_COHORT_7
     from speech_decoding.experiments.dispatch_v3 import make_bt_parcel_fn
-    from speech_decoding.models.v14_converged_v3.pack_r4 import build_r4_grid, build_r5_grid
+    from speech_decoding.models.v14_converged_v3.pack_r4 import (
+        build_r4_grid, build_r5_grid, build_r5nf_grid,
+    )
+    from speech_decoding.models.v14_converged_v3.stem import nf_token_geometry
     from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
 
     is_r5 = args.frontend == "v3r5"
-    if is_r5:
-        # r5: EarlyFusionStem, single-band grid, no teacher/perceiver/enc0. Force the flags the
-        # frontend implies so a bare `--frontend v3r5` is sufficient.
+    is_r5nf = args.frontend in ("v3r5nf", "v3r5nffast")
+    is_two_stream = is_r5 or is_r5nf
+    # NoFusionStem net decimation: 4 for v3r5nffast (16 Hz tokens), else 2 (v3r5nf, 32 Hz).
+    nf_dec = 4 if args.frontend == "v3r5nffast" else 2
+    if is_two_stream:
+        # r5 (EarlyFusion) / nf (NoFusion): 2 native-64Hz caches, no teacher/perceiver/enc0.
+        # Force the flags the frontend implies so a bare `--frontend` is sufficient.
         args.online = True
         args.no_perceiver = True
-    n_cache = 2 if is_r5 else 3
+    n_cache = 2 if is_two_stream else 3
     if len(args.band_cache_dirs) != n_cache:
-        want = "(hga, lfs)" if is_r5 else "(slow, mid, hga)"
+        want = "(hga, lfs)" if is_two_stream else "(slow, mid, hga)"
         raise SystemExit(
             f"need {n_cache} --band-cache-dir {want}, got {len(args.band_cache_dirs)}")
     os.makedirs(args.out_dir, exist_ok=True)
@@ -482,7 +493,7 @@ def main() -> None:
     clip_frames = round(CLIP_DUR_S * FPS)
     # n_slots is the Perceiver slot count; the r5 tree has the perceiver path ripped out, so
     # import SLOT_STRIDE lazily only on the r4 perceiver path (n_slots is unused for r5).
-    if is_r5:
+    if is_two_stream:
         n_slots = 0
     else:
         from speech_decoding.models.v14_converged_v3.perceiver import SLOT_STRIDE
@@ -500,7 +511,8 @@ def main() -> None:
         raise SystemExit(f"--elec-taps {bad} not in GPU_TAPS {GPU_TAPS}")
     sd = _load_ckpt(args.ckpt)
     tower_pref = "objective.online." if args.online else "objective.teacher.model."
-    teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5)
+    teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5,
+                            no_fusion=is_r5nf, nf_decimate=nf_dec)
     # --online (MAE arm, or a JEPA online-vs-online match) has no Perceiver subtree to load.
     percs = {} if (args.no_perceiver or args.online) else _load_perceivers(sd, device=device)
     del sd
@@ -519,13 +531,13 @@ def main() -> None:
             print(f"[encode-r4] {session}: exists, skip -> {path}", flush=True)
             continue
         load_kw = {}
-        if is_r5:
+        if is_two_stream:
             from speech_decoding.models.v14_converged_v3.dataset import R5_BAND_RATES
             load_kw["band_rates"] = R5_BAND_RATES
         spec = load_v3_sessions(
             sessions=[session], band_cache_dirs=args.band_cache_dirs, span_dir=args.span_dir,
             parcel_fn=parcel_fn, lof_report_path=None,
-            winsor=(20.0, 15.0) if is_r5 else (15.0, 15.0, 20.0),
+            winsor=(20.0, 15.0) if is_two_stream else (15.0, 15.0, 20.0),
             keep_labels_fn=keep_labels_fn, **load_kw,
         )[0]
         if keep_labels_fn is not None:
@@ -540,19 +552,25 @@ def main() -> None:
             if not ok:
                 raise RuntimeError("lite montage kept a non-Lite electrode — refusing to write")
         targets = _load_targets(session, args.bt_root, tasks)
-        # r5 caches are native-64Hz (R5_BAND_RATES 2×); read 2·clip_frames frames per window.
-        bands = _window_bands(spec, targets.clip_starts, clip_frames, rate_mult=2 if is_r5 else 1)
+        # r5/nf caches are native-64Hz (R5_BAND_RATES 2×); read 2·clip_frames frames per window.
+        bands = _window_bands(spec, targets.clip_starts, clip_frames,
+                              rate_mult=2 if is_two_stream else 1)
 
         geom = spec.setup.geom.to(device)
         parcel_id = spec.setup.parcel_id.to(device)
-        grid = (build_r5_grid(geom, n_time=clip_frames) if is_r5
-                else build_r4_grid(geom, n_time=clip_frames))
+        if is_r5:
+            grid = build_r5_grid(geom, n_time=clip_frames)
+        elif is_r5nf:
+            n_tok, time_stride = nf_token_geometry(clip_frames, decimate=nf_dec)
+            grid = build_r5nf_grid(geom, n_time=n_tok, time_stride=time_stride)
+        else:
+            grid = build_r4_grid(geom, n_time=clip_frames)
         parcel_packed = parcel_id[grid.contact]
         canon, parcel_canon, present = _canon_parcels(grid, parcel_id)
 
-        # enc0 = the r4 per-band decimated input floor (BAND_STRIDES is r4-only); r5's single
-        # early-fused stream has no analogous decimation, so skip it — enc3/6/12 are the arms.
-        feats = ({} if is_r5
+        # enc0 = the r4 per-band decimated input floor (BAND_STRIDES is r4-only); the r5/nf
+        # 2-stream frontends have no analogous decimation, so skip it — enc3/6/12 are the arms.
+        feats = ({} if is_two_stream
                  else {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present)}})
         tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
                                   present, device=device, batch_size=args.batch_size,
