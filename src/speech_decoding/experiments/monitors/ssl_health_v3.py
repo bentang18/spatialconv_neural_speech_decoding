@@ -70,9 +70,14 @@ def _group(pl_module: pl.LightningModule, name: str):
 
 
 class SSLHealthMonitorV3(pl.Callback):
-    def __init__(self, *, every_n_steps: int = 1) -> None:
+    def __init__(self, *, every_n_steps: int = 1, per_stream_enc12: bool = False) -> None:
         super().__init__()
         self.every_n_steps = max(int(every_n_steps), 1)
+        # v3r5nf per-stream enc12 rankme/feat_std split. OFF by default (Ben 2026-07-22): the two
+        # extra SVDs it runs per monitor step were the ~0.15 s/step "comb" on the fast arm's large
+        # feature matrix — pure diagnostic overhead that cost the run its 50k target. Opt in with
+        # --per-stream-enc12 for a diagnostic run.
+        self.per_stream_enc12 = bool(per_stream_enc12)
         self._grad_ema_l2: float = 0.0
         # θ snapshot taken at a cadence step, read one step later to form the single-step Δθ.
         self._update_snapshot: dict[str, list[Tensor]] | None = None
@@ -198,7 +203,8 @@ class SSLHealthMonitorV3(pl.Callback):
             # the eager callback (off the compiled graph). Tests whether r5nf's low pooled
             # rankme is the between-stream identity axis (per-stream rankme ≫ pooled) or a
             # genuinely low per-stream spectrum. Absent for r4/r5-fused (no enc12_band tap).
-            band = taps.get("enc12_band")
+            # OFF by default — the 2 extra SVDs are the fast-arm "comb"; opt in via --per-stream-enc12.
+            band = taps.get("enc12_band") if self.per_stream_enc12 else None
             if isinstance(band, Tensor):
                 flat = tap.detach().reshape(-1, tap.shape[-1])
                 b = band.detach().reshape(-1)

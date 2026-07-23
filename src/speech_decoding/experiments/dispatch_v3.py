@@ -348,7 +348,10 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
     callbacks: list[pl.Callback] = [
         _EpochSeedCallback(),
         _StepTimeCallback(),
-        SSLHealthMonitorV3(every_n_steps=args.monitor_every_n_steps),
+        SSLHealthMonitorV3(
+            every_n_steps=args.monitor_every_n_steps,
+            per_stream_enc12=getattr(args, "per_stream_enc12", False),
+        ),
     ]
     if args.wandb_project:  # LearningRateMonitor needs a logger; verifies the 5k warmup ramp
         from lightning.pytorch.callbacks import LearningRateMonitor
@@ -538,6 +541,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
+    p.add_argument("--per-stream-enc12", dest="per_stream_enc12", action="store_true",
+                   help="v3r5nf diagnostic: split the enc12 tap by stream (HGA/LFS) and log each "
+                        "stream's OWN rankme + feat_std. OFF by default (Ben 2026-07-22) — its 2 "
+                        "extra SVDs/monitor-step are the fast-arm 'comb' (~0.15 s/step). Opt in "
+                        "only for a diagnostic run.")
     p.add_argument("--log-every-n-steps", dest="log_every_n_steps", type=int, default=1,
                    help="wandb flush cadence; 1 = per-step resolution (Ben 2026-07-11) "
                         "so update_cos/grad-spike/feat_std are not window-averaged away")

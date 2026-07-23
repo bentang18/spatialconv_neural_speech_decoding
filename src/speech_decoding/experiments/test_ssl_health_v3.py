@@ -207,7 +207,8 @@ def test_family_b_tap_keys_finite() -> None:
 def test_enc12_stream_split_logs_per_stream_rankme_and_feat_std() -> None:
     """v3r5nf: when the taps carry ``enc12_band`` (per-visible-token stream label), the monitor
     splits the pooled enc12 by stream and logs each stream's OWN rankme + feat_std, in ADDITION
-    to the pooled keys. The boolean split + per-stream SVD run here in the eager callback."""
+    to the pooled keys. OPT-IN via per_stream_enc12=True (OFF by default — the split's 2 SVDs are
+    the fast-arm comb). The boolean split + per-stream SVD run here in the eager callback."""
     torch.manual_seed(0)
     d = 16
     enc12 = torch.cat([torch.randn(40, d), torch.randn(30, d)], 0)  # 40 HGA + 30 LFS rows
@@ -215,7 +216,7 @@ def test_enc12_stream_split_logs_per_stream_rankme_and_feat_std() -> None:
     logged: dict[str, float] = {}
     mod = SimpleNamespace(_last_taps={"enc12": enc12, "enc12_band": band}, global_step=0)
     mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[attr-defined]
-    cb = SSLHealthMonitorV3()
+    cb = SSLHealthMonitorV3(per_stream_enc12=True)
     cb.on_train_batch_end(
         trainer=_fake_trainer(), pl_module=mod, outputs=None, batch=None, batch_idx=0,
     )
@@ -229,6 +230,24 @@ def test_enc12_stream_split_logs_per_stream_rankme_and_feat_std() -> None:
     for k in keys:
         assert k in logged and logged[k] == logged[k], k  # present + finite
     print(f"[check] enc12 stream split logs pooled+HGA+LFS rankme/feat_std ({len(keys)} keys) OK")
+
+
+def test_enc12_split_off_by_default_even_with_band_tap() -> None:
+    """Default (per_stream_enc12=False): the band tap is IGNORED — pooled enc12 only, no per-stream
+    SVDs. This is the fast-arm 'comb' disabled by default (Ben 2026-07-22)."""
+    torch.manual_seed(0)
+    d = 16
+    enc12 = torch.cat([torch.randn(40, d), torch.randn(30, d)], 0)
+    band = torch.cat([torch.zeros(40), torch.ones(30)]).long()
+    logged: dict[str, float] = {}
+    mod = SimpleNamespace(_last_taps={"enc12": enc12, "enc12_band": band}, global_step=0)
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[attr-defined]
+    SSLHealthMonitorV3().on_train_batch_end(  # default: per_stream_enc12=False
+        trainer=_fake_trainer(), pl_module=mod, outputs=None, batch=None, batch_idx=0,
+    )
+    assert "train_mon_enc12_rankme" in logged  # pooled still logged
+    assert not any("_hga_" in k or "_lfs_" in k for k in logged)  # split suppressed
+    print("[check] OK per-stream split OFF by default (band tap present but ignored)")
 
 
 def test_enc12_no_stream_split_without_band_tap() -> None:
