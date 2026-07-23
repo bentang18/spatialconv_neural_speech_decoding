@@ -280,13 +280,22 @@ def _pool_parcels(x, parcel_canon, present):
     return torch.stack(blocks, dim=1).to(torch.float16)           # (B, |P|, F)
 
 
-def _enc0_pooled(bands, canon, parcel_canon, present):
+def _enc0_pooled(bands, canon, parcel_canon, present, strides=None):
     """enc0 input floor: per band decimate ``x[..., ::stride]`` (the model's own input frames),
-    reorder to canonical contacts, pool to parcels, concat bands → (n_win, |P|, F0)."""
+    reorder to canonical contacts, pool to parcels, concat bands → (n_win, |P|, F0).
+
+    ``strides`` defaults to r4's ``BAND_STRIDES`` (8,2,1) on the 32 Hz clock. The 2-stream
+    frontends pass their own: both r5/nf streams are cached at 64 Hz and their stem decimates
+    64→32 by ``NOFUSION_DECIMATE`` (2; 4 for nffast), so ``(dec, dec)`` is the exact parity of
+    r4's per-band strides — the raw bins each stem's first layer consumes."""
     from speech_decoding.models.v14_converged_v3.pack_r4 import BAND_STRIDES
 
+    if strides is None:
+        strides = BAND_STRIDES
+    if len(strides) != len(bands):
+        raise ValueError(f"enc0 got {len(bands)} bands but {len(strides)} strides")
     per_band = []
-    for x, st in zip(bands, BAND_STRIDES):                        # x (n, N, F_b, T32)
+    for x, st in zip(bands, strides):                             # x (n, N, F_b, T_clock)
         xd = x[..., ::st]                                         # (n, N, F_b, T_b) decimated
         xd = xd.transpose(-1, -2).contiguous()                   # (n, N, T_b, F_b) time-major
         xd = xd[:, canon]                                        # (n, n_canon, T_b, F_b)
@@ -430,7 +439,8 @@ def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, prese
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True)
+    p.add_argument("--ckpt", default=None,
+                   help="required unless --enc0-only (enc0 never reads weights)")
     p.add_argument("--tag", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--band-cache-dir", dest="band_cache_dirs", action="append", required=True,
@@ -440,6 +450,9 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--sessions", choices=("cohort7", "board"), default="cohort7",
                    help="cohort7 = the 7-session diagnostic cohort; board = the 12 Neuroprobe-Lite sessions")
+    p.add_argument("--session-index", type=int, default=None,
+                   help="encode ONLY cohort[i] — one Slurm array task per session "
+                        "(feedback-always-parallel-shard-shorten-loop). Default = all.")
     p.add_argument("--tasks", choices=("probe4", "board15"), default="probe4",
                    help="board15 = the 15 leaderboard tasks (re-labels the same features)")
     p.add_argument("--electrode-set", choices=("all", "lite"), default="all",
@@ -452,6 +465,15 @@ def main() -> None:
                         "v3r5nf with the first stem conv at stride 2 → 16Hz tokens (decimate 4). "
                         "All three 2-stream frontends imply --online (MAE has no teacher) + "
                         "--no-perceiver + no enc0 (band strides are r4-only).")
+    p.add_argument("--enc0-only", action="store_true",
+                   help="compute ONLY the enc0 input floor (raw decimated band bins pooled to "
+                        "parcels). No ckpt, no model, no GPU — enc0 never touched weights. Lets "
+                        "the 2-stream frontends get an enc0 at parity with r4's (Ben 2026-07-23).")
+    p.add_argument("--enc0-stride", type=int, default=None,
+                   help="override the enc0 decimation applied to EVERY band (2-stream only). "
+                        "Default = the frontend's own stem decimate (2 for v3r5/v3r5nf, 4 for "
+                        "v3r5nffast) = stem parity @32Hz. Pass 1 for NO decimation = the full "
+                        "native 64 Hz cache, which isolates what the stem's 2x downsample costs.")
     p.add_argument("--no-perceiver", action="store_true",
                    help="skip the dec/lat taps — the board number is enc12, and the Perceiver "
                         "taps need the secondary head's ckpt subtree")
@@ -503,22 +525,39 @@ def main() -> None:
             raise SystemExit(f"clip_frames={clip_frames} not divisible by SLOT_STRIDE={SLOT_STRIDE}")
     parcel_fn = make_bt_parcel_fn(args.bt_root)
     cohort = BOARD_SESSIONS if args.sessions == "board" else tuple(PROBE_COHORT_7)
+    if args.session_index is not None:
+        if not 0 <= args.session_index < len(cohort):
+            raise SystemExit(f"--session-index {args.session_index} out of range [0,{len(cohort)})")
+        cohort = (cohort[args.session_index],)
     tasks = BOARD_TASKS if args.tasks == "board15" else PROBE_TASKS
     keep_labels_fn = _lite_keep_labels_fn(args.bt_root) if args.electrode_set == "lite" else None
     elec_taps = tuple(int(t) for t in args.elec_taps.split(",") if t.strip())
     bad = [t for t in elec_taps if t not in GPU_TAPS]
     if bad:
         raise SystemExit(f"--elec-taps {bad} not in GPU_TAPS {GPU_TAPS}")
-    sd = _load_ckpt(args.ckpt)
-    tower_pref = "objective.online." if args.online else "objective.teacher.model."
-    teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5,
-                            no_fusion=is_r5nf, nf_decimate=nf_dec)
-    # --online (MAE arm, or a JEPA online-vs-online match) has no Perceiver subtree to load.
-    percs = {} if (args.no_perceiver or args.online) else _load_perceivers(sd, device=device)
-    del sd
-    perc_note = ("online encoder, no perceiver" if args.online
-                 else "no perceiver" if args.no_perceiver
-                 else "+ perceiver dec/lat (+_rand control)")
+    # enc0 on a 2-stream frontend is opt-in: --enc0-only, or an explicit --enc0-stride.
+    enc0_two_stream = args.enc0_only or args.enc0_stride is not None
+    enc0_stride = args.enc0_stride
+    if is_two_stream and enc0_stride is None:
+        enc0_stride = nf_dec  # stem parity: the stem's own net decimate
+    if args.enc0_only:
+        # enc0 is a pure function of the CACHED BANDS (no weights ever touched), so there is
+        # nothing to load and nothing to run on a GPU.
+        teacher, percs = None, {}
+        perc_note = "ENC0-ONLY (no ckpt, no model, CPU)"
+    else:
+        if not args.ckpt:
+            raise SystemExit("--ckpt is required unless --enc0-only")
+        sd = _load_ckpt(args.ckpt)
+        tower_pref = "objective.online." if args.online else "objective.teacher.model."
+        teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5,
+                                no_fusion=is_r5nf, nf_decimate=nf_dec)
+        # --online (MAE arm, or a JEPA online-vs-online match) has no Perceiver subtree to load.
+        percs = {} if (args.no_perceiver or args.online) else _load_perceivers(sd, device=device)
+        del sd
+        perc_note = ("online encoder, no perceiver" if args.online
+                     else "no perceiver" if args.no_perceiver
+                     else "+ perceiver dec/lat (+_rand control)")
     print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0 "
           f"{perc_note}, n_slots={n_slots} sessions={args.sessions}({len(cohort)}) "
           f"tasks={args.tasks}({len(tasks)}) electrodes={args.electrode_set}", flush=True)
@@ -568,21 +607,28 @@ def main() -> None:
         parcel_packed = parcel_id[grid.contact]
         canon, parcel_canon, present = _canon_parcels(grid, parcel_id)
 
-        # enc0 = the r4 per-band decimated input floor (BAND_STRIDES is r4-only); the r5/nf
-        # 2-stream frontends have no analogous decimation, so skip it — enc3/6/12 are the arms.
-        feats = ({} if is_two_stream
-                 else {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present)}})
-        tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
-                                  present, device=device, batch_size=args.batch_size,
-                                  n_slots=n_slots, run_checks=first, elec_taps=elec_taps)
+        # enc0 = the per-band decimated input floor. r4: BAND_STRIDES (8,2,1) on the 32 Hz clock.
+        # 2-stream (Ben 2026-07-23): both caches are native 64 Hz and the stem decimates by
+        # nf_dec, so (nf_dec,)*n_bands is the exact parity; --enc0-stride 1 keeps the full 64 Hz.
+        if is_two_stream and not enc0_two_stream:
+            feats = {}  # legacy: 2-stream enc0 off unless asked for
+        else:
+            st = (enc0_stride,) * len(bands) if enc0_stride is not None else None
+            feats = {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present, st)}}
+        if args.enc0_only:
+            tap_pooled = {}
+        else:
+            tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
+                                      present, device=device, batch_size=args.batch_size,
+                                      n_slots=n_slots, run_checks=first, elec_taps=elec_taps)
+            for t in GPU_TAPS:
+                feats[f"enc{t}"] = tap_pooled[t]
+            for t in elec_taps:
+                feats[f"enc{t}_elec"] = tap_pooled[f"elec{t}"]
+            for name in percs:
+                feats[f"dec{name}"] = tap_pooled[f"dec{name}"]
+                feats[f"lat{name}"] = tap_pooled[f"lat{name}"]
         first = False
-        for t in GPU_TAPS:
-            feats[f"enc{t}"] = tap_pooled[t]
-        for t in elec_taps:
-            feats[f"enc{t}_elec"] = tap_pooled[f"elec{t}"]
-        for name in percs:
-            feats[f"dec{name}"] = tap_pooled[f"dec{name}"]
-            feats[f"lat{name}"] = tap_pooled[f"lat{name}"]
 
         payload = {
             "subject_id": subject_id, "trial_id": trial_id, "ckpt_tag": args.tag,
