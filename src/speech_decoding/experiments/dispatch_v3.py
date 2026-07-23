@@ -280,18 +280,29 @@ def build_v3_training(
     mae = getattr(args, "objective", "jepa") == "mae"
     native_fine_hga, early_fusion, no_fusion, band_rates = _frontend_config(args)
     nf_decimate = _nf_decimate(args)
-    # temporal_block_w is a tunable HP (--temporal-block-w). Unset ⇒ the arm's physics default:
-    # 5 tokens (=156 ms @32 Hz) for every arm EXCEPT v3r5nffast, where the 16 Hz tokens halve the
-    # rate so the block shrinks to 3 (holds the ~95 ms masked-run half-width that clears the 83 ms
-    # LFS decorrelation horizon, the block's τ-anchor — masking.py:77). Any explicit value wins;
-    # unset + non-fast ⇒ V3MaskConfig() default (byte-identical to the locked config).
-    block_w = getattr(args, "temporal_block_w", None)
-    if block_w is None:
-        block_w = 3 if nf_decimate == 4 else V3MaskConfig().temporal_block_w
-    mask_cfg = (
-        V3MaskConfig() if block_w == V3MaskConfig().temporal_block_w
-        else V3MaskConfig(temporal_block_w=block_w)
-    )
+    # Temporal mask block width(s) in TOKENS — the τ-anchored SSL difficulty knob (masking.py:77).
+    # v3r5nf masks HGA and LFS on SEPARATE grids, so each carries its OWN width: --hga-block-w /
+    # --lfs-block-w (default HGA 3, LFS 5 — LFS wider to force extrapolation past the 83 ms LFS
+    # decorrelation horizon; a narrow LFS block was trivially in-fillable at EV ~0.6). --temporal-
+    # block-w sets BOTH streams (back-compat) unless a per-stream flag wins. Every non-no-fusion arm
+    # (r5-fused / r4) uses --temporal-block-w for its single grid; unset ⇒ V3MaskConfig() default
+    # (byte-identical to the locked config).
+    tbw = getattr(args, "temporal_block_w", None)
+    if no_fusion:
+        hga_bw = getattr(args, "hga_block_w", None)
+        lfs_bw = getattr(args, "lfs_block_w", None)
+        if hga_bw is None:
+            hga_bw = tbw
+        if lfs_bw is None:
+            lfs_bw = tbw
+        kw: dict[str, int] = {}
+        if hga_bw is not None:
+            kw["hga_block_w"] = hga_bw
+        if lfs_bw is not None:
+            kw["lfs_block_w"] = lfs_bw
+        mask_cfg = V3MaskConfig(**kw)
+    else:
+        mask_cfg = V3MaskConfig() if tbw is None else V3MaskConfig(temporal_block_w=tbw)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
@@ -495,9 +506,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--temporal-block-w", dest="temporal_block_w", type=int, default=None,
                    help="temporal mask block width in TOKENS (masking.py: the τ-anchored SSL "
                         "difficulty knob; block half-width must clear the ~83 ms LFS decorrelation "
-                        "horizon). Unset ⇒ arm default: 5 (156 ms @32 Hz) everywhere except "
-                        "v3r5nffast where 16 Hz tokens ⇒ 3 (holds the ~95 ms half-width). An "
-                        "explicit value overrides for any arm.")
+                        "horizon). r5-fused/r4: the single grid's width, unset ⇒ 5 (156 ms @32 Hz). "
+                        "v3r5nf: sets BOTH streams unless --hga-block-w/--lfs-block-w override.")
+    p.add_argument("--hga-block-w", dest="hga_block_w", type=int, default=None,
+                   help="v3r5nf ONLY: HGA-stream temporal block width in TOKENS. Unset ⇒ "
+                        "--temporal-block-w if given, else V3MaskConfig default (3). The near-white "
+                        "HGA stream stays hard at a narrow block.")
+    p.add_argument("--lfs-block-w", dest="lfs_block_w", type=int, default=None,
+                   help="v3r5nf ONLY: LFS-stream temporal block width in TOKENS. Unset ⇒ "
+                        "--temporal-block-w if given, else V3MaskConfig default (5) — wider than HGA "
+                        "so the slow LFS stream can't trivially in-fill the masked run.")
     # --- batching unit (shaft-level cross-patient vs session-homogeneous) ---
     p.add_argument("--batch-unit", dest="batch_unit", choices=("session", "shaft"),
                    default=None,

@@ -111,6 +111,41 @@ def test_temporal_is_per_shaft_independent() -> None:
     print("[check] OK each stream's temporal mask is (R,S,T) per-shaft independent")
 
 
+def test_default_config_widths_are_hga_3_lfs_5() -> None:
+    # Ben 2026-07-22: bake HGA 3 / LFS 5 as the no-fusion per-stream defaults.
+    cfg = V3MaskConfig()
+    assert (cfg.hga_block_w, cfg.lfs_block_w) == (3, 5)
+    print("[check] OK baked per-stream defaults: HGA=3, LFS=5")
+
+
+def test_per_stream_block_widths_control_masked_run_length() -> None:
+    # HGA and LFS carry SEPARATE temporal block widths: a wider LFS block ⇒ longer CONTIGUOUS
+    # masked runs (forces extrapolation past the LFS decorrelation horizon) at the SAME 50% frac.
+    # Assert the WIDTH — not the independent draw — drives it: narrow HGA (1) vs wide LFS (8) ⇒
+    # LFS max-run strictly longer on average.
+    sc, geom = _session([6, 6])
+    n = int(geom.valid.sum())
+    t = 40
+    cfg = V3MaskConfig(hga_block_w=1, lfs_block_w=8)
+    m = sample_masks_r5nf(geom, n, n_time=t, n_rows=64, generator=_gen(11), cfg=cfg)
+
+    def mean_max_run(tm: torch.Tensor) -> float:  # (R,S,T) bool → mean max contiguous True run
+        runs = []
+        for row in tm.reshape(-1, t):
+            best = cur = 0
+            for v in row.tolist():
+                cur = cur + 1 if v else 0
+                best = max(best, cur)
+            runs.append(best)
+        return sum(runs) / len(runs)
+
+    hga_run = mean_max_run(m.hga_temporal_mask)
+    lfs_run = mean_max_run(m.lfs_temporal_mask)
+    assert lfs_run > hga_run + 1.0, (hga_run, lfs_run)
+    print(f"[check] OK per-stream width drives run length: HGA(w=1)={hga_run:.2f} < "
+          f"LFS(w=8)={lfs_run:.2f}")
+
+
 def test_deterministic_in_generator_seed() -> None:
     sc, geom = _session([4, 4])
     n = int(geom.valid.sum())

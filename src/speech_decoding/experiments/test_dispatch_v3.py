@@ -340,11 +340,11 @@ def test_v3r5nf_threads_no_fusion_and_stream_weight_then_fits(tmp_path) -> None:
     _cpu_trainer(2).fit(m, datamodule=dm)  # runs; no shape/plan-cache error
 
 
-def test_v3r5nffast_threads_decimate_4_and_block_w_3_then_fits(tmp_path) -> None:
+def test_v3r5nffast_threads_decimate_4_and_per_stream_block_w_then_fits(tmp_path) -> None:
     # v3r5nffast = v3r5nf with the first stem conv at stride 2 (net 4× → 16 Hz tokens). It maps to
-    # the SAME (no_fusion, R5NF_BAND_RATES) config as v3r5nf but with nf_decimate=4, and the
-    # temporal block shrinks 5→3 (physics: hold the masked-run half-width above the 83 ms horizon).
-    # --temporal-block-w overrides for any arm; v3r5nf stays at 5 (the queued run is unaffected).
+    # the SAME (no_fusion, R5NF_BAND_RATES) config as v3r5nf but with nf_decimate=4. Temporal block
+    # widths are now PER-STREAM (Ben 2026-07-22): HGA 3 / LFS 5 by default on BOTH no-fusion arms —
+    # LFS wider so the slow stream can't trivially in-fill the masked run.
     assert _frontend_config(_smoke_args(frontend="v3r5nffast")) == (
         False, False, True, R5NF_BAND_RATES
     )  # same tuple as v3r5nf — the decimate is the only difference
@@ -367,27 +367,37 @@ def test_v3r5nffast_threads_decimate_4_and_block_w_3_then_fits(tmp_path) -> None
     assert m.model.objective.online.stem.decimate == 4
     assert m.model.objective.mae_head_hga.out_features == 16  # DEC·4
     assert m.model.objective.mae_head_lfs.out_features == 4  # DEC·1
-    assert m.model.mask_cfg.temporal_block_w == 3  # fast physics default
+    assert m.model.mask_cfg.hga_block_w == 3  # per-stream default (HGA)
+    assert m.model.mask_cfg.lfs_block_w == 5  # per-stream default (LFS, wider)
     assert dm.batch_unit == "shaft"
 
-    # v3r5nf keeps the locked default (5) — the queued run's config is byte-identical.
+    # v3r5nf gets the same per-stream defaults (3 / 5).
     m_nf, _, _ = build_v3_training(
         specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae")
     )
     assert m_nf.model.nf_decimate == 2
-    assert m_nf.model.mask_cfg.temporal_block_w == 5
+    assert (m_nf.model.mask_cfg.hga_block_w, m_nf.model.mask_cfg.lfs_block_w) == (3, 5)
 
-    # --temporal-block-w wins for any arm (fast override, and a non-default on v3r5nf).
+    # Per-stream flags override independently.
     m_ov, _, _ = build_v3_training(
         specs, _smoke_args(frontend="v3r5nffast", contact_budget=16, objective="mae",
-                           temporal_block_w=4)
+                           hga_block_w=4, lfs_block_w=8)
     )
-    assert m_ov.model.mask_cfg.temporal_block_w == 4
-    m_nf7, _, _ = build_v3_training(
+    assert (m_ov.model.mask_cfg.hga_block_w, m_ov.model.mask_cfg.lfs_block_w) == (4, 8)
+
+    # --temporal-block-w sets BOTH streams (back-compat) when no per-stream flag is given.
+    m_both, _, _ = build_v3_training(
         specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae",
-                           temporal_block_w=7)
+                           temporal_block_w=6)
     )
-    assert m_nf7.model.mask_cfg.temporal_block_w == 7
+    assert (m_both.model.mask_cfg.hga_block_w, m_both.model.mask_cfg.lfs_block_w) == (6, 6)
+
+    # A per-stream flag wins over --temporal-block-w for that stream only.
+    m_mix, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r5nf", contact_budget=16, objective="mae",
+                           temporal_block_w=6, lfs_block_w=9)
+    )
+    assert (m_mix.model.mask_cfg.hga_block_w, m_mix.model.mask_cfg.lfs_block_w) == (6, 9)
 
     _cpu_trainer(2).fit(m, datamodule=dm)  # 16 Hz token grid fits end-to-end (plan cache + backward)
 
