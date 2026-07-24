@@ -40,15 +40,24 @@ from torch.utils.data import Dataset
 # project-fine-hga-bt-rebake-tasklist-2026-07-21).
 UNIFORM_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 1), (1, 1), (1, 1))
 
+# The clip-clock rate every band_rate is expressed against (assert_band_rates_match_cache).
+REF_RATE_HZ: int = 32
+
 # r5 Chang 2-stream: both bands (v3hga, v3lfs) cached @64 Hz = 2× the 32 Hz clip clock;
 # the EarlyFusionStem pools 2 frames → 1 token (stride-2). So each band reads 2× frames.
 R5_BAND_RATES: tuple[tuple[int, int], ...] = ((2, 1), (2, 1))
 # Fine-HGA OFAT native rates vs the 32 Hz clip clock (SLOW 4 Hz = 1/8, MID 16 Hz = 1/2,
 # HGA 128 Hz = 4/1) — the SINGLE source of truth the dispatch --frontend flag reads.
 NATIVE_FINE_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 8), (1, 2), (4, 1))
-# r6 native-rate 3-band |STFT| (SLOW 4 Hz = 1/8, MID 16 Hz = 1/2, HGA 32 Hz = 1/1). Same SLOW/MID
-# as fine, but HGA at the r4 STFT_2BAND_HGA rate (32 Hz, 7-bin coarse) NOT fine's 128 Hz/4-bin —
-# so HGA lands on the 32 Hz reference clock directly (rate 1/1, NativePerBandStem consumes native).
+# DORMANT — NOT WIRED TO ANY FRONTEND (2026-07-23). These were r6's declared rates on the theory
+# that the 3 bands had been re-baked at SLOW 4 Hz / MID 16 Hz / HGA 32 Hz. That bake was never
+# made: all three caches are band_hop=64 = 32 Hz. Declaring a rate the cache does not have does
+# NOT decimate — `dataset.py` rescales the read INDEX, so SLOW came back as a contiguous 1/8-length
+# slice starting 1/8 of the way in, i.e. the wrong 0.25 s of audio from the wrong minute, at the
+# right shape. Four runs trained on it before the enc0 number gave it away. v3r6 now uses
+# UNIFORM_BAND_RATES (the stem decimates, as in r4). Kept ONLY as the regression fixture for
+# `assert_band_rates_match_cache`, which now rejects exactly this against a 32 Hz bake.
+# Memo: project-r6-band-rates-cache-rate-bug-2026-07-23.
 R6_BAND_RATES: tuple[tuple[int, int], ...] = ((1, 8), (1, 2), (1, 1))
 
 
@@ -59,6 +68,37 @@ def _start_align(band_rates: Sequence[tuple[int, int]]) -> int:
     for _num, den in band_rates:
         align = align * den // gcd(align, den)
     return align
+
+
+def assert_band_rates_match_cache(
+    frame_rates_hz: Sequence[int],
+    band_rates: Sequence[tuple[int, int]],
+    *,
+    where: str = "",
+) -> None:
+    """Fail loud when a declared ``band_rate`` contradicts the cache's REAL frame rate.
+
+    ``band_rates`` asserts band b sits at ``REF_RATE_HZ·num/den``; the sidecar says
+    ``sample_rate//band_hop``. When the two disagree, the per-band window ``t0·num//den``
+    (:meth:`V3ClipDataset.__getitem__`) stops being a decimation and silently becomes a
+    COMPRESSED, TIME-SHIFTED slice — r6 2026-07-23 declared SLOW 4 Hz / MID 16 Hz against
+    32 Hz caches and read 0.25 s from 6.5 min in / 1.0 s from 26 min in beside HGA's correct
+    2.0 s, i.e. three bands from three unrelated moments.
+
+    Nothing else catches this: the per-band clip LENGTHS still come out right (8/32/64), so
+    ``reference_n_frames`` (which takes the min, and an over-declared ``den`` only inflates
+    that band's cap) and ``clock_length_32hz`` (shape-only asserts) both pass.
+    """
+    for b, (rate, (num, den)) in enumerate(zip(frame_rates_hz, band_rates)):
+        if rate * den != REF_RATE_HZ * num:
+            raise ValueError(
+                f"{where + ': ' if where else ''}band {b} declares rate {num}/{den} of the "
+                f"{REF_RATE_HZ} Hz clip clock (= {REF_RATE_HZ * num / den:g} Hz) but its cache is "
+                f"{rate} Hz. Declared rates must match the bake — a mismatch turns the per-band "
+                f"window into a compressed, time-shifted slice instead of a decimation. To read a "
+                f"band COARSER than its cache, decimate (``[..., ::stride]``); band_rates only "
+                f"express a cache whose own rate differs from the clip clock."
+            )
 
 
 def reference_n_frames(

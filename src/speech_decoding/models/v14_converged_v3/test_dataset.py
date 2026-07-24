@@ -15,11 +15,17 @@ adapter (labels / LOF / parcel support) is a thin layer validated on DeltaAI at 
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from speech_decoding.models.v14_converged_v3.batch import v3_collate
 from speech_decoding.models.v14_converged_v3.dataset import (
+    NATIVE_FINE_BAND_RATES,
+    R5_BAND_RATES,
+    R6_BAND_RATES,
+    UNIFORM_BAND_RATES,
     V3SessionDataset,
+    assert_band_rates_match_cache,
     build_session_spec,
 )
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
@@ -298,3 +304,39 @@ def _spec_winsor(tmp, *, winsor):
         bad_spans_s=[],
         winsor=winsor,
     )
+
+
+# ---------------------------------------------------------------------------
+# band_rates vs cache-rate guard (r6 regression, 2026-07-23). R6_BAND_RATES declared
+# SLOW 4 Hz / MID 16 Hz against caches that were all baked at 32 Hz, so the per-band
+# window t0·num//den read a COMPRESSED, TIME-SHIFTED slice at the right SHAPE — three
+# bands from three unrelated moments of the recording. Every downstream shape check
+# passed, so only an explicit rate assert can catch it.
+# ---------------------------------------------------------------------------
+def test_band_rates_guard_rejects_r6_native_rates_on_32hz_caches() -> None:
+    with pytest.raises(ValueError, match="but its cache is 32 Hz"):
+        assert_band_rates_match_cache([32, 32, 32], R6_BAND_RATES, where="session 1/0")
+
+
+def test_band_rates_guard_names_the_offending_band_and_session() -> None:
+    with pytest.raises(ValueError) as ei:
+        assert_band_rates_match_cache([32, 32, 32], R6_BAND_RATES, where="session 1/0")
+    msg = str(ei.value)
+    assert "session 1/0" in msg and "band 0" in msg  # SLOW is the first mismatch
+
+
+def test_band_rates_guard_accepts_every_shipped_arm_against_its_real_bake() -> None:
+    # arm0/r4: all three bands baked at 32 Hz, stem decimates ::8/::2/::1
+    assert_band_rates_match_cache([32, 32, 32], UNIFORM_BAND_RATES)
+    # r5/r5nf: both streams baked at 64 Hz = 2× the clip clock
+    assert_band_rates_match_cache([64, 64], R5_BAND_RATES)
+    # a TRUE native 3-band bake (SLOW 4 / MID 16 / HGA 32) is what R6_BAND_RATES meant
+    assert_band_rates_match_cache([4, 16, 32], R6_BAND_RATES)
+    # fine-HGA: SLOW 4 / MID 16 / HGA 128
+    assert_band_rates_match_cache([4, 16, 128], NATIVE_FINE_BAND_RATES)
+
+
+def test_band_rates_guard_rejects_a_half_rate_bake() -> None:
+    # uniform rates against a cache baked at 16 Hz — the mirror of the r6 failure
+    with pytest.raises(ValueError, match="but its cache is 16 Hz"):
+        assert_band_rates_match_cache([32, 16, 32], UNIFORM_BAND_RATES)

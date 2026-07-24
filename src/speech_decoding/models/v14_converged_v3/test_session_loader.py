@@ -49,8 +49,13 @@ def _stub_parcel_fn(subject_id, trial_id, labels):
     return torch.tensor(pid, dtype=torch.long)
 
 
-def _write_band_cache(band_dir, band_idx, sessions, n_frames):
-    """Write {stem}.json + .npy + .stats.npz for each session into one band dir."""
+def _write_band_cache(band_dir, band_idx, sessions, n_frames, frame_rate=32):
+    """Write {stem}.json + .npy + .stats.npz for each session into one band dir.
+
+    ``frame_rate`` is the rate the sidecar CLAIMS this band was baked at. It must agree with
+    the ``band_rates`` the loader is called with, or ``assert_band_rates_match_cache`` fails
+    the load — a fixture that declares native rates over 32 Hz sidecars is exactly the r6
+    2026-07-23 defect. Sidecars carry no ``band_hop``, so sample_rate IS the frame rate."""
     band_dir.mkdir(parents=True, exist_ok=True)
     F = _BAND_F[band_idx]
     for subject_id, trial_id, labels in sessions:
@@ -63,7 +68,7 @@ def _write_band_cache(band_dir, band_idx, sessions, n_frames):
         C = len(labels)
         (band_dir / f"{stem}.json").write_text(json.dumps({
             "key": key, "ch_names": labels, "total_frames": n_frames,
-            "sample_rate": 32,
+            "sample_rate": frame_rate,
         }))
         # distinct per-channel values so a wrong keep-slice would be visible
         arr = (np.arange(C, dtype=np.float32)[:, None, None]
@@ -76,11 +81,12 @@ def _write_band_cache(band_dir, band_idx, sessions, n_frames):
         )
 
 
-def _setup_caches(tmp_path, sessions, *, n_frames=2000, bad_windows=None, lof=None):
+def _setup_caches(tmp_path, sessions, *, n_frames=2000, bad_windows=None, lof=None,
+                  frame_rate=32):
     band_dirs = []
     for b in range(3):
         d = tmp_path / f"band{b}"
-        _write_band_cache(d, b, sessions, n_frames)
+        _write_band_cache(d, b, sessions, n_frames, frame_rate)
         band_dirs.append(str(d))
     span_dir = tmp_path / "spans"
     span_dir.mkdir()
@@ -257,12 +263,16 @@ def test_guard2_spans_carried_in_seconds(tmp_path) -> None:
 FINE_RATES = ((1, 8), (1, 2), (4, 1))
 
 
-def _write_native_caches(tmp_path, sessions, per_band_frames):
-    """3 band dirs whose caches carry DIFFERENT (native) total_frames per band."""
+def _write_native_caches(tmp_path, sessions, per_band_frames,
+                         frame_rates=(4, 16, 128)):
+    """3 band dirs whose caches carry DIFFERENT (native) total_frames per band.
+
+    ``frame_rates`` defaults to FINE_RATES' bake (SLOW 4 / MID 16 / HGA 128 Hz) so the
+    sidecars agree with the rates these tests declare."""
     band_dirs = []
     for b in range(3):
         d = tmp_path / f"nband{b}"
-        _write_band_cache(d, b, sessions, per_band_frames[b])
+        _write_band_cache(d, b, sessions, per_band_frames[b], frame_rates[b])
         band_dirs.append(str(d))
     span_dir = tmp_path / "nspans"
     span_dir.mkdir()
@@ -362,7 +372,8 @@ def test_r5_two_band_load_succeeds(tmp_path) -> None:
     from speech_decoding.models.v14_converged_v3.dataset import R5_BAND_RATES
 
     sess = _mk_sessions()
-    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess)
+    # R5_BAND_RATES=(2,1) ⇒ both streams baked at 2×32 = 64 Hz
+    band_dirs, span_dir, _ = _setup_caches(tmp_path, sess, frame_rate=64)
     specs = load_v3_sessions(
         sessions=[(1, 0)], band_cache_dirs=band_dirs[:2], span_dir=span_dir,
         parcel_fn=_stub_parcel_fn, band_rates=R5_BAND_RATES,

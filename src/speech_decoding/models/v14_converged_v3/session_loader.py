@@ -38,6 +38,7 @@ from speech_decoding.models.v14_converged_v3.cache_index import (
 from speech_decoding.models.v14_converged_v3.dataset import (
     UNIFORM_BAND_RATES,
     V3SessionSpec,
+    assert_band_rates_match_cache,
     build_session_spec,
     reference_n_frames,
 )
@@ -137,6 +138,13 @@ def load_v3_sessions(
             labels, parcel_id, drop_labels=drop, mask_cfg=mask_cfg,
         )
         band_stats = [_load_stats(e.stats_path) for e in entries]
+        # the declared read rates must match what was actually baked, else every per-band
+        # window is a compressed, time-shifted slice at the RIGHT shape (r6 2026-07-23).
+        assert_band_rates_match_cache(
+            [e.frame_rate_hz for e in entries],
+            band_rates,
+            where=f"session {subject_id}/{trial_id}",
+        )
         n_frames_32 = reference_n_frames(
             [e.total_frames for e in entries], band_rates
         )

@@ -98,6 +98,17 @@ class BandCacheEntry:
     ch_names: tuple[str, ...]
     total_frames: int
     sample_rate: int
+    band_hop: int = 1
+
+    @property
+    def frame_rate_hz(self) -> int:
+        """The cache's REAL frame rate — the rate ``band_rates`` must be declared against.
+
+        The bake writes the RAW signal rate (``sample_rate`` 2048) plus the STFT ``band_hop``,
+        so a frame lands every ``band_hop`` samples ⇒ ``2048//64 = 32 Hz``. Sidecars without a
+        ``band_hop`` (synthetic test dirs) already store the frame rate directly, and the
+        ``band_hop=1`` default reduces to it."""
+        return self.sample_rate // self.band_hop
 
 
 def index_band_cache(band_dir: str) -> dict[str, BandCacheEntry]:
@@ -125,6 +136,7 @@ def index_band_cache(band_dir: str) -> dict[str, BandCacheEntry]:
             ch_names=tuple(meta["ch_names"]),
             total_frames=int(meta["total_frames"]),
             sample_rate=int(meta.get("sample_rate", 32)),
+            band_hop=int(meta.get("band_hop", 1)),
         )
     return out
 

@@ -20,6 +20,7 @@ import json
 import numpy as np
 
 from speech_decoding.models.v14_converged_v3.cache_index import (
+    BandCacheEntry,
     index_band_cache,
     index_bad_windows,
     load_bad_window_spans,
@@ -153,3 +154,25 @@ def test_parse_lof_report_maps_session_to_bad_channels(tmp_path) -> None:
 def test_parse_lof_report_missing_file_is_empty() -> None:
     # LOF is optional (a run may not have fitted a report); absent → no drops.
     assert parse_lof_report(None) == {}
+
+
+def test_frame_rate_hz_derives_from_sample_rate_and_band_hop() -> None:
+    """The bake writes the RAW rate (2048) + the STFT band_hop, so the cache's real frame
+    rate is sample_rate//band_hop. This is the quantity band_rates must be declared against
+    (r6 2026-07-23 declared 4/16 Hz against three 32 Hz bakes)."""
+    real = BandCacheEntry(
+        npy_path="x.npy", stats_path="x.stats.npz", ch_names=("A",),
+        total_frames=230501, sample_rate=2048, band_hop=64,
+    )
+    assert real.frame_rate_hz == 32
+    native_slow = BandCacheEntry(
+        npy_path="x.npy", stats_path="x.stats.npz", ch_names=("A",),
+        total_frames=28813, sample_rate=2048, band_hop=512,
+    )
+    assert native_slow.frame_rate_hz == 4
+    # sidecars with no band_hop already store the frame rate directly (synthetic test dirs)
+    legacy = BandCacheEntry(
+        npy_path="x.npy", stats_path="x.stats.npz", ch_names=("A",),
+        total_frames=5000, sample_rate=32,
+    )
+    assert legacy.frame_rate_hz == 32
