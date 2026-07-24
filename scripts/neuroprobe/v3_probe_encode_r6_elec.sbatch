@@ -6,11 +6,15 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=200G
+#SBATCH --mem=113560M
 #SBATCH --time=00:15:00
 #SBATCH --output=/projects/bhqk/htang13/probe_encode_elec_%j.out
 #
 # v3_probe_encode_r4.sbatch + --frontend v3r6 + --elec-taps 12.
+# --mem is 113560M = ghx4 DefMemPerGPU = one GPU's fair share, so billing stays at 1000 (the GPU
+# term). Above it, the Mem TRES term (weight 9.01726G) sets the price alone under MAX_TRES: 200G
+# billed 1803, an 80% overcharge that also blocks backfill next to full-share jobs. MEASURED peak
+# with the unpooled enc12_elec write is 108.4 GiB (job 2718998 MaxRSS), which fits under 113560M.
 # --frontend v3r6 is NOT cosmetic: it implies --online. r6 is MAE, which has no EMA teacher, so
 # the r4 default (--frontend v3r4 -> objective.teacher.model.*) finds no keys and dies at load
 # (jobs 2718966-68, "wrong ckpt layout"). The DATA path is r4's verbatim either way.
