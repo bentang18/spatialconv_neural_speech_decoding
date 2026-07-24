@@ -26,7 +26,9 @@ done
 [[ -d "$CACHE" ]] || { echo "cache dir does not exist: $CACHE" >&2; exit 2; }
 mkdir -p "$SHARDS" "$ROOT/logs"
 
-ASSERT=$(sbatch --parsable --mem=32G "$SB" assert "$CACHE" "$TAG")
+# assert loads ONE session's unpooled enc12_elec (~29 GB fp16) whole to parity-check it, so 32G
+# OOMs — 64G gives headroom for the fp32 pooling expansion on top.
+ASSERT=$(sbatch --parsable --mem=64G "$SB" assert "$CACHE" "$TAG")
 ARRAY=$(sbatch --parsable --dependency=afterok:"$ASSERT" --array=0-12 --mem=128G \
         "$SB" array "$CACHE" "$TAG" "$SHARDS")
 MERGE=$(sbatch --parsable --dependency=afterany:"$ARRAY" --mem=32G \
