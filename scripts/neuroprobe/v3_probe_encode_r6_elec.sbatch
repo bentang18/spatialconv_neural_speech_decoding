@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=200G
-#SBATCH --time=00:40:00
+#SBATCH --time=00:15:00
 #SBATCH --output=/projects/bhqk/htang13/probe_encode_elec_%j.out
 #
 # v3_probe_encode_r4.sbatch + --frontend v3r6 + --elec-taps 12.
@@ -21,7 +21,7 @@
 #     directions, so the measured spectrum is only a lower bound.
 #   - probe_pool_variants.py (#41): the unpooled input the readout re-pools itself.
 # Extra cost is storage + write time only. MEASURED: the r4 encode runs ~7 min (sacct, 8 jobs,
-# 05:47-07:07), so 40 min is a ~5x margin for the added elec write -- keep it SHORT so these
+# 05:47-07:07), so 15 min is a ~2x margin for the added elec write -- keep it SHORT so these
 # backfill instead of queueing behind the 48h training arms on Priority.
 set -euo pipefail
 CKPT="${1:?usage: sbatch v3_probe_encode_r6_elec.sbatch <CKPT> <TAG> <OUTDIR>}"
