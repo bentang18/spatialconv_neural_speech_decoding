@@ -6,37 +6,16 @@ SLOW 4 tokens per 1 s clip) and a flat-L1 encoder attends over the RAGGED per-(c
 tokens packed varlen per shaft (``pack_r4.build_r4_grid``). There is no ``forward_padded``;
 the teacher runs ``encoder.forward_flat`` over the packed grid.
 
-Taps (Ben 2026-07-15): enc0, enc3, enc6, enc12. Perceiver taps (Ben 2026-07-16): dec, lat.
+Taps (Ben 2026-07-15): enc0, enc3, enc6, enc12.
   - enc0 = the pre-projection DECIMATED raw band bins (``x[..., ::stride]`` per band, the exact
     tensor ``PerBandStem``'s per-band Linear consumes) — the M9 input-linear floor, decimated to
     what the model actually sees. No model, CPU-side (computed here so bands aren't re-read).
   - enc3/6/12 = raw block outputs of the EMA teacher (``_TargetTower``, the shipped
     representation), read in ONE forward via ``tap_blocks=(3,6,12)``.
-  - dec/lat = the write-only secondary Perceiver, run on the SAME teacher ``z`` (the deep-sup
-    1024-concat the tap forward already computes and the depth ladder discards).
-      * ``dec`` (n,|P|,S·128) = the DECODE cross-attn per-(parcel,slot) query read, PRE-head.
-        Already per-parcel — the model's own read, so NO electrode pooling is applied.
-      * ``lat`` (n,1,S·M·128) = the processed latent bank. PARCEL-FREE by construction (the
-        12 latents are shared learned params), hence natively subject-independent: CS needs
-        NO parcel intersection. This is the bottleneck's information CEILING — ``dec`` is a
-        deterministic function of ``(lat, parcel, slot)``, so no query set can exceed it.
-        (That is also why a fixed-75-parcel query was dropped: provably redundant with lat.)
-  Each Perceiver tap has a ``_rand`` twin from a FRESH-INIT Perceiver on the same teacher z —
-  the control isolating what the Perceiver learned with the encoder held fixed by construction.
-  Verified 2026-07-16: at the 10k ckpt every Perceiver tensor sits at std ~0.0033, a uniform
-  decay from the 0.02 init ⇒ zero loss gradient ever (λ=0 until 10000), so "trained" means the
-  10k→20k λ ramp alone.
 
-Expect WEAK absolutes from dec/lat: the Perceiver's only loss was Gaussian NLL on a 6-D
-band-power state target, so word-level information there is incidental, not optimized-for. The
-informative contrasts are lat CS vs lat WS (does the code transfer?) and tap vs its _rand twin
-(did the bottleneck learn to compress?) — both matched, hence immune to the teacher-vs-context
-stream caveat below.
-
-Stream caveat: the Perceiver trained reading the CONTEXT encoder over VISIBLE tokens; here it
-reads the EMA TEACHER over the FULL grid, to stay on the same axis as enc0/3/6/12. τ=0.99925
-makes the teacher a ~1333-step EMA (small); the full-vs-masked gap is the real one. Both sides
-of every reported contrast carry it identically.
+The write-only secondary Perceiver (dec/lat taps, Ben 2026-07-16) is GONE: secondary = CUT, and
+``v14_converged_v3.perceiver`` was deleted from the tree in ``acca0d4``. The encode kept importing
+it on the r4 path, which is what broke the v3r4-vs-v3r6 enc0 parity job (2026-07-23).
 
 Feature = keep-time, NATIVE ragged (no hold-up: linear ridge, frame alignment irrelevant),
 ELECTRODES POOLED TO PARCELS at encode (Ben 2026-07-15, OOM guard): per (band-slot, parcel)
@@ -66,14 +45,13 @@ the teacher forward are untouched, so the diagnostic and the board number are th
   --electrode-set lite    the Lite montage, injected as load_v3_sessions(keep_labels_fn=...)
                           so keep_idx/parcel_id/sidecar/geom/band_stats are all BUILT on the
                           Lite axis — geom cannot be masked after the fact
-  --no-perceiver          the board number is enc12; skip dec/lat
 
   .venv/bin/python -m scripts.neuroprobe.v3_probe_encode_r4 \
       --ckpt /projects/bhqk/htang13/v3_ckpt_r4/ladder-step=20000.ckpt --tag board_r4_20k \
       --out-dir /projects/bhqk/htang13/v3_board_cache \
       --band-cache-dir <slow_lite> --band-cache-dir <mid_lite> --band-cache-dir <hga_lite> \
       --span-dir <spans> --bt-root <bt_root> \
-      --sessions board --tasks board15 --electrode-set lite --no-perceiver
+      --sessions board --tasks board15 --electrode-set lite
 """
 from __future__ import annotations
 
@@ -102,7 +80,6 @@ FPS = 32.0
 CLIP_DUR_S = 1.0
 N_PARCELS = 75
 GPU_TAPS: tuple[int, ...] = (3, 6, 12)   # raw block outputs read in one teacher forward
-PERC_RAND_SEED = 33                      # the launch seed — the fresh-init control's twin
 
 
 def _load_ckpt(ckpt_path: str) -> dict:
@@ -158,34 +135,6 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     return _freeze(tower, device=device)
 
 
-def _load_perceivers(sd: dict, *, device: torch.device):
-    """The ckpt's TRAINED Perceiver + a FRESH-INIT twin → ``{"": trained, "_rand": control}``.
-
-    Both consume the SAME teacher z, so the pair holds the encoder fixed by construction and
-    the only moving part is what the Perceiver learned. The twin re-inits at the launch seed,
-    NOT the 10k ckpt's weights: 10k would confound Perceiver state with encoder state (10k vs
-    20k encoder) and its 6× weight-decay shrink puts it off its own init distribution."""
-    from speech_decoding.models.v14_converged_v3.perceiver import PerceiverHead
-
-    pref = "objective.perceiver."
-    psd = _subtree(sd, pref)
-    if not psd:
-        raise RuntimeError(f"no '{pref}*' keys in ckpt; a deep_sup=False run has no Perceiver")
-    # A diag_nll / point-head run (r5 Arm 3, r5mod, ctx-loss) writes a mu-only head with NO
-    # covariance params; a full-cov run writes head.chol_head.*. Match the head to the ckpt so
-    # both load strict-clean. (The enc-only readout never reads the Perceiver taps, but the
-    # encode loads it unconditionally, so a shape skew here is a hard crash.)
-    point_only = not any("chol_head" in k for k in psd)
-    trained = PerceiverHead(n_parcels=N_PARCELS, point_only=point_only)
-    missing, unexpected = trained.load_state_dict(psd, strict=False)
-    bad = [m for m in missing if "num_batches_tracked" not in m]
-    if bad or unexpected:
-        raise RuntimeError(f"perceiver state_dict mismatch: missing={bad[:8]} unexpected={unexpected[:8]}")
-    torch.manual_seed(PERC_RAND_SEED)
-    rand = PerceiverHead(n_parcels=N_PARCELS, point_only=point_only)
-    return {"": _freeze(trained, device=device), "_rand": _freeze(rand, device=device)}
-
-
 def _load_targets(session, bt_root, tasks=PROBE_TASKS):
     from scripts.neuroprobe.run_pretrain_probe_suite import _label_events
     from speech_decoding.experiments.pretrain_probe_labels import build_session_targets
@@ -216,14 +165,25 @@ def _lite_keep_labels_fn(bt_root):
     return fn
 
 
-def _window_bands(spec, starts, clip_frames, rate_mult: int = 1):
+def _window_bands(spec, starts, clip_frames, rate_mult: int = 1, band_rates=None):
     """Slice + robust-z every union window from the continuous spec caches. Returns one tensor
-    per band, each (n_windows, N, F_band, T=clip_frames·rate_mult).
+    per band, each (n_windows, N, F_band, T_b).
 
     ``rate_mult`` = cache frames per 32 Hz reference frame: 1 for the r4 uniform-32 Hz caches,
     2 for the r5 native-64 Hz caches (R5_BAND_RATES=((2,1),(2,1))) whose EarlyFusionStem
     conv-pools 64→32 Hz. Windows are sliced in the cache's own frame units (FPS·rate_mult), so
     the returned length is clip_frames·rate_mult = L = 2·T for r5.
+
+    ``band_rates`` OVERRIDES the scalar ``rate_mult``: each band is sliced at its OWN cache rate,
+    with the clip start snapped to the shared lattice (lcm of denominators, ``_start_align``) so
+    all bands stay temporally aligned, exactly as the training dataset windows them
+    (dataset.py:226, ``lo,hi = t0*num//den``). Per-band length clip_frames·num//den is integer by
+    the dispatch invariant (clip_frames·num % den == 0). NO shipped frontend passes this today —
+    every band cache is at the 32 Hz clip clock, so ``rate_mult`` covers r4/r6 (1) and r5 (2). It
+    exists for a genuinely coarser-or-finer per-band bake, and is only correct when the declared
+    rate matches the bake (``dataset.assert_band_rates_match_cache``); declaring a rate the cache
+    does not have silently yields a compressed, time-shifted slice at the right SHAPE, which is
+    what invalidated four r6 runs (memo project-r6-band-rates-cache-rate-bug-2026-07-23).
 
     Bulk-loads each band's survivor rows into RAM ONCE (``mm[keep]`` → ~1 GB/band), then slices
     windows from RAM and robust-z's the whole (n,N,F,T) batch in one vectorized call. The naive
@@ -231,10 +191,32 @@ def _window_bands(spec, starts, clip_frames, rate_mult: int = 1):
     dominated wall-clock; this is numerically identical (mm[keep] then slice == mm[keep,:,a:b];
     the normalizer is elementwise broadcast)."""
     keep = spec.keep_idx.numpy()
-    # spec.n_frames is the 32 Hz reference count; the r5 caches carry rate_mult× that many
-    # native frames. Bound the native-unit windows against the native length.
+    starts = np.asarray(starts, dtype=float)
+    if band_rates is not None:
+        from speech_decoding.models.v14_converged_v3.dataset import _start_align
+        align = _start_align(band_rates)
+        t0_ref = (np.rint(starts * FPS).astype(np.int64) // align) * align   # snap to lattice
+        end_ref = t0_ref + clip_frames
+        bands = []
+        for (path, norm), (num, den) in zip(zip(spec.band_paths, spec.band_norms), band_rates):
+            lo = t0_ref * num // den
+            hi = end_ref * num // den
+            mm = np.load(path, mmap_mode="r")
+            full = np.asarray(mm[keep], dtype=np.float32)          # (N, F, T_native) bulk → RAM
+            del mm
+            n_native = full.shape[-1]
+            oob = np.where((lo < 0) | (hi > n_native))[0]
+            if len(oob):
+                raise RuntimeError(
+                    f"{spec.session_key}: band rate {num}/{den} {len(oob)} windows out of bounds "
+                    f"(n_native={n_native}, first bad start={float(starts[oob[0]]):.4f}s)")
+            clips = np.stack([full[:, :, a:b] for a, b in zip(lo.tolist(), hi.tolist())], axis=0)
+            bands.append(norm.transform(torch.from_numpy(clips)))  # (n, N, F_b, T_b) vectorized
+        return bands
+    # uniform-rate path (r4 rate_mult=1, r5 rate_mult=2) — spec.n_frames is the 32 Hz reference
+    # count; the r5 caches carry rate_mult× that many native frames.
     n_frames_native = spec.n_frames * rate_mult
-    t0 = np.rint(np.asarray(starts, dtype=float) * FPS * rate_mult).astype(np.int64)
+    t0 = np.rint(starts * FPS * rate_mult).astype(np.int64)
     end = t0 + clip_frames * rate_mult
     oob = np.where((t0 < 0) | (end > n_frames_native))[0]
     if len(oob):
@@ -303,100 +285,15 @@ def _enc0_pooled(bands, canon, parcel_canon, present, strides=None):
     return torch.cat(per_band, dim=-1)                            # (n, |P|, F0)
 
 
-def _perc_queries(present, n_slots, *, device):
-    """Parcel-major (q_parcel, q_slot), mirroring objective._secondary_nll's query build.
-
-    Order [p0s0,p0s1,…,p1s0,…] so a (B, P·S, d) read reshapes to (B, P, S, d) — and the parcel
-    axis then matches ``present``, i.e. the SAME order the enc taps are pooled into, so the
-    readout's atlas-id intersection needs no special case for dec."""
-    p = torch.as_tensor(present, dtype=torch.long, device=device)
-    q_parcel = p.repeat_interleave(n_slots)                       # (Q,) atlas ids
-    q_slot = torch.arange(n_slots, device=device).repeat(len(p))  # (Q,) 0..S-1
-    return q_parcel, q_slot
-
-
-def _perc_forward(perc, z, grid, q_parcel, q_slot, *, n_slots):
-    """One Perceiver forward → (dec (B,Q,d_perc), lat (B,n_slots·M,d_perc)).
-
-    BOTH taps come from forward HOOKS, and deliberately so — ``forward`` returns only the head's
-    mu/cov, and hooks keep the training path untouched while r4b is queued.
-      * ``dec`` = the DECODE cross-attn output: the per-(parcel,slot) query read, PRE-head.
-      * ``lat`` = the output of the LAST ``process`` block, which is exactly the bank the
-        forward's own ``return_latents`` hands back (it returns ``lat`` after ``for blk in
-        self.process: lat = blk(...)``, pre-decode).
-    We hook ``process[-1]`` rather than pass ``return_latents=True`` because that kwarg does NOT
-    exist on the deployed r4 tree (2d3f52d) — only in a later local commit — and scp'ing src/ to
-    add it would touch the queued r4b run for no gain. Hooks work on BOTH trees, and the weights
-    are identical across them (the commit is a pure API addition, no structural change).
-
-    ``noise=None`` is safe BY CONSTRUCTION, not by luck: the count-dependent floor enters only
-    at ``head(dec, noise=...)``, strictly AFTER both taps, so it cannot reach dec or lat (and
-    secondary_head.GaussianStateHead.forward falls back to its fixed buffer regardless).
-
-    ``token_time`` on the full grid is ``grid.time_pos`` expanded — literally what the packed
-    path gathers from (``pack.time_pos = grid.time_pos[idx]``, pack_r4.py:214), and what the
-    teacher's own full-grid forward already builds (towers.py:243). No mask machinery needed;
-    ``key_mask=None`` stays correct because every full-grid token is real."""
-    B = z.shape[0]
-    grab: dict = {}
-    handles = [
-        perc.decode.register_forward_hook(lambda _m, _i, out: grab.__setitem__("dec", out)),
-        perc.process[-1].register_forward_hook(lambda _m, _i, out: grab.__setitem__("lat", out)),
-    ]
-    try:
-        perc(
-            z,
-            grid.time_pos[None].expand(B, grid.total),
-            None,
-            q_parcel[None].expand(B, q_parcel.shape[0]),
-            q_slot[None].expand(B, q_slot.shape[0]),
-            n_slots=n_slots,
-            noise=None,
-        )
-    finally:
-        for h in handles:
-            h.remove()
-    return grab["dec"], grab["lat"]
-
-
-def _perc_checks(percs, z, grid, q_parcel, q_slot, *, n_slots) -> bool:
-    """[check] the Perceiver is a BOTTLENECK and its weights actually loaded.
-
-    Rolling the parcel ids under a FIXED slot order must leave ``lat`` bit-identical — lat is
-    computed before any query touches the model — while MOVING ``dec``, whose query is a parcel
-    embedding. A lat that moves ⇒ we hooked the wrong module; a dec that doesn't ⇒ the parcel
-    embedding is dead. Separately the trained tap must differ from its fresh-init twin, else the
-    ckpt load silently no-op'd and every contrast below would be a random-vs-random null."""
-    P = q_parcel.shape[0] // n_slots
-    if P < 2:
-        print("[check] perceiver bottleneck: SKIPPED (|P|<2, the parcel roll is a no-op)", flush=True)
-        return True
-    rolled = q_parcel.reshape(P, n_slots).roll(1, 0).reshape(-1)
-    dec_a, lat_a = _perc_forward(percs[""], z, grid, q_parcel, q_slot, n_slots=n_slots)
-    dec_b, lat_b = _perc_forward(percs[""], z, grid, rolled, q_slot, n_slots=n_slots)
-    dec_r, _ = _perc_forward(percs["_rand"], z, grid, q_parcel, q_slot, n_slots=n_slots)
-    lat_free = torch.equal(lat_a, lat_b)
-    dec_sens = not torch.equal(dec_a, dec_b)
-    loaded = not torch.equal(dec_a, dec_r)
-    ok = lat_free and dec_sens and loaded
-    print(f"[check] perceiver: lat parcel-free={lat_free} dec parcel-sensitive={dec_sens} "
-          f"trained!=rand={loaded} -> {'OK' if ok else 'VIOLATED'}", flush=True)
-    return ok
-
-
 @torch.no_grad()
-def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, present,
-                 *, device, batch_size, n_slots, run_checks, elec_taps=()):
+def _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon, present,
+                 *, device, batch_size, elec_taps=()):
     """One forward of the teacher over all windows → per-tap parcel-pooled keep-time features.
 
     Cache stores the raw parcel-mean feature (n,|P|,k_full·d) — the most flexible storage: a
     readout can standardize columns on train stats (the FM linear-probe convention) or feed it
     raw (r1/M9-comparable), but neither is recoverable from a baked per-token LN. So we keep raw
-    only. Returns {tap: {'raw': ...}} for the enc taps plus the Perceiver's dec/lat (+ _rand
-    twins), which ride the SAME forward: ``z`` is the deep-sup 1024-concat the teacher already
-    computes and the depth ladder throws away, so the control costs no extra job and no extra
-    encoder pass. dec/lat are NOT electrode-pooled — dec is already per-parcel (that IS the
-    model's read) and lat has no parcel axis at all, so it is stored under one pseudo-parcel."""
+    only. Returns {tap: {'raw': ...}}."""
     n = bands[0].shape[0]
     k = grid.k_full
     acc: dict = {t: [] for t in GPU_TAPS}
@@ -405,35 +302,19 @@ def _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon, prese
     # it is the pooled tap's exact pre-mean input — the diff is the pooling and nothing else.
     for t in elec_taps:
         acc[f"elec{t}"] = []
-    for name in percs:
-        acc[f"dec{name}"], acc[f"lat{name}"] = [], []
-    checked = not run_checks
     for s in range(0, n, batch_size):
         e = min(s + batch_size, n)
         bb = [b[s:e].to(device) for b in bands]
         Bb = e - s
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=(device.type == "cuda")):
-            z, taps = teacher.forward(bb, grid, parcel_packed, tap_blocks=GPU_TAPS)
-            q_parcel, q_slot = _perc_queries(present, n_slots, device=device)
-            if not checked and percs:
-                if not _perc_checks(percs, z, grid, q_parcel, q_slot, n_slots=n_slots):
-                    raise RuntimeError("perceiver invariant VIOLATED — refusing to write a cache")
-                checked = True
-            perc_out = {name: _perc_forward(p, z, grid, q_parcel, q_slot, n_slots=n_slots)
-                        for name, p in percs.items()}
+            _z, taps = teacher.forward(bb, grid, parcel_packed, tap_blocks=GPU_TAPS)
         for t in GPU_TAPS:
             enc = taps[t].float().reshape(Bb, -1, k, taps[t].shape[-1]).cpu()  # (Bb, n, k, d)
             acc[t].append(_pool_parcels(enc, parcel_canon, present))
             if t in elec_taps:
                 # (Bb, n_contacts, k·d) fp16 — the SAME tensor, just unpooled.
                 acc[f"elec{t}"].append(enc.reshape(Bb, enc.shape[1], -1).to(torch.float16))
-        for name, (dec, lat) in perc_out.items():
-            # dec (Bb, P·S, d) → (Bb, P, S·d): per-parcel already, no pooling.
-            acc[f"dec{name}"].append(
-                dec.float().reshape(Bb, len(present), -1).cpu().to(torch.float16))
-            # lat (Bb, S·M, d) → (Bb, 1, S·M·d): parcel-FREE, one pseudo-parcel.
-            acc[f"lat{name}"].append(lat.float().reshape(Bb, 1, -1).cpu().to(torch.float16))
     return {t: {"raw": torch.cat(v, 0)} for t, v in acc.items()}
 
 
@@ -457,14 +338,18 @@ def main() -> None:
                    help="board15 = the 15 leaderboard tasks (re-labels the same features)")
     p.add_argument("--electrode-set", choices=("all", "lite"), default="all",
                    help="lite = the Neuroprobe-Lite montage (leaderboard parity)")
-    p.add_argument("--frontend", choices=("v3r4", "v3r5", "v3r5nf", "v3r5nffast"), default="v3r4",
+    p.add_argument("--frontend", choices=("v3r4", "v3r5", "v3r5nf", "v3r5nffast", "v3r6"),
+                   default="v3r4",
                    help="v3r4 = 3-band PerBandStem @32Hz (r4/arm0, default). v3r5 = Chang "
                         "2-stream EarlyFusionStem: 2 native-64Hz caches (hga, lfs) → ONE 32Hz "
                         "token. v3r5nf = NoFusionStem: the SAME 2 caches, each stem-pooled into "
                         "its OWN 32Hz token stream (two-band grid, decimate 2). v3r5nffast = "
                         "v3r5nf with the first stem conv at stride 2 → 16Hz tokens (decimate 4). "
-                        "All three 2-stream frontends imply --online (MAE has no teacher) + "
-                        "--no-perceiver + no enc0 (band strides are r4-only).")
+                        "v3r6 = arm0's frontend VERBATIM (same 3 × 32 Hz caches, same "
+                        "PerBandStem) — the encode path is byte-identical to v3r4; only --online "
+                        "is implied (MAE has no EMA teacher), and enc0 is available exactly as on "
+                        "v3r4. The two-stream frontends (v3r5/v3r5nf/v3r5nffast) imply --online + "
+                        "no enc0 (band strides are r4-only).")
     p.add_argument("--enc0-only", action="store_true",
                    help="compute ONLY the enc0 input floor (raw decimated band bins pooled to "
                         "parcels). No ckpt, no model, no GPU — enc0 never touched weights. Lets "
@@ -474,13 +359,10 @@ def main() -> None:
                         "Default = the frontend's own stem decimate (2 for v3r5/v3r5nf, 4 for "
                         "v3r5nffast) = stem parity @32Hz. Pass 1 for NO decimation = the full "
                         "native 64 Hz cache, which isolates what the stem's 2x downsample costs.")
-    p.add_argument("--no-perceiver", action="store_true",
-                   help="skip the dec/lat taps — the board number is enc12, and the Perceiver "
-                        "taps need the secondary head's ckpt subtree")
     p.add_argument("--online", action="store_true",
                    help="probe the ONLINE encoder (objective.online.*) instead of the EMA teacher. "
-                        "Required for the MAE arm (no teacher); implies --no-perceiver (MAE has no "
-                        "Perceiver). Use it on a JEPA ckpt too for an online-vs-online parity match.")
+                        "Required for the MAE arm (no teacher). Use it on a JEPA ckpt too for an "
+                        "online-vs-online parity match.")
     p.add_argument("--elec-taps", default="",
                    help="comma-separated GPU taps to ALSO write per-electrode (unpooled), e.g. "
                         "'12' -> feats['enc12_elec']. WS keeps all electrodes by default (Ben "
@@ -497,14 +379,20 @@ def main() -> None:
 
     is_r5 = args.frontend == "v3r5"
     is_r5nf = args.frontend in ("v3r5nf", "v3r5nffast")
+    is_r6 = args.frontend == "v3r6"
     is_two_stream = is_r5 or is_r5nf
     # NoFusionStem net decimation: 4 for v3r5nffast (16 Hz tokens), else 2 (v3r5nf, 32 Hz).
     nf_dec = 4 if args.frontend == "v3r5nffast" else 2
     if is_two_stream:
-        # r5 (EarlyFusion) / nf (NoFusion): 2 native-64Hz caches, no teacher/perceiver/enc0.
-        # Force the flags the frontend implies so a bare `--frontend` is sufficient.
+        # r5 (EarlyFusion) / nf (NoFusion): 2 native-64Hz caches, no EMA teacher, no enc0.
+        # Force the flag the frontend implies so a bare `--frontend` is sufficient.
         args.online = True
-        args.no_perceiver = True
+    if is_r6:
+        # r6 is MAE (--objective mae): no EMA teacher, so the deployed rep is the online encoder.
+        # Its DATA path is r4's verbatim — same 3 × 32 Hz caches, same UNIFORM band_rates, same
+        # PerBandStem decimate — so enc0 is bit-identical to v3r4 and nothing below needs an r6
+        # branch (verified by the v3r4-vs-v3r6 enc0 parity job).
+        args.online = True
     n_cache = 2 if is_two_stream else 3
     if len(args.band_cache_dirs) != n_cache:
         want = "(hga, lfs)" if is_two_stream else "(slow, mid, hga)"
@@ -513,16 +401,6 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_frames = round(CLIP_DUR_S * FPS)
-    # n_slots is the Perceiver slot count; the r5 tree has the perceiver path ripped out, so
-    # import SLOT_STRIDE lazily only on the r4 perceiver path (n_slots is unused for r5).
-    if is_two_stream:
-        n_slots = 0
-    else:
-        from speech_decoding.models.v14_converged_v3.perceiver import SLOT_STRIDE
-        # S = T // slot_stride, exactly as state_target.raw_state_vectors derives it (32//8 = 4).
-        n_slots, rem = divmod(clip_frames, SLOT_STRIDE)
-        if rem:
-            raise SystemExit(f"clip_frames={clip_frames} not divisible by SLOT_STRIDE={SLOT_STRIDE}")
     parcel_fn = make_bt_parcel_fn(args.bt_root)
     cohort = BOARD_SESSIONS if args.sessions == "board" else tuple(PROBE_COHORT_7)
     if args.session_index is not None:
@@ -543,8 +421,8 @@ def main() -> None:
     if args.enc0_only:
         # enc0 is a pure function of the CACHED BANDS (no weights ever touched), so there is
         # nothing to load and nothing to run on a GPU.
-        teacher, percs = None, {}
-        perc_note = "ENC0-ONLY (no ckpt, no model, CPU)"
+        teacher = None
+        tower_note = "ENC0-ONLY (no ckpt, no model, CPU)"
     else:
         if not args.ckpt:
             raise SystemExit("--ckpt is required unless --enc0-only")
@@ -552,17 +430,12 @@ def main() -> None:
         tower_pref = "objective.online." if args.online else "objective.teacher.model."
         teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5,
                                 no_fusion=is_r5nf, nf_decimate=nf_dec)
-        # --online (MAE arm, or a JEPA online-vs-online match) has no Perceiver subtree to load.
-        percs = {} if (args.no_perceiver or args.online) else _load_perceivers(sd, device=device)
         del sd
-        perc_note = ("online encoder, no perceiver" if args.online
-                     else "no perceiver" if args.no_perceiver
-                     else "+ perceiver dec/lat (+_rand control)")
+        tower_note = "online encoder" if args.online else "EMA teacher"
     print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0 "
-          f"{perc_note}, n_slots={n_slots} sessions={args.sessions}({len(cohort)}) "
+          f"{tower_note}, sessions={args.sessions}({len(cohort)}) "
           f"tasks={args.tasks}({len(tasks)}) electrodes={args.electrode_set}", flush=True)
 
-    first = True
     for session in cohort:
         subject_id, trial_id = session
         path = os.path.join(args.out_dir, f"enc_s{subject_id}_t{trial_id}_{args.tag}.pt")
@@ -592,6 +465,7 @@ def main() -> None:
                 raise RuntimeError("lite montage kept a non-Lite electrode — refusing to write")
         targets = _load_targets(session, args.bt_root, tasks)
         # r5/nf caches are native-64Hz (R5_BAND_RATES 2×); read 2·clip_frames frames per window.
+        # r4 AND r6 share the uniform 32 Hz caches ⇒ rate_mult 1, no per-band rates.
         bands = _window_bands(spec, targets.clip_starts, clip_frames,
                               rate_mult=2 if is_two_stream else 1)
 
@@ -610,6 +484,9 @@ def main() -> None:
         # enc0 = the per-band decimated input floor. r4: BAND_STRIDES (8,2,1) on the 32 Hz clock.
         # 2-stream (Ben 2026-07-23): both caches are native 64 Hz and the stem decimates by
         # nf_dec, so (nf_dec,)*n_bands is the exact parity; --enc0-stride 1 keeps the full 64 Hz.
+        # r6 takes NO branch here: it reads r4's uniform 32 Hz caches, so r4's default BAND_STRIDES
+        # IS its enc0 floor. (The deleted r6 branch forced (1,1,1) on the never-baked native rates —
+        # part of the R6_BAND_RATES bug, 2026-07-23.)
         if is_two_stream and not enc0_two_stream:
             feats = {}  # legacy: 2-stream enc0 off unless asked for
         else:
@@ -618,17 +495,13 @@ def main() -> None:
         if args.enc0_only:
             tap_pooled = {}
         else:
-            tap_pooled = _encode_taps(teacher, percs, bands, grid, parcel_packed, parcel_canon,
+            tap_pooled = _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon,
                                       present, device=device, batch_size=args.batch_size,
-                                      n_slots=n_slots, run_checks=first, elec_taps=elec_taps)
+                                      elec_taps=elec_taps)
             for t in GPU_TAPS:
                 feats[f"enc{t}"] = tap_pooled[t]
             for t in elec_taps:
                 feats[f"enc{t}_elec"] = tap_pooled[f"elec{t}"]
-            for name in percs:
-                feats[f"dec{name}"] = tap_pooled[f"dec{name}"]
-                feats[f"lat{name}"] = tap_pooled[f"lat{name}"]
-        first = False
 
         payload = {
             "subject_id": subject_id, "trial_id": trial_id, "ckpt_tag": args.tag,

@@ -12,11 +12,8 @@ pooled to parcels (MEAN over electrodes per band-slot) at encode. So both direct
     test subject's cs_split test half, over the anchor∩test PARCEL intersection (same v2
     direction as r1). Parcel columns aligned by atlas id.
 
-Perceiver taps (Ben 2026-07-16) ride the same caches: ``dec``/``lat`` (+ ``_rand`` fresh-init
-twins). ``dec`` has the enc taps' parcel axis and takes the normal CS intersection; ``lat`` is
-PARCEL-FREE (see PARCEL_FREE_TAPS) and is CS-scored WHOLE — no intersection, 6144 dims in every
-subject. Read the perceiver block against the _rand twin, not against enc12: tap-vs-twin is a
-matched contrast, tap-vs-enc12 crosses the teacher-vs-context stream caveat.
+The write-only Perceiver taps (dec/lat + _rand twins, Ben 2026-07-16) are GONE: secondary = CUT
+and ``v14_converged_v3.perceiver`` was deleted in ``acca0d4``. The ladder is enc0/3/6/12.
 
 Ridge/metric primitives INLINED from the r1 readout — zero speech_decoding dep, runs on the
 stock NCSA Delta pytorch module. λ held CONSTANT (lam_mult=1.0) across every cell. Sole
@@ -47,16 +44,7 @@ PROBE_TASKS = ("onset", "delta_volume", "word_index", "gpt2_surprisal")
 CS_TRAIN_ANCHOR = (2, 1)
 CS_TEST_SUBJECTS = (1, 3, 4, 6, 8, 9)
 ENCODERS = ("enc0", "enc3", "enc6", "enc12")
-# Write-only Perceiver taps (Ben 2026-07-16), each with its fresh-init control twin.
-#   dec  (n,|P|,S·128)  — the per-(parcel,slot) query read, PRE-head. Parcel axis == the enc
-#                         taps' `present_parcels`, so the CS intersection needs no special case.
-#   lat  (n,1,S·M·128)  — the processed latent bank. PARCEL-FREE by construction (the 12 latents
-#                         are shared learned params), so it is natively subject-independent and
-#                         CS takes it WHOLE: no intersection, identical 6144 dims every session.
-#                         It is also dec's information CEILING (dec = f(lat, parcel, slot)).
-PERC_TAPS = ("dec", "lat", "dec_rand", "lat_rand")
-PARCEL_FREE_TAPS = ("lat", "lat_rand")
-ALL_TAPS = ENCODERS + PERC_TAPS
+ALL_TAPS = ENCODERS
 # Readout conditioning of the raw parcel-mean feature. std = per-feature z-score on TRAIN stats
 # (the FM linear-probe convention; also removes the enc0-is-already-normalized asymmetry — enc0
 # is robust-z'd pre-pool while taps are at network scale). raw = as-cached (r1/M9-comparable).
@@ -163,14 +151,6 @@ def _cs_cell(anchor_rec, test_rec, enc, task, norm) -> float:
     if len(tr) < 2 or len(te) < 2:
         return float("nan")
 
-    if enc in PARCEL_FREE_TAPS:
-        # No parcel axis to intersect — the latent bank is the SAME 12 shared learned slots in
-        # every subject, so slot m at time s already means the same thing on both sides and the
-        # feature is dimension-matched by construction. This is the cleanest CS transfer in the
-        # suite: no intersection, no montage bridge, full 6144 dims.
-        return _ridge_test(_feat(anchor_rec, enc, tr), y_anchor[tr],
-                           _feat(test_rec, enc, te), y_test[te], norm)
-
     a_p = np.asarray(anchor_rec["present_parcels"], dtype=np.int64)
     t_p = np.asarray(test_rec["present_parcels"], dtype=np.int64)
     common = np.intersect1d(a_p, t_p)
@@ -265,31 +245,6 @@ def _print_ladder(tags, results, taps=ALL_TAPS) -> None:
                         row = [f"{e}:{results[f'{tag}|{e}|{v}|{task}'][key]:.4f}" for e in encs]
                         print(f"  {direction[:2]} {tag} {v:3s} {task:16s} " + "  ".join(row),
                               flush=True)
-    _print_perceiver(tags, results, taps)
-
-
-def _print_perceiver(tags, results, taps=ALL_TAPS) -> None:
-    """Perceiver taps against their fresh-init twins — the contrast that survives the stream
-    caveat (both sides carry it identically). lat is CS-scored WHOLE (no parcel intersection);
-    dec is a deterministic function of lat, so lat is dec's ceiling and dec>lat means only that
-    the parcel query made the same information more linearly accessible."""
-    bases = [b for b in ("dec", "lat") if b in taps and f"{b}_rand" in taps]
-    if not bases:
-        return
-    print("\n=== r4 perceiver taps — trained vs fresh-init control (Δ = trained − rand) ===",
-          flush=True)
-    for tag in tags:
-        for v in NORMS:
-            for base in bases:
-                for task in PROBE_TASKS:
-                    def val(suffix, key):
-                        return results[f"{tag}|{base}{suffix}|{v}|{task}"][key]
-                    cs, cs_r = val("", "cs_mean"), val("_rand", "cs_mean")
-                    ws, ws_r = val("", "ws_cohort"), val("_rand", "ws_cohort")
-                    print(f"  {tag} {v:3s} {base:3s} {task:16s} "
-                          f"CS {cs:.4f} (rand {cs_r:.4f}, Δ{cs - cs_r:+.4f})   "
-                          f"WS {ws:.4f} (rand {ws_r:.4f}, Δ{ws - ws_r:+.4f})", flush=True)
-
 
 # array-index layout: 0..len(cohort)-1 → WS per session; then one per CS test subject
 N_WS = len(PROBE_COHORT_7)
@@ -305,12 +260,7 @@ def main() -> None:
     p.add_argument("--array-index", type=int, help="mode=array: 0..%d" % (N_ARRAY - 1))
     p.add_argument("--shard-dir", default=None, help="mode=array writes here, mode=merge reads here")
     p.add_argument("--taps", default=",".join(ENCODERS),
-                   help="comma-separated subset of ALL_TAPS. DEFAULT = enc-only "
-                        "(enc0,enc3,enc6,enc12); the Perceiver taps (dec,lat,dec_rand,lat_rand) are "
-                        "OPT-IN because for a write-only/untrained head they are rank-degenerate and "
-                        "make the ridge gram singular. COMPUTE ONLY THE DELTA: the enc ladder is a "
-                        "re-encode-invariant function of the ckpt, so to add Perceiver taps pass "
-                        "--taps dec,lat,dec_rand,lat_rand and read enc0/3/6/12 off the existing JSON.")
+                   help="comma-separated subset of ALL_TAPS (enc0,enc3,enc6,enc12).")
     args = p.parse_args()
     tags = tuple(t.strip() for t in args.tags.split(","))
     taps = tuple(t.strip() for t in args.taps.split(","))

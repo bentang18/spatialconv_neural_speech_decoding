@@ -15,16 +15,10 @@
 # Example:
 #   scripts/neuroprobe/probe_ckpt.sh /projects/bhqk/htang13/v3_ckpt_r4/ladder-step=25000.ckpt r4_25k
 #
-# TAPS (optional) = comma-separated subset of the readout's ALL_TAPS; default all 8. COMPUTE
-# ONLY THE DELTA: the encode ALWAYS writes every tap (they ride one teacher forward, so the
-# marginal GPU cost is ~0), but each readout tap is its own n×n fp64 solve. So when a tag is
-# re-encoded only to ADD the Perceiver taps, pass dec,lat,dec_rand,lat_rand and read the enc
-# ladder off the tag's existing results JSON — half the ridge solves, same numbers.
-#   probe_ckpt.sh …/ladder-step=20000.ckpt r4_20k_perc dec,lat,dec_rand,lat_rand
+# TAPS (optional) = comma-separated subset of the readout's ALL_TAPS (enc0,enc3,enc6,enc12).
 #
-# NB a NEW TAG is required to add taps to an already-encoded ckpt: the encode skips any session
-# whose cache file exists, so reusing the old tag would silently no-op and write no Perceiver
-# taps at all. Re-encoding is ~4 min of GPU; the tag is the cheap thing to change.
+# NB a NEW TAG is required to re-encode an already-encoded ckpt: the encode skips any session
+# whose cache file exists, so reusing the old tag silently no-ops. Re-encoding is ~4 min of GPU.
 #
 # Idempotent: encode skips sessions whose cache already exists, so re-running a TAG is cheap.
 # Long-running (~10-15 min); nohup it if you want to detach.
@@ -86,8 +80,5 @@ while :; do
 done
 
 echo "== [3/3] RESULTS (tag=$TAG) =="
-# Anchor on the first result header of EITHER block: a --taps subset that omits the enc
-# ladder prints only the perceiver block, and anchoring on the ladder header alone made
-# the driver exit 0 with an empty report.
-ssh delta "sed -n '/^=== r4 \(depth ladder\|perceiver\)/,\$p' $MOUT"
+ssh delta "sed -n '/^=== r4 depth ladder/,\$p' $MOUT"
 echo "   full json: $RESULT (on delta/dtai shared Lustre)"
