@@ -514,6 +514,11 @@ def main() -> None:
         payload = {
             "subject_id": subject_id, "trial_id": trial_id, "ckpt_tag": args.tag,
             "present_parcels": np.asarray(present, dtype=np.int64),   # (|P|,) atlas ids, feature order
+            # (n_contacts,) atlas id per CANONICAL contact — the same axis the ``enc*_elec`` taps
+            # are stored on, so a readout can re-pool electrodes→parcels itself instead of being
+            # stuck with the mean baked in here. present_parcels alone is not enough: it gives the
+            # parcel ORDER but not the membership.
+            "parcel_canon": np.asarray(parcel_canon, dtype=np.int64),
             "band_lengths": tuple(int(x) for x in grid.band_lengths),
             "feats": {k: {v: t for v, t in d.items()} for k, d in feats.items()},
             "clip_starts": np.asarray(targets.clip_starts),
