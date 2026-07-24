@@ -65,6 +65,45 @@ def per_band_jepa_stats(
     return out
 
 
+def visible_recon_gap_stats(
+    pred: Tensor, tgt: Tensor, masked_w: Tensor, masked_stats: dict[str, Tensor], band_ids: Tensor
+) -> dict[str, Tensor]:
+    """Per-band VISIBLE-token reconstruction EV + the masked−visible GAP (MAE difficulty).
+
+    Companion to :func:`per_band_jepa_stats`, which gives the MASKED (scored-token) EV. The
+    gap ``visible_EV − masked_EV`` is the MAE-specific difficulty signal: → 0 means a masked
+    token is as reconstructable as one the encoder saw ⇒ the model is interpolating from
+    neighbours (task too easy, weak representation pressure); a large gap means masking poses
+    a genuine prediction problem. It is the reconstruction analogue of the r5nf block-width
+    tuning that watched masked EV directly.
+
+    ``masked_w`` (B, total) float — the scored weight (r6: ``in_loss == masked``, no margin
+    gate). VISIBLE = real tokens with ``masked_w == 0``. Shaft-batch tail-slack FILLER tokens
+    carry all-zero target bins (``shaft_batch.py`` ``torch.zeros(pad_n, f, t)``) and are
+    ALWAYS visible, so a naive ``1 − masked_w`` would fold their zero variance into the
+    visible set and deflate its EV. They are removed by an EXACT target-energy gate
+    (``‖tgt‖² > 0``); filler is constructed as exact zeros, so the gate is unambiguous.
+
+    ``masked_stats`` is the already-computed :func:`per_band_jepa_stats` dict (reused for the
+    masked EV term, so this adds ONE extra weighted reduction pass, not two). Emits, per band,
+    ``jepa_{band}_visible_explained_var`` and ``jepa_{band}_recon_gap``.
+
+    NOTE (r6 assumption): VISIBLE is defined as the complement of ``masked_w`` among real
+    tokens, which is exact only when ``in_loss == masked`` (r6 drops the margin gate). Under a
+    margin gate the gate-excluded masked tokens are neither scored nor truly visible; this fn
+    is for the gate-free MAE arm and would mislabel them otherwise."""
+    energy = tgt.pow(2).sum(-1)  # (B, total) — EXACTLY 0 at all-zero filler tokens
+    real = (energy > 0).to(pred.dtype)
+    vis_w = real * (1.0 - (masked_w > 0).to(pred.dtype))  # visible real tokens
+    vis = per_band_jepa_stats(pred, tgt, vis_w, band_ids)
+    out: dict[str, Tensor] = {}
+    for name in BAND_NAMES:
+        vev = vis[f"jepa_{name}_explained_var"]
+        out[f"jepa_{name}_visible_explained_var"] = vev
+        out[f"jepa_{name}_recon_gap"] = vev - masked_stats[f"jepa_{name}_explained_var"]
+    return out
+
+
 def early_fusion_recon_stats(
     pred: Tensor, tgt: Tensor, w: Tensor, *, n_hga: int, decimate: int
 ) -> dict[str, Tensor]:
@@ -141,6 +180,7 @@ def nofusion_recon_stats(
 
 __all__ = [
     "per_band_jepa_stats",
+    "visible_recon_gap_stats",
     "early_fusion_recon_stats",
     "nofusion_recon_stats",
     "BAND_NAMES",

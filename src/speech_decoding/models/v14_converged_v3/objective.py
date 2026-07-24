@@ -38,6 +38,7 @@ from speech_decoding.models.v14_converged_v3.monitor_taps import (
     early_fusion_recon_stats,
     nofusion_recon_stats,
     per_band_jepa_stats,
+    visible_recon_gap_stats,
 )
 from speech_decoding.models.v14_converged_v3.pack_r4 import (
     R4Grid,
@@ -545,7 +546,12 @@ class V3JepaObjective(nn.Module):
             d_enc = enc_taps[12].shape[-1]
             taps = {"enc12": enc_taps[12].detach().reshape(-1, d_enc)}  # (B·M_vis, 256)
             with torch.no_grad():  # per-band recon health; pad zeroed so it can't pollute
-                taps.update(per_band_jepa_stats(pred, target * fv, w, grid.band))
+                tgt_m = target * fv
+                stats = per_band_jepa_stats(pred, tgt_m, w, grid.band)
+                taps.update(stats)
+                # masked−visible EV gap (MAE difficulty): visible = real non-filler tokens
+                # with w==0; filler (all-zero target) removed by the ‖tgt‖²>0 energy gate.
+                taps.update(visible_recon_gap_stats(pred, tgt_m, w, stats, grid.band))
         return JepaOutput(
             loss=mae_loss,
             n_masked=w.sum().detach(),

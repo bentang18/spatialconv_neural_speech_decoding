@@ -114,3 +114,56 @@ def test_nofusion_recon_ignores_lfs_pad_slots() -> None:
     )
     print(f"[check] LFS pad slots ignored → {'OK' if same else 'VIOLATED'}")
     assert same
+
+
+def test_visible_recon_gap_excludes_filler_and_equals_ev_difference() -> None:
+    # invariant 1: filler tokens (all-zero target, always visible) must NOT enter the visible
+    #   EV — else their zero variance deflates it. invariant 2: recon_gap == visible_EV −
+    #   masked_EV per band. invariant 3: visible reconstructs BETTER than masked here (we build
+    #   pred to match tgt more closely on visible tokens), so the gap is positive.
+    from speech_decoding.models.v14_converged_v3.monitor_taps import (
+        per_band_jepa_stats,
+        visible_recon_gap_stats,
+    )
+    torch.manual_seed(7)
+    B, total, F = 2, 30, 7
+    band_ids = torch.randint(0, 3, (total,))
+    w = (torch.rand(B, total) < 0.5).float()  # masked (scored) tokens
+    tgt = torch.randn(B, total, F)
+    # visible tokens predicted well (low resid), masked tokens predicted poorly (high resid).
+    vis = (w == 0).float()[..., None]
+    pred = tgt + (0.1 * vis + 0.6 * (1 - vis)) * torch.randn(B, total, F)
+    # inject FILLER: 4 always-visible tokens with EXACT-zero target (w already 0 possible; force it)
+    fill = torch.zeros(total, dtype=torch.bool); fill[:4] = True
+    tgt[:, fill, :] = 0.0
+    pred[:, fill, :] = 0.0
+    w[:, fill] = 0.0  # filler is always visible
+
+    stats = per_band_jepa_stats(pred, tgt, w, band_ids)
+    gap = visible_recon_gap_stats(pred, tgt, w, stats, band_ids)
+
+    # reference visible EV: energy>0 AND w==0, computed by the boolean path.
+    energy = tgt.pow(2).sum(-1)
+    vis_w = ((energy > 0) & (w == 0)).float()
+    ref_vis = per_band_jepa_stats(pred, tgt, vis_w, band_ids)
+
+    worst_ev = 0.0; worst_gap = 0.0; all_pos = True
+    for b, name in enumerate(("slow", "mid", "hga")):
+        gv = float(gap[f"jepa_{name}_visible_explained_var"])
+        rv = float(ref_vis[f"jepa_{name}_explained_var"])
+        worst_ev = max(worst_ev, abs(gv - rv))
+        expect_gap = gv - float(stats[f"jepa_{name}_explained_var"])
+        worst_gap = max(worst_gap, abs(float(gap[f"jepa_{name}_recon_gap"]) - expect_gap))
+        all_pos = all_pos and float(gap[f"jepa_{name}_recon_gap"]) > 0
+
+    # filler-inclusion control: if filler were folded into visible, EV would move.
+    vis_w_naive = (w == 0).float()  # includes the 4 zero-energy filler tokens
+    naive = per_band_jepa_stats(pred, tgt, vis_w_naive, band_ids)
+    moved = any(
+        abs(float(naive[f"jepa_{n}_explained_var"]) - float(gap[f"jepa_{n}_visible_explained_var"])) > 1e-6
+        for n in ("slow", "mid", "hga")
+    )
+    ok = worst_ev < 1e-5 and worst_gap < 1e-5 and all_pos and moved
+    print(f"[check] visible EV==bool ref max|Δ|={worst_ev:.2e}; gap==Δ max|Δ|={worst_gap:.2e}; "
+          f"gap>0={all_pos}; filler-exclusion changes EV={moved} → {'OK' if ok else 'VIOLATED'}")
+    assert ok
