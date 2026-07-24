@@ -133,6 +133,47 @@ def test_true_update_ratio_logged_after_one_step() -> None:
         assert k in logged and logged[k] > 0.0, k
 
 
+def test_grad_noise_scale_logs_bsimple_keys_from_adamw_moments() -> None:
+    """With ``grad_noise_every_n_steps`` active and AdamW moments populated by one real
+    step, the monitor logs McCandlish B_simple: signal=Σm̂²>0, var=Σv̂−signal≥0,
+    ratio=var/signal (=B_crit/b_eff), scale=ratio·b_eff. b_eff=world·accum·_last_batch."""
+    mod = _module()
+    cb = SSLHealthMonitorV3(every_n_steps=1, grad_noise_every_n_steps=1)
+    opt = torch.optim.AdamW(mod.model.parameters(), lr=1e-3, betas=(0.9, 0.95))
+    mod.training_step(_session_batch(n_rows=2), 0).backward()
+    logged: dict[str, float] = {}
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    opt.step()  # populate exp_avg / exp_avg_sq (Adam state step -> 1)
+    cb.on_before_optimizer_step(trainer=_fake_trainer(), pl_module=mod, optimizer=opt)
+    for k in (
+        "train_mon_grad_noise_signal", "train_mon_grad_noise_var",
+        "train_mon_grad_noise_ratio", "train_mon_grad_noise_scale",
+    ):
+        assert k in logged and logged[k] == logged[k], k  # present + finite
+    assert logged["train_mon_grad_noise_signal"] > 0.0
+    assert logged["train_mon_grad_noise_var"] >= 0.0
+    assert logged["train_mon_grad_noise_ratio"] >= 0.0
+    b_eff = max(1, int(getattr(mod, "_last_batch_size", 1) or 1))  # world=accum=1 here
+    assert abs(
+        logged["train_mon_grad_noise_scale"]
+        - logged["train_mon_grad_noise_ratio"] * b_eff
+    ) < 1e-4
+
+
+def test_grad_noise_scale_off_by_default() -> None:
+    """Default ``grad_noise_every_n_steps=0`` ⇒ the ~28 ms critical-batch read never
+    fires and emits no ``grad_noise`` keys, even with a populated AdamW optimizer."""
+    mod = _module()
+    cb = SSLHealthMonitorV3(every_n_steps=1)
+    opt = torch.optim.AdamW(mod.model.parameters(), lr=1e-3)
+    mod.training_step(_session_batch(n_rows=2), 0).backward()
+    opt.step()
+    logged: dict[str, float] = {}
+    mod.log = lambda k, v, **kw: logged.__setitem__(k, float(v))  # type: ignore[assignment]
+    cb.on_before_optimizer_step(trainer=_fake_trainer(), pl_module=mod, optimizer=opt)
+    assert not any("grad_noise" in k for k in logged)
+
+
 def test_band_names_frontend_aware() -> None:
     """r5 (early_fusion) input tripwire labels its two streams hga/lfs; r4 keeps
     slow/mid/hga. A regression guard for the mislabel that read HGA as ``slow``."""

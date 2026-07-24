@@ -11,13 +11,15 @@ Family A — model-agnostic (grads/params), in ``on_before_optimizer_step`` at t
 monitor cadence:
   * grad spike        — total grad-L2 over trainable params.
   * ema_weight_gap    — ``‖θ_online − θ_teacher‖₂ / ‖θ_online‖₂`` (collapse guard).
-
-  Three LR-health monitors were REMOVED 2026-07-12 (all log-only ⇒ science-neutral),
-  after a per-monitor GH200 profile (job 2648659) showed they dominated the per-step
-  budget: grad_noise_scale (McCandlish B_simple, 28.2 ms), update_cos (25.3 ms) and
-  true_update_ratio (23.2 ms) — 76.7 of the 97 ms Family-A cost. They answered the
-  "is the LR too hot?" question, which is now settled; grad-spike (paired with the
-  3.0 grad-clip) remains as the divergence guard.
+  * true_update_ratio — per group ``‖Δθ‖₂/‖θ_prev‖₂`` across two consecutive steps
+    (LR calibration; ~1e-3 healthy). Runs every step to span its window.
+  * grad_noise_scale  — McCandlish B_simple critical-batch estimate from AdamW's
+    moment EMAs (opt-in, own coarse cadence). REMOVED 2026-07-12 with update_cos when
+    the "is LR too hot?" question closed; RESTORED 2026-07-23 for the batch-vs-critical
+    sizing question — a different axis: ``train_mon_grad_noise_scale`` is B_simple in
+    SAMPLES, compared to tokens/step (≫ ⇒ below critical batch). ~28 ms, gated by
+    --grad-noise-every-n-steps (0 = off) so it costs ~nothing amortized. update_cos
+    stays removed (LR-health, settled).
 
 Family B — tap-dependent (detached forward taps), in ``on_train_batch_end``, reading
 ``pl_module._last_taps`` (present ⇒ this is a cadence step; the module already
@@ -70,9 +72,15 @@ def _group(pl_module: pl.LightningModule, name: str):
 
 
 class SSLHealthMonitorV3(pl.Callback):
-    def __init__(self, *, every_n_steps: int = 1, per_stream_enc12: bool = False) -> None:
+    def __init__(self, *, every_n_steps: int = 1, per_stream_enc12: bool = False,
+                 grad_noise_every_n_steps: int = 0) -> None:
         super().__init__()
         self.every_n_steps = max(int(every_n_steps), 1)
+        # grad_noise_scale (McCandlish B_simple, critical-batch estimate) runs on its OWN coarse
+        # cadence, decoupled from the tap monitors: it costs ~28 ms (two GPU reductions over the
+        # AdamW moment buffers, no extra fwd/bwd), so at 0 it is OFF and at e.g. 25 it amortizes to
+        # ~1 ms/step. Opt in (--grad-noise-every-n-steps) when sizing the batch vs critical batch.
+        self.grad_noise_every_n_steps = max(int(grad_noise_every_n_steps), 0)
         # v3r5nf per-stream enc12 rankme/feat_std split. OFF by default (Ben 2026-07-22): the two
         # extra SVDs it runs per monitor step were the ~0.15 s/step "comb" on the fast arm's large
         # feature matrix — pure diagnostic overhead that cost the run its 50k target. Opt in with
@@ -93,6 +101,10 @@ class SSLHealthMonitorV3(pl.Callback):
         # update-to-weight ratio spans ONE optimizer step: snapshot θ at a cadence step, read
         # Δθ on the next call. Runs every step (the read is a no-op until a snapshot exists).
         self._maybe_log_true_update_ratio(pl_module, step)
+        # grad_noise_scale on its own coarse cadence (independent of the tap-monitor cadence): the
+        # critical-batch read costs ~28 ms, so gate it separately to keep throughput clean.
+        if self.grad_noise_every_n_steps and step % self.grad_noise_every_n_steps == 0:
+            self._grad_noise_scale(trainer, pl_module, optimizer)
         if not self._due(step):
             return
         grad_sq = torch.zeros((), dtype=torch.float32)
@@ -140,6 +152,55 @@ class SSLHealthMonitorV3(pl.Callback):
             num = num + (s - pt.detach().to(torch.float32)).pow(2).sum()
             den = den + s.pow(2).sum()
         return float((num.sqrt() / (den.sqrt() + 1e-12)).item())
+
+    def _grad_noise_scale(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, optimizer
+    ) -> None:
+        """McCandlish 2018 B_simple = trΣ/‖G‖² from AdamW's moment EMAs — two reductions over
+        ``optimizer.state``, no extra forward/backward. ``m`` (bias-corrected exp_avg) estimates
+        the true gradient G, ``v`` (bias-corrected exp_avg_sq) estimates E[g²]; per coordinate
+        Var(g_B) = v − m², so ‖G‖² = Σm² (signal) and trΣ = B_eff·Σ(v − m²) (per-example noise).
+        ``grad_noise_scale`` = B_simple in SAMPLE units, directly comparable to B_eff (tokens/step):
+        B_simple ≫ B_eff ⇒ below critical batch (raising batch buys ~linear step-efficiency);
+        B_simple ≈ B_eff ⇒ at the knee. The moments are EMAs (β2 window), so this is the smoothed
+        McCandlish estimate — a directional read, not the exact per-step accum estimator."""
+        if optimizer is None:
+            return
+        # Accumulate on-GPU in a running float64 scalar and sync ONCE at the end, instead of two
+        # blocking .item() per parameter tensor (hundreds of device→host stalls/step). Bit-
+        # identical: both paths are a double-precision SEQUENTIAL sum (same iteration order) of the
+        # same float32 per-tensor reductions — float32→float64 promotion is exact.
+        sig_t: torch.Tensor | None = None
+        v_t: torch.Tensor | None = None
+        for group in optimizer.param_groups:
+            beta1, beta2 = group.get("betas", (0.9, 0.999))
+            for p in group["params"]:
+                st = optimizer.state.get(p)
+                if not st or "exp_avg" not in st or "exp_avg_sq" not in st:
+                    continue
+                t = float(st["step"]) if "step" in st else 0.0
+                bc1 = 1.0 - beta1 ** t if t > 0 else 1.0
+                bc2 = 1.0 - beta2 ** t if t > 0 else 1.0
+                m = st["exp_avg"].detach().to(torch.float32) / bc1
+                v = st["exp_avg_sq"].detach().to(torch.float32) / bc2
+                s = m.pow(2).sum().double()
+                vv = v.sum().double()
+                sig_t = s if sig_t is None else sig_t + s
+                v_t = vv if v_t is None else v_t + vv
+        sig = float(sig_t.item()) if sig_t is not None else 0.0
+        v_sum = float(v_t.item()) if v_t is not None else 0.0
+        if sig <= 0.0:
+            return
+        var = max(0.0, v_sum - sig)
+        b_eff = (
+            max(1, int(getattr(trainer, "world_size", 1) or 1))
+            * max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
+            * max(1, int(getattr(pl_module, "_last_batch_size", 1) or 1))
+        )
+        pl_module.log("train_mon_grad_noise_signal", sig, on_step=True)
+        pl_module.log("train_mon_grad_noise_var", var, on_step=True)
+        pl_module.log("train_mon_grad_noise_ratio", var / sig, on_step=True)
+        pl_module.log("train_mon_grad_noise_scale", (var / sig) * b_eff, on_step=True)
 
     def _maybe_log_true_update_ratio(
         self, pl_module: pl.LightningModule, step: int
