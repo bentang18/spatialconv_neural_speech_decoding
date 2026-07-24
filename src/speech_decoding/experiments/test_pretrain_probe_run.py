@@ -73,6 +73,7 @@ def test_anchor_is_in_universe():
     assert DEFAULT_CS_TRAIN_ANCHOR in PRETRAIN_UNIVERSE
 
 
+@pytest.mark.slow
 def test_selects_the_signal_checkpoint_by_cross_subject():
     caches_by_ckpt = {
         "strong": _caches_for_universe(0, signal=True),

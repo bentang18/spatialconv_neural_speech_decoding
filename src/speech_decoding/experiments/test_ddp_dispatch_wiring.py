@@ -18,8 +18,30 @@ build); the live 4-GPU fast-dev-run on DCC is the end-to-end NCCL gate.
 """
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from speech_decoding.experiments.dispatch_v14 import main
 from speech_decoding.experiments.experiment import _is_global_zero
+
+
+@pytest.fixture(autouse=True)
+def _restore_v14_env():
+    """``main()`` configures the child run by WRITING ``V14_*`` into this process's
+    environment, and a dry-run exits before anything unsets them. Left alone, the
+    first test here leaves ``V14_COMPILE=1``/``V14_COMPILE_DYNAMIC=1`` set for the
+    REST OF THE SESSION, so any later test asserting the eager default
+    (``test_speedups_off_by_default_eager_bytewise``: ``_compile_spec is None``)
+    fails in a full-suite run while passing in isolation. Snapshot and restore.
+    """
+    saved = {k: v for k, v in os.environ.items() if k.startswith("V14_")}
+    try:
+        yield
+    finally:
+        for k in [k for k in os.environ if k.startswith("V14_")]:
+            del os.environ[k]
+        os.environ.update(saved)
 
 
 # --- main() auto-resolution (printed in the dry-run summary) -----------------

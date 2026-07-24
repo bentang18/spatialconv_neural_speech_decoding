@@ -37,7 +37,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["src"]
+# Default run EXCLUDES `slow`. A CLI `-m` overrides this entirely (pytest takes the last
+# -m, it does not AND them), so `scripts/dcc/dispatch`'s `-m must_pass_before_dispatch`
+# gate still runs its slow members. Run everything with `-m ""`; run only the slow ones
+# with `-m slow`.
+addopts = "-m 'not slow'"
 markers = [
-    "slow: marks tests that load real BIDS data (deselect with '-m \"not slow\"')",
+    "slow: loads real BIDS data OR trains a model from scratch on CPU. Deselected by default (addopts); re-run with '-m slow', or the whole suite with '-m \"\"'.",
     "must_pass_before_dispatch: pre-dispatch gate (SCAFFOLD-07, B18 closure-gate). Run by `scripts/dcc/dispatch` before sync; aborts on failure.",
 ]

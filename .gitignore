@@ -164,6 +164,7 @@ scripts/neuroprobe/run_keepS_ridge.py
 scripts/neuroprobe/run_stage0_v_qc.py
 scripts/neuroprobe/run_upstream_linear_baseline.py
 scripts/neuroprobe/sim_mask_shaft_survival.py
+scripts/neuroprobe/v3_mask_interp_floor.py
 scripts/neuroprobe/submit_upstream_baseline_matrix.py
 scripts/neuroprobe/summarize_neuroprobe_population_jsons.py
 scripts/neuroprobe/summarize_stage0_v_qc.py

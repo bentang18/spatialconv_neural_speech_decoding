@@ -161,13 +161,52 @@ def test_cogan_band_map_covers_exactly_the_v3_bands():
     assert set(d._COGAN_CACHE_BANDS) == set(_V3_BANDS)
 
 
-def test_v3_band_constants_are_hop64_and_have_band_hop():
-    """The bake does hop_length=int(band_const['band_hop']); every v3 band must carry
-    band_hop and it must be 64 (uniform 32 Hz native)."""
+# What the BAKE would write, per band: hop_length=int(band_const["band_hop"]).
+# dbd95e9 (2026-07-21) moved SLOW 64→512 (4 Hz) and MID 64→128 (16 Hz) for the
+# native-rate fine-HGA rebake. That rebake has NOT been run — every live cache is
+# still hop=64 — so this map is the DECLARED bake, not the cache on disk. The two
+# seams are pinned separately below.
+_V3_DECLARED_HOP = {"v3slow": 512, "v3mid": 128, "hga": 64}
+
+# What the v3 READ path accepts: cache_index.resolve_band_leaf is locked to this hop
+# and fails loud on any other leaf, so this is the rate every trained v3 run has seen.
+_V3_LIVE_CACHE_HOP = 64
+
+
+def test_v3_band_constants_have_band_hop_matching_the_declared_bake():
+    """The bake does hop_length=int(band_const['band_hop']); pin each v3 band's declared
+    hop so a Cogan/BT drift or an unannounced re-hop can't land silently."""
     for band in _V3_BANDS:
         const = d._COGAN_CACHE_BANDS[band]
         assert "band_hop" in const, f"{band} missing band_hop"
-        assert int(const["band_hop"]) == 64, f"{band} band_hop != 64"
+        assert int(const["band_hop"]) == _V3_DECLARED_HOP[band], (
+            f"{band} band_hop {const['band_hop']} != declared {_V3_DECLARED_HOP[band]}"
+        )
+
+
+def test_declared_bake_hop_divergence_from_the_live_read_lock_is_explicit():
+    """SLOW/MID declare a native-rate bake the live cache does not have, and the reader is
+    hard-locked to hop=64. Nothing downstream reconciles them: declaring a rate the cache
+    lacks does NOT decimate — V3ClipDataset rescales the read INDEX, so an over-declared
+    band returns a contiguous, TIME-SHIFTED slice at the right shape (the r6 bug, memo
+    project-r6-band-rates-cache-rate-bug-2026-07-23; four runs trained on it).
+
+    So this test states the seam rather than hiding it: any band whose declared bake hop
+    differs from the read lock is a band that CANNOT be rebaked without updating
+    ``resolve_band_leaf``'s ``band_hop`` default and the frontend's band_rates together.
+    """
+    from speech_decoding.models.v14_converged_v3.cache_index import resolve_band_leaf
+
+    lock = inspect.signature(resolve_band_leaf).parameters["band_hop"].default
+    assert lock == _V3_LIVE_CACHE_HOP, (
+        f"read path now locks band_hop={lock}, not {_V3_LIVE_CACHE_HOP} — if the native-rate "
+        "rebake landed, update _V3_LIVE_CACHE_HOP and every frontend's band_rates in lockstep"
+    )
+    pending = {b: h for b, h in _V3_DECLARED_HOP.items() if h != _V3_LIVE_CACHE_HOP}
+    assert pending == {"v3slow": 512, "v3mid": 128}, (
+        f"bake/read divergence changed: {pending}. This set must only ever shrink (by rebaking "
+        "and re-locking) — a NEW entry means a band was re-hopped without a cache to match."
+    )
 
 
 # ---- 3. builder input-validation guards (fire before any study construction) ---

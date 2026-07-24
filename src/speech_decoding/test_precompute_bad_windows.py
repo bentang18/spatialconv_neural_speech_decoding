@@ -73,16 +73,25 @@ def test_2band_frontend_specs() -> None:
 
 def test_v3_frontend_specs() -> None:
     """The --frontend v3 selector scans the sensor frontend's 3 bands in
-    v3slow→v3mid→hga order at the native hop=64 (32Hz), matching the verified v3
-    cache shape (91,{7,6,7},T): v3slow 7 bins (2-14Hz), v3mid 6 (16-56Hz), hga 7
-    (= STFT_2BAND_HGA 64-160Hz). v3slow is first = the dropout sentinel."""
+    v3slow→v3mid→hga order, matching the v3 cache shape (91,{7,6,7},T): v3slow 7 bins
+    (2-14Hz), v3mid 6 (16-56Hz), hga 7 (= STFT_2BAND_HGA 64-160Hz). v3slow is first =
+    the dropout sentinel.
+
+    HOPS TRACK ``view.py``, WHICH IS NOT THE LIVE CACHE. dbd95e9 (2026-07-21) moved
+    SLOW 64→512 and MID 64→128 for a native-rate rebake that has never been run, so
+    every baked cache is still hop=64 while these constants say otherwise. Spans are
+    computed in NEURAL SECONDS, so the bad-window output is rate-robust and this
+    divergence does not corrupt the span files — but the numbers below are the
+    DECLARED bake, not the cache on disk. The bake/read seam is pinned in
+    ``test_dispatch_cogan_cache_seam`` (memo: project-r6-band-rates-cache-rate-bug-2026-07-23).
+    """
     m = _mod()
     specs = m._make_band_specs(m._FRONTEND_BANDS["v3"])
     names = [name for (name, *_) in specs]
     assert names == ["v3slow", "v3mid", "hga"]
     by_name = {name: (npseg, hop, k0, k1) for (name, npseg, hop, k0, k1) in specs}
-    assert by_name["v3slow"][:2] == (1024, 64) and by_name["v3slow"][3] - by_name["v3slow"][2] + 1 == 7
-    assert by_name["v3mid"][:2] == (256, 64) and by_name["v3mid"][3] - by_name["v3mid"][2] + 1 == 6
+    assert by_name["v3slow"][:2] == (1024, 512) and by_name["v3slow"][3] - by_name["v3slow"][2] + 1 == 7
+    assert by_name["v3mid"][:2] == (256, 128) and by_name["v3mid"][3] - by_name["v3mid"][2] + 1 == 6
     assert by_name["hga"][:2] == (128, 64) and by_name["hga"][3] - by_name["hga"][2] + 1 == 7
 
 
@@ -240,7 +249,9 @@ def test_production_defaults_are_locked() -> None:
     assert m.N_FLOOR == 3
     # converged-v2 2-band finals (locked 2026-06-26, proposal §6): cat 8→6 on lfs/hga
     # only, via the band-keyed override; hot/frac/abs held. 3STFT keeps scalar cat8.
-    assert m.CAT_MULT_BY_BAND == {"lfs": 6.0, "hga": 6.0}
+    # v3hga joined 2026-07-21 (dbd95e9): the fine-HGA band covers the SAME 64-160 Hz as
+    # hga at a finer window, so it inherits the same 6.0 fence rather than the scalar 8.
+    assert m.CAT_MULT_BY_BAND == {"lfs": 6.0, "hga": 6.0, "v3hga": 6.0}
     assert m.HOT_MULT_BY_BAND == {}
 
 

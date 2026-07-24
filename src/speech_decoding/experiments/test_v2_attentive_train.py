@@ -7,6 +7,7 @@ without breaking, and diwa_average should fuse independent heads into a working 
 
 from __future__ import annotations
 
+import pytest
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
@@ -125,6 +126,7 @@ def _multi_subject(seed, *, separable, n_sub=5, d=12):
     return tokens, labels, list(range(n_sub))
 
 
+@pytest.mark.slow
 def test_loso_pooled_cs_separable_beats_chance():
     tokens, labels, subs = _multi_subject(0, separable=True)
     base = HeadTrainConfig(d_model=12, n_heads=4, attn_dropout=0.0, mlp_dropout=0.0,
@@ -140,6 +142,7 @@ def test_loso_pooled_cs_separable_beats_chance():
         assert set(f["fit_subjects"]) == set(subs) - {f["test_s"]}
 
 
+@pytest.mark.slow
 def test_loso_pooled_cs_random_near_chance():
     tokens, labels, subs = _multi_subject(1, separable=False)
     base = HeadTrainConfig(d_model=12, n_heads=4, max_steps=400, eval_every=40,
@@ -149,6 +152,7 @@ def test_loso_pooled_cs_random_near_chance():
     assert 0.3 < out["cs_mean"] < 0.7
 
 
+@pytest.mark.slow
 def test_loso_pooled_cs_hp_selection_picks_by_val():
     """Two-HP grid runs end-to-end and records the selected hp per fold."""
     tokens, labels, subs = _multi_subject(2, separable=True, n_sub=4)
