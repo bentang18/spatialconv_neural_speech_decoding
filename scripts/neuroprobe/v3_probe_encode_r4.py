@@ -117,7 +117,13 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     ``pref`` selects which tower: the JEPA EMA teacher (default) or, for the MAE arm which has no
     teacher, ``objective.online.`` — the online encoder is the MAE arm's deployed representation.
     The online subtree is key- and shape-identical to the teacher subtree (verified on arm0, which
-    carries both), so it loads into the same ``_TargetTower`` shell unchanged."""
+    carries both), so it loads into the same ``_TargetTower`` shell unchanged.
+
+    ``deep_sup`` is READ OFF the ckpt, not passed in: deep-sup towers carry ``norms_block.*`` and
+    no ``norm_out``, single-tap towers the reverse (towers.py:102/114), so the shell has to match
+    or the strict-ish check below fires. The taps this script actually reads are captured BEFORE
+    either norm (towers.py:171/311), so the flag changes which unused params exist, nothing else —
+    deep-sup ckpts encode bit-identically to before."""
     from speech_decoding.models.v14_converged_v3.objective import _TargetTower
 
     tsd = _subtree(sd, pref)
@@ -126,7 +132,9 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     peek = [v.shape[0] for kk, v in tsd.items() if kk.endswith("parcel_embed.embed.weight")]
     if peek and int(peek[0]) != N_PARCELS:
         raise ValueError(f"ckpt parcel table {peek[0]} != expected {N_PARCELS}")
-    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=True, early_fusion=early_fusion,
+    deep_sup = any(kk.startswith("encoder.norms_block.") for kk in tsd)
+    print(f"[encode] tower deep_sup={deep_sup} (inferred from ckpt keys)")
+    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=deep_sup, early_fusion=early_fusion,
                          no_fusion=no_fusion, nf_decimate=nf_decimate)
     missing, unexpected = tower.load_state_dict(tsd, strict=False)
     bad = [m for m in missing if "num_batches_tracked" not in m]
