@@ -2,9 +2,10 @@
 
 r4's 3-band leak-safe STRUCTURE (one per-shaft-balanced SPACE mask shared across bands +
 three width-``block_w_band`` band TIME masks on the SLOW/MID/HGA native grids) crossed with
-r5's PER-SHAFT INDEPENDENCE (each band's time mask is ``(R,S,T_b)``, drawn per shaft, not the
-r4 global ``(R,T_b)``). The M14 margin-2 in_loss gate is retained DOWNSTREAM (objective) — this
-sampler only lays the width-4 blocks; it does not gate. Invariants named + asserted + printed.
+PER-SENSOR INDEPENDENCE (each band's time mask is ``(R,N,T_b)``, drawn per contact, not the
+r4 global ``(R,T_b)``) — Ben 2026-07-23: the encoder is L1-within-shaft only, so per-sensor
+masking is free extra diversity. The M14 margin gate is GONE downstream (``in_loss == masked``);
+this sampler only lays the width-4 blocks. Invariants named + asserted + printed.
 """
 
 from __future__ import annotations
@@ -43,14 +44,16 @@ def test_shape_and_four_fields() -> None:
     m = sample_masks_r6(geom, n, n_time=32, n_rows=5, generator=_gen())
     assert isinstance(m, V3MasksR6)
     assert m.contact_mask.shape == (5, n)
-    assert m.hga_mask.shape == (5, geom.n_shafts, 32)
-    assert m.mid_mask.shape == (5, geom.n_shafts, 16)
-    assert m.slow_mask.shape == (5, geom.n_shafts, 4)
-    print("[check] OK V3MasksR6: shared contact (R,N) + per-shaft SLOW/MID/HGA (R,S,T_b)")
+    assert m.hga_mask.shape == (5, n, 32)
+    assert m.mid_mask.shape == (5, n, 16)
+    assert m.slow_mask.shape == (5, n, 4)
+    print("[check] OK V3MasksR6: shared contact (R,N) + per-sensor SLOW/MID/HGA (R,N,T_b)")
 
 
-def test_each_band_temporal_count_is_exact_per_shaft() -> None:
-    # per-band per-shaft count == round(frac · band-grid length) EXACTLY (static compiled shapes).
+def test_each_band_temporal_count_is_exact_per_sensor() -> None:
+    # per-band PER-SENSOR count == round(frac · band-grid length) EXACTLY. This is what keeps the
+    # visible-token count a per-session constant under per-sensor masking: every contact hides the
+    # same number of frames ⇒ per-shaft total = n_contacts · cnt ⇒ m_vis/cu_seqlens unchanged.
     sc, geom = _session([4, 4])
     n = int(geom.valid.sum())
     for frac in (0.25, 0.5, 0.75):
@@ -62,9 +65,9 @@ def test_each_band_temporal_count_is_exact_per_shaft() -> None:
             ("hga", m.hga_mask, 32), ("mid", m.mid_mask, 16), ("slow", m.slow_mask, 4)
         ):
             want = round(frac * length)
-            counts = tm.sum(-1)  # (R, S) per shaft
+            counts = tm.sum(-1)  # (R, N) per contact
             assert torch.all(counts == want), (name, frac, counts.unique().tolist())
-    print("[check] OK per-band per-shaft count == round(frac·length) exactly, all 3 bands")
+    print("[check] OK per-band per-sensor count == round(frac·length) exactly, all 3 bands")
 
 
 def test_space_balanced_shared_and_keep_alive() -> None:
@@ -85,8 +88,8 @@ def test_masked_counts_constant_across_rows_static_shapes() -> None:
     per_row = m.contact_mask.long().sum(1)
     assert torch.all(per_row == per_row[0])
     for tm in (m.hga_mask, m.mid_mask, m.slow_mask):
-        per_shaft = tm.long().sum(-1)  # (R, S)
-        assert torch.all(per_shaft == per_shaft[0, 0])
+        per_sensor = tm.long().sum(-1)  # (R, N)
+        assert torch.all(per_sensor == per_sensor[0, 0])
     print("[check] OK contact + per-band counts row-constant ⇒ static compiled shapes")
 
 
@@ -104,20 +107,24 @@ def test_bands_are_independent() -> None:
     print("[check] OK SLOW/MID/HGA masks independent (differ at shared lattice positions)")
 
 
-def test_temporal_is_per_shaft_independent() -> None:
-    # THE r5-borrowed invariant: unlike r4's GLOBAL band masks, each band mask is per-shaft.
+def test_temporal_is_per_sensor_independent_within_a_shaft() -> None:
+    # THE r6 invariant: unlike r4's GLOBAL band masks, each band mask is per-SENSOR — and the test
+    # that separates per-sensor from the old per-shaft draw is that two contacts of the SAME shaft
+    # get different masks. Compare within shaft 1 (contacts 3..7) only.
     sc, geom = _session([3, 5, 4])
     n = int(geom.valid.sum())
     m = sample_masks_r6(geom, n, n_time=32, n_rows=4, generator=_gen(2))
+    same_shaft = [i for i in range(n) if int(geom.shaft_of_contact[i]) == 1]
+    assert len(same_shaft) >= 2
     for tm in (m.hga_mask, m.mid_mask, m.slow_mask):
         any_differ = any(
             not torch.equal(tm[r, i], tm[r, j])
             for r in range(tm.shape[0])
-            for i in range(tm.shape[1])
-            for j in range(i + 1, tm.shape[1])
+            for a, i in enumerate(same_shaft)
+            for j in same_shaft[a + 1 :]
         )
-        assert any_differ, "shafts share a band mask — not per-shaft independent"
-    print("[check] OK each band mask is (R,S,T_b) per-shaft independent")
+        assert any_differ, "contacts of one shaft share a band mask — not per-sensor independent"
+    print("[check] OK each band mask is (R,N,T_b) per-sensor independent WITHIN a shaft")
 
 
 def test_block_width_controls_masked_run_length() -> None:

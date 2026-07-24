@@ -406,29 +406,37 @@ def _sample_r5_space_time(
     return contact_mask, temporal_mask
 
 
-# ── r6: r4's 3-band leak-safe structure with r5's per-shaft independence ──────────
+# ── r6: r4's 3-band leak-safe structure with PER-SENSOR temporal independence ─────
 @dataclass(frozen=True)
 class V3MasksR6:
-    """r6 masks — r4's 3-band leak-safe STRUCTURE × r5's PER-SHAFT INDEPENDENCE.
+    """r6 masks — r4's 3-band STRUCTURE × PER-SENSOR temporal INDEPENDENCE.
 
     ONE per-shaft-balanced SPACE mask (``contact_mask``, shared across bands — the r4
     outer-product structure: a (contact c, band b, token t_b) is visible iff c is spatially
     kept AND band-b token t_b is not time-masked) + THREE band TIME masks on the SLOW/MID/HGA
-    native grids. Unlike r4's GLOBAL ``(R,T_b)`` band masks, each r6 band mask is PER-SHAFT
-    ``(R,S,T_b)`` (r5 independence): each ``(row, shaft)`` hides its OWN contiguous width-
-    ``block_w_band`` blocks, exactly ``round(frac·length)`` per band — a per-session constant ⇒
-    static compiled shapes hold (r5nf-style), only the per-shaft LAYOUT differs. The M14
-    margin-2 in_loss gate is RETAINED downstream (objective) — this sampler lays width-4 blocks
-    and does NOT gate (contrast r5's accept-the-bleed)."""
+    grids. Unlike r4's GLOBAL ``(R,T_b)`` band masks, each r6 band mask is PER-SENSOR
+    ``(R,N,T_b)``: every ``(row, contact)`` hides its OWN contiguous width-``block_w_band``
+    blocks, exactly ``round(frac·length)`` per band.
+
+    WHY per-sensor (Ben 2026-07-23): r4's global time mask hid the same band-b frames for every
+    contact, which was never load-bearing — the encoder is L1-within-shaft only, so a global mask
+    bought no cross-unit consistency the architecture could use. Drawing per sensor is PURELY
+    more mask diversity per clip at identical cost and identical shapes. Counts are per-(row,
+    contact) constants ⇒ each shaft still masks ``n_s·cnt`` band-b tokens ⇒ static compiled
+    shapes hold exactly as before; only the per-sensor LAYOUT differs.
+
+    NO margin gate downstream (``token_flags_r6``: ``in_loss == masked``) — every masked token is
+    scored, the data2vec2/MAE convention (Ben 2026-07-23: "no ML SSL does a margin gate for masked
+    tokens")."""
 
     contact_mask: Tensor  # (R, N) bool — per-shaft balanced SPACE, shared across bands.
-    hga_mask: Tensor  # (R, S, T)   bool — per-shaft HGA (32 Hz). round(hga_frac·T) per (row, shaft).
-    mid_mask: Tensor  # (R, S, T/2) bool — per-shaft MID (16 Hz). round(mid_frac·T/2).
-    slow_mask: Tensor  # (R, S, T/8) bool — per-shaft SLOW (4 Hz). round(slow_frac·T/8).
+    hga_mask: Tensor  # (R, N, T)   bool — per-sensor HGA (32 Hz). round(hga_frac·T) per (row, contact).
+    mid_mask: Tensor  # (R, N, T/2) bool — per-sensor MID (16 Hz). round(mid_frac·T/2).
+    slow_mask: Tensor  # (R, N, T/8) bool — per-sensor SLOW (4 Hz). round(slow_frac·T/8).
 
 
-def _sample_pershaft_band_time(
-    n_shafts: int,
+def _sample_persensor_band_time(
+    n_units: int,
     length: int,
     *,
     frac: float,
@@ -437,14 +445,18 @@ def _sample_pershaft_band_time(
     generator: torch.Generator,
     device: torch.device,
 ) -> Tensor:
-    """One per-shaft band time mask on a ``(S, length)`` grid: contiguous width-``block_w`` blocks,
-    exactly ``round(frac·length)`` masked per ``(row, shaft)``. This is r4's leak-safe per-band
-    ``_band_mask`` (module docstring §TIME) made PER-SHAFT (r5 independence) — the ``s`` axis of the
-    ``_cover_rank`` grid is the shaft, so each shaft draws its own blocks at identical count."""
-    ones = torch.ones(n_shafts, length, dtype=torch.bool, device=device)
-    cover = _cover_rank(ones, block_w, n_rows, generator)  # (R, S, length)
+    """One per-sensor band time mask on a ``(N, length)`` grid: contiguous width-``block_w`` blocks,
+    exactly ``round(frac·length)`` masked per ``(row, contact)``. This is r4's per-band ``_band_mask``
+    (module docstring §TIME) made PER-SENSOR — the unit axis of the ``_cover_rank`` grid is the
+    CONTACT, so each contact draws its own blocks at an identical count.
+
+    The unit axis is contact INDEX space (0..N−1), matching ``R4Grid.contact``, so downstream reads
+    ``bm[:, grid.contact, grid.bandpos]`` directly. Draws are i.i.d. across units, so the ordering
+    of that axis carries no meaning — only that it agrees with the index the grid uses."""
+    ones = torch.ones(n_units, length, dtype=torch.bool, device=device)
+    cover = _cover_rank(ones, block_w, n_rows, generator)  # (R, N, length)
     cnt = round(frac * length)
-    return cover.argsort(-1).argsort(-1) < cnt  # (R, S, length) exactly cnt per (row, shaft)
+    return cover.argsort(-1).argsort(-1) < cnt  # (R, N, length) exactly cnt per (row, contact)
 
 
 def sample_masks_r6(
@@ -456,12 +468,12 @@ def sample_masks_r6(
     generator: torch.Generator,
     cfg: V3MaskConfig = V3MaskConfig(),
 ) -> V3MasksR6:
-    """Sample ``n_rows`` r6 masks: shared per-shaft-balanced SPACE + THREE per-shaft band TIME masks.
+    """Sample ``n_rows`` r6 masks: shared per-shaft-balanced SPACE + THREE per-SENSOR band TIME masks.
 
     SPACE is a faithful copy of :func:`sample_masks`'s per-shaft balanced tier (drawn ONCE, shared
-    across bands). TIME draws SLOW/MID/HGA INDEPENDENTLY on their own native grids (sequential draws
-    from the one generator ⇒ independent realizations), each PER-SHAFT ``(R,S,T_b)`` in contiguous
-    width-``block_w_band`` blocks. Per-shaft counts are per-session constants ⇒ static shapes."""
+    across bands). TIME draws SLOW/MID/HGA INDEPENDENTLY on their own grids (sequential draws from
+    the one generator ⇒ independent realizations), each PER-SENSOR ``(R,N,T_b)`` in contiguous
+    width-``block_w_band`` blocks. Per-sensor counts are per-session constants ⇒ static shapes."""
     r, s, c = n_rows, geom.n_shafts, geom.max_c
     n, t = n_contacts, n_time
     valid = geom.valid  # (S, C)
@@ -492,7 +504,7 @@ def sample_masks_r6(
     contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
     contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
 
-    # ── TIME (per-shaft INDEPENDENT, 3 bands each on its own native grid, width-4 blocks) ──
+    # ── TIME (per-SENSOR INDEPENDENT, 3 bands each on its own grid, width-4 blocks) ──
     if t % SLOW_STRIDE != 0:
         raise ValueError(f"n_time={t} not a multiple of SLOW_STRIDE={SLOW_STRIDE}")
     if t % MID_STRIDE != 0:
@@ -501,14 +513,14 @@ def sample_masks_r6(
     n_slots = t // SLOW_STRIDE
 
     def band(length: int, frac: float) -> Tensor:
-        return _sample_pershaft_band_time(
-            s, length, frac=frac, block_w=cfg.block_w_band,
+        return _sample_persensor_band_time(
+            n, length, frac=frac, block_w=cfg.block_w_band,
             n_rows=r, generator=generator, device=dev,
         )
 
-    hga_mask = band(t, cfg.hga_mask_frac)  # (R, S, T)   32 Hz
-    mid_mask = band(t_mid, cfg.mid_mask_frac)  # (R, S, T/2) 16 Hz
-    slow_mask = band(n_slots, cfg.slow_mask_frac)  # (R, S, T/8) 4 Hz
+    hga_mask = band(t, cfg.hga_mask_frac)  # (R, N, T)   32 Hz
+    mid_mask = band(t_mid, cfg.mid_mask_frac)  # (R, N, T/2) 16 Hz
+    slow_mask = band(n_slots, cfg.slow_mask_frac)  # (R, N, T/8) 4 Hz
 
     return V3MasksR6(
         contact_mask=contact_mask,

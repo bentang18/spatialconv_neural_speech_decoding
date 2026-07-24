@@ -290,40 +290,41 @@ def token_flags(
     return masked, in_loss
 
 
-# ── r6 (3-band native-rate) PER-SHAFT band masks + MARGIN gate ───────────────────
+# ── r6: PER-SENSOR band masks, NO margin gate (score every masked token) ─────────
 def token_flags_r6(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
-    """(masked, in_loss) each (B, total) bool for r6's 3-band grid with PER-SHAFT band masks.
+    """(masked, in_loss) each (B, total) bool for r6's 3-band grid with PER-SENSOR band masks.
 
-    r6 = r4's margin-gated leak-safety (``in_loss`` ⊆ ``masked``, M14 margin 2 — KEPT, unlike
-    r5's accept-the-bleed) on r5-style PER-SHAFT band masks. Reuses ``build_r4_grid`` (the grid
-    is identical — native bake changes only WHERE bins come from, not token positions). The only
-    change from :func:`token_flags`: each band mask is ``(B, S, T_b)`` (per-shaft) not ``(B, T_b)``
-    (global), so a token reads its OWN shaft's row (``bm[:, grid.shaft, grid.bandpos]``) and the
-    margin gate runs per-shaft (``_dist_to_visible`` over each ``(B·S, T_b)`` row independently).
-    Reduces EXACTLY to :func:`token_flags` when every shaft shares one mask (test_pack_r6).
-    ``masks`` (``masking.V3MasksR6``): ``contact_mask`` (B, N) + {slow,mid,hga}_mask (B, S, T_b)."""
-    band_masks = (masks.slow_mask, masks.mid_mask, masks.hga_mask)  # each (B, S, T_b)
+    Two changes from :func:`token_flags` (r4):
+
+      1. each band mask is ``(B, N, T_b)`` (per-SENSOR) not ``(B, T_b)`` (global), so a token
+         reads its OWN contact's row — ``bm[:, grid.contact, grid.bandpos]``;
+      2. NO MARGIN GATE — ``in_loss == masked``, every masked token is scored (Ben 2026-07-23:
+         "no ML SSL does a margin gate for masked tokens"). This is the data2vec2 / MAE / r5
+         convention; r4's bespoke M14 gate stays in :func:`token_flags` and is r4-only.
+
+    Trade-off accepted deliberately: within a band, adjacent decimated frames overlap by a factor
+    of 2 in raw samples (token hop = nperseg/2), so a masked token at the EDGE of a width-4 block
+    shares samples with its visible same-band neighbour. The width-4 block still buries its 2
+    interior tokens at margin ≥2 (zero overlap); dropping the gate simply scores the edge tokens
+    too instead of discarding them.
+
+    The grid is r4's (:func:`build_r4_grid`) unchanged. ``masks`` (``masking.V3MasksR6``):
+    ``contact_mask`` (B, N) + {slow,mid,hga}_mask (B, N, T_b)."""
+    band_masks = (masks.slow_mask, masks.mid_mask, masks.hga_mask)  # each (B, N, T_b)
     B = masks.contact_mask.shape[0]
     device = grid.contact.device
 
     contact_masked = masks.contact_mask[:, grid.contact]  # (B, total)
 
     temporal_masked = torch.zeros(B, grid.total, dtype=torch.bool, device=device)
-    temporal_in_loss = torch.zeros(B, grid.total, dtype=torch.bool, device=device)
-    for b, bm in enumerate(band_masks):  # bm (B, S, T_b)
+    for b, bm in enumerate(band_masks):  # bm (B, N, T_b)
         sel = grid.band == b  # (total,) tokens of band b
-        sh = grid.shaft[sel]  # (n_b,) each token's shaft
+        ct = grid.contact[sel]  # (n_b,) each token's contact
         pos = grid.bandpos[sel]  # (n_b,) band-token index
-        temporal_masked[:, sel] = bm[:, sh, pos]  # (B, n_b) per-shaft mask at token's (shaft,pos)
-        s_dim, t_b = bm.shape[1], bm.shape[2]
-        flat = bm.reshape(B * s_dim, t_b)  # margin gate PER (row, shaft), each its own grid
-        margin_ok = (flat & (_dist_to_visible(flat) >= MARGIN)).reshape(B, s_dim, t_b)
-        temporal_in_loss[:, sel] = margin_ok[:, sh, pos]  # (B, n_b)
+        temporal_masked[:, sel] = bm[:, ct, pos]  # (B, n_b) own-contact mask at (contact, pos)
 
     masked = contact_masked | temporal_masked
-    # spatially-masked contact ⇒ leak-proof (no own visible same-band frame); else margin gate.
-    in_loss = contact_masked | (temporal_masked & temporal_in_loss)
-    return masked, in_loss
+    return masked, masked  # score EVERY masked token — no margin gate
 
 
 # ── r5 (Chang 2-stream) single-band grid + accept-the-bleed flags ────────────────

@@ -172,7 +172,17 @@ class PerBandStem(nn.Module):
 
 
 class NativePerBandStem(PerBandStem):
-    """r6 stem: PerBandStem on NATIVE-RATE bands — plain per-band Linear, ZERO decimate/conv.
+    """DORMANT (2026-07-23) — NOT wired to any frontend; kept for a future native bake.
+
+    v3r6 used this until 2026-07-23 on the belief that the 3 bands had been re-baked at their
+    native rates. They had not — every band cache is 32 Hz — so there was nothing for the r4
+    decimate to drop and the arm was reading mis-windowed SLOW/MID (memo
+    project-r6-band-rates-cache-rate-bug-2026-07-23). v3r6 now uses ``PerBandStem`` on the 32 Hz
+    caches, exactly as r4. This class earns its keep again only if a real native bake is made
+    (8×/2× less SLOW/MID I/O for bit-identical tokens); ``test_native_perband_equals_perband_
+    decimated`` still pins that equivalence.
+
+    r6 stem: PerBandStem on NATIVE-RATE bands — plain per-band Linear, ZERO decimate/conv.
 
     r6 bakes each band at its own native rate (SLOW @4 Hz, MID @16 Hz, HGA @32 Hz coarse
     7-bin ``STFT_2BAND_HGA``), so the bands arrive ALREADY at token rate — the r4/PerBandStem

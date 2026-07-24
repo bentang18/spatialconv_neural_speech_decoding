@@ -48,7 +48,6 @@ from speech_decoding.models.v14_converged_v3.datamodule import V3DataModule
 from speech_decoding.models.v14_converged_v3.dataset import (
     NATIVE_FINE_BAND_RATES,
     R5_BAND_RATES,
-    R6_BAND_RATES,
     UNIFORM_BAND_RATES,
     V3SessionSpec,
 )
@@ -238,7 +237,7 @@ def _n_parcels(sessions: tp.Sequence[V3SessionSpec]) -> int:
 def _frontend_config(
     args: argparse.Namespace,
 ) -> tuple[bool, bool, bool, bool, tuple[tuple[int, int], ...]]:
-    """(native_fine_hga, early_fusion, no_fusion, native_perband, band_rates) from ``--frontend``.
+    """(native_fine_hga, early_fusion, no_fusion, r6, band_rates) from ``--frontend``.
 
     ``v3`` (default) = uniform-32Hz PerBandStem (arm0, byte-identical to every prior run).
     ``v3fine`` = FineHgaStem on native-rate caches (SLOW 4Hz / MID 16Hz / HGA 128Hz).
@@ -246,12 +245,16 @@ def _frontend_config(
     5ch→256→stride-2 to 32 Hz tokens.
     ``v3r5nf`` = NoFusionStem: the SAME 2 caches, but each conv-pooled by its OWN stem into its
     OWN 32 Hz token stream (2 streams, 2-way band embed, independent masks/heads, MAE-only).
-    ``v3r6`` = NativePerBandStem: the winning r4-MAE 3-band |STFT| frontend (SLOW 4Hz / MID 16Hz /
-    HGA 32Hz native, linear stem, per-band recon heads, RAW target) on r5's shaft-batched regime
-    with per-shaft 3-band margin-gated masks. MAE-only.
+    ``v3r6`` = arm0's frontend VERBATIM — the SAME 3-band 32 Hz |STFT| caches, the SAME
+    PerBandStem (decimating 8/2/1 internally), hence ``UNIFORM_BAND_RATES``. r6's deltas are the
+    shaft-batched data regime and the loss (no norm_pix, no margin gate, per-sensor masks, a
+    predictor band embed), NOT the frontend. It read ``R6_BAND_RATES`` until 2026-07-23, which
+    declared a native 4/16/32 Hz bake that was never made and silently mis-windowed SLOW/MID
+    (memo project-r6-band-rates-cache-rate-bug-2026-07-23); ``assert_band_rates_match_cache``
+    now fails loud on any such mismatch.
     The SAME band_rates must reach the dataset (per-band read offsets), the loader (32Hz
     reference n_frames) AND the model (stem + T derivation), so all three read this one fn.
-    (native_fine_hga, early_fusion, no_fusion, native_perband) are mutually exclusive.
+    (native_fine_hga, early_fusion, no_fusion, r6) are mutually exclusive.
     """
     frontend = getattr(args, "frontend", "v3")
     if frontend == "v3fine":
@@ -263,7 +266,7 @@ def _frontend_config(
         # tokens). SAME 2×64 Hz caches ⇒ SAME band_rates; the decimate differs (see _nf_decimate).
         return False, False, True, False, R5NF_BAND_RATES
     if frontend == "v3r6":
-        return False, False, False, True, R6_BAND_RATES
+        return False, False, False, True, UNIFORM_BAND_RATES
     return False, False, False, False, UNIFORM_BAND_RATES
 
 
@@ -284,7 +287,7 @@ def build_v3_training(
     sessions + a stub parcel_fn (no caches, no wandb, CPU).
     """
     mae = getattr(args, "objective", "jepa") == "mae"
-    native_fine_hga, early_fusion, no_fusion, native_perband, band_rates = _frontend_config(args)
+    native_fine_hga, early_fusion, no_fusion, r6, band_rates = _frontend_config(args)
     nf_decimate = _nf_decimate(args)
     # Temporal mask block width(s) in TOKENS — the τ-anchored SSL difficulty knob (masking.py:77).
     # v3r5nf masks HGA and LFS on SEPARATE grids, so each carries its OWN width: --hga-block-w /
@@ -313,7 +316,7 @@ def build_v3_training(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
         mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
-        no_fusion=no_fusion, native_perband=native_perband, nf_decimate=nf_decimate,
+        no_fusion=no_fusion, r6=r6, nf_decimate=nf_decimate,
         mae_stream_weight=getattr(args, "mae_stream_weight", "equal"),
     )
     optim = build_v3_optim_cfg(
@@ -325,11 +328,11 @@ def build_v3_training(
         model=model, optim_config=optim, seed=args.seed,
         monitor_every_n_steps=args.monitor_every_n_steps,
     )
-    # batch_unit default: the cross-patient arms (r5 early_fusion, v3r5nf no_fusion, r6
-    # native_perband) ⇒ shaft-level batching; the older session-homogeneous path stays the default
-    # for arm0/v3/v3fine. --batch-unit overrides.
+    # batch_unit default: the cross-patient arms (r5 early_fusion, v3r5nf no_fusion, r6) ⇒
+    # shaft-level batching; the older session-homogeneous path stays the default for
+    # arm0/v3/v3fine. --batch-unit overrides. For r6 this IS delta 1 of 4 vs r4.
     batch_unit = args.batch_unit or (
-        "shaft" if (early_fusion or no_fusion or native_perband) else "session"
+        "shaft" if (early_fusion or no_fusion or r6) else "session"
     )
     dm = V3DataModule(
         sessions,
@@ -359,6 +362,7 @@ def _build_trainer(args: argparse.Namespace) -> pl.Trainer:
         SSLHealthMonitorV3(
             every_n_steps=args.monitor_every_n_steps,
             per_stream_enc12=getattr(args, "per_stream_enc12", False),
+            grad_noise_every_n_steps=getattr(args, "grad_noise_every_n_steps", 0),
         ),
     ]
     if args.wandb_project:  # LearningRateMonitor needs a logger; verifies the 5k warmup ramp
@@ -504,13 +508,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "EarlyFusionStem separated into 2 stems + 2 token streams + independent "
                         "masks/heads, MAE-only), 'v3r5nffast' (v3r5nf with the first stem conv "
                         "at stride 2 → net 4× → 16 Hz tokens; physical stride-2 RoPE + block_w=3, "
-                        "SAME caches), or 'v3r6' (NativePerBandStem: the winning r4-MAE 3-band "
-                        "|STFT| frontend — SLOW 4Hz / MID 16Hz / HGA 32Hz native, LINEAR stem, "
-                        "per-band recon heads, RAW target no norm_pix — on r5's shaft-batched "
-                        "regime with per-shaft 3-band margin-gated masks; MAE-only). 'v3fine'/"
-                        "'v3r6' REQUIRE the 3 native-rate band caches; 'v3r5'/'v3r5nf'/'v3r5nffast' "
-                        "REQUIRE exactly the 2 caches --band-cache-dir v3hga --band-cache-dir "
-                        "v3lfs (HGA first).")
+                        "SAME caches), or 'v3r6' (arm0's r4-MAE 3-band |STFT| frontend VERBATIM — "
+                        "same 3 uniform 32 Hz caches, same PerBandStem, same gather — with FOUR "
+                        "deltas: shaft-level batching, no norm_pix, no M14 margin gate "
+                        "(in_loss=masked), and per-SENSOR band time masks + a predictor band "
+                        "embed; MAE-only). 'v3r6' takes the SAME 3 caches as 'v3'/arm0; 'v3fine' "
+                        "REQUIRES the fine-HGA cache; 'v3r5'/'v3r5nf'/'v3r5nffast' REQUIRE exactly "
+                        "the 2 caches --band-cache-dir v3hga --band-cache-dir v3lfs (HGA first).")
     p.add_argument("--mae-stream-weight", dest="mae_stream_weight",
                    choices=("equal", "pooled"), default="equal",
                    help="v3r5nf MAE loss weighting (Ben 07-22): 'equal' (1:1, DEFAULT) averages "
@@ -553,6 +557,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--monitor-every-n-steps", dest="monitor_every_n_steps",
                    type=int, default=1)
+    p.add_argument("--grad-noise-every-n-steps", dest="grad_noise_every_n_steps",
+                   type=int, default=0,
+                   help="cadence for the grad_noise_scale (McCandlish B_simple critical-batch) "
+                        "monitor, on its OWN schedule (~28 ms, AdamW-moment reductions, no extra "
+                        "fwd/bwd). 0 = OFF (default). Set e.g. 25 to size batch vs critical batch: "
+                        "train_mon_grad_noise_scale is B_simple in SAMPLES — compare to tokens/step "
+                        "(≫ ⇒ below critical batch, raising batch buys ~linear step-efficiency).")
     p.add_argument("--per-stream-enc12", dest="per_stream_enc12", action="store_true",
                    help="v3r5nf diagnostic: split the enc12 tap by stream (HGA/LFS) and log each "
                         "stream's OWN rankme + feat_std. OFF by default (Ben 2026-07-22) — its 2 "

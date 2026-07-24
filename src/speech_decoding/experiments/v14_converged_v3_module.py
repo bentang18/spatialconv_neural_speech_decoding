@@ -175,8 +175,7 @@ class V14ConvergedV3Module(pl.LightningModule):
                 native_fine_hga=self.model.native_fine_hga,
                 early_fusion=self.model.early_fusion,
                 no_fusion=self.model.no_fusion,
-                native_perband=self.model.native_perband,
-            )
+            )  # r6 rides arm0's 32 Hz caches ⇒ default branch, no flag of its own
             # v3r5nf(fast): session_plan grids/masks on the TOKEN count, not the 32 Hz clock —
             # decimate 4 halves it (16 Hz tokens). Convert here so the cached plan's m_vis/
             # max_seqlen match the token grid the forward builds (byte-identical at decimate 2).

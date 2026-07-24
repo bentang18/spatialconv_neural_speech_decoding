@@ -74,7 +74,7 @@ class V3ConvergedModel(nn.Module):
         native_fine_hga: bool = False,
         early_fusion: bool = False,
         no_fusion: bool = False,
-        native_perband: bool = False,
+        r6: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
         mae_stream_weight: str = "equal",
     ) -> None:
@@ -88,19 +88,19 @@ class V3ConvergedModel(nn.Module):
         # to their r5 variants below; the objective owns the frontend + scoring swap.
         # no_fusion (v3r5nf): r5-fused's fully-separated sibling — NoFusionStem (2 stems) +
         # two-band grid + INDEPENDENT per-stream masks + accept-the-bleed scoring, MAE-only.
-        # native_perband (r6): the winning r4-MAE frontend (3 native-rate |STFT| bands,
-        # NativePerBandStem linear, per-band recon heads, RAW target no norm_pix) on r5's data
-        # regime, with PER-SHAFT 3-band margin-gated masks (sample_masks_r6). MAE-only.
+        # r6: arm0's frontend VERBATIM (same 32 Hz caches, same PerBandStem) with four deltas —
+        # shaft-batched data regime, no norm_pix, no margin gate, PER-SENSOR band masks
+        # (sample_masks_r6) + a predictor band embed. MAE-only. See V3JepaObjective.__init__.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
             mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
-            no_fusion=no_fusion, native_perband=native_perband, nf_decimate=nf_decimate,
+            no_fusion=no_fusion, r6=r6, nf_decimate=nf_decimate,
             mae_stream_weight=mae_stream_weight,
         )
         self.native_fine_hga = bool(native_fine_hga)
         self.early_fusion = bool(early_fusion)
         self.no_fusion = bool(no_fusion)
-        self.native_perband = bool(native_perband)
+        self.r6 = bool(r6)
         self.nf_decimate = int(nf_decimate)
         self.mask_cfg = mask_cfg
 
@@ -122,7 +122,6 @@ class V3ConvergedModel(nn.Module):
             native_fine_hga=self.native_fine_hga,
             early_fusion=self.early_fusion,
             no_fusion=self.no_fusion,
-            native_perband=self.native_perband,
         )
         # masking is the sole augmentation: per-shaft-balanced spatial contact drop + per-band
         # (SLOW/MID/HGA) independent temporal blocks (masking.V3Masks). The flat r4 objective
@@ -139,9 +138,9 @@ class V3ConvergedModel(nn.Module):
             masks = sample_masks_r5nf(
                 geom, N, n_time=n_tok, n_rows=B, generator=generator, cfg=self.mask_cfg
             )
-        elif self.native_perband:
-            # r6: per-shaft-INDEPENDENT, per-band (SLOW/MID/HGA) width-4 blocks on the 32 Hz
-            # reference clock T (the sampler derives each band's native length T/8, T/2, T).
+        elif self.r6:
+            # r6: per-SENSOR-INDEPENDENT, per-band (SLOW/MID/HGA) width-4 blocks on the 32 Hz
+            # clock T (the sampler derives each band's own length T/8, T/2, T).
             masks = sample_masks_r6(
                 geom, N, n_time=T, n_rows=B, generator=generator, cfg=self.mask_cfg
             )
@@ -172,9 +171,12 @@ class V3ConvergedModel(nn.Module):
 
         Computed ONCE per session (the module caches the result by ``session_key``): all the
         ``.item()`` syncs fire here, not every step. The counts are session-INVARIANT — exact
-        per-shaft spatial masking (``d_s`` fixed) + GLOBAL per-band temporal masking ⇒ every
-        clip masks ``d_s·k_full + (n_s−d_s)·T_masked`` tokens per shaft — so a single
-        representative mask (fixed seed) yields the values every clip shares."""
+        per-shaft spatial masking (``d_s`` fixed) + per-band temporal masking at an exact count
+        ⇒ every clip masks ``d_s·k_full + (n_s−d_s)·T_masked`` tokens per shaft — so a single
+        representative mask (fixed seed) yields the values every clip shares. That holds however
+        finely the temporal mask is drawn: r4 masks the same band-b frames globally, r6 draws per
+        SENSOR, but both hide exactly ``round(frac·T_b)`` band-b frames per contact, so the
+        per-shaft total is the same constant either way."""
         N = int(geom.valid.sum())
         gen = torch.Generator(device=geom.gather_idx.device).manual_seed(0)
         if self.early_fusion:  # r5 single-band grid + single-temporal-mask flags
@@ -194,7 +196,7 @@ class V3ConvergedModel(nn.Module):
                 geom, N, n_time=n_time, n_rows=1, generator=gen, cfg=self.mask_cfg
             )
             masked, _ = token_flags_r5nf(grid, masks)
-        elif self.native_perband:  # r6: r4 grid + per-shaft 3-band margin-gated mask flags
+        elif self.r6:  # r6: r4 grid + per-sensor 3-band mask flags (no margin gate)
             grid = build_r4_grid(geom, n_time=n_time)
             parcel_packed = parcel_id[grid.contact]
             masks = sample_masks_r6(

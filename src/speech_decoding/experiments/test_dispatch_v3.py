@@ -34,7 +34,6 @@ from speech_decoding.experiments.dispatch_v3 import (
 from speech_decoding.models.v14_converged_v3.dataset import (
     NATIVE_FINE_BAND_RATES,
     R5_BAND_RATES,
-    R6_BAND_RATES,
     UNIFORM_BAND_RATES,
 )
 from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
@@ -171,6 +170,7 @@ def _cpu_trainer(max_steps, ckpt_dir=None):
     )
 
 
+@pytest.mark.slow
 def test_module_resumes_model_and_step_from_checkpoint(tmp_path) -> None:
     sess = [(1, 0, _shaft_labels((8, 8, 8)))]
     band_dirs, span_dir = _write_caches(tmp_path, sess)
@@ -216,13 +216,16 @@ def test_frontend_flag_parses_and_defaults_to_v3() -> None:
 
 
 def test_frontend_config_maps_flag_to_native_flag_and_rates() -> None:
-    # (native_fine_hga, early_fusion, no_fusion, native_perband, band_rates)
+    # (native_fine_hga, early_fusion, no_fusion, r6, band_rates)
     assert _frontend_config(_smoke_args()) == (False, False, False, False, UNIFORM_BAND_RATES)
     assert _frontend_config(_smoke_args(frontend="v3")) == (False, False, False, False, UNIFORM_BAND_RATES)
     assert _frontend_config(_smoke_args(frontend="v3fine")) == (True, False, False, False, NATIVE_FINE_BAND_RATES)
     assert _frontend_config(_smoke_args(frontend="v3r5")) == (False, True, False, False, R5_BAND_RATES)
     assert _frontend_config(_smoke_args(frontend="v3r5nf")) == (False, False, True, False, R5NF_BAND_RATES)
-    assert _frontend_config(_smoke_args(frontend="v3r6")) == (False, False, False, True, R6_BAND_RATES)
+    # v3r6 reads the SAME 32 Hz caches as arm0 — UNIFORM rates, not R6_BAND_RATES. The old
+    # ((1,8),(1,2),(1,1)) declared a native 4/16/32 Hz bake that was never made and made the
+    # loader hand back time-MISALIGNED compressed slices (2026-07-23 forensics).
+    assert _frontend_config(_smoke_args(frontend="v3r6")) == (False, False, False, True, UNIFORM_BAND_RATES)
 
 
 def test_v3fine_threads_native_into_model_and_dataset(tmp_path) -> None:
@@ -340,38 +343,43 @@ def test_v3r5nf_threads_no_fusion_and_stream_weight_then_fits(tmp_path) -> None:
     assert m_pooled.model.objective.mae_stream_weight == "pooled"
 
 
-def test_v3r6_threads_native_perband_and_shaft_batching(tmp_path) -> None:
-    # v3r6 = the winning r4-MAE 3-band |STFT| frontend on r5's shaft-batched regime. It reads the
-    # SAME 3 native-rate band caches (SLOW 4Hz / MID 16Hz / HGA 32Hz, F=7/6/7) as arm0/v3fine but
-    # must reach the NativePerBandStem (model.native_perband), the per-shaft 3-band masks, and
-    # default to shaft (cross-patient) batching. R6_BAND_RATES = ((1,8),(1,2),(1,1)).
+def test_v3r6_reads_arm0_caches_and_shaft_batches(tmp_path) -> None:
+    # v3r6 = arm0's r4-MAE 3-band |STFT| frontend VERBATIM (same 32 Hz caches, same PerBandStem)
+    # on the shaft-batched regime. THE regression this pins: band_rates must be UNIFORM. The old
+    # R6_BAND_RATES ((1,8),(1,2),(1,1)) asserted a native 4/16/32 Hz bake that was never made, and
+    # dataset.py's index rescale then returned compressed, time-MISALIGNED slices per band.
     from speech_decoding.models.v14_converged_v3.shaft_dataset import ShaftPackDataset
-    from speech_decoding.models.v14_converged_v3.stem import NativePerBandStem
+    from speech_decoding.models.v14_converged_v3.stem import PerBandStem
 
     sess = [(1, 0, _shaft_labels((8, 8, 8)))]
     band_dirs, span_dir = _write_caches(tmp_path, sess)
     specs = load_v3_sessions(
         sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
-        parcel_fn=_stub_parcel_fn, band_rates=R6_BAND_RATES,
+        parcel_fn=_stub_parcel_fn,
     )
     m, dm, _ = build_v3_training(
         specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
     )
-    assert m.model.native_perband is True
-    assert m.model.objective.native_perband is True
-    assert isinstance(m.model.objective.online.stem, NativePerBandStem)
+    assert m.model.r6 is True
+    assert m.model.objective.r6 is True
+    assert type(m.model.objective.online.stem) is PerBandStem  # arm0's stem, not a variant
     assert m.model.no_fusion is False and m.model.early_fusion is False
     assert m.model.native_fine_hga is False
-    assert dm.batch_unit == "shaft"  # native_perband ⇒ shaft is the default batch unit
+    assert dm.batch_unit == "shaft"  # r6 ⇒ shaft is the default batch unit
     assert isinstance(dm.dataset, ShaftPackDataset)
-    assert dm.dataset.band_rates == R6_BAND_RATES
-    assert dm.dataset.start_align == 8  # lcm(8,2,1)
+    assert dm.dataset.band_rates == UNIFORM_BAND_RATES  # THE bug-fix assertion
+    assert dm.dataset.start_align == 1  # uniform rates ⇒ no start alignment constraint
 
     # r6 is MAE-only — the JEPA objective must be rejected before any run starts.
     with pytest.raises(ValueError, match="MAE-only"):
         build_v3_training(
             specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="jepa")
         )
+
+    # No margin gate: it is unconditionally off for r6 (no flag). Ben 07-23: "No ML SSL does a
+    # margin gate for masked tokens — score ALL masked tokens."
+    assert not hasattr(m.model, "r6_margin_gate")
+    assert m.model.objective.pred_band_emb is not None  # predictor band identity, r6-only
 
     _cpu_trainer(2).fit(m, datamodule=dm)  # runs; no shape/plan-cache error
 
@@ -453,6 +461,7 @@ def test_clips_per_session_default_is_the_long_epoch() -> None:
         base + ["--clips-per-session", "32"]).clips_per_session == 32
 
 
+@pytest.mark.slow
 def test_resume_survives_a_changed_clips_per_session(tmp_path) -> None:
     """The r4 resume + arms raise --clips-per-session 40000 while r4 (and r4b) ran the
     default 2000, so the ckpt is restored into a datamodule whose EPOCH LENGTH differs
