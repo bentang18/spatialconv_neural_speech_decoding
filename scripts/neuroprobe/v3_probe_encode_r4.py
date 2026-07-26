@@ -173,9 +173,15 @@ def _lite_keep_labels_fn(bt_root):
     return fn
 
 
-def _window_bands(spec, starts, clip_frames, rate_mult: int = 1, band_rates=None):
+def _window_bands(spec, starts, clip_frames, rate_mult: int = 1, band_rates=None,
+                  normalize: bool = True):
     """Slice + robust-z every union window from the continuous spec caches. Returns one tensor
     per band, each (n_windows, N, F_band, T_b).
+
+    ``normalize=False`` returns the RAW (un-robust-z'd, un-winsored) |STFT| windows instead —
+    the enc0 log-vs-abs gate needs the raw bins so it can apply ``log(x+eps)`` BEFORE a robust-z
+    REFIT (frozen abs-stats are invalid for logged values: median commutes with log but MAD does
+    not). Default True keeps the tap/production path byte-identical.
 
     ``rate_mult`` = cache frames per 32 Hz reference frame: 1 for the r4 uniform-32 Hz caches,
     2 for the r5 native-64 Hz caches (R5_BAND_RATES=((2,1),(2,1))) whose EarlyFusionStem
@@ -219,7 +225,8 @@ def _window_bands(spec, starts, clip_frames, rate_mult: int = 1, band_rates=None
                     f"{spec.session_key}: band rate {num}/{den} {len(oob)} windows out of bounds "
                     f"(n_native={n_native}, first bad start={float(starts[oob[0]]):.4f}s)")
             clips = np.stack([full[:, :, a:b] for a, b in zip(lo.tolist(), hi.tolist())], axis=0)
-            bands.append(norm.transform(torch.from_numpy(clips)))  # (n, N, F_b, T_b) vectorized
+            t = torch.from_numpy(clips)
+            bands.append(norm.transform(t) if normalize else t)   # (n, N, F_b, T_b) vectorized
         return bands
     # uniform-rate path (r4 rate_mult=1, r5 rate_mult=2) — spec.n_frames is the 32 Hz reference
     # count; the r5 caches carry rate_mult× that many native frames.
@@ -238,8 +245,32 @@ def _window_bands(spec, starts, clip_frames, rate_mult: int = 1, band_rates=None
         full = np.asarray(mm[keep], dtype=np.float32)              # (N, F, T_total) bulk → RAM
         del mm
         clips = np.stack([full[:, :, a:b] for a, b in zip(t0.tolist(), end.tolist())], axis=0)
-        bands.append(norm.transform(torch.from_numpy(clips)))     # (n, N, F_b, T32) vectorized
+        t = torch.from_numpy(clips)
+        bands.append(norm.transform(t) if normalize else t)       # (n, N, F_b, T32) vectorized
     return bands                                                  # 3 × (n, N, F_b, T32)
+
+
+def _robustz_refit(band, winsor, sigma_floor: float = 1e-6):
+    """Per-(electrode, freq-bin) robust-z REFIT over a band's windows, then winsor clamp.
+
+    band: (n_win, N, F, T). Stats (median, 1.4826*MAD) are computed per (N, F) over the flattened
+    (n_win * T) frame axis — the windowed analogue of SessionRobustZNormalizer's per-session-time
+    fit. Byte-mirrors ``extractors/normalize.robust_z`` (sigma-floor + constant-bin zeroing), then
+    applies the read-time winsor clamp. Used ONLY by the enc0 log-vs-abs gate so both cells share
+    identical robust-z machinery and differ solely by the pre-log; the abs cell is cross-checked
+    against the frozen-stats enc0 at the CS level to confirm the window-support refit is sound."""
+    n, N, F, T = band.shape
+    flat = band.permute(1, 2, 0, 3).reshape(N, F, n * T)          # (N, F, n*T)
+    median = flat.median(dim=-1, keepdim=True).values
+    centered = flat - median
+    mad = centered.abs().median(dim=-1, keepdim=True).values
+    sigma = 1.4826 * mad
+    z = centered / sigma.clamp(min=sigma_floor)
+    z = torch.where(sigma >= sigma_floor, z, torch.zeros_like(z))  # constant bins -> 0
+    z = z.reshape(N, F, n, T).permute(2, 0, 1, 3).contiguous()    # back to (n, N, F, T)
+    if winsor is not None:
+        z = z.clamp(-float(winsor), float(winsor))
+    return z
 
 
 def _canon_parcels(grid, parcel_id):
@@ -270,27 +301,51 @@ def _pool_parcels(x, parcel_canon, present):
     return torch.stack(blocks, dim=1).to(torch.float16)           # (B, |P|, F)
 
 
-def _enc0_pooled(bands, canon, parcel_canon, present, strides=None):
-    """enc0 input floor: per band decimate ``x[..., ::stride]`` (the model's own input frames),
-    reorder to canonical contacts, pool to parcels, concat bands → (n_win, |P|, F0).
-
-    ``strides`` defaults to r4's ``BAND_STRIDES`` (8,2,1) on the 32 Hz clock. The 2-stream
-    frontends pass their own: both r5/nf streams are cached at 64 Hz and their stem decimates
-    64→32 by ``NOFUSION_DECIMATE`` (2; 4 for nffast), so ``(dec, dec)`` is the exact parity of
-    r4's per-band strides — the raw bins each stem's first layer consumes."""
+def _enc0_strides(bands, strides):
+    """Resolve/validate the per-band decimation strides shared by enc0's pooled + elec paths."""
     from speech_decoding.models.v14_converged_v3.pack_r4 import BAND_STRIDES
 
     if strides is None:
         strides = BAND_STRIDES
     if len(strides) != len(bands):
         raise ValueError(f"enc0 got {len(bands)} bands but {len(strides)} strides")
-    per_band = []
+    return strides
+
+
+def _enc0_bands_canon(bands, canon, strides):
+    """Per band: decimate ``x[..., ::stride]`` (the model's own input frames), reorder to
+    canonical contacts, time-major. Yields (n_win, n_canon, T_b, F_b) tensors, one per band —
+    the shared prefix of enc0's pooled and unpooled (elec) paths."""
     for x, st in zip(bands, strides):                             # x (n, N, F_b, T_clock)
         xd = x[..., ::st]                                         # (n, N, F_b, T_b) decimated
         xd = xd.transpose(-1, -2).contiguous()                   # (n, N, T_b, F_b) time-major
-        xd = xd[:, canon]                                        # (n, n_canon, T_b, F_b)
-        per_band.append(_pool_parcels(xd, parcel_canon, present))  # (n, |P|, T_b·2F_b)
+        yield xd[:, canon]                                       # (n, n_canon, T_b, F_b)
+
+
+def _enc0_pooled(bands, canon, parcel_canon, present, strides=None):
+    """enc0 input floor: per band decimate, reorder to canonical contacts, pool to parcels,
+    concat bands → (n_win, |P|, F0).
+
+    ``strides`` defaults to r4's ``BAND_STRIDES`` (8,2,1) on the 32 Hz clock. The 2-stream
+    frontends pass their own: both r5/nf streams are cached at 64 Hz and their stem decimates
+    64→32 by ``NOFUSION_DECIMATE`` (2; 4 for nffast), so ``(dec, dec)`` is the exact parity of
+    r4's per-band strides — the raw bins each stem's first layer consumes."""
+    strides = _enc0_strides(bands, strides)
+    per_band = [_pool_parcels(xd, parcel_canon, present)
+                for xd in _enc0_bands_canon(bands, canon, strides)]
     return torch.cat(per_band, dim=-1)                            # (n, |P|, F0)
+
+
+def _enc0_elec(bands, canon, strides=None):
+    """Unpooled enc0: same canonical-contact axis and band-concat order as ``_enc0_pooled``'s
+    pre-pool input — the depth-0 sibling of ``_encode_taps``' ``enc{t}_elec`` (GPU taps
+    3/6/12), which stores the equivalent unpooled tensor for those taps."""
+    strides = _enc0_strides(bands, strides)
+    per_band = []
+    for xd in _enc0_bands_canon(bands, canon, strides):
+        B = xd.shape[0]
+        per_band.append(xd.reshape(B, xd.shape[1], -1).to(torch.float16))
+    return torch.cat(per_band, dim=-1)                            # (n, n_canon, F0)
 
 
 @torch.no_grad()
@@ -362,6 +417,17 @@ def main() -> None:
                    help="compute ONLY the enc0 input floor (raw decimated band bins pooled to "
                         "parcels). No ckpt, no model, no GPU — enc0 never touched weights. Lets "
                         "the 2-stream frontends get an enc0 at parity with r4's (Ben 2026-07-23).")
+    p.add_argument("--enc0-log", action="store_true",
+                   help="enc0 log-vs-abs gate (implies --enc0-only). Writes TWO enc0 taps from the "
+                        "same raw |STFT| windows with an identical robust-z REFIT: 'enc0' = "
+                        "refit(abs), 'enc0_log' = refit(log(abs+1e-7)) — the ASR log-magnitude "
+                        "preprocessing (view's own apply_log=True path, log_eps 1e-7). Both refit "
+                        "over the clip windows so the ONLY difference is the pre-log; 'enc0' is "
+                        "cross-checked at the CS level against the frozen-stats enc0 to confirm the "
+                        "window-support refit is sound. mimics-asr scope-and-contract 2026-07-24.")
+    p.add_argument("--enc0-log-eps", type=float, default=1e-7,
+                   help="epsilon in log(|STFT|+eps) for --enc0-log; 1e-7 = the view's own log_eps "
+                        "so this is byte-faithful to what apply_log=True would bake.")
     p.add_argument("--enc0-stride", type=int, default=None,
                    help="override the enc0 decimation applied to EVERY band (2-stream only). "
                         "Default = the frontend's own stem decimate (2 for v3r5/v3r5nf, 4 for "
@@ -372,9 +438,11 @@ def main() -> None:
                         "Required for the MAE arm (no teacher). Use it on a JEPA ckpt too for an "
                         "online-vs-online parity match.")
     p.add_argument("--elec-taps", default="",
-                   help="comma-separated GPU taps to ALSO write per-electrode (unpooled), e.g. "
-                        "'12' -> feats['enc12_elec']. WS keeps all electrodes by default (Ben "
-                        "2026-07-16); each costs ~N/|P| (~5x) the pooled tap on disk.")
+                   help="comma-separated taps to ALSO write per-electrode (unpooled), e.g. "
+                        "'0,12' -> feats['enc0_elec'], feats['enc12_elec']. 0 = the |STFT| "
+                        "frontend (enc0); 3/6/12 route through the teacher forward (GPU_TAPS). "
+                        "WS keeps all electrodes by default (Ben 2026-07-16); each costs "
+                        "~N/|P| (~5x) the pooled tap on disk.")
     args = p.parse_args()
 
     from speech_decoding.experiments.pretrain_probe_suite import PROBE_COHORT_7
@@ -418,9 +486,16 @@ def main() -> None:
     tasks = BOARD_TASKS if args.tasks == "board15" else PROBE_TASKS
     keep_labels_fn = _lite_keep_labels_fn(args.bt_root) if args.electrode_set == "lite" else None
     elec_taps = tuple(int(t) for t in args.elec_taps.split(",") if t.strip())
-    bad = [t for t in elec_taps if t not in GPU_TAPS]
+    bad = [t for t in elec_taps if t not in (0,) + GPU_TAPS]
     if bad:
-        raise SystemExit(f"--elec-taps {bad} not in GPU_TAPS {GPU_TAPS}")
+        raise SystemExit(f"--elec-taps {bad} not in {(0,) + GPU_TAPS} (0 = enc0_elec, off the "
+                          f"|STFT| frontend directly; the rest route through GPU_TAPS {GPU_TAPS})")
+    # tap 0 never goes through the teacher forward (_encode_taps/GPU_TAPS) — it's the frontend
+    # input, handled by _enc0_elec below instead of _encode_taps' elec_taps loop.
+    gpu_elec_taps = tuple(t for t in elec_taps if t != 0)
+    want_enc0_elec = 0 in elec_taps
+    if args.enc0_log:
+        args.enc0_only = True  # the gate never touches weights: pure function of the cached bands
     # enc0 on a 2-stream frontend is opt-in: --enc0-only, or an explicit --enc0-stride.
     enc0_two_stream = args.enc0_only or args.enc0_stride is not None
     enc0_stride = args.enc0_stride
@@ -495,20 +570,49 @@ def main() -> None:
         # r6 takes NO branch here: it reads r4's uniform 32 Hz caches, so r4's default BAND_STRIDES
         # IS its enc0 floor. (The deleted r6 branch forced (1,1,1) on the never-baked native rates —
         # part of the R6_BAND_RATES bug, 2026-07-23.)
-        if is_two_stream and not enc0_two_stream:
+        if args.enc0_log:
+            # enc0 log-vs-abs gate (CPU-only, r6 3-band). Reload the RAW |STFT| windows
+            # (normalize=False) so the ONLY difference between the two taps is the pre-log:
+            #   enc0     = robustz(|STFT|)                    (ASR: magnitude)
+            #   enc0_log = robustz(log(|STFT| + eps))         (ASR: log-magnitude)
+            # Both REFIT sigma over these same clip windows because frozen abs-stats are invalid
+            # for log (median commutes with log, MAD does not), and both share the r6 read-time
+            # winsor (15,15,20 for SLOW/MID/HGA) so winsorization is not a confound. The abs cell
+            # is cross-checked against the frozen-stats enc0 below to prove the refit ≈ frozen path.
+            raw = _window_bands(spec, targets.clip_starts, clip_frames,
+                                rate_mult=2 if is_two_stream else 1, normalize=False)
+            st = (enc0_stride,) * len(raw) if enc0_stride is not None else None
+            winsor_by_band = (15.0, 15.0, 20.0)
+            abs_bands = [_robustz_refit(b, winsor_by_band[i]) for i, b in enumerate(raw)]
+            log_bands = [_robustz_refit(torch.log(b + args.enc0_log_eps), winsor_by_band[i])
+                         for i, b in enumerate(raw)]
+            feats = {
+                "enc0": {"raw": _enc0_pooled(abs_bands, canon, parcel_canon, present, st)},
+                "enc0_log": {"raw": _enc0_pooled(log_bands, canon, parcel_canon, present, st)},
+            }
+            # Cross-check: frozen-stats enc0 (from the normalized `bands`) vs the refit-abs enc0.
+            frozen0 = _enc0_pooled(bands, canon, parcel_canon, present, st)
+            refit0 = feats["enc0"]["raw"]
+            d = float((frozen0 - refit0).abs().max())
+            rel = d / (float(frozen0.abs().max()) + 1e-9)
+            print(f"[enc0-log check] {session}: frozen-abs vs refit-abs max|Δ|={d:.4g} "
+                  f"rel={rel:.4g} -> {'OK' if rel < 5e-2 else 'DIVERGENT'}", flush=True)
+        elif is_two_stream and not enc0_two_stream:
             feats = {}  # legacy: 2-stream enc0 off unless asked for
         else:
             st = (enc0_stride,) * len(bands) if enc0_stride is not None else None
             feats = {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present, st)}}
+            if want_enc0_elec:
+                feats["enc0_elec"] = {"raw": _enc0_elec(bands, canon, st)}
         if args.enc0_only:
             tap_pooled = {}
         else:
             tap_pooled = _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon,
                                       present, device=device, batch_size=args.batch_size,
-                                      elec_taps=elec_taps)
+                                      elec_taps=gpu_elec_taps)
             for t in GPU_TAPS:
                 feats[f"enc{t}"] = tap_pooled[t]
-            for t in elec_taps:
+            for t in gpu_elec_taps:
                 feats[f"enc{t}_elec"] = tap_pooled[f"elec{t}"]
 
         payload = {

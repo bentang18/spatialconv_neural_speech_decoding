@@ -17,10 +17,18 @@
 # its own process on its own node, so this cannot touch the running pretrains' session_loader.
 #
 # Cache = v14_3band_v3_spec_lite (the 12 Lite sessions), same band_hop=64 uid as pretrain.
-# --elec-taps 0,12 writes BOTH enc0_elec AND enc12_elec (per-electrode) on top of the always-
-# written parcel-mean enc0/3/6/12. The board readout consumes: WS/CSession -> enc0_elec/enc12_elec
-# (electrode-level), CSubject -> enc0/3/6/12 parcel-mean. --mem=300G: each elec tap is ~40 GB/
-# session (d=256) and torch.cat doubles it transiently, but sessions are encoded one at a time.
+# --elec-taps 0,12 writes enc0_elec (per-electrode |STFT| frontend) + enc12_elec (per-electrode
+# depth-12), on top of the always-written parcel-mean enc0/3/6/12. Tap 0 does NOT route through
+# GPU_TAPS=(3,6,12)/the teacher forward -- v3_probe_encode_r4.py's _enc0_elec computes it directly
+# off the frontend bands (same canonical-contact axis as enc12_elec, verified by re-pooling to
+# parcels and diffing against enc0's parcel-mean). Fixes the e74fb27 regression that dropped the
+# enc0 depth-0 floor from board WS/CSession by naming a tap the encoder could not yet produce --
+# see project-board-ws-lost-enc0-floor-e74fb27-2026-07-26 memo. Board readout's
+# WS_TAPS/CSESSION_TAPS = ELEC_TAPS = ("enc0_elec","enc12_elec") already expected this; no readout
+# change needed. CSubject consumes enc0/3/6/12 parcel-mean, unaffected either way.
+# --mem=300G: elec taps are ~40 GB/session (d=256) and torch.cat doubles it transiently, but
+# sessions are encoded ONE AT A TIME in this single job (not sharded -- board encode is a GPU
+# forward pass on dtai; only READOUT shards on Delta CPU, see probe_ckpt_r6.sh workflow doc).
 set -euo pipefail
 CKPT="${1:?usage: sbatch v3_board_encode_r6.sbatch <CKPT> <TAG> <OUTDIR>}"
 TAG="${2:?need TAG}"
