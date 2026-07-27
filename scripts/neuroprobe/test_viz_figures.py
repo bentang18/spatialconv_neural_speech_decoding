@@ -9,7 +9,9 @@ from __future__ import annotations
 import numpy as np
 
 from scripts.neuroprobe.viz_common import load_all
-from scripts.neuroprobe.viz_figures import _corr, figure_a, figure_b, quantify
+from scripts.neuroprobe.viz_figures import (
+    CONTRAST, _corr, figure_a, figure_b, identity_content, quantify,
+)
 
 TASK = "onset"
 BL = (4, 16, 32)
@@ -18,7 +20,8 @@ TEMPORAL = 30      # ctx-lh-superiortemporal -> temporal
 FRONTAL = 22       # a frontal DKT id
 
 
-def _write(dirpath, subject_id, trial_id, payload_by_parcel, *, halves=None, tap="enc12"):
+def _write(dirpath, subject_id, trial_id, payload_by_parcel, *, halves=None, tap="enc12",
+           offset=None):
     """payload_by_parcel: {parcel_id: (counts, (T, C) array)}."""
     parcels = sorted(payload_by_parcel)
     counts = np.array([payload_by_parcel[p][0] for p in parcels], dtype=np.int64)
@@ -32,15 +35,73 @@ def _write(dirpath, subject_id, trial_id, payload_by_parcel, *, halves=None, tap
         f"{tap}/col_sq": np.ones((len(parcels), T * C), dtype=np.float32),
     }
     for cls in (0, 1):
-        sign = 1.0 if cls == 1 else -1.0
-        out[f"{tap}/{TASK}/c{cls}/all"] = (sign * grand).astype(np.float32)
+        # NOT -1.0: an exact negation makes every session mean identically zero, which
+        # would erase the between-session variance the identity split is meant to find.
+        sign = 1.0 if cls == 1 else -0.5
+        # identity offset is added AFTER the class sign: a session constant that does not
+        # flip with condition, which is what "identity" means here.
+        off = 0.0 if offset is None else offset
+        out[f"{tap}/{TASK}/c{cls}/all"] = (sign * grand + off).astype(np.float32)
         h = halves if halves is not None else (grand, grand)
-        out[f"{tap}/{TASK}/c{cls}/h0"] = (sign * h[0]).astype(np.float32)
-        out[f"{tap}/{TASK}/c{cls}/h1"] = (sign * h[1]).astype(np.float32)
+        out[f"{tap}/{TASK}/c{cls}/h0"] = (sign * h[0] + off).astype(np.float32)
+        out[f"{tap}/{TASK}/c{cls}/h1"] = (sign * h[1] + off).astype(np.float32)
         for name in ("all", "h0", "h1"):
             out[f"n/{TASK}/c{cls}/{name}"] = np.int64(50)
         out[f"count/{TASK}/c{cls}"] = np.int64(50)
     np.savez_compressed(str(dirpath / f"red_s{subject_id}_t{trial_id}_hga.npz"), **out)
+
+
+def _write_classes(dirpath, subject_id, trial_id, parcel, counts, per_class, *, tap="enc12"):
+    """Write one session with EXPLICIT per-class (T, C) means. halves == the class mean."""
+    out = {
+        "subject_id": np.int64(subject_id), "trial_id": np.int64(trial_id),
+        "present_parcels": np.asarray([parcel], dtype=np.int64),
+        "parcel_counts": np.asarray([counts], dtype=np.int64),
+        "band_lengths": np.asarray(BL, dtype=np.int64), "n_windows": np.int64(100),
+        f"{tap}/shape": np.asarray([1, T, C], dtype=np.int64),
+        f"{tap}/col_sum": np.zeros((1, T * C), dtype=np.float32),
+        f"{tap}/col_sq": np.ones((1, T * C), dtype=np.float32),
+    }
+    for cls in (0, 1):
+        m = per_class[cls][None].astype(np.float32)          # (1, T, C)
+        for name in ("all", "h0", "h1"):
+            out[f"{tap}/{TASK}/c{cls}/{name}"] = m
+            out[f"n/{TASK}/c{cls}/{name}"] = np.int64(50)
+        out[f"count/{TASK}/c{cls}"] = np.int64(50)
+    np.savez_compressed(str(dirpath / f"red_s{subject_id}_t{trial_id}_hga.npz"), **out)
+
+
+def test_contrast_ignores_a_shared_condition_independent_profile(tmp_path) -> None:
+    """The bug this metric exists to catch.
+
+    A huge response profile shared across subjects but IDENTICAL for both classes carries
+    single-class correlations to ~1 for every task, decodable or not. The class contrast
+    must see through it: here the class difference is independent per subject, so the
+    honest answer is ~0.
+    """
+    shared_profile = 20.0 * _pattern(0)
+    rng = np.random.default_rng(3)
+    for s in (1, 2, 3, 4, 7, 10):
+        diff = rng.normal(size=(T, C))                       # subject-specific, unshared
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10,
+                       {0: shared_profile - 0.5 * diff, 1: shared_profile + 0.5 * diff})
+    sessions = load_all(str(tmp_path))
+    single = quantify(sessions, ["temporal"], "enc12", TASK, 1)
+    diff_q = quantify(sessions, ["temporal"], "enc12", TASK, CONTRAST)
+    assert single["cross_subject_r"] > 0.9, "fixture must reproduce the inflated single-class r"
+    assert abs(diff_q["cross_subject_r"]) < 0.35, diff_q["cross_subject_r"]
+
+
+def test_contrast_recovers_a_genuinely_shared_class_difference(tmp_path) -> None:
+    shared_profile = 20.0 * _pattern(0)
+    shared_diff = _pattern(1)
+    for s in (1, 2, 3, 4):
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10,
+                       {0: shared_profile - 0.5 * shared_diff,
+                        1: shared_profile + 0.5 * shared_diff})
+    sessions = load_all(str(tmp_path))
+    q = quantify(sessions, ["temporal"], "enc12", TASK, CONTRAST)
+    assert q["cross_subject_r"] > 0.999, q["cross_subject_r"]
 
 
 def _pattern(seed):
@@ -80,6 +141,7 @@ def test_a_noisy_ceiling_normalizes_the_cross_subject_score_upward(tmp_path) -> 
     sessions = load_all(str(tmp_path))
     q = quantify(sessions, ["temporal"], "enc12", TASK, 1)
     assert 0.0 < q["split_half_ceiling_r"] < 1.0
+    assert q["ceiling_usable"]
     assert q["normalized"] > q["cross_subject_r"], "normalizing by a <1 ceiling must raise r"
 
 
@@ -111,3 +173,49 @@ def test_corr_is_scale_and_offset_invariant() -> None:
     x = np.random.default_rng(1).normal(size=64)
     assert _corr(x, 3 * x + 7) > 0.999
     assert _corr(x, -x) < -0.999
+
+
+def test_identity_content_finds_a_planted_identity_offset(tmp_path) -> None:
+    """Shared content plus a big per-subject offset: identity must dominate the variance,
+    and removing it must RAISE cross-subject alignment rather than destroy it."""
+    shared = _pattern(0)
+    rng = np.random.default_rng(7)
+    for s in (1, 2, 3, 4):
+        offset = 20.0 * rng.normal(size=(1, C))       # constant per subject, huge
+        _write(tmp_path, s, 0, {TEMPORAL: (10, shared)}, offset=offset)
+    sessions = load_all(str(tmp_path))
+    ic = identity_content(sessions, ["temporal"], "enc12", TASK)
+    assert ic["identity_var_frac"] > 0.8, ic["identity_var_frac"]
+    assert ic["cross_subject_r_identity_removed"] >= ic["cross_subject_r"] - 1e-6
+
+
+def test_identity_content_reports_a_small_identity_share_when_there_is_none(tmp_path) -> None:
+    shared = _pattern(0)
+    for s in (1, 2, 3, 4):
+        _write(tmp_path, s, 0, {TEMPORAL: (10, shared)})   # identical, no offsets
+    sessions = load_all(str(tmp_path))
+    ic = identity_content(sessions, ["temporal"], "enc12", TASK)
+    assert ic["identity_var_frac"] < 0.02, ic["identity_var_frac"]
+    assert ic["identity_rank"] == 0, "no session offsets -> no identity directions"
+    # the two shares are a decomposition, so they must add to one
+    assert abs(ic["identity_var_frac"] + ic["within_session_var_frac"] - 1.0) < 1e-6
+
+
+def test_a_degenerate_ceiling_suppresses_the_normalized_score(tmp_path) -> None:
+    """No within-subject reliability -> no denominator. Must be nan, not a big number."""
+    rng = np.random.default_rng(11)
+    for s in (1, 2, 3, 4):
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10,
+                       {0: rng.normal(size=(T, C)), 1: rng.normal(size=(T, C))})
+        # overwrite the halves with independent noise: the subject disagrees with itself
+        f = tmp_path / f"red_s{s}_t0_hga.npz"
+        d = dict(np.load(f))
+        for cls in (0, 1):
+            for name in ("h0", "h1"):
+                d[f"enc12/{TASK}/c{cls}/{name}"] = rng.normal(size=(1, T, C)).astype(np.float32)
+        np.savez_compressed(str(f), **d)
+    sessions = load_all(str(tmp_path))
+    q = quantify(sessions, ["temporal"], "enc12", TASK, CONTRAST)
+    assert abs(q["split_half_ceiling_r"]) < 0.5
+    assert not q["ceiling_usable"]
+    assert np.isnan(q["normalized"])

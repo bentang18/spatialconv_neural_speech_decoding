@@ -89,9 +89,11 @@ def reduce_session(path: str, *, taps, tasks, band: str, chunk: int, verbose: bo
     band_lengths = tuple(int(x) for x in rec["band_lengths"])
     band_fdims = rec.get("band_fdims")
     if band_fdims is None and band_fdims_override is not None:
-        # Records written before band_fdims existed. Safe only because _band_slice asserts
-        # sum_b T_b*F_b against the stored enc0 width, so a wrong override raises instead of
-        # silently slicing the wrong columns.
+        # Records written before band_fdims existed. The width check in _band_slice is
+        # necessary but NOT sufficient: sum_b T_b*F_b does not determine F_b uniquely --
+        # (7,6,7) and (3,5,8) both total 348 at the 1 s window and 696 at 2 s. So only ever
+        # pass a value READ off a record the same frontend wrote, never one back-solved from
+        # the width.
         band_fdims = tuple(int(f) for f in band_fdims_override)
     n = int(rec["n_windows"])
     subj, trial = int(rec["subject_id"]), int(rec["trial_id"])
@@ -188,9 +190,10 @@ def main() -> None:
     ap.add_argument("--band", default="hga", choices=BANDS)
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--band-fdims", default=None,
-                    help="per-band frequency bins for records written before band_fdims was "
-                         "stored (the v3 3-band frontend is 3,5,8). Checked against the enc0 "
-                         "width, so a wrong value raises rather than mis-slicing.")
+                    help="per-band frequency bins for records written before band_fdims "
+                         "was stored. The v3 3-band frontend is 7,6,7 -- READ off a record "
+                         "the same frontend wrote. Do NOT back-solve it from the enc0 "
+                         "width: that total has more than one decomposition.")
     args = ap.parse_args()
     fdims = tuple(int(x) for x in args.band_fdims.split(",")) if args.band_fdims else None
 

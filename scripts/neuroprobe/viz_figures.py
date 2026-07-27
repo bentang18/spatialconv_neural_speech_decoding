@@ -1,9 +1,12 @@
 """Cross-subject encoder figures from the reduced condition means.
 
 Figure A  trajectory of the trial-averaged response through a SHARED 3-PC space, one line
-          per session. Two panels on purpose: without per-session centering (identity is
-          the dominant structure and subjects sit apart) and with it (do they MOVE the same
-          way). Those are different questions and the honest answer needs both.
+          per session. Three panels on purpose: without per-session centering (identity is
+          the dominant structure and subjects sit apart), with it (do they MOVE the same
+          way), and the class contrast (the content that distinguishes the labels).
+
+Figure T  the same contrast trajectory, one panel per task in ONE shared basis. Within a
+          decodable task subjects trace the same path; across tasks the paths differ.
 
 Figure B  the DINOv3 panel. Tokens are (region x time), PCA runs over the CHANNEL axis, the
           first 3 components are painted as RGB. Panels are NOT row-matched across subjects
@@ -39,6 +42,12 @@ from scripts.neuroprobe.viz_common import (  # noqa: E402
 SUBJ_COLORS = {1: "#e6194b", 2: "#3cb44b", 3: "#4363d8",
                4: "#f58231", 7: "#911eb4", 10: "#008080"}
 
+# Sentinel class id meaning "class 1 minus class 0".
+CONTRAST = "contrast"
+
+# Below this split-half reliability the ceiling-normalized score is reported as nan.
+CEILING_FLOOR = 0.10
+
 
 def _flat(m: np.ndarray) -> np.ndarray:
     return m.reshape(-1)
@@ -51,11 +60,28 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(a @ b / d) if d > 0 else np.nan
 
 
-def collect(sessions, tap: str, task: str, cls: int, half: str, lobes, *, centered: bool):
-    """(session, matrix) pairs for one condition, optionally identity-centered."""
+def _cond_matrix(sess, tap: str, task: str, cls, half: str, lobes):
+    """One session's (lobes, T, C) for a class, or for the class-1 minus class-0 contrast."""
+    if cls != CONTRAST:
+        return session_matrix(sess, tap, task, cls, half, lobes)
+    m1 = session_matrix(sess, tap, task, 1, half, lobes)
+    m0 = session_matrix(sess, tap, task, 0, half, lobes)
+    return None if (m1 is None or m0 is None) else m1 - m0
+
+
+def collect(sessions, tap: str, task: str, cls, half: str, lobes, *, centered: bool):
+    """(session, matrix) pairs for one condition, optionally identity-centered.
+
+    cls=CONTRAST returns the class-1 minus class-0 difference. That is the quantity the
+    figures should be scoring: a single condition mean is dominated by a large
+    condition-INDEPENDENT response profile (the average evoked HGA shape), which is shared
+    across subjects for every task and drives cross-subject r to ~0.95 whether or not the
+    task is decodable at all. Only the contrast isolates what distinguishes the classes,
+    which is also what the ridge actually reads.
+    """
     out = []
     for s in sessions:
-        m = session_matrix(s, tap, task, cls, half, lobes)
+        m = _cond_matrix(s, tap, task, cls, half, lobes)
         if m is not None:
             out.append((s, m))
     if centered and out:
@@ -64,21 +90,49 @@ def collect(sessions, tap: str, task: str, cls: int, half: str, lobes, *, center
     return out
 
 
+def _traj(m: np.ndarray, comps: np.ndarray, mu: np.ndarray) -> np.ndarray:
+    """(lobes, T, C) -> (T, 3): project to the shared basis, then average over lobes."""
+    p = (m.reshape(-1, m.shape[-1]) - mu) @ comps.T
+    return p.reshape(m.shape[0], m.shape[1], 3).mean(axis=0)
+
+
 def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
-    """3-D trajectory in a shared PC space, uncentered vs identity-centered."""
-    fig = plt.figure(figsize=(13, 6))
+    """3-D trajectory in a shared PC space: raw, identity-centered, and the class contrast.
+
+    Three panels because they answer three different questions, and only the third is about
+    content. Panels 1-2 plot condition means, which are dominated by a large
+    condition-INDEPENDENT response profile: the two classes trace nearly the same path
+    whether or not the task is decodable. Panel 3 plots class1 - class0, which is the part
+    that distinguishes the labels and the part a cross-subject decoder can actually use.
+    """
+    fig = plt.figure(figsize=(19, 6))
     info = {}
+    pairs_c = collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True)
+    if pairs_c:
+        stack_c = np.concatenate([m.reshape(-1, m.shape[-1]) for _, m in pairs_c], axis=0)
+        comps_c, mu_c, evr_c = pca_basis(stack_c, k=3)
+        ax = fig.add_subplot(1, 3, 3, projection="3d")
+        for s, m in pairs_c:
+            p = _traj(m, comps_c, mu_c)
+            ax.plot(p[:, 0], p[:, 1], p[:, 2],
+                    color=SUBJ_COLORS.get(s.subject_id, "#888"), lw=1.6, alpha=0.9)
+            ax.scatter(*p[0], color=SUBJ_COLORS.get(s.subject_id, "#888"), s=22, marker="o")
+        ax.set_title(f"{tap} · {task} · class contrast (content)\nEVR {evr_c.sum():.2f}",
+                     fontsize=10)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+        info["evr_contrast"] = [float(v) for v in evr_c]
     for col, centered in enumerate((False, True)):
         pairs = {c: collect(sessions, tap, task, c, "all", lobes, centered=centered)
                  for c in (0, 1)}
         stack = np.concatenate([m.reshape(-1, m.shape[-1])
                                 for c in (0, 1) for _, m in pairs[c]], axis=0)
         comps, mu, evr = pca_basis(stack, k=3)
-        ax = fig.add_subplot(1, 2, col + 1, projection="3d")
+        ax = fig.add_subplot(1, 3, col + 1, projection="3d")
         for c in (0, 1):
             for s, m in pairs[c]:
-                p = (m.reshape(-1, m.shape[-1]) - mu) @ comps.T
-                p = p.reshape(m.shape[0], m.shape[1], 3).mean(axis=0)  # average lobes -> (T,3)
+                p = _traj(m, comps, mu)
                 ax.plot(p[:, 0], p[:, 1], p[:, 2],
                         color=SUBJ_COLORS.get(s.subject_id, "#888"),
                         ls="-" if c == 1 else ":", lw=1.6, alpha=0.9)
@@ -102,12 +156,61 @@ def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
     return info
 
 
-def figure_b(sessions, tap: str, task: str, cls: int, out_path: str) -> dict:
+def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
+    """One shared 3-PC space, one panel per task, contrast trajectories coloured by subject.
+
+    The claim being shown is two-sided and one basis makes both visible at once: within a
+    decodable task, subjects trace the SAME path; across tasks, the paths differ. The basis
+    is fit on the pooled contrasts of every task so no task gets a basis flattering to it.
+    """
+    per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True)
+                for t in tasks}
+    per_task = {t: v for t, v in per_task.items() if v}
+    if not per_task:
+        return {}
+    stack = np.concatenate([m.reshape(-1, m.shape[-1])
+                            for v in per_task.values() for _, m in v], axis=0)
+    comps, mu, evr = pca_basis(stack, k=3)
+
+    n = len(per_task)
+    ncol = min(3, n)
+    nrow = (n + ncol - 1) // ncol
+    fig = plt.figure(figsize=(5.2 * ncol, 4.6 * nrow))
+    align = {}
+    for i, (t, v) in enumerate(per_task.items()):
+        ax = fig.add_subplot(nrow, ncol, i + 1, projection="3d")
+        trajs = []
+        for s, m in v:
+            p = _traj(m, comps, mu)
+            trajs.append(p)
+            ax.plot(p[:, 0], p[:, 1], p[:, 2],
+                    color=SUBJ_COLORS.get(s.subject_id, "#888"), lw=1.5, alpha=0.9)
+            ax.scatter(*p[0], color=SUBJ_COLORS.get(s.subject_id, "#888"), s=20)
+        # agreement between subjects IN THIS 3-D VIEW, so the number matches what is drawn
+        rs = [_corr(trajs[a].ravel(), trajs[b].ravel())
+              for a in range(len(v)) for b in range(a + 1, len(v))
+              if v[a][0].subject_id != v[b][0].subject_id]
+        align[t] = float(np.nanmean(rs)) if rs else float("nan")
+        ax.set_title(f"{t}\ncross-subject r (3-PC view) = {align[t]:+.2f}", fontsize=9)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+    handles = [Line2D([], [], color=c, lw=2, label=f"S{s}") for s, c in SUBJ_COLORS.items()]
+    fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False, fontsize=8)
+    fig.suptitle(f"Class-contrast trajectories · {tap} · ONE shared 3-PC basis across all "
+                 f"tasks (EVR {evr.sum():.2f}) · circle = window start", fontsize=11)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return {"evr": [float(v) for v in evr], "align_3pc": align}
+
+
+def figure_b(sessions, tap: str, task: str, cls, out_path: str) -> dict:
     """Per-subject PC-RGB panels: rows are that subject's own lobes, columns are time."""
     per = []
     for s in sessions:
         lobes = sorted({lb for lb in s.lobes if lb != "unknown"})
-        m = session_matrix(s, tap, task, cls, "all", lobes)
+        m = _cond_matrix(s, tap, task, cls, "all", lobes)
         if m is not None:
             per.append((s, lobes, m))
     assert per, "no session produced a panel"
@@ -138,7 +241,8 @@ def figure_b(sessions, tap: str, task: str, cls: int, out_path: str) -> dict:
         ax.set_xlabel("time →", fontsize=7)
         ax.set_title(s.key, fontsize=8)
         ax.tick_params(labelsize=6)
-    fig.suptitle(f"PC-RGB · {tap} · {task}={cls} · one shared 3-PC channel basis "
+    cond = f"{task} (class1 − class0)" if cls == CONTRAST else f"{task}={cls}"
+    fig.suptitle(f"PC-RGB · {tap} · {cond} · one shared 3-PC channel basis "
                  f"(EVR {evr.sum():.2f}) · rows are each subject's own lobes", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(out_path, dpi=170)
@@ -146,7 +250,7 @@ def figure_b(sessions, tap: str, task: str, cls: int, out_path: str) -> dict:
     return {"evr": [float(v) for v in evr], "n_panels": n}
 
 
-def quantify(sessions, lobes, tap: str, task: str, cls: int) -> dict:
+def quantify(sessions, lobes, tap: str, task: str, cls) -> dict:
     """Cross-subject similarity vs the within-session split-half ceiling."""
     grand = collect(sessions, tap, task, cls, "all", lobes, centered=True)
     h0 = {s.key: m for s, m in collect(sessions, tap, task, cls, "h0", lobes, centered=True)}
@@ -166,12 +270,89 @@ def quantify(sessions, lobes, tap: str, task: str, cls: int) -> dict:
         return float(np.nanmean(v)) if v else float("nan")
 
     c, cl = _m(cross), _m(ceiling)
+    # A ratio against a ceiling that is itself indistinguishable from zero is not a number
+    # worth reporting: it means the subject's own two half-averages disagree, so there is no
+    # reliable signal to normalize against and c/cl is dominated by noise in the denominator.
+    # frame_brightness is exactly this case (ceiling ~.06), and left unguarded it prints a
+    # confident-looking -0.62.
+    usable = bool(np.isfinite(cl) and cl > CEILING_FLOOR)
     return {
         "tap": tap, "task": task, "class": cls, "n_sessions": len(grand),
         "cross_subject_r": c, "within_subject_diff_session_r": _m(within_subj),
         "split_half_ceiling_r": cl,
-        "normalized": float(c / cl) if cl and np.isfinite(cl) and cl > 0 else float("nan"),
+        "normalized": float(c / cl) if usable else float("nan"),
+        "ceiling_usable": usable, "ceiling_floor": CEILING_FLOOR,
         "n_cross_pairs": len(cross),
+    }
+
+
+def identity_content(sessions, lobes, tap: str, task: str) -> dict:
+    """Split the token cloud into a between-session (identity) and a within-session part.
+
+    Separability, not invariance, is the claim being tested. Transfer does not require the
+    identity directions to be absent -- it requires them not to be confounded with the
+    content directions. So: build the identity subspace explicitly as the span of the
+    per-session mean offsets, project it out, and ask whether cross-subject alignment
+    SURVIVES. If it rises, the two are separable and removing identity is not removing
+    content.
+    """
+    per, labels = [], []
+    for cls in (0, 1):
+        for s, m in collect(sessions, tap, task, cls, "all", lobes, centered=False):
+            per.append(m.reshape(-1, m.shape[-1]))
+            labels.append((s.key, cls))
+    if len(per) < 4:
+        return {}
+    tokens = np.concatenate(per, axis=0)
+    grand = tokens.mean(axis=0)
+
+    keys = sorted({k for k, _ in labels})
+    by_key = {k: np.concatenate([p for p, (kk, _) in zip(per, labels) if kk == k], axis=0)
+              for k in keys}
+
+    # Between/within variance decomposition -- the ANOVA identity, so the two shares sum to
+    # the total exactly. NOT a subspace projection: projecting onto the rank-<=N span of the
+    # session means captures ~rank/C of the variance by construction, which reads as a large
+    # identity share even when the session means are pure noise.
+    n_tot = sum(len(v) for v in by_key.values())
+    between = sum(len(v) * float(((v.mean(axis=0) - grand) ** 2).sum())
+                  for v in by_key.values()) / n_tot
+    within = sum(float(((v - v.mean(axis=0)) ** 2).sum()) for v in by_key.values()) / n_tot
+    total = between + within
+
+    # Identity subspace for the projection test, rank-truncated: a direction with no energy
+    # in the session means is not an identity direction, and QR of a degenerate matrix would
+    # otherwise hand back arbitrary axes.
+    ident = np.stack([by_key[k].mean(axis=0) - grand for k in keys])
+    u_s = np.linalg.svd(ident, compute_uv=False)
+    scale = np.sqrt(max(total, 0.0))
+    keep = int((u_s > max(1e-6 * u_s.max(initial=0.0), 1e-8 * scale)).sum())
+    if keep:
+        q, _ = np.linalg.qr(ident[:keep].T)
+    else:
+        q = np.zeros((tokens.shape[1], 0))
+
+    def _align(project_out: bool) -> float:
+        # the CONTRAST, not one class: alignment of a single condition mean is carried by
+        # the condition-independent response profile and says nothing about content.
+        mats = []
+        for s, m in collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True):
+            x = m.reshape(-1, m.shape[-1])
+            if project_out:
+                x = x - (x @ q) @ q.T
+            mats.append((s, x))
+        rs = [_corr(_flat(a), _flat(b))
+              for i, (si, a) in enumerate(mats) for sj, b in mats[i + 1:]
+              if si.subject_id != sj.subject_id]
+        return float(np.nanmean(rs)) if rs else float("nan")
+
+    return {
+        "tap": tap, "task": task, "identity_rank": int(q.shape[1]),
+        "n_sessions": len(keys),
+        "identity_var_frac": float(between / total) if total > 0 else float("nan"),
+        "within_session_var_frac": float(within / total) if total > 0 else float("nan"),
+        "cross_subject_r": _align(False),
+        "cross_subject_r_identity_removed": _align(True),
     }
 
 
@@ -195,6 +376,7 @@ def main() -> None:
     print(f"[check] shared lobes across ALL subjects: {lobes}")
     assert lobes, "no lobe is shared by every subject — Figure A has no common axis"
 
+    quant_tasks = [t for t in args.tasks_quant.split(",") if t]
     report: dict = {"sessions": [s.key for s in sessions], "shared_lobes": lobes,
                     "taps": taps, "figures": {}, "quant": []}
 
@@ -205,18 +387,35 @@ def main() -> None:
         p = os.path.join(args.out_dir, f"figB_pcrgb_{tap}_{args.task}.png")
         report["figures"][f"B/{tap}"] = figure_b(sessions, tap, args.task, 1, p)
         print(f"[fig] {p}")
+        p = os.path.join(args.out_dir, f"figB_pcrgb_contrast_{tap}_{args.task}.png")
+        report["figures"][f"Bc/{tap}"] = figure_b(sessions, tap, args.task, CONTRAST, p)
+        print(f"[fig] {p}")
+        p = os.path.join(args.out_dir, f"figT_tasks_{tap}.png")
+        info = figure_tasks(sessions, lobes, tap, quant_tasks, p)
+        report["figures"][f"T/{tap}"] = info
+        print(f"[fig] {p}  align={ {k: round(v, 3) for k, v in info.get('align_3pc', {}).items()} }")
 
-    for task in [t for t in args.tasks_quant.split(",") if t]:
+    for task in quant_tasks:
         for tap in taps:
-            for cls in (0, 1):
+            for cls in (CONTRAST, 0, 1):
                 try:
                     q = quantify(sessions, lobes, tap, task, cls)
                 except (KeyError, AssertionError):
                     continue
                 report["quant"].append(q)
-                print(f"[quant] {tap:6s} {task:16s} c{cls}  cross={q['cross_subject_r']:+.4f} "
+                lab = "diff" if cls == CONTRAST else f"c{cls}  "
+                print(f"[quant] {tap:6s} {task:16s} {lab} cross={q['cross_subject_r']:+.4f} "
                       f"ceiling={q['split_half_ceiling_r']:+.4f} "
                       f"norm={q['normalized']:+.4f}")
+
+    report["identity_content"] = []
+    for tap in taps:
+        ic = identity_content(sessions, lobes, tap, args.task)
+        if ic:
+            report["identity_content"].append(ic)
+            print(f"[ident] {tap:6s} {args.task:16s} identity_var={ic['identity_var_frac']:.3f} "
+                  f"(rank {ic['identity_rank']})  cross={ic['cross_subject_r']:+.4f} "
+                  f"-> id-removed {ic['cross_subject_r_identity_removed']:+.4f}")
 
     dst = os.path.join(args.out_dir, "report.json")
     with open(dst, "w") as fh:
