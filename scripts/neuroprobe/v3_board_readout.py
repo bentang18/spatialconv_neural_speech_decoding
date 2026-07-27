@@ -60,6 +60,9 @@ import time
 import numpy as np
 import torch
 
+# Reserved DKT id for an electrode the atlas could not place (== len(parcel vocabulary)).
+UNKNOWN_PARCEL_ID = 74
+
 # ── phase timing ───────────────────────────────────────────────────────────────────
 # The 20263259 array ran shards at 98-581% of 8 cores: some were single-threaded for
 # 20 min while others sat in threaded BLAS. I diagnosed that serial phase twice from
@@ -396,10 +399,19 @@ def _grid_cells(grid) -> dict:
 
 
 def _parcel_cols(anchor_rec, test_rec):
-    """Anchor∩test parcel columns, aligned BY ATLAS ID (not by position)."""
+    """Anchor∩test parcel columns, aligned BY ATLAS ID (not by position).
+
+    The reserved 'unknown' id is NOT an anatomical location: two electrodes carrying it are
+    not in the same place, so aligning subjects on it would be a free unearned column. It is
+    a no-op on the Lite board (anchor S2T4 has no unmapped electrodes) but fires on any
+    corpus that does, so it is excluded here rather than assumed away.
+    """
     a_p = np.asarray(anchor_rec["present_parcels"], dtype=np.int64)
     t_p = np.asarray(test_rec["present_parcels"], dtype=np.int64)
     common = np.intersect1d(a_p, t_p)
+    if UNKNOWN_PARCEL_ID in common:
+        print(f"[check] dropping unknown parcel {UNKNOWN_PARCEL_ID} from intersection", flush=True)
+        common = common[common != UNKNOWN_PARCEL_ID]
     if common.size == 0:
         return None, None, common
     a_idx = [int(np.where(a_p == c)[0][0]) for c in common]

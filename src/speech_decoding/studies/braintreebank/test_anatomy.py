@@ -819,3 +819,53 @@ def test_support_attention_bias_default_eps_is_v14_prior_strength() -> None:
         np.log(np.array([[1.01, 0.01]], dtype=np.float32)),
         rtol=1e-6,
     )
+
+
+def test_parcel_lobe_keys_covers_every_dkt_base_exactly_once() -> None:
+    from speech_decoding.studies.braintreebank.anatomy import (
+        _DKT_APARC_BASE_LABELS,
+        _DKT_BASE_TO_LOBE,
+    )
+
+    assert set(_DKT_BASE_TO_LOBE) == set(_DKT_APARC_BASE_LABELS)
+    assert len(_DKT_BASE_TO_LOBE) == len(_DKT_APARC_BASE_LABELS) == 31
+
+
+def test_parcel_lobe_keys_group_sizes() -> None:
+    from collections import Counter
+
+    from speech_decoding.studies.braintreebank.anatomy import _DKT_BASE_TO_LOBE
+
+    assert Counter(_DKT_BASE_TO_LOBE.values()) == {
+        "frontal": 10, "temporal": 7, "parietal": 5,
+        "occipital": 4, "cingulate": 4, "insula": 1,
+    }
+
+
+def test_parcel_lobe_keys_is_index_aligned_with_unknown_appended() -> None:
+    from speech_decoding.studies.braintreebank.anatomy import (
+        UNKNOWN_LOBE,
+        V14_DKT_PARCEL_LABELS,
+        parcel_lobe_keys,
+    )
+
+    keys = parcel_lobe_keys()
+    assert len(keys) == len(V14_DKT_PARCEL_LABELS) + 1 == 75
+    assert keys[-1] == UNKNOWN_LOBE
+    # the reserved unknown id is the ONLY entry that may carry UNKNOWN_LOBE
+    assert [k for k in keys if k == UNKNOWN_LOBE] == [UNKNOWN_LOBE]
+    idx = V14_DKT_PARCEL_LABELS.index("ctx-lh-superiortemporal")
+    assert keys[idx] == "lh-temporal"
+    idx = V14_DKT_PARCEL_LABELS.index("ctx-rh-parsopercularis")
+    assert keys[idx] == "rh-frontal"
+    idx = V14_DKT_PARCEL_LABELS.index("Right-Hippocampus")
+    assert keys[idx] == "rh-mtl"
+    idx = V14_DKT_PARCEL_LABELS.index("Left-Putamen")
+    assert keys[idx] == "lh-subcortical"
+
+
+def test_parcel_lobe_keys_raises_on_unplaceable_label() -> None:
+    from speech_decoding.studies.braintreebank.anatomy import parcel_lobe_keys
+
+    with pytest.raises(KeyError, match="no lobe assignment"):
+        parcel_lobe_keys(("ctx-lh-notaregion",))

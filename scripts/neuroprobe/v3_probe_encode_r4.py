@@ -155,6 +155,44 @@ def _load_targets(session, bt_root, tasks=PROBE_TASKS):
     return build_session_targets(events, subject_id=subject_id, trial_id=trial_id)
 
 
+def _shift_and_trim(targets, *, offset_s: float, clip_frames: int, n_frames: int):
+    """Shift every clip start by ``offset_s`` and drop windows that leave the session cache.
+
+    Used by the visualization encode, which windows -0.5 -> +1.5 s around word onset instead
+    of the leaderboard's [onset, onset+1 s]. A pre-onset offset pushes the earliest clips
+    before frame 0 and a longer duration pushes the latest past the end; ``_window_bands``
+    raises on both, so they must be dropped here.
+
+    Dropping rows RENUMBERS the union axis, so labels and every ws/cs split index array are
+    remapped together — a stale index would silently point at a different clip. Returns a new
+    SessionTargets.
+    """
+    from speech_decoding.experiments.pretrain_probe_labels import SessionTargets
+
+    starts = np.asarray(targets.clip_starts, dtype=float) + float(offset_s)
+    t0 = np.rint(starts * FPS).astype(np.int64)
+    valid = (t0 >= 0) & (t0 + clip_frames <= n_frames)
+    remap = np.full(len(starts), -1, dtype=np.int64)
+    remap[valid] = np.arange(int(valid.sum()), dtype=np.int64)
+
+    def _idx(a):
+        r = remap[np.asarray(a, dtype=np.int64)]
+        return r[r >= 0]
+
+    return SessionTargets(
+        subject_id=targets.subject_id,
+        trial_id=targets.trial_id,
+        clip_starts=starts[valid],
+        clip_durations=np.asarray(targets.clip_durations)[valid],
+        clip_movie_onsets=np.asarray(targets.clip_movie_onsets)[valid],
+        labels={k: np.asarray(v)[valid] for k, v in targets.labels.items()},
+        ws_split={t: {f: {n: _idx(ix) for n, ix in sp.items()} for f, sp in folds.items()}
+                  for t, folds in targets.ws_split.items()},
+        cs_split={t: {n: _idx(ix) for n, ix in sp.items()}
+                  for t, sp in targets.cs_split.items()},
+    )
+
+
 def _lite_keep_labels_fn(bt_root):
     """``keep_labels_fn`` restricting a session to its Neuroprobe-Lite montage.
 
@@ -443,6 +481,17 @@ def main() -> None:
                         "frontend (enc0); 3/6/12 route through the teacher forward (GPU_TAPS). "
                         "WS keeps all electrodes by default (Ben 2026-07-16); each costs "
                         "~N/|P| (~5x) the pooled tap on disk.")
+    p.add_argument("--clip-dur", type=float, default=CLIP_DUR_S,
+                   help=f"clip seconds (default {CLIP_DUR_S} = Neuroprobe-Lite parity). The "
+                        "visualization encode uses 2.0 — the SSL training clip length, so the "
+                        "longer window is in-distribution rather than an extrapolation. Any "
+                        "value other than the default BREAKS board parity: the resulting cache "
+                        "is for figures, never for a leaderboard number.")
+    p.add_argument("--clip-offset", type=float, default=0.0,
+                   help="seconds added to every clip start; negative windows BEFORE word onset "
+                        "(e.g. -0.5 with --clip-dur 2.0 gives -0.5 -> +1.5 s). Clips whose "
+                        "shifted window leaves the session cache are dropped, with labels and "
+                        "ws/cs split indices remapped to the surviving union axis.")
     args = p.parse_args()
 
     from speech_decoding.experiments.pretrain_probe_suite import PROBE_COHORT_7
@@ -476,7 +525,10 @@ def main() -> None:
             f"need {n_cache} --band-cache-dir {want}, got {len(args.band_cache_dirs)}")
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    clip_frames = round(CLIP_DUR_S * FPS)
+    clip_frames = round(args.clip_dur * FPS)
+    if args.clip_dur != CLIP_DUR_S or args.clip_offset != 0.0:
+        print(f"[window] NON-PARITY window: dur={args.clip_dur}s offset={args.clip_offset}s "
+              f"-> {clip_frames} frames @ {FPS} Hz. Figures only, not a board number.", flush=True)
     parcel_fn = make_bt_parcel_fn(args.bt_root)
     cohort = BOARD_SESSIONS if args.sessions == "board" else tuple(PROBE_COHORT_7)
     if args.session_index is not None:
@@ -547,6 +599,13 @@ def main() -> None:
             if not ok:
                 raise RuntimeError("lite montage kept a non-Lite electrode — refusing to write")
         targets = _load_targets(session, args.bt_root, tasks)
+        if args.clip_dur != CLIP_DUR_S or args.clip_offset != 0.0:
+            n_before = len(targets.clip_starts)
+            targets = _shift_and_trim(targets, offset_s=args.clip_offset,
+                                      clip_frames=clip_frames, n_frames=spec.n_frames)
+            n_after = len(targets.clip_starts)
+            print(f"[window] {session}: {n_before} -> {n_after} clips "
+                  f"({n_before - n_after} dropped at session edges)", flush=True)
         # r5/nf caches are native-64Hz (R5_BAND_RATES 2×); read 2·clip_frames frames per window.
         # r4 AND r6 share the uniform 32 Hz caches ⇒ rate_mult 1, no per-band rates.
         bands = _window_bands(spec, targets.clip_starts, clip_frames,
@@ -624,6 +683,10 @@ def main() -> None:
             # parcel ORDER but not the membership.
             "parcel_canon": np.asarray(parcel_canon, dtype=np.int64),
             "band_lengths": tuple(int(x) for x in grid.band_lengths),
+            # Frequency bins per band. band_lengths alone does NOT let a consumer slice enc0 by
+            # band: the encoder taps are (k_full, d) so band_lengths is enough there, but enc0 is
+            # the raw spectrogram at Σ_b F_b·T_b, and F_b is not recoverable from that total.
+            "band_fdims": tuple(int(b.shape[-2]) for b in bands),
             "feats": {k: {v: t for v, t in d.items()} for k, d in feats.items()},
             "clip_starts": np.asarray(targets.clip_starts),
             "labels": {lt: np.asarray(v) for lt, v in targets.labels.items()},

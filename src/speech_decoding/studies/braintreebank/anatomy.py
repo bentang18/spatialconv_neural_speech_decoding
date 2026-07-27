@@ -576,6 +576,100 @@ Atlas-fixed, not cohort-derived — keeps unpopulated parcels alive for
 cross-cohort portability (mirrors :data:`V14_DK_PARCEL_LABELS`)."""
 
 
+# --- lobe grouping --------------------------------------------------------- #
+# Parcels are too fine to intersect across subjects: pairwise DKT supports run
+# 3-7 parcels and the 12-way Neuroprobe-Lite intersection is EMPTY, so a shared
+# anatomical axis does not exist at parcel resolution. Lobes are the coarsest
+# grouping that still separates the speech-relevant cortex, and each subject
+# covers more lobes than it shares parcels. Assignment follows FreeSurfer's own
+# lobe convention (paracentral -> frontal; fusiform + parahippocampal ->
+# temporal). Hemisphere is KEPT DISTINCT — lateralization is not a nuisance here.
+_DKT_BASE_TO_LOBE: dict[str, str] = {
+    # frontal (10)
+    "caudalmiddlefrontal": "frontal",
+    "lateralorbitofrontal": "frontal",
+    "medialorbitofrontal": "frontal",
+    "paracentral": "frontal",
+    "parsopercularis": "frontal",
+    "parsorbitalis": "frontal",
+    "parstriangularis": "frontal",
+    "precentral": "frontal",
+    "rostralmiddlefrontal": "frontal",
+    "superiorfrontal": "frontal",
+    # temporal (7)
+    "entorhinal": "temporal",
+    "fusiform": "temporal",
+    "inferiortemporal": "temporal",
+    "middletemporal": "temporal",
+    "parahippocampal": "temporal",
+    "superiortemporal": "temporal",
+    "transversetemporal": "temporal",
+    # parietal (5)
+    "inferiorparietal": "parietal",
+    "postcentral": "parietal",
+    "precuneus": "parietal",
+    "superiorparietal": "parietal",
+    "supramarginal": "parietal",
+    # occipital (4)
+    "cuneus": "occipital",
+    "lateraloccipital": "occipital",
+    "lingual": "occipital",
+    "pericalcarine": "occipital",
+    # cingulate (4)
+    "caudalanteriorcingulate": "cingulate",
+    "isthmuscingulate": "cingulate",
+    "posteriorcingulate": "cingulate",
+    "rostralanteriorcingulate": "cingulate",
+    # insula (1)
+    "insula": "insula",
+}
+"""DKT cortical base -> lobe. Covers all 31 DKT bases exactly once."""
+
+_ASEG_BASE_TO_LOBE: dict[str, str] = {
+    "Hippocampus": "mtl",
+    "Amygdala": "mtl",
+    "Caudate": "subcortical",
+    "Putamen": "subcortical",
+    "Pallidum": "subcortical",
+    "Thalamus-Proper": "subcortical",
+}
+"""aseg base -> group. Hippocampus/amygdala are split out as ``mtl`` rather than
+lumped with basal ganglia: they are the structures actually implanted in this
+cohort and are functionally nothing like thalamus or striatum."""
+
+UNKNOWN_LOBE: str = "unknown"
+"""Group for the reserved unmapped-electrode id. Never joins a real lobe."""
+
+
+def parcel_lobe_keys(
+    parcel_labels: tuple[str, ...] = V14_DKT_PARCEL_LABELS,
+) -> tuple[str, ...]:
+    """Lobe key per parcel id, index-aligned, with the reserved unknown id appended.
+
+    Returns a tuple of length ``len(parcel_labels) + 1`` so it can be indexed by a
+    raw ``parcel_id`` straight from ``make_bt_parcel_fn`` — including the reserved
+    unknown id ``len(parcel_labels)`` (``dispatch_v3.make_bt_parcel_fn``), which maps
+    to :data:`UNKNOWN_LOBE`. Keys are hemisphere-qualified (``"lh-temporal"``).
+
+    Raises on any label this module cannot place, rather than silently bucketing it
+    — an unplaced parcel would vanish from the shared axis with no error.
+    """
+    keys: list[str] = []
+    for label in parcel_labels:
+        if label.startswith("ctx-"):
+            _, hemi, base = label.split("-", 2)
+            group = _DKT_BASE_TO_LOBE.get(base)
+        else:
+            side, base = label.split("-", 1)
+            hemi = {"Left": "lh", "Right": "rh"}.get(side)
+            group = _ASEG_BASE_TO_LOBE.get(base)
+        if group is None or hemi is None:
+            raise KeyError(f"no lobe assignment for parcel label {label!r}")
+        keys.append(f"{hemi}-{group}")
+    keys.append(UNKNOWN_LOBE)
+    return tuple(keys)
+
+
 # Atlas registry — the SINGLE source pairing each atlas's CSV column with its
 # parcel vocabulary. They MUST move together: using the DKT vocabulary against the
 # ``DesikanKilliany`` column (or vice versa) silently mis-routes every electrode
