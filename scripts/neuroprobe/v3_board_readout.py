@@ -176,25 +176,56 @@ def _standardize(z_tr, others):
         return (z_tr - mu) / sd, [(z - mu) / sd for z in others]
 
 
-def _standardize_inplace(z_tr, others):
+# Columns per standardize pass. The reduction is PER COLUMN, so blocking the column axis cannot
+# change any number — it only changes what is resident while the number is computed. Measured on
+# Delta (n=1750, d=120000, tr+val+test, OMP=8), whole-array vs blocked: 6.39 s -> 0.70 s @512,
+# 0.73 s @1024, 0.75 s @2048, 0.99 s @4096, i.e. a ~9x plateau that decays once a block leaves L3.
+# 1024 sits mid-plateau at a 7 MB train-block footprint (+3.5 MB each for val/test).
+# FLOOR OF 2: at blk=1 the slice is a contiguous 1-D vector and numpy sums it PAIRWISE instead of
+# accumulating a SIMD row-vector across columns — a different summation order (drift 1.2e-7), which
+# would break the bitwise guarantee. Every width >= 2 is exact; see test_v3_board_readout.py.
+_STD_BLOCK = 1024
+
+
+def _standardize_inplace(z_tr, others, blk=_STD_BLOCK):
     """Bit-identical to _standardize but MUTATES its inputs — no second copy of the design
     matrix ever exists. `z -= mu; z /= sd` is the same two fp32 ufuncs in the same order as
     `(z - mu) / sd`, so every downstream number is unchanged; the only difference is that the
     ~tens-of-GB std copy is never allocated. That copy is what pushed heavy CSession cells (two
     sessions' design matrices resident at once) past the node memory cap into thrash.
 
+    COLUMN-BLOCKED, and the reason is measured (07-27): `standardize` was 81% of an eager WS
+    shard (68.2 of 83.7 min, 20298989_0) and 10-39% of every CSession shard. The whole cost is
+    memory traffic, not arithmetic — `np.std(axis=0)` materializes its own (n, d) fp32 `(z-mu)**2`
+    temp, which at enc12_elec is an 11 GB allocation streamed once more on top of the four passes
+    the mean/std/subtract/divide already owe. Blocking the COLUMN axis keeps each block's train +
+    val + test slices in L3 across all four passes and shrinks that temp from (n, d) to (n, blk)
+    — 11 GB down to ~7 MB. Measured ~9x on the phase, and it lowers the shard's transient peak,
+    which is the same pressure that forces --mem=176G.
+
+    Every reduction is along axis 0 and therefore independent per column, so chunking columns
+    sums exactly the same values in exactly the same order: the result is BIT-identical, asserted
+    against the whole-array path in test_v3_board_readout.py.
+
     CONSUMES z_tr and every array in `others` — the caller must run any norm that needs the RAW
     features (raw, std_target) BEFORE this one. `_run_norms` enforces that ordering.
     """
     with _timed("standardize"):
-        mu = z_tr.mean(axis=0)
-        sd = z_tr.std(axis=0)
-        sd[sd == 0] = 1.0
-        z_tr -= mu
-        z_tr /= sd
-        for z in others:
-            z -= mu
-            z /= sd
+        d = z_tr.shape[1]
+        edges = list(range(0, d, blk)) + [d]
+        if len(edges) > 2 and edges[-1] - edges[-2] == 1:
+            edges.pop(-2)                      # never leave a WIDTH-1 trailing block (see floor above)
+        for lo, hi in zip(edges, edges[1:]):
+            b = z_tr[:, lo:hi]
+            mu = b.mean(axis=0)
+            sd = b.std(axis=0)
+            sd[sd == 0] = 1.0
+            b -= mu
+            b /= sd
+            for z in others:
+                zb = z[:, lo:hi]
+                zb -= mu
+                zb /= sd
         return z_tr, others
 
 
@@ -252,6 +283,8 @@ def _lam_grid(z_tr, y_tr, evals):
     """
     if len(y_tr) < 2:
         return {name: {m: float("nan") for m in LAM_MULTS} for name in evals}
+    if z_tr.shape[1] < z_tr.shape[0]:
+        return _lam_grid_primal(z_tr, y_tr, evals)
     with _timed("gram_gemm"):
         g = np.asarray(z_tr @ z_tr.T, dtype=np.float64)         # fp32 GEMM → fp64 Gram
     n = g.shape[0]
@@ -268,6 +301,48 @@ def _lam_grid(z_tr, y_tr, evals):
             alpha = V @ (c / (w + m * base))
             for name, (_, y) in evals.items():
                 out[name][m] = (auroc(kern[name] @ alpha, y) if len(y) >= 2 else float("nan"))
+    return out
+
+
+def _lam_grid_primal(z_tr, y_tr, evals):
+    """Same fit as _lam_grid, solved in the PRIMAL — taken whenever d < n.
+
+    ``Zᵀ(ZZᵀ + λI)⁻¹ y == (ZᵀZ + λI)⁻¹ Zᵀ y`` exactly, and ``trace(ZᵀZ) == trace(ZZᵀ)``, so
+    ``base`` — and therefore what each λ multiplier MEANS — is unchanged. Three costs move:
+    the Gram is n·d² instead of n²·d, the eigendecomposition is O(d³) instead of O(n³), and the
+    eval kernels vanish entirely (score is ``z_e @ β``, an (n_e, d)·(d, |LAM|) GEMM, not
+    ``(z_e z_trᵀ) @ α``). All 25 λ share one GEMM per eval set by stacking β columnwise.
+
+    WHERE THIS ACTUALLY FIRES (measured on the r6_40k cache, 07-27): the ONE tap where d < n is
+    CS enc0 — 7 anchor∩test parcels × 348 = d 2436 against n_train 2096-3500. Every other tap is
+    d >> n (CS enc3/6/12 = 93184; WS/CSession enc0_elec = 41412, enc12_elec = 1584128, both
+    against n <= 1750), so the dual is correct there and this branch is never taken. Benchmarked
+    at the CS enc0 shape: 5.91 s dual -> 1.35 s primal, 4.4x — but enc0 is ~0.9% of a CS shard's
+    GEMM work, so the SHARD-level saving is ~1-2%. Kept because it is a few lines and free, NOT
+    because it is the lever; the lever was the standardize blocking in _standardize_inplace.
+
+    NOT bit-identical to the dual path: the fp32 GEMM accumulates a different set of products.
+    Measured max |AUROC_dual − AUROC_primal| = 2.7e-5 at the CS enc0 shape — three orders below
+    the ±.002 probe noise floor, but it does mean a re-run of an old board can move CS enc0 in
+    the 5th decimal.
+    """
+    with _timed("gram_gemm"):
+        a_mat = np.asarray(z_tr.T @ z_tr, dtype=np.float64)      # (d, d)
+    n = z_tr.shape[0]
+    with _timed("eigh"):
+        w, V = np.linalg.eigh(a_mat)
+    c = V.T @ (z_tr.T @ np.asarray(y_tr, dtype=np.float64))
+    base = float(np.trace(a_mat) / max(n, 1))                    # == sum(eig(G))/n, the dual's scale
+    with _timed("lam_sweep"):
+        lam = np.asarray(LAM_MULTS, dtype=np.float64) * base
+        beta = V @ (c[:, None] / (w[:, None] + lam[None, :]))    # (d, |LAM_MULTS|)
+        out: dict = {}
+        for name, (z, y) in evals.items():
+            if len(y) < 2:
+                out[name] = {m: float("nan") for m in LAM_MULTS}
+                continue
+            s = np.asarray(z, dtype=np.float64) @ beta           # (n_e, |LAM_MULTS|)
+            out[name] = {m: auroc(s[:, i], y) for i, m in enumerate(LAM_MULTS)}
     return out
 
 

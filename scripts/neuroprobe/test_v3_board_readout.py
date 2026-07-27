@@ -342,3 +342,81 @@ def test_mmap_is_never_the_default() -> None:
     from scripts.neuroprobe.v3_board_readout import MMAP_DEFAULT
 
     assert MMAP_DEFAULT == {"ws": False, "cs": False, "csession": False}
+
+
+# ── R8: standardize column-blocking + primal collapse ──────────────────────────────
+# Both are pure SPEED changes to phases the shard timer said dominate (standardize was 81% of an
+# eager WS shard). Neither may move a board number, so each is pinned against the path it replaces.
+
+
+@pytest.mark.parametrize("blk", [2, 3, 7, 64, 1024, 10_000])
+def test_standardize_column_blocking_is_bit_identical_at_every_block_size(blk) -> None:
+    """The reduction is per COLUMN, so the block size is a memory-layout choice and NOTHING else.
+
+    Pinned bitwise, not approximately: this function feeds every reported AUROC, and the whole
+    argument for blocking is that it cannot change an answer. Spans blk larger than d (one block
+    = the old whole-array path) down to the blk=2 floor.
+
+    blk=1 is EXCLUDED and that is why _STD_BLOCK has a floor: a width-1 column slice makes
+    np.mean/np.std reduce a contiguous 1-D vector, which numpy sums PAIRWISE, instead of
+    accumulating a SIMD row-vector across columns. Measured drift 1.2e-7 on mu — harmless in size,
+    but it is a different summation order, so the bitwise guarantee would become a claim about
+    numpy's dispatch rather than about arithmetic. Every width >= 2 sums the same values in the
+    same order (verified 2..4096 on d=4096, and 512..8192 on d=120000 on Delta).
+    """
+    import scripts.neuroprobe.v3_board_readout as B
+
+    assert B._STD_BLOCK >= 2
+    rng = np.random.default_rng(4)
+    tr = rng.normal(size=(29, 53)).astype(np.float32)
+    va = rng.normal(size=(11, 53)).astype(np.float32)
+    te = rng.normal(size=(13, 53)).astype(np.float32)
+    tr[:, 5] = 2.5                                     # a constant column: sd == 0 -> 1.0 branch
+    ref = B._standardize(tr.copy(), [va.copy(), te.copy()])
+    got_tr, (got_va, got_te) = B._standardize_inplace(tr.copy(), [va.copy(), te.copy()], blk=blk)
+    assert np.array_equal(got_tr, ref[0])
+    assert np.array_equal(got_va, ref[1][0])
+    assert np.array_equal(got_te, ref[1][1])
+
+
+def test_primal_matches_dual_on_the_same_fit() -> None:
+    """d < n takes the primal; zero-padding d past n forces the dual on the IDENTICAL problem.
+
+    Zero columns contribute nothing to ZZᵀ, to ZᵀZ's trace, or to any eval kernel, so the padded
+    fit is the same ridge — only the factorization differs. Agreement to <1e-4 AUROC is the whole
+    licence for the branch.
+    """
+    rng = np.random.default_rng(5)
+    n, d = 90, 20
+    y = np.array([float(i % 2) for i in range(n)])
+    z = rng.normal(size=(n, d)).astype(np.float32)
+    z[:, 0] += y * 1.5
+    ev = {"val": (z[50:70], y[50:70]), "test": (z[70:], y[70:])}
+    primal = _lam_grid(z[:50], y[:50], ev)
+    pad = lambda a: np.hstack([a, np.zeros((a.shape[0], 60), np.float32)])   # noqa: E731
+    dual = _lam_grid(pad(z[:50]), y[:50],
+                     {"val": (pad(z[50:70]), y[50:70]), "test": (pad(z[70:]), y[70:])})
+    for split in ("val", "test"):
+        for m in LAM_MULTS:
+            assert primal[split][m] == pytest.approx(dual[split][m], abs=1e-4)
+
+
+def test_primal_branch_is_taken_only_when_d_is_below_n() -> None:
+    """The dual builds eval kernels; the primal has none. Phase keys are the observable."""
+    import scripts.neuroprobe.v3_board_readout as B
+
+    rng = np.random.default_rng(6)
+    y = np.array([float(i % 2) for i in range(40)])
+    z = rng.normal(size=(40, 6)).astype(np.float32)
+    ev = {"val": (z[20:30], y[20:30]), "test": (z[30:], y[30:])}
+
+    B._PH.clear()
+    _lam_grid(z[:20], y[:20], ev)                       # d=6 < n=20 -> primal
+    assert "eval_kernels" not in B._PH
+
+    wide = np.hstack([z, rng.normal(size=(40, 60))]).astype(np.float32)
+    B._PH.clear()
+    _lam_grid(wide[:20], y[:20],
+              {"val": (wide[20:30], y[20:30]), "test": (wide[30:], y[30:])})   # d=66 > n=20
+    assert "eval_kernels" in B._PH
+    B._PH.clear()
