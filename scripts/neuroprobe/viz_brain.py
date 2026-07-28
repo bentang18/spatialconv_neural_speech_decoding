@@ -200,6 +200,72 @@ def figure_3d(sessions, frame: int, times, out_path: str) -> None:
     print(f"[write] {out_path}", flush=True)
 
 
+def animate_brain(sessions, times, out_path: str, *, fps: int = 12,
+                  orbit_frames: int = 90, hold: int = 6) -> dict:
+    """Six native-space clouds, colour advancing in time, then a camera orbit.
+
+    The still can only show one instant, and the interesting claim is that the SAME colour
+    appears in the SAME anatomy at the SAME moment in heads that were never aligned. That is
+    a claim about time, so it wants a time axis. The orbit then rules out the obvious
+    objection to any 3-D scatter -- that agreement is an artefact of one projection.
+
+    Every frame re-scatters rather than mutating face colours: Path3DCollection's colour
+    handling depends on depth-sort state, and a frame that silently kept the previous
+    colours would be indistinguishable from a correct one.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.animation as animation
+    import matplotlib.pyplot as plt
+
+    from scripts.neuroprobe.viz_video import _writer
+
+    subs = _one_per_subject(sessions)
+    n_t = subs[0]["rgb"].shape[1]
+    cols = 3
+    rows = (len(subs) + cols - 1) // cols
+    fig = plt.figure(figsize=(3.7 * cols, 3.4 * rows))
+    axes, clouds = [], []
+    for i, s in enumerate(subs):
+        ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
+        c3 = s["coords"]
+        clouds.append((-c3[:, 2], -c3[:, 0], -c3[:, 1]))
+        axes.append(ax)
+    title = fig.suptitle("", fontsize=11)
+    n_frames = n_t + hold + orbit_frames
+
+    def draw(i: int):
+        if i < n_t:
+            f, phase = i, "time"
+            spin = i * (25.0 / max(n_t, 1))
+        else:
+            f, phase = n_t - 1, "orbit"
+            spin = 25.0 + (i - n_t - hold) * (360.0 / max(orbit_frames, 1))
+        for ax, s, (x, y, zc) in zip(axes, subs, clouds):
+            ax.clear()
+            ax.scatter(x, y, zs=zc, c=s["rgb"][:, f, :], s=20, edgecolors="k",
+                       linewidths=0.2, depthshade=False)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_zticks([])
+            ax.set_xlabel("A", fontsize=7)
+            ax.set_ylabel("R", fontsize=7)
+            ax.set_zlabel("S", fontsize=7)
+            ax.set_title(f"S{s['subject_id']}", fontsize=9)
+            ax.view_init(elev=14, azim=-62 + spin)
+        title.set_text(f"native-space electrode clouds · colour = 3 shared PCs of the class "
+                       f"contrast\nt = {times[f]:+.2f} s · {phase}")
+        return []
+
+    writer, dst = _writer(out_path, fps)
+    anim = animation.FuncAnimation(fig, draw, frames=n_frames, interval=1000 // fps,
+                                   blit=False)
+    anim.save(dst, writer=writer)
+    plt.close(fig)
+    print(f"[write] {dst} ({n_frames} frames, {n_frames / fps:.1f}s)", flush=True)
+    return {"path": dst, "n_frames": n_frames, "n_subjects": len(subs), "t_len": n_t}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--red-dir", required=True, help="per-electrode reductions")
@@ -210,6 +276,8 @@ def main() -> None:
     ap.add_argument("--rate", type=float, default=32.0)
     ap.add_argument("--offset", type=float, default=0.0, help="seconds of the first frame")
     ap.add_argument("--frame", type=int, default=None, help="default: peak colour spread")
+    ap.add_argument("--video", action="store_true", help="also render the orbiting clip")
+    ap.add_argument("--fps", type=int, default=12)
     args = ap.parse_args()
 
     sessions, evr = build(args.red_dir, args.coords, args.tap, args.task)
@@ -235,6 +303,9 @@ def main() -> None:
     figure_3d(sessions, frame, times, os.path.join(args.out_dir, f"brain_3d_{stem}.png"))
     frames = np.linspace(0, n_t - 1, 6).astype(int).tolist()
     figure_time(sessions, frames, times, os.path.join(args.out_dir, f"brain_time_{stem}.png"))
+    if args.video:
+        animate_brain(sessions, times,
+                      os.path.join(args.out_dir, f"vid_brain_{stem}.mp4"), fps=args.fps)
 
 
 if __name__ == "__main__":

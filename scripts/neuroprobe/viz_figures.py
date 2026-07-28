@@ -172,12 +172,16 @@ def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
     return info
 
 
-def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
-    """One shared 3-PC space, one panel per task, contrast trajectories coloured by subject.
+def task_basis(sessions, lobes, tap: str, tasks):
+    """The shared 3-PC geometry behind both the task panel and the animation.
 
-    The claim being shown is two-sided and one basis makes both visible at once: within a
-    decodable task, subjects trace the SAME path; across tasks, the paths differ. The basis
-    is fit on the pooled contrasts of every task so no task gets a basis flattering to it.
+    Returned rather than recomputed in each renderer: a video drawn in a basis that is not
+    quite the figure's basis is a bug nobody can see. (per_task, comps, mu, evr, lim).
+
+    ``lim`` is ONE axis range for every panel and every frame. Per-panel autoscaling is the
+    lie here: a task with no signal gets blown up to fill its box and reads as a trajectory,
+    when the honest picture is that it barely moves. With a shared range the dud collapses
+    to a dot, which is what a cross-subject r of ~0 actually looks like.
     """
     per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True)
                 for t in tasks}
@@ -195,22 +199,31 @@ def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
     per_task = {t: [(s, m / scale[s.key] if scale.get(s.key, 0) > 0 else m) for s, m in v]
                 for t, v in per_task.items()}
     if not per_task:
-        return {}
+        return {}, np.zeros((3, 0)), np.zeros(0), np.zeros(3), 0.0
     stack = np.concatenate([m.reshape(-1, m.shape[-1])
                             for v in per_task.values() for _, m in v], axis=0)
     comps, mu, evr = pca_basis(stack, k=3)
+    lim = max(float(np.abs(_traj(m, comps, mu)).max())
+              for v in per_task.values() for _, m in v)
+    return per_task, comps, mu, evr, lim
+
+
+def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
+    """One shared 3-PC space, one panel per task, contrast trajectories coloured by subject.
+
+    The claim being shown is two-sided and one basis makes both visible at once: within a
+    decodable task, subjects trace the SAME path; across tasks, the paths differ. The basis
+    is fit on the pooled contrasts of every task so no task gets a basis flattering to it.
+    """
+    per_task, comps, mu, evr, lim = task_basis(sessions, lobes, tap, tasks)
+    if not per_task:
+        return {}
 
     n = len(per_task)
     ncol = min(3, n)
     nrow = (n + ncol - 1) // ncol
     fig = plt.figure(figsize=(5.2 * ncol, 4.6 * nrow))
     align = {}
-    # ONE axis range for every panel. Per-panel autoscaling is the lie here: a task with no
-    # signal gets blown up to fill its box and reads as a trajectory, when the honest picture
-    # is that it barely moves. With a shared range the dud collapses to a dot, which is what
-    # a cross-subject r of ~0 actually looks like.
-    lim = max(float(np.abs(_traj(m, comps, mu)).max())
-              for v in per_task.values() for _, m in v)
     for i, (t, v) in enumerate(per_task.items()):
         ax = fig.add_subplot(nrow, ncol, i + 1, projection="3d")
         ax.set_xlim(-lim, lim)

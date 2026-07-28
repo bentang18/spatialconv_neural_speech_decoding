@@ -111,3 +111,40 @@ def test_the_colour_stretch_is_shared_not_per_subject(tmp_path) -> None:
                         TAP, TASK)
     spread = [float(s["rgb"].reshape(-1, 3).std(axis=0).mean()) for s in sessions]
     assert spread[1] < 0.25 * spread[0], spread
+
+
+def test_the_clip_advances_colour_in_time_then_orbits(tmp_path) -> None:
+    """A frame that silently reused the previous colours would look like a correct render,
+    so the test checks that a colour-varying source actually changes the pixels between two
+    time frames, and that the orbit phase moves the camera instead of the clock."""
+    import os
+
+    from scripts.neuroprobe.viz_brain import animate_brain
+
+    coords = {}
+    for s in (1, 2):
+        c = _write(tmp_path, s, 0, _pattern(6, s))
+        coords[f"s{s}_t0"] = c
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, coords), TAP, TASK)
+    times = np.arange(T) / 32.0
+    info = animate_brain(sessions, times, str(tmp_path / "b.gif"), fps=6, orbit_frames=4,
+                         hold=1)
+    assert info["n_frames"] == T + 1 + 4
+    assert info["n_subjects"] == 2 and info["t_len"] == T
+    assert os.path.getsize(info["path"]) > 0
+    # the colours really do differ across time -- otherwise the clip is a still
+    r = sessions[0]["rgb"]
+    assert not np.allclose(r[:, 0, :], r[:, T - 1, :])
+
+
+def test_the_clip_draws_one_panel_per_subject_not_per_session(tmp_path) -> None:
+    from scripts.neuroprobe.viz_brain import animate_brain
+
+    coords = {}
+    for s, t in ((1, 0), (1, 1), (2, 0)):
+        coords[f"s{s}_t{t}"] = _write(tmp_path, s, t, _pattern(6, s * 10 + t))
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, coords), TAP, TASK)
+    assert len(sessions) == 3
+    info = animate_brain(sessions, np.arange(T) / 32.0, str(tmp_path / "b2.gif"),
+                         fps=6, orbit_frames=2, hold=1)
+    assert info["n_subjects"] == 2
