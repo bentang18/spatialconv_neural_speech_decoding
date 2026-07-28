@@ -24,6 +24,42 @@ import numpy as np
 import torch
 
 
+def make_parcel_fn(bt_root: str, atlas: str = "dkt"):
+    """The DKT hard tag per electrode, as a plain numpy function.
+
+    Deliberately NOT ``dispatch_v3.make_bt_parcel_fn``: importing that module pulls in
+    lr_schedule and so neuraltrain, which is absent from the Delta CPU environment this
+    script runs in. The rule is reproduced rather than imported, and two things keep the
+    copy from rotting -- a test pins it against ``make_bt_parcel_fn``'s output, and at
+    runtime the ``[check]`` below compares the tags to the encode's own ``parcel_canon``,
+    so a drifted rule refuses to write instead of mislabelling every row of a brain figure.
+    """
+    from speech_decoding.studies.braintreebank.anatomy import (
+        aligned_voltage_support,
+        atlas_spec,
+    )
+
+    lcol, plabels = atlas_spec(atlas)
+    unknown_id = len(plabels)          # reserved id, distinct from every real parcel 0..K-1
+
+    def parcel_fn(subject_id: int, trial_id: int, labels) -> np.ndarray:
+        hs = aligned_voltage_support(
+            bt_root, subject_id, trial_id=trial_id,
+            parcel_labels=plabels, unmapped_policy="zero", label_column=lcol,
+        )
+        by_label = {
+            lab: (int(hs.support[c].argmax()) if bool(hs.support[c].any()) else unknown_id)
+            for c, lab in enumerate(hs.electrode_labels)
+        }
+        missing = [lab for lab in labels if lab not in by_label]
+        if missing:
+            raise KeyError(f"subject {subject_id} trial {trial_id}: cache labels absent "
+                           f"from the voltage order {missing[:5]}")
+        return np.asarray([by_label[lab] for lab in labels], dtype=np.int64)
+
+    return parcel_fn
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", required=True, help="encode cache dir (for parcel_canon)")
@@ -31,13 +67,12 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    from speech_decoding.experiments.dispatch_v3 import make_bt_parcel_fn
     from speech_decoding.studies.braintreebank.anatomy import (
         aligned_voltage_coords,
         lite_voltage_order,
     )
 
-    parcel_fn = make_bt_parcel_fn(args.bt_root)
+    parcel_fn = make_parcel_fn(args.bt_root)
     out: dict = {}
     ok = True
     for path in sorted(glob.glob(os.path.join(args.cache, "enc_s*_t*.pt"))):
@@ -46,7 +81,7 @@ def main() -> None:
         canon = np.asarray(rec["parcel_canon"], dtype=np.int64)
 
         order = list(lite_voltage_order(args.bt_root, subj, trial))
-        got = parcel_fn(subj, trial, order).cpu().numpy().astype(np.int64)
+        got = parcel_fn(subj, trial, order)
         same = len(got) == len(canon) and bool((got == canon).all())
         n_bad = int(len(canon)) if len(got) != len(canon) else int((got != canon).sum())
         print(f"[check] s{subj}_t{trial} rows={len(canon)} lite={len(order)} "
