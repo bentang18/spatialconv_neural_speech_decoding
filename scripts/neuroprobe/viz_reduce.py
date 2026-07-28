@@ -184,6 +184,16 @@ def reduce_session(path: str, *, taps, tasks, band: str, chunk: int, verbose: bo
             print(f"[tap] s{subj}_t{trial} {tap}: |P|={n_p} T={t_len} C={c_len} "
                   f"band={band}", flush=True)
         del feat, col_sum, col_sq, acc, member
+
+    # A record that carries NONE of the requested taps used to write a 0.0 MB file of pure
+    # metadata and exit 0. A 12-shard array then "succeeded" into an empty reduction, and the
+    # emptiness only showed up much later as figures that could not be drawn. Same shape as
+    # the CSession-without-sidecar trap: exit 0 is not evidence of output.
+    written = sorted({k.split("/", 1)[0] for k in out if "/" in k} - {"count", "n"})
+    if not written:
+        raise SystemExit(
+            f"s{subj}_t{trial}: none of the requested taps {list(taps)} are in this record "
+            f"(it has {sorted(rec['feats'])}) -- refusing to write a metadata-only shard")
     return out
 
 

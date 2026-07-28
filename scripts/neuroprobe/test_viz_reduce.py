@@ -217,3 +217,26 @@ def test_contiguous_and_fancy_paths_agree(tmp_path) -> None:
     expected_first = 9.5 * 1000.0 + 80.0
     np.testing.assert_allclose(got[0, 0, 0], expected_first, rtol=1e-3)
     np.testing.assert_allclose(got[0, 0, 1], expected_first + 1, rtol=1e-3)
+
+
+def test_a_record_with_none_of_the_requested_taps_refuses_to_write(tmp_path) -> None:
+    """The 2 s viz encode was deliberately pooled-taps-only (per-electrode taps would have
+    been ~1.1 TB against 2.2 TB of headroom), so asking it for ``enc0_elec`` finds nothing.
+    That used to print ``[skip]`` per tap, write 0.0 MB of pure metadata and exit 0, and a
+    12-shard array "COMPLETED" into an empty reduction. Same shape as the CSession-without-
+    sidecar trap: exit 0 is not evidence of output."""
+    p, _, _, _ = _synthetic(tmp_path)
+    with pytest.raises(SystemExit, match="none of the requested taps"):
+        reduce_session(p, taps=("enc0_elec", "enc12_elec"), tasks=("onset",), band="hga",
+                       chunk=8, verbose=False)
+
+
+def test_a_partially_present_tap_list_still_writes_what_it_found(tmp_path) -> None:
+    """The guard must fire only on a TOTALLY empty reduction. One missing tap out of two is
+    the normal case for a cache that stores a subset of the ladder, and dropping that shard
+    would throw away real work."""
+    p, _, n_p, d = _synthetic(tmp_path)
+    out = reduce_session(p, taps=("enc0_elec", "enc12"), tasks=("onset",), band="hga",
+                         chunk=8, verbose=False)
+    assert out["enc12/shape"].tolist() == [n_p, 32, d]
+    assert not any(k.startswith("enc0_elec/") for k in out)
