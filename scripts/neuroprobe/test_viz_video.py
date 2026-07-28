@@ -119,3 +119,56 @@ def test_pooled_clip_draws_one_curve_per_subject_not_per_session(tmp_path) -> No
                         fps=6, orbit_frames=3, hold=1, per_subject=True)
     assert info["n_sessions"] == 4 and info["n_curves"] == 4     # 4 subjects, 1 trial each
     assert info["per_subject"] is True
+
+
+def test_loop_schedule_turns_a_playback_rate_into_a_seamless_frame_budget() -> None:
+    """The clip length is a consequence of speed and repeats, never typed in. 64 frames of
+    32 Hz data at 0.5x is 16 fps, so one pass is 4 s and five passes are exactly 20 s."""
+    from scripts.neuroprobe.viz_video import loop_schedule
+
+    fps, n_frames, dur = loop_schedule(64, 5, 32.0, 0.5)
+    assert (fps, n_frames) == (16, 320) and abs(dur - 20.0) < 1e-9
+    assert loop_schedule(64, 5, 32.0, 1.0) == (32, 320, 10.0)     # 1x halves the duration
+
+
+def test_loop_clip_replays_without_a_pause_between_passes(tmp_path) -> None:
+    """A seamless wrap is the point: frame t_len must be pass 2 frame 1, not a held last
+    frame. Off-by-one here shows up as a visible stutter every replay."""
+    from scripts.neuroprobe.viz_video import animate_loop
+
+    sessions = _corpus(tmp_path, shared=True)
+    lobes = shared_lobes(sessions)
+    info = animate_loop(sessions, lobes, "enc12", TASK, [TASK], str(tmp_path / "l.gif"),
+                        hz=32.0, speed=0.5, repeats=3, deg_per_replay=25.0)
+    t_len = info["t_len"]
+    assert info["n_frames"] == t_len * 3                  # no hold, no orbit tail
+    assert [i % t_len + 1 for i in (t_len - 1, t_len)] == [t_len, 1]
+
+
+def test_rotating_clip_removes_every_element_that_repicks_its_box_edge() -> None:
+    """Spine, ticks, tick labels and axis label all get re-assigned to a different cube edge
+    as the view angle crosses a threshold, which under rotation reads as flipping rather than
+    motion. The loop clip must ship none of them, and must ship the triad that replaces them."""
+    import matplotlib.pyplot as plt
+
+    from scripts.neuroprobe.viz_video import _static_axis_chrome
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    n_grid = 6
+    _static_axis_chrome(ax, 1.0, n_grid=n_grid)
+    fig.canvas.draw()          # ticks regenerate on draw; the fix must survive that
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        assert axis.line.get_visible() is False
+        assert axis._axinfo["tick"]["inward_factor"] == 0.0
+        assert axis._axinfo["tick"]["outward_factor"] == 0.0
+        assert axis.pane.get_visible() is False    # back walls swap as the camera turns
+        assert all(not t.get_text() for t in axis.get_ticklabels())
+    assert (ax.get_xlabel(), ax.get_ylabel(), ax.get_zlabel()) == ("", "", "")
+    assert {t.get_text() for t in ax.texts} == {"PC1", "PC2", "PC3"}
+    # 3 triad arms + a floor grid drawn as plain segments, and NOTHING else: the floor must
+    # be real lines rather than matplotlib's grid, or it comes and goes with the panes.
+    assert len(ax.lines) == 3 + 2 * (n_grid + 1)
+    zs = [ln.get_data_3d()[2] for ln in ax.lines[:2 * (n_grid + 1)]]
+    assert all(set(z) == {-1.0} for z in zs), "floor grid must sit at z = -lim, flat"
+    plt.close(fig)
