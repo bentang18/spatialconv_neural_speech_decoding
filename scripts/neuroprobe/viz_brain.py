@@ -89,8 +89,35 @@ def build(red_dir: str, coords_npz: str, tap: str, task: str):
     for s, p in zip(sessions, proj):
         n = p.shape[0]
         s["rgb"] = rgb[off:off + n].reshape(s["x"].shape[0], s["x"].shape[1], 3)
+        # the raw projection as well: ``rgb`` is percentile-stretched, so ranking contacts by
+        # colour would rank them by where the stretch happened to put them, not by how
+        # strongly the contrast actually loads
+        s["proj"] = p.reshape(s["x"].shape[0], s["x"].shape[1], 3)
         off += n
     return sessions, evr
+
+
+def anatomy_of_extremes(sessions, frame: int, *, q: float = 0.9) -> dict:
+    """Which lobes carry the strongest class contrast, per subject, at one frame.
+
+    The picture shows a warm cluster in most heads and it is tempting to call that "the same
+    anatomy". This is the check that makes it a claim instead of an impression: rank each
+    subject's contacts by projection magnitude, take the top decile, and report where they
+    sit. Nothing here averages across subjects, so a lobe only looks common if it really is.
+    """
+    from scripts.neuroprobe.viz_common import lobe_of
+
+    per_subject: dict[int, dict[str, int]] = {}
+    for s in _one_per_subject(sessions):
+        mag = np.linalg.norm(s["proj"][:, frame, :], axis=-1)
+        top = mag >= np.quantile(mag, q)
+        lobes = lobe_of(s["parcel"][top], pool_hemi=True)
+        counts: dict[str, int] = {}
+        for lb in lobes:
+            counts[lb] = counts.get(lb, 0) + 1
+        per_subject[s["subject_id"]] = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+    shared = set.intersection(*(set(v) for v in per_subject.values())) if per_subject else set()
+    return {"per_subject": per_subject, "shared": sorted(shared)}
 
 
 def _one_per_subject(sessions):
@@ -109,22 +136,36 @@ VIEWS = (("sagittal", 2, 1, "posterior -> anterior", "inferior -> superior"),
          ("axial", 0, 2, "left -> right", "posterior -> anterior"))
 
 
+def display_span(sessions) -> float:
+    """One half-width in mm for every panel, so the heads are drawn at the SAME scale.
+
+    Letting matplotlib autoscale each subplot to its own cloud makes a sparse montage fill
+    the box and a dense one shrink, which reads as an anatomical difference that is really
+    just an axis choice. Panels are centred on each subject's own centroid -- a translation
+    for display only, not a registration; these stay native spaces.
+    """
+    return max(float(np.abs(s["coords"] - s["coords"].mean(axis=0)).max()) for s in sessions)
+
+
 def figure_views(sessions, frame: int, times, out_path: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     subs = _one_per_subject(sessions)
+    lim = display_span(subs)
     fig, axes = plt.subplots(len(subs), len(VIEWS),
                              figsize=(3.1 * len(VIEWS), 2.9 * len(subs)))
     axes = np.atleast_2d(axes)
     for r, s in enumerate(subs):
-        c3 = s["coords"]
+        c3 = s["coords"] - s["coords"].mean(axis=0)
         for k, (name, ix, iy, xl, yl) in enumerate(VIEWS):
             ax = axes[r, k]
             ax.scatter(-c3[:, ix], -c3[:, iy], c=s["rgb"][:, frame, :], s=26,
                        edgecolors="k", linewidths=0.25)
             ax.set_aspect("equal")
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
@@ -147,16 +188,19 @@ def figure_time(sessions, frames, times, out_path: str) -> None:
     import matplotlib.pyplot as plt
 
     subs = _one_per_subject(sessions)
+    lim = display_span(subs)
     fig, axes = plt.subplots(len(subs), len(frames),
                              figsize=(1.9 * len(frames), 2.0 * len(subs)))
     axes = np.atleast_2d(axes)
     for r, s in enumerate(subs):
-        c3 = s["coords"]
+        c3 = s["coords"] - s["coords"].mean(axis=0)
         for k, f in enumerate(frames):
             ax = axes[r, k]
             ax.scatter(-c3[:, 2], -c3[:, 1], c=s["rgb"][:, f, :], s=16,
                        edgecolors="k", linewidths=0.2)
             ax.set_aspect("equal")
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
@@ -176,15 +220,19 @@ def figure_3d(sessions, frame: int, times, out_path: str) -> None:
     import matplotlib.pyplot as plt
 
     subs = _one_per_subject(sessions)
+    lim = display_span(subs)
     cols = 3
     rows = (len(subs) + cols - 1) // cols
     fig = plt.figure(figsize=(4.0 * cols, 3.6 * rows))
     for i, s in enumerate(subs):
         ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
-        c3 = s["coords"]
+        c3 = s["coords"] - s["coords"].mean(axis=0)
         # zs by keyword: the 2D signature reads a third positional as the marker size
         ax.scatter(-c3[:, 2], -c3[:, 0], zs=-c3[:, 1], c=s["rgb"][:, frame, :], s=22,
                    edgecolors="k", linewidths=0.2, depthshade=False)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, lim)
         ax.set_xlabel("A", fontsize=7)
         ax.set_ylabel("R", fontsize=7)
         ax.set_zlabel("S", fontsize=7)
@@ -221,6 +269,7 @@ def animate_brain(sessions, times, out_path: str, *, fps: int = 12,
     from scripts.neuroprobe.viz_video import _writer
 
     subs = _one_per_subject(sessions)
+    lim = display_span(subs)
     n_t = subs[0]["rgb"].shape[1]
     cols = 3
     rows = (len(subs) + cols - 1) // cols
@@ -228,7 +277,7 @@ def animate_brain(sessions, times, out_path: str, *, fps: int = 12,
     axes, clouds = [], []
     for i, s in enumerate(subs):
         ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
-        c3 = s["coords"]
+        c3 = s["coords"] - s["coords"].mean(axis=0)
         clouds.append((-c3[:, 2], -c3[:, 0], -c3[:, 1]))
         axes.append(ax)
     title = fig.suptitle("", fontsize=11)
@@ -245,6 +294,11 @@ def animate_brain(sessions, times, out_path: str, *, fps: int = 12,
             ax.clear()
             ax.scatter(x, y, zs=zc, c=s["rgb"][:, f, :], s=20, edgecolors="k",
                        linewidths=0.2, depthshade=False)
+            # inside draw(): ax.clear() drops the limits, so setting them once outside would
+            # silently give every frame a per-subject autoscale again
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_zlim(-lim, lim)
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_zticks([])
@@ -296,6 +350,13 @@ def main() -> None:
               flush=True)
     else:
         frame = args.frame
+
+    ext = anatomy_of_extremes(sessions, frame)
+    for sid, counts in ext["per_subject"].items():
+        top = ", ".join(f"{k} {v}" for k, v in list(counts.items())[:4])
+        print(f"[check] S{sid} strongest-decile lobes: {top}", flush=True)
+    print(f"[check] lobes in EVERY subject's strongest decile: "
+          f"{ext['shared'] or 'NONE'}", flush=True)
 
     os.makedirs(args.out_dir, exist_ok=True)
     stem = f"{args.tap}_{args.task}"

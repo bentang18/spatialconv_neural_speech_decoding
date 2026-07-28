@@ -44,7 +44,10 @@ PROBE_TASKS = ("onset", "delta_volume", "word_index", "gpt2_surprisal")
 CS_TRAIN_ANCHOR = (2, 1)
 CS_TEST_SUBJECTS = (1, 3, 4, 6, 8, 9)
 ENCODERS = ("enc0", "enc3", "enc6", "enc12")
-ALL_TAPS = ENCODERS
+# enc0_log = the ASR log-magnitude gate twin of enc0 (v3_probe_encode_r4.py --enc0-log). It is a
+# valid --taps value and rides the generic per-tap ridge, but is kept OUT of the depth-ladder
+# ENCODERS so _print_ladder still reads the enc0→enc12 gradient; parse it from the JSON directly.
+ALL_TAPS = ENCODERS + ("enc0_log",)
 # Readout conditioning of the raw parcel-mean feature. std = per-feature z-score on TRAIN stats
 # (the FM linear-probe convention; also removes the enc0-is-already-normalized asymmetry — enc0
 # is robust-z'd pre-pool while taps are at network scale). raw = as-cached (r1/M9-comparable).

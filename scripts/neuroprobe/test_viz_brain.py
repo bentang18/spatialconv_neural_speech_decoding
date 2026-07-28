@@ -148,3 +148,49 @@ def test_the_clip_draws_one_panel_per_subject_not_per_session(tmp_path) -> None:
     info = animate_brain(sessions, np.arange(T) / 32.0, str(tmp_path / "b2.gif"),
                          fps=6, orbit_frames=2, hold=1)
     assert info["n_subjects"] == 2
+
+
+def test_every_panel_gets_the_same_millimetre_scale(tmp_path) -> None:
+    """Autoscaling each subplot to its own cloud makes a sparse montage fill the box and a
+    dense one shrink, which reads as anatomy but is only an axis choice."""
+    from scripts.neuroprobe.viz_brain import display_span
+
+    small = np.zeros((6, 3), dtype=np.float32)
+    small[:, 0] = np.linspace(-1, 1, 6)
+    big = small * 40.0
+    sessions = [{"coords": small}, {"coords": big}]
+    assert display_span(sessions) == pytest.approx(40.0)
+    # centring is on each subject's OWN centroid, so an offset head is not pushed off-frame
+    shifted = [{"coords": big + 500.0}]
+    assert display_span(shifted) == pytest.approx(40.0)
+
+
+def test_the_strongest_decile_is_ranked_by_projection_not_by_colour(tmp_path) -> None:
+    """rgb is percentile-stretched, so ranking contacts by colour ranks them by where the
+    stretch landed. The check has to use the raw projection or it measures the colormap."""
+    coords = {}
+    for s in (1, 2):
+        coords[f"s{s}_t0"] = _write(tmp_path, s, 0, _pattern(20, s))
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, coords), TAP, TASK)
+    for s in sessions:
+        assert "proj" in s and s["proj"].shape == (20, T, 3)
+        # rgb is bounded to the unit gamut; proj is not, which is how they differ
+        assert s["rgb"].min() >= 0.0 and s["rgb"].max() <= 1.0
+        assert s["proj"].min() < 0.0
+
+
+def test_anatomy_of_extremes_reports_per_subject_and_the_intersection(tmp_path) -> None:
+    from scripts.neuroprobe.viz_brain import anatomy_of_extremes
+
+    coords = {}
+    for s in (1, 2):
+        coords[f"s{s}_t0"] = _write(tmp_path, s, 0, _pattern(20, s))
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, coords), TAP, TASK)
+    got = anatomy_of_extremes(sessions, 0, q=0.9)
+    assert set(got["per_subject"]) == {1, 2}
+    for counts in got["per_subject"].values():
+        assert sum(counts.values()) >= 2          # a decile of 20 contacts
+        assert list(counts.values()) == sorted(counts.values(), reverse=True)
+    # the intersection is exactly that -- present for every subject, not a union
+    for lb in got["shared"]:
+        assert all(lb in c for c in got["per_subject"].values())
