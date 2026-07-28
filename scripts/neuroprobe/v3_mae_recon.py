@@ -28,6 +28,22 @@ from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig, sample
 HZ = 32.0
 
 
+def clip_starts_seconds(n_frames: int, clip_frames: int, n_clips: int) -> np.ndarray:
+    """Evenly spaced clip starts, in SECONDS, spanning the session.
+
+    ``_window_bands`` takes seconds and multiplies by FPS itself. Handing it frame indices
+    instead is a unit bug that does not look like one -- it raises "start=30763.0000s out of
+    bounds", which reads as a corrupt cache rather than a caller mistake. The spacing is
+    computed in frames and divided down so ``rint(start * FPS)`` recovers the exact integer
+    frame, leaving no chance that the last clip rounds one frame past the end.
+    """
+    last = n_frames - clip_frames
+    if last <= 0:
+        raise ValueError(f"session has {n_frames} frames, shorter than a {clip_frames}-frame clip")
+    frames = np.rint(np.linspace(0, last, n_clips)).astype(np.int64)
+    return frames / HZ
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
@@ -59,9 +75,12 @@ def main() -> None:
 
     # clips spread across the session, not the first N in a row: consecutive windows overlap
     # and would make the strip look more consistent than the data is
-    starts = np.linspace(0, spec.n_frames - clip_frames - 1, args.n_clips).astype(np.int64)
-    print(f"[check] n_frames={spec.n_frames} starts={starts.tolist()}", flush=True)
-    bands = _window_bands(spec, torch.as_tensor(starts), clip_frames, rate_mult=1)
+    starts = clip_starts_seconds(int(spec.n_frames), clip_frames, args.n_clips)
+    print(f"[check] n_frames={spec.n_frames} ({spec.n_frames / HZ:.1f}s) "
+          f"starts_s={[round(float(s), 2) for s in starts]}", flush=True)
+    # rate_mult=1, no per-band rates: r4 and r6 share the uniform 32 Hz caches
+    # (v3_probe_encode_r4.py:610). Declaring per-band rates here would misalign SLOW/MID.
+    bands = _window_bands(spec, starts, clip_frames, rate_mult=1)
     bands = [b.to(device) for b in bands]
 
     geom = spec.setup.geom.to(device)
@@ -119,7 +138,7 @@ def main() -> None:
         band_lengths=np.asarray([int(x) for x in g.band_lengths], dtype=np.int64),
         band_fdims=np.asarray([int(b.shape[-2]) for b in bands], dtype=np.int64),
         k_full=np.int64(g.k_full), clip_frames=np.int64(clip_frames),
-        starts=starts, subject_id=np.int64(args.subject), trial_id=np.int64(args.trial),
+        starts_s=starts, subject_id=np.int64(args.subject), trial_id=np.int64(args.trial),
         labels=np.asarray(spec.setup.sidecar.labels, dtype=object).astype(str),
     )
     print(f"[write] {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB)", flush=True)
