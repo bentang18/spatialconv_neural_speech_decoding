@@ -202,6 +202,32 @@ def test_identity_content_reports_a_small_identity_share_when_there_is_none(tmp_
     assert abs(ic["identity_var_frac"] + ic["within_session_var_frac"] - 1.0) < 1e-6
 
 
+def test_identity_content_withholds_the_score_when_the_projection_annihilates_everything(
+        tmp_path) -> None:
+    """More sessions than feature dimensions -> the identity span IS the whole space.
+
+    This is the real enc0 case, not a hypothetical: enc0's feature axis is the 7 |STFT| bins
+    and 12 session means span all 7 directions, so projecting identity out leaves float64
+    residue whose mean correlation came back at .1833 and was read as "pretraining moved
+    content out of the identity subspace". It was the correlation of nothing. The trained taps
+    are 256-d and keep ~96% of their norm under the same projection, so the two numbers were
+    never comparable. Refuse to report a number instead of reporting noise.
+    """
+    shared = _pattern(0)
+    rng = np.random.default_rng(11)
+    for s in range(1, C + 2):                          # C + 1 sessions in a C-dim space
+        _write(tmp_path, s, 0, {TEMPORAL: (10, shared)}, offset=rng.normal(size=(1, C)))
+    sessions = load_all(str(tmp_path))
+    ic = identity_content(sessions, ["temporal"], "enc12", TASK)
+    assert ic["feature_dim"] == C
+    assert ic["identity_rank"] == C, "C+1 generic offsets must span all C directions"
+    assert ic["identity_subspace_is_complete"] is True
+    assert ic["surviving_norm_frac_after_projection"] < 1e-6
+    assert np.isnan(ic["cross_subject_r_identity_removed"])
+    # the un-projected alignment is still measurable and must NOT be suppressed
+    assert ic["cross_subject_r"] > 0.9, ic["cross_subject_r"]
+
+
 def test_a_degenerate_ceiling_suppresses_the_normalized_score(tmp_path) -> None:
     """No within-subject reliability -> no denominator. Must be nan, not a big number."""
     rng = np.random.default_rng(11)

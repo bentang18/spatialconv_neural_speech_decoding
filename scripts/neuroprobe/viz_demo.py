@@ -40,16 +40,26 @@ HTML = """<title>Cross-subject structure in a self-supervised iEEG encoder</titl
   .swatch { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
   .stat { font-variant-numeric: tabular-nums; font-size: .85rem; }
   .stat b { font-size: 1.05rem; }
+  /* the 4-tap grid is 12 numeric columns wide, so it scrolls inside its own box rather than
+     forcing the page to scroll sideways on a narrow screen */
+  .tblwrap { overflow-x: auto; }
   table { border-collapse: collapse; font-size: .82rem; width: 100%; }
-  th, td { text-align: right; padding: 3px 8px; border-bottom: 1px solid rgba(128,128,128,.2); }
+  th, td { text-align: right; padding: 3px 6px; border-bottom: 1px solid rgba(128,128,128,.2);
+           white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
+  .selcol { background: rgba(128,128,160,.16); }
+  th.gap, td.gap { border-bottom: none; padding: 0 5px; }
   .note { font-size: .8rem; opacity: .75; margin-top: 10px; }
 </style>
 <h1>Six brains, one trajectory</h1>
 <div class="sub">Trial-averaged high-gamma responses from __NSESS__ BrainTreebank sessions
 (__NSUBJ__ subjects), passed through a self-supervised encoder trained without any labels.
 Each line is one session's <b>class-1 minus class-0</b> response tracing through a shared
-PCA space. Nothing here is fit to align subjects.</div>
+PCA space. <b>No per-subject alignment is fit</b> — each session gets one mean subtraction and
+one scalar rescaling, and neither can rotate one trajectory onto another. The 3-PC basis is
+shared, fit on all sessions pooled with no subject labels. The control is in the table:
+<code>frame_brightness</code> stays at r&nbsp;≈&nbsp;0 in this same basis at every depth, so
+the shared basis is not manufacturing the agreement.</div>
 
 <div class="ctl">
   <label>task <select id="task"></select></label>
@@ -77,7 +87,7 @@ PCA space. Nothing here is fit to align subjects.</div>
 </div>
 
 <div class="panel" style="margin-top:18px">
-  <table id="tbl"></table>
+  <div class="tblwrap"><table id="tbl"></table></div>
   <div class="note">Retrieval: take one subject's response at time t, and among another
   subject's timepoints pick the nearest. Chance is 1/T. This is the cross-subject claim in
   its most direct form.</div>
@@ -162,16 +172,31 @@ function drawRgb() {
 }
 
 function drawTable() {
+  // Every tap, not just the selected one. A single-tap table makes the depth ladder invisible
+  // unless the reader clicks through four times and remembers the numbers; the whole claim
+  // here is the TREND across taps, so the trend has to be on screen at once. The selected
+  // tap's column is highlighted so the dropdown still tells you where you are.
+  const taps = D.taps;
+  const cell = (v, sel, dp) =>
+    `<td${sel ? ' class="selcol"' : ""}>${dp === 0 ? v : v.toFixed(dp)}</td>`;
   const rows = D.tasks.map(t => {
-    const r = D.retrieval[tapSel.value][t];
-    const q = D.data[tapSel.value][t].align;
     const hl = t === taskSel.value ? ' style="font-weight:600"' : "";
-    return `<tr${hl}><td>${t}</td><td>${q.toFixed(2)}</td>` +
-           `<td>${r.top1.toFixed(3)}</td><td>${r.median_rank}</td></tr>`;
+    const a = taps.map(p => cell(D.data[p][t].align, p === tapSel.value, 2)).join("");
+    const r1 = taps.map(p => cell(D.retrieval[p][t].top1, p === tapSel.value, 3)).join("");
+    const mr = taps.map(p => cell(D.retrieval[p][t].median_rank, p === tapSel.value, 0)).join("");
+    return `<tr${hl}><td>${t}</td>${a}<td class="gap"></td>${r1}` +
+           `<td class="gap"></td>${mr}</tr>`;
   }).join("");
+  const head = taps.map(p =>
+    `<th class="${p === tapSel.value ? "selcol" : ""}">${p}</th>`).join("");
   $("tbl").innerHTML =
-    `<tr><th>task</th><th>cross-subject r</th><th>retrieval top-1` +
-    ` (chance ${D.chance.toFixed(3)})</th><th>median rank</th></tr>${rows}`;
+    `<tr><th></th><th colspan="${taps.length}">cross-subject r (3-PC)</th>` +
+    `<th class="gap"></th><th colspan="${taps.length}">retrieval top-1` +
+    ` (chance ${D.chance.toFixed(3)})</th>` +
+    `<th class="gap"></th><th colspan="${taps.length}">median rank (chance ` +
+    `${Math.round(D.nframes / 2)})</th></tr>` +
+    `<tr><th>task</th>${head}<th class="gap"></th>${head}` +
+    `<th class="gap"></th>${head}</tr>${rows}`;
 }
 
 function draw() {

@@ -449,13 +449,36 @@ def identity_content(sessions, lobes, tap: str, task: str) -> dict:
               if si.subject_id != sj.subject_id]
         return float(np.nanmean(rs)) if rs else float("nan")
 
+    # How much of the contrast SURVIVES the projection. This is not decoration: when the
+    # identity subspace spans the whole feature space the projection annihilates everything
+    # and _align(True) silently returns the mean correlation of float64 RESIDUE -- a number
+    # near 0.18 that reads as "identity carried the alignment" when it means "there is
+    # nothing left to correlate".
+    #
+    # It bites precisely at enc0, whose feature axis is the 7 |STFT| bins: 12 session means
+    # span all 7 directions, so rank == D and the surviving norm is ~2e-16. The trained taps
+    # are 256-d, where 12 means can only ever span 11, leaving ~96% of the norm. Comparing
+    # the two "identity removed" numbers across that boundary compares a representation
+    # against arithmetic noise. Report nan instead, and carry the fraction so the caller can
+    # see WHY.
+    surv = []
+    for _, m in collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True):
+        x = m.reshape(-1, m.shape[-1])
+        n0 = float(np.linalg.norm(x))
+        if n0 > 0:
+            surv.append(float(np.linalg.norm(x - (x @ q) @ q.T)) / n0)
+    surv_frac = float(np.mean(surv)) if surv else float("nan")
+    complete = int(q.shape[1]) >= int(tokens.shape[1]) or surv_frac < 1e-6
     return {
         "tap": tap, "task": task, "identity_rank": int(q.shape[1]),
-        "n_sessions": len(keys),
+        "n_sessions": len(keys), "feature_dim": int(tokens.shape[1]),
         "identity_var_frac": float(between / total) if total > 0 else float("nan"),
         "within_session_var_frac": float(within / total) if total > 0 else float("nan"),
         "cross_subject_r": _align(False),
-        "cross_subject_r_identity_removed": _align(True),
+        # nan, not a number, when the projection left nothing -- same policy as CEILING_FLOOR
+        "cross_subject_r_identity_removed": float("nan") if complete else _align(True),
+        "surviving_norm_frac_after_projection": round(surv_frac, 6),
+        "identity_subspace_is_complete": bool(complete),
     }
 
 
