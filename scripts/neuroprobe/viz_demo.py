@@ -95,7 +95,9 @@ subjects with different coverage.</span></div>
     <div class="note">The DINOv3 view: each row is one region of one subject, time runs
     left to right, and colour is the first three PCs of the 256-d channel axis. Subjects do
     not share rows -- these brains have no anatomy in common beyond the temporal lobe -- but
-    they share the colour basis, so matching colours mean matching representations.</div>
+    they share the colour basis, so matching colours mean matching representations.
+    The dashed rule is the event at t=0; everything to its left is pre-stimulus. The solid
+    rule is the player's current frame.</div>
   </div>
 </div>
 
@@ -188,6 +190,18 @@ function drawRgb() {
       y += rh;
     }
     y += 3;
+  }
+  // The event, fixed. Without it the strips are 2 s of colour with no anchor, and the eye
+  // cannot tell a pre-stimulus band from a response -- which is the whole reading of the
+  // panel once the origin is a pre-stimulus baseline. Dashed, so it never reads as the
+  // draggable cursor; two-tone, because the strips are full-saturation RGB and a plain
+  // white rule vanishes wherever a PC happens to be bright.
+  if (D.t0 !== null) {
+    const x0 = lab + D.t0 * cw;
+    g.beginPath(); g.moveTo(x0, 0); g.lineTo(x0, y);
+    g.setLineDash([]); g.strokeStyle = "rgba(0,0,0,.75)"; g.lineWidth = 2.5; g.stroke();
+    g.setLineDash([5, 4]); g.strokeStyle = "white"; g.lineWidth = 1; g.stroke();
+    g.setLineDash([]);
   }
   const ti = +tSlider.value;
   g.strokeStyle = "white"; g.lineWidth = 1.5;
@@ -346,10 +360,15 @@ def build(sessions, lobes, taps, tasks, hz: float, offset: float,
     # selecting it threw on `cur().align` -- a blank page for what is really a missing shard.
     present = [t for t in tasks if all(t in data[tap] for tap in data)]
     assert present, f"none of {list(tasks)} survived at every tap"
+    i0 = round(-offset * hz)
+    t0 = int(i0) if 0 < i0 < n_frames else None
     return {
         "tasks": present, "taps": list(taps), "nframes": int(n_frames),
         "times": [round(offset + i / hz, 4) for i in range(n_frames)],
         "chance": 1.0 / max(n_frames, 1), "n_pre": n_pre or 0,
+        # The event itself, as a frame index. None unless the window actually LEADS it:
+        # at offset=0 the event is the left edge and a rule on the border marks nothing.
+        "t0": t0,
         "lim": lim, "data": data, "retrieval": retr, "lobes": rgb_lobes,
         # cross-subject DECODING accuracy, from the board run on this same checkpoint.
         # The geometry and the accuracy are different claims; showing only the first

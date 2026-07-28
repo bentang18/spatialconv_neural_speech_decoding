@@ -61,6 +61,19 @@ def test_payload_is_json_serializable_and_shaped_for_the_page(tmp_path) -> None:
                for frame in row for px in frame)
 
 
+def test_the_strip_panel_marks_the_event_only_when_the_window_leads_it(tmp_path) -> None:
+    """t=0 is a fixed landmark, not a computed one, so the only thing that can go wrong is
+    marking it in the wrong place -- or drawing it at all when the window opens ON the event,
+    where a rule on the left border marks nothing and reads as a rendering artifact."""
+    sessions = _corpus(tmp_path, shared=True)
+    lobes = shared_lobes(sessions)
+    lead = build(sessions, lobes, ["enc12"], [TASK], 32.0, -0.5)
+    assert lead["t0"] == 16                       # 0.5 s x 32 Hz
+    assert abs(lead["times"][lead["t0"]]) < 1e-9  # and it really is the zero-second frame
+    assert build(sessions, lobes, ["enc12"], [TASK], 32.0, 0.0)["t0"] is None
+    assert 'if (D.t0 !== null)' in HTML
+
+
 def test_page_ships_a_player_driven_by_the_time_axis() -> None:
     """64 frames is too many to read by dragging, so the play control is part of the page.
     Its rate comes from ``times``, which is what makes 1x mean real time at either window."""
