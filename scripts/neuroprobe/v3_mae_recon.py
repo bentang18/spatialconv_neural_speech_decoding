@@ -15,6 +15,7 @@ GPU, on dtai. CPU-only work does not belong here.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 
 import numpy as np
@@ -123,9 +124,20 @@ def main() -> None:
               f"(ignored): {unexpected[:5]}", flush=True)
     obj.eval()
 
-    gen = torch.Generator(device="cpu").manual_seed(args.seed)
-    masks = sample_masks_r6(geom, int(parcel_id.shape[0]), n_time=clip_frames,
+    # sampled on the CPU geometry, then moved. sample_masks_r6 draws on geom.valid's device,
+    # so handing it the CUDA geom would demand a CUDA generator -- a different RNG stream from
+    # every existing mask test, for a figure whose only requirement is a representative mask.
+    # L1Geometry.to() returns a copy, so spec.setup.geom is still the CPU one.
+    gen = torch.Generator().manual_seed(args.seed)
+    masks = sample_masks_r6(spec.setup.geom, int(parcel_id.shape[0]), n_time=clip_frames,
                             n_rows=len(starts), generator=gen, cfg=V3MaskConfig())
+    masks = dataclasses.replace(masks, **{f.name: getattr(masks, f.name).to(device)
+                                          for f in dataclasses.fields(masks)})
+    # the polarity of contact_mask is not asserted here -- the masked FRACTION that matters is
+    # in_loss, checked against r6's 0.75 after the forward
+    print(f"[check] masks on {masks.contact_mask.device} "
+          f"contact_mask.mean={float(masks.contact_mask.float().mean()):.3f} "
+          f"hga={tuple(masks.hga_mask.shape)}", flush=True)
 
     seen: dict = {}
     orig = obj._mae_output
