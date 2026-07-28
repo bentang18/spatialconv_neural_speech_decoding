@@ -6,18 +6,43 @@ manufacture an effect live here once, in the open:
   * Lobe pooling is ELECTRODE-WEIGHTED. The cache stores a parcel MEAN, so pooling parcels
     into a lobe by a plain mean would weight a 1-electrode parcel like a 40-electrode one.
   * Standardization is per-channel, using each session's own mean/var over all trials,
-    parcels and time. It removes a per-subject channel offset and gain -- exactly the
-    nuisance that would otherwise dominate any cross-subject comparison -- and it cannot
-    manufacture a shared pattern over time or anatomy. enc0 is the control that proves
-    this: it gets the identical treatment, so anything enc12 shows that enc0 does not is
-    the encoder's doing, not the standardizer's.
-  * Per-subject centering is OPTIONAL and always reported. Subtracting a subject's own
-    grand mean removes the identity offset. It is the difference between asking "are these
-    subjects distinguishable" and "do they move the same way", and both are shown.
+    parcels and time. Be honest about its size: that is 2C numbers fit per session per tap
+    (512 at the 256-d taps), not "one rescaling". Two things keep it from manufacturing the
+    result. It is DIAGONAL, so it cannot rotate one subject's trajectory onto another's. And
+    it is fit LABEL-FREE, over every window regardless of class, so it cannot invent a class
+    contrast -- and in the contrast the mean term cancels outright, leaving only the gain.
+    It is needed because PCA is not scale-invariant: unstandardized, a few big-variance
+    channels own every component, and their scale differs by subject (electrode count,
+    impedance, coverage), so the "shared" basis would be whichever session shouts loudest.
+    enc0 is the control that proves the treatment is not the effect: it gets the identical
+    pipeline, so anything enc12 shows that enc0 does not is the encoder's doing.
+    NOT the same as the board readout's `std`, and the differences are worth stating because
+    the resemblance is close enough to mislead. (1) The readout z-scores every column of the
+    flattened (parcel x feature) vector separately (`v3_board_readout.py` `_standardize_inplace`),
+    so it also removes each parcel's offset and each timepoint's own profile; here the estimate
+    is pooled over parcels and time and is per-CHANNEL only, because the parcel and time
+    structure is the trajectory. (2) The readout reduces over windows alone; this reduces over
+    trials, parcels and time. (3) The readout fits on the TRAIN split because it has a held-out
+    test half to protect -- nothing is held out here, which is what the LOSO and split-half
+    bases in viz_figures are for. And in the CS regime plain `std` fits on the ANCHOR subject,
+    mapping the target into the anchor's frame; the per-subject analogue of what this does is
+    the readout's `std_target` (AdaBN-style), a separate reported column that is never selected.
+  * Per-subject centering is OPTIONAL and always reported, with two possible references --
+    see center_per_session. It is the difference between asking "are these subjects
+    distinguishable" and "do they move the same way", and both are shown.
+
+WHAT THIS PIPELINE DOES NOT SHOW, and no caption should imply. Lobe pooling averages every
+electrode of a lobe into ONE vector per timepoint, so all within-lobe spatial structure is
+gone; what remains is a lobe-mean time course. For the Lite cohort the shared-lobe
+intersection is a SINGLE lobe, so "average over lobes" is a no-op and the claim is "within
+temporal cortex, do subjects' lobe-averages move alike" -- not "do subjects share a spatial
+pattern". And "the same lobe" is not the same tissue: a subject with 100 temporal contacts
+and one with 10 average over very different samples of it, and nothing here corrects for it.
 """
 from __future__ import annotations
 
 import glob
+import json
 import os
 from dataclasses import dataclass
 
@@ -127,10 +152,35 @@ def session_matrix(sess: Session, tap: str, task: str, cls: int, half: str, lobe
     return np.stack(ok, axis=0)
 
 
-def center_per_session(mats: list[np.ndarray]) -> list[np.ndarray]:
-    """Remove each session's own grand mean over (rows, time). What is left is how that
-    session MOVES, with its identity offset gone -- the content half of the split."""
-    return [m - m.mean(axis=(0, 1), keepdims=True) for m in mats]
+def center_per_session(mats: list[np.ndarray], *,
+                       n_pre: int | None = None) -> list[np.ndarray]:
+    """Put every session on a common origin. Two references, and the choice is visible.
+
+    ``n_pre=None`` subtracts the grand mean over (rows, time) -- the window's own
+    time-average. That is what shipped first, and it has a specific cost: the origin is the
+    average of the response, so a contrast that RISES and stays up is drawn as leaving the
+    origin and coming back to it. Sustained and transient look the same.
+
+    ``n_pre=k`` subtracts the mean over the first k frames instead. Those frames are
+    pre-stimulus (the 2 s window is [-0.5, +1.5] s, so k=16 at 32 Hz), which makes the origin
+    "no class difference BEFORE the event" -- a reference you can state. The sustained part
+    now survives as the trajectory failing to return, which is the whole distinction between
+    `onset` (a word after silence: over by the end) and `speech` (a word inside ongoing talk:
+    the difference persists). Standard ERP baselining, and it only exists at 2 s -- the 1 s
+    window has no pre-stimulus frames, so it keeps the time-mean reference.
+
+    Note what baselining re-references rather than removes: for `speech` the classes already
+    differ before t=0 by construction, so that offset is real signal, and subtracting it means
+    the figure reads "change relative to the state at word onset". The caption has to say so.
+    """
+    if n_pre is None:
+        return [m - m.mean(axis=(0, 1), keepdims=True) for m in mats]
+    assert n_pre > 0, f"n_pre must be positive or None, got {n_pre}"
+    out = []
+    for m in mats:
+        assert n_pre < m.shape[1], f"n_pre={n_pre} needs < {m.shape[1]} frames"
+        out.append(m - m[:, :n_pre].mean(axis=(0, 1), keepdims=True))
+    return out
 
 
 def pca_basis(stack: np.ndarray, k: int = 3):
@@ -151,4 +201,30 @@ def to_rgb(proj: np.ndarray, lo: float = 2.0, hi: float = 98.0) -> np.ndarray:
     for i in range(proj.shape[-1]):
         a, b = np.percentile(proj[..., i], [lo, hi])
         out[..., i] = np.clip((proj[..., i] - a) / max(b - a, 1e-12), 0, 1)
+    return out
+
+
+def board_cs_auroc(path: str, *, norm: str = "std") -> dict:
+    """(task -> tap -> cross-subject AUROC) from a board results JSON.
+
+    The figures answer "do subjects move alike"; this answers "and does that buy decoding
+    accuracy". They are different questions and the page should show both, because a shared
+    trajectory that decodes at chance would be a geometry curiosity, not a result.
+
+    Board keys are "<run>|<task>", each carrying {"cs": {"<tap>|<norm>": {cell: auroc}}}.
+    CS cells are PER-SUBJECT and the board number is their MEAN -- quoting one cell is the
+    standard way to misreport this table, and partial cell sets read HIGH (a 4-cell subset
+    of the decoder ablation showed .6279 where all 10 cells gave .5991).
+    """
+    with open(path) as fh:
+        board = json.load(fh)
+    out: dict[str, dict[str, float]] = {}
+    for key, blob in board.items():
+        task = key.split("|", 1)[1] if "|" in key else key
+        cs = blob.get("cs") or {}
+        for tapnorm, cells in cs.items():
+            tap, _, nm = tapnorm.partition("|")
+            if nm != norm or not cells:
+                continue
+            out.setdefault(task, {})[tap] = float(np.mean(list(cells.values())))
     return out

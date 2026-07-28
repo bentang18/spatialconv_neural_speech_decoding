@@ -333,7 +333,8 @@ def main() -> None:
     ap.add_argument("--tap", default="enc12_elec")
     ap.add_argument("--task", default="onset")
     ap.add_argument("--rate", type=float, default=32.0)
-    ap.add_argument("--offset", type=float, default=0.0, help="seconds of the first frame")
+    # Required for the same reason as viz_demo's: a wrong value mislabels every frame silently.
+    ap.add_argument("--offset", type=float, required=True, help="seconds of the first frame")
     ap.add_argument("--frame", type=int, default=None, help="default: peak colour spread")
     ap.add_argument("--video", action="store_true", help="also render the orbiting clip")
     ap.add_argument("--fps", type=int, default=12)

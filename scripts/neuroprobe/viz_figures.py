@@ -69,7 +69,8 @@ def _cond_matrix(sess, tap: str, task: str, cls, half: str, lobes):
     return None if (m1 is None or m0 is None) else m1 - m0
 
 
-def collect(sessions, tap: str, task: str, cls, half: str, lobes, *, centered: bool):
+def collect(sessions, tap: str, task: str, cls, half: str, lobes, *, centered: bool,
+            n_pre: int | None = None):
     """(session, matrix) pairs for one condition, optionally identity-centered.
 
     cls=CONTRAST returns the class-1 minus class-0 difference. That is the quantity the
@@ -85,7 +86,7 @@ def collect(sessions, tap: str, task: str, cls, half: str, lobes, *, centered: b
         if m is not None:
             out.append((s, m))
     if centered and out:
-        mats = center_per_session([m for _, m in out])
+        mats = center_per_session([m for _, m in out], n_pre=n_pre)
         out = [(s, m) for (s, _), m in zip(out, mats)]
     return out
 
@@ -106,13 +107,31 @@ def unit_scale(pairs):
     return out
 
 
+def _proj_origin(mu: np.ndarray, n_pre: int | None) -> np.ndarray:
+    """Where the origin of the plotted space sits.
+
+    ``pca_basis`` centers the token stack before the SVD, which is right for finding the
+    DIRECTIONS but wrong for the origin once a pre-stimulus baseline is in play: projecting
+    with that mean subtracted puts the origin back at the pooled average of the response --
+    exactly the reference the baseline exists to escape. The symptom is a trajectory whose
+    pre-stimulus frames sit well off centre even though they are identically zero in the
+    data, which then reads as "it starts somewhere and comes back".
+
+    So with a baseline, project from zero. The directions are unchanged; only the coordinate
+    origin is, and it now means what the caption says it means. Without a baseline there is
+    no meaningful zero in the data, so the pooled mean stays.
+    """
+    return np.zeros_like(mu) if n_pre else mu
+
+
 def _traj(m: np.ndarray, comps: np.ndarray, mu: np.ndarray) -> np.ndarray:
     """(lobes, T, C) -> (T, 3): project to the shared basis, then average over lobes."""
     p = (m.reshape(-1, m.shape[-1]) - mu) @ comps.T
     return p.reshape(m.shape[0], m.shape[1], 3).mean(axis=0)
 
 
-def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
+def figure_a(sessions, lobes, tap: str, task: str, out_path: str,
+             *, n_pre: int | None = None) -> dict:
     """3-D trajectory in a shared PC space: raw, identity-centered, and the class contrast.
 
     Three panels because they answer three different questions, and only the third is about
@@ -123,10 +142,12 @@ def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
     """
     fig = plt.figure(figsize=(19, 6))
     info = {}
-    pairs_c = unit_scale(collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True))
+    pairs_c = unit_scale(collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True,
+                                 n_pre=n_pre))
     if pairs_c:
         stack_c = np.concatenate([m.reshape(-1, m.shape[-1]) for _, m in pairs_c], axis=0)
         comps_c, mu_c, evr_c = pca_basis(stack_c, k=3)
+        mu_c = _proj_origin(mu_c, n_pre)
         ax = fig.add_subplot(1, 3, 3, projection="3d")
         for s, m in pairs_c:
             p = _traj(m, comps_c, mu_c)
@@ -140,7 +161,8 @@ def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
         ax.set_zlabel("PC3")
         info["evr_contrast"] = [float(v) for v in evr_c]
     for col, centered in enumerate((False, True)):
-        pairs = {c: collect(sessions, tap, task, c, "all", lobes, centered=centered)
+        pairs = {c: collect(sessions, tap, task, c, "all", lobes, centered=centered,
+                            n_pre=n_pre)
                  for c in (0, 1)}
         stack = np.concatenate([m.reshape(-1, m.shape[-1])
                                 for c in (0, 1) for _, m in pairs[c]], axis=0)
@@ -172,7 +194,18 @@ def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
     return info
 
 
-def task_basis(sessions, lobes, tap: str, tasks):
+def _scale_across_tasks(per_task: dict) -> dict:
+    """ONE scale per session, shared across tasks; drops sessions with no signal at all."""
+    scale: dict[str, float] = {}
+    for v in per_task.values():
+        for s, m in v:
+            scale[s.key] = scale.get(s.key, 0.0) + float((m ** 2).sum())
+    scale = {k: float(np.sqrt(x)) for k, x in scale.items()}
+    return {t: [(s, m / scale[s.key]) for s, m in v if scale.get(s.key, 0.0) > 0]
+            for t, v in per_task.items()}
+
+
+def task_basis(sessions, lobes, tap: str, tasks, *, n_pre: int | None = None):
     """The shared 3-PC geometry behind both the task panel and the animation.
 
     Returned rather than recomputed in each renderer: a video drawn in a basis that is not
@@ -183,7 +216,8 @@ def task_basis(sessions, lobes, tap: str, tasks):
     when the honest picture is that it barely moves. With a shared range the dud collapses
     to a dot, which is what a cross-subject r of ~0 actually looks like.
     """
-    per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True)
+    per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True,
+                           n_pre=n_pre)
                 for t in tasks}
     per_task = {t: v for t, v in per_task.items() if v}
     # ONE scale per session, shared across tasks. Scaling each task separately would defeat
@@ -191,31 +225,27 @@ def task_basis(sessions, lobes, tap: str, tasks):
     # and the point of the panel is that it stays small. Scaling per session removes the
     # several-fold amplitude spread BETWEEN subjects, which otherwise sets the axis range
     # and dominates the pooled basis, while keeping each subject's own task ordering intact.
-    scale: dict[str, float] = {}
-    for v in per_task.values():
-        for s, m in v:
-            scale[s.key] = scale.get(s.key, 0.0) + float((m ** 2).sum())
-    scale = {k: np.sqrt(x) for k, x in scale.items()}
-    per_task = {t: [(s, m / scale[s.key] if scale.get(s.key, 0) > 0 else m) for s, m in v]
-                for t, v in per_task.items()}
+    per_task = _scale_across_tasks(per_task)
     if not per_task:
         return {}, np.zeros((3, 0)), np.zeros(0), np.zeros(3), 0.0
     stack = np.concatenate([m.reshape(-1, m.shape[-1])
                             for v in per_task.values() for _, m in v], axis=0)
     comps, mu, evr = pca_basis(stack, k=3)
+    mu = _proj_origin(mu, n_pre)
     lim = max(float(np.abs(_traj(m, comps, mu)).max())
               for v in per_task.values() for _, m in v)
     return per_task, comps, mu, evr, lim
 
 
-def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
+def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str,
+                 *, n_pre: int | None = None) -> dict:
     """One shared 3-PC space, one panel per task, contrast trajectories coloured by subject.
 
     The claim being shown is two-sided and one basis makes both visible at once: within a
     decodable task, subjects trace the SAME path; across tasks, the paths differ. The basis
     is fit on the pooled contrasts of every task so no task gets a basis flattering to it.
     """
-    per_task, comps, mu, evr, lim = task_basis(sessions, lobes, tap, tasks)
+    per_task, comps, mu, evr, lim = task_basis(sessions, lobes, tap, tasks, n_pre=n_pre)
     if not per_task:
         return {}
 
@@ -255,7 +285,128 @@ def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
     return {"evr": [float(v) for v in evr], "align_3pc": align}
 
 
-def figure_b(sessions, tap: str, task: str, cls, out_path: str) -> dict:
+def _cross_subject_r(v, comps, mu) -> float:
+    """Mean pairwise r between DIFFERENT subjects' 3-PC trajectories in a given basis."""
+    rs = [_corr(_traj(v[a][1], comps, mu).ravel(), _traj(v[b][1], comps, mu).ravel())
+          for a in range(len(v)) for b in range(a + 1, len(v))
+          if v[a][0].subject_id != v[b][0].subject_id]
+    return float(np.nanmean(rs)) if rs else float("nan")
+
+
+def align_loso(sessions, lobes, tap: str, tasks, *, n_pre: int | None = None) -> dict:
+    """Cross-subject r with the 3-PC basis fit WITHOUT the subjects being scored.
+
+    The pooled basis is fit on every session at once, so the first thing a reviewer asks is
+    whether the agreement is the basis's doing -- three directions chosen to maximize
+    variance over the very tokens that are then correlated. This refits per pair and excludes
+    BOTH members, which is stricter than leave-one-subject-out and symmetric: a pair's score
+    cannot depend on which of the two you nominate as held out.
+
+    If the pooled number survives here, the concentration result is clean. If it collapses,
+    the pooled basis was doing the work. (`retrieval` is already basis-free, so the pooled
+    number was never the only evidence -- this makes the PCA number honest too.)
+    """
+    per_task, _, _, _, _ = task_basis(sessions, lobes, tap, tasks, n_pre=n_pre)
+    if not per_task:
+        return {}
+    cache: dict[frozenset, tuple | None] = {}
+
+    def basis_excluding(excl: frozenset):
+        rows = [m.reshape(-1, m.shape[-1]) for v in per_task.values() for s, m in v
+                if s.subject_id not in excl]
+        if not rows:
+            return None
+        stack = np.concatenate(rows, axis=0)
+        # a basis needs more tokens than components, else the SVD returns arbitrary directions
+        if stack.shape[0] <= 3:
+            return None
+        comps, mu, evr = pca_basis(stack, k=3)
+        return comps, _proj_origin(mu, n_pre), evr
+
+    out = {}
+    for t, v in per_task.items():
+        rs = []
+        for a in range(len(v)):
+            for b in range(a + 1, len(v)):
+                sa, ma = v[a]
+                sb, mb = v[b]
+                if sa.subject_id == sb.subject_id:
+                    continue
+                excl = frozenset((sa.subject_id, sb.subject_id))
+                if excl not in cache:
+                    cache[excl] = basis_excluding(excl)
+                got = cache[excl]
+                if got is None:
+                    continue
+                comps, mu, _ = got
+                rs.append(_corr(_traj(ma, comps, mu).ravel(), _traj(mb, comps, mu).ravel()))
+        out[t] = float(np.nanmean(rs)) if rs else float("nan")
+    return out
+
+
+def align_splithalf(sessions, lobes, tap: str, tasks, *, n_pre: int | None = None) -> dict:
+    """Fit the basis on one interleaved trial half, score the other.
+
+    A different question from LOSO: is the shared structure trial noise? h0 and h1 are
+    interleaved halves of the same trials, so a basis fit on h0 that still lines subjects up
+    on h1 is not fitting the noise of the tokens it scores. Returns the h1 score under the
+    h0 basis, so nothing about the reported number was fit on the data it describes.
+    """
+    fit = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True, n_pre=n_pre)
+           for t in tasks}
+    fit = _scale_across_tasks({t: v for t, v in fit.items() if v})
+    score = {t: collect(sessions, tap, t, CONTRAST, "h1", lobes, centered=True, n_pre=n_pre)
+             for t in tasks}
+    score = _scale_across_tasks({t: v for t, v in score.items() if v})
+    fit0 = {t: collect(sessions, tap, t, CONTRAST, "h0", lobes, centered=True, n_pre=n_pre)
+            for t in tasks}
+    fit0 = _scale_across_tasks({t: v for t, v in fit0.items() if v})
+    if not fit0 or not score:
+        return {}
+    rows = [m.reshape(-1, m.shape[-1]) for v in fit0.values() for _, m in v]
+    if not rows:
+        return {}
+    comps, mu, _ = pca_basis(np.concatenate(rows, axis=0), k=3)
+    mu = _proj_origin(mu, n_pre)
+    return {t: _cross_subject_r(v, comps, mu) for t, v in score.items()}
+
+
+def peak_settle(sessions, lobes, tap: str, tasks, hz: float, offset: float,
+                *, n_pre: int | None = None) -> dict:
+    """When the contrast peaks, and whether it comes back. Makes "returns" vs "settles" readable.
+
+    With a pre-stimulus baseline the origin means "no class difference before the event", so
+    distance from the origin is directly interpretable: how far the response has moved from
+    where it started. `onset` peaks and returns nearly all the way -- a word after silence is
+    over. `speech` peaks and settles high -- the talking continues, so the difference from
+    silence never goes away. Under the time-mean origin both looked like closed loops.
+
+    `baseline_frac` is the built-in check, not a result: with n_pre set the pre-stimulus
+    radius is zero by construction, so anything but ~0 means the baseline never got applied.
+    """
+    per_task, comps, mu, _, _ = task_basis(sessions, lobes, tap, tasks, n_pre=n_pre)
+    out = {}
+    for t, v in per_task.items():
+        # mean radius curve over sessions; they are unit-scaled so the average is meaningful
+        rad = np.mean([np.linalg.norm(_traj(m, comps, mu), axis=1) for _, m in v], axis=0)
+        n_t = rad.shape[0]
+        pk = int(np.argmax(rad))
+        peak = float(rad[pk])
+        tail = float(rad[max(n_t - n_t // 4, 1):].mean())
+        base = float(rad[:n_pre].mean()) if n_pre else float("nan")
+        out[t] = {
+            "peak_s": round(offset + pk / hz, 4),
+            "peak": round(peak, 6),
+            "end_frac": round(float(rad[-1]) / peak, 4) if peak > 0 else float("nan"),
+            "settle_frac": round(tail / peak, 4) if peak > 0 else float("nan"),
+            "peak_over_settle": round(peak / tail, 4) if tail > 0 else float("nan"),
+            "baseline_frac": round(base / peak, 4) if (n_pre and peak > 0) else None,
+        }
+    return out
+
+
+def figure_b(sessions, tap: str, task: str, cls, out_path: str,
+             *, n_pre: int | None = None) -> dict:
     """Per-subject PC-RGB panels: rows are that subject's own lobes, columns are time."""
     per = []
     for s in sessions:
@@ -264,7 +415,7 @@ def figure_b(sessions, tap: str, task: str, cls, out_path: str) -> dict:
         if m is not None:
             per.append((s, lobes, m))
     assert per, "no session produced a panel"
-    centered = center_per_session([m for _, _, m in per])
+    centered = center_per_session([m for _, _, m in per], n_pre=n_pre)
     stack = np.concatenate([m.reshape(-1, m.shape[-1]) for m in centered], axis=0)
     comps, mu, evr = pca_basis(stack, k=3)
     proj = [((m.reshape(-1, m.shape[-1]) - mu) @ comps.T).reshape(m.shape[0], m.shape[1], 3)
@@ -300,7 +451,8 @@ def figure_b(sessions, tap: str, task: str, cls, out_path: str) -> dict:
     return {"evr": [float(v) for v in evr], "n_panels": n}
 
 
-def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None) -> dict:
+def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None,
+              *, n_pre: int | None = None) -> dict:
     """Can a token from one subject find the SAME timepoint in another subject?
 
     Correlation says the trajectories look alike overall; retrieval asks something sharper
@@ -309,7 +461,7 @@ def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None)
     temporal identity. The whole cross-subject decoding claim rests on tokens being
     comparable ACROSS brains, and this is that claim in its most direct form.
     """
-    pairs = collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True)
+    pairs = collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True, n_pre=n_pre)
     traj = []
     for s, m in pairs:
         x = m.mean(axis=0)                                    # (T, C), lobe-averaged
@@ -353,11 +505,12 @@ def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None)
     return out
 
 
-def quantify(sessions, lobes, tap: str, task: str, cls) -> dict:
+def quantify(sessions, lobes, tap: str, task: str, cls, *, n_pre: int | None = None) -> dict:
     """Cross-subject similarity vs the within-session split-half ceiling."""
-    grand = collect(sessions, tap, task, cls, "all", lobes, centered=True)
-    h0 = {s.key: m for s, m in collect(sessions, tap, task, cls, "h0", lobes, centered=True)}
-    h1 = {s.key: m for s, m in collect(sessions, tap, task, cls, "h1", lobes, centered=True)}
+    kw = {"centered": True, "n_pre": n_pre}
+    grand = collect(sessions, tap, task, cls, "all", lobes, **kw)
+    h0 = {s.key: m for s, m in collect(sessions, tap, task, cls, "h0", lobes, **kw)}
+    h1 = {s.key: m for s, m in collect(sessions, tap, task, cls, "h1", lobes, **kw)}
 
     ceiling = [_corr(_flat(h0[s.key]), _flat(h1[s.key]))
                for s, _ in grand if s.key in h0 and s.key in h1]
@@ -389,7 +542,8 @@ def quantify(sessions, lobes, tap: str, task: str, cls) -> dict:
     }
 
 
-def identity_content(sessions, lobes, tap: str, task: str) -> dict:
+def identity_content(sessions, lobes, tap: str, task: str,
+                     *, n_pre: int | None = None) -> dict:
     """Split the token cloud into a between-session (identity) and a within-session part.
 
     Separability, not invariance, is the claim being tested. Transfer does not require the
@@ -439,7 +593,8 @@ def identity_content(sessions, lobes, tap: str, task: str) -> dict:
         # the CONTRAST, not one class: alignment of a single condition mean is carried by
         # the condition-independent response profile and says nothing about content.
         mats = []
-        for s, m in collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True):
+        for s, m in collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True,
+                            n_pre=n_pre):
             x = m.reshape(-1, m.shape[-1])
             if project_out:
                 x = x - (x @ q) @ q.T
@@ -462,7 +617,8 @@ def identity_content(sessions, lobes, tap: str, task: str) -> dict:
     # against arithmetic noise. Report nan instead, and carry the fraction so the caller can
     # see WHY.
     surv = []
-    for _, m in collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True):
+    for _, m in collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True,
+                        n_pre=n_pre):
         x = m.reshape(-1, m.shape[-1])
         n0 = float(np.linalg.norm(x))
         if n0 > 0:
@@ -591,7 +747,17 @@ def main() -> None:
     ap.add_argument("--taps", default="enc0,enc3,enc6,enc12")
     ap.add_argument("--tasks-quant", default="onset,speech,delta_volume,word_index,"
                                              "word_part_speech,frame_brightness")
+    # Baseline reference. 0 keeps the window's time-average as the origin, which is what the
+    # 1 s window has to use (it has no pre-stimulus frames). At 2 s pass 16 (= 0.5 s x 32 Hz)
+    # so the origin becomes "no class difference before the event" and the sustained part of
+    # the response survives instead of being centered away.
+    ap.add_argument("--n-pre", type=int, default=0,
+                    help="pre-stimulus frames to baseline against; 0 = time-mean origin")
+    ap.add_argument("--hz", type=float, default=32.0)
+    ap.add_argument("--offset", type=float, default=0.0,
+                    help="seconds of the first frame (negative if the window leads onset)")
     args = ap.parse_args()
+    n_pre = args.n_pre or None
     os.makedirs(args.out_dir, exist_ok=True)
 
     sessions = load_all(args.red_dir)
@@ -605,28 +771,59 @@ def main() -> None:
 
     quant_tasks = [t for t in args.tasks_quant.split(",") if t]
     report: dict = {"sessions": [s.key for s in sessions], "shared_lobes": lobes,
-                    "taps": taps, "figures": {}, "quant": []}
+                    "taps": taps, "figures": {}, "quant": [],
+                    "n_pre": args.n_pre, "offset_s": args.offset, "hz": args.hz,
+                    "centering": "baseline" if n_pre else "time-mean"}
+    print(f"[check] origin = {report['centering']}"
+          + (f" (first {args.n_pre} frames, up to t={args.offset + args.n_pre / args.hz:+.3f}s)"
+             if n_pre else " (no pre-stimulus frames available)"))
 
     for tap in taps:
         p = os.path.join(args.out_dir, f"figA_trajectory_{tap}_{args.task}.png")
-        report["figures"][f"A/{tap}"] = figure_a(sessions, lobes, tap, args.task, p)
+        report["figures"][f"A/{tap}"] = figure_a(sessions, lobes, tap, args.task, p,
+                                                 n_pre=n_pre)
         print(f"[fig] {p}")
         p = os.path.join(args.out_dir, f"figB_pcrgb_{tap}_{args.task}.png")
-        report["figures"][f"B/{tap}"] = figure_b(sessions, tap, args.task, 1, p)
+        report["figures"][f"B/{tap}"] = figure_b(sessions, tap, args.task, 1, p,
+                                                 n_pre=n_pre)
         print(f"[fig] {p}")
         p = os.path.join(args.out_dir, f"figB_pcrgb_contrast_{tap}_{args.task}.png")
-        report["figures"][f"Bc/{tap}"] = figure_b(sessions, tap, args.task, CONTRAST, p)
+        report["figures"][f"Bc/{tap}"] = figure_b(sessions, tap, args.task, CONTRAST, p,
+                                                  n_pre=n_pre)
         print(f"[fig] {p}")
         p = os.path.join(args.out_dir, f"figT_tasks_{tap}.png")
-        info = figure_tasks(sessions, lobes, tap, quant_tasks, p)
+        info = figure_tasks(sessions, lobes, tap, quant_tasks, p, n_pre=n_pre)
         report["figures"][f"T/{tap}"] = info
         print(f"[fig] {p}  align={ {k: round(v, 3) for k, v in info.get('align_3pc', {}).items()} }")
+
+    # The honesty block: the pooled 3-PC number, the same number with the basis blind to the
+    # pair being scored, and the same number with the basis fit on the other trial half.
+    report["align_loso"], report["align_splithalf"], report["peak_settle"] = {}, {}, {}
+    for tap in taps:
+        pooled = report["figures"].get(f"T/{tap}", {}).get("align_3pc", {})
+        loso = align_loso(sessions, lobes, tap, quant_tasks, n_pre=n_pre)
+        half = align_splithalf(sessions, lobes, tap, quant_tasks, n_pre=n_pre)
+        ps = peak_settle(sessions, lobes, tap, quant_tasks, args.hz, args.offset, n_pre=n_pre)
+        report["align_loso"][tap] = loso
+        report["align_splithalf"][tap] = half
+        report["peak_settle"][tap] = ps
+        for t in quant_tasks:
+            if t not in loso:
+                continue
+            d = ps.get(t, {})
+            bf = d.get("baseline_frac")
+            flag = "" if bf is None else ("  [check] OK" if abs(bf) < 0.35
+                                          else f"  [check] VIOLATED base_frac={bf:+.3f}")
+            print(f"[basis] {tap:6s} {t:16s} pooled={pooled.get(t, float('nan')):+.4f} "
+                  f"loso={loso[t]:+.4f} splithalf={half.get(t, float('nan')):+.4f} "
+                  f"peak={d.get('peak_s', float('nan')):+.3f}s "
+                  f"settle_frac={d.get('settle_frac', float('nan')):.3f}{flag}")
 
     for task in quant_tasks:
         for tap in taps:
             for cls in (CONTRAST, 0, 1):
                 try:
-                    q = quantify(sessions, lobes, tap, task, cls)
+                    q = quantify(sessions, lobes, tap, task, cls, n_pre=n_pre)
                 except (KeyError, AssertionError):
                     continue
                 report["quant"].append(q)
@@ -639,7 +836,7 @@ def main() -> None:
     for tap in taps:
         for task in quant_tasks:
             p = os.path.join(args.out_dir, f"figR_retrieval_{tap}_{task}.png")
-            r = retrieval(sessions, lobes, tap, task, p)
+            r = retrieval(sessions, lobes, tap, task, p, n_pre=n_pre)
             if r:
                 report["retrieval"].append(r)
                 print(f"[retr]  {tap:6s} {task:16s} top1={r['top1']:.3f} "
@@ -648,7 +845,7 @@ def main() -> None:
 
     report["identity_content"] = []
     for tap in taps:
-        ic = identity_content(sessions, lobes, tap, args.task)
+        ic = identity_content(sessions, lobes, tap, args.task, n_pre=n_pre)
         if ic:
             report["identity_content"].append(ic)
             print(f"[ident] {tap:6s} {args.task:16s} identity_var={ic['identity_var_frac']:.3f} "

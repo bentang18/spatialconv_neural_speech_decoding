@@ -354,3 +354,86 @@ def test_figure_identity_skips_rows_with_no_variance_split(tmp_path) -> None:
     from scripts.neuroprobe.viz_figures import figure_identity
     assert figure_identity([{"tap": "enc0", "identity_var_frac": float("nan")}],
                            str(tmp_path / "i.png")) == {}
+
+
+def _shape_corpus(tmp_path, course):
+    """Four subjects whose contrast is `course` (T,) times a fixed channel pattern."""
+    patt = np.array([1.0, -0.6, 0.3, 0.8, -0.2, 0.5])
+    d = course[:, None] * patt[None, :]
+    profile = 20.0 * _pattern(0)
+    rng = np.random.default_rng(11)
+    for s in (1, 2, 3, 4):
+        jit = d + 0.02 * rng.normal(size=d.shape)
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10,
+                       {0: profile - 0.5 * jit, 1: profile + 0.5 * jit})
+    return load_all(str(tmp_path))
+
+
+def _course(plateau: float) -> np.ndarray:
+    """Rise at frame 8, peak 2.0 at 12, decay by 20 to `plateau`, hold. Pre-stimulus is 0."""
+    c = np.zeros(T)
+    c[8:12] = np.linspace(0.0, 2.0, 4)
+    c[12:20] = np.linspace(2.0, plateau, 8)
+    c[20:] = plateau
+    return c
+
+
+def test_baseline_origin_separates_a_response_that_returns_from_one_that_settles(tmp_path):
+    """The reason the origin moved, stated as a test.
+
+    `onset` decays to nothing and `speech` decays to a plateau. Under the window's own
+    time-average as origin, the plateau is folded INTO the origin, so the sustained response
+    is drawn ending nearer its start than the transient one -- the ordering literally
+    inverts, and both read as closed loops. Against a pre-stimulus baseline the ordering is
+    the physical one. This is the bug the demo was showing.
+    """
+    from scripts.neuroprobe.viz_figures import peak_settle
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    trans = _shape_corpus(tmp_path / "a", _course(0.0))
+    sust = _shape_corpus(tmp_path / "b", _course(1.0))
+    lobes = ["temporal"]
+
+    kw = dict(hz=32.0, offset=-0.25)
+    base_t = peak_settle(trans, lobes, "enc12", [TASK], n_pre=8, **kw)[TASK]
+    base_s = peak_settle(sust, lobes, "enc12", [TASK], n_pre=8, **kw)[TASK]
+    time_t = peak_settle(trans, lobes, "enc12", [TASK], n_pre=None, **kw)[TASK]
+    time_s = peak_settle(sust, lobes, "enc12", [TASK], n_pre=None, **kw)[TASK]
+
+    # the built-in check: against a pre-stimulus baseline the pre-stimulus radius IS zero
+    assert base_t["baseline_frac"] < 0.05 and base_s["baseline_frac"] < 0.05
+    # physical ordering: the transient returns, the sustained one does not
+    assert base_t["settle_frac"] < 0.15 < 0.35 < base_s["settle_frac"]
+    # and the time-mean origin gets it backwards, which is why it had to go
+    assert time_s["settle_frac"] < time_t["settle_frac"]
+
+
+def test_loso_basis_keeps_shared_structure_and_kills_independent_structure(tmp_path):
+    """The double-dip control. The pooled basis is fit on the very tokens it then scores, so
+    the number has to survive refitting with both scored subjects held out."""
+    from scripts.neuroprobe.viz_figures import align_loso
+
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "indep").mkdir()
+    shared = _shape_corpus(tmp_path / "shared", _course(1.0))
+    profile = 20.0 * _pattern(0)
+    rng = np.random.default_rng(3)
+    for s in (1, 2, 3, 4):
+        d = rng.normal(size=(T, C))
+        _write_classes(tmp_path / "indep", s, 0, TEMPORAL, 10,
+                       {0: profile - 0.5 * d, 1: profile + 0.5 * d})
+    indep = load_all(str(tmp_path / "indep"))
+    lobes = ["temporal"]
+
+    assert align_loso(shared, lobes, "enc12", [TASK], n_pre=8)[TASK] > 0.9
+    assert abs(align_loso(indep, lobes, "enc12", [TASK], n_pre=8)[TASK]) < 0.5
+
+
+def test_splithalf_basis_scores_the_half_it_was_not_fit_on(tmp_path):
+    """h0 fits the basis, h1 is scored in it, so nothing reported was fit on itself."""
+    from scripts.neuroprobe.viz_figures import align_splithalf
+
+    (tmp_path / "s").mkdir()
+    sess = _shape_corpus(tmp_path / "s", _course(1.0))
+    assert align_splithalf(sess, ["temporal"], "enc12", [TASK], n_pre=8)[TASK] > 0.9

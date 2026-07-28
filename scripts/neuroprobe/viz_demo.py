@@ -16,9 +16,11 @@ import os
 
 import numpy as np
 
-from scripts.neuroprobe.viz_common import load_all, pca_basis, shared_lobes, to_rgb
+from scripts.neuroprobe.viz_common import (
+    board_cs_auroc, load_all, pca_basis, shared_lobes, to_rgb,
+)
 from scripts.neuroprobe.viz_figures import (
-    CONTRAST, _corr, _traj, collect, retrieval,
+    CONTRAST, _corr, _proj_origin, _traj, align_loso, collect, peak_settle, retrieval,
 )
 
 HTML = """<title>Cross-subject structure in a self-supervised iEEG encoder</title>
@@ -55,17 +57,28 @@ HTML = """<title>Cross-subject structure in a self-supervised iEEG encoder</titl
 <div class="sub">Trial-averaged high-gamma responses from __NSESS__ BrainTreebank sessions
 (__NSUBJ__ subjects), passed through a self-supervised encoder trained without any labels.
 Each line is one session's <b>class-1 minus class-0</b> response tracing through a shared
-PCA space. <b>No per-subject alignment is fit</b> — each session gets one mean subtraction and
-one scalar rescaling, and neither can rotate one trajectory onto another. The 3-PC basis is
-shared, fit on all sessions pooled with no subject labels. The control is in the table:
-<code>frame_brightness</code> stays at r&nbsp;≈&nbsp;0 in this same basis at every depth, so
-the shared basis is not manufacturing the agreement.</div>
+PCA space. <b>Nothing fit here can rotate one subject onto another.</b> Each session gets a
+per-feature calibration (2·C numbers, fit label-free over all its own windows, so it cannot
+invent a class contrast — and in a contrast the mean term cancels outright), then one mean
+subtraction and one scalar rescale. All of it is diagonal; rotation is what alignment would
+need and none of these can do it. The 3-PC basis is shared, fit on all sessions pooled with
+no subject labels. Two controls: <code>frame_brightness</code> stays at r&nbsp;≈&nbsp;0 in
+this same basis at every depth, and the <b>LOSO</b> column refits the basis with <i>both</i>
+subjects of each scored pair held out, so the number cannot be the basis's doing.
+<br><b>Origin: __ORIGIN__.</b> __ORIGINWHY__
+<br><span style="opacity:.75">Scope: electrodes are pooled to a lobe mean, so within-lobe
+spatial structure is gone and this shows temporal, not spatial, correspondence. The shared
+lobe is a single lobe for this cohort, and "the same lobe" is not the same tissue across
+subjects with different coverage.</span></div>
 
 <div class="ctl">
   <label>task <select id="task"></select></label>
   <label>depth <select id="tap"></select></label>
   <label>time <input id="t" type="range" min="0" value="0" style="width:200px"></label>
+  <button id="play" title="play / pause">&#9654;</button>
+  <label>speed <select id="speed"></select></label>
   <span class="stat" id="tlab"></span>
+  <span class="note">t = 0 is the word onset</span>
 </div>
 <div class="ctl" id="subjects"></div>
 
@@ -88,15 +101,25 @@ the shared basis is not manufacturing the agreement.</div>
 
 <div class="panel" style="margin-top:18px">
   <div class="tblwrap"><table id="tbl"></table></div>
-  <div class="note">Retrieval: take one subject's response at time t, and among another
-  subject's timepoints pick the nearest. Chance is 1/T. This is the cross-subject claim in
-  its most direct form.</div>
+  <div class="note"><b>r</b> is agreement of the plotted 3-PC trajectories;
+  <b>LOSO</b> is the same number with the basis refit without either scored subject.
+  <b>Retrieval</b> takes one subject's response at time t and picks the nearest of another
+  subject's timepoints (chance 1/T) &mdash; basis-free, so it never touches the PCA.
+  <b>Decoding AUROC</b> is the ridge readout from the board run on this same checkpoint,
+  trained on other subjects and tested on held-out ones; CS cells are per-subject and this
+  is their mean. <b>peak s</b> is when the contrast is largest and <b>settle</b> is where it
+  ends up as a fraction of that peak &mdash; low means the response returns, high means it
+  stays up.</div>
 </div>
 
 <script>
 const D = __DATA__;
 const $ = id => document.getElementById(id);
 const taskSel = $("task"), tapSel = $("tap"), tSlider = $("t");
+const playBtn = $("play"), speedSel = $("speed");
+// 1x = real time, i.e. the window plays back in its own duration. Read off the time axis
+// rather than passed in, so the 1 s and 2 s pages need no separate knob.
+const HZ = 1 / (D.times[1] - D.times[0]);
 let hidden = new Set();
 
 for (const t of D.tasks) taskSel.add(new Option(t, t));
@@ -178,37 +201,83 @@ function drawTable() {
   // tap's column is highlighted so the dropdown still tells you where you are.
   const taps = D.taps;
   const cell = (v, sel, dp) =>
-    `<td${sel ? ' class="selcol"' : ""}>${dp === 0 ? v : v.toFixed(dp)}</td>`;
+    `<td${sel ? ' class="selcol"' : ""}>${v === null || v === undefined || !isFinite(v)
+       ? "&ndash;" : (dp === 0 ? v : v.toFixed(dp))}</td>`;
   const rows = D.tasks.map(t => {
     const hl = t === taskSel.value ? ' style="font-weight:600"' : "";
     const a = taps.map(p => cell(D.data[p][t].align, p === tapSel.value, 2)).join("");
+    const lo = taps.map(p => cell(D.data[p][t].loso, p === tapSel.value, 2)).join("");
     const r1 = taps.map(p => cell(D.retrieval[p][t].top1, p === tapSel.value, 3)).join("");
-    const mr = taps.map(p => cell(D.retrieval[p][t].median_rank, p === tapSel.value, 0)).join("");
-    return `<tr${hl}><td>${t}</td>${a}<td class="gap"></td>${r1}` +
-           `<td class="gap"></td>${mr}</tr>`;
+    const de = taps.map(p => cell(D.decode[p][t], p === tapSel.value, 4)).join("");
+    const sh = D.data[tapSel.value][t].shape || {};
+    return `<tr${hl}><td>${t}</td>${a}<td class="gap"></td>${lo}` +
+           `<td class="gap"></td>${r1}<td class="gap"></td>${de}` +
+           `<td class="gap"></td>` +
+           cell(sh.peak_s, true, 2) + cell(sh.settle_frac, true, 2) + `</tr>`;
   }).join("");
   const head = taps.map(p =>
     `<th class="${p === tapSel.value ? "selcol" : ""}">${p}</th>`).join("");
   $("tbl").innerHTML =
-    `<tr><th></th><th colspan="${taps.length}">cross-subject r (3-PC)</th>` +
+    `<tr><th></th><th colspan="${taps.length}">cross-subject r (3-PC, pooled basis)</th>` +
+    `<th class="gap"></th><th colspan="${taps.length}">same r, LOSO basis</th>` +
     `<th class="gap"></th><th colspan="${taps.length}">retrieval top-1` +
     ` (chance ${D.chance.toFixed(3)})</th>` +
-    `<th class="gap"></th><th colspan="${taps.length}">median rank (chance ` +
-    `${Math.round(D.nframes / 2)})</th></tr>` +
+    `<th class="gap"></th><th colspan="${taps.length}">cross-subject decoding AUROC` +
+    ` (chance 0.5)</th>` +
+    `<th class="gap"></th><th colspan="2">shape @ ${tapSel.value}</th></tr>` +
     `<tr><th>task</th>${head}<th class="gap"></th>${head}` +
-    `<th class="gap"></th>${head}</tr>${rows}`;
+    `<th class="gap"></th>${head}<th class="gap"></th>${head}` +
+    `<th class="gap"></th>` +
+    `<th class="selcol">peak s</th><th class="selcol">settle</th></tr>${rows}`;
 }
 
 function draw() {
   tSlider.max = D.nframes - 1;
   $("tlab").textContent = `${D.times[+tSlider.value].toFixed(2)} s`;
+  const dec = D.decode[tapSel.value][taskSel.value];
   $("score").innerHTML = `cross-subject r = <b>${cur().align.toFixed(2)}</b>` +
     ` &nbsp;·&nbsp; retrieval top-1 = <b>` +
     `${D.retrieval[tapSel.value][taskSel.value].top1.toFixed(3)}</b>` +
-    ` (chance ${D.chance.toFixed(3)})`;
+    ` (chance ${D.chance.toFixed(3)})` +
+    (dec == null ? "" :
+      ` &nbsp;·&nbsp; cross-subject decoding AUROC = <b>${dec.toFixed(4)}</b>` +
+      ` (chance 0.5)`);
   drawTraj(); drawRgb(); drawTable();
 }
-taskSel.onchange = tapSel.onchange = tSlider.oninput = draw;
+for (const v of [0.1, 0.25, 0.5, 1, 2]) speedSel.add(new Option(`${v}×`, v));
+speedSel.value = "0.5";
+
+// Accumulate elapsed time and redraw only when the frame index actually moves. At 0.1x a
+// frame lasts ~300 ms, so redrawing per animation frame would be ~20 wasted canvas repaints
+// per step.
+let raf = null, last = 0, acc = 0;
+function tick(ts) {
+  if (last) {
+    acc += (ts - last) / 1000 * HZ * (+speedSel.value);
+    if (acc >= 1) {
+      const adv = Math.floor(acc);
+      acc -= adv;
+      tSlider.value = (+tSlider.value + adv) % D.nframes;
+      draw();
+    }
+  }
+  last = ts;
+  raf = requestAnimationFrame(tick);
+}
+function setPlay(on) {
+  if (on === (raf !== null)) return;
+  if (on) {
+    last = 0; acc = 0;
+    raf = requestAnimationFrame(tick);
+    playBtn.innerHTML = "&#10074;&#10074;";
+  } else {
+    cancelAnimationFrame(raf); raf = null;
+    playBtn.innerHTML = "&#9654;";
+  }
+}
+playBtn.onclick = () => setPlay(raf === null);
+taskSel.onchange = tapSel.onchange = draw;
+tSlider.oninput = () => { setPlay(false); draw(); };
 draw();
 </script>
 """
@@ -217,14 +286,18 @@ COLORS = {1: "#e6194b", 2: "#3cb44b", 3: "#4363d8",
           4: "#f58231", 7: "#911eb4", 10: "#008080"}
 
 
-def build(sessions, lobes, taps, tasks, hz: float, offset: float) -> dict:
+def build(sessions, lobes, taps, tasks, hz: float, offset: float,
+          *, n_pre: int | None = None, decode: dict | None = None) -> dict:
     data: dict = {}
     lim: dict = {}
     retr: dict = {}
     rgb_lobes: dict = {}
     n_frames = 0
     for tap in taps:
-        per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True)
+        loso = align_loso(sessions, lobes, tap, tasks, n_pre=n_pre)
+        shape = peak_settle(sessions, lobes, tap, tasks, hz, offset, n_pre=n_pre)
+        per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True,
+                               n_pre=n_pre)
                     for t in tasks}
         per_task = {t: v for t, v in per_task.items() if v}
         # per-session scale shared across tasks -- identical to figure_tasks, so the page
@@ -236,9 +309,14 @@ def build(sessions, lobes, taps, tasks, hz: float, offset: float) -> dict:
         scale = {k: float(np.sqrt(x)) for k, x in scale.items()}
         per_task = {t: [(s, m / scale[s.key]) for s, m in v if scale.get(s.key, 0) > 0]
                     for t, v in per_task.items()}
+        # Loud, not skipped. A tap that silently vanishes takes the depth ladder with it,
+        # and enc0 IS the control -- a page missing it looks like a result rather than a
+        # missing shard.
+        assert per_task, f"tap {tap} carries none of {list(tasks)}"
         stack = np.concatenate([m.reshape(-1, m.shape[-1])
                                 for v in per_task.values() for _, m in v], axis=0)
         comps, mu, _ = pca_basis(stack, k=3)
+        mu = _proj_origin(mu, n_pre)
         lim[tap] = float(max(np.abs(_traj(m, comps, mu)[:, :2]).max()
                              for v in per_task.values() for _, m in v)) * 1.05
 
@@ -248,28 +326,43 @@ def build(sessions, lobes, taps, tasks, hz: float, offset: float) -> dict:
             rs = [_corr(traj[v[a][0].key].ravel(), traj[v[b][0].key].ravel())
                   for a in range(len(v)) for b in range(a + 1, len(v))
                   if v[a][0].subject_id != v[b][0].subject_id]
+            lo = loso.get(t, float("nan"))
             data[tap][t] = {
                 "traj": {k: np.round(p[:, :2], 4).tolist() for k, p in traj.items()},
                 "align": float(np.nanmean(rs)) if rs else 0.0,
-                "rgb": _rgb_panels(sessions, tap, t, rgb_lobes),
+                # JSON has no NaN; the page renders null as an em dash rather than "NaN"
+                "loso": None if not np.isfinite(lo) else round(float(lo), 4),
+                "shape": shape.get(t, {}),
+                "rgb": _rgb_panels(sessions, tap, t, rgb_lobes, n_pre=n_pre),
             }
             n_frames = next(iter(traj.values())).shape[0]
         retr[tap] = {}
         for t in tasks:
-            r = retrieval(sessions, lobes, tap, t)
+            r = retrieval(sessions, lobes, tap, t, n_pre=n_pre)
             retr[tap][t] = {"top1": round(r.get("top1", 0.0), 4),
                             "median_rank": r.get("median_rank", 0)}
+    # Advertise only tasks that produced a trajectory at EVERY tap. Asking for a task the
+    # reduction does not carry used to leave it in the dropdown with no data behind it, and
+    # selecting it threw on `cur().align` -- a blank page for what is really a missing shard.
+    present = [t for t in tasks if all(t in data[tap] for tap in data)]
+    assert present, f"none of {list(tasks)} survived at every tap"
     return {
-        "tasks": list(tasks), "taps": list(taps), "nframes": int(n_frames),
+        "tasks": present, "taps": list(taps), "nframes": int(n_frames),
         "times": [round(offset + i / hz, 4) for i in range(n_frames)],
-        "chance": 1.0 / max(n_frames, 1),
+        "chance": 1.0 / max(n_frames, 1), "n_pre": n_pre or 0,
         "lim": lim, "data": data, "retrieval": retr, "lobes": rgb_lobes,
+        # cross-subject DECODING accuracy, from the board run on this same checkpoint.
+        # The geometry and the accuracy are different claims; showing only the first
+        # invites "pretty, but does it decode?" and the answer is already computed.
+        "decode": {tap: {t: (decode or {}).get(t, {}).get(tap) for t in present}
+                   for tap in taps},
         "sessions": [{"key": s.key, "color": COLORS.get(s.subject_id, "#888")}
                      for s in sessions],
     }
 
 
-def _rgb_panels(sessions, tap: str, task: str, rgb_lobes: dict) -> dict:
+def _rgb_panels(sessions, tap: str, task: str, rgb_lobes: dict,
+                *, n_pre: int | None = None) -> dict:
     """PC-RGB per session, one shared stretch across every panel (the DINOv3 recipe)."""
     from scripts.neuroprobe.viz_common import center_per_session
     from scripts.neuroprobe.viz_figures import _cond_matrix
@@ -282,7 +375,7 @@ def _rgb_panels(sessions, tap: str, task: str, rgb_lobes: dict) -> dict:
             rgb_lobes[s.key] = own
     if not per:
         return {}
-    cen = center_per_session([m for _, _, m in per])
+    cen = center_per_session([m for _, _, m in per], n_pre=n_pre)
     stack = np.concatenate([m.reshape(-1, m.shape[-1]) for m in cen], axis=0)
     comps, mu, _ = pca_basis(stack, k=3)
     proj = [((m.reshape(-1, m.shape[-1]) - mu) @ comps.T).reshape(m.shape[0], m.shape[1], 3)
@@ -305,19 +398,50 @@ def main() -> None:
     ap.add_argument("--tasks", default="onset,speech,delta_volume,word_index,"
                                        "word_part_speech,frame_brightness")
     ap.add_argument("--hz", type=float, default=32.0)
-    ap.add_argument("--offset", type=float, default=0.0,
+    # Required, not defaulted: it is only a time-axis label, so a wrong value mislabels every
+    # frame and nothing crashes. The 2 s page shipped with the 1 s default and read +0.5 s off.
+    ap.add_argument("--offset", type=float, required=True,
                     help="seconds of the window before the event (negative if it leads)")
+    # Baseline reference; see viz_common.center_per_session. 0 keeps the window time-average
+    # as the origin, which is all the 1 s window can do. At 2 s pass 16 (0.5 s x 32 Hz).
+    ap.add_argument("--n-pre", type=int, default=0,
+                    help="pre-stimulus frames to baseline against; 0 = time-mean origin")
+    # Board results for the SAME checkpoint. Optional, because the page still makes its
+    # point without it, but a mismatched run would be worse than none -- hence explicit.
+    ap.add_argument("--board-json", default=None,
+                    help="board results JSON; adds cross-subject decoding AUROC")
     args = ap.parse_args()
+    n_pre = args.n_pre or None
+    assert not n_pre or args.offset < 0, \
+        f"--n-pre {args.n_pre} needs a window that leads onset, got --offset {args.offset}"
 
     sessions = load_all(args.red_dir)
     taps = [t for t in args.taps.split(",") if t and any(t in s.shapes for s in sessions)]
     tasks = [t for t in args.tasks.split(",") if t]
     lobes = shared_lobes(sessions)
     assert lobes, "no lobe shared by every subject"
-    payload = build(sessions, lobes, taps, tasks, args.hz, args.offset)
+    decode = board_cs_auroc(args.board_json) if args.board_json else None
+    payload = build(sessions, lobes, taps, tasks, args.hz, args.offset, n_pre=n_pre,
+                    decode=decode)
     subj = len({s.subject_id for s in sessions})
+    if n_pre:
+        origin = (f"the {args.n_pre} pre-stimulus frames "
+                  f"({args.offset:+.2f} to {args.offset + args.n_pre / args.hz:+.2f} s)")
+        why = ("Zero means <i>no class difference before the word</i>, so a response that "
+               "rises and stays up is drawn as failing to return — which is exactly how "
+               "<code>onset</code> (a word after silence, over by the end) differs from "
+               "<code>speech</code> (a word inside ongoing talk, the difference persists). "
+               "For <code>speech</code> the classes already differ before t=0, so this "
+               "re-references to the state at word onset rather than removing that offset.")
+    else:
+        origin = "the window's own time-average"
+        why = ("This window has no pre-stimulus frames, so the origin is the average of the "
+               "response itself. Sustained and transient contrasts therefore both read as "
+               "closed loops; use the 2 s page to tell them apart.")
     html = (HTML.replace("__DATA__", json.dumps(payload))
             .replace("__NSESS__", str(len(sessions)))
+            .replace("__ORIGINWHY__", why)
+            .replace("__ORIGIN__", origin)
             .replace("__NSUBJ__", str(subj)))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as fh:
