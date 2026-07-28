@@ -49,6 +49,32 @@ def _gen(seed=0):
     return g
 
 
+def test_no_space_rope_reaches_every_l1_block_in_every_tower() -> None:
+    """A2 threading: the flag must reach EVERY ``L1RoPE`` — encoder, predictor, and the
+    EMA-mirrored ``_TargetTower`` encoder. A partial thread is the dangerous failure:
+    the run trains, the loss looks fine, and half the model still sees contact index.
+    Counted, not spot-checked, and the default arm is asserted UNTOUCHED (all bases live).
+    """
+    from speech_decoding.models.v14_converged_v3.pe import L1RoPE
+
+    def idx_freqs(model):
+        return [m.idx_freq for m in model.modules() if isinstance(m, L1RoPE)]
+
+    base = idx_freqs(V3ConvergedModel(n_parcels=N_PARCELS, r6=True, mae=True))
+    off = idx_freqs(
+        V3ConvergedModel(n_parcels=N_PARCELS, r6=True, mae=True, space_rope=False)
+    )
+    # ENC_LAYOUT L1 count + PRED_LAYOUT (6, all L1) + the online tower's own encoder.
+    assert len(base) == len(off) and len(off) >= 12, (len(base), len(off))
+    assert all(f.abs().sum() > 0 for f in base), "default arm must keep index-RoPE LIVE"
+    n_zeroed = sum(1 for f in off if f.abs().sum() == 0)
+    assert n_zeroed == len(off), f"only {n_zeroed}/{len(off)} L1RoPE zeroed — partial thread"
+    print(
+        f"[check] OK space_rope=False zeroes {n_zeroed}/{len(off)} L1RoPE index tables "
+        f"across encoder+predictor+EMA tower; default arm all {len(base)} live"
+    )
+
+
 def test_r6_end_to_end_mae() -> None:
     sc, geom = _session()
     n = len(sc.labels)

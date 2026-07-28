@@ -136,6 +136,7 @@ class _TargetTower(nn.Module):
         no_fusion: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
         parcel_embed: bool = True,
+        space_rope: bool = True,
     ) -> None:
         super().__init__()
         # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
@@ -160,7 +161,8 @@ class _TargetTower(nn.Module):
         else:
             self.stem = PerBandStem(D_MODEL)
         self.encoder = build_encoder(
-            n_parcels=n_parcels, deep_sup=deep_sup, parcel_embed=parcel_embed
+            n_parcels=n_parcels, deep_sup=deep_sup, parcel_embed=parcel_embed,
+            space_rope=space_rope,
         )
 
     def forward(
@@ -190,6 +192,7 @@ class V3JepaObjective(nn.Module):
         n_parcels: int,
         target_ln: bool = True,
         parcel_embed: bool = True,
+        space_rope: bool = True,
         ema_tau: float = EMA_TAU,
         deep_sup: bool = True,
         mae: bool = False,
@@ -287,6 +290,11 @@ class V3JepaObjective(nn.Module):
         # tower, predictor). Purely additive, so OFF == adding zero. Geometry then reaches the
         # model ONLY through L1 RoPE (index + time) -- no anatomy channel at all.
         self.parcel_embed_on = bool(parcel_embed)
+        # A2 ablation: index-RoPE OFF in EVERY L1 block of BOTH towers (and, via _TargetTower,
+        # the EMA-mirrored online tower). Time-RoPE is untouched. Combined with parcel_embed
+        # ON, the model keeps its cross-subject anatomy tag but loses within-shaft contact
+        # ORDER — isolating the sensor-index-as-physics half of the tokenization claim.
+        self.space_rope_on = bool(space_rope)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         # online target path (stem + encoder) — every param here is EMA-mirrored (JEPA arm).
         self.online = _TargetTower(
@@ -296,6 +304,7 @@ class V3JepaObjective(nn.Module):
             no_fusion=self.no_fusion,
             nf_decimate=self.nf_decimate,
             parcel_embed=self.parcel_embed_on,
+            space_rope=self.space_rope_on,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
@@ -303,7 +312,10 @@ class V3JepaObjective(nn.Module):
             if self.mae
             else EmaTeacher(self.online, coeff_schedule=fixed_ema_schedule(tau=ema_tau))
         )
-        self.predictor = build_predictor(n_parcels=n_parcels, parcel_embed=self.parcel_embed_on)
+        self.predictor = build_predictor(
+            n_parcels=n_parcels, parcel_embed=self.parcel_embed_on,
+            space_rope=self.space_rope_on,
+        )
         # Encoder→predictor input map. Deep-sup: the encoder emits n_levels concatenated
         # levels, so this is upstream's ``predictor_embed`` 2-layer fusion MLP
         # (Linear(n_levels·d → d)·GELU·Linear(d → d_pred), NO LayerNorm). Single-tap: a

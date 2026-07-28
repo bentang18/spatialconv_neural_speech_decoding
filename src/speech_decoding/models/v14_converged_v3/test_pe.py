@@ -51,6 +51,43 @@ def test_rope_preserves_shape() -> None:
     assert qr.shape == q.shape and kr.shape == k.shape
 
 
+def test_space_false_kills_the_index_axis_and_leaves_time_bit_identical() -> None:
+    """A2's premise, as three assertions rather than one.
+
+    ``space=False`` must (1) make the rotary table INDEPENDENT of contact index,
+    (2) leave the index half at the IDENTITY rotation (cos 1 / sin 0) rather than at
+    some other fixed angle, and (3) leave the TIME half BIT-identical to the locked
+    ``base_index=8`` model — the ablation has to be one-variable, and the time axis is
+    the conventional half we are not testing.
+    """
+    on, off = L1RoPE(head_dim=64), L1RoPE(head_dim=64, space=False)
+    hd_half = 32  # head_dim/2 rotary entries; first 16 = index pairs, last 16 = time
+    t = torch.tensor([[0, 1, 2, 3, 4]])
+    idx_a = torch.tensor([[0, 1, 2, 4, 5]])
+    idx_b = torch.tensor([[7, 3, 0, 11, 2]])  # a DIFFERENT, non-shifted index set
+
+    cos_a, sin_a = off.cos_sin(idx_a, t)
+    cos_b, sin_b = off.cos_sin(idx_b, t)
+    assert torch.equal(cos_a, cos_b) and torch.equal(sin_a, sin_b)
+
+    n_idx = hd_half  # index pairs occupy the first head_dim/2 dims after interleave
+    assert torch.allclose(cos_a[..., :n_idx], torch.ones_like(cos_a[..., :n_idx]))
+    assert torch.allclose(sin_a[..., :n_idx], torch.zeros_like(sin_a[..., :n_idx]))
+
+    cos_on, sin_on = on.cos_sin(idx_a, t)
+    assert torch.equal(cos_on[..., n_idx:], cos_a[..., n_idx:])
+    assert torch.equal(sin_on[..., n_idx:], sin_a[..., n_idx:])
+
+    # and the consequence that matters: the q.k score no longer sees index at all.
+    q, k = _qk(2, 5, 64)
+    assert torch.equal(_score(off, q, k, idx_a, t), _score(off, q, k, idx_b, t))
+    assert not torch.allclose(_score(on, q, k, idx_a, t), _score(on, q, k, idx_b, t))
+    print(
+        "[check] OK space=False: table index-INDEPENDENT, index half = identity "
+        "(cos 1/sin 0), time half BIT-identical to base_index=8, score index-blind"
+    )
+
+
 def test_score_is_translation_invariant_on_both_axes() -> None:
     # The RoPE relativity property: shifting index and/or time by a constant
     # leaves every pairwise q·k score unchanged.

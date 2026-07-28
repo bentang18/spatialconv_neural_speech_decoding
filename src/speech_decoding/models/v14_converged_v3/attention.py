@@ -61,7 +61,7 @@ class L1Block(nn.Module):
     """Within-shaft joint spatiotemporal attention block (block-diagonal, RoPE)."""
 
     def __init__(
-        self, d_model: int, n_heads: int, *, mlp_ratio: int = 4
+        self, d_model: int, n_heads: int, *, mlp_ratio: int = 4, space_rope: bool = True
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -76,7 +76,7 @@ class L1Block(nn.Module):
         # at the 10x LR the fix is a pair-shared (not per-element) RMSNorm.
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
-        self.rope = L1RoPE(self.head_dim)
+        self.rope = L1RoPE(self.head_dim, space=space_rope)
         self.norm1 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.norm2 = nn.LayerNorm(d_model, eps=LN_EPS)
         self.mlp = _MLP(d_model, mlp_ratio)

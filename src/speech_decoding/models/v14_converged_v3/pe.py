@@ -67,6 +67,7 @@ class L1RoPE(nn.Module):
         *,
         base_index: float = 8.0,
         base_time: float = 64.0,
+        space: bool = True,
     ) -> None:
         super().__init__()
         if head_dim % 4 != 0:
@@ -75,8 +76,19 @@ class L1RoPE(nn.Module):
                 f"got {head_dim}"
             )
         self.head_dim = head_dim
+        self.space = bool(space)
         pairs = head_dim // 4  # rotation pairs per axis
         idx_freq = 1.0 / (base_index ** (torch.arange(pairs).float() / pairs))
+        # ABLATION A2 (2026-07-28): space=False ZEROES the index frequencies, so
+        # ang_idx == 0 ⇒ cos 1 / sin 0 ⇒ the index pairs take the IDENTITY rotation.
+        # The head_dim split, pair convention and TIME half stay bit-identical; only
+        # the contact-index axis stops carrying position. Since ParcelIdentityEmbed is
+        # parcel-level and band_type_emb is band-level, index-RoPE is the ONLY per-token
+        # carrier of within-shaft contact identity ⇒ this makes L1 attention genuinely
+        # permutation-invariant over contacts in a shaft. That is the control the
+        # "physics sensor-index tokenization" claim has never had.
+        if not self.space:
+            idx_freq = torch.zeros_like(idx_freq)
         t_freq = 1.0 / (base_time ** (torch.arange(pairs).float() / pairs))
         self.register_buffer("idx_freq", idx_freq, persistent=False)
         self.register_buffer("t_freq", t_freq, persistent=False)

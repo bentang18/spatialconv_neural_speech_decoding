@@ -70,6 +70,7 @@ class V3ConvergedModel(nn.Module):
         mask_cfg: V3MaskConfig = V3MaskConfig(),
         target_ln: bool = True,
         parcel_embed: bool = True,
+        space_rope: bool = True,
         deep_sup: bool = True,
         mae: bool = False,
         native_fine_hga: bool = False,
@@ -96,7 +97,7 @@ class V3ConvergedModel(nn.Module):
         # (sample_masks_r6) + a predictor band embed. MAE-only. See V3JepaObjective.__init__.
         self.objective = V3JepaObjective(
             n_parcels=n_parcels, target_ln=target_ln, parcel_embed=parcel_embed,
-            deep_sup=deep_sup,
+            space_rope=space_rope, deep_sup=deep_sup,
             mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
             no_fusion=no_fusion, r6=r6, nf_decimate=nf_decimate,
             mae_stream_weight=mae_stream_weight,

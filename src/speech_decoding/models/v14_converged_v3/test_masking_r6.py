@@ -157,6 +157,46 @@ def test_block_width_controls_masked_run_length() -> None:
     print(f"[check] OK block_w_band drives run length: w=1 {r_narrow:.2f} < w=8 {r_wide:.2f}")
 
 
+def test_band_block_w_1_is_uniform_random_masking() -> None:
+    """A1's premise: at ``block_w_band=1`` the cover degenerates to an independent uniform draw.
+
+    "Shorter runs" (the test above) does NOT prove randomness on its own, so assert the two
+    properties that actually define it:
+      1. MARGINAL uniformity — every grid position is masked at the same rate.
+      2. NO CONTIGUITY — P(i+1 masked | i masked) ≈ the without-replacement rate 15/31 ≈ .484,
+         whereas the leak-safe width-4 block drives that conditional far above it by construction.
+    Without this, the random-masking ablation would not be testing what it claims to test.
+    """
+    sc, geom = _session([6, 6])
+    n = int(geom.valid.sum())
+    t, rows = 32, 512
+
+    def hga(width: int) -> torch.Tensor:
+        m = sample_masks_r6(
+            geom, n, n_time=t, n_rows=rows, generator=_gen(7),
+            cfg=V3MaskConfig(block_w_band=width),
+        )
+        return m.hga_mask.reshape(-1, t).float()
+
+    w1, w4 = hga(1), hga(4)
+
+    rate = w1.mean(0)  # (T,) per-position marginal
+    dev = float((rate - 0.5).abs().max())
+    assert dev < 0.08, (dev, rate.tolist())
+
+    def adjacency(m: torch.Tensor) -> float:
+        both = (m[:, :-1] * m[:, 1:]).sum()
+        return float(both / m[:, :-1].sum())
+
+    a1, a4 = adjacency(w1), adjacency(w4)
+    assert a1 < 0.55, a1
+    assert a4 > 0.65, a4
+    print(
+        f"[check] OK block_w_band=1 is UNIFORM RANDOM: max |rate-0.5| {dev:.4f} < .08; "
+        f"P(i+1|i) w=1 {a1:.3f} (chance 15/31={15 / 31:.3f}) vs w=4 {a4:.3f}"
+    )
+
+
 def test_ntime_not_multiple_of_slow_stride_raises() -> None:
     sc, geom = _session([4, 4])
     n = int(geom.valid.sum())

@@ -411,6 +411,49 @@ def test_mask_space_frac_threads_into_mask_cfg_time_unchanged(tmp_path) -> None:
     print("[check] OK --mask-space-frac 0.80 threads into mask_cfg; time fracs + block width held")
 
 
+def test_ablation_flags_a1_a2_thread_and_fit(tmp_path) -> None:
+    # A1 --band-block-w and A2 --no-space-rope: the two workshop-paper ablation flags. Each must
+    # reach the model, change NOTHING else, and actually train. Both defaults are asserted equal to
+    # the locked r6 values, so an accidental default change breaks this test rather than a 40h run.
+    from speech_decoding.models.v14_converged_v3.pe import L1RoPE
+
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    common = dict(frontend="v3r6", contact_budget=16, objective="mae")
+
+    def rope_live(mod):
+        return [m.idx_freq.abs().sum() > 0 for m in mod.modules() if isinstance(m, L1RoPE)]
+
+    m_def, _, _ = build_v3_training(specs, _smoke_args(**common))
+    assert m_def.model.mask_cfg.block_w_band == 4  # locked: the M14 leak margin
+    assert all(rope_live(m_def.model))  # locked: index-RoPE live everywhere
+
+    # A1: random masking. block_w_band is the ONLY field that moves.
+    m_a1, dm_a1, _ = build_v3_training(specs, _smoke_args(**common, band_block_w=1))
+    assert m_a1.model.mask_cfg.block_w_band == 1
+    assert m_a1.model.mask_cfg.block_w_space == 4  # SPACE block width untouched
+    assert m_a1.model.mask_cfg.space_frac == 0.50
+    assert m_a1.model.mask_cfg.hga_mask_frac == 0.50
+    assert all(rope_live(m_a1.model))  # A1 does not touch geometry
+    _cpu_trainer(2).fit(m_a1, datamodule=dm_a1)
+
+    # A2: no space-RoPE. Every L1RoPE index table zeroed, masking untouched.
+    m_a2, dm_a2, _ = build_v3_training(specs, _smoke_args(**common, no_space_rope=True))
+    live = rope_live(m_a2.model)
+    assert not any(live), f"{sum(live)}/{len(live)} L1RoPE still index-live — partial thread"
+    assert m_a2.model.mask_cfg.block_w_band == 4  # A2 does not touch masking
+    _cpu_trainer(2).fit(m_a2, datamodule=dm_a2)
+
+    print(
+        f"[check] OK A1 --band-block-w 1 → mask_cfg.block_w_band only; "
+        f"A2 --no-space-rope → all {len(live)} L1RoPE index tables zeroed; both fit"
+    )
+
+
 def test_mae_hga_envelope_threads_to_the_objective_and_fits(tmp_path) -> None:
     # HGA-envelope OFAT: --mae-hga-envelope must reach V3JepaObjective and change NOTHING else
     # (same frontend, same mask cfg, same heads/shapes ⇒ the ckpt stays loadable by the probe).

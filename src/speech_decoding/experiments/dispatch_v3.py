@@ -324,10 +324,18 @@ def build_v3_training(
     space_frac = getattr(args, "mask_space_frac", None)
     if space_frac is not None:
         mask_cfg = replace(mask_cfg, space_frac=space_frac)
+    # --band-block-w: RANDOM-vs-BLOCK MASKING ablation (A1). block_w_band is the leak-safe
+    # contiguous width in a band's OWN tokens (masking.py:75, M14 margin 2). At width 1 the
+    # cover degenerates to independent uniform per-token selection = RANDOM masking — the control
+    # the leakage-free-block claim has never had. None ⇒ unchanged (byte-identical to the lock).
+    band_bw = getattr(args, "band_block_w", None)
+    if band_bw is not None:
+        mask_cfg = replace(mask_cfg, block_w_band=band_bw)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
         parcel_embed=not getattr(args, "no_parcel_embed", False),
+        space_rope=not getattr(args, "no_space_rope", False),
         mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
         no_fusion=no_fusion, r6=r6, nf_decimate=nf_decimate,
         mae_stream_weight=getattr(args, "mae_stream_weight", "equal"),
@@ -502,6 +510,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # already trained WITH the embed measures a lesion (#30), not whether the arch needs it.
     p.add_argument("--no-parcel-embed", dest="no_parcel_embed", action="store_true",
                    help="R2 ablation: build encoder+predictor without the parcel identity embed")
+    # ABLATION A2 (2026-07-28): the control for the sensor-index-as-physics tokenization claim.
+    # Zeroes L1RoPE's INDEX frequencies in every L1 block of both towers (time-RoPE untouched),
+    # so within-shaft contact ORDER stops reaching the model while the parcel/DKT tag stays.
+    # ⚠️ L1RoPE.idx_freq is persistent=False ⇒ NOT in the state_dict ⇒ a resume/cooldown that
+    # omits this flag SILENTLY restores base_index=8. Any --resume-ckpt of an A2 run MUST re-pass it.
+    p.add_argument("--no-space-rope", dest="no_space_rope", action="store_true",
+                   help="A2 ablation: zero the contact-index RoPE axis (time RoPE unchanged)")
     p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=5000)
     p.add_argument("--min-lr-ratio", dest="min_lr_ratio", type=float, default=1.0)
     # WSD cooldown (branch a stable-phase ckpt): flat until --stable-steps, then
@@ -567,6 +582,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "feat_count 1, column 0 only). r6-only, ⊥ --mae-norm-pix. Default OFF ⇒ "
                         "byte-identical to r6. NOTE: the wandb hga recon-r panels become "
                         "ENVELOPE r, not comparable to per-bin runs.")
+    p.add_argument("--band-block-w", dest="band_block_w", type=int, default=None,
+                   help="ABLATION A1 (2026-07-28): contiguous mask block width in a band's OWN "
+                        "tokens (masking.py block_w_band, unset ⇒ 4 = the M14 leak margin 2). "
+                        "Set 1 to make _cover_rank degenerate to independent uniform per-token "
+                        "selection = RANDOM masking — the control our leakage-free-block claim has "
+                        "never had. r4/r6 path only (sample_masks); r5 uses --temporal-block-w.")
     p.add_argument("--temporal-block-w", dest="temporal_block_w", type=int, default=None,
                    help="temporal mask block width in TOKENS (masking.py: the τ-anchored SSL "
                         "difficulty knob; block half-width must clear the ~83 ms LFS decorrelation "
