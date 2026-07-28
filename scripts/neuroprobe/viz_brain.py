@@ -233,6 +233,10 @@ def figure_3d(sessions, frame: int, times, out_path: str) -> None:
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
         ax.set_zlim(-lim, lim)
+        # a shared CUBE is what equal-scale means in 3-D, but these clouds are anisotropic
+        # (one subject spans 34/17/53 mm), so the cube is mostly empty. zoom crops the
+        # viewport without touching the data limits -- the scale stays shared.
+        ax.set_box_aspect((1, 1, 1), zoom=1.35)
         ax.set_xlabel("A", fontsize=7)
         ax.set_ylabel("R", fontsize=7)
         ax.set_zlabel("S", fontsize=7)
@@ -299,6 +303,7 @@ def animate_brain(sessions, times, out_path: str, *, fps: int = 12,
             ax.set_xlim(-lim, lim)
             ax.set_ylim(-lim, lim)
             ax.set_zlim(-lim, lim)
+            ax.set_box_aspect((1, 1, 1), zoom=1.35)
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_zticks([])
