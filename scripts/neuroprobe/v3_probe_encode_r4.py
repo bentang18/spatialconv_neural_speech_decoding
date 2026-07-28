@@ -79,7 +79,7 @@ BOARD_SESSIONS: tuple[tuple[int, int], ...] = (
 FPS = 32.0
 CLIP_DUR_S = 1.0
 N_PARCELS = 75
-GPU_TAPS: tuple[int, ...] = (3, 6, 12)   # raw block outputs read in one teacher forward
+GPU_TAPS: tuple[int, ...] = (3, 6, 9, 12)   # raw block outputs read in one teacher forward
 
 
 def _load_ckpt(ckpt_path: str) -> dict:
@@ -488,7 +488,7 @@ def main() -> None:
     p.add_argument("--elec-taps", default="",
                    help="comma-separated taps to ALSO write per-electrode (unpooled), e.g. "
                         "'0,12' -> feats['enc0_elec'], feats['enc12_elec']. 0 = the |STFT| "
-                        "frontend (enc0); 3/6/12 route through the teacher forward (GPU_TAPS). "
+                        "frontend (enc0); 3/6/9/12 route through the teacher forward (GPU_TAPS). "
                         "WS keeps all electrodes by default (Ben 2026-07-16); each costs "
                         "~N/|P| (~5x) the pooled tap on disk.")
     p.add_argument("--clip-dur", type=float, default=CLIP_DUR_S,

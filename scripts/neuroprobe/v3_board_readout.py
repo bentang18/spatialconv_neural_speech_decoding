@@ -102,7 +102,7 @@ CS_TEST_CELLS = ((1, 1), (1, 2), (3, 0), (3, 1), (4, 0), (4, 1),
 # The 12 Lite sessions — verified == upstream NEUROPROBE_LITE_SUBJECT_TRIALS.
 LITE_SESSIONS = ((1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
                  (4, 0), (4, 1), (7, 0), (7, 1), (10, 0), (10, 1))
-ENCODERS = ("enc0", "enc3", "enc6", "enc12")          # parcel-mean (electrodes pooled at encode)
+ENCODERS = ("enc0", "enc3", "enc6", "enc9", "enc12")  # parcel-mean (electrodes pooled at encode)
 ELEC_TAPS = ("enc0_elec", "enc12_elec")   # per-electrode: enc0_elec = depth-0 parity FLOOR for enc12_elec
 ALL_TAPS = ELEC_TAPS + ENCODERS           # universe for --taps validation
 # Per-regime feature UNIT (Ben 2026-07-19): compute only the unit that is defensible for each
