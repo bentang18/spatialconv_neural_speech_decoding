@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from scripts.neuroprobe.v3_probe_encode_r4 import (
-    _load_ckpt, _lite_keep_labels_fn, _window_bands,
+    _load_ckpt, _lite_keep_labels_fn, _subtree, _window_bands,
 )
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig, sample_masks_r6
 
@@ -92,12 +92,35 @@ def main() -> None:
     from speech_decoding.models.v14_converged_v3.objective import V3JepaObjective
     n_parcels = int(parcel_id.max().item()) + 1
     obj = V3JepaObjective(n_parcels=max(n_parcels, 75), mae=True, r6=True).to(device)
-    missing, unexpected = obj.load_state_dict(
-        {k[len("objective."):]: v for k, v in sd.items() if k.startswith("objective.")},
-        strict=False)
-    print(f"[check] load_state_dict missing={len(missing)} unexpected={len(unexpected)}",
-          flush=True)
-    assert len(missing) < 50, f"too many missing keys, wrong prefix? {missing[:5]}"
+    # _subtree, not a bare startswith("objective."): the keeper was trained under
+    # torch.compile, so every key is "model._orig_mod.objective.…". A plain prefix test
+    # matches nothing, and strict=False turns that into a SILENT random-weight forward --
+    # the run would produce a reconstruction figure of an untrained model.
+    sub = _subtree(sd, "objective.")
+    # the namespace is printed BEFORE the load, not inferred from the failure afterwards: the
+    # dtai login node cannot import torch right now (Errno 5 on /sw/user/python), so a
+    # checkpoint that does not match has to explain itself from inside the job or not at all
+    def _roots(keys):
+        r: dict[str, int] = {}
+        for k in keys:
+            r[k.split(".")[0]] = r.get(k.split(".")[0], 0) + 1
+        return dict(sorted(r.items()))
+    print(f"[check] ckpt keys={len(sd)} sample={list(sd)[:2]}", flush=True)
+    print(f"[check] objective subtree={len(sub)} roots={_roots(sub)}", flush=True)
+    print(f"[check] fresh objective roots={_roots(obj.state_dict())}", flush=True)
+    assert sub, f"no objective.* subtree in the ckpt; sample keys {list(sd)[:5]}"
+
+    missing, unexpected = obj.load_state_dict(sub, strict=False)
+    print(f"[check] load_state_dict matched={len(sub)} missing={len(missing)} "
+          f"unexpected={len(unexpected)}", flush=True)
+    # missing is the one that has to be zero. strict=False makes a prefix mistake SILENT --
+    # it would forward random weights and draw a reconstruction figure of an untrained model,
+    # which looks like a bad result rather than a bug. unexpected is only reported: a ckpt
+    # carrying extra keys (an EMA teacher, say) still leaves every parameter here loaded.
+    assert not missing, f"{len(missing)} params not in the ckpt: {missing[:8]}"
+    if unexpected:
+        print(f"[check] ckpt carries {len(unexpected)} keys the objective does not "
+              f"(ignored): {unexpected[:5]}", flush=True)
     obj.eval()
 
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
