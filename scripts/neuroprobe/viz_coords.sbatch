@@ -14,6 +14,10 @@ set -euo pipefail
 CACHE="${1:?need CACHE}"
 BT_ROOT="${2:?need BT_ROOT}"
 OUT="${3:?need OUT}"
-module load pytorch-conda/2.8
-numactl --interleave=all python -u /projects/bhqk/htang13/viz/viz_coords_dump.py \
+# NOT the pytorch-conda module: unlike viz_reduce.py (numpy only) this imports the BT
+# anatomy stack, which needs mne. The conda base has neither mne nor speech_decoding on the
+# path, so the x86 probe venv -- which has both -- is the interpreter.
+PY=/projects/bhqk/htang13/venv_probe_x86/bin/python
+export PYTHONPATH=/projects/bhqk/htang13/speech/src:${PYTHONPATH:-}
+numactl --interleave=all "$PY" -u /projects/bhqk/htang13/viz/viz_coords_dump.py \
   --cache "$CACHE" --bt-root "$BT_ROOT" --out "$OUT"
