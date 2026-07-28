@@ -117,19 +117,50 @@ def test_figure_writes_and_reports_the_masked_fraction_it_drew(tmp_path) -> None
     assert all(f >= 0.4 for f in info["masked_frac"]), info["masked_frac"]
 
 
-def test_the_contacts_drawn_are_the_most_masked_ones(tmp_path) -> None:
-    """A contact that happened to be almost fully visible shows nothing about
-    reconstruction, so picking the first N would quietly make the figure vacuous."""
+def _bimodal(tmp_path, seed=1):
+    """r6's real per-contact structure: some contacts spatially dropped (every token hidden),
+    the rest keeping half their frames. Contact 0 partial, contact 2 fully hidden."""
+    p = _dump(tmp_path, seed=seed)
+    d = dict(np.load(p))
+    rows, _ = token_index(d["band"], d["contact"], K_FULL, d["band_lengths"])
+    ix0 = rows[(0, 2)]
+    d["in_loss"][0, ix0] = False
+    d["in_loss"][0, ix0[: len(ix0) // 2]] = True     # contact 0: half hidden
+    d["in_loss"][0, rows[(2, 2)]] = True             # contact 2: everything hidden
+    np.savez_compressed(p, **d)
+    return p
+
+
+def test_the_selection_spans_both_masking_regimes(tmp_path) -> None:
+    """The bug this pins: ranking contacts by "most masked" can only ever return fully
+    dropped ones, because r6's per-contact masked fraction is bimodal (0.50 for a spatially
+    kept contact, 1.00 for a dropped one) -- never in between. Every drawn row then has an
+    EMPTY encoder-input panel and the figure cannot show an infill at all. So the draw must
+    include at least one contact that kept some of its own history."""
+    p = _bimodal(tmp_path)
+    info = figure(str(p), str(tmp_path / "s.png"), clip=0, band=2, n_contacts=2,
+                  rate=32.0, offset=0.0)
+    fracs = info["masked_frac"]
+    assert any(f < 1.0 for f in fracs), f"every drawn contact is fully hidden: {fracs}"
+    assert any(f >= 1.0 for f in fracs), f"the fully-hidden regime is not shown: {fracs}"
+
+
+def test_a_fully_visible_contact_is_not_drawn_over_a_partly_masked_one(tmp_path) -> None:
+    """The original concern still holds: a contact with nothing hidden shows nothing about
+    reconstruction, so it must lose to one that has holes."""
     p = _dump(tmp_path, seed=1)
     d = dict(np.load(p))
     rows, _ = token_index(d["band"], d["contact"], K_FULL, d["band_lengths"])
-    d["in_loss"][0, rows[(0, 2)]] = False            # contact 0: nothing hidden in hga
+    d["in_loss"][0, rows[(0, 2)]] = False            # contact 0: nothing hidden
+    ix1 = rows[(1, 2)]
+    d["in_loss"][0, ix1] = False
+    d["in_loss"][0, ix1[: len(ix1) // 2]] = True     # contact 1: half hidden
     d["in_loss"][0, rows[(2, 2)]] = True             # contact 2: everything hidden
     np.savez_compressed(p, **d)
-    info = figure(str(p), str(tmp_path / "s.png"), clip=0, band=2, n_contacts=1,
+    info = figure(str(p), str(tmp_path / "s.png"), clip=0, band=2, n_contacts=2,
                   rate=32.0, offset=0.0)
-    assert info["contacts"] == [2]
-    assert info["masked_frac"] == [1.0]
+    assert 0 not in info["contacts"], f"drew the fully-visible contact: {info['contacts']}"
+    assert set(info["contacts"]) == {1, 2}, info["contacts"]
 
 
 def test_a_flat_prediction_is_not_stretched_into_looking_like_structure(tmp_path) -> None:

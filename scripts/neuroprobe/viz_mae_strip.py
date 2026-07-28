@@ -81,13 +81,27 @@ def figure(path: str, out_path: str, *, clip: int, band: int, n_contacts: int,
     rows, contacts = token_index(z["band"], z["contact"], int(z["k_full"]), band_lengths)
     n_blocks = len(contacts)
 
-    # pick the contacts with the most masked tokens in this band: a contact that happened to
-    # be almost fully visible shows nothing about reconstruction
-    hidden = []
-    for c in range(n_blocks):
-        m = z["in_loss"][clip][rows[(c, band)]].astype(bool)
-        hidden.append(m.sum())
-    pick = list(np.argsort(-np.asarray(hidden))[:n_contacts])
+    # The per-contact masked fraction is BIMODAL under r6, not continuous. space_frac=0.50
+    # drops half the contacts outright (fraction 1.00) and the survivors hide only what the
+    # per-band time mask took (fraction 0.50) -- measured on S4T0, exactly 60 contacts in
+    # each group, which is the 0.50-space-union-0.50-time = 0.75 contract counted directly.
+    #
+    # So "rank by most masked" returns four fully-hidden contacts EVERY time, and their
+    # "encoder input" row is empty by construction: the figure could never show an infill,
+    # only a model predicting near its mean. The selection therefore takes both regimes on
+    # purpose -- contacts that kept some of their own history (temporal infill) and contacts
+    # that kept none (pure spatial inference from the rest of the shaft). The objective asks
+    # for both, so the figure shows both, and each row is labelled with which it is.
+    frac_by_c = np.asarray([z["in_loss"][clip][rows[(c, band)]].astype(bool).mean()
+                            for c in range(n_blocks)])
+    order = list(np.argsort(-frac_by_c, kind="stable"))
+    partial = [c for c in order if frac_by_c[c] < 1.0]
+    hidden = [c for c in order if frac_by_c[c] >= 1.0]
+    half = n_contacts // 2
+    pick = partial[:n_contacts - half] + hidden[:half]
+    if len(pick) < n_contacts:                      # one regime absent — fill from the other
+        pick += [c for c in order if c not in pick][:n_contacts - len(pick)]
+    assert pick, "no contacts to draw"
 
     # the three bands run at DIFFERENT rates (4/16/32 Hz), so the time axis comes from this
     # band's own token count over the clip duration, never from a single assumed rate
@@ -111,7 +125,10 @@ def figure(path: str, out_path: str, *, clip: int, band: int, n_contacts: int,
                       vmin=vmin, vmax=vmax, interpolation="nearest",
                       extent=(times[0], times[-1], 0, img.shape[0]))
             ax.set_yticks([])
-            ax.set_ylabel(f"c{label}\n{name}" if j == 0 else name, fontsize=6)
+            # the regime is on the row, not only in the caption: a reader looking at an empty
+            # "encoder input" panel should be able to see it is a fully-dropped contact
+            regime = "all hidden" if masked.all() else f"{masked.mean():.0%} hidden"
+            ax.set_ylabel(f"c{label}\n{regime}\n{name}" if j == 0 else name, fontsize=6)
             if j != 2 or i != len(pick) - 1:
                 ax.set_xticks([])
             else:
@@ -120,9 +137,12 @@ def figure(path: str, out_path: str, *, clip: int, band: int, n_contacts: int,
                 for k in np.where(masked)[0]:
                     ax.axvspan(times[k], times[min(k + 1, t_b - 1)], color="w", alpha=0.10,
                                lw=0)
+    # the clip-wide fraction, not the mean over the four drawn rows: the drawn rows are chosen
+    # to span both regimes, so their mean is a property of the selection, not of the masking
+    clip_frac = float(z["in_loss"][clip].astype(bool).mean())
     fig.suptitle(f"r6 masked reconstruction · {BANDS[band]} band · clip {clip} · "
                  f"S{int(z['subject_id'])}T{int(z['trial_id'])} · "
-                 f"{np.mean(frac):.0%} of shown tokens hidden", fontsize=10)
+                 f"{clip_frac:.0%} of all tokens hidden", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
