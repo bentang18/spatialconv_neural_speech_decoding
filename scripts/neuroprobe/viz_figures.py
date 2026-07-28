@@ -90,6 +90,22 @@ def collect(sessions, tap: str, task: str, cls, half: str, lobes, *, centered: b
     return out
 
 
+def unit_scale(pairs):
+    """Rescale each session's matrix to unit norm, keeping its shape.
+
+    Contrast AMPLITUDE varies several-fold across subjects (trial counts, electrode counts,
+    SNR), so without this one subject sets the axis range and, worse, dominates the pooled
+    PCA basis -- the shared space would be that subject's space. The reported score is a
+    correlation, which is already scale-invariant, so leaving the figure scale-dependent
+    would mean the picture and the number disagree about what is being compared.
+    """
+    out = []
+    for s, m in pairs:
+        n = float(np.linalg.norm(m))
+        out.append((s, m / n if n > 0 else m))
+    return out
+
+
 def _traj(m: np.ndarray, comps: np.ndarray, mu: np.ndarray) -> np.ndarray:
     """(lobes, T, C) -> (T, 3): project to the shared basis, then average over lobes."""
     p = (m.reshape(-1, m.shape[-1]) - mu) @ comps.T
@@ -107,7 +123,7 @@ def figure_a(sessions, lobes, tap: str, task: str, out_path: str) -> dict:
     """
     fig = plt.figure(figsize=(19, 6))
     info = {}
-    pairs_c = collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True)
+    pairs_c = unit_scale(collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True))
     if pairs_c:
         stack_c = np.concatenate([m.reshape(-1, m.shape[-1]) for _, m in pairs_c], axis=0)
         comps_c, mu_c, evr_c = pca_basis(stack_c, k=3)
@@ -166,6 +182,18 @@ def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
     per_task = {t: collect(sessions, tap, t, CONTRAST, "all", lobes, centered=True)
                 for t in tasks}
     per_task = {t: v for t, v in per_task.items() if v}
+    # ONE scale per session, shared across tasks. Scaling each task separately would defeat
+    # the figure: a task with no signal would be blown back up to the same size as onset,
+    # and the point of the panel is that it stays small. Scaling per session removes the
+    # several-fold amplitude spread BETWEEN subjects, which otherwise sets the axis range
+    # and dominates the pooled basis, while keeping each subject's own task ordering intact.
+    scale: dict[str, float] = {}
+    for v in per_task.values():
+        for s, m in v:
+            scale[s.key] = scale.get(s.key, 0.0) + float((m ** 2).sum())
+    scale = {k: np.sqrt(x) for k, x in scale.items()}
+    per_task = {t: [(s, m / scale[s.key] if scale.get(s.key, 0) > 0 else m) for s, m in v]
+                for t, v in per_task.items()}
     if not per_task:
         return {}
     stack = np.concatenate([m.reshape(-1, m.shape[-1])
@@ -177,8 +205,17 @@ def figure_tasks(sessions, lobes, tap: str, tasks, out_path: str) -> dict:
     nrow = (n + ncol - 1) // ncol
     fig = plt.figure(figsize=(5.2 * ncol, 4.6 * nrow))
     align = {}
+    # ONE axis range for every panel. Per-panel autoscaling is the lie here: a task with no
+    # signal gets blown up to fill its box and reads as a trajectory, when the honest picture
+    # is that it barely moves. With a shared range the dud collapses to a dot, which is what
+    # a cross-subject r of ~0 actually looks like.
+    lim = max(float(np.abs(_traj(m, comps, mu)).max())
+              for v in per_task.values() for _, m in v)
     for i, (t, v) in enumerate(per_task.items()):
         ax = fig.add_subplot(nrow, ncol, i + 1, projection="3d")
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, lim)
         trajs = []
         for s, m in v:
             p = _traj(m, comps, mu)
@@ -248,6 +285,59 @@ def figure_b(sessions, tap: str, task: str, cls, out_path: str) -> dict:
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
     return {"evr": [float(v) for v in evr], "n_panels": n}
+
+
+def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None) -> dict:
+    """Can a token from one subject find the SAME timepoint in another subject?
+
+    Correlation says the trajectories look alike overall; retrieval asks something sharper
+    and harder to fake: take subject A's contrast at time t, and among all of subject B's
+    timepoints pick the nearest. Top-1 at chance 1/T means the shared structure carries no
+    temporal identity. The whole cross-subject decoding claim rests on tokens being
+    comparable ACROSS brains, and this is that claim in its most direct form.
+    """
+    pairs = collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True)
+    traj = []
+    for s, m in pairs:
+        x = m.mean(axis=0)                                    # (T, C), lobe-averaged
+        x = x - x.mean(axis=0, keepdims=True)                 # per-channel over time
+        nrm = np.linalg.norm(x, axis=1, keepdims=True)
+        traj.append((s, x / np.maximum(nrm, 1e-12)))
+    if len(traj) < 2:
+        return {}
+    t_len = traj[0][1].shape[0]
+    hits, tot, sims, ranks = 0, 0, [], []
+    for i, (si, a) in enumerate(traj):
+        for sj, b in [(s, m) for s, m in traj[i + 1:]]:
+            if si.subject_id == sj.subject_id:
+                continue
+            sim = a @ b.T                                     # (T, T) cosine
+            sims.append(sim)
+            for direction in (sim, sim.T):
+                pred = direction.argmax(axis=1)
+                hits += int((pred == np.arange(t_len)).sum())
+                tot += t_len
+                # rank of the true timepoint: top-1 is brittle at 64 frames, the rank is not
+                order = np.argsort(-direction, axis=1)
+                ranks.extend(int(np.where(order[k] == k)[0][0]) for k in range(t_len))
+    if not tot:
+        return {}
+    out = {"tap": tap, "task": task, "top1": hits / tot, "chance": 1.0 / t_len,
+           "median_rank": float(np.median(ranks)), "n_frames": t_len,
+           "n_pairs": len(sims)}
+    if out_path:
+        fig, ax = plt.subplots(figsize=(4.6, 4.0))
+        im = ax.imshow(np.mean(sims, axis=0), cmap="magma", interpolation="nearest")
+        ax.set_xlabel("subject B frame")
+        ax.set_ylabel("subject A frame")
+        ax.set_title(f"{tap} · {task} · mean cross-subject token similarity\n"
+                     f"top-1 {out['top1']:.3f} (chance {out['chance']:.3f}), "
+                     f"median rank {out['median_rank']:.0f}/{t_len}", fontsize=9)
+        fig.colorbar(im, ax=ax, fraction=0.046)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=170)
+        plt.close(fig)
+    return out
 
 
 def quantify(sessions, lobes, tap: str, task: str, cls) -> dict:
@@ -407,6 +497,17 @@ def main() -> None:
                 print(f"[quant] {tap:6s} {task:16s} {lab} cross={q['cross_subject_r']:+.4f} "
                       f"ceiling={q['split_half_ceiling_r']:+.4f} "
                       f"norm={q['normalized']:+.4f}")
+
+    report["retrieval"] = []
+    for tap in taps:
+        for task in quant_tasks:
+            p = os.path.join(args.out_dir, f"figR_retrieval_{tap}_{task}.png")
+            r = retrieval(sessions, lobes, tap, task, p)
+            if r:
+                report["retrieval"].append(r)
+                print(f"[retr]  {tap:6s} {task:16s} top1={r['top1']:.3f} "
+                      f"(chance {r['chance']:.3f}) median_rank={r['median_rank']:.0f}"
+                      f"/{r['n_frames']}")
 
     report["identity_content"] = []
     for tap in taps:

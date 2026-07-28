@@ -10,7 +10,8 @@ import numpy as np
 
 from scripts.neuroprobe.viz_common import load_all
 from scripts.neuroprobe.viz_figures import (
-    CONTRAST, _corr, figure_a, figure_b, identity_content, quantify,
+    CONTRAST, _corr, figure_a, figure_b, figure_tasks, identity_content, quantify,
+    retrieval, unit_scale,
 )
 
 TASK = "onset"
@@ -219,3 +220,65 @@ def test_a_degenerate_ceiling_suppresses_the_normalized_score(tmp_path) -> None:
     assert abs(q["split_half_ceiling_r"]) < 0.5
     assert not q["ceiling_usable"]
     assert np.isnan(q["normalized"])
+
+
+def test_retrieval_is_at_chance_when_subjects_share_nothing(tmp_path) -> None:
+    rng = np.random.default_rng(4)
+    for s in (1, 2, 3, 4):
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10,
+                       {0: rng.normal(size=(T, C)), 1: rng.normal(size=(T, C))})
+    sessions = load_all(str(tmp_path))
+    r = retrieval(sessions, ["temporal"], "enc12", TASK)
+    assert r["chance"] == 1.0 / T
+    # median rank near the middle of the list is what "no temporal identity" looks like
+    assert r["median_rank"] > T * 0.2, r["median_rank"]
+
+
+def test_retrieval_is_perfect_when_the_contrast_is_shared(tmp_path) -> None:
+    shared_diff = _pattern(2)
+    profile = 20.0 * _pattern(0)
+    for s in (1, 2, 3, 4):
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10,
+                       {0: profile - 0.5 * shared_diff, 1: profile + 0.5 * shared_diff})
+    sessions = load_all(str(tmp_path))
+    r = retrieval(sessions, ["temporal"], "enc12", TASK)
+    assert r["top1"] > 0.99, r["top1"]
+    assert r["median_rank"] == 0.0
+
+
+def test_unit_scale_removes_amplitude_but_not_shape() -> None:
+    class _S:
+        key = "S1T0"
+    m = np.arange(12, dtype=float).reshape(1, 4, 3)
+    (_, small), (_, big) = unit_scale([(_S(), m), (_S(), 100.0 * m)])
+    assert abs(np.linalg.norm(small) - 1.0) < 1e-9
+    assert np.allclose(small, big), "shape must survive; only the scale is removed"
+
+
+def test_figure_tasks_keeps_a_dead_task_small_relative_to_a_live_one(tmp_path) -> None:
+    """Per-session scaling, not per-task: a task with no signal must NOT be renormalized
+    back up to the size of a real one -- that is the entire point of the panel."""
+    live = _pattern(1)
+    profile = 20.0 * _pattern(0)
+    rng = np.random.default_rng(8)
+    for s in (1, 2, 3, 4):
+        out = {}
+        for cls in (0, 1):
+            sign = 1.0 if cls == 1 else -1.0
+            out[cls] = profile + sign * 0.5 * live
+        _write_classes(tmp_path, s, 0, TEMPORAL, 10, out)
+        # add a second, dead task to the same file
+        f = tmp_path / f"red_s{s}_t0_hga.npz"
+        d = dict(np.load(f))
+        for cls in (0, 1):
+            for name in ("all", "h0", "h1"):
+                d[f"enc12/dead/c{cls}/{name}"] = (
+                    profile + 0.001 * rng.normal(size=(T, C)))[None].astype(np.float32)
+                d[f"n/dead/c{cls}/{name}"] = np.int64(50)
+            d[f"count/dead/c{cls}"] = np.int64(50)
+        np.savez_compressed(str(f), **d)
+    sessions = load_all(str(tmp_path))
+    info = figure_tasks(sessions, ["temporal"], "enc12", [TASK, "dead"],
+                        str(tmp_path / "t.png"))
+    assert info["align_3pc"][TASK] > 0.9
+    assert abs(info["align_3pc"]["dead"]) < 0.5
