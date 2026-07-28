@@ -138,6 +138,44 @@ def test_r6_target_is_not_norm_pix() -> None:
     print("[check] OK norm_pix OFF for r6 (never called) and ON for arm0 (called)")
 
 
+def test_r6_force_norm_pix_override_turns_it_on() -> None:
+    # Isolation OFAT: --mae-norm-pix (mae_force_norm_pix=True) forces norm_pix ON under r6,
+    # decoupled from `norm_pix=not r6`, so the delta can be measured single-handed. Same poison
+    # pattern: default r6 must NOT call _norm_pix; r6 + override MUST. Proves the override is the
+    # ONLY thing that flips, and that it reaches the same target path arm0 uses.
+    from speech_decoding.models.v14_converged_v3.objective import V3JepaObjective
+
+    sc, geom = _session()
+    n = len(sc.labels)
+    bands = _bands(n, B=2)
+    orig = V3JepaObjective.__dict__["_norm_pix"]
+
+    def poisoned(*a, **kw):
+        raise AssertionError("_norm_pix called")
+
+    V3JepaObjective._norm_pix = staticmethod(poisoned)
+    try:
+        # default r6: override False ⇒ still OFF (byte-identical to contract)
+        r6_off = V3ConvergedModel(n_parcels=N_PARCELS, r6=True, mae=True)
+        assert r6_off.objective.force_norm_pix is False
+        out = r6_off(bands, geom, sc.parcel_id, generator=_gen())
+        assert torch.isfinite(out.loss)  # untouched
+        # r6 + override: norm_pix ON ⇒ MUST trip the poison
+        r6_on = V3ConvergedModel(
+            n_parcels=N_PARCELS, r6=True, mae=True, mae_force_norm_pix=True
+        )
+        assert r6_on.objective.force_norm_pix is True
+        tripped = False
+        try:
+            r6_on(bands, geom, sc.parcel_id, generator=_gen())
+        except AssertionError as e:
+            tripped = "_norm_pix called" in str(e)
+        assert tripped, "r6 + mae_force_norm_pix did NOT call _norm_pix — override is dead"
+    finally:
+        V3JepaObjective._norm_pix = orig
+    print("[check] OK force_norm_pix: OFF by default under r6, ON with the override")
+
+
 def test_r6_session_plan_matches_forward_shapes() -> None:
     sc, geom = _session()
     n = len(sc.labels)

@@ -135,6 +135,7 @@ class _TargetTower(nn.Module):
         early_fusion: bool = False,
         no_fusion: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
+        parcel_embed: bool = True,
     ) -> None:
         super().__init__()
         # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
@@ -158,7 +159,9 @@ class _TargetTower(nn.Module):
             self.stem = FineHgaStem(D_MODEL)
         else:
             self.stem = PerBandStem(D_MODEL)
-        self.encoder = build_encoder(n_parcels=n_parcels, deep_sup=deep_sup)
+        self.encoder = build_encoder(
+            n_parcels=n_parcels, deep_sup=deep_sup, parcel_embed=parcel_embed
+        )
 
     def forward(
         self,
@@ -186,6 +189,7 @@ class V3JepaObjective(nn.Module):
         *,
         n_parcels: int,
         target_ln: bool = True,
+        parcel_embed: bool = True,
         ema_tau: float = EMA_TAU,
         deep_sup: bool = True,
         mae: bool = False,
@@ -195,9 +199,25 @@ class V3JepaObjective(nn.Module):
         r6: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
         mae_stream_weight: str = "equal",
+        mae_force_norm_pix: bool = False,
+        mae_hga_envelope: bool = False,
     ) -> None:
         super().__init__()
         self.native_fine_hga = bool(native_fine_hga)
+        # ISOLATION OVERRIDE (norm_pix attribution OFAT): force He-2021 per-token norm_pix ON
+        # even under r6, decoupling it from `not self.r6` so the norm_pix delta can be measured
+        # single-handed vs r6. Default False ⇒ byte-identical to the r6 contract. Not for
+        # production (norm_pix stays OFF); it exists to attribute the r6-vs-r4-MAE CS gap.
+        self.force_norm_pix = bool(mae_force_norm_pix)
+        # HGA-ENVELOPE OFAT (2026-07-28): swap HGA's target from its 7 |STFT| bins to their MEAN.
+        # SLOW and MID keep per-bin targets. Measured, not guessed — the orthogonal
+        # y = y_env + y_res split on the r6 recon dump gives EV points env/shape of hga .154/.043
+        # (average it), mid .119/.113 (a wash ⇒ fails the single-swap bar), slow .109/.181
+        # (per-bin EARNS its place, averaging there would delete the signal). Input UNCHANGED and
+        # no head resized: HGA reuses MID's pad machinery (feat_count 1, feat_valid[:, 0] only),
+        # so the head's other 6 columns take exactly zero gradient — equivalent to a 1-wide head
+        # for training dynamics while the checkpoint keeps its shape.
+        self.mae_hga_envelope = bool(mae_hga_envelope)
         # r6 (Ben 2026-07-23) = r4 with FOUR deltas and nothing else. The frontend is r4's,
         # VERBATIM: the same 3-band 32 Hz |STFT| caches, the same PerBandStem (which decimates
         # 8/2/1 internally), the same grid, the same per-band recon heads. The deltas:
@@ -251,7 +271,22 @@ class V3JepaObjective(nn.Module):
         # r6 is MAE-only (spectral |STFT|-bin reconstruction, no norm_pix); JEPA-r6 not in scope.
         if self.r6 and not self.mae:
             raise ValueError("r6 is MAE-only")
+        if self.mae_hga_envelope:
+            # norm_pix divides by the UNBIASED variance over a token's valid bins; with ONE bin
+            # that is 0/0. Refuse at construction instead of emitting NaN mid-run. r4-MAE has
+            # norm_pix ON by default, so the envelope is r6-only by the same argument.
+            if not self.r6:
+                raise ValueError("mae_hga_envelope requires r6 (r4-MAE keeps norm_pix on)")
+            if self.force_norm_pix:
+                raise ValueError(
+                    "mae_hga_envelope is incompatible with norm_pix: unbiased variance over a "
+                    "single bin is 0/0"
+                )
         self.deep_sup = bool(deep_sup)
+        # R2 ablation: parcel identity embed OFF everywhere (encoder, EMA-mirrored online
+        # tower, predictor). Purely additive, so OFF == adding zero. Geometry then reaches the
+        # model ONLY through L1 RoPE (index + time) -- no anatomy channel at all.
+        self.parcel_embed_on = bool(parcel_embed)
         self.n_levels = N_LEVELS if self.deep_sup else 1
         # online target path (stem + encoder) — every param here is EMA-mirrored (JEPA arm).
         self.online = _TargetTower(
@@ -260,6 +295,7 @@ class V3JepaObjective(nn.Module):
             early_fusion=self.early_fusion,
             no_fusion=self.no_fusion,
             nf_decimate=self.nf_decimate,
+            parcel_embed=self.parcel_embed_on,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
@@ -267,7 +303,7 @@ class V3JepaObjective(nn.Module):
             if self.mae
             else EmaTeacher(self.online, coeff_schedule=fixed_ema_schedule(tau=ema_tau))
         )
-        self.predictor = build_predictor(n_parcels=n_parcels)
+        self.predictor = build_predictor(n_parcels=n_parcels, parcel_embed=self.parcel_embed_on)
         # Encoder→predictor input map. Deep-sup: the encoder emits n_levels concatenated
         # levels, so this is upstream's ``predictor_embed`` 2-layer fusion MLP
         # (Linear(n_levels·d → d)·GELU·Linear(d → d_pred), NO LayerNorm). Single-tap: a
@@ -470,7 +506,7 @@ class V3JepaObjective(nn.Module):
                 bands, grid, h, in_loss,
                 enc_taps=enc_taps if collect_taps else None,
                 collect_taps=collect_taps,
-                norm_pix=not self.r6,  # r6's ONLY loss-side delta from r4
+                norm_pix=self.force_norm_pix or not self.r6,  # r6's ONLY loss-side delta from r4
             )
         assert self.pred_to_target is not None  # JEPA arm always builds it (mae returned above)
         pred = self.pred_to_target(h)  # (B, total, n_levels·256)
@@ -530,6 +566,9 @@ class V3JepaObjective(nn.Module):
         purely by token count; without it the count-proportional weighting (HGA ~8:1 over
         SLOW, by token count) rides on the true amplitudes."""
         target, feat_valid, feat_count = self._mae_gather_target(bands, grid)
+        if self.mae_hga_envelope:  # HGA target := mean of its bins (OFAT; SLOW/MID untouched)
+            target, feat_valid, feat_count = self._collapse_hga_to_envelope(
+                target, feat_valid, feat_count, grid)
         if norm_pix:
             target = self._norm_pix(target.float(), feat_valid, feat_count)  # fp32 norm_pix
         pred = self._mae_pred(h, grid)  # (B, total, F_MAX); pad slot = 0
@@ -795,6 +834,33 @@ class V3JepaObjective(nn.Module):
         f_by_band = torch.tensor([nb for nb, _ in PER_BAND_SPECS], device=device)
         feat_count = f_by_band[grid.band]  # (total,)
         feat_valid = torch.arange(f_max, device=device)[None, :] < feat_count[:, None]
+        return target, feat_valid, feat_count
+
+    @staticmethod
+    def _collapse_hga_to_envelope(
+        target: Tensor, feat_valid: Tensor, feat_count: Tensor, grid: R4Grid
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """HGA tokens only: replace the 7 per-bin targets with their MEAN in column 0.
+
+        Rewrites the (target, feat_valid, feat_count) triple in place of a head change, reusing
+        the pad machinery MID already exercises: ``feat_count`` 1, ``feat_valid`` column 0 only,
+        ``target[..., 0]`` = the bin mean, columns 1..F_MAX-1 zeroed. The loss then divides by 1
+        and masks the other 6 columns out, so the HGA head's rows 1..6 receive zero gradient.
+
+        Static shapes and no boolean indexing — ``torch.where`` against the band label, the
+        compile-safe analogue of the one-hot select ``_mae_pred`` uses. SLOW and MID pass through
+        bit-for-bit: this is a SINGLE swap and their per-bin targets are what the EV split says to
+        keep."""
+        f_max = max(nb for nb, _ in PER_BAND_SPECS)
+        hga = len(PER_BAND_SPECS) - 1  # band axis order is (SLOW, MID, HGA)
+        is_hga = grid.band == hga  # (total,)
+        fv = feat_valid[None].to(target.dtype)
+        env = (target * fv).sum(-1) / feat_count[None].to(target.dtype)  # (B, total) bin mean
+        col0 = torch.arange(f_max, device=target.device) == 0  # (F_MAX,)
+        tgt_env = env[..., None] * col0[None, None, :].to(target.dtype)  # mean in slot 0, else 0
+        target = torch.where(is_hga[None, :, None], tgt_env, target)
+        feat_valid = torch.where(is_hga[:, None], col0[None, :], feat_valid)
+        feat_count = torch.where(is_hga, torch.ones_like(feat_count), feat_count)
         return target, feat_valid, feat_count
 
     def _mae_pred(self, h: Tensor, grid: R4Grid) -> Tensor:

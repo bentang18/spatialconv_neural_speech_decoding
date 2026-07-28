@@ -72,13 +72,14 @@ class V3Tower(nn.Module):
         n_parcels: int,
         deep_sup: bool = False,
         sup_taps: Sequence[int] = (),
+        parcel_embed: bool = True,
     ) -> None:
         super().__init__()
         # Parcel/DKT identity is added ONCE here at the tower input (V-JEPA 2.1
         # modality-embedding style: the learned categorical embed is added to the
         # encoder AND predictor inputs alongside RoPE) — it then rides the residual
         # into every block, so L2 needs no per-block identity injection.
-        self.parcel_embed = ParcelIdentityEmbed(n_parcels, d_model)
+        self.parcel_embed = ParcelIdentityEmbed(n_parcels, d_model, enabled=parcel_embed)
         blocks: list[nn.Module] = []
         for kind in layout:
             if kind == "L1":
@@ -319,19 +320,21 @@ class V3Tower(nn.Module):
         return out
 
 
-def build_encoder(*, n_parcels: int, deep_sup: bool = True) -> V3Tower:
+def build_encoder(*, n_parcels: int, deep_sup: bool = True, parcel_embed: bool = True) -> V3Tower:
     # deep_sup default ON (#61, Ben-greenlit "copy exactly"): tap {3,6,9,12} → 4
     # affine-normed levels concatenated. deep_sup=False = the single-tap ablation arm.
     return V3Tower(
         ENC_LAYOUT, d_model=ENC_D_MODEL, n_heads=ENC_N_HEADS, n_parcels=n_parcels,
         deep_sup=deep_sup, sup_taps=ENC_SUP_TAPS if deep_sup else (),
+        parcel_embed=parcel_embed,
     )
 
 
-def build_predictor(*, n_parcels: int) -> V3Tower:
+def build_predictor(*, n_parcels: int, parcel_embed: bool = True) -> V3Tower:
     # The predictor is NEVER deep-supervised: it emits all levels from one wide proj
     # on its final block (objective.pred_to_target), with the terminal norm_out =
     # upstream `predictor_norm`. It does not tap its own intermediate blocks.
     return V3Tower(
-        PRED_LAYOUT, d_model=PRED_D_MODEL, n_heads=PRED_N_HEADS, n_parcels=n_parcels
+        PRED_LAYOUT, d_model=PRED_D_MODEL, n_heads=PRED_N_HEADS, n_parcels=n_parcels,
+        parcel_embed=parcel_embed,
     )

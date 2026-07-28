@@ -69,6 +69,7 @@ class V3ConvergedModel(nn.Module):
         n_parcels: int,
         mask_cfg: V3MaskConfig = V3MaskConfig(),
         target_ln: bool = True,
+        parcel_embed: bool = True,
         deep_sup: bool = True,
         mae: bool = False,
         native_fine_hga: bool = False,
@@ -77,6 +78,8 @@ class V3ConvergedModel(nn.Module):
         r6: bool = False,
         nf_decimate: int = NOFUSION_DECIMATE,
         mae_stream_weight: str = "equal",
+        mae_force_norm_pix: bool = False,
+        mae_hga_envelope: bool = False,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -92,10 +95,13 @@ class V3ConvergedModel(nn.Module):
         # shaft-batched data regime, no norm_pix, no margin gate, PER-SENSOR band masks
         # (sample_masks_r6) + a predictor band embed. MAE-only. See V3JepaObjective.__init__.
         self.objective = V3JepaObjective(
-            n_parcels=n_parcels, target_ln=target_ln, deep_sup=deep_sup,
+            n_parcels=n_parcels, target_ln=target_ln, parcel_embed=parcel_embed,
+            deep_sup=deep_sup,
             mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
             no_fusion=no_fusion, r6=r6, nf_decimate=nf_decimate,
             mae_stream_weight=mae_stream_weight,
+            mae_force_norm_pix=mae_force_norm_pix,
+            mae_hga_envelope=mae_hga_envelope,
         )
         self.native_fine_hga = bool(native_fine_hga)
         self.early_fusion = bool(early_fusion)

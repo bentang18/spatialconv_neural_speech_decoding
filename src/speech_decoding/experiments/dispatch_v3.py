@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import typing as tp
+from dataclasses import replace
 
 import lightning.pytorch as pl
 import torch
@@ -143,6 +144,8 @@ def build_v3_optim_cfg(
     warmup_steps: int,
     min_lr_ratio: float,
     adam_beta2: float,
+    stable_steps: int = 0,
+    decay_shape: str = "cosine",
 ) -> LightningOptimizer:
     """The locked v3 ``LightningOptimizer``: non-fused AdamW + WarmupCosine.
 
@@ -162,6 +165,8 @@ def build_v3_optim_cfg(
             "name": "WarmupCosine",
             "warmup_steps": warmup_steps,
             "min_lr_ratio": min_lr_ratio,
+            "stable_steps": stable_steps,
+            "decay_shape": decay_shape,
         },
         "interval": "step",
     }
@@ -312,17 +317,29 @@ def build_v3_training(
         mask_cfg = V3MaskConfig(**kw)
     else:
         mask_cfg = V3MaskConfig() if tbw is None else V3MaskConfig(temporal_block_w=tbw)
+    # --mask-space-frac: HARD-MASKING OFAT knob (applied last, over any frontend's mask_cfg). r6
+    # masks 0.75 of tokens at the default 0.50 space ∪ 0.50 time; raising space to 0.80 with time
+    # held at 0.50 lands ~0.90 total and aims the hard masking at the load-bearing spatial (cross-
+    # subject) axis. None ⇒ unchanged (byte-identical to the locked config).
+    space_frac = getattr(args, "mask_space_frac", None)
+    if space_frac is not None:
+        mask_cfg = replace(mask_cfg, space_frac=space_frac)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
+        parcel_embed=not getattr(args, "no_parcel_embed", False),
         mae=mae, native_fine_hga=native_fine_hga, early_fusion=early_fusion,
         no_fusion=no_fusion, r6=r6, nf_decimate=nf_decimate,
         mae_stream_weight=getattr(args, "mae_stream_weight", "equal"),
+        mae_force_norm_pix=getattr(args, "mae_norm_pix", False),
+        mae_hga_envelope=getattr(args, "mae_hga_envelope", False),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps, min_lr_ratio=args.min_lr_ratio,
         adam_beta2=args.adam_beta2,
+        stable_steps=getattr(args, "stable_steps", 0),
+        decay_shape=getattr(args, "decay_shape", "cosine"),
     )
     module = V14ConvergedV3Module(
         model=model, optim_config=optim, seed=args.seed,
@@ -479,8 +496,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- locked optimizer/schedule ---
     p.add_argument("--lr", type=float, default=6e-3)
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=0.04)
+    # R2 ablation (#19): drop the DKT parcel-identity embed entirely. It is added to the
+    # residual at the encoder AND predictor input, so disabling == adding zero; geometry then
+    # reaches the model only via L1 index/time RoPE. FROM SCRATCH only -- branching a ckpt that
+    # already trained WITH the embed measures a lesion (#30), not whether the arch needs it.
+    p.add_argument("--no-parcel-embed", dest="no_parcel_embed", action="store_true",
+                   help="R2 ablation: build encoder+predictor without the parcel identity embed")
     p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=5000)
     p.add_argument("--min-lr-ratio", dest="min_lr_ratio", type=float, default=1.0)
+    # WSD cooldown (branch a stable-phase ckpt): flat until --stable-steps, then
+    # decay to min_lr_ratio·peak over the tail by --decay-shape. Defaults reduce
+    # to the locked warmup→cosine (stable_steps=0 ⇒ no plateau).
+    p.add_argument("--stable-steps", dest="stable_steps", type=int, default=0,
+                   help="WSD plateau length; LR held at peak until this step, then decays")
+    p.add_argument("--decay-shape", dest="decay_shape", default="cosine",
+                   choices=["cosine", "1-sqrt", "linear"],
+                   help="LR decay shape after the stable plateau")
     p.add_argument("--adam-beta2", dest="adam_beta2", type=float, default=0.95)
     p.add_argument("--grad-clip", dest="grad_clip", type=float, default=3.0)
     p.add_argument("--batch-size", dest="batch_size", type=int, default=32)
@@ -522,6 +553,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "invariant to HGA's bin granularity (lifts LFS 20%%→50%%); 'pooled' (4:1) "
                         "sums per-channel SE over both streams ⇒ HGA:LFS = 4:1 (matches r5-fused). "
                         "No-op outside the v3r5nf (no-fusion) MAE path.")
+    p.add_argument("--mae-norm-pix", dest="mae_norm_pix", action="store_true",
+                   help="ISOLATION OFAT (norm_pix attribution): force He-2021 per-token norm_pix "
+                        "ON even under r6, decoupled from the r6 contract's `norm_pix=not r6`. "
+                        "Default OFF ⇒ byte-identical to r6. Use ONLY to measure the norm_pix "
+                        "delta single-handed vs r6 (r6 vs r4-MAE CS gap); NOT for production.")
+    p.add_argument("--mae-hga-envelope", dest="mae_hga_envelope", action="store_true",
+                   help="OFAT (2026-07-28): HGA's MAE target becomes the MEAN of its 7 |STFT| "
+                        "bins; SLOW and MID keep per-bin targets. Measured rationale — the "
+                        "y=y_env+y_res EV split on the r6 recon dump gives HGA env .154 vs shape "
+                        ".043 (average it), MID .119/.113 (a wash), SLOW .109/.181 (per-bin earns "
+                        "it). Input unchanged, no head resized (HGA reuses the pad machinery: "
+                        "feat_count 1, column 0 only). r6-only, ⊥ --mae-norm-pix. Default OFF ⇒ "
+                        "byte-identical to r6. NOTE: the wandb hga recon-r panels become "
+                        "ENVELOPE r, not comparable to per-bin runs.")
     p.add_argument("--temporal-block-w", dest="temporal_block_w", type=int, default=None,
                    help="temporal mask block width in TOKENS (masking.py: the τ-anchored SSL "
                         "difficulty knob; block half-width must clear the ~83 ms LFS decorrelation "
@@ -535,6 +580,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="v3r5nf ONLY: LFS-stream temporal block width in TOKENS. Unset ⇒ "
                         "--temporal-block-w if given, else V3MaskConfig default (5) — wider than HGA "
                         "so the slow LFS stream can't trivially in-fill the masked run.")
+    p.add_argument("--mask-space-frac", dest="mask_space_frac", type=float, default=None,
+                   help="HARD-MASKING OFAT: per-shaft SPATIAL mask fraction (masking.py space_frac; "
+                        "each shaft masks round(frac*n_s) of its OWN contacts, keep_alive reserves "
+                        "one visible). Default None ⇒ 0.50 (byte-identical to r6, 0.75 total "
+                        "space-union-time). 0.80 with time held at 0.50 ≈ 0.90 total, aimed at the "
+                        "load-bearing spatial axis (image-MAE-hard space, ASR-standard time).")
     # --- batching unit (shaft-level cross-patient vs session-homogeneous) ---
     p.add_argument("--batch-unit", dest="batch_unit", choices=("session", "shaft"),
                    default=None,

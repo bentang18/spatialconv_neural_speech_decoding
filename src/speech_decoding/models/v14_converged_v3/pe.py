@@ -164,10 +164,21 @@ class TimeRoPE(nn.Module):
 class ParcelIdentityEmbed(nn.Module):
     """Learned per-parcel identity embedding indexed by the DKT/DK hard tag."""
 
-    def __init__(self, n_parcels: int, d_model: int, *, init_std: float = 1e-6) -> None:
+    def __init__(
+        self, n_parcels: int, d_model: int, *, init_std: float = 1e-6, enabled: bool = True
+    ) -> None:
         super().__init__()
-        self.embed = nn.Embedding(n_parcels, d_model)
-        nn.init.trunc_normal_(self.embed.weight, std=init_std)
+        self.d_model = d_model
+        self.embed: nn.Embedding | None = None
+        # enabled=False = the R2 ablation arm: the table is NOT CONSTRUCTED (no dead param to
+        # weight-decay, and the checkpoint's param count is honest), and forward returns zeros.
+        # Every call site adds it to the residual (towers.py:165/196/279), so "return zeros" and
+        # "don't add it" are the SAME edit — the embed is purely additive, never concatenated.
+        if not enabled:
+            return
+        embed = nn.Embedding(n_parcels, d_model)
+        nn.init.trunc_normal_(embed.weight, std=init_std)
+        self.embed = embed
         # NEAR-ZERO init = upstream parity (audit finding #1, memo's strongest
         # change-candidate). Every additive-to-residual embed in V-JEPA 2.1 inits
         # ~0 so the model GROWS into it (modality embed std 1e-6 at
@@ -186,4 +197,6 @@ class ParcelIdentityEmbed(nn.Module):
 
     def forward(self, parcel_id: Tensor) -> Tensor:
         """parcel_id: (..., seq) long → (..., seq, d_model)."""
+        if self.embed is None:
+            return parcel_id.new_zeros((*parcel_id.shape, self.d_model), dtype=torch.float32)
         return self.embed(parcel_id)

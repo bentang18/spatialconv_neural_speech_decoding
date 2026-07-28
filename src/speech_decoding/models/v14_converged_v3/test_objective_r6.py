@@ -233,6 +233,152 @@ def test_forward_finite_and_grads_reach_stem_heads_predictor_and_band_emb() -> N
     assert ok
 
 
+# --------------------------------------------------------------------------- #
+# HGA-envelope OFAT (2026-07-28). Single swap: HGA's target becomes the MEAN of its 7 |STFT|
+# bins; SLOW and MID keep per-bin targets. Rationale is measured, not assumed — the orthogonal
+# y = y_env + y_res decomposition on the real recon dump gives HGA env .154 EV vs shape .043
+# (average it), MID .119 vs .113 (a wash), SLOW .109 vs .181 (per-bin EARNS its place). Input is
+# UNCHANGED and no head is resized: HGA reuses the MID pad machinery — feat_count 1,
+# feat_valid[:, 0] only, target[:, 0] = the bin mean. The HGA head's other 6 columns then receive
+# exactly zero gradient, which for training dynamics IS a 1-wide head while keeping ckpt shape.
+HGA = 2  # PER_BAND_SPECS band-axis order is (SLOW, MID, HGA); see pack_r4.py:42
+
+
+def test_hga_envelope_target_is_the_bin_mean_and_only_column_zero_is_valid() -> None:
+    sc, geom = _session()
+    obj = _r6(mae_hga_envelope=True)
+    grid = build_r4_grid(geom, n_time=T)
+    bands = _bands(seed=7)
+    target, feat_valid, feat_count = obj._mae_gather_target(bands, grid)
+    target, feat_valid, feat_count = obj._collapse_hga_to_envelope(
+        target, feat_valid, feat_count, grid)
+    max_dev = 0.0
+    n_hga = 0
+    for t in range(grid.total):
+        if int(grid.band[t]) != HGA:
+            continue
+        n_hga += 1
+        c, p = int(grid.contact[t]), int(grid.bandpos[t])
+        ref = bands[HGA][:, c, :, p * STRIDES[HGA]].mean(-1)  # (B,) mean of the token's 7 bins
+        max_dev = max(max_dev, (target[:, t, 0] - ref).abs().max().item())
+        max_dev = max(max_dev, target[:, t, 1:].abs().max().item())  # columns 1..6 zeroed
+        assert int(feat_count[t]) == 1
+        assert bool(feat_valid[t][0]) and not feat_valid[t][1:].any()
+    exact = max_dev < 1e-6 and n_hga > 0
+    print(f"[check] HGA envelope: {n_hga} HGA tokens, target[:,0]==mean(7 bins) "
+          f"max|Δ|={max_dev:.2e}, cols 1-6 zeroed, feat_count=1 {'OK' if exact else 'VIOLATED'}")
+    assert exact
+
+
+def test_hga_envelope_leaves_slow_and_mid_bit_identical() -> None:
+    # SINGLE swap. SLOW's bin shape earns MORE EV than its envelope (.181 vs .109) and MID is a
+    # coin flip, so both MUST come through untouched — bit-for-bit, not approximately.
+    sc, geom = _session()
+    obj = _r6(mae_hga_envelope=True)
+    grid = build_r4_grid(geom, n_time=T)
+    bands = _bands(seed=11)
+    t0, v0, c0 = obj._mae_gather_target(bands, grid)
+    t1, v1, c1 = obj._collapse_hga_to_envelope(t0.clone(), v0.clone(), c0.clone(), grid)
+    keep = (grid.band != HGA)
+    ok = (
+        torch.equal(t1[:, keep], t0[:, keep])
+        and torch.equal(v1[keep], v0[keep])
+        and torch.equal(c1[keep], c0[keep])
+    )
+    print(f"[check] SLOW+MID untouched by the HGA swap: {int(keep.sum())} tokens bit-identical "
+          f"{'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_hga_envelope_off_by_default_is_the_r6_contract() -> None:
+    # The flag OFF must be byte-identical to the shipped r6 arm — the isolation-override
+    # discipline (cf. mae_force_norm_pix). A default that shifts the contract voids the keeper.
+    sc, geom = _session()
+    grid = build_r4_grid(geom, n_time=T)
+    bands = _bands(seed=13)
+    base, flag = _r6(), _r6(mae_hga_envelope=True)
+    assert base.mae_hga_envelope is False and flag.mae_hga_envelope is True
+    torch.manual_seed(0)
+    l_base = float(base(_bands(seed=2), geom, sc.parcel_id, _masks(geom)).loss.detach())
+    t0, v0, c0 = base._mae_gather_target(bands, grid)
+    t1, v1, c1 = flag._mae_gather_target(bands, grid)  # gather itself is band-agnostic, always r4
+    ok = torch.equal(t0, t1) and torch.equal(v0, v1) and torch.equal(c0, c1) and l_base > 0
+    print(f"[check] flag OFF == r6 contract (gather bit-identical, loss={l_base:.4f} finite) "
+          f"{'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_hga_envelope_is_incompatible_with_norm_pix() -> None:
+    # norm_pix divides by the UNBIASED variance over a token's valid bins. With one bin that
+    # variance is 0/0 — degenerate. Refuse the combination at construction rather than emit NaN.
+    with pytest.raises(ValueError, match="norm_pix"):
+        _r6(mae_hga_envelope=True, mae_force_norm_pix=True)
+    with pytest.raises(ValueError, match="r6"):  # r4-MAE norm_pix's ON by default ⇒ same trap
+        V3JepaObjective(n_parcels=8, mae=True, mae_hga_envelope=True)
+    print("[check] OK mae_hga_envelope ⊥ norm_pix (1-bin unbiased var is 0/0), r6-only")
+
+
+def test_hga_envelope_loss_ignores_the_dead_head_columns() -> None:
+    # The 6 unsupervised HGA columns must contribute NOTHING: perturbing them cannot move the
+    # loss, and only column 0's weights may receive gradient. That is what makes keeping the
+    # 7-wide head equivalent to a 1-wide one.
+    sc, geom = _session()
+    obj = _r6(mae_hga_envelope=True)
+    grid = build_r4_grid(geom, n_time=T)
+    bands = _bands(seed=17)
+    h = torch.randn(B, grid.total, PRED_D_MODEL)
+    in_loss = torch.ones(B, grid.total, dtype=torch.bool)
+    def _loss(w):
+        return obj._mae_output(bands, grid, h, w, enc_taps=None, collect_taps=False,
+                               norm_pix=False).loss
+    l0 = float(_loss(in_loss).detach())
+    with torch.no_grad():  # blow up rows 1..6 of the HGA head
+        obj.mae_heads[HGA].weight[1:].add_(50.0)
+        obj.mae_heads[HGA].bias[1:].add_(50.0)
+    l1 = float(_loss(in_loss).detach())
+    obj.zero_grad()
+    _loss(in_loss).backward()
+    g = obj.mae_heads[HGA].weight.grad
+    dead = float(g[1:].abs().max())
+    live = float(g[0].abs().max())
+    ok = abs(l1 - l0) < 1e-6 and dead == 0.0 and live > 0.0
+    print(f"[check] dead HGA columns: loss {l0:.6f} -> {l1:.6f} under a +50 perturbation, "
+          f"grad row0 max={live:.3e} rows1-6 max={dead:.1e} {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
+def test_hga_envelope_shrinks_hga_error_without_touching_slow_mid_error() -> None:
+    # WHY the OFAT exists, restated as an invariant on the loss itself: with a zeroed head
+    # (pred == 0) the per-token SE is the target's own mean-square, so the HGA term falls to
+    # mean(bins)² ≤ mean(bins²) — Jensen, exactly the unpredictable-residual removal — while
+    # SLOW/MID terms are unchanged. Assert both directions on the real gather.
+    sc, geom = _session()
+    grid = build_r4_grid(geom, n_time=T)
+    bands = _bands(seed=19)
+    h = torch.zeros(B, grid.total, PRED_D_MODEL)
+    per_band = {}
+    for name, obj in (("perbin", _r6()), ("env", _r6(mae_hga_envelope=True))):
+        with torch.no_grad():
+            for head in obj.mae_heads:
+                head.weight.zero_(); head.bias.zero_()
+        for b in range(3):
+            sel = (grid.band == b)
+            in_loss = torch.zeros(B, grid.total, dtype=torch.bool)
+            in_loss[:, sel] = True  # score ONE band at a time ⇒ per-band mean SE
+            per_band[(name, b)] = float(obj._mae_output(
+                bands, grid, h, in_loss, enc_taps=None, collect_taps=False,
+                norm_pix=False).loss.detach())
+    same_lo = all(abs(per_band[("env", b)] - per_band[("perbin", b)]) < 1e-6 for b in (0, 1))
+    hga_drops = per_band[("env", HGA)] < per_band[("perbin", HGA)]
+    ratio = per_band[("perbin", HGA)] / max(per_band[("env", HGA)], 1e-9)
+    ok = same_lo and hga_drops
+    print(f"[check] zero-pred SE per band: SLOW {per_band[('perbin', 0)]:.4f}=="
+          f"{per_band[('env', 0)]:.4f}, MID {per_band[('perbin', 1)]:.4f}=="
+          f"{per_band[('env', 1)]:.4f}, HGA {per_band[('perbin', HGA)]:.4f}->"
+          f"{per_band[('env', HGA)]:.4f} ({ratio:.1f}x) {'OK' if ok else 'VIOLATED'}")
+    assert ok
+
+
 def test_r6_stem_has_no_conv() -> None:
     # r6 keeps arm0's LINEAR per-band projections — the conv stem is OFAT #2, not shipped in r6.
     obj = _r6()

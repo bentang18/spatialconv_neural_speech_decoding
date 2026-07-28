@@ -66,11 +66,80 @@ def test_warmup_clamped_below_total() -> None:
     _lrs_over(sched, 5)  # does not raise
 
 
+def test_stable_plateau_then_decay() -> None:
+    """WSD shape: linear warmup → FLAT plateau until ``stable_steps`` → decay to
+    ``min_lr_ratio`` over the tail. The plateau segment sits at peak (mult 1.0)."""
+    sched = _WarmupCosineLR(
+        _opt(1.0), warmup_steps=0, stable_steps=40, total_steps=50, min_lr_ratio=0.0
+    )
+    lrs = _lrs_over(sched, 50)
+    assert math.isclose(lrs[0][0], 1.0, rel_tol=1e-6)    # plateau start
+    assert math.isclose(lrs[40][0], 1.0, rel_tol=1e-6)   # plateau end → still peak
+    assert math.isclose(lrs[45][0], 0.5, abs_tol=1e-6)   # cosine midpoint of the 10-step tail
+    assert math.isclose(lrs[50][0], 0.0, abs_tol=1e-9)   # end → 0
+
+
+def test_one_minus_sqrt_decay_shape() -> None:
+    """``1-sqrt`` decay drops faster than linear early, then lingers low (the
+    MiniCPM/Hägele-preferred cooldown profile)."""
+    sched = _WarmupCosineLR(
+        _opt(1.0), warmup_steps=0, total_steps=100, min_lr_ratio=0.0, decay_shape="1-sqrt"
+    )
+    lrs = _lrs_over(sched, 100)
+    assert math.isclose(lrs[0][0], 1.0, rel_tol=1e-6)
+    assert math.isclose(lrs[25][0], 1.0 - 0.5, abs_tol=1e-6)   # 1 - sqrt(0.25) = 0.5
+    assert math.isclose(lrs[100][0], 0.0, abs_tol=1e-9)
+    # faster-than-linear early: at p=0.25 the 1-sqrt LR (0.5) is below linear (0.75)
+    assert lrs[25][0] < 0.75
+
+
+def test_linear_decay_shape() -> None:
+    sched = _WarmupCosineLR(
+        _opt(1.0), warmup_steps=0, total_steps=100, min_lr_ratio=0.0, decay_shape="linear"
+    )
+    lrs = _lrs_over(sched, 100)
+    assert math.isclose(lrs[25][0], 0.75, abs_tol=1e-6)
+    assert math.isclose(lrs[50][0], 0.50, abs_tol=1e-6)
+
+
+def test_load_state_dict_keeps_changed_config_not_source() -> None:
+    """WSD branch-with-changed-config: resuming a FLAT (min_lr_ratio=1.0) source
+    ckpt into a decaying cooldown scheduler must restore only PROGRESS
+    (last_epoch), NOT clobber the new decay config back to the flat source's — the
+    silent-no-decay bug that torch's default ``__dict__.update`` would cause."""
+    src = _WarmupCosineLR(_opt(1.0), warmup_steps=5, total_steps=50, min_lr_ratio=1.0)
+    _lrs_over(src, 40)  # advance the flat source to step 40
+    src_state = src.state_dict()
+
+    cool = _WarmupCosineLR(
+        _opt(1.0), warmup_steps=5, stable_steps=40, total_steps=45,
+        min_lr_ratio=0.0, decay_shape="1-sqrt",
+    )
+    cool.load_state_dict(src_state)
+    assert cool.last_epoch == 40           # progress restored
+    assert cool.min_lr_ratio == 0.0        # NOT clobbered to source's 1.0
+    assert cool.decay_shape == "1-sqrt"
+    assert cool.total_steps == 45
+    # and it actually decays over the tail rather than staying flat
+    lrs = _lrs_over(cool, 5)
+    assert math.isclose(lrs[-1][0], 0.0, abs_tol=1e-9)
+
+
 def test_config_build_with_total_steps() -> None:
     cfg = WarmupCosine(warmup_steps=10, min_lr_ratio=0.0)
     sched = cfg.build(_opt(1.0), total_steps=110)
     assert isinstance(sched, _WarmupCosineLR)
     assert sched.warmup_steps == 10 and sched.total_steps == 110
+
+
+def test_config_build_threads_stable_steps_and_decay_shape() -> None:
+    cfg = WarmupCosine(warmup_steps=0, stable_steps=40, decay_shape="1-sqrt", min_lr_ratio=0.001)
+    sched = cfg.build(_opt(6e-3), total_steps=45)
+    assert sched.stable_steps == 40 and sched.decay_shape == "1-sqrt"
+    lrs = _lrs_over(sched, 45)
+    assert math.isclose(lrs[0][0], 6e-3, rel_tol=1e-6)    # plateau at peak
+    assert math.isclose(lrs[40][0], 6e-3, rel_tol=1e-6)   # plateau end
+    assert math.isclose(lrs[45][0], 6e-3 * 0.001, rel_tol=1e-6)  # decayed to floor
 
 
 def test_config_build_without_total_steps_is_constant() -> None:

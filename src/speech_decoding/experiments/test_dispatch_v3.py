@@ -384,6 +384,62 @@ def test_v3r6_reads_arm0_caches_and_shaft_batches(tmp_path) -> None:
     _cpu_trainer(2).fit(m, datamodule=dm)  # runs; no shape/plan-cache error
 
 
+def test_mask_space_frac_threads_into_mask_cfg_time_unchanged(tmp_path) -> None:
+    # HARD-MASKING OFAT: --mask-space-frac overrides V3MaskConfig.space_frac and NOTHING else.
+    # Default (absent) ⇒ 0.50, byte-identical to r6 (0.75 total space∪time). 0.80 with the time
+    # fracs held at 0.50 lands ~0.90 total (measured) and aims the hard masking at the spatial axis.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_def, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
+    )
+    assert m_def.model.mask_cfg.space_frac == 0.50  # default: unchanged from the locked config
+    m_hard, dm_hard, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           mask_space_frac=0.80)
+    )
+    assert m_hard.model.mask_cfg.space_frac == 0.80  # the ONLY field that moves
+    assert m_hard.model.mask_cfg.hga_mask_frac == 0.50  # time fracs held (ASR regime)
+    assert m_hard.model.mask_cfg.mid_mask_frac == 0.50
+    assert m_hard.model.mask_cfg.slow_mask_frac == 0.50
+    assert m_hard.model.mask_cfg.block_w_space == 4  # block width untouched
+    _cpu_trainer(2).fit(m_hard, datamodule=dm_hard)  # runs at 0.80 space, no shape/plan error
+    print("[check] OK --mask-space-frac 0.80 threads into mask_cfg; time fracs + block width held")
+
+
+def test_mae_hga_envelope_threads_to_the_objective_and_fits(tmp_path) -> None:
+    # HGA-envelope OFAT: --mae-hga-envelope must reach V3JepaObjective and change NOTHING else
+    # (same frontend, same mask cfg, same heads/shapes ⇒ the ckpt stays loadable by the probe).
+    # Absent ⇒ False, byte-identical to the r6 keeper.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_def, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
+    )
+    assert m_def.model.objective.mae_hga_envelope is False  # default = the r6 contract
+    m_env, dm_env, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           mae_hga_envelope=True)
+    )
+    obj = m_env.model.objective
+    assert obj.mae_hga_envelope is True
+    assert obj.force_norm_pix is False  # the two are mutually exclusive by construction
+    # head widths UNCHANGED (7/6/7): the envelope reuses the pad machinery, so a checkpoint from
+    # this arm still loads into the per-bin probe encoder.
+    assert [h.out_features for h in obj.mae_heads] == [7, 6, 7]
+    assert m_env.model.mask_cfg == m_def.model.mask_cfg  # masking untouched — SINGLE swap
+    _cpu_trainer(2).fit(m_env, datamodule=dm_env)  # runs end-to-end, no shape/plan-cache error
+    print("[check] OK --mae-hga-envelope threads to the objective; heads 7/6/7 and mask cfg held")
+
+
 def test_v3r5nffast_threads_decimate_4_and_per_stream_block_w_then_fits(tmp_path) -> None:
     # v3r5nffast = v3r5nf with the first stem conv at stride 2 (net 4× → 16 Hz tokens). It maps to
     # the SAME (no_fusion, R5NF_BAND_RATES) config as v3r5nf but with nf_decimate=4. Temporal block
