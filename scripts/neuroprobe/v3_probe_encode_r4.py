@@ -397,12 +397,22 @@ def _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon, present,
     only. Returns {tap: {'raw': ...}}."""
     n = bands[0].shape[0]
     k = grid.k_full
-    acc: dict = {t: [] for t in GPU_TAPS}
     # Per-electrode keep-time (Ben 2026-07-16): WS keeps ALL electrodes; the parcel-mean is the
     # comparison. Stored UNPOOLED on the canonical-contact axis (same order as parcel_canon), so
     # it is the pooled tap's exact pre-mean input — the diff is the pooling and nothing else.
-    for t in elec_taps:
-        acc[f"elec{t}"] = []
+    #
+    # Each tap is preallocated at full length and written slice-by-slice. Accumulating a list of
+    # per-batch tensors and torch.cat-ing at the end held the list AND its concatenation alive
+    # simultaneously — a 2x peak on the ~40 GB enc12_elec tap, which is what forced --mem=300G
+    # (measured 230-245 GiB on the 12-session board encode). Values, dtypes and row order are
+    # unchanged; only the allocation pattern differs.
+    acc: dict = {key: None for key in list(GPU_TAPS) + [f"elec{t}" for t in elec_taps]}
+
+    def _write(key, lo, hi, x):
+        if acc[key] is None:
+            acc[key] = torch.empty((n, *x.shape[1:]), dtype=x.dtype)
+        acc[key][lo:hi] = x
+
     for s in range(0, n, batch_size):
         e = min(s + batch_size, n)
         bb = [b[s:e].to(device) for b in bands]
@@ -412,11 +422,11 @@ def _encode_taps(teacher, bands, grid, parcel_packed, parcel_canon, present,
             _z, taps = teacher.forward(bb, grid, parcel_packed, tap_blocks=GPU_TAPS)
         for t in GPU_TAPS:
             enc = taps[t].float().reshape(Bb, -1, k, taps[t].shape[-1]).cpu()  # (Bb, n, k, d)
-            acc[t].append(_pool_parcels(enc, parcel_canon, present))
+            _write(t, s, e, _pool_parcels(enc, parcel_canon, present))
             if t in elec_taps:
                 # (Bb, n_contacts, k·d) fp16 — the SAME tensor, just unpooled.
-                acc[f"elec{t}"].append(enc.reshape(Bb, enc.shape[1], -1).to(torch.float16))
-    return {t: {"raw": torch.cat(v, 0)} for t, v in acc.items()}
+                _write(f"elec{t}", s, e, enc.reshape(Bb, enc.shape[1], -1).to(torch.float16))
+    return {t: {"raw": v} for t, v in acc.items()}
 
 
 def main() -> None:
