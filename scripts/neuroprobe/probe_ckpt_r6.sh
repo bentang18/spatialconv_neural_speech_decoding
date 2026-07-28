@@ -62,7 +62,11 @@ run_arm() {
 
   $SSH delta "mkdir -p $SHARD && rm -f $SHARD/*.json" >/dev/null 2>&1
   local BID MID
-  BID=$($SSH delta "sbatch --parsable --array=0-$((NARR-1)) --mem=128G $BASE/v3_probe_readout_r6.sbatch array '$CACHE' '$TAG' '$SHARD'")
+  # --cpus-per-task=32 is FREE at 128G: Delta CPU bills MAX_TRES (CPU=1000, Mem=512G) on a
+  # 128-core/257617M node, so billing == mem_MB/2 == 65536 and the CPU term (32000) stays under
+  # it. Break-even is 65 cores; 32 takes 4x the threads of the old default while staying small
+  # enough to backfill onto a partly-used node. Raise toward 65 only if queue latency allows.
+  BID=$($SSH delta "sbatch --parsable --array=0-$((NARR-1)) --mem=128G --cpus-per-task=32 $BASE/v3_probe_readout_r6.sbatch array '$CACHE' '$TAG' '$SHARD'")
   MID=$($SSH delta "sbatch --parsable --dependency=afterany:$BID --mem=32G $BASE/v3_probe_readout_r6.sbatch merge '$CACHE' '$TAG' '$SHARD' '$RESULT'")
   echo "[$TAG] readout array=$BID merge=$MID (afterany)" | tee -a "$LOG"
 

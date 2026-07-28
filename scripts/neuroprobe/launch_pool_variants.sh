@@ -29,7 +29,9 @@ mkdir -p "$SHARDS" "$ROOT/logs"
 # assert loads ONE session's unpooled enc12_elec (~29 GB fp16) whole to parity-check it, so 32G
 # OOMs — 64G gives headroom for the fp32 pooling expansion on top.
 ASSERT=$(sbatch --parsable --mem=64G "$SB" assert "$CACHE" "$TAG")
-ARRAY=$(sbatch --parsable --dependency=afterok:"$ASSERT" --array=0-12 --mem=128G \
+# --cpus-per-task=32 is free at 128G (MAX_TRES billing == mem_MB/2 == 65536 > 32*1000);
+# break-even is 65 cores, 32 keeps the request backfillable. See the memory-billing memo.
+ARRAY=$(sbatch --parsable --dependency=afterok:"$ASSERT" --array=0-12 --mem=128G --cpus-per-task=32 \
         "$SB" array "$CACHE" "$TAG" "$SHARDS")
 MERGE=$(sbatch --parsable --dependency=afterany:"$ARRAY" --mem=32G \
         "$SB" merge "$CACHE" "$TAG" "$SHARDS" "$OUT")

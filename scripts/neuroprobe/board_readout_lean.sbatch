@@ -38,6 +38,18 @@ cd /projects/bhqk/htang13/speech_board
 module load pytorch-conda/2.8
 CPT="${SLURM_CPUS_PER_TASK:-8}"
 export OMP_NUM_THREADS=$(( CPT / WK ))
+# BILLING: Delta CPU is MAX_TRES with TRESBillingWeights=CPU=1000,Mem=512G, and the node is
+# 128 cores / 257617M ⇒ billing == mem_MB/2 and the CPU term only bites above ~0.512·mem_GB
+# cores. Under that line the extra cores are FREE (we already paid for them with the memory);
+# above it billing flips to the CPU term and costs MORE. Print both so a submit that leaves
+# parallelism on the table -- or overshoots into a higher bill -- says so instead of going quiet.
+BE=$(( ${SLURM_MEM_PER_NODE:-0} / 2000 ))
+echo "[check] alloc cpus=$CPT mem=${SLURM_MEM_PER_NODE:-?}M workers=$WK omp=$OMP_NUM_THREADS; break-even cpus=$BE"
+if [ "$BE" -gt 0 ] && [ "$CPT" -lt "$BE" ]; then
+  echo "[check] UNDER-REQUESTED: --cpus-per-task=$BE bills the SAME as $CPT (billing is memory-bound)"
+elif [ "$BE" -gt 0 ] && [ "$CPT" -gt "$BE" ]; then
+  echo "[check] OVER-REQUESTED: $CPT cpus bills $(( CPT * 1000 )) vs $(( BE * 1000 )) at break-even -- this COSTS more"
+fi
 SIDECAR_ARGS=()
 if [[ "$MODE" == "csession" ]]; then
   SIDECAR_ARGS=(--elec-labels-sidecar /projects/bhqk/htang13/arm0_elec_labels_sidecar.pkl)

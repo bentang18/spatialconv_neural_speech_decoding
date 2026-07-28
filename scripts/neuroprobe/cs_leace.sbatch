@@ -34,6 +34,13 @@ TAPS="${4:-enc0,enc12}"; COMPONENTS="${5:-}"
 cd /projects/bhqk/htang13/speech_leace
 module load pytorch-conda/2.8
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+# BILLING: MAX_TRES with Mem=512G on a 128-core/257617M node ⇒ billing == mem_MB/2, so cores up
+# to ~0.512·mem_GB are already paid for and cores beyond it flip the bill to the CPU term.
+BE=$(( ${SLURM_MEM_PER_NODE:-0} / 2000 ))
+echo "[check] alloc cpus=${SLURM_CPUS_PER_TASK:-8} mem=${SLURM_MEM_PER_NODE:-?}M; break-even cpus=$BE"
+if [ "$BE" -gt 0 ] && [ "${SLURM_CPUS_PER_TASK:-8}" -lt "$BE" ]; then
+  echo "[check] UNDER-REQUESTED: --cpus-per-task=$BE bills the SAME as ${SLURM_CPUS_PER_TASK:-8}"
+fi
 
 # Every Lite session whose subject is not the anchor's (S2), ordered as in v3_board_readout.
 CELLS=(1,1 1,2 3,0 3,1 4,0 4,1 7,0 7,1 10,0 10,1)
