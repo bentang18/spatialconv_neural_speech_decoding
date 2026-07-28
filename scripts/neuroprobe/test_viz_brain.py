@@ -1,0 +1,113 @@
+"""A brain figure is the easiest place to publish a permutation bug and never find out.
+
+Nothing downstream of ``build`` can tell a correct electrode-to-coordinate mapping from a
+shuffled one -- both produce a pretty picture. So the row alignment is asserted, and the
+colour construction is pinned to the two properties the figure's claim rests on: one shared
+stretch across subjects, and invariance to a per-subject amplitude difference.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from scripts.neuroprobe.viz_brain import build, load_elec
+
+TAP = "enc12_elec"
+TASK = "onset"
+T, C = 8, 12
+
+
+def _pattern(n_rows: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(n_rows, T, C))
+
+
+def _write(tmp_path, subj, trial, x, n_coords=None, gain=1.0):
+    n_rows = x.shape[0]
+    base = 5.0 * np.ones((n_rows, T, C))
+    d = {
+        "subject_id": np.int64(subj), "trial_id": np.int64(trial),
+        "parcel_canon": np.arange(n_rows, dtype=np.int64) % 4,
+        f"{TAP}/shape": np.asarray([n_rows, T, C], dtype=np.int64),
+        f"{TAP}/col_sum": (base.reshape(n_rows, -1)).astype(np.float32),
+        f"{TAP}/col_sq": (base.reshape(n_rows, -1) ** 2 + 1.0).astype(np.float32),
+        f"{TAP}/{TASK}/c0/all": (gain * (base - 0.5 * x)).astype(np.float32),
+        f"{TAP}/{TASK}/c1/all": (gain * (base + 0.5 * x)).astype(np.float32),
+    }
+    np.savez_compressed(tmp_path / f"red_s{subj}_t{trial}_hga.npz", **d)
+    return np.arange((n_coords or n_rows) * 3, dtype=np.float32).reshape(-1, 3)
+
+
+def _coords(tmp_path, mapping):
+    np.savez_compressed(tmp_path / "coords.npz",
+                        **{f"{k}/coords": v for k, v in mapping.items()})
+    return str(tmp_path / "coords.npz")
+
+
+def test_load_elec_returns_the_class_contrast_not_a_condition(tmp_path) -> None:
+    x = _pattern(6, 0)
+    _write(tmp_path, 1, 0, x)
+    got = load_elec(str(tmp_path / "red_s1_t0_hga.npz"), TAP, TASK)
+    assert got is not None
+    # the shared 5.0 offset lives in BOTH classes and must cancel; sd here is 1.0
+    np.testing.assert_allclose(got["x"], x, atol=1e-4)
+
+
+def test_a_coordinate_row_count_mismatch_is_fatal(tmp_path) -> None:
+    c = _write(tmp_path, 1, 0, _pattern(6, 0), n_coords=5)
+    path = _coords(tmp_path, {"s1_t0": c})
+    with pytest.raises(AssertionError, match="coords vs"):
+        build(str(tmp_path), path, TAP, TASK)
+
+
+def test_a_session_without_coordinates_is_skipped_not_guessed(tmp_path) -> None:
+    c = _write(tmp_path, 1, 0, _pattern(6, 0))
+    _write(tmp_path, 2, 0, _pattern(6, 1))
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, {"s1_t0": c}), TAP, TASK)
+    assert [s["subject_id"] for s in sessions] == [1]
+
+
+def test_a_shared_contrast_paints_matched_contacts_the_same_colour(tmp_path) -> None:
+    x = _pattern(6, 0)
+    c1 = _write(tmp_path, 1, 0, x)
+    c2 = _write(tmp_path, 2, 0, x)
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, {"s1_t0": c1, "s2_t0": c2}),
+                        TAP, TASK)
+    a, b = sessions[0]["rgb"], sessions[1]["rgb"]
+    assert np.abs(a - b).max() < 1e-6
+
+
+def test_an_unshared_contrast_does_not(tmp_path) -> None:
+    c1 = _write(tmp_path, 1, 0, _pattern(6, 0))
+    c2 = _write(tmp_path, 2, 0, _pattern(6, 99))
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, {"s1_t0": c1, "s2_t0": c2}),
+                        TAP, TASK)
+    assert np.abs(sessions[0]["rgb"] - sessions[1]["rgb"]).max() > 0.2
+
+
+def test_a_louder_subject_does_not_get_a_different_colour(tmp_path) -> None:
+    """Per-session unit scaling is what stops one subject owning the shared basis. Without
+    it a 10x amplitude difference alone would recolour the quieter subject."""
+    x = _pattern(6, 0)
+    c1 = _write(tmp_path, 1, 0, x)
+    c2 = _write(tmp_path, 2, 0, x, gain=10.0)
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, {"s1_t0": c1, "s2_t0": c2}),
+                        TAP, TASK)
+    assert np.abs(sessions[0]["rgb"] - sessions[1]["rgb"]).max() < 1e-6
+
+
+def test_the_colour_stretch_is_shared_not_per_subject(tmp_path) -> None:
+    """A subject whose contrast barely moves must come out almost one flat colour.
+
+    Amplitude alone cannot show this -- per-session unit scaling removes it on purpose (see
+    the test above). What separates a shared stretch from a per-panel one is a subject whose
+    tokens sit in a tiny CLUSTER: stretching that panel by its own percentiles would blow
+    0.01 of jitter up to the full gamut and make it look as structured as anyone else.
+    """
+    c1 = _write(tmp_path, 1, 0, _pattern(6, 0))
+    flat = np.ones((6, T, 1)) * _pattern(1, 3)[0, 0] + 0.01 * _pattern(6, 4)
+    c2 = _write(tmp_path, 2, 0, flat)
+    sessions, _ = build(str(tmp_path), _coords(tmp_path, {"s1_t0": c1, "s2_t0": c2}),
+                        TAP, TASK)
+    spread = [float(s["rgb"].reshape(-1, 3).std(axis=0).mean()) for s in sessions]
+    assert spread[1] < 0.25 * spread[0], spread

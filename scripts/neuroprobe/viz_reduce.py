@@ -105,6 +105,10 @@ def reduce_session(path: str, *, taps, tasks, band: str, chunk: int, verbose: bo
     out: dict = {
         "subject_id": np.int64(subj), "trial_id": np.int64(trial),
         "present_parcels": present, "parcel_counts": counts,
+        # per-CANONICAL-contact atlas id. Only the ``*_elec`` taps are stored on this axis;
+        # for them it is the sole link from a feature row back to an electrode, and so to a
+        # coordinate. Kept unconditionally because it is ~1 kB.
+        "parcel_canon": canon,
         "band_lengths": np.asarray(band_lengths, dtype=np.int64),
         "n_windows": np.int64(n),
     }
@@ -129,7 +133,11 @@ def reduce_session(path: str, *, taps, tasks, band: str, chunk: int, verbose: bo
         feat = rec["feats"][tap]["raw"]
         n_p, n_feat = int(feat.shape[1]), int(feat.shape[2])
         cols, t_len, c_len = _band_slice(tap, band, band_lengths, band_fdims, n_feat)
-        assert n_p == len(present), f"{tap}: |P| {n_p} != present {len(present)}"
+        # ``enc{t}_elec`` taps are stored UNPOOLED, one row per canonical contact; the plain
+        # taps are parcel means. Getting this wrong would silently mislabel every row, so it
+        # is asserted rather than inferred from the shape.
+        n_rows = len(canon) if tap.endswith("_elec") else len(present)
+        assert n_p == n_rows, f"{tap}: {n_p} rows != expected {n_rows}"
         assert len(cols) == t_len * c_len
 
         col_sum = np.zeros((n_p, t_len * c_len), dtype=np.float64)

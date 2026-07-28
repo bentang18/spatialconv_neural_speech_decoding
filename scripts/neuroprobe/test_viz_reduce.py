@@ -129,6 +129,37 @@ def test_reduce_session_parcel_counts_partition_the_montage(tmp_path) -> None:
     assert out["parcel_counts"].sum() == 6
 
 
+def test_elec_tap_is_reduced_on_the_contact_axis(tmp_path) -> None:
+    """``enc{t}_elec`` has one row per canonical contact, not per parcel. The synthetic
+    montage has 6 contacts in 3 parcels, so the two axes cannot be confused by accident."""
+    p, n, _, d = _synthetic(tmp_path)
+    rec = torch.load(p, map_location="cpu", weights_only=False)
+    rec["feats"]["enc12_elec"] = {
+        "raw": (torch.arange(n, dtype=torch.float32).reshape(n, 1, 1)
+                * torch.ones(1, 6, sum(BL) * d)).to(torch.float16)}
+    q = str(tmp_path / "enc_s7_t5_x.pt")
+    torch.save(rec, q)
+    out = reduce_session(q, taps=("enc12_elec",), tasks=("onset",), band="hga", chunk=256,
+                         verbose=False)
+    assert out["enc12_elec/shape"].tolist() == [6, 32, d]
+    np.testing.assert_array_equal(out["parcel_canon"], [4, 4, 6, 7, 7, 7])
+    np.testing.assert_allclose(out["enc12_elec/onset/c0/all"], 9.5, rtol=1e-5)
+
+
+def test_a_parcel_pooled_tap_stored_on_the_contact_axis_is_rejected(tmp_path) -> None:
+    """The row count is the only thing that says which axis a tap is on. If a pooled tap
+    ever arrived unpooled, every downstream row label would be wrong and nothing else would
+    notice, so the mismatch has to be fatal here."""
+    p, n, _, d = _synthetic(tmp_path)
+    rec = torch.load(p, map_location="cpu", weights_only=False)
+    rec["feats"]["enc12"]["raw"] = torch.zeros(n, 6, sum(BL) * d, dtype=torch.float16)
+    q = str(tmp_path / "enc_s7_t6_x.pt")
+    torch.save(rec, q)
+    with pytest.raises(AssertionError, match="rows"):
+        reduce_session(q, taps=("enc12",), tasks=("onset",), band="hga", chunk=256,
+                       verbose=False)
+
+
 def test_band_fdims_override_only_fills_a_missing_key(tmp_path) -> None:
     p, _, _, _ = _synthetic(tmp_path)
     rec = torch.load(p, map_location="cpu", weights_only=False)

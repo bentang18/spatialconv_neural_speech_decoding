@@ -282,3 +282,49 @@ def test_figure_tasks_keeps_a_dead_task_small_relative_to_a_live_one(tmp_path) -
                         str(tmp_path / "t.png"))
     assert info["align_3pc"][TASK] > 0.9
     assert abs(info["align_3pc"]["dead"]) < 0.5
+
+
+def test_figure_depth_reports_the_slope_of_the_rows_it_was_given(tmp_path) -> None:
+    """The ladder must draw the numbers the quant/retrieval passes produced, not its own.
+    If it ever recomputed, the figure and the printed table could quietly diverge."""
+    from scripts.neuroprobe.viz_figures import figure_depth
+    taps = ["enc0", "enc6", "enc12"]
+    retr = [{"tap": t, "task": "onset", "top1": v, "chance": 1 / 32}
+            for t, v in zip(taps, (0.10, 0.18, 0.26))]
+    retr += [{"tap": t, "task": "frame_brightness", "top1": v, "chance": 1 / 32}
+             for t, v in zip(taps, (0.03, 0.03, 0.04))]
+    quant = [{"tap": t, "task": "onset", "class": CONTRAST, "normalized": v}
+             for t, v in zip(taps, (0.2, 0.4, 0.53))]
+    info = figure_depth(quant, retr, taps, ["onset", "frame_brightness"],
+                        str(tmp_path / "d.png"))
+    assert abs(info["top1_first_to_last"]["onset"] - 0.16) < 1e-9
+    assert abs(info["top1_first_to_last"]["frame_brightness"] - 0.01) < 1e-9
+    assert info["chance"] == 1 / 32 and info["n_tasks"] == 2
+
+
+def test_figure_depth_tolerates_a_tap_with_no_row(tmp_path) -> None:
+    from scripts.neuroprobe.viz_figures import figure_depth
+    taps = ["enc0", "enc6", "enc12"]
+    retr = [{"tap": "enc0", "task": "onset", "top1": 0.1, "chance": 1 / 32},
+            {"tap": "enc12", "task": "onset", "top1": 0.3, "chance": 1 / 32}]
+    info = figure_depth([], retr, taps, ["onset"], str(tmp_path / "d.png"))
+    assert abs(info["top1_first_to_last"]["onset"] - 0.2) < 1e-9
+
+
+def test_figure_identity_reports_the_cost_of_removing_identity(tmp_path) -> None:
+    from scripts.neuroprobe.viz_figures import figure_identity
+    rows = [{"tap": "enc0", "task": TASK, "identity_rank": 3, "n_sessions": 4,
+             "identity_var_frac": 0.7, "cross_subject_r": 0.20,
+             "cross_subject_r_identity_removed": 0.26},
+            {"tap": "enc12", "task": TASK, "identity_rank": 3, "n_sessions": 4,
+             "identity_var_frac": 0.6, "cross_subject_r": 0.42,
+             "cross_subject_r_identity_removed": 0.40}]
+    info = figure_identity(rows, str(tmp_path / "i.png"))
+    assert info["taps"] == ["enc0", "enc12"]
+    np.testing.assert_allclose(info["delta_r_after_removal"], [0.06, -0.02], atol=1e-9)
+
+
+def test_figure_identity_skips_rows_with_no_variance_split(tmp_path) -> None:
+    from scripts.neuroprobe.viz_figures import figure_identity
+    assert figure_identity([{"tap": "enc0", "identity_var_frac": float("nan")}],
+                           str(tmp_path / "i.png")) == {}

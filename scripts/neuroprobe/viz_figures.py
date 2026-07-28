@@ -446,6 +446,107 @@ def identity_content(sessions, lobes, tap: str, task: str) -> dict:
     }
 
 
+def figure_depth(quant, retr, taps, tasks, out_path: str) -> dict:
+    """Does cross-subject structure GROW with encoder depth? Two panels, same x axis.
+
+    Left is retrieval top-1 above chance, right is the ceiling-normalized cross-subject
+    correlation. Both are plotted for every task including the duds, because a depth ladder
+    that only shows the tasks that work is not a ladder -- if the trend were an artefact of
+    depth (more mixing -> smoother features -> higher correlation) it would lift
+    frame_brightness too, and the figure has to be able to show that.
+
+    Nothing is recomputed here: this draws the rows the quant and retrieval passes already
+    produced, so the figure and the printed table cannot disagree.
+    """
+    order = {t: i for i, t in enumerate(taps)}
+    q = {(r["tap"], r["task"]): r for r in quant if r.get("class") == CONTRAST}
+    rr = {(r["tap"], r["task"]): r for r in retr}
+    tasks = [t for t in tasks if any((tap, t) in rr for tap in taps)]
+    if not tasks or len(taps) < 2:
+        return {}
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
+    x = np.arange(len(taps))
+    chance = next((v["chance"] for v in rr.values()), float("nan"))
+    for t in tasks:
+        y = [rr[(tap, t)]["top1"] if (tap, t) in rr else np.nan for tap in taps]
+        axes[0].plot(x, y, marker="o", lw=1.6, label=t)
+        y2 = [q[(tap, t)]["normalized"] if (tap, t) in q else np.nan for tap in taps]
+        axes[1].plot(x, y2, marker="o", lw=1.6, label=t)
+    axes[0].axhline(chance, color="k", ls="--", lw=1)
+    axes[0].annotate(f"chance {chance:.3f}", (0, chance), fontsize=7,
+                     xytext=(2, 3), textcoords="offset points")
+    axes[0].set_ylabel("cross-subject retrieval, top-1")
+    axes[1].axhline(0.0, color="k", ls="--", lw=1)
+    axes[1].set_ylabel("cross-subject r / split-half ceiling")
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(taps)
+        ax.set_xlabel("encoder tap (depth →)")
+        ax.grid(alpha=0.25)
+    axes[1].set_title("gaps = split-half ceiling too low to normalize against", fontsize=8,
+                      color="#666")
+    axes[0].legend(fontsize=7, ncol=2, frameon=False)
+    fig.suptitle("Depth ladder · class contrast · shared lobes", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+    slope = {t: float(rr[(taps[-1], t)]["top1"] - rr[(taps[0], t)]["top1"])
+             for t in tasks if (taps[0], t) in rr and (taps[-1], t) in rr}
+    return {"taps": list(taps), "chance": float(chance),
+            "top1_first_to_last": slope, "n_tasks": len(tasks), "tap_order": order}
+
+
+def figure_identity(ic_rows, out_path: str) -> dict:
+    """Identity and content, side by side, per tap.
+
+    Left: how much of the token variance is BETWEEN sessions (who the subject is) versus
+    within. Right: cross-subject alignment before and after projecting the identity subspace
+    out. The pairing is the whole point -- a large identity share is only a problem if
+    removing it costs alignment. If the right panel holds up or rises while the left stays
+    large, identity and content are separable, which is what cross-subject transfer needs.
+    """
+    rows = [r for r in ic_rows if np.isfinite(r.get("identity_var_frac", np.nan))]
+    if not rows:
+        return {}
+    taps = [r["tap"] for r in rows]
+    x = np.arange(len(rows))
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+
+    ident = np.array([r["identity_var_frac"] for r in rows])
+    axes[0].bar(x, ident, color="#c44e52", label="between sessions (identity)")
+    axes[0].bar(x, 1 - ident, bottom=ident, color="#4c72b0", label="within session")
+    for i, v in enumerate(ident):
+        axes[0].text(i, v + 0.02, f"{v:.2f}", ha="center", fontsize=8)
+    axes[0].set_ylim(0, 1.15)
+    axes[0].set_ylabel("share of token variance")
+    axes[0].legend(fontsize=8, frameon=False, loc="upper right")
+
+    w = 0.38
+    before = [r["cross_subject_r"] for r in rows]
+    after = [r["cross_subject_r_identity_removed"] for r in rows]
+    axes[1].bar(x - w / 2, before, w, color="#999", label="as is")
+    axes[1].bar(x + w / 2, after, w, color="#55a868", label="identity subspace removed")
+    axes[1].axhline(0.0, color="k", lw=1)
+    axes[1].set_ylabel("cross-subject r (class contrast)")
+    axes[1].legend(fontsize=8, frameon=False)
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(taps)
+        ax.set_xlabel("encoder tap (depth →)")
+        ax.grid(alpha=0.25, axis="y")
+    task = rows[0].get("task", "")
+    fig.suptitle(f"Identity vs content · {task} · identity rank "
+                 f"{rows[0].get('identity_rank')} of {rows[0].get('n_sessions')} sessions",
+                 fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return {"taps": taps, "identity_var_frac": [float(v) for v in ident],
+            "delta_r_after_removal": [float(a - b) for a, b in zip(after, before)]}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--red-dir", required=True)
@@ -517,6 +618,14 @@ def main() -> None:
             print(f"[ident] {tap:6s} {args.task:16s} identity_var={ic['identity_var_frac']:.3f} "
                   f"(rank {ic['identity_rank']})  cross={ic['cross_subject_r']:+.4f} "
                   f"-> id-removed {ic['cross_subject_r_identity_removed']:+.4f}")
+
+    p = os.path.join(args.out_dir, "figD_depth_ladder.png")
+    report["figures"]["D"] = figure_depth(report["quant"], report["retrieval"], taps,
+                                          quant_tasks, p)
+    print(f"[fig] {p}")
+    p = os.path.join(args.out_dir, f"figI_identity_content_{args.task}.png")
+    report["figures"]["I"] = figure_identity(report["identity_content"], p)
+    print(f"[fig] {p}")
 
     dst = os.path.join(args.out_dir, "report.json")
     with open(dst, "w") as fh:
