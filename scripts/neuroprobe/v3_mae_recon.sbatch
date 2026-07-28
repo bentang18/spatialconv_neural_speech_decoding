@@ -30,7 +30,12 @@ export EXCA_CACHE_FOLDER=/work/nvme/bhqk/htang13/cache_neuroai
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH=/projects/bhqk/htang13/speech/src
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_lite
-srun /projects/bhqk/htang13/speech/.venv/bin/python -u -m scripts.neuroprobe.v3_mae_recon \
+# no srun, unlike the encode launchers. This is one process on one GPU with no ranks to
+# wire together, and srun died twice on two different nodes (gh141, gh024) with "Error
+# configuring interconnect" before Python ever started. sbatch already exports
+# CUDA_VISIBLE_DEVICES for --gpus-per-node=1, so the step launcher is pure overhead here --
+# dropping it removes the dependency rather than retrying against it.
+/projects/bhqk/htang13/speech/.venv/bin/python -u -m scripts.neuroprobe.v3_mae_recon \
   --ckpt "$CKPT" \
   --band-cache-dir $ROOT/band_v3slow \
   --band-cache-dir $ROOT/band_v3mid \
