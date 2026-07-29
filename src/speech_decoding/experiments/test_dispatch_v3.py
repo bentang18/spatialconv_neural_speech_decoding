@@ -719,6 +719,33 @@ def test_per_band_space_and_widths_thread_into_mask_cfg(tmp_path) -> None:
     print("[check] OK --per-band-space + --space-block-w-bands 6,4,2 thread in; rate/time held")
 
 
+def test_per_band_space_composes_with_a_lowered_space_frac(tmp_path) -> None:
+    # The LAUNCHED r6 arm's exact config: per-band SPACE at the best measured RATE. --mask-space-frac
+    # and --per-band-space are applied by two separate replace() calls (dispatch_v3.py:324, :337) on
+    # disjoint fields, so this pins that they compose rather than clobber. Rate 0.25 comes from the
+    # closed visible-fraction sweep (WS +.0117 real); widths stay 4 because the measured HARD
+    # fraction (masked contacts with NO visible immediate neighbour, the only regime R20's r(d)
+    # distinguishes) peaks at width 4 when the rate is 0.25 and collapses to .046 at width 1.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_arm, dm_arm, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           mask_space_frac=0.25, per_band_space=True,
+                           space_block_w_bands="4,4,4")
+    )
+    cfg = m_arm.model.mask_cfg
+    assert cfg.space_frac == 0.25  # the rate moved...
+    assert cfg.per_band_space is True and cfg.block_w_space_bands == (4, 4, 4)  # ...and so did space
+    assert cfg.hga_mask_frac == 0.50 and cfg.mid_mask_frac == 0.50 and cfg.slow_mask_frac == 0.50
+    assert cfg.block_w_band == 4  # TIME axis fully untouched — space is the only axis this arm moves
+    _cpu_trainer(2).fit(m_arm, datamodule=dm_arm)
+    print("[check] OK --mask-space-frac 0.25 composes with --per-band-space 4,4,4; TIME held")
+
+
 def test_space_block_w_bands_rejects_a_bad_triple(tmp_path) -> None:
     sess = [(1, 0, _shaft_labels((8, 8, 8)))]
     band_dirs, span_dir = _write_caches(tmp_path, sess)
