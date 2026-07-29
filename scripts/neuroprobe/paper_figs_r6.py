@@ -2,6 +2,7 @@
 
 Fig 2    CS tap ladder + leaderboard     <- results/r6_era/board/*.json
 Fig 2ws  within-session, elec-only        <- results/r6_era/board/*.json
+Fig 2cs  cross-session, elec-only         <- results/r6_era/board/*.json
 Fig 3  LEACE identity erasure            <- results/r6_era/leace/leace_S*.json
 Fig 4  concentration (3-PC vs full)      <- viz_crosssubject/archive/win{1,2}s/report.json
 
@@ -320,6 +321,119 @@ def fig2_ws() -> None:
     fig.tight_layout(); _save(fig, "fig2ws_within_session")
 
 
+# ------------------------------------------------------- fig 2cs: cross-session
+# Same selection rule again: every family, best variant, recomputed from the vendored raw JSONs
+# (`leaderboard_baselines.py --split Cross-Session`). Two asymmetries here are theirs, not ours:
+# DIVER-1 has no Cross-Session submission so it drops out, and RNN (GRU) appears ONLY here --
+# it has no Cross-Subject entry and its Within-Session directory fails task/cell coverage.
+CSESSION_BOARD = {
+    "CNN (Laplacian-STFT)": 0.6704,
+    "PopT (Laplacian-STFT)": 0.6627,
+    "MLP (Laplacian-STFT)": 0.6549,
+    "Linear (Laplacian-STFT)": 0.6511,
+    "BrainBERT (frozen)": 0.6326,
+    "BrainBERT (untrained)": 0.5725,
+    "GLIS-GNN": 0.5499,
+    "RNN (GRU)": 0.5100,
+}
+# NOT `LEAD`. The cooldown checkpoints never had csession scored -- the regime is per-electrode
+# and `board_readout_lean.sbatch` omitted the elec-labels sidecar on those runs -- so the only
+# checkpoints carrying it are 45k-no-cooldown and 20k. Since the cooldown is a REAL gain on
+# csession, using the no-cooldown file understates us; that direction is the safe one.
+CSESSION_CKPT = "MERGED_board_nocd_45k.json"
+CSESSION_TAP = "enc12_elec"
+
+
+def csession_cells(path: pathlib.Path) -> dict[str, dict[str, float]]:
+    """cell -> tap -> macro over tasks. ONE tap: the board wrote only `enc12_elec` here."""
+    d = json.load(open(path))
+    per_task = {}
+    for key, blob in d.items():
+        cse = blob.get("csession")
+        if not cse or f"{CSESSION_TAP}|std" not in cse:
+            continue
+        per_task[key] = cse[f"{CSESSION_TAP}|std"]
+    if not per_task:
+        return {}
+    cells = set.intersection(*(set(v) for v in per_task.values()))
+    return {c: {CSESSION_TAP: statistics.fmean(v[c] for v in per_task.values())}
+            for c in sorted(cells)}
+
+
+def fig2_cs() -> None:
+    cells = csession_cells(RES / "r6_era/board" / CSESSION_CKPT)
+    assert len(cells) == 12, f"[check] VIOLATED csession needs all 12 Lite cells, got {len(cells)}"
+    macro = statistics.fmean(v[CSESSION_TAP] for v in cells.values())
+    best = max(CSESSION_BOARD.values())
+    print(f"[check] CSession {CSESSION_CKPT} over {len(cells)} cells = {macro:.4f}")
+    assert macro > best, f"[check] VIOLATED csession {macro:.4f} does not clear board top {best:.4f}"
+
+    # The claim must not rest on one checkpoint. 20k is the only other file carrying csession;
+    # if it did not also clear the board the result would be a checkpoint artifact.
+    alt = csession_cells(RES / "r6_era/board" / "results_v3_board_r6_20k.json")
+    alt_macro = statistics.fmean(v[CSESSION_TAP] for v in alt.values())
+    assert len(alt) == 12 and alt_macro > best, \
+        f"[check] VIOLATED 20k csession {alt_macro:.4f} on {len(alt)} cells does not clear {best:.4f}"
+    print(f"[check] OK clears board top {best:.4f} by {macro - best:+.4f}; "
+          f"20k replicates at {alt_macro:.4f} ({alt_macro - best:+.4f})")
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.9), width_ratios=[1.25, 1])
+
+    rows = sorted(list(CSESSION_BOARD.items()) + [("ours enc12", macro)], key=lambda r: r[1])
+    cols = [PALETTE["ours"] if n.startswith("ours") else
+            PALETTE["accent"] if abs(v - best) < 1e-9 else "#bbb" for n, v in rows]
+    ax.barh(range(len(rows)), [v for _, v in rows], color=cols, height=0.66)
+    for i, (_, v) in enumerate(rows):
+        ax.text(v + 0.0015, i, f"{v:.4f}", va="center", fontsize=6.6)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([n for n, _ in rows], fontsize=6.6)
+    ax.set_xlim(0.50, 0.71)
+    ax.set_xlabel("cross-session macro AUROC (12/12 cells)")
+    ax.set_title("Cross-session leaderboard", pad=6)
+
+    # One tap means no slopegraph and no ladder, so the right panel spends its space on the
+    # DISTRIBUTION instead: a macro above the board top is compatible with most cells below it.
+    subj = by_subject(cells)
+    ys = sorted(subj.items(), key=lambda kv: kv[1][CSESSION_TAP])
+    lo = min(v[CSESSION_TAP] for _, v in ys)
+    hi = max(v[CSESSION_TAP] for _, v in ys)
+    pad = 0.055 * (hi - lo)
+    # The two reference lines are named in the legend, not inline: at 4/6 above and 2/6 below,
+    # inline labels land on top of the rows they are supposed to be read against.
+    ax2.axvline(best, color=PALETTE["accent"], lw=0.9, ls="--",
+                label=f"board top {best:.4f}")
+    ax2.axvline(macro, color="k", lw=1.6, label=f"our macro {macro:.4f}")
+    for i, (_, v) in enumerate(ys):
+        x = v[CSESSION_TAP]
+        col = PALETTE["ours"] if x > best else PALETTE["accent"]
+        ax2.plot([best, x], [i, i], lw=0.8, color=col, alpha=0.55, zorder=2)
+        ax2.plot([x], [i], marker="o", ms=5, color=col, zorder=3)
+        # Labels flip to the outside of the dot so they never straddle the macro rule.
+        left = abs(x - macro) < pad * 2.2 and x < macro
+        ax2.text(x + (-pad * 0.6 if left else pad * 0.6), i, f"{x:.4f}", fontsize=6.2,
+                 va="center", ha="right" if left else "left", zorder=4)
+    ax2.set_yticks(range(len(ys)))
+    ax2.set_yticklabels([s for s, _ in ys], fontsize=7)
+    ax2.set_xlim(lo - pad * 5.0, hi + pad * 4.0)
+    ax2.set_ylim(-0.9, len(ys) - 0.15)
+    ax2.legend(fontsize=6.3, loc="lower right")
+    ax2.set_xlabel("cross-session macro AUROC")
+    cell_win = sum(v[CSESSION_TAP] > best for v in cells.values())
+    subj_win = sum(v[CSESSION_TAP] > best for v in subj.values())
+    print(f"[check] CSession {len(cells)} sessions -> {len(subj)} subjects: clears board top in "
+          f"{subj_win}/{len(subj)} subjects, {cell_win}/{len(cells)} sessions")
+    ax2.set_title(f"Per subject: clears board top in {subj_win}/{len(subj)}\n"
+                  f"({cell_win}/{len(cells)} sessions individually)", pad=6, fontsize=8)
+
+    # Both caveats belong on the figure, not only in the caption: a single tap is not a ladder,
+    # and this is the one panel in the set that does not use the shipped checkpoint.
+    fig.text(0.5, -0.055, "csession carries only enc12_elec -- no enc0 tap, so no zero-param bar "
+             f"and no ladder  ·  checkpoint = 45k NO-cooldown (the shipped {LEAD} was never "
+             "scored on this regime; cooldown helps csession, so this understates us)",
+             ha="center", fontsize=6.0, color=PALETTE["muted"])
+    fig.tight_layout(); _save(fig, "fig2cs_cross_session")
+
+
 # ---------------------------------------------------------------- fig 3: LEACE
 def _paired_t(diffs: list[float]) -> tuple[float, float]:
     n = len(diffs)
@@ -525,10 +639,10 @@ def _save(fig, stem: str) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["2", "2ws", "3", "4"], default=None)
+    ap.add_argument("--only", choices=["2", "2ws", "2cs", "3", "4"], default=None)
     a = ap.parse_args()
     _style()
-    for n, fn in (("2", fig2), ("2ws", fig2_ws), ("3", fig3), ("4", fig4)):
+    for n, fn in (("2", fig2), ("2ws", fig2_ws), ("2cs", fig2_cs), ("3", fig3), ("4", fig4)):
         if a.only in (None, n):
             print(f"=== fig {n}")
             fn()
