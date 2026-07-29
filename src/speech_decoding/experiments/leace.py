@@ -58,6 +58,28 @@ class LeaceEraser:
     proj: np.ndarray
     var_removed: float
     residual_cov: float
+    sv: np.ndarray = None  # type: ignore[assignment]
+    """Singular values of the centered fit data, aligned with ``basis`` columns.
+
+    Kept so a caller can locate the erased direction in the VARIANCE SPECTRUM without paying for a
+    second SVD of an (n, 93184) matrix -- the spectrum and the eraser come from one factorisation.
+    """
+
+    removed_dir: np.ndarray = None  # type: ignore[assignment]
+    """(d, k) orthonormal basis of the subspace actually SUBTRACTED from x, in feature space.
+
+    ``var_removed`` says how much variance the erasure destroyed but not WHERE that direction
+    sits, and those are different questions. A rank-1 direction carrying 20% of the variance of an
+    iEEG representation is equally consistent with "the model concentrated identity into one axis"
+    and with "this is the global common-mode/amplitude axis, which differs across subjects for
+    trivial recording reasons and which the decoder never used". Distinguishing them needs the
+    direction itself -- its overlap with the leading principal components, and with the
+    between-domain mean shift that per-feature standardisation already removes.
+
+    This is the RANGE of the (oblique) projector, i.e. the thing removed, not the linear functional
+    that detects the concept. For ``proj = D qa qaᵀ D⁻¹`` in basis coordinates the range is
+    ``span(D qa)``, so in feature space it is ``basis @ (D qa)``, orthonormalised.
+    """
 
     @property
     def rank(self) -> int:
@@ -76,11 +98,20 @@ def fit_leace(
     *,
     n_components: int | None = None,
     rtol: float = 1e-10,
+    svd: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> LeaceEraser:
     """Fit the eraser that removes concept ``z`` from features ``x``.
 
     ``n_components`` truncates the row-space basis before fitting, which is the shrinkage knob
     for ill-conditioned covariances; ``None`` keeps every direction above ``rtol``.
+
+    ``svd`` accepts a precomputed thin SVD of the CENTERED ``x`` as ``(u, s, vt)`` and skips the
+    factorisation. The SVD depends only on ``x``, never on the concept, so several erasers over the
+    same features -- the real concept, a shuffled control, a variance-matched control -- cost ONE
+    factorisation between them instead of one each. That is what makes a control arm affordable at
+    d=93184, where the SVD is the entire bill and the ridge that follows is ~10% of it.
+    CALLER'S RESPONSIBILITY: it must be the SVD of this exact centered matrix. Only the shapes are
+    checked, and passing a stale factorisation yields a wrong eraser silently.
     """
     x = np.asarray(x, dtype=np.float64)
     if x.ndim != 2:
@@ -96,7 +127,15 @@ def fit_leace(
     xc = x - mean
     zc = zc - zc.mean(0)
 
-    u, s, vt = np.linalg.svd(xc, full_matrices=False)
+    if svd is None:
+        u, s, vt = np.linalg.svd(xc, full_matrices=False)
+    else:
+        u, s, vt = svd
+        k = min(xc.shape)
+        if u.shape != (n, k) or s.shape != (k,) or vt.shape != (k, xc.shape[1]):
+            raise ValueError(
+                f"precomputed svd shapes {u.shape}/{s.shape}/{vt.shape} do not match a thin SVD "
+                f"of {xc.shape}")
     keep = s > (s[0] * rtol if s[0] > 0 else 0.0)
     if n_components is not None:
         keep &= np.arange(s.size) < n_components
@@ -115,9 +154,13 @@ def fit_leace(
     live = sa > (sa[0] * rtol if sa.size and sa[0] > 0 else 0.0)
     if not live.any():
         proj = np.zeros((s.size, s.size))
+        removed_dir = np.zeros((x.shape[1], 0))
     else:
         qa = ua[:, live]
         proj = (s / scale)[:, None] * (qa @ qa.T) * (scale / s)[None, :]
+        # Range of the projector, carried back to feature space and orthonormalised. QR rather
+        # than a normalise: rank > 1 columns are not orthogonal to each other.
+        removed_dir, _ = np.linalg.qr(basis @ ((s / scale)[:, None] * qa))
 
     removed = (y @ proj.T)
     total_var = float((s**2).sum() / (n - 1))
@@ -134,4 +177,6 @@ def fit_leace(
         proj=proj,
         var_removed=var_removed,
         residual_cov=residual_cov,
+        sv=s,
+        removed_dir=removed_dir,
     )

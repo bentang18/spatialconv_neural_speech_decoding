@@ -128,3 +128,57 @@ def test_rejects_wrong_feature_width_at_apply_time():
     eraser = fit_leace(x, z)
     with pytest.raises(ValueError, match="expected"):
         eraser(np.zeros((5, 3)))
+
+
+def test_removed_dir_spans_exactly_what_erasure_subtracts():
+    """The diagnostic that asks WHERE the erased direction sits is only meaningful if the vector
+    it inspects is the one actually subtracted. Check it against the residual itself rather than
+    against the internals that produced it."""
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=(60, 25))
+    z = np.asarray(rng.integers(0, 2, size=60))
+    x[:, 4] += 3.0 * z                                  # plant the concept on a real axis
+    er = fit_leace(x, z)
+
+    d = er.removed_dir
+    assert d.shape == (25, 1), "binary concept => rank 1"
+    assert np.allclose(d.T @ d, np.eye(1), atol=1e-10), "must be orthonormal"
+
+    r = x - er(x)                                       # what erasure actually removed
+    assert np.linalg.norm(r) > 1e-6, "nothing was removed; test is vacuous"
+    resid = r - (r @ d) @ d.T                           # component outside the claimed span
+    assert np.linalg.norm(resid) / np.linalg.norm(r) < 1e-10
+
+
+def test_singular_values_line_up_with_the_basis():
+    """`sv` exists so callers can weight `basis` columns by variance. Misalignment would silently
+    mis-locate the erased direction in the spectrum."""
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(40, 15)) @ np.diag(np.linspace(5, 0.1, 15))
+    er = fit_leace(x, np.asarray(rng.integers(0, 2, size=40)))
+    assert er.sv.shape[0] == er.basis.shape[1]
+    assert np.all(np.diff(er.sv) <= 1e-9), "singular values must stay descending"
+    xc = x - x.mean(0)
+    assert np.allclose(np.linalg.norm(xc @ er.basis, axis=0), er.sv, rtol=1e-8)
+
+
+def test_a_precomputed_svd_reproduces_the_eraser_exactly():
+    """Sharing one factorisation across several concepts is only sound if it changes nothing."""
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(50, 20))
+    z = np.asarray(rng.integers(0, 2, size=50))
+    x[:, 2] += 2.0 * z
+    want = fit_leace(x, z)
+    got = fit_leace(x, z, svd=np.linalg.svd(x - x.mean(0), full_matrices=False))
+    assert np.allclose(got.proj, want.proj, atol=1e-12)
+    assert got.var_removed == pytest.approx(want.var_removed, rel=1e-12)
+    assert np.allclose(np.abs(got.removed_dir), np.abs(want.removed_dir), atol=1e-12)
+
+
+def test_a_mismatched_precomputed_svd_is_rejected_not_used():
+    """Silently accepting a stale factorisation would produce a plausible, wrong eraser."""
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(30, 12))
+    z = np.asarray(rng.integers(0, 2, size=30))
+    with pytest.raises(ValueError, match="do not match a thin SVD"):
+        fit_leace(x, z, svd=np.linalg.svd(rng.normal(size=(30, 9)), full_matrices=False))
