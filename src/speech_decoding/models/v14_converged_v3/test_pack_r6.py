@@ -67,7 +67,7 @@ def _broadcast_global_to_persensor(m: V3Masks, n_contacts: int) -> V3MasksR6:
         return t[:, None, :].expand(t.shape[0], n_contacts, t.shape[1]).contiguous()
 
     return V3MasksR6(
-        contact_mask=m.contact_mask,
+        contact_mask=m.contact_mask[:, :, None].expand(-1, -1, 3),  # r4 tube → r6 (R,N,3)
         hga_mask=bc(m.hga_mask),
         mid_mask=bc(m.mid_mask),
         slow_mask=bc(m.slow_mask),
@@ -108,7 +108,7 @@ def test_temporal_is_read_per_sensor() -> None:
     hga[:, 0, :] = True  # contact 0 fully HGA-masked; every other contact all visible
     mid = torch.zeros(B, n, t // 2, dtype=torch.bool)
     slow = torch.zeros(B, n, t // 8, dtype=torch.bool)
-    contact = torch.zeros(B, n, dtype=torch.bool)
+    contact = torch.zeros(B, n, 3, dtype=torch.bool)
     masks = V3MasksR6(contact_mask=contact, hga_mask=hga, mid_mask=mid, slow_mask=slow)
     masked, _ = token_flags_r6(grid, masks)
     is_hga = grid.band == 2
@@ -134,7 +134,7 @@ def test_block_edges_are_scored_no_margin_gate() -> None:
     hga[:, :, 10:20] = True  # width-10 masked block, positions 10..19 (rest visible)
     mid = torch.zeros(B, n, t // 2, dtype=torch.bool)
     slow = torch.zeros(B, n, t // 8, dtype=torch.bool)
-    contact = torch.zeros(B, n, dtype=torch.bool)  # no spatial mask ⇒ the temporal set alone
+    contact = torch.zeros(B, n, 3, dtype=torch.bool)  # no spatial mask ⇒ the temporal set alone
     masks = V3MasksR6(contact_mask=contact, hga_mask=hga, mid_mask=mid, slow_mask=slow)
     masked, in_loss = token_flags_r6(grid, masks)
     is_hga = grid.band == 2
@@ -155,8 +155,8 @@ def test_contact_masked_token_is_in_loss() -> None:
     t = 32
     grid = build_r4_grid(geom, n_time=t)
     B = 1
-    contact = torch.zeros(B, n, dtype=torch.bool)
-    contact[:, 0] = True  # mask contact 0 entirely
+    contact = torch.zeros(B, n, 3, dtype=torch.bool)
+    contact[:, 0, :] = True  # mask contact 0 entirely, all 3 bands
     z_hga = torch.zeros(B, n, t, dtype=torch.bool)
     z_mid = torch.zeros(B, n, t // 2, dtype=torch.bool)
     z_slow = torch.zeros(B, n, t // 8, dtype=torch.bool)

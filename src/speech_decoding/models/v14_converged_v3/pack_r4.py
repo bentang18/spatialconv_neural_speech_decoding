@@ -309,12 +309,17 @@ def token_flags_r6(grid: R4Grid, masks) -> tuple[Tensor, Tensor]:
     too instead of discarding them.
 
     The grid is r4's (:func:`build_r4_grid`) unchanged. ``masks`` (``masking.V3MasksR6``):
-    ``contact_mask`` (B, N) + {slow,mid,hga}_mask (B, N, T_b)."""
+    ``contact_mask`` (B, N, 3) + {slow,mid,hga}_mask (B, N, T_b).
+
+    SPACE is read per band — ``contact_mask[:, grid.contact, grid.band]`` — so a token is spatially
+    masked iff ITS OWN band dropped that contact. Under the locked ``per_band_space=False`` the
+    three band slices are one draw broadcast, so this reduces exactly to the old shared tube.
+    Band-axis order is (SLOW, MID, HGA), matching ``grid.band`` and ``band_masks`` below."""
     band_masks = (masks.slow_mask, masks.mid_mask, masks.hga_mask)  # each (B, N, T_b)
     B = masks.contact_mask.shape[0]
     device = grid.contact.device
 
-    contact_masked = masks.contact_mask[:, grid.contact]  # (B, total)
+    contact_masked = masks.contact_mask[:, grid.contact, grid.band]  # (B, total)
 
     temporal_masked = torch.zeros(B, grid.total, dtype=torch.bool, device=device)
     for b, bm in enumerate(band_masks):  # bm (B, N, T_b)

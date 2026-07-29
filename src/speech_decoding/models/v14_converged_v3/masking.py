@@ -68,6 +68,21 @@ class V3MaskConfig:
     whole_shaft_frac: float = 0.0  # E[K]; K ~ Binomial(S, frac) clamped to K_max. Design B: 0.
     keep_alive: bool = True  # Design B: reserve ≥1 visible contact per non-whole shaft (d_s≤n_s−1).
     block_w_space: int = 4  # depth-block width (contacts).
+    # r6/R19 ONLY. False (LOCKED) = ONE space draw shared across all 3 bands — a spatially masked
+    # contact loses SLOW, MID and HGA together (a "tube"). True = SLOW/MID/HGA each draw their own
+    # contacts at the SAME per-shaft count, so a contact can be spatially masked in HGA while
+    # visible in SLOW/MID. Ben 2026-07-29: this is the SYMMETRY argument — the three TIME masks are
+    # already independent per band (below), and SPACE was the lone exception, never argued for.
+    # Matched-visible by construction (exact-count snapping is per band), so the masked TOKEN COUNT
+    # is identical either way. Only sample_masks_r6 reads this.
+    per_band_space: bool = False
+    # r6/R19 ONLY, and REQUIRES per_band_space (a per-band width with a shared draw is incoherent).
+    # None ⇒ every band uses ``block_w_space``. A (SLOW, MID, HGA) triple sets each band's own
+    # depth-block width, which is the whole point of measuring r(d) per band (R20): SLOW is volume-
+    # conducted and stays predictable across contacts, so it needs a WIDER hole to be non-trivial,
+    # while HGA decorrelates over millimetres and is already hard at width 1. Order matches
+    # R4Grid.band. Counts are UNCHANGED by width (exact-count snapping) ⇒ still matched-visible.
+    block_w_space_bands: tuple[int, int, int] | None = None
     # ── TIME (global; each band masked INDEPENDENTLY on its OWN grid, ONE unified rule) ──
     hga_mask_frac: float = 0.50  # HGA masked on its 32 Hz grid (Ben: 50%).
     mid_mask_frac: float = 0.50  # MID masked on its 16 Hz grid (Ben: 50% for symmetry).
@@ -416,9 +431,9 @@ def _sample_r5_space_time(
 class V3MasksR6:
     """r6 masks — r4's 3-band STRUCTURE × PER-SENSOR temporal INDEPENDENCE.
 
-    ONE per-shaft-balanced SPACE mask (``contact_mask``, shared across bands — the r4
-    outer-product structure: a (contact c, band b, token t_b) is visible iff c is spatially
-    kept AND band-b token t_b is not time-masked) + THREE band TIME masks on the SLOW/MID/HGA
+    A per-shaft-balanced SPACE mask (``contact_mask``, held per band — the r4 outer-product
+    structure: a (contact c, band b, token t_b) is visible iff c is spatially kept IN BAND b
+    AND band-b token t_b is not time-masked) + THREE band TIME masks on the SLOW/MID/HGA
     grids. Unlike r4's GLOBAL ``(R,T_b)`` band masks, each r6 band mask is PER-SENSOR
     ``(R,N,T_b)``: every ``(row, contact)`` hides its OWN contiguous width-``block_w_band``
     blocks, exactly ``round(frac·length)`` per band.
@@ -434,7 +449,10 @@ class V3MasksR6:
     scored, the data2vec2/MAE convention (Ben 2026-07-23: "no ML SSL does a margin gate for masked
     tokens")."""
 
-    contact_mask: Tensor  # (R, N) bool — per-shaft balanced SPACE, shared across bands.
+    # (R, N, 3) bool — per-shaft balanced SPACE, band axis ordered (SLOW, MID, HGA) to match
+    # ``R4Grid.band`` (pack_r4 ``band_masks = (slow, mid, hga)``). Under the default
+    # ``per_band_space=False`` all three slices are the SAME draw broadcast, i.e. the shared tube.
+    contact_mask: Tensor
     hga_mask: Tensor  # (R, N, T)   bool — per-sensor HGA (32 Hz). round(hga_frac·T) per (row, contact).
     mid_mask: Tensor  # (R, N, T/2) bool — per-sensor MID (16 Hz). round(mid_frac·T/2).
     slow_mask: Tensor  # (R, N, T/8) bool — per-sensor SLOW (4 Hz). round(slow_frac·T/8).
@@ -473,12 +491,21 @@ def sample_masks_r6(
     generator: torch.Generator,
     cfg: V3MaskConfig = V3MaskConfig(),
 ) -> V3MasksR6:
-    """Sample ``n_rows`` r6 masks: shared per-shaft-balanced SPACE + THREE per-SENSOR band TIME masks.
+    """Sample ``n_rows`` r6 masks: per-shaft-balanced SPACE + THREE per-SENSOR band TIME masks.
 
-    SPACE is a faithful copy of :func:`sample_masks`'s per-shaft balanced tier (drawn ONCE, shared
-    across bands). TIME draws SLOW/MID/HGA INDEPENDENTLY on their own grids (sequential draws from
-    the one generator ⇒ independent realizations), each PER-SENSOR ``(R,N,T_b)`` in contiguous
-    width-``block_w_band`` blocks. Per-sensor counts are per-session constants ⇒ static shapes."""
+    SPACE is a faithful copy of :func:`sample_masks`'s per-shaft balanced tier. TIME draws
+    SLOW/MID/HGA INDEPENDENTLY on their own grids (sequential draws from the one generator ⇒
+    independent realizations), each PER-SENSOR ``(R,N,T_b)`` in contiguous width-``block_w_band``
+    blocks. Per-sensor counts are per-session constants ⇒ static shapes.
+
+    ``cfg.per_band_space`` (R19) makes SPACE independent per band too, so both axes follow ONE
+    rule. Default False = the locked r6 tube: ONE space draw broadcast across the band axis, with
+    the generator consumed in exactly the pre-R19 order ⇒ byte-identical to every existing run.
+    True = three independent draws, so a contact can be spatially masked in HGA while visible in
+    SLOW/MID. Every band uses the SAME ``d_s`` (``round(space_frac·n_s)``, exact-count snapping) ⇒
+    the masked TOKEN COUNT is identical either way, and the arm is MATCHED-VISIBLE by construction.
+    The whole-shaft tier (dead at ``whole_shaft_frac=0``) stays shared — a shaft dropped in one
+    band but not another is not a coherent object."""
     r, s, c = n_rows, geom.n_shafts, geom.max_c
     n, t = n_contacts, n_time
     valid = geom.valid  # (S, C)
@@ -499,15 +526,34 @@ def sample_masks_r6(
     whole = ws_rank < k[:, None]  # (R, S)
     d_s = torch.where(whole, cs[None].expand(r, s), d_s_base[None].expand(r, s))
 
-    cover_space = _cover_rank(valid, cfg.block_w_space, r, generator)  # (R, S, C)
-    key = cover_space + rand(r, s, c)
-    within_rank = key.argsort(-1).argsort(-1)  # (R, S, C)
-    grid_mask = within_rank < d_s[:, :, None]  # (R, S, C) exactly d_s per (row, shaft)
-
     vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,)
     vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,)
-    contact_mask = torch.zeros(r, n, dtype=torch.bool, device=dev)
-    contact_mask[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
+
+    def draw_space(block_w: int) -> Tensor:
+        """One (R, N) per-shaft balanced space draw, exactly d_s masked per (row, shaft)."""
+        cover_space = _cover_rank(valid, block_w, r, generator)  # (R, S, C)
+        key = cover_space + rand(r, s, c)
+        within_rank = key.argsort(-1).argsort(-1)  # (R, S, C)
+        grid_mask = within_rank < d_s[:, :, None]  # (R, S, C) exactly d_s per (row, shaft)
+        out = torch.zeros(r, n, dtype=torch.bool, device=dev)
+        out[:, vcontact] = grid_mask.reshape(r, -1)[:, vpos]
+        return out
+
+    if cfg.per_band_space:
+        # THREE INDEPENDENT draws (sequential from the one generator), band axis ordered
+        # (SLOW, MID, HGA) to match R4Grid.band. Same d_s every band ⇒ identical masked-token
+        # count to the tube ⇒ MATCHED-VISIBLE by construction.
+        bws = cfg.block_w_space_bands or (cfg.block_w_space,) * 3
+        contact_mask = torch.stack([draw_space(int(w)) for w in bws], dim=-1)  # (R, N, 3)
+    else:
+        if cfg.block_w_space_bands is not None:
+            raise ValueError(
+                "block_w_space_bands requires per_band_space=True — per-band widths with ONE "
+                "shared space draw would silently apply only the last band's width."
+            )
+        # LOCKED r6: ONE draw shared across bands. Generator consumption is unchanged from
+        # pre-R19, so every existing run stays byte-identical; the band axis is a broadcast view.
+        contact_mask = draw_space(cfg.block_w_space)[:, :, None].expand(r, n, 3)  # (R, N, 3)
 
     # ── TIME (per-SENSOR INDEPENDENT, 3 bands each on its own grid, width-4 blocks) ──
     if t % SLOW_STRIDE != 0:

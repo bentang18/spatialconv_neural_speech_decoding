@@ -17,6 +17,7 @@ from speech_decoding.models.v14_converged_v3.masking import (
     V3MaskConfig,
     V3MasksR6,
     assert_mask_feasible,
+    sample_masks,
     sample_masks_r6,
 )
 from speech_decoding.models.v14_converged_v3.pack_r4 import build_r4_grid, token_flags_r6
@@ -45,7 +46,7 @@ def test_shape_and_four_fields() -> None:
     n = int(geom.valid.sum())
     m = sample_masks_r6(geom, n, n_time=32, n_rows=5, generator=_gen())
     assert isinstance(m, V3MasksR6)
-    assert m.contact_mask.shape == (5, n)
+    assert m.contact_mask.shape == (5, n, 3)  # (R, N, band) — band axis (SLOW, MID, HGA)
     assert m.hga_mask.shape == (5, n, 32)
     assert m.mid_mask.shape == (5, n, 16)
     assert m.slow_mask.shape == (5, n, 4)
@@ -77,9 +78,10 @@ def test_space_balanced_shared_and_keep_alive() -> None:
     sc, geom = _session([4, 4, 4])
     n = int(geom.valid.sum())
     m = sample_masks_r6(geom, n, n_time=32, n_rows=64, generator=_gen(3))
-    csum = m.contact_mask.long().sum(1)  # (R,) total masked per row
+    tube = m.contact_mask[..., 0]  # default per_band_space=False ⇒ all 3 slices identical
+    csum = tube.long().sum(1)  # (R,) total masked per row
     assert torch.all(csum == 6), csum.unique().tolist()  # 3 shafts × round(0.5·4)=2
-    assert not m.contact_mask.all(1).any()  # keep-alive: never a fully-masked row
+    assert not tube.all(1).any()  # keep-alive: never a fully-masked row
     print("[check] OK shared per-shaft-balanced space (6/12), keep-alive holds")
 
 
@@ -87,7 +89,7 @@ def test_masked_counts_constant_across_rows_static_shapes() -> None:
     sc, geom = _session([3, 5, 4])
     n = int(geom.valid.sum())
     m = sample_masks_r6(geom, n, n_time=32, n_rows=8, generator=_gen(2))
-    per_row = m.contact_mask.long().sum(1)
+    per_row = m.contact_mask[..., 0].long().sum(1)
     assert torch.all(per_row == per_row[0])
     for tm in (m.hga_mask, m.mid_mask, m.slow_mask):
         per_sensor = tm.long().sum(-1)  # (R, N)
@@ -275,3 +277,119 @@ def test_degenerate_montage_still_raises_when_masking_was_requested() -> None:
         print(f"[check] degenerate montage still raises: {e}")
         return
     raise AssertionError("space_frac=0.5 on all-size-1 shafts must still raise")
+
+
+# ── R19+R20: per-band SPACE masks + per-band spatial block width ──────────────
+# Ben 2026-07-29: "I like the symmetry for independent band mask for both space and time."
+# The three TIME masks were already independent per band; SPACE was the lone shared axis. These
+# pin the two properties that make it a legitimate single-knob arm: the DEFAULT is byte-identical
+# to the locked tube, and turning it on changes ARRANGEMENT ONLY — never the masked token count.
+
+
+def test_default_is_the_shared_tube_all_three_band_slices_identical() -> None:
+    sc, geom = _session([3, 5, 4])
+    n = int(geom.valid.sum())
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=8, generator=_gen(11))
+    assert torch.equal(m.contact_mask[..., 0], m.contact_mask[..., 1])
+    assert torch.equal(m.contact_mask[..., 1], m.contact_mask[..., 2])
+    print("[check] OK per_band_space=False ⇒ one draw broadcast; band slices identical (the tube)")
+
+
+def test_default_generator_consumption_matches_the_r4_space_prologue() -> None:
+    """THE REGRESSION GUARD for every existing r6 run.
+
+    ``sample_masks`` (r4) and ``sample_masks_r6`` share a verbatim space prologue drawing from the
+    generator in the same order. If R19 had added or reordered a draw under the default, the two
+    would diverge. This pins generator consumption without needing the pre-R19 code."""
+    sc, geom = _session([3, 5, 4])
+    n = int(geom.valid.sum())
+    r4 = sample_masks(geom, n, n_time=32, n_rows=8, generator=_gen(21))
+    r6 = sample_masks_r6(geom, n, n_time=32, n_rows=8, generator=_gen(21))
+    assert torch.equal(r4.contact_mask, r6.contact_mask[..., 0]), "r6 space draw diverged from r4"
+    print("[check] OK default space draw bit-matches sample_masks ⇒ generator order unchanged")
+
+
+def test_per_band_space_bands_differ_but_counts_are_matched_visible() -> None:
+    sc, geom = _session([4, 6, 8])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(per_band_space=True)
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=32, generator=_gen(12), cfg=cfg)
+    assert not torch.equal(m.contact_mask[..., 0], m.contact_mask[..., 2]), "bands must differ"
+    # MATCHED-VISIBLE: exact-count snapping runs per band ⇒ identical masked count in every band.
+    per_band = m.contact_mask.long().sum(1)  # (R, 3)
+    assert torch.all(per_band == per_band[:, :1]), per_band.unique().tolist()
+    tube = sample_masks_r6(geom, n, n_time=32, n_rows=32, generator=_gen(12)).contact_mask
+    assert int(per_band[0, 0]) == int(tube[..., 0].long().sum(1)[0]), "count must match the tube"
+    print(f"[check] OK per-band space differs across bands, count identical ({int(per_band[0,0])}/{n} every band)")
+
+
+def test_per_band_space_creates_the_cross_band_bridge() -> None:
+    """The mechanism under test: a contact spatially masked in HGA but VISIBLE in SLOW/MID.
+    Impossible under the tube by construction — that is the whole point of the arm."""
+    sc, geom = _session([4, 6, 8])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(per_band_space=True)
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=32, generator=_gen(13), cfg=cfg)
+    hga_only = m.contact_mask[..., 2] & ~m.contact_mask[..., 0] & ~m.contact_mask[..., 1]
+    assert hga_only.any(), "no contact masked in HGA alone ⇒ no cross-band bridge"
+    tube = sample_masks_r6(geom, n, n_time=32, n_rows=32, generator=_gen(13)).contact_mask
+    assert not (tube[..., 2] & ~tube[..., 0]).any(), "the tube must never produce a bridge"
+    print(f"[check] OK cross-band bridge exists ({int(hga_only.sum())} HGA-only contacts); tube has none")
+
+
+def test_per_band_widths_change_arrangement_not_count() -> None:
+    sc, geom = _session([8, 8, 16])
+    n = int(geom.valid.sum())
+    base = V3MaskConfig(per_band_space=True)
+    wide = V3MaskConfig(per_band_space=True, block_w_space_bands=(6, 4, 1))
+    a = sample_masks_r6(geom, n, n_time=32, n_rows=32, generator=_gen(14), cfg=base)
+    b = sample_masks_r6(geom, n, n_time=32, n_rows=32, generator=_gen(14), cfg=wide)
+    assert not torch.equal(a.contact_mask, b.contact_mask), "widths must change the arrangement"
+    assert torch.equal(a.contact_mask.long().sum(1), b.contact_mask.long().sum(1)), \
+        "widths must NOT change the masked count — that would break matched-visible"
+    # a wider block must produce longer contiguous runs; a width-1 block, shorter.
+    def longest_run(v: torch.Tensor) -> int:
+        best = cur = 0
+        for x in v.tolist():
+            cur = cur + 1 if x else 0
+            best = max(best, cur)
+        return best
+    shaft16 = geom.gather_idx[2][geom.valid[2]]  # the 16-contact shaft, in depth order
+    slow_runs = max(longest_run(b.contact_mask[r][shaft16, 0]) for r in range(32))
+    hga_runs = max(longest_run(b.contact_mask[r][shaft16, 2]) for r in range(32))
+    assert slow_runs > hga_runs, (slow_runs, hga_runs)
+    print(f"[check] OK per-band widths: count fixed, SLOW(w6) run {slow_runs} > HGA(w1) run {hga_runs}")
+
+
+def test_per_band_widths_without_per_band_space_raises() -> None:
+    """A per-band width under ONE shared draw would silently apply only the LAST band's width."""
+    sc, geom = _session([4, 4])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(block_w_space_bands=(6, 4, 1))
+    try:
+        sample_masks_r6(geom, n, n_time=32, n_rows=4, generator=_gen(), cfg=cfg)
+    except ValueError as e:
+        assert "per_band_space" in str(e)
+        print("[check] OK block_w_space_bands without per_band_space raises")
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_token_flags_reads_space_per_band() -> None:
+    """End-to-end: a contact masked ONLY in HGA must flag its HGA tokens and no others."""
+    sc, geom = _session([4, 6])
+    n = int(geom.valid.sum())
+    grid = build_r4_grid(geom, n_time=32)
+    zeros = lambda t: torch.zeros(1, n, t, dtype=torch.bool)  # noqa: E731
+    contact = torch.zeros(1, n, 3, dtype=torch.bool)
+    contact[0, 2, 2] = True  # contact 2, HGA only
+    masks = V3MasksR6(
+        contact_mask=contact, hga_mask=zeros(32), mid_mask=zeros(16), slow_mask=zeros(4)
+    )
+    masked, in_loss = token_flags_r6(grid, masks)
+    hit = masked[0]
+    assert bool(hit[(grid.contact == 2) & (grid.band == 2)].all()), "all HGA tokens must be masked"
+    assert not bool(hit[(grid.contact == 2) & (grid.band != 2)].any()), "SLOW/MID must stay visible"
+    assert not bool(hit[grid.contact != 2].any()), "other contacts untouched"
+    assert bool((in_loss == masked).all())
+    print(f"[check] OK token_flags_r6 space is per band ({int(hit.sum())} tokens, HGA of contact 2 only)")

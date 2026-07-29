@@ -331,6 +331,18 @@ def build_v3_training(
     band_bw = getattr(args, "band_block_w", None)
     if band_bw is not None:
         mask_cfg = replace(mask_cfg, block_w_band=band_bw)
+    # --per-band-space / --space-block-w-bands: R19+R20 merged arm. The three TIME masks are
+    # already independent per band; SPACE was the lone shared axis, and this makes BOTH axes follow
+    # one rule. Widths come from the measured along-shaft r(d) per band (R20). Exact-count snapping
+    # is per band, so masked token count is unchanged ⇒ matched-visible. None/False ⇒ locked config.
+    if getattr(args, "per_band_space", False):
+        mask_cfg = replace(mask_cfg, per_band_space=True)
+    sbw = getattr(args, "space_block_w_bands", None)
+    if sbw is not None:
+        parts = tuple(int(x) for x in sbw.split(","))
+        if len(parts) != 3:
+            raise ValueError(f"--space-block-w-bands needs SLOW,MID,HGA (3 ints), got {sbw!r}")
+        mask_cfg = replace(mask_cfg, block_w_space_bands=parts)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
@@ -588,6 +600,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "Set 1 to make _cover_rank degenerate to independent uniform per-token "
                         "selection = RANDOM masking — the control our leakage-free-block claim has "
                         "never had. r4/r6 path only (sample_masks); r5 uses --temporal-block-w.")
+    p.add_argument("--per-band-space", dest="per_band_space", action="store_true",
+                   help="ABLATION R19 (2026-07-29): draw the SPATIAL mask INDEPENDENTLY per band "
+                        "instead of one tube shared by SLOW/MID/HGA (masking.py per_band_space). "
+                        "The three TIME masks are already per-band independent; space was the lone "
+                        "exception. Exact-count snapping is per band ⇒ identical masked token count "
+                        "⇒ MATCHED-VISIBLE. A contact can then be spatially masked in HGA while "
+                        "visible in SLOW/MID, which is the cross-band-bridge test. r6 only.")
+    p.add_argument("--space-block-w-bands", dest="space_block_w_bands", type=str, default=None,
+                   help="R20: per-band spatial block width as SLOW,MID,HGA (e.g. '6,4,2'). "
+                        "REQUIRES --per-band-space. Unset ⇒ block_w_space (4) for all three. "
+                        "Derived from the measured along-shaft r(d) per band, replacing the "
+                        "hard-coded 4 that — unlike block_w_band — has no leak-margin derivation. "
+                        "Width changes ARRANGEMENT only, never count.")
     p.add_argument("--temporal-block-w", dest="temporal_block_w", type=int, default=None,
                    help="temporal mask block width in TOKENS (masking.py: the τ-anchored SSL "
                         "difficulty knob; block half-width must clear the ~83 ms LFS decorrelation "

@@ -687,3 +687,52 @@ def test_step_time_scalar_still_skips_first_step_then_logs() -> None:
     assert len(logged) == 1
     key, value, sync = logged[0]
     assert key == "train_sec_per_step" and value >= 0.0 and sync is False
+
+
+def test_per_band_space_and_widths_thread_into_mask_cfg(tmp_path) -> None:
+    # R19+R20 merged arm: --per-band-space makes SPACE independent per band (TIME already was),
+    # --space-block-w-bands sets each band's own depth-block width. Both default OFF ⇒ the locked
+    # tube. Exact-count snapping is per band, so neither flag changes the masked TOKEN COUNT.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_def, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
+    )
+    assert m_def.model.mask_cfg.per_band_space is False  # locked config unchanged
+    assert m_def.model.mask_cfg.block_w_space_bands is None
+
+    m_arm, dm_arm, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           per_band_space=True, space_block_w_bands="6,4,2")
+    )
+    cfg = m_arm.model.mask_cfg
+    assert cfg.per_band_space is True
+    assert cfg.block_w_space_bands == (6, 4, 2)
+    assert cfg.space_frac == 0.50  # rate held — this arm moves ARRANGEMENT only
+    assert cfg.hga_mask_frac == 0.50 and cfg.mid_mask_frac == 0.50 and cfg.slow_mask_frac == 0.50
+    assert cfg.block_w_band == 4  # the leak-derived TIME width is untouched
+    _cpu_trainer(2).fit(m_arm, datamodule=dm_arm)  # real fwd/bwd: shapes + flash plan hold
+    print("[check] OK --per-band-space + --space-block-w-bands 6,4,2 thread in; rate/time held")
+
+
+def test_space_block_w_bands_rejects_a_bad_triple(tmp_path) -> None:
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    for bad in ("4,4", "4,4,4,4"):
+        try:
+            build_v3_training(specs, _smoke_args(
+                frontend="v3r6", contact_budget=16, objective="mae",
+                per_band_space=True, space_block_w_bands=bad))
+        except ValueError as e:
+            assert "SLOW,MID,HGA" in str(e)
+            continue
+        raise AssertionError(f"{bad!r} should have raised")
+    print("[check] OK --space-block-w-bands rejects non-triples")
