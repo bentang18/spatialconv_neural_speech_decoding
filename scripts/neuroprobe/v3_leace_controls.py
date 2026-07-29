@@ -175,6 +175,68 @@ def _subspace_alignment(y: np.ndarray, domain: np.ndarray, ks=(8, 32, 128)) -> d
     return out
 
 
+def _task_direction(y: np.ndarray, rows: np.ndarray, lab: np.ndarray) -> np.ndarray:
+    """Unit vector from the label-0 class mean to the label-1 class mean, within one session."""
+    pos, neg = rows[lab[rows] > 0], rows[lab[rows] <= 0]
+    if len(pos) < 2 or len(neg) < 2:
+        return np.zeros(y.shape[1])
+    d = y[pos].mean(0) - y[neg].mean(0)
+    n = float(np.linalg.norm(d))
+    return d / n if n > 0 else d
+
+
+def _task_alignment(y: np.ndarray, domain: np.ndarray, lab: np.ndarray, reps=64) -> dict:
+    """Do the two sessions encode the TASK along the same axis, and is that axis the session axis?
+
+    ``_subspace_alignment`` asks whether the sessions share a coordinate system for their full
+    single-trial covariance, and the answer at the deep tap is "less than at enc0". That does not
+    settle the question the project actually cares about, because single-trial covariance is
+    dominated by session-private variability -- electrode placement, impedance, drift -- and the
+    shared, task-locked component can be a small slice of it. The trajectory figures average trials
+    within a condition, which suppresses exactly that private part; this statistic does the same
+    thing, in the same shared basis, at the resolution the binary tasks allow: one discriminative
+    direction per session.
+
+    Two numbers, and they answer different questions:
+
+    ``task_cos``     -- cross-session agreement of the task axis. Its null is a LABEL SHUFFLE done
+                        independently inside each session, which keeps every session-specific
+                        property (spectrum, class balance, n) and destroys only the task.
+    ``task_vs_sess`` -- overlap of the task axis with the between-session offset, per session. This
+                        is the honest version of "separability": the offset is a real, large
+                        direction, and whether the task rides on it or is orthogonal to it is a
+                        measurable fact rather than an inference from an erasure that costs nothing.
+    """
+    rows = [np.flatnonzero(domain == 0), np.flatnonzero(domain == 1)]
+    d_a, d_t = (_task_direction(y, r, lab) for r in rows)
+    if not d_a.any() or not d_t.any():
+        return {}
+
+    sess = y[rows[1]].mean(0) - y[rows[0]].mean(0)
+    sess = sess / max(float(np.linalg.norm(sess)), 1e-300)
+
+    rng = np.random.default_rng(101)
+    null = []
+    for _ in range(reps):
+        sh = lab.copy()
+        for r in rows:                                   # shuffle WITHIN session, never across
+            sh[r] = rng.permutation(sh[r])
+        null.append(abs(float(_task_direction(y, rows[0], sh) @ _task_direction(y, rows[1], sh))))
+    null = np.asarray(null)
+    obs = abs(float(d_a @ d_t))
+    return {
+        "task_cos": obs,
+        "task_cos_null": float(null.mean()),
+        "task_cos_null_p95": float(np.quantile(null, 0.95)),
+        "task_cos_p": float((null >= obs).mean()),
+        "task_cos_frac": float(obs / null.mean()) if null.mean() > 0 else float("nan"),
+        # Orthogonality of task to the session offset. Chance is ~1/sqrt(rank), so report both.
+        "task_vs_sess_a": abs(float(d_a @ sess)),
+        "task_vs_sess_t": abs(float(d_t @ sess)),
+        "task_vs_sess_chance": float(1.0 / np.sqrt(y.shape[1])),
+    }
+
+
 def _geometry(er: LeaceEraser, x: np.ndarray, domain: np.ndarray) -> dict:
     """Locate the erased direction in the variance spectrum, and split what it carries.
 
@@ -291,6 +353,17 @@ def _cell_arms(anchor_rec, test_rec, task, taps, n_components) -> dict:
                   f"{al[f'align_k{k}_ceil']:.4f} | frac {al[f'align_k{k}_frac']:.4f} | floor "
                   f"{al[f'align_k{k}_floor']:.5f} | diag {al[f'diag_k{k}']:.4f} vs ceil "
                   f"{al[f'diag_k{k}_ceil']:.4f} vs rot {al[f'diag_k{k}_rot']:.4f}", flush=True)
+
+        # Same basis, but the TASK-locked component rather than the full single-trial covariance.
+        labels = np.r_[y_a[tr], y_t[va], y_t[te]]
+        ta = _task_alignment(svd[0] * svd[1], domain, labels)
+        checks[enc].update(ta)
+        if ta:
+            print(f"    [task] {enc:>6} cross-session cos {ta['task_cos']:.4f} | null "
+                  f"{ta['task_cos_null']:.4f} (p95 {ta['task_cos_null_p95']:.4f}) | frac "
+                  f"{ta['task_cos_frac']:.2f} | p {ta['task_cos_p']:.3f} || vs session offset "
+                  f"a {ta['task_vs_sess_a']:.4f} t {ta['task_vs_sess_t']:.4f} | chance "
+                  f"{ta['task_vs_sess_chance']:.4f}", flush=True)
         for name, make in erasers.items():
             er = make()
             # Geometry for EVERY eraser, not just the real one. `leace_shuf` is the matched null

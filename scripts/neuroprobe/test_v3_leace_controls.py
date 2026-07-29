@@ -366,6 +366,70 @@ def test_alignment_tells_a_shared_coordinate_system_from_a_rotated_one():
         got["rotate"][f"diag_k{k}_rot"], abs=0.12), got["rotate"]
 
 
+def _task_world(shared: bool, orthogonal: bool, n=800, d=300, k=40, offset=40.0, seed=0):
+    """Two sessions with a big rigid offset, each carrying a binary task.
+
+    ``shared`` -- both sessions encode the task along the SAME axis, or along unrelated ones.
+    ``orthogonal`` -- that axis is orthogonal to the session offset, or lies along it.
+
+    The isotropic floor is not decoration. Without it the rows span only ~k dims, and two random
+    directions in a dozen dimensions have cos ~ 0.4, so the label-shuffle null sits high and the
+    fixture cannot exercise the regime the real features are in (rank 7000, null ~ 1/sqrt(rank)).
+    """
+    r = np.random.default_rng(seed)
+    q = np.linalg.qr(r.normal(size=(d, k + 3)))[0]
+    off, t_a, t_b = q[:, 0], q[:, 1], q[:, 2]
+    if not orthogonal:
+        t_a = t_b = off
+    elif shared:
+        t_b = t_a
+    x = (r.normal(size=(2 * n, k)) * np.geomspace(5.0, 0.5, k)) @ q[:, 3:].T
+    x += 0.5 * r.normal(size=(2 * n, d))                     # full-rank floor
+    dom = (np.arange(2 * n) >= n).astype(int)
+    lab = (np.arange(2 * n) % 2).astype(float)
+    x += offset * np.outer(dom, off)
+    x += 4.0 * np.outer((lab - 0.5) * (dom == 0), t_a)
+    x += 4.0 * np.outer((lab - 0.5) * (dom == 1), t_b)
+    return x, dom, lab
+
+
+def _task_of(x, dom, lab):
+    z = x - x.mean(0)
+    u, s, _ = np.linalg.svd(z, full_matrices=False)
+    return C._task_alignment(u * s, dom, lab)
+
+
+def test_task_alignment_tells_a_shared_task_axis_from_a_session_specific_one():
+    """The falsifier for 'the task-locked component is shared even though the covariance is not'."""
+    shared = _task_of(*_task_world(shared=True, orthogonal=True))
+    private = _task_of(*_task_world(shared=False, orthogonal=True))
+
+    assert shared["task_cos"] > 0.85 and shared["task_cos_p"] == 0.0, shared
+    assert shared["task_cos_frac"] > 4.0, shared
+    assert private["task_cos"] < 0.1 and private["task_cos_p"] > 0.5, private
+    assert private["task_cos"] < private["task_cos_null"], "a private axis sits BELOW its own null"
+
+
+def test_task_alignment_reports_whether_the_task_rides_the_session_offset():
+    """`task_vs_sess` is the honest form of the separability claim -- a measured overlap, not an
+    inference from an erasure that costs nothing downstream."""
+    apart = _task_of(*_task_world(shared=True, orthogonal=True))
+    along = _task_of(*_task_world(shared=True, orthogonal=False))
+
+    for key in ("task_vs_sess_a", "task_vs_sess_t"):
+        assert apart[key] < apart["task_vs_sess_chance"], (key, apart)
+        assert along[key] > 0.9, (key, along)
+
+
+def test_the_task_null_shuffles_within_session_so_it_keeps_the_offset():
+    """A null that shuffled labels ACROSS sessions would leak the session offset into the task
+    direction and inflate the null toward 1, hiding a real shared axis."""
+    small = _task_of(*_task_world(shared=False, orthogonal=True, offset=40.0))
+    huge = _task_of(*_task_world(shared=False, orthogonal=True, offset=5000.0))
+    assert huge["task_cos_null"] < 0.25, huge
+    assert huge["task_cos_null"] == pytest.approx(small["task_cos_null"], abs=0.02), (small, huge)
+
+
 def test_alignment_is_blind_to_the_between_session_offset():
     """The offset is the one thing we already know is there, so it must not be able to
     manufacture alignment -- otherwise this metric repeats the LEACE mistake."""
