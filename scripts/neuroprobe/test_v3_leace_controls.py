@@ -169,6 +169,47 @@ def test_all_four_arms_are_reported_with_geometry(pair):
             assert key in res["checks"][tap], f"{tap} missing {key}"
 
 
+def test_var_removed_can_approach_100_percent_at_exactly_zero_cost():
+    """`var_removed` is NOT a difficulty measure, and this is the proof.
+
+    When the erased direction is a pure between-domain offset, AUROC cannot see it: the score
+    changes by a constant on every test row and ranks are unchanged. The algebra only covers a
+    FIXED w, so this drives the real standardize+ridge path end to end, INCLUDING the refit on
+    erased anchor features -- the part the algebra does not cover. At a large enough offset the
+    eraser destroys >99% of total variance and the score is bit-identical, in a model with no
+    learning at all. Any claim of the form "erasing X% of the variance cost nothing" has to be
+    read against this.
+    """
+    d, n_a, n_t = 40, 300, 200
+    r = np.random.default_rng(0)
+    u = r.normal(size=d); u /= np.linalg.norm(u)                  # offset axis
+    v = r.normal(size=d); v -= (v @ u) * u; v /= np.linalg.norm(v)  # content axis, _|_ to it
+
+    def make(n, off, seed):
+        rr = np.random.default_rng(seed)
+        y = np.r_[np.zeros(n // 2), np.ones(n - n // 2)]
+        rr.shuffle(y)
+        x = rr.normal(size=(n, d))
+        x -= np.outer(x @ u, u)                                   # zero WITHIN-domain var along u
+        x += 2.0 * np.outer(y - 0.5, v)
+        return (x + off * u).astype(np.float32), y
+
+    va, te = np.arange(n_t // 2), np.arange(n_t // 2, n_t)
+    x_a, y_a = make(n_a, 0.0, 1)
+    x_t, y_t = make(n_t, 200.0, 2)
+    er = fit_leace(np.vstack([x_a, x_t]), np.r_[np.zeros(n_a), np.ones(n_t)].astype(int))
+
+    def sel(fa, ft):
+        a, (b, c) = B._standardize_inplace(fa.copy(), [ft[va].copy(), ft[te].copy()])
+        return B._select_lam(B._lam_grid(a, y_a, {"val": (b, y_t[va]),
+                                                  "test": (c, y_t[te])}))["test"]
+
+    assert er.var_removed > 0.99, f"fixture must delete nearly everything, got {er.var_removed}"
+    before = sel(x_a, x_t)
+    after = sel(er(x_a).astype(np.float32), er(x_t).astype(np.float32))
+    assert after == before, f"a pure offset must be free, moved {after - before:+.3e}"
+
+
 def test_the_shuffled_control_erases_a_different_direction_than_identity(pair):
     """If shuffling produced the same eraser the control would be vacuous."""
     anchor, test = pair
