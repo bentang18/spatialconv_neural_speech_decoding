@@ -169,6 +169,16 @@ def test_all_four_arms_are_reported_with_geometry(pair):
             assert key in res["checks"][tap], f"{tap} missing {key}"
 
 
+def test_the_shuffled_arm_carries_a_full_geometry_null(pair):
+    """dir_between_frac is biased upward by d/n, so the shuffled arm has to report the SAME
+    statistics as the real one -- otherwise there is nothing to compare enc0 and enc12 against."""
+    anchor, test = pair
+    ck = C._cell_arms(anchor, test, TASK, TAPS, None)["checks"]["enc12"]
+    for stat in ("dir_between_frac", "cos_pc1", "pc_participation", "var_removed"):
+        assert f"{stat}_leace_shuf" in ck, f"no null for {stat}"
+        assert f"{stat}_leace" in ck, f"no treatment value for {stat}"
+
+
 def test_var_removed_can_approach_100_percent_at_exactly_zero_cost():
     """`var_removed` is NOT a difficulty measure, and this is the proof.
 
@@ -208,6 +218,71 @@ def test_var_removed_can_approach_100_percent_at_exactly_zero_cost():
     before = sel(x_a, x_t)
     after = sel(er(x_a).astype(np.float32), er(x_t).astype(np.float32))
     assert after == before, f"a pure offset must be free, moved {after - before:+.3e}"
+
+
+def _two_session_world(kind: str, n=600, d=60, k=8, offset=40.0, seed=0):
+    """Two sessions whose within-session structure is related in a controlled way.
+
+    `scale`   -- identical axes, different amount of travel along each (Ben's read of the
+                 trajectory figures: same path, different size).
+    `rotate`  -- identical SUBSPACE, but the axes inside it are rotated. This is the case a
+                 subspace-overlap number cannot tell apart from `scale`, and the whole reason
+                 `diag_k` exists.
+    `unrelated` -- disjoint subspaces; the model shares nothing.
+
+    A large between-session offset is added in every world, because the real data has one and it
+    must not be able to reach these statistics through the per-domain centering.
+    """
+    r = np.random.default_rng(seed)
+    q = np.linalg.qr(r.normal(size=(d, 2 * k)))[0]
+    qa, qb_alt = q[:, :k], q[:, k:]
+    lam = np.geomspace(5.0, 0.5, k)
+
+    if kind == "scale":
+        qb, lb = qa, lam * np.geomspace(3.0, 0.4, k)
+    elif kind == "rotate":
+        rot = np.linalg.qr(r.normal(size=(k, k)))[0]
+        qb, lb = qa @ rot, lam
+    elif kind == "unrelated":
+        qb, lb = qb_alt, lam
+    else:
+        raise ValueError(kind)
+
+    a = (r.normal(size=(n, k)) * lam) @ qa.T
+    b = (r.normal(size=(n, k)) * lb) @ qb.T + offset * q[:, 0]
+    return np.vstack([a, b]), np.r_[np.zeros(n), np.ones(n)].astype(int)
+
+
+def test_alignment_tells_a_shared_coordinate_system_from_a_rotated_one():
+    """Overlap alone cannot adjudicate "same trajectory, different scale" -- a rotation inside the
+    same subspace scores identically. `diag_k` is what separates them, and this is its proof."""
+    k = 8
+    got = {kind: C._subspace_alignment(*_two_session_world(kind), ks=(k,))
+           for kind in ("scale", "rotate", "unrelated")}
+
+    # Both related worlds recover essentially the whole shared subspace...
+    for kind in ("scale", "rotate"):
+        assert got[kind][f"align_k{k}_frac"] > 0.9, (kind, got[kind])
+    # ...and an unrelated pair sits near the analytic floor, nowhere near the ceiling.
+    assert got["unrelated"][f"align_k{k}_frac"] < 0.25, got["unrelated"]
+
+    # The discrimination overlap cannot make. Read against the random-rotation reference, never
+    # an absolute threshold -- a fully rotated steep spectrum still keeps most of its mass on the
+    # diagonal, so "diag is high" alone means nothing.
+    assert got["scale"][f"diag_k{k}"] > 0.9, got["scale"]
+    assert got["scale"][f"diag_k{k}"] > 1.4 * got["scale"][f"diag_k{k}_rot"], got["scale"]
+    assert got["rotate"][f"diag_k{k}"] == pytest.approx(
+        got["rotate"][f"diag_k{k}_rot"], abs=0.12), got["rotate"]
+
+
+def test_alignment_is_blind_to_the_between_session_offset():
+    """The offset is the one thing we already know is there, so it must not be able to
+    manufacture alignment -- otherwise this metric repeats the LEACE mistake."""
+    k = 8
+    small = C._subspace_alignment(*_two_session_world("scale", offset=0.0), ks=(k,))
+    huge = C._subspace_alignment(*_two_session_world("scale", offset=5000.0), ks=(k,))
+    for stat in (f"align_k{k}", f"diag_k{k}"):
+        assert small[stat] == pytest.approx(huge[stat], abs=1e-9), stat
 
 
 def test_the_shuffled_control_erases_a_different_direction_than_identity(pair):

@@ -96,6 +96,85 @@ def _along(x: np.ndarray, mu: np.ndarray, d: np.ndarray, domain: np.ndarray) -> 
     return {"var": total, "between_frac": between / total if total > 0 else float("nan")}
 
 
+def _subspace_alignment(y: np.ndarray, domain: np.ndarray, ks=(8, 32, 128)) -> dict:
+    """Do the two sessions share a coordinate system, once their mean difference is removed?
+
+    This is the POSITIVE question, and it is a different claim from anything LEACE measures.
+    "Identity is filed in a disjoint subspace" says where the session DIFFERENCE lives. It says
+    nothing about whether the remaining structure is shared -- and shared structure is what
+    actually makes a ridge fit on subject A work on subject B. A model could file identity
+    perfectly and still be useless cross-subject if each session's content lived in its own
+    unrelated directions.
+
+    Measured as the mean squared principal cosine between the top-k within-session principal
+    subspaces of the two domains: ||Va^T Vt||_F^2 / k, in [0, 1]. Each domain is centered on ITS
+    OWN mean first, so the between-session offset -- the thing LEACE erases and AUROC ignores --
+    cannot contribute.
+
+    ``y`` is the data already expressed in the shared row-space basis, (n, rank). That is exact,
+    not an approximation: every row lies in the pooled affine span, and each domain mean is an
+    average of rows, so per-domain centering cannot leave it. So this costs two SVDs of
+    (n_domain, rank) instead of two of (n_domain, 93184) -- essentially free.
+
+    Alignment alone does not pin down the SHAPE of the correspondence, and the shape is the
+    interesting part. Ben's read of the trajectory figures is that same-task trajectories from
+    different subjects trace the same path up to a SCALE change, with no rotation. In this
+    language that is a much stronger claim than overlap: it says the test session's covariance is
+    close to DIAGONAL in the anchor's own eigenbasis, i.e. the two sessions agree on the axes
+    themselves and disagree only on how far they travel along each. An arbitrary orthogonal map
+    would preserve the subspace and destroy the diagonal, so `diag_k` separates the two readings
+    that eyeballing two or three principal components cannot.
+    """
+    rank = y.shape[1]
+    rng = np.random.default_rng(17)
+    perm = rng.permutation(len(domain))
+    out: dict = {}
+
+    def top(rows: np.ndarray, k: int):
+        z = y[rows] - y[rows].mean(0)
+        _, s, vt = np.linalg.svd(z, full_matrices=False)
+        return vt[:k].T, s[:k]                                         # (rank, k), (k,)
+
+    def diag_mass(c: np.ndarray, sb: np.ndarray) -> float:
+        cov = (c * (sb**2)) @ c.T
+        return float(np.square(np.diag(cov)).sum() / np.square(cov).sum())
+
+    def stats(ra: np.ndarray, rb: np.ndarray, k: int):
+        va, _ = top(ra, k)
+        vb, sb = top(rb, k)
+        c = va.T @ vb                                                  # (k, k) principal cosines
+        align = float(np.square(c).sum() / k)
+        # b's covariance expressed in a's eigenbasis; how much of it sits on the diagonal.
+        # Compared against a RANDOM ROTATION of the same spectrum, never against an absolute
+        # threshold: diagonal mass has a baseline set by the eigenvalue spread alone. With a steep
+        # spectrum every diagonal entry converges to the mean eigenvalue and a fully rotated
+        # covariance still keeps ~60% of its mass on the diagonal. "Same axes up to scale" is a
+        # claim ABOUT the rotation, so the random rotation is the hypothesis it has to beat.
+        rot = [diag_mass(np.linalg.qr(rng.normal(size=(k, k)))[0], sb) for _ in range(8)]
+        return align, diag_mass(c, sb), float(np.mean(rot))
+
+    # The reference is a CEILING, not a floor. Splitting the pooled rows at random gives two iid
+    # samples of one distribution, so their subspaces agree as closely as finite n permits -- the
+    # best any pair could do -- and cross-session alignment is reported as a FRACTION of that. The
+    # floor is analytic (k/rank) and is kept only because it is near zero at these ranks, which
+    # would otherwise make any nonzero overlap look impressive.
+    real =[np.flatnonzero(domain == 0), np.flatnonzero(domain == 1)]
+    fake = [perm[: len(real[0])], perm[len(real[0]):]]
+    for k in ks:
+        if k >= min(len(real[0]), len(real[1])) or k >= rank:
+            continue
+        a_ov, a_dg, a_rot = stats(real[0], real[1], k)
+        c_ov, c_dg, _ = stats(fake[0], fake[1], k)
+        out[f"align_k{k}"] = a_ov
+        out[f"align_k{k}_ceil"] = c_ov
+        out[f"align_k{k}_floor"] = k / rank
+        out[f"align_k{k}_frac"] = a_ov / c_ov if c_ov > 0 else float("nan")
+        out[f"diag_k{k}"] = a_dg
+        out[f"diag_k{k}_rot"] = a_rot
+        out[f"diag_k{k}_ceil"] = c_dg
+    return out
+
+
 def _geometry(er: LeaceEraser, x: np.ndarray, domain: np.ndarray) -> dict:
     """Locate the erased direction in the variance spectrum, and split what it carries.
 
@@ -176,24 +255,42 @@ def _cell_arms(anchor_rec, test_rec, task, taps, n_components) -> dict:
             "leace_shuf": lambda: fit_leace(stacked, shuf, n_components=n_components, svd=svd),
             "leace_toppc": lambda: _top_pc_eraser(mean, svd[2][: svd[1].size].T, svd[1]),
         }
+        checks[enc] = {"n_parcels": int(common.size), "d": int(z_tr.shape[1]),
+                       "n_rows": int(stacked.shape[0]), "rank": int(svd[1].size)}
+
+        # The positive question, asked of the same factorisation: with the session offset removed
+        # by per-domain centering, do the two sessions USE the same axes? `u * s` is exactly the
+        # stacked rows in the shared basis, so this is a change of coordinates, not a new fit.
+        al = _subspace_alignment(svd[0] * svd[1], domain)
+        checks[enc].update(al)
+        for k in sorted({int(q.split("_k")[1]) for q in al if q.startswith("align_k")
+                         and q.count("_") == 1}):
+            print(f"    [algn] {enc:>6} k={k:<4} overlap {al[f'align_k{k}']:.4f} | ceiling "
+                  f"{al[f'align_k{k}_ceil']:.4f} | frac {al[f'align_k{k}_frac']:.4f} | floor "
+                  f"{al[f'align_k{k}_floor']:.5f} | diag {al[f'diag_k{k}']:.4f} vs ceil "
+                  f"{al[f'diag_k{k}_ceil']:.4f} vs rot {al[f'diag_k{k}_rot']:.4f}", flush=True)
         for name, make in erasers.items():
             er = make()
+            # Geometry for EVERY eraser, not just the real one. `leace_shuf` is the matched null
+            # for these statistics and it is the only defensible one: dir_between_frac is measured
+            # along a direction CHOSEN to maximise the domain gap, so it is biased upward, and the
+            # bias grows with d/n -- the axis on which enc0 (d/n ~ 0.3) and enc12 (d/n ~ 13) differ
+            # by ~45x. Measured on synthetic data with a matched d/n, the NULL dir_between_frac is
+            # 0.15 at enc0's ratio and 0.89 at enc12's. Comparing raw enc0-vs-enc12 without this
+            # null reads a dimensionality artifact as a fact about the model. The shuffled arm
+            # supplies the null on the REAL features, at the real spectrum, for free -- the SVD is
+            # already shared, so this costs one extra projection.
+            geom = _geometry(er, stacked, domain)
+            checks[enc].update({f"{k}_{name}": v for k, v in geom.items()})
             if name == "leace":
-                checks[enc] = {
-                    "n_parcels": int(common.size), "d": int(z_tr.shape[1]),
-                    "n_rows": int(stacked.shape[0]), "rank": int(svd[1].size),
-                    **_geometry(er, stacked, domain),
-                }
-                g = checks[enc]
-                assert g["cos_domain_mean_shift"] > 0.999, (
+                checks[enc].update(geom)          # unprefixed keys stay the published contract
+                assert geom["cos_domain_mean_shift"] > 0.999, (
                     f"the erased direction must BE the between-domain mean shift for a binary "
-                    f"concept, got cos={g['cos_domain_mean_shift']:.6f}")
-                print(f"    [geom] {enc:>6} pc1_var {g['pc1_var_frac']:.4f} | erased_var "
-                      f"{g['var_removed']:.4f} | cos_pc1 {g['cos_pc1']:.4f} | "
-                      f"pc_participation {g['pc_participation']:7.1f} | top10 "
-                      f"{g['wt_in_top10_pcs']:.4f} | cos_common {g['cos_common_mode']:.4f} | "
-                      f"BETWEEN dir {g['dir_between_frac']:.4f} pc1 {g['pc1_between_frac']:.4f}",
-                      flush=True)
+                    f"concept, got cos={geom['cos_domain_mean_shift']:.6f}")
+            print(f"    [geom] {enc:>6} {name:<11} var {geom['var_removed']:.4f} | cos_pc1 "
+                  f"{geom['cos_pc1']:.4f} | pc_part {geom['pc_participation']:7.1f} | "
+                  f"BETWEEN {geom['dir_between_frac']:.4f} | effective_within "
+                  f"{geom['var_removed'] * (1 - geom['dir_between_frac']):.5f}", flush=True)
             a, (b, c) = B._standardize_inplace(
                 L._f32(er(z_tr)), [L._f32(er(z_va)), L._f32(er(z_te))])
             grid[(enc, name)] = B._lam_grid(
