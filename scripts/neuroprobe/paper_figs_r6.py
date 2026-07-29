@@ -39,9 +39,18 @@ OUT = RES / "showcase/paper"
 VIZ = RES / "viz_crosssubject/archive"
 TAPS = ["enc0", "enc3", "enc6", "enc12"]
 
-# Neuroprobe CS leaderboard, same board/split. Decoder is NOT held constant across these
-# entries -- .539/.566/.578 are logistic/MLP/CNN on ONE fixed Laplacian-STFT feature set.
-BOARD = {"CNN (Laplacian-STFT)": 0.578, "PopT": 0.575, "Linear (logistic)": 0.539}
+# Neuroprobe CS leaderboard, same board/split, recomputed from the vendored leaderboard's raw
+# per-session JSONs under OUR aggregation (leaderboard_baselines.py --split Cross-Subject), so
+# these are 4 dp from source rather than 3 dp off a webpage.
+# Decoder is NOT held constant across these entries: they are logistic/MLP/CNN on ONE fixed
+# Laplacian-STFT feature set, which is why the matched comparison is enc0-ridge vs their linear.
+BOARD = {
+    "CNN (Laplacian-STFT)": 0.5777,
+    "PopT (Laplacian-STFT)": 0.5750,
+    "MLP (Laplacian-STFT)": 0.5659,
+    "BrainBERT (frozen)": 0.5471,
+    "Linear (Laplacian-STFT)": 0.5392,
+}
 LEAD = "45k cd"          # the shipped checkpoint: 45k with the linear cooldown
 CKPTS = {
     "20k": "results_v3_board_r6_20k.json",
@@ -88,6 +97,63 @@ def ladder(path: pathlib.Path) -> dict[str, float]:
     return {t: statistics.fmean(v[t] for v in per_task.values()) for t in TAPS}
 
 
+def cs_cells(path: pathlib.Path) -> dict[str, dict[str, float]]:
+    """cell -> tap -> macro over tasks, on the cell x task INTERSECTION shared by all taps.
+
+    `ladder` collapses straight to the macro, which cannot say whether the +.0164 enc0->enc12
+    gain is uniform across subjects or carried by two cells. That is exactly the question
+    "partial cells lie" is a warning about, so the per-cell rows get their own panel.
+    """
+    d = json.load(open(path))
+    per_task = {}
+    for key, blob in d.items():
+        cs = blob.get("cs")
+        if not cs:
+            continue
+        cols = {t: cs.get(f"{t}|std") for t in TAPS}
+        if any(c is None for c in cols.values()):
+            continue
+        shared = set.intersection(*(set(c) for c in cols.values()))
+        if shared:
+            per_task[key] = {c: {t: cols[t][c] for t in TAPS} for c in shared}
+    cells = set.intersection(*(set(v) for v in per_task.values()))
+    return {c: {t: statistics.fmean(v[c][t] for v in per_task.values()) for t in TAPS}
+            for c in sorted(cells)}
+
+
+def _slopegraph(ax, cells: dict[str, dict[str, float]], taps: list[str], macro: dict[str, float],
+                board: float, board_label: str) -> int:
+    """Per-cell lines across taps + the macro in black. Returns the monotone-cell count.
+
+    Labels are pushed apart bottom-up by a fixed gap and leader-lined back to their true value,
+    so the de-collision nudge can never be misread as data.
+    """
+    mono = 0
+    for v in cells.values():
+        ys = [v[t] for t in taps]
+        up = all(a <= b for a, b in zip(ys, ys[1:]))
+        mono += up
+        ax.plot(range(len(taps)), ys, marker="o", ms=3, lw=0.9,
+                color=PALETTE["ours"] if up else PALETTE["accent"], alpha=0.7)
+    order = sorted(cells.items(), key=lambda kv: kv[1][taps[-1]])
+    span = order[-1][1][taps[-1]] - order[0][1][taps[-1]]
+    gap, y_prev, x = 0.036 * span, -1e9, len(taps) - 1
+    for c, v in order:
+        y = max(v[taps[-1]], y_prev + gap)
+        y_prev = y
+        ax.plot([x + 0.02, x + 0.06], [v[taps[-1]], y], lw=0.4, color="#bbb", zorder=1)
+        ax.text(x + 0.07, y, c, fontsize=5.6, va="center", color="#555")
+    ax.plot(range(len(taps)), [macro[t] for t in taps], marker="o", ms=6, lw=2.6,
+            color="k", zorder=5, label="macro")
+    ax.axhline(board, color=PALETTE["accent"], lw=0.9, ls="--")
+    ax.text(-0.26, board + 0.0012, board_label, color=PALETTE["accent"],
+            fontsize=6.4, ha="left", va="bottom")
+    ax.set_xticks(range(len(taps)))
+    ax.set_xticklabels([t.replace("_elec", "") for t in taps], fontsize=7)
+    ax.set_xlim(-0.28, x + 0.34)
+    return mono
+
+
 def fig2() -> None:
     lads = {name: ladder(RES / "r6_era/board" / f) for name, f in CKPTS.items()}
     for name, l in lads.items():
@@ -97,35 +163,40 @@ def fig2() -> None:
     print("[check] OK ladder strictly monotone at all 4 ckpts; enc0 == .5872 in every one")
     print(f"[check] {LEAD} ladder = " + "  ".join(f"{t} {lads[LEAD][t]:.4f}" for t in TAPS))
 
-    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.6), width_ratios=[1.15, 1])
+    cells = cs_cells(RES / "r6_era/board" / CKPTS[LEAD])
+    assert len(cells) == 10, f"[check] VIOLATED CS needs all 10 test cells, got {len(cells)}"
+    macro, best = lads[LEAD], max(BOARD.values())
+    assert macro["enc12"] > best, "[check] VIOLATED enc12 does not clear the CS board top"
 
-    x = range(len(TAPS))
-    for name, l in lads.items():
-        lead = name == LEAD
-        ax.plot(x, [l[t] for t in TAPS], marker="o", ms=4 if lead else 3,
-                lw=1.8 if lead else 0.9, zorder=3 if lead else 2,
-                color=PALETTE["ours"] if lead else PALETTE["muted"],
-                alpha=1.0 if lead else 0.55, label=name)
-    ax.axhline(BOARD["CNN (Laplacian-STFT)"], color=PALETTE["accent"], lw=0.9, ls="--")
-    ax.text(0.04, BOARD["CNN (Laplacian-STFT)"] + 0.0012, "prior SOTA .578",
-            color=PALETTE["accent"], fontsize=7)
-    ax.axhline(BOARD["Linear (logistic)"], color="#888", lw=0.8, ls=":")
-    ax.text(0.04, BOARD["Linear (logistic)"] + 0.0012, "their linear .539", color="#888", fontsize=7)
-    ax.set_xticks(list(x)); ax.set_xticklabels(["enc0\n(0 params)", "enc3", "enc6", "enc12"])
-    ax.set_ylabel("cross-subject macro AUROC")
-    ax.set_title("Depth ladder, every checkpoint", pad=6)
-    ax.legend(fontsize=6.5, loc="lower right", ncol=2)
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.9), width_ratios=[1.25, 1])
 
-    names = ["their\nlinear", "our enc0\n(0 params)", "PopT", "their CNN\n(prior SOTA)", "ours\nenc12"]
-    vals = [BOARD["Linear (logistic)"], lads[LEAD]["enc0"], BOARD["PopT"],
-            BOARD["CNN (Laplacian-STFT)"], lads[LEAD]["enc12"]]
-    cols = ["#bbb", PALETTE["enc0"], "#bbb", PALETTE["accent"], PALETTE["ours"]]
-    ax2.bar(range(len(vals)), vals, color=cols, width=0.62)
-    for i, v in enumerate(vals):
-        ax2.text(i, v + 0.0015, f"{v:.3f}", ha="center", fontsize=6.8)
-    ax2.set_xticks(range(len(vals))); ax2.set_xticklabels(names, fontsize=6.5)
-    ax2.set_ylim(0.50, 0.625); ax2.set_ylabel("cross-subject macro AUROC")
-    ax2.set_title("Matched linear-vs-linear", pad=6)
+    rows = sorted(list(BOARD.items())
+                  + [("ours enc0 (0 params)", macro["enc0"]), ("ours enc12", macro["enc12"])],
+                  key=lambda r: r[1])
+    cols = [PALETTE["ours"] if n.startswith("ours enc12") else
+            PALETTE["enc0"] if n.startswith("ours") else
+            PALETTE["accent"] if abs(v - best) < 1e-9 else "#bbb" for n, v in rows]
+    ax.barh(range(len(rows)), [v for _, v in rows], color=cols, height=0.66)
+    for i, (_, v) in enumerate(rows):
+        ax.text(v + 0.0015, i, f"{v:.4f}", va="center", fontsize=6.6)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([n for n, _ in rows], fontsize=6.6)
+    ax.set_xlim(0.50, 0.625)
+    ax.set_xlabel("cross-subject macro AUROC (10/10 cells)")
+    ax.set_title("Cross-subject leaderboard", pad=6)
+
+    mono = _slopegraph(ax2, cells, TAPS, macro, best, f"board top {best:.4f}")
+    beat = sum(v["enc12"] > v["enc0"] for v in cells.values())
+    print(f"[check] CS per cell: monotone in {mono}/{len(cells)}, "
+          f"enc12 > enc0 in {beat}/{len(cells)}")
+    ax2.set_ylabel("cross-subject macro AUROC")
+    # Two DIFFERENT counts, and conflating them would overclaim. Every cell ends higher than it
+    # started, but only 4 climb at every rung -- the macro ladder is monotone, the cells are not.
+    ax2.set_title(f"Per cell: enc12 > enc0 in {beat}/{len(cells)}\n"
+                  f"(monotone at every tap in {mono})", pad=6, fontsize=8)
+    ax2.legend(fontsize=6.5, loc="lower right")
+    fig.text(0.5, -0.04, "orange = not monotone across taps (still ends above enc0)",
+             ha="center", fontsize=6.2, color=PALETTE["accent"])
     fig.tight_layout(); _save(fig, "fig2_ladder")
 
 
@@ -197,37 +268,18 @@ def fig2_ws() -> None:
 
     # Paired slopegraph, not two bars. The macro hides whether the gain is uniform or carried
     # by a couple of cells, and "partial cells lie" is exactly a warning about that.
-    for c, v in cells.items():
-        up = v["enc12_elec"] > v["enc0_elec"]
-        ax2.plot([0, 1], [v["enc0_elec"], v["enc12_elec"]], marker="o", ms=3,
-                 lw=0.9, color=PALETTE["ours"] if up else PALETTE["accent"], alpha=0.75)
-    # Cell labels collide wherever two sessions land within a few thousandths of each other,
-    # which is most of the top of the panel. Push them apart bottom-up by a fixed minimum gap
-    # and leader-line each one back to its true value, so the nudge never misreads as data.
-    order = sorted(cells.items(), key=lambda kv: kv[1]["enc12_elec"])
-    span = order[-1][1]["enc12_elec"] - order[0][1]["enc12_elec"]
-    gap, y_prev = 0.036 * span, -1e9
-    for c, v in order:
-        y = max(v["enc12_elec"], y_prev + gap)
-        y_prev = y
-        ax2.plot([1.02, 1.06], [v["enc12_elec"], y], lw=0.4, color="#bbb", zorder=1)
-        ax2.text(1.07, y, c, fontsize=5.6, va="center", color="#555")
-    ax2.plot([0, 1], [macro[t] for t in WS_TAPS], marker="o", ms=6, lw=2.6,
-             color="k", zorder=5, label="macro")
-    ax2.axhline(best, color=PALETTE["accent"], lw=0.9, ls="--")
-    ax2.text(-0.26, best + 0.0012, f"board top {best:.4f}", color=PALETTE["accent"],
-             fontsize=6.4, ha="left", va="bottom")
-    ax2.set_xticks([0, 1]); ax2.set_xticklabels(["enc0\n(0 params)", "enc12"])
-    ax2.set_xlim(-0.28, 1.34)
+    _slopegraph(ax2, cells, WS_TAPS, macro, best, f"board top {best:.4f}")
     ax2.set_ylabel("within-session macro AUROC")
     ax2.set_title(f"Per cell: depth helps {wins}/{len(cells)}", pad=6)
     ax2.legend(fontsize=6.5, loc="lower right")
 
-    # The parity caveat belongs ON the figure, not only in the memo: leaderboard WS entries
-    # carry 2 folds and our WS readout has no bit-identical parity test yet (CS does).
-    fig.text(0.5, -0.045, "WS fold-structure parity with the leaderboard is UNVERIFIED "
-             "-- no WS SOTA claim until that is closed", ha="center", fontsize=6.2,
-             color=PALETTE["accent"])
+    # Only TWO points, and that is an encode limitation, not a choice: the board encode ran
+    # `--elec-taps 0,12` (v3_board_encode_r6.sbatch:57) and WS is per-ELECTRODE, so enc3_elec
+    # and enc6_elec were never written. The parcel enc3/enc6 that fig2 uses are a different
+    # feature unit and are NOT substitutable here. A 4-tap WS panel needs a GPU re-encode.
+    fig.text(0.5, -0.045, "WS is per-electrode and the board encode wrote only elec taps 0 and 12"
+             " -- enc3/enc6 need a re-encode, not a replot", ha="center", fontsize=6.2,
+             color=PALETTE["muted"])
     fig.tight_layout(); _save(fig, "fig2ws_within_session")
 
 
