@@ -431,6 +431,71 @@ def quantify(sessions, lobes, tap: str, task: str, cls, *, n_pre: int | None = N
     }
 
 
+def task_identity_overlap(sessions, lobes, tap: str, task: str) -> dict:
+    """How much of the task axis lies INSIDE the subject-identity subspace?
+
+    This is the construction-side question that an erasure cannot answer. Erasing identity and
+    re-scoring asks whether a DECODER uses the identity directions, and that test is crippled
+    twice over: it is scored by AUROC, which is algebraically blind to a rigid offset, and for a
+    binary concept LEACE drives held-out identity to chance BY THEOREM, so the null is guaranteed
+    before any data is seen. An angle has neither problem. It is a fact about what the model
+    BUILT, which is what "the model separates subject from content" actually asserts.
+
+    Identity subspace = span{mu_session - mu_grand}, the same object the projection test used, so
+    both numbers refer to one geometry. The session mean pools BOTH classes with equal weight, so
+    a balanced session contributes no task contrast to its own identity direction.
+
+    Scored as ||P d||^2 / ||d||^2, whose null is EXACT: a direction with no preference for a
+    k-dim subspace of a d-dim space still leaves k/d of its squared norm inside it. At k=11,
+    d=256 that is 0.043 -- so a raw 0.04 is ORTHOGONALITY, not "4% of the task rides on
+    identity", and the ratio to the null is the only number worth reading.
+
+    nan when the subspace is complete (keep == d): a full-rank span contains every direction by
+    algebra. That degeneracy is what made the enc0 projection number meaningless, and enc0 is
+    exactly where it bites -- 12 session means span all 7 |STFT| dims.
+    """
+    per: dict = {}
+    for cls in (0, 1):
+        for s, m in collect(sessions, tap, task, cls, "all", lobes, centered=False):
+            per.setdefault(s.key, {})[cls] = m.reshape(-1, m.shape[-1])
+    keys = sorted(k for k, v in per.items() if 0 in v and 1 in v)
+    if len(keys) < 3:
+        return {}
+
+    d = int(per[keys[0]][0].shape[1])
+    sess_mean = {k: np.stack([per[k][0].mean(axis=0), per[k][1].mean(axis=0)]).mean(axis=0)
+                 for k in keys}
+    grand = np.stack([sess_mean[k] for k in keys]).mean(axis=0)
+    ident = np.stack([sess_mean[k] - grand for k in keys])
+
+    # Rank-truncate before building the basis: a direction with no energy in the session means is
+    # not an identity direction, and QR of a degenerate matrix hands back arbitrary axes.
+    _, sv, vt = np.linalg.svd(ident, full_matrices=False)
+    tol = max(1e-6 * float(sv.max(initial=0.0)), 1e-12)
+    keep = int((sv > tol).sum())
+    complete = keep >= d
+    out = {"tap": tap, "task": task, "n_sessions": len(keys), "feature_dim": d,
+           "identity_rank": keep, "identity_subspace_is_complete": complete}
+    if not keep or complete:
+        return {**out, "overlap_sq": float("nan"), "chance_sq": float("nan"),
+                "ratio_to_chance": float("nan")}
+
+    q = vt[:keep].T                                   # (d, keep), orthonormal by construction
+    frac = []
+    for k in keys:
+        t = per[k][1].mean(axis=0) - per[k][0].mean(axis=0)
+        n2 = float(t @ t)
+        if n2 > 0:
+            frac.append(float((q.T @ t) @ (q.T @ t)) / n2)
+    if not frac:
+        return {**out, "overlap_sq": float("nan"), "chance_sq": float("nan"),
+                "ratio_to_chance": float("nan")}
+
+    obs, chance = float(np.mean(frac)), keep / d
+    return {**out, "overlap_sq": obs, "chance_sq": chance,
+            "ratio_to_chance": obs / chance, "n_scored": len(frac)}
+
+
 def figure_depth(quant, retr, taps, tasks, out_path: str) -> dict:
     """Does cross-subject structure GROW with encoder depth? Two panels, same x axis.
 
@@ -562,6 +627,20 @@ def main() -> None:
                 print(f"[quant] {tap:6s} {task:16s} {lab} cross={q['cross_subject_r']:+.4f} "
                       f"ceiling={q['split_half_ceiling_r']:+.4f} "
                       f"norm={q['normalized']:+.4f}")
+
+    # Does the task axis sit inside the identity subspace, and does that fall with depth? The
+    # separability claim in geometric form, with an exact null and no erasure anywhere in it.
+    report["task_identity_overlap"] = []
+    for task in quant_tasks:
+        for tap in taps:
+            o = task_identity_overlap(sessions, lobes, tap, task)
+            if not o:
+                continue
+            report["task_identity_overlap"].append(o)
+            note = "  COMPLETE SUBSPACE -> vacuous" if o["identity_subspace_is_complete"] else ""
+            print(f"[ident] {tap:6s} {task:16s} rank={o['identity_rank']:3d}/{o['feature_dim']:4d} "
+                  f"overlap={o['overlap_sq']:.4f} chance={o['chance_sq']:.4f} "
+                  f"ratio={o['ratio_to_chance']:.2f}{note}")
 
     report["retrieval"] = []
     for tap in taps:

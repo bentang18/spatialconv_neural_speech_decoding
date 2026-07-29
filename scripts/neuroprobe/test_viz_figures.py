@@ -10,7 +10,7 @@ import numpy as np
 
 from scripts.neuroprobe.viz_common import load_all
 from scripts.neuroprobe.viz_figures import (
-    CONTRAST, _corr, figure_tasks, quantify, retrieval,
+    CONTRAST, _corr, figure_tasks, quantify, retrieval, task_identity_overlap,
 )
 
 TASK = "onset"
@@ -347,3 +347,58 @@ def test_splithalf_basis_scores_the_half_it_was_not_fit_on(tmp_path):
     (tmp_path / "s").mkdir()
     sess = _shape_corpus(tmp_path / "s", _course(1.0))
     assert align_splithalf(sess, ["temporal"], "enc12", [TASK], n_pre=8)[TASK] > 0.9
+
+
+def _planted(dirpath, subjects, v_ident, v_task, *, offsets=None, rng=None):
+    """Sessions whose identity offset lies along ``v_ident`` and class contrast along ``v_task``.
+
+    The temporal profile carries a NONZERO mean on purpose: the task axis is the time-average of
+    the contrast, so a zero-mean profile would hand back a null direction and the test would pass
+    for the wrong reason.
+    """
+    profile = (1.0 + np.linspace(0.0, 1.0, T))[:, None]
+    contrast = profile * np.asarray(v_task, dtype=float)[None, :]
+    for i, s in enumerate(subjects):
+        off = (rng.normal(size=C) if rng is not None
+               else float(offsets[i]) * np.asarray(v_ident, dtype=float))
+        base = np.zeros((T, C)) + off[None, :]
+        _write_classes(dirpath, s, 0, TEMPORAL, 10,
+                       {0: base - 0.5 * contrast, 1: base + 0.5 * contrast})
+
+
+def test_task_axis_inside_the_identity_subspace_reads_one(tmp_path) -> None:
+    """Contrast planted along the SAME direction the sessions differ on: fully confounded."""
+    e0 = np.eye(C)[0]
+    _planted(tmp_path, (1, 2, 3), e0, e0, offsets=(-1.0, 0.0, 2.0))
+    r = task_identity_overlap(load_all(str(tmp_path)), ["temporal"], "enc12", TASK)
+    assert r["identity_rank"] == 1 and r["feature_dim"] == C
+    assert r["overlap_sq"] > 0.999, r
+    assert r["chance_sq"] == 1 / C, "the null must be k/d, not a fudge factor"
+
+
+def test_task_axis_orthogonal_to_identity_reads_zero_not_chance(tmp_path) -> None:
+    """The case the erasure cannot distinguish from the one above once AUROC is the score."""
+    ax = np.eye(C)
+    _planted(tmp_path, (1, 2, 3), ax[0], ax[3], offsets=(-1.0, 0.0, 2.0))
+    r = task_identity_overlap(load_all(str(tmp_path)), ["temporal"], "enc12", TASK)
+    assert r["overlap_sq"] < 1e-9, r
+    assert r["ratio_to_chance"] < 0.01, "orthogonality must read BELOW chance, not at it"
+
+
+def test_a_complete_identity_subspace_refuses_to_report_a_number(tmp_path) -> None:
+    """enc0's degeneracy: 12 session means span all 7 |STFT| dims, so the projection is vacuous.
+
+    A full-rank span contains every direction by algebra. Reporting 1.0 here would read as
+    'the task rides entirely on identity' when it is a statement about dimension counting.
+    """
+    rng = np.random.default_rng(11)
+    _planted(tmp_path, (1, 2, 3, 4, 7, 10, 11), None, np.eye(C)[2], rng=rng)
+    r = task_identity_overlap(load_all(str(tmp_path)), ["temporal"], "enc12", TASK)
+    assert r["identity_subspace_is_complete"] is True, r
+    assert np.isnan(r["overlap_sq"]) and np.isnan(r["ratio_to_chance"]), r
+
+
+def test_too_few_sessions_returns_empty_rather_than_a_rank_one_artifact(tmp_path) -> None:
+    e0 = np.eye(C)[0]
+    _planted(tmp_path, (1, 2), e0, e0, offsets=(-1.0, 1.0))
+    assert task_identity_overlap(load_all(str(tmp_path)), ["temporal"], "enc12", TASK) == {}
