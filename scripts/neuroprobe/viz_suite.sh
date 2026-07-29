@@ -36,9 +36,22 @@ TAPS=enc0,enc3,enc6,enc12
 # All 15 Neuroprobe tasks, in `braintreebank/labels.py` order. The reduction must have been
 # built with the same list -- `viz_reduce.py --tasks` defaults to a 6-task subset, and a task
 # missing from the shards is dropped from the page rather than shown empty.
-TASKS=onset,speech,volume,delta_volume,pitch,word_index,word_gap,gpt2_surprisal,word_head_pos,word_part_speech,word_length,global_flow,local_flow,frame_brightness,face_num
+#
+# Overridable because the 3-PC basis is fit on the POOLED contrasts of this list, so the list
+# is a scientific choice, not plumbing: narrowing it changes every cross_subject_r on the page
+# and those numbers are not comparable across menus. Whatever it is set to, it is passed
+# identically to all three scripts -- that shared value is the whole point of this file.
+TASKS=${TASKS:-onset,speech,volume,delta_volume,pitch,word_index,word_gap,gpt2_surprisal,word_head_pos,word_part_speech,word_length,global_flow,local_flow,frame_brightness,face_num}
+# Must be a SUBSET of TASKS. viz_video does not enforce it: --animate picks which clips to
+# draw while the basis always comes from --tasks, so an --animate task outside the menu is
+# drawn in a basis that never saw it.
+ANIMATE=${ANIMATE:-onset,speech,frame_brightness}
+for a in ${ANIMATE//,/ }; do
+  [[ ",$TASKS," == *",$a,"* ]] || { echo "ANIMATE task '$a' is not in TASKS" >&2; exit 1; }
+done
 mkdir -p "$OUT"
 
+echo "### tasks ($(tr ',' '\n' <<<"$TASKS" | wc -l | tr -d ' ')): $TASKS"
 echo "### figures  (red=$RED out=$OUT taps=$TAPS)"
 $PY -m scripts.neuroprobe.viz_figures --red-dir "$RED" --out-dir "$OUT" \
   --task onset --taps "$TAPS" --tasks-quant "$TASKS" \
@@ -46,7 +59,7 @@ $PY -m scripts.neuroprobe.viz_figures --red-dir "$RED" --out-dir "$OUT" \
 
 echo "### videos"
 $PY -m scripts.neuroprobe.viz_video --red-dir "$RED" --out-dir "$OUT" \
-  --taps enc12 --tasks "$TASKS" --animate onset,speech,frame_brightness --n-pre "$NPRE"
+  --taps enc12 --tasks "$TASKS" --animate "$ANIMATE" --n-pre "$NPRE"
 
 echo "### demo page"
 $PY -m scripts.neuroprobe.viz_demo --red-dir "$RED" --out "$OUT/demo.html" \
