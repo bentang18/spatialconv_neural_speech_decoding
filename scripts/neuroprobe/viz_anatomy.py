@@ -72,10 +72,15 @@ ONSET_BIN_OF = lambda T: int(round(-WIN_START_S / ((WIN_END_S - WIN_START_S) / T
 # The regions Greg's test is about, and the ones that make it falsifiable.
 TARGET = "superiortemporal"
 NEIGHBOURS = ("middletemporal", "transversetemporal")
-# Marked in every figure that has a region axis, in ONE colour scheme so a reader who learns it
-# on the heatmap can carry it to the render. Heschl's is the hotter of the two and sits directly
-# above STG by alphabet alone, so marking only STG gets read off by one row.
-MARK = {"transversetemporal": "#00a000", TARGET: "#8e24aa"}
+# Marked in every figure that has a region axis. Heschl's is the hotter of the two and sits
+# directly above STG by alphabet alone, so marking only STG gets read off by one row.
+#
+# The mark is never a COLOUR. On a diverging RdBu_r scale a coloured outline competes with the
+# value it surrounds -- purple IS a hot dark red, and green reads as a fill on a 6 px dot -- so
+# colour is reserved for d_cv alone. On the heatmap identity is a black glyph outside the axes;
+# on the brain renders it is a text label with a leader line, which needs no per-dot marking at
+# all and so cannot clash with anything.
+MARK = {"transversetemporal": ("A1 · Heschl's", "s"), TARGET: ("STG", "D")}
 OCCIPITAL = ("lateraloccipital", "lingual", "cuneus", "pericalcarine")
 
 LOBE_ORDER = ("temporal", "insula", "frontal", "parietal", "cingulate", "mtl", "unknown")
@@ -702,23 +707,23 @@ def fig_dkt_time(D, rows, cov, T, out, tap):
         ax.tick_params(labelsize=8, labelleft=(k % 3 == 0))
         for lab in ax.get_yticklabels():
             if lab.get_text().split(" (")[0] in MARK:
-                lab.set_color(MARK[lab.get_text().split(" (")[0]])
                 lab.set_fontweight("bold")
         fam = "event" if task in EVENT else "level"
         ax.set_title(f"{task}  [{fam}]", fontsize=8,
                      color="#1f4e79" if fam == "event" else "#d98324")
         # marker OUTSIDE the left spine, not a line across the row: an axhline at the row
-        # centre paints over the very cells the marker exists to point at.
-        for base, c in MARK.items():
+        # centre paints over the very cells the marker exists to point at. Black, because
+        # inside the axes those colours would be read as d_cv values.
+        for base, (_, shape) in MARK.items():
             if base in rows:
-                ax.plot([tms[0]], [rows.index(base)], marker=">", ms=6, color=c,
+                ax.plot([tms[0]], [rows.index(base)], marker=shape, ms=5.5, color="k",
                         clip_on=False, zorder=5)
     for ax in axes[-1]:
         ax.set_xlabel("time from word onset (ms)", fontsize=7)
     fig.suptitle(
         f"Split-half unbiased standardized class contrast (d_cv) by DKT base x time — {tap}\n"
-        f"across-subject mean; (n) = subjects with that base; GREEN marker = transversetemporal "
-        f"(Heschl's gyrus / A1) · PURPLE marker = superiortemporal; "
+        f"across-subject mean; (n) = subjects with that base; ■ = transversetemporal "
+        f"(Heschl's gyrus / A1) · ◆ = superiortemporal; "
         f"zero is a TRUE zero, so blue is genuinely no-effect",
         fontsize=10)
     if im is not None:
@@ -881,6 +886,41 @@ def _pooled_contacts(tmpl: dict, base_of: dict) -> dict:
     return {"pts": pts, "gmeta": gmeta}
 
 
+def _dot_area(v: np.ndarray, lim: float, lo: float = 3.0, hi: float = 90.0) -> np.ndarray:
+    """Marker AREA proportional to |d_cv|, floored so a zero is still a visible speck.
+
+    This is the encoding that makes the render readable. With one fixed dot size, ~90% of the
+    689 contacts are drawing "nothing" at full visual weight and the eye has to search for the
+    effect; with area proportional to |d_cv| the null recedes on its own. Area (not radius) is
+    the perceptually linear channel for magnitude, so the scaling goes into `s`, which matplotlib
+    already interprets as area in points^2.
+    """
+    return lo + (hi - lo) * np.clip(np.abs(v) / lim, 0, 1)
+
+
+def _label_regions(ax, rowp, xs, ys) -> None:
+    """Name the marked regions once, with a leader line to their centroid.
+
+    Replaces per-contact rings/outlines. Any per-dot mark on a diverging scale either competes
+    with the colour or, at these dot sizes, hides it -- and with contacts this dense the rings
+    merged into one blob anyway. A label is what a reader actually wanted from the mark.
+    """
+    # staggered in x and y: A1 and STG are neighbours, so their centroids are close and
+    # unstaggered labels overlap each other.
+    for j, (base, (name, _)) in enumerate(MARK.items()):
+        m = np.array([q["base"] == base for q in rowp])
+        if m.sum() < 2:
+            continue
+        cx, cy = float(xs[m].mean()), float(ys[m].mean())
+        H = abs(ax.get_ylim()[0])
+        ax.annotate(name, xy=(cx, cy),
+                    xytext=(cx + (-1) ** j * 0.13 * H, cy - (0.30 - 0.13 * j) * H),
+                    ha="center", va="bottom", fontsize=6.5, zorder=6,
+                    color="#111", bbox=dict(fc="white", ec="none", alpha=.8, pad=.9),
+                    arrowprops=dict(arrowstyle="-", lw=.6, color="#111",
+                                    shrinkA=0, shrinkB=1))
+
+
 def fig_template_render(D, tmpl, base_of, T, out, tap, task, times_ms=(-250, 0, 250, 500)):
     """Static paper version of the demo: hemispheres x a few time points, one tap/task."""
     import matplotlib.pyplot as plt
@@ -900,11 +940,6 @@ def fig_template_render(D, tmpl, base_of, T, out, tap, task, times_ms=(-250, 0, 
     for r, sd in enumerate(("left", "right")):
         rowp = [q for q in P if q["side"] == sd]
         xs = np.array([q["x"] for q in rowp]); ys = np.array([q["y"] for q in rowp])
-        # the mark is the dot's EDGE COLOUR, not a ring drawn over it. Contacts in STG sit
-        # centimetres apart on this projection, so overlaid rings merge into one purple blob
-        # and hide the values the marker exists to draw the eye to.
-        ec = np.array([MARK.get(q["base"], "#000000") for q in rowp])
-        lw = np.array([0.7 if q["base"] in MARK else 0.2 for q in rowp])
         for c, fi in enumerate(bins):
             ax = axes[r, c]
             ax.imshow(tmpl["img"][sd]); ax.axis("off")
@@ -912,23 +947,28 @@ def fig_template_render(D, tmpl, base_of, T, out, tap, task, times_ms=(-250, 0, 
                           for q in rowp], dtype=float)
             miss = ~np.isfinite(v)
             if miss.any():
-                ax.scatter(xs[miss], ys[miss], s=9, c="#c8c8c8",
-                           ec=ec[miss], lw=lw[miss], zorder=3)
+                ax.scatter(xs[miss], ys[miss], s=3, c="#c0c0c0", ec="none", zorder=3)
             if (~miss).any():
                 sc = ax.scatter(xs[~miss], ys[~miss], c=v[~miss], cmap="RdBu_r",
-                                vmin=-lim, vmax=lim, s=22,
-                                ec=ec[~miss], lw=lw[~miss], zorder=4)
+                                vmin=-lim, vmax=lim, s=_dot_area(v[~miss], lim),
+                                ec="k", lw=.25, zorder=4)
+            _label_regions(ax, rowp, xs, ys)
             if r == 0:
                 ax.set_title(f"{tms[fi]:+.0f} ms", fontsize=9)
             if c == 0:
                 ax.text(-.02, .5, f"{sd} hemi", rotation=90, va="center", ha="right",
                         transform=ax.transAxes, fontsize=8)
     fig.suptitle(f"d_cv on the BrainTreebank lateral projection — {task}, {tap}, 6 subjects "
-                 f"pooled\ngreen outline = transversetemporal (Heschl's / A1) · "
-                 f"purple outline = superiortemporal · grey fill = parcel absent in that subject",
-                 fontsize=9)
+                 f"pooled\ndot AREA and colour both encode d_cv, so near-zero contacts shrink "
+                 f"to specks and only real effects draw the eye · tiny grey = parcel absent in "
+                 f"that subject", fontsize=9)
     if sc is not None:
         fig.colorbar(sc, ax=axes, fraction=.018, pad=.01, label="d_cv")
+        h = [plt.Line2D([], [], ls="", marker="o", mfc="#b2182b", mec="k", mew=.4,
+                        ms=np.sqrt(_dot_area(np.array([f * lim]), lim))[0],
+                        label=f"|d_cv| = {f * lim:.2f}") for f in (0.0, 0.25, 0.5, 1.0)]
+        fig.legend(handles=h, loc="lower center", ncol=4, frameon=False, fontsize=8,
+                   handletextpad=.4, columnspacing=1.6, bbox_to_anchor=(.5, -.02))
     p = os.path.join(out, f"figAN6_render_{tap}_{task}.png")
     fig.savefig(p, bbox_inches="tight")
     plt.close(fig)
@@ -973,7 +1013,17 @@ def build_demo(D, tmpl, base_of, T, out, tasks, taps):
         return
 
     lut = (255 * mpl.colormaps["RdBu_r"](np.linspace(0, 1, 128))[:, :3]).round().astype(int)
-    mark_of = {b: i + 1 for i, b in enumerate(MARK)}
+    # region LABELS with a leader line, computed here so the JS just draws them. Anchor = the
+    # centroid of that parcel's contacts on that panel; the label is placed above it.
+    labels = []
+    for j, (base, (name, _)) in enumerate(MARK.items()):
+        for si, sd in enumerate(("left", "right")):
+            m = [q for q in pts if q["base"] == base and q["side"] == sd]
+            if len(m) >= 2:
+                # dx/dy stagger: A1 and STG are neighbours, so unstaggered labels collide
+                labels.append({"s": si, "name": name, "dx": (-1) ** j * 0.13, "dy": j,
+                               "x": round(sum(q["x"] for q in m) / len(m), 1),
+                               "y": round(sum(q["y"] for q in m) / len(m), 1)})
     payload = {
         "img": {sd: base64.b64encode(_img_png(tmpl["img"][sd])).decode("ascii")
                 for sd in ("left", "right")},
@@ -983,10 +1033,9 @@ def build_demo(D, tmpl, base_of, T, out, tasks, taps):
         "y": [round(q["y"], 1) for q in pts],
         "side": [0 if q["side"] == "left" else 1 for q in pts],
         "g": [q["g"] for q in pts],
-        "mark": [mark_of.get(q["base"], 0) for q in pts],
         "lab": [f"S{q['subj']} · {q['base']}" for q in pts],
         "series": series, "lim": lims, "t_ms": [round(float(v), 1) for v in _t_ms(T)],
-        "lut": lut.tolist(), "ring": ["", *MARK.values()],
+        "lut": lut.tolist(), "labels": labels,
     }
     # menu order = the order asked for, NOT sorted: sorting opens the demo on
     # enc0|frame_brightness, which is the one view a reader has no reason to look at first.
@@ -1032,13 +1081,15 @@ _DEMO_HTML = r"""<!doctype html><meta charset="utf-8">
       padding:4px 8px;border-radius:4px;display:none;z-index:9}
  #bar{width:190px;height:12px;border:1px solid #bbb;border-radius:2px}
  .k{display:inline-flex;align-items:center;gap:5px;font-size:12px}
- .dot{width:12px;height:12px;border-radius:50%;border:2px solid}
+ #sz{vertical-align:middle}
 </style>
 <h1>Where is the decodable information? All 6 subjects on one brain, scrubbable in time</h1>
 <p>Colour is the <b>split-half unbiased standardized class contrast</b> (<code>d_cv</code>).
 Zero is a <i>true</i> zero — the two independent trial halves' contrast vectors are dotted, so
 noise contributes zero in expectation and a no-effect contact is white, not faintly warm.
-<b>Hover any contact</b> for its subject, DKT parcel and value.</p>
+<b>Dot area and colour both encode it</b>, so a contact carrying nothing shrinks to a speck and
+the effect finds you instead of the reverse. <b>Hover any contact</b> for its subject, DKT parcel
+and value.</p>
 <div class="note"><b>Frame: the BrainTreebank's own 2D lateral projection</b> — not a warp of
 mine, and not MNI. Positions are the <code>X</code>/<code>Y</code> columns of the dataset's
 <code>elec_coords_full.csv</code> drawn on the hemisphere images it ships with, scaled exactly
@@ -1052,10 +1103,8 @@ parcel has no value in that subject.</div>
  <label>time <input type=range id=t min=0 value=0 style="width:400px"></label>
  <b id=lab style="min-width:78px"></b>
  <button id=play>play</button>
- <span class=k><span class=dot style="border-color:#00a000"></span>Heschl's (A1)</span>
- <span class=k><span class=dot style="border-color:#8e24aa"></span>STG</span>
- <span class=k><span class=dot style="border-color:#666;background:#c8c8c8"></span>no value</span>
  <span class=k><span id=neg></span><canvas id=bar width=190 height=12></canvas><span id=pos></span></span>
+ <span class=k><canvas id=sz width=150 height=26></canvas></span>
 </div>
 <div class=panes>
  <div class=pane><canvas id=c0></canvas><div class=cap>left hemisphere</div></div>
@@ -1080,6 +1129,20 @@ function col(v,lim){ // matplotlib RdBu_r, sent as a 128-entry LUT
   return 'rgb('+c[0]+','+c[1]+','+c[2]+')';}
 function valAt(i,fi){const s=P.series[k.value][P.g[i]];
   if(s===null)return null; const v=s[fi]; return v===null?null:v/1000;}
+// radius from AREA proportional to |d_cv|, hence the sqrt. A near-zero contact keeps a small
+// floor so it stays visible as a null rather than disappearing (a true zero is a result).
+function rad(v,lim,Rmax){const f=Math.min(1,Math.abs(v===null?0:v)/lim);
+  return Rmax*(0.22+0.78*Math.sqrt(f));}
+function drawLabels(g,s,Rmax){
+  g.font='600 '+Math.round(Rmax*3.1)+'px -apple-system,Segoe UI,Roboto,sans-serif';
+  g.textAlign='center'; g.textBaseline='bottom';
+  for(const L of P.labels){ if(L.s!==s) continue;
+    const tx=L.x+L.dx*cv[s].height, ty=L.y-Rmax*(9-3*L.dy);
+    g.strokeStyle='#111'; g.lineWidth=Math.max(1,Rmax*.2);
+    g.beginPath(); g.moveTo(tx,ty+Rmax*.8); g.lineTo(L.x,L.y); g.stroke();
+    g.lineWidth=Math.max(3,Rmax*.9); g.strokeStyle='rgba(255,255,255,.9)';
+    g.strokeText(L.name,tx,ty); g.fillStyle='#111'; g.fillText(L.name,tx,ty);}
+}
 function draw(){
   const fi=+t.value, lim=P.lim[k.value];
   lab.textContent=(P.t_ms[fi]>=0?'+':'')+P.t_ms[fi].toFixed(0)+' ms';
@@ -1087,18 +1150,30 @@ function draw(){
   document.getElementById('pos').textContent=' +'+lim.toFixed(2);
   const bx=document.getElementById('bar').getContext('2d');
   for(let x=0;x<190;x++){bx.fillStyle=col((x/189*2-1)*lim,lim);bx.fillRect(x,0,1,12);}
+  // size key, in the same units the panels use
+  const zx=document.getElementById('sz').getContext('2d');
+  zx.clearRect(0,0,150,26); zx.fillStyle='#333'; zx.font='10px sans-serif';
+  zx.textAlign='center'; zx.textBaseline='middle';
+  [0,.25,.5,1].forEach((f,j)=>{const cx=20+j*38;
+    zx.beginPath(); zx.arc(cx,10,rad(f*lim,lim,7),0,6.2832);
+    zx.fillStyle=col(f*lim,lim); zx.fill();
+    zx.strokeStyle='rgba(0,0,0,.55)'; zx.lineWidth=.8; zx.stroke();
+    zx.fillStyle='#333'; zx.fillText((f*lim).toFixed(2),cx,23);});
   for(let s=0;s<2;s++){
     const g=cv[s].getContext('2d');
     g.clearRect(0,0,cv[s].width,cv[s].height);
     if(im[s].complete)g.drawImage(im[s],0,0,cv[s].width,cv[s].height);
-    const R=Math.max(5,cv[s].width/210);
-    for(const i of idx[s]){
+    const Rmax=Math.max(6,cv[s].width/125);
+    // draw small dots first so a big effect is never hidden behind a null
+    const ord=idx[s].slice().sort((a,b)=>
+      Math.abs(valAt(a,fi)||0)-Math.abs(valAt(b,fi)||0));
+    for(const i of ord){
       const v=valAt(i,fi);
-      g.beginPath(); g.arc(P.x[i],P.y[i],P.mark[i]?R*1.05:R,0,6.2832);
-      g.fillStyle=(v===null)?'#c8c8c8':col(v,lim); g.fill();
-      g.lineWidth=P.mark[i]?R*.38:R*.22;  // a ring, not a filled disc: the value must stay visible
-      g.strokeStyle=P.mark[i]?P.ring[P.mark[i]]:'rgba(0,0,0,.55)'; g.stroke();
+      g.beginPath(); g.arc(P.x[i],P.y[i],v===null?Rmax*.18:rad(v,lim,Rmax),0,6.2832);
+      g.fillStyle=(v===null)?'#c0c0c0':col(v,lim); g.fill();
+      g.lineWidth=Rmax*.13; g.strokeStyle='rgba(0,0,0,.5)'; g.stroke();
     }
+    drawLabels(g,s,Rmax);
   }
 }
 im.forEach(x=>x.onload=draw);
