@@ -1,6 +1,7 @@
 """Main-text figures 2/3/4 for the workshop paper, built from LOCAL artifacts only.
 
-Fig 2  tap ladder + leaderboard          <- results/r6_era/board/*.json
+Fig 2    CS tap ladder + leaderboard     <- results/r6_era/board/*.json
+Fig 2ws  within-session, elec-only        <- results/r6_era/board/*.json
 Fig 3  LEACE identity erasure            <- results/r6_era/leace/leace_S*.json
 Fig 4  concentration (3-PC vs full)      <- viz_crosssubject/archive/win{1,2}s/report.json
 
@@ -16,6 +17,7 @@ Conventions that are easy to get wrong and are therefore enforced here:
   * CS rows are PER-SUBJECT cells -> average over cells FIRST, then macro over tasks.
   * Taps are only comparable on a SHARED cell set ("partial cells lie": .6279@4 -> .5991@10).
   * LEACE is PAIRED over cells; the unit of analysis is the cell, not the task.
+  * WS is ELEC-only (enc0_elec/enc12_elec). There is NO within-session depth ladder to draw.
 """
 
 from __future__ import annotations
@@ -127,6 +129,108 @@ def fig2() -> None:
     fig.tight_layout(); _save(fig, "fig2_ladder")
 
 
+# ------------------------------------------------------- fig 2ws: within-session
+# Within-Session macros recomputed from the vendored leaderboard's raw per-session JSONs by
+# scripts/neuroprobe/leaderboard_baselines.py --split Within-Session, under OUR aggregation.
+# Hardcoded for the same reason BOARD is: this figure reads LOCAL artifacts only, and the
+# sibling neuroprobe checkout is not one.
+WS_BOARD = {
+    "DIVER-1 (0.1s, tiny, frozen)": 0.6777,
+    "PopT (Laplacian-STFT)": 0.6700,
+    "CNN (Laplacian-STFT)": 0.6686,
+    "Linear (Laplacian-STFT)": 0.6599,
+    "BrainBERT (frozen)": 0.6257,
+}
+WS_TAPS = ["enc0_elec", "enc12_elec"]
+
+
+def ws_cells(path: pathlib.Path) -> dict[str, dict[str, float]]:
+    """cell -> tap -> macro over tasks. WS is ELEC-only: the regime was never run with the
+    parcel taps, so there is no enc3/enc6 and no ladder can be drawn -- only a matched bar."""
+    d = json.load(open(path))
+    per_task = {}
+    for key, blob in d.items():
+        ws = blob.get("ws")
+        if not ws:
+            continue
+        cols = {t: ws.get(f"{t}|std") for t in WS_TAPS}
+        if any(c is None for c in cols.values()):
+            continue
+        shared = set.intersection(*(set(c) for c in cols.values()))
+        per_task[key] = {c: {t: cols[t][c] for t in WS_TAPS} for c in shared}
+    cells = set.intersection(*(set(v) for v in per_task.values()))
+    return {c: {t: statistics.fmean(v[c][t] for v in per_task.values()) for t in WS_TAPS}
+            for c in sorted(cells)}
+
+
+def fig2_ws() -> None:
+    cells = ws_cells(RES / "r6_era/board" / CKPTS[LEAD])
+    # 12/12 is why LEAD is the cooldown checkpoint: the 40k file carries only 10 WS cells, and
+    # a 10-cell macro is not comparable to a 12-cell leaderboard entry. Partial cells lie.
+    assert len(cells) == 12, f"[check] VIOLATED WS needs all 12 Lite cells, got {len(cells)}"
+    macro = {t: statistics.fmean(v[t] for v in cells.values()) for t in WS_TAPS}
+    best = max(WS_BOARD.values())
+    print(f"[check] WS {LEAD} over {len(cells)} cells = "
+          + "  ".join(f"{t} {macro[t]:.4f}" for t in WS_TAPS))
+    assert macro["enc12_elec"] > macro["enc0_elec"], "[check] VIOLATED depth did not help WS"
+    assert macro["enc12_elec"] > best, "[check] VIOLATED enc12 does not clear the WS board top"
+    wins = sum(v["enc12_elec"] > v["enc0_elec"] for v in cells.values())
+    print(f"[check] OK enc12 clears board top {best:.4f} by {macro['enc12_elec'] - best:+.4f}; "
+          f"depth helps {wins}/{len(cells)} cells")
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.9), width_ratios=[1.25, 1])
+
+    rows = sorted(list(WS_BOARD.items())
+                  + [("ours enc0 (0 params)", macro["enc0_elec"]),
+                     ("ours enc12", macro["enc12_elec"])], key=lambda r: r[1])
+    cols = [PALETTE["ours"] if n.startswith("ours enc12") else
+            PALETTE["enc0"] if n.startswith("ours") else
+            PALETTE["accent"] if abs(v - best) < 1e-9 else "#bbb" for n, v in rows]
+    ax.barh(range(len(rows)), [v for _, v in rows], color=cols, height=0.66)
+    for i, (_, v) in enumerate(rows):
+        ax.text(v + 0.0015, i, f"{v:.4f}", va="center", fontsize=6.6)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([n for n, _ in rows], fontsize=6.6)
+    ax.set_xlim(0.60, 0.70)
+    ax.set_xlabel("within-session macro AUROC (12/12 cells)")
+    ax.set_title("Within-session leaderboard", pad=6)
+
+    # Paired slopegraph, not two bars. The macro hides whether the gain is uniform or carried
+    # by a couple of cells, and "partial cells lie" is exactly a warning about that.
+    for c, v in cells.items():
+        up = v["enc12_elec"] > v["enc0_elec"]
+        ax2.plot([0, 1], [v["enc0_elec"], v["enc12_elec"]], marker="o", ms=3,
+                 lw=0.9, color=PALETTE["ours"] if up else PALETTE["accent"], alpha=0.75)
+    # Cell labels collide wherever two sessions land within a few thousandths of each other,
+    # which is most of the top of the panel. Push them apart bottom-up by a fixed minimum gap
+    # and leader-line each one back to its true value, so the nudge never misreads as data.
+    order = sorted(cells.items(), key=lambda kv: kv[1]["enc12_elec"])
+    span = order[-1][1]["enc12_elec"] - order[0][1]["enc12_elec"]
+    gap, y_prev = 0.036 * span, -1e9
+    for c, v in order:
+        y = max(v["enc12_elec"], y_prev + gap)
+        y_prev = y
+        ax2.plot([1.02, 1.06], [v["enc12_elec"], y], lw=0.4, color="#bbb", zorder=1)
+        ax2.text(1.07, y, c, fontsize=5.6, va="center", color="#555")
+    ax2.plot([0, 1], [macro[t] for t in WS_TAPS], marker="o", ms=6, lw=2.6,
+             color="k", zorder=5, label="macro")
+    ax2.axhline(best, color=PALETTE["accent"], lw=0.9, ls="--")
+    ax2.text(-0.26, best + 0.0012, f"board top {best:.4f}", color=PALETTE["accent"],
+             fontsize=6.4, ha="left", va="bottom")
+    ax2.set_xticks([0, 1]); ax2.set_xticklabels(["enc0\n(0 params)", "enc12"])
+    ax2.set_xlim(-0.28, 1.34)
+    ax2.set_ylabel("within-session macro AUROC")
+    ax2.set_title(f"Per cell: depth helps {wins}/{len(cells)}", pad=6)
+    ax2.legend(fontsize=6.5, loc="lower right")
+
+    # The parity caveat belongs ON the figure, not only in the memo: leaderboard WS entries
+    # carry 2 folds and our WS readout has no bit-identical parity test yet (CS does).
+    fig.text(0.5, -0.045, "WS fold-structure parity with the leaderboard is UNVERIFIED "
+             "-- no WS SOTA claim until that is closed", ha="center", fontsize=6.2,
+             color=PALETTE["accent"])
+    fig.tight_layout(); _save(fig, "fig2ws_within_session")
+
+
 # ---------------------------------------------------------------- fig 3: LEACE
 def _paired_t(diffs: list[float]) -> tuple[float, float]:
     n = len(diffs)
@@ -158,7 +262,6 @@ def fig3() -> None:
                     d[t]["cells"][f"{tap}|{arm}"]["test"] for t in d
                 )
             checks[tap].append(
-                statistics.fmean.__self__ if False else
                 {k: statistics.fmean(d[t]["checks"][tap][k] for t in d)
                  for k in ("id_auc_before", "id_auc_after", "var_removed", "residual_cov", "d")}
             )
@@ -309,10 +412,10 @@ def _save(fig, stem: str) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["2", "3", "4"], default=None)
+    ap.add_argument("--only", choices=["2", "2ws", "3", "4"], default=None)
     a = ap.parse_args()
     _style()
-    for n, fn in (("2", fig2), ("3", fig3), ("4", fig4)):
+    for n, fn in (("2", fig2), ("2ws", fig2_ws), ("3", fig3), ("4", fig4)):
         if a.only in (None, n):
             print(f"=== fig {n}")
             fn()
