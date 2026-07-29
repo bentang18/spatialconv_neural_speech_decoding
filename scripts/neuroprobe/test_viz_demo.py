@@ -12,7 +12,7 @@ import numpy as np
 
 from scripts.neuroprobe.test_viz_figures import TASK, TEMPORAL, _pattern, _write_classes
 from scripts.neuroprobe.viz_common import load_all, shared_lobes
-from scripts.neuroprobe.viz_demo import HTML, build
+from scripts.neuroprobe.viz_demo import HTML, NULL_TASKS, build, page_prose
 from scripts.neuroprobe.viz_figures import figure_tasks, retrieval
 
 T = 32
@@ -131,3 +131,35 @@ def test_a_task_with_no_board_entry_renders_rather_than_crashing(tmp_path) -> No
     lobes = shared_lobes(sessions)
     p = build(sessions, lobes, ["enc12"], [TASK], 32.0, -0.25, n_pre=8, decode={})
     assert json.loads(json.dumps(p))["decode"]["enc12"][TASK] is None
+
+
+def test_the_page_never_names_a_task_that_is_not_in_the_menu() -> None:
+    """The 15-task copy shipped onto an 8-task page and claimed a `frame_brightness` floor
+    that was not on it. --tasks is a free choice, so every task the prose names has to be a
+    task the reader can actually select."""
+    eight = ["onset", "delta_volume", "word_index", "word_gap", "gpt2_surprisal",
+             "word_head_pos", "word_part_speech", "word_length"]
+    prose = page_prose(eight, 16, -0.5, 32.0)
+    blob = " ".join(prose.values())
+    for absent in NULL_TASKS + ("speech", "volume"):
+        assert absent not in blob, f"page names '{absent}', which is not in the menu"
+    assert "no null task sits here as a floor" in blob
+
+
+def test_the_page_keeps_its_floor_when_a_null_task_is_on_the_menu() -> None:
+    """The other half: with a null present the sentence is TRUE and must survive, otherwise
+    the fix for the 8-task page would have silently stripped the 15-task page's control."""
+    prose = page_prose(["onset", "speech", "frame_brightness"], 16, -0.5, 32.0)
+    blob = " ".join(prose.values())
+    assert "frame_brightness" in blob and "Two controls" in blob
+    assert "onset" in blob and "speech" in blob
+
+
+def test_the_origin_illustration_needs_both_of_the_tasks_it_contrasts() -> None:
+    """onset-vs-speech explains why a sustained contrast fails to return. With only one of
+    them on the page the comparison is unverifiable, so the generic wording is used."""
+    both = page_prose(["onset", "speech"], 16, -0.5, 32.0)["why"]
+    one = page_prose(["onset", "word_length"], 16, -0.5, 32.0)["why"]
+    assert "a word inside ongoing talk" in both
+    assert "a word inside ongoing talk" not in one
+    assert "re-references to the state at word onset" in one

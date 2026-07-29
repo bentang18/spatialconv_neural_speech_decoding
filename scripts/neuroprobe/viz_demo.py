@@ -23,6 +23,12 @@ from scripts.neuroprobe.viz_figures import (
     CONTRAST, _corr, _proj_origin, _traj, align_loso, collect, peak_settle, retrieval,
 )
 
+# Tasks that sit at r ~ 0 at every depth, measured in the 15-task run: the four film-level
+# properties plus pitch. Ordered by how flat they are, so the page names the best floor it
+# actually has. Not a claim that these are undecodable -- only that this pipeline, which is
+# forbidden from rotating one subject onto another, finds no shared trajectory for them.
+NULL_TASKS = ("frame_brightness", "face_num", "pitch", "local_flow", "global_flow")
+
 HTML = """<title>Cross-subject structure in a self-supervised iEEG encoder</title>
 <style>
   :root { color-scheme: light dark; }
@@ -62,9 +68,7 @@ per-feature calibration (2·C numbers, fit label-free over all its own windows, 
 invent a class contrast — and in a contrast the mean term cancels outright), then one mean
 subtraction and one scalar rescale. All of it is diagonal; rotation is what alignment would
 need and none of these can do it. The 3-PC basis is shared, fit on all sessions pooled with
-no subject labels. Two controls: <code>frame_brightness</code> stays at r&nbsp;≈&nbsp;0 in
-this same basis at every depth, and the <b>LOSO</b> column refits the basis with <i>both</i>
-subjects of each scored pair held out, so the number cannot be the basis's doing.
+no subject labels. __CONTROLS__
 <br><b>Origin: __ORIGIN__.</b> __ORIGINWHY__
 <br><span style="opacity:.75">Scope: electrodes are pooled to a lobe mean, so within-lobe
 spatial structure is gone and this shows temporal, not spatial, correspondence. The shared
@@ -409,6 +413,52 @@ def _rgb_panels(sessions, tap: str, task: str, rgb_lobes: dict,
     return out
 
 
+def page_prose(tasks, n_pre: int | None, offset: float, hz: float) -> dict[str, str]:
+    """The page's standing claims, which depend on which tasks were actually selected.
+
+    Every sentence here asserts something a reader can go and check on the page. `--tasks` is
+    a free choice, so a sentence naming a task that is not in the menu describes a panel that
+    does not exist -- which is how the 15-task copy ended up on an 8-task page claiming a
+    `frame_brightness` floor that was not there. Pure and separate from rendering so the
+    invariant "never name an absent task" can be tested rather than eyeballed.
+    """
+    if n_pre:
+        origin = (f"the {n_pre} pre-stimulus frames "
+                  f"({offset:+.2f} to {offset + n_pre / hz:+.2f} s)")
+        why = ("Zero means <i>no class difference before the word</i>, so a response that "
+               "rises and stays up is drawn as failing to return. ")
+        # onset-vs-speech is the sharpest illustration of that, and only an illustration if
+        # BOTH are on the page.
+        if "onset" in tasks and "speech" in tasks:
+            why += ("That is exactly how <code>onset</code> (a word after silence, over by "
+                    "the end) differs from <code>speech</code> (a word inside ongoing talk, "
+                    "the difference persists). For <code>speech</code> the classes already "
+                    "differ before t=0, so this re-references to the state at word onset "
+                    "rather than removing that offset.")
+        else:
+            why += ("Where the classes already differ before t=0, this re-references to the "
+                    "state at word onset rather than removing that offset.")
+    else:
+        origin = "the window's own time-average"
+        why = ("This window has no pre-stimulus frames, so the origin is the average of the "
+               "response itself. Sustained and transient contrasts therefore both read as "
+               "closed loops; use the 2 s page to tell them apart.")
+    # The null task is the page's floor: it shows that a shared trajectory is not something
+    # this basis hands out for free. A menu of all-signal tasks has no floor ON THE PAGE, and
+    # the honest move is to say so and point at the basis-free panels instead.
+    loso_ctl = ("the <b>LOSO</b> column refits the basis with <i>both</i> subjects of each "
+                "scored pair held out, so the number cannot be the basis's doing")
+    null = next((t for t in NULL_TASKS if t in tasks), None)
+    if null:
+        controls = (f"Two controls: <code>{null}</code> stays at r&nbsp;≈&nbsp;0 in this same "
+                    f"basis at every depth, and {loso_ctl}.")
+    else:
+        controls = (f"One control on this page: {loso_ctl}. Every task in this menu carries "
+                    "signal, so no null task sits here as a floor; the basis-free "
+                    "<b>retrieval</b> panels are the floor instead.")
+    return {"origin": origin, "why": why, "controls": controls}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--red-dir", required=True)
@@ -443,24 +493,12 @@ def main() -> None:
     payload = build(sessions, lobes, taps, tasks, args.hz, args.offset, n_pre=n_pre,
                     decode=decode)
     subj = len({s.subject_id for s in sessions})
-    if n_pre:
-        origin = (f"the {args.n_pre} pre-stimulus frames "
-                  f"({args.offset:+.2f} to {args.offset + args.n_pre / args.hz:+.2f} s)")
-        why = ("Zero means <i>no class difference before the word</i>, so a response that "
-               "rises and stays up is drawn as failing to return — which is exactly how "
-               "<code>onset</code> (a word after silence, over by the end) differs from "
-               "<code>speech</code> (a word inside ongoing talk, the difference persists). "
-               "For <code>speech</code> the classes already differ before t=0, so this "
-               "re-references to the state at word onset rather than removing that offset.")
-    else:
-        origin = "the window's own time-average"
-        why = ("This window has no pre-stimulus frames, so the origin is the average of the "
-               "response itself. Sustained and transient contrasts therefore both read as "
-               "closed loops; use the 2 s page to tell them apart.")
+    prose = page_prose(tasks, n_pre, args.offset, args.hz)
     html = (HTML.replace("__DATA__", json.dumps(payload))
             .replace("__NSESS__", str(len(sessions)))
-            .replace("__ORIGINWHY__", why)
-            .replace("__ORIGIN__", origin)
+            .replace("__CONTROLS__", prose["controls"])
+            .replace("__ORIGINWHY__", prose["why"])
+            .replace("__ORIGIN__", prose["origin"])
             .replace("__NSUBJ__", str(subj)))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as fh:
