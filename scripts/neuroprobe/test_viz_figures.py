@@ -10,8 +10,7 @@ import numpy as np
 
 from scripts.neuroprobe.viz_common import load_all
 from scripts.neuroprobe.viz_figures import (
-    CONTRAST, _corr, figure_a, figure_b, figure_tasks, identity_content, quantify,
-    retrieval, unit_scale,
+    CONTRAST, _corr, figure_tasks, quantify, retrieval,
 )
 
 TASK = "onset"
@@ -157,75 +156,12 @@ def test_within_subject_pairs_are_reported_separately_from_cross_subject(tmp_pat
     assert q["within_subject_diff_session_r"] > 0.999
 
 
-def test_figures_render_and_report_explained_variance(tmp_path) -> None:
-    for s in (1, 2, 3, 4):
-        _write(tmp_path, s, 0, {TEMPORAL: (10, _pattern(s)), FRONTAL: (5, _pattern(s + 50))})
-    sessions = load_all(str(tmp_path))
-    a = figure_a(sessions, ["temporal"], "enc12", TASK, str(tmp_path / "a.png"))
-    b = figure_b(sessions, "enc12", TASK, 1, str(tmp_path / "b.png"))
-    assert (tmp_path / "a.png").stat().st_size > 5000
-    assert (tmp_path / "b.png").stat().st_size > 5000
-    assert len(a["evr_raw"]) == 3 and len(a["evr_centered"]) == 3
-    assert b["n_panels"] == 4
-    assert 0 < sum(b["evr"]) <= 1.0 + 1e-9
-
 
 def test_corr_is_scale_and_offset_invariant() -> None:
     x = np.random.default_rng(1).normal(size=64)
     assert _corr(x, 3 * x + 7) > 0.999
     assert _corr(x, -x) < -0.999
 
-
-def test_identity_content_finds_a_planted_identity_offset(tmp_path) -> None:
-    """Shared content plus a big per-subject offset: identity must dominate the variance,
-    and removing it must RAISE cross-subject alignment rather than destroy it."""
-    shared = _pattern(0)
-    rng = np.random.default_rng(7)
-    for s in (1, 2, 3, 4):
-        offset = 20.0 * rng.normal(size=(1, C))       # constant per subject, huge
-        _write(tmp_path, s, 0, {TEMPORAL: (10, shared)}, offset=offset)
-    sessions = load_all(str(tmp_path))
-    ic = identity_content(sessions, ["temporal"], "enc12", TASK)
-    assert ic["identity_var_frac"] > 0.8, ic["identity_var_frac"]
-    assert ic["cross_subject_r_identity_removed"] >= ic["cross_subject_r"] - 1e-6
-
-
-def test_identity_content_reports_a_small_identity_share_when_there_is_none(tmp_path) -> None:
-    shared = _pattern(0)
-    for s in (1, 2, 3, 4):
-        _write(tmp_path, s, 0, {TEMPORAL: (10, shared)})   # identical, no offsets
-    sessions = load_all(str(tmp_path))
-    ic = identity_content(sessions, ["temporal"], "enc12", TASK)
-    assert ic["identity_var_frac"] < 0.02, ic["identity_var_frac"]
-    assert ic["identity_rank"] == 0, "no session offsets -> no identity directions"
-    # the two shares are a decomposition, so they must add to one
-    assert abs(ic["identity_var_frac"] + ic["within_session_var_frac"] - 1.0) < 1e-6
-
-
-def test_identity_content_withholds_the_score_when_the_projection_annihilates_everything(
-        tmp_path) -> None:
-    """More sessions than feature dimensions -> the identity span IS the whole space.
-
-    This is the real enc0 case, not a hypothetical: enc0's feature axis is the 7 |STFT| bins
-    and 12 session means span all 7 directions, so projecting identity out leaves float64
-    residue whose mean correlation came back at .1833 and was read as "pretraining moved
-    content out of the identity subspace". It was the correlation of nothing. The trained taps
-    are 256-d and keep ~96% of their norm under the same projection, so the two numbers were
-    never comparable. Refuse to report a number instead of reporting noise.
-    """
-    shared = _pattern(0)
-    rng = np.random.default_rng(11)
-    for s in range(1, C + 2):                          # C + 1 sessions in a C-dim space
-        _write(tmp_path, s, 0, {TEMPORAL: (10, shared)}, offset=rng.normal(size=(1, C)))
-    sessions = load_all(str(tmp_path))
-    ic = identity_content(sessions, ["temporal"], "enc12", TASK)
-    assert ic["feature_dim"] == C
-    assert ic["identity_rank"] == C, "C+1 generic offsets must span all C directions"
-    assert ic["identity_subspace_is_complete"] is True
-    assert ic["surviving_norm_frac_after_projection"] < 1e-6
-    assert np.isnan(ic["cross_subject_r_identity_removed"])
-    # the un-projected alignment is still measurable and must NOT be suppressed
-    assert ic["cross_subject_r"] > 0.9, ic["cross_subject_r"]
 
 
 def test_a_degenerate_ceiling_suppresses_the_normalized_score(tmp_path) -> None:
@@ -271,14 +207,6 @@ def test_retrieval_is_perfect_when_the_contrast_is_shared(tmp_path) -> None:
     assert r["top1"] > 0.99, r["top1"]
     assert r["median_rank"] == 0.0
 
-
-def test_unit_scale_removes_amplitude_but_not_shape() -> None:
-    class _S:
-        key = "S1T0"
-    m = np.arange(12, dtype=float).reshape(1, 4, 3)
-    (_, small), (_, big) = unit_scale([(_S(), m), (_S(), 100.0 * m)])
-    assert abs(np.linalg.norm(small) - 1.0) < 1e-9
-    assert np.allclose(small, big), "shape must survive; only the scale is removed"
 
 
 def test_figure_tasks_keeps_a_dead_task_small_relative_to_a_live_one(tmp_path) -> None:
@@ -336,24 +264,6 @@ def test_figure_depth_tolerates_a_tap_with_no_row(tmp_path) -> None:
     info = figure_depth([], retr, taps, ["onset"], str(tmp_path / "d.png"))
     assert abs(info["top1_first_to_last"]["onset"] - 0.2) < 1e-9
 
-
-def test_figure_identity_reports_the_cost_of_removing_identity(tmp_path) -> None:
-    from scripts.neuroprobe.viz_figures import figure_identity
-    rows = [{"tap": "enc0", "task": TASK, "identity_rank": 3, "n_sessions": 4,
-             "identity_var_frac": 0.7, "cross_subject_r": 0.20,
-             "cross_subject_r_identity_removed": 0.26},
-            {"tap": "enc12", "task": TASK, "identity_rank": 3, "n_sessions": 4,
-             "identity_var_frac": 0.6, "cross_subject_r": 0.42,
-             "cross_subject_r_identity_removed": 0.40}]
-    info = figure_identity(rows, str(tmp_path / "i.png"))
-    assert info["taps"] == ["enc0", "enc12"]
-    np.testing.assert_allclose(info["delta_r_after_removal"], [0.06, -0.02], atol=1e-9)
-
-
-def test_figure_identity_skips_rows_with_no_variance_split(tmp_path) -> None:
-    from scripts.neuroprobe.viz_figures import figure_identity
-    assert figure_identity([{"tap": "enc0", "identity_var_frac": float("nan")}],
-                           str(tmp_path / "i.png")) == {}
 
 
 def _shape_corpus(tmp_path, course):

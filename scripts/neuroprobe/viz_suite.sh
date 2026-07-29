@@ -54,7 +54,7 @@ mkdir -p "$OUT"
 echo "### tasks ($(tr ',' '\n' <<<"$TASKS" | wc -l | tr -d ' ')): $TASKS"
 echo "### figures  (red=$RED out=$OUT taps=$TAPS)"
 $PY -m scripts.neuroprobe.viz_figures --red-dir "$RED" --out-dir "$OUT" \
-  --task onset --taps "$TAPS" --tasks-quant "$TASKS" \
+  --taps "$TAPS" --tasks-quant "$TASKS" \
   --n-pre "$NPRE" --hz "$HZ" --offset "$OFF"
 
 echo "### videos"
