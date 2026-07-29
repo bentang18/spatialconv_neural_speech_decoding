@@ -96,6 +96,50 @@ def test_partial_cells_are_dropped_not_silently_averaged(tmp_path):
     assert "9/9 neg" in run(tmp_path), "the unpaired cell must be dropped, leaving 9"
 
 
+def _augment(tmp: Path, tap: str, extra: dict):
+    for cell in CELLS:
+        p = tmp / f"ctrl_{cell}.json"
+        doc = json.loads(p.read_text())
+        doc["onset"]["checks"][tap].update(extra)
+        p.write_text(json.dumps(doc))
+
+
+def test_the_null_normalised_section_divides_by_the_shuffled_arm(tmp_path):
+    """`pc_participation` is not comparable across taps raw -- enc0 and enc12 have different
+    row-space ranks -- so the ratio to the shuffled arm is what gets printed."""
+    write_tree(tmp_path, between=0.99, var_removed=0.2, d_leace=-7e-6, d_shuf=-5e-6, d_top=-8e-6)
+    _augment(tmp_path, "enc12", {"pc_participation_leace_shuf": 200.0,
+                                 "cos_pc1_leace_shuf": 0.1, "dir_between_frac_leace_shuf": 0.3,
+                                 "var_removed_leace_shuf": 0.0001})
+    out = run(tmp_path)
+    assert "against the matched null" in out
+    # participation 1.1 against a null of 200 -> 0.0055
+    assert "real   1.1000   null  200.0000   ratio   0.0055" in out
+    assert "real   0.9000   null    0.1000   ratio   9.0000" in out, "cos_pc1 ratio too"
+
+
+def test_alignment_is_reported_against_its_ceiling_and_the_rotation_reference(tmp_path):
+    write_tree(tmp_path, between=0.99, var_removed=0.2, d_leace=-7e-6, d_shuf=-5e-6, d_top=-8e-6)
+    _augment(tmp_path, "enc12", {"align_k8": 0.12, "align_k8_frac": 0.13, "align_k8_ceil": 0.92,
+                                 "align_k8_floor": 0.001, "diag_k8": 0.55, "diag_k8_rot": 0.80})
+    out = run(tmp_path)
+    assert "share a coordinate system" in out
+    assert "k=8    align frac 0.1300" in out
+    assert "diag 0.5500 vs rotation 0.8000" in out, "the rotation reference must be printed beside"
+
+
+def test_the_task_axis_section_counts_cells_beating_their_own_null(tmp_path):
+    """A mean can be carried by one cell; the p95 count cannot."""
+    write_tree(tmp_path, between=0.99, var_removed=0.2, d_leace=-7e-6, d_shuf=-5e-6, d_top=-8e-6)
+    _augment(tmp_path, "enc12", {"task_cos": 0.40, "task_cos_null": 0.05,
+                                 "task_cos_null_p95": 0.12, "task_vs_sess_t": 0.02,
+                                 "task_vs_sess_chance": 0.012})
+    out = run(tmp_path)
+    assert "is the TASK axis shared" in out
+    assert "cos 0.4000  vs null 0.0500 (x8.00)   10/10 beat their p95" in out
+    assert "overlap with the session offset: 0.0200 (chance 0.0120)" in out
+
+
 def test_empty_directory_fails_loudly(tmp_path):
     r = subprocess.run([sys.executable, str(SCRIPT), "--dir", str(tmp_path)],
                        capture_output=True, text=True)

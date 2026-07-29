@@ -41,8 +41,16 @@ import re
 import statistics as st
 from pathlib import Path
 
-GEOM = ("var_removed", "pc1_var_frac", "cos_pc1", "pc_participation", "wt_in_top10_pcs",
-        "dir_between_frac", "pc1_between_frac", "cos_common_mode", "cos_domain_mean_shift")
+GEOM = ("var_removed", "pc1_var_frac", "cos_pc1", "cos_pc1_excess", "pc_participation",
+        "wt_in_top10_pcs", "dir_between_frac", "pc1_between_frac", "cos_common_mode",
+        "cos_domain_mean_shift")
+
+# Stats whose raw value means nothing on its own. `pc_participation` cannot be compared across taps
+# at all without this: the row-space rank differs (enc0 is d-limited at ~1-2.4k, enc12 is n-limited
+# at 7k), so the deep tap simply has more directions to spread over. `leace_shuf` is the same rows,
+# the same spectrum and the same rank with the session structure destroyed, so the ratio is the
+# comparable quantity and the raw number is only a diagnostic.
+NULLED = ("cos_pc1", "pc_participation", "dir_between_frac", "var_removed")
 
 
 def load(d: Path) -> tuple[dict, dict]:
@@ -125,6 +133,64 @@ def main() -> None:
                 continue
             out["geometry"][tap][k] = {"mean": st.fmean(v), "min": min(v), "max": max(v)}
             print(f"    {k:<22} {st.fmean(v):8.4f}   [{min(v):7.4f}, {max(v):7.4f}]")
+
+    print("\n=== against the matched null (leace_shuf: same rows, spectrum and rank) ===")
+    for tap in taps:
+        rows = [c for (_, tp), cks in checks.items() if tp == tap for c in cks]
+        if not rows:
+            continue
+        print(f"\n  {tap}")
+        out.setdefault("nulled", {})[tap] = {}
+        for k in NULLED:
+            pair = [(r[k], r[k + "_leace_shuf"]) for r in rows
+                    if k in r and k + "_leace_shuf" in r and r[k] == r[k]]
+            if not pair:
+                continue
+            real, null = st.fmean(a for a, _ in pair), st.fmean(b for _, b in pair)
+            ratio = real / null if null else float("nan")
+            out["nulled"][tap][k] = {"real": real, "null": null, "ratio": ratio,
+                                     "n_cells": len(pair)}
+            print(f"    {k:<20} real {real:8.4f}   null {null:9.4f}   ratio {ratio:8.4f}"
+                  f"   ({len(pair)} fits)")
+
+    print("\n=== do the sessions share a coordinate system, offset aside? ===")
+    print("    align frac: overlap of the top-k within-session subspaces as a FRACTION of the")
+    print("    shuffled-split ceiling. diag vs rot: 'same axes up to scale' must beat a random")
+    print("    rotation of the same spectrum, not an absolute threshold.")
+    for tap in taps:
+        rows = [c for (_, tp), cks in checks.items() if tp == tap for c in cks]
+        ks = sorted({int(q.split("_k")[1]) for r in rows for q in r
+                     if q.startswith("align_k") and q.count("_") == 1})
+        if not ks:
+            continue
+        print(f"\n  {tap}")
+        for k in ks:
+            fr = [r[f"align_k{k}_frac"] for r in rows if f"align_k{k}_frac" in r]
+            dg = [r[f"diag_k{k}"] for r in rows if f"diag_k{k}" in r]
+            rot = [r[f"diag_k{k}_rot"] for r in rows if f"diag_k{k}_rot" in r]
+            if not fr:
+                continue
+            out.setdefault("alignment", {}).setdefault(tap, {})[k] = {
+                "frac": st.fmean(fr), "diag": st.fmean(dg), "diag_rot": st.fmean(rot)}
+            print(f"    k={k:<4} align frac {st.fmean(fr):.4f}  [{min(fr):.4f}, {max(fr):.4f}]"
+                  f"   |  diag {st.fmean(dg):.4f} vs rotation {st.fmean(rot):.4f}")
+
+    print("\n=== is the TASK axis shared across sessions? ===")
+    for tap in taps:
+        rows = [c for (_, tp), cks in checks.items() if tp == tap for c in cks]
+        got = [r for r in rows if "task_cos" in r]
+        if not got:
+            continue
+        f = lambda k: st.fmean(r[k] for r in got)                          # noqa: E731
+        beat = sum(r["task_cos"] > r["task_cos_null_p95"] for r in got)
+        out.setdefault("task", {})[tap] = {"cos": f("task_cos"), "null": f("task_cos_null"),
+                                           "vs_sess": f("task_vs_sess_t"),
+                                           "chance": f("task_vs_sess_chance"),
+                                           "beat_p95": beat, "n": len(got)}
+        print(f"\n  {tap}   cos {f('task_cos'):.4f}  vs null {f('task_cos_null'):.4f} "
+              f"(x{f('task_cos') / f('task_cos_null'):.2f})   {beat}/{len(got)} beat their p95")
+        print(f"        overlap with the session offset: {f('task_vs_sess_t'):.4f} "
+              f"(chance {f('task_vs_sess_chance'):.4f})")
 
     print("\n=== verdict ===")
     effective: dict[str, float] = {}
