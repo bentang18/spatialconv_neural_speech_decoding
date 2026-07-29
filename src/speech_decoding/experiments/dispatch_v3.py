@@ -81,12 +81,23 @@ class _EpochSeedCallback(pl.Callback):
 
 
 class _StepTimeCallback(pl.Callback):
-    """Log wall-clock ``train_sec_per_step`` every step — FREE (a CPU perf_counter
-    diff between consecutive batch-ends + one scalar log; no CUDA sync, no extra
-    kernel, and loss already logs each step). Measures true step-to-step throughput
-    incl. dataloader, so compile spikes show as tall bars and the steady floor is
-    obvious. First step is skipped (no prior mark); ``sync_dist=False`` ⇒ no
-    cross-rank barrier.
+    """Log wall-clock ``train_sec_per_step`` per OPTIMIZER step — FREE (a CPU
+    perf_counter diff + one scalar log; no CUDA sync, no extra kernel, and loss
+    already logs each step). Measures true step-to-step throughput incl. dataloader,
+    so compile spikes show as tall bars and the steady floor is obvious.
+    ``sync_dist=False`` ⇒ no cross-rank barrier.
+
+    🔴 FIXED 2026-07-29 (task #38). It used to diff consecutive ``on_train_batch_end``
+    calls, which fire once per MICRO-batch — so the scalar was seconds per micro-batch
+    and had to be multiplied by ``accumulate_grad_batches`` by hand. That cost us a
+    false "2712189 slowdown" alarm (#37) and, on 07-29, forced a throughput estimate to
+    be rebuilt from ckpt mtimes because the heartbeat could not be read directly.
+    ``trainer.global_step`` advances ONLY on the last micro-batch of an accumulation
+    group, so a change in it IS the optimizer-step boundary — the interval between two
+    consecutive boundaries is one true optimizer step. Two boundaries are needed before
+    the first value, so the first optimizer step logs nothing (you cannot time a step
+    you only saw the end of). Strictly CHEAPER than before: one log per optimizer step
+    instead of one per micro-batch.
 
     ALSO prints a per-rank HEARTBEAT to stdout every ``heartbeat_every`` optimizer
     steps (2026-07-16). The wandb scalar above is invisible in the .log file, which
@@ -102,10 +113,12 @@ class _StepTimeCallback(pl.Callback):
     """
 
     def __init__(self, heartbeat_every: int = 100) -> None:
-        self._t: float | None = None
+        self._t: float | None = None  # mark at the previous optimizer-step boundary
         self._heartbeat_every = int(heartbeat_every)
         self._t0: float | None = None
         self._last_hb: int | None = None
+        self._last_step: int | None = None
+        self._sec: float | None = None  # duration of the last completed optimizer step
 
     def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, *_: object) -> None:  # noqa: ARG002
         import time
@@ -113,14 +126,19 @@ class _StepTimeCallback(pl.Callback):
         now = time.perf_counter()
         if self._t0 is None:
             self._t0 = now
-        sec = None if self._t is None else now - self._t
-        if sec is not None:
-            pl_module.log(
-                "train_sec_per_step", sec,
-                on_step=True, on_epoch=False, prog_bar=True, sync_dist=False,
-            )
-        self._t = now
         step = int(trainer.global_step)
+        if self._last_step is None:
+            self._last_step = step  # mid-group on entry; do NOT mark, it would be short
+        elif step != self._last_step:
+            if self._t is not None:
+                self._sec = now - self._t
+                pl_module.log(
+                    "train_sec_per_step", self._sec,
+                    on_step=True, on_epoch=False, prog_bar=True, sync_dist=False,
+                )
+            self._last_step = step
+            self._t = now
+        sec = self._sec
         if (
             self._heartbeat_every > 0
             and step % self._heartbeat_every == 0

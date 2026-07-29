@@ -670,23 +670,62 @@ def test_heartbeat_disabled_when_zero(capsys) -> None:
     assert _hb_lines(capsys) == []
 
 
-def test_step_time_scalar_still_skips_first_step_then_logs() -> None:
-    """The PRE-EXISTING _StepTimeCallback contract, pinned cheaply (no 12M-param CPU
-    fit): first batch-end has no prior perf_counter mark ⇒ no scalar; every later one
-    logs a finite train_sec_per_step with sync_dist=False (no cross-rank barrier)."""
-    logged: list[tuple[str, float, bool]] = []
+class _Rec(_HbModule):
+    """Records the wandb scalar the callback logs."""
 
-    class _Rec(_HbModule):
-        def log(self, key, value, **kw):  # type: ignore[override]
-            logged.append((key, float(value), bool(kw.get("sync_dist", False))))
+    def __init__(self) -> None:
+        self.logged: list[tuple[str, float, bool]] = []
 
+    def log(self, key, value, **kw):  # type: ignore[override]
+        self.logged.append((key, float(value), bool(kw.get("sync_dist", False))))
+
+
+def test_step_time_scalar_needs_two_boundaries_then_logs() -> None:
+    """_StepTimeCallback contract, pinned cheaply (no 12M-param CPU fit). You cannot time
+    an optimizer step you only saw the END of, so the FIRST boundary only sets the mark
+    and the SECOND is the first measurable interval. Every value carries sync_dist=False
+    (no cross-rank barrier)."""
     cb, mod = _StepTimeCallback(heartbeat_every=0), _Rec()
     cb.on_train_batch_end(_HbTrainer(global_step=1), mod)
-    assert logged == []  # first step: no prior mark
+    assert mod.logged == []  # entered mid-group: no mark
     cb.on_train_batch_end(_HbTrainer(global_step=2), mod)
-    assert len(logged) == 1
-    key, value, sync = logged[0]
+    assert mod.logged == []  # first boundary: marks, cannot yet measure
+    cb.on_train_batch_end(_HbTrainer(global_step=3), mod)
+    assert len(mod.logged) == 1
+    key, value, sync = mod.logged[0]
     assert key == "train_sec_per_step" and value >= 0.0 and sync is False
+
+
+def test_step_time_scalar_measures_optimizer_steps_not_micro_batches(monkeypatch) -> None:
+    """🔴 THE #38 REGRESSION TEST. ``on_train_batch_end`` fires once per MICRO-batch, so
+    the old callback diffed consecutive micro-batches and published the result as
+    ``train_sec_per_step`` — off by a factor of ``accumulate_grad_batches``. That
+    mislabelled scalar produced the #37 false "2712189 slowdown" alarm.
+
+    Drive a fake clock at exactly 1 s per micro-batch with accumulate=4. A correct
+    optimizer-step timer reports 4.0; the micro-batch bug reports 1.0. ``global_step``
+    advances only on the LAST micro-batch of a group, which is what marks the boundary.
+    """
+    import itertools
+    import time as _time
+
+    accum, n_opt = 4, 4
+    clock = itertools.count(0.0, 1.0)  # 1 s per micro-batch
+    monkeypatch.setattr(_time, "perf_counter", lambda: next(clock))
+
+    cb, mod = _StepTimeCallback(heartbeat_every=0), _Rec()
+    for opt_step in range(n_opt):
+        for micro in range(accum):
+            step = opt_step + 1 if micro == accum - 1 else opt_step
+            cb.on_train_batch_end(_HbTrainer(global_step=step), mod)
+
+    values = [v for _, v, _ in mod.logged]
+    print(f"[check] accum={accum} @ 1 s/micro-batch -> train_sec_per_step={values} "
+          f"(want {float(accum)} each; the micro-batch bug gives 1.0) "
+          f"{'OK' if values == [float(accum)] * (n_opt - 1) else 'VIOLATED'}")
+    assert {k for k, _, _ in mod.logged} == {"train_sec_per_step"}
+    assert values == [float(accum)] * (n_opt - 1), values  # first boundary only marks
+    assert all(sync is False for _, _, sync in mod.logged)
 
 
 def test_per_band_space_and_widths_thread_into_mask_cfg(tmp_path) -> None:
