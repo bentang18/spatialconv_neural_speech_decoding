@@ -55,9 +55,10 @@ NULLED = ("cos_pc1", "pc_participation", "dir_between_frac", "var_removed")
 # What the cross-subject gain is selective for is not modality but whether the label tracks a
 # sustained LEVEL or a CHANGE/EVENT: per-task k splits 9/9 with no interleaving (event 1.230 vs
 # level 0.996), and `volume` vs `delta_volume` -- the same signal, level vs derivative -- differ
-# cross-subject while being identical within session. Since the subject difference is a rigid
-# translation, level codes are exactly the ones it destroys. So `task_vs_sess` is predicted HIGH
-# for level tasks and LOW for event tasks; pooling over the menu averages that away.
+# cross-subject while being identical within session. The mechanism is open: a rigid offset is
+# ruled out (AUROC is blind to it) and so is a per-feature affine mismatch (AdaBN is a wash on
+# both groups). What is left is a spatial-pattern mismatch, which predicts `task_cos` LOWER for
+# level tasks -- a contrast that pooling over the menu would average away.
 LEVEL = ("volume", "pitch", "frame_brightness", "face_num", "global_flow", "local_flow")
 
 
