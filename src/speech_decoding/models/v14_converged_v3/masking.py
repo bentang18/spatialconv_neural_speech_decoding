@@ -126,12 +126,17 @@ def assert_mask_feasible(geom: L1Geometry, cfg: V3MaskConfig = V3MaskConfig()) -
     d_s = torch.round(cfg.space_frac * cs.float()).long()
     if cfg.keep_alive:
         d_s = torch.minimum(d_s, (cs - 1).clamp(min=0))
-    if int(d_s.sum()) == 0 or int(d_s.sum()) >= n:
+    d = int(d_s.sum())
+    # space_frac == 0.0 is the DELIBERATE no-spatial-masking arm: Σd_s == 0 by construction,
+    # the masked set becomes the time mask alone (still non-empty at the locked band fractions),
+    # and token_flags_r6 ORs the two, so the objective stays well defined. The bound below is
+    # here to catch a DEGENERATE montage — space_frac > 0 but every shaft ≤1 contact under
+    # keep-alive, which silently masks nothing when the caller asked for masking.
+    if (d == 0 and cfg.space_frac > 0.0) or d >= n:
         raise ValueError(
-            f"space_frac={cfg.space_frac} keep_alive={cfg.keep_alive} ⇒ Σd_s={int(d_s.sum())} "
+            f"space_frac={cfg.space_frac} keep_alive={cfg.keep_alive} ⇒ Σd_s={d} "
             f"not in (0, N={n}); every shaft size ≤1 leaves nothing to mask under keep-alive?"
         )
-    d = int(d_s.sum())
     if int(_k_max(cs, d)) < 1 and cfg.whole_shaft_frac > 0:
         raise ValueError(
             f"whole-shaft infeasible: no shaft fits under D={d} (largest shaft "

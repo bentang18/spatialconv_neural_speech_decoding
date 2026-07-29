@@ -16,8 +16,10 @@ from speech_decoding.models.v14_converged_v3.geometry import build_l1_geometry
 from speech_decoding.models.v14_converged_v3.masking import (
     V3MaskConfig,
     V3MasksR6,
+    assert_mask_feasible,
     sample_masks_r6,
 )
+from speech_decoding.models.v14_converged_v3.pack_r4 import build_r4_grid, token_flags_r6
 from speech_decoding.models.v14_converged_v3.sidecar import build_sidecar
 
 
@@ -224,3 +226,52 @@ def test_deterministic_in_generator_seed() -> None:
     diff = not torch.equal(a.hga_mask, c.hga_mask)
     assert same and diff
     print(f"[check] OK same seed → identical ({same}); different seed → differs ({diff})")
+
+
+# ── space_frac == 0.0: the no-spatial-masking arm ────────────────────────────
+# Ben 2026-07-28: ms70 → keeper → ms25 was monotone in the probe as spatial masking fell,
+# so the endpoint (no spatial masking at all, time held at the ASR-convention 0.50) has to
+# be reachable. It was not: assert_mask_feasible rejected Σd_s == 0. These pin down that the
+# arm is WELL-DEFINED, not merely permitted — the loss must still have targets.
+
+
+def test_space_frac_zero_is_feasible_and_masks_no_contacts() -> None:
+    sc, geom = _session([3, 3, 4])
+    cfg = V3MaskConfig(space_frac=0.0)
+    assert_mask_feasible(geom, cfg)  # must not raise
+    n = int(geom.valid.sum())
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=5, generator=_gen(), cfg=cfg)
+    assert not m.contact_mask.any(), "space_frac=0 must mask zero contacts"
+    # the time masks are untouched — each band still hides round(0.50 * T_b) per sensor
+    for name, band in (("slow", m.slow_mask), ("mid", m.mid_mask), ("hga", m.hga_mask)):
+        assert band.any(), f"{name} time mask empty — the arm would have no loss targets"
+    print(f"[check] space_frac=0 OK: contacts masked=0, time masks non-empty (N={n})")
+
+
+def test_space_frac_zero_still_leaves_loss_targets() -> None:
+    """The guard that matters: masked == time mask alone, and it is NOT empty."""
+    sc, geom = _session([3, 3, 4])
+    n = int(geom.valid.sum())
+    grid = build_r4_grid(geom, n_time=32)
+    m = sample_masks_r6(
+        geom, n, n_time=32, n_rows=4, generator=_gen(), cfg=V3MaskConfig(space_frac=0.0)
+    )
+    masked, in_loss = token_flags_r6(grid, m)
+    assert masked.any(), "no masked tokens ⇒ _masked_mean_l1 would divide by zero"
+    assert bool((in_loss == masked).all()), "r6 contract: in_loss == masked"
+    frac = float(masked.float().mean())
+    # space ∪ time collapses to time alone; the three bands sit at 0.50 each.
+    assert 0.3 < frac < 0.7, f"masked fraction {frac:.3f} implausible for time-only masking"
+    print(f"[check] space_frac=0 loss targets OK: masked fraction={frac:.3f}, in_loss==masked")
+
+
+def test_degenerate_montage_still_raises_when_masking_was_requested() -> None:
+    """The guard keeps its real job: space_frac > 0 that silently masks nothing is a bug."""
+    sc, geom = _session([1, 1, 1])  # every shaft size 1 ⇒ keep_alive forces d_s = 0
+    try:
+        assert_mask_feasible(geom, V3MaskConfig(space_frac=0.5))
+    except ValueError as e:
+        assert "not in (0, N=" in str(e)
+        print(f"[check] degenerate montage still raises: {e}")
+        return
+    raise AssertionError("space_frac=0.5 on all-size-1 shafts must still raise")
