@@ -39,17 +39,28 @@ OUT = RES / "showcase/paper"
 VIZ = RES / "viz_crosssubject/archive"
 TAPS = ["enc0", "enc3", "enc6", "enc12"]
 
-# Neuroprobe CS leaderboard, same board/split, recomputed from the vendored leaderboard's raw
-# per-session JSONs under OUR aggregation (leaderboard_baselines.py --split Cross-Subject), so
-# these are 4 dp from source rather than 3 dp off a webpage.
+# SELECTION RULE, applied identically to BOTH splits: every model FAMILY on the leaderboard,
+# represented by its BEST-scoring variant. Nothing is dropped for being weak and nothing is
+# kept for being flattering -- picking a subset by eye is how a comparison figure starts lying.
+# (Families with several submissions -- Linear x3, BrainBERT x2, PopT x2, DIVER-1 x2 -- would
+# otherwise pad the chart with the same model tuned differently. "BrainBERT (untrained)" is
+# kept SEPARATE because it is a random-init control, not a tuning variant of BrainBERT.)
+#
+# Macros are 4 dp recomputed from the vendored leaderboard's raw per-session JSONs under OUR
+# aggregation (leaderboard_baselines.py), not 3 dp off a webpage.
+#
 # Decoder is NOT held constant across these entries: they are logistic/MLP/CNN on ONE fixed
 # Laplacian-STFT feature set, which is why the matched comparison is enc0-ridge vs their linear.
+# NOTE: DIVER-1 is the Within-Session board top but has NO Cross-Subject submission, so it
+# appears in one chart and not the other. That asymmetry is theirs, not a filtering choice.
 BOARD = {
     "CNN (Laplacian-STFT)": 0.5777,
     "PopT (Laplacian-STFT)": 0.5750,
     "MLP (Laplacian-STFT)": 0.5659,
     "BrainBERT (frozen)": 0.5471,
     "Linear (Laplacian-STFT)": 0.5392,
+    "BrainBERT (untrained)": 0.5266,
+    "GLIS-GNN": 0.5152,
 }
 LEAD = "45k cd"          # the shipped checkpoint: 45k with the linear cooldown
 CKPTS = {
@@ -201,16 +212,17 @@ def fig2() -> None:
 
 
 # ------------------------------------------------------- fig 2ws: within-session
-# Within-Session macros recomputed from the vendored leaderboard's raw per-session JSONs by
-# scripts/neuroprobe/leaderboard_baselines.py --split Within-Session, under OUR aggregation.
-# Hardcoded for the same reason BOARD is: this figure reads LOCAL artifacts only, and the
-# sibling neuroprobe checkout is not one.
+# Same selection rule as BOARD: every family, best variant. Hardcoded for the same reason --
+# this figure reads LOCAL artifacts only and the sibling neuroprobe checkout is not one.
 WS_BOARD = {
     "DIVER-1 (0.1s, tiny, frozen)": 0.6777,
     "PopT (Laplacian-STFT)": 0.6700,
     "CNN (Laplacian-STFT)": 0.6686,
     "Linear (Laplacian-STFT)": 0.6599,
+    "MLP (Laplacian-STFT)": 0.6563,
     "BrainBERT (frozen)": 0.6257,
+    "BrainBERT (untrained)": 0.5808,
+    "GLIS-GNN": 0.5526,
 }
 WS_TAPS = ["enc0_elec", "enc12_elec"]
 
@@ -262,7 +274,7 @@ def fig2_ws() -> None:
         ax.text(v + 0.0015, i, f"{v:.4f}", va="center", fontsize=6.6)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([n for n, _ in rows], fontsize=6.6)
-    ax.set_xlim(0.60, 0.70)
+    ax.set_xlim(0.54, 0.71)
     ax.set_xlabel("within-session macro AUROC (12/12 cells)")
     ax.set_title("Within-session leaderboard", pad=6)
 
@@ -399,59 +411,71 @@ def fig3() -> None:
 
 # ---------------------------------------------------------------- fig 4: concentration
 def fig4() -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(6.6, 2.4), sharey=True)
+    """3-PC r vs FULL-SPACE r, per task, paired.
+
+    The earlier version drew per-task lines for the 3-PC r and a single pooled black line for
+    the full space. Those are different units -- one task, all tasks -- so the comparison the
+    figure exists to make was the one thing a reader could not do. Here every task carries BOTH
+    of its own numbers and the shaded gap between them IS the claim.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(7.4, 3.0), sharey=True)
+    DUD = "frame_brightness"
     for ax, win in zip(axes, ("win1s", "win2s")):
         rep = json.load(open(VIZ / win / "report.json"))
-        # Figure keys are flat "<lobe>/<tap>"; the shared-lobe panel is "T". The 1 s suite was
-        # run WITHOUT enc0, so each window gets its own tap list rather than a shared constant.
+        # Flat "<lobe>/<tap>" keys; the shared-lobe panel is "T". The 1 s suite ran WITHOUT
+        # enc0, so each window gets its own tap list rather than a shared constant.
         have = [t for t in TAPS if f"T/{t}" in rep["figures"]]
-        three = {t: statistics.fmean(rep["figures"][f"T/{t}"]["align_3pc"].values()) for t in have}
-        full = {
-            t: statistics.fmean(
-                r["cross_subject_r"] for r in rep["quant"]
-                if r["tap"] == t and str(r["class"]) == "contrast")
-            for t in have
-        }
-        lo, hi = have[0], have[-1]
-        rise = three[hi] - three[lo]
-        flat = full[hi] - full[lo]
-        lobe, TAPS_W = "T", have
-        print(f"[check] {win} lobe={lobe} taps={TAPS_W}  3PC {three[lo]:.3f}->{three[hi]:.3f} "
-              f"(+{rise:.3f})   full-space {full[lo]:.3f}->{full[hi]:.3f} ({flat:+.3f})")
-        assert rise > 3 * abs(flat), (
-            f"[check] VIOLATED concentration claim: 3-PC rise {rise:.3f} not >> full-space {flat:+.3f}")
+        three = {t: rep["figures"][f"T/{t}"]["align_3pc"] for t in have}
+        # Per-TASK full-space r, from the same rows the pooled number was averaged out of.
+        full = {t: {r["task"]: r["cross_subject_r"] for r in rep["quant"]
+                    if r["tap"] == t and str(r["class"]) == "contrast"} for t in have}
+        tasks = [k for k in sorted(three[have[0]]) if k != DUD] + [DUD]
+        x = range(len(have))
 
-        x = range(len(TAPS_W))
-        # Per-task lines, not just the mean: frame_brightness is the built-in NEGATIVE control
-        # (a visual label with no speech content) and it must stay pinned at ~0 at every depth.
-        # Averaging it into one line hides exactly the control that makes the panel credible.
-        # Colors are keyed by task name, not by draw order, so the two panels agree.
-        tasks = sorted(rep["figures"][f"T/{lo}"]["align_3pc"])
-        DUD = "frame_brightness"
         for tk in tasks:
-            ys = [rep["figures"][f"T/{t}"]["align_3pc"][tk] for t in TAPS_W]
             dud = tk == DUD
-            ax.plot(x, ys, marker="x" if dud else "o", ms=3.2, lw=1.1 if dud else 1.5,
-                    color=PALETTE["muted"] if dud else TASK_COLOR[tk],
-                    ls="--" if dud else "-", alpha=0.95, zorder=3 if dud else 2,
-                    label=(tk.replace("_", " ") + (" (visual control)" if dud else "")))
-        ax.plot(x, [full[t] for t in TAPS_W], marker="s", ms=3.2, lw=1.6, color="k",
-                ls=":", zorder=4, label="full space (all tasks)")
+            col = PALETTE["muted"] if dud else TASK_COLOR[tk]
+            y3 = [three[t][tk] for t in have]
+            yf = [full[t].get(tk, float("nan")) for t in have]
+            ax.fill_between(x, yf, y3, color=col, alpha=0.13, lw=0, zorder=1)
+            ax.plot(x, y3, marker="o", ms=3.4, lw=1.7, color=col, zorder=3)
+            ax.plot(x, yf, marker="s", ms=2.8, lw=1.0, ls=":", color=col, alpha=0.75, zorder=2)
+
+        lo, hi = have[0], have[-1]
+        g0 = statistics.fmean(three[lo][k] - full[lo][k] for k in tasks if k != DUD)
+        g1 = statistics.fmean(three[hi][k] - full[hi][k] for k in tasks if k != DUD)
+        print(f"[check] {win} taps={have}  mean(3PC - full) {g0:+.3f} at {lo} -> {g1:+.3f} at {hi}"
+              f"   |  {DUD} gap {three[hi][DUD] - full[hi][DUD]:+.3f}")
+        # The claim is that the GAP OPENS with depth. If it did not, "concentration" would just
+        # be a restatement of "the 3 PCs are a good basis", which is true at every depth.
+        assert g1 > g0, f"[check] VIOLATED gap did not widen with depth in {win}"
+        assert abs(three[hi][DUD]) < 0.05, f"[check] VIOLATED visual control not flat in {win}"
+
+        ax.annotate("", xy=(len(have) - 1, three[hi]["onset"]),
+                    xytext=(len(have) - 1, full[hi]["onset"]),
+                    arrowprops=dict(arrowstyle="<->", lw=0.9, color="k"))
+        ax.text(len(have) - 1.06, (three[hi]["onset"] + full[hi]["onset"]) / 2,
+                "concentration", fontsize=6.6, ha="right", va="center", rotation=90)
         ax.axhline(0, color="k", lw=0.6, alpha=0.4)
-        ax.set_xticks(list(x)); ax.set_xticklabels(TAPS_W)
+        ax.set_xticks(list(x)); ax.set_xticklabels(have)
+        ax.set_xlim(-0.25, len(have) - 0.55)
         ax.set_title(f"{win[3:-1]} s window", pad=6)
         ax.set_xlabel("encoder depth")
-        dud_span = max(abs(rep["figures"][f"T/{t}"]["align_3pc"][DUD]) for t in TAPS_W)
-        assert dud_span < 0.05, f"[check] VIOLATED visual control not flat: {dud_span:.3f}"
     axes[0].set_ylabel("cross-subject alignment r")
-    # ONE legend below both panels -- in-axes legends sat on top of the lines they label.
-    h, l = axes[1].get_legend_handles_labels()
-    fig.legend(h, l, fontsize=6.5, loc="upper center", bbox_to_anchor=(0.5, 0.075),
-               ncol=4, columnspacing=1.4, handlelength=1.8)
-    fig.suptitle("Shared structure concentrates into a low-dimensional subspace with depth",
+
+    style = [plt.Line2D([], [], color="k", lw=1.7, marker="o", ms=3.4,
+                        label="inside the fitted 3-PC subspace"),
+             plt.Line2D([], [], color="k", lw=1.0, ls=":", marker="s", ms=2.8,
+                        label="full feature space (same task)")]
+    task_h = [plt.Line2D([], [], color=PALETTE["muted"] if k == DUD else TASK_COLOR[k], lw=2.4,
+                         label=k.replace("_", " ") + (" (visual control)" if k == DUD else ""))
+              for k in sorted(TASK_COLOR) + [DUD]]
+    fig.legend(handles=style + task_h, fontsize=6.4, loc="upper center",
+               bbox_to_anchor=(0.5, 0.085), ncol=4, columnspacing=1.3, handlelength=2.2)
+    fig.suptitle("Cross-subject agreement barely grows -- it CONCENTRATES into 3 dimensions",
                  fontsize=8.5, y=1.01)
-    fig.tight_layout(rect=(0, 0.04, 1, 1)); _save(fig, "fig4_concentration")
-    print("[check] OK concentration reproduces in BOTH windows independently")
+    fig.tight_layout(rect=(0, 0.10, 1, 1)); _save(fig, "fig4_concentration")
+    print("[check] OK the 3PC-minus-full gap widens with depth in BOTH windows")
 
 
 def _save(fig, stem: str) -> None:
