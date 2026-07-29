@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=125000M
+#SBATCH --mem=113560M
 #SBATCH --time=00:30:00
 #SBATCH --array=0-11
 #SBATCH --output=/projects/bhqk/htang13/viz/elec_encode_%A_%a.out
@@ -16,24 +16,31 @@
 # existing v3_probe_encode_r6_elec.sbatch wrote --elec-taps 12 over the cohort7/probe4
 # DEFAULTS, which is the wrong session set and the wrong task set for this figure.
 #
-# THE WINDOW IS 1 s (board parity), NOT the 2 s viz window, and that is a choice with a reason:
+# THE WINDOW IS 1 s (board parity), NOT the 2 s viz window. Sized from the ACTUAL 2 s cache
+# (/projects/bhqk/htang13/v3_viz_cache_cdlin_45k, read 2026-07-29: 12 sessions, 353 GB,
+# n_windows 9063-13592, 100-120 contacts, band_lengths (8,32,64), band_fdims (7,6,7), fp16):
 #
-#   * disk. v3_viz_encode.sbatch refuses elec taps at 2 s because the cache would be ~1.1 TB
-#     against 2.2 TB of headroom on /projects/bhqk while pretrains write ckpts there. At 1 s it
-#     is ~571 GB (MEASURED for the board cache with the elec taps).
+#   * DISK. At 1 s band_lengths are (4,16,32) so k_full=52, enc0 is 348 columns and enc12 is
+#     52*256=13312. Over the 12 sessions' real n and contact counts that is enc12_elec 389 GB +
+#     enc0_elec 10 GB + parcel taps 171 GB = ~570 GB, which reproduces the 571 GB figure the viz
+#     sbatch quotes. The 2 s version would be ~1.14 TB. /work/nvme has 4.1 TB free so 2 s WOULD
+#     fit -- disk is no longer the binding constraint, RAM is (below).
+#   * RAM. The write is held in memory before torch.save. At 1 s the largest session is
+#     enc12_elec 43.0 GB + enc0_elec 1.1 GB + parcel taps 17.5 GB = ~62 GB, comfortably inside
+#     ghx4's DefMemPerGPU (113560M, billing exactly 1000). At 2 s it is ~124 GB, which does NOT
+#     fit and would need ~250G -- a 2.25x memory bill and much worse backfill, to buy an axis
+#     detail measure #1 already covers.
 #   * #2 does not need the pre-onset baseline that 2 s buys. Measure #1 subtracts the first 16
 #     frames because a condition-mean map has no other way to remove a baseline offset; here
 #     significance comes from a label permutation, which absorbs any baseline offset for free.
 #   * 1 s IS the leaderboard window, so these AUROCs are quotable next to board numbers.
 #
-# --elec-taps 0,12 gets both ends of the depth axis on the canonical contact axis. Tap 0 costs
-# almost nothing extra (~348 columns vs enc12_elec's k_full*256) and it is the pre-pretraining
-# anatomical map -- the half that actually answers "is the signal in STG in the DATA".
+# To match #1's axis exactly instead, add --clip-dur 2.0 --clip-offset -0.5 and RAISE --mem to
+# 250G. Do not raise the window without raising the memory.
 #
-# --mem is ABOVE ghx4's DefMemPerGPU (113560M = billing 1000) on purpose. MEASURED peak with
-# enc12_elec alone was 108.4 GiB (job 2718998 MaxRSS), leaving ~2 GiB of headroom; adding
-# enc0_elec eats into that. 125000M bills 122.07*9.01726 = ~1101, a 10% premium, which is far
-# cheaper than an OOM -- an OOM'd job bills in full and returns nothing.
+# --elec-taps 0,12 gets both ends of the depth axis on the canonical contact axis. Tap 0 adds
+# only ~2.5% to the write (348 columns vs 13312) and it is the pre-pretraining anatomical map --
+# the half that actually answers "is the signal in STG in the DATA at all".
 #
 # Sharded one session per array task (feedback-always-parallel-shard): caps memory at a single
 # session's peak and the short walltime earns backfill against the deep ghx4 queue.

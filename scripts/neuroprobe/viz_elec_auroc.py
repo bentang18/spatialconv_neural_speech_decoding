@@ -223,7 +223,7 @@ def project(feat, cols, sel, T, C, chunk, basis) -> np.ndarray:
 
 def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
                   perm_block: int, chunk: int, seed: int, store_null: bool = True,
-                  verbose: bool = True) -> dict:
+                  cov_stride: int = 4, verbose: bool = True) -> dict:
     out: dict = {}
     meta_done = False
     for tap in taps:
@@ -246,13 +246,18 @@ def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
         # label-free PC basis for this tap: one covariance per row, pooled over trials & time
         cov = np.zeros((P, C, C), dtype=np.float64)
         csum = np.zeros((P, C), dtype=np.float64)
-        n_all = int(rec["n_windows"])
-        for _, x in _chunks(feat, cols, np.arange(n_all), T, C, chunk):
+        # Every ``cov_stride``-th window. A (256, 256) covariance from a whole session is
+        # estimated from n_windows*T ~ 870k samples, which is four orders of magnitude more
+        # than its 33k free parameters, so striding costs nothing measurable and this pass
+        # otherwise reads the entire 40+ GB tap off Lustre.
+        wins = np.arange(0, int(rec["n_windows"]), max(1, cov_stride))
+        for _, x in _chunks(feat, cols, wins, T, C, chunk):
             xf = x.reshape(-1, P, C).transpose(1, 0, 2).astype(np.float64)   # (P, m, C)
             cov += xf.transpose(0, 2, 1) @ xf
             csum += xf.sum(axis=1)
             del x, xf
-        m_tot = n_all * T
+        m_tot = len(wins) * T
+        assert m_tot > 20 * C, f"{tap}: {m_tot} samples for a {C}x{C} covariance is too few"
         mu = csum / m_tot
         cov = cov / m_tot - mu[:, :, None] * mu[:, None, :]
         basis, frac = pca_basis(cov, n_pc)
@@ -605,6 +610,8 @@ def main() -> None:
     p.add_argument("--perm-block", type=int, default=200,
                    help="trials per permutation block; 0 = free (anti-conservative under drift)")
     p.add_argument("--chunk", type=int, default=256)
+    p.add_argument("--cov-stride", type=int, default=4,
+                   help="window stride for the label-free PC covariance pass")
     p.add_argument("--seed", type=int, default=33)
     p.add_argument("--aggregate", action="store_true", help="summarise shards in --out-dir")
     p.add_argument("--inference", choices=("maxstat", "fdr"), default="maxstat",
@@ -633,7 +640,8 @@ def main() -> None:
     for fn in todo:
         out = session_shard(os.path.join(a.cache, fn), taps=taps, tasks=tasks, band=a.band,
                             n_pc=a.pc, n_perm=a.n_perm, perm_block=a.perm_block,
-                            chunk=a.chunk, seed=a.seed, store_null=not a.no_store_null)
+                            chunk=a.chunk, seed=a.seed, store_null=not a.no_store_null,
+                            cov_stride=a.cov_stride)
         dst = os.path.join(a.out_dir, f"elec_s{int(out['subject_id'])}"
                                      f"_t{int(out['trial_id'])}_{a.band}.npz")
         np.savez_compressed(dst, **out)
