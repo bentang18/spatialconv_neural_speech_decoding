@@ -5,15 +5,28 @@ information. Three readings are live, and the numbers below are chosen so that e
 DIFFERENT pattern, which is what makes this a test rather than a summary:
 
   A. Pretraining relocated identity into a high-variance subspace disjoint from content.
-     Predicts: dir_between_frac well below 1 (the direction carries real within-session variance),
-     cos_pc1 not ~1, AND leace_toppc COSTS something (deleting a comparable amount of variance
-     chosen without reference to identity is NOT free).
-  B. The erased direction is the between-session offset, which AUROC cannot see.
-     Predicts: dir_between_frac ~ 1. Then "21% of variance for 7e-6" is arithmetic, not biology.
+     Predicts: a large EFFECTIVE (within-session) erased share, cos_pc1 not ~1, AND leace_toppc
+     COSTS something -- deleting a comparable amount of variance chosen without reference to
+     identity is NOT free.
+  B. The erased direction is mostly the between-session offset, which AUROC cannot see.
+     Predicts: dir_between_frac ~ 1.
   C. Ridge is simply robust to losing any one direction out of ~7000.
      Predicts: leace_shuf is ALSO null -- the test never had power, whatever the geometry says.
 
-B and C are not mutually exclusive and either one is fatal to the headline on its own.
+**B and C are not equally damaging, and it matters not to conflate them.** AUROC is invariant to a
+constant per-row score offset, so the offset component contributes EXACTLY ZERO to the measured
+delta. It therefore cannot be hiding a cost, and the -7e-6 null is already a statement about the
+WITHIN-session component alone. What B corrupts is the ADVERTISING, not the null: `var_removed`
+counts variance the test never probed. The honest headline is
+
+    erasing  var_removed x (1 - dir_between_frac)  of WITHIN-session variance costs 7e-6
+
+reported below as `effective_within_var`. That number also re-tests the enc0-vs-enc12 story: the
+published contrast is "enc0 tiny (0.37%) and ENTANGLED vs enc12 huge (20.7%) and DISJOINT", and if
+enc12's effective share collapses toward enc0's, the contrast weakens or inverts on its own terms.
+
+C is the reading that can actually void the null, because it says the instrument reads zero on
+everything.
 
 Pairing is over CELLS (average tasks within a cell first), which is the board's own test unit --
 see project-paired-over-cells-is-the-board-test-2026-07-27. Only the cell x task intersection where
@@ -114,6 +127,7 @@ def main() -> None:
             print(f"    {k:<22} {st.fmean(v):8.4f}   [{min(v):7.4f}, {max(v):7.4f}]")
 
     print("\n=== verdict ===")
+    effective: dict[str, float] = {}
     for tap in taps:
         g = out["geometry"].get(tap, {})
         if not g:
@@ -122,23 +136,36 @@ def main() -> None:
         d_shuf = out["delta"].get(f"{tap}|leace_shuf", {}).get("mean")
         d_top = out["delta"].get(f"{tap}|leace_toppc", {}).get("mean")
         d_le = out["delta"].get(f"{tap}|leace", {}).get("mean")
+        vr = g.get("var_removed", {}).get("mean")
         print(f"\n  {tap}")
-        if bf is not None:
-            print(f"    [B] {bf:.1%} of the erased direction's variance is the BETWEEN-session "
-                  f"offset, which AUROC cannot see."
-                  + ("  => the headline is largely arithmetic." if bf > 0.8 else
-                     "  => a real within-session share survives." if bf < 0.5 else
-                     "  => mixed; report the split, do not quote var_removed alone."))
+        if bf is not None and vr is not None:
+            eff = vr * (1.0 - bf)
+            effective[tap] = eff
+            print(f"    [B] var_removed {vr:.2%}, of which {bf:.1%} is the BETWEEN-session offset "
+                  f"AUROC cannot see")
+            print(f"        => EFFECTIVE within-session erased variance = {eff:.3%}"
+                  + ("   (the 'huge subspace' framing does not survive this)" if eff < 0.02 else
+                     "   (a substantial within-session share -- the framing survives)"))
         if d_shuf is not None and d_le is not None:
             print(f"    [C] shuffled-domain (rank-matched) control costs {d_shuf:+.6f} vs "
                   f"identity {d_le:+.6f}."
-                  + ("  => no power: any rank-1 deletion is free." if abs(d_shuf) < 2e-4 else
+                  + ("  => NO POWER: any rank-1 deletion is free, so the null is about ridge, "
+                     "not geometry. This voids the claim." if abs(d_shuf) < 2e-4 else
                      "  => the test HAS power; identity being free is informative."))
         if d_top is not None:
             print(f"    [A] top-PC (variance-matched) control costs {d_top:+.6f}."
                   + ("  => deleting comparable variance is ALSO free; var_removed says nothing "
                      "about identity." if abs(d_top) < 2e-4 else
                      "  => comparable variance is NOT free, so identity's freeness is specific."))
+
+    if len(effective) > 1 and "enc0" in effective and "enc12" in effective:
+        e0, e12 = effective["enc0"], effective["enc12"]
+        print(f"\n  enc0 vs enc12 on EFFECTIVE within-session erased variance: "
+              f"{e0:.3%} vs {e12:.3%}  (ratio {e12 / e0:.1f}x)" if e0 > 0 else "")
+        print("    the published contrast is 'enc0 tiny+entangled vs enc12 huge+disjoint' -- "
+              + ("that survives on effective variance too." if e12 > 5 * e0 else
+                 "on EFFECTIVE variance the size gap largely CLOSES, so the contrast rests on "
+                 "the delta (enc0 hurts, enc12 does not), NOT on subspace size."))
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(out, indent=1, default=float))
