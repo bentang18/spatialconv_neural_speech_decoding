@@ -170,3 +170,39 @@ def test_sbatch_cell_list_matches_the_code():
     line = next(ln for ln in text.splitlines() if ln.startswith("CELLS="))
     listed = [tuple(int(v) for v in c.split(",")) for c in line.split("(", 1)[1].rstrip(")").split()]
     assert listed == [c for c in B.LITE_SESSIONS if c[0] != B.CS_TRAIN_ANCHOR[0]]
+
+
+def test_probe_auc_matches_the_pinv_formulation_it_replaced():
+    """The SVD solve exists to avoid materialising a 2.7 GB pseudo-inverse, NOT to change the
+    number. numpy's pinv is this same SVD with cutoff rcond*s.max(), so agreement must be tight
+    even on a deliberately rank-deficient matrix -- which is the case that actually occurs, since
+    erased features are rank-deficient by construction."""
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(40, 12)) @ rng.normal(size=(12, 90))     # rank 12 in 90 dims
+    y_tr = np.asarray(rng.integers(0, 2, size=40), dtype=np.float64)
+    te = rng.normal(size=(30, 90))
+    y_te = np.asarray(rng.integers(0, 2, size=30), dtype=np.float64)
+
+    mu = a.mean(0)
+    w_ref = np.linalg.pinv(a - mu, rcond=1e-8) @ (y_tr - y_tr.mean())
+    ref = B.auroc((te - mu) @ w_ref, y_te - 0.5)
+    assert L._probe_auc(a, y_tr, te, y_te) == pytest.approx(ref, abs=1e-9)
+
+
+def test_every_arm_reaches_the_readout_in_the_same_precision(pair, monkeypatch):
+    """The leace arm is DIFFERENCED against the std arm. If one runs an fp32 GEMM and the other
+    fp64, the delta carries a precision change as well as an erasure -- and the fp64 side costs
+    double for the privilege. `_lam_grid` documents fp32 GEMMs; every arm must honour it."""
+    seen = {}
+    real = B._lam_grid
+
+    def spy(z_tr, y_tr, evals):
+        seen[len(seen)] = (z_tr.dtype, *(z.dtype for z, _ in evals.values()))
+        return real(z_tr, y_tr, evals)
+
+    monkeypatch.setattr(B, "_lam_grid", spy)
+    anchor, test = pair
+    L._cs_cell_arms(anchor, test, TASK, TAPS, None)
+    assert seen, "no arm reached the readout"
+    for dts in seen.values():
+        assert all(dt == np.float32 for dt in dts), f"readout got {dts}, not fp32"

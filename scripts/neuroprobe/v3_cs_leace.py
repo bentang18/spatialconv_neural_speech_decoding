@@ -65,12 +65,38 @@ ARMS = ("std", "std_target", "leace")
 LOAD_MMAP = True
 
 
+def _f32(a: np.ndarray) -> np.ndarray:
+    """Erased features back to fp32 for the READOUT ONLY -- never for the identity probe.
+
+    ``LeaceEraser.__call__`` returns fp64 by construction -- the erasure algebra needs it. Feeding
+    that straight to ``_lam_grid`` silently broke the readout's own precision contract
+    (``v3_board_readout._lam_grid``: "GEMMs are fp32 (memory), G/solve are fp64"), because
+    ``_feat`` hands every OTHER arm fp32. So the leace arm was paying a doubled GEMM and a doubled
+    footprint, and -- worse -- was not numerically matched to the std arm it is differenced
+    against. The Gram and the eigensolve stay fp64 either way; only the GEMM operand narrows.
+
+    NOT applicable to ``_probe_auc``: its ``rcond=1e-8`` sits BELOW fp32 epsilon (1.2e-7), so in
+    fp32 the cutoff cannot separate the erased direction from the noise floor and admits junk
+    directions into the weight vector. Measured on synthetic data: ``id_auc_after`` moved
+    0.448 -> 0.428 -- still at chance, but that is the erasure GUARD and it is not for trading.
+    """
+    return np.asarray(a, dtype=np.float32)
+
+
 def _probe_auc(x_tr, y_tr, x_te, y_te) -> float:
     """rcond is load-bearing: erased features are rank-deficient and pinv's default tolerance
     inverts the erased direction into a ~1e14-norm weight vector, which reads as 'erasure
-    failed' when it is numerical blow-up in the probe."""
+    failed' when it is numerical blow-up in the probe.
+
+    Solved through the SVD rather than ``pinv(A) @ b``. Identical arithmetic -- numpy's pinv IS
+    this SVD with cutoff ``rcond * s.max()`` -- but pinv MATERIALISES the (d, n) pseudo-inverse
+    first, which at d=93184 x n=3572 is a 2.7 GB fp64 temporary built solely to be collapsed
+    against one vector, twice per (task, tap).
+    """
     mu = x_tr.mean(0)
-    w = np.linalg.pinv(x_tr - mu, rcond=1e-8) @ (y_tr - y_tr.mean())
+    u, s, vt = np.linalg.svd(x_tr - mu, full_matrices=False)
+    keep = s > (s[0] * 1e-8 if s.size and s[0] > 0 else 0.0)
+    w = vt[keep].T @ ((u[:, keep].T @ (y_tr - y_tr.mean())) / s[keep])
     return B.auroc((x_te - mu) @ w, y_te - 0.5)
 
 
@@ -85,9 +111,13 @@ def _identity_checks(z_a, z_t, n_components, seed=33):
     y_held = np.r_[np.zeros(len(z_a) - ha), np.ones(len(z_t) - ht)]
     if min(y_fit.sum(), len(y_fit) - y_fit.sum(), y_held.sum(), len(y_held) - y_held.sum()) < 2:
         return float("nan"), float("nan")
-    before = _probe_auc(fit, y_fit, held, y_held)
+    # Both sides fp64. `fit` arrives fp32 from `_feat` and `er(fit)` is fp64, so before/after
+    # would otherwise be measured in different precisions -- matched by PROMOTING, because
+    # `_probe_auc`'s rcond is only meaningful in fp64 (see `_f32`).
+    fit64, held64 = fit.astype(np.float64), held.astype(np.float64)
+    before = _probe_auc(fit64, y_fit, held64, y_held)
     er = fit_leace(fit, y_fit.astype(int), n_components=n_components)
-    after = _probe_auc(er(fit), y_fit, er(held), y_held)
+    after = _probe_auc(er(fit64), y_fit, er(held64), y_held)
     return before, after
 
 
@@ -134,7 +164,7 @@ def _cs_cell_arms(anchor_rec, test_rec, task, taps, n_components) -> dict:
               f"(floor {1.0 / rank:.5f}) | {'OK' if abs(after - 0.5) < 0.10 else 'ERASURE DID NOT TRANSFER'}",
               flush=True)
 
-        e_tr, e_va, e_te = eraser(z_tr), eraser(z_va), eraser(z_te)
+        e_tr, e_va, e_te = (_f32(eraser(z)) for z in (z_tr, z_va, z_te))
         a, (b, c) = B._standardize_inplace(e_tr, [e_va, e_te])
         grid[(enc, "leace")] = B._lam_grid(a, y_a[tr], evals(b, c))
 
@@ -199,6 +229,9 @@ def main() -> None:
         print(f"  [wrote] {len(out)}/{len(tasks)} tasks -> {dest}", flush=True)
 
     print(f"[done] {dest}  ({len(out)} tasks)", flush=True)
+    # Where the hours actually went. The 07-28 array shipped no attribution, so "the SVD is the
+    # bill" stayed an estimate for a run costing ~390 core-h per cell.
+    B._phase_report(f"cs_leace {cell} taps={','.join(taps)}")
 
 
 if __name__ == "__main__":
