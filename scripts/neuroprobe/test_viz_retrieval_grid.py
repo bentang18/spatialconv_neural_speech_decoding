@@ -6,7 +6,7 @@ import numpy as np
 from scripts.neuroprobe.test_viz_figures import BL, C, T, TEMPORAL, _pattern
 from scripts.neuroprobe.viz_common import load_all, shared_lobes
 from scripts.neuroprobe.viz_figures import retrieval, retrieval_sims
-from scripts.neuroprobe.viz_retrieval_grid import grid
+from scripts.neuroprobe.viz_retrieval_grid import _time_ticks, grid
 
 TAPS = ("enc0", "enc12")
 SIG, NULL = "onset", "frame_brightness"
@@ -107,3 +107,25 @@ def test_a_task_absent_from_the_shards_is_dropped_not_crashed(tmp_path) -> None:
     info = grid(sessions, lobes, ["enc12"], [SIG, "not_a_real_task"],
                 str(tmp_path / "g2.png"))
     assert info["tasks"] == [SIG]
+
+
+def test_time_ticks_put_zero_at_the_onset_frame() -> None:
+    """The whole point of labelling the axis is locating t=0. A tick grid anchored on frame 0
+    instead of on the onset would put the '0' label wherever the window happened to start."""
+    ticks, labels = _time_ticks(64, 32.0, -0.5)
+    # No "1.5" tick: frame 63 is CENTERED at 1.469 s, so imshow's last cell ends before the
+    # 1.5 s mark. Drawing it would put a label outside the data it claims to index.
+    assert labels == ["-0.5", "0", "0.5", "1"]
+    assert ticks[labels.index("0")] == 16.0, "t=0 must land on the n_pre frame"
+    assert all(-0.5 <= t <= 63.5 for t in ticks), "no tick may sit outside the panel"
+
+
+def test_time_ticks_survive_a_window_that_does_not_straddle_zero() -> None:
+    """The 1 s window has no pre-stimulus frames; the helper must not invent a negative tick."""
+    ticks, labels = _time_ticks(32, 32.0, 0.0)
+    assert labels[0] == "0" and ticks[0] == 0.0
+    assert all(float(x) >= 0 for x in labels)
+
+
+def test_time_ticks_are_empty_without_a_sampling_rate() -> None:
+    assert _time_ticks(64, 0.0, -0.5) == ([], [])

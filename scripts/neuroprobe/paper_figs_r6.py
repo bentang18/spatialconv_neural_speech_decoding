@@ -2,7 +2,11 @@
 
 Fig 2  tap ladder + leaderboard          <- results/r6_era/board/*.json
 Fig 3  LEACE identity erasure            <- results/r6_era/leace/leace_S*.json
-Fig 4  concentration (3-PC vs full)      <- results/viz_crosssubject/win{1,2}s/report.json
+Fig 4  concentration (3-PC vs full)      <- viz_crosssubject/archive/win{1,2}s/report.json
+
+Fig 4 reads the ARCHIVED 6-task runs on purpose, not the 8-task showcase: its negative
+control is `frame_brightness`, which the 8-task menu deliberately excludes. The menu is the
+basis, so the two are different quantities and the control only exists in the older run.
 
 Every panel recomputes its numbers from the raw per-cell rows and ASSERTS them against the
 values already established, printing [check] lines. A figure that silently disagrees with the
@@ -29,7 +33,8 @@ import matplotlib.transforms as mtransforms  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RES = ROOT / "results"
-OUT = RES / "paper_figs"
+OUT = RES / "showcase/paper"
+VIZ = RES / "viz_crosssubject/archive"
 TAPS = ["enc0", "enc3", "enc6", "enc12"]
 
 # Neuroprobe CS leaderboard, same board/split. Decoder is NOT held constant across these
@@ -154,7 +159,7 @@ def fig3() -> None:
             checks[tap].append(
                 statistics.fmean.__self__ if False else
                 {k: statistics.fmean(d[t]["checks"][tap][k] for t in d)
-                 for k in ("id_auc_before", "id_auc_after", "var_removed", "residual_cov")}
+                 for k in ("id_auc_before", "id_auc_after", "var_removed", "residual_cov", "d")}
             )
         per_cell[cell] = row
 
@@ -168,6 +173,10 @@ def fig3() -> None:
         stats[f"{tap}|auc_after"] = statistics.fmean(c["id_auc_after"] for c in ck)
         stats[f"{tap}|var"] = statistics.fmean(c["var_removed"] for c in ck)
         stats[f"{tap}|resid"] = max(c["residual_cov"] for c in ck)
+        # The eraser is RANK 1 (binary anchor-vs-test concept), so `var_removed` is the share
+        # carried by ONE direction out of d. Without d on the panel, "20.7%" reads as an
+        # ordinary chunk of a representation rather than the striking thing it is.
+        stats[f"{tap}|d"] = statistics.fmean(c["d"] for c in ck)
 
     for tap in ("enc0", "enc12"):
         m, t = stats[f"{tap}|leace"]
@@ -199,7 +208,11 @@ def fig3() -> None:
     for i, t in enumerate(taps2):
         ax.text(i, stats[f"{t}|var"] * 100 + 0.4, f"{stats[f'{t}|var']*100:.1f}%",
                 ha="center", fontsize=7)
-    ax.set_xticks(range(2)); ax.set_xticklabels(taps2)
+    ax.set_xticks(range(2))
+    # d on the tick label, because the eraser is rank 1: "20.7%" is an ordinary-looking number
+    # until you see it is ONE direction out of ~77k.
+    ax.set_xticklabels([f"{t}\n(1 dir of {stats[f'{t}|d']/1000:.1f}k)" for t in taps2],
+                       fontsize=7)
     ax.set_ylabel("% of variance removed"); ax.set_title("...and deletes far more at depth")
 
     ax = axes[2]
@@ -232,7 +245,7 @@ def fig3() -> None:
 def fig4() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(6.6, 2.4), sharey=True)
     for ax, win in zip(axes, ("win1s", "win2s")):
-        rep = json.load(open(RES / "viz_crosssubject" / win / "report.json"))
+        rep = json.load(open(VIZ / win / "report.json"))
         # Figure keys are flat "<lobe>/<tap>"; the shared-lobe panel is "T". The 1 s suite was
         # run WITHOUT enc0, so each window gets its own tap list rather than a shared constant.
         have = [t for t in TAPS if f"T/{t}" in rep["figures"]]

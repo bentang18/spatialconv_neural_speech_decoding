@@ -32,6 +32,21 @@ from scripts.neuroprobe.viz_common import load_all, shared_lobes  # noqa: E402
 from scripts.neuroprobe.viz_figures import retrieval_sims  # noqa: E402
 
 
+def _time_ticks(t_len: int, hz: float, offset: float, step: float = 0.5):
+    """Frame indices and second-labels at `step`-second marks inside the window.
+
+    Anchored on t=0 rather than on frame 0, so the onset tick is always present and always
+    labelled '0' -- the reader is looking for where the word starts, not where the array does.
+    """
+    if not hz:
+        return [], []
+    k0, k1 = np.ceil(offset / step), np.floor((offset + t_len / hz) / step)
+    secs = [round(k * step, 3) for k in np.arange(k0, k1 + 1)]
+    ticks = [(s - offset) * hz for s in secs]
+    keep = [(t, s) for t, s in zip(ticks, secs) if -0.5 <= t <= t_len - 0.5]
+    return [t for t, _ in keep], [f"{s:g}" for _, s in keep]
+
+
 def _cells(sessions, lobes, taps, tasks, n_pre):
     """(task, tap) -> (mean similarity matrix, stats). Missing combinations are dropped."""
     out = {}
@@ -75,24 +90,34 @@ def grid(sessions, lobes, taps, tasks, out_path: str, *, n_pre: int | None = Non
             xr = st["top1"] / st["chance"]
             ax.set_title(f"{xr:.1f}x chance · rank {st['median_rank']:.0f}/{t_len}",
                          fontsize=7.5, pad=3)
-            ax.set_xticks([])
-            ax.set_yticks([])
+            # Ticks in SECONDS, not frame index. Without them the t=0 rule is just a white
+            # line and the reader cannot tell whether the bright block sits before or after
+            # the word -- which is the whole question the panel is being asked.
+            ticks, labels = _time_ticks(t_len, hz, offset)
+            ax.set_xticks(ticks)
+            ax.set_yticks(ticks)
+            ax.set_xticklabels(labels if i == nrow - 1 else [], fontsize=6.5)
+            ax.set_yticklabels(labels if j == 0 else [], fontsize=6.5)
+            ax.tick_params(length=2, width=0.5, pad=1.5)
+            if i == nrow - 1:
+                ax.set_xlabel("subject B time (s)", fontsize=7.5, labelpad=1)
             if i == 0:
                 ax.text(0.5, 1.30, tap, transform=ax.transAxes, ha="center", va="bottom",
                         fontsize=12, fontweight="bold")
             if j == 0:
+                ax.set_ylabel("subject A time (s)", fontsize=7.5, labelpad=1)
+                # Task name goes OUTSIDE the ylabel, which now belongs to the tick units.
                 lab = task + ("\n(null control)" if task == null_task else "")
-                ax.set_ylabel(lab, fontsize=9,
-                              fontweight="bold" if task == null_task else "normal")
+                ax.text(-0.42, 0.5, lab, transform=ax.transAxes, ha="center", va="center",
+                        rotation=90, fontsize=9,
+                        fontweight="bold" if task == null_task else "normal")
     if im is not None:
         cb = fig.colorbar(im, ax=axes, fraction=0.018, pad=0.015)
         cb.set_label("mean cross-subject token similarity (one scale for every cell)",
                      fontsize=8)
-    n_frames = next(st["n_frames"] for _, st in cells.values())
-    span = f"  ·  window {offset:+.2f} to {offset + n_frames / hz:+.2f} s" if hz else ""
     fig.suptitle("Cross-subject token retrieval, depth left to right"
-                 "  ·  rows: subject A frame, columns: subject B frame"
-                 "  ·  dotted line = the correct match" + span, fontsize=10.5)
+                 "  ·  dotted line = the correct match"
+                 "  ·  white rules = word onset (t=0)", fontsize=10.5)
     fig.savefig(out_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
     return {"tasks": tasks, "taps": list(taps), "vmax": hi, "null_task": null_task,
