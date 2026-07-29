@@ -629,6 +629,363 @@ def fig4() -> None:
           ", ".join(f"{w} {n}/{d}" for w, n, d in holds))
 
 
+# ------------------------------------------------- fig 5/6: the per-task breakdown
+# Why these two figures exist: the macro ladder in fig 2 is a single number, and a single
+# number cannot answer "are you only improving the trivially easy perceptual tasks". That is a
+# per-TASK question, so it gets per-task panels. CS is the only regime that can carry them --
+# it is the one with all four taps (WS/CSession wrote elec taps 0 and 12 only).
+#
+# FAMILY LABELS ARE THE LEDGER'S, NOT REFIT HERE. event/level is the established split
+# (`project-what-transfers-is-change-coded-not-speech-2026-07-29`): does the label track a
+# CHANGE/EVENT or a SUSTAINED LEVEL. It is transcribed, so these figures cannot quietly
+# invent a grouping that flatters the ladder.
+EVENT = ("onset", "speech", "delta_volume", "word_index", "word_head_pos",
+         "word_length", "gpt2_surprisal", "word_gap", "word_part_speech")
+LEVEL = ("volume", "pitch", "local_flow", "global_flow", "face_num", "frame_brightness")
+# Modality is a SEPARATE axis from family and is tagged, not coloured: `volume`/`pitch` are
+# acoustic yet group with the visual tasks because they are levels. Collapsing the two axes
+# into one colour is exactly the confusion the ledger warns about.
+VISUAL = ("local_flow", "global_flow", "face_num", "frame_brightness")
+FAM_COLOR = {"event": "#1f4e79", "level": "#d98324"}
+
+
+def _cells_by_task(path: pathlib.Path) -> dict[str, dict[str, dict[str, float]]]:
+    """task -> tap -> cell -> AUROC, on the cell set shared by all four taps.
+
+    Same intersection discipline as `ladder`: "partial cells lie" applies per task as hard as
+    it does to the macro.
+    """
+    d = json.load(open(path))
+    out: dict[str, dict[str, dict[str, float]]] = {}
+    for key, blob in d.items():
+        cs = blob.get("cs")
+        if not cs:
+            continue
+        cols = {t: cs.get(f"{t}|std") for t in TAPS}
+        if any(c is None for c in cols.values()):
+            continue
+        shared = sorted(set.intersection(*(set(c) for c in cols.values())))
+        if shared:
+            out[key.split("|")[1]] = {t: {c: cols[t][c] for c in shared} for t in TAPS}
+    return out
+
+
+def _k(cells: dict[str, dict[str, float]], tap: str) -> float:
+    """Scale-free gain at `tap`: no-intercept slope of (tap - .5) on (enc0 - .5) over cells.
+
+    THIS IS THE UNIT THE PER-TASK COMPARISON MUST USE, and the reason is the whole point of
+    fig 6. A task's raw AUROC gain is bounded by its headroom: `onset` sits ~.245 above chance
+    and `word_gap` ~.032, so the SAME multiplicative improvement prints ~8x larger on `onset`.
+    Plotting raw AUROC points per task therefore manufactures "it only helps the easy tasks"
+    out of the axis choice alone.
+
+    A per-cell ratio would be the naive fix and it is a trap -- dividing by an enc0 that sits
+    .003 above chance explodes (`face_num` -> 2.8, `frame_brightness` -> negative). The
+    no-intercept slope is the same quantity weighted by (enc0 - .5)^2, so near-chance cells
+    contribute in proportion to how much signal they actually had. k = 1 means "depth changed
+    nothing", k > 1 a multiplicative gain, k < 1 active degradation. k(enc0) == 1 by identity.
+    """
+    x = cells["enc0"]
+    y = cells[tap]
+    num = sum((x[c] - 0.5) * (y[c] - 0.5) for c in x)
+    den = sum((x[c] - 0.5) ** 2 for c in x)
+    return num / den
+
+
+# The ledger's per-task k table, transcribed from
+# `project-what-transfers-is-change-coded-not-speech-2026-07-29`. Asserted, not recomputed
+# into agreement: if the estimator here ever drifts from the one that produced the finding,
+# this figure must fail loudly rather than publish a second, quietly different number.
+LEDGER_K = {
+    "word_length": 1.557, "word_head_pos": 1.330, "word_gap": 1.320, "gpt2_surprisal": 1.274,
+    "word_index": 1.259, "onset": 1.252, "speech": 1.229, "delta_volume": 1.146,
+    "word_part_speech": 1.116, "volume": 1.068, "local_flow": 1.032, "global_flow": 0.932,
+    "face_num": 0.827, "frame_brightness": 0.746, "pitch": 0.642,
+}
+
+
+def per_task_cs() -> dict[str, dict]:
+    """task -> raw macros per tap, k per tap, paired raw delta, family. Averaged over 4 ckpts.
+
+    Four checkpoints, because a per-task number off ONE checkpoint is a coin flip at this
+    effect size. They are one training TRAJECTORY, not four seeds -- so this controls for
+    step/cooldown and for nothing else, which is why no seed claim is made anywhere here.
+    """
+    boards = {name: _cells_by_task(RES / "r6_era/board" / f) for name, f in CKPTS.items()}
+    tasks = sorted(set.intersection(*(set(b) for b in boards.values())))
+    out: dict[str, dict] = {}
+    for t in tasks:
+        per_ck = [boards[n][t] for n in CKPTS]
+        ncell = {len(c["enc0"]) for c in per_ck}
+        assert ncell == {10}, f"[check] VIOLATED {t} cell counts {ncell}, want 10 everywhere"
+        row: dict = {"cells": 10, "family": "event" if t in EVENT else "level"}
+        for tap in TAPS:
+            row[tap] = statistics.fmean(statistics.fmean(c[tap].values()) for c in per_ck)
+            row[f"k_{tap}"] = statistics.fmean(_k(c, tap) for c in per_ck)
+        # Paired per cell: the SEM of the per-cell DIFFERENCE, not a combination of two
+        # marginal SEMs. Unpaired bars on a paired contrast overstate the uncertainty.
+        diffs = [statistics.fmean(c["enc12"][x] - c["enc0"][x] for c in per_ck)
+                 for x in per_ck[0]["enc0"]]
+        row["delta"] = statistics.fmean(diffs)
+        row["delta_sem"] = statistics.stdev(diffs) / len(diffs) ** 0.5
+        ks = [_k(c, "enc12") for c in per_ck]
+        row["k_spread"] = max(ks) - min(ks)
+        out[t] = row
+    return out
+
+
+def board_per_task() -> tuple[dict[str, float], dict[str, float], str]:
+    """(best-of-any-entry per task, top-macro entry per task, top-macro entry name).
+
+    Two different bars, and the difference matters. `best` is a max over 10 submissions taken
+    per task INDEPENDENTLY, so it is a hypothetical model nobody submitted and it is biased in
+    the board's favour -- that is the strict bar. `top` is the single highest-macro entry (the
+    CNN), which is the honest like-for-like opponent. Reporting only one of them would be
+    picking the comparison after seeing the answer.
+    """
+    lb = json.load(open(RES / "neuroprobe_leaderboard_cs.json"))
+    for name, v in lb.items():
+        assert v["n_cells"] == 10 and v["n_tasks"] == 15, \
+            f"[check] VIOLATED leaderboard entry {name} is not 10 cells x 15 tasks"
+    top_name, top = max(lb.items(), key=lambda kv: kv[1]["macro"])
+    tasks = top["per_task"].keys()
+    best = {t: max(v["per_task"][t] for v in lb.values()) for t in tasks}
+    return best, dict(top["per_task"]), top_name
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+    den = (sum((a - mx) ** 2 for a in xs) * sum((b - my) ** 2 for b in ys)) ** 0.5
+    return num / den
+
+
+def _spearman(xs: list[float], ys: list[float]) -> float:
+    def rank(v: list[float]) -> list[float]:
+        order = sorted(range(len(v)), key=lambda i: v[i])
+        r = [0.0] * len(v)
+        for pos, i in enumerate(order):
+            r[i] = float(pos)
+        return r
+    return _pearson(rank(xs), rank(ys))
+
+
+def fig5() -> None:
+    """Per-task depth ladder in SCALE-FREE units. The figure Greg's objection asks for.
+
+    The ladder is drawn in k, not AUROC points, and that is the one design decision in this
+    figure that matters -- see `_k`. In AUROC points the panels would be ordered almost
+    perfectly by how much headroom each task started with, which is a fact about the axis and
+    not about the encoder. Raw AUROC is still printed inside every panel, so the absolute
+    scale is available and the normalisation hides nothing.
+    """
+    rows = per_task_cs()
+    assert len(rows) == 15, f"[check] VIOLATED need all 15 Lite tasks, got {len(rows)}"
+    assert set(rows) == set(LEDGER_K), "[check] VIOLATED task menu != the ledger's k table"
+    for t, r in rows.items():
+        assert abs(r["k_enc12"] - LEDGER_K[t]) < 5e-4, (
+            f"[check] VIOLATED k({t}) = {r['k_enc12']:.4f} but the ledger says "
+            f"{LEDGER_K[t]:.3f} -- the estimator has drifted from the finding")
+        assert abs(r["k_enc0"] - 1.0) < 1e-9, f"[check] VIOLATED k(enc0) != 1 for {t}"
+    print(f"[check] OK all 15 per-task k reproduce the ledger table to <5e-4")
+
+    ev = sorted(rows[t]["k_enc12"] for t in EVENT)
+    lv = sorted(rows[t]["k_enc12"] for t in LEVEL)
+    assert ev[0] > lv[-1], "[check] VIOLATED the 9/9 event-over-level split does not hold"
+    print(f"[check] OK 9/9 split, ZERO interleaving: event k >= {ev[0]:.3f} "
+          f"(mean {statistics.fmean(ev):.3f}) > level k <= {lv[-1]:.3f} "
+          f"(mean {statistics.fmean(lv):.3f})")
+
+    order = sorted(rows, key=lambda t: -rows[t]["k_enc12"])
+    rank = {t: i + 1 for i, t in enumerate(order)}
+    print(f"[check] in k units onset ranks {rank['onset']}/15 and speech {rank['speech']}/15 "
+          f"-- MID-PACK, beaten by " + ", ".join(order[:rank['onset'] - 1]))
+    assert rank["onset"] > 4 and rank["speech"] > 4, (
+        "[check] VIOLATED onset/speech are top-4 in k units, so the objection would stand")
+
+    fig, axes = plt.subplots(3, 5, figsize=(9.8, 5.6), sharey=True)
+    # SHARED y-axis, which only becomes possible in k units -- the whole menu lives in
+    # 0.6..1.6. In AUROC points a shared axis was impossible (tasks span .49 to .82), which is
+    # itself a sign that AUROC points are the wrong unit for a 15-panel comparison.
+    lo = min(r[f"k_{tp}"] for r in rows.values() for tp in TAPS)
+    hi = max(r[f"k_{tp}"] for r in rows.values() for tp in TAPS)
+    pad = 0.09 * (hi - lo)
+    for ax, t in zip(axes.ravel(), order):
+        r = rows[t]
+        col = FAM_COLOR[r["family"]]
+        ys = [r[f"k_{tp}"] for tp in TAPS]
+        ax.axhline(1.0, color="k", lw=0.7, ls=":", alpha=0.6, zorder=1)
+        ax.plot(range(4), ys, marker="o", ms=3.6, lw=1.6, color=col, zorder=3)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_xlim(-0.35, 3.35)
+        ax.set_xticks(range(4))
+        ax.set_xticklabels(["0", "3", "6", "12"], fontsize=6)
+        ax.tick_params(labelsize=6)
+        tag = " ·visual" if t in VISUAL else ""
+        ax.set_title(f"{rank[t]}. {t.replace('_', ' ')}{tag}", fontsize=7.2, color=col, pad=3)
+        ax.text(0.04, 0.955, f"k {r['k_enc12']:.3f}", fontsize=6.4, fontweight="bold",
+                transform=ax.transAxes, va="top", ha="left", color=col)
+        # The raw numbers stay ON the panel. Normalising the axis is a fix for a misleading
+        # comparison, not a licence to withhold the absolute effect: a reader must be able to
+        # see that word_length's k of 1.56 is +.026 AUROC on a task that starts at .529.
+        # Placed in whichever vertical half the trace is NOT in -- the declining level panels
+        # (pitch, frame_brightness, face_num) run straight through a fixed bottom-right slot.
+        high = statistics.fmean(ys) > (lo + hi) / 2
+        ax.text(0.96, 0.05 if high else 0.95,
+                f"{r['enc0']:.3f}→{r['enc12']:.3f}\nΔ{r['delta']:+.4f}", fontsize=5.5,
+                transform=ax.transAxes, va="bottom" if high else "top", ha="right",
+                color="#555")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("k  (scale-free gain)", fontsize=7)
+    for ax in axes[-1, :]:
+        ax.set_xlabel("encoder depth", fontsize=7)
+
+    handles = [plt.Line2D([], [], color=FAM_COLOR["event"], lw=1.6, marker="o", ms=3.6,
+                          label="event / change-coded label (9)"),
+               plt.Line2D([], [], color=FAM_COLOR["level"], lw=1.6, marker="o", ms=3.6,
+                          label="sustained-level label (6)"),
+               plt.Line2D([], [], color="k", lw=0.7, ls=":", alpha=0.6,
+                          label="k = 1: depth changed nothing")]
+    fig.legend(handles=handles, fontsize=6.7, loc="upper center", bbox_to_anchor=(0.5, 0.055),
+               ncol=3, columnspacing=1.8, handlelength=2.6)
+    fig.suptitle("Cross-subject depth ladder, per task, in scale-free units  ·  panels ranked "
+                 f"by k(enc12)  ·  10/10 held-out cells  ·  mean of {len(CKPTS)} checkpoints",
+                 fontsize=8.2, y=1.0)
+    fig.text(0.5, 0.012, f"k = no-intercept slope of (AUROC−.5) on (enc0−.5) over the 10 cells, "
+             f"so k(enc0)=1 by construction  ·  all 9 event tasks rank above all 6 level tasks "
+             f"(k ≥ {ev[0]:.3f} vs ≤ {lv[-1]:.3f}), and onset/speech sit "
+             f"{rank['onset']}th/{rank['speech']}th", ha="center", fontsize=6.3,
+             color=PALETTE["muted"])
+    fig.tight_layout(rect=(0, 0.075, 1, 0.985))
+    _save(fig, "fig5cs_per_task_ladder")
+
+
+def fig6() -> None:
+    """"It only helps the easy tasks" -- three panels: concede, dissolve, then independent check.
+
+    A concedes the objection in the units it was raised in. B shows it is an artifact of those
+    units. C stops arguing about our internal ladder altogether and asks the question the paper
+    actually rests on -- where do we beat the BOARD -- which needs no normalisation at all,
+    because it compares two models on the same task with the same headroom.
+    """
+    rows = per_task_cs()
+    best, top, top_name = board_per_task()
+    assert set(best) == set(rows), "[check] VIOLATED leaderboard task menu != ours"
+    tasks = sorted(rows)
+    x = [rows[t]["enc0"] for t in tasks]
+
+    rho_raw = _spearman(x, [rows[t]["delta"] for t in tasks])
+    r_raw = _pearson(x, [rows[t]["delta"] for t in tasks])
+    rho_k = _spearman(x, [rows[t]["k_enc12"] for t in tasks])
+    r_k = _pearson(x, [rows[t]["k_enc12"] for t in tasks])
+    print(f"[check] easiness vs RAW Δ: pearson {r_raw:+.3f} spearman {rho_raw:+.3f}  "
+          f"-> his read is CORRECT in AUROC points")
+    print(f"[check] easiness vs k     : pearson {r_k:+.3f} spearman {rho_k:+.3f}  "
+          f"-> the correlation DISSOLVES once the units are scale-free")
+    assert r_raw > 0.6, "[check] VIOLATED panel A must CONCEDE a strong raw correlation"
+    assert abs(r_k) < 0.45 and abs(r_k) < r_raw / 2, \
+        "[check] VIOLATED panel B claims the correlation dissolves; it did not"
+
+    marg = {t: rows[t]["enc12"] - best[t] for t in tasks}
+    rho_m = _spearman(x, [marg[t] for t in tasks])
+    ranks = sorted(tasks, key=lambda t: -marg[t])
+    n_win = sum(v > 0 for v in marg.values())
+    print(f"[check] margin over per-task board best: wins {n_win}/15; "
+          f"onset {ranks.index('onset') + 1}/15 ({marg['onset']:+.4f}), "
+          f"speech {ranks.index('speech') + 1}/15 ({marg['speech']:+.4f}); "
+          f"biggest = {ranks[0]} ({marg[ranks[0]]:+.4f}); spearman(easiness, margin) {rho_m:+.3f}")
+    assert marg["volume"] > marg["speech"], \
+        "[check] VIOLATED panel C rests on volume out-margining speech"
+
+    fig, (ax, axk, ax2) = plt.subplots(1, 3, figsize=(11.4, 3.6),
+                                       width_ratios=[1, 1, 1.15])
+
+    def _scatter(a, ys, ylab, title):
+        for t in tasks:
+            a.plot(rows[t]["enc0"], ys[t], marker="o", ms=4.8,
+                   color=FAM_COLOR[rows[t]["family"]], zorder=3)
+        # 15 labels in a crowded lower-left corner overlap into illegibility at a fixed offset,
+        # and an unreadable label is the same as a missing one. Candidates are tried in order and
+        # the first that does not collide with an already-placed box wins; measured against the
+        # real renderer, so it holds at whatever dpi the PDF is written at.
+        placed: list = []
+        for t in sorted(tasks, key=lambda t: -ys[t]):
+            for dx, dy, ha in ((3.4, 2.6, "left"), (-3.4, 2.6, "right"),
+                               (3.4, -7.4, "left"), (-3.4, -7.4, "right")):
+                txt = a.annotate(t.replace("_", " "), (rows[t]["enc0"], ys[t]), fontsize=5.6,
+                                 xytext=(dx, dy), textcoords="offset points", color="#444",
+                                 ha=ha)
+                a.figure.canvas.draw()
+                box = txt.get_window_extent()
+                if not any(box.overlaps(b) for b in placed):
+                    placed.append(box)
+                    break
+                txt.remove()
+            else:
+                placed.append(a.annotate(t.replace("_", " "), (rows[t]["enc0"], ys[t]),
+                                         fontsize=5.6, xytext=(3.4, 2.6),
+                                         textcoords="offset points",
+                                         color="#444").get_window_extent())
+        # The minimal pair is the within-difficulty control: the SAME physical signal read as a
+        # level and as a rate of change, at nearly matched enc0. Pure difficulty predicts these
+        # two move together.
+        a.annotate("", xy=(rows["delta_volume"]["enc0"], ys["delta_volume"]),
+                   xytext=(rows["volume"]["enc0"], ys["volume"]),
+                   arrowprops=dict(arrowstyle="->", lw=1.1, color="k", shrinkA=6, shrinkB=6))
+        a.set_xlabel("enc0 cross-subject AUROC  (how easy the task already is)")
+        a.set_ylabel(ylab)
+        a.set_title(title, fontsize=8, pad=6)
+
+    _scatter(ax, {t: rows[t]["delta"] for t in tasks}, "Δ AUROC  (enc12 − enc0)",
+             f"A. Conceded, in AUROC points\npearson {r_raw:+.2f}, spearman {rho_raw:+.2f}"
+             " — gain tracks easiness")
+    ax.axhline(0, color="k", lw=0.7)
+    _scatter(axk, {t: rows[t]["k_enc12"] for t in tasks}, "k  (scale-free gain)",
+             f"B. The same data, scale-free\npearson {r_k:+.2f}, spearman {rho_k:+.2f}"
+             " — it dissolves")
+    axk.axhline(1.0, color="k", lw=0.7, ls=":")
+
+    ys = sorted(tasks, key=lambda t: marg[t])
+    for i, t in enumerate(ys):
+        named = t in ("onset", "speech")
+        ax2.barh(i, marg[t], color=FAM_COLOR[rows[t]["family"]], height=0.66,
+                 alpha=1.0 if named else 0.45)
+        # Negative bars grow LEFT toward the tick labels, so their value goes on the free right
+        # side of zero rather than on top of the task name.
+        ax2.text(marg[t] + 0.0016 if marg[t] >= 0 else 0.0016, i, f"{marg[t]:+.4f}",
+                 va="center", ha="left", fontsize=6.2)
+    ax2.axvline(0, color="k", lw=0.8)
+    ax2.set_yticks(range(len(ys)))
+    ax2.set_yticklabels([f"{t.replace('_', ' ')}{'  ←' if t in ('onset', 'speech') else ''}"
+                         for t in ys], fontsize=6.8)
+    ax2.set_xlim(-0.032, 0.084)
+    ax2.set_xlabel("our enc12 − best Neuroprobe entry for that task")
+    # ρ is stated even though it is INCONVENIENT: margin still tracks easiness at +.62, so this
+    # panel is not a clean refutation and must not be captioned as one. What it does show is
+    # that the ordering is not the objection's ordering -- `speech` ranks 11th of 15 and the top
+    # margin is a task the board leaves near chance.
+    ax2.set_title(f"C. Independent: where we beat the BOARD\nwins {n_win}/15  ·  onset "
+                  f"{ranks.index('onset') + 1}/15, speech {ranks.index('speech') + 1}/15 by "
+                  f"margin  ·  ρ(easiness) {rho_m:+.2f}", fontsize=8, pad=6)
+
+    handles = [plt.Line2D([], [], color=FAM_COLOR["event"], lw=0, marker="o", ms=5,
+                          label="event / change-coded (9)"),
+               plt.Line2D([], [], color=FAM_COLOR["level"], lw=0, marker="o", ms=5,
+                          label="sustained-level (6)"),
+               plt.Line2D([], [], color="k", lw=1.0,
+                          label="arrow = volume → delta_volume (same signal, level vs change)"),
+               plt.Line2D([], [], color="#888", lw=0, marker="s", ms=5,
+                          label="solid bar = the two tasks the objection names")]
+    fig.legend(handles=handles, fontsize=6.6, loc="upper center", bbox_to_anchor=(0.5, 0.075),
+               ncol=4, columnspacing=1.5, handlelength=2.2)
+    fig.text(0.5, 0.008, "panel C needs no normalisation: it compares two models on the SAME "
+             "task, so headroom cancels  ·  board bar is the strict one (per-task max over all "
+             "10 submissions, a model nobody submitted)", ha="center", fontsize=6.2,
+             color=PALETTE["muted"])
+    fig.tight_layout(rect=(0, 0.10, 1, 1))
+    _save(fig, "fig6cs_gain_vs_difficulty")
+
+
 def _save(fig, stem: str) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
@@ -639,10 +996,11 @@ def _save(fig, stem: str) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["2", "2ws", "2cs", "3", "4"], default=None)
+    ap.add_argument("--only", choices=["2", "2ws", "2cs", "3", "4", "5", "6"], default=None)
     a = ap.parse_args()
     _style()
-    for n, fn in (("2", fig2), ("2ws", fig2_ws), ("2cs", fig2_cs), ("3", fig3), ("4", fig4)):
+    for n, fn in (("2", fig2), ("2ws", fig2_ws), ("2cs", fig2_cs), ("3", fig3), ("4", fig4),
+                  ("5", fig5), ("6", fig6)):
         if a.only in (None, n):
             print(f"=== fig {n}")
             fn()
