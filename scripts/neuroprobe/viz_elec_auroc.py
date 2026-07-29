@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 
 import numpy as np
@@ -584,12 +585,23 @@ def self_test(seed: int = 0) -> None:
 
 # --------------------------------------------------------------------------------------
 def main() -> None:
+    # argv is scanned for --self-test before ANY project import, so the pre-flight check runs
+    # in a bare numpy environment. It is the thing you want to be able to run when the module
+    # env is wrong, which is exactly when a heavyweight import would stop you running it.
+    if "--self-test" in sys.argv:
+        seed = 33
+        if "--seed" in sys.argv:
+            seed = int(sys.argv[sys.argv.index("--seed") + 1])
+        self_test(seed)
+        return
+
     from scripts.neuroprobe.viz_anatomy import TASKS
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--self-test", action="store_true",
-                   help="verify the statistic on synthetic data and exit (no cache needed)")
+                   help="verify the statistic on synthetic data and exit (needs no cache and no "
+                        "project imports -- handled before argparse so it runs in a bare env)")
     p.add_argument("--cache", help="encode cache dir written by v3_probe_encode_r4")
     p.add_argument("--out-dir", default="results/elec_auroc")
     p.add_argument("--session-index", type=int, default=-1,
@@ -618,11 +630,6 @@ def main() -> None:
                    help="maxstat = FWER over the whole map (use for any per-contact claim); "
                         "fdr = BH on pooled-null p, more sensitive but expects false positives")
     a = p.parse_args()
-
-    if a.self_test:
-        self_test(a.seed)
-        return
-
     taps = tuple(t for t in a.taps.split(",") if t)
     tasks = tuple(t for t in a.tasks.split(",") if t)
 

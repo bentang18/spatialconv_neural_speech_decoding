@@ -56,8 +56,6 @@ import os
 
 import numpy as np
 
-from scripts.neuroprobe.viz_common import load_all
-
 TASKS = (
     "onset", "speech", "delta_volume", "word_index", "word_head_pos", "word_length",
     "gpt2_surprisal", "word_gap", "word_part_speech",
@@ -190,6 +188,13 @@ def compute(red_dir: str, *, baseline: bool = True, common_mode: bool = True):
     Sessions of one subject are averaged, not concatenated: two trials share a montage and
     would otherwise double-count as agreement.
     """
+    # Imported HERE, not at module level, so this file's CONSTANTS and ``dkt_tables`` stay
+    # importable in an environment without the study stack. ``viz_common`` pulls in
+    # ``speech_decoding.studies.braintreebank``, whose package __init__ imports mne, which the
+    # cluster's pytorch-conda module does not have -- and ``viz_elec_auroc`` needs the task
+    # menu from this file while running there.
+    from scripts.neuroprobe.viz_common import load_all
+
     base_of, lobe_of_base = dkt_tables()
     sessions = load_all(red_dir, pool_hemi=True)
     assert sessions, red_dir
