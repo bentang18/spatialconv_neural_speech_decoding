@@ -140,28 +140,28 @@ def test_the_task_axis_section_counts_cells_beating_their_own_null(tmp_path):
     assert "overlap with the session offset: 0.0200 (chance 0.0120)" in out
 
 
-def _task_world(tmp: Path, speech_cos: float, visual_cos: float):
-    """Same cell, two tasks, one from each modality group -- the shape the real menu has."""
+def _task_world(tmp: Path, event_cos: float, level_cos: float):
+    """`onset` is event-coded, `volume` is a sustained level -- the split the gain actually obeys."""
     write_tree(tmp, between=0.99, var_removed=0.2, d_leace=-7e-6, d_shuf=-5e-6, d_top=-8e-6)
-    _augment(tmp, "enc12", {"task_cos": speech_cos, "task_cos_null": 0.05,
+    _augment(tmp, "enc12", {"task_cos": event_cos, "task_cos_null": 0.05,
                             "task_cos_null_p95": 0.12, "task_vs_sess_t": 0.02,
                             "task_vs_sess_chance": 0.012})
     for cell in CELLS:
         p = tmp / f"ctrl_{cell}.json"
         doc = json.loads(p.read_text())
-        vis = json.loads(json.dumps(doc["onset"]))          # same scores, different task axis
-        vis["checks"]["enc12"]["task_cos"] = visual_cos
-        doc["global_flow"] = vis
+        lvl = json.loads(json.dumps(doc["onset"]))          # same scores, different task axis
+        lvl["checks"]["enc12"].update({"task_cos": level_cos, "task_vs_sess_t": 0.44})
+        doc["volume"] = lvl
         p.write_text(json.dumps(doc))
 
 
-def test_the_task_axis_breakdown_separates_speech_from_visual(tmp_path):
-    """A shared task axis only explains the cross-subject gain if it rises the way the gain does --
-    for speech and not for visual. Pooling the menu averages that contrast away."""
-    _task_world(tmp_path, speech_cos=0.60, visual_cos=0.06)
+def test_the_task_axis_breakdown_separates_event_from_level(tmp_path):
+    """A shared task axis explains the gain only if it rises where the gain does -- for event-coded
+    labels and not for sustained levels, which are what the rigid session offset destroys."""
+    _task_world(tmp_path, event_cos=0.60, level_cos=0.06)
     out = run(tmp_path)
-    assert "speech/language  cos 0.6000  vs null 0.0500   10/10 beat their p95" in out
-    assert "cos 0.0600  vs null 0.0500   0/10 beat their p95" in out, "the visual group"
+    assert "event  cos 0.6000  vs null 0.0500   10/10 beat their p95   vs session offset 0.0200" in out
+    assert "level  cos 0.0600  vs null 0.0500   0/10 beat their p95   vs session offset 0.4400" in out
     assert "cos 0.3300  vs null 0.0500 (x6.60)   10/20 beat their p95" in out, \
         "the pooled line reads as a shared axis when only half the menu has one"
 
@@ -172,7 +172,7 @@ def test_the_breakdown_is_suppressed_when_the_menu_is_one_sided(tmp_path):
     _augment(tmp_path, "enc12", {"task_cos": 0.40, "task_cos_null": 0.05,
                                  "task_cos_null_p95": 0.12, "task_vs_sess_t": 0.02,
                                  "task_vs_sess_chance": 0.012})
-    assert "speech/language" not in run(tmp_path)
+    assert "\n        event " not in run(tmp_path)
 
 
 def test_empty_directory_fails_loudly(tmp_path):

@@ -52,11 +52,13 @@ GEOM = ("var_removed", "pc1_var_frac", "cos_pc1", "cos_pc1_excess", "pc_particip
 # comparable quantity and the raw number is only a diagnostic.
 NULLED = ("cos_pc1", "pc_participation", "dir_between_frac", "var_removed")
 
-# The gain pretraining delivers cross-subject is speech-selective (k_CS/k_WS: language 1.21,
-# acoustic 1.17, visual 0.86), so a shared task axis is only a candidate mechanism if it also
-# rises selectively. Pooling `task_cos` over the menu averages the two groups together and the
-# contrast disappears, which is why the breakdown is printed beside the pooled line.
-VISUAL = ("face_num", "frame_brightness", "global_flow", "local_flow")
+# What the cross-subject gain is selective for is not modality but whether the label tracks a
+# sustained LEVEL or a CHANGE/EVENT: per-task k splits 9/9 with no interleaving (event 1.230 vs
+# level 0.996), and `volume` vs `delta_volume` -- the same signal, level vs derivative -- differ
+# cross-subject while being identical within session. Since the subject difference is a rigid
+# translation, level codes are exactly the ones it destroys. So `task_vs_sess` is predicted HIGH
+# for level tasks and LOW for event tasks; pooling over the menu averages that away.
+LEVEL = ("volume", "pitch", "frame_brightness", "face_num", "global_flow", "local_flow")
 
 
 def load(d: Path) -> tuple[dict, dict, dict]:
@@ -204,16 +206,18 @@ def main() -> None:
         groups: dict[str, list] = {}
         for (_, task, tp), ck in by_task.items():
             if tp == tap and "task_cos" in ck:
-                groups.setdefault("visual" if task in VISUAL else "speech/language", []).append(ck)
-        if set(groups) == {"speech/language", "visual"}:
-            for lab in ("speech/language", "visual"):
+                groups.setdefault("level" if task in LEVEL else "event", []).append(ck)
+        if set(groups) == {"event", "level"}:
+            for lab in ("event", "level"):
                 sub = groups[lab]
                 cos = st.fmean(r["task_cos"] for r in sub)
                 nul = st.fmean(r["task_cos_null"] for r in sub)
+                vs = st.fmean(r["task_vs_sess_t"] for r in sub)
                 beat_g = sum(r["task_cos"] > r["task_cos_null_p95"] for r in sub)
-                out["task"][tap][lab] = {"cos": cos, "null": nul, "beat_p95": beat_g, "n": len(sub)}
-                print(f"        {lab:<16} cos {cos:.4f}  vs null {nul:.4f}   "
-                      f"{beat_g}/{len(sub)} beat their p95")
+                out["task"][tap][lab] = {"cos": cos, "null": nul, "vs_sess": vs,
+                                         "beat_p95": beat_g, "n": len(sub)}
+                print(f"        {lab:<6} cos {cos:.4f}  vs null {nul:.4f}   "
+                      f"{beat_g}/{len(sub)} beat their p95   vs session offset {vs:.4f}")
 
     print("\n=== verdict ===")
     effective: dict[str, float] = {}
