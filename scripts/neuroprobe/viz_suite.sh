@@ -29,7 +29,9 @@ HZ=32
 NPRE=$(python3 -c "import sys; o=float(sys.argv[1]); print(max(0, round(-o*$HZ)))" "$OFF")
 echo "### origin: n_pre=$NPRE frames (offset $OFF s at $HZ Hz)"
 
-PY=.venv/bin/python
+# The repo venv locally; overridable because the cluster has no .venv and pulling 3.5 GB of
+# reduction shards to a laptop costs 50x what pulling the finished figures back does.
+PY=${PY:-.venv/bin/python}
 TAPS=enc0,enc3,enc6,enc12
 # All 15 Neuroprobe tasks, in `braintreebank/labels.py` order. The reduction must have been
 # built with the same list -- `viz_reduce.py --tasks` defaults to a 6-task subset, and a task
