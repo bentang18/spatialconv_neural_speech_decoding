@@ -13,6 +13,17 @@
 # Measure #2: per-electrode single-trial AUROC + max-statistic permutation FWER, one array task
 # per session. CPU only -- there is no forward pass here, only a readout of the encode cache.
 #
+# THIS IS THE WHOLE JOB. viz_elec_encode.sbatch is NOT needed: the elec taps already exist in
+# /projects/bhqk/htang13/v3_board_cache_board_cdlin_45k (read 2026-07-29: 12 records, 571 GB,
+# band_lengths (4,16,32) = the 1 s board window, feats enc0/enc0_elec/enc3/enc6/enc12/enc12_elec,
+# all 15 board tasks). So measure #2 costs one CPU array and no GPU time at all.
+#
+# --band-fdims IS REQUIRED for the enc0 tap on that cache: its records store band_fdims = None,
+# and enc0's per-band widths are not recoverable from the flattened total. 7,6,7 is READ off the
+# 2 s viz cache written by the same v3r6 frontend, and 4*7 + 16*6 + 32*7 = 348 = the stored enc0
+# width on all 12 records (checked). The width check alone would NOT be enough -- several triples
+# total 348 -- which is why the value comes from a sibling record, not from arithmetic.
+#
 # WALLTIME AND MEMORY ARE BOTH MEASURED, not guessed, and they are sized against the two ways a
 # Delta CPU job wastes fairshare:
 #
@@ -45,6 +56,7 @@ CACHE="${1:?usage: sbatch viz_elec_auroc.sbatch <CACHE_DIR> <OUT_DIR> [TAPS] [N_
 OUT="${2:?need OUT_DIR}"
 TAPS="${3:-enc0_elec,enc12_elec}"
 NPERM="${4:-500}"
+FDIMS="${5:-7,6,7}"
 cd /projects/bhqk/htang13/speech
 module load pytorch-conda/2.8
 # numpy's einsum threads; argsort does not, so this helps the projection and not the inner loop
@@ -55,4 +67,5 @@ export PYTHONPATH=/projects/bhqk/htang13/speech/src
 numactl --interleave=all .venv/bin/python -u -m scripts.neuroprobe.viz_elec_auroc \
   --cache "$CACHE" --out-dir "$OUT" \
   --session-index "$SLURM_ARRAY_TASK_ID" \
-  --taps "$TAPS" --band hga --n-perm "$NPERM" --perm-block 200 --pc 32 --cov-stride 4
+  --taps "$TAPS" --band hga --n-perm "$NPERM" --perm-block 200 --pc 32 --cov-stride 4 \
+  --band-fdims "$FDIMS" --seed 33

@@ -8,6 +8,7 @@ region table, and the two guards whose failure mode is SILENT rather than loud.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from scripts.neuroprobe.viz_elec_auroc import (
     _halves,
@@ -119,7 +120,8 @@ def test_pooled_p_beats_the_per_cell_floor() -> None:
     assert p[1, 1] > 0.1, p[1, 1]                          # a null cell stays unremarkable
 
 
-def _fake_cache(tmp_path, *, plant_contact: int, seed: int = 0):
+def _fake_cache(tmp_path, *, plant_contact: int, seed: int = 0, store_fdims: bool = True,
+                name: str = "enc_s1_t1.pt"):
     """A record with the encode cache's exact schema, plus a planted effect in one contact.
 
     The band layout is deliberately NOT square: band_lengths (4,8,16) and band_fdims (3,4,5)
@@ -154,14 +156,43 @@ def _fake_cache(tmp_path, *, plant_contact: int, seed: int = 0):
     rec = {
         "subject_id": 1, "trial_id": 1,
         "present_parcels": np.unique(canon), "parcel_canon": canon,
-        "band_lengths": bl, "band_fdims": bf,
+        "band_lengths": bl,
         "feats": feats,
         "labels": {"onset": y, "frame_brightness": rng.integers(0, 2, n).astype(float)},
         "n_windows": n,
     }
-    path = tmp_path / "enc_s1_t1.pt"
+    if store_fdims:
+        rec["band_fdims"] = bf
+    path = tmp_path / name
     torch.save(rec, path)
     return str(path), T_hga
+
+
+def test_band_fdims_override_reproduces_the_stored_layout(tmp_path) -> None:
+    """The board cache stores no ``band_fdims``, so enc0 needs the override -- and the override
+    must give the SAME answer as reading it off the record, not merely a plausible one.
+
+    The non-square layout is what makes this a real check: with band_lengths (4,8,16) and
+    F_b (3,4,5) the HGA block starts at column 44 and is 80 wide, a run no other triple picks
+    out. So the guards are: no override -> refuse rather than guess; correct override -> bitwise
+    identical to the stored path; wrong TOTAL -> refuse. A wrong triple with the RIGHT total is
+    undetectable here by construction, which is exactly why the flag's help says to read the
+    value off a record the same frontend wrote.
+    """
+    stored, _ = _fake_cache(tmp_path, plant_contact=1, name="stored.pt")
+    bare, _ = _fake_cache(tmp_path, plant_contact=1, store_fdims=False, name="bare.pt")
+    kw = dict(taps=("enc0_elec",), tasks=("onset",), band="hga", n_pc=4, n_perm=0,
+              perm_block=0, chunk=64, seed=0, verbose=False)
+
+    with pytest.raises(KeyError):
+        session_shard(bare, **kw)
+
+    ref = session_shard(stored, **kw)["auroc/enc0_elec/onset"]
+    got = session_shard(bare, band_fdims_override=(3, 4, 5), **kw)["auroc/enc0_elec/onset"]
+    assert np.array_equal(ref, got)
+
+    with pytest.raises(ValueError):
+        session_shard(bare, band_fdims_override=(3, 4, 6), **kw)
 
 
 def test_session_shard_end_to_end_on_a_real_schema_record(tmp_path) -> None:

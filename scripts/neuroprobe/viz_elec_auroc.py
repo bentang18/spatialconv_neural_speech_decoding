@@ -66,6 +66,7 @@ import argparse
 import os
 import sys
 import time
+import zlib
 
 import numpy as np
 
@@ -169,7 +170,7 @@ def pca_basis(cov: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
 # --------------------------------------------------------------------------------------
 # one session
 # --------------------------------------------------------------------------------------
-def read_session(path: str, *, tap: str, band: str):
+def read_session(path: str, *, tap: str, band: str, band_fdims_override=None):
     """``(rec, feat, cols, T, C)`` for one tap, mmapped -- nothing large is materialised."""
     import torch
 
@@ -181,6 +182,12 @@ def read_session(path: str, *, tap: str, band: str):
     feat = rec["feats"][tap]["raw"]
     band_lengths = tuple(int(x) for x in rec["band_lengths"])
     band_fdims = rec.get("band_fdims")
+    if band_fdims is None and band_fdims_override is not None:
+        # The board cache stores no band_fdims, and enc0's per-band widths are not recoverable
+        # from the flattened total: (7,6,7) and (3,5,8) both sum to 348 at the 1 s window, so
+        # _band_slice's width check is necessary and NOT sufficient. Only ever pass a value READ
+        # off a record the same frontend wrote -- here (7,6,7), read off the 2 s v3r6 viz cache.
+        band_fdims = tuple(int(f) for f in band_fdims_override)
     cols, T, C = _band_slice(tap, band, band_lengths, band_fdims, int(feat.shape[2]))
     canon = np.asarray(rec["parcel_canon"], dtype=np.int64)
     n_rows = len(canon) if tap.endswith("_elec") else len(np.asarray(rec["present_parcels"]))
@@ -224,11 +231,12 @@ def project(feat, cols, sel, T, C, chunk, basis) -> np.ndarray:
 
 def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
                   perm_block: int, chunk: int, seed: int, store_null: bool = True,
-                  cov_stride: int = 4, verbose: bool = True) -> dict:
+                  cov_stride: int = 4, verbose: bool = True, band_fdims_override=None) -> dict:
     out: dict = {}
     meta_done = False
     for tap in taps:
-        rec, feat, cols, T, C = read_session(path, tap=tap, band=band)
+        rec, feat, cols, T, C = read_session(path, tap=tap, band=band,
+                                             band_fdims_override=band_fdims_override)
         if not meta_done:
             out["subject_id"] = np.int64(int(rec["subject_id"]))
             out["trial_id"] = np.int64(int(rec["trial_id"]))
@@ -284,7 +292,13 @@ def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
             Z -= Z.mean(axis=0, keepdims=True)
             Z /= np.maximum(Z.std(axis=0, keepdims=True), 1e-8)
             obs = cv_auroc(Z, y)
-            rng = np.random.default_rng(seed + abs(hash((tap, task))) % 100000)
+            # crc32, NOT hash(): Python salts string hashes per process (PYTHONHASHSEED), so
+            # hash() here would mean --seed does not actually pin the null -- every re-run and
+            # every array task would draw a different one, and a permutation p-value that
+            # changes when you re-run it is not a p-value. Each (tap, task) still gets its own
+            # independent stream; SeedSequence does the mixing, so crc32 only has to be stable.
+            rng = np.random.default_rng(np.random.SeedSequence(
+                [seed, zlib.crc32(tap.encode()), zlib.crc32(task.encode())]))
             null = np.empty((n_perm, P, T), dtype=np.float32)
             for p in range(n_perm):
                 null[p] = cv_auroc(Z, block_permute(y, rng, perm_block))
@@ -609,6 +623,12 @@ def main() -> None:
     p.add_argument("--taps", default="enc0_elec,enc12_elec")
     p.add_argument("--tasks", default=",".join(TASKS))
     p.add_argument("--band", default="hga")
+    p.add_argument("--band-fdims", default="",
+                   help="per-band F_b for records that store no band_fdims, e.g. 7,6,7. Needed "
+                        "only for an enc0 tap: the encoder taps share one d so their band offsets "
+                        "follow from band_lengths alone. The width check cannot validate this "
+                        "(several triples share a total), so pass ONLY a value read off a record "
+                        "the same frontend wrote -- never one back-solved from the width")
     p.add_argument("--pc", type=int, default=32, help="label-free PCs kept per contact")
     p.add_argument("--n-perm", type=int, default=500,
                    help="permutations. 500 because the max-stat threshold is a 95th percentile "
@@ -632,6 +652,8 @@ def main() -> None:
     a = p.parse_args()
     taps = tuple(t for t in a.taps.split(",") if t)
     tasks = tuple(t for t in a.tasks.split(",") if t)
+    fdims = tuple(int(f) for f in a.band_fdims.split(",") if f) or None
+    assert fdims is None or len(fdims) == 3, "--band-fdims needs one F_b per band"
 
     if a.aggregate:
         agg = aggregate(a.out_dir, taps=taps, tasks=tasks, alpha=a.alpha,
@@ -648,7 +670,7 @@ def main() -> None:
         out = session_shard(os.path.join(a.cache, fn), taps=taps, tasks=tasks, band=a.band,
                             n_pc=a.pc, n_perm=a.n_perm, perm_block=a.perm_block,
                             chunk=a.chunk, seed=a.seed, store_null=not a.no_store_null,
-                            cov_stride=a.cov_stride)
+                            cov_stride=a.cov_stride, band_fdims_override=fdims)
         dst = os.path.join(a.out_dir, f"elec_s{int(out['subject_id'])}"
                                      f"_t{int(out['trial_id'])}_{a.band}.npz")
         np.savez_compressed(dst, **out)

@@ -11,6 +11,12 @@
 #SBATCH --array=0-11
 #SBATCH --output=/projects/bhqk/htang13/viz/elec_encode_%A_%a.out
 #
+# DO NOT SUBMIT THIS FOR cdlin_45k -- the cache it would write ALREADY EXISTS.
+# /projects/bhqk/htang13/v3_board_cache_board_cdlin_45k (read 2026-07-29) has all 12 board
+# sessions at the 1 s window with enc0_elec AND enc12_elec and all 15 board tasks, 571 GB, which
+# is the same ~570 GB this script's own disk model below predicts. Measure #2 reads it directly.
+# Kept for a DIFFERENT checkpoint (r6_40k has no elec board cache) or a different window.
+#
 # Per-ELECTRODE encode for measure #2 (viz_elec_auroc.py). ONLY NEEDED IF an --elec-taps 0,12
 # cache over the BOARD session/task set does not already exist -- check before submitting; the
 # existing v3_probe_encode_r6_elec.sbatch wrote --elec-taps 12 over the cohort7/probe4
