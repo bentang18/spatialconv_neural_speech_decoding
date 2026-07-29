@@ -72,9 +72,26 @@ ONSET_BIN_OF = lambda T: int(round(-WIN_START_S / ((WIN_END_S - WIN_START_S) / T
 # The regions Greg's test is about, and the ones that make it falsifiable.
 TARGET = "superiortemporal"
 NEIGHBOURS = ("middletemporal", "transversetemporal")
+# Marked in every figure that has a region axis, in ONE colour scheme so a reader who learns it
+# on the heatmap can carry it to the render. Heschl's is the hotter of the two and sits directly
+# above STG by alphabet alone, so marking only STG gets read off by one row.
+MARK = {"transversetemporal": "#00a000", TARGET: "#8e24aa"}
 OCCIPITAL = ("lateraloccipital", "lingual", "cuneus", "pericalcarine")
 
 LOBE_ORDER = ("temporal", "insula", "frontal", "parietal", "cingulate", "mtl", "unknown")
+
+# The BrainTreebank's OWN template projection, transcribed from its quickstart.ipynb (cell 31)
+# rather than derived. ``elec_coords_full.csv`` holds a hemisphere-COLLAPSED 2D lateral
+# projection: the ``X`` column is anterior(+)/posterior(-), ``Y`` is superior(+)/inferior(-),
+# ``Z`` is the unused out-of-plane depth, and ``Hemisphere`` selects WHICH image to draw on
+# (1 = left, 0 = right, per the notebook's ``hem_index = 1 if hemisphere=="left" else 0``).
+# Confirmed against the data: no column sign-separates Hemisphere, and Y's range is exactly
+# +-72.98 = MATLAB_YLIM.
+#
+# This is precisely why the same file is BANNED for pitch or any distance measurement -- a 2D
+# projection of collapsed hemispheres has no metric meaning -- and fine for a figure.
+MATLAB_XLIM = (-108.0278, 108.0278)
+MATLAB_YLIM = (-72.9774, 72.9774)
 
 
 # --------------------------------------------------------------------------------------
@@ -455,40 +472,154 @@ def invariant_task_contrast(D: dict, rows: list[str], T: int,
 # --------------------------------------------------------------------------------------
 # coordinates, for the renders
 # --------------------------------------------------------------------------------------
-def load_coords(red_dir: str, bt_root: str) -> dict:
-    """``{(subj,trial): {"xyz": (n,3), "pid": (n,)}}`` in the reductions' canonical order.
+def load_template_coords(red_dir: str, bt_root: str) -> dict:
+    """Contacts projected into the BrainTreebank's own two hemisphere renders.
 
-    Alignment is TESTED, not assumed: the DKT tag recomputed for the Lite voltage order
-    must equal the reduction's own ``parcel_canon``. A silently permuted electrode axis
-    would put real effects on the wrong dots, which is worse than no render.
+    Returns ``{"img": {"left": arr, "right": arr},
+               "pts": {(subj,trial): {"xy": (n,2) px, "side": (n,) 'left'/'right',
+                                      "pid": (n,), "found": (n,) bool}}}``.
+
+    The join key is the electrode LABEL from ``lite_voltage_order``, and alignment is TESTED,
+    not assumed: the DKT tag re-derived for that order must equal the reduction's own
+    ``parcel_canon``. A permuted electrode axis would paint real effects onto the wrong dots,
+    which is worse than no render at all. Contacts absent from the CSV are marked
+    ``found=False`` and reported rather than silently dropped.
     """
-    from scripts.neuroprobe.viz_coords_dump import make_parcel_fn
-    from speech_decoding.studies.braintreebank.anatomy import (
-        aligned_voltage_coords, lite_voltage_order,
-    )
+    import matplotlib.pyplot as plt
+    import pandas as pd
 
+    from scripts.neuroprobe.viz_coords_dump import make_parcel_fn
+    from speech_decoding.studies.braintreebank.anatomy import lite_voltage_order
+
+    loc = os.path.join(bt_root, "localization")
+    img = {"left": plt.imread(os.path.join(loc, "left_hem_clean.png")),
+           "right": plt.imread(os.path.join(loc, "right_hem_clean.png"))}
+    d = pd.read_csv(os.path.join(loc, "elec_coords_full.csv"))
+
+    # the notebook's scaling, verbatim. Note it uses y_scale_r for the RIGHT panel's x axis;
+    # that is the published convention (and only 1.2% off x_scale), so it is reproduced rather
+    # than "fixed" -- the point is to land where the dataset's own figures land.
+    xs = img["left"].shape[1] / (MATLAB_XLIM[1] - MATLAB_XLIM[0])
+    ysl = img["left"].shape[0] / (MATLAB_YLIM[1] - MATLAB_YLIM[0])
+    ysr = img["right"].shape[0] / (MATLAB_YLIM[1] - MATLAB_YLIM[0])
+
+    lut = {(r.Subject, r.Electrode): (r.X, r.Y, int(r.Hemisphere)) for r in d.itertuples()}
     parcel_fn = make_parcel_fn(bt_root, atlas="dkt")
-    out = {}
+    pts, n_miss, n_tot = {}, 0, 0
     for p in sorted(glob.glob(os.path.join(red_dir, "red_s*_t*_*.npz"))):
         z = np.load(p, allow_pickle=False)
         subj, trial = int(z["subject_id"]), int(z["trial_id"])
         canon = z["parcel_canon"]
         order = list(lite_voltage_order(bt_root, subj, trial))
         if len(order) != len(canon):
-            print(f"[coords] SKIP S{subj}T{trial}: lite order {len(order)} "
-                  f"!= parcel_canon {len(canon)}")
+            print(f"[tmpl] SKIP S{subj}T{trial}: lite order {len(order)} != canon {len(canon)}")
             continue
-        tags = parcel_fn(subj, trial, order)
-        if not np.array_equal(tags, canon):
-            n_bad = int((tags != canon).sum())
-            print(f"[coords] SKIP S{subj}T{trial}: {n_bad}/{len(canon)} DKT tags disagree "
-                  f"with parcel_canon -- refusing to paint a permuted axis")
+        if not np.array_equal(parcel_fn(subj, trial, order), canon):
+            print(f"[tmpl] SKIP S{subj}T{trial}: DKT tags disagree with parcel_canon")
             continue
-        xyz = aligned_voltage_coords(bt_root, subj, trial_id=trial, electrode_set="lite")
-        assert xyz.shape == (len(canon), 3), (xyz.shape, len(canon))
-        out[(subj, trial)] = {"xyz": np.asarray(xyz, dtype=np.float64), "pid": canon}
-        print(f"[coords] OK S{subj}T{trial}: {len(canon)} contacts, DKT tags match")
-    return out
+        xy = np.full((len(order), 2), np.nan)
+        side = np.array(["left"] * len(order), dtype=object)
+        found = np.zeros(len(order), dtype=bool)
+        for i, e in enumerate(order):
+            hit = lut.get((f"sub_{subj}", e))
+            if hit is None:
+                continue
+            X, Y, hemi = hit
+            found[i] = True
+            if hemi == 1:                                   # left panel
+                xy[i] = (-(X - MATLAB_XLIM[1]) * xs, -(Y - MATLAB_YLIM[1]) * ysl)
+                side[i] = "left"
+            else:                                           # right panel
+                xy[i] = ((X + MATLAB_XLIM[1]) * ysr, -(Y - MATLAB_YLIM[1]) * ysr)
+                side[i] = "right"
+        n_miss += int((~found).sum()); n_tot += len(order)
+        pts[(subj, trial)] = {"xy": xy, "side": side, "pid": canon, "found": found}
+        print(f"[tmpl] OK S{subj}T{trial}: {int(found.sum())}/{len(order)} contacts projected")
+
+    # Bounds are necessary but nowhere near sufficient -- a mirrored or transposed projection
+    # stays in bounds. The anatomical checks are in invariant_projection().
+    allxy = np.concatenate([v["xy"][v["found"]] for v in pts.values()])
+    H = max(img["left"].shape[0], img["right"].shape[0])
+    W = img["left"].shape[1]
+    inb = ((allxy[:, 0] >= 0) & (allxy[:, 0] <= W)
+           & (allxy[:, 1] >= 0) & (allxy[:, 1] <= H)).mean()
+    print(f"[tmpl] {n_tot - n_miss}/{n_tot} contacts have coordinates "
+          f"({n_miss} absent from the CSV, reported not dropped)")
+    print(f"[tmpl] {100 * inb:.1f}% of projected contacts land inside the image bounds")
+    assert inb > 0.99, f"projection puts {100 * (1 - inb):.1f}% of contacts off-image"
+    return {"img": img, "pts": pts}
+
+
+def invariant_projection(tmpl: dict, base_of: dict, lobe_of_base: dict) -> None:
+    """Assert the projection is not mirrored or transposed, using ANATOMY, not a fit.
+
+    Both expected directions follow from the transform itself, so they are predictions and not
+    observations dressed up as ones. ``y_px = (YLIM_max - Y) * y_scale`` with ``Y`` superior(+),
+    so INFERIOR structures get a LARGER y_px; temporal cortex is inferior to frontal, and sits
+    below the lateral view's vertical midline. For x, the left panel uses
+    ``(XLIM_max - X) * s`` and the right panel ``(X + XLIM_max) * s`` with ``X`` anterior(+), so
+    ANTERIOR is a SMALLER x_px on the left panel and a LARGER x_px on the right -- opposite
+    signs, which is exactly the asymmetry a copy-paste mirror bug would break.
+    """
+    H = max(tmpl["img"][s].shape[0] for s in ("left", "right"))
+    by = collections.defaultdict(lambda: collections.defaultdict(list))
+    for v in tmpl["pts"].values():
+        for i in np.where(v["found"])[0]:
+            lobe = lobe_of_base.get(base_of.get(int(v["pid"][i]), "unknown"), "unknown")
+            by[v["side"][i]][lobe].append(v["xy"][i])
+
+    for sd in ("left", "right"):
+        med = {lb: np.median(np.array(a), axis=0) for lb, a in by[sd].items() if len(a) >= 10}
+        if not {"temporal", "frontal"} <= set(med):
+            print(f"[tmpl] {sd}: too few contacts to check ({sorted(med)}) -- skipped")
+            continue
+        ty, fy = med["temporal"][1], med["frontal"][1]
+        print(f"[tmpl] {sd}: median y_px temporal {ty:.0f} vs frontal {fy:.0f} "
+              f"(midline {H / 2:.0f}) -- temporal must be larger and below midline")
+        assert ty > fy, f"{sd}: temporal is ABOVE frontal ({ty:.0f} vs {fy:.0f}) -- y flipped?"
+        assert ty > H / 2, f"{sd}: temporal sits above the midline ({ty:.0f} < {H / 2:.0f})"
+        if "parietal" in med:
+            fx, px = med["frontal"][0], med["parietal"][0]
+            ant_is_small = sd == "left"
+            print(f"[tmpl] {sd}: median x_px frontal {fx:.0f} vs parietal {px:.0f} -- frontal "
+                  f"must be {'smaller' if ant_is_small else 'larger'}")
+            assert (fx < px) == ant_is_small, (
+                f"{sd}: anterior/posterior axis is reversed (frontal {fx:.0f}, "
+                f"parietal {px:.0f}) -- the two panels' x transforms have opposite sign")
+    print("[check] OK template projection is upright and correctly handed on both panels")
+
+
+def fig_template_qc(tmpl: dict, base_of: dict, lobe_of_base: dict, out: str) -> None:
+    """Colour every contact by LOBE on the two hemispheres. This is the check that the
+    projection is anatomically right, and it is a figure because the eye is the only
+    instrument that can confirm 'these dots are on the temporal lobe'."""
+    import matplotlib.pyplot as plt
+
+    colour = {"temporal": "#d62728", "frontal": "#1f77b4", "parietal": "#2ca02c",
+              "insula": "#9467bd", "cingulate": "#8c564b", "mtl": "#e377c2",
+              "unknown": "#999999"}
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), dpi=150)
+    for ax, sd in zip(axes, ("left", "right")):
+        ax.imshow(tmpl["img"][sd]); ax.axis("off"); ax.set_title(f"{sd} hemisphere", fontsize=10)
+        for lobe, c in colour.items():
+            xs, ys = [], []
+            for v in tmpl["pts"].values():
+                m = v["found"] & (v["side"] == sd)
+                for i in np.where(m)[0]:
+                    if lobe_of_base.get(base_of.get(int(v["pid"][i]), "unknown"),
+                                        "unknown") == lobe:
+                        xs.append(v["xy"][i, 0]); ys.append(v["xy"][i, 1])
+            if xs:
+                ax.scatter(xs, ys, s=15, c=c, ec="k", lw=.3, label=f"{lobe} ({len(xs)})")
+        ax.legend(fontsize=6, loc="lower left", framealpha=.85)
+    fig.suptitle("PROJECTION QC: contacts by lobe, on the BrainTreebank's own hemisphere "
+                 "renders.\nTemporal (red) must lie on the temporal lobe or the projection "
+                 "is wrong.", fontsize=10)
+    fig.tight_layout()
+    p = os.path.join(out, "figAN5_template_qc.png")
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig] {p}")
 
 
 # --------------------------------------------------------------------------------------
@@ -552,32 +683,42 @@ def fig_dkt_time(D, rows, cov, T, out, tap):
     tms = _t_ms(T)
 
     im = None
-    fig, axes = plt.subplots(5, 3, figsize=(14.5, 15.0), dpi=165, sharex=True, sharey=True)
+    # Both auditory rows are marked, not just STG. transversetemporal (Heschl's) sits directly
+    # ABOVE superiortemporal by alphabet alone, so one line next to two adjacent rows is read
+    # off by one -- and the hotter of the two is Heschl's.
+    fig, axes = plt.subplots(5, 3, figsize=(16.5, 15.0), dpi=165, sharex=True, sharey=True)
     for k, (ax, task) in enumerate(zip(axes.ravel(), TASKS)):
         M, n = maps[task]
         im = ax.imshow(M, aspect="auto", cmap="RdBu_r", vmin=-lim, vmax=lim,
                        extent=[tms[0], tms[-1], len(rows) - .5, -.5],
                        interpolation="nearest")
         ax.axvline(0, color="k", lw=.7, ls=":")
-        # only the leftmost column is labelled: the rows are identical in every panel, and
-        # per-panel labels overflow left into the neighbouring axes.
-        if k % 3 == 0:
-            ax.set_yticks(range(len(rows)))
-            ax.set_yticklabels([f"{b} ({c})" for b, c in zip(rows, n)], fontsize=5.0)
-        else:
-            ax.set_yticks(range(len(rows)))
-            ax.set_yticklabels([])
+        # Only the leftmost column shows labels (the rows are identical in every panel), but
+        # hiding them is `labelleft=False`, NOT set_yticklabels([]): these axes are sharey, so
+        # an empty label list REPLACES THE SHARED FORMATTER and blanks the left column too.
+        # That -- not the font size -- is why this figure previously had no readable y axis.
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels([f"{b} ({c})" for b, c in zip(rows, n)], fontsize=8.0)
+        ax.tick_params(labelsize=8, labelleft=(k % 3 == 0))
+        for lab in ax.get_yticklabels():
+            if lab.get_text().split(" (")[0] in MARK:
+                lab.set_color(MARK[lab.get_text().split(" (")[0]])
+                lab.set_fontweight("bold")
         fam = "event" if task in EVENT else "level"
         ax.set_title(f"{task}  [{fam}]", fontsize=8,
                      color="#1f4e79" if fam == "event" else "#d98324")
-        if TARGET in rows:
-            ax.axhline(rows.index(TARGET), color="#d62728", lw=.8, alpha=.65)
-        ax.tick_params(labelsize=6)
+        # marker OUTSIDE the left spine, not a line across the row: an axhline at the row
+        # centre paints over the very cells the marker exists to point at.
+        for base, c in MARK.items():
+            if base in rows:
+                ax.plot([tms[0]], [rows.index(base)], marker=">", ms=6, color=c,
+                        clip_on=False, zorder=5)
     for ax in axes[-1]:
         ax.set_xlabel("time from word onset (ms)", fontsize=7)
     fig.suptitle(
         f"Split-half unbiased standardized class contrast (d_cv) by DKT base x time — {tap}\n"
-        f"across-subject mean; (n) = subjects with that base; red line = {TARGET}; "
+        f"across-subject mean; (n) = subjects with that base; GREEN marker = transversetemporal "
+        f"(Heschl's gyrus / A1) · PURPLE marker = superiortemporal; "
         f"zero is a TRUE zero, so blue is genuinely no-effect",
         fontsize=10)
     if im is not None:
@@ -716,118 +857,271 @@ def fig_depth(D, rows, cov, T, out):
 # --------------------------------------------------------------------------------------
 # native-cloud renders + scrub demo
 # --------------------------------------------------------------------------------------
-def _png_b64(fig) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=105)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("ascii")
+def _pooled_contacts(tmpl: dict, base_of: dict) -> dict:
+    """Contacts of ONE trial per subject, flattened, plus the (subject, base) group table.
+
+    Two trials of the same subject are the same montage, so pooling both would double-weight
+    that subject. Values live per (subject, DKT base), so the render only needs a group index
+    per contact -- which is what keeps the demo payload small enough to be a single file.
+    """
+    pick = {}
+    for key in sorted(tmpl["pts"]):
+        pick.setdefault(key[0], key)
+
+    groups, gmeta, pts = {}, [], []
+    for s, key in sorted(pick.items()):
+        v = tmpl["pts"][key]
+        for i in np.where(v["found"])[0]:
+            b = base_of.get(int(v["pid"][i]), "unknown")
+            g = groups.setdefault((s, b), len(gmeta))
+            if g == len(gmeta):
+                gmeta.append((s, b))
+            pts.append({"x": float(v["xy"][i, 0]), "y": float(v["xy"][i, 1]),
+                        "side": v["side"][i], "subj": s, "base": b, "g": g})
+    return {"pts": pts, "gmeta": gmeta}
 
 
-def render_frames(D, coords, base_of, T, tap, task, n_frames=16):
-    """One PNG per time bin: every subject's native cloud, contacts painted by their base."""
+def fig_template_render(D, tmpl, base_of, T, out, tap, task, times_ms=(-250, 0, 250, 500)):
+    """Static paper version of the demo: hemispheres x a few time points, one tap/task."""
     import matplotlib.pyplot as plt
 
-    subs = sorted({s for s, _ in coords})
     per = D.get(tap, {}).get(task, {})
-    if not per or not subs:
-        return [], []
-
+    if not per or not tmpl["pts"]:
+        print(f"[fig] skip render {tap}|{task}: no data")
+        return
     vals = np.concatenate([v[0] for s in per for v in per[s].values()])
     lim = float(np.nanpercentile(np.abs(vals), 98)) or 1.0
     tms = _t_ms(T)
-    frames = np.linspace(0, T - 1, n_frames).astype(int)
+    bins = [int(np.argmin(np.abs(tms - t))) for t in times_ms]
+    P = _pooled_contacts(tmpl, base_of)["pts"]
 
-    # one trial per subject, so a montage is drawn once
-    pick = {}
-    for (s, tr) in sorted(coords):
-        pick.setdefault(s, (s, tr))
+    sc = None
+    fig, axes = plt.subplots(2, len(bins), figsize=(3.6 * len(bins), 6.0), dpi=170)
+    for r, sd in enumerate(("left", "right")):
+        rowp = [q for q in P if q["side"] == sd]
+        xs = np.array([q["x"] for q in rowp]); ys = np.array([q["y"] for q in rowp])
+        # the mark is the dot's EDGE COLOUR, not a ring drawn over it. Contacts in STG sit
+        # centimetres apart on this projection, so overlaid rings merge into one purple blob
+        # and hide the values the marker exists to draw the eye to.
+        ec = np.array([MARK.get(q["base"], "#000000") for q in rowp])
+        lw = np.array([0.7 if q["base"] in MARK else 0.2 for q in rowp])
+        for c, fi in enumerate(bins):
+            ax = axes[r, c]
+            ax.imshow(tmpl["img"][sd]); ax.axis("off")
+            v = np.array([per.get(q["subj"], {}).get(q["base"], [np.full(T, np.nan)])[0][fi]
+                          for q in rowp], dtype=float)
+            miss = ~np.isfinite(v)
+            if miss.any():
+                ax.scatter(xs[miss], ys[miss], s=9, c="#c8c8c8",
+                           ec=ec[miss], lw=lw[miss], zorder=3)
+            if (~miss).any():
+                sc = ax.scatter(xs[~miss], ys[~miss], c=v[~miss], cmap="RdBu_r",
+                                vmin=-lim, vmax=lim, s=22,
+                                ec=ec[~miss], lw=lw[~miss], zorder=4)
+            if r == 0:
+                ax.set_title(f"{tms[fi]:+.0f} ms", fontsize=9)
+            if c == 0:
+                ax.text(-.02, .5, f"{sd} hemi", rotation=90, va="center", ha="right",
+                        transform=ax.transAxes, fontsize=8)
+    fig.suptitle(f"d_cv on the BrainTreebank lateral projection — {task}, {tap}, 6 subjects "
+                 f"pooled\ngreen outline = transversetemporal (Heschl's / A1) · "
+                 f"purple outline = superiortemporal · grey fill = parcel absent in that subject",
+                 fontsize=9)
+    if sc is not None:
+        fig.colorbar(sc, ax=axes, fraction=.018, pad=.01, label="d_cv")
+    p = os.path.join(out, f"figAN6_render_{tap}_{task}.png")
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig] {p}")
 
-    out = []
-    for fi in frames:
-        fig, axes = plt.subplots(1, len(subs), figsize=(2.5 * len(subs), 2.9), dpi=105)
-        axes = np.atleast_1d(axes)
-        for ax, s in zip(axes, subs):
-            key = pick[s]
-            xyz, pid = coords[key]["xyz"], coords[key]["pid"]
-            c = np.full(len(pid), np.nan)
-            for i, p in enumerate(pid):
-                b = base_of[int(p)]
-                if b in per.get(s, {}):
-                    c[i] = per[s][b][0][fi]
-            # native (L, I, P): sagittal view, anterior left -> flip P, up = -I
-            ax.scatter(-xyz[:, 2], -xyz[:, 1], c=c, cmap="RdBu_r", vmin=-lim, vmax=lim,
-                       s=17, ec="k", lw=.25)
-            ax.set_title(f"S{s}", fontsize=7)
-            ax.set_xticks([]); ax.set_yticks([])
-            ax.set_aspect("equal")
-            for sp in ax.spines.values():
-                sp.set_visible(False)
-        fig.suptitle(f"{task} — {tap} — t = {tms[fi]:+.0f} ms   (native space, no template)",
-                     fontsize=9)
-        fig.tight_layout(rect=(0, 0, 1, .9))
-        out.append(_png_b64(fig))
-        plt.close(fig)
-    return out, [float(tms[i]) for i in frames]
 
+def build_demo(D, tmpl, base_of, T, out, tasks, taps):
+    """Interactive canvas demo: the brain ships ONCE, the contacts are drawn live in JS.
 
-def build_demo(D, coords, base_of, T, out, tasks, taps):
-    payload = {}
+    The earlier version pre-rendered a PNG per time bin -- 67 MB for 24 frames, and a picture
+    cannot be interrogated. Sending coordinates + a per-(subject, base) value table instead is
+    ~20x smaller, gives every one of the 64 bins instead of 24, and lets the reader hover a
+    contact to be told which subject and which DKT parcel it is. Which was the actual
+    complaint: not that the dots were wrong, but that a dot you cannot name is not evidence.
+    """
+    import matplotlib as mpl
+
+    if not tmpl["pts"]:
+        print("[demo] no projected contacts -- skipping")
+        return
+    P = _pooled_contacts(tmpl, base_of)
+    pts, gmeta = P["pts"], P["gmeta"]
+
+    series, lims = {}, {}
     for tap in taps:
         for task in tasks:
-            fr, tm = render_frames(D, coords, base_of, T, tap, task)
-            if fr:
-                payload[f"{tap}|{task}"] = {"frames": fr, "t_ms": tm}
-                print(f"[demo] {tap}|{task}: {len(fr)} frames")
-    if not payload:
-        print("[demo] nothing rendered (no coordinates) -- skipping")
+            per = D.get(tap, {}).get(task, {})
+            if not per:
+                continue
+            k = f"{tap}|{task}"
+            # scaled ints, not floats: d_cv lives in ~[-0.5, 0.5] so 1e-3 is well past the
+            # resolution of a 26 px dot, and it roughly halves the payload.
+            series[k] = [
+                (None if b not in per.get(s, {}) else
+                 [int(round(1000 * x)) if np.isfinite(x) else None for x in per[s][b][0]])
+                for s, b in gmeta
+            ]
+            vals = np.concatenate([v[0] for s in per for v in per[s].values()])
+            lims[k] = round(float(np.nanpercentile(np.abs(vals), 98)) or 1.0, 4)
+    if not series:
+        print("[demo] no (tap, task) had data -- skipping")
         return
-    keys = sorted(payload)
-    html = f"""<!doctype html><meta charset="utf-8">
-<title>Anatomy of decodable information — native clouds</title>
-<style>
- body{{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:24px;max-width:1200px}}
- h1{{font-size:19px;margin:0 0 4px}} p{{color:#555;margin:4px 0 14px}}
- img{{width:100%;border:1px solid #ddd;border-radius:6px}}
- .row{{display:flex;gap:12px;align-items:center;margin:10px 0}}
- select,input{{font:inherit}} code{{background:#f4f4f4;padding:1px 4px;border-radius:3px}}
- .note{{background:#fffbe6;border-left:3px solid #e8c000;padding:8px 12px;font-size:12.5px}}
-</style>
-<h1>Where is the decodable information? Native electrode clouds, scrubbable in time</h1>
-<p>Colour is the <b>split-half unbiased standardized class contrast</b> (d_cv). Zero is a true
-zero: the two independent trial halves' contrast vectors are dotted, so noise contributes zero
-in expectation and a no-effect contact is white, not faintly warm.</p>
-<div class="note"><b>No template, no borrowed mesh.</b> Each panel is that subject's own
-<code>depth-wm.csv</code> native (L, I, P) coordinates, sagittal, anterior to the left. There is
-no common brain here and none is used — MNI is banned in this project, and a fsaverage surface
-would be somebody else's brain drawn behind these electrodes. Contacts are painted by their
-<b>DKT base</b> value, so all contacts in one parcel share a colour at this granularity.</div>
-<div class="row">
- <label>view <select id=k>{''.join(f'<option>{k}</option>' for k in keys)}</select></label>
- <label>time <input type=range id=t min=0 max=0 value=0 style="width:420px"></label>
- <span id=lab></span>
- <button id=play>play</button>
-</div>
-<img id=im>
-<script>
-const P={json.dumps(payload)};
-const k=document.getElementById('k'),t=document.getElementById('t'),
-      im=document.getElementById('im'),lab=document.getElementById('lab'),
-      pb=document.getElementById('play');
-let timer=null;
-function draw(){{const d=P[k.value];t.max=d.frames.length-1;
- im.src='data:image/png;base64,'+d.frames[t.value];
- lab.textContent=(d.t_ms[t.value]>=0?'+':'')+d.t_ms[t.value].toFixed(0)+' ms';}}
-function reset(){{t.value=0;draw();}}
-k.onchange=reset;t.oninput=draw;
-pb.onclick=()=>{{if(timer){{clearInterval(timer);timer=null;pb.textContent='play';return;}}
- pb.textContent='stop';
- timer=setInterval(()=>{{t.value=(+t.value+1)%(+t.max+1);draw();}},220);}};
-reset();
-</script>"""
+
+    lut = (255 * mpl.colormaps["RdBu_r"](np.linspace(0, 1, 128))[:, :3]).round().astype(int)
+    mark_of = {b: i + 1 for i, b in enumerate(MARK)}
+    payload = {
+        "img": {sd: base64.b64encode(_img_png(tmpl["img"][sd])).decode("ascii")
+                for sd in ("left", "right")},
+        "wh": {sd: [int(tmpl["img"][sd].shape[1]), int(tmpl["img"][sd].shape[0])]
+               for sd in ("left", "right")},
+        "x": [round(q["x"], 1) for q in pts],
+        "y": [round(q["y"], 1) for q in pts],
+        "side": [0 if q["side"] == "left" else 1 for q in pts],
+        "g": [q["g"] for q in pts],
+        "mark": [mark_of.get(q["base"], 0) for q in pts],
+        "lab": [f"S{q['subj']} · {q['base']}" for q in pts],
+        "series": series, "lim": lims, "t_ms": [round(float(v), 1) for v in _t_ms(T)],
+        "lut": lut.tolist(), "ring": ["", *MARK.values()],
+    }
+    # menu order = the order asked for, NOT sorted: sorting opens the demo on
+    # enc0|frame_brightness, which is the one view a reader has no reason to look at first.
+    keys = [f"{tp}|{tk}" for tp in taps for tk in tasks if f"{tp}|{tk}" in series]
+    html = _DEMO_HTML.replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":"))) \
+                     .replace("__OPTIONS__", "".join(
+                         # value stays the payload key; the label spells it out, because in a
+                         # native <select> the pipe in "enc12|onset" reads as an l.
+                         f'<option value="{k}">{k.replace("|", " — ")}</option>' for k in keys))
     p = os.path.join(out, "demo_anatomy.html")
     with open(p, "w") as f:
         f.write(html)
-    print(f"[demo] {p}  ({os.path.getsize(p)/1e6:.1f} MB, {len(keys)} views)")
+    print(f"[demo] {p}  ({os.path.getsize(p)/1e6:.1f} MB, {len(keys)} views, "
+          f"{len(pts)} contacts, {T} bins, {len(gmeta)} (subject,parcel) groups)")
+
+
+def _img_png(arr: np.ndarray) -> bytes:
+    """PNG-encode the hemisphere image once, without a figure around it."""
+    from PIL import Image
+
+    a = arr
+    if a.dtype != np.uint8:
+        a = (255 * np.clip(a, 0, 1)).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+_DEMO_HTML = r"""<!doctype html><meta charset="utf-8">
+<title>Anatomy of decodable information</title>
+<style>
+ body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;margin:22px;max-width:1400px;
+      color:#222}
+ h1{font-size:20px;margin:0 0 6px} p{color:#444;margin:5px 0 12px}
+ .panes{display:flex;gap:10px} .pane{flex:1;position:relative}
+ canvas{width:100%;border:1px solid #ddd;border-radius:6px;background:#fff;display:block}
+ .cap{font-size:11.5px;color:#666;text-align:center;margin-top:2px}
+ .row{display:flex;gap:14px;align-items:center;margin:12px 0;flex-wrap:wrap}
+ select,input,button{font:inherit} button{padding:2px 12px}
+ code{background:#f4f4f4;padding:1px 4px;border-radius:3px}
+ .note{background:#fffbe6;border-left:3px solid #e8c000;padding:9px 13px;font-size:12.5px}
+ #tip{position:fixed;pointer-events:none;background:#111;color:#fff;font-size:12px;
+      padding:4px 8px;border-radius:4px;display:none;z-index:9}
+ #bar{width:190px;height:12px;border:1px solid #bbb;border-radius:2px}
+ .k{display:inline-flex;align-items:center;gap:5px;font-size:12px}
+ .dot{width:12px;height:12px;border-radius:50%;border:2px solid}
+</style>
+<h1>Where is the decodable information? All 6 subjects on one brain, scrubbable in time</h1>
+<p>Colour is the <b>split-half unbiased standardized class contrast</b> (<code>d_cv</code>).
+Zero is a <i>true</i> zero — the two independent trial halves' contrast vectors are dotted, so
+noise contributes zero in expectation and a no-effect contact is white, not faintly warm.
+<b>Hover any contact</b> for its subject, DKT parcel and value.</p>
+<div class="note"><b>Frame: the BrainTreebank's own 2D lateral projection</b> — not a warp of
+mine, and not MNI. Positions are the <code>X</code>/<code>Y</code> columns of the dataset's
+<code>elec_coords_full.csv</code> drawn on the hemisphere images it ships with, scaled exactly
+as its own quickstart notebook does; <code>Hemisphere</code> picks the panel. Because it is a
+flattened lateral view, depth along a shaft collapses and medial structures (cingulate, MTL)
+land only approximately — read it for <i>which region</i>, never for millimetres. Colour is a
+<b>parcel</b> value, so all of one subject's contacts in one parcel share it; grey means that
+parcel has no value in that subject.</div>
+<div class="row">
+ <label>view <select id=k>__OPTIONS__</select></label>
+ <label>time <input type=range id=t min=0 value=0 style="width:400px"></label>
+ <b id=lab style="min-width:78px"></b>
+ <button id=play>play</button>
+ <span class=k><span class=dot style="border-color:#00a000"></span>Heschl's (A1)</span>
+ <span class=k><span class=dot style="border-color:#8e24aa"></span>STG</span>
+ <span class=k><span class=dot style="border-color:#666;background:#c8c8c8"></span>no value</span>
+ <span class=k><span id=neg></span><canvas id=bar width=190 height=12></canvas><span id=pos></span></span>
+</div>
+<div class=panes>
+ <div class=pane><canvas id=c0></canvas><div class=cap>left hemisphere</div></div>
+ <div class=pane><canvas id=c1></canvas><div class=cap>right hemisphere</div></div>
+</div>
+<div id=tip></div>
+<script>
+const P=__PAYLOAD__;
+const cv=[document.getElementById('c0'),document.getElementById('c1')];
+const im=[new Image(),new Image()];
+const t=document.getElementById('t'),k=document.getElementById('k'),
+      lab=document.getElementById('lab'),pb=document.getElementById('play'),
+      tip=document.getElementById('tip');
+// open AT word onset, not at -484 ms: the first bin is pre-stimulus and shows nothing
+t.max=P.t_ms.length-1; t.value=P.t_ms.findIndex(v=>v>=0);
+['left','right'].forEach((sd,i)=>{cv[i].width=P.wh[sd][0];cv[i].height=P.wh[sd][1];
+  im[i].src='data:image/png;base64,'+P.img[sd];});
+// index contacts by panel once; only the values change as you scrub
+const idx=[[],[]]; P.side.forEach((s,i)=>idx[s].push(i));
+function col(v,lim){ // matplotlib RdBu_r, sent as a 128-entry LUT
+  let u=Math.max(0,Math.min(1,(v/lim+1)/2)), c=P.lut[Math.round(u*(P.lut.length-1))];
+  return 'rgb('+c[0]+','+c[1]+','+c[2]+')';}
+function valAt(i,fi){const s=P.series[k.value][P.g[i]];
+  if(s===null)return null; const v=s[fi]; return v===null?null:v/1000;}
+function draw(){
+  const fi=+t.value, lim=P.lim[k.value];
+  lab.textContent=(P.t_ms[fi]>=0?'+':'')+P.t_ms[fi].toFixed(0)+' ms';
+  document.getElementById('neg').textContent='-'+lim.toFixed(2)+' ';
+  document.getElementById('pos').textContent=' +'+lim.toFixed(2);
+  const bx=document.getElementById('bar').getContext('2d');
+  for(let x=0;x<190;x++){bx.fillStyle=col((x/189*2-1)*lim,lim);bx.fillRect(x,0,1,12);}
+  for(let s=0;s<2;s++){
+    const g=cv[s].getContext('2d');
+    g.clearRect(0,0,cv[s].width,cv[s].height);
+    if(im[s].complete)g.drawImage(im[s],0,0,cv[s].width,cv[s].height);
+    const R=Math.max(5,cv[s].width/210);
+    for(const i of idx[s]){
+      const v=valAt(i,fi);
+      g.beginPath(); g.arc(P.x[i],P.y[i],P.mark[i]?R*1.05:R,0,6.2832);
+      g.fillStyle=(v===null)?'#c8c8c8':col(v,lim); g.fill();
+      g.lineWidth=P.mark[i]?R*.38:R*.22;  // a ring, not a filled disc: the value must stay visible
+      g.strokeStyle=P.mark[i]?P.ring[P.mark[i]]:'rgba(0,0,0,.55)'; g.stroke();
+    }
+  }
+}
+im.forEach(x=>x.onload=draw);
+k.onchange=draw; t.oninput=draw;
+let timer=null;
+pb.onclick=()=>{if(timer){clearInterval(timer);timer=null;pb.textContent='play';return;}
+  pb.textContent='stop';
+  timer=setInterval(()=>{t.value=(+t.value+1)%(+t.max+1);draw();},110);};
+// hover: nearest contact in THIS panel, in canvas pixels
+cv.forEach((c,s)=>{
+  c.onmousemove=e=>{
+    const r=c.getBoundingClientRect(), sc=c.width/r.width;
+    const mx=(e.clientX-r.left)*sc, my=(e.clientY-r.top)*sc;
+    let best=-1,bd=1e9;
+    for(const i of idx[s]){const d=(P.x[i]-mx)**2+(P.y[i]-my)**2; if(d<bd){bd=d;best=i;}}
+    if(best<0||bd>(14*sc)**2){tip.style.display='none';return;}
+    const v=valAt(best,+t.value);
+    tip.textContent=P.lab[best]+' · d_cv '+(v===null?'n/a':(v>=0?'+':'')+v.toFixed(3));
+    tip.style.display='block';
+    tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px';};
+  c.onmouseleave=()=>tip.style.display='none';});
+draw();
+</script>"""
 
 
 # --------------------------------------------------------------------------------------
@@ -862,8 +1156,12 @@ def main() -> None:
     fig_depth(D, rows, cov, T, args.out)
 
     if not args.no_demo:
-        coords = load_coords(args.red_dir, args.bt_root)
-        build_demo(D, coords, base_of, T, args.out,
+        tmpl = load_template_coords(args.red_dir, args.bt_root)
+        invariant_projection(tmpl, base_of, lobe_of_base)
+        fig_template_qc(tmpl, base_of, lobe_of_base, args.out)
+        for task in ("onset", "speech"):
+            fig_template_render(D, tmpl, base_of, T, args.out, args.tap, task)
+        build_demo(D, tmpl, base_of, T, args.out,
                    tuple(t for t in args.demo_tasks.split(",") if t),
                    tuple(t for t in args.demo_taps.split(",") if t))
 
