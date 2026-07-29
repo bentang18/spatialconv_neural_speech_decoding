@@ -411,71 +411,83 @@ def fig3() -> None:
 
 # ---------------------------------------------------------------- fig 4: concentration
 def fig4() -> None:
-    """3-PC r vs FULL-SPACE r, per task, paired.
+    """3-PC r vs FULL-SPACE r. The shaded gap between them IS the claim.
 
-    The earlier version drew per-task lines for the 3-PC r and a single pooled black line for
-    the full space. Those are different units -- one task, all tasks -- so the comparison the
-    figure exists to make was the one thing a reader could not do. Here every task carries BOTH
-    of its own numbers and the shaded gap between them IS the claim.
+    Two earlier versions failed for opposite reasons. The first drew per-task 3-PC lines against
+    a single POOLED full-space line -- different units, so the comparison the figure exists to
+    make could not be made. The second paired every task with its own full-space line: correct,
+    but twelve lines and six fills, and the claim drowned.
+
+    So: ONE aggregate pair (mean over the five speech tasks) plus the control pair, four lines.
+    Per-task detail does not vanish -- the count of tasks whose gap widens is computed over all
+    five and printed ON the figure, which answers "does it hold for every task" with a number
+    instead of ten more lines. Full per-task values stay in report.json and the [check] output.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(7.4, 3.0), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.0), sharey=True)
     DUD = "frame_brightness"
+    holds = []
     for ax, win in zip(axes, ("win1s", "win2s")):
         rep = json.load(open(VIZ / win / "report.json"))
-        # Flat "<lobe>/<tap>" keys; the shared-lobe panel is "T". The 1 s suite ran WITHOUT
-        # enc0, so each window gets its own tap list rather than a shared constant.
         have = [t for t in TAPS if f"T/{t}" in rep["figures"]]
         three = {t: rep["figures"][f"T/{t}"]["align_3pc"] for t in have}
-        # Per-TASK full-space r, from the same rows the pooled number was averaged out of.
         full = {t: {r["task"]: r["cross_subject_r"] for r in rep["quant"]
                     if r["tap"] == t and str(r["class"]) == "contrast"} for t in have}
-        tasks = [k for k in sorted(three[have[0]]) if k != DUD] + [DUD]
-        x = range(len(have))
-
-        for tk in tasks:
-            dud = tk == DUD
-            col = PALETTE["muted"] if dud else TASK_COLOR[tk]
-            y3 = [three[t][tk] for t in have]
-            yf = [full[t].get(tk, float("nan")) for t in have]
-            ax.fill_between(x, yf, y3, color=col, alpha=0.13, lw=0, zorder=1)
-            ax.plot(x, y3, marker="o", ms=3.4, lw=1.7, color=col, zorder=3)
-            ax.plot(x, yf, marker="s", ms=2.8, lw=1.0, ls=":", color=col, alpha=0.75, zorder=2)
-
+        speech = [k for k in sorted(three[have[0]]) if k != DUD]
+        x = list(range(len(have)))
         lo, hi = have[0], have[-1]
-        g0 = statistics.fmean(three[lo][k] - full[lo][k] for k in tasks if k != DUD)
-        g1 = statistics.fmean(three[hi][k] - full[hi][k] for k in tasks if k != DUD)
-        print(f"[check] {win} taps={have}  mean(3PC - full) {g0:+.3f} at {lo} -> {g1:+.3f} at {hi}"
-              f"   |  {DUD} gap {three[hi][DUD] - full[hi][DUD]:+.3f}")
-        # The claim is that the GAP OPENS with depth. If it did not, "concentration" would just
-        # be a restatement of "the 3 PCs are a good basis", which is true at every depth.
-        assert g1 > g0, f"[check] VIOLATED gap did not widen with depth in {win}"
+
+        # Per-task, over ALL five: does the gap widen? Reported as a count, not as lines.
+        n_hold = sum((three[hi][k] - full[hi][k]) > (three[lo][k] - full[lo][k]) for k in speech)
+        holds.append((win, n_hold, len(speech)))
+
+        series = [("mean of 5 speech tasks", speech, PALETTE["ours"], 2.0),
+                  (DUD.replace("_", " ") + " (visual control)", [DUD], PALETTE["muted"], 1.4)]
+        for lab, keys, col, lw in series:
+            y3 = [statistics.fmean(three[t][k] for k in keys) for t in have]
+            yf = [statistics.fmean(full[t][k] for k in keys) for t in have]
+            ax.fill_between(x, yf, y3, color=col, alpha=0.18, lw=0, zorder=1)
+            ax.plot(x, y3, marker="o", ms=4.2, lw=lw, color=col, zorder=3)
+            ax.plot(x, yf, marker="s", ms=3.4, lw=lw * 0.6, ls=":", color=col, zorder=2)
+
+        g = [statistics.fmean(three[t][k] - full[t][k] for k in speech) for t in have]
+        print(f"[check] {win} taps={have}  gap {g[0]:+.3f} at {lo} -> {g[-1]:+.3f} at {hi}"
+              f"   widens in {n_hold}/{len(speech)} tasks   |  {DUD} gap"
+              f" {three[hi][DUD] - full[hi][DUD]:+.3f}")
+        assert g[-1] > g[0], f"[check] VIOLATED gap did not widen with depth in {win}"
         assert abs(three[hi][DUD]) < 0.05, f"[check] VIOLATED visual control not flat in {win}"
 
-        ax.annotate("", xy=(len(have) - 1, three[hi]["onset"]),
-                    xytext=(len(have) - 1, full[hi]["onset"]),
-                    arrowprops=dict(arrowstyle="<->", lw=0.9, color="k"))
-        ax.text(len(have) - 1.06, (three[hi]["onset"] + full[hi]["onset"]) / 2,
-                "concentration", fontsize=6.6, ha="right", va="center", rotation=90)
+        # Label the two ends of the claim in the panel, so the reader does not have to
+        # measure the shaded band against the axis by eye.
+        for k, tp in ((0, lo), (len(have) - 1, hi)):
+            y3 = statistics.fmean(three[tp][t] for t in speech)
+            yf = statistics.fmean(full[tp][t] for t in speech)
+            ax.annotate("", xy=(k, y3), xytext=(k, yf),
+                        arrowprops=dict(arrowstyle="<->", lw=0.9, color="k"))
+            ax.text(k + 0.06, (y3 + yf) / 2, f"{y3 - yf:+.3f}", fontsize=7,
+                    ha="left", va="center", fontweight="bold")
         ax.axhline(0, color="k", lw=0.6, alpha=0.4)
-        ax.set_xticks(list(x)); ax.set_xticklabels(have)
-        ax.set_xlim(-0.25, len(have) - 0.55)
-        ax.set_title(f"{win[3:-1]} s window", pad=6)
+        ax.set_xticks(x); ax.set_xticklabels(have)
+        ax.set_xlim(-0.3, len(have) - 0.5)
+        ax.set_title(f"{win[3:-1]} s window  ·  gap widens in {n_hold}/{len(speech)} tasks",
+                     pad=6, fontsize=8)
         ax.set_xlabel("encoder depth")
     axes[0].set_ylabel("cross-subject alignment r")
 
-    style = [plt.Line2D([], [], color="k", lw=1.7, marker="o", ms=3.4,
-                        label="inside the fitted 3-PC subspace"),
-             plt.Line2D([], [], color="k", lw=1.0, ls=":", marker="s", ms=2.8,
-                        label="full feature space (same task)")]
-    task_h = [plt.Line2D([], [], color=PALETTE["muted"] if k == DUD else TASK_COLOR[k], lw=2.4,
-                         label=k.replace("_", " ") + (" (visual control)" if k == DUD else ""))
-              for k in sorted(TASK_COLOR) + [DUD]]
-    fig.legend(handles=style + task_h, fontsize=6.4, loc="upper center",
-               bbox_to_anchor=(0.5, 0.085), ncol=4, columnspacing=1.3, handlelength=2.2)
+    handles = [plt.Line2D([], [], color=PALETTE["ours"], lw=2.0, marker="o", ms=4.2,
+                          label="3-PC subspace  ·  speech tasks"),
+               plt.Line2D([], [], color=PALETTE["ours"], lw=1.2, ls=":", marker="s", ms=3.4,
+                          label="full feature space  ·  speech tasks"),
+               plt.Line2D([], [], color=PALETTE["muted"], lw=1.4, marker="o", ms=4.2,
+                          label="3-PC  ·  visual control"),
+               plt.Line2D([], [], color=PALETTE["muted"], lw=0.9, ls=":", marker="s", ms=3.4,
+                          label="full space  ·  visual control")]
+    fig.legend(handles=handles, fontsize=6.6, loc="upper center",
+               bbox_to_anchor=(0.5, 0.10), ncol=2, columnspacing=1.6, handlelength=2.4)
     fig.suptitle("Cross-subject agreement barely grows -- it CONCENTRATES into 3 dimensions",
                  fontsize=8.5, y=1.01)
-    fig.tight_layout(rect=(0, 0.10, 1, 1)); _save(fig, "fig4_concentration")
-    print("[check] OK the 3PC-minus-full gap widens with depth in BOTH windows")
+    fig.tight_layout(rect=(0, 0.12, 1, 1)); _save(fig, "fig4_concentration")
+    print("[check] OK gap widens in both windows; per-task " +
+          ", ".join(f"{w} {n}/{d}" for w, n, d in holds))
 
 
 def _save(fig, stem: str) -> None:
