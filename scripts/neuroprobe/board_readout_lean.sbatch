@@ -19,7 +19,13 @@
 # so peak ~ one-fit floor; workers>1 multiplies it. CS taps are parcel-mean (~40x smaller) so CS
 # runs workers=4. numactl --interleave=all avoids NUMA node-0 starvation.
 #
-#   usage: sbatch --array=<0-N> --mem=<G> board_readout_lean.sbatch <CACHE> <TAG> <SHARD> <MODE> <WORKERS> [MMAP]
+#   usage: sbatch --array=<0-N> --mem=<G> board_readout_lean.sbatch <CACHE> <TAG> <SHARD> <MODE> <WORKERS> [MMAP] [TAPS]
+# TAPS (optional, comma-separated) overrides the per-regime default unit. Empty = per-regime
+# default (WS/CSession electrode, CS parcel). Passing the parcel taps to ws/csession is the
+# UNIT CONTROL: it puts all three regimes on the same feature unit so a regime effect can be
+# told apart from a spatial-averaging effect. Shard files are named {mode}_{cell}.json with no
+# tap in the name, so a tap-overridden run MUST use its own --shard-dir or it silently
+# overwrites the default-unit shards.
 # MMAP defaults to --no-mmap (EAGER load). The script's own MMAP_DEFAULT is False for every mode:
 # eager sequential load runs ~86 MB/s and leaves gathers as fast RAM indexing, whereas --mmap DEFERS
 # the read into ~180 per-(task,fold,split) scattered gathers at ~24 MB/s, which measured 78 min (73%
@@ -33,7 +39,7 @@
 # count matches exactly between the sidecar and the r6_board_40k cache for all 12 sessions.
 set -euo pipefail
 CACHE="${1:?CACHE_DIR}"; TAG="${2:?TAG}"; SHARD="${3:?SHARD_DIR}"
-MODE="${4:?MODE ws|cs|csession}"; WK="${5:?WORKERS}"; MMAP="${6:---no-mmap}"
+MODE="${4:?MODE ws|cs|csession}"; WK="${5:?WORKERS}"; MMAP="${6:---no-mmap}"; TAPS="${7:-}"
 cd /projects/bhqk/htang13/speech_board
 module load pytorch-conda/2.8
 CPT="${SLURM_CPUS_PER_TASK:-8}"
@@ -54,6 +60,12 @@ SIDECAR_ARGS=()
 if [[ "$MODE" == "csession" ]]; then
   SIDECAR_ARGS=(--elec-labels-sidecar /projects/bhqk/htang13/arm0_elec_labels_sidecar.pkl)
 fi
+TAPS_ARGS=()
+if [[ -n "$TAPS" ]]; then
+  TAPS_ARGS=(--taps "$TAPS")
+  echo "[check] TAP OVERRIDE: $TAPS (regime default NOT used) -> shard dir must be tap-specific"
+fi
 numactl --interleave=all python -u scripts/neuroprobe/v3_board_readout.py \
   --cache-dir "$CACHE" --tags "$TAG" --mode "$MODE" --index "$SLURM_ARRAY_TASK_ID" \
-  --shard-dir "$SHARD" --no-std-target --workers "$WK" "$MMAP" "${SIDECAR_ARGS[@]}" --out /dev/null
+  --shard-dir "$SHARD" --no-std-target --workers "$WK" "$MMAP" "${SIDECAR_ARGS[@]}" \
+  "${TAPS_ARGS[@]}" --out /dev/null

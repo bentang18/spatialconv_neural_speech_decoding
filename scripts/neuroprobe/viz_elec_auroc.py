@@ -317,7 +317,10 @@ def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
             out[f"n/{task}"] = np.int64(len(sel))
             out[f"n1/{task}"] = np.int64(int(y.sum()))
             if verbose:
-                thr = float(np.quantile(np.abs(null - 0.5).max(axis=(1, 2)), 0.95))
+                # --n-perm 0 is the map-only mode used to smoke-test the read path against a
+                # real record; there is no threshold to quote then, and no inference either.
+                nm = out[f"null_max/{tap}/{task}"]
+                thr = float(np.quantile(nm, 0.95)) if len(nm) else float("nan")
                 print(f"[auroc] {tap} {task}: n={len(sel)} P={P} T={T} "
                       f"max={obs.max():.3f} fwer_thr={0.5 + thr:.3f} "
                       f"n_cells_fwer={(np.abs(obs - .5) > thr).sum()} "

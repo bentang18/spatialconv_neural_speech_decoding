@@ -107,7 +107,8 @@ def _freeze(m, *, device):
 
 
 def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teacher.model.",
-                  early_fusion: bool = False, no_fusion: bool = False, nf_decimate: int = 2):
+                  early_fusion: bool = False, no_fusion: bool = False, nf_decimate: int = 2,
+                  space_rope: bool = True):
     """Load ONLY the shipped encoder tower (`_TargetTower` = PerBandStem + encoder) from the ckpt.
 
     Filter the LightningModule state_dict to the ``pref``-rooted subtree and load it into a fresh
@@ -133,8 +134,21 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     if peek and int(peek[0]) != N_PARCELS:
         raise ValueError(f"ckpt parcel table {peek[0]} != expected {N_PARCELS}")
     deep_sup = any(kk.startswith("encoder.norms_block.") for kk in tsd)
-    print(f"[encode] tower deep_sup={deep_sup} (inferred from ckpt keys)")
-    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=deep_sup, early_fusion=early_fusion,
+    # parcel_embed is READ OFF the ckpt for the same reason deep_sup is: the --no-parcel-embed
+    # arm ships a tower with no parcel_embed submodule at all, so a shell built with one puts
+    # parcel_embed.embed.weight in `missing` and the check below raises. Inferring it keeps that
+    # check as the verifier — a wrong inference still fails loud, it is never silently absorbed.
+    parcel_embed = bool(peek)
+    # ⚠️ space_rope CANNOT be inferred and is NOT checked: L1RoPE zeroes idx_freq when
+    # space=False and registers it persistent=False (pe.py), so a --no-space-rope ckpt is
+    # key- AND value-identical to a space-rope-ON one. missing/unexpected both come back
+    # empty and the check below PASSES while the tower rotates by contact index that the
+    # trained model never saw. Nothing in the ckpt can catch it (no save_hyperparameters
+    # anywhere), so the caller MUST pass it and the banner MUST record what was used.
+    print(f"[encode] tower deep_sup={deep_sup} parcel_embed={parcel_embed} "
+          f"(inferred from ckpt keys) space_rope={space_rope} (NOT inferable — from CLI)")
+    tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=deep_sup, parcel_embed=parcel_embed,
+                         space_rope=space_rope, early_fusion=early_fusion,
                          no_fusion=no_fusion, nf_decimate=nf_decimate)
     missing, unexpected = tower.load_state_dict(tsd, strict=False)
     bad = [m for m in missing if "num_batches_tracked" not in m]
@@ -461,6 +475,12 @@ def main() -> None:
                         "is implied (MAE has no EMA teacher), and enc0 is available exactly as on "
                         "v3r4. The two-stream frontends (v3r5/v3r5nf/v3r5nffast) imply --online + "
                         "no enc0 (band strides are r4-only).")
+    p.add_argument("--no-space-rope", dest="no_space_rope", action="store_true",
+                   help="the ckpt was trained with dispatch_v3 --no-space-rope (ablation A2). "
+                        "MUST be passed by hand: L1RoPE registers idx_freq persistent=False, so "
+                        "a no-space-rope ckpt is key- and value-identical to a normal one and the "
+                        "state_dict check CANNOT catch a mismatch — get this wrong and the encode "
+                        "silently applies contact-index rotation the trained model never saw.")
     p.add_argument("--enc0-only", action="store_true",
                    help="compute ONLY the enc0 input floor (raw decimated band bins pooled to "
                         "parcels). No ckpt, no model, no GPU — enc0 never touched weights. Lets "
@@ -574,7 +594,8 @@ def main() -> None:
         sd = _load_ckpt(args.ckpt)
         tower_pref = "objective.online." if args.online else "objective.teacher.model."
         teacher = _load_teacher(sd, device=device, pref=tower_pref, early_fusion=is_r5,
-                                no_fusion=is_r5nf, nf_decimate=nf_dec)
+                                no_fusion=is_r5nf, nf_decimate=nf_dec,
+                                space_rope=not args.no_space_rope)
         del sd
         tower_note = "online encoder" if args.online else "EMA teacher"
     print(f"[encode-r4] tag={args.tag} device={device} gpu_taps={GPU_TAPS} + enc0 "
