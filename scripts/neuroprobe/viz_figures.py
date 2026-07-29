@@ -451,15 +451,12 @@ def figure_b(sessions, tap: str, task: str, cls, out_path: str,
     return {"evr": [float(v) for v in evr], "n_panels": n}
 
 
-def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None,
-              *, n_pre: int | None = None) -> dict:
-    """Can a token from one subject find the SAME timepoint in another subject?
+def retrieval_sims(sessions, lobes, tap: str, task: str, *, n_pre: int | None = None):
+    """The per-pair similarity matrices behind `retrieval`, plus its scalar summary.
 
-    Correlation says the trajectories look alike overall; retrieval asks something sharper
-    and harder to fake: take subject A's contrast at time t, and among all of subject B's
-    timepoints pick the nearest. Top-1 at chance 1/T means the shared structure carries no
-    temporal identity. The whole cross-subject decoding claim rests on tokens being
-    comparable ACROSS brains, and this is that claim in its most direct form.
+    Split out so a figure can draw the matrices without recomputing them and without the
+    scalars drifting from the ones already in report.json. Returns ([] , {}) when the task
+    has fewer than two usable sessions, matching `retrieval`'s empty contract.
     """
     pairs = collect(sessions, tap, task, CONTRAST, "all", lobes, centered=True, n_pre=n_pre)
     traj = []
@@ -469,7 +466,7 @@ def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None,
         nrm = np.linalg.norm(x, axis=1, keepdims=True)
         traj.append((s, x / np.maximum(nrm, 1e-12)))
     if len(traj) < 2:
-        return {}
+        return [], {}
     t_len = traj[0][1].shape[0]
     hits, tot, sims, ranks = 0, 0, [], []
     for i, (si, a) in enumerate(traj):
@@ -486,10 +483,27 @@ def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None,
                 order = np.argsort(-direction, axis=1)
                 ranks.extend(int(np.where(order[k] == k)[0][0]) for k in range(t_len))
     if not tot:
-        return {}
+        return [], {}
     out = {"tap": tap, "task": task, "top1": hits / tot, "chance": 1.0 / t_len,
            "median_rank": float(np.median(ranks)), "n_frames": t_len,
            "n_pairs": len(sims)}
+    return sims, out
+
+
+def retrieval(sessions, lobes, tap: str, task: str, out_path: str | None = None,
+              *, n_pre: int | None = None) -> dict:
+    """Can a token from one subject find the SAME timepoint in another subject?
+
+    Correlation says the trajectories look alike overall; retrieval asks something sharper
+    and harder to fake: take subject A's contrast at time t, and among all of subject B's
+    timepoints pick the nearest. Top-1 at chance 1/T means the shared structure carries no
+    temporal identity. The whole cross-subject decoding claim rests on tokens being
+    comparable ACROSS brains, and this is that claim in its most direct form.
+    """
+    sims, out = retrieval_sims(sessions, lobes, tap, task, n_pre=n_pre)
+    if not out:
+        return {}
+    t_len = out["n_frames"]
     if out_path:
         fig, ax = plt.subplots(figsize=(4.6, 4.0))
         im = ax.imshow(np.mean(sims, axis=0), cmap="magma", interpolation="nearest")
