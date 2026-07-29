@@ -184,9 +184,27 @@ def _geometry(er: LeaceEraser, x: np.ndarray, domain: np.ndarray) -> dict:
     as a self-check -- a value below 1 means something upstream is wrong -- and NEVER as evidence.
     Its real content is interpretive: what LEACE erases here IS the between-session mean-shift
     axis, which is why the between/within split below is the load-bearing diagnostic.
+
+    ``cos_pc1`` and ``pc_participation`` have a NULL that must be printed beside them, because
+    ANISOTROPY alone drives both toward "it IS a principal axis" with no group structure at all: a
+    i^-3 spectrum gives cos_pc1 ~.67 / participation 2.6 from nothing. Dimensionality was never the
+    mechanism -- white features at d/n=13 give .04 / 180. Under the null the group-mean difference
+    is a draw from ``N(0, Sigma * 4/n)``, so its expected squared loading on PC_i goes as lambda_i:
+
+        E[cos_pc1^2] = pc1_var_frac          and       E[pc_participation] = 1 / sum(f_i^2)
+
+    So ``cos_pc1_excess`` (observed cos^2 over that null) is the number to read; a large
+    ``cos_pc1`` beside a large ``pc1_var_frac`` is not evidence of anything. Simulated across decay
+    0-3 and d/n 0.29-13.3, the null excess never exceeds ~1.5, while a rigid offset of 1 total sd
+    reaches ~5. High d/n biases it DOWNWARD (~0.6, sample pc1 eigenvalue inflation), i.e. toward
+    the safe side, so the deep taps' excess is if anything understated.
+
+    Read per-cell values with care even so: under the null ``cos_pc1^2`` rides one chi-square-1
+    variate, so a SINGLE cell near 1 is weak evidence and the agreement across cells is the signal.
     """
     s, d = er.sv, er.removed_dir[:, 0]
     tot = float((s**2).sum())
+    f = s**2 / tot                                      # the spectrum, as fractions of variance
     c = er.basis.T @ d                                  # the direction, expressed over PCs
     w = c**2 / max(float((c**2).sum()), 1e-300)         # its distribution over PCs
     uni = np.ones(d.size) / np.sqrt(d.size)             # common mode: every feature, equal weight
@@ -203,6 +221,10 @@ def _geometry(er: LeaceEraser, x: np.ndarray, domain: np.ndarray) -> dict:
         "cos_pc1": float(abs(c[0])),
         # How many PCs the direction really occupies. ~1 => it IS a principal axis.
         "pc_participation": float(1.0 / max(float((w**2).sum()), 1e-300)),
+        # ...but ~1 is only meaningful against what the spectrum alone would give. See the docstring.
+        "cos_pc1_null": float(np.sqrt(f[0])),
+        "cos_pc1_excess": float(c[0] ** 2 / max(float(f[0]), 1e-300)),
+        "pc_participation_null": float(1.0 / max(float((f**2).sum()), 1e-300)),
         "wt_in_top10_pcs": float(w[:10].sum()),
         "pc_com": float((w * np.arange(w.size)).sum()),  # centre of mass in the spectrum
         # THE decisive split. between_frac ~ 1 => the erasure deleted an AUROC-invisible offset.
@@ -288,8 +310,10 @@ def _cell_arms(anchor_rec, test_rec, task, taps, n_components) -> dict:
                     f"the erased direction must BE the between-domain mean shift for a binary "
                     f"concept, got cos={geom['cos_domain_mean_shift']:.6f}")
             print(f"    [geom] {enc:>6} {name:<11} var {geom['var_removed']:.4f} | cos_pc1 "
-                  f"{geom['cos_pc1']:.4f} | pc_part {geom['pc_participation']:7.1f} | "
-                  f"BETWEEN {geom['dir_between_frac']:.4f} | effective_within "
+                  f"{geom['cos_pc1']:.4f} vs null {geom['cos_pc1_null']:.4f} (x"
+                  f"{geom['cos_pc1_excess']:.2f}) | pc_part {geom['pc_participation']:7.1f} vs "
+                  f"null {geom['pc_participation_null']:7.1f} | BETWEEN "
+                  f"{geom['dir_between_frac']:.4f} | effective_within "
                   f"{geom['var_removed'] * (1 - geom['dir_between_frac']):.5f}", flush=True)
             a, (b, c) = B._standardize_inplace(
                 L._f32(er(z_tr)), [L._f32(er(z_va)), L._f32(er(z_te))])
