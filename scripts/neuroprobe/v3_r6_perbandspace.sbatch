@@ -48,11 +48,24 @@
 #   space_frac 0.50: bw1 .224 | bw2 .342 | bw4 .517 | bw6 .547   <- knee at 4, 6 is diminishing
 #   space_frac 0.25: bw1 .046 | bw2 .140 | bw4 .281 | bw6 .227   <- 4 is the MAXIMUM
 #
-# Ben 07-29 asked whether to mask at width 1 and let blocks emerge by chance. That works at 0.50
-# (.224 hard) but COLLAPSES at 0.25 (.046 -- 95% of masked contacts keep a visible neighbour, and
-# R20 says that neighbour carries r = .56/.40/.27). Rate and width trade off and nearly cancel:
-# 0.50+bw1 (.224) ~= 0.25+bw4 (.281). You can have emergent blocks OR the lower rate, not both.
-# This arm takes the lower rate and keeps width 4. Width changes arrangement only, never count.
+# WIDTH 1 IS THE LAUNCHED SETTING (Ben 07-29: "I think we swap to 0.25 with width 1"). Width 1 does
+# NOT mean "no blocks" -- blocks still emerge from the RATE alone (measured mean run 1.18, max 4 at
+# 0.25; 1.65, max 6 at 0.50). It means we stop IMPOSING one. That is the point: block_w_space is the
+# last hand-set number on this axis, R18 priced the whole arrangement lever at dr = +.019, and the
+# rate sweep showed harder is not better, so there is nothing left motivating a chosen width.
+#
+# The cost, stated so nobody rediscovers it: at 0.25 + width 1 only .046 of masked contacts sit off
+# the d=1 shortcut, so the spatial task is thin -- and the difficulty that remains is NOT uniform
+# (hard frac by shaft size at 0.25/bw4 runs .000/.000/.189/.152/.110/.268/.476/.503 for n_s =
+# 4/5/6/8/10/13/14/16; width 1 is flatter but lower everywhere). A null on this arm therefore CANNOT
+# distinguish "the cross-band bridge does not matter" from "there was no spatial task to bridge."
+#
+# THE COMPARISON THIS ARM EXISTS FOR (Ben): space mask 0 vs space mask 0.25 under per-band
+# independent masking. At space_frac=0, d_s = round(0*n_s) = 0 ⇒ NOTHING is spatially masked ⇒
+# per-band and tube are the SAME RUN. So maskspace0 (job 2763520) already IS the 0 arm, and the pair
+# is ONE conceptual knob: does spatial masking earn its keep at all, in its best form. Accepted
+# trade-off: width 1 gives up the one-knob control against maskspace25 (2742871 = tube, width 4), so
+# per-band ARRANGEMENT is no longer isolated. If maskspace0 wins, arrangement is moot regardless.
 #
 # THE RATE (Ben 07-29, "we should probably spatial mask at a lower percent, 25 is better than 50").
 # Correct, and it is what makes this arm READABLE: the closed visible-fraction sweep put space_frac

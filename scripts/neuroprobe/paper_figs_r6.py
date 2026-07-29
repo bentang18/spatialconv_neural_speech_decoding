@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import statistics
 
 import matplotlib
@@ -132,6 +133,23 @@ def cs_cells(path: pathlib.Path) -> dict[str, dict[str, float]]:
             for c in sorted(cells)}
 
 
+def by_subject(cells: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    """Collapse session cells (S1T1, S1T2) onto their subject (S1), averaging the taps.
+
+    Ten session lines is more clutter than argument -- the reader is asked whether depth helps
+    ACROSS PEOPLE, and two trials of one person are not two pieces of evidence for that. The
+    macro on the panel is still the unweighted mean over SESSIONS (it is the board's unit), so
+    the black line is unchanged by this collapse; only the grey lines merge.
+    """
+    groups: dict[str, list[dict[str, float]]] = {}
+    for cell, v in cells.items():
+        m = re.fullmatch(r"S(\d+)T\d+", cell)
+        assert m, f"cannot read a subject out of cell name {cell!r}"
+        groups.setdefault(f"S{m.group(1)}", []).append(v)
+    return {s: {tap: statistics.fmean(v[tap] for v in vs) for tap in vs[0]}
+            for s, vs in sorted(groups.items(), key=lambda kv: int(kv[0][1:]))}
+
+
 def _slopegraph(ax, cells: dict[str, dict[str, float]], taps: list[str], macro: dict[str, float],
                 board: float, board_label: str) -> int:
     """Per-cell lines across taps + the macro in black. Returns the monotone-cell count.
@@ -157,8 +175,11 @@ def _slopegraph(ax, cells: dict[str, dict[str, float]], taps: list[str], macro: 
     ax.plot(range(len(taps)), [macro[t] for t in taps], marker="o", ms=6, lw=2.6,
             color="k", zorder=5, label="macro")
     ax.axhline(board, color=PALETTE["accent"], lw=0.9, ls="--")
-    ax.text(-0.26, board + 0.0012, board_label, color=PALETTE["accent"],
-            fontsize=6.4, ha="left", va="bottom")
+    # Whichever side of the rule the macro line is NOT on at the left edge.
+    below = macro[taps[0]] > board
+    ax.text(-0.26, board + (-0.0012 if below else 0.0012), board_label,
+            color=PALETTE["accent"], fontsize=6.4, ha="left",
+            va="top" if below else "bottom")
     ax.set_xticks(range(len(taps)))
     ax.set_xticklabels([t.replace("_elec", "") for t in taps], fontsize=7)
     ax.set_xlim(-0.28, x + 0.34)
@@ -196,17 +217,18 @@ def fig2() -> None:
     ax.set_xlabel("cross-subject macro AUROC (10/10 cells)")
     ax.set_title("Cross-subject leaderboard", pad=6)
 
-    mono = _slopegraph(ax2, cells, TAPS, macro, best, f"board top {best:.4f}")
-    beat = sum(v["enc12"] > v["enc0"] for v in cells.values())
-    print(f"[check] CS per cell: monotone in {mono}/{len(cells)}, "
-          f"enc12 > enc0 in {beat}/{len(cells)}")
+    subj = by_subject(cells)
+    mono = _slopegraph(ax2, subj, TAPS, macro, best, f"board top {best:.4f}")
+    beat = sum(v["enc12"] > v["enc0"] for v in subj.values())
+    print(f"[check] CS {len(cells)} sessions -> {len(subj)} subjects: monotone in "
+          f"{mono}/{len(subj)}, enc12 > enc0 in {beat}/{len(subj)}")
     ax2.set_ylabel("cross-subject macro AUROC")
     # Two DIFFERENT counts, and conflating them would overclaim. Every cell ends higher than it
     # started, but only 4 climb at every rung -- the macro ladder is monotone, the cells are not.
-    ax2.set_title(f"Per cell: enc12 > enc0 in {beat}/{len(cells)}\n"
+    ax2.set_title(f"Per subject: enc12 > enc0 in {beat}/{len(subj)}\n"
                   f"(monotone at every tap in {mono})", pad=6, fontsize=8)
-    ax2.legend(fontsize=6.5, loc="lower right")
-    fig.text(0.5, -0.04, "orange = not monotone across taps (still ends above enc0)",
+    ax2.legend(fontsize=6.5, loc="upper left")
+    fig.text(0.5, -0.04, "one line per SUBJECT (trials averaged)  ·  orange = not monotone across taps (still ends above enc0)",
              ha="center", fontsize=6.2, color=PALETTE["accent"])
     fig.tight_layout(); _save(fig, "fig2_ladder")
 
@@ -280,10 +302,13 @@ def fig2_ws() -> None:
 
     # Paired slopegraph, not two bars. The macro hides whether the gain is uniform or carried
     # by a couple of cells, and "partial cells lie" is exactly a warning about that.
-    _slopegraph(ax2, cells, WS_TAPS, macro, best, f"board top {best:.4f}")
+    subj = by_subject(cells)
+    swins = sum(v["enc12_elec"] > v["enc0_elec"] for v in subj.values())
+    print(f"[check] WS {len(cells)} sessions -> {len(subj)} subjects: depth helps {swins}/{len(subj)}")
+    _slopegraph(ax2, subj, WS_TAPS, macro, best, f"board top {best:.4f}")
     ax2.set_ylabel("within-session macro AUROC")
-    ax2.set_title(f"Per cell: depth helps {wins}/{len(cells)}", pad=6)
-    ax2.legend(fontsize=6.5, loc="lower right")
+    ax2.set_title(f"Per subject: depth helps {swins}/{len(subj)}", pad=6)
+    ax2.legend(fontsize=6.5, loc="upper left")
 
     # Only TWO points, and that is an encode limitation, not a choice: the board encode ran
     # `--elec-taps 0,12` (v3_board_encode_r6.sbatch:57) and WS is per-ELECTRODE, so enc3_elec
