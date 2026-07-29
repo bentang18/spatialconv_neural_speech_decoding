@@ -40,6 +40,7 @@ TAPS = ["enc0", "enc3", "enc6", "enc12"]
 # Neuroprobe CS leaderboard, same board/split. Decoder is NOT held constant across these
 # entries -- .539/.566/.578 are logistic/MLP/CNN on ONE fixed Laplacian-STFT feature set.
 BOARD = {"CNN (Laplacian-STFT)": 0.578, "PopT": 0.575, "Linear (logistic)": 0.539}
+LEAD = "45k cd"          # the shipped checkpoint: 45k with the linear cooldown
 CKPTS = {
     "20k": "results_v3_board_r6_20k.json",
     "40k": "results_v3_board_r6_40k.json",
@@ -92,13 +93,13 @@ def fig2() -> None:
         assert mono, f"[check] VIOLATED ladder not monotone at {name}: {l}"
         assert abs(l["enc0"] - 0.5872) < 2e-4, f"enc0 drifted at {name}: {l['enc0']}"
     print("[check] OK ladder strictly monotone at all 4 ckpts; enc0 == .5872 in every one")
-    print("[check] 40k ladder = " + "  ".join(f"{t} {lads['40k'][t]:.4f}" for t in TAPS))
+    print(f"[check] {LEAD} ladder = " + "  ".join(f"{t} {lads[LEAD][t]:.4f}" for t in TAPS))
 
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.6), width_ratios=[1.15, 1])
 
     x = range(len(TAPS))
     for name, l in lads.items():
-        lead = name == "40k"
+        lead = name == LEAD
         ax.plot(x, [l[t] for t in TAPS], marker="o", ms=4 if lead else 3,
                 lw=1.8 if lead else 0.9, zorder=3 if lead else 2,
                 color=PALETTE["ours"] if lead else PALETTE["muted"],
@@ -114,8 +115,8 @@ def fig2() -> None:
     ax.legend(fontsize=6.5, loc="lower right", ncol=2)
 
     names = ["their\nlinear", "our enc0\n(0 params)", "PopT", "their CNN\n(prior SOTA)", "ours\nenc12"]
-    vals = [BOARD["Linear (logistic)"], lads["40k"]["enc0"], BOARD["PopT"],
-            BOARD["CNN (Laplacian-STFT)"], lads["40k"]["enc12"]]
+    vals = [BOARD["Linear (logistic)"], lads[LEAD]["enc0"], BOARD["PopT"],
+            BOARD["CNN (Laplacian-STFT)"], lads[LEAD]["enc12"]]
     cols = ["#bbb", PALETTE["enc0"], "#bbb", PALETTE["accent"], PALETTE["ours"]]
     ax2.bar(range(len(vals)), vals, color=cols, width=0.62)
     for i, v in enumerate(vals):
