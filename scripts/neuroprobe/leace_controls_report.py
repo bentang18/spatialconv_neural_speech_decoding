@@ -52,11 +52,19 @@ GEOM = ("var_removed", "pc1_var_frac", "cos_pc1", "cos_pc1_excess", "pc_particip
 # comparable quantity and the raw number is only a diagnostic.
 NULLED = ("cos_pc1", "pc_participation", "dir_between_frac", "var_removed")
 
+# The gain pretraining delivers cross-subject is speech-selective (k_CS/k_WS: language 1.21,
+# acoustic 1.17, visual 0.86), so a shared task axis is only a candidate mechanism if it also
+# rises selectively. Pooling `task_cos` over the menu averages the two groups together and the
+# contrast disappears, which is why the breakdown is printed beside the pooled line.
+VISUAL = ("face_num", "frame_brightness", "global_flow", "local_flow")
 
-def load(d: Path) -> tuple[dict, dict]:
-    """-> scores[(cell, task, tap, arm)] = test AUROC, and checks[(cell, tap)] = the geometry dict."""
+
+def load(d: Path) -> tuple[dict, dict, dict]:
+    """-> scores[(cell, task, tap, arm)] = test AUROC, checks[(cell, tap)] = the geometry dicts,
+    and by_task[(cell, task, tap)] = the same dict with the task it came from kept."""
     scores: dict = {}
     checks: dict = {}
+    by_task: dict = {}
     for f in sorted(d.glob("*.json")):
         m = re.search(r"_(S\d+T\d+)\.json$", f.name)
         if not m:
@@ -68,7 +76,8 @@ def load(d: Path) -> tuple[dict, dict]:
                 scores[(cell, task, tap, arm)] = v["test"]
             for tap, ck in res.get("checks", {}).items():
                 checks.setdefault((cell, tap), []).append(ck)
-    return scores, checks
+                by_task[(cell, task, tap)] = ck
+    return scores, checks, by_task
 
 
 def paired(scores: dict, tap: str, arm: str, base: str = "std") -> dict | None:
@@ -104,7 +113,7 @@ def main() -> None:
     p.add_argument("--json-out", default="")
     args = p.parse_args()
 
-    scores, checks = load(Path(args.dir))
+    scores, checks, by_task = load(Path(args.dir))
     taps = sorted({tp for (_, _, tp, _) in scores}, key=lambda t: (len(t), t))
     arms = [a for a in args.arms.split(",") if a]
     if not scores:
@@ -191,6 +200,20 @@ def main() -> None:
               f"(x{f('task_cos') / f('task_cos_null'):.2f})   {beat}/{len(got)} beat their p95")
         print(f"        overlap with the session offset: {f('task_vs_sess_t'):.4f} "
               f"(chance {f('task_vs_sess_chance'):.4f})")
+
+        groups: dict[str, list] = {}
+        for (_, task, tp), ck in by_task.items():
+            if tp == tap and "task_cos" in ck:
+                groups.setdefault("visual" if task in VISUAL else "speech/language", []).append(ck)
+        if set(groups) == {"speech/language", "visual"}:
+            for lab in ("speech/language", "visual"):
+                sub = groups[lab]
+                cos = st.fmean(r["task_cos"] for r in sub)
+                nul = st.fmean(r["task_cos_null"] for r in sub)
+                beat_g = sum(r["task_cos"] > r["task_cos_null_p95"] for r in sub)
+                out["task"][tap][lab] = {"cos": cos, "null": nul, "beat_p95": beat_g, "n": len(sub)}
+                print(f"        {lab:<16} cos {cos:.4f}  vs null {nul:.4f}   "
+                      f"{beat_g}/{len(sub)} beat their p95")
 
     print("\n=== verdict ===")
     effective: dict[str, float] = {}
