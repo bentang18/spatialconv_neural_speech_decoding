@@ -1120,6 +1120,138 @@ def movie_brain_elec(agg: dict, tmpl: dict, tap: str, tasks, out: str, *,
     return p
 
 
+def build_demo_elec(agg: dict, tmpl: dict, out: str, *, taps, tasks,
+                    win: tuple[float, float], sessions=None) -> str:
+    """The scrub demo, driven by measure #2 instead of measure #1.
+
+    Reuses ``viz_anatomy``'s template wholesale -- same canvas, scrubber, hover and LUT. Three
+    things differ from the ``d_cv`` demo and all three are substantive:
+
+    * **Per CONTACT, not per parcel.** measure #1 had one value per (subject, parcel) and needed a
+      group index to stay small; measure #2 is already per contact, and at 32 bins the whole cube
+      is a few hundred kB, so every contact carries its own series (``g[i] = i``).
+    * **Signed.** The value is ``AUROC - 0.5``, which is signed, so the diverging RdBu_r scale
+      means what it looks like it means.
+    * **The FWER layer.** Survivors of the whole-map max-statistic threshold get a heavy ring and
+      everything else fades. Without it this would be measure #1 in different paint -- the
+      calibrated null IS what measure #2 adds.
+
+    ``win`` is REQUIRED for the same reason as in :func:`fig_peak_time`: the ms axis is the
+    scrubber's entire content, and ``viz_anatomy``'s ``_t_ms`` describes the 2 s reduction.
+    """
+    import base64
+
+    from scripts.neuroprobe.viz_anatomy import MARK, _img_png, render_demo_html
+
+    w0, w1 = float(win[0]), float(win[1])
+    assert w1 > w0, f"--win must be start,end with end > start (got {win})"
+    assert tmpl["pts"], "no projected contacts"
+
+    # one trial per subject: two trials of the same subject are the same montage, so pooling both
+    # would double-weight that subject. Same rule as viz_anatomy._pooled_contacts -- but the
+    # electrode INDEX is kept here, because the value lives per contact and must be looked up.
+    pick: dict = {}
+    for key in sorted(tmpl["pts"]):
+        pick.setdefault(key[0], key)
+
+    pts = []
+    for subj, key in sorted(pick.items()):
+        sess = f"s{key[0]}_t{key[1]}"
+        if sessions is not None and sess not in sessions:
+            continue
+        v = tmpl["pts"][key]
+        canon = agg["canon"].get(sess)
+        if canon is None:
+            continue
+        assert len(canon) == len(v["pid"]) and np.array_equal(canon, v["pid"]), (
+            f"{sess}: the shard's electrode axis ({len(canon)}) disagrees with the template's "
+            f"({len(v['pid'])}) -- refusing to render onto the wrong dots")
+        base_of_row = row_bases(agg, sess, taps[0])
+        for i in np.where(v["found"])[0]:
+            pts.append({"x": float(v["xy"][i, 0]), "y": float(v["xy"][i, 1]),
+                        "side": v["side"][i], "subj": subj, "sess": sess, "ei": int(i),
+                        "base": base_of_row[i]})
+    assert pts, "no contact survived the session filter"
+
+    series, thr, lims = {}, {}, {}
+    for tap in taps:
+        for task in tasks:
+            k = f"{tap}|{task}"
+            rows, trow, vals = [], [], []
+            for q in pts:
+                d = agg["A"].get((q["sess"], tap, task))
+                if d is None:
+                    rows.append(None)
+                    trow.append(0)
+                    continue
+                a = d["au"][q["ei"]] - 0.5
+                rows.append([int(round(1000 * x)) if np.isfinite(x) else None for x in a])
+                trow.append(int(round(1000 * float(d["fwer_thr"]))))
+                vals.append(np.abs(a))
+            if not vals:
+                continue
+            series[k] = rows
+            thr[k] = trow
+            lims[k] = round(float(np.nanpercentile(np.concatenate(vals), 98)) or 0.05, 4)
+    assert series, f"no (tap, task) in {list(taps)}x{list(tasks)} had data"
+
+    import matplotlib as mpl
+    lut = (255 * mpl.colormaps["RdBu_r"](np.linspace(0, 1, 128))[:, :3]).round().astype(int)
+    labels = []
+    for j, (base, (name, _)) in enumerate(MARK.items()):
+        for si, sd in enumerate(("left", "right")):
+            m = [q for q in pts if q["base"] == base and q["side"] == sd]
+            if len(m) >= 2:
+                labels.append({"s": si, "name": name, "dx": (-1) ** j * 0.13, "dy": j,
+                               "x": round(sum(q["x"] for q in m) / len(m), 1),
+                               "y": round(sum(q["y"] for q in m) / len(m), 1)})
+
+    T = len(next(r for r in series[next(iter(series))] if r is not None))
+    step = (w1 - w0) / T * 1000.0
+    t_ms = w0 * 1000.0 + (np.arange(T) + 0.5) * step
+    payload = {
+        "img": {sd: base64.b64encode(_img_png(tmpl["img"][sd])).decode("ascii")
+                for sd in ("left", "right")},
+        "wh": {sd: [int(tmpl["img"][sd].shape[1]), int(tmpl["img"][sd].shape[0])]
+               for sd in ("left", "right")},
+        "x": [round(q["x"], 1) for q in pts],
+        "y": [round(q["y"], 1) for q in pts],
+        "side": [0 if q["side"] == "left" else 1 for q in pts],
+        "g": list(range(len(pts))),      # one series per CONTACT, not per parcel group
+        "lab": [f"S{q['subj']} · {q['base']}" for q in pts],
+        "series": series, "thr": thr, "lim": lims,
+        "t_ms": [round(float(v), 1) for v in t_ms],
+        "lut": lut.tolist(), "labels": labels,
+    }
+    keys = [f"{tp}|{tk}" for tp in taps for tk in tasks if f"{tp}|{tk}" in series]
+    ns = len({q["sess"] for q in pts})
+    html = render_demo_html(
+        payload, keys,
+        title="Measure #2: single-trial decodability, per contact, over time",
+        h1="Which contacts carry the label, and when? Single-trial, cross-validated, "
+           "FWER-controlled",
+        intro=f"Colour is <b>AUROC &minus; 0.5</b> from a <b>single-trial</b> cross-validated fit "
+              f"at that contact and that time bin — no trial averaging anywhere. Contacts with a "
+              f"<b>heavy black ring</b> beat the <b>whole-map max-statistic FWER threshold</b> "
+              f"from 500 label permutations; the faded ones do not. That threshold is corrected "
+              f"over every contact <i>and</i> every time bin jointly, so a ring in any single "
+              f"frame is already multiplicity-controlled — scrubbing spends no extra alpha. "
+              f"<b>Dot area and colour both encode the effect</b>, and <b>hover</b> gives the "
+              f"subject, DKT parcel, value and verdict. {len(pts)} contacts, {ns} subjects, "
+              f"{T} bins of {step:.1f} ms.",
+        note="Colour is a <b>per-contact</b> value here, not a parcel average — neighbouring dots "
+             "are independent measurements. Each frame is an <b>independent fit</b>, so this "
+             "shows <i>when</i> the label is decodable, <b>not</b> signal propagating between "
+             "sites; and these are 1 s-window labels, so sustained decodability is expected.",
+        valname="AUROC&minus;.5")
+    p = os.path.join(out, "demo_measure2.html")
+    with open(p, "w") as f:
+        f.write(html)
+    print(f"[demo] {p}  ({os.path.getsize(p)/1e6:.1f} MB, {len(keys)} views, "
+          f"{len(pts)} contacts, {T} bins, {step:.1f} ms/bin)")
+    return p
+
+
 def fig_peak_time(agg: dict, tap: str, out: str, *, win: tuple[float, float],
                   tasks=("onset", "speech"), sessions=None) -> str:
     """When each region's FWER-surviving contacts peak -- the honest version of the latency
@@ -1358,6 +1490,12 @@ def main() -> None:
     p.add_argument("--brain-tasks", default="onset,speech,local_flow",
                    help="rows of the brain render; keep a visual control in the list or the "
                         "figure shows only the half of the result that is flattering")
+    p.add_argument("--demo", action="store_true",
+                   help="also write demo_measure2.html: the interactive scrub demo of "
+                        "viz_anatomy, driven by measure #2 per contact with the FWER layer. "
+                        "Needs --red-dir and --win. Any _elec tap, including encoder taps")
+    p.add_argument("--demo-tasks", default="onset,speech,pitch,frame_brightness",
+                   help="views offered in the demo's menu, in menu order")
     p.add_argument("--movie", action="store_true",
                    help="also render figE5: figE3 animated over time bins. Needs --red-dir and "
                         "--win, and applies only to an enc0 _elec tap -- see movie_brain_elec")
@@ -1418,6 +1556,17 @@ def main() -> None:
             bt = tuple(t for t in a.brain_tasks.split(",") if t)
             for tap in elec_taps:
                 fig_brain_elec(agg, tmpl, tap, bt, a.fig_dir)
+            if a.demo:
+                # unlike the movie this is NOT enc0-only: the demo names the value AUROC-.5 per
+                # bin and warns in its own text that a frame is not a latency, so an encoder tap
+                # is legitimate to browse -- it is the ms-axis CLAIM that enc12 cannot support.
+                if len(win) == 2:
+                    build_demo_elec(agg, tmpl, a.fig_dir, taps=elec_taps,
+                                    tasks=tuple(t for t in a.demo_tasks.split(",") if t),
+                                    win=win, sessions=sess or None)
+                else:
+                    print("[demo] --win not given: skipping the demo rather than guessing the "
+                          "millisecond axis")
             if a.movie:
                 # enc0 only, and only with a window: the movie's whole content is a ms axis
                 mv = tuple(t for t in elec_taps if t.startswith("enc0"))

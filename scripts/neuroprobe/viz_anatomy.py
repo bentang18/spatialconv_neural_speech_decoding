@@ -1109,16 +1109,46 @@ def build_demo(D, tmpl, base_of, T, out, tasks, taps):
     # menu order = the order asked for, NOT sorted: sorting opens the demo on
     # enc0|frame_brightness, which is the one view a reader has no reason to look at first.
     keys = [f"{tp}|{tk}" for tp in taps for tk in tasks if f"{tp}|{tk}" in series]
-    html = _DEMO_HTML.replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":"))) \
-                     .replace("__OPTIONS__", "".join(
-                         # value stays the payload key; the label spells it out, because in a
-                         # native <select> the pipe in "enc12|onset" reads as an l.
-                         f'<option value="{k}">{k.replace("|", " — ")}</option>' for k in keys))
+    html = render_demo_html(
+        payload, keys,
+        title="Anatomy of decodable information",
+        h1="Where is the decodable information? All 6 subjects on one brain, scrubbable in time",
+        intro="Colour is the <b>split-half unbiased standardized class contrast</b> "
+              "(<code>d_cv</code>). Zero is a <i>true</i> zero — the two independent trial "
+              "halves' contrast vectors are dotted, so noise contributes zero in expectation and "
+              "a no-effect contact is white, not faintly warm. <b>Dot area and colour both encode "
+              "it</b>, so a contact carrying nothing shrinks to a speck and the effect finds you "
+              "instead of the reverse. <b>Hover any contact</b> for its subject, DKT parcel and "
+              "value.",
+        note="Colour is a <b>parcel</b> value, so all of one subject's contacts in one parcel "
+             "share it; grey means that parcel has no value in that subject.",
+        valname="d_cv")
     p = os.path.join(out, "demo_anatomy.html")
     with open(p, "w") as f:
         f.write(html)
     print(f"[demo] {p}  ({os.path.getsize(p)/1e6:.1f} MB, {len(keys)} views, "
           f"{len(pts)} contacts, {T} bins, {len(gmeta)} (subject,parcel) groups)")
+
+
+def render_demo_html(payload: dict, keys, *, title: str, h1: str, intro: str, note: str,
+                     valname: str) -> str:
+    """Fill the shared scrub-demo template. The canvas, scrubber, hover and colour LUT are the
+    same for any per-contact time series; only the prose and the value's NAME differ.
+
+    Parameterised rather than forked because the statistic-specific text is the part that can
+    lie: a copy that still said ``d_cv`` over an AUROC map, or "colour is a parcel value" over a
+    per-contact one, would be wrong in exactly the way a reader cannot catch. An optional
+    ``payload["thr"]`` adds the FWER layer; omit it and the render is unchanged.
+    """
+    return (_DEMO_HTML
+            .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
+            .replace("__OPTIONS__", "".join(
+                # value stays the payload key; the label spells it out, because in a
+                # native <select> the pipe in "enc12|onset" reads as an l.
+                f'<option value="{k}">{k.replace("|", " — ")}</option>' for k in keys))
+            .replace("__TITLE__", title).replace("__H1__", h1)
+            .replace("__INTRO__", intro).replace("__NOTE__", note)
+            .replace("__VALNAME__", valname))
 
 
 def _img_png(arr: np.ndarray) -> bytes:
@@ -1134,7 +1164,7 @@ def _img_png(arr: np.ndarray) -> bytes:
 
 
 _DEMO_HTML = r"""<!doctype html><meta charset="utf-8">
-<title>Anatomy of decodable information</title>
+<title>__TITLE__</title>
 <style>
  body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;margin:22px;max-width:1400px;
       color:#222}
@@ -1159,21 +1189,14 @@ _DEMO_HTML = r"""<!doctype html><meta charset="utf-8">
         color:#c62828;opacity:0;transition:opacity 60ms linear;
         text-shadow:0 0 12px #fff,0 0 12px #fff,0 0 4px #fff,0 2px 3px rgba(0,0,0,.25)}
 </style>
-<h1>Where is the decodable information? All 6 subjects on one brain, scrubbable in time</h1>
-<p>Colour is the <b>split-half unbiased standardized class contrast</b> (<code>d_cv</code>).
-Zero is a <i>true</i> zero — the two independent trial halves' contrast vectors are dotted, so
-noise contributes zero in expectation and a no-effect contact is white, not faintly warm.
-<b>Dot area and colour both encode it</b>, so a contact carrying nothing shrinks to a speck and
-the effect finds you instead of the reverse. <b>Hover any contact</b> for its subject, DKT parcel
-and value.</p>
+<h1>__H1__</h1>
+<p>__INTRO__</p>
 <div class="note"><b>Frame: the BrainTreebank's own 2D lateral projection</b> — not a warp of
 mine, and not MNI. Positions are the <code>X</code>/<code>Y</code> columns of the dataset's
 <code>elec_coords_full.csv</code> drawn on the hemisphere images it ships with, scaled exactly
 as its own quickstart notebook does; <code>Hemisphere</code> picks the panel. Because it is a
 flattened lateral view, depth along a shaft collapses and medial structures (cingulate, MTL)
-land only approximately — read it for <i>which region</i>, never for millimetres. Colour is a
-<b>parcel</b> value, so all of one subject's contacts in one parcel share it; grey means that
-parcel has no value in that subject.</div>
+land only approximately — read it for <i>which region</i>, never for millimetres. __NOTE__</div>
 <div class="row">
  <label>view <select id=k>__OPTIONS__</select></label>
  <label>time <input type=range id=t min=0 value=0 style="width:400px"></label>
@@ -1251,11 +1274,19 @@ function draw(){
     // draw small dots first so a big effect is never hidden behind a null
     const ord=idx[s].slice().sort((a,b)=>
       Math.abs(valAt(a,fi)||0)-Math.abs(valAt(b,fi)||0));
+    // P.thr is optional. When present it is this view's per-contact FWER threshold, so a
+    // survivor gets a heavy black ring and everything else is faded: the eye then reads the
+    // MULTIPLICITY-CONTROLLED map, not the raw one. Absent => every dot is drawn identically.
+    const TH=P.thr?P.thr[k.value]:null;
     for(const i of ord){
       const v=valAt(i,fi);
+      const sig=TH&&v!==null&&Math.abs(v)>TH[i]/1000;
+      g.globalAlpha=(TH&&!sig)?0.4:1;
       g.beginPath(); g.arc(P.x[i],P.y[i],v===null?Rmax*.18:rad(v,lim,Rmax),0,6.2832);
       g.fillStyle=(v===null)?'#c0c0c0':col(v,lim); g.fill();
-      g.lineWidth=Rmax*.13; g.strokeStyle='rgba(0,0,0,.5)'; g.stroke();
+      g.lineWidth=sig?Rmax*.42:Rmax*.13;
+      g.strokeStyle=sig?'#000':'rgba(0,0,0,.5)'; g.stroke();
+      g.globalAlpha=1;
     }
     drawLabels(g,s,Rmax);
   }
@@ -1275,7 +1306,9 @@ cv.forEach((c,s)=>{
     for(const i of idx[s]){const d=(P.x[i]-mx)**2+(P.y[i]-my)**2; if(d<bd){bd=d;best=i;}}
     if(best<0||bd>(14*sc)**2){tip.style.display='none';return;}
     const v=valAt(best,+t.value);
-    tip.textContent=P.lab[best]+' · d_cv '+(v===null?'n/a':(v>=0?'+':'')+v.toFixed(3));
+    const TH=P.thr?P.thr[k.value]:null;
+    tip.textContent=P.lab[best]+' · __VALNAME__ '+(v===null?'n/a':(v>=0?'+':'')+v.toFixed(3))
+      +((TH&&v!==null)?(Math.abs(v)>TH[best]/1000?' · FWER survivor':' · n.s.'):'');
     tip.style.display='block';
     tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY+12)+'px';};
   c.onmouseleave=()=>tip.style.display='none';});
