@@ -264,3 +264,30 @@ def test_bf16_rounding_of_the_tap_really_does_break_the_split():
         rounded = FT._run_tail(enc, taps[split].to(torch.bfloat16).float(), ctx)
     rel = float((exact - rounded).abs().max() / exact.abs().max())
     assert rel > 1e-3, f"bf16 rounding moved the tail by only rel={rel:.2e} — L0's gate is loose"
+
+
+def test_weight_decay_never_touches_one_dim_params():
+    """wd IS the arm here, so it must act on the linear map, not on LayerNorm gains. A single
+    AdamW group would decay 425,984 head-LayerNorm gains at wd 3.0 and the arm would lose for
+    the wrong reason. MAE's own FT code exempts 1-D params (param_groups_lrd/no_weight_decay)."""
+    import re
+    src = open(os.path.join(_HERE, "v3_ws_partialft_pilot.py")).read()
+    blk = src[src.index("NO-DECAY GROUP"):src.index("CosineAnnealingLR")]
+    assert 'q.ndim > 1' in blk and 'q.ndim <= 1' in blk
+    assert '"weight_decay": 0.0' in blk, "the no-decay group must pin wd to zero"
+    assert not re.search(r"AdamW\(\s*list\(head", blk), "still a single flat AdamW group"
+
+
+def test_no_decay_split_covers_every_trainable_param():
+    """The split must partition, not sample: no param may be dropped from the optimizer."""
+    torch.manual_seed(0)
+    head = FT._Head(8)
+    towers = __import__("speech_decoding.models.v14_converged_v3.towers",
+                        fromlist=["build_encoder"])
+    enc = towers.build_encoder(n_parcels=8)
+    train_p = list(head.parameters()) + FT._arm_params(enc, "block12")
+    decay = [q for q in train_p if q.ndim > 1]
+    no_decay = [q for q in train_p if q.ndim <= 1]
+    assert len(decay) + len(no_decay) == len(train_p)
+    assert {id(q) for q in decay}.isdisjoint({id(q) for q in no_decay})
+    assert decay and no_decay

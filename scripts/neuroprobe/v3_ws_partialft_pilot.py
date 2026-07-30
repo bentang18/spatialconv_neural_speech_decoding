@@ -560,7 +560,17 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
         print(f"[head] feature dim={dim} ({3 * dim + 1} head params) vs n_train={len(tr)} "
               f"-> {(3 * dim + 1) / max(len(tr), 1):.0f}x overparameterized", flush=True)
         _run_cell.announced = True
-    opt = torch.optim.AdamW(list(head.parameters()) + params, lr=lr, weight_decay=args.wd)
+    # NO-DECAY GROUP. A single AdamW group would apply wd to every LayerNorm gain and bias in
+    # the head and in block 12 -- and 1-D params are exactly what standard practice exempts
+    # (MAE's own FT code builds param_groups_lrd with a no_weight_decay set). It matters here
+    # because wd IS the arm: at wd 3.0 a single group crushes 425,984 LayerNorm gains, and the
+    # arm would lose for a reason that has nothing to do with regularizing the linear map.
+    train_p = list(head.parameters()) + params
+    decay = [q for q in train_p if q.ndim > 1]
+    no_decay = [q for q in train_p if q.ndim <= 1]
+    opt = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": args.wd},
+         {"params": no_decay, "weight_decay": 0.0}], lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
     ybin = torch.as_tensor((y_all[tr] > 0).astype(np.float32), device=device)
     lossf = torch.nn.BCEWithLogitsLoss()
