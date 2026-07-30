@@ -45,6 +45,8 @@
 #   sbatch --array=0-6 v3_ws_partialft.sbatch h <LR>
 # STAGE R  (stage G's driver over stage E's 28 cells; %3 -- 4 co-resident tasks OOM'd the loader):
 #   sbatch --array=0-6%3 v3_ws_partialft.sbatch r <LR>
+# STAGE RF (do depth and driver COMPOSE? 2 blocks + ridge driver, one session, precondition):
+#   sbatch --array=0 v3_ws_partialft.sbatch rf
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -126,6 +128,19 @@ case "$STAGE" in
      # block12 stays the candidate. Either way the ladder stops being open at its top end.
      SEL="--stage a --session-index 0 --lrs 1e-2,3e-2,1e-1 --arms mlp --head-norm bn"
      OUT=$BASE/ws_partialft_stageDX_mlp_bn_hi.json ;;
+  rf) # STAGE RF -- DO THE TWO LEVERS COMPOSE? F varies DEPTH under the BCE driver; G varies the
+     # DRIVER at one block. Both moved the number on their own, and nothing so far combines them,
+     # so "use both" is currently an assumption. This is the smallest experiment that checks it:
+     # ONE session, the deeper split F is testing (2 blocks, split-at 10 with F's train-batch 64 so
+     # the memory profile is F's), driven by the ridge LOO risk at a ladder centred on G's winner.
+     # It is a PRECONDITION for a 7-session combined run, not a result on its own.
+     # DECISION: if RF beats BOTH single levers on the matched session, the 7-session combined arm
+     # is the candidate for the morning and the CS build inherits it. If RF only matches the better
+     # single lever, they are redundant -- take the CHEAPER one (one block, ridge driver) and do not
+     # pay for depth. If RF is worse than both, they interfere and each stays standalone.
+     SEL="--stage a --session-index 0 --lrs 1e-3,3e-3,1e-2 --arms blocks --split-at 10
+          --head-norm bn --multitask --driver ridge --warmup-epochs 0 --train-batch 64"
+     OUT=$BASE/ws_partialft_stageRF_split10_ridge.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
@@ -216,7 +231,7 @@ case "$STAGE" in
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageR_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r' or 'dx', got" \
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r', 'dx' or 'rf', got" \
           "'$STAGE'" >&2
      exit 1 ;;
 esac
