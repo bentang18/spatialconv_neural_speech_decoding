@@ -94,6 +94,7 @@ import json
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -286,8 +287,13 @@ def main() -> None:
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--patience", type=int, default=15)
-    p.add_argument("--fwd-batch", type=int, default=64)
-    p.add_argument("--train-batch", type=int, default=16)
+    p.add_argument("--fwd-batch", type=int, default=256)
+    p.add_argument("--train-batch", type=int, default=128,
+                   help="128 not 16: with ~3650 train windows this is still ~29 optimizer steps "
+                        "per epoch (~2300 over 80 epochs), and block 12 at batch 16 was launch- "
+                        "bound rather than compute-bound. Sized against the ~70 GB left after the "
+                        "25 GB tap-11 cache, not by doubling; the run PRINTS peak memory and "
+                        "sec/epoch so the next size comes from a measurement.")
     p.add_argument("--val-margin", type=int, default=2,
                    help="windows dropped off the VAL side of the val|test seam (M14 hop "
                         "overlap). test is never touched — it must stay the frozen arm's rows.")
@@ -482,6 +488,8 @@ def main() -> None:
                               f"ep*={r['best_epoch']:2d} val={r['val']:.4f} "
                               f"ft={r['test_ft']:.4f} frozen={r['test_frozen']:.4f} "
                               f"vallam={r['test_frozen_vallam']:.4f} "
+                              f"| {r['n_epochs_run']}ep {r['sec_per_epoch']:.2f}s/ep "
+                              f"{r['peak_gib']:.1f}GiB | "
                               f"d={r['test_ft'] - r['test_frozen']:+.4f} "
                               f"n_tr={len(tr)} n_va={len(va)} n_te={len(te)}", flush=True)
                         json.dump(results, open(args.out, "w"), indent=1)
@@ -532,6 +540,9 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     # and the L1 parity gate. Epoch selection is by the head's own val AUROC.
     best = {"val": -1.0, "test_ft": float("nan"), "best_epoch": -1, "n_params": n_par}
     frozen_test = frozen_vallam = float("nan")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    t_start, n_ep = time.time(), 0
     for ep in range(args.epochs + 1):
         if ep > 0:
             enc.train()
@@ -551,11 +562,13 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
             if ep == 0:
                 # Cell A, measured in THIS code path rather than imported, plus the val-lambda
                 # control that prices the one val-selected hyperparameter D gets and A does not.
-                zs = [feats(r, False).reshape(len(r), -1).to(torch.float16).to(torch.float32)
-                      for r in (tr, va, te)]
+                z0_tr, z0_va, z0_te = (
+                    feats(r, False).reshape(len(r), -1).to(torch.float16).to(torch.float32)
+                    for r in (tr, va, te))
                 _vs, frozen_test, frozen_vallam = _ridge_eval(
-                    *zs, yt, y_all[va], y_all[te], [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])
-                del zs
+                    z0_tr, z0_va, z0_te, yt, y_all[va], y_all[te],
+                    [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])
+                del z0_tr, z0_va, z0_te
             hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1)).float().cpu().numpy(),
                            y_all[va])
             ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1)).float().cpu().numpy(),
@@ -565,9 +578,13 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
             best = {"val": float(hv), "test_ft": float(ht), "best_epoch": ep, "n_params": n_par}
         elif ep - best["best_epoch"] >= args.patience:
             break
+        n_ep = ep
     for q in enc.parameters():
         q.requires_grad_(False)
-    best.update(test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam))
+    best.update(test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam),
+                sec_per_epoch=(time.time() - t_start) / max(n_ep, 1), n_epochs_run=n_ep,
+                peak_gib=(torch.cuda.max_memory_allocated() / 2**30
+                          if device.type == "cuda" else 0.0))
     return best
 
 
