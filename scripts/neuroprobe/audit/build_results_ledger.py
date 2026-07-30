@@ -35,6 +35,11 @@ R6 = Path("results/r6_era")
 RUN_IDS = {
     "leace": "20544396",
     "leace_enc3": "20565621",
+    # pbs arms: sacct/JobName CANNOT tell them apart (one launcher, one JobName, space_frac by
+    # env). These come from each job's OWN stdout header, /projects/bhqk/htang13/logs/
+    # r6_pbspace_<jobid>.out, which prints run= and space_frac= verbatim.
+    "pbs50_20k": "2764203",
+    "pbs25_20k": "2764176",
 }
 
 FIELDS = ["family", "artifact", "run_id", "arm_tag", "regime", "tap", "norm",
@@ -58,6 +63,25 @@ def _rows_board():
                                        arm_tag=arm_tag, regime=regime, tap=tap, norm=norm,
                                        decoder="ridge", cell=cell, task=task,
                                        split=split, value=v[split])
+
+
+def _rows_pbs():
+    """results/r6_era/pbs/results_v3_probe_<arm>.json -- the PRETRAIN probe, not the board.
+
+    Kept as its own family because pooling probe numbers with board numbers is a recorded
+    defect (probe CS ~.66-.69 vs board CS ~.60). ``ws_per_session`` is keyed by session,
+    ``cs_per_test`` by held-out subject; both are held-out test values.
+    """
+    for f in sorted((R6 / "pbs").glob("results_v3_probe_*.json")):
+        d = json.load(open(f))
+        for key, rec in d.items():
+            arm_tag, tap, norm, task = key.split("|")
+            for regime, field in (("ws", "ws_per_session"), ("cs", "cs_per_test")):
+                for cell, v in rec.get(field, {}).items():
+                    yield dict(family="pbs_probe", artifact=str(f),
+                               run_id=RUN_IDS.get(arm_tag, ""), arm_tag=arm_tag, regime=regime,
+                               tap=tap, norm=norm, decoder="ridge", cell=cell, task=task,
+                               split="test", value=v)
 
 
 def _rows_leace():
@@ -108,7 +132,8 @@ def main() -> None:
     ap.add_argument("--out", default=str(R6 / "RESULTS_LEDGER.csv"))
     a = ap.parse_args()
 
-    rows = list(_rows_board()) + list(_rows_leace()) + list(_rows_decoder())
+    rows = (list(_rows_board()) + list(_rows_pbs()) + list(_rows_leace())
+            + list(_rows_decoder()))
     if not rows:
         raise SystemExit("no artifacts found -- run from the repo root")
     rows.sort(key=lambda r: tuple(str(r[k]) for k in FIELDS[:-1]))
