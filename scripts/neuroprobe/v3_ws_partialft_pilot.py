@@ -286,6 +286,9 @@ def main() -> None:
     p.add_argument("--lrs", default="1e-4", help="stage a sweeps these; stage b takes one")
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=80)
+    p.add_argument("--warmup-epochs", type=int, default=10,
+                   help="epochs with the encoder FROZEN before block 12 is unfrozen (REVE's "
+                        "two-step recipe, arXiv 2510.21585). 0 disables.")
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--fwd-batch", type=int, default=256)
     p.add_argument("--train-batch", type=int, default=128,
@@ -528,6 +531,13 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     with torch.no_grad():
         dim = int(feats(tr[:1], False).reshape(1, -1).shape[1])
     head = _Head(dim).to(device)
+    if _run_cell.announced is False:
+        # The head's shape is the thing wd is fighting. Print it MEASURED rather than asserted:
+        # MAE's classifier reads ONE d-dim token (mae.tex:610, class token or average pooling),
+        # ours reads the whole flattened |P|xF the ridge reads.
+        print(f"[head] feature dim={dim} ({3 * dim + 1} head params) vs n_train={len(tr)} "
+              f"-> {(3 * dim + 1) / max(len(tr), 1):.0f}x overparameterized", flush=True)
+        _run_cell.announced = True
     opt = torch.optim.AdamW(list(head.parameters()) + params, lr=lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
     ybin = torch.as_tensor((y_all[tr] > 0).astype(np.float32), device=device)
@@ -545,7 +555,17 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     t_start, n_ep = time.time(), 0
     for ep in range(args.epochs + 1):
         if ep > 0:
-            enc.train()
+            # REVE (arXiv 2510.21585) fine-tunes in TWO steps inside one continuous run: "We
+            # first train a linear probe while keeping the encoder frozen, aligning the
+            # classifier with the pretrained feature space. Next, we unfreeze the encoder and
+            # fine-tune the entire network." Our head starts at zero, so without this the first
+            # epochs push block 12 with gradients from a classifier that knows nothing — damage
+            # that reads as "fine-tuning does not help". Warmup epochs are also CHEAPER: no
+            # encoder param requires grad, so nothing backprops through block 12 at all.
+            warming = ep <= args.warmup_epochs
+            for q in params:
+                q.requires_grad_(not warming)
+            enc.eval() if warming else enc.train()
             order = rng.permutation(len(tr))
             for s in range(0, len(order), args.train_batch):
                 pos = order[s:s + args.train_batch]
@@ -586,6 +606,9 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
                 peak_gib=(torch.cuda.max_memory_allocated() / 2**30
                           if device.type == "cuda" else 0.0))
     return best
+
+
+_run_cell.announced = False
 
 
 def _report(results, base, args):
