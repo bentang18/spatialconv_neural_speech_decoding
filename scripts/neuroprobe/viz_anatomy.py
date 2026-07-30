@@ -1322,7 +1322,7 @@ def main() -> None:
     ap.add_argument("--red-dir",
                     default="results/viz_crosssubject/reductions/red_2s_15task_cdlin_45k")
     ap.add_argument("--bt-root", default=".cache/braintreebank")
-    ap.add_argument("--out", default="results/showcase/paper")
+    ap.add_argument("--out", default="results/showcase/3_where_the_signal_lives/trialaveraged_dcv")
     ap.add_argument("--tap", default="enc12", help="tap for the single-tap panels")
     ap.add_argument("--no-demo", action="store_true")
     ap.add_argument("--demo-tasks", default="onset,speech,pitch,frame_brightness")

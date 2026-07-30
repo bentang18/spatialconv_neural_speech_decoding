@@ -1477,7 +1477,11 @@ def main() -> None:
     p.add_argument("--aggregate", action="store_true", help="summarise shards in --out-dir")
     p.add_argument("--figs", action="store_true",
                    help="with --aggregate, render the measure #2 figure set into --fig-dir")
-    p.add_argument("--fig-dir", default="results/figs_elec")
+    p.add_argument("--fig-dir",
+                   default="results/showcase/3_where_the_signal_lives/singletrial_contacts",
+                   help="contact-unit default; the parcel-unit depth run must pass "
+                        "results/showcase/3_where_the_signal_lives/singletrial_parcels_by_depth -- the two "
+                        "units have different denominators and must never share a folder")
     p.add_argument("--red-dir", default="",
                    help="viz reduction dir; needed only by the brain render, which joins the "
                         "electrode template on it. Omit to skip that one figure.")

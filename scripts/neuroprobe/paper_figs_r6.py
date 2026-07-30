@@ -37,7 +37,7 @@ import matplotlib.transforms as mtransforms  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RES = ROOT / "results"
-OUT = RES / "showcase/paper"
+OUT = RES / "showcase"
 VIZ = RES / "viz_crosssubject/archive"
 TAPS = ["enc0", "enc3", "enc6", "enc12"]
 
@@ -231,7 +231,7 @@ def fig2() -> None:
     ax2.legend(fontsize=6.5, loc="upper left")
     fig.text(0.5, -0.04, "one line per SUBJECT (trials averaged)  ·  orange = not monotone across taps (still ends above enc0)",
              ha="center", fontsize=6.2, color=PALETTE["accent"])
-    fig.tight_layout(); _save(fig, "fig2_ladder")
+    fig.tight_layout(); _save(fig, "fig2_ladder", sub="1_beats_the_board")
 
 
 # ------------------------------------------------------- fig 2ws: within-session
@@ -318,7 +318,7 @@ def fig2_ws() -> None:
     fig.text(0.5, -0.045, "WS is per-electrode and the board encode wrote only elec taps 0 and 12"
              " -- enc3/enc6 need a re-encode, not a replot", ha="center", fontsize=6.2,
              color=PALETTE["muted"])
-    fig.tight_layout(); _save(fig, "fig2ws_within_session")
+    fig.tight_layout(); _save(fig, "fig2ws_within_session", sub="1_beats_the_board")
 
 
 # ------------------------------------------------------- fig 2cs: cross-session
@@ -431,7 +431,7 @@ def fig2_cs() -> None:
              f"and no ladder  ·  checkpoint = 45k NO-cooldown (the shipped {LEAD} was never "
              "scored on this regime; cooldown helps csession, so this understates us)",
              ha="center", fontsize=6.0, color=PALETTE["muted"])
-    fig.tight_layout(); _save(fig, "fig2cs_cross_session")
+    fig.tight_layout(); _save(fig, "fig2cs_cross_session", sub="1_beats_the_board")
 
 
 # ---------------------------------------------------------------- fig 3: LEACE
@@ -493,7 +493,13 @@ def fig3() -> None:
     assert stats["enc12|auc_after"] < 0.52, "erasure did not destroy identity at enc12"
     assert stats["enc0|leace"][0] < stats["enc12|leace"][0], (
         "[check] VIOLATED expected enc0 erasure to hurt MORE than enc12")
-    print("[check] OK enc12 erasure is a null on CS while enc0 erasure hurts -> SEPARABILITY")
+    # The numeric relation above holds, but its old reading does NOT: a rank-1 deletion at
+    # d~93k is free by construction (a matched shuffled-label control costs -0.000056 against
+    # identity's +0.000005), and rank <= C-1 makes rank 1 the maximum available in CS. So this
+    # null has no power and cannot speak to separability -- a null is what orthogonality
+    # predicts. var_removed is likewise between-cloud mean separation, 0.099% within-session.
+    print("[check] OK enc0 erasure hurts, enc12 is a null -- but this null has NO POWER "
+          "(matched shuffle is equally free) so it is NOT evidence about separability")
 
     fig, axes = plt.subplots(1, 3, figsize=(6.6, 2.4))
     taps2 = ["enc0", "enc12"]
@@ -545,7 +551,7 @@ def fig3() -> None:
     ax.set_xticks(range(2)); ax.set_xticklabels(taps2); ax.set_xlim(-0.5, 1.5)
     ax.set_ylabel("Δ cross-subject AUROC\n(erased − intact)")
     ax.set_title("Cost of erasure: none at enc12", pad=6)
-    fig.tight_layout(); _save(fig, "fig3_leace")
+    fig.tight_layout(); _save(fig, "fig3_leace", sub="retracted")
 
 
 # ---------------------------------------------------------------- fig 4: concentration
@@ -624,7 +630,7 @@ def fig4() -> None:
                bbox_to_anchor=(0.5, 0.10), ncol=2, columnspacing=1.6, handlelength=2.4)
     fig.suptitle("Cross-subject agreement barely grows -- it CONCENTRATES into 3 dimensions",
                  fontsize=8.5, y=1.01)
-    fig.tight_layout(rect=(0, 0.12, 1, 1)); _save(fig, "fig4_concentration")
+    fig.tight_layout(rect=(0, 0.12, 1, 1)); _save(fig, "fig4_concentration", sub="4_why_it_transfers")
     print("[check] OK gap widens in both windows; per-task " +
           ", ".join(f"{w} {n}/{d}" for w, n, d in holds))
 
@@ -857,7 +863,7 @@ def fig5() -> None:
              f"{rank['onset']}th/{rank['speech']}th", ha="center", fontsize=6.3,
              color=PALETTE["muted"])
     fig.tight_layout(rect=(0, 0.075, 1, 0.985))
-    _save(fig, "fig5cs_per_task_ladder")
+    _save(fig, "fig5cs_per_task_ladder", sub="2_what_pretraining_does")
 
 
 def fig6() -> None:
@@ -983,15 +989,21 @@ def fig6() -> None:
              "10 submissions, a model nobody submitted)", ha="center", fontsize=6.2,
              color=PALETTE["muted"])
     fig.tight_layout(rect=(0, 0.10, 1, 1))
-    _save(fig, "fig6cs_gain_vs_difficulty")
+    _save(fig, "fig6cs_gain_vs_difficulty", sub="2_what_pretraining_does")
 
 
-def _save(fig, stem: str) -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
+def _save(fig, stem: str, sub: str) -> None:
+    """Write to ``showcase/<sub>/``, the chapter this figure argues for.
+
+    ``sub`` is required, with no default, on purpose. The folders are the paper's argument in
+    order, so placing a figure is an editorial decision, not a filesystem detail -- and fig3 is
+    retracted, so a default would silently reinstate it beside live figures on the next run."""
+    d = OUT / sub
+    d.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
-        fig.savefig(OUT / f"{stem}.{ext}", bbox_inches="tight")
+        fig.savefig(d / f"{stem}.{ext}", bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {OUT.relative_to(ROOT)}/{stem}.pdf|.png")
+    print(f"  -> {d.relative_to(ROOT)}/{stem}.pdf|.png")
 
 
 if __name__ == "__main__":
