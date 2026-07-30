@@ -692,6 +692,32 @@ def test_merge_accepts_the_full_28_cell_design():
     assert FT._assert_mergeable(rows) == 28
 
 
+def test_merge_refuses_a_shard_that_is_still_being_written():
+    """🚨 THE PILOT DUMPS args.out AFTER EVERY CELL, so a running job's shard is valid JSON with
+    fewer rows. A cell built from ONE fold instead of two passes the duplicate guard and the one-lr
+    guard and biases the headline with no visible symptom. Observed for real: stage R's s5/s6 sat on
+    disk with 5 and 3 rows while their array tasks were still RUNNING, and the 28-cell merge would
+    have used them. Refuse, and name the shard so the fix is obvious."""
+    rows = [dict(_cell(f"S{s}T0", t, f), _src=f"s{s}.json")
+            for s in range(7) for t in FT.PROBE_TASKS for f in (0, 1)]
+    partial = [r for r in rows if not (r["session"] == "S6T0" and r["fold"] == 1)]
+    with pytest.raises(SystemExit) as e:
+        FT._assert_mergeable(partial)
+    msg = str(e.value)
+    assert "fewer folds" in msg
+    assert "s6.json" in msg, "the offending shard must be named"
+    assert "S6T0" in msg
+
+
+def test_merge_fold_completeness_is_derived_not_hardcoded():
+    """The expected fold count comes from the max seen in the merge, so a one-fold design merges
+    cleanly and a two-fold design with a missing fold does not. Hardcoding 2 would have made the
+    guard wrong the first time the fold count changed."""
+    one = [dict(_cell(f"S{s}T0", t, 0), _src=f"s{s}.json")
+           for s in range(7) for t in FT.PROBE_TASKS]
+    assert FT._assert_mergeable(one) == 28, "a uniform one-fold merge is not a partial shard"
+
+
 def test_merge_separates_arms_rather_than_pooling_them():
     """Two arms at their own lrs is legitimate (_report loops over arms); it must NOT trip the
     one-lr-per-arm guard, or a combined C+D merge would be impossible."""

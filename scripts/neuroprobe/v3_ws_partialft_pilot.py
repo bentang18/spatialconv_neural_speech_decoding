@@ -938,7 +938,31 @@ def _assert_mergeable(rows):
         raise SystemExit(f"FATAL: more than one lr per arm in the merge: {bad}\n"
                          "  _report pools over folds, so it would pool these lrs into the "
                          "headline. Merge one lr at a time.")
-    return len({(r["session"], r["task"]) for r in rows})
+    # Third guard: PARTIAL SHARDS. The pilot dumps `args.out` after EVERY cell, not once at the
+    # end, so a shard whose job is still running is a valid JSON file with fewer rows -- and a cell
+    # built from one fold instead of two passes both guards above and biases the headline with no
+    # visible symptom. This bit twice within one session: stage R's s5/s6 sat on disk with 5 and 3
+    # rows while their array tasks were still RUNNING.
+    #
+    # The expected fold count is DERIVED, not hardcoded: take the max folds seen on any cell in the
+    # merge and require every cell to match it. That refuses partials without needing to know the
+    # design, and it stays correct if the fold count ever changes.
+    folds: dict[tuple, set] = {}
+    src: dict[tuple, set] = {}
+    for r in rows:
+        k = (r["session"], r["task"])
+        folds.setdefault(k, set()).add(int(r["fold"]))
+        src.setdefault(k, set()).add(r.get("_src", "?"))
+    want = max(len(v) for v in folds.values())
+    short = {k: sorted(v) for k, v in folds.items() if len(v) < want}
+    if short:
+        lines = "\n".join(f"    {k[0]} {k[1]}: folds {v} (want {want}) in {sorted(src[k])}"
+                          for k, v in sorted(short.items()))
+        raise SystemExit(
+            f"FATAL: {len(short)} cell(s) have fewer folds than the {want} seen elsewhere in this "
+            f"merge.\n{lines}\n  The shard is almost certainly still being written -- the pilot "
+            f"dumps after every cell. Wait for the job, then re-merge.")
+    return len(folds)
 
 
 def _report(results, base, args):
