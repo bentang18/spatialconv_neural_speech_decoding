@@ -49,6 +49,8 @@
 #   sbatch --array=0 v3_ws_partialft.sbatch rf
 # STAGE RM (mlp sublayer vs whole block UNDER THE RIDGE DRIVER -- picks the CS arm):
 #   sbatch --array=0 v3_ws_partialft.sbatch rm
+# STAGE RMS (the candidate arm over 28 cells: mlp + ridge driver; R - RMS = the attention term):
+#   sbatch --array=0-6%3 v3_ws_partialft.sbatch rms <LR>
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -159,6 +161,19 @@ case "$STAGE" in
      SEL="--stage a --session-index 0 --lrs 3e-3,1e-2,3e-2 --arms mlp --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageRM_mlp_ridge.json ;;
+  rms) LR="${2:?stage rms needs the LR stage rm selected on val}"
+     # STAGE RMS -- THE CANDIDATE ARM AT FULL SCALE. Stage RM overturned the BCE-era tie: under the
+     # ridge driver the MLP SUBLAYER does not match the whole block, it BEATS it 2.1x on the matched
+     # session (+.0202 vs +.0096, val_C .8464 vs .8376 -- val agrees, so not a test-side fluke).
+     # THREE RUNS NOW AGREE THAT LESS CAPACITY IS BETTER UNDER THIS DRIVER: 2 blocks (stage RF) went
+     # NEGATIVE, 1 block gives +.0096, mlp-only gives +.0202. The leave-one-out ridge risk is a
+     # strong low-noise objective on ~1279 train rows and overfits itself when handed more
+     # parameters, so dropping attention from the trainable set is the sweet spot.
+     # Identical to stage R except --arms mlp, so R - RMS is the attention-sublayer term over the
+     # full 28-cell null and the comparison stays a one-thing-changed comparison.
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms mlp --head-norm bn
+          --multitask --driver ridge --warmup-epochs 0"
+     OUT=$BASE/ws_partialft_stageRMS_s$SLURM_ARRAY_TASK_ID.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
@@ -249,7 +264,7 @@ case "$STAGE" in
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageR_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r', 'dx', 'rf' or 'rm', got" \
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r', 'dx', 'rf', 'rm' or 'rms', got" \
           "'$STAGE'" >&2
      exit 1 ;;
 esac
