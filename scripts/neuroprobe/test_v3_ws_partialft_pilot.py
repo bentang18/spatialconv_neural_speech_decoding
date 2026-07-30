@@ -216,3 +216,51 @@ def test_run_tail_equals_the_towers_own_forward():
         got = FT._run_tail(enc, taps[split], ctx)
     assert torch.allclose(got, taps[tap], atol=1e-6), \
         f"max|d|={(got - taps[tap]).abs().max():.3e} — the block split is NOT equivalent"
+
+
+def test_the_tap_cache_is_never_downcast():
+    """Job 2779110_0 failed parity-L0 at rel 5.371e-3 because the tap-11 cache was cast to
+    bf16 on the false belief that bf16 is the autocast residual dtype. It is not — LayerNorm
+    autocasts to fp32 and the pre-norm residual add promotes the branch back up
+    (attention.py:132-136), so the tap is fp32 and the cast cost exactly one ulp. The cache
+    must carry ``taps[SPLIT_AT].dtype`` verbatim."""
+    import re
+    src = open(os.path.join(_HERE, "v3_ws_partialft_pilot.py")).read()
+    body = src[src.index("cache tap 11 once"):src.index("def feats(")]
+    assert "taps[SPLIT_AT]" in body
+    bad = re.findall(r"taps\[SPLIT_AT\]\s*\.to\(", body)
+    assert not bad, f"the tap is being cast before caching: {bad}"
+    assert "dtype=t.dtype" in body, "the cache buffer must be allocated in the tap's own dtype"
+
+
+def test_bf16_rounding_of_the_tap_really_does_break_the_split():
+    """The counterfactual, so the guard above is not cargo cult: rounding tap-11 to bf16 and
+    re-running the tail must move the output by ~a bf16 ulp, far outside L0's 1e-3 gate."""
+    towers = __import__("speech_decoding.models.v14_converged_v3.towers",
+                        fromlist=["build_encoder"])
+    torch.manual_seed(0)
+    enc = towers.build_encoder(n_parcels=8).eval()
+    n_blocks = len(enc.blocks)
+    split, tap = n_blocks - 1, n_blocks
+
+    class _G:
+        pass
+
+    B, n_contacts, T = 2, 6, 3
+    M = n_contacts * T
+    g = _G()
+    g.total, g.max_seqlen = M, M
+    g.depth = torch.arange(n_contacts).repeat_interleave(T)
+    g.time_pos = torch.arange(T).repeat(n_contacts)
+    g.cu_seqlens = torch.tensor([0, M], dtype=torch.int32)
+    d = enc.blocks[0].mlp.fc2.out_features
+    x = torch.randn(B, M, d)
+    parcel_packed = torch.randint(0, 8, (M,))
+    with torch.no_grad():
+        _out, taps = enc.forward_flat(x, g, parcel_packed, tap_blocks=(split, tap))
+        ctx = FT._flat_ctx(enc, g, B, torch.device("cpu"))
+        FT.SPLIT_AT, FT.TAP = split, tap
+        exact = FT._run_tail(enc, taps[split], ctx)
+        rounded = FT._run_tail(enc, taps[split].to(torch.bfloat16).float(), ctx)
+    rel = float((exact - rounded).abs().max() / exact.abs().max())
+    assert rel > 1e-3, f"bf16 rounding moved the tail by only rel={rel:.2e} — L0's gate is loose"

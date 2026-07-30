@@ -35,7 +35,10 @@ A full-tower forward every epoch costs ~12x what is needed. ``V3Tower._run_flat`
 (towers.py:281-317) adds the parcel embed ONCE before block 0 and then loops blocks, capturing
 ``taps[i+1] = xf`` as the RAW block output. So tap 11 already carries the parcel embed and every
 positional effect, and block 12 applied to it reproduces tap 12 exactly. We cache tap 11 once
-per session (bf16, the autocast residual dtype, so the numerics match) and re-run only block 12.
+per session IN ITS OWN DTYPE and re-run only block 12. That dtype is fp32, not bf16: under
+bf16 autocast LayerNorm runs in fp32 and the pre-norm residual add promotes the branch back
+up (attention.py:132-136). An earlier draft cast the cache to bf16 and L0 rejected it at
+rel 5.4e-3 — one bf16 ulp, amplified by block 12.
 L0 is what certifies this.
 
 WHAT IS REPORTED: A AND D ONLY (Ben, 2026-07-30)
@@ -371,9 +374,15 @@ def main() -> None:
                 ctx_cache[B] = _flat_ctx(enc, grid, B, device)
             return ctx_cache[B]
 
-        # ── cache tap 11 once (bf16 = the autocast residual dtype, so numerics match) ────────
-        x11_dev = torch.device(args.x11_device if torch.cuda.is_available() else "cpu")
-        x11 = None      # allocated on the first batch, once the tap's shape is known
+        # ── cache tap 11 once, in the tap's OWN dtype ───────────────────────────────────────
+        # NEVER cast it. An earlier draft stored bf16 on the belief that bf16 is "the autocast
+        # residual dtype". It is not: under bf16 autocast LayerNorm runs in fp32 and the pre-norm
+        # residual add promotes the branch back up, so the stream — and this tap — is fp32.
+        # attention.py:132-136 says so verbatim ("The residual add in forward() promotes back to
+        # the fp32 stream"). Storing bf16 therefore cost exactly one ulp, which block 12 then
+        # amplified: parity-L0 failed at rel 5.371e-3 ~ 2^-7.5 on job 2779110_0. The gate caught
+        # it; the lesson is to carry the dtype, not to assume it.
+        x11 = None      # allocated on the first batch, once the tap's shape AND dtype are known
         for s in range(0, n_win, args.fwd_batch):
             e = min(s + args.fwd_batch, n_win)
             bb = [b[s:e].to(device) for b in bands]
@@ -381,15 +390,28 @@ def main() -> None:
                                                  dtype=torch.bfloat16,
                                                  enabled=(device.type == "cuda")):
                 _out, taps = tower.forward(bb, grid, parcel_packed, tap_blocks=(SPLIT_AT,))
-            t = taps[SPLIT_AT].to(torch.bfloat16)
+            t = taps[SPLIT_AT]
             if x11 is None:
-                x11 = torch.empty((n_win, t.shape[1], t.shape[2]), dtype=torch.bfloat16,
-                                  device=x11_dev)
-            x11[s:e] = t.to(x11_dev)
-        gib = x11.numel() * 2 / 1024 ** 3
+                x11_dev = torch.device(args.x11_device if torch.cuda.is_available() else "cpu")
+                need = n_win * t.shape[1] * t.shape[2] * t.element_size()
+                if x11_dev.type == "cuda":
+                    # fp32 doubles this cache. Size it from the memory model, not by guessing:
+                    # if it would not leave comfortable room for block-12 activations, put it in
+                    # host RAM — on GH200 the C2C link makes the per-batch copy negligible.
+                    # empty_cache FIRST: mem_get_info reports DRIVER-free, which excludes blocks
+                    # the caching allocator is still holding from the per-batch band copies.
+                    torch.cuda.empty_cache()
+                    free = torch.cuda.mem_get_info()[0]
+                    if need > 0.55 * free:
+                        print(f"[ft-pilot] tap{SPLIT_AT} cache needs {need / 2**30:.1f} GiB but "
+                              f"only {free / 2**30:.1f} GiB is free -> host RAM", flush=True)
+                        x11_dev = torch.device("cpu")
+                x11 = torch.empty((n_win, t.shape[1], t.shape[2]), dtype=t.dtype, device=x11_dev)
+            x11[s:e] = t.to(x11.device)
+        gib = x11.numel() * x11.element_size() / 1024 ** 3
         print(f"\n[ft-pilot] === {skey} n_win={n_win} |P|={len(present)} M={grid.total} "
-              f"k_full={grid.k_full} d={x11.shape[-1]} tap{SPLIT_AT} cache {gib:.1f} GiB on "
-              f"{x11_dev} ===", flush=True)
+              f"k_full={grid.k_full} d={x11.shape[-1]} tap{SPLIT_AT} cache {gib:.1f} GiB "
+              f"{x11.dtype} on {x11.device} ===", flush=True)
 
         def feats(rows, grad):
             """block12(cached tap 11) -> parcel-pooled (r, |P|, F)."""
