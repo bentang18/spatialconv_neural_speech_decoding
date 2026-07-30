@@ -162,7 +162,14 @@ def _ridge_eval(z_tr, z_va, z_te, y_tr, y_va, y_te, lams):
     Computing it twice per epoch was pure waste. eigh additionally makes the lambda sweep free,
     which is what pays for the val-lambda control column.
 
-    Returns (val@const-lambda, test@const-lambda, test@val-selected-lambda)."""
+    ALSO returns the ridge's EFFECTIVE DEGREES OF FREEDOM at the constant lambda,
+    df = sum_i s_i / (s_i + lam*basel) over the Gram eigenvalues. This is why a 212,992-feature
+    ridge is not crippled by 1,279 training rows: the DUAL solve lives in an n x n space, so
+    capacity is bounded by n, not by p -- and because parcel-mean features are hugely redundant
+    the spectrum decays fast, putting df far below n. It is free here (eigh already ran) and it
+    turns "the ridge is fine because it is dual" from an argument into a printed number.
+
+    Returns (val@const-lambda, test@const-lambda, test@val-selected-lambda, df@const-lambda)."""
     mu = z_tr.mean(0)
     sd = z_tr.std(0, unbiased=False)
     sd = torch.where(sd == 0, torch.ones_like(sd), sd)
@@ -183,7 +190,8 @@ def _ridge_eval(z_tr, z_va, z_te, y_tr, y_va, y_te, lams):
     val_const = RDO.auroc(sc(k_va, c), y_va)
     test_const = RDO.auroc(sc(k_te, c), y_te)
     best_lm = max(lams, key=lambda L: RDO.auroc(sc(k_va, L), y_va))
-    return val_const, test_const, RDO.auroc(sc(k_te, best_lm), y_te)
+    df_const = float((w / (w + c * basel)).sum())
+    return val_const, test_const, RDO.auroc(sc(k_te, best_lm), y_te), df_const
 
 
 def _pool_t(x, cols):
@@ -513,6 +521,8 @@ def main() -> None:
                               f"ep*={r['best_epoch']:2d} val={r['val']:.4f} "
                               f"ft={r['test_ft']:.4f} frozen={r['test_frozen']:.4f} "
                               f"vallam={r['test_frozen_vallam']:.4f} "
+                              f"| ridge_df={r['ridge_df']:.1f}/{len(tr)} "
+                              f"head_p={r['n_head_params']} "
                               f"| {r['n_epochs_run']}ep {r['sec_per_epoch']:.2f}s/ep "
                               f"{r['peak_gib']:.1f}GiB | "
                               f"d={r['test_ft'] - r['test_frozen']:+.4f} "
@@ -581,7 +591,7 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     # intermediate cells are dropped, so the ridge is fit ONCE, at epoch 0, where it IS cell A
     # and the L1 parity gate. Epoch selection is by the head's own val AUROC.
     best = {"val": -1.0, "test_ft": float("nan"), "best_epoch": -1, "n_params": n_par}
-    frozen_test = frozen_vallam = float("nan")
+    frozen_test = frozen_vallam = ridge_df = float("nan")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t_start, n_ep = time.time(), 0
@@ -617,7 +627,7 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
                 z0_tr, z0_va, z0_te = (
                     feats(r, False).reshape(len(r), -1).to(torch.float16).to(torch.float32)
                     for r in (tr, va, te))
-                _vs, frozen_test, frozen_vallam = _ridge_eval(
+                _vs, frozen_test, frozen_vallam, ridge_df = _ridge_eval(
                     z0_tr, z0_va, z0_te, yt, y_all[va], y_all[te],
                     [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])
                 del z0_tr, z0_va, z0_te
@@ -634,6 +644,7 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     for q in enc.parameters():
         q.requires_grad_(False)
     best.update(test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam),
+                ridge_df=float(ridge_df), n_head_params=int(3 * dim + 1),
                 sec_per_epoch=(time.time() - t_start) / max(n_ep, 1), n_epochs_run=n_ep,
                 peak_gib=(torch.cuda.max_memory_allocated() / 2**30
                           if device.type == "cuda" else 0.0))

@@ -73,12 +73,15 @@ def test_ridge_eval_const_lambda_matches_readout(data):
     z_va = rng.normal(size=(20, 40)).astype(np.float32)
     y_va = np.sign(rng.normal(size=20))
     y_te = np.sign(rng.normal(size=25))
-    val, test, test_vl = FT._ridge_eval(
+    val, test, test_vl, df = FT._ridge_eval(
         torch.from_numpy(z_tr), torch.from_numpy(z_va), torch.from_numpy(z_te),
         torch.from_numpy(y_tr), y_va, y_te, [0.1, 1.0, 10.0])
     assert val == pytest.approx(RDO._ridge_test(z_tr, y_tr, z_va, y_va, "std"), abs=1e-9)
     assert test == pytest.approx(RDO._ridge_test(z_tr, y_tr, z_te, y_te, "std"), abs=1e-9)
     assert np.isfinite(test_vl)
+    # df is bounded by n and, on correlated features, well below it -- that bound IS the answer
+    # to "how is a 212,992-feature ridge not crippled by 1,279 rows".
+    assert 0.0 < df <= z_tr.shape[0] + 1e-9, df
 
 
 def test_standardize_matches_readout(data):
@@ -291,3 +294,33 @@ def test_no_decay_split_covers_every_trainable_param():
     assert len(decay) + len(no_decay) == len(train_p)
     assert {id(q) for q in decay}.isdisjoint({id(q) for q in no_decay})
     assert decay and no_decay
+
+
+def test_ridge_effective_dof_is_bounded_by_n_not_p():
+    """The load-bearing claim about why the ridge survives p >> n: it solves in the DUAL, so
+    effective dof = sum s_i/(s_i+lam) <= n regardless of how many features there are. Pinned on
+    a matrix that is deliberately far wider than it is tall."""
+    rng = np.random.default_rng(3)
+    n, p = 40, 5000
+    z_tr = rng.normal(size=(n, p)).astype(np.float32)
+    z_va = rng.normal(size=(12, p)).astype(np.float32)
+    z_te = rng.normal(size=(12, p)).astype(np.float32)
+    y_tr = rng.normal(size=n)
+    _v, _t, _tv, df = FT._ridge_eval(
+        torch.from_numpy(z_tr), torch.from_numpy(z_va), torch.from_numpy(z_te),
+        torch.from_numpy(y_tr), np.sign(rng.normal(size=12)), np.sign(rng.normal(size=12)),
+        [1.0])
+    assert df <= n, f"df={df} exceeds n={n} -- the dual bound is violated"
+    assert df > 0
+
+    # Redundant features must shrink df further: repeating one column many times adds p but
+    # adds no spectrum, which is exactly the parcel-mean situation in the real features.
+    z_dup = np.repeat(z_tr[:, :5], 1000, axis=1)
+    _v2, _t2, _tv2, df_dup = FT._ridge_eval(
+        torch.from_numpy(z_dup),
+        torch.from_numpy(np.repeat(z_va[:, :5], 1000, axis=1)),
+        torch.from_numpy(np.repeat(z_te[:, :5], 1000, axis=1)),
+        torch.from_numpy(y_tr), np.sign(rng.normal(size=12)), np.sign(rng.normal(size=12)),
+        [1.0])
+    assert df_dup < df, f"redundant features did not reduce df ({df_dup:.2f} vs {df:.2f})"
+    print(f"\ndf: iid p=5000 -> {df:.2f}   rank-5 duplicated to p=5000 -> {df_dup:.2f}   (n={n})")
