@@ -29,9 +29,11 @@
 #   sbatch --array=0-2 v3_ws_partialft.sbatch awd 0.5
 # STAGE B  (full 7x4x2 grid at the stage-A winner):
 #   sbatch --array=0-6 v3_ws_partialft.sbatch b <LR>
+# STAGE C  (the corrected head -- matched bn preprocessing + multitask, sharded by question):
+#   sbatch --array=0-2 v3_ws_partialft.sbatch c
 set -euo pipefail
 
-STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|b> [LR]}"
+STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
 BASE=/projects/bhqk/htang13
 CKPT=$BASE/v3_ckpt_v3_r6_pbspace111_sf50_lr6e-3_40k/ladder-step=20000.ckpt
 TAG=pbs50_20k
@@ -61,13 +63,37 @@ case "$STAGE" in
      LRS=(1e-4 3e-4 1e-3)
      SEL="--stage a --session-index 0 --lrs ${LRS[$SLURM_ARRAY_TASK_ID]} --wd $WD --arms block12"
      OUT=$BASE/ws_partialft_stageA_wd${WD}_lr${LRS[$SLURM_ARRAY_TASK_ID]}.json ;;
+  c) # STAGE C -- THE CORRECTED-HEAD STAGE. Sharded by QUESTION, not by lr: stage A showed that
+     # sweeping lr cannot rescue a head whose PREPROCESSING does not match the ridge's, so each
+     # task here changes exactly ONE thing and carries its own lr ladder.
+     #   0  head_bn      : encoder FROZEN, bn head. This is R0 measured in the PRIMAL -- the same
+     #                     term v3_frozen_readout_sweep.py fits in the DUAL on the same features,
+     #                     so the two experiments cross-check on real data. Free invariant: no
+     #                     encoder param moves, so cell C MUST equal cell A; any C != A is a
+     #                     feature-path bug, not a result. Its lr ladder is 10x higher because a
+     #                     zero-init linear on standardized features wants a bigger step than a
+     #                     pretrained block does.
+     #   1  block12_bn   : the incumbent FT arm with MATCHED preprocessing. Against task 0 it
+     #                     isolates "was d(D-A) = -.0060 a LayerNorm artifact?", because task 0
+     #                     supplies the readout-cost offset that -.0060 confounds.
+     #   2  block12_bn_mt: adds the multi-task target block -- 4 label columns on the SAME train
+     #                     rows, which is VideoMAE v2's post-pre-training lever (arXiv 2303.16727)
+     #                     in its leak-free form. Against task 1 it isolates "was the FT starved of
+     #                     supervision?" -- our block 12 is ~790k params against ~1.3k rows.
+     ARMS=(head block12 block12)
+     CLRS=(1e-3,3e-3,1e-2 1e-4,3e-4,1e-3 1e-4,3e-4,1e-3)
+     MTF=("" "" "--multitask")
+     NAMES=(head_bn block12_bn block12_bn_mt)
+     I=$SLURM_ARRAY_TASK_ID
+     SEL="--stage a --session-index 0 --lrs ${CLRS[$I]} --arms ${ARMS[$I]} --head-norm bn ${MTF[$I]}"
+     OUT=$BASE/ws_partialft_stageC_${NAMES[$I]}.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
      # pointless in stage A (there is no encoder lr to sweep) and ~doubles stage B to ~6 GPU-h.
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12"
      OUT=$BASE/ws_partialft_stageB_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd' or 'b', got '$STAGE'" >&2; exit 1 ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b' or 'c', got '$STAGE'" >&2; exit 1 ;;
 esac
 
 # pbs50 is an r6 arm => MAE => there is NO EMA teacher; the tower is objective.online.*

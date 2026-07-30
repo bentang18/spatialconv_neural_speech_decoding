@@ -80,7 +80,10 @@ pretraining, on this arm). The board WS margin over the leaderboard is +.0120.
   d >= +.010 AND >= 20/28 positive -> BUILD THE CS VERSION (15 fine-tunes) and take it to the
                                      board. Headline path.
   0 < d < +.010, or n.s.           -> negative result; ridge stays; close the thread.
-  d <= 0                           -> close the thread; the readout is not the bottleneck.
+  d <= 0                           -> INCONCLUSIVE for the features. C is ONE-SIDED: block 12 is
+                                     moved by BCE on the head, not by the ridge, so a null does
+                                     not separate "features cannot improve" from "the head is too
+                                     poor a teacher". Repair = squared-loss driver, not closure.
   parity gate fails                -> fix the forward; read nothing.
 A/B differ in all four branches.
 
@@ -254,6 +257,14 @@ def _arm_params(enc, arm: str):
     here: n_train is ~3.6k windows, so the full block (~790k params) is heavily overparameterized
     and norm-only (BitFit) is the honest floor."""
     blk = enc.blocks[TAP - 1]
+    if arm == "head":
+        # ENCODER FULLY FROZEN — only the head trains. This is the 2x2 cell that separates READOUT
+        # FAMILY from WEIGHTS: it is the primal twin of the frozen sweep's R0 term
+        # (v3_frozen_readout_sweep.py, fitted in the dual on the same features), so the two
+        # experiments cross-check each other on real data. It also carries a free invariant: with
+        # no encoder parameter moving, cell C (ridge on "fine-tuned" features) MUST equal cell A
+        # bit-for-bit, so any C != A on this arm is a bug in the feature path, not a result.
+        return []
     if arm == "norm":
         return [p for _, p in blk.named_parameters() if p.ndim == 1]
     if arm == "mlp":
@@ -268,17 +279,32 @@ class _Head(torch.nn.Module):
     on purpose — with weight decay it is an L2-regularized logistic regression on the readout's
     own feature space, so the gradient block 12 receives is about the features the ridge will
     actually use. (A parcel-pooled head would be better conditioned but would optimize a
-    different representation than the one reported.)"""
+    different representation than the one reported.)
 
-    def __init__(self, dim: int):
+    🔑 ``norm`` IS THE DEFECT UNDER TEST, not a style choice.
+      ``ln``  LayerNorm(dim) — the incumbent. Normalizes PER SAMPLE across all 212,992 features,
+              which is NOT what the ridge gets, and carries 2*dim = 425,984 params (67% of the
+              head) that are absorbable into the following Linear anyway
+              (fc(g*n + b) = (w*g).n + (w.b + c)), so they buy no function class.
+      ``bn``  BatchNorm1d(dim, affine=False) — MAE's linear-probe recipe verbatim ("an extra
+              BatchNorm layer without affine transformation before the linear classifier",
+              mae.tex:616). PER FEATURE, so it is the ridge's own train-fitted z-score
+              (``RDO._standardize``) — at full batch, algebraically identical — and it keeps
+              tracking as fine-tuning moves the features. ZERO params, so the head drops
+              638,977 -> 212,993.
+    ``n_out`` > 1 is the multi-task head: one column per probe task over a SHARED normalization
+    and a shared block 12, which is where the 4x supervision actually lands."""
+
+    def __init__(self, dim: int, norm: str = "ln", n_out: int = 1):
         super().__init__()
-        self.norm = torch.nn.LayerNorm(dim)
-        self.fc = torch.nn.Linear(dim, 1)
+        self.norm = (torch.nn.BatchNorm1d(dim, affine=False) if norm == "bn"
+                     else torch.nn.LayerNorm(dim))
+        self.fc = torch.nn.Linear(dim, n_out)
         torch.nn.init.zeros_(self.fc.weight)
         torch.nn.init.zeros_(self.fc.bias)
 
     def forward(self, z):
-        return self.fc(self.norm(z)).squeeze(-1)
+        return self.fc(self.norm(z))
 
 
 def main() -> None:
@@ -298,6 +324,17 @@ def main() -> None:
     p.add_argument("--lrs", default="1e-4", help="stage a sweeps these; stage b takes one")
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=80)
+    p.add_argument("--head-norm", choices=("ln", "bn"), default="ln",
+                   help="ln = LayerNorm(dim), the incumbent: PER-SAMPLE across 212,992 features, "
+                        "which is NOT the preprocessing the ridge gets, and 425,984 of its params "
+                        "are absorbable into the next Linear. bn = BatchNorm1d(affine=False), "
+                        "MAE's linear-probe recipe (mae.tex:616): PER-FEATURE, so it IS the "
+                        "ridge's train-fitted z-score, and it carries ZERO params.")
+    p.add_argument("--multitask", action="store_true",
+                   help="supervise the shared block with ALL probe tasks at once (VideoMAE v2's "
+                        "post-pre-training on a mixed labeled set, arXiv 2303.16727). Same rows, "
+                        "extra LABEL COLUMNS only -- ~4x the gradient signal, no new rows, no "
+                        "leak. Reported cell is unchanged.")
     p.add_argument("--warmup-epochs", type=int, default=10,
                    help="epochs with the encoder FROZEN before block 12 is unfrozen (REVE's "
                         "two-step recipe, arXiv 2510.21585). 0 disables.")
@@ -493,8 +530,11 @@ def main() -> None:
             continue
 
         # ── the cells ───────────────────────────────────────────────────────────────────────
+        # Built ONCE per session: every task labels the same windows, so the multi-task block is
+        # just extra columns indexed by the same row ids.
+        y_by_task = {t: np.asarray(targets.labels[t], dtype=np.float64) for t in PROBE_TASKS}
         for task in PROBE_TASKS:
-            y_all = np.asarray(targets.labels[task], dtype=np.float64)
+            y_all = y_by_task[task]
             for fold, sp in targets.ws_split[task].items():
                 tr = RDO._finite(y_all, sp["train"])
                 va = RDO._finite(y_all, sp["val"])
@@ -512,10 +552,14 @@ def main() -> None:
                 for arm in arms:
                     for lr in lrs:
                         enc.blocks[TAP - 1].load_state_dict(pristine)   # fresh weights per cell
+                        mt = (np.stack([y_by_task[t][tr] for t in PROBE_TASKS], axis=1)
+                              if args.multitask else None)
                         r = _run_cell(enc, feats, tr, va, te, y_all, yt, device=device,
-                                      arm=arm, lr=lr, args=args)
+                                      arm=arm, lr=lr, args=args, mt=mt,
+                                      ti=PROBE_TASKS.index(task))
                         r.update(session=skey, task=task, fold=int(fold), arm=arm, lr=lr,
-                                 wd=float(args.wd),
+                                 wd=float(args.wd), head_norm=args.head_norm,
+                                 multitask=bool(args.multitask),
                                  n_train=len(tr), n_val=len(va), n_test=len(te))
                         results.append(r)
                         print(f"[cell] {skey} {task:16s} f{fold} {arm:8s} lr={lr:g} "
@@ -557,9 +601,23 @@ def main() -> None:
     print(f"[ft-pilot] wrote {args.out}", flush=True)
 
 
-def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
+def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=None, ti=0):
     """One fine-tune. Epoch 0 is evaluated BEFORE any step, so the frozen control is measured
-    inside the same code path as the FT number — not read from elsewhere."""
+    inside the same code path as the FT number — not read from elsewhere.
+
+    ``mt`` is the MULTI-TASK target block: (n_train, K) with NaN where a task has no label on that
+    row, or None for single-task. ``ti`` is the column of the task this cell REPORTS.
+
+    WHY MULTI-TASK (VideoMAE v2, arXiv 2303.16727). Its protocol contribution is exactly aimed at
+    our failure mode: "an initial pre-training on a diverse multi-sourced unlabeled dataset,
+    followed by a post-pre-training on a MIXED LABELED dataset". Our block 12 is ~790k params
+    against n_train ~1.3k rows, so the supervision — not the capacity — is what is scarce.
+    All four probe tasks label the SAME windows, so training the shared block against all four at
+    once multiplies the gradient signal ~4x on exactly the rows this cell already trains on.
+
+    🔒 NO LEAK, BY CONSTRUCTION: the rows are ``tr`` — this cell's own train rows — and nothing
+    else. Only the LABEL COLUMNS are added, never a row. (Pooling across FOLDS would leak, since
+    fold 0's train contains fold 1's test windows; that is why only the task axis is pooled.)"""
     params = _arm_params(enc, arm)
     for q in enc.parameters():
         q.requires_grad_(False)
@@ -569,13 +627,17 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
 
     with torch.no_grad():
         dim = int(feats(tr[:1], False).reshape(1, -1).shape[1])
-    head = _Head(dim).to(device)
+    n_out = 1 if mt is None else int(mt.shape[1])
+    head = _Head(dim, args.head_norm, n_out).to(device)
+    n_head = sum(q.numel() for q in head.parameters())
     if _run_cell.announced is False:
         # The head's shape is the thing wd is fighting. Print it MEASURED rather than asserted:
         # MAE's classifier reads ONE d-dim token (mae.tex:610, class token or average pooling),
-        # ours reads the whole flattened |P|xF the ridge reads.
-        print(f"[head] feature dim={dim} ({3 * dim + 1} head params) vs n_train={len(tr)} "
-              f"-> {(3 * dim + 1) / max(len(tr), 1):.0f}x overparameterized", flush=True)
+        # ours reads the whole flattened |P|xF the ridge reads. Counted from the MODULE, not from
+        # a formula -- `ln` carries 2*dim of absorbable affine that `bn` does not have at all.
+        print(f"[head] norm={args.head_norm} feature dim={dim} n_out={n_out} "
+              f"({n_head} head params) vs n_train={len(tr)} "
+              f"-> {n_head / max(len(tr), 1):.0f}x overparameterized", flush=True)
         _run_cell.announced = True
     # NO-DECAY GROUP. A single AdamW group would apply wd to every LayerNorm gain and bias in
     # the head and in block 12 -- and 1-D params are exactly what standard practice exempts
@@ -589,7 +651,12 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
         [{"params": decay, "weight_decay": args.wd},
          {"params": no_decay, "weight_decay": 0.0}], lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
-    ybin = torch.as_tensor((y_all[tr] > 0).astype(np.float32), device=device)
+    # ONE code path for both: single-task is the K=1 column case, so the multi-task arm cannot
+    # drift from the incumbent by accident. `msk` is False where a task has no label on that row,
+    # and the loss is a FLAT masked BCE -- equal weight per (row, task) entry.
+    arr = (y_all[tr][:, None] if mt is None else mt)
+    ybin = torch.as_tensor((arr > 0).astype(np.float32), device=device)
+    msk = torch.as_tensor(np.isfinite(arr), device=device)
     lossf = torch.nn.BCEWithLogitsLoss()
     rng = np.random.default_rng(args.seed)
 
@@ -606,6 +673,21 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     # C vs D prices the readout family on its own.
     # C is cheap because eigh already runs: one extra no-grad forward over the train rows plus a
     # ~n x n Gram per epoch. C gets its OWN val-selected epoch (using D's would handicap it).
+    #
+    # 🚨 C IS A ONE-SIDED TEST (Ben 07-30: "would the features trained for the linear logistic
+    # transfer for the ridge?"). The gradient that moves block 12 comes from BCE on the head, NOT
+    # from the ridge -- the ridge is never in the autograd graph. So:
+    #   C > A  is CONCLUSIVE: the features improved for the ridge even though the driver was a
+    #          readout the ridge does not share.
+    #   C <= A is NOT conclusive: it is equally consistent with "fine-tuning cannot help these
+    #          features" and with "a 500x-overparameterized BCE head is too poor a teacher to find
+    #          features the ridge can use". Those do not separate here.
+    # Making it two-sided means either differentiating through the ridge (bilevel -- but the only
+    # outer objective available is val, 637 rows against 790k params, which trades this confound
+    # for a worse one) or matching the driver's loss family to the ridge's (squared loss on the
+    # same +-1 targets, which is approximately a primal ridge). The second is one argument and one
+    # line; it is worth adding only if C comes back flat, since a one-sided test that FIRES needs
+    # no repair.
     best = {"val": -1.0, "test_ft": float("nan"), "best_epoch": -1, "n_params": n_par}
     best_c = {"val": -1.0, "test": float("nan"), "epoch": -1}
     frozen_test = frozen_vallam = ridge_df = float("nan")
@@ -629,7 +711,8 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
             for s in range(0, len(order), args.train_batch):
                 pos = order[s:s + args.train_batch]
                 z = feats(tr[pos], True).reshape(len(pos), -1)
-                loss = lossf(head(z), ybin[pos])
+                mb = msk[pos]
+                loss = lossf(head(z)[mb], ybin[pos][mb])
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(head.parameters()) + params, 3.0)
@@ -652,10 +735,12 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
                 frozen_test, frozen_vallam, ridge_df = ct, cvl, cdf
             elif np.isfinite(cv) and cv > best_c["val"]:
                 best_c = {"val": float(cv), "test": float(ct), "epoch": ep}
-            hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1)).float().cpu().numpy(),
-                           y_all[va])
-            ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1)).float().cpu().numpy(),
-                           y_all[te])
+            # column `ti` is the task THIS cell reports; the other columns exist only to
+            # supervise the shared block 12.
+            hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1))[:, ti]
+                           .float().cpu().numpy(), y_all[va])
+            ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1))[:, ti]
+                           .float().cpu().numpy(), y_all[te])
         head.train()
         if np.isfinite(hv) and hv > best["val"]:
             best = {"val": float(hv), "test_ft": float(ht), "best_epoch": ep, "n_params": n_par}
@@ -670,7 +755,7 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     best.update(test_c=float(best_c["test"]), c_epoch=int(best_c["epoch"]),
                 val_c=float(best_c["val"]),
                 test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam),
-                ridge_df=float(ridge_df), n_head_params=int(3 * dim + 1),
+                ridge_df=float(ridge_df), n_head_params=int(n_head),
                 sec_per_epoch=(time.time() - t_start) / max(n_ep, 1), n_epochs_run=n_ep,
                 peak_gib=(torch.cuda.max_memory_allocated() / 2**30
                           if device.type == "cuda" else 0.0))
@@ -730,8 +815,13 @@ def _report(results, base, args):
         # The gate is C vs A: same estimator, so the delta is the WEIGHTS.
         ds = [r[6] - r[3] for r in rows]
         mean_d, k = float(np.mean(ds)), sum(x > 0 for x in ds)
+        # C <= A cannot close the thread: C is one-sided (the driver is a BCE head, not the
+        # ridge), so a null there does not distinguish "features cannot improve" from "the head
+        # is too poor a teacher". See the one-sidedness note in _run_cell.
         verdict = ("BUILD THE CS VERSION" if mean_d >= 0.010 and k >= 20 and len(rows) == 28
-                   else "NEGATIVE — ridge stays" if mean_d > 0 else "CLOSE THE THREAD")
+                   else "NEGATIVE — ridge stays" if mean_d > 0
+                   else "INCONCLUSIVE for the features — only that FT through a BCE head does "
+                        "not help the ridge; the live repair is a squared-loss driver")
         print(f"  DECISION (on d(C-A), the weights-only contrast) -> {verdict}"
               + ("" if len(rows) == 28 else f"  (PARTIAL: {len(rows)}/28 cells — not the gate)"))
 

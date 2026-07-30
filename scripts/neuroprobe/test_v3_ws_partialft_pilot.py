@@ -178,7 +178,10 @@ def test_head_is_trainable_and_scores_like_a_readout():
     head = FT._Head(12)
     z = torch.randn(20, 12)
     out = head(z)
-    assert out.shape == (20,)
+    # (B, K), not (B,): K is the multi-task column count and single-task is K=1, so both arms run
+    # ONE code path. Callers index [:, ti] for the column the cell reports.
+    assert out.shape == (20, 1)
+    out = out[:, 0]
     out.sum().backward()
     assert head.fc.weight.grad is not None
     y = np.sign(np.random.default_rng(0).normal(size=20))
@@ -363,11 +366,16 @@ def test_report_decision_keys_on_C_minus_A_not_D_minus_A(capsys):
     assert "C vs A const-lam" in out and "D vs C readout" in out
 
 
-def test_report_closes_the_thread_when_features_did_not_move(capsys):
-    """The mirror: C flat/down closes it even if the head happens to win."""
+def test_negative_C_is_reported_as_inconclusive_not_as_closure(capsys):
+    """C is ONE-SIDED: block 12 is moved by BCE on the head, never by the ridge. So C <= A does
+    not separate "features cannot improve" from "the BCE head is too poor a teacher", and the
+    verdict must not claim closure. An earlier draft printed CLOSE THE THREAD here, which would
+    have retired a live question on evidence that cannot decide it."""
     FT._report(_fake_results(c_delta=-0.02, d_delta=+0.05), _fake_base(), _Args())
     out = capsys.readouterr().out
-    assert "CLOSE THE THREAD" in out, out
+    assert "INCONCLUSIVE for the features" in out, out
+    assert "CLOSE THE THREAD" not in out
+    assert "squared-loss driver" in out
 
 
 def test_report_needs_all_28_cells_for_the_gate(capsys):
@@ -376,3 +384,94 @@ def test_report_needs_all_28_cells_for_the_gate(capsys):
                _fake_base(n_sess=3), _Args())
     out = capsys.readouterr().out
     assert "PARTIAL: 12/28 cells" in out and "BUILD THE CS VERSION" not in out
+
+
+# ── head norm: the defect under test ──────────────────────────────────────────────────
+def test_affine_free_bn_head_carries_zero_norm_params_and_shrinks_the_head():
+    """LayerNorm(dim) spends 2*dim on an affine that fc absorbs exactly
+    (fc(g*n+b) = (w*g).n + (w.b+c)), so it buys no function class while being 67% of the head.
+    MAE's linear-probe recipe (mae.tex:616) is affine-free BatchNorm, which spends ZERO."""
+    dim = 1000
+    ln, bn = FT._Head(dim, "ln"), FT._Head(dim, "bn")
+    n_ln = sum(q.numel() for q in ln.parameters())
+    n_bn = sum(q.numel() for q in bn.parameters())
+    assert n_ln == 2 * dim + dim + 1
+    assert n_bn == dim + 1
+    assert sum(q.numel() for q in bn.norm.parameters()) == 0
+    assert n_bn / n_ln < 0.34            # 425,984 of 638,977 head params were the LN affine
+
+
+def test_bn_head_normalizes_per_feature_and_ln_head_per_sample():
+    """The whole hypothesis in one test. The ridge standardizes PER FEATURE on train stats; `ln`
+    normalizes PER SAMPLE across all features, which is a different preprocessing. Feed a matrix
+    with wildly unequal per-feature scales and check which one equalizes the FEATURE axis."""
+    torch.manual_seed(0)
+    # 0.1, not 0.01: BatchNorm's default eps=1e-5 is not negligible against a variance of
+    # 1e-4, and the point of the test is the normalization axis, not eps.
+    z = torch.randn(64, 8) * torch.tensor([100.0, 1, 1, 1, 1, 1, 1, 0.1])
+    bn = FT._Head(8, "bn")
+    bn.train()
+    nb = bn.norm(z)
+    assert torch.allclose(nb.std(0, unbiased=False), torch.ones(8), atol=1e-3)
+    ln = FT._Head(8, "ln")
+    nl = ln.norm(z)
+    assert torch.allclose(nl.std(1, unbiased=False), torch.ones(64), atol=1e-2)
+    # ...and `ln` leaves the per-feature scales grossly unequal, which is the defect.
+    sd = nl.std(0, unbiased=False)
+    assert float(sd.max() / sd.min()) > 5.0
+
+
+def test_bn_head_at_full_batch_is_the_ridges_own_standardization():
+    """At full batch BatchNorm's batch statistics ARE the train statistics, so the `bn` head sees
+    byte-equal preprocessing to the ridge. This is why matched preprocessing needs no extra arm."""
+    torch.manual_seed(1)
+    z = torch.randn(96, 16) * 3.0 + 2.0
+    head = FT._Head(16, "bn")
+    head.train()
+    got = head.norm(z)
+    mu, sd = z.mean(0), z.std(0, unbiased=False)
+    assert torch.allclose(got, (z - mu) / sd, atol=1e-4)
+
+
+def test_multitask_head_emits_one_column_per_task():
+    head = FT._Head(20, "bn", 4)
+    assert head(torch.randn(7, 20)).shape == (7, 4)
+
+
+def test_masked_multitask_loss_ignores_missing_labels():
+    """Tasks have different finite masks on the same rows. A NaN entry must contribute NOTHING —
+    if it leaked in as 0 it would train every task to predict the negative class on those rows."""
+    arr = np.array([[1.0, np.nan], [0.0, 1.0], [1.0, 0.0]])
+    ybin = torch.as_tensor((arr > 0).astype(np.float32))
+    msk = torch.as_tensor(np.isfinite(arr))
+    logit = torch.zeros(3, 2, requires_grad=True)
+    loss = torch.nn.BCEWithLogitsLoss()(logit[msk], ybin[msk])
+    loss.backward()
+    # 5 valid entries of 6; the masked one gets exactly zero gradient.
+    assert int(msk.sum()) == 5
+    assert float(logit.grad[0, 1]) == 0.0
+    assert float(logit.grad[0, 0]) != 0.0
+
+
+def test_single_task_is_the_one_column_case_of_the_multitask_path():
+    """Single-task must be K=1 of the SAME code path, so the multitask arm cannot silently drift
+    from the incumbent. Both build ybin/msk identically for a fully-labelled single column."""
+    y = np.array([1.0, 0.0, 1.0, 0.0])
+    single = y[:, None]
+    assert single.shape == (4, 1)
+    assert np.isfinite(single).all()
+    assert np.array_equal((single > 0).astype(np.float32),
+                          np.array([[1.0], [0.0], [1.0], [0.0]], dtype=np.float32))
+
+
+def test_head_arm_freezes_every_encoder_parameter_and_extends_the_ladder():
+    """The `head` arm is the readout-family-only cell: it is the primal twin of the frozen sweep's
+    R0 term, and it carries the C==A invariant (no encoder param moves => the ridge on
+    "fine-tuned" features must reproduce the frozen ridge). If it unfroze anything, both uses die.
+    It must also EXTEND the parameter ladder at zero, not sit somewhere in the middle."""
+    towers = __import__("speech_decoding.models.v14_converged_v3.towers",
+                        fromlist=["build_encoder"])
+    enc = towers.build_encoder(n_parcels=8)
+    assert FT._arm_params(enc, "head") == []
+    n = lambda a: sum(q.numel() for q in FT._arm_params(enc, a))
+    assert n("head") == 0 < n("norm") < n("block12")
