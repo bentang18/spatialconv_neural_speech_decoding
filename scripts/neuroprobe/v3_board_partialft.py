@@ -222,6 +222,10 @@ def main() -> None:
     p.add_argument("--span-dir", required=True)
     p.add_argument("--bt-root", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--elec-labels-sidecar",
+                   help="pickle {'s{S}_t{T}': labels} for caches that predate inline elec_labels "
+                        "(board_r6_40k). REQUIRED for csession — without it the electrode "
+                        "identity-intersect has nothing to intersect on.")
     p.add_argument("--unit", choices=("parcel", "elec"), default=None,
                    help="override the regime default; for the one-session smoke test only")
     p.add_argument("--tasks", default=None, help="comma list; default = all 15 board tasks")
@@ -332,12 +336,33 @@ def main() -> None:
 
     # Board cache records: the object the frozen number was computed from. Loaded with mmap --
     # they carry enc12_elec and run 50-65 GB, and eager torch.load is the documented OOM.
+    sidecar = None
+    if args.elec_labels_sidecar:
+        import pickle
+        with open(args.elec_labels_sidecar, "rb") as fh:
+            sidecar = pickle.load(fh)
+        print(f"[sidecar] elec_labels available for {len(sidecar)} sessions", flush=True)
+
     def rec_of(session):
         hits = glob.glob(os.path.join(args.board_cache_dir,
                                       f"enc_s{session[0]}_t{session[1]}_{args.board_tag}.pt"))
         if not hits:
             raise SystemExit(f"no board cache for S{session[0]}T{session[1]} in {args.board_cache_dir}")
-        return torch.load(hits[0], map_location="cpu", mmap=True, weights_only=False)
+        rec = torch.load(hits[0], map_location="cpu", mmap=True, weights_only=False)
+        # Caches encoded before elec_labels was stored (board_r6_40k is one: the field is None)
+        # carry them in a sidecar pickle instead. Same attach + same shape check as
+        # v3_board_readout.py:615-622 — without it _elec_cols returns (None, None, 0) and every
+        # csession cell would die claiming "no shared electrodes", which is a MISSING LABEL
+        # problem wearing the costume of a data problem.
+        if sidecar is not None and rec.get("elec_labels") is None:
+            lab = sidecar.get(f"s{session[0]}_t{session[1]}")
+            if lab is not None:
+                n_e = rec["feats"]["enc12_elec"]["raw"].shape[1]
+                if lab.shape[0] != n_e:
+                    raise SystemExit(f"sidecar labels ({lab.shape[0]}) != enc12_elec electrodes "
+                                     f"({n_e}) for s{session[0]}_t{session[1]}")
+                rec["elec_labels"] = lab
+        return rec
 
     test_rec = rec_of(cell)
     train_rec = test_rec if train_cell == cell else rec_of(train_cell)
@@ -346,6 +371,10 @@ def main() -> None:
     if args.regime == "ws":
         sel_tr = sel_ev = None
     elif unit == "elec":
+        if train_rec.get("elec_labels") is None or test_rec.get("elec_labels") is None:
+            raise SystemExit(
+                f"S{cell[0]}T{cell[1]}: a record has no elec_labels, so electrodes cannot be "
+                f"identity-intersected. Pass --elec-labels-sidecar (board_r6_40k stores None).")
         a_idx, t_idx, n_sh = BRD._elec_cols(train_rec, test_rec)
         if not n_sh:
             raise SystemExit(f"no shared electrodes for S{cell[0]}T{cell[1]}")
@@ -378,10 +407,14 @@ def main() -> None:
           flush=True)
 
     # ── L0: block12(cached tap-11) == the on-disk enc12 tap, AT THE REPORTED UNIT ───────────
-    key = f"enc{TAP}" if unit == "parcel" else f"elec_enc{TAP}"
-    ref = test_rec["feats"].get(key)
-    if ref is None:
-        raise SystemExit(f"L0: board cache has no '{key}' tap -- cannot certify the {unit} unit")
+    # The elec tap is keyed "enc12_elec" (== BRD.ELEC_TAPS[1]), NOT "elec_enc12", and every tap is
+    # a dict whose "raw" holds the tensor (v3_board_readout.py:618). Both were verified against a
+    # real record's key list rather than inferred from the encode script's _write() call.
+    key = f"enc{TAP}" if unit == "parcel" else f"enc{TAP}_elec"
+    if key not in test_rec["feats"]:
+        raise SystemExit(f"L0: board cache has no '{key}' tap (has {sorted(test_rec['feats'])}) "
+                         f"-- cannot certify the {unit} unit")
+    ref = test_rec["feats"][key]["raw"]
     probe_rows = np.arange(min(256, ref.shape[0]), dtype=np.int64)
     with torch.no_grad():
         z16 = FTP._flat16(feats_ev_raw(probe_rows, False)).cpu()
