@@ -39,6 +39,8 @@
 #   sbatch --array=0-1 v3_ws_partialft.sbatch f
 # STAGE G  (two-sided: drive block 12 with the REPORTED ridge's leave-one-out risk, not BCE):
 #   sbatch --array=0-1 v3_ws_partialft.sbatch g
+# STAGE H  (stage E minus --multitask, same LR: E - H is the multitask term over 28 cells):
+#   sbatch --array=0-6 v3_ws_partialft.sbatch h <LR>
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -173,7 +175,18 @@ case "$STAGE" in
      SEL="--stage a --session-index 0 --lrs ${GLRS[$I]} --arms block12 --head-norm bn --multitask
           --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageG_ridgedriver_$I.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f' or 'g', got '$STAGE'" >&2
+  h) LR="${2:?stage h needs the same LR stage e used}"
+     # STAGE H -- ATTRIBUTE THE +.010. Stage E moved THREE things off the incumbent at once (bn
+     # preprocessing, multitask supervision, fine-tuning), so its d(C-A) cannot say which one paid.
+     # This is stage E with --multitask REMOVED and nothing else changed: same lr, same 7 sessions,
+     # same bn head, same folds, so E - H is the multitask term alone over the full 28 cells.
+     # DECISION: if H reproduces E's +.010, multitask is not load-bearing and the CS build drops it
+     # -- one fewer moving part in the arm that has to survive cross-subject. If H falls short, the
+     # 4x supervision IS the mechanism and it must carry into CS, where n_train per anchor subject
+     # is the binding constraint anyway.
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn"
+     OUT=$BASE/ws_partialft_stageH_s$SLURM_ARRAY_TASK_ID.json ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g' or 'h', got '$STAGE'" >&2
      exit 1 ;;
 esac
 
