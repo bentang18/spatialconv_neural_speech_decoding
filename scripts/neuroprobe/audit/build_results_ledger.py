@@ -40,6 +40,16 @@ RUN_IDS = {
     # r6_pbspace_<jobid>.out, which prints run= and space_frac= verbatim.
     "pbs50_20k": "2764203",
     "pbs25_20k": "2764176",
+    # pbs00_20k IS NOT FROM THE pbspace LAUNCHER. Its stdout header reads
+    # "[r6 hard-mask OFAT] run=v3_r6_maskspace0_lr6e-3_40k ... --mask-space-frac 0.0", i.e. the
+    # SHARED space knob with per_band_space=False, and cb=5500 accum=12 where pbs50/pbs25 run
+    # cb=11000 accum=6. It is still the correct zero rung: masking.py:145 makes space_frac==0.0
+    # the deliberate no-spatial-masking arm (Σd_s == 0 by construction), and per_band_space only
+    # decides how a spatial draw is split across bands (:454), so it is VACUOUS when no contacts
+    # are drawn. The cb/accum split is token-exact (66,000 contacts/step both) and accumulation
+    # averages exactly, so what differs is the per-micro-batch mask REALIZATION -- a seed-level
+    # difference, and there is 1 seed per arm. Quote the ladder with that caveat attached.
+    "pbs00_20k": "2764373",
 }
 
 FIELDS = ["family", "artifact", "run_id", "arm_tag", "regime", "tap", "norm",
