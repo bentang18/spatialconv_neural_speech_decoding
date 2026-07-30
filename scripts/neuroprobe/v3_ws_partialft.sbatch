@@ -37,6 +37,8 @@
 #   sbatch --array=0 v3_ws_partialft.sbatch dx
 # STAGE E  (the full 7-session grid at the corrected head -- the only stage that clears the null):
 #   sbatch --array=0-6 v3_ws_partialft.sbatch e <LR>
+# STAGE EM (the missing 2x2 corner: stage E with --arms mlp -- BCE + mlp over the same 28 cells):
+#   sbatch --array=0-6%3 v3_ws_partialft.sbatch em <LR>      # run at BOTH 1e-2 and 1e-3
 # STAGE F  (the block-DEPTH ladder: 2 and 3 trainable blocks vs the 1-block incumbent):
 #   sbatch --array=0-1 v3_ws_partialft.sbatch f
 # STAGE G  (two-sided: drive block 12 with the REPORTED ridge's leave-one-out risk, not BCE):
@@ -51,9 +53,12 @@
 #   sbatch --array=0 v3_ws_partialft.sbatch rm
 # STAGE RMS (the candidate arm over 28 cells: mlp + ridge driver; R - RMS = the attention term):
 #   sbatch --array=0-6%3 v3_ws_partialft.sbatch rms <LR>
+# STAGE RMSB (is the winner an artifact of the MINIBATCH LOO? --train-batch ladder vs RMS's 128):
+#   sbatch --array=0-6%3 v3_ws_partialft.sbatch rmsb 1e-2 256
+#   sbatch --array=0-6%3 v3_ws_partialft.sbatch rmsb 1e-2 512
 set -euo pipefail
 
-STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
+STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <stage> [LR] [TRAIN_BATCH]}"
 BASE=/projects/bhqk/htang13
 CKPT=$BASE/v3_ckpt_v3_r6_pbspace111_sf50_lr6e-3_40k/ladder-step=20000.ckpt
 TAG=pbs50_20k
@@ -174,6 +179,34 @@ case "$STAGE" in
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms mlp --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageRMS_s$SLURM_ARRAY_TASK_ID.json ;;
+  rmsb) LR="${2:?stage rmsb needs the LR -- 1e-2, the stage RMS winner}"
+     TB="${3:?stage rmsb needs a --train-batch: 256 or 512 (128 IS stage RMS, already run)}"
+     # STAGE RMSB -- IS THE WINNING RESULT AN ARTIFACT OF THE MINIBATCH LOO? (Ben 07-30)
+     # The driver is the leave-one-out risk of the REPORTED estimator, but it is fit on a
+     # MINIBATCH: --train-batch defaults to 128 against n_train=1279, and the reported ridge runs
+     # at ridge_df = 540.6. A ridge on 128 rows has AT MOST 128 effective dof, so the objective we
+     # optimize is a 4.2x-smaller-capacity estimator than the one we report. The first-principles
+     # case for this driver is "match the reported estimator", and on sample size we do not.
+     # 🚨 WHY IT IS NOT COSMETIC: the headline mechanism -- "the LOO risk overfits ITSELF when
+     # handed more parameters" -- is far more true at n=128 than at n=1279. If the full-sample risk
+     # is better conditioned it may tolerate the attention sublayer, which would RETRACT the
+     # "attention hurts" capacity finding (RMS - R = +.0111, 21/28, p=.0125).
+     # DESIGN: identical to stage RMS except --train-batch, so this is a one-thing-changed ladder
+     # over the SAME 28 cells. LR is held at RMS's 1e-2 rather than re-swept, which makes the read
+     # ASYMMETRIC and that is deliberate:
+     #   FLAT or BETTER -> conclusive. A too-small lr for a bigger batch would show a DROP, never
+     #                     flatness, so insensitivity at matched lr means the approximation is
+     #                     benign. State it as a stated approximation and keep --train-batch 128.
+     #   WORSE          -> AMBIGUOUS (n vs lr). Only then re-sweep lr at that batch before
+     #                     concluding, and if it survives the sweep, build the exact two-pass
+     #                     full-sample LOO (chunked no-grad forward -> Phi, closed-form dL/dPhi,
+     #                     chunked backward) which costs ~1.5x a step and NOT more memory.
+     # ⚠️ Batch size also changes UPDATES PER EPOCH (1279/tb: 10 at 128, 3 at 512). --epochs is the
+     # same and best_epoch is selected on val, so each arm picks its own number of passes; that is
+     # the fair comparison, but it is why a bare "worse" cannot be read as "n matters".
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms mlp --head-norm bn
+          --multitask --driver ridge --warmup-epochs 0 --train-batch $TB"
+     OUT=$BASE/ws_partialft_stageRMSB_tb${TB}_s$SLURM_ARRAY_TASK_ID.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
@@ -194,9 +227,36 @@ case "$STAGE" in
      # positive 7/8 in stage C.
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn --multitask"
      OUT=$BASE/ws_partialft_stageE_s$SLURM_ARRAY_TASK_ID.json ;;
-  f) # STAGE F -- HOW MANY BLOCKS. Every FT number so far unfreezes exactly ONE block, and MAE's
-     # own Fig 9 (mae.tex:467) puts one-block partial FT at 73.5 against 81.0 for the full network:
-     # one block leaves most of the gain on the table, which is the SHAPE of our d(C-A) = +.005.
+  em) LR="${2:?stage em needs an LR: 1e-2 for the mlp BCE optimum, 1e-3 to match stage E}"
+     # STAGE EM -- THE MISSING CORNER OF THE 2x2 (Ben 07-30: "do bce+mlp now").
+     # The attribution ladder has BCE/block12 (E), ridge/block12 (R) and ridge/mlp (RMS) at full
+     # scale, but BCE/mlp ONLY ON ONE SESSION (stage DX: +.0073 at lr 1e-2, and mt=False). So the
+     # claimed INTERACTION -- "restricting capacity pays only under the ridge driver" -- currently
+     # rests on 4 fold-meaned cells against 28 for every other cell of the ladder.
+     # This is stage E with --arms mlp and NOTHING else changed, so E - EM is the attention-sublayer
+     # term under BCE over the SAME 28 cells on which R - RMS measures it under the ridge driver.
+     # DECISION: if EM >= E, capacity restriction is driver-INDEPENDENT and the mechanism is simply
+     # "fewer trainable params against ~1279 rows". If EM ~= E while RMS > R, the interaction is
+     # real and the mechanism is specifically that the LOO risk overfits ITSELF when handed the
+     # attention sublayer. Those are different claims about WHY, and the CS build inherits the
+     # explanation, not just the arm.
+     # 📐 PRECEDENT, verified (arXiv 2111.06377v3 Fig 9): MAE ran this exact cut and found the MLP
+     # sub-block WORSE than a full block (79.1 vs 81.0) under its supervised/BCE-style objective.
+     # Our ridge-driver result INVERTS that ordering (mlp +.0320 vs block12 +.0209). EM is the arm
+     # that says whether the inversion is ours or the driver's.
+     # LR: run BOTH 1e-2 (mlp's own BCE optimum -- stage DX is a PLATEAU .0073/.0069/.0068 across
+     # 1e-2..1e-1, not a peak) and 1e-3 (stage E's lr, protocol-matched). The two arms have
+     # different optima, so matching lr handicaps mlp while matching protocol is the other reading;
+     # 7 extra tasks buys both and removes the ambiguity.
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms mlp --head-norm bn --multitask"
+     OUT=$BASE/ws_partialft_stageEM_lr${LR}_s$SLURM_ARRAY_TASK_ID.json ;;
+  f) # STAGE F -- HOW MANY BLOCKS. Every FT number so far unfreezes exactly ONE block.
+     # 🔴 CITATION CORRECTED 07-30 (verified against arXiv 2111.06377v3 Fig 9, ar5iv): an earlier
+     # version of this comment read "one-block partial FT at 73.5 against 81.0 for the full
+     # network", which MISMAPPED the figure. The real ladder is linear probing (0 blocks) 73.5,
+     # MLP SUB-BLOCK ONLY 79.1, ONE block 81.0, full fine-tuning ~85. So one block recovers most
+     # of the linear-probe->full-FT gap rather than leaving most of it on the table, and depth is
+     # a smaller lever than the old misreading implied. The ladder is still worth running.
      # Depth is set by --split-at because the cached tap and the trainable set are the same cut, so
      # parity-L0 (recompute the tail, compare to the on-disk enc12) validates the deeper split
      # instead of taking it on trust. Task 0 = 2 blocks, task 1 = 3 blocks; with the existing
@@ -264,7 +324,7 @@ case "$STAGE" in
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageR_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r', 'dx', 'rf', 'rm' or 'rms', got" \
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'em', 'f', 'g', 'h', 'r', 'dx', 'rf', 'rm', 'rms' or 'rmsb', got" \
           "'$STAGE'" >&2
      exit 1 ;;
 esac
