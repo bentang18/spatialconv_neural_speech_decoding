@@ -41,6 +41,8 @@
 #   sbatch --array=0-1 v3_ws_partialft.sbatch g
 # STAGE H  (stage E minus --multitask, same LR: E - H is the multitask term over 28 cells):
 #   sbatch --array=0-6 v3_ws_partialft.sbatch h <LR>
+# STAGE R  (stage G's driver over stage E's 28 cells; %3 -- 4 co-resident tasks OOM'd the loader):
+#   sbatch --array=0-6%3 v3_ws_partialft.sbatch r <LR>
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -186,7 +188,23 @@ case "$STAGE" in
      # is the binding constraint anyway.
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn"
      OUT=$BASE/ws_partialft_stageH_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g' or 'h', got '$STAGE'" >&2
+  r) LR="${2:?stage r needs the LR stage g bracketed}"
+     # STAGE R -- THE RIDGE-DRIVER ARM AT FULL SCALE. Stage G is stage C's question on ONE session:
+     # it brackets the lr for a loss family whose gradient scale we had never seen. This is that
+     # winner over the SAME 7 sessions x 4 tasks x 2 folds as stage E, so R and E are the identical
+     # design differing in ONE thing -- what moves block 12 -- and R - E is the driver term over the
+     # full 28-cell null. Nothing else changes: same bn head, same multitask targets (under the
+     # ridge driver the 4 label columns simply share one Gram), same folds, same const-lambda rule.
+     # --warmup-epochs 0 for the same reason stage G has it: REVE's warmup aligns a linear probe
+     # with frozen features and there is no probe here -- the ridge is refit at every evaluation.
+     # DECISION: if R clears +.010 by more than E does, the CS build uses the ridge driver and the
+     # BCE head is dropped from the pipeline entirely. If R ties E, the driver was not the binding
+     # constraint, E's one-sided caveat is retired, and the CS build takes the simpler BCE path.
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn
+          --multitask --driver ridge --warmup-epochs 0"
+     OUT=$BASE/ws_partialft_stageR_s$SLURM_ARRAY_TASK_ID.json ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h' or 'r', got" \
+          "'$STAGE'" >&2
      exit 1 ;;
 esac
 
