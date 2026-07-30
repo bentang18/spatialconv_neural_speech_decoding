@@ -521,7 +521,13 @@ def aggregate(shard_dir: str, *, taps, tasks, alpha: float = 0.05,
         sess = f"s{sub}_t{int(z['trial_id'])}"
         canon = z["parcel_canon"]
         bases = np.array([base_of.get(int(i), "unknown") for i in canon])
-        cov[sess] = (sub, bases)
+        # A parcel tap's map has one row per DISTINCT parcel, not one per contact, so it needs its
+        # own label axis. np.unique(parcel_canon) reproduces the cache's own `present_parcels`
+        # field exactly (verified on all 12 board records), which is why this is recoverable from
+        # what the shard already stores instead of needing the cache or a re-run.
+        pres = np.unique(canon)
+        bases_p = np.array([base_of.get(int(i), "unknown") for i in pres])
+        cov[sess] = (sub, bases, bases_p)
         # kept verbatim so the brain render can ASSERT its electrode axis against this one
         # rather than trust that two files written by different scripts agree on the order
         canon_of[sess] = canon
@@ -531,6 +537,13 @@ def aggregate(shard_dir: str, *, taps, tasks, alpha: float = 0.05,
                 if key not in z.files:
                     continue
                 au = z[key]
+                # The unit is read off the tap name, so verify it against the map that arrived:
+                # a parcel map silently labelled with the contact axis would misattribute every
+                # row rather than fail, and both axes live in the same file.
+                exp = len(bases) if tap.endswith("_elec") else len(bases_p)
+                assert au.shape[0] == exp, (
+                    f"{fn}: {tap}/{task} has {au.shape[0]} rows but its unit implies {exp} "
+                    f"(contacts={len(bases)}, parcels={len(bases_p)})")
                 peak = np.abs(au - 0.5).max(axis=1)
                 if inference == "fdr":
                     cube = f"null/{tap}/{task}"
@@ -546,6 +559,10 @@ def aggregate(shard_dir: str, *, taps, tasks, alpha: float = 0.05,
                     thr = maxstat_threshold(z[nkey], alpha)
                     sig = peak > thr
                 A[(sess, tap, task)] = {
+                    # the full (rows x time) map, not just its reduction: the movie needs every
+                    # frame, and at 119 x 32 float32 the whole cube over 12 sessions x 2 taps x
+                    # 15 tasks is ~5.5 MB, so there is nothing to save by dropping it
+                    "au": au,
                     "peak": peak, "sig": sig, "fwer_thr": thr,
                     "auroc_at_peak": au[np.arange(au.shape[0]), np.abs(au - .5).argmax(axis=1)],
                     "t_at_peak": np.abs(au - .5).argmax(axis=1),
@@ -554,16 +571,40 @@ def aggregate(shard_dir: str, *, taps, tasks, alpha: float = 0.05,
     return {"A": A, "cov": cov, "canon": canon_of, "lobe_of_base": lobe_of_base}
 
 
+def row_bases(agg: dict, sess: str, tap: str) -> np.ndarray:
+    """Row-axis DKT base labels for this tap's UNIT: contacts for ``*_elec``, parcels otherwise.
+
+    The unit is a property of the tap, not of the run, and both axes are stored side by side. So
+    it is derived here and never defaulted -- a parcel map indexed by the contact axis is a shape
+    error when the counts differ and a silent misattribution when they happen to agree.
+
+    Consequence for any number built on this: at a parcel tap the denominator counts
+    (session x distinct parcel) units, NOT contacts, so parcel and contact values are on
+    different scales and must never be pooled or compared as absolutes.
+    """
+    _, bases_elec, bases_parcel = agg["cov"][sess]
+    return bases_elec if tap.endswith("_elec") else bases_parcel
+
+
+def unit_of(tap: str) -> str:
+    """``"contacts"`` or ``"parcels"`` -- for labelling axes so a figure cannot lie about its n."""
+    return "contacts" if tap.endswith("_elec") else "parcels"
+
+
 def region_table(agg: dict, tap: str, task: str,
                  sessions=None) -> list[tuple[str, float, int, int, int]]:
-    """``(base, mean peak |AUROC-.5| over contacts, n_sig, n_contacts, n_subjects)`` desc."""
+    """``(base, mean peak |AUROC-.5| over rows, n_sig, n_rows, n_subjects)`` desc.
+
+    ``n_rows`` is in this tap's unit -- see :func:`row_bases`.
+    """
     A, cov = agg["A"], agg["cov"]
     per: dict[str, list] = {}
     subs: dict[str, set] = {}
     for (sess, tp, tk), d in A.items():
         if tp != tap or tk != task or (sessions is not None and sess not in sessions):
             continue
-        sub, bases = cov[sess]
+        sub = cov[sess][0]
+        bases = row_bases(agg, sess, tap)
         for b in np.unique(bases):
             m = bases == b
             per.setdefault(b, []).append((d["peak"][m], d["sig"][m]))
@@ -584,7 +625,7 @@ def sig_fraction(agg: dict, tap: str, task: str, base: str,
     for (sess, tp, tk), d in agg["A"].items():
         if tp != tap or tk != task or (sessions is not None and sess not in sessions):
             continue
-        m = agg["cov"][sess][1] == base
+        m = row_bases(agg, sess, tap) == base
         if not m.any():
             continue
         ns += int(d["sig"][m].sum())
@@ -633,7 +674,7 @@ def report(agg: dict, *, taps, tasks, alpha: float = 0.05, top: int = 6, only=No
         print(f"  --> STG top-3 in {sum(1 for r in ev if 0 < r['st_rank'] <= 3)}/{len(ev)} event"
               f" tasks, {sum(1 for r in al if 0 < r['st_rank'] <= 3)}/{len(al)} audio-level,"
               f" {sum(1 for r in vis if 0 < r['st_rank'] <= 3)}/{len(vis)} visual")
-        print(f"  --> STG contacts surviving FWER: event {frac(ev):.3f}, "
+        print(f"  --> STG {unit_of(tap)} surviving FWER: event {frac(ev):.3f}, "
               f"audio-level {frac(al):.3f}, visual {frac(vis):.3f}"
               f"   [{len(sessions)} sessions{'' if only is None else ', MATCHED'}]")
     return out
@@ -677,7 +718,7 @@ def matched_sessions(agg: dict, taps, tasks) -> list[str]:
 
 
 def _fam_fraction(agg, tap, base, fam_tasks, sessions=None) -> tuple[int, int]:
-    """``(n_sig, n_contacts)`` for one region pooled over a family's tasks."""
+    """``(n_sig, n_rows)`` for one region pooled over a family's tasks, in this tap's unit."""
     ns = nc = 0
     for t in fam_tasks:
         s, n, _ = sig_fraction(agg, tap, t, base, sessions=sessions)
@@ -686,26 +727,39 @@ def _fam_fraction(agg, tap, base, fam_tasks, sessions=None) -> tuple[int, int]:
     return ns, nc
 
 
-def n_contacts_of(agg, base: str, sessions=None) -> int:
-    """Contacts in one region pooled over sessions. Tap- and task-independent, so it is the
+def n_units_of(agg, base: str, tap: str, sessions=None) -> int:
+    """Rows in one region pooled over sessions, in ``tap``'s unit. Task-independent, so it is the
     honest denominator to print on a region axis: .95 of 10 contacts and .56 of 202 look
     identical on a colour scale and mean very different things."""
-    return sum(int((bb == base).sum()) for sess, (_, bb) in agg["cov"].items()
+    return sum(int((row_bases(agg, sess, tap) == base).sum()) for sess in agg["cov"]
                if sessions is None or sess in sessions)
 
 
-def _region_rows(agg, tap, sessions=None, min_contacts: int = 20, top: int = 16) -> list[str]:
-    """Regions with enough coverage to plot, ordered by their EVENT-family sig fraction."""
+def _region_rows(agg, tap, sessions=None, min_units: int = 0, top: int = 16) -> list[str]:
+    """Regions with enough coverage to plot, ordered by their EVENT-family sig fraction.
+
+    The coverage floor is in ``tap``'s UNIT, so it cannot be one constant. A region contributes
+    one row per contact at an ``_elec`` tap (tens to hundreds) but at most one row per session per
+    hemisphere at a parcel tap (<=24 here), so reusing the contact floor of 20 would reject nearly
+    every region and quietly return a short list instead of failing. ``min_units=0`` picks the
+    unit's own default; pass a number only to override both.
+    """
     from scripts.neuroprobe.viz_anatomy import EVENT
 
-    bases = {b for sess, (_, bb) in agg["cov"].items()
-             if sessions is None or sess in sessions for b in bb}
+    if not min_units:
+        min_units = 20 if tap.endswith("_elec") else 4
+    bases = {b for sess in agg["cov"]
+             if sessions is None or sess in sessions
+             for b in row_bases(agg, sess, tap)}
     scored = []
     for b in sorted(bases - {"unknown"}):
         ns, nc = _fam_fraction(agg, tap, b, EVENT, sessions)
-        if nc >= min_contacts * len(EVENT):
+        if nc >= min_units * len(EVENT):
             scored.append((ns / nc, b))
     scored.sort(reverse=True)
+    assert scored, (
+        f"{tap}: no region cleared the coverage floor of {min_units} "
+        f"{unit_of(tap)} -- refusing to render an empty figure")
     return [b for _, b in scored[:top]]
 
 
@@ -800,7 +854,7 @@ def fig_dissociation(agg: dict, tap: str, out: str, sessions=None) -> str:
     # label instead of beside it. Same convention as viz_anatomy's region axes.
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([("▶ " if b == TARGET else "▷ " if b in NEIGHBOURS else "   ")
-                        + f"{b} (n={n_contacts_of(agg, b, sessions)})" for b in rows],
+                        + f"{b} (n={n_units_of(agg, b, tap, sessions)})" for b in rows],
                        fontsize=8)
     edge = 0
     for name, ts in fam:
@@ -814,13 +868,14 @@ def fig_dissociation(agg: dict, tap: str, out: str, sessions=None) -> str:
             if np.isfinite(M[i, j]) and M[i, j] > 0.005:
                 ax.text(j, i, f"{M[i, j]:.2f}".lstrip("0"), ha="center", va="center",
                         fontsize=5.5, color="w" if M[i, j] < 0.6 * np.nanmax(M) else "k")
+    unit = unit_of(tap)
     fig.colorbar(im, ax=ax, fraction=.018, pad=.01,
-                 label="fraction of contacts surviving FWER")
+                 label=f"fraction of {unit} surviving FWER")
     ns = len(sessions) if sessions is not None else len({s for (s, _, _) in agg["A"]})
-    ax.set_title(f"MEASURE #2 -- {tap}: single-trial per-contact decodability, "
+    ax.set_title(f"MEASURE #2 -- {tap}: single-trial per-{unit[:-1]} decodability, "
                  f"max-statistic FWER at $\\alpha$=0.05\n"
                  f"{ns} sessions{' (MATCHED)' if sessions is not None else ''}; "
-                 f"▶ superiortemporal, ▷ transversetemporal / middletemporal. n = contacts "
+                 f"▶ superiortemporal, ▷ transversetemporal / middletemporal. n = {unit} "
                  f"pooled over sessions.\nThe visual block is the CONTROL. It is dark at enc0; "
                  f"whether it stays dark with depth is the result, not an assumption.",
                  fontsize=9,
@@ -846,6 +901,12 @@ def fig_family(agg: dict, taps, out: str, regions=None) -> str:
 
     if regions is None:
         regions = (NEIGHBOURS[1], TARGET, "middletemporal", "inferiorparietal")
+    units = {unit_of(t) for t in taps}
+    assert len(units) == 1, (
+        f"figE2 puts one y axis on all of {list(taps)}, but they span units {sorted(units)}. "
+        "A contact fraction and a parcel fraction have different denominators, so bars drawn "
+        "side by side would invite a comparison that is not defined. Render them separately.")
+    unit = units.pop()
     sess = matched_sessions(agg, taps, TASKS)
     assert sess, ("no session has every (tap, task) cell yet -- the array is still running. "
                   "Re-run when it finishes; an unmatched version of this figure is not worth "
@@ -874,10 +935,11 @@ def fig_family(agg: dict, taps, out: str, regions=None) -> str:
         ax.grid(axis="y", lw=.3, alpha=.4)
         ax.set_ylim(0, 1.0)    # headroom for the rotated n_sig/n labels, and a fixed 0-1 scale
                                # so the four regions are read against each other, not rescaled
-    axes[0].set_ylabel("fraction of contacts surviving FWER")
+    axes[0].set_ylabel(f"fraction of {unit} surviving FWER")
     axes[-1].legend(fontsize=7, loc="upper right")
     fig.suptitle(f"MEASURE #2: the event-vs-visual dissociation, and what depth does to it "
-                 f"({len(sess)} MATCHED sessions, all 15 tasks present in each)", fontsize=9)
+                 f"({len(sess)} MATCHED sessions, all 15 tasks present in each; unit = {unit})",
+                 fontsize=9)
     fig.tight_layout()
     p = os.path.join(out, "figE2_family.png")
     fig.savefig(p, bbox_inches="tight")
@@ -896,6 +958,9 @@ def fig_brain_elec(agg: dict, tmpl: dict, tap: str, tasks, out: str, sessions=No
     """
     import matplotlib.pyplot as plt
 
+    assert tap.endswith("_elec"), (
+        f"{tap} is a {unit_of(tap)} tap: its map has one row per parcel, so there is no "
+        "per-contact value to put on a contact. Only an _elec tap can be rendered as dots.")
     fig, axes = plt.subplots(len(tasks), 2, figsize=(12.5, 4.3 * len(tasks)), dpi=150,
                              squeeze=False)
     dev = [d["peak"] for (s, tp, tk), d in agg["A"].items()
@@ -950,6 +1015,111 @@ def fig_brain_elec(agg: dict, tmpl: dict, tap: str, tasks, out: str, sessions=No
     return p
 
 
+def movie_brain_elec(agg: dict, tmpl: dict, tap: str, tasks, out: str, *,
+                     win: tuple[float, float], sessions=None, fps: int = 4) -> str:
+    """figE3 played over time: one frame per time bin, dots coloured by that bin's |AUROC-.5|.
+
+    This is figE3's spatial map crossed with figE4's latency claim, and it needs no new compute --
+    the shards already store the whole ``(contacts x time)`` AUROC map, and figE3 was only ever
+    showing its max over time.
+
+    Two things make the per-frame threshold legitimate rather than a multiplicity disaster. The
+    FWER threshold is a MAX-statistic over the whole contact-by-time map, so a dot that clears it
+    in any single frame is already corrected for having looked at every contact AND every bin --
+    marking frames individually spends no extra alpha. And the colour scale is fixed across all
+    frames from the whole cube, so brightness changes are the signal moving, not the scale
+    rescaling under it.
+
+    What it still is NOT: a propagation measurement. Each frame is an independent
+    cross-validated fit at that bin, so this shows WHEN decodability is present, not signal
+    travelling between sites, and at an encoder tap the receptive field spans the window so the
+    frame index stops meaning time at all. Hence the enc0-only guard.
+    """
+    import matplotlib.animation as animation
+    import matplotlib.pyplot as plt
+
+    assert tap.endswith("_elec"), (
+        f"{tap} is a {unit_of(tap)} tap -- no per-contact value exists to animate on dots.")
+    assert tap.startswith("enc0"), (
+        f"{tap}: an encoder time bin has already attended over the whole window, so a frame "
+        "index there is not a time and the movie would invite a propagation reading that the "
+        "measurement cannot support. Animate enc0 only; use the static figE3 for depth.")
+    w0, w1 = float(win[0]), float(win[1])
+    assert w1 > w0, f"--win must be start,end with end > start (got {win})"
+
+    cells = [(s, d) for (s, tp, tk), d in agg["A"].items()
+             if tp == tap and tk in tasks and (sessions is None or s in sessions)]
+    assert cells, f"no {tap} cells for {list(tasks)}"
+    Ts = {d["au"].shape[1] for _, d in cells}
+    assert len(Ts) == 1, f"{tap}: mixed time axes {Ts} -- refusing one ms axis over them"
+    T = Ts.pop()
+    step = (w1 - w0) / T * 1000.0
+    t_ms = w0 * 1000.0 + (np.arange(T) + 0.5) * step
+    # fixed across every frame, from the full cube: a per-frame scale would make a quiet bin look
+    # as bright as a loud one and turn "the scale rescaled" into "the brain lit up"
+    vmax = float(np.percentile(np.abs(np.concatenate(
+        [d["au"] for _, d in cells], axis=0) - 0.5), 99.5))
+
+    fig, axes = plt.subplots(len(tasks), 2, figsize=(12.5, 4.3 * len(tasks)), dpi=110,
+                             squeeze=False)
+    art: list[tuple] = []
+    for r, task in enumerate(tasks):
+        for c, sd in enumerate(("left", "right")):
+            ax = axes[r][c]
+            ax.imshow(tmpl["img"][sd])
+            ax.axis("off")
+            for (subj, trial), v in tmpl["pts"].items():
+                sess = f"s{subj}_t{trial}"
+                d = agg["A"].get((sess, tap, task))
+                if d is None or (sessions is not None and sess not in sessions):
+                    continue
+                canon = agg["canon"][sess]
+                assert len(canon) == len(v["pid"]) and np.array_equal(canon, v["pid"]), (
+                    f"{sess}: the shard's electrode axis ({len(canon)}) disagrees with the "
+                    f"template's ({len(v['pid'])}) -- refusing to render onto the wrong dots")
+                m = v["found"] & (v["side"] == sd)
+                if not m.any():
+                    continue
+                # ONE artist per (task, side, session) holding every contact, restyled per frame.
+                # Splitting survivors into their own artist would mean rebuilding artists whenever
+                # the surviving SET changes, which is exactly what changes between frames.
+                sc = ax.scatter(v["xy"][m, 0], v["xy"][m, 1], c=np.zeros(int(m.sum())),
+                                cmap="magma", vmin=0, vmax=vmax, s=7, ec="k", lw=0)
+                art.append((sc, np.abs(d["au"][m] - 0.5), float(d["fwer_thr"])))
+            if c == 0:
+                ax.set_title(task, fontsize=11, loc="left")
+
+    sm = plt.cm.ScalarMappable(cmap="magma", norm=plt.Normalize(0, vmax))
+    fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=.014, pad=.01,
+                 label="|AUROC $-$ 0.5| in this time bin")
+    sup = fig.suptitle("", fontsize=10)
+
+    def draw(t: int):
+        n_sig = 0
+        for sc, cube, thr in art:
+            val = cube[:, t]
+            hit = val > thr
+            n_sig += int(hit.sum())
+            sc.set_array(val)
+            sc.set_sizes(np.where(hit, 34.0, 7.0))
+            sc.set_linewidths(np.where(hit, .7, 0.0))
+            sc.set_alpha(None)
+        sup.set_text(
+            f"MEASURE #2 -- {tap}: single-trial decodability over time, {t_ms[t]:+.0f} ms "
+            f"(bin {t + 1}/{T}, width {step:.1f} ms)\n"
+            f"{n_sig} contacts clear the whole-map FWER threshold in THIS bin. Colour scale and "
+            f"threshold are fixed across frames.\nEach frame is an independent fit -- this is "
+            f"when decodability is present, NOT signal propagating.")
+        return [a[0] for a in art] + [sup]
+
+    ani = animation.FuncAnimation(fig, draw, frames=T, interval=1000 // max(fps, 1), blit=False)
+    p = os.path.join(out, f"figE5_movie_{tap}.gif")
+    ani.save(p, writer=animation.PillowWriter(fps=fps))
+    plt.close(fig)
+    print(f"[fig] {p}  ({T} frames, {step:.1f} ms/bin, vmax={vmax:.3f})")
+    return p
+
+
 def fig_peak_time(agg: dict, tap: str, out: str, *, win: tuple[float, float],
                   tasks=("onset", "speech"), sessions=None) -> str:
     """When each region's FWER-surviving contacts peak -- the honest version of the latency
@@ -988,7 +1158,7 @@ def fig_peak_time(agg: dict, tap: str, out: str, *, win: tuple[float, float],
             for (sess, tp, tk), d in agg["A"].items():
                 if tp != tap or tk != task or (sessions is not None and sess not in sessions):
                     continue
-                m = (agg["cov"][sess][1] == base) & d["sig"]
+                m = (row_bases(agg, sess, tap) == base) & d["sig"]
                 v.extend(t_ms[d["t_at_peak"][m]])
             if len(v) < 5:
                 continue
@@ -1002,8 +1172,8 @@ def fig_peak_time(agg: dict, tap: str, out: str, *, win: tuple[float, float],
         ax.set_title(task, fontsize=10)
         ax.grid(lw=.3, alpha=.4)
         ax.legend(fontsize=7, loc="lower right")
-    axes[0].set_ylabel("cumulative fraction of FWER-surviving contacts")
-    fig.suptitle(f"MEASURE #2 -- {tap}: peak time of significant contacts. Window "
+    axes[0].set_ylabel(f"cumulative fraction of FWER-surviving {unit_of(tap)}")
+    fig.suptitle(f"MEASURE #2 -- {tap}: peak time of significant {unit_of(tap)}. Window "
                  f"[{w0}, {w1}] s, T={T} => bin width {step:.2f} ms -- a one-bin median gap "
                  f"is NOT a cascade.", fontsize=9)
     fig.tight_layout()
@@ -1188,6 +1358,10 @@ def main() -> None:
     p.add_argument("--brain-tasks", default="onset,speech,local_flow",
                    help="rows of the brain render; keep a visual control in the list or the "
                         "figure shows only the half of the result that is flattering")
+    p.add_argument("--movie", action="store_true",
+                   help="also render figE5: figE3 animated over time bins. Needs --red-dir and "
+                        "--win, and applies only to an enc0 _elec tap -- see movie_brain_elec")
+    p.add_argument("--movie-fps", type=int, default=4)
     p.add_argument("--inference", choices=("maxstat", "fdr"), default="maxstat",
                    help="maxstat = FWER over the whole map (use for any per-contact claim); "
                         "fdr = BH on pooled-null p, more sensitive but expects false positives")
@@ -1232,15 +1406,30 @@ def main() -> None:
         else:
             print("[fig] --win not given: skipping the peak-time figure rather than guessing "
                   "the millisecond axis (the 1 s and 2 s caches differ by 2x per bin)")
-        if a.red_dir:
+        # the dot renders are contact-level by construction: a parcel tap has no per-contact
+        # value to paint, so those taps are dropped here rather than at the assert inside
+        elec_taps = tuple(t for t in taps if t.endswith("_elec"))
+        if a.red_dir and elec_taps:
             from scripts.neuroprobe.viz_anatomy import (dkt_tables, invariant_projection,
                                                         load_template_coords)
             base_of, lobe_of_base = dkt_tables()
             tmpl = load_template_coords(a.red_dir, a.bt_root)
             invariant_projection(tmpl, base_of, lobe_of_base)
             bt = tuple(t for t in a.brain_tasks.split(",") if t)
-            for tap in taps:
+            for tap in elec_taps:
                 fig_brain_elec(agg, tmpl, tap, bt, a.fig_dir)
+            if a.movie:
+                # enc0 only, and only with a window: the movie's whole content is a ms axis
+                mv = tuple(t for t in elec_taps if t.startswith("enc0"))
+                if len(win) == 2 and mv:
+                    for tap in mv:
+                        movie_brain_elec(agg, tmpl, tap, bt, a.fig_dir, win=win,
+                                         fps=a.movie_fps)
+                else:
+                    print("[fig] --movie needs --win and an enc0 _elec tap: skipping figE5")
+        elif a.red_dir:
+            print(f"[fig] no _elec tap in {list(taps)}: skipping the brain render and movie "
+                  "(a parcel map has no per-contact value to put on a dot)")
         else:
             print("[fig] --red-dir not given: skipping the brain render")
         return
