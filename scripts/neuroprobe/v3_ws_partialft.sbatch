@@ -190,7 +190,20 @@ export EXCA_CACHE_FOLDER=/work/nvme/bhqk/htang13/cache_neuroai
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
 
-srun .venv/bin/python -u -m scripts.neuroprobe.v3_ws_partialft_pilot \
+# NO `srun`. MEASURED, not stylistic: a bare srun step lost 4 array tasks to "Error configuring
+# interconnect" in ~4 s each (2779639_0 gh078, 2779906_2 gh054, 2779981_0 gh054, 2779981_1 gh005).
+# It is not a bad node -- gh054 and gh005 COMPLETED other tasks of the same arrays -- it tracks
+# several array tasks landing on one ghx4 node and colliding on step network setup. With
+# --nodes=1 --ntasks-per-node=1 --gpus-per-node=1 the batch step already holds the allocation and
+# the GPU binding, so srun adds a step that can fail and nothing else. Other launchers here keep
+# srun because they submit ONE job; this is the only 7-way array.
+#
+# THE RISK THIS INTRODUCES, GUARDED: the pilot falls back to CPU when torch.cuda.is_available() is
+# False, so a lost GPU binding would look like a very slow run rather than an error. Refuse first.
+.venv/bin/python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" \
+  || { echo "FATAL: no CUDA in the batch step -- refusing to run on CPU" >&2; exit 1; }
+
+.venv/bin/python -u -m scripts.neuroprobe.v3_ws_partialft_pilot \
   --ckpt "$CKPT" \
   --baseline-json "$BASELINE" --baseline-prefix "$TAG" \
   --parity-cache-dir "$PARITY_CACHE" \
