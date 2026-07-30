@@ -420,3 +420,117 @@ def test_primal_branch_is_taken_only_when_d_is_below_n() -> None:
               {"val": (wide[20:30], y[20:30]), "test": (wide[30:], y[30:])})   # d=66 > n=20
     assert "eval_kernels" in B._PH
     B._PH.clear()
+
+
+def test_lam_grid_is_the_published_grid_and_any_widening_must_keep_its_spacing() -> None:
+    """The grid that produced every published board number, plus the contract for changing it.
+
+    LO-pinning is asymmetric across taps (ws enc12 39 vs enc0 16), which is why widening keeps
+    coming up. Two invariants make a widening safe when it happens, so pin them now:
+
+      spacing — extend at the SAME 1/3-decade step and the old points survive exactly, so a cell
+                that did not pin re-selects the same λ and reproduces its old test AUROC. Drift
+                the spacing and every board number moves silently.
+      HI end  — must stay at 1e4. AUROC is constant in λ past it (next test), so widening up
+                cannot change a number and only buys a 34-shard board re-run.
+    """
+    from scripts.neuroprobe.v3_board_readout import LAM_MULTS
+
+    steps = np.diff(np.log10(np.asarray(LAM_MULTS)))
+    print(f"[check] grid: {len(LAM_MULTS)} points, "
+          f"{np.log10(min(LAM_MULTS)):.0f}..{np.log10(max(LAM_MULTS)):.0f} decades, "
+          f"step={steps.mean():.4f} dec (uniform={np.ptp(steps) < 1e-9}) OK")
+    assert np.ptp(steps) < 1e-9, "spacing is not uniform"
+    assert abs(steps.mean() - 1.0 / 3.0) < 1e-9, \
+        "spacing left 1/3 decade — a widening at this step no longer contains the old grid"
+    assert max(LAM_MULTS) == pytest.approx(1e4), "the HI end must not move — it provably saturates"
+
+
+def test_widening_only_extends_downward_because_the_hi_end_saturates(monkeypatch) -> None:
+    """Why the fix is one-sided: AUROC is constant in λ past the HI end, so widening up is a no-op.
+
+    _select_lam's docstring asserts AUROC(1e4) == AUROC(1e16). Pin it so nobody 'symmetrically'
+    widens the top and pays for a 34-shard board that cannot change a number.
+    """
+    import scripts.neuroprobe.v3_board_readout as mod
+
+    rng = np.random.default_rng(0)
+    y = np.array([float(i % 2) for i in range(40)])
+    z = rng.normal(size=(40, 6))
+    z[:, 0] = y * 5.0
+    monkeypatch.setattr(mod, "LAM_MULTS", (1e4, 1e8, 1e16))
+    out = mod._lam_grid(z[:20], y[:20], {"test": (z[20:], y[20:])})
+    vals = [out["test"][m] for m in (1e4, 1e8, 1e16)]
+    print(f"[check] test AUROC at lam_mult 1e4/1e8/1e16 = {vals} "
+          f"(want all equal — the HI end saturates, widening UP cannot move a number) OK")
+    assert vals[0] == vals[1] == vals[2], vals
+
+
+def test_val_ties_make_the_selected_lambda_depend_on_the_GRID_not_the_DATA() -> None:
+    """🚨 The confound in the LO-pin audit: a 'lo pin' is not necessarily a truncated optimum.
+
+    _select_lam takes argmax with a STRICT `>` while iterating LAM_MULTS in ascending order, so on
+    a val TIE it keeps the SMALLEST λ. The val half is coarse (AUROC over a few dozen rows), so
+    ties are the common case, not the exception — on this fixture most of the grid ties at val=1.0
+    and the tied cells' TEST AUROCs differ materially. Two consequences:
+
+      1. A cell flagged ``lam_pinned`` may simply be a TIE resolved to the grid floor, NOT an
+         optimum that sits below the grid. Only the second is truncation.
+      2. Widening the grid downward moves the tie-break, so it changes numbers in cells where the
+         data expressed no preference at all — in either direction.
+
+    So the pin counts alone cannot license "our depth gains are lower bounds". This test pins the
+    mechanism so the inference is not made from the flag again.
+    """
+    from scripts.neuroprobe.v3_board_readout import LAM_MULTS, _select_lam
+
+    tied = {m: 1.0 for m in LAM_MULTS}                     # val: dead flat, no preference
+    test = {m: 0.90 + 0.05 * (i / len(LAM_MULTS)) for i, m in enumerate(LAM_MULTS)}
+    got = _select_lam({"val": tied, "test": test})
+    print(f"[check] val tied across all {len(LAM_MULTS)} λ -> selected λ={got['lam_mult']:.3e} "
+          f"(== grid min {min(LAM_MULTS):.3e}), flagged lam_pinned={got['lam_pinned']} "
+          f"while the data preferred NOTHING OK")
+    assert got["lam_mult"] == min(LAM_MULTS), "tie-break is not smallest-λ; audit logic changed"
+    assert got["lam_pinned"] is True, "a pure tie is reported as a LO pin — that is the confound"
+
+
+def test_widening_the_grid_can_LOWER_a_pinned_cell_not_raise_it(monkeypatch) -> None:
+    """🚨 THE COUNTEREXAMPLE. Resolving a LO pin does NOT mean the AUROC goes up.
+
+    The tempting inference from the pin audit (ws enc12 pins lo 39× vs enc0 16×) is that pinned
+    cells are truncated downward, so widening the grid raises them and the reported depth gains
+    are lower bounds. On this repo's OWN ws fixture that is false, and it fails in the unlucky
+    direction. Widening logspace(-4,4,25) → logspace(-8,4,37) on the enc12|std cell:
+
+        grid       fold λ            lam_pinned   test (mean of the 2 folds)
+        old        1e-4,   1e-4      True          1.0000000
+        new        1e-6, 4.64e-7     False         0.9765625   ← pin RESOLVED, number FELL
+
+    Why: val is dead flat at 1.0 across 14/25 (fold 0) and 25/25 (fold 1) of the old grid, while
+    test over that same tied plateau spans 0.906..1.000. Val cannot discriminate, so _select_lam's
+    smallest-λ tie-break lets the GRID FLOOR pick the operating point. The old floor happened to
+    land on a good point; the new floor lands on a worse one. Nothing was truncated — the cell was
+    under-determined, and both floors are equally justified by the val half.
+
+    So a LO pin is not evidence of truncation, and widening is not a free improvement. Keep this
+    test as the standing refutation before anyone spends a 34-shard board re-run on that premise.
+    """
+    import scripts.neuroprobe.v3_board_readout as mod
+
+    monkeypatch.setattr(mod, "NORMS", ("std",))
+    out = {}
+    for name, grid in (("old", tuple(np.logspace(-4.0, 4.0, 25))),
+                       ("new", tuple(np.logspace(-8.0, 4.0, 37)))):
+        monkeypatch.setattr(mod, "LAM_MULTS", grid)
+        out[name] = mod._ws_cell(_rec(), "onset", ("enc12",))["cells"]["enc12|std"]
+        print(f"[check] {name} grid floor={min(grid):.0e} -> test={out[name]['test']:.7f} "
+              f"lam/fold={[f'{m:.2e}' for m in out[name]['lam_mult']]} "
+              f"lam_pinned={out[name]['lam_pinned']}")
+
+    assert out["old"]["lam_pinned"] is True, "fixture no longer pins lo on the published grid"
+    assert out["new"]["lam_pinned"] is False, "widening should have resolved the pin"
+    assert out["new"]["test"] < out["old"]["test"], \
+        "widening no longer LOWERS this cell — re-derive the claim before trusting a re-run"
+    print(f"[check] pin resolved True->False while test FELL "
+          f"{out['old']['test']:.7f} -> {out['new']['test']:.7f} "
+          f"=> a LO pin is NOT evidence of downward truncation OK")

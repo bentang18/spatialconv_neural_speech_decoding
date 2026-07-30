@@ -147,6 +147,24 @@ NORMS = ("std",)   # std-only default (Ben 2026-07-20); raw retired
 # and val-selecting over it would bury it — and would make the headline a per-cell mixture of two
 # protocols. CS additionally reports "std_target" (per-domain/AdaBN; see _standardize_per_domain).
 # (Upstream's pip package ships no baseline readout, so nothing external forces a choice.)
+# λ multipliers on base = trace(G)/n.
+#
+# ⚠️ WIDENING THIS IS A LIVE, UNDECIDED QUESTION (07-29) — DO NOT WIDEN WITHOUT READING THIS.
+# The pin audit found LO-pinning is asymmetric across taps (ws enc12 39 vs enc0 16; csession 14 vs
+# 1), which SUGGESTS reported depth gains are lower bounds. But that inference is CONFOUNDED, and a
+# trial widening to logspace(-8, 4, 37) measured the confound directly:
+#   • _select_lam takes argmax with a strict `>` while iterating this tuple in ASCENDING order, so
+#     on a val TIE it silently keeps the SMALLEST λ — the selected λ then depends on how far down
+#     this grid runs, not on the data.
+#   • Ties are the COMMON case, not the exception: on the standard test fixture 32 of 37 λ tie at
+#     val=1.0, spanning 4.6e-7..1e4, and their TEST AUROCs range 0.906..0.969.
+#   ⇒ a `lam_pinned` cell may be a TIE resolved to the floor rather than an optimum below it, and
+#     widening moves numbers in cells where the data expressed NO preference, in either direction.
+# So widening alone is not sufficient and not safe on the headline table. Measure the tie fraction
+# first (see test_val_ties_make_the_selected_lambda_depend_on_the_GRID_not_the_DATA).
+# If it is widened later: keep the 1/3-decade spacing so the old 25 points survive exactly, and
+# stop at 1e-8 — G is a fp32 GEMM cast to fp64, so eigenvalues below ~1e-7·base are numerical
+# noise and a pin surviving past that means the cell is DEGENERATE, not that the optimum is lower.
 LAM_MULTS = tuple(np.logspace(-4.0, 4.0, 25))
 
 
