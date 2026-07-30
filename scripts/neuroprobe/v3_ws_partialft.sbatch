@@ -33,6 +33,8 @@
 #   sbatch --array=0-2 v3_ws_partialft.sbatch c
 # STAGE D  (parameter-count ladder at the bn head -- norm/BitFit and mlp, never yet run):
 #   sbatch --array=0-1 v3_ws_partialft.sbatch d
+# STAGE DX (finish the mlp ladder -- stage D's mlp was still rising at its top lr):
+#   sbatch --array=0 v3_ws_partialft.sbatch dx
 # STAGE E  (the full 7-session grid at the corrected head -- the only stage that clears the null):
 #   sbatch --array=0-6 v3_ws_partialft.sbatch e <LR>
 # STAGE F  (the block-DEPTH ladder: 2 and 3 trainable blocks vs the 1-block incumbent):
@@ -113,6 +115,17 @@ case "$STAGE" in
      I=$SLURM_ARRAY_TASK_ID
      SEL="--stage a --session-index 0 --lrs 3e-4,1e-3,3e-3 --arms ${ARMS[$I]} --head-norm bn"
      OUT=$BASE/ws_partialft_stageD_${ARMS[$I]}_bn.json ;;
+  dx) # STAGE DX -- FINISH THE mlp LADDER. Stage D ran mlp at 3e-4/1e-3/3e-3 and mean val_C rose
+     # MONOTONICALLY across the whole range (.8191 -> .8213 -> .8243), so the ladder was truncated
+     # at the wrong end: the arm is still improving where stage D stopped looking. norm is NOT
+     # extended -- it moved .0006 total across the same decade and sits exactly at frozen on 5 of 8
+     # cells, so its ladder is saturated and a higher lr cannot change the verdict.
+     # DECISION: if mlp at a higher lr reaches block12's d(C-A), the CS build unfreezes the MLP
+     # SUBLAYER ONLY -- half the parameters, no attention, and a cheaper arm to defend
+     # cross-subject. If it turns over below block12, the attention sublayer is load-bearing and
+     # block12 stays the candidate. Either way the ladder stops being open at its top end.
+     SEL="--stage a --session-index 0 --lrs 1e-2,3e-2,1e-1 --arms mlp --head-norm bn"
+     OUT=$BASE/ws_partialft_stageDX_mlp_bn_hi.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
@@ -203,7 +216,7 @@ case "$STAGE" in
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageR_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h' or 'r', got" \
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r' or 'dx', got" \
           "'$STAGE'" >&2
      exit 1 ;;
 esac
