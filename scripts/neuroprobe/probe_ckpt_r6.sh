@@ -44,10 +44,22 @@ run_arm() {
   local CKPT=$1 TAG=$2 LOG=$RUNLOG/$2.log
   local CACHE=$BASE/v3_probe_cache_$TAG SHARD=$BASE/v3_probe_shards_$TAG
   local RESULT=$BASE/results_v3_probe_$TAG.json
-  echo "[$TAG] encode <- $CKPT" | tee -a "$LOG"
+
+  # space_rope is DERIVED from the ckpt path, not asked for. It is the only tower setting that
+  # cannot be read off the ckpt — L1RoPE registers idx_freq persistent=False, so a nospacerope
+  # ckpt is key- and value-identical to a normal one and loads into a space-rope-ON shell with
+  # NO error (v3_probe_encode_r4.py:142-147). deep_sup and parcel_embed are inferred there and a
+  # wrong inference fails the strict load; this one just yields a plausible, wrong AUROC.
+  # Deriving it removes the human step, which is precisely the step that gets forgotten in a
+  # multi-arm invocation where the flag applies to only one arm. The sbatch re-checks the
+  # derivation against the ckpt name in BOTH directions and refuses to run on a mismatch, so a
+  # renamed ckpt dir is a hard failure, never a silent one.
+  local EXTRA=""
+  case "$CKPT" in *nospacerope*) EXTRA="--no-space-rope" ;; esac
+  echo "[$TAG] encode <- $CKPT  extra='${EXTRA:-<none>}'" | tee -a "$LOG"
 
   local AID
-  AID=$($SSH dtai "sbatch --parsable $BASE/v3_probe_encode_r6.sbatch '$CKPT' '$TAG' '$CACHE'") || {
+  AID=$($SSH dtai "sbatch --parsable $BASE/v3_probe_encode_r6.sbatch '$CKPT' '$TAG' '$CACHE' '$EXTRA'") || {
     echo "[$TAG] !! encode submit failed" | tee -a "$LOG"; return 1; }
   echo "[$TAG] encode job $AID -> $CACHE" | tee -a "$LOG"
 
@@ -62,11 +74,20 @@ run_arm() {
 
   $SSH delta "mkdir -p $SHARD && rm -f $SHARD/*.json" >/dev/null 2>&1
   local BID MID
-  # --cpus-per-task=32 is FREE at 128G: Delta CPU bills MAX_TRES (CPU=1000, Mem=512G) on a
-  # 128-core/257617M node, so billing == mem_MB/2 == 65536 and the CPU term (32000) stays under
-  # it. Break-even is 65 cores; 32 takes 4x the threads of the old default while staying small
-  # enough to backfill onto a partly-used node. Raise toward 65 only if queue latency allows.
-  BID=$($SSH delta "sbatch --parsable --array=0-$((NARR-1)) --mem=128G --cpus-per-task=32 $BASE/v3_probe_readout_r6.sbatch array '$CACHE' '$TAG' '$SHARD'")
+  # --mem=64G MEASURED, not guessed (was 128G, which was 6.7x over). On the 30k pretrain-probe
+  # cache the WS shards peak at 18.5-19.9G (job 20580085_0/1/2, MaxRSS via sacct). 64G is 3.2x
+  # that -- deliberately NOT sized to ~24G, because indices 0-6 are WS (ONE session each) while
+  # 7-12 are CS and _cs_shard loads TWO (anchor + test), so the measured half is the LIGHT half.
+  # On the larger board-scale cache those same CS indices OOM-killed at 48G (job 20456873), which
+  # is the whole reason 128G was picked; 64G keeps ~1.8x over a two-session estimate here.
+  # Two reasons this is worth getting right, and only one is the bill: billing == mem_MB/2, so
+  # 128G->64G halves it, but the bigger win is BACKFILL -- a 128G ask was the largest request in
+  # the queue and waited for a full-size slot, while these elements run in ~90 s.
+  # --cpus-per-task=32 is FREE at 64G: Delta CPU bills MAX_TRES (CPU=1000, Mem=512G) on a
+  # 128-core/257617M node, so billing == mem_MB/2 == 32768 and the CPU term stays under it.
+  # Break-even is 33 cores at 64G (it was 65 at 128G), so 32 is still free but now only just --
+  # do NOT raise cores without raising mem, or the CPU term starts setting the bill.
+  BID=$($SSH delta "sbatch --parsable --array=0-$((NARR-1)) --mem=64G --cpus-per-task=32 $BASE/v3_probe_readout_r6.sbatch array '$CACHE' '$TAG' '$SHARD'")
   MID=$($SSH delta "sbatch --parsable --dependency=afterany:$BID --mem=32G $BASE/v3_probe_readout_r6.sbatch merge '$CACHE' '$TAG' '$SHARD' '$RESULT'")
   echo "[$TAG] readout array=$BID merge=$MID (afterany)" | tee -a "$LOG"
 
