@@ -37,6 +37,8 @@
 #   sbatch --array=0-6 v3_ws_partialft.sbatch e <LR>
 # STAGE F  (the block-DEPTH ladder: 2 and 3 trainable blocks vs the 1-block incumbent):
 #   sbatch --array=0-1 v3_ws_partialft.sbatch f
+# STAGE G  (two-sided: drive block 12 with the REPORTED ridge's leave-one-out risk, not BCE):
+#   sbatch --array=0-1 v3_ws_partialft.sbatch g
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -149,7 +151,30 @@ case "$STAGE" in
      SEL="--stage a --session-index 0 --lrs 3e-5,1e-4,3e-4 --arms blocks --head-norm bn --multitask
           --split-at ${SPLITS[$I]} --train-batch ${TB[$I]}"
      OUT=$BASE/ws_partialft_stageF_split${SPLITS[$I]}.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e' or 'f', got '$STAGE'" >&2; exit 1 ;;
+  g) # STAGE G -- MAKE THE TEST TWO-SIDED. Every arm above drives block 12 with BCE on a trained
+     # head, so the ridge is never in the autograd graph and d(C-A) cannot distinguish "the
+     # features cannot improve" from "the head is too poor a teacher". Stage C MEASURED that the
+     # teacher is poor: head_bn's own R0 came back -.003 to -.035 where the CONVERGED dual fit of
+     # the same term is -0.0005, so most of the head's deficit is Adam not finishing.
+     # --driver ridge replaces that loss with the LEAVE-ONE-OUT risk of the reported const-lambda
+     # dual ridge -- closed form, train rows only, no head to underfit and no val split to
+     # overfit. Same estimator in the loss as in the metric.
+     # --warmup-epochs 0 because REVE's first step aligns a linear probe with the frozen features,
+     # and there is no probe here: the ridge is refit exactly at every evaluation.
+     # TWO TASKS ONLY TO BRACKET THE LR. The loss family is new, so its gradient scale is unknown
+     # and a single ladder could sit entirely on the wrong side of the optimum; together the two
+     # tasks sweep 3e-5 .. 1e-2 in half-decades. This is NOT two arms.
+     # DECISION: if d(C-A) under the matched driver EXCEEDS the BCE arm's +.005, the BCE head was
+     # the binding constraint and the CS build uses this driver. If it matches or falls, the
+     # driver was not the constraint -- which makes the one-sided caveat moot and lets a null on
+     # stage E be read as a real negative instead of an uninterpretable one.
+     GLRS=(3e-5,1e-4,3e-4 1e-3,3e-3,1e-2)
+     I=$SLURM_ARRAY_TASK_ID
+     SEL="--stage a --session-index 0 --lrs ${GLRS[$I]} --arms block12 --head-norm bn --multitask
+          --driver ridge --warmup-epochs 0"
+     OUT=$BASE/ws_partialft_stageG_ridgedriver_$I.json ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f' or 'g', got '$STAGE'" >&2
+     exit 1 ;;
 esac
 
 # pbs50 is an r6 arm => MAE => there is NO EMA teacher; the tower is objective.online.*

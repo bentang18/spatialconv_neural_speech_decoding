@@ -150,6 +150,55 @@ def _gpu_ridge(z_tr, y_tr, z_te, lam_mult=None, lams=None):
     return {lm: (k @ (v @ (vty / (w + lm * base)))).cpu().numpy() for lm in lams}
 
 
+def _loo_ridge_risk(z, y, msk, lam_mult=None):
+    """Leave-one-out squared risk of THE REPORTED ESTIMATOR, closed-form and differentiable.
+
+    WHY THIS EXISTS. Everything else here drives block 12 with BCE on a trained head, so the
+    reported contrast d(C-A) is ONE-SIDED: the ridge is never in the autograd graph, and a null is
+    equally consistent with "the features cannot improve" and "the head is too poor a teacher".
+    Stage C measured that the teacher really is poor — the primal head's own R0 came back at
+    -.003 to -.035 where the CONVERGED dual fit of the same term is -0.0005, i.e. most of the
+    head's deficit is Adam not finishing, not the readout family.
+
+    This module's own docstring dismissed the two-sided repair as bilevel-with-val ("637 rows
+    against 790k params"). That was wrong, and this is the correction: ridge LEAVE-ONE-OUT risk is
+    closed form on TRAIN alone, so there is no outer val split to overfit and no rows are spent.
+    For the dual ridge with smoother S = G(G + lam I)^-1,
+        yhat_-i = the fit with row i held out,   y_i - yhat_-i = (y_i - yhat_i) / (1 - S_ii),
+    which is the standard LOO identity for a linear smoother. Minimizing it optimizes the features
+    for the generalization risk of EXACTLY the estimator we report — same lambda rule (lam_mult x
+    mean Gram diagonal), same per-feature train-fitted standardization, same absent intercept.
+
+    ⚖️ WHAT IS STILL APPROXIMATE, STATED: this is fit on a MINIBATCH, so the shrinkage regime is
+    n=batch rather than n=n_train. The LOSS FAMILY is matched (squared error + calibrated
+    shrinkage + leave-one-out); the sample size is not. The reported C is unchanged — still the
+    full-train const-lambda ridge — so this only ever changes the DRIVER.
+
+    ``msk`` is False where a task has no label on that row: those entries are zero-filled for the
+    fit and dropped from the risk. ``y`` is (n,) or (n, K) — the multi-task columns share one Gram,
+    so K tasks cost one extra solve, not K forwards."""
+    if lam_mult is None:
+        lam_mult = RDO.CONST_LAM_MULT
+    y2 = y.reshape(len(y), -1).double()
+    m2 = msk.reshape(len(y), -1)
+    y2 = torch.where(m2, y2, torch.zeros_like(y2))
+    # Per-FEATURE standardization, fitted on these rows — the ridge's own preprocessing
+    # (``_std_gpu`` / ``RDO._standardize``), not the head's per-row LayerNorm. Kept INSIDE the
+    # graph so the encoder sees the gradient through the scaling it will actually be scored under.
+    zc = z - z.mean(0, keepdim=True)
+    zc = zc / zc.std(0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    g = (zc @ zc.T).double()
+    n = g.shape[0]
+    base = torch.diagonal(g).sum() / n
+    a = g + (lam_mult * base) * torch.eye(n, dtype=g.dtype, device=g.device)
+    yhat = g @ torch.linalg.solve(a, y2)
+    # diag(S) with S = G A^-1. A and G are symmetric, so A^-1 G is the transpose of G A^-1 and the
+    # two share a diagonal — one solve, no n x n transpose, no inverse ever formed.
+    hd = torch.diagonal(torch.linalg.solve(a, g))
+    e = (y2 - yhat) / (1.0 - hd).clamp_min(1e-3).unsqueeze(1)
+    return (e.square() * m2).sum() / m2.sum().clamp_min(1)
+
+
 def _std_gpu(z_tr, z_te):
     """Per-feature z-score on TRAIN stats only — ``RDO._standardize`` on GPU."""
     mu = z_tr.mean(0)
@@ -375,6 +424,14 @@ def main() -> None:
                         "post-pre-training on a mixed labeled set, arXiv 2303.16727). Same rows, "
                         "extra LABEL COLUMNS only -- ~4x the gradient signal, no new rows, no "
                         "leak. Reported cell is unchanged.")
+    p.add_argument("--driver", choices=("bce", "ridge"), default="bce",
+                   help="what gradient moves the encoder. bce = a trained logistic head, the "
+                        "incumbent -- which makes d(C-A) ONE-SIDED, because the ridge is never in "
+                        "the autograd graph. ridge = the leave-one-out squared risk of the "
+                        "REPORTED const-lambda dual ridge, closed form on train rows only (see "
+                        "_loo_ridge_risk): same estimator in the loss as in the metric, no head to "
+                        "underfit, no val split to overfit. Pair with --warmup-epochs 0 (there is "
+                        "no linear probe to align, so REVE's first step is a no-op here).")
     p.add_argument("--warmup-epochs", type=int, default=10,
                    help="epochs with the encoder FROZEN before block 12 is unfrozen (REVE's "
                         "two-step recipe, arXiv 2510.21585). 0 disables.")
@@ -768,7 +825,8 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=No
                 pos = order[s:s + args.train_batch]
                 z = feats(tr[pos], True).reshape(len(pos), -1)
                 mb = msk[pos]
-                loss = lossf(head(z)[mb], ybin[pos][mb])
+                loss = (_loo_ridge_risk(z, ybin[pos], mb) if args.driver == "ridge"
+                        else lossf(head(z)[mb], ybin[pos][mb]))
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(head.parameters()) + params, 3.0)
@@ -791,12 +849,18 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=No
                 frozen_test, frozen_vallam, ridge_df = ct, cvl, cdf
             elif np.isfinite(cv) and cv > best_c["val"]:
                 best_c = {"val": float(cv), "test": float(ct), "epoch": ep}
-            # column `ti` is the task THIS cell reports; the other columns exist only to
-            # supervise the shared block 12.
-            hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1))[:, col]
-                           .float().cpu().numpy(), y_all[va])
-            ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1))[:, col]
-                           .float().cpu().numpy(), y_all[te])
+            if args.driver == "ridge":
+                # The ridge driver never touches the head, so there is no D to report and the
+                # zero-init head's ~0.5 must not be printed as "the fine-tuned readout". Skipping
+                # the two eval forwards is also most of the per-epoch cost.
+                hv = ht = float("nan")
+            else:
+                # column `ti` is the task THIS cell reports; the other columns exist only to
+                # supervise the shared block 12.
+                hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1))[:, col]
+                               .float().cpu().numpy(), y_all[va])
+                ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1))[:, col]
+                               .float().cpu().numpy(), y_all[te])
         head.train()
         if np.isfinite(hv) and hv > best["val"]:
             best = {"val": float(hv), "test_ft": float(ht), "best_epoch": ep, "n_params": n_par}
@@ -815,6 +879,12 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=No
                 sec_per_epoch=(time.time() - t_start) / max(n_ep, 1), n_epochs_run=n_ep,
                 peak_gib=(torch.cuda.max_memory_allocated() / 2**30
                           if device.type == "cuda" else 0.0))
+    if args.driver == "ridge":
+        # No head is trained, so D does not exist for this arm. Mirror C into the D slots: the
+        # deployable readout under this driver IS the ridge, and reporting a zero-init head's ~0.5
+        # as d(D-A) would fabricate a catastrophic negative out of an arm that never had a head.
+        best.update(test_ft=float(best_c["test"]), best_epoch=int(best_c["epoch"]),
+                    val=float(best_c["val"]))
     return best
 
 

@@ -572,3 +572,82 @@ def test_split_at_is_rebound_globally_so_cache_and_tail_cannot_disagree():
     assert "global SPLIT_AT" in src
     assert "SPLIT_AT = args.split_at" in src
     assert "--split-at" in src
+
+
+def _brute_loo_residuals(zc, y, lam):
+    """Refit the dual ridge n times, holding out one row, at a FIXED lambda and FIXED
+    standardization. The LOO identity is a statement about a fixed linear smoother, so lambda must
+    NOT be re-derived from the retained rows' Gram -- doing so is a different estimator and the
+    identity does not hold for it."""
+    g = (zc @ zc.T).double()
+    n = g.shape[0]
+    out = []
+    for i in range(n):
+        keep = [j for j in range(n) if j != i]
+        gk = g[np.ix_(keep, keep)] if isinstance(g, np.ndarray) else g[keep][:, keep]
+        a = gk + lam * torch.eye(n - 1, dtype=gk.dtype, device=gk.device)
+        alpha = torch.linalg.solve(a, y.reshape(n, -1).double()[keep])
+        out.append((y.reshape(n, -1).double()[i] - g[i, keep] @ alpha))
+    return torch.stack(out)
+
+
+def test_loo_ridge_risk_equals_brute_force_leave_one_out_of_the_reported_ridge():
+    """🔑 THE load-bearing test for the ridge driver. The whole point of the driver is that it
+    optimizes the generalization risk of EXACTLY the estimator we report; if the closed form is not
+    the leave-one-out risk of that estimator, the arm optimizes something we never measure. Refit
+    the ridge n times by hand and require the same residuals."""
+    torch.manual_seed(0)
+    n, p = 14, 40
+    z = torch.randn(n, p, dtype=torch.float64)
+    y = (torch.rand(n) > 0.5).double()
+    msk = torch.ones(n, dtype=torch.bool)
+    # reproduce the function's own standardization and lambda so the comparison is of the IDENTITY,
+    # not of two different preprocessings
+    zc = z - z.mean(0, keepdim=True)
+    zc = zc / zc.std(0, unbiased=False, keepdim=True).clamp_min(1e-6)
+    g = zc @ zc.T
+    lam = FT.RDO.CONST_LAM_MULT * float(torch.diagonal(g).sum() / n)
+    brute = _brute_loo_residuals(zc, y, lam).reshape(n)
+    got = FT._loo_ridge_risk(z, y, msk)
+    assert float(got) == pytest.approx(float(brute.square().mean()), rel=1e-8)
+
+
+def test_loo_ridge_risk_is_differentiable_into_the_features():
+    """It is a LOSS: if no finite gradient reaches z, the arm silently trains nothing (the encoder
+    would just sit at its pretrained weights and d(C-A) would be exactly 0 for a plumbing reason)."""
+    torch.manual_seed(1)
+    z = torch.randn(16, 30, requires_grad=True)
+    y = (torch.rand(16) > 0.5).float()
+    loss = FT._loo_ridge_risk(z, y, torch.ones(16, dtype=torch.bool))
+    loss.backward()
+    assert z.grad is not None and torch.isfinite(z.grad).all()
+    assert float(z.grad.abs().max()) > 0
+
+
+def test_loo_ridge_risk_drops_masked_entries_and_shares_one_gram_across_tasks():
+    """Multitask: K label columns must share ONE Gram (that is what makes 4x supervision nearly
+    free) and unlabeled entries must not enter the risk. If a masked entry leaked in, the arm would
+    be fitting zeros as if they were labels."""
+    torch.manual_seed(2)
+    z = torch.randn(12, 25)
+    y = (torch.rand(12, 3) > 0.5).float()
+    full = torch.ones(12, 3, dtype=torch.bool)
+    r_all = float(FT._loo_ridge_risk(z, y, full))
+    m = full.clone()
+    m[:, 2] = False                                   # drop the third task entirely
+    r_two = float(FT._loo_ridge_risk(z, y, m))
+    r_ref = float(FT._loo_ridge_risk(z, y[:, :2], torch.ones(12, 2, dtype=torch.bool)))
+    assert r_two == pytest.approx(r_ref, rel=1e-6), "masked column still entered the risk"
+    assert r_all != pytest.approx(r_two, rel=1e-6)
+
+
+def test_ridge_driver_is_wired_into_the_step_and_never_reports_an_untrained_head():
+    """Two plumbing facts the arm depends on. (1) the step actually uses the ridge risk, else the
+    flag is decoration. (2) with no head trained, D must MIRROR C -- printing a zero-init head's
+    ~0.5 as d(D-A) would fabricate a catastrophic negative for an arm that never had a head."""
+    import inspect
+    src = inspect.getsource(FT._run_cell)
+    assert '_loo_ridge_risk(z, ybin[pos], mb) if args.driver == "ridge"' in src
+    assert 'if args.driver == "ridge":' in src
+    assert "test_ft=float(best_c[\"test\"])" in src
+    assert "--driver" in inspect.getsource(FT.main)
