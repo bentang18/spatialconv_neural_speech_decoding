@@ -816,6 +816,75 @@ def fig_task_similarity(R, keep, out, tap="enc12"):
     print(f"[fig] {p}")
 
 
+def fig_latency(D, cov, T, out, tap="enc12", tasks=("onset", "speech")):
+    """A1 vs STG time courses, and the honest verdict on what the timing can support.
+
+    This figure exists because "A1 fires before STG" is the claim a reader will WANT to make
+    from the render, and it is not one this data can carry. The separation between the two is
+    in AMPLITUDE (3x at onset), which is robust; the peak-latency gap is one to two 31.25 ms
+    bins while the physiological A1 -> belt lag is ~10-30 ms, i.e. BELOW the bin width, and the
+    two parcels cross half-max in the SAME bin. Only 3 of 6 subjects have both parcels, so the
+    paired comparison is n=3. All of that is printed on the figure rather than left to a caption.
+    """
+    import matplotlib.pyplot as plt
+
+    A1 = "transversetemporal"
+    tms = _t_ms(T)
+    dt = (WIN_END_S - WIN_START_S) * 1000 / T
+    col = {A1: "#1b7837", TARGET: "#762a83"}
+    fig, axes = plt.subplots(1, len(tasks), figsize=(5.6 * len(tasks), 4.2), dpi=170)
+    axes = np.atleast_1d(axes)
+    for ax, task in zip(axes, tasks):
+        per = D.get(tap, {}).get(task, {})
+        lines = {}
+        for b in (A1, TARGET):
+            have = [s for s in sorted(cov) if b in per.get(s, {})]
+            if not have:
+                continue
+            V = np.vstack([per[s][b][0] for s in have])
+            for v in V:                                   # every subject, thin
+                ax.plot(tms, v, color=col[b], lw=.7, alpha=.35)
+            m = V.mean(0)
+            lines[b] = (m, have)
+            pk = int(np.nanargmax(m))
+            post = np.where(tms >= 0)[0]
+            half = post[int(np.nanargmax(m[post] >= .5 * np.nanmax(m[post])))]
+            ax.plot(tms, m, color=col[b], lw=2.1,
+                    label=f"{b} (n={len(have)})  peak {tms[pk]:+.0f} ms, "
+                          f"50% rise {tms[half]:+.0f} ms")
+            ax.plot([tms[pk]], [m[pk]], marker="v", ms=7, color=col[b])
+        ax.axvline(0, color="k", lw=.8, ls=":")
+        ax.axhline(0, color="#888", lw=.6)
+        ax.set_xlabel("time from word onset (ms)", fontsize=8)
+        ax.set_ylabel("d_cv (thin = one subject, thick = mean)", fontsize=8)
+        ax.set_title(task, fontsize=10)
+        ax.legend(fontsize=6.6, loc="upper right", frameon=False)
+        ax.tick_params(labelsize=7)
+        # the paired statement, computed and printed, not asserted
+        both = [s for s in sorted(cov) if A1 in per.get(s, {}) and TARGET in per.get(s, {})]
+        if both:
+            d = [tms[int(np.nanargmax(per[s][TARGET][0]))]
+                 - tms[int(np.nanargmax(per[s][A1][0]))] for s in both]
+            lead = sum(x > 0 for x in d)
+            ax.text(.02, .02, f"STG peaks after A1 in {lead}/{len(both)} subjects with both "
+                              f"(n={len(both)}); median {np.median(d):+.0f} ms = "
+                              f"{np.median(d)/dt:.1f} bins",
+                    transform=ax.transAxes, fontsize=6.6, color="#333")
+        print(f"[latency] {task}: bin={dt:.2f} ms; "
+              + "; ".join(f"{b} peak {tms[int(np.nanargmax(m))]:+.0f}"
+                          for b, (m, _) in lines.items()))
+    fig.suptitle(
+        f"A1 (Heschl's) vs STG time course — {tap}. The hierarchy this data supports is "
+        f"AMPLITUDE, not latency:\nthe peak gap is 1-2 bins at {dt:.1f} ms/bin while the "
+        f"physiological A1->belt lag is ~10-30 ms (below one bin), and both cross half-max in "
+        f"the SAME bin.", fontsize=8.5)
+    p = os.path.join(out, f"figAN7_latency_{tap}.png")
+    fig.tight_layout(rect=(0, 0, 1, .88))
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig] {p}")
+
+
 def fig_depth(D, rows, cov, T, out):
     import matplotlib.pyplot as plt
 
@@ -1243,6 +1312,7 @@ def main() -> None:
             fig_dkt_time(D, rows, cov, T, args.out, tap)
     fig_st_invariant(D, cov, T, args.out, args.tap)
     fig_task_similarity(R, keep, args.out, args.tap)
+    fig_latency(D, cov, T, args.out, args.tap)
     fig_depth(D, rows, cov, T, args.out)
 
     if not args.no_demo:
