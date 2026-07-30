@@ -33,6 +33,8 @@
 #   sbatch --array=0-2 v3_ws_partialft.sbatch c
 # STAGE D  (parameter-count ladder at the bn head -- norm/BitFit and mlp, never yet run):
 #   sbatch --array=0-1 v3_ws_partialft.sbatch d
+# STAGE E  (the full 7-session grid at the corrected head -- the only stage that clears the null):
+#   sbatch --array=0-6 v3_ws_partialft.sbatch e <LR>
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -109,7 +111,21 @@ case "$STAGE" in
      # pointless in stage A (there is no encoder lr to sweep) and ~doubles stage B to ~6 GPU-h.
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12"
      OUT=$BASE/ws_partialft_stageB_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c' or 'd', got '$STAGE'" >&2; exit 1 ;;
+  e) LR="${2:?stage e needs the stage-C winning LR}"
+     # STAGE E -- THE FULL GRID AT THE CORRECTED HEAD. This is the only stage that can clear the
+     # PRE-REGISTERED null (28 fold-meaned cells, paired two-sided sign test, 20/28 -> p=.036);
+     # stage C runs ONE session, so its d(C-A) is a signal, not a verdict.
+     # ⭐ THE HEADLINE IS d(C-A), NOT d(D-A): C and A are the SAME estimator (const-lambda dual
+     # ridge) on different WEIGHTS, so their difference is attributable to the features. The frozen
+     # sweep settled the other term -- R0[std] = -0.0005 over 56 cells (27/56, p=0.894), i.e. the
+     # readout family is FREE at frozen features -- so a negative d(D-A) is now R1, a property of
+     # the HEAD on fine-tuned features, and cannot be read as "fine-tuning did not help".
+     # bn + multitask because both were established BEFORE this launch: bn beats per-row ln by
+     # +.061 at p<1e-4 in the frozen sweep, and multitask is the arm whose C column came back
+     # positive 7/8 in stage C.
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn --multitask"
+     OUT=$BASE/ws_partialft_stageE_s$SLURM_ARRAY_TASK_ID.json ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd' or 'e', got '$STAGE'" >&2; exit 1 ;;
 esac
 
 # pbs50 is an r6 arm => MAE => there is NO EMA teacher; the tower is objective.online.*
