@@ -147,22 +147,53 @@ probe_one() {
 
   echo "[rung] cb=$CB accum=$ACC -> $verdict  peak=${gib} GiB (${pct}% of card)  ~${hb} s/opt-step  rc=$rc  wall=${dt}s"
   [ "$verdict" != "FITS" ] && { echo "    ---- tail of $RLOG ----"; tail -15 "$RLOG" | sed "s/^/    | /"; }
+  LAST_VERDICT="$verdict"
   RESULTS="${RESULTS}${CB}|${ACC}|${verdict}|${gib}|${pct}|${hb}|${dt}
 "
 }
 
-# ASCENDING, control first. Ordered so a walltime overrun costs the LEAST informative rung and
-# never the control or cb11000. cb16500 is here because Ben asked for the max, not just whether
-# 11000 clears -- and the budget guard makes a 4th rung free when there is time and skipped when
-# there is not, so it cannot cost us the rungs that matter.
-for pair in "5500 12" "11000 6" "13200 5" "16500 4"; do
-  set -- $pair
+# RUNGS ARE AN ARGUMENT: a comma-separated cb list, accum DERIVED as 66000/cb.
+#   sbatch v3_r6_cb_memprobe.sbatch 8250,6600
+# Default is the first sweep. Pass a list to bisect: the first sweep found cb5500 FITS at 57% and
+# cb11000 OOM at 99%, so the max lives strictly between them, and the only token-exact divisors of
+# 66000 in that gap are 6000 (accum 11), 6600 (10) and 8250 (8). Ordered DESCENDING when bisecting
+# so the most valuable rung runs first -- an OOM rung dies in ~84 s while a fitting rung costs
+# ~270 s, so a descending order also fails cheap and succeeds last.
+RUNGS="${1:-5500,11000,13200,16500}"
+read -ra LADDER <<< "${RUNGS//,/ }"
+LAST_VERDICT=""
+for i in "${!LADDER[@]}"; do
+  CB=${LADDER[$i]}
+  case "$CB" in ''|*[!0-9]*) echo "  SKIP cb='$CB' -- not a positive integer"; continue ;; esac
+  if [ "$((66000 % CB))" -ne 0 ]; then
+    echo "  SKIP cb=$CB -- 66000 % $CB = $((66000 % CB)) != 0, no integer accum is token-exact"
+    continue
+  fi
+  set -- "$CB" "$((66000 / CB))"
   if [ "$SECONDS" -gt "$BUDGET_S" ]; then
     echo "[budget] ${SECONDS}s > ${BUDGET_S}s -- NOT starting cb=$1. A timeout bills in FULL and"
     echo "         returns nothing, while an unstarted rung is merely an unknown. Re-run for it."
     continue
   fi
   probe_one "$1" "$2"
+
+  # EARLY EXIT ON A DESCENDING BISECT. Peak memory is monotone in cb at fixed v (the activation
+  # term scales with cb, nothing else changes), so once a rung FITS every SMALLER rung must fit
+  # too and running them proves nothing. Only break when the rungs still ahead are all smaller --
+  # on the default ASCENDING ladder the first FITS is cb5500 and breaking there would abandon the
+  # whole sweep, which is the bug this condition exists to prevent.
+  if [ "$LAST_VERDICT" = "FITS" ] && [ "$((i + 1))" -lt "${#LADDER[@]}" ]; then
+    desc=1
+    for j in $(seq $((i + 1)) $((${#LADDER[@]} - 1))); do
+      [ "${LADDER[$j]}" -lt "$CB" ] 2>/dev/null || { desc=0; break; }
+    done
+    if [ "$desc" = "1" ]; then
+      echo "[early-exit] cb=$CB FITS and every remaining rung (${LADDER[*]:$((i+1))}) is SMALLER."
+      echo "             Peak memory is monotone in cb at fixed v, so those all fit by implication."
+      echo "             cb=$CB IS THE MAX of this ladder. Not burning GPU to re-prove monotonicity."
+      break
+    fi
+  fi
 done
 
 echo
