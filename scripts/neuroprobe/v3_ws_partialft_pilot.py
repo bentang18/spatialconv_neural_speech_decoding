@@ -251,12 +251,44 @@ def _run_tail(enc, x11, ctx):
     return xf.reshape(B, M, d)
 
 
+# ── per-cell weight reset ────────────────────────────────────────────────────────────────────
+def _pristine(enc):
+    """Snapshot EVERY block in the recomputed tail, not just the last one.
+
+    🚨 THIS IS A LEAK GUARD, not bookkeeping. Every cell must start from the PRETRAINED weights.
+    If any trainable block is left fine-tuned, cell k+1 inherits cell k's gradients — and cell k's
+    TEST rows are in cell k+1's TRAIN split, so the session silently becomes one long run over
+    shuffled folds and every later cell is contaminated. With one trainable block the bug was
+    invisible (the only trainable block was also the only restored one); the `blocks` arm would
+    have made it silent and fatal. ~3 MB a block, so snapshot the whole tail unconditionally
+    rather than making the reset depend on which arm is running."""
+    return [{k: v.detach().clone() for k, v in b.state_dict().items()}
+            for b in enc.blocks[SPLIT_AT:TAP]]
+
+
+def _restore(enc, pristine):
+    blocks = enc.blocks[SPLIT_AT:TAP]
+    assert len(blocks) == len(pristine), "pristine was captured at a different --split-at"
+    for b, sd_ in zip(blocks, pristine):
+        b.load_state_dict(sd_)
+
+
 # ── trainable parameter arms ─────────────────────────────────────────────────────────────────
 def _arm_params(enc, arm: str):
     """Parameters to unfreeze. The ladder is by PARAMETER COUNT, which is the axis that binds
     here: n_train is ~3.6k windows, so the full block (~790k params) is heavily overparameterized
     and norm-only (BitFit) is the honest floor."""
     blk = enc.blocks[TAP - 1]
+    if arm == "blocks":
+        # EVERY block in the recomputed tail, i.e. blocks SPLIT_AT+1 .. TAP. With the default
+        # --split-at 11 this is exactly `block12`; with --split-at 9 it is three blocks.
+        # WHY THIS ARM EXISTS: MAE's own Fig 9 (mae.tex:467) fine-tunes ONE block to 73.5 and the
+        # full network to 81.0 -- one block leaves most of the gain on the table, which is the
+        # shape our d(C-A) = +.005 has. There is no separate "how many blocks" knob because the
+        # tail depth already sets it: the cache tap and the trainable set are the SAME cut, so
+        # parity-L0 (which recomputes the tail and compares to the on-disk enc12) validates the
+        # deeper split for free instead of on trust.
+        return [p for b in enc.blocks[SPLIT_AT:TAP] for p in b.parameters()]
     if arm == "head":
         # ENCODER FULLY FROZEN — only the head trains. This is the 2x2 cell that separates READOUT
         # FAMILY from WEIGHTS: it is the primal twin of the frozen sweep's R0 term
@@ -308,6 +340,7 @@ class _Head(torch.nn.Module):
 
 
 def main() -> None:
+    global SPLIT_AT
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
     p.add_argument("--baseline-json", required=True)
@@ -321,6 +354,13 @@ def main() -> None:
     p.add_argument("--stage", choices=("a", "b"), default="b")
     p.add_argument("--session-index", type=int, default=None, help="stage b: shard by session")
     p.add_argument("--arms", default="block12")
+    p.add_argument("--split-at", type=int, default=SPLIT_AT,
+                   help="cache this tap and recompute blocks split_at+1 .. 12 every step. It is "
+                        "ALSO the depth of the `blocks` arm, because the cache cut and the "
+                        "trainable set are deliberately the same cut (see _arm_params). 11 = the "
+                        "one-block incumbent; 9 = three blocks. Cache size is INDEPENDENT of this "
+                        "(same (n_win, M, d) shape at every tap); step cost scales with 12 - "
+                        "split_at, so read peak_gib and sec_per_epoch before fanning out.")
     p.add_argument("--lrs", default="1e-4", help="stage a sweeps these; stage b takes one")
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=80)
@@ -357,6 +397,13 @@ def main() -> None:
     p.add_argument("--tower", choices=("online", "teacher"), default="online")
     p.add_argument("--seed", type=int, default=33)
     args = p.parse_args()
+    # Rebind the module global rather than threading the value: SPLIT_AT is read by _run_tail, the
+    # tap-cache builder, the parity print and _arm_params, and a partially-threaded value would
+    # cache one tap while recomputing from another -- silently wrong, and parity-L0 would be the
+    # only thing standing between that and a published number.
+    if not 0 <= args.split_at < TAP:
+        raise SystemExit(f"--split-at must be in [0, {TAP}), got {args.split_at}")
+    SPLIT_AT = args.split_at
     pref = "objective.online." if args.tower == "online" else "objective.teacher.model."
 
     torch.backends.cuda.matmul.allow_tf32 = False   # fp32 must MEAN fp32 for the parity gate
@@ -412,7 +459,10 @@ def main() -> None:
 
         tower = ENC._load_teacher(sd, device=device, pref=pref)
         enc = tower.encoder
-        pristine = {k: v.detach().clone() for k, v in enc.blocks[TAP - 1].state_dict().items()}
+        pristine = _pristine(enc)
+
+        def restore():
+            _restore(enc, pristine)
         ctx_cache: dict[int, tuple] = {}
 
         def ctx(B):
@@ -551,7 +601,7 @@ def main() -> None:
                 yt = torch.as_tensor(y_all[tr], device=device)
                 for arm in arms:
                     for lr in lrs:
-                        enc.blocks[TAP - 1].load_state_dict(pristine)   # fresh weights per cell
+                        restore()   # fresh PRETRAINED weights per cell -- see the pristine note
                         mt = (np.stack([y_by_task[t][tr] for t in PROBE_TASKS], axis=1)
                               if args.multitask else None)
                         r = _run_cell(enc, feats, tr, va, te, y_all, yt, device=device,
@@ -574,7 +624,7 @@ def main() -> None:
                               f"d={r['test_ft'] - r['test_frozen']:+.4f} "
                               f"n_tr={len(tr)} n_va={len(va)} n_te={len(te)}", flush=True)
                         json.dump(results, open(args.out, "w"), indent=1)
-        enc.blocks[TAP - 1].load_state_dict(pristine)
+        restore()
         del x11, bands, spec, tower
         torch.cuda.empty_cache()
 

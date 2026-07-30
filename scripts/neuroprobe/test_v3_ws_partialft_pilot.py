@@ -505,3 +505,70 @@ def test_reported_column_is_derived_not_taken_from_ti():
     assert "col = ti if mt is not None else 0" in src
     assert "[:, col]" in src
     assert "[:, ti]" not in src, "still indexing the head with the PROBE_TASKS position"
+
+
+def _enc8():
+    towers = __import__("speech_decoding.models.v14_converged_v3.towers",
+                        fromlist=["build_encoder"])
+    return towers.build_encoder(n_parcels=8)
+
+
+def test_blocks_arm_depth_follows_split_at_and_matches_block12_at_the_default(monkeypatch):
+    """The `blocks` arm has no depth knob of its own: --split-at sets the cache cut AND the
+    trainable set, deliberately, so parity-L0 validates the deeper split. At the incumbent cut it
+    must be EXACTLY the one-block arm (otherwise the multi-block result is not comparable to the
+    numbers already banked), and at a deeper cut it must scale by whole blocks."""
+    enc = _enc8()
+    n = lambda a: sum(p.numel() for p in FT._arm_params(enc, a))
+    monkeypatch.setattr(FT, "SPLIT_AT", 11)
+    assert n("blocks") == n("block12")
+    monkeypatch.setattr(FT, "SPLIT_AT", 9)
+    assert n("blocks") == 3 * n("block12"), "blocks are weight-shared? then the ladder is a lie"
+    # and the identity of the parameters, not merely the count: the tail must be the LAST blocks.
+    want = {id(p) for b in enc.blocks[9:12] for p in b.parameters()}
+    assert {id(p) for p in FT._arm_params(enc, "blocks")} == want
+
+
+def test_pristine_restores_every_trainable_block_not_just_the_last(monkeypatch):
+    """🚨 THE LEAK GUARD. Cell k's TEST rows are in cell k+1's TRAIN split, so a block left
+    fine-tuned turns the session into one contaminated run over shuffled folds. The old code
+    snapshotted and restored `blocks[TAP-1]` alone, which was invisible while exactly one block
+    trained and would have been silent and fatal for the `blocks` arm. Perturb EVERY tail block
+    and require every one to come back bit-exact."""
+    enc = _enc8()
+    monkeypatch.setattr(FT, "SPLIT_AT", 9)
+    pristine = FT._pristine(enc)
+    assert len(pristine) == 3
+    before = [{k: v.clone() for k, v in b.state_dict().items()} for b in enc.blocks[9:12]]
+    with torch.no_grad():
+        for p in FT._arm_params(enc, "blocks"):
+            p.add_(1.0)
+    moved = [b for b, ref in zip(enc.blocks[9:12], before)
+             if any(not torch.equal(b.state_dict()[k], v) for k, v in ref.items())]
+    assert len(moved) == 3, "the perturbation did not reach every block; the test proves nothing"
+    FT._restore(enc, pristine)
+    for i, (b, ref) in enumerate(zip(enc.blocks[9:12], before)):
+        for k, v in ref.items():
+            assert torch.equal(b.state_dict()[k], v), f"block {9 + i} param {k} not restored"
+
+
+def test_restore_refuses_a_pristine_captured_at_a_different_split(monkeypatch):
+    """A snapshot taken at one cut and replayed at another would restore the WRONG blocks — the
+    same failure mode as the leak, but pointing the other way. Refuse instead of zipping short."""
+    enc = _enc8()
+    monkeypatch.setattr(FT, "SPLIT_AT", 11)
+    pristine = FT._pristine(enc)
+    monkeypatch.setattr(FT, "SPLIT_AT", 9)
+    with pytest.raises(AssertionError):
+        FT._restore(enc, pristine)
+
+
+def test_split_at_is_rebound_globally_so_cache_and_tail_cannot_disagree():
+    """SPLIT_AT is read by _run_tail, the tap-cache builder, the parity print and _arm_params.
+    Threading it only partway would cache one tap and recompute from another — wrong in a way only
+    parity-L0 would catch. The source must rebind the module global and range-check it."""
+    import inspect
+    src = inspect.getsource(FT.main)
+    assert "global SPLIT_AT" in src
+    assert "SPLIT_AT = args.split_at" in src
+    assert "--split-at" in src

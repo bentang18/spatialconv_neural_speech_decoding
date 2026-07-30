@@ -35,6 +35,8 @@
 #   sbatch --array=0-1 v3_ws_partialft.sbatch d
 # STAGE E  (the full 7-session grid at the corrected head -- the only stage that clears the null):
 #   sbatch --array=0-6 v3_ws_partialft.sbatch e <LR>
+# STAGE F  (the block-DEPTH ladder: 2 and 3 trainable blocks vs the 1-block incumbent):
+#   sbatch --array=0-1 v3_ws_partialft.sbatch f
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -125,7 +127,29 @@ case "$STAGE" in
      # positive 7/8 in stage C.
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn --multitask"
      OUT=$BASE/ws_partialft_stageE_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd' or 'e', got '$STAGE'" >&2; exit 1 ;;
+  f) # STAGE F -- HOW MANY BLOCKS. Every FT number so far unfreezes exactly ONE block, and MAE's
+     # own Fig 9 (mae.tex:467) puts one-block partial FT at 73.5 against 81.0 for the full network:
+     # one block leaves most of the gain on the table, which is the SHAPE of our d(C-A) = +.005.
+     # Depth is set by --split-at because the cached tap and the trainable set are the same cut, so
+     # parity-L0 (recompute the tail, compare to the on-disk enc12) validates the deeper split
+     # instead of taking it on trust. Task 0 = 2 blocks, task 1 = 3 blocks; with the existing
+     # 1-block number that is a 3-point depth ladder on one session.
+     # DECISION: if d(C-A) GROWS with depth, the CS build goes deep and stage E's 1-block number is
+     # a floor, not the answer. If it is flat or falls, depth is not the binding constraint and
+     # one block is the right arm -- which retires the biggest open alternative explanation.
+     # --train-batch falls with depth to hold ACTIVATION memory roughly fixed: the 1-block arm
+     # peaked at 70-72 GiB of 96 with batch 128, and backprop activations scale with the number of
+     # trainable blocks while the ~25 GiB tap cache does not. Sized from that measurement, not by
+     # halving; the run PRINTS peak_gib, so the next size comes from a number.
+     SPLITS=(10 9)
+     TB=(64 48)
+     I=$SLURM_ARRAY_TASK_ID
+     # Lower ladder than the 1-block arm's: 3x the trainable params off the SAME pretrained init,
+     # and MAE's partial-FT recipe damps the lr further the deeper it goes (layer-wise decay 0.75).
+     SEL="--stage a --session-index 0 --lrs 3e-5,1e-4,3e-4 --arms blocks --head-norm bn --multitask
+          --split-at ${SPLITS[$I]} --train-batch ${TB[$I]}"
+     OUT=$BASE/ws_partialft_stageF_split${SPLITS[$I]}.json ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e' or 'f', got '$STAGE'" >&2; exit 1 ;;
 esac
 
 # pbs50 is an r6 arm => MAE => there is NO EMA teacher; the tower is objective.online.*
