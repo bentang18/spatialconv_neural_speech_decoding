@@ -1082,6 +1082,13 @@ _DEMO_HTML = r"""<!doctype html><meta charset="utf-8">
  #bar{width:190px;height:12px;border:1px solid #bbb;border-radius:2px}
  .k{display:inline-flex;align-items:center;gap:5px;font-size:12px}
  #sz{vertical-align:middle}
+ /* the onset flash: a screen recording has no x axis to read, so the moment the word
+    starts has to be announced in the frame itself. Fades over the first ~200 ms. */
+ #wrap{position:relative}
+ #flash{position:absolute;top:6%;left:0;right:0;text-align:center;pointer-events:none;
+        font:800 62px/1 -apple-system,Segoe UI,Roboto,sans-serif;letter-spacing:.12em;
+        color:#c62828;opacity:0;transition:opacity 60ms linear;
+        text-shadow:0 0 12px #fff,0 0 12px #fff,0 0 4px #fff,0 2px 3px rgba(0,0,0,.25)}
 </style>
 <h1>Where is the decodable information? All 6 subjects on one brain, scrubbable in time</h1>
 <p>Colour is the <b>split-half unbiased standardized class contrast</b> (<code>d_cv</code>).
@@ -1106,9 +1113,12 @@ parcel has no value in that subject.</div>
  <span class=k><span id=neg></span><canvas id=bar width=190 height=12></canvas><span id=pos></span></span>
  <span class=k><canvas id=sz width=150 height=26></canvas></span>
 </div>
-<div class=panes>
- <div class=pane><canvas id=c0></canvas><div class=cap>left hemisphere</div></div>
- <div class=pane><canvas id=c1></canvas><div class=cap>right hemisphere</div></div>
+<div id=wrap>
+ <div class=panes>
+  <div class=pane><canvas id=c0></canvas><div class=cap>left hemisphere</div></div>
+  <div class=pane><canvas id=c1></canvas><div class=cap>right hemisphere</div></div>
+ </div>
+ <div id=flash>WORD ONSET</div>
 </div>
 <div id=tip></div>
 <script>
@@ -1117,7 +1127,7 @@ const cv=[document.getElementById('c0'),document.getElementById('c1')];
 const im=[new Image(),new Image()];
 const t=document.getElementById('t'),k=document.getElementById('k'),
       lab=document.getElementById('lab'),pb=document.getElementById('play'),
-      tip=document.getElementById('tip');
+      tip=document.getElementById('tip'),fl=document.getElementById('flash');
 // open AT word onset, not at -484 ms: the first bin is pre-stimulus and shows nothing
 t.max=P.t_ms.length-1; t.value=P.t_ms.findIndex(v=>v>=0);
 ['left','right'].forEach((sd,i)=>{cv[i].width=P.wh[sd][0];cv[i].height=P.wh[sd][1];
@@ -1143,9 +1153,14 @@ function drawLabels(g,s,Rmax){
     g.lineWidth=Math.max(3,Rmax*.9); g.strokeStyle='rgba(255,255,255,.9)';
     g.strokeText(L.name,tx,ty); g.fillStyle='#111'; g.fillText(L.name,tx,ty);}
 }
+const FLASH_MS=200;  // how long "WORD ONSET" stays up after t=0
 function draw(){
   const fi=+t.value, lim=P.lim[k.value];
   lab.textContent=(P.t_ms[fi]>=0?'+':'')+P.t_ms[fi].toFixed(0)+' ms';
+  // fires on the FIRST bin at or after 0 and fades out, so scrubbing or playing both show it
+  const ms=P.t_ms[fi];
+  fl.style.opacity=(ms>=0&&ms<FLASH_MS)?(1-ms/FLASH_MS).toFixed(2):0;
+  lab.style.color=ms>=0?'#c62828':'#222';
   document.getElementById('neg').textContent='-'+lim.toFixed(2)+' ';
   document.getElementById('pos').textContent=' +'+lim.toFixed(2);
   const bx=document.getElementById('bar').getContext('2d');
