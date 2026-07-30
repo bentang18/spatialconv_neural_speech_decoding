@@ -47,6 +47,8 @@
 #   sbatch --array=0-6%3 v3_ws_partialft.sbatch r <LR>
 # STAGE RF (do depth and driver COMPOSE? 2 blocks + ridge driver, one session, precondition):
 #   sbatch --array=0 v3_ws_partialft.sbatch rf
+# STAGE RM (mlp sublayer vs whole block UNDER THE RIDGE DRIVER -- picks the CS arm):
+#   sbatch --array=0 v3_ws_partialft.sbatch rm
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -141,6 +143,22 @@ case "$STAGE" in
      SEL="--stage a --session-index 0 --lrs 1e-3,3e-3,1e-2 --arms blocks --split-at 10
           --head-norm bn --multitask --driver ridge --warmup-epochs 0 --train-batch 64"
      OUT=$BASE/ws_partialft_stageRF_split10_ridge.json ;;
+  rm) # STAGE RM -- WHICH ARM GOES INTO THE CS BUILD: the MLP sublayer or the whole block?
+     # Under the BCE driver the two TIED (mlp +.0059 vs block12 +.0065 on S1T0, a .0006 gap at
+     # n=8), so the cheaper arm was already the better buy. But every ridge-driver number so far is
+     # block12, and a tie under one driver does not transfer to another: the ridge LOO risk has a
+     # different gradient scale and could easily need the attention sublayer that BCE did not.
+     # WHY IT MATTERS BEYOND COST: attention mixes across the SPATIAL axis, and cross-subject is
+     # exactly where electrode correspondence does not exist (v3_board_readout.py aligns csession by
+     # electrode label; cs has no such alignment). A gain that lives in the per-token MLP has a
+     # reason to survive the transfer that an attention-localized gain does not.
+     # LR LADDER: mlp's BCE optimum sat 3-10x above block12's, so centre it 3-10x above the ridge
+     # driver's 3e-3 winner rather than reusing block12's ladder.
+     # DECISION: tie or better -> the CS build unfreezes blk.mlp only. Clearly worse -> attention is
+     # load-bearing under this driver and block12 goes in despite the cost.
+     SEL="--stage a --session-index 0 --lrs 3e-3,1e-2,3e-2 --arms mlp --head-norm bn
+          --multitask --driver ridge --warmup-epochs 0"
+     OUT=$BASE/ws_partialft_stageRM_mlp_ridge.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
@@ -231,7 +249,7 @@ case "$STAGE" in
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12 --head-norm bn
           --multitask --driver ridge --warmup-epochs 0"
      OUT=$BASE/ws_partialft_stageR_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r', 'dx' or 'rf', got" \
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'r', 'dx', 'rf' or 'rm', got" \
           "'$STAGE'" >&2
      exit 1 ;;
 esac
