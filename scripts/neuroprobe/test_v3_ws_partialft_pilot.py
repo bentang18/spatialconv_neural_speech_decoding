@@ -651,3 +651,49 @@ def test_ridge_driver_is_wired_into_the_step_and_never_reports_an_untrained_head
     assert 'if args.driver == "ridge":' in src
     assert "test_ft=float(best_c[\"test\"])" in src
     assert "--driver" in inspect.getsource(FT.main)
+
+
+def _cell(sess, task, fold, arm="block12", lr=1e-3, **kw):
+    r = dict(session=sess, task=task, fold=fold, arm=arm, lr=lr,
+             test_ft=0.80, test_frozen=0.79, test_frozen_vallam=0.795, test_c=0.81)
+    r.update(kw)
+    return r
+
+
+def test_merge_refuses_overlapping_shards_and_names_both_files():
+    """The pre-registered null is 28 PAIRED cells; a duplicated cell means the shards overlap and
+    _report would average two rows into one fold-mean. The sibling frozen sweep was already bitten
+    by exactly this (a glob that also matched a 60-step smoke shard reported 58 cells for a 56-cell
+    design), so refuse and name the files rather than average."""
+    rows = [dict(_cell("S1T0", "onset", 0), _src="s0.json"),
+            dict(_cell("S1T0", "onset", 0), _src="s0_copy.json")]
+    with pytest.raises(SystemExit) as e:
+        FT._assert_mergeable(rows)
+    assert "duplicated" in str(e.value)
+    assert "s0.json" in str(e.value) and "s0_copy.json" in str(e.value)
+
+
+def test_merge_refuses_two_lrs_for_one_arm():
+    """_report keys cells on (session, task) alone, so it pools over FOLDS by design -- and would
+    therefore also pool over LR without saying so, averaging a hyperparameter into the headline."""
+    rows = [dict(_cell("S1T0", "onset", 0, lr=1e-3), _src="a.json"),
+            dict(_cell("S1T0", "onset", 0, lr=1e-4), _src="b.json")]
+    with pytest.raises(SystemExit) as e:
+        FT._assert_mergeable(rows)
+    assert "more than one lr per arm" in str(e.value)
+
+
+def test_merge_accepts_the_full_28_cell_design():
+    """The shape the gate actually needs: 7 sessions x 4 tasks x 2 folds = 56 rows -> 28 cells."""
+    rows = [dict(_cell(f"S{s}T0", t, f), _src=f"s{s}.json")
+            for s in range(7) for t in FT.PROBE_TASKS for f in (0, 1)]
+    assert len(rows) == 56
+    assert FT._assert_mergeable(rows) == 28
+
+
+def test_merge_separates_arms_rather_than_pooling_them():
+    """Two arms at their own lrs is legitimate (_report loops over arms); it must NOT trip the
+    one-lr-per-arm guard, or a combined C+D merge would be impossible."""
+    rows = ([dict(_cell("S1T0", "onset", 0, arm="block12", lr=1e-3), _src="a.json")]
+            + [dict(_cell("S1T0", "onset", 0, arm="norm", lr=3e-3), _src="b.json")])
+    assert FT._assert_mergeable(rows) == 1

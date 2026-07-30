@@ -400,6 +400,11 @@ def main() -> None:
     p.add_argument("--span-dir", required=True)
     p.add_argument("--bt-root", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--merge", default=None,
+                   help="glob of per-session shard JSONs; pool them and print the 28-cell report, "
+                        "then exit. The pre-registered null is 28 PAIRED CELLS, and each shard "
+                        "holds one session (4 cells), so without this there is no gate -- only "
+                        "seven 4-cell partials. Guarded by _assert_mergeable.")
     p.add_argument("--stage", choices=("a", "b"), default="b")
     p.add_argument("--session-index", type=int, default=None, help="stage b: shard by session")
     p.add_argument("--arms", default="block12")
@@ -468,6 +473,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base = json.load(open(args.baseline_json))
+    if args.merge:
+        rows = [dict(r, _src=os.path.basename(f))
+                for f in sorted(glob.glob(args.merge)) for r in json.load(open(f))]
+        if not rows:
+            raise SystemExit(f"no rows matched {args.merge}")
+        n_cells = _assert_mergeable(rows)
+        print(f"[merge] {len(rows)} rows -> {n_cells} (session, task) cells from "
+              f"{len(sorted(glob.glob(args.merge)))} shards", flush=True)
+        _report(rows, base, args)
+        return
     arms = [a for a in args.arms.split(",") if a]
     lrs = [float(x) for x in args.lrs.split(",") if x]
     if args.stage == "b" and len(lrs) != 1:
@@ -889,6 +904,41 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=No
 
 
 _run_cell.announced = False
+
+
+def _assert_mergeable(rows):
+    """A cell is (session, task, fold, arm, lr). Two rows for the same cell means the shards
+    OVERLAP, and ``_report`` would silently average them into one fold-mean.
+
+    🚨 ARM MIXING IS THE #1 DEFECT CLASS IN THIS PROJECT and the sibling frozen sweep already got
+    caught by it once: a merge glob matched a deliberately underfit smoke shard, so a 56-cell design
+    reported 58 cells with two duplicated cells dragging the mean. Refuse and NAME THE FILES, since
+    a silent duplicate is indistinguishable from a result.
+
+    Second guard, specific to this script: ``_report`` keys cells on (session, task) alone, so it
+    pools over FOLDS by design — and would therefore also pool over LR without saying so. Two lrs
+    for one arm in a merge is a hyperparameter averaged into the headline. Refuse that too."""
+    seen, dupes = {}, []
+    for r in rows:
+        k = (r["session"], r["task"], int(r["fold"]), r["arm"], float(r["lr"]))
+        if k in seen:
+            dupes.append((k, seen[k], r.get("_src", "?")))
+        else:
+            seen[k] = r.get("_src", "?")
+    if dupes:
+        lines = "\n".join(f"    {k[0]} {k[1]} f{k[2]} {k[3]} lr={k[4]:g}: {a} vs {b}"
+                          for k, a, b in dupes)
+        raise SystemExit(f"FATAL: {len(dupes)} duplicated cell(s) — the shards overlap.\n{lines}\n"
+                         f"  Narrow the glob or delete the stale shard.")
+    by_arm: dict[str, set] = {}
+    for r in rows:
+        by_arm.setdefault(r["arm"], set()).add(float(r["lr"]))
+    bad = {a: sorted(v) for a, v in by_arm.items() if len(v) > 1}
+    if bad:
+        raise SystemExit(f"FATAL: more than one lr per arm in the merge: {bad}\n"
+                         "  _report pools over folds, so it would pool these lrs into the "
+                         "headline. Merge one lr at a time.")
+    return len({(r["session"], r["task"]) for r in rows})
 
 
 def _report(results, base, args):
