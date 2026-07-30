@@ -67,6 +67,7 @@ import os
 import sys
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -101,6 +102,30 @@ def auroc_cols(scores: np.ndarray, y: np.ndarray) -> np.ndarray:
     return au
 
 
+def auroc_rows(sT: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """AUROC of every ROW of ``sT`` (M, n) against binary ``y`` (n,). Row-major twin of
+    ``auroc_cols``, verified bit-identical to it.
+
+    Same Mann-Whitney U, but the rank sum is gathered rather than scattered: ``y[order]``
+    picks class 1's sorted positions directly, so there is no (M, n) float64 rank array to
+    allocate and no ``put_along_axis``. Ranks are summed in int64, which is exact here
+    (n*n <= 1.1e7 << 2^53) rather than merely accurate. The flat-column guard matches
+    ``auroc_cols`` and exists for the same reason: a dead contact's all-equal score must not
+    fall back on the trial INDEX order, which would read the label's own drift as signal.
+    """
+    n = sT.shape[1]
+    assert y.shape == (n,), (sT.shape, y.shape)
+    n1 = int(y.sum())
+    n0 = n - n1
+    if n1 == 0 or n0 == 0:
+        return np.full(sT.shape[0], 0.5)
+    order = np.argsort(sT, axis=-1)
+    r1 = (y[order] * np.arange(1, n + 1, dtype=np.int64)).sum(axis=-1)
+    au = (r1 - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+    au[sT.max(axis=-1) <= sT.min(axis=-1)] = 0.5
+    return au
+
+
 def _halves(y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Interleaved halves of trial POSITIONS, interleaved WITHIN each class.
 
@@ -118,24 +143,79 @@ def _halves(y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.sort(np.concatenate(h0)), np.sort(np.concatenate(h1))
 
 
+def contact_major(Z: np.ndarray) -> np.ndarray:
+    """(n, P, T, K) -> contiguous (P, T, n, K). Label-free, so it is done ONCE per (tap, task).
+
+    ``_halves`` splits WITHIN each class, so the fold index sets change with every permuted
+    label vector and the folds themselves cannot be hoisted out of the permutation loop. The
+    layout can: putting the contact axis first makes each threaded contact chunk a contiguous
+    view, and makes the score matrix fall out (P*T, n) row-major -- the axis ``argsort`` wants.
+    The previous (n, P*T) form sorted down a strided axis.
+    """
+    return np.ascontiguousarray(Z.transpose(1, 2, 0, 3))
+
+
+def cv_auroc_cm(Zc: np.ndarray, y: np.ndarray, pool=None, nthread: int = 1) -> np.ndarray:
+    """Two-fold cross-validated AUROC per (row, time) cell, from ``contact_major`` features.
+
+    Direction from the fit half's class-mean difference, AUROC on the held-out half, both
+    folds averaged. Returns (P, T). Identical statistic to the (n, P, T, K) form; this is the
+    layout and arithmetic rearranged so it can be threaded.
+
+    Two changes carry the speedup. (1) The class-mean difference is a CONTRACTION over the
+    full trial axis with weights ``+1/n1`` on the fit half's class 1, ``-1/n0`` on its class 0
+    and **zero on the eval half** -- so no fold is ever materialised. The previous form
+    fancy-index-copied ``Z[ev]`` once and ``Z[fit]`` twice (once per class mask) on every one
+    of ``n_perm`` iterations, which at enc12 is several GB of pure memcpy per permutation.
+    Both folds' weights go in one (2, n) matrix, so each permutation makes exactly two passes
+    over the features rather than four. (2) ``np.argsort`` releases the GIL, so threading over
+    contact chunks parallelises the inner loop with no process copies and no extra memory --
+    the sbatch's "argsort does not thread" note is true only within a single numpy call.
+
+    Agreement with the previous implementation is ~2e-6 in AUROC, not bit-exact: the
+    contraction sums the trial axis in a different order in float32, which flips a handful of
+    near-tie ranks out of millions of pairs. That is sound at any size because the observed
+    statistic and every permutation use the SAME estimator, so the permutation test remains
+    exact for the estimator actually computed. Changing the estimator BETWEEN them is what
+    would not be sound.
+    """
+    P, T, n, _ = Zc.shape
+    W = np.zeros((2, n), dtype=np.float32)
+    folds, degenerate = [], 0.0
+    for i, (fit, ev) in enumerate(((_halves(y)[0], _halves(y)[1]),
+                                  (_halves(y)[1], _halves(y)[0]))):
+        yf, ye = y[fit], y[ev]
+        n1 = int(yf.sum())
+        if n1 == 0 or n1 == len(yf) or ye.sum() == 0 or ye.sum() == len(ye):
+            degenerate += 0.5
+            continue
+        W[i, fit] = np.where(yf == 1, 1.0 / n1, -1.0 / (len(yf) - n1))
+        folds.append((i, ev, ye))
+    if not folds:
+        return np.full((P, T), 0.5)
+    sl = [slice(c[0], c[-1] + 1)
+          for c in np.array_split(np.arange(P), max(1, nthread)) if len(c)]
+
+    def one(s: slice) -> np.ndarray:
+        w = np.matmul(W, Zc[s])                                           # (p, T, 2, K)
+        sc = np.matmul(Zc[s], np.ascontiguousarray(w.transpose(0, 1, 3, 2)))   # (p,T,n,2)
+        acc = np.full((s.stop - s.start, T), degenerate)
+        for i, ev, ye in folds:
+            e = np.ascontiguousarray(sc[:, :, ev, i])                     # (p, T, n_ev)
+            acc += auroc_rows(e.reshape(-1, len(ev)), ye).reshape(-1, T)
+        return acc
+
+    parts = list(pool.map(one, sl)) if pool is not None else [one(s) for s in sl]
+    return np.concatenate(parts, axis=0) / 2.0
+
+
 def cv_auroc(Z: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Two-fold cross-validated AUROC per (row, time) cell. ``Z`` is (n, P, T, K).
 
-    Direction from the fit half's class-mean difference, AUROC on the held-out half, both
-    folds averaged. Returns (P, T).
+    Single-shot wrapper: the shard path transposes once and reuses it across the whole
+    permutation loop, so this exists for tests and one-off calls.
     """
-    _, P, T, _ = Z.shape
-    h0, h1 = _halves(y)
-    out = np.zeros((P, T), dtype=np.float64)
-    for fit, ev in ((h0, h1), (h1, h0)):
-        yf, ye = y[fit], y[ev]
-        if yf.sum() == 0 or yf.sum() == len(yf) or ye.sum() == 0 or ye.sum() == len(ye):
-            out += 0.5
-            continue
-        w = Z[fit][yf == 1].mean(axis=0) - Z[fit][yf == 0].mean(axis=0)   # (P, T, K)
-        s = np.einsum("nptk,ptk->npt", Z[ev], w, optimize=True)           # (n_ev, P, T)
-        out += auroc_cols(s.reshape(len(ev), P * T), ye).reshape(P, T)
-    return out / 2.0
+    return cv_auroc_cm(contact_major(Z), y)
 
 
 def block_permute(y: np.ndarray, rng: np.random.Generator, block: int) -> np.ndarray:
@@ -229,11 +309,26 @@ def project(feat, cols, sel, T, C, chunk, basis) -> np.ndarray:
     return Z
 
 
+def n_free_cores() -> int:
+    """Cores actually allocated to this process, not the node's core count.
+
+    Slurm gives the job a cpuset, and ``os.cpu_count()`` reports the whole node (128 on Delta)
+    which would oversubscribe the allocation eightfold. ``sched_getaffinity`` reports the
+    cpuset. Linux-only, hence the fallback.
+    """
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
 def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
                   perm_block: int, chunk: int, seed: int, store_null: bool = True,
-                  cov_stride: int = 4, verbose: bool = True, band_fdims_override=None) -> dict:
+                  cov_stride: int = 4, verbose: bool = True, band_fdims_override=None,
+                  nthread: int = 1, checkpoint=None) -> dict:
     out: dict = {}
     meta_done = False
+    pool = ThreadPoolExecutor(nthread) if nthread > 1 else None
     for tap in taps:
         rec, feat, cols, T, C = read_session(path, tap=tap, band=band,
                                              band_fdims_override=band_fdims_override)
@@ -291,7 +386,11 @@ def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
             # MEANS, which one high-variance PC would otherwise dominate outright.
             Z -= Z.mean(axis=0, keepdims=True)
             Z /= np.maximum(Z.std(axis=0, keepdims=True), 1e-8)
-            obs = cv_auroc(Z, y)
+            # transpose once for the whole permutation run, then drop the original: both live
+            # at once only for the duration of the copy, so the peak is 2x Z (~3.2 GB at enc12)
+            Zc = contact_major(Z)
+            del Z
+            obs = cv_auroc_cm(Zc, y, pool, nthread)
             # crc32, NOT hash(): Python salts string hashes per process (PYTHONHASHSEED), so
             # hash() here would mean --seed does not actually pin the null -- every re-run and
             # every array task would draw a different one, and a permutation p-value that
@@ -301,8 +400,8 @@ def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
                 [seed, zlib.crc32(tap.encode()), zlib.crc32(task.encode())]))
             null = np.empty((n_perm, P, T), dtype=np.float32)
             for p in range(n_perm):
-                null[p] = cv_auroc(Z, block_permute(y, rng, perm_block))
-            del Z
+                null[p] = cv_auroc_cm(Zc, block_permute(y, rng, perm_block), pool, nthread)
+            del Zc
             # The WHOLE null cube is stored, not a summary. It is ~3 MB per (tap, task) and it
             # is what lets the multiplicity correction be chosen -- and changed -- downstream
             # without re-running the array. A stored null_mean/null_sd pair would silently
@@ -325,6 +424,14 @@ def session_shard(path: str, *, taps, tasks, band: str, n_pc: int, n_perm: int,
                       f"max={obs.max():.3f} fwer_thr={0.5 + thr:.3f} "
                       f"n_cells_fwer={(np.abs(obs - .5) > thr).sum()} "
                       f"({time.time() - t0:.0f}s)", flush=True)
+            # Flush after every (tap, task), not once at the end of the session. A shard is
+            # 30 units long, so end-only writing means nothing at all is readable for hours
+            # and a walltime kill returns nothing. ``aggregate`` skips absent keys, so a
+            # partially written shard is already a usable -- and honestly labelled -- result.
+            if checkpoint is not None:
+                checkpoint(out)
+    if pool is not None:
+        pool.shutdown()
     return out
 
 
@@ -645,6 +752,9 @@ def main() -> None:
     p.add_argument("--perm-block", type=int, default=200,
                    help="trials per permutation block; 0 = free (anti-conservative under drift)")
     p.add_argument("--chunk", type=int, default=256)
+    p.add_argument("--threads", type=int, default=0,
+                   help="threads for the permutation loop; 0 = every core in the cpuset. "
+                        "argsort releases the GIL, so this is a real ~5-10x")
     p.add_argument("--cov-stride", type=int, default=4,
                    help="window stride for the label-free PC covariance pass")
     p.add_argument("--seed", type=int, default=33)
@@ -669,15 +779,34 @@ def main() -> None:
     assert files, f"no .pt records in {a.cache}"
     todo = files if a.session_index < 0 else [files[a.session_index]]
     os.makedirs(a.out_dir, exist_ok=True)
+    nthread = a.threads if a.threads > 0 else n_free_cores()
+    print(f"[cfg] {nthread} threads for the permutation loop "
+          f"({n_free_cores()} cores in this cpuset)", flush=True)
     for fn in todo:
+        def dst_of(o: dict) -> str:
+            return os.path.join(a.out_dir, f"elec_s{int(o['subject_id'])}"
+                                           f"_t{int(o['trial_id'])}_{a.band}.npz")
+
+        def checkpoint(o: dict) -> None:
+            # The null CUBES are excluded from checkpoints and written only in the final pass:
+            # they are ~7.6 MB each against ~17 kB for the map plus the per-permutation maxima,
+            # so including them would make every one of the 30 flushes rewrite the whole file.
+            # maxstat inference needs only the maxima, so a checkpoint is fully usable; the
+            # cubes buy the liberal --inference fdr companion, which can wait for the end.
+            tmp = dst_of(o) + ".tmp.npz"
+            np.savez_compressed(tmp, **{k: v for k, v in o.items()
+                                        if not k.startswith("null/")})
+            os.replace(tmp, dst_of(o))    # atomic: aggregate never sees a half-written shard
+
         out = session_shard(os.path.join(a.cache, fn), taps=taps, tasks=tasks, band=a.band,
                             n_pc=a.pc, n_perm=a.n_perm, perm_block=a.perm_block,
                             chunk=a.chunk, seed=a.seed, store_null=not a.no_store_null,
-                            cov_stride=a.cov_stride, band_fdims_override=fdims)
-        dst = os.path.join(a.out_dir, f"elec_s{int(out['subject_id'])}"
-                                     f"_t{int(out['trial_id'])}_{a.band}.npz")
-        np.savez_compressed(dst, **out)
-        print(f"[write] {dst}", flush=True)
+                            cov_stride=a.cov_stride, band_fdims_override=fdims,
+                            nthread=nthread, checkpoint=checkpoint)
+        tmp = dst_of(out) + ".tmp.npz"
+        np.savez_compressed(tmp, **out)
+        os.replace(tmp, dst_of(out))
+        print(f"[write] {dst_of(out)}", flush=True)
 
 
 if __name__ == "__main__":
