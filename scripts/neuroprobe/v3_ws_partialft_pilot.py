@@ -38,30 +38,27 @@ positional effect, and block 12 applied to it reproduces tap 12 exactly. We cach
 per session (bf16, the autocast residual dtype, so the numerics match) and re-run only block 12.
 L0 is what certifies this.
 
-BOTH READOUTS ARE REPORTED — a 2x2, not a ridge with a scaffold (Ben, 2026-07-30)
-----------------------------------------------------------------------------------
-An earlier draft treated the trained head as a gradient source only and reported the refit ridge.
-That was wrong twice over. MAE's headline numbers ARE the fine-tuned classifier's own accuracy —
-they never refit a probe — so dropping the head throws away the number a reader would compare
-against. Worse, refitting a squared-loss ridge on features co-adapted to a logistic head can
-UNDER-read the FT arm, which would be a false negative in the decision map below.
+WHAT IS REPORTED: A AND D ONLY (Ben, 2026-07-30)
+-------------------------------------------------
+An earlier draft treated the trained head as a gradient scaffold and reported a refit ridge on the
+fine-tuned features. That was wrong: MAE's headline numbers ARE the fine-tuned classifier's own
+accuracy (mae.tex:424, "All self-supervised methods are evaluated by end-to-end fine-tuning") —
+they never refit a probe. So the head is the reported readout.
 
-So the pilot fills the whole 2x2:
+  A = frozen enc12 + constant-lambda ridge   <- the number every result of ours has quoted
+  D = fine-tuned block 12 + the trained head <- the form MAE reports
 
-                     ridge readout        logistic head
-  frozen enc12       A  (the board)       B  (arm=head)
-  fine-tuned         C  (arm=block12)     D  (arm=block12)
+The two intermediate cells (frozen+head, fine-tuned+ridge) are NOT run. Ben: "I think we should
+only do A and D only." STATED PLAINLY: A vs D therefore moves weights AND readout family
+together, so a positive result says "fine-tuning the last block with a logistic head beats our
+frozen ridge", not "the features got better". That is the deployable claim, and it is the one the
+decision map below is written against.
 
-A vs C isolates WEIGHTS at fixed readout — the apples-to-apples claim against every number we
-have quoted. A vs B isolates READOUT FAMILY at fixed weights, which is why arm=head exists:
-without it, "D beats A" cannot be attributed to fine-tuning rather than to logistic-vs-ridge.
-D vs A is the headline a leaderboard would see. Each readout gets its OWN val-selected epoch on
-the same val rows, so neither is handicapped by the other's stopping point.
+Consequences for cost: the ridge is fit ONCE per cell, at epoch 0, where it IS A and the L1
+parity check. Nothing per-epoch touches a Gram, and the per-epoch eval scores only val+test —
+never the ~3.6k train rows — so the inner loop is one train fwd+bwd plus one short eval forward.
 
-``ws_split[task][fold]`` already carries ``val`` -- ``KFold(n_splits=2, shuffle=False)`` on the
-task's interleaved item order, held-out fold halved, first half val / second half test
-(``word_events.py:495-504``). val and test are adjacent contiguous blocks, so ``--val-margin``
-drops windows off the VAL side only; ``test`` stays byte-identical to the frozen arm's rows.
+Each epoch is selected on the head's val AUROC, the same quantity D reports.
 
 THE ASYMMETRY, STATED: the FT arm gets one val-selected hyperparameter (the epoch) the frozen arm
 does not. So a THIRD column is reported -- frozen features, lambda selected on the SAME val -- to
@@ -244,11 +241,6 @@ def _arm_params(enc, arm: str):
     here: n_train is ~3.6k windows, so the full block (~790k params) is heavily overparameterized
     and norm-only (BitFit) is the honest floor."""
     blk = enc.blocks[TAP - 1]
-    if arm == "head":
-        # Encoder fully frozen, head only. This is NOT a null arm — it supplies the missing cell
-        # of the 2x2: frozen features read by a LOGISTIC head. Without it, "FT-head beats
-        # frozen-ridge" cannot be attributed to the weights rather than the readout family.
-        return []
     if arm == "norm":
         return [p for _, p in blk.named_parameters() if p.ndim == 1]
     if arm == "mlp":
@@ -483,6 +475,7 @@ def main() -> None:
                         r = _run_cell(enc, feats, tr, va, te, y_all, yt, device=device,
                                       arm=arm, lr=lr, args=args)
                         r.update(session=skey, task=task, fold=int(fold), arm=arm, lr=lr,
+                                 wd=float(args.wd),
                                  n_train=len(tr), n_val=len(va), n_test=len(te))
                         results.append(r)
                         print(f"[cell] {skey} {task:16s} f{fold} {arm:8s} lr={lr:g} "
@@ -497,20 +490,17 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     if args.stage == "a":
-        # Selected PER ARM. `head` is not lr-invariant — there lr is the logistic head's own step
-        # size — and forcing it onto block12's winner would weaken cell B, which would inflate
-        # the weights contrast in exactly the direction the pilot is trying to test.
+        # Selected on the head's val AUROC — the same quantity the headline (D) reports.
         by: dict[tuple, list] = {}
         for r in results:
-            by.setdefault((r["arm"], r["lr"]), []).append(
-                r["val_head"] if r["arm"] == "head" else r["val"])
+            by.setdefault((r["arm"], r.get("wd", args.wd), r["lr"]), []).append(r["val"])
         for arm in sorted({k[0] for k in by}):
-            sel = {lr: v for (a, lr), v in by.items() if a == arm}
-            for lr in sorted(sel):
-                print(f"[stage-a] arm={arm:8s} lr={lr:g} mean val={float(np.nanmean(sel[lr])):.4f} "
-                      f"n={len(sel[lr])}")
-            print(f"[stage-a] WINNER arm={arm} "
-                  f"lr={max(sel, key=lambda k: float(np.nanmean(sel[k]))):g}")
+            sel = {(w, lr): v for (a, w, lr), v in by.items() if a == arm}
+            for w, lr in sorted(sel):
+                print(f"[stage-a] arm={arm:8s} wd={w:g} lr={lr:g} "
+                      f"mean val={float(np.nanmean(sel[(w, lr)])):.4f} n={len(sel[(w, lr)])}")
+            bw, blr = max(sel, key=lambda k: float(np.nanmean(sel[k])))
+            print(f"[stage-a] WINNER arm={arm} wd={bw:g} lr={blr:g}")
     else:
         _report(results, base, args)
     json.dump(results, open(args.out, "w"), indent=1)
@@ -536,17 +526,15 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     lossf = torch.nn.BCEWithLogitsLoss()
     rng = np.random.default_rng(args.seed)
 
+    # A and D ONLY (Ben 07-30: "I think we should only do A and D only"). A is the frozen-ridge
+    # number we quote; D is the fine-tuned head's own AUROC, which is what MAE reports. The two
+    # intermediate cells are dropped, so the ridge is fit ONCE, at epoch 0, where it IS cell A
+    # and the L1 parity gate. Epoch selection is by the head's own val AUROC.
     best = {"val": -1.0, "test_ft": float("nan"), "best_epoch": -1, "n_params": n_par}
-    # The head is the DEPLOYED readout, not a training scaffold: MAE's headline numbers are the
-    # fine-tuned classifier's own accuracy, never a refit probe. It gets its own val-selected
-    # epoch (same val set, one hyperparameter each) so neither readout is handicapped by the
-    # other's stopping point.
-    best_h = {"val": -1.0, "test": float("nan"), "epoch": -1}
     frozen_test = frozen_vallam = float("nan")
     for ep in range(args.epochs + 1):
         if ep > 0:
-            if params:                       # head-only arm: the encoder never leaves eval mode
-                enc.train()
+            enc.train()
             order = rng.permutation(len(tr))
             for s in range(0, len(order), args.train_batch):
                 pos = order[s:s + args.train_batch]
@@ -559,44 +547,39 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
             sched.step()
         enc.eval()
         head.eval()
-        zs, hs = [], []
         with torch.no_grad():
-            for r in (tr, va, te):
-                flat = feats(r, False).reshape(len(r), -1)
-                # The head trains on fp32 flat features; the ridge reads them through the cache's
-                # fp16 cast. Score each on what it actually consumes, from ONE forward.
-                hs.append(head(flat).float().cpu().numpy())
-                zs.append(flat.to(torch.float16).to(torch.float32))
-                del flat
+            if ep == 0:
+                # Cell A, measured in THIS code path rather than imported, plus the val-lambda
+                # control that prices the one val-selected hyperparameter D gets and A does not.
+                zs = [feats(r, False).reshape(len(r), -1).to(torch.float16).to(torch.float32)
+                      for r in (tr, va, te)]
+                _vs, frozen_test, frozen_vallam = _ridge_eval(
+                    *zs, yt, y_all[va], y_all[te], [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])
+                del zs
+            hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1)).float().cpu().numpy(),
+                           y_all[va])
+            ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1)).float().cpu().numpy(),
+                           y_all[te])
         head.train()
-        ztr, zva, zte = zs
-        lams = [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
-        vs, ts, ts_vl = _ridge_eval(ztr, zva, zte, yt, y_all[va], y_all[te], lams)
-        hv, ht = RDO.auroc(hs[1], y_all[va]), RDO.auroc(hs[2], y_all[te])
-        if ep == 0:
-            # epoch 0 IS the frozen arm, measured in this same code path rather than imported.
-            frozen_test, frozen_vallam = ts, ts_vl
-        if vs > best["val"]:
-            best = {"val": float(vs), "test_ft": float(ts), "best_epoch": ep, "n_params": n_par}
-        if np.isfinite(hv) and hv > best_h["val"]:
-            best_h = {"val": float(hv), "test": float(ht), "epoch": ep}
-        # Stop only when BOTH readouts have stalled — the head's optimum is generally later than
-        # the ridge's, and MAE reports that fewer tuned blocks need LONGER schedules (mae.tex:694).
-        if ep - max(best["best_epoch"], best_h["epoch"]) >= args.patience:
+        if np.isfinite(hv) and hv > best["val"]:
+            best = {"val": float(hv), "test_ft": float(ht), "best_epoch": ep, "n_params": n_par}
+        elif ep - best["best_epoch"] >= args.patience:
             break
-        del ztr, zva, zte, zs, hs
     for q in enc.parameters():
         q.requires_grad_(False)
-    best.update(test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam),
-                test_head=float(best_h["test"]), val_head=float(best_h["val"]),
-                best_epoch_head=int(best_h["epoch"]))
+    best.update(test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam))
     return best
 
 
 def _report(results, base, args):
     """28 paired cells (7 sessions x 4 tasks), fold-meaned — the same reduction the frozen
-    readout does (``_ws_session`` nanmeans over folds), so the two are comparable."""
-    per_arm: dict[str, dict] = {}
+    readout does (``_ws_session`` nanmeans over folds), so the two are comparable.
+
+    A vs D only. `ft-head` is D: the fine-tuned block-12 features read by the trained logistic
+    head, which is the form MAE reports. `frozen` is A: the same rows, frozen features, constant-
+    lambda ridge — the number every result of ours has quoted, recomputed in-path. `disk` is that
+    same A read off the probe JSON, so the two must agree (that is parity L1, printed again here).
+    `val-lam` prices the one val-selected hyperparameter D gets and A does not."""
     for arm in sorted({r["arm"] for r in results}):
         cells: dict[tuple, list] = {}
         for r in results:
@@ -609,21 +592,18 @@ def _report(results, base, args):
                          float(np.nanmean([x["test_ft"] for x in rs])),
                          float(np.nanmean([x["test_frozen"] for x in rs])),
                          float(np.nanmean([x["test_frozen_vallam"] for x in rs])),
-                         disk,
-                         float(np.nanmean([x["test_head"] for x in rs]))))
+                         disk))
         if not rows:
             continue
-        per_arm[arm] = {(r[0], r[1]): r for r in rows}
         print(f"\n=== WS partial-FT, arm={arm} — {len(rows)} paired cells "
               f"({rows[0][0] if len(rows) < 8 else '7 sessions'} x {len(PROBE_TASKS)} tasks) ===")
-        print(f"{'session':8s} {'task':16s} {'ft-ridge':>9s} {'ft-head':>8s} {'frozen':>8s} "
-              f"{'val-lam':>8s} {'disk':>8s} {'d(ft-fr)':>9s}")
-        for sess, task, ft, fr, vl, disk, hd in rows:
-            print(f"{sess:8s} {task:16s} {ft:9.4f} {hd:8.4f} {fr:8.4f} {vl:8.4f} {disk:8.4f} "
-                  f"{ft-fr:+9.4f}")
-        for label, i, j in (("ft-ridge vs const-lam", 2, 3), ("ft-ridge vs val-lam", 2, 4),
-                            ("ft-head  vs ft-ridge", 6, 2), ("ft-head  vs const-lam", 6, 3)):
-            ds = [r[i] - r[j] for r in rows]
+        print(f"{'session':8s} {'task':16s} {'D ft-head':>9s} {'A frozen':>9s} {'val-lam':>8s} "
+              f"{'disk':>8s} {'d(D-A)':>9s}")
+        for sess, task, d_ft, a_fr, vl, disk in rows:
+            print(f"{sess:8s} {task:16s} {d_ft:9.4f} {a_fr:9.4f} {vl:8.4f} {disk:8.4f} "
+                  f"{d_ft - a_fr:+9.4f}")
+        for label, j in (("D vs A const-lam", 3), ("D vs A val-lam", 4)):
+            ds = [r[2] - r[j] for r in rows]
             nz = [x for x in ds if abs(x) > 1e-9]
             k = sum(x > 0 for x in nz)
             print(f"  {label:22s} mean d={float(np.mean(ds)):+.4f}  {k}/{len(nz)} positive  "
@@ -634,33 +614,6 @@ def _report(results, base, args):
                    else "NEGATIVE — ridge stays" if mean_d > 0 else "CLOSE THE THREAD")
         print(f"  DECISION -> {verdict}"
               + ("" if len(rows) == 28 else f"  (PARTIAL: {len(rows)}/28 cells — not the gate)"))
-
-    # ── the 2x2: readout family (ridge | logistic head) x weights (frozen | fine-tuned) ──────
-    # Without the head-only arm, "FT-head beats frozen-ridge" confounds the two axes. MAE's own
-    # headline is the D cell (fine-tuned classifier, no refit probe); the board number is A.
-    if "head" in per_arm:
-        for arm in sorted(per_arm):
-            if arm == "head":
-                continue
-            keys = sorted(set(per_arm[arm]) & set(per_arm["head"]))
-            if not keys:
-                continue
-            a = [per_arm[arm][k][3] for k in keys]             # frozen enc + ridge  (the board)
-            b = [per_arm["head"][k][6] for k in keys]          # frozen enc + head
-            c = [per_arm[arm][k][2] for k in keys]             # FT enc     + ridge
-            d = [per_arm[arm][k][6] for k in keys]             # FT enc     + head
-            print(f"\n=== 2x2  arm={arm}  n={len(keys)} cells ===")
-            print(f"{'':14s} {'ridge':>9s} {'head':>9s}")
-            print(f"{'frozen':14s} {np.mean(a):9.4f} {np.mean(b):9.4f}")
-            print(f"{'fine-tuned':14s} {np.mean(c):9.4f} {np.mean(d):9.4f}")
-            for label, u, v in (("weights|ridge  C-A", c, a), ("weights|head   D-B", d, b),
-                                ("readout|frozen B-A", b, a), ("readout|FT     D-C", d, c),
-                                ("BEST vs BOARD  D-A", d, a)):
-                ds = [x - y for x, y in zip(u, v)]
-                nz = [x for x in ds if abs(x) > 1e-9]
-                k = sum(x > 0 for x in nz)
-                print(f"  {label:20s} mean d={float(np.mean(ds)):+.4f}  {k}/{len(nz)} positive  "
-                      f"p={_sign_p(k, len(nz)):.4f}")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@
 #
 # STAGE A  (lr sweep on ONE session, val-selected):
 #   sbatch --array=0-2 v3_ws_partialft.sbatch a
+# STAGE A-wd (the wd leg; a + awd 0.5 + awd 3.0 tile a 3x3 lr x wd grid):
+#   sbatch --array=0-2 v3_ws_partialft.sbatch awd 0.5
 # STAGE B  (full 7x4x2 grid at the stage-A winner):
 #   sbatch --array=0-6 v3_ws_partialft.sbatch b <LR>
 set -euo pipefail
@@ -45,15 +47,27 @@ case "$STAGE" in
   a) LRS=(1e-4 3e-4 1e-3)
      # Both arms sweep here: for `head` the lr is the logistic head's own step size, so it needs
      # its own winner. Selecting one lr on block12 and imposing it on head would weaken cell B.
-     SEL="--stage a --session-index 0 --lrs ${LRS[$SLURM_ARRAY_TASK_ID]} --arms block12,head"
+     SEL="--stage a --session-index 0 --lrs ${LRS[$SLURM_ARRAY_TASK_ID]} --arms block12"
      OUT=$BASE/ws_partialft_stageA_lr${LRS[$SLURM_ARRAY_TASK_ID]}.json ;;
+  awd) WD="${2:?stage awd needs a weight decay}"
+     # The WD leg of stage A (Ben 07-30: "add a weight decay arm as well"). Same one session and
+     # same lr ladder as stage a, at a different wd, so a and awd together tile a 3x3 lr x wd grid
+     # with no duplicated work. WHY IT IS A REAL KNOB HERE and not a copy of MAE's 0.05: the head
+     # is ~213k params against ~3.6k training windows, ~60x overparameterized, where MAE's ViT-L
+     # head faced 1.28M images. MAE itself brackets the range rather than settling it — 0.05 for
+     # end-to-end FT, 0 for linear probing ("regularization is in general harmful for linear
+     # probing", mae.tex:616), 0.3 for supervised-from-scratch ViT-L (mae.tex:701). No verified
+     # source for wd 3.0 was found, so it is included as an ARM to be measured, not as a citation.
+     LRS=(1e-4 3e-4 1e-3)
+     SEL="--stage a --session-index 0 --lrs ${LRS[$SLURM_ARRAY_TASK_ID]} --wd $WD --arms block12"
+     OUT=$BASE/ws_partialft_stageA_wd${WD}_lr${LRS[$SLURM_ARRAY_TASK_ID]}.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
      # pointless in stage A (there is no encoder lr to sweep) and ~doubles stage B to ~6 GPU-h.
-     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12,head"
+     SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12"
      OUT=$BASE/ws_partialft_stageB_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a' or 'b', got '$STAGE'" >&2; exit 1 ;;
+  *) echo "FATAL: stage must be 'a', 'awd' or 'b', got '$STAGE'" >&2; exit 1 ;;
 esac
 
 # pbs50 is an r6 arm => MAE => there is NO EMA teacher; the tower is objective.online.*

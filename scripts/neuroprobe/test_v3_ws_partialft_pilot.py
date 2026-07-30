@@ -168,20 +168,9 @@ def test_package_symbols_the_pilot_imports_in_main_resolve():
     )
 
 
-def test_head_arm_freezes_the_encoder_but_is_not_a_no_op():
-    """The head arm supplies the missing 2x2 cell: frozen features, LOGISTIC readout. It must
-    unfreeze ZERO encoder parameters — if it leaked even one, the 'readout family' contrast would
-    silently become a weights contrast and the 2x2 would be uninterpretable."""
-    towers = __import__("speech_decoding.models.v14_converged_v3.towers",
-                        fromlist=["build_encoder"])
-    enc = towers.build_encoder(n_parcels=64)
-    assert FT._arm_params(enc, "head") == []
-    assert sum(p.numel() for p in FT._arm_params(enc, "norm")) > 0
-
-
 def test_head_is_trainable_and_scores_like_a_readout():
     """The head must produce a per-window score AUROC can consume, and gradient must reach it —
-    it is the reported readout now, not just a gradient source for block 12."""
+    it IS cell D, the reported readout, not just a gradient source for block 12."""
     torch.manual_seed(0)
     head = FT._Head(12)
     z = torch.randn(20, 12)
