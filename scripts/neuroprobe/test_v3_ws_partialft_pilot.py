@@ -324,3 +324,55 @@ def test_ridge_effective_dof_is_bounded_by_n_not_p():
         [1.0])
     assert df_dup < df, f"redundant features did not reduce df ({df_dup:.2f} vs {df:.2f})"
     print(f"\ndf: iid p=5000 -> {df:.2f}   rank-5 duplicated to p=5000 -> {df_dup:.2f}   (n={n})")
+
+
+def _fake_results(*, c_delta, d_delta, n_sess=7):
+    """One result row per (session, task, fold) with A pinned at .70 and C/D offset from it."""
+    out = []
+    for si in range(n_sess):
+        for task in FT.PROBE_TASKS:
+            for fold in (0, 1):
+                out.append(dict(session=f"S{si}T0", task=task, fold=fold, arm="block12",
+                                lr=3e-4, wd=0.05, val=0.7, best_epoch=5, c_epoch=5,
+                                n_params=789760, n_head_params=638977, ridge_df=42.0,
+                                sec_per_epoch=1.0, n_epochs_run=20, peak_gib=70.0,
+                                test_frozen=0.70, test_frozen_vallam=0.70,
+                                test_c=0.70 + c_delta, test_ft=0.70 + d_delta))
+    return out
+
+
+def _fake_base(prefix="pbs50_20k", n_sess=7):
+    return {f"{prefix}|enc12|std|{task}": {
+        "ws_per_session": {f"S{si}T0": 0.70 for si in range(n_sess)}}
+        for task in FT.PROBE_TASKS}
+
+
+class _Args:
+    baseline_prefix = "pbs50_20k"
+    wd = 0.05
+
+
+def test_report_decision_keys_on_C_minus_A_not_D_minus_A(capsys):
+    """Ben reinstated C so the gate is the WEIGHTS-ONLY contrast. If the verdict still followed
+    d(D-A) then a bad head would close a thread whose features actually improved -- exactly the
+    confound C exists to remove. C up, D down => must still fire the positive branch."""
+    FT._report(_fake_results(c_delta=+0.02, d_delta=-0.05), _fake_base(), _Args())
+    out = capsys.readouterr().out
+    assert "BUILD THE CS VERSION" in out, out
+    assert "d(C-A)" in out and "d(D-A)" in out
+    assert "C vs A const-lam" in out and "D vs C readout" in out
+
+
+def test_report_closes_the_thread_when_features_did_not_move(capsys):
+    """The mirror: C flat/down closes it even if the head happens to win."""
+    FT._report(_fake_results(c_delta=-0.02, d_delta=+0.05), _fake_base(), _Args())
+    out = capsys.readouterr().out
+    assert "CLOSE THE THREAD" in out, out
+
+
+def test_report_needs_all_28_cells_for_the_gate(capsys):
+    """A partial shard must be labelled PARTIAL and must not claim the gate."""
+    FT._report(_fake_results(c_delta=+0.02, d_delta=+0.02, n_sess=3),
+               _fake_base(n_sess=3), _Args())
+    out = capsys.readouterr().out
+    assert "PARTIAL: 12/28 cells" in out and "BUILD THE CS VERSION" not in out

@@ -120,6 +120,7 @@ def _load_sibling(name: str):
 ENC = _load_sibling("v3_probe_encode_r4")
 RDO = _load_sibling("v3_probe_readout_r4")
 
+RIDGE_LAMS = [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
 PROBE_TASKS = RDO.PROBE_TASKS
 PROBE_COHORT_7 = RDO.PROBE_COHORT_7
 TAP = 12          # reported tap = RAW output of block 12 (towers.py:313)
@@ -519,7 +520,8 @@ def main() -> None:
                         results.append(r)
                         print(f"[cell] {skey} {task:16s} f{fold} {arm:8s} lr={lr:g} "
                               f"ep*={r['best_epoch']:2d} val={r['val']:.4f} "
-                              f"ft={r['test_ft']:.4f} frozen={r['test_frozen']:.4f} "
+                              f"ft={r['test_ft']:.4f} C={r['test_c']:.4f}"
+                              f"@{r['c_epoch']} frozen={r['test_frozen']:.4f} "
                               f"vallam={r['test_frozen_vallam']:.4f} "
                               f"| ridge_df={r['ridge_df']:.1f}/{len(tr)} "
                               f"head_p={r['n_head_params']} "
@@ -534,16 +536,21 @@ def main() -> None:
 
     if args.stage == "a":
         # Selected on the head's val AUROC — the same quantity the headline (D) reports.
+        # SELECT ON C's VAL, not the head's. The gate is d(C-A), so tuning (lr, wd) for the head
+        # and then reading the C contrast at that setting would price the weights at an lr chosen
+        # for a different estimator. Both means are printed so a divergence is visible.
         by: dict[tuple, list] = {}
         for r in results:
-            by.setdefault((r["arm"], r.get("wd", args.wd), r["lr"]), []).append(r["val"])
+            by.setdefault((r["arm"], r.get("wd", args.wd), r["lr"]), []).append(r)
         for arm in sorted({k[0] for k in by}):
             sel = {(w, lr): v for (a, w, lr), v in by.items() if a == arm}
             for w, lr in sorted(sel):
+                rs = sel[(w, lr)]
                 print(f"[stage-a] arm={arm:8s} wd={w:g} lr={lr:g} "
-                      f"mean val={float(np.nanmean(sel[(w, lr)])):.4f} n={len(sel[(w, lr)])}")
-            bw, blr = max(sel, key=lambda k: float(np.nanmean(sel[k])))
-            print(f"[stage-a] WINNER arm={arm} wd={bw:g} lr={blr:g}")
+                      f"mean val_C={float(np.nanmean([x['val_c'] for x in rs])):.4f} "
+                      f"mean val_D={float(np.nanmean([x['val'] for x in rs])):.4f} n={len(rs)}")
+            bw, blr = max(sel, key=lambda k: float(np.nanmean([x["val_c"] for x in sel[k]])))
+            print(f"[stage-a] WINNER (on val_C) arm={arm} wd={bw:g} lr={blr:g}")
     else:
         _report(results, base, args)
     json.dump(results, open(args.out, "w"), indent=1)
@@ -586,11 +593,21 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
     lossf = torch.nn.BCEWithLogitsLoss()
     rng = np.random.default_rng(args.seed)
 
-    # A and D ONLY (Ben 07-30: "I think we should only do A and D only"). A is the frozen-ridge
-    # number we quote; D is the fine-tuned head's own AUROC, which is what MAE reports. The two
-    # intermediate cells are dropped, so the ridge is fit ONCE, at epoch 0, where it IS cell A
-    # and the L1 parity gate. Epoch selection is by the head's own val AUROC.
+    # THREE CELLS: A, C, D (C reinstated by Ben 07-30 after the 500x finding).
+    #   A = frozen features   + const-lambda dual ridge   <- the number we quote
+    #   C = FINE-TUNED feats  + the SAME ridge            <- weights move, readout does not
+    #   D = FINE-TUNED feats  + the trained logistic head <- the form MAE reports
+    # WHY C IS BACK. A vs D moves weights AND readout family at once, and those are not
+    # comparable estimators: the ridge is DUAL, so its capacity is bounded by n (~1.3k rows) and
+    # further shrunk by the redundancy of parcel-mean features -- see ridge_df -- while the head
+    # is 638,977 params trained by ~800 zero-init SGD steps with no calibrated shrinkage, ~500x
+    # overparameterized. A vs D therefore cannot answer "did fine-tuning improve the features";
+    # it mostly measures which estimator is better regularized. A vs C answers it directly, and
+    # C vs D prices the readout family on its own.
+    # C is cheap because eigh already runs: one extra no-grad forward over the train rows plus a
+    # ~n x n Gram per epoch. C gets its OWN val-selected epoch (using D's would handicap it).
     best = {"val": -1.0, "test_ft": float("nan"), "best_epoch": -1, "n_params": n_par}
+    best_c = {"val": -1.0, "test": float("nan"), "epoch": -1}
     frozen_test = frozen_vallam = ridge_df = float("nan")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -621,16 +638,20 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
         enc.eval()
         head.eval()
         with torch.no_grad():
+            # The ridge on the CURRENT features. At ep 0 the encoder has not moved, so this IS
+            # cell A -- and the L1 parity gate -- measured in THIS code path rather than
+            # imported. From ep 1 on it is cell C. Same lambda grid either way, so the val-lambda
+            # control on A prices exactly the hyperparameter C's own selection uses.
+            zc_tr, zc_va, zc_te = (
+                feats(r, False).reshape(len(r), -1).to(torch.float16).to(torch.float32)
+                for r in (tr, va, te))
+            cv, ct, cvl, cdf = _ridge_eval(
+                zc_tr, zc_va, zc_te, yt, y_all[va], y_all[te], RIDGE_LAMS)
+            del zc_tr, zc_va, zc_te
             if ep == 0:
-                # Cell A, measured in THIS code path rather than imported, plus the val-lambda
-                # control that prices the one val-selected hyperparameter D gets and A does not.
-                z0_tr, z0_va, z0_te = (
-                    feats(r, False).reshape(len(r), -1).to(torch.float16).to(torch.float32)
-                    for r in (tr, va, te))
-                _vs, frozen_test, frozen_vallam, ridge_df = _ridge_eval(
-                    z0_tr, z0_va, z0_te, yt, y_all[va], y_all[te],
-                    [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0])
-                del z0_tr, z0_va, z0_te
+                frozen_test, frozen_vallam, ridge_df = ct, cvl, cdf
+            elif np.isfinite(cv) and cv > best_c["val"]:
+                best_c = {"val": float(cv), "test": float(ct), "epoch": ep}
             hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1)).float().cpu().numpy(),
                            y_all[va])
             ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1)).float().cpu().numpy(),
@@ -638,12 +659,17 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args):
         head.train()
         if np.isfinite(hv) and hv > best["val"]:
             best = {"val": float(hv), "test_ft": float(ht), "best_epoch": ep, "n_params": n_par}
-        elif ep - best["best_epoch"] >= args.patience:
+        # Patience must watch BOTH heads-of-selection: stopping on D's plateau alone would
+        # truncate C's search and manufacture a negative A-vs-C result.
+        if ep - max(best["best_epoch"], best_c["epoch"]) >= args.patience:
+            n_ep = ep
             break
         n_ep = ep
     for q in enc.parameters():
         q.requires_grad_(False)
-    best.update(test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam),
+    best.update(test_c=float(best_c["test"]), c_epoch=int(best_c["epoch"]),
+                val_c=float(best_c["val"]),
+                test_frozen=float(frozen_test), test_frozen_vallam=float(frozen_vallam),
                 ridge_df=float(ridge_df), n_head_params=int(3 * dim + 1),
                 sec_per_epoch=(time.time() - t_start) / max(n_ep, 1), n_epochs_run=n_ep,
                 peak_gib=(torch.cuda.max_memory_allocated() / 2**30
@@ -658,11 +684,18 @@ def _report(results, base, args):
     """28 paired cells (7 sessions x 4 tasks), fold-meaned — the same reduction the frozen
     readout does (``_ws_session`` nanmeans over folds), so the two are comparable.
 
-    A vs D only. `ft-head` is D: the fine-tuned block-12 features read by the trained logistic
-    head, which is the form MAE reports. `frozen` is A: the same rows, frozen features, constant-
-    lambda ridge — the number every result of ours has quoted, recomputed in-path. `disk` is that
-    same A read off the probe JSON, so the two must agree (that is parity L1, printed again here).
-    `val-lam` prices the one val-selected hyperparameter D gets and A does not."""
+    THREE CELLS. `A frozen` is the constant-lambda ridge on frozen enc12 — the number every
+    result of ours has quoted, recomputed in-path; `disk` is the same value read off the probe
+    JSON, so they must agree (parity L1, printed again here). `C ridge` is the SAME ridge on the
+    FINE-TUNED features. `D ft-head` is the trained logistic head on those features, the form MAE
+    reports. `val-lam` prices the one val-selected hyperparameter C and D get and A does not.
+
+    ⭐ THE HEADLINE IS d(C-A), NOT d(D-A). C and A are the same estimator on different weights, so
+    their difference is attributable to the weights. D differs from A in the estimator too, and
+    the two estimators are not comparable in capacity (ridge is dual, bounded by n and shrunk
+    further by feature redundancy; the head is ~500x overparameterized with no calibrated
+    shrinkage), so d(D-A) mostly reports which readout is better regularized. d(D-C) isolates that
+    readout question on its own."""
     for arm in sorted({r["arm"] for r in results}):
         cells: dict[tuple, list] = {}
         for r in results:
@@ -675,27 +708,31 @@ def _report(results, base, args):
                          float(np.nanmean([x["test_ft"] for x in rs])),
                          float(np.nanmean([x["test_frozen"] for x in rs])),
                          float(np.nanmean([x["test_frozen_vallam"] for x in rs])),
-                         disk))
+                         disk,
+                         float(np.nanmean([x["test_c"] for x in rs]))))
         if not rows:
             continue
         print(f"\n=== WS partial-FT, arm={arm} — {len(rows)} paired cells "
               f"({rows[0][0] if len(rows) < 8 else '7 sessions'} x {len(PROBE_TASKS)} tasks) ===")
-        print(f"{'session':8s} {'task':16s} {'D ft-head':>9s} {'A frozen':>9s} {'val-lam':>8s} "
-              f"{'disk':>8s} {'d(D-A)':>9s}")
-        for sess, task, d_ft, a_fr, vl, disk in rows:
-            print(f"{sess:8s} {task:16s} {d_ft:9.4f} {a_fr:9.4f} {vl:8.4f} {disk:8.4f} "
-                  f"{d_ft - a_fr:+9.4f}")
-        for label, j in (("D vs A const-lam", 3), ("D vs A val-lam", 4)):
-            ds = [r[2] - r[j] for r in rows]
+        print(f"{'session':8s} {'task':16s} {'A frozen':>9s} {'C ridge':>9s} {'D ft-head':>9s} "
+              f"{'val-lam':>8s} {'disk':>8s} {'d(C-A)':>9s} {'d(D-A)':>9s}")
+        for sess, task, d_ft, a_fr, vl, disk, c_r in rows:
+            print(f"{sess:8s} {task:16s} {a_fr:9.4f} {c_r:9.4f} {d_ft:9.4f} {vl:8.4f} "
+                  f"{disk:8.4f} {c_r - a_fr:+9.4f} {d_ft - a_fr:+9.4f}")
+        # i, j -> rows[i] - rows[j]. 2=D, 3=A const-lam, 4=A val-lam, 6=C.
+        for label, i, j in (("*C vs A const-lam", 6, 3), ("C vs A val-lam", 6, 4),
+                            ("D vs A const-lam", 2, 3), ("D vs C readout", 2, 6)):
+            ds = [r[i] - r[j] for r in rows]
             nz = [x for x in ds if abs(x) > 1e-9]
             k = sum(x > 0 for x in nz)
             print(f"  {label:22s} mean d={float(np.mean(ds)):+.4f}  {k}/{len(nz)} positive  "
                   f"p={_sign_p(k, len(nz)):.4f}")
-        ds = [r[2] - r[3] for r in rows]
+        # The gate is C vs A: same estimator, so the delta is the WEIGHTS.
+        ds = [r[6] - r[3] for r in rows]
         mean_d, k = float(np.mean(ds)), sum(x > 0 for x in ds)
         verdict = ("BUILD THE CS VERSION" if mean_d >= 0.010 and k >= 20 and len(rows) == 28
                    else "NEGATIVE — ridge stays" if mean_d > 0 else "CLOSE THE THREAD")
-        print(f"  DECISION -> {verdict}"
+        print(f"  DECISION (on d(C-A), the weights-only contrast) -> {verdict}"
               + ("" if len(rows) == 28 else f"  (PARTIAL: {len(rows)}/28 cells — not the gate)"))
 
 
