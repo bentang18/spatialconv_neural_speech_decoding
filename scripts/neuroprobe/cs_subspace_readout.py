@@ -42,18 +42,37 @@ TOL = 1e-3
 DIR_BETWEEN = {"enc0": 0.0747, "enc3": None, "enc6": None, "enc12": 0.9951}
 
 
+def _ckey(c: str) -> str:
+    """Canonical cell key. The ablation writes `s1_t1`, the board baseline `S1T1`; same cell.
+
+    Normalizing is safe ONLY because the mapping is a bijection on these 10 cells -- verified by
+    asserting the two label sets coincide after normalization, below. A silent non-match here is
+    what produced `CANNOT GATE`, and swallowing it would have gated against an empty reference.
+    """
+    return c.upper().replace("_", "")
+
+
 def load(pat: str) -> dict:
     """{(cell,tap,task,arm): test_auroc}, deduped. Later shards must AGREE where they overlap."""
     v: dict = {}
     clash = 0
     files = sorted(glob.glob(pat))
+    kept = []
     for f in files:
-        for r in json.load(open(f))["rows"]:
-            k = (r["cell"], r["tap"], r["task"], r["arm"])
+        d = json.load(open(f))
+        if "rows" not in d:
+            # The verdict this script writes must never be re-ingested as a shard. Announced, not
+            # silent: a shard that legitimately lost its `rows` key would otherwise vanish from the
+            # macro and the cell count would quietly drop below 10.
+            print(f"[skip] {f}: no 'rows' key — not a shard (verdict//summary file?)")
+            continue
+        kept.append(f)
+        for r in d["rows"]:
+            k = (_ckey(r["cell"]), r["tap"], r["task"], r["arm"])
             if k in v and abs(v[k] - r["test"]) > 1e-9:
                 clash += 1
             v[k] = r["test"]
-    print(f"[load] {len(files)} shards, {len(v)} unique (cell,tap,task,arm)"
+    print(f"[load] {len(kept)} shards, {len(v)} unique (cell,tap,task,arm)"
           + (f"  ⚠️ {clash} DISAGREEING duplicates" if clash else "  no duplicate disagreement"))
     return v
 
@@ -62,11 +81,21 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shards", required=True)
     ap.add_argument("--baseline", required=True, help="{tap: {cell: board auroc}} json")
-    ap.add_argument("--out", default="cs_subspace_verdict.json")
+    # NOT `cs_sub*` — the shard glob would re-ingest it on the next run.
+    ap.add_argument("--out", default="verdict_cs_subspace.json")
     a = ap.parse_args()
 
     v = load(a.shards)
-    board = json.load(open(a.baseline))
+    raw = json.load(open(a.baseline))
+    board = {t: {_ckey(c): x for c, x in d.items()} for t, d in raw.items()}
+    for t, d in board.items():
+        assert len(d) == len(raw[t]), f"{t}: cell labels collide under normalization"
+    mine = {k[0] for k in v}
+    for t, d in board.items():
+        shared = mine & set(d)
+        if mine and not shared:
+            raise SystemExit(f"🔴 {t}: shard cells {sorted(mine)[:4]} match NONE of the baseline "
+                             f"{sorted(d)[:4]} even after normalization — fix the key map, do not gate")
     arms = sorted({k[3] for k in v})
     ranks = sorted({int(x.replace("out_top", "")) for x in arms if x.startswith("out_top")})
     print(f"[arms] {len(arms)} = none + out_top/keep_top/out_rand at k={ranks}")
