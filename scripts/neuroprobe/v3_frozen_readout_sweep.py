@@ -95,29 +95,6 @@ def _standardize_t(z_tr, *others):
     return [(z_tr - mu) / sd] + [(o - mu) / sd for o in others]
 
 
-def _ridge_eval(s_tr, s_va, s_te, y_tr, y_va, y_te, lams):
-    """val/test AUROC + effective dof from ONE Gram and ONE eigendecomposition.
-
-    Inputs are ALREADY standardized so the caller can reuse them for the head arms — the ridge and
-    the heads must see byte-identical features or the contrast is not a readout contrast.
-    Returns (val@const, test@const, test@val-selected-lambda, df@const)."""
-    g = (s_tr @ s_tr.T).double()
-    k_va = (s_va @ s_tr.T).double()
-    k_te = (s_te @ s_tr.T).double()
-    n = g.shape[0]
-    basel = float(torch.diagonal(g).sum() / max(n, 1))
-    w, v = torch.linalg.eigh(g)
-    vty = v.T @ torch.as_tensor(y_tr, dtype=torch.float64)
-
-    def sc(k, lm):
-        return (k @ (v @ (vty / (w + lm * basel)))).numpy()
-
-    c = RDO.CONST_LAM_MULT
-    best = max(lams, key=lambda L: RDO.auroc(sc(k_va, L), y_va))
-    return (RDO.auroc(sc(k_va, c), y_va), RDO.auroc(sc(k_te, c), y_te),
-            RDO.auroc(sc(k_te, best), y_te), float((w / (w + c * basel)).sum()))
-
-
 def _variants(z_tr, z_va, z_te, which):
     """Build the FEATURE VARIANTS the readouts are compared on. Both are FIXED data transforms —
     neither has parameters — which is what keeps the model linear and lets the dual fit be exact.
