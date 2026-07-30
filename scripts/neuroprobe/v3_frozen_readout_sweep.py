@@ -281,6 +281,28 @@ def _cells(cache_dir, tag, session, args):
     return out
 
 
+def _assert_one_row_per_cell(rows):
+    """A cell is (session, task, fold). Merging two rows for the same cell silently POOLS ARMS —
+    which is the #1 defect class in this project — and it happened: the merge glob `s*.json` also
+    matched `smoke.json`, a deliberately underfit 60-step run over cells the real shards cover, so
+    a 56-cell design reported 58 cells with two duplicated cells dragging the mean. Refuse instead
+    of averaging, and name the files, because a silent duplicate is indistinguishable from a result."""
+    seen = {}
+    dupes = []
+    for r in rows:
+        k = (r["session"], r["task"], int(r["fold"]))
+        if k in seen:
+            dupes.append((k, seen[k], r.get("_src", "?")))
+        else:
+            seen[k] = r.get("_src", "?")
+    if dupes:
+        lines = "\n".join(f"    {k[0]} {k[1]} f{k[2]}: {a} vs {b}" for k, a, b in dupes)
+        raise SystemExit(
+            f"FATAL: {len(dupes)} duplicated cell(s) in the merge — arms are being pooled.\n"
+            f"{lines}\n  Narrow the glob (s[0-9]*.json, not s*.json) or delete the stale shard.")
+    return len(seen)
+
+
 def _report(rows, norms):
     """Paired over CELLS — the board test. R0 = head - A at frozen features."""
     print(f"\n=== FROZEN READOUT SWEEP — {len(rows)} cells ===")
@@ -372,9 +394,11 @@ def main() -> None:
         torch.set_num_threads(args.threads)
 
     if args.merge:
-        rows = [r for f in sorted(glob.glob(args.merge)) for r in json.load(open(f))]
+        rows = [dict(r, _src=os.path.basename(f)) for f in sorted(glob.glob(args.merge))
+                for r in json.load(open(f))]
         if not rows:
             raise SystemExit(f"no rows matched {args.merge}")
+        _assert_one_row_per_cell(rows)
         _report(rows, args.norms)
         return
 

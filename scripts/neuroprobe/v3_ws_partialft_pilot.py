@@ -628,6 +628,12 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=No
     with torch.no_grad():
         dim = int(feats(tr[:1], False).reshape(1, -1).shape[1])
     n_out = 1 if mt is None else int(mt.shape[1])
+    # `ti` indexes the task within PROBE_TASKS, which is only a valid COLUMN when the head actually
+    # has one column per task. A single-task head has exactly one column, so the reported column is
+    # 0 regardless of which task this cell is. Getting this wrong is silent for `onset` (ti == 0)
+    # and an IndexError for every later task -- which is exactly how it failed: the single-task
+    # arms died on delta_volume while the multitask arm sailed through, because it had 4 columns.
+    col = ti if mt is not None else 0
     head = _Head(dim, args.head_norm, n_out).to(device)
     n_head = sum(q.numel() for q in head.parameters())
     if _run_cell.announced is False:
@@ -737,9 +743,9 @@ def _run_cell(enc, feats, tr, va, te, y_all, yt, *, device, arm, lr, args, mt=No
                 best_c = {"val": float(cv), "test": float(ct), "epoch": ep}
             # column `ti` is the task THIS cell reports; the other columns exist only to
             # supervise the shared block 12.
-            hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1))[:, ti]
+            hv = RDO.auroc(head(feats(va, False).reshape(len(va), -1))[:, col]
                            .float().cpu().numpy(), y_all[va])
-            ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1))[:, ti]
+            ht = RDO.auroc(head(feats(te, False).reshape(len(te), -1))[:, col]
                            .float().cpu().numpy(), y_all[te])
         head.train()
         if np.isfinite(hv) and hv > best["val"]:

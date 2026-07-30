@@ -241,3 +241,29 @@ def test_a_win_that_dies_on_the_matched_bar_is_called_model_selection():
     won = run(+0.02)                         # 0.720 > 0.705
     assert "survives the matched bar" in won
     assert "MODEL SELECTION, not the readout family" not in won
+
+
+def test_merge_refuses_duplicated_cells():
+    """REGRESSION: the merge glob `s*.json` also matched `smoke.json` -- a deliberately underfit
+    60-step run over cells the real shards cover -- so a 56-cell design silently reported 58 cells
+    with two duplicates dragging the mean. Pooling arms is this project's #1 defect class, so the
+    merge must REFUSE, and must name the two files so the stale one is identifiable."""
+    good = [{"session": "S1", "task": "onset", "fold": 0, "_src": "s0.json"},
+            {"session": "S1", "task": "onset", "fold": 1, "_src": "s0.json"}]
+    assert SW._assert_one_row_per_cell(good) == 2
+    dupe = good + [{"session": "S1", "task": "onset", "fold": 0, "_src": "smoke.json"}]
+    with pytest.raises(SystemExit) as e:
+        SW._assert_one_row_per_cell(dupe)
+    msg = str(e.value)
+    assert "arms are being pooled" in msg
+    assert "s0.json" in msg and "smoke.json" in msg
+    assert "S1 onset f0" in msg
+
+
+def test_merge_guard_accepts_the_full_56_cell_design():
+    """7 sessions x 4 tasks x 2 folds = 56 distinct cells must pass untouched."""
+    rows = [{"session": f"S{s}", "task": t, "fold": f, "_src": f"s{s}.json"}
+            for s in range(7) for t in ("onset", "delta_volume", "word_index", "gpt2_surprisal")
+            for f in (0, 1)]
+    assert len(rows) == 56
+    assert SW._assert_one_row_per_cell(rows) == 56

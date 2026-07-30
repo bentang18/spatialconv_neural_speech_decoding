@@ -51,10 +51,14 @@ export ROOT_DIR_BRAINTREEBANK=$BASE/braintreebank
 # argparse takes only one --merge value, so the merge would have died on its own success.
 case "$MODE" in
   smoke) SEL=(--session-index 0 --tasks onset --steps 2000 --lams 1e-3,1e-1 --lrs 0.1
-              --out "$SHARDS/smoke.json") ;;
+              --out "$SHARDS/smoke_probe.json") ;;
   shard) SEL=(--session-index "$SLURM_ARRAY_TASK_ID"
               --out "$SHARDS/s$SLURM_ARRAY_TASK_ID.json") ;;
-  merge) SEL=(--merge "$SHARDS/s*.json") ;;
+  # 🚨 s[0-9]*, NOT s* -- `s*.json` also matches `smoke.json`, and the smoke shard is a
+  # DELIBERATELY underfit 60-step run on cells the real shards also cover. Pooling it silently
+  # duplicated S1T0 onset f0/f1 with their underfit values and reported 58 cells for a 56-cell
+  # design. Arm mixing is the #1 defect in this project; the glob is where it got in.
+  merge) SEL=(--merge "$SHARDS/s[0-9]*.json") ;;
   *) echo "FATAL: mode must be smoke|shard|merge, got '$MODE'" >&2; exit 1 ;;
 esac
 

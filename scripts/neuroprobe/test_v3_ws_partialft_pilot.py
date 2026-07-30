@@ -475,3 +475,33 @@ def test_head_arm_freezes_every_encoder_parameter_and_extends_the_ladder():
     assert FT._arm_params(enc, "head") == []
     n = lambda a: sum(q.numel() for q in FT._arm_params(enc, a))
     assert n("head") == 0 < n("norm") < n("block12")
+
+
+def test_single_task_head_reports_column_zero_for_every_task():
+    """REGRESSION (stage C/D, 2026-07-30). `ti` indexes PROBE_TASKS; it is NOT a column of the
+    head. A single-task head has exactly ONE column, so [:, ti] is an IndexError for every task
+    after `onset` -- and `onset` has ti == 0, which is why the bug was invisible on the first cell
+    and killed all four single-task arms on delta_volume while the multitask arm (4 columns) ran on.
+    The reported column must be derived from the HEAD's width, not from the task's position."""
+    head = FT._Head(6, "bn", 1)
+    z = torch.randn(8, 6)
+    out = head(z)
+    assert out.shape == (8, 1)
+    ti = FT.PROBE_TASKS.index("delta_volume")
+    assert ti > 0, "delta_volume must not be the first task, or this test proves nothing"
+    with pytest.raises(IndexError):
+        out[:, ti]                                  # the exact failure that happened on DCC
+    # the rule the source must implement
+    for mt in (None,):
+        assert (ti if mt is not None else 0) == 0
+    mt4 = np.zeros((8, 4))
+    assert (ti if mt4 is not None else 0) == ti     # multitask still reports its own column
+
+
+def test_reported_column_is_derived_not_taken_from_ti():
+    """Pin it in the source: the eval must index the head with the derived column."""
+    import inspect
+    src = inspect.getsource(FT._run_cell)
+    assert "col = ti if mt is not None else 0" in src
+    assert "[:, col]" in src
+    assert "[:, ti]" not in src, "still indexing the head with the PROBE_TASKS position"
