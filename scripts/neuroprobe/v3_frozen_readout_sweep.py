@@ -307,6 +307,18 @@ def _report(rows, norms):
     dv = [r["A_test_vallam"] - r["A_test"] for r in rows]
     print(f"  ridge val-lambda vs const-lambda: mean={float(np.mean(dv)):+.4f}  "
           f"(prices the ridge's OWN shrinkage selection)")
+    # ⚖️ THE MATCHED BAR. Every head number above is val-selected over (lam, lr), while `A_test` is
+    # the ridge at CONST lambda -- so R0 hands the head a model-selection advantage the ridge was
+    # never given. `A_test_vallam` is the ridge selected on the SAME val split, which is the only
+    # comparison where both estimators paid the same price. Report BOTH, always: R0 answers "does a
+    # head beat the column we quote", R0_matched answers "does a head beat a ridge tuned as hard".
+    # If they disagree, the win is model selection, not the readout family.
+    for n in norms:
+        dm = [r[f"{n}_test"] - r["A_test_vallam"] for r in rows]
+        nz = [x for x in dm if abs(x) > 1e-9]
+        k = sum(x > 0 for x in nz)
+        print(f"  R0_matched[{n:5s}] (vs val-selected ridge) mean={float(np.mean(dm)):+.4f}  "
+              f"{k}/{len(nz)} positive  p={_sign_p(k, len(nz)):.4f}")
     print(f"  ridge_df median={float(np.median([r['ridge_df'] for r in rows])):.1f} "
           f"of n_train median={float(np.median([r['n_train'] for r in rows])):.0f}")
     best = max(norms, key=lambda n: float(np.mean([r[f"{n}_test"] - r["A_test"] for r in rows])))
@@ -317,10 +329,18 @@ def _report(rows, norms):
           "vindicate the FT arms —\n  it supplies the offset that makes d(D-A) decomposable: "
           "d(D-A) = [feature gain] + R1, and\n  R1-R0 is how much the readout family's value "
           "CHANGES with fine-tuning.")
+    bm = float(np.mean([r[f"{best}_test"] - r["A_test_vallam"] for r in rows]))
     if bd > 0:
         print("  ⚠️ A FROZEN head BEATS the const-lambda ridge — that is a win with NO "
               "fine-tuning and\n     it also means our quoted column was leaving readout on the "
               "table. Verify on the board\n     before it is claimed.")
+        if bm <= 0:
+            print(f"  🚫 BUT IT LOSES TO THE VAL-SELECTED RIDGE (R0_matched={bm:+.4f}) — so the "
+                  f"win is\n     MODEL SELECTION, not the readout family. The cheap fix is to "
+                  f"val-select the ridge's\n     lambda in the readout, NOT to train a head.")
+        else:
+            print(f"  ✅ AND it survives the matched bar (R0_matched={bm:+.4f}) — the head beats a "
+                  f"ridge\n     tuned on the same val split.")
 
 
 def main() -> None:

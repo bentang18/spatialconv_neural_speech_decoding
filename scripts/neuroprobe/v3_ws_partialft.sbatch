@@ -31,6 +31,8 @@
 #   sbatch --array=0-6 v3_ws_partialft.sbatch b <LR>
 # STAGE C  (the corrected head -- matched bn preprocessing + multitask, sharded by question):
 #   sbatch --array=0-2 v3_ws_partialft.sbatch c
+# STAGE D  (parameter-count ladder at the bn head -- norm/BitFit and mlp, never yet run):
+#   sbatch --array=0-1 v3_ws_partialft.sbatch d
 set -euo pipefail
 
 STAGE="${1:?usage: sbatch v3_ws_partialft.sbatch <a|awd|b|c> [LR|WD]}"
@@ -87,13 +89,27 @@ case "$STAGE" in
      I=$SLURM_ARRAY_TASK_ID
      SEL="--stage a --session-index 0 --lrs ${CLRS[$I]} --arms ${ARMS[$I]} --head-norm bn ${MTF[$I]}"
      OUT=$BASE/ws_partialft_stageC_${NAMES[$I]}.json ;;
+  d) # STAGE D -- THE PARAMETER-COUNT LADDER, at the corrected (bn) head. Stage A only ever ran
+     # `block12`: ~790k trainable params against n_train ~1.3k rows. If the FT is failing because
+     # it is overparameterized rather than because the features cannot improve, a SMALLER arm wins,
+     # and the ladder is the instrument that separates those two explanations. Combined with stage
+     # C task 0 (head, 0 encoder params) the full ladder is head < norm < mlp < block12.
+     # DECISION: if norm or mlp beats block12 by more than noise, the adoption candidate CHANGES to
+     # the smaller arm; if the ladder is flat, capacity is not the binding constraint and the
+     # remaining suspect is supervision (stage C task 2).
+     # Higher lr ladder than block12's: fewer, mostly 1-D params (norm is BitFit) tolerate and need
+     # a larger step than a full pretrained block does.
+     ARMS=(norm mlp)
+     I=$SLURM_ARRAY_TASK_ID
+     SEL="--stage a --session-index 0 --lrs 3e-4,1e-3,3e-3 --arms ${ARMS[$I]} --head-norm bn"
+     OUT=$BASE/ws_partialft_stageD_${ARMS[$I]}_bn.json ;;
   b) LR="${2:?stage b needs the stage-A winning LR}"
      # `head` (encoder frozen, logistic head only) is the missing 2x2 cell: it separates readout
      # family from weights, so "FT beats the board" cannot be a logistic-vs-ridge artifact. It is
      # pointless in stage A (there is no encoder lr to sweep) and ~doubles stage B to ~6 GPU-h.
      SEL="--stage b --session-index $SLURM_ARRAY_TASK_ID --lrs $LR --arms block12"
      OUT=$BASE/ws_partialft_stageB_s$SLURM_ARRAY_TASK_ID.json ;;
-  *) echo "FATAL: stage must be 'a', 'awd', 'b' or 'c', got '$STAGE'" >&2; exit 1 ;;
+  *) echo "FATAL: stage must be 'a', 'awd', 'b', 'c' or 'd', got '$STAGE'" >&2; exit 1 ;;
 esac
 
 # pbs50 is an r6 arm => MAE => there is NO EMA teacher; the tower is objective.online.*

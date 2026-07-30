@@ -209,3 +209,35 @@ def test_sign_test_matches_known_binomial_tails():
     assert SW._sign_p(21, 28) == pytest.approx(0.01254, abs=1e-5)
     assert SW._sign_p(14, 28) == pytest.approx(1.0)
     assert np.isnan(SW._sign_p(0, 0))
+
+
+def test_report_prints_the_matched_bar_against_the_val_selected_ridge():
+    """Every head number is val-selected over (lam, lr); `A_test` is the ridge at CONST lambda. So
+    R0 alone hands the head a model-selection advantage. The report must ALSO test against
+    `A_test_vallam`, the ridge selected on the same val split."""
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        SW._report(_rows(+0.02), ["std"])
+    out = buf.getvalue()
+    assert "R0_matched[std" in out
+    assert "vs val-selected ridge" in out
+
+
+def test_a_win_that_dies_on_the_matched_bar_is_called_model_selection():
+    """_rows sets A_test=0.70 and A_test_vallam=0.705. A head at +0.02 beats the quoted column but
+    +0.002 does NOT beat the val-selected ridge — the report must say so rather than bank the win."""
+    import io, contextlib
+
+    def run(delta):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            SW._report(_rows(delta), ["std"])
+        return buf.getvalue()
+
+    lost = run(+0.002)                       # 0.702 > 0.700 but < 0.705
+    assert "A FROZEN head BEATS" in lost
+    assert "MODEL SELECTION, not the readout family" in lost
+    won = run(+0.02)                         # 0.720 > 0.705
+    assert "survives the matched bar" in won
+    assert "MODEL SELECTION, not the readout family" not in won
