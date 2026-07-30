@@ -704,7 +704,30 @@ def self_test(seed: int = 0) -> None:
     assert pp.min() >= 1.0 / (1 + 200 * P * T)
     assert pp.min() < 1.0 / 201.0 or np.abs(au - .5).max() < np.abs(nulls[:200] - .5).max()
 
-    print("[self-test] all 6 properties hold", flush=True)
+    # 7. the row-major AUROC is bit-identical to the column-major one, including the flat-column
+    #    guard. Not "close": these two share the significance threshold, so a drift between them
+    #    would move the map without moving anything that reports on the map.
+    s2 = rng.normal(size=(120, 40)).astype(np.float32)
+    s2[:, 4] = 2.0
+    y2 = (rng.random(120) < 0.4).astype(np.int64)
+    assert np.array_equal(auroc_cols(s2, y2), auroc_rows(np.ascontiguousarray(s2.T), y2))
+
+    # 8. threading changes nothing at all. The permutation loop runs on however many cores the
+    #    cpuset has, so a thread-count-dependent statistic would make the null depend on the
+    #    hardware -- exactly as disqualifying as the salted-hash seed bug this file already
+    #    guards against. Chunk boundaries land differently for 1, 3 and 7 threads, and 7 does
+    #    not divide P, so the ragged last chunk is covered too.
+    Zc = contact_major(Z)
+    base = cv_auroc_cm(Zc, y)
+    for nt in (3, 7):
+        with ThreadPoolExecutor(nt) as ex:
+            assert np.array_equal(base, cv_auroc_cm(Zc, y, ex, nt)), nt
+    # and it must hold under permuted labels too, where the fold split itself moves
+    yp = block_permute(y, np.random.default_rng(5), 40)
+    with ThreadPoolExecutor(4) as ex:
+        assert np.array_equal(cv_auroc_cm(Zc, yp), cv_auroc_cm(Zc, yp, ex, 4))
+
+    print("[self-test] all 8 properties hold", flush=True)
 
 
 # --------------------------------------------------------------------------------------
