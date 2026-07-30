@@ -9,6 +9,7 @@ reapplied — that cast is what makes the reported features numerically identica
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -697,3 +698,39 @@ def test_merge_separates_arms_rather_than_pooling_them():
     rows = ([dict(_cell("S1T0", "onset", 0, arm="block12", lr=1e-3), _src="a.json")]
             + [dict(_cell("S1T0", "onset", 0, arm="norm", lr=3e-3), _src="b.json")])
     assert FT._assert_mergeable(rows) == 1
+
+
+def test_report_prints_k_beside_the_additive_delta_not_instead_of_it(capsys):
+    """🚨 The gain law is multiplicative, and a raw mean d is read off the cells' HEADROOM as much
+    as off the fine-tuning: a cell at A=.977 cannot gain .03. But the +.010 gate is written against
+    the ADDITIVE delta, so both must print -- swapping the two ratio definitions is its own defect
+    class in this project."""
+    rows = [dict(_cell(f"S{s}T0", t, 0, test_frozen=0.60, test_c=0.66, test_ft=0.58,
+                       test_frozen_vallam=0.60), _src="x.json")
+            for s in range(7) for t in FT.PROBE_TASKS]
+    base = {f"pbs50_20k|enc12|std|{t}": {"ws_per_session": {f"S{s}T0": 0.60 for s in range(7)}}
+            for t in FT.PROBE_TASKS}
+    args = argparse.Namespace(baseline_prefix="pbs50_20k")
+    FT._report(rows, base, args)
+    out = capsys.readouterr().out
+    assert "k(C/A)" in out
+    assert "*C vs A const-lam" in out, "the additive gate line must survive"
+    # (.66-.5)/(.60-.5) = 1.6 exactly
+    assert "mean k=1.6000" in out
+
+
+def test_report_drops_near_chance_cells_from_k_but_not_from_the_additive_mean(capsys):
+    """k explodes when A sits on chance -- (C-.5)/(A-.5) with A=.501 is a 100x artifact, not a
+    result. Those cells must leave the k mean and STAY in the additive mean, and the count of
+    dropped cells must be printed so the exclusion is never silent."""
+    rows = [dict(_cell("S1T0", "onset", 0, test_frozen=0.501, test_c=0.55, test_ft=0.52,
+                       test_frozen_vallam=0.501), _src="x.json"),
+            dict(_cell("S1T0", "word_index", 0, test_frozen=0.60, test_c=0.66, test_ft=0.58,
+                       test_frozen_vallam=0.60), _src="x.json")]
+    base = {f"pbs50_20k|enc12|std|{t}": {"ws_per_session": {"S1T0": 0.60}}
+            for t in FT.PROBE_TASKS}
+    FT._report(rows, base, argparse.Namespace(baseline_prefix="pbs50_20k"))
+    out = capsys.readouterr().out
+    assert "1 cell(s) dropped" in out, "a silent exclusion is indistinguishable from a result"
+    assert "mean k=1.6000" in out, "the near-chance cell still contaminated k"
+    assert "2 paired cells" in out, "the near-chance cell was dropped from the additive mean too"

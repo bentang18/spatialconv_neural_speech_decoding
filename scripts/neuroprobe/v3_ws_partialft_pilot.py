@@ -988,6 +988,18 @@ def _report(results, base, args):
             k = sum(x > 0 for x in nz)
             print(f"  {label:22s} mean d={float(np.mean(ds)):+.4f}  {k}/{len(nz)} positive  "
                   f"p={_sign_p(k, len(nz)):.4f}")
+        # 🚨 QUOTE k, NOT THE RAW DELTA. A cell at A=.977 cannot gain .03 and one at A=.53 has room
+        # for .3, so a raw mean d is read off the cells' HEADROOM as much as off the fine-tuning --
+        # this project has already been burned by the mirror-image version of that ("only helps easy
+        # tasks" turned out to be a headroom artifact). The multiplicative form the gain law is
+        # written in is k = (AUC - .5) / (AUC_0 - .5), which is headroom-free by construction.
+        # Printed BESIDE the additive delta, never instead of it: the additive number is what the
+        # +.010 gate is written against, and swapping the two definitions is its own defect class.
+        ks = [(r[6] - 0.5) / (r[3] - 0.5) for r in rows if abs(r[3] - 0.5) > 0.02]
+        if ks:
+            print(f"  k(C/A) = (C-.5)/(A-.5)   mean k={float(np.mean(ks)):.4f}  "
+                  f"median={float(np.median(ks)):.4f}  {sum(x > 1 for x in ks)}/{len(ks)} above 1 "
+                  f"({len(rows) - len(ks)} cell(s) dropped: A within .02 of chance)")
         # The gate is C vs A: same estimator, so the delta is the WEIGHTS.
         ds = [r[6] - r[3] for r in rows]
         mean_d, k = float(np.mean(ds)), sum(x > 0 for x in ds)
