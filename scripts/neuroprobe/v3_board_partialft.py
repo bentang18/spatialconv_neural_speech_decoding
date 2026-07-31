@@ -128,6 +128,67 @@ def _stub_rows(y):
     return np.sort(idx.astype(np.int64))
 
 
+# ── epoch ENSEMBLING (stop selecting an epoch; average over several) ────────────────────────
+# The epoch-curve arm measured a +.0105 oracle gap on WS (112/0/8) that no val-based STOPPING rule
+# recovers: le4/le6/le8/le12 and smooth3 all LOSE to plain argmax. The val trace is too noisy to
+# PICK the best epoch -- which does not mean the epochs are bad. Averaging their predictions can
+# beat any single one even when val cannot say which one to take.
+#
+# 🔴 THE ONLY THING THAT MAKES THIS SUBMITTABLE is that the epoch SET is a function of the val
+# trace alone. That is enforced structurally: `_ensemble_index_sets` takes `vals` and nothing else,
+# so it cannot read test data even by accident (test_board_partialft_epoch_ensemble.py).
+# `ens_top1` is the SELF-CHECK -- averaging one epoch IS the published rule, so it must reproduce
+# `test_c`; the run prints the difference rather than assuming it.
+
+def _rank01(s):
+    """Scores -> ranks in [0, 1]. AUROC depends only on the ORDER of scores, so a mean of RAW
+    scores is not order-only: an epoch whose val-selected λ happens to be smaller emits
+    larger-magnitude scores and outvotes the rest for reasons that have nothing to do with how well
+    it ranks the test set. Ranks put every epoch on one scale. Ties are broken by position, which
+    is measure-zero for a continuous ridge score and cannot bias a mean either way."""
+    s = np.asarray(s, dtype=np.float64)
+    n = len(s)
+    if n < 2:
+        return np.zeros(n, dtype=np.float64)
+    r = np.empty(n, dtype=np.float64)
+    r[np.argsort(s, kind="stable")] = np.arange(n, dtype=np.float64)
+    return r / (n - 1)
+
+
+def _ensemble_index_sets(vals):
+    """{rule -> list of epoch INDICES to average}, from the val trace and NOTHING else.
+
+    Index 0 is the frozen entry (epoch 0), matching `trace`'s ordering. Non-finite vals are failed
+    fits and are dropped: left in, a nan would compare False against everything and could win a
+    top-k slot by default. Ties break toward the EARLIER epoch, the same way the training loop's
+    strict `>` does, so `ens_top1` picks exactly the epoch the loop selected."""
+    ok = [i for i, v in enumerate(vals) if np.isfinite(v)]
+    if not ok:
+        return {"ens_all": [], "ens_valge0": [], "ens_top3": [], "ens_top1": []}
+    order = sorted(ok, key=lambda i: (-float(vals[i]), i))
+    base = float(vals[ok[0]])
+    return {"ens_all": list(ok),
+            "ens_valge0": [i for i in ok if float(vals[i]) >= base],
+            "ens_top3": sorted(order[:3]),
+            "ens_top1": [order[0]]}
+
+
+def _epoch_ensembles(vals, scores, y_te, auroc):
+    """{rule -> test AUROC of the rank-averaged prediction} for every rule in `_ensemble_index_sets`."""
+    sets = _ensemble_index_sets(vals)
+    ranks = {}
+    out = {}
+    for name, idxs in sets.items():
+        if not idxs:
+            out[name] = float("nan")
+            continue
+        for i in idxs:
+            if i not in ranks:
+                ranks[i] = _rank01(scores[i])
+        out[name] = float(auroc(np.mean([ranks[i] for i in idxs], axis=0), y_te))
+    return out
+
+
 def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col, dcols, lams,
               tag):
     """Fine-tune block 12's MLP on ``rows['tr']``; return A, C and the epoch trace.
@@ -154,7 +215,7 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
     ye = ybin_ev[te][:, col].cpu().numpy()
     stub = _stub_rows(yv)
 
-    def ridge_now(want_test):
+    def ridge_now(want_test, want_scores=False):
         """val (+ optionally test) AUROC at val-selected λ on the CURRENT weights."""
         with torch.no_grad():
             z_tr = FTP._flat16(feats_tr(tr, False))
@@ -163,10 +224,17 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
                 z_te, y_te = FTP._flat16(feats_ev(te, False)), ye
             else:
                 z_te, y_te = z_va[stub], yv[stub]
-            return FTP._ridge_eval(z_tr, z_va, z_te, yt, yv, y_te, lams)
+            return FTP._ridge_eval(z_tr, z_va, z_te, yt, yv, y_te, lams, want_scores)
 
     # ── A: the frozen board entry, recomputed in-path (ep 0) ────────────────────────────────
-    v0, _t0const, a_test, a_df = ridge_now(True)
+    # Scores are collected only under --dump-epoch-test, which already pays the per-epoch test
+    # forward; the ensembles therefore cost the rank sort and nothing else on the GPU.
+    ens_scores: list = []
+    if args.dump_epoch_test:
+        v0, _t0const, a_test, a_df, s0 = ridge_now(True, True)
+        ens_scores.append(s0)
+    else:
+        v0, _t0const, a_test, a_df = ridge_now(True)
     best = {"val": float(v0), "epoch": 0, "state": None}
     trace = [(0, float(v0), float(a_test) if args.dump_epoch_test else None)]
     t0 = time.time()
@@ -199,7 +267,8 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         # val-selection leaves on the table; selecting an epoch ON it is the winner's curse that
         # already cost us a 10x shrink, so the reported number still comes from a val-fixed rule.
         if args.dump_epoch_test:
-            cv, _, ct, _ = ridge_now(True)
+            cv, _, ct, _, s_ep = ridge_now(True, True)
+            ens_scores.append(s_ep)
         else:
             cv, ct = ridge_now(False)[0], None
         trace.append((ep, float(cv), None if ct is None else float(ct)))
@@ -216,6 +285,18 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         for b, sd_ in zip(enc.blocks[SPLIT_AT:TAP], best["state"]):
             b.load_state_dict(sd_)
         c_test = ridge_now(True)[2]
+    # ── E: epoch ensembles (val-only rules, no extra forward) ───────────────────────────────
+    ens: dict = {}
+    if args.dump_epoch_test and len(ens_scores) == len(trace):
+        ens = _epoch_ensembles([v for _, v, _ in trace], ens_scores, ye, RDO.auroc)
+        # SELF-CHECK, PRINTED NOT ASSUMED. ens_top1 averages exactly one epoch -- the one the loop
+        # selected -- so it must reproduce c_test. A non-zero gap means the ensemble is reading a
+        # different curve than the run selected on, which would invalidate every other rule here.
+        print(f"[enscheck] {tag} ens_top1={ens['ens_top1']:.6f} c_test={c_test:.6f} "
+              f"d={ens['ens_top1'] - c_test:+.2e} n_ep_in_trace={len(trace)}", flush=True)
+        print("[ens] " + tag + " " + " ".join(f"{k}={v:.4f}" for k, v in sorted(ens.items())),
+              flush=True)
+
     sec = (time.time() - t0) / max(n_ep, 1)
     print(f"[cell] {tag} ep*={best['epoch']:3d} A={a_test:.4f} C={c_test:.4f} "
           f"d={c_test - a_test:+.4f} | df={a_df:.1f}/{len(tr)} | K_drv={len(dcols)} | "
@@ -227,7 +308,7 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
             "epoch_curve": [[e, v, t] for e, v, t in trace],
             "d": float(c_test - a_test), "best_epoch": int(best["epoch"]),
             "n_epochs_run": int(n_ep), "sec_per_epoch": float(sec), "ridge_df": float(a_df),
-            "n_tr": int(len(tr)), "n_va": int(len(va)), "n_te": int(len(te))}
+            "n_tr": int(len(tr)), "n_va": int(len(va)), "n_te": int(len(te)), **ens}
 
 
 def main() -> None:

@@ -207,7 +207,7 @@ def _std_gpu(z_tr, z_te):
     return (z_tr - mu) / sd, (z_te - mu) / sd
 
 
-def _ridge_eval(z_tr, z_va, z_te, y_tr, y_va, y_te, lams):
+def _ridge_eval(z_tr, z_va, z_te, y_tr, y_va, y_te, lams, want_scores=False):
     """val + test AUROC from ONE Gram and ONE eigendecomposition.
 
     Both readouts standardize on the SAME train statistics, so the standardized train matrix —
@@ -251,7 +251,14 @@ def _ridge_eval(z_tr, z_va, z_te, y_tr, y_va, y_te, lams):
     test_const = RDO.auroc(sc(k_te, c), y_te)
     best_lm = max(lams, key=lambda L: RDO.auroc(sc(k_va, L), y_va))
     df_const = float((w / (w + c * basel)).sum())
-    return val_const, test_const, RDO.auroc(sc(k_te, best_lm), y_te), df_const
+    te_scores = sc(k_te, best_lm)
+    if want_scores:
+        # 5-tuple ONLY under the opt-in flag: every existing caller unpacks 4 and must stay
+        # byte-identical. The scores are the ones the reported test AUROC is computed from --
+        # same λ, same vector -- so an epoch ensemble built on them is averaging exactly the
+        # predictions this function reports, not a re-derived approximation of them.
+        return val_const, test_const, RDO.auroc(te_scores, y_te), df_const, te_scores
+    return val_const, test_const, RDO.auroc(te_scores, y_te), df_const
 
 
 def _pool_t(x, cols):
