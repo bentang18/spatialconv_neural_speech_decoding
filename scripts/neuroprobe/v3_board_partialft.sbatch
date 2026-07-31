@@ -9,22 +9,27 @@
 #SBATCH --time=08:00:00
 #SBATCH --output=/projects/bhqk/htang13/logs/%x_%A_%a.out
 #
-#   sbatch --array=0-11 --mem=113560M  v3_board_partialft.sbatch <CKPT> ws       <CACHE> <TAG> <OUTDIR>
+#   sbatch --array=0-11 --mem=113560M  v3_board_partialft.sbatch <CKPT> ws       <CACHE> <TAG> <OUTDIR> --x11-dtype fp16
 #   sbatch --array=0-11 --mem=113560M  v3_board_partialft.sbatch <CKPT> csession <CACHE> <TAG> <OUTDIR> --x11-dtype fp16
 #   sbatch --array=0-9  --mem=113560M  v3_board_partialft.sbatch <CKPT> cs       <CACHE> <TAG> <OUTDIR> --x11-dtype fp16
 #
 # 🔴 EVERY REGIME BILLS 1000. 113560M IS ONE GPU'S DefMemPerGPU; 227120M BILLS DOUBLE FOR THE
 # SAME ONE GPU, so staying under the share is worth real fairshare on ~34 array tasks.
-# ws trains and evaluates inside ONE session -> one resident tap-11 cache. At the largest Lite
-# session (13,592 windows) that is 80.2 GiB in fp32, MEASURED MaxRSS 93.8 GiB (job 2790649)
-# against the 110.9 GiB share. It fits, so ws keeps fp32 and is BIT-EXACT (parity-L0 rel=0).
+# 🔴 fp16 ON ALL THREE REGIMES — fp32 ws DOES NOT FIT, MEASURED. The earlier claim here ("80.2 GiB
+# in fp32, MaxRSS 93.8 GiB, it fits") was inferred from a --parity-only run, which never builds
+# the training-side slices; the full ws run OOM-KILLED at this same 113560M (job 2790770, dead in
+# 1m40s during setup). fp16 ws is the configuration that actually completed (job 2790998).
 # cs and csession train on a DIFFERENT record than they evaluate (anchor S2T4 / the sibling
-# trial), so BOTH caches are resident: ~160 GiB in fp32, which would force 227120M. fp16 halves
-# the tap to 40.1 GiB each (~94 GiB total) and fits the share.
+# trial), so BOTH caches are resident -- MEASURED 40.1 + 32.3 GiB at fp16 (jobs 2791036/2791037),
+# which fits the share; fp32 would be ~160 GiB and force 227120M.
 # fp16 does NOT weaken the parity gate: parity-L0 keeps CERT_ROWS=256 windows in fp32 no matter
 # what --x11-dtype is, so the STRUCTURAL question (is the block split right?) is still certified
 # at full precision. fp16's effect is reported separately as [parity-L0s], measured 1.910e-3 --
 # storage noise, not a bug, on features the board pipeline already stores fp16 anyway.
+# MEASURED GATES: elec unit (ws/csession) is BIT-EXACT, rel=0.000e+00. parcel unit (cs) is
+# rel=5.984e-04 -- NOT zero, and expected: the cached parcel tap is the electrode mean taken over
+# values the encoder had already rounded to fp16, so the pool and the rounding commute in one path
+# and not the other. It is fp16-storage-sized, an order under the 1e-3 gate, and NOT a split bug.
 #
 # ARRAY INDEX = CELL. ws/csession are the 12 Lite sessions, cs is the 10 CS test cells
 # (v3_board_readout.py:98-118). Never fold cells together -- the board test is PAIRED OVER CELLS.
