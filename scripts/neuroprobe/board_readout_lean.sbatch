@@ -65,7 +65,9 @@ if [[ -n "$TAPS" ]]; then
   TAPS_ARGS=(--taps "$TAPS")
   echo "[check] TAP OVERRIDE: $TAPS (regime default NOT used) -> shard dir must be tap-specific"
 fi
+# Anything after TAPS is forwarded verbatim to the readout (e.g. --dump-lam-grid, --lam-rule).
+# TAPS is positional and may be empty, so pass "" to skip it and still reach these.
 numactl --interleave=all python -u scripts/neuroprobe/v3_board_readout.py \
   --cache-dir "$CACHE" --tags "$TAG" --mode "$MODE" --index "$SLURM_ARRAY_TASK_ID" \
   --shard-dir "$SHARD" --no-std-target --workers "$WK" "$MMAP" "${SIDECAR_ARGS[@]}" \
-  "${TAPS_ARGS[@]}" --out /dev/null
+  "${TAPS_ARGS[@]}" "${@:8}" --out /dev/null

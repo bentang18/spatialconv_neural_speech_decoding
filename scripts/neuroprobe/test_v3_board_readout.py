@@ -22,6 +22,7 @@ from scripts.neuroprobe.v3_board_readout import (
     auroc,
     _cs_cell,
     _finalize,
+    _grid_cells,
     _lam_grid,
     _select_lam,
     _ws_cell,
@@ -836,3 +837,303 @@ def test_the_dumped_test_curve_can_beat_the_selected_point_which_is_the_whole_po
     got = _select_lam(d)
     assert got["test"] == 0.55
     assert max(r[2] for r in got["lam_grid"]) == 0.99
+
+
+# ── --tap-ensemble: rank-averaged cross-tap ensembles ───────────────────────────────────────
+
+def _tap(val_s, test_s, y_va, y_te, lam=1.0):
+    """One (tap,norm) λ-grid entry carrying the score vectors --tap-ensemble captures."""
+    return {"val": {lam: auroc(np.asarray(val_s), y_va)},
+            "test": {lam: auroc(np.asarray(test_s), y_te)},
+            "_scores": {"val": {lam: np.asarray(val_s, dtype=float)},
+                        "test": {lam: np.asarray(test_s, dtype=float)}}}
+
+
+def test_tap_ensemble_is_off_by_default_and_adds_no_columns() -> None:
+    """The published shard shape must not grow columns because the code learned to ensemble."""
+    import scripts.neuroprobe.v3_board_readout as B
+    assert B.TAP_ENSEMBLE is False
+    y = np.array([0.0, 0, 1, 1])
+    grid = {("enc12", "std"): _tap([1, 2, 3, 4], [1, 2, 3, 4], y, y),
+            ("enc9", "std"): _tap([1, 2, 3, 4], [1, 2, 3, 4], y, y)}
+    cells = _grid_cells(grid, y, y)
+    assert set(cells) == {"enc12|std", "enc9|std"}
+
+
+def test_tap_ensemble_leaves_every_per_tap_column_bit_identical(monkeypatch) -> None:
+    """THE INVARIANT, same one --dump-lam-grid had to satisfy. Ensembles are ADDITIONAL columns;
+    if turning the flag on could move enc12|std, the arm would stop being the published one."""
+    import scripts.neuroprobe.v3_board_readout as B
+    y = np.array([0.0, 0, 1, 1, 0, 1])
+    mk = lambda: {("enc12", "std"): _tap([1, 5, 3, 4, 2, 6], [2, 1, 5, 4, 3, 6], y, y),
+                  ("enc9", "std"): _tap([2, 1, 4, 3, 5, 6], [1, 3, 4, 6, 2, 5], y, y)}
+    off = _grid_cells(mk(), y, y)
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    on = _grid_cells(mk(), y, y)
+    for k, v in off.items():
+        assert on[k] == v, f"{k} moved when --tap-ensemble was enabled"
+
+
+def test_the_score_vectors_are_stripped_so_nothing_extra_is_written(monkeypatch) -> None:
+    """`_sc` holds float arrays that are not JSON-serializable and would bloat every shard."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0, 1, 1])
+    grid = {("enc12", "std"): _tap([1, 2, 3, 4], [1, 2, 3, 4], y, y),
+            ("enc9", "std"): _tap([1, 2, 4, 3], [1, 2, 4, 3], y, y)}
+    for c in _grid_cells(grid, y, y).values():
+        assert "_sc" not in c
+
+
+def test_averaging_two_taps_that_fail_on_different_trials_beats_both(monkeypatch) -> None:
+    """THE WHOLE POINT. Depth CONCAT is closed and negative because fusing features dilutes one
+    kernel under one λ. Score ensembling is a different bargain: it pays when the members' ERRORS
+    decorrelate. Here each tap misranks a DIFFERENT pair, so each is imperfect and the rank
+    average is exact -- the effect the arm exists to look for, pinned on a case where it must fire.
+    """
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])      # negatives 0,1; positives 2,3
+    a = [3.0, 1.0, 2.0, 4.0]                # ranks neg 0 ABOVE pos 2  -> AUROC .75
+    b = [1.0, 3.0, 4.0, 2.0]                # ranks neg 1 ABOVE pos 3  -> AUROC .75
+    cells = _grid_cells({("enc12", "std"): _tap(a, a, y, y),
+                         ("enc9", "std"): _tap(b, b, y, y)}, y, y)
+    assert cells["enc12|std"]["test"] == 0.75 and cells["enc9|std"]["test"] == 0.75
+    assert cells["ens:all|std"]["test"] == 1.0
+
+
+def test_a_tap_cannot_outvote_the_others_by_score_scale(monkeypatch) -> None:
+    """Ranks, not raw scores. A tap whose selected λ is smaller emits larger-magnitude scores; a
+    raw mean would let that dominate for a reason that carries no information."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    good = [1.0, 2.0, 3.0, 4.0]                     # perfect order
+    loud = [500.0, 400.0, -400.0, -500.0]           # exactly reversed, huge magnitude
+    cells = _grid_cells({("enc12", "std"): _tap(good, good, y, y),
+                         ("enc9", "std"): _tap(loud, loud, y, y)}, y, y)
+    raw = auroc(np.mean([np.asarray(good), np.asarray(loud)], axis=0), y)
+    assert raw == 0.0, "fixture no longer reproduces the raw-mean failure it exists to exclude"
+    # The honest outcome of averaging a perfect ranker with an exactly-reversed one is a tie at
+    # .5 -- the point is that `loud` cannot DRAG IT BELOW chance the way the raw mean does.
+    assert cells["ens:all|std"]["test"] == 0.5
+
+
+def test_ens_auto_declines_to_ensemble_when_val_says_one_tap_is_better(monkeypatch) -> None:
+    """A rule that cannot say "no" is not a rule. Here one tap is perfect on BOTH halves and the
+    other is anti-correlated, so val prefers the single tap and auto must return it -- otherwise
+    the column is forced to average even where averaging hurts."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    good, bad = [1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]
+    cells = _grid_cells({("enc12", "std"): _tap(good, good, y, y),
+                         ("enc9", "std"): _tap(bad, bad, y, y)}, y, y)
+    assert cells["ens:auto|std"]["test"] == cells["enc12|std"]["test"] == 1.0
+    assert cells["ens:auto|std"]["ens_members"] == "enc12|std"
+
+
+def test_member_sets_are_a_function_of_val_alone(monkeypatch) -> None:
+    """STRUCTURAL. _ens_member_sets is handed the val AUROCs and nothing else, so no ranking rule
+    can reach test even by accident. Asserted on the signature, not on behaviour, because a
+    behavioural check passes trivially for a function that ignores an argument."""
+    import inspect
+
+    import scripts.neuroprobe.v3_board_readout as B
+    assert list(inspect.signature(B._ens_member_sets).parameters) == ["names", "vals"]
+
+
+def test_top2_picks_the_two_best_val_taps_even_when_test_disagrees(monkeypatch) -> None:
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    hi, mid, lo = [1.0, 2, 3, 4], [2.0, 1, 3, 4], [4.0, 3, 2, 1]
+    # `lo` is worst on val but BEST on test; a val-only rule must still exclude it.
+    grid = {("enc12", "std"): _tap(hi, hi, y, y),
+            ("enc9", "std"): _tap(mid, mid, y, y),
+            ("enc6", "std"): _tap(lo, hi, y, y)}
+    cells = _grid_cells(grid, y, y)
+    assert cells["ens:top2|std"]["ens_members"] == "enc12|std|enc9|std"
+
+
+def test_norms_are_never_fused_into_one_ensemble(monkeypatch) -> None:
+    """std and raw are separately REPORTED columns. Averaging across them would fuse two board
+    columns, the same defect class as pooling ws with csession."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    s = [1.0, 2.0, 3.0, 4.0]
+    cells = _grid_cells({("enc12", "std"): _tap(s, s, y, y),
+                         ("enc12", "raw"): _tap(s, s, y, y)}, y, y)
+    assert not any(k.startswith("ens:") for k in cells), "one tap per norm cannot ensemble"
+
+
+def test_a_single_tap_produces_no_ensemble_column(monkeypatch) -> None:
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    s = [1.0, 2.0, 3.0, 4.0]
+    cells = _grid_cells({("enc12", "std"): _tap(s, s, y, y)}, y, y)
+    assert set(cells) == {"enc12|std"}
+
+
+def test_tap_ensemble_runs_end_to_end_through_the_real_ridge(monkeypatch) -> None:
+    """INTEGRATION. Everything above builds the λ-grid by hand; this is the only check that
+    _lam_grid actually CAPTURES the score vectors, that they survive λ selection, and that the
+    ensemble columns come out of a real fit. Without it the flag could be a no-op on the board
+    and every unit test would still pass.
+    """
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "TAP_ENSEMBLE", True)
+    rec = _rec()
+    rec["feats"]["enc12_elec"] = rec["feats"]["enc12"]
+    got = mod._ws_cell(rec, "onset", ("enc12_elec", "enc12"))
+    assert set(got["cells"]) == {"enc12_elec|std", "enc12|std"} | {
+        f"{r}|std" for r in mod.ENS_RULES}
+    for r in mod.ENS_RULES:
+        assert not np.isnan(got["cells"][f"{r}|std"]["test"])
+    assert got["cells"]["ens:all|std"]["test"] == pytest.approx(1.0)
+
+
+def test_the_primal_branch_also_captures_scores(monkeypatch) -> None:
+    """CS enc0 is the one tap where d < n, so it takes _lam_grid_primal. If only the dual branch
+    captured scores, enc0 would vanish from every CS ensemble silently -- exactly the kind of
+    partial coverage that makes a macro lie."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "TAP_ENSEMBLE", True)
+    n, d = 40, 3
+    rng = np.random.default_rng(0)
+    y = np.array([float(i % 2) for i in range(n)])
+    z = rng.normal(size=(n, d)).astype(np.float32)
+    z[:, 0] += y
+    assert d < n, "fixture must take the primal branch"
+    out = mod._lam_grid_primal(z, y, {"val": (z, y), "test": (z, y)})
+    assert "_scores" in out
+    assert set(out["_scores"]) == {"val", "test"}
+    assert out["_scores"]["test"][LAM_MULTS[0]].shape == (n,)
+
+
+# ── --lam-ensemble: rank-averaged within-tap ensembles over λ ────────────────────────────────
+
+def _lam_tap(per_lam, y_va, y_te):
+    """One (tap,norm) grid entry with an explicit {λ: test_score_vector}; val mirrors test."""
+    return {"val": {m: auroc(np.asarray(s), y_va) for m, s in per_lam.items()},
+            "test": {m: auroc(np.asarray(s), y_te) for m, s in per_lam.items()},
+            "_scores": {nm: {m: np.asarray(s, dtype=float) for m, s in per_lam.items()}
+                        for nm in ("val", "test")}}
+
+
+def test_lam_ensemble_is_off_by_default() -> None:
+    import scripts.neuroprobe.v3_board_readout as B
+    assert B.LAM_ENSEMBLE is False
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    cells = _grid_cells({("enc12", "std"): _lam_tap({1.0: [1, 2, 3, 4], 10.0: [1, 2, 4, 3]}, y, y)},
+                        y, y)
+    assert set(cells) == {"enc12|std"}
+
+
+def test_lam_ensemble_leaves_the_per_tap_column_bit_identical(monkeypatch) -> None:
+    """Same invariant as the other two flags: extra columns only, never a moved number."""
+    import scripts.neuroprobe.v3_board_readout as B
+    y = np.array([0.0, 0.0, 1.0, 1.0, 0.0, 1.0])
+    mk = lambda: {("enc12", "std"): _lam_tap(
+        {1.0: [1, 5, 3, 4, 2, 6], 10.0: [2, 1, 5, 4, 3, 6], 100.0: [1, 3, 4, 6, 2, 5]}, y, y)}
+    off = _grid_cells(mk(), y, y)
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    on = _grid_cells(mk(), y, y)
+    assert on["enc12|std"] == off["enc12|std"]
+
+
+def test_lam_rules_appear_as_their_own_columns_and_carry_their_member_count(monkeypatch) -> None:
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    grid = {("enc12", "std"): _lam_tap(
+        {1.0: [1, 2, 3, 4], 10.0: [1, 2, 4, 3], 100.0: [2, 1, 3, 4], 1000.0: [1, 3, 2, 4]}, y, y)}
+    cells = _grid_cells(grid, y, y)
+    assert {f"{r}:enc12|std" for r in B.LAM_ENS_RULES} <= set(cells)
+    assert cells["lamall:enc12|std"]["n_lam"] == 4
+    assert cells["lam3:enc12|std"]["n_lam"] == 3
+
+
+def test_averaging_over_lambda_fixes_errors_that_no_single_lambda_gets_right(monkeypatch) -> None:
+    """The bet the CS +.0070 oracle gap motivates: each λ misranks a DIFFERENT pair, so no single
+    λ is exact and the val half cannot pick a good one -- but the average over the grid is."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    grid = {("enc12", "std"): _lam_tap({1.0: [3, 1, 2, 4], 10.0: [1, 3, 4, 2]}, y, y)}
+    cells = _grid_cells(grid, y, y)
+    assert cells["enc12|std"]["test"] == 0.75, "no single λ is exact on this fixture"
+    assert cells["lamall:enc12|std"]["test"] == 1.0
+
+
+def test_lamge_keeps_only_lambdas_within_the_val_slack(monkeypatch) -> None:
+    """`lamge` is the val-neighbourhood rule: a λ the val half rates far worse is not a peer, and
+    including it would turn the ensemble into a plain grid average (which `lamall` already is)."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+    good, near, awful = [1.0, 2, 3, 4, 5, 6], [2.0, 1, 3, 4, 5, 6], [6.0, 5, 4, 3, 2, 1]
+    grid = {("enc12", "std"): _lam_tap({1.0: good, 10.0: near, 100.0: awful}, y, y)}
+    cells = _grid_cells(grid, y, y)
+    assert cells["lamall:enc12|std"]["n_lam"] == 3
+    assert cells["lamge:enc12|std"]["n_lam"] == 2, "the anti-correlated λ must fall outside the band"
+
+
+def test_lam_ensemble_needs_at_least_two_lambdas(monkeypatch) -> None:
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    cells = _grid_cells({("enc12", "std"): _lam_tap({1.0: [1, 2, 3, 4]}, y, y)}, y, y)
+    assert not any(k.startswith(("lamall:", "lam3:", "lamge:")) for k in cells)
+
+
+def test_a_nan_val_lambda_is_excluded_from_every_member_set(monkeypatch) -> None:
+    """A degenerate λ has no val opinion; ranking it as worst would still let it into `lamall`."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    g = _lam_tap({1.0: [1, 2, 3, 4], 10.0: [1, 2, 4, 3], 100.0: [4, 3, 2, 1]}, y, y)
+    g["val"][100.0] = float("nan")
+    cells = _grid_cells({("enc12", "std"): g}, y, y)
+    assert cells["lamall:enc12|std"]["n_lam"] == 2
+
+
+def test_lam_ensemble_columns_can_never_become_tap_ensemble_members(monkeypatch) -> None:
+    """Both flags on at once. The tap ensemble is built from `cells` BEFORE the λ columns are
+    added, so ens:all must average the two real taps only -- otherwise a member would be a
+    derived column and the ensemble would double-count one tap."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "TAP_ENSEMBLE", True)
+    monkeypatch.setattr(B, "LAM_ENSEMBLE", True)
+    y = np.array([0.0, 0.0, 1.0, 1.0])
+    grid = {("enc12", "std"): _lam_tap({1.0: [1, 2, 3, 4], 10.0: [1, 2, 4, 3]}, y, y),
+            ("enc9", "std"): _lam_tap({1.0: [2, 1, 3, 4], 10.0: [1, 3, 2, 4]}, y, y)}
+    cells = _grid_cells(grid, y, y)
+    assert cells["ens:all|std"]["ens_members"] == "enc12|std|enc9|std"
+    assert {f"lamall:{t}|std" for t in ("enc12", "enc9")} <= set(cells)
+
+
+def test_lam_ensemble_runs_end_to_end_through_the_real_ridge(monkeypatch) -> None:
+    """INTEGRATION: the 25-point production grid, a real fit, real fold averaging."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "LAM_ENSEMBLE", True)
+    got = mod._ws_cell(_rec(), "onset", ("enc12",))
+    assert set(got["cells"]) == {"enc12|std"} | {f"{r}:enc12|std" for r in mod.LAM_ENS_RULES}
+    for r in mod.LAM_ENS_RULES:
+        assert not np.isnan(got["cells"][f"{r}:enc12|std"]["test"])
+
+
+def test_ws_folding_carries_ensemble_membership_through(monkeypatch) -> None:
+    """WS rebuilds each cell from a FIXED field list after fold-averaging -- the drop that made
+    --dump-lam-grid produce empty WS shards. The ensemble AUROC survives it (it is its own cell),
+    but the membership would not, leaving a column no one can audit."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    monkeypatch.setattr(mod, "TAP_ENSEMBLE", True)
+    monkeypatch.setattr(mod, "LAM_ENSEMBLE", True)
+    rec = _rec()
+    rec["feats"]["enc12_elec"] = rec["feats"]["enc12"]
+    got = mod._ws_cell(rec, "onset", ("enc12_elec", "enc12"))["cells"]
+    assert got["ens:all|std"]["ens_members"] == ["enc12_elec|std|enc12|std"] * 2
+    assert got["lam3:enc12|std"]["n_lam"] == [3, 3], "one entry per fold"

@@ -162,7 +162,18 @@ def _rows_board_ft():
                 key = (rec["regime"], rec["cell"], rec["task"])
                 folds.setdefault(key, []).append(rec)
             for (regime, cell, task), rs in sorted(folds.items()):
-                for dec, field in (("ridge", "test_frozen_vallam"), (f"ridge_ft_{k}", "test_c")):
+                decs = [("ridge", "test_frozen_vallam"), (f"ridge_ft_{k}", "test_c")]
+                # EPOCH ENSEMBLES, when the arm ran with --dump-epoch-test. Each is the test AUROC
+                # of a RANK-AVERAGED prediction over a val-only set of epochs, so it is a different
+                # DECODER on the same (arm, regime, tap, cell, task) unit -- exactly what the
+                # decoder column is for. `ens_top1` averages the single selected epoch and is
+                # therefore a copy of test_c BY CONSTRUCTION; it is emitted anyway because a
+                # groupby that shows it drifting from ridge_ft is the cheapest possible alarm that
+                # an arm's curve and its selection came apart.
+                for rule in ("ens_all", "ens_valge0", "ens_top3", "ens_top1"):
+                    if all(rule in r and r[rule] == r[rule] for r in rs):
+                        decs.append((f"ridge_ft_{k}_{rule}", rule))
+                for dec, field in decs:
                     yield dict(family="board_ft", artifact=str(sd), run_id="", arm_tag=arm_tag,
                                regime=regime, tap="enc12", norm="std", decoder=dec, cell=cell,
                                task=task, split="test",

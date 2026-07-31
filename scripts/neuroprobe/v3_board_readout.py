@@ -460,11 +460,17 @@ def _lam_grid(z_tr, y_tr, evals):
         kern = {name: np.asarray(z @ z_tr.T, dtype=np.float64)
                 for name, (z, _) in evals.items()}
     out: dict = {name: {} for name in evals}
+    sc: dict = {name: {} for name in evals}
     with _timed("lam_sweep"):
         for m in LAM_MULTS:
             alpha = V @ (c / (w + m * base))
             for name, (_, y) in evals.items():
-                out[name][m] = (auroc(kern[name] @ alpha, y) if len(y) >= 2 else float("nan"))
+                s = kern[name] @ alpha
+                if _capturing():
+                    sc[name][m] = s
+                out[name][m] = (auroc(s, y) if len(y) >= 2 else float("nan"))
+    if _capturing():
+        out["_scores"] = sc
     return out
 
 
@@ -501,12 +507,17 @@ def _lam_grid_primal(z_tr, y_tr, evals):
         lam = np.asarray(LAM_MULTS, dtype=np.float64) * base
         beta = V @ (c[:, None] / (w[:, None] + lam[None, :]))    # (d, |LAM_MULTS|)
         out: dict = {}
+        sc: dict = {}
         for name, (z, y) in evals.items():
             if len(y) < 2:
                 out[name] = {m: float("nan") for m in LAM_MULTS}
                 continue
             s = np.asarray(z, dtype=np.float64) @ beta           # (n_e, |LAM_MULTS|)
             out[name] = {m: auroc(s[:, i], y) for i, m in enumerate(LAM_MULTS)}
+            if _capturing():
+                sc[name] = {m: s[:, i] for i, m in enumerate(LAM_MULTS)}
+    if _capturing():
+        out["_scores"] = sc
     return out
 
 
@@ -522,6 +533,46 @@ LAM_RULES = ("argmax", "tiemax")
 # and no reported number (test_dump_lam_grid_does_not_move_the_selected_point). Picking λ to
 # maximise the dumped test curve is an ORACLE and must be reported as a ceiling, never a result.
 LAM_GRID_DUMP = False
+
+# --tap-ensemble: rank-average the PREDICTIONS of the per-tap ridges into extra reported columns.
+#
+# 🚫 THIS IS NOT DEPTH CONCAT, which is CLOSED AND NEGATIVE (cs enc9+enc12 -.0007, +enc6 -.0023,
+# +enc3 -.0046, monotone harm over 150 units). Concat fuses taps INSIDE one kernel, where extra
+# blocks dilute the Gram and the single shared λ has to regularize all of them at once. This fits
+# each tap SEPARATELY, with its OWN val-selected λ, and combines only at the score level -- the
+# ordinary ensemble bargain, which pays exactly when the members' ERRORS decorrelate. The
+# interesting pair is therefore not adjacent depths (nearly the same features) but the two UNITS,
+# enc12 vs enc12_elec: parcel-mean and per-electrode are different spatial aggregations of the
+# same tap, so they can be wrong on different trials.
+#
+# Ranks, not raw scores, for the same reason the FT epoch ensemble uses them: AUROC depends only
+# on the ORDER of scores, so a tap whose selected λ is smaller emits larger-magnitude scores and
+# would outvote the rest of a raw mean for a reason that carries no information.
+#
+# ✅ SUBMITTABLE. Every rule below reads the VAL half only -- the same half that already selects λ
+# -- and never test. `ens:all` has no selection at all.
+TAP_ENSEMBLE = False
+ENS_RULES = ("ens:all", "ens:top2", "ens:top3", "ens:auto")
+
+# --lam-ensemble: rank-average the predictions ACROSS λ within a single tap, as extra columns
+# "lamall:<tap>|<norm>" / "lam3:<tap>|<norm>" / "lamge:<tap>|<norm>".
+#
+# WHY THIS AXIS. The λ-grid dump measured the ceiling on the real CS board: val-argmax-λ scores
+# .6094 where the best λ PER UNIT would score .6164 (+.0070, better on 100/150 units). That gap is
+# an ORACLE and not claimable, but it is evidence that the val half picks λ NOISILY -- and
+# averaging over a val-defined NEIGHBOURHOOD of λ is the standard, submittable way to spend that
+# noise. It costs nothing: every λ's scores are already computed for the sweep.
+#
+# ⚠️ NOT the same bet as --tap-ensemble. Members here are the SAME features at adjacent shrinkage,
+# so they are far more correlated than two taps are, and the honest prior is a smaller effect.
+LAM_ENSEMBLE = False
+LAM_ENS_RULES = ("lamall", "lam3", "lamge")
+LAM_ENS_SLACK = 0.01        # `lamge` band: every λ whose val is within this of the best
+
+
+def _capturing() -> bool:
+    """Both ensemble levers need _lam_grid to keep its per-λ score vectors."""
+    return TAP_ENSEMBLE or LAM_ENSEMBLE
 
 # Tie census, accumulated across every ridge fit in a shard and printed once at the end. The
 # LAM_MULTS comment says to MEASURE THE TIE FRACTION FIRST; this is that measurement, taken on the
@@ -594,6 +645,10 @@ def _select_lam(d, rule=None) -> dict:
         # point or KeyError on a grid that differs from the global one.
         out["lam_grid"] = [[float(mm), float(d["val"][mm]), float(d["test"][mm])]
                            for mm in sorted(d["val"])]
+    if "_scores" in d:
+        # The val/test score vectors AT THE SELECTED λ, for _tap_ensembles. Carried on the cell
+        # only until the ensemble is built; _grid_cells strips it before anything is written.
+        out["_sc"] = {nm: s[m] for nm, s in d["_scores"].items() if m in s}
     return out
 
 
@@ -601,9 +656,122 @@ def _cell_key(tap, norm) -> str:
     return f"{tap}|{norm}"
 
 
-def _grid_cells(grid) -> dict:
-    """{(tap,norm): λ-grid} → {"tap|norm": λ-selected result}. Nothing is dropped or fused."""
-    return {_cell_key(t, nm): _select_lam(d) for (t, nm), d in grid.items()}
+def _rank01(s):
+    """Scores → ranks in [0,1]. Order-only, so a tap cannot outvote the others by score SCALE."""
+    s = np.asarray(s, dtype=np.float64)
+    n = len(s)
+    if n < 2:
+        return np.zeros(n, dtype=np.float64)
+    r = np.empty(n, dtype=np.float64)
+    r[np.argsort(s, kind="stable")] = np.arange(n, dtype=np.float64)
+    return r / (n - 1)
+
+
+def _ens_member_sets(names, vals):
+    """{rule → member tap keys}, from the VAL AUROCs and NOTHING else.
+
+    `ens:auto` includes the best SINGLE tap as a candidate, so the rule is allowed to decline to
+    ensemble. Without that it would be forced to average even where averaging hurts, and a rule
+    that cannot say "no" is not a rule -- it is a result waiting to be quoted selectively.
+    """
+    ok = [k for k in names if np.isfinite(vals[k])]
+    if len(ok) < 2:
+        return {}
+    order = sorted(ok, key=lambda k: (-float(vals[k]), k))
+    return {"ens:all": sorted(ok), "ens:top2": sorted(order[:2]), "ens:top3": sorted(order[:3])}
+
+
+def _tap_ensembles(cells, y_va, y_te) -> dict:
+    """Rank-averaged cross-TAP ensembles, per norm. Returns extra cell entries.
+
+    Grouped BY NORM because std and raw are different reported columns, not interchangeable
+    members: averaging a std tap with a raw tap would fuse two columns the board reports
+    separately, which is the same defect class as pooling ws with csession.
+    """
+    if y_va is None or y_te is None or len(y_te) < 2:
+        return {}
+    by_norm: dict = {}
+    for key, c in cells.items():
+        if "_sc" not in c or "val" not in c["_sc"] or "test" not in c["_sc"]:
+            continue
+        by_norm.setdefault(key.split("|", 1)[1], []).append(key)
+    out: dict = {}
+    for norm, keys in by_norm.items():
+        if len(keys) < 2:
+            continue
+        vals = {k: cells[k]["val"] for k in keys}
+        rk = {k: {nm: _rank01(cells[k]["_sc"][nm]) for nm in ("val", "test")} for k in keys}
+
+        def score(members):
+            return {nm: auroc(np.mean([rk[k][nm] for k in members], axis=0),
+                              y_va if nm == "val" else y_te) for nm in ("val", "test")}
+
+        sets = _ens_member_sets(keys, vals)
+        got = {r: score(ms) for r, ms in sets.items()}
+        # `ens:auto` picks among the ensembles AND the best single tap, on VAL alone.
+        best_single = max(keys, key=lambda k: (float(vals[k]), k))
+        cand = list(got.items()) + [("single", {"val": vals[best_single],
+                                                "test": cells[best_single]["test"]})]
+        pick = max(cand, key=lambda kv: (float(kv[1]["val"]), kv[0]))
+        got["ens:auto"] = pick[1]
+        for rule, r in got.items():
+            members = ("|".join(sets[rule]) if rule in sets else
+                       (pick[0] if pick[0] != "single" else best_single))
+            out[f"{rule}|{norm}"] = {"val": float(r["val"]), "test": float(r["test"]),
+                                     "lam_mult": float("nan"), "lam_pin": "",
+                                     "lam_pinned": False, "n_tied": 0, "ens_members": members}
+    return out
+
+
+def _lam_ensembles(grid, y_va, y_te) -> dict:
+    """Rank-averaged WITHIN-tap ensembles over λ. Returns extra cells keyed "<rule>:<tap>|<norm>".
+
+    Every member set is read off the VAL curve -- the same curve that already picks λ -- so no
+    rule here sees test. `lamall` has no selection at all: it averages the whole grid.
+    """
+    if y_va is None or y_te is None or len(y_te) < 2:
+        return {}
+    out: dict = {}
+    for (tap, norm), d in grid.items():
+        scs = d.get("_scores")
+        if not scs or "val" not in scs or "test" not in scs:
+            continue
+        ms = [m for m in sorted(d["val"]) if np.isfinite(d["val"][m]) and m in scs["test"]]
+        if len(ms) < 2:
+            continue
+        best = max(d["val"][m] for m in ms)
+        order = sorted(ms, key=lambda m: (-float(d["val"][m]), m))
+        sets = {"lamall": ms,
+                "lam3": sorted(order[:3]),
+                "lamge": [m for m in ms if d["val"][m] >= best - LAM_ENS_SLACK]}
+        rk = {nm: {m: _rank01(scs[nm][m]) for m in ms} for nm in ("val", "test")}
+        for rule, mem in sets.items():
+            if not mem:
+                continue
+            out[f"{rule}:{tap}|{norm}"] = {
+                "val": float(auroc(np.mean([rk["val"][m] for m in mem], axis=0), y_va)),
+                "test": float(auroc(np.mean([rk["test"][m] for m in mem], axis=0), y_te)),
+                "lam_mult": float("nan"), "lam_pin": "", "lam_pinned": False,
+                "n_tied": 0, "n_lam": len(mem)}
+    return out
+
+
+def _grid_cells(grid, y_va=None, y_te=None) -> dict:
+    """{(tap,norm): λ-grid} → {"tap|norm": λ-selected result}. Nothing is dropped or fused.
+
+    Under --tap-ensemble the per-tap columns are untouched and ADDITIONAL "ens:*|norm" columns are
+    appended; the score vectors that build them are stripped here so nothing extra is written.
+    """
+    cells = {_cell_key(t, nm): _select_lam(d) for (t, nm), d in grid.items()}
+    if TAP_ENSEMBLE:
+        cells.update(_tap_ensembles(cells, y_va, y_te))
+    if LAM_ENSEMBLE:
+        # Built from `grid`, not from `cells`, because it needs EVERY λ's scores, not the selected
+        # one. Ordered after the tap ensemble so a λ-ensemble column can never become a tap member.
+        cells.update(_lam_ensembles(grid, y_va, y_te))
+    for c in cells.values():
+        c.pop("_sc", None)
+    return cells
 
 
 def _parcel_cols(anchor_rec, test_rec):
@@ -666,7 +834,7 @@ def _ws_cell(rec, task, taps) -> dict:
             z_va, z_te = _feat(rec, enc, va), _feat(rec, enc, te)
             _run_norms(grid, enc, z_tr, z_va, z_te, y[tr], y[va], y[te])
         if grid:
-            folds.append(_grid_cells(grid))
+            folds.append(_grid_cells(grid, y[va], y[te]))
     if not folds:
         return {"cells": {}}
     keys = sorted({k for f in folds for k in f})
@@ -677,6 +845,15 @@ def _ws_cell(rec, task, taps) -> dict:
                   "lam_pinned": bool(any(f[k]["lam_pinned"] for f in folds if k in f)),
                   "lam_sat": bool(any(f[k].get("lam_pin") == "hi" for f in folds if k in f)),
                   "lam_mult": [f[k]["lam_mult"] for f in folds if k in f]}
+        # 🔴 THIS DICT IS A FIXED FIELD LIST, so anything a cell grew elsewhere is DROPPED here --
+        # which is exactly why --dump-lam-grid produced empty WS shards while CS/CSession (which
+        # return _grid_cells directly, unfolded) dumped fine. The ensemble AUROCs survive because
+        # they are their own cells with their own "test"; what needs carrying is the audit
+        # metadata that says WHICH members produced them, per fold.
+        for fld in ("ens_members", "n_lam"):
+            got = [f[k][fld] for f in folds if k in f and fld in f[k]]
+            if got:
+                out[k][fld] = got
     return {"cells": out}
 
 
@@ -705,7 +882,7 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
         _run_norms(grid, enc, z_tr, z_va, z_te, y_a[tr], y_t[va], y_t[te], cs=True)
     if not grid:
         return {"cells": {}}
-    return {"cells": _grid_cells(grid), "n_parcels": int(common.size)}
+    return {"cells": _grid_cells(grid, y_t[va], y_t[te]), "n_parcels": int(common.size)}
 
 
 def _elec_cols(train_rec, test_rec):
@@ -765,7 +942,7 @@ def _csession_cell(train_rec, test_rec, task, taps) -> dict:
         _run_norms(grid, enc, z_tr, z_va, z_te, y_a[tr], y_t[va], y_t[te])
     if not grid:
         return {"cells": {}}
-    return {"cells": _grid_cells(grid),
+    return {"cells": _grid_cells(grid, y_t[va], y_t[te]),
             "n_parcels": int(p_common.size) if p_a is not None else 0,
             "n_elec": n_elec}
 
@@ -1069,6 +1246,18 @@ def main() -> None:
                         "and buys every λ rule offline, forever, off one run. Observation only: "
                         "no selection and no reported number moves. 🚫 picking λ to maximise the "
                         "dumped TEST curve is an ORACLE, a ceiling, never a result.")
+    p.add_argument("--tap-ensemble", action="store_true",
+                   help="ALSO report rank-averaged cross-TAP ensemble columns (ens:all / ens:top2 "
+                        "/ ens:top3 / ens:auto, per norm). Each tap keeps its own val-selected λ "
+                        "and is fit separately; only the predictions are combined, so this is NOT "
+                        "depth concat (closed, negative). Every rule reads the val half only. "
+                        "Per-tap columns are unchanged.")
+    p.add_argument("--lam-ensemble", action="store_true",
+                   help="ALSO report rank-averaged WITHIN-tap ensembles over λ as "
+                        "lamall:/lam3:/lamge: columns. The λ-grid dump measured a +.0070 ORACLE "
+                        "gap on the CS board, i.e. val picks λ noisily; averaging a val-defined "
+                        "neighbourhood is the submittable way to spend that. Val-only, free "
+                        "(the grid is already swept), per-tap columns unchanged.")
     p.add_argument("--pool-d", type=int, default=256,
                    help="model width d, used to reshape a unit's cached (k_full*d) block before a "
                         "gpool:/bpool: mean. Asserted to divide the real width.")
@@ -1078,13 +1267,17 @@ def main() -> None:
     args = p.parse_args()
 
     global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE, POOL_D, POOL_BANDS, LAM_GRID_DUMP
+    global TAP_ENSEMBLE, LAM_ENSEMBLE
     REPORT_STD_TARGET = args.std_target
     LAM_RULE = args.lam_rule
     LAM_GRID_DUMP = args.dump_lam_grid
+    TAP_ENSEMBLE = args.tap_ensemble
+    LAM_ENSEMBLE = args.lam_ensemble
     POOL_D = args.pool_d
     POOL_BANDS = tuple(int(b) for b in args.pool_bands.split(",") if b.strip())
     print(f"[check] lam_rule={LAM_RULE} (published board = argmax) "
-          f"lam_grid_dump={LAM_GRID_DUMP}", flush=True)
+          f"lam_grid_dump={LAM_GRID_DUMP} tap_ensemble={TAP_ENSEMBLE} "
+          f"lam_ensemble={LAM_ENSEMBLE}", flush=True)
     if args.elec_labels_sidecar:
         with open(args.elec_labels_sidecar, "rb") as fh:
             _ELEC_LABELS_SIDECAR = pickle.load(fh)
