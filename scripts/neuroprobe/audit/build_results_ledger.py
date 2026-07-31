@@ -56,6 +56,23 @@ FIELDS = ["family", "artifact", "run_id", "arm_tag", "regime", "tap", "norm",
           "decoder", "cell", "task", "split", "value"]
 
 
+# Readout columns that are a DECODER over one tap rather than a tap. The rules that pool or
+# average within a single tap keep that tap; the ones whose input is a SET of layers report
+# tap="multi", because inventing a tap named "ens:auto" would put a phantom layer in any
+# groupby over depth.
+_ONE_TAP_RULES = ("gpool", "bpool", "lamall", "lam3", "lamge")
+
+
+def _split_col(tap: str) -> tuple[str, str]:
+    """"lam3:enc12" -> ("enc12", "ridge_lam3"); "ens:auto" -> ("multi", "ridge_ens_auto")."""
+    rule, sep, base = tap.partition(":")
+    if not sep:
+        return tap, "ridge"
+    if rule in _ONE_TAP_RULES:
+        return base, f"ridge_{rule}"
+    return "multi", f"ridge_{rule}_{base}"
+
+
 def _rows_board():
     """results/r6_era/board/shards_<tag>/<regime>_<cell>.json -- the trustworthy board source."""
     for sd in sorted(R6.glob("board/shards_*")):
@@ -67,11 +84,12 @@ def _rows_board():
                 arm_tag, task = (key.split("|") + [key])[:2] if "|" in key else (tag, key)
                 for col, v in rec.get("cells", {}).items():
                     tap, _, norm = col.partition("|")
+                    tap, decoder = _split_col(tap)
                     for split in ("val", "test"):
                         if split in v:
                             yield dict(family="board", artifact=str(sd), run_id="",
                                        arm_tag=arm_tag, regime=regime, tap=tap, norm=norm,
-                                       decoder="ridge", cell=cell, task=task,
+                                       decoder=decoder, cell=cell, task=task,
                                        split=split, value=v[split])
 
 

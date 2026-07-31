@@ -97,3 +97,68 @@ def test_every_emitted_row_has_exactly_the_ledger_fields(arm):
     rows = arm([_rec(f, **{r: 0.93 for r in RULES}) for f in (0, 1)])
     for r in rows.values():
         assert set(r) == set(BRL.FIELDS)
+
+
+# --- the frozen-board reader: score-level ensemble columns ------------------------------------
+#
+# `_rows_board` splits a shard column on "|" into tap|norm and stamps decoder="ridge". That is
+# right for a plain tap ("enc12|std") and WRONG for a score-level ensemble, which is a different
+# DECODER over the same features. Left unfixed, a groupby on tap would sprout phantom taps named
+# "ens:auto" and a groupby on decoder would show every ensemble hiding inside "ridge".
+
+@pytest.fixture
+def board(tmp_path, monkeypatch):
+    """Writes one frozen-board shard and returns its rows keyed by (tap, decoder)."""
+    sd = tmp_path / "board" / "shards_ens_cs"
+    sd.mkdir(parents=True)
+    monkeypatch.setattr(BRL, "R6", tmp_path)
+
+    def write(cols):
+        json.dump({"kind": "cs", "name": "sub3",
+                   "cells": {"onset": {"cells": cols}}}, open(sd / "cs_sub3.json", "w"))
+        return {(r["tap"], r["decoder"]): r for r in BRL._rows_board()
+                if r["split"] == "test"}
+    return write
+
+
+def test_a_plain_tap_column_is_untouched(board):
+    rows = board({"enc12|std": {"test": 0.61, "val": 0.60}})
+    assert set(rows) == {("enc12", "ridge")}
+    assert rows[("enc12", "ridge")]["norm"] == "std"
+    assert rows[("enc12", "ridge")]["value"] == 0.61
+
+
+def test_a_lambda_ensemble_keeps_its_tap_and_moves_the_rule_into_decoder(board):
+    # "lam3:enc12" names its own tap, so the tap survives and only the rule relocates -- which is
+    # what makes `groupby(tap).decoder` a legible comparison of rules AT a fixed tap.
+    rows = board({"lam3:enc12|std": {"test": 0.6092}})
+    assert set(rows) == {("enc12", "ridge_lam3")}
+
+
+def test_a_tap_ensemble_reports_tap_multi_because_its_members_are_a_set(board):
+    # 🔴 The one thing that must NOT happen is inventing tap="ens:auto": a tap is a layer, and
+    # this column has no single layer behind it. "multi" says exactly that, and keeps it from
+    # being averaged into a per-depth ladder.
+    rows = board({"ens:auto|std": {"test": 0.6133}, "ens:top2|std": {"test": 0.6129}})
+    assert set(rows) == {("multi", "ridge_ens_auto"), ("multi", "ridge_ens_top2")}
+
+
+def test_depth_concat_is_also_a_decoder_not_a_tap(board):
+    # Concat is the closed/negative axis, but its columns share the "rule:base" shape, so it has
+    # to land somewhere honest too -- and its base IS a set of layers.
+    rows = board({"cat:enc9+enc12|std": {"test": 0.6088}})
+    assert set(rows) == {("multi", "ridge_cat_enc9+enc12")}
+
+
+def test_time_pooling_keeps_its_tap_because_pooling_is_applied_to_one_tap(board):
+    rows = board({"gpool:enc12|std": {"test": 0.6719}, "bpool:enc12|std": {"test": 0.6711}})
+    assert set(rows) == {("enc12", "ridge_gpool"), ("enc12", "ridge_bpool")}
+
+
+def test_the_ensemble_and_its_control_stay_in_the_same_shard_so_the_delta_is_paired(board):
+    # The whole reason these columns are trustworthy is that the control is recomputed IN-PATH.
+    # If a future edit routed them to different families the pairing would be lost silently.
+    rows = board({"enc12|std": {"test": 0.6094}, "ens:auto|std": {"test": 0.6133}})
+    fams = {r["family"] for r in rows.values()}
+    cells = {r["cell"] for r in rows.values()}
+    assert fams == {"board"} and cells == {"sub3"}
