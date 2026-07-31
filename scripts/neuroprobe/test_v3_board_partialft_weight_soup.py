@@ -26,6 +26,7 @@ saved per-epoch states are not the states the loop actually selected on.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import os
 import sys
 
@@ -143,8 +144,8 @@ def test_soups_reuse_the_prediction_ensembles_index_sets():
 
     states = [[{"tag": torch.tensor([float(i)])}] for i in range(len(vals))]
     out = BFT._weight_soups(vals, states, refit)
-    assert set(out) == {"soup_all", "soup_valge0", "soup_top3", "soup_top1",
-                        "soup_last3", "soup_last5", "soup_swa"}
+    assert set(out) == {"soup_top3", "soup_top1",
+                        "soup_last5", "soup_last10", "soup_last15"}
 
 
 def test_soup_top1_refits_exactly_the_epoch_the_loop_selected():
@@ -189,71 +190,100 @@ def test_nan_val_epochs_are_never_souped():
 
 # ── greedy soup (Wortsman et al. 2022) — the rule with NO free parameter ─────────────────────
 
-def test_greedy_soup_starts_from_the_best_val_epoch():
-    """The published algorithm sorts candidates by val and seeds the soup with the best one. That
-    seed is what makes greedy soup's floor the val-argmax model rather than an arbitrary point."""
-    vals = [0.60, 0.71, 0.65]
-    states = [[{"w": torch.tensor([float(i)])}] for i in range(3)]
-    assert BFT._greedy_soup(vals, states, lambda avg: 0.0)[0] == 1
 
 
-def test_greedy_soup_rejects_a_member_that_does_not_improve_the_soups_val():
-    """THE DEFINING BEHAVIOUR, and what separates it from `valge0`/`last-N`: the criterion is the
-    val of the RESULTING AVERAGE, not the val of the candidate on its own. A member with excellent
-    solo val is still refused if souping it in makes the soup worse."""
-    vals = [0.99, 0.98, 0.97]
-    states = [[{"w": torch.tensor([float(i)])}] for i in range(3)]
-    ing = BFT._greedy_soup(vals, states, lambda avg: 0.5 if avg[0]["w"].item() == 0.0 else 0.1)
-    assert ing == [0], "a candidate that lowers the soup's val was souped in anyway"
 
 
-def test_greedy_soup_accepts_a_member_that_improves_the_soups_val():
-    vals = [0.99, 0.98]
-    states = [[{"w": torch.tensor([0.0])}], [{"w": torch.tensor([2.0])}]]
-    # solo best (w=0) scores 0.5; the average (w=1.0) scores better, so it must be kept
-    ing = BFT._greedy_soup(vals, states, lambda avg: 0.9 if avg[0]["w"].item() == 1.0 else 0.5)
-    assert ing == [0, 1]
 
-
-def test_greedy_soup_never_sees_test():
-    """Submittability. The rule is a function of the val callback alone -- there is no test
-    argument it could read even by accident."""
-    import inspect
-    prm = list(inspect.signature(BFT._greedy_soup).parameters)
-    assert not any("test" in p for p in prm), f"greedy soup takes a test-shaped argument: {prm}"
-
-
-def test_greedy_soup_skips_failed_epochs():
-    vals = [0.60, float("nan"), 0.72]
-    states = [[{"w": torch.tensor([float(i)])}] for i in range(3)]
-    seen = []
-
-    def val_of(avg):
-        seen.append(avg[0]["w"].item())
-        return 0.5
-
-    assert 1 not in BFT._greedy_soup(vals, states, val_of)
-
-
-def test_greedy_soup_on_a_one_epoch_trace_is_that_epoch():
-    assert BFT._greedy_soup([0.6], [[{"w": torch.tensor([1.0])}]], lambda avg: 0.5) == [0]
-
-
-def test_greedy_soup_has_no_free_parameter():
-    """WHY THIS RULE AND NOT last-N. `last3`/`last5` carry an N that we would have to justify --
-    Vaswani used 5 for the base model and 20 for the big one, i.e. they tuned it. Greedy soup has
-    nothing to tune: the val comparison decides the size of the soup. If a threshold or a count
-    ever appears in this signature, that claim is no longer true."""
-    import inspect
-    prm = inspect.signature(BFT._greedy_soup).parameters
-    extra = [n for n, p in prm.items() if p.default is not inspect.Parameter.empty]
-    assert extra == [], f"greedy soup grew a tunable knob: {extra}"
 
 
 def test_every_rule_returns_a_number_on_a_one_epoch_trace():
     """Degenerate cell (FT never ran): the reader must not see a ragged key set."""
     states = [[{"w": torch.tensor([1.0])}]]
     out = BFT._weight_soups([0.6], states, lambda a: 0.61)
-    assert set(out) == {"soup_all", "soup_valge0", "soup_top3", "soup_top1",
-                        "soup_last3", "soup_last5", "soup_swa"}
+    assert set(out) == {"soup_top3", "soup_top1",
+                        "soup_last5", "soup_last10", "soup_last15"}
     assert all(v == pytest.approx(0.61) for v in out.values())
+
+
+# ── EMA weight averaging ─────────────────────────────────────────────────────────────────────
+def test_ema_weights_sum_to_one():
+    """Normalising by the sum IS the bias correction, so there is no warm-up phase where the
+    average is contaminated by the pretrained init."""
+    for n in (1, 2, 5, 24):
+        for tau in (0.5, 0.8, 0.9, 0.95, 0.99):
+            w = BFT._ema_weights(n, tau)
+            assert len(w) == n
+            assert abs(sum(w) - 1.0) < 1e-12, (n, tau, sum(w))
+
+
+def test_ema_weights_are_newest_heaviest_and_strictly_decaying_backwards():
+    w = BFT._ema_weights(5, 0.9)
+    assert w[-1] == max(w)
+    for a, b in zip(w, w[1:]):
+        assert b > a, "later epochs must carry more weight than earlier ones"
+
+
+def test_ema_weights_ratio_is_exactly_tau():
+    """The defining property: consecutive weights differ by the decay, nothing else."""
+    tau = 0.8
+    w = BFT._ema_weights(6, tau)
+    for a, b in zip(w, w[1:]):
+        assert abs(a / b - tau) < 1e-12
+
+
+def test_ema_weights_on_a_one_epoch_trace_is_a_single_full_weight():
+    assert BFT._ema_weights(1, 0.9) == [1.0]
+
+
+def test_ema_weights_rejects_a_decay_outside_the_open_unit_interval():
+    """tau=1 is the uniform mean and tau=0 is argmax-of-last; both are OTHER rules, and silently
+    accepting them here would let a typo relabel a different method as EMA."""
+    for bad in (0.0, 1.0, -0.1, 1.5):
+        with pytest.raises(ValueError):
+            BFT._ema_weights(4, bad)
+
+
+def test_ema_never_reads_val():
+    """The claim we make for EMA that we do NOT make for last-N: the averaging operator is a
+    function of the trajectory length and tau alone. Pin it by signature."""
+    sig = inspect.signature(BFT._ema_weights)
+    assert list(sig.parameters) == ["n", "tau"]
+
+
+def test_weighted_average_states_matches_a_hand_computed_mean():
+    a = [{"w": torch.tensor([0.0, 10.0]), "frozen": torch.tensor([7.0])}]
+    b = [{"w": torch.tensor([2.0, 20.0]), "frozen": torch.tensor([7.0])}]
+    out = BFT._average_states([a, b], [0.25, 0.75])
+    assert torch.allclose(out[0]["w"], torch.tensor([1.5, 17.5]))
+
+
+def test_weighted_average_still_passes_identical_entries_through_untouched():
+    """The bit-exactness guarantee must survive weighting -- a weighted mean of equal floats is no
+    more reliable than an unweighted one."""
+    frozen = torch.tensor([1.0 / 3.0, 2.0 / 7.0])
+    a = [{"w": torch.tensor([0.0]), "frozen": frozen.clone()}]
+    b = [{"w": torch.tensor([1.0]), "frozen": frozen.clone()}]
+    out = BFT._average_states([a, b], [0.3, 0.7])
+    assert torch.equal(out[0]["frozen"], frozen)
+
+
+def test_weighted_average_rejects_a_weight_vector_of_the_wrong_length():
+    a = [{"w": torch.tensor([1.0])}]
+    with pytest.raises(ValueError):
+        BFT._average_states([a, a], [1.0])
+
+
+def test_ema_with_uniform_weights_reproduces_the_plain_mean():
+    """Sanity bridge between the two code paths: pass 1/n explicitly and the weighted path must
+    land where the unweighted one does."""
+    a = [{"w": torch.tensor([0.0, 4.0])}]
+    b = [{"w": torch.tensor([2.0, 8.0])}]
+    uni = BFT._average_states([a, b])
+    wtd = BFT._average_states([a, b], [0.5, 0.5])
+    assert torch.allclose(uni[0]["w"], wtd[0]["w"])
+
+
+def test_ema_taus_are_a_declared_ladder_not_a_single_pinned_value():
+    assert len(BFT.EMA_TAUS) >= 2
+    assert all(0.0 < t < 1.0 for t in BFT.EMA_TAUS)

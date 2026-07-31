@@ -85,7 +85,7 @@ def test_averaging_identical_epochs_is_a_no_op():
     s = rng.normal(size=50)
     y = (rng.random(50) > 0.5).astype(float)
     ens = BFT._epoch_ensembles([0.6, 0.6, 0.6], [s, s.copy(), s.copy()], y, _auroc)
-    assert ens["ens_all"] == pytest.approx(_auroc(s, y))
+    assert ens["ens_last15"] == pytest.approx(_auroc(s, y))
 
 
 def test_a_raw_score_mean_would_be_dominated_but_the_rank_mean_is_not():
@@ -97,7 +97,7 @@ def test_a_raw_score_mean_would_be_dominated_but_the_rank_mean_is_not():
     junk = 1e6 * rng.normal(size=80)                    # no signal, huge scale
     assert _auroc(good.tolist(), y) > 0.95
     raw = _auroc((np.asarray(good) + np.asarray(junk)) / 2, y)
-    ens = BFT._epoch_ensembles([0.9, 0.9], [good, junk], y, _auroc)["ens_all"]
+    ens = BFT._epoch_ensembles([0.9, 0.9], [good, junk], y, _auroc)["ens_last15"]
     assert raw < 0.75, "fixture broken: the raw mean was supposed to be swamped"
     assert ens > raw
 
@@ -125,13 +125,8 @@ def test_the_ensemble_auroc_changes_when_test_scores_change_but_the_index_sets_d
     a = BFT._epoch_ensembles(vals, [rng.normal(size=n) for _ in vals], y, _auroc)
     b = BFT._epoch_ensembles(vals, [rng.normal(size=n) for _ in vals], y, _auroc)
     assert set(a) == set(b)
-    assert a["ens_all"] != b["ens_all"]
+    assert a["ens_last15"] != b["ens_last15"]
 
-
-def test_valge0_keeps_epoch_zero_and_only_epochs_at_least_as_good_on_val():
-    vals = [0.60, 0.55, 0.60, 0.72, 0.59]
-    sets = BFT._ensemble_index_sets(vals)
-    assert sets["ens_valge0"] == [0, 2, 3]
 
 
 def test_top3_takes_the_three_highest_val_epochs():
@@ -145,9 +140,9 @@ def test_top3_ties_break_toward_the_earlier_epoch():
     assert sorted(BFT._ensemble_index_sets(vals)["ens_top3"]) == [0, 1, 2]
 
 
-def test_all_includes_epoch_zero_the_frozen_entry():
+def test_last15_on_a_short_trace_includes_epoch_zero_the_frozen_entry():
     vals = [0.60, 0.71, 0.65]
-    assert BFT._ensemble_index_sets(vals)["ens_all"] == [0, 1, 2]
+    assert BFT._ensemble_index_sets(vals)["ens_last15"] == [0, 1, 2]
 
 
 # ── k=1 must reproduce the published selection ──────────────────────────────────────────────
@@ -180,7 +175,7 @@ def test_nan_val_epochs_are_dropped_not_ranked_as_worst():
     be able to win top1 by comparing false against everything."""
     vals = [0.60, float("nan"), 0.72]
     sets = BFT._ensemble_index_sets(vals)
-    assert 1 not in sets["ens_all"]
+    assert 1 not in sets["ens_last15"]
     assert sets["ens_top1"] == [2]
 
 
@@ -190,8 +185,8 @@ def test_a_single_epoch_trace_still_produces_every_rule():
     rng = np.random.default_rng(7)
     y = (rng.random(20) > 0.5).astype(float)
     ens = BFT._epoch_ensembles([0.6], [rng.normal(size=20)], y, _auroc)
-    assert set(ens) == {"ens_all", "ens_valge0", "ens_top3", "ens_top1",
-                        "ens_last3", "ens_last5", "ens_swa"}
+    assert set(ens) == {"ens_top3", "ens_top1",
+                        "ens_last5", "ens_last10", "ens_last15"}
     assert all(np.isfinite(v) for v in ens.values())
 
 
@@ -210,53 +205,15 @@ def test_lastn_is_the_tail_of_a_GIVEN_trace_and_does_not_reorder_it_by_val():
 
     That mismatch is also why last-N is a poor fit here and is reported as a reference point
     rather than the headline: our tail sits ~15 epochs past the val optimum at ~80% of peak LR,
-    where Vaswani's tail was the converged end of the run. The headline rule is greedy soup."""
+    where Vaswani's tail was the converged end of the run. It is reported as a reference point."""
     good = BFT._ensemble_index_sets([0.9, 0.1, 0.1, 0.1, 0.1, 0.1])
     bad = BFT._ensemble_index_sets([0.1, 0.9, 0.9, 0.9, 0.9, 0.9])
-    assert good["ens_last3"] == [3, 4, 5] == bad["ens_last3"]
+    assert good["ens_last5"] == [1, 2, 3, 4, 5] == bad["ens_last5"]
     assert good["ens_last5"] == [1, 2, 3, 4, 5] == bad["ens_last5"]
 
 
-def test_swa_runs_from_the_val_argmax_epoch_to_the_END_of_the_trace():
-    """SWA WITH swa_start = THE VAL-ARGMAX EPOCH -- how patience and the averaging window are
-    reconciled, and the rule with the fewest numbers to defend.
-
-    `last-N` needs an N, and its window lands ~15 epochs PAST the optimum because patience-15 is
-    what ends the run. This instead STARTS at the optimum and runs to the end, so the window
-    length is set by patience rather than by a second constant nobody derived: one parameter, not
-    two. It is also SWA's actual shape -- SWA averages everything after a start point, not a
-    fixed-size tail -- and under the constant LR this file now uses, the post-argmax epochs are
-    samples from the same stationary distribution, which is exactly what Polyak averaging wants.
-    It also spends the ~15 epochs patience currently computes and discards."""
-    sets = BFT._ensemble_index_sets([0.60, 0.71, 0.65, 0.66, 0.61])
-    assert sets["ens_swa"] == [1, 2, 3, 4], "window must start AT the argmax and run to the end"
 
 
-def test_swa_excludes_everything_before_the_optimum():
-    """The climb up to the optimum is genuinely worse models, not stationary noise, so it must not
-    be averaged in. This is what distinguishes the rule from `ens_all`."""
-    sets = BFT._ensemble_index_sets([0.10, 0.20, 0.90, 0.85])
-    assert sets["ens_swa"] == [2, 3]
-    assert 0 not in sets["ens_swa"] and 1 not in sets["ens_swa"]
 
 
-def test_swa_skips_failed_epochs_inside_its_window():
-    sets = BFT._ensemble_index_sets([0.60, 0.90, float("nan"), 0.7])
-    assert sets["ens_swa"] == [1, 3]
 
-
-def test_swa_on_a_one_epoch_trace_is_that_epoch():
-    assert BFT._ensemble_index_sets([0.6])["ens_swa"] == [0]
-
-
-def test_lastn_is_shorter_than_n_on_a_short_trace_rather_than_erroring():
-    sets = BFT._ensemble_index_sets([0.6, 0.7])
-    assert sets["ens_last3"] == [0, 1]
-    assert sets["ens_last5"] == [0, 1]
-
-
-def test_lastn_skips_failed_epochs_rather_than_averaging_a_nan_in():
-    """Same contract as every other rule: a non-finite val is a failed fit. 'Last 3' means the
-    last 3 epochs that actually produced a model, not indices 3,4,5 whatever happened in them."""
-    sets = BFT._ensemble_index_sets([0.6, 0.7, float("nan"), 0.65, 0.66])
-    assert sets["ens_last3"] == [1, 3, 4]

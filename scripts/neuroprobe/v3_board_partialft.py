@@ -84,6 +84,11 @@ RDO = FTP.RDO
 
 TAP = 12
 SPLIT_AT = 11
+# EMA decays. 1/(1-tau) is the effective window in EPOCHS -- 5 / 10 / 20 -- against runs that
+# reach ~24 epochs under patience 15 with a mean val-argmax near 9. Laddered, not picked: tau is a
+# real free parameter and pre-committing to one value would be asserting a timescale we have never
+# measured. Reported in full so the choice is visible rather than buried.
+EMA_TAUS = (0.8, 0.9, 0.95)
 CERT_ROWS = 256          # rows parity-L0 probes; kept in fp32 regardless of --x11-dtype
 # Every regime's REPORTED tap. ws/csession report the per-electrode tap, cs reports the parcel
 # tap (v3_board_readout.py:115-117) -- this asymmetry is the whole reason --unit exists.
@@ -161,32 +166,37 @@ def _ensemble_index_sets(vals):
     Index 0 is the frozen entry (epoch 0), matching `trace`'s ordering. Non-finite vals are failed
     fits and are dropped: left in, a nan would compare False against everything and could win a
     top-k slot by default. Ties break toward the EARLIER epoch, the same way the training loop's
-    strict `>` does, so `ens_top1` picks exactly the epoch the loop selected."""
-    keys = ("ens_all", "ens_valge0", "ens_top3", "ens_top1", "ens_last3", "ens_last5", "ens_swa")
+    strict `>` does, so `ens_top1` picks exactly the epoch the loop selected.
+
+    THE RULE SET IS DELIBERATELY SMALL (Ben, 07-31): argmax, top3, last-{5,10,15}, and -- computed
+    separately because it is not an index set -- EMA. `ens_all` and `ens_valge0` were CUT: `all`
+    is a no-selection control we never intended to ship and `valge0` smuggles a threshold nobody
+    would defend in a methods paragraph. Greedy soup was cut on COST, not on merit -- it is the
+    one published zero-free-parameter rule here, but it costs a val evaluation per candidate
+    (~25% on the epoch loop) and fairshare does not currently support that.
+    """
+    keys = ("ens_top3", "ens_top1", "ens_last5", "ens_last10", "ens_last15")
     ok = [i for i, v in enumerate(vals) if np.isfinite(v)]
     if not ok:
         return {k: [] for k in keys}
     order = sorted(ok, key=lambda i: (-float(vals[i]), i))
-    base = float(vals[ok[0]])
-    return {"ens_all": list(ok),
-            "ens_valge0": [i for i in ok if float(vals[i]) >= base],
-            "ens_top3": sorted(order[:3]),
+    return {"ens_top3": sorted(order[:3]),
             "ens_top1": [order[0]],
-            # THE CANONICAL WEIGHT-AVERAGING RULE, and the only one here that never reads val:
-            # average the last N checkpoints of the run (Vaswani et al. 2017 used N=5 for the base
-            # transformer; SWA averages the trajectory's tail). Every other rule above is one we
-            # chose and therefore have to defend; this one is the literature's default and is the
-            # head-to-head a reviewer will ask for. It is reported for the prediction ensembles
-            # too, at no extra cost, so weight- and prediction-averaging can be compared under the
-            # SAME epoch set instead of each at its own favourite rule.
-            "ens_last3": ok[-3:],
+            # Average the last N checkpoints of the run (Vaswani et al. 2017; N=5 base, N=20 big).
+            # As a function of a GIVEN trace this does not re-rank by val -- but the end-to-end
+            # procedure IS val-dependent, because patience decides where the trace ENDS. Vaswani
+            # trained to a fixed budget with no early stopping; we do not. So this is "the
+            # literature's default operator applied to a differently-defined window", not a
+            # val-free rule.
+            #
+            # N IS LADDERED, NOT PICKED, because Vaswani tuned theirs per model (5/20) and we have
+            # never measured ours. Against a ~24-epoch trace with mean val-argmax ~9, N=15 spans
+            # roughly argmax->end -- so the ladder already brackets the val-anchored window without
+            # anchoring anything on val. ⚠️ N interacts with PATIENCE: shorten patience and N=15
+            # degenerates toward "all". Do not change one without re-reading the other.
             "ens_last5": ok[-5:],
-            # SWA with swa_start = the val-argmax epoch: average from the optimum to the END of
-            # the run. This is how patience and the averaging window are reconciled -- the window
-            # length IS patience, so there is no second constant to defend, and the ~15 epochs
-            # patience currently computes and throws away become the ingredient list. Unlike
-            # last-N the window starts AT the optimum instead of landing 15 epochs past it.
-            "ens_swa": [i for i in ok if i >= order[0]]}
+            "ens_last10": ok[-10:],
+            "ens_last15": ok[-15:]}
 
 
 def _epoch_ensembles(vals, scores, y_te, auroc):
@@ -205,8 +215,43 @@ def _epoch_ensembles(vals, scores, y_te, auroc):
     return out
 
 
-def _average_states(states):
+def _ema_weights(n, tau):
+    """Normalised exponential-moving-average weights over `n` epoch snapshots, newest heaviest.
+
+    w_t ∝ tau^(n-1-t), then divided by their sum. Dividing by the sum IS the bias correction --
+    the usual `1/(1 - tau^t)` factor is exactly the normaliser of this finite geometric series, so
+    there is no separate correction step and no "the average is contaminated by the init" phase.
+
+    WHY EMA AND NOT A WINDOW. Every other rule here has to answer "which epochs?", and for an
+    early-stopped run that question has no clean answer: last-N inherits Vaswani's N and applies it
+    to a window our patience defines, and anything anchored at the val-argmax reads validation to
+    place its start. EMA has no window, no start index and no count -- it is a smooth decay over
+    the whole trajectory, so the epoch-selection question does not arise. It is also the ONE rule
+    here whose averaging operator never touches val, without qualification.
+
+    🚫 DO NOT justify this by "pretraining already uses EMA". It does NOT. r6 is MAE-only
+    (objective.py:274-275) and the MAE arm reconstructs the token's own |STFT| bins with NO EMA
+    teacher (objective.py:265-268); `EMA_TAU = 0.99925` is live JEPA-arm code on a path r6 never
+    takes. EMA is justified here on its own terms -- no window, no start index -- and nothing else.
+
+    ⚠️ tau IS a free parameter -- EMA trades "which epochs" for "how fast to forget". It is not
+    parameter-free and must not be described as such. 1/(1-tau) is the effective window in epochs:
+    .8 -> 5, .9 -> 10, .95 -> 20, against runs that reach ~24 epochs.
+    """
+    if n <= 0:
+        return []
+    if not (0.0 < tau < 1.0):
+        raise ValueError(f"tau must be in (0, 1), got {tau}")
+    w = [tau ** (n - 1 - t) for t in range(n)]
+    z = sum(w)
+    return [x / z for x in w]
+
+
+def _average_states(states, weights=None):
     """Elementwise mean of N tail-block state lists -> ONE tail-block state list.
+
+    `weights` gives a WEIGHTED mean (used by the EMA rule); it must sum to 1 and match `states`.
+    Default None is the uniform mean every soup rule uses.
 
     Entries IDENTICAL across every member are passed through UNTOUCHED. Only block 12's MLP is
     unfrozen, so most of the block holds the same value at every epoch, and a floating mean of
@@ -220,6 +265,8 @@ def _average_states(states):
     ⚠️ Sound because block 12 is LayerNorm-only (attention.py:80-81) and its positional buffers are
     persistent=False, hence absent from state_dict. A BatchNorm here would need SWA's separate
     running-stat re-estimation pass; see test_v3_board_partialft_weight_soup.py."""
+    if weights is not None and len(weights) != len(states):
+        raise ValueError(f"weights len {len(weights)} != states len {len(states)}")
     first = states[0]
     out = []
     for bi, sd0 in enumerate(first):
@@ -232,44 +279,15 @@ def _average_states(states):
             if not torch.is_floating_point(v0):
                 raise ValueError(
                     f"non-float state entry {k!r} differs across epochs; refusing to average it")
-            avg[k] = torch.stack([m.float() for m in members]).mean(0).to(v0.dtype)
+            stk = torch.stack([m.float() for m in members])
+            if weights is None:
+                avg[k] = stk.mean(0).to(v0.dtype)
+            else:
+                w = torch.tensor(weights, dtype=stk.dtype, device=stk.device)
+                avg[k] = (stk * w.reshape(-1, *([1] * (stk.dim() - 1)))).sum(0).to(v0.dtype)
         out.append(avg)
     return out
 
-
-def _greedy_soup(vals, states, soup_val):
-    """Wortsman et al. 2022 greedy soup, over the epochs of one fine-tune.
-
-    Sort candidates by val, seed the soup with the best one, then walk the rest in order and keep
-    a candidate ONLY if souping it in raises the val of the resulting AVERAGE. The criterion is
-    the soup's val, not the candidate's own -- that is the whole difference from `valge0` and
-    `top-k`, which score each epoch in isolation and can therefore average in members that are
-    individually good but redundant or in tension with what is already in the pot.
-
-    WHY THIS IS THE RULE WE LEAD WITH. It is published, it is a weight-average (so it ships ONE
-    model), and it has NO free parameter -- the val comparison decides how many members go in.
-    `last-N` carries an N that Vaswani et al. themselves tuned per model (5 base / 20 big), and it
-    additionally assumes the run ENDS near its best, which ours does not: patience-15 stopping
-    leaves the tail ~15 epochs past the val optimum at ~80% of peak LR.
-
-    `soup_val` re-measures the averaged weights down the SAME ridge path the training loop used,
-    so the seed's score is directly comparable to the rest. Non-finite vals are failed fits and
-    can never enter. Ties break toward the earlier epoch, matching the loop's strict `>`.
-
-    Returns the ingredient INDICES; the caller averages them and scores test once."""
-    ok = [i for i, v in enumerate(vals) if np.isfinite(v)]
-    if not ok:
-        return []
-    order = sorted(ok, key=lambda i: (-float(vals[i]), i))
-    ing = [order[0]]
-    cur = float(soup_val(_average_states([states[order[0]]])))
-    for i in order[1:]:
-        cand = ing + [i]
-        v = float(soup_val(_average_states([states[j] for j in cand])))
-        # STRICT. A member has to earn its place; on a tie the smaller soup is the simpler model.
-        if np.isfinite(v) and v > cur:
-            ing, cur = cand, v
-    return sorted(ing)
 
 
 def _weight_soups(vals, states, refit):
@@ -440,20 +458,23 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
             _load_tail(enc, st)
             return ridge_now(True)[2]
         soup = _weight_soups([v for _, v, _ in trace], soup_states, _refit)
-        # GREEDY SOUP — the headline rule, and the only one here with no free parameter. It costs
-        # one VAL evaluation per candidate (not test), which is the cheaper half of ridge_now.
         vtrace = [v for _, v, _ in trace]
-
-        def _soup_val(st):
-            _load_tail(enc, st)
-            return ridge_now(False)[0]
-
-        ing = _greedy_soup(vtrace, soup_states, _soup_val)
-        soup["soup_greedy"] = float(_refit(_average_states([soup_states[i] for i in ing]))) \
-            if ing else float("nan")
-        soup["soup_greedy_n"] = float(len(ing))
-        print(f"[greedy] {tag} n_ing={len(ing)} of {len(vtrace)} ing={ing} "
-              f"test={soup['soup_greedy']:.4f}", flush=True)
+        # EMA — the only rule whose averaging operator never reads val at all, and the operator
+        # v3 pretraining already uses (teacher tau=.99925). No window, no start index, no count;
+        # tau is laddered rather than picked because 1/(1-tau) is an effective window in epochs
+        # (5 / 10 / 20) and our runs reach ~24, so the ladder brackets the plausible range instead
+        # of asserting one. Costs len(EMA_TAUS) ridge refits, no extra training.
+        okv = [i for i, v in enumerate(vtrace) if np.isfinite(v)]
+        for tau in EMA_TAUS:
+            key = f"soup_ema{int(round(tau * 100)):02d}"
+            if not okv:
+                soup[key] = float("nan")
+                continue
+            w = _ema_weights(len(okv), tau)
+            soup[key] = float(_refit(_average_states([soup_states[i] for i in okv], w)))
+        print(f"[ema] {tag} n_ep={len(okv)} " + " ".join(
+            f"tau{int(round(t * 100)):02d}={soup[f'soup_ema{int(round(t * 100)):02d}']:.4f}"
+            for t in EMA_TAUS), flush=True)
         # SELF-CHECK, PRINTED NOT ASSUMED, and STRICTER than the ensemble's. Averaging one state is
         # an identity (frozen entries pass through, and the lone member of a mean is itself), so
         # this reloads exactly the weights the loop selected and must reproduce c_test to the bit
