@@ -162,15 +162,25 @@ def _ensemble_index_sets(vals):
     fits and are dropped: left in, a nan would compare False against everything and could win a
     top-k slot by default. Ties break toward the EARLIER epoch, the same way the training loop's
     strict `>` does, so `ens_top1` picks exactly the epoch the loop selected."""
+    keys = ("ens_all", "ens_valge0", "ens_top3", "ens_top1", "ens_last3", "ens_last5")
     ok = [i for i, v in enumerate(vals) if np.isfinite(v)]
     if not ok:
-        return {"ens_all": [], "ens_valge0": [], "ens_top3": [], "ens_top1": []}
+        return {k: [] for k in keys}
     order = sorted(ok, key=lambda i: (-float(vals[i]), i))
     base = float(vals[ok[0]])
     return {"ens_all": list(ok),
             "ens_valge0": [i for i in ok if float(vals[i]) >= base],
             "ens_top3": sorted(order[:3]),
-            "ens_top1": [order[0]]}
+            "ens_top1": [order[0]],
+            # THE CANONICAL WEIGHT-AVERAGING RULE, and the only one here that never reads val:
+            # average the last N checkpoints of the run (Vaswani et al. 2017 used N=5 for the base
+            # transformer; SWA averages the trajectory's tail). Every other rule above is one we
+            # chose and therefore have to defend; this one is the literature's default and is the
+            # head-to-head a reviewer will ask for. It is reported for the prediction ensembles
+            # too, at no extra cost, so weight- and prediction-averaging can be compared under the
+            # SAME epoch set instead of each at its own favourite rule.
+            "ens_last3": ok[-3:],
+            "ens_last5": ok[-5:]}
 
 
 def _epoch_ensembles(vals, scores, y_te, auroc):

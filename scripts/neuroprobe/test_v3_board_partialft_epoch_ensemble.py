@@ -190,5 +190,32 @@ def test_a_single_epoch_trace_still_produces_every_rule():
     rng = np.random.default_rng(7)
     y = (rng.random(20) > 0.5).astype(float)
     ens = BFT._epoch_ensembles([0.6], [rng.normal(size=20)], y, _auroc)
-    assert set(ens) == {"ens_all", "ens_valge0", "ens_top3", "ens_top1"}
+    assert set(ens) == {"ens_all", "ens_valge0", "ens_top3", "ens_top1",
+                        "ens_last3", "ens_last5"}
     assert all(np.isfinite(v) for v in ens.values())
+
+
+# ── the CANONICAL rule: last-N, no val selection ────────────────────────────────────────────
+
+def test_lastn_is_the_tail_of_the_trace_and_ignores_val_entirely():
+    """THE TEXTBOOK RULE. Vaswani et al. 2017 averaged the LAST N checkpoints of one run; SWA
+    averages the tail of the trajectory. Neither consults validation. Every other rule here is
+    val-selected, which makes them ours to defend -- this one is the literature's, and it is the
+    comparison a reviewer will ask for. Its defining property is that val cannot move it."""
+    good = BFT._ensemble_index_sets([0.9, 0.1, 0.1, 0.1, 0.1, 0.1])
+    bad = BFT._ensemble_index_sets([0.1, 0.9, 0.9, 0.9, 0.9, 0.9])
+    assert good["ens_last3"] == [3, 4, 5] == bad["ens_last3"]
+    assert good["ens_last5"] == [1, 2, 3, 4, 5] == bad["ens_last5"]
+
+
+def test_lastn_is_shorter_than_n_on_a_short_trace_rather_than_erroring():
+    sets = BFT._ensemble_index_sets([0.6, 0.7])
+    assert sets["ens_last3"] == [0, 1]
+    assert sets["ens_last5"] == [0, 1]
+
+
+def test_lastn_skips_failed_epochs_rather_than_averaging_a_nan_in():
+    """Same contract as every other rule: a non-finite val is a failed fit. 'Last 3' means the
+    last 3 epochs that actually produced a model, not indices 3,4,5 whatever happened in them."""
+    sets = BFT._ensemble_index_sets([0.6, 0.7, float("nan"), 0.65, 0.66])
+    assert sets["ens_last3"] == [1, 3, 4]
