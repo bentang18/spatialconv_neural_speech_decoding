@@ -128,7 +128,8 @@ def _stub_rows(y):
     return np.sort(idx.astype(np.int64))
 
 
-def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col, lams, tag):
+def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col, dcols, lams,
+              tag):
     """Fine-tune block 12's MLP on ``rows['tr']``; return A, C and the epoch trace.
 
     ``feats_tr``/``ybin_tr`` read the TRAIN record; ``feats_ev``/``ybin_ev`` read the TEST record.
@@ -144,10 +145,14 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
     rng = np.random.default_rng(args.seed)
+    # SPLIT BY CONSUMER, NOT BY CONVENIENCE. ``_ridge_eval`` uses y_tr as a TORCH tensor on z's
+    # device (it forms v.T @ y in the dual solve) but hands y_va/y_te to RDO.auroc, which calls
+    # np.asarray -- and that raises on a CUDA tensor (v3_probe_readout_r4.py:93). Keeping all
+    # three on the GPU crashed at the very first ridge_now(True), before any weight moved.
     yt = ybin_tr[tr][:, col]
-    yv = ybin_ev[va][:, col]
-    ye = ybin_ev[te][:, col]
-    stub = _stub_rows(yv.cpu().numpy())
+    yv = ybin_ev[va][:, col].cpu().numpy()
+    ye = ybin_ev[te][:, col].cpu().numpy()
+    stub = _stub_rows(yv)
 
     def ridge_now(want_test):
         """val (+ optionally test) AUROC at val-selected λ on the CURRENT weights."""
@@ -163,7 +168,7 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
     # ── A: the frozen board entry, recomputed in-path (ep 0) ────────────────────────────────
     v0, _t0const, a_test, a_df = ridge_now(True)
     best = {"val": float(v0), "epoch": 0, "state": None}
-    trace = [(0, float(v0))]
+    trace = [(0, float(v0), float(a_test) if args.dump_epoch_test else None)]
     t0 = time.time()
     n_ep = 0
     for ep in range(1, args.epochs + 1):
@@ -175,10 +180,10 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         for s in range(0, len(order), args.train_batch):
             pos = order[s:s + args.train_batch]
             z = feats_tr(tr[pos], True).reshape(len(pos), -1)
-            # Multitask in its ONLY safe form: all 15 label COLUMNS on the primary task's own
-            # train rows (pilot :677). Extra rows would be leakage — the 15 board tasks do NOT
+            # WHICH LABEL COLUMNS DRIVE THE UPDATE — see --driver-tasks. Always on the primary
+            # task's own train rows; extra ROWS would be leakage, since the 15 board tasks do NOT
             # share a partition (audit/board_split_signature.py).
-            loss = FTP._loo_ridge_risk(z, ybin_tr[tr[pos]], msk_tr[tr[pos]])
+            loss = FTP._loo_ridge_risk(z, ybin_tr[tr[pos]][:, dcols], msk_tr[tr[pos]][:, dcols])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 3.0)
@@ -186,8 +191,18 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         sched.step()
         enc.eval()
         # THE 10% CUT: val only. Test is computed once, at the end, on the restored best state.
-        cv = ridge_now(False)[0]
-        trace.append((ep, float(cv)))
+        # --dump-epoch-test BUYS THE CUT BACK (n_te/(4*n_tr+n_va+n_te) = ~10% per epoch) to record
+        # the test curve alongside val. OBSERVATION ONLY, and provably so: _ridge_eval builds
+        # val_const from k_va and y_va alone (v3_ws_partialft_pilot.py:250), so the val trace,
+        # `best`, and the selected epoch are bit-identical either way -- asserted in
+        # test_board_partialft_epoch_curve.py. 🚫 The curve is a MEASUREMENT of how much headroom
+        # val-selection leaves on the table; selecting an epoch ON it is the winner's curse that
+        # already cost us a 10x shrink, so the reported number still comes from a val-fixed rule.
+        if args.dump_epoch_test:
+            cv, _, ct, _ = ridge_now(True)
+        else:
+            cv, ct = ridge_now(False)[0], None
+        trace.append((ep, float(cv), None if ct is None else float(ct)))
         if np.isfinite(cv) and cv > best["val"]:
             best = {"val": float(cv), "epoch": ep,
                     "state": copy.deepcopy([b.state_dict() for b in enc.blocks[SPLIT_AT:TAP]])}
@@ -203,10 +218,13 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         c_test = ridge_now(True)[2]
     sec = (time.time() - t0) / max(n_ep, 1)
     print(f"[cell] {tag} ep*={best['epoch']:3d} A={a_test:.4f} C={c_test:.4f} "
-          f"d={c_test - a_test:+.4f} | df={a_df:.1f}/{len(tr)} | {n_ep}ep {sec:.2f}s/ep "
-          f"n_tr={len(tr)} n_va={len(va)} n_te={len(te)}", flush=True)
-    print(f"[trace] {tag} " + " ".join(f"{e}:{v:.4f}" for e, v in trace), flush=True)
+          f"d={c_test - a_test:+.4f} | df={a_df:.1f}/{len(tr)} | K_drv={len(dcols)} | "
+          f"{n_ep}ep {sec:.2f}s/ep n_tr={len(tr)} n_va={len(va)} n_te={len(te)}", flush=True)
+    print(f"[trace] {tag} " + " ".join(f"{e}:{v:.4f}" for e, v, _ in trace), flush=True)
+    if args.dump_epoch_test:
+        print(f"[tracet] {tag} " + " ".join(f"{e}:{t:.4f}" for e, _, t in trace), flush=True)
     return {"test_frozen_vallam": float(a_test), "test_c": float(c_test),
+            "epoch_curve": [[e, v, t] for e, v, t in trace],
             "d": float(c_test - a_test), "best_epoch": int(best["epoch"]),
             "n_epochs_run": int(n_ep), "sec_per_epoch": float(sec), "ridge_df": float(a_df),
             "n_tr": int(len(tr)), "n_va": int(len(va)), "n_te": int(len(te))}
@@ -230,15 +248,42 @@ def main() -> None:
     p.add_argument("--unit", choices=("parcel", "elec"), default=None,
                    help="override the regime default; for the one-session smoke test only")
     p.add_argument("--tasks", default=None, help="comma list; default = all 15 board tasks")
+    p.add_argument("--driver-tasks", default="report",
+                   help="WHICH label columns enter _loo_ridge_risk: 'report' (default, ONLY the "
+                        "reported task), 'all' (every board task), or a comma list. This is the "
+                        "single knob that was silently different from the pilot: the pilot's "
+                        "--multitask meant K=4 HOMOGENEOUS language/acoustic columns, the board "
+                        "made it K=15 including visual tasks whose frozen AUROC is at chance "
+                        "(frame_brightness A=0.507). _loo_ridge_risk normalizes by m2.sum(), so a "
+                        "column is weighted by its LABEL COUNT, not by how much signal it "
+                        "carries: unfittable columns contribute large irreducible residuals and "
+                        "near-noise gradient. 'report' is also the only setting under which the "
+                        "driver is what its own docstring claims -- 'the generalization risk of "
+                        "EXACTLY the estimator we report' -- and the only one that touches no "
+                        "other task's labels, which matters for a leaderboard submission.")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--dump-epoch-test", action="store_true",
+                   help="Also evaluate TEST every epoch and record it in `epoch_curve` + a "
+                        "[tracet] log line. Costs ~10%% wall (one extra n_te forward per epoch) "
+                        "and buys the whole selection-rule family offline, forever, off one run. "
+                        "Observation only -- val, `best` and the selected epoch are unchanged. "
+                        "🚫 NOT a selection input: picking the epoch that maximises this curve is "
+                        "an ORACLE, and must be reported as a ceiling, never as a result.")
     p.add_argument("--warmup-epochs", type=int, default=0,
                    help="0: the ridge driver has no head to align, so REVE's first step is a no-op")
     p.add_argument("--fwd-batch", type=int, default=256)
     p.add_argument("--train-batch", type=int, default=128)
-    p.add_argument("--x11-device", choices=("cuda", "cpu"), default="cuda")
+    # 🔴 CPU IS THE DEFAULT AND cuSOLVER IS WHY. At fp16 the tap is 40.1 GiB, which "fits" in a
+    # 96 GB GH200 -- and then torch.linalg.eigh dies with CUSOLVER_STATUS_INTERNAL_ERROR on
+    # cusolverDnCreate (job 2790794). cuSOLVER allocates its handle and workspace OUTSIDE PyTorch's
+    # caching allocator, so a tap large enough to make the allocator claim most of HBM starves it
+    # even though the eigh itself is tiny (n x n, n ~ 1.6k). Host residency costs an index_select
+    # copy per minibatch and buys back the whole eigensolver. Keeping the tap off the GPU also
+    # leaves --mem as the only thing to reason about, which is what the billing math wants.
+    p.add_argument("--x11-device", choices=("cuda", "cpu"), default="cpu")
     p.add_argument("--x11-dtype", choices=("fp32", "fp16"), default="fp32",
                    help="dtype of the cached tap-11. fp32 is the safe default and what the pilot "
                         "used. fp16 HALVES it (measured 80 GiB -> 40 GiB on a 13,592-window board "
@@ -281,6 +326,7 @@ def main() -> None:
     print(f"[board-ft] regime={args.regime} cell=S{cell[0]}T{cell[1]} "
           f"train=S{train_cell[0]}T{train_cell[1]} unit={unit} "
           f"rowspace_tasks={len(tasks)} reporting={len(report_tasks)} "
+          f"driver_tasks={args.driver_tasks} "
           f"lams={len(lams)} (board grid) lr={args.lr} wd={args.wd} patience={args.patience} "
           f"device={device}", flush=True)
     print("[board-ft] A = frozen block12 + val-selected ridge (the published entry, recomputed "
@@ -524,6 +570,19 @@ def main() -> None:
         # multitask driver are built over — not into the reporting subset.
         ti = tasks.index(task)
         y_a, y_t = y_tr_all[:, ti], y_ev_all[:, ti]
+        # Resolve the DRIVER columns for this cell. Built per-task because 'report' depends on
+        # which task is being reported. Printed per cell so the log, not a memo, is the record of
+        # what actually drove the weights.
+        if args.driver_tasks == "report":
+            dcols = [ti]
+        elif args.driver_tasks == "all":
+            dcols = list(range(len(tasks)))
+        else:
+            want = [t.strip() for t in args.driver_tasks.split(",") if t.strip()]
+            bad = [t for t in want if t not in tasks]
+            if bad:
+                raise SystemExit(f"--driver-tasks names unknown board tasks {bad}")
+            dcols = sorted({tasks.index(t) for t in want} | {ti})
         if args.regime == "ws":
             folds = sorted(tgt_ev.ws_split[task].items())
             plan = [(f, {"tr": _finite(y_a, sp["train"]), "va": _finite(y_t, sp["val"]),
@@ -542,7 +601,7 @@ def main() -> None:
                 args, enc,
                 lambda r_, g_, s_=sel_tr: feats_tr_raw(r_, g_, s_),
                 lambda r_, g_, s_=sel_ev: feats_ev_raw(r_, g_, s_),
-                rows, ybin_tr, ybin_ev, msk_tr, ti, lams,
+                rows, ybin_tr, ybin_ev, msk_tr, ti, dcols, lams,
                 f"S{cell[0]}T{cell[1]} {task:17s} f{fold}")
             results.append(dict(res, regime=args.regime, cell=f"S{cell[0]}T{cell[1]}",
                                 task=task, fold=int(fold), unit=unit,
