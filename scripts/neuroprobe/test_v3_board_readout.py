@@ -626,3 +626,74 @@ def test_is_elec_routes_cats_by_their_parts_not_vacuously() -> None:
     assert mod._is_elec("enc12_elec") and not mod._is_elec("enc12")
     assert mod._is_elec("cat:enc0_elec+enc12_elec")
     assert not mod._is_elec("cat:enc6+enc12")
+
+
+# ── --lam-rule: the val-TIE convention ────────────────────────────────────────────────────────
+# The published board resolves a val tie to the SMALLEST λ purely because _select_lam iterated an
+# ascending tuple with a strict `>`. That is an artifact of tuple order, not a decision. `tiemax`
+# makes the opposite, a-priori-defensible choice. Both read val ONLY, so the switch cannot be a
+# selection-on-test move -- these tests pin exactly that, and that the DEFAULT never moves.
+
+def test_lam_rule_defaults_to_the_published_argmax() -> None:
+    """Every board number to date is argmax. If this default ever flips, past runs stop being
+    reproducible from the same command line -- which is the failure that made the K>1 driver
+    silently change meaning underneath a command that looked identical."""
+    from scripts.neuroprobe.v3_board_readout import LAM_RULE
+    assert LAM_RULE == "argmax"
+
+
+def test_tiemax_takes_the_largest_tied_lambda_argmax_the_smallest() -> None:
+    d = {"val": {1.0: 0.80, 10.0: 0.80, 100.0: 0.80}, "test": {1.0: 0.10, 10.0: 0.50, 100.0: 0.99}}
+    assert _select_lam(d, rule="argmax")["lam_mult"] == 1.0
+    assert _select_lam(d, rule="tiemax")["lam_mult"] == 100.0
+
+
+def test_tiemax_does_not_override_a_genuine_val_winner() -> None:
+    """tiemax is a TIE-break, not a preference for large λ. A strictly better val must still win
+    even when a larger λ is available."""
+    d = {"val": {1.0: 0.90, 10.0: 0.80, 100.0: 0.80}, "test": {1.0: 0.1, 10.0: 0.5, 100.0: 0.9}}
+    for rule in ("argmax", "tiemax"):
+        assert _select_lam(d, rule=rule)["lam_mult"] == 1.0
+
+
+def test_both_rules_agree_when_there_are_no_ties() -> None:
+    d = {"val": {1.0: 0.70, 10.0: 0.90, 100.0: 0.60}, "test": {1.0: 0.1, 10.0: 0.5, 100.0: 0.9}}
+    a, t = _select_lam(d, rule="argmax"), _select_lam(d, rule="tiemax")
+    assert a["lam_mult"] == t["lam_mult"] == 10.0 and a["test"] == t["test"]
+
+
+def test_neither_rule_can_see_test() -> None:
+    """THE LOAD-BEARING INVARIANT. Hold val fixed, vary test arbitrarily: the selected λ must not
+    move under EITHER rule. If it did, --lam-rule would be a test-selection knob, not a
+    convention, and no number produced under it would be submittable."""
+    val = {1.0: 0.80, 10.0: 0.80, 100.0: 0.75}
+    for rule in ("argmax", "tiemax"):
+        picks = {_select_lam({"val": val, "test": t}, rule=rule)["lam_mult"]
+                 for t in ({1.0: 0.9, 10.0: 0.1, 100.0: 0.2},
+                           {1.0: 0.1, 10.0: 0.9, 100.0: 0.2},
+                           {1.0: 0.5, 10.0: 0.5, 100.0: 0.5})}
+        assert len(picks) == 1, f"{rule} moved with test: {picks}"
+
+
+def test_tiemax_resolves_the_pure_tie_AWAY_from_the_lo_pin() -> None:
+    """The confound in test_val_ties_make_the_selected_lambda_depend_on_the_GRID: a dead-flat val
+    is reported as lam_pinned='lo' under argmax, which reads as truncation when nothing was
+    truncated. Under tiemax the same grid pins HI, which the docstring calls BENIGN (AUROC
+    saturates as λ→∞). Same data, opposite flag -- so the flag describes the CONVENTION, not the
+    cell, and neither can be cited as evidence about truncation."""
+    from scripts.neuroprobe.v3_board_readout import LAM_MULTS
+    d = {"val": {m: 1.0 for m in LAM_MULTS}, "test": {m: 0.9 for m in LAM_MULTS}}
+    assert _select_lam(d, rule="argmax")["lam_pinned"] is True
+    hi = _select_lam(d, rule="tiemax")
+    assert hi["lam_pinned"] is False and hi["lam_pin"] == "hi"
+    assert hi["n_tied"] == len(LAM_MULTS)
+
+
+def test_n_tied_counts_only_the_val_maximisers() -> None:
+    d = {"val": {1.0: 0.80, 10.0: 0.80, 100.0: 0.70}, "test": {1.0: 0.1, 10.0: 0.2, 100.0: 0.3}}
+    assert _select_lam(d)["n_tied"] == 2
+
+
+def test_nan_val_still_returns_the_degenerate_record_with_n_tied_zero() -> None:
+    got = _select_lam({"val": {1.0: float("nan")}, "test": {1.0: 0.99}}, rule="tiemax")
+    assert np.isnan(got["test"]) and got["n_tied"] == 0

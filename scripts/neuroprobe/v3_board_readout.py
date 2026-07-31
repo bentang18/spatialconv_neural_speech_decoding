@@ -434,7 +434,16 @@ def _lam_grid_primal(z_tr, y_tr, evals):
     return out
 
 
-def _select_lam(d) -> dict:
+LAM_RULE = "argmax"     # published tie-break. --lam-rule overrides; see _select_lam.
+LAM_RULES = ("argmax", "tiemax")
+
+# Tie census, accumulated across every ridge fit in a shard and printed once at the end. The
+# LAM_MULTS comment says to MEASURE THE TIE FRACTION FIRST; this is that measurement, taken on the
+# real board rather than on the synthetic fixture where the plateau was discovered.
+_TIE_STATS = {"fits": 0, "tied_ge2": 0, "tied_total": 0}
+
+
+def _select_lam(d, rule=None) -> dict:
     """One (tap,norm)'s λ-grid {"val": {m: auroc}, "test": {m: auroc}} → pick argmax VAL.
 
     λ is the ONLY val-selected axis (Ben 2026-07-17). Tap and norm are REPORTED, not selected:
@@ -459,19 +468,38 @@ def _select_lam(d) -> dict:
 
     ``lam_pinned`` is therefore LO-only — it is the one that invalidates a fit. Conflating the two
     costs a full re-run of a 22-shard board for nothing.
+    ``rule`` decides ONLY what happens on a val TIE, and both rules are functions of the val half
+    alone — neither can see test, so switching is not a selection-on-test move.
+
+      "argmax" (DEFAULT, the PUBLISHED rule) — strict `>` over an ascending grid ⇒ a tie keeps the
+               SMALLEST λ, i.e. the LEAST regularized model. Every board number reported to date
+               uses this; it must stay the default so past runs stay reproducible.
+      "tiemax" — a tie keeps the LARGEST λ. Among models the val half rates identically, take the
+               most shrunk one. This is the ordinary convention (cf. the 1-SE rule) and it is
+               a-priori defensible WITHOUT reference to the outcome: a tie carries no information,
+               so the arbitrary order of a tuple should not be what picks the operating point.
+               It has NO free parameter, so it adds no knob to tune against test.
+
+    ⚠️ THE TWO RULES ARE NOT COMPARABLE AS "BETTER" ON ONE BOARD. Whichever wins, it wins partly by
+    luck over an under-determined plateau (see test_widening_the_grid_can_LOWER_a_pinned_cell).
+    Report the rule, fixed in advance; do not run both and quote the max.
     """
-    best = None
-    for m, va in d["val"].items():
-        if np.isnan(va):
-            continue
-        if best is None or va > best["val"]:
-            pin = "lo" if m == LAM_MULTS[0] else ("hi" if m == LAM_MULTS[-1] else "")
-            best = {"val": va, "test": d["test"][m], "lam_mult": float(m),
-                    "lam_pin": pin, "lam_pinned": pin == "lo"}
-    if best is None:
+    rule = LAM_RULE if rule is None else rule
+    finite = [(m, va) for m, va in d["val"].items() if not np.isnan(va)]
+    if not finite:
         return {"val": float("nan"), "test": float("nan"), "lam_mult": float("nan"),
-                "lam_pin": "", "lam_pinned": False}
-    return best
+                "lam_pin": "", "lam_pinned": False, "n_tied": 0}
+    best_val = max(va for _, va in finite)
+    # Insertion order is LAM_MULTS ascending, so tied[0] is the smallest tied λ — exactly what the
+    # strict-`>` loop this replaced selected. That equivalence is what keeps "argmax" byte-faithful.
+    tied = [m for m, va in finite if va == best_val]
+    m = tied[0] if rule == "argmax" else max(tied)
+    _TIE_STATS["fits"] += 1
+    _TIE_STATS["tied_ge2"] += len(tied) > 1
+    _TIE_STATS["tied_total"] += len(tied)
+    pin = "lo" if m == LAM_MULTS[0] else ("hi" if m == LAM_MULTS[-1] else "")
+    return {"val": best_val, "test": d["test"][m], "lam_mult": float(m),
+            "lam_pin": pin, "lam_pinned": pin == "lo", "n_tied": len(tied)}
 
 
 def _cell_key(tap, norm) -> str:
@@ -936,10 +964,16 @@ def main() -> None:
                    help="pickle {'s{S}_t{T}': labels} to attach to records that lack elec_labels "
                         "(caches encoded before the field was stored, e.g. arm0/r4b). Validated "
                         "same-set upstream; _load re-asserts count-match before attaching.")
+    p.add_argument("--lam-rule", choices=LAM_RULES, default="argmax",
+                   help="how a VAL TIE picks λ. argmax (default, the PUBLISHED rule) keeps the "
+                        "smallest tied λ; tiemax keeps the largest. Both read val only. Fix this "
+                        "in advance and report it — do not run both and quote the better one.")
     args = p.parse_args()
 
-    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR
+    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE
     REPORT_STD_TARGET = args.std_target
+    LAM_RULE = args.lam_rule
+    print(f"[check] lam_rule={LAM_RULE} (published board = argmax)", flush=True)
     if args.elec_labels_sidecar:
         with open(args.elec_labels_sidecar, "rb") as fh:
             _ELEC_LABELS_SIDECAR = pickle.load(fh)
@@ -965,6 +999,16 @@ def main() -> None:
         with open(out, "w") as f:
             json.dump(sh, f, indent=2)
         print(f"wrote {out}", flush=True)
+        # THE PRECONDITION FOR --lam-rule, printed rather than assumed. If tied_ge2 is ~0 on the
+        # real board then argmax and tiemax are the SAME function here and the switch is not worth
+        # a run -- the tied plateau was found on a synthetic fixture and need not survive at
+        # n_va~875. Like _phase_report this is the PARENT's census only: with --workers>1 the
+        # children's counters die with them, so read it from a workers=1 shard.
+        _f, _t = _TIE_STATS["fits"], _TIE_STATS["tied_ge2"]
+        print(f"[check] lam ties: {_t}/{_f} fits had >=2 tied λ "
+              f"({100.0 * _t / _f if _f else 0.0:.1f}%), mean tied λ per fit "
+              f"{_TIE_STATS['tied_total'] / _f if _f else 0.0:.2f} of {len(LAM_MULTS)} "
+              f"[workers={args.workers}: parent-only if >1]", flush=True)
         # Phase totals are per-PROCESS: with --workers>1 the children's timers die with them,
         # so this table is the parent's view (load + merge) only. Profile with --workers 1.
         _phase_report(f"{args.mode} {sh['name']} workers={args.workers} "
