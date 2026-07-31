@@ -6,7 +6,13 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=08:00:00
+#SBATCH --time=02:00:00
+# 🔴 WALLTIME IS A BACKFILL KNOB, NOT A SAFETY MARGIN. 08:00:00 was a guess made before anything
+# had run and it prices the job out of every backfill window on a busy ghx4. MEASURED on the
+# 4-cell ws dress rehearsal (job 2791150, all 15 tasks x 2 folds = 30 cell-runs per task):
+# 46:01 / 51:21 / 61:27 / 63:06. csession is 15 runs but pays two tap-11 encodes (~64 min); cs is
+# 15 shorter runs on the lighter parcel unit (~35 min). 2h covers ws/csession with margin; pass
+# --time=01:30:00 for cs.
 #SBATCH --output=/projects/bhqk/htang13/logs/%x_%A_%a.out
 #
 #   sbatch --array=0-11 --mem=113560M  v3_board_partialft.sbatch <CKPT> ws       <CACHE> <TAG> <OUTDIR> --x11-dtype fp16
