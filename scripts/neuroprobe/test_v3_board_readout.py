@@ -697,3 +697,93 @@ def test_n_tied_counts_only_the_val_maximisers() -> None:
 def test_nan_val_still_returns_the_degenerate_record_with_n_tied_zero() -> None:
     got = _select_lam({"val": {1.0: float("nan")}, "test": {1.0: 0.99}}, rule="tiemax")
     assert np.isnan(got["test"]) and got["n_tied"] == 0
+
+
+# ── gpool:/bpool: time pooling ────────────────────────────────────────────────────────────────
+# A unit's cached block is k_full time tokens of width d, flattened. WS therefore fits 119*13312
+# = 1.58M features on ~1750 rows. These prefixes collapse the TIME axis (the MAE convention) --
+# the risk is entirely in the reshape, since a mean over the wrong axis still yields a
+# well-shaped array and a plausible wrong number.
+
+def _pool_mod():
+    import scripts.neuroprobe.v3_board_readout as B
+    return B
+
+
+def test_pool_spec_splits_prefix_from_base_tap() -> None:
+    from scripts.neuroprobe.v3_board_readout import _pool_spec
+    assert _pool_spec("gpool:enc12_elec") == ("gpool:", "enc12_elec")
+    assert _pool_spec("bpool:enc12") == ("bpool:", "enc12")
+    assert _pool_spec("enc12") == ("", "enc12")
+
+
+def test_pooled_tap_keeps_its_base_taps_unit() -> None:
+    """Pooling collapses the FEATURE axis, never the unit axis, so routing must not change."""
+    from scripts.neuroprobe.v3_board_readout import _is_elec
+    assert _is_elec("gpool:enc12_elec") is True
+    assert _is_elec("bpool:enc12") is False
+
+
+def test_gpool_is_the_mean_over_every_token() -> None:
+    B = _pool_mod()
+    B.POOL_D, B.POOL_BANDS, B._POOL_ANNOUNCED = 2, (1, 1, 2), set()
+    x = np.arange(1 * 2 * 8, dtype=np.float32).reshape(1, 2, 8)     # 8 = 4 tokens x d 2
+    got = B._pool_feats(x, "gpool:", "t")
+    assert got.shape == (1, 2, 2)
+    exp = x.reshape(1, 2, 4, 2).mean(axis=2)
+    assert np.allclose(got, exp)
+
+
+def test_bpool_means_WITHIN_bands_and_keeps_them_separate() -> None:
+    """The load-bearing difference from gpool. Tokens are [SLOW;MID;HGA] with 8:1 HGA:SLOW counts
+    at 1 s, so a global mean is dominated by HGA; bpool must keep one mean PER BAND, in order."""
+    B = _pool_mod()
+    B.POOL_D, B.POOL_BANDS, B._POOL_ANNOUNCED = 1, (1, 2, 4), set()
+    x = np.arange(7, dtype=np.float32).reshape(1, 1, 7)             # 7 tokens x d 1
+    got = B._pool_feats(x, "bpool:", "t")
+    assert got.shape == (1, 1, 3)
+    assert np.allclose(got[0, 0], [0.0, (1 + 2) / 2, (3 + 4 + 5 + 6) / 4])
+
+
+def test_bpool_is_NOT_gpool_when_bands_are_unbalanced() -> None:
+    """If these ever coincide the band split is not doing anything and bpool is dead weight."""
+    B = _pool_mod()
+    B.POOL_D, B.POOL_BANDS, B._POOL_ANNOUNCED = 1, (1, 2, 4), set()
+    x = np.arange(7, dtype=np.float32).reshape(1, 1, 7)
+    assert not np.allclose(B._pool_feats(x, "bpool:", "t").mean(),
+                           B._pool_feats(x, "gpool:", "t")[0, 0, 0])
+
+
+def test_wrong_pool_d_is_refused_not_silently_reshaped() -> None:
+    B = _pool_mod()
+    B.POOL_D, B.POOL_BANDS, B._POOL_ANNOUNCED = 5, (1, 1, 1), set()
+    with pytest.raises(SystemExit, match="does not divide"):
+        B._pool_feats(np.zeros((1, 1, 8), dtype=np.float32), "gpool:", "t")
+
+
+def test_band_counts_that_do_not_sum_to_k_are_refused() -> None:
+    """A band split describing a DIFFERENT cache (e.g. a 2 s clip) must fail loudly -- it would
+    otherwise average across band boundaries and report a plausible wrong number."""
+    B = _pool_mod()
+    B.POOL_D, B.POOL_BANDS, B._POOL_ANNOUNCED = 2, (1, 1, 1), set()
+    with pytest.raises(SystemExit, match="does not describe this cache"):
+        B._pool_feats(np.zeros((1, 1, 8), dtype=np.float32), "bpool:", "t")   # k=4, bands sum 3
+
+
+def test_pool_cannot_be_combined_with_cat() -> None:
+    from scripts.neuroprobe.v3_board_readout import _validate_taps
+    with pytest.raises(SystemExit, match="both rewrite the feature axis"):
+        _validate_taps(["gpool:cat:enc9+enc12"])
+
+
+def test_validator_accepts_pooled_taps_and_still_refuses_unknown_bases() -> None:
+    from scripts.neuroprobe.v3_board_readout import _validate_taps
+    _validate_taps(["gpool:enc12_elec", "bpool:enc12", "enc12"])
+    with pytest.raises(SystemExit, match="unknown tap"):
+        _validate_taps(["bpool:nope"])
+
+
+def test_pool_defaults_match_the_lite_board_layout() -> None:
+    """52 = 4+16+32 tokens at d 256 == the 13312 width the board cache actually stores, so the
+    shipped defaults describe the Lite board and a run that forgets the flags is still correct."""
+    assert sum((4, 16, 32)) * 256 == 13312

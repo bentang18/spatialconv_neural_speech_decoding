@@ -281,15 +281,42 @@ def _standardize_per_domain(z_tr, z_va, z_te):
 
 CAT = "cat:"          # virtual tap: "cat:enc6+enc9+enc12" — depth-concatenated features
 
+# ── TIME POOLING ──────────────────────────────────────────────────────────────────────────────
+# The cache stores (n, |P|, k_full·d): per unit, k_full TIME TOKENS of width d, flattened whole.
+# On the Lite board that is 52·256 = 13312 per electrode, so a WS fit carries 119·13312 = 1.58M
+# features against ~1750 train rows — p/n ~ 900. The MAE/V-JEPA convention is the opposite: mean
+# -pool the final-layer tokens and fit d. These prefixes make that an option instead of a rewrite.
+#
+#   gpool:  mean over ALL k_full tokens        -> d per unit          (the MAE convention)
+#   bpool:  mean WITHIN each band, concatenated -> n_bands·d per unit
+#
+# bpool exists because the token axis is NOT homogeneous: pack_r4 lays tokens out per contact as
+# [SLOW; MID; HGA] with per-band rates (4/16/32 at 1 s), so a global mean is dominated by the band
+# with the most tokens -- HGA outnumbers SLOW 8:1 -- and silently reweights the bands whose
+# separate behaviour is the whole point of the per-band architecture. bpool keeps band identity.
+#
+# NOT combinable with cat:. Both rewrite the feature axis, and stacking them raises the question
+# of whether to pool before or after the hstack; nothing needs the combination, so it is refused.
+POOL_PREFIXES = ("gpool:", "bpool:")
+
+
+def _pool_spec(tap):
+    """(prefix, base_tap) — ('', tap) when `tap` carries no pooling prefix."""
+    for p in POOL_PREFIXES:
+        if tap.startswith(p):
+            return p, tap[len(p):]
+    return "", tap
+
 
 def _cat_parts(tap):
     """The taps a virtual `cat:` tap is built from, or () if `tap` is an ordinary tap."""
+    tap = _pool_spec(tap)[1]
     return tuple(tap[len(CAT):].split("+")) if tap.startswith(CAT) else ()
 
 
 def _have(rec, tap) -> bool:
-    """Is `tap` (ordinary or `cat:`) computable from this record's cached features?"""
-    return all(p in rec["feats"] for p in (_cat_parts(tap) or (tap,)))
+    """Is `tap` (ordinary, `cat:` or pooled) computable from this record's cached features?"""
+    return all(p in rec["feats"] for p in (_cat_parts(tap) or (_pool_spec(tap)[1],)))
 
 
 def _validate_taps(taps) -> None:
@@ -304,11 +331,15 @@ def _validate_taps(taps) -> None:
     split one result across two grid keys.
     """
     for t in taps:
+        pre, base = _pool_spec(t)
+        if pre and base.startswith(CAT):
+            raise SystemExit(f"{t!r} combines {pre!r} with {CAT!r}; both rewrite the feature axis "
+                             f"and nothing needs the combination — pool a single tap")
         parts = _cat_parts(t)
         if not parts:
-            if t not in ALL_TAPS:
-                raise SystemExit(f"unknown tap {t!r}; choose from {ALL_TAPS} or "
-                                 f"'{CAT}a+b' over them")
+            if base not in ALL_TAPS:
+                raise SystemExit(f"unknown tap {base!r} in {t!r}; choose from {ALL_TAPS}, "
+                                 f"'{CAT}a+b' over them, or one of {POOL_PREFIXES} on one of them")
             continue
         unknown = [p for p in parts if p not in ALL_TAPS]
         if unknown:
@@ -327,8 +358,47 @@ def _is_elec(tap) -> bool:
     """Does `tap` live in the ELECTRODE index space? A `cat:` tap inherits its parts' unit, and
     `_validate_taps` has already refused a mixed one. Written over `_cat_parts(tap) or (tap,)`
     rather than `all(...)` alone because `all()` over the empty parts tuple of an ordinary PARCEL
-    tap is vacuously True, which would route it down the electrode branch."""
-    return all(p in ELEC_TAPS for p in (_cat_parts(tap) or (tap,)))
+    tap is vacuously True, which would route it down the electrode branch. Pooling collapses the
+    FEATURE axis and never the unit axis, so a pooled tap keeps its base tap's unit."""
+    return all(p in ELEC_TAPS for p in (_cat_parts(tap) or (_pool_spec(tap)[1],)))
+
+
+# Token layout of one unit's cached feature block, needed to pool the time axis. Set from
+# --pool-d / --pool-bands; ASSERTED against the real width on first use rather than trusted, and
+# printed, so a wrong layout is a loud failure instead of a silently mis-shaped mean.
+POOL_D = 256
+POOL_BANDS: tuple = (4, 16, 32)      # SLOW, MID, HGA tokens at 1 s (pack_r4 order: [SLOW;MID;HGA])
+_POOL_ANNOUNCED: set = set()
+
+
+def _pool_feats(x, pre, tap):
+    """(r, U, k·d) fp32 → pooled (r, U, ·). `pre` is a POOL_PREFIXES member.
+
+    The reshape is the whole risk: k and d are NOT recoverable from the cached width alone, so a
+    wrong --pool-d silently means the mean is taken over the wrong axis and every downstream
+    number is wrong-but-plausible. Hence the width assertion and the one-time print.
+    """
+    d, bands = POOL_D, POOL_BANDS
+    f = x.shape[-1]
+    if f % d:
+        raise SystemExit(f"--pool-d {d} does not divide the {tap!r} feature width {f}")
+    k = f // d
+    if pre == "bpool:" and sum(bands) != k:
+        raise SystemExit(f"--pool-bands {bands} sums to {sum(bands)} but {tap!r} has {k} tokens "
+                         f"(width {f} / d {d}) — the band split does not describe this cache")
+    x = x.reshape(x.shape[0], x.shape[1], k, d)
+    if pre == "gpool:":
+        out = x.mean(axis=2)
+    else:
+        cuts = np.cumsum((0,) + tuple(bands))
+        out = np.concatenate([x[:, :, cuts[i]:cuts[i + 1], :].mean(axis=2)
+                              for i in range(len(bands))], axis=2)
+    if tap not in _POOL_ANNOUNCED:
+        _POOL_ANNOUNCED.add(tap)
+        print(f"[check] {pre}{tap}: {f} = {k} tokens x d {d} -> {out.shape[-1]} per unit "
+              f"({'mean over all tokens' if pre == 'gpool:' else f'per-band means {tuple(bands)}'})"
+              f"  [{f / out.shape[-1]:.1f}x reduction]", flush=True)
+    return out
 
 
 def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
@@ -352,12 +422,18 @@ def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
     parts = _cat_parts(enc)
     if parts:
         return np.hstack([_feat(rec, p, rows, col_idx) for p in parts])
+    pre, base = _pool_spec(enc)
     with _timed("gather_fp16"):
-        x = rec["feats"][enc]["raw"][np.asarray(rows, dtype=np.int64)]
+        x = rec["feats"][base]["raw"][np.asarray(rows, dtype=np.int64)]
         if col_idx is not None:
             x = x[:, np.asarray(col_idx, dtype=np.int64)]
     with _timed("to_fp32"):
         x = x.to(torch.float32).numpy()
+        # Pool BEFORE the flatten: after reshape(r,-1) the unit and token axes are indisting-
+        # uishable, so a mean over the wrong one would still produce a well-shaped array.
+        if pre:
+            with _timed("pool"):
+                x = _pool_feats(x, pre, base)
         return x.reshape(x.shape[0], -1)
 
 
@@ -968,11 +1044,19 @@ def main() -> None:
                    help="how a VAL TIE picks λ. argmax (default, the PUBLISHED rule) keeps the "
                         "smallest tied λ; tiemax keeps the largest. Both read val only. Fix this "
                         "in advance and report it — do not run both and quote the better one.")
+    p.add_argument("--pool-d", type=int, default=256,
+                   help="model width d, used to reshape a unit's cached (k_full*d) block before a "
+                        "gpool:/bpool: mean. Asserted to divide the real width.")
+    p.add_argument("--pool-bands", default="4,16,32",
+                   help="tokens per band in pack_r4 order [SLOW,MID,HGA] for bpool:. Must sum to "
+                        "k_full = width/d; asserted, never assumed.")
     args = p.parse_args()
 
-    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE
+    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE, POOL_D, POOL_BANDS
     REPORT_STD_TARGET = args.std_target
     LAM_RULE = args.lam_rule
+    POOL_D = args.pool_d
+    POOL_BANDS = tuple(int(b) for b in args.pool_bands.split(",") if b.strip())
     print(f"[check] lam_rule={LAM_RULE} (published board = argmax)", flush=True)
     if args.elec_labels_sidecar:
         with open(args.elec_labels_sidecar, "rb") as fh:
