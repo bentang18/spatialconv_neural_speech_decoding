@@ -137,13 +137,45 @@ def _rows_decoder():
                                    task=task, split=split, value=v[split])
 
 
+def _rows_board_ft():
+    """board_ft/<arm_tag>__k<K>/ft_<regime>_<cell>.json -- the partial fine-tune arms.
+
+    Each file is a FLAT LIST of one record per (cell, task, FOLD); the board's macro unit is
+    (session, task) with folds AVERAGED, so this reader averages them and emits one row per unit.
+    Averaging here is what makes an FT row comparable to a `board` row: mixing a fold-level FT
+    number with a fold-averaged board number is the same defect class this ledger exists to catch.
+
+    Two decoders per unit, both fit on the SAME frozen ridge grid: `ridge` is A (frozen block12,
+    val-selected lambda -- the published board entry, recomputed in-path at epoch 0) and
+    `ridge_ft_k<K>` is C (block-12 MLP fine-tuned, then that same ridge). The headline is C - A,
+    which you take as a groupby difference, never from the JSON's own `d` field -- `d` in the
+    per-cell LOG is d(D-A), a different quantity. K is the DRIVER task count and lives only in the
+    directory name because the records do not carry it (the run log prints `K_drv=`).
+    """
+    for sd in sorted((R6 / "board_ft").glob("*__k*")):
+        if not sd.is_dir():
+            continue
+        arm_tag, _, k = sd.name.partition("__")
+        for f in sorted(sd.glob("ft_*.json")):
+            folds: dict[tuple, list] = {}
+            for rec in json.load(open(f)):
+                key = (rec["regime"], rec["cell"], rec["task"])
+                folds.setdefault(key, []).append(rec)
+            for (regime, cell, task), rs in sorted(folds.items()):
+                for dec, field in (("ridge", "test_frozen_vallam"), (f"ridge_ft_{k}", "test_c")):
+                    yield dict(family="board_ft", artifact=str(sd), run_id="", arm_tag=arm_tag,
+                               regime=regime, tap="enc12", norm="std", decoder=dec, cell=cell,
+                               task=task, split="test",
+                               value=sum(r[field] for r in rs) / len(rs))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(R6 / "RESULTS_LEDGER.csv"))
     a = ap.parse_args()
 
     rows = (list(_rows_board()) + list(_rows_pbs()) + list(_rows_leace())
-            + list(_rows_decoder()))
+            + list(_rows_decoder()) + list(_rows_board_ft()))
     if not rows:
         raise SystemExit("no artifacts found -- run from the repo root")
     rows.sort(key=lambda r: tuple(str(r[k]) for k in FIELDS[:-1]))
