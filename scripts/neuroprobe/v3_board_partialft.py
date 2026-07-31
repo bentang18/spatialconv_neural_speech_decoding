@@ -335,7 +335,10 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
     params = FTP._arm_params(enc, "mlp")
     for q in enc.parameters():
         q.requires_grad_(False)
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    # beta2 IS EXPLICIT, NOT torch's DEFAULT. See --beta2: 1/(1-beta2) is a horizon in optimizer
+    # STEPS and this fine-tune is ~250-330 of them, so the 0.999 default's 1000-step horizon never
+    # conditions v-hat. Passing it by name so the log records it and so nobody re-inherits 0.999.
+    opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, args.beta2), weight_decay=args.wd)
     # CONSTANT LR, DELIBERATELY. This replaced CosineAnnealingLR(T_max=args.epochs) on 07-31.
     #
     # The cosine was never actually annealing: T_max was the 80-epoch BUDGET while patience-15
@@ -499,7 +502,11 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
             "n_tr": int(len(tr)), "n_va": int(len(va)), "n_te": int(len(te)), **ens, **soup}
 
 
-def main() -> None:
+def _parser() -> argparse.ArgumentParser:
+    """The CLI, extracted from ``main`` so the DEFAULTS are testable without running a cell.
+
+    Split out when --beta2 landed: the bug it guards is a default that is WRONG BUT VALID, which
+    only a test that can read `p.get_default(...)` can catch. Nothing else moved."""
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
     p.add_argument("--regime", choices=("ws", "csession", "cs"), required=True)
@@ -532,6 +539,22 @@ def main() -> None:
                         "other task's labels, which matters for a leaderboard submission.")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--wd", type=float, default=0.05)
+    p.add_argument("--beta2", type=float, default=0.95,
+                   help="Adam second-moment decay. DEFAULT CHANGED 0.999 -> 0.95 on 07-31; every "
+                        "partial-FT number before that commit is on 0.999 and is NOT comparable. "
+                        "SIZE IT TO THE RUN: 1/(1-beta2) is the horizon in OPTIMIZER STEPS, and "
+                        "this fine-tune is ~250-330 steps total (n_tr 1122-1750 at --train-batch "
+                        "128 = 9-14 steps/epoch, ~24 epochs under patience 15). At 0.999 the "
+                        "horizon is 1000 steps, so v-hat is never conditioned on more than a third "
+                        "of its own window and the whole run sits in the high-variance regime "
+                        "warmup exists to protect (Liu et al. 2020, RAdam). 0.95 -> horizon 20 "
+                        "steps, and is the value v3 PRETRAINING already uses. "
+                        "WHY THIS WAS MISSED: the pilot swept arm/driver/lr/wd on val_C and beta2 "
+                        "was never in the grid, so it took torch's default. "
+                        "COUPLING: lr 1e-2 was chosen UNDER 0.999, i.e. partly to overcome a badly "
+                        "conditioned v-hat. With v-hat sized to the run the same lr may be too "
+                        "hot. Changing one at a time on purpose -- if 0.95 loses at lr 1e-2 the "
+                        "next question is lr, not beta2.")
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--dump-epoch-test", action="store_true",
@@ -576,7 +599,11 @@ def main() -> None:
     p.add_argument("--tower", choices=("online", "teacher"), default="online")
     p.add_argument("--parity-only", action="store_true")
     p.add_argument("--seed", type=int, default=33)
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = _parser().parse_args()
 
     FTP.SPLIT_AT = SPLIT_AT
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -606,7 +633,7 @@ def main() -> None:
           f"rowspace_tasks={len(tasks)} reporting={len(report_tasks)} "
           f"driver_tasks={args.driver_tasks} "
           f"lams={len(lams)} (board grid) lr={args.lr} sched=CONSTANT wd={args.wd} "
-          f"patience={args.patience} "
+          f"beta2={args.beta2} patience={args.patience} "
           f"device={device}", flush=True)
     print("[board-ft] A = frozen block12 + val-selected ridge (the published entry, recomputed "
           "in-path); C = fine-tuned block12 + THE SAME ridge. Headline = d(C-A). No D cell: the "
