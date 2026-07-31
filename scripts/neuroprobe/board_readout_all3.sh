@@ -39,7 +39,11 @@ cd "$TREE"
 N=$(ls "$CACHE"/enc_s*_t*.pt 2>/dev/null | wc -l)
 [ "$N" -eq 12 ] || { echo "[FATAL] expected 12 session records in $CACHE, found $N"; exit 1; }
 mkdir -p "$SHARD"
-S=scripts/neuroprobe/board_readout_lean.sbatch
+# The lean sbatch lives NEXT TO the caches, not in the tree: it is deployed to
+# /projects/bhqk/htang13/ and the git copy under scripts/neuroprobe/ is the reconciled record, not
+# what Slurm reads. Referencing it relative to $TREE fails with "Unable to open file".
+S=/projects/bhqk/htang13/board_readout_lean.sbatch
+[ -f "$S" ] || { echo "[FATAL] lean sbatch missing: $S"; exit 1; }
 WS=$( sbatch --parsable --array=0-11 --mem=120G --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" ws       1)
 CSN=$(sbatch --parsable --array=0-11 --mem=200G --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" csession 1)
 CS=$( sbatch --parsable --array=0-9  --mem=176G --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" cs       4)
