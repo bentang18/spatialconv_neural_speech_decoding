@@ -21,6 +21,10 @@
 #
 # 🔴 EVERY REGIME BILLS 1000. 113560M IS ONE GPU'S DefMemPerGPU; 227120M BILLS DOUBLE FOR THE
 # SAME ONE GPU, so staying under the share is worth real fairshare on ~34 array tasks.
+# 🔴 EXCEPT THE BIG SESSIONS. ws cells 10,11 (S10T0/S10T1) OOM-kill at 113560M -- MEASURED, job
+# 2793977 (dead right after the parity gate, "Detected 1 oom_kill event"). Submit those two as a
+# separate --array=10,11 at --mem=227120M; they bill 2000 each and there is no way around it.
+# The pilot hit the same wall on its own largest session (S4T2).
 # 🔴 fp16 ON ALL THREE REGIMES — fp32 ws DOES NOT FIT, MEASURED. The earlier claim here ("80.2 GiB
 # in fp32, MaxRSS 93.8 GiB, it fits") was inferred from a --parity-only run, which never builds
 # the training-side slices; the full ws run OOM-KILLED at this same 113560M (job 2790770, dead in
@@ -64,8 +68,20 @@ ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_lite
 mkdir -p "$OUTDIR"
 [ -f "$CKPT" ] || { echo "[FATAL] ckpt missing: $CKPT"; exit 1; }
 [ -d "$CACHE" ] || { echo "[FATAL] board cache missing: $CACHE"; exit 1; }
-echo "[board-ft] regime=$REGIME cell_index=$SLURM_ARRAY_TASK_ID ckpt=$CKPT tag=$TAG mem=${SLURM_MEM_PER_NODE}M"
+# csession intersects electrodes BY LABEL across the two records of a session pair, but the board
+# encode stores elec_labels=None, so without the sidecar every cell dies instantly with "a record
+# has no elec_labels ... Pass --elec-labels-sidecar". board_readout_lean.sbatch has auto-attached
+# this for csession since 07-20; THIS launcher did not, and the omission killed all 12 csession
+# cells at once (job 2793978, 07-31). Attach it here so a caller cannot forget it.
+SIDECAR=()
+if [ "$REGIME" = "csession" ]; then
+  SC=/projects/bhqk/htang13/arm0_elec_labels_sidecar.pkl
+  [ -f "$SC" ] || { echo "[FATAL] csession requires the elec-labels sidecar, missing: $SC"; exit 1; }
+  case " $* " in *" --elec-labels-sidecar "*) ;; *) SIDECAR=(--elec-labels-sidecar "$SC") ;; esac
+fi
+echo "[board-ft] regime=$REGIME cell_index=$SLURM_ARRAY_TASK_ID ckpt=$CKPT tag=$TAG mem=${SLURM_MEM_PER_NODE}M sidecar=${SIDECAR[*]:-none}"
 srun "$VENV" -u scripts/neuroprobe/v3_board_partialft.py \
+  "${SIDECAR[@]}" \
   --ckpt "$CKPT" \
   --regime "$REGIME" \
   --cell-index "$SLURM_ARRAY_TASK_ID" \
