@@ -787,3 +787,52 @@ def test_pool_defaults_match_the_lite_board_layout() -> None:
     """52 = 4+16+32 tokens at d 256 == the 13312 width the board cache actually stores, so the
     shipped defaults describe the Lite board and a run that forgets the flags is still correct."""
     assert sum((4, 16, 32)) * 256 == 13312
+
+
+# ── --dump-lam-grid: observation only ───────────────────────────────────────────────────────
+
+def test_lam_grid_is_absent_by_default() -> None:
+    """The published shard shape must not grow a key just because the code learned to dump one."""
+    import scripts.neuroprobe.v3_board_readout as B
+    assert B.LAM_GRID_DUMP is False
+    got = _select_lam({"val": {1.0: 0.60, 10.0: 0.90}, "test": {1.0: 0.99, 10.0: 0.55}})
+    assert "lam_grid" not in got
+
+
+def test_dump_lam_grid_does_not_move_the_selected_point(monkeypatch) -> None:
+    """THE INVARIANT. Dumping is a MEASUREMENT of how much val-argmax-λ leaves on the table; the
+    moment it perturbs the selection, the arm stops being the one we published. Every reported
+    field must be identical with the dump on and off -- and the test curve it records is exactly
+    the one the selection was NOT allowed to look at."""
+    import scripts.neuroprobe.v3_board_readout as B
+    d = {"val": {m: v for m, v in zip(LAM_MULTS, np.linspace(0.5, 0.9, len(LAM_MULTS)))},
+         "test": {m: v for m, v in zip(LAM_MULTS, np.linspace(0.9, 0.4, len(LAM_MULTS)))}}
+    off = _select_lam(d)
+    monkeypatch.setattr(B, "LAM_GRID_DUMP", True)
+    on = _select_lam(d)
+    for k in off:
+        assert on[k] == off[k], f"{k} moved when the grid dump was enabled"
+
+
+def test_dumped_grid_is_the_whole_ascending_grid_and_contains_the_selected_point(monkeypatch) -> None:
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_GRID_DUMP", True)
+    d = {"val": {m: v for m, v in zip(LAM_MULTS, np.linspace(0.5, 0.9, len(LAM_MULTS)))},
+         "test": {m: v for m, v in zip(LAM_MULTS, np.linspace(0.9, 0.4, len(LAM_MULTS)))}}
+    got = _select_lam(d)
+    grid = got["lam_grid"]
+    assert len(grid) == len(LAM_MULTS)
+    assert [r[0] for r in grid] == sorted(r[0] for r in grid), "grid must be ascending in λ"
+    hit = [r for r in grid if r[0] == got["lam_mult"]]
+    assert len(hit) == 1 and hit[0][1] == got["val"] and hit[0][2] == got["test"]
+
+
+def test_the_dumped_test_curve_can_beat_the_selected_point_which_is_the_whole_point(monkeypatch) -> None:
+    """A ceiling only exists if the grid can hold a better test value than the val pick. Pinning
+    this stops the dump from being quietly useless (e.g. if it recorded val twice)."""
+    import scripts.neuroprobe.v3_board_readout as B
+    monkeypatch.setattr(B, "LAM_GRID_DUMP", True)
+    d = {"val": {1.0: 0.90, 10.0: 0.80}, "test": {1.0: 0.55, 10.0: 0.99}}
+    got = _select_lam(d)
+    assert got["test"] == 0.55
+    assert max(r[2] for r in got["lam_grid"]) == 0.99

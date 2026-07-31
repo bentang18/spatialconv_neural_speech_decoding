@@ -513,6 +513,16 @@ def _lam_grid_primal(z_tr, y_tr, evals):
 LAM_RULE = "argmax"     # published tie-break. --lam-rule overrides; see _select_lam.
 LAM_RULES = ("argmax", "tiemax")
 
+# --dump-lam-grid: record the WHOLE 25-point (val, test) λ curve per cell instead of only the
+# selected point. Same bargain --dump-epoch-test struck on the FT side, and it paid there: the
+# epoch curve is what proved the +.0105 headroom was in SELECTION, not in the schedule. Here it
+# answers the λ-axis version of that question -- how much does val-argmax-λ cost against the best
+# λ on the grid? -- and it answers it for every λ rule, offline, forever, off one CPU run.
+# 🔴 OBSERVATION ONLY. The grid is already computed for the sweep; dumping it changes no selection
+# and no reported number (test_dump_lam_grid_does_not_move_the_selected_point). Picking λ to
+# maximise the dumped test curve is an ORACLE and must be reported as a ceiling, never a result.
+LAM_GRID_DUMP = False
+
 # Tie census, accumulated across every ridge fit in a shard and printed once at the end. The
 # LAM_MULTS comment says to MEASURE THE TIE FRACTION FIRST; this is that measurement, taken on the
 # real board rather than on the synthetic fixture where the plateau was discovered.
@@ -574,8 +584,17 @@ def _select_lam(d, rule=None) -> dict:
     _TIE_STATS["tied_ge2"] += len(tied) > 1
     _TIE_STATS["tied_total"] += len(tied)
     pin = "lo" if m == LAM_MULTS[0] else ("hi" if m == LAM_MULTS[-1] else "")
-    return {"val": best_val, "test": d["test"][m], "lam_mult": float(m),
-            "lam_pin": pin, "lam_pinned": pin == "lo", "n_tied": len(tied)}
+    out = {"val": best_val, "test": d["test"][m], "lam_mult": float(m),
+           "lam_pin": pin, "lam_pinned": pin == "lo", "n_tied": len(tied)}
+    if LAM_GRID_DUMP:
+        # Appended AFTER the selected point is built, from the same `d` the selection read, so the
+        # dump cannot influence it. Ascending λ, one [mult, val, test] row per grid point.
+        # Over the grid THIS FIT ACTUALLY SWEPT, not the module-level LAM_MULTS: they are the same
+        # tuple on every board run, but keying off `d` means the dump can never silently drop a
+        # point or KeyError on a grid that differs from the global one.
+        out["lam_grid"] = [[float(mm), float(d["val"][mm]), float(d["test"][mm])]
+                           for mm in sorted(d["val"])]
+    return out
 
 
 def _cell_key(tap, norm) -> str:
@@ -1044,6 +1063,12 @@ def main() -> None:
                    help="how a VAL TIE picks λ. argmax (default, the PUBLISHED rule) keeps the "
                         "smallest tied λ; tiemax keeps the largest. Both read val only. Fix this "
                         "in advance and report it — do not run both and quote the better one.")
+    p.add_argument("--dump-lam-grid", action="store_true",
+                   help="record the WHOLE 25-point (val, test) λ curve per cell as `lam_grid`, "
+                        "not just the selected point. Costs nothing — the grid is already swept — "
+                        "and buys every λ rule offline, forever, off one run. Observation only: "
+                        "no selection and no reported number moves. 🚫 picking λ to maximise the "
+                        "dumped TEST curve is an ORACLE, a ceiling, never a result.")
     p.add_argument("--pool-d", type=int, default=256,
                    help="model width d, used to reshape a unit's cached (k_full*d) block before a "
                         "gpool:/bpool: mean. Asserted to divide the real width.")
@@ -1052,12 +1077,14 @@ def main() -> None:
                         "k_full = width/d; asserted, never assumed.")
     args = p.parse_args()
 
-    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE, POOL_D, POOL_BANDS
+    global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE, POOL_D, POOL_BANDS, LAM_GRID_DUMP
     REPORT_STD_TARGET = args.std_target
     LAM_RULE = args.lam_rule
+    LAM_GRID_DUMP = args.dump_lam_grid
     POOL_D = args.pool_d
     POOL_BANDS = tuple(int(b) for b in args.pool_bands.split(",") if b.strip())
-    print(f"[check] lam_rule={LAM_RULE} (published board = argmax)", flush=True)
+    print(f"[check] lam_rule={LAM_RULE} (published board = argmax) "
+          f"lam_grid_dump={LAM_GRID_DUMP}", flush=True)
     if args.elec_labels_sidecar:
         with open(args.elec_labels_sidecar, "rb") as fh:
             _ELEC_LABELS_SIDECAR = pickle.load(fh)
