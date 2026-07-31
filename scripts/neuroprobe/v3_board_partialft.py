@@ -84,6 +84,7 @@ RDO = FTP.RDO
 
 TAP = 12
 SPLIT_AT = 11
+CERT_ROWS = 256          # rows parity-L0 probes; kept in fp32 regardless of --x11-dtype
 # Every regime's REPORTED tap. ws/csession report the per-electrode tap, cs reports the parcel
 # tap (v3_board_readout.py:115-117) -- this asymmetry is the whole reason --unit exists.
 REGIME_UNIT = {"ws": "elec", "csession": "elec", "cs": "parcel"}
@@ -238,6 +239,17 @@ def main() -> None:
     p.add_argument("--fwd-batch", type=int, default=256)
     p.add_argument("--train-batch", type=int, default=128)
     p.add_argument("--x11-device", choices=("cuda", "cpu"), default="cuda")
+    p.add_argument("--x11-dtype", choices=("fp32", "fp16"), default="fp32",
+                   help="dtype of the cached tap-11. fp32 is the safe default and what the pilot "
+                        "used. fp16 HALVES it (measured 80 GiB -> 40 GiB on a 13,592-window board "
+                        "session), which is the difference between fitting one GPU's memory share "
+                        "(bills 1000) and needing double (bills 2000) — and it is what makes the "
+                        "TWO resident caches of cs/csession fit at all. MEASURED at 1.910e-3 "
+                        "relative on the reported features (job 2790650) -- 10 mantissa bits "
+                        "~4.9e-4, amplified ~3.9x by block 12. That does NOT gate: parity-L0 runs "
+                        "on fp32 certificate rows, so the split is certified independently of "
+                        "storage. ws does not need this (fp32 MaxRSS 93.8 GiB already fits the "
+                        "110.9 GiB share); cs/csession do.")
     p.add_argument("--tower", choices=("online", "teacher"), default="online")
     p.add_argument("--parity-only", action="store_true")
     p.add_argument("--seed", type=int, default=33)
@@ -249,7 +261,17 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     unit = args.unit or REGIME_UNIT[args.regime]
-    tasks = [t for t in (args.tasks.split(",") if args.tasks else BRD.BOARD_TASKS) if t]
+    # 🔴 THE ROW SPACE IS DEFINED BY ALL 15 TASKS, ALWAYS. ``_load_targets`` derives clip_starts
+    # from the task list it is given, so asking it for one task yields a DIFFERENT, SHORTER row
+    # space (measured: 3,134 windows for onset alone vs 13,592 for the full board set on S1T1).
+    # The board cache's ws_split/cs_split index the full-set space, so a restricted list silently
+    # misaligns every split index and the L0 comparison. --tasks restricts only what is REPORTED.
+    # Caught by parity-L1b on the first GPU run rather than by a wrong number.
+    tasks = list(BRD.BOARD_TASKS)
+    report_tasks = [t for t in (args.tasks.split(",") if args.tasks else tasks) if t]
+    unknown = [t for t in report_tasks if t not in tasks]
+    if unknown:
+        raise SystemExit(f"--tasks names non-board tasks: {unknown}")
     cell = REGIME_CELLS[args.regime][args.cell_index]
     train_cell = (cell if args.regime == "ws"
                   else BRD._sibling(cell) if args.regime == "csession"
@@ -257,7 +279,8 @@ def main() -> None:
     lams = list(BRD.LAM_MULTS)
 
     print(f"[board-ft] regime={args.regime} cell=S{cell[0]}T{cell[1]} "
-          f"train=S{train_cell[0]}T{train_cell[1]} unit={unit} tasks={len(tasks)} "
+          f"train=S{train_cell[0]}T{train_cell[1]} unit={unit} "
+          f"rowspace_tasks={len(tasks)} reporting={len(report_tasks)} "
           f"lams={len(lams)} (board grid) lr={args.lr} wd={args.wd} patience={args.patience} "
           f"device={device}", flush=True)
     print("[board-ft] A = frozen block12 + val-selected ridge (the published entry, recomputed "
@@ -293,21 +316,50 @@ def main() -> None:
         cols = [torch.as_tensor(np.where(parcel_canon == q)[0], device=device) for q in present]
         n_win = int(bands[0].shape[0])
         x11 = None
+        x11_cert = None
         for s in range(0, n_win, args.fwd_batch):
             e = min(s + args.fwd_batch, n_win)
             bb = [b[s:e].to(device) for b in bands]
-            with torch.no_grad():
+            # 🔴 bf16 AUTOCAST IS NOT OPTIONAL — IT IS PART OF THE PARITY CONTRACT. The board cache
+            # was written under it (v3_probe_encode_r4.py:434), so tap 11 must be produced the same
+            # way or the 11 blocks below the split diverge from the ones that made the cached
+            # enc12. Running this loop in fp32 cost a full parity cycle: L0 printed rel=7.6e-3
+            # (bf16's own error accumulated over the stack) and, diagnostically, fp32 and fp16 x11
+            # storage gave the IDENTICAL rel to 4 digits -- storage precision cannot move an error
+            # that was baked in before the tap was stored.
+            with torch.no_grad(), torch.autocast(device_type=device.type,
+                                                 dtype=torch.bfloat16,
+                                                 enabled=(device.type == "cuda")):
                 _o, taps = tower.forward(bb, grid, parcel_packed, tap_blocks=(SPLIT_AT,))
             t = taps[SPLIT_AT]
             if x11 is None:
                 dev = torch.device(args.x11_device if torch.cuda.is_available() else "cpu")
-                need = n_win * t.shape[1] * t.shape[2] * t.element_size()
+                dt = t.dtype if args.x11_dtype == "fp32" else torch.float16
+                need = n_win * t.shape[1] * t.shape[2] * torch.empty((), dtype=dt).element_size()
                 if dev.type == "cuda":
                     torch.cuda.empty_cache()
                     if need > 0.55 * torch.cuda.mem_get_info()[0]:
                         dev = torch.device("cpu")
-                x11 = torch.empty((n_win, t.shape[1], t.shape[2]), dtype=t.dtype, device=dev)
-            x11[s:e] = t.to(x11.device)
+                x11 = torch.empty((n_win, t.shape[1], t.shape[2]), dtype=dt, device=dev)
+            x11[s:e] = t.to(device=x11.device, dtype=x11.dtype)
+            # THE CERTIFICATE ROWS STAY fp32 NO MATTER HOW THE BULK IS STORED. parity-L0 probes
+            # only the first CERT_ROWS windows, so an exact copy of just those costs ~1.5 GiB
+            # against ~17 GiB of headroom and keeps the STRUCTURAL question (is the block split
+            # right?) answerable at full precision even when the bulk tap is fp16. Without this the
+            # gate conflates two unrelated things: a wrong split (observed at 5.4e-3 and 7.6e-3)
+            # and fp16 storage noise (1.9e-3) -- and tightening it against the latter costs a real
+            # 2x in billing on cs/csession for no correctness gain.
+            if s < CERT_ROWS:
+                if x11_cert is None:
+                    x11_cert = torch.empty((min(CERT_ROWS, n_win), t.shape[1], t.shape[2]),
+                                           dtype=torch.float32, device=x11.device)
+                m = min(e, CERT_ROWS)
+                x11_cert[s:m] = t[:m - s].to(device=x11_cert.device, dtype=torch.float32)
+        # The windowed bands and the session spec are consumed ONLY by the encode loop above, but
+        # Python keeps them alive to the end of build(), so they sit next to the 40-80 GiB tap
+        # cache at peak. Nothing below closes over them (feats reads x11, grid, cols). Dropping
+        # them here is free and it is a large fraction of the OOM headroom.
+        del bands, spec
         ctx_cache: dict = {}
 
         def ctx(b):
@@ -315,11 +367,11 @@ def main() -> None:
                 ctx_cache[b] = FTP._flat_ctx(enc, grid, b, device)
             return ctx_cache[b]
 
-        def feats(rows, grad, sel=None):
+        def _feats_from(src, rows, grad, sel=None):
             out = []
             for s in range(0, len(rows), args.fwd_batch):
-                idx = torch.as_tensor(rows[s:s + args.fwd_batch], device=x11.device)
-                xb = x11.index_select(0, idx).to(device)
+                idx = torch.as_tensor(rows[s:s + args.fwd_batch], device=src.device)
+                xb = src.index_select(0, idx).to(device)
                 with torch.set_grad_enabled(grad), torch.autocast(
                         device_type=device.type, dtype=torch.bfloat16,
                         enabled=(device.type == "cuda")):
@@ -327,6 +379,15 @@ def main() -> None:
                 z = _unit_feats(y, grid, cols, unit, sel)
                 out.append(z if grad else z.detach())
             return torch.cat(out, 0)
+
+        def feats(rows, grad, sel=None):
+            return _feats_from(x11, rows, grad, sel)
+
+        def feats_cert(rows, grad, sel=None):
+            """parity-L0 only. Row-aligned with x11[:CERT_ROWS] and always fp32."""
+            return _feats_from(x11_cert, rows, grad, sel)
+
+        feats.cert = feats_cert
 
         print(f"[board-ft] S{session[0]}T{session[1]} n_win={n_win} |P|={len(present)} "
               f"M={grid.total} k={grid.k_full} tap{SPLIT_AT} "
@@ -414,17 +475,38 @@ def main() -> None:
     if key not in test_rec["feats"]:
         raise SystemExit(f"L0: board cache has no '{key}' tap (has {sorted(test_rec['feats'])}) "
                          f"-- cannot certify the {unit} unit")
+    # 🔴 TWO DIFFERENT QUESTIONS, TWO DIFFERENT BARS. THE GATE IS ON THE FIRST ONE ONLY.
+    #   (a) STRUCTURAL -- is the split right? Measured on the fp32 certificate rows, so storage
+    #       dtype cannot enter. Every real bug this has ever caught landed far above 1e-3: an
+    #       earlier bf16 cache draft (pilot:40), rel=5.371e-3 on job 2779110_0 (pilot:551), and a
+    #       missing bf16 autocast on the tap-11 encode at 7.641e-3. In fp32 the correct split is
+    #       BIT-EXACT (rel=0.000e+00, job 2790649), so this bar has enormous margin and should
+    #       stay tight. It is the only thing standing between a block-split bug and a number.
+    #   (b) STORAGE NOISE -- how much does --x11-dtype perturb the features? fp16 measures
+    #       1.910e-3 (job 2790650): 10 mantissa bits ~4.9e-4, amplified ~3.9x by block 12. That is
+    #       NOT a bug, and gating it at 1e-3 was a category error on my part -- it would have cost
+    #       2x billing on every cs/csession task (two resident taps -> 227120M -> bills 2000) to
+    #       buy nothing. Reported every run, never fatal. What it perturbs is C, whose features
+    #       move far more than this under fine-tuning; A is read from the on-disk cache, which is
+    #       itself stored fp16 (v3_probe_encode_r4.py:442) and rounded again by FTP._flat16.
     ref = test_rec["feats"][key]["raw"]
-    probe_rows = np.arange(min(256, ref.shape[0]), dtype=np.int64)
-    with torch.no_grad():
-        z16 = FTP._flat16(feats_ev_raw(probe_rows, False)).cpu()
+    probe_rows = np.arange(min(CERT_ROWS, ref.shape[0]), dtype=np.int64)
     r = torch.as_tensor(np.asarray(ref[probe_rows.tolist()])).float().reshape(len(probe_rows), -1)
-    d0 = float((r - z16.float()).abs().max())
-    rel = d0 / (float(r.abs().max()) + 1e-12)
-    print(f"[parity-L0] unit={unit} cached {key} vs block12(tap{SPLIT_AT}) max|d|={d0:.3e} "
-          f"rel={rel:.3e} {'OK' if rel < 1e-3 else 'FAIL'}", flush=True)
+    rmax = float(r.abs().max()) + 1e-12
+    with torch.no_grad():
+        zc = FTP._flat16(feats_ev_raw.cert(probe_rows, False)).cpu()
+    d0 = float((r - zc.float()).abs().max())
+    rel = d0 / rmax
+    print(f"[parity-L0] unit={unit} cached {key} vs block12(tap{SPLIT_AT}) fp32-cert "
+          f"max|d|={d0:.3e} rel={rel:.3e} {'OK' if rel < 1e-3 else 'FAIL'}", flush=True)
     if rel >= 1e-3:
         raise SystemExit("PARITY-L0 FAIL — the block split does not reproduce the reported tap.")
+    if args.x11_dtype != "fp32":
+        with torch.no_grad():
+            zs = FTP._flat16(feats_ev_raw(probe_rows, False)).cpu()
+        ds = float((r - zs.float()).abs().max())
+        print(f"[parity-L0s] storage={args.x11_dtype} max|d|={ds:.3e} rel={ds / rmax:.3e} "
+              f"(INFORMATIONAL -- split already certified exact above)", flush=True)
     if args.parity_only:
         return
 
@@ -437,7 +519,10 @@ def main() -> None:
                else torch.as_tensor((y_ev_all > 0).astype(np.float32), device=device))
 
     results = []
-    for ti, task in enumerate(tasks):
+    for task in report_tasks:
+        # Column index is into the FULL board task list, which is what the label matrices and the
+        # multitask driver are built over — not into the reporting subset.
+        ti = tasks.index(task)
         y_a, y_t = y_tr_all[:, ti], y_ev_all[:, ti]
         if args.regime == "ws":
             folds = sorted(tgt_ev.ws_split[task].items())
