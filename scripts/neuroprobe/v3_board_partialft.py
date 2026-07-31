@@ -189,6 +189,69 @@ def _epoch_ensembles(vals, scores, y_te, auroc):
     return out
 
 
+def _average_states(states):
+    """Elementwise mean of N tail-block state lists -> ONE tail-block state list.
+
+    Entries IDENTICAL across every member are passed through UNTOUCHED. Only block 12's MLP is
+    unfrozen, so most of the block holds the same value at every epoch, and a floating mean of
+    equal values does not reliably return that value (x+x+x need not be 3x, and dividing by 3 need
+    not undo it). Passing them through is what keeps `soup_top1 == test_c` EXACT and stops the
+    frozen half of the block drifting a ulp per rule.
+
+    Non-floating entries are never averaged: an index buffer has no meaningful mean, so one that
+    disagrees across epochs is an upstream bug and this raises rather than rounding it away.
+
+    ⚠️ Sound because block 12 is LayerNorm-only (attention.py:80-81) and its positional buffers are
+    persistent=False, hence absent from state_dict. A BatchNorm here would need SWA's separate
+    running-stat re-estimation pass; see test_v3_board_partialft_weight_soup.py."""
+    first = states[0]
+    out = []
+    for bi, sd0 in enumerate(first):
+        avg = {}
+        for k, v0 in sd0.items():
+            members = [s[bi][k] for s in states]
+            if all(torch.equal(m, v0) for m in members[1:]):
+                avg[k] = v0.clone()
+                continue
+            if not torch.is_floating_point(v0):
+                raise ValueError(
+                    f"non-float state entry {k!r} differs across epochs; refusing to average it")
+            avg[k] = torch.stack([m.float() for m in members]).mean(0).to(v0.dtype)
+        out.append(avg)
+    return out
+
+
+def _weight_soups(vals, states, refit):
+    """{soup_<rule> -> test AUROC after LOADING the averaged weights}, over the SAME val-only epoch
+    sets `_epoch_ensembles` uses.
+
+    Sharing `_ensemble_index_sets` is what makes soup-vs-ensemble apples-to-apples structurally,
+    instead of two hand-written rule tables that can drift apart. `refit` loads an averaged state
+    and returns the test AUROC at the val-selected lambda; it is injected so the rule logic is
+    testable without a GPU."""
+    sets = _ensemble_index_sets(vals)
+    out = {}
+    for name, idxs in sets.items():
+        key = "soup_" + name[len("ens_"):]
+        if not idxs:
+            out[key] = float("nan")
+            continue
+        out[key] = float(refit(_average_states([states[i] for i in idxs])))
+    return out
+
+
+def _snap_tail(enc):
+    """CPU copy of the recomputed tail's state. CPU because GPU memory is the binding constraint
+    here -- the big ws sessions already OOM at one GPU's share."""
+    return [{k: v.detach().to("cpu", copy=True) for k, v in b.state_dict().items()}
+            for b in enc.blocks[SPLIT_AT:TAP]]
+
+
+def _load_tail(enc, st):
+    for b, sd_ in zip(enc.blocks[SPLIT_AT:TAP], st):
+        b.load_state_dict(sd_)
+
+
 def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col, dcols, lams,
               tag):
     """Fine-tune block 12's MLP on ``rows['tr']``; return A, C and the epoch trace.
@@ -230,11 +293,14 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
     # Scores are collected only under --dump-epoch-test, which already pays the per-epoch test
     # forward; the ensembles therefore cost the rank sort and nothing else on the GPU.
     ens_scores: list = []
+    soup_states: list = []
     if args.dump_epoch_test:
         v0, _t0const, a_test, a_df, s0 = ridge_now(True, True)
         ens_scores.append(s0)
     else:
         v0, _t0const, a_test, a_df = ridge_now(True)
+    if args.weight_soup:
+        soup_states.append(_snap_tail(enc))
     best = {"val": float(v0), "epoch": 0, "state": None}
     trace = [(0, float(v0), float(a_test) if args.dump_epoch_test else None)]
     t0 = time.time()
@@ -272,6 +338,8 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         else:
             cv, ct = ridge_now(False)[0], None
         trace.append((ep, float(cv), None if ct is None else float(ct)))
+        if args.weight_soup:
+            soup_states.append(_snap_tail(enc))
         if np.isfinite(cv) and cv > best["val"]:
             best = {"val": float(cv), "epoch": ep,
                     "state": copy.deepcopy([b.state_dict() for b in enc.blocks[SPLIT_AT:TAP]])}
@@ -297,6 +365,25 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
         print("[ens] " + tag + " " + " ".join(f"{k}={v:.4f}" for k, v in sorted(ens.items())),
               flush=True)
 
+    # ── F: weight soups (same val-only sets, but averaged in PARAMETER space) ────────────────
+    # Runs LAST because it mutates the encoder; `c_test` is already fixed above and the caller
+    # re-runs FTP._restore(enc, pristine) before the next cell.
+    soup: dict = {}
+    if args.weight_soup and len(soup_states) == len(trace):
+        def _refit(st):
+            _load_tail(enc, st)
+            return ridge_now(True)[2]
+        soup = _weight_soups([v for _, v, _ in trace], soup_states, _refit)
+        # SELF-CHECK, PRINTED NOT ASSUMED, and STRICTER than the ensemble's. Averaging one state is
+        # an identity (frozen entries pass through, and the lone member of a mean is itself), so
+        # this reloads exactly the weights the loop selected and must reproduce c_test to the bit
+        # -- no rank-tie slack. A non-zero d means the per-epoch snapshots are not the states the
+        # run selected on, and every other soup number is then meaningless.
+        print(f"[soupcheck] {tag} soup_top1={soup['soup_top1']:.6f} c_test={c_test:.6f} "
+              f"d={soup['soup_top1'] - c_test:+.2e} n_snap={len(soup_states)}", flush=True)
+        print("[soup] " + tag + " " + " ".join(f"{k}={v:.4f}" for k, v in sorted(soup.items())),
+              flush=True)
+
     sec = (time.time() - t0) / max(n_ep, 1)
     print(f"[cell] {tag} ep*={best['epoch']:3d} A={a_test:.4f} C={c_test:.4f} "
           f"d={c_test - a_test:+.4f} | df={a_df:.1f}/{len(tr)} | K_drv={len(dcols)} | "
@@ -308,7 +395,7 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
             "epoch_curve": [[e, v, t] for e, v, t in trace],
             "d": float(c_test - a_test), "best_epoch": int(best["epoch"]),
             "n_epochs_run": int(n_ep), "sec_per_epoch": float(sec), "ridge_df": float(a_df),
-            "n_tr": int(len(tr)), "n_va": int(len(va)), "n_te": int(len(te)), **ens}
+            "n_tr": int(len(tr)), "n_va": int(len(va)), "n_te": int(len(te)), **ens, **soup}
 
 
 def main() -> None:
@@ -353,6 +440,15 @@ def main() -> None:
                         "Observation only -- val, `best` and the selected epoch are unchanged. "
                         "🚫 NOT a selection input: picking the epoch that maximises this curve is "
                         "an ORACLE, and must be reported as a ceiling, never as a result.")
+    p.add_argument("--weight-soup", action="store_true",
+                   help="Snapshot the tail's weights every epoch and additionally report, per "
+                        "val-only rule, the test AUROC of the AVERAGED WEIGHTS (`soup_*`). Same "
+                        "epoch sets as the prediction ensembles, averaged in parameter space "
+                        "instead of rank space -- so it ships ONE model, at one forward pass, "
+                        "which is the cheaper thing to defend in the paper. Costs one extra ridge "
+                        "fit per rule and ~3 MB of host RAM per epoch. Sound here only because "
+                        "block 12 is LayerNorm-only: a BatchNorm would need SWA's running-stat "
+                        "re-estimation pass, which this does NOT do.")
     p.add_argument("--warmup-epochs", type=int, default=0,
                    help="0: the ridge driver has no head to align, so REVE's first step is a no-op")
     p.add_argument("--fwd-batch", type=int, default=256)
