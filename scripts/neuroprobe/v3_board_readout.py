@@ -437,28 +437,197 @@ def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
         return x.reshape(x.shape[0], -1)
 
 
-def _lam_grid(z_tr, y_tr, evals):
+# --rbf: report an RBF KERNEL RIDGE column beside the linear one, fit on the SAME standardized
+# matrices, the same splits and the same λ grid. It is a REPORTED column, never a selected one --
+# "std" stays exactly what it is today, so the control is the untouched published path rather than
+# a re-run that has to be argued to be equivalent.
+#
+# WHY THIS IS THE ONE SINGLE-MODEL LEVER LEFT. Everything that stays inside one model has come back
+# null (depth concat, time pooling, tap/λ ensembles, weight-averaged fine-tunes); the only thing
+# that has ever moved the board is rank-averaging N models, which is an ensemble and not defensible
+# as an entry. A kernel ridge is still ONE model, ONE closed-form fit, ONE forward pass, and the
+# nonlinearity is the one axis the linear probe has never been allowed to use. Protocol parity is
+# unaffected: it is fit PER TASK on FROZEN features, and Neuroprobe's own baselines (CNN, PopT) are
+# nonlinear decoders, so this spends none of the parity a multitask driver would.
+RBF = False
+# γ = mult / median(d²_train). The median heuristic is what makes a fixed grid meaningful across
+# taps whose widths span 41k (enc0_elec) to 1.6e6 (enc12_elec) -- an absolute γ would be a
+# different model at every tap. Only TRAIN distances set the scale, exactly as λ's `base` is
+# anchor-side only, so no eval set can enter through the bandwidth.
+GAMMA_MULTS = (0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0)
+# Which γ the val half actually picked, accumulated over every fit and printed once per shard.
+# A grid whose selections pile up on an END is a grid that is too narrow to have answered the
+# question; that has to be visible in the log, not inferred later from the AUROCs.
+_RBF_STATS: dict = {"fits": 0, "picked": {}, "conc": []}
+# Top-k PC projections to ALSO report, each as its own '<tap>|std_rbfpc<k>' column. 32 because the
+# separability work measured that keeping the 32 highest-variance directions PRESERVES held-out
+# performance -- so if the content really does live there, this is the dimension at which an RBF
+# kernel can still tell two trials apart. The neighbours bracket it rather than trusting it.
+RBF_PCS = (16, 32, 64)
+
+
+def _pc_project(g, kern_lin, k):
+    """Top-k principal components, STRAIGHT OUT OF THE GRAM WE ALREADY HAVE. No extra GEMM.
+
+    Z = U S Vᵀ ⇒ G = Z Zᵀ = U S² Uᵀ, so the train scores on the top-k right-singular directions
+    are ZV = U S, and an eval block projects as Z_e V = (Z_e Zᵀ) U S⁻¹ = K_e U S⁻¹. Both are
+    read off the eigendecomposition of G and the eval kernels — the two things `_linear_grams`
+    already returns — so denoising costs an n×n eigh, not a pass over the 1.6e6-wide features.
+
+    WHY IT IS HERE: the RBF column's one failure mode is distance concentration, and the cure for
+    concentration is to stop measuring distance in directions that carry no signal. Projecting to
+    the leading PCs is the cheapest honest way to do that, and it is ANCHOR-SIDE ONLY — V comes
+    from the train Gram, so no eval row informs the basis it is projected onto.
+
+    Returns (None, None) when the Gram has no usable spectrum.
+    """
+    w, u = np.linalg.eigh(g)
+    order = np.argsort(w)[::-1][:k]
+    w_k, u_k = w[order], u[:, order]
+    if w_k.size == 0 or w_k[0] <= 0:
+        return None, None
+    keep = w_k > w_k[0] * 1e-10          # drop numerically-null directions, never invert them
+    w_k, u_k = w_k[keep], u_k[:, keep]
+    if w_k.size == 0:
+        return None, None
+    s = np.sqrt(w_k)
+    return u_k * s[None, :], {name: (ke @ u_k) / s[None, :] for name, ke in kern_lin.items()}
+
+
+def _lam_grid_rbf(z_tr, y_tr, evals, grams=None, n_pc=None):
+    """RBF kernel ridge over the same λ grid, with γ selected on val.
+
+    `n_pc` first projects to the top-n_pc principal components of the TRAIN Gram (see
+    _pc_project). That is the concentration-cure column; n_pc=None is the raw-feature one.
+
+    NEARLY FREE, BY ALGEBRA. Squared distances are a rearrangement of the products the linear fit
+    already forms: d²(i,j) = ||z_i||² + ||z_j||² − 2 z_i·z_j, and the diagonal of G supplies the
+    norms. So given `grams` the whole γ grid costs one exp() and one n×n eigendecomposition per γ
+    -- against a GEMM that is four orders of magnitude larger. K = exp(−γ d²).
+
+    γ AND λ ARE SELECTED JOINTLY ON VAL, and the nesting below IS that joint argmax:
+    max over (γ,λ) == max over γ of (max over λ). Returning the winning γ's FULL λ curve and
+    letting _select_lam take its argmax therefore picks exactly the point a flat sweep would,
+    while keeping the return shape, the tie census and the lam_pin diagnostics identical to the
+    linear path. ⚠️ Selecting on val needs no defense -- λ, and every entry's early stopping,
+    already do. Selecting on TEST would, and nothing here reads test.
+
+    INVARIANT, ASSERTED NOT ASSUMED: diag(K) == exp(0) == 1 ⇒ trace(K)/n == 1 exactly, so `base`
+    is 1 and a λ multiplier means the same absolute shrinkage at every γ. Without that the γ and λ
+    axes would be entangled and the grid would not be a grid.
+    """
+    nan = {name: {m: float("nan") for m in LAM_MULTS} for name in evals}
+    if len(y_tr) < 2:
+        return nan
+    g, kern_lin = _linear_grams(z_tr, evals) if grams is None else grams
+    if g.shape[0] < 2:
+        return nan
+    if n_pc:
+        p_tr, p_e = _pc_project(g, kern_lin, n_pc)
+        if p_tr is None or p_e is None:
+            return nan
+        g = np.asarray(p_tr @ p_tr.T, dtype=np.float64)
+        kern_lin = {name: np.asarray(p_e[name] @ p_tr.T, dtype=np.float64) for name in evals}
+        ev_sq = {name: np.einsum("ij,ij->i", p_e[name], p_e[name], dtype=np.float64)
+                 for name in evals}
+    else:
+        ev_sq = {name: np.einsum("ij,ij->i", z, z, dtype=np.float64)
+                 for name, (z, _) in evals.items()}
+    n = g.shape[0]
+    sq = np.diag(g).copy()
+    d2 = sq[:, None] + sq[None, :] - 2.0 * g
+    np.maximum(d2, 0.0, out=d2)                                 # kill fp64 round-off below zero
+    iu = np.triu_indices(n, k=1)
+    med = float(np.median(d2[iu]))
+    if not np.isfinite(med) or med <= 0.0:
+        # Every train row identical ⇒ no length scale exists. Report NaN rather than invent one.
+        return nan
+    # THE PRECONDITION FOR THE WHOLE COLUMN, recorded per fit rather than argued. An RBF kernel
+    # can only separate points its distances distinguish; as the number of UNINFORMATIVE
+    # directions grows, every pairwise distance converges to the same value, K flattens toward
+    # constant and the fit degenerates to (a worse) linear one. Measured on synthetic XOR:
+    # sd/mean .72 at d=4 (RBF .96 vs linear .53) -> .022 at d=4000 (RBF dead, and NO γ rescues
+    # it). So a near-zero ratio here means the column cannot work, and that has to be READ OFF
+    # THE LOG, not inferred afterwards from a null result.
+    _RBF_STATS["conc"].append(float(np.std(d2[iu]) / np.mean(d2[iu])))
+    d2e = {}
+    for name in evals:
+        de = ev_sq[name][:, None] + sq[None, :] - 2.0 * kern_lin[name]
+        np.maximum(de, 0.0, out=de)
+        d2e[name] = de
+    y = np.asarray(y_tr, dtype=np.float64)
+    best = None
+    for gm in GAMMA_MULTS:
+        gamma = gm / med
+        with _timed("rbf_eigh"):
+            w, V = np.linalg.eigh(np.exp(-gamma * d2))
+        base = float(np.sum(w) / max(n, 1))
+        assert abs(base - 1.0) < 1e-6, f"RBF trace(K)/n = {base}, must be 1 (diag(K)==1)"
+        c = V.T @ y
+        kern = {name: np.exp(-gamma * d2e[name]) for name in evals}
+        out: dict = {name: {} for name in evals}
+        sc: dict = {name: {} for name in evals}
+        with _timed("rbf_lam_sweep"):
+            for m in LAM_MULTS:
+                alpha = V @ (c / (w + m * base))
+                for name, (_, yy) in evals.items():
+                    s = kern[name] @ alpha
+                    if _capturing():
+                        sc[name][m] = s
+                    out[name][m] = (auroc(s, yy) if len(yy) >= 2 else float("nan"))
+        if _capturing():
+            out["_scores"] = sc
+        vals = [v for v in out.get("val", {}).values() if np.isfinite(v)]
+        key = max(vals) if vals else -np.inf
+        # Strict `>` over an ASCENDING γ grid ⇒ a val tie keeps the SMALLEST γ, i.e. the WIDEST
+        # kernel, i.e. the one closest to linear. Same tie convention as `argmax` on λ, and it
+        # breaks toward the incumbent model rather than toward the new one.
+        if best is None or key > best[0]:
+            best = (key, out, gm)
+    assert best is not None, "GAMMA_MULTS is non-empty, so a γ is always selected"
+    _RBF_STATS["fits"] += 1
+    _RBF_STATS["picked"][best[2]] = _RBF_STATS["picked"].get(best[2], 0) + 1
+    return best[1]
+
+
+def _linear_grams(z_tr, evals):
+    """(G = Z_trZ_trᵀ, {name: Z_eZ_trᵀ}) — the ONLY GEMMs either kernel needs.
+
+    Split out so the linear and RBF fits can SHARE them. At the board's headline tap this is the
+    entire cost of a fit: enc12_elec is d = 1.58e6 against n <= 1750, so G alone is ~10 TFLOP
+    while everything downstream (an n×n eigendecomposition, a 25-point λ sweep) is milliseconds.
+    Recomputing these to add a second kernel would DOUBLE a shard for nothing.
+    """
+    with _timed("gram_gemm"):
+        g = np.asarray(z_tr @ z_tr.T, dtype=np.float64)         # fp32 GEMM → fp64 Gram
+    with _timed("eval_kernels"):
+        kern = {name: np.asarray(z @ z_tr.T, dtype=np.float64)
+                for name, (z, _) in evals.items()}
+    return g, kern
+
+
+def _lam_grid(z_tr, y_tr, evals, grams=None):
     """Fit ridge on (z_tr, y_tr); score every λ in LAM_MULTS on each eval set.
 
     Returns {eval_name: {lam_mult: auroc}}. One fp64 eigendecomposition of G=Z_trZ_trᵀ serves
     the whole grid — the ridge solution is α = V diag(1/(w+λ)) Vᵀ y, so sweeping λ reuses
     (w, V, c=Vᵀy) and costs one mat-vec each. GEMMs are fp32 (memory), G/solve are fp64.
     λ NEVER enters through an eval set: only through w, which is anchor-side only.
+
+    `grams` accepts an already-computed (G, eval kernels) pair so the RBF column can be fit off
+    the SAME products. Passing it forces the dual, which is why the caller only ever passes it
+    when d >= n — the branch the primal would have taken is never the one being shared.
     """
     if len(y_tr) < 2:
         return {name: {m: float("nan") for m in LAM_MULTS} for name in evals}
-    if z_tr.shape[1] < z_tr.shape[0]:
+    if grams is None and z_tr.shape[1] < z_tr.shape[0]:
         return _lam_grid_primal(z_tr, y_tr, evals)
-    with _timed("gram_gemm"):
-        g = np.asarray(z_tr @ z_tr.T, dtype=np.float64)         # fp32 GEMM → fp64 Gram
+    g, kern = _linear_grams(z_tr, evals) if grams is None else grams
     n = g.shape[0]
     with _timed("eigh"):
         w, V = np.linalg.eigh(g)                                # G symmetric PSD ⇒ w >= 0
     c = V.T @ np.asarray(y_tr, dtype=np.float64)
     base = float(np.sum(w) / max(n, 1))                         # trace(G)/n — the λ scale
-    with _timed("eval_kernels"):
-        kern = {name: np.asarray(z @ z_tr.T, dtype=np.float64)
-                for name, (z, _) in evals.items()}
     out: dict = {name: {} for name in evals}
     sc: dict = {name: {} for name in evals}
     with _timed("lam_sweep"):
@@ -814,7 +983,16 @@ def _run_norms(grid, enc, z_tr, z_va, z_te, y_tr, y_va, y_te, cs=False):
         grid[(enc, "std_target")] = _lam_grid(a, y_tr, evals(b, c))
     if "std" in NORMS:
         a, (b, c) = _standardize_inplace(z_tr, [z_va, z_te])
-        grid[(enc, "std")] = _lam_grid(a, y_tr, evals(b, c))
+        ev = evals(b, c)
+        # Share ONE set of GEMMs between the two kernels when both are reported. Only when d >= n,
+        # because that is the branch _lam_grid would have taken anyway -- passing grams where the
+        # primal is cheaper would make the linear column slower to serve the RBF one.
+        gr = _linear_grams(a, ev) if (RBF and a.shape[1] >= a.shape[0] and len(y_tr) >= 2) else None
+        grid[(enc, "std")] = _lam_grid(a, y_tr, ev, grams=gr)
+        if RBF:
+            grid[(enc, "std_rbf")] = _lam_grid_rbf(a, y_tr, ev, grams=gr)
+            for k in RBF_PCS:
+                grid[(enc, f"std_rbfpc{k}")] = _lam_grid_rbf(a, y_tr, ev, grams=gr, n_pc=k)
 
 
 def _ws_cell(rec, task, taps) -> dict:
@@ -1258,6 +1436,11 @@ def main() -> None:
                         "gap on the CS board, i.e. val picks λ noisily; averaging a val-defined "
                         "neighbourhood is the submittable way to spend that. Val-only, free "
                         "(the grid is already swept), per-tap columns unchanged.")
+    p.add_argument("--rbf", action="store_true",
+                   help="ALSO report an RBF kernel-ridge column '<tap>|std_rbf' beside the linear "
+                        "'<tap>|std', fit on the same standardized matrices, splits and λ grid, "
+                        "sharing one set of GEMMs. γ = mult/median(d²_train) selected on val "
+                        "jointly with λ. The linear column is untouched, so it is the control.")
     p.add_argument("--pool-d", type=int, default=256,
                    help="model width d, used to reshape a unit's cached (k_full*d) block before a "
                         "gpool:/bpool: mean. Asserted to divide the real width.")
@@ -1267,8 +1450,9 @@ def main() -> None:
     args = p.parse_args()
 
     global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE, POOL_D, POOL_BANDS, LAM_GRID_DUMP
-    global TAP_ENSEMBLE, LAM_ENSEMBLE
+    global TAP_ENSEMBLE, LAM_ENSEMBLE, RBF
     REPORT_STD_TARGET = args.std_target
+    RBF = args.rbf
     LAM_RULE = args.lam_rule
     LAM_GRID_DUMP = args.dump_lam_grid
     TAP_ENSEMBLE = args.tap_ensemble
@@ -1313,6 +1497,20 @@ def main() -> None:
               f"({100.0 * _t / _f if _f else 0.0:.1f}%), mean tied λ per fit "
               f"{_TIE_STATS['tied_total'] / _f if _f else 0.0:.2f} of {len(LAM_MULTS)} "
               f"[workers={args.workers}: parent-only if >1]", flush=True)
+        if RBF and _RBF_STATS["fits"]:
+            # A γ grid whose picks pile up on an END has not answered the question -- it has run
+            # out of room. Printed so that is visible in the log, not reverse-engineered later.
+            _pk = _RBF_STATS["picked"]
+            _hist = " ".join(f"{gm:g}:{_pk.get(gm, 0)}" for gm in GAMMA_MULTS)
+            _ends = _pk.get(GAMMA_MULTS[0], 0) + _pk.get(GAMMA_MULTS[-1], 0)
+            print(f"[check] rbf γ picks over {_RBF_STATS['fits']} fits: {_hist} "
+                  f"| on a grid END {100.0 * _ends / _RBF_STATS['fits']:.0f}% "
+                  f"(high ⇒ WIDEN GAMMA_MULTS before quoting)", flush=True)
+            _c = np.asarray(_RBF_STATS["conc"], dtype=np.float64)
+            print(f"[check] rbf distance concentration sd(d²)/mean(d²): "
+                  f"min {_c.min():.4f} median {np.median(_c):.4f} max {_c.max():.4f} "
+                  f"over {_c.size} fits — BELOW ~0.05 THE KERNEL CANNOT SEPARATE and a null "
+                  f"result says nothing about nonlinearity, only about dimension", flush=True)
         # Phase totals are per-PROCESS: with --workers>1 the children's timers die with them,
         # so this table is the parent's view (load + merge) only. Profile with --workers 1.
         _phase_report(f"{args.mode} {sh['name']} workers={args.workers} "
