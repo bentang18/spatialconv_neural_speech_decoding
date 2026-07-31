@@ -197,11 +197,20 @@ def test_a_single_epoch_trace_still_produces_every_rule():
 
 # ── the CANONICAL rule: last-N, no val selection ────────────────────────────────────────────
 
-def test_lastn_is_the_tail_of_the_trace_and_ignores_val_entirely():
+def test_lastn_is_the_tail_of_a_GIVEN_trace_and_does_not_reorder_it_by_val():
     """THE TEXTBOOK RULE. Vaswani et al. 2017 averaged the LAST N checkpoints of one run; SWA
-    averages the tail of the trajectory. Neither consults validation. Every other rule here is
-    val-selected, which makes them ours to defend -- this one is the literature's, and it is the
-    comparison a reviewer will ask for. Its defining property is that val cannot move it."""
+    averages the tail of the trajectory.
+
+    ⚠️ SCOPE, AND THE REASON THIS TEST WAS RENAMED. It is tempting to call last-N "val-free". As a
+    FUNCTION OF A GIVEN TRACE it is -- that is exactly what this test pins. But the end-to-end
+    procedure is NOT val-free, because patience-15 early stopping decides where the trace ENDS,
+    and val decides the stopping point. Vaswani trained to a fixed budget with no early stopping,
+    so their last-N genuinely never touched val; ours does, through the trace length. Do not quote
+    last-N as the val-free rule -- the honest statement is that it does not RE-RANK by val.
+
+    That mismatch is also why last-N is a poor fit here and is reported as a reference point
+    rather than the headline: our tail sits ~15 epochs past the val optimum at ~80% of peak LR,
+    where Vaswani's tail was the converged end of the run. The headline rule is greedy soup."""
     good = BFT._ensemble_index_sets([0.9, 0.1, 0.1, 0.1, 0.1, 0.1])
     bad = BFT._ensemble_index_sets([0.1, 0.9, 0.9, 0.9, 0.9, 0.9])
     assert good["ens_last3"] == [3, 4, 5] == bad["ens_last3"]

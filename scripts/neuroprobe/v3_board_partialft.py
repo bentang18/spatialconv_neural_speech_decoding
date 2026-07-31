@@ -231,6 +231,41 @@ def _average_states(states):
     return out
 
 
+def _greedy_soup(vals, states, soup_val):
+    """Wortsman et al. 2022 greedy soup, over the epochs of one fine-tune.
+
+    Sort candidates by val, seed the soup with the best one, then walk the rest in order and keep
+    a candidate ONLY if souping it in raises the val of the resulting AVERAGE. The criterion is
+    the soup's val, not the candidate's own -- that is the whole difference from `valge0` and
+    `top-k`, which score each epoch in isolation and can therefore average in members that are
+    individually good but redundant or in tension with what is already in the pot.
+
+    WHY THIS IS THE RULE WE LEAD WITH. It is published, it is a weight-average (so it ships ONE
+    model), and it has NO free parameter -- the val comparison decides how many members go in.
+    `last-N` carries an N that Vaswani et al. themselves tuned per model (5 base / 20 big), and it
+    additionally assumes the run ENDS near its best, which ours does not: patience-15 stopping
+    leaves the tail ~15 epochs past the val optimum at ~80% of peak LR.
+
+    `soup_val` re-measures the averaged weights down the SAME ridge path the training loop used,
+    so the seed's score is directly comparable to the rest. Non-finite vals are failed fits and
+    can never enter. Ties break toward the earlier epoch, matching the loop's strict `>`.
+
+    Returns the ingredient INDICES; the caller averages them and scores test once."""
+    ok = [i for i, v in enumerate(vals) if np.isfinite(v)]
+    if not ok:
+        return []
+    order = sorted(ok, key=lambda i: (-float(vals[i]), i))
+    ing = [order[0]]
+    cur = float(soup_val(_average_states([states[order[0]]])))
+    for i in order[1:]:
+        cand = ing + [i]
+        v = float(soup_val(_average_states([states[j] for j in cand])))
+        # STRICT. A member has to earn its place; on a tie the smaller soup is the simpler model.
+        if np.isfinite(v) and v > cur:
+            ing, cur = cand, v
+    return sorted(ing)
+
+
 def _weight_soups(vals, states, refit):
     """{soup_<rule> -> test AUROC after LOADING the averaged weights}, over the SAME val-only epoch
     sets `_epoch_ensembles` uses.
@@ -277,7 +312,23 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
     for q in enc.parameters():
         q.requires_grad_(False)
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
+    # CONSTANT LR, DELIBERATELY. This replaced CosineAnnealingLR(T_max=args.epochs) on 07-31.
+    #
+    # The cosine was never actually annealing: T_max was the 80-epoch BUDGET while patience-15
+    # stopping ends runs at ~24, so we only ever traversed the first 30% and the LR stayed between
+    # 80% and 100% of peak. Worse, because the stop epoch varies per cell and T_max did not, a
+    # cell that stopped at 15 epochs trained at a systematically HIGHER average LR than one that
+    # ran 40 -- the effective schedule was a function of how long early stopping happened to let
+    # the cell run. That is a confound across the very cells the board test pairs over.
+    #
+    # Constant removes it, and it is the schedule the analysis actually assumes: averaging weights
+    # across checkpoints (Polyak-Ruppert, SWA) is justified when the iterates sample a STATIONARY
+    # distribution around the basin, which is what a constant LR produces and a decaying one does
+    # not. We were relying on that regime by accident; now we ask for it.
+    #
+    # 🔴 This CHANGES TRAINING. Every partial-FT number produced before 07-31 (R21/R23/R25, incl.
+    # the .7014 WS ensemble read) is on the old truncated cosine and is NOT comparable to a run
+    # from this file -- A and C both move. Re-measure, never mix.
     rng = np.random.default_rng(args.seed)
     # SPLIT BY CONSUMER, NOT BY CONVENIENCE. ``_ridge_eval`` uses y_tr as a TORCH tensor on z's
     # device (it forms v.T @ y in the dual solve) but hands y_va/y_te to RDO.auroc, which calls
@@ -332,7 +383,6 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 3.0)
             opt.step()
-        sched.step()
         enc.eval()
         # THE 10% CUT: val only. Test is computed once, at the end, on the restored best state.
         # --dump-epoch-test BUYS THE CUT BACK (n_te/(4*n_tr+n_va+n_te) = ~10% per epoch) to record
@@ -384,6 +434,20 @@ def _run_cell(args, enc, feats_tr, feats_ev, rows, ybin_tr, ybin_ev, msk_tr, col
             _load_tail(enc, st)
             return ridge_now(True)[2]
         soup = _weight_soups([v for _, v, _ in trace], soup_states, _refit)
+        # GREEDY SOUP — the headline rule, and the only one here with no free parameter. It costs
+        # one VAL evaluation per candidate (not test), which is the cheaper half of ridge_now.
+        vtrace = [v for _, v, _ in trace]
+
+        def _soup_val(st):
+            _load_tail(enc, st)
+            return ridge_now(False)[0]
+
+        ing = _greedy_soup(vtrace, soup_states, _soup_val)
+        soup["soup_greedy"] = float(_refit(_average_states([soup_states[i] for i in ing]))) \
+            if ing else float("nan")
+        soup["soup_greedy_n"] = float(len(ing))
+        print(f"[greedy] {tag} n_ing={len(ing)} of {len(vtrace)} ing={ing} "
+              f"test={soup['soup_greedy']:.4f}", flush=True)
         # SELF-CHECK, PRINTED NOT ASSUMED, and STRICTER than the ensemble's. Averaging one state is
         # an identity (frozen entries pass through, and the lone member of a mean is itself), so
         # this reloads exactly the weights the loop selected and must reproduce c_test to the bit
@@ -514,7 +578,8 @@ def main() -> None:
           f"train=S{train_cell[0]}T{train_cell[1]} unit={unit} "
           f"rowspace_tasks={len(tasks)} reporting={len(report_tasks)} "
           f"driver_tasks={args.driver_tasks} "
-          f"lams={len(lams)} (board grid) lr={args.lr} wd={args.wd} patience={args.patience} "
+          f"lams={len(lams)} (board grid) lr={args.lr} sched=CONSTANT wd={args.wd} "
+          f"patience={args.patience} "
           f"device={device}", flush=True)
     print("[board-ft] A = frozen block12 + val-selected ridge (the published entry, recomputed "
           "in-path); C = fine-tuned block12 + THE SAME ridge. Headline = d(C-A). No D cell: the "

@@ -187,6 +187,69 @@ def test_nan_val_epochs_are_never_souped():
     assert pytest.approx(1.0) in seen
 
 
+# ── greedy soup (Wortsman et al. 2022) — the rule with NO free parameter ─────────────────────
+
+def test_greedy_soup_starts_from_the_best_val_epoch():
+    """The published algorithm sorts candidates by val and seeds the soup with the best one. That
+    seed is what makes greedy soup's floor the val-argmax model rather than an arbitrary point."""
+    vals = [0.60, 0.71, 0.65]
+    states = [[{"w": torch.tensor([float(i)])}] for i in range(3)]
+    assert BFT._greedy_soup(vals, states, lambda avg: 0.0)[0] == 1
+
+
+def test_greedy_soup_rejects_a_member_that_does_not_improve_the_soups_val():
+    """THE DEFINING BEHAVIOUR, and what separates it from `valge0`/`last-N`: the criterion is the
+    val of the RESULTING AVERAGE, not the val of the candidate on its own. A member with excellent
+    solo val is still refused if souping it in makes the soup worse."""
+    vals = [0.99, 0.98, 0.97]
+    states = [[{"w": torch.tensor([float(i)])}] for i in range(3)]
+    ing = BFT._greedy_soup(vals, states, lambda avg: 0.5 if avg[0]["w"].item() == 0.0 else 0.1)
+    assert ing == [0], "a candidate that lowers the soup's val was souped in anyway"
+
+
+def test_greedy_soup_accepts_a_member_that_improves_the_soups_val():
+    vals = [0.99, 0.98]
+    states = [[{"w": torch.tensor([0.0])}], [{"w": torch.tensor([2.0])}]]
+    # solo best (w=0) scores 0.5; the average (w=1.0) scores better, so it must be kept
+    ing = BFT._greedy_soup(vals, states, lambda avg: 0.9 if avg[0]["w"].item() == 1.0 else 0.5)
+    assert ing == [0, 1]
+
+
+def test_greedy_soup_never_sees_test():
+    """Submittability. The rule is a function of the val callback alone -- there is no test
+    argument it could read even by accident."""
+    import inspect
+    prm = list(inspect.signature(BFT._greedy_soup).parameters)
+    assert not any("test" in p for p in prm), f"greedy soup takes a test-shaped argument: {prm}"
+
+
+def test_greedy_soup_skips_failed_epochs():
+    vals = [0.60, float("nan"), 0.72]
+    states = [[{"w": torch.tensor([float(i)])}] for i in range(3)]
+    seen = []
+
+    def val_of(avg):
+        seen.append(avg[0]["w"].item())
+        return 0.5
+
+    assert 1 not in BFT._greedy_soup(vals, states, val_of)
+
+
+def test_greedy_soup_on_a_one_epoch_trace_is_that_epoch():
+    assert BFT._greedy_soup([0.6], [[{"w": torch.tensor([1.0])}]], lambda avg: 0.5) == [0]
+
+
+def test_greedy_soup_has_no_free_parameter():
+    """WHY THIS RULE AND NOT last-N. `last3`/`last5` carry an N that we would have to justify --
+    Vaswani used 5 for the base model and 20 for the big one, i.e. they tuned it. Greedy soup has
+    nothing to tune: the val comparison decides the size of the soup. If a threshold or a count
+    ever appears in this signature, that claim is no longer true."""
+    import inspect
+    prm = inspect.signature(BFT._greedy_soup).parameters
+    extra = [n for n, p in prm.items() if p.default is not inspect.Parameter.empty]
+    assert extra == [], f"greedy soup grew a tunable knob: {extra}"
+
+
 def test_every_rule_returns_a_number_on_a_one_epoch_trace():
     """Degenerate cell (FT never ran): the reader must not see a ragged key set."""
     states = [[{"w": torch.tensor([1.0])}]]
