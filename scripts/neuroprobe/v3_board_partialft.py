@@ -162,7 +162,7 @@ def _ensemble_index_sets(vals):
     fits and are dropped: left in, a nan would compare False against everything and could win a
     top-k slot by default. Ties break toward the EARLIER epoch, the same way the training loop's
     strict `>` does, so `ens_top1` picks exactly the epoch the loop selected."""
-    keys = ("ens_all", "ens_valge0", "ens_top3", "ens_top1", "ens_last3", "ens_last5")
+    keys = ("ens_all", "ens_valge0", "ens_top3", "ens_top1", "ens_last3", "ens_last5", "ens_swa")
     ok = [i for i, v in enumerate(vals) if np.isfinite(v)]
     if not ok:
         return {k: [] for k in keys}
@@ -180,7 +180,13 @@ def _ensemble_index_sets(vals):
             # too, at no extra cost, so weight- and prediction-averaging can be compared under the
             # SAME epoch set instead of each at its own favourite rule.
             "ens_last3": ok[-3:],
-            "ens_last5": ok[-5:]}
+            "ens_last5": ok[-5:],
+            # SWA with swa_start = the val-argmax epoch: average from the optimum to the END of
+            # the run. This is how patience and the averaging window are reconciled -- the window
+            # length IS patience, so there is no second constant to defend, and the ~15 epochs
+            # patience currently computes and throws away become the ingredient list. Unlike
+            # last-N the window starts AT the optimum instead of landing 15 epochs past it.
+            "ens_swa": [i for i in ok if i >= order[0]]}
 
 
 def _epoch_ensembles(vals, scores, y_te, auroc):

@@ -144,7 +144,7 @@ def test_soups_reuse_the_prediction_ensembles_index_sets():
     states = [[{"tag": torch.tensor([float(i)])}] for i in range(len(vals))]
     out = BFT._weight_soups(vals, states, refit)
     assert set(out) == {"soup_all", "soup_valge0", "soup_top3", "soup_top1",
-                        "soup_last3", "soup_last5"}
+                        "soup_last3", "soup_last5", "soup_swa"}
 
 
 def test_soup_top1_refits_exactly_the_epoch_the_loop_selected():
@@ -255,5 +255,5 @@ def test_every_rule_returns_a_number_on_a_one_epoch_trace():
     states = [[{"w": torch.tensor([1.0])}]]
     out = BFT._weight_soups([0.6], states, lambda a: 0.61)
     assert set(out) == {"soup_all", "soup_valge0", "soup_top3", "soup_top1",
-                        "soup_last3", "soup_last5"}
+                        "soup_last3", "soup_last5", "soup_swa"}
     assert all(v == pytest.approx(0.61) for v in out.values())

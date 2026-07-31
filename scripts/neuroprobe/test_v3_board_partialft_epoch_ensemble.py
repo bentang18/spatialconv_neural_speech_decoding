@@ -191,7 +191,7 @@ def test_a_single_epoch_trace_still_produces_every_rule():
     y = (rng.random(20) > 0.5).astype(float)
     ens = BFT._epoch_ensembles([0.6], [rng.normal(size=20)], y, _auroc)
     assert set(ens) == {"ens_all", "ens_valge0", "ens_top3", "ens_top1",
-                        "ens_last3", "ens_last5"}
+                        "ens_last3", "ens_last5", "ens_swa"}
     assert all(np.isfinite(v) for v in ens.values())
 
 
@@ -215,6 +215,38 @@ def test_lastn_is_the_tail_of_a_GIVEN_trace_and_does_not_reorder_it_by_val():
     bad = BFT._ensemble_index_sets([0.1, 0.9, 0.9, 0.9, 0.9, 0.9])
     assert good["ens_last3"] == [3, 4, 5] == bad["ens_last3"]
     assert good["ens_last5"] == [1, 2, 3, 4, 5] == bad["ens_last5"]
+
+
+def test_swa_runs_from_the_val_argmax_epoch_to_the_END_of_the_trace():
+    """SWA WITH swa_start = THE VAL-ARGMAX EPOCH -- how patience and the averaging window are
+    reconciled, and the rule with the fewest numbers to defend.
+
+    `last-N` needs an N, and its window lands ~15 epochs PAST the optimum because patience-15 is
+    what ends the run. This instead STARTS at the optimum and runs to the end, so the window
+    length is set by patience rather than by a second constant nobody derived: one parameter, not
+    two. It is also SWA's actual shape -- SWA averages everything after a start point, not a
+    fixed-size tail -- and under the constant LR this file now uses, the post-argmax epochs are
+    samples from the same stationary distribution, which is exactly what Polyak averaging wants.
+    It also spends the ~15 epochs patience currently computes and discards."""
+    sets = BFT._ensemble_index_sets([0.60, 0.71, 0.65, 0.66, 0.61])
+    assert sets["ens_swa"] == [1, 2, 3, 4], "window must start AT the argmax and run to the end"
+
+
+def test_swa_excludes_everything_before_the_optimum():
+    """The climb up to the optimum is genuinely worse models, not stationary noise, so it must not
+    be averaged in. This is what distinguishes the rule from `ens_all`."""
+    sets = BFT._ensemble_index_sets([0.10, 0.20, 0.90, 0.85])
+    assert sets["ens_swa"] == [2, 3]
+    assert 0 not in sets["ens_swa"] and 1 not in sets["ens_swa"]
+
+
+def test_swa_skips_failed_epochs_inside_its_window():
+    sets = BFT._ensemble_index_sets([0.60, 0.90, float("nan"), 0.7])
+    assert sets["ens_swa"] == [1, 3]
+
+
+def test_swa_on_a_one_epoch_trace_is_that_epoch():
+    assert BFT._ensemble_index_sets([0.6])["ens_swa"] == [0]
 
 
 def test_lastn_is_shorter_than_n_on_a_short_trace_rather_than_erroring():
