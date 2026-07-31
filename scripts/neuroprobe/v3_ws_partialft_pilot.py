@@ -233,6 +233,13 @@ def _ridge_eval(z_tr, z_va, z_te, y_tr, y_va, y_te, lams):
     n = g.shape[0]
     basel = float(torch.diagonal(g).sum() / max(n, 1))
     y = y_tr.double()
+    # cusolverDnCreate allocates its workspace with cudaMalloc, OUTSIDE the caching allocator, so
+    # PyTorch's reserved-but-unused blocks starve it and eigh dies with CUSOLVER_STATUS_INTERNAL_ERROR
+    # rather than a clean OOM. Measured on csession cells 2 and 11 (the two largest session pairs):
+    # dead at this line on 4 different nodes, and doubling HOST memory to 227120M changed nothing
+    # because the pressure is HBM. Numerically inert -- it only returns cached blocks to the driver.
+    if g.is_cuda:
+        torch.cuda.empty_cache()
     w, v = torch.linalg.eigh(g)
     vty = v.T @ y
 
