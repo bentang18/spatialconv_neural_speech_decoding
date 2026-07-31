@@ -534,3 +534,95 @@ def test_widening_the_grid_can_LOWER_a_pinned_cell_not_raise_it(monkeypatch) -> 
     print(f"[check] pin resolved True->False while test FELL "
           f"{out['old']['test']:.7f} -> {out['new']['test']:.7f} "
           f"=> a LO pin is NOT evidence of downward truncation OK")
+
+
+# ── depth concatenation (`cat:` virtual taps) ──────────────────────────────────────────────
+# Layer combination is the one readout axis the board grid never explored: every reported number
+# comes from ONE tap. A ridge over concatenated depths is the unconstrained form of SUPERB's
+# learned layer-weighted sum, and it stays a linear probe on frozen features fit per task, so it
+# spends no protocol parity. These pin that the concatenation is what it claims to be — the parts
+# side by side, in order, indexed consistently — and that the unit-mixing footgun is refused.
+
+
+def test_cat_feat_is_exactly_the_parts_hstacked_in_order() -> None:
+    """The whole mechanism: `cat:a+b` must be `hstack([a, b])`, same rows, same order. If the
+    parts were gathered with different row sets the ridge would silently regress mismatched
+    trials against each other and still return a plausible AUROC."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    rec = _rec(seed=3)
+    rows = np.array([1, 5, 9, 2])
+    a = mod._feat(rec, "enc0", rows)
+    b = mod._feat(rec, "enc12", rows)
+    cat = mod._feat(rec, "cat:enc0+enc12", rows)
+    assert cat.shape == (len(rows), a.shape[1] + b.shape[1])
+    np.testing.assert_array_equal(cat[:, :a.shape[1]], a)
+    np.testing.assert_array_equal(cat[:, a.shape[1]:], b)
+
+
+def test_cat_feat_applies_the_same_col_idx_to_every_part() -> None:
+    """`col_idx` is the parcel (cs) or electrode (csession) intersection. It must select the SAME
+    columns from every part -- a part indexed differently would align one depth's parcel 7 with
+    another's parcel 3."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    rec = _rec(seed=4)
+    rows, cols = np.array([0, 3, 6]), np.array([1, 3])
+    a = mod._feat(rec, "enc0", rows, cols)
+    b = mod._feat(rec, "enc12", rows, cols)
+    cat = mod._feat(rec, "cat:enc0+enc12", rows, cols)
+    np.testing.assert_array_equal(cat, np.hstack([a, b]))
+
+
+def test_cat_tap_scores_and_lands_under_its_own_grid_key() -> None:
+    """A cat tap must be a first-class reported cell, not a fusion of existing ones: its own
+    `tap|norm` key, alongside the singles, so the grid still reports one complete protocol per
+    entry and nothing is picked by an argmax across taps."""
+    rec = _rec()
+    got = _ws_cell(rec, "onset", ("enc12", "cat:enc0+enc12"))
+    assert set(got["cells"]) == {"enc12|std", "cat:enc0+enc12|std"}
+    assert got["cells"]["cat:enc0+enc12|std"]["test"] == pytest.approx(1.0)
+
+
+def test_cat_tap_is_skipped_when_any_part_is_missing() -> None:
+    """Partial availability must skip the whole cat, not silently score a narrower feature block
+    under the same name -- that would make one grid key mean two different feature sets across
+    cells, which is the partial-cell defect in a new disguise."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    rec = _rec()
+    assert mod._have(rec, "cat:enc0+enc12")
+    assert not mod._have(rec, "cat:enc0+enc6")
+    got = _ws_cell(rec, "onset", ("cat:enc0+enc6", "enc12"))
+    assert set(got["cells"]) == {"enc12|std"}
+
+
+def test_cat_cs_cell_transfers_over_the_parcel_intersection() -> None:
+    """The cs path indexes by the anchor-test parcel intersection; a cat must survive it."""
+    anchor = _rec(parcels=[0, 1, 2, 3], seed=1)
+    test = _rec(parcels=[2, 3, 4, 5], seed=2)
+    got = _cs_cell(anchor, test, "onset", ("cat:enc0+enc12",))
+    assert got["n_parcels"] == 2
+    assert not np.isnan(got["cells"]["cat:enc0+enc12|std"]["test"])
+
+
+@pytest.mark.parametrize("bad", ["cat:enc12_elec+enc6", "cat:enc12", "cat:enc0+enc0",
+                                 "cat:enc0+nope", "bogus"])
+def test_validate_taps_refuses_malformed_and_unit_mixing_cats(bad) -> None:
+    """Refused at PARSE time. The unit-mixing case is the dangerous one: it would hstack an
+    electrode block onto a parcel block and index both with one col_idx, gathering wrong columns
+    from one of them -- a wrong number, not a crash."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    with pytest.raises(SystemExit):
+        mod._validate_taps((bad,))
+
+
+def test_validate_taps_accepts_singles_and_well_formed_cats() -> None:
+    import scripts.neuroprobe.v3_board_readout as mod
+    mod._validate_taps(("enc12", "cat:enc6+enc9+enc12", "cat:enc0_elec+enc12_elec"))
+
+
+def test_is_elec_routes_cats_by_their_parts_not_vacuously() -> None:
+    """`all()` over an ordinary tap's empty parts tuple is vacuously True, which would route
+    every parcel tap down the electrode branch of _csession_cell."""
+    import scripts.neuroprobe.v3_board_readout as mod
+    assert mod._is_elec("enc12_elec") and not mod._is_elec("enc12")
+    assert mod._is_elec("cat:enc0_elec+enc12_elec")
+    assert not mod._is_elec("cat:enc6+enc12")

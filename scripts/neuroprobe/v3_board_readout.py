@@ -279,12 +279,79 @@ def _standardize_per_domain(z_tr, z_va, z_te):
     return (z_tr - mu_a) / sd_a, [(z_va - mu_t) / sd_t, (z_te - mu_t) / sd_t]
 
 
+CAT = "cat:"          # virtual tap: "cat:enc6+enc9+enc12" — depth-concatenated features
+
+
+def _cat_parts(tap):
+    """The taps a virtual `cat:` tap is built from, or () if `tap` is an ordinary tap."""
+    return tuple(tap[len(CAT):].split("+")) if tap.startswith(CAT) else ()
+
+
+def _have(rec, tap) -> bool:
+    """Is `tap` (ordinary or `cat:`) computable from this record's cached features?"""
+    return all(p in rec["feats"] for p in (_cat_parts(tap) or (tap,)))
+
+
+def _validate_taps(taps) -> None:
+    """Refuse a bad tap at PARSE time, naming the flag the user typed.
+
+    A `cat:` tap must (a) name only known taps and (b) keep to ONE unit. Mixing e.g.
+    `enc12_elec` with `enc6` would hstack an (n, |E|·F) block onto an (n, |P|·F) one and then
+    index both with a single `col_idx` — the parcel intersection in cs, the electrode-label
+    intersection in csession — silently gathering the wrong columns from one of them. That is a
+    WRONG NUMBER, not a crash, so it is refused here rather than discovered in a shard.
+    A single-part cat is refused too: it is just the plain tap under a second name, and would
+    split one result across two grid keys.
+    """
+    for t in taps:
+        parts = _cat_parts(t)
+        if not parts:
+            if t not in ALL_TAPS:
+                raise SystemExit(f"unknown tap {t!r}; choose from {ALL_TAPS} or "
+                                 f"'{CAT}a+b' over them")
+            continue
+        unknown = [p for p in parts if p not in ALL_TAPS]
+        if unknown:
+            raise SystemExit(f"unknown taps {unknown} inside {t!r}; choose from {ALL_TAPS}")
+        if len(parts) < 2:
+            raise SystemExit(f"{t!r} concatenates one tap — drop the '{CAT}' prefix")
+        if len(set(parts)) != len(parts):
+            raise SystemExit(f"{t!r} repeats a tap; duplicate columns only inflate the width")
+        if len({p in ELEC_TAPS for p in parts}) != 1:
+            raise SystemExit(f"{t!r} mixes electrode and parcel taps, which live in different "
+                             f"column spaces ({ELEC_TAPS} vs {ENCODERS}) — a single col_idx "
+                             f"cannot index both, so this would silently gather wrong columns")
+
+
+def _is_elec(tap) -> bool:
+    """Does `tap` live in the ELECTRODE index space? A `cat:` tap inherits its parts' unit, and
+    `_validate_taps` has already refused a mixed one. Written over `_cat_parts(tap) or (tap,)`
+    rather than `all(...)` alone because `all()` over the empty parts tuple of an ordinary PARCEL
+    tap is vacuously True, which would route it down the electrode branch."""
+    return all(p in ELEC_TAPS for p in (_cat_parts(tap) or (tap,)))
+
+
 def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
     """(n,|P|,F) fp16 cache → rows (and optionally parcel columns) → flat fp32 (r, ·).
 
     Under --mmap this is where the cache is actually READ: the gather touches only the
     requested rows' pages, so a tap never gathered is never paged in at all.
+
+    DEPTH CONCATENATION. `enc` may be a virtual `cat:a+b+c` tap, which hstacks the parts along
+    the feature axis. This is the layer-combination readout (SUPERB fits a weighted sum over
+    layers; a ridge over the concatenation is its unconstrained form, and the λ-selection already
+    in this grid is what keeps the extra width from simply overfitting). It stays a LINEAR probe
+    on FROZEN features fit PER TASK, so it does not spend the protocol parity a leaderboard entry
+    needs -- unlike a multitask driver, which does.
+
+    `col_idx` applies to EVERY part, which is why a cat may not mix units: parcel taps are indexed
+    by the anchor∩test parcel intersection and electrode taps by the label intersection, and the
+    two index spaces are unrelated. Validated at parse time (`_validate_taps`), not here, so the
+    error names the flag the user typed.
     """
+    parts = _cat_parts(enc)
+    if parts:
+        return np.hstack([_feat(rec, p, rows, col_idx) for p in parts])
     with _timed("gather_fp16"):
         x = rec["feats"][enc]["raw"][np.asarray(rows, dtype=np.int64)]
         if col_idx is not None:
@@ -470,7 +537,7 @@ def _ws_cell(rec, task, taps) -> dict:
             continue
         grid = {}
         for enc in taps:
-            if enc not in rec["feats"]:
+            if not _have(rec, enc):
                 continue
             z_tr = _feat(rec, enc, tr)
             z_va, z_te = _feat(rec, enc, va), _feat(rec, enc, te)
@@ -505,7 +572,7 @@ def _cs_cell(anchor_rec, test_rec, task, taps) -> dict:
         return {"cells": {}}
     grid: dict = {}
     for enc in taps:
-        if enc not in anchor_rec["feats"] or enc not in test_rec["feats"]:
+        if not (_have(anchor_rec, enc) and _have(test_rec, enc)):
             continue
         z_tr = _feat(anchor_rec, enc, tr, a_idx)
         z_va, z_te = _feat(test_rec, enc, va, t_idx), _feat(test_rec, enc, te, t_idx)
@@ -560,9 +627,9 @@ def _csession_cell(train_rec, test_rec, task, taps) -> dict:
     e_a, e_t, n_elec = _elec_cols(train_rec, test_rec)
     grid: dict = {}
     for enc in taps:
-        if enc not in train_rec["feats"] or enc not in test_rec["feats"]:
+        if not (_have(train_rec, enc) and _have(test_rec, enc)):
             continue
-        if enc in ELEC_TAPS:
+        if _is_elec(enc):
             if e_a is None:
                 continue
             col_a, col_t = e_a, e_t
@@ -884,9 +951,7 @@ def main() -> None:
     _mode_taps = {"ws": WS_TAPS, "cs": CS_TAPS, "csession": CSESSION_TAPS}
     taps = (tuple(t.strip() for t in args.taps.split(",") if t.strip())
             or _mode_taps.get(args.mode, ALL_TAPS))
-    bad = [t for t in taps if t not in ALL_TAPS]
-    if bad:
-        raise SystemExit(f"unknown taps {bad}; choose from {ALL_TAPS}")
+    _validate_taps(taps)
 
     if args.mode in ("ws", "cs", "csession"):
         cells = {"ws": LITE_SESSIONS, "cs": CS_TEST_CELLS, "csession": CSESSION_CELLS}[args.mode]
