@@ -59,6 +59,30 @@ def test_N_full_reproduces_the_published_ws_cell_exactly() -> None:
         assert r["absdiff"] == 0.0, f"anchor drifted: {r}"
 
 
+def test_curve_runs_and_anchor_holds_when_the_val_split_is_UNSORTED() -> None:
+    """REGRESSION, found on real data (20715642): `va` is _finite(y, split["val"]) and carries the
+    cached split's own order, which is NOT guaranteed ascending. The board readout never noticed
+    because it only uses va via _feat(rec, enc, va) and y[va] -- both order-agnostic. An earlier
+    np.searchsorted here silently required sorted input and blew up the subset assert.
+
+    The synthetic fixture builds val with np.arange, so ONLY an explicitly shuffled split covers it.
+    """
+    rec = _big_rec()
+    rng = np.random.default_rng(0)
+    for task in rec["ws_split"]:
+        for fold in rec["ws_split"][task]:
+            v = rec["ws_split"][task][fold]["val"].copy()
+            rng.shuffle(v)
+            assert not np.all(np.diff(v) > 0), "shuffle left val sorted — test would be vacuous"
+            rec["ws_split"][task][fold]["val"] = v
+
+    task = BOARD_TASKS[0]
+    pts, _ = _ws_curve_cell(rec, SESS, task, TAPS)
+    assert pts, "unsorted val produced no points"
+    rows = _anchor_check(rec, task, TAPS, pts)
+    assert _anchor_verdict(rows) == [], f"anchor drifted under an unsorted val split: {rows}"
+
+
 def test_anchor_verdict_raises_on_an_empty_row_list() -> None:
     """A guard that reports 'no violations' because it compared nothing is worse than no guard.
     This is the only anchor failure mode that could otherwise pass silently."""

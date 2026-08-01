@@ -46,9 +46,14 @@ set -uo pipefail
 
 MODE="${1:-shard}"
 
-module load python/miniforge3_pytorch/2.10.0
-TREE=/projects/bhqk/htang13/speech
-VENV=$TREE/.venv/bin/python
+# ═══ DELTA CPU ENVIRONMENT — LIFTED VERBATIM FROM board_readout_lean.sbatch:43-44,70 ═════════════
+# Do NOT substitute the dtai incantation here. `python/miniforge3_pytorch/2.10.0` is the DeltaAI
+# (aarch64) module and does not exist on Delta CPU (x86), and $TREE/.venv/bin/python is a SYMLINK
+# INTO that dtai module path — it resolves on dtai and dangles here. `ls -l` on a dangling symlink
+# still prints a line, so check the TARGET (`python -c` or `ls -lL`), never the link.
+# The tree is speech_board, not speech: that is the tree every proven Delta CPU readout runs from.
+module load pytorch-conda/2.8
+TREE=/projects/bhqk/htang13/speech_board
 export PYTHONPATH="$TREE:$TREE/src:${PYTHONPATH:-}"
 cd "$TREE"
 
@@ -66,7 +71,7 @@ mkdir -p "$SHARDS"
 
 if [[ "$MODE" == "merge" ]]; then
   echo "[R31 merge] shards=$SHARDS"
-  "$VENV" -u scripts/neuroprobe/v3_board_samplecurve.py \
+  numactl --interleave=all python -u scripts/neuroprobe/v3_board_samplecurve.py \
     --mode merge --shard-dir "$SHARDS" --out "$OUT"
   exit $?
 fi
@@ -75,5 +80,5 @@ IDX="${SLURM_ARRAY_TASK_ID:?this script must run as an array (--array=0-11)}"
 echo "[R31 shard] idx=$IDX cache=$CACHE tag=$TAG"
 echo "[contract]  WS only | taps enc0_elec,enc12_elec | RANDOM stratified draw | test NEVER subsampled"
 echo "[anchor]    N=full MUST reproduce the published board cell — read the [anchor] line below"
-"$VENV" -u scripts/neuroprobe/v3_board_samplecurve.py \
+numactl --interleave=all python -u scripts/neuroprobe/v3_board_samplecurve.py \
   --cache-dir "$CACHE" --tag "$TAG" --index "$IDX" --shard-dir "$SHARDS"

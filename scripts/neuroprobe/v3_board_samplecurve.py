@@ -208,8 +208,17 @@ def _ws_curve_cell(rec, session, task, taps, contiguous=False):
                                    contiguous)
                 # Positions of the val subset WITHIN `va` -- `_fit_point` slices the standardized
                 # val block positionally, so it needs offsets, not row ids.
-                va_pos = np.searchsorted(va, va_s)
-                assert np.array_equal(va[va_pos], va_s), "val subset is not a subset of val"
+                #
+                # NOT searchsorted: `va` is NOT guaranteed ascending. It is _finite(y, split["val"]),
+                # which preserves whatever order the cached split stored, and the board readout never
+                # noticed because it only ever uses va via _feat(rec, enc, va) and y[va] -- both
+                # gathered with the SAME index, so both are order-agnostic. searchsorted silently
+                # requires sorted input and returns garbage positions otherwise.
+                # Order does not matter downstream either (features and labels are gathered with the
+                # same va_pos), so the invariant is a SET equality, not an elementwise one.
+                va_pos = np.flatnonzero(np.isin(va, va_s))
+                assert va_pos.size == va_s.size and np.array_equal(
+                    np.sort(va[va_pos]), np.sort(va_s)), "val subset is not a subset of val"
                 d_tr, d_va = _digest(tr_s), _digest(va_s)
                 want_sub = len(va_s) < len(va)
                 for tap in taps:
