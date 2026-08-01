@@ -24,7 +24,9 @@ from scripts.neuroprobe.v3_board_samplecurve import (
     FULL,
     N_GRID,
     SEEDS_FOR_N,
+    ANCHOR_TOL,
     _anchor_check,
+    _anchor_verdict,
     _curve,
     _digest,
     _reach,
@@ -55,6 +57,20 @@ def test_N_full_reproduces_the_published_ws_cell_exactly() -> None:
     assert rows, "no anchor rows produced — the check would vacuously pass"
     for r in rows:
         assert r["absdiff"] == 0.0, f"anchor drifted: {r}"
+
+
+def test_anchor_verdict_raises_on_an_empty_row_list() -> None:
+    """A guard that reports 'no violations' because it compared nothing is worse than no guard.
+    This is the only anchor failure mode that could otherwise pass silently."""
+    with pytest.raises(AssertionError, match="VACUOUS"):
+        _anchor_verdict([])
+
+
+def test_anchor_verdict_passes_exact_rows_and_catches_drifted_ones() -> None:
+    ok = [{"absdiff": 0.0}, {"absdiff": ANCHOR_TOL / 2}]
+    assert _anchor_verdict(ok) == []
+    drift = {"absdiff": 1e-4}
+    assert _anchor_verdict(ok + [drift]) == [drift]
 
 
 def test_anchor_covers_every_tap_and_every_column() -> None:

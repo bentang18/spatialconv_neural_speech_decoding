@@ -265,15 +265,44 @@ def _anchor_check(rec, task, taps, pts) -> list:
     return rows
 
 
+ANCHOR_TOL = 1e-9
+# Not a tolerance so much as a floor on "exact": the anchor path shares the eigendecomposition and
+# the eval kernels with the published one (adding an eval NAME cannot change another name's
+# arithmetic), so the honest expectation is 0.0 and anything above this is a real divergence.
+
+
+def _anchor_verdict(rows) -> list:
+    """Offending anchor rows, or [] if the anchor holds. Raises on an EMPTY row list.
+
+    The empty case is the one that has to raise rather than return []: no rows means nothing was
+    compared, and a guard that reports "no violations" because it checked nothing is worse than no
+    guard at all. Every other bad state shows up as a row with a large absdiff."""
+    if not rows:
+        raise AssertionError(
+            "🔴 ANCHOR VACUOUS: zero (tap, col) comparisons were made, so the N=full point was "
+            "never checked against the published _ws_cell. Nothing here is licensed.")
+    return [r for r in rows if r["absdiff"] >= ANCHOR_TOL]
+
+
 def _shard(cache_dir, tag, session, taps, contiguous=False) -> dict:
     rec = _load(cache_dir, session, tag, mmap=False)
     pts, census, anchor = [], [], []
-    for task in BOARD_TASKS:
+    for i, task in enumerate(BOARD_TASKS):
         p, c = _ws_curve_cell(rec, session, task, taps, contiguous)
         pts += p
         census += c
-        anchor += _anchor_check(rec, task, taps, p)
-        print(f"  [{task}] {len(p)} points", flush=True)
+        a = _anchor_check(rec, task, taps, p)
+        anchor += a
+        # FAIL FAST, on the FIRST task. A broken anchor invalidates every point in every shard, so
+        # discovering it at the end of a 12-way array costs ~20x what discovering it here does.
+        bad = _anchor_verdict(a)
+        if i == 0 and bad:
+            raise AssertionError(
+                f"🔴 ANCHOR FAILED on the first task ({task}): the N=full point does not reproduce "
+                f"the published _ws_cell. The subsample harness has perturbed the FIT, so no point "
+                f"on this curve is on the board protocol. Worst: {max(bad, key=lambda r: r['absdiff'])}")
+        print(f"  [{task}] {len(p)} points  anchor max|diff| "
+              f"{max(r['absdiff'] for r in a):.2e}", flush=True)
     return {"kind": "wscurve", "name": f"S{session[0]}T{session[1]}", "tag": tag,
             "contiguous": bool(contiguous), "points": pts, "census": census, "anchor": anchor}
 
