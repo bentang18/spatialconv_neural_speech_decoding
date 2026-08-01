@@ -606,6 +606,78 @@ def _linear_grams(z_tr, evals):
     return g, kern
 
 
+# ── λ SELECTED ON THE TRAIN HALF (--lam-cv) ───────────────────────────────────────────────────
+# WHY THIS IS NOT RE-OPENING THE CLOSED λ AXIS. The λ memo closes "every VAL-DEFINABLE rule", and
+# it is right: tie-break, slack, and all three ensemble rules were measured on the CS board and
+# every one failed to reach the per-unit oracle (.6094 published vs .6164 oracle, +.0070 on
+# 100/150 units). But every one of those rules reads the SAME val half, so they all inherit the
+# same noise -- they re-weight one noisy estimate instead of replacing it. `tiemax` moved ZERO of
+# 150 units, which says CS val is not TIED, it is picking a strictly-best-on-val λ that is not
+# best on test. That is selection VARIANCE, and the only cure for variance is more data.
+#
+# The train half is the one source never used, and it is ~14x larger: upstream's KFold gives train
+# = (k-1)/k of the session while val is HALF of one held-out fold = 1/(2k)
+# (train_test_splits.py:230-238). Selecting λ there is also strictly MORE protocol-safe than the
+# published rule, not less -- it touches no held-out data at all.
+#
+# 🔮 PRIOR, STATED BEFORE THE MEASUREMENT so the result cannot be rationalized afterwards. I expect
+# this to select LARGER λ than val does, for two compounding reasons:
+#   1. each CV model fits 0.8n rows, and the optimal λ grows as n shrinks;
+#   2. at d >> n (enc12_elec is d=1.58e6 against n<=1750) the ridge INTERPOLATES as λ→0, so a
+#      held-out fold punishes small λ harder than the val half does.
+# WS wants the opposite -- it is LO-pinned on 19.4% of units, i.e. it wants LESS shrinkage. So the
+# honest prior is that this HELPS CS (where λ is interior and the oracle gap is measured) and
+# HURTS WS. That asymmetry is the result to look for; a uniform win would be the surprise.
+# ⇒ the median selected λ is printed for BOTH rules per shard, so the mechanism is visible in the
+# log rather than inferred from the AUROCs afterwards.
+LAM_CV = False
+LAM_CV_K = 5            # fixed in advance; it is not a knob to tune against test.
+_CV_STATS: dict = {"pairs": []}
+
+
+def _cv_folds(n: int, k: int):
+    """CONTIGUOUS k-fold indices over 0..n-1.
+
+    Contiguous, not shuffled, deliberately: upstream builds its own folds with
+    ``KFold(shuffle=False)`` and comments that shuffling would "avoid correlated train/test
+    splits". Trial windows adjacent in time share a movie context, so a SHUFFLED fold leaks that
+    context across the split and would report an optimistic λ curve — the same leak class as the
+    M14 window-overlap bug. Contiguous blocks reproduce the train→held-out relationship the board
+    actually scores.
+    """
+    b = np.linspace(0, n, k + 1).astype(int)
+    return [(np.r_[0:b[i], b[i + 1]:n], np.arange(b[i], b[i + 1])) for i in range(k)]
+
+
+def _cv_curve(g, y_tr, base, k=None):
+    """{lam_mult: mean held-out AUROC} over contiguous CV folds of the TRAIN half.
+
+    Costs NO new GEMM: a fold's Gram is the submatrix ``g[ix_(tr,tr)]`` of the one already formed,
+    so the added work is k eigendecompositions of a (0.8n)² block — ~2s against the headline tap's
+    ~10 TFLOP GEMM.
+
+    ``base`` is the FULL-train trace(G)/n, deliberately shared with the main sweep rather than
+    recomputed per fold: a λ MULTIPLIER only transfers to the full-train fit if it denotes the same
+    absolute shrinkage in both places. (The two differ negligibly anyway — both are means of the
+    same diagonal — but sharing makes that exact instead of approximate.)
+    """
+    k = LAM_CV_K if k is None else k
+    y = np.asarray(y_tr, dtype=np.float64)
+    acc: dict = {m: [] for m in LAM_MULTS}
+    for tr_i, te_i in _cv_folds(len(y), k):
+        yte = y[te_i]
+        # A single-class held-out block scores NaN, not 0.5: it carries no ranking information, and
+        # averaging a fabricated 0.5 into the curve would flatten it toward indifference.
+        if len(tr_i) < 2 or len(yte) < 2 or (yte > 0).min() == (yte > 0).max():
+            continue
+        w2, v2 = np.linalg.eigh(g[np.ix_(tr_i, tr_i)])
+        c2 = v2.T @ y[tr_i]
+        gte = g[np.ix_(te_i, tr_i)]
+        for m in LAM_MULTS:
+            acc[m].append(auroc(gte @ (v2 @ (c2 / (w2 + m * base))), yte))
+    return {m: (float(np.nanmean(v)) if v else float("nan")) for m, v in acc.items()}
+
+
 def _lam_grid(z_tr, y_tr, evals, grams=None):
     """Fit ridge on (z_tr, y_tr); score every λ in LAM_MULTS on each eval set.
 
@@ -638,9 +710,24 @@ def _lam_grid(z_tr, y_tr, evals, grams=None):
                 if _capturing():
                     sc[name][m] = s
                 out[name][m] = (auroc(s, y) if len(y) >= 2 else float("nan"))
+    if LAM_CV:
+        # Keyed with a leading underscore so it can never be mistaken for an eval set: _grid_cells
+        # iterates real eval names, and a "cv" entry there would be reported as if it were a
+        # held-out score. It is a SELECTION curve computed entirely inside the train half.
+        out["_cv"] = _cv_curve(g, y_tr, base)
     if _capturing():
         out["_scores"] = sc
     return out
+
+
+def _cv_selected(d):
+    """Re-key a λ grid so _select_lam picks on the TRAIN-CV curve and reports the SAME test curve.
+
+    Nothing is refit. The published column and this one differ only in which λ is read off an
+    identical test curve, so the two are paired on the same fit by construction — the comparison
+    cannot be contaminated by a difference in features, splits, or arithmetic.
+    """
+    return None if "_cv" not in d else {"val": d["_cv"], "test": d["test"]}
 
 
 def _lam_grid_primal(z_tr, y_tr, evals):
@@ -932,6 +1019,17 @@ def _grid_cells(grid, y_va=None, y_te=None) -> dict:
     appended; the score vectors that build them are stripped here so nothing extra is written.
     """
     cells = {_cell_key(t, nm): _select_lam(d) for (t, nm), d in grid.items()}
+    if LAM_CV:
+        # The MECHANISM census, paired per (tap, fit). The stated prior is that the train-CV rule
+        # picks LARGER λ than val does; if the column then loses, this says whether it lost for the
+        # predicted reason (over-shrinkage) or for some other one. Recorded here because this is
+        # the only place both selections for one fit are in scope at once.
+        for (t, nm) in grid:
+            if nm != "std" or _cell_key(t, "std_cv") not in cells:
+                continue
+            a, b = cells[_cell_key(t, "std")], cells[_cell_key(t, "std_cv")]
+            if np.isfinite(a["lam_mult"]) and np.isfinite(b["lam_mult"]):
+                _CV_STATS["pairs"].append((float(a["lam_mult"]), float(b["lam_mult"])))
     if TAP_ENSEMBLE:
         cells.update(_tap_ensembles(cells, y_va, y_te))
     if LAM_ENSEMBLE:
@@ -989,6 +1087,10 @@ def _run_norms(grid, enc, z_tr, z_va, z_te, y_tr, y_va, y_te, cs=False):
         # primal is cheaper would make the linear column slower to serve the RBF one.
         gr = _linear_grams(a, ev) if (RBF and a.shape[1] >= a.shape[0] and len(y_tr) >= 2) else None
         grid[(enc, "std")] = _lam_grid(a, y_tr, ev, grams=gr)
+        if LAM_CV:
+            cv = _cv_selected(grid[(enc, "std")])
+            if cv is not None:
+                grid[(enc, "std_cv")] = cv
         if RBF:
             grid[(enc, "std_rbf")] = _lam_grid_rbf(a, y_tr, ev, grams=gr)
             for k in RBF_PCS:
@@ -1436,6 +1538,13 @@ def main() -> None:
                         "gap on the CS board, i.e. val picks λ noisily; averaging a val-defined "
                         "neighbourhood is the submittable way to spend that. Val-only, free "
                         "(the grid is already swept), per-tap columns unchanged.")
+    p.add_argument("--lam-cv", action="store_true",
+                   help="ALSO report '<tap>|std_cv', identical to '<tap>|std' except that λ is "
+                        f"selected by contiguous {LAM_CV_K}-fold CV INSIDE THE TRAIN HALF instead "
+                        "of on the val half. Not another val-defined rule (those are closed and "
+                        "negative) — it replaces the noisy estimate rather than re-weighting it, "
+                        "using ~14x more rows, and touches no held-out data at all. Free: a fold's "
+                        "Gram is a submatrix of the one already formed.")
     p.add_argument("--rbf", action="store_true",
                    help="ALSO report an RBF kernel-ridge column '<tap>|std_rbf' beside the linear "
                         "'<tap>|std', fit on the same standardized matrices, splits and λ grid, "
@@ -1450,9 +1559,15 @@ def main() -> None:
     args = p.parse_args()
 
     global REPORT_STD_TARGET, _ELEC_LABELS_SIDECAR, LAM_RULE, POOL_D, POOL_BANDS, LAM_GRID_DUMP
-    global TAP_ENSEMBLE, LAM_ENSEMBLE, RBF
+    global TAP_ENSEMBLE, LAM_ENSEMBLE, RBF, LAM_CV
     REPORT_STD_TARGET = args.std_target
     RBF = args.rbf
+    LAM_CV = args.lam_cv
+    # REFUSED rather than silently mis-scored: both ensemble builders treat every (tap, norm) in
+    # the grid as a member, so std_cv — which shares std's test curve exactly — would enter as a
+    # near-duplicate member and inflate its own weight.
+    assert not (LAM_CV and (args.tap_ensemble or args.lam_ensemble)), \
+        "--lam-cv cannot be combined with an ensemble flag: std_cv shares std's test curve"
     LAM_RULE = args.lam_rule
     LAM_GRID_DUMP = args.dump_lam_grid
     TAP_ENSEMBLE = args.tap_ensemble
@@ -1511,6 +1626,13 @@ def main() -> None:
                   f"min {_c.min():.4f} median {np.median(_c):.4f} max {_c.max():.4f} "
                   f"over {_c.size} fits — BELOW ~0.05 THE KERNEL CANNOT SEPARATE and a null "
                   f"result says nothing about nonlinearity, only about dimension", flush=True)
+        if LAM_CV and _CV_STATS["pairs"]:
+            _p = np.asarray(_CV_STATS["pairs"], dtype=np.float64)
+            _up = int((_p[:, 1] > _p[:, 0]).sum())
+            print(f"[check] λ rule over {len(_p)} paired fits: median mult val {np.median(_p[:, 0]):.3g} "
+                  f"vs train-CV {np.median(_p[:, 1]):.3g} | CV picked LARGER on {_up}/{len(_p)} "
+                  f"({100.0 * _up / len(_p):.0f}%) — the PREDICTED direction was larger; if the "
+                  f"column loses while this is high, it lost by over-shrinking", flush=True)
         # Phase totals are per-PROCESS: with --workers>1 the children's timers die with them,
         # so this table is the parent's view (load + merge) only. Profile with --workers 1.
         _phase_report(f"{args.mode} {sh['name']} workers={args.workers} "
