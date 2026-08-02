@@ -308,15 +308,120 @@ def _pool_spec(tap):
     return "", tap
 
 
+# ── fm: frontend-ablation column masks (2026-08-01) ────────────────────────────────
+# A virtual tap `fm:<arm>:<enc0 tap>` fits the SAME frozen ridge on a SUBSET of the enc0
+# spectrogram's feature axis. It answers ONE question: which axis of the multirate |STFT|
+# front end carries the zero-parameter enc0 result -- band presence, HGA temporal rate, or
+# HGA frequency resolution. Nothing else moves: same splits, same standardize, same λ grid,
+# same val-only selection. An arm is a REPORTED grid key like any tap, never a selected one,
+# so the published `enc0_elec|std` path is bit-identical whether or not arms are requested.
+#
+# LAYOUT. enc0/enc0_elec store, per unit, the three bands concatenated TIME-MAJOR
+# (v3_probe_encode_r4.py:367-400): [SLOW T=4 x F=7 | MID T=16 x F=6 | HGA T=32 x F=7] = 348
+# at 1 s. T_b and F_b are read from the record's OWN `band_lengths`/`band_fdims` and asserted
+# against the stored width -- never hardcoded, because F_b is not recoverable from the
+# flattened width alone (viz_reduce.py:56-68 makes the same point for the same cache).
+#
+# ENC0 ONLY. Encoder taps are (k tokens x d 256); they have no frequency axis, so the same
+# arm name would mean a different operation at each tap. Refused at parse time.
+FM = "fm:"
+_KEEP = (1, "all")          # keep every frame, every bin
+# arm -> per-band (time_stride, freq_mode) in [SLOW, MID, HGA] order; None DROPS the band.
+#   time_stride : keep frames ``[::stride]`` -- the band's own token rate, coarsened
+#   freq_mode   : "all" keeps the band's bins, "mean" averages them to ONE channel
+FEAT_ARMS: dict = {
+    "full":   (_KEEP, _KEEP, _KEEP),        # == the plain tap; bit-identity asserted by test
+    # band necessity -- where does the information live?
+    "slow":   (_KEEP, None, None),
+    "mid":    (None, _KEEP, None),
+    "hga":    (None, None, _KEEP),
+    "noslow": (None, _KEEP, _KEEP),
+    "nomid":  (_KEEP, None, _KEEP),
+    "nohga":  (_KEEP, _KEEP, None),
+    # HGA temporal rate (32 Hz native) -- the multirate hypothesis, stated as a ladder
+    "hgat16": (_KEEP, _KEEP, (2, "all")),
+    "hgat8":  (_KEEP, _KEEP, (4, "all")),
+    "hgat4":  (_KEEP, _KEEP, (8, "all")),
+    "hgat1":  (_KEEP, _KEEP, (32, "all")),
+    # HGA frequency resolution -- 7 bins collapsed to one envelope, time axis untouched
+    "hgaf1":  (_KEEP, _KEEP, (1, "mean")),
+    # is "match the rate to the band" general, or is it HGA-specific?
+    "midt4":  (_KEEP, (4, "all"), _KEEP),
+    # every band at the SLOW rate: the single-rate straw man inside our own bands
+    "allt4":  (_KEEP, (4, "all"), (8, "all")),
+}
+FM_TAPS = ("enc0", "enc0_elec")   # the only taps whose feature axis is a spectrogram
+
+
+def _fm_spec(tap):
+    """(arm, base_tap) — ('', tap) when `tap` carries no `fm:` prefix."""
+    if not tap.startswith(FM):
+        return "", tap
+    arm, sep, base = tap[len(FM):].partition(":")
+    if not sep:
+        raise SystemExit(f"{tap!r} names no tap — spell it '{FM}<arm>:<tap>'")
+    return arm, base
+
+
+def _fm_apply(x, arm, band_lengths, band_fdims):
+    """(r, U, F) fp32 → (r, U, F') under `arm`. Bands are sliced from the record's own layout.
+
+    The width assertion is the invariant: if `sum_b T_b*F_b` does not equal the stored width
+    the layout does not describe this cache, and every masked column after it would be a
+    wrong-but-plausible number rather than a crash.
+    """
+    spec = FEAT_ARMS[arm]
+    tl = [int(t) for t in band_lengths]
+    fd = [int(f) for f in band_fdims]
+    if len(tl) != len(fd) or len(spec) != len(tl):
+        raise SystemExit(f"{FM}{arm}: {len(spec)} band slots vs band_lengths {tl} / fdims {fd}")
+    total = sum(t * f for t, f in zip(tl, fd))
+    if total != x.shape[-1]:
+        raise SystemExit(f"{FM}{arm}: sum_b T_b*F_b = {total} != stored width {x.shape[-1]} — "
+                         f"band_lengths {tl} / band_fdims {fd} do not describe this cache")
+    lead, out, off = x.shape[:-1], [], 0
+    for (t_b, f_b), s in zip(zip(tl, fd), spec):
+        blk = x[..., off:off + t_b * f_b].reshape(lead + (t_b, f_b))
+        off += t_b * f_b
+        if s is None:
+            continue
+        stride, fmode = s
+        if t_b % stride:
+            raise SystemExit(f"{FM}{arm}: stride {stride} does not divide band frames {t_b}")
+        blk = blk[..., ::stride, :]
+        if fmode == "mean":
+            blk = blk.mean(axis=-1, keepdims=True)
+        out.append(blk.reshape(lead + (-1,)))
+    if not out:
+        raise SystemExit(f"{FM}{arm}: drops every band — nothing left to fit")
+    return np.concatenate(out, axis=-1)
+
+
+def _fm_width(arm, band_lengths, band_fdims) -> int:
+    """Columns per unit `arm` leaves — the width printed next to each arm's result."""
+    spec, out = FEAT_ARMS[arm], 0
+    for (t_b, f_b), s in zip(zip(band_lengths, band_fdims), spec):
+        if s is None:
+            continue
+        stride, fmode = s
+        out += (int(t_b) // stride) * (1 if fmode == "mean" else int(f_b))
+    return out
+
+
 def _cat_parts(tap):
     """The taps a virtual `cat:` tap is built from, or () if `tap` is an ordinary tap."""
-    tap = _pool_spec(tap)[1]
+    tap = _pool_spec(_fm_spec(tap)[1])[1]
     return tuple(tap[len(CAT):].split("+")) if tap.startswith(CAT) else ()
 
 
+def _base_tap(tap) -> str:
+    """The cached tap under any combination of virtual prefixes."""
+    return _pool_spec(_fm_spec(tap)[1])[1]
+
+
 def _have(rec, tap) -> bool:
-    """Is `tap` (ordinary, `cat:` or pooled) computable from this record's cached features?"""
-    return all(p in rec["feats"] for p in (_cat_parts(tap) or (_pool_spec(tap)[1],)))
+    """Is `tap` (ordinary, `cat:`, pooled or `fm:`) computable from this record's features?"""
+    return all(p in rec["feats"] for p in (_cat_parts(tap) or (_base_tap(tap),)))
 
 
 def _validate_taps(taps) -> None:
@@ -331,7 +436,19 @@ def _validate_taps(taps) -> None:
     split one result across two grid keys.
     """
     for t in taps:
-        pre, base = _pool_spec(t)
+        arm, rest = _fm_spec(t)
+        if arm:
+            # An fm: arm is defined over the enc0 spectrogram layout ONLY, and it rewrites the
+            # feature axis exactly as cat:/pool do — so, for the same reason those two are
+            # refused together, it may not stack with either.
+            if arm not in FEAT_ARMS:
+                raise SystemExit(f"unknown arm {arm!r} in {t!r}; choose from "
+                                 f"{tuple(FEAT_ARMS)}")
+            if rest not in FM_TAPS:
+                raise SystemExit(f"{t!r} masks {rest!r}, but {FM!r} arms are defined over the "
+                                 f"enc0 spectrogram layout only — choose from {FM_TAPS} "
+                                 f"(encoder taps are k tokens x d and have no frequency axis)")
+        pre, base = _pool_spec(rest)
         if pre and base.startswith(CAT):
             raise SystemExit(f"{t!r} combines {pre!r} with {CAT!r}; both rewrite the feature axis "
                              f"and nothing needs the combination — pool a single tap")
@@ -359,8 +476,9 @@ def _is_elec(tap) -> bool:
     `_validate_taps` has already refused a mixed one. Written over `_cat_parts(tap) or (tap,)`
     rather than `all(...)` alone because `all()` over the empty parts tuple of an ordinary PARCEL
     tap is vacuously True, which would route it down the electrode branch. Pooling collapses the
-    FEATURE axis and never the unit axis, so a pooled tap keeps its base tap's unit."""
-    return all(p in ELEC_TAPS for p in (_cat_parts(tap) or (_pool_spec(tap)[1],)))
+    FEATURE axis and never the unit axis, so a pooled tap keeps its base tap's unit -- and an
+    `fm:` mask is a feature-axis mask for the same reason."""
+    return all(p in ELEC_TAPS for p in (_cat_parts(tap) or (_base_tap(tap),)))
 
 
 # Token layout of one unit's cached feature block, needed to pool the time axis. Set from
@@ -419,6 +537,7 @@ def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
     two index spaces are unrelated. Validated at parse time (`_validate_taps`), not here, so the
     error names the flag the user typed.
     """
+    arm, enc = _fm_spec(enc)
     parts = _cat_parts(enc)
     if parts:
         return np.hstack([_feat(rec, p, rows, col_idx) for p in parts])
@@ -429,6 +548,12 @@ def _feat(rec, enc, rows, col_idx=None) -> np.ndarray:
             x = x[:, np.asarray(col_idx, dtype=np.int64)]
     with _timed("to_fp32"):
         x = x.to(torch.float32).numpy()
+        # Mask BEFORE the flatten, for the same reason pooling is: after reshape(r,-1) the
+        # unit and (time,freq) axes are indistinguishable and a mask over the wrong one would
+        # still produce a well-shaped array.
+        if arm:
+            with _timed("fm_mask"):
+                x = _fm_apply(x, arm, rec["band_lengths"], rec["band_fdims"])
         # Pool BEFORE the flatten: after reshape(r,-1) the unit and token axes are indisting-
         # uishable, so a mean over the wrong one would still produce a well-shaped array.
         if pre:
