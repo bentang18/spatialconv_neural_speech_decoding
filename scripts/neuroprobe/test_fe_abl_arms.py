@@ -22,6 +22,7 @@ from scripts.neuroprobe.test_v3_board_readout import _rec
 from scripts.neuroprobe.v3_board_readout import (
     BOARD_TASKS,
     FEAT_ARMS,
+    _ARM_BASE,
     _base_tap,
     _feat,
     _fm_apply,
@@ -125,6 +126,8 @@ def test_hgaf1_averages_the_bins_and_keeps_every_frame() -> None:
 def test_widths_match_the_arms_actual_output() -> None:
     x = _coded()
     for arm in FEAT_ARMS:
+        if _ARM_BASE.get(arm, BL) != BL:
+            continue                      # designed on another bake; covered by the 64 Hz tests
         assert _fm_apply(x, arm, BL, FD).shape[-1] == _fm_width(arm, BL, FD), arm
     assert _fm_width("full", BL, FD) == WIDTH
 
@@ -183,3 +186,64 @@ def test_arm_inherits_the_base_taps_unit_and_availability() -> None:
     rec["band_lengths"], rec["band_fdims"] = np.asarray(BL), np.asarray(FD)
     assert _have(rec, "fm:hga:enc0") is True
     assert _have(rec, "fm:hga:enc0_elec") is False      # not in this synthetic record
+
+
+# ── the 64 Hz HGA bake (band_v3hga): a stride is a RATE only against a stated base ──
+
+BL64 = (4, 16, 64)   # SLOW 32 Hz/::8 | MID 32 Hz/::2 | HGA 64 Hz/::1
+FD64 = (7, 6, 4)     # band_v3hga is 4 bins over 64-160 Hz
+WIDTH64 = 380        # 4*7 + 16*6 + 64*4
+
+
+def _coded64(r=3, u=2):
+    cols, off = np.zeros(WIDTH64, dtype=np.float32), 0
+    for b, (t_b, f_b) in enumerate(zip(BL64, FD64)):
+        for t in range(t_b):
+            for f in range(f_b):
+                cols[off] = b * 10000 + t * 100 + f
+                off += 1
+    assert off == WIDTH64
+    return np.broadcast_to(cols, (r, u, WIDTH64)).copy()
+
+
+def test_a_rate_arm_is_refused_on_a_bake_it_was_not_designed_on() -> None:
+    """The whole point of _ARM_BASE: `hgat16` is stride 2, which is 16 Hz on the 32 Hz bake but
+    32 Hz on the 64 Hz one. Both produce a valid-looking result, so only a name check catches it."""
+    with pytest.raises(SystemExit, match="designed on band_lengths"):
+        _fm_apply(_coded64(), "hgat16", BL64, FD64)
+    with pytest.raises(SystemExit, match="designed on band_lengths"):
+        _fm_apply(_coded(), "hga64t32", BL, FD)
+    # ...and the width helper must refuse identically, or a run could print a width for an arm
+    # that then raises mid-fit.
+    with pytest.raises(SystemExit, match="designed on band_lengths"):
+        _fm_width("hgat16", BL64, FD64)
+
+
+def test_layout_agnostic_arms_still_work_on_the_64hz_bake() -> None:
+    """`full` and the band-drop arms mean the same thing at any bake, so they carry no base."""
+    x = _coded64()
+    assert _fm_apply(x, "full", BL64, FD64).shape[-1] == WIDTH64
+    assert np.array_equal(_fm_apply(x, "full", BL64, FD64), x), "full must be the identity"
+    assert _fm_apply(x, "nohga", BL64, FD64).shape[-1] == 4 * 7 + 16 * 6
+    assert _fm_width("hga", BL64, FD64) == 64 * 4
+
+
+def test_hga64t32_halves_the_HGA_rate_and_touches_nothing_else() -> None:
+    """The rate control: 64 -> 32 Hz at a FIXED window and bin count, so `full` vs this arm
+    isolates temporal rate from the window and bin changes that come with the v3hga bake."""
+    got = _decode(_fm_apply(_coded64(), "hga64t32", BL64, FD64))
+    hga = {(t, f) for b, t, f in got if b == 2}
+    assert {t for t, _ in hga} == set(range(0, 64, 2)), "did not land on 32 frames"
+    assert {f for _, f in hga} == set(range(4)), "touched the frequency axis"
+    assert {(t, f) for b, t, f in got if b == 0} == {(t, f) for t in range(4) for f in range(7)}
+    assert {(t, f) for b, t, f in got if b == 1} == {(t, f) for t in range(16) for f in range(6)}
+
+
+def test_64hz_arm_widths_match_their_actual_output() -> None:
+    x = _coded64()
+    for arm in FEAT_ARMS:
+        if _ARM_BASE.get(arm, BL64) != BL64:
+            continue
+        assert _fm_apply(x, arm, BL64, FD64).shape[-1] == _fm_width(arm, BL64, FD64), arm
+    assert _fm_width("hga64t32", BL64, FD64) == 4 * 7 + 16 * 6 + 32 * 4
+    assert _fm_width("hga64f1", BL64, FD64) == 4 * 7 + 16 * 6 + 64 * 1

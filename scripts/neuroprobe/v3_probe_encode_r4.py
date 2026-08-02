@@ -353,6 +353,34 @@ def _pool_parcels(x, parcel_canon, present):
     return torch.stack(blocks, dim=1).to(torch.float16)           # (B, |P|, F)
 
 
+def _parse_band_rates(spec: str, n_bands: int):
+    """``'1/1,1/1,2/1'`` -> per-band ``(num, den)`` against the 32 Hz clip clock.
+
+    This DECLARES each cache's own bake rate; it is not a resampling request. Every entry is
+    checked against the cache's real ``band_hop`` by ``assert_band_rates_match_cache``, because a
+    wrong declaration yields a compressed, time-shifted slice at the RIGHT shape rather than an
+    error (the bug that invalidated four r6 runs, 2026-07-23)."""
+    rates = []
+    for part in spec.split(","):
+        num, _, den = part.strip().partition("/")
+        rates.append((int(num), int(den or 1)))
+    if len(rates) != n_bands:
+        raise SystemExit(
+            f"--band-rates got {len(rates)} entries, need {n_bands} (one per --band-cache-dir)")
+    return tuple(rates)
+
+
+def _enc0_band_lengths(bands, strides):
+    """enc0's per-band frame counts as the PAYLOAD actually carries them.
+
+    ``grid.band_lengths`` is ``clip_frames // BAND_STRIDES`` on the 32 Hz clock, which is only
+    the enc0 layout when every cache IS at 32 Hz. Under a mixed-rate bake (``--band-rates``) a
+    64 Hz HGA carries 2x the frames, and a record claiming the grid's 32 would hand every
+    downstream consumer a plausible, wrong slicing of enc0."""
+    st = _enc0_strides(bands, strides)
+    return tuple(int(-(-b.shape[-1] // s)) for b, s in zip(bands, st))  # len of x[..., ::s]
+
+
 def _enc0_strides(bands, strides):
     """Resolve/validate the per-band decimation strides shared by enc0's pooled + elec paths."""
     from speech_decoding.models.v14_converged_v3.pack_r4 import BAND_STRIDES
@@ -501,6 +529,13 @@ def main() -> None:
                         "Default = the frontend's own stem decimate (2 for v3r5/v3r5nf, 4 for "
                         "v3r5nffast) = stem parity @32Hz. Pass 1 for NO decimation = the full "
                         "native 64 Hz cache, which isolates what the stem's 2x downsample costs.")
+    p.add_argument("--band-rates", default=None,
+                   help="per-band NATIVE cache rate as num/den of the 32 Hz clip clock, aligned "
+                        "with --band-cache-dir, e.g. '1/1,1/1,2/1' for slow/mid at 32 Hz beside an "
+                        "HGA baked at 64 Hz. --enc0-only ONLY: no stem consumes mixed rates, so a "
+                        "mixed-rate encoder tap would be meaningless. Each band keeps its own "
+                        "BAND_STRIDES decimation, so 2/1 on HGA yields a 64 Hz enc0 band. The "
+                        "declaration is validated against every cache's real band_hop.")
     p.add_argument("--online", action="store_true",
                    help="probe the ONLINE encoder (objective.online.*) instead of the EMA teacher. "
                         "Required for the MAE arm (no teacher). Use it on a JEPA ckpt too for an "
@@ -553,6 +588,15 @@ def main() -> None:
         want = "(hga, lfs)" if is_two_stream else "(slow, mid, hga)"
         raise SystemExit(
             f"need {n_cache} --band-cache-dir {want}, got {len(args.band_cache_dirs)}")
+    band_rates = None
+    if args.band_rates:
+        if not (args.enc0_only or args.enc0_log):  # --enc0-log implies --enc0-only, set below
+            raise SystemExit("--band-rates is --enc0-only: no stem consumes bands at mixed rates")
+        if is_two_stream:
+            raise SystemExit("--band-rates conflicts with the 2-stream frontends (R5_BAND_RATES)")
+        band_rates = _parse_band_rates(args.band_rates, n_cache)
+        print(f"[check] band_rates={band_rates} (declared vs the 32 Hz clip clock; each cache's "
+              f"real band_hop is asserted against this in load_v3_sessions)", flush=True)
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_frames = round(args.clip_dur * FPS)
@@ -612,6 +656,8 @@ def main() -> None:
         if is_two_stream:
             from speech_decoding.models.v14_converged_v3.dataset import R5_BAND_RATES
             load_kw["band_rates"] = R5_BAND_RATES
+        elif band_rates is not None:
+            load_kw["band_rates"] = band_rates
         spec = load_v3_sessions(
             sessions=[session], band_cache_dirs=args.band_cache_dirs, span_dir=args.span_dir,
             parcel_fn=parcel_fn, lof_report_path=None,
@@ -640,7 +686,7 @@ def main() -> None:
         # r5/nf caches are native-64Hz (R5_BAND_RATES 2×); read 2·clip_frames frames per window.
         # r4 AND r6 share the uniform 32 Hz caches ⇒ rate_mult 1, no per-band rates.
         bands = _window_bands(spec, targets.clip_starts, clip_frames,
-                              rate_mult=2 if is_two_stream else 1)
+                              rate_mult=2 if is_two_stream else 1, band_rates=band_rates)
 
         geom = spec.setup.geom.to(device)
         parcel_id = spec.setup.parcel_id.to(device)
@@ -670,7 +716,8 @@ def main() -> None:
             # winsor (15,15,20 for SLOW/MID/HGA) so winsorization is not a confound. The abs cell
             # is cross-checked against the frozen-stats enc0 below to prove the refit ≈ frozen path.
             raw = _window_bands(spec, targets.clip_starts, clip_frames,
-                                rate_mult=2 if is_two_stream else 1, normalize=False)
+                                rate_mult=2 if is_two_stream else 1, band_rates=band_rates,
+                                normalize=False)
             st = (enc0_stride,) * len(raw) if enc0_stride is not None else None
             winsor_by_band = (15.0, 15.0, 20.0)
             abs_bands = [_robustz_refit(b, winsor_by_band[i]) for i, b in enumerate(raw)]
@@ -694,6 +741,24 @@ def main() -> None:
             feats = {"enc0": {"raw": _enc0_pooled(bands, canon, parcel_canon, present, st)}}
             if want_enc0_elec:
                 feats["enc0_elec"] = {"raw": _enc0_elec(bands, canon, st)}
+        # band_lengths must describe the PAYLOAD. It is grid-derived (clip_frames // BAND_STRIDES
+        # on the 32 Hz clock) everywhere else, which is only enc0's layout when every cache is at
+        # 32 Hz. Recompute from the band tensors whenever enc0 is written, and refuse to write if
+        # that disagrees with the grid on the DEFAULT path — that would mean the published enc0
+        # layout moved under us.
+        enc0_lengths = tuple(int(x) for x in grid.band_lengths)
+        if feats:
+            st_now = (enc0_stride,) * len(bands) if enc0_stride is not None else None
+            enc0_lengths = _enc0_band_lengths(bands, st_now)
+            fd = tuple(int(b.shape[-2]) for b in bands)
+            default_path = band_rates is None and enc0_stride is None and not is_two_stream
+            if default_path and enc0_lengths != tuple(int(x) for x in grid.band_lengths):
+                raise RuntimeError(
+                    f"enc0 band_lengths {enc0_lengths} != grid {tuple(grid.band_lengths)} on the "
+                    f"DEFAULT path — the published enc0 layout changed; refusing to write")
+            print(f"[check] enc0 band_lengths={enc0_lengths} band_fdims={fd} "
+                  f"width={sum(t * f for t, f in zip(enc0_lengths, fd))} "
+                  f"grid={tuple(int(x) for x in grid.band_lengths)}", flush=True)
         if args.enc0_only:
             tap_pooled = {}
         else:
@@ -713,7 +778,7 @@ def main() -> None:
             # stuck with the mean baked in here. present_parcels alone is not enough: it gives the
             # parcel ORDER but not the membership.
             "parcel_canon": np.asarray(parcel_canon, dtype=np.int64),
-            "band_lengths": tuple(int(x) for x in grid.band_lengths),
+            "band_lengths": enc0_lengths,
             # Frequency bins per band. band_lengths alone does NOT let a consumer slice enc0 by
             # band: the encoder taps are (k_full, d) so band_lengths is enough there, but enc0 is
             # the raw spectrogram at Σ_b F_b·T_b, and F_b is not recoverable from that total.

@@ -349,8 +349,37 @@ FEAT_ARMS: dict = {
     "midt4":  (_KEEP, (4, "all"), _KEEP),
     # every band at the SLOW rate: the single-rate straw man inside our own bands
     "allt4":  (_KEEP, (4, "all"), (8, "all")),
+    # --- 64 Hz HGA bake (band_v3hga: 31.25 ms window, 64 Hz, 4 bins). Layout (4,16,64). ---
+    # Separately named because a STRIDE means a different RATE on a different base: `hgat16` is
+    # stride 2, which is 16 Hz on the 32 Hz bake and 32 Hz on this one. Reusing it would relabel
+    # the arm rather than repeat it, so _ARM_BASE below refuses the mismatch outright.
+    "hga64t32": (_KEEP, _KEEP, (2, "all")),   # 64 -> 32 Hz: THE rate control vs "full"
+    "hga64t16": (_KEEP, _KEEP, (4, "all")),
+    "hga64f1":  (_KEEP, _KEEP, (1, "mean")),
+}
+# arm -> the per-band frame counts it was DESIGNED on, for arms whose meaning depends on the base
+# rate (a time stride > 1, or a stride ladder read as a rate). None = layout-agnostic: `full` and
+# the band-drop arms mean the same thing at any bake, so they carry no assumption.
+_ARM_BASE: dict = {
+    "hgat16": (4, 16, 32), "hgat8": (4, 16, 32), "hgat4": (4, 16, 32), "hgat1": (4, 16, 32),
+    "midt4": (4, 16, 32), "allt4": (4, 16, 32),
+    "hga64t32": (4, 16, 64), "hga64t16": (4, 16, 64), "hga64f1": (4, 16, 64),
 }
 FM_TAPS = ("enc0", "enc0_elec")   # the only taps whose feature axis is a spectrogram
+
+
+def _fm_check_base(arm, band_lengths) -> None:
+    """Refuse an arm whose name encodes a rate the record's layout does not have.
+
+    Without this, `fm:hgat16` on the 64 Hz bake yields a complete, plausible 32 Hz result filed
+    under a 16 Hz name -- the arm-mixing defect, which is silent by construction because every
+    shape still checks out."""
+    want = _ARM_BASE.get(arm)
+    got = tuple(int(t) for t in band_lengths)
+    if want is not None and got != want:
+        raise SystemExit(
+            f"{FM}{arm}: designed on band_lengths {want}, record has {got}. A time stride names a "
+            f"different RATE on a different bake -- pick the arm for THIS layout instead.")
 
 
 def _fm_spec(tap):
@@ -371,6 +400,7 @@ def _fm_apply(x, arm, band_lengths, band_fdims):
     wrong-but-plausible number rather than a crash.
     """
     spec = FEAT_ARMS[arm]
+    _fm_check_base(arm, band_lengths)
     tl = [int(t) for t in band_lengths]
     fd = [int(f) for f in band_fdims]
     if len(tl) != len(fd) or len(spec) != len(tl):
@@ -399,6 +429,7 @@ def _fm_apply(x, arm, band_lengths, band_fdims):
 
 def _fm_width(arm, band_lengths, band_fdims) -> int:
     """Columns per unit `arm` leaves — the width printed next to each arm's result."""
+    _fm_check_base(arm, band_lengths)
     spec, out = FEAT_ARMS[arm], 0
     for (t_b, f_b), s in zip(zip(band_lengths, band_fdims), spec):
         if s is None:
