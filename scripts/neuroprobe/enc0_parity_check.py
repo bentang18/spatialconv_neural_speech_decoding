@@ -3,8 +3,10 @@
 
 The 64 Hz HGA arm is only interpretable if the same script, run with uniform rates on the same
 caches, reproduces the enc0 the board numbers were computed from. enc0 touches no weights, so
-this should be exact up to cross-architecture float reassociation (the published records were
-encoded on DeltaAI aarch64; this runs on Delta CPU x86).
+the comparison should be BIT-exact: both sides were encoded on DeltaAI aarch64, so there is no
+cross-architecture float reassociation to absorb. --rtol survives as a floor for the case where
+a reference predates that, but a merely-within-tolerance result on this pairing is itself a
+finding and the summary line reports the bit-exact count separately.
 
 Compares the taps AND the metadata a consumer slices them with -- a matching tap under a
 different band layout, row count or label vector would still be a different experiment.
@@ -49,8 +51,10 @@ def main() -> None:
         if not (os.path.exists(pub) and os.path.exists(new)):
             print(f"[skip] s{s}_t{t}: pub={os.path.exists(pub)} new={os.path.exists(new)}")
             continue
-        P = torch.load(pub, map_location="cpu", weights_only=False)
-        N = torch.load(new, map_location="cpu", weights_only=False)
+        # mmap: the reference may be a FULL board record (44-71 GB, ~99% encoder taps this never
+        # reads). An eager load faults all of it in and OOMs — it killed job 20807953 at 24G.
+        P = torch.load(pub, map_location="cpu", weights_only=False, mmap=True)
+        N = torch.load(new, map_location="cpu", weights_only=False, mmap=True)
         n_seen += 1
 
         # Metadata first: a matching tap under a different layout is a different experiment.
