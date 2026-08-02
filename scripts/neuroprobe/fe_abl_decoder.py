@@ -71,6 +71,12 @@ SEED = 42          # upstream's default seed (eval_population.py argparse defaul
 # the same amount of searching for both estimators. C is INVERSE regularization, hence no reversal
 # is needed for the comparison to be fair — only the span matters.
 C_GRID = tuple(np.logspace(-4, 4, 25))
+# MEASURED 2026-08-01: on the CS anchor fit (n=13592 > d=5568) this grid PINS AT ITS FLOOR —
+# 78/150 fits chose C=1e-4 and 114/150 chose C<=1e-3, i.e. the optimum is at least 10^4x more
+# shrinkage than the sklearn default and lies BELOW the floor. A pinned floor makes the tuned
+# arm a LOWER BOUND on what tuning is worth, which understates exactly the effect being measured,
+# so the span is a CLI knob and CS must be run wide enough to leave the floor interior.
+C_SPAN_WIDE = (-10.0, 4.0, 57)
 
 
 def _NAME(c_grid) -> str:
@@ -196,8 +202,14 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--c-grid", action="store_true",
                    help="select C on the val half (arm `logregcv`) instead of the C=1.0 default")
+    p.add_argument("--c-span", default=None, metavar="LO,HI,N",
+                   help="logspace(LO,HI,N) for --c-grid; widen when the floor pins "
+                        f"(measured-wide default {C_SPAN_WIDE})")
     a = p.parse_args()
-    c_grid = C_GRID if a.c_grid else None
+    c_grid = None
+    if a.c_grid:
+        lo, hi, n = ([float(v) for v in a.c_span.split(",")] if a.c_span else C_SPAN_WIDE)
+        c_grid = tuple(np.logspace(lo, hi, int(n)))
 
     import sklearn
 
@@ -208,7 +220,7 @@ def main() -> None:
     cell = cells[a.index]
     print(f"[decoder-parity] mode={a.mode} cell=S{cell[0]}T{cell[1]} taps={taps} "
           f"arm={_NAME(c_grid)} clf=LogisticRegression("
-          f"C={'val-selected over logspace(-4,4,25)' if c_grid else '1.0 (sklearn default)'}, "
+          f"C={f'val-selected over {len(c_grid)} pts in [{c_grid[0]:.2g},{c_grid[-1]:.2g}]' if c_grid else '1.0 (sklearn default)'}, "
           f"max_iter=10000, tol=1e-3, seed={SEED})", flush=True)
 
     if a.mode == "ws":
