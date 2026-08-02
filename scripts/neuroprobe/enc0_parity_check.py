@@ -24,6 +24,26 @@ LITE_SESSIONS = ((1, 1), (1, 2), (2, 0), (2, 4), (3, 0), (3, 1),
 TAPS = ("enc0", "enc0_elec")
 
 
+def _same(x, y) -> bool:
+    """Structural equality for the record's non-tap fields.
+
+    These are the fields the READOUT slices with, and they are not all arrays: `labels` and the
+    splits are dicts keyed by task/fold. A shallow `!=` on a dict of arrays raises rather than
+    answering, and `np.array_equal` on a dict silently returns False, so both failure modes would
+    read as 'differs' and neither would be true. Recurse instead."""
+    if isinstance(x, dict) or isinstance(y, dict):
+        if not (isinstance(x, dict) and isinstance(y, dict)) or set(x) != set(y):
+            return False
+        return all(_same(x[k], y[k]) for k in x)
+    if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
+        return (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)
+                and x.shape == y.shape and bool(torch.equal(x, y)))
+    xa, ya = np.asarray(x), np.asarray(y)
+    if xa.dtype.kind in "fc" or ya.dtype.kind in "fc":
+        return xa.shape == ya.shape and bool(np.allclose(xa, ya))
+    return bool(np.array_equal(xa, ya))
+
+
 def _cmp(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, bool]:
     """max|Δ|, max|Δ| relative to the reference's scale, and bit-equality."""
     exact = a.shape == b.shape and torch.equal(a, b)
@@ -67,6 +87,15 @@ def main() -> None:
             failures.append(f"s{s}_t{t} present_parcels differ ({len(pl)} vs {len(nl)})")
         if not np.allclose(np.asarray(P["clip_starts"]), np.asarray(N["clip_starts"])):
             failures.append(f"s{s}_t{t} clip_starts differ — different windows entirely")
+        # Everything else the READOUT slices with. Bit-exact taps under a different label vector
+        # or a different fold assignment would score a different experiment at full confidence,
+        # which is the failure this gate exists to prevent. ckpt_tag is excluded deliberately: it
+        # is the arm's NAME and is supposed to differ.
+        for k in ("parcel_canon", "labels", "ws_split", "cs_split"):
+            if (k in P) != (k in N):
+                failures.append(f"s{s}_t{t} {k}: present in pub={k in P} new={k in N}")
+            elif k in P and not _same(P[k], N[k]):
+                failures.append(f"s{s}_t{t} {k} differs — same features, different experiment")
 
         for tap in TAPS:
             if tap not in P["feats"] or tap not in N["feats"]:
