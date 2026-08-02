@@ -40,7 +40,16 @@ cd "$TREE"
 module load pytorch-conda/2.8
 # The script is run as `-m scripts.neuroprobe...` (PEP 420 namespace pkg), so the TREE ROOT must
 # be importable, and src/ carries speech_decoding.
-export PYTHONPATH="$TREE:$TREE/src:${PYTHONPATH:-}"
+#
+# USER_SITE is on PYTHONPATH deliberately. The encode's import closure reaches `mne` (via
+# braintreebank/study.py), which is installed in ~/.local but INVISIBLE here: the pytorch-conda
+# env sets ENABLE_USER_SITE=False, so the interpreter prints a user-site path it never adds. The
+# readout never imports mne, which is why only the encode trips on it. Adding the path is
+# deliberately preferred over `pip install --user`: the user-site dir is shared with every job on
+# this module, and a pip run there could drag numpy/scipy under the LOCKED readout.
+USER_SITE=$(python -c 'import site; print(site.USER_SITE)')
+export PYTHONPATH="$TREE:$TREE/src:$USER_SITE:${PYTHONPATH:-}"
+python -c 'import mne; print("[check] mne", mne.__version__)'
 export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
 export EXCA_CACHE_FOLDER=/work/nvme/bhqk/htang13/cache_neuroai
 
