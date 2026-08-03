@@ -46,6 +46,7 @@ a number. The claim tested here is SHAPE -- through the origin or flat.
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import sys
 import warnings
@@ -71,7 +72,12 @@ CURVES = {"ws": SRC / "samplecurve_pbs50_cd45k.json",
           "cs": SRC / "samplecurve_cs_pbs50_cd45k.json"}
 COL = "trainonly"
 NBOOT = 4000
-# Transcribed from `paper_figs_r6.py:654`, itself the ledger's set. Not redefined here.
+# Transcribed from `paper_figs_r6.py:648-654`, itself the ledger's set. Not redefined here --
+# the event/level cut comes from the LABEL DEFINITIONS, so this analysis cannot quietly invent a
+# grouping that flatters it.
+EVENT = ("onset", "speech", "delta_volume", "word_index", "word_head_pos",
+         "word_length", "gpt2_surprisal", "word_gap", "word_part_speech")
+LEVEL = ("volume", "pitch", "local_flow", "global_flow", "face_num", "frame_brightness")
 VISUAL = ("local_flow", "global_flow", "face_num", "frame_brightness")
 
 
@@ -173,6 +179,40 @@ def ledger_check(r, nperm=10000, seed=0) -> dict:
             "null_hi": float(np.percentile(np.abs(null), 95)), "nperm": nperm}
 
 
+def selectivity_check(r) -> dict:
+    """Is the scatter around the fitted line STRUCTURED by the event/level cut?
+
+    THIS EXISTS TO STOP THIS ANALYSIS FROM ERASING A HARDENED FINDING. Fitting ONE slope across all
+    tasks says "the benefit is a fixed multiple of headroom" and implicitly treats every deviation
+    as noise. But the ledger's per-task result is a clean event-over-level split, which means the
+    deviations are not noise -- they ARE the change-coded selectivity. If the level tasks sit
+    systematically below the line, then K is a SUMMARY of a family-dependent multiplier, not a law,
+    and it must be written that way.
+
+    Tested on the RESIDUAL `gap - (A + K*headroom)`, never on a per-task ratio: dividing by an enc0
+    that sits near chance is the blow-up `paper_figs_r6._k` documents.
+
+    NULL, exact and combinatorial, no bootstrap needed: under random assignment of families to
+    tasks, the probability that all `nl` level tasks land on the `nl` most-negative residuals is
+    1 / C(n, nl). With 11 non-visual tasks and 2 level tasks that is 1/55 = .018, so the test can
+    fire at all -- state it before reading the answer.
+    """
+    x, y = np.asarray(r["headroom"], float), np.asarray(r["gap"], float)
+    resid = y - (r["A"] + r["K"] * x)
+    order = np.argsort(resid)                              # most negative first
+    lvl = {i for i, t in enumerate(r["tasks"]) if t in LEVEL}
+    evt = {i for i, t in enumerate(r["tasks"]) if t in EVENT}
+    n, nl = len(r["tasks"]), len(lvl)
+    if nl == 0 or nl == n or lvl | evt != set(range(n)):
+        return {"testable": False, "n_level": nl, "n_event": len(evt), "n": n}
+    ranks = sorted(((int(np.where(order == i)[0][0]), r["tasks"][i]) for i in lvl))
+    return {"testable": True, "n": n, "n_level": nl,
+            "all_bottom": lvl == set(order[:nl].tolist()),
+            "p_exact": 1.0 / math.comb(n, nl),
+            "level_ranks": {t: rk for rk, t in ranks},
+            "resid": resid, "order": order}
+
+
 def verdict(r) -> str:
     """NULLS STATED BEFORE THE FIT: A = 0 (through the origin), K = 0 (flat)."""
     a_sig = not (r["A_ci"][0] <= 0 <= r["A_ci"][1])
@@ -241,14 +281,27 @@ def main() -> None:
                                      'no order agreement at this n — 🚫 do not claim the axes align'}")
                     print("      🔴 same model, same test sets — two ESTIMATORS agreeing, NOT two "
                           "independent experiments. Magnitudes differ ~2x and are not claimed.")
+                sel = selectivity_check(r)
+                if sel["testable"]:
+                    print(f"    SELECTIVITY  are the {sel['n_level']} LEVEL tasks the "
+                          f"{sel['n_level']} most-NEGATIVE residuals off the fitted line?")
+                    print(f"      exact null P = 1/C({sel['n']},{sel['n_level']}) = "
+                          f"{sel['p_exact']:.4f}   level ranks (0 = most negative): "
+                          f"{sel['level_ranks']}")
+                    print(f"      ⇒ {'YES — the scatter is STRUCTURED by the event/level cut ⇒ K is a '
+                                     'SUMMARY of a family-dependent multiplier, NOT a law'
+                                     if sel['all_bottom'] else
+                                     'NO — level tasks are not the bottom; 🚫 do not claim the '
+                                     'across-N axis reproduces the event/level split'}")
                 order = np.argsort(-r["headroom"])
+                resid = sel.get("resid")
                 print("    per task (sorted by headroom, meanN):")
                 for i in order:
                     t = r["tasks"][i]
-                    print(f"      {t:>18}  headroom {r['headroom'][i]:+.4f}"
-                          f"   gap {r['gap'][i]:+.4f}"
-                          f"   ledger k {LEDGER_K[t]:.3f}"
-                          f"   predicted gap {(LEDGER_K[t] - 1) * r['headroom'][i]:+.4f}")
+                    fam = "EVENT" if t in EVENT else "level"
+                    res = f"   resid {resid[i]:+.4f}" if resid is not None else ""
+                    print(f"      {t:>18} {fam}  headroom {r['headroom'][i]:+.4f}"
+                          f"   gap {r['gap'][i]:+.4f}{res}   ledger k {LEDGER_K[t]:.3f}")
 
 
 if __name__ == "__main__":
