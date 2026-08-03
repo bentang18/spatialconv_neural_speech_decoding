@@ -95,6 +95,19 @@ def _pooled(cells: dict, tasks) -> float:
     return _k([p for t in tasks for p in cells[t].values()])
 
 
+# Claims-table M2b, canonical checkpoint, computed FROM THE SHARDS. This file computes k from the
+# CURVE ANCHOR instead -- a different code path over different files. They must agree, and checking
+# it is what makes this a recomputation of a known quantity rather than a new number nobody can
+# cross-check. Values are quoted to 2dp in the table, hence the tolerance.
+M2B_CS = {"onset": 1.32, "speech": 1.30, "delta_volume": 1.22, "volume": 1.04, "pitch": 0.64}
+M2B_TOL = 0.005
+
+
+def m2b_parity(per_task: dict) -> list:
+    return [(t, v, per_task[t], abs(per_task[t] - v))
+            for t, v in M2B_CS.items() if t in per_task]
+
+
 def split_stats(cells: dict, tasks, nperm=10000, seed=0) -> dict:
     ev = [t for t in tasks if t in EVENT]
     lv = [t for t in tasks if t in LEVEL]
@@ -167,6 +180,19 @@ def report(name, cells) -> dict:
               f"boundary pair  event-floor {s['boundary'][0]} "
               f"{s['per_task'][s['boundary'][0]]:.3f}  vs  level-ceiling {s['boundary'][1]} "
               f"{s['per_task'][s['boundary'][1]]:.3f}")
+    if res and name == "cs":
+        rows = m2b_parity(res[max(res)]["per_task"])
+        if rows:
+            worst = max(r[3] for r in rows)
+            print(f"\n    ✅ PARITY vs claims-table M2b (computed FROM SHARDS, a different code "
+                  f"path): {len(rows)}/{len(M2B_CS)} tasks, max |diff| {worst:.4f}")
+            for t, want, got, d in rows:
+                print(f"       {t:>14}  M2b {want:.2f}   anchor {got:.3f}   |diff| {d:.4f}"
+                      f"{'' if d < M2B_TOL else '   ❌ DRIFT'}")
+            assert worst < M2B_TOL, (
+                f"anchor-derived k disagrees with M2b's shard-derived k by {worst:.4f} — one of the "
+                "two paths has drifted and neither number is safe to quote until that is resolved")
+
     if res:
         s = res[max(res)]
         print("\n    per task (canonical arm; ledger column is a 4-BOARD MEAN, orientation only, "

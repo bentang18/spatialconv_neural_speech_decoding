@@ -86,6 +86,19 @@ def test_anchor_cells_ignores_non_anchor_points_and_other_columns() -> None:
     assert got["onset"]["S1T1"] == (0.6, 0.7)
 
 
+def test_m2b_parity_reports_drift_rather_than_hiding_it() -> None:
+    """The parity check is the reason this is a recomputation of a KNOWN quantity and not a new
+    number. If it silently tolerated drift it would be worse than absent, so plant a drifted k and
+    check the reported difference actually exceeds the tolerance."""
+    from scripts.neuroprobe.r31_family_split import M2B_CS, M2B_TOL, m2b_parity
+    clean = m2b_parity(dict(M2B_CS))
+    assert len(clean) == len(M2B_CS)
+    assert max(d for *_, d in clean) == pytest.approx(0.0, abs=1e-12)
+
+    drifted = m2b_parity({**M2B_CS, "pitch": M2B_CS["pitch"] + 0.25})
+    assert max(d for *_, d in drifted) > M2B_TOL
+
+
 def test_gap_ci_resamples_subjects_not_cells() -> None:
     """Two sessions of one patient are one draw. With every subject identical, resampling
     subjects can only ever return the same gap, so the CI must collapse to a point -- a
