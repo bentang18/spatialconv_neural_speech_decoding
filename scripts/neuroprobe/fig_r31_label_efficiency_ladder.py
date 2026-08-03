@@ -10,9 +10,15 @@ Same two panels as `fig_r31_samplecurve.py`, once per regime:
 the ws row here reads ~2.8x and the claims-table headline (D1) reads 2.69x -- SAME measurement,
 different column, NOT a correction. 🚫 Never quote a number off this figure next to D1's 2.69x.
 
-⚠️ THE X-RANGES ARE NOT COMMON. ws tops out at 1750 labelled trials (half a session); csession and
-cs both top out at 3500. So the ws saving sits on a shorter axis than the other two, and the
-cleanly comparable pair is csession-vs-cs. The suptitle says so; do not crop it off.
+⚠️ THE AXIS RANGES ARE SHARED, THE AXES ARE NOT THE SAME AXIS. Every row is drawn on identical
+x and y limits so a saving in one row is the same number of centimetres as a saving in another --
+that is the only reason they are shared. N still MEANS a different thing per row (target-session
+trials / other-session trials, same patient / donor-session trials), which is why each row keeps
+its own x label and why the rows stay separate panels. See `fig_r31_ws_vs_cs.py:9`.
+
+⚠️ ws still tops out at 1750 labelled trials (half a session) where csession and cs reach 3500, so
+the ws curve simply ends earlier on the shared axis. The cleanly comparable pair is csession-vs-cs.
+The suptitle says so; do not crop it off.
 
 The gates (anchor exact, unit count) and the tap map are IMPORTED from `fig_r31_ws_vs_cs`, not
 restated -- a second copy of a gate is a gate that can silently drift from the first.
@@ -84,6 +90,8 @@ def panel_falsifier(ax, d, colour, short):
     r_add = float(np.sqrt(np.mean((gap - a_add) ** 2)))
     r_mul = float(np.sqrt(np.mean((gap - (k_mult - 1) * xs) ** 2)))
 
+    # Fit drawn only over the headroom THIS regime spans -- extrapolating cs's origin-line out to
+    # ws's headroom would draw a prediction on data cs never saw, and it stretches the shared y.
     gx = np.linspace(0, xs.max() * 1.06, 100)
     ax.plot(gx, (k_mult - 1) * gx, "-", color=GREY, lw=1.4,
             label=f"multiplicative  $k$={k_mult:.3f}\n(through origin)")
@@ -93,9 +101,6 @@ def panel_falsifier(ax, d, colour, short):
         ax.annotate(t, (xi, gi), textcoords="offset points", xytext=o, ha="center",
                     va="bottom" if o[1] > 0 else "top", fontsize=5.5, color=colour)
 
-    ax.set_xlim(0, xs.max() * 1.06)
-    ax.set_ylim(min(0, gap.min() * 1.15),
-                max(gap.max(), (k_mult - 1) * xs.max()) * 1.34)
     ax.axhline(0, color="#ccc", lw=.8, zorder=0)
     ax.set_xlabel(r"enc0 headroom  (AUROC$_0$ $-$ 0.5)")
     ax.set_ylabel(r"enc12 $-$ enc0  (AUROC)")
@@ -103,7 +108,9 @@ def panel_falsifier(ax, d, colour, short):
     ax.set_title(f"{short}  ·  gap is {win}   rmse {r_add:.4f} vs {r_mul:.4f}",
                  loc="left", fontsize=8)
     ax.legend(loc="lower right", fontsize=6.2)
-    return dict(a=a_add, k=k_mult, r_add=r_add, r_mul=r_mul)
+    return dict(a=a_add, k=k_mult, r_add=r_add, r_mul=r_mul,
+                lo=min(0.0, float(gap.min())),
+                hi=max(float(gap.max()), (k_mult - 1) * xs.max() * 1.06))
 
 
 def main() -> None:
@@ -111,6 +118,16 @@ def main() -> None:
 
     _style()
     fig, axes = plt.subplots(3, 2, figsize=(7.6, 8.6))
+
+    # SHARED RANGES, computed before anything is drawn so no row is scaled to itself. A saving
+    # spanning half a panel must span half a panel in every row or the rows cannot be eyeballed
+    # against each other -- that, and only that, is what sharing the limits buys here.
+    gx_max = max(v - .5 for d in got.values() for v in d["c0"].values()) * 1.06
+    lo_a = min(v for d in got.values() for v in d["c0"].values())
+    hi_a = max(v for d in got.values() for v in d["c12"].values())
+    pad = (hi_a - lo_a) * .07
+    x_lo = min(n for d in got.values() for n in d["c0"] if n != FULL) / 1.45
+    x_hi = max(d["n_full"] for d in got.values()) * 1.45
 
     rows = []
     for i, r in enumerate(ORDER):
@@ -120,10 +137,19 @@ def main() -> None:
         b = panel_falsifier(axes[i][1], d, s["colour"], f"{'ABC'[i]}{i + 1} · {s['short']}")
         rows.append((r, s, d, a, b))
 
+    y_lo = min(b["lo"] for *_, b in rows) * 1.15
+    y_hi = max(b["hi"] for *_, b in rows) * 1.30
+    for i in range(3):
+        axes[i][0].set_xlim(x_lo, x_hi)
+        axes[i][0].set_ylim(lo_a - pad, hi_a + pad)
+        axes[i][1].set_xlim(0, gx_max)
+        axes[i][1].set_ylim(y_lo, y_hi)
+
     fig.suptitle(
         "R31 · label efficiency across the three rungs · pbs50_cd45k · column 'trainonly' "
         "(the only column all three regimes share — ws reads 2.8× here vs 2.69× on 'both')\n"
-        "180 / 180 / 150 units · anchors exact (max |curve−published| = 0e+00) · "
+        "180 / 180 / 150 units · anchors exact (max |curve−published| = 0e+00) · rows share x and y "
+        "RANGES so the savings compare by eye, but N means a different thing per row (see x labels)\n"
         "⚠ ws tops out at 1750 trials, csession and cs at 3500 — csession-vs-cs is the "
         "cleanly comparable pair",
         fontsize=7.0, y=1.005, color="#444")
