@@ -287,8 +287,10 @@ def main() -> None:
         print(f"\n{'─' * 96}\nWS vs CS, 11 non-visual tasks")
         print(f"  event-level gap:  ws {gw:+.3f}   cs {gc:+.3f}   difference {gc - gw:+.3f}")
         print("  ⚠️ TAPS DIFFER (enc*_elec vs parcel-mean enc*) — the readout unit moved with the")
-        print("     brain, so read the PRESENCE/ABSENCE of the split, never the size of the")
-        print("     difference. csession is the tap-matched rung.")
+        print("     brain, so the two k LEVELS are not comparable. Their DIFFERENCE above is")
+        print("     (the unit cancels inside each regime's own contrast), but on the 11 non-visual")
+        print("     tasks it does NOT clear its null — so on the argument unit claim PRESENCE vs")
+        print("     ABSENCE off the interleaving test, not a magnitude. csession is the tap-matched rung.")
         if "csession" in got and 11 in got["csession"]:
             print(f"  ✅ TAP-MATCHED rung available: csession gap {got['csession'][11]['gap']:+.3f}")
         else:
