@@ -86,6 +86,32 @@ def test_anchor_cells_ignores_non_anchor_points_and_other_columns() -> None:
     assert got["onset"]["S1T1"] == (0.6, 0.7)
 
 
+def test_did_fires_when_only_one_regime_has_the_split() -> None:
+    """The dissociation case: family-blind in A, split in B. That is the whole claim."""
+    from scripts.neuroprobe.r31_family_split import did_test
+    flat = _cells(lambda t: 1.10)
+    split = _cells(lambda t: 1.30 if t in EVENT else 0.90)
+    d = did_test(flat, split, list(NONVIS), nperm=2000)
+    assert d["testable"] and d["did"] == pytest.approx(0.40, abs=1e-9) and d["p"] < 0.05
+
+
+def test_did_is_null_when_both_regimes_have_the_SAME_split() -> None:
+    """The statistic must be blind to a split that is present in both — otherwise it would report
+    a dissociation wherever the family cut has any effect at all."""
+    from scripts.neuroprobe.r31_family_split import did_test
+    a = _cells(lambda t: 1.30 if t in EVENT else 0.90)
+    b = _cells(lambda t: 1.30 if t in EVENT else 0.90)
+    d = did_test(a, b, list(NONVIS), nperm=2000)
+    assert d["did"] == pytest.approx(0.0, abs=1e-9) and d["p"] > 0.05
+
+
+def test_did_refuses_when_a_family_has_fewer_than_two_tasks() -> None:
+    from scripts.neuroprobe.r31_family_split import did_test
+    tasks = list(EVENT) + ["volume"]                      # one level task only
+    a, b = _cells(lambda t: 1.1, tasks=tasks), _cells(lambda t: 1.2, tasks=tasks)
+    assert did_test(a, b, tasks, nperm=100)["testable"] is False
+
+
 def test_m2b_parity_reports_drift_rather_than_hiding_it() -> None:
     """The parity check is the reason this is a recomputation of a KNOWN quantity and not a new
     number. If it silently tolerated drift it would be worse than absent, so plant a drifted k and

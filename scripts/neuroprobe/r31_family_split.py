@@ -156,6 +156,45 @@ def gap_ci(cells: dict, tasks, nboot=NBOOT, seed=0) -> tuple:
     return float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5)), len(subs)
 
 
+def did_test(cells_a, cells_b, tasks, nperm=10000, seed=0) -> dict:
+    """Difference-in-differences: (event - level)_b  -  (event - level)_a.
+
+    WHY THIS ONE IS QUOTABLE WHEN THE RAW `k` LEVELS ARE NOT. ws reads per-electrode and cs reads
+    parcel-mean, so comparing k_event across regimes carries a readout-unit confound and the
+    ledger bans that ratio. But each SIDE of this statistic is a contrast computed INSIDE one
+    regime, on one unit and one tap pair, so the unit cancels -- which is exactly the ledger's own
+    justification for quoting `(lang-vis)_CS - (lang-vis)_WS = +0.337, perm p .0187`. This is the
+    same shape of statistic with the event/level cut in place of the modality cut.
+
+    NULL, stated first: the family cut has the SAME effect in both regimes, i.e. the difference is
+    0. Permute the family assignment over tasks and apply the SAME permutation to both regimes, so
+    the null preserves each regime's own task difficulty profile and only destroys the family
+    labelling. n_eff is the number of TASKS, not the number of cells.
+    """
+    shared = [t for t in tasks if t in cells_a and t in cells_b]
+    ev = [t for t in shared if t in EVENT]
+    lv = [t for t in shared if t in LEVEL]
+    if len(ev) < 2 or len(lv) < 2:
+        return {"testable": False, "n_event": len(ev), "n_level": len(lv)}
+
+    def gap(cells, e, l):
+        return _pooled(cells, e) - _pooled(cells, l)
+
+    obs = gap(cells_b, ev, lv) - gap(cells_a, ev, lv)
+    rng = np.random.default_rng(seed)
+    idx, nl = np.arange(len(shared)), len(lv)
+    null = []
+    for _ in range(nperm):
+        perm = rng.permutation(idx)
+        lv_p = [shared[i] for i in perm[:nl]]
+        ev_p = [shared[i] for i in perm[nl:]]
+        null.append(gap(cells_b, ev_p, lv_p) - gap(cells_a, ev_p, lv_p))
+    null = np.asarray(null)
+    return {"testable": True, "did": obs, "n_tasks": len(shared),
+            "p": float((np.abs(null) >= abs(obs)).mean()),
+            "null_hi": float(np.percentile(np.abs(null), 95)), "nperm": nperm}
+
+
 def report(name, cells) -> dict:
     print(f"\n{'─' * 96}\n{name.upper()}   canonical arm pbs50_cd45k, anchor (N=full)")
     got = sorted(cells)
@@ -212,7 +251,7 @@ def main() -> None:
     print("  k = no-intercept slope of (tap-.5) on (enc0-.5) over CELLS at the anchor.")
     print("  🚫 The ledger's table is a 4-board mean — printed for orientation, never asserted.")
 
-    got = {}
+    got, raw_cells = {}, {}
     for name, spec in REGIMES.items():
         f = SRC / spec["src"]
         if not f.exists():
@@ -224,7 +263,24 @@ def main() -> None:
         if not cells:
             print(f"\n[skip] {name}: no anchor cells at col={COL}")
             continue
+        raw_cells[name] = cells
         got[name] = report(name, cells)
+
+    for a, b in (("ws", "cs"), ("ws", "csession"), ("csession", "cs")):
+        if a not in raw_cells or b not in raw_cells:
+            continue
+        print(f"\n{'─' * 96}\nDIFFERENCE-IN-DIFFERENCES  ({b} − {a}) of the event−level gap")
+        print("  Each side is a contrast computed INSIDE one regime on one unit, so the readout")
+        print("  unit cancels — this is the statistic the raw k levels cannot be compared as.")
+        for lab, tasks in (("15 tasks", sorted(raw_cells[a])),
+                           ("11 non-visual", [t for t in sorted(raw_cells[a]) if t not in VISUAL])):
+            d = did_test(raw_cells[a], raw_cells[b], tasks)
+            if not d["testable"]:
+                print(f"    {lab}: not testable ({d['n_event']} event / {d['n_level']} level)")
+                continue
+            print(f"    {lab:>14}:  DiD = {d['did']:+.3f}   permutation p = {d['p']:.4f}   "
+                  f"(null |DiD| 95th {d['null_hi']:.3f}, {d['nperm']} perms, "
+                  f"n_eff = {d['n_tasks']} TASKS)")
 
     if "ws" in got and "cs" in got and 11 in got["ws"] and 11 in got["cs"]:
         gw, gc = got["ws"][11]["gap"], got["cs"][11]["gap"]
