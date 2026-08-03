@@ -5,9 +5,19 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=113560M
 #SBATCH --time=48:00:00
 #SBATCH --output=/projects/bhqk/htang13/logs/%x_%j.out
+#
+# ⚡ LOADER SIZING (08-03): 72 CPUs / 32 workers, was 16 / 12. Pre-08-03 runs were DATALOADER-BOUND --
+# GPU util averaged 43% with 37% of polls at exactly 0%, while sstat AveCPU showed the 12 workers
+# eating ~11 of the 16 allocated cores, i.e. saturated at their configured parallelism. ghx4 has
+# TRESBillingWeights CPU=13.888888 and MAX_TRES, so 72 CPUs bills exactly 1000.0 -- the same as the
+# 1 GPU and as DefMemPerGPU=113560M. The cores are FREE up to 72; 73 would cost. --mem pinned here so
+# the default can never drift and raise the bill.
+# 🔴 --num-workers CHANGES THE DATA ORDER (shaft_dataset.py:77 wid/nw, :121 seed, :125 packs//streams)
+# => 32 is NOT seed-matched to 12. Never straddle this line inside one arm-vs-arm comparison.
 #
 # RACE maskspace0 at a MEASURED occupancy. This is v3_r6_maskspace0_lr6e-3_40k_cb5500.sbatch
 # VERBATIM with exactly three deltas: contact-budget/accum taken from $1, and a --resume-ckpt off
@@ -142,7 +152,7 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --session-z-winsor-slow 15 --session-z-winsor-mid 15 --session-z-winsor-hga 20 \
   --batch-size 32 --accumulate-grad-batches $ACCUM \
   --accelerator gpu --devices 1 --precision bf16-mixed \
-  --num-workers 12 --monitor-every-n-steps 10 --log-every-n-steps 10 \
+  --num-workers 32 --monitor-every-n-steps 10 --log-every-n-steps 10 \
   --compile \
   --wandb-project intuition --run-name $RUN_NAME \
   --ckpt-dir $CKPT_DIR --ckpt-ladder-every 1000 \
