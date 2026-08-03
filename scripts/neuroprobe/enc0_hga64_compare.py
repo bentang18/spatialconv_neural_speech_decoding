@@ -50,12 +50,18 @@ MODES = ("ws", "csession", "cs")
 
 
 def load(shard_dir: str, mode: str, gk: str) -> dict[str, dict[str, float]]:
-    """{cell: {task: test AUROC}} for one grid key, straight from the shard files."""
+    """{cell: {task: test AUROC}} for one grid key, straight from the shard files.
+
+    The shard's outer key is "{ckpt_tag}|{task}", not the task alone (v3_board_readout.py:1492).
+    The tag MUST be stripped: these arms carry different tags -- ws/cs ran off the raw records
+    (enc0_fine) and csession off the slimmed ones (hga64) -- so keying on the raw string would
+    silently match nothing across arms and report an empty grid as if the run had not happened."""
     out: dict[str, dict[str, float]] = defaultdict(dict)
     for path in sorted(glob.glob(f"{shard_dir}/{mode}_*.json")):
         with open(path) as f:
             sh = json.load(f)
-        for task, val in sh["cells"].items():
+        for key, val in sh["cells"].items():
+            task = key.split("|", 1)[1] if "|" in key else key
             cells = val.get("cells") or {}
             if gk in cells:
                 out[sh["name"]][task] = float(cells[gk]["test"])
@@ -129,7 +135,11 @@ def main() -> None:
     for label, x, y, what in (("RATE (64 vs 32, window+bins held)", "native64", "sub32",
                                "a positive diff means the RATE pays"),
                               ("WINDOW+BINS (at matched 32 Hz)", "sub32", "published",
-                               "a positive diff means the 31.25 ms window pays")):
+                               "a positive diff means the 31.25 ms window + 4 bins pays"),
+                              ("NET — this 64 Hz cache vs what we ship", "native64", "published",
+                               "THE DECISION: positive means rebaking at 64 Hz is an upgrade. "
+                               "This is the SUM of the two contrasts above, not a third "
+                               "independent effect")):
         print(f"\n=== {label} — paired over cells, null = 0 ===\n    {what}")
         for mode in MODES:
             L = per_mode.get(mode, {})

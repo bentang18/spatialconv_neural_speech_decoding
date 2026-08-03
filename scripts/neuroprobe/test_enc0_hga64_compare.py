@@ -13,12 +13,15 @@ import pytest
 from enc0_hga64_compare import BOARD_TASKS, cell_macros, load, macro, paired
 
 
-def _shard(tmp, mode, name, gk_to_task_auroc):
-    """gk_to_task_auroc: {grid_key: {task: auroc}} -> one shard file, readout's own schema."""
+def _shard(tmp, mode, name, gk_to_task_auroc, tag="sometag"):
+    """gk_to_task_auroc: {grid_key: {task: auroc}} -> one shard file, readout's own schema.
+
+    Outer key is "{tag}|{task}" exactly as v3_board_readout writes it — the tag varies by arm,
+    so the tests must exercise the stripping rather than a tag-free convenience shape."""
     cells = {}
     for gk, per_task in gk_to_task_auroc.items():
         for task, v in per_task.items():
-            cells.setdefault(task, {"cells": {}})["cells"][gk] = {"test": v}
+            cells.setdefault(f"{tag}|{task}", {"cells": {}})["cells"][gk] = {"test": v}
     p = tmp / f"{mode}_{name}.json"
     p.write_text(json.dumps({"kind": mode, "name": name, "cells": cells}))
     return p
@@ -84,6 +87,29 @@ def test_paired_ci_spans_zero_when_the_sign_flips():
     b = {"c1": 0.6, "c2": 0.6}
     m, (lo, hi), n, wins, _ = paired(a, b)
     assert lo < 0 < hi and wins == 1
+
+
+def test_different_tags_across_arms_still_align_by_task(tmp_path):
+    """ws/cs ran under tag enc0_fine, csession under hga64. If the tag were not stripped the
+    grids would share no keys and the run would look like it never happened."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    _shard(a, "ws", "s1_t1", {"enc0_elec|std": {"onset": 0.70}}, tag="enc0_fine")
+    _shard(a, "ws", "s1_t2", {"enc0_elec|std": {"onset": 0.80}}, tag="enc0_fine")
+    _shard(b, "ws", "s1_t1", {"enc0_elec|std": {"onset": 0.60}}, tag="hga64")
+    _shard(b, "ws", "s1_t2", {"enc0_elec|std": {"onset": 0.70}}, tag="hga64")
+    A = load(str(a), "ws", "enc0_elec|std")
+    B = load(str(b), "ws", "enc0_elec|std")
+    assert A["s1_t1"] == {"onset": 0.70} and B["s1_t1"] == {"onset": 0.60}
+    m, _, n, wins, shared = paired(cell_macros(A, ("onset",)), cell_macros(B, ("onset",)))
+    assert shared == ["s1_t1", "s1_t2"] and n == 2 and wins == 2
+    assert m == pytest.approx(0.10)
+
+
+def test_paired_returns_nan_below_two_cells():
+    """One shared cell has no CI, so it must not silently report a diff as if it did."""
+    m, (lo, hi), n, _, _ = paired({"c1": 0.7}, {"c1": 0.6})
+    assert n == 1 and np.isnan(m) and np.isnan(lo) and np.isnan(hi)
 
 
 def test_board_tasks_is_exactly_15_unique():
