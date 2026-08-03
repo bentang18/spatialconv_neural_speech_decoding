@@ -50,6 +50,13 @@ RUN_IDS = {
     # averages exactly, so what differs is the per-micro-batch mask REALIZATION -- a seed-level
     # difference, and there is 1 seed per arm. Quote the ladder with that caveat attached.
     "pbs00_20k": "2764373",
+    # The extend arm is a DIFFERENT JOB from the pbs50 ladder above: 2813086 resumes
+    # pbs50's own ladder-step=40000.ckpt and runs on at CONSTANT lr 6e-3 (no cooldown),
+    # header verified in logs/v3_r6_pbs50_extend60k_2813086.out. Same trajectory, so
+    # pbs50_40k is its branch point and the comparison is within-arm -- but the rungs past
+    # 40k belong to 2813086, not 2764203, and conflating the two is exactly the arm-mixing
+    # defect this table exists to prevent.
+    "pbs50_ext45k": "2813086",
 }
 
 FIELDS = ["family", "artifact", "run_id", "arm_tag", "regime", "tap", "norm",
