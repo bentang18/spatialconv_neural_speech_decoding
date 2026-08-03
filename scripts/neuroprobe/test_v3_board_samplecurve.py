@@ -29,6 +29,7 @@ from scripts.neuroprobe.v3_board_samplecurve import (
     SHARD_PREFIX,
     ANCHOR_TOL,
     _addmult,
+    _gapslope,
     _anchor_check,
     _anchor_verdict,
     _cs_anchor_check,
@@ -629,3 +630,63 @@ def test_transfer_regimes_share_one_cell_function() -> None:
     a, _ = _cs_curve_cell(sib, tst, task, TAPS)
     b, _ = _transfer_curve_cell(sib, tst, task, TAPS, CS_TRAIN_ANCHOR)
     assert [p["test"] for p in a] == [p["test"] for p in b]
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# TIER 2 · the gap-vs-log2(N) slope, and its null
+#
+# In _planted, gap = a + (k-1)*x with x = 0.02 + 0.03*ni and log2 N = 4 + ni, so the slope against
+# log2 N is exactly (k-1)*0.03 per doubling. That makes k the knob that sets the TRUE TIER 2 answer
+# and lets the sign test be checked against a known truth instead of against a hunch.
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+def test_gapslope_is_zero_when_the_gap_is_a_constant_offset() -> None:
+    """k=1 is a pure additive shift: the gap does not move with N at all."""
+    r = _gapslope(_planted(a=0.02, k=1.0), "enc0", "enc12", "trainonly", nboot=200)
+    assert r["slope"] == pytest.approx(0.0, abs=1e-9)
+    # A noiseless fixture makes every resample identical, so the CI collapses onto 0 to within
+    # float error (~1e-19) rather than straddling it. The claim under test is that the interval is
+    # AT zero, not that it has width.
+    assert r["ci"][0] == pytest.approx(0.0, abs=1e-12)
+    assert r["ci"][1] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_gapslope_recovers_a_planted_POSITIVE_slope() -> None:
+    r = _gapslope(_planted(a=0.0, k=1.4), "enc0", "enc12", "trainonly", nboot=200)
+    assert r["slope"] == pytest.approx(0.4 * 0.03, abs=1e-9)
+    assert r["ci"][0] > 0, "a real positive slope must clear its own null"
+
+
+def test_gapslope_recovers_a_planted_NEGATIVE_slope() -> None:
+    r = _gapslope(_planted(a=0.06, k=0.6), "enc0", "enc12", "trainonly", nboot=200)
+    assert r["slope"] == pytest.approx(-0.4 * 0.03, abs=1e-9)
+    assert r["ci"][1] < 0
+
+
+def test_gapslope_reports_the_sweep_total_not_just_the_per_doubling_rate() -> None:
+    """The per-doubling number is tiny by construction; the claim is made over the whole sweep.
+    Reporting only the rate is how -0.0002 got read as a finding."""
+    r = _gapslope(_planted(a=0.0, k=1.4), "enc0", "enc12", "trainonly", nboot=100)
+    assert r["n_doublings"] == pytest.approx(5.0)         # 16..512 is five doublings
+    assert r["total"] == pytest.approx(r["slope"] * 5.0, rel=1e-9)
+
+
+def test_gapslope_CI_covers_zero_once_the_noise_swamps_a_tiny_true_slope() -> None:
+    """The whole point of the null: a slope far below the noise floor must come back FLAT."""
+    tiny = _gapslope(_planted(a=0.02, k=1.001, noise=0.02, seed=5), "enc0", "enc12", "trainonly",
+                     nboot=400)
+    assert tiny["ci"][0] < 0 < tiny["ci"][1]
+
+
+def test_gapslope_resamples_subjects_not_cells() -> None:
+    """Two sessions of one patient are one draw, not two — same unit TIER 3 uses."""
+    pts = []
+    for si in range(4):
+        for tr in range(2):
+            for ni, n in enumerate((16, 32, 64, 128, 256, 512)):
+                x = 0.02 + 0.03 * ni
+                for tap, v in (("enc0", .5 + x), ("enc12", .5 + 0.02 + x)):
+                    pts.append({"tap": tap, "col": "trainonly", "n_bucket": n, "n_is_full": False,
+                                "task": "onset", "cell": f"S{si}T{tr}", "test": v})
+    r = _gapslope(pts, "enc0", "enc12", "trainonly", nboot=50)
+    assert r["n_subjects"] == 4, "8 cells from 4 patients is 4 bootstrap units, not 8"

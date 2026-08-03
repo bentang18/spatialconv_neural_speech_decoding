@@ -605,6 +605,48 @@ def _addmult(pts, tap0, tap12, col, nboot=2000, seed=0) -> dict:
             "n_points": len(ns), "n_subjects": len(subs), "n_boot": len(A)}
 
 
+def _gapslope(pts, tap0, tap12, col, nboot=2000, seed=0) -> dict:
+    """TIER 2 with the null it was always supposed to carry: d(gap)/d(log2 N), bootstrapped over
+    SUBJECTS on the same panel TIER 3 uses.
+
+    The point estimate alone cannot answer TIER 2. The question is directional ("is the gap widest
+    when labels are scarce?"), so reading it off the SIGN of an unbootstrapped slope promotes
+    arbitrarily small numbers into a verdict: the CS run's -0.00021 per doubling is -0.0017 of AUROC
+    across the entire eight-doubling sweep, against a gap of ~0.025. That is flat, and calling it
+    "the foundation-model result" because the sign happened to land negative would be reading noise.
+    Same estimator as TIER 3 so the two tiers cannot disagree for bookkeeping reasons.
+    """
+    tot, cnt, subs, ns = _panel(pts, tap0, tap12, col)
+    lg = np.log2(np.asarray([float(n) for n in ns], dtype=np.float64))
+
+    def fit(draw):
+        w = np.bincount(np.asarray(draw, dtype=np.int64), minlength=tot.shape[0]).astype(float)
+        t = np.tensordot(w, tot, axes=(0, 0))
+        c = np.tensordot(w, cnt, axes=(0, 0))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            per_task = np.where(c > 0, t / np.where(c > 0, c, 1), np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            macro = np.nanmean(per_task, axis=2)        # [N, 2]
+        ok = np.isfinite(macro).all(axis=1)
+        if ok.sum() < 3:
+            return None
+        return float(np.polyfit(lg[ok], macro[ok, 1] - macro[ok, 0], 1)[0])
+
+    s_hat = fit(np.arange(len(subs)))
+    if s_hat is None:
+        return {"slope": None}
+    rng = np.random.default_rng(seed)
+    S = np.asarray([s for s in (fit(rng.integers(0, len(subs), len(subs))) for _ in range(nboot))
+                    if s is not None])
+    lo, hi = float(np.percentile(S, 2.5)), float(np.percentile(S, 97.5))
+    # Report the slope in the unit the claim is actually made in: AUROC across the WHOLE sweep.
+    span = float(lg.max() - lg.min())
+    return {"slope": s_hat, "ci": (lo, hi), "span": span, "n_doublings": span,
+            "total": s_hat * span, "total_ci": (lo * span, hi * span),
+            "n_subjects": len(subs), "n_boot": len(S)}
+
+
 def _panel(pts, tap0, tap12, col):
     """Collapse the point list ONCE into per-(subject, N, tap, task) cell-mean sums and counts.
 
@@ -740,19 +782,29 @@ def _report(m) -> None:
         # ── TIER 2 ─────────────────────────────────────────────────────────────────────────────
         xs = [n for n in c12 if n != FULL and n in c0]
         if len(xs) >= 3:
-            lg = np.log2(np.asarray(xs, dtype=np.float64))
-            gap = np.asarray([c12[n] - c0[n] for n in xs], dtype=np.float64)
-            slope = float(np.polyfit(lg, gap, 1)[0])
+            gs = _gapslope(pts, tap0, tap12, col)
+            slope, (slo, shi) = gs["slope"], gs["ci"]
+            tot_g, (tlo, thi) = gs["total"], gs["total_ci"]
             print(f"\n  TIER 2 · d(gap)/d(log2 N) = {slope:+.5f} per doubling   NULL: 0.0")
+            print(f"    95% CI [{slo:+.5f}, {shi:+.5f}] over {gs['n_subjects']} subjects, "
+                  f"{gs['n_boot']} bootstraps")
+            print(f"    across the whole {gs['n_doublings']:.0f}-doubling sweep that is "
+                  f"{tot_g:+.4f} AUROC [{tlo:+.4f}, {thi:+.4f}]")
             print(f"    gain law (k~1.17-1.28) PREDICTS a POSITIVE slope — gap widest at LARGE N.")
-            if slope > 0:
+            if slo > 0:
                 print("    ⇒ POSITIVE: gain law CONFIRMED. Pretraining does NOT preferentially help")
                 print("      the scarce-label regime. 🚫 CLAIM TIER 1 ONLY — do NOT write 'especially")
                 print("      valuable when labels are scarce'.")
-            else:
+            elif shi < 0:
                 print("    ⇒ NEGATIVE: gap WIDENS as labels get scarce — this CONTRADICTS the gain")
                 print("      law and IS the foundation-model result. Re-check the gain law before")
                 print("      quoting both in the same paper.")
+            else:
+                print("    ⇒ FLAT — CI covers 0. The gap is the SAME SIZE at every label budget, so")
+                print("      TIER 2 is a NULL, not a finding in either direction. 🚫 do NOT write")
+                print("      'especially valuable when labels are scarce', and 🚫 do NOT read the")
+                print("      sign of the point estimate as evidence against the gain law: the gain")
+                print("      law is fitted ACROSS TASKS at fixed N, a different axis from this one.")
 
         # ── TIER 3 · ADDITIVE vs MULTIPLICATIVE ────────────────────────────────────────────────
         am = _addmult(pts, tap0, tap12, col)
