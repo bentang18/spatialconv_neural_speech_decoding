@@ -40,7 +40,12 @@ def _same(x, y) -> bool:
                 and x.shape == y.shape and bool(torch.equal(x, y)))
     xa, ya = np.asarray(x), np.asarray(y)
     if xa.dtype.kind in "fc" or ya.dtype.kind in "fc":
-        return xa.shape == ya.shape and bool(np.allclose(xa, ya))
+        # equal_nan is REQUIRED, not defensive. `labels` is NaN-padded: a task's label is NaN on
+        # every window the task is undefined for, which is 5.5k-7.5k of 9063 on s4_t0. Plain
+        # allclose is False whenever a NaN is present, so without this the gate reports every
+        # session's labels as differing while max|d| over the defined entries is exactly 0 — a
+        # false FAIL that hides any real one.
+        return xa.shape == ya.shape and bool(np.allclose(xa, ya, equal_nan=True))
     return bool(np.array_equal(xa, ya))
 
 

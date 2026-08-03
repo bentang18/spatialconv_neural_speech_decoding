@@ -39,6 +39,19 @@ def test_float_fields_use_allclose_but_still_catch_real_drift():
     assert not _same(np.array([1.0, 2.0]), np.array([1.0, 2.5]))
 
 
+def test_nan_padding_compares_equal_but_real_drift_still_fails():
+    """`labels` is NaN-padded on every window a task is undefined for — most of them.
+
+    Plain allclose is False whenever a NaN is present, so a NaN-blind comparator reports every
+    session as differing and a real difference becomes invisible in the noise.
+    """
+    a = np.array([1.0, np.nan, 3.0])
+    assert _same(a, np.array([1.0, np.nan, 3.0]))
+    assert not _same(a, np.array([1.0, np.nan, 4.0]))     # drift beside a NaN still caught
+    assert not _same(a, np.array([1.0, 2.0, 3.0]))        # NaN vs defined is a real difference
+    assert _same({"onset": a}, {"onset": np.array([1.0, np.nan, 3.0])})
+
+
 def test_shape_mismatch_is_not_same():
     assert not _same(np.array([1, 2, 3]), np.array([1, 2]))
     assert not _same(np.array([[1, 2]]), np.array([1, 2]))
