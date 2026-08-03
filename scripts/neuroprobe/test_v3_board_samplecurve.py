@@ -18,17 +18,24 @@ import numpy as np
 import pytest
 
 from scripts.neuroprobe.test_v3_board_readout import _rec
-from scripts.neuroprobe.v3_board_readout import BOARD_TASKS, _finite
+from scripts.neuroprobe.v3_board_readout import BOARD_TASKS, CS_TRAIN_ANCHOR, _finite
 from scripts.neuroprobe.v3_board_samplecurve import (
     COLUMNS,
+    CURVE_TAPS,
     FULL,
     N_GRID,
+    N_GRID_CS,
     SEEDS_FOR_N,
+    SHARD_PREFIX,
     ANCHOR_TOL,
+    _addmult,
     _anchor_check,
     _anchor_verdict,
+    _cs_anchor_check,
+    _cs_curve_cell,
     _curve,
     _digest,
+    _merge,
     _reach,
     _rng,
     _strat_draw,
@@ -336,3 +343,187 @@ def test_curve_ignores_other_taps_and_columns() -> None:
         {"tap": "t", "col": "trainonly", "n_bucket": 16, "task": "a", "cell": "S1", "test": 0.0},
     ]
     assert _curve(pts, "t", "both")[16] == pytest.approx(1.0)
+
+
+# ── CROSS-SUBJECT MODE ─────────────────────────────────────────────────────────────────────────
+#
+# CS asks a DIFFERENT question with the same machinery, and the ways it can go quietly wrong are
+# its own: subsampling the target's val (which would answer a calibration question the benchmark
+# does not pose), keying the donor draw on the test cell (which would silently average over 10x
+# more donor subsamples than the claim is about), or letting the anchor drift off `_cs_cell`.
+
+def test_cs_N_full_reproduces_the_published_cs_cell_exactly() -> None:
+    """The CS licence, same as the WS one: computed by calling the REAL `_cs_cell`."""
+    a_rec, t_rec = _big_rec(seed=0), _big_rec(seed=1)
+    task = BOARD_TASKS[0]
+    pts, _ = _cs_curve_cell(a_rec, t_rec, task, TAPS)
+    rows = _cs_anchor_check(a_rec, t_rec, task, TAPS, pts)
+    assert rows, "no anchor rows produced — the check would vacuously pass"
+    for r in rows:
+        assert r["absdiff"] == 0.0, f"cs anchor drifted: {r}"
+
+
+def test_cs_never_subsamples_the_targets_val_or_test() -> None:
+    """val and test belong to the TARGET subject and to the protocol. If either moves with N, the
+    curve is measuring a target-calibration budget instead of a donor-label budget."""
+    a_rec, t_rec = _big_rec(seed=0), _big_rec(seed=1)
+    _, census = _cs_curve_cell(a_rec, t_rec, BOARD_TASKS[0], TAPS)
+    assert census
+    assert len({c["n_val"] for c in census}) == 1, "val shrank with N"
+    assert len({c["n_test"] for c in census}) == 1, "test shrank with N"
+
+
+def test_cs_emits_only_the_trainonly_column() -> None:
+    """`both` means 'train AND val subsampled'. In CS there is no such experiment, so emitting a
+    `both` column would ship a duplicate of `trainonly` under a name that misstates what it is."""
+    a_rec, t_rec = _big_rec(seed=0), _big_rec(seed=1)
+    pts, _ = _cs_curve_cell(a_rec, t_rec, BOARD_TASKS[0], TAPS)
+    assert pts and {p["col"] for p in pts} == {"trainonly"}
+
+
+def test_cs_donor_draw_is_keyed_on_the_anchor_not_the_test_cell() -> None:
+    """One donor subsample, evaluated on ten patients. Keying on the test cell would make each cell
+    see different donor trials — a different, lower-variance estimand than the claim."""
+    a_rec = _big_rec(seed=0)
+    t1, t2 = _big_rec(seed=1), _big_rec(seed=2)
+    task = BOARD_TASKS[0]
+    y_a = np.asarray(a_rec["labels"][task], dtype=np.float64)
+    tr = _finite(y_a, np.arange(len(y_a)))
+    d1 = _digest(_strat_draw(y_a, tr, 16, _rng(CS_TRAIN_ANCHOR, task, 0, 16, 0)))
+    seen = set()
+    for t_rec in (t1, t2):
+        pts, _ = _cs_curve_cell(a_rec, t_rec, task, TAPS)
+        seen.add(len(pts))
+    assert len(seen) == 1
+    # the draw itself is a pure function of (anchor, task, n, seed) — no test cell in the key
+    assert d1 == _digest(_strat_draw(y_a, tr, 16, _rng(CS_TRAIN_ANCHOR, task, 0, 16, 0)))
+    assert d1 != _digest(_strat_draw(y_a, tr, 16, _rng((1, 1), task, 0, 16, 0)))
+
+
+def test_cs_both_taps_are_fit_on_the_same_donor_rows(monkeypatch) -> None:
+    import scripts.neuroprobe.v3_board_samplecurve as M
+
+    real = M._feat
+    calls: list = []
+
+    def spy(rec, enc, rows, col_idx=None):
+        calls.append((enc, _digest(rows)))
+        return real(rec, enc, rows, col_idx)
+
+    monkeypatch.setattr(M, "_feat", spy)
+    _cs_curve_cell(_big_rec(seed=0), _big_rec(seed=1), BOARD_TASKS[0], TAPS)
+    by_tap: dict = {}
+    for enc, dig in calls:
+        by_tap.setdefault(enc, []).append(dig)
+    assert set(by_tap) == set(TAPS)
+    assert by_tap[TAPS[0]] == by_tap[TAPS[1]], "the two taps were gathered on different rows"
+
+
+def test_cs_grid_extends_one_doubling_past_the_ws_grid() -> None:
+    """CS fits the WHOLE anchor session, ~2x a WS train half, so the extra point is reachable there
+    and only there. Points above the parent are filtered at runtime, so an unreachable entry is a
+    no-op rather than a crash."""
+    assert N_GRID_CS[:len(N_GRID)] == N_GRID
+    assert len(N_GRID_CS) == len(N_GRID) + 1
+    assert N_GRID_CS[-1] == 2 * N_GRID[-1]
+    assert all(n in SEEDS_FOR_N for n in N_GRID_CS)
+
+
+def test_cs_taps_are_the_parcel_mean_pair_not_the_electrode_pair() -> None:
+    """Electrode identity is not shared across subjects, so a CS curve on `*_elec` would be
+    measuring nothing. The regime picks its own unit; the default must not be inherited."""
+    assert CURVE_TAPS["cs"] == ("enc0", "enc12")
+    assert CURVE_TAPS["ws"] == ("enc0_elec", "enc12_elec")
+    assert SHARD_PREFIX["ws"] != SHARD_PREFIX["cs"]
+
+
+# ── TIER 3: the additive-vs-multiplicative decision ────────────────────────────────────────────
+#
+# This is the estimator the whole verdict is read off, so it is tested against data with a KNOWN
+# law. A test that only checks it runs would not catch a sign error or a swapped intercept/slope.
+
+def _planted(a, k, taps=("enc0", "enc12"), n_subj=6, noise=0.0, seed=0):
+    """Points whose macro curve obeys (enc12-.5) = a + k*(enc0-.5) by construction."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    for si in range(n_subj):
+        for ni, n in enumerate((16, 32, 64, 128, 256, 512)):
+            x = 0.02 + 0.03 * ni                      # enc0 headroom grows with N
+            for task in ("onset", "speech"):
+                e = rng.normal(scale=noise) if noise else 0.0
+                for tap, v in ((taps[0], .5 + x), (taps[1], .5 + a + k * x + e)):
+                    pts.append({"tap": tap, "col": "trainonly", "n_bucket": n, "n_is_full": False,
+                                "task": task, "cell": f"S{si}T0", "test": v})
+    return pts
+
+
+def test_addmult_recovers_a_planted_ADDITIVE_law() -> None:
+    r = _addmult(_planted(a=0.02, k=1.0), "enc0", "enc12", "trainonly", nboot=200)
+    assert r["a"] == pytest.approx(0.02, abs=1e-6)
+    assert r["k"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_addmult_recovers_a_planted_MULTIPLICATIVE_law() -> None:
+    r = _addmult(_planted(a=0.0, k=1.4), "enc0", "enc12", "trainonly", nboot=200)
+    assert r["a"] == pytest.approx(0.0, abs=1e-6)
+    assert r["k"] == pytest.approx(1.4, abs=1e-6)
+
+
+def test_addmult_does_not_confuse_the_intercept_with_the_slope() -> None:
+    """a and k are not interchangeable: a pure multiplier and a pure offset must not both come back
+    looking like the same fit. Pinning the CROSS terms is what catches a swapped np.polyfit unpack."""
+    add = _addmult(_planted(a=0.03, k=1.0), "enc0", "enc12", "trainonly", nboot=100)
+    mul = _addmult(_planted(a=0.0, k=1.5), "enc0", "enc12", "trainonly", nboot=100)
+    assert add["a"] > mul["a"] and mul["k"] > add["k"]
+
+
+def test_addmult_bootstrap_CI_widens_with_noise_and_covers_the_truth() -> None:
+    """The CI is the whole decision rule. If noise does not widen it, the verdict is decided by an
+    error bar that is not measuring anything."""
+    quiet = _addmult(_planted(a=0.02, k=1.0, noise=0.000), "enc0", "enc12", "trainonly", nboot=400)
+    loud = _addmult(_planted(a=0.02, k=1.0, noise=0.02, seed=3), "enc0", "enc12", "trainonly",
+                    nboot=400)
+    w = lambda r: r["a_ci"][1] - r["a_ci"][0]
+    assert w(loud) > w(quiet)
+    assert loud["a_ci"][0] <= 0.02 <= loud["a_ci"][1]
+
+
+def test_addmult_resamples_subjects_not_cells() -> None:
+    """Two sessions of one patient are not two independent draws. The bootstrap unit has to be the
+    subject, or the CI is too tight and the verdict is called on an error bar that overstates n."""
+    pts = _planted(a=0.02, k=1.0, n_subj=4)
+    pts += [dict(p, cell=p["cell"].replace("T0", "T1")) for p in pts]   # 4 subjects, 8 cells
+    assert len({p["cell"] for p in pts}) == 8
+    r = _addmult(pts, "enc0", "enc12", "trainonly", nboot=50)
+    assert r["n_subjects"] == 4, "the bootstrap resampled cells, not subjects"
+
+
+def test_merge_globs_only_its_own_regimes_shards(tmp_path) -> None:
+    """One shard dir can hold both families. Merging without naming the regime would silently
+    average two different units — different taps, different train sets — into a number of no
+    regime at all, and it would not look wrong on inspection."""
+    import json as _json
+    base = {"name": "S1T1", "tag": "t", "contiguous": False,
+            "points": [], "census": [], "anchor": []}
+    (tmp_path / "cscurve_S1T1.json").write_text(
+        _json.dumps(dict(base, kind="cscurve", regime="cs")))
+    (tmp_path / "wscurve_S1T1.json").write_text(
+        _json.dumps(dict(base, kind="wscurve", regime="ws")))
+    assert _merge(str(tmp_path), "cs")["regime"] == "cs"
+    assert _merge(str(tmp_path), "ws")["regime"] == "ws"
+
+
+def test_merge_rejects_a_shard_whose_regime_contradicts_its_filename(tmp_path) -> None:
+    """Belt to the glob's braces: a hand-copied or legacy shard under the wrong prefix must fail
+    loudly rather than be averaged into the wrong regime's curve."""
+    import json as _json
+    (tmp_path / "cscurve_S1T1.json").write_text(_json.dumps(
+        {"kind": "cscurve", "regime": "ws", "name": "S1T1", "tag": "t", "contiguous": False,
+         "points": [], "census": [], "anchor": []}))
+    with pytest.raises(AssertionError):
+        _merge(str(tmp_path), "cs")
+
+
+def test_merge_raises_rather_than_reporting_an_empty_curve(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        _merge(str(tmp_path), "cs")
