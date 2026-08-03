@@ -99,11 +99,24 @@ _feat, _finite, _have = R._feat, R._finite, R._have
 _lam_grid, _load, _select_lam = R._lam_grid, R._load, R._select_lam
 _standardize_inplace, _ws_cell = R._standardize_inplace, R._ws_cell
 _cs_cell, _parcel_cols = R._cs_cell, R._parcel_cols
+_csession_cell, _sibling = R._csession_cell, R._sibling
+CSESSION_CELLS = R.CSESSION_CELLS
 
 # The two taps the additive-vs-multiplicative test needs, in each regime's OWN unit. CS is
-# parcel-mean because electrode identity is not shared across subjects (v3_board_readout.py:113-114).
-CURVE_TAPS = {"ws": ("enc0_elec", "enc12_elec"), "cs": ("enc0", "enc12")}
-SHARD_PREFIX = {"ws": "wscurve", "cs": "cscurve"}
+# parcel-mean because electrode identity is not shared across subjects (v3_board_readout.py:113-114);
+# csession KEEPS the electrode taps because within a subject the electrodes ARE the same electrodes.
+CURVE_TAPS = {"ws": ("enc0_elec", "enc12_elec"), "cs": ("enc0", "enc12"),
+              "csession": ("enc0_elec", "enc12_elec")}
+SHARD_PREFIX = {"ws": "wscurve", "cs": "cscurve", "csession": "csessioncurve"}
+
+# ═══ THE THREE REGIMES ARE A LADDER IN ONE VARIABLE: HOW FAR THE TRAIN DATA IS FROM THE TARGET ══
+#   ws        train = the target session itself      N = calibration trials FROM the target
+#   csession  train = the target's OTHER session     N = trials from the SAME patient, another day
+#   cs        train = a different patient entirely   N = trials from SOMEONE ELSE
+# csession is the control that makes the ws-vs-cs contrast mean something: without it, any
+# difference between ws and cs could be "cs is just harder / more shifted" rather than anything
+# about the SUBJECT boundary specifically.
+TRANSFER_REGIMES = ("cs", "csession")
 
 # Powers of two so "how many doublings of calibration data" reads straight off the x axis, and a
 # log-linear fit is a straight line. 16 is ~16 s of calibration at 1 s trials; below that a
@@ -277,23 +290,43 @@ def _cs_fit_point(anchor_rec, test_rec, tap, tr_s, a_idx, va, te, t_idx, y_a, y_
     return _select_lam({"val": g["val"], "test": g["test"]})
 
 
-def _cs_curve_cell(anchor_rec, test_rec, task, taps, contiguous=False):
-    """One (CS test cell, task) → curve points over N x seed x tap, plus the census.
+def _transfer_cols(train_rec, test_rec, tap):
+    """Aligned (train_cols, test_cols) for one tap across two records, or None if it cannot align.
+
+    The alignment differs by TAP, not by regime: parcel taps align by ATLAS ID and per-electrode taps
+    align by electrode IDENTITY (v3_board_readout.py:1362-1375). CS only ever asks for parcel taps
+    and CSession only for electrode taps, but reading the tap rather than the regime is what keeps
+    this from being a place a wrong pairing could hide.
+    """
+    if R._is_elec(tap):
+        e_a, e_t, _n = R._elec_cols(train_rec, test_rec)
+        return None if e_a is None else (e_a, e_t)
+    p_a, p_t, common = _parcel_cols(train_rec, test_rec)
+    return None if p_a is None or common.size == 0 else (p_a, p_t)
+
+
+def _transfer_curve_cell(train_rec, test_rec, task, taps, draw_key, contiguous=False):
+    """One (transfer test cell, task) → curve points over N x seed x tap, plus the census.
+
+    Serves BOTH transfer regimes, which are the same experiment with a different train record:
+
+      cs        train = the fixed donor S2T4 (a DIFFERENT patient)
+      csession  train = the sibling trial    (the SAME patient, a different session)
 
     ═══ WHAT N MEANS HERE, AND WHY IT IS NOT THE WS QUESTION ════════════════════════════════════
-    CS fits the ANCHOR session (2,4) and scores a held-out subject, so N is "labelled trials from
-    ONE DONOR patient", not "calibration trials from the target". The target contributes no training
-    rows at any N.
+    N is "labelled trials from the TRAIN session", and that session is never the target's. The
+    target contributes no training rows at any N. In WS, N is calibration data from the target
+    itself — a different question, which is why the two are never plotted on one axis.
 
     ⚠️ VAL IS NEVER SUBSAMPLED, unlike the WS curve's "both" column. val here is the TEST CELL's
-    ``cs_split`` val half (v3_board_readout.py:1302) — it belongs to the target subject and is the
-    protocol's, not a calibration budget the donor controls. Subsampling it would answer a question
-    the benchmark does not pose. Points are therefore emitted under col ``trainonly`` ONLY, which is
-    what that column already means: subsample train, select λ on the full val.
+    ``cs_split`` val half (v3_board_readout.py:1302, and csession reuses it VERBATIM per
+    :1349-1352) — it belongs to the target and is the protocol's, not a calibration budget the
+    donor controls. Subsampling it would answer a question the benchmark does not pose. Points are
+    therefore emitted under col ``trainonly`` ONLY, which is what that column already means.
 
-    There are no folds: CS has one train set and one val/test pair, so `fold` is pinned to 0.
+    There are no folds: one train set and one val/test pair, so `fold` is pinned to 0.
     """
-    y_a = np.asarray(anchor_rec["labels"][task], dtype=np.float64)
+    y_a = np.asarray(train_rec["labels"][task], dtype=np.float64)
     y_t = np.asarray(test_rec["labels"][task], dtype=np.float64)
     tr = _finite(y_a, np.arange(len(y_a)))
     va = _finite(y_t, test_rec["cs_split"][task]["val"])
@@ -301,25 +334,27 @@ def _cs_curve_cell(anchor_rec, test_rec, task, taps, contiguous=False):
     pts, census = [], []
     if len(tr) < 2 or len(te) < 2:
         return pts, census
-    a_idx, t_idx, common = _parcel_cols(anchor_rec, test_rec)
-    if common.size == 0:
+    cols = {t: _transfer_cols(train_rec, test_rec, t) for t in taps}
+    if all(v is None for v in cols.values()):
         return pts, census
     for n in [g for g in N_GRID_CS if g < len(tr)] + [None]:
         is_full = n is None
         nn = len(tr) if is_full else int(n)
         for seed in range(1 if is_full else SEEDS_FOR_N[int(n)]):
-            # KEYED ON THE ANCHOR, NOT THE TEST CELL. The donor session is the SAME for all 10 cells,
-            # so keying on the cell would silently average over 10x more donor subsamples than the
-            # claim is about -- a different, lower-variance estimand. One draw, ten patients.
-            rng = _rng(CS_TRAIN_ANCHOR, task, 0, nn, seed)
+            # KEYED ON THE TRAIN SESSION, NOT THE TEST CELL. In cs the donor is the SAME for all ten
+            # cells, so keying on the cell would silently average over 10x more donor subsamples than
+            # the claim is about -- a different, lower-variance estimand. One draw, ten patients.
+            # In csession the sibling IS per-cell, so the key varies with it, as it should.
+            rng = _rng(draw_key, task, 0, nn, seed)
             tr_s = _strat_draw(y_a, tr, nn, rng, contiguous)
             d_tr = _digest(tr_s)
             for tap in taps:
-                if not (_have(anchor_rec, tap) and _have(test_rec, tap)):
+                if cols[tap] is None or not (_have(train_rec, tap) and _have(test_rec, tap)):
                     continue
-                # INVARIANT 2, as in the WS path: every tap fits the SAME donor rows.
+                # INVARIANT 2, as in the WS path: every tap fits the SAME train rows.
                 assert _digest(tr_s) == d_tr, "draw drifted across taps"
-                res = _cs_fit_point(anchor_rec, test_rec, tap, tr_s, a_idx, va, te, t_idx, y_a, y_t)
+                a_idx, t_idx = cols[tap]
+                res = _cs_fit_point(train_rec, test_rec, tap, tr_s, a_idx, va, te, t_idx, y_a, y_t)
                 pts.append({"task": task, "fold": 0, "tap": tap, "col": "trainonly",
                             "n": nn, "n_is_full": is_full, "seed": seed,
                             "test": res["test"], "lam_pinned": bool(res["lam_pinned"])})
@@ -332,14 +367,24 @@ def _cs_curve_cell(anchor_rec, test_rec, task, taps, contiguous=False):
     return pts, census
 
 
-def _cs_anchor_check(anchor_rec, test_rec, task, taps, pts) -> list:
-    """INVARIANT 1 for CS — the N=full point must BE the published ``_cs_cell``.
+def _cs_curve_cell(train_rec, test_rec, task, taps, contiguous=False):
+    """Cross-subject: the donor is the FIXED anchor, so the draw is keyed on it."""
+    return _transfer_curve_cell(train_rec, test_rec, task, taps, CS_TRAIN_ANCHOR, contiguous)
 
-    Same licence the WS curve runs under: computed by calling the REAL cell function, never by
-    restating it. Note ``_cs_cell`` returns ``_grid_cells`` UNFOLDED (no fold averaging), so the
-    comparison is against a single value rather than a mean over folds.
+
+def _csession_curve_cell(train_rec, test_rec, task, taps, sibling, contiguous=False):
+    """Cross-session: the train session is this cell's SIBLING, so the draw is keyed on that."""
+    return _transfer_curve_cell(train_rec, test_rec, task, taps, sibling, contiguous)
+
+
+def _transfer_anchor_check(cell_fn, train_rec, test_rec, task, taps, pts) -> list:
+    """INVARIANT 1 for a transfer regime — the N=full point must BE the published cell.
+
+    Same licence the WS curve runs under: computed by CALLING the real cell function
+    (``_cs_cell`` / ``_csession_cell``), never by restating what it does. Note both return
+    ``_grid_cells`` UNFOLDED (no fold averaging), so the comparison is against a single value.
     """
-    pub = _cs_cell(anchor_rec, test_rec, task, taps)["cells"]
+    pub = cell_fn(train_rec, test_rec, task, taps)["cells"]
     rows = []
     for tap in taps:
         key = f"{tap}|std"
@@ -354,6 +399,14 @@ def _cs_anchor_check(anchor_rec, test_rec, task, taps, pts) -> list:
                      "curve": float(np.nanmean(mine)),
                      "absdiff": float(abs(np.nanmean(mine) - pub[key]["test"]))})
     return rows
+
+
+def _cs_anchor_check(train_rec, test_rec, task, taps, pts) -> list:
+    return _transfer_anchor_check(_cs_cell, train_rec, test_rec, task, taps, pts)
+
+
+def _csession_anchor_check(train_rec, test_rec, task, taps, pts) -> list:
+    return _transfer_anchor_check(_csession_cell, train_rec, test_rec, task, taps, pts)
 
 
 def _anchor_check(rec, task, taps, pts) -> list:
@@ -410,6 +463,14 @@ def _shard(cache_dir, tag, index, regime, taps, contiguous=False) -> dict:
         curve_fn = lambda task: _cs_curve_cell(anchor_rec, test_rec, task, taps, contiguous)
         check_fn = lambda task, p: _cs_anchor_check(anchor_rec, test_rec, task, taps, p)
         published = "_cs_cell"
+    elif regime == "csession":
+        cell = CSESSION_CELLS[index]
+        sib = _sibling(cell)
+        train_rec = _load(cache_dir, sib, tag, mmap=False)
+        test_rec = _load(cache_dir, cell, tag, mmap=False)
+        curve_fn = lambda task: _csession_curve_cell(train_rec, test_rec, task, taps, sib, contiguous)
+        check_fn = lambda task, p: _csession_anchor_check(train_rec, test_rec, task, taps, p)
+        published = "_csession_cell"
     else:
         cell = LITE_SESSIONS[index]
         rec = _load(cache_dir, cell, tag, mmap=False)
@@ -602,7 +663,7 @@ def _panel_fit(tot, cnt):
 def _report(m) -> None:
     regime = m.get("regime", "ws")
     tap0, tap12 = CURVE_TAPS[regime]
-    grid = N_GRID_CS if regime == "cs" else N_GRID
+    grid = N_GRID if regime == "ws" else N_GRID_CS
     cols = COLUMNS if regime == "ws" else ("trainonly",)
     want_cells = 10 if regime == "cs" else 12
     pts, anchor = m["points"], m["anchor"]
@@ -614,8 +675,11 @@ def _report(m) -> None:
     print(f"units: {len(cells)} cells x {len(tasks)} tasks = {len(cells) * len(tasks)} "
           f"(board convention is {want_cells * 15}; NEVER read below it)")
     if regime == "cs":
-        print(f"N = labelled trials from the DONOR session S{CS_TRAIN_ANCHOR[0]}T{CS_TRAIN_ANCHOR[1]}. "
-              f"The target subject contributes ZERO training rows at every N.")
+        print(f"N = labelled trials from the DONOR session S{CS_TRAIN_ANCHOR[0]}T{CS_TRAIN_ANCHOR[1]} "
+              f"(a DIFFERENT patient). The target contributes ZERO training rows at every N.")
+    elif regime == "csession":
+        print("N = labelled trials from this cell's SIBLING session — the SAME patient, another day. "
+              "The target session contributes ZERO training rows at every N.")
     print("=" * 96)
 
     # ── INVARIANT 1 first: if the anchor is wrong, no number below it is worth reading ──────────
@@ -648,8 +712,8 @@ def _report(m) -> None:
         c12, c0 = _curve(pts, tap12, col), _curve(pts, tap0, col)
         if not c12 or not c0:
             continue
-        if regime == "cs":
-            label = ("subsample the DONOR's train rows; λ on the target cell's own val half — "
+        if regime in TRANSFER_REGIMES:
+            label = ("subsample the TRAIN session's rows; λ on the target cell's own val half — "
                      "val belongs to the protocol, not to a calibration budget")
         else:
             label = ("subsample train AND val — the honest calibration budget" if col == "both"
@@ -735,21 +799,41 @@ def _report(m) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", default="ws", choices=("ws", "cs", "merge"))
+    p.add_argument("--mode", default="ws", choices=("ws", "cs", "csession", "merge"))
     p.add_argument("--cache-dir")
     p.add_argument("--tag", default="pbs50_cd45k")
     p.add_argument("--index", type=int, default=0,
-                   help="array task id: index into LITE_SESSIONS (ws) or CS_TEST_CELLS (cs)")
+                   help="array task id: index into LITE_SESSIONS (ws), CS_TEST_CELLS (cs), "
+                        "or CSESSION_CELLS (csession)")
     p.add_argument("--shard-dir", required=True)
     p.add_argument("--out", default="samplecurve.json")
-    p.add_argument("--regime", default="ws", choices=("ws", "cs"),
+    p.add_argument("--regime", default="ws", choices=("ws", "cs", "csession"),
                    help="merge mode only: which shard family to merge. A merge NEVER mixes the two.")
     p.add_argument("--taps", default="", help="default: the regime's own unit (see CURVE_TAPS)")
+    p.add_argument("--elec-labels-sidecar",
+                   help="REQUIRED FOR --mode csession. Its electrode intersect aligns by identity "
+                        "(_elec_cols), and the encoder never wrote elec_labels — without the "
+                        "sidecar every csession cell returns {} and the run looks like a clean "
+                        "zero. Set on the module the readout actually reads (R), not a local copy.")
     p.add_argument("--contiguous", action="store_true",
                    help="draw the FIRST N trials instead of a random N. ⚠️ with KFold(2) only one "
                         "fold has train preceding test; the other decodes the past. A different "
                         "question, NOT the overnight number.")
     args = p.parse_args()
+
+    if args.elec_labels_sidecar:
+        import pickle
+        with open(args.elec_labels_sidecar, "rb") as fh:
+            R._ELEC_LABELS_SIDECAR = pickle.load(fh)
+        print(f"[sidecar] attaching elec_labels for {len(R._ELEC_LABELS_SIDECAR)} sessions",
+              flush=True)
+    elif args.mode == "csession":
+        # Fail HERE, not 40 minutes in with an empty shard. _elec_cols returns (None, None, 0)
+        # without labels, every elec tap is skipped, and the run would exit 0 having measured
+        # nothing -- the exact silent-zero this whole file's anchor discipline exists to prevent.
+        raise SystemExit(
+            "🔴 --mode csession requires --elec-labels-sidecar. Without it _elec_cols cannot align "
+            "electrodes by identity, every cell returns {}, and the shard is a clean-looking zero.")
 
     if args.mode == "merge":
         m = _merge(args.shard_dir, args.regime)
@@ -761,13 +845,15 @@ def main():
 
     taps = (tuple(t.strip() for t in args.taps.split(",") if t.strip())
             or CURVE_TAPS[args.mode])
-    cell = CS_TEST_CELLS[args.index] if args.mode == "cs" else LITE_SESSIONS[args.index]
-    grid = N_GRID_CS if args.mode == "cs" else N_GRID
+    cell = {"cs": CS_TEST_CELLS, "csession": CSESSION_CELLS,
+            "ws": LITE_SESSIONS}[args.mode][args.index]
+    grid = N_GRID if args.mode == "ws" else N_GRID_CS
     t0 = time.perf_counter()
     print(f"[R31/{args.mode}] S{cell[0]}T{cell[1]} taps={taps} contiguous={args.contiguous} "
           f"N_GRID={grid} seeds={SEEDS_FOR_N}", flush=True)
-    if args.mode == "cs":
-        print(f"  train anchor = S{CS_TRAIN_ANCHOR[0]}T{CS_TRAIN_ANCHOR[1]} (subsampled); "
+    if args.mode in TRANSFER_REGIMES:
+        src = CS_TRAIN_ANCHOR if args.mode == "cs" else _sibling(cell)
+        print(f"  train session = S{src[0]}T{src[1]} (subsampled); "
               f"val/test = this cell's cs_split (NEVER subsampled)", flush=True)
     sh = _shard(args.cache_dir, args.tag, args.index, args.mode, taps, args.contiguous)
     os.makedirs(args.shard_dir, exist_ok=True)

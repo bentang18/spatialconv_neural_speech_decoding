@@ -33,12 +33,16 @@ from scripts.neuroprobe.v3_board_samplecurve import (
     _anchor_verdict,
     _cs_anchor_check,
     _cs_curve_cell,
+    _csession_anchor_check,
+    _csession_curve_cell,
     _curve,
     _digest,
     _merge,
     _reach,
     _rng,
     _strat_draw,
+    _transfer_cols,
+    _transfer_curve_cell,
     _ws_curve_cell,
     _x_order,
 )
@@ -527,3 +531,101 @@ def test_merge_rejects_a_shard_whose_regime_contradicts_its_filename(tmp_path) -
 def test_merge_raises_rather_than_reporting_an_empty_curve(tmp_path) -> None:
     with pytest.raises(SystemExit):
         _merge(str(tmp_path), "cs")
+
+
+# ── CROSS-SESSION MODE ─────────────────────────────────────────────────────────────────────────
+#
+# csession is the CONTROL that gives the ws-vs-cs contrast its meaning: same patient, different
+# session. Without it, any ws/cs difference could be "cs is simply harder" rather than anything
+# about the subject boundary. It shares _transfer_curve_cell with cs, so what needs pinning is the
+# two things that DIFFER: the train record is the sibling (not the fixed anchor), and the draw key
+# moves with it.
+#
+# ⚠️ COVERAGE NOTE: the synthetic fixture's taps are parcel-named, so these exercise the PARCEL
+# branch of _transfer_cols. In production csession runs on the ELECTRODE taps. That branch is
+# guarded by the anchor check against the real _csession_cell, which fails fast and loudly on the
+# first task -- which is the design, not an omission.
+
+def test_csession_N_full_reproduces_the_published_csession_cell_exactly() -> None:
+    sib, tst = _big_rec(seed=0), _big_rec(seed=1)
+    task = BOARD_TASKS[0]
+    pts, _ = _csession_curve_cell(sib, tst, task, TAPS, (1, 2))
+    rows = _csession_anchor_check(sib, tst, task, TAPS, pts)
+    assert rows, "no anchor rows produced — the check would vacuously pass"
+    for r in rows:
+        assert r["absdiff"] == 0.0, f"csession anchor drifted: {r}"
+
+
+def test_csession_draw_is_keyed_on_the_sibling_so_it_MOVES_with_the_cell() -> None:
+    """The opposite of cs. There the donor is one fixed session for all ten cells, so the draw must
+    NOT move. Here the train session IS per-cell, so two cells with different siblings must get
+    different draws — otherwise every cell would be fit on rows drawn for someone else's sibling."""
+    rec = _big_rec()
+    y = np.asarray(rec["labels"][BOARD_TASKS[0]], dtype=np.float64)
+    tr = _finite(y, np.arange(len(y)))
+    a = _digest(_strat_draw(y, tr, 16, _rng((1, 2), "onset", 0, 16, 0)))
+    b = _digest(_strat_draw(y, tr, 16, _rng((3, 1), "onset", 0, 16, 0)))
+    assert a != b
+    # and it is NOT the cs key, or csession would silently reuse the donor's draws
+    assert a != _digest(_strat_draw(y, tr, 16, _rng(CS_TRAIN_ANCHOR, "onset", 0, 16, 0)))
+
+
+def test_csession_never_subsamples_the_targets_val_or_test() -> None:
+    sib, tst = _big_rec(seed=0), _big_rec(seed=1)
+    _, census = _csession_curve_cell(sib, tst, BOARD_TASKS[0], TAPS, (1, 2))
+    assert census
+    assert len({c["n_val"] for c in census}) == 1
+    assert len({c["n_test"] for c in census}) == 1
+
+
+def test_csession_emits_only_the_trainonly_column() -> None:
+    sib, tst = _big_rec(seed=0), _big_rec(seed=1)
+    pts, _ = _csession_curve_cell(sib, tst, BOARD_TASKS[0], TAPS, (1, 2))
+    assert pts and {p["col"] for p in pts} == {"trainonly"}
+
+
+def test_csession_keeps_the_ELECTRODE_taps_because_electrodes_are_shared_within_subject() -> None:
+    """cs must drop to parcel means (electrode identity is not shared across subjects); csession
+    must NOT, or it would throw away the per-electrode resolution it is entitled to and the ws/cs
+    ladder would confound 'crossed a subject boundary' with 'changed unit'."""
+    assert CURVE_TAPS["csession"] == CURVE_TAPS["ws"] == ("enc0_elec", "enc12_elec")
+    assert CURVE_TAPS["cs"] == ("enc0", "enc12")
+    assert len({SHARD_PREFIX[r] for r in ("ws", "cs", "csession")}) == 3
+
+
+def test_transfer_cols_routes_by_TAP_not_by_regime() -> None:
+    """A parcel tap must never take the electrode branch and vice versa. _is_elec is name-based, so
+    this is the seam where a wrong pairing would hide."""
+    import scripts.neuroprobe.v3_board_samplecurve as M
+
+    a, t = _big_rec(seed=0), _big_rec(seed=1)
+    seen = []
+    real_parcel = M._parcel_cols
+    M_R = M.R
+    real_elec = M_R._elec_cols
+
+    def spy_parcel(x, y):
+        seen.append("parcel"); return real_parcel(x, y)
+
+    def spy_elec(x, y):
+        seen.append("elec"); return real_elec(x, y)
+
+    M._parcel_cols = spy_parcel
+    M_R._elec_cols = spy_elec
+    try:
+        M._transfer_cols(a, t, "enc12")
+        M._transfer_cols(a, t, "enc12_elec")
+    finally:
+        M._parcel_cols = real_parcel
+        M_R._elec_cols = real_elec
+    assert seen == ["parcel", "elec"], seen
+
+
+def test_transfer_regimes_share_one_cell_function() -> None:
+    """cs and csession differ ONLY in the train record and the draw key. If they ever stop sharing
+    _transfer_curve_cell, the two curves can drift apart for reasons that are not the regime."""
+    sib, tst = _big_rec(seed=0), _big_rec(seed=1)
+    task = BOARD_TASKS[0]
+    a, _ = _cs_curve_cell(sib, tst, task, TAPS)
+    b, _ = _transfer_curve_cell(sib, tst, task, TAPS, CS_TRAIN_ANCHOR)
+    assert [p["test"] for p in a] == [p["test"] for p in b]
