@@ -75,6 +75,7 @@ import json
 import os
 import sys
 import time
+import warnings
 
 import numpy as np
 
@@ -531,46 +532,71 @@ def _addmult(pts, tap0, tap12, col, nboot=2000, seed=0) -> dict:
     EIV-biased toward zero if anything — which makes a nonzero `a` the conservative finding and a
     null `a` the one that has to be read carefully.
     """
-    by = {}
-    for p in pts:
-        if p["col"] != col or p["tap"] not in (tap0, tap12) or p["n_is_full"]:
-            continue
-        by.setdefault(_subject(p["cell"]), {}).setdefault(p["n_bucket"], {}) \
-          .setdefault(p["task"], {}).setdefault((p["cell"], p["tap"]), []).append(p["test"])
-
-    subs = sorted(by)
-    ns = sorted({n for s in subs for n in by[s]}, key=_x_order)
-
-    def fit(draw):
-        xs, ys = [], []
-        for n in ns:
-            # Aggregation order is _curve's EXACTLY -- seeds, then cells, then tasks -- so that
-            # fit(subs) reproduces the printed curve rather than a second, differently-weighted
-            # estimate of it. A subject drawn twice contributes its cells twice; that IS the
-            # bootstrap weighting, and it is why the pooling happens here and not per subject.
-            acc = {tap0: {}, tap12: {}}
-            for s in draw:
-                for task, cellmap in by[s].get(n, {}).items():
-                    for (_cell, tap), vals in cellmap.items():
-                        acc[tap].setdefault(task, []).append(np.nanmean(vals))
-            if not acc[tap0] or not acc[tap12]:
-                continue
-            macro = {t: np.nanmean([np.nanmean(v) for v in acc[t].values()]) for t in acc}
-            xs.append(macro[tap0] - .5)
-            ys.append(macro[tap12] - .5)
-        if len(xs) < 3:
-            return None, None
-        k, a = np.polyfit(np.asarray(xs), np.asarray(ys), 1)
-        return float(a), float(k)
-
-    a_hat, k_hat = fit(subs)
+    tot, cnt, subs, ns = _panel(pts, tap0, tap12, col)
+    fit = _panel_fit(tot, cnt)
+    a_hat, k_hat = fit(np.arange(len(subs)))
     rng = np.random.default_rng(seed)
-    boots = [fit(list(rng.choice(subs, size=len(subs), replace=True))) for _ in range(nboot)]
+    boots = [fit(rng.integers(0, len(subs), len(subs))) for _ in range(nboot)]
     A = np.asarray([b[0] for b in boots if b[0] is not None])
     K = np.asarray([b[1] for b in boots if b[1] is not None])
     ci = lambda v: (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
     return {"a": a_hat, "k": k_hat, "a_ci": ci(A), "k_ci": ci(K),
             "n_points": len(ns), "n_subjects": len(subs), "n_boot": len(A)}
+
+
+def _panel(pts, tap0, tap12, col):
+    """Collapse the point list ONCE into per-(subject, N, tap, task) cell-mean sums and counts.
+
+    Without this the bootstrap re-walks a 43k-point nested dict on every one of thousands of
+    resamples, which is minutes per regime. Sums and counts are the right summary because the
+    aggregation pools CELLS across subjects before averaging tasks: a drawn subject contributes its
+    cells' sum and its cells' count, so a subject drawn twice simply doubles both — which is exactly
+    the bootstrap weighting the slow path got by appending to a list twice.
+    """
+    cellmean: dict = {}
+    for p in pts:
+        if p["col"] != col or p["tap"] not in (tap0, tap12) or p["n_is_full"]:
+            continue
+        cellmean.setdefault(
+            (_subject(p["cell"]), p["n_bucket"], p["tap"], p["task"], p["cell"]), []
+        ).append(p["test"])
+
+    subs = sorted({k[0] for k in cellmean})
+    ns = sorted({k[1] for k in cellmean}, key=_x_order)
+    tasks = sorted({k[3] for k in cellmean})
+    si = {s: i for i, s in enumerate(subs)}
+    ni = {n: i for i, n in enumerate(ns)}
+    ti = {t: i for i, t in enumerate(tasks)}
+    shape = (len(subs), len(ns), 2, len(tasks))
+    tot, cnt = np.zeros(shape), np.zeros(shape)
+    for (s, n, tap, task, _cell), vals in cellmean.items():
+        v = np.nanmean(vals)
+        if not np.isfinite(v):
+            continue
+        idx = (si[s], ni[n], 0 if tap == tap0 else 1, ti[task])
+        tot[idx] += v
+        cnt[idx] += 1
+    return tot, cnt, subs, ns
+
+
+def _panel_fit(tot, cnt):
+    """(a, k) for a subject draw given the precomputed panel. `draw` carries multiplicity."""
+    def fit(draw):
+        w = np.bincount(np.asarray(draw, dtype=np.int64), minlength=tot.shape[0]).astype(float)
+        t = np.tensordot(w, tot, axes=(0, 0))          # [N, 2, task]
+        c = np.tensordot(w, cnt, axes=(0, 0))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            per_task = np.where(c > 0, t / np.where(c > 0, c, 1), np.nan)
+        with warnings.catch_warnings():                # an all-NaN task row is a real "no data"
+            warnings.simplefilter("ignore", RuntimeWarning)
+            macro = np.nanmean(per_task, axis=2)       # [N, 2]
+        ok = np.isfinite(macro).all(axis=1)
+        if ok.sum() < 3:
+            return None, None
+        x, y = macro[ok, 0] - .5, macro[ok, 1] - .5
+        k, a = np.polyfit(x, y, 1)
+        return float(a), float(k)
+    return fit
 
 
 def _report(m) -> None:
