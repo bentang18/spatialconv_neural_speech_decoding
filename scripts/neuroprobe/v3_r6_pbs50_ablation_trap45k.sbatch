@@ -22,15 +22,17 @@
 #   sbatch scripts/neuroprobe/v3_r6_pbs50_ablation_trap45k.sbatch noparcel
 #   sbatch scripts/neuroprobe/v3_r6_pbs50_ablation_trap45k.sbatch nosrope
 #   sbatch scripts/neuroprobe/v3_r6_pbs50_ablation_trap45k.sbatch noparcel_nosrope
+#   sbatch scripts/neuroprobe/v3_r6_pbs50_ablation_trap45k.sbatch parcelperm
 #
 # GEOMETRY ABLATIONS OFF THE LIVE CANONICAL BOARD ARM (pbs50), FROM SCRATCH, PAPER-GRADE.
 # Ben 2026-08-01: "these numbers will genuinely go into the paper, so we are on a proper pass."
 # Supersedes the 20k pretrain-probe reads (#18 space-RoPE, #19 noparcel), which were taken off a
 # different, pre-pbs50 baseline and at a step where the arm had not cooled down.
 #
-# ONE FILE, THREE ARMS -- deliberately. An OFAT is only readable if every non-ablated flag is
-# byte-identical across arms; three copy-pasted launchers drift silently. The arm selects exactly
-# one line (ABL below) and nothing else.
+# ONE FILE, FOUR ARMS -- deliberately. An OFAT is only readable if every non-ablated flag is
+# byte-identical across arms; copy-pasted launchers drift silently. The arm selects exactly
+# one line (ABL below) and nothing else. (parcelperm was added 2026-08-04 and lands in the same
+# file for exactly this reason: it must be comparable to noparcel, which it splits.)
 #
 # ═══ WHAT EACH ARM REMOVES ═══════════════════════════════════════════════════════════════════════
 # noparcel  --no-parcel-embed : the DKT parcel-identity embed is NOT CONSTRUCTED. pe.py:189-190
@@ -44,6 +46,28 @@
 # noparcel_nosrope : both. Since the parcel embed is PARCEL-level and band_type_emb is BAND-level,
 #   index-RoPE is the only remaining per-token carrier of within-shaft contact identity -- so this
 #   arm is the joint control: the model keeps NO explicit spatial position at all.
+# parcelperm --parcel-perm-seed 33 : the embed is KEPT and each subject's parcel vocabulary is
+#   relabeled by a deterministic per-subject permutation (parcel_perm.py). Table size, parameter
+#   count, tag marginals, the partition of electrodes into parcels and within-subject
+#   distinguishability are all IDENTICAL to canonical; the only thing removed is the
+#   correspondence BETWEEN brains. This SPLITS the noparcel result, which confounds two accounts:
+#     (i)  the tag tells regions apart INSIDE one brain (any stable code would serve), and
+#     (ii) row p accumulates gradient from every electrode tagged p in EVERY brain, so a true
+#          atlas makes the shared-weight function conditional on a code that means the same
+#          thing across subjects -- pretraining is itself a cross-subject problem.
+#   perm ~ canonical => (i). perm ~ noparcel => (ii). In between => the -.0205/-.0129/-.0178
+#   splits into an alignment term (canonical - perm) and an identifiability term (perm - noparcel).
+#   🔴 THE READOUT IS UNTOUCHED. The permuted id is a MODEL-side tag only. The board readout pools
+#   electrodes to parcels and intersects CS anchor/test parcels by TRUE atlas id, so the encode
+#   keeps the two apart explicitly and ASSERTS the relation per session (v3_probe_encode_r4).
+#   Permuting the pooling too would scramble the readout instead of the encoder.
+#   ⚠️ THE ENCODE MUST BE PASSED --parcel-perm-seed 33. It is NOT inferable from the ckpt (no
+#   save_hyperparameters anywhere), exactly like --no-space-rope. Compare the [parcel-perm]
+#   fingerprint line in this training log against the encode log.
+#   ⚠️ STATED ASSUMPTION: board subjects 7 and 10 get ZERO pretraining, so under this arm they have
+#   no learned convention at all. The encode applies their own deterministic permutation anyway,
+#   as the faithful continuation of the training rule. Under account (ii) that makes CS the cell
+#   that should move most, which is the prediction this arm is worth running for.
 #
 # ⚠️ WORDING: self-attention without positional input is permutation-EQUIVARIANT, not invariant,
 # and it does not "learn order". Do not write either phrase off these runs.
@@ -78,14 +102,18 @@
 # requeue, not a rescue from step 44000. Watch the s/step in the first hour.
 set -uo pipefail
 
-ARM="${1:?usage: sbatch v3_r6_pbs50_ablation_trap45k.sbatch <noparcel|nosrope|noparcel_nosrope>}"
+ARM="${1:?usage: sbatch v3_r6_pbs50_ablation_trap45k.sbatch <noparcel|nosrope|noparcel_nosrope|parcelperm>}"
 # Explicit whitelist: a typo'd arm must FAIL, never silently fall through to an unablated run that
 # would look like a valid ablation in wandb and burn 43 h.
 case "$ARM" in
   noparcel)          ABL="--no-parcel-embed" ;;
   nosrope)           ABL="--no-space-rope" ;;
   noparcel_nosrope)  ABL="--no-parcel-embed --no-space-rope" ;;
-  *) echo "[FATAL] unknown arm '$ARM' (expected noparcel | nosrope | noparcel_nosrope)"; exit 1 ;;
+  # seed 33 == the run seed, reused so the arm introduces no new magic number. It keys the
+  # per-subject permutation only; it does NOT touch torch/data RNG (parcel_perm.py uses its own
+  # numpy PCG64 stream), so data order and init stay bit-matched to the other arms.
+  parcelperm)        ABL="--parcel-perm-seed 33" ;;
+  *) echo "[FATAL] unknown arm '$ARM' (expected noparcel | nosrope | noparcel_nosrope | parcelperm)"; exit 1 ;;
 esac
 
 module load python/miniforge3_pytorch/2.10.0

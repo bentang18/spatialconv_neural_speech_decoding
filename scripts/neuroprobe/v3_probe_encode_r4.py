@@ -503,6 +503,13 @@ def main() -> None:
                         "is implied (MAE has no EMA teacher), and enc0 is available exactly as on "
                         "v3r4. The two-stream frontends (v3r5/v3r5nf/v3r5nffast) imply --online + "
                         "no enc0 (band strides are r4-only).")
+    p.add_argument("--parcel-perm-seed", dest="parcel_perm_seed", type=int, default=None,
+                   help="the ckpt was trained with dispatch_v3 --parcel-perm-seed S (R35 "
+                        "ablation). Like --no-space-rope this is NOT inferable from the ckpt "
+                        "(no save_hyperparameters anywhere) and a wrong value silently feeds the "
+                        "encoder a vocabulary it never learned, so it MUST be passed and the "
+                        "[parcel-perm] fingerprint MUST match the training log. The readout's "
+                        "parcel pooling keeps the TRUE atlas ids either way.")
     p.add_argument("--no-space-rope", dest="no_space_rope", action="store_true",
                    help="the ckpt was trained with dispatch_v3 --no-space-rope (ablation A2). "
                         "MUST be passed by hand: L1RoPE registers idx_freq persistent=False, so "
@@ -566,6 +573,7 @@ def main() -> None:
     )
     from speech_decoding.models.v14_converged_v3.stem import nf_token_geometry
     from speech_decoding.models.v14_converged_v3.session_loader import load_v3_sessions
+    from speech_decoding.models.v14_converged_v3.parcel_perm import apply_parcel_perm
 
     is_r5 = args.frontend == "v3r5"
     is_r5nf = args.frontend in ("v3r5nf", "v3r5nffast")
@@ -662,7 +670,8 @@ def main() -> None:
             sessions=[session], band_cache_dirs=args.band_cache_dirs, span_dir=args.span_dir,
             parcel_fn=parcel_fn, lof_report_path=None,
             winsor=(20.0, 15.0) if is_two_stream else (15.0, 15.0, 20.0),
-            keep_labels_fn=keep_labels_fn, **load_kw,
+            keep_labels_fn=keep_labels_fn,
+            parcel_perm_seed=args.parcel_perm_seed, **load_kw,
         )[0]
         if keep_labels_fn is not None:
             # The montage is the WHOLE parity claim — print what was realized, per session.
@@ -697,8 +706,33 @@ def main() -> None:
             grid = build_r5nf_grid(geom, n_time=n_tok, time_stride=time_stride)
         else:
             grid = build_r4_grid(geom, n_time=clip_frames)
-        parcel_packed = parcel_id[grid.contact]
-        canon, parcel_canon, present = _canon_parcels(grid, parcel_id)
+        # R35 SPLIT. ``spec.setup.parcel_id`` is the MODEL-SIDE tag: under --parcel-perm-seed
+        # it is this subject's permuted vocabulary, which is what the parcel embed and the
+        # predictor mask-query were trained on. The parcel POOLING below, and the CS
+        # anchor/test parcel intersection it feeds, match parcels ACROSS subjects by atlas
+        # id, so they MUST keep the TRUE tag -- permuting them would scramble the readout
+        # instead of the encoder and the arm would measure the wrong thing.
+        # ``parcel_fn`` maps by label, so passing the survivor labels returns survivor-aligned
+        # true tags. The relation between the two is then ASSERTED on real data: with no seed
+        # the recomputation must reproduce the spec exactly (which validates the recomputation
+        # itself), and with a seed the spec must be exactly the permutation of it. This is the
+        # guard the ckpt cannot provide.
+        parcel_true = parcel_fn(subject_id, trial_id, list(spec.setup.sidecar.labels)).long()
+        expect = (parcel_true if args.parcel_perm_seed is None else
+                  apply_parcel_perm(parcel_true, subject_id, seed=args.parcel_perm_seed))
+        if not torch.equal(expect, spec.setup.parcel_id.cpu()):
+            raise RuntimeError(
+                f"parcel tag parity FAILED for s{subject_id}_t{trial_id} with "
+                f"--parcel-perm-seed {args.parcel_perm_seed}: the spec's model-side tag is not "
+                f"the expected relabeling of the true atlas tag ({int((expect != spec.setup.parcel_id.cpu()).sum())} "
+                f"of {expect.numel()} electrodes disagree). Refusing to encode."
+            )
+        print(f"[parcel-perm] s{subject_id}_t{trial_id} parity OK "
+              f"(seed={args.parcel_perm_seed}, {int((parcel_true != spec.setup.parcel_id.cpu()).sum())} "
+              f"of {parcel_true.numel()} electrodes relabeled; pooling uses TRUE atlas ids)",
+              flush=True)
+        parcel_packed = parcel_id[grid.contact]                        # MODEL-side tag
+        canon, parcel_canon, present = _canon_parcels(grid, parcel_true)  # TRUE atlas ids
 
         # enc0 = the per-band decimated input floor. r4: BAND_STRIDES (8,2,1) on the 32 Hz clock.
         # 2-stream (Ben 2026-07-23): both caches are native 64 Hz and the stem decimates by

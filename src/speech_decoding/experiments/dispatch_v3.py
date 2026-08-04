@@ -547,6 +547,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # omits this flag SILENTLY restores base_index=8. Any --resume-ckpt of an A2 run MUST re-pass it.
     p.add_argument("--no-space-rope", dest="no_space_rope", action="store_true",
                    help="A2 ablation: zero the contact-index RoPE axis (time RoPE unchanged)")
+    # R35 ablation: relabel each subject's parcel vocabulary through a deterministic
+    # per-subject permutation. Keeps the table, the parameter count, the tag marginals and
+    # within-subject distinguishability; destroys ONLY the correspondence BETWEEN brains.
+    # Separates "the tag identifies a region inside one brain" from "the tag means the same
+    # thing in every brain", which the noparcel arm confounds. FROM SCRATCH only, same
+    # reason as --no-parcel-embed: the input differs from step 0.
+    # ⚠️ NOT inferable from the ckpt (no save_hyperparameters anywhere), exactly like
+    # --no-space-rope. Any resume/cooldown of an R35 run MUST re-pass it, and the matching
+    # encode MUST be given the same seed — compare the [parcel-perm] fingerprint lines.
+    p.add_argument("--parcel-perm-seed", dest="parcel_perm_seed", type=int, default=None,
+                   help="R35 ablation: permute the parcel vocabulary per subject with this seed")
     p.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=5000)
     p.add_argument("--min-lr-ratio", dest="min_lr_ratio", type=float, default=1.0)
     # WSD cooldown (branch a stable-phase ckpt): flat until --stable-steps, then
@@ -775,6 +786,7 @@ def main(argv: tp.Sequence[str] | None = None) -> None:
         lof_report_path=args.lof_report_path,
         winsor=winsor,
         band_rates=band_rates,
+        parcel_perm_seed=getattr(args, "parcel_perm_seed", None),
     )
     module, dm, trainer = build_v3_training(sessions, args)
     if args.compile:

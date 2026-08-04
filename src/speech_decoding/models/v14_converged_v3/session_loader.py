@@ -43,6 +43,10 @@ from speech_decoding.models.v14_converged_v3.dataset import (
     reference_n_frames,
 )
 from speech_decoding.models.v14_converged_v3.masking import V3MaskConfig
+from speech_decoding.models.v14_converged_v3.parcel_perm import (
+    apply_parcel_perm,
+    perm_fingerprint,
+)
 from speech_decoding.models.v14_converged_v3.session_setup import build_session_setup
 
 ParcelFn = Callable[[int, int, Sequence[str]], Tensor]
@@ -82,6 +86,7 @@ def load_v3_sessions(
     mask_cfg: V3MaskConfig = V3MaskConfig(),
     keep_labels_fn: KeepLabelsFn | None = None,
     band_rates: Sequence[tuple[int, int]] = UNIFORM_BAND_RATES,
+    parcel_perm_seed: int | None = None,
 ) -> list[V3SessionSpec]:
     """Assemble the per-session ``V3SessionSpec`` list for the datamodule.
 
@@ -100,7 +105,17 @@ def load_v3_sessions(
     on the restricted axis by the same code path as a normal run, so none of them can
     desync. (``geom`` in particular CANNOT be masked post-hoc — ``gather_idx`` stores
     indices INTO the survivor axis, so dropping survivors invalidates every stored index.)
-    ``None`` ⇒ keep everything (the training path; byte-identical to no argument)."""
+    ``None`` ⇒ keep everything (the training path; byte-identical to no argument).
+
+    ``parcel_perm_seed`` (opt, R35 ablation): relabel each subject's parcel tags through a
+    deterministic per-subject permutation (``parcel_perm.py``). ``setup.parcel_id`` then
+    carries the MODEL-SIDE tag — what the parcel embed and the predictor mask-query see.
+    It is applied here, before ``build_session_setup``, so every downstream hop (sidecar,
+    geometry, shaft packing) carries one consistent tag and none of them need to know.
+    ⚠️ The readout's parcel POOLING and the CS anchor/test parcel intersection match
+    parcels across subjects by ATLAS id and must keep using the TRUE tag; the encode
+    recomputes it from ``parcel_fn`` rather than reading it off the spec. ``None`` ⇒ no
+    permutation, byte-identical to no argument."""
     # band-count agnostic: r4/arm0 pass 3 (slow, mid, hga); r5 passes 2 (v3hga, v3lfs).
     # dirs must align to rates; everything below zips over band_indexes.
     if len(band_cache_dirs) != len(band_rates):
@@ -124,6 +139,8 @@ def load_v3_sessions(
                 )
         labels = list(ch0)
         parcel_id = parcel_fn(subject_id, trial_id, labels).long()
+        if parcel_perm_seed is not None:
+            parcel_id = apply_parcel_perm(parcel_id, subject_id, seed=parcel_perm_seed)
         drop = set(lof.get((subject_id, trial_id), set()))
         if keep_labels_fn is not None:
             keep = keep_labels_fn(subject_id, trial_id, labels)
@@ -159,5 +176,15 @@ def load_v3_sessions(
                 sigma_floor=sigma_floor,
                 winsor=winsor,
             )
+        )
+    if parcel_perm_seed is not None:
+        subs = sorted({s for s, _ in sessions})
+        # Printed so a training run and its encode run can be compared on ONE line. The
+        # ckpt stores no hyperparameters, so this banner is the only record of which
+        # vocabulary the weights were trained against.
+        print(
+            f"[parcel-perm] R35 ACTIVE seed={parcel_perm_seed} subjects={subs} "
+            f"fingerprint={perm_fingerprint(subs, seed=parcel_perm_seed)}",
+            flush=True,
         )
     return specs
