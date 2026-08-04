@@ -8,9 +8,25 @@ are available in both; CSubject reads the parcel-mean tap because electrode iden
 across subjects. Reading one tap for all three would silently change what is being compared.
 
 The null and the decision map print BEFORE the numbers so the read cannot be rationalised after the
-fact. The floor row is the control: enc0 never reads weights (v3_probe_encode_r4.py:477), so it must
-tie across arms. A floor that MOVES means the two caches are not on the same features and the enc12
-delta is uninterpretable -- that check comes first and it is fatal, not advisory.
+fact. The floor row is the control: enc0 never reads weights (v3_probe_encode_r4.py:477), so the two
+arms must carry the SAME depth-0 features. A floor that moves means they do not and the enc12 delta
+is uninterpretable -- that check comes first and it is fatal, not advisory.
+
+The control originally demanded an EXACT tie, and that was wrong. It was validated only by reading
+the baseline against ITSELF, which is bit-exact for free and therefore tested nothing. Two
+independent GPU encodes are not bit-reproducible: reduction order in the frontend varies, and at
+near-chance AUROC a float epsilon flips many concordant pairs at once. Measured on
+board_noparcel_trap45k vs pbs50_cd45k, cs enc0 gave 132/150 EXACT ties with 11 of the 18 remainder
+differing by exactly 1.306e-06 -- one pair inversion, the AUROC quantum for that cell -- and the two
+largest drifts (4.1e-04, 3.0e-04) both sitting on near-chance cells (.490, .521).
+
+So the control now tests what it was always meant to test, in two parts:
+  (1) NO SYSTEMATIC SHIFT. The drift must be sign-balanced under the same exact sign test used on
+      the effect. A floor that leans consistently one way is a real feature difference however small.
+  (2) TOO SMALL TO MATTER. The worst per-cell drift must be at least 10x below the effect being
+      claimed. Anything closer and the floor could be generating the effect.
+Both are reported with their numbers, and the exact-tie fraction is printed alongside as direct
+evidence of shared features -- a genuine mismatch cannot tie to the last bit on most cells.
 
 An arm encoded with --elec-taps 12 has no enc0_elec, so WS/CSession lose the floor control and only
 CSubject keeps it. That is reported as SKIPPED, never silently passed.
@@ -29,6 +45,11 @@ PUBLISHED = OrderedDict(
     cs=("enc12", "enc0"),
 )
 NORM = "std"
+# Floor-control thresholds. FLOOR_P is the sign-test level below which the drift counts as leaning.
+# FLOOR_RATIO is how far the worst per-cell drift must sit below the effect; 10x is one order of
+# magnitude, the point past which the floor cannot plausibly be manufacturing the effect.
+FLOOR_P = 0.05
+FLOOR_RATIO = 10.0
 
 
 def _cells(merged: dict, tag: str, regime: str, tap: str) -> dict:
@@ -87,13 +108,22 @@ def main() -> None:
     print("HYPOTHESIS  the ablated arm scores LOWER than the baseline at enc12, in all 3 regimes.")
     print("NULL        the two arms are draws from the same distribution => each paired (cell,task)")
     print("            difference is positive with p=0.5 => an exact two-sided sign test.")
-    print("CONTROL     the depth-0 floor MUST tie exactly (enc0 never reads weights). A moving")
-    print("            floor is FATAL: the caches are not on the same features.")
+    print("CONTROL     the depth-0 floor carries the SAME features (enc0 never reads weights), so")
+    print(f"            its drift must be sign-balanced (p > {FLOOR_P:.2f}) AND its worst per-cell")
+    print(f"            drift at least {FLOOR_RATIO:.0f}x below the effect. Failing either is FATAL.")
     print("DECISION    |delta| < .005 with p > .05  -> a WASH at this power")
     print("            delta < 0 with p <= .05      -> the component is load-bearing on that regime")
     print("            delta > 0 with p <= .05      -> the ablation HELPS; report it, do not bury it")
     print("UNITS       ws 12 cells x 15 tasks = 180 | csession 180 | cs 10 x 15 = 150")
     print("=" * 78)
+
+    # The control is scored against the effect it has to be small relative to, so the effect is
+    # computed first and PRINTED second. Order of computation is not order of adjudication.
+    effect = {}
+    for regime, (tap, _floor) in PUBLISHED.items():
+        b, m = _cells(base, bt, regime, tap), _cells(arm, at, regime, tap)
+        common = sorted(set(b) & set(m))
+        effect[regime] = (b, m, common, [m[k] - b[k] for k in common])
 
     print("\n--- CONTROL: depth-0 floor ---")
     fatal = False
@@ -108,10 +138,24 @@ def main() -> None:
         d = [m[k] - b[k] for k in common]
         worst = max(abs(x) for x in d)
         ties = sum(1 for x in d if x == 0)
-        ok = worst < 1e-9
+        pos, neg, p = _sign_test(d)
+        eff = effect[regime][3]
+        eff_mean = abs(sum(eff) / len(eff)) if eff else float("nan")
+        balanced = p > FLOOR_P
+        small = bool(eff) and worst * FLOOR_RATIO <= eff_mean
+        ok = balanced and small
         fatal |= not ok
+        # worst == 0 is the bit-identical case (notably a file read against itself); the ratio is
+        # unbounded rather than undefined, so report it as such instead of dividing.
+        ratio = "inf" if worst == 0 else f"{eff_mean / worst:.0f}x"
         print(f"  {regime:9s} {floor:11s} n={len(common):3d} ties={ties:3d}/{len(common)} "
-              f"max|delta|={worst:.2e}  {'OK' if ok else 'FAIL — CACHES DIFFER'}")
+              f"max|drift|={worst:.2e} vs effect {eff_mean:.2e} ({ratio}) "
+              f"| drift signs {pos}+/{neg}- p={p:.3f}  {'OK' if ok else 'FAIL'}")
+        if not balanced:
+            print(f"  {'':9s} !! the floor leans one way — a real feature difference")
+        if not small:
+            print(f"  {'':9s} !! floor drift is within {FLOOR_RATIO:.0f}x of the effect — it could "
+                  f"be generating it")
     if fatal:
         print("\n  !! FLOOR MOVED. The enc12 comparison below is NOT interpretable. Stop here.")
 
@@ -119,14 +163,11 @@ def main() -> None:
     print(f"  {'regime':9s} {'tap':11s} {'n':>4s} {'base':>7s} {'arm':>7s} {'delta':>8s} "
           f"{'arm+':>7s} {'p':>8s}")
     for regime, (tap, _floor) in PUBLISHED.items():
-        b = _cells(base, bt, regime, tap)
-        m = _cells(arm, at, regime, tap)
-        common = sorted(set(b) & set(m))
+        b, m, common, d = effect[regime]
         if not common:
             print(f"  {regime:9s} {tap:11s}  --  no common (cell,task); arm cells="
                   f"{len(m)} base cells={len(b)}")
             continue
-        d = [m[k] - b[k] for k in common]
         pos, neg, p = _sign_test(d)
         bm = sum(b[k] for k in common) / len(common)
         mm = sum(m[k] for k in common) / len(common)
