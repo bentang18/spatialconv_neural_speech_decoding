@@ -802,3 +802,81 @@ def test_space_block_w_bands_rejects_a_bad_triple(tmp_path) -> None:
             continue
         raise AssertionError(f"{bad!r} should have raised")
     print("[check] OK --space-block-w-bands rejects non-triples")
+
+
+def test_mask_time_frac_threads_into_all_three_bands_space_unchanged(tmp_path) -> None:
+    # ARM B (Ben 2026-08-04): "just like how we did a no spatial mask arm - do you think we
+    # should do a no temporal mask arm?". --mask-time-frac sets the three per-band TIME fracs
+    # together and touches nothing else, mirroring --mask-space-frac on the other axis.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_def, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
+    )
+    c = m_def.model.mask_cfg
+    assert (c.hga_mask_frac, c.mid_mask_frac, c.slow_mask_frac) == (0.50, 0.50, 0.50)
+    m_nt, dm_nt, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           mask_time_frac=0.0)
+    )
+    c = m_nt.model.mask_cfg
+    assert (c.hga_mask_frac, c.mid_mask_frac, c.slow_mask_frac) == (0.0, 0.0, 0.0)
+    assert c.space_frac == 0.50  # the SPATIAL axis is held — this is a single-factor arm
+    assert c.block_w_space == 4 and c.block_w_band == 4  # block widths untouched
+    _cpu_trainer(2).fit(m_nt, datamodule=dm_nt)  # trains with zero temporal masking
+    print("[check] OK --mask-time-frac 0.0 zeroes all 3 band time fracs; space_frac held at 0.50")
+
+
+def test_no_time_mask_and_pbs00_are_a_matched_fraction_pair(tmp_path) -> None:
+    # THE POINT OF THE ARM. pbs00 is (space 0.0, time 0.50); this arm is (space 0.50, time 0.0).
+    # Both leave HALF the tokens masked, so the pair differs only in WHICH axis carries the
+    # masking, not in how much is masked. Written as a test because the comparison is void
+    # if the two fractions are not actually equal.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_notime, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           mask_time_frac=0.0)
+    )
+    m_pbs00, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae",
+                           mask_space_frac=0.0)
+    )
+    a, b = m_notime.model.mask_cfg, m_pbs00.model.mask_cfg
+    assert (a.space_frac, a.hga_mask_frac) == (0.50, 0.0)
+    assert (b.space_frac, b.hga_mask_frac) == (0.0, 0.50)
+    print("[check] OK matched-fraction mirror: (space .50, time 0) vs (space 0, time .50)")
+
+
+def test_enc_width_threads_into_the_model_and_defaults_to_the_lock(tmp_path) -> None:
+    # ARM A (Ben 2026-08-04): "change d=384, heads = 6 - and keep predictor width at 1/2
+    # encoder width". Heads and the predictor are DERIVED, so --enc-width is the whole knob.
+    sess = [(1, 0, _shaft_labels((8, 8, 8)))]
+    band_dirs, span_dir = _write_caches(tmp_path, sess)
+    specs = load_v3_sessions(
+        sessions=[(1, 0)], band_cache_dirs=band_dirs, span_dir=span_dir,
+        parcel_fn=_stub_parcel_fn,
+    )
+    m_def, _, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae")
+    )
+    assert (m_def.model.objective.d_model, m_def.model.objective.d_pred) == (256, 128)
+    m_vits, dm_vits, _ = build_v3_training(
+        specs, _smoke_args(frontend="v3r6", contact_budget=16, objective="mae", enc_width=384)
+    )
+    obj = m_vits.model.objective
+    assert (obj.d_model, obj.d_pred) == (384, 192)
+    blk = obj.online.encoder.blocks[0]
+    assert (blk.n_heads, blk.head_dim) == (6, 64)
+    pblk = obj.predictor.blocks[0]
+    assert (pblk.n_heads, pblk.head_dim) == (6, 32)
+    _cpu_trainer(2).fit(m_vits, datamodule=dm_vits)  # a real step at ViT-Small width
+    print("[check] OK --enc-width 384 gives enc 384/6 (head_dim 64) + pred 192/6 (head_dim 32)")

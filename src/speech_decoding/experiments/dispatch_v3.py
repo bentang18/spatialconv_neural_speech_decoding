@@ -342,6 +342,17 @@ def build_v3_training(
     space_frac = getattr(args, "mask_space_frac", None)
     if space_frac is not None:
         mask_cfg = replace(mask_cfg, space_frac=space_frac)
+    # --mask-time-frac: the TIME-axis mirror of --mask-space-frac, applied to all three bands at
+    # once (the three fracs are independent knobs but the arm moves them together, so one number
+    # keeps it a single factor). At 0.0 with space held at 0.50 the masked fraction is 0.50 — the
+    # SAME total as pbs00 (space 0, time 0.50), which makes the two a matched-fraction pair that
+    # differs only in WHICH axis is masked. None ⇒ unchanged (byte-identical to the locked config).
+    time_frac = getattr(args, "mask_time_frac", None)
+    if time_frac is not None:
+        mask_cfg = replace(
+            mask_cfg, hga_mask_frac=time_frac, mid_mask_frac=time_frac,
+            slow_mask_frac=time_frac,
+        )
     # --band-block-w: RANDOM-vs-BLOCK MASKING ablation (A1). block_w_band is the leak-safe
     # contiguous width in a band's OWN tokens (masking.py:75, M14 margin 2). At width 1 the
     # cover degenerates to independent uniform per-token selection = RANDOM masking — the control
@@ -371,6 +382,7 @@ def build_v3_training(
         mae_stream_weight=getattr(args, "mae_stream_weight", "equal"),
         mae_force_norm_pix=getattr(args, "mae_norm_pix", False),
         mae_hga_envelope=getattr(args, "mae_hga_envelope", False),
+        **({"d_model": w} if (w := getattr(args, "enc_width", None)) else {}),
     )
     optim = build_v3_optim_cfg(
         lr=args.lr, weight_decay=args.weight_decay,
@@ -661,6 +673,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "one visible). Default None ⇒ 0.50 (byte-identical to r6, 0.75 total "
                         "space-union-time). 0.80 with time held at 0.50 ≈ 0.90 total, aimed at the "
                         "load-bearing spatial axis (image-MAE-hard space, ASR-standard time).")
+    p.add_argument("--mask-time-frac", dest="mask_time_frac", type=float, default=None,
+                   help="TIME-AXIS OFAT: per-band TEMPORAL mask fraction, set on all three bands "
+                        "at once (masking.py hga/mid/slow_mask_frac). Default None ⇒ 0.50 each "
+                        "(byte-identical to r6). 0.0 removes temporal masking entirely, leaving "
+                        "the 0.50 spatial mask alone: 0.50 total masked, the matched-fraction "
+                        "mirror of pbs00 (--mask-space-frac 0, time 0.50).")
+    p.add_argument("--enc-width", dest="enc_width", type=int, default=None,
+                   help="WIDTH OFAT: encoder d_model. Must be a multiple of 128. The head count "
+                        "(d/64), the predictor width (d/2) and the predictor head count (= the "
+                        "encoder's) are DERIVED (towers.width_spec), so this one number moves the "
+                        "whole model along the ViT ladder. Default None ⇒ 256 (enc 256/4, pred "
+                        "128/4 — the locked config). 384 = ViT-Small (enc 384/6, pred 192/6).")
     # --- batching unit (shaft-level cross-patient vs session-homogeneous) ---
     p.add_argument("--batch-unit", dest="batch_unit", choices=("session", "shaft"),
                    default=None,

@@ -393,3 +393,49 @@ def test_token_flags_reads_space_per_band() -> None:
     assert not bool(hit[grid.contact != 2].any()), "other contacts untouched"
     assert bool((in_loss == masked).all())
     print(f"[check] OK token_flags_r6 space is per band ({int(hit.sum())} tokens, HGA of contact 2 only)")
+
+
+def _masked_fraction(m: V3MasksR6, *, n_time: int) -> float:
+    """Fraction of (row, contact, frame) tokens that are masked, pooled over all 3 bands.
+
+    A token is masked if its contact is spatially masked in that band OR its frame is in a
+    temporal block. This is the union the loss actually scores, so it is the quantity two
+    arms have to match on for the comparison between them to be about ARRANGEMENT."""
+    tot = hit = 0
+    for bi, (tm, length) in enumerate(
+        ((m.slow_mask, n_time // 8), (m.mid_mask, n_time // 2), (m.hga_mask, n_time))
+    ):
+        space = m.contact_mask[..., bi].unsqueeze(-1)  # (R, N, 1)
+        masked = space | tm.bool()
+        hit += int(masked.sum())
+        tot += masked.numel()
+        assert tm.shape[-1] == length
+    return hit / tot
+
+
+def test_no_time_mask_and_no_space_mask_mask_the_same_fraction() -> None:
+    # THE PRECONDITION FOR ARM B (no temporal mask, 2026-08-04). The arm is only interpretable
+    # against pbs00 if the two mask the SAME fraction and differ only in which axis does it.
+    # Measured on the real sampler rather than argued from the fractions: exact-count snapping,
+    # keep_alive and the block cover all sit between cfg and the realized count.
+    sc, geom = _session([4, 4, 4])  # round(0.5*4)=2 per shaft ⇒ the spatial half is exact
+    n = int(geom.valid.sum())
+    no_time = V3MaskConfig(hga_mask_frac=0.0, mid_mask_frac=0.0, slow_mask_frac=0.0)
+    pbs00 = V3MaskConfig(space_frac=0.0)
+    f_no_time = _masked_fraction(
+        sample_masks_r6(geom, n, n_time=32, n_rows=64, generator=_gen(7), cfg=no_time),
+        n_time=32,
+    )
+    f_pbs00 = _masked_fraction(
+        sample_masks_r6(geom, n, n_time=32, n_rows=64, generator=_gen(7), cfg=pbs00),
+        n_time=32,
+    )
+    assert abs(f_no_time - 0.50) < 1e-9, f_no_time
+    assert abs(f_pbs00 - 0.50) < 1e-9, f_pbs00
+    # and both are strictly LESS masked than the locked 0.50-space x 0.50-time config
+    f_locked = _masked_fraction(
+        sample_masks_r6(geom, n, n_time=32, n_rows=64, generator=_gen(7)), n_time=32
+    )
+    assert f_locked > 0.70, f_locked
+    print(f"[check] OK masked fraction — no-time {f_no_time:.4f}, pbs00 {f_pbs00:.4f} "
+          f"(matched pair), locked space.50xtime.50 {f_locked:.4f}")

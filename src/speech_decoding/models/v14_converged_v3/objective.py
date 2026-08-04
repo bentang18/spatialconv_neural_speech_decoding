@@ -70,14 +70,17 @@ from speech_decoding.models.v14_converged_v3.stem import (
     nf_token_geometry,
 )
 from speech_decoding.models.v14_converged_v3.towers import (
+    ENC_D_MODEL,
     N_LEVELS,
-    PRED_D_MODEL,
     build_encoder,
     build_predictor,
+    width_spec,
 )
 from speech_decoding.ssl.ema import EmaTeacher, fixed_ema_schedule, stop_grad
 
-D_MODEL = 256
+# The default encoder width; the single source of truth is towers.ENC_D_MODEL so the two
+# cannot drift. A run overrides it per-instance via the `d_model` argument (width OFAT).
+D_MODEL = ENC_D_MODEL
 EMA_TAU = 0.99925  # V-JEPA 2 / 2.1 default (B26 lock)
 
 
@@ -137,8 +140,10 @@ class _TargetTower(nn.Module):
         nf_decimate: int = NOFUSION_DECIMATE,
         parcel_embed: bool = True,
         space_rope: bool = True,
+        d_model: int = D_MODEL,
     ) -> None:
         super().__init__()
+        self.d_model = int(d_model)
         # native_fine_hga: consume native-rate bands (SLOW 4Hz / MID 16Hz / HGA 128Hz,
         # HGA 4 bins conv-pooled 128→32Hz) instead of arm0's uniform-32Hz PerBandStem.
         # Same (tokens, positions) contract + same 32Hz output lattice, so masking/pack/
@@ -153,16 +158,16 @@ class _TargetTower(nn.Module):
                 "early_fusion, native_fine_hga and no_fusion are mutually exclusive"
             )
         if early_fusion:
-            self.stem = EarlyFusionStem(D_MODEL)
+            self.stem = EarlyFusionStem(self.d_model)
         elif no_fusion:
-            self.stem = NoFusionStem(D_MODEL, decimate=nf_decimate)
+            self.stem = NoFusionStem(self.d_model, decimate=nf_decimate)
         elif native_fine_hga:
-            self.stem = FineHgaStem(D_MODEL)
+            self.stem = FineHgaStem(self.d_model)
         else:
-            self.stem = PerBandStem(D_MODEL)
+            self.stem = PerBandStem(self.d_model)
         self.encoder = build_encoder(
             n_parcels=n_parcels, deep_sup=deep_sup, parcel_embed=parcel_embed,
-            space_rope=space_rope,
+            space_rope=space_rope, d_model=self.d_model,
         )
 
     def forward(
@@ -204,8 +209,13 @@ class V3JepaObjective(nn.Module):
         mae_stream_weight: str = "equal",
         mae_force_norm_pix: bool = False,
         mae_hga_envelope: bool = False,
+        d_model: int = D_MODEL,
     ) -> None:
         super().__init__()
+        # WIDTH OFAT: the single knob is the ENCODER width; `width_spec` derives the head
+        # count and the predictor's width/heads from it by the relations the locked config
+        # already satisfies (towers.py). Default 256 ⇒ every shape below is unchanged.
+        self.d_model, _, self.d_pred, _ = width_spec(d_model)
         self.native_fine_hga = bool(native_fine_hga)
         # ISOLATION OVERRIDE (norm_pix attribution OFAT): force He-2021 per-token norm_pix ON
         # even under r6, decoupling it from `not self.r6` so the norm_pix delta can be measured
@@ -305,6 +315,7 @@ class V3JepaObjective(nn.Module):
             nf_decimate=self.nf_decimate,
             parcel_embed=self.parcel_embed_on,
             space_rope=self.space_rope_on,
+            d_model=self.d_model,
         )
         # EMA teacher exists ONLY on the JEPA arm; MAE reconstructs the raw input, no teacher.
         self.teacher = (
@@ -314,22 +325,22 @@ class V3JepaObjective(nn.Module):
         )
         self.predictor = build_predictor(
             n_parcels=n_parcels, parcel_embed=self.parcel_embed_on,
-            space_rope=self.space_rope_on,
+            space_rope=self.space_rope_on, enc_d_model=self.d_model,
         )
         # Encoder→predictor input map. Deep-sup: the encoder emits n_levels concatenated
         # levels, so this is upstream's ``predictor_embed`` 2-layer fusion MLP
         # (Linear(n_levels·d → d)·GELU·Linear(d → d_pred), NO LayerNorm). Single-tap: a
         # plain Linear(d → d_pred). ``pred_to_target`` (upstream ``predictor_proj``) is ONE
         # wide Linear emitting all n_levels·d target dims from the predictor's final block.
-        target_dim = N_LEVELS * D_MODEL if self.deep_sup else D_MODEL
+        target_dim = N_LEVELS * self.d_model if self.deep_sup else self.d_model
         if self.deep_sup:
             self.enc_to_pred = nn.Sequential(
-                nn.Linear(N_LEVELS * D_MODEL, D_MODEL),
+                nn.Linear(N_LEVELS * self.d_model, self.d_model),
                 nn.GELU(),
-                nn.Linear(D_MODEL, PRED_D_MODEL),
+                nn.Linear(self.d_model, self.d_pred),
             )
         else:
-            self.enc_to_pred = nn.Linear(D_MODEL, PRED_D_MODEL)
+            self.enc_to_pred = nn.Linear(self.d_model, self.d_pred)
         self.enc_to_pred.apply(init_transformer_weights)  # V-JEPA 2 trunc_normal(0.02)
         if self.mae:
             self.pred_to_target = None
@@ -338,17 +349,17 @@ class V3JepaObjective(nn.Module):
                 # HGA reconstructs its own DEC(2)·4 raw 64 Hz values, LFS its own DEC(2)·1. No
                 # per-token norm_pix; the loss POOLS per-channel MSE over all masked tokens both
                 # streams ⇒ HGA:LFS = 4:1 in expectation (equal masked counts × 8 vs 2 feats).
-                self.mae_head_hga = nn.Linear(PRED_D_MODEL, self.nf_decimate * NOFUSION_BINS[0])
-                self.mae_head_lfs = nn.Linear(PRED_D_MODEL, self.nf_decimate * NOFUSION_BINS[1])
+                self.mae_head_hga = nn.Linear(self.d_pred, self.nf_decimate * NOFUSION_BINS[0])
+                self.mae_head_lfs = nn.Linear(self.d_pred, self.nf_decimate * NOFUSION_BINS[1])
                 init_transformer_weights(self.mae_head_hga)
                 init_transformer_weights(self.mae_head_lfs)
                 self.mae_head_r5 = None
                 self.mae_heads = None
                 # per-stream band identity ADDED to the mask QUERY (predictor space, d_pred =
-                # PRED_D_MODEL) — a SEPARATE param from the stem's 256-dim band_type_emb. Lets
+                # self.d_pred) — a SEPARATE param from the stem's 256-dim band_type_emb. Lets
                 # the predictor tell apart two co-located masked queries (HGA vs LFS at the same
                 # RoPE position) that must predict different targets.
-                self.mask_band_emb = nn.Parameter(torch.empty(2, PRED_D_MODEL))
+                self.mask_band_emb = nn.Parameter(torch.empty(2, self.d_pred))
                 nn.init.trunc_normal_(self.mask_band_emb, std=0.02)
             elif self.early_fusion:
                 # r5 MAE decoder_pred = ONE Linear(d_pred → DEC·C) reconstructing this token's
@@ -358,7 +369,7 @@ class V3JepaObjective(nn.Module):
                 # Linear (He-2022: the predictor transformer IS the nonlinear decoder, the head a
                 # linear readout); an MLP head is a flagged OFAT if linear underperforms.
                 self.mae_head_r5 = nn.Linear(
-                    PRED_D_MODEL, EARLY_FUSION_DECIMATE * EARLY_FUSION_CHANNELS
+                    self.d_pred, EARLY_FUSION_DECIMATE * EARLY_FUSION_CHANNELS
                 )
                 self.mae_heads = None
                 init_transformer_weights(self.mae_head_r5)
@@ -369,11 +380,11 @@ class V3JepaObjective(nn.Module):
                 # decoder_norm), each emits its band's own |STFT| bins; no wide teacher target.
                 self.mae_head_r5 = None
                 self.mae_heads = nn.ModuleList(
-                    nn.Linear(PRED_D_MODEL, nb) for nb, _ in PER_BAND_SPECS
+                    nn.Linear(self.d_pred, nb) for nb, _ in PER_BAND_SPECS
                 )
                 self.mae_heads.apply(init_transformer_weights)
         else:
-            self.pred_to_target = nn.Linear(PRED_D_MODEL, target_dim)
+            self.pred_to_target = nn.Linear(self.d_pred, target_dim)
             init_transformer_weights(self.pred_to_target)
         # r6: per-BAND identity added to EVERY predictor token, visible and masked alike (Ben
         # 2026-07-23: "all tokens in predictor get +parcel embed and +freq embed — same as before
@@ -387,14 +398,14 @@ class V3JepaObjective(nn.Module):
         # could not. This is the r4/r6 analogue of no_fusion's mask_band_emb: predictor space
         # (d_pred), separate from the stem's 256-dim band_type_emb, standard 0.02 init.
         self.pred_band_emb = (
-            nn.Parameter(torch.empty(len(PER_BAND_SPECS), PRED_D_MODEL)) if self.r6 else None
+            nn.Parameter(torch.empty(len(PER_BAND_SPECS), self.d_pred)) if self.r6 else None
         )
         if self.pred_band_emb is not None:
             nn.init.trunc_normal_(self.pred_band_emb, std=0.02)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit). Stored 3-D (1, 1, D) to match
         # upstream: the shared ndim<=1 no-decay rule then DECAYS it (a 1-D store would
         # silently exempt it). Broadcasts identically in scatter_visible (a no-op there).
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, PRED_D_MODEL))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.d_pred))
         self.target_ln = target_ln
 
     def forward(
@@ -490,7 +501,7 @@ class V3JepaObjective(nn.Module):
         # I-JEPA-predictor convention of adding position/identity embeds to context AND mask
         # tokens alike. r4/r5 arms never enter this branch (no mask_band_emb).
         if self.no_fusion:
-            band_q = self.mask_band_emb[grid.band]  # (total, PRED_D_MODEL)
+            band_q = self.mask_band_emb[grid.band]  # (total, d_pred)
             pred_in = pred_in + band_q[None]  # all tokens (visible + masked)
         elif self.pred_band_emb is not None:  # r6: same fix for the 3-band grid (see __init__)
             pred_in = pred_in + self.pred_band_emb[grid.band][None]  # (B, total, d_pred)

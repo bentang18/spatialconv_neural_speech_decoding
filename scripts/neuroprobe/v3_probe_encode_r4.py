@@ -145,11 +145,19 @@ def _load_teacher(sd: dict, *, device: torch.device, pref: str = "objective.teac
     # empty and the check below PASSES while the tower rotates by contact index that the
     # trained model never saw. Nothing in the ckpt can catch it (no save_hyperparameters
     # anywhere), so the caller MUST pass it and the banner MUST record what was used.
-    print(f"[encode] tower deep_sup={deep_sup} parcel_embed={parcel_embed} "
+    # d_model is READ OFF the ckpt like deep_sup/parcel_embed, and unlike space_rope it is
+    # SELF-VERIFYING: every block's LayerNorm is d-wide, so a wrong width cannot load at all
+    # (load_state_dict raises on a size mismatch whatever `strict` says). The width OFAT
+    # therefore carries no silent-drift hazard and needs no CLI flag at encode.
+    dkey = "encoder.blocks.0.norm1.weight"
+    if dkey not in tsd:
+        raise RuntimeError(f"ckpt has no '{dkey}'; cannot infer encoder width")
+    d_model = int(tsd[dkey].shape[0])
+    print(f"[encode] tower deep_sup={deep_sup} parcel_embed={parcel_embed} d_model={d_model} "
           f"(inferred from ckpt keys) space_rope={space_rope} (NOT inferable — from CLI)")
     tower = _TargetTower(n_parcels=N_PARCELS, deep_sup=deep_sup, parcel_embed=parcel_embed,
                          space_rope=space_rope, early_fusion=early_fusion,
-                         no_fusion=no_fusion, nf_decimate=nf_decimate)
+                         no_fusion=no_fusion, nf_decimate=nf_decimate, d_model=d_model)
     missing, unexpected = tower.load_state_dict(tsd, strict=False)
     bad = [m for m in missing if "num_batches_tracked" not in m]
     if bad or unexpected:

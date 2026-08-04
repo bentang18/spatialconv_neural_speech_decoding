@@ -42,6 +42,7 @@ from speech_decoding.models.v14_converged_v3.masking import (
     sample_masks_r6,
 )
 from speech_decoding.models.v14_converged_v3.objective import (
+    D_MODEL,
     JepaOutput,
     V3JepaObjective,
 )
@@ -81,6 +82,7 @@ class V3ConvergedModel(nn.Module):
         mae_stream_weight: str = "equal",
         mae_force_norm_pix: bool = False,
         mae_hga_envelope: bool = False,
+        d_model: int = D_MODEL,
     ) -> None:
         super().__init__()
         # The stem lives inside the objective's EMA-mirrored target tower (V-JEPA
@@ -103,6 +105,7 @@ class V3ConvergedModel(nn.Module):
             mae_stream_weight=mae_stream_weight,
             mae_force_norm_pix=mae_force_norm_pix,
             mae_hga_envelope=mae_hga_envelope,
+            d_model=d_model,
         )
         self.native_fine_hga = bool(native_fine_hga)
         self.early_fusion = bool(early_fusion)

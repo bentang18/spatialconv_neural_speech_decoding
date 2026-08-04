@@ -52,6 +52,29 @@ PRED_LAYOUT: tuple[str, ...] = ("L1",) * 6  # Design B (Ben 2026-07-15): L1-only
 ENC_D_MODEL, ENC_N_HEADS = 256, 4  # head_dim 64
 PRED_D_MODEL, PRED_N_HEADS = 128, 4  # head_dim 32
 
+# ViT sizing convention (DeiT/ViT ladder): head_dim is held at 64 and only d_model moves,
+# so n_heads = d/64. The predictor keeps the two relations the locked config already
+# satisfies — HALF the encoder width, the SAME head count — which fixes its head_dim at 32
+# for every width. `width_spec(256)` therefore reproduces the four locked constants exactly;
+# `width_spec(384)` is ViT-Small (enc 384/6, pred 192/6). One integer is the whole knob.
+HEAD_DIM = ENC_D_MODEL // ENC_N_HEADS  # 64
+
+
+def width_spec(enc_d_model: int = ENC_D_MODEL) -> tuple[int, int, int, int]:
+    """``(enc_d, enc_heads, pred_d, pred_heads)`` for one encoder width.
+
+    Divisibility by ``2 * HEAD_DIM`` is required, not merely by ``HEAD_DIM``: the halved
+    predictor width must itself be an integer AND divide by the shared head count. Both
+    follow from that one check, so an off-ladder width fails loud at construction rather
+    than at the first matmul."""
+    if enc_d_model <= 0 or enc_d_model % (2 * HEAD_DIM) != 0:
+        raise ValueError(
+            f"enc_d_model={enc_d_model} must be a multiple of {2 * HEAD_DIM} "
+            f"(head_dim {HEAD_DIM} with a half-width predictor at the same head count)"
+        )
+    n_heads = enc_d_model // HEAD_DIM
+    return enc_d_model, n_heads, enc_d_model // 2, n_heads
+
 # Deep-supervision taps (V-JEPA 2.1, #61): the depth-12 encoder is tapped at the
 # equally-spaced quartiles — upstream `hierarchical_layers=[2,5,8,11]` 0-indexed =
 # {3,6,9,12} 1-indexed (`app/vjepa_2_1/models/vision_transformer.py:149`). Each tap
@@ -323,24 +346,29 @@ class V3Tower(nn.Module):
 
 def build_encoder(
     *, n_parcels: int, deep_sup: bool = True, parcel_embed: bool = True,
-    space_rope: bool = True,
+    space_rope: bool = True, d_model: int = ENC_D_MODEL,
 ) -> V3Tower:
     # deep_sup default ON (#61, Ben-greenlit "copy exactly"): tap {3,6,9,12} → 4
     # affine-normed levels concatenated. deep_sup=False = the single-tap ablation arm.
+    # DEPTH IS NOT A KNOB — only width moves; the layout stays 12 L1 blocks (Design B).
+    enc_d, enc_h, _, _ = width_spec(d_model)
     return V3Tower(
-        ENC_LAYOUT, d_model=ENC_D_MODEL, n_heads=ENC_N_HEADS, n_parcels=n_parcels,
+        ENC_LAYOUT, d_model=enc_d, n_heads=enc_h, n_parcels=n_parcels,
         deep_sup=deep_sup, sup_taps=ENC_SUP_TAPS if deep_sup else (),
         parcel_embed=parcel_embed, space_rope=space_rope,
     )
 
 
 def build_predictor(
-    *, n_parcels: int, parcel_embed: bool = True, space_rope: bool = True
+    *, n_parcels: int, parcel_embed: bool = True, space_rope: bool = True,
+    enc_d_model: int = ENC_D_MODEL,
 ) -> V3Tower:
     # The predictor is NEVER deep-supervised: it emits all levels from one wide proj
     # on its final block (objective.pred_to_target), with the terminal norm_out =
     # upstream `predictor_norm`. It does not tap its own intermediate blocks.
+    # Takes the ENCODER width and halves it, so both towers move off one number.
+    _, _, pred_d, pred_h = width_spec(enc_d_model)
     return V3Tower(
-        PRED_LAYOUT, d_model=PRED_D_MODEL, n_heads=PRED_N_HEADS, n_parcels=n_parcels,
+        PRED_LAYOUT, d_model=pred_d, n_heads=pred_h, n_parcels=n_parcels,
         parcel_embed=parcel_embed, space_rope=space_rope,
     )
