@@ -33,9 +33,20 @@
 # unions by cell name so backfilling and re-running is idempotent.
 #
 # 4th arg = ENC12_ONLY. Set it for an ABLATION arm that only needs the enc12 row in all three
-# regimes: ws/csession fit enc12_elec ALONE (not 2 taps) and cs fits enc12 ALONE (not 5). Wall is
-# close to linear in tap count and the Delta CPU bill is mem_MB/2 x WALL, so this is a ~2x saving
-# on ws/csession and ~5x on cs. It is strictly less work, with no estimate involved.
+# regimes: ws/csession fit enc12_elec ALONE (not 2 taps) and cs fits enc12 ALONE (not 5).
+#
+# 🔴 "WALL IS CLOSE TO LINEAR IN TAP COUNT ⇒ ~2x SAVING ON ws/csession" WAS WRONG — MEASURED 08-04.
+# Wall is fit_cost x taps PLUS a fixed eager load of the whole 40-61G record, and on the electrode
+# regimes the LOAD DOMINATES. Same code, same cache size, 1 tap vs 2:
+#   ws  @120G  enc12_elec only (20848696) 12.9-19.4, mean 14.6 min/cell  vs  2 taps 15-22 min/cell
+#   csn @200G  enc12_elec only (20848697) 19.3-26.3, mean 22.7 min/cell  vs  2 taps ~23-26 min/cell
+# ⇒ the second electrode tap costs a FEW MINUTES on a 15-23 min cell, i.e. **~18% of the readout
+# bill across a 3-regime arm, not 2x.** Do NOT drop enc0_elec to save money; it barely saves any.
+# ✅ THE ~5x ON cs IS REAL and is where the saving actually lives: parcel taps are ~40x lighter, so
+# cs is fit-bound, not load-bound (2-tap cs measured 3.1-4.5 min/cell, jobs 20852340/20852344).
+# 🧭 So the tap choice is a SCIENCE call, not a cost call. enc0/enc0_elec never read weights
+# (v3_probe_encode_r4.py:477) ⇒ the floor is arm-identical BY CONSTRUCTION, and re-measuring it per
+# arm buys a printed control row in board_arm_compare rather than new information.
 #
 # 🔴 ENC12 MODE DROPS THE DEPTH-0 FLOOR CONTROL IN ALL THREE REGIMES. ws/csession lose enc0_elec
 # because the matching encode did not write it, and cs loses enc0 HERE, because this argument tells
