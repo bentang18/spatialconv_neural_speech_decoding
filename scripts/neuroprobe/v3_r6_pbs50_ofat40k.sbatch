@@ -59,16 +59,25 @@
 # within-shaft attention is quadratic in it. Read at 20k as Ben asked; LR is CONSTANT after warmup
 # so the 20k ckpt here and the baseline's 20k ckpt are schedule-identical and directly comparable.
 #
-# ── WHY --num-workers 12 AND NOT 32 ──────────────────────────────────────────────────────
+# ── --num-workers 32, AND THE CAVEAT THAT COMES WITH IT (Ben 2026-08-04) ─────────────────
 # 🔴 --num-workers CHANGES THE DATA ORDER (shaft_dataset.py:77 wid/nw, :121 seed, :125
 # packs//streams). The 08-03 throughput fix (b3ced77) moved the pretrain launchers 16c/12w ->
-# 72c/32w, but EVERY pbs50 baseline these two arms are read against — pbs50_20k, pbs50_40k — was
-# produced BEFORE that commit, at 12 workers. Launching at 32 would straddle the line the launchers
-# themselves warn about, and the resulting nuisance is the same order (~.01, R28) as the effects
-# being measured. So: 12 workers, matched.
-# The 72 CPUs are kept anyway — cpus-per-task does NOT enter the data order, and on ghx4
-# (1000 x max(cpus/72, mem/113560, gpus)) 72 cores bill exactly the same as 16 on one GPU. The 12
-# workers simply stop being core-starved, which is a free speedup at zero cost to comparability.
+# 72c/32w, and EVERY pbs50 baseline these arms are read against — pbs50_20k, pbs50_40k — predates
+# that commit, at 12 workers. So these arms DO straddle the line. Ben's call, and the reasoning:
+#   • SIZE. A worker change moves the data ORDER only; a seed change moves order AND init. The
+#     worker nuisance is therefore a strict SUBSET of the ~.01 seed nuisance (R28), not equal to
+#     it. ⚠️ IT IS UNMEASURED — sizing it costs a full 40k run, which is not worth it. Do not
+#     quote ~.01 as this effect; quote that it is smaller and unmeasured.
+#   • COST. 2.79 vs 3.70 s/step is 25%, i.e. 35 h vs 46 h at 45k. Real, and paid every run.
+#   • DIRECTION. 12 workers is now the odd one out. Pinning new arms back to 12 to match a
+#     SHRINKING set of pre-b3ced77 runs makes the mismatch permanent rather than ending it.
+#   • HEADROOM. Both arms are heavier than the 3.70 s/step baseline (vits384 is 2.25x params;
+#     notimemask doubles visible tokens, so the encoder sequence roughly doubles and attention is
+#     quadratic in it). At 12 workers 40k inside 48 h is not guaranteed.
+# 🔴 CARRY THIS FORWARD: when either arm is read against pbs50_20k / pbs50_40k, the comparison
+# crosses the worker boundary. It is a nuisance draw, not a bias — but with n=1 seed per arm it
+# does not average out, so do not adjudicate a sub-.01 difference on these arms.
+# The 72 CPUs bill the same as 16 on one GPU (ghx4 = 1000 x max(cpus/72, mem/113560, gpus)).
 #
 # ── SCHEDULE ─────────────────────────────────────────────────────────────────────────────
 # 40k, ONE JOB, FROM SCRATCH, NO cooldown, ladder every 1000. LR is CONSTANT after the 5000-step
@@ -103,7 +112,8 @@ CKPT_DIR=/projects/bhqk/htang13/v3_ckpt_${RUN_NAME}
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
 echo "[r6 pbs50 OFAT 40k] arm=$ARM flags='$ABL' run=$RUN_NAME"
 echo "[schedule] ONE JOB, from scratch, no resume: warmup 5000 LINEAR -> CONSTANT 6e-3 to 40000; ladder 1000"
-echo "[matched]  space_frac=0.50 per_band_space=ON widths=1,1,1 lr=6e-3 seed=33 cb=11000 accum=6 workers=12 [FILE-ONLY scp deploy]"
+echo "[matched]  space_frac=0.50 per_band_space=ON widths=1,1,1 lr=6e-3 seed=33 cb=11000 accum=6 workers=32 [FILE-ONLY scp deploy]"
+echo "[caveat]   workers 32 vs the 12-worker pbs50 comparators => data order differs (nuisance, UNMEASURED, < the .01 seed nuisance). Do not adjudicate sub-.01 on these arms."
 echo "[read]     vits384 -> vs pbs50_40k @40k; notimemask -> vs pbs50_20k AND pbs00_20k @20k (matched masked fraction 0.50)"
 srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --bt-root /projects/bhqk/htang13/braintreebank \
@@ -121,7 +131,7 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --session-z-winsor-slow 15 --session-z-winsor-mid 15 --session-z-winsor-hga 20 \
   --batch-size 32 --accumulate-grad-batches 6 \
   --accelerator gpu --devices 1 --precision bf16-mixed \
-  --num-workers 12 --monitor-every-n-steps 10 --log-every-n-steps 10 \
+  --num-workers 32 --monitor-every-n-steps 10 --log-every-n-steps 10 \
   --mask-space-frac 0.50 --per-band-space --space-block-w-bands 1,1,1 \
   $ABL \
   --compile \
