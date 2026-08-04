@@ -32,7 +32,9 @@ TAG="${2:?need TAG}"
 OUTDIR="${3:?need OUTDIR}"
 EXTRA="${4:-}"
 
-case "$CKPT" in *nospacerope*) NAME_SAYS_OFF=1 ;; *) NAME_SAYS_OFF=0 ;; esac
+# 🔴 BOTH SPELLINGS -- the R30 arms are named `nosrope` (ablation launcher :86,:102), and matching
+# only `nospacerope` made this guard agree with an equally-wrong caller instead of catching it.
+case "$CKPT" in *nospacerope*|*nosrope*) NAME_SAYS_OFF=1 ;; *) NAME_SAYS_OFF=0 ;; esac
 case " $EXTRA " in *" --no-space-rope "*) FLAG_SAYS_OFF=1 ;; *) FLAG_SAYS_OFF=0 ;; esac
 if [ "$NAME_SAYS_OFF" != "$FLAG_SAYS_OFF" ]; then
   echo "FATAL: space_rope mismatch — ckpt name says off=$NAME_SAYS_OFF, flags say off=$FLAG_SAYS_OFF" >&2

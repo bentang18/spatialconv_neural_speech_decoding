@@ -54,8 +54,14 @@ run_arm() {
   # multi-arm invocation where the flag applies to only one arm. The sbatch re-checks the
   # derivation against the ckpt name in BOTH directions and refuses to run on a mismatch, so a
   # renamed ckpt dir is a hard failure, never a silent one.
+  # 🔴 BOTH SPELLINGS. The R30 geometry arms are named `nosrope` by the training launcher
+  # (v3_r6_pbs50_ablation_trap45k.sbatch:86,102 -> v3_ckpt_v3_r6_pbspace111_sf50_nosrope_trap45k),
+  # while this pattern only ever matched `nospacerope`. A `nosrope` ckpt therefore derived an EMPTY
+  # EXTRA, and the sbatch guard -- which reads the SAME pattern -- agreed with it, so both sides
+  # were wrong together and the guard passed. That is the precise silent-wrong AUROC the guard
+  # exists to prevent. Any new name for this ablation MUST be added here and in the sbatch.
   local EXTRA=""
-  case "$CKPT" in *nospacerope*) EXTRA="--no-space-rope" ;; esac
+  case "$CKPT" in *nospacerope*|*nosrope*) EXTRA="--no-space-rope" ;; esac
   echo "[$TAG] encode <- $CKPT  extra='${EXTRA:-<none>}'" | tee -a "$LOG"
 
   local AID
