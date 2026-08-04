@@ -31,8 +31,25 @@
 # in DependencyNeverSatisfied and it silently never runs (this stranded merge 20297526 on 07-20).
 # afterany fires once every cell is terminal; a dead cell just yields a partial grid, and _merge
 # unions by cell name so backfilling and re-running is idempotent.
+#
+# 4th arg = ENC12_ONLY. Set it for an ABLATION arm that only needs the enc12 row in all three
+# regimes: ws/csession fit enc12_elec ALONE (not 2 taps) and cs fits enc12 ALONE (not 5). Wall is
+# close to linear in tap count and the Delta CPU bill is mem_MB/2 x WALL, so this is a ~2x saving
+# on ws/csession and ~5x on cs. It is strictly less work, with no estimate involved.
+#
+# 🔴 --mem DELIBERATELY UNCHANGED, and the reason is a correction worth keeping. The matching
+# encode drops enc0_elec, and I first sized the memory down on the theory that this shrinks the
+# record by ~37%. IT DOES NOT. Tap WIDTHS are not uniform: the encoder taps are d_model-wide
+# (13312) while enc0 is the raw |STFT| width (348), so per window a record is
+#   enc0 16x348 + 4 parcel taps 16x13312 + enc12_elec 119x13312 = 2,483,076 halves
+# and enc0_elec would add only 119x348 = 41,412, i.e. **1.7% of a record, not 37%**. Dropping it
+# is still right (it never reads weights, so it is arm-identical by construction) but it buys
+# disk and encode time, NOT readout memory. The eager load still faults in the whole ~52-66G
+# record, so the proven 120G/200G/176G floor stands exactly as measured.
+# ⚠️ Restricting taps does not lower the peak either: workers=1 keeps ONE design matrix alive, so
+# peak = record + one Z regardless of how many taps are fit in sequence.
 set -euo pipefail
-CACHE="${1:?CACHE_DIR}"; TAG="${2:?TAG}"; SHARD="${3:?SHARD_DIR}"
+CACHE="${1:?CACHE_DIR}"; TAG="${2:?TAG}"; SHARD="${3:?SHARD_DIR}"; ENC12="${4:-}"
 TREE=/projects/bhqk/htang13/speech_board
 cd "$TREE"
 [ -d "$CACHE" ] || { echo "[FATAL] cache dir missing: $CACHE"; exit 1; }
@@ -44,9 +61,16 @@ mkdir -p "$SHARD"
 # what Slurm reads. Referencing it relative to $TREE fails with "Unable to open file".
 S=/projects/bhqk/htang13/board_readout_lean.sbatch
 [ -f "$S" ] || { echo "[FATAL] lean sbatch missing: $S"; exit 1; }
-WS=$( sbatch --parsable --array=0-11 --mem=120G --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" ws       1)
-CSN=$(sbatch --parsable --array=0-11 --mem=200G --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" csession 1)
-CS=$( sbatch --parsable --array=0-9  --mem=176G --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" cs       4)
+M_WS=120G; M_CSN=200G; M_CS=176G     # measured floor; see the enc0_elec width note above
+if [ -n "$ENC12" ]; then
+  T_ELEC=enc12_elec; T_PARC=enc12
+  echo "[all3] ENC12-ONLY: taps ws/csession=$T_ELEC cs=$T_PARC | mem UNCHANGED $M_WS/$M_CSN/$M_CS"
+else
+  T_ELEC=""; T_PARC=""
+fi
+WS=$( sbatch --parsable --array=0-11 --mem=$M_WS  --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" ws       1 --no-mmap "$T_ELEC")
+CSN=$(sbatch --parsable --array=0-11 --mem=$M_CSN --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" csession 1 --no-mmap "$T_ELEC")
+CS=$( sbatch --parsable --array=0-9  --mem=$M_CS  --cpus-per-task=16 "$S" "$CACHE" "$TAG" "$SHARD" cs       4 --no-mmap "$T_PARC")
 MRG=$(sbatch --parsable --dependency=afterany:"$WS":"$CSN":"$CS" \
   --account=bhqk-delta-cpu --partition=cpu --nodes=1 --ntasks-per-node=1 \
   --cpus-per-task=2 --mem=16G --time=00:15:00 --job-name=board_merge \

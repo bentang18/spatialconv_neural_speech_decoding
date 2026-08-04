@@ -35,9 +35,29 @@
 # sharded -- board encode is a GPU forward pass on dtai; only READOUT shards on Delta CPU, see
 # probe_ckpt_r6.sh workflow doc). Walltime 30m: 2756113 ran 19:44, and short jobs earn backfill.
 set -euo pipefail
-CKPT="${1:?usage: sbatch v3_board_encode_r6.sbatch <CKPT> <TAG> <OUTDIR>}"
+CKPT="${1:?usage: sbatch v3_board_encode_r6.sbatch <CKPT> <TAG> <OUTDIR> [ELEC_TAPS]}"
 TAG="${2:?need TAG}"
 OUTDIR="${3:?need OUTDIR}"
+# 4th arg = the per-ELECTRODE tap set. Default 0,12 reproduces the published arms verbatim.
+# Pass 12 for an ABLATION arm that only needs the enc12 row: enc0_elec is the depth-0 parity
+# floor computed directly off the |STFT| frontend and it NEVER reads weights
+# (v3_probe_encode_r4.py:477), so it is identical across arms BY CONSTRUCTION and re-encoding it
+# buys no control the baseline cache does not already carry. The parcel-mean enc0 is written
+# unconditionally either way, so CSubject keeps its depth-0 floor for free.
+#
+# 🔴 DROPPING enc0_elec DOES NOT LET YOU LOWER --mem. Tap WIDTHS are not uniform: encoder taps are
+# d_model-wide (13312) while enc0 is the raw |STFT| width (348). Per window a record holds
+#   enc0 16x348 + 4 parcel taps 16x13312 + enc12_elec 119x13312 = 2,483,076 halves
+# and enc0_elec adds only 119x348 = 41,412 -- **1.7% of a record.** I sized --mem down to
+# 113560M on a 37% figure, which was wrong by ~20x; job 2859716 was cancelled at 4/12 and
+# requeued at the 160G default. I then projected ~131 GiB from job 2756113 (122.3 GiB on 2,270,084
+# halves, 6 taps, NO enc9) and that projection was ALSO wrong, in the other direction: the requeued
+# job 2859870 finished 12/12 in 15:18 at a MEASURED MaxRSS of 101.9 GiB (106,854,080K) on the
+# --elec-taps 12 payload. So 113560M (110.9 GiB) WOULD have held this arm and the cancel was
+# over-cautious. 160G stays the default because the published --elec-taps 0,12 arms have never been
+# measured under the enc9 tap; drop to 113560M only for an --elec-taps 12 arm, where 101.9 GiB is
+# the number on the record.
+ELEC_TAPS="${4:-0,12}"
 cd /projects/bhqk/htang13/speech
 module load python/miniforge3_pytorch/2.10.0
 export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
@@ -54,4 +74,4 @@ srun /projects/bhqk/htang13/speech/.venv/bin/python -u -m scripts.neuroprobe.v3_
   --bt-root /projects/bhqk/htang13/braintreebank \
   --batch-size 64 \
   --frontend v3r6 \
-  --sessions board --tasks board15 --electrode-set lite --elec-taps 0,12
+  --sessions board --tasks board15 --electrode-set lite --elec-taps "$ELEC_TAPS"
