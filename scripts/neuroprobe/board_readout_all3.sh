@@ -37,6 +37,15 @@
 # close to linear in tap count and the Delta CPU bill is mem_MB/2 x WALL, so this is a ~2x saving
 # on ws/csession and ~5x on cs. It is strictly less work, with no estimate involved.
 #
+# 🔴 ENC12 MODE DROPS THE DEPTH-0 FLOOR CONTROL IN ALL THREE REGIMES. ws/csession lose enc0_elec
+# because the matching encode did not write it, and cs loses enc0 HERE, because this argument tells
+# the readout to fit enc12 alone even though the parcel-mean enc0 IS in the cache. The merged grid
+# then reports cs:enc0|std n=0 and board_arm_compare.py reports every control SKIPPED. Only the cs
+# floor is recoverable without a re-encode, via one extra array on the SAME cache:
+#   sbatch --array=0-9 --mem=176G $S <CACHE> <TAG> <SHARD>_enc0 cs 4 --no-mmap enc0
+# It MUST go to its own shard dir: shards are named {mode}_{cell}.json with no tap in the name, so
+# reusing <SHARD> overwrites the enc12 cs results with enc0 ones under identical filenames.
+#
 # 🔴 --mem DELIBERATELY UNCHANGED, and the reason is a correction worth keeping. The matching
 # encode drops enc0_elec, and I first sized the memory down on the theory that this shrinks the
 # record by ~37%. IT DOES NOT. Tap WIDTHS are not uniform: the encoder taps are d_model-wide

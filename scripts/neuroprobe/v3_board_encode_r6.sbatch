@@ -42,8 +42,17 @@ OUTDIR="${3:?need OUTDIR}"
 # Pass 12 for an ABLATION arm that only needs the enc12 row: enc0_elec is the depth-0 parity
 # floor computed directly off the |STFT| frontend and it NEVER reads weights
 # (v3_probe_encode_r4.py:477), so it is identical across arms BY CONSTRUCTION and re-encoding it
-# buys no control the baseline cache does not already carry. The parcel-mean enc0 is written
-# unconditionally either way, so CSubject keeps its depth-0 floor for free.
+# buys no control the baseline cache does not already carry.
+#
+# ⚠️ THE ENCODE STILL WRITES parcel-mean enc0 UNCONDITIONALLY, BUT THAT IS NOT THE SAME AS KEEPING
+# THE FLOOR CONTROL. board_readout_all3.sh's matching ENC12 argument restricts CSubject to fitting
+# enc12 alone, so the tap sits in the cache unread and the merged grid comes back with
+# cs:enc0|std n=0 -- the depth-0 control is then missing in ALL THREE regimes, not just the two
+# that lost enc0_elec. Recovering it costs one extra cs-only array against the SAME cache:
+#   sbatch --array=0-9 --mem=176G board_readout_lean.sbatch <CACHE> <TAG> <SHARD_DIR_enc0> cs 4 \
+#          --no-mmap enc0
+# and that array MUST target its own --shard-dir: shards are named {mode}_{cell}.json with no tap
+# in the name, so reusing the enc12 directory silently overwrites the enc12 CS results.
 #
 # 🔴 DROPPING enc0_elec DOES NOT LET YOU LOWER --mem. Tap WIDTHS are not uniform: encoder taps are
 # d_model-wide (13312) while enc0 is the raw |STFT| width (348). Per window a record holds
