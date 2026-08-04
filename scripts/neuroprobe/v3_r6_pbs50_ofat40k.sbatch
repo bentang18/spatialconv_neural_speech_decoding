@@ -90,11 +90,32 @@ set -uo pipefail
 ARM="${1:?usage: sbatch v3_r6_pbs50_ofat40k.sbatch <vits384|notimemask>}"
 # Explicit whitelist: a typo'd arm must FAIL, never fall through to an unablated run that would
 # look like a valid OFAT in wandb and burn 40 h.
+# cb/accum are ARM-DEPENDENT and always TOKEN-EXACT at cb*accum = 66000 contacts/opt-step.
+# 🔴 notimemask CANNOT run at cb 11000. MEASURED (0f9a977, job 2773794, GH200 95.6 GiB, v=0.50):
+#   cb5500  accum12 -> FITS 54.6 GiB (57%)
+#   cb11000 accum6  -> OOM  94.5 GiB (99%), dead in 84 s, NOT marginal
+# notimemask sits at v=0.50 (space .50 masks half the contacts, time keeps every frame) — the SAME
+# visible-token count as pbs00, and within-shaft attention cost matches too: pbs00 is (N contacts x
+# T/2 frames), notimemask is (N/2 x T), and both square to N^2*T^2/4.
+# cb8250/accum8, NOT cb5500/accum12 (Ben: accum 12 is too slow). ~3.53 vs ~4.36 s/step.
+# cb8250 was never probed directly (0f9a977: "8250 was never tested"), but the two MEASURED v=0.50
+# points bracket it and fit a line in cb: (94.5-54.6)/(11000-5500) = 0.00726 GiB per contact, plus
+# 14.7 GiB fixed => cb8250 lands at 74.6 GiB, 78% of the 95.6 GiB card. That is a fit on measured
+# actuals, unlike the old GiB ~ 39.0+136.8v model which over-predicted cb5500 by 34%.
+# ⚠️ TRADE-OFF ACCEPTED: 5500x12 would have matched pbs00 (2764373) EXACTLY and made the
+# matched-fraction cross-axis pair clean on cb/accum. At 8250x8 both comparisons — vs baseline and
+# vs pbs00 — carry a cb/accum difference instead. Both stay TOKEN-EXACT at 66000/opt-step, so it
+# is the same seed-level caveat pbs00-vs-baseline already carries, not a token mismatch.
+# If it OOMs it dies in ~84 s and costs nothing; drop to cb6600/accum10 (fit: 62.6 GiB, 65%).
 case "$ARM" in
-  vits384)     ABL="--enc-width 384" ;;
-  notimemask)  ABL="--mask-time-frac 0.0" ;;
+  vits384)     ABL="--enc-width 384"     ; CB=11000 ; ACC=6 ;;
+  notimemask)  ABL="--mask-time-frac 0.0"; CB=8250  ; ACC=8 ;;
   *) echo "[FATAL] unknown arm '$ARM' (expected vits384 | notimemask)"; exit 1 ;;
 esac
+# Token identity is an ASSERT, not a comment: a wrong pair silently changes the optimizer step.
+if [ "$((CB * ACC))" -ne 66000 ]; then
+  echo "[FATAL] cb=$CB x accum=$ACC = $((CB * ACC)) != 66000 contacts/opt-step"; exit 1
+fi
 
 module load python/miniforge3_pytorch/2.10.0
 export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
@@ -112,7 +133,7 @@ CKPT_DIR=/projects/bhqk/htang13/v3_ckpt_${RUN_NAME}
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
 echo "[r6 pbs50 OFAT 40k] arm=$ARM flags='$ABL' run=$RUN_NAME"
 echo "[schedule] ONE JOB, from scratch, no resume: warmup 5000 LINEAR -> CONSTANT 6e-3 to 40000; ladder 1000"
-echo "[matched]  space_frac=0.50 per_band_space=ON widths=1,1,1 lr=6e-3 seed=33 cb=11000 accum=6 workers=32 [FILE-ONLY scp deploy]"
+echo "[matched]  space_frac=0.50 per_band_space=ON widths=1,1,1 lr=6e-3 seed=33 cb=$CB accum=$ACC (=$((CB*ACC)) contacts/opt-step) workers=32 [FILE-ONLY scp deploy]"
 echo "[caveat]   workers 32 vs the 12-worker pbs50 comparators => data order differs (nuisance, UNMEASURED, < the .01 seed nuisance). Do not adjudicate sub-.01 on these arms."
 echo "[read]     vits384 -> vs pbs50_40k @40k; notimemask -> vs pbs50_20k AND pbs00_20k @20k (matched masked fraction 0.50)"
 srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
@@ -125,11 +146,11 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --session 2:6 --session 3:2 --session 4:2 --session 6:0 --session 6:1 \
   --session 6:4 --session 8:0 --session 9:0 \
   --frontend v3r6 --objective mae \
-  --batch-unit shaft --contact-budget 11000 --shaft-alpha 0.5 \
+  --batch-unit shaft --contact-budget $CB --shaft-alpha 0.5 \
   --lr 6e-3 --weight-decay 0.04 --grad-clip 3.0 --adam-beta2 0.95 --seed 33 \
   --clip-len 2.0 \
   --session-z-winsor-slow 15 --session-z-winsor-mid 15 --session-z-winsor-hga 20 \
-  --batch-size 32 --accumulate-grad-batches 6 \
+  --batch-size 32 --accumulate-grad-batches $ACC \
   --accelerator gpu --devices 1 --precision bf16-mixed \
   --num-workers 32 --monitor-every-n-steps 10 --log-every-n-steps 10 \
   --mask-space-frac 0.50 --per-band-space --space-block-w-bands 1,1,1 \
