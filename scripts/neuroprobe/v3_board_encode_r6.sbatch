@@ -67,6 +67,43 @@ OUTDIR="${3:?need OUTDIR}"
 # measured under the enc9 tap; drop to 113560M only for an --elec-taps 12 arm, where 101.9 GiB is
 # the number on the record.
 ELEC_TAPS="${4:-0,12}"
+# 5th arg = EXTRA encode flags, for ablation arms whose setting CANNOT be read off the ckpt.
+# Same slot and same splitting rule as v3_probe_encode_r6.sbatch's 4th arg; it is 5th here only
+# because ELEC_TAPS already owns 4. TWO flags are in that class, and BOTH fail SILENT:
+#   --no-space-rope      L1RoPE registers idx_freq persistent=False, so a nospacerope ckpt is key-
+#                        AND value-identical to a normal one. Omit it and the encode rotates by a
+#                        contact index the trained model never saw; the strict load PASSES.
+#   --parcel-perm-seed S the encode's own [parcel-perm] parity check is SELF-CONSISTENT, not a
+#                        check against the ckpt: it rebuilds the spec with whatever seed it was
+#                        given and asserts the spec matches THAT. Omit the flag on a parcelperm
+#                        ckpt and seed=None makes expect==parcel_true, the assert passes, and it
+#                        prints "parity OK (seed=None, 0 of N electrodes relabeled)" -- the exact
+#                        line a correct non-perm encode prints. The model is then fed TRUE atlas
+#                        ids it never trained on and the AUROC is plausible and wrong.
+# Neither can be inferred, so both are cross-checked against the ckpt/tag NAME in both directions.
+# deep_sup and parcel_embed need no guard: they ARE inferred from ckpt keys and a wrong inference
+# fails the strict load.
+EXTRA="${5:-}"
+# 🔴 BOTH SPELLINGS for space_rope -- the R30 arms are named `nosrope`, and matching only
+# `nospacerope` would make this guard agree with an equally-wrong caller instead of catching it.
+case "$CKPT$TAG" in *nospacerope*|*nosrope*) NAME_SROPE_OFF=1 ;; *) NAME_SROPE_OFF=0 ;; esac
+case " $EXTRA " in *" --no-space-rope "*) FLAG_SROPE_OFF=1 ;; *) FLAG_SROPE_OFF=0 ;; esac
+case "$CKPT$TAG" in *parcelperm*|*parcel_perm*) NAME_PERM=1 ;; *) NAME_PERM=0 ;; esac
+case " $EXTRA " in *" --parcel-perm-seed "*) FLAG_PERM=1 ;; *) FLAG_PERM=0 ;; esac
+if [ "$NAME_SROPE_OFF" != "$FLAG_SROPE_OFF" ] || [ "$NAME_PERM" != "$FLAG_PERM" ]; then
+  echo "FATAL: ablation-flag mismatch between the ckpt/tag name and the extra flags." >&2
+  echo "  space_rope off: name=$NAME_SROPE_OFF flag=$FLAG_SROPE_OFF" >&2
+  echo "  parcel perm   : name=$NAME_PERM flag=$FLAG_PERM" >&2
+  echo "  ckpt : $CKPT" >&2
+  echo "  tag  : $TAG" >&2
+  echo "  extra: '$EXTRA'" >&2
+  echo "  These are the flags NO state_dict check can catch. Refusing to write a cache that" >&2
+  echo "  would be silently wrong. For the R35 arm pass '--parcel-perm-seed 33'." >&2
+  exit 1
+fi
+echo "[encode] ablation-flag guard OK: srope_off=$NAME_SROPE_OFF perm=$NAME_PERM, extra: '${EXTRA:-<none>}'"
+EXTRA_ARGS=()
+[ -n "$EXTRA" ] && read -ra EXTRA_ARGS <<< "$EXTRA"
 cd /projects/bhqk/htang13/speech
 module load python/miniforge3_pytorch/2.10.0
 export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
@@ -83,4 +120,5 @@ srun /projects/bhqk/htang13/speech/.venv/bin/python -u -m scripts.neuroprobe.v3_
   --bt-root /projects/bhqk/htang13/braintreebank \
   --batch-size 64 \
   --frontend v3r6 \
-  --sessions board --tasks board15 --electrode-set lite --elec-taps "$ELEC_TAPS"
+  --sessions board --tasks board15 --electrode-set lite --elec-taps "$ELEC_TAPS" \
+  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
