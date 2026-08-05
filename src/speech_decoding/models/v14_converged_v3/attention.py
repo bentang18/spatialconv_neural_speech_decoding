@@ -37,7 +37,7 @@ from speech_decoding.models.v14_converged_v3.packing import PackPlan
 from speech_decoding.models.v14_converged_v3.pe import L1RoPE
 from speech_decoding.models.v14_converged_v3.varlen import (
     _reference_block_diag,
-    njt_block_diag,
+    gpu_block_diag,
     sdpa_block_diag_packed,
 )
 
@@ -197,7 +197,7 @@ class L1Block(nn.Module):
         # CPU keeps the scatter-to-padded oracle (the test reference the GPU path is
         # pinned against; njt is numerically identical to bf16, grad-matched).
         if q.is_cuda:
-            ctx = njt_block_diag(
+            ctx = gpu_block_diag(
                 q, k, v, plan.cu_seqlens_drop, plan.max_seqlen
             )  # (total, H, hd)
         else:
@@ -252,7 +252,7 @@ class L1Block(nn.Module):
         q, k = qh.transpose(0, 1), kh.transpose(0, 1)  # (M, H, hd)
         q, k = q.to(v.dtype), k.to(v.dtype)  # align to v for SDPA (no-op under fp32)
         if q.is_cuda:
-            ctx = njt_block_diag(q, k, v, cu_seqlens_drop, max_seqlen)  # (M, H, hd)
+            ctx = gpu_block_diag(q, k, v, cu_seqlens_drop, max_seqlen)  # (M, H, hd)
         else:
             ctx = _reference_block_diag(q, k, v, cu_seqlens)  # (M, H, hd)
         return self.out(ctx.reshape(m, d))
@@ -369,7 +369,7 @@ class L2Block(nn.Module):
         qkv = self.qkv(xtm.reshape(tot, d)).reshape(tot, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=1)  # (tot, H, hd) — no RoPE on L2
         if q.is_cuda:
-            ctx = njt_block_diag(q, k, v, plan.cu_l2_drop, plan.max_seqlen_l2)
+            ctx = gpu_block_diag(q, k, v, plan.cu_l2_drop, plan.max_seqlen_l2)
         else:
             ctx = _reference_block_diag(q, k, v, plan.cu_l2)  # (tot, H, hd)
         ctx = self.out(ctx.reshape(tot, d)).reshape(B, P * T, d)  # time-major

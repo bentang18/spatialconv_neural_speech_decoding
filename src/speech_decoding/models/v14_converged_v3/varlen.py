@@ -33,6 +33,7 @@ needs either.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -278,6 +279,89 @@ def _flash_varlen(
         causal=False,
     )
     return out
+
+
+# ── the GPU L1 dispatcher (what attention.py actually calls) ──────────────────────
+# ``varlen_block_diag_attention`` below is the ORIGINAL backend selector and is reached
+# only from tests; the towers call ``gpu_block_diag``. Keeping the split deliberate: the
+# selector picks flex on a CUDA box without flash, which is ~10x SLOWER than SDPA-per-block
+# and must never reach production (47ec65f replaced it).
+
+_FLASH_ENV = os.environ.get("V3_FLASH_VARLEN", "0") == "1"
+_FLASH_FN = None
+_FLASH_LOOKED = False
+
+
+def _flash_varlen_fn():
+    """Cached module-level import of ``flash_attn_varlen_func`` (None when absent).
+
+    HOISTED OUT OF THE CALL ON PURPOSE. An ``import`` inside a compiled function is
+    itself a graph break, which would cancel the one thing routing L1 to flash buys.
+    """
+    global _FLASH_FN, _FLASH_LOOKED
+    if not _FLASH_LOOKED:
+        _FLASH_LOOKED = True
+        try:
+            from flash_attn import flash_attn_varlen_func
+        except ImportError:
+            _FLASH_FN = None
+        else:
+            _FLASH_FN = flash_attn_varlen_func
+    return _FLASH_FN
+
+
+def flash_varlen_available(q: Tensor) -> bool:
+    """Whether flash can serve THIS tensor: opted in, CUDA, a wheel, and a half dtype.
+
+    FA2 rejects fp32, so the dtype test is a correctness guard, not a preference.
+
+    OFF BY DEFAULT — set ``V3_FLASH_VARLEN=1`` to enable. flash and njt are different
+    kernels, so a default-on flag would silently change numerics on every future run and
+    resume, breaking arm-vs-arm comparability against an njt-trained baseline.
+    """
+    return (
+        _FLASH_ENV
+        and q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and _flash_varlen_fn() is not None
+    )
+
+
+def flash_varlen_block_diag(
+    q: Tensor, k: Tensor, v: Tensor, cu_seqlens_drop: Tensor, max_seqlen: int
+) -> Tensor:
+    """Block-diagonal L1 attention via ``flash_attn_varlen_func`` — njt's exact contract.
+
+    Consumes the SAME compacted offsets as ``njt_block_diag`` (whole-masked shafts already
+    dropped, so no empty jagged row reaches the kernel) and the same explicit
+    ``1/sqrt(head_dim)`` scale that SDPA applies by default. Unlike ``njt_block_diag`` this
+    carries NO ``torch._dynamo.disable``: staying inside the compiled graph is the point.
+    Returns packed ``(total, H, head_dim)``.
+    """
+    fn = _flash_varlen_fn()
+    assert fn is not None, "flash_varlen_block_diag called without a flash_attn build"
+    cu = cu_seqlens_drop.to(torch.int32)
+    return fn(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        dropout_p=0.0,
+        softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+        causal=False,
+    )
+
+
+def gpu_block_diag(
+    q: Tensor, k: Tensor, v: Tensor, cu_seqlens_drop: Tensor, max_seqlen: int
+) -> Tensor:
+    """GPU L1 attention: flash when available and opted in, else njt (the default)."""
+    if flash_varlen_available(q):
+        return flash_varlen_block_diag(q, k, v, cu_seqlens_drop, max_seqlen)
+    return njt_block_diag(q, k, v, cu_seqlens_drop, max_seqlen)
 
 
 def varlen_block_diag_attention(
