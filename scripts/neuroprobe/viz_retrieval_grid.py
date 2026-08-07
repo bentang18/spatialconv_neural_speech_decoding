@@ -59,7 +59,8 @@ def _cells(sessions, lobes, taps, tasks, n_pre):
 
 
 def grid(sessions, lobes, taps, tasks, out_path: str, *, n_pre: int | None = None,
-         hz: float = 32.0, offset: float = 0.0, null_task: str | None = None) -> dict:
+         hz: float = 32.0, offset: float = 0.0, null_task: str | None = None,
+         cmap: str = "RdBu_r", arm: str = "") -> dict:
     cells = _cells(sessions, lobes, taps, tasks, n_pre)
     assert cells, "no (task, tap) combination produced a similarity matrix"
     tasks = [t for t in tasks if any((t, tp) in cells for tp in taps)]
@@ -79,14 +80,16 @@ def grid(sessions, lobes, taps, tasks, out_path: str, *, n_pre: int | None = Non
                 ax.axis("off")
                 continue
             m, st = got
-            im = ax.imshow(m, cmap="magma", vmin=-hi, vmax=hi, interpolation="nearest")
+            im = ax.imshow(m, cmap=cmap, vmin=-hi, vmax=hi, interpolation="nearest")
             t_len = st["n_frames"]
             # Where a perfect match would sit. Without it the eye has no reference for which
             # way "tighter" is, and a bright off-diagonal band reads the same as a good one.
-            ax.plot([0, t_len - 1], [0, t_len - 1], color="#69f", lw=0.7, ls=":", alpha=0.8)
+            ax.plot([0, t_len - 1], [0, t_len - 1], color="#111", lw=0.8, ls=":", alpha=0.6)
             if n_pre:
-                ax.axhline(n_pre - 0.5, color="w", lw=0.6, alpha=0.45)
-                ax.axvline(n_pre - 0.5, color="w", lw=0.6, alpha=0.45)
+                # Dark, not white: a diverging map is white at zero, so white rules vanish
+                # exactly where the contrast is weakest.
+                ax.axhline(n_pre - 0.5, color="#111", lw=0.6, alpha=0.5)
+                ax.axvline(n_pre - 0.5, color="#111", lw=0.6, alpha=0.5)
             xr = st["top1"] / st["chance"]
             ax.set_title(f"{xr:.1f}x chance · rank {st['median_rank']:.0f}/{t_len}",
                          fontsize=7.5, pad=3)
@@ -113,14 +116,20 @@ def grid(sessions, lobes, taps, tasks, out_path: str, *, n_pre: int | None = Non
                         fontweight="bold" if task == null_task else "normal")
     if im is not None:
         cb = fig.colorbar(im, ax=axes, fraction=0.018, pad=0.015)
-        cb.set_label("mean cross-subject token similarity (one scale for every cell)",
-                     fontsize=8)
+        cb.set_label("mean cross-subject cosine  ·  white = unrelated  ·  "
+                     "one scale for every cell", fontsize=8)
     fig.suptitle("Cross-subject token retrieval, depth left to right"
                  "  ·  dotted line = the correct match"
-                 "  ·  white rules = word onset (t=0)", fontsize=10.5)
+                 "  ·  solid rules = word onset (t=0)", fontsize=10.5)
     fig.savefig(out_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
+    # The matrices go to disk beside the figure so a cosmetic re-render never has to
+    # recompute them, and so the arm that produced them travels with the numbers.
+    mat_path = os.path.splitext(out_path)[0] + "_mats.npz"
+    np.savez_compressed(mat_path, **{f"{t}|{tp}": m for (t, tp), (m, _) in cells.items()})
     return {"tasks": tasks, "taps": list(taps), "vmax": hi, "null_task": null_task,
+            "arm": arm, "cmap": cmap, "hz": hz, "offset": offset, "n_pre": n_pre,
+            "matrices": os.path.basename(mat_path),
             "cells": {f"{t}|{tp}": {k: v for k, v in st.items() if k != "n_pairs"}
                       for (t, tp), (_, st) in cells.items()}}
 
@@ -137,6 +146,10 @@ def main() -> None:
     ap.add_argument("--n-pre", type=int, default=0)
     ap.add_argument("--hz", type=float, default=32.0)
     ap.add_argument("--offset", type=float, default=0.0)
+    ap.add_argument("--cmap", default="RdBu_r",
+                    help="diverging, centred on zero: the sign of the cosine IS the story")
+    ap.add_argument("--arm", default="",
+                    help="training arm / checkpoint tag, recorded in the sidecar")
     args = ap.parse_args()
 
     sessions = load_all(args.red_dir)
@@ -147,7 +160,8 @@ def main() -> None:
     print(f"[load] {len(sessions)} sessions, taps {taps}, lobes {lobes}", flush=True)
 
     info = grid(sessions, lobes, taps, tasks, args.out, n_pre=args.n_pre or None,
-                hz=args.hz, offset=args.offset, null_task=args.null_task or None)
+                hz=args.hz, offset=args.offset, null_task=args.null_task or None,
+                cmap=args.cmap, arm=args.arm or os.path.basename(args.red_dir.rstrip("/")))
     for t in info["tasks"]:
         row = [info["cells"].get(f"{t}|{tp}") for tp in taps]
         print(f"[grid] {t:18s} " + "  ".join(
