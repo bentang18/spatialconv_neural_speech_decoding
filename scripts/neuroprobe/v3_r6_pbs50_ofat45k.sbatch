@@ -74,20 +74,33 @@
 #   • HEADROOM. Both arms are heavier than the 3.70 s/step baseline (vits384 is 2.25x params;
 #     notimemask doubles visible tokens, so the encoder sequence roughly doubles and attention is
 #     quadratic in it). At 12 workers 40k inside 48 h is not guaranteed.
-# 🔴 CARRY THIS FORWARD: when either arm is read against pbs50_20k / pbs50_40k, the comparison
-# crosses the worker boundary. It is a nuisance draw, not a bias — but with n=1 seed per arm it
-# does not average out, so do not adjudicate a sub-.01 difference on these arms.
+# ✅ WORKERS MATCH, NO CAVEAT. Every pbs50 comparator is ALREADY at 32 workers: the baseline pair
+# v3_r6_perbandspace.sbatch:133 (40k) + v3_r6_pbs50_cooldown.sbatch:88 (cooldown to 45k), and the
+# R30/R35 arm launcher v3_r6_pbs50_ablation_trap45k.sbatch:153. An earlier revision of this file
+# ran 12 and carried a data-order caveat; at 32 there is no worker boundary to cross and the
+# caveat is RETRACTED. (--num-workers does change data order, shaft_dataset.py:77/:121/:125 — that
+# is exactly why it is pinned to the comparator's value rather than tuned.)
 # The 72 CPUs bill the same as 16 on one GPU (ghx4 = 1000 x max(cpus/72, mem/113560, gpus)).
 #
-# ── SCHEDULE ─────────────────────────────────────────────────────────────────────────────
-# 40k, ONE JOB, FROM SCRATCH, NO cooldown, ladder every 1000. LR is CONSTANT after the 5000-step
-# warmup (--min-lr-ratio default 1.0, dispatch_v3.py:574), so --ssl-max-steps sets RUN LENGTH ONLY:
-# every ladder ckpt is a legitimate read point and a walltime cut costs at most the last 1000 steps.
-# Baseline reference at 12 workers: R30's arms did 45k in ~46 h (3.70 s/step). Both arms here are
-# heavier than that baseline, so 40k may not land inside the 48 h wall — that is ACCEPTED, not a
-# failure. Read what the ladder holds. NEVER wire this to self-kill and never resume across arms.
+# ── SCHEDULE: 45k, MATCHED TO THE CANONICAL BASELINE (Ben 2026-08-04) ─────────────────────
+# "make sure it actually goes to 45k cooldown OFAT with basline". The published baseline is
+# pbs50_cd45k, NOT pbs50_40k, so a 40k constant-LR arm is not board-comparable to it: the arm
+# would be missing the cooldown that the baseline has, and the cooldown is REAL on CS (p=.041).
+# Every arm here therefore runs the SAME trapezoid the R30/R34/R35 arms ran:
+#   warmup 5000 LINEAR -> FLAT 6e-3 to 40000 (--stable-steps 40000)
+#                      -> LINEAR 6e-3 -> 0 to 45000 (--decay-shape linear --min-lr-ratio 0.0)
+# EXCEPT the `cosine` arm, whose whole point is a different LR SHAPE (see the arm table).
+# ONE JOB, FROM SCRATCH, NO resume, ladder every 1000.
+# 🔴 A 40k constant-LR run is a strict PREFIX of this trapezoid — identical LR at every step
+# 0..40000 — so a job already running the 40k shape does NOT need relaunching; it is finished by
+# resuming v3_r6_pbs50_cooldown.sbatch at 40000, which the trap45k header verified merges to
+# max|merged - canonical| = 0.000e+00. ⚠️ ON SUCH A RESUME, RE-PASS EVERY FLAG THAT LEAVES NO
+# TRACE IN THE STATE_DICT (--mask-time-frac 0.0 is one; same trap class as --parcel-perm-seed).
+# Reference: R30's arms did 45k in ~46 h (3.70 s/step) on this same header. The heavier arms here
+# may not land 45k inside the 48 h wall — ACCEPTED, not a failure. Read what the ladder holds.
+# NEVER wire this to self-kill and never resume across arms.
 set -uo pipefail
-ARM="${1:?usage: sbatch v3_r6_pbs50_ofat40k.sbatch <vits384|notimemask>}"
+ARM="${1:?usage: sbatch v3_r6_pbs50_ofat45k.sbatch <vits384|notimemask|cosine>}"
 # Explicit whitelist: a typo'd arm must FAIL, never fall through to an unablated run that would
 # look like a valid OFAT in wandb and burn 40 h.
 # cb/accum are ARM-DEPENDENT and always TOKEN-EXACT at cb*accum = 66000 contacts/opt-step.
@@ -107,10 +120,34 @@ ARM="${1:?usage: sbatch v3_r6_pbs50_ofat40k.sbatch <vits384|notimemask>}"
 # vs pbs00 — carry a cb/accum difference instead. Both stay TOKEN-EXACT at 66000/opt-step, so it
 # is the same seed-level caveat pbs00-vs-baseline already carries, not a token mismatch.
 # If it OOMs it dies in ~84 s and costs nothing; drop to cb6600/accum10 (fit: 62.6 GiB, 65%).
+#
+# 🔴 vits384 ALSO CANNOT run at cb 11000. MEASURED, not fitted (job 2873440, dead at 00:02:28):
+#   "Tried to allocate 1.64 GiB. GPU 0 has a total capacity of 95.08 GiB of which 92.12 MiB is
+#    free ... 94.25 GiB is allocated by PyTorch"  => it wanted ~96.7 GiB at cb11000/accum6.
+# d 256->384 is 1.5x width => ~2.25x block params and ~1.5x activations, on the SAME v=0.25 that
+# the baseline runs at cb11000 comfortably. Ben 2026-08-04: "Just do the same accum8 thing as pbs0
+# to save memory". Holding the fixed term at 14.7 GiB, the cb-proportional part is 96.7-14.7=82.0
+# GiB, so cb 11000->8250 (0.75x) predicts 14.7 + 61.5 = 76.2 GiB, 80% of the card. For scale, the
+# notimemask arm on this same rung reports 85.5% (Ben, live on 2873441), so 8250 is the tight-but-
+# real rung on this hardware, and vits384 is the lighter of the two on it (v=0.25 vs v=0.50).
+#
+# ── THE COSINE ARM (Ben 2026-08-04) ──────────────────────────────────────────────────────
+# "Now that we know that performance platueas/peaks at 40k steps - we should try a consine decay
+# arm as well." WSD was chosen because the plateau tells you WHERE to decay; cosine commits to the
+# horizon up front but usually reaches a better peak. This arm changes the LR SHAPE and NOTHING
+# else: same 45000 total steps, same cb 11000 x accum 6, same width, same masking as the baseline,
+# so it is a true OFAT against pbs50_cd45k rather than a compute-vs-schedule confound.
+#   --stable-steps 0 --decay-shape cosine --min-lr-ratio 0.0 --ssl-max-steps 45000
+# lr_schedule.py:72 clamps stable_steps to max(warmup_steps, ...) = 5000, so the cosine starts at
+# the END OF WARMUP with NO discontinuity: at step 5000 progress=0 => multiplier 1.0, which is
+# exactly where the warmup ramp lands. Decay window is 40000 steps (5000 -> 45000), and
+# 0.5(1+cos(pi p)) holds >=90% of peak only to p<0.205, i.e. this arm is BELOW baseline LR from
+# ~step 13200 onward. That is the intervention, not a bug.
 case "$ARM" in
-  vits384)     ABL="--enc-width 384"     ; CB=11000 ; ACC=6 ;;
-  notimemask)  ABL="--mask-time-frac 0.0"; CB=8250  ; ACC=8 ;;
-  *) echo "[FATAL] unknown arm '$ARM' (expected vits384 | notimemask)"; exit 1 ;;
+  vits384)     ABL="--enc-width 384"     ; CB=8250  ; ACC=8 ; SCHED="--stable-steps 40000 --decay-shape linear" ; SUF=cd45k ;;
+  notimemask)  ABL="--mask-time-frac 0.0"; CB=8250  ; ACC=8 ; SCHED="--stable-steps 40000 --decay-shape linear" ; SUF=cd45k ;;
+  cosine)      ABL=""                    ; CB=11000 ; ACC=6 ; SCHED="--stable-steps 0 --decay-shape cosine"     ; SUF=45k   ;;
+  *) echo "[FATAL] unknown arm '$ARM' (expected vits384 | notimemask | cosine)"; exit 1 ;;
 esac
 # Token identity is an ASSERT, not a comment: a wrong pair silently changes the optimizer step.
 if [ "$((CB * ACC))" -ne 66000 ]; then
@@ -128,14 +165,14 @@ TREE=/projects/bhqk/htang13/speech
 VENV=$TREE/.venv/bin/python
 export PYTHONPATH="$TREE/src:${PYTHONPATH:-}"
 cd "$TREE"
-RUN_NAME=v3_r6_pbspace111_sf50_${ARM}_40k
+RUN_NAME=v3_r6_pbspace111_sf50_${ARM}_${SUF}
 CKPT_DIR=/projects/bhqk/htang13/v3_ckpt_${RUN_NAME}
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
-echo "[r6 pbs50 OFAT 40k] arm=$ARM flags='$ABL' run=$RUN_NAME"
-echo "[schedule] ONE JOB, from scratch, no resume: warmup 5000 LINEAR -> CONSTANT 6e-3 to 40000; ladder 1000"
+echo "[r6 pbs50 OFAT 45k] arm=$ARM flags='$ABL' sched='$SCHED' run=$RUN_NAME"
+echo "[schedule] ONE JOB, from scratch, no resume, ladder 1000, max=45000: warmup 5000 LINEAR -> $SCHED --min-lr-ratio 0.0"
 echo "[matched]  space_frac=0.50 per_band_space=ON widths=1,1,1 lr=6e-3 seed=33 cb=$CB accum=$ACC (=$((CB*ACC)) contacts/opt-step) workers=32 [FILE-ONLY scp deploy]"
-echo "[caveat]   workers 32 vs the 12-worker pbs50 comparators => data order differs (nuisance, UNMEASURED, < the .01 seed nuisance). Do not adjudicate sub-.01 on these arms."
-echo "[read]     vits384 -> vs pbs50_40k @40k; notimemask -> vs pbs50_20k AND pbs00_20k @20k (matched masked fraction 0.50)"
+echo "[workers]  32 == the pbs50 comparators (perbandspace:133, cooldown:88, trap45k:153) => NO data-order caveat"
+echo "[read]     all arms -> vs pbs50_cd45k @45k (the CANONICAL baseline, not pbs50_40k); notimemask also -> vs pbs00 @20k (matched masked fraction 0.50)"
 srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --bt-root /projects/bhqk/htang13/braintreebank \
   --band-cache-dir $ROOT/band_v3slow \
@@ -154,8 +191,9 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --accelerator gpu --devices 1 --precision bf16-mixed \
   --num-workers 32 --monitor-every-n-steps 10 --log-every-n-steps 10 \
   --mask-space-frac 0.50 --per-band-space --space-block-w-bands 1,1,1 \
+  --min-lr-ratio 0.0 $SCHED \
   $ABL \
   --compile \
   --wandb-project intuition --run-name $RUN_NAME \
   --ckpt-dir $CKPT_DIR --ckpt-ladder-every 1000 \
-  --ssl-max-steps 40000
+  --ssl-max-steps 45000
