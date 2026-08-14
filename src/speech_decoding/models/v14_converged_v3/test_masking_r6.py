@@ -111,24 +111,52 @@ def test_bands_are_independent() -> None:
     print("[check] OK SLOW/MID/HGA masks independent (differ at shared lattice positions)")
 
 
-def test_temporal_is_per_sensor_independent_within_a_shaft() -> None:
-    # THE r6 invariant: unlike r4's GLOBAL band masks, each band mask is per-SENSOR — and the test
-    # that separates per-sensor from the old per-shaft draw is that two contacts of the SAME shaft
-    # get different masks. Compare within shaft 1 (contacts 3..7) only.
+def test_temporal_is_tubed_across_contacts_within_a_shaft() -> None:
+    # THE contract (Ben 2026-08-14): a band's time blocks are a TUBE across the contacts of a
+    # shaft. The encoder is L1-within-shaft only, so if contacts drew independently a masked
+    # (c,t) would keep a visible same-shaft neighbour at the same t to copy from and the pretext
+    # would never force temporal modelling. Within a shaft the masks must be IDENTICAL; across
+    # shafts they must differ, or the draw has collapsed to r4's single global mask.
     sc, geom = _session([3, 5, 4])
     n = int(geom.valid.sum())
     m = sample_masks_r6(geom, n, n_time=32, n_rows=4, generator=_gen(2))
-    same_shaft = [i for i in range(n) if int(geom.shaft_of_contact[i]) == 1]
-    assert len(same_shaft) >= 2
     for tm in (m.hga_mask, m.mid_mask, m.slow_mask):
-        any_differ = any(
+        for s in range(geom.n_shafts):
+            members = [i for i in range(n) if int(geom.shaft_of_contact[i]) == s]
+            for r in range(tm.shape[0]):
+                for i in members[1:]:
+                    assert torch.equal(tm[r, members[0]], tm[r, i]), (
+                        f"shaft {s} contact {i} does not share its shaft's time mask — "
+                        "the tube is broken and the same-t neighbour shortcut is open"
+                    )
+        heads = [
+            [i for i in range(n) if int(geom.shaft_of_contact[i]) == s][0]
+            for s in range(geom.n_shafts)
+        ]
+        assert any(
+            not torch.equal(tm[r, heads[a]], tm[r, b])
+            for r in range(tm.shape[0])
+            for a in range(len(heads))
+            for b in heads[a + 1:]
+        ), "every shaft shares one mask — this is r4's global draw, not a per-shaft tube"
+    print("[check] OK band masks tube across contacts within a shaft, shafts independent")
+
+
+def test_band_time_unit_contact_reproduces_the_old_per_sensor_draw() -> None:
+    # The pre-2026-08-14 behaviour stays reachable so those checkpoints remain reproducible.
+    sc, geom = _session([3, 5, 4])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(band_time_unit="contact")
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=4, generator=_gen(2), cfg=cfg)
+    same_shaft = [i for i in range(n) if int(geom.shaft_of_contact[i]) == 1]
+    for tm in (m.hga_mask, m.mid_mask, m.slow_mask):
+        assert any(
             not torch.equal(tm[r, i], tm[r, j])
             for r in range(tm.shape[0])
             for a, i in enumerate(same_shaft)
-            for j in same_shaft[a + 1 :]
-        )
-        assert any_differ, "contacts of one shaft share a band mask — not per-sensor independent"
-    print("[check] OK each band mask is (R,N,T_b) per-sensor independent WITHIN a shaft")
+            for j in same_shaft[a + 1:]
+        ), "band_time_unit='contact' did not restore the per-sensor draw"
+    print("[check] OK band_time_unit='contact' restores the 07-23 per-sensor draw")
 
 
 def test_block_width_controls_masked_run_length() -> None:

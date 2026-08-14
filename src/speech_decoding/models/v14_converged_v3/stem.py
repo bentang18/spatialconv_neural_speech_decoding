@@ -94,6 +94,14 @@ class SpectralStem(nn.Module):
 # HGA 1 (32 Hz), MID 2 (16 Hz), SLOW 8 (4 Hz). Bins 7/6/7 = the v2 cache band widths.
 PER_BAND_SPECS: tuple[tuple[int, int], ...] = ((7, 8), (6, 2), (7, 1))
 
+# Init std for EVERY additive-to-residual band identity embed, encoder stem and predictor
+# alike (Ben 2026-08-14). ONE constant so the two halves cannot drift apart: the predictor's
+# pred_band_emb/mask_band_emb import it rather than restating a literal. V-JEPA 2.1 inits
+# additive embeds near zero (modality embed std 1e-6) and mask_token at exactly zero, so the
+# model grows into them instead of carrying a strong prior from step 0 — the same argument
+# already applied to ParcelIdentityEmbed (pe.py:194-202). Pass band_emb_std=0.02 for the A/B arm.
+BAND_EMB_INIT_STD: float = 1e-6
+
 
 class PerBandStem(nn.Module):
     """Per-band DECIMATED token stem (r4 / Design B, contract project-r4-contract-2026-07-15).
@@ -124,14 +132,19 @@ class PerBandStem(nn.Module):
         d_model: int = 256,
         *,
         bands: Sequence[tuple[int, int]] = PER_BAND_SPECS,
-        band_emb_std: float = 0.02,
+        band_emb_std: float = BAND_EMB_INIT_STD,
     ) -> None:
         super().__init__()
         self.specs = tuple((int(nb), int(st)) for nb, st in bands)
         self.projs = nn.ModuleList(nn.Linear(nb, d_model) for nb, _ in self.specs)
-        # additive per-band identity, one d-vector per band; standard 0.02 init (the band
-        # is deliberate structure we WANT the model to use, unlike the near-zero parcel
-        # nuisance embed). band_emb_std is the A/B knob.
+        # additive per-band identity, one d-vector per band. NEAR-ZERO 1e-6 init (Ben
+        # 2026-08-14), the V-JEPA 2.1 convention for anything ADDED to the residual: the
+        # modality embed inits at std 1e-6 and mask_token at zero, so the model GROWS into
+        # the embed rather than carrying a strong prior from step 0. This is the same
+        # argument already applied to ParcelIdentityEmbed (pe.py:194-202); the band embed is
+        # added to every token at the stem and rides every block, so at 0.02 it was a large
+        # fraction of the token signal at init. 0.02 is retained as the A/B arm via
+        # band_emb_std. 🪤 NO TRACE: the init leaves nothing in a converged state_dict.
         self.band_type_emb = nn.Parameter(torch.empty(len(self.specs), d_model))
         self.projs.apply(init_transformer_weights)  # V-JEPA trunc_normal(0.02)+zero-bias
         nn.init.trunc_normal_(self.band_type_emb, std=band_emb_std)
@@ -339,7 +352,7 @@ class FineHgaStem(nn.Module):
     projections + the additive band embed, exactly as PerBandStem.
     """
 
-    def __init__(self, d_model: int = 256, *, band_emb_std: float = 0.02) -> None:
+    def __init__(self, d_model: int = 256, *, band_emb_std: float = BAND_EMB_INIT_STD) -> None:
         super().__init__()
         n_slow, n_mid, n_hga = FINE_HGA_BINS
         self.slow_proj = nn.Linear(n_slow, d_model)
@@ -517,7 +530,7 @@ class NoFusionStem(nn.Module):
         *,
         bins: tuple[int, int] = NOFUSION_BINS,
         decimate: int = NOFUSION_DECIMATE,
-        band_emb_std: float = 0.02,
+        band_emb_std: float = BAND_EMB_INIT_STD,
     ) -> None:
         super().__init__()
         self.n_hga, self.n_lfs = int(bins[0]), int(bins[1])

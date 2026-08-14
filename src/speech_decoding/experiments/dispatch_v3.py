@@ -72,12 +72,33 @@ class _EpochSeedCallback(pl.Callback):
     reshuffles each epoch. Lightning does not call a datamodule's custom
     ``set_epoch``; without this the per-epoch seed is frozen and every epoch draws
     the identical windows (``reload_dataloaders_every_n_epochs=1`` only rebuilds the
-    loader, it does not advance the seed)."""
+    loader, it does not advance the seed).
 
-    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:  # noqa: ARG002
+    ``on_train_start`` covers the RESUME SEAM, and it is not redundant. Under
+    ``--batch-unit shaft`` the loader is an IterableDataset whose pack sequence is a pure
+    function of ``(seed, epoch, worker)`` read inside ``__iter__``
+    (shaft_dataset.py:119-124), and Lightning does NOT fast-forward an iterable on resume: it
+    restarts at pack 0. So the resumed job draws fresh clips only if its epoch number differs
+    from the parent's, which makes seeding the FIRST epoch of a resumed run load-bearing.
+
+    The hook is ``on_train_start`` and not ``on_fit_start`` because of measured ordering:
+    ``on_fit_start`` runs BEFORE the checkpoint is restored (``current_epoch`` is still 0
+    there), while ``on_train_start`` sees the restored ``current_epoch`` and is still followed
+    by a ``train_dataloader()`` call whose iterator binds the value written here.
+    ``on_train_epoch_start`` alone is too late: the first iterator of a resumed run is built
+    before it fires, so it would bind the dataset's constructor default of 0 and replay epoch
+    0's packs no matter what step the job restarted from."""
+
+    def _fan_out(self, trainer: pl.Trainer) -> None:
         dm = getattr(trainer, "datamodule", None)
         if dm is not None and hasattr(dm, "set_epoch"):
             dm.set_epoch(int(trainer.current_epoch))
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:  # noqa: ARG002
+        self._fan_out(trainer)
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:  # noqa: ARG002
+        self._fan_out(trainer)
 
 
 class _StepTimeCallback(pl.Callback):
@@ -366,12 +387,24 @@ def build_v3_training(
     # is per band, so masked token count is unchanged ⇒ matched-visible. None/False ⇒ locked config.
     if getattr(args, "per_band_space", False):
         mask_cfg = replace(mask_cfg, per_band_space=True)
+    # --band-time-unit: "shaft" (DEFAULT) tubes a band's time blocks across the contacts of a
+    # shaft; "contact" restores the 07-23 per-sensor draw and exists only to reproduce the
+    # pre-2026-08-14 checkpoints. LOUD in the config, unlike the silent mask flags.
+    btu = getattr(args, "band_time_unit", None)
+    if btu is not None:
+        mask_cfg = replace(mask_cfg, band_time_unit=btu)
     sbw = getattr(args, "space_block_w_bands", None)
     if sbw is not None:
         parts = tuple(int(x) for x in sbw.split(","))
         if len(parts) != 3:
             raise ValueError(f"--space-block-w-bands needs SLOW,MID,HGA (3 ints), got {sbw!r}")
         mask_cfg = replace(mask_cfg, block_w_space_bands=parts)
+    # [mask] FINGERPRINT — the mask flags leave NO trace in the state_dict (there is no
+    # save_hyperparameters anywhere, see --parcel-perm-seed at the parser), so a run's mask arm
+    # is otherwise unrecoverable after the fact. Printing the resolved config makes the sbatch
+    # log the provenance record: grep [mask] to prove which arm a checkpoint came from, and to
+    # confirm a resume re-passed the same silent flags as its parent.
+    print(f"[mask] {mask_cfg}", flush=True)
     model = V3ConvergedModel(
         n_parcels=_n_parcels(sessions), mask_cfg=mask_cfg,
         deep_sup=getattr(args, "deep_sup", True),
@@ -648,6 +681,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "exception. Exact-count snapping is per band ⇒ identical masked token count "
                         "⇒ MATCHED-VISIBLE. A contact can then be spatially masked in HGA while "
                         "visible in SLOW/MID, which is the cross-band-bridge test. r6 only.")
+    p.add_argument("--band-time-unit", dest="band_time_unit", choices=("shaft", "contact"),
+                   default=None,
+                   help="CONTRACT (Ben 2026-08-14), r6 only. 'shaft' (the masking.py DEFAULT) "
+                        "tubes each band's width-4 time blocks across the contacts of a shaft, so "
+                        "a masked (contact, t) has NO visible same-shaft neighbour at t to copy "
+                        "from. The encoder is L1-within-shaft only, so the 07-23 per-contact draw "
+                        "left that shortcut open and the pretext never forced temporal modelling. "
+                        "'contact' restores that draw and exists ONLY to reproduce pre-08-14 "
+                        "checkpoints. Shafts are always independent of each other.")
     p.add_argument("--space-block-w-bands", dest="space_block_w_bands", type=str, default=None,
                    help="R20: per-band spatial block width as SLOW,MID,HGA (e.g. '6,4,2'). "
                         "REQUIRES --per-band-space. Unset ⇒ block_w_space (4) for all three. "

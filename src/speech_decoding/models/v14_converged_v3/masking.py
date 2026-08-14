@@ -88,6 +88,15 @@ class V3MaskConfig:
     mid_mask_frac: float = 0.50  # MID masked on its 16 Hz grid (Ben: 50% for symmetry).
     slow_mask_frac: float = 0.50  # SLOW masked on its 4 Hz grid (Ben 2026-07-15: 50%, first-class band).
     block_w_band: int = 4  # leak-safe block width in a band's OWN tokens (M14 margin 2); same all 3.
+    # r6 ONLY. "shaft" (DEFAULT, Ben 2026-08-14) = every contact of a shaft shares that shaft's
+    # hidden frames, so the time blocks are a TUBE across contacts and L1 cannot fill a masked
+    # (c,t) from a visible same-shaft neighbour at the same t. Shafts are drawn independently, so
+    # same-t cross-sensor context survives for L2. This restores the 2026-07-12 dual-axis contract
+    # ("HOMOGENEOUS within-sensor, HETEROGENEOUS inter-sensor"), which r6's per-sensor draw had
+    # reversed. "contact" = the 07-23 r6 behaviour, each contact drawing its own blocks; kept ONLY
+    # so the pre-2026-08-14 checkpoints stay reproducible. The DEFAULT is the new contract on
+    # purpose: a forgotten flag must not silently run the shortcut arm.
+    band_time_unit: str = "shaft"
     temporal_mask_frac: float = 0.50  # r5 ONLY: single early-fused 32 Hz grid masked (T7-tunable).
     # r5 temporal block width (tokens) on the 32 Hz grid. 5 tokens = 156 ms FLOOR; overlap
     # (_cover_rank) lifts the mean masked run to ~190 ms (Ben 2026-07-22, τ-anchored not speech-
@@ -482,6 +491,43 @@ def _sample_persensor_band_time(
     return cover.argsort(-1).argsort(-1) < cnt  # (R, N, length) exactly cnt per (row, contact)
 
 
+def _sample_pershaft_band_time(
+    geom: L1Geometry,
+    n_contacts: int,
+    length: int,
+    *,
+    frac: float,
+    block_w: int,
+    n_rows: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """One per-SHAFT band time mask, expanded to ``(R, N, length)`` so every contact of a shaft
+    shares that shaft's hidden frames — the TIME TUBE across contacts.
+
+    WHY (Ben 2026-08-14, restoring the 2026-07-12 dual-axis contract): L1 attends WITHIN a
+    shaft, so if each contact draws its own blocks a masked ``(c, t)`` almost always has a
+    visible same-shaft neighbour at the same ``t`` to copy from, and the pretext never forces
+    temporal modelling. Sharing the draw within a shaft removes that neighbour. Shafts stay
+    INDEPENDENT of each other, which is what keeps same-``t`` cross-sensor context alive for
+    L2 — a single global draw (r4) would hide every shaft at the same frames and leave the
+    predictor no cross-sensor context at all.
+
+    Shape and count are unchanged from the per-sensor draw: ``(R, N, length)``, exactly
+    ``round(frac·length)`` per ``(row, contact)``, so every downstream shape stays static."""
+    s = geom.n_shafts
+    ones = torch.ones(s, length, dtype=torch.bool, device=device)
+    cover = _cover_rank(ones, block_w, n_rows, generator)  # (R, S, length)
+    cnt = round(frac * length)
+    shaft_mask = cover.argsort(-1).argsort(-1) < cnt  # (R, S, length) exactly cnt per shaft
+    if int(geom.shaft_of_contact.shape[0]) != n_contacts:
+        raise ValueError(
+            f"shaft_of_contact has {int(geom.shaft_of_contact.shape[0])} entries, n_contacts="
+            f"{n_contacts} — the band time mask would be gathered against the wrong axis"
+        )
+    return shaft_mask[:, geom.shaft_of_contact]  # (R, N, length), contacts share their shaft
+
+
 def sample_masks_r6(
     geom: L1Geometry,
     n_contacts: int,
@@ -564,6 +610,11 @@ def sample_masks_r6(
     n_slots = t // SLOW_STRIDE
 
     def band(length: int, frac: float) -> Tensor:
+        if cfg.band_time_unit == "shaft":
+            return _sample_pershaft_band_time(
+                geom, n, length, frac=frac, block_w=cfg.block_w_band,
+                n_rows=r, generator=generator, device=dev,
+            )
         return _sample_persensor_band_time(
             n, length, frac=frac, block_w=cfg.block_w_band,
             n_rows=r, generator=generator, device=dev,

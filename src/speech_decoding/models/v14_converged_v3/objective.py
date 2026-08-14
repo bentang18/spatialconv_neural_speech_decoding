@@ -56,6 +56,7 @@ from speech_decoding.models.v14_converged_v3.pack_r4 import (
 )
 from speech_decoding.models.v14_converged_v3.pe import init_transformer_weights
 from speech_decoding.models.v14_converged_v3.stem import (
+    BAND_EMB_INIT_STD,
     EARLY_FUSION_BINS,
     EARLY_FUSION_CHANNELS,
     EARLY_FUSION_DECIMATE,
@@ -359,8 +360,9 @@ class V3JepaObjective(nn.Module):
                 # self.d_pred) — a SEPARATE param from the stem's 256-dim band_type_emb. Lets
                 # the predictor tell apart two co-located masked queries (HGA vs LFS at the same
                 # RoPE position) that must predict different targets.
+                # Same near-zero init as every other additive band embed (BAND_EMB_INIT_STD).
                 self.mask_band_emb = nn.Parameter(torch.empty(2, self.d_pred))
-                nn.init.trunc_normal_(self.mask_band_emb, std=0.02)
+                nn.init.trunc_normal_(self.mask_band_emb, std=BAND_EMB_INIT_STD)
             elif self.early_fusion:
                 # r5 MAE decoder_pred = ONE Linear(d_pred → DEC·C) reconstructing this token's
                 # OWN 2 raw 64 Hz frames × 5 fused channels (10 values). Plain per-channel MSE
@@ -396,12 +398,17 @@ class V3JepaObjective(nn.Module):
         # byte-identical predictor inputs required to reconstruct three DIFFERENT bands' bins —
         # only the per-band output head could tell them apart, and the predictor stack itself
         # could not. This is the r4/r6 analogue of no_fusion's mask_band_emb: predictor space
-        # (d_pred), separate from the stem's 256-dim band_type_emb, standard 0.02 init.
+        # (d_pred), separate from the stem's 256-dim band_type_emb. NEAR-ZERO 1e-6 init (Ben
+        # 2026-08-14): this is added to the residual exactly like the stem's band embed and the
+        # parcel embed, so it follows the same V-JEPA 2.1 rule (modality embed 1e-6, mask_token
+        # zero — pe.py:194-202). Encoder and predictor band embeds are now initialised the same
+        # way; leaving the predictor at 0.02 would have put the strong-prior-at-init problem
+        # back on the half of the model that consumes the mask queries.
         self.pred_band_emb = (
             nn.Parameter(torch.empty(len(PER_BAND_SPECS), self.d_pred)) if self.r6 else None
         )
         if self.pred_band_emb is not None:
-            nn.init.trunc_normal_(self.pred_band_emb, std=0.02)
+            nn.init.trunc_normal_(self.pred_band_emb, std=BAND_EMB_INIT_STD)
         # Learnable mask query, zero-init (V-JEPA-2.1 audit). Stored 3-D (1, 1, D) to match
         # upstream: the shared ndim<=1 no-decay rule then DECAYS it (a 1-D store would
         # silently exempt it). Broadcasts identically in scatter_visible (a no-op there).
