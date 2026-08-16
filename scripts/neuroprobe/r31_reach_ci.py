@@ -242,7 +242,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", required=True, nargs="+",
                     help="merged samplecurve JSON(s); regime is read from each file")
-    ap.add_argument("--nboot", type=int, default=2000, help="matches the gain-law bootstrap")
+    ap.add_argument("--nboot", type=int, default=20000,
+                    help="the decision map is the deliverable and 20k costs ~2 s; at 2k the "
+                         "map wobbles by ~1 point, which is enough to move a borderline call")
     ap.add_argument("--seed", type=int, default=0, help="matches the gain-law bootstrap")
     ap.add_argument("--resample-nfull", action="store_true",
                     help="recompute n_full per draw instead of holding it at the full-sample median")
