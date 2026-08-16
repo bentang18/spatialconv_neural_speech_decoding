@@ -1,0 +1,292 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="5.5in" height="2.139in" viewBox="0 0 396 154"
+     font-family="Times New Roman, Times, Nimbus Roman, STIX Two Text, serif">
+
+  <!-- ============================================================
+       Correspondence priors, hand-authored at final size.
+       Canvas 396 x 166 pt = 5.5 x 2.306 in.  1 user unit = 1 pt,
+       so every font-size below is the printed point size.
+
+       Panel (a) x 0..187 | gutter | panel (b) x 209..396.
+       Both panels share one row grid: subject A on the shaft at
+       y = 62, subject B at y = 126, so a row reads across the divider.
+
+       ANATOMY (checked, and it constrains the drawing):
+         * The section is CORONAL, not lateral.  A lateral silhouette
+           cannot honestly carry an orthogonal sEEG trajectory, which
+           runs into the page.  In coronal the trajectory is in plane.
+         * The shafts read the way the electrode goes in: ENTRY GYRUS on
+           the left, nearest the section it enters, and DEEP on the
+           right.  Contact indices are never shown, so this commits to
+           no numbering convention; it just keeps the schematic flowing
+           out of the brain beside it instead of back into it.
+         * STG is a surface gyrus, so it sits mid shaft only on an
+           OBLIQUE trajectory that crosses it on the way in.  Subject A
+           enters the supramarginal gyrus, crosses the supratemporal
+           plane, and ends in the hippocampus.  Subject B enters MTG,
+           crosses the superior temporal sulcus, and ends in temporal
+           white matter.  Both are real placements, and reading each row
+           left to right retraces the surgeon's path.
+         * The superficial flank of STG must therefore be the entry
+           gyrus, never white matter and never a deep nucleus.  An
+           earlier draft had hippocampus immediately deep to STG with
+           nothing between and white matter outside it, which buries a
+           lateral surface gyrus inside the medial temporal lobe.
+         * Contact pitch is uniform on a real shaft.  The gaps between
+           the enclosures here are grouping, not spacing; panel (b) is
+           where spacing is drawn to scale.
+
+       TWO accents, one per panel, and neither means a subject.  Each
+       marks only what its own panel claims: #1f4e79 for the
+       corresponding region in (a), gold #9a6f14 for the separations in
+       (b).  The enclosure is therefore accented in (a) and neutral in
+       (b), where the region is context rather than the point.  Reusing
+       one colour for two different claims made (b) read as a restated
+       (a).  Each accent is identical across the two rows inside its
+       panel, because the claim is that these are the same thing in two
+       brains.  The gold is deliberately duller and yellower than
+       #c1440e so it does not read as the zero-parameter floor.  Two subject colours would have argued
+       the opposite, and #1f4e79 already means "our arm" in the R30
+       ablation figure, so a second reading of it collides across the
+       deck.  Subject identity is carried by the row labels alone.
+       Deliberately NOT #c1440e, which means the zero-parameter floor.
+       Neutrals #5b6773 / #7d868e / #9aa7b4 / #b8c0c7 / #dfe3e6, ink #333.
+       ============================================================ -->
+
+  <defs>
+    <!-- contacts: filled = the region / the peak, hollow = elsewhere -->
+    <circle id="on-a" r="3.1" fill="#1f4e79"/>
+    <circle id="on-b" r="3.1" fill="#1f4e79"/>
+    <circle id="on-sep" r="3.1" fill="#9a6f14"/>
+    <circle id="off"  r="3.1" fill="#ffffff" stroke="#9aa7b4" stroke-width="1"/>
+
+    <!-- one coronal section at the temporal level.  Reused once per
+         subject; only the trajectory drawn over it changes.  The
+         shaded band on the outer temporal surface is the entry cortex,
+         shared anatomy, so it stays neutral. -->
+    <g id="coronal">
+      <path d="M28,2 C23,0 13,1.5 7.5,8 C2,14 1.5,22 5,27
+               C7.5,30.5 11,32 14.5,31 C17,35 22.5,35.5 24.5,30.5
+               C25.5,27.5 26.5,26.5 28,27.5 C29.5,26.5 30.5,27.5 31.5,30.5
+               C33.5,35.5 39,35 41.5,31 C45,32 48.5,30.5 51,27
+               C54.5,22 54,14 48.5,8 C43,1.5 33,0 28,2 Z"
+            fill="#ffffff" stroke="#b8c0c7" stroke-width="1.3" stroke-linejoin="round"/>
+      <line x1="28" y1="3.5" x2="28" y2="21" stroke="#d8dde1" stroke-width="1.1"/>
+      <ellipse cx="21" cy="15" rx="2.5" ry="4.4" transform="rotate(12 21 15)" fill="#eef1f3"/>
+      <ellipse cx="35" cy="15" rx="2.5" ry="4.4" transform="rotate(-12 35 15)" fill="#eef1f3"/>
+      <ellipse cx="20" cy="27" rx="3"   ry="1.8" transform="rotate(-12 20 27)" fill="#e4e9ec"/>
+      <ellipse cx="36" cy="27" rx="3"   ry="1.8" transform="rotate(12 36 27)"  fill="#e4e9ec"/>
+      <path d="M6,21.5 C4.5,24.5 6.5,27 9.5,28.5" fill="none"
+            stroke="#5b6773" stroke-opacity="0.30" stroke-width="4" stroke-linecap="round"/>
+    </g>
+
+    <!-- arrowheads, one pair per colour -->
+    <marker id="ah-n-end" viewBox="0 0 6 6" refX="5.4" refY="3" orient="auto"
+            markerUnits="userSpaceOnUse" markerWidth="6" markerHeight="6">
+      <path d="M0,0.7 L5.6,3 L0,5.3 Z" fill="#7d868e"/>
+    </marker>
+    <marker id="ah-n-start" viewBox="0 0 6 6" refX="0.6" refY="3" orient="auto"
+            markerUnits="userSpaceOnUse" markerWidth="6" markerHeight="6">
+      <path d="M5.6,0.7 L0,3 L5.6,5.3 Z" fill="#7d868e"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="396" height="154" fill="#ffffff"/>
+  <line x1="198" y1="14" x2="198" y2="148" stroke="#e8eaec" stroke-width="0.7"/>
+
+  <!-- ============================ PANEL (a) ============================
+       Absolute, by region.
+       =================================================================== -->
+  <g id="panel-a">
+
+    <text x="0" y="9" font-size="8" fill="#333333">
+      <tspan font-weight="bold">(a)</tspan><tspan dx="3">Absolute, by region</tspan>
+    </text>
+
+    <!-- subject A: orthogonal lateral temporal trajectory -->
+    <g id="a-subject-a">
+      <text x="20" y="40" font-size="7.5" fill="#333333" text-anchor="middle">Subject A</text>
+      <g transform="translate(1,48.7) scale(0.7)">
+        <use xlink:href="#coronal"/>
+        <line x1="0" y1="25" x2="20" y2="27.2"
+              stroke="#5b6773" stroke-width="2.1" stroke-linecap="round"/>
+      </g>
+
+      <line x1="45" y1="62" x2="172" y2="62" stroke="#dfe3e6" stroke-width="2.6" stroke-linecap="round"/>
+
+      <rect x="49" y="53" width="27" height="18" rx="3"
+            fill="none" stroke="#b8c0c7" stroke-width="0.8" stroke-dasharray="2.5 2"/>
+      <text x="49" y="49.5" font-size="7" fill="#6b737a">SMG</text>
+      <use xlink:href="#off" x="56" y="62"/>
+      <use xlink:href="#off" x="69" y="62"/>
+
+      <rect x="82" y="53" width="53" height="18" rx="3"
+            fill="#1f4e79" fill-opacity="0.06" stroke="#1f4e79" stroke-width="1.1"/>
+      <text x="82" y="49.5" font-size="7" fill="#1f4e79">STG</text>
+      <use xlink:href="#on-a" x="89"  y="62"/>
+      <use xlink:href="#on-a" x="102" y="62"/>
+      <use xlink:href="#on-a" x="115" y="62"/>
+      <use xlink:href="#on-a" x="128" y="62"/>
+
+      <rect x="141" y="53" width="27" height="18" rx="3"
+            fill="none" stroke="#b8c0c7" stroke-width="0.8" stroke-dasharray="2.5 2"/>
+      <text x="141" y="49.5" font-size="7" fill="#6b737a">HIPP</text>
+      <use xlink:href="#off" x="148" y="62"/>
+      <use xlink:href="#off" x="161" y="62"/>
+    </g>
+
+    <!-- the correspondence.  Neutral: it belongs to neither subject. -->
+    <line x1="108.5" y1="72" x2="89" y2="116" stroke="#7d868e" stroke-width="0.9"
+          stroke-dasharray="3 2.2" marker-start="url(#ah-n-start)" marker-end="url(#ah-n-end)"/>
+
+    <!-- subject B: oblique inferolateral trajectory, same target -->
+    <g id="a-subject-b">
+      <text x="20" y="104" font-size="7.5" fill="#333333" text-anchor="middle">Subject B</text>
+      <g transform="translate(1,112.7) scale(0.7)">
+        <use xlink:href="#coronal"/>
+        <line x1="0" y1="32" x2="16" y2="27.6"
+              stroke="#5b6773" stroke-width="2.1" stroke-linecap="round"/>
+      </g>
+
+      <line x1="45" y1="126" x2="146" y2="126" stroke="#dfe3e6" stroke-width="2.6" stroke-linecap="round"/>
+
+      <rect x="49" y="117" width="14" height="18" rx="3"
+            fill="none" stroke="#b8c0c7" stroke-width="0.8" stroke-dasharray="2.5 2"/>
+      <text x="49" y="113.5" font-size="7" fill="#6b737a">MTG</text>
+      <use xlink:href="#off" x="56" y="126"/>
+
+      <rect x="69" y="117" width="40" height="18" rx="3"
+            fill="#1f4e79" fill-opacity="0.06" stroke="#1f4e79" stroke-width="1.1"/>
+      <text x="69" y="113.5" font-size="7" fill="#1f4e79">STG</text>
+      <use xlink:href="#on-b" x="76"  y="126"/>
+      <use xlink:href="#on-b" x="89" y="126"/>
+      <use xlink:href="#on-b" x="102" y="126"/>
+
+      <rect x="115" y="117" width="27" height="18" rx="3"
+            fill="none" stroke="#b8c0c7" stroke-width="0.8" stroke-dasharray="2.5 2"/>
+      <text x="115" y="113.5" font-size="7" fill="#6b737a">WM</text>
+      <use xlink:href="#off" x="122" y="126"/>
+      <use xlink:href="#off" x="135" y="126"/>
+    </g>
+  </g>
+
+  <!-- ============================ PANEL (b) ============================
+       Relative, by separation.  Both shafts are drawn at the SAME contact
+       pitch, because spacing is fixed by sensor geometry.  Everything
+       else differs: the region covers seven contacts in subject A and
+       five in subject B, it sits at a different place along the shaft,
+       the shafts carry a different number of contacts, and the peak sits
+       at a different offset inside the region.  What survives all of that
+       is the separation structure under the peak, which is identical.
+       The enclosure hugs the shaft so that its WIDTH and its POSITION are
+       both readable; a tall box enclosing the whole apparatus can carry
+       neither.  Neither enclosure edge lands on a terminal contact.
+
+       Shared grid, pitch 13, first contact at x = 250 in both rows.
+         A: 11 contacts, region spans 7 of them, peak right of centre
+         B:  9 contacts, region spans 5 of them, peak centred
+       =================================================================== -->
+  <g id="panel-b">
+
+    <text x="208.6" y="9" font-size="8" fill="#333333">
+      <tspan font-weight="bold">(b)</tspan><tspan dx="3">Relative, by separation</tspan>
+    </text>
+
+    <!-- subject A: a wide region, late on a long shaft, peak right of centre -->
+    <g id="b-subject-a">
+      <text x="238" y="64.6" font-size="7.5" fill="#333333" text-anchor="end">Subject A</text>
+
+      <rect x="269.5" y="38" width="91.0" height="30" rx="3"
+            fill="none" stroke="#9aa7b4" stroke-width="1.0"/>
+      <text x="269.5" y="34.5" font-size="7" fill="#6b737a">STG</text>
+
+      <g fill="#b8c0c7">
+        <rect x="247.7" y="52" width="4.6" height="2"/>
+        <rect x="260.7" y="52" width="4.6" height="2"/>
+        <rect x="273.7" y="52" width="4.6" height="2"/>
+        <rect x="286.7" y="52" width="4.6" height="2"/>
+        <rect x="299.7" y="52" width="4.6" height="2"/>
+        <rect x="351.7" y="52" width="4.6" height="2"/>
+        <rect x="364.7" y="52" width="4.6" height="2"/>
+        <rect x="377.7" y="52" width="4.6" height="2"/>
+      </g>
+      <!-- the response peak is neutral in both rows: it is the same
+           thing happening in two subjects, not a property of either -->
+      <g fill="#7d868e">
+        <rect x="312.5" y="46" width="5" height="8"/>
+        <rect x="325.5" y="40" width="5" height="14"/>
+        <rect x="338.5" y="44" width="5" height="10"/>
+      </g>
+
+      <line x1="245" y1="62" x2="385" y2="62" stroke="#dfe3e6" stroke-width="2.6" stroke-linecap="round"/>
+      <use xlink:href="#off" x="250" y="62"/>
+      <use xlink:href="#off" x="263" y="62"/>
+      <use xlink:href="#off" x="276" y="62"/>
+      <use xlink:href="#off" x="289" y="62"/>
+      <use xlink:href="#off" x="302" y="62"/>
+      <use xlink:href="#on-sep" x="315" y="62"/>
+      <use xlink:href="#on-sep" x="328" y="62"/>
+      <use xlink:href="#on-sep" x="341" y="62"/>
+      <use xlink:href="#off" x="354" y="62"/>
+      <use xlink:href="#off" x="367" y="62"/>
+      <use xlink:href="#off" x="380" y="62"/>
+
+      <!-- consecutive separations -->
+      <g fill="none" stroke="#9a6f14" stroke-width="0.9">
+        <path d="M317.5,70 Q321.5,78.5 325.5,70"/>
+        <path d="M330.5,70 Q334.5,78.5 338.5,70"/>
+      </g>
+      <g font-size="7.5" fill="#9a6f14" text-anchor="middle">
+        <text x="321.5" y="82">&#916;</text>
+        <text x="334.5" y="82">&#916;</text>
+      </g>
+
+    </g>
+    <!-- subject B: a narrower region, earlier on a shorter shaft, peak centred -->
+    <g id="b-subject-b">
+      <text x="238" y="128.6" font-size="7.5" fill="#333333" text-anchor="end">Subject B</text>
+
+      <rect x="256.5" y="102" width="65.0" height="30" rx="3"
+            fill="none" stroke="#9aa7b4" stroke-width="1.0"/>
+      <text x="256.5" y="98.5" font-size="7" fill="#6b737a">STG</text>
+
+      <g fill="#b8c0c7">
+        <rect x="247.7" y="116" width="4.6" height="2"/>
+        <rect x="260.7" y="116" width="4.6" height="2"/>
+        <rect x="312.7" y="116" width="4.6" height="2"/>
+        <rect x="325.7" y="116" width="4.6" height="2"/>
+        <rect x="338.7" y="116" width="4.6" height="2"/>
+        <rect x="351.7" y="116" width="4.6" height="2"/>
+      </g>
+      <!-- the response peak is neutral in both rows: it is the same
+           thing happening in two subjects, not a property of either -->
+      <g fill="#7d868e">
+        <rect x="273.5" y="110" width="5" height="8"/>
+        <rect x="286.5" y="104" width="5" height="14"/>
+        <rect x="299.5" y="108" width="5" height="10"/>
+      </g>
+
+      <line x1="245" y1="126" x2="359" y2="126" stroke="#dfe3e6" stroke-width="2.6" stroke-linecap="round"/>
+      <use xlink:href="#off" x="250" y="126"/>
+      <use xlink:href="#off" x="263" y="126"/>
+      <use xlink:href="#on-sep" x="276" y="126"/>
+      <use xlink:href="#on-sep" x="289" y="126"/>
+      <use xlink:href="#on-sep" x="302" y="126"/>
+      <use xlink:href="#off" x="315" y="126"/>
+      <use xlink:href="#off" x="328" y="126"/>
+      <use xlink:href="#off" x="341" y="126"/>
+      <use xlink:href="#off" x="354" y="126"/>
+
+      <!-- consecutive separations -->
+      <g fill="none" stroke="#9a6f14" stroke-width="0.9">
+        <path d="M278.5,134 Q282.5,142.5 286.5,134"/>
+        <path d="M291.5,134 Q295.5,142.5 299.5,134"/>
+      </g>
+      <g font-size="7.5" fill="#9a6f14" text-anchor="middle">
+        <text x="282.5" y="146">&#916;</text>
+        <text x="295.5" y="146">&#916;</text>
+      </g>
+
+    </g>
+  </g>
+</svg>

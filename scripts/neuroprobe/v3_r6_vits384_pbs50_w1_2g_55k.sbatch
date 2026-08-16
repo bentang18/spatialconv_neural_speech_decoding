@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=r6_vits384_tube_2g_55k
+#SBATCH --job-name=r6_vits384_pbs50_w1_2g_55k
 #SBATCH --account=bhqk-dtai-gh
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
@@ -15,16 +15,42 @@
 #     sbatch scripts/neuroprobe/v3_r6_vits384_tube_2g_55k.sbatch $A
 #   done
 #
-# THE TIME-TUBE CONTRACT, FROM SCRATCH (Ben 2026-08-14). r6 drew each band's width-4 time
-# blocks PER CONTACT, so a masked (contact, t) kept visible same-shaft neighbours at the SAME t
-# to copy from. With ENC_LAYOUT = ("L1",)*12 there is no L2 anywhere, so L1 is the only place
-# context comes from, and that shortcut let the pretext be solved without modelling time.
-# masking.py now draws the blocks PER SHAFT and shares them across the shaft's contacts.
+# CELL D OF THE 2x2 (Ben 2026-08-15, launched after the 10k read). pbs50 SPACE TIER x WIDTH 1.
+# The 2x2 is {space tier on/off} x {block width 4/1}; A=2952079 B=2952162 C=2952187 are the other
+# three. At 10k, w1 beat w4 on BOTH regimes (WS +.0037 t+2.69, CS +.0052 t+0.81) and pbs50 was the
+# CS-preferred tier, so D is the CANDIDATE OPTIMUM, not a filler cell.
+# PREDICTION, measured not guessed: population time-axis copy-R2 moves -.0234 with width under
+# nospace but only -.0152 under pbs50 (half the contacts are fully tubed and have NO time-copy
+# path at all), so D-C should be about 2/3 of B-A, ~+.0024 WS, near the one-seed noise floor.
+#
+# ═══ 🔴 WHY THIS RUN EXISTS: SIX THINGS MOVED, NOT ONE ═══════════════════════════════════
+# The canonical ckpt v3_r6_pbspace111_sf50_vits384_cd55k and the mask arms 2952079 (space 0 /
+# time .75 / w4) and 2952162 (same, w1) differ in SIX ways, only one of which is the mask:
+#
+#                        canonical cd55k              2952079 / 2952162
+#   mask                 sf .50 / tf .50 / w4         sf 0 / tf .75 / w4 or w1   <- the question
+#   shaft-alpha          0.5                          0.0        (NEVER ablated)
+#   clips-per-session    default -> ipe 65,000        616 -> ipe 1000
+#   band embed init      0.02                         1e-6 (BAND_EMB_INIT_STD, stem + predictor)
+#   epoch seed           pre-fix (replayed epoch 0)   on_train_start fix
+#   provenance           cooldown RESUME from 50k     fresh from 0, 1 GPU -> 2 GPU
+#
+# All bundled by commit a7132e0. The band init is explicitly NO-TRACE ("leaves nothing in a
+# converged state_dict") and the epoch-seed bug bit RESUMED runs, which the canonical was.
+# ⇒ WITHOUT THIS RUN A MASK RESULT IN EITHER DIRECTION IS UNATTRIBUTABLE. That is the #1 defect
+# (arm mixing), and it applies to a WIN exactly as much as to a LOSS.
+#
+# THIS RUN DOES THREE JOBS AT ONCE:
+#   1. Makes 2952079 and 2952162 single-knob deltas on the mask, after the fact.
+#   2. Tests the alpha/epoch/init bundle ON ITS OWN against v3_r6_pbspace111_sf50_vits384_cd55k.
+#   3. Gives a FRESH-FROM-0 canonical, retiring the resume the epoch-seed bug affected.
+#
+# ⚠️ It is NOT a clean single-knob test of any ONE chassis change against the canonical -- alpha,
+# ipe, band init and the resume seam all move together here. It bounds the BUNDLE, not its parts.
 #
 # ═══ 🔴 WHY THIS IS A FRESH RUN AND NOT A RESUME ═════════════════════════════════════════
-# EVERY vits384 ckpt on disk was trained under the per-contact draw. The contract changes the
-# INPUT from step 0, so it starts from step 0. Cooling an old-draw ckpt would give 50k steps of
-# one mask contract and 5k of another, which is arm mixing in the one run that ships.
+# The whole point is to hold the chassis fixed against 2952079/2952162, and those are fresh from
+# 0. Cooling an old ckpt would reintroduce exactly the resume seam this run exists to remove.
 #
 # ═══ 🔴 WHY 2 GPUs, AND WHY THE CONTRACT IS UNCHANGED ════════════════════════════════════
 # On ONE GPU the run does not fit: 55,000 x 4.005 s/step = 61.2 h against a 48 h MaxTime, which
@@ -162,6 +188,17 @@ fi
 CB=8250
 ACC=4
 WORLD=2
+# 🔴 THE MASK CONTRACT, AS VARIABLES. All three leave NOTHING in the state_dict, so a wrong or
+# forgotten value runs a different arm with no error. Each is cross-checked against RUN_NAME below
+# and printed in the fingerprint, so the log is the record.
+SF=0.50   # space fraction, per band, tubed across time -- the pbs50 tier
+TF=0.50   # time fraction, per band, on that band's own grid
+BW=1      # 🔴 THE ONLY KNOB vs 2952187. width 1 => _cover_rank degenerates to independent uniform
+          # per-token selection = RANDOM masking on the time axis.
+UNIT=contact  # 🚨 the DEFAULT flipped to "shaft" in a7132e0. Omitting this runs the TUBE.
+if [ "$UNIT" != "contact" ]; then
+  echo "[FATAL] band_time_unit=$UNIT -- this control must reproduce the pbs50 PER-CONTACT draw"; exit 1
+fi
 # Token identity is an ASSERT, not a comment: a wrong triple silently changes the optimizer step.
 if [ "$((CB * ACC * WORLD))" -ne 66000 ]; then
   echo "[FATAL] cb=$CB x accum=$ACC x world=$WORLD = $((CB * ACC * WORLD)) != 66000 contacts/opt-step"; exit 1
@@ -198,7 +235,7 @@ export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
 export EXCA_CACHE_FOLDER=/work/nvme/bhqk/htang13/cache_neuroai
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SHARED WITH v3_r6_vits384_tube_2g_smoke.sbatch so a prior smoke run warms this (~20 min).
-export TORCHINDUCTOR_CACHE_DIR=/work/nvme/bhqk/htang13/torchinductor_cache_r6_tube2g_${ARM}
+export TORCHINDUCTOR_CACHE_DIR=/work/nvme/bhqk/htang13/torchinductor_cache_r6_pbs50w1_2g_${ARM}
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export WANDB_API_KEY="$(cat /projects/bhqk/htang13/.wandb_key)"
 TREE=/projects/bhqk/htang13/speech
@@ -210,21 +247,31 @@ cd "$TREE"
 # --no-space-rope from the ckpt PATH matching *nosrope*, so keep `nosrope`/`noparcel` verbatim
 # or the probe encode runs the wrong arm. `_tube_` separates this contract from every ckpt
 # already on disk.
-RUN_NAME=v3_r6_tube_pbspace111_sf50_${ARM}_2g_cd55k
+RUN_NAME=v3_r6_pbs50_sf50_t50_w1_${ARM}_2g_cd55k
 CKPT_DIR=/projects/bhqk/htang13/v3_ckpt_${RUN_NAME}
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
 
 [ -e "$CKPT_DIR" ] && { echo "[FATAL] $CKPT_DIR already exists -- refusing to mix ladders"; exit 1; }
+# 🔴 NAME/FLAG CROSS-CHECK for all three silent mask flags, both directions.
+case "$RUN_NAME" in *_sf50_t50_w1_*) : ;; *) echo "[FATAL] RUN_NAME '$RUN_NAME' does not carry the sf50_t50_w1 tag"; exit 1 ;; esac
+if [ "$SF" != "0.50" ] || [ "$TF" != "0.50" ] || [ "$BW" -ne 1 ]; then
+  echo "[FATAL] mask mismatch -- name says sf50/t50/w1, flags say SF=$SF TF=$TF BW=$BW"; exit 1
+fi
+# 🔴 THIS FILE IS THE WIDTH-1 CELL. Refuse to be edited into the w4 arm by accident.
+if [ "$BW" -ne 1 ]; then
+  echo "[FATAL] this file is cell D (width 1); BW=$BW. Use v3_r6_vits384_pbs50_2g_55k.sbatch for width 4"; exit 1
+fi
 
-echo "[r6 vits384 TIME-TUBE 2-GPU 0->55k] arm=$ARM flags='$ABL' run=$RUN_NAME"
-echo "[contract] --band-time-unit shaft: width-4 time blocks drawn PER SHAFT, shared by its contacts. FRESH from step 0."
+echo "[r6 vits384 pbs50 WIDTH-1 CELL D 2-GPU 0->55k] arm=$ARM flags='$ABL' run=$RUN_NAME"
+echo "[contract] pbs50 MASK REPRODUCED: space=$SF per-band tubed across time, time=$TF, band_block_w=$BW, --band-time-unit $UNIT."
+echo "[contract] visible = (1-$SF)x(1-$TF) = 0.25 => 75% masked. SINGLE-KNOB delta vs v3_r6_pbs50_sf50_t50_w4_${ARM}_2g_cd55k (job 2952187). FRESH from step 0."
 echo "[ddp]      world=$WORLD, accum=$ACC/rank, workers=$NW/rank -> streams=$STREAMS. Batch/ipe/pack-multiset IDENTICAL to the 1-GPU pair; opt-step GROUPING is not."
 echo "[slurm]    cpus-per-task=$SLURM_CPUS_PER_TASK (ONE SOCKET PER RANK -- 36 fails 'Error configuring interconnect' in 3 s), mem=227120M, billing still 2000/hr"
 echo "[batch]    cb=$CB x accum=$ACC x world=$WORLD = $((CB*ACC*WORLD)) contacts/opt-step"
 echo "[epoch]    cps=$CPS -> ipe=$IPE. Ladder every 1000 = EVERY rung is an epoch boundary, so a wall-clock resume draws fresh packs."
 echo "[schedule] ONE JOB: warmup 5000 -> CONSTANT 6e-3 to 50000 -> LINEAR 6e-3->0 over 50000..55000 (--min-lr-ratio 0.0)"
 echo "[sampler]  --shaft-alpha 0.0: uniform on the SUBJECT axis, 1/7 each BY CONSTRUCTION (census-independent)"
-echo "[matched]  sf50 per_band_space=ON widths=1,1,1 lr=6e-3 wd=0.04 clip=3.0 beta2=0.95 seed=33 [FILE-ONLY scp deploy]"
+echo "[matched]  sf$SF time=$TF w$BW unit=$UNIT lr=6e-3 wd=0.04 clip=3.0 beta2=0.95 seed=33 [FILE-ONLY scp deploy]"
 echo "[wall]     55000 steps. 1-GPU rate is 4.005 s/step (61.2 h); this needs >=1.5x to fit 47 h. SCALING IS MODELLED, NOT PROFILED."
 echo "[read]     what ships is the 55000 COOLED ckpt. 🚫 never board a rung below 55000."
 
@@ -247,8 +294,9 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --accelerator gpu --devices $WORLD --precision bf16-mixed \
   --clips-per-session $CPS \
   --num-workers $NW --monitor-every-n-steps 10 --log-every-n-steps 10 \
-  --mask-space-frac 0.50 --per-band-space --space-block-w-bands 1,1,1 \
-  --band-time-unit shaft \
+  --mask-space-frac $SF --per-band-space --space-block-w-bands 1,1,1 \
+  --mask-time-frac $TF --band-block-w $BW \
+  --band-time-unit $UNIT \
   $ABL \
   --compile \
   --wandb-project intuition --run-name $RUN_NAME \

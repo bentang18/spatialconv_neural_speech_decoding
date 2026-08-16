@@ -393,6 +393,14 @@ def build_v3_training(
     btu = getattr(args, "band_time_unit", None)
     if btu is not None:
         mask_cfg = replace(mask_cfg, band_time_unit=btu)
+    # --mask-iid: drop BOTH tiers and draw one global permutation over the whole token grid (MAE's
+    # own recipe). space_frac/block_w_band/band_time_unit go UNREAD, so sample_masks_r6 raises on a
+    # nonzero space tier rather than silently masking past the rate match.
+    if getattr(args, "mask_iid", False):
+        mask_cfg = replace(mask_cfg, mask_iid=True)
+        iid_frac = getattr(args, "iid_mask_frac", None)
+        if iid_frac is not None:
+            mask_cfg = replace(mask_cfg, iid_mask_frac=iid_frac)
     sbw = getattr(args, "space_block_w_bands", None)
     if sbw is not None:
         parts = tuple(int(x) for x in sbw.split(","))
@@ -681,15 +689,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "exception. Exact-count snapping is per band ⇒ identical masked token count "
                         "⇒ MATCHED-VISIBLE. A contact can then be spatially masked in HGA while "
                         "visible in SLOW/MID, which is the cross-band-bridge test. r6 only.")
-    p.add_argument("--band-time-unit", dest="band_time_unit", choices=("shaft", "contact"),
-                   default=None,
+    p.add_argument("--mask-iid", dest="mask_iid", action="store_true",
+                   help="r6 only (Ben 2026-08-15). Drop BOTH mask tiers and draw ONE uniform "
+                        "permutation over every (contact, band, token) cell, masking exactly "
+                        "round(--iid-mask-frac x total) — MAE's own recipe on the full r6 grid. "
+                        "No space tier, no block width, no per-contact or per-band budget; the "
+                        "global count is the only constraint, and it is what keeps M_vis a "
+                        "compile-time constant for the encoder's visible-token gather. "
+                        "--mask-space-frac MUST be 0.0 or the sampler raises: the tiers compose "
+                        "multiplicatively and a leftover space tier would silently mask past the "
+                        "rate match. --band-block-w and --band-time-unit go UNREAD in this mode.")
+    p.add_argument("--iid-mask-frac", dest="iid_mask_frac", type=float, default=None,
+                   help="Masked fraction for --mask-iid (masking.py iid_mask_frac, unset => 0.75). "
+                        "0.75 is the rate match to every two-tier arm, which reaches the same "
+                        "total as (1-0.50)(1-0.50) = 0.25 visible.")
+    p.add_argument("--band-time-unit", dest="band_time_unit",
+                   choices=("shaft", "contact", "shaft_budget"), default=None,
                    help="CONTRACT (Ben 2026-08-14), r6 only. 'shaft' (the masking.py DEFAULT) "
                         "tubes each band's width-4 time blocks across the contacts of a shaft, so "
                         "a masked (contact, t) has NO visible same-shaft neighbour at t to copy "
                         "from. The encoder is L1-within-shaft only, so the 07-23 per-contact draw "
                         "left that shortcut open and the pretext never forced temporal modelling. "
                         "'contact' restores that draw and exists ONLY to reproduce pre-08-14 "
-                        "checkpoints. Shafts are always independent of each other.")
+                        "checkpoints. Shafts are always independent of each other. "
+                        "'shaft_budget' (Ben 2026-08-15) draws blocks per contact but spends the "
+                        "keep budget PER SHAFT, so per-contact masked fractions are free while the "
+                        "shaft total is exact. That is the only setting under which a contact can "
+                        "be near-fully hidden without a space mask, which is what makes it a real "
+                        "test of whether the SPACE tier is load-bearing at matched rate.")
     p.add_argument("--space-block-w-bands", dest="space_block_w_bands", type=str, default=None,
                    help="R20: per-band spatial block width as SLOW,MID,HGA (e.g. '6,4,2'). "
                         "REQUIRES --per-band-space. Unset ⇒ block_w_space (4) for all three. "

@@ -25,13 +25,24 @@ Provenance discipline:
 No error bars: the board publishes a `sem` whose definition we cannot verify against ours, and
 plotting two differently-defined intervals side by side would be worse than plotting none.
 """
-import json, pathlib, statistics, collections, re
+import argparse, json, pathlib, statistics, collections, re
 import matplotlib
 matplotlib.use("Agg")
+matplotlib.rcParams["pdf.fonttype"] = 42   # NeurIPS rejects Type 3
+matplotlib.rcParams["ps.fonttype"] = 42
 import matplotlib.pyplot as plt
 
-ARM = "pbs50_cd45k"
-SH = pathlib.Path("results/r6_era/board/shards_pbs50_cd45k")
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--arm", default="pbs50_cd45k",
+                 help="arm tag carried INSIDE the shard cell keys; guards against arm mixing")
+_ap.add_argument("--shards", default="results/r6_era/board/shards_pbs50_cd45k")
+_ap.add_argument("--suffix", default="",
+                 help="appended to every output filename so a new checkpoint never clobbers the old figure")
+_args = _ap.parse_args()
+
+ARM = _args.arm
+SH = pathlib.Path(_args.shards)
+SUFFIX = _args.suffix
 BOARD = pathlib.Path("../neuroprobe/analyses/figures")
 OUT = pathlib.Path("results/showcase/1_beats_the_board")
 REGIMES = (("ws",       "WithinSession", "enc0_elec", "enc12_elec", "Within session"),
@@ -189,9 +200,9 @@ def render(tasks: tuple[str, ...], slug: str, headline: str, subtitle: str) -> N
     fig.tight_layout(rect=(0.0, .012, 1.0, .985))
     OUT.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
-        fig.savefig(OUT / f"fig_teaser_floor_splits_board{slug}.{ext}", bbox_inches="tight", dpi=180)
+        fig.savefig(OUT / f"fig_teaser_floor_splits_board{slug}{SUFFIX}.{ext}", bbox_inches="tight", dpi=180)
     plt.close(fig)
-    print(f"  -> {OUT}/fig_teaser_floor_splits_board{slug}.pdf|.png")
+    print(f"  -> {OUT}/fig_teaser_floor_splits_board{slug}{SUFFIX}.pdf|.png")
 
 
 def render_delta(tasks: tuple[str, ...], slug: str, headline: str, subtitle: str) -> None:
@@ -257,9 +268,9 @@ def render_delta(tasks: tuple[str, ...], slug: str, headline: str, subtitle: str
     fig.tight_layout(rect=(0.0, .014, 1.0, .982))
     OUT.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
-        fig.savefig(OUT / f"fig_teaser_floor_splits_board{slug}.{ext}", bbox_inches="tight", dpi=180)
+        fig.savefig(OUT / f"fig_teaser_floor_splits_board{slug}{SUFFIX}.{ext}", bbox_inches="tight", dpi=180)
     plt.close(fig)
-    print(f"  -> {OUT}/fig_teaser_floor_splits_board{slug}.pdf|.png")
+    print(f"  -> {OUT}/fig_teaser_floor_splits_board{slug}{SUFFIX}.pdf|.png")
 
 
 ALL_SUB = "Neuroprobe Lite, all 15 tasks — the submission macro ·"
@@ -267,7 +278,10 @@ SNR_SUB = (f"Neuroprobe Lite, the {len(SNR)} tasks with signal ({', '.join(SNR)}
            f"best published within-session entry reaches {SNR_CUT:.2f}, a rule that never reads "
            "our own scores ·")
 HEAD = "Most published intracranial foundation models do not beat a spectrogram"
+# 🚫 THE SNR-5 VARIANTS ARE NOT RENDERED (Ben 2026-08-10: "we only report all15 — we shall
+# never confuse a reader"). The selection rule above still RUNS, because its three robustness
+# checks are cheap and a silently-broken rule is worse than an unused one, but a second macro
+# over a different task set is a second headline number, and two headline numbers is how a
+# reader ends up quoting the flattering one. The published macro is over 15 tasks. Only 15.
 render(ALL15, "", HEAD, ALL_SUB)
-render(SNR, "_snr5", HEAD, SNR_SUB)
 render_delta(ALL15, "_delta", HEAD, ALL_SUB)
-render_delta(SNR, "_snr5_delta", HEAD, SNR_SUB)

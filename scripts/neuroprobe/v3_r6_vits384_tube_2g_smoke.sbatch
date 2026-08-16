@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
 #SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=36
-#SBATCH --mem=113560M
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=227120M
 #SBATCH --time=01:00:00
 #SBATCH --output=/projects/bhqk/htang13/logs/%x_%j.out
 #
@@ -18,10 +18,16 @@
 # width. 55,000 x 4.005 s/step is 61.2 h on one GPU, which does not fit a 48 h partition wall;
 # the plan only works if two ranks bring it under 47 h. 1.5x is enough (40.8 h) and 1.8x is
 # comfortable (34.0 h), but NONE of that is profiled. 300 steps settles it.
-# 🚨 THE REAL RISK IS MEMORY, NOT SPEED. --mem is PER NODE, so two ranks now share the 113,560M
-# that one rank held alone, while both mmap the same band .npy files through 16 workers each.
-# The known failure modes are an OOM in the first seconds (that is always the LOADER, never the
-# model) and the silent futex hang (GPU at 0%, no error, no exit). Both show up inside 300 steps.
+# 🔴 --cpus-per-task=72 IS LOAD-BEARING, 36 DOES NOT LAUNCH. A ghx4 node is 288 CPUs / 4x GH200
+# as gpu:...:4(S:0-3), ONE GPU PER SOCKET at 72 CPUs each. At 36 both ranks land on one socket
+# and contend for its single cxi NIC, and srun dies in 3 s with "Error configuring interconnect"
+# (measured, jobs 2950160-63). 🚫 --network=single_node_vni is NOT the fix, probe 2950167
+# requested one and reproduced the failure exactly. Billing is unchanged: 1000 x max(cpus/72,
+# mem_MB/113560, gpus) is pinned at 2 by the gpus term, so 144 CPUs and 227,120M are free.
+# 🚨 THE REMAINING RISK IS MEMORY. Each rank now has its own 113,560M, but both still mmap the
+# same band .npy files through 16 workers each. The failure modes are an OOM in the first
+# seconds (that is always the LOADER, never the model) and the silent futex hang (GPU at 0%, no
+# error, no exit). Both show up well inside 300 steps.
 #
 # ═══ WHAT TO READ OUT OF THE LOG ═════════════════════════════════════════════════════════
 #   1. [mask] fingerprint  -- must say the shaft time-tube contract

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=r6_vits384_tube_2g_55k
+#SBATCH --job-name=r6_vits384_nospace_w1_2g_55k
 #SBATCH --account=bhqk-dtai-gh
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
@@ -15,11 +15,30 @@
 #     sbatch scripts/neuroprobe/v3_r6_vits384_tube_2g_55k.sbatch $A
 #   done
 #
-# THE TIME-TUBE CONTRACT, FROM SCRATCH (Ben 2026-08-14). r6 drew each band's width-4 time
-# blocks PER CONTACT, so a masked (contact, t) kept visible same-shaft neighbours at the SAME t
-# to copy from. With ENC_LAYOUT = ("L1",)*12 there is no L2 anywhere, so L1 is the only place
-# context comes from, and that shortcut let the pretext be solved without modelling time.
-# masking.py now draws the blocks PER SHAFT and shares them across the shaft's contacts.
+# ABLATION A1 -- RANDOM vs BLOCK TIME MASKING (specified dispatch_v3.py:671 on 2026-07-28, launched
+# once as job 2756178 and DIED AT 6k of 40k, so it has never been read). Ben 2026-08-15: "why is
+# width 4 motivated again instead of just literally full random?"
+#
+# This is the ONE-KNOB delta against v3_r6_nospace_t75_w4_<ARM>_2g_cd55k (job 2952079). At width 1
+# _cover_rank degenerates to independent uniform per-token selection, so the mask contract becomes
+# a single sentence with NO hand-set structural parameter: each contact, each band, independently
+# hides 75% of its own tokens at random. Contiguous runs still appear, but they EMERGE from the
+# rate (expected run 1/(1-p) = 4 tokens) rather than being chosen.
+#
+# 🎯 THE NULL, STATED BEFORE THE MEASUREMENT (R42, scripts/neuroprobe/v3_band_time_corr.py, 13 BT
+# sessions). Time-lag autocorrelation of the tokens the model actually sees: HGA r(1)=.135 falling
+# to a .058 floor by 90 ms, MID r(1)=.468 cliffing to .127 at lag 2, SLOW r(1)=.956. Scoring each
+# masked token's copy-R2 from its two ACTUAL nearest visible neighbours under the REAL sampler:
+#     w   SLOW    MID     HGA     loss-weighted (8/32/64 tokens per 2 s clip)
+#     1   .739    .117    .0169   .1031
+#     4   .628    .0605   .0116   .0741
+# So width 4 buys 2.9 points of copy-R2 at this rate, concentrated entirely in MID. It buys 5.3
+# points at 50%, which is why this arm is worth running NOW and was not worth running under pbs50.
+# ⚖ BOTH OUTCOMES ARE PUBLISHABLE, which is what makes this an ABLATION and not an HP arm:
+#   NULL -> the mask has no hand-set structure left, the strongest form of the contract.
+#   LOSS -> the block is earning its keep and we can say exactly which band pays for it (MID).
+# 🚫 It is NOT a width SWEEP. Do not follow it with w2/w3/w6; those are HP arms and die on
+# paper-defensibility.
 #
 # ═══ 🔴 WHY THIS IS A FRESH RUN AND NOT A RESUME ═════════════════════════════════════════
 # EVERY vits384 ckpt on disk was trained under the per-contact draw. The contract changes the
@@ -162,6 +181,13 @@ fi
 CB=8250
 ACC=4
 WORLD=2
+# 🔴 THE ONE KNOB. --band-block-w leaves NOTHING in the state_dict, so a forgotten or wrong value
+# runs the other arm with no error and no way to tell afterwards. BW is asserted against the
+# RUN_NAME below and printed in the fingerprint, so the log is the record.
+BW=1
+if [ "$BW" -ne 1 ]; then
+  echo "[FATAL] this file is the A1 width-1 arm; BW=$BW. Use v3_r6_vits384_nospace_2g_55k.sbatch for width 4"; exit 1
+fi
 # Token identity is an ASSERT, not a comment: a wrong triple silently changes the optimizer step.
 if [ "$((CB * ACC * WORLD))" -ne 66000 ]; then
   echo "[FATAL] cb=$CB x accum=$ACC x world=$WORLD = $((CB * ACC * WORLD)) != 66000 contacts/opt-step"; exit 1
@@ -198,7 +224,7 @@ export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
 export EXCA_CACHE_FOLDER=/work/nvme/bhqk/htang13/cache_neuroai
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SHARED WITH v3_r6_vits384_tube_2g_smoke.sbatch so a prior smoke run warms this (~20 min).
-export TORCHINDUCTOR_CACHE_DIR=/work/nvme/bhqk/htang13/torchinductor_cache_r6_tube2g_${ARM}
+export TORCHINDUCTOR_CACHE_DIR=/work/nvme/bhqk/htang13/torchinductor_cache_r6_nospacew1_2g_${ARM}
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export WANDB_API_KEY="$(cat /projects/bhqk/htang13/.wandb_key)"
 TREE=/projects/bhqk/htang13/speech
@@ -210,21 +236,33 @@ cd "$TREE"
 # --no-space-rope from the ckpt PATH matching *nosrope*, so keep `nosrope`/`noparcel` verbatim
 # or the probe encode runs the wrong arm. `_tube_` separates this contract from every ckpt
 # already on disk.
-RUN_NAME=v3_r6_tube_pbspace111_sf50_${ARM}_2g_cd55k
+RUN_NAME=v3_r6_nospace_t75_w1_${ARM}_2g_cd55k
 CKPT_DIR=/projects/bhqk/htang13/v3_ckpt_${RUN_NAME}
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
 
 [ -e "$CKPT_DIR" ] && { echo "[FATAL] $CKPT_DIR already exists -- refusing to mix ladders"; exit 1; }
+# 🔴 NAME/FLAG CROSS-CHECK for the silent width flag, both directions.
+case "$RUN_NAME" in *_w1_*) NAME_W=1 ;; *_w4_*) NAME_W=4 ;; *) echo "[FATAL] RUN_NAME '$RUN_NAME' carries no _wN_ tag"; exit 1 ;; esac
+if [ "$NAME_W" -ne "$BW" ]; then
+  echo "[FATAL] band_block_w mismatch -- name says w$NAME_W, BW=$BW"; exit 1
+fi
 
-echo "[r6 vits384 TIME-TUBE 2-GPU 0->55k] arm=$ARM flags='$ABL' run=$RUN_NAME"
-echo "[contract] --band-time-unit shaft: width-4 time blocks drawn PER SHAFT, shared by its contacts. FRESH from step 0."
+echo "[r6 vits384 A1 RANDOM-MASK (width 1) 2-GPU 0->55k] arm=$ARM flags='$ABL' run=$RUN_NAME"
+echo "[contract] NO SPACE TIER, NO BLOCK. space=0.0, time=0.75, band_block_w=$BW, --band-time-unit contact."
+echo "[contract] width 1 => _cover_rank degenerates to independent uniform per-token selection = RANDOM masking."
+echo "[contract] visible = (1-0.0)x(1-0.75) = 0.25 => 75% masked. SINGLE-KNOB delta vs v3_r6_nospace_t75_w4_${ARM}_2g_cd55k. FRESH from step 0."
 echo "[ddp]      world=$WORLD, accum=$ACC/rank, workers=$NW/rank -> streams=$STREAMS. Batch/ipe/pack-multiset IDENTICAL to the 1-GPU pair; opt-step GROUPING is not."
 echo "[slurm]    cpus-per-task=$SLURM_CPUS_PER_TASK (ONE SOCKET PER RANK -- 36 fails 'Error configuring interconnect' in 3 s), mem=227120M, billing still 2000/hr"
 echo "[batch]    cb=$CB x accum=$ACC x world=$WORLD = $((CB*ACC*WORLD)) contacts/opt-step"
 echo "[epoch]    cps=$CPS -> ipe=$IPE. Ladder every 1000 = EVERY rung is an epoch boundary, so a wall-clock resume draws fresh packs."
 echo "[schedule] ONE JOB: warmup 5000 -> CONSTANT 6e-3 to 50000 -> LINEAR 6e-3->0 over 50000..55000 (--min-lr-ratio 0.0)"
 echo "[sampler]  --shaft-alpha 0.0: uniform on the SUBJECT axis, 1/7 each BY CONSTRUCTION (census-independent)"
-echo "[matched]  sf50 per_band_space=ON widths=1,1,1 lr=6e-3 wd=0.04 clip=3.0 beta2=0.95 seed=33 [FILE-ONLY scp deploy]"
+echo "[matched]  sf00 time=0.75 w$BW unit=contact lr=6e-3 wd=0.04 clip=3.0 beta2=0.95 seed=33 [FILE-ONLY scp deploy]"
+echo "[A1 null]  R42 predicts a SMALL effect: population copy-R2 of a masked token from its two"
+echo "[A1 null]  actual nearest visible neighbours is .1031 at w1 vs .0741 at w4 (loss-weighted,"
+echo "[A1 null]  SLOW/MID/HGA = .739/.117/.0169 vs .628/.0605/.0116). At 75% the RATE already makes"
+echo "[A1 null]  runs of 1/(1-p)=4, so realized HGA runs are 3.8 tokens at w1 vs 8.1 at w4."
+echo "[A1 null]  A NULL IS THE INFORMATIVE OUTCOME: it removes the last hand-set structural knob."
 echo "[wall]     55000 steps. 1-GPU rate is 4.005 s/step (61.2 h); this needs >=1.5x to fit 47 h. SCALING IS MODELLED, NOT PROFILED."
 echo "[read]     what ships is the 55000 COOLED ckpt. 🚫 never board a rung below 55000."
 
@@ -247,8 +285,9 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --accelerator gpu --devices $WORLD --precision bf16-mixed \
   --clips-per-session $CPS \
   --num-workers $NW --monitor-every-n-steps 10 --log-every-n-steps 10 \
-  --mask-space-frac 0.50 --per-band-space --space-block-w-bands 1,1,1 \
-  --band-time-unit shaft \
+  --mask-space-frac 0.0 --per-band-space --space-block-w-bands 1,1,1 \
+  --mask-time-frac 0.75 --band-block-w $BW \
+  --band-time-unit contact \
   $ABL \
   --compile \
   --wandb-project intuition --run-name $RUN_NAME \

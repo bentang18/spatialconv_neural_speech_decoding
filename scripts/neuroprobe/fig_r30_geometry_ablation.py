@@ -20,6 +20,10 @@ Null: Wilcoxon signed-rank on the per-cell mean gain against zero, 12 cells in w
 10 in cs.  n=10 puts the smallest attainable p at ~2e-3, so an unstarred bar is "does not clear
 its null at this n", not "is zero".
 """
+import argparse
+import glob
+import json
+import os
 import pathlib
 import numpy as np
 import pandas as pd
@@ -48,11 +52,52 @@ REGIMES = (("ws", "enc0_elec", "enc12_elec", "Within session"),
            ("csession", "enc0_elec", "enc12_elec", "Cross session\nnew session, same patient"),
            ("cs", "enc0", "enc12", "Cross subject\nnew patient, zero labels"))
 
+# ViT-Small / cd55k. Same four arms, read straight from the shard directories rather than the
+# r6-era ledger, which is a d=256 artifact and is not extended.
+ARMS_VITS384 = (
+    ("baseline", "both priors", ["results/board/shards_board_vits384_cd55k"]),
+    ("nosrope", "no shaft RoPE", ["results/board/shards_board_vits384_nosrope_cd55k"]),
+    ("noparcel", "no parcel embed", ["results/board/shards_board_vits384_noparcel_cd55k"]),
+    ("both_off", "neither", ["results/board/shards_board_vits384_noparcel_nosrope_cd55k"]),
+)
+WANT_CELLS = {"ws": 12, "csession": 12, "cs": 10}
+
 OURS, ABLATED, FLOOR_RED, INK = "#1f4e79", "#9aa7b4", "#c1440e", "#333333"
 
 
 def load():
     L = pd.read_csv(LEDGER)
+    return L[(L.norm == "std") & (L.decoder == "ridge") & (L.split == "test")]
+
+
+def load_shards(arms):
+    """Ledger-shaped frame built straight from the shard JSONs.
+
+    Same columns the ledger path produces, so `series`/`collect` below are untouched. The arm tag
+    inside each cell key is checked against the directory it came from: arm mixing is the failure
+    mode this whole pipeline is most exposed to, and a shard that wandered into the wrong directory
+    would otherwise be silently averaged in.
+    """
+    rows = []
+    for _arm, _label, dirs in arms:
+        for d in dirs:
+            want_tag = os.path.basename(d).replace("shards_", "")
+            for regime in WANT_CELLS:
+                paths = sorted(glob.glob(f"{d}/{regime}_*.json"))
+                assert len(paths) == WANT_CELLS[regime], (
+                    f"{d}/{regime}: {len(paths)} cells, want {WANT_CELLS[regime]} — "
+                    "a partial grid is a different experiment wearing the same name")
+                for p in paths:
+                    cell = os.path.basename(p).split("_", 1)[1].rsplit(".", 1)[0]
+                    for key, blk in json.load(open(p))["cells"].items():
+                        tag, task = key.split("|", 1)
+                        assert tag == want_tag, f"ARM MIXING: {p} carries tag {tag}, want {want_tag}"
+                        for tapnorm, v in blk["cells"].items():
+                            tap, norm = tapnorm.split("|")
+                            rows.append(dict(artifact=d, regime=regime, tap=tap, norm=norm,
+                                             decoder="ridge", split="test", cell=cell,
+                                             task=task, value=v["test"]))
+    L = pd.DataFrame(rows)
     return L[(L.norm == "std") & (L.decoder == "ridge") & (L.split == "test")]
 
 
@@ -65,11 +110,11 @@ def series(L, artifacts, regime, tap):
     return s
 
 
-def collect(L):
+def collect(L, arms=ARMS):
     rows = []
     for regime, t0, t12, _ in REGIMES:
-        floor = series(L, ARMS[0][2], regime, t0)
-        for arm, label, artifacts in ARMS:
+        floor = series(L, arms[0][2], regime, t0)
+        for arm, label, artifacts in arms:
             own = series(L, artifacts, regime, t0)
             if own is None:
                 drift = None                      # noparcel ws/csession carry no enc0 shard
@@ -90,13 +135,13 @@ def collect(L):
     return pd.DataFrame(rows)
 
 
-def render(R):
+def render(R, arms=ARMS, stem="fig_r30_geometry_ablation", ckpt="45k board checkpoint"):
     OUT.mkdir(parents=True, exist_ok=True)
     lo, hi = R.gain.min(), R.gain.max()
     pad = (hi - lo) * .30
     fig, axes = plt.subplots(1, 3, figsize=(9.4, 3.9), sharey=True)
     for ax, (regime, _, _, title) in zip(axes, REGIMES):
-        d = R[R.regime == regime].set_index("arm").loc[[a for a, _, _ in ARMS]]
+        d = R[R.regime == regime].set_index("arm").loc[[a for a, _, _ in arms]]
         x = np.arange(len(d))
         ax.bar(x, d.gain, .66, zorder=3,
                color=[OURS] + [ABLATED] * 3,
@@ -125,18 +170,27 @@ def render(R):
     axes[0].text(-.36, 0, "floor", transform=axes[0].get_yaxis_transform(),
                  ha="right", va="center", fontsize=8.6, color=FLOOR_RED, fontweight="bold")
     fig.text(.5, -.055,
-             "45k board checkpoint  ·  15 Neuroprobe Lite tasks  ·  frozen encoder, ridge readout  ·  "
+             f"{ckpt}  ·  15 Neuroprobe Lite tasks  ·  frozen encoder, ridge readout  ·  "
              "recomputed from shards  ·  n.s. = does not clear Wilcoxon signed-rank over cells at p<.05",
              ha="center", fontsize=7.6, color="#666")
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(OUT / f"fig_r30_geometry_ablation.{ext}", bbox_inches="tight", dpi=180)
+        fig.savefig(OUT / f"{stem}.{ext}", bbox_inches="tight", dpi=180)
     plt.close(fig)
 
 
 def main():
-    R = collect(load())
-    render(R)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--vits384", action="store_true",
+                    help="read the ViT-Small cd55k shards instead of the d=256 r6-era ledger")
+    args = ap.parse_args()
+    if args.vits384:
+        arms, stem, ckpt = ARMS_VITS384, "fig_r30_geometry_ablation_vits384_cd55k", "ViT-Small, cd55k"
+        R = collect(load_shards(arms), arms)
+    else:
+        arms, stem, ckpt = ARMS, "fig_r30_geometry_ablation", "45k board checkpoint"
+        R = collect(load(), arms)
+    render(R, arms, stem, ckpt)
     pd.set_option("display.width", 200)
     print(R.to_string(index=False,
                       formatters={"enc0": "{:.4f}".format, "enc12": "{:.4f}".format,
@@ -145,7 +199,7 @@ def main():
     for regime, _, _, _ in REGIMES:
         g = R[R.regime == regime].set_index("arm").gain
         print(f"  {regime:<9}{g['baseline'] + g['both_off'] - g['nosrope'] - g['noparcel']:+.4f}")
-    print(f"\nwrote {OUT}/fig_r30_geometry_ablation.{{png,pdf}}")
+    print(f"\nwrote {OUT}/{stem}.{{png,pdf}}")
 
 
 if __name__ == "__main__":

@@ -64,8 +64,8 @@ TREE=/projects/bhqk/htang13/speech_board
 export PYTHONPATH="$TREE:$TREE/src:${PYTHONPATH:-}"
 cd "$TREE"
 
-CACHE=/projects/bhqk/htang13/v3_board_cache_board_pbs50_cd45k
-TAG=pbs50_cd45k
+CACHE=${CACHE:-/projects/bhqk/htang13/v3_board_cache_board_pbs50_cd45k}
+TAG=${TAG:-pbs50_cd45k}
 # SEPARATE shard dir from the WS curve. The merge globs by prefix and asserts on the shard's own
 # `regime` field, so co-locating them would be safe — but a separate dir means a stray re-run of the
 # WS launcher cannot touch this run's inputs at all, which is cheaper than being clever.

@@ -467,3 +467,269 @@ def test_no_time_mask_and_no_space_mask_mask_the_same_fraction() -> None:
     assert f_locked > 0.70, f_locked
     print(f"[check] OK masked fraction — no-time {f_no_time:.4f}, pbs00 {f_pbs00:.4f} "
           f"(matched pair), locked space.50xtime.50 {f_locked:.4f}")
+
+
+def test_shaft_budget_total_is_identical_to_the_per_contact_draw() -> None:
+    # THE SHAPE CLAIM (Ben 2026-08-15). shaft_budget frees the per-CONTACT count but must leave the
+    # per-SHAFT total byte-identical to the per-contact draw, because that total (n_s·cnt) is what
+    # every downstream m_vis / cu_seqlens / compiled shape is derived from. If this ever fails, the
+    # arm is not a masking ablation, it is a silent shape change.
+    sc, geom = _session([3, 6, 8, 5])
+    n = int(geom.valid.sum())
+    cfg_c = V3MaskConfig(band_time_unit="contact", hga_mask_frac=0.75,
+                         mid_mask_frac=0.75, slow_mask_frac=0.75)
+    cfg_b = V3MaskConfig(band_time_unit="shaft_budget", hga_mask_frac=0.75,
+                         mid_mask_frac=0.75, slow_mask_frac=0.75)
+    mc = sample_masks_r6(geom, n, n_time=32, n_rows=8, generator=_gen(11), cfg=cfg_c)
+    mb = sample_masks_r6(geom, n, n_time=32, n_rows=8, generator=_gen(11), cfg=cfg_b)
+
+    for name, tc, tb in (("hga", mc.hga_mask, mb.hga_mask),
+                         ("mid", mc.mid_mask, mb.mid_mask),
+                         ("slow", mc.slow_mask, mb.slow_mask)):
+        assert tc.shape == tb.shape, (name, tc.shape, tb.shape)
+        for s in range(geom.n_shafts):
+            idx = [i for i in range(n) if int(geom.shaft_of_contact[i]) == s]
+            got = tb[:, idx].sum(dim=(1, 2))
+            want = tc[:, idx].sum(dim=(1, 2))
+            assert torch.equal(got, want), (name, s, got.tolist(), want.tolist())
+    print("[check] OK shaft_budget per-SHAFT total == per-contact total, all 3 bands, every shaft")
+
+
+def test_shaft_budget_frees_the_per_contact_fraction() -> None:
+    # THE POINT OF THE ARM. Under 'contact' every contact is snapped to exactly round(frac·L), so
+    # every sensor keeps exactly (1−frac) of its frames and none is ever close to fully hidden —
+    # which is the regime the SPACE tier exists to create. Under 'shaft_budget' the per-contact
+    # fraction must actually SPREAD, otherwise the arm cannot subsume the space tier and running it
+    # with space_frac=0 would test nothing.
+    sc, geom = _session([8, 8, 8])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(band_time_unit="shaft_budget", space_frac=0.0,
+                       hga_mask_frac=0.75, mid_mask_frac=0.75, slow_mask_frac=0.75)
+    m = sample_masks_r6(geom, n, n_time=64, n_rows=32, generator=_gen(12), cfg=cfg)
+
+    per_contact = m.hga_mask.float().mean(-1)  # (R, N) masked fraction per (row, contact)
+    lo, hi = float(per_contact.min()), float(per_contact.max())
+    assert per_contact.std() > 0.02, f"per-contact fraction did not spread (std {per_contact.std():.4f})"
+    assert hi > 0.85, f"no contact was heavily masked (max {hi:.3f}) — space tier has nothing to do"
+    assert lo < 0.65, f"no contact was lightly masked (min {lo:.3f})"
+    # and the per-contact draw is the flat control: exactly one value, no spread at all.
+    cfg_c = V3MaskConfig(band_time_unit="contact", space_frac=0.0, hga_mask_frac=0.75,
+                         mid_mask_frac=0.75, slow_mask_frac=0.75)
+    flat = sample_masks_r6(geom, n, n_time=64, n_rows=32, generator=_gen(12),
+                           cfg=cfg_c).hga_mask.float().mean(-1)
+    assert float(flat.std()) == 0.0, f"per-contact draw should be flat, std {float(flat.std())}"
+    print(f"[check] OK shaft_budget per-contact masked fraction spreads {lo:.3f}..{hi:.3f} "
+          f"(std {float(per_contact.std()):.4f}); 'contact' is flat at {float(flat[0, 0]):.3f}")
+
+
+def test_shaft_budget_is_not_a_tube_and_shafts_stay_independent() -> None:
+    # shaft_budget shares a BUDGET within a shaft, never a MASK. Contacts of a shaft must still
+    # differ (else it collapsed into the 08-14 tube), and shafts must not be drawn together.
+    sc, geom = _session([5, 5, 5])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(band_time_unit="shaft_budget", hga_mask_frac=0.75,
+                       mid_mask_frac=0.75, slow_mask_frac=0.75)
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=4, generator=_gen(13), cfg=cfg)
+    same = [i for i in range(n) if int(geom.shaft_of_contact[i]) == 1]
+    assert any(
+        not torch.equal(m.hga_mask[r, i], m.hga_mask[r, j])
+        for r in range(m.hga_mask.shape[0])
+        for a, i in enumerate(same)
+        for j in same[a + 1:]
+    ), "shaft_budget collapsed into the shaft tube — contacts share a mask"
+    heads = [
+        next(i for i in range(n) if int(geom.shaft_of_contact[i]) == s)
+        for s in range(geom.n_shafts)
+    ]
+    assert any(
+        not torch.equal(m.hga_mask[r, a], m.hga_mask[r, b])
+        for r in range(m.hga_mask.shape[0])
+        for k, a in enumerate(heads)
+        for b in heads[k + 1:]
+    ), "shafts are not independent under shaft_budget"
+    print("[check] OK shaft_budget shares a BUDGET within a shaft, not a mask; shafts independent")
+
+
+def test_unknown_band_time_unit_is_a_hard_error() -> None:
+    # The whole band_time_unit family is a NO-TRACE flag: nothing lands in the state_dict, so a
+    # typo used to fall through to the per-contact draw and run the wrong arm with no error.
+    sc, geom = _session([3, 4])
+    n = int(geom.valid.sum())
+    cfg = V3MaskConfig(band_time_unit="shaftbudget")  # missing underscore
+    try:
+        sample_masks_r6(geom, n, n_time=32, n_rows=2, generator=_gen(14), cfg=cfg)
+    except ValueError as e:
+        assert "shaft_budget" in str(e)
+        print("[check] OK unknown band_time_unit raises instead of silently running 'contact'")
+        return
+    raise AssertionError("unknown band_time_unit did not raise")
+
+
+# ── mask_iid (Ben 2026-08-15): no tiers, ONE global permutation over the whole token grid ──
+
+
+def _iid_cfg(frac: float = 0.75) -> V3MaskConfig:
+    return V3MaskConfig(mask_iid=True, iid_mask_frac=frac, space_frac=0.0, whole_shaft_frac=0.0)
+
+
+def test_iid_masks_exactly_frac_of_the_WHOLE_grid_per_row() -> None:
+    # THE invariant. M_vis is a compile-time constant for the encoder's visible-token gather
+    # (objective.py:190), so the GLOBAL count per row must be exact even though every per-contact
+    # and per-band count is free. A Bernoulli draw would pass the marginal and fail this.
+    # Since the draw became per-attention-unit (Ben 2026-08-16) the global count is the SUM of the
+    # per-unit rounds, which need not equal round(frac·total): at frac=.90 on this montage it is
+    # 514 against 515. Constancy is the requirement, not that particular arithmetic, so assert the
+    # requirement -- and separately that the realised rate still tracks frac to within a token per
+    # unit, so a rounding drift can never quietly become a rate mismatch against the two-tier arms.
+    sc, geom = _session([4, 4, 3])
+    n = int(geom.valid.sum())
+    t = 32
+    total = n * (t + t // 2 + t // 8)  # HGA 32 + MID 16 + SLOW 4 per contact
+    grid = build_r4_grid(geom, n_time=t)
+    n_unit = int(grid.cu_seqlens.numel() - 1)
+    cells = torch.bincount(grid.shaft, minlength=n_unit)
+    for frac in (0.75, 0.50, 0.90):
+        m = sample_masks_r6(geom, n, n_time=t, n_rows=7, generator=_gen(1), cfg=_iid_cfg(frac))
+        per_row = (
+            m.hga_mask.flatten(1).sum(1) + m.mid_mask.flatten(1).sum(1)
+            + m.slow_mask.flatten(1).sum(1)
+        )
+        want = int(torch.round(frac * cells.float()).long().sum())
+        assert per_row.tolist() == [want] * 7, f"frac={frac}: {per_row.tolist()} != {want}"
+        assert abs(want - round(frac * total)) <= n_unit, \
+            f"frac={frac}: per-unit rounding drifted {want} vs {round(frac * total)} over {n_unit} units"
+        print(f"[check] OK iid frac={frac}: exactly {want}/{total} masked in EVERY row "
+              f"(sum of {n_unit} per-unit rounds; round(frac*total)={round(frac * total)})")
+
+
+def test_iid_leaves_contact_mask_empty_so_the_space_tier_is_truly_off() -> None:
+    # The mask is a space (x) time outer product downstream (token_flags_r6). The i.i.d. arm carries
+    # its whole pattern in the three band tensors, so contact_mask must contribute NOTHING — if it
+    # did, the realised rate would exceed iid_mask_frac.
+    sc, geom = _session([4, 4])
+    n = int(geom.valid.sum())
+    m = sample_masks_r6(geom, n, n_time=32, n_rows=5, generator=_gen(2), cfg=_iid_cfg())
+    assert m.contact_mask.shape == (5, n, 3)
+    assert not bool(m.contact_mask.any()), "contact_mask must be all-False under mask_iid"
+
+    grid = build_r4_grid(geom, n_time=32)
+    masked, in_loss = token_flags_r6(grid, m)
+    frac = masked.float().mean(1)
+    assert torch.allclose(frac, torch.full_like(frac, 0.75), atol=1.0 / grid.total), \
+        f"realised token-grid rate {frac.tolist()} != 0.75"
+    assert bool((masked == in_loss).all()), "r6 scores every masked token (no margin gate)"
+    print(f"[check] OK contact_mask empty; realised grid rate {float(frac.mean()):.4f} == 0.75")
+
+
+def test_iid_frees_the_per_contact_band_fraction_that_the_per_contact_draw_snaps() -> None:
+    # This is the ONLY thing that separates the i.i.d. arm from the sf0/w1 arm. The per-contact draw
+    # snaps every (contact, band) to exactly round(frac*length); i.i.d. must NOT. The freedom is
+    # largest on the shortest grid (SLOW = 8 tokens at 2 s), which is where a contact can go fully
+    # masked -- impossible under the snapped draw.
+    sc, geom = _session([5, 5, 5, 5])
+    n = int(geom.valid.sum())
+    t = 64  # 2 s at 32 Hz => SLOW 8, MID 32, HGA 64
+    m = sample_masks_r6(geom, n, n_time=t, n_rows=64, generator=_gen(3), cfg=_iid_cfg())
+    snapped = sample_masks_r6(
+        geom, n, n_time=t, n_rows=64, generator=_gen(3),
+        cfg=V3MaskConfig(space_frac=0.0, whole_shaft_frac=0.0, block_w_band=1,
+                         band_time_unit="contact", hga_mask_frac=0.75,
+                         mid_mask_frac=0.75, slow_mask_frac=0.75),
+    )
+    for name, iid_b, snap_b, length in (
+        ("SLOW", m.slow_mask, snapped.slow_mask, t // 8),
+        ("MID", m.mid_mask, snapped.mid_mask, t // 2),
+        ("HGA", m.hga_mask, snapped.hga_mask, t),
+    ):
+        snap_frac = snap_b.float().mean(-1)
+        assert snap_frac.unique().numel() == 1, f"{name}: per-contact draw is not snapped"
+        iid_frac = iid_b.float().mean(-1)
+        assert iid_frac.unique().numel() > 1, f"{name}: iid per-contact fraction is not free"
+        full = float((iid_frac == 1.0).float().mean())
+        print(f"[check] OK {name} (len {length}): snapped sd {float(snap_frac.std()):.5f} -> "
+              f"iid sd {float(iid_frac.std()):.5f}, fully-masked cells {100 * full:.1f}%")
+    slow_full = float((m.slow_mask.float().mean(-1) == 1.0).float().mean())
+    assert slow_full > 0.0, "SLOW should sometimes go fully masked under iid (p ~ .75**8 = .10)"
+
+
+def test_iid_raises_rather_than_silently_composing_with_a_space_tier() -> None:
+    # The two tiers compose multiplicatively. A leftover space_frac would push the realised rate
+    # past iid_mask_frac and silently break the rate match against every two-tier arm, with nothing
+    # in the state_dict to catch it later -- the no-trace-flag failure mode.
+    sc, geom = _session([4, 4])
+    n = int(geom.valid.sum())
+    for bad in (V3MaskConfig(mask_iid=True, space_frac=0.50, whole_shaft_frac=0.0),
+                V3MaskConfig(mask_iid=True, space_frac=0.0, whole_shaft_frac=0.25)):
+        try:
+            sample_masks_r6(geom, n, n_time=32, n_rows=3, generator=_gen(), cfg=bad)
+        except ValueError as e:
+            assert "mask_iid" in str(e)
+        else:
+            raise AssertionError(f"expected ValueError for {bad}")
+    print("[check] OK mask_iid + a live space tier raises instead of composing")
+
+
+def _per_unit_visible(grid, masks) -> "torch.Tensor":
+    """(R, S) visible-token count per attention unit — exactly what build_visible_pack segments on."""
+    masked, _ = token_flags_r6(grid, masks)
+    n_unit = int(grid.cu_seqlens.numel() - 1)
+    out = torch.zeros(masked.shape[0], n_unit, dtype=torch.long)
+    out.scatter_add_(1, grid.shaft[None, :].expand(masked.shape[0], -1), (~masked).long())
+    return out
+
+
+def test_every_arm_holds_the_per_unit_visible_count_that_the_pack_copies_from_clip_0() -> None:
+    # 🔴 THE INVARIANT THAT KILLED JOB 2955569. build_visible_pack takes the per-unit visible counts
+    # from CLIP 0 and applies them to the entire batch (pack_r4.py:212), because
+    # towers.forward_flat_pack documents cu_seqlens as "clip-shared (per-shaft visible count is a
+    # per-session constant)". Nothing enforced it. A global-permutation mask holds M_vis per clip --
+    # so it compiles, launches, and trains -- while breaking this one, which mis-groups attention on
+    # most clips and finally runs the varlen kernel off the end of a block: all 247 tensors NaN.
+    # Every arm we can run must satisfy this, so assert it for ALL of them, not just the i.i.d. one.
+    sc, geom = _session([10, 12, 8, 14, 10, 12])
+    n = int(geom.valid.sum())
+    t = 32
+    grid = build_r4_grid(geom, n_time=t)
+    arms = {
+        "two-tier sf0 t.75 w1 unit=contact": V3MaskConfig(
+            space_frac=0.0, whole_shaft_frac=0.0, block_w_band=1, band_time_unit="contact",
+            hga_mask_frac=0.75, mid_mask_frac=0.75, slow_mask_frac=0.75),
+        "two-tier sf0 t.75 w1 unit=shaft": V3MaskConfig(
+            space_frac=0.0, whole_shaft_frac=0.0, block_w_band=1, band_time_unit="shaft",
+            hga_mask_frac=0.75, mid_mask_frac=0.75, slow_mask_frac=0.75),
+        "two-tier sf.50 t.50 w4 (canon)": V3MaskConfig(
+            space_frac=0.50, whole_shaft_frac=0.0, block_w_band=4, band_time_unit="shaft"),
+        "iid per-attention-unit": _iid_cfg(0.75),
+    }
+    for name, cfg in arms.items():
+        m = sample_masks_r6(geom, n, n_time=t, n_rows=64, generator=_gen(33), cfg=cfg)
+        per_unit = _per_unit_visible(grid, m)
+        assert bool((per_unit == per_unit[0][None, :]).all()), (
+            f"{name}: per-unit visible count VARIES across clips, so build_visible_pack would "
+            f"segment every clip with clip 0's boundaries. clip0={per_unit[0].tolist()} "
+            f"worst={per_unit[(per_unit - per_unit[0]).abs().sum(1).argmax()].tolist()}"
+        )
+        m_vis = (~token_flags_r6(grid, m)[0]).sum(1)
+        assert int(m_vis.min()) == int(m_vis.max()), f"{name}: M_vis varies across clips"
+        print(f"[check] OK {name}: per-unit counts constant, max_seqlen "
+              f"{int(per_unit[0].max())}, M_vis {int(m_vis[0])}")
+
+
+def test_iid_masks_exactly_the_frac_within_every_attention_unit() -> None:
+    # The positive statement of the rule (Ben 2026-08-16): "drop 75% random per sensor unit --
+    # whether that is shaft rn, or ECoG in the future -- per full joint attention unit."
+    sc, geom = _session([10, 12, 8, 14])
+    n = int(geom.valid.sum())
+    t = 32
+    grid = build_r4_grid(geom, n_time=t)
+    for frac in (0.75, 0.50):
+        m = sample_masks_r6(geom, n, n_time=t, n_rows=32, generator=_gen(7), cfg=_iid_cfg(frac))
+        masked, _ = token_flags_r6(grid, m)
+        n_unit = int(grid.cu_seqlens.numel() - 1)
+        got = torch.zeros(masked.shape[0], n_unit, dtype=torch.long)
+        got.scatter_add_(1, grid.shaft[None, :].expand(masked.shape[0], -1), masked.long())
+        cells = torch.bincount(grid.shaft, minlength=n_unit)
+        want = torch.round(frac * cells.float()).long()
+        assert bool((got == want[None, :]).all()), \
+            f"frac={frac}: per-unit masked counts {got[0].tolist()} != {want.tolist()}"
+        print(f"[check] OK frac={frac}: EXACTLY {want.tolist()} masked per attention unit, every clip")

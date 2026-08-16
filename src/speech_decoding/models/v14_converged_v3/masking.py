@@ -96,7 +96,26 @@ class V3MaskConfig:
     # reversed. "contact" = the 07-23 r6 behaviour, each contact drawing its own blocks; kept ONLY
     # so the pre-2026-08-14 checkpoints stay reproducible. The DEFAULT is the new contract on
     # purpose: a forgotten flag must not silently run the shortcut arm.
+    # "shaft_budget" (Ben 2026-08-15) = blocks drawn per contact as in "contact", but the KEEP
+    # BUDGET is spent per SHAFT: contacts of a shaft compete for one pool, so their individual
+    # masked fractions are FREE (one contact can land near 90% and another near 15%) while the
+    # shaft total stays exact. This is the arm that can subsume the space tier — under "contact"
+    # every contact keeps exactly (1−frac) of its frames in every band, so no sensor is ever close
+    # to fully hidden and space masking has nothing left to do.
     band_time_unit: str = "shaft"
+    # r6 ONLY (Ben 2026-08-16). True = drop the factorized space⊗time mask entirely and draw
+    # uniformly over EVERY (contact, band, token) cell, masking exactly round(iid_mask_frac·cells)
+    # PER JOINT-ATTENTION UNIT — "drop 75% random per sensor unit, whether that is shaft rn, or
+    # ECoG in the future, per full joint attention unit" (Ben). space_frac, block_w_band and
+    # band_time_unit are all UNREAD in this mode, so the sampler raises rather than silently
+    # ignoring a nonzero space tier. This is the arm with no structural prior: which contacts,
+    # which bands, which timepoints and the per-(contact, band) split are ALL free.
+    # 🔴 THE COUNT IS PER UNIT, NOT GLOBAL. A global permutation NaN'd at step 3079 (job 2955569):
+    # it holds M_vis per clip but NOT the per-unit cu_seqlens that build_visible_pack copies from
+    # clip 0 (pack_r4.py:212). See _sample_global_iid_band_time for the measurement and the proof
+    # that pinning per unit costs nothing on the axis this arm exists to free.
+    mask_iid: bool = False
+    iid_mask_frac: float = 0.75  # rate-matched to every two-tier arm ((1−.50)(1−.50) = .25 visible).
     temporal_mask_frac: float = 0.50  # r5 ONLY: single early-fused 32 Hz grid masked (T7-tunable).
     # r5 temporal block width (tokens) on the 32 Hz grid. 5 tokens = 156 ms FLOOR; overlap
     # (_cover_rank) lifts the mean masked run to ~190 ms (Ben 2026-07-22, τ-anchored not speech-
@@ -528,6 +547,137 @@ def _sample_pershaft_band_time(
     return shaft_mask[:, geom.shaft_of_contact]  # (R, N, length), contacts share their shaft
 
 
+def _sample_shaftbudget_band_time(
+    geom: L1Geometry,
+    n_contacts: int,
+    length: int,
+    *,
+    frac: float,
+    block_w: int,
+    n_rows: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """One band time mask whose keep budget is spent PER SHAFT, not per contact.
+
+    Blocks are drawn per contact exactly as in :func:`_sample_persensor_band_time` (width
+    ``block_w``, overlaps allowed), but the lowest-rank positions are taken over a shaft's WHOLE
+    ``(n_s, length)`` grid instead of each contact's own row. Contacts of a shaft therefore compete
+    for one pool and their individual masked fractions are free; only the shaft total is fixed.
+
+    WHY (Ben 2026-08-15): the per-contact draw snaps every contact to exactly ``round(frac·length)``
+    masked, so every sensor keeps exactly ``(1−frac)`` of its frames in every band. No contact is
+    ever close to fully hidden, which is the regime the SPACE tier exists to create — so an arm with
+    ``space_frac=0`` and a per-contact time draw does not actually test whether the space tier is
+    load-bearing. Spending the budget per shaft lets some contacts land near-fully masked, forcing
+    L1 to infer them from same-shaft neighbours, which is the space tier's job.
+
+    STATIC SHAPES: the per-shaft total is ``n_s · round(frac·length)``, IDENTICAL BY CONSTRUCTION to
+    what the per-contact draw produces for the same shaft (masking.py §TIME: "each shaft still masks
+    n_s·cnt band-b tokens"). Only the distribution across a shaft's contacts differs, so every
+    downstream count and compiled shape is unchanged. The count is written as ``cs · cnt`` rather
+    than ``round(frac·n_s·length)`` deliberately: the two agree at our fracs and lengths but not for
+    every (frac, length), and matching the per-contact total exactly is what makes the shape claim
+    hold for ANY config, not just the ones we happen to run.
+
+    Ties are broken by additive uniform noise, as in ``draw_space``. Cover ranks are per-contact
+    integers drawn from the same distribution in every row, so a plain ``argsort`` over the shaft
+    grid would break the many exact ties by slot index and mask low-index contacts preferentially.
+    """
+    valid = geom.valid  # (S, C)
+    s, c = geom.n_shafts, geom.max_c
+    cs = valid.sum(1)  # (S,) contacts per shaft
+    cnt = round(frac * length)  # per-contact count the per-sensor draw would have used
+
+    ones = torch.ones(n_contacts, length, dtype=torch.bool, device=device)
+    cover = _cover_rank(ones, block_w, n_rows, generator)  # (R, N, length)
+
+    vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,) slot index in the padded (S,C) grid
+    vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,) contact index at that slot
+
+    # Scatter each contact's cover ranks into its padded shaft slot; pad slots stay +inf so they
+    # sort last and can never be selected (cs·cnt <= cs·length = the valid count).
+    grid = torch.full((n_rows, s * c, length), float("inf"), device=device)
+    grid[:, vpos] = cover[:, vcontact]
+    key = grid.reshape(n_rows, s, c * length) + torch.rand(
+        n_rows, s, c * length, generator=generator, device=device
+    )
+    within_rank = key.argsort(-1).argsort(-1)  # (R, S, C*L) rank over the WHOLE shaft grid
+    grid_mask = within_rank < (cs * cnt)[None, :, None]  # exactly cs·cnt per (row, shaft)
+
+    out = torch.zeros(n_rows, n_contacts, length, dtype=torch.bool, device=device)
+    out[:, vcontact] = grid_mask.reshape(n_rows, s * c, length)[:, vpos]
+    return out
+
+
+def _sample_global_iid_band_time(
+    n_units: int,
+    lengths: tuple[int, int, int],
+    *,
+    frac: float,
+    n_rows: int,
+    unit_of_contact: Tensor,
+    generator: torch.Generator,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Uniform draw over every (contact, band, token) cell, exactly ``round(frac·cells)`` masked
+    PER JOINT-ATTENTION UNIT (Ben 2026-08-16: "drop 75% random per sensor unit -- whether that is
+    shaft rn, or ECoG in the future -- per full joint attention unit").
+
+    The MAE recipe (argsort uniform noise, take the first ``frac``) applied to the r6 token grid,
+    with the count pinned per attention unit and EVERYTHING else free: which contacts, which bands,
+    which timepoints, and the per-(contact, band) split are all unconstrained.
+
+    🔴 WHY THE COUNT IS PINNED PER UNIT AND NOT GLOBALLY. A global permutation was tried first
+    (job 2955569) and produced NaN weights at step 3079 after a pristine run-up. Two shape
+    contracts sit downstream, at different granularities, and a global count satisfies only the
+    coarser one:
+      1. ``M_vis`` per clip -- the encoder gathers visible tokens into a fixed ``(B, M_vis, d)``
+         buffer (objective.py:190), so the count per CLIP must be constant. A global permutation
+         satisfies this, which is why the arm launched and trained for 3078 steps.
+      2. ``cu_seqlens`` per (clip, unit) -- ``build_visible_pack`` takes the per-unit visible
+         counts from CLIP 0 and applies them to the whole batch (pack_r4.py:212), because
+         ``towers.forward_flat_pack`` documents them as "clip-shared (per-shaft visible count is a
+         per-session constant)". A global permutation does NOT satisfy this: measured over 256
+         clips it broke the invariant in 235 of them, and understated ``max_seqlen`` as 169 against
+         a true 210, so the varlen kernel eventually ran off the end of a block.
+    Every two-tier arm satisfies (2) for free, because an exact ``round(frac·length)`` per contact
+    per band forces every clip to the same per-unit total. Pinning the count per unit restores it
+    directly, and ``cu_seqlens`` segments the sequence by exactly this unit -- so "exact count per
+    attention unit" IS the packing contract, stated positively. Any future geometry whose attention
+    unit is not a shaft (an ECoG grid) gets the correct rule with no change here.
+
+    This costs nothing measurable on the axis the arm exists to free. On one montage at 0.75 over
+    256 clips, per-(contact, band) masked-fraction sd, global draw vs this one: SLOW .2179 vs
+    .2181, MID .1076 vs .1063, HGA .0766 vs .0744; fully-SLOW-masked contacts 31.4% vs 31.7%. The
+    per-contact draw snaps ALL of those to exactly 0.
+
+    ``unit_of_contact`` is ``(N,)``, each contact's attention-unit index. Returns (slow, mid, hga)
+    -- band order matching ``R4Grid.band`` and the ``V3MasksR6`` fields.
+    """
+    total = n_units * sum(lengths)
+    # Per-cell unit id, in the SAME flat layout the band split below undoes: each band segment is
+    # (n_units, length) row-major = contact-major, so a contact's `length` cells are contiguous.
+    unit_of_cell = torch.cat([unit_of_contact.repeat_interleave(length) for length in lengths])
+    n_unit = int(unit_of_contact.max()) + 1
+    cells = torch.bincount(unit_of_cell, minlength=n_unit)  # (U,) cells per attention unit
+    cnt = torch.round(frac * cells.float()).long()  # (U,) exact masked count per unit
+    start = torch.cat([torch.zeros(1, dtype=torch.long, device=device), cells.cumsum(0)[:-1]])
+    # Offsetting the key by the unit id makes the sort group by unit and order by key WITHIN unit,
+    # so unit u occupies sorted positions [start[u], start[u]+cells[u]) and the global rank minus
+    # start[u] IS the rank within the unit. One argsort pair, no python loop over units.
+    key = torch.rand(n_rows, total, generator=generator, device=device)
+    key = key + unit_of_cell[None, :].to(key.dtype) * 2.0
+    rank = key.argsort(-1).argsort(-1) - start[unit_of_cell][None, :]
+    flat = rank < cnt[unit_of_cell][None, :]  # (R, total) exactly cnt[u] per (row, unit)
+    out, off = [], 0
+    for length in lengths:
+        seg = n_units * length
+        out.append(flat[:, off:off + seg].reshape(n_rows, n_units, length))
+        off += seg
+    return out[0], out[1], out[2]
+
+
 def sample_masks_r6(
     geom: L1Geometry,
     n_contacts: int,
@@ -560,6 +710,35 @@ def sample_masks_r6(
 
     def rand(*shape: int) -> Tensor:
         return torch.rand(*shape, generator=generator, device=dev)
+
+    # ── i.i.d. arm: no tiers, exact count per JOINT-ATTENTION UNIT (Ben 2026-08-16) ──
+    if cfg.mask_iid:
+        if cfg.space_frac != 0.0 or cfg.whole_shaft_frac != 0.0:
+            raise ValueError(
+                f"mask_iid=True with space_frac={cfg.space_frac}, whole_shaft_frac="
+                f"{cfg.whole_shaft_frac} — the i.i.d. arm has NO space tier, so a nonzero one "
+                "would mask strictly more than iid_mask_frac and silently break the rate match "
+                "against every two-tier arm. Pass --mask-space-frac 0.0."
+            )
+        if t % SLOW_STRIDE != 0 or t % MID_STRIDE != 0:
+            raise ValueError(
+                f"n_time={t} not a multiple of SLOW_STRIDE={SLOW_STRIDE} / MID_STRIDE={MID_STRIDE}"
+            )
+        # Each contact's attention unit, in the SAME (S,C)→(N,) convention the space tier uses
+        # below: valid grid position p sits in shaft p // max_c and carries contact gather_idx[p].
+        vpos = valid.reshape(-1).nonzero(as_tuple=True)[0]  # (N,) valid grid positions
+        vcontact = geom.gather_idx.reshape(-1)[vpos]  # (N,) permutation of 0..N−1
+        unit_of_contact = torch.zeros(n, dtype=torch.long, device=dev)
+        unit_of_contact[vcontact] = vpos // c
+        slow_m, mid_m, hga_m = _sample_global_iid_band_time(
+            n, (t // SLOW_STRIDE, t // MID_STRIDE, t),
+            frac=cfg.iid_mask_frac, n_rows=r, unit_of_contact=unit_of_contact,
+            generator=generator, device=dev,
+        )
+        return V3MasksR6(
+            contact_mask=torch.zeros(r, n, 3, dtype=torch.bool, device=dev),
+            hga_mask=hga_m, mid_mask=mid_m, slow_mask=slow_m,
+        )
 
     # ── SPACE (per-shaft balanced) — faithful copy of sample_masks (shared across bands) ──
     d_s_base = torch.round(cfg.space_frac * cs.float()).long()
@@ -614,6 +793,17 @@ def sample_masks_r6(
             return _sample_pershaft_band_time(
                 geom, n, length, frac=frac, block_w=cfg.block_w_band,
                 n_rows=r, generator=generator, device=dev,
+            )
+        if cfg.band_time_unit == "shaft_budget":
+            return _sample_shaftbudget_band_time(
+                geom, n, length, frac=frac, block_w=cfg.block_w_band,
+                n_rows=r, generator=generator, device=dev,
+            )
+        if cfg.band_time_unit != "contact":
+            raise ValueError(
+                f"band_time_unit={cfg.band_time_unit!r} — expected 'shaft', 'contact' or "
+                "'shaft_budget'. An unknown value used to fall through to the per-contact draw, "
+                "which is the silent-wrong-arm failure this contract exists to prevent."
             )
         return _sample_persensor_band_time(
             n, length, frac=frac, block_w=cfg.block_w_band,

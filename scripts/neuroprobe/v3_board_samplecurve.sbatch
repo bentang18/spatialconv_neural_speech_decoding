@@ -57,8 +57,8 @@ TREE=/projects/bhqk/htang13/speech_board
 export PYTHONPATH="$TREE:$TREE/src:${PYTHONPATH:-}"
 cd "$TREE"
 
-CACHE=/projects/bhqk/htang13/v3_board_cache_board_pbs50_cd45k
-TAG=pbs50_cd45k
+CACHE=${CACHE:-/projects/bhqk/htang13/v3_board_cache_board_pbs50_cd45k}
+TAG=${TAG:-pbs50_cd45k}
 SHARDS=/projects/bhqk/htang13/samplecurve_shards_${TAG}
 OUT=/projects/bhqk/htang13/samplecurve_${TAG}.json
 

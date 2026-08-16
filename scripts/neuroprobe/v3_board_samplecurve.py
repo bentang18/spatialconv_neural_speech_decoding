@@ -454,26 +454,31 @@ def _anchor_verdict(rows) -> list:
     return [r for r in rows if r["absdiff"] >= ANCHOR_TOL]
 
 
-def _shard(cache_dir, tag, index, regime, taps, contiguous=False) -> dict:
-    """One array task: one WS session, or one CS test cell against the fixed anchor."""
+def _shard(cache_dir, tag, index, regime, taps, contiguous=False, mmap=False) -> dict:
+    """One array task: one WS session, or one CS test cell against the fixed anchor.
+
+    ``mmap`` defers the cache read into the gathers. It is the only configuration that
+    finishes csession at d=384: the eager load OOMs at 200 G and again at 240 G, and the
+    curve touches the same taps the board readout does.
+    """
     if regime == "cs":
         cell = CS_TEST_CELLS[index]
-        anchor_rec = _load(cache_dir, CS_TRAIN_ANCHOR, tag, mmap=False)
-        test_rec = _load(cache_dir, cell, tag, mmap=False)
+        anchor_rec = _load(cache_dir, CS_TRAIN_ANCHOR, tag, mmap=mmap)
+        test_rec = _load(cache_dir, cell, tag, mmap=mmap)
         curve_fn = lambda task: _cs_curve_cell(anchor_rec, test_rec, task, taps, contiguous)
         check_fn = lambda task, p: _cs_anchor_check(anchor_rec, test_rec, task, taps, p)
         published = "_cs_cell"
     elif regime == "csession":
         cell = CSESSION_CELLS[index]
         sib = _sibling(cell)
-        train_rec = _load(cache_dir, sib, tag, mmap=False)
-        test_rec = _load(cache_dir, cell, tag, mmap=False)
+        train_rec = _load(cache_dir, sib, tag, mmap=mmap)
+        test_rec = _load(cache_dir, cell, tag, mmap=mmap)
         curve_fn = lambda task: _csession_curve_cell(train_rec, test_rec, task, taps, sib, contiguous)
         check_fn = lambda task, p: _csession_anchor_check(train_rec, test_rec, task, taps, p)
         published = "_csession_cell"
     else:
         cell = LITE_SESSIONS[index]
-        rec = _load(cache_dir, cell, tag, mmap=False)
+        rec = _load(cache_dir, cell, tag, mmap=mmap)
         curve_fn = lambda task: _ws_curve_cell(rec, cell, task, taps, contiguous)
         check_fn = lambda task, p: _anchor_check(rec, task, taps, p)
         published = "_ws_cell"
@@ -867,6 +872,9 @@ def main():
                         "(_elec_cols), and the encoder never wrote elec_labels — without the "
                         "sidecar every csession cell returns {} and the run looks like a clean "
                         "zero. Set on the module the readout actually reads (R), not a local copy.")
+    p.add_argument("--mmap", action="store_true",
+                   help="defer the cache read into the gathers. REQUIRED for csession at d=384: "
+                        "the eager load OOMs at 200 G and at 240 G.")
     p.add_argument("--contiguous", action="store_true",
                    help="draw the FIRST N trials instead of a random N. ⚠️ with KFold(2) only one "
                         "fold has train preceding test; the other decodes the past. A different "
@@ -907,7 +915,8 @@ def main():
         src = CS_TRAIN_ANCHOR if args.mode == "cs" else _sibling(cell)
         print(f"  train session = S{src[0]}T{src[1]} (subsampled); "
               f"val/test = this cell's cs_split (NEVER subsampled)", flush=True)
-    sh = _shard(args.cache_dir, args.tag, args.index, args.mode, taps, args.contiguous)
+    sh = _shard(args.cache_dir, args.tag, args.index, args.mode, taps, args.contiguous,
+                args.mmap)
     os.makedirs(args.shard_dir, exist_ok=True)
     out = f"{args.shard_dir}/{SHARD_PREFIX[args.mode]}_{sh['name']}.json"
     with open(out, "w") as f:

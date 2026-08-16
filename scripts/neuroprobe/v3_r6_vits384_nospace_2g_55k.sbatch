@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=r6_vits384_tube_2g_55k
+#SBATCH --job-name=r6_vits384_nospace_2g_55k
 #SBATCH --account=bhqk-dtai-gh
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
@@ -198,7 +198,7 @@ export ROOT_DIR_BRAINTREEBANK=/projects/bhqk/htang13/braintreebank
 export EXCA_CACHE_FOLDER=/work/nvme/bhqk/htang13/cache_neuroai
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SHARED WITH v3_r6_vits384_tube_2g_smoke.sbatch so a prior smoke run warms this (~20 min).
-export TORCHINDUCTOR_CACHE_DIR=/work/nvme/bhqk/htang13/torchinductor_cache_r6_tube2g_${ARM}
+export TORCHINDUCTOR_CACHE_DIR=/work/nvme/bhqk/htang13/torchinductor_cache_r6_nospace2g_${ARM}
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export WANDB_API_KEY="$(cat /projects/bhqk/htang13/.wandb_key)"
 TREE=/projects/bhqk/htang13/speech
@@ -210,21 +210,22 @@ cd "$TREE"
 # --no-space-rope from the ckpt PATH matching *nosrope*, so keep `nosrope`/`noparcel` verbatim
 # or the probe encode runs the wrong arm. `_tube_` separates this contract from every ckpt
 # already on disk.
-RUN_NAME=v3_r6_tube_pbspace111_sf50_${ARM}_2g_cd55k
+RUN_NAME=v3_r6_nospace_t75_w4_${ARM}_2g_cd55k
 CKPT_DIR=/projects/bhqk/htang13/v3_ckpt_${RUN_NAME}
 ROOT=/work/nvme/bhqk/htang13/cache_neuroai/v14_3band_v3_spec_pretrain
 
 [ -e "$CKPT_DIR" ] && { echo "[FATAL] $CKPT_DIR already exists -- refusing to mix ladders"; exit 1; }
 
 echo "[r6 vits384 TIME-TUBE 2-GPU 0->55k] arm=$ARM flags='$ABL' run=$RUN_NAME"
-echo "[contract] --band-time-unit shaft: width-4 time blocks drawn PER SHAFT, shared by its contacts. FRESH from step 0."
+echo "[contract] NO SPACE TIER. space=0.0, time=0.75, band_block_w=4, --band-time-unit contact."
+echo "[contract] visible = (1-0.0)x(1-0.75) = 0.25 => 75% masked, RATE-MATCHED to pbs50 (0.50x0.50). FRESH from step 0."
 echo "[ddp]      world=$WORLD, accum=$ACC/rank, workers=$NW/rank -> streams=$STREAMS. Batch/ipe/pack-multiset IDENTICAL to the 1-GPU pair; opt-step GROUPING is not."
 echo "[slurm]    cpus-per-task=$SLURM_CPUS_PER_TASK (ONE SOCKET PER RANK -- 36 fails 'Error configuring interconnect' in 3 s), mem=227120M, billing still 2000/hr"
 echo "[batch]    cb=$CB x accum=$ACC x world=$WORLD = $((CB*ACC*WORLD)) contacts/opt-step"
 echo "[epoch]    cps=$CPS -> ipe=$IPE. Ladder every 1000 = EVERY rung is an epoch boundary, so a wall-clock resume draws fresh packs."
 echo "[schedule] ONE JOB: warmup 5000 -> CONSTANT 6e-3 to 50000 -> LINEAR 6e-3->0 over 50000..55000 (--min-lr-ratio 0.0)"
 echo "[sampler]  --shaft-alpha 0.0: uniform on the SUBJECT axis, 1/7 each BY CONSTRUCTION (census-independent)"
-echo "[matched]  sf50 per_band_space=ON widths=1,1,1 lr=6e-3 wd=0.04 clip=3.0 beta2=0.95 seed=33 [FILE-ONLY scp deploy]"
+echo "[matched]  sf00 time=0.75 w4 unit=contact lr=6e-3 wd=0.04 clip=3.0 beta2=0.95 seed=33 [FILE-ONLY scp deploy]"
 echo "[wall]     55000 steps. 1-GPU rate is 4.005 s/step (61.2 h); this needs >=1.5x to fit 47 h. SCALING IS MODELLED, NOT PROFILED."
 echo "[read]     what ships is the 55000 COOLED ckpt. 🚫 never board a rung below 55000."
 
@@ -247,8 +248,9 @@ srun "$VENV" -u -m speech_decoding.experiments.dispatch_v3 \
   --accelerator gpu --devices $WORLD --precision bf16-mixed \
   --clips-per-session $CPS \
   --num-workers $NW --monitor-every-n-steps 10 --log-every-n-steps 10 \
-  --mask-space-frac 0.50 --per-band-space --space-block-w-bands 1,1,1 \
-  --band-time-unit shaft \
+  --mask-space-frac 0.0 --per-band-space --space-block-w-bands 1,1,1 \
+  --mask-time-frac 0.75 --band-block-w 4 \
+  --band-time-unit contact \
   $ABL \
   --compile \
   --wandb-project intuition --run-name $RUN_NAME \

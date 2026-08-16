@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=200G
-#SBATCH --time=12:00:00
+#SBATCH --mem=160G
+#SBATCH --time=24:00:00
 #SBATCH --array=0-11
 #SBATCH --output=/projects/bhqk/htang13/logs/%x_%A_%a.out
 #
@@ -56,7 +56,18 @@
 # CSESSION_CELLS == LITE_SESSIONS: every Lite session is a cross-session test cell, trained on its
 # sibling trial. Same sharding the board's csession readout uses.
 #
-# ═══ MEMORY: 200G, THE BOARD'S OWN CSESSION NUMBER ══════════════════════════════════════════════
+# ═══ 🪤 AT d=384 THE EAGER LOAD DOES NOT FIT AT ANY REQUESTABLE SIZE — USE --mmap ═══════════════
+# Measured, not guessed. The d=384 csession curve was tried once eagerly at 240G (21023931_0) and
+# was OUT_OF_MEMORY in 18 minutes, and the board's own csession readout on the same cache OOM'd
+# 10/12 cells at 200G and 5/10 of the retries at 240G. Delta CPU nodes top out at 256G, so there is
+# no larger request to escalate to. mmap at 120G is the only configuration that has ever finished
+# csession at this width (2/2, ~1.5 h/cell), so MMAP defaults ON whenever the tag is not the d=256
+# one. It defers the read into the gathers: pages arrive where a tensor is actually indexed and
+# land in RECLAIMABLE page cache rather than anonymous RSS, which is what the OOM killer counts.
+# 160G rather than the board's 120G because the curve holds the subsample bookkeeping alive across
+# the whole N grid on top of the two records.
+#
+# ═══ MEMORY: 200G, THE BOARD'S OWN CSESSION NUMBER (d=256, EAGER) ═══════════════════════════════
 # board_readout_all3.sh:48 runs csession at 200G, and its header (:12-14) attaches the evidence:
 # csession loads TWO records with the HEAVY per-electrode taps (unlike cs, which is parcel-mean and
 # ~40x lighter). 180G OOM-killed 8 of 12 cells (20298990); 176G completed but peaked at MaxRSS 181G
@@ -65,7 +76,13 @@
 # subsample bookkeeping alive across the N grid), so shaving it is the wrong direction.
 # Cores are FREE below 0.512 x mem_GB = 102, so 32 bills identically to 8.
 #
-# ═══ WALLTIME: 12 h ════════════════════════════════════════════════════════════════════════════
+# ═══ WALLTIME: 24 h ════════════════════════════════════════════════════════════════════════════
+# Doubled from the original 12 h for the mmap path. mmap is NOT a speedup — it trades peak RSS for
+# per-gather page faults — and the board readout under mmap ran ~1.5 h/cell against a readout that
+# does ONE fit per task. This curve does the whole N grid on top of that. The bill is on ACTUAL
+# wall, so a generous limit costs backfill position; a timeout costs the night.
+#
+# ═══ WALLTIME: 12 h, THE ORIGINAL EAGER d=256 BUDGET ═══════════════════════════════════════════
 # The reference point is MEASURED: the WS curve (20715662) ran 2:01-2:25 per cell on the same heavy
 # enc12_elec tap. csession moves that in two opposite directions and the net is not knowable up
 # front, which is exactly why the limit is set where a timeout cannot truncate the array:
@@ -84,8 +101,11 @@ TREE=/projects/bhqk/htang13/speech_board
 export PYTHONPATH="$TREE:$TREE/src:${PYTHONPATH:-}"
 cd "$TREE"
 
-CACHE=/projects/bhqk/htang13/v3_board_cache_board_pbs50_cd45k
-TAG=pbs50_cd45k
+CACHE=${CACHE:-/projects/bhqk/htang13/v3_board_cache_board_pbs50_cd45k}
+TAG=${TAG:-pbs50_cd45k}
+# ON unless this is the d=256 tag the eager path was measured on. A forgotten flag here does not
+# fail loudly, it OOMs 18 minutes in, so the default carries the decision rather than the caller.
+MMAP=${MMAP:-$([[ "$TAG" == "pbs50_cd45k" ]] && echo 0 || echo 1)}
 SIDECAR=/projects/bhqk/htang13/arm0_elec_labels_sidecar.pkl
 SHARDS=/projects/bhqk/htang13/samplecurve_csession_shards_${TAG}
 OUT=/projects/bhqk/htang13/samplecurve_csession_${TAG}.json
@@ -108,6 +128,8 @@ echo "[R31/csession shard] idx=$IDX cache=$CACHE tag=$TAG"
 echo "[contract]  CSession | taps enc0_elec,enc12_elec | SIBLING session subsampled"
 echo "[contract]  target val/test NEVER subsampled — they are the protocol's"
 echo "[anchor]    N=full MUST reproduce the published _csession_cell — read the [anchor] line below"
+MMAP_FLAG=$([[ "$MMAP" == "1" ]] && echo --mmap || echo "")
+echo "[mem]       mmap=$MMAP  (eager OOMs at 240G on the d=384 cache — 21023931_0)"
 numactl --interleave=all python -u scripts/neuroprobe/v3_board_samplecurve.py \
   --mode csession --cache-dir "$CACHE" --tag "$TAG" --index "$IDX" --shard-dir "$SHARDS" \
-  --elec-labels-sidecar "$SIDECAR"
+  --elec-labels-sidecar "$SIDECAR" $MMAP_FLAG
